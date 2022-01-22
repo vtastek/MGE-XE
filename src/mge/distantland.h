@@ -87,7 +87,7 @@ public:
     static IDirect3DSurface9* surfShadowZ;
     static IDirect3DVertexBuffer9* vbFullFrame, *vbClipCube;
 
-    static D3DXMATRIX mwView, mwProj;
+    static D3DXMATRIX mwView, mwViewInv, mwViewLast,  mwProj;
     static D3DXMATRIX smView[2], smProj[2], smViewproj[2];
     static D3DXVECTOR4 eyeVec, eyePos, sunVec, sunPos;
     static float sunVis;
@@ -102,7 +102,7 @@ public:
     static float lightSunMult, lightAmbMult;
 
     static D3DXHANDLE ehRcpRes, ehShadowRcpRes;
-    static D3DXHANDLE ehWorld, ehView, ehProj;
+    static D3DXHANDLE ehWorld, ehView, ehViewInv, ehViewLast, ehProj;
     static D3DXHANDLE ehShadowViewproj;
     static D3DXHANDLE ehVertexBlendState, ehVertexBlendPalette;
     static D3DXHANDLE ehAlphaRef, ehMaterialAlpha;
@@ -144,6 +144,7 @@ public:
     static bool isDistantCell();
 
     static void setView(const D3DMATRIX* m);
+    static void setViewMotion(const D3DMATRIX* m);
     static void setProjection(D3DMATRIX* proj);
     static void setHorizonColour(const RGBVECTOR& c);
     static void setAmbientColour(const RGBVECTOR& c);
@@ -159,7 +160,7 @@ public:
     static void renderStageBlend();
     static void renderStageWater();
 
-    static void setupCommonEffect(const D3DXMATRIX* view,const  D3DXMATRIX* proj);
+    static void setupCommonEffect(const D3DXMATRIX* view, const D3DXMATRIX* viewInv, const D3DXMATRIX* viewLast, const  D3DXMATRIX* proj);
 
     static void renderDistantLand(ID3DXEffect* e, const D3DXMATRIX* view, const D3DXMATRIX* proj);
     static void renderDistantLandZ();

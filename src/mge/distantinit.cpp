@@ -72,7 +72,7 @@ IDirect3DSurface9* DistantLand::surfShadowZ;
 IDirect3DVertexBuffer9* DistantLand::vbFullFrame;
 IDirect3DVertexBuffer9* DistantLand::vbClipCube;
 
-D3DXMATRIX DistantLand::mwView, DistantLand::mwProj;
+D3DXMATRIX DistantLand::mwView, DistantLand::mwViewInv, DistantLand::mwViewLast, DistantLand::mwProj;
 D3DXMATRIX DistantLand::smView[2], DistantLand::smProj[2];
 D3DXMATRIX DistantLand::smViewproj[2];
 D3DXVECTOR4 DistantLand::eyeVec, DistantLand::eyePos;
@@ -93,6 +93,8 @@ D3DXHANDLE DistantLand::ehRcpRes;
 D3DXHANDLE DistantLand::ehShadowRcpRes;
 D3DXHANDLE DistantLand::ehWorld;
 D3DXHANDLE DistantLand::ehView;
+D3DXHANDLE DistantLand::ehViewInv;
+D3DXHANDLE DistantLand::ehViewLast;
 D3DXHANDLE DistantLand::ehProj;
 D3DXHANDLE DistantLand::ehShadowViewproj;
 D3DXHANDLE DistantLand::ehVertexBlendState;
@@ -399,6 +401,8 @@ bool DistantLand::initShader() {
     ehShadowRcpRes = effect->GetParameterByName(0, "shadowRcpRes");
     ehWorld = effect->GetParameterByName(0, "world");
     ehView = effect->GetParameterByName(0, "view");
+    ehViewInv = effect->GetParameterByName(0, "viewInv");
+    ehViewLast = effect->GetParameterByName(0, "viewLast");
     ehProj = effect->GetParameterByName(0, "proj");
     ehShadowViewproj = effect->GetParameterByName(0, "shadowViewProj");
     ehVertexBlendState = effect->GetParameterByName(0, "vertexBlendState");

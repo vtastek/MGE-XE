@@ -22,13 +22,21 @@ void DistantLand::renderStage0() {
     selectDistantCell();
 
     // Get Morrowind camera matrices
+
+
+    // last view
+    
+    mwViewLast = mwView;
     device->GetTransform(D3DTS_VIEW, &mwView);
+    
+    
+    
     device->GetTransform(D3DTS_PROJECTION, &mwProj);
 
     // Set variables derived from current game state and camera configuration
     setView(&mwView);
     adjustFog();
-    setupCommonEffect(&mwView, &mwProj);
+    setupCommonEffect(&mwView, &mwViewInv, &mwViewLast, &mwProj);
     FixedFunctionShader::updateLighting(lightSunMult, lightAmbMult);
 
     isRenderCached &= (Configuration.MGEFlags & USE_MENU_CACHING) && mwBridge->IsMenu();
@@ -101,6 +109,9 @@ void DistantLand::renderStage0() {
 
             // Reset matrices
             effect->SetMatrix(ehView, &mwView);
+            //effect->SetMatrix(ehViewInv, &mwViewInv);
+            //effect->SetMatrix(ehViewLast, &mwViewLast);
+
             effect->SetMatrix(ehProj, &mwProj);
 
             // Save distant land only frame to texture
@@ -319,11 +330,16 @@ void DistantLand::renderStageWater() {
 }
 
 // setupCommonEffect - Set shared shader variables for this frame
-void DistantLand::setupCommonEffect(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
+void DistantLand::setupCommonEffect(const D3DXMATRIX* view, const D3DXMATRIX* viewInv, const D3DXMATRIX* viewLast, const D3DXMATRIX* proj) {
     auto mwBridge = MWBridge::get();
 
     // View position
     effect->SetMatrix(ehView, view);
+
+    //effect->SetMatrix(ehViewInv, viewInv);
+
+    //effect->SetMatrix(ehViewLast, viewLast);
+
     effect->SetMatrix(ehProj, proj);
     effect->SetFloatArray(ehEyePos, eyePos, 3);
 
@@ -645,6 +661,8 @@ void DistantLand::updatePostShader(MGEShader* shader) {
     // View position
     float zoom = (Configuration.MGEFlags & ZOOM_ASPECT) ? Configuration.CameraEffects.zoom : 1.0f;
     shader->SetMatrix(EV_mview, &mwView);
+    shader->SetMatrix(EV_mviewInv, &mwViewInv);
+    shader->SetMatrix(EV_mviewLast, &mwViewLast);
     shader->SetMatrix(EV_mproj, &mwProj);
     shader->SetFloatArray(EV_eyevec, eyeVec, 3);
     shader->SetFloatArray(EV_eyepos, eyePos, 3);
@@ -716,6 +734,12 @@ void DistantLand::setView(const D3DMATRIX* m) {
     D3DXMATRIX invView, view = *m;
 
     D3DXMatrixInverse(&invView, 0, &view);
+
+    // inverse view
+    mwViewInv = invView;
+
+    
+
     D3DXVec4Transform(&eyePos, &origin, &invView);
     eyeVec.x = m->_13;
     eyeVec.y = m->_23;
