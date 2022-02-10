@@ -1705,6 +1705,11 @@ namespace MGEgui.DistantLand {
                 foreach (FileInfo file in files) {
                     Plugins.Add(file.Name.ToLowerInvariant(), new MWPlugin(file, false));
                 }
+                files = dir.GetFiles("*.esg");
+                foreach (FileInfo file in files)
+                {
+                    Plugins.Add(file.Name.ToLowerInvariant(), new MWPlugin(file, false));
+                }
                 List<string> removeDirs = new List<string>();
                 foreach (string dirName in Dirs) {
                     if (!addPluginsFromDir(dirName)) {
@@ -1755,6 +1760,11 @@ namespace MGEgui.DistantLand {
                     }
                     files = dir.GetFiles("*.esp");
                     foreach (FileInfo file in files) {
+                        Plugins.Add(file.Name.ToLowerInvariant() + " > " + casefoldDir, new MWPlugin(file, srcDir, false));
+                    }
+                    files = dir.GetFiles("*.esg");
+                    foreach (FileInfo file in files)
+                    {
                         Plugins.Add(file.Name.ToLowerInvariant() + " > " + casefoldDir, new MWPlugin(file, srcDir, false));
                     }
                     return true;
