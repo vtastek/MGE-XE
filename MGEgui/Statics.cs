@@ -184,7 +184,7 @@ namespace MGEgui {
         /// Used to ensure that created options files match the dll versions
         /// </summary>
         public const string programName = "Morrowind Graphics Extender XE";
-        public const string versionNumber = "0.17.0";
+        public const string versionNumber = "0.18.0";
         public const string versionString = "v" + versionNumber;
         public const byte SaveVersion = 47;
         public const byte DistantLandVersion = 7;
@@ -341,9 +341,21 @@ namespace MGEgui {
                 return;
             }
 
+            // DirectX init
+            try {
+                if (!DXMain.CheckAdapter()) {
+                    System.Windows.Forms.MessageBox.Show(strings["MWAdapterNotPresent"], "Warning");
+                    DXMain.ResetAdapter();
+                }
+                DXMain.GetDeviceCaps();
+            } catch (Exception ex) {
+                // Display full error to help diagnose issues
+                MessageBox.Show(ex.ToString(), strings["Error"]);
+            }
+            
+            // Initialize members
             runDir = System.Windows.Forms.Application.StartupPath;
 
-            // Create some structures
             for (int i = 0; i < MACROS; i++) {
                 Macros[i] = new Macro();
             }
@@ -351,12 +363,6 @@ namespace MGEgui {
                 Triggers[i] = new Trigger();
             }
             
-            if (!DXMain.CheckAdapter()) {
-                System.Windows.Forms.MessageBox.Show(strings["MWAdapterNotPresent"], "Warning");
-                DXMain.ResetAdapter();
-            }
-            DXMain.GetDeviceCaps();
-
             mf = new MainForm(autoLanguage);
             Application.Run(mf);
         }
