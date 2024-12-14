@@ -11,12 +11,11 @@ IPC::VirtualAlloc2_t IPC::VirtualAlloc2 = nullptr;
 
 bool IPC::initImports() {
     auto kernel32 = LoadLibraryA("Kernel32.dll");
-    auto kernelbase = LoadLibraryA("Kernelbase.dll");
-
     if (kernel32 == NULL) {
         return false;
     }
 
+    auto kernelbase = LoadLibraryA("Kernelbase.dll");
     if (kernelbase == NULL) {
         FreeLibrary(kernel32);
         return false;
