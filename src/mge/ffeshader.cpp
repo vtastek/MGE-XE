@@ -31,6 +31,9 @@ float FixedFunctionShader::sunMultiplier, FixedFunctionShader::ambMultiplier;
 
 static string buildArgString(DWORD arg, const string& mask, const string& sampler);
 
+FixedFunctionShader::ParameterCache::CachedParams FixedFunctionShader::ParameterCache::lastParams = {};
+uint32_t FixedFunctionShader::ParameterCache::currentFrame = 0;
+bool FixedFunctionShader::ParameterCache::valid = false;
 
 
 bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
@@ -203,122 +206,134 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
         shaderLRU.last_sk = sk;
     }
 
-    // Set up material
-    effectFFE->SetVector(ehMaterialDiffuse, (D3DXVECTOR4*)&frs->material.diffuse);
-    effectFFE->SetVector(ehMaterialAmbient, (D3DXVECTOR4*)&frs->material.ambient);
-    effectFFE->SetVector(ehMaterialEmissive, (D3DXVECTOR4*)&frs->material.emissive);
+
+
+    if (ParameterCache::needsMaterialUpdate(frs)) {
+        effectFFE->SetVector(ehMaterialDiffuse, (D3DXVECTOR4*)&frs->material.diffuse);
+        effectFFE->SetVector(ehMaterialAmbient, (D3DXVECTOR4*)&frs->material.ambient);
+        effectFFE->SetVector(ehMaterialEmissive, (D3DXVECTOR4*)&frs->material.emissive);
+    }
 
     // Set up lighting
-    const size_t MaxLights = 8;
-    D3DXVECTOR4 bufferDiffuse[MaxLights];
-    float bufferAmbient[MaxLights];
-    float bufferPosition[3 * MaxLights];
-    float bufferFalloffQuadratic[MaxLights], bufferFalloffLinear[MaxLights], bufferFalloffConstant;
+    if (ParameterCache::needsLightingUpdate(lightrs)) {
 
-    memset(&bufferDiffuse, 0, sizeof(bufferDiffuse));
-    memset(&bufferAmbient, 0, sizeof(bufferAmbient));
-    memset(&bufferPosition, 0, sizeof(bufferPosition));
-    memset(&bufferFalloffQuadratic, 0, sizeof(bufferFalloffQuadratic));
-    memset(&bufferFalloffLinear, 0, sizeof(bufferFalloffLinear));
-    bufferFalloffConstant = 0.33;
+        const size_t MaxLights = 8;
+        D3DXVECTOR4 bufferDiffuse[MaxLights];
+        float bufferAmbient[MaxLights];
+        float bufferPosition[3 * MaxLights];
+        float bufferFalloffQuadratic[MaxLights], bufferFalloffLinear[MaxLights], bufferFalloffConstant;
 
-    // Check each active light
-    RGBVECTOR sunDiffuse(0, 0, 0), ambient = lightrs->globalAmbient;
-    size_t n = std::min(lightrs->active.size(), MaxLights), pointLightCount = 0;
-    for (; n --> 0; ) {
-        DWORD i = lightrs->active[n];
-        const LightState::Light* light = &lightrs->lights.find(i)->second;
+        memset(&bufferDiffuse, 0, sizeof(bufferDiffuse));
+        memset(&bufferAmbient, 0, sizeof(bufferAmbient));
+        memset(&bufferPosition, 0, sizeof(bufferPosition));
+        memset(&bufferFalloffQuadratic, 0, sizeof(bufferFalloffQuadratic));
+        memset(&bufferFalloffLinear, 0, sizeof(bufferFalloffLinear));
+        bufferFalloffConstant = 0.33;
 
-        // Transform to view space if not transformed this frame
-        if (lightrs->lightsTransformed.find(i) == lightrs->lightsTransformed.end()) {
-            if (light->type == D3DLIGHT_DIRECTIONAL) {
-                D3DXVec3TransformNormal((D3DXVECTOR3*)&light->viewspacePos, (D3DXVECTOR3*)&light->position, &rs->viewTransform);
-            } else {
-                D3DXVec3TransformCoord((D3DXVECTOR3*)&light->viewspacePos, (D3DXVECTOR3*)&light->position, &rs->viewTransform);
+        // Check each active light
+        RGBVECTOR sunDiffuse(0, 0, 0), ambient = lightrs->globalAmbient;
+        size_t n = std::min(lightrs->active.size(), MaxLights), pointLightCount = 0;
+        for (; n-- > 0; ) {
+            DWORD i = lightrs->active[n];
+            const LightState::Light* light = &lightrs->lights.find(i)->second;
+
+            // Transform to view space if not transformed this frame
+            if (lightrs->lightsTransformed.find(i) == lightrs->lightsTransformed.end()) {
+                if (light->type == D3DLIGHT_DIRECTIONAL) {
+                    D3DXVec3TransformNormal((D3DXVECTOR3*)&light->viewspacePos, (D3DXVECTOR3*)&light->position, &rs->viewTransform);
+                }
+                else {
+                    D3DXVec3TransformCoord((D3DXVECTOR3*)&light->viewspacePos, (D3DXVECTOR3*)&light->position, &rs->viewTransform);
+                }
+
+                lightrs->lightsTransformed[i] = true;
             }
 
-            lightrs->lightsTransformed[i] = true;
-        }
+            if (light->type == D3DLIGHT_POINT) {
+                memcpy(&bufferDiffuse[pointLightCount], &light->diffuse, sizeof(light->diffuse));
 
-        if (light->type == D3DLIGHT_POINT) {
-            memcpy(&bufferDiffuse[pointLightCount], &light->diffuse, sizeof(light->diffuse));
+                // Scatter position vectors for vectorization
+                bufferPosition[pointLightCount] = light->viewspacePos.x;
+                bufferPosition[pointLightCount + MaxLights] = light->viewspacePos.y;
+                bufferPosition[pointLightCount + 2 * MaxLights] = light->viewspacePos.z;
 
-            // Scatter position vectors for vectorization
-            bufferPosition[pointLightCount] = light->viewspacePos.x;
-            bufferPosition[pointLightCount + MaxLights] = light->viewspacePos.y;
-            bufferPosition[pointLightCount + 2*MaxLights] = light->viewspacePos.z;
-
-            // Scatter attenuation factors for vectorization
-            if (light->falloff.x > 0) {
-                // Standard point light source (falloffConstant doesn't vary per light)
-                bufferFalloffConstant = light->falloff.x;
-                bufferFalloffLinear[pointLightCount] = light->falloff.y;
-                bufferFalloffQuadratic[pointLightCount] = light->falloff.z;
-            } else if (light->falloff.z > 0) {
-                // Probably a magic light source patched by Morrowind Code Patch
-                // Patched falloff calculation is quadratic only, which needs to be
-                // modified to account for the standard falloffConstant
-                // Diffuse colour is correctly specified with the patch
-                // Some overbrightness is applied to diffuse to cause glowing
-                bufferDiffuse[pointLightCount].x *= bufferFalloffConstant;
-                bufferDiffuse[pointLightCount].y *= bufferFalloffConstant;
-                bufferDiffuse[pointLightCount].z *= bufferFalloffConstant;
-                bufferAmbient[pointLightCount] = 1.0f + 1e-4f / sqrt(light->falloff.z);
-                bufferFalloffQuadratic[pointLightCount] = bufferFalloffConstant * light->falloff.z;
-            } else if (light->falloff.y == 0.10000001f) {
-                // Projectile light source, normally hard coded by Morrowind to { 0, 3 * (1/30), 0 }
-                // This falloff value cannot be produced by other magic effects
-                // Replacement falloff is significantly brighter to look cool
-                // Avoids modifying colour or position
-                bufferFalloffQuadratic[pointLightCount] = 5e-5;
-            } else if (light->falloff.y > 0) {
-                // Light magic effect, falloffs calculated by { 0, 3 / (22 * spell magnitude), 0 }
-                // A mix of ambient (falloff but no N.L component) and over-bright diffuse lighting
-                // It is approximated with a half-lambert weight + quadratic falloff
-                // Light colour is altered to avoid variable brightness from Morrowind bugs
-                // The point source is moved up slightly as it is often embedded in the ground
-                float brightness = 0.25f + 1e-4f / light->falloff.y;
-                bufferDiffuse[pointLightCount].x = brightness;
-                bufferDiffuse[pointLightCount].y = brightness;
-                bufferDiffuse[pointLightCount].z = brightness;
-                bufferAmbient[pointLightCount] = 1.0;
-                bufferFalloffQuadratic[pointLightCount] = 0.5555f * light->falloff.y * light->falloff.y;
-                bufferPosition[pointLightCount + 2*MaxLights] += 25.0;
+                // Scatter attenuation factors for vectorization
+                if (light->falloff.x > 0) {
+                    // Standard point light source (falloffConstant doesn't vary per light)
+                    bufferFalloffConstant = light->falloff.x;
+                    bufferFalloffLinear[pointLightCount] = light->falloff.y;
+                    bufferFalloffQuadratic[pointLightCount] = light->falloff.z;
+                }
+                else if (light->falloff.z > 0) {
+                    // Probably a magic light source patched by Morrowind Code Patch
+                    // Patched falloff calculation is quadratic only, which needs to be
+                    // modified to account for the standard falloffConstant
+                    // Diffuse colour is correctly specified with the patch
+                    // Some overbrightness is applied to diffuse to cause glowing
+                    bufferDiffuse[pointLightCount].x *= bufferFalloffConstant;
+                    bufferDiffuse[pointLightCount].y *= bufferFalloffConstant;
+                    bufferDiffuse[pointLightCount].z *= bufferFalloffConstant;
+                    bufferAmbient[pointLightCount] = 1.0f + 1e-4f / sqrt(light->falloff.z);
+                    bufferFalloffQuadratic[pointLightCount] = bufferFalloffConstant * light->falloff.z;
+                }
+                else if (light->falloff.y == 0.10000001f) {
+                    // Projectile light source, normally hard coded by Morrowind to { 0, 3 * (1/30), 0 }
+                    // This falloff value cannot be produced by other magic effects
+                    // Replacement falloff is significantly brighter to look cool
+                    // Avoids modifying colour or position
+                    bufferFalloffQuadratic[pointLightCount] = 5e-5;
+                }
+                else if (light->falloff.y > 0) {
+                    // Light magic effect, falloffs calculated by { 0, 3 / (22 * spell magnitude), 0 }
+                    // A mix of ambient (falloff but no N.L component) and over-bright diffuse lighting
+                    // It is approximated with a half-lambert weight + quadratic falloff
+                    // Light colour is altered to avoid variable brightness from Morrowind bugs
+                    // The point source is moved up slightly as it is often embedded in the ground
+                    float brightness = 0.25f + 1e-4f / light->falloff.y;
+                    bufferDiffuse[pointLightCount].x = brightness;
+                    bufferDiffuse[pointLightCount].y = brightness;
+                    bufferDiffuse[pointLightCount].z = brightness;
+                    bufferAmbient[pointLightCount] = 1.0;
+                    bufferFalloffQuadratic[pointLightCount] = 0.5555f * light->falloff.y * light->falloff.y;
+                    bufferPosition[pointLightCount + 2 * MaxLights] += 25.0;
+                }
+                ++pointLightCount;
             }
-            ++pointLightCount;
-        } else if (light->type == D3DLIGHT_DIRECTIONAL) {
-            effectFFE->SetFloatArray(ehLightSunDirection, (const float*)&light->viewspacePos, 3);
+            else if (light->type == D3DLIGHT_DIRECTIONAL) {
+                effectFFE->SetFloatArray(ehLightSunDirection, (const float*)&light->viewspacePos, 3);
 
-            sunDiffuse = light->diffuse;
-            ambient.r += light->ambient.x;
-            ambient.g += light->ambient.y;
-            ambient.b += light->ambient.z;
+                sunDiffuse = light->diffuse;
+                ambient.r += light->ambient.x;
+                ambient.g += light->ambient.y;
+                ambient.b += light->ambient.z;
+            }
         }
+
+        // Apply light multipliers, for HDR light levels
+        sunDiffuse *= sunMultiplier;
+        ambient *= ambMultiplier;
+
+        // Special case, check if ambient state is pure white (distant land does not record this for a reason)
+        // Morrowind temporarily sets this for full-bright particle effects, but just adding it
+        // to other ambient sources above would cause over-brightness
+        DWORD checkAmbient;
+        device->GetRenderState(D3DRS_AMBIENT, &checkAmbient);
+        if (checkAmbient == 0xffffffff) {
+            // Set lighting to result in full-bright equivalent after tonemapping
+            ambient.r = ambient.g = ambient.b = 1.25;
+            sunDiffuse.r = sunDiffuse.g = sunDiffuse.b = 0.0;
+        }
+
+        effectFFE->SetFloatArray(ehLightSceneAmbient, ambient, 3);
+        effectFFE->SetFloatArray(ehLightSunDiffuse, sunDiffuse, 3);
+        effectFFE->SetVectorArray(ehLightDiffuse, bufferDiffuse, MaxLights);
+        effectFFE->SetFloatArray(ehLightAmbient, bufferAmbient, MaxLights);
+        effectFFE->SetFloatArray(ehLightPosition, bufferPosition, 3 * MaxLights);
+        effectFFE->SetFloatArray(ehLightFalloffQuadratic, bufferFalloffQuadratic, MaxLights);
+        effectFFE->SetFloatArray(ehLightFalloffLinear, bufferFalloffLinear, MaxLights);
+        effectFFE->SetFloat(ehLightFalloffConstant, bufferFalloffConstant);
+
     }
-
-    // Apply light multipliers, for HDR light levels
-    sunDiffuse *= sunMultiplier;
-    ambient *= ambMultiplier;
-
-    // Special case, check if ambient state is pure white (distant land does not record this for a reason)
-    // Morrowind temporarily sets this for full-bright particle effects, but just adding it
-    // to other ambient sources above would cause over-brightness
-    DWORD checkAmbient;
-    device->GetRenderState(D3DRS_AMBIENT, &checkAmbient);
-    if (checkAmbient == 0xffffffff) {
-        // Set lighting to result in full-bright equivalent after tonemapping
-        ambient.r = ambient.g = ambient.b = 1.25;
-        sunDiffuse.r = sunDiffuse.g = sunDiffuse.b = 0.0;
-    }
-
-    effectFFE->SetFloatArray(ehLightSceneAmbient, ambient, 3);
-    effectFFE->SetFloatArray(ehLightSunDiffuse, sunDiffuse, 3);
-    effectFFE->SetVectorArray(ehLightDiffuse, bufferDiffuse, MaxLights);
-    effectFFE->SetFloatArray(ehLightAmbient, bufferAmbient, MaxLights);
-    effectFFE->SetFloatArray(ehLightPosition, bufferPosition, 3 * MaxLights);
-    effectFFE->SetFloatArray(ehLightFalloffQuadratic, bufferFalloffQuadratic, MaxLights);
-    effectFFE->SetFloatArray(ehLightFalloffLinear, bufferFalloffLinear, MaxLights);
-    effectFFE->SetFloat(ehLightFalloffConstant, bufferFalloffConstant);
 
     // Bump mapping state
     if (sk.usesBumpmap) {
@@ -335,24 +350,29 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
     }
 
     // Copy texture bindings from fixed function pipe
-    const D3DXHANDLE ehIndex[] = { ehTex0, ehTex1, ehTex2, ehTex3, ehTex4, ehTex5 };
-    for (n = 0; n != std::min((int)sk.activeStages, 6); ++n) {
-        IDirect3DBaseTexture9* tex;
-        device->GetTexture(n, &tex);
-        effectFFE->SetTexture(ehIndex[n], tex);
-        if (tex) {
-            tex->Release();
+    if (ParameterCache::needsTextureUpdate(sk)) {
+        const D3DXHANDLE ehIndex[] = { ehTex0, ehTex1, ehTex2, ehTex3, ehTex4, ehTex5 };
+        for (int n = 0; n < std::min((int)sk.activeStages, 6); ++n) {
+            IDirect3DBaseTexture9* tex;
+            device->GetTexture(n, &tex);
+            effectFFE->SetTexture(ehIndex[n], tex);
+            if (tex) tex->Release();
         }
     }
 
     // Set common state and render
-    effectFFE->SetInt(ehVertexBlendState, rs->vertexBlendState);
-    if (rs->vertexBlendState) {
-        effectFFE->SetMatrixArray(ehVertexBlendPalette, rs->worldViewTransforms, 4);
-    } else {
-        effectFFE->SetMatrix(ehWorld, &rs->worldTransforms[0]);
-        effectFFE->SetMatrix(ehWorldView, &rs->worldViewTransforms[0]);
+    if (ParameterCache::needsTransformUpdate(rs)) {
+        effectFFE->SetInt(ehVertexBlendState, rs->vertexBlendState);
+        if (rs->vertexBlendState) {
+            effectFFE->SetMatrixArray(ehVertexBlendPalette, rs->worldViewTransforms, 4);
+        }
+        else {
+            effectFFE->SetMatrix(ehWorld, &rs->worldTransforms[0]);
+            effectFFE->SetMatrix(ehWorldView, &rs->worldViewTransforms[0]);
+        }
     }
+
+    ParameterCache::updateCache(rs, frs, lightrs, sk);
 
     UINT passes;
     effectFFE->Begin(&passes, D3DXFX_DONOTSAVESTATE);
@@ -719,6 +739,9 @@ string buildArgString(DWORD arg, const string& mask, const string& sampler) {
 }
 
 void FixedFunctionShader::release() {
+
+    ParameterCache::cleanup();
+
     for (auto& i : cacheEffects) {
         if (i.second) {
             i.second->Release();

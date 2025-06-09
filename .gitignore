@@ -17,4 +17,5 @@ MGE-XE-DLfuncs.layout
 /MaterialEditor/packages/
 /CMakeCache.txt
 /CMakeFiles/
-MGEgui/.vs/
+/MGEfuncs/MGEfuncs.vcxproj
+/MGEgui/.vs/MGEgui_vc2008

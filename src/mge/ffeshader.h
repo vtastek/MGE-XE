@@ -104,6 +104,107 @@ class FixedFunctionShader {
         FixedFunctionShader::ShaderKey last_sk;
     };
 
+    // Parameter caching to reduce descriptor set allocations in DXVK
+    class ParameterCache {
+    private:
+        struct CachedParams {
+            D3DXVECTOR4 materialDiffuse, materialAmbient, materialEmissive;
+            IDirect3DBaseTexture9* textures[6];
+            D3DXMATRIX world, worldView;
+            uint32_t lightingHash;
+            uint32_t frame;
+        };
+
+        static CachedParams lastParams;
+        static uint32_t currentFrame;
+        static bool valid;
+
+    public:
+        static void newFrame() {
+            currentFrame++;
+            valid = false;
+        }
+
+        static void cleanup() {
+            // Release any cached texture references
+            for (int i = 0; i < 6; ++i) {
+                if (lastParams.textures[i]) {
+                    lastParams.textures[i]->Release();
+                    lastParams.textures[i] = nullptr;
+                }
+            }
+            valid = false;
+        }
+
+        static bool needsMaterialUpdate(const FragmentState* frs) {
+            return !valid || currentFrame != lastParams.frame ||
+                memcmp(&lastParams.materialDiffuse, &frs->material.diffuse, sizeof(D3DXVECTOR4)) ||
+                memcmp(&lastParams.materialAmbient, &frs->material.ambient, sizeof(D3DXVECTOR4)) ||
+                memcmp(&lastParams.materialEmissive, &frs->material.emissive, sizeof(D3DXVECTOR4));
+        }
+
+        static bool needsTextureUpdate(const ShaderKey& sk) {
+            if (!valid || currentFrame != lastParams.frame) return true;
+
+            for (int i = 0; i < std::min((int)sk.activeStages, 6); ++i) {
+                IDirect3DBaseTexture9* tex;
+                device->GetTexture(i, &tex);
+                if (tex != lastParams.textures[i]) {
+                    if (tex) tex->Release();
+                    return true;
+                }
+                if (tex) tex->Release();
+            }
+            return false;
+        }
+
+        static bool needsTransformUpdate(const RenderedState* rs) {
+            return !valid || currentFrame != lastParams.frame ||
+                memcmp(&lastParams.world, &rs->worldTransforms[0], sizeof(D3DXMATRIX)) ||
+                memcmp(&lastParams.worldView, &rs->worldViewTransforms[0], sizeof(D3DXMATRIX));
+        }
+
+        static uint32_t hashLighting(const LightState* lightrs) {
+            uint32_t hash = 0;
+            for (DWORD id : lightrs->active) {
+                hash ^= id + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+            }
+            return hash;
+        }
+
+        static bool needsLightingUpdate(const LightState* lightrs) {
+            uint32_t newHash = hashLighting(lightrs);
+            return !valid || currentFrame != lastParams.frame || newHash != lastParams.lightingHash;
+        }
+
+        static void updateCache(const RenderedState* rs, const FragmentState* frs,
+            const LightState* lightrs, const ShaderKey& sk) {
+            lastParams.materialDiffuse = *(D3DXVECTOR4*)&frs->material.diffuse;
+            lastParams.materialAmbient = *(D3DXVECTOR4*)&frs->material.ambient;
+            lastParams.materialEmissive = *(D3DXVECTOR4*)&frs->material.emissive;
+            lastParams.world = rs->worldTransforms[0];
+            lastParams.worldView = rs->worldViewTransforms[0];
+            lastParams.lightingHash = hashLighting(lightrs);
+            lastParams.frame = currentFrame;
+
+            // Update texture cache - release old textures first
+            for (int i = 0; i < 6; ++i) {
+                if (lastParams.textures[i]) {
+                    lastParams.textures[i]->Release();
+                    lastParams.textures[i] = nullptr;
+                }
+            }
+
+            // Store new texture references
+            for (int i = 0; i < std::min((int)sk.activeStages, 6); ++i) {
+                device->GetTexture(i, &lastParams.textures[i]);
+                // Don't release here - we need to keep the reference for comparison
+            }
+
+            valid = true;
+        }
+    };
+
     static IDirect3DDevice* device;
     static ID3DXEffectPool* constantPool;
     static std::unordered_map<ShaderKey, ID3DXEffect*, ShaderKey::hasher> cacheEffects;
@@ -129,4 +230,6 @@ public:
     static void updateLighting(float sunMult, float ambMult);
     static void renderMorrowind(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);
     static void release();
+    static void newFrame() { ParameterCache::newFrame(); }  // Public accessor for parameter cache
+    static void cleanupParameterCache() { ParameterCache::cleanup(); }  // Public cleanup accessor
 };
