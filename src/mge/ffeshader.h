@@ -1,6 +1,7 @@
 #pragma once
 
 #include "proxydx/d3d8header.h"
+#include "support/log.h"
 
 #include <unordered_map>
 #include <vector>
@@ -112,21 +113,33 @@ class FixedFunctionShader {
             IDirect3DBaseTexture9* textures[6];
             D3DXMATRIX world, worldView;
             uint32_t lightingHash;
-            uint32_t frame;
+            uint32_t bumpHash;
+            uint32_t texgenHash;
+            bool initialized;
         };
 
         static CachedParams lastParams;
         static uint32_t currentFrame;
         static bool valid;
 
+
+
+
     public:
-        static void newFrame() {
-            currentFrame++;
+        static int totalDraws;
+        static int materialUpdates;
+        static int textureUpdates;
+        static int transformUpdates;
+        static int lightingUpdates;
+
+        static void init() {
+            memset(&lastParams, 0, sizeof(lastParams));
+            lastParams.initialized = false;
             valid = false;
+            totalDraws = materialUpdates = textureUpdates = transformUpdates = lightingUpdates = 0;
         }
 
         static void cleanup() {
-            // Release any cached texture references
             for (int i = 0; i < 6; ++i) {
                 if (lastParams.textures[i]) {
                     lastParams.textures[i]->Release();
@@ -136,15 +149,31 @@ class FixedFunctionShader {
             valid = false;
         }
 
+        // Simplified checks - only compare actual values, no frame checking
         static bool needsMaterialUpdate(const FragmentState* frs) {
-            return !valid || currentFrame != lastParams.frame ||
-                memcmp(&lastParams.materialDiffuse, &frs->material.diffuse, sizeof(D3DXVECTOR4)) ||
+            if (!lastParams.initialized) return true;
+            return memcmp(&lastParams.materialDiffuse, &frs->material.diffuse, sizeof(D3DXVECTOR4)) ||
                 memcmp(&lastParams.materialAmbient, &frs->material.ambient, sizeof(D3DXVECTOR4)) ||
                 memcmp(&lastParams.materialEmissive, &frs->material.emissive, sizeof(D3DXVECTOR4));
         }
 
         static bool needsTextureUpdate(const ShaderKey& sk) {
-            if (!valid || currentFrame != lastParams.frame) return true;
+            if (!lastParams.initialized) return true;
+
+            // Debug logging every 5000 checks
+            static int debugCounter = 0;
+            if (++debugCounter % 5000 == 0) {
+                LOG::logline("TEXTURE DEBUG: activeStages=%d, initialized=%d",
+                    sk.activeStages, lastParams.initialized ? 1 : 0);
+
+                for (int i = 0; i < std::min((int)sk.activeStages, 6); ++i) {
+                    IDirect3DBaseTexture9* tex;
+                    device->GetTexture(i, &tex);
+                    LOG::logline("  Stage %d: current=%p cached=%p match=%d",
+                        i, tex, lastParams.textures[i], (tex == lastParams.textures[i]) ? 1 : 0);
+                    if (tex) tex->Release();
+                }
+            }
 
             for (int i = 0; i < std::min((int)sk.activeStages, 6); ++i) {
                 IDirect3DBaseTexture9* tex;
@@ -159,8 +188,8 @@ class FixedFunctionShader {
         }
 
         static bool needsTransformUpdate(const RenderedState* rs) {
-            return !valid || currentFrame != lastParams.frame ||
-                memcmp(&lastParams.world, &rs->worldTransforms[0], sizeof(D3DXMATRIX)) ||
+            if (!lastParams.initialized) return true;
+            return memcmp(&lastParams.world, &rs->worldTransforms[0], sizeof(D3DXMATRIX)) ||
                 memcmp(&lastParams.worldView, &rs->worldViewTransforms[0], sizeof(D3DXMATRIX));
         }
 
@@ -173,8 +202,9 @@ class FixedFunctionShader {
         }
 
         static bool needsLightingUpdate(const LightState* lightrs) {
+            if (!lastParams.initialized) return true;
             uint32_t newHash = hashLighting(lightrs);
-            return !valid || currentFrame != lastParams.frame || newHash != lastParams.lightingHash;
+            return newHash != lastParams.lightingHash;
         }
 
         static void updateCache(const RenderedState* rs, const FragmentState* frs,
@@ -185,9 +215,9 @@ class FixedFunctionShader {
             lastParams.world = rs->worldTransforms[0];
             lastParams.worldView = rs->worldViewTransforms[0];
             lastParams.lightingHash = hashLighting(lightrs);
-            lastParams.frame = currentFrame;
+            lastParams.initialized = true;
 
-            // Update texture cache - release old textures first
+            // Update texture cache
             for (int i = 0; i < 6; ++i) {
                 if (lastParams.textures[i]) {
                     lastParams.textures[i]->Release();
@@ -195,13 +225,24 @@ class FixedFunctionShader {
                 }
             }
 
-            // Store new texture references
             for (int i = 0; i < std::min((int)sk.activeStages, 6); ++i) {
                 device->GetTexture(i, &lastParams.textures[i]);
-                // Don't release here - we need to keep the reference for comparison
             }
+        }
 
-            valid = true;
+        // Debug counter - now with periodic logging
+        static void incrementCounters(bool material, bool texture, bool transform, bool lighting) {
+            totalDraws++;
+            if (material) materialUpdates++;
+            if (texture) textureUpdates++;
+            if (transform) transformUpdates++;
+            if (lighting) lightingUpdates++;
+
+            // Log every 1000 draw calls
+            if (totalDraws % 1000 == 0) {
+                LOG::logline("CACHE DEBUG: %d draws so far - %d material, %d texture, %d transform, %d lighting updates",
+                    totalDraws, materialUpdates, textureUpdates, transformUpdates, lightingUpdates);
+            }
         }
     };
 
@@ -230,6 +271,4 @@ public:
     static void updateLighting(float sunMult, float ambMult);
     static void renderMorrowind(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);
     static void release();
-    static void newFrame() { ParameterCache::newFrame(); }  // Public accessor for parameter cache
-    static void cleanupParameterCache() { ParameterCache::cleanup(); }  // Public cleanup accessor
 };

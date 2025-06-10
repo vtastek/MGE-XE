@@ -18,6 +18,7 @@ unordered_map<FixedFunctionShader::ShaderKey, ID3DXEffect*, FixedFunctionShader:
 FixedFunctionShader::ShaderLRU FixedFunctionShader::shaderLRU;
 ID3DXEffect* FixedFunctionShader::effectDefaultPurple;
 
+
 D3DXHANDLE FixedFunctionShader::ehWorld, FixedFunctionShader::ehWorldView;
 D3DXHANDLE FixedFunctionShader::ehVertexBlendState, FixedFunctionShader::ehVertexBlendPalette;
 D3DXHANDLE FixedFunctionShader::ehTex0, FixedFunctionShader::ehTex1, FixedFunctionShader::ehTex2, FixedFunctionShader::ehTex3, FixedFunctionShader::ehTex4, FixedFunctionShader::ehTex5;
@@ -32,9 +33,12 @@ float FixedFunctionShader::sunMultiplier, FixedFunctionShader::ambMultiplier;
 static string buildArgString(DWORD arg, const string& mask, const string& sampler);
 
 FixedFunctionShader::ParameterCache::CachedParams FixedFunctionShader::ParameterCache::lastParams = {};
-uint32_t FixedFunctionShader::ParameterCache::currentFrame = 0;
 bool FixedFunctionShader::ParameterCache::valid = false;
-
+int FixedFunctionShader::ParameterCache::totalDraws = 0;
+int FixedFunctionShader::ParameterCache::materialUpdates = 0;
+int FixedFunctionShader::ParameterCache::textureUpdates = 0;
+int FixedFunctionShader::ParameterCache::transformUpdates = 0;
+int FixedFunctionShader::ParameterCache::lightingUpdates = 0;
 
 bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
     device = d;
@@ -97,6 +101,8 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
         LOG::logline("-- Per-pixel shader precaching");
         precache();
     }
+
+    ParameterCache::init();
 
     return true;
 }
@@ -187,8 +193,11 @@ void FixedFunctionShader::updateLighting(float sunMult, float ambMult) {
 void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
     ID3DXEffect* effectFFE;
 
+
+
     // Check if state matches last used effect
     ShaderKey sk(rs, frs, lightrs);
+
 
     if (sk == shaderLRU.last_sk) {
         effectFFE = shaderLRU.effect;
@@ -207,15 +216,24 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
     }
 
 
+    bool needsMaterial = ParameterCache::needsMaterialUpdate(frs);
+    bool needsLighting = ParameterCache::needsLightingUpdate(lightrs);
+    bool needsTexture = ParameterCache::needsTextureUpdate(sk);
+    bool needsTransform = ParameterCache::needsTransformUpdate(rs);
 
-    if (ParameterCache::needsMaterialUpdate(frs)) {
+
+    ParameterCache::totalDraws++;
+
+    if (needsMaterial) {
+        ParameterCache::materialUpdates++;
         effectFFE->SetVector(ehMaterialDiffuse, (D3DXVECTOR4*)&frs->material.diffuse);
         effectFFE->SetVector(ehMaterialAmbient, (D3DXVECTOR4*)&frs->material.ambient);
         effectFFE->SetVector(ehMaterialEmissive, (D3DXVECTOR4*)&frs->material.emissive);
     }
 
     // Set up lighting
-    if (ParameterCache::needsLightingUpdate(lightrs)) {
+    if (needsLighting) {
+        ParameterCache::lightingUpdates++;
 
         const size_t MaxLights = 8;
         D3DXVECTOR4 bufferDiffuse[MaxLights];
@@ -336,21 +354,47 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
     }
 
     // Bump mapping state
+    static bool lastBumpState = false;
+    static float lastBumpMatrix[4] = { 0 };
+    static float lastBumpLumi[2] = { 0 };
+
     if (sk.usesBumpmap) {
         const FragmentState::Stage& bumpStage = frs->stage[sk.bumpmapStage];
-        effectFFE->SetFloatArray(ehBumpMatrix, &bumpStage.bumpEnvMat[0][0], 4);
-        effectFFE->SetFloatArray(ehBumpLumiScaleBias, &bumpStage.bumpLumiScale, 2);
+        if (!lastBumpState || memcmp(lastBumpMatrix, &bumpStage.bumpEnvMat[0][0], 16)) {
+            effectFFE->SetFloatArray(ehBumpMatrix, &bumpStage.bumpEnvMat[0][0], 4);
+            memcpy(lastBumpMatrix, &bumpStage.bumpEnvMat[0][0], 16);
+        }
+        if (!lastBumpState || memcmp(lastBumpLumi, &bumpStage.bumpLumiScale, 8)) {
+            effectFFE->SetFloatArray(ehBumpLumiScaleBias, &bumpStage.bumpLumiScale, 2);
+            memcpy(lastBumpLumi, &bumpStage.bumpLumiScale, 8);
+        }
+        lastBumpState = true;
+    }
+    else {
+        lastBumpState = false;
     }
 
     // Texgen texture matrix
+    static bool lastTexgenState = false;
+    static D3DXMATRIX lastTexgenMatrix;
+
     if (sk.usesTexgen) {
         D3DXMATRIX m;
         device->GetTransform((D3DTRANSFORMSTATETYPE)(D3DTS_TEXTURE0 + sk.texgenStage), &m);
-        effectFFE->SetMatrix(ehTexgenTransform, &m);
+        if (!lastTexgenState || memcmp(&lastTexgenMatrix, &m, sizeof(D3DXMATRIX))) {
+            effectFFE->SetMatrix(ehTexgenTransform, &m);
+            lastTexgenMatrix = m;
+        }
+        lastTexgenState = true;
+    }
+    else {
+        lastTexgenState = false;
     }
 
     // Copy texture bindings from fixed function pipe
-    if (ParameterCache::needsTextureUpdate(sk)) {
+    if (needsTexture) {
+        ParameterCache::textureUpdates++;
+
         const D3DXHANDLE ehIndex[] = { ehTex0, ehTex1, ehTex2, ehTex3, ehTex4, ehTex5 };
         for (int n = 0; n < std::min((int)sk.activeStages, 6); ++n) {
             IDirect3DBaseTexture9* tex;
@@ -361,7 +405,9 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
     }
 
     // Set common state and render
-    if (ParameterCache::needsTransformUpdate(rs)) {
+    if (needsTransform) {
+        ParameterCache::transformUpdates++;
+
         effectFFE->SetInt(ehVertexBlendState, rs->vertexBlendState);
         if (rs->vertexBlendState) {
             effectFFE->SetMatrixArray(ehVertexBlendPalette, rs->worldViewTransforms, 4);
@@ -370,6 +416,13 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
             effectFFE->SetMatrix(ehWorld, &rs->worldTransforms[0]);
             effectFFE->SetMatrix(ehWorldView, &rs->worldViewTransforms[0]);
         }
+    }
+
+    if(ParameterCache::totalDraws % 1000 == 0) {
+        LOG::logline("CACHE DEBUG: %d draws - %d material, %d texture, %d transform, %d lighting updates",
+            ParameterCache::totalDraws, ParameterCache::materialUpdates,
+            ParameterCache::textureUpdates, ParameterCache::transformUpdates,
+            ParameterCache::lightingUpdates);
     }
 
     ParameterCache::updateCache(rs, frs, lightrs, sk);

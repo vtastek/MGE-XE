@@ -53,6 +53,11 @@ MGEProxyDevice::MGEProxyDevice(IDirect3DDevice9* real, ProxyD3D* d3d) : ProxyDev
     Configuration.CameraEffects.zoomRate = 0;
     Configuration.CameraEffects.zoomRateTarget = 0;
 
+    memset(cachedSamplerState, 0, sizeof(cachedSamplerState));
+    memset(cachedTextures, 0, sizeof(cachedTextures));
+    memset(samplerStateValid, 0, sizeof(samplerStateValid));
+    memset(textureStateValid, 0, sizeof(textureStateValid));
+
     // Initialize state recorder to D3D defaults
     memset(&rs, 0, sizeof(rs));
     rs.zWrite = true;
@@ -428,10 +433,23 @@ HRESULT _stdcall MGEProxyDevice::SetTextureStageState(DWORD a, D3DTEXTURESTAGEST
     // Note that DX8 had sampling state bound to texture stages instead of samplers
     if (b == D3DTSS_MINFILTER) {
         DWORD filter = (c != D3DTEXF_NONE) ? Configuration.ScaleFilter : D3DTEXF_NONE;
-        return realDevice->SetSamplerState(a, D3DSAMP_MINFILTER, filter);
-    } else if (b == D3DTSS_MIPFILTER) {
+        // ONLY call SetSamplerState if it actually changed:
+        if (!samplerStateValid[a][D3DSAMP_MINFILTER] || cachedSamplerState[a][D3DSAMP_MINFILTER] != filter) {
+            cachedSamplerState[a][D3DSAMP_MINFILTER] = filter;
+            samplerStateValid[a][D3DSAMP_MINFILTER] = true;
+            return realDevice->SetSamplerState(a, D3DSAMP_MINFILTER, filter);
+        }
+        return D3D_OK;
+    }
+    else if (b == D3DTSS_MIPFILTER) {
         DWORD filter = (c != D3DTEXF_NONE) ? D3DTEXF_LINEAR : D3DTEXF_NONE;
-        return realDevice->SetSamplerState(a, D3DSAMP_MIPFILTER, filter);
+        // ONLY call SetSamplerState if it actually changed:
+        if (!samplerStateValid[a][D3DSAMP_MIPFILTER] || cachedSamplerState[a][D3DSAMP_MIPFILTER] != filter) {
+            cachedSamplerState[a][D3DSAMP_MIPFILTER] = filter;
+            samplerStateValid[a][D3DSAMP_MIPFILTER] = true;
+            return realDevice->SetSamplerState(a, D3DSAMP_MIPFILTER, filter);
+        }
+        return D3D_OK;
     }
 
     return ProxyDevice::SetTextureStageState(a, b, c);

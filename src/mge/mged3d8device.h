@@ -1,10 +1,14 @@
 #pragma once
-
 #include "proxydx/d3d8device.h"
 
-
-
 class MGEProxyDevice : public ProxyDevice {
+private:
+    // Cache sampler and texture state to avoid redundant DXVK descriptor set allocations
+    DWORD cachedSamplerState[8][16];  // 8 stages, up to 16 sampler states
+    IDirect3DBaseTexture9* cachedTextures[8];
+    bool samplerStateValid[8][16];
+    bool textureStateValid[8];
+
 public:
     MGEProxyDevice(IDirect3DDevice9* real, ProxyD3D* d3d);
     ULONG _stdcall Release(void);
