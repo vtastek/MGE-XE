@@ -439,7 +439,7 @@ bool PostShaders::initBuffers() {
 
     // Format: Post-transform position, texture xy, normalized device xy
     D3DXVECTOR4* v;
-    vbPost->Lock(0, 0, (void**)&v, 0);
+    vbPost->Lock(0, 0, (void**)&v, D3DLOCK_DISCARD);
     v[0] = D3DXVECTOR4(-0.5f, h - 0.5f, 0.0f, 1.0f);
     v[1] = D3DXVECTOR4(0, 1, -1, -1);
     v[2] = D3DXVECTOR4(-0.5f, -0.5f, 0.0f, 1.0f);
@@ -486,47 +486,87 @@ void PostShaders::release() {
     surfReadback->Release();
 }
 
-// evalAdaptHDR - Downsample and readback a frame to get an averaged luminance for HDR
+int hdrWaitFrames = 0;
+static const int HDR_WAIT_FRAME_COUNT = 1;
+PostShaders::HDRReadbackState hdrState = PostShaders::HDR_IDLE;
+
+// Store the last read luminance value
+float lastLuminance = 0.5f;  // Default middle gray
+
 void PostShaders::evalAdaptHDR(IDirect3DSurface9* source, int environmentFlags, float dt) {
-    D3DLOCKED_RECT lock;
-    RECT rectSrc = { 0, 0, 0, 0 };
-    RECT rectDownsample = { 0, 0, 0, 0 };
-    float r, g, b;
+    // Handle the readback state machine
+    switch (hdrState) {
+    case HDR_IDLE:
+        // Start new downsample operation
+    {
+        RECT rectDownsample = { 0, 0, 512, 512 };
+        device->StretchRect(source, 0, doublebuffer.sinkSurface(), &rectDownsample, D3DTEXF_LINEAR);
+        doublebuffer.cycle();
 
-    // Read resolved data from last frame
-    surfReadback->LockRect(&lock, NULL, D3DLOCK_READONLY);
-    BYTE* data = (BYTE*)lock.pBits;
-    r = data[0] / 255.0f;
-    g = data[1] / 255.0f;
-    b = data[2] / 255.0f;
-    surfReadback->UnlockRect();
+        // Continue downsampling to 1x1
+        while (rectDownsample.right > 1 || rectDownsample.bottom > 1) {
+            RECT rectSrc = rectDownsample;
+            rectDownsample.right = std::max(1L, rectSrc.right >> 1);
+            rectDownsample.bottom = std::max(1L, rectSrc.bottom >> 1);
+            device->StretchRect(doublebuffer.sourceSurface(), &rectSrc, doublebuffer.sinkSurface(), &rectDownsample, D3DTEXF_LINEAR);
+            doublebuffer.cycle();
+        }
 
-    // Convert to environment-weighted luminance and average over time
-    // x = normalized weighted lumi, y = unweighted lumi, z = unnormalized weighted lumi, w = immediate unweighted lumi
+        // Queue the readback
+        RECT onePixel = { 0, 0, 1, 1 };
+        device->StretchRect(doublebuffer.sourceSurface(), &onePixel, surfReadqueue, 0, D3DTEXF_NONE);
+        device->GetRenderTargetData(surfReadqueue, surfReadback);
+
+        // Move to waiting state
+        hdrState = HDR_DOWNSAMPLING;
+        hdrWaitFrames = 0;
+    }
+    break;
+
+    case HDR_DOWNSAMPLING:
+        // Just count frames while GPU works
+        hdrWaitFrames++;
+        if (hdrWaitFrames >= HDR_WAIT_FRAME_COUNT) {
+            hdrState = HDR_WAITING;
+        }
+        break;
+
+    case HDR_WAITING:
+        // Check if data is ready (one more frame after wait period)
+        hdrState = HDR_READY_TO_READ;
+        break;
+
+    case HDR_READY_TO_READ:
+        // Now safe to read without GPU sync
+    {
+        D3DLOCKED_RECT lock;
+        if (SUCCEEDED(surfReadback->LockRect(&lock, NULL, D3DLOCK_READONLY))) {
+            BYTE* data = (BYTE*)lock.pBits;
+            float r = data[2] / 255.0f;
+            float g = data[1] / 255.0f;
+            float b = data[0] / 255.0f;
+
+            // Update the stored luminance
+            lastLuminance = 0.27f * r + 0.67f * g + 0.06f * b;
+
+            surfReadback->UnlockRect();
+        }
+
+        // Go back to idle to start next cycle
+        hdrState = HDR_IDLE;
+    }
+    break;
+    }
+
+    // ALWAYS update adaptation values every frame using the last known luminance
     float environmentScaling = (environmentFlags & 6) ? 2.5f : 1.0f;
     float lambda = exp(-dt / Configuration.HDRReactionSpeed);
-    adaptPoint.w = 0.27f*r + 0.67f*g + 0.06f*b;
+
+    // Use lastLuminance instead of reading r,g,b every frame
+    adaptPoint.w = lastLuminance;
     adaptPoint.z = adaptPoint.w * environmentScaling + (adaptPoint.z - adaptPoint.w * environmentScaling) * lambda;
     adaptPoint.y = adaptPoint.w + (adaptPoint.y - adaptPoint.w) * lambda;
     adaptPoint.x = adaptPoint.z / environmentScaling;
-
-    // Shrink this frame down to a 1x1 texture
-    rectDownsample.right = 512;
-    rectDownsample.bottom = 512;
-    device->StretchRect(source, 0, doublebuffer.sinkSurface(), &rectDownsample, D3DTEXF_LINEAR);
-    doublebuffer.cycle();
-
-    while (rectDownsample.right > 1 || rectDownsample.bottom > 1) {
-        rectSrc = rectDownsample;
-        rectDownsample.right = std::max(1L, rectSrc.right >> 1);
-        rectDownsample.bottom = std::max(1L, rectSrc.bottom >> 1);
-        device->StretchRect(doublebuffer.sourceSurface(), &rectSrc, doublebuffer.sinkSurface(), &rectDownsample, D3DTEXF_LINEAR);
-        doublebuffer.cycle();
-    }
-
-    // Copy and queue readback
-    device->StretchRect(doublebuffer.sourceSurface(), &rectDownsample, surfReadqueue, 0, D3DTEXF_NONE);
-    device->GetRenderTargetData(surfReadqueue, surfReadback);
 }
 
 // shaderTime - Applies all post processing shaders for the current frame
