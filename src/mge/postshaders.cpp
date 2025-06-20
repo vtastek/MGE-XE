@@ -8,6 +8,9 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <thread>
+#include <atomic>
+
 
 
 
@@ -21,6 +24,8 @@ const char* effectVariableList[] = {
 
 const int effectVariableCount = sizeof(effectVariableList) / sizeof(const char*);
 const char* compatibleShader = "MGE XE 0";
+std::thread PostShaders::shaderLoadThread;
+std::atomic<bool> PostShaders::isLoading{ false };
 
 const DWORD fvfPost = D3DFVF_XYZRHW | D3DFVF_TEX2;  // XYZRHW -> skips vertex shader
 const DWORD fvfBlend = D3DFVF_XYZW | D3DFVF_TEX2;
@@ -48,7 +53,7 @@ bool PostShaders::init(IDirect3DDevice9* realDevice) {
 
     if (shaders.empty()) {
         // Read shader config on first load
-        if (!initShaderChain()) {
+        if (!initShaderChainThreaded()) {
             return false;
         }
     }
@@ -65,69 +70,92 @@ static const D3DXMACRO macroExpFog = { "USE_EXPFOG", "" };
 static const D3DXMACRO macroTerminator = { 0, 0 };
 
 // initShaderChain - Load and prepare all shaders, ignoring invalid shaders
-bool PostShaders::initShaderChain() {
-    char path[MAX_PATH];
-
-    // Set shader defines corresponding to required features
-    features.clear();
-    if (Configuration.MGEFlags & EXP_FOG) {
-        features.push_back(macroExpFog);
+bool PostShaders::initShaderChainThreaded() {
+    if (isLoading.load()) {
+        return true; // Already loading
     }
-    features.push_back(macroTerminator);
 
-    for (const char* p = Configuration.ShaderChain; *p;  p += strlen(p) + 1) {
-        WIN32_FILE_ATTRIBUTE_DATA fileAttrs;
-        ID3DXEffect* newEffect;
-        ID3DXBuffer* errors;
+    isLoading.store(true);
 
-        std::snprintf(path, sizeof(path), "Data Files\\shaders\\XEshaders\\%s.fx", p);
-        if (!GetFileAttributesEx(path, GetFileExInfoStandard, &fileAttrs)) {
-            LOG::logline("!! Post shader %s missing", path);
-            continue;
+    // Start loading shaders in background thread
+    shaderLoadThread = std::thread([]() {
+        char path[MAX_PATH];
+
+        // Set shader defines
+        features.clear();
+        if (Configuration.MGEFlags & EXP_FOG) {
+            features.push_back(macroExpFog);
+        }
+        features.push_back(macroTerminator);
+
+        for (const char* p = Configuration.ShaderChain; *p; p += strlen(p) + 1) {
+            WIN32_FILE_ATTRIBUTE_DATA fileAttrs;
+            ID3DXEffect* newEffect;
+            ID3DXBuffer* errors;
+
+            std::snprintf(path, sizeof(path), "Data Files\\shaders\\XEshaders\\%s.fx", p);
+            if (!GetFileAttributesEx(path, GetFileExInfoStandard, &fileAttrs)) {
+                LOG::logline("!! Post shader %s missing", path);
+                continue;
+            }
+
+            HRESULT hr = D3DXCreateEffectFromFile(device, path, &*features.begin(), 0,
+                D3DXFX_LARGEADDRESSAWARE, 0, &newEffect, &errors);
+
+            if (hr == D3D_OK) {
+                if (checkShaderVersion(newEffect)) {
+                    auto shader = std::make_unique<MGEShader>();
+                    shader->effect = newEffect;
+                    shader->name = p;
+                    shader->timestamp = fileAttrs.ftLastWriteTime.dwLowDateTime;
+                    shader->enabled = true;
+
+                    initShader(&*shader);
+                    loadShaderDependencies(&*shader);
+
+                    shaders.push_back(std::move(shader));
+                    LOG::logline("-- Post shader %s loaded", path);
+                }
+                else {
+                    newEffect->Release();
+                    LOG::logline("## Post shader %s is not version compatible, not loaded", path);
+                }
+            }
+            else {
+                LOG::logline("!! Post shader %s failed to load/compile", path);
+                if (errors) {
+                    LOG::write("!! Shader compile errors:\n");
+                    LOG::write(reinterpret_cast<const char*>(errors->GetBufferPointer()));
+                    LOG::write("\n");
+                    errors->Release();
+                }
+                LOG::flush();
+            }
         }
 
-        HRESULT hr = D3DXCreateEffectFromFile(device, path, &*features.begin(), 0, D3DXFX_LARGEADDRESSAWARE, 0, &newEffect, &errors);
+        orderShaders();
 
-        if (hr == D3D_OK) {
-            if (checkShaderVersion(newEffect)) {
-                auto shader = std::make_unique<MGEShader>();
-                shader->effect = newEffect;
-                shader->name = p;
-                shader->timestamp = fileAttrs.ftLastWriteTime.dwLowDateTime;
-                shader->enabled = true;
+        LOG::logline("-- Shader chain indicates HDR %s", (Configuration.MGEFlags & USE_HDR) ? "On" : "Off");
 
-                initShader(&*shader);
-                loadShaderDependencies(&*shader);
-
-                shaders.push_back(std::move(shader));
-                LOG::logline("-- Post shader %s loaded", path);
-            } else {
-                newEffect->Release();
-                LOG::logline("## Post shader %s is not version compatible, not loaded", path);
-            }
-        } else {
-            LOG::logline("!! Post shader %s failed to load/compile", path);
-            if (errors) {
-                LOG::write("!! Shader compile errors:\n");
-                LOG::write(reinterpret_cast<const char*>(errors->GetBufferPointer()));
-                LOG::write("\n");
-                errors->Release();
-            }
-            LOG::flush();
+        if (Configuration.MGEFlags & NO_MW_SUNGLARE) {
+            MWBridge::get()->disableSunglare();
+            LOG::logline("-- Shader chain replaces standard Morrowind sun glare");
         }
-    }
 
-    orderShaders();
+        isLoading.store(false);
+        LOG::logline("-- Post-shader loading completed");
+        });
 
-    LOG::logline("-- Shader chain indicates HDR %s", (Configuration.MGEFlags & USE_HDR) ? "On" : "Off");
-
-    if (Configuration.MGEFlags & NO_MW_SUNGLARE) {
-        MWBridge::get()->disableSunglare();
-        LOG::logline("-- Shader chain replaces standard Morrowind sun glare");
-    }
-
+    shaderLoadThread.detach(); // Let it run in background
     return true;
 }
+
+void PostShaders::waitForShaderLoading() {
+    while (isLoading.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
 
 // loadNewShader - Add a new shader to the chain
 bool PostShaders::loadNewShader(const char* name) {
@@ -571,6 +599,11 @@ void PostShaders::evalAdaptHDR(IDirect3DSurface9* source, int environmentFlags, 
 
 // shaderTime - Applies all post processing shaders for the current frame
 void PostShaders::shaderTime(MGEShaderUpdateFunc updateVarsFunc, int environmentFlags, float frameTime) {
+
+    if (isLoading.load()) {
+        return; // Skip rendering this frame if still loading
+    }
+
     IDirect3DSurface9* backbuffer, *depthstencil;
 
     // Turn off depth stencil use
