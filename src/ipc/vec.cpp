@@ -155,7 +155,7 @@ namespace IPC {
 
 		auto subIndex = m_index % m_windowSize;
 		auto window = m_index / m_windowSize;
-		m_element = reinterpret_cast<T*>(reinterpret_cast<char*>(m_element) + m_windowBytes * window) + subIndex;
+		m_element = reinterpret_cast<T*>(m_source->m_buffer + m_windowBytes * window) + subIndex;
 		m_prevWindow = window * m_windowSize;
 		m_nextWindow = m_prevWindow + m_windowSize;
 
