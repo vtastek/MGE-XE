@@ -97,31 +97,43 @@ std::vector<const RenderMesh*>::iterator StlVector::end() {
 // ----------------------
 // IpcClientVector
 // ----------------------
-IpcClientVector::IpcClientVector() : m_view() {}
-IpcClientVector::IpcClientVector(const IPC::VecView<RenderMesh>& view) : m_view(view) {
+IpcClientVector::IpcClientVector() : m_view(), m_isAtBeginning(true) {}
+IpcClientVector::IpcClientVector(const IPC::VecView<RenderMesh>& view) : m_view(view), m_isAtBeginning(true) {
 	restart();
 }
-IpcClientVector::IpcClientVector(IPC::VecView<RenderMesh>&& view) : m_view(view) {
+IpcClientVector::IpcClientVector(IPC::VecView<RenderMesh>&& view) : m_view(view), m_isAtBeginning(true) {
 	restart();
 }
 
 IpcClientVector& IpcClientVector::operator=(const IpcClientVector& other) {
 	m_view = other.m_view;
+	m_isAtBeginning = other.m_isAtBeginning;
 	return *this;
 }
 
 void IpcClientVector::restart() {
 	m_view.set_index(0);
+	m_isAtBeginning = true;
 }
 
 const RenderMesh& IpcClientVector::first() {
+	m_isAtBeginning = true;
 	return m_view.front();
 }
 
 const RenderMesh& IpcClientVector::next() {
-	auto& elem = *m_view;
-	++m_view;
-	return elem;
+	// the server vector iterator gets a pointer to the current element, increments the iterator,
+	// and then returns the pointer to the original element. but we can't do that here because if
+	// the current element is the last element in the window, then incrementing the iterator will
+	// cause the window to be re-mapped, and our pointer will no longer point to the element we
+	// wanted. so we have to always return a pointer to the current element, not a past/future
+	// element.
+	if (m_isAtBeginning) {
+		m_isAtBeginning = false;
+		return m_view.front();
+	} else {
+		return *++m_view;
+	}
 }
 
 void IpcClientVector::start_write() {
