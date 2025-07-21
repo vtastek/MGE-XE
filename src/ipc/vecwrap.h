@@ -54,6 +54,7 @@ public:
 
 class IpcClientVector {
 	IPC::VecView<RenderMesh> m_view;
+	bool m_isAtBeginning;
 
 public:
 	IpcClientVector();
