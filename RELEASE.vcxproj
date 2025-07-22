@@ -97,7 +97,8 @@
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
-    <PostBuildEvent>
+    <PostBuildEvent />
+    <PreBuildEvent>
       <Command>robocopy "$(SolutionDir)assets" "$(OutDir)." /E
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\mgeHost64.exe" "$(OutDir)"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\MGEXEgui.exe" "$(OutDir)"
@@ -107,7 +108,7 @@ copy "$(SolutionDir)bin\MSVC-$(Configuration)\MGEfuncs.dll" "$(OutDir)mge3"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\SlimDX.dll" "$(OutDir)"
 "$(SolutionDir)3rdparty\4gb_patch\4gb_patch.exe" "$(OutDir)MGEXEgui.exe"
 del "$(OutDir)MGEXEgui.exe.Backup"</Command>
-    </PostBuildEvent>
+    </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <ClCompile>
@@ -124,7 +125,8 @@ del "$(OutDir)MGEXEgui.exe.Backup"</Command>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
-    <PostBuildEvent>
+    <PostBuildEvent />
+    <PreBuildEvent>
       <Command>robocopy "$(SolutionDir)assets" "$(OutDir)." /E
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\mgeHost64.exe" "$(OutDir)"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\MGEXEgui.exe" "$(OutDir)"
@@ -134,7 +136,7 @@ copy "$(SolutionDir)bin\MSVC-$(Configuration)\MGEfuncs.dll" "$(OutDir)mge3"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\SlimDX.dll" "$(OutDir)"
 "$(SolutionDir)3rdparty\4gb_patch\4gb_patch.exe" "$(OutDir)MGEXEgui.exe"
 del "$(OutDir)MGEXEgui.exe.Backup"</Command>
-    </PostBuildEvent>
+    </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
@@ -147,7 +149,8 @@ del "$(OutDir)MGEXEgui.exe.Backup"</Command>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
-    <PostBuildEvent>
+    <PostBuildEvent />
+    <PreBuildEvent>
       <Command>robocopy "$(SolutionDir)assets" "$(OutDir)." /E
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\mgeHost64.exe" "$(OutDir)"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\MGEXEgui.exe" "$(OutDir)"
@@ -157,7 +160,7 @@ copy "$(SolutionDir)bin\MSVC-$(Configuration)\MGEfuncs.dll" "$(OutDir)mge3"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\SlimDX.dll" "$(OutDir)"
 "$(SolutionDir)3rdparty\4gb_patch\4gb_patch.exe" "$(OutDir)MGEXEgui.exe"
 del "$(OutDir)MGEXEgui.exe.Backup"</Command>
-    </PostBuildEvent>
+    </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
@@ -174,7 +177,8 @@ del "$(OutDir)MGEXEgui.exe.Backup"</Command>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
-    <PostBuildEvent>
+    <PostBuildEvent />
+    <PreBuildEvent>
       <Command>robocopy "$(SolutionDir)assets" "$(OutDir)." /E
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\mgeHost64.exe" "$(OutDir)"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\MGEXEgui.exe" "$(OutDir)"
@@ -184,7 +188,7 @@ copy "$(SolutionDir)bin\MSVC-$(Configuration)\MGEfuncs.dll" "$(OutDir)mge3"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\SlimDX.dll" "$(OutDir)"
 "$(SolutionDir)3rdparty\4gb_patch\4gb_patch.exe" "$(OutDir)MGEXEgui.exe"
 del "$(OutDir)MGEXEgui.exe.Backup"</Command>
-    </PostBuildEvent>
+    </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
   </ItemGroup>
