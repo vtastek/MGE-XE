@@ -105,7 +105,8 @@ copy "$(SolutionDir)bin\MSVC-$(Configuration)\d3d8.dll" "$(OutDir)"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\dinput8.dll" "$(OutDir)"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\MGEfuncs.dll" "$(OutDir)mge3"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\SlimDX.dll" "$(OutDir)"
-"$(SolutionDir)3rdparty\4gb_patch\4gb_patch.exe" "$(OutDir)MGEXEgui.exe"</Command>
+"$(SolutionDir)3rdparty\4gb_patch\4gb_patch.exe" "$(OutDir)MGEXEgui.exe"
+del "$(OutDir)MGEXEgui.exe.Backup"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
@@ -131,7 +132,8 @@ copy "$(SolutionDir)bin\MSVC-$(Configuration)\d3d8.dll" "$(OutDir)"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\dinput8.dll" "$(OutDir)"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\MGEfuncs.dll" "$(OutDir)mge3"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\SlimDX.dll" "$(OutDir)"
-"$(SolutionDir)3rdparty\4gb_patch\4gb_patch.exe" "$(OutDir)MGEXEgui.exe"</Command>
+"$(SolutionDir)3rdparty\4gb_patch\4gb_patch.exe" "$(OutDir)MGEXEgui.exe"
+del "$(OutDir)MGEXEgui.exe.Backup"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -153,7 +155,8 @@ copy "$(SolutionDir)bin\MSVC-$(Configuration)\d3d8.dll" "$(OutDir)"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\dinput8.dll" "$(OutDir)"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\MGEfuncs.dll" "$(OutDir)mge3"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\SlimDX.dll" "$(OutDir)"
-3rdparty\4gb_patch\4gb_patch.exe "$(SolutionDir)bin\MSVC-$(Configuration)\MGEXEgui.exe"</Command>
+"$(SolutionDir)3rdparty\4gb_patch\4gb_patch.exe" "$(OutDir)MGEXEgui.exe"
+del "$(OutDir)MGEXEgui.exe.Backup"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -179,7 +182,8 @@ copy "$(SolutionDir)bin\MSVC-$(Configuration)\d3d8.dll" "$(OutDir)"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\dinput8.dll" "$(OutDir)"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\MGEfuncs.dll" "$(OutDir)mge3"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\SlimDX.dll" "$(OutDir)"
-3rdparty\4gb_patch\4gb_patch.exe "$(SolutionDir)bin\MSVC-$(Configuration)\MGEXEgui.exe"</Command>
+"$(SolutionDir)3rdparty\4gb_patch\4gb_patch.exe" "$(OutDir)MGEXEgui.exe"
+del "$(OutDir)MGEXEgui.exe.Backup"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
