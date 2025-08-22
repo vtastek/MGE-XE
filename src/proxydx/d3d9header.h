@@ -8,6 +8,7 @@
 
 #include <d3d9.h>
 #include <d3dx9.h>
+#include <d3dcompiler.h>
 
 // Remove annoying defines from windows.h
 #undef near
