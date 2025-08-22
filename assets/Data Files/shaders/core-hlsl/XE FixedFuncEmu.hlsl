@@ -5,7 +5,7 @@
 //------------------------------------------------------------
 // Shared Variables
 
-// Matrices
+// Matrices  
 matrix proj;
 matrix worldview;
 matrix vertexBlendPalette[4];
@@ -13,19 +13,19 @@ float4 vertexBlendState;
 
 // Materials
 float4 materialDiffuse, materialAmbient, materialEmissive;
+float4 shadingMode; // .z = materialMode (1=none, 2=diffamb, 3=emissive)
 
 // Lighting - Basic
 float3 lightSceneAmbient;
 float3 lightSunDiffuse;
 float3 lightSunDirection;
 
-// Lighting - Point lights (arrays)
+// Lighting - Point lights (scattered arrays, same as C++ buffer format)
 float3 lightDiffuse[8];
-float4 lightPosition[6];
-
-// Individual light constants for C++ compatibility
-float3 lightDiffuse0, lightDiffuse1;
-float3 lightPosition0, lightPosition1;
+float lightPosition[24]; // 3*8 lights: [x0..x7, y0..y7, z0..z7] 
+float lightAmbient[8];
+float4 lightFalloffQuadratic[2];
+float lightFalloffConstant;
 
 // Fog
 float3 fogColNear;
@@ -52,13 +52,14 @@ struct VS_OUTPUT {
     float3 normal : TEXCOORD0;
     float4 color : COLOR0;
     float2 texcoord : TEXCOORD1;
+    float3 worldpos : TEXCOORD2;
     float fog : FOG;
 };
 
 //------------------------------------------------------------
 // Helper Functions
 
-// Skinning function
+// Skinning function from XE Common.hlsl
 float4 skin(float4 pos, float4 blend) {
     float blendState = vertexBlendState.x;
     
@@ -70,7 +71,7 @@ float4 skin(float4 pos, float4 blend) {
     else if(blendState == 3)
         blend.w = 1 - (blend.x + blend.y + blend.z);
     
-    // Weighted blend of matrices
+    // Weighted blend of matrices - ROW MAJOR (pos * matrix)
     float4 viewpos = mul(pos, vertexBlendPalette[0]) * blend.x;
     
     if(blendState >= 1)
@@ -115,6 +116,7 @@ VS_OUTPUT vs_main(VS_INPUT input) {
     output.normal = normalize(normal);
     output.color = input.color;
     output.texcoord = input.texcoord;
+    output.worldpos = viewpos.xyz;
     
     // Simple fog
     float dist = length(viewpos);
@@ -129,19 +131,59 @@ VS_OUTPUT vs_main(VS_INPUT input) {
 float4 ps_main(VS_OUTPUT input) : COLOR {
     float3 normal = normalize(input.normal);
     
-    // Standard morrowind lighting: sun and ambient (matching Effect shader)
-    float3 d = lightSunDiffuse * saturate(dot(normal, -lightSunDirection));
-    float3 a = lightSceneAmbient;
+    // Basic lighting calculation
+    float3 lighting = lightSceneAmbient;
     
-    // Material - match Effect shader vertexMaterialDiffAmb logic
-    float4 diffuse = float4(input.color.rgb * (d + a) + materialEmissive.rgb, input.color.a);
+    // Sun light
+    float sunDot = saturate(dot(normal, -lightSunDirection));
+    lighting += lightSunDiffuse * sunDot;
     
-    // Texturing - multiply diffuse by texture (standard approach)
+    // Point lights (using scattered array format like Effect shader)
+    float3 pointLightContribution = float3(0, 0, 0);
+    [loop]
+    for (int i = 0; i < 8; i++) {
+        // Access scattered position arrays: [x0..x7, y0..y7, z0..z7]
+        float3 lightPos = float3(lightPosition[i], lightPosition[i + 8], lightPosition[i + 16]);
+        float3 L = lightPos - input.worldpos;
+        
+        float distSq = dot(L, L);
+        float dist = sqrt(distSq);
+        L = L / dist;
+        
+        float NdotL = saturate(dot(normal, L));
+        
+        // Attenuation using Effect shader approach (quadratic + constant only)
+        int group = i / 4;
+        int index = i % 4;
+        float attenuation = 1.0 / (lightFalloffQuadratic[group][index] * distSq + lightFalloffConstant);
+        
+        // Add diffuse and ambient components like Effect shader
+        pointLightContribution += (lightDiffuse[i] * NdotL + lightAmbient[i]) * attenuation;
+    }
+    
+    lighting += pointLightContribution;
+    
+    // Sample texture
     float4 texColor = tex2D(sampTex0, input.texcoord);
+    
+    // Material calculation (exact copy from debug shader)
+    float isMode2 = step(1.5, shadingMode.z) * (1 - step(2.5, shadingMode.z));
+    float isMode3 = step(2.5, shadingMode.z);
+    
+    float3 effectiveDiffuse = lerp(materialDiffuse.rgb, input.color.rgb, isMode2);
+    float3 effectiveEmissive = lerp(materialEmissive.rgb, input.color.rgb, isMode3);
+    float effectiveAlpha = lerp(materialDiffuse.a, input.color.a, isMode2);
+    
+    float3 litColor = effectiveDiffuse * lighting;
+    litColor += effectiveEmissive;
+    
+    float4 diffuse = float4(litColor, effectiveAlpha);
+    
+    // Apply texture
     float4 c = diffuse * texColor;
     
-    // Fog - match Effect shader
-    c.rgb = lerp(fogColNear, c.rgb, input.fog);
+    // Apply fog
+    // c.rgb = lerp(fogColNear, c.rgb, input.fog);
     
     return c;
 }

@@ -982,7 +982,6 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         D3DXHANDLE hLightSunDirection = hlslShader.psConstantTable->GetConstantByName(NULL, "lightSunDirection");
         if (hLightSunDirection) {
             hlslShader.psConstantTable->SetFloatArray(device, hLightSunDirection, (const float*)&sunDirection, 3);
-            LOG::logline("++ Set lightSunDirection: %.2f, %.2f, %.2f", sunDirection.x, sunDirection.y, sunDirection.z);
         } else {
             LOG::logline("!! lightSunDirection constant not found in pixel shader");
         }
@@ -990,7 +989,6 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         D3DXHANDLE hLightSunDiffuse = hlslShader.psConstantTable->GetConstantByName(NULL, "lightSunDiffuse");
         if (hLightSunDiffuse) {
             hlslShader.psConstantTable->SetFloatArray(device, hLightSunDiffuse, (const float*)&sunDiffuse, 3);
-            LOG::logline("++ Set lightSunDiffuse: %.2f, %.2f, %.2f", sunDiffuse.r, sunDiffuse.g, sunDiffuse.b);
         } else {
             LOG::logline("!! lightSunDiffuse constant not found in pixel shader");
         }
@@ -998,59 +996,57 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         D3DXHANDLE hLightSceneAmbient = hlslShader.psConstantTable->GetConstantByName(NULL, "lightSceneAmbient");
         if (hLightSceneAmbient) {
             hlslShader.psConstantTable->SetFloatArray(device, hLightSceneAmbient, (const float*)&ambient, 3);
-            LOG::logline("++ Set lightSceneAmbient: %.2f, %.2f, %.2f", ambient.r, ambient.g, ambient.b);
         } else {
             LOG::logline("!! lightSceneAmbient constant not found in pixel shader");
         }
         
-        // Set individual point light constants for simplified shader
-        D3DXHANDLE hLightDiffuse0 = hlslShader.vsConstantTable->GetConstantByName(NULL, "lightDiffuse0");
-        if (hLightDiffuse0 && pointLightCount > 0) {
-            hlslShader.vsConstantTable->SetFloatArray(device, hLightDiffuse0, (float*)&bufferDiffuse[0], 3);
-            LOG::logline("++ Set lightDiffuse0: %.2f, %.2f, %.2f", bufferDiffuse[0].x, bufferDiffuse[0].y, bufferDiffuse[0].z);
+        // Set light arrays in pixel shader (same as Effect shader approach)
+        D3DXHANDLE hLightDiffuse = hlslShader.psConstantTable->GetConstantByName(NULL, "lightDiffuse");
+        if (hLightDiffuse) {
+            hlslShader.psConstantTable->SetVectorArray(device, hLightDiffuse, bufferDiffuse, MaxLights);
         } else {
-            LOG::logline("!! lightDiffuse0 constant not found in vertex shader");
+            LOG::logline("!! lightDiffuse array constant not found in pixel shader");
         }
         
-        D3DXHANDLE hLightDiffuse1 = hlslShader.vsConstantTable->GetConstantByName(NULL, "lightDiffuse1");
-        if (hLightDiffuse1 && pointLightCount > 1) {
-            hlslShader.vsConstantTable->SetFloatArray(device, hLightDiffuse1, (float*)&bufferDiffuse[1], 3);
-            LOG::logline("++ Set lightDiffuse1: %.2f, %.2f, %.2f", bufferDiffuse[1].x, bufferDiffuse[1].y, bufferDiffuse[1].z);
+        D3DXHANDLE hLightPosition = hlslShader.psConstantTable->GetConstantByName(NULL, "lightPosition");
+        if (hLightPosition) {
+            hlslShader.psConstantTable->SetFloatArray(device, hLightPosition, bufferPosition, 3 * MaxLights);
         } else {
-            LOG::logline("!! lightDiffuse1 constant not found in vertex shader");
+            LOG::logline("!! lightPosition array constant not found in pixel shader");
         }
         
-        D3DXHANDLE hLightPosition0 = hlslShader.vsConstantTable->GetConstantByName(NULL, "lightPosition0");
-        if (hLightPosition0 && pointLightCount > 0) {
-            float lightPos0[3] = {bufferPosition[0], bufferPosition[MaxLights], bufferPosition[2*MaxLights]};
-            hlslShader.vsConstantTable->SetFloatArray(device, hLightPosition0, lightPos0, 3);
-            LOG::logline("++ Set lightPosition0: %.2f, %.2f, %.2f", lightPos0[0], lightPos0[1], lightPos0[2]);
+        // Set light ambient array
+        D3DXHANDLE hLightAmbient = hlslShader.psConstantTable->GetConstantByName(NULL, "lightAmbient");
+        if (hLightAmbient) {
+            hlslShader.psConstantTable->SetFloatArray(device, hLightAmbient, bufferAmbient, MaxLights);
         } else {
-            LOG::logline("!! lightPosition0 constant not found in vertex shader");
+            LOG::logline("!! lightAmbient array constant not found in pixel shader");
         }
         
-        D3DXHANDLE hLightPosition1 = hlslShader.vsConstantTable->GetConstantByName(NULL, "lightPosition1");
-        if (hLightPosition1 && pointLightCount > 1) {
-            float lightPos1[3] = {bufferPosition[1], bufferPosition[MaxLights+1], bufferPosition[2*MaxLights+1]};
-            hlslShader.vsConstantTable->SetFloatArray(device, hLightPosition1, lightPos1, 3);
-            LOG::logline("++ Set lightPosition1: %.2f, %.2f, %.2f", lightPos1[0], lightPos1[1], lightPos1[2]);
-        } else {
-            LOG::logline("!! lightPosition1 constant not found in vertex shader");
-        }
-        
-        D3DXHANDLE hLightFalloffQuadratic = hlslShader.vsConstantTable->GetConstantByName(NULL, "lightFalloffQuadratic");
+        // Set falloff constants using Effect shader approach (quadratic + constant only)
+        D3DXHANDLE hLightFalloffQuadratic = hlslShader.psConstantTable->GetConstantByName(NULL, "lightFalloffQuadratic");
         if (hLightFalloffQuadratic) {
-            hlslShader.vsConstantTable->SetFloatArray(device, hLightFalloffQuadratic, bufferFalloffQuadratic, MaxLights);
+            // Pack quadratic falloffs into 2 float4 vectors (8 lights total, 4 per vector)
+            D3DXVECTOR4 quadraticData[2];
+            for (int i = 0; i < 4; i++) {
+                quadraticData[0][i] = (i < pointLightCount) ? bufferFalloffQuadratic[i] : 0.0f;
+                quadraticData[1][i] = (i + 4 < pointLightCount) ? bufferFalloffQuadratic[i + 4] : 0.0f;
+            }
+            hlslShader.psConstantTable->SetVectorArray(device, hLightFalloffQuadratic, quadraticData, 2);
         }
         
-        D3DXHANDLE hLightFalloffLinear = hlslShader.vsConstantTable->GetConstantByName(NULL, "lightFalloffLinear");
-        if (hLightFalloffLinear) {
-            hlslShader.vsConstantTable->SetFloatArray(device, hLightFalloffLinear, bufferFalloffLinear, MaxLights);
-        }
-        
-        D3DXHANDLE hLightFalloffConstant = hlslShader.vsConstantTable->GetConstantByName(NULL, "lightFalloffConstant");
+        D3DXHANDLE hLightFalloffConstant = hlslShader.psConstantTable->GetConstantByName(NULL, "lightFalloffConstant");
         if (hLightFalloffConstant) {
-            hlslShader.vsConstantTable->SetFloat(device, hLightFalloffConstant, bufferFalloffConstant);
+            hlslShader.psConstantTable->SetFloat(device, hLightFalloffConstant, bufferFalloffConstant);
+        }
+        
+        // Set shading mode from actual material mode calculation
+        D3DXHANDLE hShadingMode = hlslShader.psConstantTable->GetConstantByName(NULL, "shadingMode");
+        if (hShadingMode) {
+            float shadingModeData[4] = {0, 0, (float)sk.vertexMaterial, 0};
+            hlslShader.psConstantTable->SetFloatArray(device, hShadingMode, shadingModeData, 4);
+        } else {
+            LOG::logline("!! shadingMode constant not found in pixel shader");
         }
         
         // Set fog color
