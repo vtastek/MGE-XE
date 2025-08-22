@@ -771,13 +771,29 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         hlslShaderLRU.last_sk = sk;
     }
 
+    // Save current render states before modifying them
+    DWORD savedLighting, savedFogEnable, savedAlphaBlendEnable, savedAlphaTestEnable;
+    DWORD savedZEnable, savedZWriteEnable;
+    device->GetRenderState(D3DRS_LIGHTING, &savedLighting);
+    device->GetRenderState(D3DRS_FOGENABLE, &savedFogEnable);
+    device->GetRenderState(D3DRS_ALPHABLENDENABLE, &savedAlphaBlendEnable);
+    device->GetRenderState(D3DRS_ALPHATESTENABLE, &savedAlphaTestEnable);
+    device->GetRenderState(D3DRS_ZENABLE, &savedZEnable);
+    device->GetRenderState(D3DRS_ZWRITEENABLE, &savedZWriteEnable);
+    
     // Set shaders
     device->SetVertexShader(hlslShader.vertexShader);
     device->SetPixelShader(hlslShader.pixelShader);
     
     // Set up render states to match what D3DXEffect was doing
-    device->SetRenderState(D3DRS_ZENABLE, rs->zWrite ? TRUE : FALSE);
-    device->SetRenderState(D3DRS_ZWRITEENABLE, rs->zWrite ? TRUE : FALSE);
+    // For alpha blended objects, enable depth testing but disable depth writing
+    if (rs->blendEnable) {
+        device->SetRenderState(D3DRS_ZENABLE, TRUE);
+        device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    } else {
+        device->SetRenderState(D3DRS_ZENABLE, rs->zWrite ? TRUE : FALSE);
+        device->SetRenderState(D3DRS_ZWRITEENABLE, rs->zWrite ? TRUE : FALSE);
+    }
     device->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
     device->SetRenderState(D3DRS_CULLMODE, rs->cullMode);
     device->SetRenderState(D3DRS_LIGHTING, FALSE);
@@ -881,37 +897,160 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
             hlslShader.psConstantTable->SetVector(device, hMaterialEmissive, (D3DXVECTOR4*)&frs->material.emissive);
         }
         
-        // Set basic lighting
-        D3DXVECTOR4 lightSunDirection(0, 0, 1, 0);
-        D3DXVECTOR4 lightSunDiffuse(1, 1, 0.9f, 1);
-        D3DXVECTOR4 lightSceneAmbient(lightrs->globalAmbient.r, lightrs->globalAmbient.g, lightrs->globalAmbient.b, 1);
-        
-        // Find directional light
-        for (DWORD lightIndex : lightrs->active) {
-            auto lightIt = lightrs->lights.find(lightIndex);
-            if (lightIt != lightrs->lights.end()) {
-                const LightState::Light* light = &lightIt->second;
+        // Set up lighting using the same logic as the original renderMorrowind
+        const size_t MaxLights = 8;
+        D3DXVECTOR4 bufferDiffuse[MaxLights];
+        float bufferAmbient[MaxLights];
+        float bufferPosition[3 * MaxLights];
+        float bufferFalloffQuadratic[MaxLights], bufferFalloffLinear[MaxLights], bufferFalloffConstant;
+
+        memset(&bufferDiffuse, 0, sizeof(bufferDiffuse));
+        memset(&bufferAmbient, 0, sizeof(bufferAmbient));
+        memset(&bufferPosition, 0, sizeof(bufferPosition));
+        memset(&bufferFalloffQuadratic, 0, sizeof(bufferFalloffQuadratic));
+        memset(&bufferFalloffLinear, 0, sizeof(bufferFalloffLinear));
+        bufferFalloffConstant = 0.33;
+
+        // Check each active light
+        RGBVECTOR sunDiffuse(0, 0, 0), ambient = lightrs->globalAmbient;
+        D3DVECTOR sunDirection = {0, 0, 1};
+        size_t n = std::min(lightrs->active.size(), MaxLights), pointLightCount = 0;
+        for (; n --> 0; ) {
+            DWORD i = lightrs->active[n];
+            const LightState::Light* light = &lightrs->lights.find(i)->second;
+
+            // Transform to view space if not transformed this frame
+            if (lightrs->lightsTransformed.find(i) == lightrs->lightsTransformed.end()) {
                 if (light->type == D3DLIGHT_DIRECTIONAL) {
-                    lightSunDirection = D3DXVECTOR4(light->viewspacePos.x, light->viewspacePos.y, light->viewspacePos.z, 0);
-                    lightSunDiffuse = D3DXVECTOR4(light->diffuse.r, light->diffuse.g, light->diffuse.b, 1);
-                    break;
+                    D3DXVec3TransformNormal((D3DXVECTOR3*)&light->viewspacePos, (D3DXVECTOR3*)&light->position, &rs->viewTransform);
+                } else {
+                    D3DXVec3TransformCoord((D3DXVECTOR3*)&light->viewspacePos, (D3DXVECTOR3*)&light->position, &rs->viewTransform);
                 }
+
+                lightrs->lightsTransformed[i] = true;
+            }
+
+            if (light->type == D3DLIGHT_POINT) {
+                memcpy(&bufferDiffuse[pointLightCount], &light->diffuse, sizeof(light->diffuse));
+
+                // Scatter position vectors for vectorization
+                bufferPosition[pointLightCount] = light->viewspacePos.x;
+                bufferPosition[pointLightCount + MaxLights] = light->viewspacePos.y;
+                bufferPosition[pointLightCount + 2*MaxLights] = light->viewspacePos.z;
+
+                // Scatter attenuation factors for vectorization
+                if (light->falloff.x > 0) {
+                    // Standard point light source (falloffConstant doesn't vary per light)
+                    bufferFalloffConstant = light->falloff.x;
+                    bufferFalloffLinear[pointLightCount] = light->falloff.y;
+                    bufferFalloffQuadratic[pointLightCount] = light->falloff.z;
+                } else if (light->falloff.z > 0) {
+                    // Probably a magic light source patched by Morrowind Code Patch
+                    bufferDiffuse[pointLightCount].x *= bufferFalloffConstant;
+                    bufferDiffuse[pointLightCount].y *= bufferFalloffConstant;
+                    bufferDiffuse[pointLightCount].z *= bufferFalloffConstant;
+                    bufferAmbient[pointLightCount] = 1.0f + 1e-4f / sqrt(light->falloff.z);
+                    bufferFalloffQuadratic[pointLightCount] = bufferFalloffConstant * light->falloff.z;
+                }
+
+                ++pointLightCount;
+            } else if (light->type == D3DLIGHT_DIRECTIONAL) {
+                sunDiffuse = light->diffuse;
+                sunDirection = light->viewspacePos;  // Already transformed to view space
+                // Add directional light ambient to global ambient like the original
+                ambient.r += light->ambient.x;
+                ambient.g += light->ambient.y;
+                ambient.b += light->ambient.z;
             }
         }
         
+        // Apply light multipliers, for HDR light levels
+        sunDiffuse *= sunMultiplier;
+        ambient *= ambMultiplier;
+        
+        // Special case, check if ambient state is pure white (distant land does not record this for a reason)
+        // Morrowind temporarily sets this for full-bright particle effects
+        DWORD checkAmbient;
+        device->GetRenderState(D3DRS_AMBIENT, &checkAmbient);
+        if (checkAmbient == 0xffffffff) {
+            // Set lighting to result in full-bright equivalent after tonemapping
+            ambient.r = ambient.g = ambient.b = 1.25;
+            sunDiffuse.r = sunDiffuse.g = sunDiffuse.b = 0.0;
+        }
+        
+        // Set lighting constants using the same format as the original system
         D3DXHANDLE hLightSunDirection = hlslShader.psConstantTable->GetConstantByName(NULL, "lightSunDirection");
         if (hLightSunDirection) {
-            hlslShader.psConstantTable->SetVector(device, hLightSunDirection, &lightSunDirection);
+            hlslShader.psConstantTable->SetFloatArray(device, hLightSunDirection, (const float*)&sunDirection, 3);
+            LOG::logline("++ Set lightSunDirection: %.2f, %.2f, %.2f", sunDirection.x, sunDirection.y, sunDirection.z);
+        } else {
+            LOG::logline("!! lightSunDirection constant not found in pixel shader");
         }
         
         D3DXHANDLE hLightSunDiffuse = hlslShader.psConstantTable->GetConstantByName(NULL, "lightSunDiffuse");
         if (hLightSunDiffuse) {
-            hlslShader.psConstantTable->SetVector(device, hLightSunDiffuse, &lightSunDiffuse);
+            hlslShader.psConstantTable->SetFloatArray(device, hLightSunDiffuse, (const float*)&sunDiffuse, 3);
+            LOG::logline("++ Set lightSunDiffuse: %.2f, %.2f, %.2f", sunDiffuse.r, sunDiffuse.g, sunDiffuse.b);
+        } else {
+            LOG::logline("!! lightSunDiffuse constant not found in pixel shader");
         }
         
         D3DXHANDLE hLightSceneAmbient = hlslShader.psConstantTable->GetConstantByName(NULL, "lightSceneAmbient");
         if (hLightSceneAmbient) {
-            hlslShader.psConstantTable->SetVector(device, hLightSceneAmbient, &lightSceneAmbient);
+            hlslShader.psConstantTable->SetFloatArray(device, hLightSceneAmbient, (const float*)&ambient, 3);
+            LOG::logline("++ Set lightSceneAmbient: %.2f, %.2f, %.2f", ambient.r, ambient.g, ambient.b);
+        } else {
+            LOG::logline("!! lightSceneAmbient constant not found in pixel shader");
+        }
+        
+        // Set individual point light constants for simplified shader
+        D3DXHANDLE hLightDiffuse0 = hlslShader.vsConstantTable->GetConstantByName(NULL, "lightDiffuse0");
+        if (hLightDiffuse0 && pointLightCount > 0) {
+            hlslShader.vsConstantTable->SetFloatArray(device, hLightDiffuse0, (float*)&bufferDiffuse[0], 3);
+            LOG::logline("++ Set lightDiffuse0: %.2f, %.2f, %.2f", bufferDiffuse[0].x, bufferDiffuse[0].y, bufferDiffuse[0].z);
+        } else {
+            LOG::logline("!! lightDiffuse0 constant not found in vertex shader");
+        }
+        
+        D3DXHANDLE hLightDiffuse1 = hlslShader.vsConstantTable->GetConstantByName(NULL, "lightDiffuse1");
+        if (hLightDiffuse1 && pointLightCount > 1) {
+            hlslShader.vsConstantTable->SetFloatArray(device, hLightDiffuse1, (float*)&bufferDiffuse[1], 3);
+            LOG::logline("++ Set lightDiffuse1: %.2f, %.2f, %.2f", bufferDiffuse[1].x, bufferDiffuse[1].y, bufferDiffuse[1].z);
+        } else {
+            LOG::logline("!! lightDiffuse1 constant not found in vertex shader");
+        }
+        
+        D3DXHANDLE hLightPosition0 = hlslShader.vsConstantTable->GetConstantByName(NULL, "lightPosition0");
+        if (hLightPosition0 && pointLightCount > 0) {
+            float lightPos0[3] = {bufferPosition[0], bufferPosition[MaxLights], bufferPosition[2*MaxLights]};
+            hlslShader.vsConstantTable->SetFloatArray(device, hLightPosition0, lightPos0, 3);
+            LOG::logline("++ Set lightPosition0: %.2f, %.2f, %.2f", lightPos0[0], lightPos0[1], lightPos0[2]);
+        } else {
+            LOG::logline("!! lightPosition0 constant not found in vertex shader");
+        }
+        
+        D3DXHANDLE hLightPosition1 = hlslShader.vsConstantTable->GetConstantByName(NULL, "lightPosition1");
+        if (hLightPosition1 && pointLightCount > 1) {
+            float lightPos1[3] = {bufferPosition[1], bufferPosition[MaxLights+1], bufferPosition[2*MaxLights+1]};
+            hlslShader.vsConstantTable->SetFloatArray(device, hLightPosition1, lightPos1, 3);
+            LOG::logline("++ Set lightPosition1: %.2f, %.2f, %.2f", lightPos1[0], lightPos1[1], lightPos1[2]);
+        } else {
+            LOG::logline("!! lightPosition1 constant not found in vertex shader");
+        }
+        
+        D3DXHANDLE hLightFalloffQuadratic = hlslShader.vsConstantTable->GetConstantByName(NULL, "lightFalloffQuadratic");
+        if (hLightFalloffQuadratic) {
+            hlslShader.vsConstantTable->SetFloatArray(device, hLightFalloffQuadratic, bufferFalloffQuadratic, MaxLights);
+        }
+        
+        D3DXHANDLE hLightFalloffLinear = hlslShader.vsConstantTable->GetConstantByName(NULL, "lightFalloffLinear");
+        if (hLightFalloffLinear) {
+            hlslShader.vsConstantTable->SetFloatArray(device, hLightFalloffLinear, bufferFalloffLinear, MaxLights);
+        }
+        
+        D3DXHANDLE hLightFalloffConstant = hlslShader.vsConstantTable->GetConstantByName(NULL, "lightFalloffConstant");
+        if (hLightFalloffConstant) {
+            hlslShader.vsConstantTable->SetFloat(device, hLightFalloffConstant, bufferFalloffConstant);
         }
         
         // Set fog color
@@ -1024,8 +1163,17 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         device->DrawPrimitive(rs->primType, rs->startIndex, rs->primCount);
     }
     
-    LOG::logline("-- HLSL pipeline rendering with VS=%p PS=%p, tex=%p, fvf=%x", 
-                 hlslShader.vertexShader, hlslShader.pixelShader, rs->texture, rs->fvf);
+    // Restore device state after HLSL rendering (like the original system does)
+    device->SetVertexShader(NULL);
+    device->SetPixelShader(NULL);
+    
+    // Restore critical render states that affect other rendering modes
+    device->SetRenderState(D3DRS_LIGHTING, savedLighting);
+    device->SetRenderState(D3DRS_FOGENABLE, savedFogEnable);
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, savedAlphaBlendEnable);
+    device->SetRenderState(D3DRS_ALPHATESTENABLE, savedAlphaTestEnable);
+    device->SetRenderState(D3DRS_ZENABLE, savedZEnable);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, savedZWriteEnable);
 }
 
 FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const ShaderKey& sk) {
@@ -1035,11 +1183,11 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     const char* vertexShaderName = "vs_main";
     const char* pixelShaderName = "ps_main";
     
-    // Load Simple shader source from file
-    HANDLE hFile = CreateFileA("Data Files\\shaders\\core-hlsl\\XE FixedFuncEmu_Simple.fx", 
+    // Load Simple shader source from file 
+    HANDLE hFile = CreateFileA("Data Files\\shaders\\core-hlsl\\XE FixedFuncEmu.hlsl", 
                                GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     if (hFile == INVALID_HANDLE_VALUE) {
-        LOG::logline("!! HLSL file not found: XE FixedFuncEmu_Simple.fx");
+        LOG::logline("!! HLSL file not found: XE FixedFuncEmu.hlsl");
         return hlslShaderDefaultPurple;
     }
     
@@ -1057,7 +1205,7 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     HRESULT hr = D3DCompile(
         shaderSource,
         fileSize,
-        "XE FixedFuncEmu_Simple.fx",
+        "XE FixedFuncEmu.hlsl",
         nullptr, // Defines
         nullptr, // Include handler
         vertexShaderName,
@@ -1108,7 +1256,7 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     hr = D3DCompile(
         shaderSource,
         fileSize,
-        "XE FixedFuncEmu_Simple.fx",
+        "XE FixedFuncEmu.hlsl",
         nullptr, // Defines
         nullptr, // Include handler
         pixelShaderName,
