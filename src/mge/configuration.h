@@ -74,7 +74,8 @@
 #define USE_SHADOWS_BIT         31
 #define USE_SHADOWS             MASK(USE_SHADOWS_BIT)
 
-
+// Note: DWORD is 32 bits, so we're at the limit. Future flags would need a second DWORD.
+// For now, we'll reuse existing flags or add a separate configuration variable.
 
 typedef unsigned long DWORD;
 typedef unsigned char BYTE;
@@ -107,6 +108,7 @@ struct ConfigurationStruct {
     float UIScale;
     int WindowAlignX, WindowAlignY;
     bool UseSharedMemory;
+    bool UseHLSLPipeline;  // Use new HLSL compilation instead of ID3DXEffect
 
     struct {
         float zoom, zoomRate, zoomRateTarget;

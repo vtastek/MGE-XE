@@ -119,7 +119,8 @@ const tdictionary dictSSSuffix = {countof(dictentSSSuffix), dictentSSSuffix};
 
 const tdictent dictentPPLFlags [] = {
     {"Always", 0},
-    {"Interiors only", 1}
+    {"Interiors only", 1},
+    {"HLSL", 2}
 };
 const tdictionary dictPPLFlags = {countof(dictentPPLFlags), dictentPPLFlags};
 
@@ -142,6 +143,7 @@ const iniSetting iniSettings[] = {
     {&Configuration.MGEFlags, t_bit, USE_MENU_CACHING_BIT, siniMisc, "Use Menu Background Caching", True, &dictBool, DICTONLY, 0, 0},
     {&Configuration.OnlyProxyD3D8To9, t_bool, 1, siniMisc, "Only Proxy D3D8To9", False, &dictBool, DICTONLY|DONT_SAVE, 0, 0},
     {&Configuration.UseSharedMemory, t_bool, 1, siniMisc, "Use Shared Memory", False, &dictBool, DICTONLY, 0, 0},
+    {&Configuration.UseHLSLPipeline, t_bool, 1, siniMisc, "Use HLSL Pipeline", True, &dictBool, DICTONLY, 0, 0},
 
     // Distant Land flags
     {&Configuration.MGEFlags, t_bit, USE_DISTANT_LAND_BIT, siniDL, "Distant Land", True, &dictBool, DICTONLY, 0, 0},

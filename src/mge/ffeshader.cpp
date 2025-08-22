@@ -2,6 +2,7 @@
 #include "ffeshader.h"
 #include "configuration.h"
 #include "support/log.h"
+#include "mwbridge.h"
 
 #include <algorithm>
 #include <sstream>
@@ -29,6 +30,11 @@ D3DXHANDLE FixedFunctionShader::ehLightFalloffQuadratic, FixedFunctionShader::eh
 D3DXHANDLE FixedFunctionShader::ehTexgenTransform, FixedFunctionShader::ehBumpMatrix, FixedFunctionShader::ehBumpLumiScaleBias;
 
 float FixedFunctionShader::sunMultiplier, FixedFunctionShader::ambMultiplier;
+
+// HLSL Pipeline static variables
+unordered_map<FixedFunctionShader::ShaderKey, FixedFunctionShader::HLSLShader, FixedFunctionShader::ShaderKey::hasher> FixedFunctionShader::cacheHLSLShaders;
+FixedFunctionShader::HLSLShaderLRU FixedFunctionShader::hlslShaderLRU;
+FixedFunctionShader::HLSLShader FixedFunctionShader::hlslShaderDefaultPurple;
 
 static string buildArgString(DWORD arg, const string& mask, const string& sampler);
 
@@ -89,6 +95,20 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
     shaderLRU.effect = nullptr;
     shaderLRU.last_sk = ShaderKey();
     cacheEffects.clear();
+
+    // Initialize HLSL pipeline if enabled
+    if (Configuration.UseHLSLPipeline) {
+        LOG::logline("-- Initializing HLSL compilation pipeline");
+        
+        // Clear HLSL cache and LRU
+        hlslShaderLRU.shader = {};
+        hlslShaderLRU.last_sk = ShaderKey();
+        cacheHLSLShaders.clear();
+        
+        // Create default error shader for HLSL pipeline
+        // TODO: Load and compile default HLSL error shader
+        hlslShaderDefaultPurple = {};
+    }
 
     // Pre-warm cache if any per-pixel mode is active
     if (Configuration.MGEFlags & USE_FFESHADER) {
@@ -186,6 +206,12 @@ void FixedFunctionShader::updateLighting(float sunMult, float ambMult) {
 }
 
 void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
+    // Use HLSL pipeline if mode is set to HLSL (PerPixelLightFlags == 2)
+    if (Configuration.PerPixelLightFlags == 2) {
+        renderMorrowindHLSL(rs, frs, lightrs);
+        return;
+    }
+    
     ID3DXEffect* effectFFE;
 
     // Check if state matches last used effect
@@ -722,7 +748,428 @@ string buildArgString(DWORD arg, const string& mask, const string& sampler) {
     return s.str();
 }
 
+// HLSL Pipeline Implementation
+void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
+    HLSLShader hlslShader;
+
+    // Check if state matches last used shader
+    ShaderKey sk(rs, frs, lightrs);
+
+    if (sk == hlslShaderLRU.last_sk) {
+        hlslShader = hlslShaderLRU.shader;
+    } else {
+        // Read from shader cache / generate
+        decltype(cacheHLSLShaders)::const_iterator iShader = cacheHLSLShaders.find(sk);
+
+        if (iShader != cacheHLSLShaders.end()) {
+            hlslShader = iShader->second;
+        } else {
+            hlslShader = generateMWShaderHLSL(sk);
+        }
+
+        hlslShaderLRU.shader = hlslShader;
+        hlslShaderLRU.last_sk = sk;
+    }
+
+    // Set shaders
+    device->SetVertexShader(hlslShader.vertexShader);
+    device->SetPixelShader(hlslShader.pixelShader);
+    
+    // Set up render states to match what D3DXEffect was doing
+    device->SetRenderState(D3DRS_ZENABLE, rs->zWrite ? TRUE : FALSE);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, rs->zWrite ? TRUE : FALSE);
+    device->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+    device->SetRenderState(D3DRS_CULLMODE, rs->cullMode);
+    device->SetRenderState(D3DRS_LIGHTING, FALSE);
+    device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+    
+    // Alpha blending states
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, rs->blendEnable);
+    if (rs->blendEnable) {
+        device->SetRenderState(D3DRS_SRCBLEND, rs->srcBlend);
+        device->SetRenderState(D3DRS_DESTBLEND, rs->destBlend);
+    }
+    
+    // Alpha testing states  
+    device->SetRenderState(D3DRS_ALPHATESTENABLE, rs->alphaTest);
+    if (rs->alphaTest) {
+        device->SetRenderState(D3DRS_ALPHAFUNC, rs->alphaFunc);
+        device->SetRenderState(D3DRS_ALPHAREF, rs->alphaRef);
+    }
+    
+    // Set vertex declaration for the FVF
+    device->SetFVF(rs->fvf);
+    
+    // Set vertex and index buffers like the original system
+    device->SetStreamSource(0, rs->vb, rs->vbOffset, rs->vbStride);
+    if (rs->ib) {
+        device->SetIndices(rs->ib);
+    }
+
+    // Set up matrices using constant tables (like the Combined shader expects)
+    D3DXMATRIX projMatrix, viewMatrix, worldMatrix;
+    device->GetTransform(D3DTS_PROJECTION, &projMatrix);
+    device->GetTransform(D3DTS_VIEW, &viewMatrix);
+    device->GetTransform(D3DTS_WORLD, &worldMatrix);
+    
+    D3DXMATRIX worldViewProj = worldMatrix * viewMatrix * projMatrix;
+    D3DXMATRIX worldView = worldMatrix * viewMatrix;
+    
+    // Use constant tables to set matrices
+    if (hlslShader.vsConstantTable) {
+        D3DXHANDLE hWorldViewProj = hlslShader.vsConstantTable->GetConstantByName(NULL, "worldViewProj");
+        if (hWorldViewProj) {
+            hlslShader.vsConstantTable->SetMatrix(device, hWorldViewProj, &worldViewProj);
+        }
+        
+        D3DXHANDLE hView = hlslShader.vsConstantTable->GetConstantByName(NULL, "view");
+        if (hView) {
+            hlslShader.vsConstantTable->SetMatrix(device, hView, &viewMatrix);
+        }
+        
+        D3DXHANDLE hProj = hlslShader.vsConstantTable->GetConstantByName(NULL, "proj");
+        if (hProj) {
+            hlslShader.vsConstantTable->SetMatrix(device, hProj, &projMatrix);
+        }
+        
+        D3DXHANDLE hWorld = hlslShader.vsConstantTable->GetConstantByName(NULL, "world");
+        if (hWorld) {
+            hlslShader.vsConstantTable->SetMatrix(device, hWorld, &worldMatrix);
+        }
+        
+        D3DXHANDLE hWorldView = hlslShader.vsConstantTable->GetConstantByName(NULL, "worldview");
+        if (hWorldView) {
+            hlslShader.vsConstantTable->SetMatrix(device, hWorldView, &worldView);
+        }
+        
+        // Set up vertex blend palette for skinning using Morrowind's actual data
+        D3DXHANDLE hVertexBlendPalette = hlslShader.vsConstantTable->GetConstantByName(NULL, "vertexBlendPalette");
+        if (hVertexBlendPalette) {
+            if (rs->vertexBlendState > 0) {
+                // For skinned objects, use the bone matrices from Morrowind
+                hlslShader.vsConstantTable->SetMatrixArray(device, hVertexBlendPalette, rs->worldViewTransforms, 4);
+            } else {
+                // For rigid objects, set first matrix to worldview and clear others
+                D3DXMATRIX blendMatrices[4];
+                blendMatrices[0] = worldView;
+                memset(&blendMatrices[1], 0, sizeof(D3DXMATRIX) * 3);
+                hlslShader.vsConstantTable->SetMatrixArray(device, hVertexBlendPalette, blendMatrices, 4);
+            }
+        }
+        
+        D3DXHANDLE hVertexBlendState = hlslShader.vsConstantTable->GetConstantByName(NULL, "vertexBlendState");
+        if (hVertexBlendState) {
+            D3DXVECTOR4 blendState((float)rs->vertexBlendState, 0, 0, 0);
+            hlslShader.vsConstantTable->SetVector(device, hVertexBlendState, &blendState);
+        }
+    }
+    
+    // Set pixel shader constants using constant tables (like Combined shader expects)
+    if (hlslShader.psConstantTable) {
+        D3DXHANDLE hMaterialDiffuse = hlslShader.psConstantTable->GetConstantByName(NULL, "materialDiffuse");
+        if (hMaterialDiffuse) {
+            hlslShader.psConstantTable->SetVector(device, hMaterialDiffuse, (D3DXVECTOR4*)&frs->material.diffuse);
+        }
+        
+        D3DXHANDLE hMaterialAmbient = hlslShader.psConstantTable->GetConstantByName(NULL, "materialAmbient");
+        if (hMaterialAmbient) {
+            hlslShader.psConstantTable->SetVector(device, hMaterialAmbient, (D3DXVECTOR4*)&frs->material.ambient);
+        }
+        
+        D3DXHANDLE hMaterialEmissive = hlslShader.psConstantTable->GetConstantByName(NULL, "materialEmissive");
+        if (hMaterialEmissive) {
+            hlslShader.psConstantTable->SetVector(device, hMaterialEmissive, (D3DXVECTOR4*)&frs->material.emissive);
+        }
+        
+        // Set basic lighting
+        D3DXVECTOR4 lightSunDirection(0, 0, 1, 0);
+        D3DXVECTOR4 lightSunDiffuse(1, 1, 0.9f, 1);
+        D3DXVECTOR4 lightSceneAmbient(lightrs->globalAmbient.r, lightrs->globalAmbient.g, lightrs->globalAmbient.b, 1);
+        
+        // Find directional light
+        for (DWORD lightIndex : lightrs->active) {
+            auto lightIt = lightrs->lights.find(lightIndex);
+            if (lightIt != lightrs->lights.end()) {
+                const LightState::Light* light = &lightIt->second;
+                if (light->type == D3DLIGHT_DIRECTIONAL) {
+                    lightSunDirection = D3DXVECTOR4(light->viewspacePos.x, light->viewspacePos.y, light->viewspacePos.z, 0);
+                    lightSunDiffuse = D3DXVECTOR4(light->diffuse.r, light->diffuse.g, light->diffuse.b, 1);
+                    break;
+                }
+            }
+        }
+        
+        D3DXHANDLE hLightSunDirection = hlslShader.psConstantTable->GetConstantByName(NULL, "lightSunDirection");
+        if (hLightSunDirection) {
+            hlslShader.psConstantTable->SetVector(device, hLightSunDirection, &lightSunDirection);
+        }
+        
+        D3DXHANDLE hLightSunDiffuse = hlslShader.psConstantTable->GetConstantByName(NULL, "lightSunDiffuse");
+        if (hLightSunDiffuse) {
+            hlslShader.psConstantTable->SetVector(device, hLightSunDiffuse, &lightSunDiffuse);
+        }
+        
+        D3DXHANDLE hLightSceneAmbient = hlslShader.psConstantTable->GetConstantByName(NULL, "lightSceneAmbient");
+        if (hLightSceneAmbient) {
+            hlslShader.psConstantTable->SetVector(device, hLightSceneAmbient, &lightSceneAmbient);
+        }
+        
+        // Set fog color
+        DWORD fogColorDword = 0x808080FF;
+        device->GetRenderState(D3DRS_FOGCOLOR, &fogColorDword);
+        D3DXVECTOR4 fogColor(
+            ((fogColorDword >> 16) & 0xFF) / 255.0f,
+            ((fogColorDword >> 8) & 0xFF) / 255.0f,
+            (fogColorDword & 0xFF) / 255.0f,
+            1.0f
+        );
+        
+        D3DXHANDLE hFogColNear = hlslShader.psConstantTable->GetConstantByName(NULL, "fogColNear");
+        if (hFogColNear) {
+            hlslShader.psConstantTable->SetVector(device, hFogColNear, &fogColor);
+        }
+        
+        // Copy texture bindings from device like ID3DXEffect system (supports Combined shader)
+        for (int i = 0; i < 6; ++i) {
+            IDirect3DBaseTexture9* tex;
+            device->GetTexture(i, &tex);
+            if (tex) {
+                device->SetTexture(i, tex);
+                tex->Release();
+            }
+        }
+        
+        // Set proper sampler states for texturing
+        device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+        device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+        device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
+        device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+        device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+        
+        // Set missing constants that the Combined shader expects
+        D3DXHANDLE hTexgenTransform = hlslShader.vsConstantTable->GetConstantByName(NULL, "texgenTransform");
+        if (hTexgenTransform) {
+            D3DXMATRIX identity;
+            D3DXMatrixIdentity(&identity);
+            hlslShader.vsConstantTable->SetMatrix(device, hTexgenTransform, &identity);
+        }
+        
+        D3DXHANDLE hBumpMatrix = hlslShader.psConstantTable->GetConstantByName(NULL, "bumpMatrix");
+        if (hBumpMatrix) {
+            D3DXVECTOR4 bumpMatrix(1, 0, 0, 1);  // Identity 2x2 matrix
+            hlslShader.psConstantTable->SetVector(device, hBumpMatrix, &bumpMatrix);
+        }
+        
+        D3DXHANDLE hBumpLumiScaleBias = hlslShader.psConstantTable->GetConstantByName(NULL, "bumpLumiScaleBias");
+        if (hBumpLumiScaleBias) {
+            D3DXVECTOR2 scaleBias(1, 0);  // Scale=1, Bias=0
+            hlslShader.psConstantTable->SetFloatArray(device, hBumpLumiScaleBias, (float*)&scaleBias, 2);
+        }
+        
+        // Set critical shared variables that the Combined shader needs
+        D3DXHANDLE hHasAlpha = hlslShader.psConstantTable->GetConstantByName(NULL, "hasAlpha");
+        if (hHasAlpha) {
+            hlslShader.psConstantTable->SetBool(device, hHasAlpha, false);
+        }
+        
+        D3DXHANDLE hHasBones = hlslShader.vsConstantTable->GetConstantByName(NULL, "hasBones");
+        if (hHasBones) {
+            hlslShader.vsConstantTable->SetBool(device, hHasBones, rs->vertexBlendState > 0);
+        }
+        
+        D3DXHANDLE hHasVCol = hlslShader.psConstantTable->GetConstantByName(NULL, "hasVCol");
+        if (hHasVCol) {
+            hlslShader.psConstantTable->SetBool(device, hHasVCol, (rs->fvf & D3DFVF_DIFFUSE) != 0);
+        }
+        
+        D3DXHANDLE hMaterialAlpha = hlslShader.psConstantTable->GetConstantByName(NULL, "materialAlpha");
+        if (hMaterialAlpha) {
+            hlslShader.psConstantTable->SetFloat(device, hMaterialAlpha, frs->material.diffuse.a);
+        }
+        
+        D3DXHANDLE hAlphaRef = hlslShader.psConstantTable->GetConstantByName(NULL, "alphaRef");
+        if (hAlphaRef) {
+            hlslShader.psConstantTable->SetFloat(device, hAlphaRef, rs->alphaRef / 255.0f);
+        }
+    }
+    
+    // Error checking for vertex/index buffers
+    if (!rs->vb) {
+        LOG::logline("!! HLSL pipeline: null vertex buffer, skipping draw call");
+        return;
+    }
+    
+    // Set vertex declaration and stream sources with error checking
+    HRESULT hr = device->SetFVF(rs->fvf);
+    if (FAILED(hr)) {
+        LOG::logline("!! HLSL pipeline: failed to set FVF %x, hr=%x", rs->fvf, hr);
+        return;
+    }
+    
+    hr = device->SetStreamSource(0, rs->vb, rs->vbOffset, rs->vbStride);
+    if (FAILED(hr)) {
+        LOG::logline("!! HLSL pipeline: failed to set vertex buffer, hr=%x", hr);
+        return;
+    }
+    
+    // Execute the draw call with proper error checking
+    if (rs->ib) {
+        hr = device->SetIndices(rs->ib);
+        if (FAILED(hr)) {
+            LOG::logline("!! HLSL pipeline: failed to set index buffer, hr=%x", hr);
+            return;
+        }
+        device->DrawIndexedPrimitive(rs->primType, rs->ibBase, rs->minIndex, rs->vertCount, rs->startIndex, rs->primCount);
+    } else {
+        device->DrawPrimitive(rs->primType, rs->startIndex, rs->primCount);
+    }
+    
+    LOG::logline("-- HLSL pipeline rendering with VS=%p PS=%p, tex=%p, fvf=%x", 
+                 hlslShader.vertexShader, hlslShader.pixelShader, rs->texture, rs->fvf);
+}
+
+FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const ShaderKey& sk) {
+    HLSLShader hlslShader = {};
+    
+    // Use Simple shader with fixed positioning
+    const char* vertexShaderName = "vs_main";
+    const char* pixelShaderName = "ps_main";
+    
+    // Load Simple shader source from file
+    HANDLE hFile = CreateFileA("Data Files\\shaders\\core-hlsl\\XE FixedFuncEmu_Simple.fx", 
+                               GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        LOG::logline("!! HLSL file not found: XE FixedFuncEmu_Simple.fx");
+        return hlslShaderDefaultPurple;
+    }
+    
+    DWORD fileSize = GetFileSize(hFile, nullptr);
+    char* shaderSource = new char[fileSize + 1];
+    DWORD bytesRead;
+    ReadFile(hFile, shaderSource, fileSize, &bytesRead, nullptr);
+    shaderSource[fileSize] = '\0';
+    CloseHandle(hFile);
+
+    // Compile vertex shader
+    ID3DBlob* vsBlob = nullptr;
+    ID3DBlob* vsErrors = nullptr;
+    
+    HRESULT hr = D3DCompile(
+        shaderSource,
+        fileSize,
+        "XE FixedFuncEmu_Simple.fx",
+        nullptr, // Defines
+        nullptr, // Include handler
+        vertexShaderName,
+        "vs_3_0",
+        D3DCOMPILE_OPTIMIZATION_LEVEL3,
+        0,
+        &vsBlob,
+        &vsErrors
+    );
+    
+    if (FAILED(hr)) {
+        if (vsErrors) {
+            LOG::write("!! HLSL Vertex Shader compile errors:\n");
+            LOG::write(reinterpret_cast<const char*>(vsErrors->GetBufferPointer()));
+            LOG::write("\n");
+            vsErrors->Release();
+        }
+        LOG::logline("!! HLSL Vertex Shader compilation failed, using default");
+        delete[] shaderSource;
+        return hlslShaderDefaultPurple;
+    }
+    
+    // Create vertex shader
+    hr = device->CreateVertexShader(
+        reinterpret_cast<DWORD*>(vsBlob->GetBufferPointer()),
+        &hlslShader.vertexShader
+    );
+    
+    if (FAILED(hr)) {
+        LOG::logline("!! Failed to create HLSL vertex shader");
+        vsBlob->Release();
+        delete[] shaderSource;
+        return hlslShaderDefaultPurple;
+    }
+    
+    // Get constant table for vertex shader
+    hr = D3DXGetShaderConstantTable(
+        reinterpret_cast<DWORD*>(vsBlob->GetBufferPointer()),
+        &hlslShader.vsConstantTable
+    );
+    
+    vsBlob->Release();
+    
+    // Compile pixel shader using same source
+    ID3DBlob* psBlob = nullptr;
+    ID3DBlob* psErrors = nullptr;
+    
+    hr = D3DCompile(
+        shaderSource,
+        fileSize,
+        "XE FixedFuncEmu_Simple.fx",
+        nullptr, // Defines
+        nullptr, // Include handler
+        pixelShaderName,
+        "ps_3_0",
+        D3DCOMPILE_OPTIMIZATION_LEVEL3,
+        0,
+        &psBlob,
+        &psErrors
+    );
+    
+    if (FAILED(hr)) {
+        if (psErrors) {
+            LOG::write("!! HLSL Pixel Shader compile errors:\n");
+            LOG::write(reinterpret_cast<const char*>(psErrors->GetBufferPointer()));
+            LOG::write("\n");
+            psErrors->Release();
+        }
+        LOG::logline("!! HLSL Pixel Shader compilation failed, using default");
+        // Clean up vertex shader
+        if (hlslShader.vertexShader) hlslShader.vertexShader->Release();
+        if (hlslShader.vsConstantTable) hlslShader.vsConstantTable->Release();
+        delete[] shaderSource;
+        return hlslShaderDefaultPurple;
+    }
+    
+    // Create pixel shader
+    hr = device->CreatePixelShader(
+        reinterpret_cast<DWORD*>(psBlob->GetBufferPointer()),
+        &hlslShader.pixelShader
+    );
+    
+    if (FAILED(hr)) {
+        LOG::logline("!! Failed to create HLSL pixel shader");
+        psBlob->Release();
+        // Clean up vertex shader
+        if (hlslShader.vertexShader) hlslShader.vertexShader->Release();
+        if (hlslShader.vsConstantTable) hlslShader.vsConstantTable->Release();
+        delete[] shaderSource;
+        return hlslShaderDefaultPurple;
+    }
+    
+    // Get constant table for pixel shader
+    hr = D3DXGetShaderConstantTable(
+        reinterpret_cast<DWORD*>(psBlob->GetBufferPointer()),
+        &hlslShader.psConstantTable
+    );
+    
+    psBlob->Release();
+    
+    // Clean up shader source
+    delete[] shaderSource;
+    
+    // Cache the compiled shader
+    cacheHLSLShaders[sk] = hlslShader;
+    
+    LOG::logline("-- HLSL shader compiled successfully: VS=%s PS=%s", vertexShaderName, pixelShaderName);
+    return hlslShader;
+}
+
 void FixedFunctionShader::release() {
+    // Clean up D3DXEffect cache
     for (auto& i : cacheEffects) {
         if (i.second) {
             i.second->Release();
@@ -733,6 +1180,23 @@ void FixedFunctionShader::release() {
     shaderLRU.last_sk = ShaderKey();
     cacheEffects.clear();
     effectDefaultPurple->Release();
+    
+    // Clean up HLSL cache
+    for (auto& i : cacheHLSLShaders) {
+        if (i.second.vertexShader) i.second.vertexShader->Release();
+        if (i.second.pixelShader) i.second.pixelShader->Release();
+        if (i.second.vsConstantTable) i.second.vsConstantTable->Release();
+        if (i.second.psConstantTable) i.second.psConstantTable->Release();
+    }
+    hlslShaderLRU.shader = {};
+    hlslShaderLRU.last_sk = ShaderKey();
+    cacheHLSLShaders.clear();
+    
+    // Clean up default HLSL shader
+    if (hlslShaderDefaultPurple.vertexShader) hlslShaderDefaultPurple.vertexShader->Release();
+    if (hlslShaderDefaultPurple.pixelShader) hlslShaderDefaultPurple.pixelShader->Release();
+    if (hlslShaderDefaultPurple.vsConstantTable) hlslShaderDefaultPurple.vsConstantTable->Release();
+    if (hlslShaderDefaultPurple.psConstantTable) hlslShaderDefaultPurple.psConstantTable->Release();
 }
 
 

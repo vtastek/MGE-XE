@@ -253,6 +253,9 @@ void MacroFunctions::ToggleLightingMode() {
         if (Configuration.PerPixelLightFlags == 0) {
             Configuration.PerPixelLightFlags = 1;
             StatusOverlay::setStatus("Per-pixel dynamic lighting - interiors only");
+        } else if (Configuration.PerPixelLightFlags == 1) {
+            Configuration.PerPixelLightFlags = 2;
+            StatusOverlay::setStatus("HLSL dynamic lighting");
         } else {
             Configuration.MGEFlags ^= USE_FFESHADER;
             StatusOverlay::setStatus("Standard dynamic lighting");

@@ -123,10 +123,30 @@ class FixedFunctionShader {
 
     static ID3DXEffect* generateMWShader(const ShaderKey& sk);
 
+    // HLSL Pipeline structures and functions
+    struct HLSLShader {
+        IDirect3DVertexShader9* vertexShader;
+        IDirect3DPixelShader9* pixelShader;
+        ID3DXConstantTable* vsConstantTable;
+        ID3DXConstantTable* psConstantTable;
+    };
+
+    struct HLSLShaderLRU {
+        HLSLShader shader;
+        FixedFunctionShader::ShaderKey last_sk;
+    };
+
+    static std::unordered_map<ShaderKey, HLSLShader, ShaderKey::hasher> cacheHLSLShaders;
+    static HLSLShaderLRU hlslShaderLRU;
+    static HLSLShader hlslShaderDefaultPurple;
+
+    static HLSLShader generateMWShaderHLSL(const ShaderKey& sk);
+
 public:
     static bool init(IDirect3DDevice* d, ID3DXEffectPool* pool);
     static void precacheAsync();
     static void updateLighting(float sunMult, float ambMult);
     static void renderMorrowind(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);
+    static void renderMorrowindHLSL(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);
     static void release();
 };
