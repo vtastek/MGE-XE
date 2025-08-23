@@ -20,11 +20,11 @@ float3 lightSceneAmbient;
 float3 lightSunDiffuse;
 float3 lightSunDirection;
 
-// Lighting - Point lights (scattered arrays, same as C++ buffer format)
+// Lighting - Point lights
 float3 lightDiffuse[8];
-float lightPosition[24]; // 3*8 lights: [x0..x7, y0..y7, z0..z7] 
+float3 lightPosition[8]; // Proper float3 positions
 float lightAmbient[8];
-float4 lightFalloffQuadratic[2];
+float lightFalloffQuadratic[8];
 float lightFalloffConstant;
 
 // Fog
@@ -52,7 +52,7 @@ struct VS_OUTPUT {
     float3 normal : TEXCOORD0;
     float4 color : COLOR0;
     float2 texcoord : TEXCOORD1;
-    float3 worldpos : TEXCOORD2;
+    float3 viewpos : TEXCOORD2;  // View space position
     float fog : FOG;
 };
 
@@ -116,7 +116,7 @@ VS_OUTPUT vs_main(VS_INPUT input) {
     output.normal = normalize(normal);
     output.color = input.color;
     output.texcoord = input.texcoord;
-    output.worldpos = viewpos.xyz;
+    output.viewpos = viewpos.xyz;
     
     // Simple fog
     float dist = length(viewpos);
@@ -138,24 +138,18 @@ float4 ps_main(VS_OUTPUT input) : COLOR {
     float sunDot = saturate(dot(normal, -lightSunDirection));
     lighting += lightSunDiffuse * sunDot;
     
-    // Point lights (using scattered array format like Effect shader)
+    // Point lights 
     float3 pointLightContribution = float3(0, 0, 0);
-    [loop]
     for (int i = 0; i < 8; i++) {
-        // Access scattered position arrays: [x0..x7, y0..y7, z0..z7]
-        float3 lightPos = float3(lightPosition[i], lightPosition[i + 8], lightPosition[i + 16]);
-        float3 L = lightPos - input.worldpos;
-        
-        float distSq = dot(L, L);
-        float dist = sqrt(distSq);
+        // Use proper float3 positions 
+        float3 L = lightPosition[i] - input.viewpos;
+        float dist = length(L);
         L = L / dist;
         
         float NdotL = saturate(dot(normal, L));
         
         // Attenuation using Effect shader approach (quadratic + constant only)
-        int group = i / 4;
-        int index = i % 4;
-        float attenuation = 1.0 / (lightFalloffQuadratic[group][index] * distSq + lightFalloffConstant);
+        float attenuation = 1.0 / (lightFalloffQuadratic[i] * dist * dist + lightFalloffConstant);
         
         // Add diffuse and ambient components like Effect shader
         pointLightContribution += (lightDiffuse[i] * NdotL + lightAmbient[i]) * attenuation;
@@ -166,13 +160,28 @@ float4 ps_main(VS_OUTPUT input) : COLOR {
     // Sample texture
     float4 texColor = tex2D(sampTex0, input.texcoord);
     
-    // Material calculation (exact copy from debug shader)
-    float isMode2 = step(1.5, shadingMode.z) * (1 - step(2.5, shadingMode.z));
-    float isMode3 = step(2.5, shadingMode.z);
+    // Material calculation - straightforward approach
+    float3 effectiveDiffuse;
+    float3 effectiveEmissive;
+    float effectiveAlpha;
     
-    float3 effectiveDiffuse = lerp(materialDiffuse.rgb, input.color.rgb, isMode2);
-    float3 effectiveEmissive = lerp(materialEmissive.rgb, input.color.rgb, isMode3);
-    float effectiveAlpha = lerp(materialDiffuse.a, input.color.a, isMode2);
+    int materialMode = (int)shadingMode.z;
+    if (materialMode == 2) {
+        // Mode 2: Use vertex color for diffuse/ambient
+        effectiveDiffuse = input.color.rgb;
+        effectiveEmissive = materialEmissive.rgb;
+        effectiveAlpha = input.color.a;
+    } else if (materialMode == 3) {
+        // Mode 3: Use vertex color for emissive
+        effectiveDiffuse = materialDiffuse.rgb;
+        effectiveEmissive = input.color.rgb;
+        effectiveAlpha = materialDiffuse.a;
+    } else {
+        // Mode 1: Use material constants
+        effectiveDiffuse = materialDiffuse.rgb;
+        effectiveEmissive = materialEmissive.rgb;
+        effectiveAlpha = materialDiffuse.a;
+    }
     
     float3 litColor = effectiveDiffuse * lighting;
     litColor += effectiveEmissive;
@@ -185,5 +194,23 @@ float4 ps_main(VS_OUTPUT input) : COLOR {
     // Apply fog
     // c.rgb = lerp(fogColNear, c.rgb, input.fog);
     
-    return c;
+    // Test with ambient + sun + one point light
+    float3 lighting = lightSceneAmbient;
+    float sunDot = saturate(dot(normal, -lightSunDirection));
+    lighting += lightSunDiffuse * sunDot;
+    
+    // Add first point light only
+    float3 L = lightPosition[0] - input.viewpos;
+    float dist = length(L);
+    if (dist > 0.001) {  // Avoid division by zero
+        L = L / dist;
+        float NdotL = saturate(dot(normal, L));
+        // Simple physics-based falloff: 1/(d*d) with distance clamping
+        float clampedDist = clamp(dist, 0.5, 50.0);  // Prevent extreme values
+        float attenuation = 1.0 / (clampedDist * clampedDist);
+        lighting += (lightDiffuse[0] * NdotL + lightAmbient[0]) * attenuation;
+    }
+    
+    float4 result = float4(lighting, 1.0) * texColor;
+    return result;
 }
