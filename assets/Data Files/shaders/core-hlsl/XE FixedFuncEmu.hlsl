@@ -37,6 +37,17 @@ texture tex0, tex1;
 sampler sampTex0 = sampler_state { texture = <tex0>; };
 sampler sampTex1 = sampler_state { texture = <tex1>; };
 
+#ifdef PARAM
+texture tex2;
+sampler sampTex2 = sampler_state { texture = <tex2>; }; // _diffparam texture
+#endif
+
+#ifdef NORMALH
+texture tex3;
+sampler sampTex3 = sampler_state { texture = <tex3>; }; // _nh texture
+float2 nhTextureSize;
+#endif
+
 //------------------------------------------------------------
 // Vertex Input/Output
 
@@ -159,8 +170,23 @@ float4 ps_main(VS_OUTPUT input) : COLOR {
     
     lighting += pointLightContribution;
     
-    // Sample texture
+    // Sample base texture
     float4 texColor = tex2D(sampTex0, input.texcoord);
+    
+    // Sample and apply suffix textures if available
+#ifdef PARAM
+    float4 diffparamColor = tex2D(sampTex2, input.texcoord);
+    // Apply diffparam texture as a subtle modulation (more conservative blending)
+    texColor.rgb = lerp(texColor.rgb, texColor.rgb * diffparamColor.rgb, 0.5);
+#endif
+    
+#ifdef NORMALH
+    float4 nhColor = tex2D(sampTex3, input.texcoord);
+    // Use normal height texture for enhanced lighting (simplified approach)
+    // In a full implementation, this would modify the normal vector
+    // Blend more subtly to avoid artifacts when suffix textures don't perfectly match base texture
+    texColor.rgb = lerp(texColor.rgb, texColor.rgb * nhColor.rgb, 0.2);
+#endif
     
     // Material calculation - straightforward approach
     float3 effectiveDiffuse;
