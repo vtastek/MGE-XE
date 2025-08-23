@@ -315,28 +315,6 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
                 bufferFalloffQuadratic[pointLightCount] = 0.5555f * light->falloff.y * light->falloff.y;
                 bufferPosition[pointLightCount + 2*MaxLights] += 25.0;
             }
-            
-            // Debug: Log first light falloff values for Effect shader path (every 60 frames)
-            static int effectDebugFrameCount = 0;
-            effectDebugFrameCount++;
-            if (pointLightCount == 0 && effectDebugFrameCount % 60 == 0) {
-                LOG::logline("=== EFFECT SHADER Light[0] Falloff Values ===");
-                LOG::logline("light->falloff: (%f, %f, %f)", light->falloff.x, light->falloff.y, light->falloff.z);
-                LOG::logline("bufferFalloffQuadratic[0]: %f", bufferFalloffQuadratic[0]);
-                LOG::logline("bufferFalloffConstant: %f", bufferFalloffConstant);
-                
-                // Calculate distance for reference
-                float dist = sqrt(light->viewspacePos.x * light->viewspacePos.x + 
-                                 light->viewspacePos.y * light->viewspacePos.y + 
-                                 light->viewspacePos.z * light->viewspacePos.z);
-                LOG::logline("Light[0] distance: %f", dist);
-                
-                // Calculate Effect shader attenuation
-                float effectFalloff = bufferFalloffQuadratic[0] * dist * dist + bufferFalloffConstant;
-                float effectAttenuation = (effectFalloff > 0) ? (1.0f / effectFalloff) : 0.0f;
-                LOG::logline("Effect falloff: %f, Effect atten: %f", effectFalloff, effectAttenuation);
-            }
-            
             ++pointLightCount;
         } else if (light->type == D3DLIGHT_DIRECTIONAL) {
             effectFFE->SetFloatArray(ehLightSunDirection, (const float*)&light->viewspacePos, 3);
@@ -366,17 +344,6 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
     effectFFE->SetFloatArray(ehLightSceneAmbient, ambient, 3);
     effectFFE->SetFloatArray(ehLightSunDiffuse, sunDiffuse, 3);
     effectFFE->SetVectorArray(ehLightDiffuse, bufferDiffuse, MaxLights);
-    
-    // Debug: Log Effect shader light colors every 120 frames
-    static int effectLightDebugCounter = 0;
-    effectLightDebugCounter++;
-    if (effectLightDebugCounter % 120 == 0) {
-        LOG::logline("=== EFFECT Light Colors ===");
-        for (int i = 0; i < pointLightCount; i++) {
-            LOG::logline("Effect Light[%d]: diffuse=(%.3f,%.3f,%.3f)", i,
-                         bufferDiffuse[i].x, bufferDiffuse[i].y, bufferDiffuse[i].z);
-        }
-    }
     effectFFE->SetFloatArray(ehLightAmbient, bufferAmbient, MaxLights);
     effectFFE->SetFloatArray(ehLightPosition, bufferPosition, 3 * MaxLights);
     effectFFE->SetFloatArray(ehLightFalloffQuadratic, bufferFalloffQuadratic, MaxLights);
@@ -864,23 +831,6 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
     D3DXMATRIX worldViewProj = worldMatrix * viewMatrix * projMatrix;
     D3DXMATRIX worldView = worldMatrix * viewMatrix;
     
-    // Debug: Log matrix values once per frame to avoid spam
-    static int debugFrameCount = 0;
-    debugFrameCount++;
-    if (debugFrameCount % 60 == 0) {  // Log every 60 frames
-        LOG::logline("=== HLSL Matrix Debug Frame %d ===", debugFrameCount);
-        LOG::logline("viewMatrix: [%f,%f,%f,%f] [%f,%f,%f,%f] [%f,%f,%f,%f] [%f,%f,%f,%f]",
-            viewMatrix._11, viewMatrix._12, viewMatrix._13, viewMatrix._14,
-            viewMatrix._21, viewMatrix._22, viewMatrix._23, viewMatrix._24,
-            viewMatrix._31, viewMatrix._32, viewMatrix._33, viewMatrix._34,
-            viewMatrix._41, viewMatrix._42, viewMatrix._43, viewMatrix._44);
-        LOG::logline("worldView: [%f,%f,%f,%f] [%f,%f,%f,%f] [%f,%f,%f,%f] [%f,%f,%f,%f]",
-            worldView._11, worldView._12, worldView._13, worldView._14,
-            worldView._21, worldView._22, worldView._23, worldView._24,
-            worldView._31, worldView._32, worldView._33, worldView._34,
-            worldView._41, worldView._42, worldView._43, worldView._44);
-    }
-    
     // Use constant tables to set matrices
     if (hlslShader.vsConstantTable) {
         D3DXHANDLE hWorldViewProj = hlslShader.vsConstantTable->GetConstantByName(NULL, "worldViewProj");
@@ -951,7 +901,7 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         const size_t MaxLights = 8;
         D3DXVECTOR4 bufferDiffuse[MaxLights];
         float bufferAmbient[MaxLights];
-        D3DXVECTOR3 bufferPosition[MaxLights];  // Proper float3 positions
+        float bufferPosition[3 * MaxLights];
         float bufferFalloffQuadratic[MaxLights], bufferFalloffLinear[MaxLights], bufferFalloffConstant;
 
         memset(&bufferDiffuse, 0, sizeof(bufferDiffuse));
@@ -983,36 +933,12 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
             if (light->type == D3DLIGHT_POINT) {
                 memcpy(&bufferDiffuse[pointLightCount], &light->diffuse, sizeof(light->diffuse));
 
-                // Set position as proper float3
-                bufferPosition[pointLightCount] = D3DXVECTOR3(light->viewspacePos.x, light->viewspacePos.y, light->viewspacePos.z);
-                
-                // Debug: Log first light position data and falloff values
-                if (pointLightCount == 0 && debugFrameCount % 60 == 0) {
-                    LOG::logline("Light[0] original pos: (%f, %f, %f)", light->position.x, light->position.y, light->position.z);
-                    LOG::logline("Light[0] viewspace pos: (%f, %f, %f)", light->viewspacePos.x, light->viewspacePos.y, light->viewspacePos.z);
-                    LOG::logline("Light[0] buffer pos: (%f, %f, %f)", bufferPosition[0].x, bufferPosition[0].y, bufferPosition[0].z);
-                    
-                    // Calculate distance for reference
-                    float dist = sqrt(light->viewspacePos.x * light->viewspacePos.x + 
-                                     light->viewspacePos.y * light->viewspacePos.y + 
-                                     light->viewspacePos.z * light->viewspacePos.z);
-                    LOG::logline("Light[0] distance: %f", dist);
-                    
-                    // Log CPU-side falloff values being set
-                    LOG::logline("=== CPU Falloff Values ===");
-                    LOG::logline("bufferFalloffQuadratic[0]: %f", bufferFalloffQuadratic[0]);
-                    LOG::logline("bufferFalloffConstant: %f", bufferFalloffConstant);
-                    LOG::logline("light->falloff: (%f, %f, %f)", light->falloff.x, light->falloff.y, light->falloff.z);
-                    
-                    // Calculate Effect shader result
-                    float effectFalloff = bufferFalloffQuadratic[0] * dist * dist + bufferFalloffConstant;
-                    float effectAttenuation = (effectFalloff > 0) ? (1.0f / effectFalloff) : 0.0f;
-                    float hlslScaled = 15000.0f / (dist * dist);
-                    LOG::logline("Effect falloff: %f, Effect atten: %f", effectFalloff, effectAttenuation);
-                    LOG::logline("HLSL 15000 scaled: %f, Ratio: %f", hlslScaled, hlslScaled / (effectAttenuation > 0.0001f ? effectAttenuation : 0.0001f));
-                }
+                // Scatter position vectors for vectorization
+                bufferPosition[pointLightCount] = light->viewspacePos.x;
+                bufferPosition[pointLightCount + MaxLights] = light->viewspacePos.y;
+                bufferPosition[pointLightCount + 2*MaxLights] = light->viewspacePos.z;
 
-                // Scatter attenuation factors for vectorization
+                // Scatter attenuation factors for vectorization (match Effect path)
                 if (light->falloff.x > 0) {
                     // Standard point light source (falloffConstant doesn't vary per light)
                     bufferFalloffConstant = light->falloff.x;
@@ -1035,11 +961,15 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
                     // Light magic effect, falloffs calculated by { 0, 3 / (22 * spell magnitude), 0 }
                     // A mix of ambient (falloff but no N.L component) and over-bright diffuse lighting
                     // It is approximated with a half-lambert weight + quadratic falloff
-                    // Preserve original light color instead of overwriting with white brightness
+                    // Light colour is altered to avoid variable brightness from Morrowind bugs
                     // The point source is moved up slightly as it is often embedded in the ground
+                    float brightness = 0.25f + 1e-4f / light->falloff.y;
+                    bufferDiffuse[pointLightCount].x = brightness;
+                    bufferDiffuse[pointLightCount].y = brightness;
+                    bufferDiffuse[pointLightCount].z = brightness;
                     bufferAmbient[pointLightCount] = 1.0;
                     bufferFalloffQuadratic[pointLightCount] = 0.5555f * light->falloff.y * light->falloff.y;
-                    bufferPosition[pointLightCount].z += 25.0;
+                    bufferPosition[pointLightCount + 2*MaxLights] += 25.0;
                 }
 
                 ++pointLightCount;
@@ -1099,9 +1029,20 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         
         D3DXHANDLE hLightPosition = hlslShader.psConstantTable->GetConstantByName(NULL, "lightPosition");
         if (hLightPosition) {
-            hlslShader.psConstantTable->SetVectorArray(device, hLightPosition, (D3DXVECTOR4*)bufferPosition, MaxLights);
+            // HLSL expects float3 array, but we have packed data - need to convert
+            D3DXVECTOR3 hlslLightPositions[MaxLights];
+            for (int i = 0; i < MaxLights; i++) {
+                hlslLightPositions[i].x = bufferPosition[i];
+                hlslLightPositions[i].y = bufferPosition[i + MaxLights];
+                hlslLightPositions[i].z = bufferPosition[i + 2*MaxLights];
+            }
+            hlslShader.psConstantTable->SetFloatArray(device, hLightPosition, (float*)hlslLightPositions, 3 * MaxLights);
+            if (pointLightCount > 0) {
+                LOG::logline("HLSL: Set light[0] position to (%.2f, %.2f, %.2f)", 
+                           hlslLightPositions[0].x, hlslLightPositions[0].y, hlslLightPositions[0].z);
+            }
         } else {
-            LOG::logline("!! lightPosition array constant not found in pixel shader");
+            LOG::logline("!! HLSL ERROR: lightPosition array constant not found in pixel shader");
         }
         
         // Set light ambient array
@@ -1112,59 +1053,33 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
             LOG::logline("!! lightAmbient array constant not found in pixel shader");
         }
         
-        // Debug: List all available constants in pixel shader
-        if (debugFrameCount % 60 == 0) {
-            D3DXCONSTANTTABLE_DESC desc;
-            if (SUCCEEDED(hlslShader.psConstantTable->GetDesc(&desc))) {
-                LOG::logline("=== Available PS Constants ===");
-                LOG::logline("Total constants: %d", desc.Constants);
-                for (UINT i = 0; i < desc.Constants && i < 20; i++) {  // Limit to first 20
-                    D3DXHANDLE handle = hlslShader.psConstantTable->GetConstant(NULL, i);
-                    if (handle) {
-                        D3DXCONSTANT_DESC constDesc;
-                        UINT count = 1;
-                        if (SUCCEEDED(hlslShader.psConstantTable->GetConstantDesc(handle, &constDesc, &count))) {
-                            LOG::logline("Constant[%d]: %s", i, constDesc.Name ? constDesc.Name : "NULL");
-                        }
-                    }
-                }
-            }
+        // Set pointLightCount uniform for HLSL (CRITICAL FIX)
+        D3DXHANDLE hPointLightCount = hlslShader.psConstantTable->GetConstantByName(NULL, "pointLightCount");
+        if (hPointLightCount) {
+            hlslShader.psConstantTable->SetInt(device, hPointLightCount, (int)pointLightCount);
+            LOG::logline("HLSL: Set pointLightCount to %d", (int)pointLightCount);
+        } else {
+            LOG::logline("!! HLSL ERROR: pointLightCount constant not found in pixel shader");
         }
         
-        // Set falloff constants exactly like Effect shader
+        // Set falloff constants using Effect shader approach (quadratic + constant only)
         D3DXHANDLE hLightFalloffQuadratic = hlslShader.psConstantTable->GetConstantByName(NULL, "lightFalloffQuadratic");
         if (hLightFalloffQuadratic) {
-            hlslShader.psConstantTable->SetFloatArray(device, hLightFalloffQuadratic, bufferFalloffQuadratic, MaxLights);
-            
-            // Debug: Log falloff values every 60 frames
-            if (debugFrameCount % 60 == 0) {
-                LOG::logline("=== Falloff Constants Debug ===");
-                LOG::logline("bufferFalloffQuadratic[0]: %f", bufferFalloffQuadratic[0]);
-                LOG::logline("bufferFalloffConstant: %f", bufferFalloffConstant);
-                
-                // Calculate what Effect shader attenuation would be with logged distance
-                if (pointLightCount > 0) {
-                    float dist = sqrt(bufferPosition[0].x * bufferPosition[0].x + 
-                                     bufferPosition[0].y * bufferPosition[0].y + 
-                                     bufferPosition[0].z * bufferPosition[0].z);
-                    float effectFalloff = bufferFalloffQuadratic[0] * dist * dist + bufferFalloffConstant;
-                    float effectAttenuation = (effectFalloff > 0) ? (1.0f / effectFalloff) : 0.0f;
-                    float hlslScaled = 15000.0f / (dist * dist);
-                    
-                    LOG::logline("Distance: %f, Effect falloff: %f, Effect atten: %f", dist, effectFalloff, effectAttenuation);
-                    LOG::logline("HLSL 15000 scaled atten: %f, Ratio: %f", hlslScaled, hlslScaled / effectAttenuation);
-                }
+            // Pack quadratic falloffs into 2 float4 vectors (8 lights total, 4 per vector)
+            D3DXVECTOR4 quadraticData[2];
+            for (int i = 0; i < 4; i++) {
+                quadraticData[0][i] = (i < pointLightCount) ? bufferFalloffQuadratic[i] : 0.0f;
+                quadraticData[1][i] = (i + 4 < pointLightCount) ? bufferFalloffQuadratic[i + 4] : 0.0f;
             }
-        } else {
-            LOG::logline("!! lightFalloffQuadratic array constant not found in pixel shader");
+            hlslShader.psConstantTable->SetVectorArray(device, hLightFalloffQuadratic, quadraticData, 2);
         }
         
         D3DXHANDLE hLightFalloffConstant = hlslShader.psConstantTable->GetConstantByName(NULL, "lightFalloffConstant");
         if (hLightFalloffConstant) {
             hlslShader.psConstantTable->SetFloat(device, hLightFalloffConstant, bufferFalloffConstant);
-        } else {
-            LOG::logline("!! lightFalloffConstant constant not found in pixel shader");
         }
+        
+        // Note: HLSL uses same falloff as Effect shader - quadratic + constant only, no linear term
         
         // Set shading mode from actual material mode calculation
         D3DXHANDLE hShadingMode = hlslShader.psConstantTable->GetConstantByName(NULL, "shadingMode");
@@ -1305,12 +1220,6 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     const char* vertexShaderName = "vs_main";
     const char* pixelShaderName = "ps_main";
     
-    // Determine light count from shader key (matching Effect shader logic)
-    int lightCount = 0;
-    if (sk.vertexMaterial != 0) {
-        lightCount = sk.heavyLighting ? 8 : 4;
-    }
-    
     // Load Simple shader source from file 
     HANDLE hFile = CreateFileA("Data Files\\shaders\\core-hlsl\\XE FixedFuncEmu.hlsl", 
                                GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -1325,20 +1234,6 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     ReadFile(hFile, shaderSource, fileSize, &bytesRead, nullptr);
     shaderSource[fileSize] = '\0';
     CloseHandle(hFile);
-    
-    // Create shader defines for light count (like Effect shader FFE_LIGHTS_ACTIVE)
-    char lightCountStr[16];
-    sprintf(lightCountStr, "%d", lightCount);
-    D3D_SHADER_MACRO defines[] = {
-        { "LIGHT_COUNT", lightCountStr },
-        { nullptr, nullptr }
-    };
-    
-    LOG::logline("-- Generating HLSL shader with %d lights (heavyLighting=%d, vertexMaterial=%d)", 
-                 lightCount, sk.heavyLighting, sk.vertexMaterial);
-    if (lightCount == 0) {
-        LOG::logline("!! WARNING: Compiling shader with NO LIGHTING (lightCount=0)");
-    }
 
     // Compile vertex shader
     ID3DBlob* vsBlob = nullptr;
@@ -1348,7 +1243,7 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         shaderSource,
         fileSize,
         "XE FixedFuncEmu.hlsl",
-        defines, // Shader defines for light count
+        nullptr, // Defines
         nullptr, // Include handler
         vertexShaderName,
         "vs_3_0",
@@ -1399,7 +1294,7 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         shaderSource,
         fileSize,
         "XE FixedFuncEmu.hlsl",
-        defines, // Shader defines for light count
+        nullptr, // Defines
         nullptr, // Include handler
         pixelShaderName,
         "ps_3_0",
@@ -1501,9 +1396,6 @@ FixedFunctionShader::ShaderKey::ShaderKey(const RenderedState* rs, const Fragmen
     vertexColour = (rs->fvf & D3DFVF_DIFFUSE) ? 1 : 0;
 
     // Match constant material, diffuse+ambient vcol, or emissive vcol
-    static int debugLogCounter = 0;
-    debugLogCounter++;
-    
     if (rs->useLighting) {
         heavyLighting = (lightrs->active.size() > 4) ? 1 : 0;
         vertexMaterial = 1;
@@ -1514,22 +1406,6 @@ FixedFunctionShader::ShaderKey::ShaderKey(const RenderedState* rs, const Fragmen
             } else if (rs->matSrcEmissive == D3DMCS_COLOR1) {
                 vertexMaterial = 3;
             }
-        }
-        
-        // Log lighting decisions every 60 objects
-        if (debugLogCounter % 60 == 0) {
-            LOG::logline("=== ShaderKey Lighting Debug ===");
-            LOG::logline("useLighting=true, activeLights=%d, heavyLighting=%d, vertexMaterial=%d", 
-                         lightrs->active.size(), heavyLighting, vertexMaterial);
-            LOG::logline("vertexColour=%d, matSrcDiffuse=0x%x, matSrcEmissive=0x%x", 
-                         vertexColour, rs->matSrcDiffuse, rs->matSrcEmissive);
-        }
-    } else {
-        // Object with no lighting - this could be the problem
-        if (debugLogCounter % 60 == 0) {
-            LOG::logline("=== ShaderKey NO LIGHTING ===");
-            LOG::logline("useLighting=FALSE -> vertexMaterial=0 (no lights)");
-            LOG::logline("activeLights=%d, vertexColour=%d", lightrs->active.size(), vertexColour);
         }
     }
 

@@ -21,11 +21,12 @@ float3 lightSunDiffuse;
 float3 lightSunDirection;
 
 // Lighting - Point lights
-float3 lightDiffuse[8];
+float4 lightDiffuse[8];  // Changed to float4 to match D3DXVECTOR4 from C++
 float3 lightPosition[8]; // Proper float3 positions
 float lightAmbient[8];
 float lightFalloffQuadratic[8];
 float lightFalloffConstant;
+int pointLightCount; // Number of real point lights
 
 // Fog
 float3 fogColNear;
@@ -140,7 +141,7 @@ float4 ps_main(VS_OUTPUT input) : COLOR {
     
     // Point lights 
     float3 pointLightContribution = float3(0, 0, 0);
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < pointLightCount; i++) {
         // Use proper float3 positions 
         float3 L = lightPosition[i] - input.viewpos;
         float dist = length(L);
@@ -148,11 +149,12 @@ float4 ps_main(VS_OUTPUT input) : COLOR {
         
         float NdotL = saturate(dot(normal, L));
         
-        // Attenuation using Effect shader approach (quadratic + constant only)
-        float attenuation = 1.0 / (lightFalloffQuadratic[i] * dist * dist + lightFalloffConstant);
+        // Use actual Effect shader falloff formula: 1/(quadratic*dist² + constant) - no linear term!
+        float falloff = lightFalloffQuadratic[i] * dist * dist + lightFalloffConstant;
+        float attenuation = (falloff > 0.0) ? (1.0 / falloff) : 0.0;
         
         // Add diffuse and ambient components like Effect shader
-        pointLightContribution += (lightDiffuse[i] * NdotL + lightAmbient[i]) * attenuation;
+        pointLightContribution += (lightDiffuse[i].rgb * NdotL + lightAmbient[i]) * attenuation;
     }
     
     lighting += pointLightContribution;
@@ -194,23 +196,5 @@ float4 ps_main(VS_OUTPUT input) : COLOR {
     // Apply fog
     // c.rgb = lerp(fogColNear, c.rgb, input.fog);
     
-    // Test with ambient + sun + one point light
-    float3 lighting = lightSceneAmbient;
-    float sunDot = saturate(dot(normal, -lightSunDirection));
-    lighting += lightSunDiffuse * sunDot;
-    
-    // Add first point light only
-    float3 L = lightPosition[0] - input.viewpos;
-    float dist = length(L);
-    if (dist > 0.001) {  // Avoid division by zero
-        L = L / dist;
-        float NdotL = saturate(dot(normal, L));
-        // Simple physics-based falloff: 1/(d*d) with distance clamping
-        float clampedDist = clamp(dist, 0.5, 50.0);  // Prevent extreme values
-        float attenuation = 1.0 / (clampedDist * clampedDist);
-        lighting += (lightDiffuse[0] * NdotL + lightAmbient[0]) * attenuation;
-    }
-    
-    float4 result = float4(lighting, 1.0) * texColor;
-    return result;
+    return c;
 }
