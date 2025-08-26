@@ -48,9 +48,12 @@ static unordered_map<std::string, TextureSuffixVariants> textureSuffixDatabase;
 static unordered_map<TextureRuntimeHash, std::string, TextureRuntimeHasher> textureHashToName;
 static bool textureSuffixDatabaseBuilt = false;
 
+// Runtime texture hash cache to avoid repeated calculations
+static unordered_map<IDirect3DTexture9*, TextureRuntimeHash> runtimeTextureHashCache;
 
 
-// CRC32 implementation for texture hashing (matches ReShade approach)
+
+// CRC32 implementation for texture hashing
 static unsigned int crc32_table[256];
 static bool crc32_table_initialized = false;
 
@@ -532,161 +535,105 @@ TextureRuntimeHash calculateTextureHash(IDirect3DDevice9* device, IDirect3DTextu
         return hash;
     }
     
+    // Check cache first to avoid repeated calculations
+    auto cacheIt = runtimeTextureHashCache.find(texture);
+    if (cacheIt != runtimeTextureHashCache.end()) {
+        return cacheIt->second;
+    }
+    
     // Get texture dimensions first
     D3DSURFACE_DESC desc;
     if (FAILED(texture->GetLevelDesc(0, &desc))) {
         return hash;
     }
     
-    // DIAGNOSTIC: Analyze texture properties (ReShade-style)
-    LOG::logline("RUNTIME TEXTURE ANALYSIS: %dx%d, Format=%d, Pool=%d, Usage=0x%08x", 
-                desc.Width, desc.Height, desc.Format, desc.Pool, desc.Usage);
-    
-    // ReShade filtering checks
+    // Filtering checks
     bool isDefaultPool = (desc.Pool == D3DPOOL_DEFAULT);
     bool isRenderTarget = (desc.Usage & D3DUSAGE_RENDERTARGET) != 0;
     bool isDepthStencil = (desc.Usage & D3DUSAGE_DEPTHSTENCIL) != 0;
-    bool isDynamic = (desc.Usage & D3DUSAGE_DYNAMIC) != 0;
     
-    LOG::logline("TEXTURE FLAGS: DefaultPool=%s, RenderTarget=%s, DepthStencil=%s, Dynamic=%s",
-                isDefaultPool ? "YES" : "NO", isRenderTarget ? "YES" : "NO", 
-                isDepthStencil ? "YES" : "NO", isDynamic ? "YES" : "NO");
-    
-    // Apply ReShade-style filtering to avoid problematic textures
+    // At runtime, only process DEFAULT pool textures (actual game textures)
+    // MANAGED pool textures at runtime are likely our own BSA textures causing issues
     if (!isDefaultPool) {
-        LOG::logline("RESHADE FILTER: SKIPPING - Not D3DPOOL_DEFAULT");
         return hash; // Return zero hash for filtered textures
     }
-    if (isRenderTarget) {
-        LOG::logline("RESHADE FILTER: SKIPPING - Is render target");
-        return hash; // Return zero hash for filtered textures
-    }
-    if (isDepthStencil) {
-        LOG::logline("RESHADE FILTER: SKIPPING - Is depth stencil");
+    if (isRenderTarget || isDepthStencil) {
         return hash; // Return zero hash for filtered textures
     }
     
-    LOG::logline("RESHADE FILTER: PASSED - Processing texture");
+    // Use staging texture approach for D3DPOOL_DEFAULT textures
+    // Save to temp file for reliable hash calculation
+    char tempPath[] = "temp\\mge_hash_temp.dds";
+    bool hashSuccess = false;
     
-    // Use ReShade-style staging texture approach for D3DPOOL_DEFAULT textures
-    // Create temporary file for hashing (mimics our working dump approach)
-    char tempPath[512];
-    static int tempCounter = 0;
-    snprintf(tempPath, sizeof(tempPath), "temp\\hash_temp_%d.dds", tempCounter++);
+    // Use staging texture for D3DPOOL_DEFAULT textures
+    IDirect3DTexture9* stagingTexture = nullptr;
+    HRESULT hr = device->CreateTexture(desc.Width, desc.Height, 1, 0, desc.Format, D3DPOOL_SYSTEMMEM, &stagingTexture, nullptr);
     
-    bool saveSuccess = false;
-    
-    // ReShade method: Use staging texture for D3DPOOL_DEFAULT textures
-    if (desc.Pool == D3DPOOL_DEFAULT) {
-        LOG::logline("STAGING: Attempting ReShade-style staging for %dx%d DEFAULT pool texture", desc.Width, desc.Height);
+    if (SUCCEEDED(hr) && stagingTexture) {
+        // Get surfaces for copy operation
+        IDirect3DSurface9* srcSurface = nullptr;
+        IDirect3DSurface9* dstSurface = nullptr;
         
-        // Create staging texture in SYSTEMMEM pool
-        IDirect3DTexture9* stagingTexture = nullptr;
-        HRESULT hr = device->CreateTexture(desc.Width, desc.Height, 1, 0, desc.Format, D3DPOOL_SYSTEMMEM, &stagingTexture, nullptr);
-        
-        if (SUCCEEDED(hr) && stagingTexture) {
-            // Get surfaces for copy operation
-            IDirect3DSurface9* srcSurface = nullptr;
-            IDirect3DSurface9* dstSurface = nullptr;
+        if (SUCCEEDED(texture->GetSurfaceLevel(0, &srcSurface)) &&
+            SUCCEEDED(stagingTexture->GetSurfaceLevel(0, &dstSurface))) {
             
-            if (SUCCEEDED(texture->GetSurfaceLevel(0, &srcSurface)) &&
-                SUCCEEDED(stagingTexture->GetSurfaceLevel(0, &dstSurface))) {
+            // Try GetRenderTargetData first
+            hr = device->GetRenderTargetData(srcSurface, dstSurface);
+            
+            if (FAILED(hr)) {
+                // Fallback method: StretchRect
+                hr = device->StretchRect(srcSurface, nullptr, dstSurface, nullptr, D3DTEXF_NONE);
                 
-                // Try GetRenderTargetData first (ReShade primary method)
-                hr = device->GetRenderTargetData(srcSurface, dstSurface);
-                
-                if (SUCCEEDED(hr)) {
-                    LOG::logline("STAGING: GetRenderTargetData succeeded for %dx%d", desc.Width, desc.Height);
-                } else {
-                    LOG::logline("STAGING: GetRenderTargetData failed (0x%08x), trying StretchRect for %dx%d", hr, desc.Width, desc.Height);
+                if (FAILED(hr)) {
+                    // Third fallback: UpdateTexture
+                    IDirect3DTexture9* sysMemTexture = nullptr;
+                    HRESULT sysHr = device->CreateTexture(desc.Width, desc.Height, 1, 0, desc.Format, D3DPOOL_MANAGED, &sysMemTexture, nullptr);
                     
-                    // ReShade fallback method: StretchRect
-                    hr = device->StretchRect(srcSurface, nullptr, dstSurface, nullptr, D3DTEXF_NONE);
-                    
-                    if (SUCCEEDED(hr)) {
-                        LOG::logline("STAGING: StretchRect succeeded for %dx%d", desc.Width, desc.Height);
-                    } else {
-                        LOG::logline("STAGING: StretchRect failed (0x%08x), trying UpdateTexture for %dx%d", hr, desc.Width, desc.Height);
-                        
-                        // ReShade third fallback: UpdateTexture (system memory approach)
-                        // Create a system memory texture and copy data manually
-                        IDirect3DTexture9* sysMemTexture = nullptr;
-                        HRESULT sysHr = device->CreateTexture(desc.Width, desc.Height, 1, 0, desc.Format, D3DPOOL_MANAGED, &sysMemTexture, nullptr);
-                        
-                        if (SUCCEEDED(sysHr) && sysMemTexture) {
-                            hr = device->UpdateTexture(sysMemTexture, stagingTexture);
-                            if (SUCCEEDED(hr)) {
-                                LOG::logline("STAGING: UpdateTexture succeeded for %dx%d", desc.Width, desc.Height);
-                            } else {
-                                LOG::logline("STAGING: UpdateTexture failed (0x%08x) for %dx%d", hr, desc.Width, desc.Height);
+                    if (SUCCEEDED(sysHr) && sysMemTexture) {
+                        hr = device->UpdateTexture(sysMemTexture, stagingTexture);
+                        sysMemTexture->Release();
+                    }
+                }
+            }
+            
+            // If staging succeeded, save to temp file for hash calculation
+            if (SUCCEEDED(hr)) {
+                if (SUCCEEDED(D3DXSaveTextureToFile(tempPath, D3DXIFF_DDS, stagingTexture, nullptr))) {
+                    // Read temp file and calculate hash
+                    HANDLE file = CreateFileA(tempPath, GENERIC_READ, FILE_SHARE_READ, nullptr, 
+                                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                    if (file != INVALID_HANDLE_VALUE) {
+                        DWORD fileSize = GetFileSize(file, nullptr);
+                        if (fileSize > 0 && fileSize < 50 * 1024 * 1024) { // Max 50MB
+                            auto buffer = std::make_unique<char[]>(fileSize);
+                            DWORD bytesRead;
+                            if (ReadFile(file, buffer.get(), fileSize, &bytesRead, nullptr) && bytesRead == fileSize) {
+                                hash.size = desc.Width * desc.Height;
+                                hash.crc32 = crc32(reinterpret_cast<const unsigned char*>(buffer.get()), fileSize);
+                                hashSuccess = true;
                             }
-                            sysMemTexture->Release();
-                        } else {
-                            LOG::logline("STAGING: Failed to create system memory texture for UpdateTexture");
                         }
+                        CloseHandle(file);
                     }
-                }
-                
-                // If any method succeeded, try to save the staged texture
-                if (SUCCEEDED(hr)) {
-                    if (SUCCEEDED(D3DXSaveTextureToFile(tempPath, D3DXIFF_DDS, stagingTexture, nullptr))) {
-                        saveSuccess = true;
-                        LOG::logline("STAGING: Successfully saved staged texture %dx%d", desc.Width, desc.Height);
-                    } else {
-                        LOG::logline("STAGING: Failed to save staged texture %dx%d", desc.Width, desc.Height);
-                    }
-                } else {
-                    LOG::logline("STAGING: All staging methods failed for %dx%d", desc.Width, desc.Height);
-                }
-            } else {
-                LOG::logline("STAGING: Failed to get surfaces for %dx%d", desc.Width, desc.Height);
-            }
-            
-            if (srcSurface) srcSurface->Release();
-            if (dstSurface) dstSurface->Release();
-            stagingTexture->Release();
-        } else {
-            LOG::logline("STAGING: Failed to create staging texture (0x%08x) for %dx%d", hr, desc.Width, desc.Height);
-        }
-    } else {
-        LOG::logline("STAGING: Using direct save for %s pool texture %dx%d", 
-                    desc.Pool == D3DPOOL_MANAGED ? "MANAGED" : "OTHER", desc.Width, desc.Height);
-    }
-    
-    // Fallback to direct save if staging failed or not DEFAULT pool
-    if (!saveSuccess && SUCCEEDED(D3DXSaveTextureToFile(tempPath, D3DXIFF_DDS, texture, nullptr))) {
-        saveSuccess = true;
-        LOG::logline("STAGING: Direct save succeeded for %dx%d", desc.Width, desc.Height);
-    }
-    
-    if (saveSuccess) {
-        // Read the file back and hash it
-        HANDLE file = CreateFileA(tempPath, GENERIC_READ, FILE_SHARE_READ, nullptr, 
-                                 OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (file != INVALID_HANDLE_VALUE) {
-            DWORD fileSize = GetFileSize(file, nullptr);
-            if (fileSize > 0 && fileSize < 10 * 1024 * 1024) { // Max 10MB
-                auto buffer = std::make_unique<char[]>(fileSize);
-                DWORD bytesRead;
-                if (ReadFile(file, buffer.get(), fileSize, &bytesRead, nullptr) && bytesRead == fileSize) {
-                    hash.size = desc.Width * desc.Height;
-                    hash.crc32 = crc32(reinterpret_cast<const unsigned char*>(buffer.get()), fileSize);
-                } else {
-                    LOG::logline("HASH ERROR: Failed to read temp file for %dx%d", desc.Width, desc.Height);
+                    // Clean up temp file immediately
+                    DeleteFileA(tempPath);
                 }
             }
-            CloseHandle(file);
         }
         
-        // Clean up temp file
-        DeleteFileA(tempPath);
-    } else {
-        LOG::logline("HASH ERROR: All save methods failed for %dx%d (Pool=%d)", desc.Width, desc.Height, desc.Pool);
+        if (srcSurface) srcSurface->Release();
+        if (dstSurface) dstSurface->Release();
+        stagingTexture->Release();
+    }
+    
+    if (!hashSuccess) {
         return hash;
     }
     
-    LOG::logline("HASH SUCCESS: %dx%d texture -> hash %08x, size %u", 
-                desc.Width, desc.Height, hash.crc32, hash.size);
+    // Cache the calculated hash for future use
+    runtimeTextureHashCache[texture] = hash;
+    
     return hash;
 }
 
@@ -866,6 +813,66 @@ void addRuntimeTextureHash(uint32_t crc32Hash, uint32_t size, const char* textur
     textureHashToName[hash] = std::string(textureName);
 }
 
+// scanLooseTextureFiles - Add loose texture files to hash database (higher priority than BSA)
+void scanLooseTextureFiles(IDirect3DDevice9* dev, int& texturesHashed, int& texturesMatched) {
+    LOG::logline("-- Scanning loose texture files in Data Files/textures/");
+    
+    WIN32_FIND_DATAA findFileData;
+    HANDLE hFind = FindFirstFileA("Data Files\\textures\\*.dds", &findFileData);
+    
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(findFileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                char fullPath[512];
+                snprintf(fullPath, sizeof(fullPath), "Data Files\\textures\\%s", findFileData.cFileName);
+                
+                LOG::logline("-- Processing loose file: %s", findFileData.cFileName);
+                
+                // Load texture from loose file using DEFAULT pool to match runtime loading
+                IDirect3DTexture9* looseTexture = nullptr;
+                HRESULT hr = D3DXCreateTextureFromFileEx(dev, fullPath, 
+                    D3DX_DEFAULT, D3DX_DEFAULT, D3DX_DEFAULT, 0, D3DFMT_UNKNOWN, 
+                    D3DPOOL_DEFAULT, D3DX_DEFAULT, D3DX_DEFAULT, 0, nullptr, nullptr, &looseTexture);
+                
+                if (SUCCEEDED(hr) && looseTexture) {
+                    // Log detailed texture properties for loose files
+                    D3DSURFACE_DESC desc;
+                    looseTexture->GetLevelDesc(0, &desc);
+                    
+                    LOG::logline("-- LOOSE FILE PROPS: %s -> %dx%d, Format=%d, Pool=%d, Usage=0x%08x", 
+                               findFileData.cFileName, desc.Width, desc.Height, desc.Format, desc.Pool, desc.Usage);
+                    
+                    // Calculate hash using same method as BSA textures
+                    TextureRuntimeHash texHash = calculateTextureHash(dev, looseTexture);
+                    
+                    if (texHash.crc32 != 0) {
+                        texturesMatched++;
+                        
+                        // Create texture name (remove .dds extension for consistency)
+                        std::string textureName = "textures/" + std::string(findFileData.cFileName);
+                        size_t dotPos = textureName.find_last_of('.');
+                        if (dotPos != std::string::npos) {
+                            textureName = textureName.substr(0, dotPos);
+                        }
+                        
+                        // Add to hash database (loose files override BSA files due to priority)
+                        textureHashToName[texHash] = textureName;
+                        
+                        LOG::logline("-- LOOSE FILE hash added: %s -> hash %08x", 
+                                   textureName.c_str(), texHash.crc32);
+                    }
+                    
+                    looseTexture->Release();
+                }
+                
+                texturesHashed++;
+            }
+        } while (FindNextFileA(hFind, &findFileData) != 0);
+        
+        FindClose(hFind);
+    }
+}
+
 // buildBSATextureHashDatabase - Build hash database from BSA textures that matches runtime format
 void buildBSATextureHashDatabase(IDirect3DDevice9* dev) {
     int texturesHashed = 0;
@@ -944,8 +951,17 @@ void buildBSATextureHashDatabase(IDirect3DDevice9* dev) {
         }
     }
     
-    LOG::logline("-- BSA texture hash database complete: %d textures processed, %d hash matches created", 
+    LOG::logline("-- BSA texture hash database complete: %d BSA textures processed, %d hash matches created", 
                texturesHashed, texturesMatched);
+    
+    // Scan loose texture files (higher priority than BSA)
+    // These will override any BSA textures with the same hash
+    int looseTexturesHashed = 0;
+    int looseTexturesMatched = 0;
+    scanLooseTextureFiles(dev, looseTexturesHashed, looseTexturesMatched);
+    
+    LOG::logline("-- Texture database complete: %d BSA + %d loose = %d total textures, %d total matches", 
+               texturesHashed, looseTexturesHashed, texturesHashed + looseTexturesHashed, texturesMatched + looseTexturesMatched);
 }
 
 }

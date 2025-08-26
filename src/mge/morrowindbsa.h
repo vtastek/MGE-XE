@@ -50,7 +50,7 @@ namespace BSA {
     // BSA verification functionality
     void dumpAllBSATextures(const char* outputDir);
     
-    // Runtime texture hashing functionality (ReShade method)
+    // Runtime texture hashing functionality
     uint32_t calculateCRC32(const uint8_t* data, size_t length);
     void addRuntimeTextureHash(uint32_t crc32Hash, uint32_t size, const char* textureName);
     void buildBSATextureHashDatabase(IDirect3DDevice9* dev);
