@@ -3,6 +3,7 @@
 #include "configuration.h"
 #include "support/log.h"
 #include "mwbridge.h"
+#include "morrowindbsa.h"
 
 #include <algorithm>
 #include <sstream>
@@ -1037,10 +1038,6 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
                 hlslLightPositions[i].z = bufferPosition[i + 2*MaxLights];
             }
             hlslShader.psConstantTable->SetFloatArray(device, hLightPosition, (float*)hlslLightPositions, 3 * MaxLights);
-            if (pointLightCount > 0) {
-                LOG::logline("HLSL: Set light[0] position to (%.2f, %.2f, %.2f)", 
-                           hlslLightPositions[0].x, hlslLightPositions[0].y, hlslLightPositions[0].z);
-            }
         } else {
             LOG::logline("!! HLSL ERROR: lightPosition array constant not found in pixel shader");
         }
@@ -1057,7 +1054,7 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         D3DXHANDLE hPointLightCount = hlslShader.psConstantTable->GetConstantByName(NULL, "pointLightCount");
         if (hPointLightCount) {
             hlslShader.psConstantTable->SetInt(device, hPointLightCount, (int)pointLightCount);
-            LOG::logline("HLSL: Set pointLightCount to %d", (int)pointLightCount);
+            // LOG::logline("HLSL: Set pointLightCount to %d", (int)pointLightCount);
         } else {
             LOG::logline("!! HLSL ERROR: pointLightCount constant not found in pixel shader");
         }
@@ -1106,13 +1103,43 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         }
         
         // Copy texture bindings from device like ID3DXEffect system (supports Combined shader)
+        // Also handle texture suffix identification and loading
+        IDirect3DTexture9* primaryTexture = nullptr;
         for (int i = 0; i < 6; ++i) {
             IDirect3DBaseTexture9* tex;
             device->GetTexture(i, &tex);
             if (tex) {
                 device->SetTexture(i, tex);
+                
+                // Capture primary texture for suffix identification (texture slot 0)
+                if (i == 0 && tex->GetType() == D3DRTYPE_TEXTURE) {
+                    primaryTexture = static_cast<IDirect3DTexture9*>(tex);
+                    primaryTexture->AddRef(); // Keep reference for suffix processing
+                }
+                
                 tex->Release();
             }
+        }
+        
+        // Process texture suffix variants for primary texture if enabled
+        if (primaryTexture && Configuration.UseHLSLPipeline && Configuration.EnableTextureSuffixes) {
+            // Build BSA hash database on first use
+            static bool bsaHashDatabaseBuilt = false;
+            static uint32_t cooldownCounter = 0;
+            
+            if (!bsaHashDatabaseBuilt) {
+                LOG::logline("-- Building BSA texture hash database for matching...");
+                BSA::buildBSATextureHashDatabase((IDirect3DDevice9*)device);
+                bsaHashDatabaseBuilt = true;
+                cooldownCounter = 0; // Reset cooldown after BSA building
+                LOG::logline("-- BSA database complete, starting runtime hash cooldown period");
+            }
+            
+            // TEMPORARY: Disable runtime hashing to fix black screen issue  
+            // TODO: Fix device state corruption after BSA building
+            // Just skip the hash calculation but continue with texture processing
+            
+            primaryTexture->Release();
         }
         
         // Set proper sampler states for texturing

@@ -33,9 +33,15 @@ float3 fogColNear;
 float nearFogStart, nearFogRange;
 
 // Textures
-texture tex0, tex1;
+texture tex0, tex1, tex2, tex3;
 sampler sampTex0 = sampler_state { texture = <tex0>; };
 sampler sampTex1 = sampler_state { texture = <tex1>; };
+sampler sampTex2 = sampler_state { texture = <tex2>; }; // Diffuse parameter (_diffparam)
+sampler sampTex3 = sampler_state { texture = <tex3>; }; // Normal map (_nh)
+
+// Texture suffix support flags
+bool hasDiffParam;
+bool hasNormal;
 
 //------------------------------------------------------------
 // Vertex Input/Output
@@ -159,10 +165,24 @@ float4 ps_main(VS_OUTPUT input) : COLOR {
     
     lighting += pointLightContribution;
     
-    // Sample texture
+    // Enhanced texture sampling with suffix support
     float4 texColor = tex2D(sampTex0, input.texcoord);
+    float3 diffuseParam = float3(1, 1, 1);  // Default white
+    float3 normalMap = float3(0, 0, 1);     // Default normal pointing up
     
-    // Material calculation - straightforward approach
+    // Sample suffix textures if available
+    if (hasDiffParam) {
+        diffuseParam = tex2D(sampTex2, input.texcoord).rgb;
+    }
+    
+    if (hasNormal) {
+        // Sample normal map and decode from [0,1] to [-1,1]
+        normalMap = tex2D(sampTex3, input.texcoord).rgb * 2.0 - 1.0;
+        // Use normal map to perturb surface normal for lighting
+        input.normal = normalize(input.normal + normalMap * 0.5); // Simple normal perturbation
+    }
+    
+    // Material calculation with diffuse parameter modulation
     float3 effectiveDiffuse;
     float3 effectiveEmissive;
     float effectiveAlpha;
@@ -170,17 +190,17 @@ float4 ps_main(VS_OUTPUT input) : COLOR {
     int materialMode = (int)shadingMode.z;
     if (materialMode == 2) {
         // Mode 2: Use vertex color for diffuse/ambient
-        effectiveDiffuse = input.color.rgb;
+        effectiveDiffuse = input.color.rgb * diffuseParam;
         effectiveEmissive = materialEmissive.rgb;
         effectiveAlpha = input.color.a;
     } else if (materialMode == 3) {
         // Mode 3: Use vertex color for emissive
-        effectiveDiffuse = materialDiffuse.rgb;
+        effectiveDiffuse = materialDiffuse.rgb * diffuseParam;
         effectiveEmissive = input.color.rgb;
         effectiveAlpha = materialDiffuse.a;
     } else {
         // Mode 1: Use material constants
-        effectiveDiffuse = materialDiffuse.rgb;
+        effectiveDiffuse = materialDiffuse.rgb * diffuseParam;
         effectiveEmissive = materialEmissive.rgb;
         effectiveAlpha = materialDiffuse.a;
     }
@@ -190,7 +210,7 @@ float4 ps_main(VS_OUTPUT input) : COLOR {
     
     float4 diffuse = float4(litColor, effectiveAlpha);
     
-    // Apply texture
+    // Apply base texture with enhanced material properties
     float4 c = diffuse * texColor;
     
     // Apply fog

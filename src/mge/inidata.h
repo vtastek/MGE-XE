@@ -144,6 +144,7 @@ const iniSetting iniSettings[] = {
     {&Configuration.OnlyProxyD3D8To9, t_bool, 1, siniMisc, "Only Proxy D3D8To9", False, &dictBool, DICTONLY|DONT_SAVE, 0, 0},
     {&Configuration.UseSharedMemory, t_bool, 1, siniMisc, "Use Shared Memory", False, &dictBool, DICTONLY, 0, 0},
     {&Configuration.UseHLSLPipeline, t_bool, 1, siniMisc, "Use HLSL Pipeline", True, &dictBool, DICTONLY, 0, 0},
+    {&Configuration.EnableTextureSuffixes, t_bool, 1, siniMisc, "Enable Texture Suffixes", True, &dictBool, DICTONLY, 0, 0},
 
     // Distant Land flags
     {&Configuration.MGEFlags, t_bit, USE_DISTANT_LAND_BIT, siniDL, "Distant Land", True, &dictBool, DICTONLY, 0, 0},

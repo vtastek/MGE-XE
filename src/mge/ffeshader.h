@@ -129,6 +129,11 @@ class FixedFunctionShader {
         IDirect3DPixelShader9* pixelShader;
         ID3DXConstantTable* vsConstantTable;
         ID3DXConstantTable* psConstantTable;
+        
+        // Suffix texture support
+        IDirect3DTexture9* diffparamTexture;
+        IDirect3DTexture9* normalTexture;
+        bool hasSuffixSupport;
     };
 
     struct HLSLShaderLRU {
@@ -141,6 +146,7 @@ class FixedFunctionShader {
     static HLSLShader hlslShaderDefaultPurple;
 
     static HLSLShader generateMWShaderHLSL(const ShaderKey& sk);
+    static void captureAndDumpTexture(IDirect3DTexture9* texture);
 
 public:
     static bool init(IDirect3DDevice* d, ID3DXEffectPool* pool);

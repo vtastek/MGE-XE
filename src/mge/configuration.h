@@ -109,6 +109,7 @@ struct ConfigurationStruct {
     int WindowAlignX, WindowAlignY;
     bool UseSharedMemory;
     bool UseHLSLPipeline;  // Use new HLSL compilation instead of ID3DXEffect
+    bool EnableTextureSuffixes;  // Enable _diffparam and _nh texture suffix support
 
     struct {
         float zoom, zoomRate, zoomRateTarget;
