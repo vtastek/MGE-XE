@@ -54,4 +54,7 @@ namespace BSA {
     uint32_t calculateCRC32(const uint8_t* data, size_t length);
     void addRuntimeTextureHash(uint32_t crc32Hash, uint32_t size, const char* textureName);
     void buildBSATextureHashDatabase(IDirect3DDevice9* dev);
+    
+    // Device state diagnostics
+    void logDeviceState(IDirect3DDevice9* device, const char* stage);
 }

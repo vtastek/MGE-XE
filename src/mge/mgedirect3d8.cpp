@@ -3,6 +3,7 @@
 #include "mged3d8device.h"
 #include "configuration.h"
 #include "support/log.h"
+#include "morrowindbsa.h"
 
 #include <algorithm>
 

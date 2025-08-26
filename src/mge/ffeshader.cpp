@@ -1123,21 +1123,38 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         
         // Process texture suffix variants for primary texture if enabled
         if (primaryTexture && Configuration.UseHLSLPipeline && Configuration.EnableTextureSuffixes) {
-            // Build BSA hash database on first use
-            static bool bsaHashDatabaseBuilt = false;
-            static uint32_t cooldownCounter = 0;
+            // Hash database already built at device creation - now do runtime matching
+            static uint32_t hashCounter = 0;
+            bool shouldCalculateHash = ((++hashCounter % 10) == 0); // Every 10th texture
             
-            if (!bsaHashDatabaseBuilt) {
-                LOG::logline("-- Building BSA texture hash database for matching...");
-                BSA::buildBSATextureHashDatabase((IDirect3DDevice9*)device);
-                bsaHashDatabaseBuilt = true;
-                cooldownCounter = 0; // Reset cooldown after BSA building
-                LOG::logline("-- BSA database complete, starting runtime hash cooldown period");
+            if (shouldCalculateHash) {
+                // Calculate hash of the primary texture using same method as BSA database
+                BSA::TextureRuntimeHash texHash = BSA::calculateTextureHash((IDirect3DDevice9*)device, (IDirect3DTexture9*)primaryTexture);
+                
+                // Try to resolve texture name from hash
+                const std::string* textureName = BSA::resolveTextureNameFromHash(texHash);
+                if (textureName && texHash.crc32 != 0) {
+                    LOG::logline("HASH MATCH: Runtime hash %08x -> BSA texture: %s", texHash.crc32, textureName->c_str());
+                    
+                    // We know this texture - look up suffix variants
+                    const BSA::TextureSuffixVariants* variants = BSA::getTextureSuffixVariants(textureName->c_str());
+                    if (variants && (variants->hasDiffParam() || variants->hasNormal())) {
+                        LOG::logline("SUFFIX FOUND: %s has %s%s", 
+                                   textureName->c_str(),
+                                   variants->hasDiffParam() ? "diffparam " : "",
+                                   variants->hasNormal() ? "normal" : "");
+                    } else {
+                        LOG::logline("NO SUFFIX: %s has no suffix variants", textureName->c_str());
+                    }
+                } else {
+                    // Unknown texture - not found in BSA database
+                    if (texHash.crc32 != 0) {
+                        LOG::logline("NO MATCH: Runtime hash %08x not found in BSA database", texHash.crc32);
+                    } else {
+                        LOG::logline("NO HASH: Failed to calculate hash for runtime texture");
+                    }
+                }
             }
-            
-            // TEMPORARY: Disable runtime hashing to fix black screen issue  
-            // TODO: Fix device state corruption after BSA building
-            // Just skip the hash calculation but continue with texture processing
             
             primaryTexture->Release();
         }

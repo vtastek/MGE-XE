@@ -213,6 +213,12 @@ bool DistantLand::init() {
     LOG::logline(">> Starting Distant Land init");
     vsr.init(device);
     BSA::init();
+    
+    // Log device state before intensive initialization
+    BSA::logDeviceState(device, "BEFORE_DISTANT_LAND_INIT");
+    
+    // Build BSA hash database after BSA files are loaded (early clean device state)
+    BSA::buildBSATextureHashDatabase(device);
 
     if (Configuration.UseSharedMemory && !initIpc()) {
         return false;
@@ -257,6 +263,10 @@ bool DistantLand::init() {
     MWBridge::get()->patchResolveDuringInit(&resolveDynamicVisGroups);
 
     LOG::logline("<< Completed Distant Land init");
+    
+    // Log device state after intensive initialization  
+    BSA::logDeviceState(device, "AFTER_DISTANT_LAND_INIT");
+    
     ready = true;
     isRenderCached = false;
     return true;
