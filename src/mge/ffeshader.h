@@ -76,6 +76,8 @@ class FixedFunctionShader {
         DWORD usesTexgen : 1;
         DWORD projectiveTexgen : 1;
         DWORD texgenStage : 3;
+        DWORD hasDiffParam : 1;        // Has diffuse parameter texture (_diffparam)
+        DWORD hasNormal : 1;           // Has normal map texture (_nh)
 
         struct Stage {
             DWORD colorOp : 6;

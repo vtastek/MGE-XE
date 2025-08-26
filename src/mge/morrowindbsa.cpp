@@ -48,8 +48,29 @@ static unordered_map<std::string, TextureSuffixVariants> textureSuffixDatabase;
 static unordered_map<TextureRuntimeHash, std::string, TextureRuntimeHasher> textureHashToName;
 static bool textureSuffixDatabaseBuilt = false;
 
+// Runtime texture hash cache key (width, height, format, pool)
+struct TextureCacheKey {
+    UINT width;
+    UINT height;
+    D3DFORMAT format;
+    D3DPOOL pool;
+    
+    bool operator==(const TextureCacheKey& other) const {
+        return width == other.width && height == other.height && 
+               format == other.format && pool == other.pool;
+    }
+};
+
+// Hash function for TextureCacheKey
+struct TextureCacheKeyHasher {
+    size_t operator()(const TextureCacheKey& key) const {
+        return ((size_t)key.width << 16) | ((size_t)key.height) | 
+               ((size_t)key.format << 24) | ((size_t)key.pool << 28);
+    }
+};
+
 // Runtime texture hash cache to avoid repeated calculations
-static unordered_map<IDirect3DTexture9*, TextureRuntimeHash> runtimeTextureHashCache;
+static unordered_map<TextureCacheKey, TextureRuntimeHash, TextureCacheKeyHasher> runtimeTextureHashCache;
 
 
 
@@ -535,16 +556,17 @@ TextureRuntimeHash calculateTextureHash(IDirect3DDevice9* device, IDirect3DTextu
         return hash;
     }
     
-    // Check cache first to avoid repeated calculations
-    auto cacheIt = runtimeTextureHashCache.find(texture);
-    if (cacheIt != runtimeTextureHashCache.end()) {
-        return cacheIt->second;
-    }
-    
     // Get texture dimensions first
     D3DSURFACE_DESC desc;
     if (FAILED(texture->GetLevelDesc(0, &desc))) {
         return hash;
+    }
+    
+    // Check cache first to avoid repeated calculations
+    TextureCacheKey cacheKey = {desc.Width, desc.Height, desc.Format, desc.Pool};
+    auto cacheIt = runtimeTextureHashCache.find(cacheKey);
+    if (cacheIt != runtimeTextureHashCache.end()) {
+        return cacheIt->second;
     }
     
     // Filtering checks
@@ -632,7 +654,7 @@ TextureRuntimeHash calculateTextureHash(IDirect3DDevice9* device, IDirect3DTextu
     }
     
     // Cache the calculated hash for future use
-    runtimeTextureHashCache[texture] = hash;
+    runtimeTextureHashCache[cacheKey] = hash;
     
     return hash;
 }

@@ -37,6 +37,53 @@ unordered_map<FixedFunctionShader::ShaderKey, FixedFunctionShader::HLSLShader, F
 FixedFunctionShader::HLSLShaderLRU FixedFunctionShader::hlslShaderLRU;
 FixedFunctionShader::HLSLShader FixedFunctionShader::hlslShaderDefaultPurple;
 
+// Current suffix texture flags for shader variant generation
+struct SuffixTextureFlags {
+    bool hasDiffParam = false;
+    bool hasNormal = false;
+} static suffixFlags;
+
+// Cache for per-texture suffix flags to avoid repeated hash calculations
+static std::unordered_map<IDirect3DTexture9*, SuffixTextureFlags> textureSuffixCache;
+
+// Get suffix flags for a specific texture (per-texture, not global)
+static SuffixTextureFlags getSuffixFlagsForTexture(IDirect3DDevice9* device, IDirect3DTexture9* texture) {
+    SuffixTextureFlags flags = {false, false};
+    
+    if (!texture || !Configuration.UseHLSLPipeline || !Configuration.EnableTextureSuffixes) {
+        return flags;
+    }
+    
+    // Check cache first
+    auto cacheIt = textureSuffixCache.find(texture);
+    if (cacheIt != textureSuffixCache.end()) {
+        return cacheIt->second;  // Return cached result
+    }
+    
+    // Not in cache - calculate hash and determine suffix flags
+    BSA::TextureRuntimeHash texHash = BSA::calculateTextureHash(device, texture);
+    
+    // Try to resolve texture name from hash
+    const std::string* textureName = BSA::resolveTextureNameFromHash(texHash);
+    if (textureName && texHash.crc32 != 0) {
+        // Look up suffix variants for this specific texture
+        const BSA::TextureSuffixVariants* variants = BSA::getTextureSuffixVariants(textureName->c_str());
+        if (variants && (variants->hasDiffParam() || variants->hasNormal())) {
+            flags.hasDiffParam = variants->hasDiffParam();
+            flags.hasNormal = variants->hasNormal();
+            
+            LOG::logline("PER-TEXTURE SUFFIX: %s has %s%s", textureName->c_str(),
+                       flags.hasDiffParam ? "diffparam " : "", 
+                       flags.hasNormal ? "normal" : "");
+        }
+    }
+    
+    // Cache the result
+    textureSuffixCache[texture] = flags;
+    
+    return flags;
+}
+
 static string buildArgString(DWORD arg, const string& mask, const string& sampler);
 
 
@@ -755,6 +802,11 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
 
     // Check if state matches last used shader
     ShaderKey sk(rs, frs, lightrs);
+    
+    // Add suffix texture flags to shader key for variant generation (per-texture, not global)
+    SuffixTextureFlags textureFlags = getSuffixFlagsForTexture((IDirect3DDevice9*)device, rs->texture);
+    sk.hasDiffParam = textureFlags.hasDiffParam;
+    sk.hasNormal = textureFlags.hasNormal;
 
     if (sk == hlslShaderLRU.last_sk) {
         hlslShader = hlslShaderLRU.shader;
@@ -770,6 +822,31 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
 
         hlslShaderLRU.shader = hlslShader;
         hlslShaderLRU.last_sk = sk;
+    }
+    
+    // Load and bind suffix textures if this texture has them
+    if (textureFlags.hasDiffParam || textureFlags.hasNormal) {
+        // Get texture name for suffix loading
+        BSA::TextureRuntimeHash texHash = BSA::calculateTextureHash((IDirect3DDevice9*)device, rs->texture);
+        const std::string* textureName = BSA::resolveTextureNameFromHash(texHash);
+        if (textureName && texHash.crc32 != 0) {
+            const BSA::TextureSuffixVariants* variants = BSA::getTextureSuffixVariants(textureName->c_str());
+            if (variants) {
+                if (textureFlags.hasDiffParam && variants->hasDiffParam()) {
+                    IDirect3DTexture9* diffParamTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *variants, "diffparam");
+                    if (diffParamTexture) {
+                        device->SetTexture(2, diffParamTexture);  // Bind to slot 2
+                    }
+                }
+                
+                if (textureFlags.hasNormal && variants->hasNormal()) {
+                    IDirect3DTexture9* normalTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *variants, "normal");
+                    if (normalTexture) {
+                        device->SetTexture(3, normalTexture);  // Bind to slot 3  
+                    }
+                }
+            }
+        }
     }
 
     // Save current render states before modifying them
@@ -1121,41 +1198,9 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
             }
         }
         
-        // Process texture suffix variants for primary texture if enabled
-        if (primaryTexture && Configuration.UseHLSLPipeline && Configuration.EnableTextureSuffixes) {
-            // Hash database already built at device creation - now do runtime matching
-            static uint32_t hashCounter = 0;
-            bool shouldCalculateHash = ((++hashCounter % 10) == 0); // Every 10th texture
-            
-            if (shouldCalculateHash) {
-                // Calculate hash of the primary texture using same method as BSA database
-                BSA::TextureRuntimeHash texHash = BSA::calculateTextureHash((IDirect3DDevice9*)device, (IDirect3DTexture9*)primaryTexture);
-                
-                // Try to resolve texture name from hash
-                const std::string* textureName = BSA::resolveTextureNameFromHash(texHash);
-                if (textureName && texHash.crc32 != 0) {
-                    LOG::logline("HASH MATCH: Runtime hash %08x -> BSA texture: %s", texHash.crc32, textureName->c_str());
-                    
-                    // We know this texture - look up suffix variants
-                    const BSA::TextureSuffixVariants* variants = BSA::getTextureSuffixVariants(textureName->c_str());
-                    if (variants && (variants->hasDiffParam() || variants->hasNormal())) {
-                        LOG::logline("SUFFIX FOUND: %s has %s%s", 
-                                   textureName->c_str(),
-                                   variants->hasDiffParam() ? "diffparam " : "",
-                                   variants->hasNormal() ? "normal" : "");
-                    } else {
-                        LOG::logline("NO SUFFIX: %s has no suffix variants", textureName->c_str());
-                    }
-                } else {
-                    // Unknown texture - not found in BSA database
-                    if (texHash.crc32 != 0) {
-                        LOG::logline("NO MATCH: Runtime hash %08x not found in BSA database", texHash.crc32);
-                    } else {
-                        LOG::logline("NO HASH: Failed to calculate hash for runtime texture");
-                    }
-                }
-            }
-            
+        // Suffix texture processing is now handled per-texture in renderMorrowindHLSL()
+        
+        if (primaryTexture) {
             primaryTexture->Release();
         }
         
@@ -1279,6 +1324,18 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     shaderSource[fileSize] = '\0';
     CloseHandle(hFile);
 
+    // Build shader defines based on ShaderKey
+    D3D_SHADER_MACRO defines[4] = {};
+    int defineCount = 0;
+    
+    if (sk.hasDiffParam) {
+        defines[defineCount++] = {"HAS_DIFFPARAM", "1"};
+    }
+    if (sk.hasNormal) {
+        defines[defineCount++] = {"HAS_NORMAL", "1"};
+    }
+    defines[defineCount] = {nullptr, nullptr}; // Null terminator
+    
     // Compile vertex shader
     ID3DBlob* vsBlob = nullptr;
     ID3DBlob* vsErrors = nullptr;
@@ -1287,7 +1344,7 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         shaderSource,
         fileSize,
         "XE FixedFuncEmu.hlsl",
-        nullptr, // Defines
+        defines, // Pass suffix texture defines
         nullptr, // Include handler
         vertexShaderName,
         "vs_3_0",
@@ -1338,7 +1395,7 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         shaderSource,
         fileSize,
         "XE FixedFuncEmu.hlsl",
-        nullptr, // Defines
+        defines, // Pass same suffix texture defines
         nullptr, // Include handler
         pixelShaderName,
         "ps_3_0",
