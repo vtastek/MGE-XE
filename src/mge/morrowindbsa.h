@@ -13,7 +13,7 @@ namespace BSA {
     struct TextureSuffixVariants {
         std::string baseName;
         std::string diffparam;  // _diffparam texture path
-        std::string normal;     // _nh or _n texture path
+        std::string normal;     // _nh texture path
         
         bool hasDiffParam() const { return !diffparam.empty(); }
         bool hasNormal() const { return !normal.empty(); }

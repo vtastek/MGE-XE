@@ -380,9 +380,6 @@ static std::string extractBaseName(const std::string& texPath) {
     if (baseName.length() > 3 && baseName.substr(baseName.length() - 3) == "_nh") {
         return baseName.substr(0, baseName.length() - 3);
     }
-    if (baseName.length() > 2 && baseName.substr(baseName.length() - 2) == "_n") {
-        return baseName.substr(0, baseName.length() - 2);
-    }
     if (baseName.length() > 6 && baseName.substr(baseName.length() - 6) == "_param") {
         return baseName.substr(0, baseName.length() - 6);
     }
@@ -404,9 +401,6 @@ static const char* getSuffixType(const std::string& texPath) {
         return "diffparam";
     }
     if (baseName.length() > 3 && baseName.substr(baseName.length() - 3) == "_nh") {
-        return "normal";
-    }
-    if (baseName.length() > 2 && baseName.substr(baseName.length() - 2) == "_n") {
         return "normal";
     }
     if (baseName.length() > 6 && baseName.substr(baseName.length() - 6) == "_param") {
@@ -849,6 +843,13 @@ void scanLooseTextureFiles(IDirect3DDevice9* dev, int& texturesHashed, int& text
                 snprintf(fullPath, sizeof(fullPath), "Data Files\\textures\\%s", findFileData.cFileName);
                 
                 LOG::logline("-- Processing loose file: %s", findFileData.cFileName);
+                
+                // Skip suffix textures during hashing - only hash base textures
+                const char* suffixType = getSuffixType(std::string(findFileData.cFileName));
+                if (suffixType) {
+                    LOG::logline("-- Skipping suffix texture: %s (type: %s)", findFileData.cFileName, suffixType);
+                    continue;
+                }
                 
                 // Load texture from loose file using DEFAULT pool to match runtime loading
                 IDirect3DTexture9* looseTexture = nullptr;

@@ -148,6 +148,7 @@ class FixedFunctionShader {
     static HLSLShader hlslShaderDefaultPurple;
 
     static HLSLShader generateMWShaderHLSL(const ShaderKey& sk);
+    static HLSLShader createPurpleErrorShader();
     static void captureAndDumpTexture(IDirect3DTexture9* texture);
 
 public:

@@ -10,6 +10,7 @@
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include <cstring>
 
 using std::string;
 using std::stringstream;
@@ -45,6 +46,9 @@ struct SuffixTextureFlags {
 
 // Cache for per-texture suffix flags to avoid repeated hash calculations
 static std::unordered_map<IDirect3DTexture9*, SuffixTextureFlags> textureSuffixCache;
+
+// Cache for texture resolutions to avoid repeated GetLevelDesc calls
+static std::unordered_map<IDirect3DTexture9*, D3DXVECTOR2> textureResolutionCache;
 
 // Get suffix flags for a specific texture (per-texture, not global)
 static SuffixTextureFlags getSuffixFlagsForTexture(IDirect3DDevice9* device, IDirect3DTexture9* texture) {
@@ -154,8 +158,7 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
         cacheHLSLShaders.clear();
         
         // Create default error shader for HLSL pipeline
-        // TODO: Load and compile default HLSL error shader
-        hlslShaderDefaultPurple = {};
+        hlslShaderDefaultPurple = createPurpleErrorShader();
     }
 
     // Pre-warm cache if any per-pixel mode is active
@@ -1142,8 +1145,8 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
             // Pack quadratic falloffs into 2 float4 vectors (8 lights total, 4 per vector)
             D3DXVECTOR4 quadraticData[2];
             for (int i = 0; i < 4; i++) {
-                quadraticData[0][i] = (i < pointLightCount) ? bufferFalloffQuadratic[i] : 0.0f;
-                quadraticData[1][i] = (i + 4 < pointLightCount) ? bufferFalloffQuadratic[i + 4] : 0.0f;
+                quadraticData[0][i] = ((size_t)i < pointLightCount) ? bufferFalloffQuadratic[i] : 0.0f;
+                quadraticData[1][i] = ((size_t)(i + 4) < pointLightCount) ? bufferFalloffQuadratic[i + 4] : 0.0f;
             }
             hlslShader.psConstantTable->SetVectorArray(device, hLightFalloffQuadratic, quadraticData, 2);
         }
@@ -1256,6 +1259,41 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         if (hAlphaRef) {
             hlslShader.psConstantTable->SetFloat(device, hAlphaRef, rs->alphaRef / 255.0f);
         }
+        
+        // Set normres constant if HAS_NORMAL is defined and normal texture is bound
+        if (textureFlags.hasNormal) {
+            IDirect3DBaseTexture9* normalTexture;
+            device->GetTexture(3, &normalTexture);  // Get texture from slot 3
+            if (normalTexture && normalTexture->GetType() == D3DRTYPE_TEXTURE) {
+                IDirect3DTexture9* tex = static_cast<IDirect3DTexture9*>(normalTexture);
+                
+                // Check cache first
+                D3DXVECTOR2 normres;
+                auto cacheIt = textureResolutionCache.find(tex);
+                if (cacheIt != textureResolutionCache.end()) {
+                    normres = cacheIt->second;
+                } else {
+                    // Not in cache - get dimensions and cache them
+                    D3DSURFACE_DESC desc;
+                    if (SUCCEEDED(tex->GetLevelDesc(0, &desc))) {
+                        normres = D3DXVECTOR2((float)desc.Width, (float)desc.Height);
+                        textureResolutionCache[tex] = normres;
+                    } else {
+                        normres = D3DXVECTOR2(1.0f, 1.0f);  // Default fallback
+                    }
+                }
+                
+                // Set normres constant if it exists in pixel shader
+                D3DXHANDLE hNormres = hlslShader.psConstantTable->GetConstantByName(NULL, "normres");
+                if (hNormres) {
+                    hlslShader.psConstantTable->SetFloatArray(device, hNormres, (float*)&normres, 2);
+                } else {
+                    LOG::logline("HLSL: normres constant not found in pixel shader");
+                }
+                
+                normalTexture->Release();
+            }
+        }
     }
     
     // Error checking for vertex/index buffers
@@ -1302,6 +1340,71 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
     device->SetRenderState(D3DRS_ZWRITEENABLE, savedZWriteEnable);
 }
 
+FixedFunctionShader::HLSLShader FixedFunctionShader::createPurpleErrorShader() {
+    HLSLShader errorShader = {};
+    
+    // Minimal vertex shader - just transforms position
+    const char* vsCode = 
+        "float4x4 proj;\n"
+        "float4x4 worldview;\n"
+        "struct VS_INPUT { float4 pos : POSITION; };\n"
+        "struct VS_OUTPUT { float4 position : POSITION; };\n"
+        "VS_OUTPUT vs_main(VS_INPUT input) {\n"
+        "    VS_OUTPUT output;\n"
+        "    float4 worldPos = mul(input.pos, worldview);\n"
+        "    output.position = mul(worldPos, proj);\n"
+        "    return output;\n"
+        "}\n";
+    
+    // Minimal pixel shader - just returns purple and includes lighting constants to prevent errors
+    const char* psCode = 
+        "// Dummy lighting constants to prevent lookup errors\n"
+        "float3 lightSceneAmbient;\n"
+        "float3 lightSunDiffuse;\n"
+        "float3 lightSunDirection;\n"
+        "float4 lightDiffuse[8];\n"
+        "float3 lightPosition[8];\n"
+        "float lightAmbient[8];\n"
+        "int pointLightCount;\n"
+        "struct VS_OUTPUT { float4 position : POSITION; };\n"
+        "float4 ps_main(VS_OUTPUT input) : COLOR {\n"
+        "    return float4(1.0, 0.0, 1.0, 1.0); // Purple error color\n"
+        "}\n";
+    
+    // Compile vertex shader
+    ID3DBlob* vsBlob = nullptr;
+    ID3DBlob* vsErrors = nullptr;
+    HRESULT hr = D3DCompile(vsCode, strlen(vsCode), "ErrorShader.hlsl", nullptr, nullptr, 
+                           "vs_main", "vs_3_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vsBlob, &vsErrors);
+    
+    if (SUCCEEDED(hr)) {
+        hr = device->CreateVertexShader(reinterpret_cast<DWORD*>(vsBlob->GetBufferPointer()), &errorShader.vertexShader);
+        if (SUCCEEDED(hr)) {
+            D3DXGetShaderConstantTable(reinterpret_cast<DWORD*>(vsBlob->GetBufferPointer()), &errorShader.vsConstantTable);
+        }
+        vsBlob->Release();
+    }
+    if (vsErrors) vsErrors->Release();
+    
+    // Compile pixel shader
+    ID3DBlob* psBlob = nullptr;
+    ID3DBlob* psErrors = nullptr;
+    hr = D3DCompile(psCode, strlen(psCode), "ErrorShader.hlsl", nullptr, nullptr, 
+                   "ps_main", "ps_3_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &psBlob, &psErrors);
+    
+    if (SUCCEEDED(hr)) {
+        hr = device->CreatePixelShader(reinterpret_cast<DWORD*>(psBlob->GetBufferPointer()), &errorShader.pixelShader);
+        if (SUCCEEDED(hr)) {
+            D3DXGetShaderConstantTable(reinterpret_cast<DWORD*>(psBlob->GetBufferPointer()), &errorShader.psConstantTable);
+        }
+        psBlob->Release();
+    }
+    if (psErrors) psErrors->Release();
+    
+    LOG::logline("-- Created HLSL purple error shader");
+    return errorShader;
+}
+
 FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const ShaderKey& sk) {
     HLSLShader hlslShader = {};
     
@@ -1330,11 +1433,15 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     
     if (sk.hasDiffParam) {
         defines[defineCount++] = {"HAS_DIFFPARAM", "1"};
+        LOG::logline("HLSL: Compiling with HAS_DIFFPARAM define");
     }
     if (sk.hasNormal) {
         defines[defineCount++] = {"HAS_NORMAL", "1"};
+        LOG::logline("HLSL: Compiling with HAS_NORMAL define");
     }
     defines[defineCount] = {nullptr, nullptr}; // Null terminator
+    
+    LOG::logline("HLSL: Compiling shader with %d defines", defineCount);
     
     // Compile vertex shader
     ID3DBlob* vsBlob = nullptr;
@@ -1441,6 +1548,12 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         reinterpret_cast<DWORD*>(psBlob->GetBufferPointer()),
         &hlslShader.psConstantTable
     );
+    
+    if (SUCCEEDED(hr) && hlslShader.psConstantTable) {
+        LOG::logline("HLSL: Successfully extracted pixel shader constant table");
+    } else {
+        LOG::logline("HLSL: Failed to extract pixel shader constant table, hr=%x", hr);
+    }
     
     psBlob->Release();
     
