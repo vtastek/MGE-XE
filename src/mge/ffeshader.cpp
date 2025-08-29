@@ -11,6 +11,7 @@
 #include <chrono>
 #include <atomic>
 #include <cstring>
+#include <unordered_map>
 
 using std::string;
 using std::stringstream;
@@ -50,6 +51,28 @@ static std::unordered_map<IDirect3DTexture9*, SuffixTextureFlags> textureSuffixC
 // Cache for texture resolutions to avoid repeated GetLevelDesc calls
 static std::unordered_map<IDirect3DTexture9*, D3DXVECTOR2> textureResolutionCache;
 
+// Texture resolution cache to avoid repeated expensive operations
+struct TextureSuffixResolutionCache {
+    BSA::TextureRuntimeHash hash;
+    std::string textureName;
+    bool hasValidName;
+    const BSA::TextureSuffixVariants* variants;
+    
+    TextureSuffixResolutionCache() : hasValidName(false), variants(nullptr) {}
+};
+static std::unordered_map<IDirect3DTexture9*, TextureSuffixResolutionCache> textureSuffixResolutionCache;
+
+// Suffix texture binding cache to prevent repeated binding operations
+struct SuffixBindingState {
+    IDirect3DTexture9* lastBaseTexture;  // Texture pointer for fast comparison
+    std::string currentBaseTextureName;
+    IDirect3DTexture9* boundDiffParam;
+    IDirect3DTexture9* boundNormal;
+    
+    SuffixBindingState() : lastBaseTexture(nullptr), boundDiffParam(nullptr), boundNormal(nullptr) {}
+};
+static SuffixBindingState bindingCache;
+
 // Get suffix flags for a specific texture (per-texture, not global)
 static SuffixTextureFlags getSuffixFlagsForTexture(IDirect3DDevice9* device, IDirect3DTexture9* texture) {
     SuffixTextureFlags flags = {false, false};
@@ -73,72 +96,6 @@ static SuffixTextureFlags getSuffixFlagsForTexture(IDirect3DDevice9* device, IDi
         if (textureName) {
             // Hash lookup successful
             LOG::logline("RUNTIME HASH MATCH: %08x -> %s", texHash.crc32, textureName->c_str());
-            
-            // Dump runtime texture using same extraction method as BSA textures
-            char dumpPath[512];
-            std::string cleanName = *textureName;
-            std::replace(cleanName.begin(), cleanName.end(), '/', '_');
-            snprintf(dumpPath, sizeof(dumpPath), "runtimedump/%s_%08x.dds", 
-                   cleanName.c_str(), texHash.crc32);
-            
-            // Create runtimedump directory if it doesn't exist
-            CreateDirectoryA("runtimedump", nullptr);
-            
-            // Use identical extraction pipeline as BSA textures for comparison
-            D3DSURFACE_DESC desc;
-            bool dumpSuccess = false;
-            if (SUCCEEDED(texture->GetLevelDesc(0, &desc))) {
-                UINT mipLevels = texture->GetLevelCount();
-                LOG::logline("-- Runtime texture %s: %dx%d, format=%d, pool=%d, mips=%d", 
-                           textureName->c_str(), desc.Width, desc.Height, desc.Format, desc.Pool, mipLevels);
-                
-                // Create staging texture with same mipmap count as original
-                IDirect3DTexture9* extractStagingTexture = nullptr;
-                HRESULT hr = device->CreateTexture(desc.Width, desc.Height, mipLevels, 0, desc.Format, D3DPOOL_SYSTEMMEM, &extractStagingTexture, nullptr);
-                
-                if (SUCCEEDED(hr) && extractStagingTexture) {
-                    // Extract all mip levels
-                    bool allLevelsExtracted = true;
-                    for (UINT level = 0; level < mipLevels; level++) {
-                        IDirect3DSurface9* srcSurface = nullptr;
-                        IDirect3DSurface9* dstSurface = nullptr;
-                        
-                        if (SUCCEEDED(texture->GetSurfaceLevel(level, &srcSurface)) &&
-                            SUCCEEDED(extractStagingTexture->GetSurfaceLevel(level, &dstSurface))) {
-                            
-                            // Use same multi-tier extraction as calculateTextureHash
-                            HRESULT extractHr = device->GetRenderTargetData(srcSurface, dstSurface);
-                            if (FAILED(extractHr)) {
-                                extractHr = device->StretchRect(srcSurface, nullptr, dstSurface, nullptr, D3DTEXF_NONE);
-                            }
-                            
-                            if (FAILED(extractHr)) {
-                                allLevelsExtracted = false;
-                                LOG::logline("!! Failed to extract runtime texture level %d: %s", level, textureName->c_str());
-                            }
-                            
-                            if (srcSurface) srcSurface->Release();
-                            if (dstSurface) dstSurface->Release();
-                        } else {
-                            allLevelsExtracted = false;
-                            break;
-                        }
-                    }
-                    
-                    if (allLevelsExtracted) {
-                        HRESULT saveHr = D3DXSaveTextureToFile(dumpPath, D3DXIFF_DDS, extractStagingTexture, nullptr);
-                        if (SUCCEEDED(saveHr)) {
-                            dumpSuccess = true;
-                        }
-                    }
-                    
-                    extractStagingTexture->Release();
-                }
-            }
-            
-            if (!dumpSuccess) {
-                LOG::logline("!! Failed to dump runtime texture: %s", textureName->c_str());
-            }
             
             // Look up suffix variants for this specific texture
             const BSA::TextureSuffixVariants* variants = BSA::getTextureSuffixVariants(textureName->c_str());
@@ -903,25 +860,54 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
     
     // Load and bind suffix textures if this texture has them
     if (textureFlags.hasDiffParam || textureFlags.hasNormal) {
-        // Get texture name for suffix loading (disable caching for unique hashes)
-        BSA::TextureRuntimeHash texHash = BSA::calculateTextureHash((IDirect3DDevice9*)device, rs->texture, false);
-        const std::string* textureName = BSA::resolveTextureNameFromHash(texHash);
-        if (textureName && texHash.crc32 != 0) {
-            const BSA::TextureSuffixVariants* variants = BSA::getTextureSuffixVariants(textureName->c_str());
-            if (variants) {
-                if (textureFlags.hasDiffParam && variants->hasDiffParam()) {
-                    IDirect3DTexture9* diffParamTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *variants, "diffparam");
-                    if (diffParamTexture) {
-                        device->SetTexture(2, diffParamTexture);  // Bind to slot 2
+        // Fast check: if same texture pointer, skip all expensive operations
+        if (bindingCache.lastBaseTexture != rs->texture) {
+            // Check texture suffix resolution cache first
+            auto cacheIt = textureSuffixResolutionCache.find(rs->texture);
+            if (cacheIt == textureSuffixResolutionCache.end()) {
+                // Not in cache, perform expensive resolution
+                TextureSuffixResolutionCache entry;
+                entry.hash = BSA::calculateTextureHash((IDirect3DDevice9*)device, rs->texture, false);
+                const std::string* textureName = BSA::resolveTextureNameFromHash(entry.hash);
+                if (textureName && entry.hash.crc32 != 0) {
+                    entry.textureName = *textureName;
+                    entry.hasValidName = true;
+                    entry.variants = BSA::getTextureSuffixVariants(textureName->c_str());
+                } else {
+                    entry.hasValidName = false;
+                    entry.variants = nullptr;
+                }
+                cacheIt = textureSuffixResolutionCache.emplace(rs->texture, std::move(entry)).first;
+            }
+            
+            // Use cached resolution
+            if (cacheIt->second.hasValidName) {
+                // Check if texture name actually changed
+                if (bindingCache.currentBaseTextureName != cacheIt->second.textureName) {
+                    // Base texture changed, update cache and bind new suffix textures
+                    bindingCache.currentBaseTextureName = cacheIt->second.textureName;
+                    bindingCache.boundDiffParam = nullptr;
+                    bindingCache.boundNormal = nullptr;
+                    
+                    if (cacheIt->second.variants) {
+                        if (textureFlags.hasDiffParam && cacheIt->second.variants->hasDiffParam()) {
+                            IDirect3DTexture9* diffParamTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *cacheIt->second.variants, "diffparam");
+                            if (diffParamTexture) {
+                                device->SetTexture(2, diffParamTexture);  // Bind to slot 2
+                                bindingCache.boundDiffParam = diffParamTexture;
+                            }
+                        }
+                        
+                        if (textureFlags.hasNormal && cacheIt->second.variants->hasNormal()) {
+                            IDirect3DTexture9* normalTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *cacheIt->second.variants, "normal");
+                            if (normalTexture) {
+                                device->SetTexture(3, normalTexture);  // Bind to slot 3  
+                                bindingCache.boundNormal = normalTexture;
+                            }
+                        }
                     }
                 }
-                
-                if (textureFlags.hasNormal && variants->hasNormal()) {
-                    IDirect3DTexture9* normalTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *variants, "normal");
-                    if (normalTexture) {
-                        device->SetTexture(3, normalTexture);  // Bind to slot 3  
-                    }
-                }
+                bindingCache.lastBaseTexture = rs->texture;
             }
         }
     }
