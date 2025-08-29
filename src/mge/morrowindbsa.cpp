@@ -405,7 +405,7 @@ static const char* getSuffixType(const std::string& texPath) {
         return "normal";
     }
     if (baseName.length() > 6 && baseName.substr(baseName.length() - 6) == "_param") {
-        return "diffparam";
+        return "param";
     }
     
     return nullptr; // Base texture
@@ -454,6 +454,24 @@ void buildTextureSuffixDatabase() {
             suffixFilesFound++;
             
             LOG::logline("-- Found loose normal: %s -> base: %s", filename.c_str(), baseName.c_str());
+        } while (FindNextFile(hFind, &findFileData));
+        FindClose(hFind);
+    }
+    
+    // Scan for _param.dds files
+    hFind = FindFirstFile("Data Files\\textures\\*_param.dds", &findFileData);
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            std::string filename = findFileData.cFileName;
+            std::string normalizedPath = normalizeTexturePath(filename.c_str());
+            std::string baseName = extractBaseName(normalizedPath);
+            
+            TextureSuffixVariants& variants = suffixMap[baseName];
+            variants.baseName = baseName;
+            variants.param = "textures/" + filename;
+            suffixFilesFound++;
+            
+            LOG::logline("-- Found loose param: %s -> base: %s", filename.c_str(), baseName.c_str());
         } while (FindNextFile(hFind, &findFileData));
         FindClose(hFind);
     }
@@ -659,6 +677,8 @@ IDirect3DTexture9* loadSuffixTexture(IDirect3DDevice9* dev, const TextureSuffixV
         texturePath = variants.diffparam.c_str();
     } else if (strcmp(suffixType, "normal") == 0 && variants.hasNormal()) {
         texturePath = variants.normal.c_str();
+    } else if (strcmp(suffixType, "param") == 0 && variants.hasParam()) {
+        texturePath = variants.param.c_str();
     }
     
     if (texturePath) {

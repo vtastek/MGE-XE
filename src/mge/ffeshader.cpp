@@ -43,6 +43,7 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::hlslShaderDefaultPurple;
 struct SuffixTextureFlags {
     bool hasDiffParam = false;
     bool hasNormal = false;
+    bool hasParam = false;
 } static suffixFlags;
 
 // Cache for per-texture suffix flags to avoid repeated hash calculations
@@ -68,14 +69,15 @@ struct SuffixBindingState {
     std::string currentBaseTextureName;
     IDirect3DTexture9* boundDiffParam;
     IDirect3DTexture9* boundNormal;
+    IDirect3DTexture9* boundParam;
     
-    SuffixBindingState() : lastBaseTexture(nullptr), boundDiffParam(nullptr), boundNormal(nullptr) {}
+    SuffixBindingState() : lastBaseTexture(nullptr), boundDiffParam(nullptr), boundNormal(nullptr), boundParam(nullptr) {}
 };
 static SuffixBindingState bindingCache;
 
 // Get suffix flags for a specific texture (per-texture, not global)
 static SuffixTextureFlags getSuffixFlagsForTexture(IDirect3DDevice9* device, IDirect3DTexture9* texture) {
-    SuffixTextureFlags flags = {false, false};
+    SuffixTextureFlags flags = {false, false, false};
     
     if (!texture || !Configuration.UseHLSLPipeline || !Configuration.EnableTextureSuffixes) {
         return flags;
@@ -95,21 +97,40 @@ static SuffixTextureFlags getSuffixFlagsForTexture(IDirect3DDevice9* device, IDi
         const std::string* textureName = BSA::resolveTextureNameFromHash(texHash);
         if (textureName) {
             // Hash lookup successful
-            LOG::logline("RUNTIME HASH MATCH: %08x -> %s", texHash.crc32, textureName->c_str());
+            // LOG::logline("RUNTIME HASH MATCH: %08x -> %s", texHash.crc32, textureName->c_str());
             
             // Look up suffix variants for this specific texture
             const BSA::TextureSuffixVariants* variants = BSA::getTextureSuffixVariants(textureName->c_str());
-            if (variants && (variants->hasDiffParam() || variants->hasNormal())) {
-                flags.hasDiffParam = variants->hasDiffParam();
-                flags.hasNormal = variants->hasNormal();
+            if (variants && (variants->hasDiffParam() || variants->hasNormal() || variants->hasParam())) {
+                // Priority-based suffix selection (only one type active at a time)
+                // Priority: _diffparam > _param > _nh
+                if (variants->hasDiffParam()) {
+                    flags.hasDiffParam = true;
+                    flags.hasNormal = variants->hasNormal();  // Normal maps can coexist
+                    flags.hasParam = false;  // Exclude _param when _diffparam is present
+                } else if (variants->hasParam()) {
+                    flags.hasDiffParam = false;
+                    flags.hasNormal = variants->hasNormal();  // Normal maps can coexist
+                    flags.hasParam = true;
+                } else if (variants->hasNormal()) {
+                    flags.hasDiffParam = false;
+                    flags.hasNormal = true;
+                    flags.hasParam = false;
+                }
                 
-                LOG::logline("PER-TEXTURE SUFFIX: %s has %s%s", textureName->c_str(),
-                           flags.hasDiffParam ? "diffparam " : "", 
-                           flags.hasNormal ? "normal" : "");
+                // DEBUG: Log suffix selection decision and the actual variant paths
+                //LOG::logline("DEBUG SUFFIX SELECTION: %s -> selected: diffparam=%d normal=%d param=%d", 
+                //           textureName->c_str(), flags.hasDiffParam, flags.hasNormal, flags.hasParam);
+                // LOG::logline("DEBUG AVAILABLE VARIANTS: diffparam='%s' normal='%s' param='%s'",
+                //          variants->diffparam.c_str(), variants->normal.c_str(), variants->param.c_str());
+                
+                //const char* selectedType = flags.hasDiffParam ? "diffparam+normal" : 
+                //                         (flags.hasParam ? "param+normal" : "normal-only");
+                // LOG::logline("PER-TEXTURE SUFFIX: %s -> SELECTED: %s", textureName->c_str(), selectedType);
             }
         } else {
             // Hash lookup failed
-            LOG::logline("RUNTIME HASH FAILED: %08x -> NO MATCH FOUND", texHash.crc32);
+            // LOG::logline("RUNTIME HASH FAILED: %08x -> NO MATCH FOUND", texHash.crc32);
         }
     }
     
@@ -841,6 +862,13 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
     SuffixTextureFlags textureFlags = getSuffixFlagsForTexture((IDirect3DDevice9*)device, rs->texture);
     sk.hasDiffParam = textureFlags.hasDiffParam;
     sk.hasNormal = textureFlags.hasNormal;
+    sk.hasParam = textureFlags.hasParam;
+    
+    // DEBUG: Log final shader key flags
+    if (textureFlags.hasDiffParam || textureFlags.hasNormal || textureFlags.hasParam) {
+        //LOG::logline("DEBUG SHADER KEY: Setting flags diffparam=%d normal=%d param=%d", 
+        //           sk.hasDiffParam, sk.hasNormal, sk.hasParam);
+    }
 
     if (sk == hlslShaderLRU.last_sk) {
         hlslShader = hlslShaderLRU.shader;
@@ -850,7 +878,11 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
 
         if (iShader != cacheHLSLShaders.end()) {
             hlslShader = iShader->second;
+            // LOG::logline("DEBUG CACHE HIT: Using cached shader with flags diffparam=%d normal=%d param=%d", 
+            //           sk.hasDiffParam, sk.hasNormal, sk.hasParam);
         } else {
+            //LOG::logline("DEBUG CACHE MISS: Generating new shader with flags diffparam=%d normal=%d param=%d", 
+            //           sk.hasDiffParam, sk.hasNormal, sk.hasParam);
             hlslShader = generateMWShaderHLSL(sk);
         }
 
@@ -859,7 +891,7 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
     }
     
     // Load and bind suffix textures if this texture has them
-    if (textureFlags.hasDiffParam || textureFlags.hasNormal) {
+    if (textureFlags.hasDiffParam || textureFlags.hasNormal || textureFlags.hasParam) {
         // Fast check: if same texture pointer, skip all expensive operations
         if (bindingCache.lastBaseTexture != rs->texture) {
             // Check texture suffix resolution cache first
@@ -888,6 +920,12 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
                     bindingCache.currentBaseTextureName = cacheIt->second.textureName;
                     bindingCache.boundDiffParam = nullptr;
                     bindingCache.boundNormal = nullptr;
+                    bindingCache.boundParam = nullptr;
+                    
+                    // Clear all suffix texture slots first
+                    device->SetTexture(2, nullptr);  // Clear diffparam slot
+                    device->SetTexture(3, nullptr);  // Clear normal slot  
+                    device->SetTexture(4, nullptr);  // Clear param slot
                     
                     if (cacheIt->second.variants) {
                         if (textureFlags.hasDiffParam && cacheIt->second.variants->hasDiffParam()) {
@@ -895,6 +933,7 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
                             if (diffParamTexture) {
                                 device->SetTexture(2, diffParamTexture);  // Bind to slot 2
                                 bindingCache.boundDiffParam = diffParamTexture;
+                                // LOG::logline("DEBUG BIND: diffparam -> slot 2, texture ptr=%p", diffParamTexture);
                             }
                         }
                         
@@ -903,6 +942,15 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
                             if (normalTexture) {
                                 device->SetTexture(3, normalTexture);  // Bind to slot 3  
                                 bindingCache.boundNormal = normalTexture;
+                            }
+                        }
+                        
+                        if (textureFlags.hasParam && cacheIt->second.variants->hasParam()) {
+                            IDirect3DTexture9* paramTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *cacheIt->second.variants, "param");
+                            if (paramTexture) {
+                                device->SetTexture(4, paramTexture);  // Bind to slot 4  
+                                bindingCache.boundParam = paramTexture;
+                                // LOG::logline("DEBUG BIND: param -> slot 4, texture ptr=%p", paramTexture);
                             }
                         }
                     }
@@ -1143,21 +1191,21 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         if (hLightSunDirection) {
             hlslShader.psConstantTable->SetFloatArray(device, hLightSunDirection, (const float*)&sunDirection, 3);
         } else {
-            LOG::logline("!! lightSunDirection constant not found in pixel shader");
+            // logline("!! lightSunDirection constant not found in pixel shader");
         }
         
         D3DXHANDLE hLightSunDiffuse = hlslShader.psConstantTable->GetConstantByName(NULL, "lightSunDiffuse");
         if (hLightSunDiffuse) {
             hlslShader.psConstantTable->SetFloatArray(device, hLightSunDiffuse, (const float*)&sunDiffuse, 3);
         } else {
-            LOG::logline("!! lightSunDiffuse constant not found in pixel shader");
+            // LOG::logline("!! lightSunDiffuse constant not found in pixel shader");
         }
         
         D3DXHANDLE hLightSceneAmbient = hlslShader.psConstantTable->GetConstantByName(NULL, "lightSceneAmbient");
         if (hLightSceneAmbient) {
             hlslShader.psConstantTable->SetFloatArray(device, hLightSceneAmbient, (const float*)&ambient, 3);
         } else {
-            LOG::logline("!! lightSceneAmbient constant not found in pixel shader");
+            // LOG::logline("!! lightSceneAmbient constant not found in pixel shader");
         }
         
         // Set light arrays in pixel shader (same as Effect shader approach)
@@ -1165,7 +1213,7 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         if (hLightDiffuse) {
             hlslShader.psConstantTable->SetVectorArray(device, hLightDiffuse, bufferDiffuse, MaxLights);
         } else {
-            LOG::logline("!! lightDiffuse array constant not found in pixel shader");
+            // LOG::logline("!! lightDiffuse array constant not found in pixel shader");
         }
         
         D3DXHANDLE hLightPosition = hlslShader.psConstantTable->GetConstantByName(NULL, "lightPosition");
@@ -1179,7 +1227,7 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
             }
             hlslShader.psConstantTable->SetFloatArray(device, hLightPosition, (float*)hlslLightPositions, 3 * MaxLights);
         } else {
-            LOG::logline("!! HLSL ERROR: lightPosition array constant not found in pixel shader");
+            // LOG::logline("!! HLSL ERROR: lightPosition array constant not found in pixel shader");
         }
         
         // Set light ambient array
@@ -1187,7 +1235,7 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         if (hLightAmbient) {
             hlslShader.psConstantTable->SetFloatArray(device, hLightAmbient, bufferAmbient, MaxLights);
         } else {
-            LOG::logline("!! lightAmbient array constant not found in pixel shader");
+            // LOG::logline("!! lightAmbient array constant not found in pixel shader");
         }
         
         // Set pointLightCount uniform for HLSL (CRITICAL FIX)
@@ -1196,7 +1244,7 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
             hlslShader.psConstantTable->SetInt(device, hPointLightCount, (int)pointLightCount);
             // LOG::logline("HLSL: Set pointLightCount to %d", (int)pointLightCount);
         } else {
-            LOG::logline("!! HLSL ERROR: pointLightCount constant not found in pixel shader");
+            // LOG::logline("!! HLSL ERROR: pointLightCount constant not found in pixel shader");
         }
         
         // Set falloff constants using Effect shader approach (quadratic + constant only)
@@ -1224,7 +1272,7 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
             float shadingModeData[4] = {0, 0, (float)sk.vertexMaterial, 0};
             hlslShader.psConstantTable->SetFloatArray(device, hShadingMode, shadingModeData, 4);
         } else {
-            LOG::logline("!! shadingMode constant not found in pixel shader");
+            // LOG::logline("!! shadingMode constant not found in pixel shader");
         }
         
         // Set fog color
@@ -1348,7 +1396,7 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
                 if (hNormres) {
                     hlslShader.psConstantTable->SetFloatArray(device, hNormres, (float*)&normres, 2);
                 } else {
-                    LOG::logline("HLSL: normres constant not found in pixel shader");
+                    // LOG::logline("HLSL: normres constant not found in pixel shader");
                 }
                 
                 normalTexture->Release();
@@ -1358,7 +1406,7 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
     
     // Error checking for vertex/index buffers
     if (!rs->vb) {
-        LOG::logline("!! HLSL pipeline: null vertex buffer, skipping draw call");
+        // LOG::logline("!! HLSL pipeline: null vertex buffer, skipping draw call");
         return;
     }
     
@@ -1488,20 +1536,32 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     CloseHandle(hFile);
 
     // Build shader defines based on ShaderKey
-    D3D_SHADER_MACRO defines[4] = {};
+    D3D_SHADER_MACRO defines[7] = {};
     int defineCount = 0;
     
     if (sk.hasDiffParam) {
         defines[defineCount++] = {"HAS_DIFFPARAM", "1"};
-        LOG::logline("HLSL: Compiling with HAS_DIFFPARAM define");
+        // LOG::logline("HLSL: Compiling with HAS_DIFFPARAM define");
     }
     if (sk.hasNormal) {
         defines[defineCount++] = {"HAS_NORMAL", "1"};
-        LOG::logline("HLSL: Compiling with HAS_NORMAL define");
+        // LOG::logline("HLSL: Compiling with HAS_NORMAL define");
+    }
+    if (sk.hasParam) {
+        defines[defineCount++] = {"HAS_PARAM", "1"};
+        // LOG::logline("HLSL: Compiling with HAS_PARAM define");
+    }
+    if (!sk.useLighting) {
+        defines[defineCount++] = {"NOLIT", "1"};
+        // LOG::logline("HLSL: Compiling with NOLIT define (unlit shader)");
+    }
+    if (sk.noPointLights && sk.useLighting) {
+        defines[defineCount++] = {"NO_POINT_LIGHTS", "1"};
+        // LOG::logline("HLSL: Compiling with NO_POINT_LIGHTS define (wilderness shader)");
     }
     defines[defineCount] = {nullptr, nullptr}; // Null terminator
     
-    LOG::logline("HLSL: Compiling shader with %d defines", defineCount);
+    // LOG::logline("HLSL: Compiling shader with %d defines", defineCount);
     
     // Compile vertex shader
     ID3DBlob* vsBlob = nullptr;
@@ -1515,7 +1575,7 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         nullptr, // Include handler
         vertexShaderName,
         "vs_3_0",
-        D3DCOMPILE_OPTIMIZATION_LEVEL3,
+        D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_PREFER_FLOW_CONTROL | D3DCOMPILE_IEEE_STRICTNESS,
         0,
         &vsBlob,
         &vsErrors
@@ -1552,6 +1612,9 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         &hlslShader.vsConstantTable
     );
     
+    // Log VS blob size before releasing
+    // LOG::logline("-- HLSL VS blob size: %u bytes", vsBlob->GetBufferSize());
+    
     vsBlob->Release();
     
     // Compile pixel shader using same source
@@ -1566,7 +1629,7 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         nullptr, // Include handler
         pixelShaderName,
         "ps_3_0",
-        D3DCOMPILE_OPTIMIZATION_LEVEL3,
+        D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_PREFER_FLOW_CONTROL | D3DCOMPILE_IEEE_STRICTNESS,
         0,
         &psBlob,
         &psErrors
@@ -1615,15 +1678,21 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         LOG::logline("HLSL: Failed to extract pixel shader constant table, hr=%x", hr);
     }
     
+    // Log compilation details for debugging (before releasing blobs)
+    LOG::logline("-- HLSL shader compiled successfully: VS=%s PS=%s", vertexShaderName, pixelShaderName);
+    // LOG::logline("-- HLSL PS blob size: %u bytes", psBlob->GetBufferSize());
+    
     psBlob->Release();
     
     // Clean up shader source
     delete[] shaderSource;
     
+    // Log shader key details
+    // LOG::logline("-- HLSL ShaderKey: hasDiffParam=%d hasNormal=%d hasParam=%d", sk.hasDiffParam, sk.hasNormal, sk.hasParam);
+    
     // Cache the compiled shader
     cacheHLSLShaders[sk] = hlslShader;
     
-    LOG::logline("-- HLSL shader compiled successfully: VS=%s PS=%s", vertexShaderName, pixelShaderName);
     return hlslShader;
 }
 
@@ -1668,6 +1737,8 @@ FixedFunctionShader::ShaderKey::ShaderKey(const RenderedState* rs, const Fragmen
     uvSets = (rs->fvf & D3DFVF_TEXCOUNT_MASK) >> D3DFVF_TEXCOUNT_SHIFT;
     usesSkinning = rs->vertexBlendState ? 1 : 0;
     vertexColour = (rs->fvf & D3DFVF_DIFFUSE) ? 1 : 0;
+    useLighting = rs->useLighting ? 1 : 0;
+    noPointLights = (rs->useLighting && lightrs->active.empty()) ? 1 : 0;
 
     // Match constant material, diffuse+ambient vcol, or emissive vcol
     if (rs->useLighting) {
@@ -1764,10 +1835,10 @@ void FixedFunctionShader::ShaderKey::log() const {
         snprintf(hex, sizeof hex, "%02x ", dump[i]);
         stream << hex;
     }
-    LOG::logline("%s", stream.str().c_str());
+    // LOG::logline("%s", stream.str().c_str());
 
-    LOG::logline("   Input state: UVs:%d skin:%d vcol:%d lights:%d vmat:%d fogm:%d", uvSets, usesSkinning, vertexColour, vertexMaterial ? (heavyLighting ? 8 : 4) : 0, vertexMaterial, fogMode);
-    LOG::logline("   Texture stages:");
+    // LOG::logline("   Input state: UVs:%d skin:%d vcol:%d lights:%d vmat:%d fogm:%d", uvSets, usesSkinning, vertexColour, vertexMaterial ? (heavyLighting ? 8 : 4) : 0, vertexMaterial, fogMode);
+    // LOG::logline("   Texture stages:");
     for (int i = 0; i != activeStages; ++i) {
         const auto& s = stage[i];
         if (s.colorOp != D3DTOP_MULTIPLYADD) { // or D3DTOP_LERP (unused)
@@ -1785,5 +1856,5 @@ void FixedFunctionShader::ShaderKey::log() const {
             LOG::logline("           A % 12s    %s", opSymbols[D3DTOP_SELECTARG1], argSymbols[s.colorArg1]);
         }
     }
-    LOG::logline("");
+    // LOG::logline("");
 }

@@ -68,6 +68,8 @@ class FixedFunctionShader {
         DWORD usesSkinning : 1;
         DWORD vertexColour : 1;
         DWORD heavyLighting : 1;
+        DWORD useLighting : 1;
+        DWORD noPointLights : 1;
         DWORD vertexMaterial : 2;
         DWORD fogMode : 2;
         DWORD activeStages : 3;
@@ -78,6 +80,7 @@ class FixedFunctionShader {
         DWORD texgenStage : 3;
         DWORD hasDiffParam : 1;        // Has diffuse parameter texture (_diffparam)
         DWORD hasNormal : 1;           // Has normal map texture (_nh)
+        DWORD hasParam : 1;            // Has parameter texture (_param)
 
         struct Stage {
             DWORD colorOp : 6;
@@ -112,7 +115,7 @@ class FixedFunctionShader {
     static ShaderLRU shaderLRU;
     static ID3DXEffect* effectDefaultPurple;
 
-    static D3DXHANDLE ehWorld, ehWorldView;
+    static D3DXHANDLE ehWorld, ehWorldView, ehView;
     static D3DXHANDLE ehVertexBlendState, ehVertexBlendPalette;
     static D3DXHANDLE ehTex0, ehTex1, ehTex2, ehTex3, ehTex4, ehTex5;
     static D3DXHANDLE ehMaterialDiffuse, ehMaterialAmbient, ehMaterialEmissive;

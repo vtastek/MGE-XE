@@ -14,11 +14,13 @@ namespace BSA {
         std::string baseName;
         std::string diffparam;         // _diffparam texture path
         std::string normal;            // _nh texture path
+        std::string param;             // _param texture path
         std::string baseTextureSource; // "loose" or "bsa"  
         std::string baseTexturePath;   // Full path to base texture
         
         bool hasDiffParam() const { return !diffparam.empty(); }
         bool hasNormal() const { return !normal.empty(); }
+        bool hasParam() const { return !param.empty(); }
     };
     
     // Texture runtime hash for identification
