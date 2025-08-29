@@ -64,21 +64,95 @@ static SuffixTextureFlags getSuffixFlagsForTexture(IDirect3DDevice9* device, IDi
         return cacheIt->second;  // Return cached result
     }
     
-    // Not in cache - calculate hash and determine suffix flags
-    BSA::TextureRuntimeHash texHash = BSA::calculateTextureHash(device, texture);
+    // Not in cache - calculate hash and determine suffix flags (disable caching for unique hashes)
+    BSA::TextureRuntimeHash texHash = BSA::calculateTextureHash(device, texture, false);
     
-    // Try to resolve texture name from hash
-    const std::string* textureName = BSA::resolveTextureNameFromHash(texHash);
-    if (textureName && texHash.crc32 != 0) {
-        // Look up suffix variants for this specific texture
-        const BSA::TextureSuffixVariants* variants = BSA::getTextureSuffixVariants(textureName->c_str());
-        if (variants && (variants->hasDiffParam() || variants->hasNormal())) {
-            flags.hasDiffParam = variants->hasDiffParam();
-            flags.hasNormal = variants->hasNormal();
+    if (texHash.crc32 != 0) {
+        // Try to resolve texture name from hash
+        const std::string* textureName = BSA::resolveTextureNameFromHash(texHash);
+        if (textureName) {
+            // Hash lookup successful
+            LOG::logline("RUNTIME HASH MATCH: %08x -> %s", texHash.crc32, textureName->c_str());
             
-            LOG::logline("PER-TEXTURE SUFFIX: %s has %s%s", textureName->c_str(),
-                       flags.hasDiffParam ? "diffparam " : "", 
-                       flags.hasNormal ? "normal" : "");
+            // Dump runtime texture using same extraction method as BSA textures
+            char dumpPath[512];
+            std::string cleanName = *textureName;
+            std::replace(cleanName.begin(), cleanName.end(), '/', '_');
+            snprintf(dumpPath, sizeof(dumpPath), "runtimedump/%s_%08x.dds", 
+                   cleanName.c_str(), texHash.crc32);
+            
+            // Create runtimedump directory if it doesn't exist
+            CreateDirectoryA("runtimedump", nullptr);
+            
+            // Use identical extraction pipeline as BSA textures for comparison
+            D3DSURFACE_DESC desc;
+            bool dumpSuccess = false;
+            if (SUCCEEDED(texture->GetLevelDesc(0, &desc))) {
+                UINT mipLevels = texture->GetLevelCount();
+                LOG::logline("-- Runtime texture %s: %dx%d, format=%d, pool=%d, mips=%d", 
+                           textureName->c_str(), desc.Width, desc.Height, desc.Format, desc.Pool, mipLevels);
+                
+                // Create staging texture with same mipmap count as original
+                IDirect3DTexture9* extractStagingTexture = nullptr;
+                HRESULT hr = device->CreateTexture(desc.Width, desc.Height, mipLevels, 0, desc.Format, D3DPOOL_SYSTEMMEM, &extractStagingTexture, nullptr);
+                
+                if (SUCCEEDED(hr) && extractStagingTexture) {
+                    // Extract all mip levels
+                    bool allLevelsExtracted = true;
+                    for (UINT level = 0; level < mipLevels; level++) {
+                        IDirect3DSurface9* srcSurface = nullptr;
+                        IDirect3DSurface9* dstSurface = nullptr;
+                        
+                        if (SUCCEEDED(texture->GetSurfaceLevel(level, &srcSurface)) &&
+                            SUCCEEDED(extractStagingTexture->GetSurfaceLevel(level, &dstSurface))) {
+                            
+                            // Use same multi-tier extraction as calculateTextureHash
+                            HRESULT extractHr = device->GetRenderTargetData(srcSurface, dstSurface);
+                            if (FAILED(extractHr)) {
+                                extractHr = device->StretchRect(srcSurface, nullptr, dstSurface, nullptr, D3DTEXF_NONE);
+                            }
+                            
+                            if (FAILED(extractHr)) {
+                                allLevelsExtracted = false;
+                                LOG::logline("!! Failed to extract runtime texture level %d: %s", level, textureName->c_str());
+                            }
+                            
+                            if (srcSurface) srcSurface->Release();
+                            if (dstSurface) dstSurface->Release();
+                        } else {
+                            allLevelsExtracted = false;
+                            break;
+                        }
+                    }
+                    
+                    if (allLevelsExtracted) {
+                        HRESULT saveHr = D3DXSaveTextureToFile(dumpPath, D3DXIFF_DDS, extractStagingTexture, nullptr);
+                        if (SUCCEEDED(saveHr)) {
+                            dumpSuccess = true;
+                        }
+                    }
+                    
+                    extractStagingTexture->Release();
+                }
+            }
+            
+            if (!dumpSuccess) {
+                LOG::logline("!! Failed to dump runtime texture: %s", textureName->c_str());
+            }
+            
+            // Look up suffix variants for this specific texture
+            const BSA::TextureSuffixVariants* variants = BSA::getTextureSuffixVariants(textureName->c_str());
+            if (variants && (variants->hasDiffParam() || variants->hasNormal())) {
+                flags.hasDiffParam = variants->hasDiffParam();
+                flags.hasNormal = variants->hasNormal();
+                
+                LOG::logline("PER-TEXTURE SUFFIX: %s has %s%s", textureName->c_str(),
+                           flags.hasDiffParam ? "diffparam " : "", 
+                           flags.hasNormal ? "normal" : "");
+            }
+        } else {
+            // Hash lookup failed
+            LOG::logline("RUNTIME HASH FAILED: %08x -> NO MATCH FOUND", texHash.crc32);
         }
     }
     
@@ -829,8 +903,8 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
     
     // Load and bind suffix textures if this texture has them
     if (textureFlags.hasDiffParam || textureFlags.hasNormal) {
-        // Get texture name for suffix loading
-        BSA::TextureRuntimeHash texHash = BSA::calculateTextureHash((IDirect3DDevice9*)device, rs->texture);
+        // Get texture name for suffix loading (disable caching for unique hashes)
+        BSA::TextureRuntimeHash texHash = BSA::calculateTextureHash((IDirect3DDevice9*)device, rs->texture, false);
         const std::string* textureName = BSA::resolveTextureNameFromHash(texHash);
         if (textureName && texHash.crc32 != 0) {
             const BSA::TextureSuffixVariants* variants = BSA::getTextureSuffixVariants(textureName->c_str());

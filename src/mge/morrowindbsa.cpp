@@ -2,6 +2,7 @@
 #include "morrowindbsa.h"
 #include "proxydx/d3d8header.h"
 #include "support/log.h"
+#include "configuration.h"
 
 #include <cstdio>
 #include <cstring>
@@ -410,123 +411,105 @@ static const char* getSuffixType(const std::string& texPath) {
     return nullptr; // Base texture
 }
 
-// buildTextureSuffixDatabase - Analyze BSA contents to build texture suffix mapping
+// buildTextureSuffixDatabase - New suffix-first approach: find loose suffixes, then their bases
 void buildTextureSuffixDatabase() {
     if (textureSuffixDatabaseBuilt) return;
     
-    LOG::logline("-- Building texture suffix database from BSA files");
-    int totalTextures = 0;
-    int suffixTextures = 0;
+    LOG::logline("-- Building texture suffix database (suffix-first approach)");
     
-    // Iterate through all cached BSA entries to find texture files
-    for (const auto& entry : cacheMap) {
-        const CacheEntry& cacheEntry = entry.second;
-        const std::string& filename = cacheEntry.filename;
-        
-        // Skip non-texture files - check if filename contains "textures/"
-        if (filename.find("textures/") == std::string::npos && filename.find("textures\\") == std::string::npos) {
-            continue;
-        }
-        
-        // Check if it's a texture file (dds, tga, bmp)
-        size_t dotPos = filename.find_last_of('.');
-        if (dotPos == std::string::npos) continue;
-        
-        std::string extension = filename.substr(dotPos + 1);
-        std::transform(extension.begin(), extension.end(), extension.begin(), ::tolower);
-        
-        if (extension != "dds" && extension != "tga" && extension != "bmp") {
-            continue;
-        }
-        
-        totalTextures++;
-        
-        // Extract just the filename part (remove directory path)
-        size_t slashPos = filename.find_last_of("/\\");
-        std::string textureName = (slashPos != std::string::npos) ? filename.substr(slashPos + 1) : filename;
-        std::string normalizedPath = normalizeTexturePath(textureName.c_str());
-        
-        const char* suffixType = getSuffixType(normalizedPath);
-        if (suffixType) {
-            suffixTextures++;
-            std::string baseName = extractBaseName(normalizedPath);
-            
-            // Create or update suffix variants entry
-            TextureSuffixVariants& variants = textureSuffixDatabase[baseName];
-            variants.baseName = baseName;
-            
-            if (strcmp(suffixType, "diffparam") == 0) {
-                variants.diffparam = filename;  // Store full BSA path
-            } else if (strcmp(suffixType, "normal") == 0) {
-                variants.normal = filename;  // Store full BSA path
-            }
-            
-            LOG::logline("BSA: Found %s texture: %s -> base: %s", suffixType, filename.c_str(), baseName.c_str());
-        }
-        
-        // Also store base textures for hash mapping
-        if (!suffixType) {
-            std::string baseName = extractBaseName(normalizedPath);
-            TextureSuffixVariants& variants = textureSuffixDatabase[baseName];
-            if (variants.baseName.empty()) {
-                variants.baseName = baseName;
-            }
-        }
-    }
+    // Phase 1: Discover all loose suffix files
+    std::unordered_map<std::string, TextureSuffixVariants> suffixMap;
+    int suffixFilesFound = 0;
     
-    // Fallback: Also scan Data Files/textures for additional suffix textures
+    // Scan for _diffparam.dds files
     WIN32_FIND_DATA findFileData;
     HANDLE hFind = FindFirstFile("Data Files\\textures\\*_diffparam.dds", &findFileData);
-    
     if (hFind != INVALID_HANDLE_VALUE) {
         do {
             std::string filename = findFileData.cFileName;
             std::string normalizedPath = normalizeTexturePath(filename.c_str());
+            std::string baseName = extractBaseName(normalizedPath);
             
-            const char* suffixType = getSuffixType(normalizedPath);
-            if (suffixType) {
-                std::string baseName = extractBaseName(normalizedPath);
-                
-                TextureSuffixVariants& variants = textureSuffixDatabase[baseName];
-                variants.baseName = baseName;
-                
-                if (strcmp(suffixType, "diffparam") == 0 && variants.diffparam.empty()) {
-                    variants.diffparam = "textures/" + filename;
-                    suffixTextures++;
-                    totalTextures++;
-                }
-            }
+            TextureSuffixVariants& variants = suffixMap[baseName];
+            variants.baseName = baseName;
+            variants.diffparam = "textures/" + filename;
+            suffixFilesFound++;
+            
+            LOG::logline("-- Found loose diffparam: %s -> base: %s", filename.c_str(), baseName.c_str());
         } while (FindNextFile(hFind, &findFileData));
         FindClose(hFind);
     }
     
+    // Scan for _nh.dds files
     hFind = FindFirstFile("Data Files\\textures\\*_nh.dds", &findFileData);
     if (hFind != INVALID_HANDLE_VALUE) {
         do {
             std::string filename = findFileData.cFileName;
             std::string normalizedPath = normalizeTexturePath(filename.c_str());
+            std::string baseName = extractBaseName(normalizedPath);
             
-            const char* suffixType = getSuffixType(normalizedPath);
-            if (suffixType) {
-                std::string baseName = extractBaseName(normalizedPath);
-                
-                TextureSuffixVariants& variants = textureSuffixDatabase[baseName];
-                variants.baseName = baseName;
-                
-                if (strcmp(suffixType, "normal") == 0 && variants.normal.empty()) {
-                    variants.normal = "textures/" + filename;
-                    suffixTextures++;
-                    totalTextures++;
-                }
-            }
+            TextureSuffixVariants& variants = suffixMap[baseName];
+            variants.baseName = baseName;
+            variants.normal = "textures/" + filename;
+            suffixFilesFound++;
+            
+            LOG::logline("-- Found loose normal: %s -> base: %s", filename.c_str(), baseName.c_str());
         } while (FindNextFile(hFind, &findFileData));
         FindClose(hFind);
     }
     
-    // Hash database building is handled separately in ffeshader.cpp on first texture render
+    // Phase 2: For each base name, find the actual base texture (loose overrides BSA)
+    int basesFound = 0;
+    for (auto& pair : suffixMap) {
+        const std::string& baseName = pair.first;
+        TextureSuffixVariants& variants = pair.second;
+        
+        // Check for loose base texture first (highest priority)
+        std::string looseBasePath = "Data Files\\textures\\" + baseName.substr(baseName.find_last_of("/\\") + 1) + ".dds";
+        WIN32_FIND_DATA fileData;
+        HANDLE hFile = FindFirstFile(looseBasePath.c_str(), &fileData);
+        
+        if (hFile != INVALID_HANDLE_VALUE) {
+            // Found loose base texture
+            variants.baseTextureSource = "loose";
+            variants.baseTexturePath = looseBasePath;
+            basesFound++;
+            LOG::logline("-- Base texture (loose): %s", baseName.c_str());
+            FindClose(hFile);
+        } else {
+            // Check BSA files for base texture
+            std::string bsaPath = baseName + ".dds";
+            bool foundInBSA = false;
+            
+            for (const auto& entry : cacheMap) {
+                const std::string& filename = entry.second.filename;
+                if (filename.find(bsaPath) != std::string::npos) {
+                    variants.baseTextureSource = "bsa";
+                    variants.baseTexturePath = filename;
+                    basesFound++;
+                    foundInBSA = true;
+                    LOG::logline("-- Base texture (BSA): %s", baseName.c_str());
+                    break;
+                }
+            }
+            
+            if (!foundInBSA) {
+                LOG::logline("-- WARNING: Base texture not found for: %s", baseName.c_str());
+            }
+        }
+    }
+    
+    // Phase 3: Move to final database (only entries with found base textures)
+    for (const auto& pair : suffixMap) {
+        const TextureSuffixVariants& variants = pair.second;
+        if (!variants.baseTextureSource.empty()) {
+            textureSuffixDatabase[variants.baseName] = variants;
+        }
+    }
     
     textureSuffixDatabaseBuilt = true;
-    LOG::logline("-- BSA: Built texture suffix database with %d total textures, %d suffix textures", totalTextures, suffixTextures);
+    LOG::logline("-- Suffix database built: %d suffix files, %d bases found, %d complete entries", 
+                suffixFilesFound, basesFound, (int)textureSuffixDatabase.size());
 }
 
 // getTextureSuffixVariants - Get suffix variants for a base texture name
@@ -543,7 +526,7 @@ const TextureSuffixVariants* getTextureSuffixVariants(const char* baseTextureNam
 }
 
 // calculateTextureHash - Calculate runtime hash of a texture for identification
-TextureRuntimeHash calculateTextureHash(IDirect3DDevice9* device, IDirect3DTexture9* texture) {
+TextureRuntimeHash calculateTextureHash(IDirect3DDevice9* device, IDirect3DTexture9* texture, bool useCache) {
     TextureRuntimeHash hash = {0, 0};
     
     if (!texture) {
@@ -556,21 +539,28 @@ TextureRuntimeHash calculateTextureHash(IDirect3DDevice9* device, IDirect3DTextu
         return hash;
     }
     
-    // Check cache first to avoid repeated calculations
+    // Check cache first to avoid repeated calculations (only if useCache is true)
     TextureCacheKey cacheKey = {desc.Width, desc.Height, desc.Format, desc.Pool};
-    auto cacheIt = runtimeTextureHashCache.find(cacheKey);
-    if (cacheIt != runtimeTextureHashCache.end()) {
-        return cacheIt->second;
+    if (useCache) {
+        auto cacheIt = runtimeTextureHashCache.find(cacheKey);
+        if (cacheIt != runtimeTextureHashCache.end()) {
+            return cacheIt->second;
+        }
     }
     
     // Filtering checks
     bool isDefaultPool = (desc.Pool == D3DPOOL_DEFAULT);
+    bool isManagedPool = (desc.Pool == D3DPOOL_MANAGED);
     bool isRenderTarget = (desc.Usage & D3DUSAGE_RENDERTARGET) != 0;
     bool isDepthStencil = (desc.Usage & D3DUSAGE_DEPTHSTENCIL) != 0;
     
-    // At runtime, only process DEFAULT pool textures (actual game textures)
-    // MANAGED pool textures at runtime are likely our own BSA textures causing issues
-    if (!isDefaultPool) {
+    // Dynamic pool filtering based on "Reduce Texture Memory Use" setting
+    // When enabled: runtime textures use D3DPOOL_DEFAULT
+    // When disabled: runtime textures use D3DPOOL_MANAGED
+    D3DPOOL expectedPool = Configuration.UseDefaultTexturePool ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED;
+    bool isExpectedPool = (desc.Pool == expectedPool);
+    
+    if (!isExpectedPool) {
         return hash; // Return zero hash for filtered textures
     }
     if (isRenderTarget || isDepthStencil) {
@@ -647,8 +637,10 @@ TextureRuntimeHash calculateTextureHash(IDirect3DDevice9* device, IDirect3DTextu
         return hash;
     }
     
-    // Cache the calculated hash for future use
-    runtimeTextureHashCache[cacheKey] = hash;
+    // Cache the calculated hash for future use (only if useCache is true)
+    if (useCache) {
+        runtimeTextureHashCache[cacheKey] = hash;
+    }
     
     return hash;
 }
@@ -851,11 +843,14 @@ void scanLooseTextureFiles(IDirect3DDevice9* dev, int& texturesHashed, int& text
                     continue;
                 }
                 
-                // Load texture from loose file using DEFAULT pool to match runtime loading
+                // Load texture from loose file using same pool as runtime textures
+                // Use same pool as runtime textures based on "Reduce Texture Memory Use" setting
+                D3DPOOL runtimePool = Configuration.UseDefaultTexturePool ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED;
+                
                 IDirect3DTexture9* looseTexture = nullptr;
                 HRESULT hr = D3DXCreateTextureFromFileEx(dev, fullPath, 
                     D3DX_DEFAULT, D3DX_DEFAULT, D3DX_DEFAULT, 0, D3DFMT_UNKNOWN, 
-                    D3DPOOL_DEFAULT, D3DX_DEFAULT, D3DX_DEFAULT, 0, nullptr, nullptr, &looseTexture);
+                    runtimePool, D3DX_DEFAULT, D3DX_DEFAULT, 0, nullptr, nullptr, &looseTexture);
                 
                 if (SUCCEEDED(hr) && looseTexture) {
                     // Log detailed texture properties for loose files
@@ -896,95 +891,201 @@ void scanLooseTextureFiles(IDirect3DDevice9* dev, int& texturesHashed, int& text
     }
 }
 
-// buildBSATextureHashDatabase - Build hash database from BSA textures that matches runtime format
+// buildBSATextureHashDatabase - Build hash database from base textures that have suffix variants
 void buildBSATextureHashDatabase(IDirect3DDevice9* dev) {
-    int texturesHashed = 0;
-    int texturesMatched = 0;
+    // Ensure suffix database is built first
+    if (!textureSuffixDatabaseBuilt) {
+        buildTextureSuffixDatabase();
+    }
     
     // Clear existing hash database
     textureHashToName.clear();
     
-    for (const auto& entry : cacheMap) {
-        const CacheEntry& cacheEntry = entry.second;
-        const std::string& filename = cacheEntry.filename;
+    int texturesHashed = 0;
+    int texturesMatched = 0;
+    
+    // Hash base textures from suffix database (only textures with suffix variants)
+    for (const auto& entry : textureSuffixDatabase) {
+        const std::string& baseName = entry.first;
+        const TextureSuffixVariants& variants = entry.second;
         
-        // Skip non-texture files
-        if (filename.find("textures/") == std::string::npos && filename.find("textures\\") == std::string::npos) {
-            continue;
+        IDirect3DTexture9* baseTexture = nullptr;
+        HRESULT hr = E_FAIL;
+        
+        // Load base texture based on source (loose overrides BSA)
+        if (variants.baseTextureSource == "loose") {
+            // Load from loose file
+            D3DPOOL runtimePool = Configuration.UseDefaultTexturePool ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED;
+            hr = D3DXCreateTextureFromFileEx(dev, variants.baseTexturePath.c_str(),
+                D3DX_DEFAULT, D3DX_DEFAULT, D3DX_DEFAULT, 0, D3DFMT_UNKNOWN,
+                runtimePool, D3DX_DEFAULT, D3DX_DEFAULT, 0, nullptr, nullptr, &baseTexture);
         }
-        
-        // Check if it's a texture file
-        size_t dotPos = filename.find_last_of('.');
-        if (dotPos == std::string::npos) continue;
-        
-        std::string extension = filename.substr(dotPos + 1);
-        std::transform(extension.begin(), extension.end(), extension.begin(), ::tolower);
-        
-        if (extension != "dds" && extension != "tga" && extension != "bmp") {
-            continue;
-        }
-        
-        texturesHashed++;
-        
-        // Read texture data from BSA
-        SetFilePointer(cacheEntry.file, cacheEntry.position, 0, FILE_BEGIN);
-        
-        auto buffer = std::make_unique<char[]>(cacheEntry.size);
-        DWORD bytesRead;
-        ReadFile(cacheEntry.file, buffer.get(), cacheEntry.size, &bytesRead, 0);
-        
-        if (bytesRead != cacheEntry.size) {
-            continue;
-        }
-        
-        // Try to load texture using D3DX to match runtime format
-        IDirect3DTexture9* bsaTexture = nullptr;
-        HRESULT hr = D3DXCreateTextureFromFileInMemory(
-            dev, buffer.get(), cacheEntry.size, &bsaTexture);
+        else if (variants.baseTextureSource == "bsa") {
+            // Load from BSA file using proven BSALoadFile method
+            BSAHash3 hash = hashString(variants.baseTexturePath.c_str());
+            EntryData ed = BSALoadFile(hash);
             
-        if (SUCCEEDED(hr) && bsaTexture) {
-            // Calculate hash using same method as runtime textures
-            TextureRuntimeHash texHash = calculateTextureHash(dev, bsaTexture);
+            if (ed.valid()) {
+                // Use DirectXTex staging pattern: SYSTEMMEM → DEFAULT via UpdateTexture
+                if (Configuration.UseDefaultTexturePool) {
+                    // Method 1: DirectXTex staging pattern for D3DPOOL_DEFAULT
+                    IDirect3DTexture9* stagingTexture = nullptr;
+                    
+                    // Step 1: Load BSA data into D3DPOOL_SYSTEMMEM staging texture
+                    HRESULT stagingHr = D3DXCreateTextureFromFileInMemoryEx(dev, ed.data.get(), ed.size,
+                        D3DX_FROM_FILE, D3DX_FROM_FILE, D3DX_FROM_FILE,
+                        0, D3DFMT_UNKNOWN, D3DPOOL_SYSTEMMEM, D3DX_DEFAULT, D3DX_DEFAULT, 0, nullptr, nullptr, &stagingTexture);
+                    
+                    if (SUCCEEDED(stagingHr) && stagingTexture) {
+                        // Get staging texture properties
+                        D3DSURFACE_DESC stagingDesc;
+                        if (SUCCEEDED(stagingTexture->GetLevelDesc(0, &stagingDesc))) {
+                            UINT mipLevels = stagingTexture->GetLevelCount();
+                            
+                            // Step 2: Create empty D3DPOOL_DEFAULT final texture
+                            hr = dev->CreateTexture(stagingDesc.Width, stagingDesc.Height, mipLevels,
+                                0, stagingDesc.Format, D3DPOOL_DEFAULT, &baseTexture, nullptr);
+                            
+                            if (SUCCEEDED(hr) && baseTexture) {
+                                // Step 3: Use DirectXTex UpdateTexture transfer (SYSTEMMEM → DEFAULT)
+                                HRESULT updateHr = dev->UpdateTexture(stagingTexture, baseTexture);
+                                
+                                if (SUCCEEDED(updateHr)) {
+                                    LOG::logline("-- DirectXTex staging SUCCESS: %s (SYSTEMMEM → DEFAULT)", baseName.c_str());
+                                } else {
+                                    LOG::logline("!! DirectXTex UpdateTexture FAILED: %s (HRESULT: 0x%08x)", baseName.c_str(), updateHr);
+                                    baseTexture->Release();
+                                    baseTexture = nullptr;
+                                }
+                            } else {
+                                LOG::logline("!! Failed to create D3DPOOL_DEFAULT texture: %s (HRESULT: 0x%08x)", baseName.c_str(), hr);
+                            }
+                        }
+                        
+                        stagingTexture->Release();
+                    } else {
+                        LOG::logline("!! Failed to create SYSTEMMEM staging texture: %s (HRESULT: 0x%08x)", baseName.c_str(), stagingHr);
+                        hr = stagingHr;
+                    }
+                } else {
+                    // Method 2: Direct loading for D3DPOOL_MANAGED (no staging needed)
+                    hr = D3DXCreateTextureFromFileInMemoryEx(dev, ed.data.get(), ed.size, 
+                        D3DX_FROM_FILE, D3DX_FROM_FILE, D3DX_FROM_FILE,
+                        0, D3DFMT_UNKNOWN, D3DPOOL_MANAGED, D3DX_DEFAULT, D3DX_DEFAULT, 0, nullptr, nullptr, &baseTexture);
+                    
+                    if (SUCCEEDED(hr)) {
+                        LOG::logline("-- Direct MANAGED texture creation SUCCESS: %s", baseName.c_str());
+                    } else {
+                        LOG::logline("!! Direct MANAGED texture creation FAILED: %s (HRESULT: 0x%08x)", baseName.c_str(), hr);
+                    }
+                }
+            }
+        }
+        
+        if (SUCCEEDED(hr) && baseTexture) {
+            // Dump texture using SAME extraction method as calculateTextureHash()
+            char dumpPath[512];
+            std::string cleanName = baseName;
+            std::replace(cleanName.begin(), cleanName.end(), '/', '_');
+            snprintf(dumpPath, sizeof(dumpPath), "bsadump/%s_%s.dds", 
+                   cleanName.c_str(), variants.baseTextureSource.c_str());
             
-            if (texHash.crc32 != 0) {
-                // Extract just the filename for storage
-                size_t slashPos = filename.find_last_of("/\\");
-                std::string textureName = (slashPos != std::string::npos) ? 
-                    filename.substr(slashPos + 1) : filename;
+            // Use identical extraction pipeline from calculateTextureHash() lines 574-627
+            D3DSURFACE_DESC desc;
+            bool dumpSuccess = false;
+            if (SUCCEEDED(baseTexture->GetLevelDesc(0, &desc))) {
+                UINT mipLevels = baseTexture->GetLevelCount();
+                LOG::logline("-- BSA texture %s: %dx%d, format=%d, pool=%d, mips=%d", 
+                           baseName.c_str(), desc.Width, desc.Height, desc.Format, desc.Pool, mipLevels);
                 
-                // Store hash->name mapping
-                textureHashToName[texHash] = textureName;
-                texturesMatched++;
+                // Create staging texture with same mipmap count as original (fixed from 1 level)
+                IDirect3DTexture9* extractStagingTexture = nullptr;
+                HRESULT hr = dev->CreateTexture(desc.Width, desc.Height, mipLevels, 0, desc.Format, D3DPOOL_SYSTEMMEM, &extractStagingTexture, nullptr);
                 
-                // Log first few matches for verification
-                if (texturesMatched <= 5) {
-                    LOG::logline("BSA Hash: %08x -> %s (%dx%d)", 
-                               texHash.crc32, textureName.c_str(),
-                               texHash.size & 0xFFFF, (texHash.size >> 16) & 0xFFFF);
+                if (SUCCEEDED(hr) && extractStagingTexture) {
+                    // Extract all mip levels (fixed from single level extraction)
+                    bool allLevelsExtracted = true;
+                    for (UINT level = 0; level < mipLevels; level++) {
+                        IDirect3DSurface9* srcSurface = nullptr;
+                        IDirect3DSurface9* dstSurface = nullptr;
+                        
+                        if (SUCCEEDED(baseTexture->GetSurfaceLevel(level, &srcSurface)) &&
+                            SUCCEEDED(extractStagingTexture->GetSurfaceLevel(level, &dstSurface))) {
+                            
+                            // Use same multi-tier extraction as calculateTextureHash
+                            HRESULT extractHr = dev->GetRenderTargetData(srcSurface, dstSurface);
+                            
+                            if (FAILED(extractHr)) {
+                                // Fallback method: StretchRect (same as calculateTextureHash)
+                                extractHr = dev->StretchRect(srcSurface, nullptr, dstSurface, nullptr, D3DTEXF_NONE);
+                                
+                                if (FAILED(extractHr)) {
+                                    // Third fallback: UpdateTexture (same as calculateTextureHash)
+                                    D3DSURFACE_DESC levelDesc;
+                                    srcSurface->GetDesc(&levelDesc);
+                                    IDirect3DTexture9* sysMemTexture = nullptr;
+                                    HRESULT sysHr = dev->CreateTexture(levelDesc.Width, levelDesc.Height, 1, 0, levelDesc.Format, D3DPOOL_MANAGED, &sysMemTexture, nullptr);
+                                    
+                                    if (SUCCEEDED(sysHr) && sysMemTexture) {
+                                        extractHr = dev->UpdateTexture(sysMemTexture, extractStagingTexture);
+                                        sysMemTexture->Release();
+                                    }
+                                }
+                            }
+                            
+                            if (FAILED(extractHr)) {
+                                allLevelsExtracted = false;
+                                LOG::logline("!! Failed to extract BSA texture level %d: %s (HRESULT: 0x%08x)", level, baseName.c_str(), extractHr);
+                            }
+                            
+                            if (srcSurface) srcSurface->Release();
+                            if (dstSurface) dstSurface->Release();
+                        } else {
+                            allLevelsExtracted = false;
+                            LOG::logline("!! Failed to get surfaces for BSA texture level %d: %s", level, baseName.c_str());
+                            break;
+                        }
+                    }
+                    
+                    // If all levels extracted successfully, save to file
+                    if (allLevelsExtracted) {
+                        HRESULT saveHr = D3DXSaveTextureToFile(dumpPath, D3DXIFF_DDS, extractStagingTexture, nullptr);
+                        if (SUCCEEDED(saveHr)) {
+                            LOG::logline("-- Successfully extracted and dumped BSA texture: %s (%d mips)", baseName.c_str(), mipLevels);
+                            dumpSuccess = true;
+                        } else {
+                            LOG::logline("!! Failed to save extracted BSA texture: %s (HRESULT: 0x%08x)", baseName.c_str(), saveHr);
+                        }
+                    }
+                    
+                    extractStagingTexture->Release();
                 }
             }
             
-            bsaTexture->Release();
+            if (!dumpSuccess) {
+                LOG::logline("!! Failed to dump BSA texture using runtime extraction method: %s", baseName.c_str());
+            }
+            
+            // Calculate hash using same method as runtime textures (disable caching for BSA textures)
+            TextureRuntimeHash texHash = calculateTextureHash(dev, baseTexture, false);
+            
+            if (texHash.crc32 != 0) {
+                // Add to hash database
+                textureHashToName[texHash] = baseName;
+                texturesMatched++;
+                
+                LOG::logline("-- Hashed base texture: %s (%s) -> hash %08x", 
+                           baseName.c_str(), variants.baseTextureSource.c_str(), texHash.crc32);
+            }
+            
+            baseTexture->Release();
         }
         
-        // Log progress every 100 textures
-        if (texturesHashed % 100 == 0) {
-            LOG::logline("-- BSA hash progress: %d textures processed, %d matched", 
-                       texturesHashed, texturesMatched);
-        }
+        texturesHashed++;
     }
     
-    LOG::logline("-- BSA texture hash database complete: %d BSA textures processed, %d hash matches created", 
+    LOG::logline("-- Hash database complete: %d base textures processed, %d hash matches created", 
                texturesHashed, texturesMatched);
-    
-    // Scan loose texture files (higher priority than BSA)
-    // These will override any BSA textures with the same hash
-    int looseTexturesHashed = 0;
-    int looseTexturesMatched = 0;
-    scanLooseTextureFiles(dev, looseTexturesHashed, looseTexturesMatched);
-    
-    LOG::logline("-- Texture database complete: %d BSA + %d loose = %d total textures, %d total matches", 
-               texturesHashed, looseTexturesHashed, texturesHashed + looseTexturesHashed, texturesMatched + looseTexturesMatched);
 }
 
 }

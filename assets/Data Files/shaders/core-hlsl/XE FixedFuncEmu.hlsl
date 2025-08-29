@@ -104,8 +104,8 @@ float fogMWScalar(float dist) {
 
 #ifdef HAS_NORMAL
 // Parallax height and normal parameters
-static const float parallaxScale = 0.0;
-static const float parallaxBias = 0.0;
+static const float parallaxScale = 0.000001;
+static const float parallaxBias = 0.0000501;
 static const float heightScale = 100;
 // Returns parallax-adjusted UV and a view-space normal derived from height.
 void ParallaxHeightNormal(
@@ -151,8 +151,23 @@ void ParallaxHeightNormal(
     float hD = tex2D(sampTex3, uv + float2(0, -texel.y)).a;
     float hU = tex2D(sampTex3, uv + float2(0,  texel.y)).a;
 
-    float dhdu = (hR - hL);   // ∂h/∂u
-    float dhdv = (hU - hD);   // ∂h/∂v
+    float dhdu_cd = (hR - hL);
+    float dhdv_cd = (hU - hD);
+	
+	 // Derivative of filtered height
+    float hC = tex2D(sampTex3, uv).a;
+    float dhdu_ddx = ddx(hC);
+    float dhdv_ddy = ddy(hC);
+	
+	 float2 dudx = ddx(uv) * normres;
+    float2 dudy = ddy(uv) * normres;
+    float footprint = max(length(dudx), length(dudy));
+
+    // Blend factor: 0 = CD, 1 = ddx/ddy
+    float w = saturate(footprint - 1.0); // ~0 when minified, ~1 when magnified
+
+    float dhdu = lerp(dhdu_cd, dhdu_ddx, w);
+    float dhdv = lerp(dhdv_cd, dhdv_ddy, w);
 
     // Tangent-space bump normal
     float3 nTS = normalize(float3(-dhdu * heightScale, -dhdv * heightScale, 1.0));
@@ -220,11 +235,13 @@ float4 ps_main(VS_OUTPUT input) : COLOR {
 
 #endif
 
-#ifdef HAS_DIFFPARAM
-    diffuseParam = tex2D(sampTex2, parallaxUV).rgb; // Will use parallax-corrected UVs if HAS_NORMAL
-#endif
+
     
     float4 texColor = tex2D(sampTex0, parallaxUV); // Will use parallax-corrected UVs if HAS_NORMAL
+	
+	#ifdef HAS_DIFFPARAM
+    texColor.rgb = tex2D(sampTex2, parallaxUV).rgb; // Will use parallax-corrected UVs if HAS_NORMAL
+	#endif
    
     // Basic lighting calculation
     float3 lighting = lightSceneAmbient;

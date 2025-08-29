@@ -12,8 +12,10 @@ namespace BSA {
     // Texture suffix variants structure
     struct TextureSuffixVariants {
         std::string baseName;
-        std::string diffparam;  // _diffparam texture path
-        std::string normal;     // _nh texture path
+        std::string diffparam;         // _diffparam texture path
+        std::string normal;            // _nh texture path
+        std::string baseTextureSource; // "loose" or "bsa"  
+        std::string baseTexturePath;   // Full path to base texture
         
         bool hasDiffParam() const { return !diffparam.empty(); }
         bool hasNormal() const { return !normal.empty(); }
@@ -43,7 +45,7 @@ namespace BSA {
     // Texture suffix functionality
     void buildTextureSuffixDatabase();
     const TextureSuffixVariants* getTextureSuffixVariants(const char* baseTextureName);
-    TextureRuntimeHash calculateTextureHash(IDirect3DDevice9* device, IDirect3DTexture9* texture);
+    TextureRuntimeHash calculateTextureHash(IDirect3DDevice9* device, IDirect3DTexture9* texture, bool useCache = true);
     const std::string* resolveTextureNameFromHash(const TextureRuntimeHash& hash);
     IDirect3DTexture9* loadSuffixTexture(IDirect3DDevice9* dev, const TextureSuffixVariants& variants, const char* suffixType);
     
