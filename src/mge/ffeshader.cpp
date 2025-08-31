@@ -103,21 +103,10 @@ static SuffixTextureFlags getSuffixFlagsForTexture(IDirect3DDevice9* device, IDi
             // Look up suffix variants for this specific texture
             const BSA::TextureSuffixVariants* variants = BSA::getTextureSuffixVariants(textureName->c_str());
             if (variants && (variants->hasDiffParam() || variants->hasNormal() || variants->hasParam())) {
-                // Priority-based suffix selection (only one type active at a time)
-                // Priority: _diffparam > _param > _nh
-                if (variants->hasDiffParam()) {
-                    flags.hasDiffParam = true;
-                    flags.hasNormal = variants->hasNormal();  // Normal maps can coexist
-                    flags.hasParam = false;  // Exclude _param when _diffparam is present
-                } else if (variants->hasParam()) {
-                    flags.hasDiffParam = false;
-                    flags.hasNormal = variants->hasNormal();  // Normal maps can coexist
-                    flags.hasParam = true;
-                } else if (variants->hasNormal()) {
-                    flags.hasDiffParam = false;
-                    flags.hasNormal = true;
-                    flags.hasParam = false;
-                }
+                // Set flags based on available suffix variants (combinations allowed)
+                flags.hasDiffParam = variants->hasDiffParam();
+                flags.hasNormal = variants->hasNormal();
+                flags.hasParam = variants->hasParam();
                 
                 // DEBUG: Log suffix selection decision and the actual variant paths
                 //LOG::logline("DEBUG SUFFIX SELECTION: %s -> selected: diffparam=%d normal=%d param=%d", 
@@ -323,8 +312,6 @@ void FixedFunctionShader::precacheAsync() {
             for (int hasDiffParam = 0; hasDiffParam <= 1; ++hasDiffParam) {
                 for (int hasNormal = 0; hasNormal <= 1; ++hasNormal) {
                     for (int hasParam = 0; hasParam <= 1; ++hasParam) {
-                        // Skip invalid combinations (diffparam and param can't coexist)
-                        if (hasDiffParam && hasParam) continue;
                         
                         for (int vertexCol = 0; vertexCol <= 1; ++vertexCol) {
                             baseShaderKey.vertexColour = vertexCol;
