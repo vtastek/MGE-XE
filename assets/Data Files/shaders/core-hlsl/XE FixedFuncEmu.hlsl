@@ -114,6 +114,8 @@ float3 BRDF(float3 N, float3 V, float3 L, float3 albedo, float metalness, float 
 // Matrices  
 matrix proj;
 matrix worldview;
+matrix world;
+matrix view;
 matrix vertexBlendPalette[4];
 float4 vertexBlendState;
 
@@ -400,8 +402,8 @@ void BuildPerPixelTBN(
 }
 
 // Parallax height and normal parameters
-static const float parallaxScale = 0.000001;
-static const float parallaxBias = 0.0000501;
+static const float parallaxScale = 10.2;
+static const float parallaxBias = 0.00005;
 static const float heightScale = -4;
 
 // Returns parallax-adjusted UV and a view-space normal derived from height.
@@ -750,18 +752,19 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 
 
 #ifndef NOLIT
-    float3 lighting = pow(lightSceneAmbient, 2.2) * ao;
+    float3 lighting = pow(lightSceneAmbient, 2.2) * ao / PI;
 
-    float3 down = float3(0, 0, -1);
-    float3 downV = mul(worldview, down);
-    float skylight = max(0.0, dot(down, normalVS));
-    lighting *= skylight;
+    float3 upVS = float3(0, 1, 0); // view space up
+    float skylight = max(0.0, dot(normalize(upVS), normalize(normalVS)));
+
+    deb = skylight;
     // Sun light (Oren-Nayar)
     float3 Lsun = -lightSunDirection;
     float sunAtten = shadowpara;
     float3 sunBRDF = BRDF(normalVS, V, Lsun, albedo, metalness, roughness, roughness, radius, F0, 1);
-    deb = sunBRDF;
-    lighting += pow(lightSunDiffuse, 2.2) * sunBRDF * sunAtten;
+    float NdotL_sun = max(dot(normalVS, Lsun), 0.0);
+
+    lighting += pow(lightSunDiffuse, 2.2) * sunBRDF * sunAtten * NdotL_sun * PI;
 
 #ifndef NO_POINT_LIGHTS
     // Point lights (Lambert)
@@ -771,8 +774,9 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
         L = L / dist;
         float falloff = lightFalloffQuadratic[i] * dist * dist + lightFalloffConstant;
         float attenuation = (falloff > 0.0) ? (1.0 / falloff) : 0.0;
-        float3 pointBRDF = BRDF(normalVS, V, L, albedo * 0, metalness, roughness, roughness, radius, F0, 0);
-        lighting += (pow(lightDiffuse[i].rgb, 2.2) * pointBRDF + lightAmbient[i]) * attenuation;
+        float3 pointBRDF = BRDF(normalVS, V, L, albedo, metalness, roughness, roughness, radius, F0, 0);
+        float NdotL_point = max(dot(normalVS, normalize(L)), 0.0);
+        lighting += (pow(lightDiffuse[i].rgb, 2.2) * pointBRDF * NdotL_point + lightAmbient[i]) * attenuation * PI;
     }
 #endif
 #else

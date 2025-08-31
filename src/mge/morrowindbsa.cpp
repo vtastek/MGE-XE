@@ -411,70 +411,86 @@ static const char* getSuffixType(const std::string& texPath) {
     return nullptr; // Base texture
 }
 
+// Helper function to recursively scan directories for suffix files
+static void scanDirectoryForSuffixes(const std::string& basePath, const std::string& relativePath, 
+                                   std::unordered_map<std::string, TextureSuffixVariants>& suffixMap, int& suffixFilesFound) {
+    std::string searchPath = basePath;
+    if (!relativePath.empty()) {
+        searchPath += "\\" + relativePath;
+    }
+    searchPath += "\\*";
+    
+    WIN32_FIND_DATA findFileData;
+    HANDLE hFind = FindFirstFile(searchPath.c_str(), &findFileData);
+    
+    if (hFind == INVALID_HANDLE_VALUE) return;
+    
+    do {
+        if (findFileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            // Skip . and .. directories
+            if (strcmp(findFileData.cFileName, ".") == 0 || strcmp(findFileData.cFileName, "..") == 0) {
+                continue;
+            }
+            
+            // Recursively scan subdirectories
+            std::string newRelativePath = relativePath.empty() ? findFileData.cFileName : 
+                                        relativePath + "\\" + findFileData.cFileName;
+            scanDirectoryForSuffixes(basePath, newRelativePath, suffixMap, suffixFilesFound);
+        } else {
+            std::string filename = findFileData.cFileName;
+            std::string fullRelativePath = relativePath.empty() ? filename : relativePath + "\\" + filename;
+            
+            // Check for suffix patterns
+            bool isSuffixFile = false;
+            std::string suffixType;
+            
+            if (filename.length() > 13 && filename.substr(filename.length() - 13) == "_diffparam.dds") {
+                isSuffixFile = true;
+                suffixType = "diffparam";
+            } else if (filename.length() > 7 && filename.substr(filename.length() - 7) == "_nh.dds") {
+                isSuffixFile = true;
+                suffixType = "normal";
+            } else if (filename.length() > 10 && filename.substr(filename.length() - 10) == "_param.dds") {
+                isSuffixFile = true;
+                suffixType = "param";
+            }
+            
+            if (isSuffixFile) {
+                std::string normalizedPath = normalizeTexturePath(fullRelativePath.c_str());
+                std::string baseName = extractBaseName(normalizedPath);
+                
+                TextureSuffixVariants& variants = suffixMap[baseName];
+                variants.baseName = baseName;
+                
+                if (suffixType == "diffparam") {
+                    variants.diffparam = "textures/" + fullRelativePath;
+                } else if (suffixType == "normal") {
+                    variants.normal = "textures/" + fullRelativePath;
+                } else if (suffixType == "param") {
+                    variants.param = "textures/" + fullRelativePath;
+                }
+                
+                suffixFilesFound++;
+                LOG::logline("-- Found loose %s: %s -> base: %s", suffixType.c_str(), fullRelativePath.c_str(), baseName.c_str());
+            }
+        }
+    } while (FindNextFile(hFind, &findFileData));
+    
+    FindClose(hFind);
+}
+
 // buildTextureSuffixDatabase - New suffix-first approach: find loose suffixes, then their bases
 void buildTextureSuffixDatabase() {
     if (textureSuffixDatabaseBuilt) return;
     
-    LOG::logline("-- Building texture suffix database (suffix-first approach)");
+    LOG::logline("-- Building texture suffix database (recursive suffix-first approach)");
     
-    // Phase 1: Discover all loose suffix files
+    // Phase 1: Discover all loose suffix files recursively
     std::unordered_map<std::string, TextureSuffixVariants> suffixMap;
     int suffixFilesFound = 0;
     
-    // Scan for _diffparam.dds files
-    WIN32_FIND_DATA findFileData;
-    HANDLE hFind = FindFirstFile("Data Files\\textures\\*_diffparam.dds", &findFileData);
-    if (hFind != INVALID_HANDLE_VALUE) {
-        do {
-            std::string filename = findFileData.cFileName;
-            std::string normalizedPath = normalizeTexturePath(filename.c_str());
-            std::string baseName = extractBaseName(normalizedPath);
-            
-            TextureSuffixVariants& variants = suffixMap[baseName];
-            variants.baseName = baseName;
-            variants.diffparam = "textures/" + filename;
-            suffixFilesFound++;
-            
-            LOG::logline("-- Found loose diffparam: %s -> base: %s", filename.c_str(), baseName.c_str());
-        } while (FindNextFile(hFind, &findFileData));
-        FindClose(hFind);
-    }
-    
-    // Scan for _nh.dds files
-    hFind = FindFirstFile("Data Files\\textures\\*_nh.dds", &findFileData);
-    if (hFind != INVALID_HANDLE_VALUE) {
-        do {
-            std::string filename = findFileData.cFileName;
-            std::string normalizedPath = normalizeTexturePath(filename.c_str());
-            std::string baseName = extractBaseName(normalizedPath);
-            
-            TextureSuffixVariants& variants = suffixMap[baseName];
-            variants.baseName = baseName;
-            variants.normal = "textures/" + filename;
-            suffixFilesFound++;
-            
-            LOG::logline("-- Found loose normal: %s -> base: %s", filename.c_str(), baseName.c_str());
-        } while (FindNextFile(hFind, &findFileData));
-        FindClose(hFind);
-    }
-    
-    // Scan for _param.dds files
-    hFind = FindFirstFile("Data Files\\textures\\*_param.dds", &findFileData);
-    if (hFind != INVALID_HANDLE_VALUE) {
-        do {
-            std::string filename = findFileData.cFileName;
-            std::string normalizedPath = normalizeTexturePath(filename.c_str());
-            std::string baseName = extractBaseName(normalizedPath);
-            
-            TextureSuffixVariants& variants = suffixMap[baseName];
-            variants.baseName = baseName;
-            variants.param = "textures/" + filename;
-            suffixFilesFound++;
-            
-            LOG::logline("-- Found loose param: %s -> base: %s", filename.c_str(), baseName.c_str());
-        } while (FindNextFile(hFind, &findFileData));
-        FindClose(hFind);
-    }
+    // Recursively scan Data Files/textures/ and all subdirectories for suffix files
+    scanDirectoryForSuffixes("Data Files\\textures", "", suffixMap, suffixFilesFound);
     
     // Phase 2: For each base name, find the actual base texture (loose overrides BSA)
     int basesFound = 0;
@@ -482,17 +498,39 @@ void buildTextureSuffixDatabase() {
         const std::string& baseName = pair.first;
         TextureSuffixVariants& variants = pair.second;
         
-        // Check for loose base texture first (highest priority)
-        std::string looseBasePath = "Data Files\\textures\\" + baseName.substr(baseName.find_last_of("/\\") + 1) + ".dds";
+        // Extract the directory path from one of the suffix files to know where to look for base texture
+        std::string suffixPath;
+        if (!variants.diffparam.empty()) {
+            suffixPath = variants.diffparam;
+        } else if (!variants.normal.empty()) {
+            suffixPath = variants.normal;
+        } else if (!variants.param.empty()) {
+            suffixPath = variants.param;
+        }
+        
+        // Determine the directory where the suffix was found
+        std::string suffixDir = "";
+        size_t lastSlash = suffixPath.find_last_of("/\\");
+        if (lastSlash != std::string::npos) {
+            suffixDir = suffixPath.substr(0, lastSlash + 1);  // Include the trailing slash
+        }
+        
+        // Look for base texture in the same directory as the suffix
+        std::string baseFileName = baseName.substr(baseName.find_last_of("/\\") + 1) + ".dds";
+        std::string looseBasePath = "Data Files\\" + suffixDir + baseFileName;
+        
+        // Replace forward slashes with backslashes for Windows file system
+        std::replace(looseBasePath.begin(), looseBasePath.end(), '/', '\\');
+        
         WIN32_FIND_DATA fileData;
         HANDLE hFile = FindFirstFile(looseBasePath.c_str(), &fileData);
         
         if (hFile != INVALID_HANDLE_VALUE) {
-            // Found loose base texture
+            // Found loose base texture in same directory as suffix
             variants.baseTextureSource = "loose";
             variants.baseTexturePath = looseBasePath;
             basesFound++;
-            LOG::logline("-- Base texture (loose): %s", baseName.c_str());
+            LOG::logline("-- Base texture (loose): %s at %s", baseName.c_str(), looseBasePath.c_str());
             FindClose(hFile);
         } else {
             // Check BSA files for base texture
@@ -512,7 +550,7 @@ void buildTextureSuffixDatabase() {
             }
             
             if (!foundInBSA) {
-                LOG::logline("-- WARNING: Base texture not found for: %s", baseName.c_str());
+                LOG::logline("-- WARNING: Base texture not found for: %s (looked in %s)", baseName.c_str(), looseBasePath.c_str());
             }
         }
     }
