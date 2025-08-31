@@ -4,6 +4,7 @@
 #include "support/log.h"
 #include "mwbridge.h"
 #include "morrowindbsa.h"
+#include "statusoverlay.h"
 
 #include <algorithm>
 #include <sstream>
@@ -79,7 +80,7 @@ static SuffixBindingState bindingCache;
 static SuffixTextureFlags getSuffixFlagsForTexture(IDirect3DDevice9* device, IDirect3DTexture9* texture) {
     SuffixTextureFlags flags = {false, false, false};
     
-    if (!texture || !Configuration.UseHLSLPipeline || !Configuration.EnableTextureSuffixes) {
+    if (!texture || Configuration.PerPixelLightFlags != 2) {
         return flags;
     }
     
@@ -200,8 +201,8 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
     shaderLRU.last_sk = ShaderKey();
     cacheEffects.clear();
 
-    // Initialize HLSL pipeline if enabled
-    if (Configuration.UseHLSLPipeline) {
+    // Initialize HLSL pipeline if enabled (PerPixelLightFlags == 2 means HLSL)
+    if (Configuration.PerPixelLightFlags == 2) {
         LOG::logline("-- Initializing HLSL compilation pipeline");
         
         // Clear HLSL cache and LRU
@@ -298,6 +299,83 @@ void FixedFunctionShader::precacheAsync() {
         }
 
         LOG::logline("-- Async precaching completed: %d essential shaders compiled", compiledVariants);
+        
+        // Precache HLSL shaders if HLSL pipeline is enabled
+        if (Configuration.PerPixelLightFlags == 2) {
+            LOG::logline("-- Starting HLSL shader precaching");
+            
+            int hlslVariants = 0;
+            int totalHLSLVariants = 90; // Estimate for progress display
+            
+            // Generate base ShaderKey for HLSL variants
+            ShaderKey baseShaderKey;
+            memset(&baseShaderKey, 0, sizeof baseShaderKey);
+            baseShaderKey.uvSets = 1;
+            
+            // Progress tracking for status overlay
+            auto updateProgress = [&](const char* stage) {
+                char progressText[128];
+                std::snprintf(progressText, sizeof(progressText), "Compiling %s: %d/%d", stage, hlslVariants, totalHLSLVariants);
+                StatusOverlay::setStatus(progressText);
+            };
+            
+            // Comprehensive HLSL shader precaching with texture suffix variants
+            for (int hasDiffParam = 0; hasDiffParam <= 1; ++hasDiffParam) {
+                for (int hasNormal = 0; hasNormal <= 1; ++hasNormal) {
+                    for (int hasParam = 0; hasParam <= 1; ++hasParam) {
+                        // Skip invalid combinations (diffparam and param can't coexist)
+                        if (hasDiffParam && hasParam) continue;
+                        
+                        for (int vertexCol = 0; vertexCol <= 1; ++vertexCol) {
+                            baseShaderKey.vertexColour = vertexCol;
+                            baseShaderKey.vertexMaterial = vertexCol + 1;
+                            
+                            for (int lighting = 0; lighting <= 1; ++lighting) {
+                                baseShaderKey.useLighting = lighting;
+                                baseShaderKey.noPointLights = lighting && (hlslVariants % 3 == 0); // Some wilderness variants
+                                
+                                for (int skinning = 0; skinning <= 1; ++skinning) {
+                                    baseShaderKey.usesSkinning = skinning;
+                                    
+                                    // Set suffix texture flags
+                                    baseShaderKey.hasDiffParam = hasDiffParam;
+                                    baseShaderKey.hasNormal = hasNormal;  
+                                    baseShaderKey.hasParam = hasParam;
+                                    
+                                    // Standard single texture variant
+                                    baseShaderKey.activeStages = 1;
+                                    baseShaderKey.fogMode = 1;
+                                    baseShaderKey.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
+                                    memset(&baseShaderKey.stage[1], 0, sizeof baseShaderKey.stage[1]);
+                                    
+                                    generateMWShaderHLSL(baseShaderKey);
+                                    hlslVariants++;
+                                    
+                                    // Update progress display every few shaders
+                                    if (hlslVariants % 5 == 0) {
+                                        if (hasDiffParam) updateProgress("diffparam shaders");
+                                        else if (hasParam) updateProgress("param shaders"); 
+                                        else if (hasNormal) updateProgress("normal shaders");
+                                        else updateProgress("base shaders");
+                                    }
+                                    
+                                    // Dual texture variant (common for detail textures)
+                                    if (hlslVariants < totalHLSLVariants - 10) { // Leave room for other variants
+                                        baseShaderKey.activeStages = 2;
+                                        baseShaderKey.stage[1] = { D3DTOP_ADD, D3DTA_TEXTURE, D3DTA_CURRENT, D3DTA_CURRENT, 0, 0, 0, 0 };
+                                        generateMWShaderHLSL(baseShaderKey);
+                                        hlslVariants++;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            StatusOverlay::setStatus("HLSL shader compilation complete");
+            LOG::logline("-- HLSL precaching completed: %d shaders compiled", hlslVariants);
+        }
         });
 
     precacheThread.detach();
@@ -1513,19 +1591,12 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::createPurpleErrorShader() {
     return errorShader;
 }
 
-FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const ShaderKey& sk) {
-    HLSLShader hlslShader = {};
-    
-    // Use Simple shader with fixed positioning
-    const char* vertexShaderName = "vs_main";
-    const char* pixelShaderName = "ps_main";
-    
-    // Load Simple shader source from file 
-    HANDLE hFile = CreateFileA("Data Files\\shaders\\core-hlsl\\XE FixedFuncEmu.hlsl", 
-                               GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+// Helper function to load shader source from file
+char* FixedFunctionShader::loadShaderFile(const char* filename, DWORD* outFileSize) {
+    HANDLE hFile = CreateFileA(filename, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     if (hFile == INVALID_HANDLE_VALUE) {
-        LOG::logline("!! HLSL file not found: XE FixedFuncEmu.hlsl");
-        return hlslShaderDefaultPurple;
+        LOG::logline("!! HLSL file not found: %s", filename);
+        return nullptr;
     }
     
     DWORD fileSize = GetFileSize(hFile, nullptr);
@@ -1534,6 +1605,28 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     ReadFile(hFile, shaderSource, fileSize, &bytesRead, nullptr);
     shaderSource[fileSize] = '\0';
     CloseHandle(hFile);
+    
+    if (outFileSize) *outFileSize = fileSize;
+    return shaderSource;
+}
+
+FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const ShaderKey& sk) {
+    HLSLShader hlslShader = {};
+    
+    // Shader entry points
+    const char* vertexShaderName = "vs_main";
+    const char* pixelShaderName = "ps_main";
+    
+    // Load separate vertex and pixel shader files
+    DWORD vsFileSize = 0, psFileSize = 0;
+    char* vertexShaderSource = loadShaderFile("Data Files\\shaders\\core-hlsl\\XE FixedFuncEmu_VS.hlsl", &vsFileSize);
+    char* pixelShaderSource = loadShaderFile("Data Files\\shaders\\core-hlsl\\XE FixedFuncEmu_PS.hlsl", &psFileSize);
+    
+    if (!vertexShaderSource || !pixelShaderSource) {
+        if (vertexShaderSource) delete[] vertexShaderSource;
+        if (pixelShaderSource) delete[] pixelShaderSource;
+        return hlslShaderDefaultPurple;
+    }
 
     // Build shader defines based on ShaderKey
     D3D_SHADER_MACRO defines[7] = {};
@@ -1568,9 +1661,9 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     ID3DBlob* vsErrors = nullptr;
     
     HRESULT hr = D3DCompile(
-        shaderSource,
-        fileSize,
-        "XE FixedFuncEmu.hlsl",
+        vertexShaderSource,
+        vsFileSize,
+        "XE FixedFuncEmu_VS.hlsl",
         defines, // Pass suffix texture defines
         nullptr, // Include handler
         vertexShaderName,
@@ -1589,7 +1682,8 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
             vsErrors->Release();
         }
         LOG::logline("!! HLSL Vertex Shader compilation failed, using default");
-        delete[] shaderSource;
+        delete[] vertexShaderSource;
+        delete[] pixelShaderSource;
         return hlslShaderDefaultPurple;
     }
     
@@ -1602,7 +1696,8 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     if (FAILED(hr)) {
         LOG::logline("!! Failed to create HLSL vertex shader");
         vsBlob->Release();
-        delete[] shaderSource;
+        delete[] vertexShaderSource;
+        delete[] pixelShaderSource;
         return hlslShaderDefaultPurple;
     }
     
@@ -1617,14 +1712,14 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     
     vsBlob->Release();
     
-    // Compile pixel shader using same source
+    // Compile pixel shader using pixel shader source
     ID3DBlob* psBlob = nullptr;
     ID3DBlob* psErrors = nullptr;
     
     hr = D3DCompile(
-        shaderSource,
-        fileSize,
-        "XE FixedFuncEmu.hlsl",
+        pixelShaderSource,
+        psFileSize,
+        "XE FixedFuncEmu_PS.hlsl",
         defines, // Pass same suffix texture defines
         nullptr, // Include handler
         pixelShaderName,
@@ -1646,7 +1741,8 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         // Clean up vertex shader
         if (hlslShader.vertexShader) hlslShader.vertexShader->Release();
         if (hlslShader.vsConstantTable) hlslShader.vsConstantTable->Release();
-        delete[] shaderSource;
+        delete[] vertexShaderSource;
+        delete[] pixelShaderSource;
         return hlslShaderDefaultPurple;
     }
     
@@ -1662,7 +1758,8 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         // Clean up vertex shader
         if (hlslShader.vertexShader) hlslShader.vertexShader->Release();
         if (hlslShader.vsConstantTable) hlslShader.vsConstantTable->Release();
-        delete[] shaderSource;
+        delete[] vertexShaderSource;
+        delete[] pixelShaderSource;
         return hlslShaderDefaultPurple;
     }
     
@@ -1672,20 +1769,19 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         &hlslShader.psConstantTable
     );
     
-    if (SUCCEEDED(hr) && hlslShader.psConstantTable) {
-        LOG::logline("HLSL: Successfully extracted pixel shader constant table");
-    } else {
+    if (FAILED(hr) || !hlslShader.psConstantTable) {
         LOG::logline("HLSL: Failed to extract pixel shader constant table, hr=%x", hr);
     }
     
     // Log compilation details for debugging (before releasing blobs)
-    LOG::logline("-- HLSL shader compiled successfully: VS=%s PS=%s", vertexShaderName, pixelShaderName);
+    // LOG::logline("-- HLSL shader compiled successfully: VS=%s PS=%s", vertexShaderName, pixelShaderName);
     // LOG::logline("-- HLSL PS blob size: %u bytes", psBlob->GetBufferSize());
     
     psBlob->Release();
     
-    // Clean up shader source
-    delete[] shaderSource;
+    // Clean up shader sources
+    delete[] vertexShaderSource;
+    delete[] pixelShaderSource;
     
     // Log shader key details
     // LOG::logline("-- HLSL ShaderKey: hasDiffParam=%d hasNormal=%d hasParam=%d", sk.hasDiffParam, sk.hasNormal, sk.hasParam);
