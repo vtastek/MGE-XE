@@ -624,9 +624,7 @@ TextureRuntimeHash calculateTextureHash(IDirect3DDevice9* device, IDirect3DTextu
         return hash; // Return zero hash for filtered textures
     }
     
-    // Use staging texture approach for D3DPOOL_DEFAULT textures
-    // Save to temp file for reliable hash calculation
-    char tempPath[] = "temp\\mge_hash_temp.dds";
+    // Use staging texture approach for direct memory hashing (no temp files)
     bool hashSuccess = false;
     
     // Use staging texture for D3DPOOL_DEFAULT textures
@@ -660,27 +658,75 @@ TextureRuntimeHash calculateTextureHash(IDirect3DDevice9* device, IDirect3DTextu
                 }
             }
             
-            // If staging succeeded, save to temp file for hash calculation
+            // If staging succeeded, hash directly from memory
             if (SUCCEEDED(hr)) {
-                if (SUCCEEDED(D3DXSaveTextureToFile(tempPath, D3DXIFF_DDS, stagingTexture, nullptr))) {
-                    // Read temp file and calculate hash
-                    HANDLE file = CreateFileA(tempPath, GENERIC_READ, FILE_SHARE_READ, nullptr, 
-                                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-                    if (file != INVALID_HANDLE_VALUE) {
-                        DWORD fileSize = GetFileSize(file, nullptr);
-                        if (fileSize > 0 && fileSize < 50 * 1024 * 1024) { // Max 50MB
-                            auto buffer = std::make_unique<char[]>(fileSize);
-                            DWORD bytesRead;
-                            if (ReadFile(file, buffer.get(), fileSize, &bytesRead, nullptr) && bytesRead == fileSize) {
-                                hash.size = desc.Width * desc.Height;
-                                hash.crc32 = crc32(reinterpret_cast<const unsigned char*>(buffer.get()), fileSize);
-                                hashSuccess = true;
-                            }
-                        }
-                        CloseHandle(file);
+                D3DLOCKED_RECT lockedRect;
+                if (SUCCEEDED(dstSurface->LockRect(&lockedRect, nullptr, D3DLOCK_READONLY))) {
+                    // Calculate the total size of pixel data more carefully
+                    size_t dataSize = 0;
+                    
+                    // Sanity checks first
+                    if (lockedRect.Pitch <= 0 || desc.Width == 0 || desc.Height == 0) {
+                        LOG::logline("!! Invalid texture properties: Pitch=%d, Width=%d, Height=%d", 
+                                   lockedRect.Pitch, desc.Width, desc.Height);
+                        dstSurface->UnlockRect();
+                        return hash;
                     }
-                    // Clean up temp file immediately
-                    DeleteFileA(tempPath);
+                    
+                    switch (desc.Format) {
+                        case D3DFMT_DXT1:
+                            // DXT1: 4x4 blocks, 8 bytes per block
+                            dataSize = ((desc.Width + 3) / 4) * ((desc.Height + 3) / 4) * 8;
+                            break;
+                        case D3DFMT_DXT3:
+                        case D3DFMT_DXT5:
+                            // DXT3/5: 4x4 blocks, 16 bytes per block  
+                            dataSize = ((desc.Width + 3) / 4) * ((desc.Height + 3) / 4) * 16;
+                            break;
+                        case D3DFMT_A8R8G8B8:
+                        case D3DFMT_X8R8G8B8:
+                            dataSize = (size_t)lockedRect.Pitch * desc.Height;
+                            break;
+                        case D3DFMT_R5G6B5:
+                        case D3DFMT_A1R5G5B5:
+                            dataSize = (size_t)lockedRect.Pitch * desc.Height;
+                            break;
+                        case D3DFMT_A8:
+                            dataSize = (size_t)lockedRect.Pitch * desc.Height;
+                            break;
+                        default:
+                            // Fallback: use pitch * height for unknown formats
+                            dataSize = (size_t)lockedRect.Pitch * desc.Height;
+                            break;
+                    }
+                    
+                    // Additional sanity checks
+                    if (dataSize == 0 || dataSize > 100 * 1024 * 1024) { // Max 100MB
+                        LOG::logline("!! Invalid texture data size calculated: %zu bytes (Format=%d, %dx%d, Pitch=%d)", 
+                                   dataSize, desc.Format, desc.Width, desc.Height, lockedRect.Pitch);
+                        dstSurface->UnlockRect();
+                        return hash;
+                    }
+                    
+                    if (lockedRect.pBits == nullptr) {
+                        LOG::logline("!! Null texture data pointer");
+                        dstSurface->UnlockRect();
+                        return hash;
+                    }
+                    
+                    // Calculate hash with error handling
+                    hash.size = desc.Width * desc.Height;
+                    hash.crc32 = crc32(reinterpret_cast<const unsigned char*>(lockedRect.pBits), dataSize);
+                    
+                    if (hash.crc32 != 0) {
+                        hashSuccess = true;
+                    } else {
+                        LOG::logline("!! CRC32 calculation returned zero for texture %dx%d", desc.Width, desc.Height);
+                    }
+                    
+                    dstSurface->UnlockRect();
+                } else {
+                    LOG::logline("!! Failed to lock staging texture surface");
                 }
             }
         }
