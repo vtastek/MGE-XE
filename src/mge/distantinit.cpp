@@ -217,13 +217,8 @@ bool DistantLand::init() {
     // Log device state before intensive initialization
     BSA::logDeviceState(device, "BEFORE_DISTANT_LAND_INIT");
     
-    // Build BSA hash database after BSA files are loaded (early clean device state)
+    // Build BSA and loose texture hash database after BSA files are loaded (early clean device state)
     BSA::buildBSATextureHashDatabase(device);
-    
-    // Scan loose texture files to add their hashes to the database (higher priority than BSA)
-    int texturesHashed = 0, texturesMatched = 0;
-    BSA::scanLooseTextureFiles(device, texturesHashed, texturesMatched);
-    LOG::logline("-- Loose texture hash scan complete: %d processed, %d added to database", texturesHashed, texturesMatched);
 
     if (Configuration.UseSharedMemory && !initIpc()) {
         return false;
