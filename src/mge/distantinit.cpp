@@ -237,6 +237,9 @@ bool DistantLand::init() {
         return false;
     }
 
+    // Start priority shader loading asynchronously (don't wait yet)
+    PostShaders::startPriorityShaderLoading();
+
     if (!PostShaders::init(device)) {
         return false;
     }
@@ -266,6 +269,9 @@ bool DistantLand::init() {
     }
 
     MWBridge::get()->patchResolveDuringInit(&resolveDynamicVisGroups);
+
+    // Wait for priority shaders to be ready before MWSE scripts run
+    PostShaders::waitForPriorityShaders();
 
     LOG::logline("<< Completed Distant Land init");
     

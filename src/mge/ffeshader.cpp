@@ -215,6 +215,89 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
 void FixedFunctionShader::precacheAsync() {
     // Move precaching to a separate thread - essential variants to prevent stuttering
     std::thread precacheThread([]() {
+        // Check lighting mode to prioritize compilation order
+        bool hlslMode = (Configuration.PerPixelLightFlags == 2);
+        
+        // If HLSL is current mode, compile HLSL shaders first for better startup performance
+        if (hlslMode) {
+            LOG::logline("-- Starting HLSL shader precaching (priority - current lighting mode)");
+            
+            int hlslVariants = 0;
+            int totalHLSLVariants = 90; // Estimate for progress display
+            
+            // Generate base ShaderKey for HLSL variants
+            ShaderKey baseShaderKey;
+            memset(&baseShaderKey, 0, sizeof baseShaderKey);
+            baseShaderKey.uvSets = 1;
+            
+            // Progress tracking for status overlay
+            auto updateStatus = [&](const char* stage) {
+                char progressText[128];
+                std::snprintf(progressText, sizeof(progressText), "Compiling %s: %d/%d", stage, hlslVariants, totalHLSLVariants);
+                StatusOverlay::setStatus(progressText);
+            };
+            
+            // Comprehensive HLSL shader precaching with texture suffix variants
+            for (int hasDiffParam = 0; hasDiffParam <= 1; ++hasDiffParam) {
+                for (int hasNormal = 0; hasNormal <= 1; ++hasNormal) {
+                    for (int hasParam = 0; hasParam <= 1; ++hasParam) {
+                        
+                        for (int vertexCol = 0; vertexCol <= 1; ++vertexCol) {
+                            for (int lighting = 0; lighting <= 1; ++lighting) {
+                                for (int skinning = 0; skinning <= 1; ++skinning) {
+                                    ShaderKey sk = baseShaderKey;
+                                    sk.vertexColour = vertexCol;
+                                    sk.vertexMaterial = vertexCol + 1;
+                                    sk.useLighting = lighting;
+                                    sk.noPointLights = lighting && (hlslVariants % 3 == 0);
+                                    sk.usesSkinning = skinning;
+                                    sk.hasDiffParam = hasDiffParam;
+                                    sk.hasNormal = hasNormal;
+                                    sk.hasParam = hasParam;
+                                    
+                                    if (sk.hasNormal && !sk.hasDiffParam && !sk.hasParam) {
+                                        updateStatus("HLSL Normal");
+                                    } else if (sk.hasDiffParam && !sk.hasNormal && !sk.hasParam) {
+                                        updateStatus("HLSL DiffParam");
+                                    } else if (sk.hasParam && !sk.hasDiffParam && !sk.hasNormal) {
+                                        updateStatus("HLSL Param");
+                                    } else if (sk.hasDiffParam && sk.hasNormal && !sk.hasParam) {
+                                        updateStatus("HLSL DiffParam+Normal");
+                                    } else if (sk.hasDiffParam && sk.hasParam && !sk.hasNormal) {
+                                        updateStatus("HLSL DiffParam+Param");
+                                    } else if (sk.hasNormal && sk.hasParam && !sk.hasDiffParam) {
+                                        updateStatus("HLSL Normal+Param");
+                                    } else if (sk.hasDiffParam && sk.hasNormal && sk.hasParam) {
+                                        updateStatus("HLSL All Suffixes");
+                                    } else {
+                                        updateStatus("HLSL Base");
+                                    }
+                                    
+                                    // Single texture (most common)
+                                    sk.activeStages = 1;
+                                    sk.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
+                                    memset(&sk.stage[1], 0, sizeof sk.stage[1]);
+                                    generateMWShaderHLSL(sk);
+                                    hlslVariants++;
+                                    
+                                    // Dual texture if we haven't hit the limit
+                                    if (hlslVariants < totalHLSLVariants - 10) { // Leave room for other variants
+                                        sk.activeStages = 2;
+                                        sk.stage[1] = { D3DTOP_ADD, D3DTA_TEXTURE, D3DTA_CURRENT, D3DTA_CURRENT, 0, 0, 0, 0 };
+                                        generateMWShaderHLSL(sk);
+                                        hlslVariants++;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            StatusOverlay::setStatus("HLSL shader compilation complete");
+            LOG::logline("-- HLSL precaching completed: %d shaders compiled", hlslVariants);
+        }
+        
         LOG::logline("-- Starting async per-pixel shader precaching (essential variants)");
 
         ShaderKey skCommon;
@@ -289,8 +372,8 @@ void FixedFunctionShader::precacheAsync() {
 
         LOG::logline("-- Async precaching completed: %d essential shaders compiled", compiledVariants);
         
-        // Precache HLSL shaders if HLSL pipeline is enabled
-        if (Configuration.PerPixelLightFlags == 2) {
+        // HLSL shaders are now precached first if HLSL mode is active (above)
+        if (false) { // Removed duplicate HLSL precaching - now done first when HLSL mode is active
             LOG::logline("-- Starting HLSL shader precaching");
             
             int hlslVariants = 0;

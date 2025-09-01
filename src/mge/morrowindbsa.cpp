@@ -440,11 +440,12 @@ static void scanDirectoryForSuffixes(const std::string& basePath, const std::str
             std::string filename = findFileData.cFileName;
             std::string fullRelativePath = relativePath.empty() ? filename : relativePath + "\\" + filename;
             
+            
             // Check for suffix patterns
             bool isSuffixFile = false;
             std::string suffixType;
             
-            if (filename.length() > 13 && filename.substr(filename.length() - 13) == "_diffparam.dds") {
+            if (filename.length() > 13 && filename.substr(filename.length() - 14) == "_diffparam.dds") {
                 isSuffixFile = true;
                 suffixType = "diffparam";
             } else if (filename.length() > 7 && filename.substr(filename.length() - 7) == "_nh.dds") {

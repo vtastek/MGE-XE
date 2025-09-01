@@ -47,6 +47,8 @@ class PostShaders {
     static float rcpRes[2];
     static std::thread shaderLoadThread;
     static std::atomic<bool> isLoading; // Add this member declaration
+    static std::thread priorityShaderThread;
+    static std::atomic<bool> priorityShadersReady;
 
 public:
     static bool init(IDirect3DDevice9* realDevice);
@@ -61,6 +63,10 @@ public:
     static void release();
     static bool initShaderChainThreaded();
     static void waitForShaderLoading();
+    static std::vector<std::string> scanLuaReferencedShaders();
+    static bool preloadPriorityShaders(const std::vector<std::string>& priorityShaders);
+    static void startPriorityShaderLoading();
+    static void waitForPriorityShaders();
 
     static MGEShader* findShader(const char* shaderName);
     static const std::vector<std::unique_ptr<MGEShader>>& listShaders();

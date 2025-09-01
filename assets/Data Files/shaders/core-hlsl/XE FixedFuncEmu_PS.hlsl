@@ -517,7 +517,7 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 	
 			float falloff = lightFalloffQuadratic[i] * dist * dist + lightFalloffConstant;
 			float t = saturate(dist / 350.0); 
-			float cutoff = 1.0 - t*t*t*t;  // quartic fade, or use smoothstep
+			float cutoff = 1.0 - t*t*t*t;
 			float attenuation = (falloff > 0.0) ? (1.0 / falloff) * cutoff : 0.0;
 			float3 pointBRDF = BRDF(Norm, V, L, float3(1,1,1), metalness, roughness, roughness, radius, F0, 0);
 			float NdotL_point = max(dot(Norm, (L)), 0.0);
@@ -569,10 +569,6 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
     //c.rgb = lerp(fogColNear, c.rgb, input.fog);
     c.rgb = pow(c.rgb, 1.0 / 2.2);
 	//c.rgb = deb;
-	
-	#ifdef HAS_DIFFPARAM
-	c.rgb = float3(1,0,0);
-	#endif
 
     return c;
 }

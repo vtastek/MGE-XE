@@ -10,6 +10,9 @@
 #include <cstring>
 #include <thread>
 #include <atomic>
+#include <vector>
+#include <string>
+#include <chrono>
 
 
 
@@ -26,6 +29,8 @@ const int effectVariableCount = sizeof(effectVariableList) / sizeof(const char*)
 const char* compatibleShader = "MGE XE 0";
 std::thread PostShaders::shaderLoadThread;
 std::atomic<bool> PostShaders::isLoading{ false };
+std::thread PostShaders::priorityShaderThread;
+std::atomic<bool> PostShaders::priorityShadersReady{ false };
 
 const DWORD fvfPost = D3DFVF_XYZRHW | D3DFVF_TEX2;  // XYZRHW -> skips vertex shader
 const DWORD fvfBlend = D3DFVF_XYZW | D3DFVF_TEX2;
@@ -165,12 +170,23 @@ bool PostShaders::loadNewShader(const char* name) {
     ID3DXBuffer* errors;
 
     std::snprintf(path, sizeof(path), "Data Files\\shaders\\XEshaders\\%s.fx", name);
+    
     if (!GetFileAttributesEx(path, GetFileExInfoStandard, &fileAttrs)) {
         LOG::logline("!! Post shader %s missing", path);
         return false;
     }
 
-    HRESULT hr = D3DXCreateEffectFromFile(device, path, &*features.begin(), 0, D3DXFX_LARGEADDRESSAWARE, 0, &newEffect, &errors);
+    // Ensure features vector is properly initialized (like in initShaderChainThreaded)
+    std::vector<D3DXMACRO> localFeatures = features; // Copy current features
+    if (localFeatures.empty()) {
+        // Initialize features if not set
+        if (Configuration.MGEFlags & EXP_FOG) {
+            localFeatures.push_back(macroExpFog);
+        }
+        localFeatures.push_back(macroTerminator);
+    }
+    
+    HRESULT hr = D3DXCreateEffectFromFile(device, path, localFeatures.empty() ? nullptr : &localFeatures[0], 0, D3DXFX_LARGEADDRESSAWARE, 0, &newEffect, &errors);
 
     if (hr == D3D_OK) {
         if (checkShaderVersion(newEffect)) {
@@ -832,4 +848,158 @@ void MGEShader::SetBool(EffectVariableID id, bool b) {
     if (ehVars[id]) {
         effect->SetBool(ehVars[id], b);
     }
+}
+
+// scanLuaReferencedShaders - Scan MWSE Lua mods for shader references
+std::vector<std::string> PostShaders::scanLuaReferencedShaders() {
+    std::vector<std::string> luaShaders;
+    
+    // Build the path to MWSE mods directory
+    char mwsePath[MAX_PATH];
+    strcpy(mwsePath, "Data Files\\MWSE\\mods\\");
+    
+    LOG::logline("-- Scanning MWSE Lua mods for shader references");
+    
+    // Search for .lua files recursively
+    char searchPath[MAX_PATH];
+    WIN32_FIND_DATA findData;
+    HANDLE hFind;
+    
+    strcpy(searchPath, mwsePath);
+    strcat(searchPath, "*");
+    
+    hFind = FindFirstFile(searchPath, &findData);
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                if (strcmp(findData.cFileName, ".") != 0 && strcmp(findData.cFileName, "..") != 0) {
+                    // Search in subdirectory
+                    char subPath[MAX_PATH];
+                    char dirName[MAX_PATH];
+                    strcpy(dirName, findData.cFileName);
+                    sprintf(subPath, "%s%s\\*.lua", mwsePath, dirName);
+                    
+                    WIN32_FIND_DATA subFindData;
+                    HANDLE hSubFind = FindFirstFile(subPath, &subFindData);
+                    if (hSubFind != INVALID_HANDLE_VALUE) {
+                        do {
+                            if (!(subFindData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                                // Found a .lua file, scan it for shader references
+                                char fullPath[MAX_PATH];
+                                sprintf(fullPath, "%s%s\\%s", mwsePath, dirName, subFindData.cFileName);
+                                
+                                // Read and scan the file
+                                FILE* file = fopen(fullPath, "r");
+                                if (file) {
+                                    char line[1024];
+                                    while (fgets(line, sizeof(line), file)) {
+                                        // Look for mge.shaders.find{name = "ShaderName"}
+                                        char* pos = strstr(line, "mge.shaders.find");
+                                        if (pos) {
+                                            char* nameStart = strstr(pos, "name = \"");
+                                            if (nameStart) {
+                                                nameStart += 8; // Skip 'name = "'
+                                                char* nameEnd = strchr(nameStart, '"');
+                                                if (nameEnd) {
+                                                    std::string shaderName(nameStart, nameEnd - nameStart);
+                                                    
+                                                    // Check if we already have this shader
+                                                    bool found = false;
+                                                    for (const auto& existing : luaShaders) {
+                                                        if (existing == shaderName) {
+                                                            found = true;
+                                                            break;
+                                                        }
+                                                    }
+                                                    
+                                                    if (!found) {
+                                                        luaShaders.push_back(shaderName);
+                                                        LOG::logline("-- Found Lua-referenced shader: %s", shaderName.c_str());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    fclose(file);
+                                }
+                            }
+                        } while (FindNextFile(hSubFind, &subFindData));
+                        FindClose(hSubFind);
+                    }
+                }
+            }
+        } while (FindNextFile(hFind, &findData));
+        FindClose(hFind);
+    }
+    
+    LOG::logline("-- Found %d Lua-referenced shaders total", luaShaders.size());
+    return luaShaders;
+}
+
+// preloadPriorityShaders - Load priority shaders before main shader chain
+bool PostShaders::preloadPriorityShaders(const std::vector<std::string>& priorityShaders) {
+    if (priorityShaders.empty()) {
+        return true;
+    }
+    
+    LOG::logline("-- Preloading %d priority shaders for Lua compatibility", priorityShaders.size());
+    
+    for (const std::string& shaderName : priorityShaders) {
+        // Try to load this specific shader early
+        if (loadNewShader(shaderName.c_str())) {
+            LOG::logline("-- Priority shader loaded: %s", shaderName.c_str());
+        } else {
+            LOG::logline("-- Warning: Priority shader not found: %s", shaderName.c_str());
+        }
+    }
+    
+    return true;
+}
+
+// startPriorityShaderLoading - Start async loading of priority shaders for MWSE compatibility
+void PostShaders::startPriorityShaderLoading() {
+    if (priorityShadersReady.load()) {
+        return; // Already started
+    }
+    
+    // Start priority shader loading in background thread
+    priorityShaderThread = std::thread([]() {
+        LOG::logline("-- Starting priority shader loading for MWSE compatibility");
+        
+        // Scan for Lua-referenced shaders
+        std::vector<std::string> priorityShaders = scanLuaReferencedShaders();
+        
+        if (!priorityShaders.empty()) {
+            // Load each priority shader
+            for (const std::string& shaderName : priorityShaders) {
+                LOG::logline("-- Attempting to load priority shader: %s", shaderName.c_str());
+                if (loadNewShader(shaderName.c_str())) {
+                    LOG::logline("-- Priority shader loaded: %s", shaderName.c_str());
+                } else {
+                    LOG::logline("-- Warning: Priority shader not found: %s", shaderName.c_str());
+                }
+            }
+        }
+        
+        priorityShadersReady.store(true);
+        LOG::logline("-- Priority shader loading completed");
+    });
+    
+    priorityShaderThread.detach();
+}
+
+// waitForPriorityShaders - Wait for priority shader loading to complete
+void PostShaders::waitForPriorityShaders() {
+    if (priorityShadersReady.load()) {
+        return; // Already completed
+    }
+    
+    LOG::logline("-- Waiting for priority shaders to complete loading...");
+    
+    // Wait indefinitely for priority shaders to finish loading (no timeout)
+    while (!priorityShadersReady.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    
+    LOG::logline("-- Priority shaders ready for MWSE compatibility");
 }
