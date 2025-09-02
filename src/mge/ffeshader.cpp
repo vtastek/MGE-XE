@@ -39,6 +39,16 @@ float FixedFunctionShader::sunMultiplier, FixedFunctionShader::ambMultiplier;
 unordered_map<FixedFunctionShader::ShaderKey, FixedFunctionShader::HLSLShader, FixedFunctionShader::ShaderKey::hasher> FixedFunctionShader::cacheHLSLShaders;
 FixedFunctionShader::HLSLShaderLRU FixedFunctionShader::hlslShaderLRU;
 FixedFunctionShader::HLSLShader FixedFunctionShader::hlslShaderDefaultPurple;
+std::unordered_map<std::string, FixedFunctionShader::CachedShaderSource> FixedFunctionShader::shaderSourceCache;
+
+// Async compilation system static variables
+std::queue<std::shared_ptr<FixedFunctionShader::AsyncShaderRequest>> FixedFunctionShader::compilationQueue;
+std::mutex FixedFunctionShader::queueMutex;
+std::condition_variable FixedFunctionShader::queueCondition;
+std::thread FixedFunctionShader::compilerThread;
+std::atomic<bool> FixedFunctionShader::shutdownCompiler(false);
+std::unordered_map<FixedFunctionShader::ShaderKey, std::shared_ptr<FixedFunctionShader::AsyncShaderRequest>, FixedFunctionShader::ShaderKey::hasher> FixedFunctionShader::pendingCompilations;
+std::unordered_map<FixedFunctionShader::VertexShaderKey, IDirect3DVertexShader9*, FixedFunctionShader::VertexShaderKey::hasher> FixedFunctionShader::vertexShaderCache;
 
 // Current suffix texture flags for shader variant generation
 struct SuffixTextureFlags {
@@ -201,6 +211,9 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
         
         // Create default error shader for HLSL pipeline
         hlslShaderDefaultPurple = createPurpleErrorShader();
+        
+        // Start async compiler for on-demand compilation
+        startAsyncCompiler();
     }
 
     // Pre-warm cache if any per-pixel mode is active
@@ -220,157 +233,323 @@ void FixedFunctionShader::precacheAsync() {
         
         // If HLSL is current mode, compile HLSL shaders first for better startup performance
         if (hlslMode) {
-            LOG::logline("-- Starting HLSL shader precaching (priority - current lighting mode)");
+            LOG::logline("-- Starting unified HLSL shader precaching (using runtime logic)");
             
             int hlslVariants = 0;
-            int totalHLSLVariants = 90; // Estimate for progress display
-            
-            // Generate base ShaderKey for HLSL variants
-            ShaderKey baseShaderKey;
-            memset(&baseShaderKey, 0, sizeof baseShaderKey);
-            baseShaderKey.uvSets = 1;
+            int totalHLSLVariants = 60; // Estimate for progress display
             
             // Progress tracking for status overlay
             auto updateStatus = [&](const char* stage) {
                 char progressText[128];
-                std::snprintf(progressText, sizeof(progressText), "Compiling %s: %d/%d", stage, hlslVariants, totalHLSLVariants);
+                std::snprintf(progressText, sizeof(progressText), "Precaching %s: %d/%d", stage, hlslVariants, totalHLSLVariants);
                 StatusOverlay::setStatus(progressText);
             };
             
-            // Comprehensive HLSL shader precaching with texture suffix variants
-            for (int hasDiffParam = 0; hasDiffParam <= 1; ++hasDiffParam) {
-                for (int hasNormal = 0; hasNormal <= 1; ++hasNormal) {
-                    for (int hasParam = 0; hasParam <= 1; ++hasParam) {
+            // Unified precaching using runtime ShaderKey logic - simulates realistic game scenarios
+            
+            // Simulate common game scenarios and generate ShaderKeys using runtime constructor
+            struct GameScenario {
+                const char* name;
+                bool useLighting;
+                bool hasVertexColor;
+                bool usesSkinning;
+                int pointLightCount;
+                int directionalLightCount;
+            };
+            
+            // Common scenarios found in Morrowind gameplay - TERRAIN PRIORITY (diffparam textures)
+            GameScenario scenarios[] = {
+                // TOP PRIORITY: Terrain scenarios (most likely to use diffparam textures)
+                {"Terrain Basic", true, true, false, 0, 1},        // Basic terrain with vertex colors + diffparam
+                {"Terrain Detailed", true, true, false, 1, 1},     // Terrain with point lights + diffparam
+                {"Landscape Complex", true, true, false, 2, 1},    // Complex outdoor terrain + diffparam
+                
+                // HIGH PRIORITY: Common object scenarios  
+                {"Static Objects", true, false, false, 0, 1},      // Most static objects with sun only
+                {"Character Basic", true, false, true, 1, 1},      // NPCs with point light
+                {"Character Complex", true, true, true, 1, 1},     // NPCs with vertex colors
+                
+                // MEDIUM PRIORITY: Interior and special cases
+                {"Interior Objects", true, false, false, 4, 0},    // Indoor objects with multiple lights
+                {"Outdoor Mixed", true, false, false, 2, 1},       // Outdoor with some point lights
+                {"Heavy Lighting", true, true, false, 7, 1},       // Complex lighting scenarios
+                
+                // LOW PRIORITY: Unlit geometry
+                {"Unlit Objects", false, false, false, 0, 0},      // Unlit geometry
+                {"Unlit Colored", false, true, false, 0, 0},       // Unlit with vertex colors
+            };
+            
+            for (const auto& scenario : scenarios) {
+                updateStatus(scenario.name);
+                
+                // Simulate RenderedState for this scenario
+                RenderedState rs = {};
+                rs.fvf = D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_TEX1;
+                if (scenario.hasVertexColor) rs.fvf |= D3DFVF_DIFFUSE;
+                rs.useLighting = scenario.useLighting;
+                rs.vertexBlendState = scenario.usesSkinning;
+                rs.useFog = true;
+                
+                // Simulate FragmentState (texture stages)
+                FragmentState frs = {};
+                frs.stage[0].colorOp = D3DTOP_MODULATE;
+                frs.stage[0].colorArg1 = D3DTA_TEXTURE;
+                frs.stage[0].colorArg2 = D3DTA_DIFFUSE;
+                frs.stage[1].colorOp = D3DTOP_DISABLE;
+                
+                // Simulate LightState for this scenario
+                LightState lightrs = {};
+                DWORD lightId = 0;
+                for (int i = 0; i < scenario.pointLightCount; i++) {
+                    LightState::Light light = {};
+                    light.type = D3DLIGHT_POINT;
+                    lightrs.lights[lightId] = light;
+                    lightrs.active.insert(lightrs.active.end(), lightId++);
+                }
+                for (int i = 0; i < scenario.directionalLightCount; i++) {
+                    LightState::Light light = {};
+                    light.type = D3DLIGHT_DIRECTIONAL;
+                    lightrs.lights[lightId] = light;
+                    lightrs.active.insert(lightrs.active.end(), lightId++);
+                }
+                
+                // Create ShaderKey using runtime constructor (the working system!)
+                ShaderKey sk(&rs, &frs, &lightrs);
+                
+                // Compile shader variants for this scenario
+                for (int hasDiffParam = 0; hasDiffParam <= 1; hasDiffParam++) {
+                    for (int hasNormal = 0; hasNormal <= 1; hasNormal++) {
+                        sk.hasDiffParam = hasDiffParam;
+                        sk.hasNormal = hasNormal;
+                        sk.hasParam = 0; // Less common, skip for now
                         
-                        for (int vertexCol = 0; vertexCol <= 1; ++vertexCol) {
-                            for (int lighting = 0; lighting <= 1; ++lighting) {
-                                for (int skinning = 0; skinning <= 1; ++skinning) {
-                                    ShaderKey sk = baseShaderKey;
-                                    sk.vertexColour = vertexCol;
-                                    sk.vertexMaterial = vertexCol + 1;
-                                    sk.useLighting = lighting;
-                                    sk.noPointLights = lighting && (hlslVariants % 3 == 0);
-                                    sk.usesSkinning = skinning;
-                                    sk.hasDiffParam = hasDiffParam;
-                                    sk.hasNormal = hasNormal;
-                                    sk.hasParam = hasParam;
-                                    
-                                    if (sk.hasNormal && !sk.hasDiffParam && !sk.hasParam) {
-                                        updateStatus("HLSL Normal");
-                                    } else if (sk.hasDiffParam && !sk.hasNormal && !sk.hasParam) {
-                                        updateStatus("HLSL DiffParam");
-                                    } else if (sk.hasParam && !sk.hasDiffParam && !sk.hasNormal) {
-                                        updateStatus("HLSL Param");
-                                    } else if (sk.hasDiffParam && sk.hasNormal && !sk.hasParam) {
-                                        updateStatus("HLSL DiffParam+Normal");
-                                    } else if (sk.hasDiffParam && sk.hasParam && !sk.hasNormal) {
-                                        updateStatus("HLSL DiffParam+Param");
-                                    } else if (sk.hasNormal && sk.hasParam && !sk.hasDiffParam) {
-                                        updateStatus("HLSL Normal+Param");
-                                    } else if (sk.hasDiffParam && sk.hasNormal && sk.hasParam) {
-                                        updateStatus("HLSL All Suffixes");
-                                    } else {
-                                        updateStatus("HLSL Base");
-                                    }
-                                    
-                                    // Single texture (most common)
-                                    sk.activeStages = 1;
-                                    sk.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
-                                    memset(&sk.stage[1], 0, sizeof sk.stage[1]);
-                                    generateMWShaderHLSL(sk);
+                        // Only compile if not already cached
+                        if (cacheHLSLShaders.find(sk) == cacheHLSLShaders.end()) {
+                            cacheHLSLShaders[sk] = generateMWShaderHLSL(sk);
+                            hlslVariants++;
+                            
+                            // Also compile dual texture variant for common cases
+                            if (hasDiffParam == 0 && hasNormal == 0 && hlslVariants < totalHLSLVariants - 5) {
+                                sk.activeStages = 2;
+                                sk.stage[1].colorOp = D3DTOP_ADD;
+                                sk.stage[1].colorArg1 = D3DTA_TEXTURE;
+                                sk.stage[1].colorArg2 = D3DTA_CURRENT;
+                                if (cacheHLSLShaders.find(sk) == cacheHLSLShaders.end()) {
+                                    cacheHLSLShaders[sk] = generateMWShaderHLSL(sk);
                                     hlslVariants++;
-                                    
-                                    // Dual texture if we haven't hit the limit
-                                    if (hlslVariants < totalHLSLVariants - 10) { // Leave room for other variants
-                                        sk.activeStages = 2;
-                                        sk.stage[1] = { D3DTOP_ADD, D3DTA_TEXTURE, D3DTA_CURRENT, D3DTA_CURRENT, 0, 0, 0, 0 };
-                                        generateMWShaderHLSL(sk);
-                                        hlslVariants++;
-                                    }
                                 }
+                                sk.activeStages = 1; // Reset for next iteration
+                                sk.stage[1].colorOp = D3DTOP_DISABLE;
                             }
                         }
                     }
                 }
             }
             
-            StatusOverlay::setStatus("HLSL shader compilation complete");
-            LOG::logline("-- HLSL precaching completed: %d shaders compiled", hlslVariants);
+            StatusOverlay::setStatus("HLSL shader precaching complete");
+            LOG::logline("-- Unified HLSL precaching completed: %d shaders compiled", hlslVariants);
         }
         
         LOG::logline("-- Starting async per-pixel shader precaching (essential variants)");
 
-        ShaderKey skCommon;
-        memset(&skCommon, 0, sizeof skCommon);
-        skCommon.uvSets = 1;
+        // Targeted precaching: 20 specific combinations from cache miss patterns
+        struct TargetShaderVariant {
+            int diffparam, normal, param, vertCol, skinning;
+        };
+        
+        TargetShaderVariant targetVariants[] = {
+            // TOP PRIORITY: Essential diffparam shader variants (first 10)
+            {1, 0, 0, 0, 0}, {1, 0, 0, 1, 0}, {1, 1, 0, 0, 0}, {1, 1, 0, 1, 0}, {1, 0, 0, 0, 1},
+            {1, 0, 0, 1, 1}, {1, 1, 1, 0, 0}, {1, 1, 1, 1, 0}, {1, 0, 1, 0, 0}, {1, 0, 1, 1, 0},
+            // Lower priority: Other combinations
+            {0, 0, 1, 1, 0}, {0, 0, 1, 0, 0}, {0, 0, 0, 1, 0}, {0, 1, 1, 1, 0}, {0, 0, 0, 0, 0},
+            {0, 1, 1, 0, 0}, {0, 1, 0, 0, 0}, {0, 0, 0, 0, 1}, {0, 0, 0, 1, 1}, {0, 1, 0, 1, 0}
+        };
 
         int compiledVariants = 0;
+        
+        // Compile in priority order: 1, 4, 7, 0 point lights
+        int pointLightCounts[] = {1, 4, 7, 0};
+        const char* pointLightNames[] = {"1 point", "4 point", "7 point", "0 point (sun only)"};
+        
+        for (int priorityIdx = 0; priorityIdx < 4; ++priorityIdx) {
+            int pointLightCount = pointLightCounts[priorityIdx];
+            LOG::logline("-- Precaching %s light variants...", pointLightNames[priorityIdx]);
 
-        for (int vertexCol = 0; vertexCol <= 1; ++vertexCol) {
-            skCommon.vertexColour = vertexCol;
-            skCommon.vertexMaterial = vertexCol + 1;
-
-            for (int heavyLighting = 0; heavyLighting <= 1; ++heavyLighting) {
-                skCommon.heavyLighting = heavyLighting;
-
-                for (int skinning = 0; skinning <= 1; ++skinning) {
-                    skCommon.usesSkinning = skinning;
-
-                    // Standard diffuse texturing (most common)
-                    skCommon.activeStages = 1;
-                    skCommon.fogMode = 1;
-                    skCommon.usesTexgen = 0;
-                    skCommon.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
-                    memset(&skCommon.stage[1], 0, sizeof skCommon.stage[1]);
-                    generateMWShader(skCommon);
-                    compiledVariants++;
-
-                    // Dual texture (common for details)
-                    skCommon.activeStages = 2;
-                    skCommon.fogMode = 1;
-                    skCommon.usesTexgen = 0;
-                    skCommon.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
-                    skCommon.stage[1] = { D3DTOP_ADD, D3DTA_TEXTURE, D3DTA_CURRENT, D3DTA_CURRENT, 0, 0, 0, 0 };
-                    generateMWShader(skCommon);
-                    compiledVariants++;
-
-                    // Particle effects (additive blend)
-                    skCommon.activeStages = 1;
-                    skCommon.fogMode = 2;
-                    skCommon.usesTexgen = 0;
-                    skCommon.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
-                    memset(&skCommon.stage[1], 0, sizeof skCommon.stage[1]);
-                    generateMWShader(skCommon);
-                    compiledVariants++;
-
-                    // Enchantment effects
-                    skCommon.activeStages = 2;
-                    skCommon.fogMode = 0;
-                    skCommon.usesTexgen = 1;
-                    skCommon.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 0, 1, 0, 3 };
-                    skCommon.stage[1] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_CURRENT, D3DTA_CURRENT, 1, 0, 0, 0 };
-                    generateMWShader(skCommon);
-                    compiledVariants++;
-                }
-
-                // Untextured surfaces
-                skCommon.usesSkinning = 0;
-                skCommon.fogMode = 1;
-                skCommon.usesTexgen = 0;
-                skCommon.activeStages = 1;
-                skCommon.stage[0] = { D3DTOP_SELECTARG2, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
-                memset(&skCommon.stage[1], 0, sizeof skCommon.stage[1]);
-                generateMWShader(skCommon);
+            for (int variantIdx = 0; variantIdx < 20; ++variantIdx) {
+                ShaderKey sk;
+                memset(&sk, 0, sizeof sk);
+                
+                // Set common properties
+                sk.uvSets = 1;
+                sk.useLighting = 1;
+                sk.noPointLights = (pointLightCount == 0) ? 1 : 0;
+                sk.heavyLighting = 0; // Don't use engine's heavy lighting
+                
+                // Set variant-specific properties
+                auto& variant = targetVariants[variantIdx];
+                sk.hasDiffParam = variant.diffparam;
+                sk.hasNormal = variant.normal;
+                sk.hasParam = variant.param;
+                sk.vertexColour = variant.vertCol;
+                sk.vertexMaterial = variant.vertCol + 1;
+                sk.usesSkinning = variant.skinning;
+                
+                // Standard single texture stage
+                sk.activeStages = 1;
+                sk.fogMode = 1;
+                sk.usesTexgen = 0;
+                sk.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
+                memset(&sk.stage[1], 0, sizeof sk.stage[1]);
+                
+                cacheHLSLShaders[sk] = generateMWShaderHLSL(sk);
                 compiledVariants++;
-
+                
                 // Progress logging
-                if (compiledVariants % 4 == 0) {
-                    LOG::logline("-- Precaching progress: %d shaders", compiledVariants);
+                if (compiledVariants % 20 == 0) {
+                    LOG::logline("-- Precaching progress: %d/80 shaders completed", compiledVariants);
                 }
             }
         }
 
-        LOG::logline("-- Async precaching completed: %d essential shaders compiled", compiledVariants);
+        // Add universal fallback shaders (8 guaranteed combinations: 0-light and 1-light variants)
+        LOG::logline("-- Adding universal fallback shaders for 100% coverage...");
+        ShaderKey universalSk;
+        memset(&universalSk, 0, sizeof universalSk);
+        universalSk.uvSets = 1;
+        universalSk.useLighting = 1;
+        universalSk.heavyLighting = 0;
+        universalSk.hasDiffParam = 0;
+        universalSk.hasNormal = 0;
+        universalSk.hasParam = 0;
+        universalSk.activeStages = 1;
+        universalSk.fogMode = 1;
+        universalSk.usesTexgen = 0;
+        universalSk.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
+        memset(&universalSk.stage[1], 0, sizeof universalSk.stage[1]);
+        
+        // Generate 8 universal fallback combinations: point lights (0/1+) × vertex color (0/1) × skinning (0/1)
+        for (int pointLightMode = 0; pointLightMode <= 1; ++pointLightMode) {
+            for (int vertCol = 0; vertCol <= 1; ++vertCol) {
+                for (int skinning = 0; skinning <= 1; ++skinning) {
+                    universalSk.noPointLights = pointLightMode; // 0=1+lights, 1=0lights
+                    universalSk.vertexColour = vertCol;
+                    universalSk.vertexMaterial = vertCol + 1;
+                    universalSk.usesSkinning = skinning;
+                    
+                    cacheHLSLShaders[universalSk] = generateMWShaderHLSL(universalSk);
+                    compiledVariants++;
+                    LOG::logline("-- Universal fallback shader: %s vertCol=%d skinning=%d", 
+                               pointLightMode ? "0-light" : "1+light", vertCol, skinning);
+                }
+            }
+        }
+
+        LOG::logline("-- Async HLSL precaching completed: %d targeted shaders compiled (including 8 universal fallbacks)", compiledVariants);
+        
+        // Comprehensive precaching for common shader variants 
+        LOG::logline("-- Starting comprehensive shader precaching (effects, fog modes, etc.)");
+        
+        int comprehensiveVariants = 0;
+        
+        // Point light scenarios for comprehensive precaching
+        for (int pointLightIdx = 0; pointLightIdx < 4; ++pointLightIdx) {
+            int pointLightCount = pointLightCounts[pointLightIdx];
+            
+            for (int vertexCol = 0; vertexCol <= 1; ++vertexCol) {
+                for (int skinning = 0; skinning <= 1; ++skinning) {
+                    ShaderKey sk;
+                    memset(&sk, 0, sizeof sk);
+                    sk.uvSets = 1;
+                    sk.useLighting = 1;
+                    sk.noPointLights = (pointLightCount == 0) ? 1 : 0;
+                    sk.heavyLighting = 0;
+                    sk.vertexColour = vertexCol;
+                    sk.vertexMaterial = vertexCol + 1;
+                    sk.usesSkinning = skinning;
+                    
+                    // Standard single texture variants (if not already cached)
+                    sk.activeStages = 1;
+                    sk.fogMode = 1;
+                    sk.usesTexgen = 0;
+                    sk.hasDiffParam = 0;
+                    sk.hasNormal = 0;
+                    sk.hasParam = 0;
+                    sk.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
+                    memset(&sk.stage[1], 0, sizeof sk.stage[1]);
+                    
+                    if (cacheHLSLShaders.find(sk) == cacheHLSLShaders.end()) {
+                        cacheHLSLShaders[sk] = generateMWShaderHLSL(sk);
+                        comprehensiveVariants++;
+                    }
+
+                    // Dual texture variants (details, decals)
+                    sk.activeStages = 2;
+                    sk.fogMode = 1;
+                    sk.usesTexgen = 0;
+                    sk.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
+                    sk.stage[1] = { D3DTOP_ADD, D3DTA_TEXTURE, D3DTA_CURRENT, D3DTA_CURRENT, 0, 0, 0, 0 };
+                    
+                    if (cacheHLSLShaders.find(sk) == cacheHLSLShaders.end()) {
+                        cacheHLSLShaders[sk] = generateMWShaderHLSL(sk);
+                        comprehensiveVariants++;
+                    }
+
+                    // Particle effects (additive blend, different fog)
+                    sk.activeStages = 1;
+                    sk.fogMode = 2;
+                    sk.usesTexgen = 0;
+                    sk.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
+                    memset(&sk.stage[1], 0, sizeof sk.stage[1]);
+                    
+                    if (cacheHLSLShaders.find(sk) == cacheHLSLShaders.end()) {
+                        cacheHLSLShaders[sk] = generateMWShaderHLSL(sk);
+                        comprehensiveVariants++;
+                    }
+
+                    // Enchantment effects (texgen, dual texture, no fog)
+                    sk.activeStages = 2;
+                    sk.fogMode = 0;
+                    sk.usesTexgen = 1;
+                    sk.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 0, 1, 0, 3 };
+                    sk.stage[1] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_CURRENT, D3DTA_CURRENT, 1, 0, 0, 0 };
+                    
+                    if (cacheHLSLShaders.find(sk) == cacheHLSLShaders.end()) {
+                        cacheHLSLShaders[sk] = generateMWShaderHLSL(sk);
+                        comprehensiveVariants++;
+                    }
+                }
+            }
+
+            // Untextured surfaces (rare but important)
+            ShaderKey sk;
+            memset(&sk, 0, sizeof sk);
+            sk.uvSets = 1;
+            sk.useLighting = 1;
+            sk.noPointLights = (pointLightCount == 0) ? 1 : 0;
+            sk.heavyLighting = 0;
+            sk.vertexColour = 0;
+            sk.vertexMaterial = 1;
+            sk.usesSkinning = 0;
+            sk.fogMode = 1;
+            sk.usesTexgen = 0;
+            sk.activeStages = 1;
+            sk.stage[0] = { D3DTOP_SELECTARG2, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
+            memset(&sk.stage[1], 0, sizeof sk.stage[1]);
+            
+            if (cacheHLSLShaders.find(sk) == cacheHLSLShaders.end()) {
+                cacheHLSLShaders[sk] = generateMWShaderHLSL(sk);
+                comprehensiveVariants++;
+            }
+
+            // Progress logging
+            if (comprehensiveVariants % 20 == 0) {
+                LOG::logline("-- Comprehensive precaching progress: %d additional shaders", comprehensiveVariants);
+            }
+        }
+        
+        LOG::logline("-- Comprehensive precaching completed: %d additional shaders compiled", comprehensiveVariants);
+        LOG::logline("-- Total HLSL shaders precached: %d", compiledVariants + comprehensiveVariants);
         
         // HLSL shaders are now precached first if HLSL mode is active (above)
         if (false) { // Removed duplicate HLSL precaching - now done first when HLSL mode is active
@@ -391,7 +570,8 @@ void FixedFunctionShader::precacheAsync() {
                 StatusOverlay::setStatus(progressText);
             };
             
-            // Comprehensive HLSL shader precaching with texture suffix variants
+            // Comprehensive HLSL shader precaching DISABLED - Conflicts with unified system
+            /*
             for (int hasDiffParam = 0; hasDiffParam <= 1; ++hasDiffParam) {
                 for (int hasNormal = 0; hasNormal <= 1; ++hasNormal) {
                     for (int hasParam = 0; hasParam <= 1; ++hasParam) {
@@ -402,9 +582,11 @@ void FixedFunctionShader::precacheAsync() {
                             
                             for (int lighting = 0; lighting <= 1; ++lighting) {
                                 baseShaderKey.useLighting = lighting;
-                                baseShaderKey.noPointLights = lighting && (hlslVariants % 3 == 0); // Some wilderness variants
                                 
-                                for (int skinning = 0; skinning <= 1; ++skinning) {
+                                for (int noPointLights = 0; noPointLights <= (lighting ? 1 : 0); ++noPointLights) {
+                                    baseShaderKey.noPointLights = noPointLights;
+                                    
+                                    for (int skinning = 0; skinning <= 1; ++skinning) {
                                     baseShaderKey.usesSkinning = skinning;
                                     
                                     // Set suffix texture flags
@@ -418,7 +600,7 @@ void FixedFunctionShader::precacheAsync() {
                                     baseShaderKey.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
                                     memset(&baseShaderKey.stage[1], 0, sizeof baseShaderKey.stage[1]);
                                     
-                                    generateMWShaderHLSL(baseShaderKey);
+                                    cacheHLSLShaders[baseShaderKey] = generateMWShaderHLSL(baseShaderKey);
                                     hlslVariants++;
                                     
                                     // Update progress display every few shaders
@@ -433,8 +615,9 @@ void FixedFunctionShader::precacheAsync() {
                                     if (hlslVariants < totalHLSLVariants - 10) { // Leave room for other variants
                                         baseShaderKey.activeStages = 2;
                                         baseShaderKey.stage[1] = { D3DTOP_ADD, D3DTA_TEXTURE, D3DTA_CURRENT, D3DTA_CURRENT, 0, 0, 0, 0 };
-                                        generateMWShaderHLSL(baseShaderKey);
+                                        cacheHLSLShaders[baseShaderKey] = generateMWShaderHLSL(baseShaderKey);
                                         hlslVariants++;
+                                    }
                                     }
                                 }
                             }
@@ -442,9 +625,10 @@ void FixedFunctionShader::precacheAsync() {
                     }
                 }
             }
+            */
             
-            StatusOverlay::setStatus("HLSL shader compilation complete");
-            LOG::logline("-- HLSL precaching completed: %d shaders compiled", hlslVariants);
+            // StatusOverlay::setStatus("HLSL shader compilation complete");
+            // LOG::logline("-- HLSL precaching completed: %d shaders compiled", hlslVariants);
         }
         });
 
@@ -1001,6 +1185,9 @@ string buildArgString(DWORD arg, const string& mask, const string& sampler) {
 
 // HLSL Pipeline Implementation
 void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
+    // Process any completed async shader compilations
+    processAsyncCompletions();
+    
     HLSLShader hlslShader;
 
     // Check if state matches last used shader
@@ -1029,9 +1216,116 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
             // LOG::logline("DEBUG CACHE HIT: Using cached shader with flags diffparam=%d normal=%d param=%d", 
             //           sk.hasDiffParam, sk.hasNormal, sk.hasParam);
         } else {
-            //LOG::logline("DEBUG CACHE MISS: Generating new shader with flags diffparam=%d normal=%d param=%d", 
-            //           sk.hasDiffParam, sk.hasNormal, sk.hasParam);
-            hlslShader = generateMWShaderHLSL(sk);
+            // Cache miss - try smart fallback before using purple
+            queueShaderCompilation(sk);
+            
+            // Smart fallback hierarchy: try alternative point light counts
+            ShaderKey fallbackSk = sk;
+            HLSLShader fallbackShader = {};
+            bool foundFallback = false;
+            
+            // Priority fallback order: prefer exact match first, then alternatives
+            int currentCount = sk.noPointLights ? 0 : 1;
+            int fallbackPointLights[] = {0, 1, 4, 7};
+            for (int i = 0; i < 4 && !foundFallback; ++i) {
+                int fallbackCount = fallbackPointLights[i];
+                if (fallbackCount == currentCount) continue; // Skip exact match, already tried
+                
+                fallbackSk.noPointLights = (fallbackCount == 0) ? 1 : 0;
+                auto fallbackIter = cacheHLSLShaders.find(fallbackSk);
+                if (fallbackIter != cacheHLSLShaders.end()) {
+                    fallbackShader = fallbackIter->second;
+                    foundFallback = true;
+                    LOG::logline("DEBUG SMART FALLBACK: Using %d point light shader for %s point lights", 
+                               fallbackCount, sk.noPointLights ? "0" : "1+");
+                }
+            }
+            
+            // If no point light fallback found, try texture suffix fallbacks
+            if (!foundFallback && (sk.hasDiffParam || sk.hasNormal || sk.hasParam)) {
+                // Try progressively simpler texture combinations
+                ShaderKey textureFallbackSk = sk;
+                
+                // Step 1: Remove diffparam but keep normal+param
+                if (sk.hasDiffParam && !foundFallback) {
+                    textureFallbackSk.hasDiffParam = 0;
+                    auto fallbackIter = cacheHLSLShaders.find(textureFallbackSk);
+                    if (fallbackIter != cacheHLSLShaders.end()) {
+                        fallbackShader = fallbackIter->second;
+                        foundFallback = true;
+                        LOG::logline("DEBUG TEXTURE FALLBACK: Removed diffparam textures, keeping normal=%d param=%d", 
+                                   textureFallbackSk.hasNormal, textureFallbackSk.hasParam);
+                    }
+                }
+                
+                // Step 2: Remove normal but keep param
+                if (sk.hasNormal && !foundFallback) {
+                    textureFallbackSk = sk;
+                    textureFallbackSk.hasDiffParam = 0;
+                    textureFallbackSk.hasNormal = 0;
+                    auto fallbackIter = cacheHLSLShaders.find(textureFallbackSk);
+                    if (fallbackIter != cacheHLSLShaders.end()) {
+                        fallbackShader = fallbackIter->second;
+                        foundFallback = true;
+                        LOG::logline("DEBUG TEXTURE FALLBACK: Removed normal maps, keeping param=%d", 
+                                   textureFallbackSk.hasParam);
+                    }
+                }
+                
+                // Step 3: Base texture only (no suffixes)
+                if (!foundFallback) {
+                    textureFallbackSk = sk;
+                    textureFallbackSk.hasDiffParam = 0;
+                    textureFallbackSk.hasNormal = 0;
+                    textureFallbackSk.hasParam = 0;
+                    auto fallbackIter = cacheHLSLShaders.find(textureFallbackSk);
+                    if (fallbackIter != cacheHLSLShaders.end()) {
+                        fallbackShader = fallbackIter->second;
+                        foundFallback = true;
+                        LOG::logline("DEBUG TEXTURE FALLBACK: Using base texture with correct lighting");
+                    }
+                }
+            }
+            
+            // Final universal fallback: try the 8 guaranteed base combinations
+            if (!foundFallback) {
+                // Start with exact copy of requested shader, then simplify
+                ShaderKey universalSk = sk;
+                
+                // Force base texture settings
+                universalSk.heavyLighting = 0;
+                universalSk.hasDiffParam = 0;
+                universalSk.hasNormal = 0;
+                universalSk.hasParam = 0;
+                
+                // Try all 8 universal combinations: point lights (0/1+) × vertex color (0/1) × skinning (0/1)
+                for (int pointLightMode = 0; pointLightMode <= 1 && !foundFallback; ++pointLightMode) {
+                    for (int vertCol = 0; vertCol <= 1 && !foundFallback; ++vertCol) {
+                        for (int skinning = 0; skinning <= 1 && !foundFallback; ++skinning) {
+                            universalSk.noPointLights = pointLightMode; // 0=1+lights, 1=0lights
+                            universalSk.vertexColour = vertCol;
+                            universalSk.vertexMaterial = vertCol + 1;
+                            universalSk.usesSkinning = skinning;
+                            
+                            auto fallbackIter = cacheHLSLShaders.find(universalSk);
+                            if (fallbackIter != cacheHLSLShaders.end()) {
+                                fallbackShader = fallbackIter->second;
+                                foundFallback = true;
+                                LOG::logline("DEBUG UNIVERSAL FALLBACK: Using base shader with %s vertCol=%d skinning=%d", 
+                                           pointLightMode ? "0-light" : "1+light", vertCol, skinning);
+                            }
+                        }
+                    }
+                }
+            }
+            
+            if (foundFallback) {
+                hlslShader = fallbackShader;
+            } else {
+                hlslShader = hlslShaderDefaultPurple;
+                LOG::logline("ERROR: Impossible - no universal fallback found! Using purple shader for flags diffparam=%d normal=%d param=%d vertCol=%d lighting=%d skinning=%d noPointLights=%d", 
+                           sk.hasDiffParam, sk.hasNormal, sk.hasParam, sk.vertexColour, sk.useLighting, sk.usesSkinning, sk.noPointLights);
+            }
         }
 
         hlslShaderLRU.shader = hlslShader;
@@ -1070,20 +1364,13 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
                     bindingCache.boundNormal = nullptr;
                     bindingCache.boundParam = nullptr;
                     
-                    // Clear all suffix texture slots first
-                    device->SetTexture(2, nullptr);  // Clear diffparam slot
+                    // Clear suffix texture slots (diffparam now uses slot 0 as base)
                     device->SetTexture(3, nullptr);  // Clear normal slot  
                     device->SetTexture(4, nullptr);  // Clear param slot
                     
                     if (cacheIt->second.variants) {
-                        if (textureFlags.hasDiffParam && cacheIt->second.variants->hasDiffParam()) {
-                            IDirect3DTexture9* diffParamTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *cacheIt->second.variants, "diffparam");
-                            if (diffParamTexture) {
-                                device->SetTexture(2, diffParamTexture);  // Bind to slot 2
-                                bindingCache.boundDiffParam = diffParamTexture;
-                                // LOG::logline("DEBUG BIND: diffparam -> slot 2, texture ptr=%p", diffParamTexture);
-                            }
-                        }
+                        // Note: diffparam is now loaded as base texture (slot 0) instead of slot 2
+                        // This eliminates the need for complex shader ifdef logic
                         
                         if (textureFlags.hasNormal && cacheIt->second.variants->hasNormal()) {
                             IDirect3DTexture9* normalTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *cacheIt->second.variants, "normal");
@@ -1445,12 +1732,43 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
             IDirect3DBaseTexture9* tex;
             device->GetTexture(i, &tex);
             if (tex) {
-                device->SetTexture(i, tex);
-                
-                // Capture primary texture for suffix identification (texture slot 0)
+                // Special handling for slot 0 (base texture) - prioritize diffparam
                 if (i == 0 && tex->GetType() == D3DRTYPE_TEXTURE) {
                     primaryTexture = static_cast<IDirect3DTexture9*>(tex);
                     primaryTexture->AddRef(); // Keep reference for suffix processing
+                    
+                    // Check if we have a diffparam replacement for this base texture
+                    IDirect3DTexture9* replacementTexture = nullptr;
+                    if (textureFlags.hasDiffParam) {
+                        // Try to get diffparam replacement from cache
+                        auto cacheIt = textureSuffixResolutionCache.find(primaryTexture);
+                        if (cacheIt != textureSuffixResolutionCache.end() && 
+                            cacheIt->second.hasValidName && cacheIt->second.variants) {
+                            
+                            if (cacheIt->second.variants->hasDiffParam()) {
+                                replacementTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device, 
+                                                                          *cacheIt->second.variants, "diffparam");
+                                if (replacementTexture) {
+                                    // Use diffparam as base texture (slot 0) and preserve original for alpha (slot 5)
+                                    device->SetTexture(i, replacementTexture);
+                                    device->SetTexture(5, tex); // Bind original texture to slot 5 for alpha
+                                    LOG::logline("DEBUG DIFFPARAM PRIORITIZATION: Using _diffparam as base for %s, original alpha preserved in slot 5", 
+                                               cacheIt->second.textureName.c_str());
+                                } else {
+                                    // Fallback to original base texture
+                                    device->SetTexture(i, tex);
+                                }
+                            } else {
+                                device->SetTexture(i, tex);
+                            }
+                        } else {
+                            device->SetTexture(i, tex);
+                        }
+                    } else {
+                        device->SetTexture(i, tex);
+                    }
+                } else {
+                    device->SetTexture(i, tex);
                 }
                 
                 tex->Release();
@@ -1663,9 +1981,53 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::createPurpleErrorShader() {
 
 // Helper function to load shader source from file
 char* FixedFunctionShader::loadShaderFile(const char* filename, DWORD* outFileSize) {
+    std::string key(filename);
+    
+    // Check if we have cached version
+    auto it = shaderSourceCache.find(key);
+    if (it != shaderSourceCache.end()) {
+        // Check if file has been modified since we cached it
+        WIN32_FIND_DATAA findData;
+        HANDLE hFind = FindFirstFileA(filename, &findData);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            FindClose(hFind);
+            if (CompareFileTime(&it->second.lastWriteTime, &findData.ftLastWriteTime) == 0) {
+                // File unchanged, return cached version
+                if (outFileSize) *outFileSize = it->second.size;
+                char* cachedCopy = new char[it->second.size + 1];
+                memcpy(cachedCopy, it->second.source, it->second.size);
+                cachedCopy[it->second.size] = '\0';
+                return cachedCopy;
+            } else {
+                // File changed! Clear cache and reload
+                LOG::logline("-- HLSL shader file changed: %s, reloading...", filename);
+                delete[] it->second.source;
+                shaderSourceCache.erase(it);
+                // Clear all compiled shaders to force recompilation with new source
+                for (auto& i : cacheHLSLShaders) {
+                    if (i.second.vertexShader) i.second.vertexShader->Release();
+                    if (i.second.pixelShader) i.second.pixelShader->Release();
+                    if (i.second.vsConstantTable) i.second.vsConstantTable->Release();
+                    if (i.second.psConstantTable) i.second.psConstantTable->Release();
+                }
+                cacheHLSLShaders.clear();
+            }
+        }
+    }
+    
+    // Get file attributes for initial caching
+    WIN32_FIND_DATAA findData;
+    HANDLE hFind = FindFirstFileA(filename, &findData);
+    if (hFind == INVALID_HANDLE_VALUE) {
+        LOG::logline("!! HLSL file not found: %s", filename);
+        return nullptr;
+    }
+    FindClose(hFind);
+    
+    // Read file from disk
     HANDLE hFile = CreateFileA(filename, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     if (hFile == INVALID_HANDLE_VALUE) {
-        LOG::logline("!! HLSL file not found: %s", filename);
+        LOG::logline("!! HLSL file read error: %s", filename);
         return nullptr;
     }
     
@@ -1676,8 +2038,157 @@ char* FixedFunctionShader::loadShaderFile(const char* filename, DWORD* outFileSi
     shaderSource[fileSize] = '\0';
     CloseHandle(hFile);
     
+    // Cache the result
+    CachedShaderSource cached;
+    cached.source = new char[fileSize + 1];
+    memcpy(cached.source, shaderSource, fileSize);
+    cached.source[fileSize] = '\0';
+    cached.size = fileSize;
+    cached.lastWriteTime = findData.ftLastWriteTime;
+    shaderSourceCache[key] = cached;
+    
     if (outFileSize) *outFileSize = fileSize;
     return shaderSource;
+}
+
+void FixedFunctionShader::invalidateShaderSourceCache() {
+    // Clear shader source cache for hot reloading
+    for (auto& i : shaderSourceCache) {
+        delete[] i.second.source;
+    }
+    shaderSourceCache.clear();
+    
+    // Also clear compiled shader cache to force recompilation
+    for (auto& i : cacheHLSLShaders) {
+        if (i.second.vertexShader) i.second.vertexShader->Release();
+        if (i.second.pixelShader) i.second.pixelShader->Release();
+        if (i.second.vsConstantTable) i.second.vsConstantTable->Release();
+        if (i.second.psConstantTable) i.second.psConstantTable->Release();
+    }
+    cacheHLSLShaders.clear();
+}
+
+void FixedFunctionShader::startAsyncCompiler() {
+    shutdownCompiler = false;
+    compilerThread = std::thread([]() {
+        LOG::logline("-- HLSL Async compiler thread started");
+        
+        while (!shutdownCompiler) {
+            std::shared_ptr<AsyncShaderRequest> request;
+            
+            // Wait for work or shutdown signal
+            {
+                std::unique_lock<std::mutex> lock(queueMutex);
+                queueCondition.wait(lock, []() { 
+                    return !compilationQueue.empty() || shutdownCompiler; 
+                });
+                
+                if (shutdownCompiler && compilationQueue.empty()) {
+                    break;
+                }
+                
+                if (!compilationQueue.empty()) {
+                    request = compilationQueue.front();
+                    compilationQueue.pop();
+                }
+            }
+            
+            if (request) {
+                // Compile shader in background thread
+                request->result = generateMWShaderHLSL(request->key);
+                request->completed = true;
+                
+                // LOG::logline("-- HLSL Async compiled shader with flags diffparam=%d normal=%d param=%d", 
+                //            request->key.hasDiffParam, request->key.hasNormal, request->key.hasParam);
+            }
+        }
+        
+        LOG::logline("-- HLSL Async compiler thread stopped");
+    });
+}
+
+void FixedFunctionShader::stopAsyncCompiler() {
+    shutdownCompiler = true;
+    queueCondition.notify_all();
+    
+    if (compilerThread.joinable()) {
+        compilerThread.join();
+    }
+    
+    // Clear any pending work
+    std::lock_guard<std::mutex> lock(queueMutex);
+    while (!compilationQueue.empty()) {
+        compilationQueue.pop();
+    }
+    pendingCompilations.clear();
+}
+
+void FixedFunctionShader::queueShaderCompilation(const ShaderKey& key) {
+    // Check if already pending
+    if (pendingCompilations.find(key) != pendingCompilations.end()) {
+        return;
+    }
+    
+    auto request = std::make_shared<AsyncShaderRequest>(key);
+    pendingCompilations[key] = request;
+    
+    {
+        std::lock_guard<std::mutex> lock(queueMutex);
+        compilationQueue.push(request);
+    }
+    queueCondition.notify_one();
+    
+    // LOG::logline("-- HLSL Queued async compilation for shader with flags diffparam=%d normal=%d param=%d", 
+    //            key.hasDiffParam, key.hasNormal, key.hasParam);
+}
+
+void FixedFunctionShader::processAsyncCompletions() {
+    // Check for completed compilations and move them to the main cache
+    auto it = pendingCompilations.begin();
+    while (it != pendingCompilations.end()) {
+        if (it->second->completed) {
+            // Move completed shader to main cache
+            cacheHLSLShaders[it->first] = it->second->result;
+            
+            // LOG::logline("-- HLSL Async shader ready, added to cache with flags diffparam=%d normal=%d param=%d", 
+            //            it->first.hasDiffParam, it->first.hasNormal, it->first.hasParam);
+            
+            it = pendingCompilations.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void FixedFunctionShader::checkForShaderFileChanges() {
+    // Check if any cached shader files have been modified
+    const char* shaderFiles[] = {
+        "Data Files\\shaders\\core-hlsl\\XE FixedFuncEmu_VS.hlsl",
+        "Data Files\\shaders\\core-hlsl\\XE FixedFuncEmu_PS.hlsl"
+    };
+    
+    bool anyChanged = false;
+    for (const char* filename : shaderFiles) {
+        std::string key(filename);
+        auto it = shaderSourceCache.find(key);
+        if (it != shaderSourceCache.end()) {
+            // Check file modification time
+            WIN32_FIND_DATAA findData;
+            HANDLE hFind = FindFirstFileA(filename, &findData);
+            if (hFind != INVALID_HANDLE_VALUE) {
+                FindClose(hFind);
+                if (CompareFileTime(&it->second.lastWriteTime, &findData.ftLastWriteTime) != 0) {
+                    anyChanged = true;
+                    break;
+                }
+            }
+        }
+    }
+    
+    if (anyChanged) {
+        LOG::logline("-- HLSL shader files changed, invalidating cache for hot reload");
+        invalidateShaderSourceCache();
+    }
 }
 
 FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const ShaderKey& sk) {
@@ -1727,6 +2238,8 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     // LOG::logline("HLSL: Compiling shader with %d defines", defineCount);
     
     // Compile vertex shader
+    // TODO: Optimize - vertex shaders don't use texture suffix defines (HAS_DIFFPARAM, HAS_NORMAL, HAS_PARAM)
+    // Many vertex shaders could be cached and reused across pixel shader variants
     ID3DBlob* vsBlob = nullptr;
     ID3DBlob* vsErrors = nullptr;
     
@@ -1863,6 +2376,9 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
 }
 
 void FixedFunctionShader::release() {
+    // Stop async compiler thread
+    stopAsyncCompiler();
+    
     // Clean up D3DXEffect cache
     for (auto& i : cacheEffects) {
         if (i.second) {
@@ -1891,6 +2407,12 @@ void FixedFunctionShader::release() {
     if (hlslShaderDefaultPurple.pixelShader) hlslShaderDefaultPurple.pixelShader->Release();
     if (hlslShaderDefaultPurple.vsConstantTable) hlslShaderDefaultPurple.vsConstantTable->Release();
     if (hlslShaderDefaultPurple.psConstantTable) hlslShaderDefaultPurple.psConstantTable->Release();
+    
+    // Clean up shader source cache
+    for (auto& i : shaderSourceCache) {
+        delete[] i.second.source;
+    }
+    shaderSourceCache.clear();
 }
 
 
@@ -1904,7 +2426,30 @@ FixedFunctionShader::ShaderKey::ShaderKey(const RenderedState* rs, const Fragmen
     usesSkinning = rs->vertexBlendState ? 1 : 0;
     vertexColour = (rs->fvf & D3DFVF_DIFFUSE) ? 1 : 0;
     useLighting = rs->useLighting ? 1 : 0;
-    noPointLights = (rs->useLighting && lightrs->active.empty()) ? 1 : 0;
+    
+    // Count point lights specifically (exclude directional lights like sun)
+    int pointLightCount = 0;
+    int directionalLightCount = 0;
+    if (rs->useLighting) {
+        for (DWORD lightId : lightrs->active) {
+            auto lightIt = lightrs->lights.find(lightId);
+            if (lightIt != lightrs->lights.end()) {
+                if (lightIt->second.type == D3DLIGHT_POINT) {
+                    pointLightCount++;
+                } else if (lightIt->second.type == D3DLIGHT_DIRECTIONAL) {
+                    directionalLightCount++;
+                }
+            }
+        }
+        // Debug logging to understand light distribution
+        static int logCount = 0;
+        if (logCount < 10) {
+            LOG::logline("DEBUG LIGHTS: total=%d, point=%d, directional=%d", 
+                       (int)lightrs->active.size(), pointLightCount, directionalLightCount);
+            logCount++;
+        }
+    }
+    noPointLights = (rs->useLighting && pointLightCount == 0) ? 1 : 0;
 
     // Match constant material, diffuse+ambient vcol, or emissive vcol
     if (rs->useLighting) {

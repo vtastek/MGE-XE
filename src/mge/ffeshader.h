@@ -4,6 +4,13 @@
 
 #include <unordered_map>
 #include <vector>
+#include <string>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <memory>
+#include <atomic>
 
 
 
@@ -150,6 +157,50 @@ class FixedFunctionShader {
     static HLSLShaderLRU hlslShaderLRU;
     static HLSLShader hlslShaderDefaultPurple;
 
+    // Shader source caching for hot reload support
+    struct CachedShaderSource {
+        char* source;
+        DWORD size;
+        FILETIME lastWriteTime;
+    };
+    static std::unordered_map<std::string, CachedShaderSource> shaderSourceCache;
+
+    // Async compilation system
+    struct AsyncShaderRequest {
+        ShaderKey key;
+        std::atomic<bool> completed{false};
+        HLSLShader result;
+        
+        AsyncShaderRequest(const ShaderKey& k) : key(k) {}
+    };
+    
+    static std::queue<std::shared_ptr<AsyncShaderRequest>> compilationQueue;
+    static std::mutex queueMutex;
+    static std::condition_variable queueCondition;
+    static std::thread compilerThread;
+    static std::atomic<bool> shutdownCompiler;
+    static std::unordered_map<ShaderKey, std::shared_ptr<AsyncShaderRequest>, ShaderKey::hasher> pendingCompilations;
+
+    // Vertex shader caching (vertex shaders don't use texture suffix defines)
+    struct VertexShaderKey {
+        DWORD useLighting : 1;
+        DWORD noPointLights : 1;
+        DWORD usesSkinning : 1;
+        DWORD vertexColour : 1;
+        
+        bool operator==(const VertexShaderKey& other) const {
+            return memcmp(this, &other, sizeof(VertexShaderKey)) == 0;
+        }
+        
+        struct hasher {
+            std::size_t operator()(const VertexShaderKey& k) const {
+                return std::hash<uint32_t>{}(*(uint32_t*)&k);
+            }
+        };
+    };
+    
+    static std::unordered_map<VertexShaderKey, IDirect3DVertexShader9*, VertexShaderKey::hasher> vertexShaderCache;
+
     static char* loadShaderFile(const char* filename, DWORD* outFileSize);
     static HLSLShader generateMWShaderHLSL(const ShaderKey& sk);
     static HLSLShader createPurpleErrorShader();
@@ -162,4 +213,10 @@ public:
     static void renderMorrowind(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);
     static void renderMorrowindHLSL(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);
     static void release();
+    static void invalidateShaderSourceCache();
+    static void checkForShaderFileChanges();
+    static void startAsyncCompiler();
+    static void stopAsyncCompiler();
+    static void queueShaderCompilation(const ShaderKey& key);
+    static void processAsyncCompletions();
 };

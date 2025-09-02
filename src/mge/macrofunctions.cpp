@@ -7,6 +7,7 @@
 #include "statusoverlay.h"
 #include "distantland.h"
 #include "postshaders.h"
+#include "ffeshader.h"
 #include "support/pngsave.h"
 
 #include <cctype>

@@ -2,6 +2,7 @@
 #include "morrowindbsa.h"
 #include "proxydx/d3d8header.h"
 #include "support/log.h"
+#include "support/timing.h"
 #include "configuration.h"
 
 #include <cstdio>
@@ -78,6 +79,25 @@ static unordered_map<TextureCacheKey, TextureRuntimeHash, TextureCacheKeyHasher>
 // CRC32 implementation for texture hashing
 static unsigned int crc32_table[256];
 static bool crc32_table_initialized = false;
+
+// Helper function to get readable D3D format name
+static const char* getD3DFormatName(D3DFORMAT format) {
+    switch (format) {
+        case D3DFMT_DXT1: return "DXT1";
+        case D3DFMT_DXT3: return "DXT3";
+        case D3DFMT_DXT5: return "DXT5";
+        case D3DFMT_A8R8G8B8: return "A8R8G8B8(uncompressed)";
+        case D3DFMT_X8R8G8B8: return "X8R8G8B8(uncompressed)";
+        case D3DFMT_R5G6B5: return "R5G6B5(uncompressed)";
+        case D3DFMT_A1R5G5B5: return "A1R5G5B5(uncompressed)";
+        case D3DFMT_A8: return "A8(uncompressed)";
+        default: {
+            static char buffer[32];
+            snprintf(buffer, sizeof(buffer), "Unknown(%u)", (unsigned int)format);
+            return buffer;
+        }
+    }
+}
 
 static void init_crc32_table() {
     if (crc32_table_initialized) return;
@@ -714,14 +734,32 @@ TextureRuntimeHash calculateTextureHash(IDirect3DDevice9* device, IDirect3DTextu
                         return hash;
                     }
                     
-                    // Calculate hash with error handling
+                    // Fast texture hashing - simple first 4KB sample + metadata
+                    const unsigned char* dataPtr = reinterpret_cast<const unsigned char*>(lockedRect.pBits);
+                    
+                    // Use small fixed sample size for speed
+                    size_t sampleSize = std::min(dataSize, (size_t)4096); // Max 4KB sample
+                    
+                    // Simple hash: metadata + first N bytes only (fastest approach)
+                    size_t metadataSize = 12; // 3 x DWORD (Width, Height, Format)
+                    size_t totalHashSize = metadataSize + sampleSize;
+                    auto hashBuffer = std::make_unique<unsigned char[]>(totalHashSize);
+                    
+                    // Pack metadata efficiently
+                    DWORD* metadata = reinterpret_cast<DWORD*>(hashBuffer.get());
+                    metadata[0] = desc.Width;
+                    metadata[1] = desc.Height;
+                    metadata[2] = (DWORD)desc.Format;
+                    
+                    // Simple memcpy - no complex sampling
+                    memcpy(hashBuffer.get() + metadataSize, dataPtr, sampleSize);
+                    
+                    // Calculate hash
                     hash.size = desc.Width * desc.Height;
-                    hash.crc32 = crc32(reinterpret_cast<const unsigned char*>(lockedRect.pBits), dataSize);
+                    hash.crc32 = crc32(hashBuffer.get(), totalHashSize);
                     
                     if (hash.crc32 != 0) {
                         hashSuccess = true;
-                    } else {
-                        LOG::logline("!! CRC32 calculation returned zero for texture %dx%d", desc.Width, desc.Height);
                     }
                     
                     dstSurface->UnlockRect();
@@ -733,6 +771,10 @@ TextureRuntimeHash calculateTextureHash(IDirect3DDevice9* device, IDirect3DTextu
         
         if (srcSurface) srcSurface->Release();
         if (dstSurface) dstSurface->Release();
+    }
+    
+    // Only release stagingTexture if it was successfully created
+    if (stagingTexture) {
         stagingTexture->Release();
     }
     
@@ -929,6 +971,9 @@ void addRuntimeTextureHash(uint32_t crc32Hash, uint32_t size, const char* textur
 
 // buildBSATextureHashDatabase - Build hash database from base textures that have suffix variants
 void buildBSATextureHashDatabase(IDirect3DDevice9* dev) {
+    int databaseStartTime = HighResolutionTimer::getMicroseconds();
+    LOG::logline("-- Starting texture hash database building with timing analysis");
+    
     // Ensure suffix database is built first
     if (!textureSuffixDatabaseBuilt) {
         buildTextureSuffixDatabase();
@@ -1038,8 +1083,13 @@ void buildBSATextureHashDatabase(IDirect3DDevice9* dev) {
         texturesHashed++;
     }
     
+    int databaseTotalTime = HighResolutionTimer::getMicroseconds() - databaseStartTime;
+    float databaseTotalTimeMs = databaseTotalTime / 1000.0f;
+    float avgTimePerTextureMs = texturesHashed > 0 ? databaseTotalTimeMs / texturesHashed : 0.0f;
     LOG::logline("-- Hash database complete: %d base textures processed, %d hash matches created", 
                texturesHashed, texturesMatched);
+    LOG::logline("-- TOTAL DATABASE BUILD TIME: %.2f ms for %d textures (%.2f ms per texture)", 
+               databaseTotalTimeMs, texturesHashed, avgTimePerTextureMs);
 }
 
 }
