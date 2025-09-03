@@ -394,7 +394,10 @@ static std::string extractBaseName(const std::string& texPath) {
         baseName = baseName.substr(0, dotPos);
     }
     
-    // Check for known suffixes and remove them
+    // Check for known suffixes and remove them (order matters - check longer suffixes first)
+    if (baseName.length() > 12 && baseName.substr(baseName.length() - 12) == "_diffparam_t") {
+        return baseName.substr(0, baseName.length() - 12);
+    }
     if (baseName.length() > 10 && baseName.substr(baseName.length() - 10) == "_diffparam") {
         return baseName.substr(0, baseName.length() - 10);
     }
@@ -418,6 +421,9 @@ static const char* getSuffixType(const std::string& texPath) {
         baseName = baseName.substr(0, dotPos);
     }
     
+    if (baseName.length() > 12 && baseName.substr(baseName.length() - 12) == "_diffparam_t") {
+        return "diffparam_t";
+    }
     if (baseName.length() > 10 && baseName.substr(baseName.length() - 10) == "_diffparam") {
         return "diffparam";
     }
@@ -461,11 +467,14 @@ static void scanDirectoryForSuffixes(const std::string& basePath, const std::str
             std::string fullRelativePath = relativePath.empty() ? filename : relativePath + "\\" + filename;
             
             
-            // Check for suffix patterns
+            // Check for suffix patterns (check longer suffixes first)
             bool isSuffixFile = false;
             std::string suffixType;
             
-            if (filename.length() > 13 && filename.substr(filename.length() - 14) == "_diffparam.dds") {
+            if (filename.length() > 15 && filename.substr(filename.length() - 16) == "_diffparam_t.dds") {
+                isSuffixFile = true;
+                suffixType = "diffparam_t";
+            } else if (filename.length() > 13 && filename.substr(filename.length() - 14) == "_diffparam.dds") {
                 isSuffixFile = true;
                 suffixType = "diffparam";
             } else if (filename.length() > 7 && filename.substr(filename.length() - 7) == "_nh.dds") {
@@ -485,6 +494,9 @@ static void scanDirectoryForSuffixes(const std::string& basePath, const std::str
                 
                 if (suffixType == "diffparam") {
                     variants.diffparam = "textures/" + fullRelativePath;
+                    LOG::logline("DEBUG: Storing _diffparam variant for base %s: %s", baseName.c_str(), variants.diffparam.c_str());
+                } else if (suffixType == "diffparam_t") {
+                    variants.diffparam_t = "textures/" + fullRelativePath;
                 } else if (suffixType == "normal") {
                     variants.normal = "textures/" + fullRelativePath;
                 } else if (suffixType == "param") {
@@ -802,6 +814,8 @@ IDirect3DTexture9* loadSuffixTexture(IDirect3DDevice9* dev, const TextureSuffixV
     
     if (strcmp(suffixType, "diffparam") == 0 && variants.hasDiffParam()) {
         texturePath = variants.diffparam.c_str();
+    } else if (strcmp(suffixType, "diffparam_t") == 0 && variants.hasDiffParamT()) {
+        texturePath = variants.diffparam_t.c_str();
     } else if (strcmp(suffixType, "normal") == 0 && variants.hasNormal()) {
         texturePath = variants.normal.c_str();
     } else if (strcmp(suffixType, "param") == 0 && variants.hasParam()) {
@@ -1091,5 +1105,6 @@ void buildBSATextureHashDatabase(IDirect3DDevice9* dev) {
     LOG::logline("-- TOTAL DATABASE BUILD TIME: %.2f ms for %d textures (%.2f ms per texture)", 
                databaseTotalTimeMs, texturesHashed, avgTimePerTextureMs);
 }
+
 
 }

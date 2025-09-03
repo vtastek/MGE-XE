@@ -207,120 +207,107 @@ float3 PBRNeutralToneMapping(float3 color) {
 // --------------------------------------------------------------------------
 // -----------------FILMIC PROCESS ------------------------------------------
 
-static const float _CameraEV = 0.48;
-static const float _PrintEV = 0.0;
+//   https://github.com/sobotka/AgX
 
-// Scale factor to keep numbers in safe range for ps_3_0
-#define SCALE_FACTOR 10.0f
-#define INV_SCALE_FACTOR 0.1f
+// 0: Default, 1: Golden, 2: Punchy
+#define AGX_LOOK 0
 
-// Physical Film Constants
-static const float D_MIN = 0.0;
-static const float D_MAX = 2.0;
-static const float NEUTRAL_PRINT_EV = 0.0;
-
-static const float3x3 CROSSTALK_MATRIX = float3x3(
-    0.33, 0.09, 0.03,
-    0.05, 0.33, 0.07,
-    0.05, 0.05, 0.33
-);
-
-// Safe logistic function with scaled inputs
-float3 SafeLogistic(float3 x, float slope, float offset)
+// Mean error^2: 3.6705141e-06
+float3 AgxDefaultContrastApprox(float3 x) 
 {
-    // Clamp input to prevent exp overflow in ps_3_0
-    float3 clamped = clamp(x + offset, -10.0, 10.0);
-    return 1.0 / (1.0 + exp(-slope * clamped));
+	const float3 x2 = x * x;
+	const float3 x4 = x2 * x2;
+ 
+	return + 15.5   * x4 * x2
+			- 40.14    * x4 * x
+			+ 31.96    * x4
+			- 6.868    * x2 * x
+			+ 0.4298   * x2
+			+ 0.1191   * x
+			- 0.00232;
 }
 
-// Converts linear light value into film dye density (scaled)
-float3 CaptureToDensity(float3 scene_linear_scaled)
+float3 Agx(float3 val) 
 {
-    // Work with scaled values, then convert to log
-    float3 safe_input = max(scene_linear_scaled, 1e-3); // Higher minimum for  safety
+	const float3x3 agx_mat = float3x3(
+		0.842479062253094, 0.0423282422610123, 0.0423756549057051,
+		0.0784335999999992,  0.878468636469772,  0.0784336,
+		0.0792237451477643, 0.0791661274605434, 0.879142973793104);
 
-    float3 log_exp = log2(safe_input) / 3.32193; // log10 using log2 for better precision
+	// DEFAULT_LOG2_MIN      = -10.0
+	// DEFAULT_LOG2_MAX      =  +6.5
+	// MIDDLE_GRAY           =  0.18
+	// log2(pow(2, VALUE) * MIDDLE_GRAY)
+	// Adjusted for Unreal's zero exposure compensation
+	const float min_ev = -12.47393f; // Default: -12.47393f;
+	const float max_ev = 0.526069f;  // Default:  4.026069f;
 
+	// Input transform (inset)
+	val = mul(val, agx_mat);
+  
+	// Log2 space encoding
+	val = clamp(log2(val), min_ev, max_ev);
+	val = (val - min_ev) / (max_ev - min_ev);
+  
+	// Apply sigmoid function approximation
+	val = AgxDefaultContrastApprox(val);
 
-    float3 t = SafeLogistic(log_exp, 3.0, 1.0);
-    return D_MIN + (D_MAX - D_MIN) * t;
+	return val;
 }
 
-// Converts dye density to transmission (scaled)
-float3 DevelopFromDensity(float3 density, bool is_paper)
+float3 AgxEotf(float3 val) 
 {
-    // Clamp density to safe range
-    float3 safe_density = clamp(density, -5.0, 5.0);
+	const float3x3 agx_mat_inv = float3x3(
+		1.19687900512017, -0.0528968517574562, -0.0529716355144438,
+		-0.0980208811401368, 1.15190312990417, -0.0980434501171241,
+		-0.0990297440797205, -0.0989611768448433, 1.15107367264116);
+	
+	// Inverse input transform (outset)
+	val = mul(val, agx_mat_inv);
+  
+	// sRGB IEC 61966-2-1 2.2 Exponent Reference EOTF Display
+	// NOTE: We're linearizing the output here. Comment/adjust when
+	// *not* using a sRGB render target
+	val = pow(val, 2.2);
 
-    if (is_paper) {
-        // Paper development with safe normalization
-        float3 raw = exp2(-safe_density * 3.32193); // pow(10, -density) using exp2
-
-        // Use simpler normalization to avoid tiny denominators
-        float black_ref = exp2(-D_MAX * 0.8 * 3.32193);
-        float white_ref = exp2(-D_MIN * 3.32193);
-
-        // Safe range check
-        float range = max(white_ref - black_ref, white_ref * 0.1);
-        float3 normalized = (raw - black_ref) / range;
-
-        return saturate(normalized) * 1.2;
-    }
-    else {
-        // Negative development - simpler
-        return exp2(-safe_density * 3.32193);
-    }
+	return val;
 }
 
-// Process single channel through film pipeline
-float ProcessChannel(float channel_value)
+float3 AgxLook(float3 val) 
 {
-    // Scale to safe range
-    float scaled = channel_value * SCALE_FACTOR;
-
-    // Apply camera EV
-    scaled *= exp2(_CameraEV);
-
-    // Negative capture - single channel logistic
-    float log_val = log2(max(scaled, 1e-3)) / 3.32193; // log10 equivalent
-    float t1 = 1.0 / (1.0 + exp(-3.0 * (log_val + 1.0)));
-    float density_neg = D_MIN + (D_MAX - D_MIN) * t1;
-
-    // Negative transmission
-    float transmission = exp2(-density_neg * 3.32193);
-
-    // Print exposure
-    transmission *= exp2(_PrintEV + NEUTRAL_PRINT_EV);
-
-    // Paper capture
-    float log_print = log2(max(transmission, 1e-3)) / 3.32193;
-    float t2 = 1.0 / (1.0 + exp(-3.0 * (log_print + 1.0)));
-    float density_paper = D_MIN + (D_MAX - D_MIN) * t2;
-
-    // Paper reflection with safe normalization
-    float reflection = exp2(-density_paper * 3.32193);
-
-    // Simple contrast mapping instead of complex normalization
-    reflection = saturate(reflection * 1.2);
-
-    // Rescale back
-    return reflection * INV_SCALE_FACTOR;
+	const float3 lw = float3(0.2126, 0.7152, 0.0722);
+	const float luma = dot(val, lw);
+  
+	// Default
+	const float3 offset = float3(0.0, 0.0, 0.0);
+	float3 slope = float3(1.0, 1.0, 1.0);
+	float3 power = float3(1.0, 1.0, 1.0);
+	float sat = 1.0;
+ 
+#if AGX_LOOK == 1
+	// Golden
+	slope = float3(1.0, 0.9, 0.5);
+	power = float3(0.8, 0.8, 0.8);
+	sat = 0.8;
+#elif AGX_LOOK == 2
+	// Punchy
+	slope = float3(1.0, 1.0, 1.0);
+	power = float3(1.35, 1.35, 1.35);
+	sat = 1.4;
+#endif
+  
+	// ASC CDL
+	val = pow(val * slope + offset, power);
+	return luma + sat * (val - luma);
 }
 
-float3 filmp(float3 scene_color)
+float3 ApplyAgX(float3 LinearColorRec709)
 {
-    // Apply crosstalk first (affects all channels)
-    float3 scene_with_crosstalk = mul(CROSSTALK_MATRIX, scene_color);
-
-    // Process each channel independently
-    float r = ProcessChannel(scene_with_crosstalk.r);
-    float g = ProcessChannel(scene_with_crosstalk.g);
-    float b = ProcessChannel(scene_with_crosstalk.b);
-
-    float3 result = float3(r, g, b);
-
-    // Final artistic processing
-    return (saturate(result));
+	LinearColorRec709 = Agx(LinearColorRec709);
+	LinearColorRec709 = AgxLook(LinearColorRec709);
+	LinearColorRec709 = AgxEotf(LinearColorRec709);
+	
+	return LinearColorRec709;
 }
 
 //------------------------------------------------------------
@@ -465,10 +452,11 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 	#endif
 	
 
-    float4 texColor = pow(tex2D(sampTex0, parallaxUV), 2.2); // Will use parallax-corrected UVs if HAS_NORMAL
-
+    float4 texColor = tex2D(sampTex0, parallaxUV);
+	texColor.rgb = max(0.008, pow(texColor.rgb, 2.2));
+    // Note: When HAS_DIFFPARAM is defined, sampTex0 contains the _diffparam/_diffparam_t texture
     #ifdef HAS_DIFFPARAM
-    texColor.rgb = pow(tex2D(sampTex2, parallaxUV).rgb, 2.2); // Will use parallax-corrected UVs if HAS_NORMAL
+    texColor.a = 1.0; // Ignore alpha from _diffparam texture
     #endif
 
     // PBR lighting calculation
@@ -491,13 +479,19 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 	#endif
 #endif
 #ifdef HAS_DIFFPARAM
-    roughness = tex2D(sampTex2, parallaxUV).a;
-    roughness = roughness * roughness;
+    // Basic PBR mode: _diffparam texture with fixed material properties
+    // RGB = albedo, A = roughness. Fixed: metalness=0, specular=0.5, AO=1
+    // Sample diffparam alpha directly for roughness (before texColor.a was overwritten with original alpha)
+    float diffparamAlpha = tex2D(sampTex0, parallaxUV).a;
+    roughness = diffparamAlpha * diffparamAlpha;
+    metalness = 0.0;         // Non-metallic materials
+    F0 = 0.08 * 0.5;         // Fixed specular reflectance = 0.5
+    ao = 1.0;                // Full ambient occlusion
 #endif
 
 
 #ifndef NOLIT
-    float3 lighting = pow(lightSceneAmbient, 2.2) / PI;
+    float3 ambient = pow(lightSceneAmbient, 2.2);
 
     // Sun light (Oren-Nayar)
     float3 Lsun = normalize(-lightSunDirection);
@@ -506,8 +500,8 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 	//deb = sunBRDF;
     float NdotL_sun = max(dot(Norm, Lsun), 0.0);
 
-    lighting += pow(lightSunDiffuse, 2.2) * sunBRDF * sunAtten * NdotL_sun * PI;
-
+    float3 lighting = pow(lightSunDiffuse, 2.2) * sunBRDF * sunAtten * NdotL_sun;
+	float neglight = 0.0;
 	#ifndef NO_POINT_LIGHTS
 		// Point lights (Lambert)
 		for (int i = 0; i < pointLightCount; i++) {
@@ -521,14 +515,21 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 			float attenuation = (falloff > 0.0) ? (1.0 / falloff) * cutoff : 0.0;
 			float3 pointBRDF = BRDF(Norm, V, L, float3(1,1,1), metalness, roughness, roughness, radius, F0, 0);
 			float NdotL_point = max(dot(Norm, (L)), 0.0);
-			lighting += (pow(lightDiffuse[i].rgb, 2.2) * pointBRDF * NdotL_point + lightAmbient[i]) * attenuation * PI;
+			lighting += (pow(max(0.0, lightDiffuse[i].rgb), 2.2) * pointBRDF * NdotL_point) * attenuation;
+			neglight -= max(0.0, -lightDiffuse[i].r) * 1/pow(falloff, 1/3.2);
+			
 			//deb += attenuation;
 		}
 	#endif
+	
+	lighting += ambient;
+	neglight = max(0.0, 1 - 0.95 * saturate(-neglight));
+	lighting *= neglight;
 #else
     // Unlit shader - no lighting calculations
     float3 lighting = float3(1.0, 1.0, 1.0);
 #endif
+	
 
     // Material calculation with diffuse parameter modulation
     float3 effectiveDiffuse;
@@ -564,11 +565,11 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
     float4 c = diffuse * texColor;
    // c = diffuse * float4(1,1,1,texColor.a);
 
-    c.rgb = PBRNeutralToneMapping(min(1.6e+6f, abs(c.rgb) * 6.14));
+    c.rgb = PBRNeutralToneMapping(min(1.6e+6f, max(0.0, c.rgb) * 4.0));
     // Apply fog
     //c.rgb = lerp(fogColNear, c.rgb, input.fog);
-    c.rgb = pow(c.rgb, 1.0 / 2.2);
+    //c.rgb = ApplyAgX(min(1.6e+6f, max(0.0, c.rgb) * 3.14));
+	c.rgb = pow(c.rgb, 1.0/ 2.2);
 	//c.rgb = deb;
-
     return c;
 }

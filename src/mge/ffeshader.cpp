@@ -40,6 +40,7 @@ unordered_map<FixedFunctionShader::ShaderKey, FixedFunctionShader::HLSLShader, F
 FixedFunctionShader::HLSLShaderLRU FixedFunctionShader::hlslShaderLRU;
 FixedFunctionShader::HLSLShader FixedFunctionShader::hlslShaderDefaultPurple;
 std::unordered_map<std::string, FixedFunctionShader::CachedShaderSource> FixedFunctionShader::shaderSourceCache;
+bool FixedFunctionShader::needsCacheReset = false;
 
 // Async compilation system static variables
 std::queue<std::shared_ptr<FixedFunctionShader::AsyncShaderRequest>> FixedFunctionShader::compilationQueue;
@@ -114,7 +115,7 @@ static SuffixTextureFlags getSuffixFlagsForTexture(IDirect3DDevice9* device, IDi
             const BSA::TextureSuffixVariants* variants = BSA::getTextureSuffixVariants(textureName->c_str());
             if (variants && (variants->hasDiffParam() || variants->hasNormal() || variants->hasParam())) {
                 // Set flags based on available suffix variants (combinations allowed)
-                flags.hasDiffParam = variants->hasDiffParam();
+                flags.hasDiffParam = variants->hasDiffParam() || variants->hasDiffParamT();
                 flags.hasNormal = variants->hasNormal();
                 flags.hasParam = variants->hasParam();
                 
@@ -1455,71 +1456,112 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
     D3DXMATRIX worldViewProj = worldMatrix * viewMatrix * projMatrix;
     D3DXMATRIX worldView = worldMatrix * viewMatrix;
     
-    // Use constant tables to set matrices
+    // Use constant tables to set matrices with safety checks
     if (hlslShader.vsConstantTable) {
-        D3DXHANDLE hWorldViewProj = hlslShader.vsConstantTable->GetConstantByName(NULL, "worldViewProj");
-        if (hWorldViewProj) {
-            hlslShader.vsConstantTable->SetMatrix(device, hWorldViewProj, &worldViewProj);
-        }
-        
-        D3DXHANDLE hView = hlslShader.vsConstantTable->GetConstantByName(NULL, "view");
-        if (hView) {
-            hlslShader.vsConstantTable->SetMatrix(device, hView, &viewMatrix);
-        }
-        
-        D3DXHANDLE hProj = hlslShader.vsConstantTable->GetConstantByName(NULL, "proj");
-        if (hProj) {
-            hlslShader.vsConstantTable->SetMatrix(device, hProj, &projMatrix);
-        }
-        
-        D3DXHANDLE hWorld = hlslShader.vsConstantTable->GetConstantByName(NULL, "world");
-        if (hWorld) {
-            hlslShader.vsConstantTable->SetMatrix(device, hWorld, &worldMatrix);
-        }
-        
-        D3DXHANDLE hWorldView = hlslShader.vsConstantTable->GetConstantByName(NULL, "worldview");
-        if (hWorldView) {
-            hlslShader.vsConstantTable->SetMatrix(device, hWorldView, &worldView);
-        }
-        
-        // Set up vertex blend palette for skinning using Morrowind's actual data
-        D3DXHANDLE hVertexBlendPalette = hlslShader.vsConstantTable->GetConstantByName(NULL, "vertexBlendPalette");
-        if (hVertexBlendPalette) {
-            if (rs->vertexBlendState > 0) {
-                // For skinned objects, use the bone matrices from Morrowind
-                hlslShader.vsConstantTable->SetMatrixArray(device, hVertexBlendPalette, rs->worldViewTransforms, 4);
-            } else {
-                // For rigid objects, set first matrix to worldview and clear others
-                D3DXMATRIX blendMatrices[4];
-                blendMatrices[0] = worldView;
-                memset(&blendMatrices[1], 0, sizeof(D3DXMATRIX) * 3);
-                hlslShader.vsConstantTable->SetMatrixArray(device, hVertexBlendPalette, blendMatrices, 4);
+        try {
+            D3DXHANDLE hWorldViewProj = hlslShader.vsConstantTable->GetConstantByName(NULL, "worldViewProj");
+            if (hWorldViewProj) {
+                HRESULT hr = hlslShader.vsConstantTable->SetMatrix(device, hWorldViewProj, &worldViewProj);
+                if (FAILED(hr)) {
+                    // Shader may have been invalidated by file edit - use fallback
+                    return;
+                }
             }
-        }
-        
-        D3DXHANDLE hVertexBlendState = hlslShader.vsConstantTable->GetConstantByName(NULL, "vertexBlendState");
-        if (hVertexBlendState) {
-            D3DXVECTOR4 blendState((float)rs->vertexBlendState, 0, 0, 0);
-            hlslShader.vsConstantTable->SetVector(device, hVertexBlendState, &blendState);
+            
+            D3DXHANDLE hView = hlslShader.vsConstantTable->GetConstantByName(NULL, "view");
+            if (hView) {
+                HRESULT hr = hlslShader.vsConstantTable->SetMatrix(device, hView, &viewMatrix);
+                if (FAILED(hr)) {
+                    return;
+                }
+            }
+            
+            D3DXHANDLE hProj = hlslShader.vsConstantTable->GetConstantByName(NULL, "proj");
+            if (hProj) {
+                HRESULT hr = hlslShader.vsConstantTable->SetMatrix(device, hProj, &projMatrix);
+                if (FAILED(hr)) {
+                    return;
+                }
+            }
+            
+            D3DXHANDLE hWorld = hlslShader.vsConstantTable->GetConstantByName(NULL, "world");
+            if (hWorld) {
+                HRESULT hr = hlslShader.vsConstantTable->SetMatrix(device, hWorld, &worldMatrix);
+                if (FAILED(hr)) {
+                    return;
+                }
+            }
+            
+            D3DXHANDLE hWorldView = hlslShader.vsConstantTable->GetConstantByName(NULL, "worldview");
+            if (hWorldView) {
+                HRESULT hr = hlslShader.vsConstantTable->SetMatrix(device, hWorldView, &worldView);
+                if (FAILED(hr)) {
+                    return;
+                }
+            }
+            // Set up vertex blend palette for skinning using Morrowind's actual data
+            D3DXHANDLE hVertexBlendPalette = hlslShader.vsConstantTable->GetConstantByName(NULL, "vertexBlendPalette");
+            if (hVertexBlendPalette) {
+                if (rs->vertexBlendState > 0) {
+                    // For skinned objects, use the bone matrices from Morrowind
+                    HRESULT hr = hlslShader.vsConstantTable->SetMatrixArray(device, hVertexBlendPalette, rs->worldViewTransforms, 4);
+                    if (FAILED(hr)) {
+                        return;
+                    }
+                } else {
+                    // For rigid objects, set first matrix to worldview and clear others
+                    D3DXMATRIX blendMatrices[4];
+                    blendMatrices[0] = worldView;
+                    memset(&blendMatrices[1], 0, sizeof(D3DXMATRIX) * 3);
+                    HRESULT hr = hlslShader.vsConstantTable->SetMatrixArray(device, hVertexBlendPalette, blendMatrices, 4);
+                    if (FAILED(hr)) {
+                        return;
+                    }
+                }
+            }
+            
+            D3DXHANDLE hVertexBlendState = hlslShader.vsConstantTable->GetConstantByName(NULL, "vertexBlendState");
+            if (hVertexBlendState) {
+                D3DXVECTOR4 blendState((float)rs->vertexBlendState, 0, 0, 0);
+                HRESULT hr = hlslShader.vsConstantTable->SetVector(device, hVertexBlendState, &blendState);
+                if (FAILED(hr)) {
+                    return;
+                }
+            }
+        } catch (...) {
+            // Shader invalidated during file edit - return early
+            LOG::logline("!! HLSL Vertex shader constant table access failed - shader may have been edited");
+            return;
         }
     }
     
     // Set pixel shader constants using constant tables (like Combined shader expects)
     if (hlslShader.psConstantTable) {
-        D3DXHANDLE hMaterialDiffuse = hlslShader.psConstantTable->GetConstantByName(NULL, "materialDiffuse");
-        if (hMaterialDiffuse) {
-            hlslShader.psConstantTable->SetVector(device, hMaterialDiffuse, (D3DXVECTOR4*)&frs->material.diffuse);
-        }
-        
-        D3DXHANDLE hMaterialAmbient = hlslShader.psConstantTable->GetConstantByName(NULL, "materialAmbient");
-        if (hMaterialAmbient) {
-            hlslShader.psConstantTable->SetVector(device, hMaterialAmbient, (D3DXVECTOR4*)&frs->material.ambient);
-        }
-        
-        D3DXHANDLE hMaterialEmissive = hlslShader.psConstantTable->GetConstantByName(NULL, "materialEmissive");
-        if (hMaterialEmissive) {
-            hlslShader.psConstantTable->SetVector(device, hMaterialEmissive, (D3DXVECTOR4*)&frs->material.emissive);
-        }
+        try {
+            D3DXHANDLE hMaterialDiffuse = hlslShader.psConstantTable->GetConstantByName(NULL, "materialDiffuse");
+            if (hMaterialDiffuse) {
+                HRESULT hr = hlslShader.psConstantTable->SetVector(device, hMaterialDiffuse, (D3DXVECTOR4*)&frs->material.diffuse);
+                if (FAILED(hr)) {
+                    LOG::logline("!! HLSL Pixel shader constant table access failed - shader may have been edited");
+                    return;
+                }
+            }
+            
+            D3DXHANDLE hMaterialAmbient = hlslShader.psConstantTable->GetConstantByName(NULL, "materialAmbient");
+            if (hMaterialAmbient) {
+                HRESULT hr = hlslShader.psConstantTable->SetVector(device, hMaterialAmbient, (D3DXVECTOR4*)&frs->material.ambient);
+                if (FAILED(hr)) {
+                    return;
+                }
+            }
+            
+            D3DXHANDLE hMaterialEmissive = hlslShader.psConstantTable->GetConstantByName(NULL, "materialEmissive");
+            if (hMaterialEmissive) {
+                HRESULT hr = hlslShader.psConstantTable->SetVector(device, hMaterialEmissive, (D3DXVECTOR4*)&frs->material.emissive);
+                if (FAILED(hr)) {
+                    return;
+                }
+            }
         
         // Set up lighting using the same logic as the original renderMorrowind
         const size_t MaxLights = 8;
@@ -1745,16 +1787,27 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
                         if (cacheIt != textureSuffixResolutionCache.end() && 
                             cacheIt->second.hasValidName && cacheIt->second.variants) {
                             
-                            if (cacheIt->second.variants->hasDiffParam()) {
-                                replacementTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device, 
-                                                                          *cacheIt->second.variants, "diffparam");
+                            if (cacheIt->second.variants->hasDiffParam() || cacheIt->second.variants->hasDiffParamT()) {
+                                // Try regular _diffparam first, then _diffparam_t
+                                if (cacheIt->second.variants->hasDiffParam()) {
+                                    LOG::logline("DEBUG: Found _diffparam variant for %s, attempting to load", cacheIt->second.textureName.c_str());
+                                    replacementTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device, 
+                                                                              *cacheIt->second.variants, "diffparam");
+                                }
+                                
+                                if (!replacementTexture && cacheIt->second.variants->hasDiffParamT()) {
+                                    LOG::logline("DEBUG: Found _diffparam_t variant for %s, attempting to load", cacheIt->second.textureName.c_str());
+                                    replacementTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device, 
+                                                                              *cacheIt->second.variants, "diffparam_t");
+                                }
+                                
                                 if (replacementTexture) {
-                                    // Use diffparam as base texture (slot 0) and preserve original for alpha (slot 5)
+                                    // Use diffparam/diffparam_t as base texture (slot 0) - no alpha preservation needed
                                     device->SetTexture(i, replacementTexture);
-                                    device->SetTexture(5, tex); // Bind original texture to slot 5 for alpha
-                                    LOG::logline("DEBUG DIFFPARAM PRIORITIZATION: Using _diffparam as base for %s, original alpha preserved in slot 5", 
+                                    LOG::logline("DEBUG DIFFPARAM PRIORITIZATION: Using diffparam variant as base for %s", 
                                                cacheIt->second.textureName.c_str());
                                 } else {
+                                    LOG::logline("!! Failed to load any diffparam variant texture for %s", cacheIt->second.textureName.c_str());
                                     // Fallback to original base texture
                                     device->SetTexture(i, tex);
                                 }
@@ -1867,6 +1920,11 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
                 
                 normalTexture->Release();
             }
+        }
+        } catch (...) {
+            // Shader invalidated during file edit - return early
+            LOG::logline("!! HLSL Pixel shader constant table access failed - shader may have been edited");
+            return;
         }
     }
     
@@ -1999,18 +2057,11 @@ char* FixedFunctionShader::loadShaderFile(const char* filename, DWORD* outFileSi
                 cachedCopy[it->second.size] = '\0';
                 return cachedCopy;
             } else {
-                // File changed! Clear cache and reload
-                LOG::logline("-- HLSL shader file changed: %s, reloading...", filename);
+                // File changed! Mark for recompilation but don't clear cache immediately
                 delete[] it->second.source;
                 shaderSourceCache.erase(it);
-                // Clear all compiled shaders to force recompilation with new source
-                for (auto& i : cacheHLSLShaders) {
-                    if (i.second.vertexShader) i.second.vertexShader->Release();
-                    if (i.second.pixelShader) i.second.pixelShader->Release();
-                    if (i.second.vsConstantTable) i.second.vsConstantTable->Release();
-                    if (i.second.psConstantTable) i.second.psConstantTable->Release();
-                }
-                cacheHLSLShaders.clear();
+                // Set flag to clear cache after current compilation operations complete
+                needsCacheReset = true;
             }
         }
     }
@@ -2192,6 +2243,12 @@ void FixedFunctionShader::checkForShaderFileChanges() {
 }
 
 FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const ShaderKey& sk) {
+    // Check if we need to clear the shader cache due to file changes
+    if (needsCacheReset) {
+        cacheHLSLShaders.clear();
+        needsCacheReset = false;
+    }
+    
     HLSLShader hlslShader = {};
     
     // Shader entry points
@@ -2391,12 +2448,61 @@ void FixedFunctionShader::release() {
     cacheEffects.clear();
     effectDefaultPurple->Release();
     
-    // Clean up HLSL cache
+    // Clean up HLSL cache with safety checks
     for (auto& i : cacheHLSLShaders) {
-        if (i.second.vertexShader) i.second.vertexShader->Release();
-        if (i.second.pixelShader) i.second.pixelShader->Release();
-        if (i.second.vsConstantTable) i.second.vsConstantTable->Release();
-        if (i.second.psConstantTable) i.second.psConstantTable->Release();
+        try {
+            // Extra safety: validate pointers before release using COM object validation
+            if (i.second.vertexShader) {
+                // Try to AddRef/Release to test if object is valid
+                ULONG refCount = i.second.vertexShader->AddRef();
+                if (refCount > 1) {
+                    i.second.vertexShader->Release(); // Remove our AddRef
+                    i.second.vertexShader->Release(); // Original release
+                } else {
+                    i.second.vertexShader->Release(); // Just remove our AddRef
+                }
+                i.second.vertexShader = nullptr;
+            }
+            
+            if (i.second.pixelShader) {
+                ULONG refCount = i.second.pixelShader->AddRef();
+                if (refCount > 1) {
+                    i.second.pixelShader->Release(); // Remove our AddRef
+                    i.second.pixelShader->Release(); // Original release
+                } else {
+                    i.second.pixelShader->Release(); // Just remove our AddRef
+                }
+                i.second.pixelShader = nullptr;
+            }
+            
+            if (i.second.vsConstantTable) {
+                ULONG refCount = i.second.vsConstantTable->AddRef();
+                if (refCount > 1) {
+                    i.second.vsConstantTable->Release(); // Remove our AddRef
+                    i.second.vsConstantTable->Release(); // Original release
+                } else {
+                    i.second.vsConstantTable->Release(); // Just remove our AddRef
+                }
+                i.second.vsConstantTable = nullptr;
+            }
+            
+            if (i.second.psConstantTable) {
+                ULONG refCount = i.second.psConstantTable->AddRef();
+                if (refCount > 1) {
+                    i.second.psConstantTable->Release(); // Remove our AddRef
+                    i.second.psConstantTable->Release(); // Original release
+                } else {
+                    i.second.psConstantTable->Release(); // Just remove our AddRef
+                }
+                i.second.psConstantTable = nullptr;
+            }
+        } catch (...) {
+            // Ignore cleanup errors during shutdown - objects may already be invalid
+            i.second.vertexShader = nullptr;
+            i.second.pixelShader = nullptr;
+            i.second.vsConstantTable = nullptr;
+            i.second.psConstantTable = nullptr;
+        }
     }
     hlslShaderLRU.shader = {};
     hlslShaderLRU.last_sk = ShaderKey();

@@ -13,12 +13,14 @@ namespace BSA {
     struct TextureSuffixVariants {
         std::string baseName;
         std::string diffparam;         // _diffparam texture path
+        std::string diffparam_t;       // _diffparam_t texture path (terrain)
         std::string normal;            // _nh texture path
         std::string param;             // _param texture path
         std::string baseTextureSource; // "loose" or "bsa"  
         std::string baseTexturePath;   // Full path to base texture
         
         bool hasDiffParam() const { return !diffparam.empty(); }
+        bool hasDiffParamT() const { return !diffparam_t.empty(); }
         bool hasNormal() const { return !normal.empty(); }
         bool hasParam() const { return !param.empty(); }
     };
@@ -61,4 +63,5 @@ namespace BSA {
     
     // Device state diagnostics
     void logDeviceState(IDirect3DDevice9* device, const char* stage);
+    
 }

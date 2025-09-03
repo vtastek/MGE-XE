@@ -219,6 +219,7 @@ bool DistantLand::init() {
     
     // Build BSA and loose texture hash database after BSA files are loaded (early clean device state)
     BSA::buildBSATextureHashDatabase(device);
+    
 
     if (Configuration.UseSharedMemory && !initIpc()) {
         return false;

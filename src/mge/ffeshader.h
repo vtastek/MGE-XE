@@ -164,6 +164,7 @@ class FixedFunctionShader {
         FILETIME lastWriteTime;
     };
     static std::unordered_map<std::string, CachedShaderSource> shaderSourceCache;
+    static bool needsCacheReset;  // Flag to trigger cache reset after file changes
 
     // Async compilation system
     struct AsyncShaderRequest {
