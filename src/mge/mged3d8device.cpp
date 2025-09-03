@@ -83,6 +83,12 @@ MGEProxyDevice::MGEProxyDevice(IDirect3DDevice9* real, ProxyD3D* d3d) : ProxyDev
     // Store active device in distant land, occurs on startup and after fullscreen alt-tab
     DistantLand::device = realDevice;
 
+    // Start shader precaching immediately when device is available (before save game load)
+    if (Configuration.MGEFlags & USE_FFESHADER) {
+        LOG::logline("-- Starting immediate shader precaching (device constructor)");
+        FixedFunctionShader::startEarlyPrecache(realDevice);
+    }
+
     // Patch splash screen minor issues
     D3DVIEWPORT9 vp;
     realDevice->GetViewport(&vp);

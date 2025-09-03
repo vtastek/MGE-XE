@@ -203,12 +203,14 @@ class FixedFunctionShader {
     static std::unordered_map<VertexShaderKey, IDirect3DVertexShader9*, VertexShaderKey::hasher> vertexShaderCache;
 
     static char* loadShaderFile(const char* filename, DWORD* outFileSize);
+    static bool detectDXVK();
     static HLSLShader generateMWShaderHLSL(const ShaderKey& sk);
     static HLSLShader createPurpleErrorShader();
     static void captureAndDumpTexture(IDirect3DTexture9* texture);
 
 public:
     static bool init(IDirect3DDevice* d, ID3DXEffectPool* pool);
+    static void startEarlyPrecache(IDirect3DDevice* d);
     static void precacheAsync();
     static void updateLighting(float sunMult, float ambMult);
     static void renderMorrowind(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);

@@ -211,6 +211,13 @@ bool DistantLand::init() {
     }
 
     LOG::logline(">> Starting Distant Land init");
+    
+    // Start shader precaching as early as possible - before intensive BSA operations
+    if (Configuration.MGEFlags & USE_FFESHADER) {
+        LOG::logline("-- Starting ultra-early shader precaching");
+        FixedFunctionShader::startEarlyPrecache(device);
+    }
+    
     vsr.init(device);
     BSA::init();
     
