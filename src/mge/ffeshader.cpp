@@ -35,6 +35,10 @@ D3DXHANDLE FixedFunctionShader::ehTexgenTransform, FixedFunctionShader::ehBumpMa
 
 float FixedFunctionShader::sunMultiplier, FixedFunctionShader::ambMultiplier;
 
+// DXVK detection static variables
+static bool dxvkDetectionCached = false;
+static bool dxvkDetectionResult = false;
+
 // HLSL Pipeline static variables
 unordered_map<FixedFunctionShader::ShaderKey, FixedFunctionShader::HLSLShader, FixedFunctionShader::ShaderKey::hasher> FixedFunctionShader::cacheHLSLShaders;
 FixedFunctionShader::HLSLShaderLRU FixedFunctionShader::hlslShaderLRU;
@@ -143,7 +147,89 @@ static SuffixTextureFlags getSuffixFlagsForTexture(IDirect3DDevice9* device, IDi
 
 static string buildArgString(DWORD arg, const string& mask, const string& sampler);
 
+// DXVK detection function
+static bool isDXVK() {
+    if (dxvkDetectionCached) {
+        return dxvkDetectionResult;
+    }
 
+    dxvkDetectionCached = true;
+    dxvkDetectionResult = false;
+
+    // Get d3d9.dll version info to detect DXVK
+    DWORD dwHandle = 0;
+    DWORD dwSize = GetFileVersionInfoSizeA("d3d9.dll", &dwHandle);
+    if (dwSize == 0) {
+        return false;
+    }
+
+    std::vector<BYTE> versionInfo(dwSize);
+    if (!GetFileVersionInfoA("d3d9.dll", dwHandle, dwSize, versionInfo.data())) {
+        return false;
+    }
+
+    // Try multiple language/codepage combinations
+    const char* langCodes[] = {
+        "040904b0", // US English
+        "040904E4", // US English (another variant)
+        "04090000", // English (neutral)
+        "000004b0", // Neutral language, US English codepage
+        "00000000"  // Neutral language, neutral codepage
+    };
+
+    std::string productName;
+    bool foundProductName = false;
+
+    for (const char* langCode : langCodes) {
+        std::string queryPath = std::string("\\StringFileInfo\\") + langCode + "\\ProductName";
+        LPVOID lpBuffer = nullptr;
+        UINT uLen = 0;
+
+        if (VerQueryValueA(versionInfo.data(), queryPath.c_str(), &lpBuffer, &uLen) && lpBuffer && uLen > 0) {
+            productName = static_cast<char*>(lpBuffer);
+            foundProductName = true;
+            break;
+        }
+    }
+
+    if (!foundProductName) {
+        // Try to enumerate available language/codepage combinations
+        struct LANGANDCODEPAGE {
+            WORD wLanguage;
+            WORD wCodePage;
+        } *lpTranslate;
+
+        UINT cbTranslate = 0;
+        if (VerQueryValueA(versionInfo.data(), "\\VarFileInfo\\Translation", (LPVOID*)&lpTranslate, &cbTranslate)) {
+            for (size_t i = 0; i < (cbTranslate / sizeof(LANGANDCODEPAGE)); i++) {
+                char langCode[9];
+                std::snprintf(langCode, sizeof(langCode), "%04x%04x", lpTranslate[i].wLanguage, lpTranslate[i].wCodePage);
+
+                std::string queryPath = std::string("\\StringFileInfo\\") + langCode + "\\ProductName";
+                LPVOID lpBuffer = nullptr;
+                UINT uLen = 0;
+
+                if (VerQueryValueA(versionInfo.data(), queryPath.c_str(), &lpBuffer, &uLen) && lpBuffer && uLen > 0) {
+                    productName = static_cast<char*>(lpBuffer);
+                    foundProductName = true;
+                    break;
+                }
+            }
+        }
+
+        if (!foundProductName) {
+            return false;
+        }
+    }
+
+    // Check if this is DXVK
+    if (productName.find("DXVK") != std::string::npos) {
+        dxvkDetectionResult = true;
+        LOG::logline("-- DXVK detected, fast compilation enabled");
+    }
+
+    return dxvkDetectionResult;
+}
 
 bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
     device = d;
@@ -322,6 +408,18 @@ void FixedFunctionShader::startEarlyPrecache(IDirect3DDevice* d) {
                     
                     // Additional edge cases for complete coverage (4)  
                     {0, 1, 0, 1, 0, 0, 0, 1, 1}, {0, 1, 1, 1, 0, 0, 0, 1, 1}, {0, 0, 0, 0, 0, 0, 0, 1, 1}, {0, 0, 1, 0, 0, 0, 0, 1, 1},
+                    
+                    // CRITICAL FIX: Add the 8 universal base combinations that the fallback system expects
+                    // These are guaranteed to be cached and should always be available for fallback
+                    // Format: {lighting, noPointLights, vertexCol, skinning, hasDiffParam, hasNormal, hasParam, fogMode, stages}
+                    {1, 1, 0, 0, 0, 0, 0, 1, 1}, // lit, no points, no vertcol, no skinning, no suffixes
+                    {1, 1, 1, 0, 0, 0, 0, 1, 1}, // lit, no points, vertcol, no skinning, no suffixes  
+                    {1, 1, 0, 1, 0, 0, 0, 1, 1}, // lit, no points, no vertcol, skinning, no suffixes
+                    {1, 1, 1, 1, 0, 0, 0, 1, 1}, // lit, no points, vertcol, skinning, no suffixes
+                    {1, 0, 0, 0, 0, 0, 0, 1, 1}, // lit, points, no vertcol, no skinning, no suffixes
+                    {1, 0, 1, 0, 0, 0, 0, 1, 1}, // lit, points, vertcol, no skinning, no suffixes
+                    {1, 0, 0, 1, 0, 0, 0, 1, 1}, // lit, points, no vertcol, skinning, no suffixes
+                    {1, 0, 1, 1, 0, 0, 0, 1, 1}, // lit, points, vertcol, skinning, no suffixes
                 };
                 
                 const int totalVariants = sizeof(variants) / sizeof(variants[0]);
@@ -336,7 +434,7 @@ void FixedFunctionShader::startEarlyPrecache(IDirect3DDevice* d) {
                     }
                     
                     ShaderKey sk;
-                    memset(&sk, 0, sizeof sk);
+                    memset(&sk, 0, sizeof(sk));
                     sk.uvSets = 1;
                     sk.useLighting = v.lighting;
                     sk.noPointLights = v.noPointLights;
@@ -392,90 +490,99 @@ void FixedFunctionShader::precacheAsync() {
                 StatusOverlay::setStatus(progressText);
             };
             
-            // Direct approach: compile essential shader combinations without complex scenarios
-            // This is much faster and more predictable
-            
-            struct ShaderVariant {
-                int lighting;
-                int noPointLights; 
-                int vertexCol;
-                int skinning;
-                int hasDiffParam;
-                int hasNormal;
-                int hasParam;
-                int fogMode;
-                int stages;
-            };
-            
-            // Essential variants that cover most real-world cases
-            ShaderVariant variants[] = {
-                // Same 108 variants as immediate precaching - keep both in sync
-                // Basic unlit variants (2)
-                {0, 1, 0, 0, 0, 0, 0, 1, 1}, {0, 1, 1, 0, 0, 0, 0, 1, 1},
+                // Essential variants that cover most real-world cases
+                struct ShaderVariant {
+                    int lighting;
+                    int noPointLights; 
+                    int vertexCol;
+                    int skinning;
+                    int hasDiffParam;
+                    int hasNormal;
+                    int hasParam;
+                    int fogMode;
+                    int stages;
+                };
                 
-                // Basic lit variants - sun only (4)
-                {1, 1, 0, 0, 0, 0, 0, 1, 1}, {1, 1, 1, 0, 0, 0, 0, 1, 1}, {1, 1, 0, 1, 0, 0, 0, 1, 1}, {1, 1, 1, 1, 0, 0, 0, 1, 1},
-                
-                // Lit with point lights (4)
-                {1, 0, 0, 0, 0, 0, 0, 1, 1}, {1, 0, 1, 0, 0, 0, 0, 1, 1}, {1, 0, 0, 1, 0, 0, 0, 1, 1}, {1, 0, 1, 1, 0, 0, 0, 1, 1},
-                
-                // Diffparam variants - most important for terrain (8)
-                {1, 1, 0, 0, 1, 0, 0, 1, 1}, {1, 1, 1, 0, 1, 0, 0, 1, 1}, {1, 0, 0, 0, 1, 0, 0, 1, 1}, {1, 0, 1, 0, 1, 0, 0, 1, 1},
-                {1, 1, 0, 1, 1, 0, 0, 1, 1}, {1, 1, 1, 1, 1, 0, 0, 1, 1}, {1, 0, 0, 1, 1, 0, 0, 1, 1}, {1, 0, 1, 1, 1, 0, 0, 1, 1},
-                
-                // Normal map variants (8)
-                {1, 1, 0, 0, 0, 1, 0, 1, 1}, {1, 1, 1, 0, 0, 1, 0, 1, 1}, {1, 0, 0, 0, 0, 1, 0, 1, 1}, {1, 0, 1, 0, 0, 1, 0, 1, 1},
-                {1, 1, 0, 1, 0, 1, 0, 1, 1}, {1, 1, 1, 1, 0, 1, 0, 1, 1}, {1, 0, 0, 1, 0, 1, 0, 1, 1}, {1, 0, 1, 1, 0, 1, 0, 1, 1},
-                
-                // Diffparam + normal combinations (8)
-                {1, 1, 0, 0, 1, 1, 0, 1, 1}, {1, 1, 1, 0, 1, 1, 0, 1, 1}, {1, 0, 0, 0, 1, 1, 0, 1, 1}, {1, 0, 1, 0, 1, 1, 0, 1, 1},
-                {1, 1, 0, 1, 1, 1, 0, 1, 1}, {1, 1, 1, 1, 1, 1, 0, 1, 1}, {1, 0, 0, 1, 1, 1, 0, 1, 1}, {1, 0, 1, 1, 1, 1, 0, 1, 1},
-                
-                // Param variants (8)
-                {1, 1, 0, 0, 0, 0, 1, 1, 1}, {1, 1, 1, 0, 0, 0, 1, 1, 1}, {1, 0, 0, 0, 0, 0, 1, 1, 1}, {1, 0, 1, 0, 0, 0, 1, 1, 1},
-                {1, 1, 0, 1, 0, 0, 1, 1, 1}, {1, 1, 1, 1, 0, 0, 1, 1, 1}, {1, 0, 0, 1, 0, 0, 1, 1, 1}, {1, 0, 1, 1, 0, 0, 1, 1, 1},
-                
-                // Full combination variants (8)
-                {1, 1, 0, 0, 1, 1, 1, 1, 1}, {1, 1, 1, 0, 1, 1, 1, 1, 1}, {1, 0, 0, 0, 1, 1, 1, 1, 1}, {1, 0, 1, 0, 1, 1, 1, 1, 1},
-                {1, 1, 0, 1, 1, 1, 1, 1, 1}, {1, 1, 1, 1, 1, 1, 1, 1, 1}, {1, 0, 0, 1, 1, 1, 1, 1, 1}, {1, 0, 1, 1, 1, 1, 1, 1, 1},
-                
-                // Dual texture variants - basic (8)
-                {1, 1, 0, 0, 0, 0, 0, 1, 2}, {1, 1, 1, 0, 0, 0, 0, 1, 2}, {1, 0, 0, 0, 0, 0, 0, 1, 2}, {1, 0, 1, 0, 0, 0, 0, 1, 2},
-                {1, 1, 0, 1, 0, 0, 0, 1, 2}, {1, 1, 1, 1, 0, 0, 0, 1, 2}, {1, 0, 0, 1, 0, 0, 0, 1, 2}, {1, 0, 1, 1, 0, 0, 0, 1, 2},
-                
-                // Dual texture + diffparam (8) 
-                {1, 1, 0, 0, 1, 0, 0, 1, 2}, {1, 1, 1, 0, 1, 0, 0, 1, 2}, {1, 0, 0, 0, 1, 0, 0, 1, 2}, {1, 0, 1, 0, 1, 0, 0, 1, 2},
-                {1, 1, 0, 1, 1, 0, 0, 1, 2}, {1, 1, 1, 1, 1, 0, 0, 1, 2}, {1, 0, 0, 1, 1, 0, 0, 1, 2}, {1, 0, 1, 1, 1, 0, 0, 1, 2},
-                
-                // Dual texture + normal (8)
-                {1, 1, 0, 0, 0, 1, 0, 1, 2}, {1, 1, 1, 0, 0, 1, 0, 1, 2}, {1, 0, 0, 0, 0, 1, 0, 1, 2}, {1, 0, 1, 0, 0, 1, 0, 1, 2},
-                {1, 1, 0, 1, 0, 1, 0, 1, 2}, {1, 1, 1, 1, 0, 1, 0, 1, 2}, {1, 0, 0, 1, 0, 1, 0, 1, 2}, {1, 0, 1, 1, 0, 1, 0, 1, 2},
-                
-                // No fog variants (8)
-                {1, 1, 0, 0, 0, 0, 0, 0, 1}, {1, 1, 1, 0, 0, 0, 0, 0, 1}, {1, 0, 0, 0, 0, 0, 0, 0, 1}, {1, 0, 1, 0, 0, 0, 0, 0, 1},
-                {1, 1, 0, 0, 1, 0, 0, 0, 1}, {1, 1, 1, 0, 1, 0, 0, 0, 1}, {1, 0, 0, 0, 1, 0, 0, 0, 1}, {1, 0, 1, 0, 1, 0, 0, 0, 1},
-                
-                // Fog mode 2 variants (8)
-                {1, 1, 0, 0, 0, 0, 0, 2, 1}, {1, 1, 1, 0, 0, 0, 0, 2, 1}, {1, 0, 0, 0, 0, 0, 0, 2, 1}, {1, 0, 1, 0, 0, 0, 0, 2, 1},
-                {1, 1, 0, 0, 1, 0, 0, 2, 1}, {1, 1, 1, 0, 1, 0, 0, 2, 1}, {1, 0, 0, 0, 1, 0, 0, 2, 1}, {1, 0, 1, 0, 1, 0, 0, 2, 1},
-                
-                // Special cases - no fog, dual texture (8)
-                {1, 1, 0, 0, 0, 0, 0, 0, 2}, {1, 1, 1, 0, 0, 0, 0, 0, 2}, {1, 0, 0, 0, 0, 0, 0, 0, 2}, {1, 0, 1, 0, 0, 0, 0, 0, 2},
-                {1, 1, 0, 1, 0, 0, 0, 0, 2}, {1, 1, 1, 1, 0, 0, 0, 0, 2}, {1, 0, 0, 1, 0, 0, 0, 0, 2}, {1, 0, 1, 1, 0, 0, 0, 0, 2},
-                
-                // Fog mode 2, dual texture (8)
-                {1, 1, 0, 0, 0, 0, 0, 2, 2}, {1, 1, 1, 0, 0, 0, 0, 2, 2}, {1, 0, 0, 0, 0, 0, 0, 2, 2}, {1, 0, 1, 0, 0, 0, 0, 2, 2},
-                {1, 1, 0, 1, 0, 0, 0, 2, 2}, {1, 1, 1, 1, 0, 0, 0, 2, 2}, {1, 0, 0, 1, 0, 0, 0, 2, 2}, {1, 0, 1, 1, 0, 0, 0, 2, 2},
-                
-                // Additional edge cases for complete coverage (4)
-                {0, 1, 0, 1, 0, 0, 0, 1, 1}, {0, 1, 1, 1, 0, 0, 0, 1, 1}, {0, 0, 0, 0, 0, 0, 0, 1, 1}, {0, 0, 1, 0, 0, 0, 0, 1, 1},
-            };
+                ShaderVariant variants[] = {
+                    // Same 108 variants as immediate precaching - keep both in sync
+                    // Basic unlit variants (2)
+                    {0, 1, 0, 0, 0, 0, 0, 1, 1}, {0, 1, 1, 0, 0, 0, 0, 1, 1},
+                    
+                    // Basic lit variants - sun only (4)
+                    {1, 1, 0, 0, 0, 0, 0, 1, 1}, {1, 1, 1, 0, 0, 0, 0, 1, 1}, {1, 1, 0, 1, 0, 0, 0, 1, 1}, {1, 1, 1, 1, 0, 0, 0, 1, 1},
+                    
+                    // Lit with point lights (4)
+                    {1, 0, 0, 0, 0, 0, 0, 1, 1}, {1, 0, 1, 0, 0, 0, 0, 1, 1}, {1, 0, 0, 1, 0, 0, 0, 1, 1}, {1, 0, 1, 1, 0, 0, 0, 1, 1},
+                    
+                    // Diffparam variants - most important for terrain (8)
+                    {1, 1, 0, 0, 1, 0, 0, 1, 1}, {1, 1, 1, 0, 1, 0, 0, 1, 1}, {1, 0, 0, 0, 1, 0, 0, 1, 1}, {1, 0, 1, 0, 1, 0, 0, 1, 1},
+                    {1, 1, 0, 1, 1, 0, 0, 1, 1}, {1, 1, 1, 1, 1, 0, 0, 1, 1}, {1, 0, 0, 1, 1, 0, 0, 1, 1}, {1, 0, 1, 1, 1, 0, 0, 1, 1},
+                    
+                    // Normal map variants (8)
+                    {1, 1, 0, 0, 0, 1, 0, 1, 1}, {1, 1, 1, 0, 0, 1, 0, 1, 1}, {1, 0, 0, 0, 0, 1, 0, 1, 1}, {1, 0, 1, 0, 0, 1, 0, 1, 1},
+                    {1, 1, 0, 1, 0, 1, 0, 1, 1}, {1, 1, 1, 1, 0, 1, 0, 1, 1}, {1, 0, 0, 1, 0, 1, 0, 1, 1}, {1, 0, 1, 1, 0, 1, 0, 1, 1},
+                    
+                    // Diffparam + normal combinations (8)
+                    {1, 1, 0, 0, 1, 1, 0, 1, 1}, {1, 1, 1, 0, 1, 1, 0, 1, 1}, {1, 0, 0, 0, 1, 1, 0, 1, 1}, {1, 0, 1, 0, 1, 1, 0, 1, 1},
+                    {1, 1, 0, 1, 1, 1, 0, 1, 1}, {1, 1, 1, 1, 1, 1, 0, 1, 1}, {1, 0, 0, 1, 1, 1, 0, 1, 1}, {1, 0, 1, 1, 1, 1, 0, 1, 1},
+                    
+                    // Param variants (8)
+                    {1, 1, 0, 0, 0, 0, 1, 1, 1}, {1, 1, 1, 0, 0, 0, 1, 1, 1}, {1, 0, 0, 0, 0, 0, 1, 1, 1}, {1, 0, 1, 0, 0, 0, 1, 1, 1},
+                    {1, 1, 0, 1, 0, 0, 1, 1, 1}, {1, 1, 1, 1, 0, 0, 1, 1, 1}, {1, 0, 0, 1, 0, 0, 1, 1, 1}, {1, 0, 1, 1, 0, 0, 1, 1, 1},
+                    
+                    // Full combination variants (8)
+                    {1, 1, 0, 0, 1, 1, 1, 1, 1}, {1, 1, 1, 0, 1, 1, 1, 1, 1}, {1, 0, 0, 0, 1, 1, 1, 1, 1}, {1, 0, 1, 0, 1, 1, 1, 1, 1},
+                    {1, 1, 0, 1, 1, 1, 1, 1, 1}, {1, 1, 1, 1, 1, 1, 1, 1, 1}, {1, 0, 0, 1, 1, 1, 1, 1, 1}, {1, 0, 1, 1, 1, 1, 1, 1, 1},
+                    
+                    // Dual texture variants - basic (8)
+                    {1, 1, 0, 0, 0, 0, 0, 1, 2}, {1, 1, 1, 0, 0, 0, 0, 1, 2}, {1, 0, 0, 0, 0, 0, 0, 1, 2}, {1, 0, 1, 0, 0, 0, 0, 1, 2},
+                    {1, 1, 0, 1, 0, 0, 0, 1, 2}, {1, 1, 1, 1, 0, 0, 0, 1, 2}, {1, 0, 0, 1, 0, 0, 0, 1, 2}, {1, 0, 1, 1, 0, 0, 0, 1, 2},
+                    
+                    // Dual texture + diffparam (8) 
+                    {1, 1, 0, 0, 1, 0, 0, 1, 2}, {1, 1, 1, 0, 1, 0, 0, 1, 2}, {1, 0, 0, 0, 1, 0, 0, 1, 2}, {1, 0, 1, 0, 1, 0, 0, 1, 2},
+                    {1, 1, 0, 1, 1, 0, 0, 1, 2}, {1, 1, 1, 1, 1, 0, 0, 1, 2}, {1, 0, 0, 1, 1, 0, 0, 1, 2}, {1, 0, 1, 1, 1, 0, 0, 1, 2},
+                    
+                    // Dual texture + normal (8)
+                    {1, 1, 0, 0, 0, 1, 0, 1, 2}, {1, 1, 1, 0, 0, 1, 0, 1, 2}, {1, 0, 0, 0, 0, 1, 0, 1, 2}, {1, 0, 1, 0, 0, 1, 0, 1, 2},
+                    {1, 1, 0, 1, 0, 1, 0, 1, 2}, {1, 1, 1, 1, 0, 1, 0, 1, 2}, {1, 0, 0, 1, 0, 1, 0, 1, 2}, {1, 0, 1, 1, 0, 1, 0, 1, 2},
+                    
+                    // No fog variants (8)
+                    {1, 1, 0, 0, 0, 0, 0, 0, 1}, {1, 1, 1, 0, 0, 0, 0, 0, 1}, {1, 0, 0, 0, 0, 0, 0, 0, 1}, {1, 0, 1, 0, 0, 0, 0, 0, 1},
+                    {1, 1, 0, 0, 1, 0, 0, 0, 1}, {1, 1, 1, 0, 1, 0, 0, 0, 1}, {1, 0, 0, 0, 1, 0, 0, 0, 1}, {1, 0, 1, 0, 1, 0, 0, 0, 1},
+                    
+                    // Fog mode 2 variants (8)
+                    {1, 1, 0, 0, 0, 0, 0, 2, 1}, {1, 1, 1, 0, 0, 0, 0, 2, 1}, {1, 0, 0, 0, 0, 0, 0, 2, 1}, {1, 0, 1, 0, 0, 0, 0, 2, 1},
+                    {1, 1, 0, 0, 1, 0, 0, 2, 1}, {1, 1, 1, 0, 1, 0, 0, 2, 1}, {1, 0, 0, 0, 1, 0, 0, 2, 1}, {1, 0, 1, 0, 1, 0, 0, 2, 1},
+                    
+                    // Special cases - no fog, dual texture (8)
+                    {1, 1, 0, 0, 0, 0, 0, 0, 2}, {1, 1, 1, 0, 0, 0, 0, 0, 2}, {1, 0, 0, 0, 0, 0, 0, 0, 2}, {1, 0, 1, 0, 0, 0, 0, 0, 2},
+                    {1, 1, 0, 1, 0, 0, 0, 0, 2}, {1, 1, 1, 1, 0, 0, 0, 0, 2}, {1, 0, 0, 1, 0, 0, 0, 0, 2}, {1, 0, 1, 1, 0, 0, 0, 0, 2},
+                    
+                    // Fog mode 2, dual texture (8)
+                    {1, 1, 0, 0, 0, 0, 0, 2, 2}, {1, 1, 1, 0, 0, 0, 0, 2, 2}, {1, 0, 0, 0, 0, 0, 0, 2, 2}, {1, 0, 1, 0, 0, 0, 0, 2, 2},
+                    {1, 1, 0, 1, 0, 0, 0, 2, 2}, {1, 1, 1, 1, 0, 0, 0, 2, 2}, {1, 0, 0, 1, 0, 0, 0, 2, 2}, {1, 0, 1, 1, 0, 0, 0, 2, 2},
+                    
+                    // Additional edge cases for complete coverage (4)
+                    {0, 1, 0, 1, 0, 0, 0, 1, 1}, {0, 1, 1, 1, 0, 0, 0, 1, 1}, {0, 0, 0, 0, 0, 0, 0, 1, 1}, {0, 0, 1, 0, 0, 0, 0, 1, 1},
+                    
+                    // CRITICAL FIX: Add the 8 universal base combinations that the fallback system expects
+                    // These are guaranteed to be cached and should always be available for fallback
+                    // Format: {lighting, noPointLights, vertexCol, skinning, hasDiffParam, hasNormal, hasParam, fogMode, stages}
+                    {1, 1, 0, 0, 0, 0, 0, 1, 1}, // lit, no points, no vertcol, no skinning, no suffixes
+                    {1, 1, 1, 0, 0, 0, 0, 1, 1}, // lit, no points, vertcol, no skinning, no suffixes  
+                    {1, 1, 0, 1, 0, 0, 0, 1, 1}, // lit, no points, no vertcol, skinning, no suffixes
+                    {1, 1, 1, 1, 0, 0, 0, 1, 1}, // lit, no points, vertcol, skinning, no suffixes
+                    {1, 0, 0, 0, 0, 0, 0, 1, 1}, // lit, points, no vertcol, no skinning, no suffixes
+                    {1, 0, 1, 0, 0, 0, 0, 1, 1}, // lit, points, vertcol, no skinning, no suffixes
+                    {1, 0, 0, 1, 0, 0, 0, 1, 1}, // lit, points, no vertcol, skinning, no suffixes
+                    {1, 0, 1, 1, 0, 0, 0, 1, 1}, // lit, points, vertcol, skinning, no suffixes
+                };
             
             const int totalVariants = sizeof(variants) / sizeof(variants[0]);
             LOG::logline("-- Precaching %d essential HLSL shader variants", totalVariants);
             
             for (int i = 0; i < totalVariants; i++) {
-                const auto& v = variants[i];
+                const ShaderVariant& v = variants[i];
                 
                 // Update progress every few variants
                 if (i % 5 == 0 || i == totalVariants - 1) {
@@ -483,7 +590,7 @@ void FixedFunctionShader::precacheAsync() {
                 }
                 
                 ShaderKey sk;
-                memset(&sk, 0, sizeof sk);
+                memset(&sk, 0, sizeof(sk));
                 sk.uvSets = 1;
                 sk.useLighting = v.lighting;
                 sk.noPointLights = v.noPointLights;
@@ -544,7 +651,7 @@ void FixedFunctionShader::precacheAsync() {
             // Generate both standard fog (fogMode=1) and alpha blend fog (fogMode=2) variants
             for (int fogMode = 1; fogMode <= 2; ++fogMode) {
                 ShaderKey sk;
-                memset(&sk, 0, sizeof sk);
+                memset(&sk, 0, sizeof(sk));
                 
                 // Core shader properties
                 sk.uvSets = 1;
@@ -559,6 +666,7 @@ void FixedFunctionShader::precacheAsync() {
                 
                 // Param flavor unification: Always enable all texture suffixes
                 // Shader uses #ifdef HAS_DIFFPARAM, #ifdef HAS_NORMAL, #ifdef HAS_PARAM
+                // Note: These are compile-time defines for the collapsed shader that handles all combinations
                 sk.hasDiffParam = 1;
                 sk.hasNormal = 1; 
                 sk.hasParam = 1;
@@ -570,7 +678,7 @@ void FixedFunctionShader::precacheAsync() {
                 sk.activeStages = 1;
                 sk.usesTexgen = 0;
                 sk.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
-                memset(&sk.stage[1], 0, sizeof sk.stage[1]);
+                memset(&sk.stage[1], 0, sizeof(sk.stage[1]));
                 
                 cacheHLSLShaders[sk] = generateMWShaderHLSL(sk);
                 compiledVariants++;
@@ -581,7 +689,7 @@ void FixedFunctionShader::precacheAsync() {
         }
 
         LOG::logline("-- Collapsed HLSL precaching completed: %d core shaders compiled (reduced from 120+ permutations)", compiledVariants);
-        });
+    });
 
     precacheThread.detach();
 }
@@ -1144,11 +1252,44 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
     // Check if state matches last used shader
     ShaderKey sk(rs, frs, lightrs);
     
-    // Use static suffix combinations - no runtime texture analysis needed
-    // We'll try different combinations with fallback to base shader
-    sk.hasDiffParam = 1;  // Start with full suffix support
-    sk.hasNormal = 1;
-    sk.hasParam = 1;
+    // Perform texture suffix resolution to determine available suffixes
+    // This prevents HAS_NORMAL from being defined for textures without normal maps
+    if (rs->texture) {
+        // Check texture suffix resolution cache first
+        auto cacheIt = textureSuffixResolutionCache.find(rs->texture);
+        if (cacheIt == textureSuffixResolutionCache.end()) {
+            // Not in cache, perform expensive resolution
+            TextureSuffixResolutionCache entry;
+            entry.hash = BSA::calculateTextureHash((IDirect3DDevice9*)device, rs->texture, false);
+            const std::string* textureName = BSA::resolveTextureNameFromHash(entry.hash);
+            if (textureName && entry.hash.crc32 != 0) {
+                entry.textureName = *textureName;
+                entry.hasValidName = true;
+                entry.variants = BSA::getTextureSuffixVariants(textureName->c_str());
+            } else {
+                entry.hasValidName = false;
+                entry.variants = nullptr;
+            }
+            cacheIt = textureSuffixResolutionCache.emplace(rs->texture, std::move(entry)).first;
+        }
+        
+        // Set texture suffix flags based on actual availability
+        if (cacheIt->second.hasValidName && cacheIt->second.variants) {
+            sk.hasDiffParam = cacheIt->second.variants->hasDiffParam() || cacheIt->second.variants->hasDiffParamT();
+            sk.hasNormal = cacheIt->second.variants->hasNormal();
+            sk.hasParam = cacheIt->second.variants->hasParam();
+        } else {
+            // No suffix variants available, use base texture only
+            sk.hasDiffParam = 0;
+            sk.hasNormal = 0;
+            sk.hasParam = 0;
+        }
+    } else {
+        // No texture bound, no suffixes
+        sk.hasDiffParam = 0;
+        sk.hasNormal = 0;
+        sk.hasParam = 0;
+    }
 
     if (sk == hlslShaderLRU.last_sk) {
         hlslShader = hlslShaderLRU.shader;
@@ -1170,19 +1311,18 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
             bool foundFallback = false;
             
             // Priority fallback order: prefer exact match first, then alternatives
-            int currentCount = sk.noPointLights ? 0 : 1;
+            int currentCount = sk.noPointLights ? 0 : 1;  // 0 = no lights, 1 = has lights
             int fallbackPointLights[] = {0, 1, 4, 7};
             for (int i = 0; i < 4 && !foundFallback; ++i) {
                 int fallbackCount = fallbackPointLights[i];
                 if (fallbackCount == currentCount) continue; // Skip exact match, already tried
                 
+                // Correct the noPointLights assignment: 0 lights -> noPointLights=1, 1+ lights -> noPointLights=0
                 fallbackSk.noPointLights = (fallbackCount == 0) ? 1 : 0;
                 auto fallbackIter = cacheHLSLShaders.find(fallbackSk);
                 if (fallbackIter != cacheHLSLShaders.end()) {
                     fallbackShader = fallbackIter->second;
                     foundFallback = true;
-                    LOG::logline("DEBUG SMART FALLBACK: Using %d point light shader for %s point lights", 
-                               fallbackCount, sk.noPointLights ? "0" : "1+");
                 }
             }
             
@@ -1198,8 +1338,6 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
                     if (fallbackIter != cacheHLSLShaders.end()) {
                         fallbackShader = fallbackIter->second;
                         foundFallback = true;
-                        LOG::logline("DEBUG TEXTURE FALLBACK: Removed diffparam textures, keeping normal=%d param=%d", 
-                                   textureFallbackSk.hasNormal, textureFallbackSk.hasParam);
                     }
                 }
                 
@@ -1212,8 +1350,6 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
                     if (fallbackIter != cacheHLSLShaders.end()) {
                         fallbackShader = fallbackIter->second;
                         foundFallback = true;
-                        LOG::logline("DEBUG TEXTURE FALLBACK: Removed normal maps, keeping param=%d", 
-                                   textureFallbackSk.hasParam);
                     }
                 }
                 
@@ -1227,7 +1363,6 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
                     if (fallbackIter != cacheHLSLShaders.end()) {
                         fallbackShader = fallbackIter->second;
                         foundFallback = true;
-                        LOG::logline("DEBUG TEXTURE FALLBACK: Using base texture with correct lighting");
                     }
                 }
             }
@@ -1236,28 +1371,26 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
             if (!foundFallback) {
                 // Start with exact copy of requested shader, then simplify
                 ShaderKey universalSk = sk;
-                
+
                 // Force base texture settings
                 universalSk.heavyLighting = 0;
                 universalSk.hasDiffParam = 0;
                 universalSk.hasNormal = 0;
                 universalSk.hasParam = 0;
-                
+
                 // Try all 8 universal combinations: point lights (0/1+) × vertex color (0/1) × skinning (0/1)
                 for (int pointLightMode = 0; pointLightMode <= 1 && !foundFallback; ++pointLightMode) {
                     for (int vertCol = 0; vertCol <= 1 && !foundFallback; ++vertCol) {
                         for (int skinning = 0; skinning <= 1 && !foundFallback; ++skinning) {
-                            universalSk.noPointLights = pointLightMode; // 0=1+lights, 1=0lights
+                            universalSk.noPointLights = pointLightMode; // pointLightMode 0 = no lights, so noPointLights = 0
                             universalSk.vertexColour = vertCol;
                             universalSk.vertexMaterial = vertCol + 1;
                             universalSk.usesSkinning = skinning;
-                            
+
                             auto fallbackIter = cacheHLSLShaders.find(universalSk);
                             if (fallbackIter != cacheHLSLShaders.end()) {
                                 fallbackShader = fallbackIter->second;
                                 foundFallback = true;
-                                LOG::logline("DEBUG UNIVERSAL FALLBACK: Using base shader with %s vertCol=%d skinning=%d", 
-                                           pointLightMode ? "0-light" : "1+light", vertCol, skinning);
                             }
                         }
                     }
@@ -1268,8 +1401,6 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
                 hlslShader = fallbackShader;
             } else {
                 hlslShader = hlslShaderDefaultPurple;
-                LOG::logline("ERROR: Impossible - no universal fallback found! Using purple shader for flags diffparam=%d normal=%d param=%d vertCol=%d lighting=%d skinning=%d noPointLights=%d", 
-                           sk.hasDiffParam, sk.hasNormal, sk.hasParam, sk.vertexColour, sk.useLighting, sk.usesSkinning, sk.noPointLights);
             }
         }
 
@@ -1735,13 +1866,11 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
                             if (cacheIt->second.variants->hasDiffParam() || cacheIt->second.variants->hasDiffParamT()) {
                                 // Try regular _diffparam first, then _diffparam_t
                                 if (cacheIt->second.variants->hasDiffParam()) {
-                                    LOG::logline("DEBUG: Found _diffparam variant for %s, attempting to load", cacheIt->second.textureName.c_str());
                                     replacementTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device, 
                                                                               *cacheIt->second.variants, "diffparam");
                                 }
                                 
                                 if (!replacementTexture && cacheIt->second.variants->hasDiffParamT()) {
-                                    LOG::logline("DEBUG: Found _diffparam_t variant for %s, attempting to load", cacheIt->second.textureName.c_str());
                                     replacementTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device, 
                                                                               *cacheIt->second.variants, "diffparam_t");
                                 }
@@ -1749,8 +1878,6 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
                                 if (replacementTexture) {
                                     // Use diffparam/diffparam_t as base texture (slot 0) - no alpha preservation needed
                                     device->SetTexture(i, replacementTexture);
-                                    LOG::logline("DEBUG DIFFPARAM PRIORITIZATION: Using diffparam variant as base for %s", 
-                                               cacheIt->second.textureName.c_str());
                                 } else {
                                     LOG::logline("!! Failed to load any diffparam variant texture for %s", cacheIt->second.textureName.c_str());
                                     // Fallback to original base texture
@@ -1951,8 +2078,9 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::createPurpleErrorShader() {
     // Compile vertex shader
     ID3DBlob* vsBlob = nullptr;
     ID3DBlob* vsErrors = nullptr;
+    DWORD vsCompileFlags = isDXVK() ? D3DCOMPILE_SKIP_OPTIMIZATION : D3DCOMPILE_SKIP_OPTIMIZATION;
     HRESULT hr = D3DCompile(vsCode, strlen(vsCode), "ErrorShader.hlsl", nullptr, nullptr, 
-                           "vs_main", "vs_3_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vsBlob, &vsErrors);
+                           "vs_main", "vs_3_0", vsCompileFlags, 0, &vsBlob, &vsErrors);
     
     if (SUCCEEDED(hr)) {
         hr = device->CreateVertexShader(reinterpret_cast<DWORD*>(vsBlob->GetBufferPointer()), &errorShader.vertexShader);
@@ -1966,8 +2094,9 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::createPurpleErrorShader() {
     // Compile pixel shader
     ID3DBlob* psBlob = nullptr;
     ID3DBlob* psErrors = nullptr;
+    DWORD psCompileFlags = isDXVK() ? D3DCOMPILE_SKIP_OPTIMIZATION : D3DCOMPILE_SKIP_OPTIMIZATION;
     hr = D3DCompile(psCode, strlen(psCode), "ErrorShader.hlsl", nullptr, nullptr, 
-                   "ps_main", "ps_3_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &psBlob, &psErrors);
+                   "ps_main", "ps_3_0", psCompileFlags, 0, &psBlob, &psErrors);
     
     if (SUCCEEDED(hr)) {
         hr = device->CreatePixelShader(reinterpret_cast<DWORD*>(psBlob->GetBufferPointer()), &errorShader.pixelShader);
@@ -2245,6 +2374,13 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     ID3DBlob* vsBlob = nullptr;
     ID3DBlob* vsErrors = nullptr;
     
+    DWORD vsCompileFlags = D3DCOMPILE_PREFER_FLOW_CONTROL | D3DCOMPILE_IEEE_STRICTNESS;
+    if (isDXVK()) {
+        vsCompileFlags |= D3DCOMPILE_SKIP_OPTIMIZATION;
+    } else {
+        vsCompileFlags |= D3DCOMPILE_SKIP_OPTIMIZATION;
+    }
+    
     HRESULT hr = D3DCompile(
         vertexShaderSource,
         vsFileSize,
@@ -2253,7 +2389,7 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         nullptr, // Include handler
         vertexShaderName,
         "vs_3_0",
-        D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_PREFER_FLOW_CONTROL | D3DCOMPILE_IEEE_STRICTNESS,
+        vsCompileFlags,
         0,
         &vsBlob,
         &vsErrors
@@ -2301,6 +2437,13 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     ID3DBlob* psBlob = nullptr;
     ID3DBlob* psErrors = nullptr;
     
+    DWORD psCompileFlags = D3DCOMPILE_PREFER_FLOW_CONTROL | D3DCOMPILE_IEEE_STRICTNESS;
+    if (isDXVK()) {
+        psCompileFlags |= D3DCOMPILE_SKIP_OPTIMIZATION;
+    } else {
+        psCompileFlags |= D3DCOMPILE_SKIP_OPTIMIZATION;
+    }
+    
     hr = D3DCompile(
         pixelShaderSource,
         psFileSize,
@@ -2309,7 +2452,7 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         nullptr, // Include handler
         pixelShaderName,
         "ps_3_0",
-        D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_PREFER_FLOW_CONTROL | D3DCOMPILE_IEEE_STRICTNESS,
+        psCompileFlags,
         0,
         &psBlob,
         &psErrors
@@ -2491,13 +2634,6 @@ FixedFunctionShader::ShaderKey::ShaderKey(const RenderedState* rs, const Fragmen
                     directionalLightCount++;
                 }
             }
-        }
-        // Debug logging to understand light distribution
-        static int logCount = 0;
-        if (logCount < 10) {
-            LOG::logline("DEBUG LIGHTS: total=%d, point=%d, directional=%d", 
-                       (int)lightrs->active.size(), pointLightCount, directionalLightCount);
-            logCount++;
         }
     }
     noPointLights = (rs->useLighting && pointLightCount == 0) ? 1 : 0;

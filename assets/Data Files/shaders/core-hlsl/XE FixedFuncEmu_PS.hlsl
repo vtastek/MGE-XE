@@ -279,7 +279,7 @@ float3 ApplyAgX(float3 LinearColorRec709)
 
 static const float3x3 CROSSTALK_MATRIX = float3x3(
 	1.0, 0.05, 0.05,
-	0.05, 1.0, 0.4,
+	0.05, 1.0, 0.57,
 	0.05, 0.05, 1.0
 );
 
@@ -297,10 +297,9 @@ float3x3 Balanced(float3x3 M)
 
 float3 PBRNeutralToneMapping(float3 color) {
 	float startCompression = 0.8 - 0.04;
-	float desaturation = 0.9;
+	float desaturation = 0.15;
 
-	const float3x3 PrimB = Balanced(CROSSTALK_MATRIX);
-	color = mul(PrimB, color);
+	color = max(0.0, color);
 
 	float x = min(color.r, min(color.g, color.b));
 	float offset = x < 0.08 ? x - 6.25 * x * x : 0.04;
@@ -314,7 +313,11 @@ float3 PBRNeutralToneMapping(float3 color) {
 	color *= newPeak / peak;
 
 	float g = 1. - 1. / (desaturation * (peak - newPeak) + 1.0);
-	return lerp(color, newPeak, g);
+	float3 toneMapped = lerp(color, newPeak, g);
+	
+	// Apply balanced crosstalk to maintain neutral gray
+	float3x3 balancedCrosstalk = Balanced(CROSSTALK_MATRIX);
+	return mul(balancedCrosstalk, toneMapped);
 }
 
 
