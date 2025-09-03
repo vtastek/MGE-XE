@@ -149,6 +149,9 @@ texture tex3 : register(t3);
 #if defined(HAS_PARAM)
 texture tex4 : register(t4);
 #endif
+#if defined(HAS_SHADOWS)
+texture tex5 : register(t5);
+#endif
 sampler sampTex0 : register(s0) = sampler_state{ texture = <tex0>; };
 sampler sampTex1 : register(s1) = sampler_state{ texture = <tex1>; };
 #if defined(HAS_DIFFPARAM)
@@ -159,6 +162,19 @@ sampler sampTex3 : register(s3) = sampler_state{ texture = <tex3>; }; // Normal 
 #endif
 #if defined(HAS_PARAM)
 sampler sampTex4 : register(s4) = sampler_state{ texture = <tex4>; }; // Param map (_param)
+#endif
+#if defined(HAS_SHADOWS)
+sampler sampShadow : register(s5) = sampler_state{ texture = <tex5>; }; // Shadow map
+
+// Shadow constants
+static const int shadowCascades = 2;
+static const float shadowCascadeSize = 1.0 / shadowCascades;
+static const float ESM_c = 60.0;
+static const float ESM_bias = 2e-3 * ESM_c;
+static const float ESM_scale = 32768.0;
+
+// Shadow resolution parameter (will be set via shader constants)
+float shadowRcpRes : register(c10);
 #endif
 
 // Texture suffix support - using preprocessor defines
@@ -180,6 +196,10 @@ struct VS_OUTPUT {
 	float2 texcoord : TEXCOORD1;
 	float3 viewPos : TEXCOORD2;  // View space position
 	float fog : TEXCOORD3;       // Fog factor
+#ifdef HAS_SHADOWS
+	float4 shadow0pos : TEXCOORD4;  // Shadow map 0 position
+	float4 shadow1pos : TEXCOORD5;  // Shadow map 1 position
+#endif
 };
 
 //------------------------------------------------------------
@@ -247,7 +267,7 @@ float3 AgxEotf(float3 val)
 	// sRGB IEC 61966-2-1 2.2 Exponent Reference EOTF Display
 	// NOTE: We're linearizing the output here. Comment/adjust when
 	// *not* using a sRGB render target
-	val = pow(val, 2.2);
+	//val = pow(val, 2.2);
 
 	return val;
 }
@@ -258,10 +278,10 @@ float3 AgxLook(float3 val)
 	const float luma = dot(val, lw);
 
 	// Default
-	const float3 offset = float3(0.0, 0.0, 0.0);
+	const float3 offset = float3(0.0, 0.0, 0.00);
 	float3 slope = float3(1.0, 1.0, 1.0);
 	float3 power = float3(1.0, 1.0, 1.0);
-	float sat = 1.0;
+	float sat = 1.33;
 
 	// ASC CDL
 	val = pow(val * slope + offset, power);
@@ -314,11 +334,70 @@ float3 PBRNeutralToneMapping(float3 color) {
 
 	float g = 1. - 1. / (desaturation * (peak - newPeak) + 1.0);
 	float3 toneMapped = lerp(color, newPeak, g);
-	
+
 	// Apply balanced crosstalk to maintain neutral gray
 	float3x3 balancedCrosstalk = Balanced(CROSSTALK_MATRIX);
 	return mul(balancedCrosstalk, toneMapped);
 }
+
+#define PI 3.14159265358979323846
+#define EPS 1.17549435e-38f
+
+#define GM 1.6
+#define LINEAR_END 0.2
+#define INPUT_MAX 16.0
+#define OUTPUT_MAX 1.0
+#define A (20.0 / 21.0)  // Rational function parameter for smooth transition
+
+
+float encode(float x) {
+
+
+	if (x <= LINEAR_END) {
+		// Linear part: f(x) = x
+		return x;
+	}
+	else if (x >= INPUT_MAX) {
+		// Clamp to maximum
+		return OUTPUT_MAX;
+	}
+	else {
+		// Smooth compression using rational function
+		float t = (x - LINEAR_END) / (INPUT_MAX - LINEAR_END);
+		float h = t / (A * t + (1.0 - A));
+		return LINEAR_END + (OUTPUT_MAX - LINEAR_END) * h;
+	}
+}
+
+float decode(float y) {
+
+
+	if (y <= LINEAR_END) {
+		// Linear part: inverse of f(x) = x
+		return y;
+	}
+	else if (y >= OUTPUT_MAX) {
+		// Return maximum input value
+		return INPUT_MAX;
+	}
+	else {
+		// Inverse of rational function
+		float y_norm = (y - LINEAR_END) / (OUTPUT_MAX - LINEAR_END);
+		float t = y_norm * (1.0 - A) / (1.0 - y_norm * A);
+		return LINEAR_END + t * (INPUT_MAX - LINEAR_END);
+	}
+}
+
+// Vector versions for RGB
+float3 encode3(float3 rgb) {
+	return pow(saturate(float3(encode(rgb.r), encode(rgb.g), encode(rgb.b))), 1.0 / GM);
+}
+
+float3 decode3(float3 encoded) {
+	float3 enc = pow(encoded, GM);
+	return float3(decode(enc.r), decode(enc.g), decode(enc.b));
+}
+
 
 
 // --------------------------------------------------------------------------
@@ -411,6 +490,38 @@ float ParallaxSoftShadow(
 
 #endif
 
+#if defined(HAS_SHADOWS)
+//------------------------------------------------------------
+// Shadow Sampling Functions
+
+// Shadow UV to shadow atlas UV
+float4 mapShadowToAtlas(float2 t, int layer) {
+	return float4(t.x * shadowCascadeSize + layer * shadowCascadeSize, t.y, 0, 0);
+}
+
+// 2 layer cascade ortho ESM lookup
+float shadowSample(float4 shadow0pos, float4 shadow1pos) {
+	// Clip space margin of 4 texels, to prevent bleeding from the filter kernel + adjacent textures  
+	float3 atlasMargin = float3(1.0 - 2.0 * 4.0 * shadowRcpRes, 1.0 - 2.0 * 4.0 * shadowRcpRes, 1.0);
+
+	float dz = 1e-6;
+
+	if (all(saturate(atlasMargin - abs(shadow0pos.xyz)))) {
+		// Layer 0, inner (near shadows)
+		float2 shadowUV = (0.5 + 0.5 * shadowRcpRes) + float2(0.5, -0.5) * shadow0pos.xy;
+		dz = tex2Dlod(sampShadow, mapShadowToAtlas(shadowUV, 0)).r / ESM_scale - shadow0pos.z;
+	}
+	else if (all(saturate(atlasMargin - abs(shadow1pos.xyz)))) {
+		// Layer 1 (far shadows)
+		float2 shadowUV = (0.5 + 0.5 * shadowRcpRes) + float2(0.5, -0.5) * shadow1pos.xy;
+		dz = tex2Dlod(sampShadow, mapShadowToAtlas(shadowUV, 1)).r / ESM_scale - shadow1pos.z;
+	}
+
+	// ESM shadow filtering  
+	return 1.0 - saturate(exp(ESM_c * dz + ESM_bias));
+}
+#endif
+
 //------------------------------------------------------------
 // Pixel Shader Main
 float4 ps_main(VS_OUTPUT input) : COLOR{
@@ -421,173 +532,182 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 	float3 normalVS = normalize(input.normal);
 	float shadowpara = 1.0;
 
-	#ifdef HAS_NORMAL
-	float3 inputVS = GetSafeNormal(input.viewPos, input.normal);
-	#else
-	float3 inputVS = input.normal;
-	#endif
+	// #ifdef HAS_SHADOWS
+		// // Sample shadow map using cascaded ESM
+		// float shadowpara = shadowSample(input.shadow0pos, input.shadow1pos);
+		// deb = shadowpara;
+	// #else
+		// float shadowpara = 1.0; // No shadows
+	// #endif
 
-	float bumpIntensity = 5.5;
-	float3 T, B, N;
-	BuildPerPixelTBN(inputVS, input.viewPos, parallaxUV, T, B, N);
-
-	float3 Vvs = normalize(input.viewPos);
-	float handedness = (dot(cross(T, B), N) < 0) ? -1.0 : 1.0;
-	//B *= handedness;
-	float3x3 TBN = float3x3(T, B, N);
-	float3x3 TBN_T = transpose(TBN);
-	float3 Vts = mul(Vvs, TBN_T);
-
-	#ifdef HAS_NORMAL
-		#if defined(USE_SIMPLE_PARALLAX)
-		parallaxUV = ParallaxSimple(sampTex3, parallaxUV, Vts, 0.000015 * 1.33); // heightScale
+		#ifdef HAS_NORMAL
+		float3 inputVS = GetSafeNormal(input.viewPos, input.normal);
+		#else
+		float3 inputVS = input.normal;
 		#endif
 
-		// After parallax, sample normal as usual
-		float2 texel = 1.0 / normres;
-		float hL = tex2D(sampTex3, parallaxUV + float2(-texel.x, 0)).a;
-		float hR = tex2D(sampTex3, parallaxUV + float2(texel.x, 0)).a;
-		float hD = tex2D(sampTex3, parallaxUV + float2(0, -texel.y)).a;
-		float hU = tex2D(sampTex3, parallaxUV + float2(0,  texel.y)).a;
-		float dhdu = (hR - hL);
-		float dhdv = (hU - hD);
-		float3 nTS = normalize(float3(-dhdu * heightScale, dhdv * heightScale, 1.0));
+		float bumpIntensity = 5.5;
+		float3 T, B, N;
+		BuildPerPixelTBN(inputVS, input.viewPos, parallaxUV, T, B, N);
 
-		normalVS = normalize(mul(nTS, TBN));
-		// Soft parallax shadowing (only if lighting is enabled)
-			#ifndef NOLIT
-				#ifdef HAS_NORMAL
-				float3 lightDirVS = -lightSunDirection;
-				float3 lightDirTS = mul(lightDirVS, TBN_T);
-				shadowpara = ParallaxSoftShadow(sampTex3, parallaxUV, lightDirTS.xy, 5.0, 0.04 * 0.75);
-				#endif
+		float3 Vvs = normalize(input.viewPos);
+		float handedness = (dot(cross(T, B), N) < 0) ? -1.0 : 1.0;
+		//B *= handedness;
+		float3x3 TBN = float3x3(T, B, N);
+		float3x3 TBN_T = transpose(TBN);
+		float3 Vts = mul(Vvs, TBN_T);
+
+		#ifdef HAS_NORMAL
+			#if defined(USE_SIMPLE_PARALLAX)
+			parallaxUV = ParallaxSimple(sampTex3, parallaxUV, Vts, 0.000015 * 1.33); // heightScale
 			#endif
-		#else
-	//float3 nTS = normalize(float3(0,0,1));
-	normalVS = inputVS;
+
+			// After parallax, sample normal as usual
+			float2 texel = 1.0 / normres;
+			float hL = tex2D(sampTex3, parallaxUV + float2(-texel.x, 0)).a;
+			float hR = tex2D(sampTex3, parallaxUV + float2(texel.x, 0)).a;
+			float hD = tex2D(sampTex3, parallaxUV + float2(0, -texel.y)).a;
+			float hU = tex2D(sampTex3, parallaxUV + float2(0,  texel.y)).a;
+			float dhdu = (hR - hL);
+			float dhdv = (hU - hD);
+			float3 nTS = normalize(float3(-dhdu * heightScale, dhdv * heightScale, 1.0));
+
+			normalVS = normalize(mul(nTS, TBN));
+			// Soft parallax shadowing (only if lighting is enabled)
+				#ifndef NOLIT
+					#ifdef HAS_NORMAL
+					float3 lightDirVS = -lightSunDirection;
+					float3 lightDirTS = mul(lightDirVS, TBN_T);
+					shadowpara = ParallaxSoftShadow(sampTex3, parallaxUV, lightDirTS.xy, 5.0, 0.04 * 0.75);
+					#endif
+				#endif
+			#else
+		//float3 nTS = normalize(float3(0,0,1));
+		normalVS = inputVS;
+		#endif
+
+
+		float4 texColor = tex2D(sampTex0, parallaxUV);
+		texColor.rgb = max(0.008, pow(texColor.rgb + EPS, 2.2));
+		// Note: When HAS_DIFFPARAM is defined, sampTex0 contains the _diffparam/_diffparam_t texture
+		#ifdef HAS_DIFFPARAM
+		texColor.a = 1.0; // Ignore alpha from _diffparam texture
+		#endif
+
+		// PBR lighting calculation
+		float3 V = normalize(-input.viewPos); // view direction in view space
+		float3 Norm = normalVS;
+		float3 albedo = texColor.rgb;
+		float roughness = 0.9;
+		float metalness = 0.0;
+		float ao = 1.0;
+		float radius = 1.6;
+		float3 F0 = 0.08 * float3(0.5, 0.5, 0.5); // specular reflectance
+
+	#ifdef HAS_PARAM
+		#ifdef HAS_NORMAL
+		float4 param = tex2D(sampTex4, parallaxUV);
+		metalness = param.x;
+		roughness = param.y * param.y;
+		F0 = 0.08 * param.z * param.z;
+		ao = param.w;
+		#endif
 	#endif
-
-
-	float4 texColor = tex2D(sampTex0, parallaxUV);
-	texColor.rgb = max(0.008, pow(texColor.rgb, 2.2));
-	// Note: When HAS_DIFFPARAM is defined, sampTex0 contains the _diffparam/_diffparam_t texture
 	#ifdef HAS_DIFFPARAM
-	texColor.a = 1.0; // Ignore alpha from _diffparam texture
+		// Basic PBR mode: _diffparam texture with fixed material properties
+		// RGB = albedo, A = roughness. Fixed: metalness=0, specular=0.5, AO=1
+		// Sample diffparam alpha directly for roughness (before texColor.a was overwritten with original alpha)
+		float diffparamAlpha = tex2D(sampTex0, parallaxUV).a;
+		roughness = diffparamAlpha * diffparamAlpha;
+		metalness = 0.0;         // Non-metallic materials
+		F0 = 0.08 * 0.5;         // Fixed specular reflectance = 0.5
+		ao = 1.0;                // Full ambient occlusion
 	#endif
 
-	// PBR lighting calculation
-	float3 V = normalize(-input.viewPos); // view direction in view space
-	float3 Norm = normalVS;
-	float3 albedo = texColor.rgb;
-	float roughness = 0.9;
-	float metalness = 0.0;
-	float ao = 1.0;
-	float radius = 1.6;
-	float3 F0 = 0.08 * float3(0.5, 0.5, 0.5); // specular reflectance
 
-#ifdef HAS_PARAM
-	#ifdef HAS_NORMAL
-	float4 param = tex2D(sampTex4, parallaxUV);
-	metalness = param.x;
-	roughness = param.y * param.y;
-	F0 = 0.08 * param.z * param.z;
-	ao = param.w;
+	#ifndef NOLIT
+		float3 ambient = 18 * pow(lightSceneAmbient + EPS, 2.2) / PI;
+
+		// Sun light (Oren-Nayar)
+		float3 Lsun = normalize(-lightSunDirection);
+		float sunAtten = shadowpara;
+		float3 sunBRDF = BRDF(Norm, V, Lsun, texColor.rgb, metalness, roughness, roughness, radius, F0, 1);
+		//deb = sunBRDF;
+		float NdotL_sun = max(dot(Norm, Lsun), 0.0);
+
+		float3 lighting = 18 * pow(lightSunDiffuse + EPS, 2.2) * sunBRDF * sunAtten * NdotL_sun;
+		float neglight = 0.0;
+		#ifndef NO_POINT_LIGHTS
+		// Point lights (Lambert)
+		for (int i = 0; i < pointLightCount; i++) {
+			float3 L = lightPosition[i] - input.viewPos;
+			float dist = length(L);
+			L = L / dist;
+
+			float falloff = lightFalloffQuadratic[i] * dist * dist + lightFalloffConstant;
+			float t = saturate(dist / 350.0);
+			float cutoff = 1.0 - t * t * t * t;
+			float attenuation = (falloff > 0.0) ? (1.0 / falloff) * cutoff : 0.0;
+			float3 pointBRDF = BRDF(Norm, V, L, texColor.rgb, metalness, roughness, roughness, radius, F0, 0);
+			float NdotL_point = max(dot(Norm, (L)), 0.0);
+			lighting += 18 * (pow(max(0.0, lightDiffuse[i].rgb) + EPS, 2.2) * pointBRDF * NdotL_point) * attenuation;
+			neglight -= max(0.0, -lightDiffuse[i].r) * 1 / pow(falloff, 1 / 3.2);
+
+			//deb += attenuation;
+		}
 	#endif
-#endif
-#ifdef HAS_DIFFPARAM
-	// Basic PBR mode: _diffparam texture with fixed material properties
-	// RGB = albedo, A = roughness. Fixed: metalness=0, specular=0.5, AO=1
-	// Sample diffparam alpha directly for roughness (before texColor.a was overwritten with original alpha)
-	float diffparamAlpha = tex2D(sampTex0, parallaxUV).a;
-	roughness = diffparamAlpha * diffparamAlpha;
-	metalness = 0.0;         // Non-metallic materials
-	F0 = 0.08 * 0.5;         // Fixed specular reflectance = 0.5
-	ao = 1.0;                // Full ambient occlusion
-#endif
+
+		lighting += ambient;
+		neglight = max(0.0, 1 - 0.95 * saturate(-neglight));
+		lighting *= neglight;
+	#else
+		// Unlit shader - no lighting calculations
+		float3 lighting = float3(1.0, 1.0, 1.0);
+	#endif
 
 
-#ifndef NOLIT
-	float3 ambient = pow(lightSceneAmbient, 2.2) / PI / PI;
+		// Material calculation with diffuse parameter modulation
+		float3 effectiveDiffuse;
+		float3 effectiveEmissive;
+		float effectiveAlpha;
 
-	// Sun light (Oren-Nayar)
-	float3 Lsun = normalize(-lightSunDirection);
-	float sunAtten = shadowpara;
-	float3 sunBRDF = BRDF(Norm, V, Lsun, texColor.rgb, metalness, roughness, roughness, radius, F0, 1);
-	//deb = sunBRDF;
-	float NdotL_sun = max(dot(Norm, Lsun), 0.0);
-
-	float3 lighting = pow(lightSunDiffuse, 2.2) * sunBRDF * sunAtten * NdotL_sun;
-	float neglight = 0.0;
-	#ifndef NO_POINT_LIGHTS
-	// Point lights (Lambert)
-	for (int i = 0; i < pointLightCount; i++) {
-		float3 L = lightPosition[i] - input.viewPos;
-		float dist = length(L);
-		L = L / dist;
-
-		float falloff = lightFalloffQuadratic[i] * dist * dist + lightFalloffConstant;
-		float t = saturate(dist / 350.0);
-		float cutoff = 1.0 - t * t * t * t;
-		float attenuation = (falloff > 0.0) ? (1.0 / falloff) * cutoff : 0.0;
-		float3 pointBRDF = BRDF(Norm, V, L, texColor.rgb, metalness, roughness, roughness, radius, F0, 0);
-		float NdotL_point = max(dot(Norm, (L)), 0.0);
-		lighting += (pow(max(0.0, lightDiffuse[i].rgb), 2.2) * pointBRDF * NdotL_point) * attenuation;
-		neglight -= max(0.0, -lightDiffuse[i].r) * 1 / pow(falloff, 1 / 3.2);
-
-		//deb += attenuation;
+		int materialMode = (int)shadingMode.z;
+		if (materialMode == 2) {
+			// Mode 2: Use vertex color for diffuse/ambient
+			effectiveDiffuse = sqrt(input.color.rgb);
+			effectiveEmissive = materialEmissive.rgb * materialEmissive.rgb;
+			effectiveAlpha = input.color.a;
+		}
+		 else if (materialMode == 3)
+		{
+			// Mode 3: Use vertex color for emissive
+			effectiveDiffuse = materialDiffuse.rgb;
+			effectiveEmissive = input.color.rgb * input.color.rgb;
+			effectiveAlpha = materialDiffuse.a;
 	}
-#endif
-
-lighting += ambient;
-neglight = max(0.0, 1 - 0.95 * saturate(-neglight));
-lighting *= neglight;
-#else
-	// Unlit shader - no lighting calculations
-	float3 lighting = float3(1.0, 1.0, 1.0);
-#endif
-
-
-	// Material calculation with diffuse parameter modulation
-	float3 effectiveDiffuse;
-	float3 effectiveEmissive;
-	float effectiveAlpha;
-
-	int materialMode = (int)shadingMode.z;
-	if (materialMode == 2) {
-		// Mode 2: Use vertex color for diffuse/ambient
-		effectiveDiffuse = sqrt(input.color.rgb);
-		effectiveEmissive = materialEmissive.rgb * materialEmissive.rgb;
-		effectiveAlpha = input.color.a;
+	else
+	{
+			// Mode 1: Use material constants
+			effectiveDiffuse = materialDiffuse.rgb;
+			effectiveEmissive = materialEmissive.rgb * materialEmissive.rgb;
+			effectiveAlpha = materialDiffuse.a;
 	}
- else if (materialMode == 3)
-{
-		// Mode 3: Use vertex color for emissive
-		effectiveDiffuse = materialDiffuse.rgb;
-		effectiveEmissive = input.color.rgb * input.color.rgb;
-		effectiveAlpha = materialDiffuse.a;
-}
-else
-{
-		// Mode 1: Use material constants
-		effectiveDiffuse = materialDiffuse.rgb;
-		effectiveEmissive = materialEmissive.rgb * materialEmissive.rgb;
-		effectiveAlpha = materialDiffuse.a;
-}
 
-float3 litColor = effectiveDiffuse * lighting;
-litColor += effectiveEmissive;
+	float3 litColor = effectiveDiffuse * lighting;
+	litColor += effectiveEmissive;
 
-float4 diffuse = float4(litColor, effectiveAlpha);
+	float4 diffuse = float4(litColor, effectiveAlpha);
 
-// Apply base texture with enhanced material properties
-float4 c = diffuse * texColor;
-// c = diffuse * float4(1,1,1,texColor.a);
+	// Apply base texture with enhanced material properties
+	float4 c = diffuse * texColor;
+	// c = diffuse * float4(1,1,1,texColor.a);
 
- c.rgb = PBRNeutralToneMapping(min(1.6e+6f, max(0.0, c.rgb) * 32.0));
- // Apply fog
- //c.rgb = lerp(fogColNear, c.rgb, input.fog);
- //c.rgb = ApplyAgX(min(1.6e+6f, max(0.0, c.rgb) * 3.14));
- c.rgb = pow(c.rgb, 1.0 / 2.2);
- //c.rgb = deb;
- return c;
+	c.rgb = encode3(c.rgb);
+
+	// Apply fog
+	//c.rgb = lerp(fogColNear, c.rgb, input.fog);
+	//c.rgb = ApplyAgX(min(1.6e+6f, max(0.0, c.rgb) * 3.14));
+	//c.rgb = pow(c.rgb, 1.0 / 2.2);
+	// c.rgb = deb; // DEBUG: Show shadow coordinate visualization
+	return c;
 }

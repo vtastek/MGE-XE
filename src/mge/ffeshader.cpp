@@ -5,6 +5,7 @@
 #include "mwbridge.h"
 #include "morrowindbsa.h"
 #include "statusoverlay.h"
+#include "distantland.h"
 
 #include <algorithm>
 #include <sstream>
@@ -1290,6 +1291,9 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         sk.hasNormal = 0;
         sk.hasParam = 0;
     }
+    
+    // Set shadow flag based on MGE configuration
+    sk.hasShadows = (Configuration.MGEFlags & USE_SHADOWS) ? 1 : 0;
 
     if (sk == hlslShaderLRU.last_sk) {
         hlslShader = hlslShaderLRU.shader;
@@ -1470,6 +1474,27 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
                 bindingCache.lastBaseTexture = rs->texture;
             }
         }
+    }
+    
+    // Bind shadow texture and matrices if shadows are enabled
+    if (sk.hasShadows) {
+        // Bind shadow texture to slot 5
+        device->SetTexture(5, DistantLand::texSoftShadow);
+        
+        // Set shadow view-projection matrices via vertex shader constants
+        // Use the SAME view matrix that was used when shadows were rendered (DistantLand::mwView)
+        D3DXMATRIX inverseView, viewToShadow[2];
+        D3DXMatrixInverse(&inverseView, NULL, &DistantLand::mwView);
+        viewToShadow[0] = inverseView * DistantLand::smViewproj[0];
+        viewToShadow[1] = inverseView * DistantLand::smViewproj[1];
+        
+        // Set shadow matrices as vertex shader constants
+        device->SetVertexShaderConstantF(20, (float*)&viewToShadow[0], 4); // c20-c23
+        device->SetVertexShaderConstantF(24, (float*)&viewToShadow[1], 4); // c24-c27
+        
+        // Set shadow resolution parameter
+        float shadowRcp = 1.0f / Configuration.DL.ShadowResolution;
+        device->SetPixelShaderConstantF(10, &shadowRcp, 1); // c10
     }
 
     // Save current render states before modifying them
@@ -2341,7 +2366,7 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     }
 
     // Build shader defines based on ShaderKey
-    D3D_SHADER_MACRO defines[7] = {};
+    D3D_SHADER_MACRO defines[8] = {};
     int defineCount = 0;
     
     if (sk.hasDiffParam) {
@@ -2355,6 +2380,10 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     if (sk.hasParam) {
         defines[defineCount++] = {"HAS_PARAM", "1"};
         // LOG::logline("HLSL: Compiling with HAS_PARAM define");
+    }
+    if (sk.hasShadows) {
+        defines[defineCount++] = {"HAS_SHADOWS", "1"};
+        // LOG::logline("HLSL: Compiling with HAS_SHADOWS define");
     }
     if (!sk.useLighting) {
         defines[defineCount++] = {"NOLIT", "1"};

@@ -10,6 +10,11 @@ matrix view;
 matrix vertexBlendPalette[4];
 float4 vertexBlendState;
 
+#ifdef HAS_SHADOWS
+// Shadow matrices - using shader constants c20-c27
+matrix shadowViewProj[2] : register(c20);
+#endif
+
 // Fog parameters
 float nearFogStart, nearFogRange;
 
@@ -30,6 +35,10 @@ struct VS_OUTPUT {
     float2 texcoord : TEXCOORD1;
     float3 viewPos : TEXCOORD2;  // View space position
     float fog : TEXCOORD3;       // Fog factor
+#ifdef HAS_SHADOWS
+    float4 shadow0pos : TEXCOORD4;  // Shadow map 0 position
+    float4 shadow1pos : TEXCOORD5;  // Shadow map 1 position
+#endif
 };
 
 //------------------------------------------------------------
@@ -99,6 +108,13 @@ VS_OUTPUT vs_main(VS_INPUT input) {
     // Calculate fog
     float dist = length(viewpos);
     output.fog = fogMWScalar(dist);
+
+#ifdef HAS_SHADOWS
+    // Transform view position to shadow coordinates (like original system)
+    // Both skinned and rigid vertices end up in view space, so use that consistently
+    output.shadow0pos = mul(viewpos, shadowViewProj[0]);
+    output.shadow1pos = mul(viewpos, shadowViewProj[1]);
+#endif
 
     return output;
 }
