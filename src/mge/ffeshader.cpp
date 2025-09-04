@@ -1489,15 +1489,14 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         // Bind shadow texture to slot 5
         device->SetTexture(5, DistantLand::texSoftShadow);
         
-        // Set shadow view-projection matrices via vertex shader constants
-        // Use the SAME view matrix that was used when shadows were rendered (DistantLand::mwView)
-        D3DXMATRIX inverseView, viewToShadow[2];
-        D3DXMatrixInverse(&inverseView, NULL, &DistantLand::mwView);
+        // Use current device view matrix, not cached distant land view
+        D3DXMATRIX currentView, inverseView, viewToShadow[2];
+        device->GetTransform(D3DTS_VIEW, &currentView);
+        D3DXMatrixInverse(&inverseView, NULL, &currentView);
         viewToShadow[0] = inverseView * DistantLand::smViewproj[0];
         viewToShadow[1] = inverseView * DistantLand::smViewproj[1];
         
-        // Set shadow matrices as vertex shader constants
-        device->SetVertexShaderConstantF(20, (float*)&viewToShadow[0], 4); // c20-c23
+        device->SetVertexShaderConstantF(20, (float*)&viewToShadow[0], 4); // c20-c23 
         device->SetVertexShaderConstantF(24, (float*)&viewToShadow[1], 4); // c24-c27
         
         // Set shadow resolution parameter

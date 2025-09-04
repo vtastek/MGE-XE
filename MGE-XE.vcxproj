@@ -123,6 +123,7 @@
     <ClCompile Include="src\mge\distantland.cpp" />
     <ClCompile Include="src\mge\dlmath.cpp" />
     <ClCompile Include="src\mge\ffeshader.cpp" />
+    <ClCompile Include="src\mge\distantlandhlsl.cpp" />
     <ClCompile Include="src\mge\suffix_texture_support.cpp" />
     <ClCompile Include="src\mge\hlsl_shader_manager.cpp" />
     <ClCompile Include="src\mge\async_shader_compiler.cpp" />
@@ -192,6 +193,7 @@
     <ClInclude Include="src\mge\dlmath.h" />
     <ClInclude Include="src\mge\doublesurface.h" />
     <ClInclude Include="src\mge\ffeshader.h" />
+    <ClInclude Include="src\mge\distantlandhlsl.h" />
     <ClInclude Include="src\mge\suffix_texture_support.h" />
     <ClInclude Include="src\mge\hlsl_shader_manager.h" />
     <ClInclude Include="src\mge\async_shader_compiler.h" />

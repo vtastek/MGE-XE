@@ -11,7 +11,7 @@ matrix vertexBlendPalette[4];
 float4 vertexBlendState;
 
 #ifdef HAS_SHADOWS
-// Shadow matrices - using shader constants c20-c27
+// View-to-shadow matrices (matching original distant land shadow system)
 matrix shadowViewProj[2] : register(c20);
 #endif
 
@@ -81,6 +81,7 @@ float4 skin(float4 pos, float4 blend) {
 
     return viewpos;
 }
+
 
 // Fog calculation
 float fogMWScalar(float dist) {
@@ -181,10 +182,11 @@ VS_OUTPUT vs_main(VS_INPUT input) {
     output.fog = fogMWScalar(dist);
 
 #ifdef HAS_SHADOWS
-    // Transform view position to shadow coordinates (like original system)
-    // Both skinned and rigid vertices end up in view space, so use that consistently
+    // Copy exactly what XE Mod Shadow.fx does
     output.shadow0pos = mul(viewpos, shadowViewProj[0]);
     output.shadow1pos = mul(viewpos, shadowViewProj[1]);
+    output.shadow0pos.z = output.shadow0pos.z / output.shadow0pos.w;
+    output.shadow1pos.z = output.shadow1pos.z / output.shadow1pos.w;
 #endif
 
     return output;

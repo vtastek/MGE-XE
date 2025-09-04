@@ -510,224 +510,222 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 	float3 deb = 0;
 	float2 parallaxUV = input.texcoord;
 	float3 normalVS = normalize(input.normal);
-	float shadowpara = 1.0;
+	#ifdef HAS_SHADOWS
+	// Sample shadow map using cascaded ESM
+	float shadowpara = shadowSample(input.shadow0pos, input.shadow1pos);
+	deb = shadowpara;
+#else
+	float shadowpara = 1.0; // No shadows
+#endif
 
-	// #ifdef HAS_SHADOWS
-		// // Sample shadow map using cascaded ESM
-		// float shadowpara = shadowSample(input.shadow0pos, input.shadow1pos);
-		// deb = shadowpara;
-	// #else
-		// float shadowpara = 1.0; // No shadows
-	// #endif
+	#ifdef HAS_NORMAL
+	float3 inputVS = GetSafeNormal(input.viewPos, input.normal);
+	#else
+	float3 inputVS = input.normal;
+	#endif
 
-		#ifdef HAS_NORMAL
-		float3 inputVS = GetSafeNormal(input.viewPos, input.normal);
-		#else
-		float3 inputVS = input.normal;
+	float bumpIntensity = 5.5;
+	float3 T, B, N;
+	BuildPerPixelTBN(inputVS, input.viewPos, parallaxUV, T, B, N);
+
+	float3 Vvs = normalize(input.viewPos);
+	float handedness = (dot(cross(T, B), N) < 0) ? -1.0 : 1.0;
+	//B *= handedness;
+	float3x3 TBN = float3x3(T, B, N);
+	float3x3 TBN_T = transpose(TBN);
+	float3 Vts = mul(Vvs, TBN_T);
+
+	#ifdef HAS_NORMAL
+		#if defined(USE_SIMPLE_PARALLAX)
+		parallaxUV = ParallaxSimple(sampTex3, parallaxUV, Vts, 0.000015 * 1.33); // heightScale
 		#endif
 
-		float bumpIntensity = 5.5;
-		float3 T, B, N;
-		BuildPerPixelTBN(inputVS, input.viewPos, parallaxUV, T, B, N);
+		// After parallax, sample normal as usual
+		float2 texel = 1.0 / normres;
+		float hL = tex2D(sampTex3, parallaxUV + float2(-texel.x, 0)).a;
+		float hR = tex2D(sampTex3, parallaxUV + float2(texel.x, 0)).a;
+		float hD = tex2D(sampTex3, parallaxUV + float2(0, -texel.y)).a;
+		float hU = tex2D(sampTex3, parallaxUV + float2(0,  texel.y)).a;
+		float dhdu = (hR - hL);
+		float dhdv = (hU - hD);
+		float3 nTS = normalize(float3(-dhdu * heightScale, dhdv * heightScale, 1.0));
 
-		float3 Vvs = normalize(input.viewPos);
-		float handedness = (dot(cross(T, B), N) < 0) ? -1.0 : 1.0;
-		//B *= handedness;
-		float3x3 TBN = float3x3(T, B, N);
-		float3x3 TBN_T = transpose(TBN);
-		float3 Vts = mul(Vvs, TBN_T);
-
-		#ifdef HAS_NORMAL
-			#if defined(USE_SIMPLE_PARALLAX)
-			parallaxUV = ParallaxSimple(sampTex3, parallaxUV, Vts, 0.000015 * 1.33); // heightScale
-			#endif
-
-			// After parallax, sample normal as usual
-			float2 texel = 1.0 / normres;
-			float hL = tex2D(sampTex3, parallaxUV + float2(-texel.x, 0)).a;
-			float hR = tex2D(sampTex3, parallaxUV + float2(texel.x, 0)).a;
-			float hD = tex2D(sampTex3, parallaxUV + float2(0, -texel.y)).a;
-			float hU = tex2D(sampTex3, parallaxUV + float2(0,  texel.y)).a;
-			float dhdu = (hR - hL);
-			float dhdv = (hU - hD);
-			float3 nTS = normalize(float3(-dhdu * heightScale, dhdv * heightScale, 1.0));
-
-			normalVS = normalize(mul(nTS, TBN));
-			// Soft parallax shadowing (only if lighting is enabled)
-				#ifndef NOLIT
-					#ifdef HAS_NORMAL
-					float3 lightDirVS = -lightSunDirection;
-					float3 lightDirTS = mul(lightDirVS, TBN_T);
-					shadowpara = ParallaxSoftShadow(sampTex3, parallaxUV, lightDirTS.xy, 5.0, 0.04 * 0.75);
-					#endif
+		normalVS = normalize(mul(nTS, TBN));
+		// Soft parallax shadowing (only if lighting is enabled)
+			#ifndef NOLIT
+				#ifdef HAS_NORMAL
+				float3 lightDirVS = -lightSunDirection;
+				float3 lightDirTS = mul(lightDirVS, TBN_T);
+				shadowpara = ParallaxSoftShadow(sampTex3, parallaxUV, lightDirTS.xy, 5.0, 0.04 * 0.75);
 				#endif
-			#else
-		//float3 nTS = normalize(float3(0,0,1));
-		normalVS = inputVS;
-		#endif
-
-
-		float4 texColor = tex2D(sampTex0, parallaxUV);
-		texColor.rgb = max(0.008, pow(texColor.rgb + EPS, 2.2));
-		// Note: When HAS_DIFFPARAM is defined, sampTex0 contains the _diffparam/_diffparam_t texture
-		#ifdef HAS_DIFFPARAM
-		texColor.a = 1.0; // Ignore alpha from _diffparam texture
-		#endif
-
-		// PBR lighting calculation
-		float3 V = normalize(-input.viewPos); // view direction in view space
-		float3 Norm = normalVS;
-		float3 albedo = texColor.rgb;
-		float roughness = 0.9;
-		float metalness = 0.0;
-		float ao = 1.0;
-		float radius = 1.6;
-		float3 F0 = 0.08 * float3(0.5, 0.5, 0.5); // specular reflectance
-
-	#ifdef HAS_PARAM
-		#ifdef HAS_NORMAL
-		float4 param = tex2D(sampTex4, parallaxUV);
-		metalness = param.x;
-		roughness = param.y * param.y;
-		F0 = 0.08 * param.z * param.z;
-		ao = param.w;
-		#endif
-	#endif
-	#ifdef HAS_DIFFPARAM
-		// Basic PBR mode: _diffparam texture with fixed material properties
-		// RGB = albedo, A = roughness. Fixed: metalness=0, specular=0.5, AO=1
-		// Sample diffparam alpha directly for roughness (before texColor.a was overwritten with original alpha)
-		float diffparamAlpha = tex2D(sampTex0, parallaxUV).a;
-		roughness = diffparamAlpha * diffparamAlpha;
-		metalness = 0.0;         // Non-metallic materials
-		F0 = 0.08 * 0.5;         // Fixed specular reflectance = 0.5
-		ao = 1.0;                // Full ambient occlusion
-	#endif
-
-
-	#ifndef NOLIT
-		float3 ambient = 18 * pow(lightSceneAmbient + EPS, 2.2) / PI;
-
-		// Sun light (Oren-Nayar)
-		float3 Lsun = normalize(-lightSunDirection);
-		float sunAtten = shadowpara;
-		float3 sunBRDF = BRDF(Norm, V, Lsun, texColor.rgb, metalness, roughness, roughness, radius, F0, 1);
-		//deb = sunBRDF;
-		float dotsun = dot(Norm, Lsun);
-		float NdotL_sun = max(dotsun, 0.0);
-
-
-
-	#ifdef HAS_GRASS
-		// Apply grass-specific wrap lighting for two-sided grass rendering
-		// if (input.color.r > 0.5) {
-			  float w = GRASS_WRAP_LIGHTING_COEFF_W;
-			  float n = GRASS_WRAP_LIGHTING_COEFF_N;
-			  float lambert = dotsun * -sign(dot(V, Norm));
-			  lambert = pow(saturate((lambert + w) / (1.0f + w)), n) * (n + 1) / (2 * (1 + w)) + max(0.0, -1.0 * lambert) * GRASS_BACKLIGHTING_COEFF;
-			  lambert = max(0.0, lambert);
-			  NdotL_sun = lambert;
-
-			  // }
-		  #endif
-
-		  float3 lighting = 18 * pow(lightSunDiffuse + EPS, 2.2) * sunBRDF * sunAtten * NdotL_sun;
-
-			  float neglight = 0.0;
-			  #ifndef NO_POINT_LIGHTS
-			  // Point lights (Lambert)
-			  for (int i = 0; i < pointLightCount; i++) {
-				  float3 L = lightPosition[i] - input.viewPos;
-				  float dist = length(L);
-				  L = L / dist;
-
-				  float falloff = lightFalloffQuadratic[i] * dist * dist + lightFalloffConstant;
-				  float t = saturate(dist / 350.0);
-				  float cutoff = 1.0 - t * t * t * t;
-				  float attenuation = (falloff > 0.0) ? (1.0 / falloff) * cutoff : 0.0;
-				  float3 pointBRDF = BRDF(Norm, V, L, texColor.rgb, metalness, roughness, roughness, radius, F0, 0);
-				  float dotpoint = dot(Norm, L);
-				  float NdotL_point = max(dotpoint, 0.0);
-				  #ifdef HAS_GRASS
-				  // Apply grass-specific wrap lighting for two-sided grass rendering
-				  // if (input.color.r > 0.5) {
-
-						lambert = dotpoint * -sign(dot(V, Norm));
-						lambert = pow(saturate((lambert + w) / (1.0f + w)), n) * (n + 1) / (2 * (1 + w)) + max(0.0, -1.0 * lambert) * GRASS_BACKLIGHTING_COEFF;
-						lambert = max(0.0, lambert);
-						NdotL_point = 3.14 * lambert;
-						deb = NdotL_point;
-
-						// }
-							#endif
-
-							lighting += 18 * (pow(max(0.0, lightDiffuse[i].rgb) + EPS, 2.2) * pointBRDF * NdotL_point) * attenuation;
-							neglight -= max(0.0, -lightDiffuse[i].r) * 1 / pow(falloff, 1 / 3.2);
-
-							//deb += attenuation;
-						}
-					#endif
-
-						lighting += ambient;
-						neglight = max(0.0, 1 - 0.95 * saturate(-neglight));
-						lighting *= neglight;
-					#else
-		// Unlit shader - no lighting calculations
-		float3 lighting = float3(1.0, 1.0, 1.0);
-	#endif
-
-
-		// Material calculation with diffuse parameter modulation
-		float3 effectiveDiffuse;
-		float3 effectiveEmissive;
-		float effectiveAlpha;
-
-		int materialMode = (int)shadingMode.z;
-		if (materialMode == 2) {
-			// Mode 2: Use vertex color for diffuse/ambient
-			#ifdef HAS_GRASS
-			effectiveDiffuse = 1.0;
-			#else
-			effectiveDiffuse = sqrt(input.color.rgb);
 			#endif
-			effectiveEmissive = materialEmissive.rgb * materialEmissive.rgb;
-			effectiveAlpha = input.color.a;
-		}
-		 else if (materialMode == 3)
-		{
-			// Mode 3: Use vertex color for emissive
-			effectiveDiffuse = materialDiffuse.rgb;
-			effectiveEmissive = input.color.rgb * input.color.rgb;
-			effectiveAlpha = materialDiffuse.a;
+		#else
+	//float3 nTS = normalize(float3(0,0,1));
+	normalVS = inputVS;
+	#endif
+
+
+	float4 texColor = tex2D(sampTex0, parallaxUV);
+	texColor.rgb = max(0.008, pow(texColor.rgb + EPS, 2.2));
+	// Note: When HAS_DIFFPARAM is defined, sampTex0 contains the _diffparam/_diffparam_t texture
+	#ifdef HAS_DIFFPARAM
+	texColor.a = 1.0; // Ignore alpha from _diffparam texture
+	#endif
+
+	// PBR lighting calculation
+	float3 V = normalize(-input.viewPos); // view direction in view space
+	float3 Norm = normalVS;
+	float3 albedo = texColor.rgb;
+	float roughness = 0.9;
+	float metalness = 0.0;
+	float ao = 1.0;
+	float radius = 1.6;
+	float3 F0 = 0.08 * float3(0.5, 0.5, 0.5); // specular reflectance
+
+#ifdef HAS_PARAM
+	#ifdef HAS_NORMAL
+	float4 param = tex2D(sampTex4, parallaxUV);
+	metalness = param.x;
+	roughness = param.y * param.y;
+	F0 = 0.08 * param.z * param.z;
+	ao = param.w;
+	#endif
+#endif
+#ifdef HAS_DIFFPARAM
+	// Basic PBR mode: _diffparam texture with fixed material properties
+	// RGB = albedo, A = roughness. Fixed: metalness=0, specular=0.5, AO=1
+	// Sample diffparam alpha directly for roughness (before texColor.a was overwritten with original alpha)
+	float diffparamAlpha = tex2D(sampTex0, parallaxUV).a;
+	roughness = diffparamAlpha * diffparamAlpha;
+	metalness = 0.0;         // Non-metallic materials
+	F0 = 0.08 * 0.5;         // Fixed specular reflectance = 0.5
+	ao = 1.0;                // Full ambient occlusion
+#endif
+
+
+#ifndef NOLIT
+	float3 ambient = 18 * pow(lightSceneAmbient + EPS, 2.2) / PI;
+
+	// Sun light (Oren-Nayar)
+	float3 Lsun = normalize(-lightSunDirection);
+	float sunAtten = shadowpara;
+	float3 sunBRDF = BRDF(Norm, V, Lsun, texColor.rgb, metalness, roughness, roughness, radius, F0, 1);
+	//deb = sunBRDF;
+	float dotsun = dot(Norm, Lsun);
+	float NdotL_sun = max(dotsun, 0.0);
+
+
+
+#ifdef HAS_GRASS
+	// Apply grass-specific wrap lighting for two-sided grass rendering
+	// if (input.color.r > 0.5) {
+		  float w = GRASS_WRAP_LIGHTING_COEFF_W;
+		  float n = GRASS_WRAP_LIGHTING_COEFF_N;
+		  float lambert = dotsun * -sign(dot(V, Norm));
+		  lambert = pow(saturate((lambert + w) / (1.0f + w)), n) * (n + 1) / (2 * (1 + w)) + max(0.0, -1.0 * lambert) * GRASS_BACKLIGHTING_COEFF;
+		  lambert = max(0.0, lambert);
+		  NdotL_sun = lambert;
+
+		  // }
+	  #endif
+
+	  float3 lighting = 18 * pow(lightSunDiffuse + EPS, 2.2) * sunBRDF * sunAtten * NdotL_sun;
+
+		  float neglight = 0.0;
+		  #ifndef NO_POINT_LIGHTS
+		  // Point lights (Lambert)
+		  for (int i = 0; i < pointLightCount; i++) {
+			  float3 L = lightPosition[i] - input.viewPos;
+			  float dist = length(L);
+			  L = L / dist;
+
+			  float falloff = lightFalloffQuadratic[i] * dist * dist + lightFalloffConstant;
+			  float t = saturate(dist / 350.0);
+			  float cutoff = 1.0 - t * t * t * t;
+			  float attenuation = (falloff > 0.0) ? (1.0 / falloff) * cutoff : 0.0;
+			  float3 pointBRDF = BRDF(Norm, V, L, texColor.rgb, metalness, roughness, roughness, radius, F0, 0);
+			  float dotpoint = dot(Norm, L);
+			  float NdotL_point = max(dotpoint, 0.0);
+			  #ifdef HAS_GRASS
+			  // Apply grass-specific wrap lighting for two-sided grass rendering
+			  // if (input.color.r > 0.5) {
+
+					lambert = dotpoint * -sign(dot(V, Norm));
+					lambert = pow(saturate((lambert + w) / (1.0f + w)), n) * (n + 1) / (2 * (1 + w)) + max(0.0, -1.0 * lambert) * GRASS_BACKLIGHTING_COEFF;
+					lambert = max(0.0, lambert);
+					NdotL_point = 3.14 * lambert;
+					deb = NdotL_point;
+
+					// }
+						#endif
+
+						lighting += 18 * (pow(max(0.0, lightDiffuse[i].rgb) + EPS, 2.2) * pointBRDF * NdotL_point) * attenuation;
+						neglight -= max(0.0, -lightDiffuse[i].r) * 1 / pow(falloff, 1 / 3.2);
+
+						//deb += attenuation;
+					}
+				#endif
+
+					lighting += ambient;
+					neglight = max(0.0, 1 - 0.95 * saturate(-neglight));
+					lighting *= neglight;
+				#else
+	// Unlit shader - no lighting calculations
+	float3 lighting = float3(1.0, 1.0, 1.0);
+#endif
+
+
+	// Material calculation with diffuse parameter modulation
+	float3 effectiveDiffuse;
+	float3 effectiveEmissive;
+	float effectiveAlpha;
+
+	int materialMode = (int)shadingMode.z;
+	if (materialMode == 2) {
+		// Mode 2: Use vertex color for diffuse/ambient
+		#ifdef HAS_GRASS
+		effectiveDiffuse = 1.0;
+		#else
+		effectiveDiffuse = sqrt(input.color.rgb);
+		#endif
+		effectiveEmissive = materialEmissive.rgb * materialEmissive.rgb;
+		effectiveAlpha = input.color.a;
 	}
-	else
+	 else if (materialMode == 3)
 	{
-			// Mode 1: Use material constants
-			effectiveDiffuse = materialDiffuse.rgb;
-			effectiveEmissive = materialEmissive.rgb * materialEmissive.rgb;
-			effectiveAlpha = materialDiffuse.a;
-	}
+		// Mode 3: Use vertex color for emissive
+		effectiveDiffuse = materialDiffuse.rgb;
+		effectiveEmissive = input.color.rgb * input.color.rgb;
+		effectiveAlpha = materialDiffuse.a;
+}
+else
+{
+		// Mode 1: Use material constants
+		effectiveDiffuse = materialDiffuse.rgb;
+		effectiveEmissive = materialEmissive.rgb * materialEmissive.rgb;
+		effectiveAlpha = materialDiffuse.a;
+}
 
-	float3 litColor = effectiveDiffuse * lighting;
-	litColor += effectiveEmissive;
+float3 litColor = effectiveDiffuse * lighting;
+litColor += effectiveEmissive;
 
-	float4 diffuse = float4(litColor, effectiveAlpha);
+float4 diffuse = float4(litColor, effectiveAlpha);
 
-	// Apply base texture with enhanced material properties
-	float4 c = diffuse * texColor;
-	//c = diffuse * float4(1,1,1,texColor.a);
-	c.rgb = ToneMap_AgX(c.rgb, 0);
-	//c.rgb = encode3(c.rgb);
+// Apply base texture with enhanced material properties
+float4 c = diffuse * texColor;
+//c = diffuse * float4(1,1,1,texColor.a);
+c.rgb = ToneMap_AgX(c.rgb, 0);
+//c.rgb = encode3(c.rgb);
 
 #ifdef HAS_GRASS
 	// Alpha test early to improve performance
 	c.a = (c.a - 64.0 / 255.0) / max(fwidth(c.a), 0.0001) + 0.5;
 #endif
 
+	// Apply shadows
+	c.rgb *= shadowpara;
+
 	// Apply fog
-	//c.rgb = lerp(fogColNear, c.rgb, input.fog);
-	//c.rgb = ApplyAgX(min(1.6e+6f, max(0.0, c.rgb) * 3.14));
-	//c.rgb = pow(c.rgb, 1.0 / 2.2);
-	//c.rgb = input.color.x; // DEBUG: Show shadow coordinate visualization
+	c.rgb = lerp(fogColNear, c.rgb, input.fog);
 	return c;
 }

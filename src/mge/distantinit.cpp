@@ -4,6 +4,7 @@
 #include "configuration.h"
 #include "distantland.h"
 #include "distantshader.h"
+#include "distantlandhlsl.h"
 #include "dlformat.h"
 #include "postshaders.h"
 #include "morrowindbsa.h"
@@ -238,6 +239,12 @@ bool DistantLand::init() {
 
     if (!FixedFunctionShader::init(device, effectPool)) {
         return false;
+    }
+    
+    // Initialize Distant Land HLSL system (Phase 8)
+    if (!DistantLandHLSL::init(device)) {
+        LOG::logline("!! DistantLandHLSL::init failed, continuing with effects pipeline");
+        // Not a fatal error, we can continue with the effects pipeline
     }
 
     // Start priority shader loading asynchronously (don't wait yet)
@@ -1324,6 +1331,7 @@ void DistantLand::release() {
 
     PostShaders::release();
     FixedFunctionShader::release();
+    DistantLandHLSL::release();
 
     DistantLandShare::mapWorldSpaces.clear();
 
