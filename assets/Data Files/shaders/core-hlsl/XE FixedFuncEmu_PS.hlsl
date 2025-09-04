@@ -6,6 +6,18 @@
 #define PI 3.14159
 #define PI_DIV2 1.57079632679
 
+#ifdef HAS_GRASS
+// Grass lighting constants
+#define GRASS_WRAP_LIGHTING_COEFF_W 0.6
+#define GRASS_WRAP_LIGHTING_COEFF_N 1.5
+#define GRASS_BACKLIGHTING_COEFF 0.4
+
+// Alpha to coverage conversion for grass transparency
+float calc_coverage(float alpha, float alphaThreshold, float scale) {
+	return saturate((alpha - alphaThreshold) * scale + 0.5);
+}
+#endif
+
 float saturate(float x) { return max(0.0, min(x, 1.0)); }
 float3 saturate(float3 x) { return float3(saturate(x.x), saturate(x.y), saturate(x.z)); }
 
@@ -208,93 +220,61 @@ struct VS_OUTPUT {
 
 //   https://github.com/sobotka/AgX
 
-// 0: Default, 1: Golden, 2: Punchy
-#define AGX_LOOK 0
-
-// Mean error^2: 3.6705141e-06
-float3 AgxDefaultContrastApprox(float3 x)
+float3 ToneMap_AgX(float3 linCol, int lookMode)
 {
-	const float3 x2 = x * x;
-	const float3 x4 = x2 * x2;
+	// Minimal AgX, see by https://iolite-engine.com/blog_posts/minimal_agx_implementation
 
-	return +15.5 * x4 * x2
-		- 40.14 * x4 * x
-		+ 31.96 * x4
-		- 6.868 * x2 * x
-		+ 0.4298 * x2
-		+ 0.1191 * x
-		- 0.00232;
-}
-
-float3 Agx(float3 val)
-{
-	const float3x3 agx_mat = float3x3(
+	float3x3 agx_mat = float3x3(
 		0.842479062253094, 0.0423282422610123, 0.0423756549057051,
 		0.0784335999999992, 0.878468636469772, 0.0784336,
-		0.0792237451477643, 0.0791661274605434, 0.879142973793104);
+		0.0792237451477643, 0.0791661274605434, 0.879142973793104
+	);
 
-	// DEFAULT_LOG2_MIN      = -10.0
-	// DEFAULT_LOG2_MAX      =  +6.5
-	// MIDDLE_GRAY           =  0.18
-	// log2(pow(2, VALUE) * MIDDLE_GRAY)
-	// Adjusted for Unreal's zero exposure compensation
-	const float min_ev = -12.47393f; // Default: -12.47393f;
-	const float max_ev = 0.526069f;  // Default:  4.026069f;
+	float3x3 agx_mat_inv = float3x3(
+		1.19687900512017, -0.0528968517574562, -0.0529716355144438,
+		-0.0980208811401368, 1.15190312990417, -0.0980434501171241,
+		-0.0990297440797205, -0.0989611768448433, 1.15107367264116
+	);
 
-	// Input transform (inset)
-	val = mul(val, agx_mat);
+	float min_ev = -12.47393;
+	float max_ev = 4.026069;
+	float bias = 1.0;
+
+	// Input transform
+	float3 val = mul((linCol * bias), agx_mat);
 
 	// Log2 space encoding
 	val = clamp(log2(val), min_ev, max_ev);
 	val = (val - min_ev) / (max_ev - min_ev);
 
 	// Apply sigmoid function approximation
-	val = AgxDefaultContrastApprox(val);
+	val = ((((((((((15.5 * val) - 40.14) * val) + 31.96) * val) - 6.868) * val) + 0.4298) * val) + 0.1191) * val - 0.00232;
 
-	return val;
-}
+	// Apply Look Transform
+	float luma = dot(val, float3(0.2126, 0.7152, 0.0722));
+	float3 offset = (0.0);
+	float3 slope = (1.0);
+	float3 power = (1.0);
+	float sat = 1.0;
 
-float3 AgxEotf(float3 val)
-{
-	const float3x3 agx_mat_inv = float3x3(
-		1.19687900512017, -0.0528968517574562, -0.0529716355144438,
-		-0.0980208811401368, 1.15190312990417, -0.0980434501171241,
-		-0.0990297440797205, -0.0989611768448433, 1.15107367264116);
+	if (lookMode == 1) // "Golden"
+	{
+		slope = float3(1.0, 0.9, 0.5);
+		power = (0.8);
+		sat = 0.8;
+	}
+	else if (lookMode == 2) // "Punchy"
+	{
+		slope = (1.0);
+		power = (1.35);
+		sat = 1.4;
+	}
 
-	// Inverse input transform (outset)
-	val = mul(val, agx_mat_inv);
-
-	// sRGB IEC 61966-2-1 2.2 Exponent Reference EOTF Display
-	// NOTE: We're linearizing the output here. Comment/adjust when
-	// *not* using a sRGB render target
-	//val = pow(val, 2.2);
-
-	return val;
-}
-
-float3 AgxLook(float3 val)
-{
-	const float3 lw = float3(0.2126, 0.7152, 0.0722);
-	const float luma = dot(val, lw);
-
-	// Default
-	const float3 offset = float3(0.0, 0.0, 0.00);
-	float3 slope = float3(1.0, 1.0, 1.0);
-	float3 power = float3(1.0, 1.0, 1.0);
-	float sat = 1.33;
-
-	// ASC CDL
 	val = pow(val * slope + offset, power);
-	return luma + sat * (val - luma);
-}
+	val = luma + sat * (val - luma);
 
-float3 ApplyAgX(float3 LinearColorRec709)
-{
-	LinearColorRec709 = Agx(LinearColorRec709);
-	LinearColorRec709 = AgxLook(LinearColorRec709);
-	LinearColorRec709 = AgxEotf(LinearColorRec709);
-
-	return LinearColorRec709;
+	// Inverse Input transform
+	return mul(val, agx_mat_inv);
 }
 
 static const float3x3 CROSSTALK_MATRIX = float3x3(
@@ -340,7 +320,7 @@ float3 PBRNeutralToneMapping(float3 color) {
 	return mul(balancedCrosstalk, toneMapped);
 }
 
-#define PI 3.14159265358979323846
+
 #define EPS 1.17549435e-38f
 
 #define GM 1.6
@@ -633,34 +613,65 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 		float sunAtten = shadowpara;
 		float3 sunBRDF = BRDF(Norm, V, Lsun, texColor.rgb, metalness, roughness, roughness, radius, F0, 1);
 		//deb = sunBRDF;
-		float NdotL_sun = max(dot(Norm, Lsun), 0.0);
+		float dotsun = dot(Norm, Lsun);
+		float NdotL_sun = max(dotsun, 0.0);
 
-		float3 lighting = 18 * pow(lightSunDiffuse + EPS, 2.2) * sunBRDF * sunAtten * NdotL_sun;
-		float neglight = 0.0;
-		#ifndef NO_POINT_LIGHTS
-		// Point lights (Lambert)
-		for (int i = 0; i < pointLightCount; i++) {
-			float3 L = lightPosition[i] - input.viewPos;
-			float dist = length(L);
-			L = L / dist;
 
-			float falloff = lightFalloffQuadratic[i] * dist * dist + lightFalloffConstant;
-			float t = saturate(dist / 350.0);
-			float cutoff = 1.0 - t * t * t * t;
-			float attenuation = (falloff > 0.0) ? (1.0 / falloff) * cutoff : 0.0;
-			float3 pointBRDF = BRDF(Norm, V, L, texColor.rgb, metalness, roughness, roughness, radius, F0, 0);
-			float NdotL_point = max(dot(Norm, (L)), 0.0);
-			lighting += 18 * (pow(max(0.0, lightDiffuse[i].rgb) + EPS, 2.2) * pointBRDF * NdotL_point) * attenuation;
-			neglight -= max(0.0, -lightDiffuse[i].r) * 1 / pow(falloff, 1 / 3.2);
 
-			//deb += attenuation;
-		}
-	#endif
+	#ifdef HAS_GRASS
+		// Apply grass-specific wrap lighting for two-sided grass rendering
+		// if (input.color.r > 0.5) {
+			  float w = GRASS_WRAP_LIGHTING_COEFF_W;
+			  float n = GRASS_WRAP_LIGHTING_COEFF_N;
+			  float lambert = dotsun * -sign(dot(V, Norm));
+			  lambert = pow(saturate((lambert + w) / (1.0f + w)), n) * (n + 1) / (2 * (1 + w)) + max(0.0, -1.0 * lambert) * GRASS_BACKLIGHTING_COEFF;
+			  lambert = max(0.0, lambert);
+			  NdotL_sun = lambert;
 
-		lighting += ambient;
-		neglight = max(0.0, 1 - 0.95 * saturate(-neglight));
-		lighting *= neglight;
-	#else
+			  // }
+		  #endif
+
+		  float3 lighting = 18 * pow(lightSunDiffuse + EPS, 2.2) * sunBRDF * sunAtten * NdotL_sun;
+
+			  float neglight = 0.0;
+			  #ifndef NO_POINT_LIGHTS
+			  // Point lights (Lambert)
+			  for (int i = 0; i < pointLightCount; i++) {
+				  float3 L = lightPosition[i] - input.viewPos;
+				  float dist = length(L);
+				  L = L / dist;
+
+				  float falloff = lightFalloffQuadratic[i] * dist * dist + lightFalloffConstant;
+				  float t = saturate(dist / 350.0);
+				  float cutoff = 1.0 - t * t * t * t;
+				  float attenuation = (falloff > 0.0) ? (1.0 / falloff) * cutoff : 0.0;
+				  float3 pointBRDF = BRDF(Norm, V, L, texColor.rgb, metalness, roughness, roughness, radius, F0, 0);
+				  float dotpoint = dot(Norm, L);
+				  float NdotL_point = max(dotpoint, 0.0);
+				  #ifdef HAS_GRASS
+				  // Apply grass-specific wrap lighting for two-sided grass rendering
+				  // if (input.color.r > 0.5) {
+
+						lambert = dotpoint * -sign(dot(V, Norm));
+						lambert = pow(saturate((lambert + w) / (1.0f + w)), n) * (n + 1) / (2 * (1 + w)) + max(0.0, -1.0 * lambert) * GRASS_BACKLIGHTING_COEFF;
+						lambert = max(0.0, lambert);
+						NdotL_point = 3.14 * lambert;
+						deb = NdotL_point;
+
+						// }
+							#endif
+
+							lighting += 18 * (pow(max(0.0, lightDiffuse[i].rgb) + EPS, 2.2) * pointBRDF * NdotL_point) * attenuation;
+							neglight -= max(0.0, -lightDiffuse[i].r) * 1 / pow(falloff, 1 / 3.2);
+
+							//deb += attenuation;
+						}
+					#endif
+
+						lighting += ambient;
+						neglight = max(0.0, 1 - 0.95 * saturate(-neglight));
+						lighting *= neglight;
+					#else
 		// Unlit shader - no lighting calculations
 		float3 lighting = float3(1.0, 1.0, 1.0);
 	#endif
@@ -674,7 +685,11 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 		int materialMode = (int)shadingMode.z;
 		if (materialMode == 2) {
 			// Mode 2: Use vertex color for diffuse/ambient
+			#ifdef HAS_GRASS
+			effectiveDiffuse = 1.0;
+			#else
 			effectiveDiffuse = sqrt(input.color.rgb);
+			#endif
 			effectiveEmissive = materialEmissive.rgb * materialEmissive.rgb;
 			effectiveAlpha = input.color.a;
 		}
@@ -700,14 +715,19 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 
 	// Apply base texture with enhanced material properties
 	float4 c = diffuse * texColor;
-	// c = diffuse * float4(1,1,1,texColor.a);
+	//c = diffuse * float4(1,1,1,texColor.a);
+	c.rgb = ToneMap_AgX(c.rgb, 0);
+	//c.rgb = encode3(c.rgb);
 
-	c.rgb = encode3(c.rgb);
+#ifdef HAS_GRASS
+	// Alpha test early to improve performance
+	c.a = (c.a - 64.0 / 255.0) / max(fwidth(c.a), 0.0001) + 0.5;
+#endif
 
 	// Apply fog
 	//c.rgb = lerp(fogColNear, c.rgb, input.fog);
 	//c.rgb = ApplyAgX(min(1.6e+6f, max(0.0, c.rgb) * 3.14));
 	//c.rgb = pow(c.rgb, 1.0 / 2.2);
-	// c.rgb = deb; // DEBUG: Show shadow coordinate visualization
+	//c.rgb = input.color.x; // DEBUG: Show shadow coordinate visualization
 	return c;
 }

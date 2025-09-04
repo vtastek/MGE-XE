@@ -18,6 +18,17 @@ matrix shadowViewProj[2] : register(c20);
 // Fog parameters
 float nearFogStart, nearFogRange;
 
+// Animation parameters (available for all geometry)
+float2 windVec;
+float time;
+bool hasAlpha;  // For detecting alpha-tested geometry
+
+#ifdef HAS_GRASS
+// Additional grass-specific parameters
+float3 eyePos;
+float2 footPos;
+#endif
+
 //------------------------------------------------------------
 // Vertex Input/Output
 struct VS_INPUT {
@@ -76,15 +87,61 @@ float fogMWScalar(float dist) {
     return saturate((nearFogRange - dist) / (nearFogRange - nearFogStart));
 }
 
+#ifdef HAS_GRASS
+// Basic noise function for grass animation
+float bnoise(float x) {
+    float i = floor(x);
+    float f = frac(x);
+    float s = sign(frac(x / 2.0) - 0.5);
+    float k = frac(i * 0.1731);
+    return s * f * (f - 1.0) * ((16.0 * k - 4.0) * f * (f - 1.0) - 1.0);
+}
+#endif
+
+// Grass displacement function based on wind and player proximity
+float3 grassDisplacement(float3 worldpos, float h, float speed) {
+    float v = length(windVec);
+    float2 displace = 2 * v * 0.001 + 0.5;
+    float2 harmonics = 0;
+
+    float gtime = time * 0.1 * speed;
+
+    float fi = 5.5;
+    float cg = 1.0;
+    float bi = 0.05;
+
+
+    harmonics.x += abs(((fi * 1.0 + 0.03 * v) * sin(-2 * cg * (worldpos.x + worldpos.y + worldpos.z + gtime))) + bi * 1);
+
+    harmonics.y += abs(((fi * 2.0 + 0.044 * v) * sin(-3 * cg * (worldpos.x + worldpos.y + worldpos.z + gtime))) + bi * 0.5);
+
+    float3 stomp = 0;
+#ifdef HAS_GRASS
+    float d = length(worldpos.xy - footPos.xy);
+    //d += pow(0.06 * max(0, footPos.- worldpos.z - 60), 2);
+
+
+    if (d < 150) {
+        stomp.xy = (60 / d - 0.4) * (worldpos.xy - footPos.xy);
+    }
+    stomp.z = 0;
+#endif
+
+    return float3(saturate(0.01 * (abs(h))) * speed * 5 * (harmonics.xy * displace.xy + stomp.xy), 0);
+}
+
 //------------------------------------------------------------
 // Vertex Shader Main
 VS_OUTPUT vs_main(VS_INPUT input) {
     VS_OUTPUT output;
 
     // Transform vertex
+    float4 worldpos;
     float4 viewpos;
     float3 normal;
 
+
+    // Standard transformation for non-grass
     if (vertexBlendState.x > 0.5) {
         // Skinned vertex
         viewpos = skin(input.pos, input.blendweights);
@@ -92,8 +149,22 @@ VS_OUTPUT vs_main(VS_INPUT input) {
     }
     else {
         // Rigid vertex
+
+#ifdef HAS_GRASS
+        // Use grass displacement for grass geometry
+        float3 displacement = grassDisplacement(input.pos.xyz, input.pos.z, 0.5);
+        input.pos.xy += (1 - input.color.z) * displacement.xy;
+#else
+        // Apply simple wind animation to alpha-tested geometry (trees, bushes, etc.)
+        if (hasAlpha) {
+            float3 displacement = grassDisplacement(input.pos.xyz, input.pos.z, 1.0);
+            input.pos.xyz += displacement;
+        }
+#endif
+
         viewpos = mul(input.pos, worldview);
         normal = mul(float4(input.normal, 0), worldview).xyz;
+
     }
 
     // Project to screen

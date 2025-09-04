@@ -437,7 +437,21 @@ static const char* getSuffixType(const std::string& texPath) {
     return nullptr; // Base texture
 }
 
-// Helper function to recursively scan directories for suffix files
+// Helper function to check if a texture path is in a grass folder
+bool isInGrassFolder(const std::string& path) {
+    std::string lowerPath = path;
+    std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), ::tolower);
+    
+    // Look for /grass/ or \grass\ anywhere in the path (folder separator on both sides)
+    return (lowerPath.find("/grass/") != std::string::npos || 
+            lowerPath.find("\\grass\\") != std::string::npos ||
+            lowerPath.find("grass/") == 0 ||  // Starts with grass/
+            lowerPath.find("grass\\") == 0 || // Starts with grass\ (backslash)
+            lowerPath.find("/grass") == lowerPath.length() - 6 ||  // Ends with /grass
+            lowerPath.find("\\grass") == lowerPath.length() - 6);  // Ends with \grass
+}
+
+// Helper function to recursively scan directories for suffix files and grass textures
 static void scanDirectoryForSuffixes(const std::string& basePath, const std::string& relativePath, 
                                    std::unordered_map<std::string, TextureSuffixVariants>& suffixMap, int& suffixFilesFound) {
     std::string searchPath = basePath;
@@ -491,6 +505,7 @@ static void scanDirectoryForSuffixes(const std::string& basePath, const std::str
                 
                 TextureSuffixVariants& variants = suffixMap[baseName];
                 variants.baseName = baseName;
+                variants.isGrassTexture = false;
                 
                 if (suffixType == "diffparam") {
                     variants.diffparam = "textures/" + fullRelativePath;
@@ -505,6 +520,28 @@ static void scanDirectoryForSuffixes(const std::string& basePath, const std::str
                 
                 suffixFilesFound++;
                 LOG::logline("-- Found loose %s: %s -> base: %s", suffixType.c_str(), fullRelativePath.c_str(), baseName.c_str());
+            }
+            
+            // Check if this texture is in grass folder (for any DDS file)
+            if (isInGrassFolder(relativePath) && filename.length() > 4 && 
+                filename.substr(filename.length() - 4) == ".dds") {
+                
+                std::string normalizedPath = normalizeTexturePath(fullRelativePath.c_str());
+                std::string baseName = extractBaseName(normalizedPath);
+                
+                TextureSuffixVariants& variants = suffixMap[baseName];
+                variants.baseName = baseName;
+                variants.isGrassTexture = false;
+                variants.isGrassTexture = true;
+                // Check if this grass texture exists as a loose file
+                std::string grassTexturePath = "Data Files\\textures\\" + fullRelativePath;
+                std::replace(grassTexturePath.begin(), grassTexturePath.end(), '/', '\\');
+                if (GetFileAttributes(grassTexturePath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                    variants.baseTextureSource = "loose";
+                    variants.baseTexturePath = grassTexturePath;
+                }
+                
+                LOG::logline("-- Found grass texture: %s -> base: %s", fullRelativePath.c_str(), baseName.c_str());
             }
         }
     } while (FindNextFile(hFind, &findFileData));
@@ -524,6 +561,33 @@ void buildTextureSuffixDatabase() {
     
     // Recursively scan Data Files/textures/ and all subdirectories for suffix files
     scanDirectoryForSuffixes("Data Files\\textures", "", suffixMap, suffixFilesFound);
+    
+    // Phase 1.5: Discover grass textures from BSA files
+    int grassTexturesFoundBSA = 0;
+    for (const auto& entry : cacheMap) {
+        const CacheEntry& cacheEntry = entry.second;
+        const std::string& filename = cacheEntry.filename;
+        
+        // Check if it's a texture file in a grass folder
+        if (filename.find("textures/") != std::string::npos || filename.find("textures\\") != std::string::npos) {
+            if (isInGrassFolder(filename) && filename.length() > 4 && 
+                filename.substr(filename.length() - 4) == ".dds") {
+                
+                std::string normalizedPath = normalizeTexturePath(filename.c_str());
+                std::string baseName = extractBaseName(normalizedPath);
+                
+                TextureSuffixVariants& variants = suffixMap[baseName];
+                variants.baseName = baseName;
+                variants.isGrassTexture = true;
+                variants.baseTextureSource = "bsa";
+                variants.baseTexturePath = filename;
+                
+                grassTexturesFoundBSA++;
+                LOG::logline("-- Found BSA grass texture: %s -> base: %s", filename.c_str(), baseName.c_str());
+            }
+        }
+    }
+    LOG::logline("-- Found %d grass textures in BSA files", grassTexturesFoundBSA);
     
     // Phase 2: For each base name, find the actual base texture (loose overrides BSA)
     int basesFound = 0;
@@ -550,7 +614,7 @@ void buildTextureSuffixDatabase() {
         
         // Look for base texture in the same directory as the suffix
         std::string baseFileName = baseName.substr(baseName.find_last_of("/\\") + 1) + ".dds";
-        std::string looseBasePath = "Data Files\\" + suffixDir + baseFileName;
+        std::string looseBasePath = "Data Files\\textures\\" + suffixDir + baseFileName;
         
         // Replace forward slashes with backslashes for Windows file system
         std::replace(looseBasePath.begin(), looseBasePath.end(), '/', '\\');
@@ -588,10 +652,10 @@ void buildTextureSuffixDatabase() {
         }
     }
     
-    // Phase 3: Move to final database (only entries with found base textures)
+    // Phase 3: Move to final database (entries with found base textures OR grass textures)
     for (const auto& pair : suffixMap) {
         const TextureSuffixVariants& variants = pair.second;
-        if (!variants.baseTextureSource.empty()) {
+        if (!variants.baseTextureSource.empty() || variants.isGrassTexture) {
             textureSuffixDatabase[variants.baseName] = variants;
         }
     }

@@ -61,6 +61,7 @@ struct SuffixTextureFlags {
     bool hasDiffParam = false;
     bool hasNormal = false;
     bool hasParam = false;
+    bool hasGrass = false;
 } static suffixFlags;
 
 // Cache for per-texture suffix flags to avoid repeated hash calculations
@@ -94,7 +95,7 @@ static SuffixBindingState bindingCache;
 
 // Get suffix flags for a specific texture (per-texture, not global)
 static SuffixTextureFlags getSuffixFlagsForTexture(IDirect3DDevice9* device, IDirect3DTexture9* texture) {
-    SuffixTextureFlags flags = {false, false, false};
+    SuffixTextureFlags flags = {false, false, false, false};
     
     if (!texture || Configuration.PerPixelLightFlags != 2) {
         return flags;
@@ -118,11 +119,12 @@ static SuffixTextureFlags getSuffixFlagsForTexture(IDirect3DDevice9* device, IDi
             
             // Look up suffix variants for this specific texture
             const BSA::TextureSuffixVariants* variants = BSA::getTextureSuffixVariants(textureName->c_str());
-            if (variants && (variants->hasDiffParam() || variants->hasNormal() || variants->hasParam())) {
+            if (variants && (variants->hasDiffParam() || variants->hasNormal() || variants->hasParam() || variants->hasGrass())) {
                 // Set flags based on available suffix variants (combinations allowed)
                 flags.hasDiffParam = variants->hasDiffParam() || variants->hasDiffParamT();
                 flags.hasNormal = variants->hasNormal();
                 flags.hasParam = variants->hasParam();
+                flags.hasGrass = variants->hasGrass();
                 
                 // DEBUG: Log suffix selection decision and the actual variant paths
                 //LOG::logline("DEBUG SUFFIX SELECTION: %s -> selected: diffparam=%d normal=%d param=%d", 
@@ -445,6 +447,7 @@ void FixedFunctionShader::startEarlyPrecache(IDirect3DDevice* d) {
                     sk.hasDiffParam = v.hasDiffParam;
                     sk.hasNormal = v.hasNormal;
                     sk.hasParam = v.hasParam;
+                    sk.hasGrass = 0; // Precache without grass specific variants
                     sk.fogMode = v.fogMode;
                     sk.activeStages = v.stages;
                     
@@ -601,6 +604,7 @@ void FixedFunctionShader::precacheAsync() {
                 sk.hasDiffParam = v.hasDiffParam;
                 sk.hasNormal = v.hasNormal;
                 sk.hasParam = v.hasParam;
+                sk.hasGrass = 0; // Precache without grass specific variants
                 sk.fogMode = v.fogMode;
                 sk.activeStages = v.stages;
                 
@@ -671,6 +675,7 @@ void FixedFunctionShader::precacheAsync() {
                 sk.hasDiffParam = 1;
                 sk.hasNormal = 1; 
                 sk.hasParam = 1;
+                sk.hasGrass = 0; // Let grass shaders compile on demand
                 
                 // Fog mode: 1=standard, 2=alpha blending (diffparam textures)
                 sk.fogMode = fogMode;
@@ -1279,17 +1284,20 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
             sk.hasDiffParam = cacheIt->second.variants->hasDiffParam() || cacheIt->second.variants->hasDiffParamT();
             sk.hasNormal = cacheIt->second.variants->hasNormal();
             sk.hasParam = cacheIt->second.variants->hasParam();
+            sk.hasGrass = cacheIt->second.variants->hasGrass();
         } else {
             // No suffix variants available, use base texture only
             sk.hasDiffParam = 0;
             sk.hasNormal = 0;
             sk.hasParam = 0;
+            sk.hasGrass = 0;
         }
     } else {
         // No texture bound, no suffixes
         sk.hasDiffParam = 0;
         sk.hasNormal = 0;
         sk.hasParam = 0;
+        sk.hasGrass = 0;
     }
     
     // Set shadow flag based on MGE configuration
@@ -1969,6 +1977,32 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
             hlslShader.vsConstantTable->SetBool(device, hHasBones, rs->vertexBlendState > 0);
         }
         
+        // Alpha testing flag for wind animation
+        D3DXHANDLE hHasAlphaVS = hlslShader.vsConstantTable->GetConstantByName(NULL, "hasAlpha");
+        if (hHasAlphaVS) {
+            hlslShader.vsConstantTable->SetBool(device, hHasAlphaVS, rs->alphaTest);
+        }
+        
+        // Wind vector for animations
+        D3DXHANDLE hWindVec = hlslShader.vsConstantTable->GetConstantByName(NULL, "windVec");
+        if (hWindVec) {
+            static float smoothWind[2] = {0, 0};
+            if (!MWBridge::get()->IsMenu()) {
+                const float f = 0.02f;
+                const float windScaling = 1.0f; // Same as distant land
+                const float* wind = MWBridge::get()->GetWindVector();
+                smoothWind[0] += f * (windScaling * wind[0] - smoothWind[0]);
+                smoothWind[1] += f * (windScaling * wind[1] - smoothWind[1]);
+            }
+            hlslShader.vsConstantTable->SetFloatArray(device, hWindVec, smoothWind, 2);
+        }
+        
+        // Time for animations
+        D3DXHANDLE hTime = hlslShader.vsConstantTable->GetConstantByName(NULL, "time");
+        if (hTime) {
+            hlslShader.vsConstantTable->SetFloat(device, hTime, MWBridge::get()->simulationTime());
+        }
+        
         D3DXHANDLE hHasVCol = hlslShader.psConstantTable->GetConstantByName(NULL, "hasVCol");
         if (hHasVCol) {
             hlslShader.psConstantTable->SetBool(device, hHasVCol, (rs->fvf & D3DFVF_DIFFUSE) != 0);
@@ -2366,7 +2400,7 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     }
 
     // Build shader defines based on ShaderKey
-    D3D_SHADER_MACRO defines[8] = {};
+    D3D_SHADER_MACRO defines[9] = {};
     int defineCount = 0;
     
     if (sk.hasDiffParam) {
@@ -2380,6 +2414,10 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     if (sk.hasParam) {
         defines[defineCount++] = {"HAS_PARAM", "1"};
         // LOG::logline("HLSL: Compiling with HAS_PARAM define");
+    }
+    if (sk.hasGrass) {
+        defines[defineCount++] = {"HAS_GRASS", "1"};
+        LOG::logline("HLSL: Compiling with HAS_GRASS define");
     }
     if (sk.hasShadows) {
         defines[defineCount++] = {"HAS_SHADOWS", "1"};

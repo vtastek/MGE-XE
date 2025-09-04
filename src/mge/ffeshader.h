@@ -89,6 +89,7 @@ class FixedFunctionShader {
         DWORD hasNormal : 1;           // Has normal map texture (_nh)
         DWORD hasParam : 1;            // Has parameter texture (_param)
         DWORD hasShadows : 1;          // Has shadow mapping enabled
+        DWORD hasGrass : 1;            // Is grass texture (enables vertex animation and A2C)
 
         struct Stage {
             DWORD colorOp : 6;
