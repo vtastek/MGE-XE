@@ -170,8 +170,8 @@ void DistantLand::renderStage1() {
                 effect->EndPass();
             }
 
-            // Overlay shadow onto Morrowind objects
-            if ((Configuration.MGEFlags & USE_SHADOWS) && mwBridge->CellHasWeather()) {
+            // Overlay shadow onto Morrowind objects (skip if HLSL shadows are handling it)
+            if ((Configuration.MGEFlags & USE_SHADOWS) && mwBridge->CellHasWeather() && Configuration.PerPixelLightFlags != 2) {
                 effect->BeginPass(isPPLActive ? PASS_RENDERSHADOWFFE : PASS_RENDERSHADOW);
                 renderShadow();
                 effect->EndPass();
@@ -211,8 +211,8 @@ void DistantLand::renderStage2() {
         device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
 
         if (isDistantCell()) {
-            // Shadowing onto recorded renders
-            if ((Configuration.MGEFlags & USE_SHADOWS) && mwBridge->CellHasWeather()) {
+            // Shadowing onto recorded renders (skip if HLSL shadows are handling it)
+            if ((Configuration.MGEFlags & USE_SHADOWS) && mwBridge->CellHasWeather() && Configuration.PerPixelLightFlags != 2) {
                 effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
                 effect->BeginPass(isPPLActive ? PASS_RENDERSHADOWFFE : PASS_RENDERSHADOW);
                 renderShadow();

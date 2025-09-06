@@ -1300,8 +1300,8 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         sk.hasGrass = 0;
     }
     
-    // Set shadow flag based on MGE configuration
-    sk.hasShadows = (Configuration.MGEFlags & USE_SHADOWS) ? 1 : 0;
+    // Set shadow flag based on MGE configuration - shadows require both USE_SHADOWS and USE_DISTANT_LAND
+    sk.hasShadows = ((Configuration.MGEFlags & USE_SHADOWS) && (Configuration.MGEFlags & USE_DISTANT_LAND)) ? 1 : 0;
 
     if (sk == hlslShaderLRU.last_sk) {
         hlslShader = hlslShaderLRU.shader;

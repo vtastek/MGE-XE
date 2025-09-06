@@ -40,7 +40,7 @@ bool DistantLandHLSL::init(IDirect3DDevice9* d) {
     ShaderPermutation basicPerm = {};
     basicPerm.useExpFog = (Configuration.MGEFlags & EXP_FOG) ? 1 : 0;
     basicPerm.useATMScatter = (Configuration.MGEFlags & USE_ATM_SCATTER) ? 1 : 0;
-    basicPerm.useShadows = (Configuration.MGEFlags & USE_SHADOWS) ? 1 : 0;
+    basicPerm.useShadows = ((Configuration.MGEFlags & USE_SHADOWS) && (Configuration.MGEFlags & USE_DISTANT_LAND)) ? 1 : 0;
     
     // Pre-compile basic shaders for common cases
     getShader(SHADER_STATICS_EXTERIOR, basicPerm);
@@ -259,7 +259,7 @@ DistantLandHLSL::ShaderPermutation DistantLandHLSL::getCurrentPermutation() {
     ShaderPermutation perm = {};
     perm.useExpFog = (Configuration.MGEFlags & EXP_FOG) ? 1 : 0;
     perm.useATMScatter = (Configuration.MGEFlags & USE_ATM_SCATTER) ? 1 : 0;
-    perm.useShadows = (Configuration.MGEFlags & USE_SHADOWS) ? 1 : 0;
+    perm.useShadows = ((Configuration.MGEFlags & USE_SHADOWS) && (Configuration.MGEFlags & USE_DISTANT_LAND)) ? 1 : 0;
     return perm;
 }
 

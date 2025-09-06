@@ -5,6 +5,7 @@
 //---------------------------- PBR ----------------------------
 #define PI 3.14159
 #define PI_DIV2 1.57079632679
+#define INTENSITY 18.0
 
 #ifdef HAS_GRASS
 // Grass lighting constants
@@ -484,20 +485,25 @@ float shadowSample(float4 shadow0pos, float4 shadow1pos) {
 	// Clip space margin of 4 texels, to prevent bleeding from the filter kernel + adjacent textures  
 	float3 atlasMargin = float3(1.0 - 2.0 * 4.0 * shadowRcpRes, 1.0 - 2.0 * 4.0 * shadowRcpRes, 1.0);
 
-	float dz = 1e-6;
+	float dz = 1e-6;  // Default to unshadowed
 
 	if (all(saturate(atlasMargin - abs(shadow0pos.xyz)))) {
-		// Layer 0, inner (near shadows)
+		// Layer 0, inner (near shadows) - higher priority
 		float2 shadowUV = (0.5 + 0.5 * shadowRcpRes) + float2(0.5, -0.5) * shadow0pos.xy;
 		dz = tex2Dlod(sampShadow, mapShadowToAtlas(shadowUV, 0)).r / ESM_scale - shadow0pos.z;
 	}
 	else if (all(saturate(atlasMargin - abs(shadow1pos.xyz)))) {
-		// Layer 1 (far shadows)
+		// Layer 1 (far shadows) - only if not in near cascade
 		float2 shadowUV = (0.5 + 0.5 * shadowRcpRes) + float2(0.5, -0.5) * shadow1pos.xy;
 		dz = tex2Dlod(sampShadow, mapShadowToAtlas(shadowUV, 1)).r / ESM_scale - shadow1pos.z;
 	}
+	else {
+		// Outside both cascades - no shadow opacity
+		return 0.0;
+	}
 
-	// ESM shadow filtering  
+	// ESM shadow filtering - matches Effect system calculation
+	// Returns shadow opacity: 1.0 for shadowed, 0.0 for lit
 	return 1.0 - saturate(exp(ESM_c * dz + ESM_bias));
 }
 #endif
@@ -511,11 +517,15 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 	float2 parallaxUV = input.texcoord;
 	float3 normalVS = normalize(input.normal);
 	#ifdef HAS_SHADOWS
-	// Sample shadow map using cascaded ESM
-	float shadowpara = 1- shadowSample(input.shadow0pos, input.shadow1pos);
-	deb = shadowpara;
+	// Sample shadow map using cascaded ESM (returns shadow opacity)
+	float shadowOpacity = shadowSample(input.shadow0pos, input.shadow1pos);
+	// Convert shadow opacity to light attenuation for lighting calculations
+	float shadows = saturate(1.0 - 35 * shadowOpacity);
+	float shadowpara = 1.0;
+	//deb = shadows;
 #else
-	float shadowpara = 1.0; // No shadows
+	float shadows = 1.0; // No shadows - fully lit
+	float shadowpara = 1.0;
 #endif
 
 	#ifdef HAS_NORMAL
@@ -556,7 +566,9 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 				#ifdef HAS_NORMAL
 				float3 lightDirVS = -lightSunDirection;
 				float3 lightDirTS = mul(lightDirVS, TBN_T);
-				//shadowpara *= ParallaxSoftShadow(sampTex3, parallaxUV, lightDirTS.xy, 5.0, 0.04 * 0.75);
+				shadowpara = ParallaxSoftShadow(sampTex3, parallaxUV, lightDirTS.xy, 5.0, 0.04 * 0.75);
+				shadows *= shadowpara;
+				deb = normalVS;
 				#endif
 			#endif
 		#else
@@ -604,11 +616,11 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 
 
 #ifndef NOLIT
-	float3 ambient = 0 * pow(lightSceneAmbient + EPS, 2.2) / PI;
+	float3 ambient = INTENSITY * 0.1 * pow(lightSceneAmbient + EPS, 2.2) / PI;
 
 	// Sun light (Oren-Nayar)
 	float3 Lsun = normalize(-lightSunDirection);
-	float sunAtten = shadowpara;
+	float sunAtten = shadows;
 	float3 sunBRDF = BRDF(Norm, V, Lsun, texColor.rgb, metalness, roughness, roughness, radius, F0, 1);
 	//deb = sunBRDF;
 	float dotsun = dot(Norm, Lsun);
@@ -629,41 +641,41 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 		  // }
 	  #endif
 
-	  float3 lighting = 18 * pow(lightSunDiffuse + EPS, 2.2) * sunBRDF * sunAtten * NdotL_sun;
+		float3 lighting = shadowpara * INTENSITY * pow(lightSunDiffuse + EPS, 2.2) * sunBRDF * sunAtten * NdotL_sun;
+		//deb = shadowpara;
+		float neglight = 0.0;
+		#ifndef NO_POINT_LIGHTS
+		// Point lights (Lambert)
+		for (int i = 0; i < pointLightCount; i++) {
+			float3 L = lightPosition[i] - input.viewPos;
+			float dist = length(L);
+			L = L / dist;
 
-		  float neglight = 0.0;
-		  #ifndef NO_POINT_LIGHTS
-		  // Point lights (Lambert)
-		  for (int i = 0; i < pointLightCount; i++) {
-			  float3 L = lightPosition[i] - input.viewPos;
-			  float dist = length(L);
-			  L = L / dist;
-
-			  float falloff = lightFalloffQuadratic[i] * dist * dist + lightFalloffConstant;
-			  float t = saturate(dist / 350.0);
-			  float cutoff = 1.0 - t * t * t * t;
-			  float attenuation = (falloff > 0.0) ? (1.0 / falloff) * cutoff : 0.0;
-			  float3 pointBRDF = BRDF(Norm, V, L, texColor.rgb, metalness, roughness, roughness, radius, F0, 0);
-			  float dotpoint = dot(Norm, L);
-			  float NdotL_point = max(dotpoint, 0.0);
-			  #ifdef HAS_GRASS
-			  // Apply grass-specific wrap lighting for two-sided grass rendering
+			float falloff = lightFalloffQuadratic[i] * dist * dist + lightFalloffConstant;
+			float t = saturate(dist / 350.0);
+			float cutoff = 1.0 - t * t * t * t;
+			float attenuation = (falloff > 0.0) ? (1.0 / falloff) * cutoff : 0.0;
+			float3 pointBRDF = BRDF(Norm, V, L, texColor.rgb, metalness, roughness, roughness, radius, F0, 0);
+			float dotpoint = dot(Norm, L);
+			float NdotL_point = max(dotpoint, 0.0);
+			#ifdef HAS_GRASS
+			// Apply grass-specific wrap lighting for two-sided grass rendering
 			  // if (input.color.r > 0.5) {
 
-					lambert = dotpoint * -sign(dot(V, Norm));
-					lambert = pow(saturate((lambert + w) / (1.0f + w)), n) * (n + 1) / (2 * (1 + w)) + max(0.0, -1.0 * lambert) * GRASS_BACKLIGHTING_COEFF;
-					lambert = max(0.0, lambert);
-					NdotL_point = 3.14 * lambert;
-					deb = NdotL_point;
+				lambert = dotpoint * -sign(dot(V, Norm));
+				lambert = pow(saturate((lambert + w) / (1.0f + w)), n) * (n + 1) / (2 * (1 + w)) + max(0.0, -1.0 * lambert) * GRASS_BACKLIGHTING_COEFF;
+				lambert = max(0.0, lambert);
+				NdotL_point = 3.14 * lambert;
+				//deb = NdotL_point;
 
-					// }
-						#endif
+				// }
+					#endif
 
-						lighting += 18 * (pow(max(0.0, lightDiffuse[i].rgb) + EPS, 2.2) * pointBRDF * NdotL_point) * attenuation;
-						neglight -= max(0.0, -lightDiffuse[i].r) * 1 / pow(falloff, 1 / 3.2);
+					lighting += INTENSITY * (pow(max(0.0, lightDiffuse[i].rgb) + EPS, 2.2) * pointBRDF * NdotL_point) * attenuation;
+					neglight -= max(0.0, -lightDiffuse[i].r) * 1 / pow(falloff, 1 / 3.2);
 
-						//deb += attenuation;
-					}
+					//deb += attenuation;
+				}
 				#endif
 
 					lighting += ambient;
@@ -697,25 +709,25 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 		effectiveDiffuse = materialDiffuse.rgb;
 		effectiveEmissive = input.color.rgb * input.color.rgb;
 		effectiveAlpha = materialDiffuse.a;
-}
-else
-{
+	}
+	else
+	{
 		// Mode 1: Use material constants
 		effectiveDiffuse = materialDiffuse.rgb;
 		effectiveEmissive = materialEmissive.rgb * materialEmissive.rgb;
 		effectiveAlpha = materialDiffuse.a;
-}
+	}
 
-float3 litColor = effectiveDiffuse * lighting;
-litColor += effectiveEmissive;
+	float3 litColor = effectiveDiffuse * lighting;
+	litColor += effectiveEmissive;
 
-float4 diffuse = float4(litColor, effectiveAlpha);
+	float4 diffuse = float4(litColor, effectiveAlpha);
 
-// Apply base texture with enhanced material properties
-float4 c = diffuse * texColor;
-//c = diffuse * float4(1,1,1,texColor.a);
-c.rgb = ToneMap_AgX(c.rgb, 0);
-//c.rgb = encode3(c.rgb);
+	// Apply base texture with enhanced material properties
+	float4 c = diffuse * texColor;
+	//c = diffuse * float4(1,1,1,texColor.a);
+	//c.rgb = ToneMap_AgX(c.rgb, 0);
+	c.rgb = encode3(c.rgb);
 
 #ifdef HAS_GRASS
 	// Alpha test early to improve performance
@@ -723,8 +735,9 @@ c.rgb = ToneMap_AgX(c.rgb, 0);
 #endif
 
 	// shadows DEBUG
-	c.rgb = deb;
-
+	#ifdef HAS_NORMAL
+	c.rgb = 1; //float hL = tex2D(sampTex3, parallaxUV + float2(-texel.x, 0)).a;;
+	#endif
 	// Apply fog
 	//c.rgb = lerp(fogColNear, c.rgb, input.fog);
 	return c;
