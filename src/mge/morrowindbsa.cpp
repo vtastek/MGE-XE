@@ -508,14 +508,14 @@ static void scanDirectoryForSuffixes(const std::string& basePath, const std::str
                 variants.isGrassTexture = false;
                 
                 if (suffixType == "diffparam") {
-                    variants.diffparam = "textures/" + fullRelativePath;
+                    variants.diffparam = fullRelativePath;
                     LOG::logline("DEBUG: Storing _diffparam variant for base %s: %s", baseName.c_str(), variants.diffparam.c_str());
                 } else if (suffixType == "diffparam_t") {
-                    variants.diffparam_t = "textures/" + fullRelativePath;
+                    variants.diffparam_t = fullRelativePath;
                 } else if (suffixType == "normal") {
-                    variants.normal = "textures/" + fullRelativePath;
+                    variants.normal = fullRelativePath;
                 } else if (suffixType == "param") {
-                    variants.param = "textures/" + fullRelativePath;
+                    variants.param = fullRelativePath;
                 }
                 
                 suffixFilesFound++;
@@ -887,7 +887,9 @@ IDirect3DTexture9* loadSuffixTexture(IDirect3DDevice9* dev, const TextureSuffixV
     }
     
     if (texturePath) {
-        return loadTextureExact(dev, texturePath);
+        // Add textures\\ prefix since loadTextureExact expects full path relative to Data Files
+        std::string fullPath = "textures\\" + std::string(texturePath);
+        return loadTextureExact(dev, fullPath.c_str());
     }
     
     return nullptr;
