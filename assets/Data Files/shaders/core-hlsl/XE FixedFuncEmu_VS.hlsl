@@ -11,8 +11,8 @@ matrix vertexBlendPalette[4];
 float4 vertexBlendState;
 
 #ifdef HAS_SHADOWS
-// View-to-shadow matrices (matching original distant land shadow system)
-matrix shadowViewProj[2] : register(c20);
+// World-to-shadow matrices for proper shadow coordinate calculation
+matrix shadowWorldViewProj[2] : register(c20);
 #endif
 
 // Fog parameters
@@ -141,12 +141,17 @@ VS_OUTPUT vs_main(VS_INPUT input) {
     float4 viewpos;
     float3 normal;
 
+    // Calculate world position first (needed for shadows)
+    worldpos = input.pos;
 
     // Standard transformation for non-grass
     if (vertexBlendState.x > 0.5) {
         // Skinned vertex
         viewpos = skin(input.pos, input.blendweights);
         normal = skin(float4(input.normal, 0), input.blendweights).xyz;
+        // For skinned objects, world position calculation is more complex
+        // We'll use view position for now (shadows may not be perfect on skinned objects)
+        worldpos = viewpos;
     }
     else {
         // Rigid vertex
@@ -155,11 +160,13 @@ VS_OUTPUT vs_main(VS_INPUT input) {
         // Use grass displacement for grass geometry
         float3 displacement = grassDisplacement(input.pos.xyz, input.pos.z, 0.5);
         input.pos.xy += (1 - input.color.z) * displacement.xy;
+        worldpos.xy += (1 - input.color.z) * displacement.xy;
 #else
         // Apply simple wind animation to alpha-tested geometry (trees, bushes, etc.)
         if (hasAlpha) {
             float3 displacement = grassDisplacement(input.pos.xyz, input.pos.z, 1.0);
             input.pos.xyz += displacement;
+            worldpos.xyz += displacement;
         }
 #endif
 
@@ -182,9 +189,9 @@ VS_OUTPUT vs_main(VS_INPUT input) {
     output.fog = fogMWScalar(dist);
 
 #ifdef HAS_SHADOWS
-    // Copy exactly what XE Mod Shadow.fx does
-    output.shadow0pos = mul(viewpos, shadowViewProj[0]);
-    output.shadow1pos = mul(viewpos, shadowViewProj[1]);
+    // Use world-to-shadow transformation for proper shadow coordinates
+    output.shadow0pos = mul(worldpos, shadowWorldViewProj[0]);
+    output.shadow1pos = mul(worldpos, shadowWorldViewProj[1]);
     output.shadow0pos.z = output.shadow0pos.z / output.shadow0pos.w;
     output.shadow1pos.z = output.shadow1pos.z / output.shadow1pos.w;
 #endif

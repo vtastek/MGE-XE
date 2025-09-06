@@ -1,9 +1,8 @@
-// Shader utility functions used by multiple shader subsystems
 #pragma once
 
 #include "proxydx/d3d8header.h"
-#include <string>
 
+// Shader utility functions used by multiple shader subsystems
 class ShaderUtils {
 public:
     // DXVK detection for optimization flags

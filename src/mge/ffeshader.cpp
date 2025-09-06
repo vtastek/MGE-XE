@@ -1636,6 +1636,20 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
                     return;
                 }
             }
+            
+            // Set shadow world-to-shadow matrices for proper shadow coordinate calculation
+            D3DXHANDLE hShadowWorldViewProj = hlslShader.vsConstantTable->GetConstantByName(NULL, "shadowWorldViewProj");
+            if (hShadowWorldViewProj) {
+                // Calculate world-to-shadow matrices from world matrix and shadow view-projection matrices
+                D3DXMATRIX shadowWorldViewProj[2];
+                shadowWorldViewProj[0] = worldMatrix * DistantLand::smViewproj[0];
+                shadowWorldViewProj[1] = worldMatrix * DistantLand::smViewproj[1];
+                
+                HRESULT hr = hlslShader.vsConstantTable->SetMatrixArray(device, hShadowWorldViewProj, shadowWorldViewProj, 2);
+                if (FAILED(hr)) {
+                    return;
+                }
+            }
         } catch (...) {
             // Shader invalidated during file edit - return early
             LOG::logline("!! HLSL Vertex shader constant table access failed - shader may have been edited");
@@ -1860,6 +1874,13 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
             // LOG::logline("!! shadingMode constant not found in pixel shader");
         }
         
+        // Set shadow resolution for pixel shader
+        D3DXHANDLE hShadowRcpRes = hlslShader.psConstantTable->GetConstantByName(NULL, "shadowRcpRes");
+        if (hShadowRcpRes) {
+            float shadowRcp = 1.0f / Configuration.DL.ShadowResolution;
+            hlslShader.psConstantTable->SetFloat(device, hShadowRcpRes, shadowRcp);
+        }
+        
         // Set fog color
         DWORD fogColorDword = 0x808080FF;
         device->GetRenderState(D3DRS_FOGCOLOR, &fogColorDword);
@@ -1933,6 +1954,11 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         }
         
         // Suffix texture processing is now handled per-texture in renderMorrowindHLSL()
+        
+        // Bind shadow texture to sampler 5 (matches shader expectation s5)
+        if (DistantLand::texSoftShadow) {
+            device->SetTexture(5, DistantLand::texSoftShadow);
+        }
         
         if (primaryTexture) {
             primaryTexture->Release();

@@ -124,6 +124,7 @@
     <ClCompile Include="src\mge\dlmath.cpp" />
     <ClCompile Include="src\mge\ffeshader.cpp" />
     <ClCompile Include="src\mge\distantlandhlsl.cpp" />
+    <ClCompile Include="src\mge\shader_utils.cpp" />
     <ClCompile Include="src\mge\suffix_texture_support.cpp" />
     <ClCompile Include="src\mge\hlsl_shader_manager.cpp" />
     <ClCompile Include="src\mge\async_shader_compiler.cpp" />
@@ -180,6 +181,7 @@
     <ClInclude Include="src\ipc\view.h" />
     <ClInclude Include="src\mge\api.h" />
     <ClInclude Include="src\mge\MGEAPI.h" />
+    <ClInclude Include="src\mge\shader_utils.h" />
     <ClInclude Include="src\proxydx\d3d8header.inl">
       <FileType>Document</FileType>
     </ClInclude>

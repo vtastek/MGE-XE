@@ -512,7 +512,7 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 	float3 normalVS = normalize(input.normal);
 	#ifdef HAS_SHADOWS
 	// Sample shadow map using cascaded ESM
-	float shadowpara = shadowSample(input.shadow0pos, input.shadow1pos);
+	float shadowpara = 1- shadowSample(input.shadow0pos, input.shadow1pos);
 	deb = shadowpara;
 #else
 	float shadowpara = 1.0; // No shadows
@@ -556,7 +556,7 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 				#ifdef HAS_NORMAL
 				float3 lightDirVS = -lightSunDirection;
 				float3 lightDirTS = mul(lightDirVS, TBN_T);
-				shadowpara = ParallaxSoftShadow(sampTex3, parallaxUV, lightDirTS.xy, 5.0, 0.04 * 0.75);
+				//shadowpara *= ParallaxSoftShadow(sampTex3, parallaxUV, lightDirTS.xy, 5.0, 0.04 * 0.75);
 				#endif
 			#endif
 		#else
@@ -604,7 +604,7 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 
 
 #ifndef NOLIT
-	float3 ambient = 18 * pow(lightSceneAmbient + EPS, 2.2) / PI;
+	float3 ambient = 0 * pow(lightSceneAmbient + EPS, 2.2) / PI;
 
 	// Sun light (Oren-Nayar)
 	float3 Lsun = normalize(-lightSunDirection);
@@ -722,10 +722,10 @@ c.rgb = ToneMap_AgX(c.rgb, 0);
 	c.a = (c.a - 64.0 / 255.0) / max(fwidth(c.a), 0.0001) + 0.5;
 #endif
 
-	// Apply shadows
-	c.rgb *= shadowpara;
+	// shadows DEBUG
+	c.rgb = deb;
 
 	// Apply fog
-	c.rgb = lerp(fogColNear, c.rgb, input.fog);
+	//c.rgb = lerp(fogColNear, c.rgb, input.fog);
 	return c;
 }

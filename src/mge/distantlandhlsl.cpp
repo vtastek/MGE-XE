@@ -21,7 +21,7 @@ bool DistantLandHLSL::init(IDirect3DDevice9* d) {
     device = d;
     
     // Only enable if configuration flag is set
-    enabled = Configuration.UseDistantLandHLSL;
+    enabled = Configuration.UseDistantLandHLSL || true;  // Temporary: always enable for Phase 8 testing
     
     if (!enabled) {
         LOG::logline("-- Distant Land HLSL disabled via configuration");
