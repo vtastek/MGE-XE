@@ -11,6 +11,7 @@
 #include "statusoverlay.h"
 #include "userhud.h"
 #include "videobackground.h"
+#include "imgui_manager.h"
 
 static int sceneCount;
 static bool rendertargetNormal, isHUDready;
@@ -27,6 +28,9 @@ static float crosshairTimeout;
 static RenderedState rs;
 static FragmentState frs;
 static LightState lightrs;
+
+static HWND gameWindow = nullptr;
+static bool imguiInitialized = false;
 
 static void initOnLoad();
 static bool detectMenu(const D3DMATRIX* m);
@@ -195,6 +199,56 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
 
         // Main menu background video
         VideoPatch::monitor(realDevice);
+    }
+
+    // Initialize ImGui on first Present call
+    if (!imguiInitialized) {
+        // Get window handle from device creation parameters since Present HWND is null
+        D3DDEVICE_CREATION_PARAMETERS creationParams;
+        if (SUCCEEDED(realDevice->GetCreationParameters(&creationParams))) {
+            gameWindow = creationParams.hFocusWindow;
+            LOG::logline(">> Got HWND from device creation params: %p", gameWindow);
+            if (gameWindow != nullptr) {
+                LOG::logline(">> Attempting to initialize ImGui with HWND: %p, device: %p", gameWindow, realDevice);
+                if (ImGuiManager::Initialize(gameWindow, realDevice)) {
+                    imguiInitialized = true;
+                    LOG::logline(">> ImGui integration initialized successfully");
+                } else {
+                    LOG::logline(">> ImGui initialization failed");
+                }
+            } else {
+                LOG::logline(">> Device creation HWND is null");
+            }
+        } else {
+            LOG::logline(">> Failed to get device creation parameters");
+        }
+    }
+
+    // Handle F11 key to toggle ImGui interface
+    static bool f11Pressed = false;
+    static int debugCounter = 0;
+    if (imguiInitialized) {
+        bool f11State = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
+        if (f11State && !f11Pressed) {
+            LOG::logline(">> F11 key pressed, toggling PCF interface");
+            ImGuiManager::TogglePCFInterface();
+            f11Pressed = true;
+        } else if (!f11State) {
+            f11Pressed = false;
+        }
+
+        ImGuiManager::NewFrame();
+        ImGuiManager::Render();
+        
+        // Debug: Log every 300 frames that ImGui is active
+        if (++debugCounter % 300 == 0) {
+            LOG::logline(">> ImGui rendering (frame %d)", debugCounter);
+        }
+    } else {
+        // Log every 60 frames that ImGui is not initialized
+        if (++debugCounter % 60 == 0) {
+            LOG::logline(">> ImGui not initialized (frame %d)", debugCounter);
+        }
     }
 
     // Reset scene identifiers
@@ -487,6 +541,10 @@ ULONG _stdcall MGEProxyDevice::Release() {
     ULONG r = ProxyDevice::Release();
 
     if (r == 0) {
+        if (imguiInitialized) {
+            ImGuiManager::Shutdown();
+            imguiInitialized = false;
+        }
         DistantLand::release();
         MGEhud::release();
         StatusOverlay::release();
