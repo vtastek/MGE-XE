@@ -5,7 +5,7 @@
 //---------------------------- PBR ----------------------------
 #define PI 3.14159
 #define PI_DIV2 1.57079632679
-#define INTENSITY 18.0
+#define INTENSITY 10.0
 
 #ifdef HAS_GRASS
 // Grass lighting constants
@@ -103,7 +103,7 @@ float3 OrenNayarDiffuse(float3 L, float3 V, float3 N, float roughness, float3 al
 	return (A + B) * albedo * kD / PI;
 }
 
-float3 BRDF(float3 N, float3 V, float3 L, float3 albedo, float metalness, float roughness, float roughnessPrime, float radius, float3 F0, int isOrenNayar)
+float3 BRDF(float3 N, float3 V, float3 L, float3 albedo, float metalness, float roughness, float roughnessPrime, float radius, float3 F0, int isOrenNayar, float shadows)
 {
 	float3 H = normalize(V + L);
 	float NdotH = max(dot(N, H), 0.0);
@@ -120,7 +120,7 @@ float3 BRDF(float3 N, float3 V, float3 L, float3 albedo, float metalness, float 
 	float amask = step(0.05, dot(albedo, 0.33));
 	float3 Is = NDF * G * F * amask;
 	float3 Id = isOrenNayar != 0 ? OrenNayarDiffuse(L, V, N, roughness, albedo, kD) : LambertDiffuse(albedo, kD);
-	return Id + Is;
+	return Id + Is * max(0.0,shadows-0.09);
 }
 
 //------------------------------------------------------------
@@ -179,12 +179,7 @@ sampler sampTex4 : register(s4) = sampler_state{ texture = <tex4>; }; // Param m
 #if defined(HAS_SHADOWS)
 sampler sampShadow : register(s5) = sampler_state{ texture = <tex5>; }; // Shadow map
 
-// Shadow constants
-static const int shadowCascades = 2;
-static const float shadowCascadeSize = 1.0 / shadowCascades;
-static const float ESM_c = 60.0;
-static const float ESM_bias = 2e-3 * ESM_c;
-static const float ESM_scale = 32768.0;
+
 
 // Shadow resolution parameter (will be set via shader constants)
 float shadowRcpRes : register(c10);
@@ -266,9 +261,9 @@ float3 ToneMap_AgX(float3 linCol, int lookMode)
 	}
 	else if (lookMode == 2) // "Punchy"
 	{
-		slope = (1.0);
-		power = (1.35);
-		sat = 1.4;
+        slope = (1.1);
+        power = (1.0);
+        sat = 1.3;
 	}
 
 	val = pow(val * slope + offset, power);
@@ -329,7 +324,6 @@ float3 PBRNeutralToneMapping(float3 color) {
 #define INPUT_MAX 16.0
 #define OUTPUT_MAX 1.0
 #define A (20.0 / 21.0)  // Rational function parameter for smooth transition
-
 
 float encode(float x) {
 
@@ -472,6 +466,24 @@ float ParallaxSoftShadow(
 #endif
 
 #if defined(HAS_SHADOWS)
+
+// Shadow constants
+static const int shadowCascades = 2;
+static const float shadowCascadeSize = 1.0 / shadowCascades;
+
+// Static mode: compiled constants, cannot be overridden
+static const float ESM_c = 120.0;      // ESM sensitivity
+static const float ESM_bias = -1.72;   // ESM bias/threshold  
+static const float ESM_scale = 32768.0; // ESM scale (optimal tuned value)
+
+// PCF parameters - configurable filter size and penumbra control
+static const float PCF_filterSize = 3.0;        // Base filter size in texels
+static const float PCF_penumbraScale = 1.0;     // Scale factor for distance-based penumbra
+static const float PCF_minPenumbra = 2.0;       // Minimum penumbra size
+static const float PCF_maxPenumbra = 5.0;      // Maximum penumbra size
+static const float PCF_bias = 0.0015;           // Depth bias to prevent acne
+
+
 //------------------------------------------------------------
 // Shadow Sampling Functions
 
@@ -480,31 +492,93 @@ float4 mapShadowToAtlas(float2 t, int layer) {
 	return float4(t.x * shadowCascadeSize + layer * shadowCascadeSize, t.y, 0, 0);
 }
 
-// 2 layer cascade ortho ESM lookup
+// PCF shadow filtering with distance-based penumbra
+float shadowSamplePCF(float4 shadowPos, float2 shadowUV, int cascade, float receiverDepth) {
+	// Calculate blocker distance for penumbra scaling
+	float blockerDistance = 0.0;
+	float blockerCount = 0.0;
+	
+	// Simple blocker search in 3x3 region
+	for (int x = -1; x <= 1; x++) {
+		for (int y = -1; y <= 1; y++) {
+			float2 offset = float2(x, y) * shadowRcpRes;
+			float sampledDepth = tex2Dlod(sampShadow, mapShadowToAtlas(shadowUV + offset, cascade)).r/ESM_scale;
+			
+			if (-sampledDepth < receiverDepth - PCF_bias) {
+				blockerDistance += sampledDepth;
+				blockerCount += 1.0;
+			}
+		}
+	}
+	
+	if (blockerCount == 0.0) return 0.0; // No blockers = no shadow
+	
+	// Average blocker depth
+	blockerDistance /= blockerCount;
+	
+	// Calculate penumbra size based on distance ratio
+	// Closer blockers = smaller penumbra (harder shadows)
+	// Further blockers = larger penumbra (softer shadows)  
+	float distanceRatio = (receiverDepth - blockerDistance) / max(blockerDistance, 0.001);
+	float penumbraSize = clamp(PCF_minPenumbra + PCF_penumbraScale * distanceRatio, 
+							   PCF_minPenumbra, PCF_maxPenumbra);
+	
+	// PCF filtering with calculated penumbra size
+	float shadow = 0.0;
+	int sampleCount = 0;
+	
+	// Use adaptive sample count based on penumbra size
+	int maxSamples = (penumbraSize > 4.0) ? 5 : 3;
+	if(cascade == 1)
+		penumbraSize = 0.8;
+	if (cascade == 1)
+		maxSamples = 2;
+
+	
+	for (int x = -maxSamples; x <= maxSamples; x++) {
+		for (int y = -maxSamples; y <= maxSamples; y++) {
+			float2 offset = float2(x, y) * shadowRcpRes * penumbraSize;
+			float sampledDepth = tex2Dlod(sampShadow, mapShadowToAtlas(shadowUV + offset, cascade)).r/ESM_scale;
+			
+			shadow += (sampledDepth >= receiverDepth - PCF_bias * 2) ? 1.0 : 0.0;
+			sampleCount++;
+		}
+	}
+	
+	// Return shadow factor (0 = fully shadowed, 1 = fully lit)
+	return shadow / sampleCount;
+}
+
+// 2 layer cascade PCF lookup with distance-based penumbra
 float shadowSample(float4 shadow0pos, float4 shadow1pos) {
 	// Clip space margin of 4 texels, to prevent bleeding from the filter kernel + adjacent textures  
 	float3 atlasMargin = float3(1.0 - 2.0 * 4.0 * shadowRcpRes, 1.0 - 2.0 * 4.0 * shadowRcpRes, 1.0);
 
-	float dz = 1e-6;  // Default to unshadowed
-
 	if (all(saturate(atlasMargin - abs(shadow0pos.xyz)))) {
 		// Layer 0, inner (near shadows) - higher priority
 		float2 shadowUV = (0.5 + 0.5 * shadowRcpRes) + float2(0.5, -0.5) * shadow0pos.xy;
-		dz = tex2Dlod(sampShadow, mapShadowToAtlas(shadowUV, 0)).r / ESM_scale - shadow0pos.z;
+		float receiverDepth = shadow0pos.z;
+		
+		// PCF with distance-based penumbra - returns shadow factor (0=shadowed, 1=lit)
+		float shadowFactor = shadowSamplePCF(shadow0pos, shadowUV, 0, receiverDepth);
+		
+		return shadowFactor;
 	}
 	else if (all(saturate(atlasMargin - abs(shadow1pos.xyz)))) {
 		// Layer 1 (far shadows) - only if not in near cascade
 		float2 shadowUV = (0.5 + 0.5 * shadowRcpRes) + float2(0.5, -0.5) * shadow1pos.xy;
-		dz = tex2Dlod(sampShadow, mapShadowToAtlas(shadowUV, 1)).r / ESM_scale - shadow1pos.z;
+		float receiverDepth = shadow1pos.z;
+		
+		// PCF with distance-based penumbra - returns shadow factor (0=shadowed, 1=lit)
+		
+		float shadowFactor = shadowSamplePCF(shadow1pos, shadowUV, 1, receiverDepth);
+
+		return shadowFactor;
 	}
 	else {
 		// Outside both cascades - no shadow opacity
 		return 0.0;
 	}
-
-	// ESM shadow filtering - matches Effect system calculation
-	// Returns shadow opacity: 1.0 for shadowed, 0.0 for lit
-	return 1.0 - saturate(exp(ESM_c * dz + ESM_bias));
 }
 #endif
 
@@ -517,12 +591,9 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 	float2 parallaxUV = input.texcoord;
 	float3 normalVS = normalize(input.normal);
 	#ifdef HAS_SHADOWS
-	// Sample shadow map using cascaded ESM (returns shadow opacity)
-	float shadowOpacity = shadowSample(input.shadow0pos, input.shadow1pos);
-	// Convert shadow opacity to light attenuation for lighting calculations
-	float shadows = saturate(1.0 - 35 * shadowOpacity);
+	float shadows = shadowSample(input.shadow0pos, input.shadow1pos);
 	float shadowpara = 1.0;
-	//deb = shadows;
+	deb = shadows;
 #else
 	float shadows = 1.0; // No shadows - fully lit
 	float shadowpara = 1.0;
@@ -566,9 +637,8 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 				#ifdef HAS_NORMAL
 				float3 lightDirVS = -lightSunDirection;
 				float3 lightDirTS = mul(lightDirVS, TBN_T);
-				shadowpara = ParallaxSoftShadow(sampTex3, parallaxUV, lightDirTS.xy, 5.0, 0.04 * 0.75);
+				shadowpara = ParallaxSoftShadow(sampTex3, input.texcoord, lightDirTS.xy, 5.0, 0.04 * 0.75);
 				shadows *= shadowpara;
-				deb = normalVS;
 				#endif
 			#endif
 		#else
@@ -614,21 +684,18 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 	ao = 1.0;                // Full ambient occlusion
 #endif
 
-
 #ifndef NOLIT
-	float3 ambient = INTENSITY * 0.1 * pow(lightSceneAmbient + EPS, 2.2) / PI;
+	float3 ambient = INTENSITY * pow(lightSceneAmbient + EPS, 2.2) / PI;
 
 	// Sun light (Oren-Nayar)
 	float3 Lsun = normalize(-lightSunDirection);
 	float sunAtten = shadows;
-	float3 sunBRDF = BRDF(Norm, V, Lsun, texColor.rgb, metalness, roughness, roughness, radius, F0, 1);
-	//deb = sunBRDF;
+	float3 sunBRDF = BRDF(Norm, V, Lsun, texColor.rgb, metalness, roughness, roughness, radius, F0, 1, shadows);
+	//deb = sunAtten;
 	float dotsun = dot(Norm, Lsun);
 	float NdotL_sun = max(dotsun, 0.0);
 
-
-
-#ifdef HAS_GRASS
+	#ifdef HAS_GRASS
 	// Apply grass-specific wrap lighting for two-sided grass rendering
 	// if (input.color.r > 0.5) {
 		  float w = GRASS_WRAP_LIGHTING_COEFF_W;
@@ -639,49 +706,51 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 		  NdotL_sun = lambert;
 
 		  // }
-	  #endif
+	#endif
 
-		float3 lighting = shadowpara * INTENSITY * pow(lightSunDiffuse + EPS, 2.2) * sunBRDF * sunAtten * NdotL_sun;
-		//deb = shadowpara;
-		float neglight = 0.0;
-		#ifndef NO_POINT_LIGHTS
-		// Point lights (Lambert)
-		for (int i = 0; i < pointLightCount; i++) {
-			float3 L = lightPosition[i] - input.viewPos;
-			float dist = length(L);
-			L = L / dist;
+	float3 lighting = shadowpara * INTENSITY * pow(lightSunDiffuse + EPS, 2.2) * sunBRDF * sunAtten * NdotL_sun;
+	//deb = shadowpara;
+	float neglight = 0.0;
+	#ifndef NO_POINT_LIGHTS
+	// Point lights (Lambert)
+	for (int i = 0; i < pointLightCount; i++) 
+	{
+		float3 L = lightPosition[i] - input.viewPos;
+		float dist = length(L);
+		L = L / dist;
 
-			float falloff = lightFalloffQuadratic[i] * dist * dist + lightFalloffConstant;
-			float t = saturate(dist / 350.0);
-			float cutoff = 1.0 - t * t * t * t;
-			float attenuation = (falloff > 0.0) ? (1.0 / falloff) * cutoff : 0.0;
-			float3 pointBRDF = BRDF(Norm, V, L, texColor.rgb, metalness, roughness, roughness, radius, F0, 0);
-			float dotpoint = dot(Norm, L);
-			float NdotL_point = max(dotpoint, 0.0);
-			#ifdef HAS_GRASS
+		float falloff = lightFalloffQuadratic[i] * dist * dist + lightFalloffConstant;
+		float t = saturate(dist / 350.0);
+		float cutoff = 1.0 - t * t * t * t;
+		float attenuation = (falloff > 0.0) ? (1.0 / falloff) * cutoff : 0.0;
+		float3 pointBRDF = BRDF(Norm, V, L, texColor.rgb, metalness, roughness, roughness, radius, F0, 0, 1.0);
+		float dotpoint = dot(Norm, L);
+		float NdotL_point = max(dotpoint, 0.0);
+		
+		#ifdef HAS_GRASS
 			// Apply grass-specific wrap lighting for two-sided grass rendering
-			  // if (input.color.r > 0.5) {
+		    // if (input.color.r > 0.5) {
 
-				lambert = dotpoint * -sign(dot(V, Norm));
-				lambert = pow(saturate((lambert + w) / (1.0f + w)), n) * (n + 1) / (2 * (1 + w)) + max(0.0, -1.0 * lambert) * GRASS_BACKLIGHTING_COEFF;
-				lambert = max(0.0, lambert);
-				NdotL_point = 3.14 * lambert;
-				//deb = NdotL_point;
+			lambert = dotpoint * -sign(dot(V, Norm));
+			lambert = pow(saturate((lambert + w) / (1.0f + w)), n) * (n + 1) / (2 * (1 + w)) + max(0.0, -1.0 * lambert) * GRASS_BACKLIGHTING_COEFF;
+			lambert = max(0.0, lambert);
+			NdotL_point = 3.14 * lambert;
+			//deb = NdotL_point;
 
-				// }
-					#endif
+			// }
+		#endif
 
-					lighting += INTENSITY * (pow(max(0.0, lightDiffuse[i].rgb) + EPS, 2.2) * pointBRDF * NdotL_point) * attenuation;
-					neglight -= max(0.0, -lightDiffuse[i].r) * 1 / pow(falloff, 1 / 3.2);
+		lighting += INTENSITY * (pow(max(0.0, lightDiffuse[i].rgb) + EPS, 2.2) * pointBRDF * NdotL_point) * attenuation;
+		neglight -= max(0.0, -lightDiffuse[i].r) * 1 / pow(falloff, 1 / 3.2);
 
-					//deb += attenuation;
-				}
-				#endif
+		//deb += attenuation;
+	}
+	#endif
 
-					lighting += ambient;
-					neglight = max(0.0, 1 - 0.95 * saturate(-neglight));
-					lighting *= neglight;
-				#else
+	lighting += ambient;
+	neglight = max(0.0, 1 - 0.95 * saturate(-neglight));
+	lighting *= neglight;
+#else
 	// Unlit shader - no lighting calculations
 	float3 lighting = float3(1.0, 1.0, 1.0);
 #endif
@@ -700,7 +769,7 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 		#else
 		effectiveDiffuse = sqrt(input.color.rgb);
 		#endif
-		effectiveEmissive = materialEmissive.rgb * materialEmissive.rgb;
+		effectiveEmissive = materialEmissive.rgb * materialEmissive.rgb * 5;
 		effectiveAlpha = input.color.a;
 	}
 	 else if (materialMode == 3)
@@ -727,6 +796,7 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 	float4 c = diffuse * texColor;
 	//c = diffuse * float4(1,1,1,texColor.a);
 	//c.rgb = ToneMap_AgX(c.rgb, 0);
+	//c.rgb = 0.16;
 	c.rgb = encode3(c.rgb);
 
 #ifdef HAS_GRASS
@@ -735,10 +805,9 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 #endif
 
 	// shadows DEBUG
-	#ifdef HAS_NORMAL
-	c.rgb = 1; //float hL = tex2D(sampTex3, parallaxUV + float2(-texel.x, 0)).a;;
-	#endif
-	// Apply fog
-	//c.rgb = lerp(fogColNear, c.rgb, input.fog);
+	//c.rgb = deb; 
+	
+	// Apply fog --will enable when all rendering goes through HLSL with unified fogging.
+	//c.rgb = lerp(fogColNear, c.rgb , saturate(exp(-0.0002 * length(input.viewPos))));
 	return c;
 }

@@ -7,7 +7,8 @@ matrix proj;
 matrix worldview;
 matrix world;
 matrix view;
-matrix vertexBlendPalette[4];
+matrix vertexBlendPalette[4];      // View-space bone transforms (world * view)
+matrix vertexBlendPaletteWorld[4]; // World-space bone transforms (world only)
 float4 vertexBlendState;
 
 #ifdef HAS_SHADOWS
@@ -57,7 +58,7 @@ struct VS_OUTPUT {
 
 float saturate(float x) { return max(0.0, min(x, 1.0)); }
 
-// Skinning function
+// Skinning function for view space
 float4 skin(float4 pos, float4 blend) {
     float blendState = vertexBlendState.x;
 
@@ -82,6 +83,43 @@ float4 skin(float4 pos, float4 blend) {
     return viewpos;
 }
 
+// Skinning function for world space
+float4 skinWorld(float4 pos, float4 blend) {
+    float blendState = vertexBlendState.x;
+
+    // Calculate missing blend weights
+    if (blendState == 1)
+        blend.y = 1 - blend.x;
+    else if (blendState == 2)
+        blend.z = 1 - (blend.x + blend.y);
+    else if (blendState == 3)
+        blend.w = 1 - (blend.x + blend.y + blend.z);
+
+    // Weighted blend of world matrices - ROW MAJOR (pos * matrix)
+    float4 worldpos = mul(pos, vertexBlendPaletteWorld[0]) * blend.x;
+
+    if (blendState >= 1)
+        worldpos += mul(pos, vertexBlendPaletteWorld[1]) * blend.y;
+    if (blendState >= 2)
+        worldpos += mul(pos, vertexBlendPaletteWorld[2]) * blend.z;
+    if (blendState >= 3)
+        worldpos += mul(pos, vertexBlendPaletteWorld[3]) * blend.w;
+
+    // Check if the result is valid (not NaN or extremely large)
+    // If invalid, fallback to approximation using view space
+    // if (any(isnan(worldpos.xyz)) || length(worldpos.xyz) > 100000.0) {
+        // // Fallback: transform view position back to approximate world space
+        // float4 viewpos = skin(pos, blend);
+        // float4x4 viewInverse = transpose(view);
+        // worldpos = mul(viewpos, viewInverse);
+        // worldpos.xyz += view._41_42_43; // Add camera translation back
+    // }
+
+    return worldpos;
+}
+
+
+
 
 // Fog calculation
 float fogMWScalar(float dist) {
@@ -102,7 +140,7 @@ float bnoise(float x) {
 // Grass displacement function based on wind and player proximity
 float3 grassDisplacement(float3 worldpos, float h, float speed) {
     float v = length(windVec);
-    float2 displace = 2 * v * 0.001 + 0.5;
+    float2 displace = 2 * v * 0.1 + 0.05;
     float2 harmonics = 0;
 
     float gtime = time * 0.1 * speed;
@@ -128,7 +166,7 @@ float3 grassDisplacement(float3 worldpos, float h, float speed) {
     stomp.z = 0;
 #endif
 
-    return float3(saturate(0.01 * (abs(h))) * speed * 5 * (harmonics.xy * displace.xy + stomp.xy), 0);
+    return float3(saturate(0.001 * (abs(h))) * speed * 5 * (harmonics.xy + stomp.xy), 0);
 }
 
 //------------------------------------------------------------
@@ -142,33 +180,36 @@ VS_OUTPUT vs_main(VS_INPUT input) {
     float3 normal;
 
     // Calculate world position first (needed for shadows)
-    worldpos = input.pos;
+    worldpos = float4(input.pos.xyz, 1);
+	
+	// if(vertexBlendState.x > 0.5)
+		// input.pos.xyz += 100; 
 
     // Standard transformation for non-grass
     if (vertexBlendState.x > 0.5) {
         // Skinned vertex
         viewpos = skin(input.pos, input.blendweights);
         normal = skin(float4(input.normal, 0), input.blendweights).xyz;
-        // For skinned objects, world position calculation is more complex
-        // We'll use view position for now (shadows may not be perfect on skinned objects)
-        worldpos = viewpos;
+        // Calculate proper world position for skinned objects using world-space bone transforms
+        // don't calculate, the difference is small, negligable for shadows.
+		//worldpos = skinWorld(input.pos, input.blendweights);
     }
     else {
         // Rigid vertex
 
-#ifdef HAS_GRASS
+	#ifdef HAS_GRASS
         // Use grass displacement for grass geometry
-        float3 displacement = grassDisplacement(input.pos.xyz, input.pos.z, 0.5);
+        float3 displacement = grassDisplacement(input.pos.xyz, input.pos.z, 2.5);
         input.pos.xy += (1 - input.color.z) * displacement.xy;
-        worldpos.xy += (1 - input.color.z) * displacement.xy;
-#else
+       // worldpos.xy += (1 - input.color.z) * displacement.xy;
+	#else
         // Apply simple wind animation to alpha-tested geometry (trees, bushes, etc.)
-        if (hasAlpha) {
+        if (hasAlpha && vertexBlendState.x < 0.5) {
             float3 displacement = grassDisplacement(input.pos.xyz, input.pos.z, 1.0);
             input.pos.xyz += displacement;
-            worldpos.xyz += displacement;
+           // worldpos.xyz += displacement;
         }
-#endif
+	#endif
 
         viewpos = mul(input.pos, worldview);
         normal = mul(float4(input.normal, 0), worldview).xyz;
