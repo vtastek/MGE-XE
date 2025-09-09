@@ -476,12 +476,12 @@ static const float ESM_c = 120.0;      // ESM sensitivity
 static const float ESM_bias = -1.72;   // ESM bias/threshold  
 static const float ESM_scale = 32768.0; // ESM scale (optimal tuned value)
 
-// PCF parameters - configurable filter size and penumbra control
-static const float PCF_filterSize = 3.0;        // Base filter size in texels
-static const float PCF_penumbraScale = 1.0;     // Scale factor for distance-based penumbra
-static const float PCF_minPenumbra = 2.0;       // Minimum penumbra size
-static const float PCF_maxPenumbra = 5.0;      // Maximum penumbra size
-static const float PCF_bias = 0.0015;           // Depth bias to prevent acne
+// PCF parameters - now configurable via shader constants (set by C++ code)
+extern float PCF_filterSize : PCFFILTERSIZE;        // Base filter size in texels
+extern float PCF_penumbraScale : PCFPENUMBRASCALE;  // Scale factor for distance-based penumbra
+extern float PCF_minPenumbra : PCFMINPENUMBRA;      // Minimum penumbra size
+extern float PCF_maxPenumbra : PCFMAXPENUMBRA;      // Maximum penumbra size
+extern float PCF_bias : PCFBIAS;                    // Depth bias to prevent acne
 
 
 //------------------------------------------------------------
@@ -493,10 +493,16 @@ float4 mapShadowToAtlas(float2 t, int layer) {
 }
 
 // PCF shadow filtering with distance-based penumbra
-float shadowSamplePCF(float4 shadowPos, float2 shadowUV, int cascade, float receiverDepth) {
+float shadowSamplePCF(float4 shadowPos, float2 shadowUV, int cascade, float receiverDepth, float ndotlgeo) {
 	// Calculate blocker distance for penumbra scaling
 	float blockerDistance = 0.0;
 	float blockerCount = 0.0;
+
+	float depth_bias = lerp(PCF_bias, 0.0, ndotlgeo);
+	
+	depth_bias = PCF_bias*tan(acos(ndotlgeo)); // cosTheta is dot( n,l ), clamped between 0 and 1
+	depth_bias = clamp(PCF_bias * step(0.4, ndotlgeo), 0,0.01);
+	depth_bias = lerp(PCF_bias, 0.005 + PCF_bias * 5.0, step(0.66, ndotlgeo));
 	
 	// Simple blocker search in 3x3 region
 	for (int x = -1; x <= 1; x++) {
@@ -504,7 +510,7 @@ float shadowSamplePCF(float4 shadowPos, float2 shadowUV, int cascade, float rece
 			float2 offset = float2(x, y) * shadowRcpRes;
 			float sampledDepth = tex2Dlod(sampShadow, mapShadowToAtlas(shadowUV + offset, cascade)).r/ESM_scale;
 			
-			if (-sampledDepth < receiverDepth - PCF_bias) {
+			if (-sampledDepth < receiverDepth - depth_bias) {
 				blockerDistance += sampledDepth;
 				blockerCount += 1.0;
 			}
@@ -540,7 +546,7 @@ float shadowSamplePCF(float4 shadowPos, float2 shadowUV, int cascade, float rece
 			float2 offset = float2(x, y) * shadowRcpRes * penumbraSize;
 			float sampledDepth = tex2Dlod(sampShadow, mapShadowToAtlas(shadowUV + offset, cascade)).r/ESM_scale;
 			
-			shadow += (sampledDepth >= receiverDepth - PCF_bias * 2) ? 1.0 : 0.0;
+			shadow += (sampledDepth >= receiverDepth - depth_bias * 3) ? 1.0 : 0.0;
 			sampleCount++;
 		}
 	}
@@ -550,7 +556,7 @@ float shadowSamplePCF(float4 shadowPos, float2 shadowUV, int cascade, float rece
 }
 
 // 2 layer cascade PCF lookup with distance-based penumbra
-float shadowSample(float4 shadow0pos, float4 shadow1pos) {
+float shadowSample(float4 shadow0pos, float4 shadow1pos, float ndotlgeo) {
 	// Clip space margin of 4 texels, to prevent bleeding from the filter kernel + adjacent textures  
 	float3 atlasMargin = float3(1.0 - 2.0 * 4.0 * shadowRcpRes, 1.0 - 2.0 * 4.0 * shadowRcpRes, 1.0);
 
@@ -560,7 +566,7 @@ float shadowSample(float4 shadow0pos, float4 shadow1pos) {
 		float receiverDepth = shadow0pos.z;
 		
 		// PCF with distance-based penumbra - returns shadow factor (0=shadowed, 1=lit)
-		float shadowFactor = shadowSamplePCF(shadow0pos, shadowUV, 0, receiverDepth);
+		float shadowFactor = shadowSamplePCF(shadow0pos, shadowUV, 0, receiverDepth, ndotlgeo);
 		
 		return shadowFactor;
 	}
@@ -571,7 +577,7 @@ float shadowSample(float4 shadow0pos, float4 shadow1pos) {
 		
 		// PCF with distance-based penumbra - returns shadow factor (0=shadowed, 1=lit)
 		
-		float shadowFactor = shadowSamplePCF(shadow1pos, shadowUV, 1, receiverDepth);
+		float shadowFactor = shadowSamplePCF(shadow1pos, shadowUV, 1, receiverDepth, ndotlgeo);
 
 		return shadowFactor;
 	}
@@ -590,8 +596,14 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 	float3 deb = 0;
 	float2 parallaxUV = input.texcoord;
 	float3 normalVS = normalize(input.normal);
+
 	#ifdef HAS_SHADOWS
-	float shadows = shadowSample(input.shadow0pos, input.shadow1pos);
+	float ndotlgeo = 1;
+	#ifndef NOLIT
+	ndotlgeo = dot(normalVS, -lightSunDirection);
+	#endif
+	
+	float shadows = shadowSample(input.shadow0pos, input.shadow1pos, ndotlgeo);
 	float shadowpara = 1.0;
 	deb = shadows;
 #else

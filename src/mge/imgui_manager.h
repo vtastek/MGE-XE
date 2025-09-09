@@ -23,6 +23,11 @@ public:
     static int GetPCFSampleCount();
     static float GetPCFBiasConstant();
     static float GetPCFBiasSlope();
+    static float GetPCFFilterSize();
+    static float GetPCFPenumbraScale(); 
+    static float GetPCFMinPenumbra();
+    static float GetPCFMaxPenumbra();
+    static float GetPCFBias();
     static bool GetShowPCFInterface();
     static void TogglePCFInterface();
 
@@ -37,4 +42,9 @@ private:
     static int pcfSampleCount;
     static float pcfBiasConstant;
     static float pcfBiasSlope;
+    static float pcfFilterSize;        // Base filter size in texels (maps to PCF_filterSize)
+    static float pcfPenumbraScale;     // Scale factor for distance-based penumbra  
+    static float pcfMinPenumbra;       // Minimum penumbra size
+    static float pcfMaxPenumbra;       // Maximum penumbra size
+    static float pcfBias;              // Depth bias to prevent acne
 };

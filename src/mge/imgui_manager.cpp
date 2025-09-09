@@ -12,6 +12,11 @@ float ImGuiManager::pcfFilterRadius = 2.0f;
 int ImGuiManager::pcfSampleCount = 16;
 float ImGuiManager::pcfBiasConstant = 0.001f;
 float ImGuiManager::pcfBiasSlope = 1.0f;
+float ImGuiManager::pcfFilterSize = 3.0f;        // Base filter size in texels
+float ImGuiManager::pcfPenumbraScale = 1.0f;     // Scale factor for distance-based penumbra
+float ImGuiManager::pcfMinPenumbra = 2.0f;       // Minimum penumbra size 
+float ImGuiManager::pcfMaxPenumbra = 5.0f;       // Maximum penumbra size
+float ImGuiManager::pcfBias = 0.0015f;           // Depth bias to prevent acne
 
 bool ImGuiManager::Initialize(HWND hwnd, IDirect3DDevice9* device) {
     if (initialized) {
@@ -152,6 +157,30 @@ void ImGuiManager::RenderPCFFilteringInterface() {
         }
 
         ImGui::Separator();
+        ImGui::Text("PCF Shadow Parameters");
+        
+        // New PCF parameters that map to shader constants
+        if (ImGui::SliderFloat("Filter Size", &pcfFilterSize, 1.0f, 8.0f, "%.1f")) {
+            LOG::logline(">> PCF Filter Size: %.1f", pcfFilterSize);
+        }
+        
+        if (ImGui::SliderFloat("Penumbra Scale", &pcfPenumbraScale, 0.1f, 3.0f, "%.2f")) {
+            LOG::logline(">> PCF Penumbra Scale: %.2f", pcfPenumbraScale);
+        }
+        
+        if (ImGui::SliderFloat("Min Penumbra", &pcfMinPenumbra, 0.5f, 5.0f, "%.1f")) {
+            LOG::logline(">> PCF Min Penumbra: %.1f", pcfMinPenumbra);
+        }
+        
+        if (ImGui::SliderFloat("Max Penumbra", &pcfMaxPenumbra, 2.0f, 15.0f, "%.1f")) {
+            LOG::logline(">> PCF Max Penumbra: %.1f", pcfMaxPenumbra);
+        }
+        
+        if (ImGui::SliderFloat("Depth Bias", &pcfBias, 0.0f, 0.01f, "%.4f")) {
+            LOG::logline(">> PCF Depth Bias: %.4f", pcfBias);
+        }
+
+        ImGui::Separator();
         
         // Preset buttons
         if (ImGui::Button("Soft Shadows")) {
@@ -159,6 +188,11 @@ void ImGuiManager::RenderPCFFilteringInterface() {
             pcfSampleCount = 24;
             pcfBiasConstant = 0.002f;
             pcfBiasSlope = 1.5f;
+            pcfFilterSize = 4.0f;
+            pcfPenumbraScale = 1.5f;
+            pcfMinPenumbra = 3.0f;
+            pcfMaxPenumbra = 8.0f;
+            pcfBias = 0.002f;
             LOG::logline(">> Applied Soft Shadows preset");
         }
         ImGui::SameLine();
@@ -168,6 +202,11 @@ void ImGuiManager::RenderPCFFilteringInterface() {
             pcfSampleCount = 8;
             pcfBiasConstant = 0.0005f;
             pcfBiasSlope = 0.8f;
+            pcfFilterSize = 2.0f;
+            pcfPenumbraScale = 0.5f;
+            pcfMinPenumbra = 1.0f;
+            pcfMaxPenumbra = 3.0f;
+            pcfBias = 0.001f;
             LOG::logline(">> Applied Sharp Shadows preset");
         }
 
@@ -176,6 +215,11 @@ void ImGuiManager::RenderPCFFilteringInterface() {
             pcfSampleCount = 36;
             pcfBiasConstant = 0.0015f;
             pcfBiasSlope = 1.2f;
+            pcfFilterSize = 3.5f;
+            pcfPenumbraScale = 1.2f;
+            pcfMinPenumbra = 2.5f;
+            pcfMaxPenumbra = 6.0f;
+            pcfBias = 0.0015f;
             LOG::logline(">> Applied High Quality preset");
         }
         ImGui::SameLine();
@@ -185,6 +229,11 @@ void ImGuiManager::RenderPCFFilteringInterface() {
             pcfSampleCount = 12;
             pcfBiasConstant = 0.001f;
             pcfBiasSlope = 1.0f;
+            pcfFilterSize = 2.5f;
+            pcfPenumbraScale = 0.8f;
+            pcfMinPenumbra = 1.5f;
+            pcfMaxPenumbra = 4.0f;
+            pcfBias = 0.0012f;
             LOG::logline(">> Applied Performance preset");
         }
 
@@ -201,6 +250,11 @@ float ImGuiManager::GetPCFFilterRadius() { return pcfFilterRadius; }
 int ImGuiManager::GetPCFSampleCount() { return pcfSampleCount; }
 float ImGuiManager::GetPCFBiasConstant() { return pcfBiasConstant; }
 float ImGuiManager::GetPCFBiasSlope() { return pcfBiasSlope; }
+float ImGuiManager::GetPCFFilterSize() { return pcfFilterSize; }
+float ImGuiManager::GetPCFPenumbraScale() { return pcfPenumbraScale; }
+float ImGuiManager::GetPCFMinPenumbra() { return pcfMinPenumbra; }
+float ImGuiManager::GetPCFMaxPenumbra() { return pcfMaxPenumbra; }
+float ImGuiManager::GetPCFBias() { return pcfBias; }
 bool ImGuiManager::GetShowPCFInterface() { return showPCFInterface; }
 
 void ImGuiManager::TogglePCFInterface() { showPCFInterface = !showPCFInterface; }

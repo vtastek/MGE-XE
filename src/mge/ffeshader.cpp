@@ -6,6 +6,7 @@
 #include "morrowindbsa.h"
 #include "statusoverlay.h"
 #include "distantland.h"
+#include "imgui_manager.h"
 
 #include <algorithm>
 #include <sstream>
@@ -302,7 +303,49 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
         // Create default error shader for HLSL pipeline
         hlslShaderDefaultPurple = createPurpleErrorShader();
         
-        // Start async compiler for on-demand compilation
+        // Compile essential shaders synchronously to prevent startup regression
+        LOG::logline("-- Compiling essential HLSL shaders synchronously");
+        
+        // Most basic variants needed for immediate rendering
+        struct EssentialVariant {
+            int lighting; int noPointLights; int vertexCol; int skinning; 
+            int hasDiffParam; int hasNormal; int hasParam; int fogMode; int stages;
+        };
+        
+        EssentialVariant essentials[] = {
+            // Unlit base case
+            {0, 1, 0, 0, 0, 0, 0, 1, 1},
+            // Basic lit case (sun only, no vertex color, no skinning)
+            {1, 1, 0, 0, 0, 0, 0, 1, 1},
+            // Basic lit with vertex color
+            {1, 1, 1, 0, 0, 0, 0, 1, 1},
+        };
+        
+        for (const auto& variant : essentials) {
+            ShaderKey sk;
+            memset(&sk, 0, sizeof(sk));
+            sk.uvSets = 1;
+            sk.useLighting = variant.lighting;
+            sk.noPointLights = variant.noPointLights;
+            sk.vertexColour = variant.vertexCol;
+            sk.vertexMaterial = variant.vertexCol + 1;
+            sk.usesSkinning = variant.skinning;
+            sk.hasDiffParam = variant.hasDiffParam;
+            sk.hasNormal = variant.hasNormal;
+            sk.hasParam = variant.hasParam;
+            sk.fogMode = variant.fogMode;
+            sk.activeStages = variant.stages;
+            sk.hasShadows = ((Configuration.MGEFlags & USE_SHADOWS) && (Configuration.MGEFlags & USE_DISTANT_LAND)) ? 1 : 0;
+            
+            HLSLShader shader = generateMWShaderHLSL(sk);
+            if (shader.vertexShader && shader.pixelShader) {
+                cacheHLSLShaders[sk] = shader;
+                LOG::logline("-- Essential HLSL shader compiled: lighting=%d noPointLights=%d vertexCol=%d",
+                            variant.lighting, variant.noPointLights, variant.vertexCol);
+            }
+        }
+        
+        // Start async compiler for on-demand compilation of remaining variants
         startAsyncCompiler();
     }
 
@@ -1879,6 +1922,32 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         if (hShadowRcpRes) {
             float shadowRcp = 1.0f / Configuration.DL.ShadowResolution;
             hlslShader.psConstantTable->SetFloat(device, hShadowRcpRes, shadowRcp);
+        }
+        
+        // Set PCF parameters from ImGui debug interface
+        D3DXHANDLE hPCFFilterSize = hlslShader.psConstantTable->GetConstantByName(NULL, "PCF_filterSize");
+        if (hPCFFilterSize) {
+            hlslShader.psConstantTable->SetFloat(device, hPCFFilterSize, ImGuiManager::GetPCFFilterSize());
+        }
+        
+        D3DXHANDLE hPCFPenumbraScale = hlslShader.psConstantTable->GetConstantByName(NULL, "PCF_penumbraScale");
+        if (hPCFPenumbraScale) {
+            hlslShader.psConstantTable->SetFloat(device, hPCFPenumbraScale, ImGuiManager::GetPCFPenumbraScale());
+        }
+        
+        D3DXHANDLE hPCFMinPenumbra = hlslShader.psConstantTable->GetConstantByName(NULL, "PCF_minPenumbra");
+        if (hPCFMinPenumbra) {
+            hlslShader.psConstantTable->SetFloat(device, hPCFMinPenumbra, ImGuiManager::GetPCFMinPenumbra());
+        }
+        
+        D3DXHANDLE hPCFMaxPenumbra = hlslShader.psConstantTable->GetConstantByName(NULL, "PCF_maxPenumbra");
+        if (hPCFMaxPenumbra) {
+            hlslShader.psConstantTable->SetFloat(device, hPCFMaxPenumbra, ImGuiManager::GetPCFMaxPenumbra());
+        }
+        
+        D3DXHANDLE hPCFBias = hlslShader.psConstantTable->GetConstantByName(NULL, "PCF_bias");
+        if (hPCFBias) {
+            hlslShader.psConstantTable->SetFloat(device, hPCFBias, ImGuiManager::GetPCFBias());
         }
         
         // Set fog color
