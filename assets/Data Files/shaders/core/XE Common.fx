@@ -265,6 +265,39 @@ float4 skin(float4 pos, float4 blend) {
 }
 
 //------------------------------------------------------------
+// Grass displacement function, based on wind and player proximity
+
+//------------------------------------------------------------
+// Grass displacement function based on wind and player proximity
+// (Synchronized with HLSL pipeline)
+
+float3 grassDisplacement(float3 worldpos, float h, float speed) {
+    float v = length(windVec);
+    float2 displace = 2 * v * 0.1 + 0.05;
+    float2 harmonics = 0;
+
+    float gtime = time * 0.1 * speed;
+
+    float fi = 5.5;
+    float cg = 1.0;
+    float bi = 0.05;
+
+    harmonics.x += abs(((fi * 1.0 + 0.03 * v) * sin(-2 * cg * (worldpos.x + worldpos.y + worldpos.z + gtime))) + bi * 1);
+    harmonics.y += abs(((fi * 2.0 + 0.044 * v) * sin(-3 * cg * (worldpos.x + worldpos.y + worldpos.z + gtime))) + bi * 0.5);
+
+    float3 stomp = 0;
+#ifdef HAS_GRASS
+    float d = length(worldpos.xy - footPos.xy);
+    if (d < 150) {
+        stomp.xy = (60 / d - 0.4) * (worldpos.xy - footPos.xy);
+    }
+    stomp.z = 0;
+#endif
+
+    return float3(saturate(0.001 * (abs(h))) * speed * 5 * (harmonics.xy + stomp.xy), 0);
+}
+
+//------------------------------------------------------------
 // Vertex material to fragment colour routing
 
 float4 vertexMaterial(float4 vertexColour) {

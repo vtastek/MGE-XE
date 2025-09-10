@@ -32,14 +32,30 @@ float shadowSunEstimate(float lambert) {
 TransformedVert transformShadowVert(MorrowindVertIn IN) {
     TransformedVert v;
     float4 normal = float4(IN.normal.xyz, 0);
+    float4 pos = IN.pos;
+
+    // Apply wind animation to match HLSL pipeline exactly
+    if(vertexBlendState < 0.5) { // Rigid vertex (non-skinned)
+#ifdef HAS_GRASS
+        // Use grass displacement for grass geometry
+        float3 displacement = grassDisplacement(IN.pos.xyz, IN.pos.z, 2.5);
+        pos.xy += (1 - IN.color.z) * displacement.xy;
+#else
+        // Apply wind animation to alpha-tested geometry (trees, bushes, etc.)
+        if (hasAlpha) {
+            float3 displacement = grassDisplacement(IN.pos.xyz, IN.pos.z, 1.0);
+            pos.xyz += displacement;
+        }
+#endif
+    }
 
     // Skin mesh if required
     if(hasBones) {
-        v.viewpos = skin(IN.pos, IN.blendweights);
+        v.viewpos = skin(pos, IN.blendweights);
         v.normal = normalize(skin(normal, IN.blendweights));
     }
     else {
-        v.viewpos = mul(IN.pos, vertexBlendPalette[0]);
+        v.viewpos = mul(pos, vertexBlendPalette[0]);
         v.normal = mul(normal, vertexBlendPalette[0]);
     }
 

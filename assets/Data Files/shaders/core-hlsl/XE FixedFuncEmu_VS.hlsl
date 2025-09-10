@@ -201,13 +201,13 @@ VS_OUTPUT vs_main(VS_INPUT input) {
         // Use grass displacement for grass geometry
         float3 displacement = grassDisplacement(input.pos.xyz, input.pos.z, 2.5);
         input.pos.xy += (1 - input.color.z) * displacement.xy;
-       // worldpos.xy += (1 - input.color.z) * displacement.xy;
+        worldpos.xy += (1 - input.color.z) * displacement.xy;
 	#else
         // Apply simple wind animation to alpha-tested geometry (trees, bushes, etc.)
         if (hasAlpha && vertexBlendState.x < 0.5) {
             float3 displacement = grassDisplacement(input.pos.xyz, input.pos.z, 1.0);
             input.pos.xyz += displacement;
-           // worldpos.xyz += displacement;
+            worldpos.xyz += displacement;
         }
 	#endif
 

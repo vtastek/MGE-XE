@@ -326,6 +326,9 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 #endif
 
 	// shadows DEBUG
+	// #ifdef HAS_NORMAL
+	// c.rgb = 1.;
+	// #endif
 	//c.rgb = deb; 
 	
 	// Apply fog --will enable when all rendering goes through HLSL with unified fogging.

@@ -34,20 +34,19 @@ DepthVertOut DepthMWVS(MorrowindVertIn IN) {
     float4 viewpos;
     float4 pos = IN.pos;
 
-    // Apply wind animation to match HLSL pipeline
-    if(!hasBones && hasAlpha) {
-        float v = length(windVec);
-        float2 displace = windVec * 0.8; // Gentler animation for alpha-tested geometry
-        
-        // Gentle swaying motion (same as HLSL simpleWindDisplacement)
-        float2 harmonics = 0;
-        harmonics += sin(0.8*time + pos.xy / 800);
-        harmonics += 0.6 * cos(1.2*time + pos.xy / 600);
-        
-        // Scale by vertex height (higher vertices move more) but more subtle
-        float heightScale = saturate(pos.z / 150.0) * 0.015;
-        
-        pos.xy += harmonics * displace * heightScale;
+    // Apply wind animation to match HLSL pipeline exactly
+    if(vertexBlendState < 0.5) { // Rigid vertex (non-skinned)
+#ifdef HAS_GRASS
+        // Use grass displacement for grass geometry
+        float3 displacement = grassDisplacement(IN.pos.xyz, IN.pos.z, 2.5);
+        pos.xy += (1 - IN.color.z) * displacement.xy;
+#else
+        // Apply wind animation to alpha-tested geometry (trees, bushes, etc.)
+        if (hasAlpha) {
+            float3 displacement = grassDisplacement(IN.pos.xyz, IN.pos.z, 1.0);
+            pos.xyz += displacement;
+        }
+#endif
     }
 
     // Skin mesh if required
