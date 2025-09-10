@@ -2,6 +2,7 @@
 #include "distantland.h"
 #include "configuration.h"
 #include "support/log.h"
+#include "hlsl_shader_manager.h"
 
 #include <vector>
 #include <string>
@@ -155,8 +156,15 @@ const char* DistantLandHLSL::getShaderFilename(ShaderType type, bool isVertexSha
 }
 
 std::unique_ptr<DistantLandHLSL::CompiledShader> DistantLandHLSL::compileShader(ShaderType type, const ShaderPermutation& perm) {
-    std::vector<D3DXMACRO> defines;
-    generateDefines(type, perm, defines);
+    std::vector<D3DXMACRO> d3dxDefines;
+    generateDefines(type, perm, d3dxDefines);
+    
+    // Convert D3DXMACRO to D3D_SHADER_MACRO for D3DCompile
+    std::vector<D3D_SHADER_MACRO> defines;
+    for (const auto& d3dxDefine : d3dxDefines) {
+        D3D_SHADER_MACRO macro = { d3dxDefine.Name, d3dxDefine.Definition };
+        defines.push_back(macro);
+    }
     
     auto shader = std::make_unique<CompiledShader>();
     
@@ -168,29 +176,34 @@ std::unique_ptr<DistantLandHLSL::CompiledShader> DistantLandHLSL::compileShader(
         return nullptr;
     }
     
-    ID3DXBuffer* vsCode = nullptr;
-    ID3DXBuffer* vsErrors = nullptr;
+    ID3DBlob* vsBlob = nullptr;
+    ID3DBlob* vsBlobErrors = nullptr;
     
-    HRESULT hr = D3DXCompileShader(
-        vsSource, vsSize, &defines[0], nullptr, "main", "vs_3_0",
-        D3DXSHADER_OPTIMIZATION_LEVEL3, &vsCode, &vsErrors, &shader->vsConstantTable
+    HRESULT hr = D3DCompile(
+        vsSource, vsSize, getShaderFilename(type, true), defines.data(), 
+        HLSLShaderManager::getIncludeHandler(), "main", "vs_3_0",
+        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vsBlob, &vsBlobErrors
     );
     
-    delete[] vsSource;
+    if (SUCCEEDED(hr)) {
+        D3DXGetShaderConstantTable((DWORD*)vsBlob->GetBufferPointer(), &shader->vsConstantTable);
+    }
     
     if (FAILED(hr)) {
-        if (vsErrors) {
-            LOG::logline("!! VS compilation failed: %s", (char*)vsErrors->GetBufferPointer());
-            vsErrors->Release();
+        if (vsBlobErrors) {
+            LOG::logline("!! VS compilation failed: %s", (char*)vsBlobErrors->GetBufferPointer());
+            vsBlobErrors->Release();
         }
+        delete[] vsSource;
         return nullptr;
     }
     
-    hr = device->CreateVertexShader((DWORD*)vsCode->GetBufferPointer(), &shader->vertexShader);
-    vsCode->Release();
+    hr = device->CreateVertexShader((DWORD*)vsBlob->GetBufferPointer(), &shader->vertexShader);
+    vsBlob->Release();
     
     if (FAILED(hr)) {
         LOG::logline("!! Failed to create vertex shader");
+        delete[] vsSource;
         return nullptr;
     }
     
@@ -199,29 +212,35 @@ std::unique_ptr<DistantLandHLSL::CompiledShader> DistantLandHLSL::compileShader(
     char* psSource = loadShaderFile(getShaderFilename(type, false), &psSize);
     if (!psSource) {
         LOG::logline("!! Failed to load pixel shader for type %d", type);
+        delete[] vsSource;
         return nullptr;
     }
     
-    ID3DXBuffer* psCode = nullptr;
-    ID3DXBuffer* psErrors = nullptr;
+    ID3DBlob* psBlob = nullptr;
+    ID3DBlob* psBlobErrors = nullptr;
     
-    hr = D3DXCompileShader(
-        psSource, psSize, &defines[0], nullptr, "main", "ps_3_0",
-        D3DXSHADER_OPTIMIZATION_LEVEL3, &psCode, &psErrors, &shader->psConstantTable
+    hr = D3DCompile(
+        psSource, psSize, getShaderFilename(type, false), defines.data(), 
+        HLSLShaderManager::getIncludeHandler(), "main", "ps_3_0",
+        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &psBlob, &psBlobErrors
     );
     
-    delete[] psSource;
-    
     if (FAILED(hr)) {
-        if (psErrors) {
-            LOG::logline("!! PS compilation failed: %s", (char*)psErrors->GetBufferPointer());
-            psErrors->Release();
+        if (psBlobErrors) {
+            LOG::logline("!! PS compilation failed: %s", (char*)psBlobErrors->GetBufferPointer());
+            psBlobErrors->Release();
         }
+        delete[] vsSource;
+        delete[] psSource;
         return nullptr;
     }
     
-    hr = device->CreatePixelShader((DWORD*)psCode->GetBufferPointer(), &shader->pixelShader);
-    psCode->Release();
+    D3DXGetShaderConstantTable((DWORD*)psBlob->GetBufferPointer(), &shader->psConstantTable);
+    delete[] vsSource;
+    delete[] psSource;
+    
+    hr = device->CreatePixelShader((DWORD*)psBlob->GetBufferPointer(), &shader->pixelShader);
+    psBlob->Release();
     
     if (FAILED(hr)) {
         LOG::logline("!! Failed to create pixel shader");

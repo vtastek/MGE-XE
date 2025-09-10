@@ -7,6 +7,7 @@
 #include "statusoverlay.h"
 #include "distantland.h"
 #include "imgui_manager.h"
+#include "hlsl_shader_manager.h"
 
 #include <algorithm>
 #include <sstream>
@@ -2515,7 +2516,7 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     }
     if (sk.hasShadows) {
         defines[defineCount++] = {"HAS_SHADOWS", "1"};
-        // LOG::logline("HLSL: Compiling with HAS_SHADOWS define");
+        LOG::logline("HLSL: Compiling with HAS_SHADOWS define");
     }
     if (!sk.useLighting) {
         defines[defineCount++] = {"NOLIT", "1"};
@@ -2547,7 +2548,7 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         vsFileSize,
         "XE FixedFuncEmu_VS.hlsl",
         defines, // Pass suffix texture defines
-        nullptr, // Include handler
+        HLSLShaderManager::getIncludeHandler(), // Include handler for #include support
         vertexShaderName,
         "vs_3_0",
         vsCompileFlags,
@@ -2610,7 +2611,7 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         psFileSize,
         "XE FixedFuncEmu_PS.hlsl",
         defines, // Pass same suffix texture defines
-        nullptr, // Include handler
+        HLSLShaderManager::getIncludeHandler(), // Include handler for #include support
         pixelShaderName,
         "ps_3_0",
         psCompileFlags,

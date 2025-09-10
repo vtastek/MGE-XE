@@ -7,6 +7,7 @@
 // Static member definitions
 std::unordered_map<std::string, HLSLShaderManager::CachedShaderSource> HLSLShaderManager::shaderSourceCache;
 bool HLSLShaderManager::needsCacheReset = false;
+static HLSLIncludeHandler includeHandler;
 
 bool HLSLShaderManager::isDXVKDetected() {
     return ShaderUtils::isDXVK();
@@ -124,4 +125,58 @@ std::unordered_map<std::string, HLSLShaderManager::CachedShaderSource>& HLSLShad
 
 bool& HLSLShaderManager::getNeedsCacheReset() {
     return needsCacheReset;
+}
+
+HLSLIncludeHandler* HLSLShaderManager::getIncludeHandler() {
+    return &includeHandler;
+}
+
+// HLSLIncludeHandler implementation
+HRESULT HLSLIncludeHandler::Open(D3D_INCLUDE_TYPE IncludeType, LPCSTR pFileName, LPCVOID pParentData, LPCVOID* ppData, UINT* pBytes) {
+    // Build full path for include file
+    std::string includePath;
+    
+    if (IncludeType == D3D_INCLUDE_LOCAL) {
+        // Local includes (#include "file.hlsl") - look in shaders directory
+        includePath = "Data Files\\shaders\\core-hlsl\\";
+        includePath += pFileName;
+    } else if (IncludeType == D3D_INCLUDE_SYSTEM) {
+        // System includes (#include <file.hlsl>) - also look in shaders directory for now
+        includePath = "Data Files\\shaders\\core-hlsl\\";
+        includePath += pFileName;
+    } else {
+        LOG::logline("!! HLSL Include: Unknown include type for %s", pFileName);
+        return E_FAIL;
+    }
+    
+    // Load the include file
+    DWORD fileSize = 0;
+    char* fileData = HLSLShaderManager::loadHLSLShaderFile(includePath.c_str(), &fileSize);
+    
+    if (!fileData) {
+        LOG::logline("!! HLSL Include: Failed to load %s", includePath.c_str());
+        return E_FAIL;
+    }
+    
+    // Store for cleanup
+    loadedIncludes[fileData] = fileData;
+    
+    // Return the data
+    *ppData = fileData;
+    *pBytes = fileSize;
+    
+    return S_OK;
+}
+
+HRESULT HLSLIncludeHandler::Close(LPCVOID pData) {
+    // Find and free the allocated memory
+    auto it = loadedIncludes.find(pData);
+    if (it != loadedIncludes.end()) {
+        delete[] it->second;
+        loadedIncludes.erase(it);
+        return S_OK;
+    }
+    
+    LOG::logline("!! HLSL Include: Failed to find include data for cleanup");
+    return E_FAIL;
 }

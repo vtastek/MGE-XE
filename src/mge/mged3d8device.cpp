@@ -240,10 +240,6 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         ImGuiManager::NewFrame();
         ImGuiManager::Render();
         
-        // Debug: Log every 300 frames that ImGui is active
-        if (++debugCounter % 300 == 0) {
-            LOG::logline(">> ImGui rendering (frame %d)", debugCounter);
-        }
     } else {
         // Log every 60 frames that ImGui is not initialized
         if (++debugCounter % 60 == 0) {
