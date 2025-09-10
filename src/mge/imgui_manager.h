@@ -25,6 +25,7 @@ public:
     static float GetPCFMaxPenumbra();
     static float GetPCFBias();
     static float GetPCFBias2();
+    static float GetPCFSlopeBias();
     static bool GetShowPCFInterface();
     static void TogglePCFInterface();
 
@@ -41,4 +42,5 @@ private:
     static float pcfMaxPenumbra;       // Maximum penumbra size
     static float pcfBias;              // Depth bias to prevent acne
     static float pcfBias2;             // Second depth bias for lerp
+    static float pcfSlopeBias;         // Slope-based bias to prevent acne on angled surfaces
 };

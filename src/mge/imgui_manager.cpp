@@ -4,7 +4,7 @@
 
 bool ImGuiManager::initialized = false;
 bool ImGuiManager::showDemo = false;
-bool ImGuiManager::showPCFInterface = true;
+bool ImGuiManager::showPCFInterface = false;
 HWND ImGuiManager::windowHandle = nullptr;
 
 // PCF filtering variables
@@ -14,6 +14,7 @@ float ImGuiManager::pcfMinPenumbra = 2.0f;       // Minimum penumbra size
 float ImGuiManager::pcfMaxPenumbra = 5.0f;       // Maximum penumbra size
 float ImGuiManager::pcfBias = 0.0015f;           // Depth bias to prevent acne
 float ImGuiManager::pcfBias2 = 0.0045f;          // Second depth bias for lerp
+float ImGuiManager::pcfSlopeBias = 0.001f;       // Slope-based bias to prevent acne on angled surfaces
 
 bool ImGuiManager::Initialize(HWND hwnd, IDirect3DDevice9* device) {
     if (initialized) {
@@ -30,6 +31,7 @@ bool ImGuiManager::Initialize(HWND hwnd, IDirect3DDevice9* device) {
     pcfMaxPenumbra = Configuration.PCF.MaxPenumbra;
     pcfBias = Configuration.PCF.Bias;
     pcfBias2 = Configuration.PCF.Bias2;
+    pcfSlopeBias = Configuration.PCF.SlopeBias;
     
 
     IMGUI_CHECKVERSION();
@@ -40,8 +42,8 @@ bool ImGuiManager::Initialize(HWND hwnd, IDirect3DDevice9* device) {
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
     
-    // Enable ImGui to draw its own cursor since we do manual mouse polling
-    io.MouseDrawCursor = true;
+    // Enable ImGui to draw its own cursor when interface is showing
+    io.MouseDrawCursor = showPCFInterface;
 
     // Setup Dear ImGui style
     ImGui::StyleColorsDark();
@@ -152,6 +154,7 @@ void ImGuiManager::RenderPCFFilteringInterface() {
         ImGui::SliderFloat("Max Penumbra", &pcfMaxPenumbra, 2.0f, 15.0f, "%.1f");
         ImGui::SliderFloat("Depth Bias", &pcfBias, 0.0f, 0.01f, "%.4f");
         ImGui::SliderFloat("Depth Bias 2", &pcfBias2, 0.0f, 0.01f, "%.4f");
+        ImGui::SliderFloat("Slope Bias", &pcfSlopeBias, 0.0f, 0.01f, "%.4f");
 
         ImGui::Separator();
         ImGui::Checkbox("Show Demo Window", &showDemo);
@@ -168,8 +171,13 @@ void ImGuiManager::RenderPCFFilteringInterface() {
         Configuration.PCF.MaxPenumbra = pcfMaxPenumbra;
         Configuration.PCF.Bias = pcfBias;
         Configuration.PCF.Bias2 = pcfBias2;
+        Configuration.PCF.SlopeBias = pcfSlopeBias;
         Configuration.SaveSettings();
     }
+    
+    // Update mouse cursor visibility based on interface state
+    ImGuiIO& io = ImGui::GetIO();
+    io.MouseDrawCursor = showPCFInterface;
 }
 
 // Getter functions for shader constants
@@ -179,11 +187,16 @@ float ImGuiManager::GetPCFMinPenumbra() { return pcfMinPenumbra; }
 float ImGuiManager::GetPCFMaxPenumbra() { return pcfMaxPenumbra; }
 float ImGuiManager::GetPCFBias() { return pcfBias; }
 float ImGuiManager::GetPCFBias2() { return pcfBias2; }
+float ImGuiManager::GetPCFSlopeBias() { return pcfSlopeBias; }
 bool ImGuiManager::GetShowPCFInterface() { return showPCFInterface; }
 
 void ImGuiManager::TogglePCFInterface() { 
     bool wasShowing = showPCFInterface;
     showPCFInterface = !showPCFInterface;
+    
+    // Update mouse cursor visibility
+    ImGuiIO& io = ImGui::GetIO();
+    io.MouseDrawCursor = showPCFInterface;
     
     // Save PCF settings when interface is being closed
     if (wasShowing && !showPCFInterface) {
@@ -193,6 +206,7 @@ void ImGuiManager::TogglePCFInterface() {
         Configuration.PCF.MaxPenumbra = pcfMaxPenumbra;
         Configuration.PCF.Bias = pcfBias;
         Configuration.PCF.Bias2 = pcfBias2;
+        Configuration.PCF.SlopeBias = pcfSlopeBias;
         Configuration.SaveSettings();
     }
 }

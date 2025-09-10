@@ -148,6 +148,7 @@ struct ConfigurationStruct {
         float MaxPenumbra;
         float Bias;
         float Bias2;
+        float SlopeBias;
     } PCF;
 
     struct {

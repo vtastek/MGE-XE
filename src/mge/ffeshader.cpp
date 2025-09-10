@@ -1956,6 +1956,11 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
             hlslShader.psConstantTable->SetFloat(device, hPCFBias2, ImGuiManager::GetPCFBias2());
         }
         
+        D3DXHANDLE hPCFSlopeBias = hlslShader.psConstantTable->GetConstantByName(NULL, "PCF_slopeBias");
+        if (hPCFSlopeBias) {
+            hlslShader.psConstantTable->SetFloat(device, hPCFSlopeBias, ImGuiManager::GetPCFSlopeBias());
+        }
+        
         // Set fog color
         DWORD fogColorDword = 0x808080FF;
         device->GetRenderState(D3DRS_FOGCOLOR, &fogColorDword);

@@ -16,6 +16,7 @@ float PCF_filterSize : register(c13);
 float PCF_penumbraScale : register(c14);
 float PCF_minPenumbra : register(c15);
 float PCF_maxPenumbra : register(c16);
+float PCF_slopeBias : register(c17);
 
 // Shadow constants
 static const int shadowCascades = 2;
@@ -52,8 +53,14 @@ float shadowSamplePCF(float4 shadowPos, float2 shadowUV, int cascade, float rece
     penumbraSize = penumbraSize * PCF_penumbraScale;
     penumbraSize = clamp(penumbraSize, PCF_minPenumbra, PCF_maxPenumbra);
     
-    // Lerp between two bias values based on surface angle to light
-    float biasLerp = lerp(PCF_bias, PCF_bias2, step(0.4, ndotlgeo));
+    // Calculate slope bias based on surface angle to light
+    // ndotlgeo ranges from 0 (perpendicular) to 1 (parallel)
+    // For steep angles (low ndotlgeo), we need more bias
+    float slopeFactor = 1.0 - ndotlgeo; // 0 for parallel surfaces, 1 for perpendicular
+    float dynamicSlopeBias = PCF_slopeBias * slopeFactor;
+    
+    // Lerp between two bias values based on surface angle to light, then add slope bias
+    float biasLerp = lerp(PCF_bias, PCF_bias2, step(0.4, ndotlgeo)) + dynamicSlopeBias;
     
     // PCF filtering pass with variable penumbra
     float shadow = 0.0;
@@ -73,7 +80,11 @@ float shadowSamplePCF(float4 shadowPos, float2 shadowUV, int cascade, float rece
 
 // Simple ESM shadow sampling with blur for far cascade
 float shadowSampleESM(float4 shadowPos, float2 shadowUV, int cascade, float receiverDepth, float ndotlgeo) {
-    float biasLerp = lerp(PCF_bias, PCF_bias2, step(0.4, ndotlgeo));
+    // Calculate slope bias based on surface angle to light
+    float slopeFactor = 1.0 - ndotlgeo; // 0 for parallel surfaces, 1 for perpendicular
+    float dynamicSlopeBias = PCF_slopeBias * slopeFactor;
+    
+    float biasLerp = lerp(PCF_bias, PCF_bias2, step(0.4, ndotlgeo)) + dynamicSlopeBias;
     float shadow = 0.0;
     float sampleCount = 0.0;
     

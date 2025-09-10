@@ -279,6 +279,7 @@ const iniSetting iniSettings[] = {
     {&Configuration.PCF.MaxPenumbra, t_float, 1, siniRendState, "PCF Max Penumbra", "5.0", NULL, MINMAX, 2.0, 15.0},
     {&Configuration.PCF.Bias, t_float, 1, siniRendState, "PCF Depth Bias", "0.0015", NULL, MINMAX, 0.0, 0.01},
     {&Configuration.PCF.Bias2, t_float, 1, siniRendState, "PCF Depth Bias 2", "0.0045", NULL, MINMAX, 0.0, 0.01},
+    {&Configuration.PCF.SlopeBias, t_float, 1, siniRendState, "PCF Slope Bias", "0.001", NULL, MINMAX, 0.0, 0.01},
 };
 
 #endif /* _INIDATA_H_ */
