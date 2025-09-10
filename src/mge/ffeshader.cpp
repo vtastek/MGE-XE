@@ -1951,6 +1951,11 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
             hlslShader.psConstantTable->SetFloat(device, hPCFBias, ImGuiManager::GetPCFBias());
         }
         
+        D3DXHANDLE hPCFBias2 = hlslShader.psConstantTable->GetConstantByName(NULL, "PCF_bias2");
+        if (hPCFBias2) {
+            hlslShader.psConstantTable->SetFloat(device, hPCFBias2, ImGuiManager::GetPCFBias2());
+        }
+        
         // Set fog color
         DWORD fogColorDword = 0x808080FF;
         device->GetRenderState(D3DRS_FOGCOLOR, &fogColorDword);
@@ -2512,11 +2517,11 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     }
     if (sk.hasGrass) {
         defines[defineCount++] = {"HAS_GRASS", "1"};
-        LOG::logline("HLSL: Compiling with HAS_GRASS define");
+        // LOG::logline("HLSL: Compiling with HAS_GRASS define");
     }
     if (sk.hasShadows) {
         defines[defineCount++] = {"HAS_SHADOWS", "1"};
-        LOG::logline("HLSL: Compiling with HAS_SHADOWS define");
+        // LOG::logline("HLSL: Compiling with HAS_SHADOWS define");
     }
     if (!sk.useLighting) {
         defines[defineCount++] = {"NOLIT", "1"};

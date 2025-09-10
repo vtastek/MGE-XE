@@ -271,6 +271,14 @@ const iniSetting iniSettings[] = {
     {&Configuration.Input.Macros, t_set, sizeof(Configuration.Input.Macros), siniMacros, NULL, NULL, NULL, DONT_SAVE, 0, 0},
     {&Configuration.Input.Triggers, t_set, sizeof(Configuration.Input.Triggers), siniTriggers, NULL, NULL, NULL, DONT_SAVE, 0, 0},
     {&Configuration.Input.Remap, t_set, sizeof(Configuration.Input.Remap), siniRemap, NULL, NULL, NULL, DONT_SAVE, 0, 0},
+
+    // PCF Shadow Parameters
+    {&Configuration.PCF.FilterSize, t_float, 1, siniRendState, "PCF Filter Size", "3.0", NULL, MINMAX, 1.0, 8.0},
+    {&Configuration.PCF.PenumbraScale, t_float, 1, siniRendState, "PCF Penumbra Scale", "1.0", NULL, MINMAX, 0.1, 3.0},
+    {&Configuration.PCF.MinPenumbra, t_float, 1, siniRendState, "PCF Min Penumbra", "2.0", NULL, MINMAX, 0.5, 5.0},
+    {&Configuration.PCF.MaxPenumbra, t_float, 1, siniRendState, "PCF Max Penumbra", "5.0", NULL, MINMAX, 2.0, 15.0},
+    {&Configuration.PCF.Bias, t_float, 1, siniRendState, "PCF Depth Bias", "0.0015", NULL, MINMAX, 0.0, 0.01},
+    {&Configuration.PCF.Bias2, t_float, 1, siniRendState, "PCF Depth Bias 2", "0.0045", NULL, MINMAX, 0.0, 0.01},
 };
 
 #endif /* _INIDATA_H_ */

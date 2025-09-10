@@ -223,7 +223,7 @@ bool ConfigurationStruct::SaveSettings() {
                 break;
             case t_float:
             case t_double:
-                strSize = std::snprintf(buffer, sizeof(buffer), "%.2f", value);
+                strSize = std::snprintf(buffer, sizeof(buffer), "%.4f", value);
                 break;
             case t_set:
             case t_string:

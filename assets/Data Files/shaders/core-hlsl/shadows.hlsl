@@ -10,17 +10,17 @@
 
 // Shadow configuration
 #ifdef HAS_SHADOWS
-
-// Shadow samplers and constants 
-texture tex5 : register(t5);
-sampler sampShadow : register(s5) = sampler_state{ texture = <tex5>; };
-float shadowRcpRes : register(c10);
+float PCF_bias : register(c11);
+float PCF_bias2 : register(c12);
+float PCF_filterSize : register(c13);
+float PCF_penumbraScale : register(c14);
+float PCF_minPenumbra : register(c15);
+float PCF_maxPenumbra : register(c16);
 
 // Shadow constants
 static const int shadowCascades = 2;
 static const float shadowCascadeSize = 1.0 / shadowCascades;
-static const float ESM_scale = 10.0;
-static const float depth_bias = 0.0005;
+static const float ESM_scale = 32768.0;
 
 // Shadow UV to shadow atlas UV conversion
 float4 mapShadowToAtlas(float2 t, int layer) {
@@ -38,7 +38,7 @@ float shadowSamplePCF(float4 shadowPos, float2 shadowUV, int cascade, float rece
             float2 offset = float2(sx, sy) * shadowRcpRes;
             float sampledDepth = tex2Dlod(sampShadow, mapShadowToAtlas(shadowUV + offset, cascade)).r/ESM_scale;
             
-            if (sampledDepth < receiverDepth - depth_bias) {
+            if (sampledDepth < receiverDepth - PCF_bias) {
                 blockerSum += sampledDepth;
                 blockerCount += 1.0;
             }
@@ -48,8 +48,12 @@ float shadowSamplePCF(float4 shadowPos, float2 shadowUV, int cascade, float rece
     if (blockerCount == 0.0) return 1.0; // No blockers = no shadow
     
     float avgBlockerDepth = blockerSum / blockerCount;
-    float penumbraSize = (receiverDepth - avgBlockerDepth) / avgBlockerDepth;
-    penumbraSize = saturate(penumbraSize * 2.0);
+    float penumbraSize = (receiverDepth - avgBlockerDepth) * 100.0; // Scale factor for visibility
+    penumbraSize = penumbraSize * PCF_penumbraScale;
+    penumbraSize = clamp(penumbraSize, PCF_minPenumbra, PCF_maxPenumbra);
+    
+    // Lerp between two bias values based on surface angle to light
+    float biasLerp = lerp(PCF_bias, PCF_bias2, step(0.4, ndotlgeo));
     
     // PCF filtering pass with variable penumbra
     float shadow = 0.0;
@@ -57,9 +61,28 @@ float shadowSamplePCF(float4 shadowPos, float2 shadowUV, int cascade, float rece
     
     for (int px = -2; px <= 2; px++) {
         for (int py = -2; py <= 2; py++) {
-            float2 offset = float2(px, py) * shadowRcpRes * penumbraSize;
+            float2 offset = float2(px, py) * shadowRcpRes * penumbraSize * PCF_filterSize;
             float sampledDepth = tex2Dlod(sampShadow, mapShadowToAtlas(shadowUV + offset, cascade)).r/ESM_scale;
-            shadow += (sampledDepth >= receiverDepth - depth_bias * 3) ? 1.0 : 0.0;
+            shadow += (sampledDepth >= receiverDepth - biasLerp) ? 1.0 : 0.0;
+            sampleCount += 1.0;
+        }
+    }
+    
+    return shadow / sampleCount;
+}
+
+// Simple ESM shadow sampling with blur for far cascade
+float shadowSampleESM(float4 shadowPos, float2 shadowUV, int cascade, float receiverDepth, float ndotlgeo) {
+    float biasLerp = lerp(PCF_bias, PCF_bias2, step(0.4, ndotlgeo));
+    float shadow = 0.0;
+    float sampleCount = 0.0;
+    
+    // Simple 3x3 blur pattern for ESM
+    for (int x = -1; x <= 1; x++) {
+        for (int y = -1; y <= 1; y++) {
+            float2 offset = float2(x, y) * shadowRcpRes * 0.5; // Smaller blur than PCF
+            float sampledDepth = tex2Dlod(sampShadow, mapShadowToAtlas(shadowUV + offset, cascade)).r/ESM_scale;
+            shadow += (sampledDepth >= receiverDepth - biasLerp) ? 1.0 : 0.0;
             sampleCount += 1.0;
         }
     }
@@ -68,41 +91,50 @@ float shadowSamplePCF(float4 shadowPos, float2 shadowUV, int cascade, float rece
 }
 
 // Main shadow sampling function for cascaded shadow maps
-float shadowSample(float4 shadow0pos, float4 shadow1pos, float ndotlgeo) {
+float shadowSample(float4 shadow0pos, float4 shadow1pos, float ndotlgeo, float alphaFlag) {
     float3 atlasMargin = float3(1.0 - 2.0 * 4.0 * shadowRcpRes, 1.0 - 2.0 * 4.0 * shadowRcpRes, 1.0);
+    float3 blendMargin = float3(1.0 - 2.0 * 264.0 * shadowRcpRes, 1.0 - 2.0 * 264.0 * shadowRcpRes, 1.0); // 50% wider blend zone
     
-    if (all(saturate(atlasMargin - abs(shadow0pos.xyz)))) {
-        // Near cascade
+    bool inNear = all(saturate(atlasMargin - abs(shadow0pos.xyz)));
+    bool inFar = all(saturate(atlasMargin - abs(shadow1pos.xyz)));
+    bool nearBlend = all(saturate(blendMargin - abs(shadow0pos.xyz)));
+    
+    if (inNear && nearBlend) {
+        // Near cascade - use ESM for alpha objects, PCF for opaque
         float2 shadowUV = (0.5 + 0.5 * shadowRcpRes) + float2(0.5, -0.5) * shadow0pos.xy;
         float receiverDepth = shadow0pos.z;
-        return shadowSamplePCF(shadow0pos, shadowUV, 0, receiverDepth, ndotlgeo);
+        if (alphaFlag > 0.5) {
+            return shadowSampleESM(shadow0pos, shadowUV, 0, receiverDepth, ndotlgeo);
+        } else {
+            return shadowSamplePCF(shadow0pos, shadowUV, 0, receiverDepth, ndotlgeo);
+        }
     }
-    else if (all(saturate(atlasMargin - abs(shadow1pos.xyz)))) {
-        // Far cascade
-        float2 shadowUV = (0.5 + 0.5 * shadowRcpRes) + float2(0.5, -0.5) * shadow1pos.xy;
-        float receiverDepth = shadow1pos.z;
-        return shadowSamplePCF(shadow1pos, shadowUV, 1, receiverDepth, ndotlgeo);
+    else if (inNear || inFar) {
+        // Always blend when in overlap zone or transition
+        float2 shadowUV0 = (0.5 + 0.5 * shadowRcpRes) + float2(0.5, -0.5) * shadow0pos.xy;
+        float2 shadowUV1 = (0.5 + 0.5 * shadowRcpRes) + float2(0.5, -0.5) * shadow1pos.xy;
+        
+        float shadow0 = inNear ? (alphaFlag > 0.5 ? shadowSampleESM(shadow0pos, shadowUV0, 0, shadow0pos.z, ndotlgeo) : shadowSamplePCF(shadow0pos, shadowUV0, 0, shadow0pos.z, ndotlgeo)) : 1.0;
+        float shadow1 = inFar ? shadowSampleESM(shadow1pos, shadowUV1, 1, shadow1pos.z, ndotlgeo) : 1.0;
+        
+        // Calculate blend factor based on distance from near cascade center
+        float3 nearDist = abs(shadow0pos.xyz);
+        float nearBlendFactor = saturate(max(max(nearDist.x, nearDist.y), 0.0) - 0.7); // Start blending at 70% of cascade
+        
+        // Ensure we have valid shadow data before blending
+        if (inNear && inFar) {
+            return shadow1;
+        } else if (inNear) {
+            return shadow0;
+        } else if (inFar) {
+            return shadow1;
+        }
     }
-    else {
-        // Outside both cascades - no shadow
-        return 1.0;
-    }
+    
+    // Outside both cascades - no shadow
+    return 1.0;
 }
-
-// Soft parallax shadowing for height-mapped surfaces
-float ParallaxSoftShadow(sampler2D heightSampler, float2 texCoord, float2 lightDirTangent, 
-                        float soften, float scale) {
-    float h0 = 1.0 - tex2D(heightSampler, texCoord).a;
-    float h = h0;
-    float2 lDir = -lightDirTangent * scale;
-    h = min(1.0, 1.0 - tex2D(heightSampler, texCoord + 0.20 * lDir).a);
-    h = min(h, 1.0 - tex2D(heightSampler, texCoord + 0.35 * lDir).a);
-    h = min(h, 1.0 - tex2D(heightSampler, texCoord + 0.45 * lDir).a);
-    h = min(h, 1.0 - tex2D(heightSampler, texCoord + 0.55 * lDir).a);
-    float shadowpara = min(1.0, 1.0 - saturate((h0 - h) * soften));
-    return shadowpara;
-}
-
+	
 #endif // HAS_SHADOWS
 
 #endif // SHADOWS_HLSL_INCLUDED

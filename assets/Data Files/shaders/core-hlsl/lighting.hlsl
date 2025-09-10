@@ -80,13 +80,13 @@ float3 OrenNayarDiffuse(float3 L, float3 V, float3 N, float roughness, float3 al
 	float alpha = max(acos(NdotV), acos(NdotL));
 	float beta = min(acos(NdotV), acos(NdotL));
 	float sigma2 = roughness * roughness;
-	float A = 1.0f - 0.5f * sigma2 / (sigma2 + 0.33f);
-	float B = 0.45f * sigma2 / (sigma2 + 0.09f);
+	float At = 1.0f - 0.5f * sigma2 / (sigma2 + 0.33f);
+	float Bt = 0.45f * sigma2 / (sigma2 + 0.09f);
 	if (gamma >= 0)
-		B *= sin(alpha) * clamp(tan(beta), -PI_DIV2, PI_DIV2);
+		Bt *= sin(alpha) * clamp(tan(beta), -PI_DIV2, PI_DIV2);
 	else
-		B = 0.0f;
-	return (A + B) * albedo * kD / PI;
+		Bt = 0.0f;
+	return (At + Bt) * albedo * kD / PI;
 }
 
 float3 BRDF(float3 N, float3 V, float3 L, float3 albedo, float metalness, float roughness, float roughnessPrime, float radius, float3 F0, int isOrenNayar, float shadows)

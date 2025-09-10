@@ -56,13 +56,16 @@ sampler sampTex3 : register(s3) = sampler_state{ texture = <tex3>; }; // Normal 
 sampler sampTex4 : register(s4) = sampler_state{ texture = <tex4>; }; // Param map (_param)
 #endif
 #if defined(HAS_SHADOWS)
-sampler sampShadow : register(s5) = sampler_state{ texture = <tex5>; }; // Shadow map
+sampler sampShadow : register(s5) = sampler_state{ texture = <tex5>; addressu = border; addressv = border; bordercolor = 0xffffffff; minfilter = linear; magfilter = linear; }; // Shadow map
 
 
 
 // Shadow resolution parameter (will be set via shader constants)
 float shadowRcpRes : register(c10);
 #endif
+
+// Alpha testing/blending flag
+bool hasAlpha;
 
 // Texture suffix support - using preprocessor defines
 //#define HAS_DIFFPARAM
@@ -109,9 +112,9 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 	ndotlgeo = dot(normalVS, -lightSunDirection);
 	#endif
 	
-	float shadows = shadowSample(input.shadow0pos, input.shadow1pos, ndotlgeo);
+	float shadows = shadowSample(input.shadow0pos, input.shadow1pos, ndotlgeo, hasAlpha ? 1.0 : 0.0);
 	float shadowpara = 1.0;
-	deb = shadows;
+	deb = shadows * ndotlgeo;
 #else
 	float shadows = 1.0; // No shadows - fully lit
 	float shadowpara = 1.0;

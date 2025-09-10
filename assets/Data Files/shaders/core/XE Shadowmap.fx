@@ -141,7 +141,7 @@ technique T0 {
         ZEnable = true;
         ZWriteEnable = true;
         ColorWriteEnable = red|green|blue|alpha;
-        CullMode = CW;
+        CullMode = CCW;
 
         StencilEnable = true;
         StencilFunc = notequal;

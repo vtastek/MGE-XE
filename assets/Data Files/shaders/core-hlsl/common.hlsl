@@ -11,13 +11,6 @@
 #define PI_DIV2 1.57079632679
 #define INTENSITY 10.0
 
-// Common shader utilities
-// Note: saturate() is a built-in HLSL function, no need to redefine
-
-// Safe dot product with minimum value to prevent division by zero
-float minDot = 1e-5;
-float dot_c(float3 a, float3 b) { return max(dot(a, b), minDot); }
-
 // Luminance calculation (ITU-R BT.709)
 float luminance(float3 color) {
     return dot(color, float3(0.2126, 0.7152, 0.0722));
@@ -157,7 +150,7 @@ float3 PBRNeutralToneMapping(float3 color) {
 #define LINEAR_END 0.2
 #define INPUT_MAX 16.0
 #define OUTPUT_MAX 1.0
-#define A (20.0 / 21.0)  // Rational function parameter for smooth transition
+#define Ax (20.0 / 21.0)  // Rational function parameter for smooth transition
 
 float encode(float x) {
 
@@ -173,7 +166,7 @@ float encode(float x) {
 	else {
 		// Smooth compression using rational function
 		float t = (x - LINEAR_END) / (INPUT_MAX - LINEAR_END);
-		float h = t / (A * t + (1.0 - A));
+		float h = t / (Ax * t + (1.0 - Ax));
 		return LINEAR_END + (OUTPUT_MAX - LINEAR_END) * h;
 	}
 }
@@ -192,7 +185,7 @@ float decode(float y) {
 	else {
 		// Inverse of rational function
 		float y_norm = (y - LINEAR_END) / (OUTPUT_MAX - LINEAR_END);
-		float t = y_norm * (1.0 - A) / (1.0 - y_norm * A);
+		float t = y_norm * (1.0 - Ax) / (1.0 - y_norm * Ax);
 		return LINEAR_END + t * (INPUT_MAX - LINEAR_END);
 	}
 }

@@ -142,6 +142,15 @@ struct ConfigurationStruct {
     } DL;
 
     struct {
+        float FilterSize;
+        float PenumbraScale;
+        float MinPenumbra;
+        float MaxPenumbra;
+        float Bias;
+        float Bias2;
+    } PCF;
+
+    struct {
         float SunMult[10];
         float AmbMult[10];
     } Lighting;

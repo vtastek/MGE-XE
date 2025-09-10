@@ -19,15 +19,12 @@ public:
     static void OnResetDevice();
 
     // Getters for PCF parameters
-    static float GetPCFFilterRadius();
-    static int GetPCFSampleCount();
-    static float GetPCFBiasConstant();
-    static float GetPCFBiasSlope();
     static float GetPCFFilterSize();
     static float GetPCFPenumbraScale(); 
     static float GetPCFMinPenumbra();
     static float GetPCFMaxPenumbra();
     static float GetPCFBias();
+    static float GetPCFBias2();
     static bool GetShowPCFInterface();
     static void TogglePCFInterface();
 
@@ -38,13 +35,10 @@ private:
     static HWND windowHandle;
     
     // PCF filtering variables for tweaking
-    static float pcfFilterRadius;
-    static int pcfSampleCount;
-    static float pcfBiasConstant;
-    static float pcfBiasSlope;
     static float pcfFilterSize;        // Base filter size in texels (maps to PCF_filterSize)
     static float pcfPenumbraScale;     // Scale factor for distance-based penumbra  
     static float pcfMinPenumbra;       // Minimum penumbra size
     static float pcfMaxPenumbra;       // Maximum penumbra size
     static float pcfBias;              // Depth bias to prevent acne
+    static float pcfBias2;             // Second depth bias for lerp
 };
