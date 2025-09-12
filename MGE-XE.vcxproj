@@ -65,7 +65,7 @@
       <WarningLevel>Level3</WarningLevel>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <Optimization>Disabled</Optimization>
-      <AdditionalIncludeDirectories>./src;./imgui192;./imgui192/backends</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>./src;./src\imgui;./src\imgui/backends</AdditionalIncludeDirectories>
       <EnableEnhancedInstructionSet>StreamingSIMDExtensions2</EnableEnhancedInstructionSet>
       <FloatingPointModel>Fast</FloatingPointModel>
       <EnforceTypeConversionRules>true</EnforceTypeConversionRules>
@@ -90,7 +90,7 @@
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <EnableEnhancedInstructionSet>StreamingSIMDExtensions2</EnableEnhancedInstructionSet>
       <FloatingPointModel>Fast</FloatingPointModel>
-      <AdditionalIncludeDirectories>./src;./imgui192;./imgui192/backends</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>./src;./src\imgui;./src\imgui/backends</AdditionalIncludeDirectories>
       <EnforceTypeConversionRules>true</EnforceTypeConversionRules>
       <RuntimeTypeInfo>false</RuntimeTypeInfo>
       <LanguageStandard>stdcpp17</LanguageStandard>
@@ -171,13 +171,13 @@
     <ClCompile Include="src\support\log.cpp" />
     <ClCompile Include="src\support\pngsave.cpp" />
     <ClCompile Include="src\support\timing.cpp" />
-    <ClCompile Include="imgui192\imgui.cpp" />
-    <ClCompile Include="imgui192\imgui_demo.cpp" />
-    <ClCompile Include="imgui192\imgui_draw.cpp" />
-    <ClCompile Include="imgui192\imgui_tables.cpp" />
-    <ClCompile Include="imgui192\imgui_widgets.cpp" />
-    <ClCompile Include="imgui192\backends\imgui_impl_dx9.cpp" />
-    <ClCompile Include="imgui192\backends\imgui_impl_win32.cpp" />
+    <ClCompile Include="src\imgui\imgui.cpp" />
+    <ClCompile Include="src\imgui\imgui_demo.cpp" />
+    <ClCompile Include="src\imgui\imgui_draw.cpp" />
+    <ClCompile Include="src\imgui\imgui_tables.cpp" />
+    <ClCompile Include="src\imgui\imgui_widgets.cpp" />
+    <ClCompile Include="src\imgui\backends\imgui_impl_dx9.cpp" />
+    <ClCompile Include="src\imgui\backends\imgui_impl_win32.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\exports.def" />
@@ -250,14 +250,14 @@
     <ClInclude Include="src\support\pngsave.h" />
     <ClInclude Include="src\support\timing.h" />
     <ClInclude Include="src\support\winheader.h" />
-    <ClInclude Include="imgui192\imconfig.h" />
-    <ClInclude Include="imgui192\imgui.h" />
-    <ClInclude Include="imgui192\imgui_internal.h" />
-    <ClInclude Include="imgui192\imstb_rectpack.h" />
-    <ClInclude Include="imgui192\imstb_textedit.h" />
-    <ClInclude Include="imgui192\imstb_truetype.h" />
-    <ClInclude Include="imgui192\backends\imgui_impl_dx9.h" />
-    <ClInclude Include="imgui192\backends\imgui_impl_win32.h" />
+    <ClInclude Include="src\imgui\imconfig.h" />
+    <ClInclude Include="src\imgui\imgui.h" />
+    <ClInclude Include="src\imgui\imgui_internal.h" />
+    <ClInclude Include="src\imgui\imstb_rectpack.h" />
+    <ClInclude Include="src\imgui\imstb_textedit.h" />
+    <ClInclude Include="src\imgui\imstb_truetype.h" />
+    <ClInclude Include="src\imgui\backends\imgui_impl_dx9.h" />
+    <ClInclude Include="src\imgui\backends\imgui_impl_win32.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

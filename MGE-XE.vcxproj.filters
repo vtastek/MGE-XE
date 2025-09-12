@@ -43,11 +43,11 @@
     <Filter Include="Source Files\ipc">
       <UniqueIdentifier>{8138a600-cc8b-4e30-8213-4aba7c2d5ea0}</UniqueIdentifier>
     </Filter>
-    <Filter Include="Header Files\imgui">
-      <UniqueIdentifier>{c0d4b535-03f7-4bd7-bf4a-fbf402513db9}</UniqueIdentifier>
-    </Filter>
     <Filter Include="Source Files\imgui">
       <UniqueIdentifier>{ed86647a-dad6-4f97-985b-a819c0c06ec4}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\imgui">
+      <UniqueIdentifier>{a6d2e1be-55ba-4d24-a651-a7b14c24e67b}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
   <ItemGroup>
@@ -231,28 +231,28 @@
     <ClCompile Include="src\mge\ffe_core_rendering.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="imgui192\imgui.cpp">
+    <ClCompile Include="src\imgui\imgui.cpp">
       <Filter>Source Files\imgui</Filter>
     </ClCompile>
-    <ClCompile Include="imgui192\imgui_demo.cpp">
+    <ClCompile Include="src\imgui\imgui_demo.cpp">
       <Filter>Source Files\imgui</Filter>
     </ClCompile>
-    <ClCompile Include="imgui192\imgui_draw.cpp">
+    <ClCompile Include="src\imgui\imgui_draw.cpp">
       <Filter>Source Files\imgui</Filter>
     </ClCompile>
-    <ClCompile Include="imgui192\backends\imgui_impl_dx9.cpp">
+    <ClCompile Include="src\imgui\backends\imgui_impl_dx9.cpp">
       <Filter>Source Files\imgui</Filter>
     </ClCompile>
-    <ClCompile Include="imgui192\backends\imgui_impl_win32.cpp">
+    <ClCompile Include="src\imgui\backends\imgui_impl_win32.cpp">
       <Filter>Source Files\imgui</Filter>
     </ClCompile>
     <ClCompile Include="src\mge\imgui_manager.cpp">
       <Filter>Source Files\imgui</Filter>
     </ClCompile>
-    <ClCompile Include="imgui192\imgui_tables.cpp">
+    <ClCompile Include="src\imgui\imgui_tables.cpp">
       <Filter>Source Files\imgui</Filter>
     </ClCompile>
-    <ClCompile Include="imgui192\imgui_widgets.cpp">
+    <ClCompile Include="src\imgui\imgui_widgets.cpp">
       <Filter>Source Files\imgui</Filter>
     </ClCompile>
   </ItemGroup>
@@ -452,31 +452,31 @@
     <ClInclude Include="src\mge\ffe_core_rendering.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="imgui192\imconfig.h">
+    <ClInclude Include="src\imgui\imconfig.h">
       <Filter>Header Files\imgui</Filter>
     </ClInclude>
-    <ClInclude Include="imgui192\imgui.h">
+    <ClInclude Include="src\imgui\imgui.h">
       <Filter>Header Files\imgui</Filter>
     </ClInclude>
-    <ClInclude Include="imgui192\backends\imgui_impl_dx9.h">
+    <ClInclude Include="src\imgui\backends\imgui_impl_dx9.h">
       <Filter>Header Files\imgui</Filter>
     </ClInclude>
-    <ClInclude Include="imgui192\backends\imgui_impl_win32.h">
+    <ClInclude Include="src\imgui\backends\imgui_impl_win32.h">
       <Filter>Header Files\imgui</Filter>
     </ClInclude>
-    <ClInclude Include="imgui192\imgui_internal.h">
+    <ClInclude Include="src\imgui\imgui_internal.h">
       <Filter>Header Files\imgui</Filter>
     </ClInclude>
     <ClInclude Include="src\mge\imgui_manager.h">
       <Filter>Header Files\imgui</Filter>
     </ClInclude>
-    <ClInclude Include="imgui192\imstb_rectpack.h">
+    <ClInclude Include="src\imgui\imstb_rectpack.h">
       <Filter>Header Files\imgui</Filter>
     </ClInclude>
-    <ClInclude Include="imgui192\imstb_textedit.h">
+    <ClInclude Include="src\imgui\imstb_textedit.h">
       <Filter>Header Files\imgui</Filter>
     </ClInclude>
-    <ClInclude Include="imgui192\imstb_truetype.h">
+    <ClInclude Include="src\imgui\imstb_truetype.h">
       <Filter>Header Files\imgui</Filter>
     </ClInclude>
   </ItemGroup>
