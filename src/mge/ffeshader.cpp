@@ -2706,35 +2706,24 @@ void FixedFunctionShader::release() {
     shaderLRU.effect = nullptr;
     shaderLRU.last_sk = ShaderKey();
     cacheEffects.clear();
+    if (effectDefaultPurple) {
     effectDefaultPurple->Release();
+        effectDefaultPurple = nullptr;
+    }
     
     // Clean up HLSL cache with safety checks
     for (auto& i : cacheHLSLShaders) {
         try {
             // Extra safety: validate pointers before release using COM object validation
             if (i.second.vertexShader) {
-                // Try to AddRef/Release to test if object is valid
-                ULONG refCount = i.second.vertexShader->AddRef();
-                if (refCount > 1) {
-                    i.second.vertexShader->Release(); // Remove our AddRef
-                    i.second.vertexShader->Release(); // Original release
-                } else {
-                    i.second.vertexShader->Release(); // Just remove our AddRef
-                }
+                i.second.vertexShader->Release();
                 i.second.vertexShader = nullptr;
             }
-            
+
             if (i.second.pixelShader) {
-                ULONG refCount = i.second.pixelShader->AddRef();
-                if (refCount > 1) {
-                    i.second.pixelShader->Release(); // Remove our AddRef
-                    i.second.pixelShader->Release(); // Original release
-                } else {
-                    i.second.pixelShader->Release(); // Just remove our AddRef
-                }
+                i.second.pixelShader->Release();
                 i.second.pixelShader = nullptr;
             }
-            
             if (i.second.vsConstantTable) {
                 ULONG refCount = i.second.vsConstantTable->AddRef();
                 if (refCount > 1) {
@@ -2745,34 +2734,37 @@ void FixedFunctionShader::release() {
                 }
                 i.second.vsConstantTable = nullptr;
             }
-            
+
             if (i.second.psConstantTable) {
-                ULONG refCount = i.second.psConstantTable->AddRef();
-                if (refCount > 1) {
-                    i.second.psConstantTable->Release(); // Remove our AddRef
-                    i.second.psConstantTable->Release(); // Original release
-                } else {
-                    i.second.psConstantTable->Release(); // Just remove our AddRef
-                }
+                i.second.psConstantTable->Release();
                 i.second.psConstantTable = nullptr;
             }
         } catch (...) {
-            // Ignore cleanup errors during shutdown - objects may already be invalid
-            i.second.vertexShader = nullptr;
-            i.second.pixelShader = nullptr;
-            i.second.vsConstantTable = nullptr;
-            i.second.psConstantTable = nullptr;
+            // Ignore exceptions during cleanup
         }
     }
+
     hlslShaderLRU.shader = {};
     hlslShaderLRU.last_sk = ShaderKey();
     cacheHLSLShaders.clear();
     
-    // Clean up default HLSL shader
-    if (hlslShaderDefaultPurple.vertexShader) hlslShaderDefaultPurple.vertexShader->Release();
-    if (hlslShaderDefaultPurple.pixelShader) hlslShaderDefaultPurple.pixelShader->Release();
-    if (hlslShaderDefaultPurple.vsConstantTable) hlslShaderDefaultPurple.vsConstantTable->Release();
-    if (hlslShaderDefaultPurple.psConstantTable) hlslShaderDefaultPurple.psConstantTable->Release();
+    // Clean up default HLSL shader with null checks
+    if (hlslShaderDefaultPurple.vertexShader) {
+        hlslShaderDefaultPurple.vertexShader->Release();
+        hlslShaderDefaultPurple.vertexShader = nullptr;
+    }
+    if (hlslShaderDefaultPurple.pixelShader) {
+        hlslShaderDefaultPurple.pixelShader->Release();
+        hlslShaderDefaultPurple.pixelShader = nullptr;
+    }
+    if (hlslShaderDefaultPurple.vsConstantTable) {
+        hlslShaderDefaultPurple.vsConstantTable->Release();
+        hlslShaderDefaultPurple.vsConstantTable = nullptr;
+    }
+    if (hlslShaderDefaultPurple.psConstantTable) {
+        hlslShaderDefaultPurple.psConstantTable->Release();
+        hlslShaderDefaultPurple.psConstantTable = nullptr;
+    }
     
     // Clean up shader source cache
     for (auto& i : shaderSourceCache) {
