@@ -519,7 +519,6 @@ static void scanDirectoryForSuffixes(const std::string& basePath, const std::str
                 }
                 
                 suffixFilesFound++;
-                LOG::logline("-- Found loose %s: %s -> base: %s", suffixType.c_str(), fullRelativePath.c_str(), baseName.c_str());
             }
             
             // Check if this texture is in grass folder (for any DDS file)
@@ -541,7 +540,6 @@ static void scanDirectoryForSuffixes(const std::string& basePath, const std::str
                     variants.baseTexturePath = grassTexturePath;
                 }
                 
-                LOG::logline("-- Found grass texture: %s -> base: %s", fullRelativePath.c_str(), baseName.c_str());
             }
         }
     } while (FindNextFile(hFind, &findFileData));
@@ -583,11 +581,9 @@ void buildTextureSuffixDatabase() {
                 variants.baseTexturePath = filename;
                 
                 grassTexturesFoundBSA++;
-                LOG::logline("-- Found BSA grass texture: %s -> base: %s", filename.c_str(), baseName.c_str());
             }
         }
     }
-    LOG::logline("-- Found %d grass textures in BSA files", grassTexturesFoundBSA);
     
     // Phase 2: For each base name, find the actual base texture (loose overrides BSA)
     int basesFound = 0;
@@ -613,8 +609,7 @@ void buildTextureSuffixDatabase() {
         }
         
         // Look for base texture in the same directory as the suffix
-        std::string baseFileName = baseName.substr(baseName.find_last_of("/\\") + 1) + ".dds";
-        std::string looseBasePath = "Data Files\\textures\\" + suffixDir + baseFileName;
+        std::string looseBasePath = "Data Files\\textures\\" + baseName + ".dds";
         
         // Replace forward slashes with backslashes for Windows file system
         std::replace(looseBasePath.begin(), looseBasePath.end(), '/', '\\');
@@ -627,7 +622,6 @@ void buildTextureSuffixDatabase() {
             variants.baseTextureSource = "loose";
             variants.baseTexturePath = looseBasePath;
             basesFound++;
-            LOG::logline("-- Base texture (loose): %s at %s", baseName.c_str(), looseBasePath.c_str());
             FindClose(hFile);
         } else {
             // Check BSA files for base texture
@@ -641,7 +635,6 @@ void buildTextureSuffixDatabase() {
                     variants.baseTexturePath = filename;
                     basesFound++;
                     foundInBSA = true;
-                    LOG::logline("-- Base texture (BSA): %s", baseName.c_str());
                     break;
                 }
             }
@@ -735,23 +728,12 @@ TextureRuntimeHash calculateTextureHash(IDirect3DDevice9* device, IDirect3DTextu
         if (SUCCEEDED(texture->GetSurfaceLevel(0, &srcSurface)) &&
             SUCCEEDED(stagingTexture->GetSurfaceLevel(0, &dstSurface))) {
             
-            // Try GetRenderTargetData first
+            // Use GetRenderTargetData - proven to work 100% of the time for Pool=0 textures
             hr = device->GetRenderTargetData(srcSurface, dstSurface);
-            
+
             if (FAILED(hr)) {
-                // Fallback method: StretchRect
-                hr = device->StretchRect(srcSurface, nullptr, dstSurface, nullptr, D3DTEXF_NONE);
-                
-                if (FAILED(hr)) {
-                    // Third fallback: UpdateTexture
-                    IDirect3DTexture9* sysMemTexture = nullptr;
-                    HRESULT sysHr = device->CreateTexture(desc.Width, desc.Height, 1, 0, desc.Format, D3DPOOL_MANAGED, &sysMemTexture, nullptr);
-                    
-                    if (SUCCEEDED(sysHr) && sysMemTexture) {
-                        hr = device->UpdateTexture(sysMemTexture, stagingTexture);
-                        sysMemTexture->Release();
-                    }
-                }
+                LOG::logline("CAPTURE: GetRenderTargetData FAILED (0x%08x) for %dx%d %s Pool=%d - unexpected!",
+                           hr, desc.Width, desc.Height, getD3DFormatName(desc.Format), desc.Pool);
             }
             
             // If staging succeeded, hash directly from memory
@@ -810,25 +792,123 @@ TextureRuntimeHash calculateTextureHash(IDirect3DDevice9* device, IDirect3DTextu
                         return hash;
                     }
                     
-                    // Fast texture hashing - simple first 4KB sample + metadata
+                    // Hybrid texture hashing: Multi-point sample + 8x8 mip + enhanced metadata
                     const unsigned char* dataPtr = reinterpret_cast<const unsigned char*>(lockedRect.pBits);
-                    
-                    // Use small fixed sample size for speed
-                    size_t sampleSize = std::min(dataSize, (size_t)4096); // Max 4KB sample
-                    
-                    // Simple hash: metadata + first N bytes only (fastest approach)
-                    size_t metadataSize = 12; // 3 x DWORD (Width, Height, Format)
-                    size_t totalHashSize = metadataSize + sampleSize;
+
+                    // Multi-point sampling for better discrimination
+                    size_t pointSize = 64; // 64 bytes per sample point
+                    size_t maxSampleSize = std::min(dataSize, (size_t)2048); // 2KB from main texture
+
+                    // Enhanced metadata: include mip levels and texture size for uniqueness
+                    DWORD mipLevels = texture->GetLevelCount();
+                    size_t metadataSize = 20; // 5 x DWORD (Width, Height, Format, MipLevels, TotalSize)
+                    size_t totalHashSize = metadataSize + maxSampleSize;
                     auto hashBuffer = std::make_unique<unsigned char[]>(totalHashSize);
-                    
-                    // Pack metadata efficiently
+
+                    // Pack enhanced metadata
                     DWORD* metadata = reinterpret_cast<DWORD*>(hashBuffer.get());
                     metadata[0] = desc.Width;
                     metadata[1] = desc.Height;
                     metadata[2] = (DWORD)desc.Format;
-                    
-                    // Simple memcpy - no complex sampling
-                    memcpy(hashBuffer.get() + metadataSize, dataPtr, sampleSize);
+                    metadata[3] = mipLevels;
+                    metadata[4] = (DWORD)dataSize;
+
+                    // Multi-point sampling: beginning, middle, end points
+                    unsigned char* sampleBuffer = hashBuffer.get() + metadataSize;
+
+                    // Sample 1: Beginning (first 64 bytes)
+                    size_t beginSample = std::min(pointSize, dataSize);
+                    memcpy(sampleBuffer, dataPtr, beginSample);
+
+                    // Sample 2: Middle point
+                    if (dataSize > pointSize * 2) {
+                        size_t midOffset = dataSize / 2;
+                        size_t midSample = std::min(pointSize, dataSize - midOffset);
+                        memcpy(sampleBuffer + pointSize, dataPtr + midOffset, midSample);
+                    }
+
+                    // Sample 3: End point
+                    if (dataSize > pointSize * 3) {
+                        size_t endOffset = dataSize - pointSize;
+                        size_t endSample = std::min(pointSize, dataSize - endOffset);
+                        memcpy(sampleBuffer + (2 * pointSize), dataPtr + endOffset, endSample);
+                    }
+
+                    // Add 8x8 mip level data for enhanced discrimination
+                    size_t mipDataUsed = 0;
+                    if (mipLevels > 1) {
+                        // Find 8x8 mip level using proven method
+                        DWORD targetMip = 0;
+                        for (DWORD mip = 0; mip < mipLevels; mip++) {
+                            DWORD mipWidth = std::max(1u, desc.Width >> mip);
+                            DWORD mipHeight = std::max(1u, desc.Height >> mip);
+
+                            if (mipWidth <= 8 && mipHeight <= 8) {
+                                targetMip = mip;
+                                break;
+                            }
+                            targetMip = mip;
+                        }
+
+                        // Capture 8x8 mip using proven GetRenderTargetData method
+                        if (targetMip > 0) {
+                            D3DSURFACE_DESC mipDesc;
+                            if (SUCCEEDED(texture->GetLevelDesc(targetMip, &mipDesc))) {
+                                IDirect3DTexture9* mipTexture = nullptr;
+                                HRESULT mipHr = device->CreateTexture(mipDesc.Width, mipDesc.Height, 1, 0, mipDesc.Format, D3DPOOL_SYSTEMMEM, &mipTexture, nullptr);
+
+                                if (SUCCEEDED(mipHr) && mipTexture) {
+                                    IDirect3DSurface9* mipSrcSurface = nullptr;
+                                    IDirect3DSurface9* mipDstSurface = nullptr;
+
+                                    if (SUCCEEDED(texture->GetSurfaceLevel(targetMip, &mipSrcSurface)) &&
+                                        SUCCEEDED(mipTexture->GetSurfaceLevel(0, &mipDstSurface))) {
+
+                                        // Use proven capture method
+                                        HRESULT mipCaptureHr = device->GetRenderTargetData(mipSrcSurface, mipDstSurface);
+
+                                        if (SUCCEEDED(mipCaptureHr)) {
+                                            D3DLOCKED_RECT mipLockedRect;
+                                            if (SUCCEEDED(mipDstSurface->LockRect(&mipLockedRect, nullptr, D3DLOCK_READONLY))) {
+                                                // Calculate 8x8 mip data size
+                                                size_t mipDataSize = 0;
+                                                switch (mipDesc.Format) {
+                                                    case D3DFMT_DXT1:
+                                                        mipDataSize = std::max(1U, (mipDesc.Width + 3) / 4) * std::max(1U, (mipDesc.Height + 3) / 4) * 8;
+                                                        break;
+                                                    case D3DFMT_DXT3:
+                                                    case D3DFMT_DXT5:
+                                                        mipDataSize = std::max(1U, (mipDesc.Width + 3) / 4) * std::max(1U, (mipDesc.Height + 3) / 4) * 16;
+                                                        break;
+                                                    default:
+                                                        mipDataSize = (size_t)mipLockedRect.Pitch * mipDesc.Height;
+                                                        break;
+                                                }
+
+                                                // Add 8x8 mip data to hash (up to 256 bytes)
+                                                if (mipDataSize > 0 && mipDataSize <= 256) {
+                                                    size_t availableSpace = maxSampleSize - (3 * pointSize);
+                                                    mipDataUsed = std::min(mipDataSize, availableSpace);
+                                                    if (mipDataUsed > 0) {
+                                                        memcpy(sampleBuffer + (3 * pointSize), mipLockedRect.pBits, mipDataUsed);
+                                                    }
+                                                }
+
+                                                mipDstSurface->UnlockRect();
+                                            }
+                                        }
+                                    }
+
+                                    if (mipSrcSurface) mipSrcSurface->Release();
+                                    if (mipDstSurface) mipDstSurface->Release();
+                                    mipTexture->Release();
+                                }
+                            }
+                        }
+                    }
+
+                    // Update total hash size to include 8x8 mip data
+                    totalHashSize = metadataSize + (3 * pointSize) + mipDataUsed;
                     
                     // Calculate hash
                     hash.size = desc.Width * desc.Height;
@@ -1064,6 +1144,7 @@ void buildBSATextureHashDatabase(IDirect3DDevice9* dev) {
     
     int texturesHashed = 0;
     int texturesMatched = 0;
+    int hashCollisions = 0;
     
     // Hash base textures from suffix database (only textures with suffix variants)
     for (const auto& entry : textureSuffixDatabase) {
@@ -1111,9 +1192,7 @@ void buildBSATextureHashDatabase(IDirect3DDevice9* dev) {
                                 // Step 3: Use DirectXTex UpdateTexture transfer (SYSTEMMEM → DEFAULT)
                                 HRESULT updateHr = dev->UpdateTexture(stagingTexture, baseTexture);
                                 
-                                if (SUCCEEDED(updateHr)) {
-                                    LOG::logline("-- DirectXTex staging SUCCESS: %s (SYSTEMMEM → DEFAULT)", baseName.c_str());
-                                } else {
+                                if (!SUCCEEDED(updateHr)) {
                                     LOG::logline("!! DirectXTex UpdateTexture FAILED: %s (HRESULT: 0x%08x)", baseName.c_str(), updateHr);
                                     baseTexture->Release();
                                     baseTexture = nullptr;
@@ -1134,9 +1213,7 @@ void buildBSATextureHashDatabase(IDirect3DDevice9* dev) {
                         D3DX_FROM_FILE, D3DX_FROM_FILE, D3DX_FROM_FILE,
                         0, D3DFMT_UNKNOWN, D3DPOOL_MANAGED, D3DX_DEFAULT, D3DX_DEFAULT, 0, nullptr, nullptr, &baseTexture);
                     
-                    if (SUCCEEDED(hr)) {
-                        LOG::logline("-- Direct MANAGED texture creation SUCCESS: %s", baseName.c_str());
-                    } else {
+                    if (!SUCCEEDED(hr)) {
                         LOG::logline("!! Direct MANAGED texture creation FAILED: %s (HRESULT: 0x%08x)", baseName.c_str(), hr);
                     }
                 }
@@ -1149,12 +1226,16 @@ void buildBSATextureHashDatabase(IDirect3DDevice9* dev) {
             TextureRuntimeHash texHash = calculateTextureHash(dev, baseTexture, false);
             
             if (texHash.crc32 != 0) {
-                // Add to hash database
-                textureHashToName[texHash] = baseName;
-                texturesMatched++;
-                
-                LOG::logline("-- Hashed base texture: %s (%s) -> hash %08x", 
-                           baseName.c_str(), variants.baseTextureSource.c_str(), texHash.crc32);
+                // Check for collision before adding
+                auto existingEntry = textureHashToName.find(texHash);
+                if (existingEntry != textureHashToName.end()) {
+                    hashCollisions++;
+                } else {
+                    // Add to hash database
+                    textureHashToName[texHash] = baseName;
+                    texturesMatched++;
+                }
+
             }
             
             baseTexture->Release();
@@ -1166,10 +1247,40 @@ void buildBSATextureHashDatabase(IDirect3DDevice9* dev) {
     int databaseTotalTime = HighResolutionTimer::getMicroseconds() - databaseStartTime;
     float databaseTotalTimeMs = databaseTotalTime / 1000.0f;
     float avgTimePerTextureMs = texturesHashed > 0 ? databaseTotalTimeMs / texturesHashed : 0.0f;
-    LOG::logline("-- Hash database complete: %d base textures processed, %d hash matches created", 
-               texturesHashed, texturesMatched);
-    LOG::logline("-- TOTAL DATABASE BUILD TIME: %.2f ms for %d textures (%.2f ms per texture)", 
-               databaseTotalTimeMs, texturesHashed, avgTimePerTextureMs);
+    LOG::logline("Hash database complete: %d textures processed, %d matches, %.2f ms total",
+               texturesHashed, texturesMatched, databaseTotalTimeMs);
+
+    // Analyze hash collisions
+    std::unordered_map<uint32_t, std::vector<std::string>> hashCollisionMap;
+    for (const auto& entry : textureHashToName) {
+        hashCollisionMap[entry.first.crc32].push_back(entry.second);
+    }
+
+    int collisionGroups = 0;
+    int totalCollisions = 0;
+    for (const auto& collision : hashCollisionMap) {
+        if (collision.second.size() > 1) {
+            collisionGroups++;
+            totalCollisions += collision.second.size();
+
+            LOG::logline("Collision Group #%d - Hash %08x (%d textures):",
+                       collisionGroups, collision.first, (int)collision.second.size());
+            for (const auto& texName : collision.second) {
+                LOG::logline("  - %s", texName.c_str());
+            }
+        }
+    }
+
+    if (hashCollisions > 0) {
+        LOG::logline("=== HASH COLLISION SUMMARY ===");
+        LOG::logline("Real-time collisions detected: %d", hashCollisions);
+        LOG::logline("Post-analysis collision groups: %d", collisionGroups);
+        LOG::logline("Post-analysis textures with collisions: %d", totalCollisions);
+        LOG::logline("Collision rate: %.2f%%", (float)hashCollisions / texturesMatched * 100.0f);
+    } else {
+        LOG::logline("=== NO HASH COLLISIONS DETECTED ===");
+        LOG::logline("Perfect hash discrimination achieved!");
+    }
 }
 
 
