@@ -109,12 +109,20 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 	#ifdef HAS_SHADOWS
 	float ndotlgeo = 1;
 	#ifndef NOLIT
-	ndotlgeo = dot(normalVS, -lightSunDirection);
+	ndotlgeo = dot(normalVS, -normalize(lightSunDirection));
 	#endif
 	
 	float shadows = shadowSample(input.shadow0pos, input.shadow1pos, ndotlgeo, hasAlpha ? 1.0 : 0.0);
+	float3 atlasMargin = float3(1.0 - 2.0 * 4.0 * shadowRcpRes, 1.0 - 2.0 * 4.0 * shadowRcpRes, 1.0);
+    float3 blendMargin = float3(1.0 - 2.0 * 264.0 * shadowRcpRes, 1.0 - 2.0 * 264.0 * shadowRcpRes, 1.0); // 50% wider blend zone
+    
+    bool inNear = all(saturate(atlasMargin - abs(input.shadow0pos.xyz)));
+    bool inFar = all(saturate(atlasMargin - abs(input.shadow1pos.xyz)));
+	deb.y = float(inNear);
+	deb.xz = float(inFar);
+	
 	float shadowpara = 1.0;
-	deb = shadows * ndotlgeo;
+	//deb = shadows * ndotlgeo;
 #else
 	float shadows = 1.0; // No shadows - fully lit
 	float shadowpara = 1.0;
