@@ -494,6 +494,7 @@ static const D3DXMACRO macroExpFog = { "USE_EXPFOG", "" };
 static const D3DXMACRO macroScattering = { "USE_SCATTERING", "" };
 static const D3DXMACRO macroFilterReflection = { "FILTER_WATER_REFLECTION", "" };
 static const D3DXMACRO macroDynamicRipples = { "DYNAMIC_RIPPLES", "" };
+static const D3DXMACRO macroHLSLPipeline = { "USE_HLSL_PIPELINE", "" };
 static const D3DXMACRO macroTerminator = { 0, 0 };
 
 bool DistantLand::initShader() {
@@ -519,6 +520,9 @@ bool DistantLand::initShader() {
     }
     if (Configuration.MGEFlags & DYNAMIC_RIPPLES) {
         features.push_back(macroDynamicRipples);
+    }
+    if (Configuration.UseHLSLPipeline) {
+        features.push_back(macroHLSLPipeline);
     }
     features.push_back(macroTerminator);
 
@@ -805,7 +809,9 @@ bool DistantLand::initDynamicWaves() {
 }
 
 bool DistantLand::initShadow() {
-    const D3DFORMAT shadowFormat = D3DFMT_R16F, shadowZFormat = D3DFMT_D24S8;
+    // Use 32-bit float for HLSL path (higher precision), 16-bit for legacy effects pipeline
+    const D3DFORMAT shadowFormat = Configuration.UseHLSLPipeline ? D3DFMT_R32F : D3DFMT_R16F;
+    const D3DFORMAT shadowZFormat = D3DFMT_D24S8;
     const UINT shadowSize = Configuration.DL.ShadowResolution, cascades = 2;
     HRESULT hr;
 

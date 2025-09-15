@@ -67,7 +67,7 @@ float shadowSamplePCF(float4 shadowPos, float2 shadowUV, int cascade, float rece
     float dynamicSlopeBias = PCF_slopeBias * slopeFactor;
 	
     // Lerp between two bias values based on surface angle to light, then add slope bias
-    float biasLerp = lerp(PCF_bias, PCF_bias2, step(0.4, ndotlgeo)) + dynamicSlopeBias;
+    float biasLerp = lerp(PCF_bias, PCF_bias2, step(0.7, ndotlgeo)) + dynamicSlopeBias;
     
     // PCF filtering pass with variable penumbra - invert values so shadows=1, lit=0
     float shadow = 1.0;
@@ -89,7 +89,7 @@ float shadowSamplePCF(float4 shadowPos, float2 shadowUV, int cascade, float rece
     }
 
     // Return inverted result: 1.0=lit, 0.0=shadow (normal convention)
-    return 1-saturate(shadow / sampleCount) + 0.04;
+    return 1-saturate(shadow / sampleCount);
 }
 
 // Simple ESM shadow sampling with blur for far cascade
@@ -105,7 +105,7 @@ float shadowSampleESM(float4 shadowPos, float2 shadowUV, int cascade, float rece
     // Simple 3x3 blur pattern for ESM
     for (int x = -1; x <= 1; x++) {
         for (int y = -1; y <= 1; y++) {
-            float2 offset = float2(x, y) * shadowRcpRes * 0.1; // Smaller blur than PCF
+            float2 offset = float2(x, y) * shadowRcpRes * 0.5; // Smaller blur than PCF
             float sampledDepth = tex2Dlod(sampShadow, mapShadowToAtlas(shadowUV + offset, cascade)).r/ESM_scale;
             shadow += (sampledDepth >= receiverDepth - biasLerp) ? 1.0 : 0.0;
             sampleCount += 1.0;

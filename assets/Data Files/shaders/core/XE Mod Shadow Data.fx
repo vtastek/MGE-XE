@@ -31,4 +31,8 @@ static const float ESM_c = 60.0;
 static const float ESM_bias = 2e-3 * ESM_c;
 
 // Scale stored depth to use (most of) FP16 range
+#ifdef USE_HLSL_PIPELINE
+static const float ESM_scale = 32768.0 + 25.0;  // Add bias for HLSL path
+#else
 static const float ESM_scale = 32768.0;
+#endif

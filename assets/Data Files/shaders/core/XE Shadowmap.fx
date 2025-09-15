@@ -158,7 +158,11 @@ technique T0 {
         ZEnable = true;
         ZWriteEnable = true;
         ColorWriteEnable = red|green|blue|alpha;
-        CullMode = CCW;
+#ifdef USE_HLSL_PIPELINE
+        CullMode = none;  // No culling for HLSL path
+#else
+        CullMode = CCW;   // Counter-clockwise culling for legacy effects
+#endif
 
         StencilEnable = true;
         StencilFunc = notequal;
