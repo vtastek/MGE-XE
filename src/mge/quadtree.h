@@ -3,6 +3,7 @@
 #include "dlmath.h"
 #include "memorypool.h"
 #include "ipc/bridge.h"
+#include "configuration.h"
 
 #include <algorithm>
 #include <vector>
@@ -268,6 +269,7 @@ struct QuadTreeNode {
             D3DXVECTOR3 d = mesh->sphere.center - eyepos;
             float range_squared = d.x * d.x + d.y * d.y + d.z * d.z;
             float view_limit = viewsphere.w + mesh->sphere.radius;
+
 
             if (range_squared <= view_limit * view_limit) {
                 visible_set.PushBack(*mesh);

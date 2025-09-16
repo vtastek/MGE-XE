@@ -141,6 +141,7 @@ void DistantLand::cullDistantStatics(const D3DXMATRIX* view, const D3DXMATRIX* p
     float zn = nearViewRange - 768.0f, zf = zn;
     float cullDist = fogEnd;
 
+
     if (Configuration.UseSharedMemory) {
         visDistantShared.RemoveAll();
     } else {
@@ -149,8 +150,13 @@ void DistantLand::cullDistantStatics(const D3DXMATRIX* view, const D3DXMATRIX* p
 
     zf = std::min(Configuration.DL.NearStaticEnd * kCellSize, cullDist);
     if (zn < zf) {
-        editProjectionZ(&ds_proj, zn, zf);
-        ds_viewproj = (*view) * ds_proj;
+        // For ultra-wide FOV, use original projection matrix to avoid overly restrictive frustum planes
+        if (Configuration.ScreenFOV > 90.0f) {
+            ds_viewproj = (*view) * (*proj);
+        } else {
+            editProjectionZ(&ds_proj, zn, zf);
+            ds_viewproj = (*view) * ds_proj;
+        }
         ViewFrustum range_frustum(&ds_viewproj);
         viewsphere.w = zf;
         if (Configuration.UseSharedMemory) {
@@ -162,8 +168,13 @@ void DistantLand::cullDistantStatics(const D3DXMATRIX* view, const D3DXMATRIX* p
 
     zf = std::min(Configuration.DL.FarStaticEnd * kCellSize, cullDist);
     if (zn < zf) {
-        editProjectionZ(&ds_proj, zn, zf);
-        ds_viewproj = (*view) * ds_proj;
+        // For ultra-wide FOV, use original projection matrix to avoid overly restrictive frustum planes
+        if (Configuration.ScreenFOV > 90.0f) {
+            ds_viewproj = (*view) * (*proj);
+        } else {
+            editProjectionZ(&ds_proj, zn, zf);
+            ds_viewproj = (*view) * ds_proj;
+        }
         ViewFrustum range_frustum(&ds_viewproj);
         viewsphere.w = zf;
         if (Configuration.UseSharedMemory) {
@@ -175,8 +186,13 @@ void DistantLand::cullDistantStatics(const D3DXMATRIX* view, const D3DXMATRIX* p
 
     zf = std::min(Configuration.DL.VeryFarStaticEnd * kCellSize, cullDist);
     if (zn < zf) {
-        editProjectionZ(&ds_proj, zn, zf);
-        ds_viewproj = (*view) * ds_proj;
+        // For ultra-wide FOV, use original projection matrix to avoid overly restrictive frustum planes
+        if (Configuration.ScreenFOV > 90.0f) {
+            ds_viewproj = (*view) * (*proj);
+        } else {
+            editProjectionZ(&ds_proj, zn, zf);
+            ds_viewproj = (*view) * ds_proj;
+        }
         ViewFrustum range_frustum(&ds_viewproj);
         viewsphere.w = zf;
         if (Configuration.UseSharedMemory) {

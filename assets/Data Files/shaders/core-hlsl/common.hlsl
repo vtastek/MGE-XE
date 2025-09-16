@@ -16,6 +16,15 @@ float luminance(float3 color) {
     return dot(color, float3(0.2126, 0.7152, 0.0722));
 }
 
+
+float3 toLinear(float3 c)
+{
+    float3 low = c / 12.92;
+    float3 high = pow((c + 0.055) / 1.055, 2.4);
+    return (c < 0.04045) ? low : high;
+    
+}
+
 // Gamma correction
 float3 linearToGamma(float3 color) {
     return pow(abs(color), 1.0/2.2);
@@ -239,7 +248,7 @@ void BuildPerPixelTBN(
 	B = normalize((-dpdx * dtdy.x + dpdy * dtdx.x) * invDet);
 }
 
-#ifdef HAS_NORMAL
+#if defined(HAS_NORMAL) || defined(HAS_PARAMH)
 // Parallax height and normal parameters
 static const float parallaxScale = 10.2;
 static const float parallaxBias = 0.00005;
@@ -247,33 +256,75 @@ static const float heightScale = -4;
 
 #ifdef USE_SIMPLE_PARALLAX
 // Simple offset parallax mapping (no raymarch, just single offset)
+// Added channel parameter: 0=r, 1=g, 2=b, 3=a
 float2 ParallaxSimple(
 	sampler2D hmap,
 	float2 uv,
 	float3 Vts,
-	float heightScale)
+	float heightScale,
+	int channel = 3)  // Default to alpha channel for backward compatibility
 {
-	float h = 2 * (1 - tex2D(hmap, uv).a) - 1;
+	float4 hmapSample = tex2D(hmap, uv);
+	float h;
+	if (channel == 0) h = hmapSample.r;
+	else if (channel == 1) h = hmapSample.g;  // _paramh uses green for height
+	else if (channel == 2) h = hmapSample.b;
+	else h = hmapSample.a;  // Legacy _nh uses alpha for height
+
+	h = 2 * (1 - h) - 1;
 	float2 offset = (h * heightScale) * (-Vts.xy / max(Vts.z, 1e-3));
 	return uv + offset;
 }
 #endif
 
 // Soft parallax shadowing for parallax-mapped surfaces
+// Added channel parameter: 0=r, 1=g, 2=b, 3=a
 float ParallaxSoftShadow(
 	sampler2D hmap,
 	float2 uv,
 	float2 lightDirTS,
 	float soften,
-	float scale)
+	float scale,
+	int channel = 3)  // Default to alpha channel for backward compatibility
 {
-	float h0 = 1.0 - tex2D(hmap, uv).a;
-	float h = h0;
+	float h0, h;
+	float4 sample0 = tex2D(hmap, uv);
+	if (channel == 0) h0 = 1.0 - sample0.r;
+	else if (channel == 1) h0 = 1.0 - sample0.g;  // _paramh uses green for height
+	else if (channel == 2) h0 = 1.0 - sample0.b;
+	else h0 = 1.0 - sample0.a;  // Legacy _nh uses alpha for height
+
+	h = h0;
 	float2 lDir = -lightDirTS * scale;
-	h = min(1.0, 1.0 - tex2D(hmap, uv + 0.20 * lDir).a);
-	h = min(h, 1.0 - tex2D(hmap, uv + 0.35 * lDir).a);
-	h = min(h, 1.0 - tex2D(hmap, uv + 0.45 * lDir).a);
-	h = min(h, 1.0 - tex2D(hmap, uv + 0.55 * lDir).a);
+
+	// Sample height at multiple points along light direction
+	float4 sample1 = tex2D(hmap, uv + 0.20 * lDir);
+	float4 sample2 = tex2D(hmap, uv + 0.35 * lDir);
+	float4 sample3 = tex2D(hmap, uv + 0.45 * lDir);
+	float4 sample4 = tex2D(hmap, uv + 0.55 * lDir);
+
+	if (channel == 0) {
+		h = min(1.0, 1.0 - sample1.r);
+		h = min(h, 1.0 - sample2.r);
+		h = min(h, 1.0 - sample3.r);
+		h = min(h, 1.0 - sample4.r);
+	} else if (channel == 1) {
+		h = min(1.0, 1.0 - sample1.g);
+		h = min(h, 1.0 - sample2.g);
+		h = min(h, 1.0 - sample3.g);
+		h = min(h, 1.0 - sample4.g);
+	} else if (channel == 2) {
+		h = min(1.0, 1.0 - sample1.b);
+		h = min(h, 1.0 - sample2.b);
+		h = min(h, 1.0 - sample3.b);
+		h = min(h, 1.0 - sample4.b);
+	} else {
+		h = min(1.0, 1.0 - sample1.a);
+		h = min(h, 1.0 - sample2.a);
+		h = min(h, 1.0 - sample3.a);
+		h = min(h, 1.0 - sample4.a);
+	}
+
 	float shadowpara = min(1.0, 1.0 - saturate((h0 - h) * soften));
 	return shadowpara;
 }

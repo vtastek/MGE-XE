@@ -401,11 +401,11 @@ static std::string extractBaseName(const std::string& texPath) {
     if (baseName.length() > 10 && baseName.substr(baseName.length() - 10) == "_diffparam") {
         return baseName.substr(0, baseName.length() - 10);
     }
-    if (baseName.length() > 3 && baseName.substr(baseName.length() - 3) == "_nh") {
-        return baseName.substr(0, baseName.length() - 3);
+    if (baseName.length() > 7 && baseName.substr(baseName.length() - 7) == "_paramh") {
+        return baseName.substr(0, baseName.length() - 7);
     }
-    if (baseName.length() > 6 && baseName.substr(baseName.length() - 6) == "_param") {
-        return baseName.substr(0, baseName.length() - 6);
+    if (baseName.length() > 7 && baseName.substr(baseName.length() - 7) == "_paramx") {
+        return baseName.substr(0, baseName.length() - 7);
     }
     
     return baseName;
@@ -427,11 +427,11 @@ static const char* getSuffixType(const std::string& texPath) {
     if (baseName.length() > 10 && baseName.substr(baseName.length() - 10) == "_diffparam") {
         return "diffparam";
     }
-    if (baseName.length() > 3 && baseName.substr(baseName.length() - 3) == "_nh") {
-        return "normal";
+    if (baseName.length() > 7 && baseName.substr(baseName.length() - 7) == "_paramh") {
+        return "paramh";
     }
-    if (baseName.length() > 6 && baseName.substr(baseName.length() - 6) == "_param") {
-        return "param";
+    if (baseName.length() > 7 && baseName.substr(baseName.length() - 7) == "_paramx") {
+        return "paramx";
     }
     
     return nullptr; // Base texture
@@ -491,12 +491,12 @@ static void scanDirectoryForSuffixes(const std::string& basePath, const std::str
             } else if (filename.length() > 13 && filename.substr(filename.length() - 14) == "_diffparam.dds") {
                 isSuffixFile = true;
                 suffixType = "diffparam";
-            } else if (filename.length() > 7 && filename.substr(filename.length() - 7) == "_nh.dds") {
+            } else if (filename.length() > 10 && filename.substr(filename.length() - 11) == "_paramh.dds") {
                 isSuffixFile = true;
-                suffixType = "normal";
-            } else if (filename.length() > 10 && filename.substr(filename.length() - 10) == "_param.dds") {
+                suffixType = "paramh";
+            } else if (filename.length() > 10 && filename.substr(filename.length() - 11) == "_paramx.dds") {
                 isSuffixFile = true;
-                suffixType = "param";
+                suffixType = "paramx";
             }
             
             if (isSuffixFile) {
@@ -512,10 +512,10 @@ static void scanDirectoryForSuffixes(const std::string& basePath, const std::str
                     LOG::logline("DEBUG: Storing _diffparam variant for base %s: %s", baseName.c_str(), variants.diffparam.c_str());
                 } else if (suffixType == "diffparam_t") {
                     variants.diffparam_t = fullRelativePath;
-                } else if (suffixType == "normal") {
-                    variants.normal = fullRelativePath;
-                } else if (suffixType == "param") {
-                    variants.param = fullRelativePath;
+                } else if (suffixType == "paramh") {
+                    variants.paramh = fullRelativePath;
+                } else if (suffixType == "paramx") {
+                    variants.paramx = fullRelativePath;
                 }
                 
                 suffixFilesFound++;
@@ -595,10 +595,10 @@ void buildTextureSuffixDatabase() {
         std::string suffixPath;
         if (!variants.diffparam.empty()) {
             suffixPath = variants.diffparam;
-        } else if (!variants.normal.empty()) {
-            suffixPath = variants.normal;
-        } else if (!variants.param.empty()) {
-            suffixPath = variants.param;
+        } else if (!variants.paramh.empty()) {
+            suffixPath = variants.paramh;
+        } else if (!variants.paramx.empty()) {
+            suffixPath = variants.paramx;
         }
         
         // Determine the directory where the suffix was found
@@ -960,10 +960,10 @@ IDirect3DTexture9* loadSuffixTexture(IDirect3DDevice9* dev, const TextureSuffixV
         texturePath = variants.diffparam.c_str();
     } else if (strcmp(suffixType, "diffparam_t") == 0 && variants.hasDiffParamT()) {
         texturePath = variants.diffparam_t.c_str();
-    } else if (strcmp(suffixType, "normal") == 0 && variants.hasNormal()) {
-        texturePath = variants.normal.c_str();
-    } else if (strcmp(suffixType, "param") == 0 && variants.hasParam()) {
-        texturePath = variants.param.c_str();
+    } else if (strcmp(suffixType, "paramh") == 0 && variants.hasParamH()) {
+        texturePath = variants.paramh.c_str();
+    } else if (strcmp(suffixType, "paramx") == 0 && variants.hasParamX()) {
+        texturePath = variants.paramx.c_str();
     }
     
     if (texturePath) {
@@ -1230,17 +1230,24 @@ void buildBSATextureHashDatabase(IDirect3DDevice9* dev) {
                 auto existingEntry = textureHashToName.find(texHash);
                 if (existingEntry != textureHashToName.end()) {
                     hashCollisions++;
+                    LOG::logline("!! HASH COLLISION: %08x -> '%s' conflicts with existing '%s' - DROPPING TEXTURE",
+                               texHash.crc32, baseName.c_str(), existingEntry->second.c_str());
                 } else {
                     // Add to hash database
                     textureHashToName[texHash] = baseName;
                     texturesMatched++;
+                    LOG::logline("Hash stored: %08x -> '%s'", texHash.crc32, baseName.c_str());
                 }
 
+            } else {
+                LOG::logline("!! HASH FAILED: %08x (zero hash) for '%s' - texture skipped", texHash.crc32, baseName.c_str());
             }
-            
+
             baseTexture->Release();
+        } else {
+            LOG::logline("!! TEXTURE LOAD FAILED: Could not load '%s' from %s", baseName.c_str(), variants.baseTextureSource.c_str());
         }
-        
+
         texturesHashed++;
     }
     

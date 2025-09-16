@@ -61,8 +61,8 @@ std::unordered_map<FixedFunctionShader::VertexShaderKey, IDirect3DVertexShader9*
 // Current suffix texture flags for shader variant generation
 struct SuffixTextureFlags {
     bool hasDiffParam = false;
-    bool hasNormal = false;
-    bool hasParam = false;
+    bool hasParamH = false;
+    bool hasParamX = false;
     bool hasGrass = false;
 } static suffixFlags;
 
@@ -88,10 +88,10 @@ struct SuffixBindingState {
     IDirect3DTexture9* lastBaseTexture;  // Texture pointer for fast comparison
     std::string currentBaseTextureName;
     IDirect3DTexture9* boundDiffParam;
-    IDirect3DTexture9* boundNormal;
-    IDirect3DTexture9* boundParam;
+    IDirect3DTexture9* boundParamH;
+    IDirect3DTexture9* boundParamX;
     
-    SuffixBindingState() : lastBaseTexture(nullptr), boundDiffParam(nullptr), boundNormal(nullptr), boundParam(nullptr) {}
+    SuffixBindingState() : lastBaseTexture(nullptr), boundDiffParam(nullptr), boundParamH(nullptr), boundParamX(nullptr) {}
 };
 static SuffixBindingState bindingCache;
 
@@ -117,15 +117,15 @@ static SuffixTextureFlags getSuffixFlagsForTexture(IDirect3DDevice9* device, IDi
         const std::string* textureName = BSA::resolveTextureNameFromHash(texHash);
         if (textureName) {
             // Hash lookup successful
-            // LOG::logline("RUNTIME HASH MATCH: %08x -> %s", texHash.crc32, textureName->c_str());
+            LOG::logline("RUNTIME HASH MATCH: %08x -> %s", texHash.crc32, textureName->c_str());
             
             // Look up suffix variants for this specific texture
             const BSA::TextureSuffixVariants* variants = BSA::getTextureSuffixVariants(textureName->c_str());
-            if (variants && (variants->hasDiffParam() || variants->hasNormal() || variants->hasParam() || variants->hasGrass())) {
+            if (variants && (variants->hasDiffParam() || variants->hasParamH() || variants->hasParamX() || variants->hasGrass())) {
                 // Set flags based on available suffix variants (combinations allowed)
                 flags.hasDiffParam = variants->hasDiffParam() || variants->hasDiffParamT();
-                flags.hasNormal = variants->hasNormal();
-                flags.hasParam = variants->hasParam();
+                flags.hasParamH = variants->hasParamH();
+                flags.hasParamX = variants->hasParamX();
                 flags.hasGrass = variants->hasGrass();
                 
                 // DEBUG: Log suffix selection decision and the actual variant paths
@@ -140,7 +140,7 @@ static SuffixTextureFlags getSuffixFlagsForTexture(IDirect3DDevice9* device, IDi
             }
         } else {
             // Hash lookup failed
-            // LOG::logline("RUNTIME HASH FAILED: %08x -> NO MATCH FOUND", texHash.crc32);
+            LOG::logline("RUNTIME HASH FAILED: %08x -> NO MATCH FOUND", texHash.crc32);
         }
     }
     
@@ -309,8 +309,8 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
         
         // Most basic variants needed for immediate rendering
         struct EssentialVariant {
-            int lighting; int noPointLights; int vertexCol; int skinning; 
-            int hasDiffParam; int hasNormal; int hasParam; int fogMode; int stages;
+            int lighting; int noPointLights; int vertexCol; int skinning;
+            int hasDiffParam; int hasParamH; int hasParamX; int fogMode; int stages;
         };
         
         EssentialVariant essentials[] = {
@@ -332,8 +332,8 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
             sk.vertexMaterial = variant.vertexCol + 1;
             sk.usesSkinning = variant.skinning;
             sk.hasDiffParam = variant.hasDiffParam;
-            sk.hasNormal = variant.hasNormal;
-            sk.hasParam = variant.hasParam;
+            sk.hasParamH = variant.hasParamH;
+            sk.hasParamX = variant.hasParamX;
             sk.fogMode = variant.fogMode;
             sk.activeStages = variant.stages;
             sk.hasShadows = ((Configuration.MGEFlags & USE_SHADOWS) && (Configuration.MGEFlags & USE_DISTANT_LAND)) ? 1 : 0;
@@ -385,43 +385,43 @@ void FixedFunctionShader::startEarlyPrecache(IDirect3DDevice* d) {
                 // Same essential variants as in the main precaching
                 struct ShaderVariant {
                     int lighting;
-                    int noPointLights; 
+                    int noPointLights;
                     int vertexCol;
                     int skinning;
                     int hasDiffParam;
-                    int hasNormal;
-                    int hasParam;
+                    int hasParamH;
+                    int hasParamX;
                     int fogMode;
                     int stages;
                 };
                 
                 ShaderVariant variants[] = {
-                    // Basic unlit variants (2)
+                    // Basic unlit variants (2) - format: {lighting, noPointLights, vertexCol, skinning, hasDiffParam, hasParamH, hasParamX, fogMode, stages}
                     {0, 1, 0, 0, 0, 0, 0, 1, 1}, {0, 1, 1, 0, 0, 0, 0, 1, 1},
-                    
+
                     // Basic lit variants - sun only (4)
                     {1, 1, 0, 0, 0, 0, 0, 1, 1}, {1, 1, 1, 0, 0, 0, 0, 1, 1}, {1, 1, 0, 1, 0, 0, 0, 1, 1}, {1, 1, 1, 1, 0, 0, 0, 1, 1},
-                    
+
                     // Lit with point lights (4)
                     {1, 0, 0, 0, 0, 0, 0, 1, 1}, {1, 0, 1, 0, 0, 0, 0, 1, 1}, {1, 0, 0, 1, 0, 0, 0, 1, 1}, {1, 0, 1, 1, 0, 0, 0, 1, 1},
-                    
+
                     // Diffparam variants - most important for terrain (8)
                     {1, 1, 0, 0, 1, 0, 0, 1, 1}, {1, 1, 1, 0, 1, 0, 0, 1, 1}, {1, 0, 0, 0, 1, 0, 0, 1, 1}, {1, 0, 1, 0, 1, 0, 0, 1, 1},
                     {1, 1, 0, 1, 1, 0, 0, 1, 1}, {1, 1, 1, 1, 1, 0, 0, 1, 1}, {1, 0, 0, 1, 1, 0, 0, 1, 1}, {1, 0, 1, 1, 1, 0, 0, 1, 1},
-                    
-                    // Normal map variants (8)
+
+                    // ParamH variants (8) - replaces normal map variants
                     {1, 1, 0, 0, 0, 1, 0, 1, 1}, {1, 1, 1, 0, 0, 1, 0, 1, 1}, {1, 0, 0, 0, 0, 1, 0, 1, 1}, {1, 0, 1, 0, 0, 1, 0, 1, 1},
                     {1, 1, 0, 1, 0, 1, 0, 1, 1}, {1, 1, 1, 1, 0, 1, 0, 1, 1}, {1, 0, 0, 1, 0, 1, 0, 1, 1}, {1, 0, 1, 1, 0, 1, 0, 1, 1},
-                    
-                    // Diffparam + normal combinations (8)
+
+                    // Diffparam + ParamH combinations (8)
                     {1, 1, 0, 0, 1, 1, 0, 1, 1}, {1, 1, 1, 0, 1, 1, 0, 1, 1}, {1, 0, 0, 0, 1, 1, 0, 1, 1}, {1, 0, 1, 0, 1, 1, 0, 1, 1},
                     {1, 1, 0, 1, 1, 1, 0, 1, 1}, {1, 1, 1, 1, 1, 1, 0, 1, 1}, {1, 0, 0, 1, 1, 1, 0, 1, 1}, {1, 0, 1, 1, 1, 1, 0, 1, 1},
-                    
-                    // Param variants (8)
+
+                    // ParamX variants (8) - replaces param variants
                     {1, 1, 0, 0, 0, 0, 1, 1, 1}, {1, 1, 1, 0, 0, 0, 1, 1, 1}, {1, 0, 0, 0, 0, 0, 1, 1, 1}, {1, 0, 1, 0, 0, 0, 1, 1, 1},
                     {1, 1, 0, 1, 0, 0, 1, 1, 1}, {1, 1, 1, 1, 0, 0, 1, 1, 1}, {1, 0, 0, 1, 0, 0, 1, 1, 1}, {1, 0, 1, 1, 0, 0, 1, 1, 1},
-                    
-                    // Full combination variants (8)
+
+                    // Full combination variants - diffparam + paramh + paramx (8)
                     {1, 1, 0, 0, 1, 1, 1, 1, 1}, {1, 1, 1, 0, 1, 1, 1, 1, 1}, {1, 0, 0, 0, 1, 1, 1, 1, 1}, {1, 0, 1, 0, 1, 1, 1, 1, 1},
                     {1, 1, 0, 1, 1, 1, 1, 1, 1}, {1, 1, 1, 1, 1, 1, 1, 1, 1}, {1, 0, 0, 1, 1, 1, 1, 1, 1}, {1, 0, 1, 1, 1, 1, 1, 1, 1},
                     
@@ -489,8 +489,8 @@ void FixedFunctionShader::startEarlyPrecache(IDirect3DDevice* d) {
                     sk.vertexMaterial = v.vertexCol + 1;
                     sk.usesSkinning = v.skinning;
                     sk.hasDiffParam = v.hasDiffParam;
-                    sk.hasNormal = v.hasNormal;
-                    sk.hasParam = v.hasParam;
+                    sk.hasParamH = v.hasParamH;
+                    sk.hasParamX = v.hasParamX;
                     sk.hasGrass = 0; // Precache without grass specific variants
                     sk.fogMode = v.fogMode;
                     sk.activeStages = v.stages;
@@ -545,8 +545,8 @@ void FixedFunctionShader::precacheAsync() {
                     int vertexCol;
                     int skinning;
                     int hasDiffParam;
-                    int hasNormal;
-                    int hasParam;
+                    int hasParamH;
+                    int hasParamX;
                     int fogMode;
                     int stages;
                 };
@@ -646,8 +646,6 @@ void FixedFunctionShader::precacheAsync() {
                 sk.vertexMaterial = v.vertexCol + 1;
                 sk.usesSkinning = v.skinning;
                 sk.hasDiffParam = v.hasDiffParam;
-                sk.hasNormal = v.hasNormal;
-                sk.hasParam = v.hasParam;
                 sk.hasGrass = 0; // Precache without grass specific variants
                 sk.fogMode = v.fogMode;
                 sk.activeStages = v.stages;
@@ -717,8 +715,6 @@ void FixedFunctionShader::precacheAsync() {
                 // Shader uses #ifdef HAS_DIFFPARAM, #ifdef HAS_NORMAL, #ifdef HAS_PARAM
                 // Note: These are compile-time defines for the collapsed shader that handles all combinations
                 sk.hasDiffParam = 1;
-                sk.hasNormal = 1; 
-                sk.hasParam = 1;
                 sk.hasGrass = 0; // Let grass shaders compile on demand
                 
                 // Fog mode: 1=standard, 2=alpha blending (diffparam textures)
@@ -1326,21 +1322,21 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         // Set texture suffix flags based on actual availability
         if (cacheIt->second.hasValidName && cacheIt->second.variants) {
             sk.hasDiffParam = cacheIt->second.variants->hasDiffParam() || cacheIt->second.variants->hasDiffParamT();
-            sk.hasNormal = cacheIt->second.variants->hasNormal();
-            sk.hasParam = cacheIt->second.variants->hasParam();
+            sk.hasParamH = cacheIt->second.variants->hasParamH();
+            sk.hasParamX = cacheIt->second.variants->hasParamX();
             sk.hasGrass = cacheIt->second.variants->hasGrass();
         } else {
             // No suffix variants available, use base texture only
             sk.hasDiffParam = 0;
-            sk.hasNormal = 0;
-            sk.hasParam = 0;
+            sk.hasParamH = 0;
+            sk.hasParamX = 0;
             sk.hasGrass = 0;
         }
     } else {
         // No texture bound, no suffixes
         sk.hasDiffParam = 0;
-        sk.hasNormal = 0;
-        sk.hasParam = 0;
+        sk.hasParamH = 0;
+        sk.hasParamX = 0;
         sk.hasGrass = 0;
     }
     
@@ -1383,7 +1379,7 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
             }
             
             // If no point light fallback found, try texture suffix fallbacks
-            if (!foundFallback && (sk.hasDiffParam || sk.hasNormal || sk.hasParam)) {
+            if (!foundFallback && (sk.hasDiffParam || sk.hasParamH || sk.hasParamX)) {
                 // Try progressively simpler texture combinations
                 ShaderKey textureFallbackSk = sk;
                 
@@ -1398,10 +1394,11 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
                 }
                 
                 // Step 2: Remove normal but keep param
-                if (sk.hasNormal && !foundFallback) {
+                if (sk.hasParamH && !foundFallback) {
                     textureFallbackSk = sk;
                     textureFallbackSk.hasDiffParam = 0;
-                    textureFallbackSk.hasNormal = 0;
+                    textureFallbackSk.hasParamH = 0;
+                    textureFallbackSk.hasParamX = 0;
                     auto fallbackIter = cacheHLSLShaders.find(textureFallbackSk);
                     if (fallbackIter != cacheHLSLShaders.end()) {
                         fallbackShader = fallbackIter->second;
@@ -1413,8 +1410,8 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
                 if (!foundFallback) {
                     textureFallbackSk = sk;
                     textureFallbackSk.hasDiffParam = 0;
-                    textureFallbackSk.hasNormal = 0;
-                    textureFallbackSk.hasParam = 0;
+                    textureFallbackSk.hasParamH = 0;
+                    textureFallbackSk.hasParamX = 0;
                     auto fallbackIter = cacheHLSLShaders.find(textureFallbackSk);
                     if (fallbackIter != cacheHLSLShaders.end()) {
                         fallbackShader = fallbackIter->second;
@@ -1431,8 +1428,8 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
                 // Force base texture settings
                 universalSk.heavyLighting = 0;
                 universalSk.hasDiffParam = 0;
-                universalSk.hasNormal = 0;
-                universalSk.hasParam = 0;
+                universalSk.hasParamH = 0;
+                universalSk.hasParamX = 0;
 
                 // Try all 8 universal combinations: point lights (0/1+) × vertex color (0/1) × skinning (0/1)
                 for (int pointLightMode = 0; pointLightMode <= 1 && !foundFallback; ++pointLightMode) {
@@ -1466,7 +1463,7 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
     
     // Static suffix texture support - shaders are precached for all combinations
     // Actual suffix texture binding will be handled by the HLSL shader internally
-    if (sk.hasDiffParam || sk.hasNormal || sk.hasParam) {
+    if (sk.hasDiffParam || sk.hasParamH || sk.hasParamX) {
         // Fast check: if same texture pointer, skip all expensive operations
         if (bindingCache.lastBaseTexture != rs->texture) {
             // Check texture suffix resolution cache first
@@ -1494,8 +1491,8 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
                     // Base texture changed, update cache and bind new suffix textures
                     bindingCache.currentBaseTextureName = cacheIt->second.textureName;
                     bindingCache.boundDiffParam = nullptr;
-                    bindingCache.boundNormal = nullptr;
-                    bindingCache.boundParam = nullptr;
+                    bindingCache.boundParamH = nullptr;
+                    bindingCache.boundParamX = nullptr;
                     
                     // Clear suffix texture slots (diffparam now uses slot 0 as base)
                     device->SetTexture(3, nullptr);  // Clear normal slot  
@@ -1505,20 +1502,20 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
                         // Note: diffparam is now loaded as base texture (slot 0) instead of slot 2
                         // This eliminates the need for complex shader ifdef logic
                         
-                        if (sk.hasNormal && cacheIt->second.variants->hasNormal()) {
-                            IDirect3DTexture9* normalTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *cacheIt->second.variants, "normal");
-                            if (normalTexture) {
-                                device->SetTexture(3, normalTexture);  // Bind to slot 3  
-                                bindingCache.boundNormal = normalTexture;
+                        if (sk.hasParamH && cacheIt->second.variants->hasParamH()) {
+                            IDirect3DTexture9* paramhTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *cacheIt->second.variants, "paramh");
+                            if (paramhTexture) {
+                                device->SetTexture(2, paramhTexture);  // Bind to slot 2
+                                bindingCache.boundParamH = paramhTexture;
                             }
                         }
-                        
-                        if (sk.hasParam && cacheIt->second.variants->hasParam()) {
-                            IDirect3DTexture9* paramTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *cacheIt->second.variants, "param");
-                            if (paramTexture) {
-                                device->SetTexture(4, paramTexture);  // Bind to slot 4  
-                                bindingCache.boundParam = paramTexture;
-                                // LOG::logline("DEBUG BIND: param -> slot 4, texture ptr=%p", paramTexture);
+
+                        if (sk.hasParamX && cacheIt->second.variants->hasParamX()) {
+                            IDirect3DTexture9* paramxTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *cacheIt->second.variants, "paramx");
+                            if (paramxTexture) {
+                                device->SetTexture(3, paramxTexture);  // Bind to slot 3
+                                bindingCache.boundParamX = paramxTexture;
+                                // LOG::logline("DEBUG BIND: paramx -> slot 3, texture ptr=%p", paramxTexture);
                             }
                         }
                     }
@@ -1531,7 +1528,7 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
     // Bind shadow texture and matrices if shadows are enabled
     if (sk.hasShadows) {
         // Bind shadow texture to slot 5
-        device->SetTexture(5, DistantLand::texSoftShadow);
+        device->SetTexture(4, DistantLand::texSoftShadow);
         
         // Use current device view matrix, not cached distant land view
         D3DXMATRIX currentView, inverseView, viewToShadow[2];
@@ -2037,7 +2034,7 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         
         // Bind shadow texture to sampler 5 (matches shader expectation s5)
         if (DistantLand::texSoftShadow) {
-            device->SetTexture(5, DistantLand::texSoftShadow);
+            device->SetTexture(4, DistantLand::texSoftShadow);
         }
         
         if (primaryTexture) {
@@ -2123,8 +2120,8 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
             hlslShader.psConstantTable->SetFloat(device, hAlphaRef, rs->alphaRef / 255.0f);
         }
         
-        // Set normres constant if HAS_NORMAL is defined and normal texture is bound
-        if (sk.hasNormal) {
+        // Set normres constant if HAS_PARAMH is defined and paramh texture is bound
+        if (sk.hasParamH) {
             IDirect3DBaseTexture9* normalTexture;
             device->GetTexture(3, &normalTexture);  // Get texture from slot 3
             if (normalTexture && normalTexture->GetType() == D3DRTYPE_TEXTURE) {
@@ -2512,13 +2509,13 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         defines[defineCount++] = {"HAS_DIFFPARAM", "1"};
         // LOG::logline("HLSL: Compiling with HAS_DIFFPARAM define");
     }
-    if (sk.hasNormal) {
-        defines[defineCount++] = {"HAS_NORMAL", "1"};
-        // LOG::logline("HLSL: Compiling with HAS_NORMAL define");
+    if (sk.hasParamH) {
+        defines[defineCount++] = {"HAS_PARAMH", "1"};
+        // LOG::logline("HLSL: Compiling with HAS_PARAMH define");
     }
-    if (sk.hasParam) {
-        defines[defineCount++] = {"HAS_PARAM", "1"};
-        // LOG::logline("HLSL: Compiling with HAS_PARAM define");
+    if (sk.hasParamX) {
+        defines[defineCount++] = {"HAS_PARAMX", "1"};
+        // LOG::logline("HLSL: Compiling with HAS_PARAMX define");
     }
     if (sk.hasGrass) {
         defines[defineCount++] = {"HAS_GRASS", "1"};

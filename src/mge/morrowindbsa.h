@@ -14,16 +14,16 @@ namespace BSA {
         std::string baseName;
         std::string diffparam;         // _diffparam texture path
         std::string diffparam_t;       // _diffparam_t texture path (terrain)
-        std::string normal;            // _nh texture path
-        std::string param;             // _param texture path
-        std::string baseTextureSource; // "loose" or "bsa"  
+        std::string paramh;            // _paramh texture path (metallic/roughness/IOR or metallic/height/IOR)
+        std::string paramx;            // _paramx texture path (aniso rotation/strength/metallic)
+        std::string baseTextureSource; // "loose" or "bsa"
         std::string baseTexturePath;   // Full path to base texture
         bool isGrassTexture;           // True if texture is in grass folder
-        
+
         bool hasDiffParam() const { return !diffparam.empty(); }
         bool hasDiffParamT() const { return !diffparam_t.empty(); }
-        bool hasNormal() const { return !normal.empty(); }
-        bool hasParam() const { return !param.empty(); }
+        bool hasParamH() const { return !paramh.empty(); }
+        bool hasParamX() const { return !paramx.empty(); }
         bool hasGrass() const { return isGrassTexture; }
     };
     

@@ -11,6 +11,12 @@
 float minDot = 1e-5;
 float dot_c(float3 a, float3 b) { return max(dot(a, b), minDot); }
 
+// Reflected light result
+struct LightResult
+{
+    float3 ambient, diffuse, specular;
+};
+
 float2 EnvBRDFApprox(float NoV, float roughness)
 {
 	float4 c0 = float4(-1.0, -0.0275, -0.572, 0.022);
@@ -65,12 +71,12 @@ float GeometrySmith(float3 N, float3 V, float3 L, float roughness)
 	return ggx1 * ggx2;
 }
 
-float3 LambertDiffuse(float3 albedo, float3 kD)
+float3 LambertDiffuse(float3 kD)
 {
-	return kD * albedo / PI;
+	return kD / PI;
 }
 
-float3 OrenNayarDiffuse(float3 L, float3 V, float3 N, float roughness, float3 albedo, float3 kD)
+float3 OrenNayarDiffuse(float3 L, float3 V, float3 N, float roughness, float3 kD)
 {
 	float NdotL = max(dot(N, L), 0.0f);
 	float NdotV = max(dot(N, V), 0.0f);
@@ -86,11 +92,14 @@ float3 OrenNayarDiffuse(float3 L, float3 V, float3 N, float roughness, float3 al
 		Bt *= sin(alpha) * clamp(tan(beta), -PI_DIV2, PI_DIV2);
 	else
 		Bt = 0.0f;
-	return (At + Bt) * albedo * kD / PI;
+	return (At + Bt) * kD / PI;
 }
 
-float3 BRDF(float3 N, float3 V, float3 L, float3 albedo, float metalness, float roughness, float roughnessPrime, float radius, float3 F0, int isOrenNayar, float shadows)
+LightResult BRDF(float3 N, float3 V, float3 L, float3 albedo, float metalness, float roughness, float roughnessPrime, float radius, float3 F0, int isOrenNayar, float shadows)
 {
+	LightResult lr;
+	lr.ambient = float3(0, 0, 0);  // No ambient in BRDF
+
 	float3 H = normalize(V + L);
 	float NdotH = max(dot(N, H), 0.0);
 	float NdotH2 = NdotH * NdotH;
@@ -103,10 +112,13 @@ float3 BRDF(float3 N, float3 V, float3 L, float3 albedo, float metalness, float 
 	float3 F = FresnelSchlick(max(dot(V, H), 0.0), F0);
 	float3 kS = F;
 	float3 kD = (float3(1.0, 1.0, 1.0) - kS) * (1.0 - metalness);
-	float amask = step(0.05, dot(albedo, 0.33));
-	float3 Is = NDF * G * F * amask;
-	float3 Id = isOrenNayar != 0 ? OrenNayarDiffuse(L, V, N, roughness, albedo, kD) : LambertDiffuse(albedo, kD);
-	return Id + Is * max(0.0,shadows-0.09);
+	//float amask = step(0.05, dot(albedo, 0.33));
+
+	// Separate diffuse and specular
+	lr.diffuse = isOrenNayar != 0 ? OrenNayarDiffuse(L, V, N, roughness, kD) : LambertDiffuse(kD);
+	lr.specular = NDF * G * F; //* amask * max(0.0, shadows - 0.09);
+
+	return lr;
 }
 
 #endif // LIGHTING_HLSL_INCLUDED

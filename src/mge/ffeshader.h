@@ -86,8 +86,8 @@ class FixedFunctionShader {
         DWORD projectiveTexgen : 1;
         DWORD texgenStage : 3;
         DWORD hasDiffParam : 1;        // Has diffuse parameter texture (_diffparam)
-        DWORD hasNormal : 1;           // Has normal map texture (_nh)
-        DWORD hasParam : 1;            // Has parameter texture (_param)
+        DWORD hasParamH : 1;           // Has parameter texture (_paramh: metallic/roughness|height/IOR)
+        DWORD hasParamX : 1;           // Has anisotropic texture (_paramx: aniso rotation/strength/metallic)
         DWORD hasShadows : 1;          // Has shadow mapping enabled
         DWORD hasGrass : 1;            // Is grass texture (enables vertex animation and A2C)
 
