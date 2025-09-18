@@ -252,16 +252,16 @@ void BuildPerPixelTBN(
 // Parallax height and normal parameters
 static const float parallaxScale = 10.2;
 static const float parallaxBias = 0.00005;
-static const float heightScale = -4;
+static const float heightScale = -16;
 
-#ifdef USE_SIMPLE_PARALLAX
+#ifdef USE_PARALLAX
 // Simple offset parallax mapping (no raymarch, just single offset)
 // Added channel parameter: 0=r, 1=g, 2=b, 3=a
-float2 ParallaxSimple(
+float2 Parallax(
 	sampler2D hmap,
 	float2 uv,
 	float3 Vts,
-	float heightScale,
+	float hs,
 	int channel = 3)  // Default to alpha channel for backward compatibility
 {
 	float4 hmapSample = tex2D(hmap, uv);
@@ -272,7 +272,7 @@ float2 ParallaxSimple(
 	else h = hmapSample.a;  // Legacy _nh uses alpha for height
 
 	h = 2 * (1 - h) - 1;
-	float2 offset = (h * heightScale) * (-Vts.xy / max(Vts.z, 1e-3));
+	float2 offset = (h * hs) * (-Vts.xy / max(Vts.z, 1e-3));
 	return uv + offset;
 }
 #endif

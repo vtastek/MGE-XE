@@ -2123,7 +2123,7 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         // Set normres constant if HAS_PARAMH is defined and paramh texture is bound
         if (sk.hasParamH) {
             IDirect3DBaseTexture9* normalTexture;
-            device->GetTexture(3, &normalTexture);  // Get texture from slot 3
+            device->GetTexture(2, &normalTexture);  // Get texture from slot 2
             if (normalTexture && normalTexture->GetType() == D3DRTYPE_TEXTURE) {
                 IDirect3DTexture9* tex = static_cast<IDirect3DTexture9*>(normalTexture);
                 

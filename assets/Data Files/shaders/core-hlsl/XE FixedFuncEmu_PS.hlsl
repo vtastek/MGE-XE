@@ -42,19 +42,21 @@ texture tex3 : register(t3);  // Anisotropic map (_paramx: aniso rotation/streng
 #if defined(HAS_SHADOWS)
 texture tex4 : register(t4);  // Shadow map
 #endif
-sampler sampTex0 : register(s0) = sampler_state{ texture = <tex0>; };  // Base or diffparam texture
-sampler sampTex1 : register(s1) = sampler_state{ texture = <tex1>; };  // Detail texture
+sampler sampTex0 : register(s0) = sampler_state{ texture = <tex0>; minfilter = anisotropic; magfilter = linear; mipfilter = linear; maxanisotropy = 16; };  // Base or diffparam texture
+sampler sampTex1 : register(s1) = sampler_state{ texture = <tex1>; minfilter = anisotropic; magfilter = linear; mipfilter = linear; maxanisotropy = 16; };  // Detail texture
 #if defined(HAS_PARAMH)
-sampler sampTex2 : register(s2) = sampler_state{ texture = <tex2>; };  // Parameter map (_paramh)
+sampler sampTex2 : register(s2) = sampler_state{ texture = <tex2>; minfilter = anisotropic; magfilter = linear; mipfilter = linear; maxanisotropy = 16; };  // Parameter map (_paramh)
 #endif
 #if defined(HAS_PARAMX)
-sampler sampTex3 : register(s3) = sampler_state{ texture = <tex3>; };  // Anisotropic map (_paramx)
+sampler sampTex3 : register(s3) = sampler_state{ texture = <tex3>; minfilter = anisotropic; magfilter = linear; mipfilter = linear; maxanisotropy = 16; };  // Anisotropic map (_paramx)
 #endif
 #if defined(HAS_SHADOWS)
 sampler sampShadow : register(s4) = sampler_state{ texture = <tex4>; addressu = border; addressv = border; bordercolor = 0xffffffff; minfilter = linear; magfilter = linear; }; // Shadow map
  
 // Shadow resolution parameter (will be set via shader constants)
 float shadowRcpRes : register(c10);
+// View inverse matrix for converting view-space normals to world space
+matrix viewInverse : register(c18);
 #endif
 
 // Alpha testing/blending flag
@@ -65,7 +67,8 @@ bool hasAlpha;
 //#define HAS_PARAMH     // _paramh metallic/roughness|height/IOR (tex2)
 //#define HAS_PARAMX     // _paramx aniso rotation/strength/metallic (tex3)
 
-#define USE_SIMPLE_PARALLAX // Enable this for simple offset parallax mapping
+#define USE_PARALLAX // Enable this for simple offset parallax mapping
+//#define USE_PARALLAX_SHADOWS // Enable this for simple offset parallax mapping
 #ifdef HAS_PARAMH
 float2 normres;  // Parameter map texture resolution (width, height) for height mapping
 #endif
@@ -99,7 +102,7 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 	float2 parallaxUV = input.texcoord;
 	float3 normalVS = normalize(input.normal);
 	
-	float3 ambient = INTENSITY * pow(lightSceneAmbient + EPS, 2.2) / PI;
+	float3 ambient = INTENSITY * pow((lightSceneAmbient) + EPS, 2.2) / PI;
 
 	#ifdef HAS_SHADOWS
 		float ndotlgeo = 1;
@@ -110,8 +113,6 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 		float shadows = shadowSample(input.shadow0pos, input.shadow1pos, ndotlgeo, hasAlpha ? 1.0 : 0.0);
 		deb = shadows; // returns 0 black
 		#endif
-	#else
-		float shadows = 1.0; // No shadows - fully lit
 	#endif
 
 	#if defined(HAS_NORMAL) || defined(HAS_PARAMH)
@@ -133,19 +134,25 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 
 	// Height mapping and normal calculation using _paramh green channel
 	#if defined(HAS_PARAMH)
-		#if defined(USE_SIMPLE_PARALLAX)
+		#if defined(USE_PARALLAX)
 		// Use height from green channel of _paramh texture
-		parallaxUV = ParallaxSimple(sampTex2, parallaxUV, Vts, 0.000015 * 1.33, 1); // heightScale, green channel
+		parallaxUV = Parallax(sampTex2, parallaxUV, Vts, 0.000015 * 1.33, 1); // heightScale, green channel
 		#endif
 
 		// Calculate normal from height gradient in green channel
+		
+		float deriv = 1.5;
+		// if(parallaxUV.x > 0.5)
+			// deriv = 2.0;
+		
 		float2 texel = 1.0 / normres;
-		float hL = tex2D(sampTex2, parallaxUV + float2(-texel.x, 0)).g; // Green = height
-		float hR = tex2D(sampTex2, parallaxUV + float2(texel.x, 0)).g;
-		float hD = tex2D(sampTex2, parallaxUV + float2(0, -texel.y)).g;
-		float hU = tex2D(sampTex2, parallaxUV + float2(0,  texel.y)).g;
+		float hL = tex2D(sampTex2, parallaxUV + float2(-texel.x * deriv, 0)).g; // Green = height
+		float hR = tex2D(sampTex2, parallaxUV + float2(texel.x * deriv, 0)).g;
+		float hD = tex2D(sampTex2, parallaxUV + float2(0, -texel.y * deriv)).g;
+		float hU = tex2D(sampTex2, parallaxUV + float2(0,  texel.y * deriv)).g;
 		float dhdu = (hR - hL);
 		float dhdv = (hU - hD);
+
 		float3 nTS = normalize(float3(-dhdu * heightScale, dhdv * heightScale, 1.0));
 
 		normalVS = normalize(mul(nTS, TBN));
@@ -153,8 +160,10 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 			#ifndef NOLIT
 			float3 lightDirVS = -lightSunDirection;
 			float3 lightDirTS = mul(lightDirVS, TBN_T);
-			float shadowpara = ParallaxSoftShadow(sampTex2, input.texcoord, lightDirTS.xy, 5.0, 0.04 * 0.75, 1); // green channel
-			shadows *= shadowpara;
+				#ifdef USE_PARALLAX_SHADOWS
+					float shadowpara = ParallaxSoftShadow(sampTex2, input.texcoord, lightDirTS.xy, 5.0, 0.04 * 0.75, 1); // green channel
+					shadows *= shadowpara;
+				#endif
 			#endif
 	#else
 		// No height mapping - use interpolated normal
@@ -164,6 +173,7 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 
 	float4 texColor = tex2D(sampTex0, parallaxUV);
 	texColor.rgb = max(0.0, toLinear(texColor.rgb));
+	//texColor.rgb = 0.18;
 	// Note: When HAS_DIFFPARAM is defined, sampTex0 contains the _diffparam/_diffparam_t texture
 	#ifdef HAS_DIFFPARAM
 	texColor.a = 1.0; // Ignore alpha from _diffparam texture
@@ -266,7 +276,7 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 		float dist = length(L);
 		L = L / dist;
 
-		float falloff = 41*lightFalloffQuadratic[i] * dist * dist + lightFalloffConstant;
+		float falloff = 40 * lightFalloffQuadratic[i] * dist * dist + lightFalloffConstant;
 		float t = saturate(dist / 350.0);
 		float cutoff = 1.0 - t * t * t * t;
 		float attenuation = (falloff > 0.0) ? (1.0 / falloff) * cutoff : 0.0;
@@ -287,8 +297,8 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 			// }
 		#endif
 
-		float3 pointIntensity = INTENSITY * pow(max(0.0, lightDiffuse[i].rgb) + EPS, 2.2) * NdotL_point * attenuation;
-		diffuseLight += pointLR.diffuse * pointIntensity;
+		float3 pointIntensity = 10 * INTENSITY * pow(max(0.0, lightDiffuse[i].rgb) + EPS, 2.2) * NdotL_point * attenuation;
+		diffuseLight +=  pointLR.diffuse * pointIntensity;
 	
 		#if defined(HAS_PARAMH) || defined(HAS_NORMAL)
 		specularLight += pointLR.specular * pointIntensity;
