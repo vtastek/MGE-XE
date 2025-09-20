@@ -1527,7 +1527,7 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
     
     // Bind shadow texture and matrices if shadows are enabled
     if (sk.hasShadows) {
-        // Bind shadow texture to slot 5
+        // Bind shadow texture to slot 4
         device->SetTexture(4, DistantLand::texSoftShadow);
         
         // Use current device view matrix, not cached distant land view
@@ -2031,11 +2031,7 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         }
         
         // Suffix texture processing is now handled per-texture in renderMorrowindHLSL()
-        
-        // Bind shadow texture to sampler 5 (matches shader expectation s5)
-        if (DistantLand::texSoftShadow) {
-            device->SetTexture(4, DistantLand::texSoftShadow);
-        }
+        // Shadow texture already bound earlier in the function at line 1531
         
         if (primaryTexture) {
             primaryTexture->Release();
@@ -2239,7 +2235,7 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::createPurpleErrorShader() {
     // Compile vertex shader
     ID3DBlob* vsBlob = nullptr;
     ID3DBlob* vsErrors = nullptr;
-    DWORD vsCompileFlags = isDXVK() ? D3DCOMPILE_SKIP_OPTIMIZATION : D3DCOMPILE_SKIP_OPTIMIZATION;
+    DWORD vsCompileFlags = isDXVK() ? D3DCOMPILE_OPTIMIZATION_LEVEL1 : D3DCOMPILE_OPTIMIZATION_LEVEL3;
     HRESULT hr = D3DCompile(vsCode, strlen(vsCode), "ErrorShader.hlsl", nullptr, nullptr, 
                            "vs_main", "vs_3_0", vsCompileFlags, 0, &vsBlob, &vsErrors);
     
@@ -2255,7 +2251,7 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::createPurpleErrorShader() {
     // Compile pixel shader
     ID3DBlob* psBlob = nullptr;
     ID3DBlob* psErrors = nullptr;
-    DWORD psCompileFlags = isDXVK() ? D3DCOMPILE_SKIP_OPTIMIZATION : D3DCOMPILE_SKIP_OPTIMIZATION;
+    DWORD psCompileFlags = isDXVK() ? D3DCOMPILE_OPTIMIZATION_LEVEL1 : D3DCOMPILE_OPTIMIZATION_LEVEL3;
     hr = D3DCompile(psCode, strlen(psCode), "ErrorShader.hlsl", nullptr, nullptr, 
                    "ps_main", "ps_3_0", psCompileFlags, 0, &psBlob, &psErrors);
     
@@ -2545,9 +2541,9 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     
     DWORD vsCompileFlags = D3DCOMPILE_PREFER_FLOW_CONTROL | D3DCOMPILE_IEEE_STRICTNESS;
     if (isDXVK()) {
-        vsCompileFlags |= D3DCOMPILE_SKIP_OPTIMIZATION;
+        vsCompileFlags |= D3DCOMPILE_OPTIMIZATION_LEVEL1;
     } else {
-        vsCompileFlags |= D3DCOMPILE_SKIP_OPTIMIZATION;
+        vsCompileFlags |= D3DCOMPILE_OPTIMIZATION_LEVEL3;
     }
     
     HRESULT hr = D3DCompile(
@@ -2608,9 +2604,9 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     
     DWORD psCompileFlags = D3DCOMPILE_PREFER_FLOW_CONTROL | D3DCOMPILE_IEEE_STRICTNESS;
     if (isDXVK()) {
-        psCompileFlags |= D3DCOMPILE_SKIP_OPTIMIZATION;
+        psCompileFlags |= D3DCOMPILE_OPTIMIZATION_LEVEL1;
     } else {
-        psCompileFlags |= D3DCOMPILE_SKIP_OPTIMIZATION;
+        psCompileFlags |= D3DCOMPILE_OPTIMIZATION_LEVEL3;
     }
     
     hr = D3DCompile(
