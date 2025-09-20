@@ -103,14 +103,14 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 	float3 normalVS = normalize(input.normal);
 	
 	float3 ambient = INTENSITY * pow((lightSceneAmbient) + EPS, 2.2) / PI;
-
+	float shadows = 1.0;
 	#ifdef HAS_SHADOWS
 		float ndotlgeo = 1;
 		#ifndef NOLIT
 		ndotlgeo = dot(normalVS, -normalize(lightSunDirection));
 		//deb = ndotlgeo;
 		
-		float shadows = shadowSample(input.shadow0pos, input.shadow1pos, ndotlgeo, hasAlpha ? 1.0 : 0.0);
+		shadows = shadowSample(input.shadow0pos, input.shadow1pos, ndotlgeo, hasAlpha ? 1.0 : 0.0);
 		deb = shadows; // returns 0 black
 		#endif
 	#endif
