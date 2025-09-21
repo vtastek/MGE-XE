@@ -21,21 +21,18 @@ ShadowVertOut ShadowVS(StatVertIn IN) {
     ShadowVertOut OUT;
 	
 	float4 pos = IN.pos;
-	    // Apply wind animation to match HLSL pipeline exactly
-    if(vertexBlendState < 0.5) { // Rigid vertex (non-skinned)
-		#ifdef HAS_GRASS
-				// Use grass displacement for grass geometry
-				float3 displacement = grassDisplacement(IN.pos.xyz, IN.pos.z, 2.5);
-				pos.xy += (1 - IN.color.z) * displacement.xy;
-		#else
-				// Apply wind animation to alpha-tested geometry (trees, bushes, etc.)
-				if (hasAlpha) {
-					float3 displacement = grassDisplacement(IN.pos.xyz, IN.pos.z, 1.0);
-					pos.xyz += displacement;
-				}
-		#endif
-	}
-		
+	// Apply wind animation to match HLSL pipeline exactly
+	#ifdef HAS_GRASS
+			// Use grass displacement for grass geometry
+			float3 displacement = grassDisplacement(IN.pos.xyz, IN.pos.z, 2.5);
+			pos.xy += (1 - IN.color.z) * displacement.xy;
+	#else
+			// Apply wind animation to alpha-tested geometry (trees, bushes, etc.)
+			if (hasAlpha) {
+				float3 displacement = grassDisplacement(IN.pos.xyz, IN.pos.z, 1.0);
+				pos.xyz += displacement;
+			}
+	#endif	
 
     OUT.pos = mul(pos, world);
     OUT.pos = mul(OUT.pos, shadowViewProj[0]);
