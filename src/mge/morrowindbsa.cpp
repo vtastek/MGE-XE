@@ -610,8 +610,8 @@ void buildTextureSuffixDatabase() {
         
         // Look for base texture in the same directory as the suffix
         std::string looseBasePath = "Data Files\\textures\\" + baseName + ".dds";
-        
-        // Replace forward slashes with backslashes for Windows file system
+
+        // Replace ALL forward slashes with backslashes for Windows file system consistency
         std::replace(looseBasePath.begin(), looseBasePath.end(), '/', '\\');
         
         WIN32_FIND_DATA fileData;
@@ -644,7 +644,7 @@ void buildTextureSuffixDatabase() {
             }
         }
     }
-    
+
     // Phase 3: Move to final database (entries with found base textures OR grass textures)
     for (const auto& pair : suffixMap) {
         const TextureSuffixVariants& variants = pair.second;
@@ -1156,11 +1156,10 @@ void buildBSATextureHashDatabase(IDirect3DDevice9* dev) {
         
         // Load base texture based on source (loose overrides BSA)
         if (variants.baseTextureSource == "loose") {
-            // Load from loose file
-            D3DPOOL runtimePool = Configuration.UseDefaultTexturePool ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED;
+            // Load from loose file using SAME parameters as runtime loadTextureExact()
             hr = D3DXCreateTextureFromFileEx(dev, variants.baseTexturePath.c_str(),
-                D3DX_DEFAULT, D3DX_DEFAULT, D3DX_DEFAULT, 0, D3DFMT_UNKNOWN,
-                runtimePool, D3DX_DEFAULT, D3DX_DEFAULT, 0, nullptr, nullptr, &baseTexture);
+                D3DX_FROM_FILE, D3DX_FROM_FILE, D3DX_FROM_FILE, 0, D3DFMT_UNKNOWN,
+                D3DPOOL_DEFAULT, D3DX_FILTER_NONE, D3DX_FILTER_NONE, 0, 0, 0, &baseTexture);
         }
         else if (variants.baseTextureSource == "bsa") {
             // Load from BSA file using proven BSALoadFile method
