@@ -30,9 +30,11 @@ int pointLightCount; // Number of real point lights
 // Fog
 float3 fogColNear;
 
-// Textures with explicit register bindings for DX9 HLSL
+// Textures with explicit register bindings for DX9 HLSL (original slot order)
 texture tex0 : register(t0);  // Base texture (or _diffparam when diffparam replaces base)
-texture tex1 : register(t1);  // Detail texture
+#if defined(HAS_DETAIL)
+texture tex1 : register(t1);  // Detail texture (conditional only)
+#endif
 #if defined(HAS_PARAMH)
 texture tex2 : register(t2);  // Parameter map (_paramh: metallic/roughness|height/IOR)
 #endif
@@ -40,10 +42,12 @@ texture tex2 : register(t2);  // Parameter map (_paramh: metallic/roughness|heig
 texture tex3 : register(t3);  // Anisotropic map (_paramx: aniso rotation/strength/metallic)
 #endif
 #if defined(HAS_SHADOWS)
-texture tex4 : register(t4);  // Shadow map
+texture tex4 : register(t4);  // Shadow map (original slot)
 #endif
 sampler sampTex0 : register(s0) = sampler_state{ texture = <tex0>; minfilter = anisotropic; magfilter = linear; mipfilter = linear; maxanisotropy = 16; };  // Base or diffparam texture
-sampler sampTex1 : register(s1) = sampler_state{ texture = <tex1>; minfilter = anisotropic; magfilter = linear; mipfilter = linear; maxanisotropy = 16; };  // Detail texture
+#if defined(HAS_DETAIL)
+sampler sampDetail : register(s1) = sampler_state{ texture = <tex1>; minfilter = anisotropic; magfilter = linear; mipfilter = linear; maxanisotropy = 16; }; // Detail texture (conditional)
+#endif
 #if defined(HAS_PARAMH)
 sampler sampTex2 : register(s2) = sampler_state{ texture = <tex2>; minfilter = anisotropic; magfilter = linear; mipfilter = linear; maxanisotropy = 16; };  // Parameter map (_paramh)
 #endif
@@ -51,8 +55,10 @@ sampler sampTex2 : register(s2) = sampler_state{ texture = <tex2>; minfilter = a
 sampler sampTex3 : register(s3) = sampler_state{ texture = <tex3>; minfilter = anisotropic; magfilter = linear; mipfilter = linear; maxanisotropy = 16; };  // Anisotropic map (_paramx)
 #endif
 #if defined(HAS_SHADOWS)
-sampler sampShadow : register(s4) = sampler_state{ texture = <tex4>; addressu = border; addressv = border; bordercolor = 0xffffffff; minfilter = linear; magfilter = linear; }; // Shadow map
- 
+sampler sampShadow : register(s4) = sampler_state{ texture = <tex4>; addressu = border; addressv = border; bordercolor = 0xffffffff; minfilter = linear; magfilter = linear; }; // Shadow map (original slot)
+#endif
+
+#if defined(HAS_SHADOWS)
 // Shadow resolution parameter (will be set via shader constants)
 float shadowRcpRes : register(c10);
 // View inverse matrix for converting view-space normals to world space
@@ -68,7 +74,7 @@ bool hasAlpha;
 //#define HAS_PARAMX     // _paramx aniso rotation/strength/metallic (tex3)
 
 #define USE_PARALLAX // Enable this for simple offset parallax mapping
-//#define USE_PARALLAX_SHADOWS // Enable this for simple offset parallax mapping
+#define USE_PARALLAX_SHADOWS // Enable this for simple offset parallax mapping
 #ifdef HAS_PARAMH
 float2 normres;  // Parameter map texture resolution (width, height) for height mapping
 #endif

@@ -6,6 +6,7 @@
 #include "distantshader.h"
 #include "postshaders.h"
 #include "mwbridge.h"
+#include "ffeshader.h"
 
 
 
@@ -17,6 +18,9 @@ void DistantLand::renderStage0() {
     auto mwBridge = MWBridge::get();
     IDirect3DStateBlock9* stateSaved;
     UINT passes;
+
+    // Reset frame-to-frame hash cache for new frame
+    FixedFunctionShader::newFrame();
 
     // Update current cell and select distant static set
     selectDistantCell();

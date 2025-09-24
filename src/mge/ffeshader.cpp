@@ -49,6 +49,18 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::hlslShaderDefaultPurple;
 
 // Material state cache static member
 FixedFunctionShader::MaterialStateCache FixedFunctionShader::materialCache;
+
+// Texture binding cache static member
+FixedFunctionShader::TextureBindingCache FixedFunctionShader::textureCache;
+
+// Default textures static members
+IDirect3DTexture9* FixedFunctionShader::defaultWhiteTexture = nullptr;
+IDirect3DTexture9* FixedFunctionShader::defaultBlackTexture = nullptr;
+IDirect3DTexture9* FixedFunctionShader::defaultNormalTexture = nullptr;
+
+// Original detail texture storage
+IDirect3DBaseTexture9* FixedFunctionShader::savedOriginalDetailTexture = nullptr;
+
 std::unordered_map<std::string, FixedFunctionShader::CachedShaderSource> FixedFunctionShader::shaderSourceCache;
 bool FixedFunctionShader::needsCacheReset = false;
 
@@ -358,6 +370,9 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
         LOG::logline("-- Starting early shader precaching");
         precacheAsync();
     }
+
+    // Create default textures to avoid null binds that cause DXVK descriptor updates
+    createDefaultTextures();
 
     return true;
 }
@@ -1308,10 +1323,179 @@ static inline void setCachedFVF(IDirect3DDevice9* device, DWORD fvf, DWORD& cach
     }
 }
 
+// Texture binding cache helper function with DXVK optimization
+void FixedFunctionShader::setCachedTexture(IDirect3DDevice9* device, DWORD stage, IDirect3DTexture9* texture) {
+    // Replace null textures with appropriate defaults to avoid DXVK descriptor updates
+    IDirect3DTexture9* actualTexture = texture;
+    if (!texture) {
+        switch (stage) {
+            case 0: // Base texture slot
+            case 2: // ParamH slot (metallic/roughness)
+                actualTexture = defaultWhiteTexture;
+                break;
+            case 1: // Normal texture slot
+            case 3: // ParamX slot (anisotropic/normal)
+                actualTexture = defaultNormalTexture;
+                break;
+            case 4: // Shadow slot
+            default:
+                actualTexture = defaultBlackTexture;
+                break;
+        }
+    }
+
+    if (textureCache.needsUpdate(stage, actualTexture)) {
+        device->SetTexture(stage, actualTexture);
+        textureCache.updateCache(stage, actualTexture);
+    }
+}
+
+// Create default textures to avoid null binds that cause DXVK descriptor updates
+void FixedFunctionShader::createDefaultTextures() {
+    if (!device) return;
+
+    // Create 1x1 white texture (for missing diffuse/param textures)
+    if (device->CreateTexture(1, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &defaultWhiteTexture, nullptr) == S_OK) {
+        D3DLOCKED_RECT lockedRect;
+        if (defaultWhiteTexture->LockRect(0, &lockedRect, nullptr, 0) == S_OK) {
+            *(DWORD*)lockedRect.pBits = 0xFFFFFFFF; // White ARGB
+            defaultWhiteTexture->UnlockRect(0);
+        }
+    }
+
+    // Create 1x1 black texture (for missing specular/height textures)
+    if (device->CreateTexture(1, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &defaultBlackTexture, nullptr) == S_OK) {
+        D3DLOCKED_RECT lockedRect;
+        if (defaultBlackTexture->LockRect(0, &lockedRect, nullptr, 0) == S_OK) {
+            *(DWORD*)lockedRect.pBits = 0xFF000000; // Black ARGB (alpha=1, rgb=0)
+            defaultBlackTexture->UnlockRect(0);
+        }
+    }
+
+    // Create 1x1 normal texture (128,128,255,255 for flat normal map)
+    if (device->CreateTexture(1, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &defaultNormalTexture, nullptr) == S_OK) {
+        D3DLOCKED_RECT lockedRect;
+        if (defaultNormalTexture->LockRect(0, &lockedRect, nullptr, 0) == S_OK) {
+            *(DWORD*)lockedRect.pBits = 0xFF8080FF; // Normal map: A=255, R=128, G=128, B=255
+            defaultNormalTexture->UnlockRect(0);
+        }
+    }
+
+    LOG::logline("-- Created default textures for DXVK optimization");
+}
+
+// Smart texture binding - only binds slots that the shader actually uses
+void FixedFunctionShader::bindShaderTextures(const ShaderKey& sk, const RenderedState* rs) {
+    // Original slot assignment (keeping existing layout):
+    // Slot 0: Base texture (always bound)
+    // Slot 1: Detail texture (conditional with ifdef)
+    // Slot 2: ParamH metallic/roughness
+    // Slot 3: ParamX anisotropic
+    // Slot 4: Shadow map
+
+    // Slot 0: Base texture or diffparam replacement (always used by HLSL shaders)
+    IDirect3DTexture9* baseTexture = rs->texture;
+
+    // Check for diffparam replacement if shader supports it
+    if (sk.hasDiffParam) {
+        auto cacheIt = textureSuffixResolutionCache.find(rs->texture);
+        if (cacheIt != textureSuffixResolutionCache.end() &&
+            cacheIt->second.hasValidName && cacheIt->second.variants) {
+
+            // Try diffparam_t first, then regular diffparam
+            IDirect3DTexture9* replacementTexture = nullptr;
+            if (cacheIt->second.variants->hasDiffParamT()) {
+                replacementTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device,
+                                                          *cacheIt->second.variants, "diffparam_t");
+            }
+            if (!replacementTexture && cacheIt->second.variants->hasDiffParam()) {
+                replacementTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device,
+                                                          *cacheIt->second.variants, "diffparam");
+            }
+
+            if (replacementTexture) {
+                baseTexture = replacementTexture;
+            }
+        }
+    }
+
+    setCachedTexture(device, 0, baseTexture);
+
+    // Slot 1: Detail texture (conditional only - with ifdef support)
+    if (sk.hasDetail && savedOriginalDetailTexture) {
+        setCachedTexture(device, 1, static_cast<IDirect3DTexture9*>(savedOriginalDetailTexture));
+    }
+
+    // Slots 2-3: Suffix textures (only if shader has suffix support)
+    if (sk.hasDiffParam || sk.hasParamH || sk.hasParamX) {
+        // Fast check: if same texture pointer, skip all expensive operations
+        if (bindingCache.lastBaseTexture != rs->texture) {
+            // Check texture suffix resolution cache first
+            auto cacheIt = textureSuffixResolutionCache.find(rs->texture);
+            if (cacheIt == textureSuffixResolutionCache.end()) {
+                // Not in cache, perform expensive resolution
+                TextureSuffixResolutionCache entry;
+                entry.hash = BSA::calculateTextureHash((IDirect3DDevice9*)device, rs->texture, false);
+                const std::string* textureName = BSA::resolveTextureNameFromHash(entry.hash);
+                if (textureName && entry.hash.crc32 != 0) {
+                    entry.textureName = *textureName;
+                    entry.hasValidName = true;
+                    entry.variants = BSA::getTextureSuffixVariants(textureName->c_str());
+                } else {
+                    entry.hasValidName = false;
+                    entry.variants = nullptr;
+                }
+
+                // Cache the result
+                textureSuffixResolutionCache[rs->texture] = entry;
+                cacheIt = textureSuffixResolutionCache.find(rs->texture);
+            }
+
+            if (cacheIt->second.hasValidName) {
+                if (bindingCache.currentBaseTextureName != cacheIt->second.textureName) {
+                    // Reset cache when texture changes
+                    bindingCache.currentBaseTextureName = cacheIt->second.textureName;
+                    bindingCache.boundDiffParam = nullptr;
+                    bindingCache.boundParamH = nullptr;
+                    bindingCache.boundParamX = nullptr;
+
+                    if (cacheIt->second.variants) {
+                        // Slot 2: ParamH (metallic/roughness)
+                        if (sk.hasParamH && cacheIt->second.variants->hasParamH()) {
+                            IDirect3DTexture9* paramhTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *cacheIt->second.variants, "paramh");
+                            if (paramhTexture) {
+                                setCachedTexture(device, 2, paramhTexture);
+                                bindingCache.boundParamH = paramhTexture;
+                            }
+                        }
+
+                        // Slot 3: ParamX (anisotropic)
+                        if (sk.hasParamX && cacheIt->second.variants->hasParamX()) {
+                            IDirect3DTexture9* paramxTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *cacheIt->second.variants, "paramx");
+                            if (paramxTexture) {
+                                setCachedTexture(device, 3, paramxTexture);
+                                bindingCache.boundParamX = paramxTexture;
+                            }
+                        }
+                    }
+                }
+                bindingCache.lastBaseTexture = rs->texture;
+            }
+        }
+    }
+
+    // Slot 4: Shadow map
+    if (sk.hasShadows) {
+        setCachedTexture(device, 4, DistantLand::texSoftShadow);
+    }
+}
+
+
 // HLSL Pipeline Implementation
 void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
     // Process any completed async shader compilations
     processAsyncCompletions();
+
     
     HLSLShader hlslShader;
 
@@ -1362,6 +1546,15 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
     
     // Set shadow flag based on MGE configuration - shadows require both USE_SHADOWS and USE_DISTANT_LAND
     sk.hasShadows = ((Configuration.MGEFlags & USE_SHADOWS) && (Configuration.MGEFlags & USE_DISTANT_LAND)) ? 1 : 0;
+
+    // Check if Morrowind bound a detail texture to slot 1 (frequency optimization)
+    // Save the original detail texture before we start binding our own textures
+    if (savedOriginalDetailTexture) {
+        savedOriginalDetailTexture->Release(); // Release previous frame's texture
+        savedOriginalDetailTexture = nullptr;
+    }
+    device->GetTexture(1, &savedOriginalDetailTexture);
+    sk.hasDetail = (savedOriginalDetailTexture != nullptr) ? 1 : 0;
 
     if (sk == hlslShaderLRU.last_sk) {
         hlslShader = hlslShaderLRU.shader;
@@ -1481,87 +1674,21 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         hlslShaderLRU.last_sk = sk;
     }
     
-    // Static suffix texture support - shaders are precached for all combinations
-    // Actual suffix texture binding will be handled by the HLSL shader internally
-    if (sk.hasDiffParam || sk.hasParamH || sk.hasParamX) {
-        // Fast check: if same texture pointer, skip all expensive operations
-        if (bindingCache.lastBaseTexture != rs->texture) {
-            // Check texture suffix resolution cache first
-            auto cacheIt = textureSuffixResolutionCache.find(rs->texture);
-            if (cacheIt == textureSuffixResolutionCache.end()) {
-                // Not in cache, perform expensive resolution
-                TextureSuffixResolutionCache entry;
-                entry.hash = BSA::calculateTextureHash((IDirect3DDevice9*)device, rs->texture, false);
-                const std::string* textureName = BSA::resolveTextureNameFromHash(entry.hash);
-                if (textureName && entry.hash.crc32 != 0) {
-                    entry.textureName = *textureName;
-                    entry.hasValidName = true;
-                    entry.variants = BSA::getTextureSuffixVariants(textureName->c_str());
-                } else {
-                    entry.hasValidName = false;
-                    entry.variants = nullptr;
-                }
-                cacheIt = textureSuffixResolutionCache.emplace(rs->texture, std::move(entry)).first;
-            }
-            
-            // Use cached resolution
-            if (cacheIt->second.hasValidName) {
-                // Check if texture name actually changed
-                if (bindingCache.currentBaseTextureName != cacheIt->second.textureName) {
-                    // Base texture changed, update cache and bind new suffix textures
-                    bindingCache.currentBaseTextureName = cacheIt->second.textureName;
-                    bindingCache.boundDiffParam = nullptr;
-                    bindingCache.boundParamH = nullptr;
-                    bindingCache.boundParamX = nullptr;
-                    
-                    // Clear suffix texture slots (diffparam now uses slot 0 as base)
-                    device->SetTexture(3, nullptr);  // Clear normal slot  
-                    device->SetTexture(4, nullptr);  // Clear param slot
-                    
-                    if (cacheIt->second.variants) {
-                        // Note: diffparam is now loaded as base texture (slot 0) instead of slot 2
-                        // This eliminates the need for complex shader ifdef logic
-                        
-                        if (sk.hasParamH && cacheIt->second.variants->hasParamH()) {
-                            IDirect3DTexture9* paramhTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *cacheIt->second.variants, "paramh");
-                            if (paramhTexture) {
-                                device->SetTexture(2, paramhTexture);  // Bind to slot 2
-                                bindingCache.boundParamH = paramhTexture;
-                            }
-                        }
+    // DXVK-optimized texture binding - only touches slots the shader actually uses
+    bindShaderTextures(sk, rs);
 
-                        if (sk.hasParamX && cacheIt->second.variants->hasParamX()) {
-                            IDirect3DTexture9* paramxTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *cacheIt->second.variants, "paramx");
-                            if (paramxTexture) {
-                                device->SetTexture(3, paramxTexture);  // Bind to slot 3
-                                bindingCache.boundParamX = paramxTexture;
-                                // LOG::logline("DEBUG BIND: paramx -> slot 3, texture ptr=%p", paramxTexture);
-                            }
-                        }
-                    }
-                }
-                bindingCache.lastBaseTexture = rs->texture;
-            }
-        }
-    }
-    
-    // Bind shadow texture and matrices if shadows are enabled
+    // Set shadow matrices if shadows are enabled (moved from bindShaderTextures for clarity)
     if (sk.hasShadows) {
-        // Clear legacy MGE effects shadow binding to prevent dual binding in RenderDoc
-        device->SetTexture(3, nullptr);
-        // Bind shadow texture to slot 4 for HLSL shaders
-        device->SetTexture(4, DistantLand::texSoftShadow);
-        
         // Use current device view matrix, not cached distant land view
         D3DXMATRIX currentView, inverseView, viewToShadow[2];
         device->GetTransform(D3DTS_VIEW, &currentView);
         D3DXMatrixInverse(&inverseView, NULL, &currentView);
         viewToShadow[0] = inverseView * DistantLand::smViewproj[0];
         viewToShadow[1] = inverseView * DistantLand::smViewproj[1];
-        
-        device->SetVertexShaderConstantF(20, (float*)&viewToShadow[0], 4); // c20-c23 
+
+        device->SetVertexShaderConstantF(20, (float*)&viewToShadow[0], 4); // c20-c23
         device->SetVertexShaderConstantF(24, (float*)&viewToShadow[1], 4); // c24-c27
-        
+
         // Set shadow resolution parameter
         float shadowRcp = 1.0f / Configuration.DL.ShadowResolution;
         device->SetPixelShaderConstantF(10, &shadowRcp, 1); // c10
@@ -2004,69 +2131,9 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
             hlslShader.psConstantTable->SetVector(device, hFogColNear, &fogColor);
         }
         
-        // Copy texture bindings from device like ID3DXEffect system (supports Combined shader)
-        // Also handle texture suffix identification and loading
-        IDirect3DTexture9* primaryTexture = nullptr;
-        for (int i = 0; i < 6; ++i) {
-            IDirect3DBaseTexture9* tex;
-            device->GetTexture(i, &tex);
-            if (tex) {
-                // Special handling for slot 0 (base texture) - prioritize diffparam
-                if (i == 0 && tex->GetType() == D3DRTYPE_TEXTURE) {
-                    primaryTexture = static_cast<IDirect3DTexture9*>(tex);
-                    primaryTexture->AddRef(); // Keep reference for suffix processing
-                    
-                    // Check if we have a diffparam replacement for this base texture
-                    IDirect3DTexture9* replacementTexture = nullptr;
-                    if (sk.hasDiffParam) {
-                        // Try to get diffparam replacement from cache
-                        auto cacheIt = textureSuffixResolutionCache.find(primaryTexture);
-                        if (cacheIt != textureSuffixResolutionCache.end() && 
-                            cacheIt->second.hasValidName && cacheIt->second.variants) {
-                            
-                            if (cacheIt->second.variants->hasDiffParam() || cacheIt->second.variants->hasDiffParamT()) {
-                                // Try regular _diffparam first, then _diffparam_t
-                                if (cacheIt->second.variants->hasDiffParam()) {
-                                    replacementTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device, 
-                                                                              *cacheIt->second.variants, "diffparam");
-                                }
-                                
-                                if (!replacementTexture && cacheIt->second.variants->hasDiffParamT()) {
-                                    replacementTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device, 
-                                                                              *cacheIt->second.variants, "diffparam_t");
-                                }
-                                
-                                if (replacementTexture) {
-                                    // Use diffparam/diffparam_t as base texture (slot 0) - no alpha preservation needed
-                                    device->SetTexture(i, replacementTexture);
-                                } else {
-                                    LOG::logline("!! Failed to load any diffparam variant texture for %s", cacheIt->second.textureName.c_str());
-                                    // Fallback to original base texture
-                                    device->SetTexture(i, tex);
-                                }
-                            } else {
-                                device->SetTexture(i, tex);
-                            }
-                        } else {
-                            device->SetTexture(i, tex);
-                        }
-                    } else {
-                        device->SetTexture(i, tex);
-                    }
-                } else {
-                    device->SetTexture(i, tex);
-                }
-                
-                tex->Release();
-            }
-        }
-        
-        // Suffix texture processing is now handled per-texture in renderMorrowindHLSL()
-        // Shadow texture already bound earlier in the function at line 1531
-        
-        if (primaryTexture) {
-            primaryTexture->Release();
-        }
+        // NOTE: Texture binding and suffix processing is now handled by bindShaderTextures() above
+        // This includes frequency-optimized slot assignment and proper cache management.
+        // Removed redundant texture copying loop that was interfering with optimized binding.
         
         // HLSL samplers are declared in shader with proper filtering/addressing - no need for manual sampler states
         
@@ -2219,8 +2286,8 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
     device->SetPixelShader(NULL);
 
     // Clear HLSL shadow texture bindings to prevent legacy artifacts
-    device->SetTexture(3, nullptr);  // Clear any legacy MGE effects shadow binding
-    device->SetTexture(4, nullptr);  // Clear HLSL shadow binding
+    FixedFunctionShader::setCachedTexture(device, 3, nullptr);  // Clear any legacy MGE effects shadow binding
+    FixedFunctionShader::setCachedTexture(device, 4, nullptr);  // Clear HLSL shadow binding
 
     // Restore render states that HLSL rendering may have changed
     device->SetRenderState(D3DRS_ALPHABLENDENABLE, savedAlphaBlendEnable);
@@ -2552,6 +2619,10 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         defines[defineCount++] = {"HAS_SHADOWS", "1"};
         // LOG::logline("HLSL: Compiling with HAS_SHADOWS define");
     }
+    if (sk.hasDetail) {
+        defines[defineCount++] = {"HAS_DETAIL", "1"};
+        // LOG::logline("HLSL: Compiling with HAS_DETAIL define");
+    }
     if (!sk.useLighting) {
         defines[defineCount++] = {"NOLIT", "1"};
         // LOG::logline("HLSL: Compiling with NOLIT define (unlit shader)");
@@ -2798,6 +2869,15 @@ void FixedFunctionShader::release() {
 
     // Reset material state cache
     materialCache.reset();
+
+}
+
+void FixedFunctionShader::newFrame() {
+    // Reset material cache for new frame to avoid stale state
+    materialCache.reset();
+
+    // Reset texture binding cache for new frame
+    textureCache.reset();
 }
 
 

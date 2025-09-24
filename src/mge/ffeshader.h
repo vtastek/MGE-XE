@@ -3,6 +3,7 @@
 #include "proxydx/d3d8header.h"
 
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <string>
 #include <thread>
@@ -90,6 +91,7 @@ class FixedFunctionShader {
         DWORD hasParamX : 1;           // Has anisotropic texture (_paramx: aniso rotation/strength/metallic)
         DWORD hasShadows : 1;          // Has shadow mapping enabled
         DWORD hasGrass : 1;            // Is grass texture (enables vertex animation and A2C)
+        DWORD hasDetail : 1;           // Has detail texture (conditional binding to minimize overhead)
 
         struct Stage {
             DWORD colorOp : 6;
@@ -210,6 +212,46 @@ class FixedFunctionShader {
     };
     static MaterialStateCache materialCache;
 
+    // Texture binding cache to minimize redundant SetTexture calls
+    struct TextureBindingCache {
+        IDirect3DTexture9* boundTextures[8];  // Track bound textures for slots 0-7
+        bool textureValid[8];                 // Track which slots have valid cached values
+
+        TextureBindingCache() {
+            reset();
+        }
+
+        void reset() {
+            for (int i = 0; i < 8; i++) {
+                boundTextures[i] = nullptr;
+                textureValid[i] = false;
+            }
+        }
+
+        bool needsUpdate(DWORD stage, IDirect3DTexture9* texture) {
+            if (stage >= 8) return true;  // Outside cache range
+            if (!textureValid[stage]) return true;  // No cached value
+            return boundTextures[stage] != texture;  // Different texture
+        }
+
+        void updateCache(DWORD stage, IDirect3DTexture9* texture) {
+            if (stage < 8) {
+                boundTextures[stage] = texture;
+                textureValid[stage] = true;
+            }
+        }
+    };
+    static TextureBindingCache textureCache;
+
+    // Default textures to avoid null binds that cause DXVK descriptor updates
+    static IDirect3DTexture9* defaultWhiteTexture;
+    static IDirect3DTexture9* defaultBlackTexture;
+    static IDirect3DTexture9* defaultNormalTexture;  // 128,128,255,255 for flat normal
+
+    // Original detail texture storage for frequency optimization
+    static IDirect3DBaseTexture9* savedOriginalDetailTexture;
+
+
     // Async compilation system
     struct AsyncShaderRequest {
         ShaderKey key;
@@ -266,4 +308,8 @@ public:
     static void stopAsyncCompiler();
     static void queueShaderCompilation(const ShaderKey& key);
     static void processAsyncCompletions();
+    static void newFrame(); // Reset caches for new frame
+    static void setCachedTexture(IDirect3DDevice9* device, DWORD stage, IDirect3DTexture9* texture); // Cached texture binding
+    static void createDefaultTextures(); // Create default textures to avoid null binds
+    static void bindShaderTextures(const ShaderKey& sk, const RenderedState* rs); // Smart texture binding for shader
 };
