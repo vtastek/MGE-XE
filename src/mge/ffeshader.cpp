@@ -46,6 +46,9 @@ static bool dxvkDetectionResult = false;
 unordered_map<FixedFunctionShader::ShaderKey, FixedFunctionShader::HLSLShader, FixedFunctionShader::ShaderKey::hasher> FixedFunctionShader::cacheHLSLShaders;
 FixedFunctionShader::HLSLShaderLRU FixedFunctionShader::hlslShaderLRU;
 FixedFunctionShader::HLSLShader FixedFunctionShader::hlslShaderDefaultPurple;
+
+// Material state cache static member
+FixedFunctionShader::MaterialStateCache FixedFunctionShader::materialCache;
 std::unordered_map<std::string, FixedFunctionShader::CachedShaderSource> FixedFunctionShader::shaderSourceCache;
 bool FixedFunctionShader::needsCacheReset = false;
 
@@ -1288,6 +1291,23 @@ string buildArgString(DWORD arg, const string& mask, const string& sampler) {
     return s.str();
 }
 
+// Material state cache helper functions
+static inline void setCachedRenderState(IDirect3DDevice9* device, D3DRENDERSTATETYPE state, DWORD value, DWORD& cachedValue, bool& cacheValid) {
+    if (!cacheValid || cachedValue != value) {
+        device->SetRenderState(state, value);
+        cachedValue = value;
+        cacheValid = true;
+    }
+}
+
+static inline void setCachedFVF(IDirect3DDevice9* device, DWORD fvf, DWORD& cachedFVF, bool& cacheValid) {
+    if (!cacheValid || cachedFVF != fvf) {
+        device->SetFVF(fvf);
+        cachedFVF = fvf;
+        cacheValid = true;
+    }
+}
+
 // HLSL Pipeline Implementation
 void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
     // Process any completed async shader compilations
@@ -1563,40 +1583,43 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
     device->SetVertexShader(hlslShader.vertexShader);
     device->SetPixelShader(hlslShader.pixelShader);
     
-    // Set up render states to match what D3DXEffect was doing
-    // For alpha blended objects, enable depth testing but disable depth writing
+    // Use cached render state setting to minimize redundant SetRenderState calls
+    // Depth and culling states
+    DWORD zEnable, zWriteEnable;
     if (rs->blendEnable) {
-        device->SetRenderState(D3DRS_ZENABLE, TRUE);
-        device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+        zEnable = TRUE;
+        zWriteEnable = FALSE;
     } else {
-        device->SetRenderState(D3DRS_ZENABLE, rs->zWrite ? TRUE : FALSE);
-        device->SetRenderState(D3DRS_ZWRITEENABLE, rs->zWrite ? TRUE : FALSE);
+        zEnable = rs->zWrite ? TRUE : FALSE;
+        zWriteEnable = rs->zWrite ? TRUE : FALSE;
     }
-    device->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
-    device->SetRenderState(D3DRS_CULLMODE, rs->cullMode);
-    // HLSL shaders handle lighting and fog internally - no need to disable legacy fixed function
+
+    setCachedRenderState(device, D3DRS_ZENABLE, zEnable, materialCache.zEnable, materialCache.zEnableValid);
+    setCachedRenderState(device, D3DRS_ZWRITEENABLE, zWriteEnable, materialCache.zWriteEnable, materialCache.zWriteEnableValid);
+    setCachedRenderState(device, D3DRS_ZFUNC, D3DCMP_LESSEQUAL, materialCache.zFunc, materialCache.zFuncValid);
+    setCachedRenderState(device, D3DRS_CULLMODE, rs->cullMode, materialCache.cullMode, materialCache.cullModeValid);
 
     // Disable DX8 specular pipeline that Morrowind.exe might have enabled - HLSL handles specular internally
-    device->SetRenderState(D3DRS_SPECULARENABLE, FALSE);
-    device->SetRenderState(D3DRS_LOCALVIEWER, FALSE);
-    device->SetRenderState(D3DRS_NORMALIZENORMALS, FALSE);
-    
+    setCachedRenderState(device, D3DRS_SPECULARENABLE, FALSE, materialCache.specularEnable, materialCache.specularEnableValid);
+    setCachedRenderState(device, D3DRS_LOCALVIEWER, FALSE, materialCache.localViewer, materialCache.localViewerValid);
+    setCachedRenderState(device, D3DRS_NORMALIZENORMALS, FALSE, materialCache.normalizeNormals, materialCache.normalizeNormalsValid);
+
     // Alpha blending states
-    device->SetRenderState(D3DRS_ALPHABLENDENABLE, rs->blendEnable);
+    setCachedRenderState(device, D3DRS_ALPHABLENDENABLE, rs->blendEnable, materialCache.alphaBlendEnable, materialCache.alphaBlendEnableValid);
     if (rs->blendEnable) {
-        device->SetRenderState(D3DRS_SRCBLEND, rs->srcBlend);
-        device->SetRenderState(D3DRS_DESTBLEND, rs->destBlend);
+        setCachedRenderState(device, D3DRS_SRCBLEND, rs->srcBlend, materialCache.srcBlend, materialCache.srcBlendValid);
+        setCachedRenderState(device, D3DRS_DESTBLEND, rs->destBlend, materialCache.destBlend, materialCache.destBlendValid);
     }
-    
-    // Alpha testing states  
-    device->SetRenderState(D3DRS_ALPHATESTENABLE, rs->alphaTest);
+
+    // Alpha testing states
+    setCachedRenderState(device, D3DRS_ALPHATESTENABLE, rs->alphaTest, materialCache.alphaTestEnable, materialCache.alphaTestEnableValid);
     if (rs->alphaTest) {
-        device->SetRenderState(D3DRS_ALPHAFUNC, rs->alphaFunc);
-        device->SetRenderState(D3DRS_ALPHAREF, rs->alphaRef);
+        setCachedRenderState(device, D3DRS_ALPHAFUNC, rs->alphaFunc, materialCache.alphaFunc, materialCache.alphaFuncValid);
+        setCachedRenderState(device, D3DRS_ALPHAREF, rs->alphaRef, materialCache.alphaRef, materialCache.alphaRefValid);
     }
-    
+
     // Set vertex format (legacy DX8 FVF - HLSL input semantics handle layout internally)
-    device->SetFVF(rs->fvf);
+    setCachedFVF(device, rs->fvf, materialCache.fvf, materialCache.fvfValid);
     
     // Set vertex and index buffers like the original system
     device->SetStreamSource(0, rs->vb, rs->vbOffset, rs->vbStride);
@@ -2772,6 +2795,9 @@ void FixedFunctionShader::release() {
         delete[] i.second.source;
     }
     shaderSourceCache.clear();
+
+    // Reset material state cache
+    materialCache.reset();
 }
 
 

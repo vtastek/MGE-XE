@@ -168,6 +168,48 @@ class FixedFunctionShader {
     static std::unordered_map<std::string, CachedShaderSource> shaderSourceCache;
     static bool needsCacheReset;  // Flag to trigger cache reset after file changes
 
+    // Material state cache to minimize redundant SetRenderState calls
+    struct MaterialStateCache {
+        bool initialized;
+
+        // Depth and culling states
+        DWORD zEnable, zWriteEnable, zFunc, cullMode;
+        bool zEnableValid, zWriteEnableValid, zFuncValid, cullModeValid;
+
+        // Alpha blending states
+        DWORD alphaBlendEnable, srcBlend, destBlend;
+        bool alphaBlendEnableValid, srcBlendValid, destBlendValid;
+
+        // Alpha testing states
+        DWORD alphaTestEnable, alphaFunc, alphaRef;
+        bool alphaTestEnableValid, alphaFuncValid, alphaRefValid;
+
+        // DX8 specular states (always disabled in HLSL)
+        DWORD specularEnable, localViewer, normalizeNormals;
+        bool specularEnableValid, localViewerValid, normalizeNormalsValid;
+
+        // Vertex format
+        DWORD fvf;
+        bool fvfValid;
+
+        MaterialStateCache() : initialized(false),
+            zEnableValid(false), zWriteEnableValid(false), zFuncValid(false), cullModeValid(false),
+            alphaBlendEnableValid(false), srcBlendValid(false), destBlendValid(false),
+            alphaTestEnableValid(false), alphaFuncValid(false), alphaRefValid(false),
+            specularEnableValid(false), localViewerValid(false), normalizeNormalsValid(false),
+            fvfValid(false) {}
+
+        void reset() {
+            initialized = false;
+            zEnableValid = zWriteEnableValid = zFuncValid = cullModeValid = false;
+            alphaBlendEnableValid = srcBlendValid = destBlendValid = false;
+            alphaTestEnableValid = alphaFuncValid = alphaRefValid = false;
+            specularEnableValid = localViewerValid = normalizeNormalsValid = false;
+            fvfValid = false;
+        }
+    };
+    static MaterialStateCache materialCache;
+
     // Async compilation system
     struct AsyncShaderRequest {
         ShaderKey key;
