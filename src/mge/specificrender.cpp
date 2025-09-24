@@ -32,7 +32,10 @@ void VendorSpecificRendering::beginAlphaToCoverage(IDirect3DDevice9* device) {
         device->SetRenderState(D3DRS_ADAPTIVETESS_Y, D3DFMT_ATOC);
         break;
     case ATOC_POINTSIZE:
-        device->SetRenderState(D3DRS_POINTSIZE, D3DFMT_A2M1);
+        // Skip point size render state in HLSL mode to remove legacy artifacts
+        if (Configuration.PerPixelLightFlags != 2) {
+            device->SetRenderState(D3DRS_POINTSIZE, D3DFMT_A2M1);
+        }
         break;
     }
 }
@@ -48,7 +51,10 @@ void VendorSpecificRendering::endAlphaToCoverage(IDirect3DDevice9* device) {
         device->SetRenderState(D3DRS_ADAPTIVETESS_Y, D3DFMT_UNKNOWN);
         break;
     case ATOC_POINTSIZE:
-        device->SetRenderState(D3DRS_POINTSIZE, D3DFMT_A2M0);
+        // Skip point size render state in HLSL mode to remove legacy artifacts
+        if (Configuration.PerPixelLightFlags != 2) {
+            device->SetRenderState(D3DRS_POINTSIZE, D3DFMT_A2M0);
+        }
         break;
     }
 }

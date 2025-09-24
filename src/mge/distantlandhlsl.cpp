@@ -21,8 +21,8 @@ D3DXHANDLE DistantLandHLSL::ehTime, DistantLandHLSL::ehWindVec, DistantLandHLSL:
 bool DistantLandHLSL::init(IDirect3DDevice9* d) {
     device = d;
     
-    // Only enable if configuration flag is set
-    enabled = Configuration.UseDistantLandHLSL || true;  // Temporary: always enable for Phase 8 testing
+    // Only enable if configuration flag is set (Phase 3+)
+    enabled = Configuration.UseDistantLandHLSL;  // Disabled for Phase 2 - only Morrowind object HLSL
     
     if (!enabled) {
         LOG::logline("-- Distant Land HLSL disabled via configuration");

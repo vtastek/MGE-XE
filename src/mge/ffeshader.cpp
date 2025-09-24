@@ -1527,7 +1527,9 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
     
     // Bind shadow texture and matrices if shadows are enabled
     if (sk.hasShadows) {
-        // Bind shadow texture to slot 4
+        // Clear legacy MGE effects shadow binding to prevent dual binding in RenderDoc
+        device->SetTexture(3, nullptr);
+        // Bind shadow texture to slot 4 for HLSL shaders
         device->SetTexture(4, DistantLand::texSoftShadow);
         
         // Use current device view matrix, not cached distant land view
@@ -1545,15 +1547,17 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         device->SetPixelShaderConstantF(10, &shadowRcp, 1); // c10
     }
 
-    // Save current render states before modifying them
-    DWORD savedLighting, savedFogEnable, savedAlphaBlendEnable, savedAlphaTestEnable;
+    // Save current render states before modifying them (only states that HLSL actually changes)
+    DWORD savedAlphaBlendEnable, savedAlphaTestEnable;
     DWORD savedZEnable, savedZWriteEnable;
-    device->GetRenderState(D3DRS_LIGHTING, &savedLighting);
-    device->GetRenderState(D3DRS_FOGENABLE, &savedFogEnable);
+    DWORD savedSpecularEnable, savedLocalViewer, savedNormalizeNormals;
     device->GetRenderState(D3DRS_ALPHABLENDENABLE, &savedAlphaBlendEnable);
     device->GetRenderState(D3DRS_ALPHATESTENABLE, &savedAlphaTestEnable);
     device->GetRenderState(D3DRS_ZENABLE, &savedZEnable);
     device->GetRenderState(D3DRS_ZWRITEENABLE, &savedZWriteEnable);
+    device->GetRenderState(D3DRS_SPECULARENABLE, &savedSpecularEnable);
+    device->GetRenderState(D3DRS_LOCALVIEWER, &savedLocalViewer);
+    device->GetRenderState(D3DRS_NORMALIZENORMALS, &savedNormalizeNormals);
     
     // Set shaders
     device->SetVertexShader(hlslShader.vertexShader);
@@ -1570,8 +1574,12 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
     }
     device->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
     device->SetRenderState(D3DRS_CULLMODE, rs->cullMode);
-    device->SetRenderState(D3DRS_LIGHTING, FALSE);
-    device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+    // HLSL shaders handle lighting and fog internally - no need to disable legacy fixed function
+
+    // Disable DX8 specular pipeline that Morrowind.exe might have enabled - HLSL handles specular internally
+    device->SetRenderState(D3DRS_SPECULARENABLE, FALSE);
+    device->SetRenderState(D3DRS_LOCALVIEWER, FALSE);
+    device->SetRenderState(D3DRS_NORMALIZENORMALS, FALSE);
     
     // Alpha blending states
     device->SetRenderState(D3DRS_ALPHABLENDENABLE, rs->blendEnable);
@@ -1587,7 +1595,7 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         device->SetRenderState(D3DRS_ALPHAREF, rs->alphaRef);
     }
     
-    // Set vertex declaration for the FVF
+    // Set vertex format (legacy DX8 FVF - HLSL input semantics handle layout internally)
     device->SetFVF(rs->fvf);
     
     // Set vertex and index buffers like the original system
@@ -1709,7 +1717,7 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
                     return;
                 }
             }
-            
+
             D3DXHANDLE hMaterialAmbient = hlslShader.psConstantTable->GetConstantByName(NULL, "materialAmbient");
             if (hMaterialAmbient) {
                 HRESULT hr = hlslShader.psConstantTable->SetVector(device, hMaterialAmbient, (D3DXVECTOR4*)&frs->material.ambient);
@@ -1717,7 +1725,7 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
                     return;
                 }
             }
-            
+
             D3DXHANDLE hMaterialEmissive = hlslShader.psConstantTable->GetConstantByName(NULL, "materialEmissive");
             if (hMaterialEmissive) {
                 HRESULT hr = hlslShader.psConstantTable->SetVector(device, hMaterialEmissive, (D3DXVECTOR4*)&frs->material.emissive);
@@ -2037,12 +2045,7 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
             primaryTexture->Release();
         }
         
-        // Set proper sampler states for texturing
-        device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
-        device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
-        device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
-        device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
-        device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+        // HLSL samplers are declared in shader with proper filtering/addressing - no need for manual sampler states
         
         // Set missing constants that the Combined shader expects
         D3DXHANDLE hTexgenTransform = hlslShader.vsConstantTable->GetConstantByName(NULL, "texgenTransform");
@@ -2191,14 +2194,19 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
     // Restore device state after HLSL rendering (like the original system does)
     device->SetVertexShader(NULL);
     device->SetPixelShader(NULL);
-    
-    // Restore critical render states that affect other rendering modes
-    device->SetRenderState(D3DRS_LIGHTING, savedLighting);
-    device->SetRenderState(D3DRS_FOGENABLE, savedFogEnable);
+
+    // Clear HLSL shadow texture bindings to prevent legacy artifacts
+    device->SetTexture(3, nullptr);  // Clear any legacy MGE effects shadow binding
+    device->SetTexture(4, nullptr);  // Clear HLSL shadow binding
+
+    // Restore render states that HLSL rendering may have changed
     device->SetRenderState(D3DRS_ALPHABLENDENABLE, savedAlphaBlendEnable);
     device->SetRenderState(D3DRS_ALPHATESTENABLE, savedAlphaTestEnable);
     device->SetRenderState(D3DRS_ZENABLE, savedZEnable);
     device->SetRenderState(D3DRS_ZWRITEENABLE, savedZWriteEnable);
+    device->SetRenderState(D3DRS_SPECULARENABLE, savedSpecularEnable);
+    device->SetRenderState(D3DRS_LOCALVIEWER, savedLocalViewer);
+    device->SetRenderState(D3DRS_NORMALIZENORMALS, savedNormalizeNormals);
 }
 
 FixedFunctionShader::HLSLShader FixedFunctionShader::createPurpleErrorShader() {
