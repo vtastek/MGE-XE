@@ -294,6 +294,28 @@ class FixedFunctionShader {
     static HLSLShader createPurpleErrorShader();
     static void captureAndDumpTexture(IDirect3DTexture9* texture);
 
+    // HLSL Render Dispatch Recording System
+    struct HLSLRenderCall {
+        const RenderedState* rs;
+        const FragmentState* frs;
+        LightState* lightrs;
+        ShaderKey sk;
+
+        // Copy constructor to capture render state data
+        HLSLRenderCall(const RenderedState* rs_, const FragmentState* frs_, LightState* lightrs_)
+            : rs(rs_), frs(frs_), lightrs(lightrs_), sk(rs_, frs_, lightrs_) {}
+    };
+
+    static std::vector<HLSLRenderCall> recordedCalls;
+    static bool isRecording;
+    static bool isReplaying;
+
+    static void startRecording();
+    static void stopRecordingAndReplay();
+    static void recordRenderCall(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);
+    static void replayRecordedCalls();
+    static void renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);
+
 public:
     static bool init(IDirect3DDevice* d, ID3DXEffectPool* pool);
     static void startEarlyPrecache(IDirect3DDevice* d);

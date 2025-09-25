@@ -47,6 +47,11 @@ unordered_map<FixedFunctionShader::ShaderKey, FixedFunctionShader::HLSLShader, F
 FixedFunctionShader::HLSLShaderLRU FixedFunctionShader::hlslShaderLRU;
 FixedFunctionShader::HLSLShader FixedFunctionShader::hlslShaderDefaultPurple;
 
+// HLSL Render Dispatch Recording System
+std::vector<FixedFunctionShader::HLSLRenderCall> FixedFunctionShader::recordedCalls;
+bool FixedFunctionShader::isRecording = false;
+bool FixedFunctionShader::isReplaying = false;
+
 // Material state cache static member
 FixedFunctionShader::MaterialStateCache FixedFunctionShader::materialCache;
 
@@ -1493,6 +1498,32 @@ void FixedFunctionShader::bindShaderTextures(const ShaderKey& sk, const Rendered
 
 // HLSL Pipeline Implementation
 void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
+    static bool recordingStarted = false;
+
+    // Skip if we're in replay mode to avoid recursion
+    if (isReplaying) {
+        // During replay mode, perform actual rendering with this specific call
+        renderMorrowindHLSL_Internal(rs, frs, lightrs);
+        return;
+    }
+
+    // Start recording automatically on first HLSL render call
+    if (!recordingStarted && !isRecording) {
+        startRecording();
+        recordingStarted = true;
+    }
+
+    // Record this call if recording is active
+    if (isRecording) {
+        recordRenderCall(rs, frs, lightrs);
+    }
+
+    // Always render immediately for now (basic implementation)
+    renderMorrowindHLSL_Internal(rs, frs, lightrs);
+}
+
+// Internal rendering function that does the actual HLSL rendering
+void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
     // Process any completed async shader compilations
     processAsyncCompletions();
 
@@ -2873,6 +2904,12 @@ void FixedFunctionShader::release() {
 }
 
 void FixedFunctionShader::newFrame() {
+    // Handle recording-to-replay transition at frame boundaries
+    if (isRecording && !recordedCalls.empty()) {
+        LOG::logline("HLSL: Frame boundary - stopping recording and replaying %d calls", recordedCalls.size());
+        stopRecordingAndReplay();
+    }
+
     // Reset material cache for new frame to avoid stale state
     materialCache.reset();
 
@@ -3026,4 +3063,54 @@ void FixedFunctionShader::ShaderKey::log() const {
         }
     }
     // LOG::logline("");
+}
+
+// HLSL Render Dispatch Recording System Implementation
+
+void FixedFunctionShader::startRecording() {
+    recordedCalls.clear();
+    isRecording = true;
+    isReplaying = false;
+    LOG::logline("HLSL Recording: Started recording render dispatches");
+}
+
+void FixedFunctionShader::stopRecordingAndReplay() {
+    if (!isRecording) {
+        return;
+    }
+
+    isRecording = false;
+    LOG::logline("HLSL Recording: Stopped recording, captured %d render calls", recordedCalls.size());
+
+    // Now replay all recorded calls
+    replayRecordedCalls();
+
+    // Clear recorded calls after replay
+    recordedCalls.clear();
+}
+
+void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
+    if (!isRecording || isReplaying) {
+        return;
+    }
+
+    // Record this render call
+    recordedCalls.emplace_back(rs, frs, lightrs);
+}
+
+void FixedFunctionShader::replayRecordedCalls() {
+    if (recordedCalls.empty()) {
+        return;
+    }
+
+    isReplaying = true;
+    LOG::logline("HLSL Replay: Replaying %d recorded render calls", recordedCalls.size());
+
+    for (const auto& call : recordedCalls) {
+        // Use internal function to avoid recursion
+        renderMorrowindHLSL_Internal(call.rs, call.frs, call.lightrs);
+    }
+
+    isReplaying = false;
+    LOG::logline("HLSL Replay: Completed replay of %d calls", recordedCalls.size());
 }
