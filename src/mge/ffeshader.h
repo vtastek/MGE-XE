@@ -354,7 +354,7 @@ public:
     static void stopAsyncCompiler();
     static void queueShaderCompilation(const ShaderKey& key);
     static void processAsyncCompletions();
-    static void newFrame(); // Reset caches for new frame
+    static void resetHLSLCaches(); // Reset material/texture caches for HLSL rendering session
     static void setCachedTexture(IDirect3DDevice9* device, DWORD stage, IDirect3DTexture9* texture); // Cached texture binding
     static void createDefaultTextures(); // Create default textures to avoid null binds
     static void bindShaderTextures(const ShaderKey& sk, const RenderedState* rs); // Smart texture binding for shader

@@ -19,8 +19,6 @@ void DistantLand::renderStage0() {
     IDirect3DStateBlock9* stateSaved;
     UINT passes;
 
-    // Reset frame-to-frame hash cache for new frame
-    FixedFunctionShader::newFrame();
 
     // Update current cell and select distant static set
     selectDistantCell();

@@ -1855,8 +1855,13 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             D3DXHANDLE hVertexBlendPalette = hlslShader.vsConstantTable->GetConstantByName(NULL, "vertexBlendPalette");
             if (hVertexBlendPalette) {
                 if (rs->vertexBlendState > 0) {
-                    // For skinned objects, use the bone matrices from Morrowind
-                    HRESULT hr = hlslShader.vsConstantTable->SetMatrixArray(device, hVertexBlendPalette, rs->worldViewTransforms, 4);
+                    // For skinned objects, recombine recorded world matrices with current view matrix
+                    // rs->worldViewTransforms contains old view matrix, causing one-frame delay
+                    D3DXMATRIX currentWorldViewTransforms[4];
+                    for (int i = 0; i < 4; i++) {
+                        currentWorldViewTransforms[i] = rs->worldTransforms[i] * viewMatrix;
+                    }
+                    HRESULT hr = hlslShader.vsConstantTable->SetMatrixArray(device, hVertexBlendPalette, currentWorldViewTransforms, 4);
                     if (FAILED(hr)) {
                         return;
                     }
@@ -2918,14 +2923,14 @@ void FixedFunctionShader::release() {
 
 }
 
-void FixedFunctionShader::newFrame() {
+void FixedFunctionShader::resetHLSLCaches() {
     // Note: Recording/replay happens within same frame during HLSL pipeline
     // This function should NOT interfere with the recording system
 
-    // Reset material cache for new frame to avoid stale state
+    // Reset material cache for HLSL rendering session to avoid stale state
     materialCache.reset();
 
-    // Reset texture binding cache for new frame
+    // Reset texture binding cache for HLSL rendering session
     textureCache.reset();
 }
 
@@ -3080,6 +3085,9 @@ void FixedFunctionShader::ShaderKey::log() const {
 // HLSL Render Dispatch Recording System Implementation
 
 void FixedFunctionShader::startRecording() {
+    // Reset HLSL caches for new recording session
+    resetHLSLCaches();
+
     recordedCalls.clear();
     isRecording = true;
     isReplaying = false;
@@ -3124,6 +3132,9 @@ void FixedFunctionShader::finalizeBatchAndReplay() {
     isRecording = false;
     isReplaying = false;
     recordedCalls.clear();
+
+    // Reset HLSL caches after recording session completes
+    resetHLSLCaches();
 }
 
 void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
