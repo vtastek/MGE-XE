@@ -139,6 +139,9 @@ void DistantLand::renderStage0() {
         }
     }
 
+    // Finalize any pending HLSL batch before clearing recordings
+    FixedFunctionShader::finalizeBatchAndReplay();
+
     // Clear stray recordings
     recordMW.clear();
     recordSky.clear();

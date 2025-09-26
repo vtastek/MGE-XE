@@ -294,27 +294,51 @@ class FixedFunctionShader {
     static HLSLShader createPurpleErrorShader();
     static void captureAndDumpTexture(IDirect3DTexture9* texture);
 
-    // HLSL Render Dispatch Recording System
-    struct HLSLRenderCall {
-        const RenderedState* rs;
-        const FragmentState* frs;
-        LightState* lightrs;
-        ShaderKey sk;
-
-        // Copy constructor to capture render state data
-        HLSLRenderCall(const RenderedState* rs_, const FragmentState* frs_, LightState* lightrs_)
-            : rs(rs_), frs(frs_), lightrs(lightrs_), sk(rs_, frs_, lightrs_) {}
+    // HLSL Render Dispatch Recording System with proper resource management
+    struct RecordedRenderedState : RenderedState {
+        RecordedRenderedState(const RenderedState&);
+        ~RecordedRenderedState();
+        RecordedRenderedState(const RecordedRenderedState&) = delete;
+        RecordedRenderedState(RecordedRenderedState&&) noexcept;
     };
 
-    static std::vector<HLSLRenderCall> recordedCalls;
+    struct RecordedFragmentState : FragmentState {
+        RecordedFragmentState(const FragmentState& frs) : FragmentState(frs) {}
+    };
+
+    struct RecordedLightState : LightState {
+        RecordedLightState(const LightState& lightrs) : LightState(lightrs) {}
+    };
+
+    struct HLSLRecordedCall {
+        RecordedRenderedState rs;
+        RecordedFragmentState frs;
+        RecordedLightState lightrs;
+        ShaderKey sk;
+
+        // Constructor to capture render state data with proper resource management
+        HLSLRecordedCall(const RenderedState* rs_, const FragmentState* frs_, const LightState* lightrs_)
+            : rs(*rs_), frs(*frs_), lightrs(*lightrs_), sk(rs_, frs_, lightrs_) {}
+    };
+
+    static std::vector<HLSLRecordedCall> recordedCalls;
     static bool isRecording;
     static bool isReplaying;
+
+    // Consistent matrices for entire recording session
+    static D3DXMATRIX recordingDeviceView, recordingDeviceProj;
+    static D3DXMATRIX recordingShadowViewproj[2];
 
     static void startRecording();
     static void stopRecordingAndReplay();
     static void recordRenderCall(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);
     static void replayRecordedCalls();
     static void renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);
+
+public:
+    static void finalizeBatchAndReplay(); // Call when HLSL rendering session is complete
+
+private:
 
 public:
     static bool init(IDirect3DDevice* d, ID3DXEffectPool* pool);

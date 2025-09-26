@@ -48,9 +48,14 @@ FixedFunctionShader::HLSLShaderLRU FixedFunctionShader::hlslShaderLRU;
 FixedFunctionShader::HLSLShader FixedFunctionShader::hlslShaderDefaultPurple;
 
 // HLSL Render Dispatch Recording System
-std::vector<FixedFunctionShader::HLSLRenderCall> FixedFunctionShader::recordedCalls;
+std::vector<FixedFunctionShader::HLSLRecordedCall> FixedFunctionShader::recordedCalls;
 bool FixedFunctionShader::isRecording = false;
 bool FixedFunctionShader::isReplaying = false;
+
+// Consistent matrices for entire recording session
+D3DXMATRIX FixedFunctionShader::recordingDeviceView;
+D3DXMATRIX FixedFunctionShader::recordingDeviceProj;
+D3DXMATRIX FixedFunctionShader::recordingShadowViewproj[2];
 
 // Material state cache static member
 FixedFunctionShader::MaterialStateCache FixedFunctionShader::materialCache;
@@ -1498,8 +1503,6 @@ void FixedFunctionShader::bindShaderTextures(const ShaderKey& sk, const Rendered
 
 // HLSL Pipeline Implementation
 void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
-    static bool recordingStarted = false;
-
     // Skip if we're in replay mode to avoid recursion
     if (isReplaying) {
         // During replay mode, perform actual rendering with this specific call
@@ -1507,23 +1510,26 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         return;
     }
 
-    // Start recording automatically on first HLSL render call
-    if (!recordingStarted && !isRecording) {
+    // Start recording at first HLSL call if not already recording
+    if (!isRecording && !isReplaying) {
         startRecording();
-        recordingStarted = true;
     }
 
-    // Record this call if recording is active
+    // Record this render call for later replay (only if recording)
     if (isRecording) {
         recordRenderCall(rs, frs, lightrs);
+        // Skip immediate rendering - will be done in batch during replay
+        return;
     }
 
-    // Always render immediately for now (basic implementation)
+    // Normal rendering path (when not recording)
     renderMorrowindHLSL_Internal(rs, frs, lightrs);
 }
 
 // Internal rendering function that does the actual HLSL rendering
 void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
+    LOG::logline("HLSL Internal: Called (recording=%d, replaying=%d)", isRecording, isReplaying);
+
     // Process any completed async shader compilations
     processAsyncCompletions();
 
@@ -1725,6 +1731,7 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         device->SetPixelShaderConstantF(10, &shadowRcp, 1); // c10
     }
 
+
     // Save current render states before modifying them (only states that HLSL actually changes)
     DWORD savedAlphaBlendEnable, savedAlphaTestEnable;
     DWORD savedZEnable, savedZWriteEnable;
@@ -1789,7 +1796,14 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     D3DXMATRIX projMatrix, viewMatrix, worldMatrix;
     device->GetTransform(D3DTS_PROJECTION, &projMatrix);
     device->GetTransform(D3DTS_VIEW, &viewMatrix);
-    device->GetTransform(D3DTS_WORLD, &worldMatrix);
+
+    // During replay, use the stored world transform from the recorded call
+    // During normal rendering, get it from the device
+    if (isReplaying) {
+        worldMatrix = rs->worldTransforms[0];
+    } else {
+        device->GetTransform(D3DTS_WORLD, &worldMatrix);
+    }
     
     D3DXMATRIX worldViewProj = worldMatrix * viewMatrix * projMatrix;
     D3DXMATRIX worldView = worldMatrix * viewMatrix;
@@ -2311,12 +2325,13 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     } else {
         device->DrawPrimitive(rs->primType, rs->startIndex, rs->primCount);
     }
-    
+
     // Restore device state after HLSL rendering (like the original system does)
     device->SetVertexShader(NULL);
     device->SetPixelShader(NULL);
 
     // Clear HLSL shadow texture bindings to prevent legacy artifacts
+
     FixedFunctionShader::setCachedTexture(device, 3, nullptr);  // Clear any legacy MGE effects shadow binding
     FixedFunctionShader::setCachedTexture(device, 4, nullptr);  // Clear HLSL shadow binding
 
@@ -2904,11 +2919,8 @@ void FixedFunctionShader::release() {
 }
 
 void FixedFunctionShader::newFrame() {
-    // Handle recording-to-replay transition at frame boundaries
-    if (isRecording && !recordedCalls.empty()) {
-        LOG::logline("HLSL: Frame boundary - stopping recording and replaying %d calls", recordedCalls.size());
-        stopRecordingAndReplay();
-    }
+    // Note: Recording/replay happens within same frame during HLSL pipeline
+    // This function should NOT interfere with the recording system
 
     // Reset material cache for new frame to avoid stale state
     materialCache.reset();
@@ -3071,6 +3083,14 @@ void FixedFunctionShader::startRecording() {
     recordedCalls.clear();
     isRecording = true;
     isReplaying = false;
+
+    // Capture view/projection matrices once at start of recording
+    // Note: World transforms are captured per-call in each RenderedState
+    device->GetTransform(D3DTS_VIEW, &recordingDeviceView);
+    device->GetTransform(D3DTS_PROJECTION, &recordingDeviceProj);
+    recordingShadowViewproj[0] = DistantLand::smViewproj[0];
+    recordingShadowViewproj[1] = DistantLand::smViewproj[1];
+
     LOG::logline("HLSL Recording: Started recording render dispatches");
 }
 
@@ -3086,6 +3106,23 @@ void FixedFunctionShader::stopRecordingAndReplay() {
     replayRecordedCalls();
 
     // Clear recorded calls after replay
+    recordedCalls.clear();
+
+    // Reset state to allow new recording sessions
+    // Note: isRecording stays false until next startRecording() call
+    isReplaying = false;
+}
+
+// Call this when HLSL rendering session is complete to trigger replay
+void FixedFunctionShader::finalizeBatchAndReplay() {
+    if (isRecording && !recordedCalls.empty()) {
+        LOG::logline("HLSL: Batch complete - replaying %d recorded calls", recordedCalls.size());
+        stopRecordingAndReplay();
+    }
+
+    // Ensure clean state for next batch - recording can start fresh next time
+    isRecording = false;
+    isReplaying = false;
     recordedCalls.clear();
 }
 
@@ -3106,11 +3143,62 @@ void FixedFunctionShader::replayRecordedCalls() {
     isReplaying = true;
     LOG::logline("HLSL Replay: Replaying %d recorded render calls", recordedCalls.size());
 
+    // Use CURRENT view/projection matrices for replay, not stale recorded ones
+    // This ensures objects render at current camera position, not old position
+    D3DXMATRIX currentView, currentProj;
+    device->GetTransform(D3DTS_VIEW, &currentView);
+    device->GetTransform(D3DTS_PROJECTION, &currentProj);
+    device->SetTransform(D3DTS_VIEW, &currentView);
+    device->SetTransform(D3DTS_PROJECTION, &currentProj);
+
+    // Temporarily set shadow matrices to recording state
+    D3DXMATRIX savedShadowViewproj[2];
+    savedShadowViewproj[0] = DistantLand::smViewproj[0];
+    savedShadowViewproj[1] = DistantLand::smViewproj[1];
+    DistantLand::smViewproj[0] = recordingShadowViewproj[0];
+    DistantLand::smViewproj[1] = recordingShadowViewproj[1];
+
+    // Render all recorded calls with consistent matrices
     for (const auto& call : recordedCalls) {
-        // Use internal function to avoid recursion
-        renderMorrowindHLSL_Internal(call.rs, call.frs, call.lightrs);
+        renderMorrowindHLSL_Internal(&call.rs, &call.frs, const_cast<LightState*>(static_cast<const LightState*>(&call.lightrs)));
     }
+
+    // Restore current shadow matrices
+    DistantLand::smViewproj[0] = savedShadowViewproj[0];
+    DistantLand::smViewproj[1] = savedShadowViewproj[1];
 
     isReplaying = false;
     LOG::logline("HLSL Replay: Completed replay of %d calls", recordedCalls.size());
 }
+
+// ------------------------------------
+// FixedFunctionShader::RecordedRenderedState
+
+FixedFunctionShader::RecordedRenderedState::RecordedRenderedState(const RenderedState& state)
+    : RenderedState(state) {
+    vb->AddRef();
+    ib->AddRef();
+    if (texture) {
+        texture->AddRef();
+    }
+}
+
+FixedFunctionShader::RecordedRenderedState::~RecordedRenderedState() {
+    if (vb) {
+        vb->Release();
+    }
+    if (ib) {
+        ib->Release();
+    }
+    if (texture) {
+        texture->Release();
+    }
+}
+
+FixedFunctionShader::RecordedRenderedState::RecordedRenderedState(RecordedRenderedState&& source) noexcept
+    : RenderedState(source) {
+    source.vb = nullptr;
+    source.ib = nullptr;
+    source.texture = nullptr;
+}
+
