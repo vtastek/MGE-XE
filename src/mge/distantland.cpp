@@ -137,9 +137,6 @@ void DistantLand::renderStage0() {
         }
     }
 
-    // Finalize any pending HLSL batch before clearing recordings
-    FixedFunctionShader::finalizeBatchAndReplay();
-
     // Clear stray recordings
     recordMW.clear();
     recordSky.clear();
@@ -150,6 +147,10 @@ void DistantLand::renderStage1() {
     auto mwBridge = MWBridge::get();
     IDirect3DStateBlock9* stateSaved;
     UINT passes;
+
+    // Finalize any pending HLSL batch before depth texture creation
+    // This ensures HLSL replay happens in same frame as depth texture generation
+    FixedFunctionShader::finalizeBatchAndReplay();
 
     ///LOG::logline("Stage 1 prims: %d", recordMW.size());
 

@@ -27,6 +27,7 @@ struct RenderedState {
     D3DXMATRIX worldTransforms[4];
     D3DXMATRIX viewTransform;
     D3DXMATRIX worldViewTransforms[4];
+    D3DXMATRIX shadowWorldViewProj[2];  // Complete shadow world-view-projection matrices at time of recording
     D3DCOLORVALUE diffuseMaterial;
     BYTE blendEnable, srcBlend, destBlend;
     BYTE alphaTest, alphaFunc, alphaRef;

@@ -1517,7 +1517,15 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
 
     // Record this render call for later replay (only if recording)
     if (isRecording) {
-        recordRenderCall(rs, frs, lightrs);
+        // Create a copy of rs and add CURRENT shadow world-view-projection matrices for this draw call
+        // During recording, use current matrices; during replay, these will be the "recorded" matrices
+        RenderedState rsWithShadows = *rs;
+
+        // Use current shadow matrices for this specific draw call during recording
+        rsWithShadows.shadowWorldViewProj[0] = rs->worldTransforms[0] * DistantLand::smViewproj[0];
+        rsWithShadows.shadowWorldViewProj[1] = rs->worldTransforms[0] * DistantLand::smViewproj[1];
+
+        recordRenderCall(&rsWithShadows, frs, lightrs);
         // Skip immediate rendering - will be done in batch during replay
         return;
     }
@@ -1536,8 +1544,19 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     
     HLSLShader hlslShader;
 
-    // Check if state matches last used shader
-    ShaderKey sk(rs, frs, lightrs);
+    // During replay, use recorded ShaderKey; during normal rendering, generate from current state
+    ShaderKey sk;
+    if (isReplaying) {
+        // Find the recorded ShaderKey for this call
+        for (const auto& call : recordedCalls) {
+            if (&call.rs == rs) {
+                sk = call.sk;
+                break;
+            }
+        }
+    } else {
+        sk = ShaderKey(rs, frs, lightrs);
+    }
     
     // Perform texture suffix resolution to determine available suffixes
     // This prevents HAS_NORMAL from being defined for textures without normal maps
@@ -1769,18 +1788,34 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     setCachedRenderState(device, D3DRS_LOCALVIEWER, FALSE, materialCache.localViewer, materialCache.localViewerValid);
     setCachedRenderState(device, D3DRS_NORMALIZENORMALS, FALSE, materialCache.normalizeNormals, materialCache.normalizeNormalsValid);
 
-    // Alpha blending states
-    setCachedRenderState(device, D3DRS_ALPHABLENDENABLE, rs->blendEnable, materialCache.alphaBlendEnable, materialCache.alphaBlendEnableValid);
-    if (rs->blendEnable) {
-        setCachedRenderState(device, D3DRS_SRCBLEND, rs->srcBlend, materialCache.srcBlend, materialCache.srcBlendValid);
-        setCachedRenderState(device, D3DRS_DESTBLEND, rs->destBlend, materialCache.destBlend, materialCache.destBlendValid);
+    // Alpha blending states - force set during replay to ensure correctness
+    if (isReplaying) {
+        device->SetRenderState(D3DRS_ALPHABLENDENABLE, rs->blendEnable);
+        if (rs->blendEnable) {
+            device->SetRenderState(D3DRS_SRCBLEND, rs->srcBlend);
+            device->SetRenderState(D3DRS_DESTBLEND, rs->destBlend);
+        }
+    } else {
+        setCachedRenderState(device, D3DRS_ALPHABLENDENABLE, rs->blendEnable, materialCache.alphaBlendEnable, materialCache.alphaBlendEnableValid);
+        if (rs->blendEnable) {
+            setCachedRenderState(device, D3DRS_SRCBLEND, rs->srcBlend, materialCache.srcBlend, materialCache.srcBlendValid);
+            setCachedRenderState(device, D3DRS_DESTBLEND, rs->destBlend, materialCache.destBlend, materialCache.destBlendValid);
+        }
     }
 
-    // Alpha testing states
-    setCachedRenderState(device, D3DRS_ALPHATESTENABLE, rs->alphaTest, materialCache.alphaTestEnable, materialCache.alphaTestEnableValid);
-    if (rs->alphaTest) {
-        setCachedRenderState(device, D3DRS_ALPHAFUNC, rs->alphaFunc, materialCache.alphaFunc, materialCache.alphaFuncValid);
-        setCachedRenderState(device, D3DRS_ALPHAREF, rs->alphaRef, materialCache.alphaRef, materialCache.alphaRefValid);
+    // Alpha testing states - force set during replay to ensure correctness
+    if (isReplaying) {
+        device->SetRenderState(D3DRS_ALPHATESTENABLE, rs->alphaTest);
+        if (rs->alphaTest) {
+            device->SetRenderState(D3DRS_ALPHAFUNC, rs->alphaFunc);
+            device->SetRenderState(D3DRS_ALPHAREF, rs->alphaRef);
+        }
+    } else {
+        setCachedRenderState(device, D3DRS_ALPHATESTENABLE, rs->alphaTest, materialCache.alphaTestEnable, materialCache.alphaTestEnableValid);
+        if (rs->alphaTest) {
+            setCachedRenderState(device, D3DRS_ALPHAFUNC, rs->alphaFunc, materialCache.alphaFunc, materialCache.alphaFuncValid);
+            setCachedRenderState(device, D3DRS_ALPHAREF, rs->alphaRef, materialCache.alphaRef, materialCache.alphaRefValid);
+        }
     }
 
     // Set vertex format (legacy DX8 FVF - HLSL input semantics handle layout internally)
@@ -1794,19 +1829,30 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
 
     // Set up matrices using constant tables (like the Combined shader expects)
     D3DXMATRIX projMatrix, viewMatrix, worldMatrix;
-    device->GetTransform(D3DTS_PROJECTION, &projMatrix);
-    device->GetTransform(D3DTS_VIEW, &viewMatrix);
 
-    // During replay, use the stored world transform from the recorded call
-    // During normal rendering, get it from the device
+    // During replay, use ALL recorded matrices to avoid stale matrix issues
+    // During normal rendering, get them from the device
     if (isReplaying) {
+        projMatrix = recordingDeviceProj;
+        viewMatrix = recordingDeviceView;
         worldMatrix = rs->worldTransforms[0];
     } else {
+        device->GetTransform(D3DTS_PROJECTION, &projMatrix);
+        device->GetTransform(D3DTS_VIEW, &viewMatrix);
         device->GetTransform(D3DTS_WORLD, &worldMatrix);
     }
     
-    D3DXMATRIX worldViewProj = worldMatrix * viewMatrix * projMatrix;
-    D3DXMATRIX worldView = worldMatrix * viewMatrix;
+    // During replay, use recorded combined matrices; during normal rendering, calculate them
+    D3DXMATRIX worldViewProj, worldView;
+    if (isReplaying) {
+        // Use pre-recorded combined matrices to avoid any matrix timing issues
+        worldViewProj = rs->worldTransforms[0] * recordingDeviceView * recordingDeviceProj;
+        worldView = rs->worldTransforms[0] * recordingDeviceView;
+    } else {
+        // Normal rendering - calculate from current matrices
+        worldViewProj = worldMatrix * viewMatrix * projMatrix;
+        worldView = worldMatrix * viewMatrix;
+    }
     
     // Use constant tables to set matrices with safety checks
     if (hlslShader.vsConstantTable) {
@@ -1838,7 +1884,8 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             
             D3DXHANDLE hWorld = hlslShader.vsConstantTable->GetConstantByName(NULL, "world");
             if (hWorld) {
-                HRESULT hr = hlslShader.vsConstantTable->SetMatrix(device, hWorld, &worldMatrix);
+                // Use recorded world matrix for each object, not current device world matrix
+                HRESULT hr = hlslShader.vsConstantTable->SetMatrix(device, hWorld, &rs->worldTransforms[0]);
                 if (FAILED(hr)) {
                     return;
                 }
@@ -1876,6 +1923,7 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
                     }
                 }
             }
+
             
             D3DXHANDLE hVertexBlendState = hlslShader.vsConstantTable->GetConstantByName(NULL, "vertexBlendState");
             if (hVertexBlendState) {
@@ -1889,12 +1937,9 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             // Set shadow world-to-shadow matrices for proper shadow coordinate calculation
             D3DXHANDLE hShadowWorldViewProj = hlslShader.vsConstantTable->GetConstantByName(NULL, "shadowWorldViewProj");
             if (hShadowWorldViewProj) {
-                // Calculate world-to-shadow matrices from world matrix and shadow view-projection matrices
-                D3DXMATRIX shadowWorldViewProj[2];
-                shadowWorldViewProj[0] = worldMatrix * DistantLand::smViewproj[0];
-                shadowWorldViewProj[1] = worldMatrix * DistantLand::smViewproj[1];
-                
-                HRESULT hr = hlslShader.vsConstantTable->SetMatrixArray(device, hShadowWorldViewProj, shadowWorldViewProj, 2);
+                // Use recorded complete shadow world-view-projection matrices directly
+                // This avoids any stale matrix issues by using exact matrices from recording time
+                HRESULT hr = hlslShader.vsConstantTable->SetMatrixArray(device, hShadowWorldViewProj, rs->shadowWorldViewProj, 2);
                 if (FAILED(hr)) {
                     return;
                 }
