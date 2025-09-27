@@ -372,6 +372,10 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
         isHUDComplete = true;
     }
 
+    // Finalize any HLSL batch immediately after scene draw calls complete
+    // This ensures HLSL replay happens within the same scene, not deferred to next stage
+    FixedFunctionShader::finalizeBatchAndReplay();
+
     return ProxyDevice::EndScene();
 }
 

@@ -190,9 +190,9 @@ VS_OUTPUT vs_main(VS_INPUT input) {
         // Skinned vertex
         viewpos = skin(input.pos, input.blendweights);
         normal = skin(float4(input.normal, 0), input.blendweights).xyz;
-        // Calculate proper world position for skinned objects using world-space bone transforms
-        // don't calculate, the difference is small, negligable for shadows.
-		//worldpos = skinWorld(input.pos, input.blendweights);
+        // Don't calculate deformed world position - treat as rigid for shadow receiving
+        // This simplifies shadow calculations while maintaining visual quality
+		// worldpos = skinWorld(input.pos, input.blendweights);
     }
     else {
         // Rigid vertex

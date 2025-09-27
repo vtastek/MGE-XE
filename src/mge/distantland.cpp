@@ -148,9 +148,6 @@ void DistantLand::renderStage1() {
     IDirect3DStateBlock9* stateSaved;
     UINT passes;
 
-    // Finalize any pending HLSL batch before depth texture creation
-    // This ensures HLSL replay happens in same frame as depth texture generation
-    FixedFunctionShader::finalizeBatchAndReplay();
 
     ///LOG::logline("Stage 1 prims: %d", recordMW.size());
 
