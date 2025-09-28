@@ -336,14 +336,10 @@ class FixedFunctionShader {
         RecordedFragmentState(const FragmentState& frs) : FragmentState(frs) {}
     };
 
-    struct RecordedLightState : LightState {
-        RecordedLightState(const LightState& lightrs) : LightState(lightrs) {}
-    };
-
     struct HLSLRecordedCall {
         RecordedRenderedState rs;
         RecordedFragmentState frs;
-        RecordedLightState lightrs;
+        const LightState* lightrs;  // Store pointer instead of copy to avoid expensive deep copy
         ShaderKey sk;
 
         // Captured sampler states for each texture stage

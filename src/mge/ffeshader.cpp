@@ -3333,7 +3333,7 @@ void FixedFunctionShader::replayRecordedCalls() {
             }
         }
 
-        renderMorrowindHLSL_Internal(&call.rs, &call.frs, const_cast<LightState*>(static_cast<const LightState*>(&call.lightrs)));
+        renderMorrowindHLSL_Internal(&call.rs, &call.frs, const_cast<LightState*>(call.lightrs));
     }
 
     // Restore current shadow matrices
@@ -3379,7 +3379,7 @@ FixedFunctionShader::RecordedRenderedState::RecordedRenderedState(RecordedRender
 // FixedFunctionShader::HLSLRecordedCall
 
 FixedFunctionShader::HLSLRecordedCall::HLSLRecordedCall(const RenderedState* rs_, const FragmentState* frs_, const LightState* lightrs_, const ShaderKey& sk_)
-    : rs(*rs_), frs(*frs_), lightrs(*lightrs_), sk(sk_) {
+    : rs(*rs_), frs(*frs_), lightrs(lightrs_), sk(sk_) {
 
     // Capture current sampler states for all texture stages
     for (int stage = 0; stage < 8; ++stage) {
