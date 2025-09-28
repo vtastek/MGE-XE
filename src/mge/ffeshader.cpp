@@ -1903,53 +1903,47 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         worldView = worldMatrix * viewMatrix;
     }
     
-    // Use constant tables to set matrices with safety checks
+    // Use constant tables to set matrices with cached handles (no per-draw string lookups)
     if (hlslShader.vsConstantTable) {
         try {
-            D3DXHANDLE hWorldViewProj = hlslShader.vsConstantTable->GetConstantByName(NULL, "worldViewProj");
-            if (hWorldViewProj) {
-                HRESULT hr = hlslShader.vsConstantTable->SetMatrix(device, hWorldViewProj, &worldViewProj);
+            if (hlslShader.hWorldViewProj) {
+                HRESULT hr = hlslShader.vsConstantTable->SetMatrix(device, hlslShader.hWorldViewProj, &worldViewProj);
                 if (FAILED(hr)) {
                     // Shader may have been invalidated by file edit - use fallback
                     return;
                 }
             }
-            
-            D3DXHANDLE hView = hlslShader.vsConstantTable->GetConstantByName(NULL, "view");
-            if (hView) {
-                HRESULT hr = hlslShader.vsConstantTable->SetMatrix(device, hView, &viewMatrix);
+
+            if (hlslShader.hView) {
+                HRESULT hr = hlslShader.vsConstantTable->SetMatrix(device, hlslShader.hView, &viewMatrix);
                 if (FAILED(hr)) {
                     return;
                 }
             }
-            
-            D3DXHANDLE hProj = hlslShader.vsConstantTable->GetConstantByName(NULL, "proj");
-            if (hProj) {
-                HRESULT hr = hlslShader.vsConstantTable->SetMatrix(device, hProj, &projMatrix);
+
+            if (hlslShader.hProj) {
+                HRESULT hr = hlslShader.vsConstantTable->SetMatrix(device, hlslShader.hProj, &projMatrix);
                 if (FAILED(hr)) {
                     return;
                 }
             }
-            
-            D3DXHANDLE hWorld = hlslShader.vsConstantTable->GetConstantByName(NULL, "world");
-            if (hWorld) {
+
+            if (hlslShader.hWorld) {
                 // Use recorded world matrix for each object, not current device world matrix
-                HRESULT hr = hlslShader.vsConstantTable->SetMatrix(device, hWorld, &rs->worldTransforms[0]);
+                HRESULT hr = hlslShader.vsConstantTable->SetMatrix(device, hlslShader.hWorld, &rs->worldTransforms[0]);
                 if (FAILED(hr)) {
                     return;
                 }
             }
-            
-            D3DXHANDLE hWorldView = hlslShader.vsConstantTable->GetConstantByName(NULL, "worldview");
-            if (hWorldView) {
-                HRESULT hr = hlslShader.vsConstantTable->SetMatrix(device, hWorldView, &worldView);
+
+            if (hlslShader.hWorldView) {
+                HRESULT hr = hlslShader.vsConstantTable->SetMatrix(device, hlslShader.hWorldView, &worldView);
                 if (FAILED(hr)) {
                     return;
                 }
             }
             // Set up vertex blend palette for skinning using Morrowind's actual data
-            D3DXHANDLE hVertexBlendPalette = hlslShader.vsConstantTable->GetConstantByName(NULL, "vertexBlendPalette");
-            if (hVertexBlendPalette) {
+            if (hlslShader.hVertexBlendPalette) {
                 if (rs->vertexBlendState > 0) {
                     // For skinned objects, recombine recorded world matrices with current view matrix
                     // rs->worldViewTransforms contains old view matrix, causing one-frame delay
@@ -1957,7 +1951,7 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
                     for (int i = 0; i < 4; i++) {
                         currentWorldViewTransforms[i] = rs->worldTransforms[i] * viewMatrix;
                     }
-                    HRESULT hr = hlslShader.vsConstantTable->SetMatrixArray(device, hVertexBlendPalette, currentWorldViewTransforms, 4);
+                    HRESULT hr = hlslShader.vsConstantTable->SetMatrixArray(device, hlslShader.hVertexBlendPalette, currentWorldViewTransforms, 4);
                     if (FAILED(hr)) {
                         return;
                     }
@@ -1966,29 +1960,26 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
                     D3DXMATRIX blendMatrices[4];
                     blendMatrices[0] = worldView;
                     memset(&blendMatrices[1], 0, sizeof(D3DXMATRIX) * 3);
-                    HRESULT hr = hlslShader.vsConstantTable->SetMatrixArray(device, hVertexBlendPalette, blendMatrices, 4);
+                    HRESULT hr = hlslShader.vsConstantTable->SetMatrixArray(device, hlslShader.hVertexBlendPalette, blendMatrices, 4);
                     if (FAILED(hr)) {
                         return;
                     }
                 }
             }
 
-            
-            D3DXHANDLE hVertexBlendState = hlslShader.vsConstantTable->GetConstantByName(NULL, "vertexBlendState");
-            if (hVertexBlendState) {
+            if (hlslShader.hVertexBlendState) {
                 D3DXVECTOR4 blendState((float)rs->vertexBlendState, 0, 0, 0);
-                HRESULT hr = hlslShader.vsConstantTable->SetVector(device, hVertexBlendState, &blendState);
+                HRESULT hr = hlslShader.vsConstantTable->SetVector(device, hlslShader.hVertexBlendState, &blendState);
                 if (FAILED(hr)) {
                     return;
                 }
             }
-            
+
             // Set shadow world-to-shadow matrices for proper shadow coordinate calculation
-            D3DXHANDLE hShadowWorldViewProj = hlslShader.vsConstantTable->GetConstantByName(NULL, "shadowWorldViewProj");
-            if (hShadowWorldViewProj) {
+            if (hlslShader.hShadowWorldViewProj) {
                 // Use recorded complete shadow world-view-projection matrices directly
                 // This avoids any stale matrix issues by using exact matrices from recording time
-                HRESULT hr = hlslShader.vsConstantTable->SetMatrixArray(device, hShadowWorldViewProj, rs->shadowWorldViewProj, 2);
+                HRESULT hr = hlslShader.vsConstantTable->SetMatrixArray(device, hlslShader.hShadowWorldViewProj, rs->shadowWorldViewProj, 2);
                 if (FAILED(hr)) {
                     return;
                 }
@@ -2000,29 +1991,26 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         }
     }
     
-    // Set pixel shader constants using constant tables (like Combined shader expects)
+    // Set pixel shader constants using cached handles (no per-draw string lookups)
     if (hlslShader.psConstantTable) {
         try {
-            D3DXHANDLE hMaterialDiffuse = hlslShader.psConstantTable->GetConstantByName(NULL, "materialDiffuse");
-            if (hMaterialDiffuse) {
-                HRESULT hr = hlslShader.psConstantTable->SetVector(device, hMaterialDiffuse, (D3DXVECTOR4*)&frs->material.diffuse);
+            if (hlslShader.hMaterialDiffuse) {
+                HRESULT hr = hlslShader.psConstantTable->SetVector(device, hlslShader.hMaterialDiffuse, (D3DXVECTOR4*)&frs->material.diffuse);
                 if (FAILED(hr)) {
                     LOG::logline("!! HLSL Pixel shader constant table access failed - shader may have been edited");
                     return;
                 }
             }
 
-            D3DXHANDLE hMaterialAmbient = hlslShader.psConstantTable->GetConstantByName(NULL, "materialAmbient");
-            if (hMaterialAmbient) {
-                HRESULT hr = hlslShader.psConstantTable->SetVector(device, hMaterialAmbient, (D3DXVECTOR4*)&frs->material.ambient);
+            if (hlslShader.hMaterialAmbient) {
+                HRESULT hr = hlslShader.psConstantTable->SetVector(device, hlslShader.hMaterialAmbient, (D3DXVECTOR4*)&frs->material.ambient);
                 if (FAILED(hr)) {
                     return;
                 }
             }
 
-            D3DXHANDLE hMaterialEmissive = hlslShader.psConstantTable->GetConstantByName(NULL, "materialEmissive");
-            if (hMaterialEmissive) {
-                HRESULT hr = hlslShader.psConstantTable->SetVector(device, hMaterialEmissive, (D3DXVECTOR4*)&frs->material.emissive);
+            if (hlslShader.hMaterialEmissive) {
+                HRESULT hr = hlslShader.psConstantTable->SetVector(device, hlslShader.hMaterialEmissive, (D3DXVECTOR4*)&frs->material.emissive);
                 if (FAILED(hr)) {
                     return;
                 }
@@ -2486,6 +2474,18 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::createPurpleErrorShader() {
         hr = device->CreateVertexShader(reinterpret_cast<DWORD*>(vsBlob->GetBufferPointer()), &errorShader.vertexShader);
         if (SUCCEEDED(hr)) {
             D3DXGetShaderConstantTable(reinterpret_cast<DWORD*>(vsBlob->GetBufferPointer()), &errorShader.vsConstantTable);
+
+            // Cache vertex shader constant handles for error shader
+            if (errorShader.vsConstantTable) {
+                errorShader.hWorldViewProj = errorShader.vsConstantTable->GetConstantByName(NULL, "worldViewProj");
+                errorShader.hView = errorShader.vsConstantTable->GetConstantByName(NULL, "view");
+                errorShader.hProj = errorShader.vsConstantTable->GetConstantByName(NULL, "proj");
+                errorShader.hWorld = errorShader.vsConstantTable->GetConstantByName(NULL, "world");
+                errorShader.hWorldView = errorShader.vsConstantTable->GetConstantByName(NULL, "worldview");
+                errorShader.hVertexBlendPalette = errorShader.vsConstantTable->GetConstantByName(NULL, "vertexBlendPalette");
+                errorShader.hVertexBlendState = errorShader.vsConstantTable->GetConstantByName(NULL, "vertexBlendState");
+                errorShader.hShadowWorldViewProj = errorShader.vsConstantTable->GetConstantByName(NULL, "shadowWorldViewProj");
+            }
         }
         vsBlob->Release();
     }
@@ -2502,6 +2502,13 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::createPurpleErrorShader() {
         hr = device->CreatePixelShader(reinterpret_cast<DWORD*>(psBlob->GetBufferPointer()), &errorShader.pixelShader);
         if (SUCCEEDED(hr)) {
             D3DXGetShaderConstantTable(reinterpret_cast<DWORD*>(psBlob->GetBufferPointer()), &errorShader.psConstantTable);
+
+            // Cache pixel shader constant handles for error shader
+            if (errorShader.psConstantTable) {
+                errorShader.hMaterialDiffuse = errorShader.psConstantTable->GetConstantByName(NULL, "materialDiffuse");
+                errorShader.hMaterialAmbient = errorShader.psConstantTable->GetConstantByName(NULL, "materialAmbient");
+                errorShader.hMaterialEmissive = errorShader.psConstantTable->GetConstantByName(NULL, "materialEmissive");
+            }
         }
         psBlob->Release();
     }
@@ -2839,10 +2846,22 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         reinterpret_cast<DWORD*>(vsBlob->GetBufferPointer()),
         &hlslShader.vsConstantTable
     );
-    
+
+    // Cache vertex shader constant handles to avoid per-draw string lookups
+    if (hlslShader.vsConstantTable) {
+        hlslShader.hWorldViewProj = hlslShader.vsConstantTable->GetConstantByName(NULL, "worldViewProj");
+        hlslShader.hView = hlslShader.vsConstantTable->GetConstantByName(NULL, "view");
+        hlslShader.hProj = hlslShader.vsConstantTable->GetConstantByName(NULL, "proj");
+        hlslShader.hWorld = hlslShader.vsConstantTable->GetConstantByName(NULL, "world");
+        hlslShader.hWorldView = hlslShader.vsConstantTable->GetConstantByName(NULL, "worldview");
+        hlslShader.hVertexBlendPalette = hlslShader.vsConstantTable->GetConstantByName(NULL, "vertexBlendPalette");
+        hlslShader.hVertexBlendState = hlslShader.vsConstantTable->GetConstantByName(NULL, "vertexBlendState");
+        hlslShader.hShadowWorldViewProj = hlslShader.vsConstantTable->GetConstantByName(NULL, "shadowWorldViewProj");
+    }
+
     // Log VS blob size before releasing
     // LOG::logline("-- HLSL VS blob size: %u bytes", vsBlob->GetBufferSize());
-    
+
     vsBlob->Release();
     
     // Compile pixel shader using pixel shader source
@@ -2908,9 +2927,14 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         reinterpret_cast<DWORD*>(psBlob->GetBufferPointer()),
         &hlslShader.psConstantTable
     );
-    
+
     if (FAILED(hr) || !hlslShader.psConstantTable) {
         LOG::logline("HLSL: Failed to extract pixel shader constant table, hr=%x", hr);
+    } else {
+        // Cache pixel shader constant handles to avoid per-draw string lookups
+        hlslShader.hMaterialDiffuse = hlslShader.psConstantTable->GetConstantByName(NULL, "materialDiffuse");
+        hlslShader.hMaterialAmbient = hlslShader.psConstantTable->GetConstantByName(NULL, "materialAmbient");
+        hlslShader.hMaterialEmissive = hlslShader.psConstantTable->GetConstantByName(NULL, "materialEmissive");
     }
     
     // Log compilation details for debugging (before releasing blobs)

@@ -146,7 +146,22 @@ class FixedFunctionShader {
         IDirect3DPixelShader9* pixelShader;
         ID3DXConstantTable* vsConstantTable;
         ID3DXConstantTable* psConstantTable;
-        
+
+        // Cached vertex shader constant handles (avoid per-draw string lookups)
+        D3DXHANDLE hWorldViewProj;
+        D3DXHANDLE hView;
+        D3DXHANDLE hProj;
+        D3DXHANDLE hWorld;
+        D3DXHANDLE hWorldView;
+        D3DXHANDLE hVertexBlendPalette;
+        D3DXHANDLE hVertexBlendState;
+        D3DXHANDLE hShadowWorldViewProj;
+
+        // Cached pixel shader constant handles
+        D3DXHANDLE hMaterialDiffuse;
+        D3DXHANDLE hMaterialAmbient;
+        D3DXHANDLE hMaterialEmissive;
+
         // Suffix texture support
         IDirect3DTexture9* diffparamTexture;
         IDirect3DTexture9* normalTexture;
