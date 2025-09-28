@@ -122,10 +122,20 @@ void* CreateInputWrapper(void* real) {
     FakeFuncs[GF_MoveRight3PC] = MacroFunctions::MoveRight3PCam;
     FakeFuncs[GF_MoveDown3PC] = MacroFunctions::MoveDown3PCam;
     FakeFuncs[GF_MoveUp3PC] = MacroFunctions::MoveUp3PCam;
+    FakeFuncs[GF_ToggleRecordReplay] = MacroFunctions::ToggleRecordReplay;
+    FakeFuncs[GF_DumpFrame] = MacroFunctions::DumpFrame;
 
     // Force screenshots from PrintScreen
     FakeKeys[DIK_SYSRQ].type = MT_Graphics;
     FakeKeys[DIK_SYSRQ].Function.index = GF_Screenshot;
+
+    // Debug controls for record/replay system
+    // DIK_K = 37 (0x25), DIK_O = 24 (0x18) - standard DirectInput scan codes
+    FakeKeys[37].type = MT_Graphics;  // K key - Toggle record/replay
+    FakeKeys[37].Function.index = GF_ToggleRecordReplay;
+
+    FakeKeys[24].type = MT_Graphics;  // O key - Dump frame
+    FakeKeys[24].Function.index = GF_DumpFrame;
 
     return new MGEProxyDirectInput((IDirectInput8A*)real);
 }

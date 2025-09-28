@@ -213,10 +213,16 @@ class FixedFunctionShader {
     };
     static MaterialStateCache materialCache;
 
-    // Texture binding cache to minimize redundant SetTexture calls
+    // Texture binding cache to minimize redundant SetTexture calls and preserve sampler states
     struct TextureBindingCache {
         IDirect3DTexture9* boundTextures[8];  // Track bound textures for slots 0-7
         bool textureValid[8];                 // Track which slots have valid cached values
+
+        // Sampler state preservation for suffix texture binding
+        struct SamplerState {
+            DWORD addressU, addressV;
+            bool addressUValid, addressVValid;
+        } samplerStates[8];
 
         TextureBindingCache() {
             reset();
@@ -226,6 +232,8 @@ class FixedFunctionShader {
             for (int i = 0; i < 8; i++) {
                 boundTextures[i] = nullptr;
                 textureValid[i] = false;
+                samplerStates[i].addressUValid = false;
+                samplerStates[i].addressVValid = false;
             }
         }
 
@@ -239,6 +247,27 @@ class FixedFunctionShader {
             if (stage < 8) {
                 boundTextures[stage] = texture;
                 textureValid[stage] = true;
+            }
+        }
+
+        void cacheSamplerState(DWORD stage, D3DSAMPLERSTATETYPE type, DWORD value) {
+            if (stage >= 8) return;
+            if (type == D3DSAMP_ADDRESSU) {
+                samplerStates[stage].addressU = value;
+                samplerStates[stage].addressUValid = true;
+            } else if (type == D3DSAMP_ADDRESSV) {
+                samplerStates[stage].addressV = value;
+                samplerStates[stage].addressVValid = true;
+            }
+        }
+
+        void restoreSamplerStates(IDirect3DDevice9* device, DWORD stage) {
+            if (stage >= 8) return;
+            if (samplerStates[stage].addressUValid) {
+                device->SetSamplerState(stage, D3DSAMP_ADDRESSU, samplerStates[stage].addressU);
+            }
+            if (samplerStates[stage].addressVValid) {
+                device->SetSamplerState(stage, D3DSAMP_ADDRESSV, samplerStates[stage].addressV);
             }
         }
     };
@@ -317,14 +346,24 @@ class FixedFunctionShader {
         RecordedLightState lightrs;
         ShaderKey sk;
 
+        // Captured sampler states for each texture stage
+        struct SamplerState {
+            DWORD addressU = D3DTADDRESS_WRAP;
+            DWORD addressV = D3DTADDRESS_WRAP;
+            bool captured = false;
+        };
+        SamplerState samplerStates[8];  // D3D9 supports up to 8 texture stages
+
         // Constructor to capture render state data with proper resource management
-        HLSLRecordedCall(const RenderedState* rs_, const FragmentState* frs_, const LightState* lightrs_)
-            : rs(*rs_), frs(*frs_), lightrs(*lightrs_), sk(rs_, frs_, lightrs_) {}
+        HLSLRecordedCall(const RenderedState* rs_, const FragmentState* frs_, const LightState* lightrs_, const ShaderKey& sk_);
     };
 
     static std::vector<HLSLRecordedCall> recordedCalls;
     static bool isRecording;
     static bool isReplaying;
+    static bool manualRecordingControl;  // When true, user controls recording via K key
+    static bool recordingEnabled;  // Global toggle for entire recording system
+    static bool dumpRequested;  // When true, preserve calls for dump
 
     // Consistent matrices for entire recording session
     static D3DXMATRIX recordingDeviceView, recordingDeviceProj;
@@ -332,12 +371,31 @@ class FixedFunctionShader {
 
     static void startRecording();
     static void stopRecordingAndReplay();
-    static void recordRenderCall(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);
+    static void recordRenderCall(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, const ShaderKey& sk);
     static void replayRecordedCalls();
     static void renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);
+    static ShaderKey computeShaderKeyWithSuffixes(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);
 
 public:
     static void finalizeBatchAndReplay(); // Call when HLSL rendering session is complete
+
+    // Debug controls for record/replay system
+    static bool getIsRecording() { return isRecording; }
+    static bool getIsReplaying() { return isReplaying; }
+    static void setRecordingState(bool recording) { isRecording = recording; }
+    static void setReplayingState(bool replaying) { isReplaying = replaying; }
+    static void setManualRecordingControl(bool manual) { manualRecordingControl = manual; }
+    static bool getManualRecordingControl() { return manualRecordingControl; }
+    static size_t getRecordedCallsCount() { return recordedCalls.size(); }
+
+    // Global recording system toggle
+    static bool getRecordingEnabled() { return recordingEnabled; }
+    static void setRecordingEnabled(bool enabled) { recordingEnabled = enabled; }
+
+    // Dump control
+    static void requestDump() { dumpRequested = true; }
+
+    static const std::vector<HLSLRecordedCall>& getRecordedCalls() { return recordedCalls; }
 
 private:
 
@@ -357,6 +415,8 @@ public:
     static void processAsyncCompletions();
     static void resetHLSLCaches(); // Reset material/texture caches for HLSL rendering session
     static void setCachedTexture(IDirect3DDevice9* device, DWORD stage, IDirect3DTexture9* texture); // Cached texture binding
+    static void setCachedTextureWithSamplerPreservation(IDirect3DDevice9* device, DWORD stage, IDirect3DTexture9* texture); // Cached texture binding that preserves sampler states
+    static void captureSamplerStates(IDirect3DDevice9* device, DWORD stage); // Capture current sampler states before texture binding
     static void createDefaultTextures(); // Create default textures to avoid null binds
     static void bindShaderTextures(const ShaderKey& sk, const RenderedState* rs); // Smart texture binding for shader
 };

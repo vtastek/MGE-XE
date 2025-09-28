@@ -43,6 +43,8 @@ public:
     static void MoveRight3PCam();
     static void MoveDown3PCam();
     static void MoveUp3PCam();
+    static void ToggleRecordReplay();
+    static void DumpFrame();
 };
 
 
@@ -129,6 +131,8 @@ enum GraphicsFuncs {
     GF_MoveRight3PC = 51,
     GF_MoveDown3PC = 52,
     GF_MoveUp3PC = 53,
+    GF_ToggleRecordReplay = 54,     // Toggle record/replay system (K key)
+    GF_DumpFrame = 55,              // Dump single frame data (O key)
     MGEINPUT_GRAPHICSFUNCS          // Handy way of getting the number of elements in an enum
 };
 

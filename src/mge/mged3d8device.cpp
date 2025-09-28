@@ -254,6 +254,9 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
     isFrameComplete = false;
     isHUDComplete = false;
 
+    // Reset HLSL texture caches at frame boundary to prevent stale texture pointers
+    FixedFunctionShader::resetHLSLCaches();
+
     return ProxyDevice::Present(a, b, c, d);
 }
 

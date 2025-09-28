@@ -416,3 +416,31 @@ void MacroFunctions::MoveUp3PCam() {
         displayCamPosition();
     }
 }
+
+void MacroFunctions::ToggleRecordReplay() {
+    bool wasEnabled = FixedFunctionShader::getRecordingEnabled();
+
+    // Simple toggle of entire recording system
+    FixedFunctionShader::setRecordingEnabled(!wasEnabled);
+
+    if (FixedFunctionShader::getRecordingEnabled()) {
+        StatusOverlay::setStatus("Recording: ON");
+        LOG::logline("Recording: ON");
+    } else {
+        StatusOverlay::setStatus("Recording: OFF");
+        LOG::logline("Recording: OFF");
+    }
+}
+
+void MacroFunctions::DumpFrame() {
+    LOG::logline("DumpFrame function called!");
+
+    if (FixedFunctionShader::getRecordingEnabled()) {
+        StatusOverlay::setStatus("Frame dump: Requesting batch dump...");
+    } else {
+        StatusOverlay::setStatus("Frame dump: Requesting immediate dump...");
+    }
+
+    // Request dump - this will be handled in the next frame
+    FixedFunctionShader::requestDump();
+}

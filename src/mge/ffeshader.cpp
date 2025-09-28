@@ -51,6 +51,9 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::hlslShaderDefaultPurple;
 std::vector<FixedFunctionShader::HLSLRecordedCall> FixedFunctionShader::recordedCalls;
 bool FixedFunctionShader::isRecording = false;
 bool FixedFunctionShader::isReplaying = false;
+bool FixedFunctionShader::manualRecordingControl = false;
+bool FixedFunctionShader::recordingEnabled = true;
+bool FixedFunctionShader::dumpRequested = false;
 
 // Consistent matrices for entire recording session
 D3DXMATRIX FixedFunctionShader::recordingDeviceView;
@@ -1394,6 +1397,33 @@ void FixedFunctionShader::createDefaultTextures() {
     LOG::logline("-- Created default textures for DXVK optimization");
 }
 
+// Capture current sampler states before replacing textures
+void FixedFunctionShader::captureSamplerStates(IDirect3DDevice9* device, DWORD stage) {
+    if (stage >= 8) return;
+
+    DWORD addressU, addressV;
+    if (device->GetSamplerState(stage, D3DSAMP_ADDRESSU, &addressU) == S_OK) {
+        textureCache.cacheSamplerState(stage, D3DSAMP_ADDRESSU, addressU);
+    }
+    if (device->GetSamplerState(stage, D3DSAMP_ADDRESSV, &addressV) == S_OK) {
+        textureCache.cacheSamplerState(stage, D3DSAMP_ADDRESSV, addressV);
+    }
+}
+
+// Cached texture binding that preserves sampler states for suffix textures
+void FixedFunctionShader::setCachedTextureWithSamplerPreservation(IDirect3DDevice9* device, DWORD stage, IDirect3DTexture9* texture) {
+    // Capture current sampler states if this is the first time binding to this stage
+    if (!textureCache.textureValid[stage] || textureCache.boundTextures[stage] != texture) {
+        captureSamplerStates(device, stage);
+    }
+
+    // Bind the texture using normal caching
+    setCachedTexture(device, stage, texture);
+
+    // Restore the original sampler states after texture binding
+    textureCache.restoreSamplerStates(device, stage);
+}
+
 // Smart texture binding - only binds slots that the shader actually uses
 void FixedFunctionShader::bindShaderTextures(const ShaderKey& sk, const RenderedState* rs) {
     // Original slot assignment (keeping existing layout):
@@ -1412,24 +1442,38 @@ void FixedFunctionShader::bindShaderTextures(const ShaderKey& sk, const Rendered
         if (cacheIt != textureSuffixResolutionCache.end() &&
             cacheIt->second.hasValidName && cacheIt->second.variants) {
 
-            // Try diffparam_t first, then regular diffparam
-            IDirect3DTexture9* replacementTexture = nullptr;
-            if (cacheIt->second.variants->hasDiffParamT()) {
-                replacementTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device,
-                                                          *cacheIt->second.variants, "diffparam_t");
-            }
-            if (!replacementTexture && cacheIt->second.variants->hasDiffParam()) {
-                replacementTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device,
-                                                          *cacheIt->second.variants, "diffparam");
-            }
+            // Use cached diffparam replacement or load once per texture change
+            if (bindingCache.currentBaseTextureName == cacheIt->second.textureName &&
+                bindingCache.boundDiffParam) {
+                // Use cached replacement
+                baseTexture = bindingCache.boundDiffParam;
+            } else {
+                // Load replacement texture once for this base texture
+                IDirect3DTexture9* replacementTexture = nullptr;
+                if (cacheIt->second.variants->hasDiffParamT()) {
+                    replacementTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device,
+                                                              *cacheIt->second.variants, "diffparam_t");
+                }
+                if (!replacementTexture && cacheIt->second.variants->hasDiffParam()) {
+                    replacementTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device,
+                                                              *cacheIt->second.variants, "diffparam");
+                }
 
-            if (replacementTexture) {
-                baseTexture = replacementTexture;
+                if (replacementTexture) {
+                    baseTexture = replacementTexture;
+                    // Cache this replacement for future use with same base texture
+                    bindingCache.boundDiffParam = replacementTexture;
+                }
             }
         }
     }
 
-    setCachedTexture(device, 0, baseTexture);
+    // Use sampler preservation if base texture is a diffparam replacement
+    if (sk.hasDiffParam && baseTexture != rs->texture) {
+        setCachedTextureWithSamplerPreservation(device, 0, baseTexture);
+    } else {
+        setCachedTexture(device, 0, baseTexture);
+    }
 
     // Slot 1: Detail texture (conditional only - with ifdef support)
     if (sk.hasDetail && savedOriginalDetailTexture) {
@@ -1470,21 +1514,23 @@ void FixedFunctionShader::bindShaderTextures(const ShaderKey& sk, const Rendered
                     bindingCache.boundParamX = nullptr;
 
                     if (cacheIt->second.variants) {
-                        // Slot 2: ParamH (metallic/roughness)
+                        // Slot 2: ParamH (metallic/roughness) - load once per texture change
                         if (sk.hasParamH && cacheIt->second.variants->hasParamH()) {
-                            IDirect3DTexture9* paramhTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *cacheIt->second.variants, "paramh");
-                            if (paramhTexture) {
-                                setCachedTexture(device, 2, paramhTexture);
-                                bindingCache.boundParamH = paramhTexture;
+                            if (!bindingCache.boundParamH) {
+                                bindingCache.boundParamH = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *cacheIt->second.variants, "paramh");
+                            }
+                            if (bindingCache.boundParamH) {
+                                setCachedTextureWithSamplerPreservation(device, 2, bindingCache.boundParamH);
                             }
                         }
 
-                        // Slot 3: ParamX (anisotropic)
+                        // Slot 3: ParamX (anisotropic) - load once per texture change
                         if (sk.hasParamX && cacheIt->second.variants->hasParamX()) {
-                            IDirect3DTexture9* paramxTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *cacheIt->second.variants, "paramx");
-                            if (paramxTexture) {
-                                setCachedTexture(device, 3, paramxTexture);
-                                bindingCache.boundParamX = paramxTexture;
+                            if (!bindingCache.boundParamX) {
+                                bindingCache.boundParamX = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *cacheIt->second.variants, "paramx");
+                            }
+                            if (bindingCache.boundParamX) {
+                                setCachedTextureWithSamplerPreservation(device, 3, bindingCache.boundParamX);
                             }
                         }
                     }
@@ -1501,65 +1547,11 @@ void FixedFunctionShader::bindShaderTextures(const ShaderKey& sk, const Rendered
 }
 
 
-// HLSL Pipeline Implementation
-void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
-    // Skip if we're in replay mode to avoid recursion
-    if (isReplaying) {
-        // During replay mode, perform actual rendering with this specific call
-        renderMorrowindHLSL_Internal(rs, frs, lightrs);
-        return;
-    }
+// Helper function to compute ShaderKey with texture suffix detection
+FixedFunctionShader::ShaderKey FixedFunctionShader::computeShaderKeyWithSuffixes(const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
+    // Step 1: Determine texture suffix availability
+    bool hasDiffParam = false, hasParamH = false, hasParamX = false, hasGrass = false;
 
-    // Start recording at first HLSL call if not already recording
-    if (!isRecording && !isReplaying) {
-        startRecording();
-    }
-
-    // Record this render call for later replay (only if recording)
-    if (isRecording) {
-        // Create a copy of rs and add CURRENT shadow world-view-projection matrices for this draw call
-        // During recording, use current matrices; during replay, these will be the "recorded" matrices
-        RenderedState rsWithShadows = *rs;
-
-        // Use current shadow matrices for this specific draw call during recording
-        rsWithShadows.shadowWorldViewProj[0] = rs->worldTransforms[0] * DistantLand::smViewproj[0];
-        rsWithShadows.shadowWorldViewProj[1] = rs->worldTransforms[0] * DistantLand::smViewproj[1];
-
-        recordRenderCall(&rsWithShadows, frs, lightrs);
-        // Skip immediate rendering - will be done in batch during replay
-        return;
-    }
-
-    // Normal rendering path (when not recording)
-    renderMorrowindHLSL_Internal(rs, frs, lightrs);
-}
-
-// Internal rendering function that does the actual HLSL rendering
-void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
-    LOG::logline("HLSL Internal: Called (recording=%d, replaying=%d)", isRecording, isReplaying);
-
-    // Process any completed async shader compilations
-    processAsyncCompletions();
-
-    
-    HLSLShader hlslShader;
-
-    // During replay, use recorded ShaderKey; during normal rendering, generate from current state
-    ShaderKey sk;
-    if (isReplaying) {
-        // Find the recorded ShaderKey for this call
-        for (const auto& call : recordedCalls) {
-            if (&call.rs == rs) {
-                sk = call.sk;
-                break;
-            }
-        }
-    } else {
-        sk = ShaderKey(rs, frs, lightrs);
-    }
-    
-    // Perform texture suffix resolution to determine available suffixes
-    // This prevents HAS_NORMAL from being defined for textures without normal maps
     if (rs->texture) {
         // Check texture suffix resolution cache first
         auto cacheIt = textureSuffixResolutionCache.find(rs->texture);
@@ -1578,30 +1570,87 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             }
             cacheIt = textureSuffixResolutionCache.emplace(rs->texture, std::move(entry)).first;
         }
-        
+
         // Set texture suffix flags based on actual availability
         if (cacheIt->second.hasValidName && cacheIt->second.variants) {
-            sk.hasDiffParam = cacheIt->second.variants->hasDiffParam() || cacheIt->second.variants->hasDiffParamT();
-            sk.hasParamH = cacheIt->second.variants->hasParamH();
-            sk.hasParamX = cacheIt->second.variants->hasParamX();
-            sk.hasGrass = cacheIt->second.variants->hasGrass();
-        } else {
-            // No suffix variants available, use base texture only
-            sk.hasDiffParam = 0;
-            sk.hasParamH = 0;
-            sk.hasParamX = 0;
-            sk.hasGrass = 0;
+            hasDiffParam = cacheIt->second.variants->hasDiffParam() || cacheIt->second.variants->hasDiffParamT();
+            hasParamH = cacheIt->second.variants->hasParamH();
+            hasParamX = cacheIt->second.variants->hasParamX();
+            hasGrass = cacheIt->second.variants->hasGrass();
+        }
+    }
+
+    // Step 2: Create ShaderKey with suffix flags
+    ShaderKey sk(rs, frs, lightrs);
+    sk.hasDiffParam = hasDiffParam;
+    sk.hasParamH = hasParamH;
+    sk.hasParamX = hasParamX;
+    sk.hasGrass = hasGrass;
+
+    // Set shadow flag based on MGE configuration
+    sk.hasShadows = ((Configuration.MGEFlags & USE_SHADOWS) && (Configuration.MGEFlags & USE_DISTANT_LAND)) ? 1 : 0;
+
+    return sk;
+}
+
+// HLSL Pipeline Implementation
+void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
+    // Skip if we're in replay mode to avoid recursion
+    if (isReplaying) {
+        // During replay mode, perform actual rendering with this specific call
+        renderMorrowindHLSL_Internal(rs, frs, lightrs);
+        return;
+    }
+
+    // Start recording at first HLSL call if not already recording (unless under manual control or disabled)
+    if (!isRecording && !isReplaying && !manualRecordingControl && recordingEnabled) {
+        startRecording();
+    }
+
+    // Always record calls for potential dump
+    if (true) {
+        // Create a copy of rs and add CURRENT shadow world-view-projection matrices for this draw call
+        // During recording, use current matrices; during replay, these will be the "recorded" matrices
+        RenderedState rsWithShadows = *rs;
+
+        // Use current shadow matrices for this specific draw call during recording
+        rsWithShadows.shadowWorldViewProj[0] = rs->worldTransforms[0] * DistantLand::smViewproj[0];
+        rsWithShadows.shadowWorldViewProj[1] = rs->worldTransforms[0] * DistantLand::smViewproj[1];
+
+        // Compute ShaderKey with texture suffix detection for recording
+        ShaderKey sk = computeShaderKeyWithSuffixes(&rsWithShadows, frs, lightrs);
+        recordRenderCall(&rsWithShadows, frs, lightrs, sk);
+        // Skip immediate rendering - will be done in batch during replay
+        return;
+    }
+
+    // Normal rendering path (when not recording)
+    renderMorrowindHLSL_Internal(rs, frs, lightrs);
+}
+
+// Internal rendering function that does the actual HLSL rendering
+void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
+
+    // Process any completed async shader compilations
+    processAsyncCompletions();
+
+    
+    HLSLShader hlslShader;
+
+    // Get ShaderKey with texture suffix detection
+    ShaderKey sk;
+    if (isReplaying) {
+        // During replay, use the recorded ShaderKey with original suffix flags
+        for (const auto& call : recordedCalls) {
+            if (&call.rs == rs) {
+                sk = call.sk;
+                break;
+            }
         }
     } else {
-        // No texture bound, no suffixes
-        sk.hasDiffParam = 0;
-        sk.hasParamH = 0;
-        sk.hasParamX = 0;
-        sk.hasGrass = 0;
+        // During normal rendering, compute ShaderKey with texture suffix detection
+        sk = computeShaderKeyWithSuffixes(rs, frs, lightrs);
     }
-    
-    // Set shadow flag based on MGE configuration - shadows require both USE_SHADOWS and USE_DISTANT_LAND
-    sk.hasShadows = ((Configuration.MGEFlags & USE_SHADOWS) && (Configuration.MGEFlags & USE_DISTANT_LAND)) ? 1 : 0;
 
     // Check if Morrowind bound a detail texture to slot 1 (frequency optimization)
     // Save the original detail texture before we start binding our own textures
@@ -2977,6 +3026,13 @@ void FixedFunctionShader::resetHLSLCaches() {
 
     // Reset texture binding cache for HLSL rendering session
     textureCache.reset();
+
+    // Reset suffix binding cache to prevent stale texture pointers across frames
+    bindingCache.lastBaseTexture = nullptr;
+    bindingCache.currentBaseTextureName.clear();
+    bindingCache.boundDiffParam = nullptr;
+    bindingCache.boundParamH = nullptr;
+    bindingCache.boundParamX = nullptr;
 }
 
 
@@ -3153,7 +3209,6 @@ void FixedFunctionShader::stopRecordingAndReplay() {
     }
 
     isRecording = false;
-    LOG::logline("HLSL Recording: Stopped recording, captured %d render calls", recordedCalls.size());
 
     // Now replay all recorded calls
     replayRecordedCalls();
@@ -3168,27 +3223,82 @@ void FixedFunctionShader::stopRecordingAndReplay() {
 
 // Call this when HLSL rendering session is complete to trigger replay
 void FixedFunctionShader::finalizeBatchAndReplay() {
-    if (isRecording && !recordedCalls.empty()) {
-        LOG::logline("HLSL: Batch complete - replaying %d recorded calls", recordedCalls.size());
-        stopRecordingAndReplay();
+    // Handle dump request
+    if (dumpRequested) {
+        if (recordingEnabled) {
+            // Recording ON: Batch dump
+            LOG::logline("Frame dump: Dumping %d recorded calls (batch)", recordedCalls.size());
+            StatusOverlay::setStatus("Frame dump: Batch complete");
+
+            char logline[512];
+            for (size_t i = 0; i < recordedCalls.size(); ++i) {
+                const auto& call = recordedCalls[i];
+                snprintf(logline, sizeof(logline), "Call %zu: texture=0x%p, vb=0x%p, ib=0x%p, hasShadows=%d, hasParamH=%d (batch)",
+                         i, call.rs.texture, call.rs.vb, call.rs.ib,
+                         call.sk.hasShadows, call.sk.hasParamH);
+                LOG::logline(logline);
+
+                if (call.rs.texture) {
+                    D3DSURFACE_DESC desc;
+                    if (SUCCEEDED(call.rs.texture->GetLevelDesc(0, &desc))) {
+                        snprintf(logline, sizeof(logline), "  Texture: %dx%d, format=%d",
+                                 desc.Width, desc.Height, desc.Format);
+                        LOG::logline(logline);
+                    }
+                }
+            }
+        } else {
+            // Recording OFF: Immediate dump was already done per-call
+            LOG::logline("Frame dump: Immediate dump complete");
+            StatusOverlay::setStatus("Frame dump: Immediate complete");
+        }
+        dumpRequested = false;
     }
 
-    // Ensure clean state for next batch - recording can start fresh next time
-    isRecording = false;
-    isReplaying = false;
-    recordedCalls.clear();
+    if (recordingEnabled) {
+        // Recording mode: record, replay, and reset for next cycle
+        if (isRecording && !recordedCalls.empty()) {
+            stopRecordingAndReplay();
+        }
 
-    // Reset HLSL caches after recording session completes
+        // Ensure clean state for next batch - recording can start fresh next time
+        isRecording = false;
+        isReplaying = false;
+        recordedCalls.clear();
+    } else {
+        // When recording disabled, still clear calls after potential dump
+        recordedCalls.clear();
+    }
+
+    // Always reset HLSL caches after rendering session completes
     resetHLSLCaches();
 }
 
-void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
-    if (!isRecording || isReplaying) {
-        return;
+void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, const ShaderKey& sk) {
+    if (isReplaying) {
+        return;  // Don't record during replay to avoid recursion
     }
 
-    // Record this render call
-    recordedCalls.emplace_back(rs, frs, lightrs);
+    // When recording is OFF and dump is requested, dump each call immediately
+    if (!recordingEnabled && dumpRequested) {
+        static int callIndex = 0;
+        char logline[512];
+        snprintf(logline, sizeof(logline), "Call %d: texture=0x%p, vb=0x%p, ib=0x%p (immediate)",
+                 callIndex++, rs->texture, rs->vb, rs->ib);
+        LOG::logline(logline);
+
+        if (rs->texture) {
+            D3DSURFACE_DESC desc;
+            if (SUCCEEDED(rs->texture->GetLevelDesc(0, &desc))) {
+                snprintf(logline, sizeof(logline), "  Texture: %dx%d, format=%d",
+                         desc.Width, desc.Height, desc.Format);
+                LOG::logline(logline);
+            }
+        }
+    }
+
+    // Always record calls for potential batch dump when recording is ON
+    recordedCalls.emplace_back(rs, frs, lightrs, sk);
 }
 
 void FixedFunctionShader::replayRecordedCalls() {
@@ -3197,7 +3307,6 @@ void FixedFunctionShader::replayRecordedCalls() {
     }
 
     isReplaying = true;
-    LOG::logline("HLSL Replay: Replaying %d recorded render calls", recordedCalls.size());
 
     // Use CURRENT view/projection matrices for replay, not stale recorded ones
     // This ensures objects render at current camera position, not old position
@@ -3216,6 +3325,14 @@ void FixedFunctionShader::replayRecordedCalls() {
 
     // Render all recorded calls with consistent matrices
     for (const auto& call : recordedCalls) {
+        // Restore sampler states for this call
+        for (int stage = 0; stage < 8; ++stage) {
+            if (call.samplerStates[stage].captured) {
+                device->SetSamplerState(stage, D3DSAMP_ADDRESSU, call.samplerStates[stage].addressU);
+                device->SetSamplerState(stage, D3DSAMP_ADDRESSV, call.samplerStates[stage].addressV);
+            }
+        }
+
         renderMorrowindHLSL_Internal(&call.rs, &call.frs, const_cast<LightState*>(static_cast<const LightState*>(&call.lightrs)));
     }
 
@@ -3256,5 +3373,28 @@ FixedFunctionShader::RecordedRenderedState::RecordedRenderedState(RecordedRender
     source.vb = nullptr;
     source.ib = nullptr;
     source.texture = nullptr;
+}
+
+// ------------------------------------
+// FixedFunctionShader::HLSLRecordedCall
+
+FixedFunctionShader::HLSLRecordedCall::HLSLRecordedCall(const RenderedState* rs_, const FragmentState* frs_, const LightState* lightrs_, const ShaderKey& sk_)
+    : rs(*rs_), frs(*frs_), lightrs(*lightrs_), sk(sk_) {
+
+    // Capture current sampler states for all texture stages
+    for (int stage = 0; stage < 8; ++stage) {
+        samplerStates[stage].captured = false;
+
+        // Only capture sampler state if there's a texture bound to this stage
+        IDirect3DBaseTexture9* texture = nullptr;
+        if (SUCCEEDED(device->GetTexture(stage, &texture)) && texture) {
+            // Capture address modes for U and V
+            if (SUCCEEDED(device->GetSamplerState(stage, D3DSAMP_ADDRESSU, &samplerStates[stage].addressU)) &&
+                SUCCEEDED(device->GetSamplerState(stage, D3DSAMP_ADDRESSV, &samplerStates[stage].addressV))) {
+                samplerStates[stage].captured = true;
+            }
+            texture->Release(); // Release the reference from GetTexture
+        }
+    }
 }
 
