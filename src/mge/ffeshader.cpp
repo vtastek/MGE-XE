@@ -66,6 +66,15 @@ FixedFunctionShader::MaterialStateCache FixedFunctionShader::materialCache;
 // Texture binding cache static member
 FixedFunctionShader::TextureBindingCache FixedFunctionShader::textureCache;
 
+// Exterior texture binding optimization flags
+bool FixedFunctionShader::isExteriorShadowBound = false;
+bool FixedFunctionShader::isDetailTextureBound = false;
+
+// Shadow matrix caching optimization
+D3DXMATRIX FixedFunctionShader::cachedViewMatrix;
+D3DXMATRIX FixedFunctionShader::cachedViewToShadow[2];
+bool FixedFunctionShader::shadowMatricesValid = false;
+
 // Default textures static members
 IDirect3DTexture9* FixedFunctionShader::defaultWhiteTexture = nullptr;
 IDirect3DTexture9* FixedFunctionShader::defaultBlackTexture = nullptr;
@@ -1782,17 +1791,24 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     // DXVK-optimized texture binding - only touches slots the shader actually uses
     bindShaderTextures(sk, rs);
 
-    // Set shadow matrices if shadows are enabled (moved from bindShaderTextures for clarity)
+    // Set shadow matrices if shadows are enabled with view change caching
     if (sk.hasShadows) {
         // Use current device view matrix, not cached distant land view
-        D3DXMATRIX currentView, inverseView, viewToShadow[2];
+        D3DXMATRIX currentView;
         device->GetTransform(D3DTS_VIEW, &currentView);
-        D3DXMatrixInverse(&inverseView, NULL, &currentView);
-        viewToShadow[0] = inverseView * DistantLand::smViewproj[0];
-        viewToShadow[1] = inverseView * DistantLand::smViewproj[1];
 
-        device->SetVertexShaderConstantF(20, (float*)&viewToShadow[0], 4); // c20-c23
-        device->SetVertexShaderConstantF(24, (float*)&viewToShadow[1], 4); // c24-c27
+        // Only recalculate shadow matrices when view changes
+        if (!shadowMatricesValid || memcmp(&currentView, &cachedViewMatrix, sizeof(D3DXMATRIX)) != 0) {
+            cachedViewMatrix = currentView;
+            D3DXMATRIX inverseView;
+            D3DXMatrixInverse(&inverseView, NULL, &currentView);
+            cachedViewToShadow[0] = inverseView * DistantLand::smViewproj[0];
+            cachedViewToShadow[1] = inverseView * DistantLand::smViewproj[1];
+            shadowMatricesValid = true;
+        }
+
+        device->SetVertexShaderConstantF(20, (float*)&cachedViewToShadow[0], 4); // c20-c23
+        device->SetVertexShaderConstantF(24, (float*)&cachedViewToShadow[1], 4); // c24-c27
 
         // Set shadow resolution parameter
         float shadowRcp = 1.0f / Configuration.DL.ShadowResolution;
@@ -2117,23 +2133,20 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         }
         
         // Set lighting constants using the same format as the original system
-        D3DXHANDLE hLightSunDirection = hlslShader.psConstantTable->GetConstantByName(NULL, "lightSunDirection");
-        if (hLightSunDirection) {
-            hlslShader.psConstantTable->SetFloatArray(device, hLightSunDirection, (const float*)&sunDirection, 3);
+        if (hlslShader.hLightSunDirection) {
+            hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightSunDirection, (const float*)&sunDirection, 3);
         } else {
             // logline("!! lightSunDirection constant not found in pixel shader");
         }
-        
-        D3DXHANDLE hLightSunDiffuse = hlslShader.psConstantTable->GetConstantByName(NULL, "lightSunDiffuse");
-        if (hLightSunDiffuse) {
-            hlslShader.psConstantTable->SetFloatArray(device, hLightSunDiffuse, (const float*)&sunDiffuse, 3);
+
+        if (hlslShader.hLightSunDiffuse) {
+            hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightSunDiffuse, (const float*)&sunDiffuse, 3);
         } else {
             // LOG::logline("!! lightSunDiffuse constant not found in pixel shader");
         }
-        
-        D3DXHANDLE hLightSceneAmbient = hlslShader.psConstantTable->GetConstantByName(NULL, "lightSceneAmbient");
-        if (hLightSceneAmbient) {
-            hlslShader.psConstantTable->SetFloatArray(device, hLightSceneAmbient, (const float*)&ambient, 3);
+
+        if (hlslShader.hLightSceneAmbient) {
+            hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightSceneAmbient, (const float*)&ambient, 3);
         } else {
             // LOG::logline("!! lightSceneAmbient constant not found in pixel shader");
         }
@@ -2206,16 +2219,14 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         }
         
         // Set shadow resolution for pixel shader
-        D3DXHANDLE hShadowRcpRes = hlslShader.psConstantTable->GetConstantByName(NULL, "shadowRcpRes");
-        if (hShadowRcpRes) {
+        if (hlslShader.hShadowRcpRes) {
             float shadowRcp = 1.0f / Configuration.DL.ShadowResolution;
-            hlslShader.psConstantTable->SetFloat(device, hShadowRcpRes, shadowRcp);
+            hlslShader.psConstantTable->SetFloat(device, hlslShader.hShadowRcpRes, shadowRcp);
         }
-        
+
         // Set PCF parameters from ImGui debug interface
-        D3DXHANDLE hPCFFilterSize = hlslShader.psConstantTable->GetConstantByName(NULL, "PCF_filterSize");
-        if (hPCFFilterSize) {
-            hlslShader.psConstantTable->SetFloat(device, hPCFFilterSize, ImGuiManager::GetPCFFilterSize());
+        if (hlslShader.hPCFFilterSize) {
+            hlslShader.psConstantTable->SetFloat(device, hlslShader.hPCFFilterSize, ImGuiManager::GetPCFFilterSize());
         }
         
         D3DXHANDLE hPCFPenumbraScale = hlslShader.psConstantTable->GetConstantByName(NULL, "PCF_penumbraScale");
@@ -2508,6 +2519,13 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::createPurpleErrorShader() {
                 errorShader.hMaterialDiffuse = errorShader.psConstantTable->GetConstantByName(NULL, "materialDiffuse");
                 errorShader.hMaterialAmbient = errorShader.psConstantTable->GetConstantByName(NULL, "materialAmbient");
                 errorShader.hMaterialEmissive = errorShader.psConstantTable->GetConstantByName(NULL, "materialEmissive");
+
+                // Cache additional handles for error shader
+                errorShader.hLightSunDirection = errorShader.psConstantTable->GetConstantByName(NULL, "lightSunDirection");
+                errorShader.hLightSunDiffuse = errorShader.psConstantTable->GetConstantByName(NULL, "lightSunDiffuse");
+                errorShader.hLightSceneAmbient = errorShader.psConstantTable->GetConstantByName(NULL, "lightSceneAmbient");
+                errorShader.hShadowRcpRes = errorShader.psConstantTable->GetConstantByName(NULL, "shadowRcpRes");
+                errorShader.hPCFFilterSize = errorShader.psConstantTable->GetConstantByName(NULL, "PCFFilterSize");
             }
         }
         psBlob->Release();
@@ -2935,6 +2953,13 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         hlslShader.hMaterialDiffuse = hlslShader.psConstantTable->GetConstantByName(NULL, "materialDiffuse");
         hlslShader.hMaterialAmbient = hlslShader.psConstantTable->GetConstantByName(NULL, "materialAmbient");
         hlslShader.hMaterialEmissive = hlslShader.psConstantTable->GetConstantByName(NULL, "materialEmissive");
+
+        // Cache additional lighting and shader constant handles
+        hlslShader.hLightSunDirection = hlslShader.psConstantTable->GetConstantByName(NULL, "lightSunDirection");
+        hlslShader.hLightSunDiffuse = hlslShader.psConstantTable->GetConstantByName(NULL, "lightSunDiffuse");
+        hlslShader.hLightSceneAmbient = hlslShader.psConstantTable->GetConstantByName(NULL, "lightSceneAmbient");
+        hlslShader.hShadowRcpRes = hlslShader.psConstantTable->GetConstantByName(NULL, "shadowRcpRes");
+        hlslShader.hPCFFilterSize = hlslShader.psConstantTable->GetConstantByName(NULL, "PCF_filterSize");
     }
     
     // Log compilation details for debugging (before releasing blobs)
@@ -3050,6 +3075,13 @@ void FixedFunctionShader::resetHLSLCaches() {
 
     // Reset texture binding cache for HLSL rendering session
     textureCache.reset();
+
+    // Reset exterior texture binding optimizations
+    isExteriorShadowBound = false;
+    isDetailTextureBound = false;
+
+    // Reset shadow matrix cache validity
+    shadowMatricesValid = false;
 
     // Reset suffix binding cache to prevent stale texture pointers across frames
     bindingCache.lastBaseTexture = nullptr;

@@ -162,6 +162,13 @@ class FixedFunctionShader {
         D3DXHANDLE hMaterialAmbient;
         D3DXHANDLE hMaterialEmissive;
 
+        // Additional cached lighting constant handles (avoid per-draw string lookups)
+        D3DXHANDLE hLightSunDirection;
+        D3DXHANDLE hLightSunDiffuse;
+        D3DXHANDLE hLightSceneAmbient;
+        D3DXHANDLE hShadowRcpRes;
+        D3DXHANDLE hPCFFilterSize;
+
         // Suffix texture support
         IDirect3DTexture9* diffparamTexture;
         IDirect3DTexture9* normalTexture;
@@ -287,6 +294,15 @@ class FixedFunctionShader {
         }
     };
     static TextureBindingCache textureCache;
+
+    // Exterior texture binding optimizations
+    static bool isExteriorShadowBound;
+    static bool isDetailTextureBound;
+
+    // Shadow matrix caching to avoid per-draw calculations
+    static D3DXMATRIX cachedViewMatrix;
+    static D3DXMATRIX cachedViewToShadow[2];
+    static bool shadowMatricesValid;
 
     // Default textures to avoid null binds that cause DXVK descriptor updates
     static IDirect3DTexture9* defaultWhiteTexture;
