@@ -18,9 +18,12 @@ void DistantLand::renderDepth() {
     // Unbind depth sampler
     effect->SetTexture(ehTex3, NULL);
 
-    // Projection should cover whole scene
+    // Projection should match main rendering - use distant land logic when enabled
     D3DXMATRIX distProj = mwProj;
-    editProjectionZ(&distProj, 4.0f, Configuration.DL.DrawDist * kCellSize);
+    if (Configuration.MGEFlags & USE_DISTANT_LAND) {
+        editProjectionZ(&distProj, 4.0f, Configuration.DL.DrawDist * kCellSize);
+    }
+    // When distant land is off, use original Morrowind projection (near=1.0)
     effect->SetMatrix(ehProj, &distProj);
 
     // Clear floating point buffer to far depth
@@ -74,9 +77,12 @@ void DistantLand::renderDepthAdditional() {
     // Unbind depth sampler
     effect->SetTexture(ehTex3, NULL);
 
-    // Projection should cover whole scene
+    // Projection should match main rendering - use distant land logic when enabled
     D3DXMATRIX distProj = mwProj;
-    editProjectionZ(&distProj, 4.0f, Configuration.DL.DrawDist * kCellSize);
+    if (Configuration.MGEFlags & USE_DISTANT_LAND) {
+        editProjectionZ(&distProj, 4.0f, Configuration.DL.DrawDist * kCellSize);
+    }
+    // When distant land is off, use original Morrowind projection (near=1.0)
     effect->SetMatrix(ehProj, &distProj);
 
     // Recorded draw calls
@@ -136,6 +142,7 @@ void DistantLand::renderDepthRecorded() {
 
         // Phase A: Set render states to match HLSL rendering exactly
         // For alpha blended objects, disable backface culling to show both sides
+        // In depth-only rendering, both front and back faces need proper depth values
         if (i.blendEnable) {
             device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
         } else {
@@ -145,6 +152,13 @@ void DistantLand::renderDepthRecorded() {
         if (i.blendEnable) {
             device->SetRenderState(D3DRS_SRCBLEND, i.srcBlend);
             device->SetRenderState(D3DRS_DESTBLEND, i.destBlend);
+        }
+
+        // Phase A: Set alpha test for depth-only rendering to match color rendering
+        device->SetRenderState(D3DRS_ALPHATESTENABLE, i.alphaTest);
+        if (i.alphaTest) {
+            device->SetRenderState(D3DRS_ALPHAREF, i.alphaRef);
+            device->SetRenderState(D3DRS_ALPHAFUNC, i.alphaFunc);
         }
 
         device->SetStreamSource(0, i.vb, i.vbOffset, i.vbStride);

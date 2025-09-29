@@ -3394,9 +3394,12 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     device->GetTransform(D3DTS_VIEW, &currentView);
     device->GetTransform(D3DTS_PROJECTION, &depthProj);
 
-    // Phase A: Always match renderDepth() near/far planes for consistent depth values
-    // This is required for proper depth testing regardless of distant land status
-    DistantLand::editProjectionZ(&depthProj, 4.0f, Configuration.DL.DrawDist * DistantLand::kCellSize);
+    // Phase A: Match renderDepth() projection matrix logic for consistent depth values
+    // Use same near/far logic as renderDepth() based on distant land settings
+    if (Configuration.MGEFlags & USE_DISTANT_LAND) {
+        DistantLand::editProjectionZ(&depthProj, 4.0f, Configuration.DL.DrawDist * DistantLand::kCellSize);
+    }
+    // When distant land is off, use original Morrowind projection (near=1.0)
 
     device->SetTransform(D3DTS_VIEW, &currentView);
     device->SetTransform(D3DTS_PROJECTION, &depthProj);
