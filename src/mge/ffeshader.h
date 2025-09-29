@@ -404,12 +404,12 @@ class FixedFunctionShader {
     static void startRecording();
     static void stopRecordingAndReplay();
     static void recordRenderCall(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, const ShaderKey& sk);
-    static void replayRecordedCalls();
+    static void replayRecordedCalls(int sceneCount);
     static void renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);
     static ShaderKey computeShaderKeyWithSuffixes(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);
 
 public:
-    static void finalizeBatchAndReplay(); // Call when HLSL rendering session is complete
+    static void finalizeBatchAndReplay(int sceneCount = 0); // Call when HLSL rendering session is complete
 
     // Debug controls for record/replay system
     static bool getIsRecording() { return isRecording; }

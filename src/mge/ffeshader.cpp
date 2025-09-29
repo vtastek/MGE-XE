@@ -3267,7 +3267,7 @@ void FixedFunctionShader::stopRecordingAndReplay() {
     isRecording = false;
 
     // Now replay all recorded calls
-    replayRecordedCalls();
+    replayRecordedCalls(0); // Default to scene 0 for manual stop/replay
 
     // Clear recorded calls after replay
     recordedCalls.clear();
@@ -3278,7 +3278,7 @@ void FixedFunctionShader::stopRecordingAndReplay() {
 }
 
 // Call this when HLSL rendering session is complete to trigger replay
-void FixedFunctionShader::finalizeBatchAndReplay() {
+void FixedFunctionShader::finalizeBatchAndReplay(int sceneCount) {
     // Handle dump request
     if (dumpRequested) {
         if (recordingEnabled) {
@@ -3357,20 +3357,56 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
     recordedCalls.emplace_back(rs, frs, lightrs, sk);
 }
 
-void FixedFunctionShader::replayRecordedCalls() {
+void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     if (recordedCalls.empty()) {
         return;
     }
 
     isReplaying = true;
 
-    // Use CURRENT view/projection matrices for replay, not stale recorded ones
-    // This ensures objects render at current camera position, not old position
-    D3DXMATRIX currentView, currentProj;
+    // Phase A: Restore depth buffer from backup for early-Z optimization
+    if (sceneCount == 0) {
+        DistantLand::restoreDepthBuffer();
+    }
+
+    // Phase A: Smart Scene-Aware Early-Z Optimization
+    DWORD savedZWriteEnable, savedZFunc;
+    device->GetRenderState(D3DRS_ZWRITEENABLE, &savedZWriteEnable);
+    device->GetRenderState(D3DRS_ZFUNC, &savedZFunc);
+
+    if (sceneCount == 0) {
+        // Scene 0: World geometry - leverage depth prepass for early-Z
+        // renderDepth() has populated depth buffer, use read-only depth testing
+        device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);      // Disable depth writes (early-Z still works)
+        device->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL); // Standard depth testing
+        // Early-Z benefit: pixels behind existing depth are culled before lighting
+    } else {
+        // Scene 1+: Post Z-clear scenes (1st person, sunglare)
+        // Depth buffer was cleared, use normal depth testing with writes
+        device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);       // Enable depth writes
+        device->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL); // Standard depth testing
+        // Normal depth testing for scenes after Z-clear
+    }
+
+    // Use CURRENT view matrix and DEPTH-COMPATIBLE projection matrix for replay
+    // This ensures objects render at current camera position with matching depth values
+    D3DXMATRIX currentView, depthProj;
     device->GetTransform(D3DTS_VIEW, &currentView);
-    device->GetTransform(D3DTS_PROJECTION, &currentProj);
+    device->GetTransform(D3DTS_PROJECTION, &depthProj);
+
+    // Make projection matrix compatible with renderDepth() for proper early-Z
+    // Use same near/far planes as renderDepth(): 4.0f to Configuration.DL.DrawDist * kCellSize
+    DistantLand::editProjectionZ(&depthProj, 4.0f, Configuration.DL.DrawDist * DistantLand::kCellSize);
+
     device->SetTransform(D3DTS_VIEW, &currentView);
-    device->SetTransform(D3DTS_PROJECTION, &currentProj);
+    device->SetTransform(D3DTS_PROJECTION, &depthProj);
+
+    // Phase A: Early-Z optimization - use same MSAA depth buffer as renderDepth() for Scene 0
+    IDirect3DSurface9* savedDepthStencil = nullptr;
+    if (sceneCount == 0) {
+        device->GetDepthStencilSurface(&savedDepthStencil);
+        device->SetDepthStencilSurface(DistantLand::surfDepthDepth);
+    }
 
     // Temporarily set shadow matrices to recording state
     D3DXMATRIX savedShadowViewproj[2];
@@ -3395,6 +3431,16 @@ void FixedFunctionShader::replayRecordedCalls() {
     // Restore current shadow matrices
     DistantLand::smViewproj[0] = savedShadowViewproj[0];
     DistantLand::smViewproj[1] = savedShadowViewproj[1];
+
+    // Phase A: Restore depth stencil surface for Scene 0
+    if (sceneCount == 0 && savedDepthStencil) {
+        device->SetDepthStencilSurface(savedDepthStencil);
+        savedDepthStencil->Release();
+    }
+
+    // Phase A: Restore depth buffer state after early-Z optimization
+    device->SetRenderState(D3DRS_ZWRITEENABLE, savedZWriteEnable);
+    device->SetRenderState(D3DRS_ZFUNC, savedZFunc);
 
     isReplaying = false;
     LOG::logline("HLSL Replay: Completed replay of %d calls", recordedCalls.size());

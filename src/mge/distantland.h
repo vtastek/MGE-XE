@@ -102,7 +102,9 @@ public:
 
     static IDirect3DTexture9* texWorldColour, *texWorldNormals, *texWorldDetail;
     static IDirect3DTexture9* texDepthFrame;
+    static IDirect3DSurface9* surfDepthFrameMSAA; // Phase A: MSAA render target for depth frame
     static IDirect3DSurface9* surfDepthDepth;
+    static IDirect3DSurface9* surfDepthBackup; // Phase A: Backup depth surface for early-Z
     static IDirect3DTexture9* texDistantBlend;
     static IDirect3DTexture9* texReflection;
     static IDirect3DSurface9* surfReflectionZ;
@@ -176,6 +178,10 @@ public:
     static bool loadDistantStaticsClient(T& distantStatics, U& distantSubsets);
     static bool reloadShaders();
     static void release();
+
+    // Phase A: Depth buffer backup for early-Z optimization
+    static void backupDepthBuffer();
+    static void restoreDepthBuffer();
 
     static void editProjectionZ(D3DMATRIX* m, float zn, float zf);
     static bool selectDistantCell();

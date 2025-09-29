@@ -12,7 +12,7 @@ void DistantLand::renderDepth() {
     auto mwBridge = MWBridge::get();
 
     // Switch to render target
-    RenderTargetSwitcher rtsw(texDepthFrame, surfDepthDepth);
+    RenderTargetSwitcher rtsw(surfDepthFrameMSAA, surfDepthDepth);
     device->Clear(0, 0, D3DCLEAR_ZBUFFER, 0, 1.0, 0);
 
     // Unbind depth sampler
@@ -69,7 +69,7 @@ void DistantLand::renderDepth() {
 
 void DistantLand::renderDepthAdditional() {
     // Switch to render target
-    RenderTargetSwitcher rtsw(texDepthFrame, surfDepthDepth);
+    RenderTargetSwitcher rtsw(surfDepthFrameMSAA, surfDepthDepth);
 
     // Unbind depth sampler
     effect->SetTexture(ehTex3, NULL);

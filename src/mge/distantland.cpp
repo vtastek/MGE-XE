@@ -188,6 +188,17 @@ void DistantLand::renderStage1() {
         renderDepth();
         effectDepth->End();
 
+        // Phase A: Resolve MSAA depth frame to non-MSAA texture for post-processing
+        if (Configuration.AALevel > 0) {
+            IDirect3DSurface9* texDepthFrameSurface;
+            texDepthFrame->GetSurfaceLevel(0, &texDepthFrameSurface);
+            device->StretchRect(surfDepthFrameMSAA, NULL, texDepthFrameSurface, NULL, D3DTEXF_NONE);
+            texDepthFrameSurface->Release();
+        }
+
+        // Phase A: Backup depth buffer after renderDepth() for early-Z optimization
+        backupDepthBuffer();
+
         // Restore render state
         stateSaved->Apply();
         stateSaved->Release();
@@ -1062,5 +1073,28 @@ RenderTargetSwitcher::~RenderTargetSwitcher() {
     }
     if (savedDepthStencil) {
         savedDepthStencil->Release();
+    }
+}
+
+// Phase A: Depth buffer backup/restore for early-Z optimization
+void DistantLand::backupDepthBuffer() {
+    if (!surfDepthBackup || !device) return;
+
+    IDirect3DSurface9* currentDepthStencil;
+    if (SUCCEEDED(device->GetDepthStencilSurface(&currentDepthStencil))) {
+        // Copy current depth buffer to backup
+        device->StretchRect(currentDepthStencil, nullptr, surfDepthBackup, nullptr, D3DTEXF_NONE);
+        currentDepthStencil->Release();
+    }
+}
+
+void DistantLand::restoreDepthBuffer() {
+    if (!surfDepthBackup || !device) return;
+
+    IDirect3DSurface9* currentDepthStencil;
+    if (SUCCEEDED(device->GetDepthStencilSurface(&currentDepthStencil))) {
+        // Restore depth buffer from backup
+        device->StretchRect(surfDepthBackup, nullptr, currentDepthStencil, nullptr, D3DTEXF_NONE);
+        currentDepthStencil->Release();
     }
 }

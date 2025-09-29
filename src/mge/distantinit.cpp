@@ -65,7 +65,9 @@ vector< std::pair<const RenderMesh*, int> > DistantLand::batchedGrass;
 
 IDirect3DTexture9* DistantLand::texWorldColour, *DistantLand::texWorldNormals, *DistantLand::texWorldDetail;
 IDirect3DTexture9* DistantLand::texDepthFrame;
+IDirect3DSurface9* DistantLand::surfDepthFrameMSAA;
 IDirect3DSurface9* DistantLand::surfDepthDepth;
+IDirect3DSurface9* DistantLand::surfDepthBackup;
 IDirect3DTexture9* DistantLand::texDistantBlend;
 IDirect3DTexture9* DistantLand::texReflection;
 IDirect3DSurface9* DistantLand::surfReflectionZ;
@@ -622,15 +624,40 @@ bool DistantLand::initDepth() {
     // Set up depth frame texture, requires its own z-buffer (my card fails to support INTZ/DF24)
     device->GetViewport(&vp);
 
+    // Phase A: Create both MSAA and non-MSAA render targets for depth frame
+    D3DMULTISAMPLE_TYPE msaaSamples = (D3DMULTISAMPLE_TYPE)Configuration.AALevel;
+    DWORD msaaQuality = 0; // Use default quality level
+
+    // Create non-MSAA texture for resolved results (post-processing compatibility)
     hr = device->CreateTexture(vp.Width, vp.Height, 1, D3DUSAGE_RENDERTARGET, D3DFMT_R32F, D3DPOOL_DEFAULT, &texDepthFrame, NULL);
     if (hr != D3D_OK) {
         LOG::logline("!! Failed to create depth frame render target");
         return false;
     }
 
-    hr = device->CreateDepthStencilSurface(vp.Width, vp.Height, D3DFMT_D24X8, D3DMULTISAMPLE_NONE, 0, FALSE, &surfDepthDepth, NULL);
+    // Create MSAA render target surface for actual rendering
+    if (msaaSamples != D3DMULTISAMPLE_NONE) {
+        hr = device->CreateRenderTarget(vp.Width, vp.Height, D3DFMT_R32F, msaaSamples, msaaQuality, FALSE, &surfDepthFrameMSAA, NULL);
+        if (hr != D3D_OK) {
+            LOG::logline("!! Failed to create MSAA depth frame render target");
+            return false;
+        }
+    } else {
+        // Non-MSAA case - use texture surface directly
+        texDepthFrame->GetSurfaceLevel(0, &surfDepthFrameMSAA);
+    }
+
+    // Create matching MSAA depth buffer
+    hr = device->CreateDepthStencilSurface(vp.Width, vp.Height, D3DFMT_D24X8, msaaSamples, msaaQuality, FALSE, &surfDepthDepth, NULL);
     if (hr != D3D_OK) {
         LOG::logline("!! Failed to create depth target z-buffer");
+        return false;
+    }
+
+    // Phase A: Create backup depth surface for early-Z optimization
+    hr = device->CreateDepthStencilSurface(vp.Width, vp.Height, D3DFMT_D24X8, msaaSamples, msaaQuality, FALSE, &surfDepthBackup, NULL);
+    if (hr != D3D_OK) {
+        LOG::logline("!! Failed to create backup depth z-buffer");
         return false;
     }
 
@@ -1419,8 +1446,12 @@ void DistantLand::release() {
 
     texDepthFrame->Release();
     texDepthFrame = nullptr;
+    surfDepthFrameMSAA->Release();
+    surfDepthFrameMSAA = nullptr;
     surfDepthDepth->Release();
     surfDepthDepth = nullptr;
+    surfDepthBackup->Release();
+    surfDepthBackup = nullptr;
 
     effectPool->Release();
     effectPool = nullptr;
