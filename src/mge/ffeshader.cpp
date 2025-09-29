@@ -3394,8 +3394,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     device->GetTransform(D3DTS_VIEW, &currentView);
     device->GetTransform(D3DTS_PROJECTION, &depthProj);
 
-    // Make projection matrix compatible with renderDepth() for proper early-Z
-    // Use same near/far planes as renderDepth(): 4.0f to Configuration.DL.DrawDist * kCellSize
+    // Phase A: Always match renderDepth() near/far planes for consistent depth values
+    // This is required for proper depth testing regardless of distant land status
     DistantLand::editProjectionZ(&depthProj, 4.0f, Configuration.DL.DrawDist * DistantLand::kCellSize);
 
     device->SetTransform(D3DTS_VIEW, &currentView);
@@ -3403,7 +3403,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
 
     // Phase A: Early-Z optimization - use same MSAA depth buffer as renderDepth() for Scene 0
     IDirect3DSurface9* savedDepthStencil = nullptr;
-    if (sceneCount == 0) {
+    if (sceneCount == 0 && DistantLand::ready && DistantLand::surfDepthDepth) {
         device->GetDepthStencilSurface(&savedDepthStencil);
         device->SetDepthStencilSurface(DistantLand::surfDepthDepth);
     }

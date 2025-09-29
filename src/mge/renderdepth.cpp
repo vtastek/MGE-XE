@@ -118,10 +118,35 @@ void DistantLand::renderDepthRecorded() {
         // Skin using worldview matrices for numerical accuracy
         effect->SetBool(ehHasBones, i.vertexBlendState != 0);
         effect->SetInt(ehVertexBlendState, i.vertexBlendState);
-        effect->SetMatrixArray(ehVertexBlendPalette, i.worldViewTransforms, 4);
+
+        // Phase A: Fix vertex animation timing - recalculate transforms with current view matrix
+        if (i.vertexBlendState > 0) {
+            // For skinned objects, recombine recorded world matrices with current view matrix
+            // i.worldViewTransforms contains old view matrix data, causing animation mismatch
+            D3DXMATRIX currentView, currentWorldViewTransforms[4];
+            device->GetTransform(D3DTS_VIEW, &currentView);
+            for (int j = 0; j < 4; j++) {
+                currentWorldViewTransforms[j] = i.worldTransforms[j] * currentView;
+            }
+            effect->SetMatrixArray(ehVertexBlendPalette, currentWorldViewTransforms, 4);
+        } else {
+            effect->SetMatrixArray(ehVertexBlendPalette, i.worldViewTransforms, 4);
+        }
         effectDepth->CommitChanges();
 
-        device->SetRenderState(D3DRS_CULLMODE, i.cullMode);
+        // Phase A: Set render states to match HLSL rendering exactly
+        // For alpha blended objects, disable backface culling to show both sides
+        if (i.blendEnable) {
+            device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+        } else {
+            device->SetRenderState(D3DRS_CULLMODE, i.cullMode);
+        }
+        device->SetRenderState(D3DRS_ALPHABLENDENABLE, i.blendEnable);
+        if (i.blendEnable) {
+            device->SetRenderState(D3DRS_SRCBLEND, i.srcBlend);
+            device->SetRenderState(D3DRS_DESTBLEND, i.destBlend);
+        }
+
         device->SetStreamSource(0, i.vb, i.vbOffset, i.vbStride);
         device->SetIndices(i.ib);
         device->SetFVF(i.fvf);
