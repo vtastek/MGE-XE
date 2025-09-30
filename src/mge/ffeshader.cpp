@@ -2411,7 +2411,12 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         LOG::logline("!! HLSL pipeline: failed to set vertex buffer, hr=%x", hr);
         return;
     }
-    
+
+    // Phase A: Add small depth bias to resolve Z-fighting with depth prepass
+    // Use a very small bias to push HLSL geometry slightly forward
+    device->SetRenderState(D3DRS_DEPTHBIAS, *(DWORD*)&(const float&)-1e-6f);
+    device->SetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, *(DWORD*)&(const float&)-1e-6f);
+
     // Execute the draw call with proper error checking
     if (rs->ib) {
         hr = device->SetIndices(rs->ib);
@@ -2423,6 +2428,10 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     } else {
         device->DrawPrimitive(rs->primType, rs->startIndex, rs->primCount);
     }
+
+    // Reset depth bias after drawing
+    device->SetRenderState(D3DRS_DEPTHBIAS, 0);
+    device->SetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, 0);
 
     // Restore device state after HLSL rendering (like the original system does)
     device->SetVertexShader(NULL);
@@ -2810,8 +2819,9 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     // Many vertex shaders could be cached and reused across pixel shader variants
     ID3DBlob* vsBlob = nullptr;
     ID3DBlob* vsErrors = nullptr;
-    
-    DWORD vsCompileFlags = D3DCOMPILE_PREFER_FLOW_CONTROL | D3DCOMPILE_IEEE_STRICTNESS;
+
+    // Match D3DX9 effect compilation - no IEEE_STRICTNESS for invariance with depth pass
+    DWORD vsCompileFlags = D3DCOMPILE_PREFER_FLOW_CONTROL;
     if (isDXVK()) {
         vsCompileFlags |= D3DCOMPILE_OPTIMIZATION_LEVEL1;
     } else {
@@ -2885,8 +2895,9 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     // Compile pixel shader using pixel shader source
     ID3DBlob* psBlob = nullptr;
     ID3DBlob* psErrors = nullptr;
-    
-    DWORD psCompileFlags = D3DCOMPILE_PREFER_FLOW_CONTROL | D3DCOMPILE_IEEE_STRICTNESS;
+
+    // Match D3DX9 effect compilation - no IEEE_STRICTNESS for invariance with depth pass
+    DWORD psCompileFlags = D3DCOMPILE_PREFER_FLOW_CONTROL;
     if (isDXVK()) {
         psCompileFlags |= D3DCOMPILE_OPTIMIZATION_LEVEL1;
     } else {

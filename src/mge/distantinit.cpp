@@ -11,6 +11,7 @@
 #include "mwbridge.h"
 #include "mgeversion.h"
 #include "statusoverlay.h"
+#include "shader_utils.h"
 #include "ipc/dlshare.h"
 #include <memory>
 #include <optional>
@@ -448,8 +449,12 @@ static bool createCoreEffectWithMods(const char *name, IDirect3DDevice9* device,
     CoreModInclude includer;
     HRESULT hr;
 
+    // Match optimization level to HLSL shaders for invariance (consistent precision between depth/color passes)
+    DWORD optimizationLevel = ShaderUtils::isDXVK() ? D3DXSHADER_OPTIMIZATION_LEVEL1 : D3DXSHADER_OPTIMIZATION_LEVEL3;
+    DWORD shaderFlags = optimizationLevel | D3DXFX_LARGEADDRESSAWARE;
+
     // Attempt to compile with core mods first
-    hr = D3DXCreateEffectFromFile(device, path.c_str(), &*features.begin(), &includer, D3DXSHADER_OPTIMIZATION_LEVEL3|D3DXFX_LARGEADDRESSAWARE, effectPool, pEffect, &errors);
+    hr = D3DXCreateEffectFromFile(device, path.c_str(), &*features.begin(), &includer, shaderFlags, effectPool, pEffect, &errors);
     if (hr == D3D_OK) {
         if (reportMods) {
             for (auto& m : includer.modsFound) {
@@ -481,8 +486,8 @@ static bool createCoreEffectWithMods(const char *name, IDirect3DDevice9* device,
         }
     }
 
-    // Fallback to compiling without core mods
-    hr = D3DXCreateEffectFromFile(device, path.c_str(), &*features.begin(), 0, D3DXSHADER_OPTIMIZATION_LEVEL3|D3DXFX_LARGEADDRESSAWARE, effectPool, pEffect, &errors);
+    // Fallback to compiling without core mods (use same flags for consistency)
+    hr = D3DXCreateEffectFromFile(device, path.c_str(), &*features.begin(), 0, shaderFlags, effectPool, pEffect, &errors);
     if (hr == D3D_OK) {
         return true;
     } else {
