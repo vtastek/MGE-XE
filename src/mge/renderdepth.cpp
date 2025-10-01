@@ -421,6 +421,8 @@ bool DistantLand::cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& 
     float minLinearDepth = 1e10f;
     float maxLinearDepth = -1e10f;
     bool anyInFront = false;
+    bool anyBehindCamera = false;
+    float cornerDepths[8];  // Store all corner depths for detailed logging
 
     for (int i = 0; i < 8; i++) {
         D3DXVECTOR4 clipPos;
@@ -434,6 +436,7 @@ bool DistantLand::cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& 
 
             // Store linear depth (clipPos.w is view-space Z, which is linear depth)
             float linearDepth = clipPos.w;
+            cornerDepths[i] = linearDepth;
 
             float screenX = ndcX * 0.5f + 0.5f;
             float screenY = -ndcY * 0.5f + 0.5f;
@@ -444,10 +447,21 @@ bool DistantLand::cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& 
             maxY = std::max(maxY, screenY);
             minLinearDepth = std::min(minLinearDepth, linearDepth);
             maxLinearDepth = std::max(maxLinearDepth, linearDepth);
+        } else {
+            anyBehindCamera = true;
+            cornerDepths[i] = -1.0f;  // Mark as behind camera
         }
     }
 
     if (!anyInFront) return false;
+
+    // If any corners are behind the camera, object intersects near plane - never cull
+    if (anyBehindCamera) {
+        if (debugLog) {
+            LOG::logline("Hi-Z Debug: Object intersects near plane (corners behind camera) - forced visible");
+        }
+        return false;
+    }
 
     // Clamp to screen bounds
     minX = std::max(0.0f, std::min(1.0f, minX));
@@ -467,12 +481,10 @@ bool DistantLand::cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& 
     float boxSize = std::max(boxWidth, boxHeight);
 
     // Select mip level based on bbox screen size
-    // Smaller objects use lower mips (more detailed), larger objects use higher mips (coarser)
+    // TEMPORARY FIX: Use mip 0 (full resolution) always for accuracy
+    // The mip selection was causing false positives by sampling too coarse a region
+    // TODO: Implement proper hierarchical sampling with correct mip selection
     int mipLevel = 0;
-    if (boxSize > 0) {
-        mipLevel = (int)std::floor(std::log2(boxSize));
-        mipLevel = std::max(0, std::min(hiZLevels - 1, mipLevel));
-    }
 
     // Lock the staging texture at selected mip level
     D3DLOCKED_RECT lr;
@@ -500,26 +512,53 @@ bool DistantLand::cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& 
     float* depthData = (float*)lr.pBits;
     int pitch = lr.Pitch / sizeof(float);
     float maxHiZDepth = 0.0f;
+    float minHiZDepth = 1e10f;
+    int pixelCount = 0;
 
     for (int y = pixelMinY; y <= pixelMaxY; y++) {
         for (int x = pixelMinX; x <= pixelMaxX; x++) {
             float depth = depthData[y * pitch + x];
             maxHiZDepth = std::max(maxHiZDepth, depth);
+            minHiZDepth = std::min(minHiZDepth, depth);
+            pixelCount++;
         }
     }
 
     texHiZStaging->UnlockRect(mipLevel);
 
-    // Proper Hi-Z occlusion test:
+    // Proper Hi-Z occlusion test with intersection detection:
     // Hi-Z stores MAXIMUM depth (furthest visible point per pixel)
     // We found maxHiZDepth = furthest visible point in bbox's screen region
-    // Object is occluded if its NEAREST point is BEHIND this maximum
-    // Small bias (1.0) for conservative culling
-    bool culled = minLinearDepth > maxHiZDepth + 1.0f;
+    //
+    // Three cases:
+    // 1. All corners behind Hi-Z (minLinearDepth > maxHiZDepth) → completely occluded, CULL
+    // 2. All corners in front of Hi-Z (maxLinearDepth < maxHiZDepth) → completely visible, RENDER
+    // 3. Some corners in front, some behind → INTERSECTING Hi-Z surface, RENDER (partially visible)
+    //
+    // So we only cull if minLinearDepth > maxHiZDepth (all corners behind)
+    float bias = 10.0f; // Conservative bias for depth precision and bbox padding
+    bool culled = minLinearDepth > maxHiZDepth + bias;
 
-    if (debugLog) {
-        LOG::logline("Hi-Z Debug: minDepth=%.4f, maxDepth=%.4f, maxHiZ=%.4f, mip=%d, region=[%d,%d]->[%d,%d], culled=%d",
-                     minLinearDepth, maxLinearDepth, maxHiZDepth, mipLevel, pixelMinX, pixelMinY, pixelMaxX, pixelMaxY, culled ? 1 : 0);
+    if (debugLog && culled) {
+        // Only log when object is CULLED (false positive candidates)
+        LOG::logline("Hi-Z Debug CULLED: minDepth=%.4f, maxDepth=%.4f, maxHiZ=%.4f, mip=%d, region=[%d,%d]->[%d,%d]",
+                     minLinearDepth, maxLinearDepth, maxHiZDepth, mipLevel, pixelMinX, pixelMinY, pixelMaxX, pixelMaxY);
+
+        // Log all 8 corner depths for detailed analysis
+        LOG::logline("  Corner depths: [0]=%.2f [1]=%.2f [2]=%.2f [3]=%.2f [4]=%.2f [5]=%.2f [6]=%.2f [7]=%.2f",
+                     cornerDepths[0], cornerDepths[1], cornerDepths[2], cornerDepths[3],
+                     cornerDepths[4], cornerDepths[5], cornerDepths[6], cornerDepths[7]);
+
+        // Log Hi-Z depth range and pixel count
+        LOG::logline("  Hi-Z depth range: min=%.4f max=%.4f (%d pixels sampled)", minHiZDepth, maxHiZDepth, pixelCount);
+
+        // Log screen-space bounds
+        LOG::logline("  Screen bounds: X=[%.3f,%.3f] Y=[%.3f,%.3f] size=%.1fx%.1f pixels",
+                     minX, maxX, minY, maxY, boxWidth, boxHeight);
+
+        // Log bbox world coordinates
+        LOG::logline("  BBox: min=(%.1f,%.1f,%.1f) max=(%.1f,%.1f,%.1f)",
+                     bboxMin.x, bboxMin.y, bboxMin.z, bboxMax.x, bboxMax.y, bboxMax.z);
     }
 
     return culled;

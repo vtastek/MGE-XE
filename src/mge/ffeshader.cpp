@@ -3411,15 +3411,15 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     int callsWithBBox = 0;
     int callsWithoutBBox = 0;
 
-    // Check for debug key press (L key)
+    // Check for debug key press (Y key)
     static bool debugHiZ = false;
     static int debugCallCount = 0;
-    if (GetAsyncKeyState('L') & 0x8000) {
+    if (GetAsyncKeyState('Y') & 0x8000) {
         static bool wasPressed = false;
         if (!wasPressed) {
             debugHiZ = true;
-            debugCallCount = 5; // Log next 5 calls
-            LOG::logline(">> Hi-Z Debug: Enabled for next 5 calls");
+            debugCallCount = 5; // Log next 5 culled calls
+            LOG::logline(">> Hi-Z Debug: Enabled for next 5 CULLED calls");
             wasPressed = true;
         }
     } else {
@@ -3430,41 +3430,194 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     // Calculate view-projection matrix for Hi-Z culling
     D3DXMATRIX viewProj = currentView * depthProj;
 
-    // Render all recorded calls with consistent matrices
-    for (const auto& call : recordedCalls) {
-        // Track bbox stats regardless of culling enabled/disabled
+    // Simple Hi-Z culling with expanded bboxes for camera intersection handling
+    for (size_t i = 0; i < recordedCalls.size(); i++) {
+        const auto& call = recordedCalls[i];
+
+        // Track bbox stats
         if (call.hasBoundingBox) {
             callsWithBBox++;
         } else {
             callsWithoutBBox++;
         }
 
-        // Hi-Z occlusion culling
-        if (call.hasBoundingBox) {
+        // Expand bbox conservatively to avoid false positives
+        // Use 1.25x scale + fixed 10 unit padding to handle bad pivots/asymmetric meshes
+        // Add 2x padding for thin axes (< 20 units) to avoid missing flat/small objects
+        D3DXVECTOR3 center = (call.bboxMin + call.bboxMax) * 0.5f;
+        D3DXVECTOR3 halfSize = (call.bboxMax - call.bboxMin) * 0.5f;
+        D3DXVECTOR3 padding(10.0f, 10.0f, 10.0f);
+
+        // Double padding for thin axes
+        if (halfSize.x * 2.0f < 20.0f) padding.x *= 2.0f;
+        if (halfSize.y * 2.0f < 20.0f) padding.y *= 2.0f;
+        if (halfSize.z * 2.0f < 20.0f) padding.z *= 2.0f;
+
+        D3DXVECTOR3 expandedHalfSize = halfSize * 1.25f + padding;
+        D3DXVECTOR3 expandedMin = center - expandedHalfSize;
+        D3DXVECTOR3 expandedMax = center + expandedHalfSize;
+
+        // Treat camera as 100x100x100 unit bbox for intersection test
+        const float cameraBBoxSize = 50.0f; // Half-size = 50 units (100x100x100 total)
+        D3DXVECTOR3 cameraBBoxMin = D3DXVECTOR3(DistantLand::eyePos.x - cameraBBoxSize,
+                                                 DistantLand::eyePos.y - cameraBBoxSize,
+                                                 DistantLand::eyePos.z - cameraBBoxSize);
+        D3DXVECTOR3 cameraBBoxMax = D3DXVECTOR3(DistantLand::eyePos.x + cameraBBoxSize,
+                                                 DistantLand::eyePos.y + cameraBBoxSize,
+                                                 DistantLand::eyePos.z + cameraBBoxSize);
+
+        // Check if camera bbox intersects expanded object bbox - if so, always render
+        bool cameraInside = !(cameraBBoxMax.x < expandedMin.x || cameraBBoxMin.x > expandedMax.x ||
+                              cameraBBoxMax.y < expandedMin.y || cameraBBoxMin.y > expandedMax.y ||
+                              cameraBBoxMax.z < expandedMin.z || cameraBBoxMin.z > expandedMax.z);
+
+        bool shouldRender = true;
+        if (call.hasBoundingBox && !cameraInside) {
+            // Only cull if we have a bbox and camera is NOT inside expanded bbox
+            // Use expanded bbox for Hi-Z test too
             bool shouldDebug = debugHiZ && debugCallCount > 0;
-            if (DistantLand::cullAgainstHiZ(call.bboxMin, call.bboxMax, viewProj, shouldDebug)) {
+            bool isOccluded = DistantLand::cullAgainstHiZ(expandedMin, expandedMax, viewProj, shouldDebug);
+
+            if (isOccluded) {
                 culledCalls++;
-                if (shouldDebug) debugCallCount--;
-                continue; // Skip this draw call - it's occluded
-            }
-            if (shouldDebug) debugCallCount--;
-        }
-
-        // Restore sampler states for this call
-        for (int stage = 0; stage < 8; ++stage) {
-            if (call.samplerStates[stage].captured) {
-                device->SetSamplerState(stage, D3DSAMP_ADDRESSU, call.samplerStates[stage].addressU);
-                device->SetSamplerState(stage, D3DSAMP_ADDRESSV, call.samplerStates[stage].addressV);
+                shouldRender = false;
+                if (shouldDebug) {
+                    debugCallCount--;  // Only decrement when we actually log a culled object
+                }
             }
         }
 
-        renderMorrowindHLSL_Internal(&call.rs, &call.frs, const_cast<LightState*>(static_cast<const LightState*>(&call.lightrs)));
+        if (shouldRender) {
+            // Restore sampler states for this call
+            for (int stage = 0; stage < 8; ++stage) {
+                if (call.samplerStates[stage].captured) {
+                    device->SetSamplerState(stage, D3DSAMP_ADDRESSU, call.samplerStates[stage].addressU);
+                    device->SetSamplerState(stage, D3DSAMP_ADDRESSV, call.samplerStates[stage].addressV);
+                }
+            }
+
+            renderMorrowindHLSL_Internal(&call.rs, &call.frs, const_cast<LightState*>(static_cast<const LightState*>(&call.lightrs)));
+        }
     }
 
     // Log culling statistics
-    LOG::logline("Hi-Z Stats: %d total calls, %d with bbox, %d without bbox, %d culled (%.1f%%)",
+    int renderedCalls = totalCalls - culledCalls;
+    LOG::logline("Hi-Z Stats: %d total calls, %d with bbox, %d without bbox, %d culled (%.1f%%), %d rendered",
                  totalCalls, callsWithBBox, callsWithoutBBox, culledCalls,
-                 callsWithBBox > 0 ? (culledCalls * 100.0f) / callsWithBBox : 0.0f);
+                 totalCalls > 0 ? (culledCalls * 100.0f) / totalCalls : 0.0f,
+                 renderedCalls);
+
+    // Debug visualization: Render bounding boxes with color-coded status
+    // Toggle with 'B' key
+    static bool debugBBoxVis = false;
+    static bool wasBPressed = false;
+    if (GetAsyncKeyState('B') & 0x8000) {
+        if (!wasBPressed) {
+            debugBBoxVis = !debugBBoxVis;
+            LOG::logline(">> BBox visualization: %s", debugBBoxVis ? "ON" : "OFF");
+            wasBPressed = true;
+        }
+    } else {
+        wasBPressed = false;
+    }
+
+    if (debugBBoxVis) {
+        // Save render states
+        IDirect3DStateBlock9* savedState;
+        device->CreateStateBlock(D3DSBT_ALL, &savedState);
+
+        // Setup for line rendering - disable depth test so boxes always render
+        device->SetRenderState(D3DRS_ZENABLE, FALSE);
+        device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+        device->SetRenderState(D3DRS_LIGHTING, FALSE);
+        device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+        device->SetRenderState(D3DRS_FOGENABLE, FALSE); // Disable fog
+        device->SetRenderState(D3DRS_AMBIENT, 0xFFFFFFFF); // Full ambient
+        device->SetRenderState(D3DRS_COLORVERTEX, TRUE);
+        device->SetRenderState(D3DRS_DIFFUSEMATERIALSOURCE, D3DMCS_COLOR1);
+        device->SetRenderState(D3DRS_EMISSIVEMATERIALSOURCE, D3DMCS_COLOR1);
+        device->SetRenderState(D3DRS_TEXTUREFACTOR, 0xFFFFFFFF); // Full white texture factor
+        device->SetFVF(D3DFVF_XYZ | D3DFVF_DIFFUSE);
+
+        // Set up transforms for world-space rendering
+        D3DXMATRIX identity;
+        D3DXMatrixIdentity(&identity);
+        device->SetTransform(D3DTS_WORLD, &identity);
+        device->SetTransform(D3DTS_VIEW, &currentView);
+        device->SetTransform(D3DTS_PROJECTION, &depthProj);
+
+        // Helper to draw bbox edges
+        auto drawBBox = [&](const D3DXVECTOR3& bmin, const D3DXVECTOR3& bmax, D3DCOLOR color) {
+            struct Vertex { float x, y, z; D3DCOLOR color; };
+            Vertex vertices[24] = {
+                // Bottom face
+                {bmin.x, bmin.y, bmin.z, color}, {bmax.x, bmin.y, bmin.z, color},
+                {bmax.x, bmin.y, bmin.z, color}, {bmax.x, bmax.y, bmin.z, color},
+                {bmax.x, bmax.y, bmin.z, color}, {bmin.x, bmax.y, bmin.z, color},
+                {bmin.x, bmax.y, bmin.z, color}, {bmin.x, bmin.y, bmin.z, color},
+                // Top face
+                {bmin.x, bmin.y, bmax.z, color}, {bmax.x, bmin.y, bmax.z, color},
+                {bmax.x, bmin.y, bmax.z, color}, {bmax.x, bmax.y, bmax.z, color},
+                {bmax.x, bmax.y, bmax.z, color}, {bmin.x, bmax.y, bmax.z, color},
+                {bmin.x, bmax.y, bmax.z, color}, {bmin.x, bmin.y, bmax.z, color},
+                // Vertical edges
+                {bmin.x, bmin.y, bmin.z, color}, {bmin.x, bmin.y, bmax.z, color},
+                {bmax.x, bmin.y, bmin.z, color}, {bmax.x, bmin.y, bmax.z, color},
+                {bmax.x, bmax.y, bmin.z, color}, {bmax.x, bmax.y, bmax.z, color},
+                {bmin.x, bmax.y, bmin.z, color}, {bmin.x, bmax.y, bmax.z, color},
+            };
+            device->DrawPrimitiveUP(D3DPT_LINELIST, 12, vertices, sizeof(Vertex));
+        };
+
+        // Re-run culling logic to determine which objects to visualize
+        for (size_t i = 0; i < recordedCalls.size(); i++) {
+            const auto& call = recordedCalls[i];
+            if (!call.hasBoundingBox) continue;
+
+            // Expand bbox conservatively to avoid false positives
+            // Use 1.25x scale + fixed 10 unit padding to handle bad pivots/asymmetric meshes
+            // Add 2x padding for thin axes (< 20 units) to avoid missing flat/small objects
+            D3DXVECTOR3 center = (call.bboxMin + call.bboxMax) * 0.5f;
+            D3DXVECTOR3 halfSize = (call.bboxMax - call.bboxMin) * 0.5f;
+            D3DXVECTOR3 padding(10.0f, 10.0f, 10.0f);
+
+            // Double padding for thin axes
+            if (halfSize.x * 2.0f < 20.0f) padding.x *= 2.0f;
+            if (halfSize.y * 2.0f < 20.0f) padding.y *= 2.0f;
+            if (halfSize.z * 2.0f < 20.0f) padding.z *= 2.0f;
+
+            D3DXVECTOR3 expandedHalfSize = halfSize * 1.25f + padding;
+            D3DXVECTOR3 expandedMin = center - expandedHalfSize;
+            D3DXVECTOR3 expandedMax = center + expandedHalfSize;
+
+            // Treat camera as 100x100x100 unit bbox for intersection test
+            const float cameraBBoxSize = 50.0f;
+            D3DXVECTOR3 cameraBBoxMin = D3DXVECTOR3(DistantLand::eyePos.x - cameraBBoxSize,
+                                                     DistantLand::eyePos.y - cameraBBoxSize,
+                                                     DistantLand::eyePos.z - cameraBBoxSize);
+            D3DXVECTOR3 cameraBBoxMax = D3DXVECTOR3(DistantLand::eyePos.x + cameraBBoxSize,
+                                                     DistantLand::eyePos.y + cameraBBoxSize,
+                                                     DistantLand::eyePos.z + cameraBBoxSize);
+
+            bool cameraInside = !(cameraBBoxMax.x < expandedMin.x || cameraBBoxMin.x > expandedMax.x ||
+                                  cameraBBoxMax.y < expandedMin.y || cameraBBoxMin.y > expandedMax.y ||
+                                  cameraBBoxMax.z < expandedMin.z || cameraBBoxMin.z > expandedMax.z);
+
+            bool isCulled = false;
+            if (!cameraInside) {
+                // Use expanded bbox for Hi-Z test
+                isCulled = DistantLand::cullAgainstHiZ(expandedMin, expandedMax, viewProj, false);
+            }
+
+            // Draw expanded bbox only: green for rendered, red for culled
+            D3DCOLOR color = isCulled ? D3DCOLOR_ARGB(255, 255, 0, 0) : D3DCOLOR_ARGB(255, 0, 255, 0);
+            drawBBox(expandedMin, expandedMax, color);
+        }
+
+        // Restore render states
+        savedState->Apply();
+        savedState->Release();
+    }
 
     // Restore current shadow matrices
     DistantLand::smViewproj[0] = savedShadowViewproj[0];
