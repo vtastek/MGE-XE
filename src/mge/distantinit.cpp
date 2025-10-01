@@ -68,7 +68,11 @@ IDirect3DTexture9* DistantLand::texWorldColour, *DistantLand::texWorldNormals, *
 IDirect3DTexture9* DistantLand::texDepthFrame;
 IDirect3DSurface9* DistantLand::surfDepthFrameMSAA;
 IDirect3DSurface9* DistantLand::surfDepthDepth;
-IDirect3DSurface9* DistantLand::surfDepthBackup;
+IDirect3DTexture9* DistantLand::texCullDepth;
+IDirect3DTexture9* DistantLand::texHiZ;
+IDirect3DTexture9* DistantLand::texHiZStaging;
+ID3DXEffect* DistantLand::effectHiZ;
+int DistantLand::hiZLevels;
 IDirect3DTexture9* DistantLand::texDistantBlend;
 IDirect3DTexture9* DistantLand::texReflection;
 IDirect3DSurface9* DistantLand::surfReflectionZ;
@@ -258,6 +262,10 @@ bool DistantLand::init() {
     }
 
     if (!initDepth()) {
+        return false;
+    }
+
+    if (!initHiZ()) {
         return false;
     }
 
@@ -659,13 +667,56 @@ bool DistantLand::initDepth() {
         return false;
     }
 
-    // Phase A: Create backup depth surface for early-Z optimization
-    hr = device->CreateDepthStencilSurface(vp.Width, vp.Height, D3DFMT_D24X8, msaaSamples, msaaQuality, FALSE, &surfDepthBackup, NULL);
+    // Create cull depth texture (non-MSAA, recordMW only, for Hi-Z culling)
+    hr = device->CreateTexture(vp.Width, vp.Height, 1, D3DUSAGE_RENDERTARGET, D3DFMT_R32F, D3DPOOL_DEFAULT, &texCullDepth, NULL);
     if (hr != D3D_OK) {
-        LOG::logline("!! Failed to create backup depth z-buffer");
+        LOG::logline("!! Failed to create cull depth texture");
+        return false;
+    }
+    LOG::logline(">> Cull depth texture created: %dx%d R32F", vp.Width, vp.Height);
+
+    return true;
+}
+
+bool DistantLand::initHiZ() {
+    HRESULT hr;
+    D3DVIEWPORT9 vp;
+    device->GetViewport(&vp);
+
+    // Create Hi-Z pyramid as single mip-chained texture
+    // Mip 0 = 160x120, auto-generates mips down to 1x1
+    int baseWidth = vp.Width / 2;
+    int baseHeight = vp.Height / 2;
+
+    // Create with full mip chain (0 = auto-generate all mips)
+    hr = device->CreateTexture(baseWidth, baseHeight, 0, D3DUSAGE_RENDERTARGET, D3DFMT_R32F, D3DPOOL_DEFAULT, &texHiZ, NULL);
+    if (hr != D3D_OK) {
+        LOG::logline("!! Failed to create Hi-Z texture");
         return false;
     }
 
+    // Get actual mip level count
+    D3DSURFACE_DESC desc;
+    texHiZ->GetLevelDesc(0, &desc);
+    hiZLevels = texHiZ->GetLevelCount();
+    LOG::logline(">> Hi-Z texture created: %dx%d with %d mip levels", desc.Width, desc.Height, hiZLevels);
+
+    // Create staging texture with matching mip chain for CPU readback
+    hr = device->CreateTexture(baseWidth, baseHeight, 0, 0, D3DFMT_R32F, D3DPOOL_SYSTEMMEM, &texHiZStaging, NULL);
+    if (hr != D3D_OK) {
+        LOG::logline("!! Failed to create Hi-Z staging texture");
+        return false;
+    }
+
+    // Load Hi-Z downsample shader
+    std::string shaderPath = "Data Files\\shaders\\core\\XE HiZ.fx";
+    hr = D3DXCreateEffectFromFile(device, shaderPath.c_str(), NULL, NULL, D3DXSHADER_OPTIMIZATION_LEVEL3, effectPool, &effectHiZ, NULL);
+    if (hr != D3D_OK) {
+        LOG::logline("!! Failed to load Hi-Z shader: %s", shaderPath.c_str());
+        return false;
+    }
+
+    LOG::logline(">> Hi-Z system initialized: %d levels (%dx%d base)", hiZLevels, vp.Width / 2, vp.Height / 2);
     return true;
 }
 
@@ -1455,8 +1506,23 @@ void DistantLand::release() {
     surfDepthFrameMSAA = nullptr;
     surfDepthDepth->Release();
     surfDepthDepth = nullptr;
-    surfDepthBackup->Release();
-    surfDepthBackup = nullptr;
+
+    if (texCullDepth) {
+        texCullDepth->Release();
+        texCullDepth = nullptr;
+    }
+    if (texHiZ) {
+        texHiZ->Release();
+        texHiZ = nullptr;
+    }
+    if (texHiZStaging) {
+        texHiZStaging->Release();
+        texHiZStaging = nullptr;
+    }
+    if (effectHiZ) {
+        effectHiZ->Release();
+        effectHiZ = nullptr;
+    }
 
     effectPool->Release();
     effectPool = nullptr;

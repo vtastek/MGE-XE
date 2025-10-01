@@ -3375,30 +3375,6 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
 
     isReplaying = true;
 
-    // Phase A: Restore depth buffer from backup for early-Z optimization
-    if (sceneCount == 0) {
-        DistantLand::restoreDepthBuffer();
-    }
-
-    // Phase A: Smart Scene-Aware Early-Z Optimization
-    DWORD savedZWriteEnable, savedZFunc;
-    device->GetRenderState(D3DRS_ZWRITEENABLE, &savedZWriteEnable);
-    device->GetRenderState(D3DRS_ZFUNC, &savedZFunc);
-
-    if (sceneCount == 0) {
-        // Scene 0: World geometry - leverage depth prepass for early-Z
-        // renderDepth() has populated depth buffer, use read-only depth testing
-        device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);      // Disable depth writes (early-Z still works)
-        device->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL); // Standard depth testing
-        // Early-Z benefit: pixels behind existing depth are culled before lighting
-    } else {
-        // Scene 1+: Post Z-clear scenes (1st person, sunglare)
-        // Depth buffer was cleared, use normal depth testing with writes
-        device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);       // Enable depth writes
-        device->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL); // Standard depth testing
-        // Normal depth testing for scenes after Z-clear
-    }
-
     // Use CURRENT view matrix and DEPTH-COMPATIBLE projection matrix for replay
     // This ensures objects render at current camera position with matching depth values
     D3DXMATRIX currentView, depthProj;
@@ -3406,21 +3382,14 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     device->GetTransform(D3DTS_PROJECTION, &depthProj);
 
     // Phase A: Match renderDepth() projection matrix logic for consistent depth values
-    // Use same near/far logic as renderDepth() based on distant land settings
+    // Use Morrowind's native near plane (near=1.0) to match depth buffer rendering
     if (Configuration.MGEFlags & USE_DISTANT_LAND) {
-        DistantLand::editProjectionZ(&depthProj, 4.0f, Configuration.DL.DrawDist * DistantLand::kCellSize);
+        DistantLand::editProjectionZ(&depthProj, 1.0f, Configuration.DL.DrawDist * DistantLand::kCellSize);
     }
     // When distant land is off, use original Morrowind projection (near=1.0)
 
     device->SetTransform(D3DTS_VIEW, &currentView);
     device->SetTransform(D3DTS_PROJECTION, &depthProj);
-
-    // Phase A: Early-Z optimization - use same MSAA depth buffer as renderDepth() for Scene 0
-    IDirect3DSurface9* savedDepthStencil = nullptr;
-    if (sceneCount == 0 && DistantLand::ready && DistantLand::surfDepthDepth) {
-        device->GetDepthStencilSurface(&savedDepthStencil);
-        device->SetDepthStencilSurface(DistantLand::surfDepthDepth);
-    }
 
     // Temporarily set shadow matrices to recording state
     D3DXMATRIX savedShadowViewproj[2];
@@ -3429,8 +3398,58 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     DistantLand::smViewproj[0] = recordingShadowViewproj[0];
     DistantLand::smViewproj[1] = recordingShadowViewproj[1];
 
+    // Generate Hi-Z pyramid for occlusion culling
+    IDirect3DStateBlock9* stateSavedHiZ;
+    device->CreateStateBlock(D3DSBT_ALL, &stateSavedHiZ);
+    DistantLand::generateHiZPyramid();
+    stateSavedHiZ->Apply();
+    stateSavedHiZ->Release();
+
+    // Hi-Z culling statistics
+    int totalCalls = recordedCalls.size();
+    int culledCalls = 0;
+    int callsWithBBox = 0;
+    int callsWithoutBBox = 0;
+
+    // Check for debug key press (L key)
+    static bool debugHiZ = false;
+    static int debugCallCount = 0;
+    if (GetAsyncKeyState('L') & 0x8000) {
+        static bool wasPressed = false;
+        if (!wasPressed) {
+            debugHiZ = true;
+            debugCallCount = 5; // Log next 5 calls
+            LOG::logline(">> Hi-Z Debug: Enabled for next 5 calls");
+            wasPressed = true;
+        }
+    } else {
+        static bool wasPressed = false;
+        wasPressed = false;
+    }
+
+    // Calculate view-projection matrix for Hi-Z culling
+    D3DXMATRIX viewProj = currentView * depthProj;
+
     // Render all recorded calls with consistent matrices
     for (const auto& call : recordedCalls) {
+        // Track bbox stats regardless of culling enabled/disabled
+        if (call.hasBoundingBox) {
+            callsWithBBox++;
+        } else {
+            callsWithoutBBox++;
+        }
+
+        // Hi-Z occlusion culling
+        if (call.hasBoundingBox) {
+            bool shouldDebug = debugHiZ && debugCallCount > 0;
+            if (DistantLand::cullAgainstHiZ(call.bboxMin, call.bboxMax, viewProj, shouldDebug)) {
+                culledCalls++;
+                if (shouldDebug) debugCallCount--;
+                continue; // Skip this draw call - it's occluded
+            }
+            if (shouldDebug) debugCallCount--;
+        }
+
         // Restore sampler states for this call
         for (int stage = 0; stage < 8; ++stage) {
             if (call.samplerStates[stage].captured) {
@@ -3442,22 +3461,16 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
         renderMorrowindHLSL_Internal(&call.rs, &call.frs, const_cast<LightState*>(static_cast<const LightState*>(&call.lightrs)));
     }
 
+    // Log culling statistics
+    LOG::logline("Hi-Z Stats: %d total calls, %d with bbox, %d without bbox, %d culled (%.1f%%)",
+                 totalCalls, callsWithBBox, callsWithoutBBox, culledCalls,
+                 callsWithBBox > 0 ? (culledCalls * 100.0f) / callsWithBBox : 0.0f);
+
     // Restore current shadow matrices
     DistantLand::smViewproj[0] = savedShadowViewproj[0];
     DistantLand::smViewproj[1] = savedShadowViewproj[1];
 
-    // Phase A: Restore depth stencil surface for Scene 0
-    if (sceneCount == 0 && savedDepthStencil) {
-        device->SetDepthStencilSurface(savedDepthStencil);
-        savedDepthStencil->Release();
-    }
-
-    // Phase A: Restore depth buffer state after early-Z optimization
-    device->SetRenderState(D3DRS_ZWRITEENABLE, savedZWriteEnable);
-    device->SetRenderState(D3DRS_ZFUNC, savedZFunc);
-
     isReplaying = false;
-    LOG::logline("HLSL Replay: Completed replay of %d calls", recordedCalls.size());
 }
 
 // ------------------------------------
@@ -3495,7 +3508,7 @@ FixedFunctionShader::RecordedRenderedState::RecordedRenderedState(RecordedRender
 // FixedFunctionShader::HLSLRecordedCall
 
 FixedFunctionShader::HLSLRecordedCall::HLSLRecordedCall(const RenderedState* rs_, const FragmentState* frs_, const LightState* lightrs_, const ShaderKey& sk_)
-    : rs(*rs_), frs(*frs_), lightrs(*lightrs_), sk(sk_) {
+    : rs(*rs_), frs(*frs_), lightrs(*lightrs_), sk(sk_), hasBoundingBox(false) {
 
     // Capture current sampler states for all texture stages
     for (int stage = 0; stage < 8; ++stage) {
@@ -3512,5 +3525,197 @@ FixedFunctionShader::HLSLRecordedCall::HLSLRecordedCall(const RenderedState* rs_
             texture->Release(); // Release the reference from GetTexture
         }
     }
+
+    // Compute bounding box for Hi-Z culling
+    hasBoundingBox = computeBoundingBox(rs_, bboxMin, bboxMax);
+
+    // Debug: Log first few failures
+    static int failCount = 0;
+    static int successCount = 0;
+    if (!hasBoundingBox && failCount < 3) {
+        LOG::logline("!! BBox compute failed: vb=%p, fvf=0x%X, stride=%d", rs_->vb, rs_->fvf, rs_->vbStride);
+        failCount++;
+    }
+    if (hasBoundingBox && successCount < 3) {
+        LOG::logline(">> BBox success: min=(%.2f,%.2f,%.2f), max=(%.2f,%.2f,%.2f)",
+                     bboxMin.x, bboxMin.y, bboxMin.z, bboxMax.x, bboxMax.y, bboxMax.z);
+        successCount++;
+    }
+}
+
+bool FixedFunctionShader::computeBoundingBox(const RenderedState* rs, D3DXVECTOR3& bboxMin, D3DXVECTOR3& bboxMax) {
+    static bool debugBBox = false;
+    static int debugCount = 0;
+
+    // Check for U key to enable debug logging
+    if (GetAsyncKeyState('U') & 0x8000) {
+        static bool wasPressed = false;
+        if (!wasPressed) {
+            debugBBox = true;
+            debugCount = 10;
+            LOG::logline(">> BBox Debug: Enabled for next 10 calls");
+            wasPressed = true;
+        }
+    } else {
+        static bool wasPressed = false;
+        wasPressed = false;
+    }
+
+    if (!rs->vb) {
+        if (debugBBox && debugCount > 0) {
+            LOG::logline("!! computeBBox: no VB");
+            debugCount--;
+        }
+        return false;
+    }
+
+    if (debugBBox && debugCount > 0) {
+        LOG::logline(">> computeBBox: has VB=%p, fvf=0x%X, stride=%d", rs->vb, rs->fvf, rs->vbStride);
+    }
+
+    // Initialize bounds
+    bboxMin = D3DXVECTOR3(1e10f, 1e10f, 1e10f);
+    bboxMax = D3DXVECTOR3(-1e10f, -1e10f, -1e10f);
+
+    // Lock vertex buffer to read position data
+    void* pVertices = nullptr;
+    HRESULT hr = rs->vb->Lock(rs->vbOffset, 0, &pVertices, D3DLOCK_READONLY);
+    if (FAILED(hr)) {
+        if (debugBBox && debugCount > 0) {
+            LOG::logline("!! computeBBox: VB Lock failed hr=0x%X", hr);
+            debugCount--;
+        }
+        return false;
+    }
+
+    // Get vertex stride from FVF
+    UINT stride = rs->vbStride;
+    if (stride == 0) {
+        if (debugBBox && debugCount > 0) {
+            LOG::logline("!! computeBBox: stride == 0");
+            debugCount--;
+        }
+        rs->vb->Unlock();
+        return false;
+    }
+
+    // Determine position offset in vertex structure (FVF formats always have position first if XYZ is present)
+    bool hasPosition = (rs->fvf & D3DFVF_POSITION_MASK) != 0;
+    if (!hasPosition) {
+        if (debugBBox && debugCount > 0) {
+            LOG::logline("!! computeBBox: no position in FVF (fvf=0x%X, mask=0x%X)", rs->fvf, D3DFVF_POSITION_MASK);
+            debugCount--;
+        }
+        rs->vb->Unlock();
+        return false;
+    }
+
+    // For indexed primitives, we need to check all referenced vertices
+    // Lock index buffer to determine which vertices to check
+    void* pIndices = nullptr;
+    if (rs->ib) {
+        if (debugBBox && debugCount > 0) {
+            LOG::logline(">> computeBBox: has IB=%p, attempting lock", rs->ib);
+        }
+        hr = rs->ib->Lock(0, 0, &pIndices, D3DLOCK_READONLY);
+        if (FAILED(hr)) {
+            if (debugBBox && debugCount > 0) {
+                LOG::logline("!! computeBBox: IB lock failed, hr=0x%X", hr);
+                debugCount--;
+            }
+            rs->vb->Unlock();
+            return false;
+        }
+        if (debugBBox && debugCount > 0) {
+            LOG::logline(">> computeBBox: IB locked successfully");
+        }
+
+        // Determine index format (16-bit or 32-bit)
+        D3DINDEXBUFFER_DESC ibDesc;
+        rs->ib->GetDesc(&ibDesc);
+        bool is16Bit = (ibDesc.Format == D3DFMT_INDEX16);
+
+        // Process indexed vertices
+        UINT indexCount = 0;
+        switch (rs->primType) {
+            case D3DPT_TRIANGLELIST: indexCount = rs->primCount * 3; break;
+            case D3DPT_TRIANGLESTRIP: indexCount = rs->primCount + 2; break;
+            case D3DPT_TRIANGLEFAN: indexCount = rs->primCount + 2; break;
+            default:
+                if (debugBBox && debugCount > 0) {
+                    LOG::logline("!! computeBBox: unsupported primType=%d", rs->primType);
+                    debugCount--;
+                }
+                rs->ib->Unlock();
+                rs->vb->Unlock();
+                return false;
+        }
+
+        if (debugBBox && debugCount > 0) {
+            LOG::logline(">> computeBBox: primType=%d, primCount=%d, indexCount=%d", rs->primType, rs->primCount, indexCount);
+        }
+
+        for (UINT i = 0; i < indexCount; i++) {
+            UINT vertexIndex;
+            if (is16Bit) {
+                vertexIndex = ((WORD*)pIndices)[rs->startIndex + i] + rs->ibBase;
+            } else {
+                vertexIndex = ((DWORD*)pIndices)[rs->startIndex + i] + rs->ibBase;
+            }
+
+            // Get vertex position (positions are always at offset 0 in FVF)
+            BYTE* vertexData = ((BYTE*)pVertices) + vertexIndex * stride;
+            D3DXVECTOR3* pos = (D3DXVECTOR3*)vertexData;
+
+            // Transform by world matrix to get world-space bounds
+            D3DXVECTOR3 worldPos;
+            D3DXVec3TransformCoord(&worldPos, pos, &rs->worldTransforms[0]);
+
+            bboxMin.x = std::min(bboxMin.x, worldPos.x);
+            bboxMin.y = std::min(bboxMin.y, worldPos.y);
+            bboxMin.z = std::min(bboxMin.z, worldPos.z);
+            bboxMax.x = std::max(bboxMax.x, worldPos.x);
+            bboxMax.y = std::max(bboxMax.y, worldPos.y);
+            bboxMax.z = std::max(bboxMax.z, worldPos.z);
+        }
+
+        rs->ib->Unlock();
+    } else {
+        // Non-indexed primitives - check sequential vertices
+        UINT vertexCount = rs->vertCount;
+        for (UINT i = 0; i < vertexCount; i++) {
+            BYTE* vertexData = ((BYTE*)pVertices) + (rs->baseIndex + i) * stride;
+            D3DXVECTOR3* pos = (D3DXVECTOR3*)vertexData;
+
+            // Transform by world matrix to get world-space bounds
+            D3DXVECTOR3 worldPos;
+            D3DXVec3TransformCoord(&worldPos, pos, &rs->worldTransforms[0]);
+
+            bboxMin.x = std::min(bboxMin.x, worldPos.x);
+            bboxMin.y = std::min(bboxMin.y, worldPos.y);
+            bboxMin.z = std::min(bboxMin.z, worldPos.z);
+            bboxMax.x = std::max(bboxMax.x, worldPos.x);
+            bboxMax.y = std::max(bboxMax.y, worldPos.y);
+            bboxMax.z = std::max(bboxMax.z, worldPos.z);
+        }
+    }
+
+    rs->vb->Unlock();
+
+    // Validate bounding box
+    bool valid = (bboxMin.x <= bboxMax.x && bboxMin.y <= bboxMax.y && bboxMin.z <= bboxMax.z);
+
+    if (debugBBox && debugCount > 0) {
+        if (valid) {
+            LOG::logline(">> computeBBox: SUCCESS! bbox=[%.2f,%.2f,%.2f] to [%.2f,%.2f,%.2f]",
+                bboxMin.x, bboxMin.y, bboxMin.z, bboxMax.x, bboxMax.y, bboxMax.z);
+        } else {
+            LOG::logline("!! computeBBox: INVALID bbox! min=[%.2f,%.2f,%.2f] max=[%.2f,%.2f,%.2f]",
+                bboxMin.x, bboxMin.y, bboxMin.z, bboxMax.x, bboxMax.y, bboxMax.z);
+        }
+        debugCount--;
+    }
+
+    return valid;
 }
 

@@ -196,8 +196,8 @@ void DistantLand::renderStage1() {
             texDepthFrameSurface->Release();
         }
 
-        // Phase A: Backup depth buffer after renderDepth() for early-Z optimization
-        backupDepthBuffer();
+        // Hi-Z pyramid generation moved to before HLSL replay in ffeshader.cpp
+        // This ensures depth buffer is complete before culling
 
         // Restore render state
         stateSaved->Apply();
@@ -1073,28 +1073,5 @@ RenderTargetSwitcher::~RenderTargetSwitcher() {
     }
     if (savedDepthStencil) {
         savedDepthStencil->Release();
-    }
-}
-
-// Phase A: Depth buffer backup/restore for early-Z optimization
-void DistantLand::backupDepthBuffer() {
-    if (!surfDepthBackup || !device) return;
-
-    IDirect3DSurface9* currentDepthStencil;
-    if (SUCCEEDED(device->GetDepthStencilSurface(&currentDepthStencil))) {
-        // Copy current depth buffer to backup
-        device->StretchRect(currentDepthStencil, nullptr, surfDepthBackup, nullptr, D3DTEXF_NONE);
-        currentDepthStencil->Release();
-    }
-}
-
-void DistantLand::restoreDepthBuffer() {
-    if (!surfDepthBackup || !device) return;
-
-    IDirect3DSurface9* currentDepthStencil;
-    if (SUCCEEDED(device->GetDepthStencilSurface(&currentDepthStencil))) {
-        // Restore depth buffer from backup
-        device->StretchRect(surfDepthBackup, nullptr, currentDepthStencil, nullptr, D3DTEXF_NONE);
-        currentDepthStencil->Release();
     }
 }

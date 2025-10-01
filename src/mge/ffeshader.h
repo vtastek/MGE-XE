@@ -385,6 +385,11 @@ class FixedFunctionShader {
         };
         SamplerState samplerStates[8];  // D3D9 supports up to 8 texture stages
 
+        // Bounding box for Hi-Z culling
+        D3DXVECTOR3 bboxMin;
+        D3DXVECTOR3 bboxMax;
+        bool hasBoundingBox;
+
         // Constructor to capture render state data with proper resource management
         HLSLRecordedCall(const RenderedState* rs_, const FragmentState* frs_, const LightState* lightrs_, const ShaderKey& sk_);
         // Implementation moved to cpp file to handle sampler state capture
@@ -407,6 +412,7 @@ class FixedFunctionShader {
     static void replayRecordedCalls(int sceneCount);
     static void renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);
     static ShaderKey computeShaderKeyWithSuffixes(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);
+    static bool computeBoundingBox(const RenderedState* rs, D3DXVECTOR3& bboxMin, D3DXVECTOR3& bboxMax);
 
 public:
     static void finalizeBatchAndReplay(int sceneCount = 0); // Call when HLSL rendering session is complete

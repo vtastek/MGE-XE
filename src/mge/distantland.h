@@ -104,7 +104,11 @@ public:
     static IDirect3DTexture9* texDepthFrame;
     static IDirect3DSurface9* surfDepthFrameMSAA; // Phase A: MSAA render target for depth frame
     static IDirect3DSurface9* surfDepthDepth;
-    static IDirect3DSurface9* surfDepthBackup; // Phase A: Backup depth surface for early-Z
+    static IDirect3DTexture9* texCullDepth; // Cull-only depth (recordMW only, for Hi-Z)
+    static IDirect3DTexture9* texHiZ; // Hi-Z pyramid with full mip chain
+    static IDirect3DTexture9* texHiZStaging; // Staging texture for CPU readback (with mip chain)
+    static ID3DXEffect* effectHiZ; // Shader effect for Hi-Z downsample
+    static int hiZLevels; // Number of levels in Hi-Z pyramid
     static IDirect3DTexture9* texDistantBlend;
     static IDirect3DTexture9* texReflection;
     static IDirect3DSurface9* surfReflectionZ;
@@ -164,6 +168,7 @@ public:
     static bool initIpc();
     static bool initShader();
     static bool initDepth();
+    static bool initHiZ();
     static bool initWater();
     static bool initDynamicWaves();
     static bool initLandscapeClient();
@@ -178,10 +183,6 @@ public:
     static bool loadDistantStaticsClient(T& distantStatics, U& distantSubsets);
     static bool reloadShaders();
     static void release();
-
-    // Phase A: Depth buffer backup for early-Z optimization
-    static void backupDepthBuffer();
-    static void restoreDepthBuffer();
 
     static void editProjectionZ(D3DMATRIX* m, float zn, float zf);
     static bool selectDistantCell();
@@ -229,6 +230,8 @@ public:
     static void renderDepth();
     static void renderDepthAdditional();
     static void renderDepthRecorded();
+    static void generateHiZPyramid();
+    static bool cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& bboxMax, const D3DXMATRIX& worldViewProj, bool debugLog = false);
 
     static void renderShadowMap();
     template<class T>
