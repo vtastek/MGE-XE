@@ -62,6 +62,7 @@ D3DXMATRIX FixedFunctionShader::recordingShadowViewproj[2];
 
 // Bbox cache: persists across frames for fast object-space bbox lookup
 std::unordered_map<FixedFunctionShader::MeshKey, FixedFunctionShader::ObjectSpaceBBox, FixedFunctionShader::MeshKeyHash> FixedFunctionShader::bboxCache;
+std::shared_ptr<LightState> FixedFunctionShader::lastLightState;
 
 // Material state cache static member
 FixedFunctionShader::MaterialStateCache FixedFunctionShader::materialCache;
@@ -75,6 +76,7 @@ bool FixedFunctionShader::isDetailTextureBound = false;
 
 // Shadow matrix caching optimization
 D3DXMATRIX FixedFunctionShader::cachedViewMatrix;
+D3DXMATRIX FixedFunctionShader::cachedInverseView;
 D3DXMATRIX FixedFunctionShader::cachedViewToShadow[2];
 bool FixedFunctionShader::shadowMatricesValid = false;
 
@@ -1556,6 +1558,11 @@ void FixedFunctionShader::bindShaderTextures(const ShaderKey& sk, const Rendered
     if (sk.hasShadows) {
         setCachedTexture(device, 4, DistantLand::texSoftShadow);
     }
+
+    // Slot 5: Light data texture (for texture-based point lighting)
+    if (DistantLand::texLightData) {
+        setCachedTexture(device, 5, DistantLand::texLightData);
+    }
 }
 
 
@@ -1794,24 +1801,34 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     // DXVK-optimized texture binding - only touches slots the shader actually uses
     bindShaderTextures(sk, rs);
 
-    // Set shadow matrices if shadows are enabled with view change caching
-    if (sk.hasShadows) {
-        // Use current device view matrix, not cached distant land view
-        D3DXMATRIX currentView;
-        device->GetTransform(D3DTS_VIEW, &currentView);
+    // Get current view matrix and compute inverse (needed for texture lights and shadows)
+    D3DXMATRIX currentView;
+    device->GetTransform(D3DTS_VIEW, &currentView);
 
-        // Only recalculate shadow matrices when view changes
-        if (!shadowMatricesValid || memcmp(&currentView, &cachedViewMatrix, sizeof(D3DXMATRIX)) != 0) {
-            cachedViewMatrix = currentView;
-            D3DXMATRIX inverseView;
-            D3DXMatrixInverse(&inverseView, NULL, &currentView);
-            cachedViewToShadow[0] = inverseView * DistantLand::smViewproj[0];
-            cachedViewToShadow[1] = inverseView * DistantLand::smViewproj[1];
-            shadowMatricesValid = true;
+    // Only recalculate inverse view when view changes
+    if (!shadowMatricesValid || memcmp(&currentView, &cachedViewMatrix, sizeof(D3DXMATRIX)) != 0) {
+        cachedViewMatrix = currentView;
+        D3DXMatrixInverse(&cachedInverseView, NULL, &currentView);
+        shadowMatricesValid = true;
+    }
+
+    // Set viewInverse matrix for texture-based lighting (always needed)
+    device->SetPixelShaderConstantF(18, (float*)&cachedInverseView, 4); // c18
+
+    // Set shadow matrices if shadows are enabled
+    if (sk.hasShadows) {
+        // Compute shadow transform matrices using cached inverse view
+        static D3DXMATRIX cachedViewToShadowLocal[2];
+        static bool shadowTransformValid = false;
+
+        if (!shadowTransformValid || !shadowMatricesValid) {
+            cachedViewToShadowLocal[0] = cachedInverseView * DistantLand::smViewproj[0];
+            cachedViewToShadowLocal[1] = cachedInverseView * DistantLand::smViewproj[1];
+            shadowTransformValid = shadowMatricesValid;
         }
 
-        device->SetVertexShaderConstantF(20, (float*)&cachedViewToShadow[0], 4); // c20-c23
-        device->SetVertexShaderConstantF(24, (float*)&cachedViewToShadow[1], 4); // c24-c27
+        device->SetVertexShaderConstantF(20, (float*)&cachedViewToShadowLocal[0], 4); // c20-c23
+        device->SetVertexShaderConstantF(24, (float*)&cachedViewToShadowLocal[1], 4); // c24-c27
 
         // Set shadow resolution parameter
         float shadowRcp = 1.0f / Configuration.DL.ShadowResolution;
@@ -2778,9 +2795,12 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     }
 
     // Build shader defines based on ShaderKey
-    D3D_SHADER_MACRO defines[9] = {};
+    D3D_SHADER_MACRO defines[10] = {};  // Increased to 10 for USE_TEXTURE_LIGHTS
     int defineCount = 0;
-    
+
+    // Always enable texture-based lighting system
+    defines[defineCount++] = {"USE_TEXTURE_LIGHTS", "1"};
+
     if (sk.hasDiffParam) {
         defines[defineCount++] = {"HAS_DIFFPARAM", "1"};
         // LOG::logline("HLSL: Compiling with HAS_DIFFPARAM define");
@@ -3260,6 +3280,7 @@ void FixedFunctionShader::startRecording() {
     resetHLSLCaches();
 
     recordedCalls.clear();
+    lastLightState.reset();  // Clear LightState cache for new recording
     isRecording = true;
     isReplaying = false;
 
@@ -3340,8 +3361,30 @@ void FixedFunctionShader::finalizeBatchAndReplay(int sceneCount) {
         recordedCalls.clear();
     }
 
+    // Clear lights for next frame
+    DistantLand::sceneLights.clear();
+    DistantLand::visibleLights.clear();
+
     // Always reset HLSL caches after rendering session completes
     resetHLSLCaches();
+}
+
+// Compare two LightStates for equality (to detect if we can reuse cached state)
+bool FixedFunctionShader::compareLightStates(const LightState* a, const LightState* b) {
+    if (a->globalAmbient.r != b->globalAmbient.r || a->globalAmbient.g != b->globalAmbient.g ||
+        a->globalAmbient.b != b->globalAmbient.b || a->globalAmbient.a != b->globalAmbient.a) {
+        return false;
+    }
+    if (a->lights.size() != b->lights.size() || a->active.size() != b->active.size()) {
+        return false;
+    }
+    // Quick check: compare active light indices
+    for (size_t i = 0; i < a->active.size(); i++) {
+        if (a->active[i] != b->active[i]) {
+            return false;
+        }
+    }
+    return true;  // Same lighting state
 }
 
 void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, const ShaderKey& sk) {
@@ -3367,8 +3410,40 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
         }
     }
 
-    // Always record calls for potential batch dump when recording is ON
-    recordedCalls.emplace_back(rs, frs, lightrs, sk);
+    // Collect lights from Morrowind for texture-based lighting system
+    for (const auto& [id, light] : lightrs->lights) {
+        // Check if light already exists
+        auto it = std::find_if(DistantLand::sceneLights.begin(), DistantLand::sceneLights.end(),
+                               [id](const DistantLand::SceneLight& sl) { return sl.id == id; });
+
+        if (it == DistantLand::sceneLights.end()) {
+            // New light - add to scene
+            DistantLand::SceneLight sl;
+            sl.id = id;
+            sl.position = light.position;
+            sl.diffuse = light.diffuse;
+            sl.falloff = light.falloff;  // (constant, linear, quadratic)
+            sl.radius = DistantLand::computeLightRadius(sl.falloff.x, sl.falloff.y, sl.falloff.z);
+            sl.isVisible = false;  // Will be set during Hi-Z culling
+            DistantLand::sceneLights.push_back(sl);
+        } else {
+            // Update dynamic properties (color may pulse)
+            it->diffuse = light.diffuse;
+        }
+    }
+
+    // Reuse last LightState if identical to avoid allocation overhead
+    std::shared_ptr<LightState> sharedLightState;
+    if (lastLightState && compareLightStates(lastLightState.get(), lightrs)) {
+        // Reuse existing shared_ptr (no allocation)
+        sharedLightState = lastLightState;
+    } else {
+        // Create new LightState copy and cache it
+        sharedLightState = std::make_shared<LightState>(*lightrs);
+        lastLightState = sharedLightState;
+    }
+
+    recordedCalls.emplace_back(rs, frs, sharedLightState, sk);
 }
 
 void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
@@ -3432,6 +3507,19 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
 
     // Calculate view-projection matrix for Hi-Z culling
     D3DXMATRIX viewProj = currentView * depthProj;
+
+    // Cull lights against Hi-Z pyramid and upload to texture
+    DistantLand::cullSceneLights(viewProj);
+    DistantLand::uploadLightDataToTexture(currentView);
+
+    // Set light count parameter for shaders
+    int numLights = (int)DistantLand::visibleLights.size();
+    float lightParams[4] = {
+        (float)numLights,                               // numLights
+        numLights > 0 ? 1.0f / (numLights * 3) : 0.0f,  // texelSize
+        0.0f, 0.0f
+    };
+    device->SetPixelShaderConstantF(50, lightParams, 1); // c50
 
     // Simple Hi-Z culling with expanded bboxes for camera intersection handling
     for (size_t i = 0; i < recordedCalls.size(); i++) {
@@ -3499,7 +3587,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
                 }
             }
 
-            renderMorrowindHLSL_Internal(&call.rs, &call.frs, const_cast<LightState*>(static_cast<const LightState*>(&call.lightrs)));
+            renderMorrowindHLSL_Internal(&call.rs, &call.frs, call.lightrs.get());
         }
     }
 
@@ -3511,20 +3599,21 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
                  renderedCalls);
 
     // Debug visualization: Render bounding boxes with color-coded status
-    // Toggle with 'B' key
-    static bool debugBBoxVis = false;
+    // Cycle with 'B' key: 0=none, 1=culled objects only, 2=lights only
+    static int debugBBoxMode = 0;
     static bool wasBPressed = false;
     if (GetAsyncKeyState('B') & 0x8000) {
         if (!wasBPressed) {
-            debugBBoxVis = !debugBBoxVis;
-            LOG::logline(">> BBox visualization: %s", debugBBoxVis ? "ON" : "OFF");
+            debugBBoxMode = (debugBBoxMode + 1) % 3;
+            const char* modeNames[] = {"OFF", "CULLED ONLY", "LIGHTS ONLY"};
+            LOG::logline(">> BBox visualization: %s", modeNames[debugBBoxMode]);
             wasBPressed = true;
         }
     } else {
         wasBPressed = false;
     }
 
-    if (debugBBoxVis) {
+    if (debugBBoxMode > 0) {
         // Save render states
         IDirect3DStateBlock9* savedState;
         device->CreateStateBlock(D3DSBT_ALL, &savedState);
@@ -3572,49 +3661,65 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
             device->DrawPrimitiveUP(D3DPT_LINELIST, 12, vertices, sizeof(Vertex));
         };
 
-        // Re-run culling logic to determine which objects to visualize
-        for (size_t i = 0; i < recordedCalls.size(); i++) {
-            const auto& call = recordedCalls[i];
-            if (!call.hasBoundingBox) continue;
+        // Mode 1: Show culled objects only (red boxes)
+        if (debugBBoxMode == 1) {
+            for (size_t i = 0; i < recordedCalls.size(); i++) {
+                const auto& call = recordedCalls[i];
+                if (!call.hasBoundingBox) continue;
 
-            // Expand bbox conservatively to avoid false positives
-            // Use 1.25x scale + fixed 10 unit padding to handle bad pivots/asymmetric meshes
-            // Add 2x padding for thin axes (< 20 units) to avoid missing flat/small objects
-            D3DXVECTOR3 center = (call.bboxMin + call.bboxMax) * 0.5f;
-            D3DXVECTOR3 halfSize = (call.bboxMax - call.bboxMin) * 0.5f;
-            D3DXVECTOR3 padding(10.0f, 10.0f, 10.0f);
+                // Expand bbox conservatively to avoid false positives
+                // Use 1.25x scale + fixed 10 unit padding to handle bad pivots/asymmetric meshes
+                // Add 2x padding for thin axes (< 20 units) to avoid missing flat/small objects
+                D3DXVECTOR3 center = (call.bboxMin + call.bboxMax) * 0.5f;
+                D3DXVECTOR3 halfSize = (call.bboxMax - call.bboxMin) * 0.5f;
+                D3DXVECTOR3 padding(10.0f, 10.0f, 10.0f);
 
-            // Double padding for thin axes
-            if (halfSize.x * 2.0f < 20.0f) padding.x *= 2.0f;
-            if (halfSize.y * 2.0f < 20.0f) padding.y *= 2.0f;
-            if (halfSize.z * 2.0f < 20.0f) padding.z *= 2.0f;
+                // Double padding for thin axes
+                if (halfSize.x * 2.0f < 20.0f) padding.x *= 2.0f;
+                if (halfSize.y * 2.0f < 20.0f) padding.y *= 2.0f;
+                if (halfSize.z * 2.0f < 20.0f) padding.z *= 2.0f;
 
-            D3DXVECTOR3 expandedHalfSize = halfSize * 1.25f + padding;
-            D3DXVECTOR3 expandedMin = center - expandedHalfSize;
-            D3DXVECTOR3 expandedMax = center + expandedHalfSize;
+                D3DXVECTOR3 expandedHalfSize = halfSize * 1.25f + padding;
+                D3DXVECTOR3 expandedMin = center - expandedHalfSize;
+                D3DXVECTOR3 expandedMax = center + expandedHalfSize;
 
-            // Treat camera as 100x100x100 unit bbox for intersection test
-            const float cameraBBoxSize = 50.0f;
-            D3DXVECTOR3 cameraBBoxMin = D3DXVECTOR3(DistantLand::eyePos.x - cameraBBoxSize,
-                                                     DistantLand::eyePos.y - cameraBBoxSize,
-                                                     DistantLand::eyePos.z - cameraBBoxSize);
-            D3DXVECTOR3 cameraBBoxMax = D3DXVECTOR3(DistantLand::eyePos.x + cameraBBoxSize,
-                                                     DistantLand::eyePos.y + cameraBBoxSize,
-                                                     DistantLand::eyePos.z + cameraBBoxSize);
+                // Treat camera as 100x100x100 unit bbox for intersection test
+                const float cameraBBoxSize = 50.0f;
+                D3DXVECTOR3 cameraBBoxMin = D3DXVECTOR3(DistantLand::eyePos.x - cameraBBoxSize,
+                                                         DistantLand::eyePos.y - cameraBBoxSize,
+                                                         DistantLand::eyePos.z - cameraBBoxSize);
+                D3DXVECTOR3 cameraBBoxMax = D3DXVECTOR3(DistantLand::eyePos.x + cameraBBoxSize,
+                                                         DistantLand::eyePos.y + cameraBBoxSize,
+                                                         DistantLand::eyePos.z + cameraBBoxSize);
 
-            bool cameraInside = !(cameraBBoxMax.x < expandedMin.x || cameraBBoxMin.x > expandedMax.x ||
-                                  cameraBBoxMax.y < expandedMin.y || cameraBBoxMin.y > expandedMax.y ||
-                                  cameraBBoxMax.z < expandedMin.z || cameraBBoxMin.z > expandedMax.z);
+                bool cameraInside = !(cameraBBoxMax.x < expandedMin.x || cameraBBoxMin.x > expandedMax.x ||
+                                      cameraBBoxMax.y < expandedMin.y || cameraBBoxMin.y > expandedMax.y ||
+                                      cameraBBoxMax.z < expandedMin.z || cameraBBoxMin.z > expandedMax.z);
 
-            bool isCulled = false;
-            if (!cameraInside) {
-                // Use expanded bbox for Hi-Z test
-                isCulled = DistantLand::cullAgainstHiZ(expandedMin, expandedMax, viewProj, false);
+                bool isCulled = false;
+                if (!cameraInside) {
+                    // Use expanded bbox for Hi-Z test
+                    isCulled = DistantLand::cullAgainstHiZ(expandedMin, expandedMax, viewProj, false);
+                }
+
+                // Draw only culled objects in red
+                if (isCulled) {
+                    drawBBox(expandedMin, expandedMax, D3DCOLOR_ARGB(255, 255, 0, 0));
+                }
             }
+        }
 
-            // Draw expanded bbox only: green for rendered, red for culled
-            D3DCOLOR color = isCulled ? D3DCOLOR_ARGB(255, 255, 0, 0) : D3DCOLOR_ARGB(255, 0, 255, 0);
-            drawBBox(expandedMin, expandedMax, color);
+        // Mode 2: Show culled lights only (red boxes)
+        if (debugBBoxMode == 2) {
+            for (const auto& light : DistantLand::sceneLights) {
+                if (!light.isVisible) {  // Only show culled lights
+                    D3DXVECTOR3 bmin = light.position - D3DXVECTOR3(light.radius, light.radius, light.radius);
+                    D3DXVECTOR3 bmax = light.position + D3DXVECTOR3(light.radius, light.radius, light.radius);
+
+                    // Red color for culled lights
+                    drawBBox(bmin, bmax, D3DCOLOR_ARGB(255, 255, 0, 0));
+                }
+            }
         }
 
         // Restore render states
@@ -3663,8 +3768,8 @@ FixedFunctionShader::RecordedRenderedState::RecordedRenderedState(RecordedRender
 // ------------------------------------
 // FixedFunctionShader::HLSLRecordedCall
 
-FixedFunctionShader::HLSLRecordedCall::HLSLRecordedCall(const RenderedState* rs_, const FragmentState* frs_, const LightState* lightrs_, const ShaderKey& sk_)
-    : rs(*rs_), frs(*frs_), lightrs(*lightrs_), sk(sk_), hasBoundingBox(false) {
+FixedFunctionShader::HLSLRecordedCall::HLSLRecordedCall(const RenderedState* rs_, const FragmentState* frs_, std::shared_ptr<LightState> lightrs_, const ShaderKey& sk_)
+    : rs(*rs_), frs(*frs_), lightrs(lightrs_), sk(sk_), hasBoundingBox(false) {
 
     // Capture current sampler states for all texture stages
     for (int stage = 0; stage < 8; ++stage) {
@@ -3702,19 +3807,28 @@ FixedFunctionShader::HLSLRecordedCall::HLSLRecordedCall(const RenderedState* rs_
 bool FixedFunctionShader::computeBoundingBox(const RenderedState* rs, D3DXVECTOR3& bboxMin, D3DXVECTOR3& bboxMax) {
     static bool debugBBox = false;
     static int debugCount = 0;
+    static bool keyCheckedThisRecording = false;
 
-    // Check for U key to enable debug logging
-    if (GetAsyncKeyState('U') & 0x8000) {
-        static bool wasPressed = false;
-        if (!wasPressed) {
-            debugBBox = true;
-            debugCount = 10;
-            LOG::logline(">> BBox Debug: Enabled for next 10 calls");
-            wasPressed = true;
+    // Check for U key only once per recording session (avoid GetAsyncKeyState in per-mesh hotpath)
+    if (isRecording && !keyCheckedThisRecording) {
+        if (GetAsyncKeyState('U') & 0x8000) {
+            static bool wasPressed = false;
+            if (!wasPressed) {
+                debugBBox = true;
+                debugCount = 10;
+                LOG::logline(">> BBox Debug: Enabled for next 10 calls");
+                wasPressed = true;
+            }
+        } else {
+            static bool wasPressed = false;
+            wasPressed = false;
         }
-    } else {
-        static bool wasPressed = false;
-        wasPressed = false;
+        keyCheckedThisRecording = true;
+    }
+
+    // Reset flag when not recording
+    if (!isRecording) {
+        keyCheckedThisRecording = false;
     }
 
     if (!rs->vb) {

@@ -471,3 +471,277 @@ bool DistantLand::cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& 
 
     return culled;
 }
+
+// --------------------------------------------------------
+// Texture-Based Lighting System
+// --------------------------------------------------------
+
+float DistantLand::computeLightRadius(float constant, float linear, float quadratic) {
+    // Match shader attenuation: (1 / (40*q*d² + c)) * (1 - (d/350)^4)
+    // Use fixed 350 unit cutoff from shader, but extend slightly for culling safety margin
+    // The shader's quartic cutoff at 350 units means lights are effectively invisible beyond that
+
+    // Use 400 units as safe maximum (350 + margin for Hi-Z culling tolerance)
+    return 400.0f;
+}
+
+bool DistantLand::cullLightAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& bboxMax, const D3DXMATRIX& worldViewProj) {
+    if (!texHiZStaging) return false;
+
+    // Transform bounding box corners to clip space
+    D3DXVECTOR3 corners[8] = {
+        D3DXVECTOR3(bboxMin.x, bboxMin.y, bboxMin.z),
+        D3DXVECTOR3(bboxMax.x, bboxMin.y, bboxMin.z),
+        D3DXVECTOR3(bboxMin.x, bboxMax.y, bboxMin.z),
+        D3DXVECTOR3(bboxMax.x, bboxMax.y, bboxMin.z),
+        D3DXVECTOR3(bboxMin.x, bboxMin.y, bboxMax.z),
+        D3DXVECTOR3(bboxMax.x, bboxMin.y, bboxMax.z),
+        D3DXVECTOR3(bboxMin.x, bboxMax.y, bboxMax.z),
+        D3DXVECTOR3(bboxMax.x, bboxMax.y, bboxMax.z)
+    };
+
+    float minX = 1e10f, maxX = -1e10f;
+    float minY = 1e10f, maxY = -1e10f;
+    float minLinearDepth = 1e10f;
+    bool anyInFront = false;
+    bool anyBehindCamera = false;
+
+    for (int i = 0; i < 8; i++) {
+        D3DXVECTOR4 clipPos;
+        D3DXVec3Transform(&clipPos, &corners[i], &worldViewProj);
+
+        if (clipPos.w > 0.0f) {
+            anyInFront = true;
+            float invW = 1.0f / clipPos.w;
+            float ndcX = clipPos.x * invW;
+            float ndcY = clipPos.y * invW;
+            float linearDepth = clipPos.w;
+
+            float screenX = ndcX * 0.5f + 0.5f;
+            float screenY = -ndcY * 0.5f + 0.5f;
+
+            minX = std::min(minX, screenX);
+            maxX = std::max(maxX, screenX);
+            minY = std::min(minY, screenY);
+            maxY = std::max(maxY, screenY);
+            minLinearDepth = std::min(minLinearDepth, linearDepth);
+        } else {
+            anyBehindCamera = true;
+        }
+    }
+
+    // Light completely behind camera → cull
+    if (!anyInFront) return true;
+
+    // Light intersects near plane → visible (needs to illuminate nearby geometry)
+    if (anyBehindCamera) return false;
+
+    // Check if completely offscreen (before clamping)
+    bool isOffscreen = (maxX <= 0.0f || minX >= 1.0f || maxY <= 0.0f || minY >= 1.0f);
+
+    // Clamp to screen bounds for depth testing
+    minX = std::max(0.0f, std::min(1.0f, minX));
+    maxX = std::max(0.0f, std::min(1.0f, maxX));
+    minY = std::max(0.0f, std::min(1.0f, minY));
+    maxY = std::max(0.0f, std::min(1.0f, maxY));
+
+    // Calculate bbox screen size and select appropriate mip level
+    D3DSURFACE_DESC desc;
+    texHiZStaging->GetLevelDesc(0, &desc);
+    float boxWidth = (maxX - minX) * desc.Width;
+    float boxHeight = (maxY - minY) * desc.Height;
+    float boxSize = std::max(boxWidth, boxHeight);
+
+    int mipLevel = 0;
+    if (boxSize > 8.0f) {
+        mipLevel = (int)std::floor(std::log2(boxSize / 6.0f)) - 1;
+        mipLevel = std::max(0, std::min(hiZLevels - 1, mipLevel));
+    }
+
+    // Lock the staging texture at selected mip level
+    D3DLOCKED_RECT lr;
+    HRESULT hr = texHiZStaging->LockRect(mipLevel, &lr, NULL, D3DLOCK_READONLY);
+    if (FAILED(hr)) return false;
+
+    texHiZStaging->GetLevelDesc(mipLevel, &desc);
+
+    int pixelMinX = (int)(minX * desc.Width);
+    int pixelMaxX = (int)(maxX * desc.Width);
+    int pixelMinY = (int)(minY * desc.Height);
+    int pixelMaxY = (int)(maxY * desc.Height);
+
+    pixelMinX = std::max(0, std::min((int)desc.Width - 1, pixelMinX));
+    pixelMaxX = std::max(0, std::min((int)desc.Width - 1, pixelMaxX));
+    pixelMinY = std::max(0, std::min((int)desc.Height - 1, pixelMinY));
+    pixelMaxY = std::max(0, std::min((int)desc.Height - 1, pixelMaxY));
+
+    // Sample Hi-Z depth
+    float* depthData = (float*)lr.pBits;
+    int pitch = lr.Pitch / sizeof(float);
+    float maxHiZDepth = 0.0f;
+
+    for (int y = pixelMinY; y <= pixelMaxY; y++) {
+        for (int x = pixelMinX; x <= pixelMaxX; x++) {
+            float depth = depthData[y * pitch + x];
+            maxHiZDepth = std::max(maxHiZDepth, depth);
+        }
+    }
+
+    texHiZStaging->UnlockRect(mipLevel);
+
+    // Light culling test: if light's nearest point is behind furthest visible surface → cull
+    // Use bias for depth precision tolerance
+    float bias = 20.0f;
+    bool depthOccluded = minLinearDepth > maxHiZDepth + bias;
+
+    // If offscreen but depth intersects visible geometry → visible (light can illuminate it)
+    if (isOffscreen && !depthOccluded) {
+        return false;
+    }
+
+    // If offscreen and depth occluded → cull
+    if (isOffscreen && depthOccluded) {
+        return true;
+    }
+
+    // Onscreen: use depth occlusion result
+    return depthOccluded;
+}
+
+void DistantLand::cullSceneLights(const D3DXMATRIX& viewProj) {
+    visibleLights.clear();
+    int culled = 0;
+
+    // Debug: log first few lights
+    static bool logged = false;
+    if (!logged && sceneLights.size() > 0) {
+        LOG::logline(">> Light Debug: Total lights = %d", sceneLights.size());
+        for (int i = 0; i < std::min(3, (int)sceneLights.size()); i++) {
+            const auto& light = sceneLights[i];
+            LOG::logline("  Light %d: pos=(%.1f,%.1f,%.1f) radius=%.1f falloff=(%.3f,%.3f,%.3f) color=(%.2f,%.2f,%.2f)",
+                i, light.position.x, light.position.y, light.position.z, light.radius,
+                light.falloff.x, light.falloff.y, light.falloff.z,
+                light.diffuse.r, light.diffuse.g, light.diffuse.b);
+        }
+        logged = true;
+    }
+
+    for (auto& light : sceneLights) {
+        // Create sphere bounding box for light volume
+        D3DXVECTOR3 bboxMin = light.position - D3DXVECTOR3(light.radius, light.radius, light.radius);
+        D3DXVECTOR3 bboxMax = light.position + D3DXVECTOR3(light.radius, light.radius, light.radius);
+
+        // Hi-Z cull the light's influence volume (use light-specific function)
+        bool isOccluded = cullLightAgainstHiZ(bboxMin, bboxMax, viewProj);
+
+        if (!isOccluded) {
+            light.isVisible = true;
+            visibleLights.push_back(light);
+        } else {
+            light.isVisible = false;
+            culled++;
+        }
+    }
+
+    LOG::logline(">> Light Culling: %d total, %d visible, %d culled (%.1f%%)",
+                 (int)sceneLights.size(), (int)visibleLights.size(), culled,
+                 sceneLights.size() > 0 ? (culled * 100.0f) / sceneLights.size() : 0.0f);
+}
+
+void DistantLand::uploadLightDataToTexture(const D3DXMATRIX& viewMatrix) {
+    int numLights = (int)visibleLights.size();
+
+    if (numLights == 0) {
+        // No lights - unbind texture
+        if (texLightData) {
+            device->SetTexture(5, nullptr);
+        }
+        return;
+    }
+
+    int texelsNeeded = numLights * 3;  // 3 texels per light
+
+    // Create or resize texture if needed
+    if (!texLightData) {
+        HRESULT hr = device->CreateTexture(
+            texelsNeeded, 1,        // 1D texture (width × 1)
+            1,                      // No mipmaps
+            0,                      // Not a render target
+            D3DFMT_A32B32G32R32F,   // 128-bit float format
+            D3DPOOL_MANAGED,
+            &texLightData,
+            nullptr
+        );
+
+        if (FAILED(hr)) {
+            LOG::logline("!! Failed to create light data texture (hr=0x%X)", hr);
+            return;
+        }
+    } else {
+        // Check if we need to resize
+        D3DSURFACE_DESC desc;
+        texLightData->GetLevelDesc(0, &desc);
+
+        if (desc.Width != (UINT)texelsNeeded) {
+            // Resize needed
+            texLightData->Release();
+
+            HRESULT hr = device->CreateTexture(
+                texelsNeeded, 1,
+                1,
+                0,
+                D3DFMT_A32B32G32R32F,
+                D3DPOOL_MANAGED,
+                &texLightData,
+                nullptr
+            );
+
+            if (FAILED(hr)) {
+                LOG::logline("!! Failed to resize light data texture (hr=0x%X)", hr);
+                texLightData = nullptr;
+                return;
+            }
+        }
+    }
+
+    // Lock and fill texture
+    D3DLOCKED_RECT locked;
+    if (SUCCEEDED(texLightData->LockRect(0, &locked, nullptr, 0))) {
+        float* data = (float*)locked.pBits;
+
+        for (int i = 0; i < numLights; i++) {
+            const SceneLight& light = visibleLights[i];
+            int offset = i * 12;  // 3 texels × 4 floats per texel
+
+            // Transform light position to view-space (to match legacy system)
+            D3DXVECTOR4 worldPos4(light.position.x, light.position.y, light.position.z, 1.0f);
+            D3DXVECTOR4 viewPos4;
+            D3DXVec4Transform(&viewPos4, &worldPos4, &viewMatrix);
+
+            // Texel 0: view-space position + radius
+            data[offset + 0] = viewPos4.x;
+            data[offset + 1] = viewPos4.y;
+            data[offset + 2] = viewPos4.z;
+            data[offset + 3] = light.radius;
+
+            // Texel 1: color
+            data[offset + 4] = light.diffuse.r;
+            data[offset + 5] = light.diffuse.g;
+            data[offset + 6] = light.diffuse.b;
+            data[offset + 7] = 0.0f;
+
+            // Texel 2: falloff parameters
+            data[offset + 8]  = light.falloff.x;  // constant
+            data[offset + 9]  = light.falloff.y;  // linear
+            data[offset + 10] = light.falloff.z;  // quadratic
+            data[offset + 11] = 0.0f;
+        }
+
+        texLightData->UnlockRect(0);
+    }
+
+    // Bind to device (slot 5)
+    device->SetTexture(5, texLightData);
+
+    LOG::logline(">> Uploaded %d lights to texture (slot 5)", numLights);
+}

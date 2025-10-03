@@ -301,6 +301,7 @@ class FixedFunctionShader {
 
     // Shadow matrix caching to avoid per-draw calculations
     static D3DXMATRIX cachedViewMatrix;
+    static D3DXMATRIX cachedInverseView;
     static D3DXMATRIX cachedViewToShadow[2];
     static bool shadowMatricesValid;
 
@@ -411,7 +412,7 @@ class FixedFunctionShader {
     struct HLSLRecordedCall {
         RecordedRenderedState rs;
         RecordedFragmentState frs;
-        RecordedLightState lightrs;
+        std::shared_ptr<LightState> lightrs;  // Shared pointer to avoid redundant copies
         ShaderKey sk;
 
         // Captured sampler states for each texture stage
@@ -428,7 +429,7 @@ class FixedFunctionShader {
         bool hasBoundingBox;
 
         // Constructor to capture render state data with proper resource management
-        HLSLRecordedCall(const RenderedState* rs_, const FragmentState* frs_, const LightState* lightrs_, const ShaderKey& sk_);
+        HLSLRecordedCall(const RenderedState* rs_, const FragmentState* frs_, std::shared_ptr<LightState> lightrs_, const ShaderKey& sk_);
         // Implementation moved to cpp file to handle sampler state capture
     };
 
@@ -445,6 +446,10 @@ class FixedFunctionShader {
 
     // Bbox cache: maps mesh identifier to object-space bbox (persists across frames)
     static std::unordered_map<MeshKey, ObjectSpaceBBox, MeshKeyHash> bboxCache;
+
+    // LightState cache: reuse shared_ptr for identical lighting states to avoid redundant allocations
+    static std::shared_ptr<LightState> lastLightState;
+    static bool compareLightStates(const LightState* a, const LightState* b);
 
     static void startRecording();
     static void stopRecordingAndReplay();

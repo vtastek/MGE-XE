@@ -75,6 +75,11 @@ ID3DXEffect* DistantLand::effectHiZ;
 IDirect3DVertexShader9* DistantLand::vsHiZ = nullptr;
 IDirect3DPixelShader9* DistantLand::psHiZ = nullptr;
 int DistantLand::hiZLevels;
+
+// Texture-based lighting system
+std::vector<DistantLand::SceneLight> DistantLand::sceneLights;
+std::vector<DistantLand::SceneLight> DistantLand::visibleLights;
+IDirect3DTexture9* DistantLand::texLightData = nullptr;
 IDirect3DTexture9* DistantLand::texDistantBlend;
 IDirect3DTexture9* DistantLand::texReflection;
 IDirect3DSurface9* DistantLand::surfReflectionZ;
@@ -1590,6 +1595,10 @@ void DistantLand::release() {
     if (psHiZ) {
         psHiZ->Release();
         psHiZ = nullptr;
+    }
+    if (texLightData) {
+        texLightData->Release();
+        texLightData = nullptr;
     }
 
     effectPool->Release();

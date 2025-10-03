@@ -127,6 +127,19 @@ public:
     static IDirect3DSurface9* surfShadowZ;
     static IDirect3DVertexBuffer9* vbFullFrame, *vbClipCube;
 
+    // Texture-based lighting system for HLSL
+    struct SceneLight {
+        DWORD id;                    // D3D light index for deduplication
+        D3DXVECTOR3 position;        // World-space position
+        D3DCOLORVALUE diffuse;       // Color (may pulse for dynamic lights)
+        float radius;                // Computed from attenuation parameters
+        D3DXVECTOR3 falloff;         // (constant, linear, quadratic) attenuation
+        bool isVisible;              // After Hi-Z culling
+    };
+    static std::vector<SceneLight> sceneLights;       // All unique lights in scene
+    static std::vector<SceneLight> visibleLights;     // After Hi-Z culling
+    static IDirect3DTexture9* texLightData;           // GPU texture with light data
+
     static D3DXMATRIX mwView, mwProj;
     static D3DXMATRIX smView[2], smProj[2], smViewproj[2];
     static D3DXVECTOR4 eyeVec, eyePos, sunVec, sunPos;
@@ -234,6 +247,12 @@ public:
     static void renderDepthRecorded();
     static void generateHiZPyramid();
     static bool cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& bboxMax, const D3DXMATRIX& worldViewProj, bool debugLog = false);
+    static bool cullLightAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& bboxMax, const D3DXMATRIX& worldViewProj);
+
+    // Texture-based lighting system
+    static float computeLightRadius(float constant, float linear, float quadratic);
+    static void cullSceneLights(const D3DXMATRIX& viewProj);
+    static void uploadLightDataToTexture(const D3DXMATRIX& viewMatrix);
 
     static void renderShadowMap();
     template<class T>
