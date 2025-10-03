@@ -438,6 +438,7 @@ class FixedFunctionShader {
     static bool isReplaying;
     static bool manualRecordingControl;  // When true, user controls recording via K key
     static bool recordingEnabled;  // Global toggle for entire recording system
+    static bool recordingCompletedThisFrame;  // Prevents restarting recording after Scene 0
     static bool dumpRequested;  // When true, preserve calls for dump
 
     // Consistent matrices for entire recording session
@@ -466,6 +467,7 @@ public:
     static bool getIsRecording() { return isRecording; }
     static bool getIsReplaying() { return isReplaying; }
     static void setRecordingState(bool recording) { isRecording = recording; }
+    static void resetRecordingCompletedFlag() { recordingCompletedThisFrame = false; }
     static void setReplayingState(bool replaying) { isReplaying = replaying; }
     static void setManualRecordingControl(bool manual) { manualRecordingControl = manual; }
     static bool getManualRecordingControl() { return manualRecordingControl; }

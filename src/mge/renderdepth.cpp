@@ -42,7 +42,8 @@ void DistantLand::renderDepth() {
     renderDepthRecorded();
     effectDepth->EndPass();
 
-    // Copy recordMW depth to texCullDepth for Hi-Z culling (before distant land)
+    // Copy recordMW opaques to Hi-Z buffer - used for culling during HLSL replay
+    // MUST happen here: after recordMW rendered, before distant land
     if (texCullDepth) {
         IDirect3DSurface9* cullDepthSurface;
         texCullDepth->GetSurfaceLevel(0, &cullDepthSurface);
@@ -215,6 +216,11 @@ void DistantLand::generateHiZPyramid() {
         // Get dimensions of destination mip level
         D3DSURFACE_DESC dstDesc;
         texHiZ->GetLevelDesc(mipLevel, &dstDesc);
+
+        // Stop at 8x8 minimum - don't generate smaller mips
+        if (dstDesc.Width < 8 || dstDesc.Height < 8) {
+            break;
+        }
 
         // Set render target to current mip level
         texHiZ->GetSurfaceLevel(mipLevel, &dstSurf);

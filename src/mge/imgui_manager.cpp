@@ -5,16 +5,33 @@
 bool ImGuiManager::initialized = false;
 bool ImGuiManager::showDemo = false;
 bool ImGuiManager::showPCFInterface = false;
+bool ImGuiManager::showDebugInterface = false;
 HWND ImGuiManager::windowHandle = nullptr;
 
 // PCF filtering variables
 float ImGuiManager::pcfFilterSize = 3.0f;        // Base filter size in texels
 float ImGuiManager::pcfPenumbraScale = 1.0f;     // Scale factor for distance-based penumbra
-float ImGuiManager::pcfMinPenumbra = 2.0f;       // Minimum penumbra size 
+float ImGuiManager::pcfMinPenumbra = 2.0f;       // Minimum penumbra size
 float ImGuiManager::pcfMaxPenumbra = 5.0f;       // Maximum penumbra size
 float ImGuiManager::pcfBias = 0.0015f;           // Depth bias to prevent acne
 float ImGuiManager::pcfBias2 = 0.0045f;          // Second depth bias for lerp
 float ImGuiManager::pcfSlopeBias = 0.001f;       // Slope-based bias to prevent acne on angled surfaces
+
+// Debug interface controls
+bool ImGuiManager::enableRecording = true;
+bool ImGuiManager::enableReplay = true;
+bool ImGuiManager::enableImmediateRendering = true;
+bool ImGuiManager::enableDepthPass = true;
+int ImGuiManager::bboxVisualizationMode = 0;
+
+// Debug stats
+int ImGuiManager::debugRecordedCalls = 0;
+int ImGuiManager::debugRenderedCalls = 0;
+int ImGuiManager::debugCulledCalls = 0;
+int ImGuiManager::debugSceneLights = 0;
+int ImGuiManager::debugVisibleLights = 0;
+int ImGuiManager::debugRecordMWSize = 0;
+int ImGuiManager::debugImmediateCount = 0;
 
 bool ImGuiManager::Initialize(HWND hwnd, IDirect3DDevice9* device) {
     if (initialized) {
@@ -118,6 +135,11 @@ void ImGuiManager::Render() {
     // Show PCF filtering interface
     if (showPCFInterface) {
         RenderPCFFilteringInterface();
+    }
+
+    // Show debug interface
+    if (showDebugInterface) {
+        RenderDebugInterface();
     }
 
     ImGui::Render();
@@ -232,5 +254,86 @@ void ImGuiManager::OnResetDevice() {
         ImGui_ImplDX9_CreateDeviceObjects();
         LOG::logline(">> ImGui device objects recreated");
     }
+}
+
+void ImGuiManager::RenderDebugInterface() {
+    ImGui::SetNextWindowPos(ImVec2(400, 10), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(450, 400), ImGuiCond_FirstUseEver);
+
+    if (ImGui::Begin("HLSL Pipeline Debug", &showDebugInterface, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("Recording/Replay System (Scene 0)");
+        ImGui::Separator();
+
+        // Pass enable/disable controls
+        ImGui::Checkbox("Enable Recording", &enableRecording);
+        ImGui::SameLine();
+        ImGui::Checkbox("Enable Replay", &enableReplay);
+        ImGui::Checkbox("Enable Immediate Rendering (Scene 1+)", &enableImmediateRendering);
+        ImGui::Checkbox("Enable Depth Pass (recordMW)", &enableDepthPass);
+
+        ImGui::Separator();
+        ImGui::Text("Statistics");
+
+        // Recording stats
+        ImGui::Text("Scene 0 (Recorded): %d calls", debugRecordedCalls);
+        ImGui::Text("  Rendered: %d (%.1f%%)", debugRenderedCalls,
+                    debugRecordedCalls > 0 ? (debugRenderedCalls * 100.0f) / debugRecordedCalls : 0.0f);
+        ImGui::Text("  Culled: %d (%.1f%%)", debugCulledCalls,
+                    debugRecordedCalls > 0 ? (debugCulledCalls * 100.0f) / debugRecordedCalls : 0.0f);
+
+        ImGui::Separator();
+
+        // Lighting stats
+        ImGui::Text("Lights:");
+        ImGui::Text("  Scene Lights: %d", debugSceneLights);
+        ImGui::Text("  Visible: %d", debugVisibleLights);
+        ImGui::Text("  Culled: %d", debugSceneLights - debugVisibleLights);
+
+        ImGui::Separator();
+
+        // Depth buffer stats
+        ImGui::Text("Depth Buffer (recordMW): %d geometries", debugRecordMWSize);
+        ImGui::Text("Scene 1+ Immediate Renders: %d", debugImmediateCount);
+
+        ImGui::Separator();
+        ImGui::Text("Bounding Box Visualization");
+
+        const char* bboxModes[] = { "OFF", "Objects (Green=Rendered, Red=Culled)", "Lights (Green=Visible, Red=Culled)" };
+        ImGui::Combo("BBox Mode", &bboxVisualizationMode, bboxModes, 3);
+
+        ImGui::Separator();
+        ImGui::Text("Press G to toggle this interface");
+    }
+    ImGui::End();
+
+    // Update mouse cursor visibility based on interface state
+    ImGuiIO& io = ImGui::GetIO();
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface;
+}
+
+void ImGuiManager::ToggleDebugInterface() {
+    showDebugInterface = !showDebugInterface;
+
+    // Update mouse cursor visibility
+    ImGuiIO& io = ImGui::GetIO();
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface;
+}
+
+// Debug control getters
+bool ImGuiManager::GetEnableRecording() { return enableRecording; }
+bool ImGuiManager::GetEnableReplay() { return enableReplay; }
+bool ImGuiManager::GetEnableImmediateRendering() { return enableImmediateRendering; }
+bool ImGuiManager::GetEnableDepthPass() { return enableDepthPass; }
+int ImGuiManager::GetBBoxVisualizationMode() { return bboxVisualizationMode; }
+
+void ImGuiManager::UpdateDebugStats(int recordedCalls, int renderedCalls, int culledCalls,
+                                     int sceneLights, int visibleLights, int recordMWSize, int immediateCount) {
+    debugRecordedCalls = recordedCalls;
+    debugRenderedCalls = renderedCalls;
+    debugCulledCalls = culledCalls;
+    debugSceneLights = sceneLights;
+    debugVisibleLights = visibleLights;
+    debugRecordMWSize = recordMWSize;
+    debugImmediateCount = immediateCount;
 }
 

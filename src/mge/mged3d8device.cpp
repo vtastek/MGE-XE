@@ -237,6 +237,16 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
             f11Pressed = false;
         }
 
+        // Handle G key for debug interface toggle
+        static bool gPressed = false;
+        bool gState = (GetAsyncKeyState('G') & 0x8000) != 0;
+        if (gState && !gPressed) {
+            ImGuiManager::ToggleDebugInterface();
+            gPressed = true;
+        } else if (!gState) {
+            gPressed = false;
+        }
+
         ImGuiManager::NewFrame();
         ImGuiManager::Render();
         
@@ -352,9 +362,6 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
             // Blend close objects over distant land
             DistantLand::renderStageBlend();
         } else if (!isFrameComplete) {
-            // Everything else except UI
-            DistantLand::renderStage2();
-
             // Draw water if the Morrowind water plane doesn't appear in view
             // it may be too distant or stencil scene order is non-normative
             if (distantWater && !waterDrawn && !isStencilScene) {
@@ -378,6 +385,11 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
     // Finalize any HLSL batch immediately after scene draw calls complete
     // This ensures HLSL replay happens within the same scene, not deferred to next stage
     FixedFunctionShader::finalizeBatchAndReplay(sceneCount);
+
+    // Render depth for Scene 1+ AFTER all geometry has been captured
+    if (!isFrameComplete && sceneCount > 0) {
+        DistantLand::renderStage2();
+    }
 
     return ProxyDevice::EndScene();
 }

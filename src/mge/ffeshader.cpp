@@ -53,6 +53,7 @@ bool FixedFunctionShader::isRecording = false;
 bool FixedFunctionShader::isReplaying = false;
 bool FixedFunctionShader::manualRecordingControl = false;
 bool FixedFunctionShader::recordingEnabled = true;
+bool FixedFunctionShader::recordingCompletedThisFrame = false;
 bool FixedFunctionShader::dumpRequested = false;
 
 // Consistent matrices for entire recording session
@@ -1622,12 +1623,13 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
     }
 
     // Start recording at first HLSL call if not already recording (unless under manual control or disabled)
-    if (!isRecording && !isReplaying && !manualRecordingControl && recordingEnabled) {
+    // Don't restart recording if it already completed this frame (Scene 0 finished)
+    if (!isRecording && !isReplaying && !manualRecordingControl && recordingEnabled && !recordingCompletedThisFrame && ImGuiManager::GetEnableRecording()) {
         startRecording();
     }
 
-    // Always record calls for potential dump
-    if (true) {
+    // If recording is active, record the call for batched replay
+    if (isRecording && ImGuiManager::GetEnableRecording()) {
         // Create a copy of rs and add CURRENT shadow world-view-projection matrices for this draw call
         // During recording, use current matrices; during replay, these will be the "recorded" matrices
         RenderedState rsWithShadows = *rs;
@@ -1643,7 +1645,15 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         return;
     }
 
-    // Normal rendering path (when not recording)
+    // Normal rendering path (when not recording or replaying) - renders immediately
+    if (!ImGuiManager::GetEnableImmediateRendering()) {
+        return;  // Skip immediate rendering if disabled
+    }
+
+    // Set empty light parameters for immediate rendering (hands/UI don't use texture lights)
+    float lightParams[4] = { 0.0f, 0.0f, 0.0f, 0.0f };  // numLights = 0
+    device->SetPixelShaderConstantF(50, lightParams, 1);
+
     renderMorrowindHLSL_Internal(rs, frs, lightrs);
 }
 
@@ -3281,8 +3291,14 @@ void FixedFunctionShader::startRecording() {
 
     recordedCalls.clear();
     lastLightState.reset();  // Clear LightState cache for new recording
+
+    // Clear lights from previous frame (do this at start of new frame, not end of each scene)
+    DistantLand::sceneLights.clear();
+    DistantLand::visibleLights.clear();
+
     isRecording = true;
     isReplaying = false;
+    recordingCompletedThisFrame = false;  // Allow recording to proceed
 
     // Capture view/projection matrices once at start of recording
     // Note: World transforms are captured per-call in each RenderedState
@@ -3347,23 +3363,30 @@ void FixedFunctionShader::finalizeBatchAndReplay(int sceneCount) {
     }
 
     if (recordingEnabled) {
-        // Recording mode: record, replay, and reset for next cycle
-        if (isRecording && !recordedCalls.empty()) {
-            stopRecordingAndReplay();
-        }
+        // Only record/replay Scene 0 (world geometry)
+        // Scene 1+ (hands, sunglare, UI) should render normally without recording
+        if (sceneCount == 0) {
+            // Scene 0: record, replay, and reset for next cycle
+            if (isRecording && !recordedCalls.empty()) {
+                stopRecordingAndReplay();
+            }
 
-        // Ensure clean state for next batch - recording can start fresh next time
-        isRecording = false;
-        isReplaying = false;
-        recordedCalls.clear();
+            // Ensure clean state for next scene - stop recording to exclude hands/UI
+            isRecording = false;
+            isReplaying = false;
+            recordingCompletedThisFrame = true;  // Prevent restarting for Scene 1+
+        } else {
+            // Scene 1+: don't replay, just clear any stale recordings
+            // This ensures hands/UI render normally without HLSL batching
+            recordedCalls.clear();
+        }
     } else {
         // When recording disabled, still clear calls after potential dump
         recordedCalls.clear();
     }
 
-    // Clear lights for next frame
-    DistantLand::sceneLights.clear();
-    DistantLand::visibleLights.clear();
+    // Note: Lights are cleared at start of new frame in startRecording(), not here
+    // This allows lights to persist across all scenes in a frame (Scene 0, Scene 1 hands, etc.)
 
     // Always reset HLSL caches after rendering session completes
     resetHLSLCaches();
@@ -3451,23 +3474,17 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
         return;
     }
 
+    // Check if replay is disabled via ImGui
+    if (!ImGuiManager::GetEnableReplay()) {
+        return;
+    }
+
     isReplaying = true;
 
-    // Use CURRENT view matrix and DEPTH-COMPATIBLE projection matrix for replay
-    // This ensures objects render at current camera position with matching depth values
-    D3DXMATRIX currentView, depthProj;
+    // Get current matrices for culling
+    D3DXMATRIX currentView, currentProj;
     device->GetTransform(D3DTS_VIEW, &currentView);
-    device->GetTransform(D3DTS_PROJECTION, &depthProj);
-
-    // Phase A: Match renderDepth() projection matrix logic for consistent depth values
-    // Use Morrowind's native near plane (near=1.0) to match depth buffer rendering
-    if (Configuration.MGEFlags & USE_DISTANT_LAND) {
-        DistantLand::editProjectionZ(&depthProj, 1.0f, Configuration.DL.DrawDist * DistantLand::kCellSize);
-    }
-    // When distant land is off, use original Morrowind projection (near=1.0)
-
-    device->SetTransform(D3DTS_VIEW, &currentView);
-    device->SetTransform(D3DTS_PROJECTION, &depthProj);
+    device->GetTransform(D3DTS_PROJECTION, &currentProj);
 
     // Temporarily set shadow matrices to recording state
     D3DXMATRIX savedShadowViewproj[2];
@@ -3506,7 +3523,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     }
 
     // Calculate view-projection matrix for Hi-Z culling
-    D3DXMATRIX viewProj = currentView * depthProj;
+    D3DXMATRIX viewProj = currentView * currentProj;
 
     // Cull lights against Hi-Z pyramid and upload to texture
     DistantLand::cullSceneLights(viewProj);
@@ -3598,20 +3615,15 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
                  totalCalls > 0 ? (culledCalls * 100.0f) / totalCalls : 0.0f,
                  renderedCalls);
 
-    // Debug visualization: Render bounding boxes with color-coded status
-    // Cycle with 'B' key: 0=none, 1=culled objects only, 2=lights only
-    static int debugBBoxMode = 0;
-    static bool wasBPressed = false;
-    if (GetAsyncKeyState('B') & 0x8000) {
-        if (!wasBPressed) {
-            debugBBoxMode = (debugBBoxMode + 1) % 3;
-            const char* modeNames[] = {"OFF", "CULLED ONLY", "LIGHTS ONLY"};
-            LOG::logline(">> BBox visualization: %s", modeNames[debugBBoxMode]);
-            wasBPressed = true;
-        }
-    } else {
-        wasBPressed = false;
-    }
+    // Update ImGui debug stats
+    ImGuiManager::UpdateDebugStats(
+        totalCalls, renderedCalls, culledCalls,
+        (int)DistantLand::sceneLights.size(), numLights,
+        (int)DistantLand::recordMW.size(), 0  // immediateCount will be updated in finalizeBatchAndReplay
+    );
+
+    // Debug visualization: Render bounding boxes with color-coded status from ImGui
+    int debugBBoxMode = ImGuiManager::GetBBoxVisualizationMode();
 
     if (debugBBoxMode > 0) {
         // Save render states
@@ -3636,7 +3648,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
         D3DXMatrixIdentity(&identity);
         device->SetTransform(D3DTS_WORLD, &identity);
         device->SetTransform(D3DTS_VIEW, &currentView);
-        device->SetTransform(D3DTS_PROJECTION, &depthProj);
+        device->SetTransform(D3DTS_PROJECTION, &currentProj);
 
         // Helper to draw bbox edges
         auto drawBBox = [&](const D3DXVECTOR3& bmin, const D3DXVECTOR3& bmax, D3DCOLOR color) {

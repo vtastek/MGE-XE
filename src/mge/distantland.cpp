@@ -7,6 +7,7 @@
 #include "postshaders.h"
 #include "mwbridge.h"
 #include "ffeshader.h"
+#include "imgui_manager.h"
 
 
 
@@ -15,10 +16,15 @@ using std::unordered_map;
 
 // renderStage0 - Render distant land at beginning of scene 0, after sky
 void DistantLand::renderStage0() {
+    static int frameNumber = 0;
+    LOG::logline("======== FRAME %d START (Scene 0) ========", ++frameNumber);
+
     auto mwBridge = MWBridge::get();
     IDirect3DStateBlock9* stateSaved;
     UINT passes;
 
+    // Reset recording flag for new frame (Scene 0 starts a new frame)
+    FixedFunctionShader::resetRecordingCompletedFlag();
 
     // Update current cell and select distant static set
     selectDistantCell();
@@ -185,7 +191,9 @@ void DistantLand::renderStage1() {
 
         // Depth texture from recorded renders and distant land
         effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
-        renderDepth();
+        if (ImGuiManager::GetEnableDepthPass()) {
+            renderDepth();
+        }
         effectDepth->End();
 
         // Phase A: Resolve MSAA depth frame to non-MSAA texture for post-processing
@@ -237,15 +245,18 @@ void DistantLand::renderStage2() {
 
         // Depth texture from recorded renders
         effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
-        renderDepthAdditional();
+        if (ImGuiManager::GetEnableDepthPass()) {
+            renderDepthAdditional();
+        }
         effectDepth->End();
 
         // Restore state
         stateSaved->Apply();
         stateSaved->Release();
-    }
 
-    recordMW.clear();
+        // Clear recordMW for next scene's depth pass
+        recordMW.clear();
+    }
 }
 
 
@@ -913,6 +924,16 @@ void DistantLand::setSunLight(const D3DLIGHT8* s) {
 // Can also replace selected fixed function calls with an augmented shader
 bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
     auto mwBridge = MWBridge::get();
+
+    // Log Scene 1+ draws to debug hand rendering
+    static int scene1DrawCount = 0;
+    if (sceneCount >= 1) {
+        scene1DrawCount++;
+        if (scene1DrawCount <= 5) {
+            LOG::logline(">> Scene %d draw #%d: zWrite=%d, blendEnable=%d, alphaTest=%d",
+                         sceneCount, scene1DrawCount, rs->zWrite, rs->blendEnable, rs->alphaTest);
+        }
+    }
 
     // Avoid recording landscape alpha blend drawcalls, a form of multi-pass splatting
     static IDirect3DVertexBuffer9* lastVB = nullptr;
