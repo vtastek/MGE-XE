@@ -186,7 +186,7 @@ void DistantLand::generateHiZPyramid() {
         return;
     }
 
-    LOG::logline("Hi-Z: Generating pyramid with %d mip levels (optimized mip chain method)", hiZLevels);
+    // Removed verbose logging - Hi-Z pyramid generation is silent unless errors occur
 
     // Save current render targets explicitly
     IDirect3DSurface9* savedRT0;
@@ -194,71 +194,11 @@ void DistantLand::generateHiZPyramid() {
     device->GetRenderTarget(0, &savedRT0);
     device->GetDepthStencilSurface(&savedDepthStencil);
 
-    // Step 1: Compile shaders for MAX downsampling
+    // Use cached shaders (compiled once during initialization, not per-frame!)
     IDirect3DSurface9* dstSurf;
-    D3DXHANDLE hTechnique = effectHiZ->GetTechniqueByName("T0");
-    D3DXHANDLE hPass = effectHiZ->GetPass(hTechnique, 0);
 
-    D3DXPASS_DESC passDesc;
-    effectHiZ->GetPassDesc(hPass, &passDesc);
-
-    // Get vertex and pixel shaders from the pass
-    IDirect3DVertexShader9* vs = nullptr;
-    IDirect3DPixelShader9* ps = nullptr;
-
-    // Compile shaders from effect
-    ID3DXBuffer* vsCode = nullptr;
-    ID3DXBuffer* psCode = nullptr;
-    ID3DXBuffer* vsErrors = nullptr;
-    ID3DXBuffer* psErrors = nullptr;
-
-    const char* vsSource =
-        "float4 main(float4 pos : POSITION, out float2 oTex : TEXCOORD0) : POSITION {\n"
-        "    oTex = float2(pos.x * 0.5 + 0.5, -pos.y * 0.5 + 0.5);\n"
-        "    return pos;\n"
-        "}\n";
-
-    HRESULT hrVS = D3DXCompileShader(
-        vsSource, strlen(vsSource),
-        NULL, NULL, "main", "vs_3_0", 0, &vsCode, &vsErrors, NULL
-    );
-
-    if (FAILED(hrVS) && vsErrors) {
-        LOG::logline("!! Hi-Z VS compile error: %s", (char*)vsErrors->GetBufferPointer());
-        vsErrors->Release();
-    }
-
-    const char* psSource =
-        "sampler2D sampDepth : register(s0);\n"
-        "float4 texelSize : register(c0);\n"
-        "float4 main(float2 tex : TEXCOORD0) : COLOR0 {\n"
-        "    float d0 = tex2D(sampDepth, tex).r;\n"
-        "    float d1 = tex2D(sampDepth, tex + float2(texelSize.x, 0)).r;\n"
-        "    float d2 = tex2D(sampDepth, tex + float2(0, texelSize.y)).r;\n"
-        "    float d3 = tex2D(sampDepth, tex + texelSize.xy).r;\n"
-        "    float maxDepth = max(max(d0, d1), max(d2, d3));\n"
-        "    return float4(maxDepth, maxDepth, maxDepth, 1.0);\n"
-        "}\n";
-
-    HRESULT hrPS = D3DXCompileShader(psSource, strlen(psSource), NULL, NULL, "main", "ps_3_0", 0, &psCode, &psErrors, NULL);
-
-    if (FAILED(hrPS) && psErrors) {
-        LOG::logline("!! Hi-Z PS compile error: %s", (char*)psErrors->GetBufferPointer());
-        psErrors->Release();
-    }
-
-    LOG::logline("Hi-Z shader compilation: VS=%s PS=%s", SUCCEEDED(hrVS) ? "OK" : "FAIL", SUCCEEDED(hrPS) ? "OK" : "FAIL");
-
-    if (vsCode) device->CreateVertexShader((DWORD*)vsCode->GetBufferPointer(), &vs);
-    if (psCode) device->CreatePixelShader((DWORD*)psCode->GetBufferPointer(), &ps);
-
-    if (vsCode) vsCode->Release();
-    if (psCode) psCode->Release();
-
-    if (!vs || !ps) {
-        LOG::logline("!! Hi-Z: Failed to compile shaders");
-        if (vs) vs->Release();
-        if (ps) ps->Release();
+    if (!vsHiZ || !psHiZ) {
+        LOG::logline("!! Hi-Z: Shaders not initialized (vsHiZ=%p psHiZ=%p)", vsHiZ, psHiZ);
         device->SetRenderTarget(0, savedRT0);
         device->SetDepthStencilSurface(savedDepthStencil);
         savedRT0->Release();
@@ -266,11 +206,11 @@ void DistantLand::generateHiZPyramid() {
         return;
     }
 
-    // Set shaders
-    device->SetVertexShader(vs);
-    device->SetPixelShader(ps);
+    // Set cached shaders
+    device->SetVertexShader(vsHiZ);
+    device->SetPixelShader(psHiZ);
 
-    // Step 2: Generate all mip levels using MAX downsampling shader
+    // Generate all mip levels using MAX downsampling shader
     for (int mipLevel = 0; mipLevel < hiZLevels; mipLevel++) {
         // Get dimensions of destination mip level
         D3DSURFACE_DESC dstDesc;
@@ -324,18 +264,14 @@ void DistantLand::generateHiZPyramid() {
         device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
 
         dstSurf->Release();
-
-        LOG::logline("Hi-Z mip %d: %dx%d, texelSize=(%.6f, %.6f)", mipLevel, dstDesc.Width, dstDesc.Height, texelSize[0], texelSize[1]);
     }
 
     // Reset sampler state
     device->SetSamplerState(0, D3DSAMP_MAXMIPLEVEL, 0);
 
-    // Cleanup
+    // Cleanup (don't release cached shaders - they're reused every frame!)
     device->SetVertexShader(NULL);
     device->SetPixelShader(NULL);
-    vs->Release();
-    ps->Release();
 
     // Restore render targets explicitly
     device->SetRenderTarget(0, savedRT0);
@@ -344,6 +280,7 @@ void DistantLand::generateHiZPyramid() {
     if (savedDepthStencil) savedDepthStencil->Release();
 
     // Step 3: Copy entire Hi-Z mip chain to staging texture for CPU readback
+    // Note: GetRenderTargetData is synchronous - each call blocks until GPU completes that copy
     for (int mipLevel = 0; mipLevel < hiZLevels; mipLevel++) {
         IDirect3DSurface9* srcSurf = nullptr;
         IDirect3DSurface9* dstSurf = nullptr;
@@ -364,18 +301,6 @@ void DistantLand::generateHiZPyramid() {
         }
     }
 
-    // Force GPU to complete all operations before staging texture is accessed
-    // This prevents heap corruption when cullAgainstHiZ() locks the staging texture
-    IDirect3DQuery9* eventQuery = nullptr;
-    if (SUCCEEDED(device->CreateQuery(D3DQUERYTYPE_EVENT, &eventQuery))) {
-        eventQuery->Issue(D3DISSUE_END);
-        // Wait for GPU to complete
-        while (eventQuery->GetData(nullptr, 0, D3DGETDATA_FLUSH) == S_FALSE) {
-            // Spin-wait for GPU completion
-        }
-        eventQuery->Release();
-    }
-
     // Debug: Sample a few depth values from mip 0 to verify Hi-Z content
     static bool loggedOnce = false;
     if (!loggedOnce && texHiZStaging) {
@@ -393,7 +318,7 @@ void DistantLand::generateHiZPyramid() {
             float bl = data[(desc.Height-1) * stride];
             float br = data[(desc.Height-1) * stride + (desc.Width-1)];
 
-            LOG::logline("Hi-Z Mip0 samples: center=%.2f, TL=%.2f, TR=%.2f, BL=%.2f, BR=%.2f", center, tl, tr, bl, br);
+            // Removed debug mip0 sampling logging
             texHiZStaging->UnlockRect(0);
             loggedOnce = true;
         }
@@ -422,7 +347,7 @@ bool DistantLand::cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& 
     float maxLinearDepth = -1e10f;
     bool anyInFront = false;
     bool anyBehindCamera = false;
-    float cornerDepths[8];  // Store all corner depths for detailed logging
+    float cornerDepths[8];
 
     for (int i = 0; i < 8; i++) {
         D3DXVECTOR4 clipPos;
@@ -433,8 +358,6 @@ bool DistantLand::cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& 
             float invW = 1.0f / clipPos.w;
             float ndcX = clipPos.x * invW;
             float ndcY = clipPos.y * invW;
-
-            // Store linear depth (clipPos.w is view-space Z, which is linear depth)
             float linearDepth = clipPos.w;
             cornerDepths[i] = linearDepth;
 
@@ -449,16 +372,16 @@ bool DistantLand::cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& 
             maxLinearDepth = std::max(maxLinearDepth, linearDepth);
         } else {
             anyBehindCamera = true;
-            cornerDepths[i] = -1.0f;  // Mark as behind camera
+            cornerDepths[i] = -1.0f;
         }
     }
 
     if (!anyInFront) return false;
 
-    // If any corners are behind the camera, object intersects near plane - never cull
+    // If any corners behind camera, object intersects near plane - never cull
     if (anyBehindCamera) {
         if (debugLog) {
-            LOG::logline("Hi-Z Debug: Object intersects near plane (corners behind camera) - forced visible");
+            LOG::logline("Hi-Z Debug: Object intersects near plane - forced visible");
         }
         return false;
     }
@@ -480,11 +403,13 @@ bool DistantLand::cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& 
     float boxHeight = (maxY - minY) * desc.Height;
     float boxSize = std::max(boxWidth, boxHeight);
 
-    // Select mip level based on bbox screen size
-    // TEMPORARY FIX: Use mip 0 (full resolution) always for accuracy
-    // The mip selection was causing false positives by sampling too coarse a region
-    // TODO: Implement proper hierarchical sampling with correct mip selection
+    // Select mip level: target ~6 pixels at selected mip for good coverage
+    // Add -1 mip bias to use higher resolution (one mip level lower/more detailed)
     int mipLevel = 0;
+    if (boxSize > 8.0f) {
+        mipLevel = (int)std::floor(std::log2(boxSize / 6.0f)) - 1;
+        mipLevel = std::max(0, std::min(hiZLevels - 1, mipLevel));
+    }
 
     // Lock the staging texture at selected mip level
     D3DLOCKED_RECT lr;
@@ -508,7 +433,7 @@ bool DistantLand::cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& 
     pixelMinY = std::max(0, std::min((int)desc.Height - 1, pixelMinY));
     pixelMaxY = std::max(0, std::min((int)desc.Height - 1, pixelMaxY));
 
-    // Sample ALL Hi-Z pixels covered by bbox and find maximum depth
+    // Sample ALL Hi-Z pixels in bbox region and find maximum depth
     float* depthData = (float*)lr.pBits;
     int pitch = lr.Pitch / sizeof(float);
     float maxHiZDepth = 0.0f;
@@ -526,37 +451,20 @@ bool DistantLand::cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& 
 
     texHiZStaging->UnlockRect(mipLevel);
 
-    // Proper Hi-Z occlusion test with intersection detection:
-    // Hi-Z stores MAXIMUM depth (furthest visible point per pixel)
-    // We found maxHiZDepth = furthest visible point in bbox's screen region
-    //
-    // Three cases:
-    // 1. All corners behind Hi-Z (minLinearDepth > maxHiZDepth) → completely occluded, CULL
-    // 2. All corners in front of Hi-Z (maxLinearDepth < maxHiZDepth) → completely visible, RENDER
-    // 3. Some corners in front, some behind → INTERSECTING Hi-Z surface, RENDER (partially visible)
-    //
-    // So we only cull if minLinearDepth > maxHiZDepth (all corners behind)
-    float bias = 10.0f; // Conservative bias for depth precision and bbox padding
+    // Occlusion test: if closest bbox corner is behind furthest visible depth, cull
+    // Increased bias to handle depth precision errors and bbox expansion padding
+    float bias = 20.0f;
     bool culled = minLinearDepth > maxHiZDepth + bias;
 
     if (debugLog && culled) {
-        // Only log when object is CULLED (false positive candidates)
         LOG::logline("Hi-Z Debug CULLED: minDepth=%.4f, maxDepth=%.4f, maxHiZ=%.4f, mip=%d, region=[%d,%d]->[%d,%d]",
                      minLinearDepth, maxLinearDepth, maxHiZDepth, mipLevel, pixelMinX, pixelMinY, pixelMaxX, pixelMaxY);
-
-        // Log all 8 corner depths for detailed analysis
         LOG::logline("  Corner depths: [0]=%.2f [1]=%.2f [2]=%.2f [3]=%.2f [4]=%.2f [5]=%.2f [6]=%.2f [7]=%.2f",
                      cornerDepths[0], cornerDepths[1], cornerDepths[2], cornerDepths[3],
                      cornerDepths[4], cornerDepths[5], cornerDepths[6], cornerDepths[7]);
-
-        // Log Hi-Z depth range and pixel count
         LOG::logline("  Hi-Z depth range: min=%.4f max=%.4f (%d pixels sampled)", minHiZDepth, maxHiZDepth, pixelCount);
-
-        // Log screen-space bounds
         LOG::logline("  Screen bounds: X=[%.3f,%.3f] Y=[%.3f,%.3f] size=%.1fx%.1f pixels",
                      minX, maxX, minY, maxY, boxWidth, boxHeight);
-
-        // Log bbox world coordinates
         LOG::logline("  BBox: min=(%.1f,%.1f,%.1f) max=(%.1f,%.1f,%.1f)",
                      bboxMin.x, bboxMin.y, bboxMin.z, bboxMax.x, bboxMax.y, bboxMax.z);
     }

@@ -60,6 +60,9 @@ D3DXMATRIX FixedFunctionShader::recordingDeviceView;
 D3DXMATRIX FixedFunctionShader::recordingDeviceProj;
 D3DXMATRIX FixedFunctionShader::recordingShadowViewproj[2];
 
+// Bbox cache: persists across frames for fast object-space bbox lookup
+std::unordered_map<FixedFunctionShader::MeshKey, FixedFunctionShader::ObjectSpaceBBox, FixedFunctionShader::MeshKeyHash> FixedFunctionShader::bboxCache;
+
 // Material state cache static member
 FixedFunctionShader::MaterialStateCache FixedFunctionShader::materialCache;
 
@@ -3722,13 +3725,75 @@ bool FixedFunctionShader::computeBoundingBox(const RenderedState* rs, D3DXVECTOR
         return false;
     }
 
-    if (debugBBox && debugCount > 0) {
-        LOG::logline(">> computeBBox: has VB=%p, fvf=0x%X, stride=%d", rs->vb, rs->fvf, rs->vbStride);
+    // Determine position offset in vertex structure (FVF formats always have position first if XYZ is present)
+    bool hasPosition = (rs->fvf & D3DFVF_POSITION_MASK) != 0;
+    if (!hasPosition) {
+        if (debugBBox && debugCount > 0) {
+            LOG::logline("!! computeBBox: no position in FVF (fvf=0x%X, mask=0x%X)", rs->fvf, D3DFVF_POSITION_MASK);
+            debugCount--;
+        }
+        return false;
     }
 
-    // Initialize bounds
-    bboxMin = D3DXVECTOR3(1e10f, 1e10f, 1e10f);
-    bboxMax = D3DXVECTOR3(-1e10f, -1e10f, -1e10f);
+    // Create mesh key for cache lookup
+    MeshKey key;
+    key.vb = rs->vb;
+    key.ib = rs->ib;
+    key.fvf = rs->fvf;
+    key.baseIndex = rs->baseIndex;
+    key.vertCount = rs->vertCount;
+    key.startIndex = rs->startIndex;
+    key.primCount = rs->primCount;
+
+    // Check cache first
+    auto it = bboxCache.find(key);
+    if (it != bboxCache.end()) {
+        // Cache hit! Transform cached object-space bbox to world-space
+        const ObjectSpaceBBox& objBBox = it->second;
+
+        // Transform 8 corners of object-space bbox by world matrix
+        D3DXVECTOR3 corners[8] = {
+            D3DXVECTOR3(objBBox.bboxMin.x, objBBox.bboxMin.y, objBBox.bboxMin.z),
+            D3DXVECTOR3(objBBox.bboxMax.x, objBBox.bboxMin.y, objBBox.bboxMin.z),
+            D3DXVECTOR3(objBBox.bboxMin.x, objBBox.bboxMax.y, objBBox.bboxMin.z),
+            D3DXVECTOR3(objBBox.bboxMax.x, objBBox.bboxMax.y, objBBox.bboxMin.z),
+            D3DXVECTOR3(objBBox.bboxMin.x, objBBox.bboxMin.y, objBBox.bboxMax.z),
+            D3DXVECTOR3(objBBox.bboxMax.x, objBBox.bboxMin.y, objBBox.bboxMax.z),
+            D3DXVECTOR3(objBBox.bboxMin.x, objBBox.bboxMax.y, objBBox.bboxMax.z),
+            D3DXVECTOR3(objBBox.bboxMax.x, objBBox.bboxMax.y, objBBox.bboxMax.z),
+        };
+
+        bboxMin = D3DXVECTOR3(1e10f, 1e10f, 1e10f);
+        bboxMax = D3DXVECTOR3(-1e10f, -1e10f, -1e10f);
+
+        for (int i = 0; i < 8; i++) {
+            D3DXVECTOR3 worldCorner;
+            D3DXVec3TransformCoord(&worldCorner, &corners[i], &rs->worldTransforms[0]);
+
+            bboxMin.x = std::min(bboxMin.x, worldCorner.x);
+            bboxMin.y = std::min(bboxMin.y, worldCorner.y);
+            bboxMin.z = std::min(bboxMin.z, worldCorner.z);
+            bboxMax.x = std::max(bboxMax.x, worldCorner.x);
+            bboxMax.y = std::max(bboxMax.y, worldCorner.y);
+            bboxMax.z = std::max(bboxMax.z, worldCorner.z);
+        }
+
+        if (debugBBox && debugCount > 0) {
+            LOG::logline(">> computeBBox: CACHE HIT! world bbox=[%.2f,%.2f,%.2f] to [%.2f,%.2f,%.2f]",
+                bboxMin.x, bboxMin.y, bboxMin.z, bboxMax.x, bboxMax.y, bboxMax.z);
+            debugCount--;
+        }
+
+        return true;
+    }
+
+    // Cache miss - compute object-space bbox and cache it
+    if (debugBBox && debugCount > 0) {
+        LOG::logline(">> computeBBox: CACHE MISS - computing from vertices, VB=%p, fvf=0x%X, stride=%d", rs->vb, rs->fvf, rs->vbStride);
+    }
+
+    D3DXVECTOR3 objBBoxMin(1e10f, 1e10f, 1e10f);
+    D3DXVECTOR3 objBBoxMax(-1e10f, -1e10f, -1e10f);
 
     // Lock vertex buffer to read position data
     void* pVertices = nullptr;
@@ -3752,24 +3817,10 @@ bool FixedFunctionShader::computeBoundingBox(const RenderedState* rs, D3DXVECTOR
         return false;
     }
 
-    // Determine position offset in vertex structure (FVF formats always have position first if XYZ is present)
-    bool hasPosition = (rs->fvf & D3DFVF_POSITION_MASK) != 0;
-    if (!hasPosition) {
-        if (debugBBox && debugCount > 0) {
-            LOG::logline("!! computeBBox: no position in FVF (fvf=0x%X, mask=0x%X)", rs->fvf, D3DFVF_POSITION_MASK);
-            debugCount--;
-        }
-        rs->vb->Unlock();
-        return false;
-    }
-
     // For indexed primitives, we need to check all referenced vertices
     // Lock index buffer to determine which vertices to check
     void* pIndices = nullptr;
     if (rs->ib) {
-        if (debugBBox && debugCount > 0) {
-            LOG::logline(">> computeBBox: has IB=%p, attempting lock", rs->ib);
-        }
         hr = rs->ib->Lock(0, 0, &pIndices, D3DLOCK_READONLY);
         if (FAILED(hr)) {
             if (debugBBox && debugCount > 0) {
@@ -3778,9 +3829,6 @@ bool FixedFunctionShader::computeBoundingBox(const RenderedState* rs, D3DXVECTOR
             }
             rs->vb->Unlock();
             return false;
-        }
-        if (debugBBox && debugCount > 0) {
-            LOG::logline(">> computeBBox: IB locked successfully");
         }
 
         // Determine index format (16-bit or 32-bit)
@@ -3804,10 +3852,6 @@ bool FixedFunctionShader::computeBoundingBox(const RenderedState* rs, D3DXVECTOR
                 return false;
         }
 
-        if (debugBBox && debugCount > 0) {
-            LOG::logline(">> computeBBox: primType=%d, primCount=%d, indexCount=%d", rs->primType, rs->primCount, indexCount);
-        }
-
         for (UINT i = 0; i < indexCount; i++) {
             UINT vertexIndex;
             if (is16Bit) {
@@ -3816,20 +3860,16 @@ bool FixedFunctionShader::computeBoundingBox(const RenderedState* rs, D3DXVECTOR
                 vertexIndex = ((DWORD*)pIndices)[rs->startIndex + i] + rs->ibBase;
             }
 
-            // Get vertex position (positions are always at offset 0 in FVF)
+            // Get vertex position (positions are always at offset 0 in FVF) - object space
             BYTE* vertexData = ((BYTE*)pVertices) + vertexIndex * stride;
             D3DXVECTOR3* pos = (D3DXVECTOR3*)vertexData;
 
-            // Transform by world matrix to get world-space bounds
-            D3DXVECTOR3 worldPos;
-            D3DXVec3TransformCoord(&worldPos, pos, &rs->worldTransforms[0]);
-
-            bboxMin.x = std::min(bboxMin.x, worldPos.x);
-            bboxMin.y = std::min(bboxMin.y, worldPos.y);
-            bboxMin.z = std::min(bboxMin.z, worldPos.z);
-            bboxMax.x = std::max(bboxMax.x, worldPos.x);
-            bboxMax.y = std::max(bboxMax.y, worldPos.y);
-            bboxMax.z = std::max(bboxMax.z, worldPos.z);
+            objBBoxMin.x = std::min(objBBoxMin.x, pos->x);
+            objBBoxMin.y = std::min(objBBoxMin.y, pos->y);
+            objBBoxMin.z = std::min(objBBoxMin.z, pos->z);
+            objBBoxMax.x = std::max(objBBoxMax.x, pos->x);
+            objBBoxMax.y = std::max(objBBoxMax.y, pos->y);
+            objBBoxMax.z = std::max(objBBoxMax.z, pos->z);
         }
 
         rs->ib->Unlock();
@@ -3840,35 +3880,68 @@ bool FixedFunctionShader::computeBoundingBox(const RenderedState* rs, D3DXVECTOR
             BYTE* vertexData = ((BYTE*)pVertices) + (rs->baseIndex + i) * stride;
             D3DXVECTOR3* pos = (D3DXVECTOR3*)vertexData;
 
-            // Transform by world matrix to get world-space bounds
-            D3DXVECTOR3 worldPos;
-            D3DXVec3TransformCoord(&worldPos, pos, &rs->worldTransforms[0]);
-
-            bboxMin.x = std::min(bboxMin.x, worldPos.x);
-            bboxMin.y = std::min(bboxMin.y, worldPos.y);
-            bboxMin.z = std::min(bboxMin.z, worldPos.z);
-            bboxMax.x = std::max(bboxMax.x, worldPos.x);
-            bboxMax.y = std::max(bboxMax.y, worldPos.y);
-            bboxMax.z = std::max(bboxMax.z, worldPos.z);
+            objBBoxMin.x = std::min(objBBoxMin.x, pos->x);
+            objBBoxMin.y = std::min(objBBoxMin.y, pos->y);
+            objBBoxMin.z = std::min(objBBoxMin.z, pos->z);
+            objBBoxMax.x = std::max(objBBoxMax.x, pos->x);
+            objBBoxMax.y = std::max(objBBoxMax.y, pos->y);
+            objBBoxMax.z = std::max(objBBoxMax.z, pos->z);
         }
     }
 
     rs->vb->Unlock();
 
-    // Validate bounding box
-    bool valid = (bboxMin.x <= bboxMax.x && bboxMin.y <= bboxMax.y && bboxMin.z <= bboxMax.z);
+    // Validate object-space bounding box
+    bool valid = (objBBoxMin.x <= objBBoxMax.x && objBBoxMin.y <= objBBoxMax.y && objBBoxMin.z <= objBBoxMax.z);
+    if (!valid) {
+        if (debugBBox && debugCount > 0) {
+            LOG::logline("!! computeBBox: INVALID object bbox! min=[%.2f,%.2f,%.2f] max=[%.2f,%.2f,%.2f]",
+                objBBoxMin.x, objBBoxMin.y, objBBoxMin.z, objBBoxMax.x, objBBoxMax.y, objBBoxMax.z);
+            debugCount--;
+        }
+        return false;
+    }
+
+    // Cache the object-space bbox
+    ObjectSpaceBBox cachedBBox;
+    cachedBBox.bboxMin = objBBoxMin;
+    cachedBBox.bboxMax = objBBoxMax;
+    bboxCache[key] = cachedBBox;
+
+    // Transform 8 corners to world space
+    D3DXVECTOR3 corners[8] = {
+        D3DXVECTOR3(objBBoxMin.x, objBBoxMin.y, objBBoxMin.z),
+        D3DXVECTOR3(objBBoxMax.x, objBBoxMin.y, objBBoxMin.z),
+        D3DXVECTOR3(objBBoxMin.x, objBBoxMax.y, objBBoxMin.z),
+        D3DXVECTOR3(objBBoxMax.x, objBBoxMax.y, objBBoxMin.z),
+        D3DXVECTOR3(objBBoxMin.x, objBBoxMin.y, objBBoxMax.z),
+        D3DXVECTOR3(objBBoxMax.x, objBBoxMin.y, objBBoxMax.z),
+        D3DXVECTOR3(objBBoxMin.x, objBBoxMax.y, objBBoxMax.z),
+        D3DXVECTOR3(objBBoxMax.x, objBBoxMax.y, objBBoxMax.z),
+    };
+
+    bboxMin = D3DXVECTOR3(1e10f, 1e10f, 1e10f);
+    bboxMax = D3DXVECTOR3(-1e10f, -1e10f, -1e10f);
+
+    for (int i = 0; i < 8; i++) {
+        D3DXVECTOR3 worldCorner;
+        D3DXVec3TransformCoord(&worldCorner, &corners[i], &rs->worldTransforms[0]);
+
+        bboxMin.x = std::min(bboxMin.x, worldCorner.x);
+        bboxMin.y = std::min(bboxMin.y, worldCorner.y);
+        bboxMin.z = std::min(bboxMin.z, worldCorner.z);
+        bboxMax.x = std::max(bboxMax.x, worldCorner.x);
+        bboxMax.y = std::max(bboxMax.y, worldCorner.y);
+        bboxMax.z = std::max(bboxMax.z, worldCorner.z);
+    }
 
     if (debugBBox && debugCount > 0) {
-        if (valid) {
-            LOG::logline(">> computeBBox: SUCCESS! bbox=[%.2f,%.2f,%.2f] to [%.2f,%.2f,%.2f]",
-                bboxMin.x, bboxMin.y, bboxMin.z, bboxMax.x, bboxMax.y, bboxMax.z);
-        } else {
-            LOG::logline("!! computeBBox: INVALID bbox! min=[%.2f,%.2f,%.2f] max=[%.2f,%.2f,%.2f]",
-                bboxMin.x, bboxMin.y, bboxMin.z, bboxMax.x, bboxMax.y, bboxMax.z);
-        }
+        LOG::logline(">> computeBBox: CACHED! obj=[%.2f,%.2f,%.2f] to [%.2f,%.2f,%.2f], world=[%.2f,%.2f,%.2f] to [%.2f,%.2f,%.2f]",
+            objBBoxMin.x, objBBoxMin.y, objBBoxMin.z, objBBoxMax.x, objBBoxMax.y, objBBoxMax.z,
+            bboxMin.x, bboxMin.y, bboxMin.z, bboxMax.x, bboxMax.y, bboxMax.z);
         debugCount--;
     }
 
-    return valid;
+    return true;
 }
 

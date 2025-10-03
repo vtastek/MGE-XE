@@ -108,6 +108,8 @@ public:
     static IDirect3DTexture9* texHiZ; // Hi-Z pyramid with full mip chain
     static IDirect3DTexture9* texHiZStaging; // Staging texture for CPU readback (with mip chain)
     static ID3DXEffect* effectHiZ; // Shader effect for Hi-Z downsample
+    static IDirect3DVertexShader9* vsHiZ; // Cached Hi-Z vertex shader (compiled once)
+    static IDirect3DPixelShader9* psHiZ; // Cached Hi-Z pixel shader (compiled once)
     static int hiZLevels; // Number of levels in Hi-Z pyramid
     static IDirect3DTexture9* texDistantBlend;
     static IDirect3DTexture9* texReflection;

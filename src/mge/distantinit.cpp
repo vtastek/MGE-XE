@@ -72,6 +72,8 @@ IDirect3DTexture9* DistantLand::texCullDepth;
 IDirect3DTexture9* DistantLand::texHiZ;
 IDirect3DTexture9* DistantLand::texHiZStaging;
 ID3DXEffect* DistantLand::effectHiZ;
+IDirect3DVertexShader9* DistantLand::vsHiZ = nullptr;
+IDirect3DPixelShader9* DistantLand::psHiZ = nullptr;
 int DistantLand::hiZLevels;
 IDirect3DTexture9* DistantLand::texDistantBlend;
 IDirect3DTexture9* DistantLand::texReflection;
@@ -713,6 +715,64 @@ bool DistantLand::initHiZ() {
     hr = D3DXCreateEffectFromFile(device, shaderPath.c_str(), NULL, NULL, D3DXSHADER_OPTIMIZATION_LEVEL3, effectPool, &effectHiZ, NULL);
     if (hr != D3D_OK) {
         LOG::logline("!! Failed to load Hi-Z shader: %s", shaderPath.c_str());
+        return false;
+    }
+
+    // Compile Hi-Z shaders once during initialization (not per-frame!)
+    const char* vsSource =
+        "float4 main(float4 pos : POSITION, out float2 oTex : TEXCOORD0) : POSITION {\n"
+        "    oTex = float2(pos.x * 0.5 + 0.5, -pos.y * 0.5 + 0.5);\n"
+        "    return pos;\n"
+        "}\n";
+
+    const char* psSource =
+        "sampler2D sampDepth : register(s0);\n"
+        "float4 texelSize : register(c0);\n"
+        "float4 main(float2 tex : TEXCOORD0) : COLOR0 {\n"
+        "    // Standard 2x2 max downsampling (no dilation to preserve gaps)\n"
+        "    float d0 = tex2D(sampDepth, tex).r;\n"
+        "    float d1 = tex2D(sampDepth, tex + float2(texelSize.x, 0)).r;\n"
+        "    float d2 = tex2D(sampDepth, tex + float2(0, texelSize.y)).r;\n"
+        "    float d3 = tex2D(sampDepth, tex + texelSize.xy).r;\n"
+        "    float maxDepth = max(max(d0, d1), max(d2, d3));\n"
+        "    return float4(maxDepth, maxDepth, maxDepth, 1.0);\n"
+        "}\n";
+
+    ID3DXBuffer* vsCode = nullptr;
+    ID3DXBuffer* psCode = nullptr;
+    ID3DXBuffer* vsErrors = nullptr;
+    ID3DXBuffer* psErrors = nullptr;
+
+    HRESULT hrVS = D3DXCompileShader(vsSource, strlen(vsSource), NULL, NULL, "main", "vs_3_0", 0, &vsCode, &vsErrors, NULL);
+    if (FAILED(hrVS)) {
+        if (vsErrors) {
+            LOG::logline("!! Hi-Z VS compile error: %s", (char*)vsErrors->GetBufferPointer());
+            vsErrors->Release();
+        }
+        return false;
+    }
+
+    HRESULT hrPS = D3DXCompileShader(psSource, strlen(psSource), NULL, NULL, "main", "ps_3_0", 0, &psCode, &psErrors, NULL);
+    if (FAILED(hrPS)) {
+        if (psErrors) {
+            LOG::logline("!! Hi-Z PS compile error: %s", (char*)psErrors->GetBufferPointer());
+            psErrors->Release();
+        }
+        if (vsCode) vsCode->Release();
+        return false;
+    }
+
+    // Create shader objects
+    if (vsCode) device->CreateVertexShader((DWORD*)vsCode->GetBufferPointer(), &vsHiZ);
+    if (psCode) device->CreatePixelShader((DWORD*)psCode->GetBufferPointer(), &psHiZ);
+
+    if (vsCode) vsCode->Release();
+    if (psCode) psCode->Release();
+
+    if (!vsHiZ || !psHiZ) {
+        LOG::logline("!! Hi-Z: Failed to create shader objects");
+        if (vsHiZ) { vsHiZ->Release(); vsHiZ = nullptr; }
+        if (psHiZ) { psHiZ->Release(); psHiZ = nullptr; }
         return false;
     }
 
@@ -1522,6 +1582,14 @@ void DistantLand::release() {
     if (effectHiZ) {
         effectHiZ->Release();
         effectHiZ = nullptr;
+    }
+    if (vsHiZ) {
+        vsHiZ->Release();
+        vsHiZ = nullptr;
+    }
+    if (psHiZ) {
+        psHiZ->Release();
+        psHiZ = nullptr;
     }
 
     effectPool->Release();
