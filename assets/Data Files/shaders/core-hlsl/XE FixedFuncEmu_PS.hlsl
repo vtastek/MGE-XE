@@ -58,11 +58,12 @@ sampler sampTex3 : register(s3) = sampler_state{ texture = <tex3>; minfilter = a
 sampler sampShadow : register(s4) = sampler_state{ texture = <tex4>; addressu = border; addressv = border; bordercolor = 0xffffffff; minfilter = linear; magfilter = linear; }; // Shadow map (original slot)
 #endif
 
+// View inverse matrix for converting view-space to world space (used by texture lights and shadows)
+matrix viewInverse : register(c18);
+
 #if defined(HAS_SHADOWS)
 // Shadow resolution parameter (will be set via shader constants)
 float shadowRcpRes : register(c10);
-// View inverse matrix for converting view-space normals to world space
-matrix viewInverse : register(c18);
 #endif
 
 // Alpha testing/blending flag
@@ -275,7 +276,20 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 
 	float neglight = 0.0;
 	#ifndef NO_POINT_LIGHTS
-	// Point lights - using LightResult structure
+	// Texture-based point light system (replaces old per-light arrays)
+	#ifdef USE_TEXTURE_LIGHTS
+		// Use PBR version matching legacy path exactly
+		PointLightResult pointLightResult = evaluatePointLightsPBR(input.viewPos, Norm, V, texColor.rgb, metalness, roughness, radius, F0);
+
+		diffuseLight += pointLightResult.diffuse;
+
+		#if defined(HAS_PARAMH) || defined(HAS_NORMAL)
+		specularLight += pointLightResult.specular;
+		#endif
+
+		neglight = pointLightResult.neglight;
+	#else
+	// Legacy point light system (old arrays-based lighting)
 	for (int i = 0; i < pointLightCount; i++)
 	{
 		float3 L = lightPosition[i] - input.viewPos;
@@ -305,7 +319,7 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 
 		float3 pointIntensity = 10 * INTENSITY * pow(max(0.0, lightDiffuse[i].rgb) + EPS, 2.2) * NdotL_point * attenuation;
 		diffuseLight +=  pointLR.diffuse * pointIntensity;
-	
+
 		#if defined(HAS_PARAMH) || defined(HAS_NORMAL)
 		specularLight += pointLR.specular * pointIntensity;
 		#else
@@ -315,8 +329,9 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 
 		//deb += attenuation;
 	}
-	#endif
-			
+	#endif // USE_TEXTURE_LIGHTS
+	#endif // NO_POINT_LIGHTS
+
 	neglight = max(0.0, 1 - 0.95 * saturate(-neglight));
 	diffuseLight *= neglight;
 	specularLight *= neglight;

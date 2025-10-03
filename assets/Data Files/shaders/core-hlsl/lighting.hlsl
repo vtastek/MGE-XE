@@ -121,4 +121,119 @@ LightResult BRDF(float3 N, float3 V, float3 L, float3 albedo, float metalness, f
 	return lr;
 }
 
+//============================================================================
+// Texture-Based Point Light System
+//============================================================================
+
+// Light data texture (3 texels per light)
+// Texel 0: [posX, posY, posZ, radius]
+// Texel 1: [colorR, colorG, colorB, unused]
+// Texel 2: [falloffConstant, falloffLinear, falloffQuadratic, unused]
+sampler LightDataSampler : register(s5) = sampler_state {
+    MinFilter = POINT;
+    MagFilter = POINT;
+    MipFilter = NONE;
+    AddressU = CLAMP;
+    AddressV = CLAMP;
+};
+
+// Light system parameters: (numLights, texelSize, unused, unused)
+float4 lightDataParams : register(c50);
+
+// Read light data from texture
+float4 readLightTexel(int lightIndex, int texelOffset) {
+    float u = (lightIndex * 3 + texelOffset + 0.5) * lightDataParams.y;  // texelSize
+    return tex2Dlod(LightDataSampler, float4(u, 0.5, 0, 0));
+}
+
+// Evaluate point lights from texture with full PBR matching legacy path
+// viewPos and light positions are in view-space (matching legacy system)
+struct PointLightResult {
+    float3 diffuse;
+    float3 specular;
+    float neglight;
+};
+
+PointLightResult evaluatePointLightsPBR(float3 viewPos, float3 normal, float3 V, float3 albedo, float metalness, float roughness, float radius, float3 F0) {
+    PointLightResult result;
+    result.diffuse = float3(0, 0, 0);
+    result.specular = float3(0, 0, 0);
+    result.neglight = 0.0;
+
+    int numLights = (int)lightDataParams.x;
+
+    for (int i = 0; i < numLights; i++) {
+        // Read light data
+        float4 posRadius = readLightTexel(i, 0);
+        float4 color = readLightTexel(i, 1);
+        float4 falloff = readLightTexel(i, 2);
+
+        float3 lightPos = posRadius.xyz;  // View-space position
+
+        // Distance test (same as legacy: lightPosition[i] - input.viewPos)
+        float3 toLight = lightPos - viewPos;
+        float dist = length(toLight);
+        float3 L = toLight / dist;
+
+        // Match original shader attenuation formula with magic numbers
+        // falloff.x = constant, falloff.y = linear, falloff.z = quadratic
+        float falloffValue = 40.0 * falloff.z * dist * dist + falloff.x;
+        float t = saturate(dist / 350.0);
+        float cutoff = 1.0 - t * t * t * t;
+        float attenuation = (falloffValue > 0.0) ? (1.0 / falloffValue) * cutoff : 0.0;
+
+        // PBR BRDF (matching legacy path)
+        LightResult pointLR = BRDF(normal, V, L, albedo, metalness, roughness, roughness, radius, F0, 0, 1.0);
+
+        float dotpoint = dot(normal, L);
+        float NdotL_point = max(dotpoint, 0.0);
+
+        // Match legacy intensity with gamma correction
+        float3 pointIntensity = 10 * INTENSITY * pow(max(0.0, color.rgb) + EPS, 2.2) * NdotL_point * attenuation;
+
+        result.diffuse += pointLR.diffuse * pointIntensity;
+        result.specular += pointLR.specular * pointIntensity;
+
+        // Negative light handling (matching legacy)
+        result.neglight -= max(0.0, -color.r) * 1 / pow(falloffValue, 1 / 3.2);
+    }
+
+    return result;
+}
+
+// Legacy simple diffuse version (kept for compatibility)
+float3 evaluatePointLights(float3 viewPos, float3 normal) {
+    float3 lighting = float3(0, 0, 0);
+    int numLights = (int)lightDataParams.x;
+
+    for (int i = 0; i < numLights; i++) {
+        // Read light data
+        float4 posRadius = readLightTexel(i, 0);
+        float4 color = readLightTexel(i, 1);
+        float4 falloff = readLightTexel(i, 2);
+
+        float3 lightPos = posRadius.xyz;  // View-space position
+
+        // Distance test (same as legacy: lightPosition[i] - input.viewPos)
+        float3 toLight = lightPos - viewPos;
+        float dist = length(toLight);
+        float3 L = toLight / dist;
+
+        // Match original shader attenuation formula with magic numbers
+        // falloff.x = constant, falloff.y = linear, falloff.z = quadratic
+        float falloffValue = 40.0 * falloff.z * dist * dist + falloff.x;
+        float t = saturate(dist / 350.0);
+        float cutoff = 1.0 - t * t * t * t;
+        float attenuation = (falloffValue > 0.0) ? (1.0 / falloffValue) * cutoff : 0.0;
+
+        // Lambert diffuse
+        float NdotL = max(0, dot(normal, L));
+
+        lighting += color.rgb * attenuation * NdotL;
+    }
+
+    return lighting;
+}
+
+
 #endif // LIGHTING_HLSL_INCLUDED
