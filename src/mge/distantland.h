@@ -243,6 +243,7 @@ public:
     static void renderWaterPlane();
 
     static void renderDepth();
+    static void renderDepthDistantLand();
     static void renderDepthAdditional();
     static void renderDepthRecorded();
     static void generateHiZPyramid();

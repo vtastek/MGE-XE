@@ -42,14 +42,22 @@ void DistantLand::renderDepth() {
     renderDepthRecorded();
     effectDepth->EndPass();
 
-    // Copy recordMW opaques to Hi-Z buffer - used for culling during HLSL replay
-    // MUST happen here: after recordMW rendered, before distant land
-    if (texCullDepth) {
-        IDirect3DSurface9* cullDepthSurface;
-        texCullDepth->GetSurfaceLevel(0, &cullDepthSurface);
-        device->StretchRect(surfDepthFrameMSAA, NULL, cullDepthSurface, NULL, D3DTEXF_NONE);
-        cullDepthSurface->Release();
+    // Reset projection matrix
+    effect->SetMatrix(ehProj, &mwProj);
+}
+
+void DistantLand::renderDepthDistantLand() {
+    auto mwBridge = MWBridge::get();
+
+    // Switch to render target (already set from previous pass, but be explicit)
+    RenderTargetSwitcher rtsw(surfDepthFrameMSAA, surfDepthDepth);
+
+    // Projection for distant land
+    D3DXMATRIX mwDepthProj = mwProj;
+    if (Configuration.MGEFlags & USE_DISTANT_LAND) {
+        editProjectionZ(&mwDepthProj, 1.0f, Configuration.DL.DrawDist * kCellSize);
     }
+    effect->SetMatrix(ehProj, &mwDepthProj);
 
     if (isDistantCell()) {
         if (!mwBridge->IsUnderwater(eyePos.z)) {

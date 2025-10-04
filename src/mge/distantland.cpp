@@ -189,10 +189,25 @@ void DistantLand::renderStage1() {
             effect->End();
         }
 
-        // Depth texture from recorded renders and distant land
+        // Depth texture from recorded renders (Scene 0)
         effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
         if (ImGuiManager::GetEnableDepthPass()) {
             renderDepth();
+        }
+        effectDepth->End();
+
+        // Copy recordMW to Hi-Z for culling (before distant land adds to depth)
+        if (texCullDepth) {
+            IDirect3DSurface9* cullDepthSurface;
+            texCullDepth->GetSurfaceLevel(0, &cullDepthSurface);
+            device->StretchRect(surfDepthFrameMSAA, NULL, cullDepthSurface, NULL, D3DTEXF_NONE);
+            cullDepthSurface->Release();
+        }
+
+        // Continue depth with distant land
+        effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
+        if (ImGuiManager::GetEnableDepthPass()) {
+            renderDepthDistantLand();
         }
         effectDepth->End();
 
