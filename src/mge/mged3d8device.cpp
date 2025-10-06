@@ -267,6 +267,20 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
     // Reset HLSL texture caches at frame boundary to prevent stale texture pointers
     FixedFunctionShader::resetHLSLCaches();
 
+    // Generate Hi-Z pyramid at end of frame (GPU idle time before vsync)
+    // This is async - next frame will use this data for culling
+    if (DistantLand::ready) {
+        // Save all render state to prevent corruption
+        IDirect3DStateBlock9* stateSaved;
+        realDevice->CreateStateBlock(D3DSBT_ALL, &stateSaved);
+
+        DistantLand::generateHiZPyramid();
+
+        // Restore render state
+        stateSaved->Apply();
+        stateSaved->Release();
+    }
+
     return ProxyDevice::Present(a, b, c, d);
 }
 

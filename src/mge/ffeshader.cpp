@@ -3493,12 +3493,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     DistantLand::smViewproj[0] = recordingShadowViewproj[0];
     DistantLand::smViewproj[1] = recordingShadowViewproj[1];
 
-    // Generate Hi-Z pyramid for occlusion culling
-    IDirect3DStateBlock9* stateSavedHiZ;
-    device->CreateStateBlock(D3DSBT_ALL, &stateSavedHiZ);
-    DistantLand::generateHiZPyramid();
-    stateSavedHiZ->Apply();
-    stateSavedHiZ->Release();
+    // Hi-Z pyramid generation moved to end of frame (Present) for better performance
+    // We use previous frame's Hi-Z here for culling (minimal 1-frame delay)
 
     // Hi-Z culling statistics
     int totalCalls = recordedCalls.size();
