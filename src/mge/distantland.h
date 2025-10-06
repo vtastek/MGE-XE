@@ -105,8 +105,10 @@ public:
     static IDirect3DSurface9* surfDepthFrameMSAA; // Phase A: MSAA render target for depth frame
     static IDirect3DSurface9* surfDepthDepth;
     static IDirect3DTexture9* texCullDepth; // Cull-only depth (recordMW only, for Hi-Z)
-    static IDirect3DTexture9* texHiZ; // Hi-Z pyramid with full mip chain
+    static IDirect3DTexture9* texHiZ; // Hi-Z pyramid with full mip chain (current frame, being generated)
+    static IDirect3DTexture9* texHiZPrev; // Hi-Z pyramid from previous frame (used for culling)
     static IDirect3DTexture9* texHiZStaging; // Staging texture for CPU readback (with mip chain)
+    static IDirect3DTexture9* texHiZStagingPrev; // Previous frame's staging texture (used for culling)
     static ID3DXEffect* effectHiZ; // Shader effect for Hi-Z downsample
     static IDirect3DVertexShader9* vsHiZ; // Cached Hi-Z vertex shader (compiled once)
     static IDirect3DPixelShader9* psHiZ; // Cached Hi-Z pixel shader (compiled once)

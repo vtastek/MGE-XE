@@ -70,7 +70,9 @@ IDirect3DSurface9* DistantLand::surfDepthFrameMSAA;
 IDirect3DSurface9* DistantLand::surfDepthDepth;
 IDirect3DTexture9* DistantLand::texCullDepth;
 IDirect3DTexture9* DistantLand::texHiZ;
+IDirect3DTexture9* DistantLand::texHiZPrev;
 IDirect3DTexture9* DistantLand::texHiZStaging;
+IDirect3DTexture9* DistantLand::texHiZStagingPrev;
 ID3DXEffect* DistantLand::effectHiZ;
 IDirect3DVertexShader9* DistantLand::vsHiZ = nullptr;
 IDirect3DPixelShader9* DistantLand::psHiZ = nullptr;
@@ -702,16 +704,30 @@ bool DistantLand::initHiZ() {
         return false;
     }
 
+    // Create previous frame Hi-Z texture (double-buffered for async culling)
+    hr = device->CreateTexture(baseWidth, baseHeight, 0, D3DUSAGE_RENDERTARGET, D3DFMT_R32F, D3DPOOL_DEFAULT, &texHiZPrev, NULL);
+    if (hr != D3D_OK) {
+        LOG::logline("!! Failed to create previous frame Hi-Z texture");
+        return false;
+    }
+
     // Get actual mip level count
     D3DSURFACE_DESC desc;
     texHiZ->GetLevelDesc(0, &desc);
     hiZLevels = texHiZ->GetLevelCount();
-    LOG::logline(">> Hi-Z texture created: %dx%d with %d mip levels", desc.Width, desc.Height, hiZLevels);
+    LOG::logline(">> Hi-Z texture created: %dx%d with %d mip levels (double-buffered)", desc.Width, desc.Height, hiZLevels);
 
     // Create staging texture with matching mip chain for CPU readback
     hr = device->CreateTexture(baseWidth, baseHeight, 0, 0, D3DFMT_R32F, D3DPOOL_SYSTEMMEM, &texHiZStaging, NULL);
     if (hr != D3D_OK) {
         LOG::logline("!! Failed to create Hi-Z staging texture");
+        return false;
+    }
+
+    // Create previous frame staging texture (for async culling)
+    hr = device->CreateTexture(baseWidth, baseHeight, 0, 0, D3DFMT_R32F, D3DPOOL_SYSTEMMEM, &texHiZStagingPrev, NULL);
+    if (hr != D3D_OK) {
+        LOG::logline("!! Failed to create previous frame Hi-Z staging texture");
         return false;
     }
 
@@ -1580,9 +1596,17 @@ void DistantLand::release() {
         texHiZ->Release();
         texHiZ = nullptr;
     }
+    if (texHiZPrev) {
+        texHiZPrev->Release();
+        texHiZPrev = nullptr;
+    }
     if (texHiZStaging) {
         texHiZStaging->Release();
         texHiZStaging = nullptr;
+    }
+    if (texHiZStagingPrev) {
+        texHiZStagingPrev->Release();
+        texHiZStagingPrev = nullptr;
     }
     if (effectHiZ) {
         effectHiZ->Release();

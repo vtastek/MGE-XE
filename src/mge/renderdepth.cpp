@@ -190,12 +190,10 @@ void DistantLand::renderDepthRecorded() {
 }
 
 void DistantLand::generateHiZPyramid() {
-    if (!texHiZ || !effectHiZ) {
-        LOG::logline("Hi-Z: Skipping generation - texHiZ=%p effectHiZ=%p", texHiZ, effectHiZ);
+    if (!texHiZ || !texHiZPrev || !effectHiZ) {
+        LOG::logline("Hi-Z: Skipping generation - texHiZ=%p texHiZPrev=%p effectHiZ=%p", texHiZ, texHiZPrev, effectHiZ);
         return;
     }
-
-    // Removed verbose logging - Hi-Z pyramid generation is silent unless errors occur
 
     // Save current render targets explicitly
     IDirect3DSurface9* savedRT0;
@@ -337,10 +335,15 @@ void DistantLand::generateHiZPyramid() {
             loggedOnce = true;
         }
     }
+
+    // Swap Hi-Z buffers: current becomes previous for next frame's culling
+    std::swap(texHiZ, texHiZPrev);
+    std::swap(texHiZStaging, texHiZStagingPrev);
 }
 
 bool DistantLand::cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& bboxMax, const D3DXMATRIX& worldViewProj, bool debugLog) {
-    if (!texHiZStaging) return false;
+    // Use previous frame's Hi-Z for async culling (no GPU stall waiting for current frame)
+    if (!texHiZStagingPrev) return false;
 
     // Transform bounding box corners to clip space
     D3DXVECTOR3 corners[8] = {
@@ -412,7 +415,7 @@ bool DistantLand::cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& 
 
     // Calculate bbox screen size and select appropriate mip level
     D3DSURFACE_DESC desc;
-    texHiZStaging->GetLevelDesc(0, &desc);
+    texHiZStagingPrev->GetLevelDesc(0, &desc);
     float boxWidth = (maxX - minX) * desc.Width;
     float boxHeight = (maxY - minY) * desc.Height;
     float boxSize = std::max(boxWidth, boxHeight);
@@ -427,13 +430,13 @@ bool DistantLand::cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& 
 
     // Lock the staging texture at selected mip level
     D3DLOCKED_RECT lr;
-    HRESULT hr = texHiZStaging->LockRect(mipLevel, &lr, NULL, D3DLOCK_READONLY);
+    HRESULT hr = texHiZStagingPrev->LockRect(mipLevel, &lr, NULL, D3DLOCK_READONLY);
     if (FAILED(hr)) {
         return false;
     }
 
     // Get mip level dimensions
-    texHiZStaging->GetLevelDesc(mipLevel, &desc);
+    texHiZStagingPrev->GetLevelDesc(mipLevel, &desc);
 
     // Calculate pixel range covered by bbox at this mip level
     int pixelMinX = (int)(minX * desc.Width);
@@ -463,7 +466,7 @@ bool DistantLand::cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& 
         }
     }
 
-    texHiZStaging->UnlockRect(mipLevel);
+    texHiZStagingPrev->UnlockRect(mipLevel);
 
     // Detect depth discontinuities (gaps between buildings, fences, etc.)
     // If there's a large depth variation in the screen-space region, don't cull
@@ -476,9 +479,9 @@ bool DistantLand::cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& 
     if (mipLevel > 0 && depthRange > 50.0f) {
         // Re-check at mip 0 for more accurate gap detection
         D3DLOCKED_RECT lr0;
-        if (SUCCEEDED(texHiZStaging->LockRect(0, &lr0, NULL, D3DLOCK_READONLY))) {
+        if (SUCCEEDED(texHiZStagingPrev->LockRect(0, &lr0, NULL, D3DLOCK_READONLY))) {
             D3DSURFACE_DESC desc0;
-            texHiZStaging->GetLevelDesc(0, &desc0);
+            texHiZStagingPrev->GetLevelDesc(0, &desc0);
 
             int pix0MinX = (int)(minX * desc0.Width);
             int pix0MaxX = (int)(maxX * desc0.Width);
@@ -503,7 +506,7 @@ bool DistantLand::cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& 
                 }
             }
 
-            texHiZStaging->UnlockRect(0);
+            texHiZStagingPrev->UnlockRect(0);
 
             float range0 = max0 - min0;
             if (range0 > 100.0f) {
