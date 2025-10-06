@@ -465,6 +465,65 @@ bool DistantLand::cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& 
 
     texHiZStaging->UnlockRect(mipLevel);
 
+    // Detect depth discontinuities (gaps between buildings, fences, etc.)
+    // If there's a large depth variation in the screen-space region, don't cull
+    // because the object might be visible through the gap
+    float depthRange = maxHiZDepth - minHiZDepth;
+
+    // For large objects, always check at mip 0 for gap detection to avoid false culling
+    // when coarse mips fill in thin gaps through dilation
+    bool hasGap = false;
+    if (mipLevel > 0 && depthRange > 50.0f) {
+        // Re-check at mip 0 for more accurate gap detection
+        D3DLOCKED_RECT lr0;
+        if (SUCCEEDED(texHiZStaging->LockRect(0, &lr0, NULL, D3DLOCK_READONLY))) {
+            D3DSURFACE_DESC desc0;
+            texHiZStaging->GetLevelDesc(0, &desc0);
+
+            int pix0MinX = (int)(minX * desc0.Width);
+            int pix0MaxX = (int)(maxX * desc0.Width);
+            int pix0MinY = (int)(minY * desc0.Height);
+            int pix0MaxY = (int)(maxY * desc0.Height);
+
+            pix0MinX = std::max(0, std::min((int)desc0.Width - 1, pix0MinX));
+            pix0MaxX = std::max(0, std::min((int)desc0.Width - 1, pix0MaxX));
+            pix0MinY = std::max(0, std::min((int)desc0.Height - 1, pix0MinY));
+            pix0MaxY = std::max(0, std::min((int)desc0.Height - 1, pix0MaxY));
+
+            float* depth0 = (float*)lr0.pBits;
+            int pitch0 = lr0.Pitch / sizeof(float);
+            float max0 = 0.0f;
+            float min0 = 1e10f;
+
+            for (int y = pix0MinY; y <= pix0MaxY; y++) {
+                for (int x = pix0MinX; x <= pix0MaxX; x++) {
+                    float d = depth0[y * pitch0 + x];
+                    max0 = std::max(max0, d);
+                    min0 = std::min(min0, d);
+                }
+            }
+
+            texHiZStaging->UnlockRect(0);
+
+            float range0 = max0 - min0;
+            if (range0 > 100.0f) {
+                hasGap = true;
+                if (debugLog) {
+                    LOG::logline("Hi-Z Debug: Gap detected at mip 0 (range=%.1f) - forced visible", range0);
+                }
+            }
+        }
+    } else if (depthRange > 100.0f) {
+        hasGap = true;
+        if (debugLog) {
+            LOG::logline("Hi-Z Debug: Depth discontinuity detected (range=%.1f) - forced visible", depthRange);
+        }
+    }
+
+    if (hasGap) {
+        return false; // Don't cull - might be visible through gap
+    }
+
     // Occlusion test: if closest bbox corner is behind furthest visible depth, cull
     // Increased bias to handle depth precision errors and bbox expansion padding
     float bias = 20.0f;
