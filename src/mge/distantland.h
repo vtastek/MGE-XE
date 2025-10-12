@@ -107,8 +107,14 @@ public:
     static IDirect3DTexture9* texCullDepth; // Cull-only depth (recordMW only, for Hi-Z)
     static IDirect3DTexture9* texHiZ; // Hi-Z pyramid with full mip chain (current frame, being generated)
     static IDirect3DTexture9* texHiZPrev; // Hi-Z pyramid from previous frame (used for culling)
-    static IDirect3DTexture9* texHiZStaging; // Staging texture for CPU readback (with mip chain)
-    static IDirect3DTexture9* texHiZStagingPrev; // Previous frame's staging texture (used for culling)
+    static IDirect3DTexture9* texHiZStaging; // Staging texture for CPU readback - frame N (async copy target)
+    static IDirect3DTexture9* texHiZStaging2; // Staging texture - frame N-1 (1 frame old, still copying)
+    static IDirect3DTexture9* texHiZStagingPrev; // Staging texture - frame N-2 (2 frames old, safe to lock)
+    static IDirect3DQuery9* queryHiZCopy; // D3D9 Event Query to track completion of GetRenderTargetData
+    static IDirect3DQuery9* queryHiZCopy2; // Query for staging2 buffer
+    static IDirect3DQuery9* queryHiZCopyPrev; // Query for stagingPrev buffer
+    static D3DLOCKED_RECT hiZLockedRects[16]; // Pre-locked rects for each mip (locked in Present, unlocked next frame)
+    static int hiZLockedMips; // Number of mips currently locked (0 = none, hiZLevels = all)
     static ID3DXEffect* effectHiZ; // Shader effect for Hi-Z downsample
     static IDirect3DVertexShader9* vsHiZ; // Cached Hi-Z vertex shader (compiled once)
     static IDirect3DPixelShader9* psHiZ; // Cached Hi-Z pixel shader (compiled once)
@@ -139,6 +145,7 @@ public:
         bool isVisible;              // After Hi-Z culling
     };
     static std::vector<SceneLight> sceneLights;       // All unique lights in scene
+    static std::unordered_map<int, size_t> sceneLightIndexMap;  // ID -> index for O(1) lookup
     static std::vector<SceneLight> visibleLights;     // After Hi-Z culling
     static IDirect3DTexture9* texLightData;           // GPU texture with light data
 
@@ -249,6 +256,7 @@ public:
     static void renderDepthAdditional();
     static void renderDepthRecorded();
     static void generateHiZPyramid();
+    static void lockRemainingHiZMips();
     static bool cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& bboxMax, const D3DXMATRIX& worldViewProj, bool debugLog = false);
     static bool cullLightAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& bboxMax, const D3DXMATRIX& worldViewProj);
 

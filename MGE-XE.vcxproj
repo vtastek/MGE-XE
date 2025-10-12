@@ -65,7 +65,7 @@
       <WarningLevel>Level3</WarningLevel>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <Optimization>Disabled</Optimization>
-      <AdditionalIncludeDirectories>./src;./src\imgui;./src\imgui/backends</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>./src;./src\imgui;./src\imgui/backends;./src\tracy</AdditionalIncludeDirectories>
       <EnableEnhancedInstructionSet>StreamingSIMDExtensions2</EnableEnhancedInstructionSet>
       <FloatingPointModel>Fast</FloatingPointModel>
       <EnforceTypeConversionRules>true</EnforceTypeConversionRules>
@@ -88,13 +88,14 @@
       <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
       <WarningLevel>Level3</WarningLevel>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <Optimization>MaxSpeed</Optimization>
       <EnableEnhancedInstructionSet>StreamingSIMDExtensions2</EnableEnhancedInstructionSet>
       <FloatingPointModel>Fast</FloatingPointModel>
-      <AdditionalIncludeDirectories>./src;./src\imgui;./src\imgui/backends</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>./src;./src\imgui;./src\imgui/backends;./src\tracy</AdditionalIncludeDirectories>
       <EnforceTypeConversionRules>true</EnforceTypeConversionRules>
       <RuntimeTypeInfo>false</RuntimeTypeInfo>
       <LanguageStandard>stdcpp17</LanguageStandard>
-      <PreprocessorDefinitions>WIN32;NOMINMAX;NDEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;NOMINMAX;NDEBUG;_WINDOWS;TRACY_ENABLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
     </ClCompile>
@@ -178,6 +179,7 @@
     <ClCompile Include="src\imgui\imgui_widgets.cpp" />
     <ClCompile Include="src\imgui\backends\imgui_impl_dx9.cpp" />
     <ClCompile Include="src\imgui\backends\imgui_impl_win32.cpp" />
+    <ClCompile Include="src\tracy\TracyClient.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\exports.def" />

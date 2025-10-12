@@ -3,6 +3,7 @@
 #include "proxydx/d3d8header.h"
 #include <unordered_map>
 #include <string>
+#include <mutex>
 #include <d3dcompiler.h>
 
 // Forward declarations
@@ -13,8 +14,9 @@ class HLSLIncludeHandler : public ID3DInclude {
 public:
     HRESULT __stdcall Open(D3D_INCLUDE_TYPE IncludeType, LPCSTR pFileName, LPCVOID pParentData, LPCVOID* ppData, UINT* pBytes) override;
     HRESULT __stdcall Close(LPCVOID pData) override;
-    
+
 private:
+    std::mutex includeMutex; // Protect loadedIncludes from concurrent access
     std::unordered_map<LPCVOID, char*> loadedIncludes; // Track allocated memory for cleanup
 };
 

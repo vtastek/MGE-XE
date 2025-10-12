@@ -1,5 +1,6 @@
 
 #include "ffeshader.h"
+#include "tracy/Tracy.hpp"
 #include "configuration.h"
 #include "support/log.h"
 #include "mwbridge.h"
@@ -63,7 +64,14 @@ D3DXMATRIX FixedFunctionShader::recordingShadowViewproj[2];
 
 // Bbox cache: persists across frames for fast object-space bbox lookup
 std::unordered_map<FixedFunctionShader::MeshKey, FixedFunctionShader::ObjectSpaceBBox, FixedFunctionShader::MeshKeyHash> FixedFunctionShader::bboxCache;
+
+// Previous frame camera tracking for velocity-based bbox expansion
+D3DXVECTOR3 FixedFunctionShader::prevCameraPos;
+D3DXMATRIX FixedFunctionShader::prevCameraView;
+bool FixedFunctionShader::hasPrevCamera = false;
+
 std::shared_ptr<LightState> FixedFunctionShader::lastLightState;
+const LightState* FixedFunctionShader::lastLightStatePtr = nullptr;
 
 // Material state cache static member
 FixedFunctionShader::MaterialStateCache FixedFunctionShader::materialCache;
@@ -1569,6 +1577,8 @@ void FixedFunctionShader::bindShaderTextures(const ShaderKey& sk, const Rendered
 
 // Helper function to compute ShaderKey with texture suffix detection
 FixedFunctionShader::ShaderKey FixedFunctionShader::computeShaderKeyWithSuffixes(const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
+    ZoneScopedN("HLSL_ComputeShaderKeyWithSuffixes");
+
     // Step 1: Determine texture suffix availability
     bool hasDiffParam = false, hasParamH = false, hasParamX = false, hasGrass = false;
 
@@ -1578,7 +1588,9 @@ FixedFunctionShader::ShaderKey FixedFunctionShader::computeShaderKeyWithSuffixes
         if (cacheIt == textureSuffixResolutionCache.end()) {
             // Not in cache, perform expensive resolution
             TextureSuffixResolutionCache entry;
+
             entry.hash = BSA::calculateTextureHash((IDirect3DDevice9*)device, rs->texture, false);
+
             const std::string* textureName = BSA::resolveTextureNameFromHash(entry.hash);
             if (textureName && entry.hash.crc32 != 0) {
                 entry.textureName = *textureName;
@@ -1588,6 +1600,7 @@ FixedFunctionShader::ShaderKey FixedFunctionShader::computeShaderKeyWithSuffixes
                 entry.hasValidName = false;
                 entry.variants = nullptr;
             }
+
             cacheIt = textureSuffixResolutionCache.emplace(rs->texture, std::move(entry)).first;
         }
 
@@ -1615,6 +1628,7 @@ FixedFunctionShader::ShaderKey FixedFunctionShader::computeShaderKeyWithSuffixes
 
 // HLSL Pipeline Implementation
 void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
+    ZoneScopedN("RenderMorrowindHLSL");
     // Skip if we're in replay mode to avoid recursion
     if (isReplaying) {
         // During replay mode, perform actual rendering with this specific call
@@ -3286,14 +3300,18 @@ void FixedFunctionShader::ShaderKey::log() const {
 // HLSL Render Dispatch Recording System Implementation
 
 void FixedFunctionShader::startRecording() {
+    ZoneScopedN("HLSL_StartRecording");
+
     // Reset HLSL caches for new recording session
     resetHLSLCaches();
 
     recordedCalls.clear();
     lastLightState.reset();  // Clear LightState cache for new recording
+    lastLightStatePtr = nullptr;  // Clear pointer cache
 
     // Clear lights from previous frame (do this at start of new frame, not end of each scene)
     DistantLand::sceneLights.clear();
+    DistantLand::sceneLightIndexMap.clear();
     DistantLand::visibleLights.clear();
 
     isRecording = true;
@@ -3311,6 +3329,8 @@ void FixedFunctionShader::startRecording() {
 }
 
 void FixedFunctionShader::stopRecordingAndReplay() {
+    ZoneScopedN("HLSL_StopRecordingAndReplay");
+
     if (!isRecording) {
         return;
     }
@@ -3330,6 +3350,8 @@ void FixedFunctionShader::stopRecordingAndReplay() {
 
 // Call this when HLSL rendering session is complete to trigger replay
 void FixedFunctionShader::finalizeBatchAndReplay(int sceneCount) {
+    ZoneScopedN("HLSL_FinalizeBatchAndReplay");
+
     // Handle dump request
     if (dumpRequested) {
         if (recordingEnabled) {
@@ -3394,29 +3416,39 @@ void FixedFunctionShader::finalizeBatchAndReplay(int sceneCount) {
 
 // Compare two LightStates for equality (to detect if we can reuse cached state)
 bool FixedFunctionShader::compareLightStates(const LightState* a, const LightState* b) {
-    if (a->globalAmbient.r != b->globalAmbient.r || a->globalAmbient.g != b->globalAmbient.g ||
-        a->globalAmbient.b != b->globalAmbient.b || a->globalAmbient.a != b->globalAmbient.a) {
-        return false;
-    }
+    // Fast path: check sizes first (cheapest comparison)
     if (a->lights.size() != b->lights.size() || a->active.size() != b->active.size()) {
         return false;
     }
-    // Quick check: compare active light indices
-    for (size_t i = 0; i < a->active.size(); i++) {
-        if (a->active[i] != b->active[i]) {
-            return false;
-        }
+
+    // Compare active array with memcmp (faster than loop for larger arrays)
+    if (!a->active.empty() && memcmp(a->active.data(), b->active.data(), a->active.size() * sizeof(DWORD)) != 0) {
+        return false;
     }
+
+    // Compare globalAmbient as 4 DWORDs instead of 4 floats (avoids FP comparison)
+    const DWORD* aAmb = reinterpret_cast<const DWORD*>(&a->globalAmbient);
+    const DWORD* bAmb = reinterpret_cast<const DWORD*>(&b->globalAmbient);
+    if (aAmb[0] != bAmb[0] || aAmb[1] != bAmb[1] || aAmb[2] != bAmb[2] || aAmb[3] != bAmb[3]) {
+        return false;
+    }
+
     return true;  // Same lighting state
 }
 
 void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, const ShaderKey& sk) {
-    if (isReplaying) {
-        return;  // Don't record during replay to avoid recursion
+    ZoneScopedN("HLSL_RecordRenderCall");
+
+    {
+        ZoneScopedN("RecordCall_EarlyChecks");
+        if (isReplaying) {
+            return;  // Don't record during replay to avoid recursion
+        }
     }
 
     // When recording is OFF and dump is requested, dump each call immediately
     if (!recordingEnabled && dumpRequested) {
+        ZoneScopedN("RecordCall_DumpLogging");
         static int callIndex = 0;
         char logline[512];
         snprintf(logline, sizeof(logline), "Call %d: texture=0x%p, vb=0x%p, ib=0x%p (immediate)",
@@ -3434,67 +3466,97 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
     }
 
     // Collect lights from Morrowind for texture-based lighting system
-    for (const auto& [id, light] : lightrs->lights) {
-        // Check if light already exists
-        auto it = std::find_if(DistantLand::sceneLights.begin(), DistantLand::sceneLights.end(),
-                               [id](const DistantLand::SceneLight& sl) { return sl.id == id; });
+    {
+        ZoneScopedN("RecordCall_CollectLights");
+        for (const auto& [id, light] : lightrs->lights) {
+            // Check if light already exists using O(1) hash map lookup
+            auto mapIt = DistantLand::sceneLightIndexMap.find(id);
 
-        if (it == DistantLand::sceneLights.end()) {
-            // New light - add to scene
-            DistantLand::SceneLight sl;
-            sl.id = id;
-            sl.position = light.position;
-            sl.diffuse = light.diffuse;
-            sl.falloff = light.falloff;  // (constant, linear, quadratic)
-            sl.radius = DistantLand::computeLightRadius(sl.falloff.x, sl.falloff.y, sl.falloff.z);
-            sl.isVisible = false;  // Will be set during Hi-Z culling
-            DistantLand::sceneLights.push_back(sl);
-        } else {
-            // Update dynamic properties (color may pulse)
-            it->diffuse = light.diffuse;
+            if (mapIt == DistantLand::sceneLightIndexMap.end()) {
+                // New light - add to scene
+                size_t newIndex = DistantLand::sceneLights.size();
+                DistantLand::SceneLight sl;
+                sl.id = id;
+                sl.position = light.position;
+                sl.diffuse = light.diffuse;
+                sl.falloff = light.falloff;  // (constant, linear, quadratic)
+                sl.radius = DistantLand::computeLightRadius(sl.falloff.x, sl.falloff.y, sl.falloff.z);
+                sl.isVisible = false;  // Will be set during Hi-Z culling
+                DistantLand::sceneLights.push_back(sl);
+                DistantLand::sceneLightIndexMap[id] = newIndex;  // Add to index map
+            } else {
+                // Update dynamic properties (color may pulse)
+                size_t index = mapIt->second;
+                DistantLand::sceneLights[index].diffuse = light.diffuse;
+            }
         }
     }
 
     // Reuse last LightState if identical to avoid allocation overhead
     std::shared_ptr<LightState> sharedLightState;
-    if (lastLightState && compareLightStates(lastLightState.get(), lightrs)) {
-        // Reuse existing shared_ptr (no allocation)
-        sharedLightState = lastLightState;
-    } else {
-        // Create new LightState copy and cache it
-        sharedLightState = std::make_shared<LightState>(*lightrs);
-        lastLightState = sharedLightState;
+    {
+        ZoneScopedN("RecordCall_LightStateReuse");
+        // Ultra-fast path: pointer equality (O(1), no function call)
+        if (lightrs == lastLightStatePtr) {
+            sharedLightState = lastLightState;
+        }
+        // Fast path: value comparison only if pointer differs
+        else if (lastLightState && compareLightStates(lastLightState.get(), lightrs)) {
+            // Reuse existing shared_ptr (no allocation)
+            sharedLightState = lastLightState;
+        }
+        // Slow path: create new copy
+        else {
+            sharedLightState = std::make_shared<LightState>(*lightrs);
+            lastLightState = sharedLightState;
+            lastLightStatePtr = lightrs;  // Cache raw pointer for next comparison
+        }
     }
 
-    recordedCalls.emplace_back(rs, frs, sharedLightState, sk);
+    {
+        ZoneScopedN("RecordCall_EmplaceBack");
+        recordedCalls.emplace_back(rs, frs, sharedLightState, sk);
+    }
 }
 
 void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
-    if (recordedCalls.empty()) {
-        return;
-    }
+    ZoneScopedN("HLSL_ReplayRecordedCalls");
 
-    // Check if replay is disabled via ImGui
-    if (!ImGuiManager::GetEnableReplay()) {
-        return;
+    {
+        ZoneScopedN("Replay_EarlyChecks");
+        if (recordedCalls.empty()) {
+            return;
+        }
+
+        // Check if replay is disabled via ImGui
+        if (!ImGuiManager::GetEnableReplay()) {
+            return;
+        }
     }
 
     isReplaying = true;
 
     // Get current matrices for culling
     D3DXMATRIX currentView, currentProj;
+    D3DXMATRIX viewProj;
+    D3DXMATRIX savedShadowViewproj[2];
     device->GetTransform(D3DTS_VIEW, &currentView);
     device->GetTransform(D3DTS_PROJECTION, &currentProj);
 
     // Temporarily set shadow matrices to recording state
-    D3DXMATRIX savedShadowViewproj[2];
     savedShadowViewproj[0] = DistantLand::smViewproj[0];
     savedShadowViewproj[1] = DistantLand::smViewproj[1];
     DistantLand::smViewproj[0] = recordingShadowViewproj[0];
     DistantLand::smViewproj[1] = recordingShadowViewproj[1];
 
+    // Calculate view-projection matrix for Hi-Z culling
+    viewProj = currentView * currentProj;
+
     // Hi-Z pyramid generation moved to end of frame (Present) for better performance
     // We use previous frame's Hi-Z here for culling (minimal 1-frame delay)
+
+    // Lock remaining Hi-Z mips (second half) - split stall strategy
+    DistantLand::lockRemainingHiZMips();
 
     // Hi-Z culling statistics
     int totalCalls = recordedCalls.size();
@@ -3518,11 +3580,25 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
         wasPressed = false;
     }
 
-    // Calculate view-projection matrix for Hi-Z culling
-    D3DXMATRIX viewProj = currentView * currentProj;
+    // Calculate camera velocity from previous frame (to compensate for one-frame-behind Hi-Z)
+    D3DXVECTOR3 currentCameraPos = D3DXVECTOR3(DistantLand::eyePos.x, DistantLand::eyePos.y, DistantLand::eyePos.z);
+    D3DXVECTOR3 cameraVelocity(0.0f, 0.0f, 0.0f);
+    float cameraMovementMag = 0.0f;
 
-    // Cull lights against Hi-Z pyramid and upload to texture
+    if (hasPrevCamera) {
+        cameraVelocity = currentCameraPos - prevCameraPos;
+        cameraMovementMag = D3DXVec3Length(&cameraVelocity);
+    }
+
+    // Store current camera for next frame
+    prevCameraPos = currentCameraPos;
+    prevCameraView = currentView;
+    hasPrevCamera = true;
+
+    // Cull lights against Hi-Z pyramid
     DistantLand::cullSceneLights(viewProj);
+
+    // Upload visible lights to GPU texture (may stall if GPU idle)
     DistantLand::uploadLightDataToTexture(currentView);
 
     // Set light count parameter for shaders
@@ -3558,6 +3634,22 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
         if (halfSize.z * 2.0f < 20.0f) padding.z *= 2.0f;
 
         D3DXVECTOR3 expandedHalfSize = halfSize * 1.25f + padding;
+
+        // Camera velocity-based bbox expansion: compensate for one-frame-behind Hi-Z culling
+        // When camera moves/rotates, newly visible objects weren't in previous frame's depth, so they get culled
+        // Solution: expand bboxes based on camera movement magnitude AND distance from camera
+        // Far objects move more in screen space during rotation than near objects
+        if (cameraMovementMag > 0.1f) {
+            // Calculate distance from camera to object center
+            float distanceToCamera = D3DXVec3Length(&(center - currentCameraPos));
+
+            // Expansion scales with both camera movement and distance
+            // Base: 2.5x camera movement, scaled linearly by distance (far objects expand more)
+            // This handles both translation (uniform) and rotation (distance-dependent)
+            float expansionAmount = cameraMovementMag * 2.5f * (1.0f + distanceToCamera / 1000.0f);
+            expandedHalfSize += D3DXVECTOR3(expansionAmount, expansionAmount, expansionAmount);
+        }
+
         D3DXVECTOR3 expandedMin = center - expandedHalfSize;
         D3DXVECTOR3 expandedMax = center + expandedHalfSize;
 
@@ -3572,8 +3664,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
 
         // Check if camera bbox intersects expanded object bbox - if so, always render
         bool cameraInside = !(cameraBBoxMax.x < expandedMin.x || cameraBBoxMin.x > expandedMax.x ||
-                              cameraBBoxMax.y < expandedMin.y || cameraBBoxMin.y > expandedMax.y ||
-                              cameraBBoxMax.z < expandedMin.z || cameraBBoxMin.z > expandedMax.z);
+                          cameraBBoxMax.y < expandedMin.y || cameraBBoxMin.y > expandedMax.y ||
+                          cameraBBoxMax.z < expandedMin.z || cameraBBoxMin.z > expandedMax.z);
 
         bool shouldRender = true;
         if (call.hasBoundingBox && !cameraInside) {
@@ -3688,6 +3780,14 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
                 if (halfSize.z * 2.0f < 20.0f) padding.z *= 2.0f;
 
                 D3DXVECTOR3 expandedHalfSize = halfSize * 1.25f + padding;
+
+                // Camera velocity-based bbox expansion (same as culling loop)
+                if (cameraMovementMag > 0.1f) {
+                    float distanceToCamera = D3DXVec3Length(&(center - currentCameraPos));
+                    float expansionAmount = cameraMovementMag * 2.5f * (1.0f + distanceToCamera / 1000.0f);
+                    expandedHalfSize += D3DXVECTOR3(expansionAmount, expansionAmount, expansionAmount);
+                }
+
                 D3DXVECTOR3 expandedMin = center - expandedHalfSize;
                 D3DXVECTOR3 expandedMax = center + expandedHalfSize;
 
@@ -3739,6 +3839,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     DistantLand::smViewproj[0] = savedShadowViewproj[0];
     DistantLand::smViewproj[1] = savedShadowViewproj[1];
 
+    // Note: Camera position is already stored above for next frame's velocity calculation
+
     isReplaying = false;
 }
 
@@ -3778,7 +3880,6 @@ FixedFunctionShader::RecordedRenderedState::RecordedRenderedState(RecordedRender
 
 FixedFunctionShader::HLSLRecordedCall::HLSLRecordedCall(const RenderedState* rs_, const FragmentState* frs_, std::shared_ptr<LightState> lightrs_, const ShaderKey& sk_)
     : rs(*rs_), frs(*frs_), lightrs(lightrs_), sk(sk_), hasBoundingBox(false) {
-
     // Capture current sampler states for all texture stages
     for (int stage = 0; stage < 8; ++stage) {
         samplerStates[stage].captured = false;
@@ -3813,6 +3914,8 @@ FixedFunctionShader::HLSLRecordedCall::HLSLRecordedCall(const RenderedState* rs_
 }
 
 bool FixedFunctionShader::computeBoundingBox(const RenderedState* rs, D3DXVECTOR3& bboxMin, D3DXVECTOR3& bboxMax) {
+    ZoneScopedN("HLSL_ComputeBoundingBox");
+
     static bool debugBBox = false;
     static int debugCount = 0;
     static bool keyCheckedThisRecording = false;

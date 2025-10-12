@@ -5,6 +5,7 @@
 #include "mwbridge.h"
 #include "proxydx/d3d8header.h"
 #include "support/log.h"
+#include "tracy/Tracy.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -190,6 +191,16 @@ void DistantLand::renderDepthRecorded() {
 }
 
 void DistantLand::generateHiZPyramid() {
+    ZoneScopedN("HiZ_GeneratePyramid");
+
+    // Unlock staging texture from 2 frames ago (all locked mips)
+    if (hiZLockedMips > 0 && texHiZStagingPrev) {
+        for (int mip = 0; mip < hiZLockedMips; mip++) {
+            texHiZStagingPrev->UnlockRect(mip);
+        }
+        hiZLockedMips = 0;
+    }
+
     if (!texHiZ || !texHiZPrev || !effectHiZ) {
         LOG::logline("Hi-Z: Skipping generation - texHiZ=%p texHiZPrev=%p effectHiZ=%p", texHiZ, texHiZPrev, effectHiZ);
         return;
@@ -292,7 +303,7 @@ void DistantLand::generateHiZPyramid() {
     if (savedDepthStencil) savedDepthStencil->Release();
 
     // Step 3: Copy entire Hi-Z mip chain to staging texture for CPU readback
-    // Note: GetRenderTargetData is synchronous - each call blocks until GPU completes that copy
+    // Note: GetRenderTargetData queues the copy, but GPU work is async - use query to track completion
     for (int mipLevel = 0; mipLevel < hiZLevels; mipLevel++) {
         IDirect3DSurface9* srcSurf = nullptr;
         IDirect3DSurface9* dstSurf = nullptr;
@@ -311,6 +322,11 @@ void DistantLand::generateHiZPyramid() {
             }
             return;
         }
+    }
+
+    // Issue D3D9 Event Query to track when GetRenderTargetData completes for this staging buffer
+    if (queryHiZCopy) {
+        queryHiZCopy->Issue(D3DISSUE_END);
     }
 
     // Debug: Sample a few depth values from mip 0 to verify Hi-Z content
@@ -338,12 +354,92 @@ void DistantLand::generateHiZPyramid() {
 
     // Swap Hi-Z buffers: current becomes previous for next frame's culling
     std::swap(texHiZ, texHiZPrev);
-    std::swap(texHiZStaging, texHiZStagingPrev);
+
+    // Triple-buffer rotation: N → N-1 → N-2 → N (gives 2 frames = ~40ms for GetRenderTargetData to complete)
+    IDirect3DTexture9* temp = texHiZStagingPrev;  // Save N-2 (oldest, about to be freed for reuse)
+    texHiZStagingPrev = texHiZStaging2;           // N-1 becomes N-2 (safe to lock now)
+    texHiZStaging2 = texHiZStaging;               // N becomes N-1 (still copying)
+    texHiZStaging = temp;                         // N-2 becomes N (ready for fresh GetRenderTargetData)
+
+    // Rotate queries along with buffers
+    IDirect3DQuery9* tempQuery = queryHiZCopyPrev;
+    queryHiZCopyPrev = queryHiZCopy2;
+    queryHiZCopy2 = queryHiZCopy;
+    queryHiZCopy = tempQuery;
+
+    // Pre-lock FIRST HALF of mip levels from 2-frame-old staging (query-synced, minimal stall)
+    // Wait for GPU copy to complete before locking (check query for N-2 frame)
+    if (queryHiZCopyPrev) {
+        // Poll query until GPU signals completion (or timeout after 100ms)
+        int attempts = 0;
+        while (attempts < 1000) {
+            HRESULT hr = queryHiZCopyPrev->GetData(NULL, 0, D3DGETDATA_FLUSH);
+            if (hr == S_OK) {
+                break; // GPU finished copying
+            }
+            if (hr != S_FALSE) {
+                LOG::logline("!! Hi-Z: Query failed with error 0x%08x", hr);
+                break;
+            }
+            // Query still pending, spin-wait a bit (GPU work in progress)
+            attempts++;
+        }
+        if (attempts >= 1000) {
+            LOG::logline("!! Hi-Z: Query timeout after 100ms - GPU copy still not complete!");
+        }
+    }
+
+    int mipsToLockNow = (hiZLevels + 1) / 2; // Lock lower mips (0 to mid-1), most commonly used
+    for (int mip = 0; mip < mipsToLockNow; mip++) {
+        HRESULT hr = texHiZStagingPrev->LockRect(mip, &hiZLockedRects[mip], NULL, D3DLOCK_READONLY);
+        if (FAILED(hr)) {
+            LOG::logline("!! Hi-Z: Failed to pre-lock mip %d (2 frames old)", mip);
+            // Unlock any that succeeded
+            for (int j = 0; j < mip; j++) {
+                texHiZStagingPrev->UnlockRect(j);
+            }
+            hiZLockedMips = 0;
+            return;
+        }
+    }
+    hiZLockedMips = mipsToLockNow;
+}
+
+void DistantLand::lockRemainingHiZMips() {
+    ZoneScopedN("HiZ_LockRemainingMips");
+
+    if (!texHiZStagingPrev || hiZLockedMips >= hiZLevels) {
+        return; // Already all locked or no texture
+    }
+
+    // Lock SECOND HALF of mip levels (remaining mips from where we left off)
+    int startMip = hiZLockedMips;
+    for (int mip = startMip; mip < hiZLevels; mip++) {
+        HRESULT hr = texHiZStagingPrev->LockRect(mip, &hiZLockedRects[mip], NULL, D3DLOCK_READONLY);
+        if (FAILED(hr)) {
+            LOG::logline("!! Hi-Z: Failed to lock remaining mip %d", mip);
+            // Unlock the ones we just tried to lock (keep the first half locked)
+            for (int j = startMip; j < mip; j++) {
+                texHiZStagingPrev->UnlockRect(j);
+            }
+            return;
+        }
+    }
+    hiZLockedMips = hiZLevels; // Now all mips are locked
 }
 
 bool DistantLand::cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& bboxMax, const D3DXMATRIX& worldViewProj, bool debugLog) {
+    ZoneScopedN("HiZ_CullAgainstHiZ");
+
     // Use previous frame's Hi-Z for async culling (no GPU stall waiting for current frame)
-    if (!texHiZStagingPrev) return false;
+    if (!texHiZStagingPrev || hiZLockedMips == 0) return false;
+
+    float minX, maxX, minY, maxY, minLinearDepth, maxLinearDepth;
+    int mipLevel;
+    D3DSURFACE_DESC desc;
+    float cornerDepths[8];
+    float boxWidth, boxHeight;
+    int pixelMinX, pixelMaxX, pixelMinY, pixelMaxY;
 
     // Transform bounding box corners to clip space
     D3DXVECTOR3 corners[8] = {
@@ -358,13 +454,12 @@ bool DistantLand::cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& 
     };
 
     // Transform corners and find screen space bounds
-    float minX = 1e10f, maxX = -1e10f;
-    float minY = 1e10f, maxY = -1e10f;
-    float minLinearDepth = 1e10f;
-    float maxLinearDepth = -1e10f;
+    minX = 1e10f, maxX = -1e10f;
+    minY = 1e10f, maxY = -1e10f;
+    minLinearDepth = 1e10f;
+    maxLinearDepth = -1e10f;
     bool anyInFront = false;
     bool anyBehindCamera = false;
-    float cornerDepths[8];
 
     for (int i = 0; i < 8; i++) {
         D3DXVECTOR4 clipPos;
@@ -414,35 +509,40 @@ bool DistantLand::cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& 
     }
 
     // Calculate bbox screen size and select appropriate mip level
-    D3DSURFACE_DESC desc;
     texHiZStagingPrev->GetLevelDesc(0, &desc);
-    float boxWidth = (maxX - minX) * desc.Width;
-    float boxHeight = (maxY - minY) * desc.Height;
+    boxWidth = (maxX - minX) * desc.Width;
+    boxHeight = (maxY - minY) * desc.Height;
     float boxSize = std::max(boxWidth, boxHeight);
 
     // Select mip level: target ~6 pixels at selected mip for good coverage
     // Add -1 mip bias to use higher resolution (one mip level lower/more detailed)
-    int mipLevel = 0;
+    mipLevel = 0;
     if (boxSize > 8.0f) {
         mipLevel = (int)std::floor(std::log2(boxSize / 6.0f)) - 1;
         mipLevel = std::max(0, std::min(hiZLevels - 1, mipLevel));
     }
 
-    // Lock the staging texture at selected mip level
-    D3DLOCKED_RECT lr;
-    HRESULT hr = texHiZStagingPrev->LockRect(mipLevel, &lr, NULL, D3DLOCK_READONLY);
-    if (FAILED(hr)) {
+    // Check if the required mip is locked yet (split locking strategy)
+    if (mipLevel >= hiZLockedMips) {
+        // This mip hasn't been locked yet - don't cull (conservative approach)
         return false;
     }
+
+    // Use pre-locked staging texture (locked in Present, no stall here!)
+    float maxHiZDepth, minHiZDepth;
+    int pixelCount;
+
+    // Use pre-locked rect data
+    D3DLOCKED_RECT& lr = hiZLockedRects[mipLevel];
 
     // Get mip level dimensions
     texHiZStagingPrev->GetLevelDesc(mipLevel, &desc);
 
     // Calculate pixel range covered by bbox at this mip level
-    int pixelMinX = (int)(minX * desc.Width);
-    int pixelMaxX = (int)(maxX * desc.Width);
-    int pixelMinY = (int)(minY * desc.Height);
-    int pixelMaxY = (int)(maxY * desc.Height);
+    pixelMinX = (int)(minX * desc.Width);
+    pixelMaxX = (int)(maxX * desc.Width);
+    pixelMinY = (int)(minY * desc.Height);
+    pixelMaxY = (int)(maxY * desc.Height);
 
     // Clamp to texture bounds
     pixelMinX = std::max(0, std::min((int)desc.Width - 1, pixelMinX));
@@ -453,9 +553,9 @@ bool DistantLand::cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& 
     // Sample ALL Hi-Z pixels in bbox region and find maximum depth
     float* depthData = (float*)lr.pBits;
     int pitch = lr.Pitch / sizeof(float);
-    float maxHiZDepth = 0.0f;
-    float minHiZDepth = 1e10f;
-    int pixelCount = 0;
+    maxHiZDepth = 0.0f;
+    minHiZDepth = 1e10f;
+    pixelCount = 0;
 
     for (int y = pixelMinY; y <= pixelMaxY; y++) {
         for (int x = pixelMinX; x <= pixelMaxX; x++) {
@@ -466,7 +566,7 @@ bool DistantLand::cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& 
         }
     }
 
-    texHiZStagingPrev->UnlockRect(mipLevel);
+    // No unlock needed - already unlocked at start of next frame's generateHiZPyramid
 
     // Detect depth discontinuities (gaps between buildings, fences, etc.)
     // If there's a large depth variation in the screen-space region, don't cull
@@ -477,43 +577,39 @@ bool DistantLand::cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& 
     // when coarse mips fill in thin gaps through dilation
     bool hasGap = false;
     if (mipLevel > 0 && depthRange > 50.0f) {
-        // Re-check at mip 0 for more accurate gap detection
-        D3DLOCKED_RECT lr0;
-        if (SUCCEEDED(texHiZStagingPrev->LockRect(0, &lr0, NULL, D3DLOCK_READONLY))) {
-            D3DSURFACE_DESC desc0;
-            texHiZStagingPrev->GetLevelDesc(0, &desc0);
+        // Re-check at mip 0 for more accurate gap detection using pre-locked data
+        D3DLOCKED_RECT& lr0 = hiZLockedRects[0];
+        D3DSURFACE_DESC desc0;
+        texHiZStagingPrev->GetLevelDesc(0, &desc0);
 
-            int pix0MinX = (int)(minX * desc0.Width);
-            int pix0MaxX = (int)(maxX * desc0.Width);
-            int pix0MinY = (int)(minY * desc0.Height);
-            int pix0MaxY = (int)(maxY * desc0.Height);
+        int pix0MinX = (int)(minX * desc0.Width);
+        int pix0MaxX = (int)(maxX * desc0.Width);
+        int pix0MinY = (int)(minY * desc0.Height);
+        int pix0MaxY = (int)(maxY * desc0.Height);
 
-            pix0MinX = std::max(0, std::min((int)desc0.Width - 1, pix0MinX));
-            pix0MaxX = std::max(0, std::min((int)desc0.Width - 1, pix0MaxX));
-            pix0MinY = std::max(0, std::min((int)desc0.Height - 1, pix0MinY));
-            pix0MaxY = std::max(0, std::min((int)desc0.Height - 1, pix0MaxY));
+        pix0MinX = std::max(0, std::min((int)desc0.Width - 1, pix0MinX));
+        pix0MaxX = std::max(0, std::min((int)desc0.Width - 1, pix0MaxX));
+        pix0MinY = std::max(0, std::min((int)desc0.Height - 1, pix0MinY));
+        pix0MaxY = std::max(0, std::min((int)desc0.Height - 1, pix0MaxY));
 
-            float* depth0 = (float*)lr0.pBits;
-            int pitch0 = lr0.Pitch / sizeof(float);
-            float max0 = 0.0f;
-            float min0 = 1e10f;
+        float* depth0 = (float*)lr0.pBits;
+        int pitch0 = lr0.Pitch / sizeof(float);
+        float max0 = 0.0f;
+        float min0 = 1e10f;
 
-            for (int y = pix0MinY; y <= pix0MaxY; y++) {
-                for (int x = pix0MinX; x <= pix0MaxX; x++) {
-                    float d = depth0[y * pitch0 + x];
-                    max0 = std::max(max0, d);
-                    min0 = std::min(min0, d);
-                }
+        for (int y = pix0MinY; y <= pix0MaxY; y++) {
+            for (int x = pix0MinX; x <= pix0MaxX; x++) {
+                float d = depth0[y * pitch0 + x];
+                max0 = std::max(max0, d);
+                min0 = std::min(min0, d);
             }
+        }
 
-            texHiZStagingPrev->UnlockRect(0);
-
-            float range0 = max0 - min0;
-            if (range0 > 100.0f) {
-                hasGap = true;
-                if (debugLog) {
-                    LOG::logline("Hi-Z Debug: Gap detected at mip 0 (range=%.1f) - forced visible", range0);
-                }
+        float range0 = max0 - min0;
+        if (range0 > 100.0f) {
+            hasGap = true;
+            if (debugLog) {
+                LOG::logline("Hi-Z Debug: Gap detected at mip 0 (range=%.1f) - forced visible", range0);
             }
         }
     } else if (depthRange > 100.0f) {

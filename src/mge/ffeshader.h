@@ -448,8 +448,14 @@ class FixedFunctionShader {
     // Bbox cache: maps mesh identifier to object-space bbox (persists across frames)
     static std::unordered_map<MeshKey, ObjectSpaceBBox, MeshKeyHash> bboxCache;
 
+    // Previous frame camera tracking for velocity-based bbox expansion
+    static D3DXVECTOR3 prevCameraPos;
+    static D3DXMATRIX prevCameraView;
+    static bool hasPrevCamera;
+
     // LightState cache: reuse shared_ptr for identical lighting states to avoid redundant allocations
     static std::shared_ptr<LightState> lastLightState;
+    static const LightState* lastLightStatePtr;  // Raw pointer for fast O(1) comparison
     static bool compareLightStates(const LightState* a, const LightState* b);
 
     static void startRecording();

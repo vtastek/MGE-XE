@@ -1,5 +1,6 @@
 
 #include "mged3d8device.h"
+#include "tracy/Tracy.hpp"
 #include "proxydx/d3d8texture.h"
 #include "proxydx/d3d8surface.h"
 
@@ -102,6 +103,8 @@ MGEProxyDevice::MGEProxyDevice(IDirect3DDevice9* real, ProxyD3D* d3d) : ProxyDev
 // Present - End of MW frame
 // MGE end of frame processing
 HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, const RGNDATA* d) {
+    ZoneScopedN("MGE_Present");
+
     auto mwBridge = MWBridge::get();
 
     // Load Morrowind's dynamic memory pointers
@@ -281,6 +284,7 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         stateSaved->Release();
     }
 
+    FrameMark;  // Mark frame boundary at the very end of Present()
     return ProxyDevice::Present(a, b, c, d);
 }
 
@@ -529,6 +533,8 @@ HRESULT _stdcall MGEProxyDevice::SetTextureStageState(DWORD a, D3DTEXTURESTAGEST
 // DrawIndexedPrimitive - Where all the drawing happens
 // Inspect draw calls for re-use later
 HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b, UINT c, UINT d, UINT e) {
+    ZoneScopedN("DrawIndexedPrimitive");
+
     // Allow distant land to inspect draw calls
     bool isShadowStencil = isStencilScene && stencilRef <= 1;
     if (DistantLand::ready && rendertargetNormal && isMainView && !isShadowStencil) {

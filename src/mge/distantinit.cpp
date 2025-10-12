@@ -3,6 +3,7 @@
 #include "support/log.h"
 #include "configuration.h"
 #include "distantland.h"
+#include "tracy/Tracy.hpp"
 #include "distantshader.h"
 #include "distantlandhlsl.h"
 #include "dlformat.h"
@@ -72,7 +73,13 @@ IDirect3DTexture9* DistantLand::texCullDepth;
 IDirect3DTexture9* DistantLand::texHiZ;
 IDirect3DTexture9* DistantLand::texHiZPrev;
 IDirect3DTexture9* DistantLand::texHiZStaging;
+IDirect3DTexture9* DistantLand::texHiZStaging2;
 IDirect3DTexture9* DistantLand::texHiZStagingPrev;
+IDirect3DQuery9* DistantLand::queryHiZCopy = nullptr;
+IDirect3DQuery9* DistantLand::queryHiZCopy2 = nullptr;
+IDirect3DQuery9* DistantLand::queryHiZCopyPrev = nullptr;
+D3DLOCKED_RECT DistantLand::hiZLockedRects[16];
+int DistantLand::hiZLockedMips = 0;
 ID3DXEffect* DistantLand::effectHiZ;
 IDirect3DVertexShader9* DistantLand::vsHiZ = nullptr;
 IDirect3DPixelShader9* DistantLand::psHiZ = nullptr;
@@ -80,6 +87,7 @@ int DistantLand::hiZLevels;
 
 // Texture-based lighting system
 std::vector<DistantLand::SceneLight> DistantLand::sceneLights;
+std::unordered_map<int, size_t> DistantLand::sceneLightIndexMap;
 std::vector<DistantLand::SceneLight> DistantLand::visibleLights;
 IDirect3DTexture9* DistantLand::texLightData = nullptr;
 IDirect3DTexture9* DistantLand::texDistantBlend;
@@ -715,7 +723,7 @@ bool DistantLand::initHiZ() {
     D3DSURFACE_DESC desc;
     texHiZ->GetLevelDesc(0, &desc);
     hiZLevels = texHiZ->GetLevelCount();
-    LOG::logline(">> Hi-Z texture created: %dx%d with %d mip levels (double-buffered)", desc.Width, desc.Height, hiZLevels);
+    LOG::logline(">> Hi-Z texture created: %dx%d with %d mip levels (triple-buffered for 2-frame latency)", desc.Width, desc.Height, hiZLevels);
 
     // Create staging texture with matching mip chain for CPU readback
     hr = device->CreateTexture(baseWidth, baseHeight, 0, 0, D3DFMT_R32F, D3DPOOL_SYSTEMMEM, &texHiZStaging, NULL);
@@ -724,12 +732,42 @@ bool DistantLand::initHiZ() {
         return false;
     }
 
-    // Create previous frame staging texture (for async culling)
-    hr = device->CreateTexture(baseWidth, baseHeight, 0, 0, D3DFMT_R32F, D3DPOOL_SYSTEMMEM, &texHiZStagingPrev, NULL);
+    // Create second staging texture (frame N-1, triple-buffering)
+    hr = device->CreateTexture(baseWidth, baseHeight, 0, 0, D3DFMT_R32F, D3DPOOL_SYSTEMMEM, &texHiZStaging2, NULL);
     if (hr != D3D_OK) {
-        LOG::logline("!! Failed to create previous frame Hi-Z staging texture");
+        LOG::logline("!! Failed to create Hi-Z staging2 texture");
         return false;
     }
+
+    // Create third staging texture (frame N-2, safe to lock - triple-buffering)
+    hr = device->CreateTexture(baseWidth, baseHeight, 0, 0, D3DFMT_R32F, D3DPOOL_SYSTEMMEM, &texHiZStagingPrev, NULL);
+    if (hr != D3D_OK) {
+        LOG::logline("!! Failed to create Hi-Z stagingPrev texture");
+        return false;
+    }
+
+    LOG::logline(">> Hi-Z staging textures created (triple-buffered for 2-frame latency)");
+
+    // Create D3D9 Event Queries to track when GetRenderTargetData completes for each staging buffer
+    hr = device->CreateQuery(D3DQUERYTYPE_EVENT, &queryHiZCopy);
+    if (hr != D3D_OK) {
+        LOG::logline("!! Failed to create Hi-Z copy query (frame N)");
+        return false;
+    }
+
+    hr = device->CreateQuery(D3DQUERYTYPE_EVENT, &queryHiZCopy2);
+    if (hr != D3D_OK) {
+        LOG::logline("!! Failed to create Hi-Z copy query (frame N-1)");
+        return false;
+    }
+
+    hr = device->CreateQuery(D3DQUERYTYPE_EVENT, &queryHiZCopyPrev);
+    if (hr != D3D_OK) {
+        LOG::logline("!! Failed to create Hi-Z copy query (frame N-2)");
+        return false;
+    }
+
+    LOG::logline(">> Hi-Z Event Queries created for triple-buffer sync");
 
     // Load Hi-Z downsample shader
     std::string shaderPath = "Data Files\\shaders\\core\\XE HiZ.fx";
@@ -1604,9 +1642,25 @@ void DistantLand::release() {
         texHiZStaging->Release();
         texHiZStaging = nullptr;
     }
+    if (texHiZStaging2) {
+        texHiZStaging2->Release();
+        texHiZStaging2 = nullptr;
+    }
     if (texHiZStagingPrev) {
         texHiZStagingPrev->Release();
         texHiZStagingPrev = nullptr;
+    }
+    if (queryHiZCopy) {
+        queryHiZCopy->Release();
+        queryHiZCopy = nullptr;
+    }
+    if (queryHiZCopy2) {
+        queryHiZCopy2->Release();
+        queryHiZCopy2 = nullptr;
+    }
+    if (queryHiZCopyPrev) {
+        queryHiZCopyPrev->Release();
+        queryHiZCopyPrev = nullptr;
     }
     if (effectHiZ) {
         effectHiZ->Release();
