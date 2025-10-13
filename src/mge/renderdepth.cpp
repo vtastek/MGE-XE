@@ -228,16 +228,18 @@ void DistantLand::generateHiZPyramid() {
     device->SetVertexShader(vsHiZ);
     device->SetPixelShader(psHiZ);
 
-    // Generate all mip levels using MAX downsampling shader
-    for (int mipLevel = 0; mipLevel < hiZLevels; mipLevel++) {
+    // Generate all mip levels using MAX downsampling shader (only valid mips down to 8x8)
+    int actualMipsGenerated = 0;
+    for (int mipLevel = 0; mipLevel < hiZValidMips; mipLevel++) {
         // Get dimensions of destination mip level
         D3DSURFACE_DESC dstDesc;
         texHiZ->GetLevelDesc(mipLevel, &dstDesc);
 
-        // Stop at 8x8 minimum - don't generate smaller mips
+        // Double-check: Stop at 8x8 minimum - don't generate smaller mips
         if (dstDesc.Width < 8 || dstDesc.Height < 8) {
             break;
         }
+        actualMipsGenerated++;
 
         // Set render target to current mip level
         texHiZ->GetSurfaceLevel(mipLevel, &dstSurf);
@@ -302,9 +304,9 @@ void DistantLand::generateHiZPyramid() {
     savedRT0->Release();
     if (savedDepthStencil) savedDepthStencil->Release();
 
-    // Step 3: Copy entire Hi-Z mip chain to staging texture for CPU readback
+    // Step 3: Copy valid Hi-Z mips to staging texture for CPU readback (only mips down to 8x8)
     // Note: GetRenderTargetData queues the copy, but GPU work is async - use query to track completion
-    for (int mipLevel = 0; mipLevel < hiZLevels; mipLevel++) {
+    for (int mipLevel = 0; mipLevel < hiZValidMips; mipLevel++) {
         IDirect3DSurface9* srcSurf = nullptr;
         IDirect3DSurface9* dstSurf = nullptr;
 
@@ -322,11 +324,6 @@ void DistantLand::generateHiZPyramid() {
             }
             return;
         }
-    }
-
-    // Issue D3D9 Event Query to track when GetRenderTargetData completes for this staging buffer
-    if (queryHiZCopy) {
-        queryHiZCopy->Issue(D3DISSUE_END);
     }
 
     // Debug: Sample a few depth values from mip 0 to verify Hi-Z content
@@ -367,29 +364,38 @@ void DistantLand::generateHiZPyramid() {
     queryHiZCopy2 = queryHiZCopy;
     queryHiZCopy = tempQuery;
 
+    // Issue D3D9 Event Query AFTER rotation, so queryHiZCopy tracks the buffer we just copied to
+    if (queryHiZCopy) {
+        queryHiZCopy->Issue(D3DISSUE_END);
+    }
+
     // Pre-lock FIRST HALF of mip levels from 2-frame-old staging (query-synced, minimal stall)
     // Wait for GPU copy to complete before locking (check query for N-2 frame)
+    static int checkCount = 0;
+
+    // Skip first 2 checks - triple buffer needs 2 frames to prime
+    if (checkCount < 2) {
+        checkCount++;
+        return;
+    }
+
     if (queryHiZCopyPrev) {
-        // Poll query until GPU signals completion (or timeout after 100ms)
-        int attempts = 0;
-        while (attempts < 1000) {
-            HRESULT hr = queryHiZCopyPrev->GetData(NULL, 0, D3DGETDATA_FLUSH);
-            if (hr == S_OK) {
-                break; // GPU finished copying
+        // Poll query until GPU signals completion (should complete immediately after 2 frames)
+        // Use minimal attempts since 2 frames is plenty of time for GetRenderTargetData
+        HRESULT hr = queryHiZCopyPrev->GetData(NULL, 0, 0);
+
+        if (hr != S_OK) {
+            // Query not ready - very rare, skip locking this frame
+            static int timeoutCount = 0;
+            if (timeoutCount < 3) {
+                LOG::logline("!! Hi-Z: Query not ready after 2 frames (unusual) - skipping pre-lock");
+                timeoutCount++;
             }
-            if (hr != S_FALSE) {
-                LOG::logline("!! Hi-Z: Query failed with error 0x%08x", hr);
-                break;
-            }
-            // Query still pending, spin-wait a bit (GPU work in progress)
-            attempts++;
-        }
-        if (attempts >= 1000) {
-            LOG::logline("!! Hi-Z: Query timeout after 100ms - GPU copy still not complete!");
+            return;
         }
     }
 
-    int mipsToLockNow = (hiZLevels + 1) / 2; // Lock lower mips (0 to mid-1), most commonly used
+    int mipsToLockNow = (hiZValidMips + 1) / 2; // Lock lower mips (0 to mid-1), most commonly used
     for (int mip = 0; mip < mipsToLockNow; mip++) {
         HRESULT hr = texHiZStagingPrev->LockRect(mip, &hiZLockedRects[mip], NULL, D3DLOCK_READONLY);
         if (FAILED(hr)) {
@@ -408,13 +414,13 @@ void DistantLand::generateHiZPyramid() {
 void DistantLand::lockRemainingHiZMips() {
     ZoneScopedN("HiZ_LockRemainingMips");
 
-    if (!texHiZStagingPrev || hiZLockedMips >= hiZLevels) {
-        return; // Already all locked or no texture
+    if (!texHiZStagingPrev || hiZLockedMips >= hiZValidMips) {
+        return; // Already all valid mips locked or no texture
     }
 
-    // Lock SECOND HALF of mip levels (remaining mips from where we left off)
+    // Lock SECOND HALF of mip levels (remaining valid mips from where we left off)
     int startMip = hiZLockedMips;
-    for (int mip = startMip; mip < hiZLevels; mip++) {
+    for (int mip = startMip; mip < hiZValidMips; mip++) {
         HRESULT hr = texHiZStagingPrev->LockRect(mip, &hiZLockedRects[mip], NULL, D3DLOCK_READONLY);
         if (FAILED(hr)) {
             LOG::logline("!! Hi-Z: Failed to lock remaining mip %d", mip);
@@ -425,7 +431,7 @@ void DistantLand::lockRemainingHiZMips() {
             return;
         }
     }
-    hiZLockedMips = hiZLevels; // Now all mips are locked
+    hiZLockedMips = hiZValidMips; // Now all valid mips are locked
 }
 
 bool DistantLand::cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& bboxMax, const D3DXMATRIX& worldViewProj, bool debugLog) {

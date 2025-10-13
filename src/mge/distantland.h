@@ -118,7 +118,8 @@ public:
     static ID3DXEffect* effectHiZ; // Shader effect for Hi-Z downsample
     static IDirect3DVertexShader9* vsHiZ; // Cached Hi-Z vertex shader (compiled once)
     static IDirect3DPixelShader9* psHiZ; // Cached Hi-Z pixel shader (compiled once)
-    static int hiZLevels; // Number of levels in Hi-Z pyramid
+    static int hiZLevels; // Number of levels in Hi-Z pyramid (total texture mips)
+    static int hiZValidMips; // Number of actually generated mips (stops at 8x8 minimum)
     static IDirect3DTexture9* texDistantBlend;
     static IDirect3DTexture9* texReflection;
     static IDirect3DSurface9* surfReflectionZ;

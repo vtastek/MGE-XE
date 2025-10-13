@@ -84,6 +84,7 @@ ID3DXEffect* DistantLand::effectHiZ;
 IDirect3DVertexShader9* DistantLand::vsHiZ = nullptr;
 IDirect3DPixelShader9* DistantLand::psHiZ = nullptr;
 int DistantLand::hiZLevels;
+int DistantLand::hiZValidMips = 0;
 
 // Texture-based lighting system
 std::vector<DistantLand::SceneLight> DistantLand::sceneLights;
@@ -723,7 +724,19 @@ bool DistantLand::initHiZ() {
     D3DSURFACE_DESC desc;
     texHiZ->GetLevelDesc(0, &desc);
     hiZLevels = texHiZ->GetLevelCount();
-    LOG::logline(">> Hi-Z texture created: %dx%d with %d mip levels (triple-buffered for 2-frame latency)", desc.Width, desc.Height, hiZLevels);
+
+    // Calculate how many mips will actually be generated (stops at 8x8 minimum)
+    hiZValidMips = 0;
+    int w = desc.Width;
+    int h = desc.Height;
+    while (hiZValidMips < hiZLevels && w >= 8 && h >= 8) {
+        hiZValidMips++;
+        w /= 2;
+        h /= 2;
+    }
+
+    LOG::logline(">> Hi-Z texture created: %dx%d with %d mip levels (%d valid down to 8x8, triple-buffered for 2-frame latency)",
+                 desc.Width, desc.Height, hiZLevels, hiZValidMips);
 
     // Create staging texture with matching mip chain for CPU readback
     hr = device->CreateTexture(baseWidth, baseHeight, 0, 0, D3DFMT_R32F, D3DPOOL_SYSTEMMEM, &texHiZStaging, NULL);
