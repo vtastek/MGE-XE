@@ -15,6 +15,13 @@
 void DistantLand::renderDepth() {
     auto mwBridge = MWBridge::get();
 
+    // DEBUG: Log that renderDepth is being called
+    static bool loggedOnce = false;
+    if (!loggedOnce) {
+        LOG::logline(">> renderDepth() is being called - depth rendering active");
+        loggedOnce = true;
+    }
+
     // Switch to render target
     RenderTargetSwitcher rtsw(surfDepthFrameMSAA, surfDepthDepth);
     device->Clear(0, 0, D3DCLEAR_ZBUFFER, 0, 1.0, 0);
@@ -122,6 +129,13 @@ void DistantLand::renderDepthRecorded() {
     // to have interpolated fragment values that vary either side of the threshold and cause noise.
     const float solidThreshold = 0.499f;
 
+    // DEBUG: Log renderDepthRecorded call and recordMW size
+    static bool loggedOnce = false;
+    if (!loggedOnce) {
+        LOG::logline(">> renderDepthRecorded() called with %d recorded draws", (int)recordMW.size());
+        loggedOnce = true;
+    }
+
     // Recorded renders
     const auto& recordMW_const = recordMW;
     for (const auto& i : recordMW_const) {
@@ -190,27 +204,43 @@ void DistantLand::renderDepthRecorded() {
     }
 }
 
-void DistantLand::generateHiZPyramid() {
-    ZoneScopedN("HiZ_GeneratePyramid");
-
-    // Unlock staging texture from 2 frames ago (all locked mips)
-    if (hiZLockedMips > 0 && texHiZStagingPrev) {
-        for (int mip = 0; mip < hiZLockedMips; mip++) {
-            texHiZStagingPrev->UnlockRect(mip);
-        }
-        hiZLockedMips = 0;
-    }
+// GPU-only Hi-Z mip generation (non-blocking, ~0.5ms)
+// Called at end of Present() - generates mips on GPU, returns immediately
+void DistantLand::generateHiZMipsGPU() {
+    ZoneScopedN("HiZ_GenerateMipsGPU");
 
     if (!texHiZ || !texHiZPrev || !effectHiZ) {
-        LOG::logline("Hi-Z: Skipping generation - texHiZ=%p texHiZPrev=%p effectHiZ=%p", texHiZ, texHiZPrev, effectHiZ);
+        LOG::logline("Hi-Z: Skipping GPU generation - texHiZ=%p texHiZPrev=%p effectHiZ=%p", texHiZ, texHiZPrev, effectHiZ);
         return;
     }
 
-    // Save current render targets explicitly
+    // Save current render targets and states that we'll modify
     IDirect3DSurface9* savedRT0;
     IDirect3DSurface9* savedDepthStencil;
-    device->GetRenderTarget(0, &savedRT0);
-    device->GetDepthStencilSurface(&savedDepthStencil);
+    D3DVIEWPORT9 savedViewport;
+    IDirect3DVertexShader9* savedVS = nullptr;
+    IDirect3DPixelShader9* savedPS = nullptr;
+    IDirect3DVertexDeclaration9* savedDecl = nullptr;
+    IDirect3DVertexBuffer9* savedVB = nullptr;
+    UINT savedVBStride, savedVBOffset;
+
+    // Save render states we'll modify
+    DWORD savedZEnable, savedZWriteEnable, savedCullMode, savedAlphaBlendEnable;
+
+    {
+        device->GetRenderTarget(0, &savedRT0);
+        device->GetDepthStencilSurface(&savedDepthStencil);
+        device->GetViewport(&savedViewport);
+        device->GetVertexShader(&savedVS);
+        device->GetPixelShader(&savedPS);
+        device->GetVertexDeclaration(&savedDecl);
+        device->GetStreamSource(0, &savedVB, &savedVBOffset, &savedVBStride);
+
+        device->GetRenderState(D3DRS_ZENABLE, &savedZEnable);
+        device->GetRenderState(D3DRS_ZWRITEENABLE, &savedZWriteEnable);
+        device->GetRenderState(D3DRS_CULLMODE, &savedCullMode);
+        device->GetRenderState(D3DRS_ALPHABLENDENABLE, &savedAlphaBlendEnable);
+    }
 
     // Use cached shaders (compiled once during initialization, not per-frame!)
     IDirect3DSurface9* dstSurf;
@@ -228,101 +258,206 @@ void DistantLand::generateHiZPyramid() {
     device->SetVertexShader(vsHiZ);
     device->SetPixelShader(psHiZ);
 
-    // Generate all mip levels using MAX downsampling shader (only valid mips down to 8x8)
-    int actualMipsGenerated = 0;
-    for (int mipLevel = 0; mipLevel < hiZValidMips; mipLevel++) {
-        // Get dimensions of destination mip level
-        D3DSURFACE_DESC dstDesc;
-        texHiZ->GetLevelDesc(mipLevel, &dstDesc);
+    // Generate all mip levels (0-N) using MAX downsampling shader
+    // Mip 0: Downsample from texCullDepth (320x240) to texHiZ mip 0 (160x120) using MAX
+    // Mips 1-N: Ping-pong downsample between texHiZ and texHiZPrev
+    {
+        int actualMipsGenerated = 0;
+        for (int mipLevel = 0; mipLevel < hiZValidMips; mipLevel++) {
+            // Determine which texture to render to and which to sample from (ping-pong)
+            // Even mips (0, 2, 4...): render to texHiZ, sample from texHiZPrev
+            // Odd mips  (1, 3, 5...): render to texHiZPrev, sample from texHiZ
+            IDirect3DTexture9* dstTexture = (mipLevel % 2 == 0) ? texHiZ : texHiZPrev;
+            IDirect3DTexture9* srcTexture;
 
-        // Double-check: Stop at 8x8 minimum - don't generate smaller mips
-        if (dstDesc.Width < 8 || dstDesc.Height < 8) {
-            break;
+            // Get dimensions of destination mip level
+            D3DSURFACE_DESC dstDesc;
+            dstTexture->GetLevelDesc(mipLevel, &dstDesc);
+
+            // Double-check: Stop at 8x8 minimum - don't generate smaller mips
+            if (dstDesc.Width < 8 || dstDesc.Height < 8) {
+                break;
+            }
+            actualMipsGenerated++;
+
+            // Set render target to current mip level of destination texture
+            dstTexture->GetSurfaceLevel(mipLevel, &dstSurf);
+            device->SetRenderTarget(0, dstSurf);
+            device->SetDepthStencilSurface(NULL);
+
+            // Set viewport to match the current mip size
+            D3DVIEWPORT9 vp;
+            vp.X = 0;
+            vp.Y = 0;
+            vp.Width = dstDesc.Width;
+            vp.Height = dstDesc.Height;
+            vp.MinZ = 0.0f;
+            vp.MaxZ = 1.0f;
+            device->SetViewport(&vp);
+
+            // Get SOURCE dimensions and mip level (texture we're sampling from)
+            D3DSURFACE_DESC srcDesc;
+            int sourceMipLevel;
+
+            if (mipLevel == 0) {
+                // Mip 0: Sample from texCullDepth (Morrowind geometry only, copied from surfDepthFrameMSAA)
+                // texCullDepth is filled by StretchRect in distantland.cpp:206 after renderDepth()
+                texCullDepth->GetLevelDesc(0, &srcDesc);
+                sourceMipLevel = 0;
+                srcTexture = texCullDepth;
+            } else {
+                // Mip N: Sample from OPPOSITE texture's mip N-1 (ping-pong to avoid read/write conflict!)
+                srcTexture = (mipLevel % 2 == 0) ? texHiZPrev : texHiZ;
+                srcTexture->GetLevelDesc(mipLevel - 1, &srcDesc);
+                sourceMipLevel = mipLevel - 1;
+            }
+
+            // Bind source texture (will be different from destination!)
+            device->SetTexture(0, srcTexture);
+
+            // Configure sampler with POINT filtering (matches HizMipmap9.fx)
+            // CRITICAL: MIPFILTER must be POINT (not NONE) for tex2Dlod to access mip levels!
+            device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+            device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+            device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT);  // Was NONE - broke tex2Dlod!
+            device->SetSamplerState(0, D3DSAMP_MAXMIPLEVEL, 0);  // Allow all mip levels
+            device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+            device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+
+            // Set SOURCE texture info as pixel shader constant (c0)
+            // xy = source dimensions, z = source mip level, w = destination mip level
+            // CRITICAL: tex2Dlod needs the SOURCE mip level, not destination!
+            float sourceInfo[4] = { (float)srcDesc.Width, (float)srcDesc.Height, (float)sourceMipLevel, (float)mipLevel };
+            device->SetPixelShaderConstantF(0, sourceInfo, 1);
+
+            // Set render states
+            device->SetRenderState(D3DRS_ZENABLE, FALSE);
+            device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+            device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+            device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+
+            // Render full-screen quad with MAX downsample shader
+            device->SetVertexDeclaration(WaterDecl);
+            device->SetStreamSource(0, vbFullFrame, 0, 12);
+            device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+
+            // CRITICAL: Unbind source texture BEFORE next iteration (matches HZBManagerD3D9.cpp:213)
+            // D3D9 requires this so the texture can be sampled in the next ping-pong step
+            // Do NOT unbind render target - let next iteration SetRenderTarget handle it
+            device->SetTexture(0, nullptr);
+
+            dstSurf->Release();
         }
-        actualMipsGenerated++;
 
-        // Set render target to current mip level
-        texHiZ->GetSurfaceLevel(mipLevel, &dstSurf);
-        device->SetRenderTarget(0, dstSurf);
-        device->SetDepthStencilSurface(NULL);
+        // No consolidation needed - GPU culling shader samples from both textures
+        // Even mips (0,2,4...) are in texHiZ, odd mips (1,3,5...) are in texHiZPrev
+        // The shader checks mip level % 2 and samples from appropriate texture
 
-        // Set viewport to match the current mip size
-        D3DVIEWPORT9 vp;
-        vp.X = 0;
-        vp.Y = 0;
-        vp.Width = dstDesc.Width;
-        vp.Height = dstDesc.Height;
-        vp.MinZ = 0.0f;
-        vp.MaxZ = 1.0f;
-        device->SetViewport(&vp);
-
-        // Bind input texture: texCullDepth for mip 0, previous mip level for others
-        if (mipLevel == 0) {
-            device->SetTexture(0, texCullDepth);
-        } else {
-            device->SetTexture(0, texHiZ);
-            // Force sampling from previous mip level only
-            device->SetSamplerState(0, D3DSAMP_MAXMIPLEVEL, mipLevel - 1);
-        }
-
-        // Configure sampler with POINT filtering
-        device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
-        device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
-        device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
-        device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
-        device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
-
-        // Set texel size as pixel shader constant (c0)
-        // Use current output size (not previous) to map output pixels to 2x2 input regions
-        float texelSize[4] = { 1.0f / dstDesc.Width, 1.0f / dstDesc.Height, 0.0f, 0.0f };
-        device->SetPixelShaderConstantF(0, texelSize, 1);
-
-        // Set render states
-        device->SetRenderState(D3DRS_ZENABLE, FALSE);
-        device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
-        device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
-        device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-
-        // Render full-screen quad with MAX downsample shader
-        device->SetVertexDeclaration(WaterDecl);
-        device->SetStreamSource(0, vbFullFrame, 0, 12);
-        device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
-
-        dstSurf->Release();
+        // Depth texture logging removed - render targets can't be locked directly
     }
 
-    // Reset sampler state
+    // Reset sampler states we modified
     device->SetSamplerState(0, D3DSAMP_MAXMIPLEVEL, 0);
+    device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+    device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
+    device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+    device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
 
-    // Cleanup (don't release cached shaders - they're reused every frame!)
-    device->SetVertexShader(NULL);
-    device->SetPixelShader(NULL);
+    // Restore all modified state
+    {
+        device->SetRenderTarget(0, savedRT0);
+        device->SetDepthStencilSurface(savedDepthStencil);
+        device->SetViewport(&savedViewport);
+        device->SetVertexShader(savedVS);
+        device->SetPixelShader(savedPS);
+        device->SetVertexDeclaration(savedDecl);
+        device->SetStreamSource(0, savedVB, savedVBOffset, savedVBStride);
+        device->SetTexture(0, nullptr);  // Clear texture binding
 
-    // Restore render targets explicitly
-    device->SetRenderTarget(0, savedRT0);
-    device->SetDepthStencilSurface(savedDepthStencil);
-    savedRT0->Release();
-    if (savedDepthStencil) savedDepthStencil->Release();
+        // Restore render states
+        device->SetRenderState(D3DRS_ZENABLE, savedZEnable);
+        device->SetRenderState(D3DRS_ZWRITEENABLE, savedZWriteEnable);
+        device->SetRenderState(D3DRS_CULLMODE, savedCullMode);
+        device->SetRenderState(D3DRS_ALPHABLENDENABLE, savedAlphaBlendEnable);
+
+        // Release saved references
+        savedRT0->Release();
+        if (savedDepthStencil) savedDepthStencil->Release();
+        if (savedVS) savedVS->Release();
+        if (savedPS) savedPS->Release();
+        if (savedDecl) savedDecl->Release();
+        if (savedVB) savedVB->Release();
+    }
+}
+
+// CPU-GPU sync copy from render target to staging texture (blocking, ~1.5ms)
+// Called at beginning of Clear/BeginScene() - copies GPU-generated mips to CPU-readable staging
+void DistantLand::copyHiZToStaging() {
+    {
+        // Unlock staging texture from 2 frames ago (all locked mips)
+        if (hiZLockedMips > 0 && texHiZStagingPrev) {
+            for (int mip = 0; mip < hiZLockedMips; mip++) {
+                texHiZStagingPrev->UnlockRect(mip);
+            }
+            hiZLockedMips = 0;
+        }
+    }
+
+    if (!texHiZ || !texHiZPrev) {
+        return;
+    }
 
     // Step 3: Copy valid Hi-Z mips to staging texture for CPU readback (only mips down to 8x8)
-    // Note: GetRenderTargetData queues the copy, but GPU work is async - use query to track completion
-    for (int mipLevel = 0; mipLevel < hiZValidMips; mipLevel++) {
-        IDirect3DSurface9* srcSurf = nullptr;
-        IDirect3DSurface9* dstSurf = nullptr;
+    // IMPORTANT: Check if previous GetRenderTargetData is complete BEFORE issuing a new one
+    // This allows us to skip the copy if GPU is still busy, avoiding 6ms stalls
+    bool canCopyThisFrame = false;
 
-        texHiZ->GetSurfaceLevel(mipLevel, &srcSurf);
-        texHiZStaging->GetSurfaceLevel(mipLevel, &dstSurf);
-        HRESULT hr = device->GetRenderTargetData(srcSurf, dstSurf);
-        srcSurf->Release();
-        dstSurf->Release();
-
-        if (FAILED(hr)) {
-            static bool loggedOnce = false;
-            if (!loggedOnce) {
-                LOG::logline("!! Hi-Z: GetRenderTargetData failed for mip %d", mipLevel);
-                loggedOnce = true;
+    {
+        if (queryHiZCopy) {
+            // Non-blocking query check: Is the previous GetRenderTargetData complete?
+            HRESULT hr = queryHiZCopy->GetData(NULL, 0, D3DGETDATA_FLUSH);
+            if (hr == S_OK) {
+                // Previous copy finished - safe to issue new one
+                canCopyThisFrame = true;
+            } else {
+                // GPU still busy with previous copy - skip this frame, use old Hi-Z data
+                // This is the KEY to non-blocking behavior!
+                canCopyThisFrame = false;
             }
-            return;
+        } else {
+            // No query available - first frame, just try the copy
+            canCopyThisFrame = true;
+        }
+    }
+
+    if (!canCopyThisFrame) {
+        // Skip GetRenderTargetData this frame - GPU busy, use previous Hi-Z data
+        // This prevents the 6ms stall and maintains frame rate!
+        // Don't rotate buffers or issue query - keep using current pyramid
+        return;
+    }
+
+    // Only copy if GPU is ready (non-blocking async behavior)
+    {
+        for (int mipLevel = 0; mipLevel < hiZValidMips; mipLevel++) {
+            IDirect3DSurface9* srcSurf = nullptr;
+            IDirect3DSurface9* dstSurf = nullptr;
+
+            texHiZ->GetSurfaceLevel(mipLevel, &srcSurf);
+            texHiZStaging->GetSurfaceLevel(mipLevel, &dstSurf);
+            HRESULT hr = device->GetRenderTargetData(srcSurf, dstSurf);
+            srcSurf->Release();
+            dstSurf->Release();
+
+            if (FAILED(hr)) {
+                static bool loggedOnce = false;
+                if (!loggedOnce) {
+                    LOG::logline("!! Hi-Z: GetRenderTargetData failed for mip %d", mipLevel);
+                    loggedOnce = true;
+                }
+                return;
+            }
         }
     }
 
@@ -349,70 +484,73 @@ void DistantLand::generateHiZPyramid() {
         }
     }
 
-    // Swap Hi-Z buffers: current becomes previous for next frame's culling
-    std::swap(texHiZ, texHiZPrev);
+    {
+        // Swap Hi-Z buffers: current becomes previous for next frame's culling
+        std::swap(texHiZ, texHiZPrev);
 
-    // Triple-buffer rotation: N → N-1 → N-2 → N (gives 2 frames = ~40ms for GetRenderTargetData to complete)
-    IDirect3DTexture9* temp = texHiZStagingPrev;  // Save N-2 (oldest, about to be freed for reuse)
-    texHiZStagingPrev = texHiZStaging2;           // N-1 becomes N-2 (safe to lock now)
-    texHiZStaging2 = texHiZStaging;               // N becomes N-1 (still copying)
-    texHiZStaging = temp;                         // N-2 becomes N (ready for fresh GetRenderTargetData)
+        // Triple-buffer rotation: N → N-1 → N-2 → N (gives 2 frames = ~40ms for GetRenderTargetData to complete)
+        IDirect3DTexture9* temp = texHiZStagingPrev;  // Save N-2 (oldest, about to be freed for reuse)
+        texHiZStagingPrev = texHiZStaging2;           // N-1 becomes N-2 (safe to lock now)
+        texHiZStaging2 = texHiZStaging;               // N becomes N-1 (still copying)
+        texHiZStaging = temp;                         // N-2 becomes N (ready for fresh GetRenderTargetData)
 
-    // Rotate queries along with buffers
-    IDirect3DQuery9* tempQuery = queryHiZCopyPrev;
-    queryHiZCopyPrev = queryHiZCopy2;
-    queryHiZCopy2 = queryHiZCopy;
-    queryHiZCopy = tempQuery;
+        // Rotate queries along with buffers
+        IDirect3DQuery9* tempQuery = queryHiZCopyPrev;
+        queryHiZCopyPrev = queryHiZCopy2;
+        queryHiZCopy2 = queryHiZCopy;
+        queryHiZCopy = tempQuery;
 
-    // Issue D3D9 Event Query AFTER rotation, so queryHiZCopy tracks the buffer we just copied to
-    if (queryHiZCopy) {
-        queryHiZCopy->Issue(D3DISSUE_END);
-    }
-
-    // Pre-lock FIRST HALF of mip levels from 2-frame-old staging (query-synced, minimal stall)
-    // Wait for GPU copy to complete before locking (check query for N-2 frame)
-    static int checkCount = 0;
-
-    // Skip first 2 checks - triple buffer needs 2 frames to prime
-    if (checkCount < 2) {
-        checkCount++;
-        return;
-    }
-
-    if (queryHiZCopyPrev) {
-        // Poll query until GPU signals completion (should complete immediately after 2 frames)
-        // Use minimal attempts since 2 frames is plenty of time for GetRenderTargetData
-        HRESULT hr = queryHiZCopyPrev->GetData(NULL, 0, 0);
-
-        if (hr != S_OK) {
-            // Query not ready - very rare, skip locking this frame
-            static int timeoutCount = 0;
-            if (timeoutCount < 3) {
-                LOG::logline("!! Hi-Z: Query not ready after 2 frames (unusual) - skipping pre-lock");
-                timeoutCount++;
-            }
-            return;
+        // Issue D3D9 Event Query AFTER rotation, so queryHiZCopy tracks the buffer we just copied to
+        if (queryHiZCopy) {
+            queryHiZCopy->Issue(D3DISSUE_END);
         }
     }
 
-    int mipsToLockNow = (hiZValidMips + 1) / 2; // Lock lower mips (0 to mid-1), most commonly used
-    for (int mip = 0; mip < mipsToLockNow; mip++) {
-        HRESULT hr = texHiZStagingPrev->LockRect(mip, &hiZLockedRects[mip], NULL, D3DLOCK_READONLY);
-        if (FAILED(hr)) {
-            LOG::logline("!! Hi-Z: Failed to pre-lock mip %d (2 frames old)", mip);
-            // Unlock any that succeeded
-            for (int j = 0; j < mip; j++) {
-                texHiZStagingPrev->UnlockRect(j);
-            }
-            hiZLockedMips = 0;
+    {
+        // Pre-lock FIRST HALF of mip levels from 2-frame-old staging (query-synced, minimal stall)
+        // Wait for GPU copy to complete before locking (check query for N-2 frame)
+        static int checkCount = 0;
+
+        // Skip first 2 checks - triple buffer needs 2 frames to prime
+        if (checkCount < 2) {
+            checkCount++;
             return;
         }
+
+        if (queryHiZCopyPrev) {
+            // Poll query until GPU signals completion (should complete immediately after 2 frames)
+            // Use minimal attempts since 2 frames is plenty of time for GetRenderTargetData
+            HRESULT hr = queryHiZCopyPrev->GetData(NULL, 0, 0);
+
+            if (hr != S_OK) {
+                // Query not ready - very rare, skip locking this frame
+                static int timeoutCount = 0;
+                if (timeoutCount < 3) {
+                    LOG::logline("!! Hi-Z: Query not ready after 2 frames (unusual) - skipping pre-lock");
+                    timeoutCount++;
+                }
+                return;
+            }
+        }
+
+        int mipsToLockNow = (hiZValidMips + 1) / 2; // Lock lower mips (0 to mid-1), most commonly used
+        for (int mip = 0; mip < mipsToLockNow; mip++) {
+            HRESULT hr = texHiZStagingPrev->LockRect(mip, &hiZLockedRects[mip], NULL, D3DLOCK_READONLY);
+            if (FAILED(hr)) {
+                LOG::logline("!! Hi-Z: Failed to pre-lock mip %d (2 frames old)", mip);
+                // Unlock any that succeeded
+                for (int j = 0; j < mip; j++) {
+                    texHiZStagingPrev->UnlockRect(j);
+                }
+                hiZLockedMips = 0;
+                return;
+            }
+        }
+        hiZLockedMips = mipsToLockNow;
     }
-    hiZLockedMips = mipsToLockNow;
 }
 
 void DistantLand::lockRemainingHiZMips() {
-    ZoneScopedN("HiZ_LockRemainingMips");
 
     if (!texHiZStagingPrev || hiZLockedMips >= hiZValidMips) {
         return; // Already all valid mips locked or no texture
@@ -435,7 +573,9 @@ void DistantLand::lockRemainingHiZMips() {
 }
 
 bool DistantLand::cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& bboxMax, const D3DXMATRIX& worldViewProj, bool debugLog) {
-    ZoneScopedN("HiZ_CullAgainstHiZ");
+
+    // TEMPORARY: Disable Hi-Z culling while debugging pyramid data issue
+    return false;
 
     // Use previous frame's Hi-Z for async culling (no GPU stall waiting for current frame)
     if (!texHiZStagingPrev || hiZLockedMips == 0) return false;
@@ -805,4 +945,417 @@ void DistantLand::uploadLightDataToTexture(const D3DXMATRIX& viewMatrix) {
     device->SetTexture(5, texLightData);
 
     LOG::logline(">> Uploaded %d lights to texture (slot 5)", numLights);
+}
+
+// -------- GPU-Based Hi-Z Occlusion Culling Implementation --------
+
+void DistantLand::initGPUCulling() {
+    LOG::logline(">> Initializing GPU-based Hi-Z occlusion culling");
+
+    // Load GPU culling shader
+    {
+        ID3DXBuffer* errors = nullptr;
+        const char* shaderPath = "Data Files\\shaders\\core-hlsl\\XE HiZCull.hlsl";
+
+        HRESULT hr = D3DXCreateEffectFromFileA(
+            device,
+            shaderPath,
+            nullptr,
+            nullptr,
+            D3DXSHADER_OPTIMIZATION_LEVEL3,
+            effectPool,
+            &effectGPUCull,
+            &errors
+        );
+
+        if (FAILED(hr)) {
+            if (errors) {
+                LOG::logline("!! GPU culling shader compile error:\n%s", (char*)errors->GetBufferPointer());
+                errors->Release();
+            }
+            LOG::logline("!! Failed to load GPU culling shader: %s", shaderPath);
+            return;
+        }
+
+        if (errors) {
+            LOG::logline("-- GPU culling shader warnings:\n%s", (char*)errors->GetBufferPointer());
+            errors->Release();
+        }
+
+        LOG::logline(">> Loaded GPU culling shader: %s", shaderPath);
+    }
+
+    // Create vertex declaration for bounding box data
+    {
+        D3DVERTEXELEMENT9 elements[] = {
+            { 0, 0,  D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0 }, // BBoxMin
+            { 0, 12, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 1 }, // BBoxMax
+            { 0, 24, D3DDECLTYPE_FLOAT2, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 0 }, // ResultPixel
+            D3DDECL_END()
+        };
+
+        HRESULT hr = device->CreateVertexDeclaration(elements, &declGPUCullBounds);
+        if (FAILED(hr)) {
+            LOG::logline("!! Failed to create GPU culling vertex declaration");
+            return;
+        }
+    }
+
+    // Allocate vertex buffer for bounding boxes (initial size: 4096 objects)
+    const UINT initialMaxObjects = 4096;
+    const UINT vertexSize = sizeof(float) * 8; // 3 + 3 + 2 = 8 floats per vertex
+    {
+        HRESULT hr = device->CreateVertexBuffer(
+            initialMaxObjects * vertexSize,
+            D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
+            0,
+            D3DPOOL_DEFAULT,
+            &vbGPUCullBounds,
+            nullptr
+        );
+
+        if (FAILED(hr)) {
+            LOG::logline("!! Failed to create GPU culling vertex buffer");
+            return;
+        }
+    }
+
+    // Calculate results texture size (1 pixel per object, packed into square)
+    gpuCullMaxObjects = initialMaxObjects;
+    gpuCullResultsWidth = (UINT)ceil(sqrt((float)gpuCullMaxObjects));
+    gpuCullResultsHeight = gpuCullResultsWidth;
+
+    // Create results texture in GPU memory (render target)
+    {
+        HRESULT hr = device->CreateTexture(
+            gpuCullResultsWidth,
+            gpuCullResultsHeight,
+            1, // Single mip level
+            D3DUSAGE_RENDERTARGET,
+            D3DFMT_A8R8G8B8, // Simple 32-bit format for visibility flags
+            D3DPOOL_DEFAULT,
+            &texGPUCullResults,
+            nullptr
+        );
+
+        if (FAILED(hr)) {
+            LOG::logline("!! Failed to create GPU culling results texture (GPU)");
+            return;
+        }
+
+        hr = texGPUCullResults->GetSurfaceLevel(0, &surfGPUCullResults);
+        if (FAILED(hr)) {
+            LOG::logline("!! Failed to get GPU culling results surface (GPU)");
+            return;
+        }
+    }
+
+    // Create results texture in system memory (for readback)
+    {
+        HRESULT hr = device->CreateTexture(
+            gpuCullResultsWidth,
+            gpuCullResultsHeight,
+            1,
+            0, // No D3DUSAGE flags
+            D3DFMT_A8R8G8B8,
+            D3DPOOL_SYSTEMMEM,
+            &texGPUCullResultsSys,
+            nullptr
+        );
+
+        if (FAILED(hr)) {
+            LOG::logline("!! Failed to create GPU culling results texture (system memory)");
+            return;
+        }
+
+        hr = texGPUCullResultsSys->GetSurfaceLevel(0, &surfGPUCullResultsSys);
+        if (FAILED(hr)) {
+            LOG::logline("!! Failed to get GPU culling results surface (system memory)");
+            return;
+        }
+    }
+
+    LOG::logline(">> GPU culling initialized: max %d objects, results texture %dx%d",
+                 gpuCullMaxObjects, gpuCullResultsWidth, gpuCullResultsHeight);
+}
+
+void DistantLand::shutdownGPUCulling() {
+    if (surfGPUCullResultsSys) {
+        surfGPUCullResultsSys->Release();
+        surfGPUCullResultsSys = nullptr;
+    }
+    if (texGPUCullResultsSys) {
+        texGPUCullResultsSys->Release();
+        texGPUCullResultsSys = nullptr;
+    }
+    if (surfGPUCullResults) {
+        surfGPUCullResults->Release();
+        surfGPUCullResults = nullptr;
+    }
+    if (texGPUCullResults) {
+        texGPUCullResults->Release();
+        texGPUCullResults = nullptr;
+    }
+    if (declGPUCullBounds) {
+        declGPUCullBounds->Release();
+        declGPUCullBounds = nullptr;
+    }
+    if (vbGPUCullBounds) {
+        vbGPUCullBounds->Release();
+        vbGPUCullBounds = nullptr;
+    }
+    if (effectGPUCull) {
+        effectGPUCull->Release();
+        effectGPUCull = nullptr;
+    }
+
+    gpuCullMaxObjects = 0;
+    gpuCullResultsWidth = 0;
+    gpuCullResultsHeight = 0;
+}
+
+void DistantLand::beginGPUCullingQuery(
+    int numObjects,
+    const D3DXVECTOR3* bboxMins,
+    const D3DXVECTOR3* bboxMaxs,
+    const D3DXMATRIX& view,
+    const D3DXMATRIX& proj
+) {
+    if (!effectGPUCull || numObjects <= 0) {
+        return;
+    }
+
+    // Check if we need to resize buffers
+    if ((UINT)numObjects > gpuCullMaxObjects) {
+        LOG::logline(">> GPU culling: resizing buffers for %d objects (was %d)", numObjects, gpuCullMaxObjects);
+        shutdownGPUCulling();
+
+        // Reinitialize with larger size (round up to next power of 2)
+        UINT newSize = 1;
+        while (newSize < (UINT)numObjects) {
+            newSize *= 2;
+        }
+
+        gpuCullMaxObjects = newSize;
+        initGPUCulling();
+    }
+
+    // Upload bounding box data to vertex buffer
+    {
+
+        void* pData = nullptr;
+        HRESULT hr = vbGPUCullBounds->Lock(0, 0, &pData, D3DLOCK_DISCARD);
+        if (FAILED(hr)) {
+            LOG::logline("!! Failed to lock GPU culling vertex buffer");
+            return;
+        }
+
+        float* vertices = (float*)pData;
+        for (int i = 0; i < numObjects; i++) {
+            // Calculate pixel position in results texture
+            int pixelX = i % gpuCullResultsWidth;
+            int pixelY = i / gpuCullResultsWidth;
+
+            // BBoxMin (3 floats)
+            vertices[i * 8 + 0] = bboxMins[i].x;
+            vertices[i * 8 + 1] = bboxMins[i].y;
+            vertices[i * 8 + 2] = bboxMins[i].z;
+
+            // BBoxMax (3 floats)
+            vertices[i * 8 + 3] = bboxMaxs[i].x;
+            vertices[i * 8 + 4] = bboxMaxs[i].y;
+            vertices[i * 8 + 5] = bboxMaxs[i].z;
+
+            // ResultPixel (2 floats) - center of pixel
+            vertices[i * 8 + 6] = (float)pixelX + 0.5f;
+            vertices[i * 8 + 7] = (float)pixelY + 0.5f;
+        }
+
+        vbGPUCullBounds->Unlock();
+    }
+
+    // Compute view-projection matrix
+    D3DXMATRIX viewProj = view * proj;
+
+    // Extract frustum planes from view-projection matrix
+    D3DXVECTOR4 frustumPlanes[6];
+    {
+        // Left plane
+        frustumPlanes[0].x = viewProj._14 + viewProj._11;
+        frustumPlanes[0].y = viewProj._24 + viewProj._21;
+        frustumPlanes[0].z = viewProj._34 + viewProj._31;
+        frustumPlanes[0].w = viewProj._44 + viewProj._41;
+
+        // Right plane
+        frustumPlanes[1].x = viewProj._14 - viewProj._11;
+        frustumPlanes[1].y = viewProj._24 - viewProj._21;
+        frustumPlanes[1].z = viewProj._34 - viewProj._31;
+        frustumPlanes[1].w = viewProj._44 - viewProj._41;
+
+        // Bottom plane
+        frustumPlanes[2].x = viewProj._14 + viewProj._12;
+        frustumPlanes[2].y = viewProj._24 + viewProj._22;
+        frustumPlanes[2].z = viewProj._34 + viewProj._32;
+        frustumPlanes[2].w = viewProj._44 + viewProj._42;
+
+        // Top plane
+        frustumPlanes[3].x = viewProj._14 - viewProj._12;
+        frustumPlanes[3].y = viewProj._24 - viewProj._22;
+        frustumPlanes[3].z = viewProj._34 - viewProj._32;
+        frustumPlanes[3].w = viewProj._44 - viewProj._42;
+
+        // Near plane
+        frustumPlanes[4].x = viewProj._13;
+        frustumPlanes[4].y = viewProj._23;
+        frustumPlanes[4].z = viewProj._33;
+        frustumPlanes[4].w = viewProj._43;
+
+        // Far plane
+        frustumPlanes[5].x = viewProj._14 - viewProj._13;
+        frustumPlanes[5].y = viewProj._24 - viewProj._23;
+        frustumPlanes[5].z = viewProj._34 - viewProj._33;
+        frustumPlanes[5].w = viewProj._44 - viewProj._43;
+
+        // Normalize planes
+        for (int i = 0; i < 6; i++) {
+            float len = sqrt(frustumPlanes[i].x * frustumPlanes[i].x +
+                           frustumPlanes[i].y * frustumPlanes[i].y +
+                           frustumPlanes[i].z * frustumPlanes[i].z);
+            if (len > 0.0f) {
+                frustumPlanes[i] /= len;
+            }
+        }
+    }
+
+    // Get viewport dimensions from current viewport
+    D3DVIEWPORT9 viewport;
+    device->GetViewport(&viewport);
+    D3DXVECTOR2 viewportSize((float)viewport.Width, (float)viewport.Height);
+    D3DXVECTOR2 resultsSize((float)gpuCullResultsWidth, (float)gpuCullResultsHeight);
+
+    // Set shader parameters
+    {
+        effectGPUCull->SetMatrix(effectGPUCull->GetParameterByName(NULL, "g_mView"), &view);
+        effectGPUCull->SetMatrix(effectGPUCull->GetParameterByName(NULL, "g_mProjection"), &proj);
+        effectGPUCull->SetMatrix(effectGPUCull->GetParameterByName(NULL, "g_mViewProjection"), &viewProj);
+        effectGPUCull->SetVectorArray(effectGPUCull->GetParameterByName(NULL, "g_FrustumPlanes"), frustumPlanes, 6);
+        effectGPUCull->SetValue(effectGPUCull->GetParameterByName(NULL, "g_ViewportSize"), &viewportSize, sizeof(D3DXVECTOR2));
+        effectGPUCull->SetValue(effectGPUCull->GetParameterByName(NULL, "g_ResultsSize"), &resultsSize, sizeof(D3DXVECTOR2));
+
+        // Bind both Even and Odd Hi-Z textures (ping-pong pyramid)
+        // copyHiZToStaging() is NEVER CALLED, so no swap happens
+        // Even mips (0,2,4...) are in texHiZ, odd mips (1,3,5...) are in texHiZPrev
+        effectGPUCull->SetTexture(effectGPUCull->GetParameterByName(NULL, "g_texHiZEven"), texHiZ);
+        effectGPUCull->SetTexture(effectGPUCull->GetParameterByName(NULL, "g_texHiZOdd"), texHiZPrev);
+    }
+
+    // Save current render target
+    IDirect3DSurface9* savedRT = nullptr;
+    IDirect3DSurface9* savedDS = nullptr;
+    device->GetRenderTarget(0, &savedRT);
+    device->GetDepthStencilSurface(&savedDS);
+
+    // Set results texture as render target
+    device->SetRenderTarget(0, surfGPUCullResults);
+    device->SetDepthStencilSurface(nullptr);
+
+    // Clear results texture to black (all occluded)
+    device->Clear(0, nullptr, D3DCLEAR_TARGET, D3DCOLOR_ARGB(0, 0, 0, 0), 1.0f, 0);
+
+    // Render visibility test
+    {
+        device->SetVertexDeclaration(declGPUCullBounds);
+        device->SetStreamSource(0, vbGPUCullBounds, 0, sizeof(float) * 8);
+
+        // Set point size to 1.0 to ensure each point renders exactly 1 pixel
+        float pointSize = 1.0f;
+        device->SetRenderState(D3DRS_POINTSIZE, *((DWORD*)&pointSize));
+        device->SetRenderState(D3DRS_POINTSPRITEENABLE, FALSE);
+        device->SetRenderState(D3DRS_POINTSCALEENABLE, FALSE);
+
+        UINT numPasses = 0;
+        effectGPUCull->Begin(&numPasses, 0);
+
+        for (UINT pass = 0; pass < numPasses; pass++) {
+            effectGPUCull->BeginPass(pass);
+            device->DrawPrimitive(D3DPT_POINTLIST, 0, numObjects);
+            effectGPUCull->EndPass();
+        }
+
+        effectGPUCull->End();
+    }
+
+    // Restore render target
+    device->SetRenderTarget(0, savedRT);
+    device->SetDepthStencilSurface(savedDS);
+
+    if (savedRT) savedRT->Release();
+    if (savedDS) savedDS->Release();
+}
+
+void DistantLand::endGPUCullingQuery(int numObjects, bool* visibilityResults) {
+    if (!texGPUCullResults || !texGPUCullResultsSys || numObjects <= 0) {
+        return;
+    }
+
+    // Copy results from GPU to system memory
+    {
+        HRESULT hr = device->GetRenderTargetData(surfGPUCullResults, surfGPUCullResultsSys);
+        if (FAILED(hr)) {
+            LOG::logline("!! Failed to copy GPU culling results to system memory");
+            return;
+        }
+    }
+
+    // Lock and read results
+    {
+        D3DLOCKED_RECT lockedRect;
+        HRESULT hr = texGPUCullResultsSys->LockRect(0, &lockedRect, nullptr, D3DLOCK_READONLY);
+        if (FAILED(hr)) {
+            LOG::logline("!! Failed to lock GPU culling results texture");
+            return;
+        }
+
+        BYTE* pixels = (BYTE*)lockedRect.pBits;
+
+        // DEBUG: Sample first few pixels at frames 500, 1000, 1500
+        static int frameCount = 0;
+        frameCount++;
+        if (frameCount == 500 || frameCount == 1000 || frameCount == 1500) {
+            LOG::logline(">> GPU Culling Debug Sample FRAME %d (first 5 objects):", frameCount);
+            for (int i = 0; i < std::min(5, numObjects); i++) {
+                int pixelX = i % gpuCullResultsWidth;
+                int pixelY = i / gpuCullResultsWidth;
+                int offset = pixelY * lockedRect.Pitch + pixelX * 4;
+
+                // A8R8G8B8 format: [B, G, R, A]
+                BYTE b = pixels[offset + 0];
+                BYTE g = pixels[offset + 1];
+                BYTE r = pixels[offset + 2];
+                BYTE a = pixels[offset + 3];
+
+                // Decode: R=closestDepth/1000, G=maxOccluderDepth/1000, B=mipLevel/10, A=isVisible
+                float closestDepth = (r / 255.0f) * 1000.0f;
+                float maxOccluderDepth = (g / 255.0f) * 1000.0f;
+                float mipLevel = (b / 255.0f) * 10.0f;
+                bool isVisible = (a > 127);
+
+                LOG::logline("  [%d]: closestDepth=%.1f, maxOccluderDepth=%.1f, mipLevel=%.1f, isVisible=%d (RGBA=%d,%d,%d,%d)",
+                    i, closestDepth, maxOccluderDepth, mipLevel, isVisible ? 1 : 0, r, g, b, a);
+            }
+        }
+
+        for (int i = 0; i < numObjects; i++) {
+            int pixelX = i % gpuCullResultsWidth;
+            int pixelY = i / gpuCullResultsWidth;
+
+            int offset = pixelY * lockedRect.Pitch + pixelX * 4; // 4 bytes per pixel (A8R8G8B8)
+
+            // DEBUG: Read alpha channel (isVisible flag) - A8R8G8B8 format: [B, G, R, A]
+            BYTE visibility = pixels[offset + 3]; // A channel in A8R8G8B8 format
+            visibilityResults[i] = (visibility > 127);
+        }
+
+        texGPUCullResultsSys->UnlockRect(0);
+    }
 }

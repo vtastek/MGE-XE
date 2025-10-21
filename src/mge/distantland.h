@@ -120,6 +120,19 @@ public:
     static IDirect3DPixelShader9* psHiZ; // Cached Hi-Z pixel shader (compiled once)
     static int hiZLevels; // Number of levels in Hi-Z pyramid (total texture mips)
     static int hiZValidMips; // Number of actually generated mips (stops at 8x8 minimum)
+
+    // GPU-based Hi-Z culling resources
+    static ID3DXEffect* effectGPUCull; // GPU culling shader
+    static IDirect3DVertexBuffer9* vbGPUCullBounds; // Vertex buffer for bounding boxes
+    static IDirect3DVertexDeclaration9* declGPUCullBounds; // Vertex declaration for bbox data
+    static IDirect3DTexture9* texGPUCullResults; // Results texture (GPU memory, render target)
+    static IDirect3DSurface9* surfGPUCullResults; // Surface for results texture
+    static IDirect3DTexture9* texGPUCullResultsSys; // Results texture (system memory, for readback)
+    static IDirect3DSurface9* surfGPUCullResultsSys; // Surface for system memory results
+    static UINT gpuCullResultsWidth; // Results texture width
+    static UINT gpuCullResultsHeight; // Results texture height
+    static UINT gpuCullMaxObjects; // Maximum number of objects that can be culled in one batch
+
     static IDirect3DTexture9* texDistantBlend;
     static IDirect3DTexture9* texReflection;
     static IDirect3DSurface9* surfReflectionZ;
@@ -256,8 +269,17 @@ public:
     static void renderDepthDistantLand();
     static void renderDepthAdditional();
     static void renderDepthRecorded();
-    static void generateHiZPyramid();
+    static void generateHiZMipsGPU();
+    static void copyHiZToStaging();
     static void lockRemainingHiZMips();
+
+    // GPU-based Hi-Z occlusion culling
+    static void initGPUCulling();
+    static void shutdownGPUCulling();
+    static void beginGPUCullingQuery(int numObjects, const D3DXVECTOR3* bboxMins, const D3DXVECTOR3* bboxMaxs, const D3DXMATRIX& view, const D3DXMATRIX& proj);
+    static void endGPUCullingQuery(int numObjects, bool* visibilityResults);
+
+    // Legacy CPU-based culling (will be replaced by GPU culling)
     static bool cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& bboxMax, const D3DXMATRIX& worldViewProj, bool debugLog = false);
     static bool cullLightAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& bboxMax, const D3DXMATRIX& worldViewProj);
 

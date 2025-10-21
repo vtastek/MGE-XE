@@ -86,6 +86,18 @@ IDirect3DPixelShader9* DistantLand::psHiZ = nullptr;
 int DistantLand::hiZLevels;
 int DistantLand::hiZValidMips = 0;
 
+// GPU-based Hi-Z culling resources
+ID3DXEffect* DistantLand::effectGPUCull = nullptr;
+IDirect3DVertexBuffer9* DistantLand::vbGPUCullBounds = nullptr;
+IDirect3DVertexDeclaration9* DistantLand::declGPUCullBounds = nullptr;
+IDirect3DTexture9* DistantLand::texGPUCullResults = nullptr;
+IDirect3DSurface9* DistantLand::surfGPUCullResults = nullptr;
+IDirect3DTexture9* DistantLand::texGPUCullResultsSys = nullptr;
+IDirect3DSurface9* DistantLand::surfGPUCullResultsSys = nullptr;
+UINT DistantLand::gpuCullResultsWidth = 0;
+UINT DistantLand::gpuCullResultsHeight = 0;
+UINT DistantLand::gpuCullMaxObjects = 0;
+
 // Texture-based lighting system
 std::vector<DistantLand::SceneLight> DistantLand::sceneLights;
 std::unordered_map<int, size_t> DistantLand::sceneLightIndexMap;
@@ -286,6 +298,9 @@ bool DistantLand::init() {
     if (!initHiZ()) {
         return false;
     }
+
+    // Initialize GPU-based Hi-Z culling
+    initGPUCulling();
 
     if (!initShadow()) {
         return false;
@@ -799,13 +814,17 @@ bool DistantLand::initHiZ() {
 
     const char* psSource =
         "sampler2D sampDepth : register(s0);\n"
-        "float4 texelSize : register(c0);\n"
+        "float4 sourceInfo : register(c0);  // xy=srcDims, z=srcMipLevel, w=dstMipLevel\n"
         "float4 main(float2 tex : TEXCOORD0) : COLOR0 {\n"
-        "    // Standard 2x2 max downsampling (no dilation to preserve gaps)\n"
-        "    float d0 = tex2D(sampDepth, tex).r;\n"
-        "    float d1 = tex2D(sampDepth, tex + float2(texelSize.x, 0)).r;\n"
-        "    float d2 = tex2D(sampDepth, tex + float2(0, texelSize.y)).r;\n"
-        "    float d3 = tex2D(sampDepth, tex + texelSize.xy).r;\n"
+        "    // Calculate texel size from source dimensions\n"
+        "    float2 texelSize = 1.0 / sourceInfo.xy;\n"
+        "    float srcMip = sourceInfo.z;\n"
+        "    \n"
+        "    // 2x2 MAX downsampling from explicit source mip level (for ping-pong)\n"
+        "    float d0 = tex2Dlod(sampDepth, float4(tex, 0, srcMip)).r;\n"
+        "    float d1 = tex2Dlod(sampDepth, float4(tex + float2(texelSize.x, 0), 0, srcMip)).r;\n"
+        "    float d2 = tex2Dlod(sampDepth, float4(tex + float2(0, texelSize.y), 0, srcMip)).r;\n"
+        "    float d3 = tex2Dlod(sampDepth, float4(tex + texelSize.xy, 0, srcMip)).r;\n"
         "    float maxDepth = max(max(d0, d1), max(d2, d3));\n"
         "    return float4(maxDepth, maxDepth, maxDepth, 1.0);\n"
         "}\n";
@@ -1687,6 +1706,10 @@ void DistantLand::release() {
         psHiZ->Release();
         psHiZ = nullptr;
     }
+
+    // Shutdown GPU-based Hi-Z culling
+    shutdownGPUCulling();
+
     if (texLightData) {
         texLightData->Release();
         texLightData = nullptr;

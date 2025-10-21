@@ -203,7 +203,14 @@ void DistantLand::renderStage1() {
         if (texCullDepth) {
             IDirect3DSurface9* cullDepthSurface;
             texCullDepth->GetSurfaceLevel(0, &cullDepthSurface);
-            device->StretchRect(surfDepthFrameMSAA, NULL, cullDepthSurface, NULL, D3DTEXF_NONE);
+            HRESULT hr = device->StretchRect(surfDepthFrameMSAA, NULL, cullDepthSurface, NULL, D3DTEXF_NONE);
+            if (FAILED(hr)) {
+                static bool logged = false;
+                if (!logged) {
+                    LOG::logline("!! Failed to copy depth to texCullDepth (hr=0x%x)", hr);
+                    logged = true;
+                }
+            }
             cullDepthSurface->Release();
         }
 
@@ -222,8 +229,9 @@ void DistantLand::renderStage1() {
             texDepthFrameSurface->Release();
         }
 
-        // Hi-Z pyramid generation moved to before HLSL replay in ffeshader.cpp
-        // This ensures depth buffer is complete before culling
+        // Generate Hi-Z pyramid AFTER all depth rendering is complete
+        // Must happen before HLSL rendering uses it for GPU culling
+        generateHiZMipsGPU();
 
         // Restore render state
         stateSaved->Apply();

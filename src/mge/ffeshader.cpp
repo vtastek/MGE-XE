@@ -1577,7 +1577,6 @@ void FixedFunctionShader::bindShaderTextures(const ShaderKey& sk, const Rendered
 
 // Helper function to compute ShaderKey with texture suffix detection
 FixedFunctionShader::ShaderKey FixedFunctionShader::computeShaderKeyWithSuffixes(const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
-    ZoneScopedN("HLSL_ComputeShaderKeyWithSuffixes");
 
     // Step 1: Determine texture suffix availability
     bool hasDiffParam = false, hasParamH = false, hasParamX = false, hasGrass = false;
@@ -1628,7 +1627,6 @@ FixedFunctionShader::ShaderKey FixedFunctionShader::computeShaderKeyWithSuffixes
 
 // HLSL Pipeline Implementation
 void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
-    ZoneScopedN("RenderMorrowindHLSL");
     // Skip if we're in replay mode to avoid recursion
     if (isReplaying) {
         // During replay mode, perform actual rendering with this specific call
@@ -3300,8 +3298,6 @@ void FixedFunctionShader::ShaderKey::log() const {
 // HLSL Render Dispatch Recording System Implementation
 
 void FixedFunctionShader::startRecording() {
-    ZoneScopedN("HLSL_StartRecording");
-
     // Reset HLSL caches for new recording session
     resetHLSLCaches();
 
@@ -3329,8 +3325,6 @@ void FixedFunctionShader::startRecording() {
 }
 
 void FixedFunctionShader::stopRecordingAndReplay() {
-    ZoneScopedN("HLSL_StopRecordingAndReplay");
-
     if (!isRecording) {
         return;
     }
@@ -3350,8 +3344,6 @@ void FixedFunctionShader::stopRecordingAndReplay() {
 
 // Call this when HLSL rendering session is complete to trigger replay
 void FixedFunctionShader::finalizeBatchAndReplay(int sceneCount) {
-    ZoneScopedN("HLSL_FinalizeBatchAndReplay");
-
     // Handle dump request
     if (dumpRequested) {
         if (recordingEnabled) {
@@ -3437,10 +3429,7 @@ bool FixedFunctionShader::compareLightStates(const LightState* a, const LightSta
 }
 
 void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, const ShaderKey& sk) {
-    ZoneScopedN("HLSL_RecordRenderCall");
-
     {
-        ZoneScopedN("RecordCall_EarlyChecks");
         if (isReplaying) {
             return;  // Don't record during replay to avoid recursion
         }
@@ -3448,7 +3437,6 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
 
     // When recording is OFF and dump is requested, dump each call immediately
     if (!recordingEnabled && dumpRequested) {
-        ZoneScopedN("RecordCall_DumpLogging");
         static int callIndex = 0;
         char logline[512];
         snprintf(logline, sizeof(logline), "Call %d: texture=0x%p, vb=0x%p, ib=0x%p (immediate)",
@@ -3467,7 +3455,6 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
 
     // Collect lights from Morrowind for texture-based lighting system
     {
-        ZoneScopedN("RecordCall_CollectLights");
         for (const auto& [id, light] : lightrs->lights) {
             // Check if light already exists using O(1) hash map lookup
             auto mapIt = DistantLand::sceneLightIndexMap.find(id);
@@ -3495,7 +3482,6 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
     // Reuse last LightState if identical to avoid allocation overhead
     std::shared_ptr<LightState> sharedLightState;
     {
-        ZoneScopedN("RecordCall_LightStateReuse");
         // Ultra-fast path: pointer equality (O(1), no function call)
         if (lightrs == lastLightStatePtr) {
             sharedLightState = lastLightState;
@@ -3514,16 +3500,12 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
     }
 
     {
-        ZoneScopedN("RecordCall_EmplaceBack");
         recordedCalls.emplace_back(rs, frs, sharedLightState, sk);
     }
 }
 
 void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
-    ZoneScopedN("HLSL_ReplayRecordedCalls");
-
     {
-        ZoneScopedN("Replay_EarlyChecks");
         if (recordedCalls.empty()) {
             return;
         }
@@ -3553,10 +3535,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     viewProj = currentView * currentProj;
 
     // Hi-Z pyramid generation moved to end of frame (Present) for better performance
-    // We use previous frame's Hi-Z here for culling (minimal 1-frame delay)
-
-    // Lock remaining Hi-Z mips (second half) - split stall strategy
-    DistantLand::lockRemainingHiZMips();
+    // We use previous frame's Hi-Z here for GPU culling (minimal 1-frame delay)
+    // GPU-based culling: Hi-Z stays in VRAM, no CPU locking needed!
 
     // Hi-Z culling statistics
     int totalCalls = recordedCalls.size();
@@ -3610,8 +3590,17 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     };
     device->SetPixelShaderConstantF(50, lightParams, 1); // c50
 
-    // Simple Hi-Z culling with expanded bboxes for camera intersection handling
-    for (size_t i = 0; i < recordedCalls.size(); i++) {
+    // GPU-based Hi-Z batch culling with expanded bboxes for camera intersection handling
+    const size_t numCalls = recordedCalls.size();
+
+    // Allocate temporary arrays for batch GPU culling
+    std::vector<D3DXVECTOR3> bboxMins(numCalls);
+    std::vector<D3DXVECTOR3> bboxMaxs(numCalls);
+    std::vector<bool> cameraInsideFlags(numCalls);
+    std::vector<bool> visibilityResults(numCalls);
+
+    // Prepare bboxes for batch culling
+    for (size_t i = 0; i < numCalls; i++) {
         const auto& call = recordedCalls[i];
 
         // Track bbox stats
@@ -3635,23 +3624,15 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
 
         D3DXVECTOR3 expandedHalfSize = halfSize * 1.25f + padding;
 
-        // Camera velocity-based bbox expansion: compensate for one-frame-behind Hi-Z culling
-        // When camera moves/rotates, newly visible objects weren't in previous frame's depth, so they get culled
-        // Solution: expand bboxes based on camera movement magnitude AND distance from camera
-        // Far objects move more in screen space during rotation than near objects
-        if (cameraMovementMag > 0.1f) {
-            // Calculate distance from camera to object center
-            float distanceToCamera = D3DXVec3Length(&(center - currentCameraPos));
-
-            // Expansion scales with both camera movement and distance
-            // Base: 2.5x camera movement, scaled linearly by distance (far objects expand more)
-            // This handles both translation (uniform) and rotation (distance-dependent)
-            float expansionAmount = cameraMovementMag * 2.5f * (1.0f + distanceToCamera / 1000.0f);
-            expandedHalfSize += D3DXVECTOR3(expansionAmount, expansionAmount, expansionAmount);
-        }
+        // GPU culling uses current frame's Hi-Z (no delay), so no velocity expansion needed
+        // CPU culling used 2-frame-old data and needed velocity compensation (removed)
 
         D3DXVECTOR3 expandedMin = center - expandedHalfSize;
         D3DXVECTOR3 expandedMax = center + expandedHalfSize;
+
+        // Store expanded bbox for GPU culling
+        bboxMins[i] = expandedMin;
+        bboxMaxs[i] = expandedMax;
 
         // Treat camera as 100x100x100 unit bbox for intersection test
         const float cameraBBoxSize = 50.0f; // Half-size = 50 units (100x100x100 total)
@@ -3667,20 +3648,53 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
                           cameraBBoxMax.y < expandedMin.y || cameraBBoxMin.y > expandedMax.y ||
                           cameraBBoxMax.z < expandedMin.z || cameraBBoxMin.z > expandedMax.z);
 
-        bool shouldRender = true;
-        if (call.hasBoundingBox && !cameraInside) {
-            // Only cull if we have a bbox and camera is NOT inside expanded bbox
-            // Use expanded bbox for Hi-Z test too
-            bool shouldDebug = debugHiZ && debugCallCount > 0;
-            bool isOccluded = DistantLand::cullAgainstHiZ(expandedMin, expandedMax, viewProj, shouldDebug);
+        cameraInsideFlags[i] = cameraInside;
 
-            if (isOccluded) {
-                culledCalls++;
-                shouldRender = false;
-                if (shouldDebug) {
-                    debugCallCount--;  // Only decrement when we actually log a culled object
-                }
+        // Initialize visibility: visible by default if no bbox or camera inside
+        visibilityResults[i] = (!call.hasBoundingBox || cameraInside);
+    }
+
+    // Batch GPU occlusion culling for all objects with bboxes (camera not inside)
+    {
+        DistantLand::beginGPUCullingQuery(
+            (int)numCalls,
+            bboxMins.data(),
+            bboxMaxs.data(),
+            currentView,
+            currentProj
+        );
+
+        // std::vector<bool> doesn't have .data(), need to use a regular bool array
+        bool* resultsPtr = new bool[numCalls];
+        DistantLand::endGPUCullingQuery((int)numCalls, resultsPtr);
+
+        // Copy GPU results back, but only for objects with bboxes (camera not inside)
+        // Objects without bboxes or with camera inside were pre-initialized to visible
+        for (size_t i = 0; i < numCalls; i++) {
+            const auto& call = recordedCalls[i];
+            if (call.hasBoundingBox && !cameraInsideFlags[i]) {
+                // Only update visibility for objects that should be GPU-culled
+                visibilityResults[i] = resultsPtr[i];
             }
+            // Otherwise keep pre-initialized value (visible for no-bbox or camera-inside)
+        }
+        delete[] resultsPtr;
+    }
+
+    // Render visible objects
+    for (size_t i = 0; i < numCalls; i++) {
+        const auto& call = recordedCalls[i];
+
+        bool shouldRender = visibilityResults[i];
+
+        // Apply camera-inside override (always render if camera intersects bbox)
+        if (call.hasBoundingBox && cameraInsideFlags[i]) {
+            shouldRender = true;
+        }
+
+        // Track culling stats
+        if (call.hasBoundingBox && !cameraInsideFlags[i] && !shouldRender) {
+            culledCalls++;
         }
 
         if (shouldRender) {
@@ -3784,7 +3798,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
                 // Camera velocity-based bbox expansion (same as culling loop)
                 if (cameraMovementMag > 0.1f) {
                     float distanceToCamera = D3DXVec3Length(&(center - currentCameraPos));
-                    float expansionAmount = cameraMovementMag * 2.5f * (1.0f + distanceToCamera / 1000.0f);
+                    float expansionAmount = cameraMovementMag * 4.0f * (1.0f + distanceToCamera / 1000.0f);
                     expandedHalfSize += D3DXVECTOR3(expansionAmount, expansionAmount, expansionAmount);
                 }
 
@@ -3914,8 +3928,6 @@ FixedFunctionShader::HLSLRecordedCall::HLSLRecordedCall(const RenderedState* rs_
 }
 
 bool FixedFunctionShader::computeBoundingBox(const RenderedState* rs, D3DXVECTOR3& bboxMin, D3DXVECTOR3& bboxMax) {
-    ZoneScopedN("HLSL_ComputeBoundingBox");
-
     static bool debugBBox = false;
     static int debugCount = 0;
     static bool keyCheckedThisRecording = false;

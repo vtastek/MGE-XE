@@ -13,44 +13,49 @@ sampler sampDepthInput = sampler_state {
     AddressV = Clamp;
 };
 
-// Texel size for sampling 4 pixels
-float2 texelSize;
+// Source texture info: xy = source dimensions, z = source mip level, w = destination mip level
+float4 sourceInfo;
 
 //------------------------------------------------------------
-// Downsample shader - Samples 4 pixels and outputs MAX depth
+// Downsample shader - EXACT D3D9 reference implementation
+// Uses VPOS semantic and tex2Dlod for precise mip sampling
 //------------------------------------------------------------
 
 struct VS_OUTPUT {
     float4 pos : POSITION;
-    float2 texcoord : TEXCOORD0;
 };
 
-VS_OUTPUT DownsampleVS(float4 pos : POSITION, float2 texcoord : TEXCOORD0) {
+VS_OUTPUT DownsampleVS(float4 pos : POSITION) {
     VS_OUTPUT OUT;
     OUT.pos = pos;
-    OUT.texcoord = texcoord;
     return OUT;
 }
 
-float4 DownsamplePS(float2 texcoord : TEXCOORD0) : COLOR0 {
-    // Sample 4x4 grid with dilation to prevent false culling through thin gaps
-    // Center the 4x4 samples around the output pixel for proper coverage
-    float2 baseUV = texcoord - texelSize * 1.5;
+float4 DownsamplePS(float4 screenPos : VPOS) : COLOR0 {
+    float sourceWidth = sourceInfo.x;
+    float sourceHeight = sourceInfo.y;
+    float sourceMip = sourceInfo.z;
 
-    float maxDepth = 0.0;
+    // CRITICAL FIX: Use exact D3D9 reference implementation UV calculation
+    // Reference: nCoords0 = float2((PositionSS.x * 2) / width, (PositionSS.y * 2) / height);
+    // Note: In D3D9, dividing by texture dimensions gives normalized [0,1] coordinates
+    float2 uv0 = float2((screenPos.x * 2.0) / sourceWidth, (screenPos.y * 2.0) / sourceHeight);
 
-    // Sample 4x4 = 16 pixels and take maximum
-    [unroll]
-    for (int y = 0; y < 4; y++) {
-        [unroll]
-        for (int x = 0; x < 4; x++) {
-            float2 sampleUV = baseUV + float2(x, y) * texelSize;
-            float depth = tex2D(sampDepthInput, sampleUV).r;
-            maxDepth = max(maxDepth, depth);
-        }
-    }
+    // Add 1 texel offset in normalized coordinates (reference does: nCoords0.x + (1 / width))
+    float2 uv1 = float2(uv0.x + (1.0 / sourceWidth), uv0.y);
+    float2 uv2 = float2(uv0.x, uv0.y + (1.0 / sourceHeight));
+    float2 uv3 = float2(uv1.x, uv2.y);
 
-    // Return MAXIMUM depth for conservative occlusion culling with dilation
+    // Sample 2x2 block using tex2Dlod with explicit source mip level
+    // CRITICAL: Use .r (red channel) not .x for R32F format
+    float4 depths;
+    depths.x = tex2Dlod(sampDepthInput, float4(uv0, 0, sourceMip)).r;
+    depths.y = tex2Dlod(sampDepthInput, float4(uv1, 0, sourceMip)).r;
+    depths.z = tex2Dlod(sampDepthInput, float4(uv2, 0, sourceMip)).r;
+    depths.w = tex2Dlod(sampDepthInput, float4(uv3, 0, sourceMip)).r;
+
+    // Return MAXIMUM depth for conservative occlusion (reference does same)
+    float maxDepth = max(max(depths.x, depths.y), max(depths.z, depths.w));
     return float4(maxDepth, maxDepth, maxDepth, 1.0);
 }
 

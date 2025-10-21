@@ -227,65 +227,68 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         }
     }
 
-    // Handle F11 key to toggle ImGui interface
-    static bool f11Pressed = false;
-    static int debugCounter = 0;
-    if (imguiInitialized) {
-        bool f11State = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
-        if (f11State && !f11Pressed) {
-            LOG::logline(">> F11 key pressed, toggling PCF interface");
-            ImGuiManager::TogglePCFInterface();
-            f11Pressed = true;
-        } else if (!f11State) {
-            f11Pressed = false;
-        }
+    {
+        ZoneScopedN("Present_ImGui");
+        // Handle F11 key to toggle ImGui interface
+        static bool f11Pressed = false;
+        static int debugCounter = 0;
+        if (imguiInitialized) {
+            bool f11State = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
+            if (f11State && !f11Pressed) {
+                LOG::logline(">> F11 key pressed, toggling PCF interface");
+                ImGuiManager::TogglePCFInterface();
+                f11Pressed = true;
+            } else if (!f11State) {
+                f11Pressed = false;
+            }
 
-        // Handle G key for debug interface toggle
-        static bool gPressed = false;
-        bool gState = (GetAsyncKeyState('G') & 0x8000) != 0;
-        if (gState && !gPressed) {
-            ImGuiManager::ToggleDebugInterface();
-            gPressed = true;
-        } else if (!gState) {
-            gPressed = false;
-        }
+            // Handle G key for debug interface toggle
+            static bool gPressed = false;
+            bool gState = (GetAsyncKeyState('G') & 0x8000) != 0;
+            if (gState && !gPressed) {
+                ImGuiManager::ToggleDebugInterface();
+                gPressed = true;
+            } else if (!gState) {
+                gPressed = false;
+            }
 
-        ImGuiManager::NewFrame();
-        ImGuiManager::Render();
-        
-    } else {
-        // Log every 60 frames that ImGui is not initialized
-        if (++debugCounter % 60 == 0) {
-            LOG::logline(">> ImGui not initialized (frame %d)", debugCounter);
+            {
+                ZoneScopedN("Present_ImGuiNewFrame");
+                ImGuiManager::NewFrame();
+            }
+            {
+                ZoneScopedN("Present_ImGuiRender");
+                ImGuiManager::Render();
+            }
+        } else {
+            // Log every 60 frames that ImGui is not initialized
+            if (++debugCounter % 60 == 0) {
+                LOG::logline(">> ImGui not initialized (frame %d)", debugCounter);
+            }
         }
     }
 
-    // Reset scene identifiers
-    sceneCount = -1;
-    stage0Complete = false;
-    waterDrawn = false;
-    isFrameComplete = false;
-    isHUDComplete = false;
+    {
+        ZoneScopedN("Present_ResetState");
+        // Reset scene identifiers
+        sceneCount = -1;
+        stage0Complete = false;
+        waterDrawn = false;
+        isFrameComplete = false;
+        isHUDComplete = false;
 
-    // Reset HLSL texture caches at frame boundary to prevent stale texture pointers
-    FixedFunctionShader::resetHLSLCaches();
-
-    // Generate Hi-Z pyramid at end of frame (GPU idle time before vsync)
-    // This is async - next frame will use this data for culling
-    if (DistantLand::ready) {
-        // Save all render state to prevent corruption
-        IDirect3DStateBlock9* stateSaved;
-        realDevice->CreateStateBlock(D3DSBT_ALL, &stateSaved);
-
-        DistantLand::generateHiZPyramid();
-
-        // Restore render state
-        stateSaved->Apply();
-        stateSaved->Release();
+        // Reset HLSL texture caches at frame boundary to prevent stale texture pointers
+        FixedFunctionShader::resetHLSLCaches();
     }
+
+    // Hi-Z pyramid generation moved to renderStage1 (immediately after depth copy)
+    // This ensures pyramid is ready when HLSL rendering does GPU culling
 
     FrameMark;  // Mark frame boundary at the very end of Present()
-    return ProxyDevice::Present(a, b, c, d);
+    {
+        ZoneScopedN("Present_ProxyDevicePresent");
+        return ProxyDevice::Present(a, b, c, d);
+    }
 }
 
 // SetRenderTarget
@@ -310,6 +313,8 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
     if (hr != D3D_OK) {
         return hr;
     }
+
+    // GPU-based culling: Hi-Z stays in VRAM, no CPU readback needed!
 
     if (mwBridge->IsLoaded() && rendertargetNormal) {
         if (!isHUDready) {
