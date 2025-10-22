@@ -3775,57 +3775,22 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
             device->DrawPrimitiveUP(D3DPT_LINELIST, 12, vertices, sizeof(Vertex));
         };
 
-        // Mode 1: Show culled objects only (red boxes)
+        // Mode 1: Show culled objects only (red boxes) - uses GPU culling results
         if (debugBBoxMode == 1) {
             for (size_t i = 0; i < recordedCalls.size(); i++) {
                 const auto& call = recordedCalls[i];
                 if (!call.hasBoundingBox) continue;
 
-                // Expand bbox conservatively to avoid false positives
-                // Use 1.25x scale + fixed 10 unit padding to handle bad pivots/asymmetric meshes
-                // Add 2x padding for thin axes (< 20 units) to avoid missing flat/small objects
-                D3DXVECTOR3 center = (call.bboxMin + call.bboxMax) * 0.5f;
-                D3DXVECTOR3 halfSize = (call.bboxMax - call.bboxMin) * 0.5f;
-                D3DXVECTOR3 padding(10.0f, 10.0f, 10.0f);
-
-                // Double padding for thin axes
-                if (halfSize.x * 2.0f < 20.0f) padding.x *= 2.0f;
-                if (halfSize.y * 2.0f < 20.0f) padding.y *= 2.0f;
-                if (halfSize.z * 2.0f < 20.0f) padding.z *= 2.0f;
-
-                D3DXVECTOR3 expandedHalfSize = halfSize * 1.25f + padding;
-
-                // Camera velocity-based bbox expansion (same as culling loop)
-                if (cameraMovementMag > 0.1f) {
-                    float distanceToCamera = D3DXVec3Length(&(center - currentCameraPos));
-                    float expansionAmount = cameraMovementMag * 4.0f * (1.0f + distanceToCamera / 1000.0f);
-                    expandedHalfSize += D3DXVECTOR3(expansionAmount, expansionAmount, expansionAmount);
-                }
-
-                D3DXVECTOR3 expandedMin = center - expandedHalfSize;
-                D3DXVECTOR3 expandedMax = center + expandedHalfSize;
-
-                // Treat camera as 100x100x100 unit bbox for intersection test
-                const float cameraBBoxSize = 50.0f;
-                D3DXVECTOR3 cameraBBoxMin = D3DXVECTOR3(DistantLand::eyePos.x - cameraBBoxSize,
-                                                         DistantLand::eyePos.y - cameraBBoxSize,
-                                                         DistantLand::eyePos.z - cameraBBoxSize);
-                D3DXVECTOR3 cameraBBoxMax = D3DXVECTOR3(DistantLand::eyePos.x + cameraBBoxSize,
-                                                         DistantLand::eyePos.y + cameraBBoxSize,
-                                                         DistantLand::eyePos.z + cameraBBoxSize);
-
-                bool cameraInside = !(cameraBBoxMax.x < expandedMin.x || cameraBBoxMin.x > expandedMax.x ||
-                                      cameraBBoxMax.y < expandedMin.y || cameraBBoxMin.y > expandedMax.y ||
-                                      cameraBBoxMax.z < expandedMin.z || cameraBBoxMin.z > expandedMax.z);
-
-                bool isCulled = false;
-                if (!cameraInside) {
-                    // Use expanded bbox for Hi-Z test
-                    isCulled = DistantLand::cullAgainstHiZ(expandedMin, expandedMax, viewProj, false);
-                }
+                // Use GPU culling results stored in visibilityResults
+                bool isVisible = visibilityResults[i];
+                bool wasCameraInside = cameraInsideFlags[i];
+                bool isCulled = !isVisible && !wasCameraInside;
 
                 // Draw only culled objects in red
                 if (isCulled) {
+                    // Use the expanded bbox that was sent to GPU culling
+                    D3DXVECTOR3 expandedMin = bboxMins[i];
+                    D3DXVECTOR3 expandedMax = bboxMaxs[i];
                     drawBBox(expandedMin, expandedMax, D3DCOLOR_ARGB(255, 255, 0, 0));
                 }
             }

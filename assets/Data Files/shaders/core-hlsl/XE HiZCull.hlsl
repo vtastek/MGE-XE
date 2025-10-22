@@ -132,22 +132,39 @@ float4 PS(PS_INPUT input) : COLOR0
     float2 screenMin = float2(1, 1);
     float2 screenMax = float2(-1, -1);
     float closestDepth = 1e38;  // Large value for view-space depth
+    bool anyInFront = false;
+    bool anyBehindCamera = false;
 
     for (int i = 0; i < 8; i++)
     {
         // ROW MAJOR: vector * matrix (matches D3DXVec3Transform and other HLSL shaders)
         float4 clipPos = mul(float4(corners[i], 1.0), g_mViewProjection);
 
-        // Skip if behind camera
-        if (clipPos.w <= 0)
+        // Track corners behind camera for near-plane intersection detection
+        if (clipPos.w <= 0) {
+            anyBehindCamera = true;
             continue;
+        }
 
+        anyInFront = true;
         float3 ndc = clipPos.xyz / clipPos.w;
         screenMin = min(screenMin, ndc.xy);
         screenMax = max(screenMax, ndc.xy);
         // CRITICAL: Use view-space depth (clipPos.w) to match depth texture format!
         // Depth texture stores clipPos.w (view-space Z), not NDC Z
         closestDepth = min(closestDepth, clipPos.w);
+    }
+
+    // If no corners are in front, bbox is entirely behind camera (already culled by frustum test)
+    if (!anyInFront) {
+        return float4(0, 0, 0, 1); // Mark as visible (conservative - shouldn't happen after frustum cull)
+    }
+
+    // CRITICAL: If some corners behind camera, bbox intersects near plane
+    // Screen-space AABB is unreliable (missing corners) - force visible to avoid false positives
+    // Matches CPU culling behavior (renderdepth.cpp:640-645)
+    if (anyBehindCamera) {
+        return float4(0, 0, 0, 1); // Force visible (alpha=1)
     }
 
     // Convert NDC [-1,1] to UV [0,1]
@@ -160,6 +177,12 @@ float4 PS(PS_INPUT input) : COLOR0
     float2 uvMaxCorrected = max(uvMin, uvMax);
     uvMin = uvMinCorrected;
     uvMax = uvMaxCorrected;
+
+    // Off-screen check: Test BEFORE clamping to detect objects completely off-screen
+    // Matches CPU culling behavior (renderdepth.cpp:653-655)
+    if (uvMax.x <= 0.0 || uvMin.x >= 1.0 || uvMax.y <= 0.0 || uvMin.y >= 1.0) {
+        return float4(0, 0, 0, 1); // Completely off-screen - force visible (conservative)
+    }
 
     // Clamp to screen bounds
     uvMin = saturate(uvMin);
@@ -177,25 +200,50 @@ float4 PS(PS_INPUT input) : COLOR0
     float mipLevel = max(0, floor(log2(maxScreenSize / 6.0)) - 1.0);
     mipLevel = clamp(mipLevel, 0, 4); // Clamp to valid mip range (5 mips: 0-4, down to 8x8)
 
-    // Sample Hi-Z at 4 corners of screen-space bbox using tex2Dlod (SM 3.0)
+    // Sample Hi-Z in 3×3 grid for better coverage and gap detection
+    // CPU version samples ALL pixels (renderdepth.cpp:706-713), this is a GPU-friendly approximation
     // Reference: Even mips are in texHiZEven, odd mips are in texHiZOdd
-    float4 depths;
+    float2 uvMid = (uvMin + uvMax) * 0.5;
+    float depthSamples[9];
+
     if (int(mipLevel) % 2 == 0) {
-        // Even mip level - sample from Even texture
-        depths.x = tex2Dlod(g_sampHiZEven, float4(uvMin.x, uvMin.y, 0, mipLevel)).r;
-        depths.y = tex2Dlod(g_sampHiZEven, float4(uvMax.x, uvMin.y, 0, mipLevel)).r;
-        depths.z = tex2Dlod(g_sampHiZEven, float4(uvMin.x, uvMax.y, 0, mipLevel)).r;
-        depths.w = tex2Dlod(g_sampHiZEven, float4(uvMax.x, uvMax.y, 0, mipLevel)).r;
+        // Even mip level - sample from Even texture (3×3 grid)
+        depthSamples[0] = tex2Dlod(g_sampHiZEven, float4(uvMin.x, uvMin.y, 0, mipLevel)).r;
+        depthSamples[1] = tex2Dlod(g_sampHiZEven, float4(uvMid.x, uvMin.y, 0, mipLevel)).r;
+        depthSamples[2] = tex2Dlod(g_sampHiZEven, float4(uvMax.x, uvMin.y, 0, mipLevel)).r;
+        depthSamples[3] = tex2Dlod(g_sampHiZEven, float4(uvMin.x, uvMid.y, 0, mipLevel)).r;
+        depthSamples[4] = tex2Dlod(g_sampHiZEven, float4(uvMid.x, uvMid.y, 0, mipLevel)).r;
+        depthSamples[5] = tex2Dlod(g_sampHiZEven, float4(uvMax.x, uvMid.y, 0, mipLevel)).r;
+        depthSamples[6] = tex2Dlod(g_sampHiZEven, float4(uvMin.x, uvMax.y, 0, mipLevel)).r;
+        depthSamples[7] = tex2Dlod(g_sampHiZEven, float4(uvMid.x, uvMax.y, 0, mipLevel)).r;
+        depthSamples[8] = tex2Dlod(g_sampHiZEven, float4(uvMax.x, uvMax.y, 0, mipLevel)).r;
     } else {
-        // Odd mip level - sample from Odd texture
-        depths.x = tex2Dlod(g_sampHiZOdd, float4(uvMin.x, uvMin.y, 0, mipLevel)).r;
-        depths.y = tex2Dlod(g_sampHiZOdd, float4(uvMax.x, uvMin.y, 0, mipLevel)).r;
-        depths.z = tex2Dlod(g_sampHiZOdd, float4(uvMin.x, uvMax.y, 0, mipLevel)).r;
-        depths.w = tex2Dlod(g_sampHiZOdd, float4(uvMax.x, uvMax.y, 0, mipLevel)).r;
+        // Odd mip level - sample from Odd texture (3×3 grid)
+        depthSamples[0] = tex2Dlod(g_sampHiZOdd, float4(uvMin.x, uvMin.y, 0, mipLevel)).r;
+        depthSamples[1] = tex2Dlod(g_sampHiZOdd, float4(uvMid.x, uvMin.y, 0, mipLevel)).r;
+        depthSamples[2] = tex2Dlod(g_sampHiZOdd, float4(uvMax.x, uvMin.y, 0, mipLevel)).r;
+        depthSamples[3] = tex2Dlod(g_sampHiZOdd, float4(uvMin.x, uvMid.y, 0, mipLevel)).r;
+        depthSamples[4] = tex2Dlod(g_sampHiZOdd, float4(uvMid.x, uvMid.y, 0, mipLevel)).r;
+        depthSamples[5] = tex2Dlod(g_sampHiZOdd, float4(uvMax.x, uvMid.y, 0, mipLevel)).r;
+        depthSamples[6] = tex2Dlod(g_sampHiZOdd, float4(uvMin.x, uvMax.y, 0, mipLevel)).r;
+        depthSamples[7] = tex2Dlod(g_sampHiZOdd, float4(uvMid.x, uvMax.y, 0, mipLevel)).r;
+        depthSamples[8] = tex2Dlod(g_sampHiZOdd, float4(uvMax.x, uvMax.y, 0, mipLevel)).r;
     }
 
-    // Get maximum depth from Hi-Z (furthest occluder)
-    float maxOccluderDepth = max(max(depths.x, depths.y), max(depths.z, depths.w));
+    // Find min/max depth across all samples for gap detection
+    float maxOccluderDepth = depthSamples[0];
+    float minOccluderDepth = depthSamples[0];
+    for (int i = 1; i < 9; i++) {
+        maxOccluderDepth = max(maxOccluderDepth, depthSamples[i]);
+        minOccluderDepth = min(minOccluderDepth, depthSamples[i]);
+    }
+
+    // Depth discontinuity detection: large depth variation indicates gaps (fences, between buildings)
+    // Matches CPU culling behavior (renderdepth.cpp:717-770)
+    float depthRange = maxOccluderDepth - minOccluderDepth;
+    if (depthRange > 100.0) {
+        return float4(0, 0, 0, 1); // Depth gap detected - force visible to avoid false culling
+    }
 
     // Conservative bias to prevent self-occlusion (matches CPU culling)
     // BBoxes are already expanded by 1.25x + 10 units on CPU side (ffeshader.cpp:3625)
