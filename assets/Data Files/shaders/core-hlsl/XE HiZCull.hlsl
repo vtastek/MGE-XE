@@ -14,22 +14,11 @@ float4 g_FrustumPlanes[6];
 float2 g_ViewportSize;       // Width and Height in pixels
 float2 g_ResultsSize;        // Results texture dimensions
 
-// Hi-Z pyramid textures (ping-pong: Even and Odd mip levels)
-texture g_texHiZEven;
-sampler g_sampHiZEven = sampler_state
+// Hi-Z pyramid texture (consolidated from previous frame)
+texture g_texHiZPrevFrame;
+sampler g_sampHiZPrevFrame = sampler_state
 {
-    Texture = <g_texHiZEven>;
-    MinFilter = POINT;
-    MagFilter = POINT;
-    MipFilter = POINT;
-    AddressU = CLAMP;
-    AddressV = CLAMP;
-};
-
-texture g_texHiZOdd;
-sampler g_sampHiZOdd = sampler_state
-{
-    Texture = <g_texHiZOdd>;
+    Texture = <g_texHiZPrevFrame>;
     MinFilter = POINT;
     MagFilter = POINT;
     MipFilter = POINT;
@@ -202,33 +191,20 @@ float4 PS(PS_INPUT input) : COLOR0
 
     // Sample Hi-Z in 3×3 grid for better coverage and gap detection
     // CPU version samples ALL pixels (renderdepth.cpp:706-713), this is a GPU-friendly approximation
-    // Reference: Even mips are in texHiZEven, odd mips are in texHiZOdd
+    // Uses consolidated previous frame Hi-Z pyramid (all mips in one texture)
     float2 uvMid = (uvMin + uvMax) * 0.5;
     float depthSamples[9];
 
-    if (int(mipLevel) % 2 == 0) {
-        // Even mip level - sample from Even texture (3×3 grid)
-        depthSamples[0] = tex2Dlod(g_sampHiZEven, float4(uvMin.x, uvMin.y, 0, mipLevel)).r;
-        depthSamples[1] = tex2Dlod(g_sampHiZEven, float4(uvMid.x, uvMin.y, 0, mipLevel)).r;
-        depthSamples[2] = tex2Dlod(g_sampHiZEven, float4(uvMax.x, uvMin.y, 0, mipLevel)).r;
-        depthSamples[3] = tex2Dlod(g_sampHiZEven, float4(uvMin.x, uvMid.y, 0, mipLevel)).r;
-        depthSamples[4] = tex2Dlod(g_sampHiZEven, float4(uvMid.x, uvMid.y, 0, mipLevel)).r;
-        depthSamples[5] = tex2Dlod(g_sampHiZEven, float4(uvMax.x, uvMid.y, 0, mipLevel)).r;
-        depthSamples[6] = tex2Dlod(g_sampHiZEven, float4(uvMin.x, uvMax.y, 0, mipLevel)).r;
-        depthSamples[7] = tex2Dlod(g_sampHiZEven, float4(uvMid.x, uvMax.y, 0, mipLevel)).r;
-        depthSamples[8] = tex2Dlod(g_sampHiZEven, float4(uvMax.x, uvMax.y, 0, mipLevel)).r;
-    } else {
-        // Odd mip level - sample from Odd texture (3×3 grid)
-        depthSamples[0] = tex2Dlod(g_sampHiZOdd, float4(uvMin.x, uvMin.y, 0, mipLevel)).r;
-        depthSamples[1] = tex2Dlod(g_sampHiZOdd, float4(uvMid.x, uvMin.y, 0, mipLevel)).r;
-        depthSamples[2] = tex2Dlod(g_sampHiZOdd, float4(uvMax.x, uvMin.y, 0, mipLevel)).r;
-        depthSamples[3] = tex2Dlod(g_sampHiZOdd, float4(uvMin.x, uvMid.y, 0, mipLevel)).r;
-        depthSamples[4] = tex2Dlod(g_sampHiZOdd, float4(uvMid.x, uvMid.y, 0, mipLevel)).r;
-        depthSamples[5] = tex2Dlod(g_sampHiZOdd, float4(uvMax.x, uvMid.y, 0, mipLevel)).r;
-        depthSamples[6] = tex2Dlod(g_sampHiZOdd, float4(uvMin.x, uvMax.y, 0, mipLevel)).r;
-        depthSamples[7] = tex2Dlod(g_sampHiZOdd, float4(uvMid.x, uvMax.y, 0, mipLevel)).r;
-        depthSamples[8] = tex2Dlod(g_sampHiZOdd, float4(uvMax.x, uvMax.y, 0, mipLevel)).r;
-    }
+    // Sample from consolidated previous frame texture (3×3 grid)
+    depthSamples[0] = tex2Dlod(g_sampHiZPrevFrame, float4(uvMin.x, uvMin.y, 0, mipLevel)).r;
+    depthSamples[1] = tex2Dlod(g_sampHiZPrevFrame, float4(uvMid.x, uvMin.y, 0, mipLevel)).r;
+    depthSamples[2] = tex2Dlod(g_sampHiZPrevFrame, float4(uvMax.x, uvMin.y, 0, mipLevel)).r;
+    depthSamples[3] = tex2Dlod(g_sampHiZPrevFrame, float4(uvMin.x, uvMid.y, 0, mipLevel)).r;
+    depthSamples[4] = tex2Dlod(g_sampHiZPrevFrame, float4(uvMid.x, uvMid.y, 0, mipLevel)).r;
+    depthSamples[5] = tex2Dlod(g_sampHiZPrevFrame, float4(uvMax.x, uvMid.y, 0, mipLevel)).r;
+    depthSamples[6] = tex2Dlod(g_sampHiZPrevFrame, float4(uvMin.x, uvMax.y, 0, mipLevel)).r;
+    depthSamples[7] = tex2Dlod(g_sampHiZPrevFrame, float4(uvMid.x, uvMax.y, 0, mipLevel)).r;
+    depthSamples[8] = tex2Dlod(g_sampHiZPrevFrame, float4(uvMax.x, uvMax.y, 0, mipLevel)).r;
 
     // Find min/max depth across all samples for gap detection
     float maxOccluderDepth = depthSamples[0];

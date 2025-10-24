@@ -230,8 +230,12 @@ void DistantLand::renderStage1() {
         }
 
         // Generate Hi-Z pyramid AFTER all depth rendering is complete
-        // Must happen before HLSL rendering uses it for GPU culling
+        // Generates into ping-pong pair (texHiZ + texHiZPrev)
         generateHiZMipsGPU();
+
+        // Consolidate ping-pong pyramid into single texture for next frame's GPU culling
+        // This gives true 1-frame latency without breaking the ping-pong pattern
+        consolidateHiZPyramid();
 
         // Restore render state
         stateSaved->Apply();

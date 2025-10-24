@@ -391,6 +391,49 @@ void DistantLand::generateHiZMipsGPU() {
     }
 }
 
+// Consolidate ping-pong Hi-Z pyramid into single texture for GPU culling
+// Called after generateHiZMipsGPU() - copies all mips from texHiZ/texHiZPrev → texHiZPrevFrame
+void DistantLand::consolidateHiZPyramid() {
+    ZoneScopedN("HiZ_Consolidate");
+
+    if (!texHiZ || !texHiZPrev || !texHiZPrevFrame) {
+        return;
+    }
+
+    // Copy all valid mip levels from ping-pong pair into consolidated previous frame texture
+    // Even mips (0,2,4...) from texHiZ → texHiZPrevFrame
+    // Odd mips  (1,3,5...) from texHiZPrev → texHiZPrevFrame
+    for (int mipLevel = 0; mipLevel < hiZValidMips; mipLevel++) {
+        IDirect3DSurface9* srcSurf = nullptr;
+        IDirect3DSurface9* dstSurf = nullptr;
+
+        // Determine source texture based on ping-pong pattern
+        IDirect3DTexture9* srcTexture = (mipLevel % 2 == 0) ? texHiZ : texHiZPrev;
+
+        // Get surfaces
+        srcTexture->GetSurfaceLevel(mipLevel, &srcSurf);
+        texHiZPrevFrame->GetSurfaceLevel(mipLevel, &dstSurf);
+
+        // Copy mip level from ping-pong source to consolidated destination
+        // Use StretchRect for fast GPU-to-GPU copy (no CPU involvement)
+        HRESULT hr = device->StretchRect(srcSurf, NULL, dstSurf, NULL, D3DTEXF_NONE);
+
+        if (FAILED(hr)) {
+            static bool logged = false;
+            if (!logged) {
+                LOG::logline("!! Failed to consolidate Hi-Z mip %d (hr=0x%x)", mipLevel, hr);
+                logged = true;
+            }
+        }
+
+        srcSurf->Release();
+        dstSurf->Release();
+    }
+
+    // texHiZPrevFrame now contains complete pyramid for next frame's GPU culling
+    // This happens at the END of frame N, ready for GPU culling in frame N+1
+}
+
 // CPU-GPU sync copy from render target to staging texture (blocking, ~1.5ms)
 // Called at beginning of Clear/BeginScene() - copies GPU-generated mips to CPU-readable staging
 void DistantLand::copyHiZToStaging() {
@@ -1242,11 +1285,10 @@ void DistantLand::beginGPUCullingQuery(
         effectGPUCull->SetValue(effectGPUCull->GetParameterByName(NULL, "g_ViewportSize"), &viewportSize, sizeof(D3DXVECTOR2));
         effectGPUCull->SetValue(effectGPUCull->GetParameterByName(NULL, "g_ResultsSize"), &resultsSize, sizeof(D3DXVECTOR2));
 
-        // Bind both Even and Odd Hi-Z textures (ping-pong pyramid)
-        // copyHiZToStaging() is NEVER CALLED, so no swap happens
-        // Even mips (0,2,4...) are in texHiZ, odd mips (1,3,5...) are in texHiZPrev
-        effectGPUCull->SetTexture(effectGPUCull->GetParameterByName(NULL, "g_texHiZEven"), texHiZ);
-        effectGPUCull->SetTexture(effectGPUCull->GetParameterByName(NULL, "g_texHiZOdd"), texHiZPrev);
+        // Bind consolidated previous frame Hi-Z pyramid texture
+        // texHiZPrevFrame contains all mips from previous frame (consolidated after generation)
+        // This provides true 1-frame latency for occlusion culling
+        effectGPUCull->SetTexture(effectGPUCull->GetParameterByName(NULL, "g_texHiZPrevFrame"), texHiZPrevFrame);
     }
 
     // Save current render target

@@ -105,8 +105,9 @@ public:
     static IDirect3DSurface9* surfDepthFrameMSAA; // Phase A: MSAA render target for depth frame
     static IDirect3DSurface9* surfDepthDepth;
     static IDirect3DTexture9* texCullDepth; // Cull-only depth (recordMW only, for Hi-Z)
-    static IDirect3DTexture9* texHiZ; // Hi-Z pyramid with full mip chain (current frame, being generated)
-    static IDirect3DTexture9* texHiZPrev; // Hi-Z pyramid from previous frame (used for culling)
+    static IDirect3DTexture9* texHiZ; // Hi-Z pyramid - even mips (0,2,4...) for ping-pong generation
+    static IDirect3DTexture9* texHiZPrev; // Hi-Z pyramid - odd mips (1,3,5...) for ping-pong generation
+    static IDirect3DTexture9* texHiZPrevFrame; // Consolidated Hi-Z pyramid from previous frame (for GPU culling)
     static IDirect3DTexture9* texHiZStaging; // Staging texture for CPU readback - frame N (async copy target)
     static IDirect3DTexture9* texHiZStaging2; // Staging texture - frame N-1 (1 frame old, still copying)
     static IDirect3DTexture9* texHiZStagingPrev; // Staging texture - frame N-2 (2 frames old, safe to lock)
@@ -270,6 +271,7 @@ public:
     static void renderDepthAdditional();
     static void renderDepthRecorded();
     static void generateHiZMipsGPU();
+    static void consolidateHiZPyramid();
     static void copyHiZToStaging();
     static void lockRemainingHiZMips();
 

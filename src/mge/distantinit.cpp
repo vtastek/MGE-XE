@@ -72,6 +72,7 @@ IDirect3DSurface9* DistantLand::surfDepthDepth;
 IDirect3DTexture9* DistantLand::texCullDepth;
 IDirect3DTexture9* DistantLand::texHiZ;
 IDirect3DTexture9* DistantLand::texHiZPrev;
+IDirect3DTexture9* DistantLand::texHiZPrevFrame;
 IDirect3DTexture9* DistantLand::texHiZStaging;
 IDirect3DTexture9* DistantLand::texHiZStaging2;
 IDirect3DTexture9* DistantLand::texHiZStagingPrev;
@@ -728,10 +729,17 @@ bool DistantLand::initHiZ() {
         return false;
     }
 
-    // Create previous frame Hi-Z texture (double-buffered for async culling)
+    // Create second ping-pong Hi-Z texture (for odd mips)
     hr = device->CreateTexture(baseWidth, baseHeight, 0, D3DUSAGE_RENDERTARGET, D3DFMT_R32F, D3DPOOL_DEFAULT, &texHiZPrev, NULL);
     if (hr != D3D_OK) {
-        LOG::logline("!! Failed to create previous frame Hi-Z texture");
+        LOG::logline("!! Failed to create ping-pong Hi-Z texture");
+        return false;
+    }
+
+    // Create consolidated previous frame Hi-Z texture (for GPU culling with 1-frame delay)
+    hr = device->CreateTexture(baseWidth, baseHeight, 0, D3DUSAGE_RENDERTARGET, D3DFMT_R32F, D3DPOOL_DEFAULT, &texHiZPrevFrame, NULL);
+    if (hr != D3D_OK) {
+        LOG::logline("!! Failed to create previous frame consolidated Hi-Z texture");
         return false;
     }
 
@@ -1669,6 +1677,10 @@ void DistantLand::release() {
     if (texHiZPrev) {
         texHiZPrev->Release();
         texHiZPrev = nullptr;
+    }
+    if (texHiZPrevFrame) {
+        texHiZPrevFrame->Release();
+        texHiZPrevFrame = nullptr;
     }
     if (texHiZStaging) {
         texHiZStaging->Release();
