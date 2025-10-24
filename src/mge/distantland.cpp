@@ -229,13 +229,9 @@ void DistantLand::renderStage1() {
             texDepthFrameSurface->Release();
         }
 
-        // Generate Hi-Z pyramid AFTER all depth rendering is complete
-        // Generates into ping-pong pair (texHiZ + texHiZPrev)
-        generateHiZMipsGPU();
-
-        // Consolidate ping-pong pyramid into single texture for next frame's GPU culling
-        // This gives true 1-frame latency without breaking the ping-pong pattern
-        consolidateHiZPyramid();
+        // Hi-Z generation DISABLED (culling disabled for baseline testing)
+        // generateHiZMipsGPU();
+        // consolidateHiZPyramid();
 
         // Restore render state
         stateSaved->Apply();

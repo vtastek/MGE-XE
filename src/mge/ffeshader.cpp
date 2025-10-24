@@ -3575,8 +3575,11 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     prevCameraView = currentView;
     hasPrevCamera = true;
 
-    // Cull lights against Hi-Z pyramid
-    DistantLand::cullSceneLights(viewProj);
+    // Light culling DISABLED for baseline performance testing
+    // DistantLand::cullSceneLights(viewProj);
+
+    // Make all lights visible (no culling)
+    DistantLand::visibleLights = DistantLand::sceneLights;
 
     // Upload visible lights to GPU texture (may stall if GPU idle)
     DistantLand::uploadLightDataToTexture(currentView);
@@ -3650,36 +3653,16 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
 
         cameraInsideFlags[i] = cameraInside;
 
-        // Initialize visibility: visible by default if no bbox or camera inside
-        visibilityResults[i] = (!call.hasBoundingBox || cameraInside);
+        // Initialize visibility: ALL objects visible (culling disabled)
+        visibilityResults[i] = true;
     }
 
-    // Batch GPU occlusion culling for all objects with bboxes (camera not inside)
-    {
-        DistantLand::beginGPUCullingQuery(
-            (int)numCalls,
-            bboxMins.data(),
-            bboxMaxs.data(),
-            currentView,
-            currentProj
-        );
-
-        // std::vector<bool> doesn't have .data(), need to use a regular bool array
-        bool* resultsPtr = new bool[numCalls];
-        DistantLand::endGPUCullingQuery((int)numCalls, resultsPtr);
-
-        // Copy GPU results back, but only for objects with bboxes (camera not inside)
-        // Objects without bboxes or with camera inside were pre-initialized to visible
-        for (size_t i = 0; i < numCalls; i++) {
-            const auto& call = recordedCalls[i];
-            if (call.hasBoundingBox && !cameraInsideFlags[i]) {
-                // Only update visibility for objects that should be GPU-culled
-                visibilityResults[i] = resultsPtr[i];
-            }
-            // Otherwise keep pre-initialized value (visible for no-bbox or camera-inside)
-        }
-        delete[] resultsPtr;
-    }
+    // GPU culling DISABLED for baseline performance testing
+    // All objects render without culling (conservative)
+    // {
+    //     DistantLand::beginGPUCullingQuery(...);
+    //     DistantLand::endGPUCullingQuery(...);
+    // }
 
     // Render visible objects
     for (size_t i = 0; i < numCalls; i++) {
