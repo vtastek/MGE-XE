@@ -1,6 +1,7 @@
 #pragma once
 
 #include "proxydx/d3d8header.h"
+#include "softwareocclusion.h"
 
 #include <unordered_map>
 #include <unordered_set>
@@ -35,6 +36,10 @@ struct RenderedState {
 
     D3DPRIMITIVETYPE primType;
     UINT baseIndex, minIndex, vertCount, startIndex, primCount;
+
+    // Bounding box for occlusion culling during depth rendering
+    D3DXVECTOR3 bboxMin, bboxMax;
+    bool hasBoundingBox;
 };
 
 struct FragmentState {
@@ -434,11 +439,13 @@ class FixedFunctionShader {
     };
 
     static std::vector<HLSLRecordedCall> recordedCalls;
+    static std::vector<HLSLRecordedCall> previousFrameCalls;  // Previous frame for raycast targeting
     static bool isRecording;
     static bool isReplaying;
     static bool manualRecordingControl;  // When true, user controls recording via K key
     static bool recordingEnabled;  // Global toggle for entire recording system
     static bool recordingCompletedThisFrame;  // Prevents restarting recording after Scene 0
+    static bool hiZBuiltThisFrame;  // Prevents rebuilding Hi-Z pyramid multiple times per frame
     static bool dumpRequested;  // When true, preserve calls for dump
 
     // Consistent matrices for entire recording session
@@ -474,6 +481,7 @@ public:
     static bool getIsReplaying() { return isReplaying; }
     static void setRecordingState(bool recording) { isRecording = recording; }
     static void resetRecordingCompletedFlag() { recordingCompletedThisFrame = false; }
+    static void resetHiZBuiltFlag() { hiZBuiltThisFrame = false; }
     static void setReplayingState(bool replaying) { isReplaying = replaying; }
     static void setManualRecordingControl(bool manual) { manualRecordingControl = manual; }
     static bool getManualRecordingControl() { return manualRecordingControl; }
@@ -491,6 +499,15 @@ public:
 private:
 
 public:
+    // Software occlusion culler for CPU-based Hi-Z depth buffer generation (public for depth culling)
+    static SoftwareOcclusionCuller softwareOcclusionCuller;
+
+    // Set of meshes rasterized as occluders - these must never be culled by Hi-Z
+    static std::unordered_set<MeshKey, MeshKeyHash> rasterizedOccluderMeshes;
+
+    // Prepare occlusion culling for depth rendering (build Hi-Z and filter recordMW)
+    static void prepareOcclusionCullingForDepth();
+
     static bool init(IDirect3DDevice* d, ID3DXEffectPool* pool);
     static void startEarlyPrecache(IDirect3DDevice* d);
     static void precacheAsync();

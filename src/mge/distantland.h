@@ -158,6 +158,7 @@ public:
         float radius;                // Computed from attenuation parameters
         D3DXVECTOR3 falloff;         // (constant, linear, quadratic) attenuation
         bool isVisible;              // After Hi-Z culling
+        int lastSeenFrame;           // Frame number when light was last updated
     };
     static std::vector<SceneLight> sceneLights;       // All unique lights in scene
     static std::unordered_map<int, size_t> sceneLightIndexMap;  // ID -> index for O(1) lookup
@@ -274,6 +275,7 @@ public:
     static void consolidateHiZPyramid();
     static void copyHiZToStaging();
     static void lockRemainingHiZMips();
+    static void saveHiZSnapshot(); // Save Hi-Z pyramid to temp folder (all mip levels)
 
     // GPU-based Hi-Z occlusion culling
     static void initGPUCulling();

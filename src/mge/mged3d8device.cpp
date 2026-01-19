@@ -252,6 +252,16 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
                 gPressed = false;
             }
 
+            // Handle U key for Hi-Z interface toggle
+            static bool uPressed = false;
+            bool uState = (GetAsyncKeyState('U') & 0x8000) != 0;
+            if (uState && !uPressed) {
+                ImGuiManager::ToggleHiZInterface();
+                uPressed = true;
+            } else if (!uState) {
+                uPressed = false;
+            }
+
             {
                 ZoneScopedN("Present_ImGuiNewFrame");
                 ImGuiManager::NewFrame();

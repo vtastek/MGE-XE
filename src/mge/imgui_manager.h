@@ -40,11 +40,50 @@ public:
     static void UpdateDebugStats(int recordedCalls, int renderedCalls, int culledCalls,
                                   int sceneLights, int visibleLights, int recordMWSize, int immediateCount);
 
+    // Hi-Z visualization interface
+    static void RenderHiZInterface();
+    static void ToggleHiZInterface();
+    static bool GetShowHiZInterface();
+    static int GetHiZDisplayMip() { return hiZDisplayMip; }
+    static float GetHiZBrightness() { return hiZBrightness; }
+    static float GetHiZGamma() { return hiZGamma; }
+    static bool GetHiZInvert() { return hiZInvert; }
+    static bool GetHiZShowRaycastGrid() { return hiZShowRaycastGrid; }
+    static int GetHiZRaycastStep() { return hiZRaycastStep; }
+
+    // Hi-Z occluder selection parameters
+    static int GetOccluderMaxCount() { return occluderMaxCount; }
+    static int GetOccluderP0ExtraBudget() { return occluderP0ExtraBudget; }
+    static int GetOccluderP1ExtraBudget() { return occluderP1ExtraBudget; }
+    static int GetOccluderP2ExtraBudget() { return occluderP2ExtraBudget; }
+    static int GetOccluderMinTriangles() { return occluderMinTriangles; }
+    static int GetOccluderMaxTriangles() { return occluderMaxTriangles; }
+    static float GetOccluderCloseDistance() { return occluderCloseDistance; }
+
+    // Wall detection heuristics (shape-based occluder selection)
+    static bool GetWallDetectionEnabled() { return wallDetectionEnabled; }
+    static float GetWallFlatnessThreshold() { return wallFlatnessThreshold; }
+    static float GetWallMinLargeDim() { return wallMinLargeDim; }
+    static float GetWallMaxThinDim() { return wallMaxThinDim; }
+    static int GetOccluderWallExtraBudget() { return occluderWallExtraBudget; }
+
+    // Occluder highlighting (debug visualization)
+    static bool GetHighlightOccluders() { return highlightOccluders; }
+
+    // Rasterize All mode - bypass all heuristics, rasterize everything
+    static bool GetRasterizeAll() { return rasterizeAll; }
+
+    // Hi-Z single object visualization mode (public for ffeshader access)
+    static bool hiZSingleObjectMode;
+    static int hiZSingleObjectIndex;
+    static int hiZTotalObjectCount;
+
 private:
     static bool initialized;
     static bool showDemo;
     static bool showPCFInterface;
     static bool showDebugInterface;
+    static bool showHiZInterface;
     static HWND windowHandle;
 
     // PCF filtering variables for tweaking
@@ -71,4 +110,34 @@ private:
     static int debugVisibleLights;
     static int debugRecordMWSize;
     static int debugImmediateCount;
+
+    // Hi-Z visualization variables
+    static int hiZDisplayMip;
+    static float hiZBrightness;
+    static float hiZGamma;
+    static bool hiZInvert;
+    static bool hiZShowRaycastGrid;
+    static int hiZRaycastStep;
+
+    // Hi-Z occluder selection parameters
+    static int occluderMaxCount;          // Base budget (default 100)
+    static int occluderP0ExtraBudget;     // Extra budget for P0 (camera inside bbox) - default 80
+    static int occluderP1ExtraBudget;     // Extra budget for P1 (off-screen corners) - default 50
+    static int occluderP2ExtraBudget;     // Extra budget for P2 (very close) - default 30
+    static int occluderMinTriangles;      // Minimum triangle count to be considered - default 0
+    static int occluderMaxTriangles;      // Maximum triangle count (filter out too complex) - default 9999999
+    static float occluderCloseDistance;   // Distance threshold for "very close" (P2) - default 2048
+
+    // Wall detection heuristics (shape-based occluder selection)
+    static bool wallDetectionEnabled;     // Enable wall shape detection - default true
+    static float wallFlatnessThreshold;   // Ratio of thin dim to mid dim (e.g., 0.15 = thin < 15% of mid) - default 0.15
+    static float wallMinLargeDim;         // Min size of the largest dimension to qualify as wall - default 200
+    static float wallMaxThinDim;          // Max size of thin dimension to qualify as wall - default 50
+    static int occluderWallExtraBudget;   // Extra budget for wall-shaped occluders - default 100
+
+    // Occluder highlighting (debug visualization)
+    static bool highlightOccluders;       // Tint occluders green for debugging - default false
+
+    // Rasterize All mode - bypass all heuristics
+    static bool rasterizeAll;             // Rasterize ALL objects to Hi-Z - default false
 };

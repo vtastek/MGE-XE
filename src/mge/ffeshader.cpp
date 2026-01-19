@@ -17,6 +17,7 @@
 #include <atomic>
 #include <cstring>
 #include <unordered_map>
+#include <random>
 
 using std::string;
 using std::stringstream;
@@ -50,11 +51,13 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::hlslShaderDefaultPurple;
 
 // HLSL Render Dispatch Recording System
 std::vector<FixedFunctionShader::HLSLRecordedCall> FixedFunctionShader::recordedCalls;
+std::vector<FixedFunctionShader::HLSLRecordedCall> FixedFunctionShader::previousFrameCalls;
 bool FixedFunctionShader::isRecording = false;
 bool FixedFunctionShader::isReplaying = false;
 bool FixedFunctionShader::manualRecordingControl = false;
 bool FixedFunctionShader::recordingEnabled = true;
 bool FixedFunctionShader::recordingCompletedThisFrame = false;
+bool FixedFunctionShader::hiZBuiltThisFrame = false;
 bool FixedFunctionShader::dumpRequested = false;
 
 // Consistent matrices for entire recording session
@@ -64,6 +67,12 @@ D3DXMATRIX FixedFunctionShader::recordingShadowViewproj[2];
 
 // Bbox cache: persists across frames for fast object-space bbox lookup
 std::unordered_map<FixedFunctionShader::MeshKey, FixedFunctionShader::ObjectSpaceBBox, FixedFunctionShader::MeshKeyHash> FixedFunctionShader::bboxCache;
+
+// Software occlusion culler for CPU-based Hi-Z depth buffer generation
+SoftwareOcclusionCuller FixedFunctionShader::softwareOcclusionCuller;
+
+// Set of meshes rasterized as occluders - these must never be culled by Hi-Z
+std::unordered_set<FixedFunctionShader::MeshKey, FixedFunctionShader::MeshKeyHash> FixedFunctionShader::rasterizedOccluderMeshes;
 
 // Previous frame camera tracking for velocity-based bbox expansion
 D3DXVECTOR3 FixedFunctionShader::prevCameraPos;
@@ -409,6 +418,26 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
 
     // Create default textures to avoid null binds that cause DXVK descriptor updates
     createDefaultTextures();
+
+    // Initialize software occlusion culler for CPU-based Hi-Z depth buffer
+    D3DDISPLAYMODE dm;
+    device->GetDisplayMode(0, &dm);
+
+    // Use current resolution or reasonable default
+    UINT width = (dm.Width > 0) ? dm.Width : 1920;
+    UINT height = (dm.Height > 0) ? dm.Height : 1080;
+
+    // Cap Hi-Z buffer at 256 horizontal resolution (mip 0 = half-res = 128)
+    // This significantly reduces rasterization cost while maintaining good culling
+    const UINT MAX_HIZ_WIDTH = 256;
+    if (width > MAX_HIZ_WIDTH) {
+        float scale = (float)MAX_HIZ_WIDTH / (float)width;
+        height = (UINT)(height * scale);
+        width = MAX_HIZ_WIDTH;
+    }
+
+    softwareOcclusionCuller.init(width, height);
+    LOG::logline("-- Software occlusion culler initialized (%dx%d)", width, height);
 
     return true;
 }
@@ -1650,10 +1679,9 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         rsWithShadows.shadowWorldViewProj[0] = rs->worldTransforms[0] * DistantLand::smViewproj[0];
         rsWithShadows.shadowWorldViewProj[1] = rs->worldTransforms[0] * DistantLand::smViewproj[1];
 
-        // Compute ShaderKey with texture suffix detection for recording
-        ShaderKey sk = computeShaderKeyWithSuffixes(&rsWithShadows, frs, lightrs);
+        // Compute shader key during recording (original working approach)
+        ShaderKey sk = computeShaderKeyWithSuffixes(rs, frs, lightrs);
         recordRenderCall(&rsWithShadows, frs, lightrs, sk);
-        // Skip immediate rendering - will be done in batch during replay
         return;
     }
 
@@ -3297,15 +3325,19 @@ void FixedFunctionShader::ShaderKey::log() const {
 
 // HLSL Render Dispatch Recording System Implementation
 
+// Frame counter for light persistence (prevent flickering)
+static int g_currentFrame = 0;
+
 void FixedFunctionShader::startRecording() {
     // Reset HLSL caches for new recording session
     resetHLSLCaches();
 
     recordedCalls.clear();
+    DistantLand::recordMW.clear();  // Clear previous frame's (filtered) depth recordings
     lastLightState.reset();  // Clear LightState cache for new recording
     lastLightStatePtr = nullptr;  // Clear pointer cache
 
-    // Clear lights from previous frame (do this at start of new frame, not end of each scene)
+    // Clear lights from previous frame (simple approach, no persistence)
     DistantLand::sceneLights.clear();
     DistantLand::sceneLightIndexMap.clear();
     DistantLand::visibleLights.clear();
@@ -3313,6 +3345,9 @@ void FixedFunctionShader::startRecording() {
     isRecording = true;
     isReplaying = false;
     recordingCompletedThisFrame = false;  // Allow recording to proceed
+
+    // Clear CPU depth buffer for new frame (replaces GPU Hi-Z readback)
+    softwareOcclusionCuller.clear();
 
     // Capture view/projection matrices once at start of recording
     // Note: World transforms are captured per-call in each RenderedState
@@ -3324,12 +3359,81 @@ void FixedFunctionShader::startRecording() {
     LOG::logline("HLSL Recording: Started recording render dispatches");
 }
 
+// prepareOcclusionCullingForDepth - Build Hi-Z pyramid and filter recordMW before depth rendering
+// Called at the start of renderStage1(), BEFORE renderDepth() executes
+void FixedFunctionShader::prepareOcclusionCullingForDepth() {
+    ZoneScopedN("Prepare Occlusion Culling for Depth");
+
+    // Build Hi-Z mipmap pyramid from rasterized occluders (only once per frame)
+    if (!hiZBuiltThisFrame) {
+        ZoneScopedN("Build Hi-Z Pyramid");
+        softwareOcclusionCuller.buildHiZPyramid();
+        softwareOcclusionCuller.uploadHiZToTexture(reinterpret_cast<IDirect3DDevice9*>(device), ImGuiManager::GetHiZDisplayMip(), ImGuiManager::GetHiZBrightness(), ImGuiManager::GetHiZGamma(), ImGuiManager::GetHiZInvert(), ImGuiManager::GetHiZShowRaycastGrid(), ImGuiManager::GetHiZRaycastStep());
+        hiZBuiltThisFrame = true;
+    }
+
+    // Filter recordMW before depth rendering (120 occluders → cull 2800 depth objects)
+    // This reduces GPU depth rendering workload by testing bboxes against CPU Hi-Z buffer
+    {
+        ZoneScopedN("Filter recordMW for Depth Rendering");
+
+        // Get current view/projection matrices for culling tests
+        D3DXMATRIX currentView, currentProj;
+        device->GetTransform(D3DTS_VIEW, &currentView);
+        device->GetTransform(D3DTS_PROJECTION, &currentProj);
+
+        std::vector<DistantLand::RecordedState> filteredRecordMW;
+        filteredRecordMW.reserve(DistantLand::recordMW.size() / 10);  // Expect ~10% survival
+
+        int culledCount = 0;
+        int testedCount = 0;
+
+        for (size_t i = 0; i < DistantLand::recordMW.size(); i++) {
+            auto& obj = DistantLand::recordMW[i];
+
+            // Try to match with recordedCalls bbox (same index, same order)
+            bool isVisible = true;
+            if (i < recordedCalls.size() && recordedCalls[i].hasBoundingBox) {
+                testedCount++;
+                isVisible = softwareOcclusionCuller.testBoundingBox(
+                    recordedCalls[i].bboxMin,
+                    recordedCalls[i].bboxMax,
+                    currentView,
+                    currentProj
+                );
+                if (!isVisible) {
+                    culledCount++;
+                }
+            }
+
+            if (isVisible) {
+                filteredRecordMW.push_back(std::move(obj));
+            }
+        }
+
+        int originalSize = DistantLand::recordMW.size();
+        DistantLand::recordMW = std::move(filteredRecordMW);
+
+        LOG::logline(">> Pre-filtered recordMW for depth: %d → %d objects (%d tested, %d culled, %.1f%% reduction)",
+                     originalSize, (int)DistantLand::recordMW.size(),
+                     testedCount, culledCount,
+                     originalSize > 0 ? ((originalSize - DistantLand::recordMW.size()) * 100.0f) / originalSize : 0.0f);
+    }
+}
+
 void FixedFunctionShader::stopRecordingAndReplay() {
     if (!isRecording) {
         return;
     }
 
     isRecording = false;
+
+    // Build Hi-Z mipmap pyramid from rasterized depth (call once after all occluders done)
+    {
+        ZoneScopedN("Build Hi-Z Pyramid");
+        softwareOcclusionCuller.buildHiZPyramid();
+        softwareOcclusionCuller.uploadHiZToTexture(reinterpret_cast<IDirect3DDevice9*>(device), ImGuiManager::GetHiZDisplayMip(), ImGuiManager::GetHiZBrightness(), ImGuiManager::GetHiZGamma(), ImGuiManager::GetHiZInvert(), ImGuiManager::GetHiZShowRaycastGrid(), ImGuiManager::GetHiZRaycastStep());
+    }
 
     // Now replay all recorded calls
     replayRecordedCalls(0); // Default to scene 0 for manual stop/replay
@@ -3453,29 +3557,29 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
         }
     }
 
-    // Collect lights from Morrowind for texture-based lighting system
-    {
-        for (const auto& [id, light] : lightrs->lights) {
-            // Check if light already exists using O(1) hash map lookup
-            auto mapIt = DistantLand::sceneLightIndexMap.find(id);
+    // Extract lights for texture-based lighting system (all objects, even if culled)
+    // Lights from culled objects can still illuminate visible geometry
+    for (const auto& [id, light] : lightrs->lights) {
+        // Check if light already exists using O(1) hash map lookup
+        auto mapIt = DistantLand::sceneLightIndexMap.find(id);
 
-            if (mapIt == DistantLand::sceneLightIndexMap.end()) {
-                // New light - add to scene
-                size_t newIndex = DistantLand::sceneLights.size();
-                DistantLand::SceneLight sl;
-                sl.id = id;
-                sl.position = light.position;
-                sl.diffuse = light.diffuse;
-                sl.falloff = light.falloff;  // (constant, linear, quadratic)
-                sl.radius = DistantLand::computeLightRadius(sl.falloff.x, sl.falloff.y, sl.falloff.z);
-                sl.isVisible = false;  // Will be set during Hi-Z culling
-                DistantLand::sceneLights.push_back(sl);
-                DistantLand::sceneLightIndexMap[id] = newIndex;  // Add to index map
-            } else {
-                // Update dynamic properties (color may pulse)
-                size_t index = mapIt->second;
-                DistantLand::sceneLights[index].diffuse = light.diffuse;
-            }
+        if (mapIt == DistantLand::sceneLightIndexMap.end()) {
+            // New light - add to scene
+            size_t newIndex = DistantLand::sceneLights.size();
+            DistantLand::SceneLight sl;
+            sl.id = id;
+            sl.position = light.position;
+            sl.diffuse = light.diffuse;
+            sl.falloff = light.falloff;  // (constant, linear, quadratic)
+            sl.radius = DistantLand::computeLightRadius(sl.falloff.x, sl.falloff.y, sl.falloff.z);
+            sl.isVisible = false;  // Will be set during Hi-Z culling
+            sl.lastSeenFrame = 0;  // Not used without persistence
+            DistantLand::sceneLights.push_back(sl);
+            DistantLand::sceneLightIndexMap[id] = newIndex;  // Add to index map
+        } else {
+            // Update dynamic properties (color may pulse)
+            size_t index = mapIt->second;
+            DistantLand::sceneLights[index].diffuse = light.diffuse;
         }
     }
 
@@ -3502,6 +3606,558 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
     {
         recordedCalls.emplace_back(rs, frs, sharedLightState, sk);
     }
+
+    // OCCLUSION CULLING - Raycast-based occluder selection
+    // Shoot raycasts at start of frame against previous frame's bboxes
+    // Then rasterize current frame's meshes that were hit by raycasts
+    {
+        static int occluderCount = 0;
+        const int MAX_OCCLUDERS = ImGuiManager::GetOccluderMaxCount();
+
+        // At start of recording (first call), shoot raycasts against previous frame
+        static std::unordered_set<MeshKey, MeshKeyHash> meshesToRasterize;
+        static int p0Count = 0, p1Count = 0, pWallCount = 0, p2Count = 0, p3Count = 0;
+        static int noBBoxCount = 0, notOpaqueCount = 0, failedTriFilterCount = 0;
+        static int totalOpaqueObjectsProcessed = 0;
+
+        if (recordedCalls.size() == 1) {
+            occluderCount = 0;
+            meshesToRasterize.clear();
+            p0Count = p1Count = pWallCount = p2Count = p3Count = 0;
+            noBBoxCount = notOpaqueCount = failedTriFilterCount = 0;
+            totalOpaqueObjectsProcessed = 0;
+
+            // Only perform raycasting if we have previous frame data
+            if (!previousFrameCalls.empty()) {
+                // Generate rays in screen space (5x4 base grid)
+                // Avoid screen edges/corners (use 10% margin)
+                const int gridWidth = 5;
+                const int gridHeight = 4;
+                const float edgeMargin = 0.1f;  // 10% margin on each edge
+
+                std::vector<D3DXVECTOR3> rayDirections;
+                rayDirections.reserve(MAX_OCCLUDERS);
+
+                // Generate base 5x4 grid of rays
+                for (int y = 0; y < gridHeight; y++) {
+                    for (int x = 0; x < gridWidth; x++) {
+                        // Map to screen space [0, 1] with edge margin
+                        float u = edgeMargin + (x + 0.5f) / gridWidth * (1.0f - 2.0f * edgeMargin);
+                        float v = edgeMargin + (y + 0.5f) / gridHeight * (1.0f - 2.0f * edgeMargin);
+
+                        // Convert to NDC space [-1, 1]
+                        float ndcX = u * 2.0f - 1.0f;
+                        float ndcY = 1.0f - v * 2.0f;  // Y is flipped in NDC
+
+                        // Unproject to get ray direction
+                        D3DXMATRIX invViewProj;
+                        D3DXMATRIX viewProj = recordingDeviceView * recordingDeviceProj;
+                        D3DXMatrixInverse(&invViewProj, nullptr, &viewProj);
+
+                        // Near and far points in NDC
+                        D3DXVECTOR4 nearPoint(ndcX, ndcY, 0.0f, 1.0f);
+                        D3DXVECTOR4 farPoint(ndcX, ndcY, 1.0f, 1.0f);
+
+                        // Transform to world space
+                        D3DXVECTOR4 nearWorld, farWorld;
+                        D3DXVec4Transform(&nearWorld, &nearPoint, &invViewProj);
+                        D3DXVec4Transform(&farWorld, &farPoint, &invViewProj);
+
+                        // Perspective divide
+                        nearWorld /= nearWorld.w;
+                        farWorld /= farWorld.w;
+
+                        // Ray direction (normalized)
+                        D3DXVECTOR3 rayDir(
+                            farWorld.x - nearWorld.x,
+                            farWorld.y - nearWorld.y,
+                            farWorld.z - nearWorld.z
+                        );
+                        D3DXVec3Normalize(&rayDir, &rayDir);
+                        rayDirections.push_back(rayDir);
+                    }
+                }
+
+                // Ray origin (camera position)
+                D3DXVECTOR3 rayOrigin = DistantLand::eyePos;
+
+                // Helper lambda: Ray-AABB intersection test
+                auto rayIntersectAABB = [](const D3DXVECTOR3& origin, const D3DXVECTOR3& dir,
+                                          const D3DXVECTOR3& bmin, const D3DXVECTOR3& bmax,
+                                          float& tMin, float& tMax) -> bool {
+                    tMin = 0.0f;
+                    tMax = FLT_MAX;
+
+                    for (int i = 0; i < 3; i++) {
+                        float invD = 1.0f / (&dir.x)[i];
+                        float t0 = ((&bmin.x)[i] - (&origin.x)[i]) * invD;
+                        float t1 = ((&bmax.x)[i] - (&origin.x)[i]) * invD;
+
+                        if (invD < 0.0f) {
+                            std::swap(t0, t1);
+                        }
+
+                        tMin = t0 > tMin ? t0 : tMin;
+                        tMax = t1 < tMax ? t1 : tMax;
+
+                        if (tMax <= tMin) {
+                            return false;
+                        }
+                    }
+
+                    return true;
+                };
+
+                // Helper lambda: Generate random ray avoiding edges
+                auto generateRandomRay = [&](std::mt19937& rng) -> D3DXVECTOR3 {
+                    std::uniform_real_distribution<float> dist(edgeMargin, 1.0f - edgeMargin);
+                    float u = dist(rng);
+                    float v = dist(rng);
+
+                    float ndcX = u * 2.0f - 1.0f;
+                    float ndcY = 1.0f - v * 2.0f;
+
+                    D3DXMATRIX invViewProj;
+                    D3DXMATRIX viewProj = recordingDeviceView * recordingDeviceProj;
+                    D3DXMatrixInverse(&invViewProj, nullptr, &viewProj);
+
+                    D3DXVECTOR4 nearPoint(ndcX, ndcY, 0.0f, 1.0f);
+                    D3DXVECTOR4 farPoint(ndcX, ndcY, 1.0f, 1.0f);
+                    D3DXVECTOR4 nearWorld, farWorld;
+                    D3DXVec4Transform(&nearWorld, &nearPoint, &invViewProj);
+                    D3DXVec4Transform(&farWorld, &farPoint, &invViewProj);
+
+                    nearWorld /= nearWorld.w;
+                    farWorld /= farWorld.w;
+
+                    D3DXVECTOR3 rayDir(
+                        farWorld.x - nearWorld.x,
+                        farWorld.y - nearWorld.y,
+                        farWorld.z - nearWorld.z
+                    );
+                    D3DXVec3Normalize(&rayDir, &rayDir);
+                    return rayDir;
+                };
+
+                // Random number generator for adaptive resampling
+                std::random_device rd;
+                std::mt19937 rng(rd());
+
+                // DEBUG: Count bboxes in previousFrameCalls and how many contain camera
+                int bboxCount = 0;
+                int bboxContainingCamera = 0;
+                for (const auto& call : previousFrameCalls) {
+                    if (call.hasBoundingBox) {
+                        bboxCount++;
+                        bool cameraInside = (rayOrigin.x >= call.bboxMin.x && rayOrigin.x <= call.bboxMax.x &&
+                                            rayOrigin.y >= call.bboxMin.y && rayOrigin.y <= call.bboxMax.y &&
+                                            rayOrigin.z >= call.bboxMin.z && rayOrigin.z <= call.bboxMax.z);
+                        if (cameraInside) bboxContainingCamera++;
+                    }
+                }
+                LOG::logline("    Raycast setup: %d calls, %d with bboxes, %d contain camera (skipped)",
+                             (int)previousFrameCalls.size(), bboxCount, bboxContainingCamera);
+
+                // Process each ray and perform adaptive resampling
+                int totalRays = 0;
+                int raysHit = 0;
+                for (size_t i = 0; i < rayDirections.size() && totalRays < MAX_OCCLUDERS; i++) {
+                    const D3DXVECTOR3& rayDir = rayDirections[i];
+
+                    // Find closest hit in previous frame
+                    float closestDist = FLT_MAX;
+                    const HLSLRecordedCall* closestHit = nullptr;
+
+                    for (const auto& call : previousFrameCalls) {
+                        if (!call.hasBoundingBox) continue;
+
+                        // Skip bboxes that contain the camera (let rays pass through room walls/floors)
+                        bool cameraInsideBBox = (rayOrigin.x >= call.bboxMin.x && rayOrigin.x <= call.bboxMax.x &&
+                                                  rayOrigin.y >= call.bboxMin.y && rayOrigin.y <= call.bboxMax.y &&
+                                                  rayOrigin.z >= call.bboxMin.z && rayOrigin.z <= call.bboxMax.z);
+                        if (cameraInsideBBox) continue;
+
+                        float tMin, tMax;
+                        if (rayIntersectAABB(rayOrigin, rayDir, call.bboxMin, call.bboxMax, tMin, tMax)) {
+                            if (tMin < closestDist) {
+                                closestDist = tMin;
+                                closestHit = &call;
+                            }
+                        }
+                    }
+
+                    // If we hit something, add it to rasterization set
+                    if (closestHit) {
+                        raysHit++;
+
+                        // Build MeshKey from the hit call
+                        MeshKey key;
+                        key.vb = closestHit->rs.vb;
+                        key.ib = closestHit->rs.ib;
+                        key.fvf = closestHit->rs.fvf;
+                        key.baseIndex = closestHit->rs.ibBase;
+                        key.vertCount = closestHit->rs.vertCount;
+                        key.startIndex = closestHit->rs.startIndex;
+                        key.primCount = closestHit->rs.primCount;
+
+                        // DEBUG: Log first few hits
+                        if (raysHit <= 5) {
+                            LOG::logline("      Ray %d hit: vb=0x%p ib=0x%p tris=%d dist=%.1f",
+                                        (int)i, key.vb, key.ib, key.primCount, closestDist);
+                        }
+
+                        meshesToRasterize.insert(key);
+
+                        // Adaptive resampling based on hit characteristics
+                        int additionalRays = 0;
+
+                        // Check if hit is "small" (low triangle count)
+                        if (closestHit->rs.primCount < 10) {
+                            additionalRays = 1;
+                        }
+
+                        // Check if hit is distant
+                        if (closestDist > 2048.0f) {
+                            additionalRays = std::max(additionalRays, 1);
+                        }
+
+                        // Check if hit is very far
+                        if (closestDist > 4000.0f) {
+                            additionalRays = std::max(additionalRays, 2);
+                        }
+
+                        // Cast additional random rays
+                        for (int j = 0; j < additionalRays && totalRays < MAX_OCCLUDERS; j++) {
+                            D3DXVECTOR3 randomRayDir = generateRandomRay(rng);
+
+                            // Find closest hit for random ray
+                            float randomClosestDist = FLT_MAX;
+                            const HLSLRecordedCall* randomClosestHit = nullptr;
+
+                            for (const auto& call : previousFrameCalls) {
+                                if (!call.hasBoundingBox) continue;
+
+                                // Skip bboxes that contain the camera (let rays pass through room walls/floors)
+                                bool cameraInsideBBox = (rayOrigin.x >= call.bboxMin.x && rayOrigin.x <= call.bboxMax.x &&
+                                                          rayOrigin.y >= call.bboxMin.y && rayOrigin.y <= call.bboxMax.y &&
+                                                          rayOrigin.z >= call.bboxMin.z && rayOrigin.z <= call.bboxMax.z);
+                                if (cameraInsideBBox) continue;
+
+                                float tMin, tMax;
+                                if (rayIntersectAABB(rayOrigin, randomRayDir, call.bboxMin, call.bboxMax, tMin, tMax)) {
+                                    if (tMin < randomClosestDist) {
+                                        randomClosestDist = tMin;
+                                        randomClosestHit = &call;
+                                    }
+                                }
+                            }
+
+                            if (randomClosestHit) {
+                                MeshKey randomKey;
+                                randomKey.vb = randomClosestHit->rs.vb;
+                                randomKey.ib = randomClosestHit->rs.ib;
+                                randomKey.fvf = randomClosestHit->rs.fvf;
+                                randomKey.baseIndex = randomClosestHit->rs.ibBase;
+                                randomKey.vertCount = randomClosestHit->rs.vertCount;
+                                randomKey.startIndex = randomClosestHit->rs.startIndex;
+                                randomKey.primCount = randomClosestHit->rs.primCount;
+
+                                meshesToRasterize.insert(randomKey);
+                            }
+
+                            totalRays++;
+                        }
+                    }
+
+                    totalRays++;
+                }
+
+                LOG::logline(">> Raycast occluder selection: %d unique meshes from %d raycasts (%d hits)",
+                            (int)meshesToRasterize.size(), totalRays, raysHit);
+
+                // Update static set so replay phase knows which meshes are occluders
+                rasterizedOccluderMeshes = meshesToRasterize;
+            }
+        }
+
+        // Check if this mesh should be rasterized
+        bool shouldRasterize = false;
+        if (rs->vb && rs->ib) {
+            const HLSLRecordedCall& call = recordedCalls.back();
+
+            if (!call.hasBoundingBox) {
+                noBBoxCount++;
+            } else {
+                // Log first few objects WITH bboxes to verify walls are coming through
+                static int bboxLogCount = 0;
+                if (bboxLogCount++ < 20) {
+                    D3DXVECTOR3 bboxSize = call.bboxMax - call.bboxMin;
+                    float volume = bboxSize.x * bboxSize.y * bboxSize.z;
+                    LOG::logline(">> Object with bbox: tris=%d vol=%.0f size=(%.1f,%.1f,%.1f) blend=%d zwrite=%d",
+                                rs->primCount, volume, bboxSize.x, bboxSize.y, bboxSize.z,
+                                rs->blendEnable ? 1 : 0, rs->zWrite ? 1 : 0);
+                }
+            }
+
+            // ALWAYS rasterize objects with off-screen corners (large nearby walls/floors/ceilings)
+            // These are the most important occluders and must not be skipped
+            bool hasOffScreenCorners = false;
+            if (call.hasBoundingBox) {
+                D3DXMATRIX viewProj = recordingDeviceView * recordingDeviceProj;
+                D3DXVECTOR3 corners[8] = {
+                    D3DXVECTOR3(call.bboxMin.x, call.bboxMin.y, call.bboxMin.z),
+                    D3DXVECTOR3(call.bboxMax.x, call.bboxMin.y, call.bboxMin.z),
+                    D3DXVECTOR3(call.bboxMin.x, call.bboxMax.y, call.bboxMin.z),
+                    D3DXVECTOR3(call.bboxMax.x, call.bboxMax.y, call.bboxMin.z),
+                    D3DXVECTOR3(call.bboxMin.x, call.bboxMin.y, call.bboxMax.z),
+                    D3DXVECTOR3(call.bboxMax.x, call.bboxMin.y, call.bboxMax.z),
+                    D3DXVECTOR3(call.bboxMin.x, call.bboxMax.y, call.bboxMax.z),
+                    D3DXVECTOR3(call.bboxMax.x, call.bboxMax.y, call.bboxMax.z)
+                };
+                for (int i = 0; i < 8; i++) {
+                    D3DXVECTOR4 clipPos;
+                    D3DXVec3Transform(&clipPos, &corners[i], &viewProj);
+
+                    // Corner behind camera (w <= 0) is definitely off-screen!
+                    if (clipPos.w <= 0.0f) {
+                        hasOffScreenCorners = true;
+                        break;
+                    }
+
+                    // Corner in front of camera - check if outside NDC range
+                    clipPos /= clipPos.w;
+                    if (clipPos.x < -1.0f || clipPos.x > 1.0f ||
+                        clipPos.y < -1.0f || clipPos.y > 1.0f) {
+                        hasOffScreenCorners = true;
+                        break;
+                    }
+                }
+            }
+
+            // Check if camera is inside bbox (most important - always rasterize!)
+            bool cameraInsideBBox = false;
+            bool isVeryClose = false;
+
+            if (call.hasBoundingBox) {
+                // Camera inside bbox check - if true, this is definitely a wall/floor/ceiling
+                // DistantLand::eyePos is D3DXVECTOR4, use .x/.y/.z components
+                float eyeX = DistantLand::eyePos.x;
+                float eyeY = DistantLand::eyePos.y;
+                float eyeZ = DistantLand::eyePos.z;
+                cameraInsideBBox = (eyeX >= call.bboxMin.x && eyeX <= call.bboxMax.x &&
+                                   eyeY >= call.bboxMin.y && eyeY <= call.bboxMax.y &&
+                                   eyeZ >= call.bboxMin.z && eyeZ <= call.bboxMax.z);
+
+                // Proximity check
+                D3DXVECTOR3 bboxCenter = (call.bboxMin + call.bboxMax) * 0.5f;
+                D3DXVECTOR3 eyeToCenter = D3DXVECTOR3(bboxCenter.x - eyeX,
+                                                       bboxCenter.y - eyeY,
+                                                       bboxCenter.z - eyeZ);
+                float distanceSquared = D3DXVec3LengthSq(&eyeToCenter);
+                float closeThreshold = ImGuiManager::GetOccluderCloseDistance();
+                isVeryClose = distanceSquared < closeThreshold * closeThreshold;
+            }
+
+            // RASTERIZE EVERYTHING MODE - NO FILTERS AT ALL
+            // Removed: Opaque check, triangle count filter, all priority logic
+            // Goal: Find out if walls are in recordedCalls at all
+
+            // Calculate bbox volume for logging
+            float bboxVolume = 0.0f;
+            if (call.hasBoundingBox) {
+                D3DXVECTOR3 bboxSize = call.bboxMax - call.bboxMin;
+                bboxVolume = bboxSize.x * bboxSize.y * bboxSize.z;
+            }
+
+            // Track ALL objects for single object mode (no filters!)
+            int currentObjectIndex = totalOpaqueObjectsProcessed++;
+
+            // Single object visualization mode - only rasterize selected object
+            if (ImGuiManager::hiZSingleObjectMode) {
+                if (currentObjectIndex == ImGuiManager::hiZSingleObjectIndex) {
+                    shouldRasterize = true;
+                    LOG::logline("    SINGLE OBJECT MODE: Showing object %d: vb=0x%p ib=0x%p tris=%d bbox_vol=%.0f blend=%d zwrite=%d",
+                                currentObjectIndex, rs->vb, rs->ib, rs->primCount, bboxVolume,
+                                rs->blendEnable ? 1 : 0, rs->zWrite ? 1 : 0);
+                }
+            }
+
+            // Wall shape detection: thin and long bboxes are likely walls
+            bool isWallShaped = false;
+            if (call.hasBoundingBox && ImGuiManager::GetWallDetectionEnabled()) {
+                D3DXVECTOR3 bboxSize = call.bboxMax - call.bboxMin;
+
+                // Sort dimensions to find thin/mid/large
+                float dims[3] = { bboxSize.x, bboxSize.y, bboxSize.z };
+                std::sort(dims, dims + 3);  // dims[0]=smallest, dims[2]=largest
+
+                float thinDim = dims[0];
+                float midDim = dims[1];
+                float largeDim = dims[2];
+
+                // Wall detection criteria:
+                // 1. Thin dimension is very small relative to mid dimension (flatness)
+                // 2. Largest dimension is big enough (not a tiny object)
+                // 3. Thin dimension is below absolute threshold (not a cube)
+                float flatnessRatio = (midDim > 0.001f) ? (thinDim / midDim) : 1.0f;
+
+                isWallShaped = (flatnessRatio < ImGuiManager::GetWallFlatnessThreshold()) &&
+                               (largeDim >= ImGuiManager::GetWallMinLargeDim()) &&
+                               (thinDim <= ImGuiManager::GetWallMaxThinDim());
+            }
+
+            // RASTERIZE ALL MODE - bypass all heuristics
+            if (ImGuiManager::GetRasterizeAll() && call.hasBoundingBox) {
+                shouldRasterize = true;
+            }
+
+            // Normal priority checks (skipped if rasterizeAll mode)
+            if (!shouldRasterize) {
+                // Triangle count filter
+                int triCount = rs->primCount;
+                bool passesTriangleFilter = (triCount >= ImGuiManager::GetOccluderMinTriangles() &&
+                                            triCount <= ImGuiManager::GetOccluderMaxTriangles());
+
+                if (!passesTriangleFilter) {
+                    failedTriFilterCount++;
+                }
+
+                if (passesTriangleFilter) {
+                    // Priority 0: ALWAYS rasterize if camera is inside bbox (room walls/floors/ceilings!)
+                    if (cameraInsideBBox && occluderCount < MAX_OCCLUDERS + ImGuiManager::GetOccluderP0ExtraBudget()) {
+                        shouldRasterize = true;
+                        p0Count++;
+                        static int logCountP0 = 0;
+                        if (logCountP0++ < 5) LOG::logline("    P0: Camera inside bbox (tris=%d)", rs->primCount);
+                    }
+                    // Priority 1: ALWAYS rasterize objects with off-screen corners (nearby walls/floors)
+                    else if (hasOffScreenCorners && occluderCount < MAX_OCCLUDERS + ImGuiManager::GetOccluderP1ExtraBudget()) {
+                        shouldRasterize = true;
+                        p1Count++;
+                        static int logCountP1 = 0;
+                        if (logCountP1++ < 5) LOG::logline("    P1: Off-screen corners (tris=%d)", rs->primCount);
+                    }
+                    // Priority Wall: Rasterize wall-shaped objects (thin and long bboxes)
+                    else if (isWallShaped && occluderCount < MAX_OCCLUDERS + ImGuiManager::GetOccluderWallExtraBudget()) {
+                        shouldRasterize = true;
+                        pWallCount++;
+                        static int logCountWall = 0;
+                        if (logCountWall++ < 10) {
+                            D3DXVECTOR3 bboxSize = call.bboxMax - call.bboxMin;
+                            LOG::logline("    PWall: Wall-shaped (tris=%d size=%.1f,%.1f,%.1f)",
+                                        rs->primCount, bboxSize.x, bboxSize.y, bboxSize.z);
+                        }
+                    }
+                    // Priority 2: ALWAYS rasterize very close objects (walls directly in front)
+                    else if (isVeryClose && occluderCount < MAX_OCCLUDERS + ImGuiManager::GetOccluderP2ExtraBudget()) {
+                        shouldRasterize = true;
+                        p2Count++;
+                        static int logCountP2 = 0;
+                        if (logCountP2++ < 5) LOG::logline("    P2: Very close (tris=%d)", rs->primCount);
+                    }
+                    // Priority 3: Rasterize meshes hit by raycasts
+                    else if (occluderCount < MAX_OCCLUDERS) {
+                        // Build MeshKey for current draw call
+                        MeshKey currentKey;
+                        currentKey.vb = rs->vb;
+                        currentKey.ib = rs->ib;
+                        currentKey.fvf = rs->fvf;
+                        currentKey.baseIndex = rs->ibBase;
+                        currentKey.vertCount = rs->vertCount;
+                        currentKey.startIndex = rs->startIndex;
+                        currentKey.primCount = rs->primCount;
+
+                        // Check if this mesh was hit by a raycast
+                        if (meshesToRasterize.find(currentKey) != meshesToRasterize.end()) {
+                            shouldRasterize = true;
+                            p3Count++;
+                            static int logCountP3 = 0;
+                            if (logCountP3++ < 5) LOG::logline("    P3: Raycast hit (tris=%d)", rs->primCount);
+                        }
+                    }
+                }
+            }
+
+        if (shouldRasterize) {
+            // DEBUG: Log first few rasterizations
+            static int rasterLogCount = 0;
+            if (rasterLogCount++ < 10) {
+                LOG::logline("    Rasterizing: vb=0x%p ib=0x%p tris=%d", rs->vb, rs->ib, rs->primCount);
+            }
+
+            // Add this mesh to the static occluder set (so it won't be culled later)
+            MeshKey occluderKey;
+            occluderKey.vb = rs->vb;
+            occluderKey.ib = rs->ib;
+            occluderKey.fvf = rs->fvf;
+            occluderKey.baseIndex = rs->ibBase;
+            occluderKey.vertCount = rs->vertCount;
+            occluderKey.startIndex = rs->startIndex;
+            occluderKey.primCount = rs->primCount;
+            rasterizedOccluderMeshes.insert(occluderKey);
+
+            // Rasterize mesh
+            int pixelsWritten = softwareOcclusionCuller.rasterizeMesh(
+                rs->vb,
+                rs->vbOffset,
+                rs->vbStride,
+                rs->ib,
+                rs->ibBase,
+                rs->startIndex,
+                rs->primCount,
+                rs->primType,
+                rs->fvf,
+                rs->worldTransforms[0],
+                recordingDeviceView,
+                recordingDeviceProj
+            );
+
+            // Debug: Log rasterization results
+            static int rasterResultLogCount = 0;
+            if (rasterResultLogCount++ < 20) {
+                LOG::logline("    Raster result: %d pixels written for %d tris (fvf=0x%X stride=%d)",
+                            pixelsWritten, rs->primCount, rs->fvf, rs->vbStride);
+            }
+
+            occluderCount++;
+        }
+
+        // Build Hi-Z pyramid after enough occluders are rasterized, then start culling
+        static bool hiZBuiltDuringRecording = false;
+        int totalBudget = MAX_OCCLUDERS + ImGuiManager::GetOccluderP0ExtraBudget() +
+                          ImGuiManager::GetOccluderP1ExtraBudget() + ImGuiManager::GetOccluderWallExtraBudget() +
+                          ImGuiManager::GetOccluderP2ExtraBudget();
+        if ((occluderCount >= totalBudget && !hiZBuiltDuringRecording) || (ImGuiManager::hiZSingleObjectMode && occluderCount >= 1)) {
+            // Update total object count for UI
+            ImGuiManager::hiZTotalObjectCount = totalOpaqueObjectsProcessed;
+
+            // Log statistics before building Hi-Z
+            LOG::logline(">> Occluder Selection Stats:");
+            LOG::logline("    Rejected: %d no-bbox, %d not-opaque, %d failed-tri-filter",
+                        noBBoxCount, notOpaqueCount, failedTriFilterCount);
+            LOG::logline("    Selected: P0=%d, P1=%d, PWall=%d, P2=%d, P3=%d (Total=%d)",
+                        p0Count, p1Count, pWallCount, p2Count, p3Count, occluderCount);
+            LOG::logline("    Total opaque objects processed: %d", totalOpaqueObjectsProcessed);
+
+            softwareOcclusionCuller.buildHiZPyramid();
+            softwareOcclusionCuller.uploadHiZToTexture(reinterpret_cast<IDirect3DDevice9*>(device), ImGuiManager::GetHiZDisplayMip(), ImGuiManager::GetHiZBrightness(), ImGuiManager::GetHiZGamma(), ImGuiManager::GetHiZInvert(), ImGuiManager::GetHiZShowRaycastGrid(), ImGuiManager::GetHiZRaycastStep());
+            hiZBuiltDuringRecording = true;
+            hiZBuiltThisFrame = true;  // Prevent rebuild in prepareOcclusionCullingForDepth
+            LOG::logline(">> Hi-Z pyramid built after %d occluders rasterized (raycasts found %d meshes)", occluderCount, (int)meshesToRasterize.size());
+        }
+
+        // Reset counters at end of recording (when replay starts)
+        if (recordedCalls.size() == 1) {
+            occluderCount = 0;
+            hiZBuiltDuringRecording = false;
+        }
+        }  // Close if (rs->vb && rs->ib) block from line ~3885
+    }
+
+    // 2-PASS OCCLUSION: Don't cull during recording!
+    // Culling during recording uses incomplete Hi-Z buffer → false occlusions
+    // All culling happens during replay when Hi-Z is complete
+    // (See replayRecordedCalls lines ~4310 for replay-time culling)
 }
 
 void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
@@ -3560,6 +4216,19 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
         wasPressed = false;
     }
 
+    // Check for Hi-Z snapshot save key press (L key)
+    if (GetAsyncKeyState('L') & 0x8000) {
+        static bool wasPressed = false;
+        if (!wasPressed) {
+            LOG::logline(">> L key pressed: Saving Hi-Z snapshot...");
+            DistantLand::saveHiZSnapshot();
+            wasPressed = true;
+        }
+    } else {
+        static bool wasPressed = false;
+        wasPressed = false;
+    }
+
     // Calculate camera velocity from previous frame (to compensate for one-frame-behind Hi-Z)
     D3DXVECTOR3 currentCameraPos = D3DXVECTOR3(DistantLand::eyePos.x, DistantLand::eyePos.y, DistantLand::eyePos.z);
     D3DXVECTOR3 cameraVelocity(0.0f, 0.0f, 0.0f);
@@ -3575,11 +4244,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     prevCameraView = currentView;
     hasPrevCamera = true;
 
-    // Light culling DISABLED for baseline performance testing
-    // DistantLand::cullSceneLights(viewProj);
-
-    // Make all lights visible (no culling)
-    DistantLand::visibleLights = DistantLand::sceneLights;
+    // Light culling using Hi-Z occlusion
+    DistantLand::cullSceneLights(viewProj);
 
     // Upload visible lights to GPU texture (may stall if GPU idle)
     DistantLand::uploadLightDataToTexture(currentView);
@@ -3593,99 +4259,86 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     };
     device->SetPixelShaderConstantF(50, lightParams, 1); // c50
 
-    // GPU-based Hi-Z batch culling with expanded bboxes for camera intersection handling
+    // Direct occlusion culling for each recorded call
     const size_t numCalls = recordedCalls.size();
 
-    // Allocate temporary arrays for batch GPU culling
-    std::vector<D3DXVECTOR3> bboxMins(numCalls);
-    std::vector<D3DXVECTOR3> bboxMaxs(numCalls);
-    std::vector<bool> cameraInsideFlags(numCalls);
-    std::vector<bool> visibilityResults(numCalls);
-
-    // Prepare bboxes for batch culling
+    // Render visible objects with direct occlusion testing
     for (size_t i = 0; i < numCalls; i++) {
-        const auto& call = recordedCalls[i];
+        auto& call = recordedCalls[i];  // Non-const to update shader key
 
-        // Track bbox stats
+        // Direct occlusion test using Hi-Z buffer
+        bool shouldRender = true;
         if (call.hasBoundingBox) {
             callsWithBBox++;
+
+            // CRITICAL: Don't cull meshes that were rasterized as occluders!
+            // Check if this mesh was used as an occluder
+            MeshKey currentKey;
+            currentKey.vb = call.rs.vb;
+            currentKey.ib = call.rs.ib;
+            currentKey.fvf = call.rs.fvf;
+            currentKey.baseIndex = call.rs.ibBase;
+            currentKey.vertCount = call.rs.vertCount;
+            currentKey.startIndex = call.rs.startIndex;
+            currentKey.primCount = call.rs.primCount;
+
+            // Check if this mesh was rasterized as an occluder
+            bool isOccluderMesh = (rasterizedOccluderMeshes.find(currentKey) != rasterizedOccluderMeshes.end());
+
+            if (isOccluderMesh) {
+                // This mesh was rasterized as an occluder - never cull it!
+                static int occluderSkipLogCount = 0;
+                if (occluderSkipLogCount++ < 5) {
+                    LOG::logline("    Skipping Hi-Z test for occluder mesh: vb=0x%p ib=0x%p", call.rs.vb, call.rs.ib);
+                }
+            } else {
+                // Test bbox against CPU depth buffer
+                bool isVisible = softwareOcclusionCuller.testBoundingBox(
+                    call.bboxMin,
+                    call.bboxMax,
+                    currentView,
+                    currentProj
+                );
+
+                if (!isVisible) {
+                    culledCalls++;
+                    shouldRender = false;
+                }
+            }
         } else {
             callsWithoutBBox++;
         }
 
-        // Expand bbox conservatively to avoid false positives
-        // Use 1.25x scale + fixed 10 unit padding to handle bad pivots/asymmetric meshes
-        // Add 2x padding for thin axes (< 20 units) to avoid missing flat/small objects
-        D3DXVECTOR3 center = (call.bboxMin + call.bboxMax) * 0.5f;
-        D3DXVECTOR3 halfSize = (call.bboxMax - call.bboxMin) * 0.5f;
-        D3DXVECTOR3 padding(10.0f, 10.0f, 10.0f);
-
-        // Double padding for thin axes
-        if (halfSize.x * 2.0f < 20.0f) padding.x *= 2.0f;
-        if (halfSize.y * 2.0f < 20.0f) padding.y *= 2.0f;
-        if (halfSize.z * 2.0f < 20.0f) padding.z *= 2.0f;
-
-        D3DXVECTOR3 expandedHalfSize = halfSize * 1.25f + padding;
-
-        // GPU culling uses current frame's Hi-Z (no delay), so no velocity expansion needed
-        // CPU culling used 2-frame-old data and needed velocity compensation (removed)
-
-        D3DXVECTOR3 expandedMin = center - expandedHalfSize;
-        D3DXVECTOR3 expandedMax = center + expandedHalfSize;
-
-        // Store expanded bbox for GPU culling
-        bboxMins[i] = expandedMin;
-        bboxMaxs[i] = expandedMax;
-
-        // Treat camera as 100x100x100 unit bbox for intersection test
-        const float cameraBBoxSize = 50.0f; // Half-size = 50 units (100x100x100 total)
-        D3DXVECTOR3 cameraBBoxMin = D3DXVECTOR3(DistantLand::eyePos.x - cameraBBoxSize,
-                                                 DistantLand::eyePos.y - cameraBBoxSize,
-                                                 DistantLand::eyePos.z - cameraBBoxSize);
-        D3DXVECTOR3 cameraBBoxMax = D3DXVECTOR3(DistantLand::eyePos.x + cameraBBoxSize,
-                                                 DistantLand::eyePos.y + cameraBBoxSize,
-                                                 DistantLand::eyePos.z + cameraBBoxSize);
-
-        // Check if camera bbox intersects expanded object bbox - if so, always render
-        bool cameraInside = !(cameraBBoxMax.x < expandedMin.x || cameraBBoxMin.x > expandedMax.x ||
-                          cameraBBoxMax.y < expandedMin.y || cameraBBoxMin.y > expandedMax.y ||
-                          cameraBBoxMax.z < expandedMin.z || cameraBBoxMin.z > expandedMax.z);
-
-        cameraInsideFlags[i] = cameraInside;
-
-        // Initialize visibility: ALL objects visible (culling disabled)
-        visibilityResults[i] = true;
-    }
-
-    // GPU culling DISABLED for baseline performance testing
-    // All objects render without culling (conservative)
-    // {
-    //     DistantLand::beginGPUCullingQuery(...);
-    //     DistantLand::endGPUCullingQuery(...);
-    // }
-
-    // Render visible objects
-    for (size_t i = 0; i < numCalls; i++) {
-        const auto& call = recordedCalls[i];
-
-        bool shouldRender = visibilityResults[i];
-
-        // Apply camera-inside override (always render if camera intersects bbox)
-        if (call.hasBoundingBox && cameraInsideFlags[i]) {
-            shouldRender = true;
-        }
-
-        // Track culling stats
-        if (call.hasBoundingBox && !cameraInsideFlags[i] && !shouldRender) {
-            culledCalls++;
-        }
-
         if (shouldRender) {
-            // Restore sampler states for this call
+            // Restore sampler states for this call (captured during recording)
             for (int stage = 0; stage < 8; ++stage) {
                 if (call.samplerStates[stage].captured) {
                     device->SetSamplerState(stage, D3DSAMP_ADDRESSU, call.samplerStates[stage].addressU);
                     device->SetSamplerState(stage, D3DSAMP_ADDRESSV, call.samplerStates[stage].addressV);
+                }
+            }
+
+            // Occluder highlighting: tint occluders green for debug visualization
+            if (ImGuiManager::GetHighlightOccluders()) {
+                MeshKey highlightKey;
+                highlightKey.vb = call.rs.vb;
+                highlightKey.ib = call.rs.ib;
+                highlightKey.fvf = call.rs.fvf;
+                highlightKey.baseIndex = call.rs.ibBase;
+                highlightKey.vertCount = call.rs.vertCount;
+                highlightKey.startIndex = call.rs.startIndex;
+                highlightKey.primCount = call.rs.primCount;
+
+                bool isOccluder = (rasterizedOccluderMeshes.find(highlightKey) != rasterizedOccluderMeshes.end());
+                if (isOccluder) {
+                    // Create a modified FragmentState with green emissive tint
+                    FragmentState tintedFrs = call.frs;
+                    tintedFrs.material.emissive.r = 0.0f;
+                    tintedFrs.material.emissive.g = 0.4f;
+                    tintedFrs.material.emissive.b = 0.0f;
+                    tintedFrs.material.emissive.a = 1.0f;
+                    renderMorrowindHLSL_Internal(&call.rs, &tintedFrs, call.lightrs.get());
+                    continue;
                 }
             }
 
@@ -3704,7 +4357,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     ImGuiManager::UpdateDebugStats(
         totalCalls, renderedCalls, culledCalls,
         (int)DistantLand::sceneLights.size(), numLights,
-        (int)DistantLand::recordMW.size(), 0  // immediateCount will be updated in finalizeBatchAndReplay
+        (int)DistantLand::recordMW.size(), 0  // Now shows filtered count
     );
 
     // Debug visualization: Render bounding boxes with color-coded status from ImGui
@@ -3758,23 +4411,23 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
             device->DrawPrimitiveUP(D3DPT_LINELIST, 12, vertices, sizeof(Vertex));
         };
 
-        // Mode 1: Show culled objects only (red boxes) - uses GPU culling results
+        // Mode 1: Show culled objects only (red boxes) - test directly
         if (debugBBoxMode == 1) {
             for (size_t i = 0; i < recordedCalls.size(); i++) {
                 const auto& call = recordedCalls[i];
                 if (!call.hasBoundingBox) continue;
 
-                // Use GPU culling results stored in visibilityResults
-                bool isVisible = visibilityResults[i];
-                bool wasCameraInside = cameraInsideFlags[i];
-                bool isCulled = !isVisible && !wasCameraInside;
+                // Direct occlusion test
+                bool isVisible = softwareOcclusionCuller.testBoundingBox(
+                    call.bboxMin,
+                    call.bboxMax,
+                    currentView,
+                    currentProj
+                );
 
                 // Draw only culled objects in red
-                if (isCulled) {
-                    // Use the expanded bbox that was sent to GPU culling
-                    D3DXVECTOR3 expandedMin = bboxMins[i];
-                    D3DXVECTOR3 expandedMax = bboxMaxs[i];
-                    drawBBox(expandedMin, expandedMax, D3DCOLOR_ARGB(255, 255, 0, 0));
+                if (!isVisible) {
+                    drawBBox(call.bboxMin, call.bboxMax, D3DCOLOR_ARGB(255, 255, 0, 0));
                 }
             }
         }
@@ -3797,11 +4450,87 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
         savedState->Release();
     }
 
+    // Single Object Mode: Show selected object's bbox in CYAN (always visible, regardless of bbox mode)
+    if (ImGuiManager::hiZSingleObjectMode) {
+        // Save render states
+        IDirect3DStateBlock9* savedState;
+        device->CreateStateBlock(D3DSBT_ALL, &savedState);
+
+        // Setup for line rendering - disable depth test so box always renders
+        device->SetRenderState(D3DRS_ZENABLE, FALSE);
+        device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+        device->SetRenderState(D3DRS_LIGHTING, FALSE);
+        device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+        device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+        device->SetRenderState(D3DRS_AMBIENT, 0xFFFFFFFF);
+        device->SetRenderState(D3DRS_COLORVERTEX, TRUE);
+        device->SetRenderState(D3DRS_DIFFUSEMATERIALSOURCE, D3DMCS_COLOR1);
+        device->SetRenderState(D3DRS_EMISSIVEMATERIALSOURCE, D3DMCS_COLOR1);
+        device->SetFVF(D3DFVF_XYZ | D3DFVF_DIFFUSE);
+
+        // Set up transforms for world-space rendering
+        D3DXMATRIX identity;
+        D3DXMatrixIdentity(&identity);
+        device->SetTransform(D3DTS_WORLD, &identity);
+        device->SetTransform(D3DTS_VIEW, &currentView);
+        device->SetTransform(D3DTS_PROJECTION, &currentProj);
+
+        // Helper to draw bbox edges
+        auto drawBBox = [&](const D3DXVECTOR3& bmin, const D3DXVECTOR3& bmax, D3DCOLOR color) {
+            struct Vertex { float x, y, z; D3DCOLOR color; };
+            Vertex vertices[24] = {
+                // Bottom face
+                {bmin.x, bmin.y, bmin.z, color}, {bmax.x, bmin.y, bmin.z, color},
+                {bmax.x, bmin.y, bmin.z, color}, {bmax.x, bmax.y, bmin.z, color},
+                {bmax.x, bmax.y, bmin.z, color}, {bmin.x, bmax.y, bmin.z, color},
+                {bmin.x, bmax.y, bmin.z, color}, {bmin.x, bmin.y, bmin.z, color},
+                // Top face
+                {bmin.x, bmin.y, bmax.z, color}, {bmax.x, bmin.y, bmax.z, color},
+                {bmax.x, bmin.y, bmax.z, color}, {bmax.x, bmax.y, bmax.z, color},
+                {bmax.x, bmax.y, bmax.z, color}, {bmin.x, bmax.y, bmax.z, color},
+                {bmin.x, bmax.y, bmax.z, color}, {bmin.x, bmin.y, bmax.z, color},
+                // Vertical edges
+                {bmin.x, bmin.y, bmin.z, color}, {bmin.x, bmin.y, bmax.z, color},
+                {bmax.x, bmin.y, bmin.z, color}, {bmax.x, bmin.y, bmax.z, color},
+                {bmax.x, bmax.y, bmin.z, color}, {bmax.x, bmax.y, bmax.z, color},
+                {bmin.x, bmax.y, bmin.z, color}, {bmin.x, bmax.y, bmax.z, color},
+            };
+            device->DrawPrimitiveUP(D3DPT_LINELIST, 12, vertices, sizeof(Vertex));
+        };
+
+        // Find and draw the selected object's bbox
+        int currentObjectIndex = 0;
+        for (size_t i = 0; i < recordedCalls.size(); i++) {
+            const auto& call = recordedCalls[i];
+
+            // Count only opaque objects with >2 tris (matching selection logic)
+            bool isOpaque = !call.rs.blendEnable && call.rs.zWrite;
+            if (isOpaque && call.rs.primCount > 2) {
+                if (currentObjectIndex == ImGuiManager::hiZSingleObjectIndex) {
+                    if (call.hasBoundingBox) {
+                        // Draw in CYAN
+                        drawBBox(call.bboxMin, call.bboxMax, D3DCOLOR_ARGB(255, 0, 255, 255));
+                    }
+                    break;
+                }
+                currentObjectIndex++;
+            }
+        }
+
+        // Restore render states
+        savedState->Apply();
+        savedState->Release();
+    }
+
     // Restore current shadow matrices
     DistantLand::smViewproj[0] = savedShadowViewproj[0];
     DistantLand::smViewproj[1] = savedShadowViewproj[1];
 
     // Note: Camera position is already stored above for next frame's velocity calculation
+
+    // Save current frame's calls for next frame's raycast targeting
+    // Swap is efficient - avoids copying, just exchanges internal pointers
+    std::swap(previousFrameCalls, recordedCalls);
 
     isReplaying = false;
 }
@@ -3842,23 +4571,21 @@ FixedFunctionShader::RecordedRenderedState::RecordedRenderedState(RecordedRender
 
 FixedFunctionShader::HLSLRecordedCall::HLSLRecordedCall(const RenderedState* rs_, const FragmentState* frs_, std::shared_ptr<LightState> lightrs_, const ShaderKey& sk_)
     : rs(*rs_), frs(*frs_), lightrs(lightrs_), sk(sk_), hasBoundingBox(false) {
-    // Capture current sampler states for all texture stages
+    // Capture sampler states during recording (original working approach)
     for (int stage = 0; stage < 8; ++stage) {
-        samplerStates[stage].captured = false;
-
-        // Only capture sampler state if there's a texture bound to this stage
         IDirect3DBaseTexture9* texture = nullptr;
         if (SUCCEEDED(device->GetTexture(stage, &texture)) && texture) {
-            // Capture address modes for U and V
             if (SUCCEEDED(device->GetSamplerState(stage, D3DSAMP_ADDRESSU, &samplerStates[stage].addressU)) &&
                 SUCCEEDED(device->GetSamplerState(stage, D3DSAMP_ADDRESSV, &samplerStates[stage].addressV))) {
                 samplerStates[stage].captured = true;
             }
-            texture->Release(); // Release the reference from GetTexture
+            texture->Release();
+        } else {
+            samplerStates[stage].captured = false;
         }
     }
 
-    // Compute bounding box for Hi-Z culling
+    // Compute bounding box for Hi-Z culling (needed during recording for occluder selection)
     hasBoundingBox = computeBoundingBox(rs_, bboxMin, bboxMax);
 
     // Debug: Log first few failures
@@ -3980,9 +4707,9 @@ bool FixedFunctionShader::computeBoundingBox(const RenderedState* rs, D3DXVECTOR
     D3DXVECTOR3 objBBoxMin(1e10f, 1e10f, 1e10f);
     D3DXVECTOR3 objBBoxMax(-1e10f, -1e10f, -1e10f);
 
-    // Lock vertex buffer to read position data
+    // Lock vertex buffer to read position data (non-blocking to avoid GPU stalls)
     void* pVertices = nullptr;
-    HRESULT hr = rs->vb->Lock(rs->vbOffset, 0, &pVertices, D3DLOCK_READONLY);
+    HRESULT hr = rs->vb->Lock(rs->vbOffset, 0, &pVertices, D3DLOCK_READONLY | D3DLOCK_DONOTWAIT);
     if (FAILED(hr)) {
         if (debugBBox && debugCount > 0) {
             LOG::logline("!! computeBBox: VB Lock failed hr=0x%X", hr);
@@ -4003,10 +4730,10 @@ bool FixedFunctionShader::computeBoundingBox(const RenderedState* rs, D3DXVECTOR
     }
 
     // For indexed primitives, we need to check all referenced vertices
-    // Lock index buffer to determine which vertices to check
+    // Lock index buffer to determine which vertices to check (non-blocking)
     void* pIndices = nullptr;
     if (rs->ib) {
-        hr = rs->ib->Lock(0, 0, &pIndices, D3DLOCK_READONLY);
+        hr = rs->ib->Lock(0, 0, &pIndices, D3DLOCK_READONLY | D3DLOCK_DONOTWAIT);
         if (FAILED(hr)) {
             if (debugBBox && debugCount > 0) {
                 LOG::logline("!! computeBBox: IB lock failed, hr=0x%X", hr);

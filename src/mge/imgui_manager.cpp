@@ -1,11 +1,13 @@
 #include "imgui_manager.h"
 #include "support/log.h"
 #include "configuration.h"
+#include "ffeshader.h"
 
 bool ImGuiManager::initialized = false;
 bool ImGuiManager::showDemo = false;
 bool ImGuiManager::showPCFInterface = false;
 bool ImGuiManager::showDebugInterface = false;
+bool ImGuiManager::showHiZInterface = false;
 HWND ImGuiManager::windowHandle = nullptr;
 
 // PCF filtering variables
@@ -32,6 +34,41 @@ int ImGuiManager::debugSceneLights = 0;
 int ImGuiManager::debugVisibleLights = 0;
 int ImGuiManager::debugRecordMWSize = 0;
 int ImGuiManager::debugImmediateCount = 0;
+
+// Hi-Z visualization variables
+int ImGuiManager::hiZDisplayMip = 0;
+float ImGuiManager::hiZBrightness = 1.0f;
+float ImGuiManager::hiZGamma = 2.2f;
+bool ImGuiManager::hiZInvert = false;
+bool ImGuiManager::hiZShowRaycastGrid = false;
+int ImGuiManager::hiZRaycastStep = 2;
+
+// Hi-Z occluder selection parameters
+int ImGuiManager::occluderMaxCount = 100;
+int ImGuiManager::occluderP0ExtraBudget = 80;
+int ImGuiManager::occluderP1ExtraBudget = 50;
+int ImGuiManager::occluderP2ExtraBudget = 30;
+int ImGuiManager::occluderMinTriangles = 0;
+int ImGuiManager::occluderMaxTriangles = 9999999;
+float ImGuiManager::occluderCloseDistance = 2048.0f;
+
+// Wall detection heuristics (shape-based occluder selection)
+bool ImGuiManager::wallDetectionEnabled = true;
+float ImGuiManager::wallFlatnessThreshold = 0.15f;   // Thin dim < 15% of mid dim = wall-like
+float ImGuiManager::wallMinLargeDim = 200.0f;        // Must be at least 200 units in largest dim
+float ImGuiManager::wallMaxThinDim = 50.0f;          // Thin dimension must be < 50 units
+int ImGuiManager::occluderWallExtraBudget = 100;     // Extra budget for wall-shaped occluders
+
+// Occluder highlighting (debug visualization)
+bool ImGuiManager::highlightOccluders = false;
+
+// Rasterize All mode - bypass all heuristics
+bool ImGuiManager::rasterizeAll = false;
+
+// Hi-Z single object visualization mode
+bool ImGuiManager::hiZSingleObjectMode = false;
+int ImGuiManager::hiZSingleObjectIndex = 0;
+int ImGuiManager::hiZTotalObjectCount = 0;
 
 bool ImGuiManager::Initialize(HWND hwnd, IDirect3DDevice9* device) {
     if (initialized) {
@@ -140,6 +177,11 @@ void ImGuiManager::Render() {
     // Show debug interface
     if (showDebugInterface) {
         RenderDebugInterface();
+    }
+
+    // Show Hi-Z visualization interface
+    if (showHiZInterface) {
+        RenderHiZInterface();
     }
 
     ImGui::Render();
@@ -308,7 +350,7 @@ void ImGuiManager::RenderDebugInterface() {
 
     // Update mouse cursor visibility based on interface state
     ImGuiIO& io = ImGui::GetIO();
-    io.MouseDrawCursor = showDebugInterface || showPCFInterface;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface;
 }
 
 void ImGuiManager::ToggleDebugInterface() {
@@ -316,7 +358,7 @@ void ImGuiManager::ToggleDebugInterface() {
 
     // Update mouse cursor visibility
     ImGuiIO& io = ImGui::GetIO();
-    io.MouseDrawCursor = showDebugInterface || showPCFInterface;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface;
 }
 
 // Debug control getters
@@ -335,5 +377,119 @@ void ImGuiManager::UpdateDebugStats(int recordedCalls, int renderedCalls, int cu
     debugVisibleLights = visibleLights;
     debugRecordMWSize = recordMWSize;
     debugImmediateCount = immediateCount;
+}
+
+void ImGuiManager::RenderHiZInterface() {
+    ImGui::SetNextWindowPos(ImVec2(800, 10), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(650, 800), ImGuiCond_FirstUseEver);
+
+    if (ImGui::Begin("Hi-Z Occlusion Buffer", &showHiZInterface, ImGuiWindowFlags_AlwaysAutoResize)) {
+        auto& culler = FixedFunctionShader::softwareOcclusionCuller;
+
+        if (culler.getHiZTexture()) {
+            int maxMipLevel = culler.getHiZMipLevels() - 1;
+
+            // Display controls
+            ImGui::Text("Visualization Settings");
+            ImGui::SliderInt("Mip Level", &hiZDisplayMip, 0, maxMipLevel);
+            ImGui::SliderFloat("Brightness", &hiZBrightness, 0.1f, 10.0f, "%.2f");
+            ImGui::SliderFloat("Gamma", &hiZGamma, 0.5f, 4.0f, "%.2f");
+            ImGui::Checkbox("Invert Depth", &hiZInvert);
+
+            ImGui::Separator();
+            ImGui::Text("Raycast Grid Overlay");
+            ImGui::Checkbox("Show Raycast Grid", &hiZShowRaycastGrid);
+            if (hiZShowRaycastGrid) {
+                ImGui::SliderInt("Grid Step Size", &hiZRaycastStep, 1, 8);
+                ImGui::Text("(Red dots show occlusion test sample points)");
+            }
+
+            UINT width = culler.getHiZWidth(hiZDisplayMip);
+            UINT height = culler.getHiZHeight(hiZDisplayMip);
+
+            ImGui::Separator();
+            ImGui::Text("Single Object Visualization");
+            ImGui::Checkbox("Enable Single Object Mode", &hiZSingleObjectMode);
+            if (hiZSingleObjectMode) {
+                ImGui::Text("Object %d of %d", hiZSingleObjectIndex + 1, hiZTotalObjectCount);
+                if (ImGui::Button("< Previous")) {
+                    hiZSingleObjectIndex = (hiZSingleObjectIndex - 1 + hiZTotalObjectCount) % std::max(1, hiZTotalObjectCount);
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Next >")) {
+                    hiZSingleObjectIndex = (hiZSingleObjectIndex + 1) % std::max(1, hiZTotalObjectCount);
+                }
+            }
+
+            ImGui::Separator();
+            ImGui::Text("Occluder Selection Settings");
+            ImGui::SliderInt("Max Occluders (Base)", &occluderMaxCount, 10, 1000);
+            ImGui::Text("Priority Budgets (extra above base):");
+            ImGui::SliderInt("P0: Camera Inside BBox", &occluderP0ExtraBudget, 0, 200);
+            ImGui::SliderInt("P1: Off-Screen Corners", &occluderP1ExtraBudget, 0, 150);
+            ImGui::SliderInt("P2: Very Close", &occluderP2ExtraBudget, 0, 100);
+            ImGui::Separator();
+            ImGui::Text("Triangle Count Filters:");
+            ImGui::SliderInt("Min Triangles", &occluderMinTriangles, 0, 1000);
+            ImGui::SliderInt("Max Triangles", &occluderMaxTriangles, 10, 50000);
+            ImGui::Separator();
+            ImGui::Text("Distance Thresholds:");
+            ImGui::SliderFloat("Close Distance (P2)", &occluderCloseDistance, 256.0f, 8192.0f, "%.0f units");
+
+            ImGui::Separator();
+            ImGui::Text("Wall Detection (Shape-Based):");
+            ImGui::Checkbox("Enable Wall Detection", &wallDetectionEnabled);
+            if (wallDetectionEnabled) {
+                ImGui::SliderFloat("Flatness Threshold", &wallFlatnessThreshold, 0.05f, 0.5f, "%.2f");
+                ImGui::SetItemTooltip("Thin dim / mid dim ratio. Lower = stricter (0.15 = thin < 15%% of mid)");
+                ImGui::SliderFloat("Min Large Dim", &wallMinLargeDim, 50.0f, 500.0f, "%.0f units");
+                ImGui::SetItemTooltip("Minimum size of largest dimension to qualify as wall");
+                ImGui::SliderFloat("Max Thin Dim", &wallMaxThinDim, 10.0f, 150.0f, "%.0f units");
+                ImGui::SetItemTooltip("Maximum size of thin dimension to qualify as wall");
+                ImGui::SliderInt("Wall Extra Budget", &occluderWallExtraBudget, 0, 200);
+                ImGui::SetItemTooltip("Extra occluder budget for wall-shaped objects");
+            }
+
+            ImGui::Separator();
+            ImGui::Text("Debug Visualization:");
+            ImGui::Checkbox("Highlight Occluders (Green Tint)", &highlightOccluders);
+            ImGui::SetItemTooltip("Tint objects selected as occluders with green to visualize selection");
+
+            ImGui::Checkbox("Rasterize ALL (Bypass Heuristics)", &rasterizeAll);
+            ImGui::SetItemTooltip("Rasterize ALL objects to Hi-Z buffer - bypasses all selection heuristics for debugging");
+
+            ImGui::Separator();
+            ImGui::Text("Mip %d: %dx%d", hiZDisplayMip, width, height);
+            ImGui::Separator();
+
+            // Display the Hi-Z texture at 2x scale for visibility
+            float scale = 2.0f;
+            ImGui::Image((void*)culler.getHiZTexture(),
+                        ImVec2(width * scale, height * scale));
+        } else {
+            ImGui::Text("No Hi-Z buffer available");
+            ImGui::Text("(Hi-Z is built during scene rendering)");
+        }
+
+        ImGui::Separator();
+        ImGui::Text("Press U to toggle this interface");
+    }
+    ImGui::End();
+
+    // Update mouse cursor visibility based on interface state
+    ImGuiIO& io = ImGui::GetIO();
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface;
+}
+
+void ImGuiManager::ToggleHiZInterface() {
+    showHiZInterface = !showHiZInterface;
+
+    // Update mouse cursor visibility
+    ImGuiIO& io = ImGui::GetIO();
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface;
+}
+
+bool ImGuiManager::GetShowHiZInterface() {
+    return showHiZInterface;
 }
 

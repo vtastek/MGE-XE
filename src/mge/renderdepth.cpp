@@ -2,6 +2,7 @@
 #include "configuration.h"
 #include "distantland.h"
 #include "distantshader.h"
+#include "ffeshader.h"
 #include "mwbridge.h"
 #include "proxydx/d3d8header.h"
 #include "support/log.h"
@@ -136,9 +137,30 @@ void DistantLand::renderDepthRecorded() {
         loggedOnce = true;
     }
 
-    // Recorded renders
+    // Get current view/projection for occlusion testing
+    D3DXMATRIX currentView, currentProj;
+    device->GetTransform(D3DTS_VIEW, &currentView);
+    device->GetTransform(D3DTS_PROJECTION, &currentProj);
+
+    int skippedDepthDraws = 0;
+    int totalDepthDraws = (int)recordMW.size();
+
+    // Recorded renders with direct occlusion testing
     const auto& recordMW_const = recordMW;
     for (const auto& i : recordMW_const) {
+        // Direct occlusion test using Hi-Z buffer
+        if (i.hasBoundingBox) {
+            bool isVisible = FixedFunctionShader::softwareOcclusionCuller.testBoundingBox(
+                i.bboxMin,
+                i.bboxMax,
+                currentView,
+                currentProj
+            );
+            if (!isVisible) {
+                skippedDepthDraws++;
+                continue; // Skip invisible object
+            }
+        }
         // Set variables in main effect; variables are shared via effect pool
 
         // Fragment colour routing
@@ -202,12 +224,26 @@ void DistantLand::renderDepthRecorded() {
         device->SetFVF(i.fvf);
         device->DrawIndexedPrimitive(i.primType, i.baseIndex, i.minIndex, i.vertCount, i.startIndex, i.primCount);
     }
+
+    // Log depth pass culling statistics
+    if (skippedDepthDraws > 0) {
+        LOG::logline(">> Depth pass culling: %d total draws, %d culled (%.1f%%), %d rendered",
+                     totalDepthDraws, skippedDepthDraws,
+                     totalDepthDraws > 0 ? (skippedDepthDraws * 100.0f) / totalDepthDraws : 0.0f,
+                     totalDepthDraws - skippedDepthDraws);
+    }
 }
 
 // GPU-only Hi-Z mip generation (non-blocking, ~0.5ms)
 // Called at end of Present() - generates mips on GPU, returns immediately
 void DistantLand::generateHiZMipsGPU() {
     ZoneScopedN("HiZ_GenerateMipsGPU");
+
+    static int callCount = 0;
+    if (callCount < 5) {
+        LOG::logline(">> Hi-Z: generateHiZMipsGPU() called (frame %d)", callCount);
+        callCount++;
+    }
 
     if (!texHiZ || !texHiZPrev || !effectHiZ) {
         LOG::logline("Hi-Z: Skipping GPU generation - texHiZ=%p texHiZPrev=%p effectHiZ=%p", texHiZ, texHiZPrev, effectHiZ);
@@ -615,6 +651,25 @@ void DistantLand::lockRemainingHiZMips() {
     hiZLockedMips = hiZValidMips; // Now all valid mips are locked
 }
 
+// Save CPU Hi-Z pyramid snapshot to temp folder (all mip levels as DDS + PNG files)
+// Called when L key is pressed for debugging/analysis
+void DistantLand::saveHiZSnapshot() {
+    // Create temp directory if it doesn't exist
+    const char* tempDir = "temp";
+    CreateDirectoryA(tempDir, NULL);
+
+    // Generate timestamped folder name for this snapshot
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char snapshotDir[256];
+    snprintf(snapshotDir, sizeof(snapshotDir), "%s/cpu_hiz_%04d%02d%02d_%02d%02d%02d",
+             tempDir, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    CreateDirectoryA(snapshotDir, NULL);
+
+    // Save CPU Hi-Z buffers from software occlusion culler
+    FixedFunctionShader::softwareOcclusionCuller.saveToDisk(device, snapshotDir);
+}
+
 bool DistantLand::cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& bboxMax, const D3DXMATRIX& worldViewProj, bool debugLog) {
 
     // TEMPORARY: Disable Hi-Z culling while debugging pyramid data issue
@@ -887,9 +942,17 @@ void DistantLand::cullSceneLights(const D3DXMATRIX& viewProj) {
         }
     }
 
-    LOG::logline(">> Light Culling: %d total, %d visible, %d culled (%.1f%%)",
-                 (int)sceneLights.size(), (int)visibleLights.size(), culled,
-                 sceneLights.size() > 0 ? (culled * 100.0f) / sceneLights.size() : 0.0f);
+    static int lastLoggedTotal = -1;
+    static int lastLoggedVisible = -1;
+
+    // Log if light counts changed significantly
+    if (lastLoggedTotal != (int)sceneLights.size() || lastLoggedVisible != (int)visibleLights.size()) {
+        LOG::logline(">> Light Culling: %d total, %d visible, %d culled (%.1f%%)",
+                     (int)sceneLights.size(), (int)visibleLights.size(), culled,
+                     sceneLights.size() > 0 ? (culled * 100.0f) / sceneLights.size() : 0.0f);
+        lastLoggedTotal = (int)sceneLights.size();
+        lastLoggedVisible = (int)visibleLights.size();
+    }
 }
 
 void DistantLand::uploadLightDataToTexture(const D3DXMATRIX& viewMatrix) {

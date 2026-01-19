@@ -65,7 +65,7 @@
       <WarningLevel>Level3</WarningLevel>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <Optimization>Disabled</Optimization>
-      <AdditionalIncludeDirectories>./src;./src\imgui;./src\imgui/backends;./src\tracy</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>./src;./src\imgui;./src\imgui/backends;./src\tracy;./3rdparty/meshoptimizer/src</AdditionalIncludeDirectories>
       <EnableEnhancedInstructionSet>StreamingSIMDExtensions2</EnableEnhancedInstructionSet>
       <FloatingPointModel>Fast</FloatingPointModel>
       <EnforceTypeConversionRules>true</EnforceTypeConversionRules>
@@ -91,7 +91,7 @@
       <Optimization>MaxSpeed</Optimization>
       <EnableEnhancedInstructionSet>StreamingSIMDExtensions2</EnableEnhancedInstructionSet>
       <FloatingPointModel>Fast</FloatingPointModel>
-      <AdditionalIncludeDirectories>./src;./src\imgui;./src\imgui/backends;./src\tracy</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>./src;./src\imgui;./src\imgui/backends;./src\tracy;./3rdparty/meshoptimizer/src</AdditionalIncludeDirectories>
       <EnforceTypeConversionRules>true</EnforceTypeConversionRules>
       <RuntimeTypeInfo>false</RuntimeTypeInfo>
       <LanguageStandard>stdcpp17</LanguageStandard>
@@ -129,6 +129,8 @@
     <ClCompile Include="src\mge\suffix_texture_support.cpp" />
     <ClCompile Include="src\mge\hlsl_shader_manager.cpp" />
     <ClCompile Include="src\mge\async_shader_compiler.cpp" />
+    <ClCompile Include="src\mge\softwareocclusion.cpp" />
+    <ClCompile Include="src\mge\meshlodcache.cpp" />
     <ClCompile Include="src\mge\ffe_core_rendering.cpp" />
     <ClCompile Include="src\mge\imgui_manager.cpp" />
     <ClCompile Include="src\mge\macrofunctions.cpp" />
@@ -180,6 +182,9 @@
     <ClCompile Include="src\imgui\backends\imgui_impl_dx9.cpp" />
     <ClCompile Include="src\imgui\backends\imgui_impl_win32.cpp" />
     <ClCompile Include="src\tracy\TracyClient.cpp" />
+    <ClCompile Include="3rdparty\meshoptimizer\src\simplifier.cpp" />
+    <ClCompile Include="3rdparty\meshoptimizer\src\clusterizer.cpp" />
+    <ClCompile Include="3rdparty\meshoptimizer\src\vcacheoptimizer.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\exports.def" />

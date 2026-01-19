@@ -28,6 +28,9 @@ void DistantLand::renderStage0() {
     // Reset recording flag for new frame (Scene 0 starts a new frame)
     FixedFunctionShader::resetRecordingCompletedFlag();
 
+    // Reset Hi-Z build flag for new frame
+    FixedFunctionShader::resetHiZBuiltFlag();
+
     // Update current cell and select distant static set
     selectDistantCell();
 
@@ -145,8 +148,7 @@ void DistantLand::renderStage0() {
         }
     }
 
-    // Clear stray recordings
-    recordMW.clear();
+    // Clear stray sky recordings (but NOT recordMW - it's needed for depth rendering)
     recordSky.clear();
 }
 
@@ -156,7 +158,6 @@ void DistantLand::renderStage1() {
     auto mwBridge = MWBridge::get();
     IDirect3DStateBlock9* stateSaved;
     UINT passes;
-
 
     ///LOG::logline("Stage 1 prims: %d", recordMW.size());
 
@@ -191,6 +192,11 @@ void DistantLand::renderStage1() {
 
             effect->End();
         }
+
+        // Build Hi-Z pyramid and filter recordMW after Scene 0 recording completes
+        // Scene 0 rasterized 120 occluders during recording, now filter recordMW before depth rendering
+        // This filters recordMW from ~2800 → ~100 objects BEFORE renderDepth() executes
+        FixedFunctionShader::prepareOcclusionCullingForDepth();
 
         // Depth texture from recorded renders (Scene 0)
         effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
@@ -978,6 +984,10 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
         if (rs->alphaFunc == D3DCMP_GREATER) {
             recordMW.back().alphaRef++;
         }
+
+        // Don't compute bboxes here - too expensive (buffer locks cause stalls)
+        // Bboxes will be computed on-the-fly during culling if needed
+        recordMW.back().hasBoundingBox = false;
     }
 
     // Special case, capture sky
