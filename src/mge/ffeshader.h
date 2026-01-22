@@ -455,6 +455,31 @@ class FixedFunctionShader {
     // Bbox cache: maps mesh identifier to object-space bbox (persists across frames)
     static std::unordered_map<MeshKey, ObjectSpaceBBox, MeshKeyHash> bboxCache;
 
+    // VB+IB key for bbox lookup between recordedCalls and recordMW
+    struct VBIBKey {
+        IDirect3DVertexBuffer9* vb;
+        IDirect3DIndexBuffer9* ib;
+
+        bool operator==(const VBIBKey& other) const {
+            return vb == other.vb && ib == other.ib;
+        }
+    };
+
+    struct VBIBKeyHash {
+        std::size_t operator()(const VBIBKey& k) const {
+            std::size_t h1 = std::hash<void*>{}(k.vb);
+            std::size_t h2 = std::hash<void*>{}(k.ib);
+            return h1 ^ (h2 << 1);
+        }
+    };
+
+    // Bbox lookup: maps VB+IB to world-space bbox (rebuilt each frame from recordedCalls)
+    static std::unordered_map<VBIBKey, ObjectSpaceBBox, VBIBKeyHash> bboxLookup;
+
+    // Visibility lookup: stores culling results from HLSL replay for depth pass to reuse
+    // Key is full MeshKey, value is whether the mesh should be rendered (true = visible)
+    static std::unordered_map<MeshKey, bool, MeshKeyHash> visibilityLookup;
+
     // Previous frame camera tracking for velocity-based bbox expansion
     static D3DXVECTOR3 prevCameraPos;
     static D3DXMATRIX prevCameraView;

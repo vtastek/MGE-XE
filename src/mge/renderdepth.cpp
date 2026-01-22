@@ -137,30 +137,12 @@ void DistantLand::renderDepthRecorded() {
         loggedOnce = true;
     }
 
-    // Get current view/projection for occlusion testing
-    D3DXMATRIX currentView, currentProj;
-    device->GetTransform(D3DTS_VIEW, &currentView);
-    device->GetTransform(D3DTS_PROJECTION, &currentProj);
+    // Note: Culling is already done by prepareOcclusionCullingForDepth() using synced visibility
+    // from HLSL replay. No need to test again here - recordMW is pre-filtered.
 
-    int skippedDepthDraws = 0;
-    int totalDepthDraws = (int)recordMW.size();
-
-    // Recorded renders with direct occlusion testing
+    // Recorded renders (pre-filtered by prepareOcclusionCullingForDepth)
     const auto& recordMW_const = recordMW;
     for (const auto& i : recordMW_const) {
-        // Direct occlusion test using Hi-Z buffer
-        if (i.hasBoundingBox) {
-            bool isVisible = FixedFunctionShader::softwareOcclusionCuller.testBoundingBox(
-                i.bboxMin,
-                i.bboxMax,
-                currentView,
-                currentProj
-            );
-            if (!isVisible) {
-                skippedDepthDraws++;
-                continue; // Skip invisible object
-            }
-        }
         // Set variables in main effect; variables are shared via effect pool
 
         // Fragment colour routing
@@ -224,14 +206,7 @@ void DistantLand::renderDepthRecorded() {
         device->SetFVF(i.fvf);
         device->DrawIndexedPrimitive(i.primType, i.baseIndex, i.minIndex, i.vertCount, i.startIndex, i.primCount);
     }
-
-    // Log depth pass culling statistics
-    if (skippedDepthDraws > 0) {
-        LOG::logline(">> Depth pass culling: %d total draws, %d culled (%.1f%%), %d rendered",
-                     totalDepthDraws, skippedDepthDraws,
-                     totalDepthDraws > 0 ? (skippedDepthDraws * 100.0f) / totalDepthDraws : 0.0f,
-                     totalDepthDraws - skippedDepthDraws);
-    }
+    // Note: Culling stats are now logged in prepareOcclusionCullingForDepth()
 }
 
 // GPU-only Hi-Z mip generation (non-blocking, ~0.5ms)
