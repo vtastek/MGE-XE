@@ -3380,6 +3380,14 @@ void FixedFunctionShader::prepareOcclusionCullingForDepth() {
         hiZBuiltThisFrame = true;
     }
 
+    // Only do Hi-Z culling in HLSL mode (PerPixelLightFlags == 2)
+    // Non-HLSL modes don't have bboxCache populated, so skip culling
+    if (Configuration.PerPixelLightFlags != 2) {
+        LOG::logline(">> Depth: %d objects (no culling - non-HLSL mode)",
+                     (int)DistantLand::recordMW.size());
+        return;
+    }
+
     // Direct Hi-Z culling for depth pass using bboxCache + current matrices
     {
         ZoneScopedN("Filter recordMW with Hi-Z Culling");
