@@ -3334,11 +3334,17 @@ void FixedFunctionShader::ShaderKey::log() const {
 // Frame counter for light persistence (prevent flickering)
 static int g_currentFrame = 0;
 
+// Sampler state cache: maps texture pointer to (addressU, addressV) pair
+// Reduces D3D API calls from ~24 to 0-2 per draw call
+static std::unordered_map<IDirect3DBaseTexture9*, std::pair<DWORD, DWORD>> samplerCache;
+
 void FixedFunctionShader::startRecording() {
     // Reset HLSL caches for new recording session
     resetHLSLCaches();
 
     recordedCalls.clear();
+    recordedCalls.reserve(4000);  // Pre-allocate to avoid reallocation spikes
+    samplerCache.clear();  // Clear sampler cache for new frame
     bboxLookup.clear();  // Clear for new frame (populated during recording)
     // NOTE: Do NOT clear recordMW here - it's populated by inspectIndexedPrimitive()
     // BEFORE startRecording() is called. recordMW is cleared at end of renderStage1/2.
@@ -3376,7 +3382,9 @@ void FixedFunctionShader::prepareOcclusionCullingForDepth() {
     if (!hiZBuiltThisFrame) {
         ZoneScopedN("Build Hi-Z Pyramid");
         softwareOcclusionCuller.buildHiZPyramid();
-        softwareOcclusionCuller.uploadHiZToTexture(reinterpret_cast<IDirect3DDevice9*>(device), ImGuiManager::GetHiZDisplayMip(), ImGuiManager::GetHiZBrightness(), ImGuiManager::GetHiZGamma(), ImGuiManager::GetHiZInvert(), ImGuiManager::GetHiZShowRaycastGrid(), ImGuiManager::GetHiZRaycastStep());
+        if (ImGuiManager::GetShowHiZInterface()) {
+            softwareOcclusionCuller.uploadHiZToTexture(reinterpret_cast<IDirect3DDevice9*>(device), ImGuiManager::GetHiZDisplayMip(), ImGuiManager::GetHiZBrightness(), ImGuiManager::GetHiZGamma(), ImGuiManager::GetHiZInvert(), ImGuiManager::GetHiZShowRaycastGrid(), ImGuiManager::GetHiZRaycastStep());
+        }
         hiZBuiltThisFrame = true;
     }
 
@@ -3451,7 +3459,9 @@ void FixedFunctionShader::stopRecordingAndReplay() {
     {
         ZoneScopedN("Build Hi-Z Pyramid");
         softwareOcclusionCuller.buildHiZPyramid();
-        softwareOcclusionCuller.uploadHiZToTexture(reinterpret_cast<IDirect3DDevice9*>(device), ImGuiManager::GetHiZDisplayMip(), ImGuiManager::GetHiZBrightness(), ImGuiManager::GetHiZGamma(), ImGuiManager::GetHiZInvert(), ImGuiManager::GetHiZShowRaycastGrid(), ImGuiManager::GetHiZRaycastStep());
+        if (ImGuiManager::GetShowHiZInterface()) {
+            softwareOcclusionCuller.uploadHiZToTexture(reinterpret_cast<IDirect3DDevice9*>(device), ImGuiManager::GetHiZDisplayMip(), ImGuiManager::GetHiZBrightness(), ImGuiManager::GetHiZGamma(), ImGuiManager::GetHiZInvert(), ImGuiManager::GetHiZShowRaycastGrid(), ImGuiManager::GetHiZRaycastStep());
+        }
     }
 
     // Now replay all recorded calls
@@ -3637,12 +3647,11 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
         }
     }
 
-    // OCCLUSION CULLING - Simple heuristics
-    // Select occluders based on: low triangle count + large screen coverage
+    // OCCLUSION CULLING - Improved heuristics
+    // Select occluders based on: geometry type + scaled triangle limit + screen coverage
     {
         static int occluderCount = 0;
         const int MAX_OCCLUDERS = ImGuiManager::GetOccluderMaxCount();
-        const int MAX_TRIANGLES = 500;  // Simple geometry rasterizes fast on CPU
         const float MIN_SCREEN_COVERAGE = 0.01f;  // 1% of screen area
 
         if (recordedCalls.size() == 1) {
@@ -3650,54 +3659,74 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
             rasterizedOccluderMeshes.clear();
         }
 
-        // Check if this mesh should be rasterized (simple heuristics: low tri count + large screen coverage)
+        // NEVER use alpha-tested or alpha-blended geometry as occluders - they have holes!
+        bool isTransparent = (rs->alphaTest || rs->blendEnable);
+
+        // Check if this mesh should be rasterized
         bool shouldRasterize = false;
-        if (rs->vb && rs->ib && occluderCount < MAX_OCCLUDERS) {
+        if (rs->vb && rs->ib && occluderCount < MAX_OCCLUDERS && !isTransparent) {
             const HLSLRecordedCall& call = recordedCalls.back();
 
-            if (call.hasBoundingBox && rs->primCount <= MAX_TRIANGLES) {
-                // Compute screen coverage by projecting bbox corners
-                D3DXMATRIX viewProj = recordingDeviceView * recordingDeviceProj;
-                D3DXVECTOR3 corners[8] = {
-                    D3DXVECTOR3(call.bboxMin.x, call.bboxMin.y, call.bboxMin.z),
-                    D3DXVECTOR3(call.bboxMax.x, call.bboxMin.y, call.bboxMin.z),
-                    D3DXVECTOR3(call.bboxMin.x, call.bboxMax.y, call.bboxMin.z),
-                    D3DXVECTOR3(call.bboxMax.x, call.bboxMax.y, call.bboxMin.z),
-                    D3DXVECTOR3(call.bboxMin.x, call.bboxMin.y, call.bboxMax.z),
-                    D3DXVECTOR3(call.bboxMax.x, call.bboxMin.y, call.bboxMax.z),
-                    D3DXVECTOR3(call.bboxMin.x, call.bboxMax.y, call.bboxMax.z),
-                    D3DXVECTOR3(call.bboxMax.x, call.bboxMax.y, call.bboxMax.z)
-                };
+            if (call.hasBoundingBox) {
+                // Calculate bbox size (largest dimension)
+                float bboxSizeX = call.bboxMax.x - call.bboxMin.x;
+                float bboxSizeY = call.bboxMax.y - call.bboxMin.y;
+                float bboxSizeZ = call.bboxMax.z - call.bboxMin.z;
+                float bboxSize = std::max({bboxSizeX, bboxSizeY, bboxSizeZ});
 
-                // Project corners to NDC and compute screen-space bounding box
-                float minX = FLT_MAX, maxX = -FLT_MAX;
-                float minY = FLT_MAX, maxY = -FLT_MAX;
-                bool allBehindCamera = true;
+                // Scaled triangle limit: larger structures can have more triangles
+                // 2 tris at size 0 -> 400 tris at size 3000 (linear scale)
+                const UINT BASE_TRIANGLES = 2;      // Minimum (wall)
+                const UINT MAX_TRIANGLES = 400;     // Maximum for huge structures
+                const float MAX_SIZE = 3000.0f;     // Size at which max triangles allowed
 
-                for (int i = 0; i < 8; i++) {
-                    D3DXVECTOR4 clipPos;
-                    D3DXVec3Transform(&clipPos, &corners[i], &viewProj);
+                float sizeRatio = std::min(bboxSize / MAX_SIZE, 1.0f);
+                UINT allowedTriangles = BASE_TRIANGLES + (UINT)(sizeRatio * (MAX_TRIANGLES - BASE_TRIANGLES));
 
-                    if (clipPos.w > 0.0f) {
-                        allBehindCamera = false;
-                        float ndcX = clipPos.x / clipPos.w;
-                        float ndcY = clipPos.y / clipPos.w;
-                        // Clamp to screen
-                        ndcX = std::max(-1.0f, std::min(1.0f, ndcX));
-                        ndcY = std::max(-1.0f, std::min(1.0f, ndcY));
-                        minX = std::min(minX, ndcX);
-                        maxX = std::max(maxX, ndcX);
-                        minY = std::min(minY, ndcY);
-                        maxY = std::max(maxY, ndcY);
+                if (rs->primCount <= allowedTriangles) {
+                    // Compute screen coverage by projecting bbox corners
+                    D3DXMATRIX viewProj = recordingDeviceView * recordingDeviceProj;
+                    D3DXVECTOR3 corners[8] = {
+                        D3DXVECTOR3(call.bboxMin.x, call.bboxMin.y, call.bboxMin.z),
+                        D3DXVECTOR3(call.bboxMax.x, call.bboxMin.y, call.bboxMin.z),
+                        D3DXVECTOR3(call.bboxMin.x, call.bboxMax.y, call.bboxMin.z),
+                        D3DXVECTOR3(call.bboxMax.x, call.bboxMax.y, call.bboxMin.z),
+                        D3DXVECTOR3(call.bboxMin.x, call.bboxMin.y, call.bboxMax.z),
+                        D3DXVECTOR3(call.bboxMax.x, call.bboxMin.y, call.bboxMax.z),
+                        D3DXVECTOR3(call.bboxMin.x, call.bboxMax.y, call.bboxMax.z),
+                        D3DXVECTOR3(call.bboxMax.x, call.bboxMax.y, call.bboxMax.z)
+                    };
+
+                    // Project corners to NDC and compute screen-space bounding box
+                    float minX = FLT_MAX, maxX = -FLT_MAX;
+                    float minY = FLT_MAX, maxY = -FLT_MAX;
+                    bool allBehindCamera = true;
+
+                    for (int i = 0; i < 8; i++) {
+                        D3DXVECTOR4 clipPos;
+                        D3DXVec3Transform(&clipPos, &corners[i], &viewProj);
+
+                        if (clipPos.w > 0.0f) {
+                            allBehindCamera = false;
+                            float ndcX = clipPos.x / clipPos.w;
+                            float ndcY = clipPos.y / clipPos.w;
+                            // Clamp to screen
+                            ndcX = std::max(-1.0f, std::min(1.0f, ndcX));
+                            ndcY = std::max(-1.0f, std::min(1.0f, ndcY));
+                            minX = std::min(minX, ndcX);
+                            maxX = std::max(maxX, ndcX);
+                            minY = std::min(minY, ndcY);
+                            maxY = std::max(maxY, ndcY);
+                        }
                     }
-                }
 
-                if (!allBehindCamera) {
-                    // Screen coverage = (width * height) / 4.0 (NDC is -1 to 1, so total area is 4)
-                    float screenCoverage = ((maxX - minX) * (maxY - minY)) / 4.0f;
-                    shouldRasterize = (screenCoverage >= MIN_SCREEN_COVERAGE);
-                }
-            }
+                    if (!allBehindCamera) {
+                        // Screen coverage = (width * height) / 4.0 (NDC is -1 to 1, so total area is 4)
+                        float screenCoverage = ((maxX - minX) * (maxY - minY)) / 4.0f;
+                        shouldRasterize = (screenCoverage >= MIN_SCREEN_COVERAGE);
+                    }
+                } // if (rs->primCount <= allowedTriangles)
+            } // if (call.hasBoundingBox)
         }
 
         if (shouldRasterize) {
@@ -3748,7 +3777,9 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
         static bool hiZBuiltDuringRecording = false;
         if (occluderCount >= MAX_OCCLUDERS && !hiZBuiltDuringRecording) {
             softwareOcclusionCuller.buildHiZPyramid();
-            softwareOcclusionCuller.uploadHiZToTexture(reinterpret_cast<IDirect3DDevice9*>(device), ImGuiManager::GetHiZDisplayMip(), ImGuiManager::GetHiZBrightness(), ImGuiManager::GetHiZGamma(), ImGuiManager::GetHiZInvert(), ImGuiManager::GetHiZShowRaycastGrid(), ImGuiManager::GetHiZRaycastStep());
+            if (ImGuiManager::GetShowHiZInterface()) {
+                softwareOcclusionCuller.uploadHiZToTexture(reinterpret_cast<IDirect3DDevice9*>(device), ImGuiManager::GetHiZDisplayMip(), ImGuiManager::GetHiZBrightness(), ImGuiManager::GetHiZGamma(), ImGuiManager::GetHiZInvert(), ImGuiManager::GetHiZShowRaycastGrid(), ImGuiManager::GetHiZRaycastStep());
+            }
             hiZBuiltDuringRecording = true;
             hiZBuiltThisFrame = true;  // Prevent rebuild in prepareOcclusionCullingForDepth
             LOG::logline(">> Hi-Z pyramid built after %d occluders rasterized", occluderCount);
@@ -4157,13 +4188,25 @@ FixedFunctionShader::RecordedRenderedState::RecordedRenderedState(RecordedRender
 
 FixedFunctionShader::HLSLRecordedCall::HLSLRecordedCall(const RenderedState* rs_, const FragmentState* frs_, std::shared_ptr<LightState> lightrs_, const ShaderKey& sk_)
     : rs(*rs_), frs(*frs_), lightrs(lightrs_), sk(sk_), hasBoundingBox(false) {
-    // Capture sampler states during recording (original working approach)
+    // Capture sampler states during recording with cache optimization
+    // Uses texture pointer as key - same texture always has same sampler states
     for (int stage = 0; stage < 8; ++stage) {
         IDirect3DBaseTexture9* texture = nullptr;
         if (SUCCEEDED(device->GetTexture(stage, &texture)) && texture) {
-            if (SUCCEEDED(device->GetSamplerState(stage, D3DSAMP_ADDRESSU, &samplerStates[stage].addressU)) &&
-                SUCCEEDED(device->GetSamplerState(stage, D3DSAMP_ADDRESSV, &samplerStates[stage].addressV))) {
+            // Check cache first
+            auto cacheIt = samplerCache.find(texture);
+            if (cacheIt != samplerCache.end()) {
+                // Cache hit - use cached sampler states
+                samplerStates[stage].addressU = cacheIt->second.first;
+                samplerStates[stage].addressV = cacheIt->second.second;
                 samplerStates[stage].captured = true;
+            } else {
+                // Cache miss - query D3D and store in cache
+                if (SUCCEEDED(device->GetSamplerState(stage, D3DSAMP_ADDRESSU, &samplerStates[stage].addressU)) &&
+                    SUCCEEDED(device->GetSamplerState(stage, D3DSAMP_ADDRESSV, &samplerStates[stage].addressV))) {
+                    samplerStates[stage].captured = true;
+                    samplerCache[texture] = std::make_pair(samplerStates[stage].addressU, samplerStates[stage].addressV);
+                }
             }
             texture->Release();
         } else {
