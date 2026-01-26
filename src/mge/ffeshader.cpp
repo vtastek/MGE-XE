@@ -72,6 +72,10 @@ std::unordered_map<FixedFunctionShader::MeshKey, FixedFunctionShader::ObjectSpac
 std::unordered_map<FixedFunctionShader::VBIBKey, FixedFunctionShader::ObjectSpaceBBox, FixedFunctionShader::VBIBKeyHash> FixedFunctionShader::bboxLookup;
 
 // Visibility lookup: stores culling results from HLSL replay for depth pass to reuse
+std::vector<int8_t> FixedFunctionShader::visibilityResults;
+
+// Visibility lookup (map-based): stores culling results keyed by MeshKey for replay to reuse
+// Uses OR-logic: if any instance of a mesh is visible, the key is marked visible
 std::unordered_map<FixedFunctionShader::MeshKey, bool, FixedFunctionShader::MeshKeyHash> FixedFunctionShader::visibilityLookup;
 
 // Software occlusion culler for CPU-based Hi-Z depth buffer generation
@@ -834,10 +838,10 @@ void FixedFunctionShader::updateLighting(float sunMult, float ambMult) {
     ambMultiplier = ambMult;
 }
 
-void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
+void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, int recordMWIdx) {
     // Use HLSL pipeline if mode is set to HLSL (PerPixelLightFlags == 2)
     if (Configuration.PerPixelLightFlags == 2) {
-        renderMorrowindHLSL(rs, frs, lightrs);
+        renderMorrowindHLSL(rs, frs, lightrs, recordMWIdx);
         return;
     }
     
@@ -1661,7 +1665,7 @@ FixedFunctionShader::ShaderKey FixedFunctionShader::computeShaderKeyWithSuffixes
 }
 
 // HLSL Pipeline Implementation
-void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
+void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, int recordMWIdx) {
     // Skip if we're in replay mode to avoid recursion
     if (isReplaying) {
         // During replay mode, perform actual rendering with this specific call
@@ -1687,7 +1691,7 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
 
         // Compute shader key during recording (original working approach)
         ShaderKey sk = computeShaderKeyWithSuffixes(rs, frs, lightrs);
-        recordRenderCall(&rsWithShadows, frs, lightrs, sk);
+        recordRenderCall(&rsWithShadows, frs, lightrs, sk, recordMWIdx);
         return;
     }
 
@@ -3378,6 +3382,9 @@ void FixedFunctionShader::startRecording() {
 void FixedFunctionShader::prepareOcclusionCullingForDepth() {
     ZoneScopedN("Prepare Occlusion Culling for Depth");
 
+    // Resize visibility results for this frame (indexed by draw order)
+    visibilityResults.assign(DistantLand::recordMW.size(), -1);  // -1 = not yet tested
+
     // Build Hi-Z mipmap pyramid from rasterized occluders (only once per frame)
     if (!hiZBuiltThisFrame) {
         ZoneScopedN("Build Hi-Z Pyramid");
@@ -3410,7 +3417,8 @@ void FixedFunctionShader::prepareOcclusionCullingForDepth() {
 
         int visibleCount = 0, culledCount = 0, noBboxCount = 0;
 
-        for (auto& obj : DistantLand::recordMW) {
+        for (size_t i = 0; i < DistantLand::recordMW.size(); i++) {
+            auto& obj = DistantLand::recordMW[i];
             bool isVisible = true;  // Default to visible
 
             // Compute world-space bbox for this entry using bboxCache
@@ -3429,9 +3437,13 @@ void FixedFunctionShader::prepareOcclusionCullingForDepth() {
                         worldBboxMin, worldBboxMax, currentView, currentProj);
                 }
 
+                // Store visibility by index
+                visibilityResults[i] = isVisible ? 1 : 0;
+
                 if (isVisible) visibleCount++; else culledCount++;
             } else {
-                // No bbox - keep visible (conservative)
+                // No bbox - keep visible (conservative), mark as tested
+                visibilityResults[i] = 1;
                 noBboxCount++;
             }
 
@@ -3564,7 +3576,7 @@ bool FixedFunctionShader::compareLightStates(const LightState* a, const LightSta
     return true;  // Same lighting state
 }
 
-void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, const ShaderKey& sk) {
+void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, const ShaderKey& sk, int recordMWIdx) {
     {
         if (isReplaying) {
             return;  // Don't record during replay to avoid recursion
@@ -3636,7 +3648,7 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
     }
 
     {
-        recordedCalls.emplace_back(rs, frs, sharedLightState, sk);
+        recordedCalls.emplace_back(rs, frs, sharedLightState, sk, recordMWIdx);
 
         // Immediately populate bboxLookup so depth pass can use current-frame bboxes
         // (prepareOcclusionCullingForDepth runs BEFORE finalizeBatchAndReplay)
@@ -3836,6 +3848,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     int culledCalls = 0;
     int callsWithBBox = 0;
     int callsWithoutBBox = 0;
+    int cacheHits = 0;    // Visibility reused from depth pass
+    int cacheMisses = 0;  // New Hi-Z tests (alpha objects)
 
     // Check for debug key press (Y key)
     static bool debugHiZ = false;
@@ -3906,7 +3920,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
         MeshKey currentKey{call.rs.vb, call.rs.ib, call.rs.fvf, call.rs.baseIndex,
                           call.rs.vertCount, call.rs.startIndex, call.rs.primCount};
 
-        // Inline Hi-Z culling (same logic as bbox visualization)
+        // Visibility culling: reuse depth pass results when available
         bool shouldRender = true;
         if (call.hasBoundingBox) {
             callsWithBBox++;
@@ -3915,9 +3929,17 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
             bool isOccluder = (rasterizedOccluderMeshes.count(currentKey) > 0);
 
             if (!isOccluder) {
-                // Hi-Z test using CURRENT matrices (same as bbox visualization)
-                shouldRender = softwareOcclusionCuller.testBoundingBox(
-                    call.bboxMin, call.bboxMax, currentView, currentProj);
+                // Use recordMWIndex to reuse visibility results from depth pass
+                if (call.recordMWIndex >= 0 && call.recordMWIndex < (int)visibilityResults.size()) {
+                    // Z-writing object tested in depth pass - reuse result
+                    shouldRender = (visibilityResults[call.recordMWIndex] == 1);
+                    cacheHits++;
+                } else {
+                    // Alpha object (not in recordMW) - test fresh
+                    shouldRender = softwareOcclusionCuller.testBoundingBox(
+                        call.bboxMin, call.bboxMax, currentView, currentProj);
+                    cacheMisses++;
+                }
                 if (!shouldRender) {
                     culledCalls++;
                 }
@@ -3965,10 +3987,10 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
 
     // Log culling statistics
     int renderedCalls = totalCalls - culledCalls;
-    LOG::logline("Hi-Z Stats: %d total calls, %d with bbox, %d without bbox, %d culled (%.1f%%), %d rendered",
-                 totalCalls, callsWithBBox, callsWithoutBBox, culledCalls,
+    LOG::logline("Hi-Z Stats: %d total, %d bbox, %d culled (%.1f%%), cache: %d hits %d misses",
+                 totalCalls, callsWithBBox, culledCalls,
                  totalCalls > 0 ? (culledCalls * 100.0f) / totalCalls : 0.0f,
-                 renderedCalls);
+                 cacheHits, cacheMisses);
 
     // Update ImGui debug stats
     ImGuiManager::UpdateDebugStats(
@@ -4186,8 +4208,8 @@ FixedFunctionShader::RecordedRenderedState::RecordedRenderedState(RecordedRender
 // ------------------------------------
 // FixedFunctionShader::HLSLRecordedCall
 
-FixedFunctionShader::HLSLRecordedCall::HLSLRecordedCall(const RenderedState* rs_, const FragmentState* frs_, std::shared_ptr<LightState> lightrs_, const ShaderKey& sk_)
-    : rs(*rs_), frs(*frs_), lightrs(lightrs_), sk(sk_), hasBoundingBox(false) {
+FixedFunctionShader::HLSLRecordedCall::HLSLRecordedCall(const RenderedState* rs_, const FragmentState* frs_, std::shared_ptr<LightState> lightrs_, const ShaderKey& sk_, int recordMWIdx)
+    : rs(*rs_), frs(*frs_), lightrs(lightrs_), sk(sk_), hasBoundingBox(false), recordMWIndex(recordMWIdx) {
     // Capture sampler states during recording with cache optimization
     // Uses texture pointer as key - same texture always has same sampler states
     for (int stage = 0; stage < 8; ++stage) {

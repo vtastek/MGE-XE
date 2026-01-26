@@ -976,6 +976,9 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
     const auto& stage0 = frs->stage[0];
     bool isDecal = stage0.texcoordIndex != 0 && (stage0.colorArg1 == D3DTA_TEXTURE || stage0.colorArg2 == D3DTA_TEXTURE);
 
+    // Track index of entry added to recordMW (local variable, not global state)
+    int recordMWIdx = -1;
+
     // Capture all writes to z-buffer, except detectable second passes of multi-pass rendering
     if (rs->zWrite && !isLandSplat && !isDecal) {
         recordMW.emplace_back(*rs);
@@ -988,6 +991,9 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
         // Don't compute bboxes here - too expensive (buffer locks cause stalls)
         // Bboxes will be computed on-the-fly during culling if needed
         recordMW.back().hasBoundingBox = false;
+
+        // Store index of just-added entry (for HLSL recording to reuse visibility)
+        recordMWIdx = static_cast<int>(recordMW.size() - 1);
     }
 
     // Special case, capture sky
@@ -1005,7 +1011,8 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
         }
     } else if (isPPLActive) {
         // Render Morrowind with replacement shaders
-        FixedFunctionShader::renderMorrowind(rs, frs, lightrs);
+        // Pass recordMWIdx so HLSL recording can reuse visibility results from depth pass
+        FixedFunctionShader::renderMorrowind(rs, frs, lightrs, recordMWIdx);
         return false;
     }
 

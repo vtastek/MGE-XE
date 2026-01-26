@@ -137,12 +137,11 @@ void DistantLand::renderDepthRecorded() {
         loggedOnce = true;
     }
 
-    // Note: Culling is already done by prepareOcclusionCullingForDepth() using synced visibility
-    // from HLSL replay. No need to test again here - recordMW is pre-filtered.
+    // Note: Culling is already done by prepareOcclusionCullingForDepth() using Hi-Z.
+    // recordMW is pre-filtered - only visible objects remain.
 
     // Recorded renders (pre-filtered by prepareOcclusionCullingForDepth)
-    const auto& recordMW_const = recordMW;
-    for (const auto& i : recordMW_const) {
+    for (const auto& i : recordMW) {
         // Set variables in main effect; variables are shared via effect pool
 
         // Fragment colour routing

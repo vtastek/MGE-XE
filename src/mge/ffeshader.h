@@ -433,8 +433,11 @@ class FixedFunctionShader {
         D3DXVECTOR3 bboxMax;
         bool hasBoundingBox;
 
+        // Index into recordMW for visibility lookup (-1 if not in recordMW, e.g., alpha objects)
+        int recordMWIndex;
+
         // Constructor to capture render state data with proper resource management
-        HLSLRecordedCall(const RenderedState* rs_, const FragmentState* frs_, std::shared_ptr<LightState> lightrs_, const ShaderKey& sk_);
+        HLSLRecordedCall(const RenderedState* rs_, const FragmentState* frs_, std::shared_ptr<LightState> lightrs_, const ShaderKey& sk_, int recordMWIdx = -1);
         // Implementation moved to cpp file to handle sampler state capture
     };
 
@@ -476,8 +479,12 @@ class FixedFunctionShader {
     // Bbox lookup: maps VB+IB to world-space bbox (rebuilt each frame from recordedCalls)
     static std::unordered_map<VBIBKey, ObjectSpaceBBox, VBIBKeyHash> bboxLookup;
 
-    // Visibility lookup: stores culling results from HLSL replay for depth pass to reuse
-    // Key is full MeshKey, value is whether the mesh should be rendered (true = visible)
+    // Visibility results (index-based): stores culling results indexed by draw order
+    static std::vector<int8_t> visibilityResults;
+
+    // Visibility lookup (map-based): stores culling results from depth pass for replay to reuse
+    // Key is MeshKey, value is whether ANY instance of that mesh is visible
+    // Uses OR-logic: if any instance visible, key = true (conservative, avoids missing objects)
     static std::unordered_map<MeshKey, bool, MeshKeyHash> visibilityLookup;
 
     // Previous frame camera tracking for velocity-based bbox expansion
@@ -492,7 +499,7 @@ class FixedFunctionShader {
 
     static void startRecording();
     static void stopRecordingAndReplay();
-    static void recordRenderCall(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, const ShaderKey& sk);
+    static void recordRenderCall(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, const ShaderKey& sk, int recordMWIdx = -1);
     static void replayRecordedCalls(int sceneCount);
     static void renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);
     static ShaderKey computeShaderKeyWithSuffixes(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);
@@ -511,6 +518,9 @@ public:
     static void setManualRecordingControl(bool manual) { manualRecordingControl = manual; }
     static bool getManualRecordingControl() { return manualRecordingControl; }
     static size_t getRecordedCallsCount() { return recordedCalls.size(); }
+
+    // Visibility results for depth pass (indexed by recordMW)
+    static const std::vector<int8_t>& getVisibilityResults() { return visibilityResults; }
 
     // Global recording system toggle
     static bool getRecordingEnabled() { return recordingEnabled; }
@@ -537,8 +547,8 @@ public:
     static void startEarlyPrecache(IDirect3DDevice* d);
     static void precacheAsync();
     static void updateLighting(float sunMult, float ambMult);
-    static void renderMorrowind(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);
-    static void renderMorrowindHLSL(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);
+    static void renderMorrowind(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, int recordMWIdx = -1);
+    static void renderMorrowindHLSL(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, int recordMWIdx = -1);
     static void release();
     static void invalidateShaderSourceCache();
     static void checkForShaderFileChanges();
