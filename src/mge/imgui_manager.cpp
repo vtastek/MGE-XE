@@ -24,6 +24,7 @@ bool ImGuiManager::enableRecording = true;
 bool ImGuiManager::enableReplay = true;
 bool ImGuiManager::enableImmediateRendering = true;
 bool ImGuiManager::enableDepthPass = true;
+bool ImGuiManager::enableLightProcessing = true;
 int ImGuiManager::bboxVisualizationMode = 0;
 
 // Debug stats
@@ -312,6 +313,7 @@ void ImGuiManager::RenderDebugInterface() {
         ImGui::Checkbox("Enable Replay", &enableReplay);
         ImGui::Checkbox("Enable Immediate Rendering (Scene 1+)", &enableImmediateRendering);
         ImGui::Checkbox("Enable Depth Pass (recordMW)", &enableDepthPass);
+        ImGui::Checkbox("Enable Light Processing", &enableLightProcessing);
 
         ImGui::Separator();
         ImGui::Text("Statistics");
@@ -366,6 +368,7 @@ bool ImGuiManager::GetEnableRecording() { return enableRecording; }
 bool ImGuiManager::GetEnableReplay() { return enableReplay; }
 bool ImGuiManager::GetEnableImmediateRendering() { return enableImmediateRendering; }
 bool ImGuiManager::GetEnableDepthPass() { return enableDepthPass; }
+bool ImGuiManager::GetEnableLightProcessing() { return enableLightProcessing; }
 int ImGuiManager::GetBBoxVisualizationMode() { return bboxVisualizationMode; }
 
 void ImGuiManager::UpdateDebugStats(int recordedCalls, int renderedCalls, int culledCalls,

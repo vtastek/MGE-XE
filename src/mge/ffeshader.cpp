@@ -3471,9 +3471,10 @@ void FixedFunctionShader::stopRecordingAndReplay() {
     {
         ZoneScopedN("Build Hi-Z Pyramid");
         softwareOcclusionCuller.buildHiZPyramid();
-        if (ImGuiManager::GetShowHiZInterface()) {
-            softwareOcclusionCuller.uploadHiZToTexture(reinterpret_cast<IDirect3DDevice9*>(device), ImGuiManager::GetHiZDisplayMip(), ImGuiManager::GetHiZBrightness(), ImGuiManager::GetHiZGamma(), ImGuiManager::GetHiZInvert(), ImGuiManager::GetHiZShowRaycastGrid(), ImGuiManager::GetHiZRaycastStep());
-        }
+    }
+    if (ImGuiManager::GetShowHiZInterface()) {
+        ZoneScopedN("Upload Hi-Z Debug");
+        softwareOcclusionCuller.uploadHiZToTexture(reinterpret_cast<IDirect3DDevice9*>(device), ImGuiManager::GetHiZDisplayMip(), ImGuiManager::GetHiZBrightness(), ImGuiManager::GetHiZGamma(), ImGuiManager::GetHiZInvert(), ImGuiManager::GetHiZShowRaycastGrid(), ImGuiManager::GetHiZRaycastStep());
     }
 
     // Now replay all recorded calls
@@ -3827,8 +3828,11 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     D3DXMATRIX currentView, currentProj;
     D3DXMATRIX viewProj;
     D3DXMATRIX savedShadowViewproj[2];
-    device->GetTransform(D3DTS_VIEW, &currentView);
-    device->GetTransform(D3DTS_PROJECTION, &currentProj);
+    {
+        ZoneScopedN("replay_GetTransforms");
+        device->GetTransform(D3DTS_VIEW, &currentView);
+        device->GetTransform(D3DTS_PROJECTION, &currentProj);
+    }
 
     // Temporarily set shadow matrices to recording state
     savedShadowViewproj[0] = DistantLand::smViewproj[0];
@@ -3895,11 +3899,13 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     prevCameraView = currentView;
     hasPrevCamera = true;
 
-    // Light culling using Hi-Z occlusion
-    DistantLand::cullSceneLights(viewProj);
+    // Light culling using Hi-Z occlusion (skip if disabled for profiling)
+    if (ImGuiManager::GetEnableLightProcessing()) {
+        DistantLand::cullSceneLights(viewProj);
 
-    // Upload visible lights to GPU texture (may stall if GPU idle)
-    DistantLand::uploadLightDataToTexture(currentView);
+        // Upload visible lights to GPU texture (may stall if GPU idle)
+        DistantLand::uploadLightDataToTexture(currentView);
+    }
 
     // Set light count parameter for shaders
     int numLights = (int)DistantLand::visibleLights.size();
@@ -3908,11 +3914,16 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
         numLights > 0 ? 1.0f / (numLights * 3) : 0.0f,  // texelSize
         0.0f, 0.0f
     };
-    device->SetPixelShaderConstantF(50, lightParams, 1); // c50
+    {
+        ZoneScopedN("replay_SetLightParams");
+        device->SetPixelShaderConstantF(50, lightParams, 1); // c50
+    }
 
     // Inline Hi-Z culling using current matrices (same as bbox visualization)
     const size_t numCalls = recordedCalls.size();
 
+    ZoneScopedN("replay_MainLoop");
+    bool firstDrawDone = false;
     for (size_t i = 0; i < numCalls; i++) {
         auto& call = recordedCalls[i];  // Non-const to update shader key
 
@@ -3950,10 +3961,13 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
 
         if (shouldRender) {
             // Restore sampler states for this call (captured during recording)
-            for (int stage = 0; stage < 8; ++stage) {
-                if (call.samplerStates[stage].captured) {
-                    device->SetSamplerState(stage, D3DSAMP_ADDRESSU, call.samplerStates[stage].addressU);
-                    device->SetSamplerState(stage, D3DSAMP_ADDRESSV, call.samplerStates[stage].addressV);
+            {
+                ZoneScopedN("replay_SetSamplers");
+                for (int stage = 0; stage < 8; ++stage) {
+                    if (call.samplerStates[stage].captured) {
+                        device->SetSamplerState(stage, D3DSAMP_ADDRESSU, call.samplerStates[stage].addressU);
+                        device->SetSamplerState(stage, D3DSAMP_ADDRESSV, call.samplerStates[stage].addressV);
+                    }
                 }
             }
 
@@ -3981,7 +3995,14 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
                 }
             }
 
-            renderMorrowindHLSL_Internal(&call.rs, &call.frs, call.lightrs.get());
+            {
+                ZoneScopedN("replay_RenderCall");
+                renderMorrowindHLSL_Internal(&call.rs, &call.frs, call.lightrs.get());
+                if (!firstDrawDone) {
+                    ZoneScopedN("replay_FirstDrawDone");
+                    firstDrawDone = true;
+                }
+            }
         }
     }
 

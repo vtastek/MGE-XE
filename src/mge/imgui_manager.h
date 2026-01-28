@@ -36,6 +36,7 @@ public:
     static bool GetEnableReplay();
     static bool GetEnableImmediateRendering();
     static bool GetEnableDepthPass();
+    static bool GetEnableLightProcessing();
     static int GetBBoxVisualizationMode();
     static void UpdateDebugStats(int recordedCalls, int renderedCalls, int culledCalls,
                                   int sceneLights, int visibleLights, int recordMWSize, int immediateCount);
@@ -100,6 +101,7 @@ private:
     static bool enableReplay;
     static bool enableImmediateRendering;
     static bool enableDepthPass;
+    static bool enableLightProcessing;
     static int bboxVisualizationMode;  // 0=off, 1=objects, 2=lights
 
     // Debug stats (updated each frame)

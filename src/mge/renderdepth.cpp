@@ -882,6 +882,7 @@ bool DistantLand::cullLightAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECT
 }
 
 void DistantLand::cullSceneLights(const D3DXMATRIX& viewProj) {
+    ZoneScopedN("cullSceneLights");
     visibleLights.clear();
     int culled = 0;
 
@@ -899,20 +900,23 @@ void DistantLand::cullSceneLights(const D3DXMATRIX& viewProj) {
         logged = true;
     }
 
-    for (auto& light : sceneLights) {
-        // Create sphere bounding box for light volume
-        D3DXVECTOR3 bboxMin = light.position - D3DXVECTOR3(light.radius, light.radius, light.radius);
-        D3DXVECTOR3 bboxMax = light.position + D3DXVECTOR3(light.radius, light.radius, light.radius);
+    {
+        ZoneScopedN("cullSceneLights_loop");
+        for (auto& light : sceneLights) {
+            // Create sphere bounding box for light volume
+            D3DXVECTOR3 bboxMin = light.position - D3DXVECTOR3(light.radius, light.radius, light.radius);
+            D3DXVECTOR3 bboxMax = light.position + D3DXVECTOR3(light.radius, light.radius, light.radius);
 
-        // Hi-Z cull the light's influence volume (use light-specific function)
-        bool isOccluded = cullLightAgainstHiZ(bboxMin, bboxMax, viewProj);
+            // Hi-Z cull the light's influence volume (use light-specific function)
+            bool isOccluded = cullLightAgainstHiZ(bboxMin, bboxMax, viewProj);
 
-        if (!isOccluded) {
-            light.isVisible = true;
-            visibleLights.push_back(light);
-        } else {
-            light.isVisible = false;
-            culled++;
+            if (!isOccluded) {
+                light.isVisible = true;
+                visibleLights.push_back(light);
+            } else {
+                light.isVisible = false;
+                culled++;
+            }
         }
     }
 
@@ -930,6 +934,7 @@ void DistantLand::cullSceneLights(const D3DXMATRIX& viewProj) {
 }
 
 void DistantLand::uploadLightDataToTexture(const D3DXMATRIX& viewMatrix) {
+    ZoneScopedN("uploadLightDataToTexture");
     int numLights = (int)visibleLights.size();
 
     if (numLights == 0) {
@@ -944,6 +949,7 @@ void DistantLand::uploadLightDataToTexture(const D3DXMATRIX& viewMatrix) {
 
     // Create or resize texture if needed
     if (!texLightData) {
+        ZoneScopedN("uploadLights_CreateTexture");
         HRESULT hr = device->CreateTexture(
             texelsNeeded, 1,        // 1D texture (width × 1)
             1,                      // No mipmaps
@@ -964,6 +970,7 @@ void DistantLand::uploadLightDataToTexture(const D3DXMATRIX& viewMatrix) {
         texLightData->GetLevelDesc(0, &desc);
 
         if (desc.Width != (UINT)texelsNeeded) {
+            ZoneScopedN("uploadLights_ResizeTexture");
             // Resize needed
             texLightData->Release();
 
@@ -987,42 +994,54 @@ void DistantLand::uploadLightDataToTexture(const D3DXMATRIX& viewMatrix) {
 
     // Lock and fill texture
     D3DLOCKED_RECT locked;
-    if (SUCCEEDED(texLightData->LockRect(0, &locked, nullptr, 0))) {
-        float* data = (float*)locked.pBits;
+    {
+        ZoneScopedN("uploadLights_LockRect");
+        if (SUCCEEDED(texLightData->LockRect(0, &locked, nullptr, 0))) {
+            float* data = (float*)locked.pBits;
 
-        for (int i = 0; i < numLights; i++) {
-            const SceneLight& light = visibleLights[i];
-            int offset = i * 12;  // 3 texels × 4 floats per texel
+            {
+                ZoneScopedN("uploadLights_FillData");
+                for (int i = 0; i < numLights; i++) {
+                    const SceneLight& light = visibleLights[i];
+                    int offset = i * 12;  // 3 texels × 4 floats per texel
 
-            // Transform light position to view-space (to match legacy system)
-            D3DXVECTOR4 worldPos4(light.position.x, light.position.y, light.position.z, 1.0f);
-            D3DXVECTOR4 viewPos4;
-            D3DXVec4Transform(&viewPos4, &worldPos4, &viewMatrix);
+                    // Transform light position to view-space (to match legacy system)
+                    D3DXVECTOR4 worldPos4(light.position.x, light.position.y, light.position.z, 1.0f);
+                    D3DXVECTOR4 viewPos4;
+                    D3DXVec4Transform(&viewPos4, &worldPos4, &viewMatrix);
 
-            // Texel 0: view-space position + radius
-            data[offset + 0] = viewPos4.x;
-            data[offset + 1] = viewPos4.y;
-            data[offset + 2] = viewPos4.z;
-            data[offset + 3] = light.radius;
+                    // Texel 0: view-space position + radius
+                    data[offset + 0] = viewPos4.x;
+                    data[offset + 1] = viewPos4.y;
+                    data[offset + 2] = viewPos4.z;
+                    data[offset + 3] = light.radius;
 
-            // Texel 1: color
-            data[offset + 4] = light.diffuse.r;
-            data[offset + 5] = light.diffuse.g;
-            data[offset + 6] = light.diffuse.b;
-            data[offset + 7] = 0.0f;
+                    // Texel 1: color
+                    data[offset + 4] = light.diffuse.r;
+                    data[offset + 5] = light.diffuse.g;
+                    data[offset + 6] = light.diffuse.b;
+                    data[offset + 7] = 0.0f;
 
-            // Texel 2: falloff parameters
-            data[offset + 8]  = light.falloff.x;  // constant
-            data[offset + 9]  = light.falloff.y;  // linear
-            data[offset + 10] = light.falloff.z;  // quadratic
-            data[offset + 11] = 0.0f;
+                    // Texel 2: falloff parameters
+                    data[offset + 8]  = light.falloff.x;  // constant
+                    data[offset + 9]  = light.falloff.y;  // linear
+                    data[offset + 10] = light.falloff.z;  // quadratic
+                    data[offset + 11] = 0.0f;
+                }
+            }
+
+            {
+                ZoneScopedN("uploadLights_UnlockRect");
+                texLightData->UnlockRect(0);
+            }
         }
-
-        texLightData->UnlockRect(0);
     }
 
     // Bind to device (slot 5)
-    device->SetTexture(5, texLightData);
+    {
+        ZoneScopedN("uploadLights_SetTexture");
+        device->SetTexture(5, texLightData);
+    }
 
     LOG::logline(">> Uploaded %d lights to texture (slot 5)", numLights);
 }
