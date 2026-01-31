@@ -436,6 +436,9 @@ class FixedFunctionShader {
         // Index into recordMW for visibility lookup (-1 if not in recordMW, e.g., alpha objects)
         int recordMWIndex;
 
+        // Whether this call has been through the prepare phase (shader key, bbox, etc.)
+        bool prepared;
+
         // Constructor to capture render state data with proper resource management
         HLSLRecordedCall(const RenderedState* rs_, const FragmentState* frs_, std::shared_ptr<LightState> lightrs_, const ShaderKey& sk_, int recordMWIdx = -1);
         // Implementation moved to cpp file to handle sampler state capture
@@ -499,6 +502,7 @@ class FixedFunctionShader {
 
     static void startRecording();
     static void stopRecordingAndReplay();
+    static void prepareRecordedCalls();
     static void recordRenderCall(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, const ShaderKey& sk, int recordMWIdx = -1);
     static void replayRecordedCalls(int sceneCount);
     static void renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);

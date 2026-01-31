@@ -1689,8 +1689,9 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         rsWithShadows.shadowWorldViewProj[0] = rs->worldTransforms[0] * DistantLand::smViewproj[0];
         rsWithShadows.shadowWorldViewProj[1] = rs->worldTransforms[0] * DistantLand::smViewproj[1];
 
-        // Compute shader key during recording (original working approach)
-        ShaderKey sk = computeShaderKeyWithSuffixes(rs, frs, lightrs);
+        // Defer shader key computation to prepare phase (avoid texture hash lookups during recording)
+        ShaderKey sk;
+        memset(&sk, 0, sizeof(sk));  // Placeholder — computed in prepareRecordedCalls()
         recordRenderCall(&rsWithShadows, frs, lightrs, sk, recordMWIdx);
         return;
     }
@@ -3385,6 +3386,108 @@ void FixedFunctionShader::prepareOcclusionCullingForDepth() {
     // Resize visibility results for this frame (indexed by draw order)
     visibilityResults.assign(DistantLand::recordMW.size(), -1);  // -1 = not yet tested
 
+    // Phase 2a: Compute deferred bboxes and rasterize occluders from recorded HLSL calls
+    // This must happen before Hi-Z build so the depth pass benefits from culling
+    if (!recordedCalls.empty() && !hiZBuiltThisFrame) {
+        // Compute bounding boxes for calls that missed the cache during recording
+        {
+            ZoneScopedN("Prepare: BBox Cache Misses");
+            for (auto& call : recordedCalls) {
+                if (!call.hasBoundingBox) {
+                    call.hasBoundingBox = computeBoundingBox(&call.rs, call.bboxMin, call.bboxMax);
+                    if (call.hasBoundingBox) {
+                        VBIBKey key{call.rs.vb, call.rs.ib};
+                        bboxLookup[key] = {call.bboxMin, call.bboxMax};
+                    }
+                }
+            }
+        }
+
+        // Occluder selection and rasterization
+        {
+            ZoneScopedN("Prepare: Occluder Rasterization");
+            int occluderCount = 0;
+            const int MAX_OCCLUDERS = ImGuiManager::GetOccluderMaxCount();
+            const float MIN_SCREEN_COVERAGE = 0.01f;
+            rasterizedOccluderMeshes.clear();
+
+            D3DXMATRIX viewProj = recordingDeviceView * recordingDeviceProj;
+
+            for (auto& call : recordedCalls) {
+                if (occluderCount >= MAX_OCCLUDERS) break;
+
+                const RenderedState* rs = &call.rs;
+                bool isTransparent = (rs->alphaTest || rs->blendEnable);
+                if (!rs->vb || !rs->ib || isTransparent || !call.hasBoundingBox) continue;
+
+                float bboxSizeX = call.bboxMax.x - call.bboxMin.x;
+                float bboxSizeY = call.bboxMax.y - call.bboxMin.y;
+                float bboxSizeZ = call.bboxMax.z - call.bboxMin.z;
+                float bboxSize = std::max({bboxSizeX, bboxSizeY, bboxSizeZ});
+
+                const UINT BASE_TRIANGLES = 2;
+                const UINT MAX_TRIANGLES = 400;
+                const float MAX_SIZE = 3000.0f;
+                float sizeRatio = std::min(bboxSize / MAX_SIZE, 1.0f);
+                UINT allowedTriangles = BASE_TRIANGLES + (UINT)(sizeRatio * (MAX_TRIANGLES - BASE_TRIANGLES));
+
+                if (rs->primCount > allowedTriangles) continue;
+
+                // Screen coverage test
+                D3DXVECTOR3 corners[8] = {
+                    D3DXVECTOR3(call.bboxMin.x, call.bboxMin.y, call.bboxMin.z),
+                    D3DXVECTOR3(call.bboxMax.x, call.bboxMin.y, call.bboxMin.z),
+                    D3DXVECTOR3(call.bboxMin.x, call.bboxMax.y, call.bboxMin.z),
+                    D3DXVECTOR3(call.bboxMax.x, call.bboxMax.y, call.bboxMin.z),
+                    D3DXVECTOR3(call.bboxMin.x, call.bboxMin.y, call.bboxMax.z),
+                    D3DXVECTOR3(call.bboxMax.x, call.bboxMin.y, call.bboxMax.z),
+                    D3DXVECTOR3(call.bboxMin.x, call.bboxMax.y, call.bboxMax.z),
+                    D3DXVECTOR3(call.bboxMax.x, call.bboxMax.y, call.bboxMax.z)
+                };
+
+                float minX = FLT_MAX, maxX = -FLT_MAX;
+                float minY = FLT_MAX, maxY = -FLT_MAX;
+                bool allBehindCamera = true;
+
+                for (int i = 0; i < 8; i++) {
+                    D3DXVECTOR4 clipPos;
+                    D3DXVec3Transform(&clipPos, &corners[i], &viewProj);
+                    if (clipPos.w > 0.0f) {
+                        allBehindCamera = false;
+                        float ndcX = std::max(-1.0f, std::min(1.0f, clipPos.x / clipPos.w));
+                        float ndcY = std::max(-1.0f, std::min(1.0f, clipPos.y / clipPos.w));
+                        minX = std::min(minX, ndcX);
+                        maxX = std::max(maxX, ndcX);
+                        minY = std::min(minY, ndcY);
+                        maxY = std::max(maxY, ndcY);
+                    }
+                }
+
+                if (allBehindCamera) continue;
+                float screenCoverage = ((maxX - minX) * (maxY - minY)) / 4.0f;
+                if (screenCoverage < MIN_SCREEN_COVERAGE) continue;
+
+                MeshKey occluderKey;
+                occluderKey.vb = rs->vb;
+                occluderKey.ib = rs->ib;
+                occluderKey.fvf = rs->fvf;
+                occluderKey.baseIndex = rs->baseIndex;
+                occluderKey.vertCount = rs->vertCount;
+                occluderKey.startIndex = rs->startIndex;
+                occluderKey.primCount = rs->primCount;
+                rasterizedOccluderMeshes.insert(occluderKey);
+
+                softwareOcclusionCuller.rasterizeMesh(
+                    rs->vb, rs->vbOffset, rs->vbStride,
+                    rs->ib, rs->baseIndex, rs->startIndex, rs->primCount, rs->primType,
+                    rs->fvf, rs->worldTransforms[0],
+                    recordingDeviceView, recordingDeviceProj
+                );
+                occluderCount++;
+            }
+        }
+    }
+
     // Build Hi-Z mipmap pyramid from rasterized occluders (only once per frame)
     if (!hiZBuiltThisFrame) {
         ZoneScopedN("Build Hi-Z Pyramid");
@@ -3460,6 +3563,25 @@ void FixedFunctionShader::prepareOcclusionCullingForDepth() {
     }
 }
 
+// Phase 2b: Prepare shader keys — runs after recording completes, before replay.
+// BBox computation and occluder rasterization already done in prepareOcclusionCullingForDepth (Phase 2a).
+void FixedFunctionShader::prepareRecordedCalls() {
+    ZoneScopedN("prepareRecordedCalls");
+
+    if (recordedCalls.empty()) {
+        return;
+    }
+
+    // Compute shader keys (deferred from renderMorrowindHLSL recording path)
+    {
+        ZoneScopedN("Prepare: Shader Keys");
+        for (auto& call : recordedCalls) {
+            call.sk = computeShaderKeyWithSuffixes(&call.rs, &call.frs, call.lightrs.get());
+            call.prepared = true;
+        }
+    }
+}
+
 void FixedFunctionShader::stopRecordingAndReplay() {
     if (!isRecording) {
         return;
@@ -3467,21 +3589,26 @@ void FixedFunctionShader::stopRecordingAndReplay() {
 
     isRecording = false;
 
-    // Build Hi-Z mipmap pyramid from rasterized depth (call once after all occluders done)
-    {
-        ZoneScopedN("Build Hi-Z Pyramid");
-        softwareOcclusionCuller.buildHiZPyramid();
-    }
-    if (ImGuiManager::GetShowHiZInterface()) {
-        ZoneScopedN("Upload Hi-Z Debug");
-        softwareOcclusionCuller.uploadHiZToTexture(reinterpret_cast<IDirect3DDevice9*>(device), ImGuiManager::GetHiZDisplayMip(), ImGuiManager::GetHiZBrightness(), ImGuiManager::GetHiZGamma(), ImGuiManager::GetHiZInvert(), ImGuiManager::GetHiZShowRaycastGrid(), ImGuiManager::GetHiZRaycastStep());
-    }
+    // Phase 2b: Prepare shader keys (bbox + occluders already done in prepareOcclusionCullingForDepth)
+    prepareRecordedCalls();
 
-    // Now replay all recorded calls
-    replayRecordedCalls(0); // Default to scene 0 for manual stop/replay
+    // Phase 3: Replay all prepared calls (Hi-Z already built by prepareOcclusionCullingForDepth)
+    replayRecordedCalls(0);
 
     // Clear recorded calls after replay
     recordedCalls.clear();
+
+    // Clean up HLSL-only texture slots to prevent DXVK descriptor bloat
+    // Use raw SetTexture to truly unbind (setCachedTexture substitutes default textures)
+    // Slots 0-1 are used by Morrowind normally, don't touch them
+    // Slots 2-5 are HLSL-specific (paramH, paramX, shadow, lightData)
+    for (int i = 2; i < 6; i++) {
+        device->SetTexture(i, NULL);
+        textureCache.updateCache(i, nullptr);
+        textureCache.textureValid[i] = false;
+    }
+    device->SetVertexShader(NULL);
+    device->SetPixelShader(NULL);
 
     // Reset state to allow new recording sessions
     // Note: isRecording stays false until next startRecording() call
@@ -3660,154 +3787,8 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
         }
     }
 
-    // OCCLUSION CULLING - Improved heuristics
-    // Select occluders based on: geometry type + scaled triangle limit + screen coverage
-    {
-        static int occluderCount = 0;
-        const int MAX_OCCLUDERS = ImGuiManager::GetOccluderMaxCount();
-        const float MIN_SCREEN_COVERAGE = 0.01f;  // 1% of screen area
-
-        if (recordedCalls.size() == 1) {
-            occluderCount = 0;
-            rasterizedOccluderMeshes.clear();
-        }
-
-        // NEVER use alpha-tested or alpha-blended geometry as occluders - they have holes!
-        bool isTransparent = (rs->alphaTest || rs->blendEnable);
-
-        // Check if this mesh should be rasterized
-        bool shouldRasterize = false;
-        if (rs->vb && rs->ib && occluderCount < MAX_OCCLUDERS && !isTransparent) {
-            const HLSLRecordedCall& call = recordedCalls.back();
-
-            if (call.hasBoundingBox) {
-                // Calculate bbox size (largest dimension)
-                float bboxSizeX = call.bboxMax.x - call.bboxMin.x;
-                float bboxSizeY = call.bboxMax.y - call.bboxMin.y;
-                float bboxSizeZ = call.bboxMax.z - call.bboxMin.z;
-                float bboxSize = std::max({bboxSizeX, bboxSizeY, bboxSizeZ});
-
-                // Scaled triangle limit: larger structures can have more triangles
-                // 2 tris at size 0 -> 400 tris at size 3000 (linear scale)
-                const UINT BASE_TRIANGLES = 2;      // Minimum (wall)
-                const UINT MAX_TRIANGLES = 400;     // Maximum for huge structures
-                const float MAX_SIZE = 3000.0f;     // Size at which max triangles allowed
-
-                float sizeRatio = std::min(bboxSize / MAX_SIZE, 1.0f);
-                UINT allowedTriangles = BASE_TRIANGLES + (UINT)(sizeRatio * (MAX_TRIANGLES - BASE_TRIANGLES));
-
-                if (rs->primCount <= allowedTriangles) {
-                    // Compute screen coverage by projecting bbox corners
-                    D3DXMATRIX viewProj = recordingDeviceView * recordingDeviceProj;
-                    D3DXVECTOR3 corners[8] = {
-                        D3DXVECTOR3(call.bboxMin.x, call.bboxMin.y, call.bboxMin.z),
-                        D3DXVECTOR3(call.bboxMax.x, call.bboxMin.y, call.bboxMin.z),
-                        D3DXVECTOR3(call.bboxMin.x, call.bboxMax.y, call.bboxMin.z),
-                        D3DXVECTOR3(call.bboxMax.x, call.bboxMax.y, call.bboxMin.z),
-                        D3DXVECTOR3(call.bboxMin.x, call.bboxMin.y, call.bboxMax.z),
-                        D3DXVECTOR3(call.bboxMax.x, call.bboxMin.y, call.bboxMax.z),
-                        D3DXVECTOR3(call.bboxMin.x, call.bboxMax.y, call.bboxMax.z),
-                        D3DXVECTOR3(call.bboxMax.x, call.bboxMax.y, call.bboxMax.z)
-                    };
-
-                    // Project corners to NDC and compute screen-space bounding box
-                    float minX = FLT_MAX, maxX = -FLT_MAX;
-                    float minY = FLT_MAX, maxY = -FLT_MAX;
-                    bool allBehindCamera = true;
-
-                    for (int i = 0; i < 8; i++) {
-                        D3DXVECTOR4 clipPos;
-                        D3DXVec3Transform(&clipPos, &corners[i], &viewProj);
-
-                        if (clipPos.w > 0.0f) {
-                            allBehindCamera = false;
-                            float ndcX = clipPos.x / clipPos.w;
-                            float ndcY = clipPos.y / clipPos.w;
-                            // Clamp to screen
-                            ndcX = std::max(-1.0f, std::min(1.0f, ndcX));
-                            ndcY = std::max(-1.0f, std::min(1.0f, ndcY));
-                            minX = std::min(minX, ndcX);
-                            maxX = std::max(maxX, ndcX);
-                            minY = std::min(minY, ndcY);
-                            maxY = std::max(maxY, ndcY);
-                        }
-                    }
-
-                    if (!allBehindCamera) {
-                        // Screen coverage = (width * height) / 4.0 (NDC is -1 to 1, so total area is 4)
-                        float screenCoverage = ((maxX - minX) * (maxY - minY)) / 4.0f;
-                        shouldRasterize = (screenCoverage >= MIN_SCREEN_COVERAGE);
-                    }
-                } // if (rs->primCount <= allowedTriangles)
-            } // if (call.hasBoundingBox)
-        }
-
-        if (shouldRasterize) {
-            // DEBUG: Log first few rasterizations
-            static int rasterLogCount = 0;
-            if (rasterLogCount++ < 10) {
-                LOG::logline("    Rasterizing: vb=0x%p ib=0x%p tris=%d", rs->vb, rs->ib, rs->primCount);
-            }
-
-            // Add this mesh to the static occluder set (so it won't be culled later)
-            MeshKey occluderKey;
-            occluderKey.vb = rs->vb;
-            occluderKey.ib = rs->ib;
-            occluderKey.fvf = rs->fvf;
-            occluderKey.baseIndex = rs->baseIndex;
-            occluderKey.vertCount = rs->vertCount;
-            occluderKey.startIndex = rs->startIndex;
-            occluderKey.primCount = rs->primCount;
-            rasterizedOccluderMeshes.insert(occluderKey);
-
-            // Rasterize mesh
-            int pixelsWritten = softwareOcclusionCuller.rasterizeMesh(
-                rs->vb,
-                rs->vbOffset,
-                rs->vbStride,
-                rs->ib,
-                rs->baseIndex,
-                rs->startIndex,
-                rs->primCount,
-                rs->primType,
-                rs->fvf,
-                rs->worldTransforms[0],
-                recordingDeviceView,
-                recordingDeviceProj
-            );
-
-            // Debug: Log rasterization results
-            static int rasterResultLogCount = 0;
-            if (rasterResultLogCount++ < 20) {
-                LOG::logline("    Raster result: %d pixels written for %d tris (fvf=0x%X stride=%d)",
-                            pixelsWritten, rs->primCount, rs->fvf, rs->vbStride);
-            }
-
-            occluderCount++;
-        }
-
-        // Build Hi-Z pyramid after enough occluders are rasterized
-        static bool hiZBuiltDuringRecording = false;
-        if (occluderCount >= MAX_OCCLUDERS && !hiZBuiltDuringRecording) {
-            softwareOcclusionCuller.buildHiZPyramid();
-            if (ImGuiManager::GetShowHiZInterface()) {
-                softwareOcclusionCuller.uploadHiZToTexture(reinterpret_cast<IDirect3DDevice9*>(device), ImGuiManager::GetHiZDisplayMip(), ImGuiManager::GetHiZBrightness(), ImGuiManager::GetHiZGamma(), ImGuiManager::GetHiZInvert(), ImGuiManager::GetHiZShowRaycastGrid(), ImGuiManager::GetHiZRaycastStep());
-            }
-            hiZBuiltDuringRecording = true;
-            hiZBuiltThisFrame = true;  // Prevent rebuild in prepareOcclusionCullingForDepth
-            LOG::logline(">> Hi-Z pyramid built after %d occluders rasterized", occluderCount);
-        }
-
-        // Reset flag at start of recording
-        if (recordedCalls.size() == 1) {
-            hiZBuiltDuringRecording = false;
-        }
-    }
-
-    // 2-PASS OCCLUSION: Don't cull during recording!
-    // Culling during recording uses incomplete Hi-Z buffer → false occlusions
-    // All culling happens during replay when Hi-Z is complete
-    // (See replayRecordedCalls lines ~4310 for replay-time culling)
+    // Occluder selection and rasterization deferred to prepareRecordedCalls()
+    // This removes the heaviest per-draw work from the recording hot path
 }
 
 void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
@@ -4230,21 +4211,18 @@ FixedFunctionShader::RecordedRenderedState::RecordedRenderedState(RecordedRender
 // FixedFunctionShader::HLSLRecordedCall
 
 FixedFunctionShader::HLSLRecordedCall::HLSLRecordedCall(const RenderedState* rs_, const FragmentState* frs_, std::shared_ptr<LightState> lightrs_, const ShaderKey& sk_, int recordMWIdx)
-    : rs(*rs_), frs(*frs_), lightrs(lightrs_), sk(sk_), hasBoundingBox(false), recordMWIndex(recordMWIdx) {
-    // Capture sampler states during recording with cache optimization
-    // Uses texture pointer as key - same texture always has same sampler states
-    for (int stage = 0; stage < 8; ++stage) {
+    : rs(*rs_), frs(*frs_), lightrs(lightrs_), sk(sk_), hasBoundingBox(false), recordMWIndex(recordMWIdx), prepared(false) {
+    // Lean recording: capture sampler states for stages 0-1 only (Morrowind-bound textures)
+    // Stages 2+ are HLSL-specific textures bound by MGE XE with known sampler states
+    for (int stage = 0; stage < 2; ++stage) {
         IDirect3DBaseTexture9* texture = nullptr;
         if (SUCCEEDED(device->GetTexture(stage, &texture)) && texture) {
-            // Check cache first
             auto cacheIt = samplerCache.find(texture);
             if (cacheIt != samplerCache.end()) {
-                // Cache hit - use cached sampler states
                 samplerStates[stage].addressU = cacheIt->second.first;
                 samplerStates[stage].addressV = cacheIt->second.second;
                 samplerStates[stage].captured = true;
             } else {
-                // Cache miss - query D3D and store in cache
                 if (SUCCEEDED(device->GetSamplerState(stage, D3DSAMP_ADDRESSU, &samplerStates[stage].addressU)) &&
                     SUCCEEDED(device->GetSamplerState(stage, D3DSAMP_ADDRESSV, &samplerStates[stage].addressV))) {
                     samplerStates[stage].captured = true;
@@ -4256,21 +4234,52 @@ FixedFunctionShader::HLSLRecordedCall::HLSLRecordedCall(const RenderedState* rs_
             samplerStates[stage].captured = false;
         }
     }
-
-    // Compute bounding box for Hi-Z culling (needed during recording for occluder selection)
-    hasBoundingBox = computeBoundingBox(rs_, bboxMin, bboxMax);
-
-    // Debug: Log first few failures
-    static int failCount = 0;
-    static int successCount = 0;
-    if (!hasBoundingBox && failCount < 3) {
-        LOG::logline("!! BBox compute failed: vb=%p, fvf=0x%X, stride=%d", rs_->vb, rs_->fvf, rs_->vbStride);
-        failCount++;
+    // Stages 2-7: mark as not captured (will use defaults during replay)
+    for (int stage = 2; stage < 8; ++stage) {
+        samplerStates[stage].captured = false;
     }
-    if (hasBoundingBox && successCount < 3) {
-        LOG::logline(">> BBox success: min=(%.2f,%.2f,%.2f), max=(%.2f,%.2f,%.2f)",
-                     bboxMin.x, bboxMin.y, bboxMin.z, bboxMax.x, bboxMax.y, bboxMax.z);
-        successCount++;
+
+    // Defer bbox computation to prepare phase — only use cache hits during recording
+    // This avoids VB/IB locks on cache miss (the expensive path)
+    if (rs_->vb && (rs_->fvf & D3DFVF_POSITION_MASK) != 0) {
+        MeshKey key;
+        key.vb = rs_->vb;
+        key.ib = rs_->ib;
+        key.fvf = rs_->fvf;
+        key.baseIndex = rs_->baseIndex;
+        key.vertCount = rs_->vertCount;
+        key.startIndex = rs_->startIndex;
+        key.primCount = rs_->primCount;
+
+        auto it = bboxCache.find(key);
+        if (it != bboxCache.end()) {
+            // Cache hit — cheap world-space transform
+            const ObjectSpaceBBox& objBBox = it->second;
+            D3DXVECTOR3 corners[8] = {
+                D3DXVECTOR3(objBBox.bboxMin.x, objBBox.bboxMin.y, objBBox.bboxMin.z),
+                D3DXVECTOR3(objBBox.bboxMax.x, objBBox.bboxMin.y, objBBox.bboxMin.z),
+                D3DXVECTOR3(objBBox.bboxMin.x, objBBox.bboxMax.y, objBBox.bboxMin.z),
+                D3DXVECTOR3(objBBox.bboxMax.x, objBBox.bboxMax.y, objBBox.bboxMin.z),
+                D3DXVECTOR3(objBBox.bboxMin.x, objBBox.bboxMin.y, objBBox.bboxMax.z),
+                D3DXVECTOR3(objBBox.bboxMax.x, objBBox.bboxMin.y, objBBox.bboxMax.z),
+                D3DXVECTOR3(objBBox.bboxMin.x, objBBox.bboxMax.y, objBBox.bboxMax.z),
+                D3DXVECTOR3(objBBox.bboxMax.x, objBBox.bboxMax.y, objBBox.bboxMax.z),
+            };
+            bboxMin = D3DXVECTOR3(1e10f, 1e10f, 1e10f);
+            bboxMax = D3DXVECTOR3(-1e10f, -1e10f, -1e10f);
+            for (int i = 0; i < 8; i++) {
+                D3DXVECTOR3 worldCorner;
+                D3DXVec3TransformCoord(&worldCorner, &corners[i], &rs_->worldTransforms[0]);
+                bboxMin.x = std::min(bboxMin.x, worldCorner.x);
+                bboxMin.y = std::min(bboxMin.y, worldCorner.y);
+                bboxMin.z = std::min(bboxMin.z, worldCorner.z);
+                bboxMax.x = std::max(bboxMax.x, worldCorner.x);
+                bboxMax.y = std::max(bboxMax.y, worldCorner.y);
+                bboxMax.z = std::max(bboxMax.z, worldCorner.z);
+            }
+            hasBoundingBox = true;
+        }
+        // Cache miss: hasBoundingBox stays false, will be computed in prepareRecordedCalls()
     }
 }
 
