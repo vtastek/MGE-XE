@@ -14,7 +14,31 @@
 #include <memory>
 #include <atomic>
 
+// Dirty flags for performance mode (dirty tracking between frames)
+enum DirtyFlags : DWORD {
+    DIRTY_NONE      = 0,
+    DIRTY_TRANSFORM = 1 << 0,  // worldTransforms[0] changed (object moved)
+    DIRTY_LIGHT     = 1 << 1,  // LightState pointer differs
+    DIRTY_MATERIAL  = 1 << 2,  // material diffuse/ambient/emissive differs
+    DIRTY_SHADER    = 1 << 3,  // ShaderKey differs
+    DIRTY_BLEND     = 1 << 4,  // blendEnable/srcBlend/destBlend changed
+    DIRTY_TEXTURE   = 1 << 5,  // base texture pointer changed
+    DIRTY_ALL       = 0xFFFFFFFF  // new object or mode disabled
+};
 
+// Expected device state for debug mode (state leak detection)
+struct ExpectedDeviceState {
+    DWORD alphaBlendEnable, alphaTestEnable;
+    DWORD zEnable, zWriteEnable;
+    DWORD fogEnable, cullMode;
+    DWORD srcBlend, destBlend;
+    float depthBias, slopeScaledDepthBias;
+    DWORD samplerAddressU[2], samplerAddressV[2];  // stages 0-1
+    IDirect3DBaseTexture9* textures[8];  // for leak detection on unused stages
+    bool captured;
+
+    ExpectedDeviceState() : captured(false) {}
+};
 
 struct RenderedState {
     IDirect3DTexture9* texture;
@@ -300,6 +324,17 @@ class FixedFunctionShader {
     };
     static TextureBindingCache textureCache;
 
+    // Render state saved at recording start, restored after replay
+    struct SavedRenderStates {
+        DWORD alphaBlendEnable, alphaTestEnable;
+        DWORD zEnable, zWriteEnable;
+        DWORD cullMode, srcBlend, destBlend;
+        DWORD fogEnable;
+        DWORD specularEnable, localViewer, normalizeNormals;
+        DWORD zFunc, alphaFunc, alphaRef;
+    };
+    static SavedRenderStates preRecordingState;
+
     // Exterior texture binding optimizations
     static bool isExteriorShadowBound;
     static bool isDetailTextureBound;
@@ -439,6 +474,12 @@ class FixedFunctionShader {
         // Whether this call has been through the prepare phase (shader key, bbox, etc.)
         bool prepared;
 
+        // Dirty tracking for performance mode
+        DWORD dirtyFlags;
+
+        // Expected device state for debug mode (state leak detection)
+        ExpectedDeviceState expectedState;
+
         // Constructor to capture render state data with proper resource management
         HLSLRecordedCall(const RenderedState* rs_, const FragmentState* frs_, std::shared_ptr<LightState> lightrs_, const ShaderKey& sk_, int recordMWIdx = -1);
         // Implementation moved to cpp file to handle sampler state capture
@@ -505,7 +546,9 @@ class FixedFunctionShader {
     static void prepareRecordedCalls();
     static void recordRenderCall(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, const ShaderKey& sk, int recordMWIdx = -1);
     static void replayRecordedCalls(int sceneCount);
-    static void renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);
+    static void renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, DWORD dirtyFlags = DIRTY_ALL);
+    static void validateDeviceState(const ExpectedDeviceState& expected, int callIndex);
+    static void matchPreviousFrameCalls();
     static ShaderKey computeShaderKeyWithSuffixes(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);
     static bool computeBoundingBox(const RenderedState* rs, D3DXVECTOR3& bboxMin, D3DXVECTOR3& bboxMax);
 

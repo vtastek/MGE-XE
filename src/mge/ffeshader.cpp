@@ -98,6 +98,8 @@ FixedFunctionShader::MaterialStateCache FixedFunctionShader::materialCache;
 // Texture binding cache static member
 FixedFunctionShader::TextureBindingCache FixedFunctionShader::textureCache;
 
+FixedFunctionShader::SavedRenderStates FixedFunctionShader::preRecordingState = {};
+
 // Exterior texture binding optimization flags
 bool FixedFunctionShader::isExteriorShadowBound = false;
 bool FixedFunctionShader::isDetailTextureBound = false;
@@ -1709,12 +1711,11 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
 }
 
 // Internal rendering function that does the actual HLSL rendering
-void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
+void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, DWORD dirtyFlags) {
 
     // Process any completed async shader compilations
     processAsyncCompletions();
 
-    
     HLSLShader hlslShader;
 
     // Get ShaderKey with texture suffix detection
@@ -1898,9 +1899,9 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
 
 
     // Save current render states before modifying them (only states that HLSL actually changes)
-    DWORD savedAlphaBlendEnable, savedAlphaTestEnable;
-    DWORD savedZEnable, savedZWriteEnable;
-    DWORD savedSpecularEnable, savedLocalViewer, savedNormalizeNormals;
+    DWORD savedAlphaBlendEnable = 0, savedAlphaTestEnable = 0;
+    DWORD savedZEnable = 0, savedZWriteEnable = 0;
+    DWORD savedSpecularEnable = 0, savedLocalViewer = 0, savedNormalizeNormals = 0;
     device->GetRenderState(D3DRS_ALPHABLENDENABLE, &savedAlphaBlendEnable);
     device->GetRenderState(D3DRS_ALPHATESTENABLE, &savedAlphaTestEnable);
     device->GetRenderState(D3DRS_ZENABLE, &savedZEnable);
@@ -1934,34 +1935,18 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     setCachedRenderState(device, D3DRS_LOCALVIEWER, FALSE, materialCache.localViewer, materialCache.localViewerValid);
     setCachedRenderState(device, D3DRS_NORMALIZENORMALS, FALSE, materialCache.normalizeNormals, materialCache.normalizeNormalsValid);
 
-    // Alpha blending states - force set during replay to ensure correctness
-    if (isReplaying) {
-        device->SetRenderState(D3DRS_ALPHABLENDENABLE, rs->blendEnable);
-        if (rs->blendEnable) {
-            device->SetRenderState(D3DRS_SRCBLEND, rs->srcBlend);
-            device->SetRenderState(D3DRS_DESTBLEND, rs->destBlend);
-        }
-    } else {
-        setCachedRenderState(device, D3DRS_ALPHABLENDENABLE, rs->blendEnable, materialCache.alphaBlendEnable, materialCache.alphaBlendEnableValid);
-        if (rs->blendEnable) {
-            setCachedRenderState(device, D3DRS_SRCBLEND, rs->srcBlend, materialCache.srcBlend, materialCache.srcBlendValid);
-            setCachedRenderState(device, D3DRS_DESTBLEND, rs->destBlend, materialCache.destBlend, materialCache.destBlendValid);
-        }
+    // Alpha blending states
+    setCachedRenderState(device, D3DRS_ALPHABLENDENABLE, rs->blendEnable, materialCache.alphaBlendEnable, materialCache.alphaBlendEnableValid);
+    if (rs->blendEnable) {
+        setCachedRenderState(device, D3DRS_SRCBLEND, rs->srcBlend, materialCache.srcBlend, materialCache.srcBlendValid);
+        setCachedRenderState(device, D3DRS_DESTBLEND, rs->destBlend, materialCache.destBlend, materialCache.destBlendValid);
     }
 
-    // Alpha testing states - force set during replay to ensure correctness
-    if (isReplaying) {
-        device->SetRenderState(D3DRS_ALPHATESTENABLE, rs->alphaTest);
-        if (rs->alphaTest) {
-            device->SetRenderState(D3DRS_ALPHAFUNC, rs->alphaFunc);
-            device->SetRenderState(D3DRS_ALPHAREF, rs->alphaRef);
-        }
-    } else {
-        setCachedRenderState(device, D3DRS_ALPHATESTENABLE, rs->alphaTest, materialCache.alphaTestEnable, materialCache.alphaTestEnableValid);
-        if (rs->alphaTest) {
-            setCachedRenderState(device, D3DRS_ALPHAFUNC, rs->alphaFunc, materialCache.alphaFunc, materialCache.alphaFuncValid);
-            setCachedRenderState(device, D3DRS_ALPHAREF, rs->alphaRef, materialCache.alphaRef, materialCache.alphaRefValid);
-        }
+    // Alpha testing states
+    setCachedRenderState(device, D3DRS_ALPHATESTENABLE, rs->alphaTest, materialCache.alphaTestEnable, materialCache.alphaTestEnableValid);
+    if (rs->alphaTest) {
+        setCachedRenderState(device, D3DRS_ALPHAFUNC, rs->alphaFunc, materialCache.alphaFunc, materialCache.alphaFuncValid);
+        setCachedRenderState(device, D3DRS_ALPHAREF, rs->alphaRef, materialCache.alphaRef, materialCache.alphaRefValid);
     }
 
     // Set vertex format (legacy DX8 FVF - HLSL input semantics handle layout internally)
@@ -2087,7 +2072,6 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             return;
         }
     }
-    
     // Set pixel shader constants using cached handles (no per-draw string lookups)
     if (hlslShader.psConstantTable) {
         try {
@@ -2112,7 +2096,6 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
                     return;
                 }
             }
-        
         // Set up lighting using the same logic as the original renderMorrowind
         const size_t MaxLights = 8;
         D3DXVECTOR4 bufferDiffuse[MaxLights];
@@ -2289,7 +2272,6 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         }
         
         // Note: HLSL uses same falloff as Effect shader - quadratic + constant only, no linear term
-        
         // Set shading mode from actual material mode calculation
         D3DXHANDLE hShadingMode = hlslShader.psConstantTable->GetConstantByName(NULL, "shadingMode");
         if (hShadingMode) {
@@ -2518,19 +2500,24 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     device->SetVertexShader(NULL);
     device->SetPixelShader(NULL);
 
-    // Clear HLSL shadow texture bindings to prevent legacy artifacts
+    // During replay, texture slots are managed by bindShaderTextures and cleaned up
+    // at batch end in stopRecordingAndReplay. Per-call clearing would break the
+    // bindingCache optimization (consecutive same-texture calls skip rebinding).
+    if (!isReplaying) {
+        // Clear HLSL texture bindings to prevent leaks across calls
+        FixedFunctionShader::setCachedTexture(device, 2, nullptr);  // Clear paramH/suffix texture
+        FixedFunctionShader::setCachedTexture(device, 3, nullptr);  // Clear any legacy MGE effects shadow binding
+        FixedFunctionShader::setCachedTexture(device, 4, nullptr);  // Clear HLSL shadow binding
 
-    FixedFunctionShader::setCachedTexture(device, 3, nullptr);  // Clear any legacy MGE effects shadow binding
-    FixedFunctionShader::setCachedTexture(device, 4, nullptr);  // Clear HLSL shadow binding
-
-    // Restore render states that HLSL rendering may have changed
-    device->SetRenderState(D3DRS_ALPHABLENDENABLE, savedAlphaBlendEnable);
-    device->SetRenderState(D3DRS_ALPHATESTENABLE, savedAlphaTestEnable);
-    device->SetRenderState(D3DRS_ZENABLE, savedZEnable);
-    device->SetRenderState(D3DRS_ZWRITEENABLE, savedZWriteEnable);
-    device->SetRenderState(D3DRS_SPECULARENABLE, savedSpecularEnable);
-    device->SetRenderState(D3DRS_LOCALVIEWER, savedLocalViewer);
-    device->SetRenderState(D3DRS_NORMALIZENORMALS, savedNormalizeNormals);
+        // Restore render states that HLSL rendering may have changed
+        device->SetRenderState(D3DRS_ALPHABLENDENABLE, savedAlphaBlendEnable);
+        device->SetRenderState(D3DRS_ALPHATESTENABLE, savedAlphaTestEnable);
+        device->SetRenderState(D3DRS_ZENABLE, savedZEnable);
+        device->SetRenderState(D3DRS_ZWRITEENABLE, savedZWriteEnable);
+        device->SetRenderState(D3DRS_SPECULARENABLE, savedSpecularEnable);
+        device->SetRenderState(D3DRS_LOCALVIEWER, savedLocalViewer);
+        device->SetRenderState(D3DRS_NORMALIZENORMALS, savedNormalizeNormals);
+    }
 }
 
 FixedFunctionShader::HLSLShader FixedFunctionShader::createPurpleErrorShader() {
@@ -3344,6 +3331,22 @@ static int g_currentFrame = 0;
 static std::unordered_map<IDirect3DBaseTexture9*, std::pair<DWORD, DWORD>> samplerCache;
 
 void FixedFunctionShader::startRecording() {
+    // Save render states before recording so we can restore after replay
+    device->GetRenderState(D3DRS_ALPHABLENDENABLE, &preRecordingState.alphaBlendEnable);
+    device->GetRenderState(D3DRS_ALPHATESTENABLE, &preRecordingState.alphaTestEnable);
+    device->GetRenderState(D3DRS_ZENABLE, &preRecordingState.zEnable);
+    device->GetRenderState(D3DRS_ZWRITEENABLE, &preRecordingState.zWriteEnable);
+    device->GetRenderState(D3DRS_CULLMODE, &preRecordingState.cullMode);
+    device->GetRenderState(D3DRS_SRCBLEND, &preRecordingState.srcBlend);
+    device->GetRenderState(D3DRS_DESTBLEND, &preRecordingState.destBlend);
+    device->GetRenderState(D3DRS_FOGENABLE, &preRecordingState.fogEnable);
+    device->GetRenderState(D3DRS_SPECULARENABLE, &preRecordingState.specularEnable);
+    device->GetRenderState(D3DRS_LOCALVIEWER, &preRecordingState.localViewer);
+    device->GetRenderState(D3DRS_NORMALIZENORMALS, &preRecordingState.normalizeNormals);
+    device->GetRenderState(D3DRS_ZFUNC, &preRecordingState.zFunc);
+    device->GetRenderState(D3DRS_ALPHAFUNC, &preRecordingState.alphaFunc);
+    device->GetRenderState(D3DRS_ALPHAREF, &preRecordingState.alphaRef);
+
     // Reset HLSL caches for new recording session
     resetHLSLCaches();
 
@@ -3563,6 +3566,89 @@ void FixedFunctionShader::prepareOcclusionCullingForDepth() {
     }
 }
 
+// Dirty tracking: match current frame calls to previous frame by MeshKey
+void FixedFunctionShader::matchPreviousFrameCalls() {
+    ZoneScopedN("matchPreviousFrameCalls");
+
+    if (previousFrameCalls.empty()) {
+        // First frame or no previous data — all dirty
+        for (auto& call : recordedCalls) {
+            call.dirtyFlags = DIRTY_ALL;
+        }
+        return;
+    }
+
+    // Build lookup from previous frame
+    std::unordered_map<MeshKey, int, MeshKeyHash> prevLookup;
+    prevLookup.reserve(previousFrameCalls.size());
+    for (int i = 0; i < (int)previousFrameCalls.size(); ++i) {
+        auto& prev = previousFrameCalls[i];
+        MeshKey key;
+        key.vb = prev.rs.vb;
+        key.ib = prev.rs.ib;
+        key.fvf = prev.rs.fvf;
+        key.baseIndex = prev.rs.baseIndex;
+        key.vertCount = prev.rs.vertCount;
+        key.startIndex = prev.rs.startIndex;
+        key.primCount = prev.rs.primCount;
+        prevLookup[key] = i;  // Last wins for duplicates
+    }
+
+    for (auto& call : recordedCalls) {
+        MeshKey key;
+        key.vb = call.rs.vb;
+        key.ib = call.rs.ib;
+        key.fvf = call.rs.fvf;
+        key.baseIndex = call.rs.baseIndex;
+        key.vertCount = call.rs.vertCount;
+        key.startIndex = call.rs.startIndex;
+        key.primCount = call.rs.primCount;
+
+        auto it = prevLookup.find(key);
+        if (it == prevLookup.end()) {
+            call.dirtyFlags = DIRTY_ALL;
+            continue;
+        }
+
+        auto& prev = previousFrameCalls[it->second];
+        DWORD flags = DIRTY_NONE;
+
+        // Compare world transform (object moved?)
+        if (memcmp(&call.rs.worldTransforms[0], &prev.rs.worldTransforms[0], sizeof(D3DXMATRIX)) != 0) {
+            flags |= DIRTY_TRANSFORM;
+        }
+
+        // Compare light state (pointer comparison — shared_ptr reuse)
+        if (call.lightrs.get() != prev.lightrs.get()) {
+            flags |= DIRTY_LIGHT;
+        }
+
+        // Compare material
+        if (memcmp(&call.frs.material, &prev.frs.material, sizeof(FragmentState::Material)) != 0) {
+            flags |= DIRTY_MATERIAL;
+        }
+
+        // Compare shader key
+        if (!(call.sk == prev.sk)) {
+            flags |= DIRTY_SHADER;
+        }
+
+        // Compare blend state
+        if (call.rs.blendEnable != prev.rs.blendEnable ||
+            call.rs.srcBlend != prev.rs.srcBlend ||
+            call.rs.destBlend != prev.rs.destBlend) {
+            flags |= DIRTY_BLEND;
+        }
+
+        // Compare base texture
+        if (call.rs.texture != prev.rs.texture) {
+            flags |= DIRTY_TEXTURE;
+        }
+
+        call.dirtyFlags = flags;
+    }
+}
+
 // Phase 2b: Prepare shader keys — runs after recording completes, before replay.
 // BBox computation and occluder rasterization already done in prepareOcclusionCullingForDepth (Phase 2a).
 void FixedFunctionShader::prepareRecordedCalls() {
@@ -3580,6 +3666,11 @@ void FixedFunctionShader::prepareRecordedCalls() {
             call.prepared = true;
         }
     }
+
+    // Performance mode: match against previous frame for dirty tracking
+    if (ImGuiManager::GetPerformanceMode()) {
+        matchPreviousFrameCalls();
+    }
 }
 
 void FixedFunctionShader::stopRecordingAndReplay() {
@@ -3588,6 +3679,25 @@ void FixedFunctionShader::stopRecordingAndReplay() {
     }
 
     isRecording = false;
+
+    // Capture device state NOW — this is Morrowind's last mesh state (correct end-of-Scene-0 state).
+    // We restore this after replay instead of preRecordingState (which was the FIRST mesh's state
+    // and could have different alpha test/blend settings that corrupt the sky).
+    SavedRenderStates postRecordingState;
+    device->GetRenderState(D3DRS_ALPHABLENDENABLE, &postRecordingState.alphaBlendEnable);
+    device->GetRenderState(D3DRS_ALPHATESTENABLE, &postRecordingState.alphaTestEnable);
+    device->GetRenderState(D3DRS_ZENABLE, &postRecordingState.zEnable);
+    device->GetRenderState(D3DRS_ZWRITEENABLE, &postRecordingState.zWriteEnable);
+    device->GetRenderState(D3DRS_CULLMODE, &postRecordingState.cullMode);
+    device->GetRenderState(D3DRS_SRCBLEND, &postRecordingState.srcBlend);
+    device->GetRenderState(D3DRS_DESTBLEND, &postRecordingState.destBlend);
+    device->GetRenderState(D3DRS_FOGENABLE, &postRecordingState.fogEnable);
+    device->GetRenderState(D3DRS_SPECULARENABLE, &postRecordingState.specularEnable);
+    device->GetRenderState(D3DRS_LOCALVIEWER, &postRecordingState.localViewer);
+    device->GetRenderState(D3DRS_NORMALIZENORMALS, &postRecordingState.normalizeNormals);
+    device->GetRenderState(D3DRS_ZFUNC, &postRecordingState.zFunc);
+    device->GetRenderState(D3DRS_ALPHAFUNC, &postRecordingState.alphaFunc);
+    device->GetRenderState(D3DRS_ALPHAREF, &postRecordingState.alphaRef);
 
     // Phase 2b: Prepare shader keys (bbox + occluders already done in prepareOcclusionCullingForDepth)
     prepareRecordedCalls();
@@ -3609,6 +3719,24 @@ void FixedFunctionShader::stopRecordingAndReplay() {
     }
     device->SetVertexShader(NULL);
     device->SetPixelShader(NULL);
+
+    // Restore Morrowind's end-of-Scene-0 state (last mesh state, not first mesh state).
+    // This undoes any state changes from replay/HLSL rendering, and also cleans up
+    // leaked state from previous frame's Scene 1+ immediate rendering.
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, postRecordingState.alphaBlendEnable);
+    device->SetRenderState(D3DRS_ALPHATESTENABLE, postRecordingState.alphaTestEnable);
+    device->SetRenderState(D3DRS_ZENABLE, postRecordingState.zEnable);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, postRecordingState.zWriteEnable);
+    device->SetRenderState(D3DRS_CULLMODE, postRecordingState.cullMode);
+    device->SetRenderState(D3DRS_SRCBLEND, postRecordingState.srcBlend);
+    device->SetRenderState(D3DRS_DESTBLEND, postRecordingState.destBlend);
+    device->SetRenderState(D3DRS_FOGENABLE, postRecordingState.fogEnable);
+    device->SetRenderState(D3DRS_SPECULARENABLE, postRecordingState.specularEnable);
+    device->SetRenderState(D3DRS_LOCALVIEWER, postRecordingState.localViewer);
+    device->SetRenderState(D3DRS_NORMALIZENORMALS, postRecordingState.normalizeNormals);
+    device->SetRenderState(D3DRS_ZFUNC, postRecordingState.zFunc);
+    device->SetRenderState(D3DRS_ALPHAFUNC, postRecordingState.alphaFunc);
+    device->SetRenderState(D3DRS_ALPHAREF, postRecordingState.alphaRef);
 
     // Reset state to allow new recording sessions
     // Note: isRecording stays false until next startRecording() call
@@ -3971,14 +4099,32 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
                     tintedFrs.material.emissive.g = 0.4f;
                     tintedFrs.material.emissive.b = 0.0f;
                     tintedFrs.material.emissive.a = 1.0f;
-                    renderMorrowindHLSL_Internal(&call.rs, &tintedFrs, call.lightrs.get());
+                    renderMorrowindHLSL_Internal(&call.rs, &tintedFrs, call.lightrs.get(), DIRTY_ALL);
                     continue;
                 }
             }
 
             {
                 ZoneScopedN("replay_RenderCall");
-                renderMorrowindHLSL_Internal(&call.rs, &call.frs, call.lightrs.get());
+                // Restore Morrowind-recorded device state before each replay call
+                // During recording, Morrowind sets these between calls; during replay we must do it
+                // Debug mode: validate BEFORE pre-set to detect leaks from previous call
+                if (i > 0 && ImGuiManager::GetStateLeakDetection() && call.expectedState.captured) {
+                    validateDeviceState(call.expectedState, i);
+                }
+                if (call.expectedState.captured) {
+                    device->SetRenderState(D3DRS_ALPHABLENDENABLE, call.expectedState.alphaBlendEnable);
+                    device->SetRenderState(D3DRS_ALPHATESTENABLE, call.expectedState.alphaTestEnable);
+                    device->SetRenderState(D3DRS_ZENABLE, call.expectedState.zEnable);
+                    device->SetRenderState(D3DRS_ZWRITEENABLE, call.expectedState.zWriteEnable);
+                    device->SetRenderState(D3DRS_CULLMODE, call.expectedState.cullMode);
+                    device->SetRenderState(D3DRS_SRCBLEND, call.expectedState.srcBlend);
+                    device->SetRenderState(D3DRS_DESTBLEND, call.expectedState.destBlend);
+                    device->SetRenderState(D3DRS_FOGENABLE, call.expectedState.fogEnable);
+                    // Invalidate cache since we bypassed it with raw SetRenderState
+                    materialCache.reset();
+                }
+                renderMorrowindHLSL_Internal(&call.rs, &call.frs, call.lightrs.get(), call.dirtyFlags);
                 if (!firstDrawDone) {
                     ZoneScopedN("replay_FirstDrawDone");
                     firstDrawDone = true;
@@ -4208,10 +4354,55 @@ FixedFunctionShader::RecordedRenderedState::RecordedRenderedState(RecordedRender
 }
 
 // ------------------------------------
+// State Leak Detection
+
+void FixedFunctionShader::validateDeviceState(const ExpectedDeviceState& expected, int callIndex) {
+    if (!expected.captured) return;
+
+    auto checkState = [&](D3DRENDERSTATETYPE state, const char* name, DWORD expectedVal) {
+        DWORD actual;
+        device->GetRenderState(state, &actual);
+        if (actual != expectedVal) {
+            LOG::logline("[LEAK] %s = %d but expected %d (call #%d)", name, actual, expectedVal, callIndex);
+        }
+    };
+
+    // Skip render states covered by the pre-set (ALPHABLENDENABLE, ALPHATESTENABLE,
+    // ZENABLE, ZWRITEENABLE, FOGENABLE, CULLMODE, SRCBLEND, DESTBLEND).
+    // These are always restored before the next call, so leaks are benign.
+    // Only check states that would escape the replay loop unhandled.
+
+    // Check sampler states for stages 0-1
+    for (int s = 0; s < 2; ++s) {
+        DWORD addrU, addrV;
+        device->GetSamplerState(s, D3DSAMP_ADDRESSU, &addrU);
+        device->GetSamplerState(s, D3DSAMP_ADDRESSV, &addrV);
+        if (addrU != expected.samplerAddressU[s]) {
+            LOG::logline("[LEAK] Sampler%d ADDRESSU = %d but expected %d (call #%d)", s, addrU, expected.samplerAddressU[s], callIndex);
+        }
+        if (addrV != expected.samplerAddressV[s]) {
+            LOG::logline("[LEAK] Sampler%d ADDRESSV = %d but expected %d (call #%d)", s, addrV, expected.samplerAddressV[s], callIndex);
+        }
+    }
+
+    // Check for texture leaks on unused stages (stages 2-7 should be clean)
+    for (int s = 2; s < 8; ++s) {
+        IDirect3DBaseTexture9* tex = nullptr;
+        device->GetTexture(s, &tex);
+        if (tex) {
+            tex->Release();
+            if (!expected.textures[s]) {
+                LOG::logline("[LEAK] Texture bound on stage %d but expected NULL (call #%d)", s, callIndex);
+            }
+        }
+    }
+}
+
+// ------------------------------------
 // FixedFunctionShader::HLSLRecordedCall
 
 FixedFunctionShader::HLSLRecordedCall::HLSLRecordedCall(const RenderedState* rs_, const FragmentState* frs_, std::shared_ptr<LightState> lightrs_, const ShaderKey& sk_, int recordMWIdx)
-    : rs(*rs_), frs(*frs_), lightrs(lightrs_), sk(sk_), hasBoundingBox(false), recordMWIndex(recordMWIdx), prepared(false) {
+    : rs(*rs_), frs(*frs_), lightrs(lightrs_), sk(sk_), hasBoundingBox(false), recordMWIndex(recordMWIdx), prepared(false), dirtyFlags(DIRTY_ALL) {
     // Lean recording: capture sampler states for stages 0-1 only (Morrowind-bound textures)
     // Stages 2+ are HLSL-specific textures bound by MGE XE with known sampler states
     for (int stage = 0; stage < 2; ++stage) {
@@ -4280,6 +4471,35 @@ FixedFunctionShader::HLSLRecordedCall::HLSLRecordedCall(const RenderedState* rs_
             hasBoundingBox = true;
         }
         // Cache miss: hasBoundingBox stays false, will be computed in prepareRecordedCalls()
+    }
+
+    // Always capture device state for replay pre-set (prevents state leaks between calls)
+    device->GetRenderState(D3DRS_ALPHABLENDENABLE, &expectedState.alphaBlendEnable);
+    device->GetRenderState(D3DRS_ALPHATESTENABLE, &expectedState.alphaTestEnable);
+    device->GetRenderState(D3DRS_ZENABLE, &expectedState.zEnable);
+    device->GetRenderState(D3DRS_ZWRITEENABLE, &expectedState.zWriteEnable);
+    device->GetRenderState(D3DRS_FOGENABLE, &expectedState.fogEnable);
+    device->GetRenderState(D3DRS_CULLMODE, &expectedState.cullMode);
+    device->GetRenderState(D3DRS_SRCBLEND, &expectedState.srcBlend);
+    device->GetRenderState(D3DRS_DESTBLEND, &expectedState.destBlend);
+    expectedState.captured = true;
+
+    // Debug-only: capture additional state for validation
+    if (ImGuiManager::GetStateLeakDetection()) {
+        DWORD dbias, sbias;
+        device->GetRenderState(D3DRS_DEPTHBIAS, &dbias);
+        device->GetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, &sbias);
+        expectedState.depthBias = *(float*)&dbias;
+        expectedState.slopeScaledDepthBias = *(float*)&sbias;
+        for (int s = 0; s < 2; ++s) {
+            device->GetSamplerState(s, D3DSAMP_ADDRESSU, &expectedState.samplerAddressU[s]);
+            device->GetSamplerState(s, D3DSAMP_ADDRESSV, &expectedState.samplerAddressV[s]);
+        }
+        for (int s = 0; s < 8; ++s) {
+            expectedState.textures[s] = nullptr;
+            device->GetTexture(s, &expectedState.textures[s]);
+            if (expectedState.textures[s]) expectedState.textures[s]->Release();
+        }
     }
 }
 

@@ -66,6 +66,10 @@ bool ImGuiManager::highlightOccluders = false;
 // Rasterize All mode - bypass all heuristics
 bool ImGuiManager::rasterizeAll = false;
 
+// Debug/Performance mode toggles
+bool ImGuiManager::stateLeakDetection = false;
+bool ImGuiManager::performanceMode = true;
+
 // Hi-Z single object visualization mode
 bool ImGuiManager::hiZSingleObjectMode = false;
 int ImGuiManager::hiZSingleObjectIndex = 0;
@@ -314,6 +318,13 @@ void ImGuiManager::RenderDebugInterface() {
         ImGui::Checkbox("Enable Immediate Rendering (Scene 1+)", &enableImmediateRendering);
         ImGui::Checkbox("Enable Depth Pass (recordMW)", &enableDepthPass);
         ImGui::Checkbox("Enable Light Processing", &enableLightProcessing);
+
+        ImGui::Separator();
+        ImGui::Text("Optimization Modes");
+        ImGui::Checkbox("Performance Mode (Dirty Tracking)", &performanceMode);
+        ImGui::SetItemTooltip("Skip redundant GPU state updates for unchanged meshes between frames");
+        ImGui::Checkbox("State Leak Detection (Heavy)", &stateLeakDetection);
+        ImGui::SetItemTooltip("Query device state before each draw to detect state leaks. Very slow!");
 
         ImGui::Separator();
         ImGui::Text("Statistics");

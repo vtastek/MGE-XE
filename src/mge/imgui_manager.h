@@ -74,6 +74,10 @@ public:
     // Rasterize All mode - bypass all heuristics, rasterize everything
     static bool GetRasterizeAll() { return rasterizeAll; }
 
+    // Debug/Performance mode toggles
+    static bool GetStateLeakDetection() { return stateLeakDetection; }
+    static bool GetPerformanceMode() { return performanceMode; }
+
     // Hi-Z single object visualization mode (public for ffeshader access)
     static bool hiZSingleObjectMode;
     static int hiZSingleObjectIndex;
@@ -142,4 +146,8 @@ private:
 
     // Rasterize All mode - bypass all heuristics
     static bool rasterizeAll;             // Rasterize ALL objects to Hi-Z - default false
+
+    // Debug/Performance mode toggles
+    static bool stateLeakDetection;       // State leak detection debug mode - default false
+    static bool performanceMode;          // Dirty tracking performance mode - default true
 };
