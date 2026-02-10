@@ -16,14 +16,14 @@ float3 lightSceneAmbient;
 float3 lightSunDiffuse;
 float3 lightSunDirection;
 
-#ifndef NO_POINT_LIGHTS
-// Lighting - Point lights
-float4 lightDiffuse[8];  // Changed to float4 to match D3DXVECTOR4 from C++
-float3 lightPosition[8]; // Proper float3 positions
+// Point light uniforms (only compiled for LIGHT_MODE 1 or 2)
+#if defined(LIGHT_MODE) && LIGHT_MODE >= 1 && LIGHT_MODE <= 2
+float4 lightDiffuse[8];
+float3 lightPosition[8];
 float lightAmbient[8];
 float lightFalloffQuadratic[8];
 float lightFalloffConstant;
-int pointLightCount; // Number of real point lights
+int pointLightCount;
 #endif
 #endif
 
@@ -275,21 +275,40 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 	//deb = shadowpara;
 
 	float neglight = 0.0;
-	#ifndef NO_POINT_LIGHTS
-	// Texture-based point light system (replaces old per-light arrays)
-	#ifdef USE_TEXTURE_LIGHTS
-		// Use PBR version matching legacy path exactly
-		PointLightResult pointLightResult = evaluatePointLightsPBR(input.viewPos, Norm, V, texColor.rgb, metalness, roughness, radius, F0);
 
-		diffuseLight += pointLightResult.diffuse;
+	// Point light evaluation — 4-way switch on LIGHT_MODE
+	#if defined(LIGHT_MODE) && LIGHT_MODE == 1
+	// Mode 1: Single point light — unrolled, no loop
+	{
+		float3 L = lightPosition[0] - input.viewPos;
+		float dist = length(L);
+		L = L / dist;
 
-		#if defined(HAS_PARAMH) || defined(HAS_NORMAL)
-		specularLight += pointLightResult.specular;
+		float falloff = 40 * lightFalloffQuadratic[0] * dist * dist + lightFalloffConstant;
+		float t = saturate(dist / 350.0);
+		float cutoff = 1.0 - t * t * t * t;
+		float attenuation = (falloff > 0.0) ? (1.0 / falloff) * cutoff : 0.0;
+		LightResult pointLR = BRDF(Norm, V, L, texColor.rgb, metalness, roughness, roughness, radius, F0, 0, 1.0);
+		float dotpoint = dot(Norm, L);
+		float NdotL_point = max(dotpoint, 0.0);
+
+		#ifdef HAS_GRASS
+			lambert = dotpoint * -sign(dot(V, Norm));
+			lambert = pow(saturate((lambert + w) / (1.0f + w)), n) * (n + 1) / (2 * (1 + w)) + max(0.0, -1.0 * lambert) * GRASS_BACKLIGHTING_COEFF;
+			lambert = max(0.0, lambert);
+			NdotL_point = 3.14 * lambert;
 		#endif
 
-		neglight = pointLightResult.neglight;
-	#else
-	// Legacy point light system (old arrays-based lighting)
+		float3 pointIntensity = 10 * INTENSITY * pow(max(0.0, lightDiffuse[0].rgb) + EPS, 2.2) * NdotL_point * attenuation;
+		diffuseLight += pointLR.diffuse * pointIntensity;
+
+		#if defined(HAS_PARAMH) || defined(HAS_NORMAL)
+		specularLight += pointLR.specular * pointIntensity;
+		#endif
+		neglight -= max(0.0, -lightDiffuse[0].r) * 1 / pow(falloff, 1 / 3.2);
+	}
+	#elif defined(LIGHT_MODE) && LIGHT_MODE == 2
+	// Mode 2: Few point lights — loop up to pointLightCount (max 8)
 	for (int i = 0; i < pointLightCount; i++)
 	{
 		float3 L = lightPosition[i] - input.viewPos;
@@ -305,32 +324,34 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 		float NdotL_point = max(dotpoint, 0.0);
 
 		#ifdef HAS_GRASS
-			// Apply grass-specific wrap lighting for two-sided grass rendering
-		    // if (input.color.r > 0.5) {
-
 			lambert = dotpoint * -sign(dot(V, Norm));
 			lambert = pow(saturate((lambert + w) / (1.0f + w)), n) * (n + 1) / (2 * (1 + w)) + max(0.0, -1.0 * lambert) * GRASS_BACKLIGHTING_COEFF;
 			lambert = max(0.0, lambert);
 			NdotL_point = 3.14 * lambert;
-			//deb = NdotL_point;
-
-			// }
 		#endif
 
 		float3 pointIntensity = 10 * INTENSITY * pow(max(0.0, lightDiffuse[i].rgb) + EPS, 2.2) * NdotL_point * attenuation;
-		diffuseLight +=  pointLR.diffuse * pointIntensity;
+		diffuseLight += pointLR.diffuse * pointIntensity;
 
 		#if defined(HAS_PARAMH) || defined(HAS_NORMAL)
 		specularLight += pointLR.specular * pointIntensity;
-		#else
-		specularLight += 0;
 		#endif
 		neglight -= max(0.0, -lightDiffuse[i].r) * 1 / pow(falloff, 1 / 3.2);
-
-		//deb += attenuation;
 	}
-	#endif // USE_TEXTURE_LIGHTS
-	#endif // NO_POINT_LIGHTS
+	#elif defined(LIGHT_MODE) && LIGHT_MODE == 3
+	// Mode 3: Texture-based point light system (>8 lights, rare)
+	{
+		PointLightResult pointLightResult = evaluatePointLightsPBR(input.viewPos, Norm, V, texColor.rgb, metalness, roughness, radius, F0);
+		diffuseLight += pointLightResult.diffuse;
+
+		#if defined(HAS_PARAMH) || defined(HAS_NORMAL)
+		specularLight += pointLightResult.specular;
+		#endif
+
+		neglight = pointLightResult.neglight;
+	}
+	#endif
+	// LIGHT_MODE==0 or undefined: no point light code
 
 	neglight = max(0.0, 1 - 0.95 * saturate(-neglight));
 	diffuseLight *= neglight;

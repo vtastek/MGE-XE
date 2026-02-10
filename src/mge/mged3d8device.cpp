@@ -278,6 +278,22 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         }
     }
 
+    // Log render pass break instrumentation
+    {
+        static int frameCounter = 0;
+        if (++frameCounter <= 60 || frameCounter % 300 == 0) {
+            LOG::logline("DXVK passes: raw[RT=%d DS=%d Clear=%d Stretch=%d] cat[MW_Clear=%d depth=%d shadow=%d water=%d post=%d stretch=%d other=%d =%d]",
+                g_passBreaks.raw_setRT, g_passBreaks.raw_setDS,
+                g_passBreaks.raw_clear, g_passBreaks.raw_stretchRect,
+                g_passBreaks.mw_clear,
+                g_passBreaks.mge_depthRT, g_passBreaks.mge_shadowRT,
+                g_passBreaks.mge_waterRT, g_passBreaks.mge_postRT,
+                g_passBreaks.mge_stretchRect, g_passBreaks.mge_otherRT,
+                g_passBreaks.categorized());
+        }
+        g_passBreaks.reset();
+    }
+
     {
         ZoneScopedN("Present_ResetState");
         // Reset scene identifiers
@@ -311,6 +327,8 @@ HRESULT _stdcall MGEProxyDevice::SetRenderTarget(IDirect3DSurface8* a, IDirect3D
         back->Release();
     }
 
+    g_passBreaks.raw_setRT++;
+    g_passBreaks.raw_setDS++;
     return ProxyDevice::SetRenderTarget(a, b);
 }
 
@@ -430,6 +448,8 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
 // Clear - Occurs at start of frame, and also a z-clear before rendering 1st person and sunglare
 // Skybox mesh doesn't extend over whole background; cleared background colour is visible at horizon
 HRESULT _stdcall MGEProxyDevice::Clear(DWORD a, const D3DRECT* b, DWORD c, D3DCOLOR d, float e, DWORD f) {
+    g_passBreaks.mw_clear++;
+    g_passBreaks.raw_clear++;
     DistantLand::setHorizonColour(d);
     return ProxyDevice::Clear(a, b, c, d, e, f);
 }
@@ -552,6 +572,12 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
 
     // Allow distant land to inspect draw calls
     bool isShadowStencil = isStencilScene && stencilRef <= 1;
+
+    // Skip stencil shadow rendering entirely in HLSL mode (HLSL has its own shadows)
+    if (isShadowStencil && Configuration.PerPixelLightFlags == 2) {
+        return D3D_OK;
+    }
+
     if (DistantLand::ready && rendertargetNormal && isMainView && !isShadowStencil) {
         rs.primType = a;
         rs.baseIndex = baseVertexIndex;

@@ -23,9 +23,9 @@ void DistantLand::renderDepth() {
         loggedOnce = true;
     }
 
-    // Switch to render target
-    RenderTargetSwitcher rtsw(surfDepthFrameMSAA, surfDepthDepth);
+    // RT is set by caller (renderStage1) to avoid redundant switches
     device->Clear(0, 0, D3DCLEAR_ZBUFFER, 0, 1.0, 0);
+    g_passBreaks.raw_clear++;
 
     // Unbind depth sampler
     effect->SetTexture(ehTex3, NULL);
@@ -58,8 +58,7 @@ void DistantLand::renderDepth() {
 void DistantLand::renderDepthDistantLand() {
     auto mwBridge = MWBridge::get();
 
-    // Switch to render target (already set from previous pass, but be explicit)
-    RenderTargetSwitcher rtsw(surfDepthFrameMSAA, surfDepthDepth);
+    // RT is set by caller (renderStage1) to avoid redundant switches
 
     // Projection for distant land
     D3DXMATRIX mwDepthProj = mwProj;

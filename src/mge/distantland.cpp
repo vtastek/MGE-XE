@@ -15,6 +15,8 @@
 using std::string;
 using std::unordered_map;
 
+PassBreakCounters g_passBreaks;
+
 // renderStage0 - Render distant land at beginning of scene 0, after sky
 void DistantLand::renderStage0() {
     ZoneScopedN("DL_RenderStage0");
@@ -61,6 +63,7 @@ void DistantLand::renderStage0() {
                 if (mwBridge->CellHasWeather() && !mwBridge->IsMenu()) {
                     effectShadow->Begin(&passes, D3DXFX_DONOTSAVESTATE);
                     renderShadowMap();
+                    g_passBreaks.mge_shadowRT += 2; // RenderTargetSwitcher in renderShadowMap
                     effectShadow->End();
                 }
             }
@@ -106,11 +109,13 @@ void DistantLand::renderStage0() {
             // Update reflection
             if (mwBridge->CellHasWater()) {
                 renderWaterReflection(&mwView, &distProj);
+                g_passBreaks.mge_waterRT += 2; // RenderTargetSwitcher in renderWaterReflection
             }
 
             // Update water simulation
             if (Configuration.MGEFlags & DYNAMIC_RIPPLES) {
                 simulateDynamicWaves();
+                g_passBreaks.mge_waterRT += 4; // 2 RenderTargetSwitchers in simulateDynamicWaves
             }
 
             effect->End();
@@ -122,10 +127,12 @@ void DistantLand::renderStage0() {
             // Save distant land only frame to texture
             if (~Configuration.MGEFlags & NO_MW_MGE_BLEND) {
                 texDistantBlend = PostShaders::borrowBuffer(1);
+                g_passBreaks.mge_stretchRect++; // borrowBuffer does StretchRect
             }
 
             // Restore render state
             stateSaved->Apply();
+    
             stateSaved->Release();
         } else {
             // Clear water reflection to avoid seeing previous cell environment reflected
@@ -143,6 +150,7 @@ void DistantLand::renderStage0() {
 
                 // Restore render state
                 stateSaved->Apply();
+        
                 stateSaved->Release();
             }
         }
@@ -198,41 +206,55 @@ void DistantLand::renderStage1() {
         // This filters recordMW from ~2800 → ~100 objects BEFORE renderDepth() executes
         FixedFunctionShader::prepareOcclusionCullingForDepth();
 
-        // Depth texture from recorded renders (Scene 0)
-        effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
-        if (ImGuiManager::GetEnableDepthPass()) {
-            renderDepth();
-        }
-        effectDepth->End();
+        // Single RT switch for all depth rendering (renderDepth + StretchRect + renderDepthDistantLand + MSAA resolve)
+        {
+            RenderTargetSwitcher rtsw(surfDepthFrameMSAA, surfDepthDepth);
+            g_passBreaks.mge_depthRT += 2; // Single RenderTargetSwitcher in+out for entire depth section
 
-        // Copy recordMW to Hi-Z for culling (before distant land adds to depth)
-        if (texCullDepth) {
-            IDirect3DSurface9* cullDepthSurface;
-            texCullDepth->GetSurfaceLevel(0, &cullDepthSurface);
-            HRESULT hr = device->StretchRect(surfDepthFrameMSAA, NULL, cullDepthSurface, NULL, D3DTEXF_NONE);
-            if (FAILED(hr)) {
-                static bool logged = false;
-                if (!logged) {
-                    LOG::logline("!! Failed to copy depth to texCullDepth (hr=0x%x)", hr);
-                    logged = true;
-                }
+            // Depth texture from recorded renders (Scene 0)
+            effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
+            if (ImGuiManager::GetEnableDepthPass()) {
+                renderDepth();
             }
-            cullDepthSurface->Release();
-        }
+            effectDepth->End();
 
-        // Continue depth with distant land
-        effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
-        if (ImGuiManager::GetEnableDepthPass()) {
-            renderDepthDistantLand();
-        }
-        effectDepth->End();
+            // Copy recordMW to Hi-Z for culling (before distant land adds to depth)
+            // Disabled: Hi-Z generation is disabled, so this StretchRect is wasted
+            // Re-enable when generateHiZMipsGPU() is active
+            /*if (texCullDepth) {
+                IDirect3DSurface9* cullDepthSurface;
+                texCullDepth->GetSurfaceLevel(0, &cullDepthSurface);
+                HRESULT hr = device->StretchRect(surfDepthFrameMSAA, NULL, cullDepthSurface, NULL, D3DTEXF_NONE);
+                g_passBreaks.mge_stretchRect++;
+                g_passBreaks.raw_stretchRect++;
+                if (FAILED(hr)) {
+                    static bool logged = false;
+                    if (!logged) {
+                        LOG::logline("!! Failed to copy depth to texCullDepth (hr=0x%x)", hr);
+                        logged = true;
+                    }
+                }
+                cullDepthSurface->Release();
+            }*/
 
-        // Phase A: Resolve MSAA depth frame to non-MSAA texture for post-processing
-        if (Configuration.AALevel > 0) {
-            IDirect3DSurface9* texDepthFrameSurface;
-            texDepthFrame->GetSurfaceLevel(0, &texDepthFrameSurface);
-            device->StretchRect(surfDepthFrameMSAA, NULL, texDepthFrameSurface, NULL, D3DTEXF_NONE);
-            texDepthFrameSurface->Release();
+            // Continue depth with distant land (skip for interiors - no distant geometry)
+            if (isDistantCell()) {
+                effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
+                if (ImGuiManager::GetEnableDepthPass()) {
+                    renderDepthDistantLand();
+                }
+                effectDepth->End();
+            }
+
+            // Phase A: Resolve MSAA depth frame to non-MSAA texture for post-processing
+            if (Configuration.AALevel > 0) {
+                IDirect3DSurface9* texDepthFrameSurface;
+                texDepthFrame->GetSurfaceLevel(0, &texDepthFrameSurface);
+                device->StretchRect(surfDepthFrameMSAA, NULL, texDepthFrameSurface, NULL, D3DTEXF_NONE);
+                g_passBreaks.mge_stretchRect++;
+                g_passBreaks.raw_stretchRect++;
+                texDepthFrameSurface->Release();
+            }
         }
 
         // Hi-Z generation DISABLED (culling disabled for baseline testing)
@@ -241,6 +263,7 @@ void DistantLand::renderStage1() {
 
         // Restore render state
         stateSaved->Apply();
+
         stateSaved->Release();
     }
 
@@ -279,11 +302,13 @@ void DistantLand::renderStage2() {
         effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
         if (ImGuiManager::GetEnableDepthPass()) {
             renderDepthAdditional();
+            g_passBreaks.mge_depthRT += 2; // RenderTargetSwitcher in+out
         }
         effectDepth->End();
 
         // Restore state
         stateSaved->Apply();
+
         stateSaved->Release();
 
         // Clear recordMW for next scene's depth pass
@@ -374,6 +399,7 @@ void DistantLand::renderStageWater() {
 
         effect->End();
         stateSaved->Apply();
+
         stateSaved->Release();
     }
 }
@@ -685,6 +711,7 @@ void DistantLand::postProcess() {
 
         // Restore state
         stateSaved->Apply();
+
         stateSaved->Release();
     } else {
         // Blit cached frame to screen
@@ -1126,11 +1153,15 @@ void RenderTargetSwitcher::init(IDirect3DSurface9* target, IDirect3DSurface9* ta
 
     DistantLand::device->SetRenderTarget(0, target);
     DistantLand::device->SetDepthStencilSurface(targetDepthStencil);
+    g_passBreaks.raw_setRT++;
+    g_passBreaks.raw_setDS++;
 }
 
 RenderTargetSwitcher::~RenderTargetSwitcher() {
     DistantLand::device->SetRenderTarget(0, savedTarget);
     DistantLand::device->SetDepthStencilSurface(savedDepthStencil);
+    g_passBreaks.raw_setRT++;
+    g_passBreaks.raw_setDS++;
 
     if (savedTarget) {
         savedTarget->Release();

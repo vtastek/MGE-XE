@@ -307,6 +307,29 @@ public:
     static IDirect3DSurface9* captureScreenshot();
 };
 
+// Instrumentation for DXVK render pass break tracking
+struct PassBreakCounters {
+    // Categorized MGE counters
+    int mw_clear;           // Morrowind Clear calls (via proxy)
+    int mge_depthRT;        // MGE depth pass RT switches
+    int mge_shadowRT;       // MGE shadow map RT switches
+    int mge_waterRT;        // MGE water reflection RT switches
+    int mge_postRT;         // MGE post-process RT/DS switches
+    int mge_stretchRect;    // MGE StretchRect calls
+    int mge_otherRT;        // MGE other RT switches (sky, blend, etc.)
+
+    // Raw totals from ALL device calls (MGE + Morrowind)
+    int raw_setRT;          // All SetRenderTarget calls
+    int raw_setDS;          // All SetDepthStencilSurface calls
+    int raw_clear;          // All Clear calls
+    int raw_stretchRect;    // All StretchRect calls
+
+    void reset() { memset(this, 0, sizeof(*this)); }
+    int categorized() const { return mw_clear + mge_depthRT + mge_shadowRT + mge_waterRT + mge_postRT + mge_stretchRect + mge_otherRT; }
+};
+
+extern PassBreakCounters g_passBreaks;
+
 class RenderTargetSwitcher {
     IDirect3DSurface9* savedTarget, *savedDepthStencil;
     void init(IDirect3DSurface9* target, IDirect3DSurface9* targetDepthStencil);

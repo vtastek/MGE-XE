@@ -107,7 +107,7 @@ class FixedFunctionShader {
         DWORD vertexColour : 1;
         DWORD heavyLighting : 1;
         DWORD useLighting : 1;
-        DWORD noPointLights : 1;
+        DWORD lightMode : 2;  // 0=sun only, 1=single point, 2=few (loop up to 8), 3=texture (>8)
         DWORD vertexMaterial : 2;
         DWORD fogMode : 2;
         DWORD activeStages : 3;
@@ -180,6 +180,7 @@ class FixedFunctionShader {
         D3DXHANDLE hWorldViewProj;
         D3DXHANDLE hView;
         D3DXHANDLE hProj;
+        UINT projRegister;  // Cached register index for direct SetVertexShaderConstantF fallback
         D3DXHANDLE hWorld;
         D3DXHANDLE hWorldView;
         D3DXHANDLE hVertexBlendPalette;
@@ -197,6 +198,10 @@ class FixedFunctionShader {
         D3DXHANDLE hLightSceneAmbient;
         D3DXHANDLE hShadowRcpRes;
         D3DXHANDLE hPCFFilterSize;
+
+        // Cached point light constant handles (per-object uniform path, lightMode 1-2)
+        D3DXHANDLE hLightDiffuse, hLightPosition, hLightAmbient;
+        D3DXHANDLE hPointLightCount, hLightFalloffQuadratic, hLightFalloffConstant;
 
         // Suffix texture support
         IDirect3DTexture9* diffparamTexture;
@@ -353,6 +358,15 @@ class FixedFunctionShader {
     // Original detail texture storage for frequency optimization
     static IDirect3DBaseTexture9* savedOriginalDetailTexture;
 
+    // Per-object light packing for mode 3 (saturated Morrowind assignment)
+    struct PerObjectLightInfo {
+        int texelOffset;   // starting texel index in packed texture
+        int lightCount;    // number of nearby lights for this object
+    };
+    static std::vector<PerObjectLightInfo> perObjectLightInfo;
+    static float perObjectTexelSize;  // 1/totalTexels, computed once per frame
+    static IDirect3DTexture9* texPerObjectLightData;  // Per-object packed light texture
+
 
     // Async compilation system
     struct AsyncShaderRequest {
@@ -373,7 +387,7 @@ class FixedFunctionShader {
     // Vertex shader caching (vertex shaders don't use texture suffix defines)
     struct VertexShaderKey {
         DWORD useLighting : 1;
-        DWORD noPointLights : 1;
+        DWORD lightMode : 2;  // matches ShaderKey::lightMode
         DWORD usesSkinning : 1;
         DWORD vertexColour : 1;
         
@@ -546,7 +560,7 @@ class FixedFunctionShader {
     static void prepareRecordedCalls();
     static void recordRenderCall(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, const ShaderKey& sk, int recordMWIdx = -1);
     static void replayRecordedCalls(int sceneCount);
-    static void renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, DWORD dirtyFlags = DIRTY_ALL);
+    static void renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, DWORD dirtyFlags = DIRTY_ALL, int callIndex = -1);
     static void validateDeviceState(const ExpectedDeviceState& expected, int callIndex);
     static void matchPreviousFrameCalls();
     static ShaderKey computeShaderKeyWithSuffixes(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);

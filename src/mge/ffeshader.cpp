@@ -16,6 +16,7 @@
 #include <chrono>
 #include <atomic>
 #include <cstring>
+#include <climits>
 #include <unordered_map>
 #include <random>
 
@@ -117,6 +118,11 @@ IDirect3DTexture9* FixedFunctionShader::defaultNormalTexture = nullptr;
 
 // Original detail texture storage
 IDirect3DBaseTexture9* FixedFunctionShader::savedOriginalDetailTexture = nullptr;
+
+// Per-object light packing for mode 3
+std::vector<FixedFunctionShader::PerObjectLightInfo> FixedFunctionShader::perObjectLightInfo;
+float FixedFunctionShader::perObjectTexelSize = 0.0f;
+IDirect3DTexture9* FixedFunctionShader::texPerObjectLightData = nullptr;
 
 std::unordered_map<std::string, FixedFunctionShader::CachedShaderSource> FixedFunctionShader::shaderSourceCache;
 bool FixedFunctionShader::needsCacheReset = false;
@@ -367,7 +373,12 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
     // Initialize HLSL pipeline if enabled (PerPixelLightFlags == 2 means HLSL)
     if (Configuration.PerPixelLightFlags == 2) {
         LOG::logline("-- Initializing HLSL compilation pipeline");
-        
+
+        // Disable Morrowind sunglare in HLSL mode (HLSL handles sun effects differently)
+        Configuration.MGEFlags |= NO_MW_SUNGLARE;
+        MWBridge::get()->disableSunglare();
+        LOG::logline("-- Morrowind sunglare disabled for HLSL mode");
+
         // Clear HLSL cache and LRU
         hlslShaderLRU.shader = {};
         hlslShaderLRU.last_sk = ShaderKey();
@@ -381,25 +392,31 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
         
         // Most basic variants needed for immediate rendering
         struct EssentialVariant {
-            int lighting; int noPointLights; int vertexCol; int skinning;
+            int lighting; int lightMode; int vertexCol; int skinning;
             int hasDiffParam; int hasParamH; int hasParamX; int fogMode; int stages;
         };
-        
+
         EssentialVariant essentials[] = {
             // Unlit base case
-            {0, 1, 0, 0, 0, 0, 0, 1, 1},
+            {0, 0, 0, 0, 0, 0, 0, 1, 1},
             // Basic lit case (sun only, no vertex color, no skinning)
-            {1, 1, 0, 0, 0, 0, 0, 1, 1},
+            {1, 0, 0, 0, 0, 0, 0, 1, 1},
             // Basic lit with vertex color
+            {1, 0, 1, 0, 0, 0, 0, 1, 1},
+            // Lit with single point light
+            {1, 1, 0, 0, 0, 0, 0, 1, 1},
             {1, 1, 1, 0, 0, 0, 0, 1, 1},
+            // Lit with few point lights (loop)
+            {1, 2, 0, 0, 0, 0, 0, 1, 1},
+            {1, 2, 1, 0, 0, 0, 0, 1, 1},
         };
-        
+
         for (const auto& variant : essentials) {
             ShaderKey sk;
             memset(&sk, 0, sizeof(sk));
             sk.uvSets = 1;
             sk.useLighting = variant.lighting;
-            sk.noPointLights = variant.noPointLights;
+            sk.lightMode = variant.lightMode;
             sk.vertexColour = variant.vertexCol;
             sk.vertexMaterial = variant.vertexCol + 1;
             sk.usesSkinning = variant.skinning;
@@ -409,12 +426,12 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
             sk.fogMode = variant.fogMode;
             sk.activeStages = variant.stages;
             sk.hasShadows = ((Configuration.MGEFlags & USE_SHADOWS) && (Configuration.MGEFlags & USE_DISTANT_LAND)) ? 1 : 0;
-            
+
             HLSLShader shader = generateMWShaderHLSL(sk);
             if (shader.vertexShader && shader.pixelShader) {
                 cacheHLSLShaders[sk] = shader;
-                LOG::logline("-- Essential HLSL shader compiled: lighting=%d noPointLights=%d vertexCol=%d",
-                            variant.lighting, variant.noPointLights, variant.vertexCol);
+                LOG::logline("-- Essential HLSL shader compiled: lighting=%d lightMode=%d vertexCol=%d",
+                            variant.lighting, variant.lightMode, variant.vertexCol);
             }
         }
         
@@ -478,9 +495,10 @@ void FixedFunctionShader::startEarlyPrecache(IDirect3DDevice* d) {
                 };
                 
                 // Same essential variants as in the main precaching
+                // format: {lighting, lightMode, vertexCol, skinning, hasDiffParam, hasParamH, hasParamX, fogMode, stages}
                 struct ShaderVariant {
                     int lighting;
-                    int noPointLights;
+                    int lightMode;
                     int vertexCol;
                     int skinning;
                     int hasDiffParam;
@@ -489,104 +507,108 @@ void FixedFunctionShader::startEarlyPrecache(IDirect3DDevice* d) {
                     int fogMode;
                     int stages;
                 };
-                
+
                 ShaderVariant variants[] = {
-                    // Basic unlit variants (2) - format: {lighting, noPointLights, vertexCol, skinning, hasDiffParam, hasParamH, hasParamX, fogMode, stages}
-                    {0, 1, 0, 0, 0, 0, 0, 1, 1}, {0, 1, 1, 0, 0, 0, 0, 1, 1},
+                    // Basic unlit variants (2)
+                    {0, 0, 0, 0, 0, 0, 0, 1, 1}, {0, 0, 1, 0, 0, 0, 0, 1, 1},
 
-                    // Basic lit variants - sun only (4)
-                    {1, 1, 0, 0, 0, 0, 0, 1, 1}, {1, 1, 1, 0, 0, 0, 0, 1, 1}, {1, 1, 0, 1, 0, 0, 0, 1, 1}, {1, 1, 1, 1, 0, 0, 0, 1, 1},
-
-                    // Lit with point lights (4)
+                    // Basic lit variants - sun only, lightMode=0 (4)
                     {1, 0, 0, 0, 0, 0, 0, 1, 1}, {1, 0, 1, 0, 0, 0, 0, 1, 1}, {1, 0, 0, 1, 0, 0, 0, 1, 1}, {1, 0, 1, 1, 0, 0, 0, 1, 1},
 
-                    // Diffparam variants - most important for terrain (8)
-                    {1, 1, 0, 0, 1, 0, 0, 1, 1}, {1, 1, 1, 0, 1, 0, 0, 1, 1}, {1, 0, 0, 0, 1, 0, 0, 1, 1}, {1, 0, 1, 0, 1, 0, 0, 1, 1},
-                    {1, 1, 0, 1, 1, 0, 0, 1, 1}, {1, 1, 1, 1, 1, 0, 0, 1, 1}, {1, 0, 0, 1, 1, 0, 0, 1, 1}, {1, 0, 1, 1, 1, 0, 0, 1, 1},
+                    // Lit with single point light, lightMode=1 (4)
+                    {1, 1, 0, 0, 0, 0, 0, 1, 1}, {1, 1, 1, 0, 0, 0, 0, 1, 1}, {1, 1, 0, 1, 0, 0, 0, 1, 1}, {1, 1, 1, 1, 0, 0, 0, 1, 1},
 
-                    // ParamH variants (8) - replaces normal map variants
-                    {1, 1, 0, 0, 0, 1, 0, 1, 1}, {1, 1, 1, 0, 0, 1, 0, 1, 1}, {1, 0, 0, 0, 0, 1, 0, 1, 1}, {1, 0, 1, 0, 0, 1, 0, 1, 1},
-                    {1, 1, 0, 1, 0, 1, 0, 1, 1}, {1, 1, 1, 1, 0, 1, 0, 1, 1}, {1, 0, 0, 1, 0, 1, 0, 1, 1}, {1, 0, 1, 1, 0, 1, 0, 1, 1},
+                    // Lit with few point lights, lightMode=2 (4)
+                    {1, 2, 0, 0, 0, 0, 0, 1, 1}, {1, 2, 1, 0, 0, 0, 0, 1, 1}, {1, 2, 0, 1, 0, 0, 0, 1, 1}, {1, 2, 1, 1, 0, 0, 0, 1, 1},
 
-                    // Diffparam + ParamH combinations (8)
-                    {1, 1, 0, 0, 1, 1, 0, 1, 1}, {1, 1, 1, 0, 1, 1, 0, 1, 1}, {1, 0, 0, 0, 1, 1, 0, 1, 1}, {1, 0, 1, 0, 1, 1, 0, 1, 1},
-                    {1, 1, 0, 1, 1, 1, 0, 1, 1}, {1, 1, 1, 1, 1, 1, 0, 1, 1}, {1, 0, 0, 1, 1, 1, 0, 1, 1}, {1, 0, 1, 1, 1, 1, 0, 1, 1},
+                    // Diffparam variants (12: lightMode 0,1,2 × vertCol 0/1)
+                    {1, 0, 0, 0, 1, 0, 0, 1, 1}, {1, 0, 1, 0, 1, 0, 0, 1, 1}, {1, 1, 0, 0, 1, 0, 0, 1, 1}, {1, 1, 1, 0, 1, 0, 0, 1, 1},
+                    {1, 2, 0, 0, 1, 0, 0, 1, 1}, {1, 2, 1, 0, 1, 0, 0, 1, 1},
+                    {1, 0, 0, 1, 1, 0, 0, 1, 1}, {1, 0, 1, 1, 1, 0, 0, 1, 1}, {1, 1, 0, 1, 1, 0, 0, 1, 1}, {1, 1, 1, 1, 1, 0, 0, 1, 1},
+                    {1, 2, 0, 1, 1, 0, 0, 1, 1}, {1, 2, 1, 1, 1, 0, 0, 1, 1},
 
-                    // ParamX variants (8) - replaces param variants
-                    {1, 1, 0, 0, 0, 0, 1, 1, 1}, {1, 1, 1, 0, 0, 0, 1, 1, 1}, {1, 0, 0, 0, 0, 0, 1, 1, 1}, {1, 0, 1, 0, 0, 0, 1, 1, 1},
-                    {1, 1, 0, 1, 0, 0, 1, 1, 1}, {1, 1, 1, 1, 0, 0, 1, 1, 1}, {1, 0, 0, 1, 0, 0, 1, 1, 1}, {1, 0, 1, 1, 0, 0, 1, 1, 1},
+                    // ParamH variants (12)
+                    {1, 0, 0, 0, 0, 1, 0, 1, 1}, {1, 0, 1, 0, 0, 1, 0, 1, 1}, {1, 1, 0, 0, 0, 1, 0, 1, 1}, {1, 1, 1, 0, 0, 1, 0, 1, 1},
+                    {1, 2, 0, 0, 0, 1, 0, 1, 1}, {1, 2, 1, 0, 0, 1, 0, 1, 1},
+                    {1, 0, 0, 1, 0, 1, 0, 1, 1}, {1, 0, 1, 1, 0, 1, 0, 1, 1}, {1, 1, 0, 1, 0, 1, 0, 1, 1}, {1, 1, 1, 1, 0, 1, 0, 1, 1},
+                    {1, 2, 0, 1, 0, 1, 0, 1, 1}, {1, 2, 1, 1, 0, 1, 0, 1, 1},
 
-                    // Full combination variants - diffparam + paramh + paramx (8)
-                    {1, 1, 0, 0, 1, 1, 1, 1, 1}, {1, 1, 1, 0, 1, 1, 1, 1, 1}, {1, 0, 0, 0, 1, 1, 1, 1, 1}, {1, 0, 1, 0, 1, 1, 1, 1, 1},
-                    {1, 1, 0, 1, 1, 1, 1, 1, 1}, {1, 1, 1, 1, 1, 1, 1, 1, 1}, {1, 0, 0, 1, 1, 1, 1, 1, 1}, {1, 0, 1, 1, 1, 1, 1, 1, 1},
-                    
-                    // Dual texture variants - basic (8)
-                    {1, 1, 0, 0, 0, 0, 0, 1, 2}, {1, 1, 1, 0, 0, 0, 0, 1, 2}, {1, 0, 0, 0, 0, 0, 0, 1, 2}, {1, 0, 1, 0, 0, 0, 0, 1, 2},
-                    {1, 1, 0, 1, 0, 0, 0, 1, 2}, {1, 1, 1, 1, 0, 0, 0, 1, 2}, {1, 0, 0, 1, 0, 0, 0, 1, 2}, {1, 0, 1, 1, 0, 0, 0, 1, 2},
-                    
-                    // Dual texture + diffparam (8) 
-                    {1, 1, 0, 0, 1, 0, 0, 1, 2}, {1, 1, 1, 0, 1, 0, 0, 1, 2}, {1, 0, 0, 0, 1, 0, 0, 1, 2}, {1, 0, 1, 0, 1, 0, 0, 1, 2},
-                    {1, 1, 0, 1, 1, 0, 0, 1, 2}, {1, 1, 1, 1, 1, 0, 0, 1, 2}, {1, 0, 0, 1, 1, 0, 0, 1, 2}, {1, 0, 1, 1, 1, 0, 0, 1, 2},
-                    
-                    // Dual texture + normal (8)
-                    {1, 1, 0, 0, 0, 1, 0, 1, 2}, {1, 1, 1, 0, 0, 1, 0, 1, 2}, {1, 0, 0, 0, 0, 1, 0, 1, 2}, {1, 0, 1, 0, 0, 1, 0, 1, 2},
-                    {1, 1, 0, 1, 0, 1, 0, 1, 2}, {1, 1, 1, 1, 0, 1, 0, 1, 2}, {1, 0, 0, 1, 0, 1, 0, 1, 2}, {1, 0, 1, 1, 0, 1, 0, 1, 2},
-                    
-                    // No fog variants (8)
-                    {1, 1, 0, 0, 0, 0, 0, 0, 1}, {1, 1, 1, 0, 0, 0, 0, 0, 1}, {1, 0, 0, 0, 0, 0, 0, 0, 1}, {1, 0, 1, 0, 0, 0, 0, 0, 1},
-                    {1, 1, 0, 0, 1, 0, 0, 0, 1}, {1, 1, 1, 0, 1, 0, 0, 0, 1}, {1, 0, 0, 0, 1, 0, 0, 0, 1}, {1, 0, 1, 0, 1, 0, 0, 0, 1},
-                    
-                    // Fog mode 2 variants (8)
-                    {1, 1, 0, 0, 0, 0, 0, 2, 1}, {1, 1, 1, 0, 0, 0, 0, 2, 1}, {1, 0, 0, 0, 0, 0, 0, 2, 1}, {1, 0, 1, 0, 0, 0, 0, 2, 1},
-                    {1, 1, 0, 0, 1, 0, 0, 2, 1}, {1, 1, 1, 0, 1, 0, 0, 2, 1}, {1, 0, 0, 0, 1, 0, 0, 2, 1}, {1, 0, 1, 0, 1, 0, 0, 2, 1},
-                    
-                    // Special cases - no fog, dual texture (8)
-                    {1, 1, 0, 0, 0, 0, 0, 0, 2}, {1, 1, 1, 0, 0, 0, 0, 0, 2}, {1, 0, 0, 0, 0, 0, 0, 0, 2}, {1, 0, 1, 0, 0, 0, 0, 0, 2},
-                    {1, 1, 0, 1, 0, 0, 0, 0, 2}, {1, 1, 1, 1, 0, 0, 0, 0, 2}, {1, 0, 0, 1, 0, 0, 0, 0, 2}, {1, 0, 1, 1, 0, 0, 0, 0, 2},
-                    
-                    // Fog mode 2, dual texture (8)
-                    {1, 1, 0, 0, 0, 0, 0, 2, 2}, {1, 1, 1, 0, 0, 0, 0, 2, 2}, {1, 0, 0, 0, 0, 0, 0, 2, 2}, {1, 0, 1, 0, 0, 0, 0, 2, 2},
-                    {1, 1, 0, 1, 0, 0, 0, 2, 2}, {1, 1, 1, 1, 0, 0, 0, 2, 2}, {1, 0, 0, 1, 0, 0, 0, 2, 2}, {1, 0, 1, 1, 0, 0, 0, 2, 2},
-                    
-                    // Additional edge cases for complete coverage (4)  
-                    {0, 1, 0, 1, 0, 0, 0, 1, 1}, {0, 1, 1, 1, 0, 0, 0, 1, 1}, {0, 0, 0, 0, 0, 0, 0, 1, 1}, {0, 0, 1, 0, 0, 0, 0, 1, 1},
-                    
-                    // CRITICAL FIX: Add the 8 universal base combinations that the fallback system expects
-                    // These are guaranteed to be cached and should always be available for fallback
-                    // Format: {lighting, noPointLights, vertexCol, skinning, hasDiffParam, hasNormal, hasParam, fogMode, stages}
-                    {1, 1, 0, 0, 0, 0, 0, 1, 1}, // lit, no points, no vertcol, no skinning, no suffixes
-                    {1, 1, 1, 0, 0, 0, 0, 1, 1}, // lit, no points, vertcol, no skinning, no suffixes  
-                    {1, 1, 0, 1, 0, 0, 0, 1, 1}, // lit, no points, no vertcol, skinning, no suffixes
-                    {1, 1, 1, 1, 0, 0, 0, 1, 1}, // lit, no points, vertcol, skinning, no suffixes
-                    {1, 0, 0, 0, 0, 0, 0, 1, 1}, // lit, points, no vertcol, no skinning, no suffixes
-                    {1, 0, 1, 0, 0, 0, 0, 1, 1}, // lit, points, vertcol, no skinning, no suffixes
-                    {1, 0, 0, 1, 0, 0, 0, 1, 1}, // lit, points, no vertcol, skinning, no suffixes
-                    {1, 0, 1, 1, 0, 0, 0, 1, 1}, // lit, points, vertcol, skinning, no suffixes
+                    // Diffparam + ParamH (12)
+                    {1, 0, 0, 0, 1, 1, 0, 1, 1}, {1, 0, 1, 0, 1, 1, 0, 1, 1}, {1, 1, 0, 0, 1, 1, 0, 1, 1}, {1, 1, 1, 0, 1, 1, 0, 1, 1},
+                    {1, 2, 0, 0, 1, 1, 0, 1, 1}, {1, 2, 1, 0, 1, 1, 0, 1, 1},
+                    {1, 0, 0, 1, 1, 1, 0, 1, 1}, {1, 0, 1, 1, 1, 1, 0, 1, 1}, {1, 1, 0, 1, 1, 1, 0, 1, 1}, {1, 1, 1, 1, 1, 1, 0, 1, 1},
+                    {1, 2, 0, 1, 1, 1, 0, 1, 1}, {1, 2, 1, 1, 1, 1, 0, 1, 1},
+
+                    // ParamX variants (6: lightMode 0,2 × vertCol 0/1 × skinning 0/1, skip 1 for brevity)
+                    {1, 0, 0, 0, 0, 0, 1, 1, 1}, {1, 0, 1, 0, 0, 0, 1, 1, 1}, {1, 2, 0, 0, 0, 0, 1, 1, 1}, {1, 2, 1, 0, 0, 0, 1, 1, 1},
+                    {1, 0, 0, 1, 0, 0, 1, 1, 1}, {1, 0, 1, 1, 0, 0, 1, 1, 1},
+
+                    // Full combination diffparam+paramh+paramx (6)
+                    {1, 0, 0, 0, 1, 1, 1, 1, 1}, {1, 0, 1, 0, 1, 1, 1, 1, 1}, {1, 2, 0, 0, 1, 1, 1, 1, 1}, {1, 2, 1, 0, 1, 1, 1, 1, 1},
+                    {1, 0, 0, 1, 1, 1, 1, 1, 1}, {1, 0, 1, 1, 1, 1, 1, 1, 1},
+
+                    // Dual texture variants (12: lightMode 0,1,2 × vertCol 0/1)
+                    {1, 0, 0, 0, 0, 0, 0, 1, 2}, {1, 0, 1, 0, 0, 0, 0, 1, 2}, {1, 1, 0, 0, 0, 0, 0, 1, 2}, {1, 1, 1, 0, 0, 0, 0, 1, 2},
+                    {1, 2, 0, 0, 0, 0, 0, 1, 2}, {1, 2, 1, 0, 0, 0, 0, 1, 2},
+                    {1, 0, 0, 1, 0, 0, 0, 1, 2}, {1, 0, 1, 1, 0, 0, 0, 1, 2}, {1, 1, 0, 1, 0, 0, 0, 1, 2}, {1, 1, 1, 1, 0, 0, 0, 1, 2},
+                    {1, 2, 0, 1, 0, 0, 0, 1, 2}, {1, 2, 1, 1, 0, 0, 0, 1, 2},
+
+                    // Dual texture + diffparam (6)
+                    {1, 0, 0, 0, 1, 0, 0, 1, 2}, {1, 0, 1, 0, 1, 0, 0, 1, 2}, {1, 2, 0, 0, 1, 0, 0, 1, 2}, {1, 2, 1, 0, 1, 0, 0, 1, 2},
+                    {1, 0, 0, 1, 1, 0, 0, 1, 2}, {1, 0, 1, 1, 1, 0, 0, 1, 2},
+
+                    // Dual texture + paramH (6)
+                    {1, 0, 0, 0, 0, 1, 0, 1, 2}, {1, 0, 1, 0, 0, 1, 0, 1, 2}, {1, 2, 0, 0, 0, 1, 0, 1, 2}, {1, 2, 1, 0, 0, 1, 0, 1, 2},
+                    {1, 0, 0, 1, 0, 1, 0, 1, 2}, {1, 0, 1, 1, 0, 1, 0, 1, 2},
+
+                    // No fog variants (6)
+                    {1, 0, 0, 0, 0, 0, 0, 0, 1}, {1, 0, 1, 0, 0, 0, 0, 0, 1}, {1, 2, 0, 0, 0, 0, 0, 0, 1}, {1, 2, 1, 0, 0, 0, 0, 0, 1},
+                    {1, 0, 0, 0, 1, 0, 0, 0, 1}, {1, 0, 1, 0, 1, 0, 0, 0, 1},
+
+                    // Fog mode 2 variants (6)
+                    {1, 0, 0, 0, 0, 0, 0, 2, 1}, {1, 0, 1, 0, 0, 0, 0, 2, 1}, {1, 2, 0, 0, 0, 0, 0, 2, 1}, {1, 2, 1, 0, 0, 0, 0, 2, 1},
+                    {1, 0, 0, 0, 1, 0, 0, 2, 1}, {1, 0, 1, 0, 1, 0, 0, 2, 1},
+
+                    // No fog + dual texture (6)
+                    {1, 0, 0, 0, 0, 0, 0, 0, 2}, {1, 0, 1, 0, 0, 0, 0, 0, 2}, {1, 2, 0, 0, 0, 0, 0, 0, 2}, {1, 2, 1, 0, 0, 0, 0, 0, 2},
+                    {1, 0, 0, 1, 0, 0, 0, 0, 2}, {1, 0, 1, 1, 0, 0, 0, 0, 2},
+
+                    // Fog mode 2 + dual texture (6)
+                    {1, 0, 0, 0, 0, 0, 0, 2, 2}, {1, 0, 1, 0, 0, 0, 0, 2, 2}, {1, 2, 0, 0, 0, 0, 0, 2, 2}, {1, 2, 1, 0, 0, 0, 0, 2, 2},
+                    {1, 0, 0, 1, 0, 0, 0, 2, 2}, {1, 0, 1, 1, 0, 0, 0, 2, 2},
+
+                    // Additional edge cases (4)
+                    {0, 0, 0, 1, 0, 0, 0, 1, 1}, {0, 0, 1, 1, 0, 0, 0, 1, 1}, {0, 0, 0, 0, 0, 0, 0, 1, 1}, {0, 0, 1, 0, 0, 0, 0, 1, 1},
+
+                    // Universal base combinations for fallback (lightMode 0,1,2 × vertCol × skinning)
+                    {1, 0, 0, 0, 0, 0, 0, 1, 1}, {1, 0, 1, 0, 0, 0, 0, 1, 1}, {1, 0, 0, 1, 0, 0, 0, 1, 1}, {1, 0, 1, 1, 0, 0, 0, 1, 1},
+                    {1, 1, 0, 0, 0, 0, 0, 1, 1}, {1, 1, 1, 0, 0, 0, 0, 1, 1}, {1, 1, 0, 1, 0, 0, 0, 1, 1}, {1, 1, 1, 1, 0, 0, 0, 1, 1},
+                    {1, 2, 0, 0, 0, 0, 0, 1, 1}, {1, 2, 1, 0, 0, 0, 0, 1, 1}, {1, 2, 0, 1, 0, 0, 0, 1, 1}, {1, 2, 1, 1, 0, 0, 0, 1, 1},
                 };
-                
+
                 const int totalVariants = sizeof(variants) / sizeof(variants[0]);
                 LOG::logline("-- Immediate precaching %d essential HLSL shader variants", totalVariants);
-                
+
                 for (int i = 0; i < totalVariants; i++) {
                     const auto& v = variants[i];
-                    
+
                     // Update progress every few variants
                     if (i % 5 == 0 || i == totalVariants - 1) {
                         updateStatus(i + 1, totalVariants);
                     }
-                    
+
                     ShaderKey sk;
                     memset(&sk, 0, sizeof(sk));
                     sk.uvSets = 1;
                     sk.useLighting = v.lighting;
-                    sk.noPointLights = v.noPointLights;
+                    sk.lightMode = v.lightMode;
                     sk.vertexColour = v.vertexCol;
                     sk.vertexMaterial = v.vertexCol + 1;
                     sk.usesSkinning = v.skinning;
                     sk.hasDiffParam = v.hasDiffParam;
                     sk.hasParamH = v.hasParamH;
                     sk.hasParamX = v.hasParamX;
-                    sk.hasGrass = 0; // Precache without grass specific variants
+                    sk.hasGrass = 0;
                     sk.fogMode = v.fogMode;
                     sk.activeStages = v.stages;
                     
@@ -634,9 +656,10 @@ void FixedFunctionShader::precacheAsync() {
             };
             
                 // Essential variants that cover most real-world cases
+                // format: {lighting, lightMode, vertexCol, skinning, hasDiffParam, hasParamH, hasParamX, fogMode, stages}
                 struct ShaderVariant {
                     int lighting;
-                    int noPointLights; 
+                    int lightMode;
                     int vertexCol;
                     int skinning;
                     int hasDiffParam;
@@ -645,103 +668,107 @@ void FixedFunctionShader::precacheAsync() {
                     int fogMode;
                     int stages;
                 };
-                
+
                 ShaderVariant variants[] = {
-                    // Same 108 variants as immediate precaching - keep both in sync
-                    // Basic unlit variants (2)
-                    {0, 1, 0, 0, 0, 0, 0, 1, 1}, {0, 1, 1, 0, 0, 0, 0, 1, 1},
-                    
-                    // Basic lit variants - sun only (4)
-                    {1, 1, 0, 0, 0, 0, 0, 1, 1}, {1, 1, 1, 0, 0, 0, 0, 1, 1}, {1, 1, 0, 1, 0, 0, 0, 1, 1}, {1, 1, 1, 1, 0, 0, 0, 1, 1},
-                    
-                    // Lit with point lights (4)
+                    // Keep in sync with immediate precaching table above
+                    // Basic unlit (2)
+                    {0, 0, 0, 0, 0, 0, 0, 1, 1}, {0, 0, 1, 0, 0, 0, 0, 1, 1},
+
+                    // Sun only lightMode=0 (4)
                     {1, 0, 0, 0, 0, 0, 0, 1, 1}, {1, 0, 1, 0, 0, 0, 0, 1, 1}, {1, 0, 0, 1, 0, 0, 0, 1, 1}, {1, 0, 1, 1, 0, 0, 0, 1, 1},
-                    
-                    // Diffparam variants - most important for terrain (8)
-                    {1, 1, 0, 0, 1, 0, 0, 1, 1}, {1, 1, 1, 0, 1, 0, 0, 1, 1}, {1, 0, 0, 0, 1, 0, 0, 1, 1}, {1, 0, 1, 0, 1, 0, 0, 1, 1},
-                    {1, 1, 0, 1, 1, 0, 0, 1, 1}, {1, 1, 1, 1, 1, 0, 0, 1, 1}, {1, 0, 0, 1, 1, 0, 0, 1, 1}, {1, 0, 1, 1, 1, 0, 0, 1, 1},
-                    
-                    // Normal map variants (8)
-                    {1, 1, 0, 0, 0, 1, 0, 1, 1}, {1, 1, 1, 0, 0, 1, 0, 1, 1}, {1, 0, 0, 0, 0, 1, 0, 1, 1}, {1, 0, 1, 0, 0, 1, 0, 1, 1},
-                    {1, 1, 0, 1, 0, 1, 0, 1, 1}, {1, 1, 1, 1, 0, 1, 0, 1, 1}, {1, 0, 0, 1, 0, 1, 0, 1, 1}, {1, 0, 1, 1, 0, 1, 0, 1, 1},
-                    
-                    // Diffparam + normal combinations (8)
-                    {1, 1, 0, 0, 1, 1, 0, 1, 1}, {1, 1, 1, 0, 1, 1, 0, 1, 1}, {1, 0, 0, 0, 1, 1, 0, 1, 1}, {1, 0, 1, 0, 1, 1, 0, 1, 1},
-                    {1, 1, 0, 1, 1, 1, 0, 1, 1}, {1, 1, 1, 1, 1, 1, 0, 1, 1}, {1, 0, 0, 1, 1, 1, 0, 1, 1}, {1, 0, 1, 1, 1, 1, 0, 1, 1},
-                    
-                    // Param variants (8)
-                    {1, 1, 0, 0, 0, 0, 1, 1, 1}, {1, 1, 1, 0, 0, 0, 1, 1, 1}, {1, 0, 0, 0, 0, 0, 1, 1, 1}, {1, 0, 1, 0, 0, 0, 1, 1, 1},
-                    {1, 1, 0, 1, 0, 0, 1, 1, 1}, {1, 1, 1, 1, 0, 0, 1, 1, 1}, {1, 0, 0, 1, 0, 0, 1, 1, 1}, {1, 0, 1, 1, 0, 0, 1, 1, 1},
-                    
-                    // Full combination variants (8)
-                    {1, 1, 0, 0, 1, 1, 1, 1, 1}, {1, 1, 1, 0, 1, 1, 1, 1, 1}, {1, 0, 0, 0, 1, 1, 1, 1, 1}, {1, 0, 1, 0, 1, 1, 1, 1, 1},
-                    {1, 1, 0, 1, 1, 1, 1, 1, 1}, {1, 1, 1, 1, 1, 1, 1, 1, 1}, {1, 0, 0, 1, 1, 1, 1, 1, 1}, {1, 0, 1, 1, 1, 1, 1, 1, 1},
-                    
-                    // Dual texture variants - basic (8)
-                    {1, 1, 0, 0, 0, 0, 0, 1, 2}, {1, 1, 1, 0, 0, 0, 0, 1, 2}, {1, 0, 0, 0, 0, 0, 0, 1, 2}, {1, 0, 1, 0, 0, 0, 0, 1, 2},
-                    {1, 1, 0, 1, 0, 0, 0, 1, 2}, {1, 1, 1, 1, 0, 0, 0, 1, 2}, {1, 0, 0, 1, 0, 0, 0, 1, 2}, {1, 0, 1, 1, 0, 0, 0, 1, 2},
-                    
-                    // Dual texture + diffparam (8) 
-                    {1, 1, 0, 0, 1, 0, 0, 1, 2}, {1, 1, 1, 0, 1, 0, 0, 1, 2}, {1, 0, 0, 0, 1, 0, 0, 1, 2}, {1, 0, 1, 0, 1, 0, 0, 1, 2},
-                    {1, 1, 0, 1, 1, 0, 0, 1, 2}, {1, 1, 1, 1, 1, 0, 0, 1, 2}, {1, 0, 0, 1, 1, 0, 0, 1, 2}, {1, 0, 1, 1, 1, 0, 0, 1, 2},
-                    
-                    // Dual texture + normal (8)
-                    {1, 1, 0, 0, 0, 1, 0, 1, 2}, {1, 1, 1, 0, 0, 1, 0, 1, 2}, {1, 0, 0, 0, 0, 1, 0, 1, 2}, {1, 0, 1, 0, 0, 1, 0, 1, 2},
-                    {1, 1, 0, 1, 0, 1, 0, 1, 2}, {1, 1, 1, 1, 0, 1, 0, 1, 2}, {1, 0, 0, 1, 0, 1, 0, 1, 2}, {1, 0, 1, 1, 0, 1, 0, 1, 2},
-                    
-                    // No fog variants (8)
-                    {1, 1, 0, 0, 0, 0, 0, 0, 1}, {1, 1, 1, 0, 0, 0, 0, 0, 1}, {1, 0, 0, 0, 0, 0, 0, 0, 1}, {1, 0, 1, 0, 0, 0, 0, 0, 1},
-                    {1, 1, 0, 0, 1, 0, 0, 0, 1}, {1, 1, 1, 0, 1, 0, 0, 0, 1}, {1, 0, 0, 0, 1, 0, 0, 0, 1}, {1, 0, 1, 0, 1, 0, 0, 0, 1},
-                    
-                    // Fog mode 2 variants (8)
-                    {1, 1, 0, 0, 0, 0, 0, 2, 1}, {1, 1, 1, 0, 0, 0, 0, 2, 1}, {1, 0, 0, 0, 0, 0, 0, 2, 1}, {1, 0, 1, 0, 0, 0, 0, 2, 1},
-                    {1, 1, 0, 0, 1, 0, 0, 2, 1}, {1, 1, 1, 0, 1, 0, 0, 2, 1}, {1, 0, 0, 0, 1, 0, 0, 2, 1}, {1, 0, 1, 0, 1, 0, 0, 2, 1},
-                    
-                    // Special cases - no fog, dual texture (8)
-                    {1, 1, 0, 0, 0, 0, 0, 0, 2}, {1, 1, 1, 0, 0, 0, 0, 0, 2}, {1, 0, 0, 0, 0, 0, 0, 0, 2}, {1, 0, 1, 0, 0, 0, 0, 0, 2},
-                    {1, 1, 0, 1, 0, 0, 0, 0, 2}, {1, 1, 1, 1, 0, 0, 0, 0, 2}, {1, 0, 0, 1, 0, 0, 0, 0, 2}, {1, 0, 1, 1, 0, 0, 0, 0, 2},
-                    
-                    // Fog mode 2, dual texture (8)
-                    {1, 1, 0, 0, 0, 0, 0, 2, 2}, {1, 1, 1, 0, 0, 0, 0, 2, 2}, {1, 0, 0, 0, 0, 0, 0, 2, 2}, {1, 0, 1, 0, 0, 0, 0, 2, 2},
-                    {1, 1, 0, 1, 0, 0, 0, 2, 2}, {1, 1, 1, 1, 0, 0, 0, 2, 2}, {1, 0, 0, 1, 0, 0, 0, 2, 2}, {1, 0, 1, 1, 0, 0, 0, 2, 2},
-                    
-                    // Additional edge cases for complete coverage (4)
-                    {0, 1, 0, 1, 0, 0, 0, 1, 1}, {0, 1, 1, 1, 0, 0, 0, 1, 1}, {0, 0, 0, 0, 0, 0, 0, 1, 1}, {0, 0, 1, 0, 0, 0, 0, 1, 1},
-                    
-                    // CRITICAL FIX: Add the 8 universal base combinations that the fallback system expects
-                    // These are guaranteed to be cached and should always be available for fallback
-                    // Format: {lighting, noPointLights, vertexCol, skinning, hasDiffParam, hasNormal, hasParam, fogMode, stages}
-                    {1, 1, 0, 0, 0, 0, 0, 1, 1}, // lit, no points, no vertcol, no skinning, no suffixes
-                    {1, 1, 1, 0, 0, 0, 0, 1, 1}, // lit, no points, vertcol, no skinning, no suffixes  
-                    {1, 1, 0, 1, 0, 0, 0, 1, 1}, // lit, no points, no vertcol, skinning, no suffixes
-                    {1, 1, 1, 1, 0, 0, 0, 1, 1}, // lit, no points, vertcol, skinning, no suffixes
-                    {1, 0, 0, 0, 0, 0, 0, 1, 1}, // lit, points, no vertcol, no skinning, no suffixes
-                    {1, 0, 1, 0, 0, 0, 0, 1, 1}, // lit, points, vertcol, no skinning, no suffixes
-                    {1, 0, 0, 1, 0, 0, 0, 1, 1}, // lit, points, no vertcol, skinning, no suffixes
-                    {1, 0, 1, 1, 0, 0, 0, 1, 1}, // lit, points, vertcol, skinning, no suffixes
+
+                    // Single point lightMode=1 (4)
+                    {1, 1, 0, 0, 0, 0, 0, 1, 1}, {1, 1, 1, 0, 0, 0, 0, 1, 1}, {1, 1, 0, 1, 0, 0, 0, 1, 1}, {1, 1, 1, 1, 0, 0, 0, 1, 1},
+
+                    // Few points lightMode=2 (4)
+                    {1, 2, 0, 0, 0, 0, 0, 1, 1}, {1, 2, 1, 0, 0, 0, 0, 1, 1}, {1, 2, 0, 1, 0, 0, 0, 1, 1}, {1, 2, 1, 1, 0, 0, 0, 1, 1},
+
+                    // Diffparam (12: lightMode 0,1,2)
+                    {1, 0, 0, 0, 1, 0, 0, 1, 1}, {1, 0, 1, 0, 1, 0, 0, 1, 1}, {1, 1, 0, 0, 1, 0, 0, 1, 1}, {1, 1, 1, 0, 1, 0, 0, 1, 1},
+                    {1, 2, 0, 0, 1, 0, 0, 1, 1}, {1, 2, 1, 0, 1, 0, 0, 1, 1},
+                    {1, 0, 0, 1, 1, 0, 0, 1, 1}, {1, 0, 1, 1, 1, 0, 0, 1, 1}, {1, 1, 0, 1, 1, 0, 0, 1, 1}, {1, 1, 1, 1, 1, 0, 0, 1, 1},
+                    {1, 2, 0, 1, 1, 0, 0, 1, 1}, {1, 2, 1, 1, 1, 0, 0, 1, 1},
+
+                    // ParamH (12)
+                    {1, 0, 0, 0, 0, 1, 0, 1, 1}, {1, 0, 1, 0, 0, 1, 0, 1, 1}, {1, 1, 0, 0, 0, 1, 0, 1, 1}, {1, 1, 1, 0, 0, 1, 0, 1, 1},
+                    {1, 2, 0, 0, 0, 1, 0, 1, 1}, {1, 2, 1, 0, 0, 1, 0, 1, 1},
+                    {1, 0, 0, 1, 0, 1, 0, 1, 1}, {1, 0, 1, 1, 0, 1, 0, 1, 1}, {1, 1, 0, 1, 0, 1, 0, 1, 1}, {1, 1, 1, 1, 0, 1, 0, 1, 1},
+                    {1, 2, 0, 1, 0, 1, 0, 1, 1}, {1, 2, 1, 1, 0, 1, 0, 1, 1},
+
+                    // Diffparam + ParamH (12)
+                    {1, 0, 0, 0, 1, 1, 0, 1, 1}, {1, 0, 1, 0, 1, 1, 0, 1, 1}, {1, 1, 0, 0, 1, 1, 0, 1, 1}, {1, 1, 1, 0, 1, 1, 0, 1, 1},
+                    {1, 2, 0, 0, 1, 1, 0, 1, 1}, {1, 2, 1, 0, 1, 1, 0, 1, 1},
+                    {1, 0, 0, 1, 1, 1, 0, 1, 1}, {1, 0, 1, 1, 1, 1, 0, 1, 1}, {1, 1, 0, 1, 1, 1, 0, 1, 1}, {1, 1, 1, 1, 1, 1, 0, 1, 1},
+                    {1, 2, 0, 1, 1, 1, 0, 1, 1}, {1, 2, 1, 1, 1, 1, 0, 1, 1},
+
+                    // ParamX (6)
+                    {1, 0, 0, 0, 0, 0, 1, 1, 1}, {1, 0, 1, 0, 0, 0, 1, 1, 1}, {1, 2, 0, 0, 0, 0, 1, 1, 1}, {1, 2, 1, 0, 0, 0, 1, 1, 1},
+                    {1, 0, 0, 1, 0, 0, 1, 1, 1}, {1, 0, 1, 1, 0, 0, 1, 1, 1},
+
+                    // Full combo (6)
+                    {1, 0, 0, 0, 1, 1, 1, 1, 1}, {1, 0, 1, 0, 1, 1, 1, 1, 1}, {1, 2, 0, 0, 1, 1, 1, 1, 1}, {1, 2, 1, 0, 1, 1, 1, 1, 1},
+                    {1, 0, 0, 1, 1, 1, 1, 1, 1}, {1, 0, 1, 1, 1, 1, 1, 1, 1},
+
+                    // Dual texture (12)
+                    {1, 0, 0, 0, 0, 0, 0, 1, 2}, {1, 0, 1, 0, 0, 0, 0, 1, 2}, {1, 1, 0, 0, 0, 0, 0, 1, 2}, {1, 1, 1, 0, 0, 0, 0, 1, 2},
+                    {1, 2, 0, 0, 0, 0, 0, 1, 2}, {1, 2, 1, 0, 0, 0, 0, 1, 2},
+                    {1, 0, 0, 1, 0, 0, 0, 1, 2}, {1, 0, 1, 1, 0, 0, 0, 1, 2}, {1, 1, 0, 1, 0, 0, 0, 1, 2}, {1, 1, 1, 1, 0, 0, 0, 1, 2},
+                    {1, 2, 0, 1, 0, 0, 0, 1, 2}, {1, 2, 1, 1, 0, 0, 0, 1, 2},
+
+                    // Dual texture + diffparam (6)
+                    {1, 0, 0, 0, 1, 0, 0, 1, 2}, {1, 0, 1, 0, 1, 0, 0, 1, 2}, {1, 2, 0, 0, 1, 0, 0, 1, 2}, {1, 2, 1, 0, 1, 0, 0, 1, 2},
+                    {1, 0, 0, 1, 1, 0, 0, 1, 2}, {1, 0, 1, 1, 1, 0, 0, 1, 2},
+
+                    // Dual texture + paramH (6)
+                    {1, 0, 0, 0, 0, 1, 0, 1, 2}, {1, 0, 1, 0, 0, 1, 0, 1, 2}, {1, 2, 0, 0, 0, 1, 0, 1, 2}, {1, 2, 1, 0, 0, 1, 0, 1, 2},
+                    {1, 0, 0, 1, 0, 1, 0, 1, 2}, {1, 0, 1, 1, 0, 1, 0, 1, 2},
+
+                    // No fog (6)
+                    {1, 0, 0, 0, 0, 0, 0, 0, 1}, {1, 0, 1, 0, 0, 0, 0, 0, 1}, {1, 2, 0, 0, 0, 0, 0, 0, 1}, {1, 2, 1, 0, 0, 0, 0, 0, 1},
+                    {1, 0, 0, 0, 1, 0, 0, 0, 1}, {1, 0, 1, 0, 1, 0, 0, 0, 1},
+
+                    // Fog mode 2 (6)
+                    {1, 0, 0, 0, 0, 0, 0, 2, 1}, {1, 0, 1, 0, 0, 0, 0, 2, 1}, {1, 2, 0, 0, 0, 0, 0, 2, 1}, {1, 2, 1, 0, 0, 0, 0, 2, 1},
+                    {1, 0, 0, 0, 1, 0, 0, 2, 1}, {1, 0, 1, 0, 1, 0, 0, 2, 1},
+
+                    // No fog + dual texture (6)
+                    {1, 0, 0, 0, 0, 0, 0, 0, 2}, {1, 0, 1, 0, 0, 0, 0, 0, 2}, {1, 2, 0, 0, 0, 0, 0, 0, 2}, {1, 2, 1, 0, 0, 0, 0, 0, 2},
+                    {1, 0, 0, 1, 0, 0, 0, 0, 2}, {1, 0, 1, 1, 0, 0, 0, 0, 2},
+
+                    // Fog mode 2 + dual texture (6)
+                    {1, 0, 0, 0, 0, 0, 0, 2, 2}, {1, 0, 1, 0, 0, 0, 0, 2, 2}, {1, 2, 0, 0, 0, 0, 0, 2, 2}, {1, 2, 1, 0, 0, 0, 0, 2, 2},
+                    {1, 0, 0, 1, 0, 0, 0, 2, 2}, {1, 0, 1, 1, 0, 0, 0, 2, 2},
+
+                    // Edge cases (4)
+                    {0, 0, 0, 1, 0, 0, 0, 1, 1}, {0, 0, 1, 1, 0, 0, 0, 1, 1}, {0, 0, 0, 0, 0, 0, 0, 1, 1}, {0, 0, 1, 0, 0, 0, 0, 1, 1},
+
+                    // Universal base fallback (12: lightMode 0,1,2 × vertCol × skinning)
+                    {1, 0, 0, 0, 0, 0, 0, 1, 1}, {1, 0, 1, 0, 0, 0, 0, 1, 1}, {1, 0, 0, 1, 0, 0, 0, 1, 1}, {1, 0, 1, 1, 0, 0, 0, 1, 1},
+                    {1, 1, 0, 0, 0, 0, 0, 1, 1}, {1, 1, 1, 0, 0, 0, 0, 1, 1}, {1, 1, 0, 1, 0, 0, 0, 1, 1}, {1, 1, 1, 1, 0, 0, 0, 1, 1},
+                    {1, 2, 0, 0, 0, 0, 0, 1, 1}, {1, 2, 1, 0, 0, 0, 0, 1, 1}, {1, 2, 0, 1, 0, 0, 0, 1, 1}, {1, 2, 1, 1, 0, 0, 0, 1, 1},
                 };
-            
+
             const int totalVariants = sizeof(variants) / sizeof(variants[0]);
             LOG::logline("-- Precaching %d essential HLSL shader variants", totalVariants);
-            
+
             for (int i = 0; i < totalVariants; i++) {
                 const ShaderVariant& v = variants[i];
-                
+
                 // Update progress every few variants
                 if (i % 5 == 0 || i == totalVariants - 1) {
                     updateStatus(i + 1, totalVariants);
                 }
-                
+
                 ShaderKey sk;
                 memset(&sk, 0, sizeof(sk));
                 sk.uvSets = 1;
                 sk.useLighting = v.lighting;
-                sk.noPointLights = v.noPointLights;
+                sk.lightMode = v.lightMode;
                 sk.vertexColour = v.vertexCol;
                 sk.vertexMaterial = v.vertexCol + 1;
                 sk.usesSkinning = v.skinning;
                 sk.hasDiffParam = v.hasDiffParam;
-                sk.hasGrass = 0; // Precache without grass specific variants
+                sk.hasGrass = 0;
                 sk.fogMode = v.fogMode;
                 sk.activeStages = v.stages;
                 
@@ -803,8 +830,8 @@ void FixedFunctionShader::precacheAsync() {
                 sk.vertexMaterial = variant.vertCol + 1;  
                 sk.usesSkinning = variant.skinning;
                 
-                // Lighting collapse: Use dynamic loop (no separate shaders for light counts)
-                sk.noPointLights = 0; // Always allow point lights, handled dynamically
+                // Lighting collapse: Use few-loop mode as default precache (covers 2-8 lights)
+                sk.lightMode = 2;
                 
                 // Param flavor unification: Always enable all texture suffixes
                 // Shader uses #ifdef HAS_DIFFPARAM, #ifdef HAS_NORMAL, #ifdef HAS_PARAM
@@ -1610,7 +1637,10 @@ void FixedFunctionShader::bindShaderTextures(const ShaderKey& sk, const Rendered
     }
 
     // Slot 5: Light data texture (for texture-based point lighting)
-    if (DistantLand::texLightData) {
+    // Per-object packed texture takes priority (mode 3 spatial query)
+    if (texPerObjectLightData) {
+        setCachedTexture(device, 5, texPerObjectLightData);
+    } else if (DistantLand::texLightData) {
         setCachedTexture(device, 5, DistantLand::texLightData);
     }
 }
@@ -1711,7 +1741,7 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
 }
 
 // Internal rendering function that does the actual HLSL rendering
-void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, DWORD dirtyFlags) {
+void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, DWORD dirtyFlags, int callIndex) {
 
     // Process any completed async shader compilations
     processAsyncCompletions();
@@ -1761,15 +1791,11 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             HLSLShader fallbackShader = {};
             bool foundFallback = false;
             
-            // Priority fallback order: prefer exact match first, then alternatives
-            int currentCount = sk.noPointLights ? 0 : 1;  // 0 = no lights, 1 = has lights
-            int fallbackPointLights[] = {0, 1, 4, 7};
-            for (int i = 0; i < 4 && !foundFallback; ++i) {
-                int fallbackCount = fallbackPointLights[i];
-                if (fallbackCount == currentCount) continue; // Skip exact match, already tried
-                
-                // Correct the noPointLights assignment: 0 lights -> noPointLights=1, 1+ lights -> noPointLights=0
-                fallbackSk.noPointLights = (fallbackCount == 0) ? 1 : 0;
+            // lightMode cascade fallback: try 2→1→0 (prefer "few" loop, then single, then sun-only)
+            int fallbackModes[] = {2, 1, 0};
+            for (int i = 0; i < 3 && !foundFallback; ++i) {
+                if (fallbackModes[i] == (int)sk.lightMode) continue; // Skip exact match
+                fallbackSk.lightMode = fallbackModes[i];
                 auto fallbackIter = cacheHLSLShaders.find(fallbackSk);
                 if (fallbackIter != cacheHLSLShaders.end()) {
                     fallbackShader = fallbackIter->second;
@@ -1830,11 +1856,11 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
                 universalSk.hasParamH = 0;
                 universalSk.hasParamX = 0;
 
-                // Try all 8 universal combinations: point lights (0/1+) × vertex color (0/1) × skinning (0/1)
-                for (int pointLightMode = 0; pointLightMode <= 1 && !foundFallback; ++pointLightMode) {
+                // Try universal combinations: lightMode (0-2) × vertex color (0/1) × skinning (0/1)
+                for (int lm = 0; lm <= 2 && !foundFallback; ++lm) {
                     for (int vertCol = 0; vertCol <= 1 && !foundFallback; ++vertCol) {
                         for (int skinning = 0; skinning <= 1 && !foundFallback; ++skinning) {
-                            universalSk.noPointLights = pointLightMode; // pointLightMode 0 = no lights, so noPointLights = 0
+                            universalSk.lightMode = lm;
                             universalSk.vertexColour = vertCol;
                             universalSk.vertexMaterial = vertCol + 1;
                             universalSk.usesSkinning = skinning;
@@ -1986,128 +2012,98 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     }
     
     // Use constant tables to set matrices with cached handles (no per-draw string lookups)
+    // Constant-setting failures are non-fatal: WorldViewProj is the critical transform,
+    // other constants (View, Proj, World, etc.) use stale values if SetMatrix fails.
     if (hlslShader.vsConstantTable) {
         try {
             if (hlslShader.hWorldViewProj) {
-                HRESULT hr = hlslShader.vsConstantTable->SetMatrix(device, hlslShader.hWorldViewProj, &worldViewProj);
-                if (FAILED(hr)) {
-                    // Shader may have been invalidated by file edit - use fallback
-                    return;
-                }
+                hlslShader.vsConstantTable->SetMatrix(device, hlslShader.hWorldViewProj, &worldViewProj);
             }
 
             if (hlslShader.hView) {
-                HRESULT hr = hlslShader.vsConstantTable->SetMatrix(device, hlslShader.hView, &viewMatrix);
-                if (FAILED(hr)) {
-                    return;
-                }
+                hlslShader.vsConstantTable->SetMatrix(device, hlslShader.hView, &viewMatrix);
             }
 
             if (hlslShader.hProj) {
                 HRESULT hr = hlslShader.vsConstantTable->SetMatrix(device, hlslShader.hProj, &projMatrix);
                 if (FAILED(hr)) {
-                    return;
+                    // Constant table SetMatrix failed — bypass it with direct register write
+                    // SetMatrix transposes internally, so we must transpose before SetVertexShaderConstantF
+                    D3DXMATRIX projT;
+                    D3DXMatrixTranspose(&projT, &projMatrix);
+                    device->SetVertexShaderConstantF(hlslShader.projRegister, (float*)&projT, 4);
+                    static bool projWarningLogged = false;
+                    if (!projWarningLogged) {
+                        LOG::logline("!! HLSL: Proj SetMatrix failed (hr=0x%08x), using direct register %d fallback", hr, hlslShader.projRegister);
+                        projWarningLogged = true;
+                    }
                 }
             }
 
             if (hlslShader.hWorld) {
-                // Use recorded world matrix for each object, not current device world matrix
-                HRESULT hr = hlslShader.vsConstantTable->SetMatrix(device, hlslShader.hWorld, &rs->worldTransforms[0]);
-                if (FAILED(hr)) {
-                    return;
-                }
+                hlslShader.vsConstantTable->SetMatrix(device, hlslShader.hWorld, &rs->worldTransforms[0]);
             }
 
             if (hlslShader.hWorldView) {
-                HRESULT hr = hlslShader.vsConstantTable->SetMatrix(device, hlslShader.hWorldView, &worldView);
-                if (FAILED(hr)) {
-                    return;
-                }
+                hlslShader.vsConstantTable->SetMatrix(device, hlslShader.hWorldView, &worldView);
             }
-            // Set up vertex blend palette for skinning using Morrowind's actual data
             if (hlslShader.hVertexBlendPalette) {
                 if (rs->vertexBlendState > 0) {
-                    // For skinned objects, recombine recorded world matrices with current view matrix
-                    // rs->worldViewTransforms contains old view matrix, causing one-frame delay
                     D3DXMATRIX currentWorldViewTransforms[4];
                     for (int i = 0; i < 4; i++) {
                         currentWorldViewTransforms[i] = rs->worldTransforms[i] * viewMatrix;
                     }
-                    HRESULT hr = hlslShader.vsConstantTable->SetMatrixArray(device, hlslShader.hVertexBlendPalette, currentWorldViewTransforms, 4);
-                    if (FAILED(hr)) {
-                        return;
-                    }
+                    hlslShader.vsConstantTable->SetMatrixArray(device, hlslShader.hVertexBlendPalette, currentWorldViewTransforms, 4);
                 } else {
-                    // For rigid objects, set first matrix to worldview and clear others
                     D3DXMATRIX blendMatrices[4];
                     blendMatrices[0] = worldView;
                     memset(&blendMatrices[1], 0, sizeof(D3DXMATRIX) * 3);
-                    HRESULT hr = hlslShader.vsConstantTable->SetMatrixArray(device, hlslShader.hVertexBlendPalette, blendMatrices, 4);
-                    if (FAILED(hr)) {
-                        return;
-                    }
+                    hlslShader.vsConstantTable->SetMatrixArray(device, hlslShader.hVertexBlendPalette, blendMatrices, 4);
                 }
             }
 
             if (hlslShader.hVertexBlendState) {
                 D3DXVECTOR4 blendState((float)rs->vertexBlendState, 0, 0, 0);
-                HRESULT hr = hlslShader.vsConstantTable->SetVector(device, hlslShader.hVertexBlendState, &blendState);
-                if (FAILED(hr)) {
-                    return;
-                }
+                hlslShader.vsConstantTable->SetVector(device, hlslShader.hVertexBlendState, &blendState);
             }
 
-            // Set shadow world-to-shadow matrices for proper shadow coordinate calculation
             if (hlslShader.hShadowWorldViewProj) {
-                // Use recorded complete shadow world-view-projection matrices directly
-                // This avoids any stale matrix issues by using exact matrices from recording time
-                HRESULT hr = hlslShader.vsConstantTable->SetMatrixArray(device, hlslShader.hShadowWorldViewProj, rs->shadowWorldViewProj, 2);
-                if (FAILED(hr)) {
-                    return;
-                }
+                hlslShader.vsConstantTable->SetMatrixArray(device, hlslShader.hShadowWorldViewProj, rs->shadowWorldViewProj, 2);
             }
         } catch (...) {
-            // Shader invalidated during file edit - return early
             LOG::logline("!! HLSL Vertex shader constant table access failed - shader may have been edited");
-            return;
         }
     }
     // Set pixel shader constants using cached handles (no per-draw string lookups)
+    // Constant-setting failures are non-fatal: stale material values are acceptable.
     if (hlslShader.psConstantTable) {
         try {
             if (hlslShader.hMaterialDiffuse) {
-                HRESULT hr = hlslShader.psConstantTable->SetVector(device, hlslShader.hMaterialDiffuse, (D3DXVECTOR4*)&frs->material.diffuse);
-                if (FAILED(hr)) {
-                    LOG::logline("!! HLSL Pixel shader constant table access failed - shader may have been edited");
-                    return;
-                }
+                hlslShader.psConstantTable->SetVector(device, hlslShader.hMaterialDiffuse, (D3DXVECTOR4*)&frs->material.diffuse);
             }
 
             if (hlslShader.hMaterialAmbient) {
-                HRESULT hr = hlslShader.psConstantTable->SetVector(device, hlslShader.hMaterialAmbient, (D3DXVECTOR4*)&frs->material.ambient);
-                if (FAILED(hr)) {
-                    return;
-                }
+                hlslShader.psConstantTable->SetVector(device, hlslShader.hMaterialAmbient, (D3DXVECTOR4*)&frs->material.ambient);
             }
 
             if (hlslShader.hMaterialEmissive) {
-                HRESULT hr = hlslShader.psConstantTable->SetVector(device, hlslShader.hMaterialEmissive, (D3DXVECTOR4*)&frs->material.emissive);
-                if (FAILED(hr)) {
-                    return;
-                }
+                hlslShader.psConstantTable->SetVector(device, hlslShader.hMaterialEmissive, (D3DXVECTOR4*)&frs->material.emissive);
             }
-        // Set up lighting using the same logic as the original renderMorrowind
+        // Set up lighting — extract sun + ambient for all modes, point lights only for modes 1-2
         const size_t MaxLights = 8;
         D3DXVECTOR4 bufferDiffuse[MaxLights];
         float bufferAmbient[MaxLights];
         float bufferPosition[3 * MaxLights];
         float bufferFalloffQuadratic[MaxLights], bufferFalloffLinear[MaxLights], bufferFalloffConstant;
+        bool needPointLightBuffers = (sk.lightMode == 1 || sk.lightMode == 2);
 
-        memset(&bufferDiffuse, 0, sizeof(bufferDiffuse));
-        memset(&bufferAmbient, 0, sizeof(bufferAmbient));
-        memset(&bufferPosition, 0, sizeof(bufferPosition));
-        memset(&bufferFalloffQuadratic, 0, sizeof(bufferFalloffQuadratic));
-        memset(&bufferFalloffLinear, 0, sizeof(bufferFalloffLinear));
+        if (needPointLightBuffers) {
+            memset(&bufferDiffuse, 0, sizeof(bufferDiffuse));
+            memset(&bufferAmbient, 0, sizeof(bufferAmbient));
+            memset(&bufferPosition, 0, sizeof(bufferPosition));
+            memset(&bufferFalloffQuadratic, 0, sizeof(bufferFalloffQuadratic));
+            memset(&bufferFalloffLinear, 0, sizeof(bufferFalloffLinear));
+        }
         bufferFalloffConstant = 0.33;
 
         // Check each active light
@@ -2129,7 +2125,7 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
                 lightrs->lightsTransformed[i] = true;
             }
 
-            if (light->type == D3DLIGHT_POINT) {
+            if (light->type == D3DLIGHT_POINT && needPointLightBuffers) {
                 memcpy(&bufferDiffuse[pointLightCount], &light->diffuse, sizeof(light->diffuse));
 
                 // Scatter position vectors for vectorization
@@ -2139,29 +2135,18 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
 
                 // Scatter attenuation factors for vectorization (match Effect path)
                 if (light->falloff.x > 0) {
-                    // Standard point light source (falloffConstant doesn't vary per light)
                     bufferFalloffConstant = light->falloff.x;
                     bufferFalloffLinear[pointLightCount] = light->falloff.y;
                     bufferFalloffQuadratic[pointLightCount] = light->falloff.z;
                 } else if (light->falloff.z > 0) {
-                    // Probably a magic light source patched by Morrowind Code Patch
                     bufferDiffuse[pointLightCount].x *= bufferFalloffConstant;
                     bufferDiffuse[pointLightCount].y *= bufferFalloffConstant;
                     bufferDiffuse[pointLightCount].z *= bufferFalloffConstant;
                     bufferAmbient[pointLightCount] = 1.0f + 1e-4f / sqrt(light->falloff.z);
                     bufferFalloffQuadratic[pointLightCount] = bufferFalloffConstant * light->falloff.z;
                 } else if (light->falloff.y == 0.10000001f) {
-                    // Projectile light source, normally hard coded by Morrowind to { 0, 3 * (1/30), 0 }
-                    // This falloff value cannot be produced by other magic effects
-                    // Replacement falloff is significantly brighter to look cool
-                    // Avoids modifying colour or position
                     bufferFalloffQuadratic[pointLightCount] = 5e-5;
                 } else if (light->falloff.y > 0) {
-                    // Light magic effect, falloffs calculated by { 0, 3 / (22 * spell magnitude), 0 }
-                    // A mix of ambient (falloff but no N.L component) and over-bright diffuse lighting
-                    // It is approximated with a half-lambert weight + quadratic falloff
-                    // Light colour is altered to avoid variable brightness from Morrowind bugs
-                    // The point source is moved up slightly as it is often embedded in the ground
                     float brightness = 0.25f + 1e-4f / light->falloff.y;
                     bufferDiffuse[pointLightCount].x = brightness;
                     bufferDiffuse[pointLightCount].y = brightness;
@@ -2175,102 +2160,88 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             } else if (light->type == D3DLIGHT_DIRECTIONAL) {
                 sunDiffuse = light->diffuse;
                 sunDirection = light->viewspacePos;  // Already transformed to view space
-                // Add directional light ambient to global ambient like the original
                 ambient.r += light->ambient.x;
                 ambient.g += light->ambient.y;
                 ambient.b += light->ambient.z;
             }
         }
-        
+
         // Apply light multipliers, for HDR light levels
         sunDiffuse *= sunMultiplier;
         ambient *= ambMultiplier;
-        
+
         // Special case, check if ambient state is pure white (distant land does not record this for a reason)
         // Morrowind temporarily sets this for full-bright particle effects
         DWORD checkAmbient;
         device->GetRenderState(D3DRS_AMBIENT, &checkAmbient);
         if (checkAmbient == 0xffffffff) {
-            // Set lighting to result in full-bright equivalent after tonemapping
             ambient.r = ambient.g = ambient.b = 1.25;
             sunDiffuse.r = sunDiffuse.g = sunDiffuse.b = 0.0;
         }
-        
-        // Set lighting constants using the same format as the original system
+
+        // Sun + ambient constants (all modes)
         if (hlslShader.hLightSunDirection) {
             hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightSunDirection, (const float*)&sunDirection, 3);
-        } else {
-            // logline("!! lightSunDirection constant not found in pixel shader");
         }
 
         if (hlslShader.hLightSunDiffuse) {
             hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightSunDiffuse, (const float*)&sunDiffuse, 3);
-        } else {
-            // LOG::logline("!! lightSunDiffuse constant not found in pixel shader");
         }
 
         if (hlslShader.hLightSceneAmbient) {
             hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightSceneAmbient, (const float*)&ambient, 3);
-        } else {
-            // LOG::logline("!! lightSceneAmbient constant not found in pixel shader");
         }
-        
-        // Set light arrays in pixel shader (same as Effect shader approach)
-        D3DXHANDLE hLightDiffuse = hlslShader.psConstantTable->GetConstantByName(NULL, "lightDiffuse");
-        if (hLightDiffuse) {
-            hlslShader.psConstantTable->SetVectorArray(device, hLightDiffuse, bufferDiffuse, MaxLights);
-        } else {
-            // LOG::logline("!! lightDiffuse array constant not found in pixel shader");
-        }
-        
-        D3DXHANDLE hLightPosition = hlslShader.psConstantTable->GetConstantByName(NULL, "lightPosition");
-        if (hLightPosition) {
-            // HLSL expects float3 array, but we have packed data - need to convert
-            D3DXVECTOR3 hlslLightPositions[MaxLights];
-            for (int i = 0; i < MaxLights; i++) {
-                hlslLightPositions[i].x = bufferPosition[i];
-                hlslLightPositions[i].y = bufferPosition[i + MaxLights];
-                hlslLightPositions[i].z = bufferPosition[i + 2*MaxLights];
+
+        // Point light uniforms — only for lightMode 1 (single) and 2 (few loop)
+        if (needPointLightBuffers) {
+            if (hlslShader.hLightDiffuse) {
+                hlslShader.psConstantTable->SetVectorArray(device, hlslShader.hLightDiffuse, bufferDiffuse, MaxLights);
             }
-            hlslShader.psConstantTable->SetFloatArray(device, hLightPosition, (float*)hlslLightPositions, 3 * MaxLights);
-        } else {
-            // LOG::logline("!! HLSL ERROR: lightPosition array constant not found in pixel shader");
-        }
-        
-        // Set light ambient array
-        D3DXHANDLE hLightAmbient = hlslShader.psConstantTable->GetConstantByName(NULL, "lightAmbient");
-        if (hLightAmbient) {
-            hlslShader.psConstantTable->SetFloatArray(device, hLightAmbient, bufferAmbient, MaxLights);
-        } else {
-            // LOG::logline("!! lightAmbient array constant not found in pixel shader");
-        }
-        
-        // Set pointLightCount uniform for HLSL (CRITICAL FIX)
-        D3DXHANDLE hPointLightCount = hlslShader.psConstantTable->GetConstantByName(NULL, "pointLightCount");
-        if (hPointLightCount) {
-            hlslShader.psConstantTable->SetInt(device, hPointLightCount, (int)pointLightCount);
-            // LOG::logline("HLSL: Set pointLightCount to %d", (int)pointLightCount);
-        } else {
-            // LOG::logline("!! HLSL ERROR: pointLightCount constant not found in pixel shader");
-        }
-        
-        // Set falloff constants using Effect shader approach (quadratic + constant only)
-        D3DXHANDLE hLightFalloffQuadratic = hlslShader.psConstantTable->GetConstantByName(NULL, "lightFalloffQuadratic");
-        if (hLightFalloffQuadratic) {
-            // Pack quadratic falloffs into 2 float4 vectors (8 lights total, 4 per vector)
-            D3DXVECTOR4 quadraticData[2];
-            for (int i = 0; i < 4; i++) {
-                quadraticData[0][i] = ((size_t)i < pointLightCount) ? bufferFalloffQuadratic[i] : 0.0f;
-                quadraticData[1][i] = ((size_t)(i + 4) < pointLightCount) ? bufferFalloffQuadratic[i + 4] : 0.0f;
+
+            if (hlslShader.hLightPosition) {
+                D3DXVECTOR3 hlslLightPositions[MaxLights];
+                for (int i = 0; i < (int)MaxLights; i++) {
+                    hlslLightPositions[i].x = bufferPosition[i];
+                    hlslLightPositions[i].y = bufferPosition[i + MaxLights];
+                    hlslLightPositions[i].z = bufferPosition[i + 2*MaxLights];
+                }
+                hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightPosition, (float*)hlslLightPositions, 3 * MaxLights);
             }
-            hlslShader.psConstantTable->SetVectorArray(device, hLightFalloffQuadratic, quadraticData, 2);
+
+            if (hlslShader.hLightAmbient) {
+                hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightAmbient, bufferAmbient, MaxLights);
+            }
+
+            if (hlslShader.hPointLightCount) {
+                hlslShader.psConstantTable->SetInt(device, hlslShader.hPointLightCount, (int)pointLightCount);
+            }
+
+            if (hlslShader.hLightFalloffQuadratic) {
+                D3DXVECTOR4 quadraticData[2];
+                for (int i = 0; i < 4; i++) {
+                    quadraticData[0][i] = ((size_t)i < pointLightCount) ? bufferFalloffQuadratic[i] : 0.0f;
+                    quadraticData[1][i] = ((size_t)(i + 4) < pointLightCount) ? bufferFalloffQuadratic[i + 4] : 0.0f;
+                }
+                hlslShader.psConstantTable->SetVectorArray(device, hlslShader.hLightFalloffQuadratic, quadraticData, 2);
+            }
+
+            if (hlslShader.hLightFalloffConstant) {
+                hlslShader.psConstantTable->SetFloat(device, hlslShader.hLightFalloffConstant, bufferFalloffConstant);
+            }
         }
-        
-        D3DXHANDLE hLightFalloffConstant = hlslShader.psConstantTable->GetConstantByName(NULL, "lightFalloffConstant");
-        if (hLightFalloffConstant) {
-            hlslShader.psConstantTable->SetFloat(device, hLightFalloffConstant, bufferFalloffConstant);
+
+        // Per-object light texture parameters for mode 3 (saturated objects)
+        if (sk.lightMode == 3 && callIndex >= 0 && callIndex < (int)perObjectLightInfo.size()) {
+            const auto& li = perObjectLightInfo[callIndex];
+            float lightParams[4] = {
+                (float)li.lightCount,
+                perObjectTexelSize,
+                (float)li.texelOffset,
+                0.0f
+            };
+            device->SetPixelShaderConstantF(50, lightParams, 1);
         }
-        
+
         // Note: HLSL uses same falloff as Effect shader - quadratic + constant only, no linear term
         // Set shading mode from actual material mode calculation
         D3DXHANDLE hShadingMode = hlslShader.psConstantTable->GetConstantByName(NULL, "shadingMode");
@@ -2450,28 +2421,21 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             }
         }
         } catch (...) {
-            // Shader invalidated during file edit - return early
-            LOG::logline("!! HLSL Pixel shader constant table access failed - shader may have been edited");
-            return;
+            LOG::logline("!! HLSL Pixel shader constant table access failed");
         }
     }
-    
-    // Error checking for vertex/index buffers
+
     if (!rs->vb) {
-        // LOG::logline("!! HLSL pipeline: null vertex buffer, skipping draw call");
         return;
     }
-    
-    // Set vertex declaration and stream sources with error checking
+
     HRESULT hr = device->SetFVF(rs->fvf);
     if (FAILED(hr)) {
-        LOG::logline("!! HLSL pipeline: failed to set FVF %x, hr=%x", rs->fvf, hr);
         return;
     }
-    
+
     hr = device->SetStreamSource(0, rs->vb, rs->vbOffset, rs->vbStride);
     if (FAILED(hr)) {
-        LOG::logline("!! HLSL pipeline: failed to set vertex buffer, hr=%x", hr);
         return;
     }
 
@@ -2843,11 +2807,18 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     }
 
     // Build shader defines based on ShaderKey
-    D3D_SHADER_MACRO defines[10] = {};  // Increased to 10 for USE_TEXTURE_LIGHTS
+    D3D_SHADER_MACRO defines[10] = {};
     int defineCount = 0;
 
-    // Always enable texture-based lighting system
-    defines[defineCount++] = {"USE_TEXTURE_LIGHTS", "1"};
+    // Light mode define: 0=sun only, 1=single, 2=few loop, 3=texture
+    char lightModeStr[2] = {'0', '\0'};
+    lightModeStr[0] = (char)('0' + sk.lightMode);
+    defines[defineCount++] = {"LIGHT_MODE", lightModeStr};
+
+    // Only emit USE_TEXTURE_LIGHTS for mode 3 (>8 lights, texture loop)
+    if (sk.lightMode == 3) {
+        defines[defineCount++] = {"USE_TEXTURE_LIGHTS", "1"};
+    }
 
     if (sk.hasDiffParam) {
         defines[defineCount++] = {"HAS_DIFFPARAM", "1"};
@@ -2876,10 +2847,6 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     if (!sk.useLighting) {
         defines[defineCount++] = {"NOLIT", "1"};
         // LOG::logline("HLSL: Compiling with NOLIT define (unlit shader)");
-    }
-    if (sk.noPointLights && sk.useLighting) {
-        defines[defineCount++] = {"NO_POINT_LIGHTS", "1"};
-        // LOG::logline("HLSL: Compiling with NO_POINT_LIGHTS define (wilderness shader)");
     }
     defines[defineCount] = {nullptr, nullptr}; // Null terminator
     
@@ -2951,6 +2918,14 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         hlslShader.hWorldViewProj = hlslShader.vsConstantTable->GetConstantByName(NULL, "worldViewProj");
         hlslShader.hView = hlslShader.vsConstantTable->GetConstantByName(NULL, "view");
         hlslShader.hProj = hlslShader.vsConstantTable->GetConstantByName(NULL, "proj");
+        hlslShader.projRegister = 0;
+        if (hlslShader.hProj) {
+            D3DXCONSTANT_DESC desc;
+            UINT count = 1;
+            if (SUCCEEDED(hlslShader.vsConstantTable->GetConstantDesc(hlslShader.hProj, &desc, &count))) {
+                hlslShader.projRegister = desc.RegisterIndex;
+            }
+        }
         hlslShader.hWorld = hlslShader.vsConstantTable->GetConstantByName(NULL, "world");
         hlslShader.hWorldView = hlslShader.vsConstantTable->GetConstantByName(NULL, "worldview");
         hlslShader.hVertexBlendPalette = hlslShader.vsConstantTable->GetConstantByName(NULL, "vertexBlendPalette");
@@ -3042,6 +3017,14 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         hlslShader.hLightSceneAmbient = hlslShader.psConstantTable->GetConstantByName(NULL, "lightSceneAmbient");
         hlslShader.hShadowRcpRes = hlslShader.psConstantTable->GetConstantByName(NULL, "shadowRcpRes");
         hlslShader.hPCFFilterSize = hlslShader.psConstantTable->GetConstantByName(NULL, "PCF_filterSize");
+
+        // Cache point light constant handles (only present for lightMode 1-2)
+        hlslShader.hLightDiffuse = hlslShader.psConstantTable->GetConstantByName(NULL, "lightDiffuse");
+        hlslShader.hLightPosition = hlslShader.psConstantTable->GetConstantByName(NULL, "lightPosition");
+        hlslShader.hLightAmbient = hlslShader.psConstantTable->GetConstantByName(NULL, "lightAmbient");
+        hlslShader.hPointLightCount = hlslShader.psConstantTable->GetConstantByName(NULL, "pointLightCount");
+        hlslShader.hLightFalloffQuadratic = hlslShader.psConstantTable->GetConstantByName(NULL, "lightFalloffQuadratic");
+        hlslShader.hLightFalloffConstant = hlslShader.psConstantTable->GetConstantByName(NULL, "lightFalloffConstant");
     }
     
     // Log compilation details for debugging (before releasing blobs)
@@ -3146,6 +3129,11 @@ void FixedFunctionShader::release() {
     // Reset material state cache
     materialCache.reset();
 
+    // Clean up per-object light texture
+    if (texPerObjectLightData) {
+        texPerObjectLightData->Release();
+        texPerObjectLightData = nullptr;
+    }
 }
 
 void FixedFunctionShader::resetHLSLCaches() {
@@ -3200,7 +3188,10 @@ FixedFunctionShader::ShaderKey::ShaderKey(const RenderedState* rs, const Fragmen
             }
         }
     }
-    noPointLights = (rs->useLighting && pointLightCount == 0) ? 1 : 0;
+    if (!rs->useLighting || pointLightCount == 0) lightMode = 0;
+    else if (pointLightCount == 1) lightMode = 1;
+    else if (pointLightCount <= 6) lightMode = 2;
+    else lightMode = 3;
 
     // Match constant material, diffuse+ambient vcol, or emissive vcol
     if (rs->useLighting) {
@@ -3357,7 +3348,6 @@ void FixedFunctionShader::startRecording() {
     // NOTE: Do NOT clear recordMW here - it's populated by inspectIndexedPrimitive()
     // BEFORE startRecording() is called. recordMW is cleared at end of renderStage1/2.
     lastLightState.reset();  // Clear LightState cache for new recording
-    lastLightStatePtr = nullptr;  // Clear pointer cache
 
     // Clear lights from previous frame (simple approach, no persistence)
     DistantLand::sceneLights.clear();
@@ -3884,22 +3874,22 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
     }
 
     // Reuse last LightState if identical to avoid allocation overhead
+    // NOTE: Cannot use raw pointer comparison here! lightrs is a file-scope static in
+    // mged3d8device.cpp — its address never changes, but Morrowind mutates it in-place
+    // between draw calls via LightEnable(). Pointer equality always returns true,
+    // causing ALL calls to share the first call's light config.
     std::shared_ptr<LightState> sharedLightState;
     {
-        // Ultra-fast path: pointer equality (O(1), no function call)
-        if (lightrs == lastLightStatePtr) {
-            sharedLightState = lastLightState;
-        }
-        // Fast path: value comparison only if pointer differs
-        else if (lastLightState && compareLightStates(lastLightState.get(), lightrs)) {
+        ZoneScopedN("record_LightStateCache");
+        // Content comparison: reuse if lights haven't changed since last call
+        if (lastLightState && compareLightStates(lastLightState.get(), lightrs)) {
             // Reuse existing shared_ptr (no allocation)
             sharedLightState = lastLightState;
         }
-        // Slow path: create new copy
+        // Different lights: create new copy
         else {
             sharedLightState = std::make_shared<LightState>(*lightrs);
             lastLightState = sharedLightState;
-            lastLightStatePtr = lightrs;  // Cache raw pointer for next comparison
         }
     }
 
@@ -3918,6 +3908,121 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
     // Occluder selection and rasterization deferred to prepareRecordedCalls()
     // This removes the heaviest per-draw work from the recording hot path
 }
+
+// ====== Light A/B Diagnostic Snapshot System ======
+// F5 captures snapshot A ("good angle"), F6 captures snapshot B ("bad angle") and logs diff
+
+struct LightCallInfo {
+    size_t activeCount;          // lightrs->active.size()
+    size_t pointLightCount;      // counted from lightrs->lights
+    int lightModeFlag;           // shader key lightMode (0-3)
+    size_t lightsTransformedCount; // lightrs->lightsTransformed.size()
+    struct PointLightDetail {
+        DWORD id;
+        float wx, wy, wz;       // world position
+        float vx, vy, vz;       // viewspace position
+        bool wasTransformed;     // lightsTransformed[id] was set
+    };
+    PointLightDetail pointLights[3]; // first 3 point lights
+    int numPointLightDetails;
+};
+
+struct LightSnapshot {
+    bool valid;
+    int sceneLightsTotal;
+    int visibleLightsAfterCull;
+    float deviceView41, deviceView42, deviceView43;
+    float recordView41, recordView42, recordView43;
+    std::vector<LightCallInfo> callInfos; // first 20 + last 5
+
+    LightSnapshot() : valid(false), sceneLightsTotal(0), visibleLightsAfterCull(0),
+        deviceView41(0), deviceView42(0), deviceView43(0),
+        recordView41(0), recordView42(0), recordView43(0) {}
+
+    // Called from replayRecordedCalls with pre-built callInfos
+    void capture(std::vector<LightCallInfo>&& infos,
+                 const D3DXMATRIX& currentView, const D3DXMATRIX& recView) {
+        valid = true;
+        sceneLightsTotal = (int)DistantLand::sceneLights.size();
+        visibleLightsAfterCull = (int)DistantLand::visibleLights.size();
+        deviceView41 = currentView._41; deviceView42 = currentView._42; deviceView43 = currentView._43;
+        recordView41 = recView._41; recordView42 = recView._42; recordView43 = recView._43;
+        callInfos = std::move(infos);
+    }
+
+    void log(const char* label) const {
+        if (!valid) return;
+        LOG::logline("=== LightSnapshot %s ===", label);
+        LOG::logline("  sceneLights: %d total, %d visible after cull", sceneLightsTotal, visibleLightsAfterCull);
+        LOG::logline("  deviceView translation: (%.1f, %.1f, %.1f)", deviceView41, deviceView42, deviceView43);
+        LOG::logline("  recordView translation: (%.1f, %.1f, %.1f)", recordView41, recordView42, recordView43);
+        LOG::logline("  %d call summaries:", (int)callInfos.size());
+        for (size_t i = 0; i < callInfos.size(); i++) {
+            const auto& c = callInfos[i];
+            LOG::logline("    call[%d]: active=%d, pointLights=%d, lightMode=%d, lightsTransformed=%d",
+                (int)i, (int)c.activeCount, (int)c.pointLightCount, c.lightModeFlag, (int)c.lightsTransformedCount);
+            for (int j = 0; j < c.numPointLightDetails; j++) {
+                const auto& p = c.pointLights[j];
+                LOG::logline("      light[%d] id=%d world=(%.1f,%.1f,%.1f) view=(%.1f,%.1f,%.1f) transformed=%d",
+                    j, p.id, p.wx, p.wy, p.wz, p.vx, p.vy, p.vz, p.wasTransformed ? 1 : 0);
+            }
+        }
+    }
+
+    static void logDiff(const LightSnapshot& a, const LightSnapshot& b) {
+        if (!a.valid || !b.valid) return;
+        LOG::logline("=== Light A/B DIFF ===");
+
+        // Scene lights
+        if (a.sceneLightsTotal != b.sceneLightsTotal)
+            LOG::logline("  DIFF sceneLightsTotal: A=%d B=%d", a.sceneLightsTotal, b.sceneLightsTotal);
+        if (a.visibleLightsAfterCull != b.visibleLightsAfterCull)
+            LOG::logline("  DIFF visibleLightsAfterCull: A=%d B=%d  << Hi-Z culling issue?", a.visibleLightsAfterCull, b.visibleLightsAfterCull);
+        else
+            LOG::logline("  SAME visibleLightsAfterCull: %d", a.visibleLightsAfterCull);
+
+        // Camera
+        LOG::logline("  Camera A: (%.1f, %.1f, %.1f)  B: (%.1f, %.1f, %.1f)",
+            a.deviceView41, a.deviceView42, a.deviceView43,
+            b.deviceView41, b.deviceView42, b.deviceView43);
+
+        // Per-call comparison
+        size_t minCalls = std::min(a.callInfos.size(), b.callInfos.size());
+        int droppedCalls = 0, transformedDiffs = 0, flagDiffs = 0;
+        for (size_t i = 0; i < minCalls; i++) {
+            const auto& ca = a.callInfos[i];
+            const auto& cb = b.callInfos[i];
+            if (ca.pointLightCount > 0 && cb.pointLightCount == 0) droppedCalls++;
+            if (ca.lightsTransformedCount != cb.lightsTransformedCount) transformedDiffs++;
+            if (ca.lightModeFlag != cb.lightModeFlag) flagDiffs++;
+
+            // Log viewspace position changes for matching point lights
+            int minDetails = std::min(ca.numPointLightDetails, cb.numPointLightDetails);
+            for (int j = 0; j < minDetails; j++) {
+                float dx = cb.pointLights[j].vx - ca.pointLights[j].vx;
+                float dy = cb.pointLights[j].vy - ca.pointLights[j].vy;
+                float dz = cb.pointLights[j].vz - ca.pointLights[j].vz;
+                float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+                if (dist > 10.0f) {
+                    LOG::logline("  call[%d] light[%d] viewspace moved %.1f: A=(%.1f,%.1f,%.1f) B=(%.1f,%.1f,%.1f)",
+                        (int)i, j, dist,
+                        ca.pointLights[j].vx, ca.pointLights[j].vy, ca.pointLights[j].vz,
+                        cb.pointLights[j].vx, cb.pointLights[j].vy, cb.pointLights[j].vz);
+                }
+            }
+        }
+
+        LOG::logline("  Summary: %d calls dropped to 0 pointLights, %d lightsTransformed diffs, %d lightMode diffs",
+            droppedCalls, transformedDiffs, flagDiffs);
+        if (droppedCalls > 0) LOG::logline("  >> LIKELY: per-object pointLightCount dropping to 0 (LightState or transform issue)");
+        if (flagDiffs > 0) LOG::logline("  >> LIKELY: lightMode shader key changed (different light permutation)");
+        if (transformedDiffs > 0) LOG::logline("  >> LIKELY: lightsTransformed cache preventing re-transform when view changes");
+        LOG::logline("=== END DIFF ===");
+    }
+};
+
+static LightSnapshot lightSnapshotA;
+static LightSnapshot lightSnapshotB;
 
 void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     {
@@ -3993,6 +4098,80 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
         wasPressed = false;
     }
 
+    // Helper: build LightCallInfo vector from recorded calls (first 20 + last 5)
+    auto buildLightCallInfos = [&]() -> std::vector<LightCallInfo> {
+        std::vector<LightCallInfo> infos;
+        size_t total = recordedCalls.size();
+        for (size_t i = 0; i < total; i++) {
+            bool shouldCapture = (i < 20) || (total > 5 && i >= total - 5);
+            if (!shouldCapture) continue;
+
+            const auto& call = recordedCalls[i];
+            LightCallInfo info;
+            info.activeCount = call.lightrs ? call.lightrs->active.size() : 0;
+            info.lightModeFlag = call.sk.lightMode;
+            info.lightsTransformedCount = call.lightrs ? call.lightrs->lightsTransformed.size() : 0;
+
+            info.pointLightCount = 0;
+            info.numPointLightDetails = 0;
+            if (call.lightrs) {
+                for (DWORD id : call.lightrs->active) {
+                    auto it = call.lightrs->lights.find(id);
+                    if (it != call.lightrs->lights.end() && it->second.type == D3DLIGHT_POINT) {
+                        info.pointLightCount++;
+                        if (info.numPointLightDetails < 3) {
+                            auto& d = info.pointLights[info.numPointLightDetails];
+                            d.id = id;
+                            d.wx = it->second.position.x;
+                            d.wy = it->second.position.y;
+                            d.wz = it->second.position.z;
+                            d.vx = it->second.viewspacePos.x;
+                            d.vy = it->second.viewspacePos.y;
+                            d.vz = it->second.viewspacePos.z;
+                            d.wasTransformed = (call.lightrs->lightsTransformed.find(id) != call.lightrs->lightsTransformed.end());
+                            info.numPointLightDetails++;
+                        }
+                    }
+                }
+            }
+            infos.push_back(info);
+        }
+        return infos;
+    };
+
+    // F5: Capture light snapshot A ("good angle")
+    if (GetAsyncKeyState(VK_F5) & 0x8000) {
+        static bool wasPressed = false;
+        if (!wasPressed) {
+            lightSnapshotA.capture(buildLightCallInfos(), currentView, recordingDeviceView);
+            lightSnapshotA.log("A (good angle)");
+            StatusOverlay::setStatus("Light snapshot A captured (good angle)");
+            wasPressed = true;
+        }
+    } else {
+        static bool wasPressed = false;
+        wasPressed = false;
+    }
+
+    // F6: Capture light snapshot B ("bad angle") and log diff
+    if (GetAsyncKeyState(VK_F6) & 0x8000) {
+        static bool wasPressed = false;
+        if (!wasPressed) {
+            lightSnapshotB.capture(buildLightCallInfos(), currentView, recordingDeviceView);
+            lightSnapshotB.log("B (bad angle)");
+            if (lightSnapshotA.valid) {
+                LightSnapshot::logDiff(lightSnapshotA, lightSnapshotB);
+            } else {
+                LOG::logline(">> No snapshot A captured yet. Press F5 first at good angle.");
+            }
+            StatusOverlay::setStatus("Light snapshot B captured + diff logged");
+            wasPressed = true;
+        }
+    } else {
+        static bool wasPressed = false;
+        wasPressed = false;
+    }
+
     // Calculate camera velocity from previous frame (to compensate for one-frame-behind Hi-Z)
     D3DXVECTOR3 currentCameraPos = D3DXVECTOR3(DistantLand::eyePos.x, DistantLand::eyePos.y, DistantLand::eyePos.z);
     D3DXVECTOR3 cameraVelocity(0.0f, 0.0f, 0.0f);
@@ -4011,21 +4190,162 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     // Light culling using Hi-Z occlusion (skip if disabled for profiling)
     if (ImGuiManager::GetEnableLightProcessing()) {
         DistantLand::cullSceneLights(viewProj);
-
-        // Upload visible lights to GPU texture (may stall if GPU idle)
-        DistantLand::uploadLightDataToTexture(currentView);
     }
 
-    // Set light count parameter for shaders
-    int numLights = (int)DistantLand::visibleLights.size();
-    float lightParams[4] = {
-        (float)numLights,                               // numLights
-        numLights > 0 ? 1.0f / (numLights * 3) : 0.0f,  // texelSize
-        0.0f, 0.0f
-    };
+    // Per-object light packing for mode 3 (saturated Morrowind assignment)
+    // Instead of uploading all visibleLights globally, each mode 3 object gets
+    // only its spatially-nearby lights packed into the texture.
+    int numVisibleLights = (int)DistantLand::visibleLights.size();
     {
-        ZoneScopedN("replay_SetLightParams");
-        device->SetPixelShaderConstantF(50, lightParams, 1); // c50
+        ZoneScopedN("replay_PerObjectLightPack");
+        const size_t numCallsForPack = recordedCalls.size();
+        perObjectLightInfo.resize(numCallsForPack);
+        memset(perObjectLightInfo.data(), 0, numCallsForPack * sizeof(PerObjectLightInfo));
+
+        // Flat buffer: 12 floats per light (3 texels × 4 floats), packed contiguously
+        std::vector<float> packedLightData;
+        int currentTexelOffset = 0;
+        int mode3Count = 0;
+        int maxPerObjectLights = 0;
+
+        for (size_t i = 0; i < numCallsForPack; i++) {
+            if (recordedCalls[i].sk.lightMode != 3) continue;
+
+            const auto& call = recordedCalls[i];
+
+            // Bounding box for sphere-AABB intersection test
+            // For large meshes, lights can be inside the bbox but far from center
+            D3DXVECTOR3 bMin, bMax;
+            if (call.hasBoundingBox) {
+                bMin = call.bboxMin;
+                bMax = call.bboxMax;
+            } else {
+                // No bbox: use object origin as a point
+                float ox = call.rs.worldTransforms[0]._41;
+                float oy = call.rs.worldTransforms[0]._42;
+                float oz = call.rs.worldTransforms[0]._43;
+                bMin = bMax = D3DXVECTOR3(ox, oy, oz);
+            }
+
+            int count = 0;
+
+            for (const auto& light : DistantLand::visibleLights) {
+                // Sphere-AABB intersection: closest point on bbox to light center
+                float cx = (light.position.x < bMin.x) ? bMin.x : (light.position.x > bMax.x) ? bMax.x : light.position.x;
+                float cy = (light.position.y < bMin.y) ? bMin.y : (light.position.y > bMax.y) ? bMax.y : light.position.y;
+                float cz = (light.position.z < bMin.z) ? bMin.z : (light.position.z > bMax.z) ? bMax.z : light.position.z;
+                float dx = light.position.x - cx;
+                float dy = light.position.y - cy;
+                float dz = light.position.z - cz;
+                float dist2 = dx*dx + dy*dy + dz*dz;
+                float lightRadius = light.radius;
+                if (dist2 < lightRadius * lightRadius) {
+                    // Transform to view-space and pack 12 floats (3 texels)
+                    D3DXVECTOR4 worldPos4(light.position.x, light.position.y, light.position.z, 1.0f);
+                    D3DXVECTOR4 viewPos4;
+                    D3DXVec4Transform(&viewPos4, &worldPos4, &currentView);
+
+                    // Texel 0: view-space position + radius
+                    packedLightData.push_back(viewPos4.x);
+                    packedLightData.push_back(viewPos4.y);
+                    packedLightData.push_back(viewPos4.z);
+                    packedLightData.push_back(light.radius);
+
+                    // Texel 1: color
+                    packedLightData.push_back(light.diffuse.r);
+                    packedLightData.push_back(light.diffuse.g);
+                    packedLightData.push_back(light.diffuse.b);
+                    packedLightData.push_back(0.0f);
+
+                    // Texel 2: falloff parameters
+                    packedLightData.push_back(light.falloff.x);  // constant
+                    packedLightData.push_back(light.falloff.y);  // linear
+                    packedLightData.push_back(light.falloff.z);  // quadratic
+                    packedLightData.push_back(0.0f);
+
+                    count++;
+                }
+            }
+
+            perObjectLightInfo[i] = {currentTexelOffset, count};
+            currentTexelOffset += count * 3;  // 3 texels per light
+
+            // Diagnostic: log first mode 3 object's bbox and nearest light (sphere-AABB distance)
+            if (mode3Count == 0 && !DistantLand::visibleLights.empty()) {
+                float nearestDist = FLT_MAX;
+                int nearestIdx = -1;
+                float nearestRadius = 0;
+                for (int li = 0; li < (int)DistantLand::visibleLights.size(); li++) {
+                    const auto& light = DistantLand::visibleLights[li];
+                    float cx = (light.position.x < bMin.x) ? bMin.x : (light.position.x > bMax.x) ? bMax.x : light.position.x;
+                    float cy = (light.position.y < bMin.y) ? bMin.y : (light.position.y > bMax.y) ? bMax.y : light.position.y;
+                    float cz = (light.position.z < bMin.z) ? bMin.z : (light.position.z > bMax.z) ? bMax.z : light.position.z;
+                    float dx = light.position.x - cx, dy = light.position.y - cy, dz = light.position.z - cz;
+                    float d = sqrtf(dx*dx + dy*dy + dz*dz);
+                    if (d < nearestDist) { nearestDist = d; nearestIdx = li; nearestRadius = light.radius; }
+                }
+                LOG::logline("Mode3 diag: obj[%d] bbox=(%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f) nearest light[%d] dist=%.1f radius=%.1f found=%d",
+                    (int)i, bMin.x, bMin.y, bMin.z, bMax.x, bMax.y, bMax.z,
+                    nearestIdx, nearestDist, nearestRadius, count);
+            }
+
+            mode3Count++;
+            if (count > maxPerObjectLights) maxPerObjectLights = count;
+        }
+
+        int totalTexels = currentTexelOffset;
+        perObjectTexelSize = totalTexels > 0 ? 1.0f / totalTexels : 0.0f;
+
+        // Upload packed light data to per-object texture
+        if (totalTexels > 0) {
+            // Create or resize texture if needed
+            if (!texPerObjectLightData) {
+                HRESULT hr = device->CreateTexture(
+                    totalTexels, 1, 1, 0,
+                    D3DFMT_A32B32G32R32F, D3DPOOL_MANAGED,
+                    &texPerObjectLightData, nullptr);
+                if (FAILED(hr)) {
+                    LOG::logline("!! Failed to create per-object light texture (hr=0x%X)", hr);
+                    texPerObjectLightData = nullptr;
+                }
+            } else {
+                D3DSURFACE_DESC desc;
+                texPerObjectLightData->GetLevelDesc(0, &desc);
+                if (desc.Width != (UINT)totalTexels) {
+                    texPerObjectLightData->Release();
+                    HRESULT hr = device->CreateTexture(
+                        totalTexels, 1, 1, 0,
+                        D3DFMT_A32B32G32R32F, D3DPOOL_MANAGED,
+                        &texPerObjectLightData, nullptr);
+                    if (FAILED(hr)) {
+                        LOG::logline("!! Failed to resize per-object light texture (hr=0x%X)", hr);
+                        texPerObjectLightData = nullptr;
+                    }
+                }
+            }
+
+            if (texPerObjectLightData) {
+                D3DLOCKED_RECT locked;
+                if (SUCCEEDED(texPerObjectLightData->LockRect(0, &locked, nullptr, 0))) {
+                    memcpy(locked.pBits, packedLightData.data(), totalTexels * 4 * sizeof(float));
+                    texPerObjectLightData->UnlockRect(0);
+                }
+                device->SetTexture(5, texPerObjectLightData);
+            }
+        }
+
+        if (mode3Count > 0) {
+            LOG::logline("Mode3 packing: %d objects, maxLights/obj=%d, totalTexels=%d (from %d visible)",
+                mode3Count, maxPerObjectLights, totalTexels, numVisibleLights);
+        }
+    }
+
+    // For mode 0-2 objects, also upload global light data for non-mode-3 texture access
+    // Mode 2 uses uniform constants (not texture), mode 3 uses per-object texture via c50
+    // Set default c50 for non-mode-3 objects (will be overridden per-draw for mode 3)
+    {
+        float lightParams[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        device->SetPixelShaderConstantF(50, lightParams, 1);
     }
 
     // Inline Hi-Z culling using current matrices (same as bbox visualization)
@@ -4124,7 +4444,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
                     // Invalidate cache since we bypassed it with raw SetRenderState
                     materialCache.reset();
                 }
-                renderMorrowindHLSL_Internal(&call.rs, &call.frs, call.lightrs.get(), call.dirtyFlags);
+                renderMorrowindHLSL_Internal(&call.rs, &call.frs, call.lightrs.get(), call.dirtyFlags, (int)i);
                 if (!firstDrawDone) {
                     ZoneScopedN("replay_FirstDrawDone");
                     firstDrawDone = true;
@@ -4140,11 +4460,37 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
                  totalCalls > 0 ? (culledCalls * 100.0f) / totalCalls : 0.0f,
                  cacheHits, cacheMisses);
 
+    // Per-frame light summary: scan all calls for point light statistics and mode distribution
+    {
+        int minPL = INT_MAX, maxPL = 0;
+        double sumPL = 0;
+        int litCalls = 0;
+        int modeCounts[4] = {0, 0, 0, 0};
+        for (const auto& call : recordedCalls) {
+            if (call.sk.lightMode < 4) modeCounts[call.sk.lightMode]++;
+            if (!call.lightrs) continue;
+            int pl = 0;
+            for (DWORD id : call.lightrs->active) {
+                auto it = call.lightrs->lights.find(id);
+                if (it != call.lightrs->lights.end() && it->second.type == D3DLIGHT_POINT) pl++;
+            }
+            if (pl < minPL) minPL = pl;
+            if (pl > maxPL) maxPL = pl;
+            sumPL += pl;
+            litCalls++;
+        }
+        if (litCalls == 0) minPL = 0;
+        LOG::logline("Lights: %d scene, %d visible, perObj: min=%d max=%d avg=%.1f (%d calls) modes:[%d,%d,%d,%d]",
+            (int)DistantLand::sceneLights.size(), numVisibleLights, minPL, maxPL,
+            litCalls > 0 ? sumPL / litCalls : 0.0, litCalls,
+            modeCounts[0], modeCounts[1], modeCounts[2], modeCounts[3]);
+    }
+
     // Update ImGui debug stats
     ImGuiManager::UpdateDebugStats(
         totalCalls, renderedCalls, culledCalls,
-        (int)DistantLand::sceneLights.size(), numLights,
-        (int)DistantLand::recordMW.size(), 0  // Now shows filtered count
+        (int)DistantLand::sceneLights.size(), numVisibleLights,
+        (int)DistantLand::recordMW.size(), 0
     );
 
     // Debug visualization: Render bounding boxes with color-coded status from ImGui

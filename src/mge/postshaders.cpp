@@ -4,6 +4,7 @@
 #include "configuration.h"
 #include "mwbridge.h"
 #include "postshaders.h"
+#include "distantland.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -620,12 +621,27 @@ void PostShaders::shaderTime(MGEShaderUpdateFunc updateVarsFunc, int environment
         return; // Skip rendering this frame if still loading
     }
 
+    // Early-out if no shaders will actually render (avoids RT/DS switches and StretchRect)
+    {
+        bool anyActive = false;
+        for (auto& s : shaders) {
+            if (s->enabled && !(s->disableFlags & environmentFlags)) {
+                anyActive = true;
+                break;
+            }
+        }
+        if (!anyActive && !(Configuration.MGEFlags & USE_HDR)) {
+            return;
+        }
+    }
+
     IDirect3DSurface9* backbuffer, *depthstencil;
 
     // Turn off depth stencil use
     device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backbuffer);
     device->GetDepthStencilSurface(&depthstencil);
     device->SetDepthStencilSurface(NULL);
+    g_passBreaks.mge_postRT++; // SetDepthStencilSurface(NULL)
 
     // Turn off useless states
     device->SetRenderState(D3DRS_ZENABLE, 0);
@@ -648,6 +664,7 @@ void PostShaders::shaderTime(MGEShaderUpdateFunc updateVarsFunc, int environment
 
     // Resolve back buffer to lastshader surface
     device->StretchRect(backbuffer, 0, surfaceLastShader, 0, D3DTEXF_NONE);
+    g_passBreaks.mge_stretchRect++;
 
     // Set vertex buffer
     device->SetFVF(fvfPost);
@@ -678,6 +695,7 @@ void PostShaders::shaderTime(MGEShaderUpdateFunc updateVarsFunc, int environment
 
         for (UINT p = 0; p != passes; ++p) {
             device->SetRenderTarget(0, doublebuffer.sinkSurface());
+            g_passBreaks.mge_postRT++; // per-pass RT switch
             s->SetTexture(EV_lastpass, doublebuffer.sourceTexture());
 
             effect->BeginPass(p);
@@ -695,10 +713,12 @@ void PostShaders::shaderTime(MGEShaderUpdateFunc updateVarsFunc, int environment
 
     // Copy result to back buffer
     device->StretchRect(surfaceLastShader, 0, backbuffer, 0, D3DTEXF_NONE);
+    g_passBreaks.mge_stretchRect++;
 
     // Restore render target
     device->SetRenderTarget(0, backbuffer);
     device->SetDepthStencilSurface(depthstencil);
+    g_passBreaks.mge_postRT += 2; // SetRenderTarget + SetDepthStencilSurface restore
     backbuffer->Release();
     depthstencil->Release();
 }
