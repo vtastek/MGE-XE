@@ -107,7 +107,6 @@ public:
     static IDirect3DTexture9* texCullDepth; // Cull-only depth (recordMW only, for Hi-Z)
     static IDirect3DTexture9* texHiZ; // Hi-Z pyramid - even mips (0,2,4...) for ping-pong generation
     static IDirect3DTexture9* texHiZPrev; // Hi-Z pyramid - odd mips (1,3,5...) for ping-pong generation
-    static IDirect3DTexture9* texHiZPrevFrame; // Consolidated Hi-Z pyramid from previous frame (for GPU culling)
     static IDirect3DTexture9* texHiZStaging; // Staging texture for CPU readback - frame N (async copy target)
     static IDirect3DTexture9* texHiZStaging2; // Staging texture - frame N-1 (1 frame old, still copying)
     static IDirect3DTexture9* texHiZStagingPrev; // Staging texture - frame N-2 (2 frames old, safe to lock)
@@ -121,18 +120,6 @@ public:
     static IDirect3DPixelShader9* psHiZ; // Cached Hi-Z pixel shader (compiled once)
     static int hiZLevels; // Number of levels in Hi-Z pyramid (total texture mips)
     static int hiZValidMips; // Number of actually generated mips (stops at 8x8 minimum)
-
-    // GPU-based Hi-Z culling resources
-    static ID3DXEffect* effectGPUCull; // GPU culling shader
-    static IDirect3DVertexBuffer9* vbGPUCullBounds; // Vertex buffer for bounding boxes
-    static IDirect3DVertexDeclaration9* declGPUCullBounds; // Vertex declaration for bbox data
-    static IDirect3DTexture9* texGPUCullResults; // Results texture (GPU memory, render target)
-    static IDirect3DSurface9* surfGPUCullResults; // Surface for results texture
-    static IDirect3DTexture9* texGPUCullResultsSys; // Results texture (system memory, for readback)
-    static IDirect3DSurface9* surfGPUCullResultsSys; // Surface for system memory results
-    static UINT gpuCullResultsWidth; // Results texture width
-    static UINT gpuCullResultsHeight; // Results texture height
-    static UINT gpuCullMaxObjects; // Maximum number of objects that can be culled in one batch
 
     static IDirect3DTexture9* texDistantBlend;
     static IDirect3DTexture9* texReflection;
@@ -162,7 +149,6 @@ public:
     };
     static std::vector<SceneLight> sceneLights;       // All unique lights in scene
     static std::unordered_map<int, size_t> sceneLightIndexMap;  // ID -> index for O(1) lookup
-    static std::vector<SceneLight> visibleLights;     // After Hi-Z culling
     static IDirect3DTexture9* texLightData;           // GPU texture with light data
 
     static D3DXMATRIX mwView, mwProj;
@@ -272,25 +258,14 @@ public:
     static void renderDepthAdditional();
     static void renderDepthRecorded();
     static void generateHiZMipsGPU();
-    static void consolidateHiZPyramid();
     static void copyHiZToStaging();
     static void lockRemainingHiZMips();
     static void saveHiZSnapshot(); // Save Hi-Z pyramid to temp folder (all mip levels)
 
-    // GPU-based Hi-Z occlusion culling
-    static void initGPUCulling();
-    static void shutdownGPUCulling();
-    static void beginGPUCullingQuery(int numObjects, const D3DXVECTOR3* bboxMins, const D3DXVECTOR3* bboxMaxs, const D3DXMATRIX& view, const D3DXMATRIX& proj);
-    static void endGPUCullingQuery(int numObjects, bool* visibilityResults);
-
-    // Legacy CPU-based culling (will be replaced by GPU culling)
+    // CPU-based Hi-Z culling
     static bool cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& bboxMax, const D3DXMATRIX& worldViewProj, bool debugLog = false);
-    static bool cullLightAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& bboxMax, const D3DXMATRIX& worldViewProj);
-
     // Texture-based lighting system
     static float computeLightRadius(float constant, float linear, float quadratic);
-    static void cullSceneLights(const D3DXMATRIX& viewProj);
-    static void uploadLightDataToTexture(const D3DXMATRIX& viewMatrix);
 
     static void renderShadowMap();
     template<class T>

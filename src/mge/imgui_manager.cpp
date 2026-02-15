@@ -24,22 +24,19 @@ bool ImGuiManager::enableRecording = true;
 bool ImGuiManager::enableReplay = true;
 bool ImGuiManager::enableImmediateRendering = true;
 bool ImGuiManager::enableDepthPass = true;
-bool ImGuiManager::enableLightProcessing = true;
 int ImGuiManager::bboxVisualizationMode = 0;
+bool ImGuiManager::disableHiZCulling = false;
 
 // Debug stats
 int ImGuiManager::debugRecordedCalls = 0;
 int ImGuiManager::debugRenderedCalls = 0;
 int ImGuiManager::debugCulledCalls = 0;
 int ImGuiManager::debugSceneLights = 0;
-int ImGuiManager::debugVisibleLights = 0;
 int ImGuiManager::debugRecordMWSize = 0;
 int ImGuiManager::debugImmediateCount = 0;
 
 // Hi-Z visualization variables
 int ImGuiManager::hiZDisplayMip = 0;
-float ImGuiManager::hiZBrightness = 1.0f;
-float ImGuiManager::hiZGamma = 2.2f;
 bool ImGuiManager::hiZInvert = false;
 bool ImGuiManager::hiZShowRaycastGrid = false;
 int ImGuiManager::hiZRaycastStep = 2;
@@ -69,6 +66,9 @@ bool ImGuiManager::rasterizeAll = false;
 // Debug/Performance mode toggles
 bool ImGuiManager::stateLeakDetection = false;
 bool ImGuiManager::performanceMode = true;
+
+// Debug hotkey gating
+bool ImGuiManager::debugKeysEnabled = false;
 
 // Hi-Z single object visualization mode
 bool ImGuiManager::hiZSingleObjectMode = false;
@@ -303,11 +303,16 @@ void ImGuiManager::OnResetDevice() {
     }
 }
 
+bool ImGuiManager::GetDebugKeysEnabled() { return debugKeysEnabled; }
+
 void ImGuiManager::RenderDebugInterface() {
     ImGui::SetNextWindowPos(ImVec2(400, 10), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(450, 400), ImGuiCond_FirstUseEver);
 
     if (ImGui::Begin("HLSL Pipeline Debug", &showDebugInterface, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Checkbox("Enable Debug Hotkeys (F11/U/Y/L/F5/F6/K/O)", &debugKeysEnabled);
+        ImGui::Separator();
+
         ImGui::Text("Recording/Replay System (Scene 0)");
         ImGui::Separator();
 
@@ -317,7 +322,7 @@ void ImGuiManager::RenderDebugInterface() {
         ImGui::Checkbox("Enable Replay", &enableReplay);
         ImGui::Checkbox("Enable Immediate Rendering (Scene 1+)", &enableImmediateRendering);
         ImGui::Checkbox("Enable Depth Pass (recordMW)", &enableDepthPass);
-        ImGui::Checkbox("Enable Light Processing", &enableLightProcessing);
+        ImGui::Checkbox("Disable Hi-Z Culling (terrain hole diagnosis)", &disableHiZCulling);
 
         ImGui::Separator();
         ImGui::Text("Optimization Modes");
@@ -341,8 +346,6 @@ void ImGuiManager::RenderDebugInterface() {
         // Lighting stats
         ImGui::Text("Lights:");
         ImGui::Text("  Scene Lights: %d", debugSceneLights);
-        ImGui::Text("  Visible: %d", debugVisibleLights);
-        ImGui::Text("  Culled: %d", debugSceneLights - debugVisibleLights);
 
         ImGui::Separator();
 
@@ -379,16 +382,15 @@ bool ImGuiManager::GetEnableRecording() { return enableRecording; }
 bool ImGuiManager::GetEnableReplay() { return enableReplay; }
 bool ImGuiManager::GetEnableImmediateRendering() { return enableImmediateRendering; }
 bool ImGuiManager::GetEnableDepthPass() { return enableDepthPass; }
-bool ImGuiManager::GetEnableLightProcessing() { return enableLightProcessing; }
 int ImGuiManager::GetBBoxVisualizationMode() { return bboxVisualizationMode; }
+bool ImGuiManager::GetDisableHiZCulling() { return disableHiZCulling; }
 
 void ImGuiManager::UpdateDebugStats(int recordedCalls, int renderedCalls, int culledCalls,
-                                     int sceneLights, int visibleLights, int recordMWSize, int immediateCount) {
+                                     int sceneLights, int recordMWSize, int immediateCount) {
     debugRecordedCalls = recordedCalls;
     debugRenderedCalls = renderedCalls;
     debugCulledCalls = culledCalls;
     debugSceneLights = sceneLights;
-    debugVisibleLights = visibleLights;
     debugRecordMWSize = recordMWSize;
     debugImmediateCount = immediateCount;
 }
@@ -406,8 +408,6 @@ void ImGuiManager::RenderHiZInterface() {
             // Display controls
             ImGui::Text("Visualization Settings");
             ImGui::SliderInt("Mip Level", &hiZDisplayMip, 0, maxMipLevel);
-            ImGui::SliderFloat("Brightness", &hiZBrightness, 0.1f, 10.0f, "%.2f");
-            ImGui::SliderFloat("Gamma", &hiZGamma, 0.5f, 4.0f, "%.2f");
             ImGui::Checkbox("Invert Depth", &hiZInvert);
 
             ImGui::Separator();

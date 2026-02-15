@@ -218,6 +218,9 @@ class FixedFunctionShader {
     static HLSLShaderLRU hlslShaderLRU;
     static HLSLShader hlslShaderDefaultPurple;
 
+    // Diagnostic: track which precached variants get hit (temporary)
+    static std::unordered_set<ShaderKey, ShaderKey::hasher> diagHitKeys;
+
     // Shader source caching for hot reload support
     struct CachedShaderSource {
         char* source;
@@ -225,7 +228,8 @@ class FixedFunctionShader {
         FILETIME lastWriteTime;
     };
     static std::unordered_map<std::string, CachedShaderSource> shaderSourceCache;
-    static bool needsCacheReset;  // Flag to trigger cache reset after file changes
+    static SRWLOCK hlslCacheLock;  // Protects cacheHLSLShaders (zero-init = valid)
+    static HANDLE precacheThread;  // Joinable precache thread handle
 
     // Material state cache to minimize redundant SetRenderState calls
     struct MaterialStateCache {
@@ -606,7 +610,6 @@ public:
 
     static bool init(IDirect3DDevice* d, ID3DXEffectPool* pool);
     static void startEarlyPrecache(IDirect3DDevice* d);
-    static void precacheAsync();
     static void updateLighting(float sunMult, float ambMult);
     static void renderMorrowind(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, int recordMWIdx = -1);
     static void renderMorrowindHLSL(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, int recordMWIdx = -1);

@@ -1,6 +1,6 @@
 
 #include "ffeshader.h"
-#include "tracy/Tracy.hpp"
+#include "mge_tracy.h"
 #include "configuration.h"
 #include "support/log.h"
 #include "mwbridge.h"
@@ -60,6 +60,10 @@ bool FixedFunctionShader::recordingEnabled = true;
 bool FixedFunctionShader::recordingCompletedThisFrame = false;
 bool FixedFunctionShader::hiZBuiltThisFrame = false;
 bool FixedFunctionShader::dumpRequested = false;
+
+// Diagnostic: cache hit/miss logging for first N frames (temporary)
+static int hlslDiagFrameCounter = 0;
+std::unordered_set<FixedFunctionShader::ShaderKey, FixedFunctionShader::ShaderKey::hasher> FixedFunctionShader::diagHitKeys;
 
 // Consistent matrices for entire recording session
 D3DXMATRIX FixedFunctionShader::recordingDeviceView;
@@ -125,7 +129,8 @@ float FixedFunctionShader::perObjectTexelSize = 0.0f;
 IDirect3DTexture9* FixedFunctionShader::texPerObjectLightData = nullptr;
 
 std::unordered_map<std::string, FixedFunctionShader::CachedShaderSource> FixedFunctionShader::shaderSourceCache;
-bool FixedFunctionShader::needsCacheReset = false;
+SRWLOCK FixedFunctionShader::hlslCacheLock = SRWLOCK_INIT;
+HANDLE FixedFunctionShader::precacheThread = nullptr;
 
 // Async compilation system static variables
 std::queue<std::shared_ptr<FixedFunctionShader::AsyncShaderRequest>> FixedFunctionShader::compilationQueue;
@@ -315,6 +320,14 @@ static bool isDXVK() {
 }
 
 bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
+    // Join precache thread — it ran during BSA/distant land init, should be nearly done
+    if (precacheThread) {
+        WaitForSingleObject(precacheThread, INFINITE);
+        CloseHandle(precacheThread);
+        precacheThread = nullptr;
+        LOG::logline("-- Precache thread joined, %d shaders in cache", (int)cacheHLSLShaders.size());
+    }
+
     device = d;
     constantPool = pool;
 
@@ -379,70 +392,16 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
         MWBridge::get()->disableSunglare();
         LOG::logline("-- Morrowind sunglare disabled for HLSL mode");
 
-        // Clear HLSL cache and LRU
+        // Reset LRU only — don't clear cacheHLSLShaders, precache thread already populated it
         hlslShaderLRU.shader = {};
         hlslShaderLRU.last_sk = ShaderKey();
-        cacheHLSLShaders.clear();
         
         // Create default error shader for HLSL pipeline
         hlslShaderDefaultPurple = createPurpleErrorShader();
-        
-        // Compile essential shaders synchronously to prevent startup regression
-        LOG::logline("-- Compiling essential HLSL shaders synchronously");
-        
-        // Most basic variants needed for immediate rendering
-        struct EssentialVariant {
-            int lighting; int lightMode; int vertexCol; int skinning;
-            int hasDiffParam; int hasParamH; int hasParamX; int fogMode; int stages;
-        };
 
-        EssentialVariant essentials[] = {
-            // Unlit base case
-            {0, 0, 0, 0, 0, 0, 0, 1, 1},
-            // Basic lit case (sun only, no vertex color, no skinning)
-            {1, 0, 0, 0, 0, 0, 0, 1, 1},
-            // Basic lit with vertex color
-            {1, 0, 1, 0, 0, 0, 0, 1, 1},
-            // Lit with single point light
-            {1, 1, 0, 0, 0, 0, 0, 1, 1},
-            {1, 1, 1, 0, 0, 0, 0, 1, 1},
-            // Lit with few point lights (loop)
-            {1, 2, 0, 0, 0, 0, 0, 1, 1},
-            {1, 2, 1, 0, 0, 0, 0, 1, 1},
-        };
-
-        for (const auto& variant : essentials) {
-            ShaderKey sk;
-            memset(&sk, 0, sizeof(sk));
-            sk.uvSets = 1;
-            sk.useLighting = variant.lighting;
-            sk.lightMode = variant.lightMode;
-            sk.vertexColour = variant.vertexCol;
-            sk.vertexMaterial = variant.vertexCol + 1;
-            sk.usesSkinning = variant.skinning;
-            sk.hasDiffParam = variant.hasDiffParam;
-            sk.hasParamH = variant.hasParamH;
-            sk.hasParamX = variant.hasParamX;
-            sk.fogMode = variant.fogMode;
-            sk.activeStages = variant.stages;
-            sk.hasShadows = ((Configuration.MGEFlags & USE_SHADOWS) && (Configuration.MGEFlags & USE_DISTANT_LAND)) ? 1 : 0;
-
-            HLSLShader shader = generateMWShaderHLSL(sk);
-            if (shader.vertexShader && shader.pixelShader) {
-                cacheHLSLShaders[sk] = shader;
-                LOG::logline("-- Essential HLSL shader compiled: lighting=%d lightMode=%d vertexCol=%d",
-                            variant.lighting, variant.lightMode, variant.vertexCol);
-            }
-        }
-        
         // Start async compiler for on-demand compilation of remaining variants
+        // (precache thread already populated the cache during splash screens)
         startAsyncCompiler();
-    }
-
-    // Start shader precaching immediately after init - moved earlier for faster startup
-    if (Configuration.MGEFlags & USE_FFESHADER) {
-        LOG::logline("-- Starting early shader precaching");
-        precacheAsync();
     }
 
     // Create default textures to avoid null binds that cause DXVK descriptor updates
@@ -472,394 +431,149 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
 }
 
 void FixedFunctionShader::startEarlyPrecache(IDirect3DDevice* d) {
-    // Set device early and start immediate precaching
+    // Set device early and start immediate precaching in a tracked thread
     if (!device && d) {
         device = d;
-        LOG::logline("-- Starting immediate HLSL shader precaching");
-        
-        // Start the full precaching immediately in the background
-        // This runs the same code as precacheAsync but starts much earlier
-        std::thread immediateThread([]() {
+        LOG::logline("-- Starting immediate HLSL shader precaching (tracked thread)");
+
+        // Launch a joinable Win32 thread (can be stopped on cell change / shutdown)
+        precacheThread = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
             bool hlslMode = (Configuration.PerPixelLightFlags == 2);
-            
+
             if (hlslMode) {
-                LOG::logline("-- Immediate HLSL shader precaching started");
-                
+                LOG::logline("-- Precache thread started");
+
                 int hlslVariants = 0;
-                
-                // Progress tracking for status overlay
+
                 auto updateStatus = [&](int current, int total) {
                     char progressText[128];
                     std::snprintf(progressText, sizeof(progressText), "Compiling HLSL shaders: %d/%d", current, total);
                     StatusOverlay::setStatus(progressText);
                 };
-                
-                // Same essential variants as in the main precaching
-                // format: {lighting, lightMode, vertexCol, skinning, hasDiffParam, hasParamH, hasParamX, fogMode, stages}
+
+                // Variant struct: {lighting, lightMode, vertexCol, vertexMat, heavyLighting, skinning, dp, ph, px, fogMode, stages}
+                // Derived from runtime hit data — only variants actually seen in gameplay
                 struct ShaderVariant {
-                    int lighting;
-                    int lightMode;
-                    int vertexCol;
-                    int skinning;
-                    int hasDiffParam;
-                    int hasParamH;
-                    int hasParamX;
-                    int fogMode;
-                    int stages;
+                    int lighting, lightMode, vertexCol, vertexMat, heavyLighting, skinning;
+                    int hasDiffParam, hasParamH, hasParamX, fogMode, stages;
                 };
 
                 ShaderVariant variants[] = {
-                    // Basic unlit variants (2)
-                    {0, 0, 0, 0, 0, 0, 0, 1, 1}, {0, 0, 1, 0, 0, 0, 0, 1, 1},
+                    // lm=0 (sun only) — base, dp+ph, skinning, vm=1 skinning
+                    {1,0, 0,1, 0,0, 0,0,0, 1,1}, {1,0, 1,2, 0,0, 0,0,0, 1,1},
+                    {1,0, 0,1, 0,0, 1,1,0, 1,1}, {1,0, 1,2, 0,0, 1,1,0, 1,1},
+                    {1,0, 0,1, 0,1, 0,0,0, 1,1}, {1,0, 1,2, 0,1, 0,0,0, 1,1},
+                    {1,0, 1,1, 0,0, 0,0,0, 1,1}, {1,0, 1,1, 0,1, 0,0,0, 1,1},
+                    {1,0, 1,1, 0,1, 1,1,0, 1,1},
+                    {1,0, 0,1, 0,0, 0,0,0, 1,2},  // dual texture
 
-                    // Basic lit variants - sun only, lightMode=0 (4)
-                    {1, 0, 0, 0, 0, 0, 0, 1, 1}, {1, 0, 1, 0, 0, 0, 0, 1, 1}, {1, 0, 0, 1, 0, 0, 0, 1, 1}, {1, 0, 1, 1, 0, 0, 0, 1, 1},
+                    // lm=1 (single point light) — base, dp+ph, skinning, vm=1 skinning
+                    {1,1, 0,1, 0,0, 0,0,0, 1,1}, {1,1, 1,2, 0,0, 0,0,0, 1,1},
+                    {1,1, 0,1, 0,0, 1,1,0, 1,1}, {1,1, 1,2, 0,0, 1,1,0, 1,1},
+                    {1,1, 0,1, 0,1, 0,0,0, 1,1},
+                    {1,1, 1,1, 0,1, 0,0,0, 1,1}, {1,1, 1,1, 0,1, 1,1,0, 1,1},
+                    {1,1, 1,2, 0,0, 0,0,0, 2,1},  // fog=2
 
-                    // Lit with single point light, lightMode=1 (4)
-                    {1, 1, 0, 0, 0, 0, 0, 1, 1}, {1, 1, 1, 0, 0, 0, 0, 1, 1}, {1, 1, 0, 1, 0, 0, 0, 1, 1}, {1, 1, 1, 1, 0, 0, 0, 1, 1},
+                    // lm=2 (few lights) — hl=0 and hl=1, base, dp+ph, skinning
+                    {1,2, 0,1, 0,0, 0,0,0, 1,1}, {1,2, 0,1, 1,0, 0,0,0, 1,1},
+                    {1,2, 1,2, 0,0, 0,0,0, 1,1}, {1,2, 1,2, 1,0, 0,0,0, 1,1},
+                    {1,2, 0,1, 0,0, 1,1,0, 1,1}, {1,2, 0,1, 1,0, 1,1,0, 1,1},
+                    {1,2, 1,2, 0,0, 1,1,0, 1,1}, {1,2, 1,2, 1,0, 1,1,0, 1,1},
+                    {1,2, 0,1, 0,1, 0,0,0, 1,1}, {1,2, 0,1, 1,1, 0,0,0, 1,1},
+                    {1,2, 1,2, 0,1, 0,0,0, 1,1}, {1,2, 1,2, 1,1, 0,0,0, 1,1},
+                    {1,2, 1,1, 0,1, 1,1,0, 1,1},  // vm=1 skinning dp+ph
+                    {1,2, 0,1, 0,0, 0,0,0, 1,2},  // dual texture
+                    {1,2, 1,2, 0,0, 0,0,0, 2,1}, {1,2, 1,2, 1,0, 0,0,0, 2,1},  // fog=2
 
-                    // Lit with few point lights, lightMode=2 (4)
-                    {1, 2, 0, 0, 0, 0, 0, 1, 1}, {1, 2, 1, 0, 0, 0, 0, 1, 1}, {1, 2, 0, 1, 0, 0, 0, 1, 1}, {1, 2, 1, 1, 0, 0, 0, 1, 1},
-
-                    // Diffparam variants (12: lightMode 0,1,2 × vertCol 0/1)
-                    {1, 0, 0, 0, 1, 0, 0, 1, 1}, {1, 0, 1, 0, 1, 0, 0, 1, 1}, {1, 1, 0, 0, 1, 0, 0, 1, 1}, {1, 1, 1, 0, 1, 0, 0, 1, 1},
-                    {1, 2, 0, 0, 1, 0, 0, 1, 1}, {1, 2, 1, 0, 1, 0, 0, 1, 1},
-                    {1, 0, 0, 1, 1, 0, 0, 1, 1}, {1, 0, 1, 1, 1, 0, 0, 1, 1}, {1, 1, 0, 1, 1, 0, 0, 1, 1}, {1, 1, 1, 1, 1, 0, 0, 1, 1},
-                    {1, 2, 0, 1, 1, 0, 0, 1, 1}, {1, 2, 1, 1, 1, 0, 0, 1, 1},
-
-                    // ParamH variants (12)
-                    {1, 0, 0, 0, 0, 1, 0, 1, 1}, {1, 0, 1, 0, 0, 1, 0, 1, 1}, {1, 1, 0, 0, 0, 1, 0, 1, 1}, {1, 1, 1, 0, 0, 1, 0, 1, 1},
-                    {1, 2, 0, 0, 0, 1, 0, 1, 1}, {1, 2, 1, 0, 0, 1, 0, 1, 1},
-                    {1, 0, 0, 1, 0, 1, 0, 1, 1}, {1, 0, 1, 1, 0, 1, 0, 1, 1}, {1, 1, 0, 1, 0, 1, 0, 1, 1}, {1, 1, 1, 1, 0, 1, 0, 1, 1},
-                    {1, 2, 0, 1, 0, 1, 0, 1, 1}, {1, 2, 1, 1, 0, 1, 0, 1, 1},
-
-                    // Diffparam + ParamH (12)
-                    {1, 0, 0, 0, 1, 1, 0, 1, 1}, {1, 0, 1, 0, 1, 1, 0, 1, 1}, {1, 1, 0, 0, 1, 1, 0, 1, 1}, {1, 1, 1, 0, 1, 1, 0, 1, 1},
-                    {1, 2, 0, 0, 1, 1, 0, 1, 1}, {1, 2, 1, 0, 1, 1, 0, 1, 1},
-                    {1, 0, 0, 1, 1, 1, 0, 1, 1}, {1, 0, 1, 1, 1, 1, 0, 1, 1}, {1, 1, 0, 1, 1, 1, 0, 1, 1}, {1, 1, 1, 1, 1, 1, 0, 1, 1},
-                    {1, 2, 0, 1, 1, 1, 0, 1, 1}, {1, 2, 1, 1, 1, 1, 0, 1, 1},
-
-                    // ParamX variants (6: lightMode 0,2 × vertCol 0/1 × skinning 0/1, skip 1 for brevity)
-                    {1, 0, 0, 0, 0, 0, 1, 1, 1}, {1, 0, 1, 0, 0, 0, 1, 1, 1}, {1, 2, 0, 0, 0, 0, 1, 1, 1}, {1, 2, 1, 0, 0, 0, 1, 1, 1},
-                    {1, 0, 0, 1, 0, 0, 1, 1, 1}, {1, 0, 1, 1, 0, 0, 1, 1, 1},
-
-                    // Full combination diffparam+paramh+paramx (6)
-                    {1, 0, 0, 0, 1, 1, 1, 1, 1}, {1, 0, 1, 0, 1, 1, 1, 1, 1}, {1, 2, 0, 0, 1, 1, 1, 1, 1}, {1, 2, 1, 0, 1, 1, 1, 1, 1},
-                    {1, 0, 0, 1, 1, 1, 1, 1, 1}, {1, 0, 1, 1, 1, 1, 1, 1, 1},
-
-                    // Dual texture variants (12: lightMode 0,1,2 × vertCol 0/1)
-                    {1, 0, 0, 0, 0, 0, 0, 1, 2}, {1, 0, 1, 0, 0, 0, 0, 1, 2}, {1, 1, 0, 0, 0, 0, 0, 1, 2}, {1, 1, 1, 0, 0, 0, 0, 1, 2},
-                    {1, 2, 0, 0, 0, 0, 0, 1, 2}, {1, 2, 1, 0, 0, 0, 0, 1, 2},
-                    {1, 0, 0, 1, 0, 0, 0, 1, 2}, {1, 0, 1, 1, 0, 0, 0, 1, 2}, {1, 1, 0, 1, 0, 0, 0, 1, 2}, {1, 1, 1, 1, 0, 0, 0, 1, 2},
-                    {1, 2, 0, 1, 0, 0, 0, 1, 2}, {1, 2, 1, 1, 0, 0, 0, 1, 2},
-
-                    // Dual texture + diffparam (6)
-                    {1, 0, 0, 0, 1, 0, 0, 1, 2}, {1, 0, 1, 0, 1, 0, 0, 1, 2}, {1, 2, 0, 0, 1, 0, 0, 1, 2}, {1, 2, 1, 0, 1, 0, 0, 1, 2},
-                    {1, 0, 0, 1, 1, 0, 0, 1, 2}, {1, 0, 1, 1, 1, 0, 0, 1, 2},
-
-                    // Dual texture + paramH (6)
-                    {1, 0, 0, 0, 0, 1, 0, 1, 2}, {1, 0, 1, 0, 0, 1, 0, 1, 2}, {1, 2, 0, 0, 0, 1, 0, 1, 2}, {1, 2, 1, 0, 0, 1, 0, 1, 2},
-                    {1, 0, 0, 1, 0, 1, 0, 1, 2}, {1, 0, 1, 1, 0, 1, 0, 1, 2},
-
-                    // No fog variants (6)
-                    {1, 0, 0, 0, 0, 0, 0, 0, 1}, {1, 0, 1, 0, 0, 0, 0, 0, 1}, {1, 2, 0, 0, 0, 0, 0, 0, 1}, {1, 2, 1, 0, 0, 0, 0, 0, 1},
-                    {1, 0, 0, 0, 1, 0, 0, 0, 1}, {1, 0, 1, 0, 1, 0, 0, 0, 1},
-
-                    // Fog mode 2 variants (6)
-                    {1, 0, 0, 0, 0, 0, 0, 2, 1}, {1, 0, 1, 0, 0, 0, 0, 2, 1}, {1, 2, 0, 0, 0, 0, 0, 2, 1}, {1, 2, 1, 0, 0, 0, 0, 2, 1},
-                    {1, 0, 0, 0, 1, 0, 0, 2, 1}, {1, 0, 1, 0, 1, 0, 0, 2, 1},
-
-                    // No fog + dual texture (6)
-                    {1, 0, 0, 0, 0, 0, 0, 0, 2}, {1, 0, 1, 0, 0, 0, 0, 0, 2}, {1, 2, 0, 0, 0, 0, 0, 0, 2}, {1, 2, 1, 0, 0, 0, 0, 0, 2},
-                    {1, 0, 0, 1, 0, 0, 0, 0, 2}, {1, 0, 1, 1, 0, 0, 0, 0, 2},
-
-                    // Fog mode 2 + dual texture (6)
-                    {1, 0, 0, 0, 0, 0, 0, 2, 2}, {1, 0, 1, 0, 0, 0, 0, 2, 2}, {1, 2, 0, 0, 0, 0, 0, 2, 2}, {1, 2, 1, 0, 0, 0, 0, 2, 2},
-                    {1, 0, 0, 1, 0, 0, 0, 2, 2}, {1, 0, 1, 1, 0, 0, 0, 2, 2},
-
-                    // Additional edge cases (4)
-                    {0, 0, 0, 1, 0, 0, 0, 1, 1}, {0, 0, 1, 1, 0, 0, 0, 1, 1}, {0, 0, 0, 0, 0, 0, 0, 1, 1}, {0, 0, 1, 0, 0, 0, 0, 1, 1},
-
-                    // Universal base combinations for fallback (lightMode 0,1,2 × vertCol × skinning)
-                    {1, 0, 0, 0, 0, 0, 0, 1, 1}, {1, 0, 1, 0, 0, 0, 0, 1, 1}, {1, 0, 0, 1, 0, 0, 0, 1, 1}, {1, 0, 1, 1, 0, 0, 0, 1, 1},
-                    {1, 1, 0, 0, 0, 0, 0, 1, 1}, {1, 1, 1, 0, 0, 0, 0, 1, 1}, {1, 1, 0, 1, 0, 0, 0, 1, 1}, {1, 1, 1, 1, 0, 0, 0, 1, 1},
-                    {1, 2, 0, 0, 0, 0, 0, 1, 1}, {1, 2, 1, 0, 0, 0, 0, 1, 1}, {1, 2, 0, 1, 0, 0, 0, 1, 1}, {1, 2, 1, 1, 0, 0, 0, 1, 1},
+                    // lm=3 (texture lights, always hl=1) — base, dp+ph, fog=2
+                    {1,3, 0,1, 1,0, 0,0,0, 1,1}, {1,3, 1,2, 1,0, 0,0,0, 1,1},
+                    {1,3, 0,1, 1,0, 1,1,0, 1,1}, {1,3, 1,2, 1,0, 1,1,0, 1,1},
+                    {1,3, 1,2, 1,0, 0,0,0, 2,1},  // fog=2
                 };
 
                 const int totalVariants = sizeof(variants) / sizeof(variants[0]);
-                LOG::logline("-- Immediate precaching %d essential HLSL shader variants", totalVariants);
+                LOG::logline("-- Precaching %d HLSL shader variants (tracked thread)", totalVariants);
 
                 for (int i = 0; i < totalVariants; i++) {
                     const auto& v = variants[i];
 
-                    // Update progress every few variants
                     if (i % 5 == 0 || i == totalVariants - 1) {
                         updateStatus(i + 1, totalVariants);
                     }
 
+                    {
+                        ShaderKey sk;
+                        memset(&sk, 0, sizeof(sk));
+                        sk.uvSets = 1;
+                        sk.useLighting = v.lighting;
+                        sk.lightMode = v.lightMode;
+                        sk.vertexColour = v.vertexCol;
+                        sk.vertexMaterial = v.vertexMat;
+                        sk.usesSkinning = v.skinning;
+                        sk.heavyLighting = v.heavyLighting;
+                        sk.hasDiffParam = v.hasDiffParam;
+                        sk.hasParamH = v.hasParamH;
+                        sk.hasParamX = v.hasParamX;
+                        sk.hasGrass = 0;
+                        sk.hasShadows = ((Configuration.MGEFlags & USE_SHADOWS) && (Configuration.MGEFlags & USE_DISTANT_LAND)) ? 1 : 0;
+                        sk.fogMode = v.fogMode;
+                        sk.activeStages = v.stages;
+
+                        sk.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
+                        if (v.stages > 1) {
+                            sk.stage[1] = { D3DTOP_ADD, D3DTA_TEXTURE, D3DTA_CURRENT, D3DTA_CURRENT, 0, 0, 0, 0 };
+                        }
+                        memset(&sk.stage[v.stages], 0, sizeof(sk.stage[0]) * (8 - v.stages));
+
+                        // Compile shader (no lock needed for generateMWShaderHLSL — it no longer writes cache)
+                        HLSLShader shader = generateMWShaderHLSL(sk);
+
+                        // Insert under exclusive lock
+                        AcquireSRWLockExclusive(&hlslCacheLock);
+                        if (cacheHLSLShaders.find(sk) == cacheHLSLShaders.end()) {
+                            cacheHLSLShaders[sk] = shader;
+                            hlslVariants++;
+                        }
+                        ReleaseSRWLockExclusive(&hlslCacheLock);
+                    }
+                }
+
+                // Grass variants (hasGrass=1) — separate because main loop hardcodes hasGrass=0
+                // From cache miss log: lm=0 vc=0/1, lm=1 vc=1
+                struct GrassVariant { int lightMode, vertexCol, vertexMat; };
+                GrassVariant grassVariants[] = {
+                    {0, 0, 1}, {0, 1, 2},
+                    {1, 0, 1}, {1, 1, 2},
+                };
+                for (const auto& gv : grassVariants) {
                     ShaderKey sk;
                     memset(&sk, 0, sizeof(sk));
                     sk.uvSets = 1;
-                    sk.useLighting = v.lighting;
-                    sk.lightMode = v.lightMode;
-                    sk.vertexColour = v.vertexCol;
-                    sk.vertexMaterial = v.vertexCol + 1;
-                    sk.usesSkinning = v.skinning;
-                    sk.hasDiffParam = v.hasDiffParam;
-                    sk.hasParamH = v.hasParamH;
-                    sk.hasParamX = v.hasParamX;
-                    sk.hasGrass = 0;
-                    sk.fogMode = v.fogMode;
-                    sk.activeStages = v.stages;
-                    
-                    // Standard texture stage setup
+                    sk.useLighting = 1;
+                    sk.lightMode = gv.lightMode;
+                    sk.vertexColour = gv.vertexCol;
+                    sk.vertexMaterial = gv.vertexMat;
+                    sk.fogMode = 1;
+                    sk.activeStages = 1;
+                    sk.hasGrass = 1;
+                    sk.hasShadows = ((Configuration.MGEFlags & USE_SHADOWS) && (Configuration.MGEFlags & USE_DISTANT_LAND)) ? 1 : 0;
                     sk.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
-                    if (v.stages > 1) {
-                        sk.stage[1] = { D3DTOP_ADD, D3DTA_TEXTURE, D3DTA_CURRENT, D3DTA_CURRENT, 0, 0, 0, 0 };
-                    }
-                    memset(&sk.stage[v.stages], 0, sizeof(sk.stage[0]) * (8 - v.stages));
-                    
-                    // Compile if not already cached
+
+                    HLSLShader shader = generateMWShaderHLSL(sk);
+                    AcquireSRWLockExclusive(&hlslCacheLock);
                     if (cacheHLSLShaders.find(sk) == cacheHLSLShaders.end()) {
-                        cacheHLSLShaders[sk] = generateMWShaderHLSL(sk);
+                        cacheHLSLShaders[sk] = shader;
                         hlslVariants++;
                     }
+                    ReleaseSRWLockExclusive(&hlslCacheLock);
                 }
-                
-                StatusOverlay::setStatus("Immediate HLSL shader precaching complete");
-                LOG::logline("-- Immediate HLSL precaching completed: %d shaders compiled", hlslVariants);
+
+                StatusOverlay::setStatus("HLSL shader precaching complete");
+                LOG::logline("-- Precache thread completed: %d shaders compiled", hlslVariants);
             }
-        });
-        
-        immediateThread.detach();
+            return 0;
+        }, nullptr, 0, nullptr);
     }
-}
-
-void FixedFunctionShader::precacheAsync() {
-    // Move precaching to a separate thread - essential variants to prevent stuttering
-    std::thread precacheThread([]() {
-        // Check lighting mode to prioritize compilation order
-        bool hlslMode = (Configuration.PerPixelLightFlags == 2);
-        
-        // If HLSL is current mode, compile HLSL shaders first for better startup performance
-        // Skip if immediate precaching already handled the essential variants
-        if (hlslMode && cacheHLSLShaders.size() < 20) {
-            LOG::logline("-- Starting HLSL shader precaching (supplemental)");
-            
-            int hlslVariants = 0;
-            
-            // Progress tracking for status overlay
-            auto updateStatus = [&](int current, int total) {
-                char progressText[128];
-                std::snprintf(progressText, sizeof(progressText), "Compiling HLSL shaders: %d/%d", current, total);
-                StatusOverlay::setStatus(progressText);
-            };
-            
-                // Essential variants that cover most real-world cases
-                // format: {lighting, lightMode, vertexCol, skinning, hasDiffParam, hasParamH, hasParamX, fogMode, stages}
-                struct ShaderVariant {
-                    int lighting;
-                    int lightMode;
-                    int vertexCol;
-                    int skinning;
-                    int hasDiffParam;
-                    int hasParamH;
-                    int hasParamX;
-                    int fogMode;
-                    int stages;
-                };
-
-                ShaderVariant variants[] = {
-                    // Keep in sync with immediate precaching table above
-                    // Basic unlit (2)
-                    {0, 0, 0, 0, 0, 0, 0, 1, 1}, {0, 0, 1, 0, 0, 0, 0, 1, 1},
-
-                    // Sun only lightMode=0 (4)
-                    {1, 0, 0, 0, 0, 0, 0, 1, 1}, {1, 0, 1, 0, 0, 0, 0, 1, 1}, {1, 0, 0, 1, 0, 0, 0, 1, 1}, {1, 0, 1, 1, 0, 0, 0, 1, 1},
-
-                    // Single point lightMode=1 (4)
-                    {1, 1, 0, 0, 0, 0, 0, 1, 1}, {1, 1, 1, 0, 0, 0, 0, 1, 1}, {1, 1, 0, 1, 0, 0, 0, 1, 1}, {1, 1, 1, 1, 0, 0, 0, 1, 1},
-
-                    // Few points lightMode=2 (4)
-                    {1, 2, 0, 0, 0, 0, 0, 1, 1}, {1, 2, 1, 0, 0, 0, 0, 1, 1}, {1, 2, 0, 1, 0, 0, 0, 1, 1}, {1, 2, 1, 1, 0, 0, 0, 1, 1},
-
-                    // Diffparam (12: lightMode 0,1,2)
-                    {1, 0, 0, 0, 1, 0, 0, 1, 1}, {1, 0, 1, 0, 1, 0, 0, 1, 1}, {1, 1, 0, 0, 1, 0, 0, 1, 1}, {1, 1, 1, 0, 1, 0, 0, 1, 1},
-                    {1, 2, 0, 0, 1, 0, 0, 1, 1}, {1, 2, 1, 0, 1, 0, 0, 1, 1},
-                    {1, 0, 0, 1, 1, 0, 0, 1, 1}, {1, 0, 1, 1, 1, 0, 0, 1, 1}, {1, 1, 0, 1, 1, 0, 0, 1, 1}, {1, 1, 1, 1, 1, 0, 0, 1, 1},
-                    {1, 2, 0, 1, 1, 0, 0, 1, 1}, {1, 2, 1, 1, 1, 0, 0, 1, 1},
-
-                    // ParamH (12)
-                    {1, 0, 0, 0, 0, 1, 0, 1, 1}, {1, 0, 1, 0, 0, 1, 0, 1, 1}, {1, 1, 0, 0, 0, 1, 0, 1, 1}, {1, 1, 1, 0, 0, 1, 0, 1, 1},
-                    {1, 2, 0, 0, 0, 1, 0, 1, 1}, {1, 2, 1, 0, 0, 1, 0, 1, 1},
-                    {1, 0, 0, 1, 0, 1, 0, 1, 1}, {1, 0, 1, 1, 0, 1, 0, 1, 1}, {1, 1, 0, 1, 0, 1, 0, 1, 1}, {1, 1, 1, 1, 0, 1, 0, 1, 1},
-                    {1, 2, 0, 1, 0, 1, 0, 1, 1}, {1, 2, 1, 1, 0, 1, 0, 1, 1},
-
-                    // Diffparam + ParamH (12)
-                    {1, 0, 0, 0, 1, 1, 0, 1, 1}, {1, 0, 1, 0, 1, 1, 0, 1, 1}, {1, 1, 0, 0, 1, 1, 0, 1, 1}, {1, 1, 1, 0, 1, 1, 0, 1, 1},
-                    {1, 2, 0, 0, 1, 1, 0, 1, 1}, {1, 2, 1, 0, 1, 1, 0, 1, 1},
-                    {1, 0, 0, 1, 1, 1, 0, 1, 1}, {1, 0, 1, 1, 1, 1, 0, 1, 1}, {1, 1, 0, 1, 1, 1, 0, 1, 1}, {1, 1, 1, 1, 1, 1, 0, 1, 1},
-                    {1, 2, 0, 1, 1, 1, 0, 1, 1}, {1, 2, 1, 1, 1, 1, 0, 1, 1},
-
-                    // ParamX (6)
-                    {1, 0, 0, 0, 0, 0, 1, 1, 1}, {1, 0, 1, 0, 0, 0, 1, 1, 1}, {1, 2, 0, 0, 0, 0, 1, 1, 1}, {1, 2, 1, 0, 0, 0, 1, 1, 1},
-                    {1, 0, 0, 1, 0, 0, 1, 1, 1}, {1, 0, 1, 1, 0, 0, 1, 1, 1},
-
-                    // Full combo (6)
-                    {1, 0, 0, 0, 1, 1, 1, 1, 1}, {1, 0, 1, 0, 1, 1, 1, 1, 1}, {1, 2, 0, 0, 1, 1, 1, 1, 1}, {1, 2, 1, 0, 1, 1, 1, 1, 1},
-                    {1, 0, 0, 1, 1, 1, 1, 1, 1}, {1, 0, 1, 1, 1, 1, 1, 1, 1},
-
-                    // Dual texture (12)
-                    {1, 0, 0, 0, 0, 0, 0, 1, 2}, {1, 0, 1, 0, 0, 0, 0, 1, 2}, {1, 1, 0, 0, 0, 0, 0, 1, 2}, {1, 1, 1, 0, 0, 0, 0, 1, 2},
-                    {1, 2, 0, 0, 0, 0, 0, 1, 2}, {1, 2, 1, 0, 0, 0, 0, 1, 2},
-                    {1, 0, 0, 1, 0, 0, 0, 1, 2}, {1, 0, 1, 1, 0, 0, 0, 1, 2}, {1, 1, 0, 1, 0, 0, 0, 1, 2}, {1, 1, 1, 1, 0, 0, 0, 1, 2},
-                    {1, 2, 0, 1, 0, 0, 0, 1, 2}, {1, 2, 1, 1, 0, 0, 0, 1, 2},
-
-                    // Dual texture + diffparam (6)
-                    {1, 0, 0, 0, 1, 0, 0, 1, 2}, {1, 0, 1, 0, 1, 0, 0, 1, 2}, {1, 2, 0, 0, 1, 0, 0, 1, 2}, {1, 2, 1, 0, 1, 0, 0, 1, 2},
-                    {1, 0, 0, 1, 1, 0, 0, 1, 2}, {1, 0, 1, 1, 1, 0, 0, 1, 2},
-
-                    // Dual texture + paramH (6)
-                    {1, 0, 0, 0, 0, 1, 0, 1, 2}, {1, 0, 1, 0, 0, 1, 0, 1, 2}, {1, 2, 0, 0, 0, 1, 0, 1, 2}, {1, 2, 1, 0, 0, 1, 0, 1, 2},
-                    {1, 0, 0, 1, 0, 1, 0, 1, 2}, {1, 0, 1, 1, 0, 1, 0, 1, 2},
-
-                    // No fog (6)
-                    {1, 0, 0, 0, 0, 0, 0, 0, 1}, {1, 0, 1, 0, 0, 0, 0, 0, 1}, {1, 2, 0, 0, 0, 0, 0, 0, 1}, {1, 2, 1, 0, 0, 0, 0, 0, 1},
-                    {1, 0, 0, 0, 1, 0, 0, 0, 1}, {1, 0, 1, 0, 1, 0, 0, 0, 1},
-
-                    // Fog mode 2 (6)
-                    {1, 0, 0, 0, 0, 0, 0, 2, 1}, {1, 0, 1, 0, 0, 0, 0, 2, 1}, {1, 2, 0, 0, 0, 0, 0, 2, 1}, {1, 2, 1, 0, 0, 0, 0, 2, 1},
-                    {1, 0, 0, 0, 1, 0, 0, 2, 1}, {1, 0, 1, 0, 1, 0, 0, 2, 1},
-
-                    // No fog + dual texture (6)
-                    {1, 0, 0, 0, 0, 0, 0, 0, 2}, {1, 0, 1, 0, 0, 0, 0, 0, 2}, {1, 2, 0, 0, 0, 0, 0, 0, 2}, {1, 2, 1, 0, 0, 0, 0, 0, 2},
-                    {1, 0, 0, 1, 0, 0, 0, 0, 2}, {1, 0, 1, 1, 0, 0, 0, 0, 2},
-
-                    // Fog mode 2 + dual texture (6)
-                    {1, 0, 0, 0, 0, 0, 0, 2, 2}, {1, 0, 1, 0, 0, 0, 0, 2, 2}, {1, 2, 0, 0, 0, 0, 0, 2, 2}, {1, 2, 1, 0, 0, 0, 0, 2, 2},
-                    {1, 0, 0, 1, 0, 0, 0, 2, 2}, {1, 0, 1, 1, 0, 0, 0, 2, 2},
-
-                    // Edge cases (4)
-                    {0, 0, 0, 1, 0, 0, 0, 1, 1}, {0, 0, 1, 1, 0, 0, 0, 1, 1}, {0, 0, 0, 0, 0, 0, 0, 1, 1}, {0, 0, 1, 0, 0, 0, 0, 1, 1},
-
-                    // Universal base fallback (12: lightMode 0,1,2 × vertCol × skinning)
-                    {1, 0, 0, 0, 0, 0, 0, 1, 1}, {1, 0, 1, 0, 0, 0, 0, 1, 1}, {1, 0, 0, 1, 0, 0, 0, 1, 1}, {1, 0, 1, 1, 0, 0, 0, 1, 1},
-                    {1, 1, 0, 0, 0, 0, 0, 1, 1}, {1, 1, 1, 0, 0, 0, 0, 1, 1}, {1, 1, 0, 1, 0, 0, 0, 1, 1}, {1, 1, 1, 1, 0, 0, 0, 1, 1},
-                    {1, 2, 0, 0, 0, 0, 0, 1, 1}, {1, 2, 1, 0, 0, 0, 0, 1, 1}, {1, 2, 0, 1, 0, 0, 0, 1, 1}, {1, 2, 1, 1, 0, 0, 0, 1, 1},
-                };
-
-            const int totalVariants = sizeof(variants) / sizeof(variants[0]);
-            LOG::logline("-- Precaching %d essential HLSL shader variants", totalVariants);
-
-            for (int i = 0; i < totalVariants; i++) {
-                const ShaderVariant& v = variants[i];
-
-                // Update progress every few variants
-                if (i % 5 == 0 || i == totalVariants - 1) {
-                    updateStatus(i + 1, totalVariants);
-                }
-
-                ShaderKey sk;
-                memset(&sk, 0, sizeof(sk));
-                sk.uvSets = 1;
-                sk.useLighting = v.lighting;
-                sk.lightMode = v.lightMode;
-                sk.vertexColour = v.vertexCol;
-                sk.vertexMaterial = v.vertexCol + 1;
-                sk.usesSkinning = v.skinning;
-                sk.hasDiffParam = v.hasDiffParam;
-                sk.hasGrass = 0;
-                sk.fogMode = v.fogMode;
-                sk.activeStages = v.stages;
-                
-                // Standard texture stage setup
-                sk.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
-                if (v.stages > 1) {
-                    sk.stage[1] = { D3DTOP_ADD, D3DTA_TEXTURE, D3DTA_CURRENT, D3DTA_CURRENT, 0, 0, 0, 0 };
-                }
-                memset(&sk.stage[v.stages], 0, sizeof(sk.stage[0]) * (8 - v.stages));
-                
-                // Compile if not already cached
-                if (cacheHLSLShaders.find(sk) == cacheHLSLShaders.end()) {
-                    cacheHLSLShaders[sk] = generateMWShaderHLSL(sk);
-                    hlslVariants++;
-                }
-            }
-            
-            StatusOverlay::setStatus("HLSL shader precaching complete");
-            LOG::logline("-- HLSL precaching completed: %d shaders compiled", hlslVariants);
-        }
-        
-        LOG::logline("-- Starting collapsed HLSL shader precaching (optimized permutations)");
-
-        // Collapsed precaching using modern engine techniques:
-        // 1. Lighting loop collapse: One shader handles 0-N lights dynamically
-        // 2. Unified param flavors: All texture suffixes handled with #ifdef guards  
-        // 3. Skinning in VS only: Pixel shader doesn't care about skinning
-        // 4. Runtime normal selection: Shader samples normal or derives from height
-
-        struct CoreShaderVariant {
-            bool lighting, vertCol, skinning;
-            const char* desc;
-        };
-        
-        CoreShaderVariant coreVariants[] = {
-            {true, false, false, "lit"},
-            {true, true, false, "lit+vertColor"}, 
-            {true, false, true, "lit+skinned"},
-            {true, true, true, "lit+vertColor+skinned"},
-            {false, false, false, "unlit"},
-            {false, true, false, "unlit+vertColor"},
-            {false, false, true, "unlit+skinned"}, 
-            {false, true, true, "unlit+vertColor+skinned"}
-        };
-
-        int compiledVariants = 0;
-        
-        for (auto& variant : coreVariants) {
-            // Generate both standard fog (fogMode=1) and alpha blend fog (fogMode=2) variants
-            for (int fogMode = 1; fogMode <= 2; ++fogMode) {
-                ShaderKey sk;
-                memset(&sk, 0, sizeof(sk));
-                
-                // Core shader properties
-                sk.uvSets = 1;
-                sk.useLighting = variant.lighting;
-                sk.heavyLighting = 0;
-                sk.vertexColour = variant.vertCol;
-                sk.vertexMaterial = variant.vertCol + 1;  
-                sk.usesSkinning = variant.skinning;
-                
-                // Lighting collapse: Use few-loop mode as default precache (covers 2-8 lights)
-                sk.lightMode = 2;
-                
-                // Param flavor unification: Always enable all texture suffixes
-                // Shader uses #ifdef HAS_DIFFPARAM, #ifdef HAS_NORMAL, #ifdef HAS_PARAM
-                // Note: These are compile-time defines for the collapsed shader that handles all combinations
-                sk.hasDiffParam = 1;
-                sk.hasGrass = 0; // Let grass shaders compile on demand
-                
-                // Fog mode: 1=standard, 2=alpha blending (diffparam textures)
-                sk.fogMode = fogMode;
-                
-                // Standard texture stage
-                sk.activeStages = 1;
-                sk.usesTexgen = 0;
-                sk.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
-                memset(&sk.stage[1], 0, sizeof(sk.stage[1]));
-                
-                cacheHLSLShaders[sk] = generateMWShaderHLSL(sk);
-                compiledVariants++;
-                
-                const char* fogDesc = (fogMode == 2) ? "+alphaBlend" : "";
-                LOG::logline("-- Compiled collapsed shader: %s%s", variant.desc, fogDesc);
-            }
-        }
-
-        LOG::logline("-- Collapsed HLSL precaching completed: %d core shaders compiled (reduced from 120+ permutations)", compiledVariants);
-    });
-
-    precacheThread.detach();
 }
 
 void FixedFunctionShader::updateLighting(float sunMult, float ambMult) {
@@ -1775,40 +1489,82 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     if (sk == hlslShaderLRU.last_sk) {
         hlslShader = hlslShaderLRU.shader;
     } else {
-        // Read from shader cache / generate
+        bool exactHit = false;
+        // Read from shader cache under shared lock (precache thread may be inserting)
+        AcquireSRWLockShared(&hlslCacheLock);
         decltype(cacheHLSLShaders)::const_iterator iShader = cacheHLSLShaders.find(sk);
 
         if (iShader != cacheHLSLShaders.end()) {
             hlslShader = iShader->second;
-            // LOG::logline("DEBUG CACHE HIT: Using cached shader with flags diffparam=%d normal=%d param=%d", 
-            //           sk.hasDiffParam, sk.hasNormal, sk.hasParam);
-        } else {
-            // Cache miss - try smart fallback before using purple
-            queueShaderCompilation(sk);
-            
-            // Smart fallback hierarchy: try alternative point light counts
+            exactHit = true;
+            if (hlslDiagFrameCounter <= 5) {
+                diagHitKeys.insert(sk);
+            }
+        }
+
+        if (!exactHit) {
+            // Diagnostic: log cache misses on early frames to identify precache gaps
+            if (hlslDiagFrameCounter <= 3) {
+                char buf[512];
+                snprintf(buf, sizeof(buf),
+                    "CACHE MISS frame=%d: lm=%d lit=%d vc=%d vm=%d hl=%d skin=%d fog=%d uv=%d stages=%d shadow=%d detail=%d dp=%d ph=%d px=%d grass=%d bump=%d tg=%d",
+                    hlslDiagFrameCounter,
+                    (int)sk.lightMode, (int)sk.useLighting, (int)sk.vertexColour,
+                    (int)sk.vertexMaterial, (int)sk.heavyLighting,
+                    (int)sk.usesSkinning, (int)sk.fogMode, (int)sk.uvSets,
+                    (int)sk.activeStages,
+                    (int)sk.hasShadows, (int)sk.hasDetail, (int)sk.hasDiffParam,
+                    (int)sk.hasParamH, (int)sk.hasParamX, (int)sk.hasGrass,
+                    (int)sk.usesBumpmap, (int)sk.usesTexgen);
+                LOG::logline("%s", buf);
+                // Log per-stage details
+                for (int s = 0; s < (int)sk.activeStages && s < 8; ++s) {
+                    snprintf(buf, sizeof(buf),
+                        "  stg%d=[op=%d a1=%d a2=%d a0=%d am=%d as=%d ti=%d tg=%d]",
+                        s,
+                        (int)sk.stage[s].colorOp, (int)sk.stage[s].colorArg1,
+                        (int)sk.stage[s].colorArg2, (int)sk.stage[s].colorArg0,
+                        (int)sk.stage[s].alphaOpMatched, (int)sk.stage[s].alphaOpSelect1,
+                        (int)sk.stage[s].texcoordIndex, (int)sk.stage[s].texcoordGen);
+                    LOG::logline("%s", buf);
+                }
+            }
+            // Smart fallback hierarchy before using purple
             ShaderKey fallbackSk = sk;
             HLSLShader fallbackShader = {};
             bool foundFallback = false;
-            
-            // lightMode cascade fallback: try 2→1→0 (prefer "few" loop, then single, then sun-only)
+
+            // Normalize only alphaOpSelect1 (spurious variation); leave alphaOpMatched
+            // untouched — it affects code generation and differs between stage[0] and stage[1+]
+            auto normalizeAlpha = [](ShaderKey& key) {
+                for (int s = 0; s < (int)key.activeStages; ++s) {
+                    key.stage[s].alphaOpSelect1 = 0;
+                }
+            };
+
+            // Normalize alpha bits on the base fallback key
+            normalizeAlpha(fallbackSk);
+
+            // lightMode + heavyLighting cascade: try different light modes AND hl=0
             int fallbackModes[] = {2, 1, 0};
-            for (int i = 0; i < 3 && !foundFallback; ++i) {
-                if (fallbackModes[i] == (int)sk.lightMode) continue; // Skip exact match
-                fallbackSk.lightMode = fallbackModes[i];
-                auto fallbackIter = cacheHLSLShaders.find(fallbackSk);
-                if (fallbackIter != cacheHLSLShaders.end()) {
-                    fallbackShader = fallbackIter->second;
-                    foundFallback = true;
+            for (int hl = (int)sk.heavyLighting; hl >= 0 && !foundFallback; --hl) {
+                fallbackSk.heavyLighting = hl;
+                for (int i = 0; i < 3 && !foundFallback; ++i) {
+                    if (fallbackModes[i] == (int)sk.lightMode && hl == (int)sk.heavyLighting) continue;
+                    fallbackSk.lightMode = fallbackModes[i];
+                    auto fallbackIter = cacheHLSLShaders.find(fallbackSk);
+                    if (fallbackIter != cacheHLSLShaders.end()) {
+                        fallbackShader = fallbackIter->second;
+                        foundFallback = true;
+                    }
                 }
             }
-            
+
             // If no point light fallback found, try texture suffix fallbacks
             if (!foundFallback && (sk.hasDiffParam || sk.hasParamH || sk.hasParamX)) {
-                // Try progressively simpler texture combinations
                 ShaderKey textureFallbackSk = sk;
-                
-                // Step 1: Remove diffparam but keep normal+param
+                normalizeAlpha(textureFallbackSk);
+
                 if (sk.hasDiffParam && !foundFallback) {
                     textureFallbackSk.hasDiffParam = 0;
                     auto fallbackIter = cacheHLSLShaders.find(textureFallbackSk);
@@ -1817,10 +1573,10 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
                         foundFallback = true;
                     }
                 }
-                
-                // Step 2: Remove normal but keep param
+
                 if (sk.hasParamH && !foundFallback) {
                     textureFallbackSk = sk;
+                    normalizeAlpha(textureFallbackSk);
                     textureFallbackSk.hasDiffParam = 0;
                     textureFallbackSk.hasParamH = 0;
                     textureFallbackSk.hasParamX = 0;
@@ -1830,10 +1586,10 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
                         foundFallback = true;
                     }
                 }
-                
-                // Step 3: Base texture only (no suffixes)
+
                 if (!foundFallback) {
                     textureFallbackSk = sk;
+                    normalizeAlpha(textureFallbackSk);
                     textureFallbackSk.hasDiffParam = 0;
                     textureFallbackSk.hasParamH = 0;
                     textureFallbackSk.hasParamX = 0;
@@ -1844,19 +1600,16 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
                     }
                 }
             }
-            
+
             // Final universal fallback: try the 8 guaranteed base combinations
             if (!foundFallback) {
-                // Start with exact copy of requested shader, then simplify
                 ShaderKey universalSk = sk;
-
-                // Force base texture settings
+                normalizeAlpha(universalSk);
                 universalSk.heavyLighting = 0;
                 universalSk.hasDiffParam = 0;
                 universalSk.hasParamH = 0;
                 universalSk.hasParamX = 0;
 
-                // Try universal combinations: lightMode (0-2) × vertex color (0/1) × skinning (0/1)
                 for (int lm = 0; lm <= 2 && !foundFallback; ++lm) {
                     for (int vertCol = 0; vertCol <= 1 && !foundFallback; ++vertCol) {
                         for (int skinning = 0; skinning <= 1 && !foundFallback; ++skinning) {
@@ -1874,12 +1627,48 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
                     }
                 }
             }
-            
+
+            // Last resort: completely standardize key to match precache patterns
+            // Resets fogMode, texgen, grass, bump, detail, and stage data
+            if (!foundFallback) {
+                ShaderKey stdSk;
+                memset(&stdSk, 0, sizeof(stdSk));
+                stdSk.uvSets = 1;
+                stdSk.useLighting = sk.useLighting;
+                stdSk.fogMode = 1;
+                stdSk.activeStages = 1;
+                stdSk.hasShadows = sk.hasShadows;
+                stdSk.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
+
+                for (int lm = 0; lm <= 2 && !foundFallback; ++lm) {
+                    for (int vertCol = 0; vertCol <= 1 && !foundFallback; ++vertCol) {
+                        for (int skinning = 0; skinning <= 1 && !foundFallback; ++skinning) {
+                            stdSk.lightMode = lm;
+                            stdSk.vertexColour = vertCol;
+                            stdSk.vertexMaterial = vertCol + 1;
+                            stdSk.usesSkinning = skinning;
+
+                            auto fallbackIter = cacheHLSLShaders.find(stdSk);
+                            if (fallbackIter != cacheHLSLShaders.end()) {
+                                fallbackShader = fallbackIter->second;
+                                foundFallback = true;
+                            }
+                        }
+                    }
+                }
+            }
+
             if (foundFallback) {
                 hlslShader = fallbackShader;
             } else {
                 hlslShader = hlslShaderDefaultPurple;
             }
+        }
+        ReleaseSRWLockShared(&hlslCacheLock);
+
+        // Queue async compilation for exact key on cache miss (outside lock)
+        if (!exactHit) {
+            queueShaderCompilation(sk);
         }
 
         hlslShaderLRU.shader = hlslShader;
@@ -2600,8 +2389,7 @@ char* FixedFunctionShader::loadShaderFile(const char* filename, DWORD* outFileSi
                 // File changed! Mark for recompilation but don't clear cache immediately
                 delete[] it->second.source;
                 shaderSourceCache.erase(it);
-                // Set flag to clear cache after current compilation operations complete
-                needsCacheReset = true;
+                // Cache will be cleared by invalidateShaderSourceCache() on main thread
             }
         }
     }
@@ -2643,13 +2431,24 @@ char* FixedFunctionShader::loadShaderFile(const char* filename, DWORD* outFileSi
 }
 
 void FixedFunctionShader::invalidateShaderSourceCache() {
-    // Clear shader source cache for hot reloading
-    for (auto& i : shaderSourceCache) {
-        delete[] i.second.source;
+    // 1. Join precache thread if still running
+    if (precacheThread) {
+        WaitForSingleObject(precacheThread, INFINITE);
+        CloseHandle(precacheThread);
+        precacheThread = nullptr;
     }
-    shaderSourceCache.clear();
-    
-    // Also clear compiled shader cache to force recompilation
+
+    // 2. Stop async compiler — joins thread and drains queue
+    stopAsyncCompiler();
+
+    // 3. Acquire exclusive lock and clear everything
+    AcquireSRWLockExclusive(&hlslCacheLock);
+
+    // Reset LRU to prevent use-after-free of released shader pointers
+    hlslShaderLRU.shader = {};
+    hlslShaderLRU.last_sk = ShaderKey();
+
+    // Release COM objects and clear compiled shader cache
     for (auto& i : cacheHLSLShaders) {
         if (i.second.vertexShader) i.second.vertexShader->Release();
         if (i.second.pixelShader) i.second.pixelShader->Release();
@@ -2657,6 +2456,17 @@ void FixedFunctionShader::invalidateShaderSourceCache() {
         if (i.second.psConstantTable) i.second.psConstantTable->Release();
     }
     cacheHLSLShaders.clear();
+
+    // Clear shader source cache for hot reloading
+    for (auto& i : shaderSourceCache) {
+        delete[] i.second.source;
+    }
+    shaderSourceCache.clear();
+
+    ReleaseSRWLockExclusive(&hlslCacheLock);
+
+    // 4. Restart async compiler for future on-demand compilations
+    startAsyncCompiler();
 }
 
 void FixedFunctionShader::startAsyncCompiler() {
@@ -2736,18 +2546,23 @@ void FixedFunctionShader::queueShaderCompilation(const ShaderKey& key) {
 void FixedFunctionShader::processAsyncCompletions() {
     // Check for completed compilations and move them to the main cache
     auto it = pendingCompilations.begin();
+    bool anyCompleted = false;
     while (it != pendingCompilations.end()) {
         if (it->second->completed) {
-            // Move completed shader to main cache
+            // Move completed shader to main cache under exclusive lock
+            AcquireSRWLockExclusive(&hlslCacheLock);
             cacheHLSLShaders[it->first] = it->second->result;
-            
-            // LOG::logline("-- HLSL Async shader ready, added to cache with flags diffparam=%d normal=%d param=%d", 
-            //            it->first.hasDiffParam, it->first.hasNormal, it->first.hasParam);
-            
+            ReleaseSRWLockExclusive(&hlslCacheLock);
+            anyCompleted = true;
+
             it = pendingCompilations.erase(it);
         } else {
             ++it;
         }
+    }
+    // Invalidate LRU so next draw picks up newly cached shaders
+    if (anyCompleted) {
+        hlslShaderLRU.last_sk = ShaderKey();
     }
 }
 
@@ -2783,12 +2598,6 @@ void FixedFunctionShader::checkForShaderFileChanges() {
 }
 
 FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const ShaderKey& sk) {
-    // Check if we need to clear the shader cache due to file changes
-    if (needsCacheReset) {
-        cacheHLSLShaders.clear();
-        needsCacheReset = false;
-    }
-    
     HLSLShader hlslShader = {};
     
     // Shader entry points
@@ -3040,13 +2849,17 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     // Log shader key details
     // LOG::logline("-- HLSL ShaderKey: hasDiffParam=%d hasNormal=%d hasParam=%d", sk.hasDiffParam, sk.hasNormal, sk.hasParam);
     
-    // Cache the compiled shader
-    cacheHLSLShaders[sk] = hlslShader;
-    
     return hlslShader;
 }
 
 void FixedFunctionShader::release() {
+    // Join precache thread before cleaning up HLSL cache
+    if (precacheThread) {
+        WaitForSingleObject(precacheThread, INFINITE);
+        CloseHandle(precacheThread);
+        precacheThread = nullptr;
+    }
+
     // Stop async compiler thread
     stopAsyncCompiler();
     
@@ -3349,11 +3162,35 @@ void FixedFunctionShader::startRecording() {
     // BEFORE startRecording() is called. recordMW is cleared at end of renderStage1/2.
     lastLightState.reset();  // Clear LightState cache for new recording
 
+    // Clear pointer-keyed caches on cell transitions.
+    // Morrowind reuses freed VB/IB/texture pointers for different data after cell changes,
+    // so pointer-keyed caches (bboxCache, textureSuffixResolutionCache, blacklist) return stale data.
+    {
+        static bool lastWasExterior = false;
+        static void* lastPlayerCell = nullptr;
+
+        bool isExterior = MWBridge::get()->IsExterior();
+        void* currentCell = MWBridge::get()->getPlayerCell();
+
+        if (isExterior != lastWasExterior) {
+            // Interior ↔ exterior transition: clear everything
+            textureSuffixResolutionCache.clear();
+            bboxCache.clear();
+            softwareOcclusionCuller.clearBlacklist();
+            lastWasExterior = isExterior;
+        } else if (currentCell != lastPlayerCell) {
+            // Any cell change (exterior-to-exterior, interior-to-interior): clear pointer-keyed caches
+            textureSuffixResolutionCache.clear();
+            bboxCache.clear();
+            softwareOcclusionCuller.clearBlacklist();
+        }
+
+        lastPlayerCell = currentCell;
+    }
+
     // Clear lights from previous frame (simple approach, no persistence)
     DistantLand::sceneLights.clear();
     DistantLand::sceneLightIndexMap.clear();
-    DistantLand::visibleLights.clear();
-
     isRecording = true;
     isReplaying = false;
     recordingCompletedThisFrame = false;  // Allow recording to proceed
@@ -3374,7 +3211,7 @@ void FixedFunctionShader::startRecording() {
 // prepareOcclusionCullingForDepth - Build Hi-Z pyramid and filter recordMW before depth rendering
 // Called at the start of renderStage1(), BEFORE renderDepth() executes
 void FixedFunctionShader::prepareOcclusionCullingForDepth() {
-    ZoneScopedN("Prepare Occlusion Culling for Depth");
+    MGE_ZoneScopedN("Prepare Occlusion Culling for Depth");
 
     // Resize visibility results for this frame (indexed by draw order)
     visibilityResults.assign(DistantLand::recordMW.size(), -1);  // -1 = not yet tested
@@ -3384,7 +3221,7 @@ void FixedFunctionShader::prepareOcclusionCullingForDepth() {
     if (!recordedCalls.empty() && !hiZBuiltThisFrame) {
         // Compute bounding boxes for calls that missed the cache during recording
         {
-            ZoneScopedN("Prepare: BBox Cache Misses");
+            MGE_ZoneScopedN("Prepare: BBox Cache Misses");
             for (auto& call : recordedCalls) {
                 if (!call.hasBoundingBox) {
                     call.hasBoundingBox = computeBoundingBox(&call.rs, call.bboxMin, call.bboxMax);
@@ -3398,7 +3235,7 @@ void FixedFunctionShader::prepareOcclusionCullingForDepth() {
 
         // Occluder selection and rasterization
         {
-            ZoneScopedN("Prepare: Occluder Rasterization");
+            MGE_ZoneScopedN("Prepare: Occluder Rasterization");
             int occluderCount = 0;
             const int MAX_OCCLUDERS = ImGuiManager::GetOccluderMaxCount();
             const float MIN_SCREEN_COVERAGE = 0.01f;
@@ -3483,10 +3320,10 @@ void FixedFunctionShader::prepareOcclusionCullingForDepth() {
 
     // Build Hi-Z mipmap pyramid from rasterized occluders (only once per frame)
     if (!hiZBuiltThisFrame) {
-        ZoneScopedN("Build Hi-Z Pyramid");
+        MGE_ZoneScopedN("Build Hi-Z Pyramid");
         softwareOcclusionCuller.buildHiZPyramid();
         if (ImGuiManager::GetShowHiZInterface()) {
-            softwareOcclusionCuller.uploadHiZToTexture(reinterpret_cast<IDirect3DDevice9*>(device), ImGuiManager::GetHiZDisplayMip(), ImGuiManager::GetHiZBrightness(), ImGuiManager::GetHiZGamma(), ImGuiManager::GetHiZInvert(), ImGuiManager::GetHiZShowRaycastGrid(), ImGuiManager::GetHiZRaycastStep());
+            softwareOcclusionCuller.uploadHiZToTexture(reinterpret_cast<IDirect3DDevice9*>(device), ImGuiManager::GetHiZDisplayMip(), recordingDeviceProj, ImGuiManager::GetHiZInvert(), ImGuiManager::GetHiZShowRaycastGrid(), ImGuiManager::GetHiZRaycastStep());
         }
         hiZBuiltThisFrame = true;
     }
@@ -3499,9 +3336,18 @@ void FixedFunctionShader::prepareOcclusionCullingForDepth() {
         return;
     }
 
+    // Hi-Z bypass toggle for terrain hole diagnosis
+    if (ImGuiManager::GetDisableHiZCulling()) {
+        for (size_t i = 0; i < visibilityResults.size(); i++)
+            visibilityResults[i] = 1;
+        LOG::logline(">> Depth: %d objects (Hi-Z culling DISABLED by toggle)",
+                     (int)DistantLand::recordMW.size());
+        return;
+    }
+
     // Direct Hi-Z culling for depth pass using bboxCache + current matrices
     {
-        ZoneScopedN("Filter recordMW with Hi-Z Culling");
+        MGE_ZoneScopedN("Filter recordMW with Hi-Z Culling");
 
         // Get current matrices at depth-render time (not recording time!)
         D3DXMATRIX currentView, currentProj;
@@ -3558,7 +3404,7 @@ void FixedFunctionShader::prepareOcclusionCullingForDepth() {
 
 // Dirty tracking: match current frame calls to previous frame by MeshKey
 void FixedFunctionShader::matchPreviousFrameCalls() {
-    ZoneScopedN("matchPreviousFrameCalls");
+    MGE_ZoneScopedN("matchPreviousFrameCalls");
 
     if (previousFrameCalls.empty()) {
         // First frame or no previous data — all dirty
@@ -3642,7 +3488,7 @@ void FixedFunctionShader::matchPreviousFrameCalls() {
 // Phase 2b: Prepare shader keys — runs after recording completes, before replay.
 // BBox computation and occluder rasterization already done in prepareOcclusionCullingForDepth (Phase 2a).
 void FixedFunctionShader::prepareRecordedCalls() {
-    ZoneScopedN("prepareRecordedCalls");
+    MGE_ZoneScopedN("prepareRecordedCalls");
 
     if (recordedCalls.empty()) {
         return;
@@ -3650,7 +3496,7 @@ void FixedFunctionShader::prepareRecordedCalls() {
 
     // Compute shader keys (deferred from renderMorrowindHLSL recording path)
     {
-        ZoneScopedN("Prepare: Shader Keys");
+        MGE_ZoneScopedN("Prepare: Shader Keys");
         for (auto& call : recordedCalls) {
             call.sk = computeShaderKeyWithSuffixes(&call.rs, &call.frs, call.lightrs.get());
             call.prepared = true;
@@ -3771,6 +3617,33 @@ void FixedFunctionShader::finalizeBatchAndReplay(int sceneCount) {
         // Only record/replay Scene 0 (world geometry)
         // Scene 1+ (hands, sunglare, UI) should render normally without recording
         if (sceneCount == 0) {
+            // Diagnostic: increment frame counter for cache miss/hit logging
+            ++hlslDiagFrameCounter;
+
+            // After frame 5, dump unused precached variants
+            if (hlslDiagFrameCounter == 6) {
+                LOG::logline("-- PRECACHE HIT REPORT: %d keys hit out of %d cached", (int)diagHitKeys.size(), (int)cacheHLSLShaders.size());
+                AcquireSRWLockShared(&hlslCacheLock);
+                for (const auto& entry : cacheHLSLShaders) {
+                    const auto& k = entry.first;
+                    bool hit = diagHitKeys.count(k) > 0;
+                    char buf[256];
+                    snprintf(buf, sizeof(buf),
+                        "%s lm=%d lit=%d vc=%d vm=%d hl=%d skin=%d fog=%d uv=%d stg=%d shd=%d det=%d dp=%d ph=%d px=%d gr=%d bm=%d tg=%d",
+                        hit ? "HIT " : "UNUSED",
+                        (int)k.lightMode, (int)k.useLighting, (int)k.vertexColour,
+                        (int)k.vertexMaterial, (int)k.heavyLighting,
+                        (int)k.usesSkinning, (int)k.fogMode, (int)k.uvSets,
+                        (int)k.activeStages,
+                        (int)k.hasShadows, (int)k.hasDetail, (int)k.hasDiffParam,
+                        (int)k.hasParamH, (int)k.hasParamX, (int)k.hasGrass,
+                        (int)k.usesBumpmap, (int)k.usesTexgen);
+                    LOG::logline("%s", buf);
+                }
+                ReleaseSRWLockShared(&hlslCacheLock);
+                diagHitKeys.clear();
+            }
+
             // NOTE: bboxLookup is now populated during recording (in recordRenderCall)
             // so it's available for prepareOcclusionCullingForDepth which runs before this
 
@@ -3849,7 +3722,24 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
 
     // Extract lights for texture-based lighting system (all objects, even if culled)
     // Lights from culled objects can still illuminate visible geometry
-    for (const auto& [id, light] : lightrs->lights) {
+    // Only process ACTIVE lights — lightrs->lights accumulates all SetLight() calls
+    // across the session and never removes entries, so inactive/stale lights persist.
+    for (DWORD id : lightrs->active) {
+        auto lightIt = lightrs->lights.find(id);
+        if (lightIt == lightrs->lights.end()) continue;
+        const auto& light = lightIt->second;
+
+        // Skip directional lights (sun) — only point lights for scene lighting
+        if (light.type != D3DLIGHT_POINT) continue;
+
+        // Distance filter: reject lights far from camera (stale interior lights after cell change)
+        float dx = light.position.x - DistantLand::eyePos.x;
+        float dy = light.position.y - DistantLand::eyePos.y;
+        float dz = light.position.z - DistantLand::eyePos.z;
+        float distSq = dx*dx + dy*dy + dz*dz;
+        const float MAX_LIGHT_DIST_SQ = 8192.0f * 8192.0f;
+        if (distSq > MAX_LIGHT_DIST_SQ) continue;
+
         // Check if light already exists using O(1) hash map lookup
         auto mapIt = DistantLand::sceneLightIndexMap.find(id);
 
@@ -3862,8 +3752,8 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
             sl.diffuse = light.diffuse;
             sl.falloff = light.falloff;  // (constant, linear, quadratic)
             sl.radius = DistantLand::computeLightRadius(sl.falloff.x, sl.falloff.y, sl.falloff.z);
-            sl.isVisible = false;  // Will be set during Hi-Z culling
-            sl.lastSeenFrame = 0;  // Not used without persistence
+            sl.isVisible = false;
+            sl.lastSeenFrame = 0;
             DistantLand::sceneLights.push_back(sl);
             DistantLand::sceneLightIndexMap[id] = newIndex;  // Add to index map
         } else {
@@ -3880,7 +3770,7 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
     // causing ALL calls to share the first call's light config.
     std::shared_ptr<LightState> sharedLightState;
     {
-        ZoneScopedN("record_LightStateCache");
+        MGE_ZoneScopedN("record_LightStateCache");
         // Content comparison: reuse if lights haven't changed since last call
         if (lastLightState && compareLightStates(lastLightState.get(), lightrs)) {
             // Reuse existing shared_ptr (no allocation)
@@ -3909,120 +3799,520 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
     // This removes the heaviest per-draw work from the recording hot path
 }
 
-// ====== Light A/B Diagnostic Snapshot System ======
-// F5 captures snapshot A ("good angle"), F6 captures snapshot B ("bad angle") and logs diff
+// ====== Full Pipeline A/B Diagnostic Snapshot System ======
+// F5 captures snapshot A (saves to disk), F6 captures snapshot B (loads A from disk, diffs)
+// Designed for cross-launch comparison: exterior-direct (A) vs interior→exterior (B)
 
-struct LightCallInfo {
-    size_t activeCount;          // lightrs->active.size()
-    size_t pointLightCount;      // counted from lightrs->lights
-    int lightModeFlag;           // shader key lightMode (0-3)
-    size_t lightsTransformedCount; // lightrs->lightsTransformed.size()
+#include <cstdio>
+
+struct CallSnapshotInfo {
+    // Geometry identity
+    DWORD fvf;
+    UINT primCount, vertCount;
+    // Render state
+    BYTE alphaTest, alphaFunc, alphaRef;
+    BYTE blendEnable, srcBlend, destBlend;
+    // Shader
+    DWORD shaderKeyDword;  // first 32 bits of ShaderKey (bitfield)
+    int lightMode;
+    int activeStages;
+    // World position (from worldTransform[0])
+    float posX, posY, posZ;
+    // Light state
+    size_t activeCount;
+    size_t pointLightCount;
+    size_t lightsTransformedCount;
+    // Flags
+    bool hasBoundingBox;
+    bool prepared;
+    int8_t hiZVisible;  // 1=visible, 0=culled, -1=not tested
+    // Point light details (first 3)
     struct PointLightDetail {
         DWORD id;
-        float wx, wy, wz;       // world position
-        float vx, vy, vz;       // viewspace position
-        bool wasTransformed;     // lightsTransformed[id] was set
+        float wx, wy, wz;
+        float vx, vy, vz;
     };
-    PointLightDetail pointLights[3]; // first 3 point lights
+    PointLightDetail pointLights[3];
     int numPointLightDetails;
 };
 
-struct LightSnapshot {
+struct FrameSnapshot {
     bool valid;
+    int totalRecordedCalls;
     int sceneLightsTotal;
-    int visibleLightsAfterCull;
-    float deviceView41, deviceView42, deviceView43;
-    float recordView41, recordView42, recordView43;
-    std::vector<LightCallInfo> callInfos; // first 20 + last 5
+    float cameraX, cameraY, cameraZ;
+    float eyePosX, eyePosY, eyePosZ;  // World position from DistantLand::eyePos
+    float recordCameraX, recordCameraY, recordCameraZ;
+    std::vector<CallSnapshotInfo> callInfos;  // ALL calls
 
-    LightSnapshot() : valid(false), sceneLightsTotal(0), visibleLightsAfterCull(0),
-        deviceView41(0), deviceView42(0), deviceView43(0),
-        recordView41(0), recordView42(0), recordView43(0) {}
+    FrameSnapshot() : valid(false), totalRecordedCalls(0), sceneLightsTotal(0),
+        cameraX(0), cameraY(0), cameraZ(0),
+        eyePosX(0), eyePosY(0), eyePosZ(0),
+        recordCameraX(0), recordCameraY(0), recordCameraZ(0) {}
 
-    // Called from replayRecordedCalls with pre-built callInfos
-    void capture(std::vector<LightCallInfo>&& infos,
-                 const D3DXMATRIX& currentView, const D3DXMATRIX& recView) {
-        valid = true;
-        sceneLightsTotal = (int)DistantLand::sceneLights.size();
-        visibleLightsAfterCull = (int)DistantLand::visibleLights.size();
-        deviceView41 = currentView._41; deviceView42 = currentView._42; deviceView43 = currentView._43;
-        recordView41 = recView._41; recordView42 = recView._42; recordView43 = recView._43;
-        callInfos = std::move(infos);
-    }
+    bool saveToFile(const char* path) const {
+        FILE* f = fopen(path, "w");
+        if (!f) return false;
 
-    void log(const char* label) const {
-        if (!valid) return;
-        LOG::logline("=== LightSnapshot %s ===", label);
-        LOG::logline("  sceneLights: %d total, %d visible after cull", sceneLightsTotal, visibleLightsAfterCull);
-        LOG::logline("  deviceView translation: (%.1f, %.1f, %.1f)", deviceView41, deviceView42, deviceView43);
-        LOG::logline("  recordView translation: (%.1f, %.1f, %.1f)", recordView41, recordView42, recordView43);
-        LOG::logline("  %d call summaries:", (int)callInfos.size());
+        fprintf(f, "[frame]\n");
+        fprintf(f, "totalCalls=%d\n", totalRecordedCalls);
+        fprintf(f, "sceneLights=%d\n", sceneLightsTotal);
+        fprintf(f, "camera=%.2f,%.2f,%.2f\n", cameraX, cameraY, cameraZ);
+        fprintf(f, "eyePos=%.2f,%.2f,%.2f\n", eyePosX, eyePosY, eyePosZ);
+        fprintf(f, "recordCamera=%.2f,%.2f,%.2f\n", recordCameraX, recordCameraY, recordCameraZ);
+
         for (size_t i = 0; i < callInfos.size(); i++) {
             const auto& c = callInfos[i];
-            LOG::logline("    call[%d]: active=%d, pointLights=%d, lightMode=%d, lightsTransformed=%d",
-                (int)i, (int)c.activeCount, (int)c.pointLightCount, c.lightModeFlag, (int)c.lightsTransformedCount);
+            fprintf(f, "[call %d]\n", (int)i);
+            fprintf(f, "fvf=0x%X prim=%u vert=%u\n", c.fvf, c.primCount, c.vertCount);
+            fprintf(f, "alpha=%d,%d,%d blend=%d,%d,%d\n",
+                c.alphaTest, c.alphaFunc, c.alphaRef,
+                c.blendEnable, c.srcBlend, c.destBlend);
+            fprintf(f, "sk=0x%08X lightMode=%d stages=%d\n",
+                c.shaderKeyDword, c.lightMode, c.activeStages);
+            fprintf(f, "pos=%.2f,%.2f,%.2f\n", c.posX, c.posY, c.posZ);
+            fprintf(f, "lights=%d pointLights=%d transformed=%d\n",
+                (int)c.activeCount, (int)c.pointLightCount, (int)c.lightsTransformedCount);
+            fprintf(f, "bbox=%d prepared=%d hiZ=%d\n", c.hasBoundingBox ? 1 : 0, c.prepared ? 1 : 0, (int)c.hiZVisible);
             for (int j = 0; j < c.numPointLightDetails; j++) {
                 const auto& p = c.pointLights[j];
-                LOG::logline("      light[%d] id=%d world=(%.1f,%.1f,%.1f) view=(%.1f,%.1f,%.1f) transformed=%d",
-                    j, p.id, p.wx, p.wy, p.wz, p.vx, p.vy, p.vz, p.wasTransformed ? 1 : 0);
+                fprintf(f, "light[%d] id=%u world=%.2f,%.2f,%.2f view=%.2f,%.2f,%.2f\n",
+                    j, p.id, p.wx, p.wy, p.wz, p.vx, p.vy, p.vz);
             }
         }
+        fclose(f);
+        return true;
     }
 
-    static void logDiff(const LightSnapshot& a, const LightSnapshot& b) {
-        if (!a.valid || !b.valid) return;
-        LOG::logline("=== Light A/B DIFF ===");
+    bool loadFromFile(const char* path) {
+        FILE* f = fopen(path, "r");
+        if (!f) return false;
 
-        // Scene lights
-        if (a.sceneLightsTotal != b.sceneLightsTotal)
-            LOG::logline("  DIFF sceneLightsTotal: A=%d B=%d", a.sceneLightsTotal, b.sceneLightsTotal);
-        if (a.visibleLightsAfterCull != b.visibleLightsAfterCull)
-            LOG::logline("  DIFF visibleLightsAfterCull: A=%d B=%d  << Hi-Z culling issue?", a.visibleLightsAfterCull, b.visibleLightsAfterCull);
-        else
-            LOG::logline("  SAME visibleLightsAfterCull: %d", a.visibleLightsAfterCull);
+        valid = false;
+        callInfos.clear();
+        char line[512];
+        CallSnapshotInfo* currentCall = nullptr;
 
-        // Camera
-        LOG::logline("  Camera A: (%.1f, %.1f, %.1f)  B: (%.1f, %.1f, %.1f)",
-            a.deviceView41, a.deviceView42, a.deviceView43,
-            b.deviceView41, b.deviceView42, b.deviceView43);
+        while (fgets(line, sizeof(line), f)) {
+            // Strip newline
+            size_t len = strlen(line);
+            while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = 0;
 
-        // Per-call comparison
-        size_t minCalls = std::min(a.callInfos.size(), b.callInfos.size());
-        int droppedCalls = 0, transformedDiffs = 0, flagDiffs = 0;
-        for (size_t i = 0; i < minCalls; i++) {
-            const auto& ca = a.callInfos[i];
-            const auto& cb = b.callInfos[i];
-            if (ca.pointLightCount > 0 && cb.pointLightCount == 0) droppedCalls++;
-            if (ca.lightsTransformedCount != cb.lightsTransformedCount) transformedDiffs++;
-            if (ca.lightModeFlag != cb.lightModeFlag) flagDiffs++;
-
-            // Log viewspace position changes for matching point lights
-            int minDetails = std::min(ca.numPointLightDetails, cb.numPointLightDetails);
-            for (int j = 0; j < minDetails; j++) {
-                float dx = cb.pointLights[j].vx - ca.pointLights[j].vx;
-                float dy = cb.pointLights[j].vy - ca.pointLights[j].vy;
-                float dz = cb.pointLights[j].vz - ca.pointLights[j].vz;
-                float dist = sqrtf(dx*dx + dy*dy + dz*dz);
-                if (dist > 10.0f) {
-                    LOG::logline("  call[%d] light[%d] viewspace moved %.1f: A=(%.1f,%.1f,%.1f) B=(%.1f,%.1f,%.1f)",
-                        (int)i, j, dist,
-                        ca.pointLights[j].vx, ca.pointLights[j].vy, ca.pointLights[j].vz,
-                        cb.pointLights[j].vx, cb.pointLights[j].vy, cb.pointLights[j].vz);
+            if (strncmp(line, "[frame]", 7) == 0) {
+                continue;
+            } else if (strncmp(line, "[call ", 6) == 0) {
+                callInfos.push_back(CallSnapshotInfo{});
+                currentCall = &callInfos.back();
+                memset(currentCall, 0, sizeof(CallSnapshotInfo));
+            } else if (sscanf(line, "totalCalls=%d", &totalRecordedCalls) == 1) {
+                // parsed
+            } else if (sscanf(line, "sceneLights=%d", &sceneLightsTotal) == 1) {
+                // parsed
+            } else if (sscanf(line, "camera=%f,%f,%f", &cameraX, &cameraY, &cameraZ) == 3) {
+                // parsed
+            } else if (sscanf(line, "eyePos=%f,%f,%f", &eyePosX, &eyePosY, &eyePosZ) == 3) {
+                // parsed
+            } else if (sscanf(line, "recordCamera=%f,%f,%f", &recordCameraX, &recordCameraY, &recordCameraZ) == 3) {
+                // parsed
+            } else if (currentCall) {
+                unsigned int fvfTmp;
+                if (sscanf(line, "fvf=0x%X prim=%u vert=%u", &fvfTmp, &currentCall->primCount, &currentCall->vertCount) == 3) {
+                    currentCall->fvf = (DWORD)fvfTmp;
+                } else {
+                    int at, af, ar, be, sb, db;
+                    if (sscanf(line, "alpha=%d,%d,%d blend=%d,%d,%d", &at, &af, &ar, &be, &sb, &db) == 6) {
+                        currentCall->alphaTest = (BYTE)at; currentCall->alphaFunc = (BYTE)af; currentCall->alphaRef = (BYTE)ar;
+                        currentCall->blendEnable = (BYTE)be; currentCall->srcBlend = (BYTE)sb; currentCall->destBlend = (BYTE)db;
+                    } else {
+                        unsigned int skTmp;
+                        if (sscanf(line, "sk=0x%X lightMode=%d stages=%d", &skTmp, &currentCall->lightMode, &currentCall->activeStages) == 3) {
+                            currentCall->shaderKeyDword = (DWORD)skTmp;
+                        } else if (sscanf(line, "pos=%f,%f,%f", &currentCall->posX, &currentCall->posY, &currentCall->posZ) == 3) {
+                            // parsed
+                        } else {
+                            int lc, plc, tc;
+                            if (sscanf(line, "lights=%d pointLights=%d transformed=%d", &lc, &plc, &tc) == 3) {
+                                currentCall->activeCount = lc; currentCall->pointLightCount = plc; currentCall->lightsTransformedCount = tc;
+                            } else {
+                                int bb, pp, hz = -1;
+                                if (sscanf(line, "bbox=%d prepared=%d hiZ=%d", &bb, &pp, &hz) >= 2) {
+                                    currentCall->hasBoundingBox = (bb != 0); currentCall->prepared = (pp != 0);
+                                    currentCall->hiZVisible = (int8_t)hz;
+                                } else {
+                                    int li; unsigned int lid;
+                                    float lwx, lwy, lwz, lvx, lvy, lvz;
+                                    if (sscanf(line, "light[%d] id=%u world=%f,%f,%f view=%f,%f,%f",
+                                               &li, &lid, &lwx, &lwy, &lwz, &lvx, &lvy, &lvz) == 8) {
+                                        if (currentCall->numPointLightDetails < 3) {
+                                            auto& p = currentCall->pointLights[currentCall->numPointLightDetails];
+                                            p.id = (DWORD)lid;
+                                            p.wx = lwx; p.wy = lwy; p.wz = lwz;
+                                            p.vx = lvx; p.vy = lvy; p.vz = lvz;
+                                            currentCall->numPointLightDetails++;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
+        fclose(f);
+        valid = (totalRecordedCalls > 0);
+        return valid;
+    }
 
-        LOG::logline("  Summary: %d calls dropped to 0 pointLights, %d lightsTransformed diffs, %d lightMode diffs",
-            droppedCalls, transformedDiffs, flagDiffs);
-        if (droppedCalls > 0) LOG::logline("  >> LIKELY: per-object pointLightCount dropping to 0 (LightState or transform issue)");
-        if (flagDiffs > 0) LOG::logline("  >> LIKELY: lightMode shader key changed (different light permutation)");
-        if (transformedDiffs > 0) LOG::logline("  >> LIKELY: lightsTransformed cache preventing re-transform when view changes");
-        LOG::logline("=== END DIFF ===");
+    // Structural key for position-based matching (quantized to 256-unit grid)
+    struct StructuralKey {
+        DWORD fvf;
+        UINT primCount;
+        int qx, qy;  // quantized position (nearest 256 units)
+
+        bool operator==(const StructuralKey& other) const {
+            return fvf == other.fvf && primCount == other.primCount && qx == other.qx && qy == other.qy;
+        }
+    };
+
+    struct StructuralKeyHash {
+        std::size_t operator()(const StructuralKey& k) const {
+            std::size_t h = std::hash<DWORD>{}(k.fvf);
+            h ^= std::hash<UINT>{}(k.primCount) << 1;
+            h ^= std::hash<int>{}(k.qx) << 2;
+            h ^= std::hash<int>{}(k.qy) << 3;
+            return h;
+        }
+    };
+
+    static StructuralKey makeKey(const CallSnapshotInfo& c) {
+        return { c.fvf, c.primCount,
+                 (int)floorf(c.posX / 256.0f + 0.5f),
+                 (int)floorf(c.posY / 256.0f + 0.5f) };
+    }
+
+    // Write diff to a FILE* (used for both log and dedicated diff file)
+    static void writeDiff(FILE* out, const FrameSnapshot& a, const FrameSnapshot& b) {
+        fprintf(out, "=== Pipeline A/B DIFF (A=problem, B=reference) ===\n");
+
+        // Frame-level
+        if (a.totalRecordedCalls != b.totalRecordedCalls)
+            fprintf(out, "DIFF totalRecordedCalls: A=%d B=%d\n", a.totalRecordedCalls, b.totalRecordedCalls);
+        else
+            fprintf(out, "SAME totalRecordedCalls: %d\n", a.totalRecordedCalls);
+
+        if (a.sceneLightsTotal != b.sceneLightsTotal)
+            fprintf(out, "DIFF sceneLightsTotal: A=%d B=%d\n", a.sceneLightsTotal, b.sceneLightsTotal);
+
+        fprintf(out, "Camera A: (%.1f, %.1f, %.1f)  B: (%.1f, %.1f, %.1f)\n",
+            a.cameraX, a.cameraY, a.cameraZ, b.cameraX, b.cameraY, b.cameraZ);
+        fprintf(out, "EyePos A: (%.1f, %.1f, %.1f)  B: (%.1f, %.1f, %.1f)\n",
+            a.eyePosX, a.eyePosY, a.eyePosZ, b.eyePosX, b.eyePosY, b.eyePosZ);
+        fprintf(out, "RecordCamera A: (%.1f, %.1f, %.1f)  B: (%.1f, %.1f, %.1f)\n",
+            a.recordCameraX, a.recordCameraY, a.recordCameraZ,
+            b.recordCameraX, b.recordCameraY, b.recordCameraZ);
+
+        // Build multimap from A calls by structural key
+        std::unordered_multimap<StructuralKey, size_t, StructuralKeyHash> aLookup;
+        for (size_t i = 0; i < a.callInfos.size(); i++) {
+            aLookup.insert({makeKey(a.callInfos[i]), i});
+        }
+
+        // Track which A calls got matched
+        std::vector<bool> aMatched(a.callInfos.size(), false);
+
+        // Diff counters
+        int shaderDiffs = 0, lightCountDiffs = 0, alphaDiffs = 0, blendDiffs = 0;
+        int posDiffs = 0, bboxDiffs = 0, visDiffs = 0;
+        // Visibility transition details for identifying false occlusion
+        struct VisTransition {
+            int aIdx, bIdx;
+            int8_t aVis, bVis;
+            DWORD fvf; UINT primCount;
+            float posX, posY, posZ;
+        };
+        std::vector<VisTransition> visTransitions;
+        int matchedCount = 0, onlyInA = 0, onlyInB = 0;
+
+        // Grouped diff details
+        std::unordered_map<DWORD, int> shaderXorHistogram;  // xor pattern -> count
+        std::unordered_map<int, int> lightDeltaHistogram;   // (aCount - bCount) -> count
+        // Alpha transition histogram: "A(test,func,ref) -> B(test,func,ref)" -> count
+        struct AlphaTransition {
+            BYTE aTest, aFunc, aRef, bTest, bFunc, bRef;
+            bool operator==(const AlphaTransition& o) const {
+                return aTest==o.aTest && aFunc==o.aFunc && aRef==o.aRef &&
+                       bTest==o.bTest && bFunc==o.bFunc && bRef==o.bRef;
+            }
+        };
+        struct AlphaTransitionHash {
+            std::size_t operator()(const AlphaTransition& t) const {
+                return std::hash<uint64_t>{}(
+                    (uint64_t)t.aTest | ((uint64_t)t.aFunc<<8) | ((uint64_t)t.aRef<<16) |
+                    ((uint64_t)t.bTest<<24) | ((uint64_t)t.bFunc<<32) | ((uint64_t)t.bRef<<40));
+            }
+        };
+        std::unordered_map<AlphaTransition, int, AlphaTransitionHash> alphaHistogram;
+        // Blend transition histogram
+        struct BlendTransition {
+            BYTE aEn, aSrc, aDst, bEn, bSrc, bDst;
+            bool operator==(const BlendTransition& o) const {
+                return aEn==o.aEn && aSrc==o.aSrc && aDst==o.aDst &&
+                       bEn==o.bEn && bSrc==o.bSrc && bDst==o.bDst;
+            }
+        };
+        struct BlendTransitionHash {
+            std::size_t operator()(const BlendTransition& t) const {
+                return std::hash<uint64_t>{}(
+                    (uint64_t)t.aEn | ((uint64_t)t.aSrc<<8) | ((uint64_t)t.aDst<<16) |
+                    ((uint64_t)t.bEn<<24) | ((uint64_t)t.bSrc<<32) | ((uint64_t)t.bDst<<40));
+            }
+        };
+        std::unordered_map<BlendTransition, int, BlendTransitionHash> blendHistogram;
+
+        // For each B call (reference), find matching A call
+        for (size_t bi = 0; bi < b.callInfos.size(); bi++) {
+            const auto& cb = b.callInfos[bi];
+            StructuralKey bKey = makeKey(cb);
+
+            // Find first unmatched A entry with same key
+            auto range = aLookup.equal_range(bKey);
+            size_t bestAi = SIZE_MAX;
+            for (auto it = range.first; it != range.second; ++it) {
+                if (!aMatched[it->second]) {
+                    bestAi = it->second;
+                    break;
+                }
+            }
+
+            if (bestAi == SIZE_MAX) {
+                onlyInB++;
+                continue;
+            }
+
+            aMatched[bestAi] = true;
+            matchedCount++;
+            const auto& ca = a.callInfos[bestAi];
+
+            // Diff matched pair
+            if (ca.shaderKeyDword != cb.shaderKeyDword || ca.lightMode != cb.lightMode) {
+                shaderDiffs++;
+                DWORD xor_bits = ca.shaderKeyDword ^ cb.shaderKeyDword;
+                shaderXorHistogram[xor_bits]++;
+            }
+
+            if (ca.activeCount != cb.activeCount || ca.pointLightCount != cb.pointLightCount) {
+                lightCountDiffs++;
+                int delta = (int)ca.pointLightCount - (int)cb.pointLightCount;
+                lightDeltaHistogram[delta]++;
+            }
+
+            if (ca.alphaTest != cb.alphaTest || ca.alphaFunc != cb.alphaFunc || ca.alphaRef != cb.alphaRef) {
+                alphaDiffs++;
+                alphaHistogram[{ca.alphaTest, ca.alphaFunc, ca.alphaRef,
+                                cb.alphaTest, cb.alphaFunc, cb.alphaRef}]++;
+            }
+
+            if (ca.blendEnable != cb.blendEnable || ca.srcBlend != cb.srcBlend || ca.destBlend != cb.destBlend) {
+                blendDiffs++;
+                blendHistogram[{ca.blendEnable, ca.srcBlend, ca.destBlend,
+                                cb.blendEnable, cb.srcBlend, cb.destBlend}]++;
+            }
+
+            float dx = cb.posX - ca.posX;
+            float dy = cb.posY - ca.posY;
+            float dz = cb.posZ - ca.posZ;
+            if (sqrtf(dx*dx + dy*dy + dz*dz) > 10.0f) {
+                posDiffs++;
+            }
+
+            if (ca.hasBoundingBox != cb.hasBoundingBox) {
+                bboxDiffs++;
+            }
+
+            // Visibility diff: detect false occlusion (A culled, B visible)
+            if (ca.hiZVisible != cb.hiZVisible) {
+                visDiffs++;
+                // Track transition pattern with position for detailed output
+                visTransitions.push_back({(int)bestAi, (int)bi, ca.hiZVisible, cb.hiZVisible,
+                    ca.fvf, ca.primCount, ca.posX, ca.posY, ca.posZ});
+            }
+        }
+
+        // Count unmatched A calls (stale calls in problem scene)
+        for (size_t i = 0; i < a.callInfos.size(); i++) {
+            if (!aMatched[i]) onlyInA++;
+        }
+
+        // --- Grouped output ---
+        fprintf(out, "\n=== STRUCTURAL MATCHING: %d matched, %d ONLY IN A (stale), %d ONLY IN B (missing) ===\n",
+            matchedCount, onlyInA, onlyInB);
+
+        if (shaderDiffs > 0) {
+            fprintf(out, "\nSHADER DIFFS: %d calls with changed shaderKey\n", shaderDiffs);
+            // Known ShaderKey bit names for decoding XOR diffs
+            const char* bitNames[] = {
+                nullptr, nullptr, nullptr, nullptr,  // bits 0-3: uvSets
+                "usesSkinning", "vertexColour", "heavyLighting", "useLighting",  // 4-7
+                nullptr, nullptr,  // 8-9: lightMode
+                nullptr, nullptr,  // 10-11: vertexMaterial
+                nullptr, nullptr,  // 12-13: fogMode
+                nullptr, nullptr, nullptr,  // 14-16: activeStages
+                "usesBumpmap",  // 17
+                nullptr, nullptr, nullptr,  // 18-20: bumpmapStage
+                "usesTexgen", "projectiveTexgen",  // 21-22
+                nullptr, nullptr, nullptr,  // 23-25: texgenStage
+                "hasDiffParam", "hasParamH", "hasParamX",  // 26-28
+                "hasShadows", "hasGrass", "hasDetail"  // 29-31
+            };
+            for (const auto& [xorBits, count] : shaderXorHistogram) {
+                fprintf(out, "  xor=0x%08X: %d calls", xorBits, count);
+                std::string decoded;
+                for (int bit = 0; bit < 32; bit++) {
+                    if ((xorBits & (1u << bit)) && bitNames[bit]) {
+                        if (!decoded.empty()) decoded += "+";
+                        decoded += bitNames[bit];
+                    }
+                }
+                if (!decoded.empty()) {
+                    fprintf(out, " [%s]", decoded.c_str());
+                }
+                fprintf(out, "\n");
+            }
+        }
+
+        if (lightCountDiffs > 0) {
+            fprintf(out, "\nLIGHT COUNT DIFFS: %d calls\n", lightCountDiffs);
+            for (const auto& [delta, count] : lightDeltaHistogram) {
+                fprintf(out, "  A has %+d more point lights: %d calls\n", delta, count);
+            }
+        }
+
+        if (alphaDiffs > 0) {
+            fprintf(out, "\nALPHA DIFFS: %d calls\n", alphaDiffs);
+            for (const auto& [t, count] : alphaHistogram) {
+                fprintf(out, "  A(test=%d func=%d ref=%d) -> B(test=%d func=%d ref=%d): %d calls\n",
+                    t.aTest, t.aFunc, t.aRef, t.bTest, t.bFunc, t.bRef, count);
+            }
+        }
+        if (blendDiffs > 0) {
+            fprintf(out, "\nBLEND DIFFS: %d calls\n", blendDiffs);
+            for (const auto& [t, count] : blendHistogram) {
+                fprintf(out, "  A(en=%d src=%d dst=%d) -> B(en=%d src=%d dst=%d): %d calls\n",
+                    t.aEn, t.aSrc, t.aDst, t.bEn, t.bSrc, t.bDst, count);
+            }
+        }
+        if (posDiffs > 0) fprintf(out, "\nPOSITION DIFFS: %d calls moved >10 units\n", posDiffs);
+        if (bboxDiffs > 0) fprintf(out, "\nBBOX DIFFS: %d calls\n", bboxDiffs);
+
+        if (visDiffs > 0) {
+            fprintf(out, "\nVISIBILITY DIFFS: %d calls with different Hi-Z culling\n", visDiffs);
+            // Group by transition type
+            int falseOcclusion = 0, falseMiss = 0, other = 0;
+            for (const auto& v : visTransitions) {
+                if (v.aVis == 0 && v.bVis == 1) falseOcclusion++;
+                else if (v.aVis == 1 && v.bVis == 0) falseMiss++;
+                else other++;
+            }
+            if (falseOcclusion > 0)
+                fprintf(out, "  A=CULLED B=VISIBLE (FALSE OCCLUSION): %d calls\n", falseOcclusion);
+            if (falseMiss > 0)
+                fprintf(out, "  A=VISIBLE B=CULLED: %d calls\n", falseMiss);
+            if (other > 0)
+                fprintf(out, "  Other transitions: %d calls\n", other);
+
+            // List false occlusion calls with details (the most important ones)
+            if (falseOcclusion > 0) {
+                fprintf(out, "  --- False occlusion details (A culled, B visible) ---\n");
+                int printed = 0;
+                for (const auto& v : visTransitions) {
+                    if (v.aVis == 0 && v.bVis == 1 && printed < 30) {
+                        fprintf(out, "    A[%d]/B[%d]: fvf=0x%X prim=%u pos=(%.1f,%.1f,%.1f)\n",
+                            v.aIdx, v.bIdx, v.fvf, v.primCount, v.posX, v.posY, v.posZ);
+                        printed++;
+                    }
+                }
+                if (falseOcclusion > 30) fprintf(out, "    ... and %d more\n", falseOcclusion - 30);
+            }
+        }
+
+        // List calls ONLY IN A (stale — present in problem scene, absent from reference)
+        if (onlyInA > 0) {
+            fprintf(out, "\n--- ONLY IN A (stale calls in problem scene): %d ---\n", onlyInA);
+            int printed = 0;
+            for (size_t i = 0; i < a.callInfos.size() && printed < 50; i++) {
+                if (!aMatched[i]) {
+                    const auto& c = a.callInfos[i];
+                    fprintf(out, "  A[%d]: fvf=0x%X prim=%u pos=(%.1f,%.1f,%.1f) sk=0x%08X lm=%d lights=%d\n",
+                        (int)i, c.fvf, c.primCount, c.posX, c.posY, c.posZ,
+                        c.shaderKeyDword, c.lightMode, (int)c.pointLightCount);
+                    printed++;
+                }
+            }
+            if (onlyInA > 50) fprintf(out, "  ... and %d more\n", onlyInA - 50);
+        }
+
+        // List calls ONLY IN B (missing from problem scene — present in fresh reference)
+        if (onlyInB > 0) {
+            fprintf(out, "\n--- ONLY IN B (missing from problem scene): %d ---\n", onlyInB);
+            // Re-scan to find unmatched B calls
+            // Rebuild: mark B calls that found matches
+            std::vector<bool> bMatched(b.callInfos.size(), false);
+            // Reset A matched for re-matching
+            std::fill(aMatched.begin(), aMatched.end(), false);
+            for (size_t bi = 0; bi < b.callInfos.size(); bi++) {
+                StructuralKey bKey = makeKey(b.callInfos[bi]);
+                auto range = aLookup.equal_range(bKey);
+                for (auto it = range.first; it != range.second; ++it) {
+                    if (!aMatched[it->second]) {
+                        aMatched[it->second] = true;
+                        bMatched[bi] = true;
+                        break;
+                    }
+                }
+            }
+            int printed = 0;
+            for (size_t i = 0; i < b.callInfos.size() && printed < 50; i++) {
+                if (!bMatched[i]) {
+                    const auto& c = b.callInfos[i];
+                    fprintf(out, "  B[%d]: fvf=0x%X prim=%u pos=(%.1f,%.1f,%.1f) sk=0x%08X lm=%d lights=%d\n",
+                        (int)i, c.fvf, c.primCount, c.posX, c.posY, c.posZ,
+                        c.shaderKeyDword, c.lightMode, (int)c.pointLightCount);
+                    printed++;
+                }
+            }
+            if (onlyInB > 50) fprintf(out, "  ... and %d more\n", onlyInB - 50);
+        }
+
+        fprintf(out, "\n=== SUMMARY ===\n");
+        fprintf(out, "Calls: A=%d B=%d | Matched=%d | ONLY IN A (stale)=%d | ONLY IN B (missing)=%d\n",
+            (int)a.callInfos.size(), (int)b.callInfos.size(), matchedCount, onlyInA, onlyInB);
+        fprintf(out, "Diffs in matched: %d shader, %d lightCount, %d alpha, %d blend, %d position, %d bbox, %d visibility\n",
+            shaderDiffs, lightCountDiffs, alphaDiffs, blendDiffs, posDiffs, bboxDiffs, visDiffs);
+        fprintf(out, "=== END DIFF ===\n");
+    }
+
+    static void logDiff(const FrameSnapshot& a, const FrameSnapshot& b) {
+        if (!a.valid || !b.valid) return;
+
+        // Write to mgeXE.log via LOG
+        LOG::logline("=== Pipeline A/B DIFF (summary) ===");
+        LOG::logline("  totalCalls: A=%d B=%d", a.totalRecordedCalls, b.totalRecordedCalls);
+        LOG::logline("  sceneLights: A=%d B=%d", a.sceneLightsTotal, b.sceneLightsTotal);
+        LOG::logline("  eyePos A=(%.1f,%.1f,%.1f) B=(%.1f,%.1f,%.1f)",
+            a.eyePosX, a.eyePosY, a.eyePosZ, b.eyePosX, b.eyePosY, b.eyePosZ);
+        LOG::logline("  Full diff written to mge_snapshot_diff.log");
+
+        // Write detailed diff to dedicated file
+        FILE* diffFile = fopen("mge_snapshot_diff.log", "w");
+        if (diffFile) {
+            writeDiff(diffFile, a, b);
+            fclose(diffFile);
+        }
     }
 };
 
-static LightSnapshot lightSnapshotA;
-static LightSnapshot lightSnapshotB;
+static FrameSnapshot snapshotA;
+static FrameSnapshot snapshotB;
 
 void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     {
@@ -4043,7 +4333,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     D3DXMATRIX viewProj;
     D3DXMATRIX savedShadowViewproj[2];
     {
-        ZoneScopedN("replay_GetTransforms");
+        MGE_ZoneScopedN("replay_GetTransforms");
         device->GetTransform(D3DTS_VIEW, &currentView);
         device->GetTransform(D3DTS_PROJECTION, &currentProj);
     }
@@ -4057,10 +4347,6 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     // Calculate view-projection matrix for Hi-Z culling
     viewProj = currentView * currentProj;
 
-    // Hi-Z pyramid generation moved to end of frame (Present) for better performance
-    // We use previous frame's Hi-Z here for GPU culling (minimal 1-frame delay)
-    // GPU-based culling: Hi-Z stays in VRAM, no CPU locking needed!
-
     // Hi-Z culling statistics
     int totalCalls = recordedCalls.size();
     int culledCalls = 0;
@@ -4069,10 +4355,10 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     int cacheHits = 0;    // Visibility reused from depth pass
     int cacheMisses = 0;  // New Hi-Z tests (alpha objects)
 
-    // Check for debug key press (Y key)
+    // Check for debug key press (Y key) - gated behind debug hotkeys toggle
     static bool debugHiZ = false;
     static int debugCallCount = 0;
-    if (GetAsyncKeyState('Y') & 0x8000) {
+    if (ImGuiManager::GetDebugKeysEnabled() && (GetAsyncKeyState('Y') & 0x8000)) {
         static bool wasPressed = false;
         if (!wasPressed) {
             debugHiZ = true;
@@ -4085,8 +4371,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
         wasPressed = false;
     }
 
-    // Check for Hi-Z snapshot save key press (L key)
-    if (GetAsyncKeyState('L') & 0x8000) {
+    // Check for Hi-Z snapshot save key press (L key) - gated behind debug hotkeys toggle
+    if (ImGuiManager::GetDebugKeysEnabled() && (GetAsyncKeyState('L') & 0x8000)) {
         static bool wasPressed = false;
         if (!wasPressed) {
             LOG::logline(">> L key pressed: Saving Hi-Z snapshot...");
@@ -4098,19 +4384,50 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
         wasPressed = false;
     }
 
-    // Helper: build LightCallInfo vector from recorded calls (first 20 + last 5)
-    auto buildLightCallInfos = [&]() -> std::vector<LightCallInfo> {
-        std::vector<LightCallInfo> infos;
+    // Helper: build CallSnapshotInfo vector from ALL recorded calls
+    auto buildCallSnapshots = [&]() -> std::vector<CallSnapshotInfo> {
+        std::vector<CallSnapshotInfo> infos;
         size_t total = recordedCalls.size();
+        infos.reserve(total);
         for (size_t i = 0; i < total; i++) {
-            bool shouldCapture = (i < 20) || (total > 5 && i >= total - 5);
-            if (!shouldCapture) continue;
-
             const auto& call = recordedCalls[i];
-            LightCallInfo info;
+            CallSnapshotInfo info;
+            memset(&info, 0, sizeof(info));
+
+            // Geometry identity
+            info.fvf = call.rs.fvf;
+            info.primCount = call.rs.primCount;
+            info.vertCount = call.rs.vertCount;
+
+            // Render state
+            info.alphaTest = call.rs.alphaTest;
+            info.alphaFunc = call.rs.alphaFunc;
+            info.alphaRef = call.rs.alphaRef;
+            info.blendEnable = call.rs.blendEnable;
+            info.srcBlend = call.rs.srcBlend;
+            info.destBlend = call.rs.destBlend;
+
+            // Shader key (cast first 32 bits)
+            info.shaderKeyDword = *(const DWORD*)&call.sk;
+            info.lightMode = call.sk.lightMode;
+            info.activeStages = call.sk.activeStages;
+
+            // World position
+            info.posX = call.rs.worldTransforms[0]._41;
+            info.posY = call.rs.worldTransforms[0]._42;
+            info.posZ = call.rs.worldTransforms[0]._43;
+
+            // Light state
             info.activeCount = call.lightrs ? call.lightrs->active.size() : 0;
-            info.lightModeFlag = call.sk.lightMode;
             info.lightsTransformedCount = call.lightrs ? call.lightrs->lightsTransformed.size() : 0;
+            info.hasBoundingBox = call.hasBoundingBox;
+            info.prepared = call.prepared;
+            // Capture Hi-Z visibility from depth pass results
+            if (call.recordMWIndex >= 0 && call.recordMWIndex < (int)visibilityResults.size()) {
+                info.hiZVisible = visibilityResults[call.recordMWIndex];
+            } else {
+                info.hiZVisible = -1;  // Not tested (no recordMW mapping)
+            }
 
             info.pointLightCount = 0;
             info.numPointLightDetails = 0;
@@ -4128,7 +4445,6 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
                             d.vx = it->second.viewspacePos.x;
                             d.vy = it->second.viewspacePos.y;
                             d.vz = it->second.viewspacePos.z;
-                            d.wasTransformed = (call.lightrs->lightsTransformed.find(id) != call.lightrs->lightsTransformed.end());
                             info.numPointLightDetails++;
                         }
                     }
@@ -4139,13 +4455,25 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
         return infos;
     };
 
-    // F5: Capture light snapshot A ("good angle")
-    if (GetAsyncKeyState(VK_F5) & 0x8000) {
+    // F5: Capture snapshot A and save to disk - gated behind debug hotkeys toggle
+    if (ImGuiManager::GetDebugKeysEnabled() && (GetAsyncKeyState(VK_F5) & 0x8000)) {
         static bool wasPressed = false;
         if (!wasPressed) {
-            lightSnapshotA.capture(buildLightCallInfos(), currentView, recordingDeviceView);
-            lightSnapshotA.log("A (good angle)");
-            StatusOverlay::setStatus("Light snapshot A captured (good angle)");
+            snapshotA.valid = true;
+            snapshotA.totalRecordedCalls = (int)recordedCalls.size();
+            snapshotA.sceneLightsTotal = (int)DistantLand::sceneLights.size();
+            snapshotA.cameraX = currentView._41; snapshotA.cameraY = currentView._42; snapshotA.cameraZ = currentView._43;
+            snapshotA.eyePosX = DistantLand::eyePos.x; snapshotA.eyePosY = DistantLand::eyePos.y; snapshotA.eyePosZ = DistantLand::eyePos.z;
+            snapshotA.recordCameraX = recordingDeviceView._41; snapshotA.recordCameraY = recordingDeviceView._42; snapshotA.recordCameraZ = recordingDeviceView._43;
+            snapshotA.callInfos = buildCallSnapshots();
+
+            if (snapshotA.saveToFile("mge_snapshot_A.log")) {
+                LOG::logline("Snapshot A saved to mge_snapshot_A.log (%d calls)", snapshotA.totalRecordedCalls);
+                StatusOverlay::setStatus("Snapshot A saved to mge_snapshot_A.log");
+            } else {
+                LOG::logline("!! Failed to write mge_snapshot_A.log");
+                StatusOverlay::setStatus("Snapshot A capture failed (file write error)");
+            }
             wasPressed = true;
         }
     } else {
@@ -4153,18 +4481,30 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
         wasPressed = false;
     }
 
-    // F6: Capture light snapshot B ("bad angle") and log diff
-    if (GetAsyncKeyState(VK_F6) & 0x8000) {
+    // F6: Capture snapshot B, load A from disk, diff - gated behind debug hotkeys toggle
+    if (ImGuiManager::GetDebugKeysEnabled() && (GetAsyncKeyState(VK_F6) & 0x8000)) {
         static bool wasPressed = false;
         if (!wasPressed) {
-            lightSnapshotB.capture(buildLightCallInfos(), currentView, recordingDeviceView);
-            lightSnapshotB.log("B (bad angle)");
-            if (lightSnapshotA.valid) {
-                LightSnapshot::logDiff(lightSnapshotA, lightSnapshotB);
+            snapshotB.valid = true;
+            snapshotB.totalRecordedCalls = (int)recordedCalls.size();
+            snapshotB.sceneLightsTotal = (int)DistantLand::sceneLights.size();
+            snapshotB.cameraX = currentView._41; snapshotB.cameraY = currentView._42; snapshotB.cameraZ = currentView._43;
+            snapshotB.eyePosX = DistantLand::eyePos.x; snapshotB.eyePosY = DistantLand::eyePos.y; snapshotB.eyePosZ = DistantLand::eyePos.z;
+            snapshotB.recordCameraX = recordingDeviceView._41; snapshotB.recordCameraY = recordingDeviceView._42; snapshotB.recordCameraZ = recordingDeviceView._43;
+            snapshotB.callInfos = buildCallSnapshots();
+
+            LOG::logline("Snapshot B captured (%d calls)", snapshotB.totalRecordedCalls);
+
+            // Load A from disk (supports cross-launch comparison)
+            FrameSnapshot loadedA;
+            if (loadedA.loadFromFile("mge_snapshot_A.log")) {
+                LOG::logline("Loaded snapshot A from disk (%d calls)", loadedA.totalRecordedCalls);
+                FrameSnapshot::logDiff(loadedA, snapshotB);
+                StatusOverlay::setStatus("Snapshot B captured + diff written to mge_snapshot_diff.log");
             } else {
-                LOG::logline(">> No snapshot A captured yet. Press F5 first at good angle.");
+                LOG::logline(">> No mge_snapshot_A.log found. Press F5 first at good state, then relaunch.");
+                StatusOverlay::setStatus("No snapshot A on disk. Press F5 first.");
             }
-            StatusOverlay::setStatus("Light snapshot B captured + diff logged");
             wasPressed = true;
         }
     } else {
@@ -4187,17 +4527,11 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     prevCameraView = currentView;
     hasPrevCamera = true;
 
-    // Light culling using Hi-Z occlusion (skip if disabled for profiling)
-    if (ImGuiManager::GetEnableLightProcessing()) {
-        DistantLand::cullSceneLights(viewProj);
-    }
-
     // Per-object light packing for mode 3 (saturated Morrowind assignment)
-    // Instead of uploading all visibleLights globally, each mode 3 object gets
-    // only its spatially-nearby lights packed into the texture.
-    int numVisibleLights = (int)DistantLand::visibleLights.size();
+    // Each mode 3 object gets only its spatially-nearby lights packed into the texture.
+    int numSceneLights = (int)DistantLand::sceneLights.size();
     {
-        ZoneScopedN("replay_PerObjectLightPack");
+        MGE_ZoneScopedN("replay_PerObjectLightPack");
         const size_t numCallsForPack = recordedCalls.size();
         perObjectLightInfo.resize(numCallsForPack);
         memset(perObjectLightInfo.data(), 0, numCallsForPack * sizeof(PerObjectLightInfo));
@@ -4229,7 +4563,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
 
             int count = 0;
 
-            for (const auto& light : DistantLand::visibleLights) {
+            for (const auto& light : DistantLand::sceneLights) {
                 // Sphere-AABB intersection: closest point on bbox to light center
                 float cx = (light.position.x < bMin.x) ? bMin.x : (light.position.x > bMax.x) ? bMax.x : light.position.x;
                 float cy = (light.position.y < bMin.y) ? bMin.y : (light.position.y > bMax.y) ? bMax.y : light.position.y;
@@ -4271,12 +4605,12 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
             currentTexelOffset += count * 3;  // 3 texels per light
 
             // Diagnostic: log first mode 3 object's bbox and nearest light (sphere-AABB distance)
-            if (mode3Count == 0 && !DistantLand::visibleLights.empty()) {
+            if (mode3Count == 0 && !DistantLand::sceneLights.empty()) {
                 float nearestDist = FLT_MAX;
                 int nearestIdx = -1;
                 float nearestRadius = 0;
-                for (int li = 0; li < (int)DistantLand::visibleLights.size(); li++) {
-                    const auto& light = DistantLand::visibleLights[li];
+                for (int li = 0; li < (int)DistantLand::sceneLights.size(); li++) {
+                    const auto& light = DistantLand::sceneLights[li];
                     float cx = (light.position.x < bMin.x) ? bMin.x : (light.position.x > bMax.x) ? bMax.x : light.position.x;
                     float cy = (light.position.y < bMin.y) ? bMin.y : (light.position.y > bMax.y) ? bMax.y : light.position.y;
                     float cz = (light.position.z < bMin.z) ? bMin.z : (light.position.z > bMax.z) ? bMax.z : light.position.z;
@@ -4335,8 +4669,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
         }
 
         if (mode3Count > 0) {
-            LOG::logline("Mode3 packing: %d objects, maxLights/obj=%d, totalTexels=%d (from %d visible)",
-                mode3Count, maxPerObjectLights, totalTexels, numVisibleLights);
+            LOG::logline("Mode3 packing: %d objects, maxLights/obj=%d, totalTexels=%d (from %d scene)",
+                mode3Count, maxPerObjectLights, totalTexels, numSceneLights);
         }
     }
 
@@ -4351,7 +4685,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     // Inline Hi-Z culling using current matrices (same as bbox visualization)
     const size_t numCalls = recordedCalls.size();
 
-    ZoneScopedN("replay_MainLoop");
+    MGE_ZoneScopedN("replay_MainLoop");
     bool firstDrawDone = false;
     for (size_t i = 0; i < numCalls; i++) {
         auto& call = recordedCalls[i];  // Non-const to update shader key
@@ -4362,7 +4696,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
 
         // Visibility culling: reuse depth pass results when available
         bool shouldRender = true;
-        if (call.hasBoundingBox) {
+        bool hiZDisabled = ImGuiManager::GetDisableHiZCulling();
+        if (!hiZDisabled && call.hasBoundingBox) {
             callsWithBBox++;
 
             // Check if occluder (never cull occluders)
@@ -4384,19 +4719,16 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
                     culledCalls++;
                 }
             }
-        } else {
+        } else if (!hiZDisabled) {
             callsWithoutBBox++;
         }
 
         if (shouldRender) {
             // Restore sampler states for this call (captured during recording)
-            {
-                ZoneScopedN("replay_SetSamplers");
-                for (int stage = 0; stage < 8; ++stage) {
-                    if (call.samplerStates[stage].captured) {
-                        device->SetSamplerState(stage, D3DSAMP_ADDRESSU, call.samplerStates[stage].addressU);
-                        device->SetSamplerState(stage, D3DSAMP_ADDRESSV, call.samplerStates[stage].addressV);
-                    }
+            for (int stage = 0; stage < 8; ++stage) {
+                if (call.samplerStates[stage].captured) {
+                    device->SetSamplerState(stage, D3DSAMP_ADDRESSU, call.samplerStates[stage].addressU);
+                    device->SetSamplerState(stage, D3DSAMP_ADDRESSV, call.samplerStates[stage].addressV);
                 }
             }
 
@@ -4425,7 +4757,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
             }
 
             {
-                ZoneScopedN("replay_RenderCall");
+                MGE_ZoneScopedN("replay_RenderCall");
                 // Restore Morrowind-recorded device state before each replay call
                 // During recording, Morrowind sets these between calls; during replay we must do it
                 // Debug mode: validate BEFORE pre-set to detect leaks from previous call
@@ -4446,7 +4778,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
                 }
                 renderMorrowindHLSL_Internal(&call.rs, &call.frs, call.lightrs.get(), call.dirtyFlags, (int)i);
                 if (!firstDrawDone) {
-                    ZoneScopedN("replay_FirstDrawDone");
+                    MGE_ZoneScopedN("replay_FirstDrawDone");
                     firstDrawDone = true;
                 }
             }
@@ -4480,8 +4812,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
             litCalls++;
         }
         if (litCalls == 0) minPL = 0;
-        LOG::logline("Lights: %d scene, %d visible, perObj: min=%d max=%d avg=%.1f (%d calls) modes:[%d,%d,%d,%d]",
-            (int)DistantLand::sceneLights.size(), numVisibleLights, minPL, maxPL,
+        LOG::logline("Lights: %d scene, perObj: min=%d max=%d avg=%.1f (%d calls) modes:[%d,%d,%d,%d]",
+            (int)DistantLand::sceneLights.size(), minPL, maxPL,
             litCalls > 0 ? sumPL / litCalls : 0.0, litCalls,
             modeCounts[0], modeCounts[1], modeCounts[2], modeCounts[3]);
     }
@@ -4489,7 +4821,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     // Update ImGui debug stats
     ImGuiManager::UpdateDebugStats(
         totalCalls, renderedCalls, culledCalls,
-        (int)DistantLand::sceneLights.size(), numVisibleLights,
+        (int)DistantLand::sceneLights.size(),
         (int)DistantLand::recordMW.size(), 0
     );
 

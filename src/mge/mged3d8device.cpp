@@ -1,10 +1,11 @@
 
 #include "mged3d8device.h"
-#include "tracy/Tracy.hpp"
+#include "mge_tracy.h"
 #include "proxydx/d3d8texture.h"
 #include "proxydx/d3d8surface.h"
 
 #include <algorithm>
+#include <tlhelp32.h>
 #include "mgeversion.h"
 #include "configuration.h"
 #include "distantland.h"
@@ -13,6 +14,26 @@
 #include "userhud.h"
 #include "videobackground.h"
 #include "imgui_manager.h"
+
+bool g_tracyActive = false;
+
+static bool isTracyProfilerRunning() {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+    PROCESSENTRY32 pe;
+    pe.dwSize = sizeof(pe);
+    bool found = false;
+    if (Process32First(snap, &pe)) {
+        do {
+            if (_strnicmp(pe.szExeFile, "tracy", 5) == 0) {
+                found = true;
+                break;
+            }
+        } while (Process32Next(snap, &pe));
+    }
+    CloseHandle(snap);
+    return found;
+}
 
 static int sceneCount;
 static bool rendertargetNormal, isHUDready;
@@ -85,6 +106,10 @@ MGEProxyDevice::MGEProxyDevice(IDirect3DDevice9* real, ProxyD3D* d3d) : ProxyDev
     lightrs.lights.clear();
     lightrs.active.clear();
 
+    // Detect Tracy profiler for conditional zone activation
+    g_tracyActive = isTracyProfilerRunning();
+    LOG::logline("Tracy: profiler %s, zones %s", g_tracyActive ? "detected" : "not detected", g_tracyActive ? "enabled" : "disabled");
+
     // Store active device in distant land, occurs on startup and after fullscreen alt-tab
     DistantLand::device = realDevice;
 
@@ -103,7 +128,7 @@ MGEProxyDevice::MGEProxyDevice(IDirect3DDevice9* real, ProxyD3D* d3d) : ProxyDev
 // Present - End of MW frame
 // MGE end of frame processing
 HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, const RGNDATA* d) {
-    ZoneScopedN("MGE_Present");
+    MGE_ZoneScopedN("MGE_Present");
 
     auto mwBridge = MWBridge::get();
 
@@ -122,6 +147,15 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
     }
 
     if (mwBridge->IsLoaded()) {
+        // Detect when Morrowind starts its data loading phase (first loading bar before MGE init)
+        if (!DistantLand::ready && mwBridge->isLoadingBar()) {
+            static bool dataLoadStartLogged = false;
+            if (!dataLoadStartLogged) {
+                LOG::logline("== Initializing data: START ==");
+                dataLoadStartLogged = true;
+            }
+        }
+
         if (Configuration.Force3rdPerson && DistantLand::ready) {
             // Set 3rd person camera
             D3DXVECTOR3* camera = mwBridge->PCam3Offset();
@@ -228,21 +262,24 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
     }
 
     {
-        ZoneScopedN("Present_ImGui");
+        MGE_ZoneScopedN("Present_ImGui");
         // Handle F11 key to toggle ImGui interface
         static bool f11Pressed = false;
         static int debugCounter = 0;
         if (imguiInitialized) {
-            bool f11State = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
-            if (f11State && !f11Pressed) {
-                LOG::logline(">> F11 key pressed, toggling PCF interface");
-                ImGuiManager::TogglePCFInterface();
-                f11Pressed = true;
-            } else if (!f11State) {
-                f11Pressed = false;
+            // F11: Toggle PCF interface (gated)
+            if (ImGuiManager::GetDebugKeysEnabled()) {
+                bool f11State = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
+                if (f11State && !f11Pressed) {
+                    LOG::logline(">> F11 key pressed, toggling PCF interface");
+                    ImGuiManager::TogglePCFInterface();
+                    f11Pressed = true;
+                } else if (!f11State) {
+                    f11Pressed = false;
+                }
             }
 
-            // Handle G key for debug interface toggle
+            // G key: Toggle debug interface (always active)
             static bool gPressed = false;
             bool gState = (GetAsyncKeyState('G') & 0x8000) != 0;
             if (gState && !gPressed) {
@@ -252,22 +289,24 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
                 gPressed = false;
             }
 
-            // Handle U key for Hi-Z interface toggle
-            static bool uPressed = false;
-            bool uState = (GetAsyncKeyState('U') & 0x8000) != 0;
-            if (uState && !uPressed) {
-                ImGuiManager::ToggleHiZInterface();
-                uPressed = true;
-            } else if (!uState) {
-                uPressed = false;
+            // U: Toggle Hi-Z interface (gated)
+            if (ImGuiManager::GetDebugKeysEnabled()) {
+                static bool uPressed = false;
+                bool uState = (GetAsyncKeyState('U') & 0x8000) != 0;
+                if (uState && !uPressed) {
+                    ImGuiManager::ToggleHiZInterface();
+                    uPressed = true;
+                } else if (!uState) {
+                    uPressed = false;
+                }
             }
 
             {
-                ZoneScopedN("Present_ImGuiNewFrame");
+                MGE_ZoneScopedN("Present_ImGuiNewFrame");
                 ImGuiManager::NewFrame();
             }
             {
-                ZoneScopedN("Present_ImGuiRender");
+                MGE_ZoneScopedN("Present_ImGuiRender");
                 ImGuiManager::Render();
             }
         } else {
@@ -295,7 +334,7 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
     }
 
     {
-        ZoneScopedN("Present_ResetState");
+        MGE_ZoneScopedN("Present_ResetState");
         // Reset scene identifiers
         sceneCount = -1;
         stage0Complete = false;
@@ -307,12 +346,9 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         FixedFunctionShader::resetHLSLCaches();
     }
 
-    // Hi-Z pyramid generation moved to renderStage1 (immediately after depth copy)
-    // This ensures pyramid is ready when HLSL rendering does GPU culling
-
-    FrameMark;  // Mark frame boundary at the very end of Present()
+    MGE_FrameMark;  // Mark frame boundary at the very end of Present()
     {
-        ZoneScopedN("Present_ProxyDevicePresent");
+        MGE_ZoneScopedN("Present_ProxyDevicePresent");
         return ProxyDevice::Present(a, b, c, d);
     }
 }
@@ -341,8 +377,6 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
     if (hr != D3D_OK) {
         return hr;
     }
-
-    // GPU-based culling: Hi-Z stays in VRAM, no CPU readback needed!
 
     if (mwBridge->IsLoaded() && rendertargetNormal) {
         if (!isHUDready) {
@@ -568,7 +602,7 @@ HRESULT _stdcall MGEProxyDevice::SetTextureStageState(DWORD a, D3DTEXTURESTAGEST
 // DrawIndexedPrimitive - Where all the drawing happens
 // Inspect draw calls for re-use later
 HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b, UINT c, UINT d, UINT e) {
-    ZoneScopedN("DrawIndexedPrimitive");
+    MGE_ZoneScopedN("DrawIndexedPrimitive");
 
     // Allow distant land to inspect draw calls
     bool isShadowStencil = isStencilScene && stencilRef <= 1;
@@ -635,6 +669,9 @@ ULONG _stdcall MGEProxyDevice::Release() {
 // Initializes distant land
 // Called after new game or load game is selected from the main menu
 void initOnLoad() {
+    LOG::logline("== Initializing data: END ==");
+    LOG::logline("== Loading MGE XE: START ==");
+
     auto mwBridge = MWBridge::get();
 
     // Compose loading message from translated string
@@ -663,6 +700,7 @@ void initOnLoad() {
 
     // Clean up loading bar menu, otherwise it persists in the background
     mwBridge->destroyLoadingBar();
+    LOG::logline("== Loading MGE XE: END ==");
 
     VideoPatch::start(DistantLand::device);
 }

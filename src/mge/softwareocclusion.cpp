@@ -3,10 +3,10 @@
 #include <cstring>
 #include <d3dx9.h>
 #include "support/log.h"
-#include "tracy/Tracy.hpp"
+#include "mge_tracy.h"
 
 SoftwareOcclusionCuller::SoftwareOcclusionCuller()
-    : mWidth(0), mHeight(0), mNumMipLevels(0), mHiZVisualizationTexture(nullptr)
+    : mWidth(0), mHeight(0), mNumMipLevels(0), mHiZVisualizationTexture(nullptr), mVisTexWidth(0), mVisTexHeight(0)
 {
     for (int i = 0; i < MAX_MIP_LEVELS; i++) {
         mHiZBuffer[i] = nullptr;
@@ -94,7 +94,7 @@ int SoftwareOcclusionCuller::rasterizeMesh(
     const D3DXMATRIX& proj
 )
 {
-    ZoneScoped;
+    MGE_ZoneScoped;
     if (!vb || !ib) return 0;
 
     // Check if FVF has position data
@@ -298,7 +298,7 @@ int SoftwareOcclusionCuller::rasterizeMesh(
 
 void SoftwareOcclusionCuller::buildHiZPyramid()
 {
-    ZoneScopedN("Build Hi-Z Pyramid");
+    MGE_ZoneScopedN("Build Hi-Z Pyramid");
 
     // Build mipmap chain from mip 0 down to 8x8
     // Each mip stores MAX depth of 2x2 region from previous mip
@@ -459,7 +459,7 @@ bool SoftwareOcclusionCuller::testBoundingBox(
     const D3DXMATRIX& proj
 )
 {
-    ZoneScoped;
+    MGE_ZoneScoped;
     D3DXMATRIX viewProj = view * proj;
 
     // Test all 8 corners of bounding box
@@ -536,7 +536,7 @@ bool SoftwareOcclusionCuller::testBoundingBox(
     return false; // Occluded - all depth samples are in front of bbox
 }
 
-void SoftwareOcclusionCuller::uploadHiZToTexture(IDirect3DDevice9* device, int mipLevel, float brightness, float gamma, bool invert, bool showRaycastGrid, int raycastStep)
+void SoftwareOcclusionCuller::uploadHiZToTexture(IDirect3DDevice9* device, int mipLevel, const D3DXMATRIX& proj, bool invert, bool showRaycastGrid, int raycastStep)
 {
     if (mNumMipLevels == 0 || !mHiZBuffer[0]) return;
 
@@ -546,13 +546,21 @@ void SoftwareOcclusionCuller::uploadHiZToTexture(IDirect3DDevice9* device, int m
     UINT width = mHiZWidth[mipLevel];
     UINT height = mHiZHeight[mipLevel];
 
-    // Create/recreate texture if needed (always use mip 0 size for consistency)
-    if (!mHiZVisualizationTexture || mipLevel == 0) {
+    // Recreate texture when dimensions change (switching mip levels)
+    if (!mHiZVisualizationTexture || width != mVisTexWidth || height != mVisTexHeight) {
         if (mHiZVisualizationTexture) mHiZVisualizationTexture->Release();
         device->CreateTexture(width, height, 1, 0,
                              D3DFMT_A8R8G8B8, D3DPOOL_MANAGED,
                              &mHiZVisualizationTexture, nullptr);
+        mVisTexWidth = width;
+        mVisTexHeight = height;
     }
+
+    // Extract near/far from projection matrix for depth linearization
+    // D3D projection: proj._33 = far/(far-near), proj._43 = -near*far/(far-near)
+    // near = -proj._43 / proj._33, far = -proj._43 / (proj._33 - 1)
+    float nearPlane = -proj._43 / proj._33;
+    float farPlane = -proj._43 / (proj._33 - 1.0f);
 
     // Lock and fill texture with depth visualization
     D3DLOCKED_RECT rect;
@@ -565,32 +573,25 @@ void SoftwareOcclusionCuller::uploadHiZToTexture(IDirect3DDevice9* device, int m
 
     for (UINT y = 0; y < height; y++) {
         for (UINT x = 0; x < width; x++) {
-            float depth = buffer[y * width + x];
+            float zNdc = buffer[y * width + x];
 
-            // Remap depth values from compressed range to full [0,1] for better visibility
-            // Most depth values cluster near 1.0 (0.9-1.0 range), so use smoothstep for better contrast
-            float remappedDepth = depth;
-            if (depth > 0.85f) {
-                // Apply smoothstep to expand the 0.85-1.0 range to 0.0-1.0
-                float t = (depth - 0.85f) / 0.15f; // Map [0.85, 1.0] to [0, 1]
-                remappedDepth = t * t * (3.0f - 2.0f * t); // Smoothstep for better visibility
+            // Linearize: convert NDC depth to view-space distance, normalize by far plane
+            // z_view = near * far / (far - zNdc * (far - near))
+            // linear01 = z_view / far = near / (far - zNdc * (far - near))
+            float linear01;
+            if (zNdc >= 1.0f) {
+                linear01 = 1.0f; // At or beyond far plane (empty pixel)
+            } else {
+                float zView = nearPlane * farPlane / (farPlane - zNdc * (farPlane - nearPlane));
+                linear01 = zView / farPlane;
+                linear01 = std::min(1.0f, std::max(0.0f, linear01));
             }
 
-            // Apply gamma correction
-            if (gamma != 1.0f) {
-                remappedDepth = powf(remappedDepth, 1.0f / gamma);
-            }
-
-            // Apply brightness
-            remappedDepth *= brightness;
-            remappedDepth = std::min(1.0f, std::max(0.0f, remappedDepth)); // Clamp to [0,1]
-
-            // Invert if requested
             if (invert) {
-                remappedDepth = 1.0f - remappedDepth;
+                linear01 = 1.0f - linear01;
             }
 
-            BYTE gray = (BYTE)(remappedDepth * 255.0f);
+            BYTE gray = (BYTE)(linear01 * 255.0f);
 
             // Overlay 5x4 raycast grid visualization (matches ffeshader.cpp raycast pattern)
             // Grid covers central 80% of screen (10% margin on each edge)

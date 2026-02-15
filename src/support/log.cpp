@@ -11,10 +11,24 @@
 namespace LOG {
 
     static HANDLE handle = INVALID_HANDLE_VALUE;
+    static LARGE_INTEGER startTime;
+    static LARGE_INTEGER perfFreq;
 
+    // Prepend elapsed timestamp to a buffer, returns chars written
+    static int prependTimestamp(char* buf, std::size_t bufSize) {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        double elapsed = (double)(now.QuadPart - startTime.QuadPart) / perfFreq.QuadPart;
+        int secs = (int)elapsed;
+        int ms = (int)((elapsed - secs) * 1000.0);
+        return std::snprintf(buf, bufSize, "[%4d.%03ds] ", secs, ms);
+    }
 
     bool open(const char* filename) {
         close();
+        QueryPerformanceFrequency(&perfFreq);
+        QueryPerformanceCounter(&startTime);
+
         handle = CreateFile(filename, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
 
         if (handle == INVALID_HANDLE_VALUE) {
@@ -71,12 +85,15 @@ namespace LOG {
         char buf[4096] = "\0";
         std::size_t result = 0;
 
+        int tsLen = prependTimestamp(buf, sizeof(buf));
+
         va_list args;
         va_start(args, fmt);
 
         if (fmt) {
-            result = std::vsnprintf(buf, sizeof(buf) - 4, fmt, args);
-            std::strcat(buf + result, "\r\n");
+            result = std::vsnprintf(buf + tsLen, sizeof(buf) - tsLen - 4, fmt, args);
+            std::strcat(buf + tsLen + result, "\r\n");
+            result += tsLen;
         } else {
             result = 4;
             std::strcpy(buf, "LOG::log(null)\r\n");

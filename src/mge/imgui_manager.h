@@ -36,18 +36,18 @@ public:
     static bool GetEnableReplay();
     static bool GetEnableImmediateRendering();
     static bool GetEnableDepthPass();
-    static bool GetEnableLightProcessing();
     static int GetBBoxVisualizationMode();
     static void UpdateDebugStats(int recordedCalls, int renderedCalls, int culledCalls,
-                                  int sceneLights, int visibleLights, int recordMWSize, int immediateCount);
+                                  int sceneLights, int recordMWSize, int immediateCount);
+
+    // Hi-Z culling bypass for terrain hole diagnosis
+    static bool GetDisableHiZCulling();
 
     // Hi-Z visualization interface
     static void RenderHiZInterface();
     static void ToggleHiZInterface();
     static bool GetShowHiZInterface();
     static int GetHiZDisplayMip() { return hiZDisplayMip; }
-    static float GetHiZBrightness() { return hiZBrightness; }
-    static float GetHiZGamma() { return hiZGamma; }
     static bool GetHiZInvert() { return hiZInvert; }
     static bool GetHiZShowRaycastGrid() { return hiZShowRaycastGrid; }
     static int GetHiZRaycastStep() { return hiZRaycastStep; }
@@ -78,6 +78,9 @@ public:
     static bool GetStateLeakDetection() { return stateLeakDetection; }
     static bool GetPerformanceMode() { return performanceMode; }
 
+    // Debug hotkey gating
+    static bool GetDebugKeysEnabled();
+
     // Hi-Z single object visualization mode (public for ffeshader access)
     static bool hiZSingleObjectMode;
     static int hiZSingleObjectIndex;
@@ -105,22 +108,19 @@ private:
     static bool enableReplay;
     static bool enableImmediateRendering;
     static bool enableDepthPass;
-    static bool enableLightProcessing;
     static int bboxVisualizationMode;  // 0=off, 1=objects, 2=lights
+    static bool disableHiZCulling;     // Bypass Hi-Z culling for terrain hole diagnosis
 
     // Debug stats (updated each frame)
     static int debugRecordedCalls;
     static int debugRenderedCalls;
     static int debugCulledCalls;
     static int debugSceneLights;
-    static int debugVisibleLights;
     static int debugRecordMWSize;
     static int debugImmediateCount;
 
     // Hi-Z visualization variables
     static int hiZDisplayMip;
-    static float hiZBrightness;
-    static float hiZGamma;
     static bool hiZInvert;
     static bool hiZShowRaycastGrid;
     static int hiZRaycastStep;
@@ -150,4 +150,7 @@ private:
     // Debug/Performance mode toggles
     static bool stateLeakDetection;       // State leak detection debug mode - default false
     static bool performanceMode;          // Dirty tracking performance mode - default true
+
+    // Debug hotkey gating
+    static bool debugKeysEnabled;         // Gate debug hotkeys (F11/U/Y/L/F5/F6) - default false
 };

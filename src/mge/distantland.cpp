@@ -3,7 +3,7 @@
 #include "mgedinput.h"
 #include "configuration.h"
 #include "distantland.h"
-#include "tracy/Tracy.hpp"
+#include "mge_tracy.h"
 #include "distantshader.h"
 #include "postshaders.h"
 #include "mwbridge.h"
@@ -19,7 +19,7 @@ PassBreakCounters g_passBreaks;
 
 // renderStage0 - Render distant land at beginning of scene 0, after sky
 void DistantLand::renderStage0() {
-    ZoneScopedN("DL_RenderStage0");
+    MGE_ZoneScopedN("DL_RenderStage0");
     static int frameNumber = 0;
     LOG::logline("======== FRAME %d START (Scene 0) ========", ++frameNumber);
 
@@ -162,7 +162,7 @@ void DistantLand::renderStage0() {
 
 // renderStage1 - Render grass and shadows over near features, and write depth texture for scene 0
 void DistantLand::renderStage1() {
-    ZoneScopedN("DL_RenderStage1");
+    MGE_ZoneScopedN("DL_RenderStage1");
     auto mwBridge = MWBridge::get();
     IDirect3DStateBlock9* stateSaved;
     UINT passes;
@@ -259,7 +259,6 @@ void DistantLand::renderStage1() {
 
         // Hi-Z generation DISABLED (culling disabled for baseline testing)
         // generateHiZMipsGPU();
-        // consolidateHiZPyramid();
 
         // Restore render state
         stateSaved->Apply();

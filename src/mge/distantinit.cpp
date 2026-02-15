@@ -3,7 +3,7 @@
 #include "support/log.h"
 #include "configuration.h"
 #include "distantland.h"
-#include "tracy/Tracy.hpp"
+#include "mge_tracy.h"
 #include "distantshader.h"
 #include "distantlandhlsl.h"
 #include "dlformat.h"
@@ -72,7 +72,6 @@ IDirect3DSurface9* DistantLand::surfDepthDepth;
 IDirect3DTexture9* DistantLand::texCullDepth;
 IDirect3DTexture9* DistantLand::texHiZ;
 IDirect3DTexture9* DistantLand::texHiZPrev;
-IDirect3DTexture9* DistantLand::texHiZPrevFrame;
 IDirect3DTexture9* DistantLand::texHiZStaging;
 IDirect3DTexture9* DistantLand::texHiZStaging2;
 IDirect3DTexture9* DistantLand::texHiZStagingPrev;
@@ -87,22 +86,9 @@ IDirect3DPixelShader9* DistantLand::psHiZ = nullptr;
 int DistantLand::hiZLevels;
 int DistantLand::hiZValidMips = 0;
 
-// GPU-based Hi-Z culling resources
-ID3DXEffect* DistantLand::effectGPUCull = nullptr;
-IDirect3DVertexBuffer9* DistantLand::vbGPUCullBounds = nullptr;
-IDirect3DVertexDeclaration9* DistantLand::declGPUCullBounds = nullptr;
-IDirect3DTexture9* DistantLand::texGPUCullResults = nullptr;
-IDirect3DSurface9* DistantLand::surfGPUCullResults = nullptr;
-IDirect3DTexture9* DistantLand::texGPUCullResultsSys = nullptr;
-IDirect3DSurface9* DistantLand::surfGPUCullResultsSys = nullptr;
-UINT DistantLand::gpuCullResultsWidth = 0;
-UINT DistantLand::gpuCullResultsHeight = 0;
-UINT DistantLand::gpuCullMaxObjects = 0;
-
 // Texture-based lighting system
 std::vector<DistantLand::SceneLight> DistantLand::sceneLights;
 std::unordered_map<int, size_t> DistantLand::sceneLightIndexMap;
-std::vector<DistantLand::SceneLight> DistantLand::visibleLights;
 IDirect3DTexture9* DistantLand::texLightData = nullptr;
 IDirect3DTexture9* DistantLand::texDistantBlend;
 IDirect3DTexture9* DistantLand::texReflection;
@@ -251,12 +237,8 @@ bool DistantLand::init() {
 
     LOG::logline(">> Starting Distant Land init");
     
-    // Start shader precaching as early as possible - before intensive BSA operations
-    if (Configuration.MGEFlags & USE_FFESHADER) {
-        LOG::logline("-- Starting ultra-early shader precaching");
-        FixedFunctionShader::startEarlyPrecache(device);
-    }
-    
+    // Shader precaching already started from device constructor (mged3d8device.cpp)
+
     vsr.init(device);
     BSA::init();
     
@@ -299,9 +281,6 @@ bool DistantLand::init() {
     if (!initHiZ()) {
         return false;
     }
-
-    // Initialize GPU-based Hi-Z culling
-    initGPUCulling();
 
     if (!initShadow()) {
         return false;
@@ -733,13 +712,6 @@ bool DistantLand::initHiZ() {
     hr = device->CreateTexture(baseWidth, baseHeight, 0, D3DUSAGE_RENDERTARGET, D3DFMT_R32F, D3DPOOL_DEFAULT, &texHiZPrev, NULL);
     if (hr != D3D_OK) {
         LOG::logline("!! Failed to create ping-pong Hi-Z texture");
-        return false;
-    }
-
-    // Create consolidated previous frame Hi-Z texture (for GPU culling with 1-frame delay)
-    hr = device->CreateTexture(baseWidth, baseHeight, 0, D3DUSAGE_RENDERTARGET, D3DFMT_R32F, D3DPOOL_DEFAULT, &texHiZPrevFrame, NULL);
-    if (hr != D3D_OK) {
-        LOG::logline("!! Failed to create previous frame consolidated Hi-Z texture");
         return false;
     }
 
@@ -1678,10 +1650,6 @@ void DistantLand::release() {
         texHiZPrev->Release();
         texHiZPrev = nullptr;
     }
-    if (texHiZPrevFrame) {
-        texHiZPrevFrame->Release();
-        texHiZPrevFrame = nullptr;
-    }
     if (texHiZStaging) {
         texHiZStaging->Release();
         texHiZStaging = nullptr;
@@ -1718,9 +1686,6 @@ void DistantLand::release() {
         psHiZ->Release();
         psHiZ = nullptr;
     }
-
-    // Shutdown GPU-based Hi-Z culling
-    shutdownGPUCulling();
 
     if (texLightData) {
         texLightData->Release();

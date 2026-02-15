@@ -216,6 +216,7 @@
     <ClInclude Include="src\mge\async_shader_compiler.h" />
     <ClInclude Include="src\mge\ffe_core_rendering.h" />
     <ClInclude Include="src\mge\imgui_manager.h" />
+    <ClInclude Include="src\mge\mge_tracy.h" />
     <ClInclude Include="src\mge\inidata.h" />
     <ClInclude Include="src\mge\memorypool.h" />
     <ClInclude Include="src\mge\mged3d8device.h" />

@@ -1,7 +1,7 @@
 #include "meshlodcache.h"
 #include "meshoptimizer.h"
 #include "support/log.h"
-#include "tracy/Tracy.hpp"
+#include "mge_tracy.h"
 #include <algorithm>
 
 MeshLODCache::MeshLODCache()
@@ -43,7 +43,7 @@ const SimplifiedMesh* MeshLODCache::getOrCreateLOD(
     float targetError
 )
 {
-    ZoneScoped;
+    MGE_ZoneScoped;
 
     // Check if mesh is large enough to bother simplifying
     UINT triCount = indexCount / 3;
@@ -81,7 +81,7 @@ bool MeshLODCache::simplifyMesh(
     float targetError
 )
 {
-    ZoneScoped;
+    MGE_ZoneScoped;
 
     if (!vb || !ib) return false;
 

@@ -88,7 +88,7 @@ public:
     MeshLODCache mLODCache;
 
     // ImGui Hi-Z visualization
-    void uploadHiZToTexture(IDirect3DDevice9* device, int mipLevel = 0, float brightness = 1.0f, float gamma = 1.0f, bool invert = false, bool showRaycastGrid = false, int raycastStep = 2);
+    void uploadHiZToTexture(IDirect3DDevice9* device, int mipLevel, const D3DXMATRIX& proj, bool invert = false, bool showRaycastGrid = false, int raycastStep = 2);
     IDirect3DTexture9* getHiZTexture() const { return mHiZVisualizationTexture; }
     int getHiZMipLevels() const { return mNumMipLevels; }
     UINT getHiZWidth(int mip) const { return (mip < mNumMipLevels) ? mHiZWidth[mip] : 0; }
@@ -113,4 +113,5 @@ private:
 
     // ImGui visualization texture
     IDirect3DTexture9* mHiZVisualizationTexture;
+    UINT mVisTexWidth, mVisTexHeight;
 };

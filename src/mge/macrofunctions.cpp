@@ -8,6 +8,7 @@
 #include "distantland.h"
 #include "postshaders.h"
 #include "ffeshader.h"
+#include "imgui_manager.h"
 #include "support/pngsave.h"
 
 #include <cctype>
@@ -418,6 +419,7 @@ void MacroFunctions::MoveUp3PCam() {
 }
 
 void MacroFunctions::ToggleRecordReplay() {
+    if (!ImGuiManager::GetDebugKeysEnabled()) return;
     bool wasEnabled = FixedFunctionShader::getRecordingEnabled();
 
     // Simple toggle of entire recording system
@@ -433,6 +435,7 @@ void MacroFunctions::ToggleRecordReplay() {
 }
 
 void MacroFunctions::DumpFrame() {
+    if (!ImGuiManager::GetDebugKeysEnabled()) return;
     LOG::logline("DumpFrame function called!");
 
     if (FixedFunctionShader::getRecordingEnabled()) {
