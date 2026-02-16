@@ -3,6 +3,9 @@
 #include "d3d8surface.h"
 #include "d3d8texture.h"
 
+// Declared in ffeshader.h — evicts texture from suffix resolution cache on release
+extern void (*g_onTextureReleased)(IDirect3DTexture9* realTexture);
+
 
 
 ProxyTexture::ProxyTexture(IDirect3DTexture9* real, ProxyDevice* device) : realTexture(real), proxDevice(device) {
@@ -23,6 +26,9 @@ ULONG _stdcall ProxyTexture::AddRef() {
 ULONG _stdcall ProxyTexture::Release() {
     ULONG refcount = realTexture->Release();
     if (!refcount) {
+        if (g_onTextureReleased) {
+            g_onTextureReleased(realTexture);
+        }
         delete this;
         return 0;
     }

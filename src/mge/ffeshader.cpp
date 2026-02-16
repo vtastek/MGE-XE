@@ -61,6 +61,9 @@ bool FixedFunctionShader::recordingCompletedThisFrame = false;
 bool FixedFunctionShader::hiZBuiltThisFrame = false;
 bool FixedFunctionShader::dumpRequested = false;
 
+// Slow frame detection: prepareMs stored by prepareRecordedCalls, read by replayRecordedCalls
+static float lastPrepareMs = 0.0f;
+
 // Diagnostic: cache hit/miss logging for first N frames (temporary)
 static int hlslDiagFrameCounter = 0;
 std::unordered_set<FixedFunctionShader::ShaderKey, FixedFunctionShader::ShaderKey::hasher> FixedFunctionShader::diagHitKeys;
@@ -161,10 +164,20 @@ struct TextureSuffixResolutionCache {
     std::string textureName;
     bool hasValidName;
     const BSA::TextureSuffixVariants* variants;
-    
+
     TextureSuffixResolutionCache() : hasValidName(false), variants(nullptr) {}
 };
 static std::unordered_map<IDirect3DTexture9*, TextureSuffixResolutionCache> textureSuffixResolutionCache;
+static SRWLOCK textureSuffixLock = SRWLOCK_INIT;
+
+// Texture release callback (evicts from suffix cache on texture free)
+void (*g_onTextureReleased)(IDirect3DTexture9* realTexture) = nullptr;
+
+static void onTextureReleased(IDirect3DTexture9* tex) {
+    AcquireSRWLockExclusive(&textureSuffixLock);
+    textureSuffixResolutionCache.erase(tex);
+    ReleaseSRWLockExclusive(&textureSuffixLock);
+}
 
 // Suffix texture binding cache to prevent repeated binding operations
 struct SuffixBindingState {
@@ -403,6 +416,9 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
         // (precache thread already populated the cache during splash screens)
         startAsyncCompiler();
     }
+
+    // Register texture release callback for evict-on-release cache management
+    g_onTextureReleased = onTextureReleased;
 
     // Create default textures to avoid null binds that cause DXVK descriptor updates
     createDefaultTextures();
@@ -3173,14 +3189,13 @@ void FixedFunctionShader::startRecording() {
         void* currentCell = MWBridge::get()->getPlayerCell();
 
         if (isExterior != lastWasExterior) {
-            // Interior ↔ exterior transition: clear everything
-            textureSuffixResolutionCache.clear();
+            // Interior ↔ exterior transition: clear geometry caches
+            // textureSuffixResolutionCache is now evict-on-release (no bulk clear needed)
             bboxCache.clear();
             softwareOcclusionCuller.clearBlacklist();
             lastWasExterior = isExterior;
         } else if (currentCell != lastPlayerCell) {
-            // Any cell change (exterior-to-exterior, interior-to-interior): clear pointer-keyed caches
-            textureSuffixResolutionCache.clear();
+            // Any cell change (exterior-to-exterior, interior-to-interior): clear geometry caches
             bboxCache.clear();
             softwareOcclusionCuller.clearBlacklist();
         }
@@ -3494,13 +3509,28 @@ void FixedFunctionShader::prepareRecordedCalls() {
         return;
     }
 
-    // Compute shader keys (deferred from renderMorrowindHLSL recording path)
+    // Compute shader keys and assign render bins (with slow-frame timing)
+    LARGE_INTEGER freqQPC, prepStartQPC, prepEndQPC;
+    QueryPerformanceFrequency(&freqQPC);
+    QueryPerformanceCounter(&prepStartQPC);
     {
-        MGE_ZoneScopedN("Prepare: Shader Keys");
+        MGE_ZoneScopedN("Prepare: Shader Keys + Bins");
         for (auto& call : recordedCalls) {
             call.sk = computeShaderKeyWithSuffixes(&call.rs, &call.frs, call.lightrs.get());
             call.prepared = true;
+
+            // Classify into render bin
+            if (call.sk.hasGrass)              call.bin = RenderBin::Grass;
+            else if (call.sk.usesSkinning)     call.bin = RenderBin::Skinning;
+            else if (call.rs.blendEnable)      call.bin = RenderBin::Blending;
+            else if (call.rs.alphaTest)         call.bin = RenderBin::AlphaTested;
+            else                                call.bin = RenderBin::Opaque;
         }
+    }
+    QueryPerformanceCounter(&prepEndQPC);
+    lastPrepareMs = (prepEndQPC.QuadPart - prepStartQPC.QuadPart) * 1000.0f / freqQPC.QuadPart;
+    if (lastPrepareMs > ImGuiManager::GetSlowFrameThreshold()) {
+        LOG::logline("SLOW PREPARE: %.1fms for %d calls (Shader Keys + Bins)", lastPrepareMs, (int)recordedCalls.size());
     }
 
     // Performance mode: match against previous frame for dirty tracking
@@ -4685,10 +4715,46 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     // Inline Hi-Z culling using current matrices (same as bbox visualization)
     const size_t numCalls = recordedCalls.size();
 
+    // Bin statistics
+    int binCounts[(int)RenderBin::Count] = {};
+    static const char* binNames[] = { "Terrain", "Opaque", "Skinning", "Grass", "AlphaTested", "Blending" };
+
+#ifdef TRACY_ENABLE
+    // Tracy bin zone: manually managed ScopedZone for per-bin profiling regions
+    static constexpr tracy::SourceLocationData binZoneSrcLoc { "RenderBin", TracyFunction, TracyFile, (uint32_t)__LINE__, 0 };
+    tracy::ScopedZone* binZone = nullptr;
+    alignas(tracy::ScopedZone) char binZoneBuf[sizeof(tracy::ScopedZone)];
+    RenderBin currentBin = RenderBin::Count;
+#endif
+
+    // Slow frame detection: QPC timing for replay loop
+    LARGE_INTEGER replayFreqQPC, replayStartQPC, replayEndQPC;
+    QueryPerformanceFrequency(&replayFreqQPC);
+    QueryPerformanceCounter(&replayStartQPC);
+    float worstCallMs = 0.0f;
+    int worstCallIndex = -1;
+    int worstCallPrims = 0;
+    int worstCallBin = 0;
+    float slowCallThreshold = ImGuiManager::GetSlowCallThreshold();
+
     MGE_ZoneScopedN("replay_MainLoop");
     bool firstDrawDone = false;
     for (size_t i = 0; i < numCalls; i++) {
         auto& call = recordedCalls[i];  // Non-const to update shader key
+
+        // Track bin statistics
+        binCounts[(int)call.bin]++;
+
+#ifdef TRACY_ENABLE
+        // Emit Tracy zone on bin transition
+        if (g_tracyActive && call.bin != currentBin) {
+            if (binZone) binZone->~ScopedZone();
+            currentBin = call.bin;
+            binZone = new (binZoneBuf) tracy::ScopedZone(&binZoneSrcLoc, TRACY_CALLSTACK, true);
+            const char* name = binNames[(int)currentBin];
+            binZone->Name(name, strlen(name));
+        }
+#endif
 
         // Build MeshKey for this call
         MeshKey currentKey{call.rs.vb, call.rs.ib, call.rs.fvf, call.rs.baseIndex,
@@ -4756,6 +4822,24 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
                 }
             }
 
+            // Render bin highlighting: tint by bin category
+            if (ImGuiManager::GetHighlightBins() && call.bin != RenderBin::Opaque) {
+                FragmentState tintedFrs = call.frs;
+                switch (call.bin) {
+                    case RenderBin::Skinning:
+                        tintedFrs.material.emissive = {0.0f, 0.0f, 1.0f, 1.0f}; break; // Blue
+                    case RenderBin::Grass:
+                        tintedFrs.material.emissive = {0.0f, 1.0f, 0.0f, 1.0f}; break; // Green
+                    case RenderBin::AlphaTested:
+                        tintedFrs.material.emissive = {1.0f, 1.0f, 0.0f, 1.0f}; break; // Yellow
+                    case RenderBin::Blending:
+                        tintedFrs.material.emissive = {1.0f, 0.0f, 1.0f, 1.0f}; break; // Magenta
+                    default: break;
+                }
+                renderMorrowindHLSL_Internal(&call.rs, &tintedFrs, call.lightrs.get(), DIRTY_ALL);
+                continue;
+            }
+
             {
                 MGE_ZoneScopedN("replay_RenderCall");
                 // Restore Morrowind-recorded device state before each replay call
@@ -4776,12 +4860,46 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
                     // Invalidate cache since we bypassed it with raw SetRenderState
                     materialCache.reset();
                 }
+                LARGE_INTEGER callStartQPC, callEndQPC;
+                QueryPerformanceCounter(&callStartQPC);
                 renderMorrowindHLSL_Internal(&call.rs, &call.frs, call.lightrs.get(), call.dirtyFlags, (int)i);
+                QueryPerformanceCounter(&callEndQPC);
+                float callMs = (callEndQPC.QuadPart - callStartQPC.QuadPart) * 1000.0f / replayFreqQPC.QuadPart;
+                if (callMs > worstCallMs) {
+                    worstCallMs = callMs;
+                    worstCallIndex = (int)i;
+                    worstCallPrims = call.rs.primCount;
+                    worstCallBin = (int)call.bin;
+                }
+                if (callMs > slowCallThreshold) {
+                    LOG::logline("SLOW CALL[%d]: %.1fms bin=%s prims=%d tex=%p",
+                        (int)i, callMs, binNames[(int)call.bin], call.rs.primCount, call.rs.texture);
+                }
                 if (!firstDrawDone) {
                     MGE_ZoneScopedN("replay_FirstDrawDone");
                     firstDrawDone = true;
                 }
             }
+        }
+    }
+
+#ifdef TRACY_ENABLE
+    // Close final bin zone
+    if (binZone) binZone->~ScopedZone();
+#endif
+
+    // Slow frame detection: measure total replay time
+    QueryPerformanceCounter(&replayEndQPC);
+    float replayMs = (replayEndQPC.QuadPart - replayStartQPC.QuadPart) * 1000.0f / replayFreqQPC.QuadPart;
+    float slowFrameThreshold = ImGuiManager::GetSlowFrameThreshold();
+    if (replayMs > slowFrameThreshold) {
+        LOG::logline("SLOW REPLAY: %.1fms for %d calls", replayMs, (int)numCalls);
+    }
+
+    // Auto-freeze on slow frame (prepare timing comes from prepareRecordedCalls via stored value)
+    if (ImGuiManager::GetSlowFrameAutoFreeze() && !ImGuiManager::GetSlowFrameFrozen()) {
+        if (lastPrepareMs > slowFrameThreshold || replayMs > slowFrameThreshold) {
+            ImGuiManager::FreezeSlowFrame(lastPrepareMs, replayMs, worstCallIndex, worstCallMs, worstCallPrims, worstCallBin);
         }
     }
 
@@ -4791,6 +4909,12 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
                  totalCalls, callsWithBBox, culledCalls,
                  totalCalls > 0 ? (culledCalls * 100.0f) / totalCalls : 0.0f,
                  cacheHits, cacheMisses);
+
+    // Log bin statistics
+    LOG::logline("Bins: Opaque=%d Skinning=%d Grass=%d AlphaTested=%d Blending=%d",
+                 binCounts[(int)RenderBin::Opaque], binCounts[(int)RenderBin::Skinning],
+                 binCounts[(int)RenderBin::Grass], binCounts[(int)RenderBin::AlphaTested],
+                 binCounts[(int)RenderBin::Blending]);
 
     // Per-frame light summary: scan all calls for point light statistics and mode distribution
     {
@@ -5080,7 +5204,7 @@ void FixedFunctionShader::validateDeviceState(const ExpectedDeviceState& expecte
 // FixedFunctionShader::HLSLRecordedCall
 
 FixedFunctionShader::HLSLRecordedCall::HLSLRecordedCall(const RenderedState* rs_, const FragmentState* frs_, std::shared_ptr<LightState> lightrs_, const ShaderKey& sk_, int recordMWIdx)
-    : rs(*rs_), frs(*frs_), lightrs(lightrs_), sk(sk_), hasBoundingBox(false), recordMWIndex(recordMWIdx), prepared(false), dirtyFlags(DIRTY_ALL) {
+    : rs(*rs_), frs(*frs_), lightrs(lightrs_), sk(sk_), hasBoundingBox(false), recordMWIndex(recordMWIdx), bin(RenderBin::Opaque), prepared(false), dirtyFlags(DIRTY_ALL) {
     // Lean recording: capture sampler states for stages 0-1 only (Morrowind-bound textures)
     // Stages 2+ are HLSL-specific textures bound by MGE XE with known sampler states
     for (int stage = 0; stage < 2; ++stage) {

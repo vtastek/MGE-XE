@@ -54,6 +54,19 @@ static LightState lightrs;
 static HWND gameWindow = nullptr;
 static bool imguiInitialized = false;
 
+// Per-frame DIP category counters for Tracy profiling
+struct DIPCounters {
+    int scene0;
+    int scene1plus;
+    int offscreen;
+    int ui;
+    int stencilShadow;
+    int unknown;
+    void reset() { memset(this, 0, sizeof(*this)); }
+    int total() const { return scene0 + scene1plus + offscreen + ui + stencilShadow + unknown; }
+};
+static DIPCounters g_dipCounters;
+
 static void initOnLoad();
 static bool detectMenu(const D3DMATRIX* m);
 static void captureRenderState(D3DRENDERSTATETYPE a, DWORD b);
@@ -333,6 +346,31 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         g_passBreaks.reset();
     }
 
+    // Log DIP category counters (only when there were actual DIPs)
+    if (g_dipCounters.total() > 0) {
+        static int dipLogCounter = 0;
+        int dipTotal = g_dipCounters.total();
+        bool isSpike = dipTotal >= ImGuiManager::GetDIPSpikeThreshold();
+        if (++dipLogCounter <= 60 || dipLogCounter % 300 == 0 || isSpike) {
+            LOG::logline("%sDIPs: Scene0=%d Scene1+=%d Offscreen=%d UI=%d StencilShadow=%d PreScene=%d Total=%d",
+                isSpike ? "DIP SPIKE! " : "",
+                g_dipCounters.scene0, g_dipCounters.scene1plus,
+                g_dipCounters.offscreen, g_dipCounters.ui,
+                g_dipCounters.stencilShadow, g_dipCounters.unknown,
+                dipTotal);
+        }
+        // Auto-freeze DIP stats on spike
+        if (isSpike && ImGuiManager::GetDIPAutoFreeze() && !ImGuiManager::GetDIPFrozen()) {
+            ImGuiManager::FreezeDIPStats(g_dipCounters.scene0, g_dipCounters.scene1plus,
+                g_dipCounters.offscreen, g_dipCounters.ui,
+                g_dipCounters.stencilShadow, g_dipCounters.unknown);
+        }
+    }
+    ImGuiManager::UpdateDIPStats(g_dipCounters.scene0, g_dipCounters.scene1plus,
+        g_dipCounters.offscreen, g_dipCounters.ui,
+        g_dipCounters.stencilShadow, g_dipCounters.unknown);
+    g_dipCounters.reset();
+
     {
         MGE_ZoneScopedN("Present_ResetState");
         // Reset scene identifiers
@@ -602,10 +640,47 @@ HRESULT _stdcall MGEProxyDevice::SetTextureStageState(DWORD a, D3DTEXTURESTAGEST
 // DrawIndexedPrimitive - Where all the drawing happens
 // Inspect draw calls for re-use later
 HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b, UINT c, UINT d, UINT e) {
-    MGE_ZoneScopedN("DrawIndexedPrimitive");
-
     // Allow distant land to inspect draw calls
     bool isShadowStencil = isStencilScene && stencilRef <= 1;
+
+    // Categorize this DIP for Tracy profiling
+    const char* dipCategory;
+    static thread_local char dipBuf[32];
+    if (!rendertargetNormal) {
+        snprintf(dipBuf, sizeof(dipBuf), "DIP_Offscreen_S%d", sceneCount);
+        dipCategory = dipBuf;
+        g_dipCounters.offscreen++;
+    } else if (!isMainView) {
+        dipCategory = "DIP_UI";
+        g_dipCounters.ui++;
+    } else if (isShadowStencil) {
+        dipCategory = "DIP_StencilShadow";
+        g_dipCounters.stencilShadow++;
+    } else if (sceneCount == 0) {
+        dipCategory = "DIP_Scene0";
+        g_dipCounters.scene0++;
+    } else if (sceneCount > 0) {
+        snprintf(dipBuf, sizeof(dipBuf), "DIP_Scene%d", sceneCount);
+        dipCategory = dipBuf;
+        g_dipCounters.scene1plus++;
+    } else {
+        dipCategory = "DIP_PreScene";
+        g_dipCounters.unknown++;
+    }
+
+#ifdef TRACY_ENABLE
+    static constexpr tracy::SourceLocationData dipSrcLoc { nullptr, TracyFunction, TracyFile, (uint32_t)__LINE__, 0 };
+    tracy::ScopedZone dipZone(&dipSrcLoc, TRACY_CALLSTACK, g_tracyActive);
+    dipZone.Name(dipCategory, strlen(dipCategory));
+#endif
+
+    // Debug: suppress DIP categories via ImGui toggles
+    if (!rendertargetNormal && ImGuiManager::GetSuppressOffscreen()) return D3D_OK;
+    if (!isMainView && rendertargetNormal && ImGuiManager::GetSuppressUI()) return D3D_OK;
+    if (isShadowStencil && ImGuiManager::GetSuppressStencilShadow()) return D3D_OK;
+    if (sceneCount == 0 && rendertargetNormal && isMainView && !isShadowStencil && ImGuiManager::GetSuppressScene0()) return D3D_OK;
+    if (sceneCount > 0 && rendertargetNormal && isMainView && !isShadowStencil && ImGuiManager::GetSuppressScene1Plus()) return D3D_OK;
+    if (sceneCount < 0 && rendertargetNormal && ImGuiManager::GetSuppressPreScene()) return D3D_OK;
 
     // Skip stencil shadow rendering entirely in HLSL mode (HLSL has its own shadows)
     if (isShadowStencil && Configuration.PerPixelLightFlags == 2) {

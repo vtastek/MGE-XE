@@ -14,6 +14,17 @@
 #include <memory>
 #include <atomic>
 
+// Render bin classification for Tracy profiling and debug visualization
+enum class RenderBin : uint8_t {
+    Terrain,      // Landscape verts (future: detected by land splat pattern)
+    Opaque,       // Z-write, no blend, no skin, no grass
+    Skinning,     // sk.usesSkinning
+    Grass,        // sk.hasGrass
+    AlphaTested,  // alphaTest enabled, no blend
+    Blending,     // blendEnable
+    Count
+};
+
 // Dirty flags for performance mode (dirty tracking between frames)
 enum DirtyFlags : DWORD {
     DIRTY_NONE      = 0,
@@ -99,6 +110,9 @@ struct LightState {
     std::unordered_map<DWORD, bool> lightsTransformed;
     std::vector<DWORD> active;
 };
+
+// Global callback for texture release notification (set by FixedFunctionShader::init)
+extern void (*g_onTextureReleased)(IDirect3DTexture9* realTexture);
 
 class FixedFunctionShader {
     struct ShaderKey {
@@ -491,6 +505,9 @@ class FixedFunctionShader {
 
         // Whether this call has been through the prepare phase (shader key, bbox, etc.)
         bool prepared;
+
+        // Render bin classification
+        RenderBin bin;
 
         // Dirty tracking for performance mode
         DWORD dirtyFlags;

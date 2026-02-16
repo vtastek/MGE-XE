@@ -71,12 +71,39 @@ public:
     // Occluder highlighting (debug visualization)
     static bool GetHighlightOccluders() { return highlightOccluders; }
 
+    // Render bin highlighting (debug visualization)
+    static bool GetHighlightBins() { return highlightBins; }
+
     // Rasterize All mode - bypass all heuristics, rasterize everything
     static bool GetRasterizeAll() { return rasterizeAll; }
 
     // Debug/Performance mode toggles
     static bool GetStateLeakDetection() { return stateLeakDetection; }
     static bool GetPerformanceMode() { return performanceMode; }
+
+    // DIP category suppression toggles
+    static bool GetSuppressScene0() { return suppressScene0; }
+    static bool GetSuppressScene1Plus() { return suppressScene1Plus; }
+    static bool GetSuppressOffscreen() { return suppressOffscreen; }
+    static bool GetSuppressUI() { return suppressUI; }
+    static bool GetSuppressStencilShadow() { return suppressStencilShadow; }
+    static bool GetSuppressPreScene() { return suppressPreScene; }
+
+    // DIP counter stats (updated each frame from mged3d8device)
+    static void UpdateDIPStats(int scene0, int scene1plus, int offscreen, int ui, int stencilShadow, int preScene);
+
+    // DIP spike freeze
+    static bool GetDIPFrozen() { return dipFrozen; }
+    static bool GetDIPAutoFreeze() { return dipAutoFreeze; }
+    static int GetDIPSpikeThreshold() { return dipSpikeThreshold; }
+    static void FreezeDIPStats(int scene0, int scene1plus, int offscreen, int ui, int stencilShadow, int preScene);
+
+    // Slow frame detection
+    static float GetSlowFrameThreshold() { return slowFrameThreshold; }
+    static float GetSlowCallThreshold() { return slowCallThreshold; }
+    static bool GetSlowFrameAutoFreeze() { return slowFrameAutoFreeze; }
+    static bool GetSlowFrameFrozen() { return slowFrameFrozen; }
+    static void FreezeSlowFrame(float prepareMs, float replayMs, int worstCallIndex, float worstCallMs, int worstCallPrims, int worstCallBin);
 
     // Debug hotkey gating
     static bool GetDebugKeysEnabled();
@@ -144,12 +171,55 @@ private:
     // Occluder highlighting (debug visualization)
     static bool highlightOccluders;       // Tint occluders green for debugging - default false
 
+    // Render bin highlighting (debug visualization)
+    static bool highlightBins;            // Tint draw calls by render bin for debugging - default false
+
     // Rasterize All mode - bypass all heuristics
     static bool rasterizeAll;             // Rasterize ALL objects to Hi-Z - default false
 
     // Debug/Performance mode toggles
     static bool stateLeakDetection;       // State leak detection debug mode - default false
     static bool performanceMode;          // Dirty tracking performance mode - default true
+
+    // DIP category suppression toggles
+    static bool suppressScene0;
+    static bool suppressScene1Plus;
+    static bool suppressOffscreen;
+    static bool suppressUI;
+    static bool suppressStencilShadow;
+    static bool suppressPreScene;
+
+    // DIP counter stats
+    static int dipScene0;
+    static int dipScene1Plus;
+    static int dipOffscreen;
+    static int dipUI;
+    static int dipStencilShadow;
+    static int dipPreScene;
+
+    // DIP spike freeze state
+    static bool dipFrozen;
+    static bool dipAutoFreeze;
+    static int dipSpikeThreshold;
+    static int frozenDipScene0;
+    static int frozenDipScene1Plus;
+    static int frozenDipOffscreen;
+    static int frozenDipUI;
+    static int frozenDipStencilShadow;
+    static int frozenDipPreScene;
+    static int frozenTotal;
+
+    // Slow frame detection state
+    static bool slowFrameFrozen;
+    static bool slowFrameAutoFreeze;
+    static float slowFrameThreshold;      // Frame-level threshold (ms) - default 5.0
+    static float slowCallThreshold;       // Per-call threshold (ms) - default 5.0
+    static float frozenPrepareMs;
+    static float frozenReplayMs;
+    static int frozenSlowCallIndex;
+    static float frozenSlowCallMs;
+    static int frozenSlowCallPrims;
+    static int frozenSlowCallBin;
 
     // Debug hotkey gating
     static bool debugKeysEnabled;         // Gate debug hotkeys (F11/U/Y/L/F5/F6) - default false

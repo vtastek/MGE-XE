@@ -60,12 +60,55 @@ int ImGuiManager::occluderWallExtraBudget = 100;     // Extra budget for wall-sh
 // Occluder highlighting (debug visualization)
 bool ImGuiManager::highlightOccluders = false;
 
+// Render bin highlighting (debug visualization)
+bool ImGuiManager::highlightBins = false;
+
 // Rasterize All mode - bypass all heuristics
 bool ImGuiManager::rasterizeAll = false;
 
 // Debug/Performance mode toggles
 bool ImGuiManager::stateLeakDetection = false;
 bool ImGuiManager::performanceMode = true;
+
+// DIP category suppression toggles
+bool ImGuiManager::suppressScene0 = false;
+bool ImGuiManager::suppressScene1Plus = false;
+bool ImGuiManager::suppressOffscreen = true;
+bool ImGuiManager::suppressUI = false;
+bool ImGuiManager::suppressStencilShadow = false;
+bool ImGuiManager::suppressPreScene = false;
+
+// DIP counter stats
+int ImGuiManager::dipScene0 = 0;
+int ImGuiManager::dipScene1Plus = 0;
+int ImGuiManager::dipOffscreen = 0;
+int ImGuiManager::dipUI = 0;
+int ImGuiManager::dipStencilShadow = 0;
+int ImGuiManager::dipPreScene = 0;
+
+// DIP spike freeze state
+bool ImGuiManager::dipFrozen = false;
+bool ImGuiManager::dipAutoFreeze = true;
+int ImGuiManager::dipSpikeThreshold = 2000;
+int ImGuiManager::frozenDipScene0 = 0;
+int ImGuiManager::frozenDipScene1Plus = 0;
+int ImGuiManager::frozenDipOffscreen = 0;
+int ImGuiManager::frozenDipUI = 0;
+int ImGuiManager::frozenDipStencilShadow = 0;
+int ImGuiManager::frozenDipPreScene = 0;
+int ImGuiManager::frozenTotal = 0;
+
+// Slow frame detection state
+bool ImGuiManager::slowFrameFrozen = false;
+bool ImGuiManager::slowFrameAutoFreeze = true;
+float ImGuiManager::slowFrameThreshold = 5.0f;
+float ImGuiManager::slowCallThreshold = 5.0f;
+float ImGuiManager::frozenPrepareMs = 0.0f;
+float ImGuiManager::frozenReplayMs = 0.0f;
+int ImGuiManager::frozenSlowCallIndex = -1;
+float ImGuiManager::frozenSlowCallMs = 0.0f;
+int ImGuiManager::frozenSlowCallPrims = 0;
+int ImGuiManager::frozenSlowCallBin = 0;
 
 // Debug hotkey gating
 bool ImGuiManager::debugKeysEnabled = false;
@@ -360,6 +403,74 @@ void ImGuiManager::RenderDebugInterface() {
         ImGui::Combo("BBox Mode", &bboxVisualizationMode, bboxModes, 3);
 
         ImGui::Separator();
+        ImGui::Text("DIP Categories (uncheck to suppress)");
+
+        // Choose frozen or live values for display
+        int dispScene0 = dipFrozen ? frozenDipScene0 : dipScene0;
+        int dispScene1Plus = dipFrozen ? frozenDipScene1Plus : dipScene1Plus;
+        int dispOffscreen = dipFrozen ? frozenDipOffscreen : dipOffscreen;
+        int dispUI = dipFrozen ? frozenDipUI : dipUI;
+        int dispStencilShadow = dipFrozen ? frozenDipStencilShadow : dipStencilShadow;
+        int dispPreScene = dipFrozen ? frozenDipPreScene : dipPreScene;
+        int dispTotal = dispScene0 + dispScene1Plus + dispOffscreen + dispUI + dispStencilShadow + dispPreScene;
+
+        if (dipFrozen) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.3f, 0.3f, 1.0f));
+            ImGui::Text("FROZEN (spike: %d total)", frozenTotal);
+            ImGui::PopStyleColor();
+            if (ImGui::Button("Unfreeze")) {
+                dipFrozen = false;
+            }
+        } else {
+            ImGui::Text("Total: %d DIPs/frame", dispTotal);
+        }
+
+        ImGui::Checkbox("Auto-freeze on spike", &dipAutoFreeze);
+        ImGui::SliderInt("Spike threshold", &dipSpikeThreshold, 500, 10000);
+
+        ImGui::Checkbox("Scene 0 (Main 3D)", &suppressScene0);
+        ImGui::SameLine(); ImGui::Text("= %d", dispScene0);
+
+        ImGui::Checkbox("Scene 1+ (Hands/Alpha)", &suppressScene1Plus);
+        ImGui::SameLine(); ImGui::Text("= %d", dispScene1Plus);
+
+        ImGui::Checkbox("Offscreen (Map/Inv)", &suppressOffscreen);
+        ImGui::SameLine(); ImGui::Text("= %d", dispOffscreen);
+
+        ImGui::Checkbox("UI / Menu", &suppressUI);
+        ImGui::SameLine(); ImGui::Text("= %d", dispUI);
+
+        ImGui::Checkbox("Stencil Shadow", &suppressStencilShadow);
+        ImGui::SameLine(); ImGui::Text("= %d", dispStencilShadow);
+
+        ImGui::Checkbox("Pre-Scene", &suppressPreScene);
+        ImGui::SameLine(); ImGui::Text("= %d", dispPreScene);
+
+        ImGui::Separator();
+        ImGui::Text("Slow Frame Detection");
+
+        static const char* binNamesUI[] = { "Terrain", "Opaque", "Skinning", "Grass", "AlphaTested", "Blending" };
+
+        if (slowFrameFrozen) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.3f, 0.3f, 1.0f));
+            ImGui::Text("FROZEN (prepare: %.1fms, replay: %.1fms)", frozenPrepareMs, frozenReplayMs);
+            if (frozenSlowCallIndex >= 0) {
+                const char* binName = (frozenSlowCallBin >= 0 && frozenSlowCallBin < 6) ? binNamesUI[frozenSlowCallBin] : "?";
+                ImGui::Text("Worst call[%d]: %.1fms, bin=%s, prims=%d", frozenSlowCallIndex, frozenSlowCallMs, binName, frozenSlowCallPrims);
+            }
+            ImGui::PopStyleColor();
+            if (ImGui::Button("Unfreeze Slow Frame")) {
+                slowFrameFrozen = false;
+            }
+        } else {
+            ImGui::Text("(no slow frame detected)");
+        }
+
+        ImGui::Checkbox("Auto-freeze on slow frame", &slowFrameAutoFreeze);
+        ImGui::SliderFloat("Frame threshold (ms)", &slowFrameThreshold, 1.0f, 50.0f, "%.1f");
+        ImGui::SliderFloat("Call threshold (ms)", &slowCallThreshold, 1.0f, 50.0f, "%.1f");
+
+        ImGui::Separator();
         ImGui::Text("Press G to toggle this interface");
     }
     ImGui::End();
@@ -393,6 +504,36 @@ void ImGuiManager::UpdateDebugStats(int recordedCalls, int renderedCalls, int cu
     debugSceneLights = sceneLights;
     debugRecordMWSize = recordMWSize;
     debugImmediateCount = immediateCount;
+}
+
+void ImGuiManager::UpdateDIPStats(int scene0, int scene1plus, int offscreen, int ui, int stencilShadow, int preScene) {
+    dipScene0 = scene0;
+    dipScene1Plus = scene1plus;
+    dipOffscreen = offscreen;
+    dipUI = ui;
+    dipStencilShadow = stencilShadow;
+    dipPreScene = preScene;
+}
+
+void ImGuiManager::FreezeDIPStats(int scene0, int scene1plus, int offscreen, int ui, int stencilShadow, int preScene) {
+    dipFrozen = true;
+    frozenDipScene0 = scene0;
+    frozenDipScene1Plus = scene1plus;
+    frozenDipOffscreen = offscreen;
+    frozenDipUI = ui;
+    frozenDipStencilShadow = stencilShadow;
+    frozenDipPreScene = preScene;
+    frozenTotal = scene0 + scene1plus + offscreen + ui + stencilShadow + preScene;
+}
+
+void ImGuiManager::FreezeSlowFrame(float prepareMs, float replayMs, int worstCallIndex, float worstCallMs, int worstCallPrims, int worstCallBin) {
+    slowFrameFrozen = true;
+    frozenPrepareMs = prepareMs;
+    frozenReplayMs = replayMs;
+    frozenSlowCallIndex = worstCallIndex;
+    frozenSlowCallMs = worstCallMs;
+    frozenSlowCallPrims = worstCallPrims;
+    frozenSlowCallBin = worstCallBin;
 }
 
 void ImGuiManager::RenderHiZInterface() {
@@ -468,6 +609,9 @@ void ImGuiManager::RenderHiZInterface() {
             ImGui::Text("Debug Visualization:");
             ImGui::Checkbox("Highlight Occluders (Green Tint)", &highlightOccluders);
             ImGui::SetItemTooltip("Tint objects selected as occluders with green to visualize selection");
+
+            ImGui::Checkbox("Highlight Render Bins (Color Tint)", &highlightBins);
+            ImGui::SetItemTooltip("Tint draw calls by render bin: Blue=Skinning, Green=Grass, Yellow=AlphaTested, Magenta=Blending");
 
             ImGui::Checkbox("Rasterize ALL (Bypass Heuristics)", &rasterizeAll);
             ImGui::SetItemTooltip("Rasterize ALL objects to Hi-Z buffer - bypasses all selection heuristics for debugging");
