@@ -111,6 +111,24 @@ struct LightState {
     std::vector<DWORD> active;
 };
 
+// Pipeline state diagnostic snapshot — captured at Present() before reset
+struct PipelineDiag {
+    // Per-frame DIP counters (end-of-frame totals)
+    int dipScene0, dipScene1plus, dipOffscreen, dipUI, dipStencilShadow, dipUnknown;
+    // Pipeline flags at end of frame
+    int sceneCount;
+    bool isMainView, rendertargetNormal, stage0Complete, isFrameComplete;
+    bool isHUDComplete, isHUDready, isStencilScene, isAmbientWhite;
+    // DistantLand state
+    bool distantLandReady, isPPLActive;
+    // View matrix at last SetTransform(VIEW) — raw values for detectMenu analysis
+    float view_11, view_12, view_13, view_41, view_42, view_43;
+    // MWBridge state
+    bool mwLoaded;
+    DWORD mwCellAddr;
+};
+extern PipelineDiag g_pipelineDiag;
+
 // Global callback for texture release notification (set by FixedFunctionShader::init)
 extern void (*g_onTextureReleased)(IDirect3DTexture9* realTexture);
 
@@ -444,6 +462,7 @@ class FixedFunctionShader {
         RecordedLightState(const LightState& lightrs) : LightState(lightrs) {}
     };
 
+public:
     // Mesh identifier for bbox caching (VB + IB + FVF combo uniquely identifies object-space mesh)
     struct MeshKey {
         IDirect3DVertexBuffer9* vb;
@@ -512,6 +531,9 @@ class FixedFunctionShader {
         // Dirty tracking for performance mode
         DWORD dirtyFlags;
 
+        // Whether this call should be rendered (set by cull pass)
+        bool shouldRender = true;
+
         // Expected device state for debug mode (state leak detection)
         ExpectedDeviceState expectedState;
 
@@ -519,23 +541,6 @@ class FixedFunctionShader {
         HLSLRecordedCall(const RenderedState* rs_, const FragmentState* frs_, std::shared_ptr<LightState> lightrs_, const ShaderKey& sk_, int recordMWIdx = -1);
         // Implementation moved to cpp file to handle sampler state capture
     };
-
-    static std::vector<HLSLRecordedCall> recordedCalls;
-    static std::vector<HLSLRecordedCall> previousFrameCalls;  // Previous frame for raycast targeting
-    static bool isRecording;
-    static bool isReplaying;
-    static bool manualRecordingControl;  // When true, user controls recording via K key
-    static bool recordingEnabled;  // Global toggle for entire recording system
-    static bool recordingCompletedThisFrame;  // Prevents restarting recording after Scene 0
-    static bool hiZBuiltThisFrame;  // Prevents rebuilding Hi-Z pyramid multiple times per frame
-    static bool dumpRequested;  // When true, preserve calls for dump
-
-    // Consistent matrices for entire recording session
-    static D3DXMATRIX recordingDeviceView, recordingDeviceProj;
-    static D3DXMATRIX recordingShadowViewproj[2];
-
-    // Bbox cache: maps mesh identifier to object-space bbox (persists across frames)
-    static std::unordered_map<MeshKey, ObjectSpaceBBox, MeshKeyHash> bboxCache;
 
     // VB+IB key for bbox lookup between recordedCalls and recordMW
     struct VBIBKey {
@@ -554,6 +559,75 @@ class FixedFunctionShader {
             return h1 ^ (h2 << 1);
         }
     };
+
+    // Buffer lifecycle states for triple-buffered pipeline
+    enum class BufferState {
+        Available,      // Free for recording
+        Recording,      // Main thread writing draw calls
+        ReadyToCull,    // Recording complete, waiting for cull thread
+        Culling,        // Cull thread processing (Hi-Z, shouldRender, shader keys)
+        ReadyToRender,  // Cull complete, waiting for render thread
+        Rendering       // Render thread submitting GPU calls
+    };
+
+    struct FrameBuffer {
+        std::vector<HLSLRecordedCall> recordedCalls;
+
+        // Matrices captured at recording time
+        D3DXMATRIX view, proj;
+        D3DXMATRIX shadowViewproj[2];
+
+        // Matrices stamped at Present() for render pass (fresh camera)
+        D3DXMATRIX currentView, currentProj;
+        D3DXMATRIX currentShadowViewproj[2];
+
+        // Per-buffer occluder set (no cross-buffer sharing)
+        std::unordered_set<MeshKey, MeshKeyHash> rasterizedOccluderMeshes;
+
+        // Per-buffer bbox lookup (rebuilt each frame from recordedCalls)
+        std::unordered_map<VBIBKey, ObjectSpaceBBox, VBIBKeyHash> bboxLookup;
+
+        // Per-buffer LightState cache for recording
+        std::shared_ptr<LightState> lastLightState;
+
+        bool valid;
+        BufferState state;
+
+        FrameBuffer() : valid(false), state(BufferState::Available) {}
+
+        void clear() {
+            recordedCalls.clear();
+            rasterizedOccluderMeshes.clear();
+            bboxLookup.clear();
+            lastLightState.reset();
+            valid = false;
+        }
+
+        void reserve() {
+            recordedCalls.reserve(4000);
+        }
+    };
+
+    static FrameBuffer frameBuffers[3];
+    static int recordingBuffer;
+
+private:
+
+    static std::vector<HLSLRecordedCall> recordedCalls;
+    static bool isRecording;
+    static bool isReplaying;
+    static bool manualRecordingControl;  // When true, user controls recording via K key
+    static bool recordingEnabled;  // Global toggle for entire recording system
+    static bool recordingCompletedThisFrame;  // Prevents restarting recording after Scene 0
+    static bool hiZBuiltThisFrame;  // Prevents rebuilding Hi-Z pyramid multiple times per frame
+    static bool dumpRequested;  // When true, preserve calls for dump
+
+    // Consistent matrices for entire recording session
+    static D3DXMATRIX recordingDeviceView, recordingDeviceProj;
+    static D3DXMATRIX recordingShadowViewproj[2];
+
+    // Bbox cache: maps mesh identifier to object-space bbox (persists across frames)
+    static std::unordered_map<MeshKey, ObjectSpaceBBox, MeshKeyHash> bboxCache;
 
     // Bbox lookup: maps VB+IB to world-space bbox (rebuilt each frame from recordedCalls)
     static std::unordered_map<VBIBKey, ObjectSpaceBBox, VBIBKeyHash> bboxLookup;
@@ -589,6 +663,23 @@ class FixedFunctionShader {
 
 public:
     static void finalizeBatchAndReplay(int sceneCount = 0); // Call when HLSL rendering session is complete
+
+    // Scene lifecycle for triple-buffered pipeline
+    static void markSceneStart(int sceneNum, bool isUI = false);
+    static void markSceneEnd();
+
+    // Triple-buffer pipeline: split cull (CPU) and render (GPU) passes
+    static void executeCullPass(int bufferIndex);
+    static void executeRenderPass(int bufferIndex);
+
+    static FrameBuffer& getFrameBuffer(int index) { return frameBuffers[index]; }
+    static int getRecordingBufferIndex() { return recordingBuffer; }
+    static void rotateRecordingBuffer() {
+        recordingBuffer = (recordingBuffer + 1) % 3;
+        // Clear the buffer we're about to record into — releases stale COM refs
+        // from 3 frames ago and frees memory before startRecording() allocates
+        frameBuffers[recordingBuffer].clear();
+    }
 
     // Debug controls for record/replay system
     static bool getIsRecording() { return isRecording; }
@@ -643,4 +734,7 @@ public:
     static void captureSamplerStates(IDirect3DDevice9* device, DWORD stage); // Capture current sampler states before texture binding
     static void createDefaultTextures(); // Create default textures to avoid null binds
     static void bindShaderTextures(const ShaderKey& sk, const RenderedState* rs); // Smart texture binding for shader
+
+    // Pipeline diagnostic snapshot hotkeys (called from Present())
+    static void checkSnapshotHotkeys();
 };

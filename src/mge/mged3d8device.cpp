@@ -17,6 +17,9 @@
 
 bool g_tracyActive = false;
 
+// Pipeline state diagnostic snapshot — filled at Present() before reset
+PipelineDiag g_pipelineDiag = {};
+
 static bool isTracyProfilerRunning() {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return false;
@@ -371,6 +374,39 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         g_dipCounters.stencilShadow, g_dipCounters.unknown);
     g_dipCounters.reset();
 
+    // Fill pipeline diagnostic snapshot (end-of-frame state, before reset)
+    {
+        auto mwb = MWBridge::get();
+        g_pipelineDiag.dipScene0 = g_dipCounters.scene0;
+        g_pipelineDiag.dipScene1plus = g_dipCounters.scene1plus;
+        g_pipelineDiag.dipOffscreen = g_dipCounters.offscreen;
+        g_pipelineDiag.dipUI = g_dipCounters.ui;
+        g_pipelineDiag.dipStencilShadow = g_dipCounters.stencilShadow;
+        g_pipelineDiag.dipUnknown = g_dipCounters.unknown;
+        g_pipelineDiag.sceneCount = sceneCount;
+        g_pipelineDiag.isMainView = isMainView;
+        g_pipelineDiag.rendertargetNormal = rendertargetNormal;
+        g_pipelineDiag.stage0Complete = stage0Complete;
+        g_pipelineDiag.isFrameComplete = isFrameComplete;
+        g_pipelineDiag.isHUDComplete = isHUDComplete;
+        g_pipelineDiag.isHUDready = isHUDready;
+        g_pipelineDiag.isStencilScene = isStencilScene;
+        g_pipelineDiag.isAmbientWhite = isAmbientWhite;
+        g_pipelineDiag.distantLandReady = DistantLand::ready;
+        g_pipelineDiag.isPPLActive = DistantLand::isPPLActive;
+        g_pipelineDiag.view_11 = rs.viewTransform._11;
+        g_pipelineDiag.view_12 = rs.viewTransform._12;
+        g_pipelineDiag.view_13 = rs.viewTransform._13;
+        g_pipelineDiag.view_41 = rs.viewTransform._41;
+        g_pipelineDiag.view_42 = rs.viewTransform._42;
+        g_pipelineDiag.view_43 = rs.viewTransform._43;
+        g_pipelineDiag.mwLoaded = mwb->IsLoaded();
+        g_pipelineDiag.mwCellAddr = mwb->IsLoaded() ? mwb->IntCurCellAddr() : 0;
+    }
+
+    // F5/F6 pipeline snapshot hotkeys — fires every frame from Present()
+    FixedFunctionShader::checkSnapshotHotkeys();
+
     {
         MGE_ZoneScopedN("Present_ResetState");
         // Reset scene identifiers
@@ -379,6 +415,23 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         waterDrawn = false;
         isFrameComplete = false;
         isHUDComplete = false;
+
+        // Stamp current camera into the FrameBuffer that just finished recording
+        // (for future render pass to use fresh matrices instead of stale recording-time ones)
+        {
+            auto& fb = FixedFunctionShader::getFrameBuffer(FixedFunctionShader::getRecordingBufferIndex());
+            realDevice->GetTransform(D3DTS_VIEW, &fb.currentView);
+            realDevice->GetTransform(D3DTS_PROJECTION, &fb.currentProj);
+            fb.currentShadowViewproj[0] = DistantLand::smViewproj[0];
+            fb.currentShadowViewproj[1] = DistantLand::smViewproj[1];
+        }
+
+        // Rotate to next FrameBuffer for the next frame's recording
+        FixedFunctionShader::rotateRecordingBuffer();
+
+        // Reset per-frame flags
+        FixedFunctionShader::resetHiZBuiltFlag();
+        FixedFunctionShader::resetRecordingCompletedFlag();
 
         // Reset HLSL texture caches at frame boundary to prevent stale texture pointers
         FixedFunctionShader::resetHLSLCaches();

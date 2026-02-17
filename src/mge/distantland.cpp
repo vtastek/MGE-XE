@@ -137,7 +137,10 @@ void DistantLand::renderStage0() {
         } else {
             // Clear water reflection to avoid seeing previous cell environment reflected
             // Must be done every frame to react to lighting changes
-            clearReflection();
+            // Skip for cells without water to avoid unnecessary GPU work
+            if (mwBridge->CellHasWater()) {
+                clearReflection();
+            }
 
             // Update water simulation
             if (Configuration.MGEFlags & DYNAMIC_RIPPLES) {
@@ -326,12 +329,19 @@ void DistantLand::renderStageBlend() {
         return;
     }
 
+    // Early out: skip state block overhead when no blend work will be done
+    bool hasCaustics = mwBridge->IsExterior() && Configuration.DL.WaterCaustics > 0;
+    bool hasBlend = isDistantCell() && (~Configuration.MGEFlags & NO_MW_MGE_BLEND);
+    if (!hasCaustics && !hasBlend) {
+        return;
+    }
+
     // Save state block manually since we can change FVF/decl
     device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
     effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
 
     // Render caustics
-    if (mwBridge->IsExterior() && Configuration.DL.WaterCaustics > 0) {
+    if (hasCaustics) {
         D3DXMATRIX m;
         IDirect3DTexture9* tex = PostShaders::borrowBuffer(0);
         D3DXMatrixTranslation(&m, eyePos.x, eyePos.y, mwBridge->WaterLevel());
@@ -349,7 +359,7 @@ void DistantLand::renderStageBlend() {
     }
 
     // Blend MW/MGE
-    if (isDistantCell() && (~Configuration.MGEFlags & NO_MW_MGE_BLEND)) {
+    if (hasBlend) {
         effect->SetTexture(ehTex0, texDistantBlend);
         effect->SetTexture(ehTex3, texDepthFrame);
         effect->CommitChanges();

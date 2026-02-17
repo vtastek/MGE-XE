@@ -73,7 +73,7 @@ bool ImGuiManager::performanceMode = true;
 // DIP category suppression toggles
 bool ImGuiManager::suppressScene0 = false;
 bool ImGuiManager::suppressScene1Plus = false;
-bool ImGuiManager::suppressOffscreen = true;
+bool ImGuiManager::suppressOffscreen = false;
 bool ImGuiManager::suppressUI = false;
 bool ImGuiManager::suppressStencilShadow = false;
 bool ImGuiManager::suppressPreScene = false;

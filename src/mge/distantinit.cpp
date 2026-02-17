@@ -3,6 +3,8 @@
 #include "support/log.h"
 #include "configuration.h"
 #include "distantland.h"
+#include "cullthread.h"
+#include "renderthread.h"
 #include "mge_tracy.h"
 #include "distantshader.h"
 #include "distantlandhlsl.h"
@@ -27,6 +29,13 @@ bool DistantLand::ready = false;
 bool DistantLand::isRenderCached = false;
 bool DistantLand::isPPLActive = false;
 int DistantLand::numWaterVerts, DistantLand::numWaterTris;
+
+// Cull thread for CPU-side occlusion culling (heap-allocated to avoid
+// std::mutex construction during DLL static init — see MEMORY.md)
+static CullThread* cullThreadPtr = nullptr;
+
+// Render thread for GPU submission (heap-allocated, same reason)
+static RenderThread* renderThreadPtr = nullptr;
 
 IDirect3DDevice9* DistantLand::device;
 ID3DXEffect* DistantLand::effect;
@@ -307,11 +316,21 @@ bool DistantLand::init() {
     // Wait for priority shaders to be ready before MWSE scripts run
     PostShaders::waitForPriorityShaders();
 
+    // Start cull thread for CPU-side occlusion culling
+    cullThreadPtr = new CullThread();
+    cullThreadPtr->start();
+    g_cullThread = cullThreadPtr;
+
+    // Start render thread for GPU submission
+    renderThreadPtr = new RenderThread();
+    renderThreadPtr->start(device);
+    g_renderThread = renderThreadPtr;
+
     LOG::logline("<< Completed Distant Land init");
-    
-    // Log device state after intensive initialization  
+
+    // Log device state after intensive initialization
     BSA::logDeviceState(device, "AFTER_DISTANT_LAND_INIT");
-    
+
     ready = true;
     isRenderCached = false;
     return true;
@@ -1545,6 +1564,22 @@ void DistantLand::release() {
     }
 
     LOG::logline("-- Renderer unloading");
+
+    // Stop cull thread first (before render thread, in case it's waiting)
+    if (cullThreadPtr) {
+        cullThreadPtr->stop();
+        delete cullThreadPtr;
+        cullThreadPtr = nullptr;
+    }
+    g_cullThread = nullptr;
+
+    // Stop render thread (before releasing any D3D9 resources it might use)
+    if (renderThreadPtr) {
+        renderThreadPtr->stop();
+        delete renderThreadPtr;
+        renderThreadPtr = nullptr;
+    }
+    g_renderThread = nullptr;
 
     recordMW.clear();
     recordSky.clear();

@@ -1,5 +1,6 @@
 
 #include "ffeshader.h"
+#include "cullthread.h"
 #include "mge_tracy.h"
 #include "configuration.h"
 #include "support/log.h"
@@ -50,9 +51,12 @@ unordered_map<FixedFunctionShader::ShaderKey, FixedFunctionShader::HLSLShader, F
 FixedFunctionShader::HLSLShaderLRU FixedFunctionShader::hlslShaderLRU;
 FixedFunctionShader::HLSLShader FixedFunctionShader::hlslShaderDefaultPurple;
 
+// Triple-buffered FrameBuffer infrastructure
+FixedFunctionShader::FrameBuffer FixedFunctionShader::frameBuffers[3];
+int FixedFunctionShader::recordingBuffer = 0;
+
 // HLSL Render Dispatch Recording System
 std::vector<FixedFunctionShader::HLSLRecordedCall> FixedFunctionShader::recordedCalls;
-std::vector<FixedFunctionShader::HLSLRecordedCall> FixedFunctionShader::previousFrameCalls;
 bool FixedFunctionShader::isRecording = false;
 bool FixedFunctionShader::isReplaying = false;
 bool FixedFunctionShader::manualRecordingControl = false;
@@ -3220,6 +3224,15 @@ void FixedFunctionShader::startRecording() {
     recordingShadowViewproj[0] = DistantLand::smViewproj[0];
     recordingShadowViewproj[1] = DistantLand::smViewproj[1];
 
+    // Store into FrameBuffer for triple-buffer pipeline
+    auto& fb = frameBuffers[recordingBuffer];
+    fb.view = recordingDeviceView;
+    fb.proj = recordingDeviceProj;
+    fb.shadowViewproj[0] = recordingShadowViewproj[0];
+    fb.shadowViewproj[1] = recordingShadowViewproj[1];
+    fb.state = BufferState::Recording;
+    fb.valid = true;
+
     LOG::logline("HLSL Recording: Started recording render dispatches");
 }
 
@@ -3421,7 +3434,11 @@ void FixedFunctionShader::prepareOcclusionCullingForDepth() {
 void FixedFunctionShader::matchPreviousFrameCalls() {
     MGE_ZoneScopedN("matchPreviousFrameCalls");
 
-    if (previousFrameCalls.empty()) {
+    // Find previous frame's FrameBuffer (the one before current recording buffer)
+    int prevBuf = (recordingBuffer + 2) % 3;
+    auto& prevCalls = frameBuffers[prevBuf].recordedCalls;
+
+    if (prevCalls.empty()) {
         // First frame or no previous data — all dirty
         for (auto& call : recordedCalls) {
             call.dirtyFlags = DIRTY_ALL;
@@ -3431,9 +3448,9 @@ void FixedFunctionShader::matchPreviousFrameCalls() {
 
     // Build lookup from previous frame
     std::unordered_map<MeshKey, int, MeshKeyHash> prevLookup;
-    prevLookup.reserve(previousFrameCalls.size());
-    for (int i = 0; i < (int)previousFrameCalls.size(); ++i) {
-        auto& prev = previousFrameCalls[i];
+    prevLookup.reserve(prevCalls.size());
+    for (int i = 0; i < (int)prevCalls.size(); ++i) {
+        auto& prev = prevCalls[i];
         MeshKey key;
         key.vb = prev.rs.vb;
         key.ib = prev.rs.ib;
@@ -3461,7 +3478,7 @@ void FixedFunctionShader::matchPreviousFrameCalls() {
             continue;
         }
 
-        auto& prev = previousFrameCalls[it->second];
+        auto& prev = prevCalls[it->second];
         DWORD flags = DIRTY_NONE;
 
         // Compare world transform (object moved?)
@@ -3566,12 +3583,16 @@ void FixedFunctionShader::stopRecordingAndReplay() {
     device->GetRenderState(D3DRS_ALPHAREF, &postRecordingState.alphaRef);
 
     // Phase 2b: Prepare shader keys (bbox + occluders already done in prepareOcclusionCullingForDepth)
+    // Note: CullThread exists but is not activated here yet — computeShaderKeyWithSuffixes
+    // accesses BSA/texture data that isn't thread-safe. Cull thread will be activated in
+    // Step 4 when FrameBuffer isolation ensures no shared mutable state.
     prepareRecordedCalls();
 
     // Phase 3: Replay all prepared calls (Hi-Z already built by prepareOcclusionCullingForDepth)
     replayRecordedCalls(0);
 
-    // Clear recorded calls after replay
+    // recordedCalls was moved into frameBuffers[recordingBuffer] at end of replay
+    // Clear the moved-from vector to release any residual state
     recordedCalls.clear();
 
     // Clean up HLSL-only texture slots to prevent DXVK descriptor bloat
@@ -3701,6 +3722,32 @@ void FixedFunctionShader::finalizeBatchAndReplay(int sceneCount) {
 
     // Always reset HLSL caches after rendering session completes
     resetHLSLCaches();
+}
+
+// Scene lifecycle stubs for triple-buffered pipeline (Step 1: no-op, infrastructure only)
+void FixedFunctionShader::markSceneStart(int sceneNum, bool isUI) {
+    // Will be used in Step 2+ to track scene boundaries within a FrameBuffer
+    // For now, processAsyncCompletions is called from renderMorrowindHLSL_Internal
+    if (sceneNum == 0 && !isUI) {
+        processAsyncCompletions();
+    }
+}
+
+void FixedFunctionShader::markSceneEnd() {
+    // Will be used in Step 2+ to finalize scene boundaries
+}
+
+// Triple-buffer pipeline pass stubs (Step 1: delegate to existing functions)
+void FixedFunctionShader::executeCullPass(int bufferIndex) {
+    // Will be called by CullThread in Step 2
+    // For now, prepareRecordedCalls() is called inline from stopRecordingAndReplay()
+    prepareRecordedCalls();
+}
+
+void FixedFunctionShader::executeRenderPass(int bufferIndex) {
+    // Will be called by RenderThread in Step 3
+    // For now, replayRecordedCalls() is called inline from stopRecordingAndReplay()
+    replayRecordedCalls(0);
 }
 
 // Compare two LightStates for equality (to detect if we can reuse cached state)
@@ -3875,10 +3922,30 @@ struct FrameSnapshot {
     float recordCameraX, recordCameraY, recordCameraZ;
     std::vector<CallSnapshotInfo> callInfos;  // ALL calls
 
+    // Pipeline control-flow state (from g_pipelineDiag, filled at Present())
+    PipelineDiag pipeline;
+
+    // FFS-side recording state
+    bool ffs_isRecording, ffs_isReplaying;
+    bool ffs_recordingCompletedThisFrame, ffs_recordingEnabled, ffs_manualRecordingControl;
+    int ffs_recordedCallCount;  // static recordedCalls.size()
+    int ffs_recordingBuffer;    // which buffer index was recording
+    // Per-buffer state
+    struct BufferInfo {
+        int callCount;
+        bool valid;
+        int state;  // BufferState enum as int
+    };
+    BufferInfo bufferInfos[3];
+
     FrameSnapshot() : valid(false), totalRecordedCalls(0), sceneLightsTotal(0),
         cameraX(0), cameraY(0), cameraZ(0),
         eyePosX(0), eyePosY(0), eyePosZ(0),
-        recordCameraX(0), recordCameraY(0), recordCameraZ(0) {}
+        recordCameraX(0), recordCameraY(0), recordCameraZ(0),
+        pipeline{}, ffs_isRecording(false), ffs_isReplaying(false),
+        ffs_recordingCompletedThisFrame(false), ffs_recordingEnabled(false),
+        ffs_manualRecordingControl(false), ffs_recordedCallCount(0), ffs_recordingBuffer(0),
+        bufferInfos{} {}
 
     bool saveToFile(const char* path) const {
         FILE* f = fopen(path, "w");
@@ -3890,6 +3957,31 @@ struct FrameSnapshot {
         fprintf(f, "camera=%.2f,%.2f,%.2f\n", cameraX, cameraY, cameraZ);
         fprintf(f, "eyePos=%.2f,%.2f,%.2f\n", eyePosX, eyePosY, eyePosZ);
         fprintf(f, "recordCamera=%.2f,%.2f,%.2f\n", recordCameraX, recordCameraY, recordCameraZ);
+
+        // Pipeline control-flow state
+        fprintf(f, "[pipeline]\n");
+        fprintf(f, "dip=%d,%d,%d,%d,%d,%d\n", pipeline.dipScene0, pipeline.dipScene1plus,
+            pipeline.dipOffscreen, pipeline.dipUI, pipeline.dipStencilShadow, pipeline.dipUnknown);
+        fprintf(f, "sceneCount=%d\n", pipeline.sceneCount);
+        fprintf(f, "flags=%d,%d,%d,%d,%d,%d,%d,%d\n",
+            pipeline.isMainView, pipeline.rendertargetNormal, pipeline.stage0Complete, pipeline.isFrameComplete,
+            pipeline.isHUDComplete, pipeline.isHUDready, pipeline.isStencilScene, pipeline.isAmbientWhite);
+        fprintf(f, "dl=%d,%d\n", pipeline.distantLandReady, pipeline.isPPLActive);
+        fprintf(f, "viewMat=%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+            pipeline.view_11, pipeline.view_12, pipeline.view_13,
+            pipeline.view_41, pipeline.view_42, pipeline.view_43);
+        fprintf(f, "mw=%d,%u\n", pipeline.mwLoaded, (unsigned)pipeline.mwCellAddr);
+
+        // FFS recording state
+        fprintf(f, "[ffs]\n");
+        fprintf(f, "recording=%d,%d,%d,%d,%d\n",
+            ffs_isRecording, ffs_isReplaying, ffs_recordingCompletedThisFrame,
+            ffs_recordingEnabled, ffs_manualRecordingControl);
+        fprintf(f, "recordedCalls=%d\n", ffs_recordedCallCount);
+        fprintf(f, "recordingBuffer=%d\n", ffs_recordingBuffer);
+        for (int i = 0; i < 3; i++) {
+            fprintf(f, "buf%d=%d,%d,%d\n", i, bufferInfos[i].callCount, bufferInfos[i].valid, bufferInfos[i].state);
+        }
 
         for (size_t i = 0; i < callInfos.size(); i++) {
             const auto& c = callInfos[i];
@@ -3923,27 +4015,59 @@ struct FrameSnapshot {
         char line[512];
         CallSnapshotInfo* currentCall = nullptr;
 
+        enum Section { SEC_FRAME, SEC_PIPELINE, SEC_FFS, SEC_CALL } section = SEC_FRAME;
+
         while (fgets(line, sizeof(line), f)) {
             // Strip newline
             size_t len = strlen(line);
             while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = 0;
 
-            if (strncmp(line, "[frame]", 7) == 0) {
-                continue;
-            } else if (strncmp(line, "[call ", 6) == 0) {
+            if (strncmp(line, "[frame]", 7) == 0) { section = SEC_FRAME; continue; }
+            if (strncmp(line, "[pipeline]", 10) == 0) { section = SEC_PIPELINE; continue; }
+            if (strncmp(line, "[ffs]", 5) == 0) { section = SEC_FFS; continue; }
+            if (strncmp(line, "[call ", 6) == 0) {
+                section = SEC_CALL;
                 callInfos.push_back(CallSnapshotInfo{});
                 currentCall = &callInfos.back();
                 memset(currentCall, 0, sizeof(CallSnapshotInfo));
-            } else if (sscanf(line, "totalCalls=%d", &totalRecordedCalls) == 1) {
-                // parsed
-            } else if (sscanf(line, "sceneLights=%d", &sceneLightsTotal) == 1) {
-                // parsed
-            } else if (sscanf(line, "camera=%f,%f,%f", &cameraX, &cameraY, &cameraZ) == 3) {
-                // parsed
-            } else if (sscanf(line, "eyePos=%f,%f,%f", &eyePosX, &eyePosY, &eyePosZ) == 3) {
-                // parsed
-            } else if (sscanf(line, "recordCamera=%f,%f,%f", &recordCameraX, &recordCameraY, &recordCameraZ) == 3) {
-                // parsed
+            } else if (section == SEC_FRAME) {
+                sscanf(line, "totalCalls=%d", &totalRecordedCalls);
+                sscanf(line, "sceneLights=%d", &sceneLightsTotal);
+                sscanf(line, "camera=%f,%f,%f", &cameraX, &cameraY, &cameraZ);
+                sscanf(line, "eyePos=%f,%f,%f", &eyePosX, &eyePosY, &eyePosZ);
+                sscanf(line, "recordCamera=%f,%f,%f", &recordCameraX, &recordCameraY, &recordCameraZ);
+            } else if (section == SEC_PIPELINE) {
+                int i0,i1,i2,i3,i4,i5,i6,i7;
+                unsigned int u0;
+                if (sscanf(line, "dip=%d,%d,%d,%d,%d,%d", &i0,&i1,&i2,&i3,&i4,&i5) == 6) {
+                    pipeline.dipScene0=i0; pipeline.dipScene1plus=i1; pipeline.dipOffscreen=i2;
+                    pipeline.dipUI=i3; pipeline.dipStencilShadow=i4; pipeline.dipUnknown=i5;
+                } else if (sscanf(line, "sceneCount=%d", &pipeline.sceneCount) == 1) {
+                } else if (sscanf(line, "flags=%d,%d,%d,%d,%d,%d,%d,%d", &i0,&i1,&i2,&i3,&i4,&i5,&i6,&i7) == 8) {
+                    pipeline.isMainView=i0; pipeline.rendertargetNormal=i1; pipeline.stage0Complete=i2;
+                    pipeline.isFrameComplete=i3; pipeline.isHUDComplete=i4; pipeline.isHUDready=i5;
+                    pipeline.isStencilScene=i6; pipeline.isAmbientWhite=i7;
+                } else if (sscanf(line, "dl=%d,%d", &i0,&i1) == 2) {
+                    pipeline.distantLandReady=i0; pipeline.isPPLActive=i1;
+                } else if (sscanf(line, "viewMat=%f,%f,%f,%f,%f,%f",
+                    &pipeline.view_11, &pipeline.view_12, &pipeline.view_13,
+                    &pipeline.view_41, &pipeline.view_42, &pipeline.view_43) == 6) {
+                } else if (sscanf(line, "mw=%d,%u", &i0, &u0) == 2) {
+                    pipeline.mwLoaded=i0; pipeline.mwCellAddr=(DWORD)u0;
+                }
+            } else if (section == SEC_FFS) {
+                int i0,i1,i2,i3,i4;
+                if (sscanf(line, "recording=%d,%d,%d,%d,%d", &i0,&i1,&i2,&i3,&i4) == 5) {
+                    ffs_isRecording=i0; ffs_isReplaying=i1; ffs_recordingCompletedThisFrame=i2;
+                    ffs_recordingEnabled=i3; ffs_manualRecordingControl=i4;
+                } else if (sscanf(line, "recordedCalls=%d", &ffs_recordedCallCount) == 1) {
+                } else if (sscanf(line, "recordingBuffer=%d", &ffs_recordingBuffer) == 1) {
+                } else {
+                    int bi, cc, v, s;
+                    if (sscanf(line, "buf%d=%d,%d,%d", &bi, &cc, &v, &s) == 4 && bi >= 0 && bi < 3) {
+                        bufferInfos[bi].callCount=cc; bufferInfos[bi].valid=v; bufferInfos[bi].state=s;
+                    }
+                }
             } else if (currentCall) {
                 unsigned int fvfTmp;
                 if (sscanf(line, "fvf=0x%X prim=%u vert=%u", &fvfTmp, &currentCall->primCount, &currentCall->vertCount) == 3) {
@@ -3989,7 +4113,7 @@ struct FrameSnapshot {
             }
         }
         fclose(f);
-        valid = (totalRecordedCalls > 0);
+        valid = true;  // Pipeline state is valid even with 0 recorded calls (stuck state diagnostic)
         return valid;
     }
 
@@ -4040,6 +4164,78 @@ struct FrameSnapshot {
         fprintf(out, "RecordCamera A: (%.1f, %.1f, %.1f)  B: (%.1f, %.1f, %.1f)\n",
             a.recordCameraX, a.recordCameraY, a.recordCameraZ,
             b.recordCameraX, b.recordCameraY, b.recordCameraZ);
+
+        // Pipeline control-flow state diff
+        fprintf(out, "\n=== PIPELINE STATE ===\n");
+        #define DIAG_DIFF_INT(field, name) \
+            if (a.pipeline.field != b.pipeline.field) \
+                fprintf(out, "DIFF " name ": A=%d B=%d\n", a.pipeline.field, b.pipeline.field); \
+            else \
+                fprintf(out, "SAME " name ": %d\n", a.pipeline.field);
+        #define DIAG_DIFF_BOOL(field, name) \
+            if (a.pipeline.field != b.pipeline.field) \
+                fprintf(out, "DIFF " name ": A=%s B=%s\n", a.pipeline.field?"true":"false", b.pipeline.field?"true":"false"); \
+            else \
+                fprintf(out, "SAME " name ": %s\n", a.pipeline.field?"true":"false");
+
+        DIAG_DIFF_INT(sceneCount, "sceneCount");
+        DIAG_DIFF_BOOL(isMainView, "isMainView");
+        DIAG_DIFF_BOOL(rendertargetNormal, "rendertargetNormal");
+        DIAG_DIFF_BOOL(stage0Complete, "stage0Complete");
+        DIAG_DIFF_BOOL(isFrameComplete, "isFrameComplete");
+        DIAG_DIFF_BOOL(isHUDComplete, "isHUDComplete");
+        DIAG_DIFF_BOOL(isHUDready, "isHUDready");
+        DIAG_DIFF_BOOL(isStencilScene, "isStencilScene");
+        DIAG_DIFF_BOOL(isAmbientWhite, "isAmbientWhite");
+        DIAG_DIFF_BOOL(distantLandReady, "distantLandReady");
+        DIAG_DIFF_BOOL(isPPLActive, "isPPLActive");
+        DIAG_DIFF_BOOL(mwLoaded, "mwLoaded");
+        DIAG_DIFF_INT(dipScene0, "dipScene0");
+        DIAG_DIFF_INT(dipScene1plus, "dipScene1plus");
+        DIAG_DIFF_INT(dipOffscreen, "dipOffscreen");
+        DIAG_DIFF_INT(dipUI, "dipUI");
+        DIAG_DIFF_INT(dipStencilShadow, "dipStencilShadow");
+        DIAG_DIFF_INT(dipUnknown, "dipUnknown");
+
+        fprintf(out, "ViewMatrix A: _11=%.4f _12=%.4f _13=%.4f _41=%.4f _42=%.4f _43=%.4f\n",
+            a.pipeline.view_11, a.pipeline.view_12, a.pipeline.view_13,
+            a.pipeline.view_41, a.pipeline.view_42, a.pipeline.view_43);
+        fprintf(out, "ViewMatrix B: _11=%.4f _12=%.4f _13=%.4f _41=%.4f _42=%.4f _43=%.4f\n",
+            b.pipeline.view_11, b.pipeline.view_12, b.pipeline.view_13,
+            b.pipeline.view_41, b.pipeline.view_42, b.pipeline.view_43);
+        fprintf(out, "MWCellAddr A: 0x%X  B: 0x%X\n", (unsigned)a.pipeline.mwCellAddr, (unsigned)b.pipeline.mwCellAddr);
+
+        // FFS recording state diff
+        fprintf(out, "\n=== FFS RECORDING STATE ===\n");
+        #define FFS_DIFF_BOOL(field, name) \
+            if (a.field != b.field) \
+                fprintf(out, "DIFF " name ": A=%s B=%s\n", a.field?"true":"false", b.field?"true":"false"); \
+            else \
+                fprintf(out, "SAME " name ": %s\n", a.field?"true":"false");
+        #define FFS_DIFF_INT(field, name) \
+            if (a.field != b.field) \
+                fprintf(out, "DIFF " name ": A=%d B=%d\n", a.field, b.field); \
+            else \
+                fprintf(out, "SAME " name ": %d\n", a.field);
+
+        FFS_DIFF_BOOL(ffs_isRecording, "isRecording");
+        FFS_DIFF_BOOL(ffs_isReplaying, "isReplaying");
+        FFS_DIFF_BOOL(ffs_recordingCompletedThisFrame, "recordingCompletedThisFrame");
+        FFS_DIFF_BOOL(ffs_recordingEnabled, "recordingEnabled");
+        FFS_DIFF_BOOL(ffs_manualRecordingControl, "manualRecordingControl");
+        FFS_DIFF_INT(ffs_recordedCallCount, "recordedCallCount");
+        FFS_DIFF_INT(ffs_recordingBuffer, "recordingBuffer");
+
+        for (int i = 0; i < 3; i++) {
+            fprintf(out, "Buffer[%d] A: calls=%d valid=%d state=%d  B: calls=%d valid=%d state=%d\n",
+                i, a.bufferInfos[i].callCount, a.bufferInfos[i].valid, a.bufferInfos[i].state,
+                b.bufferInfos[i].callCount, b.bufferInfos[i].valid, b.bufferInfos[i].state);
+        }
+
+        #undef DIAG_DIFF_INT
+        #undef DIAG_DIFF_BOOL
+        #undef FFS_DIFF_BOOL
+        #undef FFS_DIFF_INT
 
         // Build multimap from A calls by structural key
         std::unordered_multimap<StructuralKey, size_t, StructuralKeyHash> aLookup;
@@ -4330,6 +4526,14 @@ struct FrameSnapshot {
         LOG::logline("  sceneLights: A=%d B=%d", a.sceneLightsTotal, b.sceneLightsTotal);
         LOG::logline("  eyePos A=(%.1f,%.1f,%.1f) B=(%.1f,%.1f,%.1f)",
             a.eyePosX, a.eyePosY, a.eyePosZ, b.eyePosX, b.eyePosY, b.eyePosZ);
+        LOG::logline("  sceneCount: A=%d B=%d | isMainView: A=%d B=%d | dipScene0: A=%d B=%d | dipUI: A=%d B=%d",
+            a.pipeline.sceneCount, b.pipeline.sceneCount,
+            a.pipeline.isMainView, b.pipeline.isMainView,
+            a.pipeline.dipScene0, b.pipeline.dipScene0,
+            a.pipeline.dipUI, b.pipeline.dipUI);
+        LOG::logline("  recordedCallCount: A=%d B=%d | recordingEnabled: A=%d B=%d",
+            a.ffs_recordedCallCount, b.ffs_recordedCallCount,
+            a.ffs_recordingEnabled, b.ffs_recordingEnabled);
         LOG::logline("  Full diff written to mge_snapshot_diff.log");
 
         // Write detailed diff to dedicated file
@@ -4343,6 +4547,146 @@ struct FrameSnapshot {
 
 static FrameSnapshot snapshotA;
 static FrameSnapshot snapshotB;
+
+// Helper: build CallSnapshotInfo vector from a FrameBuffer's recorded calls
+static std::vector<CallSnapshotInfo> buildCallSnapshotsFromBuffer(const std::vector<FixedFunctionShader::HLSLRecordedCall>& calls) {
+    std::vector<CallSnapshotInfo> infos;
+    infos.reserve(calls.size());
+    for (size_t i = 0; i < calls.size(); i++) {
+        const auto& call = calls[i];
+        CallSnapshotInfo info;
+        memset(&info, 0, sizeof(info));
+
+        info.fvf = call.rs.fvf;
+        info.primCount = call.rs.primCount;
+        info.vertCount = call.rs.vertCount;
+        info.alphaTest = call.rs.alphaTest;
+        info.alphaFunc = call.rs.alphaFunc;
+        info.alphaRef = call.rs.alphaRef;
+        info.blendEnable = call.rs.blendEnable;
+        info.srcBlend = call.rs.srcBlend;
+        info.destBlend = call.rs.destBlend;
+        info.shaderKeyDword = *(const DWORD*)&call.sk;
+        info.lightMode = call.sk.lightMode;
+        info.activeStages = call.sk.activeStages;
+        info.posX = call.rs.worldTransforms[0]._41;
+        info.posY = call.rs.worldTransforms[0]._42;
+        info.posZ = call.rs.worldTransforms[0]._43;
+        info.activeCount = call.lightrs ? call.lightrs->active.size() : 0;
+        info.lightsTransformedCount = call.lightrs ? call.lightrs->lightsTransformed.size() : 0;
+        info.hasBoundingBox = call.hasBoundingBox;
+        info.prepared = call.prepared;
+        info.hiZVisible = -1;  // Not available at Present() time
+        info.pointLightCount = 0;
+        info.numPointLightDetails = 0;
+        if (call.lightrs) {
+            for (DWORD id : call.lightrs->active) {
+                auto it = call.lightrs->lights.find(id);
+                if (it != call.lightrs->lights.end() && it->second.type == D3DLIGHT_POINT) {
+                    info.pointLightCount++;
+                    if (info.numPointLightDetails < 3) {
+                        auto& d = info.pointLights[info.numPointLightDetails];
+                        d.id = id;
+                        d.wx = it->second.position.x;
+                        d.wy = it->second.position.y;
+                        d.wz = it->second.position.z;
+                        d.vx = it->second.viewspacePos.x;
+                        d.vy = it->second.viewspacePos.y;
+                        d.vz = it->second.viewspacePos.z;
+                        info.numPointLightDetails++;
+                    }
+                }
+            }
+        }
+        infos.push_back(info);
+    }
+    return infos;
+}
+
+// Fill common snapshot fields from current state
+static void fillSnapshotState(FrameSnapshot& snap) {
+    // Pipeline state from g_pipelineDiag (filled at top of Present())
+    snap.pipeline = g_pipelineDiag;
+
+    // FFS internal state
+    snap.ffs_isRecording = FixedFunctionShader::getIsRecording();
+    snap.ffs_isReplaying = FixedFunctionShader::getIsReplaying();
+    snap.ffs_recordingCompletedThisFrame = false;  // Already reset by this point
+    snap.ffs_recordingEnabled = FixedFunctionShader::getRecordingEnabled();
+    snap.ffs_manualRecordingControl = FixedFunctionShader::getManualRecordingControl();
+    snap.ffs_recordedCallCount = (int)FixedFunctionShader::getRecordedCallsCount();
+    snap.ffs_recordingBuffer = FixedFunctionShader::getRecordingBufferIndex();
+
+    // Per-buffer state
+    for (int i = 0; i < 3; i++) {
+        auto& fb = FixedFunctionShader::getFrameBuffer(i);
+        snap.bufferInfos[i].callCount = (int)fb.recordedCalls.size();
+        snap.bufferInfos[i].valid = fb.valid;
+        snap.bufferInfos[i].state = (int)fb.state;
+    }
+
+    // Camera and eye position
+    snap.eyePosX = DistantLand::eyePos.x;
+    snap.eyePosY = DistantLand::eyePos.y;
+    snap.eyePosZ = DistantLand::eyePos.z;
+    snap.sceneLightsTotal = (int)DistantLand::sceneLights.size();
+
+    // Read recorded calls from the recording buffer (already filled before rotation)
+    auto& fb = FixedFunctionShader::getFrameBuffer(snap.ffs_recordingBuffer);
+    snap.totalRecordedCalls = (int)fb.recordedCalls.size();
+    snap.callInfos = buildCallSnapshotsFromBuffer(fb.recordedCalls);
+
+    // Camera from the buffer's view matrix
+    snap.cameraX = fb.view._41; snap.cameraY = fb.view._42; snap.cameraZ = fb.view._43;
+    snap.recordCameraX = fb.view._41; snap.recordCameraY = fb.view._42; snap.recordCameraZ = fb.view._43;
+
+    snap.valid = true;
+}
+
+void FixedFunctionShader::checkSnapshotHotkeys() {
+    if (!ImGuiManager::GetDebugKeysEnabled()) return;
+
+    // F5: Capture snapshot A and save to disk
+    static bool f5WasPressed = false;
+    bool f5State = (GetAsyncKeyState(VK_F5) & 0x8000) != 0;
+    if (f5State && !f5WasPressed) {
+        fillSnapshotState(snapshotA);
+
+        if (snapshotA.saveToFile("mge_snapshot_A.log")) {
+            LOG::logline("Snapshot A saved to mge_snapshot_A.log (%d calls, sceneCount=%d, isMainView=%d, dipScene0=%d)",
+                snapshotA.totalRecordedCalls, snapshotA.pipeline.sceneCount,
+                snapshotA.pipeline.isMainView, snapshotA.pipeline.dipScene0);
+            StatusOverlay::setStatus("Snapshot A saved to mge_snapshot_A.log");
+        } else {
+            LOG::logline("!! Failed to write mge_snapshot_A.log");
+            StatusOverlay::setStatus("Snapshot A capture failed (file write error)");
+        }
+    }
+    f5WasPressed = f5State;
+
+    // F6: Capture snapshot B, load A from disk, diff
+    static bool f6WasPressed = false;
+    bool f6State = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
+    if (f6State && !f6WasPressed) {
+        fillSnapshotState(snapshotB);
+
+        LOG::logline("Snapshot B captured (%d calls, sceneCount=%d, isMainView=%d, dipScene0=%d)",
+            snapshotB.totalRecordedCalls, snapshotB.pipeline.sceneCount,
+            snapshotB.pipeline.isMainView, snapshotB.pipeline.dipScene0);
+
+        // Load A from disk (supports cross-launch comparison)
+        FrameSnapshot loadedA;
+        if (loadedA.loadFromFile("mge_snapshot_A.log")) {
+            LOG::logline("Loaded snapshot A from disk (%d calls)", loadedA.totalRecordedCalls);
+            FrameSnapshot::logDiff(loadedA, snapshotB);
+            StatusOverlay::setStatus("Snapshot B captured + diff written to mge_snapshot_diff.log");
+        } else {
+            LOG::logline(">> No mge_snapshot_A.log found. Press F5 first at good state, then relaunch.");
+            StatusOverlay::setStatus("No snapshot A on disk. Press F5 first.");
+        }
+    }
+    f6WasPressed = f6State;
+}
 
 void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     {
@@ -4407,134 +4751,6 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
         if (!wasPressed) {
             LOG::logline(">> L key pressed: Saving Hi-Z snapshot...");
             DistantLand::saveHiZSnapshot();
-            wasPressed = true;
-        }
-    } else {
-        static bool wasPressed = false;
-        wasPressed = false;
-    }
-
-    // Helper: build CallSnapshotInfo vector from ALL recorded calls
-    auto buildCallSnapshots = [&]() -> std::vector<CallSnapshotInfo> {
-        std::vector<CallSnapshotInfo> infos;
-        size_t total = recordedCalls.size();
-        infos.reserve(total);
-        for (size_t i = 0; i < total; i++) {
-            const auto& call = recordedCalls[i];
-            CallSnapshotInfo info;
-            memset(&info, 0, sizeof(info));
-
-            // Geometry identity
-            info.fvf = call.rs.fvf;
-            info.primCount = call.rs.primCount;
-            info.vertCount = call.rs.vertCount;
-
-            // Render state
-            info.alphaTest = call.rs.alphaTest;
-            info.alphaFunc = call.rs.alphaFunc;
-            info.alphaRef = call.rs.alphaRef;
-            info.blendEnable = call.rs.blendEnable;
-            info.srcBlend = call.rs.srcBlend;
-            info.destBlend = call.rs.destBlend;
-
-            // Shader key (cast first 32 bits)
-            info.shaderKeyDword = *(const DWORD*)&call.sk;
-            info.lightMode = call.sk.lightMode;
-            info.activeStages = call.sk.activeStages;
-
-            // World position
-            info.posX = call.rs.worldTransforms[0]._41;
-            info.posY = call.rs.worldTransforms[0]._42;
-            info.posZ = call.rs.worldTransforms[0]._43;
-
-            // Light state
-            info.activeCount = call.lightrs ? call.lightrs->active.size() : 0;
-            info.lightsTransformedCount = call.lightrs ? call.lightrs->lightsTransformed.size() : 0;
-            info.hasBoundingBox = call.hasBoundingBox;
-            info.prepared = call.prepared;
-            // Capture Hi-Z visibility from depth pass results
-            if (call.recordMWIndex >= 0 && call.recordMWIndex < (int)visibilityResults.size()) {
-                info.hiZVisible = visibilityResults[call.recordMWIndex];
-            } else {
-                info.hiZVisible = -1;  // Not tested (no recordMW mapping)
-            }
-
-            info.pointLightCount = 0;
-            info.numPointLightDetails = 0;
-            if (call.lightrs) {
-                for (DWORD id : call.lightrs->active) {
-                    auto it = call.lightrs->lights.find(id);
-                    if (it != call.lightrs->lights.end() && it->second.type == D3DLIGHT_POINT) {
-                        info.pointLightCount++;
-                        if (info.numPointLightDetails < 3) {
-                            auto& d = info.pointLights[info.numPointLightDetails];
-                            d.id = id;
-                            d.wx = it->second.position.x;
-                            d.wy = it->second.position.y;
-                            d.wz = it->second.position.z;
-                            d.vx = it->second.viewspacePos.x;
-                            d.vy = it->second.viewspacePos.y;
-                            d.vz = it->second.viewspacePos.z;
-                            info.numPointLightDetails++;
-                        }
-                    }
-                }
-            }
-            infos.push_back(info);
-        }
-        return infos;
-    };
-
-    // F5: Capture snapshot A and save to disk - gated behind debug hotkeys toggle
-    if (ImGuiManager::GetDebugKeysEnabled() && (GetAsyncKeyState(VK_F5) & 0x8000)) {
-        static bool wasPressed = false;
-        if (!wasPressed) {
-            snapshotA.valid = true;
-            snapshotA.totalRecordedCalls = (int)recordedCalls.size();
-            snapshotA.sceneLightsTotal = (int)DistantLand::sceneLights.size();
-            snapshotA.cameraX = currentView._41; snapshotA.cameraY = currentView._42; snapshotA.cameraZ = currentView._43;
-            snapshotA.eyePosX = DistantLand::eyePos.x; snapshotA.eyePosY = DistantLand::eyePos.y; snapshotA.eyePosZ = DistantLand::eyePos.z;
-            snapshotA.recordCameraX = recordingDeviceView._41; snapshotA.recordCameraY = recordingDeviceView._42; snapshotA.recordCameraZ = recordingDeviceView._43;
-            snapshotA.callInfos = buildCallSnapshots();
-
-            if (snapshotA.saveToFile("mge_snapshot_A.log")) {
-                LOG::logline("Snapshot A saved to mge_snapshot_A.log (%d calls)", snapshotA.totalRecordedCalls);
-                StatusOverlay::setStatus("Snapshot A saved to mge_snapshot_A.log");
-            } else {
-                LOG::logline("!! Failed to write mge_snapshot_A.log");
-                StatusOverlay::setStatus("Snapshot A capture failed (file write error)");
-            }
-            wasPressed = true;
-        }
-    } else {
-        static bool wasPressed = false;
-        wasPressed = false;
-    }
-
-    // F6: Capture snapshot B, load A from disk, diff - gated behind debug hotkeys toggle
-    if (ImGuiManager::GetDebugKeysEnabled() && (GetAsyncKeyState(VK_F6) & 0x8000)) {
-        static bool wasPressed = false;
-        if (!wasPressed) {
-            snapshotB.valid = true;
-            snapshotB.totalRecordedCalls = (int)recordedCalls.size();
-            snapshotB.sceneLightsTotal = (int)DistantLand::sceneLights.size();
-            snapshotB.cameraX = currentView._41; snapshotB.cameraY = currentView._42; snapshotB.cameraZ = currentView._43;
-            snapshotB.eyePosX = DistantLand::eyePos.x; snapshotB.eyePosY = DistantLand::eyePos.y; snapshotB.eyePosZ = DistantLand::eyePos.z;
-            snapshotB.recordCameraX = recordingDeviceView._41; snapshotB.recordCameraY = recordingDeviceView._42; snapshotB.recordCameraZ = recordingDeviceView._43;
-            snapshotB.callInfos = buildCallSnapshots();
-
-            LOG::logline("Snapshot B captured (%d calls)", snapshotB.totalRecordedCalls);
-
-            // Load A from disk (supports cross-launch comparison)
-            FrameSnapshot loadedA;
-            if (loadedA.loadFromFile("mge_snapshot_A.log")) {
-                LOG::logline("Loaded snapshot A from disk (%d calls)", loadedA.totalRecordedCalls);
-                FrameSnapshot::logDiff(loadedA, snapshotB);
-                StatusOverlay::setStatus("Snapshot B captured + diff written to mge_snapshot_diff.log");
-            } else {
-                LOG::logline(">> No mge_snapshot_A.log found. Press F5 first at good state, then relaunch.");
-                StatusOverlay::setStatus("No snapshot A on disk. Press F5 first.");
-            }
             wasPressed = true;
         }
     } else {
@@ -5117,9 +5333,10 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
 
     // Note: Camera position is already stored above for next frame's velocity calculation
 
-    // Save current frame's calls for next frame's raycast targeting
-    // Swap is efficient - avoids copying, just exchanges internal pointers
-    std::swap(previousFrameCalls, recordedCalls);
+    // Save current frame's calls into FrameBuffer for cross-frame matching
+    // Move is efficient — just transfers internal pointers
+    frameBuffers[recordingBuffer].recordedCalls = std::move(recordedCalls);
+    frameBuffers[recordingBuffer].state = BufferState::Available;
 
     isReplaying = false;
 }
