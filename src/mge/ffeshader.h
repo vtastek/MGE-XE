@@ -613,7 +613,6 @@ public:
 
 private:
 
-    static std::vector<HLSLRecordedCall> recordedCalls;
     static bool isRecording;
     static bool isReplaying;
     static bool manualRecordingControl;  // When true, user controls recording via K key
@@ -621,10 +620,6 @@ private:
     static bool recordingCompletedThisFrame;  // Prevents restarting recording after Scene 0
     static bool hiZBuiltThisFrame;  // Prevents rebuilding Hi-Z pyramid multiple times per frame
     static bool dumpRequested;  // When true, preserve calls for dump
-
-    // Consistent matrices for entire recording session
-    static D3DXMATRIX recordingDeviceView, recordingDeviceProj;
-    static D3DXMATRIX recordingShadowViewproj[2];
 
     // Bbox cache: maps mesh identifier to object-space bbox (persists across frames)
     static std::unordered_map<MeshKey, ObjectSpaceBBox, MeshKeyHash> bboxCache;
@@ -652,12 +647,12 @@ private:
 
     static void startRecording();
     static void stopRecordingAndReplay();
-    static void prepareRecordedCalls();
+    static void prepareRecordedCalls(int bufferIndex);
     static void recordRenderCall(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, const ShaderKey& sk, int recordMWIdx = -1);
     static void replayRecordedCalls(int sceneCount);
     static void renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, DWORD dirtyFlags = DIRTY_ALL, int callIndex = -1);
     static void validateDeviceState(const ExpectedDeviceState& expected, int callIndex);
-    static void matchPreviousFrameCalls();
+    static void matchPreviousFrameCalls(int bufferIndex);
     static ShaderKey computeShaderKeyWithSuffixes(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);
     static bool computeBoundingBox(const RenderedState* rs, D3DXVECTOR3& bboxMin, D3DXVECTOR3& bboxMax);
 
@@ -690,7 +685,7 @@ public:
     static void setReplayingState(bool replaying) { isReplaying = replaying; }
     static void setManualRecordingControl(bool manual) { manualRecordingControl = manual; }
     static bool getManualRecordingControl() { return manualRecordingControl; }
-    static size_t getRecordedCallsCount() { return recordedCalls.size(); }
+    static size_t getRecordedCallsCount() { return frameBuffers[recordingBuffer].recordedCalls.size(); }
 
     // Visibility results for depth pass (indexed by recordMW)
     static const std::vector<int8_t>& getVisibilityResults() { return visibilityResults; }
@@ -702,7 +697,7 @@ public:
     // Dump control
     static void requestDump() { dumpRequested = true; }
 
-    static const std::vector<HLSLRecordedCall>& getRecordedCalls() { return recordedCalls; }
+    static const std::vector<HLSLRecordedCall>& getRecordedCalls() { return frameBuffers[recordingBuffer].recordedCalls; }
 
 private:
 

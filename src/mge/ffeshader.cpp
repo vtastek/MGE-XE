@@ -56,7 +56,6 @@ FixedFunctionShader::FrameBuffer FixedFunctionShader::frameBuffers[3];
 int FixedFunctionShader::recordingBuffer = 0;
 
 // HLSL Render Dispatch Recording System
-std::vector<FixedFunctionShader::HLSLRecordedCall> FixedFunctionShader::recordedCalls;
 bool FixedFunctionShader::isRecording = false;
 bool FixedFunctionShader::isReplaying = false;
 bool FixedFunctionShader::manualRecordingControl = false;
@@ -71,11 +70,6 @@ static float lastPrepareMs = 0.0f;
 // Diagnostic: cache hit/miss logging for first N frames (temporary)
 static int hlslDiagFrameCounter = 0;
 std::unordered_set<FixedFunctionShader::ShaderKey, FixedFunctionShader::ShaderKey::hasher> FixedFunctionShader::diagHitKeys;
-
-// Consistent matrices for entire recording session
-D3DXMATRIX FixedFunctionShader::recordingDeviceView;
-D3DXMATRIX FixedFunctionShader::recordingDeviceProj;
-D3DXMATRIX FixedFunctionShader::recordingShadowViewproj[2];
 
 // Bbox cache: persists across frames for fast object-space bbox lookup
 std::unordered_map<FixedFunctionShader::MeshKey, FixedFunctionShader::ObjectSpaceBBox, FixedFunctionShader::MeshKeyHash> FixedFunctionShader::bboxCache;
@@ -180,6 +174,38 @@ void (*g_onTextureReleased)(IDirect3DTexture9* realTexture) = nullptr;
 static void onTextureReleased(IDirect3DTexture9* tex) {
     AcquireSRWLockExclusive(&textureSuffixLock);
     textureSuffixResolutionCache.erase(tex);
+    ReleaseSRWLockExclusive(&textureSuffixLock);
+}
+
+// Pre-populate suffix cache during recording (main thread) so that
+// computeShaderKeyWithSuffixes() never needs device calls when called
+// from the cull thread. Device calls (CreateTexture, GetRenderTargetData)
+// are only safe on the main thread.
+static void warmSuffixCache(IDirect3DDevice* dev, IDirect3DTexture9* texture) {
+    if (!texture) return;
+
+    AcquireSRWLockShared(&textureSuffixLock);
+    bool found = textureSuffixResolutionCache.count(texture) > 0;
+    ReleaseSRWLockShared(&textureSuffixLock);
+
+    if (found) return;  // Already cached
+
+    // Expensive path: device calls for hash computation (main thread only)
+    TextureSuffixResolutionCache entry;
+    entry.hash = BSA::calculateTextureHash((IDirect3DDevice9*)dev, texture, false);
+
+    const std::string* textureName = BSA::resolveTextureNameFromHash(entry.hash);
+    if (textureName && entry.hash.crc32 != 0) {
+        entry.textureName = *textureName;
+        entry.hasValidName = true;
+        entry.variants = BSA::getTextureSuffixVariants(textureName->c_str());
+    } else {
+        entry.hasValidName = false;
+        entry.variants = nullptr;
+    }
+
+    AcquireSRWLockExclusive(&textureSuffixLock);
+    textureSuffixResolutionCache.emplace(texture, std::move(entry));
     ReleaseSRWLockExclusive(&textureSuffixLock);
 }
 
@@ -1387,12 +1413,24 @@ FixedFunctionShader::ShaderKey FixedFunctionShader::computeShaderKeyWithSuffixes
     bool hasDiffParam = false, hasParamH = false, hasParamX = false, hasGrass = false;
 
     if (rs->texture) {
-        // Check texture suffix resolution cache first
+        // Check texture suffix resolution cache (protected by shared lock for thread safety)
+        AcquireSRWLockShared(&textureSuffixLock);
         auto cacheIt = textureSuffixResolutionCache.find(rs->texture);
-        if (cacheIt == textureSuffixResolutionCache.end()) {
-            // Not in cache, perform expensive resolution
-            TextureSuffixResolutionCache entry;
+        if (cacheIt != textureSuffixResolutionCache.end()) {
+            // Cache hit — read suffix flags under shared lock
+            if (cacheIt->second.hasValidName && cacheIt->second.variants) {
+                hasDiffParam = cacheIt->second.variants->hasDiffParam() || cacheIt->second.variants->hasDiffParamT();
+                hasParamH = cacheIt->second.variants->hasParamH();
+                hasParamX = cacheIt->second.variants->hasParamX();
+                hasGrass = cacheIt->second.variants->hasGrass();
+            }
+            ReleaseSRWLockShared(&textureSuffixLock);
+        } else {
+            ReleaseSRWLockShared(&textureSuffixLock);
 
+            // Cache miss fallback — perform expensive resolution (main thread only)
+            // In the threaded pipeline, warmSuffixCache() ensures this path rarely executes
+            TextureSuffixResolutionCache entry;
             entry.hash = BSA::calculateTextureHash((IDirect3DDevice9*)device, rs->texture, false);
 
             const std::string* textureName = BSA::resolveTextureNameFromHash(entry.hash);
@@ -1405,15 +1443,17 @@ FixedFunctionShader::ShaderKey FixedFunctionShader::computeShaderKeyWithSuffixes
                 entry.variants = nullptr;
             }
 
-            cacheIt = textureSuffixResolutionCache.emplace(rs->texture, std::move(entry)).first;
-        }
+            // Read suffix flags before moving entry into cache
+            if (entry.hasValidName && entry.variants) {
+                hasDiffParam = entry.variants->hasDiffParam() || entry.variants->hasDiffParamT();
+                hasParamH = entry.variants->hasParamH();
+                hasParamX = entry.variants->hasParamX();
+                hasGrass = entry.variants->hasGrass();
+            }
 
-        // Set texture suffix flags based on actual availability
-        if (cacheIt->second.hasValidName && cacheIt->second.variants) {
-            hasDiffParam = cacheIt->second.variants->hasDiffParam() || cacheIt->second.variants->hasDiffParamT();
-            hasParamH = cacheIt->second.variants->hasParamH();
-            hasParamX = cacheIt->second.variants->hasParamX();
-            hasGrass = cacheIt->second.variants->hasGrass();
+            AcquireSRWLockExclusive(&textureSuffixLock);
+            textureSuffixResolutionCache.emplace(rs->texture, std::move(entry));
+            ReleaseSRWLockExclusive(&textureSuffixLock);
         }
     }
 
@@ -1486,7 +1526,7 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     ShaderKey sk;
     if (isReplaying) {
         // During replay, use the recorded ShaderKey with original suffix flags
-        for (const auto& call : recordedCalls) {
+        for (const auto& call : frameBuffers[recordingBuffer].recordedCalls) {
             if (&call.rs == rs) {
                 sk = call.sk;
                 break;
@@ -1799,8 +1839,8 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     // During replay, use ALL recorded matrices to avoid stale matrix issues
     // During normal rendering, get them from the device
     if (isReplaying) {
-        projMatrix = recordingDeviceProj;
-        viewMatrix = recordingDeviceView;
+        projMatrix = frameBuffers[recordingBuffer].proj;
+        viewMatrix = frameBuffers[recordingBuffer].view;
         worldMatrix = rs->worldTransforms[0];
     } else {
         device->GetTransform(D3DTS_PROJECTION, &projMatrix);
@@ -1812,8 +1852,8 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     D3DXMATRIX worldViewProj, worldView;
     if (isReplaying) {
         // Use pre-recorded combined matrices to avoid any matrix timing issues
-        worldViewProj = rs->worldTransforms[0] * recordingDeviceView * recordingDeviceProj;
-        worldView = rs->worldTransforms[0] * recordingDeviceView;
+        worldViewProj = rs->worldTransforms[0] * frameBuffers[recordingBuffer].view * frameBuffers[recordingBuffer].proj;
+        worldView = rs->worldTransforms[0] * frameBuffers[recordingBuffer].view;
     } else {
         // Normal rendering - calculate from current matrices
         worldViewProj = worldMatrix * viewMatrix * projMatrix;
@@ -3154,6 +3194,9 @@ static int g_currentFrame = 0;
 // Reduces D3D API calls from ~24 to 0-2 per draw call
 static std::unordered_map<IDirect3DBaseTexture9*, std::pair<DWORD, DWORD>> samplerCache;
 
+// Helper: get current recording buffer's calls vector (eliminates static recordedCalls)
+static auto& currentRecordedCalls() { return FixedFunctionShader::frameBuffers[FixedFunctionShader::recordingBuffer].recordedCalls; }
+
 void FixedFunctionShader::startRecording() {
     // Save render states before recording so we can restore after replay
     device->GetRenderState(D3DRS_ALPHABLENDENABLE, &preRecordingState.alphaBlendEnable);
@@ -3174,8 +3217,7 @@ void FixedFunctionShader::startRecording() {
     // Reset HLSL caches for new recording session
     resetHLSLCaches();
 
-    recordedCalls.clear();
-    recordedCalls.reserve(4000);  // Pre-allocate to avoid reallocation spikes
+    currentRecordedCalls().reserve(4000);  // Pre-allocate (already cleared by rotateRecordingBuffer)
     samplerCache.clear();  // Clear sampler cache for new frame
     bboxLookup.clear();  // Clear for new frame (populated during recording)
     // NOTE: Do NOT clear recordMW here - it's populated by inspectIndexedPrimitive()
@@ -3217,19 +3259,13 @@ void FixedFunctionShader::startRecording() {
     // Clear CPU depth buffer for new frame (replaces GPU Hi-Z readback)
     softwareOcclusionCuller.clear();
 
-    // Capture view/projection matrices once at start of recording
+    // Capture view/projection matrices once at start of recording directly into FrameBuffer
     // Note: World transforms are captured per-call in each RenderedState
-    device->GetTransform(D3DTS_VIEW, &recordingDeviceView);
-    device->GetTransform(D3DTS_PROJECTION, &recordingDeviceProj);
-    recordingShadowViewproj[0] = DistantLand::smViewproj[0];
-    recordingShadowViewproj[1] = DistantLand::smViewproj[1];
-
-    // Store into FrameBuffer for triple-buffer pipeline
     auto& fb = frameBuffers[recordingBuffer];
-    fb.view = recordingDeviceView;
-    fb.proj = recordingDeviceProj;
-    fb.shadowViewproj[0] = recordingShadowViewproj[0];
-    fb.shadowViewproj[1] = recordingShadowViewproj[1];
+    device->GetTransform(D3DTS_VIEW, &fb.view);
+    device->GetTransform(D3DTS_PROJECTION, &fb.proj);
+    fb.shadowViewproj[0] = DistantLand::smViewproj[0];
+    fb.shadowViewproj[1] = DistantLand::smViewproj[1];
     fb.state = BufferState::Recording;
     fb.valid = true;
 
@@ -3246,11 +3282,12 @@ void FixedFunctionShader::prepareOcclusionCullingForDepth() {
 
     // Phase 2a: Compute deferred bboxes and rasterize occluders from recorded HLSL calls
     // This must happen before Hi-Z build so the depth pass benefits from culling
-    if (!recordedCalls.empty() && !hiZBuiltThisFrame) {
+    auto& recCalls = currentRecordedCalls();
+    if (!recCalls.empty() && !hiZBuiltThisFrame) {
         // Compute bounding boxes for calls that missed the cache during recording
         {
             MGE_ZoneScopedN("Prepare: BBox Cache Misses");
-            for (auto& call : recordedCalls) {
+            for (auto& call : recCalls) {
                 if (!call.hasBoundingBox) {
                     call.hasBoundingBox = computeBoundingBox(&call.rs, call.bboxMin, call.bboxMax);
                     if (call.hasBoundingBox) {
@@ -3269,9 +3306,10 @@ void FixedFunctionShader::prepareOcclusionCullingForDepth() {
             const float MIN_SCREEN_COVERAGE = 0.01f;
             rasterizedOccluderMeshes.clear();
 
-            D3DXMATRIX viewProj = recordingDeviceView * recordingDeviceProj;
+            auto& fb = frameBuffers[recordingBuffer];
+            D3DXMATRIX viewProj = fb.view * fb.proj;
 
-            for (auto& call : recordedCalls) {
+            for (auto& call : recCalls) {
                 if (occluderCount >= MAX_OCCLUDERS) break;
 
                 const RenderedState* rs = &call.rs;
@@ -3339,7 +3377,7 @@ void FixedFunctionShader::prepareOcclusionCullingForDepth() {
                     rs->vb, rs->vbOffset, rs->vbStride,
                     rs->ib, rs->baseIndex, rs->startIndex, rs->primCount, rs->primType,
                     rs->fvf, rs->worldTransforms[0],
-                    recordingDeviceView, recordingDeviceProj
+                    fb.view, fb.proj
                 );
                 occluderCount++;
             }
@@ -3351,7 +3389,7 @@ void FixedFunctionShader::prepareOcclusionCullingForDepth() {
         MGE_ZoneScopedN("Build Hi-Z Pyramid");
         softwareOcclusionCuller.buildHiZPyramid();
         if (ImGuiManager::GetShowHiZInterface()) {
-            softwareOcclusionCuller.uploadHiZToTexture(reinterpret_cast<IDirect3DDevice9*>(device), ImGuiManager::GetHiZDisplayMip(), recordingDeviceProj, ImGuiManager::GetHiZInvert(), ImGuiManager::GetHiZShowRaycastGrid(), ImGuiManager::GetHiZRaycastStep());
+            softwareOcclusionCuller.uploadHiZToTexture(reinterpret_cast<IDirect3DDevice9*>(device), ImGuiManager::GetHiZDisplayMip(), frameBuffers[recordingBuffer].proj, ImGuiManager::GetHiZInvert(), ImGuiManager::GetHiZShowRaycastGrid(), ImGuiManager::GetHiZRaycastStep());
         }
         hiZBuiltThisFrame = true;
     }
@@ -3431,16 +3469,18 @@ void FixedFunctionShader::prepareOcclusionCullingForDepth() {
 }
 
 // Dirty tracking: match current frame calls to previous frame by MeshKey
-void FixedFunctionShader::matchPreviousFrameCalls() {
+void FixedFunctionShader::matchPreviousFrameCalls(int bufferIndex) {
     MGE_ZoneScopedN("matchPreviousFrameCalls");
 
-    // Find previous frame's FrameBuffer (the one before current recording buffer)
-    int prevBuf = (recordingBuffer + 2) % 3;
+    auto& curCalls = frameBuffers[bufferIndex].recordedCalls;
+
+    // Find previous frame's FrameBuffer (the one before this buffer)
+    int prevBuf = (bufferIndex + 2) % 3;
     auto& prevCalls = frameBuffers[prevBuf].recordedCalls;
 
     if (prevCalls.empty()) {
         // First frame or no previous data — all dirty
-        for (auto& call : recordedCalls) {
+        for (auto& call : curCalls) {
             call.dirtyFlags = DIRTY_ALL;
         }
         return;
@@ -3462,7 +3502,7 @@ void FixedFunctionShader::matchPreviousFrameCalls() {
         prevLookup[key] = i;  // Last wins for duplicates
     }
 
-    for (auto& call : recordedCalls) {
+    for (auto& call : curCalls) {
         MeshKey key;
         key.vb = call.rs.vb;
         key.ib = call.rs.ib;
@@ -3519,10 +3559,11 @@ void FixedFunctionShader::matchPreviousFrameCalls() {
 
 // Phase 2b: Prepare shader keys — runs after recording completes, before replay.
 // BBox computation and occluder rasterization already done in prepareOcclusionCullingForDepth (Phase 2a).
-void FixedFunctionShader::prepareRecordedCalls() {
+void FixedFunctionShader::prepareRecordedCalls(int bufferIndex) {
     MGE_ZoneScopedN("prepareRecordedCalls");
 
-    if (recordedCalls.empty()) {
+    auto& recCalls = frameBuffers[bufferIndex].recordedCalls;
+    if (recCalls.empty()) {
         return;
     }
 
@@ -3532,7 +3573,7 @@ void FixedFunctionShader::prepareRecordedCalls() {
     QueryPerformanceCounter(&prepStartQPC);
     {
         MGE_ZoneScopedN("Prepare: Shader Keys + Bins");
-        for (auto& call : recordedCalls) {
+        for (auto& call : recCalls) {
             call.sk = computeShaderKeyWithSuffixes(&call.rs, &call.frs, call.lightrs.get());
             call.prepared = true;
 
@@ -3547,12 +3588,12 @@ void FixedFunctionShader::prepareRecordedCalls() {
     QueryPerformanceCounter(&prepEndQPC);
     lastPrepareMs = (prepEndQPC.QuadPart - prepStartQPC.QuadPart) * 1000.0f / freqQPC.QuadPart;
     if (lastPrepareMs > ImGuiManager::GetSlowFrameThreshold()) {
-        LOG::logline("SLOW PREPARE: %.1fms for %d calls (Shader Keys + Bins)", lastPrepareMs, (int)recordedCalls.size());
+        LOG::logline("SLOW PREPARE: %.1fms for %d calls (Shader Keys + Bins)", lastPrepareMs, (int)recCalls.size());
     }
 
     // Performance mode: match against previous frame for dirty tracking
     if (ImGuiManager::GetPerformanceMode()) {
-        matchPreviousFrameCalls();
+        matchPreviousFrameCalls(bufferIndex);
     }
 }
 
@@ -3583,17 +3624,13 @@ void FixedFunctionShader::stopRecordingAndReplay() {
     device->GetRenderState(D3DRS_ALPHAREF, &postRecordingState.alphaRef);
 
     // Phase 2b: Prepare shader keys (bbox + occluders already done in prepareOcclusionCullingForDepth)
-    // Note: CullThread exists but is not activated here yet — computeShaderKeyWithSuffixes
-    // accesses BSA/texture data that isn't thread-safe. Cull thread will be activated in
-    // Step 4 when FrameBuffer isolation ensures no shared mutable state.
-    prepareRecordedCalls();
+    prepareRecordedCalls(recordingBuffer);
 
     // Phase 3: Replay all prepared calls (Hi-Z already built by prepareOcclusionCullingForDepth)
     replayRecordedCalls(0);
 
-    // recordedCalls was moved into frameBuffers[recordingBuffer] at end of replay
-    // Clear the moved-from vector to release any residual state
-    recordedCalls.clear();
+    // Data is already in frameBuffers[recordingBuffer].recordedCalls (recorded directly there)
+    // No move or clear needed — buffer ownership transfers via rotateRecordingBuffer()
 
     // Clean up HLSL-only texture slots to prevent DXVK descriptor bloat
     // Use raw SetTexture to truly unbind (setCachedTexture substitutes default textures)
@@ -3636,12 +3673,13 @@ void FixedFunctionShader::finalizeBatchAndReplay(int sceneCount) {
     if (dumpRequested) {
         if (recordingEnabled) {
             // Recording ON: Batch dump
-            LOG::logline("Frame dump: Dumping %d recorded calls (batch)", recordedCalls.size());
+            auto& recCalls = currentRecordedCalls();
+            LOG::logline("Frame dump: Dumping %d recorded calls (batch)", recCalls.size());
             StatusOverlay::setStatus("Frame dump: Batch complete");
 
             char logline[512];
-            for (size_t i = 0; i < recordedCalls.size(); ++i) {
-                const auto& call = recordedCalls[i];
+            for (size_t i = 0; i < recCalls.size(); ++i) {
+                const auto& call = recCalls[i];
                 snprintf(logline, sizeof(logline), "Call %zu: texture=0x%p, vb=0x%p, ib=0x%p, hasShadows=%d, hasParamH=%d (batch)",
                          i, call.rs.texture, call.rs.vb, call.rs.ib,
                          call.sk.hasShadows, call.sk.hasParamH);
@@ -3699,7 +3737,7 @@ void FixedFunctionShader::finalizeBatchAndReplay(int sceneCount) {
             // so it's available for prepareOcclusionCullingForDepth which runs before this
 
             // Scene 0: record, replay, and reset for next cycle
-            if (isRecording && !recordedCalls.empty()) {
+            if (isRecording && !currentRecordedCalls().empty()) {
                 stopRecordingAndReplay();
             }
 
@@ -3710,11 +3748,11 @@ void FixedFunctionShader::finalizeBatchAndReplay(int sceneCount) {
         } else {
             // Scene 1+: don't replay, just clear any stale recordings
             // This ensures hands/UI render normally without HLSL batching
-            recordedCalls.clear();
+            currentRecordedCalls().clear();
         }
     } else {
         // When recording disabled, still clear calls after potential dump
-        recordedCalls.clear();
+        currentRecordedCalls().clear();
     }
 
     // Note: Lights are cleared at start of new frame in startRecording(), not here
@@ -3741,7 +3779,7 @@ void FixedFunctionShader::markSceneEnd() {
 void FixedFunctionShader::executeCullPass(int bufferIndex) {
     // Will be called by CullThread in Step 2
     // For now, prepareRecordedCalls() is called inline from stopRecordingAndReplay()
-    prepareRecordedCalls();
+    prepareRecordedCalls(bufferIndex);
 }
 
 void FixedFunctionShader::executeRenderPass(int bufferIndex) {
@@ -3860,12 +3898,15 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
         }
     }
 
+    // Warm suffix cache on main thread (device calls not safe off main thread)
+    warmSuffixCache(device, rs->texture);
+
     {
-        recordedCalls.emplace_back(rs, frs, sharedLightState, sk, recordMWIdx);
+        currentRecordedCalls().emplace_back(rs, frs, sharedLightState, sk, recordMWIdx);
 
         // Immediately populate bboxLookup so depth pass can use current-frame bboxes
         // (prepareOcclusionCullingForDepth runs BEFORE finalizeBatchAndReplay)
-        const auto& call = recordedCalls.back();
+        const auto& call = currentRecordedCalls().back();
         if (call.hasBoundingBox) {
             VBIBKey key{call.rs.vb, call.rs.ib};
             bboxLookup[key] = {call.bboxMin, call.bboxMax};
@@ -4689,8 +4730,9 @@ void FixedFunctionShader::checkSnapshotHotkeys() {
 }
 
 void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
+    auto& recCalls = currentRecordedCalls();
     {
-        if (recordedCalls.empty()) {
+        if (recCalls.empty()) {
             return;
         }
 
@@ -4713,16 +4755,17 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     }
 
     // Temporarily set shadow matrices to recording state
+    auto& fb = frameBuffers[recordingBuffer];
     savedShadowViewproj[0] = DistantLand::smViewproj[0];
     savedShadowViewproj[1] = DistantLand::smViewproj[1];
-    DistantLand::smViewproj[0] = recordingShadowViewproj[0];
-    DistantLand::smViewproj[1] = recordingShadowViewproj[1];
+    DistantLand::smViewproj[0] = fb.shadowViewproj[0];
+    DistantLand::smViewproj[1] = fb.shadowViewproj[1];
 
     // Calculate view-projection matrix for Hi-Z culling
     viewProj = currentView * currentProj;
 
     // Hi-Z culling statistics
-    int totalCalls = recordedCalls.size();
+    int totalCalls = recCalls.size();
     int culledCalls = 0;
     int callsWithBBox = 0;
     int callsWithoutBBox = 0;
@@ -4778,7 +4821,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     int numSceneLights = (int)DistantLand::sceneLights.size();
     {
         MGE_ZoneScopedN("replay_PerObjectLightPack");
-        const size_t numCallsForPack = recordedCalls.size();
+        const size_t numCallsForPack = recCalls.size();
         perObjectLightInfo.resize(numCallsForPack);
         memset(perObjectLightInfo.data(), 0, numCallsForPack * sizeof(PerObjectLightInfo));
 
@@ -4789,9 +4832,9 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
         int maxPerObjectLights = 0;
 
         for (size_t i = 0; i < numCallsForPack; i++) {
-            if (recordedCalls[i].sk.lightMode != 3) continue;
+            if (recCalls[i].sk.lightMode != 3) continue;
 
-            const auto& call = recordedCalls[i];
+            const auto& call = recCalls[i];
 
             // Bounding box for sphere-AABB intersection test
             // For large meshes, lights can be inside the bbox but far from center
@@ -4929,7 +4972,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     }
 
     // Inline Hi-Z culling using current matrices (same as bbox visualization)
-    const size_t numCalls = recordedCalls.size();
+    const size_t numCalls = recCalls.size();
 
     // Bin statistics
     int binCounts[(int)RenderBin::Count] = {};
@@ -4956,7 +4999,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     MGE_ZoneScopedN("replay_MainLoop");
     bool firstDrawDone = false;
     for (size_t i = 0; i < numCalls; i++) {
-        auto& call = recordedCalls[i];  // Non-const to update shader key
+        auto& call = recCalls[i];  // Non-const to update shader key
 
         // Track bin statistics
         binCounts[(int)call.bin]++;
@@ -5138,7 +5181,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
         double sumPL = 0;
         int litCalls = 0;
         int modeCounts[4] = {0, 0, 0, 0};
-        for (const auto& call : recordedCalls) {
+        for (const auto& call : recCalls) {
             if (call.sk.lightMode < 4) modeCounts[call.sk.lightMode]++;
             if (!call.lightrs) continue;
             int pl = 0;
@@ -5218,8 +5261,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
 
         // Mode 1: Show culled objects only (red boxes) - test directly
         if (debugBBoxMode == 1) {
-            for (size_t i = 0; i < recordedCalls.size(); i++) {
-                const auto& call = recordedCalls[i];
+            for (size_t i = 0; i < recCalls.size(); i++) {
+                const auto& call = recCalls[i];
                 if (!call.hasBoundingBox) continue;
 
                 // Direct occlusion test
@@ -5305,8 +5348,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
 
         // Find and draw the selected object's bbox
         int currentObjectIndex = 0;
-        for (size_t i = 0; i < recordedCalls.size(); i++) {
-            const auto& call = recordedCalls[i];
+        for (size_t i = 0; i < recCalls.size(); i++) {
+            const auto& call = recCalls[i];
 
             // Count only opaque objects with >2 tris (matching selection logic)
             bool isOpaque = !call.rs.blendEnable && call.rs.zWrite;
@@ -5333,9 +5376,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
 
     // Note: Camera position is already stored above for next frame's velocity calculation
 
-    // Save current frame's calls into FrameBuffer for cross-frame matching
-    // Move is efficient — just transfers internal pointers
-    frameBuffers[recordingBuffer].recordedCalls = std::move(recordedCalls);
+    // Data is already in frameBuffers[recordingBuffer].recordedCalls (recorded directly there)
     frameBuffers[recordingBuffer].state = BufferState::Available;
 
     isReplaying = false;
