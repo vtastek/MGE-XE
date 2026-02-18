@@ -532,11 +532,18 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
                 stage0Complete = true;
             }
 
-            // Opaque features
+            // Submit HLSL recording to cull thread BEFORE renderStage1
+            // Cull thread runs prepareRecordedCalls() in parallel with grass/depth rendering
+            FixedFunctionShader::finalizeBatchAndSubmitCull();
+
+            // Opaque features (cull thread runs in parallel with this)
             DistantLand::renderStage1();
 
             // Blend close objects over distant land
             DistantLand::renderStageBlend();
+
+            // Wait for cull completion and replay HLSL draws
+            FixedFunctionShader::waitCullAndReplay();
         } else if (!isFrameComplete) {
             // Draw water if the Morrowind water plane doesn't appear in view
             // it may be too distant or stencil scene order is non-normative

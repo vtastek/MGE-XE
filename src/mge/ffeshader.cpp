@@ -67,6 +67,11 @@ bool FixedFunctionShader::dumpRequested = false;
 // Slow frame detection: prepareMs stored by prepareRecordedCalls, read by replayRecordedCalls
 static float lastPrepareMs = 0.0f;
 
+// Flag: set to false by executeCullPass (cull thread) to prevent device calls in suffix fallback
+// Main thread leaves this true (default). No overlap: main thread doesn't call computeShaderKeyWithSuffixes
+// during cull window (recording is stopped, replay hasn't started).
+bool deviceCallsSafeInPrepare = true;
+
 // Diagnostic: cache hit/miss logging for first N frames (temporary)
 static int hlslDiagFrameCounter = 0;
 std::unordered_set<FixedFunctionShader::ShaderKey, FixedFunctionShader::ShaderKey::hasher> FixedFunctionShader::diagHitKeys;
@@ -105,6 +110,7 @@ FixedFunctionShader::MaterialStateCache FixedFunctionShader::materialCache;
 FixedFunctionShader::TextureBindingCache FixedFunctionShader::textureCache;
 
 FixedFunctionShader::SavedRenderStates FixedFunctionShader::preRecordingState = {};
+FixedFunctionShader::SavedRenderStates FixedFunctionShader::postRecordingState = {};
 
 // Exterior texture binding optimization flags
 bool FixedFunctionShader::isExteriorShadowBound = false;
@@ -1428,32 +1434,36 @@ FixedFunctionShader::ShaderKey FixedFunctionShader::computeShaderKeyWithSuffixes
         } else {
             ReleaseSRWLockShared(&textureSuffixLock);
 
-            // Cache miss fallback — perform expensive resolution (main thread only)
-            // In the threaded pipeline, warmSuffixCache() ensures this path rarely executes
-            TextureSuffixResolutionCache entry;
-            entry.hash = BSA::calculateTextureHash((IDirect3DDevice9*)device, rs->texture, false);
+            if (deviceCallsSafeInPrepare) {
+                // Main thread: perform expensive resolution (original fallback)
+                TextureSuffixResolutionCache entry;
+                entry.hash = BSA::calculateTextureHash((IDirect3DDevice9*)device, rs->texture, false);
 
-            const std::string* textureName = BSA::resolveTextureNameFromHash(entry.hash);
-            if (textureName && entry.hash.crc32 != 0) {
-                entry.textureName = *textureName;
-                entry.hasValidName = true;
-                entry.variants = BSA::getTextureSuffixVariants(textureName->c_str());
+                const std::string* textureName = BSA::resolveTextureNameFromHash(entry.hash);
+                if (textureName && entry.hash.crc32 != 0) {
+                    entry.textureName = *textureName;
+                    entry.hasValidName = true;
+                    entry.variants = BSA::getTextureSuffixVariants(textureName->c_str());
+                } else {
+                    entry.hasValidName = false;
+                    entry.variants = nullptr;
+                }
+
+                if (entry.hasValidName && entry.variants) {
+                    hasDiffParam = entry.variants->hasDiffParam() || entry.variants->hasDiffParamT();
+                    hasParamH = entry.variants->hasParamH();
+                    hasParamX = entry.variants->hasParamX();
+                    hasGrass = entry.variants->hasGrass();
+                }
+
+                AcquireSRWLockExclusive(&textureSuffixLock);
+                textureSuffixResolutionCache.emplace(rs->texture, std::move(entry));
+                ReleaseSRWLockExclusive(&textureSuffixLock);
             } else {
-                entry.hasValidName = false;
-                entry.variants = nullptr;
+                // Cull thread: device calls not safe. warmSuffixCache should have populated
+                // this during recording. Skip suffix detection (default flags = no suffixes).
+                LOG::logline("Warning: suffix cache miss for texture 0x%p on cull thread", rs->texture);
             }
-
-            // Read suffix flags before moving entry into cache
-            if (entry.hasValidName && entry.variants) {
-                hasDiffParam = entry.variants->hasDiffParam() || entry.variants->hasDiffParamT();
-                hasParamH = entry.variants->hasParamH();
-                hasParamX = entry.variants->hasParamX();
-                hasGrass = entry.variants->hasGrass();
-            }
-
-            AcquireSRWLockExclusive(&textureSuffixLock);
-            textureSuffixResolutionCache.emplace(rs->texture, std::move(entry));
-            ReleaseSRWLockExclusive(&textureSuffixLock);
         }
     }
 
@@ -1480,7 +1490,6 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
     }
 
     // Start recording at first HLSL call if not already recording (unless under manual control or disabled)
-    // Don't restart recording if it already completed this frame (Scene 0 finished)
     if (!isRecording && !isReplaying && !manualRecordingControl && recordingEnabled && !recordingCompletedThisFrame && ImGuiManager::GetEnableRecording()) {
         startRecording();
     }
@@ -1502,16 +1511,19 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         return;
     }
 
-    // Normal rendering path (when not recording or replaying) - renders immediately
+    // Immediate path for hands (Scene 1+) and fallback when recording disabled.
+    // Uses game's built-in 8 lights via lightrs, but needs shadow matrices computed.
     if (!ImGuiManager::GetEnableImmediateRendering()) {
         return;  // Skip immediate rendering if disabled
     }
 
-    // Set empty light parameters for immediate rendering (hands/UI don't use texture lights)
-    float lightParams[4] = { 0.0f, 0.0f, 0.0f, 0.0f };  // numLights = 0
-    device->SetPixelShaderConstantF(50, lightParams, 1);
+    // Compute shadow world-view-projection matrices for this draw call
+    // (rs from mged3d8device has zeros — compute from current shadow map VP)
+    RenderedState rsWithShadows = *rs;
+    rsWithShadows.shadowWorldViewProj[0] = rs->worldTransforms[0] * DistantLand::smViewproj[0];
+    rsWithShadows.shadowWorldViewProj[1] = rs->worldTransforms[0] * DistantLand::smViewproj[1];
 
-    renderMorrowindHLSL_Internal(rs, frs, lightrs);
+    renderMorrowindHLSL_Internal(&rsWithShadows, frs, lightrs);
 }
 
 // Internal rendering function that does the actual HLSL rendering
@@ -1535,6 +1547,12 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     } else {
         // During normal rendering, compute ShaderKey with texture suffix detection
         sk = computeShaderKeyWithSuffixes(rs, frs, lightrs);
+
+        // Clamp lightMode to 2 (uniform-based) for immediate path.
+        // Mode 3 (texture-based) requires per-object light packing from prepareRecordedCalls.
+        if (sk.lightMode > 2) {
+            sk.lightMode = 2;
+        }
     }
 
     // Check if Morrowind bound a detail texture to slot 1 (frequency optimization)
@@ -3667,12 +3685,11 @@ void FixedFunctionShader::stopRecordingAndReplay() {
     isReplaying = false;
 }
 
-// Call this when HLSL rendering session is complete to trigger replay
-void FixedFunctionShader::finalizeBatchAndReplay(int sceneCount) {
-    // Handle dump request
+// Step 2: Submit recording to cull thread for async prepare (called before renderStage1)
+void FixedFunctionShader::finalizeBatchAndSubmitCull() {
+    // Handle dump request (same logic as finalizeBatchAndReplay)
     if (dumpRequested) {
         if (recordingEnabled) {
-            // Recording ON: Batch dump
             auto& recCalls = currentRecordedCalls();
             LOG::logline("Frame dump: Dumping %d recorded calls (batch)", recCalls.size());
             StatusOverlay::setStatus("Frame dump: Batch complete");
@@ -3695,71 +3712,148 @@ void FixedFunctionShader::finalizeBatchAndReplay(int sceneCount) {
                 }
             }
         } else {
-            // Recording OFF: Immediate dump was already done per-call
             LOG::logline("Frame dump: Immediate dump complete");
             StatusOverlay::setStatus("Frame dump: Immediate complete");
         }
         dumpRequested = false;
     }
 
+    if (!recordingEnabled || !isRecording || currentRecordedCalls().empty()) {
+        // Nothing to cull — just mark Scene 0 as done
+        isRecording = false;
+        recordingCompletedThisFrame = true;
+        return;
+    }
+
+    isRecording = false;
+
+    // Capture Morrowind's end-of-Scene-0 device state for restoration after replay
+    device->GetRenderState(D3DRS_ALPHABLENDENABLE, &postRecordingState.alphaBlendEnable);
+    device->GetRenderState(D3DRS_ALPHATESTENABLE, &postRecordingState.alphaTestEnable);
+    device->GetRenderState(D3DRS_ZENABLE, &postRecordingState.zEnable);
+    device->GetRenderState(D3DRS_ZWRITEENABLE, &postRecordingState.zWriteEnable);
+    device->GetRenderState(D3DRS_CULLMODE, &postRecordingState.cullMode);
+    device->GetRenderState(D3DRS_SRCBLEND, &postRecordingState.srcBlend);
+    device->GetRenderState(D3DRS_DESTBLEND, &postRecordingState.destBlend);
+    device->GetRenderState(D3DRS_FOGENABLE, &postRecordingState.fogEnable);
+    device->GetRenderState(D3DRS_SPECULARENABLE, &postRecordingState.specularEnable);
+    device->GetRenderState(D3DRS_LOCALVIEWER, &postRecordingState.localViewer);
+    device->GetRenderState(D3DRS_NORMALIZENORMALS, &postRecordingState.normalizeNormals);
+    device->GetRenderState(D3DRS_ZFUNC, &postRecordingState.zFunc);
+    device->GetRenderState(D3DRS_ALPHAFUNC, &postRecordingState.alphaFunc);
+    device->GetRenderState(D3DRS_ALPHAREF, &postRecordingState.alphaRef);
+
+    // Diagnostic: increment frame counter for cache miss/hit logging
+    ++hlslDiagFrameCounter;
+
+    // After frame 5, dump unused precached variants
+    if (hlslDiagFrameCounter == 6) {
+        LOG::logline("-- PRECACHE HIT REPORT: %d keys hit out of %d cached", (int)diagHitKeys.size(), (int)cacheHLSLShaders.size());
+        AcquireSRWLockShared(&hlslCacheLock);
+        for (const auto& entry : cacheHLSLShaders) {
+            const auto& k = entry.first;
+            bool hit = diagHitKeys.count(k) > 0;
+            char buf[256];
+            snprintf(buf, sizeof(buf),
+                "%s lm=%d lit=%d vc=%d vm=%d hl=%d skin=%d fog=%d uv=%d stg=%d shd=%d det=%d dp=%d ph=%d px=%d gr=%d bm=%d tg=%d",
+                hit ? "HIT " : "UNUSED",
+                (int)k.lightMode, (int)k.useLighting, (int)k.vertexColour,
+                (int)k.vertexMaterial, (int)k.heavyLighting,
+                (int)k.usesSkinning, (int)k.fogMode, (int)k.uvSets,
+                (int)k.activeStages,
+                (int)k.hasShadows, (int)k.hasDetail, (int)k.hasDiffParam,
+                (int)k.hasParamH, (int)k.hasParamX, (int)k.hasGrass,
+                (int)k.usesBumpmap, (int)k.usesTexgen);
+            LOG::logline("%s", buf);
+        }
+        ReleaseSRWLockShared(&hlslCacheLock);
+        diagHitKeys.clear();
+    }
+
+    // Submit to cull thread for async prepare
+    int buf = recordingBuffer;
+    frameBuffers[buf].state = BufferState::ReadyToCull;
+
+    if (g_cullThread && g_cullThread->isRunning()) {
+        g_cullThread->submitWork(buf, false);  // false = don't wait
+    } else {
+        // Fallback: no cull thread, run prepare inline
+        executeCullPass(buf);
+        frameBuffers[buf].state = BufferState::ReadyToRender;
+    }
+
+    recordingCompletedThisFrame = true;
+}
+
+// Step 2: Wait for cull completion and replay (called after renderStageBlend)
+void FixedFunctionShader::waitCullAndReplay() {
+    if (!recordingEnabled) return;
+
+    auto& fb = frameBuffers[recordingBuffer];
+    if (fb.state != BufferState::ReadyToCull && fb.state != BufferState::Culling
+        && fb.state != BufferState::ReadyToRender) {
+        return;  // Nothing was submitted
+    }
+
+    // Wait for cull thread to finish (should be done by now — renderStage1+Blend gave it time)
+    if (g_cullThread && g_cullThread->isRunning() && fb.state != BufferState::ReadyToRender) {
+        g_cullThread->waitForCompletion();
+    }
+    fb.state = BufferState::ReadyToRender;
+
+    // Replay all prepared calls
+    replayRecordedCalls(0);
+
+    // Clean up HLSL-only texture slots to prevent DXVK descriptor bloat
+    for (int i = 2; i < 6; i++) {
+        device->SetTexture(i, NULL);
+        textureCache.updateCache(i, nullptr);
+        textureCache.textureValid[i] = false;
+    }
+    device->SetVertexShader(NULL);
+    device->SetPixelShader(NULL);
+
+    // Restore Morrowind's end-of-Scene-0 state
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, postRecordingState.alphaBlendEnable);
+    device->SetRenderState(D3DRS_ALPHATESTENABLE, postRecordingState.alphaTestEnable);
+    device->SetRenderState(D3DRS_ZENABLE, postRecordingState.zEnable);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, postRecordingState.zWriteEnable);
+    device->SetRenderState(D3DRS_CULLMODE, postRecordingState.cullMode);
+    device->SetRenderState(D3DRS_SRCBLEND, postRecordingState.srcBlend);
+    device->SetRenderState(D3DRS_DESTBLEND, postRecordingState.destBlend);
+    device->SetRenderState(D3DRS_FOGENABLE, postRecordingState.fogEnable);
+    device->SetRenderState(D3DRS_SPECULARENABLE, postRecordingState.specularEnable);
+    device->SetRenderState(D3DRS_LOCALVIEWER, postRecordingState.localViewer);
+    device->SetRenderState(D3DRS_NORMALIZENORMALS, postRecordingState.normalizeNormals);
+    device->SetRenderState(D3DRS_ZFUNC, postRecordingState.zFunc);
+    device->SetRenderState(D3DRS_ALPHAFUNC, postRecordingState.alphaFunc);
+    device->SetRenderState(D3DRS_ALPHAREF, postRecordingState.alphaRef);
+
+    isReplaying = false;
+
+    // Reset HLSL caches after rendering session completes
+    resetHLSLCaches();
+}
+
+// Call this when HLSL rendering session is complete to trigger replay
+void FixedFunctionShader::finalizeBatchAndReplay(int sceneCount) {
     if (recordingEnabled) {
-        // Only record/replay Scene 0 (world geometry)
-        // Scene 1+ (hands, sunglare, UI) should render normally without recording
         if (sceneCount == 0) {
-            // Diagnostic: increment frame counter for cache miss/hit logging
-            ++hlslDiagFrameCounter;
-
-            // After frame 5, dump unused precached variants
-            if (hlslDiagFrameCounter == 6) {
-                LOG::logline("-- PRECACHE HIT REPORT: %d keys hit out of %d cached", (int)diagHitKeys.size(), (int)cacheHLSLShaders.size());
-                AcquireSRWLockShared(&hlslCacheLock);
-                for (const auto& entry : cacheHLSLShaders) {
-                    const auto& k = entry.first;
-                    bool hit = diagHitKeys.count(k) > 0;
-                    char buf[256];
-                    snprintf(buf, sizeof(buf),
-                        "%s lm=%d lit=%d vc=%d vm=%d hl=%d skin=%d fog=%d uv=%d stg=%d shd=%d det=%d dp=%d ph=%d px=%d gr=%d bm=%d tg=%d",
-                        hit ? "HIT " : "UNUSED",
-                        (int)k.lightMode, (int)k.useLighting, (int)k.vertexColour,
-                        (int)k.vertexMaterial, (int)k.heavyLighting,
-                        (int)k.usesSkinning, (int)k.fogMode, (int)k.uvSets,
-                        (int)k.activeStages,
-                        (int)k.hasShadows, (int)k.hasDetail, (int)k.hasDiffParam,
-                        (int)k.hasParamH, (int)k.hasParamX, (int)k.hasGrass,
-                        (int)k.usesBumpmap, (int)k.usesTexgen);
-                    LOG::logline("%s", buf);
-                }
-                ReleaseSRWLockShared(&hlslCacheLock);
-                diagHitKeys.clear();
-            }
-
-            // NOTE: bboxLookup is now populated during recording (in recordRenderCall)
-            // so it's available for prepareOcclusionCullingForDepth which runs before this
-
-            // Scene 0: record, replay, and reset for next cycle
-            if (isRecording && !currentRecordedCalls().empty()) {
-                stopRecordingAndReplay();
-            }
-
-            // Ensure clean state for next scene - stop recording to exclude hands/UI
+            // Scene 0: work already done by finalizeBatchAndSubmitCull() + waitCullAndReplay()
+            // Just ensure clean state flags (should already be set, but defensive)
             isRecording = false;
             isReplaying = false;
-            recordingCompletedThisFrame = true;  // Prevent restarting for Scene 1+
+            recordingCompletedThisFrame = true;
         } else {
-            // Scene 1+: don't replay, just clear any stale recordings
-            // This ensures hands/UI render normally without HLSL batching
+            // Scene 1+: hands render via immediate path (with shadow matrices)
             currentRecordedCalls().clear();
+            resetHLSLCaches();
         }
     } else {
         // When recording disabled, still clear calls after potential dump
         currentRecordedCalls().clear();
+        resetHLSLCaches();
     }
-
-    // Note: Lights are cleared at start of new frame in startRecording(), not here
-    // This allows lights to persist across all scenes in a frame (Scene 0, Scene 1 hands, etc.)
-
-    // Always reset HLSL caches after rendering session completes
-    resetHLSLCaches();
 }
 
 // Scene lifecycle stubs for triple-buffered pipeline (Step 1: no-op, infrastructure only)
@@ -3775,10 +3869,11 @@ void FixedFunctionShader::markSceneEnd() {
     // Will be used in Step 2+ to finalize scene boundaries
 }
 
-// Triple-buffer pipeline pass stubs (Step 1: delegate to existing functions)
+// Triple-buffer pipeline: cull pass (called by CullThread or inline on main thread)
 void FixedFunctionShader::executeCullPass(int bufferIndex) {
-    // Will be called by CullThread in Step 2
-    // For now, prepareRecordedCalls() is called inline from stopRecordingAndReplay()
+    // When called from CullThread, device calls are not safe (D3D9 is single-threaded).
+    // When called inline from main thread (no cull thread fallback), device calls are OK.
+    // CullThread::executeCull sets this to false before calling us.
     prepareRecordedCalls(bufferIndex);
 }
 

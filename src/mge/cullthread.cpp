@@ -84,9 +84,17 @@ void CullThread::workerLoop() {
     }
 }
 
+// Flag defined in ffeshader.cpp — prevents device calls in suffix fallback on cull thread
+extern bool deviceCallsSafeInPrepare;
+
 void CullThread::executeCull(int bufferIndex) {
     MGE_ZoneScopedN("executeCull");
+    auto& fb = FixedFunctionShader::getFrameBuffer(bufferIndex);
+    fb.state = FixedFunctionShader::BufferState::Culling;
+    deviceCallsSafeInPrepare = false;
     FixedFunctionShader::executeCullPass(bufferIndex);
+    deviceCallsSafeInPrepare = true;
+    fb.state = FixedFunctionShader::BufferState::ReadyToRender;
 }
 
 void CullThread::submitWork(int bufferIndex, bool waitNow) {

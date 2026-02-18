@@ -375,6 +375,7 @@ class FixedFunctionShader {
         DWORD zFunc, alphaFunc, alphaRef;
     };
     static SavedRenderStates preRecordingState;
+    static SavedRenderStates postRecordingState;  // Saved at end of recording, restored after replay
 
     // Exterior texture binding optimizations
     static bool isExteriorShadowBound;
@@ -658,6 +659,8 @@ private:
 
 public:
     static void finalizeBatchAndReplay(int sceneCount = 0); // Call when HLSL rendering session is complete
+    static void finalizeBatchAndSubmitCull();  // Stop recording, submit to cull thread (before renderStage1)
+    static void waitCullAndReplay();           // Wait for cull, replay, restore state (after renderStageBlend)
 
     // Scene lifecycle for triple-buffered pipeline
     static void markSceneStart(int sceneNum, bool isUI = false);
