@@ -2,6 +2,7 @@
 #include "support/log.h"
 #include "configuration.h"
 #include "ffeshader.h"
+#include <cstdio>
 
 bool ImGuiManager::initialized = false;
 bool ImGuiManager::showDemo = false;
@@ -70,33 +71,41 @@ bool ImGuiManager::rasterizeAll = false;
 bool ImGuiManager::stateLeakDetection = false;
 bool ImGuiManager::performanceMode = true;
 
-// DIP category suppression toggles
-bool ImGuiManager::suppressScene0 = false;
-bool ImGuiManager::suppressScene1Plus = false;
+// Per-bin DIP suppression toggles
+bool ImGuiManager::suppressSky = false;
+bool ImGuiManager::suppressTerrain = false;
+bool ImGuiManager::suppressOpaque = false;
+bool ImGuiManager::suppressSkinning = false;
+bool ImGuiManager::suppressGrass = false;
+bool ImGuiManager::suppressAlphaTested = false;
+bool ImGuiManager::suppressBlending = false;
+bool ImGuiManager::suppress1PSkinning = false;
+bool ImGuiManager::suppress1PAlpha = false;
+bool ImGuiManager::suppress1POther = false;
 bool ImGuiManager::suppressOffscreen = false;
 bool ImGuiManager::suppressUI = false;
 bool ImGuiManager::suppressStencilShadow = false;
 bool ImGuiManager::suppressPreScene = false;
+bool ImGuiManager::suppressWater = false;
 
-// DIP counter stats
-int ImGuiManager::dipScene0 = 0;
-int ImGuiManager::dipScene1Plus = 0;
-int ImGuiManager::dipOffscreen = 0;
-int ImGuiManager::dipUI = 0;
-int ImGuiManager::dipStencilShadow = 0;
-int ImGuiManager::dipPreScene = 0;
+// Per-bin DIP counter stats
+ImGuiManager::DIPBinStats ImGuiManager::dipStats = {};
 
 // DIP spike freeze state
 bool ImGuiManager::dipFrozen = false;
 bool ImGuiManager::dipAutoFreeze = true;
 int ImGuiManager::dipSpikeThreshold = 2000;
-int ImGuiManager::frozenDipScene0 = 0;
-int ImGuiManager::frozenDipScene1Plus = 0;
-int ImGuiManager::frozenDipOffscreen = 0;
-int ImGuiManager::frozenDipUI = 0;
-int ImGuiManager::frozenDipStencilShadow = 0;
-int ImGuiManager::frozenDipPreScene = 0;
+ImGuiManager::DIPBinStats ImGuiManager::frozenDipStats = {};
 int ImGuiManager::frozenTotal = 0;
+
+// Frame event log
+bool ImGuiManager::showFrameEventLog = false;
+std::vector<FrameEvent> ImGuiManager::frameEvents;
+std::vector<FrameEvent> ImGuiManager::displayFrameEvents;
+std::vector<FrameEvent> ImGuiManager::frozenFrameEvents;
+bool ImGuiManager::eventLogFrozen = false;
+bool ImGuiManager::eventLogAutoFreeze = true;
+int ImGuiManager::eventLogFreezeOffscreenThreshold = 1;  // Freeze when offscreen >= 1
 
 // Slow frame detection state
 bool ImGuiManager::slowFrameFrozen = false;
@@ -230,6 +239,11 @@ void ImGuiManager::Render() {
     // Show Hi-Z visualization interface
     if (showHiZInterface) {
         RenderHiZInterface();
+    }
+
+    // Show frame event log
+    if (showFrameEventLog) {
+        RenderFrameEventLog();
     }
 
     ImGui::Render();
@@ -406,13 +420,8 @@ void ImGuiManager::RenderDebugInterface() {
         ImGui::Text("DIP Categories (uncheck to suppress)");
 
         // Choose frozen or live values for display
-        int dispScene0 = dipFrozen ? frozenDipScene0 : dipScene0;
-        int dispScene1Plus = dipFrozen ? frozenDipScene1Plus : dipScene1Plus;
-        int dispOffscreen = dipFrozen ? frozenDipOffscreen : dipOffscreen;
-        int dispUI = dipFrozen ? frozenDipUI : dipUI;
-        int dispStencilShadow = dipFrozen ? frozenDipStencilShadow : dipStencilShadow;
-        int dispPreScene = dipFrozen ? frozenDipPreScene : dipPreScene;
-        int dispTotal = dispScene0 + dispScene1Plus + dispOffscreen + dispUI + dispStencilShadow + dispPreScene;
+        const DIPBinStats& disp = dipFrozen ? frozenDipStats : dipStats;
+        int dispTotal = disp.total();
 
         if (dipFrozen) {
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.3f, 0.3f, 1.0f));
@@ -428,23 +437,55 @@ void ImGuiManager::RenderDebugInterface() {
         ImGui::Checkbox("Auto-freeze on spike", &dipAutoFreeze);
         ImGui::SliderInt("Spike threshold", &dipSpikeThreshold, 500, 10000);
 
-        ImGui::Checkbox("Scene 0 (Main 3D)", &suppressScene0);
-        ImGui::SameLine(); ImGui::Text("= %d", dispScene0);
+        ImGui::Text("Scene 0 (HLSL Recorded):");
+        ImGui::Checkbox("Sky##s0", &suppressSky);
+        ImGui::SameLine(); ImGui::Text("= %d", disp.sky);
+        if (suppressSky) { ImGui::SameLine(); ImGui::TextColored(ImVec4(0.5f,0.5f,1.0f,1.0f), "[wireframe]"); }
 
-        ImGui::Checkbox("Scene 1+ (Hands/Alpha)", &suppressScene1Plus);
-        ImGui::SameLine(); ImGui::Text("= %d", dispScene1Plus);
+        ImGui::Checkbox("Terrain##s0", &suppressTerrain);
+        ImGui::SameLine(); ImGui::Text("= %d", disp.terrain);
 
-        ImGui::Checkbox("Offscreen (Map/Inv)", &suppressOffscreen);
-        ImGui::SameLine(); ImGui::Text("= %d", dispOffscreen);
+        ImGui::Checkbox("Opaque##s0", &suppressOpaque);
+        ImGui::SameLine(); ImGui::Text("= %d", disp.opaque);
 
-        ImGui::Checkbox("UI / Menu", &suppressUI);
-        ImGui::SameLine(); ImGui::Text("= %d", dispUI);
+        ImGui::Checkbox("Skinning##s0", &suppressSkinning);
+        ImGui::SameLine(); ImGui::Text("= %d", disp.skinning);
 
-        ImGui::Checkbox("Stencil Shadow", &suppressStencilShadow);
-        ImGui::SameLine(); ImGui::Text("= %d", dispStencilShadow);
+        ImGui::Checkbox("Grass##s0", &suppressGrass);
+        ImGui::SameLine(); ImGui::Text("= %d", disp.grass);
 
-        ImGui::Checkbox("Pre-Scene", &suppressPreScene);
-        ImGui::SameLine(); ImGui::Text("= %d", dispPreScene);
+        ImGui::Checkbox("Alpha Tested##s0", &suppressAlphaTested);
+        ImGui::SameLine(); ImGui::Text("= %d", disp.alphaTested);
+
+        ImGui::Checkbox("Blending##s0", &suppressBlending);
+        ImGui::SameLine(); ImGui::Text("= %d", disp.blending);
+
+        ImGui::Checkbox("Water##s0", &suppressWater);
+        ImGui::SameLine(); ImGui::Text("= %d", disp.water);
+        if (suppressWater) { ImGui::SameLine(); ImGui::TextColored(ImVec4(0.5f,0.5f,1.0f,1.0f), "[wireframe]"); }
+
+        ImGui::Text("Scene 1+ (First Person / Alpha):");
+        ImGui::Checkbox("1P Skinning (Hands)##s1", &suppress1PSkinning);
+        ImGui::SameLine(); ImGui::Text("= %d", disp.firstPersonSkinning);
+
+        ImGui::Checkbox("1P Alpha (Sorted/Weather)##s1", &suppress1PAlpha);
+        ImGui::SameLine(); ImGui::Text("= %d", disp.firstPersonAlpha);
+
+        ImGui::Checkbox("1P Other##s1", &suppress1POther);
+        ImGui::SameLine(); ImGui::Text("= %d", disp.firstPersonOther);
+
+        ImGui::Text("Pass-through:");
+        ImGui::Checkbox("Offscreen (Map/Inv)##pt", &suppressOffscreen);
+        ImGui::SameLine(); ImGui::Text("= %d", disp.offscreen);
+
+        ImGui::Checkbox("UI / Menu##pt", &suppressUI);
+        ImGui::SameLine(); ImGui::Text("= %d", disp.ui);
+
+        ImGui::Checkbox("Stencil Shadow##pt", &suppressStencilShadow);
+        ImGui::SameLine(); ImGui::Text("= %d", disp.stencilShadow);
+
+        ImGui::Checkbox("Pre-Scene##pt", &suppressPreScene);
+        ImGui::SameLine(); ImGui::Text("= %d", disp.preScene);
 
         ImGui::Separator();
         ImGui::Text("Slow Frame Detection");
@@ -477,7 +518,7 @@ void ImGuiManager::RenderDebugInterface() {
 
     // Update mouse cursor visibility based on interface state
     ImGuiIO& io = ImGui::GetIO();
-    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showFrameEventLog;
 }
 
 void ImGuiManager::ToggleDebugInterface() {
@@ -485,7 +526,7 @@ void ImGuiManager::ToggleDebugInterface() {
 
     // Update mouse cursor visibility
     ImGuiIO& io = ImGui::GetIO();
-    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showFrameEventLog;
 }
 
 // Debug control getters
@@ -506,24 +547,195 @@ void ImGuiManager::UpdateDebugStats(int recordedCalls, int renderedCalls, int cu
     debugImmediateCount = immediateCount;
 }
 
-void ImGuiManager::UpdateDIPStats(int scene0, int scene1plus, int offscreen, int ui, int stencilShadow, int preScene) {
-    dipScene0 = scene0;
-    dipScene1Plus = scene1plus;
-    dipOffscreen = offscreen;
-    dipUI = ui;
-    dipStencilShadow = stencilShadow;
-    dipPreScene = preScene;
+void ImGuiManager::UpdateDIPStats(const DIPBinStats& stats) {
+    dipStats = stats;
 }
 
-void ImGuiManager::FreezeDIPStats(int scene0, int scene1plus, int offscreen, int ui, int stencilShadow, int preScene) {
+void ImGuiManager::FreezeDIPStats(const DIPBinStats& stats) {
     dipFrozen = true;
-    frozenDipScene0 = scene0;
-    frozenDipScene1Plus = scene1plus;
-    frozenDipOffscreen = offscreen;
-    frozenDipUI = ui;
-    frozenDipStencilShadow = stencilShadow;
-    frozenDipPreScene = preScene;
-    frozenTotal = scene0 + scene1plus + offscreen + ui + stencilShadow + preScene;
+    frozenDipStats = stats;
+    frozenTotal = stats.total();
+}
+
+void ImGuiManager::UpdateReplayBinCounts(int terrain, int opaque, int skinning, int grass, int alphaTested, int blending) {
+    dipStats.terrain += terrain;
+    dipStats.opaque += opaque;
+    dipStats.skinning += skinning;
+    dipStats.grass += grass;
+    dipStats.alphaTested += alphaTested;
+    dipStats.blending += blending;
+}
+
+// Frame event log
+void ImGuiManager::LogFrameEvent(FrameEvent::Type type, int sceneNum, int primCount) {
+    frameEvents.push_back({type, sceneNum, primCount});
+}
+
+void ImGuiManager::SnapshotFrameEvents() {
+    // Check auto-freeze trigger before swapping
+    if (eventLogAutoFreeze && !eventLogFrozen && eventLogFreezeOffscreenThreshold > 0) {
+        int offscreenCount = 0;
+        for (const auto& e : frameEvents) {
+            if (e.type == FrameEvent::DIP_Offscreen) offscreenCount++;
+        }
+        if (offscreenCount >= eventLogFreezeOffscreenThreshold) {
+            frozenFrameEvents = frameEvents;  // Copy before swap
+            eventLogFrozen = true;
+        }
+    }
+
+    if (!eventLogFrozen) {
+        displayFrameEvents.swap(frameEvents);
+    }
+    // Always clear the accumulator for next frame
+    frameEvents.clear();
+    frameEvents.reserve(256);
+}
+
+void ImGuiManager::ToggleFrameEventLog() {
+    showFrameEventLog = !showFrameEventLog;
+
+    ImGuiIO& io = ImGui::GetIO();
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showFrameEventLog;
+}
+
+void ImGuiManager::RenderFrameEventLog() {
+    ImGui::SetNextWindowPos(ImVec2(10, 400), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(430, 550), ImGuiCond_FirstUseEver);
+
+    if (ImGui::Begin("Frame Event Log", &showFrameEventLog)) {
+        // Use frozen or live events for display
+        const auto& events = eventLogFrozen ? frozenFrameEvents : displayFrameEvents;
+
+        // Freeze controls
+        if (eventLogFrozen) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.3f, 0.3f, 1.0f));
+            ImGui::Text("FROZEN (%d events)", (int)events.size());
+            ImGui::PopStyleColor();
+            ImGui::SameLine();
+            if (ImGui::Button("Unfreeze")) {
+                eventLogFrozen = false;
+            }
+        } else {
+            ImGui::Text("%d events (live)", (int)events.size());
+            ImGui::SameLine();
+            if (ImGui::Button("Freeze")) {
+                frozenFrameEvents = displayFrameEvents;
+                eventLogFrozen = true;
+            }
+        }
+
+        ImGui::Checkbox("Auto-freeze on offscreen", &eventLogAutoFreeze);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(80);
+        ImGui::InputInt("##offThresh", &eventLogFreezeOffscreenThreshold);
+        if (eventLogFreezeOffscreenThreshold < 0) eventLogFreezeOffscreenThreshold = 0;
+
+        // Print to file button
+        if (ImGui::Button("Print to File")) {
+            PrintFrameEventsToFile();
+        }
+
+        ImGui::Separator();
+
+        // Scrollable list
+        if (ImGui::BeginChild("EventList", ImVec2(0, 0), false)) {
+            // Collapsible summary: count each event type
+            if (ImGui::TreeNode("Summary")) {
+                int counts[(int)FrameEvent::Count] = {};
+                int totalPrims = 0;
+                for (const auto& e : events) {
+                    counts[(int)e.type]++;
+                    totalPrims += e.primCount;
+                }
+                for (int i = 0; i < (int)FrameEvent::Count; i++) {
+                    if (counts[i] > 0) {
+                        ImGui::Text("%-20s %d", FrameEvent::typeName((FrameEvent::Type)i), counts[i]);
+                    }
+                }
+                ImGui::Separator();
+                ImGui::Text("Total primitives: %d", totalPrims);
+                ImGui::TreePop();
+            }
+
+            ImGui::Separator();
+
+            // Color lookup for event types
+            for (int i = 0; i < (int)events.size(); i++) {
+                const auto& e = events[i];
+                ImVec4 color(1.0f, 1.0f, 1.0f, 1.0f);
+
+                // Color-code by category
+                bool isMGEInternal = (e.type >= FrameEvent::MGE_ShadowMap && e.type <= FrameEvent::MGE_SkyRender);
+                if (e.type >= FrameEvent::DIP_Sky && e.type <= FrameEvent::DIP_Water) {
+                    color = ImVec4(0.8f, 1.0f, 0.8f, 1.0f);  // green for DIP
+                } else if (isMGEInternal) {
+                    color = ImVec4(1.0f, 0.7f, 0.5f, 1.0f);  // orange for MGE internal rendering
+                } else if (e.type >= FrameEvent::MGE_Stage0 && e.type <= FrameEvent::MGE_HLSLReplay) {
+                    color = ImVec4(0.8f, 0.8f, 1.0f, 1.0f);  // blue for MGE stage markers
+                } else if (e.type == FrameEvent::BeginScene || e.type == FrameEvent::EndScene) {
+                    color = ImVec4(1.0f, 1.0f, 0.6f, 1.0f);  // yellow for scene boundaries
+                }
+
+                ImGui::PushStyleColor(ImGuiCol_Text, color);
+                if (isMGEInternal && e.primCount > 0) {
+                    ImGui::Text("[%3d] S%d %-20s draws=%d", i, e.sceneNum, FrameEvent::typeName(e.type), e.primCount);
+                } else if (e.primCount > 0) {
+                    ImGui::Text("[%3d] S%d %-20s prims=%d", i, e.sceneNum, FrameEvent::typeName(e.type), e.primCount);
+                } else {
+                    ImGui::Text("[%3d] S%d %s", i, e.sceneNum, FrameEvent::typeName(e.type));
+                }
+                ImGui::PopStyleColor();
+            }
+        }
+        ImGui::EndChild();
+    }
+    ImGui::End();
+}
+
+void ImGuiManager::PrintFrameEventsToFile() {
+    const auto& events = eventLogFrozen ? frozenFrameEvents : displayFrameEvents;
+    if (events.empty()) return;
+
+    // Write to MGE XE log directory
+    FILE* f = fopen("frame_events.txt", "w");
+    if (!f) return;
+
+    fprintf(f, "Frame Event Log (%d events)\n", (int)events.size());
+    fprintf(f, "========================================\n\n");
+
+    // Summary
+    int counts[(int)FrameEvent::Count] = {};
+    int totalPrims = 0;
+    for (const auto& e : events) {
+        counts[(int)e.type]++;
+        totalPrims += e.primCount;
+    }
+    fprintf(f, "Summary:\n");
+    for (int i = 0; i < (int)FrameEvent::Count; i++) {
+        if (counts[i] > 0) {
+            fprintf(f, "  %-20s %d\n", FrameEvent::typeName((FrameEvent::Type)i), counts[i]);
+        }
+    }
+    fprintf(f, "  Total primitives: %d\n\n", totalPrims);
+
+    // Ordered event list
+    fprintf(f, "Events (ordered):\n");
+    fprintf(f, "----------------------------------------\n");
+    for (int i = 0; i < (int)events.size(); i++) {
+        const auto& e = events[i];
+        bool isMGEInternal = (e.type >= FrameEvent::MGE_ShadowMap && e.type <= FrameEvent::MGE_SkyRender);
+        if (isMGEInternal && e.primCount > 0) {
+            fprintf(f, "[%3d] S%d %-20s draws=%d\n", i, e.sceneNum, FrameEvent::typeName(e.type), e.primCount);
+        } else if (e.primCount > 0) {
+            fprintf(f, "[%3d] S%d %-20s prims=%d\n", i, e.sceneNum, FrameEvent::typeName(e.type), e.primCount);
+        } else {
+            fprintf(f, "[%3d] S%d %s\n", i, e.sceneNum, FrameEvent::typeName(e.type));
+        }
+    }
+
+    fclose(f);
+    LOG::logline(">> Frame events written to frame_events.txt (%d events)", (int)events.size());
 }
 
 void ImGuiManager::FreezeSlowFrame(float prepareMs, float replayMs, int worstCallIndex, float worstCallMs, int worstCallPrims, int worstCallBin) {
@@ -636,7 +848,7 @@ void ImGuiManager::RenderHiZInterface() {
 
     // Update mouse cursor visibility based on interface state
     ImGuiIO& io = ImGui::GetIO();
-    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showFrameEventLog;
 }
 
 void ImGuiManager::ToggleHiZInterface() {
@@ -644,7 +856,7 @@ void ImGuiManager::ToggleHiZInterface() {
 
     // Update mouse cursor visibility
     ImGuiIO& io = ImGui::GetIO();
-    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showFrameEventLog;
 }
 
 bool ImGuiManager::GetShowHiZInterface() {

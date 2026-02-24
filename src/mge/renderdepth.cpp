@@ -5,6 +5,7 @@
 #include "ffeshader.h"
 #include "mwbridge.h"
 #include "proxydx/d3d8header.h"
+#include "imgui_manager.h"
 #include "support/log.h"
 #include "mge_tracy.h"
 
@@ -14,6 +15,7 @@
 
 
 void DistantLand::renderDepth() {
+    ImGuiManager::LogFrameEvent(FrameEvent::MGE_Depth, 0, (int)recordMW.size());
     auto mwBridge = MWBridge::get();
 
     // DEBUG: Log that renderDepth is being called
@@ -56,6 +58,7 @@ void DistantLand::renderDepth() {
 }
 
 void DistantLand::renderDepthDistantLand() {
+    ImGuiManager::LogFrameEvent(FrameEvent::MGE_DepthDistant, 0);
     auto mwBridge = MWBridge::get();
 
     // RT is set by caller (renderStage1) to avoid redundant switches
@@ -210,6 +213,7 @@ void DistantLand::renderDepthRecorded() {
 // GPU-only Hi-Z mip generation (non-blocking, ~0.5ms)
 // Called at end of Present() - generates mips on GPU, returns immediately
 void DistantLand::generateHiZMipsGPU() {
+    ImGuiManager::LogFrameEvent(FrameEvent::MGE_HiZGen, 0, hiZValidMips);
     MGE_ZoneScopedN("HiZ_GenerateMipsGPU");
 
     static int callCount = 0;

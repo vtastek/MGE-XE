@@ -5,10 +5,12 @@
 #include "doublesurface.h"
 #include "mwbridge.h"
 #include "postshaders.h"
+#include "imgui_manager.h"
 
 
 
 void DistantLand::renderWaterReflection(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
+    ImGuiManager::LogFrameEvent(FrameEvent::MGE_WaterReflection, 0);
     auto mwBridge = MWBridge::get();
 
     // Switch to render target
@@ -445,6 +447,7 @@ void DistantLand::simulateDynamicWaves() {
 }
 
 void DistantLand::renderWaterPlane() {
+    ImGuiManager::LogFrameEvent(FrameEvent::MGE_WaterPlane, 0, 1);
     D3DXMATRIX m;
     IDirect3DTexture9* texRefract = PostShaders::borrowBuffer(0);
 

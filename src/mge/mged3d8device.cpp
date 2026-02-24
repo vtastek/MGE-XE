@@ -57,18 +57,10 @@ static LightState lightrs;
 static HWND gameWindow = nullptr;
 static bool imguiInitialized = false;
 
-// Per-frame DIP category counters for Tracy profiling
-struct DIPCounters {
-    int scene0;
-    int scene1plus;
-    int offscreen;
-    int ui;
-    int stencilShadow;
-    int unknown;
-    void reset() { memset(this, 0, sizeof(*this)); }
-    int total() const { return scene0 + scene1plus + offscreen + ui + stencilShadow + unknown; }
-};
-static DIPCounters g_dipCounters;
+// Per-frame DIP bin counters (replaces old coarse DIPCounters)
+static ImGuiManager::DIPBinStats g_dipBinStats = {};
+// Keep coarse counters for Tracy log formatting
+static int g_dipScene0 = 0, g_dipScene1plus = 0;
 
 static void initOnLoad();
 static bool detectMenu(const D3DMATRIX* m);
@@ -317,6 +309,18 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
                 }
             }
 
+            // E: Toggle Frame Event Log (gated)
+            if (ImGuiManager::GetDebugKeysEnabled()) {
+                static bool ePressed = false;
+                bool eState = (GetAsyncKeyState('E') & 0x8000) != 0;
+                if (eState && !ePressed) {
+                    ImGuiManager::ToggleFrameEventLog();
+                    ePressed = true;
+                } else if (!eState) {
+                    ePressed = false;
+                }
+            }
+
             {
                 MGE_ZoneScopedN("Present_ImGuiNewFrame");
                 ImGuiManager::NewFrame();
@@ -350,39 +354,44 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
     }
 
     // Log DIP category counters (only when there were actual DIPs)
-    if (g_dipCounters.total() > 0) {
-        static int dipLogCounter = 0;
-        int dipTotal = g_dipCounters.total();
-        bool isSpike = dipTotal >= ImGuiManager::GetDIPSpikeThreshold();
-        if (++dipLogCounter <= 60 || dipLogCounter % 300 == 0 || isSpike) {
-            LOG::logline("%sDIPs: Scene0=%d Scene1+=%d Offscreen=%d UI=%d StencilShadow=%d PreScene=%d Total=%d",
-                isSpike ? "DIP SPIKE! " : "",
-                g_dipCounters.scene0, g_dipCounters.scene1plus,
-                g_dipCounters.offscreen, g_dipCounters.ui,
-                g_dipCounters.stencilShadow, g_dipCounters.unknown,
-                dipTotal);
+    {
+        int dipTotal = g_dipBinStats.total();
+        if (dipTotal > 0) {
+            static int dipLogCounter = 0;
+            bool isSpike = dipTotal >= ImGuiManager::GetDIPSpikeThreshold();
+            if (++dipLogCounter <= 60 || dipLogCounter % 300 == 0 || isSpike) {
+                LOG::logline("%sDIPs: Sky=%d Ter=%d Opq=%d Skin=%d Grass=%d AT=%d Blend=%d 1PS=%d 1PA=%d 1PO=%d Wat=%d Off=%d UI=%d Sten=%d Pre=%d T=%d",
+                    isSpike ? "DIP SPIKE! " : "",
+                    g_dipBinStats.sky, g_dipBinStats.terrain, g_dipBinStats.opaque,
+                    g_dipBinStats.skinning, g_dipBinStats.grass, g_dipBinStats.alphaTested,
+                    g_dipBinStats.blending, g_dipBinStats.firstPersonSkinning,
+                    g_dipBinStats.firstPersonAlpha, g_dipBinStats.firstPersonOther,
+                    g_dipBinStats.water, g_dipBinStats.offscreen, g_dipBinStats.ui,
+                    g_dipBinStats.stencilShadow, g_dipBinStats.preScene, dipTotal);
+            }
+            // Auto-freeze DIP stats on spike
+            if (isSpike && ImGuiManager::GetDIPAutoFreeze() && !ImGuiManager::GetDIPFrozen()) {
+                ImGuiManager::FreezeDIPStats(g_dipBinStats);
+            }
         }
-        // Auto-freeze DIP stats on spike
-        if (isSpike && ImGuiManager::GetDIPAutoFreeze() && !ImGuiManager::GetDIPFrozen()) {
-            ImGuiManager::FreezeDIPStats(g_dipCounters.scene0, g_dipCounters.scene1plus,
-                g_dipCounters.offscreen, g_dipCounters.ui,
-                g_dipCounters.stencilShadow, g_dipCounters.unknown);
-        }
+        ImGuiManager::UpdateDIPStats(g_dipBinStats);
+        g_dipBinStats.reset();
+        g_dipScene0 = 0;
+        g_dipScene1plus = 0;
     }
-    ImGuiManager::UpdateDIPStats(g_dipCounters.scene0, g_dipCounters.scene1plus,
-        g_dipCounters.offscreen, g_dipCounters.ui,
-        g_dipCounters.stencilShadow, g_dipCounters.unknown);
-    g_dipCounters.reset();
+
+    // Snapshot frame events for ImGui display
+    ImGuiManager::SnapshotFrameEvents();
 
     // Fill pipeline diagnostic snapshot (end-of-frame state, before reset)
     {
         auto mwb = MWBridge::get();
-        g_pipelineDiag.dipScene0 = g_dipCounters.scene0;
-        g_pipelineDiag.dipScene1plus = g_dipCounters.scene1plus;
-        g_pipelineDiag.dipOffscreen = g_dipCounters.offscreen;
-        g_pipelineDiag.dipUI = g_dipCounters.ui;
-        g_pipelineDiag.dipStencilShadow = g_dipCounters.stencilShadow;
-        g_pipelineDiag.dipUnknown = g_dipCounters.unknown;
+        g_pipelineDiag.dipScene0 = g_dipScene0;
+        g_pipelineDiag.dipScene1plus = g_dipScene1plus;
+        g_pipelineDiag.dipOffscreen = g_dipBinStats.offscreen;
+        g_pipelineDiag.dipUI = g_dipBinStats.ui;
+        g_pipelineDiag.dipStencilShadow = g_dipBinStats.stencilShadow;
+        g_pipelineDiag.dipUnknown = g_dipBinStats.preScene;
         g_pipelineDiag.sceneCount = sceneCount;
         g_pipelineDiag.isMainView = isMainView;
         g_pipelineDiag.rendertargetNormal = rendertargetNormal;
@@ -456,6 +465,7 @@ HRESULT _stdcall MGEProxyDevice::SetRenderTarget(IDirect3DSurface8* a, IDirect3D
 
     g_passBreaks.raw_setRT++;
     g_passBreaks.raw_setDS++;
+    ImGuiManager::LogFrameEvent(FrameEvent::SetRenderTarget, sceneCount);
     return ProxyDevice::SetRenderTarget(a, b);
 }
 
@@ -468,6 +478,8 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
     if (hr != D3D_OK) {
         return hr;
     }
+
+    ImGuiManager::LogFrameEvent(FrameEvent::BeginScene, sceneCount);
 
     if (mwBridge->IsLoaded() && rendertargetNormal) {
         if (!isHUDready) {
@@ -518,6 +530,8 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
 // EndScene - Multiple scenes per frame, non-alpha / 2x stencil / post-stencil redraw / alpha / 1st person / UI
 // MGE intercepts first scene to draw distant land before it finishes, others it applies shadows to
 HRESULT _stdcall MGEProxyDevice::EndScene() {
+    ImGuiManager::LogFrameEvent(FrameEvent::EndScene, sceneCount);
+
     if (DistantLand::ready && rendertargetNormal) {
         // The following Morrowind scenes get past the filters:
         // ~ Opaque meshes, plus alpha meshes with 'No Sorter' property (which should use alpha test)
@@ -582,6 +596,7 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
 HRESULT _stdcall MGEProxyDevice::Clear(DWORD a, const D3DRECT* b, DWORD c, D3DCOLOR d, float e, DWORD f) {
     g_passBreaks.mw_clear++;
     g_passBreaks.raw_clear++;
+    ImGuiManager::LogFrameEvent(FrameEvent::Clear, sceneCount);
     DistantLand::setHorizonColour(d);
     return ProxyDevice::Clear(a, b, c, d, e, f);
 }
@@ -703,29 +718,53 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
     // Allow distant land to inspect draw calls
     bool isShadowStencil = isStencilScene && stencilRef <= 1;
 
-    // Categorize this DIP for Tracy profiling
+    // Categorize this DIP for Tracy profiling and per-bin counting
+    // Scene 0 mainview non-stencil calls are NOT logged here — they get classified
+    // more precisely downstream (sky/water/HLSL bins via inspectIndexedPrimitive)
     const char* dipCategory;
     static thread_local char dipBuf[32];
+    FrameEvent::Type dipEventType = FrameEvent::Count;  // Count = "don't log yet"
+    bool deferEventLog = false;
     if (!rendertargetNormal) {
         snprintf(dipBuf, sizeof(dipBuf), "DIP_Offscreen_S%d", sceneCount);
         dipCategory = dipBuf;
-        g_dipCounters.offscreen++;
+        dipEventType = FrameEvent::DIP_Offscreen;
+        g_dipBinStats.offscreen++;
     } else if (!isMainView) {
         dipCategory = "DIP_UI";
-        g_dipCounters.ui++;
+        dipEventType = FrameEvent::DIP_UI;
+        g_dipBinStats.ui++;
     } else if (isShadowStencil) {
         dipCategory = "DIP_StencilShadow";
-        g_dipCounters.stencilShadow++;
+        dipEventType = FrameEvent::DIP_StencilShadow;
+        g_dipBinStats.stencilShadow++;
     } else if (sceneCount == 0) {
         dipCategory = "DIP_Scene0";
-        g_dipCounters.scene0++;
+        g_dipScene0++;
+        deferEventLog = true;  // Classified downstream by inspect/water/HLSL replay
     } else if (sceneCount > 0) {
         snprintf(dipBuf, sizeof(dipBuf), "DIP_Scene%d", sceneCount);
         dipCategory = dipBuf;
-        g_dipCounters.scene1plus++;
+        g_dipScene1plus++;
+        // Sub-classify Scene 1+ by render state
+        if (rs.vertexBlendState != 0) {
+            dipEventType = FrameEvent::DIP_1P_Skinning;
+            g_dipBinStats.firstPersonSkinning++;
+        } else if (rs.blendEnable) {
+            dipEventType = FrameEvent::DIP_1P_Alpha;
+            g_dipBinStats.firstPersonAlpha++;
+        } else {
+            dipEventType = FrameEvent::DIP_1P_Other;
+            g_dipBinStats.firstPersonOther++;
+        }
     } else {
         dipCategory = "DIP_PreScene";
-        g_dipCounters.unknown++;
+        dipEventType = FrameEvent::DIP_PreScene;
+        g_dipBinStats.preScene++;
+    }
+
+    if (!deferEventLog) {
+        ImGuiManager::LogFrameEvent(dipEventType, sceneCount, e);
     }
 
 #ifdef TRACY_ENABLE
@@ -738,9 +777,13 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
     if (!rendertargetNormal && ImGuiManager::GetSuppressOffscreen()) return D3D_OK;
     if (!isMainView && rendertargetNormal && ImGuiManager::GetSuppressUI()) return D3D_OK;
     if (isShadowStencil && ImGuiManager::GetSuppressStencilShadow()) return D3D_OK;
-    if (sceneCount == 0 && rendertargetNormal && isMainView && !isShadowStencil && ImGuiManager::GetSuppressScene0()) return D3D_OK;
-    if (sceneCount > 0 && rendertargetNormal && isMainView && !isShadowStencil && ImGuiManager::GetSuppressScene1Plus()) return D3D_OK;
     if (sceneCount < 0 && rendertargetNormal && ImGuiManager::GetSuppressPreScene()) return D3D_OK;
+    // Scene 1+ per-subcategory suppress
+    if (sceneCount > 0 && rendertargetNormal && isMainView && !isShadowStencil) {
+        if (rs.vertexBlendState != 0 && ImGuiManager::GetSuppress1PSkinning()) return D3D_OK;
+        if (rs.vertexBlendState == 0 && rs.blendEnable && ImGuiManager::GetSuppress1PAlpha()) return D3D_OK;
+        if (rs.vertexBlendState == 0 && !rs.blendEnable && ImGuiManager::GetSuppress1POther()) return D3D_OK;
+    }
 
     // Skip stencil shadow rendering entirely in HLSL mode (HLSL has its own shadows)
     if (isShadowStencil && Configuration.PerPixelLightFlags == 2) {
@@ -762,6 +805,15 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
         }
 
         if (isWaterMaterial) {
+            g_dipBinStats.water++;
+            ImGuiManager::LogFrameEvent(FrameEvent::DIP_Water, sceneCount, e);
+            if (ImGuiManager::GetSuppressWater()) {
+                // Render wireframe outline to show water mesh location
+                realDevice->SetRenderState(D3DRS_FILLMODE, D3DFILL_WIREFRAME);
+                HRESULT hr = ProxyDevice::DrawIndexedPrimitive(a, b, c, d, e);
+                realDevice->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
+                return hr;
+            }
             if (distantWater) {
                 // Call distant land instead of drawing water grid
                 if (!waterDrawn) {
@@ -776,6 +828,12 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
                 return D3D_OK;
             }
         }
+    }
+
+    // Log deferred Scene 0 calls that fell through without specific classification
+    // (e.g. fixed-function path, sky without atmosphere scatter)
+    if (deferEventLog) {
+        ImGuiManager::LogFrameEvent(FrameEvent::DIP_Opaque, sceneCount, e);
     }
 
     return ProxyDevice::DrawIndexedPrimitive(a, b, c, d, e);

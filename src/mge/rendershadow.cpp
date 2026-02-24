@@ -4,6 +4,7 @@
 #include "configuration.h"
 #include "mwbridge.h"
 #include "proxydx/d3d8header.h"
+#include "imgui_manager.h"
 #include "support/log.h"
 
 #include <cmath>
@@ -20,6 +21,7 @@ static const float shadowFarRadius = 4000.0;
 // Applies filtering to soften shadow edges
 // This *must* restore render state on return
 void DistantLand::renderShadowMap() {
+    ImGuiManager::LogFrameEvent(FrameEvent::MGE_ShadowMap, 0);
     IDirect3DSurface9* target, *targetSoft;
     texShadow->GetSurfaceLevel(0, &target);
     texSoftShadow->GetSurfaceLevel(0, &targetSoft);
@@ -177,6 +179,7 @@ void DistantLand::renderShadowLayer(int layer, float radius, const D3DXMATRIX* i
 
 // renderShadow - Renders shadows (using blending) over Morrowind shadow receivers
 void DistantLand::renderShadow() {
+    ImGuiManager::LogFrameEvent(FrameEvent::MGE_ShadowOverlay, 0, (int)recordMW.size());
     // Supply view space -> shadow clip space matrix
     D3DXMATRIX inverseView, viewToShadow[2];
     D3DXMatrixInverse(&inverseView, NULL, &mwView);

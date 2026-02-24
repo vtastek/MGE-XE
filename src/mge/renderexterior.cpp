@@ -4,6 +4,7 @@
 #include "configuration.h"
 #include "mwbridge.h"
 #include "proxydx/d3d8header.h"
+#include "imgui_manager.h"
 
 #include <algorithm>
 
@@ -11,6 +12,7 @@
 
 // renderSky - Render atmosphere scattering sky layer and other recorded draw calls on top
 void DistantLand::renderSky() {
+    ImGuiManager::LogFrameEvent(FrameEvent::MGE_SkyRender, 0, (int)recordSky.size());
     // Recorded renders
     const auto& recordSky_const = recordSky;
     const int standardCloudVerts = 65, standardCloudTris = 112;
@@ -85,6 +87,7 @@ void DistantLand::renderSky() {
 }
 
 void DistantLand::renderDistantLand(ID3DXEffect* e, const D3DXMATRIX* view, const D3DXMATRIX* proj) {
+    ImGuiManager::LogFrameEvent(FrameEvent::MGE_DistantLand, 0);
     D3DXMATRIX world, viewproj = (*view) * (*proj);
     D3DXVECTOR4 viewsphere(eyePos.x, eyePos.y, eyePos.z, Configuration.DL.DrawDist * kCellSize);
 
@@ -211,6 +214,7 @@ void DistantLand::cullDistantStatics(const D3DXMATRIX* view, const D3DXMATRIX* p
 }
 
 void DistantLand::renderDistantStatics() {
+    ImGuiManager::LogFrameEvent(FrameEvent::MGE_DistantStatics, 0);
     if (!MWBridge::get()->IsExterior()) {
         // Set clipping to stop large architectural meshes (that don't match exactly)
         // from visible overdrawing and causing z-buffer occlusion

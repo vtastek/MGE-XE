@@ -3996,6 +3996,17 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
     // Warm suffix cache on main thread (device calls not safe off main thread)
     warmSuffixCache(device, rs->texture);
 
+    // Log per-bin frame event (we know the bin from sk and rs at record time)
+    {
+        FrameEvent::Type evType;
+        if (sk.hasGrass)              evType = FrameEvent::DIP_Grass;
+        else if (sk.usesSkinning)     evType = FrameEvent::DIP_Skinning;
+        else if (rs->blendEnable)     evType = FrameEvent::DIP_Blending;
+        else if (rs->alphaTest)       evType = FrameEvent::DIP_AlphaTested;
+        else                          evType = FrameEvent::DIP_Opaque;
+        ImGuiManager::LogFrameEvent(evType, 0, rs->primCount);
+    }
+
     {
         currentRecordedCalls().emplace_back(rs, frs, sharedLightState, sk, recordMWIdx);
 
@@ -4831,6 +4842,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
             return;
         }
 
+        ImGuiManager::LogFrameEvent(FrameEvent::MGE_HLSLReplay, sceneCount, (int)recCalls.size());
+
         // Check if replay is disabled via ImGui
         if (!ImGuiManager::GetEnableReplay()) {
             return;
@@ -5099,6 +5112,17 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
         // Track bin statistics
         binCounts[(int)call.bin]++;
 
+        // Per-bin suppress check
+        switch (call.bin) {
+            case RenderBin::Terrain:    if (ImGuiManager::GetSuppressTerrain()) continue; break;
+            case RenderBin::Opaque:     if (ImGuiManager::GetSuppressOpaque()) continue; break;
+            case RenderBin::Skinning:   if (ImGuiManager::GetSuppressSkinning()) continue; break;
+            case RenderBin::Grass:      if (ImGuiManager::GetSuppressGrass()) continue; break;
+            case RenderBin::AlphaTested:if (ImGuiManager::GetSuppressAlphaTested()) continue; break;
+            case RenderBin::Blending:   if (ImGuiManager::GetSuppressBlending()) continue; break;
+            default: break;
+        }
+
 #ifdef TRACY_ENABLE
         // Emit Tracy zone on bin transition
         if (g_tracyActive && call.bin != currentBin) {
@@ -5265,10 +5289,20 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
                  cacheHits, cacheMisses);
 
     // Log bin statistics
-    LOG::logline("Bins: Opaque=%d Skinning=%d Grass=%d AlphaTested=%d Blending=%d",
+    LOG::logline("Bins: Terrain=%d Opaque=%d Skinning=%d Grass=%d AlphaTested=%d Blending=%d",
+                 binCounts[(int)RenderBin::Terrain],
                  binCounts[(int)RenderBin::Opaque], binCounts[(int)RenderBin::Skinning],
                  binCounts[(int)RenderBin::Grass], binCounts[(int)RenderBin::AlphaTested],
                  binCounts[(int)RenderBin::Blending]);
+
+    // Feed per-bin counts back to ImGui DIP stats (these replace the coarse Scene0 count)
+    ImGuiManager::UpdateReplayBinCounts(
+        binCounts[(int)RenderBin::Terrain],
+        binCounts[(int)RenderBin::Opaque],
+        binCounts[(int)RenderBin::Skinning],
+        binCounts[(int)RenderBin::Grass],
+        binCounts[(int)RenderBin::AlphaTested],
+        binCounts[(int)RenderBin::Blending]);
 
     // Per-frame light summary: scan all calls for point light statistics and mode distribution
     {

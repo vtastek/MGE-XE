@@ -5,6 +5,49 @@
 #include "imgui_impl_win32.h"
 #include "proxydx/d3d9header.h"
 
+#include <vector>
+
+// Frame event log entry — lightweight record of what happened this frame and in what order
+struct FrameEvent {
+    enum Type : uint8_t {
+        Clear, BeginScene, EndScene, SetRenderTarget,
+        DIP_Sky, DIP_Terrain, DIP_Opaque, DIP_Skinning, DIP_Grass,
+        DIP_AlphaTested, DIP_Blending,
+        DIP_1P_Skinning, DIP_1P_Alpha, DIP_1P_Other,
+        DIP_Offscreen, DIP_UI, DIP_StencilShadow, DIP_PreScene, DIP_Water,
+        MGE_Stage0, MGE_Stage1, MGE_StageBlend, MGE_Stage2,
+        MGE_PostProcess, MGE_HLSLReplay,
+        // MGE internal rendering (summarized, primCount = draw call count)
+        MGE_ShadowMap, MGE_DistantLand, MGE_DistantStatics,
+        MGE_Grass, MGE_GrassZ,
+        MGE_ShadowOverlay, MGE_Depth, MGE_DepthDistant,
+        MGE_HiZGen, MGE_WaterReflection, MGE_WaterPlane,
+        MGE_SkyRender,
+        Count
+    };
+    Type type;
+    int sceneNum;       // which scene this occurred in
+    int primCount;      // for DIP events: prim count. For MGE internal: draw call count
+
+    static const char* typeName(Type t) {
+        static const char* names[] = {
+            "Clear", "BeginScene", "EndScene", "SetRenderTarget",
+            "DIP_Sky", "DIP_Terrain", "DIP_Opaque", "DIP_Skinning", "DIP_Grass",
+            "DIP_AlphaTested", "DIP_Blending",
+            "DIP_1P_Skinning", "DIP_1P_Alpha", "DIP_1P_Other",
+            "DIP_Offscreen", "DIP_UI", "DIP_StencilShadow", "DIP_PreScene", "DIP_Water",
+            "MGE_Stage0", "MGE_Stage1", "MGE_StageBlend", "MGE_Stage2",
+            "MGE_PostProcess", "MGE_HLSLReplay",
+            "MGE_ShadowMap", "MGE_DistantLand", "MGE_DistantStatics",
+            "MGE_Grass", "MGE_GrassZ",
+            "MGE_ShadowOverlay", "MGE_Depth", "MGE_DepthDistant",
+            "MGE_HiZGen", "MGE_WaterReflection", "MGE_WaterPlane",
+            "MGE_SkyRender"
+        };
+        return (t < Count) ? names[t] : "Unknown";
+    }
+};
+
 class ImGuiManager {
 public:
     static bool Initialize(HWND hwnd, IDirect3DDevice9* device);
@@ -81,22 +124,50 @@ public:
     static bool GetStateLeakDetection() { return stateLeakDetection; }
     static bool GetPerformanceMode() { return performanceMode; }
 
-    // DIP category suppression toggles
-    static bool GetSuppressScene0() { return suppressScene0; }
-    static bool GetSuppressScene1Plus() { return suppressScene1Plus; }
+    // Per-bin DIP suppression toggles
+    static bool GetSuppressSky() { return suppressSky; }
+    static bool GetSuppressTerrain() { return suppressTerrain; }
+    static bool GetSuppressOpaque() { return suppressOpaque; }
+    static bool GetSuppressSkinning() { return suppressSkinning; }
+    static bool GetSuppressGrass() { return suppressGrass; }
+    static bool GetSuppressAlphaTested() { return suppressAlphaTested; }
+    static bool GetSuppressBlending() { return suppressBlending; }
+    static bool GetSuppress1PSkinning() { return suppress1PSkinning; }
+    static bool GetSuppress1PAlpha() { return suppress1PAlpha; }
+    static bool GetSuppress1POther() { return suppress1POther; }
     static bool GetSuppressOffscreen() { return suppressOffscreen; }
     static bool GetSuppressUI() { return suppressUI; }
     static bool GetSuppressStencilShadow() { return suppressStencilShadow; }
     static bool GetSuppressPreScene() { return suppressPreScene; }
+    static bool GetSuppressWater() { return suppressWater; }
 
-    // DIP counter stats (updated each frame from mged3d8device)
-    static void UpdateDIPStats(int scene0, int scene1plus, int offscreen, int ui, int stencilShadow, int preScene);
+    // Per-bin DIP counter stats
+    struct DIPBinStats {
+        int sky, terrain, opaque, skinning, grass, alphaTested, blending;
+        int firstPersonSkinning, firstPersonAlpha, firstPersonOther;
+        int offscreen, ui, stencilShadow, preScene, water;
+        int total() const { return sky + terrain + opaque + skinning + grass + alphaTested + blending + firstPersonSkinning + firstPersonAlpha + firstPersonOther + offscreen + ui + stencilShadow + preScene + water; }
+        void reset() { memset(this, 0, sizeof(*this)); }
+    };
+    static void UpdateDIPStats(const DIPBinStats& stats);
 
     // DIP spike freeze
     static bool GetDIPFrozen() { return dipFrozen; }
     static bool GetDIPAutoFreeze() { return dipAutoFreeze; }
     static int GetDIPSpikeThreshold() { return dipSpikeThreshold; }
-    static void FreezeDIPStats(int scene0, int scene1plus, int offscreen, int ui, int stencilShadow, int preScene);
+    static void FreezeDIPStats(const DIPBinStats& stats);
+
+    // Per-bin counts from HLSL replay (called from ffeshader.cpp after replay loop)
+    static void UpdateReplayBinCounts(int terrain, int opaque, int skinning, int grass, int alphaTested, int blending);
+    static void IncrementSkyStat() { dipStats.sky++; }
+
+    // Frame event log
+    static void LogFrameEvent(FrameEvent::Type type, int sceneNum, int primCount = 0);
+    static void SnapshotFrameEvents();  // Call at Present() to snapshot for display
+    static void RenderFrameEventLog();
+    static void ToggleFrameEventLog();
+    static bool GetShowFrameEventLog() { return showFrameEventLog; }
+    static void PrintFrameEventsToFile();  // Dump current display events to file
 
     // Slow frame detection
     static float GetSlowFrameThreshold() { return slowFrameThreshold; }
@@ -181,33 +252,41 @@ private:
     static bool stateLeakDetection;       // State leak detection debug mode - default false
     static bool performanceMode;          // Dirty tracking performance mode - default true
 
-    // DIP category suppression toggles
-    static bool suppressScene0;
-    static bool suppressScene1Plus;
+    // Per-bin DIP suppression toggles
+    static bool suppressSky;
+    static bool suppressTerrain;
+    static bool suppressOpaque;
+    static bool suppressSkinning;
+    static bool suppressGrass;
+    static bool suppressAlphaTested;
+    static bool suppressBlending;
+    static bool suppress1PSkinning;
+    static bool suppress1PAlpha;
+    static bool suppress1POther;
     static bool suppressOffscreen;
     static bool suppressUI;
     static bool suppressStencilShadow;
     static bool suppressPreScene;
+    static bool suppressWater;
 
-    // DIP counter stats
-    static int dipScene0;
-    static int dipScene1Plus;
-    static int dipOffscreen;
-    static int dipUI;
-    static int dipStencilShadow;
-    static int dipPreScene;
+    // Per-bin DIP counter stats
+    static DIPBinStats dipStats;
 
     // DIP spike freeze state
     static bool dipFrozen;
     static bool dipAutoFreeze;
     static int dipSpikeThreshold;
-    static int frozenDipScene0;
-    static int frozenDipScene1Plus;
-    static int frozenDipOffscreen;
-    static int frozenDipUI;
-    static int frozenDipStencilShadow;
-    static int frozenDipPreScene;
+    static DIPBinStats frozenDipStats;
     static int frozenTotal;
+
+    // Frame event log
+    static bool showFrameEventLog;
+    static std::vector<FrameEvent> frameEvents;          // Current frame accumulator
+    static std::vector<FrameEvent> displayFrameEvents;   // Snapshot for ImGui display (live or frozen)
+    static std::vector<FrameEvent> frozenFrameEvents;    // Frozen snapshot
+    static bool eventLogFrozen;
+    static bool eventLogAutoFreeze;
+    static int eventLogFreezeOffscreenThreshold;  // Auto-freeze when offscreen DIPs >= this (0=disabled)
 
     // Slow frame detection state
     static bool slowFrameFrozen;

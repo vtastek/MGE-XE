@@ -20,6 +20,7 @@ PassBreakCounters g_passBreaks;
 // renderStage0 - Render distant land at beginning of scene 0, after sky
 void DistantLand::renderStage0() {
     MGE_ZoneScopedN("DL_RenderStage0");
+    ImGuiManager::LogFrameEvent(FrameEvent::MGE_Stage0, 0);
     static int frameNumber = 0;
     LOG::logline("======== FRAME %d START (Scene 0) ========", ++frameNumber);
 
@@ -102,7 +103,7 @@ void DistantLand::renderStage0() {
             }
 
             // Sky scattering and sky objects (should be drawn late as possible)
-            if ((Configuration.MGEFlags & USE_ATM_SCATTER) && mwBridge->CellHasWeather()) {
+            if ((Configuration.MGEFlags & USE_ATM_SCATTER) && mwBridge->CellHasWeather() && !ImGuiManager::GetSuppressSky()) {
                 renderSky();
             }
 
@@ -166,6 +167,7 @@ void DistantLand::renderStage0() {
 // renderStage1 - Render grass and shadows over near features, and write depth texture for scene 0
 void DistantLand::renderStage1() {
     MGE_ZoneScopedN("DL_RenderStage1");
+    ImGuiManager::LogFrameEvent(FrameEvent::MGE_Stage1, 0);
     auto mwBridge = MWBridge::get();
     IDirect3DStateBlock9* stateSaved;
     UINT passes;
@@ -274,6 +276,7 @@ void DistantLand::renderStage1() {
 
 // renderStage2 - Render shadows and depth texture for scenes 1+ (post-stencil redraw/alpha/1st person)
 void DistantLand::renderStage2() {
+    ImGuiManager::LogFrameEvent(FrameEvent::MGE_Stage2, 1);
     auto mwBridge = MWBridge::get();
     IDirect3DStateBlock9* stateSaved;
     UINT passes;
@@ -321,6 +324,7 @@ void DistantLand::renderStage2() {
 
 // renderStageBlend - Blend between MGE distant land and Morrowind, rendering caustics first so it blends out
 void DistantLand::renderStageBlend() {
+    ImGuiManager::LogFrameEvent(FrameEvent::MGE_StageBlend, 0);
     auto mwBridge = MWBridge::get();
     IDirect3DStateBlock9* stateSaved;
     UINT passes;
@@ -671,6 +675,7 @@ void DistantLand::adjustFog() {
 
 // postProcess - Calls post process module, or captures and applies frame cache to avoid rendering
 void DistantLand::postProcess() {
+    ImGuiManager::LogFrameEvent(FrameEvent::MGE_PostProcess, -1);
     if (!isRenderCached) {
         auto mwBridge = MWBridge::get();
 
@@ -1034,6 +1039,8 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
 
     // Special case, capture sky
     if (recordMW.empty() && rs->blendEnable && sceneCount == 0 && mwBridge->CellHasWeather()) {
+        ImGuiManager::LogFrameEvent(FrameEvent::DIP_Sky, sceneCount, rs->primCount);
+        ImGuiManager::IncrementSkyStat();
         recordSky.emplace_back(*rs);
 
         // Check for moon geometry, and mark those records by setting lighting off
@@ -1041,11 +1048,21 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
             recordSky.back().useLighting = false;
         }
 
+        // Sky suppress: render wireframe outline instead of normal rendering
+        if (ImGuiManager::GetSuppressSky()) {
+            device->SetRenderState(D3DRS_FILLMODE, D3DFILL_WIREFRAME);
+            device->DrawIndexedPrimitive(rs->primType, rs->baseIndex, rs->minIndex,
+                rs->vertCount, rs->startIndex, rs->primCount);
+            device->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
+            return false;  // Skip normal DIP
+        }
+
         // If using atmosphere scattering, draw sky later in stage 0
         if ((Configuration.MGEFlags & USE_DISTANT_LAND) && (Configuration.MGEFlags & USE_ATM_SCATTER)) {
             return false;
         }
     } else if (isPPLActive) {
+        // Event logging deferred to recordRenderCall where exact RenderBin is known
         // Render Morrowind with replacement shaders
         // Pass recordMWIdx so HLSL recording can reuse visibility results from depth pass
         FixedFunctionShader::renderMorrowind(rs, frs, lightrs, recordMWIdx);

@@ -3,6 +3,7 @@
 #include "distantshader.h"
 #include "configuration.h"
 #include "mged3d8device.h"
+#include "imgui_manager.h"
 #include "support/log.h"
 
 #include <algorithm>
@@ -115,6 +116,7 @@ void DistantLand::renderGrassInst() {
     if (!hasVisibleGrass()) {
         return;
     }
+    ImGuiManager::LogFrameEvent(FrameEvent::MGE_Grass, 0, (int)batchedGrass.size());
 
     effect->SetMatrixArray(ehShadowViewproj, smViewproj, 2);
     effect->SetTexture(ehTex3, texSoftShadow);
@@ -128,6 +130,7 @@ void DistantLand::renderGrassInstZ() {
     if (!hasVisibleGrass()) {
         return;
     }
+    ImGuiManager::LogFrameEvent(FrameEvent::MGE_GrassZ, 0, (int)batchedGrass.size());
 
     effect->SetBool(ehHasAlpha, true);
     effect->SetFloat(ehAlphaRef, 128.0f / 255.0f);
