@@ -139,6 +139,8 @@ float DistantLand::nearViewRange;
 float DistantLand::windScaling, DistantLand::niceWeather;
 float DistantLand::lightSunMult, DistantLand::lightAmbMult;
 
+DLContext DistantLand::s_staging = {};
+
 D3DXHANDLE DistantLand::ehRcpRes;
 D3DXHANDLE DistantLand::ehShadowRcpRes;
 D3DXHANDLE DistantLand::ehWorld;

@@ -17,6 +17,43 @@ using std::unordered_map;
 
 PassBreakCounters g_passBreaks;
 
+// captureContext - Snapshot current statics into a DLContext for this frame
+DLContext DistantLand::captureContext() {
+    DLContext ctx;
+    ctx.mwView = mwView;
+    ctx.mwProj = mwProj;
+    ctx.eyeVec = eyeVec;
+    ctx.eyePos = eyePos;
+    ctx.sunVec = sunVec;
+    ctx.sunPos = sunPos;
+    ctx.sunVis = sunVis;
+    ctx.sunCol = sunCol;
+    ctx.sunAmb = sunAmb;
+    ctx.ambCol = ambCol;
+    ctx.horizonCol = horizonCol;
+    ctx.nearFogCol = nearFogCol;
+    ctx.atmOutscatter = atmOutscatter;
+    ctx.atmInscatter = atmInscatter;
+    ctx.atmSkylightScatter = atmSkylightScatter;
+    ctx.fogStart = fogStart;
+    ctx.fogEnd = fogEnd;
+    ctx.fogExpStart = fogExpStart;
+    ctx.fogExpDivisor = fogExpDivisor;
+    ctx.fogNearStart = fogNearStart;
+    ctx.fogNearEnd = fogNearEnd;
+    ctx.nearViewRange = nearViewRange;
+    ctx.windScaling = windScaling;
+    ctx.niceWeather = niceWeather;
+    ctx.lightSunMult = lightSunMult;
+    ctx.lightAmbMult = lightAmbMult;
+    memcpy(ctx.smView, smView, sizeof(smView));
+    memcpy(ctx.smProj, smProj, sizeof(smProj));
+    memcpy(ctx.smViewproj, smViewproj, sizeof(smViewproj));
+    ctx.isRenderCached = isRenderCached;
+    ctx.isPPLActive = isPPLActive;
+    return ctx;
+}
+
 // renderStage0 - Render distant land at beginning of scene 0, after sky
 void DistantLand::renderStage0() {
     MGE_ZoneScopedN("DL_RenderStage0");
@@ -49,6 +86,9 @@ void DistantLand::renderStage0() {
 
     isRenderCached &= (Configuration.MGEFlags & USE_MENU_CACHING) && mwBridge->IsMenu();
     isPPLActive = (Configuration.MGEFlags & USE_FFESHADER) && !(Configuration.PerPixelLightFlags == 1 && !mwBridge->IntCurCellAddr());
+
+    // Snapshot all per-frame state into context (foundation for threading)
+    DLContext ctx = captureContext();
 
     if (!isRenderCached) {
         ///LOG::logline("Sky prims: %d", recordSky.size());

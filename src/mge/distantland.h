@@ -17,6 +17,39 @@
 
 struct MGEShader;
 
+// Per-frame rendering context — snapshotted at start of Stage0, passed through all stages.
+// Replaces scattered static variables with explicit data flow for threading readiness.
+struct DLContext {
+    // Camera
+    D3DXMATRIX mwView, mwProj;
+    D3DXVECTOR4 eyeVec, eyePos;
+
+    // Lighting
+    D3DXVECTOR4 sunVec, sunPos;
+    float sunVis;
+    RGBVECTOR sunCol, sunAmb, ambCol;
+    RGBVECTOR horizonCol, nearFogCol;
+
+    // Atmosphere
+    RGBVECTOR atmOutscatter, atmInscatter;
+    D3DXVECTOR4 atmSkylightScatter;
+
+    // Fog
+    float fogStart, fogEnd;
+    float fogExpStart, fogExpDivisor;
+    float fogNearStart, fogNearEnd;
+    float nearViewRange;
+    float windScaling, niceWeather;
+    float lightSunMult, lightAmbMult;
+
+    // Shadow (written by renderShadowMap in Stage0, read by Stage1/2)
+    D3DXMATRIX smView[2], smProj[2], smViewproj[2];
+
+    // Flags
+    bool isRenderCached;
+    bool isPPLActive;
+};
+
 class DistantLand {
 public:
     struct DynamicVisGroup {
@@ -224,6 +257,10 @@ public:
     static void setScattering(const RGBVECTOR& out, const RGBVECTOR& in);
     static void adjustFog();
     static bool inspectIndexedPrimitive(int sceneCount, const RenderedState* rs, const FragmentState* frs, LightState* lightrs);
+
+    // Staging context — setters write here, captureContext() snapshots to DLContext
+    static DLContext s_staging;
+    static DLContext captureContext();
 
     static void renderSky();
     static void renderStage0();
