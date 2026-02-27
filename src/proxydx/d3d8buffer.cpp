@@ -63,7 +63,6 @@ HRESULT _stdcall ProxyVertexBuffer::Lock(UINT OffsetToLock, UINT SizeToLock, BYT
     HRESULT hr = realBuffer->Lock(OffsetToLock, SizeToLock, (void**)ppbData, Flags);
 
     if (SUCCEEDED(hr) && ppbData && *ppbData) {
-        // Notify resource tracker about lock
         ResourceTracker::getInstance().onVertexBufferLock(realBuffer, *ppbData, OffsetToLock, SizeToLock, Flags);
     }
 
@@ -71,7 +70,6 @@ HRESULT _stdcall ProxyVertexBuffer::Lock(UINT OffsetToLock, UINT SizeToLock, BYT
 }
 
 HRESULT _stdcall ProxyVertexBuffer::Unlock() {
-    // Notify resource tracker before unlock
     ResourceTracker::getInstance().onVertexBufferUnlock(realBuffer);
 
     return realBuffer->Unlock();
@@ -143,7 +141,6 @@ HRESULT _stdcall ProxyIndexBuffer::Lock(UINT OffsetToLock, UINT SizeToLock, BYTE
     HRESULT hr = realBuffer->Lock(OffsetToLock, SizeToLock, (void**)ppbData, Flags);
 
     if (SUCCEEDED(hr) && ppbData && *ppbData) {
-        // Notify resource tracker about lock
         ResourceTracker::getInstance().onIndexBufferLock(realBuffer, *ppbData, OffsetToLock, SizeToLock, Flags);
     }
 
@@ -151,7 +148,6 @@ HRESULT _stdcall ProxyIndexBuffer::Lock(UINT OffsetToLock, UINT SizeToLock, BYTE
 }
 
 HRESULT _stdcall ProxyIndexBuffer::Unlock() {
-    // Notify resource tracker before unlock
     ResourceTracker::getInstance().onIndexBufferUnlock(realBuffer);
 
     return realBuffer->Unlock();

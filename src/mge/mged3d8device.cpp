@@ -60,9 +60,17 @@ static int g_rtRequested = 0, g_rtForwarded = 0, g_rtSuppressed = 0;
 static int g_copyRectsTotal = 0, g_copyRectsSuppressed = 0;
 
 // Offscreen amortization — limit offscreen scenes per frame
-static const int OFFSCREEN_BUDGET = 0;  // max offscreen scenes forwarded per frame (0 = suppress all for testing)
 static int g_offscreenScenesThisFrame = 0;
 static bool g_suppressingCurrentScene = false;  // true when current offscreen scene is over budget
+
+// Offscreen scene collapsing — keep one device-level scene open for all offscreen work
+static bool g_offscreenMegaScene = false;  // true when device has an open scene for offscreen rendering
+
+// Offscreen local map timing
+static LARGE_INTEGER g_offscreenStartQPC = {};
+static bool g_offscreenTimingActive = false;
+static int g_offscreenDIPs = 0;
+static int g_offscreenScenes = 0;
 
 static bool zoomSensSaved;
 static float zoomSensX, zoomSensY;
@@ -447,12 +455,12 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         sceneForwarded = false;
         rtPending = false;
 
-        // Log deferral stats on frames with suppressed scenes (local map frames)
-        if (g_scenesSuppressed > 0 || g_rtSuppressed > 0 || g_copyRectsTotal > 0) {
-            LOG::logline("Deferral: scenes %d/%d/%d RT %d/%d/%d offscreen %d/%d CopyRects %d/%d (req/fwd/supp)",
+        // Log deferral stats on frames with offscreen scenes
+        if (g_offscreenScenesThisFrame > 0 || g_copyRectsTotal > 0) {
+            LOG::logline("Deferral: scenes %d/%d/%d RT %d/%d/%d offscreen %d (mega-scene) CopyRects %d/%d",
                 g_scenesRequested, g_scenesForwarded, g_scenesSuppressed,
                 g_rtRequested, g_rtForwarded, g_rtSuppressed,
-                g_offscreenScenesThisFrame, OFFSCREEN_BUDGET,
+                g_offscreenScenesThisFrame,
                 g_copyRectsTotal, g_copyRectsSuppressed);
         }
         g_scenesRequested = g_scenesForwarded = g_scenesSuppressed = 0;
@@ -460,6 +468,11 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         g_copyRectsTotal = g_copyRectsSuppressed = 0;
         g_offscreenScenesThisFrame = 0;
         g_suppressingCurrentScene = false;
+        // Safety: close mega-scene if still open at Present
+        if (g_offscreenMegaScene) {
+            ProxyDevice::EndScene();
+            g_offscreenMegaScene = false;
+        }
 
         // Stamp current camera into the FrameBuffer that just finished recording
         // (for future render pass to use fresh matrices instead of stale recording-time ones)
@@ -555,11 +568,33 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
     sceneForwarded = false;
     g_scenesRequested++;
 
-    // Offscreen amortization: suppress scenes beyond per-frame budget
+    // Offscreen scene collapsing: keep one device-level scene open for all offscreen work
+    // This eliminates per-scene DXVK command buffer submissions
     if (!rendertargetNormal) {
-        g_suppressingCurrentScene = (g_offscreenScenesThisFrame >= OFFSCREEN_BUDGET);
+        g_suppressingCurrentScene = false;
+        if (!g_offscreenTimingActive) {
+            QueryPerformanceCounter(&g_offscreenStartQPC);
+            g_offscreenTimingActive = true;
+            g_offscreenDIPs = 0;
+            g_offscreenScenes = 0;
+        }
+        g_offscreenScenes++;
+        if (!g_offscreenMegaScene) {
+            // First offscreen scene: open device scene, keep it open for all subsequent offscreen work
+            flushPendingRT();
+            ProxyDevice::BeginScene();
+            g_offscreenMegaScene = true;
+        }
+        // Device is already in a scene — mark as forwarded so draws go through
+        sceneForwarded = true;
+        scenePending = false;
     } else {
         g_suppressingCurrentScene = false;
+        // Transitioning back to normal rendering — close the offscreen mega-scene
+        if (g_offscreenMegaScene) {
+            ProxyDevice::EndScene();
+            g_offscreenMegaScene = false;
+        }
     }
 
     ImGuiManager::LogFrameEvent(FrameEvent::BeginScene, sceneCount);
@@ -586,6 +621,15 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
 
             // Set any custom FOV and check distant water state
             if (sceneCount == 0) {
+                // Log offscreen local map timing if any offscreen work happened
+                if (g_offscreenTimingActive) {
+                    LARGE_INTEGER now, freq;
+                    QueryPerformanceFrequency(&freq);
+                    QueryPerformanceCounter(&now);
+                    float totalMs = (float)((now.QuadPart - g_offscreenStartQPC.QuadPart) * 1000.0 / freq.QuadPart);
+                    LOG::logline("Local map: %.1fms, %d DIPs, %d scenes", totalMs, g_offscreenDIPs, g_offscreenScenes);
+                    g_offscreenTimingActive = false;
+                }
                 if (Configuration.ScreenFOV > 0) {
                     mwBridge->SetFOV(Configuration.ScreenFOV);
                 }
@@ -677,9 +721,14 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
         DistantLand::renderStage2();
     }
 
-    // Track forwarded offscreen scenes for amortization budget
-    if (!rendertargetNormal && sceneForwarded) {
+    // Track offscreen scenes
+    if (!rendertargetNormal) {
         g_offscreenScenesThisFrame++;
+        // Don't forward EndScene — mega-scene stays open until normal rendering resumes
+        g_scenesForwarded++;
+        sceneForwarded = false;
+        scenePending = false;
+        return D3D_OK;
     }
 
     // Only forward EndScene if BeginScene was actually forwarded to real device
@@ -691,7 +740,6 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
     }
 
     // Empty scene — swallow both BeginScene and EndScene
-    // Also suppress any pending RT that was only for this empty scene
     if (rtPending) {
         g_rtSuppressed++;
         rtPending = false;
@@ -707,14 +755,13 @@ HRESULT _stdcall MGEProxyDevice::CopyRects(IDirect3DSurface8* a, const RECT* b, 
     g_copyRectsTotal++;
 
     // Check if this is an offscreen RT→sysmem readback we should suppress
-    // Suppress when: source is a render target, dest is sysmem, and we have active offscreen suppression
-    if (g_offscreenScenesThisFrame > 0 || g_suppressingCurrentScene) {
+    // Only suppress when the current scene was actually suppressed (over budget)
+    if (g_suppressingCurrentScene) {
         IDirect3DSurface9* a_real = static_cast<ProxySurface*>(a)->realSurface;
         IDirect3DSurface9* d_real = static_cast<ProxySurface*>(d)->realSurface;
         D3DSURFACE_DESC9 source, dest;
         if (a_real->GetDesc(&source) == D3D_OK && d_real->GetDesc(&dest) == D3D_OK) {
             if (source.Usage == 1 && dest.Usage == 0) {
-                // This is GetRenderTargetData — GPU pipeline drain
                 g_copyRectsSuppressed++;
                 return D3D_OK;
             }
@@ -865,6 +912,7 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
         snprintf(dipBuf, sizeof(dipBuf), "DIP_Offscreen_S%d", sceneCount);
         dipCategory = dipBuf;
         dipEventType = FrameEvent::DIP_Offscreen;
+        g_offscreenDIPs++;
         g_dipBinStats.offscreen++;
     } else if (!isMainView) {
         dipCategory = "DIP_UI";
@@ -1068,17 +1116,21 @@ HRESULT _stdcall MGEProxyDevice::SetTexture(DWORD a, IDirect3DBaseTexture8* b) {
 }
 
 // Draw method overrides — ensure deferred BeginScene is forwarded before any draw
+// Suppress offscreen draws (same logic as DrawIndexedPrimitive)
 HRESULT _stdcall MGEProxyDevice::DrawPrimitive(D3DPRIMITIVETYPE a, UINT b, UINT c) {
+    if (!rendertargetNormal && (g_suppressingCurrentScene || ImGuiManager::GetSuppressOffscreen())) return D3D_OK;
     ensureSceneActive();
     return ProxyDevice::DrawPrimitive(a, b, c);
 }
 
 HRESULT _stdcall MGEProxyDevice::DrawPrimitiveUP(D3DPRIMITIVETYPE a, UINT b, const void* c, UINT d) {
+    if (!rendertargetNormal && (g_suppressingCurrentScene || ImGuiManager::GetSuppressOffscreen())) return D3D_OK;
     ensureSceneActive();
     return ProxyDevice::DrawPrimitiveUP(a, b, c, d);
 }
 
 HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitiveUP(D3DPRIMITIVETYPE a, UINT b, UINT c, UINT d, const void* e, D3DFORMAT f, const void* g, UINT h) {
+    if (!rendertargetNormal && (g_suppressingCurrentScene || ImGuiManager::GetSuppressOffscreen())) return D3D_OK;
     ensureSceneActive();
     return ProxyDevice::DrawIndexedPrimitiveUP(a, b, c, d, e, f, g, h);
 }

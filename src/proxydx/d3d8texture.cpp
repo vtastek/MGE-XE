@@ -6,6 +6,7 @@
 // Declared in ffeshader.h — evicts texture from suffix resolution cache on release
 extern void (*g_onTextureReleased)(IDirect3DTexture9* realTexture);
 
+
 // Upload hash map: populated during UnlockRect(0), queried by calculateTextureHash
 std::unordered_map<IDirect3DTexture9*, UploadHash> g_uploadHashMap;
 

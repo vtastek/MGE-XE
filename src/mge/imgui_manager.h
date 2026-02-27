@@ -136,6 +136,7 @@ public:
     static bool GetSuppress1PAlpha() { return suppress1PAlpha; }
     static bool GetSuppress1POther() { return suppress1POther; }
     static bool GetSuppressOffscreen() { return suppressOffscreen; }
+    static int GetOffscreenBudget() { return offscreenBudget; }
     static bool GetSuppressUI() { return suppressUI; }
     static bool GetSuppressStencilShadow() { return suppressStencilShadow; }
     static bool GetSuppressPreScene() { return suppressPreScene; }
@@ -264,6 +265,7 @@ private:
     static bool suppress1PAlpha;
     static bool suppress1POther;
     static bool suppressOffscreen;
+    static int offscreenBudget;
     static bool suppressUI;
     static bool suppressStencilShadow;
     static bool suppressPreScene;

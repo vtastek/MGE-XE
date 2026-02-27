@@ -83,6 +83,7 @@ bool ImGuiManager::suppress1PSkinning = false;
 bool ImGuiManager::suppress1PAlpha = false;
 bool ImGuiManager::suppress1POther = false;
 bool ImGuiManager::suppressOffscreen = false;
+int ImGuiManager::offscreenBudget = 9999;  // unlimited by default
 bool ImGuiManager::suppressUI = false;
 bool ImGuiManager::suppressStencilShadow = false;
 bool ImGuiManager::suppressPreScene = false;
@@ -477,6 +478,9 @@ void ImGuiManager::RenderDebugInterface() {
         ImGui::Text("Pass-through:");
         ImGui::Checkbox("Offscreen (Map/Inv)##pt", &suppressOffscreen);
         ImGui::SameLine(); ImGui::Text("= %d", disp.offscreen);
+        ImGui::SliderInt("Offscreen Budget##pt", &offscreenBudget, 0, 50, "%d scenes/frame");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Unlimited##ob")) offscreenBudget = 9999;
 
         ImGui::Checkbox("UI / Menu##pt", &suppressUI);
         ImGui::SameLine(); ImGui::Text("= %d", disp.ui);
