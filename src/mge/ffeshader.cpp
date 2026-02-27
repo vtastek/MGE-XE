@@ -205,6 +205,21 @@ static void warmSuffixCache(IDirect3DDevice* dev, IDirect3DTexture9* texture) {
         entry.textureName = *textureName;
         entry.hasValidName = true;
         entry.variants = BSA::getTextureSuffixVariants(textureName->c_str());
+
+        // Pre-load suffix textures so bindShaderTextures never stalls on disk I/O
+        if (entry.variants) {
+            if (entry.variants->hasDiffParamT()) {
+                BSA::loadSuffixTexture((IDirect3DDevice9*)dev, *entry.variants, "diffparam_t");
+            } else if (entry.variants->hasDiffParam()) {
+                BSA::loadSuffixTexture((IDirect3DDevice9*)dev, *entry.variants, "diffparam");
+            }
+            if (entry.variants->hasParamH()) {
+                BSA::loadSuffixTexture((IDirect3DDevice9*)dev, *entry.variants, "paramh");
+            }
+            if (entry.variants->hasParamX()) {
+                BSA::loadSuffixTexture((IDirect3DDevice9*)dev, *entry.variants, "paramx");
+            }
+        }
     } else {
         entry.hasValidName = false;
         entry.variants = nullptr;
@@ -2349,6 +2364,7 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         device->SetRenderState(D3DRS_LOCALVIEWER, savedLocalViewer);
         device->SetRenderState(D3DRS_NORMALIZENORMALS, savedNormalizeNormals);
     }
+
 }
 
 FixedFunctionShader::HLSLShader FixedFunctionShader::createPurpleErrorShader() {
@@ -3641,6 +3657,24 @@ void FixedFunctionShader::stopRecordingAndReplay() {
     device->GetRenderState(D3DRS_ALPHAFUNC, &postRecordingState.alphaFunc);
     device->GetRenderState(D3DRS_ALPHAREF, &postRecordingState.alphaRef);
 
+    // Batch-warm suffix cache — resolve all unique textures and pre-load suffix files
+    // before prepare/replay, so neither stalls on hash computation or disk I/O.
+    {
+        MGE_ZoneScopedN("BatchWarmSuffixCache");
+        auto& recCalls = frameBuffers[recordingBuffer].recordedCalls;
+        std::unordered_set<IDirect3DTexture9*> seen;
+        for (const auto& call : recCalls) {
+            if (call.rs.texture && seen.insert(call.rs.texture).second) {
+                AcquireSRWLockShared(&textureSuffixLock);
+                bool found = textureSuffixResolutionCache.count(call.rs.texture) > 0;
+                ReleaseSRWLockShared(&textureSuffixLock);
+                if (!found) {
+                    warmSuffixCache(device, call.rs.texture);
+                }
+            }
+        }
+    }
+
     // Phase 2b: Prepare shader keys (bbox + occluders already done in prepareOcclusionCullingForDepth)
     prepareRecordedCalls(recordingBuffer);
 
@@ -3768,6 +3802,26 @@ void FixedFunctionShader::finalizeBatchAndSubmitCull() {
         }
         ReleaseSRWLockShared(&hlslCacheLock);
         diagHitKeys.clear();
+    }
+
+    // Batch-warm suffix cache on main thread before cull thread gets the buffer.
+    // Resolves all unique textures and pre-loads suffix files so that
+    // computeShaderKeyWithSuffixes on the cull thread never hits expensive fallbacks,
+    // and replay never stalls on hash computation or disk I/O.
+    {
+        MGE_ZoneScopedN("BatchWarmSuffixCache");
+        auto& recCalls = frameBuffers[recordingBuffer].recordedCalls;
+        std::unordered_set<IDirect3DTexture9*> seen;
+        for (const auto& call : recCalls) {
+            if (call.rs.texture && seen.insert(call.rs.texture).second) {
+                AcquireSRWLockShared(&textureSuffixLock);
+                bool found = textureSuffixResolutionCache.count(call.rs.texture) > 0;
+                ReleaseSRWLockShared(&textureSuffixLock);
+                if (!found) {
+                    warmSuffixCache(device, call.rs.texture);
+                }
+            }
+        }
     }
 
     // Submit to cull thread for async prepare
@@ -5248,10 +5302,6 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
                     worstCallIndex = (int)i;
                     worstCallPrims = call.rs.primCount;
                     worstCallBin = (int)call.bin;
-                }
-                if (callMs > slowCallThreshold) {
-                    LOG::logline("SLOW CALL[%d]: %.1fms bin=%s prims=%d tex=%p",
-                        (int)i, callMs, binNames[(int)call.bin], call.rs.primCount, call.rs.texture);
                 }
                 if (!firstDrawDone) {
                     MGE_ZoneScopedN("replay_FirstDrawDone");

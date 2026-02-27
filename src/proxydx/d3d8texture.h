@@ -2,10 +2,24 @@
 
 #include "d3d8interface.h"
 
+// Upload hash: computed at UnlockRect time, avoids GPU readback for texture identification
+struct UploadHash {
+    unsigned int crc32;
+    unsigned int size;  // width * height
+};
+
+// Global lookup: real texture → upload hash (populated during UnlockRect, evicted on Release)
+#include <unordered_map>
+extern std::unordered_map<IDirect3DTexture9*, UploadHash> g_uploadHashMap;
+
 class ProxyTexture : public IDirect3DTexture8 {
 public:
     IDirect3DTexture9* realTexture;
     ProxyDevice* proxDevice;
+
+    // Upload hash state: captured during LockRect(0), hashed during UnlockRect(0)
+    D3DLOCKED_RECT pendingLockRect;
+    bool hasActiveLock0;
 
     ProxyTexture(IDirect3DTexture9* real, ProxyDevice* device);
 

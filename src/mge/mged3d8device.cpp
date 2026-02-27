@@ -45,6 +45,25 @@ static DWORD stencilRef;
 static bool stage0Complete, isFrameComplete, isHUDComplete;
 static bool isWaterMaterial, waterDrawn, distantWater;
 
+// Deferred scene forwarding — suppress empty BeginScene/EndScene pairs
+static bool scenePending = false;      // BeginScene called but not forwarded to real device
+static bool sceneForwarded = false;    // BeginScene has been forwarded to real device
+
+// Deferred render target — suppress RT churn from empty scenes
+static bool rtPending = false;
+static IDirect3DSurface8* pendingRT_color = nullptr;
+static IDirect3DSurface8* pendingRT_depth = nullptr;
+
+// Deferral instrumentation — per-frame counters logged at Present()
+static int g_scenesRequested = 0, g_scenesForwarded = 0, g_scenesSuppressed = 0;
+static int g_rtRequested = 0, g_rtForwarded = 0, g_rtSuppressed = 0;
+static int g_copyRectsTotal = 0, g_copyRectsSuppressed = 0;
+
+// Offscreen amortization — limit offscreen scenes per frame
+static const int OFFSCREEN_BUDGET = 0;  // max offscreen scenes forwarded per frame (0 = suppress all for testing)
+static int g_offscreenScenesThisFrame = 0;
+static bool g_suppressingCurrentScene = false;  // true when current offscreen scene is over budget
+
 static bool zoomSensSaved;
 static float zoomSensX, zoomSensY;
 static D3DXMATRIX camEffectsMatrix;
@@ -424,6 +443,23 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         waterDrawn = false;
         isFrameComplete = false;
         isHUDComplete = false;
+        scenePending = false;
+        sceneForwarded = false;
+        rtPending = false;
+
+        // Log deferral stats on frames with suppressed scenes (local map frames)
+        if (g_scenesSuppressed > 0 || g_rtSuppressed > 0 || g_copyRectsTotal > 0) {
+            LOG::logline("Deferral: scenes %d/%d/%d RT %d/%d/%d offscreen %d/%d CopyRects %d/%d (req/fwd/supp)",
+                g_scenesRequested, g_scenesForwarded, g_scenesSuppressed,
+                g_rtRequested, g_rtForwarded, g_rtSuppressed,
+                g_offscreenScenesThisFrame, OFFSCREEN_BUDGET,
+                g_copyRectsTotal, g_copyRectsSuppressed);
+        }
+        g_scenesRequested = g_scenesForwarded = g_scenesSuppressed = 0;
+        g_rtRequested = g_rtForwarded = g_rtSuppressed = 0;
+        g_copyRectsTotal = g_copyRectsSuppressed = 0;
+        g_offscreenScenesThisFrame = 0;
+        g_suppressingCurrentScene = false;
 
         // Stamp current camera into the FrameBuffer that just finished recording
         // (for future render pass to use fresh matrices instead of stale recording-time ones)
@@ -453,8 +489,24 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
     }
 }
 
+// Forward pending render target change to real device
+static HRESULT flushPendingRT() {
+    if (rtPending) {
+        rtPending = false;
+        g_rtForwarded++;
+        auto device = DistantLand::device;
+        HRESULT hr1 = D3D_OK, hr2 = D3D_OK;
+        if (pendingRT_color) {
+            hr1 = device->SetRenderTarget(0, static_cast<ProxySurface*>(pendingRT_color)->realSurface);
+        }
+        hr2 = device->SetDepthStencilSurface(pendingRT_depth ? static_cast<ProxySurface*>(pendingRT_depth)->realSurface : nullptr);
+        return (hr1 != D3D_OK) ? hr1 : hr2;
+    }
+    return D3D_OK;
+}
+
 // SetRenderTarget
-// Remember if MW is rendering to back buffer
+// Remember if MW is rendering to back buffer, defer forwarding
 HRESULT _stdcall MGEProxyDevice::SetRenderTarget(IDirect3DSurface8* a, IDirect3DSurface8* b) {
     if (a) {
         IDirect3DSurface9* back;
@@ -466,7 +518,31 @@ HRESULT _stdcall MGEProxyDevice::SetRenderTarget(IDirect3DSurface8* a, IDirect3D
     g_passBreaks.raw_setRT++;
     g_passBreaks.raw_setDS++;
     ImGuiManager::LogFrameEvent(FrameEvent::SetRenderTarget, sceneCount);
-    return ProxyDevice::SetRenderTarget(a, b);
+
+    // Defer RT change — forward only when a Clear or Draw needs it
+    // If previous pending RT was never forwarded, count it as suppressed
+    if (rtPending) {
+        g_rtSuppressed++;
+    }
+    g_rtRequested++;
+    pendingRT_color = a;
+    pendingRT_depth = b;
+    rtPending = true;
+    return D3D_OK;
+}
+
+// Forward deferred RT + BeginScene to real device (call before any draw)
+static HRESULT ensureSceneActive() {
+    flushPendingRT();
+    if (scenePending && !sceneForwarded) {
+        HRESULT hr = DistantLand::device->BeginScene();
+        if (hr != D3D_OK) {
+            return hr;
+        }
+        sceneForwarded = true;
+        scenePending = false;
+    }
+    return D3D_OK;
 }
 
 // BeginScene - Multiple scenes per frame, non-alpha / 2x stencil / post-stencil redraw / alpha / 1st person / UI
@@ -474,9 +550,16 @@ HRESULT _stdcall MGEProxyDevice::SetRenderTarget(IDirect3DSurface8* a, IDirect3D
 HRESULT _stdcall MGEProxyDevice::BeginScene() {
     auto mwBridge = MWBridge::get();
 
-    HRESULT hr = ProxyDevice::BeginScene();
-    if (hr != D3D_OK) {
-        return hr;
+    // Defer real device BeginScene until a draw call needs it
+    scenePending = true;
+    sceneForwarded = false;
+    g_scenesRequested++;
+
+    // Offscreen amortization: suppress scenes beyond per-frame budget
+    if (!rendertargetNormal) {
+        g_suppressingCurrentScene = (g_offscreenScenesThisFrame >= OFFSCREEN_BUDGET);
+    } else {
+        g_suppressingCurrentScene = false;
     }
 
     ImGuiManager::LogFrameEvent(FrameEvent::BeginScene, sceneCount);
@@ -512,11 +595,13 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
             // UI scene, apply post-process if there was anything drawn before it
             // Race menu will render an extra scene past this point
             if (DistantLand::ready && sceneCount > 0 && !isFrameComplete) {
+                ensureSceneActive();
                 DistantLand::postProcess();
             }
 
             // Render user HUD before Morrowind HUD
             if (isHUDready && !isHUDComplete) {
+                ensureSceneActive();
                 MGEhud::draw();
             }
 
@@ -533,6 +618,9 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
     ImGuiManager::LogFrameEvent(FrameEvent::EndScene, sceneCount);
 
     if (DistantLand::ready && rendertargetNormal) {
+        // Ensure real device scene is active before MGE renders anything
+        ensureSceneActive();
+
         // The following Morrowind scenes get past the filters:
         // ~ Opaque meshes, plus alpha meshes with 'No Sorter' property (which should use alpha test)
         // ~ If stencil shadows are active, then shadow casters are deferred to be drawn in a scene after
@@ -569,6 +657,7 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
     }
 
     if (isFrameComplete && isHUDready && !isHUDComplete) {
+        ensureSceneActive();
         // Capture post-UI screenshots here
         DistantLand::checkCaptureScreenshot(true);
 
@@ -588,7 +677,50 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
         DistantLand::renderStage2();
     }
 
-    return ProxyDevice::EndScene();
+    // Track forwarded offscreen scenes for amortization budget
+    if (!rendertargetNormal && sceneForwarded) {
+        g_offscreenScenesThisFrame++;
+    }
+
+    // Only forward EndScene if BeginScene was actually forwarded to real device
+    if (sceneForwarded) {
+        g_scenesForwarded++;
+        sceneForwarded = false;
+        scenePending = false;
+        return ProxyDevice::EndScene();
+    }
+
+    // Empty scene — swallow both BeginScene and EndScene
+    // Also suppress any pending RT that was only for this empty scene
+    if (rtPending) {
+        g_rtSuppressed++;
+        rtPending = false;
+    }
+    g_scenesSuppressed++;
+    scenePending = false;
+    sceneForwarded = false;
+    return D3D_OK;
+}
+
+// CopyRects — intercept GPU→CPU readback for offscreen amortization
+HRESULT _stdcall MGEProxyDevice::CopyRects(IDirect3DSurface8* a, const RECT* b, UINT c, IDirect3DSurface8* d, const POINT* e) {
+    g_copyRectsTotal++;
+
+    // Check if this is an offscreen RT→sysmem readback we should suppress
+    // Suppress when: source is a render target, dest is sysmem, and we have active offscreen suppression
+    if (g_offscreenScenesThisFrame > 0 || g_suppressingCurrentScene) {
+        IDirect3DSurface9* a_real = static_cast<ProxySurface*>(a)->realSurface;
+        IDirect3DSurface9* d_real = static_cast<ProxySurface*>(d)->realSurface;
+        D3DSURFACE_DESC9 source, dest;
+        if (a_real->GetDesc(&source) == D3D_OK && d_real->GetDesc(&dest) == D3D_OK) {
+            if (source.Usage == 1 && dest.Usage == 0) {
+                // This is GetRenderTargetData — GPU pipeline drain
+                g_copyRectsSuppressed++;
+                return D3D_OK;
+            }
+        }
+    }
+    return ProxyDevice::CopyRects(a, b, c, d, e);
 }
 
 // Clear - Occurs at start of frame, and also a z-clear before rendering 1st person and sunglare
@@ -598,6 +730,10 @@ HRESULT _stdcall MGEProxyDevice::Clear(DWORD a, const D3DRECT* b, DWORD c, D3DCO
     g_passBreaks.raw_clear++;
     ImGuiManager::LogFrameEvent(FrameEvent::Clear, sceneCount);
     DistantLand::setHorizonColour(d);
+    // Suppress Clear for offscreen scenes over amortization budget
+    if (!rendertargetNormal && g_suppressingCurrentScene) return D3D_OK;
+    // Flush pending RT before Clear — Clear needs correct target
+    flushPendingRT();
     return ProxyDevice::Clear(a, b, c, d, e, f);
 }
 
@@ -773,8 +909,11 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
     dipZone.Name(dipCategory, strlen(dipCategory));
 #endif
 
-    // Debug: suppress DIP categories via ImGui toggles
-    if (!rendertargetNormal && ImGuiManager::GetSuppressOffscreen()) return D3D_OK;
+    // Suppress offscreen scenes over amortization budget (or via ImGui toggle)
+    // Return BEFORE ensureSceneActive so deferred scene stays unforwarded
+    if (!rendertargetNormal && (g_suppressingCurrentScene || ImGuiManager::GetSuppressOffscreen())) return D3D_OK;
+
+    // Debug: suppress other DIP categories via ImGui toggles
     if (!isMainView && rendertargetNormal && ImGuiManager::GetSuppressUI()) return D3D_OK;
     if (isShadowStencil && ImGuiManager::GetSuppressStencilShadow()) return D3D_OK;
     if (sceneCount < 0 && rendertargetNormal && ImGuiManager::GetSuppressPreScene()) return D3D_OK;
@@ -789,6 +928,9 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
     if (isShadowStencil && Configuration.PerPixelLightFlags == 2) {
         return D3D_OK;
     }
+
+    // Forward deferred scene to real device — AFTER all suppression checks
+    ensureSceneActive();
 
     if (DistantLand::ready && rendertargetNormal && isMainView && !isShadowStencil) {
         rs.primType = a;
@@ -923,6 +1065,22 @@ HRESULT _stdcall MGEProxyDevice::SetTexture(DWORD a, IDirect3DBaseTexture8* b) {
         rs.texture = b ? static_cast<ProxyTexture*>(b)->realTexture : NULL;
     }
     return ProxyDevice::SetTexture(a, b);
+}
+
+// Draw method overrides — ensure deferred BeginScene is forwarded before any draw
+HRESULT _stdcall MGEProxyDevice::DrawPrimitive(D3DPRIMITIVETYPE a, UINT b, UINT c) {
+    ensureSceneActive();
+    return ProxyDevice::DrawPrimitive(a, b, c);
+}
+
+HRESULT _stdcall MGEProxyDevice::DrawPrimitiveUP(D3DPRIMITIVETYPE a, UINT b, const void* c, UINT d) {
+    ensureSceneActive();
+    return ProxyDevice::DrawPrimitiveUP(a, b, c, d);
+}
+
+HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitiveUP(D3DPRIMITIVETYPE a, UINT b, UINT c, UINT d, const void* e, D3DFORMAT f, const void* g, UINT h) {
+    ensureSceneActive();
+    return ProxyDevice::DrawIndexedPrimitiveUP(a, b, c, d, e, f, g, h);
 }
 
 HRESULT _stdcall MGEProxyDevice::SetVertexShader(DWORD a) {

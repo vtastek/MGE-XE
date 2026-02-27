@@ -1,6 +1,7 @@
 
 #include "morrowindbsa.h"
 #include "proxydx/d3d8header.h"
+#include "proxydx/d3d8texture.h"
 #include "support/log.h"
 #include "support/timing.h"
 #include "configuration.h"
@@ -674,17 +675,25 @@ const TextureSuffixVariants* getTextureSuffixVariants(const char* baseTextureNam
 // calculateTextureHash - Calculate runtime hash of a texture for identification
 TextureRuntimeHash calculateTextureHash(IDirect3DDevice9* device, IDirect3DTexture9* texture, bool useCache) {
     TextureRuntimeHash hash = {0, 0};
-    
+
     if (!texture) {
         return hash;
     }
-    
+
+    // Fast path: check upload hash (computed at UnlockRect time, zero GPU cost)
+    auto uploadIt = g_uploadHashMap.find(texture);
+    if (uploadIt != g_uploadHashMap.end() && uploadIt->second.crc32 != 0) {
+        hash.crc32 = uploadIt->second.crc32;
+        hash.size = uploadIt->second.size;
+        return hash;
+    }
+
     // Get texture dimensions first
     D3DSURFACE_DESC desc;
     if (FAILED(texture->GetLevelDesc(0, &desc))) {
         return hash;
     }
-    
+
     // Check cache first to avoid repeated calculations (only if useCache is true)
     TextureCacheKey cacheKey = {desc.Width, desc.Height, desc.Format, desc.Pool};
     if (useCache) {
@@ -707,231 +716,105 @@ TextureRuntimeHash calculateTextureHash(IDirect3DDevice9* device, IDirect3DTextu
     bool isExpectedPool = (desc.Pool == expectedPool);
     
     if (!isExpectedPool) {
-        return hash; // Return zero hash for filtered textures
+        return hash;
     }
     if (isRenderTarget || isDepthStencil) {
         return hash; // Return zero hash for filtered textures
     }
     
-    // Use staging texture approach for direct memory hashing (no temp files)
+    // Access texture data for hashing
+    // MANAGED pool: LockRect directly (data is in system memory, no GPU readback)
+    // DEFAULT pool: staging texture + GetRenderTargetData (GPU readback, slower)
     bool hashSuccess = false;
-    
-    // Use staging texture for D3DPOOL_DEFAULT textures
+    D3DLOCKED_RECT lockedRect = {};
     IDirect3DTexture9* stagingTexture = nullptr;
-    HRESULT hr = device->CreateTexture(desc.Width, desc.Height, 1, 0, desc.Format, D3DPOOL_SYSTEMMEM, &stagingTexture, nullptr);
-    
-    if (SUCCEEDED(hr) && stagingTexture) {
-        // Get surfaces for copy operation
-        IDirect3DSurface9* srcSurface = nullptr;
-        IDirect3DSurface9* dstSurface = nullptr;
-        
-        if (SUCCEEDED(texture->GetSurfaceLevel(0, &srcSurface)) &&
-            SUCCEEDED(stagingTexture->GetSurfaceLevel(0, &dstSurface))) {
-            
-            // Use GetRenderTargetData - proven to work 100% of the time for Pool=0 textures
-            hr = device->GetRenderTargetData(srcSurface, dstSurface);
+    IDirect3DSurface9* srcSurface = nullptr;
+    IDirect3DSurface9* dstSurface = nullptr;
+    bool lockedDirect = false;
 
-            if (FAILED(hr)) {
-                LOG::logline("CAPTURE: GetRenderTargetData FAILED (0x%08x) for %dx%d %s Pool=%d - unexpected!",
-                           hr, desc.Width, desc.Height, getD3DFormatName(desc.Format), desc.Pool);
-            }
-            
-            // If staging succeeded, hash directly from memory
-            if (SUCCEEDED(hr)) {
-                D3DLOCKED_RECT lockedRect;
-                if (SUCCEEDED(dstSurface->LockRect(&lockedRect, nullptr, D3DLOCK_READONLY))) {
-                    // Calculate the total size of pixel data more carefully
-                    size_t dataSize = 0;
-                    
-                    // Sanity checks first
-                    if (lockedRect.Pitch <= 0 || desc.Width == 0 || desc.Height == 0) {
-                        LOG::logline("!! Invalid texture properties: Pitch=%d, Width=%d, Height=%d", 
-                                   lockedRect.Pitch, desc.Width, desc.Height);
-                        dstSurface->UnlockRect();
-                        return hash;
-                    }
-                    
-                    switch (desc.Format) {
-                        case D3DFMT_DXT1:
-                            // DXT1: 4x4 blocks, 8 bytes per block
-                            dataSize = ((desc.Width + 3) / 4) * ((desc.Height + 3) / 4) * 8;
-                            break;
-                        case D3DFMT_DXT3:
-                        case D3DFMT_DXT5:
-                            // DXT3/5: 4x4 blocks, 16 bytes per block  
-                            dataSize = ((desc.Width + 3) / 4) * ((desc.Height + 3) / 4) * 16;
-                            break;
-                        case D3DFMT_A8R8G8B8:
-                        case D3DFMT_X8R8G8B8:
-                            dataSize = (size_t)lockedRect.Pitch * desc.Height;
-                            break;
-                        case D3DFMT_R5G6B5:
-                        case D3DFMT_A1R5G5B5:
-                            dataSize = (size_t)lockedRect.Pitch * desc.Height;
-                            break;
-                        case D3DFMT_A8:
-                            dataSize = (size_t)lockedRect.Pitch * desc.Height;
-                            break;
-                        default:
-                            // Fallback: use pitch * height for unknown formats
-                            dataSize = (size_t)lockedRect.Pitch * desc.Height;
-                            break;
-                    }
-                    
-                    // Additional sanity checks
-                    if (dataSize == 0 || dataSize > 100 * 1024 * 1024) { // Max 100MB
-                        LOG::logline("!! Invalid texture data size calculated: %zu bytes (Format=%d, %dx%d, Pitch=%d)", 
-                                   dataSize, desc.Format, desc.Width, desc.Height, lockedRect.Pitch);
-                        dstSurface->UnlockRect();
-                        return hash;
-                    }
-                    
-                    if (lockedRect.pBits == nullptr) {
-                        LOG::logline("!! Null texture data pointer");
-                        dstSurface->UnlockRect();
-                        return hash;
-                    }
-                    
-                    // Hybrid texture hashing: Multi-point sample + 8x8 mip + enhanced metadata
-                    const unsigned char* dataPtr = reinterpret_cast<const unsigned char*>(lockedRect.pBits);
-
-                    // Multi-point sampling for better discrimination
-                    size_t pointSize = 64; // 64 bytes per sample point
-                    size_t maxSampleSize = std::min(dataSize, (size_t)2048); // 2KB from main texture
-
-                    // Enhanced metadata: include mip levels and texture size for uniqueness
-                    DWORD mipLevels = texture->GetLevelCount();
-                    size_t metadataSize = 20; // 5 x DWORD (Width, Height, Format, MipLevels, TotalSize)
-                    size_t totalHashSize = metadataSize + maxSampleSize;
-                    auto hashBuffer = std::make_unique<unsigned char[]>(totalHashSize);
-
-                    // Pack enhanced metadata
-                    DWORD* metadata = reinterpret_cast<DWORD*>(hashBuffer.get());
-                    metadata[0] = desc.Width;
-                    metadata[1] = desc.Height;
-                    metadata[2] = (DWORD)desc.Format;
-                    metadata[3] = mipLevels;
-                    metadata[4] = (DWORD)dataSize;
-
-                    // Multi-point sampling: beginning, middle, end points
-                    unsigned char* sampleBuffer = hashBuffer.get() + metadataSize;
-
-                    // Sample 1: Beginning (first 64 bytes)
-                    size_t beginSample = std::min(pointSize, dataSize);
-                    memcpy(sampleBuffer, dataPtr, beginSample);
-
-                    // Sample 2: Middle point
-                    if (dataSize > pointSize * 2) {
-                        size_t midOffset = dataSize / 2;
-                        size_t midSample = std::min(pointSize, dataSize - midOffset);
-                        memcpy(sampleBuffer + pointSize, dataPtr + midOffset, midSample);
-                    }
-
-                    // Sample 3: End point
-                    if (dataSize > pointSize * 3) {
-                        size_t endOffset = dataSize - pointSize;
-                        size_t endSample = std::min(pointSize, dataSize - endOffset);
-                        memcpy(sampleBuffer + (2 * pointSize), dataPtr + endOffset, endSample);
-                    }
-
-                    // Add 8x8 mip level data for enhanced discrimination
-                    size_t mipDataUsed = 0;
-                    if (mipLevels > 1) {
-                        // Find 8x8 mip level using proven method
-                        DWORD targetMip = 0;
-                        for (DWORD mip = 0; mip < mipLevels; mip++) {
-                            DWORD mipWidth = std::max(1u, desc.Width >> mip);
-                            DWORD mipHeight = std::max(1u, desc.Height >> mip);
-
-                            if (mipWidth <= 8 && mipHeight <= 8) {
-                                targetMip = mip;
-                                break;
-                            }
-                            targetMip = mip;
-                        }
-
-                        // Capture 8x8 mip using proven GetRenderTargetData method
-                        if (targetMip > 0) {
-                            D3DSURFACE_DESC mipDesc;
-                            if (SUCCEEDED(texture->GetLevelDesc(targetMip, &mipDesc))) {
-                                IDirect3DTexture9* mipTexture = nullptr;
-                                HRESULT mipHr = device->CreateTexture(mipDesc.Width, mipDesc.Height, 1, 0, mipDesc.Format, D3DPOOL_SYSTEMMEM, &mipTexture, nullptr);
-
-                                if (SUCCEEDED(mipHr) && mipTexture) {
-                                    IDirect3DSurface9* mipSrcSurface = nullptr;
-                                    IDirect3DSurface9* mipDstSurface = nullptr;
-
-                                    if (SUCCEEDED(texture->GetSurfaceLevel(targetMip, &mipSrcSurface)) &&
-                                        SUCCEEDED(mipTexture->GetSurfaceLevel(0, &mipDstSurface))) {
-
-                                        // Use proven capture method
-                                        HRESULT mipCaptureHr = device->GetRenderTargetData(mipSrcSurface, mipDstSurface);
-
-                                        if (SUCCEEDED(mipCaptureHr)) {
-                                            D3DLOCKED_RECT mipLockedRect;
-                                            if (SUCCEEDED(mipDstSurface->LockRect(&mipLockedRect, nullptr, D3DLOCK_READONLY))) {
-                                                // Calculate 8x8 mip data size
-                                                size_t mipDataSize = 0;
-                                                switch (mipDesc.Format) {
-                                                    case D3DFMT_DXT1:
-                                                        mipDataSize = std::max(1U, (mipDesc.Width + 3) / 4) * std::max(1U, (mipDesc.Height + 3) / 4) * 8;
-                                                        break;
-                                                    case D3DFMT_DXT3:
-                                                    case D3DFMT_DXT5:
-                                                        mipDataSize = std::max(1U, (mipDesc.Width + 3) / 4) * std::max(1U, (mipDesc.Height + 3) / 4) * 16;
-                                                        break;
-                                                    default:
-                                                        mipDataSize = (size_t)mipLockedRect.Pitch * mipDesc.Height;
-                                                        break;
-                                                }
-
-                                                // Add 8x8 mip data to hash (up to 256 bytes)
-                                                if (mipDataSize > 0 && mipDataSize <= 256) {
-                                                    size_t availableSpace = maxSampleSize - (3 * pointSize);
-                                                    mipDataUsed = std::min(mipDataSize, availableSpace);
-                                                    if (mipDataUsed > 0) {
-                                                        memcpy(sampleBuffer + (3 * pointSize), mipLockedRect.pBits, mipDataUsed);
-                                                    }
-                                                }
-
-                                                mipDstSurface->UnlockRect();
-                                            }
-                                        }
-                                    }
-
-                                    if (mipSrcSurface) mipSrcSurface->Release();
-                                    if (mipDstSurface) mipDstSurface->Release();
-                                    mipTexture->Release();
-                                }
-                            }
-                        }
-                    }
-
-                    // Update total hash size to include 8x8 mip data
-                    totalHashSize = metadataSize + (3 * pointSize) + mipDataUsed;
-                    
-                    // Calculate hash
-                    hash.size = desc.Width * desc.Height;
-                    hash.crc32 = crc32(hashBuffer.get(), totalHashSize);
-                    
-                    if (hash.crc32 != 0) {
-                        hashSuccess = true;
-                    }
-                    
-                    dstSurface->UnlockRect();
-                } else {
-                    LOG::logline("!! Failed to lock staging texture surface");
+    if (isManagedPool) {
+        // MANAGED: lock the texture directly (zero GPU cost)
+        if (SUCCEEDED(texture->LockRect(0, &lockedRect, nullptr, D3DLOCK_READONLY))) {
+            lockedDirect = true;
+        }
+    } else {
+        // DEFAULT: staging copy via GetRenderTargetData (GPU pipeline drain)
+        HRESULT hr = device->CreateTexture(desc.Width, desc.Height, 1, 0, desc.Format, D3DPOOL_SYSTEMMEM, &stagingTexture, nullptr);
+        if (SUCCEEDED(hr) && stagingTexture) {
+            if (SUCCEEDED(texture->GetSurfaceLevel(0, &srcSurface)) &&
+                SUCCEEDED(stagingTexture->GetSurfaceLevel(0, &dstSurface))) {
+                hr = device->GetRenderTargetData(srcSurface, dstSurface);
+                if (SUCCEEDED(hr)) {
+                    dstSurface->LockRect(&lockedRect, nullptr, D3DLOCK_READONLY);
                 }
             }
         }
-        
-        if (srcSurface) srcSurface->Release();
-        if (dstSurface) dstSurface->Release();
     }
-    
-    // Only release stagingTexture if it was successfully created
-    if (stagingTexture) {
-        stagingTexture->Release();
+
+    if (lockedRect.pBits && lockedRect.Pitch > 0) {
+        size_t dataSize = 0;
+        switch (desc.Format) {
+            case D3DFMT_DXT1:
+                dataSize = ((desc.Width + 3) / 4) * ((desc.Height + 3) / 4) * 8;
+                break;
+            case D3DFMT_DXT3:
+            case D3DFMT_DXT5:
+                dataSize = ((desc.Width + 3) / 4) * ((desc.Height + 3) / 4) * 16;
+                break;
+            default:
+                dataSize = (size_t)lockedRect.Pitch * desc.Height;
+                break;
+        }
+
+        if (dataSize > 0 && dataSize < 100 * 1024 * 1024) {
+            const unsigned char* dataPtr = reinterpret_cast<const unsigned char*>(lockedRect.pBits);
+
+            // Hash algorithm: metadata (5 DWORDs) + 3-point sample (3 × 64 bytes)
+            // Must match upload hash in ProxyTexture::UnlockRect
+            size_t pointSize = 64;
+            DWORD mipLevels = texture->GetLevelCount();
+            size_t metadataSize = 20;
+            size_t totalHashSize = metadataSize + (3 * pointSize);
+            unsigned char hashBuffer[212]; // 20 + 192
+            memset(hashBuffer, 0, sizeof(hashBuffer));
+
+            DWORD* metadata = reinterpret_cast<DWORD*>(hashBuffer);
+            metadata[0] = desc.Width;
+            metadata[1] = desc.Height;
+            metadata[2] = (DWORD)desc.Format;
+            metadata[3] = mipLevels;
+            metadata[4] = (DWORD)dataSize;
+
+            unsigned char* sampleBuffer = hashBuffer + metadataSize;
+
+            size_t s1 = std::min(pointSize, dataSize);
+            memcpy(sampleBuffer, dataPtr, s1);
+
+            if (dataSize > pointSize * 2) {
+                size_t mid = dataSize / 2;
+                memcpy(sampleBuffer + pointSize, dataPtr + mid, std::min(pointSize, dataSize - mid));
+            }
+
+            if (dataSize > pointSize * 3) {
+                size_t end = dataSize - pointSize;
+                memcpy(sampleBuffer + (2 * pointSize), dataPtr + end, std::min(pointSize, dataSize - end));
+            }
+
+            hash.size = desc.Width * desc.Height;
+            hash.crc32 = crc32(hashBuffer, totalHashSize);
+            if (hash.crc32 != 0) {
+                hashSuccess = true;
+            }
+        }
+    }
+
+    // Cleanup
+    if (lockedDirect) {
+        texture->UnlockRect(0);
+    } else {
+        if (dstSurface) { dstSurface->UnlockRect(); dstSurface->Release(); }
+        if (srcSurface) srcSurface->Release();
+        if (stagingTexture) stagingTexture->Release();
     }
     
     if (!hashSuccess) {
@@ -1155,11 +1038,12 @@ void buildBSATextureHashDatabase(IDirect3DDevice9* dev) {
         HRESULT hr = E_FAIL;
         
         // Load base texture based on source (loose overrides BSA)
+        D3DPOOL initPool = Configuration.UseDefaultTexturePool ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED;
         if (variants.baseTextureSource == "loose") {
-            // Load from loose file using SAME parameters as runtime loadTextureExact()
+            // Load from loose file using SAME pool as runtime textures
             hr = D3DXCreateTextureFromFileEx(dev, variants.baseTexturePath.c_str(),
                 D3DX_FROM_FILE, D3DX_FROM_FILE, D3DX_FROM_FILE, 0, D3DFMT_UNKNOWN,
-                D3DPOOL_DEFAULT, D3DX_FILTER_NONE, D3DX_FILTER_NONE, 0, 0, 0, &baseTexture);
+                initPool, D3DX_FILTER_NONE, D3DX_FILTER_NONE, 0, 0, 0, &baseTexture);
         }
         else if (variants.baseTextureSource == "bsa") {
             // Load from BSA file using proven BSALoadFile method
