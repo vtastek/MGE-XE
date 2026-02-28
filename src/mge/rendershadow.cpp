@@ -20,7 +20,7 @@ static const float shadowFarRadius = 4000.0;
 // Renders multiple shadow map layers to channels in one texture
 // Applies filtering to soften shadow edges
 // This *must* restore render state on return
-void DistantLand::renderShadowMap() {
+void DistantLand::renderShadowMap(DLContext* ctx) {
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_ShadowMap, 0);
     IDirect3DSurface9* target, *targetSoft;
     texShadow->GetSurfaceLevel(0, &target);
@@ -47,14 +47,14 @@ void DistantLand::renderShadowMap() {
 
     // Calculate transform to map view frustum into world space
     D3DXMATRIX inverseCameraProj, cameraViewProj;
-    D3DXMatrixMultiply(&cameraViewProj, &mwView, &mwProj);
+    D3DXMatrixMultiply(&cameraViewProj, &ctx->mwView, &ctx->mwProj);
     D3DXMatrixInverse(&inverseCameraProj, NULL, &cameraViewProj);
 
     // Render near layer (changes viewport)
-    renderShadowLayer(0, shadowNearRadius, &inverseCameraProj);
+    renderShadowLayer(ctx, 0, shadowNearRadius, &inverseCameraProj);
 
     // Render far layer (changes viewport)
-    renderShadowLayer(1, shadowFarRadius, &inverseCameraProj);
+    renderShadowLayer(ctx, 1, shadowFarRadius, &inverseCameraProj);
 
     // Reset viewport
     device->SetViewport(&vp);
@@ -84,7 +84,7 @@ void DistantLand::renderShadowMap() {
 }
 
 template<class T>
-void DistantLand::renderShadowLayerGeneric(MWBridge* mwBridge, int layer, const D3DXMATRIX* inverseCameraProj, D3DXMATRIX* view, D3DXMATRIX* proj, VisibleSet<T>& visible_set) {
+void DistantLand::renderShadowLayerGeneric(DLContext* ctx, MWBridge* mwBridge, int layer, const D3DXMATRIX* inverseCameraProj, D3DXMATRIX* view, D3DXMATRIX* proj, VisibleSet<T>& visible_set) {
     // Clip to atlas region with viewport
     const DWORD res = Configuration.DL.ShadowResolution;
     D3DVIEWPORT9 vp = { layer * res, 0, res, res, 0.0f, 1.0f };
@@ -102,7 +102,7 @@ void DistantLand::renderShadowLayerGeneric(MWBridge* mwBridge, int layer, const 
     effectShadow->BeginPass(PASS_RENDERSHADOWMAP);
 
     if (mwBridge->IsExterior()) {
-        renderDistantLand(effectShadow, view, proj);
+        renderDistantLand(ctx, effectShadow, view, proj);
     }
 
     device->SetVertexDeclaration(StaticDecl);
@@ -112,26 +112,26 @@ void DistantLand::renderShadowLayerGeneric(MWBridge* mwBridge, int layer, const 
 }
 
 // renderShadowLayer - Calculates projection for, and renders, one shadow layer
-void DistantLand::renderShadowLayer(int layer, float radius, const D3DXMATRIX* inverseCameraProj) {
+void DistantLand::renderShadowLayer(DLContext* ctx, int layer, float radius, const D3DXMATRIX* inverseCameraProj) {
     auto mwBridge = MWBridge::get();
     D3DXVECTOR3 lookAt, lookAtEye, shadowCameraPos, up(0, 0, 1);
-    D3DXMATRIX* view = &smView[layer], *proj = &smProj[layer], *viewproj = &smViewproj[layer];
+    D3DXMATRIX* view = &ctx->smView[layer], *proj = &ctx->smProj[layer], *viewproj = &ctx->smViewproj[layer];
 
     // Select light vector, sunPos during daytime, sunVec during night
-    D3DXVECTOR4 lightVec = (sunPos.z > 0) ? -sunPos : sunVec;
+    D3DXVECTOR4 lightVec = (ctx->sunPos.z > 0) ? -ctx->sunPos : ctx->sunVec;
 
     // Centre of projection is one radius ahead of the player
     // Not as far in z direction as player is likely looking at the ground plane rather than below
     // This will be split into a non-texel-quantized but temporally stable view position part,
     // and a texel-quantized view rotation part with small magnitude
-    lookAt.x = eyePos.x + radius * eyeVec.x;
-    lookAt.y = eyePos.y + radius * eyeVec.y;
-    lookAt.z = eyePos.z + 0.5f * radius * eyeVec.z;
+    lookAt.x = ctx->eyePos.x + radius * ctx->eyeVec.x;
+    lookAt.y = ctx->eyePos.y + radius * ctx->eyeVec.y;
+    lookAt.z = ctx->eyePos.z + 0.5f * radius * ctx->eyeVec.z;
 
     // Quantize eye position to partially reduce texture swimming during camera movement
-    lookAtEye.x = float(16.0 * std::floor(0.0625 * eyePos.x));
-    lookAtEye.y = float(16.0 * std::floor(0.0625 * eyePos.y));
-    lookAtEye.z = float(16.0 * std::floor(0.0625 * eyePos.z));
+    lookAtEye.x = float(16.0 * std::floor(0.0625 * ctx->eyePos.x));
+    lookAtEye.y = float(16.0 * std::floor(0.0625 * ctx->eyePos.y));
+    lookAtEye.z = float(16.0 * std::floor(0.0625 * ctx->eyePos.z));
 
     // Create shadow frustum centred on lookAtEye, looking along lightVec
     const float zrange = kCellSize;
@@ -165,7 +165,7 @@ void DistantLand::renderShadowLayer(int layer, float radius, const D3DXMATRIX* i
         // because shadow meshes don't need to be sorted, we can read and write in parallel
         ipcClient.getVisibleMeshesCoarse(visExtraSharedId, range_frustum, VIS_STATIC);
 
-        renderShadowLayerGeneric(mwBridge, layer, inverseCameraProj, view, proj, visExtraShared);
+        renderShadowLayerGeneric(ctx, mwBridge, layer, inverseCameraProj, view, proj, visExtraShared);
     } else {
         VisibleSet<StlVector> visible_set((StlVector()));
 
@@ -173,18 +173,18 @@ void DistantLand::renderShadowLayer(int layer, float radius, const D3DXMATRIX* i
         DistantLandShare::currentWorldSpace->FarStatics->GetVisibleMeshesCoarse(range_frustum, visible_set);
         DistantLandShare::currentWorldSpace->VeryFarStatics->GetVisibleMeshesCoarse(range_frustum, visible_set);
 
-        renderShadowLayerGeneric(mwBridge, layer, inverseCameraProj, view, proj, visible_set);
+        renderShadowLayerGeneric(ctx, mwBridge, layer, inverseCameraProj, view, proj, visible_set);
     }
 }
 
 // renderShadow - Renders shadows (using blending) over Morrowind shadow receivers
-void DistantLand::renderShadow() {
+void DistantLand::renderShadow(DLContext* ctx) {
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_ShadowOverlay, 0, (int)recordMW.size());
     // Supply view space -> shadow clip space matrix
     D3DXMATRIX inverseView, viewToShadow[2];
-    D3DXMatrixInverse(&inverseView, NULL, &mwView);
-    viewToShadow[0] = inverseView * smViewproj[0];
-    viewToShadow[1] = inverseView * smViewproj[1];
+    D3DXMatrixInverse(&inverseView, NULL, &ctx->mwView);
+    viewToShadow[0] = inverseView * ctx->smViewproj[0];
+    viewToShadow[1] = inverseView * ctx->smViewproj[1];
     effect->SetMatrixArray(ehShadowViewproj, viewToShadow, 2);
 
     // Bind filtered ESM
@@ -237,16 +237,16 @@ void DistantLand::renderShadow() {
 }
 
 // renderShadowDebug - display shadow layers
-void DistantLand::renderShadowDebug() {
+void DistantLand::renderShadowDebug(DLContext* ctx) {
     UINT passes;
 
     // Create shadow clip space -> camera clip space matrices
     D3DXMATRIX inverseShadowViewProj, cameraViewProj, shadowToCameraProj[2];
 
-    D3DXMatrixMultiply(&cameraViewProj, &mwView, &mwProj);
-    D3DXMatrixInverse(&inverseShadowViewProj, NULL, &smViewproj[0]);
+    D3DXMatrixMultiply(&cameraViewProj, &ctx->mwView, &ctx->mwProj);
+    D3DXMatrixInverse(&inverseShadowViewProj, NULL, &ctx->smViewproj[0]);
     D3DXMatrixMultiply(&shadowToCameraProj[0], &inverseShadowViewProj, &cameraViewProj);
-    D3DXMatrixInverse(&inverseShadowViewProj, NULL, &smViewproj[1]);
+    D3DXMatrixInverse(&inverseShadowViewProj, NULL, &ctx->smViewproj[1]);
     D3DXMatrixMultiply(&shadowToCameraProj[1], &inverseShadowViewProj, &cameraViewProj);
 
     // Display shadow layers in top right corner

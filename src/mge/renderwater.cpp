@@ -9,13 +9,13 @@
 
 
 
-void DistantLand::renderWaterReflection(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
+void DistantLand::renderWaterReflection(DLContext* ctx, const D3DXMATRIX* view, const D3DXMATRIX* proj) {
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_WaterReflection, 0);
     auto mwBridge = MWBridge::get();
 
     // Switch to render target
     RenderTargetSwitcher rtsw(texReflection, surfReflectionZ);
-    device->Clear(0, NULL, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, horizonCol, 1.0, 0);
+    device->Clear(0, NULL, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, ctx->horizonCol, 1.0, 0);
 
     // Calculate reflected view matrix, mirror plane at water mesh level
     D3DXMATRIX reflView;
@@ -33,7 +33,7 @@ void DistantLand::renderWaterReflection(const D3DXMATRIX* view, const D3DXMATRIX
     D3DXMATRIX clipMat;
 
     // Clip geometry on opposite side of water plane
-    plane *= mwBridge->IsUnderwater(eyePos.z) ? -1.0f : 1.0f;
+    plane *= mwBridge->IsUnderwater(ctx->eyePos.z) ? -1.0f : 1.0f;
 
     // If using dynamic ripples, the water level can be lowered by up to 0.5 * waveheight
     // so move clip plane downwards at the cost of some reflection errors
@@ -71,24 +71,24 @@ void DistantLand::renderWaterReflection(const D3DXMATRIX* view, const D3DXMATRIX
         // Draw land reflection, with opposite culling
         effect->BeginPass(PASS_RENDERLANDREFL);
         device->SetRenderState(D3DRS_CULLMODE, D3DCULL_CCW);
-        renderDistantLand(effect, &reflView, &reflProj);
+        renderDistantLand(ctx, effect, &reflView, &reflProj);
         effect->EndPass();
     }
 
     if (isDistantCell() && (Configuration.MGEFlags & REFLECT_NEAR)) {
         // Draw statics reflection, with opposite culling and no dissolve
-        DWORD p = (mwBridge->CellHasWeather() && !mwBridge->IsUnderwater(eyePos.z)) ? PASS_RENDERSTATICSEXTERIOR : PASS_RENDERSTATICSINTERIOR;
+        DWORD p = (mwBridge->CellHasWeather() && !mwBridge->IsUnderwater(ctx->eyePos.z)) ? PASS_RENDERSTATICSEXTERIOR : PASS_RENDERSTATICSINTERIOR;
         effect->SetFloat(ehNearViewRange, 0);
         effect->BeginPass(p);
         device->SetRenderState(D3DRS_CULLMODE, D3DCULL_CCW);
-        renderReflectedStatics(&reflView, &reflProj);
+        renderReflectedStatics(ctx, &reflView, &reflProj);
         effect->EndPass();
-        effect->SetFloat(ehNearViewRange, nearViewRange);
+        effect->SetFloat(ehNearViewRange, ctx->nearViewRange);
     }
 
-    if ((Configuration.MGEFlags & REFLECT_SKY) && !recordSky.empty() && !mwBridge->IsUnderwater(eyePos.z)) {
+    if ((Configuration.MGEFlags & REFLECT_SKY) && !recordSky.empty() && !mwBridge->IsUnderwater(ctx->eyePos.z)) {
         // Draw sky reflection, with opposite culling
-        renderReflectedSky();
+        renderReflectedSky(ctx);
     }
 
     // Restore view state
@@ -97,9 +97,9 @@ void DistantLand::renderWaterReflection(const D3DXMATRIX* view, const D3DXMATRIX
     effect->SetMatrix(ehProj, proj);
 }
 
-void DistantLand::renderReflectedSky() {
+void DistantLand::renderReflectedSky(DLContext* ctx) {
     // Sky objects are not correctly positioned at infinity, so correction is required
-    const float adjustZ = -2.0f * eyePos.z;
+    const float adjustZ = -2.0f * ctx->eyePos.z;
     D3DXMATRIX skyScale, worldTransform;
     D3DXMatrixScaling(&skyScale, 1e6, 1e6, 1e6);
 
@@ -192,13 +192,13 @@ void DistantLand::renderReflectedSky() {
     effect->EndPass();
 }
 
-void DistantLand::renderReflectedStatics(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
+void DistantLand::renderReflectedStatics(DLContext* ctx, const D3DXMATRIX* view, const D3DXMATRIX* proj) {
     // Select appropriate static clipping distance
     D3DXMATRIX ds_proj = *proj, ds_viewproj;
     float zn = 4.0f, zf = Configuration.DL.NearStaticEnd * kCellSize;
 
     // Don't draw beyond fully fogged distance; early out if frustum is empty
-    zf = std::min(fogEnd, zf);
+    zf = std::min(ctx->fogEnd, zf);
     if (zf <= zn) {
         return;
     }
@@ -209,7 +209,7 @@ void DistantLand::renderReflectedStatics(const D3DXMATRIX* view, const D3DXMATRI
 
     // Cull sort and draw
     ViewFrustum range_frustum(&ds_viewproj);
-    D3DXVECTOR4 viewsphere(eyePos.x, eyePos.y, eyePos.z, zf);
+    D3DXVECTOR4 viewsphere(ctx->eyePos.x, ctx->eyePos.y, ctx->eyePos.z, zf);
 
     if (Configuration.UseSharedMemory) {
         visExtraShared.RemoveAll();
@@ -232,21 +232,21 @@ void DistantLand::renderReflectedStatics(const D3DXMATRIX* view, const D3DXMATRI
     }
 }
 
-void DistantLand::clearReflection() {
+void DistantLand::clearReflection(DLContext* ctx) {
     auto mwBridge = MWBridge::get();
     IDirect3DSurface9* target;
     DWORD baseColour;
 
     texReflection->GetSurfaceLevel(0, &target);
-    if (mwBridge->CellHasWeather() || mwBridge->IsUnderwater(eyePos.z)) {
+    if (mwBridge->CellHasWeather() || mwBridge->IsUnderwater(ctx->eyePos.z)) {
         // Use fog colour as reflection
-        baseColour = (DWORD)horizonCol;
+        baseColour = (DWORD)ctx->horizonCol;
     } else {
         // Interior fog colour is typically too bright
         // Guess a reflection colour based on cell lighting parameters
         const BYTE* sun = mwBridge->getInteriorSun();
         RGBVECTOR c(sun[0] / 255.0f, sun[1] / 255.0f, sun[2] / 255.0f);
-        c += ambCol;
+        c += ctx->ambCol;
         baseColour = (DWORD)c;
     }
     device->ColorFill(target, 0, baseColour);
@@ -446,12 +446,12 @@ void DistantLand::simulateDynamicWaves() {
     effect->SetFloat(ehWaveHeight, (float)Configuration.DL.WaterWaveHeight);
 }
 
-void DistantLand::renderWaterPlane() {
+void DistantLand::renderWaterPlane(DLContext* ctx) {
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_WaterPlane, 0, 1);
     D3DXMATRIX m;
     IDirect3DTexture9* texRefract = PostShaders::borrowBuffer(0);
 
-    D3DXMatrixTranslation(&m, eyePos.x, eyePos.y, MWBridge::get()->WaterLevel());
+    D3DXMatrixTranslation(&m, ctx->eyePos.x, ctx->eyePos.y, MWBridge::get()->WaterLevel());
     effect->SetMatrix(ehWorld, &m);
     effect->SetTexture(ehTex0, texReflection);
     effect->SetTexture(ehTex1, texWater);

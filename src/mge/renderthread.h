@@ -6,6 +6,8 @@
 #include <condition_variable>
 #include <atomic>
 
+struct DLContext;
+
 /**
  * RenderThread - Manages a dedicated thread for GPU rendering operations.
  *
@@ -37,6 +39,7 @@ public:
         WorkType type = WorkType::None;
         int sceneCount = 0;
         int bufferIndex = -1;
+        DLContext* ctx = nullptr;
     };
 
     enum class State {
@@ -61,8 +64,8 @@ private:
     void workerLoop();
 
     void executeRenderStage0();
-    void executeRenderStage1();
-    void executeRenderStage2();
+    void executeRenderStage1(DLContext* ctx);
+    void executeRenderStage2(DLContext* ctx);
     void executeReplayHLSL(int sceneCount);
     void executeFullFrame(int bufferIndex);
 

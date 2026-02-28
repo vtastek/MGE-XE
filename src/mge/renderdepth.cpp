@@ -14,7 +14,7 @@
 
 
 
-void DistantLand::renderDepth() {
+void DistantLand::renderDepth(DLContext* ctx) {
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_Depth, 0, (int)recordMW.size());
     auto mwBridge = MWBridge::get();
 
@@ -34,7 +34,7 @@ void DistantLand::renderDepth() {
 
     // Projection should match main rendering
     // For Morrowind geometry, use Morrowind's native near plane to match recording
-    D3DXMATRIX mwDepthProj = mwProj;
+    D3DXMATRIX mwDepthProj = ctx->mwProj;
     // Morrowind uses near=1.0, but we extend far plane for better depth precision
     if (Configuration.MGEFlags & USE_DISTANT_LAND) {
         editProjectionZ(&mwDepthProj, 1.0f, Configuration.DL.DrawDist * kCellSize);
@@ -54,24 +54,24 @@ void DistantLand::renderDepth() {
     effectDepth->EndPass();
 
     // Reset projection matrix
-    effect->SetMatrix(ehProj, &mwProj);
+    effect->SetMatrix(ehProj, &ctx->mwProj);
 }
 
-void DistantLand::renderDepthDistantLand() {
+void DistantLand::renderDepthDistantLand(DLContext* ctx) {
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_DepthDistant, 0);
     auto mwBridge = MWBridge::get();
 
     // RT is set by caller (renderStage1) to avoid redundant switches
 
     // Projection for distant land
-    D3DXMATRIX mwDepthProj = mwProj;
+    D3DXMATRIX mwDepthProj = ctx->mwProj;
     if (Configuration.MGEFlags & USE_DISTANT_LAND) {
         editProjectionZ(&mwDepthProj, 1.0f, Configuration.DL.DrawDist * kCellSize);
     }
     effect->SetMatrix(ehProj, &mwDepthProj);
 
     if (isDistantCell()) {
-        if (!mwBridge->IsUnderwater(eyePos.z)) {
+        if (!mwBridge->IsUnderwater(ctx->eyePos.z)) {
             // Distant land
             if (mwBridge->IsExterior()) {
                 effectDepth->BeginPass(PASS_RENDERLANDDEPTH);
@@ -99,10 +99,10 @@ void DistantLand::renderDepthDistantLand() {
     }
 
     // Reset projection matrix
-    effect->SetMatrix(ehProj, &mwProj);
+    effect->SetMatrix(ehProj, &ctx->mwProj);
 }
 
-void DistantLand::renderDepthAdditional() {
+void DistantLand::renderDepthAdditional(DLContext* ctx) {
     // Switch to render target
     RenderTargetSwitcher rtsw(surfDepthFrameMSAA, surfDepthDepth);
 
@@ -111,7 +111,7 @@ void DistantLand::renderDepthAdditional() {
 
     // Projection should match main rendering
     // For Morrowind geometry, use Morrowind's native near plane to match recording
-    D3DXMATRIX mwDepthProj = mwProj;
+    D3DXMATRIX mwDepthProj = ctx->mwProj;
     if (Configuration.MGEFlags & USE_DISTANT_LAND) {
         editProjectionZ(&mwDepthProj, 1.0f, Configuration.DL.DrawDist * kCellSize);
     }
@@ -123,7 +123,7 @@ void DistantLand::renderDepthAdditional() {
     effectDepth->EndPass();
 
     // Reset projection matrix
-    effect->SetMatrix(ehProj, &mwProj);
+    effect->SetMatrix(ehProj, &ctx->mwProj);
 }
 
 void DistantLand::renderDepthRecorded() {

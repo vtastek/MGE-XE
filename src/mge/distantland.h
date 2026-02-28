@@ -263,36 +263,36 @@ public:
     static DLContext captureContext();
 
     static void renderSky();
-    static void renderStage0();
-    static void renderStage1();
-    static void renderStage2();
-    static void renderStageBlend();
-    static void renderStageWater();
+    static DLContext renderStage0();
+    static void renderStage1(DLContext* ctx);
+    static void renderStage2(DLContext* ctx);
+    static void renderStageBlend(DLContext* ctx);
+    static void renderStageWater(DLContext* ctx);
 
-    static void setupCommonEffect(const D3DXMATRIX* view,const  D3DXMATRIX* proj);
+    static void setupCommonEffect(DLContext* ctx, const D3DXMATRIX* view, const D3DXMATRIX* proj);
 
-    static void renderDistantLand(ID3DXEffect* e, const D3DXMATRIX* view, const D3DXMATRIX* proj);
+    static void renderDistantLand(DLContext* ctx, ID3DXEffect* e, const D3DXMATRIX* view, const D3DXMATRIX* proj);
     static void renderDistantLandZ();
-    static void cullDistantStatics(const D3DXMATRIX* view, const D3DXMATRIX* proj);
-    static void renderDistantStatics();
-    static void cullGrass(const D3DXMATRIX* view, const D3DXMATRIX* proj);
+    static void cullDistantStatics(DLContext* ctx, const D3DXMATRIX* view, const D3DXMATRIX* proj);
+    static void renderDistantStatics(DLContext* ctx);
+    static void cullGrass(DLContext* ctx, const D3DXMATRIX* view, const D3DXMATRIX* proj);
     template<class T>
     static void buildGrassInstanceVB(VisibleSet<T>& grassSet);
     static bool hasVisibleGrass();
-    static void renderGrassInst();
+    static void renderGrassInst(DLContext* ctx);
     static void renderGrassInstZ();
     static void renderGrassCommon(ID3DXEffect* e);
 
-    static void renderWaterReflection(const D3DXMATRIX* view, const D3DXMATRIX* proj);
-    static void renderReflectedSky();
-    static void renderReflectedStatics(const D3DXMATRIX* view, const D3DXMATRIX* proj);
-    static void clearReflection();
+    static void renderWaterReflection(DLContext* ctx, const D3DXMATRIX* view, const D3DXMATRIX* proj);
+    static void renderReflectedSky(DLContext* ctx);
+    static void renderReflectedStatics(DLContext* ctx, const D3DXMATRIX* view, const D3DXMATRIX* proj);
+    static void clearReflection(DLContext* ctx);
     static void simulateDynamicWaves();
-    static void renderWaterPlane();
+    static void renderWaterPlane(DLContext* ctx);
 
-    static void renderDepth();
-    static void renderDepthDistantLand();
-    static void renderDepthAdditional();
+    static void renderDepth(DLContext* ctx);
+    static void renderDepthDistantLand(DLContext* ctx);
+    static void renderDepthAdditional(DLContext* ctx);
     static void renderDepthRecorded();
     static void generateHiZMipsGPU();
     static void copyHiZToStaging();
@@ -304,14 +304,14 @@ public:
     // Texture-based lighting system
     static float computeLightRadius(float constant, float linear, float quadratic);
 
-    static void renderShadowMap();
+    static void renderShadowMap(DLContext* ctx);
     template<class T>
-    static void renderShadowLayerGeneric(MWBridge* mwBridge, int layer, const D3DXMATRIX* inverseCameraProj, D3DXMATRIX* view, D3DXMATRIX* proj, VisibleSet<T>& visible_set);
-    static void renderShadowLayer(int layer, float radius, const D3DXMATRIX* inverseCameraProj);
-    static void renderShadow();
-    static void renderShadowDebug();
+    static void renderShadowLayerGeneric(DLContext* ctx, MWBridge* mwBridge, int layer, const D3DXMATRIX* inverseCameraProj, D3DXMATRIX* view, D3DXMATRIX* proj, VisibleSet<T>& visible_set);
+    static void renderShadowLayer(DLContext* ctx, int layer, float radius, const D3DXMATRIX* inverseCameraProj);
+    static void renderShadow(DLContext* ctx);
+    static void renderShadowDebug(DLContext* ctx);
 
-    static void postProcess();
+    static void postProcess(DLContext* ctx);
     static void updatePostShader(MGEShader* shader);
 
     static void requestCapture(std::function<void(IDirect3DSurface9*)> handler, bool captureWithUI);

@@ -86,10 +86,10 @@ void DistantLand::renderSky() {
     effect->EndPass();
 }
 
-void DistantLand::renderDistantLand(ID3DXEffect* e, const D3DXMATRIX* view, const D3DXMATRIX* proj) {
+void DistantLand::renderDistantLand(DLContext* ctx, ID3DXEffect* e, const D3DXMATRIX* view, const D3DXMATRIX* proj) {
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_DistantLand, 0);
     D3DXMATRIX world, viewproj = (*view) * (*proj);
-    D3DXVECTOR4 viewsphere(eyePos.x, eyePos.y, eyePos.z, Configuration.DL.DrawDist * kCellSize);
+    D3DXVECTOR4 viewsphere(ctx->eyePos.x, ctx->eyePos.y, ctx->eyePos.z, Configuration.DL.DrawDist * kCellSize);
 
     // Cull and draw
     ViewFrustum frustum(&viewproj);
@@ -138,11 +138,11 @@ void DistantLand::renderDistantLandZ() {
     }
 }
 
-void DistantLand::cullDistantStatics(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
+void DistantLand::cullDistantStatics(DLContext* ctx, const D3DXMATRIX* view, const D3DXMATRIX* proj) {
     D3DXMATRIX ds_proj = *proj, ds_viewproj;
-    D3DXVECTOR4 viewsphere(eyePos.x, eyePos.y, eyePos.z, 0);
-    float zn = nearViewRange - 768.0f, zf = zn;
-    float cullDist = fogEnd;
+    D3DXVECTOR4 viewsphere(ctx->eyePos.x, ctx->eyePos.y, ctx->eyePos.z, 0);
+    float zn = ctx->nearViewRange - 768.0f, zf = zn;
+    float cullDist = ctx->fogEnd;
 
 
     if (Configuration.UseSharedMemory) {
@@ -213,13 +213,13 @@ void DistantLand::cullDistantStatics(const D3DXMATRIX* view, const D3DXMATRIX* p
     }
 }
 
-void DistantLand::renderDistantStatics() {
+void DistantLand::renderDistantStatics(DLContext* ctx) {
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_DistantStatics, 0);
     if (!MWBridge::get()->IsExterior()) {
         // Set clipping to stop large architectural meshes (that don't match exactly)
         // from visible overdrawing and causing z-buffer occlusion
-        float clipAt = nearViewRange - 768.0f;
-        D3DXPLANE clipPlane(0, 0, clipAt, -(mwProj._33 * clipAt + mwProj._43));
+        float clipAt = ctx->nearViewRange - 768.0f;
+        D3DXPLANE clipPlane(0, 0, clipAt, -(ctx->mwProj._33 * clipAt + ctx->mwProj._43));
         device->SetClipPlane(0, clipPlane);
         device->SetRenderState(D3DRS_CLIPPLANEENABLE, 1);
     }

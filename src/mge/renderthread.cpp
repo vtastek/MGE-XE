@@ -83,10 +83,10 @@ void RenderThread::workerLoop() {
                 executeRenderStage0();
                 break;
             case WorkType::RenderStage1:
-                executeRenderStage1();
+                executeRenderStage1(work.ctx);
                 break;
             case WorkType::RenderStage2:
-                executeRenderStage2();
+                executeRenderStage2(work.ctx);
                 break;
             case WorkType::ReplayHLSL:
                 executeReplayHLSL(work.sceneCount);
@@ -139,14 +139,14 @@ void RenderThread::executeRenderStage0() {
     DistantLand::renderStage0();
 }
 
-void RenderThread::executeRenderStage1() {
+void RenderThread::executeRenderStage1(DLContext* ctx) {
     MGE_ZoneScopedN("RT_RenderStage1");
-    DistantLand::renderStage1();
+    DistantLand::renderStage1(ctx);
 }
 
-void RenderThread::executeRenderStage2() {
+void RenderThread::executeRenderStage2(DLContext* ctx) {
     MGE_ZoneScopedN("RT_RenderStage2");
-    DistantLand::renderStage2();
+    DistantLand::renderStage2(ctx);
 }
 
 void RenderThread::executeReplayHLSL(int sceneCount) {

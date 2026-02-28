@@ -139,7 +139,25 @@ float DistantLand::nearViewRange;
 float DistantLand::windScaling, DistantLand::niceWeather;
 float DistantLand::lightSunMult, DistantLand::lightAmbMult;
 
-DLContext DistantLand::s_staging = {};
+DLContext DistantLand::s_staging = {
+    {}, {},                                              // mwView, mwProj
+    {}, {},                                              // eyeVec, eyePos
+    {}, {},                                              // sunVec, sunPos
+    0,                                                   // sunVis
+    {}, {}, {},                                          // sunCol, sunAmb, ambCol
+    {}, {},                                              // horizonCol, nearFogCol
+    {0.07f, 0.36f, 0.76f},                              // atmOutscatter
+    {0.25f, 0.38f, 0.48f},                              // atmInscatter
+    {0.4456f, 0.6194f, 1.0f, 0.44f},                    // atmSkylightScatter
+    0, 0,                                                // fogStart, fogEnd
+    0, 0,                                                // fogExpStart, fogExpDivisor
+    0, 0,                                                // fogNearStart, fogNearEnd
+    0,                                                   // nearViewRange
+    0, 0,                                                // windScaling, niceWeather
+    0, 0,                                                // lightSunMult, lightAmbMult
+    {}, {}, {},                                          // smView[2], smProj[2], smViewproj[2]
+    false, false                                         // isRenderCached, isPPLActive
+};
 
 D3DXHANDLE DistantLand::ehRcpRes;
 D3DXHANDLE DistantLand::ehShadowRcpRes;

@@ -10,13 +10,13 @@
 
 
 
-void DistantLand::cullGrass(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
+void DistantLand::cullGrass(DLContext* ctx, const D3DXMATRIX* view, const D3DXMATRIX* proj) {
     D3DXMATRIX ds_proj = *proj, ds_viewproj;
-    float zn = 4.0f, zf = nearViewRange;
+    float zn = 4.0f, zf = ctx->nearViewRange;
 
     // Don't draw beyond fully fogged distance; early out if frustum is empty
     if (~Configuration.MGEFlags & EXP_FOG) {
-        zf = std::min(fogEnd, zf);
+        zf = std::min(ctx->fogEnd, zf);
     }
     if (zf <= zn) {
         return;
@@ -112,13 +112,13 @@ bool DistantLand::hasVisibleGrass() {
 
 
 // renderGrassInst - instanced grass with shadows
-void DistantLand::renderGrassInst() {
+void DistantLand::renderGrassInst(DLContext* ctx) {
     if (!hasVisibleGrass()) {
         return;
     }
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_Grass, 0, (int)batchedGrass.size());
 
-    effect->SetMatrixArray(ehShadowViewproj, smViewproj, 2);
+    effect->SetMatrixArray(ehShadowViewproj, ctx->smViewproj, 2);
     effect->SetTexture(ehTex3, texSoftShadow);
     device->SetVertexDeclaration(GrassDecl);
 

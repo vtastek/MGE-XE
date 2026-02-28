@@ -44,6 +44,7 @@ static bool isMainView, isStencilScene, isAmbientWhite;
 static DWORD stencilRef;
 static bool stage0Complete, isFrameComplete, isHUDComplete;
 static bool isWaterMaterial, waterDrawn, distantWater;
+static DLContext frameCtx;  // Per-frame rendering context, created by renderStage0
 
 // Deferred scene forwarding — suppress empty BeginScene/EndScene pairs
 static bool scenePending = false;      // BeginScene called but not forwarded to real device
@@ -640,7 +641,7 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
             // Race menu will render an extra scene past this point
             if (DistantLand::ready && sceneCount > 0 && !isFrameComplete) {
                 ensureSceneActive();
-                DistantLand::postProcess();
+                DistantLand::postProcess(&frameCtx);
             }
 
             // Render user HUD before Morrowind HUD
@@ -674,7 +675,7 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
         if (sceneCount == 0) {
             // Edge case, render distant land even if Morrowind has culled everything
             if (!stage0Complete) {
-                DistantLand::renderStage0();
+                frameCtx = DistantLand::renderStage0();
                 stage0Complete = true;
             }
 
@@ -683,10 +684,10 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
             FixedFunctionShader::finalizeBatchAndSubmitCull();
 
             // Opaque features (cull thread runs in parallel with this)
-            DistantLand::renderStage1();
+            DistantLand::renderStage1(&frameCtx);
 
             // Blend close objects over distant land
-            DistantLand::renderStageBlend();
+            DistantLand::renderStageBlend(&frameCtx);
 
             // Wait for cull completion and replay HLSL draws
             FixedFunctionShader::waitCullAndReplay();
@@ -694,7 +695,7 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
             // Draw water if the Morrowind water plane doesn't appear in view
             // it may be too distant or stencil scene order is non-normative
             if (distantWater && !waterDrawn && !isStencilScene) {
-                DistantLand::renderStageWater();
+                DistantLand::renderStageWater(&frameCtx);
                 waterDrawn = true;
             }
         }
@@ -718,7 +719,7 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
 
     // Render depth for Scene 1+ AFTER all geometry has been captured
     if (!isFrameComplete && sceneCount > 0) {
-        DistantLand::renderStage2();
+        DistantLand::renderStage2(&frameCtx);
     }
 
     // Track offscreen scenes
@@ -990,7 +991,7 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
 
         if (!stage0Complete && !isAmbientWhite) {
             // At this point, only the sky is rendered in exteriors, or nothing in interiors
-            DistantLand::renderStage0();
+            frameCtx = DistantLand::renderStage0();
             stage0Complete = true;
         }
 
@@ -1007,7 +1008,7 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
             if (distantWater) {
                 // Call distant land instead of drawing water grid
                 if (!waterDrawn) {
-                    DistantLand::renderStageWater();
+                    DistantLand::renderStageWater(&frameCtx);
                     waterDrawn = true;
                 }
                 return D3D_OK;

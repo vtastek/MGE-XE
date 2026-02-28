@@ -726,13 +726,13 @@ namespace api {
     }
 
     void MGEAPIv1::weatherScatteringGet(float* inscatter, float* outscatter) {
-        memcpy(inscatter, &DistantLand::atmInscatter.r, 3 * sizeof(float));
-        memcpy(outscatter, &DistantLand::atmOutscatter.r, 3 * sizeof(float));
+        memcpy(inscatter, &DistantLand::s_staging.atmInscatter.r, 3 * sizeof(float));
+        memcpy(outscatter, &DistantLand::s_staging.atmOutscatter.r, 3 * sizeof(float));
     }
 
     void MGEAPIv1::weatherScatteringSet(float inscatter[3], float outscatter[3]) {
-        memcpy(&DistantLand::atmInscatter.r, inscatter, 3 * sizeof(float));
-        memcpy(&DistantLand::atmOutscatter.r, outscatter, 3 * sizeof(float));
+        memcpy(&DistantLand::s_staging.atmInscatter.r, inscatter, 3 * sizeof(float));
+        memcpy(&DistantLand::s_staging.atmOutscatter.r, outscatter, 3 * sizeof(float));
     }
 
     void MGEAPIv1::weatherDistantFogGet(int weatherID, float* fogDistMult, float* fogOffset) {
@@ -837,11 +837,11 @@ namespace api {
     }
 
     void MGEAPIv2::weatherScatteringSkylightGet(float* skylight) {
-        memcpy(skylight, &DistantLand::atmSkylightScatter.x, 4 * sizeof(float));
+        memcpy(skylight, &DistantLand::s_staging.atmSkylightScatter.x, 4 * sizeof(float));
     }
 
     void MGEAPIv2::weatherScatteringSkylightSet(float skylight[4]) {
-        memcpy(&DistantLand::atmSkylightScatter.x, skylight, 4 * sizeof(float));
+        memcpy(&DistantLand::s_staging.atmSkylightScatter.x, skylight, 4 * sizeof(float));
     }
 
     float MGEAPIv3::nearRenderDistanceGet() {
