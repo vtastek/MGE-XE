@@ -59,37 +59,6 @@ DLContext DistantLand::renderStage0() {
     // Snapshot all per-frame state into context (foundation for threading)
     DLContext ctx = captureContext();
 
-    // Write back statics still read by ffeshader.cpp and external code
-    // These are removed in Step 4 when ffeshader is also migrated
-    mwView = ctx.mwView;
-    mwProj = ctx.mwProj;
-    eyeVec = ctx.eyeVec;
-    eyePos = ctx.eyePos;
-    sunVec = ctx.sunVec;
-    sunPos = ctx.sunPos;
-    sunVis = ctx.sunVis;
-    sunCol = ctx.sunCol;
-    sunAmb = ctx.sunAmb;
-    ambCol = ctx.ambCol;
-    horizonCol = ctx.horizonCol;
-    nearFogCol = ctx.nearFogCol;
-    atmOutscatter = ctx.atmOutscatter;
-    atmInscatter = ctx.atmInscatter;
-    atmSkylightScatter = ctx.atmSkylightScatter;
-    fogStart = ctx.fogStart;
-    fogEnd = ctx.fogEnd;
-    fogExpStart = ctx.fogExpStart;
-    fogExpDivisor = ctx.fogExpDivisor;
-    fogNearStart = ctx.fogNearStart;
-    fogNearEnd = ctx.fogNearEnd;
-    nearViewRange = ctx.nearViewRange;
-    windScaling = ctx.windScaling;
-    niceWeather = ctx.niceWeather;
-    lightSunMult = ctx.lightSunMult;
-    lightAmbMult = ctx.lightAmbMult;
-    isRenderCached = ctx.isRenderCached;
-    isPPLActive = ctx.isPPLActive;
-
     setupCommonEffect(&ctx, &ctx.mwView, &ctx.mwProj);
     FixedFunctionShader::updateLighting(ctx.lightSunMult, ctx.lightAmbMult);
 
@@ -110,10 +79,8 @@ DLContext DistantLand::renderStage0() {
                     g_passBreaks.mge_shadowRT += 2; // RenderTargetSwitcher in renderShadowMap
                     effectShadow->End();
 
-                    // Write shadow matrices back to statics — ffeshader.cpp reads them directly
-                    memcpy(smView, ctx.smView, sizeof(smView));
-                    memcpy(smProj, ctx.smProj, sizeof(smProj));
-                    memcpy(smViewproj, ctx.smViewproj, sizeof(smViewproj));
+                    // Write shadow viewproj back to s_staging for ffeshader/mged3d8device reads
+                    memcpy(s_staging.smViewproj, ctx.smViewproj, sizeof(s_staging.smViewproj));
                 }
             }
 
@@ -1153,7 +1120,7 @@ IDirect3DSurface9* DistantLand::captureScreenshot() {
     t->GetSurfaceLevel(0, &s);
 
     // Cancel render cache, borrowBuffer just overwrote it
-    isRenderCached = false;
+    s_staging.isRenderCached = false;
 
     // Copy buffer to system memory surface
     IDirect3DSurface9* surfSS;

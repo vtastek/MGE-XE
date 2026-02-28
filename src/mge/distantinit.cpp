@@ -26,8 +26,6 @@ using std::string_view;
 using std::vector;
 
 bool DistantLand::ready = false;
-bool DistantLand::isRenderCached = false;
-bool DistantLand::isPPLActive = false;
 int DistantLand::numWaterVerts, DistantLand::numWaterTris;
 
 // Cull thread for CPU-side occlusion culling (heap-allocated to avoid
@@ -120,24 +118,6 @@ IDirect3DTexture9* DistantLand::texSoftShadow;
 IDirect3DSurface9* DistantLand::surfShadowZ;
 IDirect3DVertexBuffer9* DistantLand::vbFullFrame;
 IDirect3DVertexBuffer9* DistantLand::vbClipCube;
-
-D3DXMATRIX DistantLand::mwView, DistantLand::mwProj;
-D3DXMATRIX DistantLand::smView[2], DistantLand::smProj[2];
-D3DXMATRIX DistantLand::smViewproj[2];
-D3DXVECTOR4 DistantLand::eyeVec, DistantLand::eyePos;
-D3DXVECTOR4 DistantLand::sunVec, DistantLand::sunPos;
-float DistantLand::sunVis;
-RGBVECTOR DistantLand::sunCol, DistantLand::sunAmb, DistantLand::ambCol;
-RGBVECTOR DistantLand::nearFogCol, DistantLand::horizonCol;
-RGBVECTOR DistantLand::atmOutscatter(0.07, 0.36, 0.76);
-RGBVECTOR DistantLand::atmInscatter(0.25, 0.38, 0.48);
-D3DXVECTOR4 DistantLand::atmSkylightScatter(0.4456, 0.6194, 1.0, 0.44);
-float DistantLand::fogStart, DistantLand::fogEnd;
-float DistantLand::fogExpStart, DistantLand::fogExpDivisor;
-float DistantLand::fogNearStart, DistantLand::fogNearEnd;
-float DistantLand::nearViewRange;
-float DistantLand::windScaling, DistantLand::niceWeather;
-float DistantLand::lightSunMult, DistantLand::lightAmbMult;
 
 DLContext DistantLand::s_staging = {
     {}, {},                                              // mwView, mwProj
@@ -352,7 +332,7 @@ bool DistantLand::init() {
     BSA::logDeviceState(device, "AFTER_DISTANT_LAND_INIT");
 
     ready = true;
-    isRenderCached = false;
+    s_staging.isRenderCached = false;
     return true;
 }
 
@@ -1759,7 +1739,7 @@ void DistantLand::release() {
     LOG::logline("-- Renderer unloaded");
     LOG::flush();
 
-    fogNearEnd = 0;
+    s_staging.fogNearEnd = 0;
     device = nullptr;
     ready = false;
 }

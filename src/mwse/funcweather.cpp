@@ -139,12 +139,12 @@ MWSEINSTRUCTION_DECLARE_VTABLE(mwseGetScattering)
 
 // GetWeatherScattering -> <float outscatter_red> <float outscatter_green> <float outscatter_blue> <float inscatter_red> <float inscatter_geen> <float inscatter_blue>
 bool mwseGetScattering::execute(mwseInstruction* _this) {
-    _this->vmPush(DistantLand::atmOutscatter.r);
-    _this->vmPush(DistantLand::atmOutscatter.g);
-    _this->vmPush(DistantLand::atmOutscatter.b);
-    _this->vmPush(DistantLand::atmInscatter.r);
-    _this->vmPush(DistantLand::atmInscatter.g);
-    _this->vmPush(DistantLand::atmInscatter.b);
+    _this->vmPush(DistantLand::s_staging.atmOutscatter.r);
+    _this->vmPush(DistantLand::s_staging.atmOutscatter.g);
+    _this->vmPush(DistantLand::s_staging.atmOutscatter.b);
+    _this->vmPush(DistantLand::s_staging.atmInscatter.r);
+    _this->vmPush(DistantLand::s_staging.atmInscatter.g);
+    _this->vmPush(DistantLand::s_staging.atmInscatter.b);
 
     return true;
 }

@@ -92,8 +92,6 @@ public:
     static constexpr float kMoonTag = 88888.0f;
 
     static bool ready;
-    static bool isRenderCached;
-    static bool isPPLActive;
     static int numWaterVerts, numWaterTris;
 
     static IDirect3DDevice9* device;
@@ -183,21 +181,6 @@ public:
     static std::vector<SceneLight> sceneLights;       // All unique lights in scene
     static std::unordered_map<int, size_t> sceneLightIndexMap;  // ID -> index for O(1) lookup
     static IDirect3DTexture9* texLightData;           // GPU texture with light data
-
-    static D3DXMATRIX mwView, mwProj;
-    static D3DXMATRIX smView[2], smProj[2], smViewproj[2];
-    static D3DXVECTOR4 eyeVec, eyePos, sunVec, sunPos;
-    static float sunVis;
-    static RGBVECTOR sunCol, sunAmb, ambCol;
-    static RGBVECTOR nearFogCol, horizonCol;
-    static RGBVECTOR atmOutscatter, atmInscatter;
-    static D3DXVECTOR4 atmSkylightScatter;
-    static float fogStart, fogEnd;
-    static float fogExpStart, fogExpDivisor;
-    static float fogNearStart, fogNearEnd;
-    static float nearViewRange;
-    static float windScaling, niceWeather;
-    static float lightSunMult, lightAmbMult;
 
     static D3DXHANDLE ehRcpRes, ehShadowRcpRes;
     static D3DXHANDLE ehWorld, ehView, ehProj;

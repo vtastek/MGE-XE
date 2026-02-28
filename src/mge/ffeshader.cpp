@@ -42,6 +42,10 @@ D3DXHANDLE FixedFunctionShader::ehTexgenTransform, FixedFunctionShader::ehBumpMa
 
 float FixedFunctionShader::sunMultiplier, FixedFunctionShader::ambMultiplier;
 
+// During replay, points to fb.shadowViewproj (recording-time matrices).
+// Outside replay, nullptr — callers fall back to s_staging.smViewproj.
+static const D3DXMATRIX* s_activeShadowVP = nullptr;
+
 // DXVK detection static variables
 static bool dxvkDetectionCached = false;
 static bool dxvkDetectionResult = false;
@@ -1516,8 +1520,8 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         RenderedState rsWithShadows = *rs;
 
         // Use current shadow matrices for this specific draw call during recording
-        rsWithShadows.shadowWorldViewProj[0] = rs->worldTransforms[0] * DistantLand::smViewproj[0];
-        rsWithShadows.shadowWorldViewProj[1] = rs->worldTransforms[0] * DistantLand::smViewproj[1];
+        rsWithShadows.shadowWorldViewProj[0] = rs->worldTransforms[0] * DistantLand::s_staging.smViewproj[0];
+        rsWithShadows.shadowWorldViewProj[1] = rs->worldTransforms[0] * DistantLand::s_staging.smViewproj[1];
 
         // Defer shader key computation to prepare phase (avoid texture hash lookups during recording)
         ShaderKey sk;
@@ -1535,8 +1539,8 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
     // Compute shadow world-view-projection matrices for this draw call
     // (rs from mged3d8device has zeros — compute from current shadow map VP)
     RenderedState rsWithShadows = *rs;
-    rsWithShadows.shadowWorldViewProj[0] = rs->worldTransforms[0] * DistantLand::smViewproj[0];
-    rsWithShadows.shadowWorldViewProj[1] = rs->worldTransforms[0] * DistantLand::smViewproj[1];
+    rsWithShadows.shadowWorldViewProj[0] = rs->worldTransforms[0] * DistantLand::s_staging.smViewproj[0];
+    rsWithShadows.shadowWorldViewProj[1] = rs->worldTransforms[0] * DistantLand::s_staging.smViewproj[1];
 
     renderMorrowindHLSL_Internal(&rsWithShadows, frs, lightrs);
 }
@@ -1792,8 +1796,9 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         static bool shadowTransformValid = false;
 
         if (!shadowTransformValid || !shadowMatricesValid) {
-            cachedViewToShadowLocal[0] = cachedInverseView * DistantLand::smViewproj[0];
-            cachedViewToShadowLocal[1] = cachedInverseView * DistantLand::smViewproj[1];
+            const auto* svp = s_activeShadowVP ? s_activeShadowVP : DistantLand::s_staging.smViewproj;
+            cachedViewToShadowLocal[0] = cachedInverseView * svp[0];
+            cachedViewToShadowLocal[1] = cachedInverseView * svp[1];
             shadowTransformValid = shadowMatricesValid;
         }
 
@@ -3298,8 +3303,8 @@ void FixedFunctionShader::startRecording() {
     auto& fb = frameBuffers[recordingBuffer];
     device->GetTransform(D3DTS_VIEW, &fb.view);
     device->GetTransform(D3DTS_PROJECTION, &fb.proj);
-    fb.shadowViewproj[0] = DistantLand::smViewproj[0];
-    fb.shadowViewproj[1] = DistantLand::smViewproj[1];
+    fb.shadowViewproj[0] = DistantLand::s_staging.smViewproj[0];
+    fb.shadowViewproj[1] = DistantLand::s_staging.smViewproj[1];
     fb.state = BufferState::Recording;
     fb.valid = true;
 
@@ -3997,9 +4002,9 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
         if (light.type != D3DLIGHT_POINT) continue;
 
         // Distance filter: reject lights far from camera (stale interior lights after cell change)
-        float dx = light.position.x - DistantLand::eyePos.x;
-        float dy = light.position.y - DistantLand::eyePos.y;
-        float dz = light.position.z - DistantLand::eyePos.z;
+        float dx = light.position.x - DistantLand::s_staging.eyePos.x;
+        float dy = light.position.y - DistantLand::s_staging.eyePos.y;
+        float dz = light.position.z - DistantLand::s_staging.eyePos.z;
         float distSq = dx*dx + dy*dy + dz*dz;
         const float MAX_LIGHT_DIST_SQ = 8192.0f * 8192.0f;
         if (distSq > MAX_LIGHT_DIST_SQ) continue;
@@ -4827,9 +4832,9 @@ static void fillSnapshotState(FrameSnapshot& snap) {
     }
 
     // Camera and eye position
-    snap.eyePosX = DistantLand::eyePos.x;
-    snap.eyePosY = DistantLand::eyePos.y;
-    snap.eyePosZ = DistantLand::eyePos.z;
+    snap.eyePosX = DistantLand::s_staging.eyePos.x;
+    snap.eyePosY = DistantLand::s_staging.eyePos.y;
+    snap.eyePosZ = DistantLand::s_staging.eyePos.z;
     snap.sceneLightsTotal = (int)DistantLand::sceneLights.size();
 
     // Read recorded calls from the recording buffer (already filled before rotation)
@@ -4909,19 +4914,15 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     // Get current matrices for culling
     D3DXMATRIX currentView, currentProj;
     D3DXMATRIX viewProj;
-    D3DXMATRIX savedShadowViewproj[2];
     {
         MGE_ZoneScopedN("replay_GetTransforms");
         device->GetTransform(D3DTS_VIEW, &currentView);
         device->GetTransform(D3DTS_PROJECTION, &currentProj);
     }
 
-    // Temporarily set shadow matrices to recording state
+    // Set active shadow pointer to recording-time matrices for replay
     auto& fb = frameBuffers[recordingBuffer];
-    savedShadowViewproj[0] = DistantLand::smViewproj[0];
-    savedShadowViewproj[1] = DistantLand::smViewproj[1];
-    DistantLand::smViewproj[0] = fb.shadowViewproj[0];
-    DistantLand::smViewproj[1] = fb.shadowViewproj[1];
+    s_activeShadowVP = fb.shadowViewproj;
 
     // Calculate view-projection matrix for Hi-Z culling
     viewProj = currentView * currentProj;
@@ -4964,7 +4965,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     }
 
     // Calculate camera velocity from previous frame (to compensate for one-frame-behind Hi-Z)
-    D3DXVECTOR3 currentCameraPos = D3DXVECTOR3(DistantLand::eyePos.x, DistantLand::eyePos.y, DistantLand::eyePos.z);
+    D3DXVECTOR3 currentCameraPos = D3DXVECTOR3(DistantLand::s_staging.eyePos.x, DistantLand::s_staging.eyePos.y, DistantLand::s_staging.eyePos.z);
     D3DXVECTOR3 cameraVelocity(0.0f, 0.0f, 0.0f);
     float cameraMovementMag = 0.0f;
 
@@ -5549,9 +5550,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
         savedState->Release();
     }
 
-    // Restore current shadow matrices
-    DistantLand::smViewproj[0] = savedShadowViewproj[0];
-    DistantLand::smViewproj[1] = savedShadowViewproj[1];
+    // Clear replay shadow pointer — callers revert to s_staging
+    s_activeShadowVP = nullptr;
 
     // Note: Camera position is already stored above for next frame's velocity calculation
 

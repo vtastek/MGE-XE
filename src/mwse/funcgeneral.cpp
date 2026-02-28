@@ -71,8 +71,8 @@ MWSEINSTRUCTION_DECLARE_VTABLE(mwseGetEyeVec)
 
 // GetEyeVec -> returns <float x, float y, float z>
 bool mwseGetEyeVec::execute(mwseInstruction* _this) {
-    _this->vmPush(DistantLand::eyeVec.z);
-    _this->vmPush(DistantLand::eyeVec.y);
-    _this->vmPush(DistantLand::eyeVec.x);
+    _this->vmPush(DistantLand::s_staging.eyeVec.z);
+    _this->vmPush(DistantLand::s_staging.eyeVec.y);
+    _this->vmPush(DistantLand::s_staging.eyeVec.x);
     return true;
 }

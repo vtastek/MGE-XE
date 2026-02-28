@@ -430,7 +430,7 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         g_pipelineDiag.isStencilScene = isStencilScene;
         g_pipelineDiag.isAmbientWhite = isAmbientWhite;
         g_pipelineDiag.distantLandReady = DistantLand::ready;
-        g_pipelineDiag.isPPLActive = DistantLand::isPPLActive;
+        g_pipelineDiag.isPPLActive = DistantLand::s_staging.isPPLActive;
         g_pipelineDiag.view_11 = rs.viewTransform._11;
         g_pipelineDiag.view_12 = rs.viewTransform._12;
         g_pipelineDiag.view_13 = rs.viewTransform._13;
@@ -481,8 +481,8 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
             auto& fb = FixedFunctionShader::getFrameBuffer(FixedFunctionShader::getRecordingBufferIndex());
             realDevice->GetTransform(D3DTS_VIEW, &fb.currentView);
             realDevice->GetTransform(D3DTS_PROJECTION, &fb.currentProj);
-            fb.currentShadowViewproj[0] = DistantLand::smViewproj[0];
-            fb.currentShadowViewproj[1] = DistantLand::smViewproj[1];
+            fb.currentShadowViewproj[0] = DistantLand::s_staging.smViewproj[0];
+            fb.currentShadowViewproj[1] = DistantLand::s_staging.smViewproj[1];
         }
 
         // Rotate to next FrameBuffer for the next frame's recording
