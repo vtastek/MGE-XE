@@ -4124,7 +4124,7 @@ struct FrameSnapshot {
     int totalRecordedCalls;
     int sceneLightsTotal;
     float cameraX, cameraY, cameraZ;
-    float eyePosX, eyePosY, eyePosZ;  // World position from DistantLand::eyePos
+    float eyePosX, eyePosY, eyePosZ;  // World position from DistantLand::s_staging.eyePos
     float recordCameraX, recordCameraY, recordCameraZ;
     std::vector<CallSnapshotInfo> callInfos;  // ALL calls
 
