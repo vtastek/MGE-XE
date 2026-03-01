@@ -3311,10 +3311,11 @@ void FixedFunctionShader::startRecording() {
     LOG::logline("HLSL Recording: Started recording render dispatches");
 }
 
-// prepareOcclusionCullingForDepth - Build Hi-Z pyramid and filter recordMW before depth rendering
-// Called at the start of renderStage1(), BEFORE renderDepth() executes
-void FixedFunctionShader::prepareOcclusionCullingForDepth() {
-    MGE_ZoneScopedN("Prepare Occlusion Culling for Depth");
+// executeHiZCulling - Pure CPU work: bbox computation, occluder rasterization, Hi-Z pyramid build,
+// visibility testing on recordMW and recordedCalls. Takes view/proj as parameters (no D3D device access).
+// This is a draw-thread candidate: touches no GPU state.
+void FixedFunctionShader::executeHiZCulling(const D3DXMATRIX& currentView, const D3DXMATRIX& currentProj) {
+    MGE_ZoneScopedN("Execute Hi-Z Culling");
 
     // Resize visibility results for this frame (indexed by draw order)
     visibilityResults.assign(DistantLand::recordMW.size(), -1);  // -1 = not yet tested
@@ -3445,66 +3446,94 @@ void FixedFunctionShader::prepareOcclusionCullingForDepth() {
     if (ImGuiManager::GetDisableHiZCulling()) {
         for (size_t i = 0; i < visibilityResults.size(); i++)
             visibilityResults[i] = 1;
+        // Mark all recordedCalls visible when culling disabled
+        for (auto& call : recCalls) {
+            call.shouldRender = true;
+        }
         LOG::logline(">> Depth: %d objects (Hi-Z culling DISABLED by toggle)",
                      (int)DistantLand::recordMW.size());
         return;
     }
 
-    // Direct Hi-Z culling for depth pass using bboxCache + current matrices
+    // Unified Hi-Z visibility pass over recordedCalls (pure CPU, no device access)
+    // recordedCalls already have world-space bboxes from recording/prepare phase.
+    // One loop: test each call, set shouldRender, AND populate visibilityResults[recordMWIndex]
+    // for the subsequent applyVisibilityAndFilterRecordMW() pass.
     {
-        MGE_ZoneScopedN("Filter recordMW with Hi-Z Culling");
-
-        // Get current matrices at depth-render time (not recording time!)
-        D3DXMATRIX currentView, currentProj;
-        device->GetTransform(D3DTS_VIEW, &currentView);
-        device->GetTransform(D3DTS_PROJECTION, &currentProj);
-
-        std::vector<DistantLand::RecordedState> filteredRecordMW;
-        filteredRecordMW.reserve(DistantLand::recordMW.size());
+        MGE_ZoneScopedN("Hi-Z Test recordedCalls");
 
         int visibleCount = 0, culledCount = 0, noBboxCount = 0;
 
-        for (size_t i = 0; i < DistantLand::recordMW.size(); i++) {
-            auto& obj = DistantLand::recordMW[i];
-            bool isVisible = true;  // Default to visible
-
-            // Compute world-space bbox for this entry using bboxCache
-            D3DXVECTOR3 worldBboxMin, worldBboxMax;
-            bool hasBbox = computeBoundingBox(&obj, worldBboxMin, worldBboxMax);
-
-            if (hasBbox) {
-                // Check if this is an occluder (never cull occluders)
-                MeshKey key{obj.vb, obj.ib, obj.fvf, obj.baseIndex,
-                            obj.vertCount, obj.startIndex, obj.primCount};
-                bool isOccluder = (rasterizedOccluderMeshes.count(key) > 0);
-
-                if (!isOccluder) {
-                    // Hi-Z test using CURRENT matrices (same as bbox visualization)
-                    isVisible = softwareOcclusionCuller.testBoundingBox(
-                        worldBboxMin, worldBboxMax, currentView, currentProj);
+        for (auto& call : recCalls) {
+            if (!call.hasBoundingBox) {
+                call.shouldRender = true;  // No bbox = conservative visible
+                if (call.recordMWIndex >= 0 && call.recordMWIndex < (int)visibilityResults.size()) {
+                    visibilityResults[call.recordMWIndex] = 1;
                 }
-
-                // Store visibility by index
-                visibilityResults[i] = isVisible ? 1 : 0;
-
-                if (isVisible) visibleCount++; else culledCount++;
-            } else {
-                // No bbox - keep visible (conservative), mark as tested
-                visibilityResults[i] = 1;
                 noBboxCount++;
+                continue;
             }
 
-            if (isVisible) {
-                filteredRecordMW.push_back(std::move(obj));
+            // Check if occluder (never cull occluders)
+            MeshKey key{call.rs.vb, call.rs.ib, call.rs.fvf, call.rs.baseIndex,
+                        call.rs.vertCount, call.rs.startIndex, call.rs.primCount};
+            bool isOccluder = (rasterizedOccluderMeshes.count(key) > 0);
+
+            if (isOccluder) {
+                call.shouldRender = true;
+                if (call.recordMWIndex >= 0 && call.recordMWIndex < (int)visibilityResults.size()) {
+                    visibilityResults[call.recordMWIndex] = 1;
+                }
+                visibleCount++;
+                continue;
             }
+
+            // Hi-Z test using current matrices (all CPU, no device access)
+            bool isVisible = softwareOcclusionCuller.testBoundingBox(
+                call.bboxMin, call.bboxMax, currentView, currentProj);
+
+            call.shouldRender = isVisible;
+
+            // Propagate to visibilityResults for recordMW filtering
+            if (call.recordMWIndex >= 0 && call.recordMWIndex < (int)visibilityResults.size()) {
+                visibilityResults[call.recordMWIndex] = isVisible ? 1 : 0;
+            }
+
+            if (isVisible) visibleCount++; else culledCount++;
         }
 
-        DistantLand::recordMW = std::move(filteredRecordMW);
-
-        LOG::logline(">> Depth Hi-Z: %d visible, %d culled, %d no bbox (of %d total)",
+        LOG::logline(">> Hi-Z: %d visible, %d culled, %d no bbox (of %d calls)",
                      visibleCount, culledCount, noBboxCount,
                      visibleCount + culledCount + noBboxCount);
     }
+}
+
+// applyVisibilityAndFilterRecordMW - Lightweight filter pass over recordMW using visibilityResults
+// Runs after executeHiZCulling, before renderDepth
+void FixedFunctionShader::applyVisibilityAndFilterRecordMW() {
+    MGE_ZoneScopedN("Apply Visibility Filter to recordMW");
+
+    // Non-HLSL mode or culling disabled: nothing to filter
+    if (Configuration.PerPixelLightFlags != 2 || ImGuiManager::GetDisableHiZCulling()) {
+        return;
+    }
+
+    int inputCount = (int)DistantLand::recordMW.size();
+
+    std::vector<DistantLand::RecordedState> filteredRecordMW;
+    filteredRecordMW.reserve(DistantLand::recordMW.size());
+
+    for (size_t i = 0; i < DistantLand::recordMW.size(); i++) {
+        if (visibilityResults[i] == 1 || visibilityResults[i] == -1) {
+            filteredRecordMW.push_back(std::move(DistantLand::recordMW[i]));
+        }
+    }
+
+    DistantLand::recordMW = std::move(filteredRecordMW);
+
+    int outputCount = (int)DistantLand::recordMW.size();
+    LOG::logline(">> Filter recordMW: %d in, %d out, %d culled",
+                 inputCount, outputCount, inputCount - outputCount);
 }
 
 // Dirty tracking: match current frame calls to previous frame by MeshKey
@@ -3597,7 +3626,7 @@ void FixedFunctionShader::matchPreviousFrameCalls(int bufferIndex) {
 }
 
 // Phase 2b: Prepare shader keys — runs after recording completes, before replay.
-// BBox computation and occluder rasterization already done in prepareOcclusionCullingForDepth (Phase 2a).
+// BBox computation and occluder rasterization already done in executeHiZCulling (Phase 2a).
 void FixedFunctionShader::prepareRecordedCalls(int bufferIndex) {
     MGE_ZoneScopedN("prepareRecordedCalls");
 
@@ -3680,10 +3709,10 @@ void FixedFunctionShader::stopRecordingAndReplay() {
         }
     }
 
-    // Phase 2b: Prepare shader keys (bbox + occluders already done in prepareOcclusionCullingForDepth)
+    // Phase 2b: Prepare shader keys (bbox + occluders already done in executeHiZCulling)
     prepareRecordedCalls(recordingBuffer);
 
-    // Phase 3: Replay all prepared calls (Hi-Z already built by prepareOcclusionCullingForDepth)
+    // Phase 3: Replay all prepared calls (Hi-Z already built by executeHiZCulling)
     replayRecordedCalls(0);
 
     // Data is already in frameBuffers[recordingBuffer].recordedCalls (recorded directly there)
@@ -4070,7 +4099,7 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
         currentRecordedCalls().emplace_back(rs, frs, sharedLightState, sk, recordMWIdx);
 
         // Immediately populate bboxLookup so depth pass can use current-frame bboxes
-        // (prepareOcclusionCullingForDepth runs BEFORE finalizeBatchAndReplay)
+        // (executeHiZCulling runs BEFORE finalizeBatchAndReplay)
         const auto& call = currentRecordedCalls().back();
         if (call.hasBoundingBox) {
             VBIBKey key{call.rs.vb, call.rs.ib};
@@ -4911,9 +4940,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
 
     isReplaying = true;
 
-    // Get current matrices for culling
+    // Get current matrices for debug bbox visualization and transform restoration
     D3DXMATRIX currentView, currentProj;
-    D3DXMATRIX viewProj;
     {
         MGE_ZoneScopedN("replay_GetTransforms");
         device->GetTransform(D3DTS_VIEW, &currentView);
@@ -4924,16 +4952,9 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     auto& fb = frameBuffers[recordingBuffer];
     s_activeShadowVP = fb.shadowViewproj;
 
-    // Calculate view-projection matrix for Hi-Z culling
-    viewProj = currentView * currentProj;
-
-    // Hi-Z culling statistics
+    // Hi-Z culling statistics (shouldRender pre-set by executeHiZCulling)
     int totalCalls = recCalls.size();
     int culledCalls = 0;
-    int callsWithBBox = 0;
-    int callsWithoutBBox = 0;
-    int cacheHits = 0;    // Visibility reused from depth pass
-    int cacheMisses = 0;  // New Hi-Z tests (alpha objects)
 
     // Check for debug key press (Y key) - gated behind debug hotkeys toggle
     static bool debugHiZ = false;
@@ -5189,40 +5210,13 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
         }
 #endif
 
-        // Build MeshKey for this call
-        MeshKey currentKey{call.rs.vb, call.rs.ib, call.rs.fvf, call.rs.baseIndex,
-                          call.rs.vertCount, call.rs.startIndex, call.rs.primCount};
-
-        // Visibility culling: reuse depth pass results when available
-        bool shouldRender = true;
-        bool hiZDisabled = ImGuiManager::GetDisableHiZCulling();
-        if (!hiZDisabled && call.hasBoundingBox) {
-            callsWithBBox++;
-
-            // Check if occluder (never cull occluders)
-            bool isOccluder = (rasterizedOccluderMeshes.count(currentKey) > 0);
-
-            if (!isOccluder) {
-                // Use recordMWIndex to reuse visibility results from depth pass
-                if (call.recordMWIndex >= 0 && call.recordMWIndex < (int)visibilityResults.size()) {
-                    // Z-writing object tested in depth pass - reuse result
-                    shouldRender = (visibilityResults[call.recordMWIndex] == 1);
-                    cacheHits++;
-                } else {
-                    // Alpha object (not in recordMW) - test fresh
-                    shouldRender = softwareOcclusionCuller.testBoundingBox(
-                        call.bboxMin, call.bboxMax, currentView, currentProj);
-                    cacheMisses++;
-                }
-                if (!shouldRender) {
-                    culledCalls++;
-                }
-            }
-        } else if (!hiZDisabled) {
-            callsWithoutBBox++;
+        // Visibility culling: shouldRender pre-set by executeHiZCulling()
+        if (!call.shouldRender) {
+            culledCalls++;
+            continue;
         }
 
-        if (shouldRender) {
+        {
             // Restore sampler states for this call (captured during recording)
             for (int stage = 0; stage < 8; ++stage) {
                 if (call.samplerStates[stage].captured) {
@@ -5332,12 +5326,12 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
         }
     }
 
-    // Log culling statistics
+    // Log culling statistics (shouldRender pre-set by executeHiZCulling)
     int renderedCalls = totalCalls - culledCalls;
-    LOG::logline("Hi-Z Stats: %d total, %d bbox, %d culled (%.1f%%), cache: %d hits %d misses",
-                 totalCalls, callsWithBBox, culledCalls,
+    LOG::logline("Hi-Z Replay: %d total, %d culled (%.1f%%), %d rendered",
+                 totalCalls, culledCalls,
                  totalCalls > 0 ? (culledCalls * 100.0f) / totalCalls : 0.0f,
-                 cacheHits, cacheMisses);
+                 renderedCalls);
 
     // Log bin statistics
     LOG::logline("Bins: Terrain=%d Opaque=%d Skinning=%d Grass=%d AlphaTested=%d Blending=%d",

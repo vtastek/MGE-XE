@@ -711,8 +711,13 @@ public:
     // Set of meshes rasterized as occluders - these must never be culled by Hi-Z
     static std::unordered_set<MeshKey, MeshKeyHash> rasterizedOccluderMeshes;
 
-    // Prepare occlusion culling for depth rendering (build Hi-Z and filter recordMW)
-    static void prepareOcclusionCullingForDepth();
+    // Hi-Z culling: split into CPU-only test pass and lightweight filter pass
+    // executeHiZCulling: bbox computation, occluder rasterization, Hi-Z pyramid, visibility testing.
+    //   Pure CPU work (no D3D device access) — draw thread candidate.
+    //   Populates visibilityResults[] and sets shouldRender on recordedCalls.
+    static void executeHiZCulling(const D3DXMATRIX& currentView, const D3DXMATRIX& currentProj);
+    // applyVisibilityAndFilterRecordMW: filters recordMW using visibilityResults from executeHiZCulling.
+    static void applyVisibilityAndFilterRecordMW();
 
     static bool init(IDirect3DDevice* d, ID3DXEffectPool* pool);
     static void startEarlyPrecache(IDirect3DDevice* d);

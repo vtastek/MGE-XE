@@ -223,10 +223,16 @@ void DistantLand::renderStage1(DLContext* ctx) {
             effect->End();
         }
 
-        // Build Hi-Z pyramid and filter recordMW after Scene 0 recording completes
-        // Scene 0 rasterized 120 occluders during recording, now filter recordMW before depth rendering
-        // This filters recordMW from ~2800 → ~100 objects BEFORE renderDepth() executes
-        FixedFunctionShader::prepareOcclusionCullingForDepth();
+        // Hi-Z culling: split into CPU-only visibility testing and lightweight recordMW filter
+        // executeHiZCulling: bbox, occluder rasterization, Hi-Z pyramid, visibility test (no D3D device)
+        // applyVisibilityAndFilterRecordMW: filters recordMW using visibility results
+        {
+            D3DXMATRIX currentView, currentProj;
+            device->GetTransform(D3DTS_VIEW, &currentView);
+            device->GetTransform(D3DTS_PROJECTION, &currentProj);
+            FixedFunctionShader::executeHiZCulling(currentView, currentProj);
+        }
+        FixedFunctionShader::applyVisibilityAndFilterRecordMW();
 
         // Single RT switch for all depth rendering (renderDepth + StretchRect + renderDepthDistantLand + MSAA resolve)
         {

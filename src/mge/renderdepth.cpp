@@ -15,6 +15,7 @@
 
 
 void DistantLand::renderDepth(DLContext* ctx) {
+    MGE_ZoneScopedN("renderDepth");
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_Depth, 0, (int)recordMW.size());
     auto mwBridge = MWBridge::get();
 
@@ -139,11 +140,12 @@ void DistantLand::renderDepthRecorded() {
         loggedOnce = true;
     }
 
-    // Note: Culling is already done by prepareOcclusionCullingForDepth() using Hi-Z.
+    // Note: Culling is already done by executeHiZCulling/applyVisibilityAndFilterRecordMW() using Hi-Z.
     // recordMW is pre-filtered - only visible objects remain.
 
-    // Recorded renders (pre-filtered by prepareOcclusionCullingForDepth)
+    // Recorded renders (pre-filtered by executeHiZCulling/applyVisibilityAndFilterRecordMW)
     for (const auto& i : recordMW) {
+        MGE_ZoneScopedN("renderDepth_Draw");
         // Set variables in main effect; variables are shared via effect pool
 
         // Fragment colour routing
@@ -207,7 +209,7 @@ void DistantLand::renderDepthRecorded() {
         device->SetFVF(i.fvf);
         device->DrawIndexedPrimitive(i.primType, i.baseIndex, i.minIndex, i.vertCount, i.startIndex, i.primCount);
     }
-    // Note: Culling stats are now logged in prepareOcclusionCullingForDepth()
+    // Note: Culling stats are now logged in executeHiZCulling/applyVisibilityAndFilterRecordMW()
 }
 
 // GPU-only Hi-Z mip generation (non-blocking, ~0.5ms)
