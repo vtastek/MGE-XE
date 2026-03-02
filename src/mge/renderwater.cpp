@@ -9,7 +9,7 @@
 
 
 
-void DistantLand::renderWaterReflection(DLContext* ctx, const D3DXMATRIX* view, const D3DXMATRIX* proj) {
+void DistantLand::renderWaterReflection(DLContext* ctx, const D3DXMATRIX* view, const D3DXMATRIX* proj, const std::vector<RecordedMWState>* sky) {
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_WaterReflection, 0);
     auto mwBridge = MWBridge::get();
 
@@ -86,9 +86,10 @@ void DistantLand::renderWaterReflection(DLContext* ctx, const D3DXMATRIX* view, 
         effect->SetFloat(ehNearViewRange, ctx->nearViewRange);
     }
 
-    if ((Configuration.MGEFlags & REFLECT_SKY) && !recordSky.empty() && !mwBridge->IsUnderwater(ctx->eyePos.z)) {
+    const auto& activeSky = sky ? *sky : recordSky;
+    if ((Configuration.MGEFlags & REFLECT_SKY) && !activeSky.empty() && !mwBridge->IsUnderwater(ctx->eyePos.z)) {
         // Draw sky reflection, with opposite culling
-        renderReflectedSky(ctx);
+        renderReflectedSky(ctx, activeSky);
     }
 
     // Restore view state
@@ -97,14 +98,14 @@ void DistantLand::renderWaterReflection(DLContext* ctx, const D3DXMATRIX* view, 
     effect->SetMatrix(ehProj, proj);
 }
 
-void DistantLand::renderReflectedSky(DLContext* ctx) {
+void DistantLand::renderReflectedSky(DLContext* ctx, const std::vector<RecordedMWState>& sky) {
     // Sky objects are not correctly positioned at infinity, so correction is required
     const float adjustZ = -2.0f * ctx->eyePos.z;
     D3DXMATRIX skyScale, worldTransform;
     D3DXMatrixScaling(&skyScale, 1e6, 1e6, 1e6);
 
     // Recorded renders
-    const auto& recordSky_const = recordSky;
+    const auto& recordSky_const = sky;
     const int standardCloudVerts = 65, standardCloudTris = 112;
     const int standardMoonVerts = 4, standardMoonTris = 2;
 

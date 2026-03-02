@@ -59,6 +59,47 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::hlslShaderDefaultPurple;
 FixedFunctionShader::FrameBuffer FixedFunctionShader::frameBuffers[3];
 int FixedFunctionShader::recordingBuffer = 0;
 
+// Pipeline phase tracking for GPU call separation verification
+FixedFunctionShader::PipelinePhase FixedFunctionShader::currentPhase = FixedFunctionShader::PipelinePhase::Idle;
+FixedFunctionShader::PhaseCallCounts FixedFunctionShader::frameCaptureGpuCalls = {};
+FixedFunctionShader::PhaseCallCounts FixedFunctionShader::recordingGpuCalls = {};
+
+static FixedFunctionShader::PhaseCallCounts* getActiveCounters() {
+    auto phase = FixedFunctionShader::getPhase();
+    if (phase == FixedFunctionShader::PipelinePhase::FrameCapture)
+        return &FixedFunctionShader::frameCaptureGpuCalls;
+    if (phase == FixedFunctionShader::PipelinePhase::Recording)
+        return &FixedFunctionShader::recordingGpuCalls;
+    return nullptr;  // Idle/CpuPrepare/GpuRender — not tracked
+}
+
+void FixedFunctionShader::trackDeviceRead(const char* callName) {
+    if (auto* c = getActiveCounters()) {
+        c->deviceReads++;
+    }
+}
+
+void FixedFunctionShader::trackDeviceWrite(const char* callName) {
+    if (auto* c = getActiveCounters()) {
+        c->deviceWrites++;
+        // Log first few writes during recording as warnings
+        if (currentPhase == PipelinePhase::Recording && c->deviceWrites <= 3) {
+            LOG::logline("!! RECORD WRITE: device write '%s' during Recording (#%d)", callName, c->deviceWrites);
+        }
+    }
+}
+
+void FixedFunctionShader::trackDeviceSubmit(const char* callName) {
+    if (auto* c = getActiveCounters()) {
+        c->deviceSubmits++;
+        // Always log submits — these are the worst violations
+        LOG::logline("!! PHASE VIOLATION: GPU submit '%s' during %s phase (#%d)",
+            callName,
+            currentPhase == PipelinePhase::FrameCapture ? "FrameCapture" : "Recording",
+            c->deviceSubmits);
+    }
+}
+
 // HLSL Render Dispatch Recording System
 bool FixedFunctionShader::isRecording = false;
 bool FixedFunctionShader::isReplaying = false;
@@ -3255,6 +3296,7 @@ static auto& currentRecordedCalls() { return FixedFunctionShader::frameBuffers[F
 
 void FixedFunctionShader::startRecording() {
     // Save render states before recording so we can restore after replay
+    trackDeviceRead("GetRenderState(x14 preRecording)");
     device->GetRenderState(D3DRS_ALPHABLENDENABLE, &preRecordingState.alphaBlendEnable);
     device->GetRenderState(D3DRS_ALPHATESTENABLE, &preRecordingState.alphaTestEnable);
     device->GetRenderState(D3DRS_ZENABLE, &preRecordingState.zEnable);
@@ -3318,6 +3360,7 @@ void FixedFunctionShader::startRecording() {
     // Capture view/projection matrices once at start of recording directly into FrameBuffer
     // Note: World transforms are captured per-call in each RenderedState
     auto& fb = frameBuffers[recordingBuffer];
+    trackDeviceRead("GetTransform(VIEW,PROJ)");
     device->GetTransform(D3DTS_VIEW, &fb.view);
     device->GetTransform(D3DTS_PROJECTION, &fb.proj);
     fb.shadowViewproj[0] = DistantLand::s_staging.smViewproj[0];
@@ -3325,6 +3368,7 @@ void FixedFunctionShader::startRecording() {
     fb.state = BufferState::Recording;
     fb.valid = true;
 
+    currentPhase = PipelinePhase::Recording;
     LOG::logline("HLSL Recording: Started recording render dispatches");
 }
 
@@ -3335,7 +3379,11 @@ void FixedFunctionShader::executeHiZCulling(const D3DXMATRIX& currentView, const
     MGE_ZoneScopedN("Execute Hi-Z Culling");
 
     // Resize visibility results for this frame (indexed by draw order)
-    visibilityResults.assign(DistantLand::recordMW.size(), -1);  // -1 = not yet tested
+    // HLSL mode: recordMW is per-buffer; legacy mode: global static
+    const auto& activeRecordMW = isHLSLActive()
+        ? frameBuffers[recordingBuffer].recordMW
+        : DistantLand::recordMW;
+    visibilityResults.assign(activeRecordMW.size(), -1);  // -1 = not yet tested
 
     // Phase 2a: Compute deferred bboxes and rasterize occluders from recorded HLSL calls
     // This must happen before Hi-Z build so the depth pass benefits from culling
@@ -3537,7 +3585,7 @@ void FixedFunctionShader::executeHiZCulling(const D3DXMATRIX& currentView, const
 
 // applyVisibilityAndFilterRecordMW - Lightweight filter pass over recordMW using visibilityResults
 // Runs after executeHiZCulling, before renderDepth
-void FixedFunctionShader::applyVisibilityAndFilterRecordMW() {
+void FixedFunctionShader::applyVisibilityAndFilterRecordMW(FrameBuffer* fb) {
     MGE_ZoneScopedN("Apply Visibility Filter to recordMW");
 
     // Non-HLSL mode or culling disabled: nothing to filter
@@ -3545,20 +3593,23 @@ void FixedFunctionShader::applyVisibilityAndFilterRecordMW() {
         return;
     }
 
-    int inputCount = (int)DistantLand::recordMW.size();
+    // Select recordMW source: per-buffer in HLSL mode, global static otherwise
+    auto& activeRecordMW = fb ? fb->recordMW : DistantLand::recordMW;
 
-    std::vector<DistantLand::RecordedState> filteredRecordMW;
-    filteredRecordMW.reserve(DistantLand::recordMW.size());
+    int inputCount = (int)activeRecordMW.size();
 
-    for (size_t i = 0; i < DistantLand::recordMW.size(); i++) {
+    std::vector<RecordedMWState> filteredRecordMW;
+    filteredRecordMW.reserve(activeRecordMW.size());
+
+    for (size_t i = 0; i < activeRecordMW.size(); i++) {
         if (visibilityResults[i] == 1 || visibilityResults[i] == -1) {
-            filteredRecordMW.push_back(std::move(DistantLand::recordMW[i]));
+            filteredRecordMW.push_back(std::move(activeRecordMW[i]));
         }
     }
 
-    DistantLand::recordMW = std::move(filteredRecordMW);
+    activeRecordMW = std::move(filteredRecordMW);
 
-    int outputCount = (int)DistantLand::recordMW.size();
+    int outputCount = (int)activeRecordMW.size();
     LOG::logline(">> Filter recordMW: %d in, %d out, %d culled",
                  inputCount, outputCount, inputCount - outputCount);
 }
@@ -3973,20 +4024,23 @@ void FixedFunctionShader::finalizeBatchAndReplay(int sceneCount) {
 void FixedFunctionShader::capturePostRecordingState() {
     if (!isRecording) return;
 
-    device->GetRenderState(D3DRS_ALPHABLENDENABLE, &postRecordingState.alphaBlendEnable);
-    device->GetRenderState(D3DRS_ALPHATESTENABLE, &postRecordingState.alphaTestEnable);
-    device->GetRenderState(D3DRS_ZENABLE, &postRecordingState.zEnable);
-    device->GetRenderState(D3DRS_ZWRITEENABLE, &postRecordingState.zWriteEnable);
-    device->GetRenderState(D3DRS_CULLMODE, &postRecordingState.cullMode);
-    device->GetRenderState(D3DRS_SRCBLEND, &postRecordingState.srcBlend);
-    device->GetRenderState(D3DRS_DESTBLEND, &postRecordingState.destBlend);
-    device->GetRenderState(D3DRS_FOGENABLE, &postRecordingState.fogEnable);
-    device->GetRenderState(D3DRS_SPECULARENABLE, &postRecordingState.specularEnable);
-    device->GetRenderState(D3DRS_LOCALVIEWER, &postRecordingState.localViewer);
-    device->GetRenderState(D3DRS_NORMALIZENORMALS, &postRecordingState.normalizeNormals);
-    device->GetRenderState(D3DRS_ZFUNC, &postRecordingState.zFunc);
-    device->GetRenderState(D3DRS_ALPHAFUNC, &postRecordingState.alphaFunc);
-    device->GetRenderState(D3DRS_ALPHAREF, &postRecordingState.alphaRef);
+    // Write to per-buffer postRecordingState for HLSL isolation
+    trackDeviceRead("GetRenderState(x14 postRecording)");
+    auto& prs = frameBuffers[recordingBuffer].postRecordingState;
+    device->GetRenderState(D3DRS_ALPHABLENDENABLE, &prs.alphaBlendEnable);
+    device->GetRenderState(D3DRS_ALPHATESTENABLE, &prs.alphaTestEnable);
+    device->GetRenderState(D3DRS_ZENABLE, &prs.zEnable);
+    device->GetRenderState(D3DRS_ZWRITEENABLE, &prs.zWriteEnable);
+    device->GetRenderState(D3DRS_CULLMODE, &prs.cullMode);
+    device->GetRenderState(D3DRS_SRCBLEND, &prs.srcBlend);
+    device->GetRenderState(D3DRS_DESTBLEND, &prs.destBlend);
+    device->GetRenderState(D3DRS_FOGENABLE, &prs.fogEnable);
+    device->GetRenderState(D3DRS_SPECULARENABLE, &prs.specularEnable);
+    device->GetRenderState(D3DRS_LOCALVIEWER, &prs.localViewer);
+    device->GetRenderState(D3DRS_NORMALIZENORMALS, &prs.normalizeNormals);
+    device->GetRenderState(D3DRS_ZFUNC, &prs.zFunc);
+    device->GetRenderState(D3DRS_ALPHAFUNC, &prs.alphaFunc);
+    device->GetRenderState(D3DRS_ALPHAREF, &prs.alphaRef);
 }
 
 // finalizeAndRender - Complete prepare+render phase at frame finalize point (BeginScene UI)
@@ -4025,6 +4079,16 @@ void FixedFunctionShader::finalizeAndRender(DLContext* frameCtx, bool waterSeen)
         DistantLand::renderStage2(frameCtx);
         return;
     }
+
+    // Log phase summary: FrameCapture + Recording device call counts
+    {
+        auto& fc = frameCaptureGpuCalls;
+        auto& rc = recordingGpuCalls;
+        LOG::logline("PHASE: FrameCapture={reads:%d writes:%d submits:%d} Recording={reads:%d writes:%d submits:%d}",
+            fc.deviceReads, fc.deviceWrites, fc.deviceSubmits,
+            rc.deviceReads, rc.deviceWrites, rc.deviceSubmits);
+    }
+    currentPhase = PipelinePhase::Idle;
 
     isRecording = false;
     recordingCompletedThisFrame = true;
@@ -4083,16 +4147,18 @@ void FixedFunctionShader::finalizeAndRender(DLContext* frameCtx, bool waterSeen)
                 if (c.sceneNum == 0) s0++; else s1++;
             }
             int m0 = 0, m1 = 0;
-            for (const auto& m : DistantLand::recordMW) {
+            auto& activeRecordMW = frameBuffers[recordingBuffer].recordMW;
+            for (const auto& m : activeRecordMW) {
                 if (m.sceneNum == 0) m0++; else m1++;
             }
             LOG::logline(">> finalizeAndRender: HLSL calls=%d (scene0=%d, scene1+=%d), recordMW=%d (scene0=%d, scene1+=%d)",
-                         (int)recCalls.size(), s0, s1, (int)DistantLand::recordMW.size(), m0, m1);
+                         (int)recCalls.size(), s0, s1, (int)activeRecordMW.size(), m0, m1);
             loggedOnce = true;
         }
     }
 
-    // === PREPARE ===
+    // === PREPARE (CPU) ===
+    currentPhase = PipelinePhase::CpuPrepare;
     {
         MGE_ZoneScopedN("Frame_Prepare");
 
@@ -4108,30 +4174,35 @@ void FixedFunctionShader::finalizeAndRender(DLContext* frameCtx, bool waterSeen)
         }
     }
 
-    // === RENDER ===
+    // === RENDER (GPU) ===
+    currentPhase = PipelinePhase::GpuRender;
     {
         MGE_ZoneScopedN("Frame_Render");
 
+        auto& fb = frameBuffers[recordingBuffer];
+
+        // Store DLContext and waterSeen in FrameBuffer for per-frame isolation
+        fb.dlContext = *frameCtx;
+        fb.waterSeen = waterSeen;
+
         // Stage 0 GPU: shadow map, distant land, sky, water reflection, wave sim
-        DistantLand::renderStage0GPU(frameCtx);
+        DistantLand::renderStage0GPU(frameCtx, &fb);
 
         // Update shadow VP in frame buffer — renderShadowMap just computed current frame's
         // shadow matrices and wrote them back to s_staging. The stale previous-frame values
         // captured at startRecording() would cause shadow shaking on camera movement.
         {
-            auto& fbShadow = frameBuffers[recordingBuffer];
-            fbShadow.shadowViewproj[0] = DistantLand::s_staging.smViewproj[0];
-            fbShadow.shadowViewproj[1] = DistantLand::s_staging.smViewproj[1];
+            fb.shadowViewproj[0] = DistantLand::s_staging.smViewproj[0];
+            fb.shadowViewproj[1] = DistantLand::s_staging.smViewproj[1];
         }
 
         // Stage 1: grass, shadow overlay, depth (cull thread runs in parallel with this)
-        DistantLand::renderStage1(frameCtx);
+        DistantLand::renderStage1(frameCtx, &fb);
 
         // Blend close objects over distant land
-        DistantLand::renderStageBlend(frameCtx);
+        DistantLand::renderStageBlend(frameCtx, &fb);
 
         // Wait for cull completion
-        auto& fb = frameBuffers[recordingBuffer];
         if (g_cullThread && g_cullThread->isRunning() && fb.state != BufferState::ReadyToRender) {
             g_cullThread->waitForCompletion();
         }
@@ -4146,7 +4217,7 @@ void FixedFunctionShader::finalizeAndRender(DLContext* frameCtx, bool waterSeen)
         }
 
         // Stage 2: additional depth for all recorded geometry
-        DistantLand::renderStage2(frameCtx);
+        DistantLand::renderStage2(frameCtx, &fb);
 
         // Clean up HLSL-only texture slots to prevent DXVK descriptor bloat
         for (int i = 2; i < 6; i++) {
@@ -4157,25 +4228,28 @@ void FixedFunctionShader::finalizeAndRender(DLContext* frameCtx, bool waterSeen)
         device->SetVertexShader(NULL);
         device->SetPixelShader(NULL);
 
-        // Restore Morrowind's end-of-Scene-0 state
-        device->SetRenderState(D3DRS_ALPHABLENDENABLE, postRecordingState.alphaBlendEnable);
-        device->SetRenderState(D3DRS_ALPHATESTENABLE, postRecordingState.alphaTestEnable);
-        device->SetRenderState(D3DRS_ZENABLE, postRecordingState.zEnable);
-        device->SetRenderState(D3DRS_ZWRITEENABLE, postRecordingState.zWriteEnable);
-        device->SetRenderState(D3DRS_CULLMODE, postRecordingState.cullMode);
-        device->SetRenderState(D3DRS_SRCBLEND, postRecordingState.srcBlend);
-        device->SetRenderState(D3DRS_DESTBLEND, postRecordingState.destBlend);
-        device->SetRenderState(D3DRS_FOGENABLE, postRecordingState.fogEnable);
-        device->SetRenderState(D3DRS_SPECULARENABLE, postRecordingState.specularEnable);
-        device->SetRenderState(D3DRS_LOCALVIEWER, postRecordingState.localViewer);
-        device->SetRenderState(D3DRS_NORMALIZENORMALS, postRecordingState.normalizeNormals);
-        device->SetRenderState(D3DRS_ZFUNC, postRecordingState.zFunc);
-        device->SetRenderState(D3DRS_ALPHAFUNC, postRecordingState.alphaFunc);
-        device->SetRenderState(D3DRS_ALPHAREF, postRecordingState.alphaRef);
+        // Restore Morrowind's end-of-Scene-0 state (from per-buffer snapshot)
+        const auto& prs = fb.postRecordingState;
+        device->SetRenderState(D3DRS_ALPHABLENDENABLE, prs.alphaBlendEnable);
+        device->SetRenderState(D3DRS_ALPHATESTENABLE, prs.alphaTestEnable);
+        device->SetRenderState(D3DRS_ZENABLE, prs.zEnable);
+        device->SetRenderState(D3DRS_ZWRITEENABLE, prs.zWriteEnable);
+        device->SetRenderState(D3DRS_CULLMODE, prs.cullMode);
+        device->SetRenderState(D3DRS_SRCBLEND, prs.srcBlend);
+        device->SetRenderState(D3DRS_DESTBLEND, prs.destBlend);
+        device->SetRenderState(D3DRS_FOGENABLE, prs.fogEnable);
+        device->SetRenderState(D3DRS_SPECULARENABLE, prs.specularEnable);
+        device->SetRenderState(D3DRS_LOCALVIEWER, prs.localViewer);
+        device->SetRenderState(D3DRS_NORMALIZENORMALS, prs.normalizeNormals);
+        device->SetRenderState(D3DRS_ZFUNC, prs.zFunc);
+        device->SetRenderState(D3DRS_ALPHAFUNC, prs.alphaFunc);
+        device->SetRenderState(D3DRS_ALPHAREF, prs.alphaRef);
 
         isReplaying = false;
         resetHLSLCaches();
     }
+
+    currentPhase = PipelinePhase::Idle;
 }
 
 // Scene lifecycle stubs for triple-buffered pipeline (Step 1: no-op, infrastructure only)
@@ -5872,6 +5946,7 @@ FixedFunctionShader::HLSLRecordedCall::HLSLRecordedCall(const RenderedState* rs_
     : rs(*rs_), frs(*frs_), lightrs(lightrs_), sk(sk_), hasBoundingBox(false), recordMWIndex(recordMWIdx), bin(RenderBin::Opaque), prepared(false), dirtyFlags(DIRTY_ALL) {
     // Lean recording: capture sampler states for stages 0-1 only (Morrowind-bound textures)
     // Stages 2+ are HLSL-specific textures bound by MGE XE with known sampler states
+    trackDeviceRead("GetTexture+GetSamplerState(recording)");
     for (int stage = 0; stage < 2; ++stage) {
         IDirect3DBaseTexture9* texture = nullptr;
         if (SUCCEEDED(device->GetTexture(stage, &texture)) && texture) {

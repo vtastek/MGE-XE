@@ -720,8 +720,13 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
             // Draw water if the Morrowind water plane doesn't appear in view
             // it may be too distant or stencil scene order is non-normative
             if (distantWater && !waterDrawn && !isStencilScene) {
-                DistantLand::renderStageWater(&frameCtx);
-                waterDrawn = true;
+                if (isHLSLActive()) {
+                    // HLSL: just flag — finalizeAndRender will render water in GPU phase
+                    waterDrawn = true;
+                } else {
+                    DistantLand::renderStageWater(&frameCtx);
+                    waterDrawn = true;
+                }
             }
         }
     }
@@ -1038,10 +1043,15 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
                 return hr;
             }
             if (distantWater) {
-                // Call distant land instead of drawing water grid
                 if (!waterDrawn) {
-                    DistantLand::renderStageWater(&frameCtx);
-                    waterDrawn = true;
+                    if (isHLSLActive()) {
+                        // HLSL: just flag — finalizeAndRender will render water in GPU phase
+                        waterDrawn = true;
+                    } else {
+                        // Legacy: render water immediately
+                        DistantLand::renderStageWater(&frameCtx);
+                        waterDrawn = true;
+                    }
                 }
                 return D3D_OK;
             }

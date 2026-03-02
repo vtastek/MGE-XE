@@ -11,10 +11,10 @@
 
 
 // renderSky - Render atmosphere scattering sky layer and other recorded draw calls on top
-void DistantLand::renderSky() {
-    ImGuiManager::LogFrameEvent(FrameEvent::MGE_SkyRender, 0, (int)recordSky.size());
+void DistantLand::renderSky(const std::vector<RecordedMWState>& sky) {
+    ImGuiManager::LogFrameEvent(FrameEvent::MGE_SkyRender, 0, (int)sky.size());
     // Recorded renders
-    const auto& recordSky_const = recordSky;
+    const auto& recordSky_const = sky;
     const int standardCloudVerts = 65, standardCloudTris = 112;
     const int standardMoonVerts = 4, standardMoonTris = 2;
 

@@ -14,9 +14,9 @@
 
 
 
-void DistantLand::renderDepth(DLContext* ctx, int sceneFilter) {
+void DistantLand::renderDepth(DLContext* ctx, const std::vector<RecordedMWState>& recMW, int sceneFilter) {
     MGE_ZoneScopedN("renderDepth");
-    ImGuiManager::LogFrameEvent(FrameEvent::MGE_Depth, 0, (int)recordMW.size());
+    ImGuiManager::LogFrameEvent(FrameEvent::MGE_Depth, 0, (int)recMW.size());
     auto mwBridge = MWBridge::get();
 
     // DEBUG: Log that renderDepth is being called
@@ -52,7 +52,7 @@ void DistantLand::renderDepth(DLContext* ctx, int sceneFilter) {
     // Recorded draw calls with Morrowind near plane
     // Pass game view for skinned object transforms (device may have UI view in deferred pipeline)
     effectDepth->BeginPass(PASS_RENDERMWDEPTH);
-    renderDepthRecorded(sceneFilter, &ctx->mwView);
+    renderDepthRecorded(recMW, sceneFilter, &ctx->mwView);
     effectDepth->EndPass();
 
     // Reset projection matrix
@@ -104,7 +104,7 @@ void DistantLand::renderDepthDistantLand(DLContext* ctx) {
     effect->SetMatrix(ehProj, &ctx->mwProj);
 }
 
-void DistantLand::renderDepthAdditional(DLContext* ctx, int sceneFilter) {
+void DistantLand::renderDepthAdditional(DLContext* ctx, const std::vector<RecordedMWState>& recMW, int sceneFilter) {
     // Switch to render target
     RenderTargetSwitcher rtsw(surfDepthFrameMSAA, surfDepthDepth);
 
@@ -122,14 +122,14 @@ void DistantLand::renderDepthAdditional(DLContext* ctx, int sceneFilter) {
     // Recorded draw calls with Morrowind near plane
     // Pass game view for skinned object transforms (device may have UI view in deferred pipeline)
     effectDepth->BeginPass(PASS_RENDERMWDEPTH);
-    renderDepthRecorded(sceneFilter, &ctx->mwView);
+    renderDepthRecorded(recMW, sceneFilter, &ctx->mwView);
     effectDepth->EndPass();
 
     // Reset projection matrix
     effect->SetMatrix(ehProj, &ctx->mwProj);
 }
 
-void DistantLand::renderDepthRecorded(int sceneFilter, const D3DXMATRIX* gameView) {
+void DistantLand::renderDepthRecorded(const std::vector<RecordedMWState>& recMW, int sceneFilter, const D3DXMATRIX* gameView) {
     // Use an alpha threshold for solidity that isn't precisely equal to a commonly used value (such as 0.5).
     // Vertex interpolators can be slightly inaccurate and cause a value that should be constant across a triangle
     // to have interpolated fragment values that vary either side of the threshold and cause noise.
@@ -139,9 +139,9 @@ void DistantLand::renderDepthRecorded(int sceneFilter, const D3DXMATRIX* gameVie
     static int logCount = 0;
     if (logCount < 4) {
         int s0 = 0, s1 = 0;
-        for (const auto& m : recordMW) { if (m.sceneNum == 0) s0++; else s1++; }
+        for (const auto& m : recMW) { if (m.sceneNum == 0) s0++; else s1++; }
         LOG::logline(">> renderDepthRecorded(sceneFilter=%d): total=%d, scene0=%d, scene1+=%d",
-                     sceneFilter, (int)recordMW.size(), s0, s1);
+                     sceneFilter, (int)recMW.size(), s0, s1);
         logCount++;
     }
 
@@ -149,7 +149,7 @@ void DistantLand::renderDepthRecorded(int sceneFilter, const D3DXMATRIX* gameVie
     // recordMW is pre-filtered - only visible objects remain.
 
     // Recorded renders (pre-filtered by executeHiZCulling/applyVisibilityAndFilterRecordMW)
-    for (const auto& i : recordMW) {
+    for (const auto& i : recMW) {
         // Scene filter: -1 = all, 0 = scene 0 only, >0 = scene 1+ only
         if (sceneFilter == 0 && i.sceneNum != 0) continue;
         if (sceneFilter > 0 && i.sceneNum == 0) continue;

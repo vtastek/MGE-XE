@@ -17,38 +17,7 @@
 
 struct MGEShader;
 
-// Per-frame rendering context — snapshotted at start of Stage0, passed through all stages.
-// Replaces scattered static variables with explicit data flow for threading readiness.
-struct DLContext {
-    // Camera
-    D3DXMATRIX mwView, mwProj;
-    D3DXVECTOR4 eyeVec, eyePos;
-
-    // Lighting
-    D3DXVECTOR4 sunVec, sunPos;
-    float sunVis;
-    RGBVECTOR sunCol, sunAmb, ambCol;
-    RGBVECTOR horizonCol, nearFogCol;
-
-    // Atmosphere
-    RGBVECTOR atmOutscatter, atmInscatter;
-    D3DXVECTOR4 atmSkylightScatter;
-
-    // Fog
-    float fogStart, fogEnd;
-    float fogExpStart, fogExpDivisor;
-    float fogNearStart, fogNearEnd;
-    float nearViewRange;
-    float windScaling, niceWeather;
-    float lightSunMult, lightAmbMult;
-
-    // Shadow (written by renderShadowMap in Stage0, read by Stage1/2)
-    D3DXMATRIX smView[2], smProj[2], smViewproj[2];
-
-    // Flags
-    bool isRenderCached;
-    bool isPPLActive;
-};
+// DLContext is now defined in ffeshader.h (shared by FrameBuffer and DistantLand)
 
 class DistantLand {
 public:
@@ -74,12 +43,8 @@ public:
         }
     };
 
-    struct RecordedState : RenderedState {
-        RecordedState(const RenderedState&);
-        ~RecordedState();
-        RecordedState(const RecordedState&) = delete;
-        RecordedState(RecordedState&&) noexcept;
-    };
+    // RecordedState is now an alias for RecordedMWState (defined in ffeshader.h)
+    using RecordedState = RecordedMWState;
 
     static constexpr DWORD fvfWave = D3DFVF_XYZRHW | D3DFVF_TEX2;
     static constexpr int waveTexResolution = 512;
@@ -245,13 +210,13 @@ public:
     static DLContext s_staging;
     static DLContext captureContext();
 
-    static void renderSky();
+    static void renderSky(const std::vector<RecordedMWState>& sky);
     static DLContext captureStage0Context();
-    static void renderStage0GPU(DLContext* ctx);
+    static void renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuffer* fb = nullptr);
     static DLContext renderStage0();
-    static void renderStage1(DLContext* ctx);
-    static void renderStage2(DLContext* ctx);
-    static void renderStageBlend(DLContext* ctx);
+    static void renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer* fb = nullptr);
+    static void renderStage2(DLContext* ctx, FixedFunctionShader::FrameBuffer* fb = nullptr);
+    static void renderStageBlend(DLContext* ctx, FixedFunctionShader::FrameBuffer* fb = nullptr);
     static void renderStageWater(DLContext* ctx);
 
     static void setupCommonEffect(DLContext* ctx, const D3DXMATRIX* view, const D3DXMATRIX* proj);
@@ -268,17 +233,17 @@ public:
     static void renderGrassInstZ();
     static void renderGrassCommon(ID3DXEffect* e);
 
-    static void renderWaterReflection(DLContext* ctx, const D3DXMATRIX* view, const D3DXMATRIX* proj);
-    static void renderReflectedSky(DLContext* ctx);
+    static void renderWaterReflection(DLContext* ctx, const D3DXMATRIX* view, const D3DXMATRIX* proj, const std::vector<RecordedMWState>* sky = nullptr);
+    static void renderReflectedSky(DLContext* ctx, const std::vector<RecordedMWState>& sky);
     static void renderReflectedStatics(DLContext* ctx, const D3DXMATRIX* view, const D3DXMATRIX* proj);
     static void clearReflection(DLContext* ctx);
     static void simulateDynamicWaves();
     static void renderWaterPlane(DLContext* ctx);
 
-    static void renderDepth(DLContext* ctx, int sceneFilter = -1);
+    static void renderDepth(DLContext* ctx, const std::vector<RecordedMWState>& recMW, int sceneFilter = -1);
     static void renderDepthDistantLand(DLContext* ctx);
-    static void renderDepthAdditional(DLContext* ctx, int sceneFilter = -1);
-    static void renderDepthRecorded(int sceneFilter = -1, const D3DXMATRIX* gameView = nullptr);
+    static void renderDepthAdditional(DLContext* ctx, const std::vector<RecordedMWState>& recMW, int sceneFilter = -1);
+    static void renderDepthRecorded(const std::vector<RecordedMWState>& recMW, int sceneFilter = -1, const D3DXMATRIX* gameView = nullptr);
     static void generateHiZMipsGPU();
     static void copyHiZToStaging();
     static void lockRemainingHiZMips();

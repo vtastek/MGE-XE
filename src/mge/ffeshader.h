@@ -14,7 +14,38 @@
 #include <memory>
 #include <atomic>
 
-struct DLContext;  // Forward declaration (defined in distantland.h)
+// Per-frame rendering context — snapshotted at start of Stage0, passed through all stages.
+// Replaces scattered static variables with explicit data flow for threading readiness.
+struct DLContext {
+    // Camera
+    D3DXMATRIX mwView, mwProj;
+    D3DXVECTOR4 eyeVec, eyePos;
+
+    // Lighting
+    D3DXVECTOR4 sunVec, sunPos;
+    float sunVis;
+    RGBVECTOR sunCol, sunAmb, ambCol;
+    RGBVECTOR horizonCol, nearFogCol;
+
+    // Atmosphere
+    RGBVECTOR atmOutscatter, atmInscatter;
+    D3DXVECTOR4 atmSkylightScatter;
+
+    // Fog
+    float fogStart, fogEnd;
+    float fogExpStart, fogExpDivisor;
+    float fogNearStart, fogNearEnd;
+    float nearViewRange;
+    float windScaling, niceWeather;
+    float lightSunMult, lightAmbMult;
+
+    // Shadow (written by renderShadowMap in Stage0, read by Stage1/2)
+    D3DXMATRIX smView[2], smProj[2], smViewproj[2];
+
+    // Flags
+    bool isRenderCached;
+    bool isPPLActive;
+};
 
 // Render bin classification for Tracy profiling and debug visualization
 enum class RenderBin : uint8_t {
@@ -80,6 +111,15 @@ struct RenderedState {
 
     // Scene number (0 = main opaques, 1+ = hands/alpha after Z-clear)
     int sceneNum = 0;
+};
+
+// RecordedMWState - RenderedState with COM reference management for deferred rendering.
+// Used by both DistantLand::recordMW/recordSky and FrameBuffer per-frame isolation.
+struct RecordedMWState : RenderedState {
+    RecordedMWState(const RenderedState& state);
+    ~RecordedMWState();
+    RecordedMWState(const RecordedMWState&) = delete;
+    RecordedMWState(RecordedMWState&& source) noexcept;
 };
 
 struct FragmentState {
@@ -599,6 +639,14 @@ public:
         // Per-buffer LightState cache for recording
         std::shared_ptr<LightState> lastLightState;
 
+        // Per-buffer scene data (HLSL mode only — isolates record/render phases)
+        std::vector<RecordedMWState> recordMW;
+        std::vector<RecordedMWState> recordSky;
+        DLContext dlContext;
+        bool waterSeen = false;
+        IDirect3DTexture9* texDistantBlend = nullptr;
+        SavedRenderStates postRecordingState = {};
+
         bool valid;
         BufferState state;
 
@@ -609,6 +657,11 @@ public:
             rasterizedOccluderMeshes.clear();
             bboxLookup.clear();
             lastLightState.reset();
+            recordMW.clear();
+            recordSky.clear();
+            waterSeen = false;
+            texDistantBlend = nullptr;
+            postRecordingState = {};
             valid = false;
         }
 
@@ -620,8 +673,27 @@ public:
     static FrameBuffer frameBuffers[3];
     static int recordingBuffer;
 
-private:
+public:
+    // Pipeline phase tracking for GPU call separation verification
+    enum class PipelinePhase {
+        Idle,           // Between frames or non-HLSL
+        FrameCapture,   // captureStage0Context: effect uniforms, camera reads
+        Recording,      // Main thread capturing DIP calls (should be CPU-only)
+        CpuPrepare,     // Hi-Z culling, shader key computation (CPU-only)
+        GpuRender       // Stages + replay (GPU calls expected here)
+    };
+    static PipelinePhase currentPhase;
 
+    struct PhaseCallCounts {
+        int deviceReads;    // Get* calls (safe, just reading state)
+        int deviceWrites;   // Set*, effect->Set* (state changes, need to defer for threading)
+        int deviceSubmits;  // Draw*, Clear, StretchRect, CreateStateBlock (GPU work, must not happen)
+        void reset() { deviceReads = deviceWrites = deviceSubmits = 0; }
+    };
+    static PhaseCallCounts frameCaptureGpuCalls;
+    static PhaseCallCounts recordingGpuCalls;
+
+private:
     static bool isRecording;
     static bool isReplaying;
     static bool manualRecordingControl;  // When true, user controls recording via K key
@@ -681,6 +753,7 @@ public:
     static void executeCullPass(int bufferIndex);
     static void executeRenderPass(int bufferIndex);
 
+    static FrameBuffer& currentFrameBuffer() { return frameBuffers[recordingBuffer]; }
     static FrameBuffer& getFrameBuffer(int index) { return frameBuffers[index]; }
     static int getRecordingBufferIndex() { return recordingBuffer; }
     static void rotateRecordingBuffer() {
@@ -712,6 +785,15 @@ public:
     // Dump control
     static void requestDump() { dumpRequested = true; }
 
+    // Pipeline phase tracking
+    static PipelinePhase getPhase() { return currentPhase; }
+    static void setPhase(PipelinePhase phase) { currentPhase = phase; }
+    static void trackDeviceRead(const char* callName);   // Get* calls
+    static void trackDeviceWrite(const char* callName);  // Set*, effect->Set* calls
+    static void trackDeviceSubmit(const char* callName); // Draw*, Clear, StretchRect, CreateStateBlock
+    // Convenience: legacy name for backwards compat
+    static void trackGpuCall(const char* callName) { trackDeviceSubmit(callName); }
+
     static const std::vector<HLSLRecordedCall>& getRecordedCalls() { return frameBuffers[recordingBuffer].recordedCalls; }
 
 private:
@@ -729,7 +811,7 @@ public:
     //   Populates visibilityResults[] and sets shouldRender on recordedCalls.
     static void executeHiZCulling(const D3DXMATRIX& currentView, const D3DXMATRIX& currentProj);
     // applyVisibilityAndFilterRecordMW: filters recordMW using visibilityResults from executeHiZCulling.
-    static void applyVisibilityAndFilterRecordMW();
+    static void applyVisibilityAndFilterRecordMW(FrameBuffer* fb = nullptr);
 
     static bool init(IDirect3DDevice* d, ID3DXEffectPool* pool);
     static void startEarlyPrecache(IDirect3DDevice* d);
