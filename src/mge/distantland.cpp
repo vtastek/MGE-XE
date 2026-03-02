@@ -25,16 +25,15 @@ DLContext DistantLand::captureContext() {
     return s_staging;
 }
 
-// renderStage0 - Render distant land at beginning of scene 0, after sky
-DLContext DistantLand::renderStage0() {
-    MGE_ZoneScopedN("DL_RenderStage0");
+// captureStage0Context - CPU-only capture of per-frame context at start of Scene 0
+// Called from DIP trigger (first non-sky draw). No GPU work.
+DLContext DistantLand::captureStage0Context() {
+    MGE_ZoneScopedN("DL_CaptureStage0");
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_Stage0, 0);
     static int frameNumber = 0;
     LOG::logline("======== FRAME %d START (Scene 0) ========", ++frameNumber);
 
     auto mwBridge = MWBridge::get();
-    IDirect3DStateBlock9* stateSaved;
-    UINT passes;
 
     // Reset recording flag for new frame (Scene 0 starts a new frame)
     FixedFunctionShader::resetRecordingCompletedFlag();
@@ -62,9 +61,19 @@ DLContext DistantLand::renderStage0() {
     setupCommonEffect(&ctx, &ctx.mwView, &ctx.mwProj);
     FixedFunctionShader::updateLighting(ctx.lightSunMult, ctx.lightAmbMult);
 
-    if (!ctx.isRenderCached) {
-        ///LOG::logline("Sky prims: %d", recordSky.size());
+    return ctx;
+}
 
+// renderStage0GPU - All GPU work from stage 0 (shadow map, distant land, sky, water reflection, wave sim)
+// Called in render phase after recording is complete.
+void DistantLand::renderStage0GPU(DLContext* ctx) {
+    MGE_ZoneScopedN("DL_RenderStage0GPU");
+
+    auto mwBridge = MWBridge::get();
+    IDirect3DStateBlock9* stateSaved;
+    UINT passes;
+
+    if (!ctx->isRenderCached) {
         if (isDistantCell()) {
             // Save state block manually since we can change FVF/decl
             device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
@@ -75,28 +84,28 @@ DLContext DistantLand::renderStage0() {
             if (Configuration.MGEFlags & USE_SHADOWS) {
                 if (mwBridge->CellHasWeather() && !mwBridge->IsMenu()) {
                     effectShadow->Begin(&passes, D3DXFX_DONOTSAVESTATE);
-                    renderShadowMap(&ctx);
-                    g_passBreaks.mge_shadowRT += 2; // RenderTargetSwitcher in renderShadowMap
+                    renderShadowMap(ctx);
+                    g_passBreaks.mge_shadowRT += 2;
                     effectShadow->End();
 
                     // Write shadow viewproj back to s_staging for ffeshader/mged3d8device reads
-                    memcpy(s_staging.smViewproj, ctx.smViewproj, sizeof(s_staging.smViewproj));
+                    memcpy(s_staging.smViewproj, ctx->smViewproj, sizeof(s_staging.smViewproj));
                 }
             }
 
             // Distant everything; bias the projection matrix such that
             // distant land gets drawn behind anything Morrowind would draw
-            D3DXMATRIX distProj = ctx.mwProj;
+            D3DXMATRIX distProj = ctx->mwProj;
             editProjectionZ(&distProj, kDistantNearPlane - 1e-2, Configuration.DL.DrawDist * kCellSize);
             effect->SetMatrix(ehProj, &distProj);
 
             effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
 
-            if (!mwBridge->IsUnderwater(ctx.eyePos.z)) {
+            if (!mwBridge->IsUnderwater(ctx->eyePos.z)) {
                 // Draw distant landscape
                 if (mwBridge->IsExterior()) {
                     effect->BeginPass(PASS_RENDERLAND);
-                    renderDistantLand(&ctx, effect, &ctx.mwView, &distProj);
+                    renderDistantLand(ctx, effect, &ctx->mwView, &distProj);
                     effect->EndPass();
                 }
 
@@ -106,8 +115,8 @@ DLContext DistantLand::renderStage0() {
                     effect->BeginPass(p);
                     vsr.beginAlphaToCoverage(device);
 
-                    cullDistantStatics(&ctx, &ctx.mwView, &distProj);
-                    renderDistantStatics(&ctx);
+                    cullDistantStatics(ctx, &ctx->mwView, &distProj);
+                    renderDistantStatics(ctx);
 
                     vsr.endAlphaToCoverage(device);
                     effect->EndPass();
@@ -124,38 +133,38 @@ DLContext DistantLand::renderStage0() {
 
             // Update reflection
             if (mwBridge->CellHasWater()) {
-                renderWaterReflection(&ctx, &ctx.mwView, &distProj);
-                g_passBreaks.mge_waterRT += 2; // RenderTargetSwitcher in renderWaterReflection
+                renderWaterReflection(ctx, &ctx->mwView, &distProj);
+                g_passBreaks.mge_waterRT += 2;
             }
 
             // Update water simulation
             if (Configuration.MGEFlags & DYNAMIC_RIPPLES) {
                 simulateDynamicWaves();
-                g_passBreaks.mge_waterRT += 4; // 2 RenderTargetSwitchers in simulateDynamicWaves
+                g_passBreaks.mge_waterRT += 4;
             }
 
             effect->End();
 
             // Reset matrices
-            effect->SetMatrix(ehView, &ctx.mwView);
-            effect->SetMatrix(ehProj, &ctx.mwProj);
+            effect->SetMatrix(ehView, &ctx->mwView);
+            effect->SetMatrix(ehProj, &ctx->mwProj);
 
             // Save distant land only frame to texture
             if (~Configuration.MGEFlags & NO_MW_MGE_BLEND) {
                 texDistantBlend = PostShaders::borrowBuffer(1);
-                g_passBreaks.mge_stretchRect++; // borrowBuffer does StretchRect
+                g_passBreaks.mge_stretchRect++;
             }
 
             // Restore render state
             stateSaved->Apply();
-    
+
             stateSaved->Release();
         } else {
             // Clear water reflection to avoid seeing previous cell environment reflected
             // Must be done every frame to react to lighting changes
             // Skip for cells without water to avoid unnecessary GPU work
             if (mwBridge->CellHasWater()) {
-                clearReflection(&ctx);
+                clearReflection(ctx);
             }
 
             // Update water simulation
@@ -169,7 +178,7 @@ DLContext DistantLand::renderStage0() {
 
                 // Restore render state
                 stateSaved->Apply();
-        
+
                 stateSaved->Release();
             }
         }
@@ -177,7 +186,12 @@ DLContext DistantLand::renderStage0() {
 
     // Clear stray sky recordings (but NOT recordMW - it's needed for depth rendering)
     recordSky.clear();
+}
 
+// renderStage0 - Legacy combined path (calls capture + GPU)
+DLContext DistantLand::renderStage0() {
+    DLContext ctx = captureStage0Context();
+    renderStage0GPU(&ctx);
     return ctx;
 }
 
@@ -214,7 +228,7 @@ void DistantLand::renderStage1(DLContext* ctx) {
             }
 
             // Overlay shadow onto Morrowind objects (skip if HLSL shadows are handling it)
-            if ((Configuration.MGEFlags & USE_SHADOWS) && mwBridge->CellHasWeather() && Configuration.PerPixelLightFlags != 2) {
+            if ((Configuration.MGEFlags & USE_SHADOWS) && mwBridge->CellHasWeather() && !isHLSLActive()) {
                 effect->BeginPass(ctx->isPPLActive ? PASS_RENDERSHADOWFFE : PASS_RENDERSHADOW);
                 renderShadow(ctx);
                 effect->EndPass();
@@ -227,10 +241,8 @@ void DistantLand::renderStage1(DLContext* ctx) {
         // executeHiZCulling: bbox, occluder rasterization, Hi-Z pyramid, visibility test (no D3D device)
         // applyVisibilityAndFilterRecordMW: filters recordMW using visibility results
         {
-            D3DXMATRIX currentView, currentProj;
-            device->GetTransform(D3DTS_VIEW, &currentView);
-            device->GetTransform(D3DTS_PROJECTION, &currentProj);
-            FixedFunctionShader::executeHiZCulling(currentView, currentProj);
+            // Use game view/proj from context (device may have UI view in deferred pipeline)
+            FixedFunctionShader::executeHiZCulling(ctx->mwView, ctx->mwProj);
         }
         FixedFunctionShader::applyVisibilityAndFilterRecordMW();
 
@@ -239,10 +251,12 @@ void DistantLand::renderStage1(DLContext* ctx) {
             RenderTargetSwitcher rtsw(surfDepthFrameMSAA, surfDepthDepth);
             g_passBreaks.mge_depthRT += 2; // Single RenderTargetSwitcher in+out for entire depth section
 
-            // Depth texture from recorded renders (Scene 0)
+            // Depth texture from recorded renders
+            // HLSL path: only render Scene 0 depth (Scene 1+ handled by renderStage2)
+            int sceneFilter = (isHLSLActive()) ? 0 : -1;
             effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
             if (ImGuiManager::GetEnableDepthPass()) {
-                renderDepth(ctx);
+                renderDepth(ctx, sceneFilter);
             }
             effectDepth->End();
 
@@ -294,7 +308,11 @@ void DistantLand::renderStage1(DLContext* ctx) {
         stateSaved->Release();
     }
 
-    recordMW.clear();
+    // HLSL path: keep recordMW for renderStage2 (Scene 1+ depth still needed)
+    // Legacy path: clear now (Scene 1+ will re-populate during its own recording)
+    if (!isHLSLActive()) {
+        recordMW.clear();
+    }
 }
 
 // renderStage2 - Render shadows and depth texture for scenes 1+ (post-stencil redraw/alpha/1st person)
@@ -317,7 +335,7 @@ void DistantLand::renderStage2(DLContext* ctx) {
 
         if (isDistantCell()) {
             // Shadowing onto recorded renders (skip if HLSL shadows are handling it)
-            if ((Configuration.MGEFlags & USE_SHADOWS) && mwBridge->CellHasWeather() && Configuration.PerPixelLightFlags != 2) {
+            if ((Configuration.MGEFlags & USE_SHADOWS) && mwBridge->CellHasWeather() && !isHLSLActive()) {
                 effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
                 effect->BeginPass(ctx->isPPLActive ? PASS_RENDERSHADOWFFE : PASS_RENDERSHADOW);
                 renderShadow(ctx);
@@ -327,9 +345,11 @@ void DistantLand::renderStage2(DLContext* ctx) {
         }
 
         // Depth texture from recorded renders
+        // HLSL path: only render Scene 1+ depth (Scene 0 already done in renderStage1)
+        int sceneFilter = (isHLSLActive()) ? 1 : -1;
         effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
         if (ImGuiManager::GetEnableDepthPass()) {
-            renderDepthAdditional(ctx);
+            renderDepthAdditional(ctx, sceneFilter);
             g_passBreaks.mge_depthRT += 2; // RenderTargetSwitcher in+out
         }
         effectDepth->End();
@@ -339,7 +359,7 @@ void DistantLand::renderStage2(DLContext* ctx) {
 
         stateSaved->Release();
 
-        // Clear recordMW for next scene's depth pass
+        // Clear recordMW (always — HLSL path deferred clear, legacy path normal clear)
         recordMW.clear();
     }
 }
@@ -1024,14 +1044,18 @@ void DistantLand::setSunLight(const D3DLIGHT8* s) {
 bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
     auto mwBridge = MWBridge::get();
 
-    // Log Scene 1+ draws to debug hand rendering
+    // Log ALL Scene 1+ draws to debug hand rendering (one-time dump)
     static int scene1DrawCount = 0;
-    if (sceneCount >= 1) {
+    static bool scene1LogDone = false;
+    if (sceneCount >= 1 && !scene1LogDone) {
         scene1DrawCount++;
-        if (scene1DrawCount <= 5) {
-            LOG::logline(">> Scene %d draw #%d: zWrite=%d, blendEnable=%d, alphaTest=%d",
-                         sceneCount, scene1DrawCount, rs->zWrite, rs->blendEnable, rs->alphaTest);
-        }
+        LOG::logline(">> Scene %d draw #%d: zWrite=%d, blendEnable=%d, alphaTest=%d, vertBlend=%d, prims=%d",
+                     sceneCount, scene1DrawCount, rs->zWrite, rs->blendEnable, rs->alphaTest,
+                     rs->vertexBlendState, rs->primCount);
+    }
+    // After first frame finalize, stop logging
+    if (sceneCount == 0 && scene1DrawCount > 0) {
+        scene1LogDone = true;
     }
 
     // Avoid recording landscape alpha blend drawcalls, a form of multi-pass splatting
@@ -1046,8 +1070,13 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
     // Track index of entry added to recordMW (local variable, not global state)
     int recordMWIdx = -1;
 
-    // Capture all writes to z-buffer, except detectable second passes of multi-pass rendering
-    if (rs->zWrite && !isLandSplat && !isDecal) {
+    // Capture z-writing draws, plus Scene 1+ skinning/other (for depth texture even if zWrite=0)
+    // Scene 0: only zWrite draws (skip multi-pass splatting and decals)
+    // Scene 1+ skinning (hands): vertexBlendState != 0 → depth for SSAO/DOF
+    // Scene 1+ other (opaque 1P): !blendEnable → depth for SSAO/DOF
+    // Scene 1+ alpha sorted: vertexBlendState == 0 && blendEnable → skip depth
+    bool is1PDepthCandidate = sceneCount > 0 && (rs->vertexBlendState != 0 || !rs->blendEnable);
+    if ((rs->zWrite && !isLandSplat && !isDecal) || is1PDepthCandidate) {
         recordMW.emplace_back(*rs);
 
         // Unify alpha test operator/reference to be equivalent to GREATEREQUAL
@@ -1058,6 +1087,7 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
         // Don't compute bboxes here - too expensive (buffer locks cause stalls)
         // Bboxes will be computed on-the-fly during culling if needed
         recordMW.back().hasBoundingBox = false;
+        recordMW.back().sceneNum = sceneCount;
 
         // Store index of just-added entry (for HLSL recording to reuse visibility)
         recordMWIdx = static_cast<int>(recordMW.size() - 1);

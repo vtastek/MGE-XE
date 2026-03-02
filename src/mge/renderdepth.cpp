@@ -14,7 +14,7 @@
 
 
 
-void DistantLand::renderDepth(DLContext* ctx) {
+void DistantLand::renderDepth(DLContext* ctx, int sceneFilter) {
     MGE_ZoneScopedN("renderDepth");
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_Depth, 0, (int)recordMW.size());
     auto mwBridge = MWBridge::get();
@@ -50,8 +50,9 @@ void DistantLand::renderDepth(DLContext* ctx) {
     effectDepth->EndPass();
 
     // Recorded draw calls with Morrowind near plane
+    // Pass game view for skinned object transforms (device may have UI view in deferred pipeline)
     effectDepth->BeginPass(PASS_RENDERMWDEPTH);
-    renderDepthRecorded();
+    renderDepthRecorded(sceneFilter, &ctx->mwView);
     effectDepth->EndPass();
 
     // Reset projection matrix
@@ -103,7 +104,7 @@ void DistantLand::renderDepthDistantLand(DLContext* ctx) {
     effect->SetMatrix(ehProj, &ctx->mwProj);
 }
 
-void DistantLand::renderDepthAdditional(DLContext* ctx) {
+void DistantLand::renderDepthAdditional(DLContext* ctx, int sceneFilter) {
     // Switch to render target
     RenderTargetSwitcher rtsw(surfDepthFrameMSAA, surfDepthDepth);
 
@@ -119,25 +120,29 @@ void DistantLand::renderDepthAdditional(DLContext* ctx) {
     effect->SetMatrix(ehProj, &mwDepthProj);
 
     // Recorded draw calls with Morrowind near plane
+    // Pass game view for skinned object transforms (device may have UI view in deferred pipeline)
     effectDepth->BeginPass(PASS_RENDERMWDEPTH);
-    renderDepthRecorded();
+    renderDepthRecorded(sceneFilter, &ctx->mwView);
     effectDepth->EndPass();
 
     // Reset projection matrix
     effect->SetMatrix(ehProj, &ctx->mwProj);
 }
 
-void DistantLand::renderDepthRecorded() {
+void DistantLand::renderDepthRecorded(int sceneFilter, const D3DXMATRIX* gameView) {
     // Use an alpha threshold for solidity that isn't precisely equal to a commonly used value (such as 0.5).
     // Vertex interpolators can be slightly inaccurate and cause a value that should be constant across a triangle
     // to have interpolated fragment values that vary either side of the threshold and cause noise.
     const float solidThreshold = 0.499f;
 
-    // DEBUG: Log renderDepthRecorded call and recordMW size
-    static bool loggedOnce = false;
-    if (!loggedOnce) {
-        LOG::logline(">> renderDepthRecorded() called with %d recorded draws", (int)recordMW.size());
-        loggedOnce = true;
+    // DEBUG: Log renderDepthRecorded call and scene filter breakdown
+    static int logCount = 0;
+    if (logCount < 4) {
+        int s0 = 0, s1 = 0;
+        for (const auto& m : recordMW) { if (m.sceneNum == 0) s0++; else s1++; }
+        LOG::logline(">> renderDepthRecorded(sceneFilter=%d): total=%d, scene0=%d, scene1+=%d",
+                     sceneFilter, (int)recordMW.size(), s0, s1);
+        logCount++;
     }
 
     // Note: Culling is already done by executeHiZCulling/applyVisibilityAndFilterRecordMW() using Hi-Z.
@@ -145,6 +150,10 @@ void DistantLand::renderDepthRecorded() {
 
     // Recorded renders (pre-filtered by executeHiZCulling/applyVisibilityAndFilterRecordMW)
     for (const auto& i : recordMW) {
+        // Scene filter: -1 = all, 0 = scene 0 only, >0 = scene 1+ only
+        if (sceneFilter == 0 && i.sceneNum != 0) continue;
+        if (sceneFilter > 0 && i.sceneNum == 0) continue;
+
         MGE_ZoneScopedN("renderDepth_Draw");
         // Set variables in main effect; variables are shared via effect pool
 
@@ -168,10 +177,15 @@ void DistantLand::renderDepthRecorded() {
         effect->SetBool(ehHasBones, i.vertexBlendState != 0);
         effect->SetInt(ehVertexBlendState, i.vertexBlendState);
 
-        // Phase A: Fix vertex animation timing - recalculate transforms with current view matrix
-        if (i.vertexBlendState > 0) {
-            // For skinned objects, recombine recorded world matrices with current view matrix
-            // i.worldViewTransforms contains old view matrix data, causing animation mismatch
+        // Recalculate skinned transforms with game view matrix (not device view, which may be UI)
+        if (i.vertexBlendState > 0 && gameView) {
+            D3DXMATRIX currentWorldViewTransforms[4];
+            for (int j = 0; j < 4; j++) {
+                currentWorldViewTransforms[j] = i.worldTransforms[j] * (*gameView);
+            }
+            effect->SetMatrixArray(ehVertexBlendPalette, currentWorldViewTransforms, 4);
+        } else if (i.vertexBlendState > 0) {
+            // Fallback: use device view (legacy path)
             D3DXMATRIX currentView, currentWorldViewTransforms[4];
             device->GetTransform(D3DTS_VIEW, &currentView);
             for (int j = 0; j < 4; j++) {
@@ -183,25 +197,35 @@ void DistantLand::renderDepthRecorded() {
         }
         effectDepth->CommitChanges();
 
-        // Phase A: Set render states to match HLSL rendering exactly
-        // For alpha blended objects, disable backface culling to show both sides
-        // In depth-only rendering, both front and back faces need proper depth values
-        if (i.blendEnable) {
-            device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
-        } else {
-            device->SetRenderState(D3DRS_CULLMODE, i.cullMode);
-        }
-        device->SetRenderState(D3DRS_ALPHABLENDENABLE, i.blendEnable);
-        if (i.blendEnable) {
-            device->SetRenderState(D3DRS_SRCBLEND, i.srcBlend);
-            device->SetRenderState(D3DRS_DESTBLEND, i.destBlend);
-        }
+        // Scene 1+ objects (hands/alpha): force opaque depth write
+        // They have zWrite=0 and blendEnable=1 in Morrowind, but we need solid depth for SSAO/DOF
+        bool forceOpaqueDepth = (i.sceneNum > 0);
 
-        // Phase A: Set alpha test for depth-only rendering to match color rendering
-        device->SetRenderState(D3DRS_ALPHATESTENABLE, i.alphaTest);
-        if (i.alphaTest) {
-            device->SetRenderState(D3DRS_ALPHAREF, i.alphaRef);
-            device->SetRenderState(D3DRS_ALPHAFUNC, i.alphaFunc);
+        // Set render states for depth pass
+        if (forceOpaqueDepth) {
+            // Scene 1+: write solid depth, no blending, standard culling
+            device->SetRenderState(D3DRS_CULLMODE, i.cullMode);
+            device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+            device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+        } else {
+            // Scene 0: match HLSL rendering states
+            if (i.blendEnable) {
+                device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+            } else {
+                device->SetRenderState(D3DRS_CULLMODE, i.cullMode);
+            }
+            device->SetRenderState(D3DRS_ALPHABLENDENABLE, i.blendEnable);
+            if (i.blendEnable) {
+                device->SetRenderState(D3DRS_SRCBLEND, i.srcBlend);
+                device->SetRenderState(D3DRS_DESTBLEND, i.destBlend);
+            }
+
+            // Alpha test for depth-only rendering to match color rendering
+            device->SetRenderState(D3DRS_ALPHATESTENABLE, i.alphaTest);
+            if (i.alphaTest) {
+                device->SetRenderState(D3DRS_ALPHAREF, i.alphaRef);
+                device->SetRenderState(D3DRS_ALPHAFUNC, i.alphaFunc);
+            }
         }
 
         device->SetStreamSource(0, i.vb, i.vbOffset, i.vbStride);

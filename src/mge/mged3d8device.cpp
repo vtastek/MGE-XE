@@ -46,6 +46,7 @@ static bool stage0Complete, isFrameComplete, isHUDComplete;
 static bool isWaterMaterial, waterDrawn, distantWater;
 static DLContext frameCtx;  // Per-frame rendering context, created by renderStage0
 
+
 // Deferred scene forwarding — suppress empty BeginScene/EndScene pairs
 static bool scenePending = false;      // BeginScene called but not forwarded to real device
 static bool sceneForwarded = false;    // BeginScene has been forwarded to real device
@@ -163,9 +164,9 @@ MGEProxyDevice::MGEProxyDevice(IDirect3DDevice9* real, ProxyD3D* d3d) : ProxyDev
 
 // Present - End of MW frame
 // MGE end of frame processing
+// bisect test comment
 HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, const RGNDATA* d) {
     MGE_ZoneScopedN("MGE_Present");
-
     auto mwBridge = MWBridge::get();
 
     // Load Morrowind's dynamic memory pointers
@@ -637,10 +638,34 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                 distantWater = (Configuration.MGEFlags & USE_DISTANT_LAND) || (Configuration.MGEFlags & USE_DISTANT_WATER);
             }
         } else {
-            // UI scene, apply post-process if there was anything drawn before it
-            // Race menu will render an extra scene past this point
+            // UI scene — frame finalize point
             if (DistantLand::ready && sceneCount > 0 && !isFrameComplete) {
                 ensureSceneActive();
+
+                if (stage0Complete && isHLSLActive()) {
+                    // Save UI scene state — finalizeAndRender changes RT, DS, shaders, blend state
+                    IDirect3DSurface9* savedRT = nullptr;
+                    IDirect3DSurface9* savedDS = nullptr;
+                    realDevice->GetRenderTarget(0, &savedRT);
+                    realDevice->GetDepthStencilSurface(&savedDS);
+
+                    IDirect3DStateBlock9* uiStateSaved;
+                    realDevice->CreateStateBlock(D3DSBT_ALL, &uiStateSaved);
+
+                    FixedFunctionShader::finalizeAndRender(&frameCtx, waterDrawn);
+
+                    // Restore UI scene state
+                    uiStateSaved->Apply();
+                    uiStateSaved->Release();
+
+                    realDevice->SetRenderTarget(0, savedRT);
+                    realDevice->SetDepthStencilSurface(savedDS);
+                    if (savedRT) savedRT->Release();
+                    if (savedDS) savedDS->Release();
+
+                    realDevice->Clear(0, NULL, D3DCLEAR_ZBUFFER, 0, 1.0f, 0);
+                }
+
                 DistantLand::postProcess(&frameCtx);
             }
 
@@ -673,24 +698,24 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
         // ~ If any alpha meshes are visible, they are sorted and drawn in another scene (except those with 'No Sorter' property)
         // ~ If 1st person or sunglare is visible, they are drawn in another scene after a Z clear
         if (sceneCount == 0) {
-            // Edge case, render distant land even if Morrowind has culled everything
-            if (!stage0Complete) {
-                frameCtx = DistantLand::renderStage0();
-                stage0Complete = true;
+            if (isHLSLActive()) {
+                // HLSL path: capture context only, defer all GPU work to frame finalize
+                if (!stage0Complete) {
+                    frameCtx = DistantLand::captureStage0Context();
+                    stage0Complete = true;
+                }
+                FixedFunctionShader::capturePostRecordingState();
+            } else {
+                // Legacy path: interleaved GPU work as before
+                if (!stage0Complete) {
+                    frameCtx = DistantLand::renderStage0();
+                    stage0Complete = true;
+                }
+                FixedFunctionShader::finalizeBatchAndSubmitCull();
+                DistantLand::renderStage1(&frameCtx);
+                DistantLand::renderStageBlend(&frameCtx);
+                FixedFunctionShader::waitCullAndReplay();
             }
-
-            // Submit HLSL recording to cull thread BEFORE renderStage1
-            // Cull thread runs prepareRecordedCalls() in parallel with grass/depth rendering
-            FixedFunctionShader::finalizeBatchAndSubmitCull();
-
-            // Opaque features (cull thread runs in parallel with this)
-            DistantLand::renderStage1(&frameCtx);
-
-            // Blend close objects over distant land
-            DistantLand::renderStageBlend(&frameCtx);
-
-            // Wait for cull completion and replay HLSL draws
-            FixedFunctionShader::waitCullAndReplay();
         } else if (!isFrameComplete) {
             // Draw water if the Morrowind water plane doesn't appear in view
             // it may be too distant or stencil scene order is non-normative
@@ -718,7 +743,8 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
     FixedFunctionShader::finalizeBatchAndReplay(sceneCount);
 
     // Render depth for Scene 1+ AFTER all geometry has been captured
-    if (!isFrameComplete && sceneCount > 0) {
+    // HLSL defers this to finalizeAndRender (renderStage2 clears recordMW, which renderStage1 needs)
+    if (!isFrameComplete && sceneCount > 0 && !isHLSLActive()) {
         DistantLand::renderStage2(&frameCtx);
     }
 
@@ -974,7 +1000,7 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
     }
 
     // Skip stencil shadow rendering entirely in HLSL mode (HLSL has its own shadows)
-    if (isShadowStencil && Configuration.PerPixelLightFlags == 2) {
+    if (isShadowStencil && isHLSLActive()) {
         return D3D_OK;
     }
 
@@ -991,7 +1017,13 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
 
         if (!stage0Complete && !isAmbientWhite) {
             // At this point, only the sky is rendered in exteriors, or nothing in interiors
-            frameCtx = DistantLand::renderStage0();
+            if (isHLSLActive()) {
+                // HLSL: CPU-only context capture, GPU work deferred to finalizeAndRender
+                frameCtx = DistantLand::captureStage0Context();
+            } else {
+                // Legacy: interleaved GPU work (distant land renders now)
+                frameCtx = DistantLand::renderStage0();
+            }
             stage0Complete = true;
         }
 

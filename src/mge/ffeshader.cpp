@@ -65,6 +65,7 @@ bool FixedFunctionShader::isReplaying = false;
 bool FixedFunctionShader::manualRecordingControl = false;
 bool FixedFunctionShader::recordingEnabled = true;
 bool FixedFunctionShader::recordingCompletedThisFrame = false;
+int FixedFunctionShader::currentRecordingScene = 0;
 bool FixedFunctionShader::hiZBuiltThisFrame = false;
 bool FixedFunctionShader::dumpRequested = false;
 
@@ -653,8 +654,8 @@ void FixedFunctionShader::updateLighting(float sunMult, float ambMult) {
 }
 
 void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, int recordMWIdx) {
-    // Use HLSL pipeline if mode is set to HLSL (PerPixelLightFlags == 2)
-    if (Configuration.PerPixelLightFlags == 2) {
+    // Use HLSL pipeline if mode is set to HLSL
+    if (isHLSLActive()) {
         renderMorrowindHLSL(rs, frs, lightrs, recordMWIdx);
         return;
     }
@@ -1509,6 +1510,8 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
     }
 
     // Start recording at first HLSL call if not already recording (unless under manual control or disabled)
+    // Recording happens for ALL modes (standard, PPL, HLSL) — renderStageBlend is designed to run
+    // before replay, compositing distant land based on depth before the scene is drawn.
     if (!isRecording && !isReplaying && !manualRecordingControl && recordingEnabled && !recordingCompletedThisFrame && ImGuiManager::GetEnableRecording()) {
         startRecording();
     }
@@ -1776,8 +1779,13 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     bindShaderTextures(sk, rs);
 
     // Get current view matrix and compute inverse (needed for texture lights and shadows)
+    // During replay, device may have UI view — use recorded game view instead
     D3DXMATRIX currentView;
-    device->GetTransform(D3DTS_VIEW, &currentView);
+    if (isReplaying) {
+        currentView = frameBuffers[recordingBuffer].view;
+    } else {
+        device->GetTransform(D3DTS_VIEW, &currentView);
+    }
 
     // Only recalculate inverse view when view changes
     if (!shadowMatricesValid || memcmp(&currentView, &cachedViewMatrix, sizeof(D3DXMATRIX)) != 0) {
@@ -1955,7 +1963,16 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             }
 
             if (hlslShader.hShadowWorldViewProj) {
-                hlslShader.vsConstantTable->SetMatrixArray(device, hlslShader.hShadowWorldViewProj, rs->shadowWorldViewProj, 2);
+                // During replay, recompute shadow matrices from current frame's shadow VP
+                // (baked values from recording used previous frame's shadow VP → shaking)
+                if (isReplaying && s_activeShadowVP) {
+                    D3DXMATRIX currentShadowWVP[2];
+                    currentShadowWVP[0] = rs->worldTransforms[0] * s_activeShadowVP[0];
+                    currentShadowWVP[1] = rs->worldTransforms[0] * s_activeShadowVP[1];
+                    hlslShader.vsConstantTable->SetMatrixArray(device, hlslShader.hShadowWorldViewProj, currentShadowWVP, 2);
+                } else {
+                    hlslShader.vsConstantTable->SetMatrixArray(device, hlslShader.hShadowWorldViewProj, rs->shadowWorldViewProj, 2);
+                }
             }
         } catch (...) {
             LOG::logline("!! HLSL Vertex shader constant table access failed - shader may have been edited");
@@ -3465,6 +3482,16 @@ void FixedFunctionShader::executeHiZCulling(const D3DXMATRIX& currentView, const
         int visibleCount = 0, culledCount = 0, noBboxCount = 0;
 
         for (auto& call : recCalls) {
+            // Scene 1+ (hands/alpha after Z-clear): always visible, skip Hi-Z test
+            if (call.sceneNum > 0) {
+                call.shouldRender = true;
+                if (call.recordMWIndex >= 0 && call.recordMWIndex < (int)visibilityResults.size()) {
+                    visibilityResults[call.recordMWIndex] = 1;
+                }
+                visibleCount++;
+                continue;
+            }
+
             if (!call.hasBoundingBox) {
                 call.shouldRender = true;  // No bbox = conservative visible
                 if (call.recordMWIndex >= 0 && call.recordMWIndex < (int)visibilityResults.size()) {
@@ -3927,19 +3954,226 @@ void FixedFunctionShader::waitCullAndReplay() {
 void FixedFunctionShader::finalizeBatchAndReplay(int sceneCount) {
     if (recordingEnabled) {
         if (sceneCount == 0) {
-            // Scene 0: work already done by finalizeBatchAndSubmitCull() + waitCullAndReplay()
-            // Just ensure clean state flags (should already be set, but defensive)
-            isRecording = false;
-            isReplaying = false;
-            recordingCompletedThisFrame = true;
+            // Scene 0: recording continues through Scene 1+
+            // capturePostRecordingState() already saved device state
+            // finalizeAndRender() will do the actual prepare+render later
         } else {
-            // Scene 1+: hands render via immediate path (with shadow matrices)
-            currentRecordedCalls().clear();
-            resetHLSLCaches();
+            // Scene 1+: recording continues, no-op
+            // Calls accumulate into the same buffer for unified replay
         }
     } else {
         // When recording disabled, still clear calls after potential dump
         currentRecordedCalls().clear();
+        resetHLSLCaches();
+    }
+}
+
+// capturePostRecordingState - Capture MW device state at end of Scene 0
+// Recording continues through Scene 1+; this just saves what we need to restore later.
+void FixedFunctionShader::capturePostRecordingState() {
+    if (!isRecording) return;
+
+    device->GetRenderState(D3DRS_ALPHABLENDENABLE, &postRecordingState.alphaBlendEnable);
+    device->GetRenderState(D3DRS_ALPHATESTENABLE, &postRecordingState.alphaTestEnable);
+    device->GetRenderState(D3DRS_ZENABLE, &postRecordingState.zEnable);
+    device->GetRenderState(D3DRS_ZWRITEENABLE, &postRecordingState.zWriteEnable);
+    device->GetRenderState(D3DRS_CULLMODE, &postRecordingState.cullMode);
+    device->GetRenderState(D3DRS_SRCBLEND, &postRecordingState.srcBlend);
+    device->GetRenderState(D3DRS_DESTBLEND, &postRecordingState.destBlend);
+    device->GetRenderState(D3DRS_FOGENABLE, &postRecordingState.fogEnable);
+    device->GetRenderState(D3DRS_SPECULARENABLE, &postRecordingState.specularEnable);
+    device->GetRenderState(D3DRS_LOCALVIEWER, &postRecordingState.localViewer);
+    device->GetRenderState(D3DRS_NORMALIZENORMALS, &postRecordingState.normalizeNormals);
+    device->GetRenderState(D3DRS_ZFUNC, &postRecordingState.zFunc);
+    device->GetRenderState(D3DRS_ALPHAFUNC, &postRecordingState.alphaFunc);
+    device->GetRenderState(D3DRS_ALPHAREF, &postRecordingState.alphaRef);
+}
+
+// finalizeAndRender - Complete prepare+render phase at frame finalize point (BeginScene UI)
+// Stops recording, runs cull/prepare, then all GPU stages, then replay.
+void FixedFunctionShader::finalizeAndRender(DLContext* frameCtx, bool waterSeen) {
+    MGE_ZoneScopedN("Frame_PrepareAndRender");
+
+    // Handle dump request
+    if (dumpRequested) {
+        auto& recCalls = currentRecordedCalls();
+        LOG::logline("Frame dump: Dumping %d recorded calls (finalize)", recCalls.size());
+        StatusOverlay::setStatus("Frame dump: Finalize complete");
+        char logline[512];
+        for (size_t i = 0; i < recCalls.size(); ++i) {
+            const auto& call = recCalls[i];
+            snprintf(logline, sizeof(logline), "Call %zu: texture=0x%p, vb=0x%p, ib=0x%p (finalize)",
+                     i, call.rs.texture, call.rs.vb, call.rs.ib);
+            LOG::logline(logline);
+        }
+        dumpRequested = false;
+    }
+
+    // === STOP RECORDING ===
+    if (!recordingEnabled || !isRecording) {
+        // Nothing recorded — still need to run GPU stages
+        isRecording = false;
+        recordingCompletedThisFrame = true;
+
+        // GPU stages even without HLSL recording
+        DistantLand::renderStage0GPU(frameCtx);
+        DistantLand::renderStage1(frameCtx);
+        DistantLand::renderStageBlend(frameCtx);
+        if (waterSeen) {
+            DistantLand::renderStageWater(frameCtx);
+        }
+        DistantLand::renderStage2(frameCtx);
+        return;
+    }
+
+    isRecording = false;
+    recordingCompletedThisFrame = true;
+
+    // Diagnostic: increment frame counter for cache miss/hit logging
+    ++hlslDiagFrameCounter;
+
+    // After frame 5, dump unused precached variants
+    if (hlslDiagFrameCounter == 6) {
+        LOG::logline("-- PRECACHE HIT REPORT: %d keys hit out of %d cached", (int)diagHitKeys.size(), (int)cacheHLSLShaders.size());
+        AcquireSRWLockShared(&hlslCacheLock);
+        for (const auto& entry : cacheHLSLShaders) {
+            const auto& k = entry.first;
+            bool hit = diagHitKeys.count(k) > 0;
+            char buf[256];
+            snprintf(buf, sizeof(buf),
+                "%s lm=%d lit=%d vc=%d vm=%d hl=%d skin=%d fog=%d uv=%d stg=%d shd=%d det=%d dp=%d ph=%d px=%d gr=%d bm=%d tg=%d",
+                hit ? "HIT " : "UNUSED",
+                (int)k.lightMode, (int)k.useLighting, (int)k.vertexColour,
+                (int)k.vertexMaterial, (int)k.heavyLighting,
+                (int)k.usesSkinning, (int)k.fogMode, (int)k.uvSets,
+                (int)k.activeStages,
+                (int)k.hasShadows, (int)k.hasDetail, (int)k.hasDiffParam,
+                (int)k.hasParamH, (int)k.hasParamX, (int)k.hasGrass,
+                (int)k.usesBumpmap, (int)k.usesTexgen);
+            LOG::logline("%s", buf);
+        }
+        ReleaseSRWLockShared(&hlslCacheLock);
+        diagHitKeys.clear();
+    }
+
+    // Batch-warm suffix cache before prepare
+    {
+        MGE_ZoneScopedN("BatchWarmSuffixCache");
+        auto& recCalls = frameBuffers[recordingBuffer].recordedCalls;
+        std::unordered_set<IDirect3DTexture9*> seen;
+        for (const auto& call : recCalls) {
+            if (call.rs.texture && seen.insert(call.rs.texture).second) {
+                AcquireSRWLockShared(&textureSuffixLock);
+                bool found = textureSuffixResolutionCache.count(call.rs.texture) > 0;
+                ReleaseSRWLockShared(&textureSuffixLock);
+                if (!found) {
+                    warmSuffixCache(device, call.rs.texture);
+                }
+            }
+        }
+    }
+
+    // Diagnostic: log scene breakdown once
+    {
+        static bool loggedOnce = false;
+        if (!loggedOnce) {
+            auto& recCalls = currentRecordedCalls();
+            int s0 = 0, s1 = 0;
+            for (const auto& c : recCalls) {
+                if (c.sceneNum == 0) s0++; else s1++;
+            }
+            int m0 = 0, m1 = 0;
+            for (const auto& m : DistantLand::recordMW) {
+                if (m.sceneNum == 0) m0++; else m1++;
+            }
+            LOG::logline(">> finalizeAndRender: HLSL calls=%d (scene0=%d, scene1+=%d), recordMW=%d (scene0=%d, scene1+=%d)",
+                         (int)recCalls.size(), s0, s1, (int)DistantLand::recordMW.size(), m0, m1);
+            loggedOnce = true;
+        }
+    }
+
+    // === PREPARE ===
+    {
+        MGE_ZoneScopedN("Frame_Prepare");
+
+        // Submit to cull thread or run inline
+        int buf = recordingBuffer;
+        frameBuffers[buf].state = BufferState::ReadyToCull;
+
+        if (g_cullThread && g_cullThread->isRunning()) {
+            g_cullThread->submitWork(buf, false);
+        } else {
+            executeCullPass(buf);
+            frameBuffers[buf].state = BufferState::ReadyToRender;
+        }
+    }
+
+    // === RENDER ===
+    {
+        MGE_ZoneScopedN("Frame_Render");
+
+        // Stage 0 GPU: shadow map, distant land, sky, water reflection, wave sim
+        DistantLand::renderStage0GPU(frameCtx);
+
+        // Update shadow VP in frame buffer — renderShadowMap just computed current frame's
+        // shadow matrices and wrote them back to s_staging. The stale previous-frame values
+        // captured at startRecording() would cause shadow shaking on camera movement.
+        {
+            auto& fbShadow = frameBuffers[recordingBuffer];
+            fbShadow.shadowViewproj[0] = DistantLand::s_staging.smViewproj[0];
+            fbShadow.shadowViewproj[1] = DistantLand::s_staging.smViewproj[1];
+        }
+
+        // Stage 1: grass, shadow overlay, depth (cull thread runs in parallel with this)
+        DistantLand::renderStage1(frameCtx);
+
+        // Blend close objects over distant land
+        DistantLand::renderStageBlend(frameCtx);
+
+        // Wait for cull completion
+        auto& fb = frameBuffers[recordingBuffer];
+        if (g_cullThread && g_cullThread->isRunning() && fb.state != BufferState::ReadyToRender) {
+            g_cullThread->waitForCompletion();
+        }
+        fb.state = BufferState::ReadyToRender;
+
+        // Replay all recorded HLSL calls (Scene 0 + Scene 1+)
+        replayRecordedCalls(0);
+
+        // Water surface AFTER replay — refraction samples backbuffer which needs scene content
+        if (waterSeen) {
+            DistantLand::renderStageWater(frameCtx);
+        }
+
+        // Stage 2: additional depth for all recorded geometry
+        DistantLand::renderStage2(frameCtx);
+
+        // Clean up HLSL-only texture slots to prevent DXVK descriptor bloat
+        for (int i = 2; i < 6; i++) {
+            device->SetTexture(i, NULL);
+            textureCache.updateCache(i, nullptr);
+            textureCache.textureValid[i] = false;
+        }
+        device->SetVertexShader(NULL);
+        device->SetPixelShader(NULL);
+
+        // Restore Morrowind's end-of-Scene-0 state
+        device->SetRenderState(D3DRS_ALPHABLENDENABLE, postRecordingState.alphaBlendEnable);
+        device->SetRenderState(D3DRS_ALPHATESTENABLE, postRecordingState.alphaTestEnable);
+        device->SetRenderState(D3DRS_ZENABLE, postRecordingState.zEnable);
+        device->SetRenderState(D3DRS_ZWRITEENABLE, postRecordingState.zWriteEnable);
+        device->SetRenderState(D3DRS_CULLMODE, postRecordingState.cullMode);
+        device->SetRenderState(D3DRS_SRCBLEND, postRecordingState.srcBlend);
+        device->SetRenderState(D3DRS_DESTBLEND, postRecordingState.destBlend);
+        device->SetRenderState(D3DRS_FOGENABLE, postRecordingState.fogEnable);
+        device->SetRenderState(D3DRS_SPECULARENABLE, postRecordingState.specularEnable);
+        device->SetRenderState(D3DRS_LOCALVIEWER, postRecordingState.localViewer);
+        device->SetRenderState(D3DRS_NORMALIZENORMALS, postRecordingState.normalizeNormals);
+        device->SetRenderState(D3DRS_ZFUNC, postRecordingState.zFunc);
+        device->SetRenderState(D3DRS_ALPHAFUNC, postRecordingState.alphaFunc);
+        device->SetRenderState(D3DRS_ALPHAREF, postRecordingState.alphaRef);
+
+        isReplaying = false;
         resetHLSLCaches();
     }
 }
@@ -4097,6 +4331,7 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
 
     {
         currentRecordedCalls().emplace_back(rs, frs, sharedLightState, sk, recordMWIdx);
+        currentRecordedCalls().back().sceneNum = currentRecordingScene;
 
         // Immediately populate bboxLookup so depth pass can use current-frame bboxes
         // (executeHiZCulling runs BEFORE finalizeBatchAndReplay)
@@ -4940,13 +5175,10 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
 
     isReplaying = true;
 
-    // Get current matrices for debug bbox visualization and transform restoration
-    D3DXMATRIX currentView, currentProj;
-    {
-        MGE_ZoneScopedN("replay_GetTransforms");
-        device->GetTransform(D3DTS_VIEW, &currentView);
-        device->GetTransform(D3DTS_PROJECTION, &currentProj);
-    }
+    // Use game view/proj for light transforms and debug visualization
+    // In deferred pipeline, device may have UI view — use s_staging which has the game matrices
+    D3DXMATRIX currentView = DistantLand::s_staging.mwView;
+    D3DXMATRIX currentProj = DistantLand::s_staging.mwProj;
 
     // Set active shadow pointer to recording-time matrices for replay
     auto& fb = frameBuffers[recordingBuffer];
@@ -5184,6 +5416,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
     bool firstDrawDone = false;
     for (size_t i = 0; i < numCalls; i++) {
         auto& call = recCalls[i];  // Non-const to update shader key
+        // No Z-clear between scenes: Scene 1+ depth-tests against Scene 0.
+        // Alpha-sorted objects properly occlude behind world geometry.
 
         // Track bin statistics
         binCounts[(int)call.bin]++;

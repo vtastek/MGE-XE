@@ -170,3 +170,9 @@ struct ConfigurationStruct {
 };
 
 extern ConfigurationStruct Configuration;
+
+// HLSL mode requires both USE_FFESHADER flag and PerPixelLightFlags==2.
+// "Standard" mode cycling turns off USE_FFESHADER but leaves PPLFlags at 2.
+inline bool isHLSLActive() {
+    return (Configuration.MGEFlags & USE_FFESHADER) && Configuration.PerPixelLightFlags == 2;
+}

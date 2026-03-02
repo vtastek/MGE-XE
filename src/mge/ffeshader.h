@@ -14,6 +14,8 @@
 #include <memory>
 #include <atomic>
 
+struct DLContext;  // Forward declaration (defined in distantland.h)
+
 // Render bin classification for Tracy profiling and debug visualization
 enum class RenderBin : uint8_t {
     Terrain,      // Landscape verts (future: detected by land splat pattern)
@@ -75,6 +77,9 @@ struct RenderedState {
     // Bounding box for occlusion culling during depth rendering
     D3DXVECTOR3 bboxMin, bboxMax;
     bool hasBoundingBox;
+
+    // Scene number (0 = main opaques, 1+ = hands/alpha after Z-clear)
+    int sceneNum = 0;
 };
 
 struct FragmentState {
@@ -535,6 +540,9 @@ public:
         // Whether this call should be rendered (set by cull pass)
         bool shouldRender = true;
 
+        // Scene number this call was recorded in (0 = main, 1+ = hands/alpha after Z-clear)
+        int sceneNum = 0;
+
         // Expected device state for debug mode (state leak detection)
         ExpectedDeviceState expectedState;
 
@@ -619,6 +627,7 @@ private:
     static bool manualRecordingControl;  // When true, user controls recording via K key
     static bool recordingEnabled;  // Global toggle for entire recording system
     static bool recordingCompletedThisFrame;  // Prevents restarting recording after Scene 0
+    static int currentRecordingScene;  // Scene number being recorded (0 = main, 1+ = hands/alpha)
     static bool hiZBuiltThisFrame;  // Prevents rebuilding Hi-Z pyramid multiple times per frame
     static bool dumpRequested;  // When true, preserve calls for dump
 
@@ -661,6 +670,8 @@ public:
     static void finalizeBatchAndReplay(int sceneCount = 0); // Call when HLSL rendering session is complete
     static void finalizeBatchAndSubmitCull();  // Stop recording, submit to cull thread (before renderStage1)
     static void waitCullAndReplay();           // Wait for cull, replay, restore state (after renderStageBlend)
+    static void capturePostRecordingState();   // Capture MW device state at end of Scene 0 (recording continues)
+    static void finalizeAndRender(DLContext* frameCtx, bool waterSeen); // Prepare + render phase at frame finalize point
 
     // Scene lifecycle for triple-buffered pipeline
     static void markSceneStart(int sceneNum, bool isUI = false);
@@ -683,7 +694,8 @@ public:
     static bool getIsRecording() { return isRecording; }
     static bool getIsReplaying() { return isReplaying; }
     static void setRecordingState(bool recording) { isRecording = recording; }
-    static void resetRecordingCompletedFlag() { recordingCompletedThisFrame = false; }
+    static void resetRecordingCompletedFlag() { recordingCompletedThisFrame = false; currentRecordingScene = 0; }
+    static void setCurrentRecordingScene(int scene) { currentRecordingScene = scene; }
     static void resetHiZBuiltFlag() { hiZBuiltThisFrame = false; }
     static void setReplayingState(bool replaying) { isReplaying = replaying; }
     static void setManualRecordingControl(bool manual) { manualRecordingControl = manual; }

@@ -246,6 +246,8 @@ public:
     static DLContext captureContext();
 
     static void renderSky();
+    static DLContext captureStage0Context();
+    static void renderStage0GPU(DLContext* ctx);
     static DLContext renderStage0();
     static void renderStage1(DLContext* ctx);
     static void renderStage2(DLContext* ctx);
@@ -273,10 +275,10 @@ public:
     static void simulateDynamicWaves();
     static void renderWaterPlane(DLContext* ctx);
 
-    static void renderDepth(DLContext* ctx);
+    static void renderDepth(DLContext* ctx, int sceneFilter = -1);
     static void renderDepthDistantLand(DLContext* ctx);
-    static void renderDepthAdditional(DLContext* ctx);
-    static void renderDepthRecorded();
+    static void renderDepthAdditional(DLContext* ctx, int sceneFilter = -1);
+    static void renderDepthRecorded(int sceneFilter = -1, const D3DXMATRIX* gameView = nullptr);
     static void generateHiZMipsGPU();
     static void copyHiZToStaging();
     static void lockRemainingHiZMips();
