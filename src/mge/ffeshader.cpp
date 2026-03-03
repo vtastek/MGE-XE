@@ -1,6 +1,7 @@
 
 #include "ffeshader.h"
 #include "cullthread.h"
+#include "renderthread.h"
 #include "mge_tracy.h"
 #include "configuration.h"
 #include "support/log.h"
@@ -4084,9 +4085,12 @@ void FixedFunctionShader::finalizeAndRender(DLContext* frameCtx, bool waterSeen)
     {
         auto& fc = frameCaptureGpuCalls;
         auto& rc = recordingGpuCalls;
-        LOG::logline("PHASE: FrameCapture={reads:%d writes:%d submits:%d} Recording={reads:%d writes:%d submits:%d}",
-            fc.deviceReads, fc.deviceWrites, fc.deviceSubmits,
-            rc.deviceReads, rc.deviceWrites, rc.deviceSubmits);
+        bool hasViolation = (fc.deviceSubmits > 0 || rc.deviceSubmits > 0 || rc.deviceWrites > 0);
+        if (hasViolation) {
+            LOG::logline("!! PHASE: FrameCapture={reads:%d writes:%d submits:%d} Recording={reads:%d writes:%d submits:%d}",
+                fc.deviceReads, fc.deviceWrites, fc.deviceSubmits,
+                rc.deviceReads, rc.deviceWrites, rc.deviceSubmits);
+        }
     }
     currentPhase = PipelinePhase::Idle;
 
@@ -4177,79 +4181,94 @@ void FixedFunctionShader::finalizeAndRender(DLContext* frameCtx, bool waterSeen)
     // === RENDER (GPU) ===
     currentPhase = PipelinePhase::GpuRender;
     {
-        MGE_ZoneScopedN("Frame_Render");
-
         auto& fb = frameBuffers[recordingBuffer];
 
         // Store DLContext and waterSeen in FrameBuffer for per-frame isolation
         fb.dlContext = *frameCtx;
         fb.waterSeen = waterSeen;
 
-        // Stage 0 GPU: shadow map, distant land, sky, water reflection, wave sim
-        DistantLand::renderStage0GPU(frameCtx, &fb);
-
-        // Update shadow VP in frame buffer — renderShadowMap just computed current frame's
-        // shadow matrices and wrote them back to s_staging. The stale previous-frame values
-        // captured at startRecording() would cause shadow shaking on camera movement.
-        {
-            fb.shadowViewproj[0] = DistantLand::s_staging.smViewproj[0];
-            fb.shadowViewproj[1] = DistantLand::s_staging.smViewproj[1];
+        if (g_renderThread && g_renderThread->isRunning()) {
+            RenderThread::SceneWork work;
+            work.type = RenderThread::WorkType::RenderFullFrame;
+            work.bufferIndex = recordingBuffer;
+            g_renderThread->submitWork(std::move(work), true);  // wait=true — blocking for 3a
+        } else {
+            executeGpuPhase(recordingBuffer);
         }
-
-        // Stage 1: grass, shadow overlay, depth (cull thread runs in parallel with this)
-        DistantLand::renderStage1(frameCtx, &fb);
-
-        // Blend close objects over distant land
-        DistantLand::renderStageBlend(frameCtx, &fb);
-
-        // Wait for cull completion
-        if (g_cullThread && g_cullThread->isRunning() && fb.state != BufferState::ReadyToRender) {
-            g_cullThread->waitForCompletion();
-        }
-        fb.state = BufferState::ReadyToRender;
-
-        // Replay all recorded HLSL calls (Scene 0 + Scene 1+)
-        replayRecordedCalls(0);
-
-        // Water surface AFTER replay — refraction samples backbuffer which needs scene content
-        if (waterSeen) {
-            DistantLand::renderStageWater(frameCtx);
-        }
-
-        // Stage 2: additional depth for all recorded geometry
-        DistantLand::renderStage2(frameCtx, &fb);
-
-        // Clean up HLSL-only texture slots to prevent DXVK descriptor bloat
-        for (int i = 2; i < 6; i++) {
-            device->SetTexture(i, NULL);
-            textureCache.updateCache(i, nullptr);
-            textureCache.textureValid[i] = false;
-        }
-        device->SetVertexShader(NULL);
-        device->SetPixelShader(NULL);
-
-        // Restore Morrowind's end-of-Scene-0 state (from per-buffer snapshot)
-        const auto& prs = fb.postRecordingState;
-        device->SetRenderState(D3DRS_ALPHABLENDENABLE, prs.alphaBlendEnable);
-        device->SetRenderState(D3DRS_ALPHATESTENABLE, prs.alphaTestEnable);
-        device->SetRenderState(D3DRS_ZENABLE, prs.zEnable);
-        device->SetRenderState(D3DRS_ZWRITEENABLE, prs.zWriteEnable);
-        device->SetRenderState(D3DRS_CULLMODE, prs.cullMode);
-        device->SetRenderState(D3DRS_SRCBLEND, prs.srcBlend);
-        device->SetRenderState(D3DRS_DESTBLEND, prs.destBlend);
-        device->SetRenderState(D3DRS_FOGENABLE, prs.fogEnable);
-        device->SetRenderState(D3DRS_SPECULARENABLE, prs.specularEnable);
-        device->SetRenderState(D3DRS_LOCALVIEWER, prs.localViewer);
-        device->SetRenderState(D3DRS_NORMALIZENORMALS, prs.normalizeNormals);
-        device->SetRenderState(D3DRS_ZFUNC, prs.zFunc);
-        device->SetRenderState(D3DRS_ALPHAFUNC, prs.alphaFunc);
-        device->SetRenderState(D3DRS_ALPHAREF, prs.alphaRef);
-
-        isReplaying = false;
-        resetHLSLCaches();
     }
 
     currentPhase = PipelinePhase::Idle;
+}
+
+void FixedFunctionShader::executeGpuPhase(int bufferIndex) {
+    MGE_ZoneScopedN("Frame_Render");
+
+    auto& fb = frameBuffers[bufferIndex];
+    DLContext* frameCtx = &fb.dlContext;
+    bool waterSeen = fb.waterSeen;
+
+    // Stage 0 GPU: shadow map, distant land, sky, water reflection, wave sim
+    DistantLand::renderStage0GPU(frameCtx, &fb);
+
+    // Update shadow VP in frame buffer — renderShadowMap just computed current frame's
+    // shadow matrices and wrote them back to s_staging. The stale previous-frame values
+    // captured at startRecording() would cause shadow shaking on camera movement.
+    {
+        fb.shadowViewproj[0] = DistantLand::s_staging.smViewproj[0];
+        fb.shadowViewproj[1] = DistantLand::s_staging.smViewproj[1];
+    }
+
+    // Stage 1: grass, shadow overlay, depth (cull thread runs in parallel with this)
+    DistantLand::renderStage1(frameCtx, &fb);
+
+    // Blend close objects over distant land
+    DistantLand::renderStageBlend(frameCtx, &fb);
+
+    // Wait for cull completion
+    if (g_cullThread && g_cullThread->isRunning() && fb.state != BufferState::ReadyToRender) {
+        g_cullThread->waitForCompletion();
+    }
+    fb.state = BufferState::ReadyToRender;
+
+    // Replay all recorded HLSL calls (Scene 0 + Scene 1+)
+    replayRecordedCalls(0);
+
+    // Water surface AFTER replay — refraction samples backbuffer which needs scene content
+    if (waterSeen) {
+        DistantLand::renderStageWater(frameCtx);
+    }
+
+    // Stage 2: additional depth for all recorded geometry
+    DistantLand::renderStage2(frameCtx, &fb);
+
+    // Clean up HLSL-only texture slots to prevent DXVK descriptor bloat
+    for (int i = 2; i < 6; i++) {
+        device->SetTexture(i, NULL);
+        textureCache.updateCache(i, nullptr);
+        textureCache.textureValid[i] = false;
+    }
+    device->SetVertexShader(NULL);
+    device->SetPixelShader(NULL);
+
+    // Restore Morrowind's end-of-Scene-0 state (from per-buffer snapshot)
+    const auto& prs = fb.postRecordingState;
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, prs.alphaBlendEnable);
+    device->SetRenderState(D3DRS_ALPHATESTENABLE, prs.alphaTestEnable);
+    device->SetRenderState(D3DRS_ZENABLE, prs.zEnable);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, prs.zWriteEnable);
+    device->SetRenderState(D3DRS_CULLMODE, prs.cullMode);
+    device->SetRenderState(D3DRS_SRCBLEND, prs.srcBlend);
+    device->SetRenderState(D3DRS_DESTBLEND, prs.destBlend);
+    device->SetRenderState(D3DRS_FOGENABLE, prs.fogEnable);
+    device->SetRenderState(D3DRS_SPECULARENABLE, prs.specularEnable);
+    device->SetRenderState(D3DRS_LOCALVIEWER, prs.localViewer);
+    device->SetRenderState(D3DRS_NORMALIZENORMALS, prs.normalizeNormals);
+    device->SetRenderState(D3DRS_ZFUNC, prs.zFunc);
+    device->SetRenderState(D3DRS_ALPHAFUNC, prs.alphaFunc);
+    device->SetRenderState(D3DRS_ALPHAREF, prs.alphaRef);
+
+    isReplaying = false;
+    resetHLSLCaches();
 }
 
 // Scene lifecycle stubs for triple-buffered pipeline (Step 1: no-op, infrastructure only)
@@ -4274,9 +4293,7 @@ void FixedFunctionShader::executeCullPass(int bufferIndex) {
 }
 
 void FixedFunctionShader::executeRenderPass(int bufferIndex) {
-    // Will be called by RenderThread in Step 3
-    // For now, replayRecordedCalls() is called inline from stopRecordingAndReplay()
-    replayRecordedCalls(0);
+    executeGpuPhase(bufferIndex);
 }
 
 // Compare two LightStates for equality (to detect if we can reuse cached state)

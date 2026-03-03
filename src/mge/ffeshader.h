@@ -744,6 +744,7 @@ public:
     static void waitCullAndReplay();           // Wait for cull, replay, restore state (after renderStageBlend)
     static void capturePostRecordingState();   // Capture MW device state at end of Scene 0 (recording continues)
     static void finalizeAndRender(DLContext* frameCtx, bool waterSeen); // Prepare + render phase at frame finalize point
+    static void executeGpuPhase(int bufferIndex); // GPU render block — called by render thread or inline
 
     // Scene lifecycle for triple-buffered pipeline
     static void markSceneStart(int sceneNum, bool isUI = false);

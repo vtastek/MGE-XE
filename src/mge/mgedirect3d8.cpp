@@ -87,8 +87,9 @@ HRESULT _stdcall MGEProxyD3D::CreateDevice(UINT a, D3DDEVTYPE b, HWND c, DWORD d
     pp.PresentationInterval = e->FullScreen_PresentationInterval;
 
     // Create device in the same manner as the proxy
+    // D3DCREATE_MULTITHREADED: serializes device access for render thread safety
     IDirect3DDevice9* realDevice = NULL;
-    HRESULT hr = realD3D->CreateDevice(a, b, c, d, &pp, &realDevice);
+    HRESULT hr = realD3D->CreateDevice(a, b, c, d | D3DCREATE_MULTITHREADED, &pp, &realDevice);
 
     if (hr != D3D_OK) {
         LOG::logline("!! D3D Proxy CreateDevice failure");
