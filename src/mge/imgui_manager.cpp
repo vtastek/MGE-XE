@@ -2,6 +2,7 @@
 #include "support/log.h"
 #include "configuration.h"
 #include "ffeshader.h"
+#include "mwbridge.h"
 #include <cstdio>
 
 bool ImGuiManager::initialized = false;
@@ -108,6 +109,18 @@ bool ImGuiManager::eventLogFrozen = false;
 bool ImGuiManager::eventLogAutoFreeze = true;
 int ImGuiManager::eventLogFreezeOffscreenThreshold = 1;  // Freeze when offscreen >= 1
 
+// Detailed trace
+bool ImGuiManager::traceEnabled = false;
+bool ImGuiManager::traceShowStateChanges = true;
+bool ImGuiManager::traceOnlyDeltas = false;
+bool ImGuiManager::traceShowDIPDetails = true;
+bool ImGuiManager::traceShowViewportClip = true;
+char ImGuiManager::traceScenarioLabel[128] = "";
+
+// State shadow for delta tracking (file-scope)
+static DWORD s_rsState[256] = {};
+static DWORD s_tssState[8][32] = {};
+
 // Slow frame detection state
 bool ImGuiManager::slowFrameFrozen = false;
 bool ImGuiManager::slowFrameAutoFreeze = true;
@@ -121,6 +134,11 @@ int ImGuiManager::frozenSlowCallPrims = 0;
 int ImGuiManager::frozenSlowCallBin = 0;
 
 // Debug hotkey gating
+// D3D Command Buffer
+bool ImGuiManager::cmdBufferRecording = false;
+int ImGuiManager::cmdBufferCmdCount = 0;
+int ImGuiManager::cmdBufferSizeKB = 0;
+
 bool ImGuiManager::debugKeysEnabled = false;
 
 // Hi-Z single object visualization mode
@@ -516,6 +534,14 @@ void ImGuiManager::RenderDebugInterface() {
         ImGui::SliderFloat("Call threshold (ms)", &slowCallThreshold, 1.0f, 50.0f, "%.1f");
 
         ImGui::Separator();
+        ImGui::Text("D3D Command Buffer");
+        ImGui::Checkbox("Record All MW Calls", &cmdBufferRecording);
+        ImGui::SetItemTooltip("Record every MW D3D call into a command buffer (dual-write: still forwards to device)");
+        if (cmdBufferRecording) {
+            ImGui::Text("  Commands: %d  Size: %d KB", cmdBufferCmdCount, cmdBufferSizeKB);
+        }
+
+        ImGui::Separator();
         ImGui::Text("Press G to toggle this interface");
     }
     ImGui::End();
@@ -555,6 +581,11 @@ void ImGuiManager::UpdateDIPStats(const DIPBinStats& stats) {
     dipStats = stats;
 }
 
+void ImGuiManager::UpdateCmdBufferStats(int cmdCount, int sizeKB) {
+    cmdBufferCmdCount = cmdCount;
+    cmdBufferSizeKB = sizeKB;
+}
+
 void ImGuiManager::FreezeDIPStats(const DIPBinStats& stats) {
     dipFrozen = true;
     frozenDipStats = stats;
@@ -570,9 +601,327 @@ void ImGuiManager::UpdateReplayBinCounts(int terrain, int opaque, int skinning, 
     dipStats.blending += blending;
 }
 
+// D3D enum name lookups
+static const char* D3DRSName(DWORD rs) {
+    switch (rs) {
+    case 7:  return "ZENABLE";
+    case 8:  return "FILLMODE";
+    case 9:  return "SHADEMODE";
+    case 14: return "ZWRITEENABLE";
+    case 15: return "ALPHATESTENABLE";
+    case 16: return "LASTPIXEL";
+    case 19: return "SRCBLEND";
+    case 20: return "DESTBLEND";
+    case 22: return "CULLMODE";
+    case 23: return "ZFUNC";
+    case 24: return "ALPHAREF";
+    case 25: return "ALPHAFUNC";
+    case 26: return "DITHERENABLE";
+    case 27: return "ALPHABLENDENABLE";
+    case 28: return "FOGENABLE";
+    case 29: return "SPECULARENABLE";
+    case 34: return "FOGCOLOR";
+    case 35: return "FOGTABLEMODE";
+    case 36: return "FOGSTART";
+    case 37: return "FOGEND";
+    case 38: return "FOGDENSITY";
+    case 48: return "RANGEFOGENABLE";
+    case 52: return "STENCILENABLE";
+    case 53: return "STENCILFAIL";
+    case 54: return "STENCILZFAIL";
+    case 55: return "STENCILPASS";
+    case 56: return "STENCILFUNC";
+    case 57: return "STENCILREF";
+    case 58: return "STENCILMASK";
+    case 59: return "STENCILWRITEMASK";
+    case 60: return "TEXTUREFACTOR";
+    case 136: return "CLIPPING";
+    case 137: return "LIGHTING";
+    case 139: return "AMBIENT";
+    case 140: return "FOGVERTEXMODE";
+    case 141: return "COLORVERTEX";
+    case 142: return "LOCALVIEWER";
+    case 143: return "NORMALIZENORMALS";
+    case 145: return "DIFFUSEMATERIALSOURCE";
+    case 146: return "SPECULARMATERIALSOURCE";
+    case 147: return "AMBIENTMATERIALSOURCE";
+    case 148: return "EMISSIVEMATERIALSOURCE";
+    case 151: return "VERTEXBLEND";
+    case 152: return "CLIPPLANEENABLE";
+    case 161: return "MULTISAMPLEANTIALIAS";
+    case 168: return "COLORWRITEENABLE";
+    case 171: return "BLENDOP";
+    default: {
+        static thread_local char buf[16];
+        snprintf(buf, sizeof(buf), "RS_%d", (int)rs);
+        return buf;
+    }
+    }
+}
+
+static const char* D3DTSSName(DWORD tss) {
+    switch (tss) {
+    case 1:  return "COLOROP";
+    case 2:  return "COLORARG1";
+    case 3:  return "COLORARG2";
+    case 4:  return "ALPHAOP";
+    case 5:  return "ALPHAARG1";
+    case 6:  return "ALPHAARG2";
+    case 7:  return "BUMPENVMAT00";
+    case 8:  return "BUMPENVMAT01";
+    case 9:  return "BUMPENVMAT10";
+    case 10: return "BUMPENVMAT11";
+    case 11: return "TEXCOORDINDEX";
+    case 22: return "BUMPENVLSCALE";
+    case 23: return "BUMPENVLOFFSET";
+    case 24: return "TEXTURETRANSFORMFLAGS";
+    case 26: return "COLORARG0";
+    case 27: return "ALPHAARG0";
+    case 28: return "RESULTARG";
+    default: {
+        static thread_local char buf[16];
+        snprintf(buf, sizeof(buf), "TSS_%d", (int)tss);
+        return buf;
+    }
+    }
+}
+
+static const char* D3DTSName(DWORD ts) {
+    switch (ts) {
+    case 2:   return "VIEW";
+    case 3:   return "PROJECTION";
+    case 256: return "WORLD";
+    case 257: return "WORLD1";
+    case 258: return "WORLD2";
+    case 259: return "WORLD3";
+    default: {
+        static thread_local char buf[16];
+        snprintf(buf, sizeof(buf), "TS_%d", (int)ts);
+        return buf;
+    }
+    }
+}
+
+void ImGuiManager::ResetStateShadow() {
+    memset(s_rsState, 0, sizeof(s_rsState));
+    memset(s_tssState, 0, sizeof(s_tssState));
+}
+
+void ImGuiManager::AutoNameScenario() {
+    auto mw = MWBridge::get();
+    if (!mw || !mw->IsLoaded()) return;
+
+    const char* location = mw->IsExterior() ? "exterior" : "interior";
+    const char* weather = mw->CellHasWeather() ? "" : "_noweather";
+
+    const char* lightMode;
+    if (isHLSLActive()) {
+        lightMode = "hlsl";
+    } else if (Configuration.PerPixelLightFlags == 1) {
+        lightMode = "ppl";
+    } else {
+        lightMode = "fixedfunc";
+    }
+
+    // Check for water presence from last frame's events
+    bool hasWater = false;
+    const auto& events = eventLogFrozen ? frozenFrameEvents : displayFrameEvents;
+    for (const auto& e : events) {
+        if (e.type == FrameEvent::DIP_Water || e.type == FrameEvent::MGE_WaterPlane || e.type == FrameEvent::MGE_WaterReflection) {
+            hasWater = true;
+            break;
+        }
+    }
+
+    snprintf(traceScenarioLabel, sizeof(traceScenarioLabel), "%s_%s%s%s",
+        location, lightMode, weather, hasWater ? "_water" : "");
+}
+
 // Frame event log
 void ImGuiManager::LogFrameEvent(FrameEvent::Type type, int sceneNum, int primCount) {
-    frameEvents.push_back({type, sceneNum, primCount});
+    FrameEvent e;
+    e.type = type;
+    e.sceneNum = sceneNum;
+    e.primCount = primCount;
+    e.detail.kind = StateDetail::None;
+    frameEvents.push_back(e);
+}
+
+void ImGuiManager::LogFrameEventDetailed(FrameEvent::Type type, int sceneNum, int primCount, const StateDetail& detail) {
+    FrameEvent e;
+    e.type = type;
+    e.sceneNum = sceneNum;
+    e.primCount = primCount;
+    e.detail = detail;
+    frameEvents.push_back(e);
+}
+
+void ImGuiManager::TraceRS(int sceneNum, DWORD state, DWORD value) {
+    if (!traceEnabled) return;
+    StateDetail d;
+    d.kind = StateDetail::RenderState;
+    d.rs.state = state;
+    d.rs.value = value;
+    d.rs.prev = (state < 256) ? s_rsState[state] : 0;
+    d.rs.changed = (d.rs.value != d.rs.prev);
+    if (state < 256) s_rsState[state] = value;
+    LogFrameEventDetailed(FrameEvent::State_RS, sceneNum, 0, d);
+}
+
+void ImGuiManager::TraceTSS(int sceneNum, DWORD stage, DWORD state, DWORD value) {
+    if (!traceEnabled) return;
+    StateDetail d;
+    d.kind = StateDetail::TextureStageState;
+    d.tss.stage = stage;
+    d.tss.state = state;
+    d.tss.value = value;
+    d.tss.prev = (stage < 8 && state < 32) ? s_tssState[stage][state] : 0;
+    d.tss.changed = (d.tss.value != d.tss.prev);
+    if (stage < 8 && state < 32) s_tssState[stage][state] = value;
+    LogFrameEventDetailed(FrameEvent::State_TSS, sceneNum, 0, d);
+}
+
+void ImGuiManager::TraceTransform(int sceneNum, DWORD type, const float* matrix) {
+    if (!traceEnabled) return;
+    StateDetail d;
+    d.kind = StateDetail::Transform;
+    d.xform.type = type;
+    if (matrix) {
+        memcpy(d.xform.m, matrix, 16 * sizeof(float));
+    } else {
+        memset(d.xform.m, 0, 16 * sizeof(float));
+    }
+    LogFrameEventDetailed(FrameEvent::State_Transform, sceneNum, 0, d);
+}
+
+void ImGuiManager::TraceMultiplyTransform(int sceneNum, DWORD type, const float* matrix) {
+    if (!traceEnabled) return;
+    StateDetail d;
+    d.kind = StateDetail::Transform;
+    d.xform.type = type;
+    if (matrix) {
+        memcpy(d.xform.m, matrix, 16 * sizeof(float));
+    } else {
+        memset(d.xform.m, 0, 16 * sizeof(float));
+    }
+    LogFrameEventDetailed(FrameEvent::State_MultiplyTransform, sceneNum, 0, d);
+}
+
+void ImGuiManager::TraceTexture(int sceneNum, DWORD stage, void* ptr) {
+    if (!traceEnabled) return;
+    StateDetail d;
+    d.kind = StateDetail::Texture;
+    d.tex.stage = stage;
+    d.tex.ptr = (uintptr_t)ptr;
+    LogFrameEventDetailed(FrameEvent::State_Texture, sceneNum, 0, d);
+}
+
+void ImGuiManager::TraceDIP(int sceneNum, FrameEvent::Type dipType, DWORD fvf, void* vb, void* ib, void* tex0,
+                            DWORD primCount, DWORD vertCount, DWORD zWrite, DWORD cull,
+                            DWORD alphaBlend, DWORD alphaTest, DWORD srcBlend, DWORD destBlend, DWORD vertBlend) {
+    if (!traceEnabled) return;
+    StateDetail d;
+    d.kind = StateDetail::DrawCall;
+    d.dip.fvf = fvf;
+    d.dip.vb = (uintptr_t)vb;
+    d.dip.ib = (uintptr_t)ib;
+    d.dip.tex0 = (uintptr_t)tex0;
+    d.dip.primCount = primCount;
+    d.dip.vertCount = vertCount;
+    d.dip.zWrite = zWrite;
+    d.dip.cull = cull;
+    d.dip.alphaBlend = alphaBlend;
+    d.dip.alphaTest = alphaTest;
+    d.dip.srcBlend = srcBlend;
+    d.dip.destBlend = destBlend;
+    d.dip.vertBlend = vertBlend;
+    LogFrameEventDetailed(dipType, sceneNum, primCount, d);
+}
+
+void ImGuiManager::TraceClear(int sceneNum, DWORD flags, DWORD color, float z) {
+    if (!traceEnabled) return;
+    StateDetail d;
+    d.kind = StateDetail::ClearCall;
+    d.clear.flags = flags;
+    d.clear.color = color;
+    d.clear.z = z;
+    LogFrameEventDetailed(FrameEvent::Clear, sceneNum, 0, d);
+}
+
+void ImGuiManager::TraceRT(int sceneNum, void* color, void* depth) {
+    if (!traceEnabled) return;
+    StateDetail d;
+    d.kind = StateDetail::RenderTarget;
+    d.rt.color = (uintptr_t)color;
+    d.rt.depth = (uintptr_t)depth;
+    LogFrameEventDetailed(FrameEvent::SetRenderTarget, sceneNum, 0, d);
+}
+
+void ImGuiManager::TraceLight(int sceneNum, DWORD index, bool enable) {
+    if (!traceEnabled) return;
+    StateDetail d;
+    d.kind = StateDetail::Light;
+    d.light.index = index;
+    d.light.enable = enable;
+    LogFrameEventDetailed(FrameEvent::State_Light, sceneNum, 0, d);
+}
+
+void ImGuiManager::TraceMaterial(int sceneNum, float dr, float dg, float db, float da) {
+    if (!traceEnabled) return;
+    StateDetail d;
+    d.kind = StateDetail::Material;
+    d.mat.dr = dr;
+    d.mat.dg = dg;
+    d.mat.db = db;
+    d.mat.da = da;
+    LogFrameEventDetailed(FrameEvent::State_Material, sceneNum, 0, d);
+}
+
+void ImGuiManager::TraceViewport(int sceneNum, DWORD x, DWORD y, DWORD w, DWORD h, float minZ, float maxZ) {
+    if (!traceEnabled) return;
+    StateDetail d;
+    d.kind = StateDetail::Viewport;
+    d.vp.x = x;
+    d.vp.y = y;
+    d.vp.w = w;
+    d.vp.h = h;
+    d.vp.minZ = minZ;
+    d.vp.maxZ = maxZ;
+    LogFrameEventDetailed(FrameEvent::State_Viewport, sceneNum, 0, d);
+}
+
+void ImGuiManager::TraceClipPlane(int sceneNum, DWORD index) {
+    if (!traceEnabled) return;
+    StateDetail d;
+    d.kind = StateDetail::ClipPlane;
+    d.clip.index = index;
+    LogFrameEventDetailed(FrameEvent::State_ClipPlane, sceneNum, 0, d);
+}
+
+void ImGuiManager::TraceStreamSource(int sceneNum, DWORD stream, void* vb, DWORD stride) {
+    if (!traceEnabled) return;
+    StateDetail d;
+    d.kind = StateDetail::StreamSource;
+    d.ss.stream = stream;
+    d.ss.vb = (uintptr_t)vb;
+    d.ss.stride = stride;
+    LogFrameEventDetailed(FrameEvent::State_StreamSource, sceneNum, 0, d);
+}
+
+void ImGuiManager::TraceVertexShader(int sceneNum, DWORD fvf) {
+    if (!traceEnabled) return;
+    StateDetail d;
+    d.kind = StateDetail::VertexShader;
+    d.vs.fvf = fvf;
+    LogFrameEventDetailed(FrameEvent::State_VertexShader, sceneNum, 0, d);
+}
+
+void ImGuiManager::TraceIndexBuffer(int sceneNum, void* ib) {
+    if (!traceEnabled) return;
+    StateDetail d;
+    d.kind = StateDetail::IndexBuffer;
+    d.ib.ib = (uintptr_t)ib;
+    LogFrameEventDetailed(FrameEvent::State_IndexBuffer, sceneNum, 0, d);
 }
 
 void ImGuiManager::SnapshotFrameEvents() {
@@ -594,6 +943,11 @@ void ImGuiManager::SnapshotFrameEvents() {
     // Always clear the accumulator for next frame
     frameEvents.clear();
     frameEvents.reserve(256);
+    // Reset state shadow for next frame's delta tracking
+    if (traceEnabled) {
+        ResetStateShadow();
+        AutoNameScenario();
+    }
 }
 
 void ImGuiManager::ToggleFrameEventLog() {
@@ -605,7 +959,7 @@ void ImGuiManager::ToggleFrameEventLog() {
 
 void ImGuiManager::RenderFrameEventLog() {
     ImGui::SetNextWindowPos(ImVec2(10, 400), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(430, 550), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(600, 650), ImGuiCond_FirstUseEver);
 
     if (ImGui::Begin("Frame Event Log", &showFrameEventLog)) {
         // Use frozen or live events for display
@@ -635,7 +989,23 @@ void ImGuiManager::RenderFrameEventLog() {
         ImGui::InputInt("##offThresh", &eventLogFreezeOffscreenThreshold);
         if (eventLogFreezeOffscreenThreshold < 0) eventLogFreezeOffscreenThreshold = 0;
 
-        // Print to file button
+        // Detailed trace controls
+        ImGui::Separator();
+        ImGui::Checkbox("Detailed Trace", &traceEnabled);
+        if (traceEnabled) {
+            ImGui::SameLine();
+            ImGui::Checkbox("State changes", &traceShowStateChanges);
+            ImGui::SameLine();
+            ImGui::Checkbox("Only deltas", &traceOnlyDeltas);
+            ImGui::Checkbox("DIP details", &traceShowDIPDetails);
+            ImGui::SameLine();
+            ImGui::Checkbox("Viewport/Clip", &traceShowViewportClip);
+        }
+
+        // Scenario label + file dump
+        ImGui::SetNextItemWidth(200);
+        ImGui::InputText("Scenario", traceScenarioLabel, sizeof(traceScenarioLabel));
+        ImGui::SameLine();
         if (ImGui::Button("Print to File")) {
             PrintFrameEventsToFile();
         }
@@ -664,25 +1034,106 @@ void ImGuiManager::RenderFrameEventLog() {
 
             ImGui::Separator();
 
-            // Color lookup for event types
             for (int i = 0; i < (int)events.size(); i++) {
                 const auto& e = events[i];
+                const auto& d = e.detail;
                 ImVec4 color(1.0f, 1.0f, 1.0f, 1.0f);
 
-                // Color-code by category
                 bool isMGEInternal = (e.type >= FrameEvent::MGE_ShadowMap && e.type <= FrameEvent::MGE_SkyRender);
+                bool isTraceEvent = (e.type >= FrameEvent::State_RS && e.type <= FrameEvent::State_MultiplyTransform);
+
+                // Filter trace events based on checkboxes
+                if (isTraceEvent) {
+                    if (!traceShowStateChanges && (e.type == FrameEvent::State_RS || e.type == FrameEvent::State_TSS))
+                        continue;
+                    if (!traceShowViewportClip && (e.type == FrameEvent::State_Viewport || e.type == FrameEvent::State_ClipPlane))
+                        continue;
+                    // Only-deltas filter for RS/TSS
+                    if (traceOnlyDeltas) {
+                        if (e.type == FrameEvent::State_RS && d.kind == StateDetail::RenderState && !d.rs.changed)
+                            continue;
+                        if (e.type == FrameEvent::State_TSS && d.kind == StateDetail::TextureStageState && !d.tss.changed)
+                            continue;
+                    }
+                }
+
+                // Color coding
                 if (e.type >= FrameEvent::DIP_Sky && e.type <= FrameEvent::DIP_Water) {
-                    color = ImVec4(0.8f, 1.0f, 0.8f, 1.0f);  // green for DIP
+                    color = ImVec4(0.4f, 1.0f, 0.4f, 1.0f);  // green for DIP
                 } else if (isMGEInternal) {
-                    color = ImVec4(1.0f, 0.7f, 0.5f, 1.0f);  // orange for MGE internal rendering
+                    color = ImVec4(1.0f, 0.7f, 0.5f, 1.0f);  // orange for MGE internal
                 } else if (e.type >= FrameEvent::MGE_Stage0 && e.type <= FrameEvent::MGE_HLSLReplay) {
-                    color = ImVec4(0.8f, 0.8f, 1.0f, 1.0f);  // blue for MGE stage markers
+                    color = ImVec4(0.8f, 0.8f, 1.0f, 1.0f);  // blue for MGE stages
                 } else if (e.type == FrameEvent::BeginScene || e.type == FrameEvent::EndScene) {
-                    color = ImVec4(1.0f, 1.0f, 0.6f, 1.0f);  // yellow for scene boundaries
+                    color = ImVec4(1.0f, 1.0f, 0.6f, 1.0f);  // yellow for scene bounds
+                } else if (isTraceEvent) {
+                    // Trace state events
+                    if (e.type == FrameEvent::State_RS && d.kind == StateDetail::RenderState) {
+                        color = d.rs.changed ? ImVec4(0.5f, 1.0f, 1.0f, 1.0f) : ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
+                    } else if (e.type == FrameEvent::State_TSS && d.kind == StateDetail::TextureStageState) {
+                        color = d.tss.changed ? ImVec4(0.5f, 1.0f, 1.0f, 1.0f) : ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
+                    } else {
+                        color = ImVec4(0.5f, 1.0f, 1.0f, 1.0f);  // cyan for other state
+                    }
                 }
 
                 ImGui::PushStyleColor(ImGuiCol_Text, color);
-                if (isMGEInternal && e.primCount > 0) {
+
+                // Format based on detail kind
+                if (isTraceEvent && d.kind == StateDetail::RenderState) {
+                    if (d.rs.changed) {
+                        ImGui::Text("[%3d] S%d RS %s: %d->%d", i, e.sceneNum, D3DRSName(d.rs.state), d.rs.prev, d.rs.value);
+                    } else {
+                        ImGui::Text("[%3d] S%d RS %s: %d (=)", i, e.sceneNum, D3DRSName(d.rs.state), d.rs.value);
+                    }
+                } else if (isTraceEvent && d.kind == StateDetail::TextureStageState) {
+                    if (d.tss.changed) {
+                        ImGui::Text("[%3d] S%d TSS[%d] %s: %d->%d", i, e.sceneNum, d.tss.stage, D3DTSSName(d.tss.state), d.tss.prev, d.tss.value);
+                    } else {
+                        ImGui::Text("[%3d] S%d TSS[%d] %s: %d (=)", i, e.sceneNum, d.tss.stage, D3DTSSName(d.tss.state), d.tss.value);
+                    }
+                } else if (isTraceEvent && d.kind == StateDetail::Transform) {
+                    const float* m = d.xform.m;
+                    bool isIdentity = (m[0]==1 && m[5]==1 && m[10]==1 && m[15]==1 &&
+                        m[1]==0 && m[2]==0 && m[3]==0 && m[4]==0 && m[6]==0 && m[7]==0 &&
+                        m[8]==0 && m[9]==0 && m[11]==0 && m[12]==0 && m[13]==0 && m[14]==0);
+                    if (isIdentity) {
+                        ImGui::Text("[%3d] S%d %s %s = IDENTITY", i, e.sceneNum, FrameEvent::typeName(e.type), D3DTSName(d.xform.type));
+                    } else {
+                        // Show first row inline, full matrix in tooltip
+                        ImGui::Text("[%3d] S%d %s %s [%.2f %.2f %.2f %.2f | ...]", i, e.sceneNum,
+                            FrameEvent::typeName(e.type), D3DTSName(d.xform.type), m[0], m[1], m[2], m[3]);
+                        if (ImGui::IsItemHovered()) {
+                            ImGui::SetTooltip("%.4f %.4f %.4f %.4f\n%.4f %.4f %.4f %.4f\n%.4f %.4f %.4f %.4f\n%.4f %.4f %.4f %.4f",
+                                m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7],
+                                m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]);
+                        }
+                    }
+                } else if (isTraceEvent && d.kind == StateDetail::Texture) {
+                    ImGui::Text("[%3d] S%d Texture[%d] = %p", i, e.sceneNum, d.tex.stage, (void*)d.tex.ptr);
+                } else if (isTraceEvent && d.kind == StateDetail::DrawCall && traceShowDIPDetails) {
+                    ImGui::Text("[%3d] S%d %s p=%d v=%d fvf=%X zW=%d cull=%d blend=%d vb=%X",
+                        i, e.sceneNum, FrameEvent::typeName(e.type), d.dip.primCount, d.dip.vertCount,
+                        d.dip.fvf, d.dip.zWrite, d.dip.cull, d.dip.alphaBlend, (unsigned)(d.dip.vb & 0xFFFF));
+                } else if (isTraceEvent && d.kind == StateDetail::ClearCall) {
+                    ImGui::Text("[%3d] S%d Clear flags=%X color=%08X z=%.2f", i, e.sceneNum, d.clear.flags, d.clear.color, d.clear.z);
+                } else if (isTraceEvent && d.kind == StateDetail::RenderTarget) {
+                    ImGui::Text("[%3d] S%d SetRT color=%p depth=%p", i, e.sceneNum, (void*)d.rt.color, (void*)d.rt.depth);
+                } else if (isTraceEvent && d.kind == StateDetail::Light) {
+                    ImGui::Text("[%3d] S%d Light[%d] %s", i, e.sceneNum, d.light.index, d.light.enable ? "ON" : "OFF");
+                } else if (isTraceEvent && d.kind == StateDetail::Material) {
+                    ImGui::Text("[%3d] S%d Material d=(%.2f,%.2f,%.2f,%.2f)", i, e.sceneNum, d.mat.dr, d.mat.dg, d.mat.db, d.mat.da);
+                } else if (isTraceEvent && d.kind == StateDetail::Viewport) {
+                    ImGui::Text("[%3d] S%d Viewport %dx%d+%d+%d z=[%.2f,%.2f]", i, e.sceneNum, d.vp.w, d.vp.h, d.vp.x, d.vp.y, d.vp.minZ, d.vp.maxZ);
+                } else if (isTraceEvent && d.kind == StateDetail::ClipPlane) {
+                    ImGui::Text("[%3d] S%d ClipPlane[%d]", i, e.sceneNum, d.clip.index);
+                } else if (isTraceEvent && d.kind == StateDetail::StreamSource) {
+                    ImGui::Text("[%3d] S%d Stream[%d] vb=%X stride=%d", i, e.sceneNum, d.ss.stream, (unsigned)(d.ss.vb & 0xFFFF), d.ss.stride);
+                } else if (isTraceEvent && d.kind == StateDetail::VertexShader) {
+                    ImGui::Text("[%3d] S%d FVF=%08X", i, e.sceneNum, d.vs.fvf);
+                } else if (isTraceEvent && d.kind == StateDetail::IndexBuffer) {
+                    ImGui::Text("[%3d] S%d IB=%X", i, e.sceneNum, (unsigned)(d.ib.ib & 0xFFFF));
+                } else if (isMGEInternal && e.primCount > 0) {
                     ImGui::Text("[%3d] S%d %-20s draws=%d", i, e.sceneNum, FrameEvent::typeName(e.type), e.primCount);
                 } else if (e.primCount > 0) {
                     ImGui::Text("[%3d] S%d %-20s prims=%d", i, e.sceneNum, FrameEvent::typeName(e.type), e.primCount);
@@ -701,11 +1152,29 @@ void ImGuiManager::PrintFrameEventsToFile() {
     const auto& events = eventLogFrozen ? frozenFrameEvents : displayFrameEvents;
     if (events.empty()) return;
 
-    // Write to MGE XE log directory
-    FILE* f = fopen("frame_events.txt", "w");
+    // Build filename from scenario label
+    char filename[256];
+    if (traceScenarioLabel[0]) {
+        // Sanitize label for filename
+        char sanitized[128];
+        int j = 0;
+        for (int i = 0; traceScenarioLabel[i] && j < 120; i++) {
+            char c = traceScenarioLabel[i];
+            sanitized[j++] = (c == ' ') ? '_' : ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-') ? c : '_';
+        }
+        sanitized[j] = 0;
+        snprintf(filename, sizeof(filename), "frame_trace_%s.txt", sanitized);
+    } else {
+        snprintf(filename, sizeof(filename), "frame_trace.txt");
+    }
+
+    FILE* f = fopen(filename, "w");
     if (!f) return;
 
-    fprintf(f, "Frame Event Log (%d events)\n", (int)events.size());
+    fprintf(f, "Frame Trace Log (%d events)\n", (int)events.size());
+    if (traceScenarioLabel[0]) {
+        fprintf(f, "Scenario: %s\n", traceScenarioLabel);
+    }
     fprintf(f, "========================================\n\n");
 
     // Summary
@@ -718,28 +1187,72 @@ void ImGuiManager::PrintFrameEventsToFile() {
     fprintf(f, "Summary:\n");
     for (int i = 0; i < (int)FrameEvent::Count; i++) {
         if (counts[i] > 0) {
-            fprintf(f, "  %-20s %d\n", FrameEvent::typeName((FrameEvent::Type)i), counts[i]);
+            fprintf(f, "  %-24s %d\n", FrameEvent::typeName((FrameEvent::Type)i), counts[i]);
         }
     }
     fprintf(f, "  Total primitives: %d\n\n", totalPrims);
 
-    // Ordered event list
+    // Ordered event list with full detail
     fprintf(f, "Events (ordered):\n");
     fprintf(f, "----------------------------------------\n");
     for (int i = 0; i < (int)events.size(); i++) {
         const auto& e = events[i];
+        const auto& d = e.detail;
         bool isMGEInternal = (e.type >= FrameEvent::MGE_ShadowMap && e.type <= FrameEvent::MGE_SkyRender);
-        if (isMGEInternal && e.primCount > 0) {
-            fprintf(f, "[%3d] S%d %-20s draws=%d\n", i, e.sceneNum, FrameEvent::typeName(e.type), e.primCount);
+        bool isTraceEvent = (e.type >= FrameEvent::State_RS && e.type <= FrameEvent::State_MultiplyTransform);
+
+        if (isTraceEvent && d.kind == StateDetail::RenderState) {
+            fprintf(f, "[%4d] S%d RS %-24s %d -> %d %s\n", i, e.sceneNum, D3DRSName(d.rs.state),
+                d.rs.prev, d.rs.value, d.rs.changed ? "CHANGED" : "(same)");
+        } else if (isTraceEvent && d.kind == StateDetail::TextureStageState) {
+            fprintf(f, "[%4d] S%d TSS[%d] %-20s %d -> %d %s\n", i, e.sceneNum, d.tss.stage,
+                D3DTSSName(d.tss.state), d.tss.prev, d.tss.value, d.tss.changed ? "CHANGED" : "(same)");
+        } else if (isTraceEvent && d.kind == StateDetail::Transform) {
+            const float* m = d.xform.m;
+            fprintf(f, "[%4d] S%d %-12s %s\n", i, e.sceneNum, FrameEvent::typeName(e.type), D3DTSName(d.xform.type));
+            fprintf(f, "       [%10.4f %10.4f %10.4f %10.4f]\n", m[0], m[1], m[2], m[3]);
+            fprintf(f, "       [%10.4f %10.4f %10.4f %10.4f]\n", m[4], m[5], m[6], m[7]);
+            fprintf(f, "       [%10.4f %10.4f %10.4f %10.4f]\n", m[8], m[9], m[10], m[11]);
+            fprintf(f, "       [%10.4f %10.4f %10.4f %10.4f]\n", m[12], m[13], m[14], m[15]);
+        } else if (isTraceEvent && d.kind == StateDetail::Texture) {
+            fprintf(f, "[%4d] S%d Texture[%d] = 0x%p\n", i, e.sceneNum, d.tex.stage, (void*)d.tex.ptr);
+        } else if (isTraceEvent && d.kind == StateDetail::DrawCall) {
+            fprintf(f, "[%4d] S%d %s prims=%d verts=%d fvf=0x%08X vb=0x%X ib=0x%X tex0=0x%X\n",
+                i, e.sceneNum, FrameEvent::typeName(e.type), d.dip.primCount, d.dip.vertCount,
+                d.dip.fvf, (unsigned)(d.dip.vb & 0xFFFF), (unsigned)(d.dip.ib & 0xFFFF), (unsigned)(d.dip.tex0 & 0xFFFF));
+            fprintf(f, "       zWrite=%d cull=%d alphaBlend=%d alphaTest=%d src=%d dst=%d vertBlend=%d\n",
+                d.dip.zWrite, d.dip.cull, d.dip.alphaBlend, d.dip.alphaTest,
+                d.dip.srcBlend, d.dip.destBlend, d.dip.vertBlend);
+        } else if (isTraceEvent && d.kind == StateDetail::ClearCall) {
+            fprintf(f, "[%4d] S%d Clear flags=0x%X color=0x%08X z=%.4f\n", i, e.sceneNum,
+                d.clear.flags, d.clear.color, d.clear.z);
+        } else if (isTraceEvent && d.kind == StateDetail::RenderTarget) {
+            fprintf(f, "[%4d] S%d SetRT color=%p depth=%p\n", i, e.sceneNum, (void*)d.rt.color, (void*)d.rt.depth);
+        } else if (isTraceEvent && d.kind == StateDetail::Light) {
+            fprintf(f, "[%4d] S%d Light[%d] %s\n", i, e.sceneNum, d.light.index, d.light.enable ? "ON" : "OFF");
+        } else if (isTraceEvent && d.kind == StateDetail::Material) {
+            fprintf(f, "[%4d] S%d Material diffuse=(%.3f,%.3f,%.3f,%.3f)\n", i, e.sceneNum, d.mat.dr, d.mat.dg, d.mat.db, d.mat.da);
+        } else if (isTraceEvent && d.kind == StateDetail::Viewport) {
+            fprintf(f, "[%4d] S%d Viewport %dx%d+%d+%d z=[%.4f,%.4f]\n", i, e.sceneNum, d.vp.w, d.vp.h, d.vp.x, d.vp.y, d.vp.minZ, d.vp.maxZ);
+        } else if (isTraceEvent && d.kind == StateDetail::ClipPlane) {
+            fprintf(f, "[%4d] S%d ClipPlane[%d]\n", i, e.sceneNum, d.clip.index);
+        } else if (isTraceEvent && d.kind == StateDetail::StreamSource) {
+            fprintf(f, "[%4d] S%d Stream[%d] vb=0x%X stride=%d\n", i, e.sceneNum, d.ss.stream, (unsigned)(d.ss.vb & 0xFFFF), d.ss.stride);
+        } else if (isTraceEvent && d.kind == StateDetail::VertexShader) {
+            fprintf(f, "[%4d] S%d FVF=0x%08X\n", i, e.sceneNum, d.vs.fvf);
+        } else if (isTraceEvent && d.kind == StateDetail::IndexBuffer) {
+            fprintf(f, "[%4d] S%d IB=0x%X\n", i, e.sceneNum, (unsigned)(d.ib.ib & 0xFFFF));
+        } else if (isMGEInternal && e.primCount > 0) {
+            fprintf(f, "[%4d] S%d %-20s draws=%d\n", i, e.sceneNum, FrameEvent::typeName(e.type), e.primCount);
         } else if (e.primCount > 0) {
-            fprintf(f, "[%3d] S%d %-20s prims=%d\n", i, e.sceneNum, FrameEvent::typeName(e.type), e.primCount);
+            fprintf(f, "[%4d] S%d %-20s prims=%d\n", i, e.sceneNum, FrameEvent::typeName(e.type), e.primCount);
         } else {
-            fprintf(f, "[%3d] S%d %s\n", i, e.sceneNum, FrameEvent::typeName(e.type));
+            fprintf(f, "[%4d] S%d %s\n", i, e.sceneNum, FrameEvent::typeName(e.type));
         }
     }
 
     fclose(f);
-    LOG::logline(">> Frame events written to frame_events.txt (%d events)", (int)events.size());
+    LOG::logline(">> Frame trace written to %s (%d events)", filename, (int)events.size());
 }
 
 void ImGuiManager::FreezeSlowFrame(float prepareMs, float replayMs, int worstCallIndex, float worstCallMs, int worstCallPrims, int worstCallBin) {

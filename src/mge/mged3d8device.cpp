@@ -14,6 +14,7 @@
 #include "userhud.h"
 #include "videobackground.h"
 #include "imgui_manager.h"
+#include "d3dcommandbuffer.h"
 
 bool g_tracyActive = false;
 
@@ -85,6 +86,10 @@ static LightState lightrs;
 
 static HWND gameWindow = nullptr;
 static bool imguiInitialized = false;
+
+// D3D command buffer — records all MW calls for future replay
+D3DCommandBuffer g_cmdBuffer;
+static int g_lastCmdBufferSize = 0;  // Snapshot for ImGui display
 
 // Per-frame DIP bin counters (replaces old coarse DIPCounters)
 static ImGuiManager::DIPBinStats g_dipBinStats = {};
@@ -412,6 +417,13 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
     // Snapshot frame events for ImGui display
     ImGuiManager::SnapshotFrameEvents();
 
+    // Snapshot command buffer stats for ImGui, then clear for next frame
+    if (ImGuiManager::GetCmdBufferRecording()) {
+        g_lastCmdBufferSize = g_cmdBuffer.size();
+        ImGuiManager::UpdateCmdBufferStats(g_lastCmdBufferSize, (int)(g_cmdBuffer.sizeBytes() / 1024));
+        g_cmdBuffer.clear();
+    }
+
     // Fill pipeline diagnostic snapshot (end-of-frame state, before reset)
     {
         auto mwb = MWBridge::get();
@@ -472,6 +484,9 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         g_suppressingCurrentScene = false;
         // Safety: close mega-scene if still open at Present
         if (g_offscreenMegaScene) {
+            if (ImGuiManager::GetCmdBufferRecording()) {
+                g_cmdBuffer.recordEndScene();
+            }
             ProxyDevice::EndScene();
             g_offscreenMegaScene = false;
         }
@@ -511,10 +526,19 @@ static HRESULT flushPendingRT() {
         g_rtForwarded++;
         auto device = DistantLand::device;
         HRESULT hr1 = D3D_OK, hr2 = D3D_OK;
-        if (pendingRT_color) {
-            hr1 = device->SetRenderTarget(0, static_cast<ProxySurface*>(pendingRT_color)->realSurface);
+        IDirect3DSurface9* rtSurface = pendingRT_color ? static_cast<ProxySurface*>(pendingRT_color)->realSurface : nullptr;
+        IDirect3DSurface9* dsSurface = pendingRT_depth ? static_cast<ProxySurface*>(pendingRT_depth)->realSurface : nullptr;
+        if (rtSurface) {
+            hr1 = device->SetRenderTarget(0, rtSurface);
         }
-        hr2 = device->SetDepthStencilSurface(pendingRT_depth ? static_cast<ProxySurface*>(pendingRT_depth)->realSurface : nullptr);
+        hr2 = device->SetDepthStencilSurface(dsSurface);
+
+        // Record RT/DS changes to command buffer
+        if (ImGuiManager::GetCmdBufferRecording()) {
+            if (rtSurface) g_cmdBuffer.recordSetRenderTarget(rtSurface);
+            g_cmdBuffer.recordSetDepthStencilSurface(dsSurface);
+        }
+
         return (hr1 != D3D_OK) ? hr1 : hr2;
     }
     return D3D_OK;
@@ -533,6 +557,7 @@ HRESULT _stdcall MGEProxyDevice::SetRenderTarget(IDirect3DSurface8* a, IDirect3D
     g_passBreaks.raw_setRT++;
     g_passBreaks.raw_setDS++;
     ImGuiManager::LogFrameEvent(FrameEvent::SetRenderTarget, sceneCount);
+    ImGuiManager::TraceRT(sceneCount, a, b);
 
     // Defer RT change — forward only when a Clear or Draw needs it
     // If previous pending RT was never forwarded, count it as suppressed
@@ -553,6 +578,9 @@ static HRESULT ensureSceneActive() {
         HRESULT hr = DistantLand::device->BeginScene();
         if (hr != D3D_OK) {
             return hr;
+        }
+        if (ImGuiManager::GetCmdBufferRecording()) {
+            g_cmdBuffer.recordBeginScene();
         }
         sceneForwarded = true;
         scenePending = false;
@@ -585,6 +613,9 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
             // First offscreen scene: open device scene, keep it open for all subsequent offscreen work
             flushPendingRT();
             ProxyDevice::BeginScene();
+            if (ImGuiManager::GetCmdBufferRecording()) {
+                g_cmdBuffer.recordBeginScene();
+            }
             g_offscreenMegaScene = true;
         }
         // Device is already in a scene — mark as forwarded so draws go through
@@ -594,6 +625,9 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
         g_suppressingCurrentScene = false;
         // Transitioning back to normal rendering — close the offscreen mega-scene
         if (g_offscreenMegaScene) {
+            if (ImGuiManager::GetCmdBufferRecording()) {
+                g_cmdBuffer.recordEndScene();
+            }
             ProxyDevice::EndScene();
             g_offscreenMegaScene = false;
         }
@@ -768,6 +802,9 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
         g_scenesForwarded++;
         sceneForwarded = false;
         scenePending = false;
+        if (ImGuiManager::GetCmdBufferRecording()) {
+            g_cmdBuffer.recordEndScene();
+        }
         return ProxyDevice::EndScene();
     }
 
@@ -808,11 +845,15 @@ HRESULT _stdcall MGEProxyDevice::Clear(DWORD a, const D3DRECT* b, DWORD c, D3DCO
     g_passBreaks.mw_clear++;
     g_passBreaks.raw_clear++;
     ImGuiManager::LogFrameEvent(FrameEvent::Clear, sceneCount);
+    ImGuiManager::TraceClear(sceneCount, c, d, e);
     DistantLand::setHorizonColour(d);
     // Suppress Clear for offscreen scenes over amortization budget
     if (!rendertargetNormal && g_suppressingCurrentScene) return D3D_OK;
     // Flush pending RT before Clear — Clear needs correct target
     flushPendingRT();
+    if (ImGuiManager::GetCmdBufferRecording()) {
+        g_cmdBuffer.recordClear(a, c, d, e, f);
+    }
     return ProxyDevice::Clear(a, b, c, d, e, f);
 }
 
@@ -820,6 +861,7 @@ HRESULT _stdcall MGEProxyDevice::Clear(DWORD a, const D3DRECT* b, DWORD c, D3DCO
 // Projection needs modifying to allow room for distant land
 HRESULT _stdcall MGEProxyDevice::SetTransform(D3DTRANSFORMSTATETYPE a, const D3DMATRIX* b) {
     captureTransform(a, b);
+    ImGuiManager::TraceTransform(sceneCount, (DWORD)a, b ? (const float*)b : nullptr);
 
     if (rendertargetNormal) {
         if (a == D3DTS_VIEW) {
@@ -829,6 +871,9 @@ HRESULT _stdcall MGEProxyDevice::SetTransform(D3DTRANSFORMSTATETYPE a, const D3D
             if (isMainView) {
                 D3DXMATRIX view = *b;
                 view *= camEffectsMatrix;
+                if (ImGuiManager::GetCmdBufferRecording()) {
+                    g_cmdBuffer.recordSetTransform((DWORD)a, &view);
+                }
                 return ProxyDevice::SetTransform(a, &view);
             }
         } else if (a == D3DTS_PROJECTION) {
@@ -842,11 +887,17 @@ HRESULT _stdcall MGEProxyDevice::SetTransform(D3DTRANSFORMSTATETYPE a, const D3D
                     proj._22 *= Configuration.CameraEffects.zoom;
                 }
 
+                if (ImGuiManager::GetCmdBufferRecording()) {
+                    g_cmdBuffer.recordSetTransform((DWORD)a, &proj);
+                }
                 return ProxyDevice::SetTransform(a, &proj);
             }
         }
     }
 
+    if (ImGuiManager::GetCmdBufferRecording()) {
+        g_cmdBuffer.recordSetTransform((DWORD)a, b);
+    }
     return ProxyDevice::SetTransform(a, b);
 }
 
@@ -855,7 +906,11 @@ HRESULT _stdcall MGEProxyDevice::SetTransform(D3DTRANSFORMSTATETYPE a, const D3D
 HRESULT _stdcall MGEProxyDevice::SetMaterial(const D3DMATERIAL8* a) {
     captureMaterial(a);
     isWaterMaterial = (a->Power == 99999.0f);
+    ImGuiManager::TraceMaterial(sceneCount, a->Diffuse.r, a->Diffuse.g, a->Diffuse.b, a->Diffuse.a);
 
+    if (ImGuiManager::GetCmdBufferRecording()) {
+        g_cmdBuffer.recordSetMaterial(a);
+    }
     return ProxyDevice::SetMaterial(a);
 }
 
@@ -863,12 +918,16 @@ HRESULT _stdcall MGEProxyDevice::SetMaterial(const D3DMATERIAL8* a) {
 // Capture what the sun is doing
 HRESULT _stdcall MGEProxyDevice::SetLight(DWORD a, const D3DLIGHT8* b) {
     captureLight(a, b);
+    ImGuiManager::TraceLight(sceneCount, a, true);
 
     // Exterior sunlight/interior "sun" appears to always be light 6
     if (a == 6 && DistantLand::ready) {
         DistantLand::setSunLight(b);
     }
 
+    if (ImGuiManager::GetCmdBufferRecording()) {
+        g_cmdBuffer.recordSetLight(a, b);
+    }
     return ProxyDevice::SetLight(a, b);
 }
 
@@ -876,6 +935,7 @@ HRESULT _stdcall MGEProxyDevice::SetLight(DWORD a, const D3DLIGHT8* b) {
 // Ignore Morrowind fog settings, and run stage 0 rendering after lighting setup
 HRESULT _stdcall MGEProxyDevice::SetRenderState(D3DRENDERSTATETYPE a, DWORD b) {
     captureRenderState(a, b);
+    ImGuiManager::TraceRS(sceneCount, (DWORD)a, b);
 
     if (a == D3DRS_FOGVERTEXMODE || a == D3DRS_FOGTABLEMODE) {
         return D3D_OK;
@@ -906,6 +966,9 @@ HRESULT _stdcall MGEProxyDevice::SetRenderState(D3DRENDERSTATETYPE a, DWORD b) {
         }
     }
 
+    if (ImGuiManager::GetCmdBufferRecording()) {
+        g_cmdBuffer.recordSetRenderState((DWORD)a, b);
+    }
     return ProxyDevice::SetRenderState(a, b);
 }
 
@@ -913,17 +976,48 @@ HRESULT _stdcall MGEProxyDevice::SetRenderState(D3DRENDERSTATETYPE a, DWORD b) {
 // Override some sampler options
 HRESULT _stdcall MGEProxyDevice::SetTextureStageState(DWORD a, D3DTEXTURESTAGESTATETYPE b, DWORD c) {
     captureFragmentRenderState(a, b, c);
+    ImGuiManager::TraceTSS(sceneCount, a, (DWORD)b, c);
 
     // Sampler overrides to ensure trilinear/anisotropic filtering works
     // Note that DX8 had sampling state bound to texture stages instead of samplers
     if (b == D3DTSS_MINFILTER) {
         DWORD filter = (c != D3DTEXF_NONE) ? Configuration.ScaleFilter : D3DTEXF_NONE;
+        if (ImGuiManager::GetCmdBufferRecording()) {
+            g_cmdBuffer.recordSetSamplerState(a, D3DSAMP_MINFILTER, filter);
+        }
         return realDevice->SetSamplerState(a, D3DSAMP_MINFILTER, filter);
     } else if (b == D3DTSS_MIPFILTER) {
         DWORD filter = (c != D3DTEXF_NONE) ? D3DTEXF_LINEAR : D3DTEXF_NONE;
+        if (ImGuiManager::GetCmdBufferRecording()) {
+            g_cmdBuffer.recordSetSamplerState(a, D3DSAMP_MIPFILTER, filter);
+        }
         return realDevice->SetSamplerState(a, D3DSAMP_MIPFILTER, filter);
     }
 
+    // ProxyDevice::SetTextureStageState splits sampler states from TSS
+    // Record at DX9 level — proxy does the split, so we check what it would do
+    if (ImGuiManager::GetCmdBufferRecording()) {
+        // Mirror proxy's DX8→DX9 sampler state split logic
+        D3DSAMPLERSTATETYPE sampler = (D3DSAMPLERSTATETYPE)-1;
+        switch (b) {
+        case D3DTSS_ADDRESSU: sampler = D3DSAMP_ADDRESSU; break;
+        case D3DTSS_ADDRESSV: sampler = D3DSAMP_ADDRESSV; break;
+        case D3DTSS_BORDERCOLOR: sampler = D3DSAMP_BORDERCOLOR; break;
+        case D3DTSS_MAGFILTER: sampler = D3DSAMP_MAGFILTER; break;
+        case D3DTSS_MINFILTER: sampler = D3DSAMP_MINFILTER; break;
+        case D3DTSS_MIPFILTER: sampler = D3DSAMP_MIPFILTER; break;
+        case D3DTSS_MIPMAPLODBIAS: sampler = D3DSAMP_MIPMAPLODBIAS; break;
+        case D3DTSS_MAXMIPLEVEL: sampler = D3DSAMP_MAXMIPLEVEL; break;
+        case D3DTSS_MAXANISOTROPY: sampler = D3DSAMP_MAXANISOTROPY; break;
+        case D3DTSS_ADDRESSW: sampler = D3DSAMP_ADDRESSW; break;
+        default: break;
+        }
+        if (sampler != (D3DSAMPLERSTATETYPE)-1) {
+            g_cmdBuffer.recordSetSamplerState(a, sampler, c);
+        } else {
+            g_cmdBuffer.recordSetTextureStageState(a, (DWORD)b, c);
+        }
+    }
     return ProxyDevice::SetTextureStageState(a, b, c);
 }
 
@@ -981,6 +1075,14 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
 
     if (!deferEventLog) {
         ImGuiManager::LogFrameEvent(dipEventType, sceneCount, e);
+    }
+
+    // Detailed trace for DIP — log regardless of deferral (trace wants ALL calls)
+    if (ImGuiManager::GetTraceEnabled()) {
+        FrameEvent::Type traceType = deferEventLog ? FrameEvent::DIP_Opaque : dipEventType;  // placeholder bin for deferred
+        ImGuiManager::TraceDIP(sceneCount, traceType, rs.fvf, rs.vb, rs.ib, rs.texture,
+            e, c, rs.zWrite, rs.cullMode, rs.blendEnable, rs.alphaTest,
+            rs.srcBlend, rs.destBlend, rs.vertexBlendState);
     }
 
 #ifdef TRACY_ENABLE
@@ -1069,6 +1171,9 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
         ImGuiManager::LogFrameEvent(FrameEvent::DIP_Opaque, sceneCount, e);
     }
 
+    if (ImGuiManager::GetCmdBufferRecording()) {
+        g_cmdBuffer.recordDrawIndexedPrimitive(a, (INT)baseVertexIndex, b, c, d, e);
+    }
     return ProxyDevice::DrawIndexedPrimitive(a, b, c, d, e);
 }
 
@@ -1155,6 +1260,11 @@ HRESULT _stdcall MGEProxyDevice::SetTexture(DWORD a, IDirect3DBaseTexture8* b) {
     if (a == 0) {
         rs.texture = b ? static_cast<ProxyTexture*>(b)->realTexture : NULL;
     }
+    ImGuiManager::TraceTexture(sceneCount, a, rs.texture);
+    if (ImGuiManager::GetCmdBufferRecording()) {
+        IDirect3DBaseTexture9* realTex = b ? static_cast<ProxyTexture*>(b)->realTexture : nullptr;
+        g_cmdBuffer.recordSetTexture(a, realTex);
+    }
     return ProxyDevice::SetTexture(a, b);
 }
 
@@ -1163,6 +1273,9 @@ HRESULT _stdcall MGEProxyDevice::SetTexture(DWORD a, IDirect3DBaseTexture8* b) {
 HRESULT _stdcall MGEProxyDevice::DrawPrimitive(D3DPRIMITIVETYPE a, UINT b, UINT c) {
     if (!rendertargetNormal && (g_suppressingCurrentScene || ImGuiManager::GetSuppressOffscreen())) return D3D_OK;
     ensureSceneActive();
+    if (ImGuiManager::GetCmdBufferRecording()) {
+        g_cmdBuffer.recordDrawPrimitive(a, b, c);
+    }
     return ProxyDevice::DrawPrimitive(a, b, c);
 }
 
@@ -1180,6 +1293,10 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitiveUP(D3DPRIMITIVETYPE a, UINT
 
 HRESULT _stdcall MGEProxyDevice::SetVertexShader(DWORD a) {
     rs.fvf = a;
+    ImGuiManager::TraceVertexShader(sceneCount, a);
+    if (ImGuiManager::GetCmdBufferRecording()) {
+        g_cmdBuffer.recordSetFVF(a);
+    }
     return ProxyDevice::SetVertexShader(a);
 }
 
@@ -1189,15 +1306,24 @@ HRESULT _stdcall MGEProxyDevice::SetStreamSource(UINT a, IDirect3DVertexBuffer8*
         rs.vbOffset = 0;
         rs.vbStride = c;
     }
+    ImGuiManager::TraceStreamSource(sceneCount, a, b, c);
+    if (ImGuiManager::GetCmdBufferRecording()) {
+        g_cmdBuffer.recordSetStreamSource(a, (IDirect3DVertexBuffer9*)b, 0, c);
+    }
     return ProxyDevice::SetStreamSource(a, b, c);
 }
 
 HRESULT _stdcall MGEProxyDevice::SetIndices(IDirect3DIndexBuffer8* a, UINT b) {
     rs.ib = (IDirect3DIndexBuffer9*)a;
+    ImGuiManager::TraceIndexBuffer(sceneCount, a);
+    if (ImGuiManager::GetCmdBufferRecording()) {
+        g_cmdBuffer.recordSetIndices((IDirect3DIndexBuffer9*)a);
+    }
     return ProxyDevice::SetIndices(a, b);
 }
 
 HRESULT _stdcall MGEProxyDevice::LightEnable(DWORD a, BOOL b) {
+    ImGuiManager::TraceLight(sceneCount, a, b != 0);
     if (b) {
         if (std::find(lightrs.active.begin(), lightrs.active.end(), a) == lightrs.active.end()) {
             lightrs.active.push_back(a);
@@ -1206,6 +1332,9 @@ HRESULT _stdcall MGEProxyDevice::LightEnable(DWORD a, BOOL b) {
         if (std::remove(lightrs.active.begin(), lightrs.active.end(), a) != lightrs.active.end()) {
             lightrs.active.pop_back();
         }
+    }
+    if (ImGuiManager::GetCmdBufferRecording()) {
+        g_cmdBuffer.recordLightEnable(a, b);
     }
     return ProxyDevice::LightEnable(a, b);
 }
@@ -1367,6 +1496,29 @@ void captureMaterial(const D3DMATERIAL8* a) {
     frs.material.ambient = a->Ambient;
     frs.material.emissive = a->Emissive;
     frs.material.emissive.a = a->Power;
+}
+
+// --------------------------------------------------------
+// Trace-only overrides — forward to ProxyDevice, log when trace enabled
+
+HRESULT _stdcall MGEProxyDevice::SetViewport(const D3DVIEWPORT8* a) {
+    if (a) {
+        ImGuiManager::TraceViewport(sceneCount, a->X, a->Y, a->Width, a->Height, a->MinZ, a->MaxZ);
+        if (ImGuiManager::GetCmdBufferRecording()) {
+            g_cmdBuffer.recordSetViewport(a);
+        }
+    }
+    return ProxyDevice::SetViewport(a);
+}
+
+HRESULT _stdcall MGEProxyDevice::SetClipPlane(DWORD a, const float* b) {
+    ImGuiManager::TraceClipPlane(sceneCount, a);
+    return ProxyDevice::SetClipPlane(a, b);
+}
+
+HRESULT _stdcall MGEProxyDevice::MultiplyTransform(D3DTRANSFORMSTATETYPE a, const D3DMATRIX* b) {
+    ImGuiManager::TraceMultiplyTransform(sceneCount, (DWORD)a, b ? (const float*)b : nullptr);
+    return ProxyDevice::MultiplyTransform(a, b);
 }
 
 // --------------------------------------------------------

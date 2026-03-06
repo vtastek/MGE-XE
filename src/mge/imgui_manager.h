@@ -7,6 +7,36 @@
 
 #include <vector>
 
+// Detailed state attached to trace-level frame events
+struct StateDetail {
+    enum Kind : uint8_t {
+        None, RenderState, TextureStageState, Transform, Texture,
+        DrawCall, ClearCall, RenderTarget, Light, Material,
+        Viewport, ClipPlane, StreamSource, VertexShader, IndexBuffer
+    };
+    Kind kind = None;
+
+    union {
+        struct { DWORD state; DWORD value; DWORD prev; bool changed; } rs;
+        struct { DWORD stage; DWORD state; DWORD value; DWORD prev; bool changed; } tss;
+        struct { DWORD type; float m[16]; } xform;
+        struct { DWORD stage; uintptr_t ptr; } tex;
+        struct { DWORD fvf; uintptr_t vb; uintptr_t ib; uintptr_t tex0;
+                 DWORD primCount; DWORD vertCount;
+                 DWORD zWrite; DWORD cull; DWORD alphaBlend; DWORD alphaTest;
+                 DWORD srcBlend; DWORD destBlend; DWORD vertBlend; } dip;
+        struct { DWORD flags; DWORD color; float z; } clear;
+        struct { uintptr_t color; uintptr_t depth; } rt;
+        struct { DWORD index; bool enable; } light;
+        struct { float dr; float dg; float db; float da; } mat;
+        struct { DWORD x; DWORD y; DWORD w; DWORD h; float minZ; float maxZ; } vp;
+        struct { DWORD index; } clip;
+        struct { DWORD stream; uintptr_t vb; DWORD stride; } ss;
+        struct { DWORD fvf; } vs;
+        struct { uintptr_t ib; } ib;
+    };
+};
+
 // Frame event log entry — lightweight record of what happened this frame and in what order
 struct FrameEvent {
     enum Type : uint8_t {
@@ -23,11 +53,17 @@ struct FrameEvent {
         MGE_ShadowOverlay, MGE_Depth, MGE_DepthDistant,
         MGE_HiZGen, MGE_WaterReflection, MGE_WaterPlane,
         MGE_SkyRender,
+        // Detailed trace events (only logged when trace enabled)
+        State_RS, State_TSS, State_Transform, State_Texture,
+        State_Light, State_Material, State_Viewport, State_ClipPlane,
+        State_StreamSource, State_VertexShader, State_IndexBuffer,
+        State_MultiplyTransform,
         Count
     };
     Type type;
     int sceneNum;       // which scene this occurred in
     int primCount;      // for DIP events: prim count. For MGE internal: draw call count
+    StateDetail detail; // detailed state (only filled when trace enabled)
 
     static const char* typeName(Type t) {
         static const char* names[] = {
@@ -42,7 +78,11 @@ struct FrameEvent {
             "MGE_Grass", "MGE_GrassZ",
             "MGE_ShadowOverlay", "MGE_Depth", "MGE_DepthDistant",
             "MGE_HiZGen", "MGE_WaterReflection", "MGE_WaterPlane",
-            "MGE_SkyRender"
+            "MGE_SkyRender",
+            "RS", "TSS", "Transform", "Texture",
+            "Light", "Material", "Viewport", "ClipPlane",
+            "StreamSource", "VertexShader", "IndexBuffer",
+            "MultiplyTransform"
         };
         return (t < Count) ? names[t] : "Unknown";
     }
@@ -164,11 +204,35 @@ public:
 
     // Frame event log
     static void LogFrameEvent(FrameEvent::Type type, int sceneNum, int primCount = 0);
+    static void LogFrameEventDetailed(FrameEvent::Type type, int sceneNum, int primCount, const StateDetail& detail);
     static void SnapshotFrameEvents();  // Call at Present() to snapshot for display
     static void RenderFrameEventLog();
     static void ToggleFrameEventLog();
     static bool GetShowFrameEventLog() { return showFrameEventLog; }
     static void PrintFrameEventsToFile();  // Dump current display events to file
+
+    // Detailed trace
+    static bool GetTraceEnabled() { return traceEnabled; }
+    static void ResetStateShadow();
+    static void AutoNameScenario();  // Auto-fill scenario label from game state
+    // Convenience trace loggers (handle state shadow internally)
+    static void TraceRS(int sceneNum, DWORD state, DWORD value);
+    static void TraceTSS(int sceneNum, DWORD stage, DWORD state, DWORD value);
+    static void TraceTransform(int sceneNum, DWORD type, const float* matrix);
+    static void TraceMultiplyTransform(int sceneNum, DWORD type, const float* matrix);
+    static void TraceTexture(int sceneNum, DWORD stage, void* ptr);
+    static void TraceDIP(int sceneNum, FrameEvent::Type dipType, DWORD fvf, void* vb, void* ib, void* tex0,
+                         DWORD primCount, DWORD vertCount, DWORD zWrite, DWORD cull,
+                         DWORD alphaBlend, DWORD alphaTest, DWORD srcBlend, DWORD destBlend, DWORD vertBlend);
+    static void TraceClear(int sceneNum, DWORD flags, DWORD color, float z);
+    static void TraceRT(int sceneNum, void* color, void* depth);
+    static void TraceLight(int sceneNum, DWORD index, bool enable);
+    static void TraceMaterial(int sceneNum, float dr, float dg, float db, float da);
+    static void TraceViewport(int sceneNum, DWORD x, DWORD y, DWORD w, DWORD h, float minZ, float maxZ);
+    static void TraceClipPlane(int sceneNum, DWORD index);
+    static void TraceStreamSource(int sceneNum, DWORD stream, void* vb, DWORD stride);
+    static void TraceVertexShader(int sceneNum, DWORD fvf);
+    static void TraceIndexBuffer(int sceneNum, void* ib);
 
     // Slow frame detection
     static float GetSlowFrameThreshold() { return slowFrameThreshold; }
@@ -176,6 +240,10 @@ public:
     static bool GetSlowFrameAutoFreeze() { return slowFrameAutoFreeze; }
     static bool GetSlowFrameFrozen() { return slowFrameFrozen; }
     static void FreezeSlowFrame(float prepareMs, float replayMs, int worstCallIndex, float worstCallMs, int worstCallPrims, int worstCallBin);
+
+    // D3D Command Buffer
+    static bool GetCmdBufferRecording() { return cmdBufferRecording; }
+    static void UpdateCmdBufferStats(int cmdCount, int sizeKB);
 
     // Debug hotkey gating
     static bool GetDebugKeysEnabled();
@@ -290,6 +358,14 @@ private:
     static bool eventLogAutoFreeze;
     static int eventLogFreezeOffscreenThreshold;  // Auto-freeze when offscreen DIPs >= this (0=disabled)
 
+    // Detailed trace
+    static bool traceEnabled;
+    static bool traceShowStateChanges;
+    static bool traceOnlyDeltas;
+    static bool traceShowDIPDetails;
+    static bool traceShowViewportClip;
+    static char traceScenarioLabel[128];
+
     // Slow frame detection state
     static bool slowFrameFrozen;
     static bool slowFrameAutoFreeze;
@@ -301,6 +377,11 @@ private:
     static float frozenSlowCallMs;
     static int frozenSlowCallPrims;
     static int frozenSlowCallBin;
+
+    // D3D Command Buffer
+    static bool cmdBufferRecording;       // Enable command buffer recording - default false
+    static int cmdBufferCmdCount;         // Last frame's command count
+    static int cmdBufferSizeKB;           // Last frame's buffer size in KB
 
     // Debug hotkey gating
     static bool debugKeysEnabled;         // Gate debug hotkeys (F11/U/Y/L/F5/F6) - default false

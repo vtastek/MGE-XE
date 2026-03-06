@@ -29,4 +29,9 @@ public:
     HRESULT _stdcall SetVertexShader(DWORD a);
     HRESULT _stdcall SetStreamSource(UINT a, IDirect3DVertexBuffer8* b, UINT c);
     HRESULT _stdcall SetIndices(IDirect3DIndexBuffer8* a, UINT b);
+
+    // Trace-only overrides (currently pass through to ProxyDevice)
+    HRESULT _stdcall SetViewport(const D3DVIEWPORT8* a);
+    HRESULT _stdcall SetClipPlane(DWORD a, const float* b);
+    HRESULT _stdcall MultiplyTransform(D3DTRANSFORMSTATETYPE a, const D3DMATRIX* b);
 };

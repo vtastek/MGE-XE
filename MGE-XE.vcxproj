@@ -134,6 +134,7 @@
     <ClCompile Include="src\mge\softwareocclusion.cpp" />
     <ClCompile Include="src\mge\meshlodcache.cpp" />
     <ClCompile Include="src\mge\ffe_core_rendering.cpp" />
+    <ClCompile Include="src\mge\d3dcommandbuffer.cpp" />
     <ClCompile Include="src\mge\imgui_manager.cpp" />
     <ClCompile Include="src\mge\macrofunctions.cpp" />
     <ClCompile Include="src\mge\memorypool.cpp" />
@@ -219,6 +220,7 @@
     <ClInclude Include="src\mge\hlsl_shader_manager.h" />
     <ClInclude Include="src\mge\async_shader_compiler.h" />
     <ClInclude Include="src\mge\ffe_core_rendering.h" />
+    <ClInclude Include="src\mge\d3dcommandbuffer.h" />
     <ClInclude Include="src\mge\imgui_manager.h" />
     <ClInclude Include="src\mge\mge_tracy.h" />
     <ClInclude Include="src\mge\inidata.h" />
