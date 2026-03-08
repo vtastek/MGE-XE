@@ -11,7 +11,10 @@ struct D3DCmd {
         Cmd_SetFVF, Cmd_SetStreamSource, Cmd_SetIndices,
         Cmd_DrawIndexedPrimitive, Cmd_DrawPrimitive,
         Cmd_Clear, Cmd_SetRenderTarget, Cmd_SetDepthStencilSurface,
-        Cmd_BeginScene, Cmd_EndScene, Cmd_SetViewport
+        Cmd_BeginScene, Cmd_EndScene, Cmd_SetViewport,
+        Cmd_SetVertexShader, Cmd_SetPixelShader,
+        Cmd_SetVSConstantF, Cmd_SetPSConstantF,
+        Cmd_SetVSConstantI, Cmd_SetPSConstantI
     };
     Type type;
 
@@ -34,8 +37,17 @@ struct D3DCmd {
         struct { IDirect3DSurface9* surface; } rt;
         struct { IDirect3DSurface9* surface; } ds;
         struct { D3DVIEWPORT9 viewport; } vp;
+        struct { IDirect3DVertexShader9* shader; } vs;
+        struct { IDirect3DPixelShader9* shader; } ps;
+        struct { UINT startReg; UINT count; UINT arenaOffset; } constF;
     };
 };
+
+enum class CmdStage : uint8_t {
+    PreScene, Scene0, InterScene, Scene1Plus, UI, Count
+};
+
+const char* CmdStageName(CmdStage s);
 
 class D3DCommandBuffer {
 public:
@@ -74,10 +86,34 @@ public:
     void recordBeginScene();
     void recordEndScene();
     void recordSetViewport(const D3DVIEWPORT9* vp);
+    void recordSetVertexShader(IDirect3DVertexShader9* shader);
+    void recordSetPixelShader(IDirect3DPixelShader9* shader);
+    void recordSetVSConstantF(UINT startReg, const float* data, UINT count);
+    void recordSetPSConstantF(UINT startReg, const float* data, UINT count);
+    void recordSetVSConstantI(UINT startReg, const int* data, UINT count);
+    void recordSetPSConstantI(UINT startReg, const int* data, UINT count);
 
     int size() const { return (int)commands.size(); }
-    size_t sizeBytes() const { return commands.size() * sizeof(D3DCmd); }
+    size_t sizeBytes() const { return commands.size() * sizeof(D3DCmd) + constantArena.size() * sizeof(float); }
+    void dumpToFrameLog(int sceneNum) const;
 
 private:
     std::vector<D3DCmd> commands;
+    std::vector<float> constantArena;
+};
+
+class D3DCommandBufferSet {
+public:
+    D3DCommandBuffer& active() { return buffers[(int)activeStage]; }
+    const D3DCommandBuffer& active() const { return buffers[(int)activeStage]; }
+    D3DCommandBuffer& operator[](CmdStage s) { return buffers[(int)s]; }
+    const D3DCommandBuffer& operator[](CmdStage s) const { return buffers[(int)s]; }
+    void clearAll();
+    int totalSize() const;
+    size_t totalSizeBytes() const;
+    void dumpToFrameLog() const;
+
+    CmdStage activeStage = CmdStage::PreScene;
+private:
+    D3DCommandBuffer buffers[(int)CmdStage::Count];
 };

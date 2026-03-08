@@ -108,6 +108,8 @@ std::vector<FrameEvent> ImGuiManager::frozenFrameEvents;
 bool ImGuiManager::eventLogFrozen = false;
 bool ImGuiManager::eventLogAutoFreeze = true;
 int ImGuiManager::eventLogFreezeOffscreenThreshold = 1;  // Freeze when offscreen >= 1
+char ImGuiManager::frameConfigLabel[128] = {};
+char ImGuiManager::frozenConfigLabel[128] = {};
 
 // Detailed trace
 bool ImGuiManager::traceEnabled = false;
@@ -136,8 +138,14 @@ int ImGuiManager::frozenSlowCallBin = 0;
 // Debug hotkey gating
 // D3D Command Buffer
 bool ImGuiManager::cmdBufferRecording = false;
+bool ImGuiManager::cmdBufferReplay = false;
 int ImGuiManager::cmdBufferCmdCount = 0;
 int ImGuiManager::cmdBufferSizeKB = 0;
+int ImGuiManager::cmdStagePreScene = 0;
+int ImGuiManager::cmdStageScene0 = 0;
+int ImGuiManager::cmdStageInterScene = 0;
+int ImGuiManager::cmdStageScene1Plus = 0;
+int ImGuiManager::cmdStageUI = 0;
 
 bool ImGuiManager::debugKeysEnabled = false;
 
@@ -537,8 +545,12 @@ void ImGuiManager::RenderDebugInterface() {
         ImGui::Text("D3D Command Buffer");
         ImGui::Checkbox("Record All MW Calls", &cmdBufferRecording);
         ImGui::SetItemTooltip("Record every MW D3D call into a command buffer (dual-write: still forwards to device)");
-        if (cmdBufferRecording) {
+        ImGui::Checkbox("Command Buffer Replay", &cmdBufferReplay);
+        ImGui::SetItemTooltip("Skip MW forwards, replay entire buffer at Present(). Forces recording on.");
+        if (cmdBufferRecording || cmdBufferReplay) {
             ImGui::Text("  Commands: %d  Size: %d KB", cmdBufferCmdCount, cmdBufferSizeKB);
+            ImGui::Text("  Pre:%d S0:%d Inter:%d S1+:%d UI:%d",
+                cmdStagePreScene, cmdStageScene0, cmdStageInterScene, cmdStageScene1Plus, cmdStageUI);
         }
 
         ImGui::Separator();
@@ -584,6 +596,14 @@ void ImGuiManager::UpdateDIPStats(const DIPBinStats& stats) {
 void ImGuiManager::UpdateCmdBufferStats(int cmdCount, int sizeKB) {
     cmdBufferCmdCount = cmdCount;
     cmdBufferSizeKB = sizeKB;
+}
+
+void ImGuiManager::UpdateCmdBufferPerStageStats(int preScene, int scene0, int interScene, int scene1Plus, int ui) {
+    cmdStagePreScene = preScene;
+    cmdStageScene0 = scene0;
+    cmdStageInterScene = interScene;
+    cmdStageScene1Plus = scene1Plus;
+    cmdStageUI = ui;
 }
 
 void ImGuiManager::FreezeDIPStats(const DIPBinStats& stats) {
@@ -925,6 +945,18 @@ void ImGuiManager::TraceIndexBuffer(int sceneNum, void* ib) {
 }
 
 void ImGuiManager::SnapshotFrameEvents() {
+    // Build config label for this frame
+    {
+        const char* lightMode = isHLSLActive() ? "HLSL" :
+            (Configuration.PerPixelLightFlags == 1) ? "PPL" : "Standard";
+        bool distLand = (Configuration.MGEFlags & USE_DISTANT_LAND) != 0;
+        const char* cmdBuf = cmdBufferReplay ? "Replay" :
+            cmdBufferRecording ? "Record" : "Off";
+        snprintf(frameConfigLabel, sizeof(frameConfigLabel),
+            "Mode: %s | DistLand: %s | CmdBuf: %s",
+            lightMode, distLand ? "ON" : "OFF", cmdBuf);
+    }
+
     // Check auto-freeze trigger before swapping
     if (eventLogAutoFreeze && !eventLogFrozen && eventLogFreezeOffscreenThreshold > 0) {
         int offscreenCount = 0;
@@ -933,6 +965,7 @@ void ImGuiManager::SnapshotFrameEvents() {
         }
         if (offscreenCount >= eventLogFreezeOffscreenThreshold) {
             frozenFrameEvents = frameEvents;  // Copy before swap
+            memcpy(frozenConfigLabel, frameConfigLabel, sizeof(frozenConfigLabel));
             eventLogFrozen = true;
         }
     }
@@ -979,9 +1012,14 @@ void ImGuiManager::RenderFrameEventLog() {
             ImGui::SameLine();
             if (ImGui::Button("Freeze")) {
                 frozenFrameEvents = displayFrameEvents;
+                memcpy(frozenConfigLabel, frameConfigLabel, sizeof(frozenConfigLabel));
                 eventLogFrozen = true;
             }
         }
+
+        // Show current mode/config
+        const char* configLabel = eventLogFrozen ? frozenConfigLabel : frameConfigLabel;
+        ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "%s", configLabel);
 
         ImGui::Checkbox("Auto-freeze on offscreen", &eventLogAutoFreeze);
         ImGui::SameLine();
@@ -1172,6 +1210,10 @@ void ImGuiManager::PrintFrameEventsToFile() {
     if (!f) return;
 
     fprintf(f, "Frame Trace Log (%d events)\n", (int)events.size());
+    const char* configLabel = eventLogFrozen ? frozenConfigLabel : frameConfigLabel;
+    if (configLabel[0]) {
+        fprintf(f, "Config: %s\n", configLabel);
+    }
     if (traceScenarioLabel[0]) {
         fprintf(f, "Scenario: %s\n", traceScenarioLabel);
     }
@@ -1200,8 +1242,46 @@ void ImGuiManager::PrintFrameEventsToFile() {
         const auto& d = e.detail;
         bool isMGEInternal = (e.type >= FrameEvent::MGE_ShadowMap && e.type <= FrameEvent::MGE_SkyRender);
         bool isTraceEvent = (e.type >= FrameEvent::State_RS && e.type <= FrameEvent::State_MultiplyTransform);
+        bool isReplayEvent = (e.type >= FrameEvent::Replay_Clear && e.type <= FrameEvent::Replay_DP);
 
-        if (isTraceEvent && d.kind == StateDetail::RenderState) {
+        if (isReplayEvent && d.kind == StateDetail::ClearCall) {
+            fprintf(f, "[%4d] S%d R_Clear flags=0x%X color=0x%08X z=%.4f\n", i, e.sceneNum,
+                d.clear.flags, d.clear.color, d.clear.z);
+        } else if (isReplayEvent && d.kind == StateDetail::RenderTarget) {
+            fprintf(f, "[%4d] S%d %s ptr=0x%X\n", i, e.sceneNum, FrameEvent::typeName(e.type),
+                (unsigned)((d.rt.color ? d.rt.color : d.rt.depth) & 0xFFFF));
+        } else if (isReplayEvent && d.kind == StateDetail::Viewport) {
+            fprintf(f, "[%4d] S%d R_Viewport %dx%d+%d+%d z=[%.4f,%.4f]\n", i, e.sceneNum,
+                d.vp.w, d.vp.h, d.vp.x, d.vp.y, d.vp.minZ, d.vp.maxZ);
+        } else if (isReplayEvent && d.kind == StateDetail::RenderState) {
+            fprintf(f, "[%4d] S%d R_RS %-24s = %d\n", i, e.sceneNum, D3DRSName(d.rs.state), d.rs.value);
+        } else if (isReplayEvent && d.kind == StateDetail::TextureStageState) {
+            fprintf(f, "[%4d] S%d R_TSS[%d] %-20s = %d\n", i, e.sceneNum, d.tss.stage,
+                D3DTSSName(d.tss.state), d.tss.value);
+        } else if (isReplayEvent && d.kind == StateDetail::Transform) {
+            const float* m = d.xform.m;
+            fprintf(f, "[%4d] S%d R_Transform %s\n", i, e.sceneNum, D3DTSName(d.xform.type));
+            fprintf(f, "       [%10.4f %10.4f %10.4f %10.4f]\n", m[0], m[1], m[2], m[3]);
+            fprintf(f, "       [%10.4f %10.4f %10.4f %10.4f]\n", m[4], m[5], m[6], m[7]);
+            fprintf(f, "       [%10.4f %10.4f %10.4f %10.4f]\n", m[8], m[9], m[10], m[11]);
+            fprintf(f, "       [%10.4f %10.4f %10.4f %10.4f]\n", m[12], m[13], m[14], m[15]);
+        } else if (isReplayEvent && d.kind == StateDetail::Texture) {
+            fprintf(f, "[%4d] S%d R_Texture[%d] = 0x%p\n", i, e.sceneNum, d.tex.stage, (void*)d.tex.ptr);
+        } else if (isReplayEvent && d.kind == StateDetail::Material) {
+            fprintf(f, "[%4d] S%d R_Material diffuse=(%.3f,%.3f,%.3f,%.3f)\n", i, e.sceneNum, d.mat.dr, d.mat.dg, d.mat.db, d.mat.da);
+        } else if (isReplayEvent && d.kind == StateDetail::Light) {
+            fprintf(f, "[%4d] S%d R_LightEn[%d] %s\n", i, e.sceneNum, d.light.index, d.light.enable ? "ON" : "OFF");
+        } else if (isReplayEvent && d.kind == StateDetail::DrawCall) {
+            fprintf(f, "[%4d] S%d R_DIP prims=%d verts=%d\n", i, e.sceneNum, d.dip.primCount, d.dip.vertCount);
+        } else if (isReplayEvent && d.kind == StateDetail::VertexShader) {
+            fprintf(f, "[%4d] S%d R_FVF=0x%08X\n", i, e.sceneNum, d.vs.fvf);
+        } else if (isReplayEvent && d.kind == StateDetail::StreamSource) {
+            fprintf(f, "[%4d] S%d R_Stream[%d] vb=0x%X stride=%d\n", i, e.sceneNum, d.ss.stream, (unsigned)(d.ss.vb & 0xFFFF), d.ss.stride);
+        } else if (isReplayEvent && d.kind == StateDetail::IndexBuffer) {
+            fprintf(f, "[%4d] S%d R_IB=0x%X\n", i, e.sceneNum, (unsigned)(d.ib.ib & 0xFFFF));
+        } else if (isReplayEvent) {
+            fprintf(f, "[%4d] S%d %s prims=%d\n", i, e.sceneNum, FrameEvent::typeName(e.type), e.primCount);
+        } else if (isTraceEvent && d.kind == StateDetail::RenderState) {
             fprintf(f, "[%4d] S%d RS %-24s %d -> %d %s\n", i, e.sceneNum, D3DRSName(d.rs.state),
                 d.rs.prev, d.rs.value, d.rs.changed ? "CHANGED" : "(same)");
         } else if (isTraceEvent && d.kind == StateDetail::TextureStageState) {

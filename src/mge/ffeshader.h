@@ -3,6 +3,8 @@
 #include "proxydx/d3d8header.h"
 #include "softwareocclusion.h"
 
+#include "d3dcommandbuffer.h"
+
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -246,6 +248,17 @@ class FixedFunctionShader {
 
     static ID3DXEffect* generateMWShader(const ShaderKey& sk);
 
+public:
+    // Register offset for a shader constant (resolved at compile time from handle)
+    static const UINT REG_INVALID = 0xFFFF;
+    struct ConstReg {
+        UINT reg;
+        UINT count;  // Number of float4 registers
+        UINT regSet; // 0=FLOAT4, 1=INT4, 2=BOOL (from D3DXREGISTER_SET)
+        ConstReg() : reg(REG_INVALID), count(0), regSet(0) {}
+    };
+
+private:
     // HLSL Pipeline structures and functions
     struct HLSLShader {
         IDirect3DVertexShader9* vertexShader;
@@ -264,6 +277,10 @@ class FixedFunctionShader {
         D3DXHANDLE hVertexBlendState;
         D3DXHANDLE hShadowWorldViewProj;
 
+        // Resolved register offsets for VS constants (for command buffer path)
+        ConstReg regWorldViewProj, regView, regProj, regWorld, regWorldView;
+        ConstReg regVertexBlendPalette, regVertexBlendState, regShadowWorldViewProj;
+
         // Cached pixel shader constant handles
         D3DXHANDLE hMaterialDiffuse;
         D3DXHANDLE hMaterialAmbient;
@@ -279,6 +296,22 @@ class FixedFunctionShader {
         // Cached point light constant handles (per-object uniform path, lightMode 1-2)
         D3DXHANDLE hLightDiffuse, hLightPosition, hLightAmbient;
         D3DXHANDLE hPointLightCount, hLightFalloffQuadratic, hLightFalloffConstant;
+
+        // Resolved register offsets for PS constants (for command buffer path)
+        ConstReg regMaterialDiffuse, regMaterialAmbient, regMaterialEmissive;
+        ConstReg regLightSunDirection, regLightSunDiffuse, regLightSceneAmbient;
+        ConstReg regShadowRcpRes, regPCFFilterSize;
+        ConstReg regLightDiffuse, regLightPosition, regLightAmbient;
+        ConstReg regPointLightCount, regLightFalloffQuadratic, regLightFalloffConstant;
+
+        // Dynamic PS constants resolved on first use
+        ConstReg regShadingMode, regFogColNear, regMaterialAlpha, regAlphaRef;
+        ConstReg regHasVCol, regHasAlpha, regHasBones, regHasAlphaVS;
+        ConstReg regTexgenTransform, regBumpMatrix, regBumpLumiScaleBias;
+        ConstReg regPCFPenumbraScale, regPCFMinPenumbra, regPCFMaxPenumbra;
+        ConstReg regPCFBias, regPCFBias2, regPCFSlopeBias;
+        ConstReg regWindVec, regTime, regNormres;
+        bool dynamicConstsResolved;
 
         // Suffix texture support
         IDirect3DTexture9* diffparamTexture;
@@ -647,6 +680,9 @@ public:
         IDirect3DTexture9* texDistantBlend = nullptr;
         SavedRenderStates postRecordingState = {};
 
+        // HLSL replay command buffer — built by replayRecordedCalls, replayed in executeGpuPhase
+        D3DCommandBuffer hlslCmds;
+
         bool valid;
         BufferState state;
 
@@ -662,6 +698,7 @@ public:
             waterSeen = false;
             texDistantBlend = nullptr;
             postRecordingState = {};
+            hlslCmds.clear();
             valid = false;
         }
 
@@ -731,8 +768,8 @@ private:
     static void stopRecordingAndReplay();
     static void prepareRecordedCalls(int bufferIndex);
     static void recordRenderCall(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, const ShaderKey& sk, int recordMWIdx = -1);
-    static void replayRecordedCalls(int sceneCount);
-    static void renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, DWORD dirtyFlags = DIRTY_ALL, int callIndex = -1);
+    static void replayRecordedCalls(int sceneCount, D3DCommandBuffer* cmdBuf = nullptr);
+    static void renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, DWORD dirtyFlags = DIRTY_ALL, int callIndex = -1, D3DCommandBuffer* cmdBuf = nullptr);
     static void validateDeviceState(const ExpectedDeviceState& expected, int callIndex);
     static void matchPreviousFrameCalls(int bufferIndex);
     static ShaderKey computeShaderKeyWithSuffixes(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);

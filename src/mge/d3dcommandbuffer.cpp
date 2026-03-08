@@ -1,15 +1,17 @@
 #include "d3dcommandbuffer.h"
+#include "imgui_manager.h"
 
 // --- Move semantics ---
 
 D3DCommandBuffer::D3DCommandBuffer(D3DCommandBuffer&& other) noexcept
-    : commands(std::move(other.commands)) {
+    : commands(std::move(other.commands)), constantArena(std::move(other.constantArena)) {
 }
 
 D3DCommandBuffer& D3DCommandBuffer::operator=(D3DCommandBuffer&& other) noexcept {
     if (this != &other) {
         clear();
         commands = std::move(other.commands);
+        constantArena = std::move(other.constantArena);
     }
     return *this;
 }
@@ -34,11 +36,18 @@ void D3DCommandBuffer::clear() {
         case D3DCmd::Cmd_SetDepthStencilSurface:
             if (cmd.ds.surface) cmd.ds.surface->Release();
             break;
+        case D3DCmd::Cmd_SetVertexShader:
+            if (cmd.vs.shader) cmd.vs.shader->Release();
+            break;
+        case D3DCmd::Cmd_SetPixelShader:
+            if (cmd.ps.shader) cmd.ps.shader->Release();
+            break;
         default:
             break;
         }
     }
     commands.clear();
+    constantArena.clear();
 }
 
 // --- Record methods ---
@@ -203,6 +212,68 @@ void D3DCommandBuffer::recordSetViewport(const D3DVIEWPORT9* vp) {
     commands.push_back(cmd);
 }
 
+void D3DCommandBuffer::recordSetVertexShader(IDirect3DVertexShader9* shader) {
+    D3DCmd cmd;
+    cmd.type = D3DCmd::Cmd_SetVertexShader;
+    cmd.vs.shader = shader;
+    if (shader) shader->AddRef();
+    commands.push_back(cmd);
+}
+
+void D3DCommandBuffer::recordSetPixelShader(IDirect3DPixelShader9* shader) {
+    D3DCmd cmd;
+    cmd.type = D3DCmd::Cmd_SetPixelShader;
+    cmd.ps.shader = shader;
+    if (shader) shader->AddRef();
+    commands.push_back(cmd);
+}
+
+void D3DCommandBuffer::recordSetVSConstantF(UINT startReg, const float* data, UINT count) {
+    D3DCmd cmd;
+    cmd.type = D3DCmd::Cmd_SetVSConstantF;
+    cmd.constF.startReg = startReg;
+    cmd.constF.count = count;
+    cmd.constF.arenaOffset = (UINT)constantArena.size();
+    UINT numFloats = count * 4;
+    constantArena.insert(constantArena.end(), data, data + numFloats);
+    commands.push_back(cmd);
+}
+
+void D3DCommandBuffer::recordSetPSConstantF(UINT startReg, const float* data, UINT count) {
+    D3DCmd cmd;
+    cmd.type = D3DCmd::Cmd_SetPSConstantF;
+    cmd.constF.startReg = startReg;
+    cmd.constF.count = count;
+    cmd.constF.arenaOffset = (UINT)constantArena.size();
+    UINT numFloats = count * 4;
+    constantArena.insert(constantArena.end(), data, data + numFloats);
+    commands.push_back(cmd);
+}
+
+void D3DCommandBuffer::recordSetVSConstantI(UINT startReg, const int* data, UINT count) {
+    D3DCmd cmd;
+    cmd.type = D3DCmd::Cmd_SetVSConstantI;
+    cmd.constF.startReg = startReg;
+    cmd.constF.count = count;
+    cmd.constF.arenaOffset = (UINT)constantArena.size();
+    UINT numFloats = count * 4;  // reuse float arena, reinterpreted as int
+    const float* asFloat = reinterpret_cast<const float*>(data);
+    constantArena.insert(constantArena.end(), asFloat, asFloat + numFloats);
+    commands.push_back(cmd);
+}
+
+void D3DCommandBuffer::recordSetPSConstantI(UINT startReg, const int* data, UINT count) {
+    D3DCmd cmd;
+    cmd.type = D3DCmd::Cmd_SetPSConstantI;
+    cmd.constF.startReg = startReg;
+    cmd.constF.count = count;
+    cmd.constF.arenaOffset = (UINT)constantArena.size();
+    UINT numFloats = count * 4;  // reuse float arena, reinterpreted as int
+    const float* asFloat = reinterpret_cast<const float*>(data);
+    constantArena.insert(constantArena.end(), asFloat, asFloat + numFloats);
+    commands.push_back(cmd);
+}
+
 // --- Replay ---
 
 void D3DCommandBuffer::replay(IDirect3DDevice9* device) const {
@@ -249,7 +320,8 @@ void D3DCommandBuffer::replay(IDirect3DDevice9* device) const {
             device->DrawPrimitive(cmd.dp.primType, cmd.dp.startVertex, cmd.dp.primCount);
             break;
         case D3DCmd::Cmd_Clear:
-            device->Clear(cmd.clear.count, NULL, cmd.clear.flags, cmd.clear.color, cmd.clear.z, cmd.clear.stencil);
+            device->Clear(cmd.clear.count, NULL,
+                cmd.clear.flags, cmd.clear.color, cmd.clear.z, cmd.clear.stencil);
             break;
         case D3DCmd::Cmd_SetRenderTarget:
             device->SetRenderTarget(0, cmd.rt.surface);
@@ -265,6 +337,236 @@ void D3DCommandBuffer::replay(IDirect3DDevice9* device) const {
             break;
         case D3DCmd::Cmd_SetViewport:
             device->SetViewport(&cmd.vp.viewport);
+            break;
+        case D3DCmd::Cmd_SetVertexShader:
+            device->SetVertexShader(cmd.vs.shader);
+            break;
+        case D3DCmd::Cmd_SetPixelShader:
+            device->SetPixelShader(cmd.ps.shader);
+            break;
+        case D3DCmd::Cmd_SetVSConstantF:
+            device->SetVertexShaderConstantF(cmd.constF.startReg,
+                &constantArena[cmd.constF.arenaOffset], cmd.constF.count);
+            break;
+        case D3DCmd::Cmd_SetPSConstantF:
+            device->SetPixelShaderConstantF(cmd.constF.startReg,
+                &constantArena[cmd.constF.arenaOffset], cmd.constF.count);
+            break;
+        case D3DCmd::Cmd_SetVSConstantI:
+            device->SetVertexShaderConstantI(cmd.constF.startReg,
+                reinterpret_cast<const int*>(&constantArena[cmd.constF.arenaOffset]), cmd.constF.count);
+            break;
+        case D3DCmd::Cmd_SetPSConstantI:
+            device->SetPixelShaderConstantI(cmd.constF.startReg,
+                reinterpret_cast<const int*>(&constantArena[cmd.constF.arenaOffset]), cmd.constF.count);
+            break;
+        }
+    }
+}
+
+// --- CmdStage names ---
+
+const char* CmdStageName(CmdStage s) {
+    static const char* names[] = { "PreScene", "Scene0", "InterScene", "Scene1Plus", "UI" };
+    return ((int)s < (int)CmdStage::Count) ? names[(int)s] : "Unknown";
+}
+
+// --- D3DCommandBufferSet ---
+
+void D3DCommandBufferSet::clearAll() {
+    for (int i = 0; i < (int)CmdStage::Count; i++) {
+        buffers[i].clear();
+    }
+    activeStage = CmdStage::PreScene;
+}
+
+int D3DCommandBufferSet::totalSize() const {
+    int total = 0;
+    for (int i = 0; i < (int)CmdStage::Count; i++) {
+        total += buffers[i].size();
+    }
+    return total;
+}
+
+size_t D3DCommandBufferSet::totalSizeBytes() const {
+    size_t total = 0;
+    for (int i = 0; i < (int)CmdStage::Count; i++) {
+        total += buffers[i].sizeBytes();
+    }
+    return total;
+}
+
+void D3DCommandBufferSet::dumpToFrameLog() const {
+    for (int i = 0; i < (int)CmdStage::Count; i++) {
+        if (buffers[i].size() > 0) {
+            buffers[i].dumpToFrameLog(i);  // use stage index as sceneNum for identification
+        }
+    }
+}
+
+// --- D3DCommandBuffer dump ---
+
+void D3DCommandBuffer::dumpToFrameLog(int sceneNum) const {
+    for (const auto& cmd : commands) {
+        switch (cmd.type) {
+        case D3DCmd::Cmd_Clear: {
+            StateDetail d;
+            d.kind = StateDetail::ClearCall;
+            d.clear.flags = cmd.clear.flags;
+            d.clear.color = cmd.clear.color;
+            d.clear.z = cmd.clear.z;
+            ImGuiManager::LogFrameEventDetailed(FrameEvent::Replay_Clear, sceneNum, 0, d);
+            break;
+        }
+        case D3DCmd::Cmd_BeginScene:
+            ImGuiManager::LogFrameEvent(FrameEvent::Replay_BeginScene, sceneNum);
+            break;
+        case D3DCmd::Cmd_EndScene:
+            ImGuiManager::LogFrameEvent(FrameEvent::Replay_EndScene, sceneNum);
+            break;
+        case D3DCmd::Cmd_SetRenderTarget: {
+            StateDetail d;
+            d.kind = StateDetail::RenderTarget;
+            d.rt.color = (uintptr_t)cmd.rt.surface;
+            d.rt.depth = 0;
+            ImGuiManager::LogFrameEventDetailed(FrameEvent::Replay_SetRT, sceneNum, 0, d);
+            break;
+        }
+        case D3DCmd::Cmd_SetDepthStencilSurface: {
+            StateDetail d;
+            d.kind = StateDetail::RenderTarget;
+            d.rt.color = 0;
+            d.rt.depth = (uintptr_t)cmd.ds.surface;
+            ImGuiManager::LogFrameEventDetailed(FrameEvent::Replay_SetDS, sceneNum, 0, d);
+            break;
+        }
+        case D3DCmd::Cmd_SetViewport: {
+            StateDetail d;
+            d.kind = StateDetail::Viewport;
+            d.vp.x = cmd.vp.viewport.X;
+            d.vp.y = cmd.vp.viewport.Y;
+            d.vp.w = cmd.vp.viewport.Width;
+            d.vp.h = cmd.vp.viewport.Height;
+            d.vp.minZ = cmd.vp.viewport.MinZ;
+            d.vp.maxZ = cmd.vp.viewport.MaxZ;
+            ImGuiManager::LogFrameEventDetailed(FrameEvent::Replay_SetViewport, sceneNum, 0, d);
+            break;
+        }
+        case D3DCmd::Cmd_SetRenderState: {
+            StateDetail d;
+            d.kind = StateDetail::RenderState;
+            d.rs.state = cmd.rs.state;
+            d.rs.value = cmd.rs.value;
+            d.rs.prev = 0;
+            d.rs.changed = true;
+            ImGuiManager::LogFrameEventDetailed(FrameEvent::Replay_RS, sceneNum, 0, d);
+            break;
+        }
+        case D3DCmd::Cmd_SetTextureStageState: {
+            StateDetail d;
+            d.kind = StateDetail::TextureStageState;
+            d.tss.stage = cmd.tss.stage;
+            d.tss.state = cmd.tss.state;
+            d.tss.value = cmd.tss.value;
+            d.tss.prev = 0;
+            d.tss.changed = true;
+            ImGuiManager::LogFrameEventDetailed(FrameEvent::Replay_TSS, sceneNum, 0, d);
+            break;
+        }
+        case D3DCmd::Cmd_SetSamplerState: {
+            StateDetail d;
+            d.kind = StateDetail::None;
+            ImGuiManager::LogFrameEventDetailed(FrameEvent::Replay_SS, sceneNum, cmd.ss.state, d);
+            break;
+        }
+        case D3DCmd::Cmd_SetTransform: {
+            StateDetail d;
+            d.kind = StateDetail::Transform;
+            d.xform.type = cmd.xform.transformType;
+            memcpy(d.xform.m, &cmd.xform.matrix, 16 * sizeof(float));
+            ImGuiManager::LogFrameEventDetailed(FrameEvent::Replay_Transform, sceneNum, 0, d);
+            break;
+        }
+        case D3DCmd::Cmd_SetTexture: {
+            StateDetail d;
+            d.kind = StateDetail::Texture;
+            d.tex.stage = cmd.tex.stage;
+            d.tex.ptr = (uintptr_t)cmd.tex.tex;
+            ImGuiManager::LogFrameEventDetailed(FrameEvent::Replay_Texture, sceneNum, 0, d);
+            break;
+        }
+        case D3DCmd::Cmd_SetMaterial: {
+            StateDetail d;
+            d.kind = StateDetail::Material;
+            d.mat.dr = cmd.mat.material.Diffuse.r;
+            d.mat.dg = cmd.mat.material.Diffuse.g;
+            d.mat.db = cmd.mat.material.Diffuse.b;
+            d.mat.da = cmd.mat.material.Diffuse.a;
+            ImGuiManager::LogFrameEventDetailed(FrameEvent::Replay_Material, sceneNum, 0, d);
+            break;
+        }
+        case D3DCmd::Cmd_SetLight:
+            ImGuiManager::LogFrameEvent(FrameEvent::Replay_Light, sceneNum, cmd.light.index);
+            break;
+        case D3DCmd::Cmd_LightEnable: {
+            StateDetail d;
+            d.kind = StateDetail::Light;
+            d.light.index = cmd.lightEn.index;
+            d.light.enable = cmd.lightEn.enable;
+            ImGuiManager::LogFrameEventDetailed(FrameEvent::Replay_LightEnable, sceneNum, 0, d);
+            break;
+        }
+        case D3DCmd::Cmd_SetFVF: {
+            StateDetail d;
+            d.kind = StateDetail::VertexShader;
+            d.vs.fvf = cmd.fvf.fvf;
+            ImGuiManager::LogFrameEventDetailed(FrameEvent::Replay_FVF, sceneNum, 0, d);
+            break;
+        }
+        case D3DCmd::Cmd_SetStreamSource: {
+            StateDetail d;
+            d.kind = StateDetail::StreamSource;
+            d.ss.stream = cmd.streamSrc.stream;
+            d.ss.vb = (uintptr_t)cmd.streamSrc.vb;
+            d.ss.stride = cmd.streamSrc.stride;
+            ImGuiManager::LogFrameEventDetailed(FrameEvent::Replay_StreamSource, sceneNum, 0, d);
+            break;
+        }
+        case D3DCmd::Cmd_SetIndices: {
+            StateDetail d;
+            d.kind = StateDetail::IndexBuffer;
+            d.ib.ib = (uintptr_t)cmd.indices.ib;
+            ImGuiManager::LogFrameEventDetailed(FrameEvent::Replay_Indices, sceneNum, 0, d);
+            break;
+        }
+        case D3DCmd::Cmd_DrawIndexedPrimitive: {
+            StateDetail d;
+            d.kind = StateDetail::DrawCall;
+            d.dip.primCount = cmd.dip.primCount;
+            d.dip.vertCount = cmd.dip.numVerts;
+            d.dip.fvf = 0;
+            d.dip.vb = 0;
+            d.dip.ib = 0;
+            d.dip.tex0 = 0;
+            d.dip.zWrite = 0;
+            d.dip.cull = 0;
+            d.dip.alphaBlend = 0;
+            d.dip.alphaTest = 0;
+            d.dip.srcBlend = 0;
+            d.dip.destBlend = 0;
+            d.dip.vertBlend = 0;
+            ImGuiManager::LogFrameEventDetailed(FrameEvent::Replay_DIP, sceneNum, cmd.dip.primCount, d);
+            break;
+        }
+        case D3DCmd::Cmd_DrawPrimitive:
+            ImGuiManager::LogFrameEvent(FrameEvent::Replay_DP, sceneNum, cmd.dp.primCount);
+            break;
+        case D3DCmd::Cmd_SetVertexShader:
+        case D3DCmd::Cmd_SetPixelShader:
+        case D3DCmd::Cmd_SetVSConstantF:
+        case D3DCmd::Cmd_SetPSConstantF:
+        case D3DCmd::Cmd_SetVSConstantI:
+        case D3DCmd::Cmd_SetPSConstantI:
             break;
         }
     }

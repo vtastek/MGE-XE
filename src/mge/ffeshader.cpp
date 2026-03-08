@@ -2,6 +2,7 @@
 #include "ffeshader.h"
 #include "cullthread.h"
 #include "renderthread.h"
+#include "d3dcommandbuffer.h"
 #include "mge_tracy.h"
 #include "configuration.h"
 #include "support/log.h"
@@ -25,6 +26,9 @@
 using std::string;
 using std::stringstream;
 using std::unordered_map;
+
+// Per-stage command buffer set (defined in mged3d8device.cpp)
+extern D3DCommandBufferSet g_cmdBufferSet;
 
 IDirect3DDevice* FixedFunctionShader::device;
 ID3DXEffectPool* FixedFunctionShader::constantPool;
@@ -1591,7 +1595,53 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
 }
 
 // Internal rendering function that does the actual HLSL rendering
-void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, DWORD dirtyFlags, int callIndex) {
+// Resolve a D3DXHANDLE to register offset using GetConstantDesc
+static FixedFunctionShader::ConstReg resolveConstReg(ID3DXConstantTable* table, D3DXHANDLE handle) {
+    FixedFunctionShader::ConstReg cr;
+    if (table && handle) {
+        D3DXCONSTANT_DESC desc;
+        UINT count = 1;
+        if (SUCCEEDED(table->GetConstantDesc(handle, &desc, &count))) {
+            cr.reg = desc.RegisterIndex;
+            cr.count = desc.RegisterCount;
+            // D3DXRS_BOOL=0, D3DXRS_INT4=1, D3DXRS_FLOAT4=2, D3DXRS_SAMPLER=3
+            cr.regSet = (UINT)desc.RegisterSet;
+        }
+    }
+    return cr;
+}
+
+// Resolve a named constant to a register offset, storing result in cached
+static void resolveAndCache(ID3DXConstantTable* table, const char* name, FixedFunctionShader::ConstReg& cached) {
+    D3DXHANDLE h = table ? table->GetConstantByName(NULL, name) : (D3DXHANDLE)NULL;
+    cached = resolveConstReg(table, h);
+}
+
+// Write a transposed matrix to a command buffer or device
+static void setMatrixConstantF(D3DCommandBuffer* cmdBuf, IDirect3DDevice9* device, bool isVS, UINT reg, const D3DXMATRIX& matrix) {
+    D3DXMATRIX transposed;
+    D3DXMatrixTranspose(&transposed, &matrix);
+    if (cmdBuf) {
+        if (isVS) cmdBuf->recordSetVSConstantF(reg, (float*)&transposed, 4);
+        else cmdBuf->recordSetPSConstantF(reg, (float*)&transposed, 4);
+    } else {
+        if (isVS) device->SetVertexShaderConstantF(reg, (float*)&transposed, 4);
+        else device->SetPixelShaderConstantF(reg, (float*)&transposed, 4);
+    }
+}
+
+// Write float4 constants to command buffer or device
+static void setConstantF(D3DCommandBuffer* cmdBuf, IDirect3DDevice9* device, bool isVS, UINT reg, const float* data, UINT count) {
+    if (cmdBuf) {
+        if (isVS) cmdBuf->recordSetVSConstantF(reg, data, count);
+        else cmdBuf->recordSetPSConstantF(reg, data, count);
+    } else {
+        if (isVS) device->SetVertexShaderConstantF(reg, data, count);
+        else device->SetPixelShaderConstantF(reg, data, count);
+    }
+}
+
+void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, DWORD dirtyFlags, int callIndex, D3DCommandBuffer* cmdBuf) {
 
     // Process any completed async shader compilations
     processAsyncCompletions();
@@ -1820,6 +1870,18 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     // DXVK-optimized texture binding - only touches slots the shader actually uses
     bindShaderTextures(sk, rs);
 
+    // When building command buffer, snapshot bound textures into the buffer
+    // (bindShaderTextures sets device textures; we need them in the command buffer
+    //  so they replay correctly in order with other commands)
+    if (cmdBuf) {
+        for (DWORD slot = 0; slot < 6; slot++) {
+            IDirect3DBaseTexture9* boundTex = nullptr;
+            device->GetTexture(slot, &boundTex);
+            cmdBuf->recordSetTexture(slot, boundTex);
+            if (boundTex) boundTex->Release(); // GetTexture AddRef'd, recordSetTexture will AddRef again
+        }
+    }
+
     // Get current view matrix and compute inverse (needed for texture lights and shadows)
     // During replay, device may have UI view — use recorded game view instead
     D3DXMATRIX currentView;
@@ -1837,7 +1899,7 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     }
 
     // Set viewInverse matrix for texture-based lighting (always needed)
-    device->SetPixelShaderConstantF(18, (float*)&cachedInverseView, 4); // c18
+    setConstantF(cmdBuf, device, false, 18, (float*)&cachedInverseView, 4); // c18
 
     // Set shadow matrices if shadows are enabled
     if (sk.hasShadows) {
@@ -1852,12 +1914,12 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             shadowTransformValid = shadowMatricesValid;
         }
 
-        device->SetVertexShaderConstantF(20, (float*)&cachedViewToShadowLocal[0], 4); // c20-c23
-        device->SetVertexShaderConstantF(24, (float*)&cachedViewToShadowLocal[1], 4); // c24-c27
+        setConstantF(cmdBuf, device, true, 20, (float*)&cachedViewToShadowLocal[0], 4); // c20-c23
+        setConstantF(cmdBuf, device, true, 24, (float*)&cachedViewToShadowLocal[1], 4); // c24-c27
 
         // Set shadow resolution parameter
-        float shadowRcp = 1.0f / Configuration.DL.ShadowResolution;
-        device->SetPixelShaderConstantF(10, &shadowRcp, 1); // c10
+        float shadowRcpData[4] = { 1.0f / Configuration.DL.ShadowResolution, 0, 0, 0 };
+        setConstantF(cmdBuf, device, false, 10, shadowRcpData, 1); // c10
     }
 
 
@@ -1865,17 +1927,24 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     DWORD savedAlphaBlendEnable = 0, savedAlphaTestEnable = 0;
     DWORD savedZEnable = 0, savedZWriteEnable = 0;
     DWORD savedSpecularEnable = 0, savedLocalViewer = 0, savedNormalizeNormals = 0;
-    device->GetRenderState(D3DRS_ALPHABLENDENABLE, &savedAlphaBlendEnable);
-    device->GetRenderState(D3DRS_ALPHATESTENABLE, &savedAlphaTestEnable);
-    device->GetRenderState(D3DRS_ZENABLE, &savedZEnable);
-    device->GetRenderState(D3DRS_ZWRITEENABLE, &savedZWriteEnable);
-    device->GetRenderState(D3DRS_SPECULARENABLE, &savedSpecularEnable);
-    device->GetRenderState(D3DRS_LOCALVIEWER, &savedLocalViewer);
-    device->GetRenderState(D3DRS_NORMALIZENORMALS, &savedNormalizeNormals);
-    
+    if (!cmdBuf) {
+        device->GetRenderState(D3DRS_ALPHABLENDENABLE, &savedAlphaBlendEnable);
+        device->GetRenderState(D3DRS_ALPHATESTENABLE, &savedAlphaTestEnable);
+        device->GetRenderState(D3DRS_ZENABLE, &savedZEnable);
+        device->GetRenderState(D3DRS_ZWRITEENABLE, &savedZWriteEnable);
+        device->GetRenderState(D3DRS_SPECULARENABLE, &savedSpecularEnable);
+        device->GetRenderState(D3DRS_LOCALVIEWER, &savedLocalViewer);
+        device->GetRenderState(D3DRS_NORMALIZENORMALS, &savedNormalizeNormals);
+    }
+
     // Set shaders
-    device->SetVertexShader(hlslShader.vertexShader);
-    device->SetPixelShader(hlslShader.pixelShader);
+    if (cmdBuf) {
+        cmdBuf->recordSetVertexShader(hlslShader.vertexShader);
+        cmdBuf->recordSetPixelShader(hlslShader.pixelShader);
+    } else {
+        device->SetVertexShader(hlslShader.vertexShader);
+        device->SetPixelShader(hlslShader.pixelShader);
+    }
     
     // Use cached render state setting to minimize redundant SetRenderState calls
     // Depth and culling states
@@ -1888,37 +1957,62 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         zWriteEnable = rs->zWrite ? TRUE : FALSE;
     }
 
-    setCachedRenderState(device, D3DRS_ZENABLE, zEnable, materialCache.zEnable, materialCache.zEnableValid);
-    setCachedRenderState(device, D3DRS_ZWRITEENABLE, zWriteEnable, materialCache.zWriteEnable, materialCache.zWriteEnableValid);
-    setCachedRenderState(device, D3DRS_ZFUNC, D3DCMP_LESSEQUAL, materialCache.zFunc, materialCache.zFuncValid);
-    setCachedRenderState(device, D3DRS_CULLMODE, rs->cullMode, materialCache.cullMode, materialCache.cullModeValid);
+    if (cmdBuf) {
+        cmdBuf->recordSetRenderState(D3DRS_ZENABLE, zEnable);
+        cmdBuf->recordSetRenderState(D3DRS_ZWRITEENABLE, zWriteEnable);
+        cmdBuf->recordSetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+        cmdBuf->recordSetRenderState(D3DRS_CULLMODE, rs->cullMode);
+        cmdBuf->recordSetRenderState(D3DRS_SPECULARENABLE, FALSE);
+        cmdBuf->recordSetRenderState(D3DRS_LOCALVIEWER, FALSE);
+        cmdBuf->recordSetRenderState(D3DRS_NORMALIZENORMALS, FALSE);
+        cmdBuf->recordSetRenderState(D3DRS_ALPHABLENDENABLE, rs->blendEnable);
+        if (rs->blendEnable) {
+            cmdBuf->recordSetRenderState(D3DRS_SRCBLEND, rs->srcBlend);
+            cmdBuf->recordSetRenderState(D3DRS_DESTBLEND, rs->destBlend);
+        }
+        cmdBuf->recordSetRenderState(D3DRS_ALPHATESTENABLE, rs->alphaTest);
+        if (rs->alphaTest) {
+            cmdBuf->recordSetRenderState(D3DRS_ALPHAFUNC, rs->alphaFunc);
+            cmdBuf->recordSetRenderState(D3DRS_ALPHAREF, rs->alphaRef);
+        }
+        cmdBuf->recordSetFVF(rs->fvf);
+        cmdBuf->recordSetStreamSource(0, rs->vb, rs->vbOffset, rs->vbStride);
+        if (rs->ib) {
+            cmdBuf->recordSetIndices(rs->ib);
+        }
+    } else {
+        setCachedRenderState(device, D3DRS_ZENABLE, zEnable, materialCache.zEnable, materialCache.zEnableValid);
+        setCachedRenderState(device, D3DRS_ZWRITEENABLE, zWriteEnable, materialCache.zWriteEnable, materialCache.zWriteEnableValid);
+        setCachedRenderState(device, D3DRS_ZFUNC, D3DCMP_LESSEQUAL, materialCache.zFunc, materialCache.zFuncValid);
+        setCachedRenderState(device, D3DRS_CULLMODE, rs->cullMode, materialCache.cullMode, materialCache.cullModeValid);
 
-    // Disable DX8 specular pipeline that Morrowind.exe might have enabled - HLSL handles specular internally
-    setCachedRenderState(device, D3DRS_SPECULARENABLE, FALSE, materialCache.specularEnable, materialCache.specularEnableValid);
-    setCachedRenderState(device, D3DRS_LOCALVIEWER, FALSE, materialCache.localViewer, materialCache.localViewerValid);
-    setCachedRenderState(device, D3DRS_NORMALIZENORMALS, FALSE, materialCache.normalizeNormals, materialCache.normalizeNormalsValid);
+        // Disable DX8 specular pipeline that Morrowind.exe might have enabled - HLSL handles specular internally
+        setCachedRenderState(device, D3DRS_SPECULARENABLE, FALSE, materialCache.specularEnable, materialCache.specularEnableValid);
+        setCachedRenderState(device, D3DRS_LOCALVIEWER, FALSE, materialCache.localViewer, materialCache.localViewerValid);
+        setCachedRenderState(device, D3DRS_NORMALIZENORMALS, FALSE, materialCache.normalizeNormals, materialCache.normalizeNormalsValid);
 
-    // Alpha blending states
-    setCachedRenderState(device, D3DRS_ALPHABLENDENABLE, rs->blendEnable, materialCache.alphaBlendEnable, materialCache.alphaBlendEnableValid);
-    if (rs->blendEnable) {
-        setCachedRenderState(device, D3DRS_SRCBLEND, rs->srcBlend, materialCache.srcBlend, materialCache.srcBlendValid);
-        setCachedRenderState(device, D3DRS_DESTBLEND, rs->destBlend, materialCache.destBlend, materialCache.destBlendValid);
-    }
+        // Alpha blending states
+        setCachedRenderState(device, D3DRS_ALPHABLENDENABLE, rs->blendEnable, materialCache.alphaBlendEnable, materialCache.alphaBlendEnableValid);
+        if (rs->blendEnable) {
+            setCachedRenderState(device, D3DRS_SRCBLEND, rs->srcBlend, materialCache.srcBlend, materialCache.srcBlendValid);
+            setCachedRenderState(device, D3DRS_DESTBLEND, rs->destBlend, materialCache.destBlend, materialCache.destBlendValid);
+        }
 
-    // Alpha testing states
-    setCachedRenderState(device, D3DRS_ALPHATESTENABLE, rs->alphaTest, materialCache.alphaTestEnable, materialCache.alphaTestEnableValid);
-    if (rs->alphaTest) {
-        setCachedRenderState(device, D3DRS_ALPHAFUNC, rs->alphaFunc, materialCache.alphaFunc, materialCache.alphaFuncValid);
-        setCachedRenderState(device, D3DRS_ALPHAREF, rs->alphaRef, materialCache.alphaRef, materialCache.alphaRefValid);
-    }
+        // Alpha testing states
+        setCachedRenderState(device, D3DRS_ALPHATESTENABLE, rs->alphaTest, materialCache.alphaTestEnable, materialCache.alphaTestEnableValid);
+        if (rs->alphaTest) {
+            setCachedRenderState(device, D3DRS_ALPHAFUNC, rs->alphaFunc, materialCache.alphaFunc, materialCache.alphaFuncValid);
+            setCachedRenderState(device, D3DRS_ALPHAREF, rs->alphaRef, materialCache.alphaRef, materialCache.alphaRefValid);
+        }
 
-    // Set vertex format (legacy DX8 FVF - HLSL input semantics handle layout internally)
-    setCachedFVF(device, rs->fvf, materialCache.fvf, materialCache.fvfValid);
-    
-    // Set vertex and index buffers like the original system
-    device->SetStreamSource(0, rs->vb, rs->vbOffset, rs->vbStride);
-    if (rs->ib) {
-        device->SetIndices(rs->ib);
+        // Set vertex format (legacy DX8 FVF - HLSL input semantics handle layout internally)
+        setCachedFVF(device, rs->fvf, materialCache.fvf, materialCache.fvfValid);
+
+        // Set vertex and index buffers like the original system
+        device->SetStreamSource(0, rs->vb, rs->vbOffset, rs->vbStride);
+        if (rs->ib) {
+            device->SetIndices(rs->ib);
+        }
     }
 
     // Set up matrices using constant tables (like the Combined shader expects)
@@ -1935,23 +2029,67 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         device->GetTransform(D3DTS_VIEW, &viewMatrix);
         device->GetTransform(D3DTS_WORLD, &worldMatrix);
     }
-    
+
     // During replay, use recorded combined matrices; during normal rendering, calculate them
     D3DXMATRIX worldViewProj, worldView;
     if (isReplaying) {
-        // Use pre-recorded combined matrices to avoid any matrix timing issues
         worldViewProj = rs->worldTransforms[0] * frameBuffers[recordingBuffer].view * frameBuffers[recordingBuffer].proj;
         worldView = rs->worldTransforms[0] * frameBuffers[recordingBuffer].view;
     } else {
-        // Normal rendering - calculate from current matrices
         worldViewProj = worldMatrix * viewMatrix * projMatrix;
         worldView = worldMatrix * viewMatrix;
     }
-    
-    // Use constant tables to set matrices with cached handles (no per-draw string lookups)
-    // Constant-setting failures are non-fatal: WorldViewProj is the critical transform,
-    // other constants (View, Proj, World, etc.) use stale values if SetMatrix fails.
-    if (hlslShader.vsConstantTable) {
+
+    // Set vertex shader constants — command buffer path uses resolved registers,
+    // direct path uses constant tables (SetMatrix transposes internally)
+    if (cmdBuf) {
+        if (hlslShader.regWorldViewProj.reg != REG_INVALID)
+            setMatrixConstantF(cmdBuf, device, true, hlslShader.regWorldViewProj.reg, worldViewProj);
+        if (hlslShader.regView.reg != REG_INVALID)
+            setMatrixConstantF(cmdBuf, device, true, hlslShader.regView.reg, viewMatrix);
+        if (hlslShader.regProj.reg != REG_INVALID)
+            setMatrixConstantF(cmdBuf, device, true, hlslShader.regProj.reg, projMatrix);
+        if (hlslShader.regWorld.reg != REG_INVALID)
+            setMatrixConstantF(cmdBuf, device, true, hlslShader.regWorld.reg, rs->worldTransforms[0]);
+        if (hlslShader.regWorldView.reg != REG_INVALID)
+            setMatrixConstantF(cmdBuf, device, true, hlslShader.regWorldView.reg, worldView);
+
+        if (hlslShader.regVertexBlendPalette.reg != REG_INVALID) {
+            D3DXMATRIX blendMatrices[4];
+            if (rs->vertexBlendState > 0) {
+                for (int i = 0; i < 4; i++)
+                    blendMatrices[i] = rs->worldTransforms[i] * viewMatrix;
+            } else {
+                blendMatrices[0] = worldView;
+                memset(&blendMatrices[1], 0, sizeof(D3DXMATRIX) * 3);
+            }
+            // SetMatrixArray transposes each matrix — we must do the same
+            D3DXMATRIX transposed[4];
+            for (int i = 0; i < 4; i++)
+                D3DXMatrixTranspose(&transposed[i], &blendMatrices[i]);
+            cmdBuf->recordSetVSConstantF(hlslShader.regVertexBlendPalette.reg, (float*)transposed, 16);
+        }
+
+        if (hlslShader.regVertexBlendState.reg != REG_INVALID) {
+            float blendState[4] = { (float)rs->vertexBlendState, 0, 0, 0 };
+            cmdBuf->recordSetVSConstantF(hlslShader.regVertexBlendState.reg, blendState, 1);
+        }
+
+        if (hlslShader.regShadowWorldViewProj.reg != REG_INVALID) {
+            D3DXMATRIX shadowWVP[2];
+            if (isReplaying && s_activeShadowVP) {
+                shadowWVP[0] = rs->worldTransforms[0] * s_activeShadowVP[0];
+                shadowWVP[1] = rs->worldTransforms[0] * s_activeShadowVP[1];
+            } else {
+                shadowWVP[0] = rs->shadowWorldViewProj[0];
+                shadowWVP[1] = rs->shadowWorldViewProj[1];
+            }
+            D3DXMATRIX transposed[2];
+            D3DXMatrixTranspose(&transposed[0], &shadowWVP[0]);
+            D3DXMatrixTranspose(&transposed[1], &shadowWVP[1]);
+            cmdBuf->recordSetVSConstantF(hlslShader.regShadowWorldViewProj.reg, (float*)transposed, 8);
+        }
+    } else if (hlslShader.vsConstantTable) {
         try {
             if (hlslShader.hWorldViewProj) {
                 hlslShader.vsConstantTable->SetMatrix(device, hlslShader.hWorldViewProj, &worldViewProj);
@@ -1964,8 +2102,6 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             if (hlslShader.hProj) {
                 HRESULT hr = hlslShader.vsConstantTable->SetMatrix(device, hlslShader.hProj, &projMatrix);
                 if (FAILED(hr)) {
-                    // Constant table SetMatrix failed — bypass it with direct register write
-                    // SetMatrix transposes internally, so we must transpose before SetVertexShaderConstantF
                     D3DXMATRIX projT;
                     D3DXMatrixTranspose(&projT, &projMatrix);
                     device->SetVertexShaderConstantF(hlslShader.projRegister, (float*)&projT, 4);
@@ -2005,8 +2141,6 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             }
 
             if (hlslShader.hShadowWorldViewProj) {
-                // During replay, recompute shadow matrices from current frame's shadow VP
-                // (baked values from recording used previous frame's shadow VP → shaking)
                 if (isReplaying && s_activeShadowVP) {
                     D3DXMATRIX currentShadowWVP[2];
                     currentShadowWVP[0] = rs->worldTransforms[0] * s_activeShadowVP[0];
@@ -2020,130 +2154,355 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             LOG::logline("!! HLSL Vertex shader constant table access failed - shader may have been edited");
         }
     }
-    // Set pixel shader constants using cached handles (no per-draw string lookups)
-    // Constant-setting failures are non-fatal: stale material values are acceptable.
-    if (hlslShader.psConstantTable) {
+    // Compute lighting data (shared between cmdBuf and device paths)
+    const size_t MaxLights = 8;
+    D3DXVECTOR4 bufferDiffuse[MaxLights];
+    float bufferAmbient[MaxLights];
+    float bufferPosition[3 * MaxLights];
+    float bufferFalloffQuadratic[MaxLights], bufferFalloffLinear[MaxLights], bufferFalloffConstant;
+    bool needPointLightBuffers = (sk.lightMode == 1 || sk.lightMode == 2);
+
+    if (needPointLightBuffers) {
+        memset(&bufferDiffuse, 0, sizeof(bufferDiffuse));
+        memset(&bufferAmbient, 0, sizeof(bufferAmbient));
+        memset(&bufferPosition, 0, sizeof(bufferPosition));
+        memset(&bufferFalloffQuadratic, 0, sizeof(bufferFalloffQuadratic));
+        memset(&bufferFalloffLinear, 0, sizeof(bufferFalloffLinear));
+    }
+    bufferFalloffConstant = 0.33;
+
+    RGBVECTOR sunDiffuse(0, 0, 0), ambient = lightrs->globalAmbient;
+    D3DVECTOR sunDirection = {0, 0, 1};
+    size_t n = std::min(lightrs->active.size(), MaxLights), pointLightCount = 0;
+    for (; n --> 0; ) {
+        DWORD i = lightrs->active[n];
+        const LightState::Light* light = &lightrs->lights.find(i)->second;
+
+        if (lightrs->lightsTransformed.find(i) == lightrs->lightsTransformed.end()) {
+            if (light->type == D3DLIGHT_DIRECTIONAL) {
+                D3DXVec3TransformNormal((D3DXVECTOR3*)&light->viewspacePos, (D3DXVECTOR3*)&light->position, &rs->viewTransform);
+            } else {
+                D3DXVec3TransformCoord((D3DXVECTOR3*)&light->viewspacePos, (D3DXVECTOR3*)&light->position, &rs->viewTransform);
+            }
+            lightrs->lightsTransformed[i] = true;
+        }
+
+        if (light->type == D3DLIGHT_POINT && needPointLightBuffers) {
+            memcpy(&bufferDiffuse[pointLightCount], &light->diffuse, sizeof(light->diffuse));
+            bufferPosition[pointLightCount] = light->viewspacePos.x;
+            bufferPosition[pointLightCount + MaxLights] = light->viewspacePos.y;
+            bufferPosition[pointLightCount + 2*MaxLights] = light->viewspacePos.z;
+
+            if (light->falloff.x > 0) {
+                bufferFalloffConstant = light->falloff.x;
+                bufferFalloffLinear[pointLightCount] = light->falloff.y;
+                bufferFalloffQuadratic[pointLightCount] = light->falloff.z;
+            } else if (light->falloff.z > 0) {
+                bufferDiffuse[pointLightCount].x *= bufferFalloffConstant;
+                bufferDiffuse[pointLightCount].y *= bufferFalloffConstant;
+                bufferDiffuse[pointLightCount].z *= bufferFalloffConstant;
+                bufferAmbient[pointLightCount] = 1.0f + 1e-4f / sqrt(light->falloff.z);
+                bufferFalloffQuadratic[pointLightCount] = bufferFalloffConstant * light->falloff.z;
+            } else if (light->falloff.y == 0.10000001f) {
+                bufferFalloffQuadratic[pointLightCount] = 5e-5;
+            } else if (light->falloff.y > 0) {
+                float brightness = 0.25f + 1e-4f / light->falloff.y;
+                bufferDiffuse[pointLightCount].x = brightness;
+                bufferDiffuse[pointLightCount].y = brightness;
+                bufferDiffuse[pointLightCount].z = brightness;
+                bufferAmbient[pointLightCount] = 1.0;
+                bufferFalloffQuadratic[pointLightCount] = 0.5555f * light->falloff.y * light->falloff.y;
+                bufferPosition[pointLightCount + 2*MaxLights] += 25.0;
+            }
+            ++pointLightCount;
+        } else if (light->type == D3DLIGHT_DIRECTIONAL) {
+            sunDiffuse = light->diffuse;
+            sunDirection = light->viewspacePos;
+            ambient.r += light->ambient.x;
+            ambient.g += light->ambient.y;
+            ambient.b += light->ambient.z;
+        }
+    }
+
+    sunDiffuse *= sunMultiplier;
+    ambient *= ambMultiplier;
+
+    // Check full-bright ambient (Morrowind particle effect mode)
+    DWORD checkAmbient;
+    device->GetRenderState(D3DRS_AMBIENT, &checkAmbient);
+    if (checkAmbient == 0xffffffff) {
+        ambient.r = ambient.g = ambient.b = 1.25;
+        sunDiffuse.r = sunDiffuse.g = sunDiffuse.b = 0.0;
+    }
+
+    // Get fog color (needed by both paths)
+    DWORD fogColorDword = 0x808080FF;
+    device->GetRenderState(D3DRS_FOGCOLOR, &fogColorDword);
+    float fogColor[4] = {
+        ((fogColorDword >> 16) & 0xFF) / 255.0f,
+        ((fogColorDword >> 8) & 0xFF) / 255.0f,
+        (fogColorDword & 0xFF) / 255.0f,
+        1.0f
+    };
+
+    // Set pixel shader constants
+    if (cmdBuf) {
+        // Command buffer path: use resolved registers, write to cmdBuf
+        // Resolve dynamic constants on first use for this shader variant
+        if (!hlslShader.dynamicConstsResolved && hlslShader.psConstantTable && hlslShader.vsConstantTable) {
+            resolveAndCache(hlslShader.psConstantTable, "shadingMode", hlslShader.regShadingMode);
+            resolveAndCache(hlslShader.psConstantTable, "fogColNear", hlslShader.regFogColNear);
+            resolveAndCache(hlslShader.psConstantTable, "materialAlpha", hlslShader.regMaterialAlpha);
+            resolveAndCache(hlslShader.psConstantTable, "alphaRef", hlslShader.regAlphaRef);
+            resolveAndCache(hlslShader.psConstantTable, "hasVCol", hlslShader.regHasVCol);
+            resolveAndCache(hlslShader.psConstantTable, "hasAlpha", hlslShader.regHasAlpha);
+            resolveAndCache(hlslShader.vsConstantTable, "hasBones", hlslShader.regHasBones);
+            resolveAndCache(hlslShader.vsConstantTable, "hasAlpha", hlslShader.regHasAlphaVS);
+            resolveAndCache(hlslShader.vsConstantTable, "texgenTransform", hlslShader.regTexgenTransform);
+            resolveAndCache(hlslShader.psConstantTable, "bumpMatrix", hlslShader.regBumpMatrix);
+            resolveAndCache(hlslShader.psConstantTable, "bumpLumiScaleBias", hlslShader.regBumpLumiScaleBias);
+            resolveAndCache(hlslShader.psConstantTable, "PCF_penumbraScale", hlslShader.regPCFPenumbraScale);
+            resolveAndCache(hlslShader.psConstantTable, "PCF_minPenumbra", hlslShader.regPCFMinPenumbra);
+            resolveAndCache(hlslShader.psConstantTable, "PCF_maxPenumbra", hlslShader.regPCFMaxPenumbra);
+            resolveAndCache(hlslShader.psConstantTable, "PCF_bias", hlslShader.regPCFBias);
+            resolveAndCache(hlslShader.psConstantTable, "PCF_bias2", hlslShader.regPCFBias2);
+            resolveAndCache(hlslShader.psConstantTable, "PCF_slopeBias", hlslShader.regPCFSlopeBias);
+            resolveAndCache(hlslShader.vsConstantTable, "windVec", hlslShader.regWindVec);
+            resolveAndCache(hlslShader.vsConstantTable, "time", hlslShader.regTime);
+            resolveAndCache(hlslShader.psConstantTable, "normres", hlslShader.regNormres);
+            hlslShader.dynamicConstsResolved = true;
+        }
+
+        // Material constants
+        if (hlslShader.regMaterialDiffuse.reg != REG_INVALID)
+            cmdBuf->recordSetPSConstantF(hlslShader.regMaterialDiffuse.reg, (float*)&frs->material.diffuse, 1);
+        if (hlslShader.regMaterialAmbient.reg != REG_INVALID)
+            cmdBuf->recordSetPSConstantF(hlslShader.regMaterialAmbient.reg, (float*)&frs->material.ambient, 1);
+        if (hlslShader.regMaterialEmissive.reg != REG_INVALID)
+            cmdBuf->recordSetPSConstantF(hlslShader.regMaterialEmissive.reg, (float*)&frs->material.emissive, 1);
+
+        // Sun + ambient
+        if (hlslShader.regLightSunDirection.reg != REG_INVALID) {
+            float v[4] = { sunDirection.x, sunDirection.y, sunDirection.z, 0 };
+            cmdBuf->recordSetPSConstantF(hlslShader.regLightSunDirection.reg, v, 1);
+        }
+        if (hlslShader.regLightSunDiffuse.reg != REG_INVALID) {
+            float v[4] = { sunDiffuse.r, sunDiffuse.g, sunDiffuse.b, 0 };
+            cmdBuf->recordSetPSConstantF(hlslShader.regLightSunDiffuse.reg, v, 1);
+        }
+        if (hlslShader.regLightSceneAmbient.reg != REG_INVALID) {
+            float v[4] = { ambient.r, ambient.g, ambient.b, 0 };
+            cmdBuf->recordSetPSConstantF(hlslShader.regLightSceneAmbient.reg, v, 1);
+        }
+
+        // Point lights
+        if (needPointLightBuffers) {
+            if (hlslShader.regLightDiffuse.reg != REG_INVALID)
+                cmdBuf->recordSetPSConstantF(hlslShader.regLightDiffuse.reg, (float*)bufferDiffuse, MaxLights);
+            if (hlslShader.regLightPosition.reg != REG_INVALID) {
+                // HLSL float3[8] = 8 registers, each float3 padded to float4
+                float hlslLightPositions[MaxLights * 4];
+                for (int i = 0; i < (int)MaxLights; i++) {
+                    hlslLightPositions[i * 4 + 0] = bufferPosition[i];
+                    hlslLightPositions[i * 4 + 1] = bufferPosition[i + MaxLights];
+                    hlslLightPositions[i * 4 + 2] = bufferPosition[i + 2*MaxLights];
+                    hlslLightPositions[i * 4 + 3] = 0.0f;
+                }
+                cmdBuf->recordSetPSConstantF(hlslShader.regLightPosition.reg, hlslLightPositions, MaxLights);
+            }
+            if (hlslShader.regLightAmbient.reg != REG_INVALID) {
+                // HLSL float[8] = 8 registers, each scalar padded to float4
+                float paddedAmbient[MaxLights * 4];
+                for (int i = 0; i < (int)MaxLights; i++) {
+                    paddedAmbient[i * 4 + 0] = bufferAmbient[i];
+                    paddedAmbient[i * 4 + 1] = 0.0f;
+                    paddedAmbient[i * 4 + 2] = 0.0f;
+                    paddedAmbient[i * 4 + 3] = 0.0f;
+                }
+                cmdBuf->recordSetPSConstantF(hlslShader.regLightAmbient.reg, paddedAmbient, MaxLights);
+            }
+            if (hlslShader.regPointLightCount.reg != REG_INVALID) {
+                // D3D9 loop instruction format: {count, initialValue, step, 0}
+                // D3DXRS_INT4 = 1
+                if (hlslShader.regPointLightCount.regSet == 1) {
+                    int iv[4] = { (int)pointLightCount, 0, 1, 0 };
+                    cmdBuf->recordSetPSConstantI(hlslShader.regPointLightCount.reg, iv, 1);
+                } else {
+                    float v[4] = { (float)(int)pointLightCount, 0, 0, 0 };
+                    cmdBuf->recordSetPSConstantF(hlslShader.regPointLightCount.reg, v, 1);
+                }
+            }
+            if (hlslShader.regLightFalloffQuadratic.reg != REG_INVALID) {
+                // HLSL float[8] = 8 registers, each scalar padded to float4
+                float paddedQuadratic[MaxLights * 4];
+                for (int i = 0; i < (int)MaxLights; i++) {
+                    paddedQuadratic[i * 4 + 0] = ((size_t)i < pointLightCount) ? bufferFalloffQuadratic[i] : 0.0f;
+                    paddedQuadratic[i * 4 + 1] = 0.0f;
+                    paddedQuadratic[i * 4 + 2] = 0.0f;
+                    paddedQuadratic[i * 4 + 3] = 0.0f;
+                }
+                cmdBuf->recordSetPSConstantF(hlslShader.regLightFalloffQuadratic.reg, paddedQuadratic, MaxLights);
+            }
+            if (hlslShader.regLightFalloffConstant.reg != REG_INVALID) {
+                float v[4] = { bufferFalloffConstant, 0, 0, 0 };
+                cmdBuf->recordSetPSConstantF(hlslShader.regLightFalloffConstant.reg, v, 1);
+            }
+        }
+
+        // Per-object light texture parameters for mode 3
+        if (sk.lightMode == 3 && callIndex >= 0 && callIndex < (int)perObjectLightInfo.size()) {
+            const auto& li = perObjectLightInfo[callIndex];
+            float lightParams[4] = { (float)li.lightCount, perObjectTexelSize, (float)li.texelOffset, 0.0f };
+            cmdBuf->recordSetPSConstantF(50, lightParams, 1);
+        }
+
+        // Dynamic PS constants
+        if (hlslShader.regShadingMode.reg != REG_INVALID) {
+            float v[4] = { 0, 0, (float)sk.vertexMaterial, 0 };
+            cmdBuf->recordSetPSConstantF(hlslShader.regShadingMode.reg, v, 1);
+        }
+        if (hlslShader.regShadowRcpRes.reg != REG_INVALID) {
+            float v[4] = { 1.0f / Configuration.DL.ShadowResolution, 0, 0, 0 };
+            cmdBuf->recordSetPSConstantF(hlslShader.regShadowRcpRes.reg, v, 1);
+        }
+        if (hlslShader.regPCFFilterSize.reg != REG_INVALID) {
+            float v[4] = { ImGuiManager::GetPCFFilterSize(), 0, 0, 0 };
+            cmdBuf->recordSetPSConstantF(hlslShader.regPCFFilterSize.reg, v, 1);
+        }
+        if (hlslShader.regPCFPenumbraScale.reg != REG_INVALID) {
+            float v[4] = { ImGuiManager::GetPCFPenumbraScale(), 0, 0, 0 };
+            cmdBuf->recordSetPSConstantF(hlslShader.regPCFPenumbraScale.reg, v, 1);
+        }
+        if (hlslShader.regPCFMinPenumbra.reg != REG_INVALID) {
+            float v[4] = { ImGuiManager::GetPCFMinPenumbra(), 0, 0, 0 };
+            cmdBuf->recordSetPSConstantF(hlslShader.regPCFMinPenumbra.reg, v, 1);
+        }
+        if (hlslShader.regPCFMaxPenumbra.reg != REG_INVALID) {
+            float v[4] = { ImGuiManager::GetPCFMaxPenumbra(), 0, 0, 0 };
+            cmdBuf->recordSetPSConstantF(hlslShader.regPCFMaxPenumbra.reg, v, 1);
+        }
+        if (hlslShader.regPCFBias.reg != REG_INVALID) {
+            float v[4] = { ImGuiManager::GetPCFBias(), 0, 0, 0 };
+            cmdBuf->recordSetPSConstantF(hlslShader.regPCFBias.reg, v, 1);
+        }
+        if (hlslShader.regPCFBias2.reg != REG_INVALID) {
+            float v[4] = { ImGuiManager::GetPCFBias2(), 0, 0, 0 };
+            cmdBuf->recordSetPSConstantF(hlslShader.regPCFBias2.reg, v, 1);
+        }
+        if (hlslShader.regPCFSlopeBias.reg != REG_INVALID) {
+            float v[4] = { ImGuiManager::GetPCFSlopeBias(), 0, 0, 0 };
+            cmdBuf->recordSetPSConstantF(hlslShader.regPCFSlopeBias.reg, v, 1);
+        }
+        cmdBuf->recordSetPSConstantF(hlslShader.regFogColNear.reg != REG_INVALID ? hlslShader.regFogColNear.reg : 255, fogColor, 1);
+
+        // VS dynamic constants
+        if (hlslShader.regTexgenTransform.reg != REG_INVALID) {
+            D3DXMATRIX identity;
+            D3DXMatrixIdentity(&identity);
+            setMatrixConstantF(cmdBuf, device, true, hlslShader.regTexgenTransform.reg, identity);
+        }
+        if (hlslShader.regHasBones.reg != REG_INVALID) {
+            float v[4] = { rs->vertexBlendState > 0 ? 1.0f : 0.0f, 0, 0, 0 };
+            cmdBuf->recordSetVSConstantF(hlslShader.regHasBones.reg, v, 1);
+        }
+        if (hlslShader.regHasAlphaVS.reg != REG_INVALID) {
+            float v[4] = { rs->alphaTest ? 1.0f : 0.0f, 0, 0, 0 };
+            cmdBuf->recordSetVSConstantF(hlslShader.regHasAlphaVS.reg, v, 1);
+        }
+        if (hlslShader.regWindVec.reg != REG_INVALID) {
+            static float smoothWind[2] = {0, 0};
+            if (!MWBridge::get()->IsMenu()) {
+                const float f = 0.02f;
+                const float* wind = MWBridge::get()->GetWindVector();
+                smoothWind[0] += f * (1.0f * wind[0] - smoothWind[0]);
+                smoothWind[1] += f * (1.0f * wind[1] - smoothWind[1]);
+            }
+            float v[4] = { smoothWind[0], smoothWind[1], 0, 0 };
+            cmdBuf->recordSetVSConstantF(hlslShader.regWindVec.reg, v, 1);
+        }
+        if (hlslShader.regTime.reg != REG_INVALID) {
+            float v[4] = { MWBridge::get()->simulationTime(), 0, 0, 0 };
+            cmdBuf->recordSetVSConstantF(hlslShader.regTime.reg, v, 1);
+        }
+
+        // PS misc constants
+        if (hlslShader.regBumpMatrix.reg != REG_INVALID) {
+            float v[4] = { 1, 0, 0, 1 };
+            cmdBuf->recordSetPSConstantF(hlslShader.regBumpMatrix.reg, v, 1);
+        }
+        if (hlslShader.regBumpLumiScaleBias.reg != REG_INVALID) {
+            float v[4] = { 1, 0, 0, 0 };
+            cmdBuf->recordSetPSConstantF(hlslShader.regBumpLumiScaleBias.reg, v, 1);
+        }
+        if (hlslShader.regHasAlpha.reg != REG_INVALID) {
+            float v[4] = { 0, 0, 0, 0 };
+            cmdBuf->recordSetPSConstantF(hlslShader.regHasAlpha.reg, v, 1);
+        }
+        if (hlslShader.regHasVCol.reg != REG_INVALID) {
+            float v[4] = { (rs->fvf & D3DFVF_DIFFUSE) ? 1.0f : 0.0f, 0, 0, 0 };
+            cmdBuf->recordSetPSConstantF(hlslShader.regHasVCol.reg, v, 1);
+        }
+        if (hlslShader.regMaterialAlpha.reg != REG_INVALID) {
+            float v[4] = { frs->material.diffuse.a, 0, 0, 0 };
+            cmdBuf->recordSetPSConstantF(hlslShader.regMaterialAlpha.reg, v, 1);
+        }
+        if (hlslShader.regAlphaRef.reg != REG_INVALID) {
+            float v[4] = { rs->alphaRef / 255.0f, 0, 0, 0 };
+            cmdBuf->recordSetPSConstantF(hlslShader.regAlphaRef.reg, v, 1);
+        }
+
+        // Normres for paramH textures
+        if (sk.hasParamH && hlslShader.regNormres.reg != REG_INVALID) {
+            IDirect3DBaseTexture9* normalTexture;
+            device->GetTexture(2, &normalTexture);
+            if (normalTexture && normalTexture->GetType() == D3DRTYPE_TEXTURE) {
+                IDirect3DTexture9* tex = static_cast<IDirect3DTexture9*>(normalTexture);
+                D3DXVECTOR2 normres;
+                auto cacheIt = textureResolutionCache.find(tex);
+                if (cacheIt != textureResolutionCache.end()) {
+                    normres = cacheIt->second;
+                } else {
+                    D3DSURFACE_DESC desc;
+                    if (SUCCEEDED(tex->GetLevelDesc(0, &desc))) {
+                        normres = D3DXVECTOR2((float)desc.Width, (float)desc.Height);
+                        textureResolutionCache[tex] = normres;
+                    } else {
+                        normres = D3DXVECTOR2(1.0f, 1.0f);
+                    }
+                }
+                float v[4] = { normres.x, normres.y, 0, 0 };
+                cmdBuf->recordSetPSConstantF(hlslShader.regNormres.reg, v, 1);
+                normalTexture->Release();
+            }
+        }
+    } else if (hlslShader.psConstantTable) {
+        // Device path: use constant tables (SetMatrix transposes internally)
         try {
             if (hlslShader.hMaterialDiffuse) {
                 hlslShader.psConstantTable->SetVector(device, hlslShader.hMaterialDiffuse, (D3DXVECTOR4*)&frs->material.diffuse);
             }
-
             if (hlslShader.hMaterialAmbient) {
                 hlslShader.psConstantTable->SetVector(device, hlslShader.hMaterialAmbient, (D3DXVECTOR4*)&frs->material.ambient);
             }
-
             if (hlslShader.hMaterialEmissive) {
                 hlslShader.psConstantTable->SetVector(device, hlslShader.hMaterialEmissive, (D3DXVECTOR4*)&frs->material.emissive);
             }
-        // Set up lighting — extract sun + ambient for all modes, point lights only for modes 1-2
-        const size_t MaxLights = 8;
-        D3DXVECTOR4 bufferDiffuse[MaxLights];
-        float bufferAmbient[MaxLights];
-        float bufferPosition[3 * MaxLights];
-        float bufferFalloffQuadratic[MaxLights], bufferFalloffLinear[MaxLights], bufferFalloffConstant;
-        bool needPointLightBuffers = (sk.lightMode == 1 || sk.lightMode == 2);
-
-        if (needPointLightBuffers) {
-            memset(&bufferDiffuse, 0, sizeof(bufferDiffuse));
-            memset(&bufferAmbient, 0, sizeof(bufferAmbient));
-            memset(&bufferPosition, 0, sizeof(bufferPosition));
-            memset(&bufferFalloffQuadratic, 0, sizeof(bufferFalloffQuadratic));
-            memset(&bufferFalloffLinear, 0, sizeof(bufferFalloffLinear));
-        }
-        bufferFalloffConstant = 0.33;
-
-        // Check each active light
-        RGBVECTOR sunDiffuse(0, 0, 0), ambient = lightrs->globalAmbient;
-        D3DVECTOR sunDirection = {0, 0, 1};
-        size_t n = std::min(lightrs->active.size(), MaxLights), pointLightCount = 0;
-        for (; n --> 0; ) {
-            DWORD i = lightrs->active[n];
-            const LightState::Light* light = &lightrs->lights.find(i)->second;
-
-            // Transform to view space if not transformed this frame
-            if (lightrs->lightsTransformed.find(i) == lightrs->lightsTransformed.end()) {
-                if (light->type == D3DLIGHT_DIRECTIONAL) {
-                    D3DXVec3TransformNormal((D3DXVECTOR3*)&light->viewspacePos, (D3DXVECTOR3*)&light->position, &rs->viewTransform);
-                } else {
-                    D3DXVec3TransformCoord((D3DXVECTOR3*)&light->viewspacePos, (D3DXVECTOR3*)&light->position, &rs->viewTransform);
-                }
-
-                lightrs->lightsTransformed[i] = true;
-            }
-
-            if (light->type == D3DLIGHT_POINT && needPointLightBuffers) {
-                memcpy(&bufferDiffuse[pointLightCount], &light->diffuse, sizeof(light->diffuse));
-
-                // Scatter position vectors for vectorization
-                bufferPosition[pointLightCount] = light->viewspacePos.x;
-                bufferPosition[pointLightCount + MaxLights] = light->viewspacePos.y;
-                bufferPosition[pointLightCount + 2*MaxLights] = light->viewspacePos.z;
-
-                // Scatter attenuation factors for vectorization (match Effect path)
-                if (light->falloff.x > 0) {
-                    bufferFalloffConstant = light->falloff.x;
-                    bufferFalloffLinear[pointLightCount] = light->falloff.y;
-                    bufferFalloffQuadratic[pointLightCount] = light->falloff.z;
-                } else if (light->falloff.z > 0) {
-                    bufferDiffuse[pointLightCount].x *= bufferFalloffConstant;
-                    bufferDiffuse[pointLightCount].y *= bufferFalloffConstant;
-                    bufferDiffuse[pointLightCount].z *= bufferFalloffConstant;
-                    bufferAmbient[pointLightCount] = 1.0f + 1e-4f / sqrt(light->falloff.z);
-                    bufferFalloffQuadratic[pointLightCount] = bufferFalloffConstant * light->falloff.z;
-                } else if (light->falloff.y == 0.10000001f) {
-                    bufferFalloffQuadratic[pointLightCount] = 5e-5;
-                } else if (light->falloff.y > 0) {
-                    float brightness = 0.25f + 1e-4f / light->falloff.y;
-                    bufferDiffuse[pointLightCount].x = brightness;
-                    bufferDiffuse[pointLightCount].y = brightness;
-                    bufferDiffuse[pointLightCount].z = brightness;
-                    bufferAmbient[pointLightCount] = 1.0;
-                    bufferFalloffQuadratic[pointLightCount] = 0.5555f * light->falloff.y * light->falloff.y;
-                    bufferPosition[pointLightCount + 2*MaxLights] += 25.0;
-                }
-
-                ++pointLightCount;
-            } else if (light->type == D3DLIGHT_DIRECTIONAL) {
-                sunDiffuse = light->diffuse;
-                sunDirection = light->viewspacePos;  // Already transformed to view space
-                ambient.r += light->ambient.x;
-                ambient.g += light->ambient.y;
-                ambient.b += light->ambient.z;
-            }
-        }
-
-        // Apply light multipliers, for HDR light levels
-        sunDiffuse *= sunMultiplier;
-        ambient *= ambMultiplier;
-
-        // Special case, check if ambient state is pure white (distant land does not record this for a reason)
-        // Morrowind temporarily sets this for full-bright particle effects
-        DWORD checkAmbient;
-        device->GetRenderState(D3DRS_AMBIENT, &checkAmbient);
-        if (checkAmbient == 0xffffffff) {
-            ambient.r = ambient.g = ambient.b = 1.25;
-            sunDiffuse.r = sunDiffuse.g = sunDiffuse.b = 0.0;
-        }
 
         // Sun + ambient constants (all modes)
         if (hlslShader.hLightSunDirection) {
             hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightSunDirection, (const float*)&sunDirection, 3);
         }
-
         if (hlslShader.hLightSunDiffuse) {
             hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightSunDiffuse, (const float*)&sunDiffuse, 3);
         }
-
         if (hlslShader.hLightSceneAmbient) {
             hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightSceneAmbient, (const float*)&ambient, 3);
         }
 
         // Point light uniforms — only for lightMode 1 (single) and 2 (few loop)
         if (needPointLightBuffers) {
-            if (hlslShader.hLightDiffuse) {
+            if (hlslShader.hLightDiffuse)
                 hlslShader.psConstantTable->SetVectorArray(device, hlslShader.hLightDiffuse, bufferDiffuse, MaxLights);
-            }
-
             if (hlslShader.hLightPosition) {
                 D3DXVECTOR3 hlslLightPositions[MaxLights];
                 for (int i = 0; i < (int)MaxLights; i++) {
@@ -2153,15 +2512,10 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
                 }
                 hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightPosition, (float*)hlslLightPositions, 3 * MaxLights);
             }
-
-            if (hlslShader.hLightAmbient) {
+            if (hlslShader.hLightAmbient)
                 hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightAmbient, bufferAmbient, MaxLights);
-            }
-
-            if (hlslShader.hPointLightCount) {
+            if (hlslShader.hPointLightCount)
                 hlslShader.psConstantTable->SetInt(device, hlslShader.hPointLightCount, (int)pointLightCount);
-            }
-
             if (hlslShader.hLightFalloffQuadratic) {
                 D3DXVECTOR4 quadraticData[2];
                 for (int i = 0; i < 4; i++) {
@@ -2170,199 +2524,106 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
                 }
                 hlslShader.psConstantTable->SetVectorArray(device, hlslShader.hLightFalloffQuadratic, quadraticData, 2);
             }
-
-            if (hlslShader.hLightFalloffConstant) {
+            if (hlslShader.hLightFalloffConstant)
                 hlslShader.psConstantTable->SetFloat(device, hlslShader.hLightFalloffConstant, bufferFalloffConstant);
-            }
         }
 
         // Per-object light texture parameters for mode 3 (saturated objects)
         if (sk.lightMode == 3 && callIndex >= 0 && callIndex < (int)perObjectLightInfo.size()) {
             const auto& li = perObjectLightInfo[callIndex];
-            float lightParams[4] = {
-                (float)li.lightCount,
-                perObjectTexelSize,
-                (float)li.texelOffset,
-                0.0f
-            };
+            float lightParams[4] = { (float)li.lightCount, perObjectTexelSize, (float)li.texelOffset, 0.0f };
             device->SetPixelShaderConstantF(50, lightParams, 1);
         }
 
-        // Note: HLSL uses same falloff as Effect shader - quadratic + constant only, no linear term
-        // Set shading mode from actual material mode calculation
         D3DXHANDLE hShadingMode = hlslShader.psConstantTable->GetConstantByName(NULL, "shadingMode");
         if (hShadingMode) {
             float shadingModeData[4] = {0, 0, (float)sk.vertexMaterial, 0};
             hlslShader.psConstantTable->SetFloatArray(device, hShadingMode, shadingModeData, 4);
-        } else {
-            // LOG::logline("!! shadingMode constant not found in pixel shader");
         }
-        
-        // Set shadow resolution for pixel shader
         if (hlslShader.hShadowRcpRes) {
             float shadowRcp = 1.0f / Configuration.DL.ShadowResolution;
             hlslShader.psConstantTable->SetFloat(device, hlslShader.hShadowRcpRes, shadowRcp);
         }
-
-        // Set PCF parameters from ImGui debug interface
-        if (hlslShader.hPCFFilterSize) {
+        if (hlslShader.hPCFFilterSize)
             hlslShader.psConstantTable->SetFloat(device, hlslShader.hPCFFilterSize, ImGuiManager::GetPCFFilterSize());
-        }
-        
         D3DXHANDLE hPCFPenumbraScale = hlslShader.psConstantTable->GetConstantByName(NULL, "PCF_penumbraScale");
-        if (hPCFPenumbraScale) {
-            hlslShader.psConstantTable->SetFloat(device, hPCFPenumbraScale, ImGuiManager::GetPCFPenumbraScale());
-        }
-        
+        if (hPCFPenumbraScale) hlslShader.psConstantTable->SetFloat(device, hPCFPenumbraScale, ImGuiManager::GetPCFPenumbraScale());
         D3DXHANDLE hPCFMinPenumbra = hlslShader.psConstantTable->GetConstantByName(NULL, "PCF_minPenumbra");
-        if (hPCFMinPenumbra) {
-            hlslShader.psConstantTable->SetFloat(device, hPCFMinPenumbra, ImGuiManager::GetPCFMinPenumbra());
-        }
-        
+        if (hPCFMinPenumbra) hlslShader.psConstantTable->SetFloat(device, hPCFMinPenumbra, ImGuiManager::GetPCFMinPenumbra());
         D3DXHANDLE hPCFMaxPenumbra = hlslShader.psConstantTable->GetConstantByName(NULL, "PCF_maxPenumbra");
-        if (hPCFMaxPenumbra) {
-            hlslShader.psConstantTable->SetFloat(device, hPCFMaxPenumbra, ImGuiManager::GetPCFMaxPenumbra());
-        }
-        
+        if (hPCFMaxPenumbra) hlslShader.psConstantTable->SetFloat(device, hPCFMaxPenumbra, ImGuiManager::GetPCFMaxPenumbra());
         D3DXHANDLE hPCFBias = hlslShader.psConstantTable->GetConstantByName(NULL, "PCF_bias");
-        if (hPCFBias) {
-            hlslShader.psConstantTable->SetFloat(device, hPCFBias, ImGuiManager::GetPCFBias());
-        }
-        
+        if (hPCFBias) hlslShader.psConstantTable->SetFloat(device, hPCFBias, ImGuiManager::GetPCFBias());
         D3DXHANDLE hPCFBias2 = hlslShader.psConstantTable->GetConstantByName(NULL, "PCF_bias2");
-        if (hPCFBias2) {
-            hlslShader.psConstantTable->SetFloat(device, hPCFBias2, ImGuiManager::GetPCFBias2());
-        }
-        
+        if (hPCFBias2) hlslShader.psConstantTable->SetFloat(device, hPCFBias2, ImGuiManager::GetPCFBias2());
         D3DXHANDLE hPCFSlopeBias = hlslShader.psConstantTable->GetConstantByName(NULL, "PCF_slopeBias");
-        if (hPCFSlopeBias) {
-            hlslShader.psConstantTable->SetFloat(device, hPCFSlopeBias, ImGuiManager::GetPCFSlopeBias());
-        }
-        
-        // Set fog color
-        DWORD fogColorDword = 0x808080FF;
-        device->GetRenderState(D3DRS_FOGCOLOR, &fogColorDword);
-        D3DXVECTOR4 fogColor(
-            ((fogColorDword >> 16) & 0xFF) / 255.0f,
-            ((fogColorDword >> 8) & 0xFF) / 255.0f,
-            (fogColorDword & 0xFF) / 255.0f,
-            1.0f
-        );
-        
+        if (hPCFSlopeBias) hlslShader.psConstantTable->SetFloat(device, hPCFSlopeBias, ImGuiManager::GetPCFSlopeBias());
+
         D3DXHANDLE hFogColNear = hlslShader.psConstantTable->GetConstantByName(NULL, "fogColNear");
-        if (hFogColNear) {
-            hlslShader.psConstantTable->SetVector(device, hFogColNear, &fogColor);
-        }
-        
-        // NOTE: Texture binding and suffix processing is now handled by bindShaderTextures() above
-        // This includes frequency-optimized slot assignment and proper cache management.
-        // Removed redundant texture copying loop that was interfering with optimized binding.
-        
-        // HLSL samplers are declared in shader with proper filtering/addressing - no need for manual sampler states
-        
-        // Set missing constants that the Combined shader expects
+        if (hFogColNear) hlslShader.psConstantTable->SetVector(device, hFogColNear, (D3DXVECTOR4*)fogColor);
+
         D3DXHANDLE hTexgenTransform = hlslShader.vsConstantTable->GetConstantByName(NULL, "texgenTransform");
         if (hTexgenTransform) {
             D3DXMATRIX identity;
             D3DXMatrixIdentity(&identity);
             hlslShader.vsConstantTable->SetMatrix(device, hTexgenTransform, &identity);
         }
-        
         D3DXHANDLE hBumpMatrix = hlslShader.psConstantTable->GetConstantByName(NULL, "bumpMatrix");
         if (hBumpMatrix) {
-            D3DXVECTOR4 bumpMatrix(1, 0, 0, 1);  // Identity 2x2 matrix
+            D3DXVECTOR4 bumpMatrix(1, 0, 0, 1);
             hlslShader.psConstantTable->SetVector(device, hBumpMatrix, &bumpMatrix);
         }
-        
         D3DXHANDLE hBumpLumiScaleBias = hlslShader.psConstantTable->GetConstantByName(NULL, "bumpLumiScaleBias");
         if (hBumpLumiScaleBias) {
-            D3DXVECTOR2 scaleBias(1, 0);  // Scale=1, Bias=0
+            D3DXVECTOR2 scaleBias(1, 0);
             hlslShader.psConstantTable->SetFloatArray(device, hBumpLumiScaleBias, (float*)&scaleBias, 2);
         }
-        
-        // Set critical shared variables that the Combined shader needs
         D3DXHANDLE hHasAlpha = hlslShader.psConstantTable->GetConstantByName(NULL, "hasAlpha");
-        if (hHasAlpha) {
-            hlslShader.psConstantTable->SetBool(device, hHasAlpha, false);
-        }
-        
+        if (hHasAlpha) hlslShader.psConstantTable->SetBool(device, hHasAlpha, false);
         D3DXHANDLE hHasBones = hlslShader.vsConstantTable->GetConstantByName(NULL, "hasBones");
-        if (hHasBones) {
-            hlslShader.vsConstantTable->SetBool(device, hHasBones, rs->vertexBlendState > 0);
-        }
-        
-        // Alpha testing flag for wind animation
+        if (hHasBones) hlslShader.vsConstantTable->SetBool(device, hHasBones, rs->vertexBlendState > 0);
         D3DXHANDLE hHasAlphaVS = hlslShader.vsConstantTable->GetConstantByName(NULL, "hasAlpha");
-        if (hHasAlphaVS) {
-            hlslShader.vsConstantTable->SetBool(device, hHasAlphaVS, rs->alphaTest);
-        }
-        
-        // Wind vector for animations
+        if (hHasAlphaVS) hlslShader.vsConstantTable->SetBool(device, hHasAlphaVS, rs->alphaTest);
         D3DXHANDLE hWindVec = hlslShader.vsConstantTable->GetConstantByName(NULL, "windVec");
         if (hWindVec) {
             static float smoothWind[2] = {0, 0};
             if (!MWBridge::get()->IsMenu()) {
                 const float f = 0.02f;
-                const float windScaling = 1.0f; // Same as distant land
                 const float* wind = MWBridge::get()->GetWindVector();
-                smoothWind[0] += f * (windScaling * wind[0] - smoothWind[0]);
-                smoothWind[1] += f * (windScaling * wind[1] - smoothWind[1]);
+                smoothWind[0] += f * (1.0f * wind[0] - smoothWind[0]);
+                smoothWind[1] += f * (1.0f * wind[1] - smoothWind[1]);
             }
             hlslShader.vsConstantTable->SetFloatArray(device, hWindVec, smoothWind, 2);
         }
-        
-        // Time for animations
         D3DXHANDLE hTime = hlslShader.vsConstantTable->GetConstantByName(NULL, "time");
-        if (hTime) {
-            hlslShader.vsConstantTable->SetFloat(device, hTime, MWBridge::get()->simulationTime());
-        }
-        
+        if (hTime) hlslShader.vsConstantTable->SetFloat(device, hTime, MWBridge::get()->simulationTime());
         D3DXHANDLE hHasVCol = hlslShader.psConstantTable->GetConstantByName(NULL, "hasVCol");
-        if (hHasVCol) {
-            hlslShader.psConstantTable->SetBool(device, hHasVCol, (rs->fvf & D3DFVF_DIFFUSE) != 0);
-        }
-        
+        if (hHasVCol) hlslShader.psConstantTable->SetBool(device, hHasVCol, (rs->fvf & D3DFVF_DIFFUSE) != 0);
         D3DXHANDLE hMaterialAlpha = hlslShader.psConstantTable->GetConstantByName(NULL, "materialAlpha");
-        if (hMaterialAlpha) {
-            hlslShader.psConstantTable->SetFloat(device, hMaterialAlpha, frs->material.diffuse.a);
-        }
-        
+        if (hMaterialAlpha) hlslShader.psConstantTable->SetFloat(device, hMaterialAlpha, frs->material.diffuse.a);
         D3DXHANDLE hAlphaRef = hlslShader.psConstantTable->GetConstantByName(NULL, "alphaRef");
-        if (hAlphaRef) {
-            hlslShader.psConstantTable->SetFloat(device, hAlphaRef, rs->alphaRef / 255.0f);
-        }
-        
-        // Set normres constant if HAS_PARAMH is defined and paramh texture is bound
+        if (hAlphaRef) hlslShader.psConstantTable->SetFloat(device, hAlphaRef, rs->alphaRef / 255.0f);
+
         if (sk.hasParamH) {
             IDirect3DBaseTexture9* normalTexture;
-            device->GetTexture(2, &normalTexture);  // Get texture from slot 2
+            device->GetTexture(2, &normalTexture);
             if (normalTexture && normalTexture->GetType() == D3DRTYPE_TEXTURE) {
                 IDirect3DTexture9* tex = static_cast<IDirect3DTexture9*>(normalTexture);
-                
-                // Check cache first
                 D3DXVECTOR2 normres;
                 auto cacheIt = textureResolutionCache.find(tex);
                 if (cacheIt != textureResolutionCache.end()) {
                     normres = cacheIt->second;
                 } else {
-                    // Not in cache - get dimensions and cache them
                     D3DSURFACE_DESC desc;
                     if (SUCCEEDED(tex->GetLevelDesc(0, &desc))) {
                         normres = D3DXVECTOR2((float)desc.Width, (float)desc.Height);
                         textureResolutionCache[tex] = normres;
                     } else {
-                        normres = D3DXVECTOR2(1.0f, 1.0f);  // Default fallback
+                        normres = D3DXVECTOR2(1.0f, 1.0f);
                     }
                 }
-                
-                // Set normres constant if it exists in pixel shader
                 D3DXHANDLE hNormres = hlslShader.psConstantTable->GetConstantByName(NULL, "normres");
-                if (hNormres) {
-                    hlslShader.psConstantTable->SetFloatArray(device, hNormres, (float*)&normres, 2);
-                } else {
-                    // LOG::logline("HLSL: normres constant not found in pixel shader");
-                }
-                
+                if (hNormres) hlslShader.psConstantTable->SetFloatArray(device, hNormres, (float*)&normres, 2);
                 normalTexture->Release();
             }
         }
@@ -2375,58 +2636,73 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         return;
     }
 
-    HRESULT hr = device->SetFVF(rs->fvf);
-    if (FAILED(hr)) {
-        return;
-    }
+    if (cmdBuf) {
+        // Depth bias
+        cmdBuf->recordSetRenderState(D3DRS_DEPTHBIAS, *(DWORD*)&(const float&)-1e-6f);
+        cmdBuf->recordSetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, *(DWORD*)&(const float&)-1e-6f);
 
-    hr = device->SetStreamSource(0, rs->vb, rs->vbOffset, rs->vbStride);
-    if (FAILED(hr)) {
-        return;
-    }
+        // Draw call
+        if (rs->ib) {
+            cmdBuf->recordDrawIndexedPrimitive(rs->primType, rs->baseIndex, rs->minIndex, rs->vertCount, rs->startIndex, rs->primCount);
+        } else {
+            cmdBuf->recordDrawPrimitive(rs->primType, rs->startIndex, rs->primCount);
+        }
 
-    // Phase A: Add small depth bias to resolve Z-fighting with depth prepass
-    // Use a very small bias to push HLSL geometry slightly forward
-    device->SetRenderState(D3DRS_DEPTHBIAS, *(DWORD*)&(const float&)-1e-6f);
-    device->SetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, *(DWORD*)&(const float&)-1e-6f);
+        // Reset depth bias
+        cmdBuf->recordSetRenderState(D3DRS_DEPTHBIAS, 0);
+        cmdBuf->recordSetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, 0);
 
-    // Execute the draw call with proper error checking
-    if (rs->ib) {
-        hr = device->SetIndices(rs->ib);
+        // Restore shaders (per-draw cleanup)
+        cmdBuf->recordSetVertexShader(NULL);
+        cmdBuf->recordSetPixelShader(NULL);
+    } else {
+        HRESULT hr = device->SetFVF(rs->fvf);
         if (FAILED(hr)) {
-            LOG::logline("!! HLSL pipeline: failed to set index buffer, hr=%x", hr);
             return;
         }
-        device->DrawIndexedPrimitive(rs->primType, rs->baseIndex, rs->minIndex, rs->vertCount, rs->startIndex, rs->primCount);
-    } else {
-        device->DrawPrimitive(rs->primType, rs->startIndex, rs->primCount);
-    }
 
-    // Reset depth bias after drawing
-    device->SetRenderState(D3DRS_DEPTHBIAS, 0);
-    device->SetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, 0);
+        hr = device->SetStreamSource(0, rs->vb, rs->vbOffset, rs->vbStride);
+        if (FAILED(hr)) {
+            return;
+        }
 
-    // Restore device state after HLSL rendering (like the original system does)
-    device->SetVertexShader(NULL);
-    device->SetPixelShader(NULL);
+        // Phase A: Add small depth bias to resolve Z-fighting with depth prepass
+        device->SetRenderState(D3DRS_DEPTHBIAS, *(DWORD*)&(const float&)-1e-6f);
+        device->SetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, *(DWORD*)&(const float&)-1e-6f);
 
-    // During replay, texture slots are managed by bindShaderTextures and cleaned up
-    // at batch end in stopRecordingAndReplay. Per-call clearing would break the
-    // bindingCache optimization (consecutive same-texture calls skip rebinding).
-    if (!isReplaying) {
-        // Clear HLSL texture bindings to prevent leaks across calls
-        FixedFunctionShader::setCachedTexture(device, 2, nullptr);  // Clear paramH/suffix texture
-        FixedFunctionShader::setCachedTexture(device, 3, nullptr);  // Clear any legacy MGE effects shadow binding
-        FixedFunctionShader::setCachedTexture(device, 4, nullptr);  // Clear HLSL shadow binding
+        if (rs->ib) {
+            hr = device->SetIndices(rs->ib);
+            if (FAILED(hr)) {
+                LOG::logline("!! HLSL pipeline: failed to set index buffer, hr=%x", hr);
+                return;
+            }
+            device->DrawIndexedPrimitive(rs->primType, rs->baseIndex, rs->minIndex, rs->vertCount, rs->startIndex, rs->primCount);
+        } else {
+            device->DrawPrimitive(rs->primType, rs->startIndex, rs->primCount);
+        }
 
-        // Restore render states that HLSL rendering may have changed
-        device->SetRenderState(D3DRS_ALPHABLENDENABLE, savedAlphaBlendEnable);
-        device->SetRenderState(D3DRS_ALPHATESTENABLE, savedAlphaTestEnable);
-        device->SetRenderState(D3DRS_ZENABLE, savedZEnable);
-        device->SetRenderState(D3DRS_ZWRITEENABLE, savedZWriteEnable);
-        device->SetRenderState(D3DRS_SPECULARENABLE, savedSpecularEnable);
-        device->SetRenderState(D3DRS_LOCALVIEWER, savedLocalViewer);
-        device->SetRenderState(D3DRS_NORMALIZENORMALS, savedNormalizeNormals);
+        // Reset depth bias after drawing
+        device->SetRenderState(D3DRS_DEPTHBIAS, 0);
+        device->SetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, 0);
+
+        // Restore device state after HLSL rendering
+        device->SetVertexShader(NULL);
+        device->SetPixelShader(NULL);
+
+        // During replay, texture slots are managed by bindShaderTextures
+        if (!isReplaying) {
+            FixedFunctionShader::setCachedTexture(device, 2, nullptr);
+            FixedFunctionShader::setCachedTexture(device, 3, nullptr);
+            FixedFunctionShader::setCachedTexture(device, 4, nullptr);
+
+            device->SetRenderState(D3DRS_ALPHABLENDENABLE, savedAlphaBlendEnable);
+            device->SetRenderState(D3DRS_ALPHATESTENABLE, savedAlphaTestEnable);
+            device->SetRenderState(D3DRS_ZENABLE, savedZEnable);
+            device->SetRenderState(D3DRS_ZWRITEENABLE, savedZWriteEnable);
+            device->SetRenderState(D3DRS_SPECULARENABLE, savedSpecularEnable);
+            device->SetRenderState(D3DRS_LOCALVIEWER, savedLocalViewer);
+            device->SetRenderState(D3DRS_NORMALIZENORMALS, savedNormalizeNormals);
+        }
     }
 
 }
@@ -2755,6 +3031,7 @@ void FixedFunctionShader::checkForShaderFileChanges() {
     }
 }
 
+// Resolve a D3DXHANDLE to register offset using GetConstantDesc
 FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const ShaderKey& sk) {
     HLSLShader hlslShader = {};
     
@@ -2898,6 +3175,16 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         hlslShader.hVertexBlendPalette = hlslShader.vsConstantTable->GetConstantByName(NULL, "vertexBlendPalette");
         hlslShader.hVertexBlendState = hlslShader.vsConstantTable->GetConstantByName(NULL, "vertexBlendState");
         hlslShader.hShadowWorldViewProj = hlslShader.vsConstantTable->GetConstantByName(NULL, "shadowWorldViewProj");
+
+        // Resolve VS register offsets for command buffer path
+        hlslShader.regWorldViewProj = resolveConstReg(hlslShader.vsConstantTable, hlslShader.hWorldViewProj);
+        hlslShader.regView = resolveConstReg(hlslShader.vsConstantTable, hlslShader.hView);
+        hlslShader.regProj = resolveConstReg(hlslShader.vsConstantTable, hlslShader.hProj);
+        hlslShader.regWorld = resolveConstReg(hlslShader.vsConstantTable, hlslShader.hWorld);
+        hlslShader.regWorldView = resolveConstReg(hlslShader.vsConstantTable, hlslShader.hWorldView);
+        hlslShader.regVertexBlendPalette = resolveConstReg(hlslShader.vsConstantTable, hlslShader.hVertexBlendPalette);
+        hlslShader.regVertexBlendState = resolveConstReg(hlslShader.vsConstantTable, hlslShader.hVertexBlendState);
+        hlslShader.regShadowWorldViewProj = resolveConstReg(hlslShader.vsConstantTable, hlslShader.hShadowWorldViewProj);
     }
 
     // Log VS blob size before releasing
@@ -2992,8 +3279,27 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         hlslShader.hPointLightCount = hlslShader.psConstantTable->GetConstantByName(NULL, "pointLightCount");
         hlslShader.hLightFalloffQuadratic = hlslShader.psConstantTable->GetConstantByName(NULL, "lightFalloffQuadratic");
         hlslShader.hLightFalloffConstant = hlslShader.psConstantTable->GetConstantByName(NULL, "lightFalloffConstant");
+
+        // Resolve PS register offsets for command buffer path
+        hlslShader.regMaterialDiffuse = resolveConstReg(hlslShader.psConstantTable, hlslShader.hMaterialDiffuse);
+        hlslShader.regMaterialAmbient = resolveConstReg(hlslShader.psConstantTable, hlslShader.hMaterialAmbient);
+        hlslShader.regMaterialEmissive = resolveConstReg(hlslShader.psConstantTable, hlslShader.hMaterialEmissive);
+        hlslShader.regLightSunDirection = resolveConstReg(hlslShader.psConstantTable, hlslShader.hLightSunDirection);
+        hlslShader.regLightSunDiffuse = resolveConstReg(hlslShader.psConstantTable, hlslShader.hLightSunDiffuse);
+        hlslShader.regLightSceneAmbient = resolveConstReg(hlslShader.psConstantTable, hlslShader.hLightSceneAmbient);
+        hlslShader.regShadowRcpRes = resolveConstReg(hlslShader.psConstantTable, hlslShader.hShadowRcpRes);
+        hlslShader.regPCFFilterSize = resolveConstReg(hlslShader.psConstantTable, hlslShader.hPCFFilterSize);
+        hlslShader.regLightDiffuse = resolveConstReg(hlslShader.psConstantTable, hlslShader.hLightDiffuse);
+        hlslShader.regLightPosition = resolveConstReg(hlslShader.psConstantTable, hlslShader.hLightPosition);
+        hlslShader.regLightAmbient = resolveConstReg(hlslShader.psConstantTable, hlslShader.hLightAmbient);
+        hlslShader.regPointLightCount = resolveConstReg(hlslShader.psConstantTable, hlslShader.hPointLightCount);
+        hlslShader.regLightFalloffQuadratic = resolveConstReg(hlslShader.psConstantTable, hlslShader.hLightFalloffQuadratic);
+        hlslShader.regLightFalloffConstant = resolveConstReg(hlslShader.psConstantTable, hlslShader.hLightFalloffConstant);
+
+        // Dynamic constants resolved on first use in renderMorrowindHLSL_Internal
+        hlslShader.dynamicConstsResolved = false;
     }
-    
+
     // Log compilation details for debugging (before releasing blobs)
     // LOG::logline("-- HLSL shader compiled successfully: VS=%s PS=%s", vertexShaderName, pixelShaderName);
     // LOG::logline("-- HLSL PS blob size: %u bytes", psBlob->GetBufferSize());
@@ -4207,6 +4513,11 @@ void FixedFunctionShader::executeGpuPhase(int bufferIndex) {
     DLContext* frameCtx = &fb.dlContext;
     bool waterSeen = fb.waterSeen;
 
+    // Replay PreScene command buffer (initial Clear, VIEW/PROJ, viewport, RT/DS)
+    if (ImGuiManager::GetCmdBufferReplay()) {
+        g_cmdBufferSet[CmdStage::PreScene].replay(device);
+    }
+
     // Stage 0 GPU: shadow map, distant land, sky, water reflection, wave sim
     DistantLand::renderStage0GPU(frameCtx, &fb);
 
@@ -4230,8 +4541,12 @@ void FixedFunctionShader::executeGpuPhase(int bufferIndex) {
     }
     fb.state = BufferState::ReadyToRender;
 
-    // Replay all recorded HLSL calls (Scene 0 + Scene 1+)
-    replayRecordedCalls(0);
+    // Build HLSL replay into command buffer, then replay it
+    // Scene 0 + Scene 1+ always go through HLSL replay (recordMW populated by inspectIndexedPrimitive)
+    // Build HLSL replay into command buffer, then replay it
+    fb.hlslCmds.clear();
+    replayRecordedCalls(0, &fb.hlslCmds);
+    fb.hlslCmds.replay(device);
 
     // Water surface AFTER replay — refraction samples backbuffer which needs scene content
     if (waterSeen) {
@@ -5249,7 +5564,7 @@ void FixedFunctionShader::checkSnapshotHotkeys() {
     f6WasPressed = f6State;
 }
 
-void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
+void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* cmdBuf) {
     auto& recCalls = currentRecordedCalls();
     {
         if (recCalls.empty()) {
@@ -5545,8 +5860,13 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
             // Restore sampler states for this call (captured during recording)
             for (int stage = 0; stage < 8; ++stage) {
                 if (call.samplerStates[stage].captured) {
-                    device->SetSamplerState(stage, D3DSAMP_ADDRESSU, call.samplerStates[stage].addressU);
-                    device->SetSamplerState(stage, D3DSAMP_ADDRESSV, call.samplerStates[stage].addressV);
+                    if (cmdBuf) {
+                        cmdBuf->recordSetSamplerState(stage, D3DSAMP_ADDRESSU, call.samplerStates[stage].addressU);
+                        cmdBuf->recordSetSamplerState(stage, D3DSAMP_ADDRESSV, call.samplerStates[stage].addressV);
+                    } else {
+                        device->SetSamplerState(stage, D3DSAMP_ADDRESSU, call.samplerStates[stage].addressU);
+                        device->SetSamplerState(stage, D3DSAMP_ADDRESSV, call.samplerStates[stage].addressV);
+                    }
                 }
             }
 
@@ -5569,7 +5889,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
                     tintedFrs.material.emissive.g = 0.4f;
                     tintedFrs.material.emissive.b = 0.0f;
                     tintedFrs.material.emissive.a = 1.0f;
-                    renderMorrowindHLSL_Internal(&call.rs, &tintedFrs, call.lightrs.get(), DIRTY_ALL);
+                    renderMorrowindHLSL_Internal(&call.rs, &tintedFrs, call.lightrs.get(), DIRTY_ALL, -1, cmdBuf);
                     continue;
                 }
             }
@@ -5588,33 +5908,41 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount) {
                         tintedFrs.material.emissive = {1.0f, 0.0f, 1.0f, 1.0f}; break; // Magenta
                     default: break;
                 }
-                renderMorrowindHLSL_Internal(&call.rs, &tintedFrs, call.lightrs.get(), DIRTY_ALL);
+                renderMorrowindHLSL_Internal(&call.rs, &tintedFrs, call.lightrs.get(), DIRTY_ALL, -1, cmdBuf);
                 continue;
             }
 
             {
                 MGE_ZoneScopedN("replay_RenderCall");
                 // Restore Morrowind-recorded device state before each replay call
-                // During recording, Morrowind sets these between calls; during replay we must do it
-                // Debug mode: validate BEFORE pre-set to detect leaks from previous call
-                if (i > 0 && ImGuiManager::GetStateLeakDetection() && call.expectedState.captured) {
+                if (i > 0 && !cmdBuf && ImGuiManager::GetStateLeakDetection() && call.expectedState.captured) {
                     validateDeviceState(call.expectedState, i);
                 }
                 if (call.expectedState.captured) {
-                    device->SetRenderState(D3DRS_ALPHABLENDENABLE, call.expectedState.alphaBlendEnable);
-                    device->SetRenderState(D3DRS_ALPHATESTENABLE, call.expectedState.alphaTestEnable);
-                    device->SetRenderState(D3DRS_ZENABLE, call.expectedState.zEnable);
-                    device->SetRenderState(D3DRS_ZWRITEENABLE, call.expectedState.zWriteEnable);
-                    device->SetRenderState(D3DRS_CULLMODE, call.expectedState.cullMode);
-                    device->SetRenderState(D3DRS_SRCBLEND, call.expectedState.srcBlend);
-                    device->SetRenderState(D3DRS_DESTBLEND, call.expectedState.destBlend);
-                    device->SetRenderState(D3DRS_FOGENABLE, call.expectedState.fogEnable);
-                    // Invalidate cache since we bypassed it with raw SetRenderState
-                    materialCache.reset();
+                    if (cmdBuf) {
+                        cmdBuf->recordSetRenderState(D3DRS_ALPHABLENDENABLE, call.expectedState.alphaBlendEnable);
+                        cmdBuf->recordSetRenderState(D3DRS_ALPHATESTENABLE, call.expectedState.alphaTestEnable);
+                        cmdBuf->recordSetRenderState(D3DRS_ZENABLE, call.expectedState.zEnable);
+                        cmdBuf->recordSetRenderState(D3DRS_ZWRITEENABLE, call.expectedState.zWriteEnable);
+                        cmdBuf->recordSetRenderState(D3DRS_CULLMODE, call.expectedState.cullMode);
+                        cmdBuf->recordSetRenderState(D3DRS_SRCBLEND, call.expectedState.srcBlend);
+                        cmdBuf->recordSetRenderState(D3DRS_DESTBLEND, call.expectedState.destBlend);
+                        cmdBuf->recordSetRenderState(D3DRS_FOGENABLE, call.expectedState.fogEnable);
+                    } else {
+                        device->SetRenderState(D3DRS_ALPHABLENDENABLE, call.expectedState.alphaBlendEnable);
+                        device->SetRenderState(D3DRS_ALPHATESTENABLE, call.expectedState.alphaTestEnable);
+                        device->SetRenderState(D3DRS_ZENABLE, call.expectedState.zEnable);
+                        device->SetRenderState(D3DRS_ZWRITEENABLE, call.expectedState.zWriteEnable);
+                        device->SetRenderState(D3DRS_CULLMODE, call.expectedState.cullMode);
+                        device->SetRenderState(D3DRS_SRCBLEND, call.expectedState.srcBlend);
+                        device->SetRenderState(D3DRS_DESTBLEND, call.expectedState.destBlend);
+                        device->SetRenderState(D3DRS_FOGENABLE, call.expectedState.fogEnable);
+                        materialCache.reset();
+                    }
                 }
                 LARGE_INTEGER callStartQPC, callEndQPC;
                 QueryPerformanceCounter(&callStartQPC);
-                renderMorrowindHLSL_Internal(&call.rs, &call.frs, call.lightrs.get(), call.dirtyFlags, (int)i);
+                renderMorrowindHLSL_Internal(&call.rs, &call.frs, call.lightrs.get(), call.dirtyFlags, (int)i, cmdBuf);
                 QueryPerformanceCounter(&callEndQPC);
                 float callMs = (callEndQPC.QuadPart - callStartQPC.QuadPart) * 1000.0f / replayFreqQPC.QuadPart;
                 if (callMs > worstCallMs) {

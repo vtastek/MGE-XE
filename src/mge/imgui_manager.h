@@ -53,6 +53,14 @@ struct FrameEvent {
         MGE_ShadowOverlay, MGE_Depth, MGE_DepthDistant,
         MGE_HiZGen, MGE_WaterReflection, MGE_WaterPlane,
         MGE_SkyRender,
+        // Command buffer replay events (logged during dumpToFrameLog)
+        Replay_Clear, Replay_BeginScene, Replay_EndScene,
+        Replay_SetRT, Replay_SetDS, Replay_SetViewport,
+        Replay_RS, Replay_TSS, Replay_SS,
+        Replay_Transform, Replay_Texture, Replay_Material,
+        Replay_Light, Replay_LightEnable, Replay_FVF,
+        Replay_StreamSource, Replay_Indices,
+        Replay_DIP, Replay_DP,
         // Detailed trace events (only logged when trace enabled)
         State_RS, State_TSS, State_Transform, State_Texture,
         State_Light, State_Material, State_Viewport, State_ClipPlane,
@@ -79,6 +87,13 @@ struct FrameEvent {
             "MGE_ShadowOverlay", "MGE_Depth", "MGE_DepthDistant",
             "MGE_HiZGen", "MGE_WaterReflection", "MGE_WaterPlane",
             "MGE_SkyRender",
+            "R_Clear", "R_BeginScene", "R_EndScene",
+            "R_SetRT", "R_SetDS", "R_Viewport",
+            "R_RS", "R_TSS", "R_SS",
+            "R_Transform", "R_Texture", "R_Material",
+            "R_Light", "R_LightEn", "R_FVF",
+            "R_Stream", "R_Indices",
+            "R_DIP", "R_DP",
             "RS", "TSS", "Transform", "Texture",
             "Light", "Material", "Viewport", "ClipPlane",
             "StreamSource", "VertexShader", "IndexBuffer",
@@ -242,8 +257,10 @@ public:
     static void FreezeSlowFrame(float prepareMs, float replayMs, int worstCallIndex, float worstCallMs, int worstCallPrims, int worstCallBin);
 
     // D3D Command Buffer
-    static bool GetCmdBufferRecording() { return cmdBufferRecording; }
+    static bool GetCmdBufferRecording() { return cmdBufferRecording || cmdBufferReplay; }
+    static bool GetCmdBufferReplay() { return cmdBufferReplay; }
     static void UpdateCmdBufferStats(int cmdCount, int sizeKB);
+    static void UpdateCmdBufferPerStageStats(int preScene, int scene0, int interScene, int scene1Plus, int ui);
 
     // Debug hotkey gating
     static bool GetDebugKeysEnabled();
@@ -357,6 +374,8 @@ private:
     static bool eventLogFrozen;
     static bool eventLogAutoFreeze;
     static int eventLogFreezeOffscreenThreshold;  // Auto-freeze when offscreen DIPs >= this (0=disabled)
+    static char frameConfigLabel[128];         // Current frame's mode/config string
+    static char frozenConfigLabel[128];        // Frozen frame's mode/config string
 
     // Detailed trace
     static bool traceEnabled;
@@ -380,8 +399,14 @@ private:
 
     // D3D Command Buffer
     static bool cmdBufferRecording;       // Enable command buffer recording - default false
+    static bool cmdBufferReplay;          // Enable command buffer replay mode - default false
     static int cmdBufferCmdCount;         // Last frame's command count
     static int cmdBufferSizeKB;           // Last frame's buffer size in KB
+    static int cmdStagePreScene;          // Per-stage command counts
+    static int cmdStageScene0;
+    static int cmdStageInterScene;
+    static int cmdStageScene1Plus;
+    static int cmdStageUI;
 
     // Debug hotkey gating
     static bool debugKeysEnabled;         // Gate debug hotkeys (F11/U/Y/L/F5/F6) - default false

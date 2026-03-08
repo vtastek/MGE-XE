@@ -49,11 +49,8 @@ DLContext DistantLand::captureStage0Context() {
     // Update current cell and select distant static set
     selectDistantCell();
 
-    // Get Morrowind camera matrices
-    FixedFunctionShader::trackDeviceRead("GetTransform(VIEW)");
-    device->GetTransform(D3DTS_VIEW, &s_staging.mwView);
-    FixedFunctionShader::trackDeviceRead("GetTransform(PROJ)");
-    device->GetTransform(D3DTS_PROJECTION, &s_staging.mwProj);
+    // Morrowind camera matrices — already captured CPU-side by SetTransform handler
+    // (no device->GetTransform needed, works with state forwarding suppression)
 
     // Set variables derived from current game state and camera configuration
     setView(&s_staging.mwView);

@@ -185,9 +185,9 @@ void DistantLand::renderDepthRecorded(const std::vector<RecordedMWState>& recMW,
             }
             effect->SetMatrixArray(ehVertexBlendPalette, currentWorldViewTransforms, 4);
         } else if (i.vertexBlendState > 0) {
-            // Fallback: use device view (legacy path)
+            // Fallback: use staging view (device may not have current transforms with state suppression)
             D3DXMATRIX currentView, currentWorldViewTransforms[4];
-            device->GetTransform(D3DTS_VIEW, &currentView);
+            currentView = DistantLand::s_staging.mwView;
             for (int j = 0; j < 4; j++) {
                 currentWorldViewTransforms[j] = i.worldTransforms[j] * currentView;
             }
