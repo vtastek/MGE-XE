@@ -4513,10 +4513,16 @@ void FixedFunctionShader::executeGpuPhase(int bufferIndex) {
     DLContext* frameCtx = &fb.dlContext;
     bool waterSeen = fb.waterSeen;
 
-    // Replay PreScene command buffer (initial Clear, VIEW/PROJ, viewport, RT/DS)
-    if (ImGuiManager::GetCmdBufferReplay()) {
-        g_cmdBufferSet[CmdStage::PreScene].replay(device);
-    }
+    // Offscreen/PreScene buffer replay is only needed when those draws are suppressed
+    // from the device (future: Scene0 suppression for render thread overlap).
+    // Currently, offscreen and prescene draws go direct to device (not suppressed),
+    // so replaying them here would double-render and leave wrong RT/state.
+    // if (ImGuiManager::GetCmdBufferReplay() && g_cmdBufferSet[CmdStage::Offscreen].size() > 0) {
+    //     g_cmdBufferSet[CmdStage::Offscreen].replay(device);
+    // }
+    // if (ImGuiManager::GetCmdBufferReplay()) {
+    //     g_cmdBufferSet[CmdStage::PreScene].replay(device);
+    // }
 
     // Stage 0 GPU: shadow map, distant land, sky, water reflection, wave sim
     DistantLand::renderStage0GPU(frameCtx, &fb);

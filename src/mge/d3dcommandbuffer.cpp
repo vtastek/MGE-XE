@@ -42,6 +42,10 @@ void D3DCommandBuffer::clear() {
         case D3DCmd::Cmd_SetPixelShader:
             if (cmd.ps.shader) cmd.ps.shader->Release();
             break;
+        case D3DCmd::Cmd_GetRenderTargetData:
+            if (cmd.rtData.source) cmd.rtData.source->Release();
+            if (cmd.rtData.dest) cmd.rtData.dest->Release();
+            break;
         default:
             break;
         }
@@ -274,6 +278,16 @@ void D3DCommandBuffer::recordSetPSConstantI(UINT startReg, const int* data, UINT
     commands.push_back(cmd);
 }
 
+void D3DCommandBuffer::recordGetRenderTargetData(IDirect3DSurface9* source, IDirect3DSurface9* dest) {
+    D3DCmd cmd;
+    cmd.type = D3DCmd::Cmd_GetRenderTargetData;
+    cmd.rtData.source = source;
+    cmd.rtData.dest = dest;
+    if (source) source->AddRef();
+    if (dest) dest->AddRef();
+    commands.push_back(cmd);
+}
+
 // --- Replay ---
 
 void D3DCommandBuffer::replay(IDirect3DDevice9* device) const {
@@ -360,6 +374,9 @@ void D3DCommandBuffer::replay(IDirect3DDevice9* device) const {
             device->SetPixelShaderConstantI(cmd.constF.startReg,
                 reinterpret_cast<const int*>(&constantArena[cmd.constF.arenaOffset]), cmd.constF.count);
             break;
+        case D3DCmd::Cmd_GetRenderTargetData:
+            device->GetRenderTargetData(cmd.rtData.source, cmd.rtData.dest);
+            break;
         }
     }
 }
@@ -367,7 +384,7 @@ void D3DCommandBuffer::replay(IDirect3DDevice9* device) const {
 // --- CmdStage names ---
 
 const char* CmdStageName(CmdStage s) {
-    static const char* names[] = { "PreScene", "Scene0", "InterScene", "Scene1Plus", "UI" };
+    static const char* names[] = { "Offscreen", "PreScene", "Scene0", "InterScene", "Scene1Plus", "UI" };
     return ((int)s < (int)CmdStage::Count) ? names[(int)s] : "Unknown";
 }
 
@@ -567,6 +584,7 @@ void D3DCommandBuffer::dumpToFrameLog(int sceneNum) const {
         case D3DCmd::Cmd_SetPSConstantF:
         case D3DCmd::Cmd_SetVSConstantI:
         case D3DCmd::Cmd_SetPSConstantI:
+        case D3DCmd::Cmd_GetRenderTargetData:
             break;
         }
     }

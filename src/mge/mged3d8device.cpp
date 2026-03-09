@@ -113,12 +113,80 @@ static float calcFPS();
 // When true, MW state/draw calls record to command buffer only — no device forwarding.
 // Keeps main thread off the device for threading safety.
 static inline bool shouldSuppressMWState() {
-    // CONTROL TEST: suppression disabled, testing s_staging changes only
+    // Currently disabled — UI draws go direct to device.
+    // Will be re-enabled for Scene0 suppression when render thread overlap is implemented.
     return false;
-    //return isHLSLActive() && ImGuiManager::GetCmdBufferReplay();
 }
 
 
+
+// Snapshot key device render states and record them as preamble to UI command buffer.
+// After state block restore + z-clear, MW expects certain inherited states for UI rendering.
+// When the UI buffer is replayed later, these states make it self-contained.
+static void recordUIStatePreamble(IDirect3DDevice9* dev, D3DCommandBuffer& buf) {
+    DWORD val;
+
+    // Blend state
+    dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &val); buf.recordSetRenderState(D3DRS_ALPHABLENDENABLE, val);
+    dev->GetRenderState(D3DRS_SRCBLEND, &val);         buf.recordSetRenderState(D3DRS_SRCBLEND, val);
+    dev->GetRenderState(D3DRS_DESTBLEND, &val);        buf.recordSetRenderState(D3DRS_DESTBLEND, val);
+
+    // Depth state
+    dev->GetRenderState(D3DRS_ZENABLE, &val);          buf.recordSetRenderState(D3DRS_ZENABLE, val);
+    dev->GetRenderState(D3DRS_ZWRITEENABLE, &val);     buf.recordSetRenderState(D3DRS_ZWRITEENABLE, val);
+    dev->GetRenderState(D3DRS_ZFUNC, &val);            buf.recordSetRenderState(D3DRS_ZFUNC, val);
+
+    // Lighting / fog / cull
+    dev->GetRenderState(D3DRS_LIGHTING, &val);         buf.recordSetRenderState(D3DRS_LIGHTING, val);
+    dev->GetRenderState(D3DRS_FOGENABLE, &val);        buf.recordSetRenderState(D3DRS_FOGENABLE, val);
+    dev->GetRenderState(D3DRS_CULLMODE, &val);         buf.recordSetRenderState(D3DRS_CULLMODE, val);
+
+    // Material source
+    dev->GetRenderState(D3DRS_COLORVERTEX, &val);              buf.recordSetRenderState(D3DRS_COLORVERTEX, val);
+    dev->GetRenderState(D3DRS_AMBIENTMATERIALSOURCE, &val);    buf.recordSetRenderState(D3DRS_AMBIENTMATERIALSOURCE, val);
+    dev->GetRenderState(D3DRS_DIFFUSEMATERIALSOURCE, &val);    buf.recordSetRenderState(D3DRS_DIFFUSEMATERIALSOURCE, val);
+
+    // Alpha test
+    dev->GetRenderState(D3DRS_ALPHATESTENABLE, &val);  buf.recordSetRenderState(D3DRS_ALPHATESTENABLE, val);
+    dev->GetRenderState(D3DRS_ALPHAREF, &val);         buf.recordSetRenderState(D3DRS_ALPHAREF, val);
+    dev->GetRenderState(D3DRS_ALPHAFUNC, &val);        buf.recordSetRenderState(D3DRS_ALPHAFUNC, val);
+
+    // Stencil
+    dev->GetRenderState(D3DRS_STENCILENABLE, &val);    buf.recordSetRenderState(D3DRS_STENCILENABLE, val);
+
+    // Ambient / texture factor
+    dev->GetRenderState(D3DRS_AMBIENT, &val);          buf.recordSetRenderState(D3DRS_AMBIENT, val);
+    dev->GetRenderState(D3DRS_TEXTUREFACTOR, &val);    buf.recordSetRenderState(D3DRS_TEXTUREFACTOR, val);
+
+    // Texture stage state for stages 0-1
+    for (DWORD stage = 0; stage < 2; stage++) {
+        dev->GetTextureStageState(stage, D3DTSS_COLOROP, &val);   buf.recordSetTextureStageState(stage, D3DTSS_COLOROP, val);
+        dev->GetTextureStageState(stage, D3DTSS_COLORARG1, &val); buf.recordSetTextureStageState(stage, D3DTSS_COLORARG1, val);
+        dev->GetTextureStageState(stage, D3DTSS_COLORARG2, &val); buf.recordSetTextureStageState(stage, D3DTSS_COLORARG2, val);
+        dev->GetTextureStageState(stage, D3DTSS_ALPHAOP, &val);   buf.recordSetTextureStageState(stage, D3DTSS_ALPHAOP, val);
+        dev->GetTextureStageState(stage, D3DTSS_ALPHAARG1, &val); buf.recordSetTextureStageState(stage, D3DTSS_ALPHAARG1, val);
+        dev->GetTextureStageState(stage, D3DTSS_ALPHAARG2, &val); buf.recordSetTextureStageState(stage, D3DTSS_ALPHAARG2, val);
+    }
+
+    // Fixed-function pipeline (UI doesn't use shaders)
+    buf.recordSetVertexShader(nullptr);
+    buf.recordSetPixelShader(nullptr);
+
+    // FVF — MW doesn't set FVF before first UI DIP, inherits from scene rendering
+    dev->GetFVF(&val);                          buf.recordSetFVF(val);
+
+    // Viewport — MW sets it before BeginScene (goes to Scene1Plus buffer, not UI)
+    D3DVIEWPORT9 vp;
+    dev->GetViewport(&vp);                      buf.recordSetViewport(&vp);
+
+    // Transforms — MW sets VIEW/PROJ before BeginScene (goes to Scene1Plus buffer, not UI)
+    D3DMATRIX mat;
+    dev->GetTransform(D3DTS_VIEW, &mat);        buf.recordSetTransform(D3DTS_VIEW, &mat);
+    dev->GetTransform(D3DTS_PROJECTION, &mat);   buf.recordSetTransform(D3DTS_PROJECTION, &mat);
+
+    // Record z-clear into the UI buffer so it's self-contained
+    buf.recordClear(0, D3DCLEAR_ZBUFFER, 0, 1.0f, 0);
+}
 
 MGEProxyDevice::MGEProxyDevice(IDirect3DDevice9* real, ProxyD3D* d3d) : ProxyDevice(real, d3d) {
     // Initialize state here, as the device is released and recreated on fullscreen Alt-Tab
@@ -510,15 +578,18 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         g_suppressingCurrentScene = false;
         // Safety: close mega-scene if still open at Present
         if (g_offscreenMegaScene) {
-            if (ImGuiManager::GetCmdBufferRecording()) {
+            if (ImGuiManager::GetCmdBufferRecording() && !ImGuiManager::GetCmdBufferReplay()) {
                 g_cmdBufferSet.active().recordEndScene();
             }
             ProxyDevice::EndScene();
             g_offscreenMegaScene = false;
         }
 
-        // Reset stage for next frame
-        g_cmdBufferSet.activeStage = CmdStage::PreScene;
+        // Reset stage for next frame — Offscreen because MW always starts with offscreen
+        // rendering (local map tiles) before the main scene. Events before the first
+        // BeginScene (SetRenderTarget, Viewport, Clear, Transforms) must go to the
+        // Offscreen buffer, not PreScene.
+        g_cmdBufferSet.activeStage = CmdStage::Offscreen;
 
         // Stamp current camera into the FrameBuffer that just finished recording
         // (for future render pass to use fresh matrices instead of stale recording-time ones)
@@ -564,11 +635,13 @@ static HRESULT flushPendingRT() {
             g_cmdBufferSet.active().recordSetDepthStencilSurface(dsSurface);
         }
 
-        // Phase 1: RT/scene management still forwards to device (postProcess needs it)
-        if (rtSurface) {
-            hr1 = device->SetRenderTarget(0, rtSurface);
+        // Forward to device — except during Offscreen replay (device calls deferred to buffer)
+        if (!shouldSuppressMWState()) {
+            if (rtSurface) {
+                hr1 = device->SetRenderTarget(0, rtSurface);
+            }
+            hr2 = device->SetDepthStencilSurface(dsSurface);
         }
-        hr2 = device->SetDepthStencilSurface(dsSurface);
 
         return (hr1 != D3D_OK) ? hr1 : hr2;
     }
@@ -611,7 +684,10 @@ static HRESULT ensureSceneActive() {
             return hr;
         }
         if (ImGuiManager::GetCmdBufferRecording()) {
-            g_cmdBufferSet.active().recordBeginScene();
+            // Don't record BeginScene to UI buffer — UI replay happens within the existing scene
+            if (g_cmdBufferSet.activeStage != CmdStage::UI) {
+                g_cmdBufferSet.active().recordBeginScene();
+            }
         }
         sceneForwarded = true;
         scenePending = false;
@@ -632,6 +708,7 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
     // Offscreen scene collapsing: keep one device-level scene open for all offscreen work
     // This eliminates per-scene DXVK command buffer submissions
     if (!rendertargetNormal) {
+        g_cmdBufferSet.activeStage = CmdStage::Offscreen;
         g_suppressingCurrentScene = false;
         if (!g_offscreenTimingActive) {
             QueryPerformanceCounter(&g_offscreenStartQPC);
@@ -643,8 +720,13 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
         if (!g_offscreenMegaScene) {
             // First offscreen scene: open device scene, keep it open for all subsequent offscreen work
             flushPendingRT();
-            ProxyDevice::BeginScene();
-            if (ImGuiManager::GetCmdBufferRecording()) {
+            if (!shouldSuppressMWState()) {
+                ProxyDevice::BeginScene();
+            }
+            if (ImGuiManager::GetCmdBufferRecording() && !ImGuiManager::GetCmdBufferReplay()) {
+                // Only record BeginScene when not replaying — during replay, the Offscreen
+                // buffer is replayed inside an existing scene (from ensureSceneActive).
+                // Recording BeginScene/EndScene would close that scene and break subsequent draws.
                 g_cmdBufferSet.active().recordBeginScene();
             }
             g_offscreenMegaScene = true;
@@ -656,11 +738,14 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
         g_suppressingCurrentScene = false;
         // Transitioning back to normal rendering — close the offscreen mega-scene
         if (g_offscreenMegaScene) {
-            if (ImGuiManager::GetCmdBufferRecording()) {
+            if (ImGuiManager::GetCmdBufferRecording() && !ImGuiManager::GetCmdBufferReplay()) {
                 g_cmdBufferSet.active().recordEndScene();
             }
-            ProxyDevice::EndScene();
+            if (!shouldSuppressMWState()) {
+                ProxyDevice::EndScene();
+            }
             g_offscreenMegaScene = false;
+            g_cmdBufferSet.activeStage = CmdStage::PreScene;
         }
     }
 
@@ -740,6 +825,12 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                 }
 
                 DistantLand::postProcess(&frameCtx);
+
+                // Record state preamble AFTER postProcess — captures actual device state MW sees
+                // postProcess has its own state block but may leak some state
+                if (stage0Complete && isHLSLActive() && ImGuiManager::GetCmdBufferRecording()) {
+                    recordUIStatePreamble(realDevice, g_cmdBufferSet[CmdStage::UI]);
+                }
 
                 // UI command buffer is replayed at EndScene (after all UI draws are recorded)
             }
@@ -847,13 +938,18 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
         sceneForwarded = false;
         scenePending = false;
         if (ImGuiManager::GetCmdBufferRecording()) {
-            g_cmdBufferSet.active().recordEndScene();
+            // Don't record EndScene to UI buffer — UI replay happens within the existing scene
+            if (g_cmdBufferSet.activeStage != CmdStage::UI) {
+                g_cmdBufferSet.active().recordEndScene();
+            }
         }
+
+        // UI replay disabled — UI draws go direct to device for correct hit-testing
+        // and inherited state. Will be re-enabled when Scene0 suppression + render thread
+        // overlap is implemented (UI stays on main thread either way).
+        // UI command buffer is still recorded for diagnostics and future use.
+
         HRESULT hr = ProxyDevice::EndScene();
-
-        // UI draws go direct to device (not suppressed), so no UI buffer replay needed here.
-        // Future Phase 2 (full state suppression) will replay UI buffer when draws are suppressed.
-
         return hr;
     }
 
@@ -885,6 +981,12 @@ HRESULT _stdcall MGEProxyDevice::CopyRects(IDirect3DSurface8* a, const RECT* b, 
             }
         }
     }
+
+    // DIAGNOSTIC: CopyRects deferral disabled — always execute immediately.
+    // if (isHLSLActive() && ImGuiManager::GetCmdBufferReplay() && b == NULL && e == NULL) {
+    //     ...defer to Offscreen buffer replay...
+    // }
+
     return ProxyDevice::CopyRects(a, b, c, d, e);
 }
 
@@ -1241,9 +1343,8 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
         ImGuiManager::LogFrameEvent(FrameEvent::DIP_Opaque, sceneCount, e);
     }
 
-    // Suppress scene draws in replay mode — HLSL replay (hlslCmds) handles them via executeGpuPhase
-    // UI draws (!isMainView) go direct to device — no command buffer replay needed for UI
-    // Standard/PPL modes keep dual-write: draws go to device AND get recorded
+    // Suppress scene draws in replay mode — replayed via executeGpuPhase HLSL pipeline.
+    // UI draws (!isMainView) go direct to device for correct hit-testing and inherited state.
     if (isMainView && isHLSLActive() && ImGuiManager::GetCmdBufferReplay()) return D3D_OK;
     return ProxyDevice::DrawIndexedPrimitive(a, b, c, d, e);
 }

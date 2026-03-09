@@ -14,7 +14,8 @@ struct D3DCmd {
         Cmd_BeginScene, Cmd_EndScene, Cmd_SetViewport,
         Cmd_SetVertexShader, Cmd_SetPixelShader,
         Cmd_SetVSConstantF, Cmd_SetPSConstantF,
-        Cmd_SetVSConstantI, Cmd_SetPSConstantI
+        Cmd_SetVSConstantI, Cmd_SetPSConstantI,
+        Cmd_GetRenderTargetData
     };
     Type type;
 
@@ -40,11 +41,12 @@ struct D3DCmd {
         struct { IDirect3DVertexShader9* shader; } vs;
         struct { IDirect3DPixelShader9* shader; } ps;
         struct { UINT startReg; UINT count; UINT arenaOffset; } constF;
+        struct { IDirect3DSurface9* source; IDirect3DSurface9* dest; } rtData;
     };
 };
 
 enum class CmdStage : uint8_t {
-    PreScene, Scene0, InterScene, Scene1Plus, UI, Count
+    Offscreen, PreScene, Scene0, InterScene, Scene1Plus, UI, Count
 };
 
 const char* CmdStageName(CmdStage s);
@@ -92,6 +94,7 @@ public:
     void recordSetPSConstantF(UINT startReg, const float* data, UINT count);
     void recordSetVSConstantI(UINT startReg, const int* data, UINT count);
     void recordSetPSConstantI(UINT startReg, const int* data, UINT count);
+    void recordGetRenderTargetData(IDirect3DSurface9* source, IDirect3DSurface9* dest);
 
     int size() const { return (int)commands.size(); }
     size_t sizeBytes() const { return commands.size() * sizeof(D3DCmd) + constantArena.size() * sizeof(float); }
