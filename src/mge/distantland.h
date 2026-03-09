@@ -262,6 +262,7 @@ public:
     static void renderShadowDebug(DLContext* ctx);
 
     static void postProcess(DLContext* ctx);
+    static void postProcess(DLContext* ctx, const PostProcessData& ppd);
     static void updatePostShader(MGEShader* shader);
 
     static void requestCapture(std::function<void(IDirect3DSurface9*)> handler, bool captureWithUI);

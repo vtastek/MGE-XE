@@ -4493,6 +4493,26 @@ void FixedFunctionShader::finalizeAndRender(DLContext* frameCtx, bool waterSeen)
         fb.dlContext = *frameCtx;
         fb.waterSeen = waterSeen;
 
+        // Capture MWBridge state for postProcess (render thread safe)
+        {
+            auto mwBridge = MWBridge::get();
+            auto& ppd = fb.postProcessData;
+            ppd.frameTime = mwBridge->frameTime();
+            ppd.simulationTime = mwBridge->simulationTime();
+            ppd.waterLevel = mwBridge->CellHasWater() ? mwBridge->WaterLevel() : -1e9f;
+            ppd.isMenu = mwBridge->IsMenu();
+            ppd.isInterior = !mwBridge->CellHasWeather();
+            ppd.isUnderwater = mwBridge->IsUnderwater(frameCtx->eyePos.z);
+
+            int envFlags = 0;
+            if (!mwBridge->CellHasWeather()) envFlags |= 1;
+            if (mwBridge->IsExterior()) envFlags |= 2;
+            if (mwBridge->IntLikeExterior()) envFlags |= 4;
+            if (ppd.isUnderwater) envFlags |= 8; else envFlags |= 16;
+            if (frameCtx->sunVis >= 0.001) envFlags |= 32; else envFlags |= 64;
+            ppd.envFlags = envFlags;
+        }
+
         if (g_renderThread && g_renderThread->isRunning()) {
             RenderThread::SceneWork work;
             work.type = RenderThread::WorkType::RenderFullFrame;

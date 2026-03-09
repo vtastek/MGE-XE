@@ -19,6 +19,8 @@ PassBreakCounters g_passBreaks;
 
 // File-scope ctx pointer for updatePostShader callback (set/cleared in postProcess)
 static DLContext* s_postShaderCtx = nullptr;
+// File-scope pointer for updatePostShader to access captured MWBridge state
+static const PostProcessData* s_postProcessData = nullptr;
 
 // captureContext - Snapshot staging into a DLContext for this frame
 DLContext DistantLand::captureContext() {
@@ -813,9 +815,52 @@ void DistantLand::postProcess(DLContext* ctx) {
     }
 }
 
+// postProcess overload using captured PostProcessData (render thread safe)
+void DistantLand::postProcess(DLContext* ctx, const PostProcessData& ppd) {
+    ImGuiManager::LogFrameEvent(FrameEvent::MGE_PostProcess, -1);
+    if (!ctx->isRenderCached) {
+        // Save state block
+        IDirect3DStateBlock9* stateSaved;
+        device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
+
+        if (Configuration.MGEFlags & USE_HW_SHADER) {
+            // Run all shaders (with callback to set changed vars)
+            s_postShaderCtx = ctx;
+            s_postProcessData = &ppd;
+            PostShaders::shaderTime(&updatePostShader, ppd.envFlags, ppd.frameTime);
+            s_postProcessData = nullptr;
+            s_postShaderCtx = nullptr;
+        }
+
+        // Capture pre-UI screenshots here
+        checkCaptureScreenshot(false);
+
+        // Cache render for first frame of menu mode
+        if ((Configuration.MGEFlags & USE_MENU_CACHING) && ppd.isMenu) {
+            texDistantBlend = PostShaders::borrowBuffer(0);
+            // TODO: For async N-1, this write to s_staging must complete before the next frame reads it
+            s_staging.isRenderCached = true;
+        }
+
+        // Restore state
+        stateSaved->Apply();
+        stateSaved->Release();
+    } else {
+        // Blit cached frame to screen
+        IDirect3DSurface9* backbuffer, *surfDistant;
+        device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backbuffer);
+        texDistantBlend->GetSurfaceLevel(0, &surfDistant);
+        device->StretchRect(surfDistant, 0, backbuffer, 0, D3DTEXF_NONE);
+        surfDistant->Release();
+        backbuffer->Release();
+
+        // Cache expires for frame after mouse click, so as not to affect click response time
+        s_staging.isRenderCached &= !MGEProxyDirectInput::mouseClick;
+    }
+}
+
 // updatePostShader - callback for setting post shader variables based on environment
 void DistantLand::updatePostShader(MGEShader* shader) {
-    auto mwBridge = MWBridge::get();
     const DLContext* ctx = s_postShaderCtx;
 
     // Internal textures
@@ -848,13 +893,20 @@ void DistantLand::updatePostShader(MGEShader* shader) {
     shader->SetFloat(EV_fognearstart, ctx->fogNearStart);
     shader->SetFloat(EV_fognearrange, ctx->fogNearEnd);
 
-    // Other
-    // In cells without water, set very low waterlevel for shaders that clip against water
-    float water = mwBridge->CellHasWater() ? mwBridge->WaterLevel() : -1e9f;
-    shader->SetFloat(EV_time, mwBridge->simulationTime());
-    shader->SetFloat(EV_waterlevel, water);
-    shader->SetBool(EV_isinterior, !mwBridge->CellHasWeather());
-    shader->SetBool(EV_isunderwater, mwBridge->IsUnderwater(ctx->eyePos.z));
+    // Other — use captured PostProcessData when available, else fall back to MWBridge
+    if (s_postProcessData) {
+        shader->SetFloat(EV_time, s_postProcessData->simulationTime);
+        shader->SetFloat(EV_waterlevel, s_postProcessData->waterLevel);
+        shader->SetBool(EV_isinterior, s_postProcessData->isInterior);
+        shader->SetBool(EV_isunderwater, s_postProcessData->isUnderwater);
+    } else {
+        auto mwBridge = MWBridge::get();
+        float water = mwBridge->CellHasWater() ? mwBridge->WaterLevel() : -1e9f;
+        shader->SetFloat(EV_time, mwBridge->simulationTime());
+        shader->SetFloat(EV_waterlevel, water);
+        shader->SetBool(EV_isinterior, !mwBridge->CellHasWeather());
+        shader->SetBool(EV_isunderwater, mwBridge->IsUnderwater(ctx->eyePos.z));
+    }
 }
 
 //------------------------------------------------------------

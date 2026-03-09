@@ -824,10 +824,16 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                     realDevice->Clear(0, NULL, D3DCLEAR_ZBUFFER, 0, 1.0f, 0);
                 }
 
-                DistantLand::postProcess(&frameCtx);
+                // postProcess: HLSL mode uses captured PostProcessData (render thread ready),
+                // non-HLSL mode uses MWBridge directly (original path)
+                if (stage0Complete && isHLSLActive()) {
+                    auto& fb = FixedFunctionShader::currentFrameBuffer();
+                    DistantLand::postProcess(&frameCtx, fb.postProcessData);
+                } else {
+                    DistantLand::postProcess(&frameCtx);
+                }
 
-                // Record state preamble AFTER postProcess — captures actual device state MW sees
-                // postProcess has its own state block but may leak some state
+                // Record state preamble AFTER finalizeAndRender — captures actual device state MW sees
                 if (stage0Complete && isHLSLActive() && ImGuiManager::GetCmdBufferRecording()) {
                     recordUIStatePreamble(realDevice, g_cmdBufferSet[CmdStage::UI]);
                 }
@@ -1343,9 +1349,10 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
         ImGuiManager::LogFrameEvent(FrameEvent::DIP_Opaque, sceneCount, e);
     }
 
-    // Suppress scene draws in replay mode — replayed via executeGpuPhase HLSL pipeline.
-    // UI draws (!isMainView) go direct to device for correct hit-testing and inherited state.
-    if (isMainView && isHLSLActive() && ImGuiManager::GetCmdBufferReplay()) return D3D_OK;
+    // In HLSL mode, inspectIndexedPrimitive already returns false (suppressing) for all
+    // draws it records (HLSL scene objects, sky with ATM_SCATTER). Draws that reach here
+    // returned true from inspect — they are NOT part of the HLSL replay pipeline
+    // (e.g. sky without ATM_SCATTER) and must go through to the device.
     return ProxyDevice::DrawIndexedPrimitive(a, b, c, d, e);
 }
 
@@ -1449,7 +1456,6 @@ HRESULT _stdcall MGEProxyDevice::DrawPrimitive(D3DPRIMITIVETYPE a, UINT b, UINT 
     }
     if (!rendertargetNormal && (g_suppressingCurrentScene || ImGuiManager::GetSuppressOffscreen())) return D3D_OK;
     ensureSceneActive();
-    if (isMainView && isHLSLActive() && ImGuiManager::GetCmdBufferReplay()) return D3D_OK;
     return ProxyDevice::DrawPrimitive(a, b, c);
 }
 

@@ -49,6 +49,17 @@ struct DLContext {
     bool isPPLActive;
 };
 
+// Captured MWBridge state for postProcess — allows render thread execution without MWBridge access
+struct PostProcessData {
+    int envFlags;           // computed from CellHasWeather/IsExterior/IntLikeExterior/IsUnderwater/sunVis
+    float frameTime;        // mwBridge->frameTime()
+    float simulationTime;   // mwBridge->simulationTime()
+    float waterLevel;       // mwBridge->WaterLevel() or -1e9 if no water
+    bool isMenu;            // mwBridge->IsMenu()
+    bool isInterior;        // !mwBridge->CellHasWeather()
+    bool isUnderwater;      // mwBridge->IsUnderwater(eyePos.z)
+};
+
 // Render bin classification for Tracy profiling and debug visualization
 enum class RenderBin : uint8_t {
     Terrain,      // Landscape verts (future: detected by land splat pattern)
@@ -683,6 +694,9 @@ public:
         // HLSL replay command buffer — built by replayRecordedCalls, replayed in executeGpuPhase
         D3DCommandBuffer hlslCmds;
 
+        // Captured MWBridge state for postProcess (render thread safe)
+        PostProcessData postProcessData = {};
+
         bool valid;
         BufferState state;
 
@@ -699,6 +713,7 @@ public:
             texDistantBlend = nullptr;
             postRecordingState = {};
             hlslCmds.clear();
+            postProcessData = {};
             valid = false;
         }
 
