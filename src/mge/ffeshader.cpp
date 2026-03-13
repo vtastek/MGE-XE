@@ -13,6 +13,7 @@
 #include "distantland.h"
 #include "imgui_manager.h"
 #include "hlsl_shader_manager.h"
+#include "shader_utils.h"
 
 #include <algorithm>
 #include <sstream>
@@ -51,10 +52,6 @@ float FixedFunctionShader::sunMultiplier, FixedFunctionShader::ambMultiplier;
 // During replay, points to fb.shadowViewproj (recording-time matrices).
 // Outside replay, nullptr — callers fall back to s_staging.smViewproj.
 static const D3DXMATRIX* s_activeShadowVP = nullptr;
-
-// DXVK detection static variables
-static bool dxvkDetectionCached = false;
-static bool dxvkDetectionResult = false;
 
 // HLSL Pipeline static variables
 unordered_map<FixedFunctionShader::ShaderKey, FixedFunctionShader::HLSLShader, FixedFunctionShader::ShaderKey::hasher> FixedFunctionShader::cacheHLSLShaders;
@@ -187,7 +184,6 @@ std::vector<FixedFunctionShader::PerObjectLightInfo> FixedFunctionShader::perObj
 float FixedFunctionShader::perObjectTexelSize = 0.0f;
 IDirect3DTexture9* FixedFunctionShader::texPerObjectLightData = nullptr;
 
-std::unordered_map<std::string, FixedFunctionShader::CachedShaderSource> FixedFunctionShader::shaderSourceCache;
 SRWLOCK FixedFunctionShader::hlslCacheLock = SRWLOCK_INIT;
 HANDLE FixedFunctionShader::precacheThread = nullptr;
 
@@ -207,90 +203,6 @@ static std::unordered_map<IDirect3DTexture9*, D3DXVECTOR2> textureResolutionCach
 void (*g_onTextureReleased)(IDirect3DTexture9* realTexture) = nullptr;
 
 static string buildArgString(DWORD arg, const string& mask, const string& sampler);
-
-// DXVK detection function
-static bool isDXVK() {
-    if (dxvkDetectionCached) {
-        return dxvkDetectionResult;
-    }
-
-    dxvkDetectionCached = true;
-    dxvkDetectionResult = false;
-
-    // Get d3d9.dll version info to detect DXVK
-    DWORD dwHandle = 0;
-    DWORD dwSize = GetFileVersionInfoSizeA("d3d9.dll", &dwHandle);
-    if (dwSize == 0) {
-        return false;
-    }
-
-    std::vector<BYTE> versionInfo(dwSize);
-    if (!GetFileVersionInfoA("d3d9.dll", dwHandle, dwSize, versionInfo.data())) {
-        return false;
-    }
-
-    // Try multiple language/codepage combinations
-    const char* langCodes[] = {
-        "040904b0", // US English
-        "040904E4", // US English (another variant)
-        "04090000", // English (neutral)
-        "000004b0", // Neutral language, US English codepage
-        "00000000"  // Neutral language, neutral codepage
-    };
-
-    std::string productName;
-    bool foundProductName = false;
-
-    for (const char* langCode : langCodes) {
-        std::string queryPath = std::string("\\StringFileInfo\\") + langCode + "\\ProductName";
-        LPVOID lpBuffer = nullptr;
-        UINT uLen = 0;
-
-        if (VerQueryValueA(versionInfo.data(), queryPath.c_str(), &lpBuffer, &uLen) && lpBuffer && uLen > 0) {
-            productName = static_cast<char*>(lpBuffer);
-            foundProductName = true;
-            break;
-        }
-    }
-
-    if (!foundProductName) {
-        // Try to enumerate available language/codepage combinations
-        struct LANGANDCODEPAGE {
-            WORD wLanguage;
-            WORD wCodePage;
-        } *lpTranslate;
-
-        UINT cbTranslate = 0;
-        if (VerQueryValueA(versionInfo.data(), "\\VarFileInfo\\Translation", (LPVOID*)&lpTranslate, &cbTranslate)) {
-            for (size_t i = 0; i < (cbTranslate / sizeof(LANGANDCODEPAGE)); i++) {
-                char langCode[9];
-                std::snprintf(langCode, sizeof(langCode), "%04x%04x", lpTranslate[i].wLanguage, lpTranslate[i].wCodePage);
-
-                std::string queryPath = std::string("\\StringFileInfo\\") + langCode + "\\ProductName";
-                LPVOID lpBuffer = nullptr;
-                UINT uLen = 0;
-
-                if (VerQueryValueA(versionInfo.data(), queryPath.c_str(), &lpBuffer, &uLen) && lpBuffer && uLen > 0) {
-                    productName = static_cast<char*>(lpBuffer);
-                    foundProductName = true;
-                    break;
-                }
-            }
-        }
-
-        if (!foundProductName) {
-            return false;
-        }
-    }
-
-    // Check if this is DXVK
-    if (productName.find("DXVK") != std::string::npos) {
-        dxvkDetectionResult = true;
-        LOG::logline("-- DXVK detected, fast compilation enabled");
-    }
-
-    return dxvkDetectionResult;
-}
 
 bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
     // Join precache thread — it ran during BSA/distant land init, should be nearly done
@@ -2546,7 +2458,7 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::createPurpleErrorShader() {
     // Compile vertex shader
     ID3DBlob* vsBlob = nullptr;
     ID3DBlob* vsErrors = nullptr;
-    DWORD vsCompileFlags = isDXVK() ? D3DCOMPILE_OPTIMIZATION_LEVEL1 : D3DCOMPILE_OPTIMIZATION_LEVEL3;
+    DWORD vsCompileFlags = ShaderUtils::isDXVK() ? D3DCOMPILE_OPTIMIZATION_LEVEL1 : D3DCOMPILE_OPTIMIZATION_LEVEL3;
     HRESULT hr = D3DCompile(vsCode, strlen(vsCode), "ErrorShader.hlsl", nullptr, nullptr, 
                            "vs_main", "vs_3_0", vsCompileFlags, 0, &vsBlob, &vsErrors);
     
@@ -2574,7 +2486,7 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::createPurpleErrorShader() {
     // Compile pixel shader
     ID3DBlob* psBlob = nullptr;
     ID3DBlob* psErrors = nullptr;
-    DWORD psCompileFlags = isDXVK() ? D3DCOMPILE_OPTIMIZATION_LEVEL1 : D3DCOMPILE_OPTIMIZATION_LEVEL3;
+    DWORD psCompileFlags = ShaderUtils::isDXVK() ? D3DCOMPILE_OPTIMIZATION_LEVEL1 : D3DCOMPILE_OPTIMIZATION_LEVEL3;
     hr = D3DCompile(psCode, strlen(psCode), "ErrorShader.hlsl", nullptr, nullptr, 
                    "ps_main", "ps_3_0", psCompileFlags, 0, &psBlob, &psErrors);
     
@@ -2605,70 +2517,6 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::createPurpleErrorShader() {
     return errorShader;
 }
 
-// Helper function to load shader source from file
-char* FixedFunctionShader::loadShaderFile(const char* filename, DWORD* outFileSize) {
-    std::string key(filename);
-    
-    // Check if we have cached version
-    auto it = shaderSourceCache.find(key);
-    if (it != shaderSourceCache.end()) {
-        // Check if file has been modified since we cached it
-        WIN32_FIND_DATAA findData;
-        HANDLE hFind = FindFirstFileA(filename, &findData);
-        if (hFind != INVALID_HANDLE_VALUE) {
-            FindClose(hFind);
-            if (CompareFileTime(&it->second.lastWriteTime, &findData.ftLastWriteTime) == 0) {
-                // File unchanged, return cached version
-                if (outFileSize) *outFileSize = it->second.size;
-                char* cachedCopy = new char[it->second.size + 1];
-                memcpy(cachedCopy, it->second.source, it->second.size);
-                cachedCopy[it->second.size] = '\0';
-                return cachedCopy;
-            } else {
-                // File changed! Mark for recompilation but don't clear cache immediately
-                delete[] it->second.source;
-                shaderSourceCache.erase(it);
-                // Cache will be cleared by invalidateShaderSourceCache() on main thread
-            }
-        }
-    }
-    
-    // Get file attributes for initial caching
-    WIN32_FIND_DATAA findData;
-    HANDLE hFind = FindFirstFileA(filename, &findData);
-    if (hFind == INVALID_HANDLE_VALUE) {
-        LOG::logline("!! HLSL file not found: %s", filename);
-        return nullptr;
-    }
-    FindClose(hFind);
-    
-    // Read file from disk
-    HANDLE hFile = CreateFileA(filename, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        LOG::logline("!! HLSL file read error: %s", filename);
-        return nullptr;
-    }
-    
-    DWORD fileSize = GetFileSize(hFile, nullptr);
-    char* shaderSource = new char[fileSize + 1];
-    DWORD bytesRead;
-    ReadFile(hFile, shaderSource, fileSize, &bytesRead, nullptr);
-    shaderSource[fileSize] = '\0';
-    CloseHandle(hFile);
-    
-    // Cache the result
-    CachedShaderSource cached;
-    cached.source = new char[fileSize + 1];
-    memcpy(cached.source, shaderSource, fileSize);
-    cached.source[fileSize] = '\0';
-    cached.size = fileSize;
-    cached.lastWriteTime = findData.ftLastWriteTime;
-    shaderSourceCache[key] = cached;
-    
-    if (outFileSize) *outFileSize = fileSize;
-    return shaderSource;
-}
-
 void FixedFunctionShader::invalidateShaderSourceCache() {
     // 1. Join precache thread if still running
     if (precacheThread) {
@@ -2696,13 +2544,10 @@ void FixedFunctionShader::invalidateShaderSourceCache() {
     }
     cacheHLSLShaders.clear();
 
-    // Clear shader source cache for hot reloading
-    for (auto& i : shaderSourceCache) {
-        delete[] i.second.source;
-    }
-    shaderSourceCache.clear();
-
     ReleaseSRWLockExclusive(&hlslCacheLock);
+
+    // Clear shader source cache for hot reloading (delegated to HLSLShaderManager)
+    HLSLShaderManager::invalidateHLSLCache();
 
     // 4. Restart async compiler for future on-demand compilations
     startAsyncCompiler();
@@ -2805,37 +2650,6 @@ void FixedFunctionShader::processAsyncCompletions() {
     }
 }
 
-void FixedFunctionShader::checkForShaderFileChanges() {
-    // Check if any cached shader files have been modified
-    const char* shaderFiles[] = {
-        "Data Files\\shaders\\core-hlsl\\XE FixedFuncEmu_VS.hlsl",
-        "Data Files\\shaders\\core-hlsl\\XE FixedFuncEmu_PS.hlsl"
-    };
-    
-    bool anyChanged = false;
-    for (const char* filename : shaderFiles) {
-        std::string key(filename);
-        auto it = shaderSourceCache.find(key);
-        if (it != shaderSourceCache.end()) {
-            // Check file modification time
-            WIN32_FIND_DATAA findData;
-            HANDLE hFind = FindFirstFileA(filename, &findData);
-            if (hFind != INVALID_HANDLE_VALUE) {
-                FindClose(hFind);
-                if (CompareFileTime(&it->second.lastWriteTime, &findData.ftLastWriteTime) != 0) {
-                    anyChanged = true;
-                    break;
-                }
-            }
-        }
-    }
-    
-    if (anyChanged) {
-        LOG::logline("-- HLSL shader files changed, invalidating cache for hot reload");
-        invalidateShaderSourceCache();
-    }
-}
-
 // Resolve a D3DXHANDLE to register offset using GetConstantDesc
 FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const ShaderKey& sk) {
     HLSLShader hlslShader = {};
@@ -2846,8 +2660,8 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     
     // Load separate vertex and pixel shader files
     DWORD vsFileSize = 0, psFileSize = 0;
-    char* vertexShaderSource = loadShaderFile("Data Files\\shaders\\core-hlsl\\XE FixedFuncEmu_VS.hlsl", &vsFileSize);
-    char* pixelShaderSource = loadShaderFile("Data Files\\shaders\\core-hlsl\\XE FixedFuncEmu_PS.hlsl", &psFileSize);
+    char* vertexShaderSource = HLSLShaderManager::loadHLSLShaderFile("Data Files\\shaders\\core-hlsl\\XE FixedFuncEmu_VS.hlsl", &vsFileSize);
+    char* pixelShaderSource = HLSLShaderManager::loadHLSLShaderFile("Data Files\\shaders\\core-hlsl\\XE FixedFuncEmu_PS.hlsl", &psFileSize);
     
     if (!vertexShaderSource || !pixelShaderSource) {
         if (vertexShaderSource) delete[] vertexShaderSource;
@@ -2909,7 +2723,7 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
 
     // Match D3DX9 effect compilation - no IEEE_STRICTNESS for invariance with depth pass
     DWORD vsCompileFlags = D3DCOMPILE_PREFER_FLOW_CONTROL;
-    if (isDXVK()) {
+    if (ShaderUtils::isDXVK()) {
         vsCompileFlags |= D3DCOMPILE_OPTIMIZATION_LEVEL1;
     } else {
         vsCompileFlags |= D3DCOMPILE_OPTIMIZATION_LEVEL3;
@@ -3003,7 +2817,7 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
 
     // Match D3DX9 effect compilation - no IEEE_STRICTNESS for invariance with depth pass
     DWORD psCompileFlags = D3DCOMPILE_PREFER_FLOW_CONTROL;
-    if (isDXVK()) {
+    if (ShaderUtils::isDXVK()) {
         psCompileFlags |= D3DCOMPILE_OPTIMIZATION_LEVEL1;
     } else {
         psCompileFlags |= D3DCOMPILE_OPTIMIZATION_LEVEL3;
@@ -3201,12 +3015,9 @@ void FixedFunctionShader::release() {
         hlslShaderDefaultPurple.psConstantTable->Release();
         hlslShaderDefaultPurple.psConstantTable = nullptr;
     }
-    
-    // Clean up shader source cache
-    for (auto& i : shaderSourceCache) {
-        delete[] i.second.source;
-    }
-    shaderSourceCache.clear();
+
+    // Clean up shader source cache (delegated to HLSLShaderManager)
+    HLSLShaderManager::invalidateHLSLCache();
 
     // Reset material state cache
     materialCache.reset();

@@ -342,13 +342,6 @@ private:
     // Diagnostic: track which precached variants get hit (temporary)
     static std::unordered_set<ShaderKey, ShaderKey::hasher> diagHitKeys;
 
-    // Shader source caching for hot reload support
-    struct CachedShaderSource {
-        char* source;
-        DWORD size;
-        FILETIME lastWriteTime;
-    };
-    static std::unordered_map<std::string, CachedShaderSource> shaderSourceCache;
     static SRWLOCK hlslCacheLock;  // Protects cacheHLSLShaders (zero-init = valid)
     static HANDLE precacheThread;  // Joinable precache thread handle
 
@@ -530,8 +523,6 @@ private:
     
     static std::unordered_map<VertexShaderKey, IDirect3DVertexShader9*, VertexShaderKey::hasher> vertexShaderCache;
 
-    static char* loadShaderFile(const char* filename, DWORD* outFileSize);
-    static bool detectDXVK();
     static HLSLShader generateMWShaderHLSL(const ShaderKey& sk);
     static HLSLShader createPurpleErrorShader();
     static void captureAndDumpTexture(IDirect3DTexture9* texture);
@@ -873,7 +864,6 @@ public:
     static void renderMorrowindHLSL(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, int recordMWIdx = -1);
     static void release();
     static void invalidateShaderSourceCache();
-    static void checkForShaderFileChanges();
     static void startAsyncCompiler();
     static void stopAsyncCompiler();
     static void queueShaderCompilation(const ShaderKey& key);
