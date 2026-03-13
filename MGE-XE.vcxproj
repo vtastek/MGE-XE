@@ -124,6 +124,7 @@
     <ClCompile Include="src\mge\distantland.cpp" />
     <ClCompile Include="src\mge\dlmath.cpp" />
     <ClCompile Include="src\mge\ffeshader.cpp" />
+    <ClCompile Include="src\mge\hiz_culling.cpp" />
     <ClCompile Include="src\mge\cullthread.cpp" />
     <ClCompile Include="src\mge\renderthread.cpp" />
     <ClCompile Include="src\mge\distantlandhlsl.cpp" />
