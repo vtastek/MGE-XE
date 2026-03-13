@@ -1,0 +1,77 @@
+// Texture suffix resolution and caching system
+// Handles BSA texture suffix detection (_diffparam, _paramh, _paramx, _grass)
+#pragma once
+
+#include "proxydx/d3d8header.h"
+#include "morrowindbsa.h"
+#include <unordered_map>
+#include <string>
+
+namespace TextureSuffix {
+
+// Texture suffix flags for shader variant selection
+struct SuffixTextureFlags {
+    bool hasDiffParam = false;
+    bool hasParamH = false;
+    bool hasParamX = false;
+    bool hasGrass = false;
+};
+
+// Cached texture resolution data (avoids repeated hash calculations)
+struct ResolutionCache {
+    BSA::TextureRuntimeHash hash;
+    std::string textureName;
+    bool hasValidName;
+    const BSA::TextureSuffixVariants* variants;
+
+    ResolutionCache() : hasValidName(false), variants(nullptr) {}
+};
+
+// Suffix texture binding state (for caching bound textures)
+struct BindingState {
+    IDirect3DTexture9* lastBaseTexture;  // Texture pointer for fast comparison
+    std::string currentBaseTextureName;
+    IDirect3DTexture9* boundDiffParam;
+    IDirect3DTexture9* boundParamH;
+    IDirect3DTexture9* boundParamX;
+
+    BindingState() : lastBaseTexture(nullptr), boundDiffParam(nullptr), boundParamH(nullptr), boundParamX(nullptr) {}
+
+    void reset() {
+        lastBaseTexture = nullptr;
+        currentBaseTextureName.clear();
+        boundDiffParam = nullptr;
+        boundParamH = nullptr;
+        boundParamX = nullptr;
+    }
+};
+
+// Initialize the suffix system
+void init();
+
+// Pre-populate suffix cache during recording (main thread only).
+// Device calls (CreateTexture, GetRenderTargetData) are only safe on the main thread.
+void warmCache(IDirect3DDevice9* device, IDirect3DTexture9* texture);
+
+// Get suffix flags for a specific texture
+SuffixTextureFlags getFlagsForTexture(IDirect3DDevice9* device, IDirect3DTexture9* texture);
+
+// Look up cached resolution data for a texture (returns nullptr if not cached)
+const ResolutionCache* getCachedResolution(IDirect3DTexture9* texture);
+
+// Get or create resolution cache entry (may perform expensive hash calculation)
+const ResolutionCache* getOrCreateResolution(IDirect3DDevice9* device, IDirect3DTexture9* texture, bool allowDeviceCalls = true);
+
+// Texture release callback (evicts from cache on texture free)
+void onTextureReleased(IDirect3DTexture9* texture);
+
+// Get the binding state for caching suffix texture binds
+BindingState& getBindingState();
+
+// Access the resolution cache lock for thread-safe operations
+SRWLOCK& getCacheLock();
+
+// Clear all caches (for testing or reset)
+void clearCaches();
+
+} // namespace TextureSuffix

@@ -129,6 +129,7 @@
     <ClCompile Include="src\mge\distantlandhlsl.cpp" />
     <ClCompile Include="src\mge\shader_utils.cpp" />
     <ClCompile Include="src\mge\suffix_texture_support.cpp" />
+    <ClCompile Include="src\mge\texture_suffix.cpp" />
     <ClCompile Include="src\mge\hlsl_shader_manager.cpp" />
     <ClCompile Include="src\mge\async_shader_compiler.cpp" />
     <ClCompile Include="src\mge\softwareocclusion.cpp" />
@@ -217,6 +218,7 @@
     <ClInclude Include="src\mge\renderthread.h" />
     <ClInclude Include="src\mge\distantlandhlsl.h" />
     <ClInclude Include="src\mge\suffix_texture_support.h" />
+    <ClInclude Include="src\mge\texture_suffix.h" />
     <ClInclude Include="src\mge\hlsl_shader_manager.h" />
     <ClInclude Include="src\mge\async_shader_compiler.h" />
     <ClInclude Include="src\mge\ffe_core_rendering.h" />

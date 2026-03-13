@@ -1,5 +1,6 @@
 
 #include "ffeshader.h"
+#include "texture_suffix.h"
 #include "cullthread.h"
 #include "renderthread.h"
 #include "d3dcommandbuffer.h"
@@ -199,154 +200,11 @@ std::atomic<bool> FixedFunctionShader::shutdownCompiler(false);
 std::unordered_map<FixedFunctionShader::ShaderKey, std::shared_ptr<FixedFunctionShader::AsyncShaderRequest>, FixedFunctionShader::ShaderKey::hasher> FixedFunctionShader::pendingCompilations;
 std::unordered_map<FixedFunctionShader::VertexShaderKey, IDirect3DVertexShader9*, FixedFunctionShader::VertexShaderKey::hasher> FixedFunctionShader::vertexShaderCache;
 
-// Current suffix texture flags for shader variant generation
-struct SuffixTextureFlags {
-    bool hasDiffParam = false;
-    bool hasParamH = false;
-    bool hasParamX = false;
-    bool hasGrass = false;
-} static suffixFlags;
-
-// Cache for per-texture suffix flags to avoid repeated hash calculations
-static std::unordered_map<IDirect3DTexture9*, SuffixTextureFlags> textureSuffixCache;
-
 // Cache for texture resolutions to avoid repeated GetLevelDesc calls
 static std::unordered_map<IDirect3DTexture9*, D3DXVECTOR2> textureResolutionCache;
 
-// Texture resolution cache to avoid repeated expensive operations
-struct TextureSuffixResolutionCache {
-    BSA::TextureRuntimeHash hash;
-    std::string textureName;
-    bool hasValidName;
-    const BSA::TextureSuffixVariants* variants;
-
-    TextureSuffixResolutionCache() : hasValidName(false), variants(nullptr) {}
-};
-static std::unordered_map<IDirect3DTexture9*, TextureSuffixResolutionCache> textureSuffixResolutionCache;
-static SRWLOCK textureSuffixLock = SRWLOCK_INIT;
-
 // Texture release callback (evicts from suffix cache on texture free)
 void (*g_onTextureReleased)(IDirect3DTexture9* realTexture) = nullptr;
-
-static void onTextureReleased(IDirect3DTexture9* tex) {
-    AcquireSRWLockExclusive(&textureSuffixLock);
-    textureSuffixResolutionCache.erase(tex);
-    ReleaseSRWLockExclusive(&textureSuffixLock);
-}
-
-// Pre-populate suffix cache during recording (main thread) so that
-// computeShaderKeyWithSuffixes() never needs device calls when called
-// from the cull thread. Device calls (CreateTexture, GetRenderTargetData)
-// are only safe on the main thread.
-static void warmSuffixCache(IDirect3DDevice* dev, IDirect3DTexture9* texture) {
-    if (!texture) return;
-
-    AcquireSRWLockShared(&textureSuffixLock);
-    bool found = textureSuffixResolutionCache.count(texture) > 0;
-    ReleaseSRWLockShared(&textureSuffixLock);
-
-    if (found) return;  // Already cached
-
-    // Expensive path: device calls for hash computation (main thread only)
-    TextureSuffixResolutionCache entry;
-    entry.hash = BSA::calculateTextureHash((IDirect3DDevice9*)dev, texture, false);
-
-    const std::string* textureName = BSA::resolveTextureNameFromHash(entry.hash);
-    if (textureName && entry.hash.crc32 != 0) {
-        entry.textureName = *textureName;
-        entry.hasValidName = true;
-        entry.variants = BSA::getTextureSuffixVariants(textureName->c_str());
-
-        // Pre-load suffix textures so bindShaderTextures never stalls on disk I/O
-        if (entry.variants) {
-            if (entry.variants->hasDiffParamT()) {
-                BSA::loadSuffixTexture((IDirect3DDevice9*)dev, *entry.variants, "diffparam_t");
-            } else if (entry.variants->hasDiffParam()) {
-                BSA::loadSuffixTexture((IDirect3DDevice9*)dev, *entry.variants, "diffparam");
-            }
-            if (entry.variants->hasParamH()) {
-                BSA::loadSuffixTexture((IDirect3DDevice9*)dev, *entry.variants, "paramh");
-            }
-            if (entry.variants->hasParamX()) {
-                BSA::loadSuffixTexture((IDirect3DDevice9*)dev, *entry.variants, "paramx");
-            }
-        }
-    } else {
-        entry.hasValidName = false;
-        entry.variants = nullptr;
-    }
-
-    AcquireSRWLockExclusive(&textureSuffixLock);
-    textureSuffixResolutionCache.emplace(texture, std::move(entry));
-    ReleaseSRWLockExclusive(&textureSuffixLock);
-}
-
-// Suffix texture binding cache to prevent repeated binding operations
-struct SuffixBindingState {
-    IDirect3DTexture9* lastBaseTexture;  // Texture pointer for fast comparison
-    std::string currentBaseTextureName;
-    IDirect3DTexture9* boundDiffParam;
-    IDirect3DTexture9* boundParamH;
-    IDirect3DTexture9* boundParamX;
-    
-    SuffixBindingState() : lastBaseTexture(nullptr), boundDiffParam(nullptr), boundParamH(nullptr), boundParamX(nullptr) {}
-};
-static SuffixBindingState bindingCache;
-
-// Get suffix flags for a specific texture (per-texture, not global)
-static SuffixTextureFlags getSuffixFlagsForTexture(IDirect3DDevice9* device, IDirect3DTexture9* texture) {
-    SuffixTextureFlags flags = {false, false, false, false};
-    
-    if (!texture || Configuration.PerPixelLightFlags != 2) {
-        return flags;
-    }
-    
-    // Check cache first
-    auto cacheIt = textureSuffixCache.find(texture);
-    if (cacheIt != textureSuffixCache.end()) {
-        return cacheIt->second;  // Return cached result
-    }
-    
-    // Not in cache - calculate hash and determine suffix flags (disable caching for unique hashes)
-    BSA::TextureRuntimeHash texHash = BSA::calculateTextureHash(device, texture, false);
-    
-    if (texHash.crc32 != 0) {
-        // Try to resolve texture name from hash
-        const std::string* textureName = BSA::resolveTextureNameFromHash(texHash);
-        if (textureName) {
-            // Hash lookup successful
-            LOG::logline("RUNTIME HASH MATCH: %08x -> %s", texHash.crc32, textureName->c_str());
-            
-            // Look up suffix variants for this specific texture
-            const BSA::TextureSuffixVariants* variants = BSA::getTextureSuffixVariants(textureName->c_str());
-            if (variants && (variants->hasDiffParam() || variants->hasParamH() || variants->hasParamX() || variants->hasGrass())) {
-                // Set flags based on available suffix variants (combinations allowed)
-                flags.hasDiffParam = variants->hasDiffParam() || variants->hasDiffParamT();
-                flags.hasParamH = variants->hasParamH();
-                flags.hasParamX = variants->hasParamX();
-                flags.hasGrass = variants->hasGrass();
-                
-                // DEBUG: Log suffix selection decision and the actual variant paths
-                //LOG::logline("DEBUG SUFFIX SELECTION: %s -> selected: diffparam=%d normal=%d param=%d", 
-                //           textureName->c_str(), flags.hasDiffParam, flags.hasNormal, flags.hasParam);
-                // LOG::logline("DEBUG AVAILABLE VARIANTS: diffparam='%s' normal='%s' param='%s'",
-                //          variants->diffparam.c_str(), variants->normal.c_str(), variants->param.c_str());
-                
-                //const char* selectedType = flags.hasDiffParam ? "diffparam+normal" : 
-                //                         (flags.hasParam ? "param+normal" : "normal-only");
-                // LOG::logline("PER-TEXTURE SUFFIX: %s -> SELECTED: %s", textureName->c_str(), selectedType);
-            }
-        } else {
-            // Hash lookup failed
-            LOG::logline("RUNTIME HASH FAILED: %08x -> NO MATCH FOUND", texHash.crc32);
-        }
-    }
-    
-    // Cache the result
-    textureSuffixCache[texture] = flags;
-    
-    return flags;
-}
 
 static string buildArgString(DWORD arg, const string& mask, const string& sampler);
 
@@ -520,7 +378,7 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
     }
 
     // Register texture release callback for evict-on-release cache management
-    g_onTextureReleased = onTextureReleased;
+    g_onTextureReleased = TextureSuffix::onTextureReleased;
 
     // Create default textures to avoid null binds that cause DXVK descriptor updates
     createDefaultTextures();
@@ -1356,36 +1214,36 @@ void FixedFunctionShader::bindShaderTextures(const ShaderKey& sk, const Rendered
     // Slot 3: ParamX anisotropic
     // Slot 4: Shadow map
 
+    auto& bindState = TextureSuffix::getBindingState();
+
     // Slot 0: Base texture or diffparam replacement (always used by HLSL shaders)
     IDirect3DTexture9* baseTexture = rs->texture;
 
     // Check for diffparam replacement if shader supports it
     if (sk.hasDiffParam) {
-        auto cacheIt = textureSuffixResolutionCache.find(rs->texture);
-        if (cacheIt != textureSuffixResolutionCache.end() &&
-            cacheIt->second.hasValidName && cacheIt->second.variants) {
-
+        const auto* cached = TextureSuffix::getCachedResolution(rs->texture);
+        if (cached && cached->hasValidName && cached->variants) {
             // Use cached diffparam replacement or load once per texture change
-            if (bindingCache.currentBaseTextureName == cacheIt->second.textureName &&
-                bindingCache.boundDiffParam) {
+            if (bindState.currentBaseTextureName == cached->textureName &&
+                bindState.boundDiffParam) {
                 // Use cached replacement
-                baseTexture = bindingCache.boundDiffParam;
+                baseTexture = bindState.boundDiffParam;
             } else {
                 // Load replacement texture once for this base texture
                 IDirect3DTexture9* replacementTexture = nullptr;
-                if (cacheIt->second.variants->hasDiffParamT()) {
+                if (cached->variants->hasDiffParamT()) {
                     replacementTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device,
-                                                              *cacheIt->second.variants, "diffparam_t");
+                                                              *cached->variants, "diffparam_t");
                 }
-                if (!replacementTexture && cacheIt->second.variants->hasDiffParam()) {
+                if (!replacementTexture && cached->variants->hasDiffParam()) {
                     replacementTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device,
-                                                              *cacheIt->second.variants, "diffparam");
+                                                              *cached->variants, "diffparam");
                 }
 
                 if (replacementTexture) {
                     baseTexture = replacementTexture;
                     // Cache this replacement for future use with same base texture
-                    bindingCache.boundDiffParam = replacementTexture;
+                    bindState.boundDiffParam = replacementTexture;
                 }
             }
         }
@@ -1406,59 +1264,41 @@ void FixedFunctionShader::bindShaderTextures(const ShaderKey& sk, const Rendered
     // Slots 2-3: Suffix textures (only if shader has suffix support)
     if (sk.hasDiffParam || sk.hasParamH || sk.hasParamX) {
         // Fast check: if same texture pointer, skip all expensive operations
-        if (bindingCache.lastBaseTexture != rs->texture) {
-            // Check texture suffix resolution cache first
-            auto cacheIt = textureSuffixResolutionCache.find(rs->texture);
-            if (cacheIt == textureSuffixResolutionCache.end()) {
-                // Not in cache, perform expensive resolution
-                TextureSuffixResolutionCache entry;
-                entry.hash = BSA::calculateTextureHash((IDirect3DDevice9*)device, rs->texture, false);
-                const std::string* textureName = BSA::resolveTextureNameFromHash(entry.hash);
-                if (textureName && entry.hash.crc32 != 0) {
-                    entry.textureName = *textureName;
-                    entry.hasValidName = true;
-                    entry.variants = BSA::getTextureSuffixVariants(textureName->c_str());
-                } else {
-                    entry.hasValidName = false;
-                    entry.variants = nullptr;
-                }
+        if (bindState.lastBaseTexture != rs->texture) {
+            // Get or create resolution cache entry (may perform expensive hash calculation)
+            const auto* cached = TextureSuffix::getOrCreateResolution((IDirect3DDevice9*)device, rs->texture, true);
 
-                // Cache the result
-                textureSuffixResolutionCache[rs->texture] = entry;
-                cacheIt = textureSuffixResolutionCache.find(rs->texture);
-            }
-
-            if (cacheIt->second.hasValidName) {
-                if (bindingCache.currentBaseTextureName != cacheIt->second.textureName) {
+            if (cached && cached->hasValidName) {
+                if (bindState.currentBaseTextureName != cached->textureName) {
                     // Reset cache when texture changes
-                    bindingCache.currentBaseTextureName = cacheIt->second.textureName;
-                    bindingCache.boundDiffParam = nullptr;
-                    bindingCache.boundParamH = nullptr;
-                    bindingCache.boundParamX = nullptr;
+                    bindState.currentBaseTextureName = cached->textureName;
+                    bindState.boundDiffParam = nullptr;
+                    bindState.boundParamH = nullptr;
+                    bindState.boundParamX = nullptr;
 
-                    if (cacheIt->second.variants) {
+                    if (cached->variants) {
                         // Slot 2: ParamH (metallic/roughness) - load once per texture change
-                        if (sk.hasParamH && cacheIt->second.variants->hasParamH()) {
-                            if (!bindingCache.boundParamH) {
-                                bindingCache.boundParamH = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *cacheIt->second.variants, "paramh");
+                        if (sk.hasParamH && cached->variants->hasParamH()) {
+                            if (!bindState.boundParamH) {
+                                bindState.boundParamH = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *cached->variants, "paramh");
                             }
-                            if (bindingCache.boundParamH) {
-                                setCachedTextureWithSamplerPreservation(device, 2, bindingCache.boundParamH);
+                            if (bindState.boundParamH) {
+                                setCachedTextureWithSamplerPreservation(device, 2, bindState.boundParamH);
                             }
                         }
 
                         // Slot 3: ParamX (anisotropic) - load once per texture change
-                        if (sk.hasParamX && cacheIt->second.variants->hasParamX()) {
-                            if (!bindingCache.boundParamX) {
-                                bindingCache.boundParamX = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *cacheIt->second.variants, "paramx");
+                        if (sk.hasParamX && cached->variants->hasParamX()) {
+                            if (!bindState.boundParamX) {
+                                bindState.boundParamX = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *cached->variants, "paramx");
                             }
-                            if (bindingCache.boundParamX) {
-                                setCachedTextureWithSamplerPreservation(device, 3, bindingCache.boundParamX);
+                            if (bindState.boundParamX) {
+                                setCachedTextureWithSamplerPreservation(device, 3, bindState.boundParamX);
                             }
                         }
                     }
                 }
-                bindingCache.lastBaseTexture = rs->texture;
+                bindState.lastBaseTexture = rs->texture;
             }
         }
     }
@@ -1485,51 +1325,16 @@ FixedFunctionShader::ShaderKey FixedFunctionShader::computeShaderKeyWithSuffixes
     bool hasDiffParam = false, hasParamH = false, hasParamX = false, hasGrass = false;
 
     if (rs->texture) {
-        // Check texture suffix resolution cache (protected by shared lock for thread safety)
-        AcquireSRWLockShared(&textureSuffixLock);
-        auto cacheIt = textureSuffixResolutionCache.find(rs->texture);
-        if (cacheIt != textureSuffixResolutionCache.end()) {
-            // Cache hit — read suffix flags under shared lock
-            if (cacheIt->second.hasValidName && cacheIt->second.variants) {
-                hasDiffParam = cacheIt->second.variants->hasDiffParam() || cacheIt->second.variants->hasDiffParamT();
-                hasParamH = cacheIt->second.variants->hasParamH();
-                hasParamX = cacheIt->second.variants->hasParamX();
-                hasGrass = cacheIt->second.variants->hasGrass();
-            }
-            ReleaseSRWLockShared(&textureSuffixLock);
-        } else {
-            ReleaseSRWLockShared(&textureSuffixLock);
+        // Use TextureSuffix module for thread-safe cache lookup/creation
+        // deviceCallsSafeInPrepare controls whether device calls are allowed
+        const auto* cached = TextureSuffix::getOrCreateResolution(
+            (IDirect3DDevice9*)device, rs->texture, deviceCallsSafeInPrepare);
 
-            if (deviceCallsSafeInPrepare) {
-                // Main thread: perform expensive resolution (original fallback)
-                TextureSuffixResolutionCache entry;
-                entry.hash = BSA::calculateTextureHash((IDirect3DDevice9*)device, rs->texture, false);
-
-                const std::string* textureName = BSA::resolveTextureNameFromHash(entry.hash);
-                if (textureName && entry.hash.crc32 != 0) {
-                    entry.textureName = *textureName;
-                    entry.hasValidName = true;
-                    entry.variants = BSA::getTextureSuffixVariants(textureName->c_str());
-                } else {
-                    entry.hasValidName = false;
-                    entry.variants = nullptr;
-                }
-
-                if (entry.hasValidName && entry.variants) {
-                    hasDiffParam = entry.variants->hasDiffParam() || entry.variants->hasDiffParamT();
-                    hasParamH = entry.variants->hasParamH();
-                    hasParamX = entry.variants->hasParamX();
-                    hasGrass = entry.variants->hasGrass();
-                }
-
-                AcquireSRWLockExclusive(&textureSuffixLock);
-                textureSuffixResolutionCache.emplace(rs->texture, std::move(entry));
-                ReleaseSRWLockExclusive(&textureSuffixLock);
-            } else {
-                // Cull thread: device calls not safe. warmSuffixCache should have populated
-                // this during recording. Skip suffix detection (default flags = no suffixes).
-                LOG::logline("Warning: suffix cache miss for texture 0x%p on cull thread", rs->texture);
-            }
+        if (cached && cached->hasValidName && cached->variants) {
+            hasDiffParam = cached->variants->hasDiffParam() || cached->variants->hasDiffParamT();
+            hasParamH = cached->variants->hasParamH();
+            hasParamX = cached->variants->hasParamX();
+            hasGrass = cached->variants->hasGrass();
         }
     }
 
@@ -3431,11 +3236,7 @@ void FixedFunctionShader::resetHLSLCaches() {
     shadowMatricesValid = false;
 
     // Reset suffix binding cache to prevent stale texture pointers across frames
-    bindingCache.lastBaseTexture = nullptr;
-    bindingCache.currentBaseTextureName.clear();
-    bindingCache.boundDiffParam = nullptr;
-    bindingCache.boundParamH = nullptr;
-    bindingCache.boundParamX = nullptr;
+    TextureSuffix::getBindingState().reset();
 }
 
 
@@ -4084,12 +3885,7 @@ void FixedFunctionShader::stopRecordingAndReplay() {
         std::unordered_set<IDirect3DTexture9*> seen;
         for (const auto& call : recCalls) {
             if (call.rs.texture && seen.insert(call.rs.texture).second) {
-                AcquireSRWLockShared(&textureSuffixLock);
-                bool found = textureSuffixResolutionCache.count(call.rs.texture) > 0;
-                ReleaseSRWLockShared(&textureSuffixLock);
-                if (!found) {
-                    warmSuffixCache(device, call.rs.texture);
-                }
+                TextureSuffix::warmCache((IDirect3DDevice9*)device, call.rs.texture);
             }
         }
     }
@@ -4233,12 +4029,7 @@ void FixedFunctionShader::finalizeBatchAndSubmitCull() {
         std::unordered_set<IDirect3DTexture9*> seen;
         for (const auto& call : recCalls) {
             if (call.rs.texture && seen.insert(call.rs.texture).second) {
-                AcquireSRWLockShared(&textureSuffixLock);
-                bool found = textureSuffixResolutionCache.count(call.rs.texture) > 0;
-                ReleaseSRWLockShared(&textureSuffixLock);
-                if (!found) {
-                    warmSuffixCache(device, call.rs.texture);
-                }
+                TextureSuffix::warmCache((IDirect3DDevice9*)device, call.rs.texture);
             }
         }
     }
@@ -4437,12 +4228,7 @@ void FixedFunctionShader::finalizeAndRender(DLContext* frameCtx, bool waterSeen)
         std::unordered_set<IDirect3DTexture9*> seen;
         for (const auto& call : recCalls) {
             if (call.rs.texture && seen.insert(call.rs.texture).second) {
-                AcquireSRWLockShared(&textureSuffixLock);
-                bool found = textureSuffixResolutionCache.count(call.rs.texture) > 0;
-                ReleaseSRWLockShared(&textureSuffixLock);
-                if (!found) {
-                    warmSuffixCache(device, call.rs.texture);
-                }
+                TextureSuffix::warmCache((IDirect3DDevice9*)device, call.rs.texture);
             }
         }
     }
@@ -4748,7 +4534,7 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
     }
 
     // Warm suffix cache on main thread (device calls not safe off main thread)
-    warmSuffixCache(device, rs->texture);
+    TextureSuffix::warmCache((IDirect3DDevice9*)device, rs->texture);
 
     // Log per-bin frame event (we know the bin from sk and rs at record time)
     {
