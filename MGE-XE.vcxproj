@@ -231,6 +231,7 @@
     <ClInclude Include="src\mge\inidata.h" />
     <ClInclude Include="src\mge\memorypool.h" />
     <ClInclude Include="src\mge\mged3d8device.h" />
+    <ClInclude Include="src\mge\mgedevicehelpers.h" />
     <ClInclude Include="src\mge\mgedinput.h" />
     <ClInclude Include="src\mge\mgedirect3d8.h" />
     <ClInclude Include="src\mge\mgeversion.h" />

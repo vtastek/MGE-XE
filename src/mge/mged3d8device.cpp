@@ -1,5 +1,6 @@
 
 #include "mged3d8device.h"
+#include "mgedevicehelpers.h"
 #include "mge_tracy.h"
 #include "proxydx/d3d8texture.h"
 #include "proxydx/d3d8surface.h"
@@ -13,12 +14,9 @@
 #include "statusoverlay.h"
 #include "userhud.h"
 #include "videobackground.h"
-#include "imgui_manager.h"
 #include "d3dcommandbuffer.h"
 
 bool g_tracyActive = false;
-
-// Pipeline state diagnostic snapshot — filled at Present() before reset
 PipelineDiag g_pipelineDiag = {};
 
 static bool isTracyProfilerRunning() {
@@ -39,65 +37,35 @@ static bool isTracyProfilerRunning() {
     return found;
 }
 
-static int sceneCount;
-static bool rendertargetNormal, isHUDready;
-static bool isMainView, isStencilScene, isAmbientWhite;
-static DWORD stencilRef;
-static bool stage0Complete, isFrameComplete, isHUDComplete;
-static bool isWaterMaterial, waterDrawn, distantWater;
-static DLContext frameCtx;  // Per-frame rendering context, created by renderStage0
+// Grouped state structs (see mgedevicehelpers.h)
+static SceneState g_scene;
+static DeferredSceneState g_deferred;
+static DeferralCounters g_deferralCounters;
+static OffscreenState g_offscreen;
+static DLContext frameCtx;  // Per-frame rendering context
 
-
-// Deferred scene forwarding — suppress empty BeginScene/EndScene pairs
-static bool scenePending = false;      // BeginScene called but not forwarded to real device
-static bool sceneForwarded = false;    // BeginScene has been forwarded to real device
-
-// Deferred render target — suppress RT churn from empty scenes
-static bool rtPending = false;
-static IDirect3DSurface8* pendingRT_color = nullptr;
-static IDirect3DSurface8* pendingRT_depth = nullptr;
-
-// Deferral instrumentation — per-frame counters logged at Present()
-static int g_scenesRequested = 0, g_scenesForwarded = 0, g_scenesSuppressed = 0;
-static int g_rtRequested = 0, g_rtForwarded = 0, g_rtSuppressed = 0;
-static int g_copyRectsTotal = 0, g_copyRectsSuppressed = 0;
-
-// Offscreen amortization — limit offscreen scenes per frame
-static int g_offscreenScenesThisFrame = 0;
-static bool g_suppressingCurrentScene = false;  // true when current offscreen scene is over budget
-
-// Offscreen scene collapsing — keep one device-level scene open for all offscreen work
-static bool g_offscreenMegaScene = false;  // true when device has an open scene for offscreen rendering
-
-// Offscreen local map timing
-static LARGE_INTEGER g_offscreenStartQPC = {};
-static bool g_offscreenTimingActive = false;
-static int g_offscreenDIPs = 0;
-static int g_offscreenScenes = 0;
-
+// Camera effects state
 static bool zoomSensSaved;
 static float zoomSensX, zoomSensY;
 static D3DXMATRIX camEffectsMatrix;
 static float crosshairTimeout;
 
+// MW state recorders
 static RenderedState rs;
 static FragmentState frs;
 static LightState lightrs;
-
-// Global device state tracker — updated by every SetRenderState, snapshot captured per-draw
-// Enables async replay where device starts from UNKNOWN state (not synchronous assumptions)
 DeviceStateSnapshot g_deviceState;
 
+// ImGui state
 static HWND gameWindow = nullptr;
 static bool imguiInitialized = false;
 
-// D3D command buffer set — records all MW calls per-stage for future replay
+// Command buffer
 D3DCommandBufferSet g_cmdBufferSet;
-static int g_lastCmdBufferSize = 0;  // Snapshot for ImGui display
+static int g_lastCmdBufferSize = 0;
 
-// Per-frame DIP bin counters (replaces old coarse DIPCounters)
+// DIP counters
 static ImGuiManager::DIPBinStats g_dipBinStats = {};
-// Keep coarse counters for Tracy log formatting
 static int g_dipScene0 = 0, g_dipScene1plus = 0;
 
 static void initOnLoad();
@@ -108,6 +76,46 @@ static void captureTransform(D3DTRANSFORMSTATETYPE a, const D3DMATRIX* b);
 static void captureLight(DWORD a, const D3DLIGHT8* b);
 static void captureMaterial(const D3DMATERIAL8* a);
 static float calcFPS();
+
+// Helper: process debug hotkeys when ImGui is initialized
+static void processImGuiHotkeys() {
+    static bool f11Pressed = false, gPressed = false, uPressed = false, ePressed = false;
+
+    // F11: Toggle PCF interface (gated)
+    if (ImGuiManager::GetDebugKeysEnabled()) {
+        bool f11State = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
+        if (f11State && !f11Pressed) {
+            LOG::logline(">> F11 key pressed, toggling PCF interface");
+            ImGuiManager::TogglePCFInterface();
+        }
+        f11Pressed = f11State;
+    }
+
+    // G key: Toggle debug interface (always active)
+    bool gState = (GetAsyncKeyState('G') & 0x8000) != 0;
+    if (gState && !gPressed) {
+        ImGuiManager::ToggleDebugInterface();
+    }
+    gPressed = gState;
+
+    // U: Toggle Hi-Z interface (gated)
+    if (ImGuiManager::GetDebugKeysEnabled()) {
+        bool uState = (GetAsyncKeyState('U') & 0x8000) != 0;
+        if (uState && !uPressed) {
+            ImGuiManager::ToggleHiZInterface();
+        }
+        uPressed = uState;
+    }
+
+    // E: Toggle Frame Event Log (gated)
+    if (ImGuiManager::GetDebugKeysEnabled()) {
+        bool eState = (GetAsyncKeyState('E') & 0x8000) != 0;
+        if (eState && !ePressed) {
+            ImGuiManager::ToggleFrameEventLog();
+        }
+        ePressed = eState;
+    }
+}
 
 // When true, MW state/draw calls record to command buffer only — no device forwarding.
 // Keeps main thread off the device for threading safety.
@@ -194,12 +202,10 @@ static void recordUIStatePreamble(IDirect3DDevice9* dev, D3DCommandBuffer& buf) 
 
 MGEProxyDevice::MGEProxyDevice(IDirect3DDevice9* real, ProxyD3D* d3d) : ProxyDevice(real, d3d) {
     // Initialize state here, as the device is released and recreated on fullscreen Alt-Tab
-    sceneCount = -1;
-    rendertargetNormal = true;
-    isHUDready = false;
-    isMainView = isStencilScene = isAmbientWhite = stage0Complete = isFrameComplete = isHUDComplete = false;
-    stencilRef = 0;
-    isWaterMaterial = waterDrawn = false;
+    g_scene = SceneState();
+    g_deferred = DeferredSceneState();
+    g_deferralCounters = DeferralCounters();
+    g_offscreen = OffscreenState();
     D3DXMatrixIdentity(&camEffectsMatrix);
 
     Configuration.CameraEffects.zoom = 1.0;
@@ -397,69 +403,13 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
 
     {
         MGE_ZoneScopedN("Present_ImGui");
-        // Handle F11 key to toggle ImGui interface
-        static bool f11Pressed = false;
         static int debugCounter = 0;
         if (imguiInitialized) {
-            // F11: Toggle PCF interface (gated)
-            if (ImGuiManager::GetDebugKeysEnabled()) {
-                bool f11State = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
-                if (f11State && !f11Pressed) {
-                    LOG::logline(">> F11 key pressed, toggling PCF interface");
-                    ImGuiManager::TogglePCFInterface();
-                    f11Pressed = true;
-                } else if (!f11State) {
-                    f11Pressed = false;
-                }
-            }
-
-            // G key: Toggle debug interface (always active)
-            static bool gPressed = false;
-            bool gState = (GetAsyncKeyState('G') & 0x8000) != 0;
-            if (gState && !gPressed) {
-                ImGuiManager::ToggleDebugInterface();
-                gPressed = true;
-            } else if (!gState) {
-                gPressed = false;
-            }
-
-            // U: Toggle Hi-Z interface (gated)
-            if (ImGuiManager::GetDebugKeysEnabled()) {
-                static bool uPressed = false;
-                bool uState = (GetAsyncKeyState('U') & 0x8000) != 0;
-                if (uState && !uPressed) {
-                    ImGuiManager::ToggleHiZInterface();
-                    uPressed = true;
-                } else if (!uState) {
-                    uPressed = false;
-                }
-            }
-
-            // E: Toggle Frame Event Log (gated)
-            if (ImGuiManager::GetDebugKeysEnabled()) {
-                static bool ePressed = false;
-                bool eState = (GetAsyncKeyState('E') & 0x8000) != 0;
-                if (eState && !ePressed) {
-                    ImGuiManager::ToggleFrameEventLog();
-                    ePressed = true;
-                } else if (!eState) {
-                    ePressed = false;
-                }
-            }
-
-            {
-                MGE_ZoneScopedN("Present_ImGuiNewFrame");
-                ImGuiManager::NewFrame();
-            }
-            {
-                MGE_ZoneScopedN("Present_ImGuiRender");
-                ImGuiManager::Render();
-            }
-        } else {
-            // Log every 60 frames that ImGui is not initialized
-            if (++debugCounter % 60 == 0) {
-                LOG::logline(">> ImGui not initialized (frame %d)", debugCounter);
-            }
+            processImGuiHotkeys();
+            ImGuiManager::NewFrame();
+            ImGuiManager::Render();
+        } else if (++debugCounter % 60 == 0) {
+            LOG::logline(">> ImGui not initialized (frame %d)", debugCounter);
         }
     }
 
@@ -531,15 +481,15 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         g_pipelineDiag.dipUI = g_dipBinStats.ui;
         g_pipelineDiag.dipStencilShadow = g_dipBinStats.stencilShadow;
         g_pipelineDiag.dipUnknown = g_dipBinStats.preScene;
-        g_pipelineDiag.sceneCount = sceneCount;
-        g_pipelineDiag.isMainView = isMainView;
-        g_pipelineDiag.rendertargetNormal = rendertargetNormal;
-        g_pipelineDiag.stage0Complete = stage0Complete;
-        g_pipelineDiag.isFrameComplete = isFrameComplete;
-        g_pipelineDiag.isHUDComplete = isHUDComplete;
-        g_pipelineDiag.isHUDready = isHUDready;
-        g_pipelineDiag.isStencilScene = isStencilScene;
-        g_pipelineDiag.isAmbientWhite = isAmbientWhite;
+        g_pipelineDiag.sceneCount = g_scene.sceneCount;
+        g_pipelineDiag.isMainView = g_scene.isMainView;
+        g_pipelineDiag.rendertargetNormal = g_scene.rendertargetNormal;
+        g_pipelineDiag.stage0Complete = g_scene.stage0Complete;
+        g_pipelineDiag.isFrameComplete = g_scene.isFrameComplete;
+        g_pipelineDiag.isHUDComplete = g_scene.isHUDComplete;
+        g_pipelineDiag.isHUDready = g_scene.isHUDready;
+        g_pipelineDiag.isStencilScene = g_scene.isStencilScene;
+        g_pipelineDiag.isAmbientWhite = g_scene.isAmbientWhite;
         g_pipelineDiag.distantLandReady = DistantLand::ready;
         g_pipelineDiag.isPPLActive = DistantLand::s_staging.isPPLActive;
         g_pipelineDiag.view_11 = rs.viewTransform._11;
@@ -558,35 +508,26 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
     {
         MGE_ZoneScopedN("Present_ResetState");
         // Reset scene identifiers
-        sceneCount = -1;
-        stage0Complete = false;
-        waterDrawn = false;
-        isFrameComplete = false;
-        isHUDComplete = false;
-        scenePending = false;
-        sceneForwarded = false;
-        rtPending = false;
+        g_scene.resetForFrame();
+        g_deferred.reset();
 
         // Log deferral stats on frames with offscreen scenes
-        if (g_offscreenScenesThisFrame > 0 || g_copyRectsTotal > 0) {
+        if (g_offscreen.scenesThisFrame > 0 || g_deferralCounters.copyRectsTotal > 0) {
             LOG::logline("Deferral: scenes %d/%d/%d RT %d/%d/%d offscreen %d (mega-scene) CopyRects %d/%d",
-                g_scenesRequested, g_scenesForwarded, g_scenesSuppressed,
-                g_rtRequested, g_rtForwarded, g_rtSuppressed,
-                g_offscreenScenesThisFrame,
-                g_copyRectsTotal, g_copyRectsSuppressed);
+                g_deferralCounters.scenesRequested, g_deferralCounters.scenesForwarded, g_deferralCounters.scenesSuppressed,
+                g_deferralCounters.rtRequested, g_deferralCounters.rtForwarded, g_deferralCounters.rtSuppressed,
+                g_offscreen.scenesThisFrame,
+                g_deferralCounters.copyRectsTotal, g_deferralCounters.copyRectsSuppressed);
         }
-        g_scenesRequested = g_scenesForwarded = g_scenesSuppressed = 0;
-        g_rtRequested = g_rtForwarded = g_rtSuppressed = 0;
-        g_copyRectsTotal = g_copyRectsSuppressed = 0;
-        g_offscreenScenesThisFrame = 0;
-        g_suppressingCurrentScene = false;
+        g_deferralCounters.reset();
+        g_offscreen.resetForFrame();
         // Safety: close mega-scene if still open at Present
-        if (g_offscreenMegaScene) {
+        if (g_offscreen.megaSceneOpen) {
             if (ImGuiManager::GetCmdBufferRecording() && !ImGuiManager::GetCmdBufferReplay()) {
                 g_cmdBufferSet.active().recordEndScene();
             }
             ProxyDevice::EndScene();
-            g_offscreenMegaScene = false;
+            g_offscreen.megaSceneOpen = false;
         }
 
         // Reset stage for next frame — Offscreen because MW always starts with offscreen
@@ -625,13 +566,13 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
 
 // Forward pending render target change to real device
 static HRESULT flushPendingRT() {
-    if (rtPending) {
-        rtPending = false;
-        g_rtForwarded++;
+    if (g_deferred.rtPending) {
+        g_deferred.rtPending = false;
+        g_deferralCounters.rtForwarded++;
         auto device = DistantLand::device;
         HRESULT hr1 = D3D_OK, hr2 = D3D_OK;
-        IDirect3DSurface9* rtSurface = pendingRT_color ? static_cast<ProxySurface*>(pendingRT_color)->realSurface : nullptr;
-        IDirect3DSurface9* dsSurface = pendingRT_depth ? static_cast<ProxySurface*>(pendingRT_depth)->realSurface : nullptr;
+        IDirect3DSurface9* rtSurface = g_deferred.pendingRT_color ? static_cast<ProxySurface*>(g_deferred.pendingRT_color)->realSurface : nullptr;
+        IDirect3DSurface9* dsSurface = g_deferred.pendingRT_depth ? static_cast<ProxySurface*>(g_deferred.pendingRT_depth)->realSurface : nullptr;
 
         // Record RT/DS changes to command buffer
         if (ImGuiManager::GetCmdBufferRecording()) {
@@ -658,31 +599,31 @@ HRESULT _stdcall MGEProxyDevice::SetRenderTarget(IDirect3DSurface8* a, IDirect3D
     if (a) {
         IDirect3DSurface9* back;
         realDevice->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back);
-        rendertargetNormal = (static_cast<ProxySurface*>(a)->realSurface == back);
+        g_scene.rendertargetNormal = (static_cast<ProxySurface*>(a)->realSurface == back);
         back->Release();
     }
 
     g_passBreaks.raw_setRT++;
     g_passBreaks.raw_setDS++;
-    ImGuiManager::LogFrameEvent(FrameEvent::SetRenderTarget, sceneCount);
-    ImGuiManager::TraceRT(sceneCount, a, b);
+    ImGuiManager::LogFrameEvent(FrameEvent::SetRenderTarget, g_scene.sceneCount);
+    ImGuiManager::TraceRT(g_scene.sceneCount, a, b);
 
     // Defer RT change — forward only when a Clear or Draw needs it
     // If previous pending RT was never forwarded, count it as suppressed
-    if (rtPending) {
-        g_rtSuppressed++;
+    if (g_deferred.rtPending) {
+        g_deferralCounters.rtSuppressed++;
     }
-    g_rtRequested++;
-    pendingRT_color = a;
-    pendingRT_depth = b;
-    rtPending = true;
+    g_deferralCounters.rtRequested++;
+    g_deferred.pendingRT_color = a;
+    g_deferred.pendingRT_depth = b;
+    g_deferred.rtPending = true;
     return D3D_OK;
 }
 
 // Forward deferred RT + BeginScene to real device (call before any draw)
 static HRESULT ensureSceneActive() {
     flushPendingRT();
-    if (scenePending && !sceneForwarded) {
+    if (g_deferred.scenePending && !g_deferred.sceneForwarded) {
         HRESULT hr = DistantLand::device->BeginScene();
         if (hr != D3D_OK) {
             return hr;
@@ -693,8 +634,8 @@ static HRESULT ensureSceneActive() {
                 g_cmdBufferSet.active().recordBeginScene();
             }
         }
-        sceneForwarded = true;
-        scenePending = false;
+        g_deferred.sceneForwarded = true;
+        g_deferred.scenePending = false;
     }
     return D3D_OK;
 }
@@ -705,23 +646,18 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
     auto mwBridge = MWBridge::get();
 
     // Defer real device BeginScene until a draw call needs it
-    scenePending = true;
-    sceneForwarded = false;
-    g_scenesRequested++;
+    g_deferred.scenePending = true;
+    g_deferred.sceneForwarded = false;
+    g_deferralCounters.scenesRequested++;
 
     // Offscreen scene collapsing: keep one device-level scene open for all offscreen work
     // This eliminates per-scene DXVK command buffer submissions
-    if (!rendertargetNormal) {
+    if (!g_scene.rendertargetNormal) {
         g_cmdBufferSet.activeStage = CmdStage::Offscreen;
-        g_suppressingCurrentScene = false;
-        if (!g_offscreenTimingActive) {
-            QueryPerformanceCounter(&g_offscreenStartQPC);
-            g_offscreenTimingActive = true;
-            g_offscreenDIPs = 0;
-            g_offscreenScenes = 0;
-        }
-        g_offscreenScenes++;
-        if (!g_offscreenMegaScene) {
+        g_offscreen.suppressingCurrentScene = false;
+        g_offscreen.startTiming();
+        g_offscreen.sceneCount++;
+        if (!g_offscreen.megaSceneOpen) {
             // First offscreen scene: open device scene, keep it open for all subsequent offscreen work
             flushPendingRT();
             if (!shouldSuppressMWState()) {
@@ -733,30 +669,30 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                 // Recording BeginScene/EndScene would close that scene and break subsequent draws.
                 g_cmdBufferSet.active().recordBeginScene();
             }
-            g_offscreenMegaScene = true;
+            g_offscreen.megaSceneOpen = true;
         }
         // Device is already in a scene — mark as forwarded so draws go through
-        sceneForwarded = true;
-        scenePending = false;
+        g_deferred.sceneForwarded = true;
+        g_deferred.scenePending = false;
     } else {
-        g_suppressingCurrentScene = false;
+        g_offscreen.suppressingCurrentScene = false;
         // Transitioning back to normal rendering — close the offscreen mega-scene
-        if (g_offscreenMegaScene) {
+        if (g_offscreen.megaSceneOpen) {
             if (ImGuiManager::GetCmdBufferRecording() && !ImGuiManager::GetCmdBufferReplay()) {
                 g_cmdBufferSet.active().recordEndScene();
             }
             if (!shouldSuppressMWState()) {
                 ProxyDevice::EndScene();
             }
-            g_offscreenMegaScene = false;
+            g_offscreen.megaSceneOpen = false;
             g_cmdBufferSet.activeStage = CmdStage::PreScene;
         }
     }
 
-    ImGuiManager::LogFrameEvent(FrameEvent::BeginScene, sceneCount);
+    ImGuiManager::LogFrameEvent(FrameEvent::BeginScene, g_scene.sceneCount);
 
-    if (mwBridge->IsLoaded() && rendertargetNormal) {
-        if (!isHUDready) {
+    if (mwBridge->IsLoaded() && g_scene.rendertargetNormal) {
+        if (!g_scene.isHUDready) {
             // Initialize HUD
             StatusOverlay::init(realDevice);
             StatusOverlay::setStatus(XE_VERSION_STRING);
@@ -767,44 +703,40 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                 mwBridge->setUIScale(Configuration.UIScale);
             }
 
-            isHUDready = true;
+            g_scene.isHUDready = true;
         }
 
-        if (isMainView) {
+        if (g_scene.isMainView) {
             // Track scene count here in BeginScene
-            // isMainView is not always valid at EndScene if Morrowind draws sunglare
-            ++sceneCount;
+            // g_scene.isMainView is not always valid at EndScene if Morrowind draws sunglare
+            ++g_scene.sceneCount;
 
             // Stage transitions for per-stage command buffers
-            if (sceneCount == 0) {
+            if (g_scene.sceneCount == 0) {
                 g_cmdBufferSet.activeStage = CmdStage::Scene0;
-            } else if (sceneCount == 1) {
+            } else if (g_scene.sceneCount == 1) {
                 g_cmdBufferSet.activeStage = CmdStage::Scene1Plus;
             }
 
             // Set any custom FOV and check distant water state
-            if (sceneCount == 0) {
+            if (g_scene.sceneCount == 0) {
                 // Log offscreen local map timing if any offscreen work happened
-                if (g_offscreenTimingActive) {
-                    LARGE_INTEGER now, freq;
-                    QueryPerformanceFrequency(&freq);
-                    QueryPerformanceCounter(&now);
-                    float totalMs = (float)((now.QuadPart - g_offscreenStartQPC.QuadPart) * 1000.0 / freq.QuadPart);
-                    LOG::logline("Local map: %.1fms, %d DIPs, %d scenes", totalMs, g_offscreenDIPs, g_offscreenScenes);
-                    g_offscreenTimingActive = false;
+                if (g_offscreen.timingActive) {
+                    float totalMs = g_offscreen.stopTimingMs();
+                    LOG::logline("Local map: %.1fms, %d DIPs, %d scenes", totalMs, g_offscreen.dipCount, g_offscreen.sceneCount);
                 }
                 if (Configuration.ScreenFOV > 0) {
                     mwBridge->SetFOV(Configuration.ScreenFOV);
                 }
-                distantWater = (Configuration.MGEFlags & USE_DISTANT_LAND) || (Configuration.MGEFlags & USE_DISTANT_WATER);
+                g_scene.distantWater = (Configuration.MGEFlags & USE_DISTANT_LAND) || (Configuration.MGEFlags & USE_DISTANT_WATER);
             }
         } else {
             // UI scene — frame finalize point
             g_cmdBufferSet.activeStage = CmdStage::UI;
-            if (DistantLand::ready && sceneCount > 0 && !isFrameComplete) {
+            if (DistantLand::ready && g_scene.sceneCount > 0 && !g_scene.isFrameComplete) {
                 ensureSceneActive();
 
-                if (stage0Complete && isHLSLActive()) {
+                if (g_scene.stage0Complete && isHLSLActive()) {
                     // Save UI scene state — finalizeAndRender changes RT, DS, shaders, blend state
                     IDirect3DSurface9* savedRT = nullptr;
                     IDirect3DSurface9* savedDS = nullptr;
@@ -814,7 +746,7 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                     IDirect3DStateBlock9* uiStateSaved;
                     realDevice->CreateStateBlock(D3DSBT_ALL, &uiStateSaved);
 
-                    FixedFunctionShader::finalizeAndRender(&frameCtx, waterDrawn);
+                    FixedFunctionShader::finalizeAndRender(&frameCtx, g_scene.waterDrawn);
 
                     // Restore UI scene state
                     uiStateSaved->Apply();
@@ -830,7 +762,7 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
 
                 // postProcess: HLSL mode uses captured PostProcessData (render thread ready),
                 // non-HLSL mode uses MWBridge directly (original path)
-                if (stage0Complete && isHLSLActive()) {
+                if (g_scene.stage0Complete && isHLSLActive()) {
                     auto& fb = FixedFunctionShader::currentFrameBuffer();
                     DistantLand::postProcess(&frameCtx, fb.postProcessData);
                 } else {
@@ -838,7 +770,7 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                 }
 
                 // Record state preamble AFTER finalizeAndRender — captures actual device state MW sees
-                if (stage0Complete && isHLSLActive() && ImGuiManager::GetCmdBufferRecording()) {
+                if (g_scene.stage0Complete && isHLSLActive() && ImGuiManager::GetCmdBufferRecording()) {
                     recordUIStatePreamble(realDevice, g_cmdBufferSet[CmdStage::UI]);
                 }
 
@@ -846,12 +778,12 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
             }
 
             // Render user HUD before Morrowind HUD
-            if (isHUDready && !isHUDComplete) {
+            if (g_scene.isHUDready && !g_scene.isHUDComplete) {
                 ensureSceneActive();
                 MGEhud::draw();
             }
 
-            isFrameComplete = true;
+            g_scene.isFrameComplete = true;
         }
     }
 
@@ -861,9 +793,9 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
 // EndScene - Multiple scenes per frame, non-alpha / 2x stencil / post-stencil redraw / alpha / 1st person / UI
 // MGE intercepts first scene to draw distant land before it finishes, others it applies shadows to
 HRESULT _stdcall MGEProxyDevice::EndScene() {
-    ImGuiManager::LogFrameEvent(FrameEvent::EndScene, sceneCount);
+    ImGuiManager::LogFrameEvent(FrameEvent::EndScene, g_scene.sceneCount);
 
-    if (DistantLand::ready && rendertargetNormal) {
+    if (DistantLand::ready && g_scene.rendertargetNormal) {
         // Ensure real device scene is active before MGE renders anything
         ensureSceneActive();
 
@@ -873,44 +805,44 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
         //    shadows are fully applied to avoid self-shadowing problems with simplified shadow meshes
         // ~ If any alpha meshes are visible, they are sorted and drawn in another scene (except those with 'No Sorter' property)
         // ~ If 1st person or sunglare is visible, they are drawn in another scene after a Z clear
-        if (sceneCount == 0) {
+        if (g_scene.sceneCount == 0) {
             // Transition to InterScene after Scene0 ends
             g_cmdBufferSet.activeStage = CmdStage::InterScene;
 
             if (isHLSLActive()) {
                 // HLSL path: capture context only, defer all GPU work to frame finalize
-                if (!stage0Complete) {
+                if (!g_scene.stage0Complete) {
                     frameCtx = DistantLand::captureStage0Context();
-                    stage0Complete = true;
+                    g_scene.stage0Complete = true;
                 }
                 FixedFunctionShader::capturePostRecordingState();
             } else {
                 // Legacy path: interleaved GPU work as before
-                if (!stage0Complete) {
+                if (!g_scene.stage0Complete) {
                     frameCtx = DistantLand::renderStage0();
-                    stage0Complete = true;
+                    g_scene.stage0Complete = true;
                 }
                 FixedFunctionShader::finalizeBatchAndSubmitCull();
                 DistantLand::renderStage1(&frameCtx);
                 DistantLand::renderStageBlend(&frameCtx);
                 FixedFunctionShader::waitCullAndReplay();
             }
-        } else if (!isFrameComplete) {
+        } else if (!g_scene.isFrameComplete) {
             // Draw water if the Morrowind water plane doesn't appear in view
             // it may be too distant or stencil scene order is non-normative
-            if (distantWater && !waterDrawn && !isStencilScene) {
+            if (g_scene.distantWater && !g_scene.waterDrawn && !g_scene.isStencilScene) {
                 if (isHLSLActive()) {
                     // HLSL: just flag — finalizeAndRender will render water in GPU phase
-                    waterDrawn = true;
+                    g_scene.waterDrawn = true;
                 } else {
                     DistantLand::renderStageWater(&frameCtx);
-                    waterDrawn = true;
+                    g_scene.waterDrawn = true;
                 }
             }
         }
     }
 
-    if (isFrameComplete && isHUDready && !isHUDComplete) {
+    if (g_scene.isFrameComplete && g_scene.isHUDready && !g_scene.isHUDComplete) {
         ensureSceneActive();
         // Capture post-UI screenshots here
         DistantLand::checkCaptureScreenshot(true);
@@ -919,34 +851,34 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
         StatusOverlay::setFPS(calcFPS());
         StatusOverlay::show(realDevice);
 
-        isHUDComplete = true;
+        g_scene.isHUDComplete = true;
     }
 
     // Finalize any HLSL batch immediately after scene draw calls complete
     // This ensures HLSL replay happens within the same scene, not deferred to next stage
-    FixedFunctionShader::finalizeBatchAndReplay(sceneCount);
+    FixedFunctionShader::finalizeBatchAndReplay(g_scene.sceneCount);
 
     // Render depth for Scene 1+ AFTER all geometry has been captured
     // HLSL defers this to finalizeAndRender (renderStage2 clears recordMW, which renderStage1 needs)
-    if (!isFrameComplete && sceneCount > 0 && !isHLSLActive()) {
+    if (!g_scene.isFrameComplete && g_scene.sceneCount > 0 && !isHLSLActive()) {
         DistantLand::renderStage2(&frameCtx);
     }
 
     // Track offscreen scenes
-    if (!rendertargetNormal) {
-        g_offscreenScenesThisFrame++;
+    if (!g_scene.rendertargetNormal) {
+        g_offscreen.scenesThisFrame++;
         // Don't forward EndScene — mega-scene stays open until normal rendering resumes
-        g_scenesForwarded++;
-        sceneForwarded = false;
-        scenePending = false;
+        g_deferralCounters.scenesForwarded++;
+        g_deferred.sceneForwarded = false;
+        g_deferred.scenePending = false;
         return D3D_OK;
     }
 
     // Only forward EndScene if BeginScene was actually forwarded to real device
-    if (sceneForwarded) {
-        g_scenesForwarded++;
-        sceneForwarded = false;
-        scenePending = false;
+    if (g_deferred.sceneForwarded) {
+        g_deferralCounters.scenesForwarded++;
+        g_deferred.sceneForwarded = false;
+        g_deferred.scenePending = false;
         if (ImGuiManager::GetCmdBufferRecording()) {
             // Don't record EndScene to UI buffer — UI replay happens within the existing scene
             if (g_cmdBufferSet.activeStage != CmdStage::UI) {
@@ -964,29 +896,29 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
     }
 
     // Empty scene — swallow both BeginScene and EndScene
-    if (rtPending) {
-        g_rtSuppressed++;
-        rtPending = false;
+    if (g_deferred.rtPending) {
+        g_deferralCounters.rtSuppressed++;
+        g_deferred.rtPending = false;
     }
-    g_scenesSuppressed++;
-    scenePending = false;
-    sceneForwarded = false;
+    g_deferralCounters.scenesSuppressed++;
+    g_deferred.scenePending = false;
+    g_deferred.sceneForwarded = false;
     return D3D_OK;
 }
 
 // CopyRects — intercept GPU→CPU readback for offscreen amortization
 HRESULT _stdcall MGEProxyDevice::CopyRects(IDirect3DSurface8* a, const RECT* b, UINT c, IDirect3DSurface8* d, const POINT* e) {
-    g_copyRectsTotal++;
+    g_deferralCounters.copyRectsTotal++;
 
     // Check if this is an offscreen RT→sysmem readback we should suppress
     // Only suppress when the current scene was actually suppressed (over budget)
-    if (g_suppressingCurrentScene) {
+    if (g_offscreen.suppressingCurrentScene) {
         IDirect3DSurface9* a_real = static_cast<ProxySurface*>(a)->realSurface;
         IDirect3DSurface9* d_real = static_cast<ProxySurface*>(d)->realSurface;
         D3DSURFACE_DESC9 source, dest;
         if (a_real->GetDesc(&source) == D3D_OK && d_real->GetDesc(&dest) == D3D_OK) {
             if (source.Usage == 1 && dest.Usage == 0) {
-                g_copyRectsSuppressed++;
+                g_deferralCounters.copyRectsSuppressed++;
                 return D3D_OK;
             }
         }
@@ -1005,8 +937,8 @@ HRESULT _stdcall MGEProxyDevice::CopyRects(IDirect3DSurface8* a, const RECT* b, 
 HRESULT _stdcall MGEProxyDevice::Clear(DWORD a, const D3DRECT* b, DWORD c, D3DCOLOR d, float e, DWORD f) {
     g_passBreaks.mw_clear++;
     g_passBreaks.raw_clear++;
-    ImGuiManager::LogFrameEvent(FrameEvent::Clear, sceneCount);
-    ImGuiManager::TraceClear(sceneCount, c, d, e);
+    ImGuiManager::LogFrameEvent(FrameEvent::Clear, g_scene.sceneCount);
+    ImGuiManager::TraceClear(g_scene.sceneCount, c, d, e);
     DistantLand::setHorizonColour(d);
     if (ImGuiManager::GetCmdBufferRecording()) {
         // Flush pending RT to command buffer BEFORE recording Clear — Clear needs correct target
@@ -1015,7 +947,7 @@ HRESULT _stdcall MGEProxyDevice::Clear(DWORD a, const D3DRECT* b, DWORD c, D3DCO
     }
     if (shouldSuppressMWState()) return D3D_OK;
     // Suppress Clear for offscreen scenes over amortization budget
-    if (!rendertargetNormal && g_suppressingCurrentScene) return D3D_OK;
+    if (!g_scene.rendertargetNormal && g_offscreen.suppressingCurrentScene) return D3D_OK;
     // Flush pending RT before Clear — Clear needs correct target
     flushPendingRT();
     return ProxyDevice::Clear(a, b, c, d, e, f);
@@ -1025,14 +957,14 @@ HRESULT _stdcall MGEProxyDevice::Clear(DWORD a, const D3DRECT* b, DWORD c, D3DCO
 // Projection needs modifying to allow room for distant land
 HRESULT _stdcall MGEProxyDevice::SetTransform(D3DTRANSFORMSTATETYPE a, const D3DMATRIX* b) {
     captureTransform(a, b);
-    ImGuiManager::TraceTransform(sceneCount, (DWORD)a, b ? (const float*)b : nullptr);
+    ImGuiManager::TraceTransform(g_scene.sceneCount, (DWORD)a, b ? (const float*)b : nullptr);
 
-    if (rendertargetNormal) {
+    if (g_scene.rendertargetNormal) {
         if (a == D3DTS_VIEW) {
             // Check for UI view
-            isMainView = !detectMenu(b);
+            g_scene.isMainView = !detectMenu(b);
 
-            if (isMainView) {
+            if (g_scene.isMainView) {
                 D3DXMATRIX view = *b;
                 view *= camEffectsMatrix;
                 // Store modified view for CPU-side reads (replaces device->GetTransform)
@@ -1045,7 +977,7 @@ HRESULT _stdcall MGEProxyDevice::SetTransform(D3DTRANSFORMSTATETYPE a, const D3D
             }
         } else if (a == D3DTS_PROJECTION) {
             // Only screw with main scene projection
-            if (isMainView) {
+            if (g_scene.isMainView) {
                 D3DXMATRIX proj = *b;
                 DistantLand::setProjection(&proj);
 
@@ -1076,8 +1008,8 @@ HRESULT _stdcall MGEProxyDevice::SetTransform(D3DTRANSFORMSTATETYPE a, const D3D
 // Check for materials marked for hiding
 HRESULT _stdcall MGEProxyDevice::SetMaterial(const D3DMATERIAL8* a) {
     captureMaterial(a);
-    isWaterMaterial = (a->Power == 99999.0f);
-    ImGuiManager::TraceMaterial(sceneCount, a->Diffuse.r, a->Diffuse.g, a->Diffuse.b, a->Diffuse.a);
+    g_scene.isWaterMaterial = (a->Power == 99999.0f);
+    ImGuiManager::TraceMaterial(g_scene.sceneCount, a->Diffuse.r, a->Diffuse.g, a->Diffuse.b, a->Diffuse.a);
 
     if (ImGuiManager::GetCmdBufferRecording()) {
         g_cmdBufferSet.active().recordSetMaterial(a);
@@ -1090,7 +1022,7 @@ HRESULT _stdcall MGEProxyDevice::SetMaterial(const D3DMATERIAL8* a) {
 // Capture what the sun is doing
 HRESULT _stdcall MGEProxyDevice::SetLight(DWORD a, const D3DLIGHT8* b) {
     captureLight(a, b);
-    ImGuiManager::TraceLight(sceneCount, a, true);
+    ImGuiManager::TraceLight(g_scene.sceneCount, a, true);
 
     // Exterior sunlight/interior "sun" appears to always be light 6
     if (a == 6 && DistantLand::ready) {
@@ -1108,7 +1040,7 @@ HRESULT _stdcall MGEProxyDevice::SetLight(DWORD a, const D3DLIGHT8* b) {
 // Ignore Morrowind fog settings, and run stage 0 rendering after lighting setup
 HRESULT _stdcall MGEProxyDevice::SetRenderState(D3DRENDERSTATETYPE a, DWORD b) {
     captureRenderState(a, b);
-    ImGuiManager::TraceRS(sceneCount, (DWORD)a, b);
+    ImGuiManager::TraceRS(g_scene.sceneCount, (DWORD)a, b);
 
     if (a == D3DRS_FOGVERTEXMODE || a == D3DRS_FOGTABLEMODE) {
         return D3D_OK;
@@ -1117,19 +1049,19 @@ HRESULT _stdcall MGEProxyDevice::SetRenderState(D3DRENDERSTATETYPE a, DWORD b) {
         return D3D_OK;
     }
     if (a == D3DRS_STENCILENABLE) {
-        isStencilScene = b;
+        g_scene.isStencilScene = b;
     }
     else if (a == D3DRS_STENCILREF) {
-        stencilRef = b;
+        g_scene.stencilRef = b;
     }
 
     // Ambient is used for scene detection
     if (a == D3DRS_AMBIENT) {
         // Pure white ambient occurs with skydome and menu mode rendering
         // Ambient is also never set properly when high enough outside that Morrowind renders nothing
-        isAmbientWhite = (b == 0xffffffff);
+        g_scene.isAmbientWhite = (b == 0xffffffff);
 
-        if (!isAmbientWhite) {
+        if (!g_scene.isAmbientWhite) {
             // Save real ambient, can be used in future frames if no draw calls are provoked
             RGBVECTOR amb = D3DCOLOR(b);
             DistantLand::setAmbientColour(amb);
@@ -1150,7 +1082,7 @@ HRESULT _stdcall MGEProxyDevice::SetRenderState(D3DRENDERSTATETYPE a, DWORD b) {
 // Override some sampler options
 HRESULT _stdcall MGEProxyDevice::SetTextureStageState(DWORD a, D3DTEXTURESTAGESTATETYPE b, DWORD c) {
     captureFragmentRenderState(a, b, c);
-    ImGuiManager::TraceTSS(sceneCount, a, (DWORD)b, c);
+    ImGuiManager::TraceTSS(g_scene.sceneCount, a, (DWORD)b, c);
 
     // Sampler overrides to ensure trilinear/anisotropic filtering works
     // Note that DX8 had sampling state bound to texture stages instead of samplers
@@ -1202,7 +1134,7 @@ HRESULT _stdcall MGEProxyDevice::SetTextureStageState(DWORD a, D3DTEXTURESTAGEST
 // Inspect draw calls for re-use later
 HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b, UINT c, UINT d, UINT e) {
     // Allow distant land to inspect draw calls
-    bool isShadowStencil = isStencilScene && stencilRef <= 1;
+    bool isShadowStencil = g_scene.isStencilScene && g_scene.stencilRef <= 1;
 
     // Categorize this DIP for Tracy profiling and per-bin counting
     // Scene 0 mainview non-stencil calls are NOT logged here — they get classified
@@ -1211,13 +1143,13 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
     static thread_local char dipBuf[32];
     FrameEvent::Type dipEventType = FrameEvent::Count;  // Count = "don't log yet"
     bool deferEventLog = false;
-    if (!rendertargetNormal) {
-        snprintf(dipBuf, sizeof(dipBuf), "DIP_Offscreen_S%d", sceneCount);
+    if (!g_scene.rendertargetNormal) {
+        snprintf(dipBuf, sizeof(dipBuf), "DIP_Offscreen_S%d", g_scene.sceneCount);
         dipCategory = dipBuf;
         dipEventType = FrameEvent::DIP_Offscreen;
-        g_offscreenDIPs++;
+        g_offscreen.dipCount++;
         g_dipBinStats.offscreen++;
-    } else if (!isMainView) {
+    } else if (!g_scene.isMainView) {
         dipCategory = "DIP_UI";
         dipEventType = FrameEvent::DIP_UI;
         g_dipBinStats.ui++;
@@ -1225,12 +1157,12 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
         dipCategory = "DIP_StencilShadow";
         dipEventType = FrameEvent::DIP_StencilShadow;
         g_dipBinStats.stencilShadow++;
-    } else if (sceneCount == 0) {
+    } else if (g_scene.sceneCount == 0) {
         dipCategory = "DIP_Scene0";
         g_dipScene0++;
         deferEventLog = true;  // Classified downstream by inspect/water/HLSL replay
-    } else if (sceneCount > 0) {
-        snprintf(dipBuf, sizeof(dipBuf), "DIP_Scene%d", sceneCount);
+    } else if (g_scene.sceneCount > 0) {
+        snprintf(dipBuf, sizeof(dipBuf), "DIP_Scene%d", g_scene.sceneCount);
         dipCategory = dipBuf;
         g_dipScene1plus++;
         // Sub-classify Scene 1+ by render state
@@ -1251,13 +1183,13 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
     }
 
     if (!deferEventLog) {
-        ImGuiManager::LogFrameEvent(dipEventType, sceneCount, e);
+        ImGuiManager::LogFrameEvent(dipEventType, g_scene.sceneCount, e);
     }
 
     // Detailed trace for DIP — log regardless of deferral (trace wants ALL calls)
     if (ImGuiManager::GetTraceEnabled()) {
         FrameEvent::Type traceType = deferEventLog ? FrameEvent::DIP_Opaque : dipEventType;  // placeholder bin for deferred
-        ImGuiManager::TraceDIP(sceneCount, traceType, rs.fvf, rs.vb, rs.ib, rs.texture,
+        ImGuiManager::TraceDIP(g_scene.sceneCount, traceType, rs.fvf, rs.vb, rs.ib, rs.texture,
             e, c, rs.zWrite, rs.cullMode, rs.blendEnable, rs.alphaTest,
             rs.srcBlend, rs.destBlend, rs.vertexBlendState);
     }
@@ -1275,14 +1207,14 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
 
     // Suppress offscreen scenes over amortization budget (or via ImGui toggle)
     // Return BEFORE ensureSceneActive so deferred scene stays unforwarded
-    if (!rendertargetNormal && (g_suppressingCurrentScene || ImGuiManager::GetSuppressOffscreen())) return D3D_OK;
+    if (!g_scene.rendertargetNormal && (g_offscreen.suppressingCurrentScene || ImGuiManager::GetSuppressOffscreen())) return D3D_OK;
 
     // Debug: suppress other DIP categories via ImGui toggles
-    if (!isMainView && rendertargetNormal && ImGuiManager::GetSuppressUI()) return D3D_OK;
+    if (!g_scene.isMainView && g_scene.rendertargetNormal && ImGuiManager::GetSuppressUI()) return D3D_OK;
     if (isShadowStencil && ImGuiManager::GetSuppressStencilShadow()) return D3D_OK;
-    if (sceneCount < 0 && rendertargetNormal && ImGuiManager::GetSuppressPreScene()) return D3D_OK;
+    if (g_scene.sceneCount < 0 && g_scene.rendertargetNormal && ImGuiManager::GetSuppressPreScene()) return D3D_OK;
     // Scene 1+ per-subcategory suppress
-    if (sceneCount > 0 && rendertargetNormal && isMainView && !isShadowStencil) {
+    if (g_scene.sceneCount > 0 && g_scene.rendertargetNormal && g_scene.isMainView && !isShadowStencil) {
         if (rs.vertexBlendState != 0 && ImGuiManager::GetSuppress1PSkinning()) return D3D_OK;
         if (rs.vertexBlendState == 0 && rs.blendEnable && ImGuiManager::GetSuppress1PAlpha()) return D3D_OK;
         if (rs.vertexBlendState == 0 && !rs.blendEnable && ImGuiManager::GetSuppress1POther()) return D3D_OK;
@@ -1296,7 +1228,7 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
     // Forward deferred scene to real device — AFTER all suppression checks
     ensureSceneActive();
 
-    if (DistantLand::ready && rendertargetNormal && isMainView && !isShadowStencil) {
+    if (DistantLand::ready && g_scene.rendertargetNormal && g_scene.isMainView && !isShadowStencil) {
         rs.primType = a;
         rs.baseIndex = baseVertexIndex;
         rs.minIndex = b;
@@ -1304,7 +1236,7 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
         rs.startIndex = d;
         rs.primCount = e;
 
-        if (!stage0Complete && !isAmbientWhite) {
+        if (!g_scene.stage0Complete && !g_scene.isAmbientWhite) {
             // At this point, only the sky is rendered in exteriors, or nothing in interiors
             if (isHLSLActive()) {
                 // HLSL: CPU-only context capture, GPU work deferred to finalizeAndRender
@@ -1313,12 +1245,12 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
                 // Legacy: interleaved GPU work (distant land renders now)
                 frameCtx = DistantLand::renderStage0();
             }
-            stage0Complete = true;
+            g_scene.stage0Complete = true;
         }
 
-        if (isWaterMaterial) {
+        if (g_scene.isWaterMaterial) {
             g_dipBinStats.water++;
-            ImGuiManager::LogFrameEvent(FrameEvent::DIP_Water, sceneCount, e);
+            ImGuiManager::LogFrameEvent(FrameEvent::DIP_Water, g_scene.sceneCount, e);
             if (ImGuiManager::GetSuppressWater()) {
                 // Render wireframe outline to show water mesh location
                 realDevice->SetRenderState(D3DRS_FILLMODE, D3DFILL_WIREFRAME);
@@ -1326,22 +1258,22 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
                 realDevice->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
                 return hr;
             }
-            if (distantWater) {
-                if (!waterDrawn) {
+            if (g_scene.distantWater) {
+                if (!g_scene.waterDrawn) {
                     if (isHLSLActive()) {
                         // HLSL: just flag — finalizeAndRender will render water in GPU phase
-                        waterDrawn = true;
+                        g_scene.waterDrawn = true;
                     } else {
                         // Legacy: render water immediately
                         DistantLand::renderStageWater(&frameCtx);
-                        waterDrawn = true;
+                        g_scene.waterDrawn = true;
                     }
                 }
                 return D3D_OK;
             }
         } else {
             // Let distant land record call and skip if signalled
-            if (!DistantLand::inspectIndexedPrimitive(sceneCount, &rs, &frs, &lightrs)) {
+            if (!DistantLand::inspectIndexedPrimitive(g_scene.sceneCount, &rs, &frs, &lightrs)) {
                 return D3D_OK;
             }
         }
@@ -1350,7 +1282,7 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
     // Log deferred Scene 0 calls that fell through without specific classification
     // (e.g. fixed-function path, sky without atmosphere scatter)
     if (deferEventLog) {
-        ImGuiManager::LogFrameEvent(FrameEvent::DIP_Opaque, sceneCount, e);
+        ImGuiManager::LogFrameEvent(FrameEvent::DIP_Opaque, g_scene.sceneCount, e);
     }
 
     // In HLSL mode, inspectIndexedPrimitive already returns false (suppressing) for all
@@ -1443,7 +1375,7 @@ HRESULT _stdcall MGEProxyDevice::SetTexture(DWORD a, IDirect3DBaseTexture8* b) {
     if (a == 0) {
         rs.texture = b ? static_cast<ProxyTexture*>(b)->realTexture : NULL;
     }
-    ImGuiManager::TraceTexture(sceneCount, a, rs.texture);
+    ImGuiManager::TraceTexture(g_scene.sceneCount, a, rs.texture);
     if (ImGuiManager::GetCmdBufferRecording()) {
         IDirect3DBaseTexture9* realTex = b ? static_cast<ProxyTexture*>(b)->realTexture : nullptr;
         g_cmdBufferSet.active().recordSetTexture(a, realTex);
@@ -1458,26 +1390,26 @@ HRESULT _stdcall MGEProxyDevice::DrawPrimitive(D3DPRIMITIVETYPE a, UINT b, UINT 
     if (ImGuiManager::GetCmdBufferRecording()) {
         g_cmdBufferSet.active().recordDrawPrimitive(a, b, c);
     }
-    if (!rendertargetNormal && (g_suppressingCurrentScene || ImGuiManager::GetSuppressOffscreen())) return D3D_OK;
+    if (!g_scene.rendertargetNormal && (g_offscreen.suppressingCurrentScene || ImGuiManager::GetSuppressOffscreen())) return D3D_OK;
     ensureSceneActive();
     return ProxyDevice::DrawPrimitive(a, b, c);
 }
 
 HRESULT _stdcall MGEProxyDevice::DrawPrimitiveUP(D3DPRIMITIVETYPE a, UINT b, const void* c, UINT d) {
-    if (!rendertargetNormal && (g_suppressingCurrentScene || ImGuiManager::GetSuppressOffscreen())) return D3D_OK;
+    if (!g_scene.rendertargetNormal && (g_offscreen.suppressingCurrentScene || ImGuiManager::GetSuppressOffscreen())) return D3D_OK;
     ensureSceneActive();
     return ProxyDevice::DrawPrimitiveUP(a, b, c, d);
 }
 
 HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitiveUP(D3DPRIMITIVETYPE a, UINT b, UINT c, UINT d, const void* e, D3DFORMAT f, const void* g, UINT h) {
-    if (!rendertargetNormal && (g_suppressingCurrentScene || ImGuiManager::GetSuppressOffscreen())) return D3D_OK;
+    if (!g_scene.rendertargetNormal && (g_offscreen.suppressingCurrentScene || ImGuiManager::GetSuppressOffscreen())) return D3D_OK;
     ensureSceneActive();
     return ProxyDevice::DrawIndexedPrimitiveUP(a, b, c, d, e, f, g, h);
 }
 
 HRESULT _stdcall MGEProxyDevice::SetVertexShader(DWORD a) {
     rs.fvf = a;
-    ImGuiManager::TraceVertexShader(sceneCount, a);
+    ImGuiManager::TraceVertexShader(g_scene.sceneCount, a);
     if (ImGuiManager::GetCmdBufferRecording()) {
         g_cmdBufferSet.active().recordSetFVF(a);
     }
@@ -1491,7 +1423,7 @@ HRESULT _stdcall MGEProxyDevice::SetStreamSource(UINT a, IDirect3DVertexBuffer8*
         rs.vbOffset = 0;
         rs.vbStride = c;
     }
-    ImGuiManager::TraceStreamSource(sceneCount, a, b, c);
+    ImGuiManager::TraceStreamSource(g_scene.sceneCount, a, b, c);
     if (ImGuiManager::GetCmdBufferRecording()) {
         g_cmdBufferSet.active().recordSetStreamSource(a, (IDirect3DVertexBuffer9*)b, 0, c);
     }
@@ -1501,7 +1433,7 @@ HRESULT _stdcall MGEProxyDevice::SetStreamSource(UINT a, IDirect3DVertexBuffer8*
 
 HRESULT _stdcall MGEProxyDevice::SetIndices(IDirect3DIndexBuffer8* a, UINT b) {
     rs.ib = (IDirect3DIndexBuffer9*)a;
-    ImGuiManager::TraceIndexBuffer(sceneCount, a);
+    ImGuiManager::TraceIndexBuffer(g_scene.sceneCount, a);
     if (ImGuiManager::GetCmdBufferRecording()) {
         g_cmdBufferSet.active().recordSetIndices((IDirect3DIndexBuffer9*)a);
     }
@@ -1510,7 +1442,7 @@ HRESULT _stdcall MGEProxyDevice::SetIndices(IDirect3DIndexBuffer8* a, UINT b) {
 }
 
 HRESULT _stdcall MGEProxyDevice::LightEnable(DWORD a, BOOL b) {
-    ImGuiManager::TraceLight(sceneCount, a, b != 0);
+    ImGuiManager::TraceLight(g_scene.sceneCount, a, b != 0);
     if (b) {
         if (std::find(lightrs.active.begin(), lightrs.active.end(), a) == lightrs.active.end()) {
             lightrs.active.push_back(a);
@@ -1801,7 +1733,7 @@ void captureMaterial(const D3DMATERIAL8* a) {
 
 HRESULT _stdcall MGEProxyDevice::SetViewport(const D3DVIEWPORT8* a) {
     if (a) {
-        ImGuiManager::TraceViewport(sceneCount, a->X, a->Y, a->Width, a->Height, a->MinZ, a->MaxZ);
+        ImGuiManager::TraceViewport(g_scene.sceneCount, a->X, a->Y, a->Width, a->Height, a->MinZ, a->MaxZ);
         if (ImGuiManager::GetCmdBufferRecording()) {
             g_cmdBufferSet.active().recordSetViewport(a);
         }
@@ -1811,12 +1743,12 @@ HRESULT _stdcall MGEProxyDevice::SetViewport(const D3DVIEWPORT8* a) {
 }
 
 HRESULT _stdcall MGEProxyDevice::SetClipPlane(DWORD a, const float* b) {
-    ImGuiManager::TraceClipPlane(sceneCount, a);
+    ImGuiManager::TraceClipPlane(g_scene.sceneCount, a);
     return ProxyDevice::SetClipPlane(a, b);
 }
 
 HRESULT _stdcall MGEProxyDevice::MultiplyTransform(D3DTRANSFORMSTATETYPE a, const D3DMATRIX* b) {
-    ImGuiManager::TraceMultiplyTransform(sceneCount, (DWORD)a, b ? (const float*)b : nullptr);
+    ImGuiManager::TraceMultiplyTransform(g_scene.sceneCount, (DWORD)a, b ? (const float*)b : nullptr);
     return ProxyDevice::MultiplyTransform(a, b);
 }
 

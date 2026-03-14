@@ -482,6 +482,9 @@
     <ClInclude Include="src\mge\mged3d8device.h">
       <Filter>Header Files\mge</Filter>
     </ClInclude>
+    <ClInclude Include="src\mge\mgedevicehelpers.h">
+      <Filter>Header Files\mge</Filter>
+    </ClInclude>
     <ClInclude Include="src\mge\mgedinput.h">
       <Filter>Header Files\mge</Filter>
     </ClInclude>
