@@ -147,4 +147,60 @@ inline DIPCategory categorizeDIP(
     return result;
 }
 
+// Complete device state snapshot for async replay (no assumptions about prior state)
+// Captured per-draw-call to enable correct replay from any starting device state.
+struct DeviceStateSnapshot {
+    // Depth
+    DWORD zEnable = D3DZB_TRUE;
+    DWORD zWriteEnable = TRUE;
+    DWORD zFunc = D3DCMP_LESSEQUAL;
+    float depthBias = 0.0f;
+    float slopeScaleDepthBias = 0.0f;
+
+    // Culling
+    DWORD cullMode = D3DCULL_CW;
+
+    // Blending
+    DWORD alphaBlendEnable = FALSE;
+    DWORD srcBlend = D3DBLEND_ONE;
+    DWORD destBlend = D3DBLEND_ZERO;
+
+    // Alpha test
+    DWORD alphaTestEnable = FALSE;
+    DWORD alphaFunc = D3DCMP_ALWAYS;
+    DWORD alphaRef = 0;
+
+    // Lighting/Material
+    DWORD lighting = TRUE;
+    DWORD specularEnable = FALSE;
+    DWORD localViewer = FALSE;
+    DWORD normalizeNormals = FALSE;
+    DWORD diffuseMatSrc = D3DMCS_COLOR1;
+    DWORD emissiveMatSrc = D3DMCS_MATERIAL;
+    DWORD ambientMatSrc = D3DMCS_MATERIAL;
+    DWORD colorVertex = TRUE;
+    DWORD vertexBlend = D3DVBF_DISABLE;
+
+    // Fog
+    DWORD fogEnable = FALSE;
+
+    // Output
+    DWORD colorWriteEnable = 0xF;
+
+    // Stencil
+    DWORD stencilEnable = FALSE;
+
+    // UI-specific
+    DWORD ambient = 0;
+    DWORD textureFactor = 0xFFFFFFFF;
+
+    // Clip planes
+    DWORD clipPlaneEnable = 0;
+
+    // Debug
+    DWORD fillMode = D3DFILL_SOLID;
+};
+
+extern DeviceStateSnapshot g_deviceState;
+
 // PipelineDiag is defined in ffeshader.h

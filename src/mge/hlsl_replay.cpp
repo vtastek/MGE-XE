@@ -988,20 +988,24 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     ambient *= ambMultiplier;
 
     // Check full-bright ambient (Morrowind particle effect mode)
+    // Use captured state to avoid reading stale device values during replay
     DWORD checkAmbient;
-    device->GetRenderState(D3DRS_AMBIENT, &checkAmbient);
+    if (capturedState) {
+        checkAmbient = capturedState->ambient;
+    } else {
+        device->GetRenderState(D3DRS_AMBIENT, &checkAmbient);
+    }
     if (checkAmbient == 0xffffffff) {
         ambient.r = ambient.g = ambient.b = 1.25;
         sunDiffuse.r = sunDiffuse.g = sunDiffuse.b = 0.0;
     }
 
-    // Get fog color (needed by both paths)
-    DWORD fogColorDword = 0x808080FF;
-    device->GetRenderState(D3DRS_FOGCOLOR, &fogColorDword);
+    // Get fog color from staging (per-frame, not per-draw)
+    // Using staged value avoids device read during replay
     float fogColor[4] = {
-        ((fogColorDword >> 16) & 0xFF) / 255.0f,
-        ((fogColorDword >> 8) & 0xFF) / 255.0f,
-        (fogColorDword & 0xFF) / 255.0f,
+        DistantLand::s_staging.nearFogCol.r,
+        DistantLand::s_staging.nearFogCol.g,
+        DistantLand::s_staging.nearFogCol.b,
         1.0f
     };
 

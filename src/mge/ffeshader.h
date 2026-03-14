@@ -2,8 +2,10 @@
 
 #include "proxydx/d3d8header.h"
 #include "softwareocclusion.h"
-
 #include "d3dcommandbuffer.h"
+#include "renderstate.h"
+#include "meshkey.h"
+#include "mgedevicehelpers.h"
 
 #include <unordered_map>
 #include <unordered_set>
@@ -17,7 +19,6 @@
 #include <atomic>
 
 // Per-frame rendering context — snapshotted at start of Stage0, passed through all stages.
-// Replaces scattered static variables with explicit data flow for threading readiness.
 struct DLContext {
     // Camera
     D3DXMATRIX mwView, mwProj;
@@ -51,13 +52,9 @@ struct DLContext {
 
 // Captured MWBridge state for postProcess — allows render thread execution without MWBridge access
 struct PostProcessData {
-    int envFlags;           // computed from CellHasWeather/IsExterior/IntLikeExterior/IsUnderwater/sunVis
-    float frameTime;        // mwBridge->frameTime()
-    float simulationTime;   // mwBridge->simulationTime()
-    float waterLevel;       // mwBridge->WaterLevel() or -1e9 if no water
-    bool isMenu;            // mwBridge->IsMenu()
-    bool isInterior;        // !mwBridge->CellHasWeather()
-    bool isUnderwater;      // mwBridge->IsUnderwater(eyePos.z)
+    int envFlags;
+    float frameTime, simulationTime, waterLevel;
+    bool isMenu, isInterior, isUnderwater;
 };
 
 // Render bin classification for Tracy profiling and debug visualization
@@ -83,94 +80,7 @@ enum DirtyFlags : DWORD {
     DIRTY_ALL       = 0xFFFFFFFF  // new object or mode disabled
 };
 
-// Complete device state snapshot for async replay (no assumptions about prior state)
-// Captured per-draw-call to enable correct replay from any starting device state.
-// ~30 DWORDs per call = 120 bytes. 4000 calls/frame × 3 buffers = ~1.4 MB total.
-struct DeviceStateSnapshot {
-    // Depth
-    DWORD zEnable;              // D3DRS_ZENABLE
-    DWORD zWriteEnable;         // D3DRS_ZWRITEENABLE
-    DWORD zFunc;                // D3DRS_ZFUNC
-    float depthBias;            // D3DRS_DEPTHBIAS
-    float slopeScaleDepthBias;  // D3DRS_SLOPESCALEDEPTHBIAS
-
-    // Culling
-    DWORD cullMode;             // D3DRS_CULLMODE
-
-    // Blending
-    DWORD alphaBlendEnable;     // D3DRS_ALPHABLENDENABLE
-    DWORD srcBlend;             // D3DRS_SRCBLEND
-    DWORD destBlend;            // D3DRS_DESTBLEND
-
-    // Alpha test
-    DWORD alphaTestEnable;      // D3DRS_ALPHATESTENABLE
-    DWORD alphaFunc;            // D3DRS_ALPHAFUNC
-    DWORD alphaRef;             // D3DRS_ALPHAREF
-
-    // Lighting/Material
-    DWORD lighting;             // D3DRS_LIGHTING
-    DWORD specularEnable;       // D3DRS_SPECULARENABLE
-    DWORD localViewer;          // D3DRS_LOCALVIEWER
-    DWORD normalizeNormals;     // D3DRS_NORMALIZENORMALS
-    DWORD diffuseMatSrc;        // D3DRS_DIFFUSEMATERIALSOURCE
-    DWORD emissiveMatSrc;       // D3DRS_EMISSIVEMATERIALSOURCE
-    DWORD ambientMatSrc;        // D3DRS_AMBIENTMATERIALSOURCE
-    DWORD colorVertex;          // D3DRS_COLORVERTEX
-    DWORD vertexBlend;          // D3DRS_VERTEXBLEND
-
-    // Fog
-    DWORD fogEnable;            // D3DRS_FOGENABLE
-
-    // Output
-    DWORD colorWriteEnable;     // D3DRS_COLORWRITEENABLE
-
-    // Stencil (rarely used but captures MW state)
-    DWORD stencilEnable;        // D3DRS_STENCILENABLE
-
-    // UI-specific (captured when relevant)
-    DWORD ambient;              // D3DRS_AMBIENT
-    DWORD textureFactor;        // D3DRS_TEXTUREFACTOR
-
-    // Clip planes (distant land)
-    DWORD clipPlaneEnable;      // D3DRS_CLIPPLANEENABLE
-
-    // Debug
-    DWORD fillMode;             // D3DRS_FILLMODE
-
-    // Default constructor - D3D9 defaults
-    DeviceStateSnapshot() :
-        zEnable(D3DZB_TRUE),
-        zWriteEnable(TRUE),
-        zFunc(D3DCMP_LESSEQUAL),
-        depthBias(0.0f),
-        slopeScaleDepthBias(0.0f),
-        cullMode(D3DCULL_CW),
-        alphaBlendEnable(FALSE),
-        srcBlend(D3DBLEND_ONE),
-        destBlend(D3DBLEND_ZERO),
-        alphaTestEnable(FALSE),
-        alphaFunc(D3DCMP_ALWAYS),
-        alphaRef(0),
-        lighting(TRUE),
-        specularEnable(FALSE),
-        localViewer(FALSE),
-        normalizeNormals(FALSE),
-        diffuseMatSrc(D3DMCS_COLOR1),
-        emissiveMatSrc(D3DMCS_MATERIAL),
-        ambientMatSrc(D3DMCS_MATERIAL),
-        colorVertex(TRUE),
-        vertexBlend(D3DVBF_DISABLE),
-        fogEnable(FALSE),
-        colorWriteEnable(0xF),
-        stencilEnable(FALSE),
-        ambient(0),
-        textureFactor(0xFFFFFFFF),
-        clipPlaneEnable(0),
-        fillMode(D3DFILL_SOLID) {}
-};
-
-// Global device state tracker - updated by every SetRenderState, snapshot captured per-draw
-extern DeviceStateSnapshot g_deviceState;
+// DeviceStateSnapshot is in mgedevicehelpers.h
 
 // Expected device state for debug mode (state leak detection)
 struct ExpectedDeviceState {
@@ -186,77 +96,7 @@ struct ExpectedDeviceState {
     ExpectedDeviceState() : captured(false) {}
 };
 
-struct RenderedState {
-    IDirect3DTexture9* texture;
-    IDirect3DVertexBuffer9* vb;
-    UINT vbOffset, vbStride;
-    IDirect3DIndexBuffer9* ib;
-    DWORD ibBase;
-    DWORD fvf;
-    DWORD zWrite, cullMode;
-    DWORD vertexBlendState;
-    D3DXMATRIX worldTransforms[4];
-    D3DXMATRIX viewTransform;
-    D3DXMATRIX worldViewTransforms[4];
-    D3DXMATRIX shadowWorldViewProj[2];  // Complete shadow world-view-projection matrices at time of recording
-    D3DCOLORVALUE diffuseMaterial;
-    BYTE blendEnable, srcBlend, destBlend;
-    BYTE alphaTest, alphaFunc, alphaRef;
-    BYTE useLighting, useFog, matSrcDiffuse, matSrcEmissive;
-
-    D3DPRIMITIVETYPE primType;
-    UINT baseIndex, minIndex, vertCount, startIndex, primCount;
-
-    // Bounding box for occlusion culling during depth rendering
-    D3DXVECTOR3 bboxMin, bboxMax;
-    bool hasBoundingBox;
-
-    // Scene number (0 = main opaques, 1+ = hands/alpha after Z-clear)
-    int sceneNum = 0;
-};
-
-// RecordedMWState - RenderedState with COM reference management for deferred rendering.
-// Used by both DistantLand::recordMW/recordSky and FrameBuffer per-frame isolation.
-struct RecordedMWState : RenderedState {
-    RecordedMWState(const RenderedState& state);
-    ~RecordedMWState();
-    RecordedMWState(const RecordedMWState&) = delete;
-    RecordedMWState(RecordedMWState&& source) noexcept;
-};
-
-struct FragmentState {
-    struct Stage {
-        BYTE colorOp, colorArg1, colorArg2;
-        BYTE alphaOp, alphaArg1, alphaArg2;
-        BYTE colorArg0, alphaArg0, resultArg;
-        DWORD texcoordIndex;
-        DWORD texTransformFlags;
-        float bumpEnvMat[2][2];
-        float bumpLumiScale, bumpLumiBias;
-    } stage[8];
-
-    struct Material {
-        D3DCOLORVALUE diffuse, ambient, emissive;
-    } material;
-};
-
-struct LightState {
-    struct Light {
-        D3DLIGHTTYPE type;
-        D3DCOLORVALUE diffuse;
-        D3DVECTOR position;     // position / normalized direction
-        D3DVECTOR viewspacePos;
-        union {
-            D3DVECTOR falloff;  // constant, linear, quadratic
-            D3DVECTOR ambient;  // for directional lights
-        };
-    };
-
-    D3DCOLORVALUE globalAmbient;
-    std::unordered_map<DWORD, Light> lights;
-    std::unordered_map<DWORD, bool> lightsTransformed;
-    std::vector<DWORD> active;
-};
+// RenderedState, RecordedMWState, FragmentState, LightState are in renderstate.h
 
 // Pipeline state diagnostic snapshot — captured at Present() before reset
 struct PipelineDiag {
@@ -634,41 +474,10 @@ private:
 
 public:
     // Mesh identifier for bbox caching (VB + IB + FVF combo uniquely identifies object-space mesh)
-    struct MeshKey {
-        IDirect3DVertexBuffer9* vb;
-        IDirect3DIndexBuffer9* ib;
-        DWORD fvf;
-        UINT baseIndex;
-        UINT vertCount;
-        UINT startIndex;
-        UINT primCount;
-
-        bool operator==(const MeshKey& other) const {
-            return vb == other.vb && ib == other.ib && fvf == other.fvf &&
-                   baseIndex == other.baseIndex && vertCount == other.vertCount &&
-                   startIndex == other.startIndex && primCount == other.primCount;
-        }
-    };
-
-    // Hash function for MeshKey
-    struct MeshKeyHash {
-        std::size_t operator()(const MeshKey& k) const {
-            std::size_t h1 = std::hash<void*>{}(k.vb);
-            std::size_t h2 = std::hash<void*>{}(k.ib);
-            std::size_t h3 = std::hash<DWORD>{}(k.fvf);
-            std::size_t h4 = std::hash<UINT>{}(k.baseIndex);
-            std::size_t h5 = std::hash<UINT>{}(k.vertCount);
-            std::size_t h6 = std::hash<UINT>{}(k.startIndex);
-            std::size_t h7 = std::hash<UINT>{}(k.primCount);
-            return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4) ^ (h6 << 5) ^ (h7 << 6);
-        }
-    };
-
-    // Cached object-space bounding box
-    struct ObjectSpaceBBox {
-        D3DXVECTOR3 bboxMin;
-        D3DXVECTOR3 bboxMax;
-    };
+    // Type aliases for mesh identification (definitions in meshkey.h)
+    using MeshKey = ::MeshKey;
+    using MeshKeyHash = ::MeshKeyHash;
+    using ObjectSpaceBBox = ::ObjectSpaceBBox;
 
     struct HLSLRecordedCall {
         RecordedRenderedState rs;
@@ -719,22 +528,9 @@ public:
     };
 
     // VB+IB key for bbox lookup between recordedCalls and recordMW
-    struct VBIBKey {
-        IDirect3DVertexBuffer9* vb;
-        IDirect3DIndexBuffer9* ib;
-
-        bool operator==(const VBIBKey& other) const {
-            return vb == other.vb && ib == other.ib;
-        }
-    };
-
-    struct VBIBKeyHash {
-        std::size_t operator()(const VBIBKey& k) const {
-            std::size_t h1 = std::hash<void*>{}(k.vb);
-            std::size_t h2 = std::hash<void*>{}(k.ib);
-            return h1 ^ (h2 << 1);
-        }
-    };
+    // Type aliases for VB+IB key (definitions in meshkey.h)
+    using VBIBKey = ::VBIBKey;
+    using VBIBKeyHash = ::VBIBKeyHash;
 
     // Buffer lifecycle states for triple-buffered pipeline
     enum class BufferState {
