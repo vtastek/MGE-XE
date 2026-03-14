@@ -384,6 +384,13 @@ private:
         DWORD fogEnable;
         DWORD specularEnable, localViewer, normalizeNormals;
         DWORD zFunc, alphaFunc, alphaRef;
+        // Sampler states for stages 0-1 (texture filtering, addressing)
+        DWORD sampler0MinFilter, sampler0MagFilter, sampler0MipFilter;
+        DWORD sampler0AddressU, sampler0AddressV;
+        DWORD sampler1MinFilter, sampler1MagFilter, sampler1MipFilter;
+        DWORD sampler1AddressU, sampler1AddressV;
+        // Transforms (HLSL replay changes these, particles/Scene1+ need original)
+        D3DMATRIX world, view, projection;
     };
     static SavedRenderStates preRecordingState;
     static SavedRenderStates postRecordingState;  // Saved at end of recording, restored after replay
@@ -674,6 +681,7 @@ public:
     static void finalizeBatchAndSubmitCull();  // Stop recording, submit to cull thread (before renderStage1)
     static void waitCullAndReplay();           // Wait for cull, replay, restore state (after renderStageBlend)
     static void capturePostRecordingState();   // Capture MW device state at end of Scene 0 (recording continues)
+    static void restorePostRecordingState();   // Clean up device state for Scene 1+ (shaders, textures)
     static void finalizeAndRender(DLContext* frameCtx, bool waterSeen); // Prepare + render phase at frame finalize point
     static void executeGpuPhase(int bufferIndex); // GPU render block — called by render thread or inline
 
@@ -727,6 +735,9 @@ public:
     static void trackGpuCall(const char* callName) { trackDeviceSubmit(callName); }
 
     static const std::vector<HLSLRecordedCall>& getRecordedCalls() { return frameBuffers[recordingBuffer].recordedCalls; }
+
+    // Scene handover debugging (particle bug investigation)
+    static void logSceneHandoverState(const char* label);
 
 private:
 

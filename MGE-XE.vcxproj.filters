@@ -458,6 +458,12 @@
     <ClInclude Include="src\mge\ffeshader.h">
       <Filter>Header Files\mge</Filter>
     </ClInclude>
+    <ClInclude Include="src\mge\renderstate.h">
+      <Filter>Header Files\mge</Filter>
+    </ClInclude>
+    <ClInclude Include="src\mge\meshkey.h">
+      <Filter>Header Files\mge</Filter>
+    </ClInclude>
     <ClInclude Include="src\mge\hiz_culling.h">
       <Filter>Header Files\mge</Filter>
     </ClInclude>

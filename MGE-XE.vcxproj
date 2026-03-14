@@ -217,6 +217,8 @@
     <ClInclude Include="src\mge\dlmath.h" />
     <ClInclude Include="src\mge\doublesurface.h" />
     <ClInclude Include="src\mge\ffeshader.h" />
+    <ClInclude Include="src\mge\renderstate.h" />
+    <ClInclude Include="src\mge\meshkey.h" />
     <ClInclude Include="src\mge\cullthread.h" />
     <ClInclude Include="src\mge\renderthread.h" />
     <ClInclude Include="src\mge\distantlandhlsl.h" />

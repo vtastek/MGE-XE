@@ -472,7 +472,36 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
         renderMorrowindHLSL(rs, frs, lightrs, recordMWIdx);
         return;
     }
-    
+
+    // Debug: Log device state for PPL Scene 1+ draws (first few per frame)
+    static int pplDrawLogCount = 0;
+    static int lastFrameLogged = -1;
+    int currentFrame = hlslDiagFrameCounter;
+    if (currentFrame != lastFrameLogged) {
+        pplDrawLogCount = 0;
+        lastFrameLogged = currentFrame;
+    }
+    // Log for Scene 1+ (blend enabled, likely particles)
+    if (rs->blendEnable && pplDrawLogCount < 3) {
+        D3DXMATRIX proj, view, world;
+        device->GetTransform(D3DTS_PROJECTION, &proj);
+        device->GetTransform(D3DTS_VIEW, &view);
+        device->GetTransform(D3DTS_WORLD, &world);
+
+        DWORD pointSize, pointScaleEnable, pointScaleA, pointScaleB, pointScaleC;
+        device->GetRenderState(D3DRS_POINTSIZE, &pointSize);
+        device->GetRenderState(D3DRS_POINTSCALEENABLE, &pointScaleEnable);
+        device->GetRenderState(D3DRS_POINTSCALE_A, &pointScaleA);
+        device->GetRenderState(D3DRS_POINTSCALE_B, &pointScaleB);
+        device->GetRenderState(D3DRS_POINTSCALE_C, &pointScaleC);
+
+        LOG::logline(">> PPL Blend #%d: proj[0][0]=%.3f proj[3][2]=%.3f view[3][2]=%.3f world[3][0]=%.1f",
+            pplDrawLogCount, proj._11, proj._34, view._34, world._41);
+        LOG::logline("   PointSprite: size=%08X scaleEnable=%d A=%08X B=%08X C=%08X",
+            pointSize, pointScaleEnable, pointScaleA, pointScaleB, pointScaleC);
+        pplDrawLogCount++;
+    }
+
     ID3DXEffect* effectFFE;
 
     // Check if state matches last used effect

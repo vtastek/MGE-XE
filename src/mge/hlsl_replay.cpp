@@ -385,6 +385,34 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         return;  // Skip immediate rendering if disabled
     }
 
+    // Debug: Log device state for Scene 1+ immediate draws (first few per frame)
+    static int scene1DrawLogCount = 0;
+    static int lastFrameLogged = -1;
+    int currentFrame = hlslDiagFrameCounter;
+    if (currentFrame != lastFrameLogged) {
+        scene1DrawLogCount = 0;
+        lastFrameLogged = currentFrame;
+    }
+    if (scene1DrawLogCount < 3) {
+        D3DXMATRIX proj, view, world;
+        device->GetTransform(D3DTS_PROJECTION, &proj);
+        device->GetTransform(D3DTS_VIEW, &view);
+        device->GetTransform(D3DTS_WORLD, &world);
+
+        DWORD pointSize, pointScaleEnable, pointScaleA, pointScaleB, pointScaleC;
+        device->GetRenderState(D3DRS_POINTSIZE, &pointSize);
+        device->GetRenderState(D3DRS_POINTSCALEENABLE, &pointScaleEnable);
+        device->GetRenderState(D3DRS_POINTSCALE_A, &pointScaleA);
+        device->GetRenderState(D3DRS_POINTSCALE_B, &pointScaleB);
+        device->GetRenderState(D3DRS_POINTSCALE_C, &pointScaleC);
+
+        LOG::logline(">> Scene1+ Immediate #%d: proj[0][0]=%.3f proj[3][2]=%.3f view[3][2]=%.3f world[3][0]=%.1f",
+            scene1DrawLogCount, proj._11, proj._34, view._34, world._41);
+        LOG::logline("   PointSprite: size=%08X scaleEnable=%d A=%08X B=%08X C=%08X",
+            pointSize, pointScaleEnable, pointScaleA, pointScaleB, pointScaleC);
+        scene1DrawLogCount++;
+    }
+
     // Compute shadow world-view-projection matrices for this draw call
     // (rs from mged3d8device has zeros - compute from current shadow map VP)
     RenderedState rsWithShadows = *rs;

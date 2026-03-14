@@ -15,6 +15,7 @@
 #include "userhud.h"
 #include "videobackground.h"
 #include "d3dcommandbuffer.h"
+#include "renderthread.h"
 
 bool g_tracyActive = false;
 PipelineDiag g_pipelineDiag = {};
@@ -122,11 +123,19 @@ static void processImGuiHotkeys() {
 // Batch 1: Material, Light, LightEnable, FVF, StreamSource, Indices (low-risk)
 // Batch 2: TSS, Texture, RenderState (medium-risk)
 // Batch 3: Transform, Viewport, Clear (high-risk — affects coordinate system and framebuffer)
-// When true, MW state/draw calls record to command buffer only — no device forwarding.
-// Keeps main thread off the device for threading safety.
+//
+// Suppression phases:
+//   Off-screen (local map, inventory): suppress=false, forward to device
+//   Scene0/Scene1+ recording:          suppress=true, record only (render thread owns device)
+//   UI/HUD after sync:                 suppress=false, forward to device
 static inline bool shouldSuppressMWState() {
-    // Currently disabled — UI draws go direct to device.
-    // Will be re-enabled for Scene0 suppression when render thread overlap is implemented.
+    // DISABLED: Suppression causes systemic state leakage.
+    // MW calls SetXXX() -> suppressed -> device never gets MW's values
+    // HLSL replay sets its own values -> GetXXX() returns HLSL values
+    // capturePostRecordingState gets wrong values -> restore corrupts state
+    //
+    // Full command buffer replay (Option B) is needed for true async overlap.
+    // Until then, all MW calls must forward to device (Phase 3a sync behavior).
     return false;
 }
 
@@ -653,6 +662,12 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
     // Offscreen scene collapsing: keep one device-level scene open for all offscreen work
     // This eliminates per-scene DXVK command buffer submissions
     if (!g_scene.rendertargetNormal) {
+        // SYNC: Wait for render thread before off-screen rendering touches device.
+        // Off-screen work (local map, inventory doll) needs direct device access.
+        if (isHLSLActive() && g_renderThread && g_renderThread->isRunning()) {
+            g_renderThread->waitForCompletion();
+        }
+
         g_cmdBufferSet.activeStage = CmdStage::Offscreen;
         g_offscreen.suppressingCurrentScene = false;
         g_offscreen.startTiming();
@@ -716,6 +731,10 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                 g_cmdBufferSet.activeStage = CmdStage::Scene0;
             } else if (g_scene.sceneCount == 1) {
                 g_cmdBufferSet.activeStage = CmdStage::Scene1Plus;
+                // Particle bug debug: state at BeginScene 1 (first Scene 1+ scene)
+                if (isHLSLActive()) {
+                    FixedFunctionShader::logSceneHandoverState("BeginScene1");
+                }
             }
 
             // Set any custom FOV and check distant water state
@@ -736,38 +755,9 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
             if (DistantLand::ready && g_scene.sceneCount > 0 && !g_scene.isFrameComplete) {
                 ensureSceneActive();
 
-                if (g_scene.stage0Complete && isHLSLActive()) {
-                    // Save UI scene state — finalizeAndRender changes RT, DS, shaders, blend state
-                    IDirect3DSurface9* savedRT = nullptr;
-                    IDirect3DSurface9* savedDS = nullptr;
-                    realDevice->GetRenderTarget(0, &savedRT);
-                    realDevice->GetDepthStencilSurface(&savedDS);
-
-                    IDirect3DStateBlock9* uiStateSaved;
-                    realDevice->CreateStateBlock(D3DSBT_ALL, &uiStateSaved);
-
-                    FixedFunctionShader::finalizeAndRender(&frameCtx, g_scene.waterDrawn);
-
-                    // Restore UI scene state
-                    uiStateSaved->Apply();
-                    uiStateSaved->Release();
-
-                    realDevice->SetRenderTarget(0, savedRT);
-                    realDevice->SetDepthStencilSurface(savedDS);
-                    if (savedRT) savedRT->Release();
-                    if (savedDS) savedDS->Release();
-
-                    realDevice->Clear(0, NULL, D3DCLEAR_ZBUFFER, 0, 1.0f, 0);
-                }
-
-                // postProcess: HLSL mode uses captured PostProcessData (render thread ready),
-                // non-HLSL mode uses MWBridge directly (original path)
-                if (g_scene.stage0Complete && isHLSLActive()) {
-                    auto& fb = FixedFunctionShader::currentFrameBuffer();
-                    DistantLand::postProcess(&frameCtx, fb.postProcessData);
-                } else {
-                    DistantLand::postProcess(&frameCtx);
-                }
+                // HLSL: finalizeAndRender runs at EndScene 0 (sync path).
+                // postProcess runs here at UI BeginScene (after Scene 1+) for both HLSL and legacy.
+                DistantLand::postProcess(&frameCtx);
 
                 // Record state preamble AFTER finalizeAndRender — captures actual device state MW sees
                 if (g_scene.stage0Complete && isHLSLActive() && ImGuiManager::GetCmdBufferRecording()) {
@@ -810,12 +800,24 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
             g_cmdBufferSet.activeStage = CmdStage::InterScene;
 
             if (isHLSLActive()) {
-                // HLSL path: capture context only, defer all GPU work to frame finalize
+                // HLSL path: do GPU work at EndScene 0 (sync, same timing as legacy)
+                // Scene 1+ draws happen after this, so Scene 0 must be complete first.
                 if (!g_scene.stage0Complete) {
                     frameCtx = DistantLand::captureStage0Context();
                     g_scene.stage0Complete = true;
                 }
+
+                // Particle bug debug: capture state BEFORE finalizeAndRender
+                FixedFunctionShader::logSceneHandoverState("EndScene0_Before");
+
+                // Capture MW device state before replay (for Scene 1+ restoration)
                 FixedFunctionShader::capturePostRecordingState();
+
+                // Do GPU replay — finalizeAndRender internally saves/restores RT/DS
+                FixedFunctionShader::finalizeAndRender(&frameCtx, g_scene.waterDrawn);
+
+                // Particle bug debug: state AFTER finalizeAndRender (should be restored)
+                FixedFunctionShader::logSceneHandoverState("EndScene0_After");
             } else {
                 // Legacy path: interleaved GPU work as before
                 if (!g_scene.stage0Complete) {
@@ -955,6 +957,7 @@ HRESULT _stdcall MGEProxyDevice::Clear(DWORD a, const D3DRECT* b, DWORD c, D3DCO
 
 // SetTransform
 // Projection needs modifying to allow room for distant land
+// NOTE: Transforms are NOT suppressed — device needs correct values for capture/restore
 HRESULT _stdcall MGEProxyDevice::SetTransform(D3DTRANSFORMSTATETYPE a, const D3DMATRIX* b) {
     captureTransform(a, b);
     ImGuiManager::TraceTransform(g_scene.sceneCount, (DWORD)a, b ? (const float*)b : nullptr);
@@ -972,7 +975,7 @@ HRESULT _stdcall MGEProxyDevice::SetTransform(D3DTRANSFORMSTATETYPE a, const D3D
                 if (ImGuiManager::GetCmdBufferRecording()) {
                     g_cmdBufferSet.active().recordSetTransform((DWORD)a, &view);
                 }
-                if (shouldSuppressMWState()) return D3D_OK;
+                // Don't suppress transforms — needed for capture/restore
                 return ProxyDevice::SetTransform(a, &view);
             }
         } else if (a == D3DTS_PROJECTION) {
@@ -991,7 +994,7 @@ HRESULT _stdcall MGEProxyDevice::SetTransform(D3DTRANSFORMSTATETYPE a, const D3D
                 if (ImGuiManager::GetCmdBufferRecording()) {
                     g_cmdBufferSet.active().recordSetTransform((DWORD)a, &proj);
                 }
-                if (shouldSuppressMWState()) return D3D_OK;
+                // Don't suppress transforms — needed for capture/restore
                 return ProxyDevice::SetTransform(a, &proj);
             }
         }
@@ -1000,7 +1003,7 @@ HRESULT _stdcall MGEProxyDevice::SetTransform(D3DTRANSFORMSTATETYPE a, const D3D
     if (ImGuiManager::GetCmdBufferRecording()) {
         g_cmdBufferSet.active().recordSetTransform((DWORD)a, b);
     }
-    if (shouldSuppressMWState()) return D3D_OK;
+    // Don't suppress transforms — needed for capture/restore
     return ProxyDevice::SetTransform(a, b);
 }
 
@@ -1074,7 +1077,13 @@ HRESULT _stdcall MGEProxyDevice::SetRenderState(D3DRENDERSTATETYPE a, DWORD b) {
     if (ImGuiManager::GetCmdBufferRecording()) {
         g_cmdBufferSet.active().recordSetRenderState((DWORD)a, b);
     }
-    if (shouldSuppressMWState()) return D3D_OK;
+
+    // Don't suppress point sprite states — particles need these for correct sizing
+    bool isPointSpriteState = (a == D3DRS_POINTSIZE || a == D3DRS_POINTSIZE_MIN ||
+                               a == D3DRS_POINTSIZE_MAX || a == D3DRS_POINTSCALEENABLE ||
+                               a == D3DRS_POINTSCALE_A || a == D3DRS_POINTSCALE_B ||
+                               a == D3DRS_POINTSCALE_C || a == D3DRS_POINTSPRITEENABLE);
+    if (!isPointSpriteState && shouldSuppressMWState()) return D3D_OK;
     return ProxyDevice::SetRenderState(a, b);
 }
 
@@ -1084,6 +1093,20 @@ HRESULT _stdcall MGEProxyDevice::SetTextureStageState(DWORD a, D3DTEXTURESTAGEST
     captureFragmentRenderState(a, b, c);
     ImGuiManager::TraceTSS(g_scene.sceneCount, a, (DWORD)b, c);
 
+    // Check if this is a sampler-related state (filter, address modes)
+    // These must NOT be suppressed so we can capture MW's intended values for UI restoration
+    bool isSamplerState = false;
+    switch (b) {
+    case D3DTSS_ADDRESSU: case D3DTSS_ADDRESSV: case D3DTSS_ADDRESSW:
+    case D3DTSS_BORDERCOLOR: case D3DTSS_MAGFILTER: case D3DTSS_MINFILTER:
+    case D3DTSS_MIPFILTER: case D3DTSS_MIPMAPLODBIAS: case D3DTSS_MAXMIPLEVEL:
+    case D3DTSS_MAXANISOTROPY:
+        isSamplerState = true;
+        break;
+    default:
+        break;
+    }
+
     // Sampler overrides to ensure trilinear/anisotropic filtering works
     // Note that DX8 had sampling state bound to texture stages instead of samplers
     if (b == D3DTSS_MINFILTER) {
@@ -1091,14 +1114,14 @@ HRESULT _stdcall MGEProxyDevice::SetTextureStageState(DWORD a, D3DTEXTURESTAGEST
         if (ImGuiManager::GetCmdBufferRecording()) {
             g_cmdBufferSet.active().recordSetSamplerState(a, D3DSAMP_MINFILTER, filter);
         }
-        if (shouldSuppressMWState()) return D3D_OK;
+        // Don't suppress sampler states — needed for UI state capture
         return realDevice->SetSamplerState(a, D3DSAMP_MINFILTER, filter);
     } else if (b == D3DTSS_MIPFILTER) {
         DWORD filter = (c != D3DTEXF_NONE) ? D3DTEXF_LINEAR : D3DTEXF_NONE;
         if (ImGuiManager::GetCmdBufferRecording()) {
             g_cmdBufferSet.active().recordSetSamplerState(a, D3DSAMP_MIPFILTER, filter);
         }
-        if (shouldSuppressMWState()) return D3D_OK;
+        // Don't suppress sampler states — needed for UI state capture
         return realDevice->SetSamplerState(a, D3DSAMP_MIPFILTER, filter);
     }
 
@@ -1126,7 +1149,9 @@ HRESULT _stdcall MGEProxyDevice::SetTextureStageState(DWORD a, D3DTEXTURESTAGEST
             g_cmdBufferSet.active().recordSetTextureStageState(a, (DWORD)b, c);
         }
     }
-    if (shouldSuppressMWState()) return D3D_OK;
+    // Don't suppress sampler states — needed for UI state capture
+    // Non-sampler TSS can be suppressed
+    if (!isSamplerState && shouldSuppressMWState()) return D3D_OK;
     return ProxyDevice::SetTextureStageState(a, b, c);
 }
 
@@ -1260,11 +1285,12 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
             }
             if (g_scene.distantWater) {
                 if (!g_scene.waterDrawn) {
-                    if (isHLSLActive()) {
-                        // HLSL: just flag — finalizeAndRender will render water in GPU phase
+                    if (isHLSLActive() && g_scene.sceneCount == 0) {
+                        // HLSL Scene 0: flag for deferred rendering in GPU phase
                         g_scene.waterDrawn = true;
                     } else {
-                        // Legacy: render water immediately
+                        // Legacy mode, or HLSL Scene 1+: render water immediately
+                        // (Scene 1+ happens after GPU phase already ran)
                         DistantLand::renderStageWater(&frameCtx);
                         g_scene.waterDrawn = true;
                     }
@@ -1289,6 +1315,9 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
     // draws it records (HLSL scene objects, sky with ATM_SCATTER). Draws that reach here
     // returned true from inspect — they are NOT part of the HLSL replay pipeline
     // (e.g. sky without ATM_SCATTER) and must go through to the device.
+    // When suppressing MW state (async GPU overlap), these draws must also be suppressed
+    // since device state is stale. This means ATM_SCATTER must be enabled for full HLSL path.
+    if (shouldSuppressMWState()) return D3D_OK;
     return ProxyDevice::DrawIndexedPrimitive(a, b, c, d, e);
 }
 
@@ -1391,18 +1420,21 @@ HRESULT _stdcall MGEProxyDevice::DrawPrimitive(D3DPRIMITIVETYPE a, UINT b, UINT 
         g_cmdBufferSet.active().recordDrawPrimitive(a, b, c);
     }
     if (!g_scene.rendertargetNormal && (g_offscreen.suppressingCurrentScene || ImGuiManager::GetSuppressOffscreen())) return D3D_OK;
+    if (shouldSuppressMWState()) return D3D_OK;
     ensureSceneActive();
     return ProxyDevice::DrawPrimitive(a, b, c);
 }
 
 HRESULT _stdcall MGEProxyDevice::DrawPrimitiveUP(D3DPRIMITIVETYPE a, UINT b, const void* c, UINT d) {
     if (!g_scene.rendertargetNormal && (g_offscreen.suppressingCurrentScene || ImGuiManager::GetSuppressOffscreen())) return D3D_OK;
+    if (shouldSuppressMWState()) return D3D_OK;
     ensureSceneActive();
     return ProxyDevice::DrawPrimitiveUP(a, b, c, d);
 }
 
 HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitiveUP(D3DPRIMITIVETYPE a, UINT b, UINT c, UINT d, const void* e, D3DFORMAT f, const void* g, UINT h) {
     if (!g_scene.rendertargetNormal && (g_offscreen.suppressingCurrentScene || ImGuiManager::GetSuppressOffscreen())) return D3D_OK;
+    if (shouldSuppressMWState()) return D3D_OK;
     ensureSceneActive();
     return ProxyDevice::DrawIndexedPrimitiveUP(a, b, c, d, e, f, g, h);
 }

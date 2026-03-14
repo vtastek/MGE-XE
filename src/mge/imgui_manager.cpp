@@ -148,6 +148,7 @@ int ImGuiManager::cmdStageScene1Plus = 0;
 int ImGuiManager::cmdStageUI = 0;
 
 bool ImGuiManager::debugKeysEnabled = false;
+bool ImGuiManager::handoverLogging = false;
 
 // Hi-Z single object visualization mode
 bool ImGuiManager::hiZSingleObjectMode = false;
@@ -395,6 +396,7 @@ void ImGuiManager::RenderDebugInterface() {
 
     if (ImGui::Begin("HLSL Pipeline Debug", &showDebugInterface, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::Checkbox("Enable Debug Hotkeys (F11/U/Y/L/F5/F6/K/O)", &debugKeysEnabled);
+        ImGui::Checkbox("Handover Logging (Scene 0/1+ state)", &handoverLogging);
         ImGui::Separator();
 
         ImGui::Text("Recording/Replay System (Scene 0)");

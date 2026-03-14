@@ -396,6 +396,52 @@ void FixedFunctionShader::capturePostRecordingState() {
     device->GetRenderState(D3DRS_ZFUNC, &prs.zFunc);
     device->GetRenderState(D3DRS_ALPHAFUNC, &prs.alphaFunc);
     device->GetRenderState(D3DRS_ALPHAREF, &prs.alphaRef);
+
+    // Capture sampler states for stages 0-1 (texture filtering leaks to UI otherwise)
+    trackDeviceRead("GetSamplerState(x10 postRecording)");
+    device->GetSamplerState(0, D3DSAMP_MINFILTER, &prs.sampler0MinFilter);
+    device->GetSamplerState(0, D3DSAMP_MAGFILTER, &prs.sampler0MagFilter);
+    device->GetSamplerState(0, D3DSAMP_MIPFILTER, &prs.sampler0MipFilter);
+    device->GetSamplerState(0, D3DSAMP_ADDRESSU, &prs.sampler0AddressU);
+    device->GetSamplerState(0, D3DSAMP_ADDRESSV, &prs.sampler0AddressV);
+    device->GetSamplerState(1, D3DSAMP_MINFILTER, &prs.sampler1MinFilter);
+    device->GetSamplerState(1, D3DSAMP_MAGFILTER, &prs.sampler1MagFilter);
+    device->GetSamplerState(1, D3DSAMP_MIPFILTER, &prs.sampler1MipFilter);
+    device->GetSamplerState(1, D3DSAMP_ADDRESSU, &prs.sampler1AddressU);
+    device->GetSamplerState(1, D3DSAMP_ADDRESSV, &prs.sampler1AddressV);
+
+    // Capture transforms (HLSL replay changes these, particles/Scene1+ need original)
+    trackDeviceRead("GetTransform(x3 postRecording)");
+    device->GetTransform(D3DTS_WORLD, &prs.world);
+    device->GetTransform(D3DTS_VIEW, &prs.view);
+    device->GetTransform(D3DTS_PROJECTION, &prs.projection);
+}
+
+// restorePostRecordingState - Clean up device state for Scene 1+ after HLSL recording
+// Called at EndScene 0 in deferred HLSL mode so particles/hands render correctly.
+// Stops recording so Scene 1+ uses immediate rendering path.
+// Does NOT do replay (that happens later at finalizeAndRender).
+void FixedFunctionShader::restorePostRecordingState() {
+    if (!isRecording) return;
+
+    // Stop recording - Scene 0 calls are captured, Scene 1+ will use immediate path
+    // Recording will be finalized at finalizeAndRender
+    isRecording = false;
+
+    // Clean up HLSL-only texture slots
+    for (int i = 2; i < 6; i++) {
+        device->SetTexture(i, NULL);
+        textureCache.updateCache(i, nullptr);
+        textureCache.textureValid[i] = false;
+    }
+
+    // Clear shaders so Scene 1+ uses fixed-function or gets fresh shader setup
+    device->SetVertexShader(NULL);
+    device->SetPixelShader(NULL);
+
+    // Reset all HLSL caches - shadow matrices, material cache, shader LRU
+    // This ensures Scene 1+ gets fresh state, not stale cached values from Scene 0
+    resetHLSLCaches();
 }
 
 // finalizeAndRender - Complete prepare+render phase at frame finalize point (BeginScene UI)
@@ -625,6 +671,8 @@ void FixedFunctionShader::executeGpuPhase(int bufferIndex) {
     // Stage 2: additional depth for all recorded geometry
     DistantLand::renderStage2(frameCtx, &fb);
 
+    // NOTE: postProcess moved to UI BeginScene to avoid RT/DS state corruption for Scene 1+
+
     // Clean up HLSL-only texture slots to prevent DXVK descriptor bloat
     for (int i = 2; i < 6; i++) {
         device->SetTexture(i, NULL);
@@ -651,6 +699,23 @@ void FixedFunctionShader::executeGpuPhase(int bufferIndex) {
     device->SetRenderState(D3DRS_ALPHAFUNC, prs.alphaFunc);
     device->SetRenderState(D3DRS_ALPHAREF, prs.alphaRef);
 
+    // Restore sampler states for stages 0-1 (texture filtering for UI)
+    device->SetSamplerState(0, D3DSAMP_MINFILTER, prs.sampler0MinFilter);
+    device->SetSamplerState(0, D3DSAMP_MAGFILTER, prs.sampler0MagFilter);
+    device->SetSamplerState(0, D3DSAMP_MIPFILTER, prs.sampler0MipFilter);
+    device->SetSamplerState(0, D3DSAMP_ADDRESSU, prs.sampler0AddressU);
+    device->SetSamplerState(0, D3DSAMP_ADDRESSV, prs.sampler0AddressV);
+    device->SetSamplerState(1, D3DSAMP_MINFILTER, prs.sampler1MinFilter);
+    device->SetSamplerState(1, D3DSAMP_MAGFILTER, prs.sampler1MagFilter);
+    device->SetSamplerState(1, D3DSAMP_MIPFILTER, prs.sampler1MipFilter);
+    device->SetSamplerState(1, D3DSAMP_ADDRESSU, prs.sampler1AddressU);
+    device->SetSamplerState(1, D3DSAMP_ADDRESSV, prs.sampler1AddressV);
+
+    // Restore transforms (particles/Scene1+ need MW's original transforms)
+    device->SetTransform(D3DTS_WORLD, &prs.world);
+    device->SetTransform(D3DTS_VIEW, &prs.view);
+    device->SetTransform(D3DTS_PROJECTION, &prs.projection);
+
     isReplaying = false;
     resetHLSLCaches();
 }
@@ -666,6 +731,60 @@ void FixedFunctionShader::markSceneStart(int sceneNum, bool isUI) {
 
 void FixedFunctionShader::markSceneEnd() {
     // Will be used in Step 2+ to finalize scene boundaries
+}
+
+// Scene handover debugging - logs device state for particle bug investigation
+void FixedFunctionShader::logSceneHandoverState(const char* label) {
+    if (!ImGuiManager::GetHandoverLogging()) return;
+
+    static int logCount = 0;
+    if (logCount > 30) return;  // Only log first ~10 frames (3 events per frame)
+    logCount++;
+
+    D3DMATRIX world, view, proj;
+    device->GetTransform(D3DTS_WORLD, &world);
+    device->GetTransform(D3DTS_VIEW, &view);
+    device->GetTransform(D3DTS_PROJECTION, &proj);
+
+    // Point sprite render states
+    float pointSize;
+    DWORD pointSpriteEnable, pointScaleEnable;
+    float pointScaleA, pointScaleB, pointScaleC;
+    device->GetRenderState(D3DRS_POINTSIZE, (DWORD*)&pointSize);
+    device->GetRenderState(D3DRS_POINTSPRITEENABLE, &pointSpriteEnable);
+    device->GetRenderState(D3DRS_POINTSCALEENABLE, &pointScaleEnable);
+    device->GetRenderState(D3DRS_POINTSCALE_A, (DWORD*)&pointScaleA);
+    device->GetRenderState(D3DRS_POINTSCALE_B, (DWORD*)&pointScaleB);
+    device->GetRenderState(D3DRS_POINTSCALE_C, (DWORD*)&pointScaleC);
+
+    // FVF
+    DWORD fvf;
+    device->GetFVF(&fvf);
+
+    // Texture on stage 0
+    IDirect3DBaseTexture9* tex0 = nullptr;
+    device->GetTexture(0, &tex0);
+    if (tex0) tex0->Release();
+
+    // Vertex/pixel shader
+    IDirect3DVertexShader9* vs = nullptr;
+    IDirect3DPixelShader9* ps = nullptr;
+    device->GetVertexShader(&vs);
+    device->GetPixelShader(&ps);
+    if (vs) vs->Release();
+    if (ps) ps->Release();
+
+    LOG::logline("== HANDOVER [%s] ==", label);
+    LOG::logline("  World: [%.2f,%.2f,%.2f,%.2f] [%.2f,%.2f,%.2f,%.2f] ...",
+        world._11, world._12, world._13, world._14,
+        world._21, world._22, world._23, world._24);
+    LOG::logline("  View: [%.2f,%.2f,%.2f,%.2f] ...",
+        view._11, view._12, view._13, view._14);
+    LOG::logline("  Proj: [%.2f,%.2f,%.2f,%.2f] ...",
+        proj._11, proj._12, proj._13, proj._14);
+    LOG::logline("  PointSprite: size=%.4f enable=%d scaleEnable=%d A=%.4f B=%.4f C=%.4f",
+        pointSize, pointSpriteEnable, pointScaleEnable, pointScaleA, pointScaleB, pointScaleC);
+    LOG::logline("  FVF=0x%08X tex0=%p VS=%p PS=%p", fvf, tex0, vs, ps);
 }
 
 // Triple-buffer pipeline: cull pass (called by CullThread or inline on main thread)
