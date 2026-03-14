@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
     <Filter Include="Source Files">
@@ -54,6 +54,7 @@
     <ClCompile Include="src\main.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <!-- mwse -->
     <ClCompile Include="src\mwse\funccamera.cpp">
       <Filter>Source Files\mwse</Filter>
     </ClCompile>
@@ -87,11 +88,12 @@
     <ClCompile Include="src\mwse\mwseinstruction.cpp">
       <Filter>Source Files\mwse</Filter>
     </ClCompile>
+    <ClCompile Include="src\mwse\mgebridge.cpp">
+      <Filter>Source Files\mwse</Filter>
+    </ClCompile>
+    <!-- proxydx -->
     <ClCompile Include="src\proxydx\dxguid.cpp">
       <Filter>Source Files\proxydx</Filter>
-    </ClCompile>
-    <ClCompile Include="src\support\log.cpp">
-      <Filter>Source Files\support</Filter>
     </ClCompile>
     <ClCompile Include="src\proxydx\d3d8device.cpp">
       <Filter>Source Files\proxydx</Filter>
@@ -108,16 +110,101 @@
     <ClCompile Include="src\proxydx\direct3d8.cpp">
       <Filter>Source Files\proxydx</Filter>
     </ClCompile>
+    <!-- support -->
+    <ClCompile Include="src\support\log.cpp">
+      <Filter>Source Files\support</Filter>
+    </ClCompile>
+    <ClCompile Include="src\support\timing.cpp">
+      <Filter>Source Files\support</Filter>
+    </ClCompile>
+    <ClCompile Include="src\support\pngsave.cpp">
+      <Filter>Source Files\support</Filter>
+    </ClCompile>
+    <!-- ipc -->
+    <ClCompile Include="src\ipc\client.cpp">
+      <Filter>Source Files\ipc</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ipc\vecwrap.cpp">
+      <Filter>Source Files\ipc</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ipc\bridge.cpp">
+      <Filter>Source Files\ipc</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ipc\view.cpp">
+      <Filter>Source Files\ipc</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ipc\dlshare.cpp">
+      <Filter>Source Files\ipc</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ipc\vecbase.cpp">
+      <Filter>Source Files\ipc</Filter>
+    </ClCompile>
+    <!-- imgui -->
+    <ClCompile Include="src\imgui\imgui.cpp">
+      <Filter>Source Files\imgui</Filter>
+    </ClCompile>
+    <ClCompile Include="src\imgui\imgui_demo.cpp">
+      <Filter>Source Files\imgui</Filter>
+    </ClCompile>
+    <ClCompile Include="src\imgui\imgui_draw.cpp">
+      <Filter>Source Files\imgui</Filter>
+    </ClCompile>
+    <ClCompile Include="src\imgui\backends\imgui_impl_dx9.cpp">
+      <Filter>Source Files\imgui</Filter>
+    </ClCompile>
+    <ClCompile Include="src\imgui\backends\imgui_impl_win32.cpp">
+      <Filter>Source Files\imgui</Filter>
+    </ClCompile>
+    <ClCompile Include="src\imgui\imgui_tables.cpp">
+      <Filter>Source Files\imgui</Filter>
+    </ClCompile>
+    <ClCompile Include="src\imgui\imgui_widgets.cpp">
+      <Filter>Source Files\imgui</Filter>
+    </ClCompile>
+    <!-- mge -->
+    <ClCompile Include="src\mge\api.cpp">
+      <Filter>Source Files\mge</Filter>
+    </ClCompile>
+    <ClCompile Include="src\mge\async_shader_compiler.cpp">
+      <Filter>Source Files\mge</Filter>
+    </ClCompile>
+    <ClCompile Include="src\mge\configuration.cpp">
+      <Filter>Source Files\mge</Filter>
+    </ClCompile>
+    <ClCompile Include="src\mge\cullthread.cpp">
+      <Filter>Source Files\mge</Filter>
+    </ClCompile>
+    <ClCompile Include="src\mge\d3dcommandbuffer.cpp">
+      <Filter>Source Files\mge</Filter>
+    </ClCompile>
     <ClCompile Include="src\mge\distantinit.cpp">
       <Filter>Source Files\mge</Filter>
     </ClCompile>
     <ClCompile Include="src\mge\distantland.cpp">
       <Filter>Source Files\mge</Filter>
     </ClCompile>
+    <ClCompile Include="src\mge\distantlandhlsl.cpp">
+      <Filter>Source Files\mge</Filter>
+    </ClCompile>
     <ClCompile Include="src\mge\dlmath.cpp">
       <Filter>Source Files\mge</Filter>
     </ClCompile>
+    <ClCompile Include="src\mge\ffe_core_rendering.cpp">
+      <Filter>Source Files\mge</Filter>
+    </ClCompile>
     <ClCompile Include="src\mge\ffeshader.cpp">
+      <Filter>Source Files\mge</Filter>
+    </ClCompile>
+    <ClCompile Include="src\mge\hiz_culling.cpp">
+      <Filter>Source Files\mge</Filter>
+    </ClCompile>
+    <ClCompile Include="src\mge\hlsl_replay.cpp">
+      <Filter>Source Files\mge</Filter>
+    </ClCompile>
+    <ClCompile Include="src\mge\hlsl_shader_manager.cpp">
+      <Filter>Source Files\mge</Filter>
+    </ClCompile>
+    <ClCompile Include="src\mge\imgui_manager.cpp">
       <Filter>Source Files\mge</Filter>
     </ClCompile>
     <ClCompile Include="src\mge\macrofunctions.cpp">
@@ -126,7 +213,13 @@
     <ClCompile Include="src\mge\memorypool.cpp">
       <Filter>Source Files\mge</Filter>
     </ClCompile>
+    <ClCompile Include="src\mge\meshlodcache.cpp">
+      <Filter>Source Files\mge</Filter>
+    </ClCompile>
     <ClCompile Include="src\mge\mged3d8device.cpp">
+      <Filter>Source Files\mge</Filter>
+    </ClCompile>
+    <ClCompile Include="src\mge\mgedinput.cpp">
       <Filter>Source Files\mge</Filter>
     </ClCompile>
     <ClCompile Include="src\mge\mgedirect3d8.cpp">
@@ -150,6 +243,9 @@
     <ClCompile Include="src\mge\quadtree.cpp">
       <Filter>Source Files\mge</Filter>
     </ClCompile>
+    <ClCompile Include="src\mge\recording_system.cpp">
+      <Filter>Source Files\mge</Filter>
+    </ClCompile>
     <ClCompile Include="src\mge\renderdepth.cpp">
       <Filter>Source Files\mge</Filter>
     </ClCompile>
@@ -162,7 +258,16 @@
     <ClCompile Include="src\mge\rendershadow.cpp">
       <Filter>Source Files\mge</Filter>
     </ClCompile>
+    <ClCompile Include="src\mge\renderthread.cpp">
+      <Filter>Source Files\mge</Filter>
+    </ClCompile>
     <ClCompile Include="src\mge\renderwater.cpp">
+      <Filter>Source Files\mge</Filter>
+    </ClCompile>
+    <ClCompile Include="src\mge\shader_utils.cpp">
+      <Filter>Source Files\mge</Filter>
+    </ClCompile>
+    <ClCompile Include="src\mge\softwareocclusion.cpp">
       <Filter>Source Files\mge</Filter>
     </ClCompile>
     <ClCompile Include="src\mge\specificrender.cpp">
@@ -171,96 +276,28 @@
     <ClCompile Include="src\mge\statusoverlay.cpp">
       <Filter>Source Files\mge</Filter>
     </ClCompile>
+    <ClCompile Include="src\mge\suffix_texture_support.cpp">
+      <Filter>Source Files\mge</Filter>
+    </ClCompile>
+    <ClCompile Include="src\mge\texture_suffix.cpp">
+      <Filter>Source Files\mge</Filter>
+    </ClCompile>
     <ClCompile Include="src\mge\userhud.cpp">
       <Filter>Source Files\mge</Filter>
     </ClCompile>
     <ClCompile Include="src\mge\videobackground.cpp">
       <Filter>Source Files\mge</Filter>
     </ClCompile>
-    <ClCompile Include="src\mge\mgedinput.cpp">
-      <Filter>Source Files\mge</Filter>
-    </ClCompile>
-    <ClCompile Include="src\support\timing.cpp">
-      <Filter>Source Files\support</Filter>
-    </ClCompile>
-    <ClCompile Include="src\mwse\mgebridge.cpp">
-      <Filter>Source Files\mwse</Filter>
-    </ClCompile>
-    <ClCompile Include="src\mge\configuration.cpp">
-      <Filter>Source Files\mge</Filter>
-    </ClCompile>
-    <ClCompile Include="src\support\pngsave.cpp">
-      <Filter>Source Files\support</Filter>
-    </ClCompile>
-    <ClCompile Include="src\mge\api.cpp">
-      <Filter>Source Files\mge</Filter>
-    </ClCompile>
-    <ClCompile Include="src\ipc\client.cpp">
-      <Filter>Source Files\ipc</Filter>
-    </ClCompile>
-    <ClCompile Include="src\ipc\vecwrap.cpp">
-      <Filter>Source Files\ipc</Filter>
-    </ClCompile>
-    <ClCompile Include="src\ipc\bridge.cpp">
-      <Filter>Source Files\ipc</Filter>
-    </ClCompile>
-    <ClCompile Include="src\ipc\view.cpp">
-      <Filter>Source Files\ipc</Filter>
-    </ClCompile>
-    <ClCompile Include="src\ipc\dlshare.cpp">
-      <Filter>Source Files\ipc</Filter>
-    </ClCompile>
-    <ClCompile Include="src\ipc\vecbase.cpp">
-      <Filter>Source Files\ipc</Filter>
-    </ClCompile>
-    <ClCompile Include="src\mge\distantlandhlsl.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\mge\shader_utils.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\mge\suffix_texture_support.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\mge\hlsl_shader_manager.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\mge\async_shader_compiler.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\mge\ffe_core_rendering.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="src\imgui\imgui.cpp">
-      <Filter>Source Files\imgui</Filter>
-    </ClCompile>
-    <ClCompile Include="src\imgui\imgui_demo.cpp">
-      <Filter>Source Files\imgui</Filter>
-    </ClCompile>
-    <ClCompile Include="src\imgui\imgui_draw.cpp">
-      <Filter>Source Files\imgui</Filter>
-    </ClCompile>
-    <ClCompile Include="src\imgui\backends\imgui_impl_dx9.cpp">
-      <Filter>Source Files\imgui</Filter>
-    </ClCompile>
-    <ClCompile Include="src\imgui\backends\imgui_impl_win32.cpp">
-      <Filter>Source Files\imgui</Filter>
-    </ClCompile>
-    <ClCompile Include="src\mge\imgui_manager.cpp">
-      <Filter>Source Files\imgui</Filter>
-    </ClCompile>
-    <ClCompile Include="src\imgui\imgui_tables.cpp">
-      <Filter>Source Files\imgui</Filter>
-    </ClCompile>
-    <ClCompile Include="src\imgui\imgui_widgets.cpp">
-      <Filter>Source Files\imgui</Filter>
-    </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <!-- proxydx -->
     <ClInclude Include="src\proxydx\d3d8device.h">
       <Filter>Header Files\proxydx</Filter>
     </ClInclude>
     <ClInclude Include="src\proxydx\d3d8header.h">
+      <Filter>Header Files\proxydx</Filter>
+    </ClInclude>
+    <ClInclude Include="src\proxydx\d3d8header.inl">
       <Filter>Header Files\proxydx</Filter>
     </ClInclude>
     <ClInclude Include="src\proxydx\d3d8interface.h">
@@ -281,9 +318,20 @@
     <ClInclude Include="src\proxydx\directin8.h">
       <Filter>Header Files\proxydx</Filter>
     </ClInclude>
+    <!-- support -->
     <ClInclude Include="src\support\log.h">
       <Filter>Header Files\support</Filter>
     </ClInclude>
+    <ClInclude Include="src\support\winheader.h">
+      <Filter>Header Files\support</Filter>
+    </ClInclude>
+    <ClInclude Include="src\support\timing.h">
+      <Filter>Header Files\support</Filter>
+    </ClInclude>
+    <ClInclude Include="src\support\pngsave.h">
+      <Filter>Header Files\support</Filter>
+    </ClInclude>
+    <!-- mwse -->
     <ClInclude Include="src\mwse\funccamera.h">
       <Filter>Header Files\mwse</Filter>
     </ClInclude>
@@ -317,7 +365,79 @@
     <ClInclude Include="src\mwse\mwseinstruction.h">
       <Filter>Header Files\mwse</Filter>
     </ClInclude>
+    <ClInclude Include="src\mwse\VMTYPES.h">
+      <Filter>Header Files\mwse</Filter>
+    </ClInclude>
+    <ClInclude Include="src\mwse\mgebridge.h">
+      <Filter>Header Files\mwse</Filter>
+    </ClInclude>
+    <!-- ipc -->
+    <ClInclude Include="src\ipc\client.h">
+      <Filter>Header Files\ipc</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ipc\view.h">
+      <Filter>Header Files\ipc</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ipc\vecwrap.h">
+      <Filter>Header Files\ipc</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ipc\bridge.h">
+      <Filter>Header Files\ipc</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ipc\dlshare.h">
+      <Filter>Header Files\ipc</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ipc\vecbase.h">
+      <Filter>Header Files\ipc</Filter>
+    </ClInclude>
+    <!-- imgui -->
+    <ClInclude Include="src\imgui\imconfig.h">
+      <Filter>Header Files\imgui</Filter>
+    </ClInclude>
+    <ClInclude Include="src\imgui\imgui.h">
+      <Filter>Header Files\imgui</Filter>
+    </ClInclude>
+    <ClInclude Include="src\imgui\backends\imgui_impl_dx9.h">
+      <Filter>Header Files\imgui</Filter>
+    </ClInclude>
+    <ClInclude Include="src\imgui\backends\imgui_impl_win32.h">
+      <Filter>Header Files\imgui</Filter>
+    </ClInclude>
+    <ClInclude Include="src\imgui\imgui_internal.h">
+      <Filter>Header Files\imgui</Filter>
+    </ClInclude>
+    <ClInclude Include="src\imgui\imstb_rectpack.h">
+      <Filter>Header Files\imgui</Filter>
+    </ClInclude>
+    <ClInclude Include="src\imgui\imstb_textedit.h">
+      <Filter>Header Files\imgui</Filter>
+    </ClInclude>
+    <ClInclude Include="src\imgui\imstb_truetype.h">
+      <Filter>Header Files\imgui</Filter>
+    </ClInclude>
+    <!-- mge -->
+    <ClInclude Include="src\mge\api.h">
+      <Filter>Header Files\mge</Filter>
+    </ClInclude>
+    <ClInclude Include="src\mge\async_shader_compiler.h">
+      <Filter>Header Files\mge</Filter>
+    </ClInclude>
+    <ClInclude Include="src\mge\configinternal.h">
+      <Filter>Header Files\mge</Filter>
+    </ClInclude>
+    <ClInclude Include="src\mge\configuration.h">
+      <Filter>Header Files\mge</Filter>
+    </ClInclude>
+    <ClInclude Include="src\mge\cullthread.h">
+      <Filter>Header Files\mge</Filter>
+    </ClInclude>
+    <ClInclude Include="src\mge\d3dcommandbuffer.h">
+      <Filter>Header Files\mge</Filter>
+    </ClInclude>
     <ClInclude Include="src\mge\distantland.h">
+      <Filter>Header Files\mge</Filter>
+    </ClInclude>
+    <ClInclude Include="src\mge\distantlandhlsl.h">
       <Filter>Header Files\mge</Filter>
     </ClInclude>
     <ClInclude Include="src\mge\distantshader.h">
@@ -332,10 +452,31 @@
     <ClInclude Include="src\mge\doublesurface.h">
       <Filter>Header Files\mge</Filter>
     </ClInclude>
+    <ClInclude Include="src\mge\ffe_core_rendering.h">
+      <Filter>Header Files\mge</Filter>
+    </ClInclude>
     <ClInclude Include="src\mge\ffeshader.h">
       <Filter>Header Files\mge</Filter>
     </ClInclude>
+    <ClInclude Include="src\mge\hiz_culling.h">
+      <Filter>Header Files\mge</Filter>
+    </ClInclude>
+    <ClInclude Include="src\mge\hlsl_shader_manager.h">
+      <Filter>Header Files\mge</Filter>
+    </ClInclude>
+    <ClInclude Include="src\mge\imgui_manager.h">
+      <Filter>Header Files\mge</Filter>
+    </ClInclude>
+    <ClInclude Include="src\mge\inidata.h">
+      <Filter>Header Files\mge</Filter>
+    </ClInclude>
     <ClInclude Include="src\mge\memorypool.h">
+      <Filter>Header Files\mge</Filter>
+    </ClInclude>
+    <ClInclude Include="src\mge\meshlodcache.h">
+      <Filter>Header Files\mge</Filter>
+    </ClInclude>
+    <ClInclude Include="src\mge\MGEAPI.h">
       <Filter>Header Files\mge</Filter>
     </ClInclude>
     <ClInclude Include="src\mge\mged3d8device.h">
@@ -368,10 +509,28 @@
     <ClInclude Include="src\mge\quadtree.h">
       <Filter>Header Files\mge</Filter>
     </ClInclude>
+    <ClInclude Include="src\mge\recording_system.h">
+      <Filter>Header Files\mge</Filter>
+    </ClInclude>
+    <ClInclude Include="src\mge\renderthread.h">
+      <Filter>Header Files\mge</Filter>
+    </ClInclude>
+    <ClInclude Include="src\mge\shader_utils.h">
+      <Filter>Header Files\mge</Filter>
+    </ClInclude>
+    <ClInclude Include="src\mge\softwareocclusion.h">
+      <Filter>Header Files\mge</Filter>
+    </ClInclude>
     <ClInclude Include="src\mge\specificrender.h">
       <Filter>Header Files\mge</Filter>
     </ClInclude>
     <ClInclude Include="src\mge\statusoverlay.h">
+      <Filter>Header Files\mge</Filter>
+    </ClInclude>
+    <ClInclude Include="src\mge\suffix_texture_support.h">
+      <Filter>Header Files\mge</Filter>
+    </ClInclude>
+    <ClInclude Include="src\mge\texture_suffix.h">
       <Filter>Header Files\mge</Filter>
     </ClInclude>
     <ClInclude Include="src\mge\userhud.h">
@@ -380,104 +539,9 @@
     <ClInclude Include="src\mge\videobackground.h">
       <Filter>Header Files\mge</Filter>
     </ClInclude>
-    <ClInclude Include="src\mwse\VMTYPES.h">
-      <Filter>Header Files\mwse</Filter>
-    </ClInclude>
-    <ClInclude Include="src\support\winheader.h">
-      <Filter>Header Files\support</Filter>
-    </ClInclude>
-    <ClInclude Include="src\support\timing.h">
-      <Filter>Header Files\support</Filter>
-    </ClInclude>
-    <ClInclude Include="src\mge\inidata.h">
-      <Filter>Header Files\mge</Filter>
-    </ClInclude>
-    <ClInclude Include="src\mge\configinternal.h">
-      <Filter>Header Files\mge</Filter>
-    </ClInclude>
-    <ClInclude Include="src\mge\configuration.h">
-      <Filter>Header Files\mge</Filter>
-    </ClInclude>
-    <ClInclude Include="src\mwse\mgebridge.h">
-      <Filter>Header Files\mwse</Filter>
-    </ClInclude>
+    <!-- misc -->
     <ClInclude Include="src\exports.def">
       <Filter>Source Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\proxydx\d3d8header.inl">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\support\pngsave.h">
-      <Filter>Header Files\support</Filter>
-    </ClInclude>
-    <ClInclude Include="src\mge\api.h">
-      <Filter>Header Files\mge</Filter>
-    </ClInclude>
-    <ClInclude Include="src\mge\MGEAPI.h">
-      <Filter>Header Files\mge</Filter>
-    </ClInclude>
-    <ClInclude Include="src\ipc\client.h">
-      <Filter>Header Files\ipc</Filter>
-    </ClInclude>
-    <ClInclude Include="src\ipc\view.h">
-      <Filter>Header Files\ipc</Filter>
-    </ClInclude>
-    <ClInclude Include="src\ipc\vecwrap.h">
-      <Filter>Header Files\ipc</Filter>
-    </ClInclude>
-    <ClInclude Include="src\ipc\bridge.h">
-      <Filter>Header Files\ipc</Filter>
-    </ClInclude>
-    <ClInclude Include="src\ipc\dlshare.h">
-      <Filter>Header Files\ipc</Filter>
-    </ClInclude>
-    <ClInclude Include="src\ipc\vecbase.h">
-      <Filter>Header Files\ipc</Filter>
-    </ClInclude>
-    <ClInclude Include="src\mge\shader_utils.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\mge\distantlandhlsl.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\mge\suffix_texture_support.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\mge\hlsl_shader_manager.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\mge\async_shader_compiler.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\mge\ffe_core_rendering.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="src\imgui\imconfig.h">
-      <Filter>Header Files\imgui</Filter>
-    </ClInclude>
-    <ClInclude Include="src\imgui\imgui.h">
-      <Filter>Header Files\imgui</Filter>
-    </ClInclude>
-    <ClInclude Include="src\imgui\backends\imgui_impl_dx9.h">
-      <Filter>Header Files\imgui</Filter>
-    </ClInclude>
-    <ClInclude Include="src\imgui\backends\imgui_impl_win32.h">
-      <Filter>Header Files\imgui</Filter>
-    </ClInclude>
-    <ClInclude Include="src\imgui\imgui_internal.h">
-      <Filter>Header Files\imgui</Filter>
-    </ClInclude>
-    <ClInclude Include="src\mge\imgui_manager.h">
-      <Filter>Header Files\imgui</Filter>
-    </ClInclude>
-    <ClInclude Include="src\imgui\imstb_rectpack.h">
-      <Filter>Header Files\imgui</Filter>
-    </ClInclude>
-    <ClInclude Include="src\imgui\imstb_textedit.h">
-      <Filter>Header Files\imgui</Filter>
-    </ClInclude>
-    <ClInclude Include="src\imgui\imstb_truetype.h">
-      <Filter>Header Files\imgui</Filter>
     </ClInclude>
   </ItemGroup>
 </Project>
