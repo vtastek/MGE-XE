@@ -115,6 +115,91 @@ static void setConstantF(D3DCommandBuffer* cmdBuf, IDirect3DDevice9* device, boo
     }
 }
 
+// Apply complete device state from snapshot to command buffer or device directly.
+// Used during async replay where device starts from UNKNOWN state (no synchronous assumptions).
+static void applyDeviceState(D3DCommandBuffer* cmdBuf, IDirect3DDevice9* device, const DeviceStateSnapshot& s) {
+    // Helper lambda for setting render state to either cmdBuf or device
+    auto setRS = [cmdBuf, device](D3DRENDERSTATETYPE state, DWORD value) {
+        if (cmdBuf) {
+            cmdBuf->recordSetRenderState(state, value);
+        } else {
+            device->SetRenderState(state, value);
+        }
+    };
+
+    // Depth states
+    setRS(D3DRS_ZENABLE, s.zEnable);
+    setRS(D3DRS_ZWRITEENABLE, s.zWriteEnable);
+    setRS(D3DRS_ZFUNC, s.zFunc);
+    // depthBias and slopeScaleDepthBias are float-encoded DWORDs
+    setRS(D3DRS_DEPTHBIAS, *(DWORD*)&s.depthBias);
+    setRS(D3DRS_SLOPESCALEDEPTHBIAS, *(DWORD*)&s.slopeScaleDepthBias);
+
+    // Culling
+    setRS(D3DRS_CULLMODE, s.cullMode);
+
+    // Blending
+    setRS(D3DRS_ALPHABLENDENABLE, s.alphaBlendEnable);
+    if (s.alphaBlendEnable) {
+        setRS(D3DRS_SRCBLEND, s.srcBlend);
+        setRS(D3DRS_DESTBLEND, s.destBlend);
+    }
+
+    // Alpha test
+    setRS(D3DRS_ALPHATESTENABLE, s.alphaTestEnable);
+    if (s.alphaTestEnable) {
+        setRS(D3DRS_ALPHAFUNC, s.alphaFunc);
+        setRS(D3DRS_ALPHAREF, s.alphaRef);
+    }
+
+    // Lighting/Material (HLSL handles these internally, but set for completeness)
+    setRS(D3DRS_LIGHTING, s.lighting);
+    setRS(D3DRS_SPECULARENABLE, s.specularEnable);
+    setRS(D3DRS_LOCALVIEWER, s.localViewer);
+    setRS(D3DRS_NORMALIZENORMALS, s.normalizeNormals);
+    setRS(D3DRS_DIFFUSEMATERIALSOURCE, s.diffuseMatSrc);
+    setRS(D3DRS_EMISSIVEMATERIALSOURCE, s.emissiveMatSrc);
+    setRS(D3DRS_AMBIENTMATERIALSOURCE, s.ambientMatSrc);
+    setRS(D3DRS_COLORVERTEX, s.colorVertex);
+    setRS(D3DRS_VERTEXBLEND, s.vertexBlend);
+
+    // Fog
+    setRS(D3DRS_FOGENABLE, s.fogEnable);
+
+    // Output
+    setRS(D3DRS_COLORWRITEENABLE, s.colorWriteEnable);
+
+    // Stencil
+    setRS(D3DRS_STENCILENABLE, s.stencilEnable);
+
+    // UI-specific
+    setRS(D3DRS_AMBIENT, s.ambient);
+    setRS(D3DRS_TEXTUREFACTOR, s.textureFactor);
+
+    // Clip planes
+    setRS(D3DRS_CLIPPLANEENABLE, s.clipPlaneEnable);
+
+    // Debug
+    setRS(D3DRS_FILLMODE, s.fillMode);
+}
+
+// Set replay baseline — establishes known device state at start of async replay
+static void setReplayBaseline(D3DCommandBuffer* cmdBuf, IDirect3DDevice9* device) {
+    DeviceStateSnapshot baseline;  // Default-constructed = D3D9 defaults
+    applyDeviceState(cmdBuf, device, baseline);
+
+    // Also reset samplers to known state
+    for (int i = 0; i < 8; i++) {
+        if (cmdBuf) {
+            cmdBuf->recordSetSamplerState(i, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+            cmdBuf->recordSetSamplerState(i, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+        } else {
+            device->SetSamplerState(i, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+            device->SetSamplerState(i, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+        }
+    }
+}
+
 // Smart texture binding - only binds slots that the shader actually uses
 void FixedFunctionShader::bindShaderTextures(const ShaderKey& sk, const RenderedState* rs) {
     // Original slot assignment (keeping existing layout):
@@ -309,7 +394,7 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
     renderMorrowindHLSL_Internal(&rsWithShadows, frs, lightrs);
 }
 
-void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, DWORD dirtyFlags, int callIndex, D3DCommandBuffer* cmdBuf) {
+void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, DWORD dirtyFlags, int callIndex, D3DCommandBuffer* cmdBuf, const DeviceStateSnapshot* capturedState) {
 
     // Process any completed async shader compilations
     processAsyncCompletions();
@@ -626,22 +711,29 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     }
 
     if (cmdBuf) {
-        cmdBuf->recordSetRenderState(D3DRS_ZENABLE, zEnable);
-        cmdBuf->recordSetRenderState(D3DRS_ZWRITEENABLE, zWriteEnable);
-        cmdBuf->recordSetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
-        cmdBuf->recordSetRenderState(D3DRS_CULLMODE, rs->cullMode);
-        cmdBuf->recordSetRenderState(D3DRS_SPECULARENABLE, FALSE);
-        cmdBuf->recordSetRenderState(D3DRS_LOCALVIEWER, FALSE);
-        cmdBuf->recordSetRenderState(D3DRS_NORMALIZENORMALS, FALSE);
-        cmdBuf->recordSetRenderState(D3DRS_ALPHABLENDENABLE, rs->blendEnable);
-        if (rs->blendEnable) {
-            cmdBuf->recordSetRenderState(D3DRS_SRCBLEND, rs->srcBlend);
-            cmdBuf->recordSetRenderState(D3DRS_DESTBLEND, rs->destBlend);
-        }
-        cmdBuf->recordSetRenderState(D3DRS_ALPHATESTENABLE, rs->alphaTest);
-        if (rs->alphaTest) {
-            cmdBuf->recordSetRenderState(D3DRS_ALPHAFUNC, rs->alphaFunc);
-            cmdBuf->recordSetRenderState(D3DRS_ALPHAREF, rs->alphaRef);
+        // Async replay path: apply full captured device state when available
+        if (capturedState) {
+            // Apply complete captured state (no assumptions about prior device state)
+            applyDeviceState(cmdBuf, device, *capturedState);
+        } else {
+            // Fallback to computed state (legacy path, for non-recorded calls)
+            cmdBuf->recordSetRenderState(D3DRS_ZENABLE, zEnable);
+            cmdBuf->recordSetRenderState(D3DRS_ZWRITEENABLE, zWriteEnable);
+            cmdBuf->recordSetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+            cmdBuf->recordSetRenderState(D3DRS_CULLMODE, rs->cullMode);
+            cmdBuf->recordSetRenderState(D3DRS_SPECULARENABLE, FALSE);
+            cmdBuf->recordSetRenderState(D3DRS_LOCALVIEWER, FALSE);
+            cmdBuf->recordSetRenderState(D3DRS_NORMALIZENORMALS, FALSE);
+            cmdBuf->recordSetRenderState(D3DRS_ALPHABLENDENABLE, rs->blendEnable);
+            if (rs->blendEnable) {
+                cmdBuf->recordSetRenderState(D3DRS_SRCBLEND, rs->srcBlend);
+                cmdBuf->recordSetRenderState(D3DRS_DESTBLEND, rs->destBlend);
+            }
+            cmdBuf->recordSetRenderState(D3DRS_ALPHATESTENABLE, rs->alphaTest);
+            if (rs->alphaTest) {
+                cmdBuf->recordSetRenderState(D3DRS_ALPHAFUNC, rs->alphaFunc);
+                cmdBuf->recordSetRenderState(D3DRS_ALPHAREF, rs->alphaRef);
+            }
         }
         cmdBuf->recordSetFVF(rs->fvf);
         cmdBuf->recordSetStreamSource(0, rs->vb, rs->vbOffset, rs->vbStride);
@@ -1700,7 +1792,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     tintedFrs.material.emissive.g = 0.4f;
                     tintedFrs.material.emissive.b = 0.0f;
                     tintedFrs.material.emissive.a = 1.0f;
-                    renderMorrowindHLSL_Internal(&call.rs, &tintedFrs, call.lightrs.get(), DIRTY_ALL, -1, cmdBuf);
+                    renderMorrowindHLSL_Internal(&call.rs, &tintedFrs, call.lightrs.get(), DIRTY_ALL, -1, cmdBuf, &call.deviceState);
                     continue;
                 }
             }
@@ -1719,7 +1811,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                         tintedFrs.material.emissive = {1.0f, 0.0f, 1.0f, 1.0f}; break; // Magenta
                     default: break;
                 }
-                renderMorrowindHLSL_Internal(&call.rs, &tintedFrs, call.lightrs.get(), DIRTY_ALL, -1, cmdBuf);
+                renderMorrowindHLSL_Internal(&call.rs, &tintedFrs, call.lightrs.get(), DIRTY_ALL, -1, cmdBuf, &call.deviceState);
                 continue;
             }
 
@@ -1753,7 +1845,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                 }
                 LARGE_INTEGER callStartQPC, callEndQPC;
                 QueryPerformanceCounter(&callStartQPC);
-                renderMorrowindHLSL_Internal(&call.rs, &call.frs, call.lightrs.get(), call.dirtyFlags, (int)i, cmdBuf);
+                renderMorrowindHLSL_Internal(&call.rs, &call.frs, call.lightrs.get(), call.dirtyFlags, (int)i, cmdBuf, &call.deviceState);
                 QueryPerformanceCounter(&callEndQPC);
                 float callMs = (callEndQPC.QuadPart - callStartQPC.QuadPart) * 1000.0f / replayFreqQPC.QuadPart;
                 if (callMs > worstCallMs) {

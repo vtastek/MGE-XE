@@ -83,6 +83,95 @@ enum DirtyFlags : DWORD {
     DIRTY_ALL       = 0xFFFFFFFF  // new object or mode disabled
 };
 
+// Complete device state snapshot for async replay (no assumptions about prior state)
+// Captured per-draw-call to enable correct replay from any starting device state.
+// ~30 DWORDs per call = 120 bytes. 4000 calls/frame × 3 buffers = ~1.4 MB total.
+struct DeviceStateSnapshot {
+    // Depth
+    DWORD zEnable;              // D3DRS_ZENABLE
+    DWORD zWriteEnable;         // D3DRS_ZWRITEENABLE
+    DWORD zFunc;                // D3DRS_ZFUNC
+    float depthBias;            // D3DRS_DEPTHBIAS
+    float slopeScaleDepthBias;  // D3DRS_SLOPESCALEDEPTHBIAS
+
+    // Culling
+    DWORD cullMode;             // D3DRS_CULLMODE
+
+    // Blending
+    DWORD alphaBlendEnable;     // D3DRS_ALPHABLENDENABLE
+    DWORD srcBlend;             // D3DRS_SRCBLEND
+    DWORD destBlend;            // D3DRS_DESTBLEND
+
+    // Alpha test
+    DWORD alphaTestEnable;      // D3DRS_ALPHATESTENABLE
+    DWORD alphaFunc;            // D3DRS_ALPHAFUNC
+    DWORD alphaRef;             // D3DRS_ALPHAREF
+
+    // Lighting/Material
+    DWORD lighting;             // D3DRS_LIGHTING
+    DWORD specularEnable;       // D3DRS_SPECULARENABLE
+    DWORD localViewer;          // D3DRS_LOCALVIEWER
+    DWORD normalizeNormals;     // D3DRS_NORMALIZENORMALS
+    DWORD diffuseMatSrc;        // D3DRS_DIFFUSEMATERIALSOURCE
+    DWORD emissiveMatSrc;       // D3DRS_EMISSIVEMATERIALSOURCE
+    DWORD ambientMatSrc;        // D3DRS_AMBIENTMATERIALSOURCE
+    DWORD colorVertex;          // D3DRS_COLORVERTEX
+    DWORD vertexBlend;          // D3DRS_VERTEXBLEND
+
+    // Fog
+    DWORD fogEnable;            // D3DRS_FOGENABLE
+
+    // Output
+    DWORD colorWriteEnable;     // D3DRS_COLORWRITEENABLE
+
+    // Stencil (rarely used but captures MW state)
+    DWORD stencilEnable;        // D3DRS_STENCILENABLE
+
+    // UI-specific (captured when relevant)
+    DWORD ambient;              // D3DRS_AMBIENT
+    DWORD textureFactor;        // D3DRS_TEXTUREFACTOR
+
+    // Clip planes (distant land)
+    DWORD clipPlaneEnable;      // D3DRS_CLIPPLANEENABLE
+
+    // Debug
+    DWORD fillMode;             // D3DRS_FILLMODE
+
+    // Default constructor - D3D9 defaults
+    DeviceStateSnapshot() :
+        zEnable(D3DZB_TRUE),
+        zWriteEnable(TRUE),
+        zFunc(D3DCMP_LESSEQUAL),
+        depthBias(0.0f),
+        slopeScaleDepthBias(0.0f),
+        cullMode(D3DCULL_CW),
+        alphaBlendEnable(FALSE),
+        srcBlend(D3DBLEND_ONE),
+        destBlend(D3DBLEND_ZERO),
+        alphaTestEnable(FALSE),
+        alphaFunc(D3DCMP_ALWAYS),
+        alphaRef(0),
+        lighting(TRUE),
+        specularEnable(FALSE),
+        localViewer(FALSE),
+        normalizeNormals(FALSE),
+        diffuseMatSrc(D3DMCS_COLOR1),
+        emissiveMatSrc(D3DMCS_MATERIAL),
+        ambientMatSrc(D3DMCS_MATERIAL),
+        colorVertex(TRUE),
+        vertexBlend(D3DVBF_DISABLE),
+        fogEnable(FALSE),
+        colorWriteEnable(0xF),
+        stencilEnable(FALSE),
+        ambient(0),
+        textureFactor(0xFFFFFFFF),
+        clipPlaneEnable(0),
+        fillMode(D3DFILL_SOLID) {}
+};
+
+// Global device state tracker - updated by every SetRenderState, snapshot captured per-draw
+extern DeviceStateSnapshot g_deviceState;
+
 // Expected device state for debug mode (state leak detection)
 struct ExpectedDeviceState {
     DWORD alphaBlendEnable, alphaTestEnable;
@@ -621,6 +710,9 @@ public:
         // Expected device state for debug mode (state leak detection)
         ExpectedDeviceState expectedState;
 
+        // Complete device state snapshot for async replay (no assumptions)
+        DeviceStateSnapshot deviceState;
+
         // Constructor to capture render state data with proper resource management
         HLSLRecordedCall(const RenderedState* rs_, const FragmentState* frs_, std::shared_ptr<LightState> lightrs_, const ShaderKey& sk_, int recordMWIdx = -1);
         // Implementation moved to cpp file to handle sampler state capture
@@ -775,7 +867,7 @@ private:
     static void prepareRecordedCalls(int bufferIndex);
     static void recordRenderCall(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, const ShaderKey& sk, int recordMWIdx = -1);
     static void replayRecordedCalls(int sceneCount, D3DCommandBuffer* cmdBuf = nullptr);
-    static void renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, DWORD dirtyFlags = DIRTY_ALL, int callIndex = -1, D3DCommandBuffer* cmdBuf = nullptr);
+    static void renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, DWORD dirtyFlags = DIRTY_ALL, int callIndex = -1, D3DCommandBuffer* cmdBuf = nullptr, const DeviceStateSnapshot* capturedState = nullptr);
     static void validateDeviceState(const ExpectedDeviceState& expected, int callIndex);
     static void matchPreviousFrameCalls(int bufferIndex);
     static ShaderKey computeShaderKeyWithSuffixes(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);

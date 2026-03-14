@@ -2831,6 +2831,9 @@ void FixedFunctionShader::validateDeviceState(const ExpectedDeviceState& expecte
 
 FixedFunctionShader::HLSLRecordedCall::HLSLRecordedCall(const RenderedState* rs_, const FragmentState* frs_, std::shared_ptr<LightState> lightrs_, const ShaderKey& sk_, int recordMWIdx)
     : rs(*rs_), frs(*frs_), lightrs(lightrs_), sk(sk_), hasBoundingBox(false), recordMWIndex(recordMWIdx), bin(RenderBin::Opaque), prepared(false), dirtyFlags(DIRTY_ALL) {
+    // Capture complete device state snapshot for async replay (no assumptions about prior state)
+    deviceState = g_deviceState;
+
     // Lean recording: capture sampler states for stages 0-1 only (Morrowind-bound textures)
     // Stages 2+ are HLSL-specific textures bound by MGE XE with known sampler states
     trackDeviceRead("GetTexture+GetSamplerState(recording)");

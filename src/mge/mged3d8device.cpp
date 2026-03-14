@@ -84,6 +84,10 @@ static RenderedState rs;
 static FragmentState frs;
 static LightState lightrs;
 
+// Global device state tracker — updated by every SetRenderState, snapshot captured per-draw
+// Enables async replay where device starts from UNKNOWN state (not synchronous assumptions)
+DeviceStateSnapshot g_deviceState;
+
 static HWND gameWindow = nullptr;
 static bool imguiInitialized = false;
 
@@ -1524,6 +1528,7 @@ HRESULT _stdcall MGEProxyDevice::LightEnable(DWORD a, BOOL b) {
 }
 
 void captureRenderState(D3DRENDERSTATETYPE a, DWORD b) {
+    // Update legacy RenderedState for existing code paths
     switch (a) {
     case D3DRS_VERTEXBLEND:
         rs.vertexBlendState = b;
@@ -1563,6 +1568,115 @@ void captureRenderState(D3DRENDERSTATETYPE a, DWORD b) {
         break;
     case D3DRS_EMISSIVEMATERIALSOURCE:
         rs.matSrcEmissive = (BYTE)b;
+        break;
+    }
+
+    // Update complete DeviceStateSnapshot for async replay (no assumptions about prior state)
+    switch (a) {
+    // Depth states
+    case D3DRS_ZENABLE:
+        g_deviceState.zEnable = b;
+        break;
+    case D3DRS_ZWRITEENABLE:
+        g_deviceState.zWriteEnable = b;
+        break;
+    case D3DRS_ZFUNC:
+        g_deviceState.zFunc = b;
+        break;
+    case D3DRS_DEPTHBIAS:
+        g_deviceState.depthBias = *(float*)&b;
+        break;
+    case D3DRS_SLOPESCALEDEPTHBIAS:
+        g_deviceState.slopeScaleDepthBias = *(float*)&b;
+        break;
+
+    // Culling
+    case D3DRS_CULLMODE:
+        g_deviceState.cullMode = b;
+        break;
+
+    // Blending
+    case D3DRS_ALPHABLENDENABLE:
+        g_deviceState.alphaBlendEnable = b;
+        break;
+    case D3DRS_SRCBLEND:
+        g_deviceState.srcBlend = b;
+        break;
+    case D3DRS_DESTBLEND:
+        g_deviceState.destBlend = b;
+        break;
+
+    // Alpha test
+    case D3DRS_ALPHATESTENABLE:
+        g_deviceState.alphaTestEnable = b;
+        break;
+    case D3DRS_ALPHAFUNC:
+        g_deviceState.alphaFunc = b;
+        break;
+    case D3DRS_ALPHAREF:
+        g_deviceState.alphaRef = b;
+        break;
+
+    // Lighting/Material
+    case D3DRS_LIGHTING:
+        g_deviceState.lighting = b;
+        break;
+    case D3DRS_SPECULARENABLE:
+        g_deviceState.specularEnable = b;
+        break;
+    case D3DRS_LOCALVIEWER:
+        g_deviceState.localViewer = b;
+        break;
+    case D3DRS_NORMALIZENORMALS:
+        g_deviceState.normalizeNormals = b;
+        break;
+    case D3DRS_DIFFUSEMATERIALSOURCE:
+        g_deviceState.diffuseMatSrc = b;
+        break;
+    case D3DRS_EMISSIVEMATERIALSOURCE:
+        g_deviceState.emissiveMatSrc = b;
+        break;
+    case D3DRS_AMBIENTMATERIALSOURCE:
+        g_deviceState.ambientMatSrc = b;
+        break;
+    case D3DRS_COLORVERTEX:
+        g_deviceState.colorVertex = b;
+        break;
+    case D3DRS_VERTEXBLEND:
+        g_deviceState.vertexBlend = b;
+        break;
+
+    // Fog
+    case D3DRS_FOGENABLE:
+        g_deviceState.fogEnable = b;
+        break;
+
+    // Output
+    case D3DRS_COLORWRITEENABLE:
+        g_deviceState.colorWriteEnable = b;
+        break;
+
+    // Stencil
+    case D3DRS_STENCILENABLE:
+        g_deviceState.stencilEnable = b;
+        break;
+
+    // UI-specific
+    case D3DRS_AMBIENT:
+        g_deviceState.ambient = b;
+        break;
+    case D3DRS_TEXTUREFACTOR:
+        g_deviceState.textureFactor = b;
+        break;
+
+    // Clip planes
+    case D3DRS_CLIPPLANEENABLE:
+        g_deviceState.clipPlaneEnable = b;
+        break;
+
+    // Debug
+    case D3DRS_FILLMODE:
+        g_deviceState.fillMode = b;
         break;
     }
 }
