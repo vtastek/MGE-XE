@@ -2,6 +2,81 @@
 
 #include "proxydx/d3d9header.h"
 #include <vector>
+#include <unordered_map>
+
+// Forward declaration
+struct StateContract;
+
+// Shadow state tracker for MW state during recording.
+// Mirrors SetXXX calls so we can reconstruct MW state without GetXXX.
+// This enables true async: device can be owned by render thread while main records.
+struct MWStateTracker {
+    // Render states (keyed by D3DRENDERSTATETYPE)
+    std::unordered_map<DWORD, DWORD> renderStates;
+
+    // Sampler states (keyed by sampler * 256 + state)
+    std::unordered_map<DWORD, DWORD> samplerStates;
+
+    // Transforms (keyed by D3DTRANSFORMSTATETYPE)
+    std::unordered_map<DWORD, D3DMATRIX> transforms;
+
+    // Track a render state change
+    void trackRenderState(DWORD state, DWORD value) {
+        renderStates[state] = value;
+    }
+
+    // Track a sampler state change
+    void trackSamplerState(DWORD sampler, DWORD state, DWORD value) {
+        samplerStates[sampler * 256 + state] = value;
+    }
+
+    // Track a transform change
+    void trackTransform(DWORD type, const D3DMATRIX& matrix) {
+        transforms[type] = matrix;
+    }
+
+    // Get render state (returns false if not tracked)
+    bool getRenderState(DWORD state, DWORD* outValue) const {
+        auto it = renderStates.find(state);
+        if (it != renderStates.end()) {
+            *outValue = it->second;
+            return true;
+        }
+        return false;
+    }
+
+    // Get sampler state (returns false if not tracked)
+    bool getSamplerState(DWORD sampler, DWORD state, DWORD* outValue) const {
+        auto it = samplerStates.find(sampler * 256 + state);
+        if (it != samplerStates.end()) {
+            *outValue = it->second;
+            return true;
+        }
+        return false;
+    }
+
+    // Get transform (returns false if not tracked)
+    bool getTransform(DWORD type, D3DMATRIX* outMatrix) const {
+        auto it = transforms.find(type);
+        if (it != transforms.end()) {
+            *outMatrix = it->second;
+            return true;
+        }
+        return false;
+    }
+
+    // Export tracked state to StateContract (defined in recording_system.cpp)
+    void exportToStateContract(struct StateContract* out) const;
+
+    void clear() {
+        renderStates.clear();
+        samplerStates.clear();
+        transforms.clear();
+    }
+
+    // Seed tracker with current device state (call at start of recording)
+    void seedFromDevice(IDirect3DDevice9* dev);
+};
 
 struct D3DCmd {
     enum Type : uint8_t {
@@ -66,6 +141,7 @@ public:
 
     void clear();
     void replay(IDirect3DDevice9* device) const;
+    void replayStateOnly(IDirect3DDevice9* device) const;  // Replay without draw calls (for state restoration)
 
     // Record methods
     void recordSetRenderState(DWORD state, DWORD value);
@@ -116,7 +192,26 @@ public:
     size_t totalSizeBytes() const;
     void dumpToFrameLog() const;
 
+    // State tracker for shadow state during recording
+    MWStateTracker& stateTracker() { return tracker; }
+    const MWStateTracker& stateTracker() const { return tracker; }
+
+    // Convenience: record + track in one call
+    void recordAndTrackRenderState(DWORD state, DWORD value) {
+        active().recordSetRenderState(state, value);
+        tracker.trackRenderState(state, value);
+    }
+    void recordAndTrackSamplerState(DWORD sampler, DWORD state, DWORD value) {
+        active().recordSetSamplerState(sampler, state, value);
+        tracker.trackSamplerState(sampler, state, value);
+    }
+    void recordAndTrackTransform(DWORD type, const D3DMATRIX* matrix) {
+        active().recordSetTransform(type, matrix);
+        tracker.trackTransform(type, *matrix);
+    }
+
     CmdStage activeStage = CmdStage::PreScene;
 private:
     D3DCommandBuffer buffers[(int)CmdStage::Count];
+    MWStateTracker tracker;
 };

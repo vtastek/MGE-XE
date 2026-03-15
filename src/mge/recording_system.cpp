@@ -30,8 +30,107 @@ static auto& currentRecordedCalls() {
 // Diagnostic: cache hit/miss logging for first N frames (temporary)
 static int hlslDiagFrameCounter = 0;
 
+// === Debug Validation ===
+// Compare tracked state vs device state (for verifying tracker accuracy)
+#ifdef _DEBUG
+static void validateTrackedVsDevice(const MWStateTracker& tracker, const StateContract& device, const char* context) {
+    StateContract tracked;
+    tracker.exportToStateContract(&tracked);
+
+    // Compare key fields and log mismatches
+    auto checkRS = [&](const char* name, DWORD t, DWORD d) {
+        if (t != d) {
+            LOG::logline("[%s] Tracker mismatch %s: tracked=%lu device=%lu", context, name, t, d);
+        }
+    };
+
+    checkRS("zEnable", tracked.zEnable, device.zEnable);
+    checkRS("zWriteEnable", tracked.zWriteEnable, device.zWriteEnable);
+    checkRS("zFunc", tracked.zFunc, device.zFunc);
+    checkRS("alphaBlendEnable", tracked.alphaBlendEnable, device.alphaBlendEnable);
+    checkRS("srcBlend", tracked.srcBlend, device.srcBlend);
+    checkRS("destBlend", tracked.destBlend, device.destBlend);
+    checkRS("alphaTestEnable", tracked.alphaTestEnable, device.alphaTestEnable);
+    checkRS("alphaFunc", tracked.alphaFunc, device.alphaFunc);
+    checkRS("alphaRef", tracked.alphaRef, device.alphaRef);
+    checkRS("cullMode", tracked.cullMode, device.cullMode);
+    checkRS("fogEnable", tracked.fogEnable, device.fogEnable);
+
+    // Compare sampler states
+    for (int s = 0; s < 2; ++s) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "sampler%d.minFilter", s);
+        checkRS(buf, tracked.samplers[s].minFilter, device.samplers[s].minFilter);
+        snprintf(buf, sizeof(buf), "sampler%d.magFilter", s);
+        checkRS(buf, tracked.samplers[s].magFilter, device.samplers[s].magFilter);
+        snprintf(buf, sizeof(buf), "sampler%d.addressU", s);
+        checkRS(buf, tracked.samplers[s].addressU, device.samplers[s].addressU);
+        snprintf(buf, sizeof(buf), "sampler%d.addressV", s);
+        checkRS(buf, tracked.samplers[s].addressV, device.samplers[s].addressV);
+    }
+}
+#endif
+
+// === MWStateTracker Implementation ===
+// Export tracked shadow state to StateContract for restoration
+
+void MWStateTracker::exportToStateContract(StateContract* out) const {
+    // Helper to get tracked value or keep default
+    auto getRS = [this](DWORD state, DWORD* target) {
+        DWORD val;
+        if (getRenderState(state, &val)) *target = val;
+    };
+    auto getSS = [this](DWORD sampler, DWORD state, DWORD* target) {
+        DWORD val;
+        if (getSamplerState(sampler, state, &val)) *target = val;
+    };
+
+    // Depth state
+    getRS(D3DRS_ZENABLE, &out->zEnable);
+    getRS(D3DRS_ZWRITEENABLE, &out->zWriteEnable);
+    getRS(D3DRS_ZFUNC, &out->zFunc);
+
+    // Blending state
+    getRS(D3DRS_ALPHABLENDENABLE, &out->alphaBlendEnable);
+    getRS(D3DRS_SRCBLEND, &out->srcBlend);
+    getRS(D3DRS_DESTBLEND, &out->destBlend);
+
+    // Alpha test state
+    getRS(D3DRS_ALPHATESTENABLE, &out->alphaTestEnable);
+    getRS(D3DRS_ALPHAFUNC, &out->alphaFunc);
+    getRS(D3DRS_ALPHAREF, &out->alphaRef);
+
+    // Culling and fog
+    getRS(D3DRS_CULLMODE, &out->cullMode);
+    getRS(D3DRS_FOGENABLE, &out->fogEnable);
+
+    // Specular and lighting
+    getRS(D3DRS_SPECULARENABLE, &out->specularEnable);
+    getRS(D3DRS_LOCALVIEWER, &out->localViewer);
+    getRS(D3DRS_NORMALIZENORMALS, &out->normalizeNormals);
+
+    // Sampler states for stages 0-1
+    for (DWORD s = 0; s < 2; ++s) {
+        getSS(s, D3DSAMP_MINFILTER, &out->samplers[s].minFilter);
+        getSS(s, D3DSAMP_MAGFILTER, &out->samplers[s].magFilter);
+        getSS(s, D3DSAMP_MIPFILTER, &out->samplers[s].mipFilter);
+        getSS(s, D3DSAMP_ADDRESSU, &out->samplers[s].addressU);
+        getSS(s, D3DSAMP_ADDRESSV, &out->samplers[s].addressV);
+    }
+
+    // Transforms
+    getTransform(D3DTS_WORLD, &out->world);
+    getTransform(D3DTS_VIEW, &out->view);
+    getTransform(D3DTS_PROJECTION, &out->projection);
+}
+
 // === StateContract Implementation ===
 // Centralized device state capture/restore for explicit phase handoffs
+
+void StateContract::captureFromTracker(const MWStateTracker& tracker) {
+    // Delegate to MWStateTracker's export method
+    tracker.exportToStateContract(this);
+}
 
 void StateContract::captureFrom(IDirect3DDevice9* dev) {
     // Depth state
@@ -209,6 +308,12 @@ void FixedFunctionShader::startRecording() {
     trackDeviceRead("StateContract::captureFrom(preRecording)");
     preRecordingContract.captureFrom((IDirect3DDevice9*)device);
 
+    // Seed the state tracker with current device state BEFORE suppression takes effect.
+    // This ensures the tracker has complete state (baseline + MW changes during recording).
+    // Without this, tracker only has values MW explicitly set during recording.
+    if (ImGuiManager::GetStateSuppressionEnabled()) {
+        g_cmdBufferSet.stateTracker().seedFromDevice((IDirect3DDevice9*)device);
+    }
 
     // Reset HLSL caches for new recording session
     resetHLSLCaches();
@@ -372,7 +477,13 @@ void FixedFunctionShader::finalizeBatchAndSubmitCull() {
     isRecording = false;
 
     // Capture Morrowind's end-of-Scene-0 device state for restoration after replay
-    postRecordingContract.captureFrom((IDirect3DDevice9*)device);
+    if (ImGuiManager::GetStateSuppressionEnabled()) {
+        // Suppression ON: use tracked state (device has HLSL values, not MW values)
+        postRecordingContract.captureFromTracker(g_cmdBufferSet.stateTracker());
+    } else {
+        // Suppression OFF: use device directly (MW calls forwarded, device has correct values)
+        postRecordingContract.captureFrom((IDirect3DDevice9*)device);
+    }
 
 
     // Diagnostic: increment frame counter for cache miss/hit logging
@@ -493,17 +604,33 @@ void FixedFunctionShader::finalizeBatchAndReplay(int sceneCount) {
 void FixedFunctionShader::capturePostRecordingState() {
     if (!isRecording) return;
 
-    // Capture full device state into per-buffer StateContract for HLSL isolation
-    trackDeviceRead("StateContract::captureFrom(postRecording)");
     auto& fb = frameBuffers[recordingBuffer];
-    fb.stateContract.captureFrom((IDirect3DDevice9*)device);
+
+    if (ImGuiManager::GetStateSuppressionEnabled()) {
+        // Suppression ON: use tracked state (device has HLSL values, not MW values)
+        fb.stateContract.captureFromTracker(g_cmdBufferSet.stateTracker());
+    } else {
+        // Suppression OFF: use device directly (MW calls forwarded, device has correct values)
+        trackDeviceRead("StateContract::captureFrom(postRecording)");
+        fb.stateContract.captureFrom((IDirect3DDevice9*)device);
+    }
+
+#ifdef _DEBUG
+    // Validation: compare tracked vs device (only useful when suppression is OFF)
+    // When suppression is ON, device has HLSL values so comparison is meaningless.
+    if (!ImGuiManager::GetStateSuppressionEnabled()) {
+        StateContract deviceState;
+        deviceState.captureFrom((IDirect3DDevice9*)device);
+        // Log any mismatches (tracked should equal device when suppression is off)
+        validateTrackedVsDevice(g_cmdBufferSet.stateTracker(), deviceState, "capturePostRecordingState");
+    }
+#endif
 
 }
 
 // restorePostRecordingState - Clean up device state for Scene 1+ after HLSL recording
 // Called at EndScene 0 in deferred HLSL mode so particles/hands render correctly.
-// Stops recording so Scene 1+ uses immediate rendering path.
-// Does NOT do replay (that happens later at finalizeAndRender).
+// NOTE: State restoration for suppression mode now happens in executeGpuPhase().
 void FixedFunctionShader::restorePostRecordingState() {
     if (!isRecording) return;
 
@@ -765,8 +892,15 @@ void FixedFunctionShader::executeGpuPhase(int bufferIndex) {
     device->SetVertexShader(NULL);
     device->SetPixelShader(NULL);
 
-    // Restore Morrowind's end-of-Scene-0 state (from per-buffer StateContract)
-    fb.stateContract.applyTo((IDirect3DDevice9*)device);
+    // Restore Morrowind's end-of-Scene-0 state for Scene 1+
+    if (ImGuiManager::GetStateSuppressionEnabled()) {
+        // Suppression ON: replay full Scene0 buffer (materials, lights, textures, etc.)
+        // StateContract only has a subset; Scene0 buffer has complete recorded state.
+        g_cmdBufferSet[CmdStage::Scene0].replayStateOnly((IDirect3DDevice9*)device);
+    } else {
+        // Suppression OFF: StateContract captured from device is accurate
+        fb.stateContract.applyTo((IDirect3DDevice9*)device);
+    }
 
 
     isReplaying = false;

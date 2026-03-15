@@ -139,8 +139,11 @@ struct StateContract {
     D3DMATRIX view = {};
     D3DMATRIX projection = {};
 
-    // Capture all state from device
+    // Capture all state from device (uses GetXXX calls)
     void captureFrom(IDirect3DDevice9* dev);
+
+    // Capture state from MWStateTracker (no device calls - enables async)
+    void captureFromTracker(const struct MWStateTracker& tracker);
 
     // Apply all state to device
     void applyTo(IDirect3DDevice9* dev) const;

@@ -1,6 +1,51 @@
 #include "d3dcommandbuffer.h"
 #include "imgui_manager.h"
 
+// --- MWStateTracker ---
+
+void MWStateTracker::seedFromDevice(IDirect3DDevice9* dev) {
+    DWORD val;
+
+    // Depth state
+    dev->GetRenderState(D3DRS_ZENABLE, &val); renderStates[D3DRS_ZENABLE] = val;
+    dev->GetRenderState(D3DRS_ZWRITEENABLE, &val); renderStates[D3DRS_ZWRITEENABLE] = val;
+    dev->GetRenderState(D3DRS_ZFUNC, &val); renderStates[D3DRS_ZFUNC] = val;
+
+    // Blending state
+    dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &val); renderStates[D3DRS_ALPHABLENDENABLE] = val;
+    dev->GetRenderState(D3DRS_SRCBLEND, &val); renderStates[D3DRS_SRCBLEND] = val;
+    dev->GetRenderState(D3DRS_DESTBLEND, &val); renderStates[D3DRS_DESTBLEND] = val;
+
+    // Alpha test state
+    dev->GetRenderState(D3DRS_ALPHATESTENABLE, &val); renderStates[D3DRS_ALPHATESTENABLE] = val;
+    dev->GetRenderState(D3DRS_ALPHAFUNC, &val); renderStates[D3DRS_ALPHAFUNC] = val;
+    dev->GetRenderState(D3DRS_ALPHAREF, &val); renderStates[D3DRS_ALPHAREF] = val;
+
+    // Culling and fog
+    dev->GetRenderState(D3DRS_CULLMODE, &val); renderStates[D3DRS_CULLMODE] = val;
+    dev->GetRenderState(D3DRS_FOGENABLE, &val); renderStates[D3DRS_FOGENABLE] = val;
+
+    // Specular and lighting
+    dev->GetRenderState(D3DRS_SPECULARENABLE, &val); renderStates[D3DRS_SPECULARENABLE] = val;
+    dev->GetRenderState(D3DRS_LOCALVIEWER, &val); renderStates[D3DRS_LOCALVIEWER] = val;
+    dev->GetRenderState(D3DRS_NORMALIZENORMALS, &val); renderStates[D3DRS_NORMALIZENORMALS] = val;
+
+    // Sampler states for stages 0-1
+    for (DWORD s = 0; s < 2; ++s) {
+        dev->GetSamplerState(s, D3DSAMP_MINFILTER, &val); samplerStates[s * 256 + D3DSAMP_MINFILTER] = val;
+        dev->GetSamplerState(s, D3DSAMP_MAGFILTER, &val); samplerStates[s * 256 + D3DSAMP_MAGFILTER] = val;
+        dev->GetSamplerState(s, D3DSAMP_MIPFILTER, &val); samplerStates[s * 256 + D3DSAMP_MIPFILTER] = val;
+        dev->GetSamplerState(s, D3DSAMP_ADDRESSU, &val); samplerStates[s * 256 + D3DSAMP_ADDRESSU] = val;
+        dev->GetSamplerState(s, D3DSAMP_ADDRESSV, &val); samplerStates[s * 256 + D3DSAMP_ADDRESSV] = val;
+    }
+
+    // Transforms
+    D3DMATRIX mat;
+    dev->GetTransform(D3DTS_WORLD, &mat); transforms[D3DTS_WORLD] = mat;
+    dev->GetTransform(D3DTS_VIEW, &mat); transforms[D3DTS_VIEW] = mat;
+    dev->GetTransform(D3DTS_PROJECTION, &mat); transforms[D3DTS_PROJECTION] = mat;
+}
+
 // --- Move semantics ---
 
 D3DCommandBuffer::D3DCommandBuffer(D3DCommandBuffer&& other) noexcept
@@ -381,6 +426,74 @@ void D3DCommandBuffer::replay(IDirect3DDevice9* device) const {
     }
 }
 
+// Replay only state commands (skip draw calls) — for restoring MW device state
+void D3DCommandBuffer::replayStateOnly(IDirect3DDevice9* device) const {
+    for (const auto& cmd : commands) {
+        switch (cmd.type) {
+        // State commands — replay these
+        case D3DCmd::Cmd_SetRenderState:
+            device->SetRenderState((D3DRENDERSTATETYPE)cmd.rs.state, cmd.rs.value);
+            break;
+        case D3DCmd::Cmd_SetTextureStageState:
+            device->SetTextureStageState(cmd.tss.stage, (D3DTEXTURESTAGESTATETYPE)cmd.tss.state, cmd.tss.value);
+            break;
+        case D3DCmd::Cmd_SetSamplerState:
+            device->SetSamplerState(cmd.ss.sampler, (D3DSAMPLERSTATETYPE)cmd.ss.state, cmd.ss.value);
+            break;
+        case D3DCmd::Cmd_SetTransform:
+            device->SetTransform((D3DTRANSFORMSTATETYPE)cmd.xform.transformType, &cmd.xform.matrix);
+            break;
+        case D3DCmd::Cmd_SetTexture:
+            device->SetTexture(cmd.tex.stage, cmd.tex.tex);
+            break;
+        case D3DCmd::Cmd_SetMaterial:
+            device->SetMaterial(&cmd.mat.material);
+            break;
+        case D3DCmd::Cmd_SetLight:
+            device->SetLight(cmd.light.index, &cmd.light.light);
+            break;
+        case D3DCmd::Cmd_LightEnable:
+            device->LightEnable(cmd.lightEn.index, cmd.lightEn.enable);
+            break;
+        case D3DCmd::Cmd_SetFVF:
+            device->SetFVF(cmd.fvf.fvf);
+            break;
+        case D3DCmd::Cmd_SetStreamSource:
+            device->SetStreamSource(cmd.streamSrc.stream, cmd.streamSrc.vb, cmd.streamSrc.offset, cmd.streamSrc.stride);
+            break;
+        case D3DCmd::Cmd_SetIndices:
+            device->SetIndices(cmd.indices.ib);
+            break;
+        case D3DCmd::Cmd_SetViewport:
+            device->SetViewport(&cmd.vp.viewport);
+            break;
+
+        // Skip draw commands
+        case D3DCmd::Cmd_DrawIndexedPrimitive:
+        case D3DCmd::Cmd_DrawPrimitive:
+            break;
+
+        // Skip scene/clear/RT commands — caller manages these
+        case D3DCmd::Cmd_Clear:
+        case D3DCmd::Cmd_SetRenderTarget:
+        case D3DCmd::Cmd_SetDepthStencilSurface:
+        case D3DCmd::Cmd_BeginScene:
+        case D3DCmd::Cmd_EndScene:
+            break;
+
+        // Skip shader commands — HLSL-specific, not MW state
+        case D3DCmd::Cmd_SetVertexShader:
+        case D3DCmd::Cmd_SetPixelShader:
+        case D3DCmd::Cmd_SetVSConstantF:
+        case D3DCmd::Cmd_SetPSConstantF:
+        case D3DCmd::Cmd_SetVSConstantI:
+        case D3DCmd::Cmd_SetPSConstantI:
+        case D3DCmd::Cmd_GetRenderTargetData:
+            break;
+        }
+    }
+}
+
 // --- CmdStage names ---
 
 const char* CmdStageName(CmdStage s) {
@@ -394,6 +507,7 @@ void D3DCommandBufferSet::clearAll() {
     for (int i = 0; i < (int)CmdStage::Count; i++) {
         buffers[i].clear();
     }
+    tracker.clear();
     activeStage = CmdStage::PreScene;
 }
 

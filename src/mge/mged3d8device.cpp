@@ -134,14 +134,25 @@ static void processImGuiHotkeys() {
 //   Scene0/Scene1+ recording:          suppress=true, record only (render thread owns device)
 //   UI/HUD after sync:                 suppress=false, forward to device
 static inline bool shouldSuppressMWState() {
-    // DISABLED: Suppression causes systemic state leakage.
-    // MW calls SetXXX() -> suppressed -> device never gets MW's values
-    // HLSL replay sets its own values -> GetXXX() returns HLSL values
-    // capturePostRecordingState gets wrong values -> restore corrupts state
+    // Phase B: Suppression enabled via ImGui toggle for testing.
+    // When enabled:
+    // - Scene 0 MW calls record to command buffer only (no device forwarding)
+    // - State capture uses tracked values (MWStateTracker) instead of GetXXX
+    // - State restore replays command buffer to device
     //
-    // Full command buffer replay (Option B) is needed for true async overlap.
-    // Until then, all MW calls must forward to device (Phase 3a sync behavior).
-    return false;
+    // Prerequisites for enabling:
+    // - MWStateTracker must track all state that StateContract cares about
+    // - State restore must replay MW command buffer (Phase C)
+    //
+    // Currently: toggled via "State Suppression" checkbox in ImGui debug panel
+    if (!ImGuiManager::GetStateSuppressionEnabled()) {
+        return false;
+    }
+
+    // Only suppress during Scene 0 HLSL recording
+    return isHLSLActive()
+        && FixedFunctionShader::getIsRecording()
+        && g_scene.sceneCount == 0;
 }
 
 
@@ -1007,7 +1018,7 @@ HRESULT _stdcall MGEProxyDevice::SetTransform(D3DTRANSFORMSTATETYPE a, const D3D
                 // Store modified view for CPU-side reads (replaces device->GetTransform)
                 DistantLand::s_staging.mwView = view;
                 if (ImGuiManager::GetCmdBufferRecording()) {
-                    g_cmdBufferSet.active().recordSetTransform((DWORD)a, &view);
+                    g_cmdBufferSet.recordAndTrackTransform((DWORD)a, &view);
                 }
                 // Don't suppress transforms — needed for capture/restore
                 return ProxyDevice::SetTransform(a, &view);
@@ -1026,7 +1037,7 @@ HRESULT _stdcall MGEProxyDevice::SetTransform(D3DTRANSFORMSTATETYPE a, const D3D
                 // Store modified projection for CPU-side reads (replaces device->GetTransform)
                 DistantLand::s_staging.mwProj = proj;
                 if (ImGuiManager::GetCmdBufferRecording()) {
-                    g_cmdBufferSet.active().recordSetTransform((DWORD)a, &proj);
+                    g_cmdBufferSet.recordAndTrackTransform((DWORD)a, &proj);
                 }
                 // Don't suppress transforms — needed for capture/restore
                 return ProxyDevice::SetTransform(a, &proj);
@@ -1035,7 +1046,7 @@ HRESULT _stdcall MGEProxyDevice::SetTransform(D3DTRANSFORMSTATETYPE a, const D3D
     }
 
     if (ImGuiManager::GetCmdBufferRecording()) {
-        g_cmdBufferSet.active().recordSetTransform((DWORD)a, b);
+        g_cmdBufferSet.recordAndTrackTransform((DWORD)a, b);
     }
     // Don't suppress transforms — needed for capture/restore
     return ProxyDevice::SetTransform(a, b);
@@ -1109,7 +1120,7 @@ HRESULT _stdcall MGEProxyDevice::SetRenderState(D3DRENDERSTATETYPE a, DWORD b) {
     }
 
     if (ImGuiManager::GetCmdBufferRecording()) {
-        g_cmdBufferSet.active().recordSetRenderState((DWORD)a, b);
+        g_cmdBufferSet.recordAndTrackRenderState((DWORD)a, b);
     }
 
     // Don't suppress point sprite states — particles need these for correct sizing
@@ -1146,14 +1157,14 @@ HRESULT _stdcall MGEProxyDevice::SetTextureStageState(DWORD a, D3DTEXTURESTAGEST
     if (b == D3DTSS_MINFILTER) {
         DWORD filter = (c != D3DTEXF_NONE) ? Configuration.ScaleFilter : D3DTEXF_NONE;
         if (ImGuiManager::GetCmdBufferRecording()) {
-            g_cmdBufferSet.active().recordSetSamplerState(a, D3DSAMP_MINFILTER, filter);
+            g_cmdBufferSet.recordAndTrackSamplerState(a, D3DSAMP_MINFILTER, filter);
         }
         // Don't suppress sampler states — needed for UI state capture
         return realDevice->SetSamplerState(a, D3DSAMP_MINFILTER, filter);
     } else if (b == D3DTSS_MIPFILTER) {
         DWORD filter = (c != D3DTEXF_NONE) ? D3DTEXF_LINEAR : D3DTEXF_NONE;
         if (ImGuiManager::GetCmdBufferRecording()) {
-            g_cmdBufferSet.active().recordSetSamplerState(a, D3DSAMP_MIPFILTER, filter);
+            g_cmdBufferSet.recordAndTrackSamplerState(a, D3DSAMP_MIPFILTER, filter);
         }
         // Don't suppress sampler states — needed for UI state capture
         return realDevice->SetSamplerState(a, D3DSAMP_MIPFILTER, filter);
@@ -1178,7 +1189,7 @@ HRESULT _stdcall MGEProxyDevice::SetTextureStageState(DWORD a, D3DTEXTURESTAGEST
         default: break;
         }
         if (sampler != (D3DSAMPLERSTATETYPE)-1) {
-            g_cmdBufferSet.active().recordSetSamplerState(a, sampler, c);
+            g_cmdBufferSet.recordAndTrackSamplerState(a, sampler, c);
         } else {
             g_cmdBufferSet.active().recordSetTextureStageState(a, (DWORD)b, c);
         }
