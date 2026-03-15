@@ -896,9 +896,13 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
     FixedFunctionShader::finalizeBatchAndReplay(g_scene.sceneCount);
 
     // Render depth for Scene 1+ AFTER all geometry has been captured
-    // HLSL defers this to finalizeAndRender (renderStage2 clears recordMW, which renderStage1 needs)
-    if (!g_scene.isFrameComplete && g_scene.sceneCount > 0 && !isHLSLActive()) {
-        DistantLand::renderStage2(&frameCtx);
+    if (!g_scene.isFrameComplete && g_scene.sceneCount > 0) {
+        if (isHLSLActive()) {
+            auto& fb = FixedFunctionShader::frameBuffers[FixedFunctionShader::recordingBuffer];
+            DistantLand::renderStage2(&frameCtx, &fb);
+        } else {
+            DistantLand::renderStage2(&frameCtx);
+        }
     }
 
     // Track offscreen scenes

@@ -878,8 +878,8 @@ void FixedFunctionShader::executeGpuPhase(int bufferIndex) {
         DistantLand::renderStageWater(frameCtx);
     }
 
-    // Stage 2: additional depth for all recorded geometry
-    DistantLand::renderStage2(frameCtx, &fb);
+    // NOTE: renderStage2 (depth for Scene 1+ hands) runs at EndScene(1+) in mged3d8device.cpp
+    // It cannot run here because Scene 1 hasn't happened yet at EndScene(0)
 
     // NOTE: postProcess moved to UI BeginScene to avoid RT/DS state corruption for Scene 1+
 
