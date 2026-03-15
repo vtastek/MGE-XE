@@ -1,6 +1,7 @@
 
 #include "winheader.h"
 #include "log.h"
+#include "mge/mged3d8device.h"
 
 #include <cstdarg>
 #include <cctype>
@@ -14,14 +15,15 @@ namespace LOG {
     static LARGE_INTEGER startTime;
     static LARGE_INTEGER perfFreq;
 
-    // Prepend elapsed timestamp to a buffer, returns chars written
+    // Prepend elapsed timestamp and frame number to a buffer, returns chars written
     static int prependTimestamp(char* buf, std::size_t bufSize) {
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
         double elapsed = (double)(now.QuadPart - startTime.QuadPart) / perfFreq.QuadPart;
         int secs = (int)elapsed;
         int ms = (int)((elapsed - secs) * 1000.0);
-        return std::snprintf(buf, bufSize, "[%4d.%03ds] ", secs, ms);
+        int frame = getFrameNumber();
+        return std::snprintf(buf, bufSize, "[%4d.%03ds F:%d] ", secs, ms, frame);
     }
 
     bool open(const char* filename) {

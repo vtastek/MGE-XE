@@ -689,7 +689,7 @@ void FixedFunctionShader::finalizeAndRender(DLContext* frameCtx, bool waterSeen)
             RenderThread::SceneWork work;
             work.type = RenderThread::WorkType::RenderFullFrame;
             work.bufferIndex = recordingBuffer;
-            g_renderThread->submitWork(std::move(work), true);  // wait=true — blocking for 3a
+            g_renderThread->submitWork(std::move(work), false);  // wait=false — async for 3b
         } else {
             executeGpuPhase(recordingBuffer);
         }

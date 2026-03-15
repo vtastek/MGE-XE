@@ -802,7 +802,8 @@ public:
     // executeHiZCulling: bbox computation, occluder rasterization, Hi-Z pyramid, visibility testing.
     //   Pure CPU work (no D3D device access) — draw thread candidate.
     //   Populates visibilityResults[] and sets shouldRender on recordedCalls.
-    static void executeHiZCulling(const D3DXMATRIX& currentView, const D3DXMATRIX& currentProj);
+    //   fb parameter: explicit FrameBuffer to use (avoids recordingBuffer race condition)
+    static void executeHiZCulling(const D3DXMATRIX& currentView, const D3DXMATRIX& currentProj, FrameBuffer* fb = nullptr);
     // applyVisibilityAndFilterRecordMW: filters recordMW using visibilityResults from executeHiZCulling.
     static void applyVisibilityAndFilterRecordMW(FrameBuffer* fb = nullptr);
 

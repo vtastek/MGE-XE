@@ -11,13 +11,14 @@
 namespace StatusOverlay {
     char statusText[512];
     char fpsText[16];
+    char frameNumText[32];
     DWORD statusTimeout;
     int currentPriority;
     D3DCOLOR statusColour;
 
     ID3DXFont* font;
     ID3DXSprite* sprite;
-    RECT statusRect, shadowRect, fpsRect;
+    RECT statusRect, shadowRect, fpsRect, frameNumRect;
 }
 
 const D3DCOLOR colWhite = 0xffffffff, colRed = 0xffff2222, colShadow = 0xc0000000;
@@ -32,6 +33,7 @@ bool StatusOverlay::init(IDirect3DDevice9* device) {
     statusRect = {8, 10, 635, 25};
     shadowRect = {statusRect.left+1, statusRect.top+1, statusRect.right+1, statusRect.bottom+1};
     fpsRect = {8, 35, 160, 50};
+    frameNumRect = {60, 35, 200, 50};  // Right of FPS
     return true;
 }
 
@@ -45,8 +47,16 @@ void StatusOverlay::show(IDirect3DDevice9* device) {
         return;
     }
 
-    if ((Configuration.MGEFlags & FPS_COUNTER) || statusTimeout) {
+    // Frame number always visible for debugging; FPS and status depend on config
+    bool showAnything = frameNumText[0] || (Configuration.MGEFlags & FPS_COUNTER) || statusTimeout;
+    if (showAnything) {
         sprite->Begin(D3DXSPRITE_ALPHABLEND);
+
+        // Always show frame number when populated
+        if (frameNumText[0]) {
+            font->DrawTextA(sprite, frameNumText, -1, &frameNumRect, DT_NOCLIP, colWhite);
+        }
+
         if (Configuration.MGEFlags & FPS_COUNTER) {
             font->DrawTextA(sprite, fpsText, -1, &fpsRect, DT_NOCLIP, colWhite);
         }
@@ -75,6 +85,10 @@ void StatusOverlay::setStatus(const char* s, int priority) {
 
 void StatusOverlay::setFPS(float fps) {
     std::snprintf(fpsText, sizeof(fpsText), "%4.0f", fps);
+}
+
+void StatusOverlay::setFrameNumber(int frameNum) {
+    std::snprintf(frameNumText, sizeof(frameNumText), "F:%d", frameNum);
 }
 
 void StatusOverlay::showLastStatus() {

@@ -131,6 +131,11 @@ void RenderThread::waitForCompletion() {
 }
 
 bool RenderThread::isComplete() const {
+    // Must read both state and hasPendingWork atomically to avoid TOCTOU race.
+    // Worker thread sets hasPendingWork=false, then state=Rendering under lock.
+    // Without lock here, main thread could see hasPendingWork=false before state=Rendering,
+    // incorrectly concluding work is complete and skipping the wait.
+    std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mutex));
     return state == State::Complete || (state == State::Idle && !hasPendingWork);
 }
 

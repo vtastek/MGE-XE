@@ -2,7 +2,8 @@
 
 #include "proxydx/d3d8device.h"
 
-
+// Frame number accessor for logging correlation
+int getFrameNumber();
 
 class MGEProxyDevice : public ProxyDevice {
 public:

@@ -20,19 +20,19 @@ static auto& currentRecordedCalls() {
 // executeHiZCulling - Pure CPU work: bbox computation, occluder rasterization, Hi-Z pyramid build,
 // visibility testing on recordMW and recordedCalls. Takes view/proj as parameters (no D3D device access).
 // This is a draw-thread candidate: touches no GPU state.
-void FixedFunctionShader::executeHiZCulling(const D3DXMATRIX& currentView, const D3DXMATRIX& currentProj) {
+// fb parameter: explicit FrameBuffer to use (HLSL mode). Avoids recordingBuffer global race condition
+// where Present() can rotate buffers between recording and Hi-Z execution.
+void FixedFunctionShader::executeHiZCulling(const D3DXMATRIX& currentView, const D3DXMATRIX& currentProj, FrameBuffer* fb) {
     MGE_ZoneScopedN("Execute Hi-Z Culling");
 
     // Resize visibility results for this frame (indexed by draw order)
-    // HLSL mode: recordMW is per-buffer; legacy mode: global static
-    const auto& activeRecordMW = isHLSLActive()
-        ? frameBuffers[recordingBuffer].recordMW
-        : DistantLand::recordMW;
+    // HLSL mode: use explicit fb parameter; legacy mode: global static
+    const auto& activeRecordMW = fb ? fb->recordMW : DistantLand::recordMW;
     visibilityResults.assign(activeRecordMW.size(), -1);  // -1 = not yet tested
 
     // Phase 2a: Compute deferred bboxes and rasterize occluders from recorded HLSL calls
     // This must happen before Hi-Z build so the depth pass benefits from culling
-    auto& recCalls = currentRecordedCalls();
+    auto& recCalls = fb ? fb->recordedCalls : currentRecordedCalls();
     if (!recCalls.empty() && !hiZBuiltThisFrame) {
         // Compute bounding boxes for calls that missed the cache during recording
         {
@@ -56,8 +56,9 @@ void FixedFunctionShader::executeHiZCulling(const D3DXMATRIX& currentView, const
             const float MIN_SCREEN_COVERAGE = 0.01f;
             rasterizedOccluderMeshes.clear();
 
-            auto& fb = frameBuffers[recordingBuffer];
-            D3DXMATRIX viewProj = fb.view * fb.proj;
+            // Use explicit fb parameter if provided (HLSL mode), fall back to recordingBuffer (legacy)
+            auto& activeFb = fb ? *fb : frameBuffers[recordingBuffer];
+            D3DXMATRIX viewProj = activeFb.view * activeFb.proj;
 
             for (auto& call : recCalls) {
                 if (occluderCount >= MAX_OCCLUDERS) break;
@@ -127,7 +128,7 @@ void FixedFunctionShader::executeHiZCulling(const D3DXMATRIX& currentView, const
                     rs->vb, rs->vbOffset, rs->vbStride,
                     rs->ib, rs->baseIndex, rs->startIndex, rs->primCount, rs->primType,
                     rs->fvf, rs->worldTransforms[0],
-                    fb.view, fb.proj
+                    activeFb.view, activeFb.proj
                 );
                 occluderCount++;
             }
@@ -139,7 +140,9 @@ void FixedFunctionShader::executeHiZCulling(const D3DXMATRIX& currentView, const
         MGE_ZoneScopedN("Build Hi-Z Pyramid");
         softwareOcclusionCuller.buildHiZPyramid();
         if (ImGuiManager::GetShowHiZInterface()) {
-            softwareOcclusionCuller.uploadHiZToTexture(reinterpret_cast<IDirect3DDevice9*>(device), ImGuiManager::GetHiZDisplayMip(), frameBuffers[recordingBuffer].proj, ImGuiManager::GetHiZInvert(), ImGuiManager::GetHiZShowRaycastGrid(), ImGuiManager::GetHiZRaycastStep());
+            // Use explicit fb parameter for proj matrix (HLSL mode), fall back to recordingBuffer (legacy)
+            const D3DXMATRIX& uploadProj = fb ? fb->proj : frameBuffers[recordingBuffer].proj;
+            softwareOcclusionCuller.uploadHiZToTexture(reinterpret_cast<IDirect3DDevice9*>(device), ImGuiManager::GetHiZDisplayMip(), uploadProj, ImGuiManager::GetHiZInvert(), ImGuiManager::GetHiZShowRaycastGrid(), ImGuiManager::GetHiZRaycastStep());
         }
         hiZBuiltThisFrame = true;
     }

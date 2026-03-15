@@ -14,5 +14,6 @@ namespace StatusOverlay {
     void show(IDirect3DDevice9* device);
     void setStatus(const char* s, int priority = PriorityNormal);
     void setFPS(float fps);
+    void setFrameNumber(int frameNum);
     void showLastStatus();
 };

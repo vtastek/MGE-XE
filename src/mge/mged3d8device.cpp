@@ -69,6 +69,11 @@ static int g_lastCmdBufferSize = 0;
 static ImGuiManager::DIPBinStats g_dipBinStats = {};
 static int g_dipScene0 = 0, g_dipScene1plus = 0;
 
+// Frame counter for display and correlation with logs
+static int g_frameNumber = 0;
+
+int getFrameNumber() { return g_frameNumber; }
+
 static void initOnLoad();
 static bool detectMenu(const D3DMATRIX* m);
 static void captureRenderState(D3DRENDERSTATETYPE a, DWORD b);
@@ -272,6 +277,7 @@ MGEProxyDevice::MGEProxyDevice(IDirect3DDevice9* real, ProxyD3D* d3d) : ProxyDev
 // bisect test comment
 HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, const RGNDATA* d) {
     MGE_ZoneScopedN("MGE_Present");
+    ++g_frameNumber;
     auto mwBridge = MWBridge::get();
 
     // Load Morrowind's dynamic memory pointers
@@ -546,7 +552,6 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         g_cmdBufferSet.activeStage = CmdStage::Offscreen;
 
         // Stamp current camera into the FrameBuffer that just finished recording
-        // (for future render pass to use fresh matrices instead of stale recording-time ones)
         {
             auto& fb = FixedFunctionShader::getFrameBuffer(FixedFunctionShader::getRecordingBufferIndex());
             fb.currentView = DistantLand::s_staging.mwView;
@@ -567,6 +572,7 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
     }
 
     MGE_FrameMark;  // Mark frame boundary at the very end of Present()
+    MGE_TracyPlot("Frame", (int64_t)g_frameNumber);
     {
         MGE_ZoneScopedN("Present_ProxyDevicePresent");
         return ProxyDevice::Present(a, b, c, d);
@@ -737,6 +743,11 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                 g_cmdBufferSet.activeStage = CmdStage::Scene0;
             } else if (g_scene.sceneCount == 1) {
                 g_cmdBufferSet.activeStage = CmdStage::Scene1Plus;
+                // Step 3b: Sync point for async render thread
+                // Wait for GPU phase to complete before Scene 1+ draws
+                if (isHLSLActive() && g_scene.stage0Complete && g_renderThread && g_renderThread->isPending()) {
+                    g_renderThread->waitForCompletion();
+                }
                 // Particle bug debug: state at BeginScene 1 (first Scene 1+ scene)
                 if (isHLSLActive()) {
                     FixedFunctionShader::logSceneHandoverState("BeginScene1");
@@ -860,6 +871,7 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
 
         // Render status overlay
         StatusOverlay::setFPS(calcFPS());
+        StatusOverlay::setFrameNumber(g_frameNumber);
         StatusOverlay::show(realDevice);
 
         g_scene.isHUDComplete = true;

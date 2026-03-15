@@ -265,9 +265,9 @@ void DistantLand::renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer*
         // Hi-Z culling: split into CPU-only visibility testing and lightweight recordMW filter
         // executeHiZCulling: bbox, occluder rasterization, Hi-Z pyramid, visibility test (no D3D device)
         // applyVisibilityAndFilterRecordMW: filters recordMW using visibility results
+        // Pass fb explicitly to avoid recordingBuffer race condition (Present() can rotate buffers)
         {
-            // Use game view/proj from context (device may have UI view in deferred pipeline)
-            FixedFunctionShader::executeHiZCulling(ctx->mwView, ctx->mwProj);
+            FixedFunctionShader::executeHiZCulling(ctx->mwView, ctx->mwProj, fb);
         }
         FixedFunctionShader::applyVisibilityAndFilterRecordMW(fb);
 

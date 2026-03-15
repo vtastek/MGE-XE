@@ -83,6 +83,7 @@ public:
     void submitWork(SceneWork&& work, bool waitNow = true);
     void waitForCompletion();
     bool isComplete() const;
+    bool isPending() const { return !isComplete(); }
     bool isRunning() const { return thread.joinable(); }
 };
 
