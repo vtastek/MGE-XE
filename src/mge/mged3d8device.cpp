@@ -674,6 +674,9 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
         g_offscreen.sceneCount++;
         if (!g_offscreen.megaSceneOpen) {
             // First offscreen scene: open device scene, keep it open for all subsequent offscreen work
+            if (isHLSLActive()) {
+                FixedFunctionShader::logSceneHandoverState("OffscreenStart");
+            }
             flushPendingRT();
             if (!shouldSuppressMWState()) {
                 ProxyDevice::BeginScene();
@@ -693,6 +696,9 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
         g_offscreen.suppressingCurrentScene = false;
         // Transitioning back to normal rendering — close the offscreen mega-scene
         if (g_offscreen.megaSceneOpen) {
+            if (isHLSLActive()) {
+                FixedFunctionShader::logSceneHandoverState("OffscreenEnd");
+            }
             if (ImGuiManager::GetCmdBufferRecording() && !ImGuiManager::GetCmdBufferReplay()) {
                 g_cmdBufferSet.active().recordEndScene();
             }
@@ -751,6 +757,9 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
             }
         } else {
             // UI scene — frame finalize point
+            if (isHLSLActive()) {
+                FixedFunctionShader::logSceneHandoverState("UISceneEntry");
+            }
             g_cmdBufferSet.activeStage = CmdStage::UI;
             if (DistantLand::ready && g_scene.sceneCount > 0 && !g_scene.isFrameComplete) {
                 ensureSceneActive();
@@ -854,6 +863,9 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
         StatusOverlay::show(realDevice);
 
         g_scene.isHUDComplete = true;
+        if (isHLSLActive()) {
+            FixedFunctionShader::logSceneHandoverState("HUDComplete");
+        }
     }
 
     // Finalize any HLSL batch immediately after scene draw calls complete
@@ -941,6 +953,16 @@ HRESULT _stdcall MGEProxyDevice::Clear(DWORD a, const D3DRECT* b, DWORD c, D3DCO
     g_passBreaks.raw_clear++;
     ImGuiManager::LogFrameEvent(FrameEvent::Clear, g_scene.sceneCount);
     ImGuiManager::TraceClear(g_scene.sceneCount, c, d, e);
+
+    // Handover logging: Clear calls
+    if (ImGuiManager::GetHandoverLogging()) {
+        char flagStr[32] = "";
+        if (c & D3DCLEAR_TARGET) strcat(flagStr, "COLOR ");
+        if (c & D3DCLEAR_ZBUFFER) strcat(flagStr, "Z ");
+        if (c & D3DCLEAR_STENCIL) strcat(flagStr, "STENCIL ");
+        LOG::logline("HANDOVER Clear S%d: flags=[%s] color=0x%08X z=%.3f",
+            g_scene.sceneCount, flagStr, d, e);
+    }
     DistantLand::setHorizonColour(d);
     if (ImGuiManager::GetCmdBufferRecording()) {
         // Flush pending RT to command buffer BEFORE recording Clear — Clear needs correct target

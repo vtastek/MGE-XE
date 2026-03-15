@@ -96,6 +96,71 @@ struct ExpectedDeviceState {
     ExpectedDeviceState() : captured(false) {}
 };
 
+// State contract for explicit state handoffs between pipeline phases.
+// Consolidates scattered GetRenderState/SetRenderState calls into a single structure.
+// Each phase transition has defined preconditions and postconditions using this contract.
+struct StateContract {
+    // Depth state
+    DWORD zEnable = D3DZB_TRUE;
+    DWORD zWriteEnable = TRUE;
+    DWORD zFunc = D3DCMP_LESSEQUAL;
+
+    // Blending state
+    DWORD alphaBlendEnable = FALSE;
+    DWORD srcBlend = D3DBLEND_ONE;
+    DWORD destBlend = D3DBLEND_ZERO;
+
+    // Alpha test state
+    DWORD alphaTestEnable = FALSE;
+    DWORD alphaFunc = D3DCMP_ALWAYS;
+    DWORD alphaRef = 0;
+
+    // Culling and fog
+    DWORD cullMode = D3DCULL_CW;
+    DWORD fogEnable = FALSE;
+
+    // Specular and lighting (legacy FFE state)
+    DWORD specularEnable = FALSE;
+    DWORD localViewer = FALSE;
+    DWORD normalizeNormals = FALSE;
+
+    // Sampler states for stages 0-1 (MW doesn't use 2+)
+    struct SamplerState {
+        DWORD minFilter = D3DTEXF_LINEAR;
+        DWORD magFilter = D3DTEXF_LINEAR;
+        DWORD mipFilter = D3DTEXF_LINEAR;
+        DWORD addressU = D3DTADDRESS_WRAP;
+        DWORD addressV = D3DTADDRESS_WRAP;
+    };
+    SamplerState samplers[2];
+
+    // Transforms
+    D3DMATRIX world = {};
+    D3DMATRIX view = {};
+    D3DMATRIX projection = {};
+
+    // Capture all state from device
+    void captureFrom(IDirect3DDevice9* dev);
+
+    // Apply all state to device
+    void applyTo(IDirect3DDevice9* dev) const;
+
+    // Apply only render states (not samplers/transforms) to device
+    void applyRenderStatesTo(IDirect3DDevice9* dev) const;
+
+    // Apply only sampler states to device
+    void applySamplersTo(IDirect3DDevice9* dev) const;
+
+    // Apply only transforms to device
+    void applyTransformsTo(IDirect3DDevice9* dev) const;
+
+#ifdef _DEBUG
+    // Validate device matches expected state (returns false on mismatch, logs diffs)
+    bool validate(IDirect3DDevice9* dev, const char* context) const;
+#endif
+};
+
+
 // RenderedState, RecordedMWState, FragmentState, LightState are in renderstate.h
 
 // Pipeline state diagnostic snapshot — captured at Present() before reset
@@ -376,24 +441,9 @@ private:
     };
     static TextureBindingCache textureCache;
 
-    // Render state saved at recording start, restored after replay
-    struct SavedRenderStates {
-        DWORD alphaBlendEnable, alphaTestEnable;
-        DWORD zEnable, zWriteEnable;
-        DWORD cullMode, srcBlend, destBlend;
-        DWORD fogEnable;
-        DWORD specularEnable, localViewer, normalizeNormals;
-        DWORD zFunc, alphaFunc, alphaRef;
-        // Sampler states for stages 0-1 (texture filtering, addressing)
-        DWORD sampler0MinFilter, sampler0MagFilter, sampler0MipFilter;
-        DWORD sampler0AddressU, sampler0AddressV;
-        DWORD sampler1MinFilter, sampler1MagFilter, sampler1MipFilter;
-        DWORD sampler1AddressU, sampler1AddressV;
-        // Transforms (HLSL replay changes these, particles/Scene1+ need original)
-        D3DMATRIX world, view, projection;
-    };
-    static SavedRenderStates preRecordingState;
-    static SavedRenderStates postRecordingState;  // Saved at end of recording, restored after replay
+    // State contracts for phase transitions (replaces scattered GetRenderState calls)
+    static StateContract preRecordingContract;   // MW state before recording starts
+    static StateContract postRecordingContract;  // MW state at end of Scene 0 (restored after replay)
 
     // Exterior texture binding optimizations
     static bool isExteriorShadowBound;
@@ -575,7 +625,7 @@ public:
         DLContext dlContext;
         bool waterSeen = false;
         IDirect3DTexture9* texDistantBlend = nullptr;
-        SavedRenderStates postRecordingState = {};
+        StateContract stateContract;  // MW device state at end of Scene 0 (restored after replay)
 
         // HLSL replay command buffer — built by replayRecordedCalls, replayed in executeGpuPhase
         D3DCommandBuffer hlslCmds;
@@ -597,7 +647,7 @@ public:
             recordSky.clear();
             waterSeen = false;
             texDistantBlend = nullptr;
-            postRecordingState = {};
+            stateContract = StateContract();  // Reset to default state
             hlslCmds.clear();
             postProcessData = {};
             valid = false;

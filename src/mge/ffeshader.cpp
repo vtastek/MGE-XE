@@ -156,8 +156,9 @@ FixedFunctionShader::MaterialStateCache FixedFunctionShader::materialCache;
 // Texture binding cache static member
 FixedFunctionShader::TextureBindingCache FixedFunctionShader::textureCache;
 
-FixedFunctionShader::SavedRenderStates FixedFunctionShader::preRecordingState = {};
-FixedFunctionShader::SavedRenderStates FixedFunctionShader::postRecordingState = {};
+// State contracts for phase transitions
+StateContract FixedFunctionShader::preRecordingContract;
+StateContract FixedFunctionShader::postRecordingContract;
 
 // Exterior texture binding optimization flags
 bool FixedFunctionShader::isExteriorShadowBound = false;

@@ -30,23 +30,185 @@ static auto& currentRecordedCalls() {
 // Diagnostic: cache hit/miss logging for first N frames (temporary)
 static int hlslDiagFrameCounter = 0;
 
+// === StateContract Implementation ===
+// Centralized device state capture/restore for explicit phase handoffs
+
+void StateContract::captureFrom(IDirect3DDevice9* dev) {
+    // Depth state
+    dev->GetRenderState(D3DRS_ZENABLE, &zEnable);
+    dev->GetRenderState(D3DRS_ZWRITEENABLE, &zWriteEnable);
+    dev->GetRenderState(D3DRS_ZFUNC, &zFunc);
+
+    // Blending state
+    dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &alphaBlendEnable);
+    dev->GetRenderState(D3DRS_SRCBLEND, &srcBlend);
+    dev->GetRenderState(D3DRS_DESTBLEND, &destBlend);
+
+    // Alpha test state
+    dev->GetRenderState(D3DRS_ALPHATESTENABLE, &alphaTestEnable);
+    dev->GetRenderState(D3DRS_ALPHAFUNC, &alphaFunc);
+    dev->GetRenderState(D3DRS_ALPHAREF, &alphaRef);
+
+    // Culling and fog
+    dev->GetRenderState(D3DRS_CULLMODE, &cullMode);
+    dev->GetRenderState(D3DRS_FOGENABLE, &fogEnable);
+
+    // Specular and lighting (legacy FFE state)
+    dev->GetRenderState(D3DRS_SPECULARENABLE, &specularEnable);
+    dev->GetRenderState(D3DRS_LOCALVIEWER, &localViewer);
+    dev->GetRenderState(D3DRS_NORMALIZENORMALS, &normalizeNormals);
+
+    // Sampler states for stages 0-1
+    dev->GetSamplerState(0, D3DSAMP_MINFILTER, &samplers[0].minFilter);
+    dev->GetSamplerState(0, D3DSAMP_MAGFILTER, &samplers[0].magFilter);
+    dev->GetSamplerState(0, D3DSAMP_MIPFILTER, &samplers[0].mipFilter);
+    dev->GetSamplerState(0, D3DSAMP_ADDRESSU, &samplers[0].addressU);
+    dev->GetSamplerState(0, D3DSAMP_ADDRESSV, &samplers[0].addressV);
+    dev->GetSamplerState(1, D3DSAMP_MINFILTER, &samplers[1].minFilter);
+    dev->GetSamplerState(1, D3DSAMP_MAGFILTER, &samplers[1].magFilter);
+    dev->GetSamplerState(1, D3DSAMP_MIPFILTER, &samplers[1].mipFilter);
+    dev->GetSamplerState(1, D3DSAMP_ADDRESSU, &samplers[1].addressU);
+    dev->GetSamplerState(1, D3DSAMP_ADDRESSV, &samplers[1].addressV);
+
+    // Transforms
+    dev->GetTransform(D3DTS_WORLD, (D3DMATRIX*)&world);
+    dev->GetTransform(D3DTS_VIEW, (D3DMATRIX*)&view);
+    dev->GetTransform(D3DTS_PROJECTION, (D3DMATRIX*)&projection);
+}
+
+void StateContract::applyTo(IDirect3DDevice9* dev) const {
+    applyRenderStatesTo(dev);
+    applySamplersTo(dev);
+    applyTransformsTo(dev);
+}
+
+void StateContract::applyRenderStatesTo(IDirect3DDevice9* dev) const {
+    // Depth state
+    dev->SetRenderState(D3DRS_ZENABLE, zEnable);
+    dev->SetRenderState(D3DRS_ZWRITEENABLE, zWriteEnable);
+    dev->SetRenderState(D3DRS_ZFUNC, zFunc);
+
+    // Blending state
+    dev->SetRenderState(D3DRS_ALPHABLENDENABLE, alphaBlendEnable);
+    dev->SetRenderState(D3DRS_SRCBLEND, srcBlend);
+    dev->SetRenderState(D3DRS_DESTBLEND, destBlend);
+
+    // Alpha test state
+    dev->SetRenderState(D3DRS_ALPHATESTENABLE, alphaTestEnable);
+    dev->SetRenderState(D3DRS_ALPHAFUNC, alphaFunc);
+    dev->SetRenderState(D3DRS_ALPHAREF, alphaRef);
+
+    // Culling and fog
+    dev->SetRenderState(D3DRS_CULLMODE, cullMode);
+    dev->SetRenderState(D3DRS_FOGENABLE, fogEnable);
+
+    // Specular and lighting
+    dev->SetRenderState(D3DRS_SPECULARENABLE, specularEnable);
+    dev->SetRenderState(D3DRS_LOCALVIEWER, localViewer);
+    dev->SetRenderState(D3DRS_NORMALIZENORMALS, normalizeNormals);
+}
+
+void StateContract::applySamplersTo(IDirect3DDevice9* dev) const {
+    // Sampler states for stages 0-1
+    dev->SetSamplerState(0, D3DSAMP_MINFILTER, samplers[0].minFilter);
+    dev->SetSamplerState(0, D3DSAMP_MAGFILTER, samplers[0].magFilter);
+    dev->SetSamplerState(0, D3DSAMP_MIPFILTER, samplers[0].mipFilter);
+    dev->SetSamplerState(0, D3DSAMP_ADDRESSU, samplers[0].addressU);
+    dev->SetSamplerState(0, D3DSAMP_ADDRESSV, samplers[0].addressV);
+    dev->SetSamplerState(1, D3DSAMP_MINFILTER, samplers[1].minFilter);
+    dev->SetSamplerState(1, D3DSAMP_MAGFILTER, samplers[1].magFilter);
+    dev->SetSamplerState(1, D3DSAMP_MIPFILTER, samplers[1].mipFilter);
+    dev->SetSamplerState(1, D3DSAMP_ADDRESSU, samplers[1].addressU);
+    dev->SetSamplerState(1, D3DSAMP_ADDRESSV, samplers[1].addressV);
+}
+
+void StateContract::applyTransformsTo(IDirect3DDevice9* dev) const {
+    dev->SetTransform(D3DTS_WORLD, (const D3DMATRIX*)&world);
+    dev->SetTransform(D3DTS_VIEW, (const D3DMATRIX*)&view);
+    dev->SetTransform(D3DTS_PROJECTION, (const D3DMATRIX*)&projection);
+}
+
+#ifdef _DEBUG
+bool StateContract::validate(IDirect3DDevice9* dev, const char* context) const {
+    StateContract actual;
+    actual.captureFrom(dev);
+
+    bool valid = true;
+    char buf[256];
+
+    // Check depth state
+    if (actual.zEnable != zEnable) {
+        snprintf(buf, sizeof(buf), "[%s] StateContract mismatch: zEnable expected %lu, got %lu", context, zEnable, actual.zEnable);
+        LOG::logline(buf);
+        valid = false;
+    }
+    if (actual.zWriteEnable != zWriteEnable) {
+        snprintf(buf, sizeof(buf), "[%s] StateContract mismatch: zWriteEnable expected %lu, got %lu", context, zWriteEnable, actual.zWriteEnable);
+        LOG::logline(buf);
+        valid = false;
+    }
+    if (actual.zFunc != zFunc) {
+        snprintf(buf, sizeof(buf), "[%s] StateContract mismatch: zFunc expected %lu, got %lu", context, zFunc, actual.zFunc);
+        LOG::logline(buf);
+        valid = false;
+    }
+
+    // Check blending state
+    if (actual.alphaBlendEnable != alphaBlendEnable) {
+        snprintf(buf, sizeof(buf), "[%s] StateContract mismatch: alphaBlendEnable expected %lu, got %lu", context, alphaBlendEnable, actual.alphaBlendEnable);
+        LOG::logline(buf);
+        valid = false;
+    }
+    if (actual.srcBlend != srcBlend) {
+        snprintf(buf, sizeof(buf), "[%s] StateContract mismatch: srcBlend expected %lu, got %lu", context, srcBlend, actual.srcBlend);
+        LOG::logline(buf);
+        valid = false;
+    }
+    if (actual.destBlend != destBlend) {
+        snprintf(buf, sizeof(buf), "[%s] StateContract mismatch: destBlend expected %lu, got %lu", context, destBlend, actual.destBlend);
+        LOG::logline(buf);
+        valid = false;
+    }
+
+    // Check alpha test state
+    if (actual.alphaTestEnable != alphaTestEnable) {
+        snprintf(buf, sizeof(buf), "[%s] StateContract mismatch: alphaTestEnable expected %lu, got %lu", context, alphaTestEnable, actual.alphaTestEnable);
+        LOG::logline(buf);
+        valid = false;
+    }
+    if (actual.alphaFunc != alphaFunc) {
+        snprintf(buf, sizeof(buf), "[%s] StateContract mismatch: alphaFunc expected %lu, got %lu", context, alphaFunc, actual.alphaFunc);
+        LOG::logline(buf);
+        valid = false;
+    }
+    if (actual.alphaRef != alphaRef) {
+        snprintf(buf, sizeof(buf), "[%s] StateContract mismatch: alphaRef expected %lu, got %lu", context, alphaRef, actual.alphaRef);
+        LOG::logline(buf);
+        valid = false;
+    }
+
+    // Check culling and fog
+    if (actual.cullMode != cullMode) {
+        snprintf(buf, sizeof(buf), "[%s] StateContract mismatch: cullMode expected %lu, got %lu", context, cullMode, actual.cullMode);
+        LOG::logline(buf);
+        valid = false;
+    }
+    if (actual.fogEnable != fogEnable) {
+        snprintf(buf, sizeof(buf), "[%s] StateContract mismatch: fogEnable expected %lu, got %lu", context, fogEnable, actual.fogEnable);
+        LOG::logline(buf);
+        valid = false;
+    }
+
+    return valid;
+}
+
+#endif
+
 void FixedFunctionShader::startRecording() {
-    // Save render states before recording so we can restore after replay
-    trackDeviceRead("GetRenderState(x14 preRecording)");
-    device->GetRenderState(D3DRS_ALPHABLENDENABLE, &preRecordingState.alphaBlendEnable);
-    device->GetRenderState(D3DRS_ALPHATESTENABLE, &preRecordingState.alphaTestEnable);
-    device->GetRenderState(D3DRS_ZENABLE, &preRecordingState.zEnable);
-    device->GetRenderState(D3DRS_ZWRITEENABLE, &preRecordingState.zWriteEnable);
-    device->GetRenderState(D3DRS_CULLMODE, &preRecordingState.cullMode);
-    device->GetRenderState(D3DRS_SRCBLEND, &preRecordingState.srcBlend);
-    device->GetRenderState(D3DRS_DESTBLEND, &preRecordingState.destBlend);
-    device->GetRenderState(D3DRS_FOGENABLE, &preRecordingState.fogEnable);
-    device->GetRenderState(D3DRS_SPECULARENABLE, &preRecordingState.specularEnable);
-    device->GetRenderState(D3DRS_LOCALVIEWER, &preRecordingState.localViewer);
-    device->GetRenderState(D3DRS_NORMALIZENORMALS, &preRecordingState.normalizeNormals);
-    device->GetRenderState(D3DRS_ZFUNC, &preRecordingState.zFunc);
-    device->GetRenderState(D3DRS_ALPHAFUNC, &preRecordingState.alphaFunc);
-    device->GetRenderState(D3DRS_ALPHAREF, &preRecordingState.alphaRef);
+    // Capture device state at recording start using StateContract
+    trackDeviceRead("StateContract::captureFrom(preRecording)");
+    preRecordingContract.captureFrom((IDirect3DDevice9*)device);
+
 
     // Reset HLSL caches for new recording session
     resetHLSLCaches();
@@ -116,23 +278,11 @@ void FixedFunctionShader::stopRecordingAndReplay() {
     isRecording = false;
 
     // Capture device state NOW — this is Morrowind's last mesh state (correct end-of-Scene-0 state).
-    // We restore this after replay instead of preRecordingState (which was the FIRST mesh's state
+    // We restore this after replay instead of preRecordingContract (which was the FIRST mesh's state
     // and could have different alpha test/blend settings that corrupt the sky).
-    SavedRenderStates postRecordingState;
-    device->GetRenderState(D3DRS_ALPHABLENDENABLE, &postRecordingState.alphaBlendEnable);
-    device->GetRenderState(D3DRS_ALPHATESTENABLE, &postRecordingState.alphaTestEnable);
-    device->GetRenderState(D3DRS_ZENABLE, &postRecordingState.zEnable);
-    device->GetRenderState(D3DRS_ZWRITEENABLE, &postRecordingState.zWriteEnable);
-    device->GetRenderState(D3DRS_CULLMODE, &postRecordingState.cullMode);
-    device->GetRenderState(D3DRS_SRCBLEND, &postRecordingState.srcBlend);
-    device->GetRenderState(D3DRS_DESTBLEND, &postRecordingState.destBlend);
-    device->GetRenderState(D3DRS_FOGENABLE, &postRecordingState.fogEnable);
-    device->GetRenderState(D3DRS_SPECULARENABLE, &postRecordingState.specularEnable);
-    device->GetRenderState(D3DRS_LOCALVIEWER, &postRecordingState.localViewer);
-    device->GetRenderState(D3DRS_NORMALIZENORMALS, &postRecordingState.normalizeNormals);
-    device->GetRenderState(D3DRS_ZFUNC, &postRecordingState.zFunc);
-    device->GetRenderState(D3DRS_ALPHAFUNC, &postRecordingState.alphaFunc);
-    device->GetRenderState(D3DRS_ALPHAREF, &postRecordingState.alphaRef);
+    StateContract endState;
+    endState.captureFrom((IDirect3DDevice9*)device);
+
 
     // Batch-warm suffix cache — resolve all unique textures and pre-load suffix files
     // before prepare/replay, so neither stalls on hash computation or disk I/O.
@@ -171,20 +321,8 @@ void FixedFunctionShader::stopRecordingAndReplay() {
     // Restore Morrowind's end-of-Scene-0 state (last mesh state, not first mesh state).
     // This undoes any state changes from replay/HLSL rendering, and also cleans up
     // leaked state from previous frame's Scene 1+ immediate rendering.
-    device->SetRenderState(D3DRS_ALPHABLENDENABLE, postRecordingState.alphaBlendEnable);
-    device->SetRenderState(D3DRS_ALPHATESTENABLE, postRecordingState.alphaTestEnable);
-    device->SetRenderState(D3DRS_ZENABLE, postRecordingState.zEnable);
-    device->SetRenderState(D3DRS_ZWRITEENABLE, postRecordingState.zWriteEnable);
-    device->SetRenderState(D3DRS_CULLMODE, postRecordingState.cullMode);
-    device->SetRenderState(D3DRS_SRCBLEND, postRecordingState.srcBlend);
-    device->SetRenderState(D3DRS_DESTBLEND, postRecordingState.destBlend);
-    device->SetRenderState(D3DRS_FOGENABLE, postRecordingState.fogEnable);
-    device->SetRenderState(D3DRS_SPECULARENABLE, postRecordingState.specularEnable);
-    device->SetRenderState(D3DRS_LOCALVIEWER, postRecordingState.localViewer);
-    device->SetRenderState(D3DRS_NORMALIZENORMALS, postRecordingState.normalizeNormals);
-    device->SetRenderState(D3DRS_ZFUNC, postRecordingState.zFunc);
-    device->SetRenderState(D3DRS_ALPHAFUNC, postRecordingState.alphaFunc);
-    device->SetRenderState(D3DRS_ALPHAREF, postRecordingState.alphaRef);
+    endState.applyRenderStatesTo((IDirect3DDevice9*)device);
+
 
     // Reset state to allow new recording sessions
     // Note: isRecording stays false until next startRecording() call
@@ -234,20 +372,8 @@ void FixedFunctionShader::finalizeBatchAndSubmitCull() {
     isRecording = false;
 
     // Capture Morrowind's end-of-Scene-0 device state for restoration after replay
-    device->GetRenderState(D3DRS_ALPHABLENDENABLE, &postRecordingState.alphaBlendEnable);
-    device->GetRenderState(D3DRS_ALPHATESTENABLE, &postRecordingState.alphaTestEnable);
-    device->GetRenderState(D3DRS_ZENABLE, &postRecordingState.zEnable);
-    device->GetRenderState(D3DRS_ZWRITEENABLE, &postRecordingState.zWriteEnable);
-    device->GetRenderState(D3DRS_CULLMODE, &postRecordingState.cullMode);
-    device->GetRenderState(D3DRS_SRCBLEND, &postRecordingState.srcBlend);
-    device->GetRenderState(D3DRS_DESTBLEND, &postRecordingState.destBlend);
-    device->GetRenderState(D3DRS_FOGENABLE, &postRecordingState.fogEnable);
-    device->GetRenderState(D3DRS_SPECULARENABLE, &postRecordingState.specularEnable);
-    device->GetRenderState(D3DRS_LOCALVIEWER, &postRecordingState.localViewer);
-    device->GetRenderState(D3DRS_NORMALIZENORMALS, &postRecordingState.normalizeNormals);
-    device->GetRenderState(D3DRS_ZFUNC, &postRecordingState.zFunc);
-    device->GetRenderState(D3DRS_ALPHAFUNC, &postRecordingState.alphaFunc);
-    device->GetRenderState(D3DRS_ALPHAREF, &postRecordingState.alphaRef);
+    postRecordingContract.captureFrom((IDirect3DDevice9*)device);
+
 
     // Diagnostic: increment frame counter for cache miss/hit logging
     ++hlslDiagFrameCounter;
@@ -335,20 +461,8 @@ void FixedFunctionShader::waitCullAndReplay() {
     device->SetPixelShader(NULL);
 
     // Restore Morrowind's end-of-Scene-0 state
-    device->SetRenderState(D3DRS_ALPHABLENDENABLE, postRecordingState.alphaBlendEnable);
-    device->SetRenderState(D3DRS_ALPHATESTENABLE, postRecordingState.alphaTestEnable);
-    device->SetRenderState(D3DRS_ZENABLE, postRecordingState.zEnable);
-    device->SetRenderState(D3DRS_ZWRITEENABLE, postRecordingState.zWriteEnable);
-    device->SetRenderState(D3DRS_CULLMODE, postRecordingState.cullMode);
-    device->SetRenderState(D3DRS_SRCBLEND, postRecordingState.srcBlend);
-    device->SetRenderState(D3DRS_DESTBLEND, postRecordingState.destBlend);
-    device->SetRenderState(D3DRS_FOGENABLE, postRecordingState.fogEnable);
-    device->SetRenderState(D3DRS_SPECULARENABLE, postRecordingState.specularEnable);
-    device->SetRenderState(D3DRS_LOCALVIEWER, postRecordingState.localViewer);
-    device->SetRenderState(D3DRS_NORMALIZENORMALS, postRecordingState.normalizeNormals);
-    device->SetRenderState(D3DRS_ZFUNC, postRecordingState.zFunc);
-    device->SetRenderState(D3DRS_ALPHAFUNC, postRecordingState.alphaFunc);
-    device->SetRenderState(D3DRS_ALPHAREF, postRecordingState.alphaRef);
+    postRecordingContract.applyRenderStatesTo((IDirect3DDevice9*)device);
+
 
     isReplaying = false;
 
@@ -379,42 +493,11 @@ void FixedFunctionShader::finalizeBatchAndReplay(int sceneCount) {
 void FixedFunctionShader::capturePostRecordingState() {
     if (!isRecording) return;
 
-    // Write to per-buffer postRecordingState for HLSL isolation
-    trackDeviceRead("GetRenderState(x14 postRecording)");
-    auto& prs = frameBuffers[recordingBuffer].postRecordingState;
-    device->GetRenderState(D3DRS_ALPHABLENDENABLE, &prs.alphaBlendEnable);
-    device->GetRenderState(D3DRS_ALPHATESTENABLE, &prs.alphaTestEnable);
-    device->GetRenderState(D3DRS_ZENABLE, &prs.zEnable);
-    device->GetRenderState(D3DRS_ZWRITEENABLE, &prs.zWriteEnable);
-    device->GetRenderState(D3DRS_CULLMODE, &prs.cullMode);
-    device->GetRenderState(D3DRS_SRCBLEND, &prs.srcBlend);
-    device->GetRenderState(D3DRS_DESTBLEND, &prs.destBlend);
-    device->GetRenderState(D3DRS_FOGENABLE, &prs.fogEnable);
-    device->GetRenderState(D3DRS_SPECULARENABLE, &prs.specularEnable);
-    device->GetRenderState(D3DRS_LOCALVIEWER, &prs.localViewer);
-    device->GetRenderState(D3DRS_NORMALIZENORMALS, &prs.normalizeNormals);
-    device->GetRenderState(D3DRS_ZFUNC, &prs.zFunc);
-    device->GetRenderState(D3DRS_ALPHAFUNC, &prs.alphaFunc);
-    device->GetRenderState(D3DRS_ALPHAREF, &prs.alphaRef);
+    // Capture full device state into per-buffer StateContract for HLSL isolation
+    trackDeviceRead("StateContract::captureFrom(postRecording)");
+    auto& fb = frameBuffers[recordingBuffer];
+    fb.stateContract.captureFrom((IDirect3DDevice9*)device);
 
-    // Capture sampler states for stages 0-1 (texture filtering leaks to UI otherwise)
-    trackDeviceRead("GetSamplerState(x10 postRecording)");
-    device->GetSamplerState(0, D3DSAMP_MINFILTER, &prs.sampler0MinFilter);
-    device->GetSamplerState(0, D3DSAMP_MAGFILTER, &prs.sampler0MagFilter);
-    device->GetSamplerState(0, D3DSAMP_MIPFILTER, &prs.sampler0MipFilter);
-    device->GetSamplerState(0, D3DSAMP_ADDRESSU, &prs.sampler0AddressU);
-    device->GetSamplerState(0, D3DSAMP_ADDRESSV, &prs.sampler0AddressV);
-    device->GetSamplerState(1, D3DSAMP_MINFILTER, &prs.sampler1MinFilter);
-    device->GetSamplerState(1, D3DSAMP_MAGFILTER, &prs.sampler1MagFilter);
-    device->GetSamplerState(1, D3DSAMP_MIPFILTER, &prs.sampler1MipFilter);
-    device->GetSamplerState(1, D3DSAMP_ADDRESSU, &prs.sampler1AddressU);
-    device->GetSamplerState(1, D3DSAMP_ADDRESSV, &prs.sampler1AddressV);
-
-    // Capture transforms (HLSL replay changes these, particles/Scene1+ need original)
-    trackDeviceRead("GetTransform(x3 postRecording)");
-    device->GetTransform(D3DTS_WORLD, &prs.world);
-    device->GetTransform(D3DTS_VIEW, &prs.view);
-    device->GetTransform(D3DTS_PROJECTION, &prs.projection);
 }
 
 // restorePostRecordingState - Clean up device state for Scene 1+ after HLSL recording
@@ -682,39 +765,9 @@ void FixedFunctionShader::executeGpuPhase(int bufferIndex) {
     device->SetVertexShader(NULL);
     device->SetPixelShader(NULL);
 
-    // Restore Morrowind's end-of-Scene-0 state (from per-buffer snapshot)
-    const auto& prs = fb.postRecordingState;
-    device->SetRenderState(D3DRS_ALPHABLENDENABLE, prs.alphaBlendEnable);
-    device->SetRenderState(D3DRS_ALPHATESTENABLE, prs.alphaTestEnable);
-    device->SetRenderState(D3DRS_ZENABLE, prs.zEnable);
-    device->SetRenderState(D3DRS_ZWRITEENABLE, prs.zWriteEnable);
-    device->SetRenderState(D3DRS_CULLMODE, prs.cullMode);
-    device->SetRenderState(D3DRS_SRCBLEND, prs.srcBlend);
-    device->SetRenderState(D3DRS_DESTBLEND, prs.destBlend);
-    device->SetRenderState(D3DRS_FOGENABLE, prs.fogEnable);
-    device->SetRenderState(D3DRS_SPECULARENABLE, prs.specularEnable);
-    device->SetRenderState(D3DRS_LOCALVIEWER, prs.localViewer);
-    device->SetRenderState(D3DRS_NORMALIZENORMALS, prs.normalizeNormals);
-    device->SetRenderState(D3DRS_ZFUNC, prs.zFunc);
-    device->SetRenderState(D3DRS_ALPHAFUNC, prs.alphaFunc);
-    device->SetRenderState(D3DRS_ALPHAREF, prs.alphaRef);
+    // Restore Morrowind's end-of-Scene-0 state (from per-buffer StateContract)
+    fb.stateContract.applyTo((IDirect3DDevice9*)device);
 
-    // Restore sampler states for stages 0-1 (texture filtering for UI)
-    device->SetSamplerState(0, D3DSAMP_MINFILTER, prs.sampler0MinFilter);
-    device->SetSamplerState(0, D3DSAMP_MAGFILTER, prs.sampler0MagFilter);
-    device->SetSamplerState(0, D3DSAMP_MIPFILTER, prs.sampler0MipFilter);
-    device->SetSamplerState(0, D3DSAMP_ADDRESSU, prs.sampler0AddressU);
-    device->SetSamplerState(0, D3DSAMP_ADDRESSV, prs.sampler0AddressV);
-    device->SetSamplerState(1, D3DSAMP_MINFILTER, prs.sampler1MinFilter);
-    device->SetSamplerState(1, D3DSAMP_MAGFILTER, prs.sampler1MagFilter);
-    device->SetSamplerState(1, D3DSAMP_MIPFILTER, prs.sampler1MipFilter);
-    device->SetSamplerState(1, D3DSAMP_ADDRESSU, prs.sampler1AddressU);
-    device->SetSamplerState(1, D3DSAMP_ADDRESSV, prs.sampler1AddressV);
-
-    // Restore transforms (particles/Scene1+ need MW's original transforms)
-    device->SetTransform(D3DTS_WORLD, &prs.world);
-    device->SetTransform(D3DTS_VIEW, &prs.view);
-    device->SetTransform(D3DTS_PROJECTION, &prs.projection);
 
     isReplaying = false;
     resetHLSLCaches();
@@ -737,16 +790,11 @@ void FixedFunctionShader::markSceneEnd() {
 void FixedFunctionShader::logSceneHandoverState(const char* label) {
     if (!ImGuiManager::GetHandoverLogging()) return;
 
-    static int logCount = 0;
-    if (logCount > 30) return;  // Only log first ~10 frames (3 events per frame)
-    logCount++;
+    // Capture full StateContract
+    StateContract state;
+    state.captureFrom((IDirect3DDevice9*)device);
 
-    D3DMATRIX world, view, proj;
-    device->GetTransform(D3DTS_WORLD, &world);
-    device->GetTransform(D3DTS_VIEW, &view);
-    device->GetTransform(D3DTS_PROJECTION, &proj);
-
-    // Point sprite render states
+    // Point sprite render states (not in StateContract - particle-specific)
     float pointSize;
     DWORD pointSpriteEnable, pointScaleEnable;
     float pointScaleA, pointScaleB, pointScaleC;
@@ -775,13 +823,16 @@ void FixedFunctionShader::logSceneHandoverState(const char* label) {
     if (ps) ps->Release();
 
     LOG::logline("== HANDOVER [%s] ==", label);
-    LOG::logline("  World: [%.2f,%.2f,%.2f,%.2f] [%.2f,%.2f,%.2f,%.2f] ...",
-        world._11, world._12, world._13, world._14,
-        world._21, world._22, world._23, world._24);
+    LOG::logline("  Z: enable=%lu write=%lu func=%lu | Blend: %lu src=%lu dst=%lu",
+        state.zEnable, state.zWriteEnable, state.zFunc,
+        state.alphaBlendEnable, state.srcBlend, state.destBlend);
+    LOG::logline("  AlphaTest: %lu func=%lu ref=%lu | Cull=%lu Fog=%lu",
+        state.alphaTestEnable, state.alphaFunc, state.alphaRef,
+        state.cullMode, state.fogEnable);
+    LOG::logline("  World: [%.2f,%.2f,%.2f,%.2f] ...",
+        state.world._11, state.world._12, state.world._13, state.world._14);
     LOG::logline("  View: [%.2f,%.2f,%.2f,%.2f] ...",
-        view._11, view._12, view._13, view._14);
-    LOG::logline("  Proj: [%.2f,%.2f,%.2f,%.2f] ...",
-        proj._11, proj._12, proj._13, proj._14);
+        state.view._11, state.view._12, state.view._13, state.view._14);
     LOG::logline("  PointSprite: size=%.4f enable=%d scaleEnable=%d A=%.4f B=%.4f C=%.4f",
         pointSize, pointSpriteEnable, pointScaleEnable, pointScaleA, pointScaleB, pointScaleC);
     LOG::logline("  FVF=0x%08X tex0=%p VS=%p PS=%p", fvf, tex0, vs, ps);

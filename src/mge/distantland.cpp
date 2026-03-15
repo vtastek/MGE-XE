@@ -34,6 +34,7 @@ DLContext DistantLand::captureStage0Context() {
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_Stage0, 0);
     static int frameNumber = 0;
     LOG::logline("======== FRAME %d START (Scene 0) ========", ++frameNumber);
+    FixedFunctionShader::logSceneHandoverState("FrameStart");
 
     // Phase tracking: mark frame capture start (effect uniforms, camera reads)
     FixedFunctionShader::setPhase(FixedFunctionShader::PipelinePhase::FrameCapture);
@@ -137,8 +138,10 @@ void DistantLand::renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuff
 
             // Sky scattering and sky objects (should be drawn late as possible)
             if ((Configuration.MGEFlags & USE_ATM_SCATTER) && mwBridge->CellHasWeather() && !ImGuiManager::GetSuppressSky()) {
+                FixedFunctionShader::logSceneHandoverState("BeforeSky");
                 const auto& sky = fb ? fb->recordSky : recordSky;
                 renderSky(sky);
+                FixedFunctionShader::logSceneHandoverState("AfterSky");
             }
 
             // Update reflection
