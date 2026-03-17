@@ -3,7 +3,6 @@
 
 #include "ffeshader.h"
 #include "texture_suffix.h"
-#include "cullthread.h"
 #include "renderthread.h"
 #include "d3dcommandbuffer.h"
 #include "mge_tracy.h"
@@ -528,17 +527,10 @@ void FixedFunctionShader::finalizeBatchAndSubmitCull() {
         }
     }
 
-    // Submit to cull thread for async prepare
+    // Prepare recorded calls inline on main thread
     int buf = recordingBuffer;
-    frameBuffers[buf].state = BufferState::ReadyToCull;
-
-    if (g_cullThread && g_cullThread->isRunning()) {
-        g_cullThread->submitWork(buf, false);  // false = don't wait
-    } else {
-        // Fallback: no cull thread, run prepare inline
-        executeCullPass(buf);
-        frameBuffers[buf].state = BufferState::ReadyToRender;
-    }
+    prepareRecordedCalls(buf);
+    frameBuffers[buf].state = BufferState::ReadyToRender;
 
     recordingCompletedThisFrame = true;
 }
@@ -548,14 +540,8 @@ void FixedFunctionShader::waitCullAndReplay() {
     if (!recordingEnabled) return;
 
     auto& fb = frameBuffers[recordingBuffer];
-    if (fb.state != BufferState::ReadyToCull && fb.state != BufferState::Culling
-        && fb.state != BufferState::ReadyToRender) {
-        return;  // Nothing was submitted
-    }
-
-    // Wait for cull thread to finish (should be done by now — renderStage1+Blend gave it time)
-    if (g_cullThread && g_cullThread->isRunning() && fb.state != BufferState::ReadyToRender) {
-        g_cullThread->waitForCompletion();
+    if (fb.state != BufferState::ReadyToRender) {
+        return;  // Nothing prepared
     }
     fb.state = BufferState::ReadyToRender;
 
@@ -771,16 +757,10 @@ void FixedFunctionShader::finalizeAndRender(DLContext* frameCtx, bool waterSeen)
     {
         MGE_ZoneScopedN("Frame_Prepare");
 
-        // Submit to cull thread or run inline
+        // Prepare recorded calls inline on main thread
         int buf = recordingBuffer;
-        frameBuffers[buf].state = BufferState::ReadyToCull;
-
-        if (g_cullThread && g_cullThread->isRunning()) {
-            g_cullThread->submitWork(buf, false);
-        } else {
-            executeCullPass(buf);
-            frameBuffers[buf].state = BufferState::ReadyToRender;
-        }
+        prepareRecordedCalls(buf);
+        frameBuffers[buf].state = BufferState::ReadyToRender;
     }
 
     // === RENDER (GPU) ===
@@ -854,17 +834,11 @@ void FixedFunctionShader::executeGpuPhase(int bufferIndex) {
         fb.shadowViewproj[1] = DistantLand::s_staging.smViewproj[1];
     }
 
-    // Stage 1: grass, shadow overlay, depth (cull thread runs in parallel with this)
+    // Stage 1: grass, shadow overlay, depth
     DistantLand::renderStage1(frameCtx, &fb);
 
     // Blend close objects over distant land
     DistantLand::renderStageBlend(frameCtx, &fb);
-
-    // Wait for cull completion
-    if (g_cullThread && g_cullThread->isRunning() && fb.state != BufferState::ReadyToRender) {
-        g_cullThread->waitForCompletion();
-    }
-    fb.state = BufferState::ReadyToRender;
 
     // Build HLSL replay into command buffer, then replay it
     // Scene 0 + Scene 1+ always go through HLSL replay (recordMW populated by inspectIndexedPrimitive)
@@ -974,10 +948,8 @@ void FixedFunctionShader::logSceneHandoverState(const char* label) {
 
 // Triple-buffer pipeline: cull pass (called by CullThread or inline on main thread)
 void FixedFunctionShader::executeCullPass(int bufferIndex) {
-    // When called from CullThread, device calls are not safe (D3D9 is single-threaded).
-    // When called inline from main thread (no cull thread fallback), device calls are OK.
-    // CullThread::executeCull sets this to false before calling us.
-    prepareRecordedCalls(bufferIndex);
+    // Cull thread is idle - prepareRecordedCalls moved to main thread
+    (void)bufferIndex;
 }
 
 void FixedFunctionShader::executeRenderPass(int bufferIndex) {
