@@ -679,6 +679,7 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
     // Offscreen scene collapsing: keep one device-level scene open for all offscreen work
     // This eliminates per-scene DXVK command buffer submissions
     if (!g_scene.rendertargetNormal) {
+        MGE_ZoneScopedN("OffscreenRender");
         // SYNC: Wait for render thread before off-screen rendering touches device.
         // Off-screen work (local map, inventory doll) needs direct device access.
         if (isHLSLActive() && g_renderThread && g_renderThread->isRunning()) {

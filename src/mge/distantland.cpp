@@ -750,6 +750,7 @@ void DistantLand::adjustFog() {
 
 // postProcess - Calls post process module, or captures and applies frame cache to avoid rendering
 void DistantLand::postProcess(DLContext* ctx) {
+    MGE_ZoneScopedN("postProcess");
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_PostProcess, -1);
     if (!ctx->isRenderCached) {
         auto mwBridge = MWBridge::get();
@@ -820,6 +821,7 @@ void DistantLand::postProcess(DLContext* ctx) {
 
 // postProcess overload using captured PostProcessData (render thread safe)
 void DistantLand::postProcess(DLContext* ctx, const PostProcessData& ppd) {
+    MGE_ZoneScopedN("postProcess");
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_PostProcess, -1);
     if (!ctx->isRenderCached) {
         // Save state block
