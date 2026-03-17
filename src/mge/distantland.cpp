@@ -3,6 +3,7 @@
 #include "mgedinput.h"
 #include "configuration.h"
 #include "distantland.h"
+#include "mged3d8device.h"
 #include "mge_tracy.h"
 #include "distantshader.h"
 #include "postshaders.h"
@@ -32,8 +33,7 @@ DLContext DistantLand::captureContext() {
 DLContext DistantLand::captureStage0Context() {
     MGE_ZoneScopedN("DL_CaptureStage0");
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_Stage0, 0);
-    static int frameNumber = 0;
-    LOG::logline("======== FRAME %d START (Scene 0) ========", ++frameNumber);
+    LOG::logline("======== FRAME %d START (Scene 0) ========", getFrameNumber());
     FixedFunctionShader::logSceneHandoverState("FrameStart");
 
     // Phase tracking: mark frame capture start (effect uniforms, camera reads)
