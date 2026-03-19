@@ -34,7 +34,7 @@ DLContext DistantLand::captureStage0Context() {
     MGE_ZoneScopedN("DL_CaptureStage0");
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_Stage0, 0);
     LOG::logline("======== FRAME %d START (Scene 0) ========", getFrameNumber());
-    FixedFunctionShader::logSceneHandoverState("FrameStart");
+    FixedFunctionShader::transitionTo(PhaseTransition::RecordingEntry);
 
     // Phase tracking: mark frame capture start (effect uniforms, camera reads)
     FixedFunctionShader::setPhase(FixedFunctionShader::PipelinePhase::FrameCapture);
@@ -79,6 +79,8 @@ DLContext DistantLand::captureStage0Context() {
 void DistantLand::renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuffer* fb) {
     MGE_ZoneScopedN("DL_RenderStage0GPU");
 
+    FixedFunctionShader::transitionTo(PhaseTransition::Stage0Entry);
+
     auto mwBridge = MWBridge::get();
     IDirect3DStateBlock9* stateSaved;
     UINT passes;
@@ -93,10 +95,12 @@ void DistantLand::renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuff
             // Shadow map early render
             if (Configuration.MGEFlags & USE_SHADOWS) {
                 if (mwBridge->CellHasWeather() && !mwBridge->IsMenu()) {
+                    FixedFunctionShader::transitionTo(PhaseTransition::ShadowEntry);
                     effectShadow->Begin(&passes, D3DXFX_DONOTSAVESTATE);
                     renderShadowMap(ctx);
                     g_passBreaks.mge_shadowRT += 2;
                     effectShadow->End();
+                    FixedFunctionShader::transitionTo(PhaseTransition::ShadowExit);
 
                     // Write shadow viewproj back to s_staging for ffeshader/mged3d8device reads
                     memcpy(s_staging.smViewproj, ctx->smViewproj, sizeof(s_staging.smViewproj));
@@ -138,17 +142,19 @@ void DistantLand::renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuff
 
             // Sky scattering and sky objects (should be drawn late as possible)
             if ((Configuration.MGEFlags & USE_ATM_SCATTER) && mwBridge->CellHasWeather() && !ImGuiManager::GetSuppressSky()) {
-                FixedFunctionShader::logSceneHandoverState("BeforeSky");
+                FixedFunctionShader::transitionTo(PhaseTransition::SkyEntry);
                 const auto& sky = fb ? fb->recordSky : recordSky;
                 renderSky(sky);
-                FixedFunctionShader::logSceneHandoverState("AfterSky");
+                FixedFunctionShader::transitionTo(PhaseTransition::SkyExit);
             }
 
             // Update reflection
             if (mwBridge->CellHasWater()) {
+                FixedFunctionShader::transitionTo(PhaseTransition::WaterReflEntry);
                 const auto* sky = fb ? &fb->recordSky : nullptr;
                 renderWaterReflection(ctx, &ctx->mwView, &distProj, sky);
                 g_passBreaks.mge_waterRT += 2;
+                FixedFunctionShader::transitionTo(PhaseTransition::WaterReflExit);
             }
 
             // Update water simulation
@@ -208,6 +214,8 @@ void DistantLand::renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuff
     if (!fb) {
         recordSky.clear();
     }
+
+    FixedFunctionShader::transitionTo(PhaseTransition::Stage0Exit);
 }
 
 // renderStage0 - Legacy combined path (calls capture + GPU)
@@ -221,6 +229,7 @@ DLContext DistantLand::renderStage0() {
 void DistantLand::renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer* fb) {
     MGE_ZoneScopedN("DL_RenderStage1");
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_Stage1, 0);
+    FixedFunctionShader::transitionTo(PhaseTransition::Stage1Entry);
     auto mwBridge = MWBridge::get();
     IDirect3DStateBlock9* stateSaved;
     UINT passes;
@@ -279,11 +288,13 @@ void DistantLand::renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer*
             // Depth texture from recorded renders
             // HLSL path: only render Scene 0 depth (Scene 1+ handled by renderStage2)
             int sceneFilter = (isHLSLActive()) ? 0 : -1;
+            FixedFunctionShader::transitionTo(PhaseTransition::DepthEntry);
             effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
             if (ImGuiManager::GetEnableDepthPass()) {
                 renderDepth(ctx, activeRecordMW, sceneFilter);
             }
             effectDepth->End();
+            FixedFunctionShader::transitionTo(PhaseTransition::DepthExit);
 
             // Copy recordMW to Hi-Z for culling (before distant land adds to depth)
             // Disabled: Hi-Z generation is disabled, so this StretchRect is wasted
@@ -339,6 +350,8 @@ void DistantLand::renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer*
     if (!fb && !isHLSLActive()) {
         recordMW.clear();
     }
+
+    FixedFunctionShader::transitionTo(PhaseTransition::Stage1Exit);
 }
 
 // renderStage2 - Render shadows and depth texture for scenes 1+ (post-stencil redraw/alpha/1st person)
@@ -399,6 +412,7 @@ void DistantLand::renderStage2(DLContext* ctx, FixedFunctionShader::FrameBuffer*
 // renderStageBlend - Blend between MGE distant land and Morrowind, rendering caustics first so it blends out
 void DistantLand::renderStageBlend(DLContext* ctx, FixedFunctionShader::FrameBuffer* fb) {
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_StageBlend, 0);
+    FixedFunctionShader::transitionTo(PhaseTransition::StageBlendEntry);
     auto mwBridge = MWBridge::get();
     IDirect3DStateBlock9* stateSaved;
     UINT passes;
@@ -451,6 +465,8 @@ void DistantLand::renderStageBlend(DLContext* ctx, FixedFunctionShader::FrameBuf
     effect->End();
     stateSaved->Apply();
     stateSaved->Release();
+
+    FixedFunctionShader::transitionTo(PhaseTransition::StageBlendExit);
 }
 
 // renderStageWater - Render replacement water plane
@@ -481,9 +497,11 @@ void DistantLand::renderStageWater(DLContext* ctx) {
         }
 
         // Switch to appropriate shader and render
+        FixedFunctionShader::transitionTo(PhaseTransition::WaterPlaneEntry);
         effect->BeginPass(u ? PASS_RENDERUNDERWATER : PASS_RENDERWATER);
         renderWaterPlane(ctx);
         effect->EndPass();
+        FixedFunctionShader::transitionTo(PhaseTransition::WaterPlaneExit);
 
         effect->End();
         stateSaved->Apply();

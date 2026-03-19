@@ -843,9 +843,11 @@ void FixedFunctionShader::executeGpuPhase(int bufferIndex) {
     // Build HLSL replay into command buffer, then replay it
     // Scene 0 + Scene 1+ always go through HLSL replay (recordMW populated by inspectIndexedPrimitive)
     // Build HLSL replay into command buffer, then replay it
+    transitionTo(PhaseTransition::ReplayEntry);
     fb.hlslCmds.clear();
     replayRecordedCalls(0, &fb.hlslCmds);
     fb.hlslCmds.replay(device);
+    transitionTo(PhaseTransition::ReplayExit);
 
     // Water surface AFTER replay — refraction samples backbuffer which needs scene content
     if (waterSeen) {
@@ -944,6 +946,101 @@ void FixedFunctionShader::logSceneHandoverState(const char* label) {
     LOG::logline("  PointSprite: size=%.4f enable=%d scaleEnable=%d A=%.4f B=%.4f C=%.4f",
         pointSize, pointSpriteEnable, pointScaleEnable, pointScaleA, pointScaleB, pointScaleC);
     LOG::logline("  FVF=0x%08X tex0=%p VS=%p PS=%p", fvf, tex0, vs, ps);
+}
+
+// === Phase Transition Tracking ===
+// Captures state at each boundary and validates against expected state
+
+bool FixedFunctionShader::transitionTo(PhaseTransition trans) {
+    int idx = static_cast<int>(trans);
+    StateContract& captured = transitionState[idx];
+
+    // Capture current device state
+    captured.captureFrom((IDirect3DDevice9*)device);
+
+    const char* name = getPhaseTransitionName(trans);
+
+    // Log if handover logging is enabled
+    if (ImGuiManager::GetHandoverLogging()) {
+        LOG::logline("== TRANSITION [%s] ==", name);
+        LOG::logline("  Z: enable=%lu write=%lu func=%lu | Blend: %lu src=%lu dst=%lu",
+            captured.zEnable, captured.zWriteEnable, captured.zFunc,
+            captured.alphaBlendEnable, captured.srcBlend, captured.destBlend);
+        LOG::logline("  AlphaTest: %lu func=%lu ref=%lu | Cull=%lu Fog=%lu",
+            captured.alphaTestEnable, captured.alphaFunc, captured.alphaRef,
+            captured.cullMode, captured.fogEnable);
+    }
+
+    // Validate against expected state based on transition
+    bool valid = true;
+
+    switch (trans) {
+        case PhaseTransition::GpuExit:
+        case PhaseTransition::Scene1Entry: {
+            // These must match RecordingExit - that's the invariant
+            const StateContract& expected = transitionState[static_cast<int>(PhaseTransition::RecordingExit)];
+
+            // Check critical render states (not transforms - those are set by replay)
+            if (captured.zEnable != expected.zEnable ||
+                captured.zWriteEnable != expected.zWriteEnable ||
+                captured.alphaBlendEnable != expected.alphaBlendEnable ||
+                captured.alphaTestEnable != expected.alphaTestEnable ||
+                captured.cullMode != expected.cullMode ||
+                captured.fogEnable != expected.fogEnable) {
+
+                valid = false;
+                LOG::logline("!! STATE MISMATCH at %s (expected RecordingExit state) !!", name);
+                LOG::logline("  Z: expected enable=%lu write=%lu, got enable=%lu write=%lu",
+                    expected.zEnable, expected.zWriteEnable,
+                    captured.zEnable, captured.zWriteEnable);
+                LOG::logline("  Blend: expected %lu, got %lu",
+                    expected.alphaBlendEnable, captured.alphaBlendEnable);
+                LOG::logline("  AlphaTest: expected %lu, got %lu",
+                    expected.alphaTestEnable, captured.alphaTestEnable);
+                LOG::logline("  Cull: expected %lu, got %lu",
+                    expected.cullMode, captured.cullMode);
+                LOG::logline("  Fog: expected %lu, got %lu",
+                    expected.fogEnable, captured.fogEnable);
+            }
+            break;
+        }
+        default:
+            // Other transitions just capture, no validation target yet
+            break;
+    }
+
+    return valid;
+}
+
+const StateContract& FixedFunctionShader::getTransitionState(PhaseTransition trans) {
+    return transitionState[static_cast<int>(trans)];
+}
+
+// Save all captured transition states as baselines
+void FixedFunctionShader::saveCurrentAsBaseline() {
+    LOG::logline("=== SAVING STATE BASELINES ===");
+    for (int i = 0; i < static_cast<int>(PhaseTransition::Count); ++i) {
+        PhaseTransition trans = static_cast<PhaseTransition>(i);
+        saveStateBaseline(trans, transitionState[i]);
+    }
+    LOG::logline("=== BASELINES SAVED ===");
+}
+
+// Compare all captured states to saved baselines
+void FixedFunctionShader::validateAgainstBaselines() {
+    LOG::logline("=== VALIDATING AGAINST BASELINES ===");
+    int mismatches = 0;
+    for (int i = 0; i < static_cast<int>(PhaseTransition::Count); ++i) {
+        PhaseTransition trans = static_cast<PhaseTransition>(i);
+        if (!compareToBaseline(trans, transitionState[i])) {
+            mismatches++;
+        }
+    }
+    if (mismatches == 0) {
+        LOG::logline("=== ALL STATES MATCH BASELINES ===");
+    } else {
+        LOG::logline("=== %d STATES DIFFER FROM BASELINES ===", mismatches);
+    }
 }
 
 // Triple-buffer pipeline: cull pass (called by CullThread or inline on main thread)

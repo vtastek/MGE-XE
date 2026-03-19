@@ -398,6 +398,14 @@ void ImGuiManager::RenderDebugInterface() {
     if (ImGui::Begin("HLSL Pipeline Debug", &showDebugInterface, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::Checkbox("Enable Debug Hotkeys (F11/U/Y/L/F5/F6/K/O)", &debugKeysEnabled);
         ImGui::Checkbox("Handover Logging (Scene 0/1+ state)", &handoverLogging);
+        ImGui::SameLine();
+        if (ImGui::Button("Save Baselines")) {
+            FixedFunctionShader::saveCurrentAsBaseline();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Validate")) {
+            FixedFunctionShader::validateAgainstBaselines();
+        }
         ImGui::Separator();
 
         ImGui::Text("Recording/Replay System (Scene 0)");

@@ -692,9 +692,7 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
         g_offscreen.sceneCount++;
         if (!g_offscreen.megaSceneOpen) {
             // First offscreen scene: open device scene, keep it open for all subsequent offscreen work
-            if (isHLSLActive()) {
-                FixedFunctionShader::logSceneHandoverState("OffscreenStart");
-            }
+            FixedFunctionShader::transitionTo(PhaseTransition::OffscreenEntry);
             flushPendingRT();
             if (!shouldSuppressMWState()) {
                 ProxyDevice::BeginScene();
@@ -714,9 +712,7 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
         g_offscreen.suppressingCurrentScene = false;
         // Transitioning back to normal rendering — close the offscreen mega-scene
         if (g_offscreen.megaSceneOpen) {
-            if (isHLSLActive()) {
-                FixedFunctionShader::logSceneHandoverState("OffscreenEnd");
-            }
+            FixedFunctionShader::transitionTo(PhaseTransition::OffscreenExit);
             if (ImGuiManager::GetCmdBufferRecording() && !ImGuiManager::GetCmdBufferReplay()) {
                 g_cmdBufferSet.active().recordEndScene();
             }
@@ -760,9 +756,9 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                 if (isHLSLActive() && g_scene.stage0Complete && g_renderThread && g_renderThread->isPending()) {
                     g_renderThread->waitForCompletion();
                 }
-                // Particle bug debug: state at BeginScene 1 (first Scene 1+ scene)
+                // Phase transition: Scene1Entry - validates state matches RecordingExit
                 if (isHLSLActive()) {
-                    FixedFunctionShader::logSceneHandoverState("BeginScene1");
+                    FixedFunctionShader::transitionTo(PhaseTransition::Scene1Entry);
                 }
             }
 
@@ -781,7 +777,7 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
         } else {
             // UI scene — frame finalize point
             if (isHLSLActive()) {
-                FixedFunctionShader::logSceneHandoverState("UISceneEntry");
+                FixedFunctionShader::transitionTo(PhaseTransition::UIEntry);
             }
             g_cmdBufferSet.activeStage = CmdStage::UI;
             if (DistantLand::ready && g_scene.sceneCount > 0 && !g_scene.isFrameComplete) {
@@ -839,8 +835,8 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
                     g_scene.stage0Complete = true;
                 }
 
-                // Particle bug debug: capture state BEFORE finalizeAndRender
-                FixedFunctionShader::logSceneHandoverState("EndScene0_Before");
+                // Phase transition: RecordingExit - MW state at end of Scene 0
+                FixedFunctionShader::transitionTo(PhaseTransition::RecordingExit);
 
                 // Capture MW device state before replay (for Scene 1+ restoration)
                 FixedFunctionShader::capturePostRecordingState();
@@ -848,8 +844,8 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
                 // Do GPU replay — finalizeAndRender internally saves/restores RT/DS
                 FixedFunctionShader::finalizeAndRender(&frameCtx, g_scene.waterDrawn);
 
-                // Particle bug debug: state AFTER finalizeAndRender (should be restored)
-                FixedFunctionShader::logSceneHandoverState("EndScene0_After");
+                // Phase transition: GpuExit - must match RecordingExit
+                FixedFunctionShader::transitionTo(PhaseTransition::GpuExit);
             } else {
                 // Legacy path: interleaved GPU work as before
                 if (!g_scene.stage0Complete) {

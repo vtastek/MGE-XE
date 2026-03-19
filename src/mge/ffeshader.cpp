@@ -159,6 +159,168 @@ FixedFunctionShader::TextureBindingCache FixedFunctionShader::textureCache;
 // State contracts for phase transitions
 StateContract FixedFunctionShader::preRecordingContract;
 StateContract FixedFunctionShader::postRecordingContract;
+StateContract FixedFunctionShader::transitionState[static_cast<int>(PhaseTransition::Count)];
+
+// Phase transition name helper
+const char* getPhaseTransitionName(PhaseTransition trans) {
+    switch (trans) {
+        // Main scene boundaries
+        case PhaseTransition::RecordingEntry: return "RecordingEntry";
+        case PhaseTransition::RecordingExit:  return "RecordingExit";
+
+        // GPU phase sub-stages
+        case PhaseTransition::Stage0Entry:    return "Stage0Entry";
+        case PhaseTransition::ShadowEntry:    return "ShadowEntry";
+        case PhaseTransition::ShadowExit:     return "ShadowExit";
+        case PhaseTransition::SkyEntry:       return "SkyEntry";
+        case PhaseTransition::SkyExit:        return "SkyExit";
+        case PhaseTransition::WaterReflEntry: return "WaterReflEntry";
+        case PhaseTransition::WaterReflExit:  return "WaterReflExit";
+        case PhaseTransition::Stage0Exit:     return "Stage0Exit";
+
+        // Offscreen
+        case PhaseTransition::OffscreenEntry: return "OffscreenEntry";
+        case PhaseTransition::OffscreenExit:  return "OffscreenExit";
+
+        // Stage 1
+        case PhaseTransition::Stage1Entry:    return "Stage1Entry";
+        case PhaseTransition::DepthEntry:     return "DepthEntry";
+        case PhaseTransition::DepthExit:      return "DepthExit";
+        case PhaseTransition::Stage1Exit:     return "Stage1Exit";
+
+        // Stage Blend
+        case PhaseTransition::StageBlendEntry:  return "StageBlendEntry";
+        case PhaseTransition::WaterPlaneEntry:  return "WaterPlaneEntry";
+        case PhaseTransition::WaterPlaneExit:   return "WaterPlaneExit";
+        case PhaseTransition::StageBlendExit:   return "StageBlendExit";
+
+        // HLSL replay
+        case PhaseTransition::ReplayEntry:    return "ReplayEntry";
+        case PhaseTransition::ReplayExit:     return "ReplayExit";
+
+        // Post-GPU
+        case PhaseTransition::GpuExit:        return "GpuExit";
+        case PhaseTransition::Scene1Entry:    return "Scene1Entry";
+        case PhaseTransition::UIEntry:        return "UIEntry";
+
+        default: return "Unknown";
+    }
+}
+
+// Baseline file path helper
+static std::string getBaselineFilePath(PhaseTransition trans) {
+    char path[512];
+    snprintf(path, sizeof(path), "Data Files/shaders/state_baselines/%s.txt", getPhaseTransitionName(trans));
+    return std::string(path);
+}
+
+// Save state contract to file
+void saveStateBaseline(PhaseTransition trans, const StateContract& state) {
+    std::string path = getBaselineFilePath(trans);
+
+    // Ensure directory exists
+    CreateDirectoryA("Data Files/shaders/state_baselines", NULL);
+
+    FILE* f = fopen(path.c_str(), "w");
+    if (!f) {
+        LOG::logline("Failed to save baseline: %s", path.c_str());
+        return;
+    }
+
+    fprintf(f, "# State baseline for %s\n", getPhaseTransitionName(trans));
+    fprintf(f, "zEnable=%lu\n", state.zEnable);
+    fprintf(f, "zWriteEnable=%lu\n", state.zWriteEnable);
+    fprintf(f, "zFunc=%lu\n", state.zFunc);
+    fprintf(f, "alphaBlendEnable=%lu\n", state.alphaBlendEnable);
+    fprintf(f, "srcBlend=%lu\n", state.srcBlend);
+    fprintf(f, "destBlend=%lu\n", state.destBlend);
+    fprintf(f, "alphaTestEnable=%lu\n", state.alphaTestEnable);
+    fprintf(f, "alphaFunc=%lu\n", state.alphaFunc);
+    fprintf(f, "alphaRef=%lu\n", state.alphaRef);
+    fprintf(f, "cullMode=%lu\n", state.cullMode);
+    fprintf(f, "fogEnable=%lu\n", state.fogEnable);
+    fprintf(f, "specularEnable=%lu\n", state.specularEnable);
+    fprintf(f, "localViewer=%lu\n", state.localViewer);
+    fprintf(f, "normalizeNormals=%lu\n", state.normalizeNormals);
+
+    fclose(f);
+    LOG::logline("Saved baseline: %s", path.c_str());
+}
+
+// Load state contract from file
+bool loadStateBaseline(PhaseTransition trans, StateContract* outState) {
+    std::string path = getBaselineFilePath(trans);
+
+    FILE* f = fopen(path.c_str(), "r");
+    if (!f) {
+        return false;
+    }
+
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#' || line[0] == '\n') continue;
+
+        char key[64];
+        DWORD value;
+        if (sscanf(line, "%63[^=]=%lu", key, &value) == 2) {
+            if (strcmp(key, "zEnable") == 0) outState->zEnable = value;
+            else if (strcmp(key, "zWriteEnable") == 0) outState->zWriteEnable = value;
+            else if (strcmp(key, "zFunc") == 0) outState->zFunc = value;
+            else if (strcmp(key, "alphaBlendEnable") == 0) outState->alphaBlendEnable = value;
+            else if (strcmp(key, "srcBlend") == 0) outState->srcBlend = value;
+            else if (strcmp(key, "destBlend") == 0) outState->destBlend = value;
+            else if (strcmp(key, "alphaTestEnable") == 0) outState->alphaTestEnable = value;
+            else if (strcmp(key, "alphaFunc") == 0) outState->alphaFunc = value;
+            else if (strcmp(key, "alphaRef") == 0) outState->alphaRef = value;
+            else if (strcmp(key, "cullMode") == 0) outState->cullMode = value;
+            else if (strcmp(key, "fogEnable") == 0) outState->fogEnable = value;
+            else if (strcmp(key, "specularEnable") == 0) outState->specularEnable = value;
+            else if (strcmp(key, "localViewer") == 0) outState->localViewer = value;
+            else if (strcmp(key, "normalizeNormals") == 0) outState->normalizeNormals = value;
+        }
+    }
+
+    fclose(f);
+    return true;
+}
+
+// Compare current state to baseline
+bool compareToBaseline(PhaseTransition trans, const StateContract& current) {
+    StateContract baseline;
+    if (!loadStateBaseline(trans, &baseline)) {
+        return true; // No baseline to compare against
+    }
+
+    bool match = true;
+    const char* name = getPhaseTransitionName(trans);
+
+    if (current.zEnable != baseline.zEnable) {
+        LOG::logline("!! BASELINE DIFF [%s] zEnable: baseline=%lu current=%lu", name, baseline.zEnable, current.zEnable);
+        match = false;
+    }
+    if (current.zWriteEnable != baseline.zWriteEnable) {
+        LOG::logline("!! BASELINE DIFF [%s] zWriteEnable: baseline=%lu current=%lu", name, baseline.zWriteEnable, current.zWriteEnable);
+        match = false;
+    }
+    if (current.alphaBlendEnable != baseline.alphaBlendEnable) {
+        LOG::logline("!! BASELINE DIFF [%s] alphaBlendEnable: baseline=%lu current=%lu", name, baseline.alphaBlendEnable, current.alphaBlendEnable);
+        match = false;
+    }
+    if (current.alphaTestEnable != baseline.alphaTestEnable) {
+        LOG::logline("!! BASELINE DIFF [%s] alphaTestEnable: baseline=%lu current=%lu", name, baseline.alphaTestEnable, current.alphaTestEnable);
+        match = false;
+    }
+    if (current.cullMode != baseline.cullMode) {
+        LOG::logline("!! BASELINE DIFF [%s] cullMode: baseline=%lu current=%lu", name, baseline.cullMode, current.cullMode);
+        match = false;
+    }
+    if (current.fogEnable != baseline.fogEnable) {
+        LOG::logline("!! BASELINE DIFF [%s] fogEnable: baseline=%lu current=%lu", name, baseline.fogEnable, current.fogEnable);
+        match = false;
+    }
+
+    return match;
+}
 
 // Exterior texture binding optimization flags
 bool FixedFunctionShader::isExteriorShadowBound = false;

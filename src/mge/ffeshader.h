@@ -164,6 +164,58 @@ struct StateContract {
 };
 
 
+// Named transition points between pipeline phases.
+// State is captured at each transition for validation.
+enum class PhaseTransition {
+    // Main scene boundaries
+    RecordingEntry,    // BeginScene 0 - MW starting state
+    RecordingExit,     // EndScene 0 pre-GPU - MW ending state (what MW expects after Scene 0)
+
+    // GPU phase sub-stages (renderStage0GPU)
+    Stage0Entry,       // Start of GPU phase (shadows, distant land)
+    ShadowEntry,       // Before shadow map render
+    ShadowExit,        // After shadow map render
+    SkyEntry,          // Before sky render
+    SkyExit,           // After sky render
+    WaterReflEntry,    // Before water reflection render
+    WaterReflExit,     // After water reflection render
+    Stage0Exit,        // End of renderStage0GPU
+
+    // Offscreen rendering
+    OffscreenEntry,    // Start of offscreen (local map, inventory)
+    OffscreenExit,     // End of offscreen
+
+    // Stage 1 (grass, shadows over near, depth)
+    Stage1Entry,       // Before renderStage1
+    DepthEntry,        // Before depth render
+    DepthExit,         // After depth render
+    Stage1Exit,        // After renderStage1
+
+    // Stage Blend (distant land blend, water plane)
+    StageBlendEntry,   // Before renderStageBlend
+    WaterPlaneEntry,   // Before water plane render
+    WaterPlaneExit,    // After water plane render
+    StageBlendExit,    // After renderStageBlend
+
+    // HLSL replay
+    ReplayEntry,       // Before HLSL replay
+    ReplayExit,        // After HLSL replay
+
+    // Post-GPU boundaries
+    GpuExit,           // After all GPU work - must match RecordingExit
+    Scene1Entry,       // BeginScene 1 - validates state was restored correctly
+    UIEntry,           // UI BeginScene - after all 3D scenes
+
+    Count
+};
+
+const char* getPhaseTransitionName(PhaseTransition trans);
+
+// Save/load state baselines to files for comparison
+void saveStateBaseline(PhaseTransition trans, const StateContract& state);
+bool loadStateBaseline(PhaseTransition trans, StateContract* outState);
+bool compareToBaseline(PhaseTransition trans, const StateContract& current);
+
 // RenderedState, RecordedMWState, FragmentState, LightState are in renderstate.h
 
 // Pipeline state diagnostic snapshot — captured at Present() before reset
@@ -447,6 +499,9 @@ private:
     // State contracts for phase transitions (replaces scattered GetRenderState calls)
     static StateContract preRecordingContract;   // MW state before recording starts
     static StateContract postRecordingContract;  // MW state at end of Scene 0 (restored after replay)
+
+    // Phase transition tracking - captured state at each boundary
+    static StateContract transitionState[static_cast<int>(PhaseTransition::Count)];
 
     // Exterior texture binding optimizations
     static bool isExteriorShadowBound;
@@ -791,6 +846,17 @@ public:
 
     // Scene handover debugging (particle bug investigation)
     static void logSceneHandoverState(const char* label);
+
+    // Phase transition tracking - captures state and validates against expected
+    // Returns true if state matches expected (or no expected state to compare)
+    static bool transitionTo(PhaseTransition trans);
+
+    // Get captured state at a transition (for comparison)
+    static const StateContract& getTransitionState(PhaseTransition trans);
+
+    // Baseline management - save/load known-good states
+    static void saveCurrentAsBaseline();   // Save all current transition states as baselines
+    static void validateAgainstBaselines(); // Compare current states to saved baselines
 
 private:
 
