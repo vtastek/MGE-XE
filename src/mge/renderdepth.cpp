@@ -138,10 +138,14 @@ void DistantLand::renderDepthRecorded(const std::vector<RecordedMWState>& recMW,
     // DEBUG: Log renderDepthRecorded call and scene filter breakdown
     static int logCount = 0;
     if (logCount < 4) {
-        int s0 = 0, s1 = 0;
-        for (const auto& m : recMW) { if (m.sceneNum == 0) s0++; else s1++; }
-        LOG::logline(">> renderDepthRecorded(sceneFilter=%d): total=%d, scene0=%d, scene1+=%d",
-                     sceneFilter, (int)recMW.size(), s0, s1);
+        int s0 = 0, s1 = 0, s2 = 0;
+        for (const auto& m : recMW) {
+            if (m.sceneNum == 0) s0++;
+            else if (m.sceneNum == 1) s1++;
+            else s2++;
+        }
+        LOG::logline(">> renderDepthRecorded(sceneFilter=%d): total=%d, scene0=%d, scene1=%d, scene2=%d",
+                     sceneFilter, (int)recMW.size(), s0, s1, s2);
         logCount++;
     }
 
@@ -150,7 +154,7 @@ void DistantLand::renderDepthRecorded(const std::vector<RecordedMWState>& recMW,
 
     // Recorded renders (pre-filtered by executeHiZCulling/applyVisibilityAndFilterRecordMW)
     for (const auto& i : recMW) {
-        // Scene filter: -1 = all, 0 = scene 0 only, >0 = scene 1+ only
+        // Scene filter: -1 = all, 0 = scene 0 only, 1 = scene 1 only, 2 = scene 2 only, etc.
         if (sceneFilter == 0 && i.sceneNum != 0) continue;
         if (sceneFilter > 0 && i.sceneNum == 0) continue;
 
@@ -197,13 +201,14 @@ void DistantLand::renderDepthRecorded(const std::vector<RecordedMWState>& recMW,
         }
         effectDepth->CommitChanges();
 
-        // Scene 1+ objects (hands/alpha): force opaque depth write
+        // Scene 2 objects (hands): force opaque depth write
         // They have zWrite=0 and blendEnable=1 in Morrowind, but we need solid depth for SSAO/DOF
+        // Scene 1 (particles) typically skipped via sceneFilter, but if present also force depth
         bool forceOpaqueDepth = (i.sceneNum > 0);
 
         // Set render states for depth pass
         if (forceOpaqueDepth) {
-            // Scene 1+: write solid depth, no blending, standard culling
+            // Scene 1/2: write solid depth, no blending, standard culling
             device->SetRenderState(D3DRS_CULLMODE, i.cullMode);
             device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
             device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);

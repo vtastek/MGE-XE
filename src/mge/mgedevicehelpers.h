@@ -99,10 +99,11 @@ struct DIPCategory {
 };
 
 // Categorize a DrawIndexedPrimitive call
+// Scene 0 = world, Scene 1 = particles (alpha sorted), Scene 2 = hands (skinned)
 inline DIPCategory categorizeDIP(
     bool rendertargetNormal, bool isMainView, bool isShadowStencil,
     int sceneCount, DWORD vertexBlendState, bool blendEnable,
-    ImGuiManager::DIPBinStats& stats, int& dipScene0, int& dipScene1plus)
+    ImGuiManager::DIPBinStats& stats, int& dipScene0, int& dipScene1, int& dipScene2)
 {
     DIPCategory result = { FrameEvent::Count, nullptr, false };
     static thread_local char dipBuf[32];
@@ -124,10 +125,22 @@ inline DIPCategory categorizeDIP(
         result.tracyName = "DIP_Scene0";
         dipScene0++;
         result.deferEventLog = true;
-    } else if (sceneCount > 0) {
+    } else if (sceneCount == 1) {
+        result.tracyName = "DIP_Scene1";
+        dipScene1++;
+        // Scene 1 = particles (alpha sorted, no depth write)
+        if (blendEnable) {
+            result.eventType = FrameEvent::DIP_1P_Alpha;
+            stats.firstPersonAlpha++;
+        } else {
+            result.eventType = FrameEvent::DIP_1P_Other;
+            stats.firstPersonOther++;
+        }
+    } else if (sceneCount >= 2) {
         snprintf(dipBuf, sizeof(dipBuf), "DIP_Scene%d", sceneCount);
         result.tracyName = dipBuf;
-        dipScene1plus++;
+        dipScene2++;
+        // Scene 2 = hands (skinned, solid depth after Z-clear)
         if (vertexBlendState != 0) {
             result.eventType = FrameEvent::DIP_1P_Skinning;
             stats.firstPersonSkinning++;

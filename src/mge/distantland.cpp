@@ -286,7 +286,7 @@ void DistantLand::renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer*
             g_passBreaks.mge_depthRT += 2; // Single RenderTargetSwitcher in+out for entire depth section
 
             // Depth texture from recorded renders
-            // HLSL path: only render Scene 0 depth (Scene 1+ handled by renderStage2)
+            // HLSL path: only render Scene 0 depth (Scene 2 hands handled by renderStage2)
             int sceneFilter = (isHLSLActive()) ? 0 : -1;
             FixedFunctionShader::transitionTo(PhaseTransition::DepthEntry);
             effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
@@ -344,8 +344,8 @@ void DistantLand::renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer*
         stateSaved->Release();
     }
 
-    // HLSL path: keep recordMW for renderStage2 (Scene 1+ depth still needed)
-    // Legacy path: clear now (Scene 1+ will re-populate during its own recording)
+    // HLSL path: keep recordMW for renderStage2 (Scene 2 hands depth still needed)
+    // Legacy path: clear now (Scene 1/2 will re-populate during their own recording)
     // Per-buffer recordMW is cleared by FrameBuffer::clear(); only clear global static
     if (!fb && !isHLSLActive()) {
         recordMW.clear();
@@ -354,7 +354,7 @@ void DistantLand::renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer*
     FixedFunctionShader::transitionTo(PhaseTransition::Stage1Exit);
 }
 
-// renderStage2 - Render shadows and depth texture for scenes 1+ (post-stencil redraw/alpha/1st person)
+// renderStage2 - Render depth texture for Scene 2 (hands after Z-clear)
 void DistantLand::renderStage2(DLContext* ctx, FixedFunctionShader::FrameBuffer* fb) {
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_Stage2, 1);
     auto mwBridge = MWBridge::get();
@@ -387,7 +387,8 @@ void DistantLand::renderStage2(DLContext* ctx, FixedFunctionShader::FrameBuffer*
         }
 
         // Depth texture from recorded renders
-        // HLSL path: only render Scene 1+ depth (Scene 0 already done in renderStage1)
+        // HLSL path: render Scene 2 (hands) depth only (Scene 0 done in renderStage1)
+        // sceneFilter=1 means "scenes >= 1", so both particles (1) and hands (2) if any
         int sceneFilter = (isHLSLActive()) ? 1 : -1;
         effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
         if (ImGuiManager::GetEnableDepthPass()) {
@@ -1146,18 +1147,18 @@ void DistantLand::setSunLight(const D3DLIGHT8* s) {
 bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
     auto mwBridge = MWBridge::get();
 
-    // Log ALL Scene 1+ draws to debug hand rendering (one-time dump)
-    static int scene1DrawCount = 0;
-    static bool scene1LogDone = false;
-    if (sceneCount >= 1 && !scene1LogDone) {
-        scene1DrawCount++;
+    // Log ALL Scene 1/2 draws to debug particles/hands (one-time dump)
+    static int scene12DrawCount = 0;
+    static bool scene12LogDone = false;
+    if (sceneCount >= 1 && !scene12LogDone) {
+        scene12DrawCount++;
         LOG::logline(">> Scene %d draw #%d: zWrite=%d, blendEnable=%d, alphaTest=%d, vertBlend=%d, prims=%d",
-                     sceneCount, scene1DrawCount, rs->zWrite, rs->blendEnable, rs->alphaTest,
+                     sceneCount, scene12DrawCount, rs->zWrite, rs->blendEnable, rs->alphaTest,
                      rs->vertexBlendState, rs->primCount);
     }
     // After first frame finalize, stop logging
-    if (sceneCount == 0 && scene1DrawCount > 0) {
-        scene1LogDone = true;
+    if (sceneCount == 0 && scene12DrawCount > 0) {
+        scene12LogDone = true;
     }
 
     // Avoid recording landscape alpha blend drawcalls, a form of multi-pass splatting
@@ -1177,11 +1178,10 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
     auto& targetRecordMW = hlsl ? FixedFunctionShader::currentFrameBuffer().recordMW : recordMW;
     auto& targetRecordSky = hlsl ? FixedFunctionShader::currentFrameBuffer().recordSky : recordSky;
 
-    // Capture z-writing draws, plus Scene 1+ skinning/other (for depth texture even if zWrite=0)
+    // Capture z-writing draws, plus Scene 2 hands (for depth texture even if zWrite=0)
     // Scene 0: only zWrite draws (skip multi-pass splatting and decals)
-    // Scene 1+ skinning (hands): vertexBlendState != 0 → depth for SSAO/DOF
-    // Scene 1+ other (opaque 1P): !blendEnable → depth for SSAO/DOF
-    // Scene 1+ alpha sorted: vertexBlendState == 0 && blendEnable → skip depth
+    // Scene 1 (particles): vertexBlendState == 0 && blendEnable → skip depth (alpha sorted)
+    // Scene 2 (hands): vertexBlendState != 0 (skinned) or !blendEnable (opaque) → depth for SSAO/DOF
     bool is1PDepthCandidate = sceneCount > 0 && (rs->vertexBlendState != 0 || !rs->blendEnable);
     if ((rs->zWrite && !isLandSplat && !isDecal) || is1PDepthCandidate) {
         targetRecordMW.emplace_back(*rs);
@@ -1229,6 +1229,11 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
         // Event logging deferred to recordRenderCall where exact RenderBin is known
         // Render Morrowind with replacement shaders
         // Pass recordMWIdx so HLSL recording can reuse visibility results from depth pass
+        FixedFunctionShader::renderMorrowind(rs, frs, lightrs, recordMWIdx);
+        return false;
+    } else if (sceneCount >= 1 && isHLSLActive() && FixedFunctionShader::getIsRecording()) {
+        // Scene 1 (particles) / Scene 2 (hands): record to HLSL for deferred replay
+        // This path is separate from isPPLActive to allow recording even in non-PPL modes
         FixedFunctionShader::renderMorrowind(rs, frs, lightrs, recordMWIdx);
         return false;
     }

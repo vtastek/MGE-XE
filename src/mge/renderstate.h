@@ -30,7 +30,7 @@ struct RenderedState {
     D3DXVECTOR3 bboxMin, bboxMax;
     bool hasBoundingBox;
 
-    // Scene number (0 = main opaques, 1+ = hands/alpha after Z-clear)
+    // Scene number (0=world, 1=particles, 2=hands)
     int sceneNum = 0;
 };
 

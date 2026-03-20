@@ -221,7 +221,7 @@ bool compareToBaseline(PhaseTransition trans, const StateContract& current);
 // Pipeline state diagnostic snapshot — captured at Present() before reset
 struct PipelineDiag {
     // Per-frame DIP counters (end-of-frame totals)
-    int dipScene0, dipScene1plus, dipOffscreen, dipUI, dipStencilShadow, dipUnknown;
+    int dipScene0, dipScene1, dipOffscreen, dipUI, dipStencilShadow, dipUnknown;
     // Pipeline flags at end of frame
     int sceneCount;
     bool isMainView, rendertargetNormal, stage0Complete, isFrameComplete;
@@ -628,7 +628,7 @@ public:
         // Whether this call should be rendered (set by cull pass)
         bool shouldRender = true;
 
-        // Scene number this call was recorded in (0 = main, 1+ = hands/alpha after Z-clear)
+        // Scene number this call was recorded in (0=world, 1=particles, 2=hands)
         int sceneNum = 0;
 
         // Expected device state for debug mode (state leak detection)
@@ -658,7 +658,9 @@ public:
     };
 
     struct FrameBuffer {
-        std::vector<HLSLRecordedCall> recordedCalls;
+        std::vector<HLSLRecordedCall> recordedCalls;        // Scene 0 (main world)
+        std::vector<HLSLRecordedCall> recordedCallsScene1;  // Scene 1 (particles, alpha sorted)
+        std::vector<HLSLRecordedCall> recordedCallsScene2;  // Scene 2 (hands, skinned)
 
         // Matrices captured at recording time
         D3DXMATRIX view, proj;
@@ -698,6 +700,8 @@ public:
 
         void clear() {
             recordedCalls.clear();
+            recordedCallsScene1.clear();
+            recordedCallsScene2.clear();
             rasterizedOccluderMeshes.clear();
             bboxLookup.clear();
             lastLightState.reset();
@@ -713,6 +717,8 @@ public:
 
         void reserve() {
             recordedCalls.reserve(4000);
+            recordedCallsScene1.reserve(100);   // Particles: moderate draws
+            recordedCallsScene2.reserve(50);    // Hands: far fewer draws
         }
     };
 
@@ -745,7 +751,7 @@ private:
     static bool manualRecordingControl;  // When true, user controls recording via K key
     static bool recordingEnabled;  // Global toggle for entire recording system
     static bool recordingCompletedThisFrame;  // Prevents restarting recording after Scene 0
-    static int currentRecordingScene;  // Scene number being recorded (0 = main, 1+ = hands/alpha)
+    static int currentRecordingScene;  // Scene number being recorded (0=world, 1=particles, 2=hands)
     static bool hiZBuiltThisFrame;  // Prevents rebuilding Hi-Z pyramid multiple times per frame
     static bool dumpRequested;  // When true, preserve calls for dump
 
@@ -789,9 +795,11 @@ public:
     static void finalizeBatchAndSubmitCull();  // Stop recording, submit to cull thread (before renderStage1)
     static void waitCullAndReplay();           // Wait for cull, replay, restore state (after renderStageBlend)
     static void capturePostRecordingState();   // Capture MW device state at end of Scene 0 (recording continues)
-    static void restorePostRecordingState();   // Clean up device state for Scene 1+ (shaders, textures)
+    static void restorePostRecordingState();   // Clean up device state for Scene 1/2 (shaders, textures)
     static void finalizeAndRender(DLContext* frameCtx, bool waterSeen); // Prepare + render phase at frame finalize point
+    static void finalizeAndRenderAllScenes(DLContext* frameCtx, bool waterSeen); // Full deferred GPU phase at UI BeginScene
     static void executeGpuPhase(int bufferIndex); // GPU render block — called by render thread or inline
+    static void replayScene1And2(FrameBuffer* fb);  // Replay Scene 1/2 at UI BeginScene (after recording)
 
     // Scene lifecycle for triple-buffered pipeline
     static void markSceneStart(int sceneNum, bool isUI = false);
@@ -817,6 +825,7 @@ public:
     static void setRecordingState(bool recording) { isRecording = recording; }
     static void resetRecordingCompletedFlag() { recordingCompletedThisFrame = false; currentRecordingScene = 0; }
     static void setCurrentRecordingScene(int scene) { currentRecordingScene = scene; }
+    static int getCurrentRecordingScene() { return currentRecordingScene; }
     static void resetHiZBuiltFlag() { hiZBuiltThisFrame = false; }
     static void setReplayingState(bool replaying) { isReplaying = replaying; }
     static void setManualRecordingControl(bool manual) { manualRecordingControl = manual; }

@@ -121,7 +121,7 @@ struct D3DCmd {
 };
 
 enum class CmdStage : uint8_t {
-    Offscreen, PreScene, Scene0, InterScene, Scene1Plus, UI, Count
+    Offscreen, PreScene, Scene0, InterScene, Scene1, Scene2, UI, Count
 };
 
 const char* CmdStageName(CmdStage s);

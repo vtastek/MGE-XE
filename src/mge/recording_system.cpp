@@ -22,8 +22,17 @@ extern D3DCommandBufferSet g_cmdBufferSet;
 // File-scope helpers for recording system
 static std::unordered_map<IDirect3DBaseTexture9*, std::pair<DWORD, DWORD>> samplerCache;
 
+// Route to correct vector based on current recording scene
+// Scene 0 = world, Scene 1 = particles (alpha sorted), Scene 2 = hands (skinned)
 static auto& currentRecordedCalls() {
-    return FixedFunctionShader::frameBuffers[FixedFunctionShader::recordingBuffer].recordedCalls;
+    auto& fb = FixedFunctionShader::frameBuffers[FixedFunctionShader::recordingBuffer];
+    int scene = FixedFunctionShader::getCurrentRecordingScene();
+    if (scene == 1) {
+        return fb.recordedCallsScene1;
+    } else if (scene >= 2) {
+        return fb.recordedCallsScene2;
+    }
+    return fb.recordedCalls;
 }
 
 // Diagnostic: cache hit/miss logging for first N frames (temporary)
@@ -424,7 +433,7 @@ void FixedFunctionShader::stopRecordingAndReplay() {
 
     // Restore Morrowind's end-of-Scene-0 state (last mesh state, not first mesh state).
     // This undoes any state changes from replay/HLSL rendering, and also cleans up
-    // leaked state from previous frame's Scene 1+ immediate rendering.
+    // leaked state from previous frame's Scene 1/2 immediate rendering.
     endState.applyRenderStatesTo((IDirect3DDevice9*)device);
 
 
@@ -571,22 +580,31 @@ void FixedFunctionShader::waitCullAndReplay() {
 void FixedFunctionShader::finalizeBatchAndReplay(int sceneCount) {
     if (recordingEnabled) {
         if (sceneCount == 0) {
-            // Scene 0: recording continues through Scene 1+
+            // Scene 0: recording continues through Scene 1/2
             // capturePostRecordingState() already saved device state
             // finalizeAndRender() will do the actual prepare+render later
-        } else {
-            // Scene 1+: recording continues, no-op
-            // Calls accumulate into the same buffer for unified replay
+        } else if (sceneCount == 1) {
+            // Scene 1 (particles): log recording count, continue recording
+            auto& fb = frameBuffers[recordingBuffer];
+            LOG::logline("Scene 1 (particles) recording: %d calls", fb.recordedCallsScene1.size());
+        } else if (sceneCount >= 2) {
+            // Scene 2+ (hands): log recording count, continue recording
+            auto& fb = frameBuffers[recordingBuffer];
+            LOG::logline("Scene %d recording: scene2 buffer=%d calls", sceneCount, fb.recordedCallsScene2.size());
         }
+        // sceneCount < 0: pre-scene, ignore
     } else {
         // When recording disabled, still clear calls after potential dump
-        currentRecordedCalls().clear();
+        auto& fb = frameBuffers[recordingBuffer];
+        fb.recordedCalls.clear();
+        fb.recordedCallsScene1.clear();
+        fb.recordedCallsScene2.clear();
         resetHLSLCaches();
     }
 }
 
 // capturePostRecordingState - Capture MW device state at end of Scene 0
-// Recording continues through Scene 1+; this just saves what we need to restore later.
+// Recording continues through Scene 1/2; this just saves what we need to restore later.
 void FixedFunctionShader::capturePostRecordingState() {
     if (!isRecording) return;
 
@@ -614,13 +632,13 @@ void FixedFunctionShader::capturePostRecordingState() {
 
 }
 
-// restorePostRecordingState - Clean up device state for Scene 1+ after HLSL recording
+// restorePostRecordingState - Clean up device state for Scene 1/2 after HLSL recording
 // Called at EndScene 0 in deferred HLSL mode so particles/hands render correctly.
 // NOTE: State restoration for suppression mode now happens in executeGpuPhase().
 void FixedFunctionShader::restorePostRecordingState() {
     if (!isRecording) return;
 
-    // Stop recording - Scene 0 calls are captured, Scene 1+ will use immediate path
+    // Stop recording - Scene 0 calls are captured, Scene 1/2 will use immediate path
     // Recording will be finalized at finalizeAndRender
     isRecording = false;
 
@@ -631,12 +649,12 @@ void FixedFunctionShader::restorePostRecordingState() {
         textureCache.textureValid[i] = false;
     }
 
-    // Clear shaders so Scene 1+ uses fixed-function or gets fresh shader setup
+    // Clear shaders so Scene 1/2 uses fixed-function or gets fresh shader setup
     device->SetVertexShader(NULL);
     device->SetPixelShader(NULL);
 
     // Reset all HLSL caches - shadow matrices, material cache, shader LRU
-    // This ensures Scene 1+ gets fresh state, not stale cached values from Scene 0
+    // This ensures Scene 1/2 gets fresh state, not stale cached values from Scene 0
     resetHLSLCaches();
 }
 
@@ -736,18 +754,18 @@ void FixedFunctionShader::finalizeAndRender(DLContext* frameCtx, bool waterSeen)
     {
         static bool loggedOnce = false;
         if (!loggedOnce) {
-            auto& recCalls = currentRecordedCalls();
-            int s0 = 0, s1 = 0;
-            for (const auto& c : recCalls) {
-                if (c.sceneNum == 0) s0++; else s1++;
+            auto& fb = frameBuffers[recordingBuffer];
+            int s0 = (int)fb.recordedCalls.size();
+            int s1 = (int)fb.recordedCallsScene1.size();
+            int s2 = (int)fb.recordedCallsScene2.size();
+            int m0 = 0, m1 = 0, m2 = 0;
+            for (const auto& m : fb.recordMW) {
+                if (m.sceneNum == 0) m0++;
+                else if (m.sceneNum == 1) m1++;
+                else m2++;
             }
-            int m0 = 0, m1 = 0;
-            auto& activeRecordMW = frameBuffers[recordingBuffer].recordMW;
-            for (const auto& m : activeRecordMW) {
-                if (m.sceneNum == 0) m0++; else m1++;
-            }
-            LOG::logline(">> finalizeAndRender: HLSL calls=%d (scene0=%d, scene1+=%d), recordMW=%d (scene0=%d, scene1+=%d)",
-                         (int)recCalls.size(), s0, s1, (int)activeRecordMW.size(), m0, m1);
+            LOG::logline(">> finalizeAndRender: HLSL scene0=%d, scene1=%d, scene2=%d; recordMW scene0=%d, scene1=%d, scene2=%d",
+                         s0, s1, s2, m0, m1, m2);
             loggedOnce = true;
         }
     }
@@ -841,11 +859,19 @@ void FixedFunctionShader::executeGpuPhase(int bufferIndex) {
     DistantLand::renderStageBlend(frameCtx, &fb);
 
     // Build HLSL replay into command buffer, then replay it
-    // Scene 0 + Scene 1+ always go through HLSL replay (recordMW populated by inspectIndexedPrimitive)
-    // Build HLSL replay into command buffer, then replay it
+    // Scene 0/1/2 all go through HLSL replay
     transitionTo(PhaseTransition::ReplayEntry);
     fb.hlslCmds.clear();
+
+    // Scene 0: World geometry
     replayRecordedCalls(0, &fb.hlslCmds);
+
+    // Scene 1: Particles (alpha sorted, blended)
+    replayRecordedCalls(1, &fb.hlslCmds);
+
+    // Scene 2: Hands (skinned, after Z-clear in MW but we replay without clear)
+    replayRecordedCalls(2, &fb.hlslCmds);
+
     fb.hlslCmds.replay(device);
     transitionTo(PhaseTransition::ReplayExit);
 
@@ -854,10 +880,10 @@ void FixedFunctionShader::executeGpuPhase(int bufferIndex) {
         DistantLand::renderStageWater(frameCtx);
     }
 
-    // NOTE: renderStage2 (depth for Scene 1+ hands) runs at EndScene(1+) in mged3d8device.cpp
-    // It cannot run here because Scene 1 hasn't happened yet at EndScene(0)
+    // NOTE: renderStage2 (depth for Scene 2 hands) runs at EndScene(1/2) in mged3d8device.cpp
+    // It cannot run here because Scene 1/2 haven't happened yet at EndScene(0)
 
-    // NOTE: postProcess moved to UI BeginScene to avoid RT/DS state corruption for Scene 1+
+    // NOTE: postProcess moved to UI BeginScene to avoid RT/DS state corruption for Scene 1/2
 
     // Clean up HLSL-only texture slots to prevent DXVK descriptor bloat
     for (int i = 2; i < 6; i++) {
@@ -868,7 +894,7 @@ void FixedFunctionShader::executeGpuPhase(int bufferIndex) {
     device->SetVertexShader(NULL);
     device->SetPixelShader(NULL);
 
-    // Restore Morrowind's end-of-Scene-0 state for Scene 1+
+    // Restore Morrowind's end-of-Scene-0 state for Scene 1/2
     if (ImGuiManager::GetStateSuppressionEnabled()) {
         // Suppression ON: replay full Scene0 buffer (materials, lights, textures, etc.)
         // StateContract only has a subset; Scene0 buffer has complete recorded state.
@@ -881,6 +907,160 @@ void FixedFunctionShader::executeGpuPhase(int bufferIndex) {
 
     isReplaying = false;
     resetHLSLCaches();
+}
+
+// Full deferred GPU phase at UI BeginScene - all scenes recorded, now render everything
+// Flow: Depth(Scene 0) → Depth(Scene 2) → Replay(0) → Replay(1) → Replay(2)
+void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool waterSeen) {
+    MGE_ZoneScopedN("finalizeAndRenderAllScenes");
+
+    if (!recordingEnabled) return;
+
+    auto& fb = frameBuffers[recordingBuffer];
+
+    LOG::logline("finalizeAndRenderAllScenes: scene0=%d, scene1=%d, scene2=%d",
+        (int)fb.recordedCalls.size(), (int)fb.recordedCallsScene1.size(), (int)fb.recordedCallsScene2.size());
+
+    // === SAVE UI TRANSFORMS ===
+    // MW set up UI view/projection before calling BeginScene. We need to restore these
+    // after 3D rendering so HUD draws correctly.
+    D3DXMATRIX savedUIView, savedUIProj;
+    device->GetTransform(D3DTS_VIEW, &savedUIView);
+    device->GetTransform(D3DTS_PROJECTION, &savedUIProj);
+
+    // === RESTORE ENDSCENE(0) STATE ===
+    // State was captured at EndScene(0), but MW ran Scene 1/2 since then.
+    // Restore to match baseline expectations for renderStage0GPU.
+    fb.stateContract.applyTo((IDirect3DDevice9*)device);
+
+    // === PREPARE ALL SCENES ===
+    {
+        MGE_ZoneScopedN("Prepare All Scenes");
+        prepareRecordedCalls(recordingBuffer);  // This now prepares Scene 0, 1, and 2
+        fb.state = BufferState::ReadyToRender;
+    }
+
+    // Store context in FrameBuffer
+    fb.dlContext = *frameCtx;
+    fb.waterSeen = waterSeen;
+
+    // === DEPTH PASSES ===
+    // Render depth for Scene 0 (world) and Scene 2 (hands)
+    // Scene 1 (particles) skipped - they're alpha blended, no depth write
+    {
+        MGE_ZoneScopedN("Depth Passes");
+
+        // Use renderStage1 for Scene 0 depth (includes shadows, distant land setup)
+        DistantLand::renderStage1(frameCtx, &fb);
+
+        // Render Scene 2 (hands) depth into the depth texture
+        // Filter for sceneNum >= 2 only
+        DistantLand::renderStage2(frameCtx, &fb);
+    }
+
+    // === REPLAY ALL SCENES ===
+    isReplaying = true;
+    {
+        MGE_ZoneScopedN("Replay All Scenes");
+
+        // Blend close objects over distant land (before replay)
+        DistantLand::renderStageBlend(frameCtx, &fb);
+
+        transitionTo(PhaseTransition::ReplayEntry);
+
+        // Replay Scene 0 (world)
+        replayRecordedCalls(0, nullptr);
+
+        // Replay Scene 1 (particles) - depth tested against Scene 0
+        replayRecordedCalls(1, nullptr);
+
+        // Replay Scene 2 (hands) - rendered on top
+        replayRecordedCalls(2, nullptr);
+
+        transitionTo(PhaseTransition::ReplayExit);
+    }
+
+    // Water surface AFTER replay
+    if (waterSeen) {
+        DistantLand::renderStageWater(frameCtx);
+    }
+
+    // Clean up HLSL state (textures, shaders)
+    for (int i = 2; i < 6; i++) {
+        device->SetTexture(i, NULL);
+        textureCache.updateCache(i, nullptr);
+        textureCache.textureValid[i] = false;
+    }
+    device->SetVertexShader(NULL);
+    device->SetPixelShader(NULL);
+
+    // === RESTORE UI STATE ===
+    // MW set up UI view/projection before calling BeginScene. Restore them so HUD draws correctly.
+    device->SetTransform(D3DTS_VIEW, &savedUIView);
+    device->SetTransform(D3DTS_PROJECTION, &savedUIProj);
+
+    // MW cleared depth buffer before BeginScene, but we filled it with 3D scene.
+    // Clear it again so UI draws aren't depth-tested against 3D geometry.
+    device->Clear(0, NULL, D3DCLEAR_ZBUFFER, 0, 1.0f, 0);
+
+    isReplaying = false;
+    resetHLSLCaches();
+}
+
+// Replay Scene 1 and Scene 2 at UI BeginScene (after they've been recorded)
+// Called separately from executeGpuPhase because Scene 1/2 are recorded AFTER EndScene(0)
+void FixedFunctionShader::replayScene1And2(FrameBuffer* fb) {
+    if (!fb) return;
+
+    // Prepare Scene 1/2 if not already done (shader keys, bins)
+    // Scene 0 was prepared in executeGpuPhase, but we need to prepare 1/2 now
+    {
+        MGE_ZoneScopedN("Prepare Scene 1/2");
+        for (auto& call : fb->recordedCallsScene1) {
+            if (!call.prepared) {
+                call.sk = computeShaderKeyWithSuffixes(&call.rs, &call.frs, call.lightrs.get());
+                call.prepared = true;
+                call.shouldRender = true;
+
+                if (call.sk.hasGrass)              call.bin = RenderBin::Grass;
+                else if (call.sk.usesSkinning)     call.bin = RenderBin::Skinning;
+                else if (call.rs.blendEnable)      call.bin = RenderBin::Blending;
+                else if (call.rs.alphaTest)        call.bin = RenderBin::AlphaTested;
+                else                               call.bin = RenderBin::Opaque;
+            }
+        }
+        for (auto& call : fb->recordedCallsScene2) {
+            if (!call.prepared) {
+                call.sk = computeShaderKeyWithSuffixes(&call.rs, &call.frs, call.lightrs.get());
+                call.prepared = true;
+                call.shouldRender = true;
+
+                if (call.sk.hasGrass)              call.bin = RenderBin::Grass;
+                else if (call.sk.usesSkinning)     call.bin = RenderBin::Skinning;
+                else if (call.rs.blendEnable)      call.bin = RenderBin::Blending;
+                else if (call.rs.alphaTest)        call.bin = RenderBin::AlphaTested;
+                else                               call.bin = RenderBin::Opaque;
+            }
+        }
+    }
+
+    // Skip if nothing to replay
+    if (fb->recordedCallsScene1.empty() && fb->recordedCallsScene2.empty()) {
+        return;
+    }
+
+    LOG::logline("replayScene1And2: scene1=%d, scene2=%d calls",
+        (int)fb->recordedCallsScene1.size(), (int)fb->recordedCallsScene2.size());
+
+    isReplaying = true;
+
+    // Replay Scene 1 (particles)
+    replayRecordedCalls(1, nullptr);
+
+    // Replay Scene 2 (hands)
+    replayRecordedCalls(2, nullptr);
+
+    isReplaying = false;
 }
 
 // Scene lifecycle stubs for triple-buffered pipeline (Step 1: no-op, infrastructure only)
@@ -1166,16 +1346,8 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
     // Warm suffix cache on main thread (device calls not safe off main thread)
     TextureSuffix::warmCache((IDirect3DDevice9*)device, rs->texture);
 
-    // Log per-bin frame event (we know the bin from sk and rs at record time)
-    {
-        FrameEvent::Type evType;
-        if (sk.hasGrass)              evType = FrameEvent::DIP_Grass;
-        else if (sk.usesSkinning)     evType = FrameEvent::DIP_Skinning;
-        else if (rs->blendEnable)     evType = FrameEvent::DIP_Blending;
-        else if (rs->alphaTest)       evType = FrameEvent::DIP_AlphaTested;
-        else                          evType = FrameEvent::DIP_Opaque;
-        ImGuiManager::LogFrameEvent(evType, 0, rs->primCount);
-    }
+    // NOTE: DIP events are already logged in mged3d8device.cpp DrawIndexedPrimitive
+    // before reaching this recording path. Do NOT log again here to avoid double-counting.
 
     {
         currentRecordedCalls().emplace_back(rs, frs, sharedLightState, sk, recordMWIdx);

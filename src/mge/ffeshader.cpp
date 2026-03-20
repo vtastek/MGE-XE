@@ -636,7 +636,7 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
         return;
     }
 
-    // Debug: Log device state for PPL Scene 1+ draws (first few per frame)
+    // Debug: Log device state for PPL Scene 1/2 draws (first few per frame)
     static int pplDrawLogCount = 0;
     static int lastFrameLogged = -1;
     int currentFrame = hlslDiagFrameCounter;
@@ -644,7 +644,7 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
         pplDrawLogCount = 0;
         lastFrameLogged = currentFrame;
     }
-    // Log for Scene 1+ (blend enabled, likely particles)
+    // Log for Scene 1/2 (blend enabled = particles, skinned = hands)
     if (rs->blendEnable && pplDrawLogCount < 3) {
         D3DXMATRIX proj, view, world;
         device->GetTransform(D3DTS_PROJECTION, &proj);
@@ -2213,7 +2213,7 @@ struct FrameSnapshot {
 
         // Pipeline control-flow state
         fprintf(f, "[pipeline]\n");
-        fprintf(f, "dip=%d,%d,%d,%d,%d,%d\n", pipeline.dipScene0, pipeline.dipScene1plus,
+        fprintf(f, "dip=%d,%d,%d,%d,%d,%d\n", pipeline.dipScene0, pipeline.dipScene1,
             pipeline.dipOffscreen, pipeline.dipUI, pipeline.dipStencilShadow, pipeline.dipUnknown);
         fprintf(f, "sceneCount=%d\n", pipeline.sceneCount);
         fprintf(f, "flags=%d,%d,%d,%d,%d,%d,%d,%d\n",
@@ -2293,7 +2293,7 @@ struct FrameSnapshot {
                 int i0,i1,i2,i3,i4,i5,i6,i7;
                 unsigned int u0;
                 if (sscanf(line, "dip=%d,%d,%d,%d,%d,%d", &i0,&i1,&i2,&i3,&i4,&i5) == 6) {
-                    pipeline.dipScene0=i0; pipeline.dipScene1plus=i1; pipeline.dipOffscreen=i2;
+                    pipeline.dipScene0=i0; pipeline.dipScene1=i1; pipeline.dipOffscreen=i2;
                     pipeline.dipUI=i3; pipeline.dipStencilShadow=i4; pipeline.dipUnknown=i5;
                 } else if (sscanf(line, "sceneCount=%d", &pipeline.sceneCount) == 1) {
                 } else if (sscanf(line, "flags=%d,%d,%d,%d,%d,%d,%d,%d", &i0,&i1,&i2,&i3,&i4,&i5,&i6,&i7) == 8) {
@@ -2444,7 +2444,7 @@ struct FrameSnapshot {
         DIAG_DIFF_BOOL(isPPLActive, "isPPLActive");
         DIAG_DIFF_BOOL(mwLoaded, "mwLoaded");
         DIAG_DIFF_INT(dipScene0, "dipScene0");
-        DIAG_DIFF_INT(dipScene1plus, "dipScene1plus");
+        DIAG_DIFF_INT(dipScene1, "dipScene1");
         DIAG_DIFF_INT(dipOffscreen, "dipOffscreen");
         DIAG_DIFF_INT(dipUI, "dipUI");
         DIAG_DIFF_INT(dipStencilShadow, "dipStencilShadow");

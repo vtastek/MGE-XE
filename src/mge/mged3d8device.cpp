@@ -67,7 +67,19 @@ static int g_lastCmdBufferSize = 0;
 
 // DIP counters
 static ImGuiManager::DIPBinStats g_dipBinStats = {};
-static int g_dipScene0 = 0, g_dipScene1plus = 0;
+static int g_dipScene0 = 0, g_dipScene1 = 0, g_dipScene2 = 0;
+
+// Per-scene draw characteristic tracking (to understand what each scene contains)
+struct SceneDrawStats {
+    int total = 0;
+    int skinned = 0;      // vertexBlendState != 0
+    int blended = 0;      // blendEnable
+    int zWriting = 0;     // zWrite
+    int alphaTested = 0;  // alphaTest
+    void reset() { total = skinned = blended = zWriting = alphaTested = 0; }
+};
+static SceneDrawStats g_sceneStats[4];  // Scene 0, 1, 2, 3+
+static bool g_sceneStatsLogged = false;
 
 // Frame counter for display and correlation with logs
 static int g_frameNumber = 0;
@@ -131,12 +143,12 @@ static void processImGuiHotkeys() {
 //
 // Suppression phases:
 //   Off-screen (local map, inventory): suppress=false, forward to device
-//   Scene0/Scene1+ recording:          suppress=true, record only (render thread owns device)
+//   Scene0/1/2 recording:              suppress=true, record only (render thread owns device)
 //   UI/HUD after sync:                 suppress=false, forward to device
 static inline bool shouldSuppressMWState() {
     // Phase B: Suppression enabled via ImGui toggle for testing.
     // When enabled:
-    // - Scene 0 MW calls record to command buffer only (no device forwarding)
+    // - Scene 0/1 MW calls record to command buffer only (no device forwarding)
     // - State capture uses tracked values (MWStateTracker) instead of GetXXX
     // - State restore replays command buffer to device
     //
@@ -149,10 +161,11 @@ static inline bool shouldSuppressMWState() {
         return false;
     }
 
-    // Only suppress during Scene 0 HLSL recording
+    // Suppress during Scene 0, 1, 2 HLSL recording
+    // sceneCount starts at -1, so after increment: Scene 0=0, Scene 1=1, Scene 2=2
     return isHLSLActive()
         && FixedFunctionShader::getIsRecording()
-        && g_scene.sceneCount == 0;
+        && g_scene.sceneCount <= 2;
 }
 
 
@@ -212,11 +225,11 @@ static void recordUIStatePreamble(IDirect3DDevice9* dev, D3DCommandBuffer& buf) 
     // FVF — MW doesn't set FVF before first UI DIP, inherits from scene rendering
     dev->GetFVF(&val);                          buf.recordSetFVF(val);
 
-    // Viewport — MW sets it before BeginScene (goes to Scene1Plus buffer, not UI)
+    // Viewport — MW sets it before BeginScene (goes to Scene 1/2 buffer, not UI)
     D3DVIEWPORT9 vp;
     dev->GetViewport(&vp);                      buf.recordSetViewport(&vp);
 
-    // Transforms — MW sets VIEW/PROJ before BeginScene (goes to Scene1Plus buffer, not UI)
+    // Transforms — MW sets VIEW/PROJ before BeginScene (goes to Scene 1/2 buffer, not UI)
     D3DMATRIX mat;
     dev->GetTransform(D3DTS_VIEW, &mat);        buf.recordSetTransform(D3DTS_VIEW, &mat);
     dev->GetTransform(D3DTS_PROJECTION, &mat);   buf.recordSetTransform(D3DTS_PROJECTION, &mat);
@@ -479,7 +492,8 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         ImGuiManager::UpdateDIPStats(g_dipBinStats);
         g_dipBinStats.reset();
         g_dipScene0 = 0;
-        g_dipScene1plus = 0;
+        g_dipScene1 = 0;
+        g_dipScene2 = 0;
     }
 
     // Snapshot frame events for ImGui display
@@ -493,7 +507,7 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
             g_cmdBufferSet[CmdStage::PreScene].size(),
             g_cmdBufferSet[CmdStage::Scene0].size(),
             g_cmdBufferSet[CmdStage::InterScene].size(),
-            g_cmdBufferSet[CmdStage::Scene1Plus].size(),
+            g_cmdBufferSet[CmdStage::Scene1].size() + g_cmdBufferSet[CmdStage::Scene2].size(),
             g_cmdBufferSet[CmdStage::UI].size());
         g_cmdBufferSet.clearAll();
     }
@@ -502,7 +516,7 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
     {
         auto mwb = MWBridge::get();
         g_pipelineDiag.dipScene0 = g_dipScene0;
-        g_pipelineDiag.dipScene1plus = g_dipScene1plus;
+        g_pipelineDiag.dipScene1 = g_dipScene1 + g_dipScene2;
         g_pipelineDiag.dipOffscreen = g_dipBinStats.offscreen;
         g_pipelineDiag.dipUI = g_dipBinStats.ui;
         g_pipelineDiag.dipStencilShadow = g_dipBinStats.stencilShadow;
@@ -741,28 +755,55 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
             g_scene.isHUDready = true;
         }
 
-        if (g_scene.isMainView) {
+        // Scene 1/2 (particles, hands) may use view matrices that trigger detectMenu() false positive.
+        // Force main view path for Scene 1/2 after we've had a valid Scene 0.
+        // sceneCount starts at -1. After Scene 0 increment it's 0, after Scene 1 it's 1.
+        // Main menu has sceneCount=-1 and isMainView=false - must NOT override that.
+        bool isScene12Override = g_scene.sceneCount >= 0 && g_scene.sceneCount < 2;
+        if (g_scene.isMainView || isScene12Override) {
             // Track scene count here in BeginScene
             // g_scene.isMainView is not always valid at EndScene if Morrowind draws sunglare
             ++g_scene.sceneCount;
 
             // Stage transitions for per-stage command buffers
+            // sceneCount starts at -1; after increment: 0=Scene0, 1=Scene1, 2=Scene2
             if (g_scene.sceneCount == 0) {
+                // Scene 0 (world) - first main scene
                 g_cmdBufferSet.activeStage = CmdStage::Scene0;
             } else if (g_scene.sceneCount == 1) {
-                g_cmdBufferSet.activeStage = CmdStage::Scene1Plus;
+                // Scene 1 (particles)
+                g_cmdBufferSet.activeStage = CmdStage::Scene1;
                 // Step 3b: Sync point for async render thread
-                // Wait for GPU phase to complete before Scene 1+ draws
+                // Wait for GPU phase to complete before Scene 1 draws
                 if (isHLSLActive() && g_scene.stage0Complete && g_renderThread && g_renderThread->isPending()) {
                     g_renderThread->waitForCompletion();
                 }
                 // Phase transition: Scene1Entry - validates state matches RecordingExit
                 if (isHLSLActive()) {
                     FixedFunctionShader::transitionTo(PhaseTransition::Scene1Entry);
+
+                    // Start recording Scene 1 (particles) to separate vector
+                    FixedFunctionShader::setCurrentRecordingScene(1);
+                    FixedFunctionShader::setRecordingState(true);
+                    LOG::logline("BeginScene(1): Started Scene 1 (particles) recording, isRecording=%d", FixedFunctionShader::getIsRecording());
                 }
+            } else if (g_scene.sceneCount == 2) {
+                // Scene 2 (hands)
+                g_cmdBufferSet.activeStage = CmdStage::Scene2;
+                if (isHLSLActive()) {
+                    // Continue recording Scene 2 (hands)
+                    FixedFunctionShader::setCurrentRecordingScene(2);
+                    FixedFunctionShader::setRecordingState(true);
+                    LOG::logline("BeginScene(2): Started Scene 2 (hands) recording, isRecording=%d", FixedFunctionShader::getIsRecording());
+                }
+            } else if (g_scene.sceneCount > 2 && isHLSLActive()) {
+                // Scene 3+: Continue recording (unlikely, but handle gracefully)
+                FixedFunctionShader::setCurrentRecordingScene(g_scene.sceneCount);
+                FixedFunctionShader::setRecordingState(true);
+                LOG::logline("BeginScene(%d): Continued recording, isRecording=%d", g_scene.sceneCount, FixedFunctionShader::getIsRecording());
             }
 
-            // Set any custom FOV and check distant water state
+            // Set any custom FOV and check distant water state (Scene 0 = post-increment 0)
             if (g_scene.sceneCount == 0) {
                 // Log offscreen local map timing if any offscreen work happened
                 if (g_offscreen.timingActive) {
@@ -777,14 +818,27 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
         } else {
             // UI scene — frame finalize point
             if (isHLSLActive()) {
+                // Stop Scene 1/2 recording before UI
+                if (FixedFunctionShader::getIsRecording()) {
+                    FixedFunctionShader::setRecordingState(false);
+                    auto& fb = FixedFunctionShader::frameBuffers[FixedFunctionShader::recordingBuffer];
+                    LOG::logline("Scene 1+2 recording complete: scene1=%d, scene2=%d calls",
+                        fb.recordedCallsScene1.size(), fb.recordedCallsScene2.size());
+                }
                 FixedFunctionShader::transitionTo(PhaseTransition::UIEntry);
             }
             g_cmdBufferSet.activeStage = CmdStage::UI;
             if (DistantLand::ready && g_scene.sceneCount > 0 && !g_scene.isFrameComplete) {
                 ensureSceneActive();
 
-                // HLSL: finalizeAndRender runs at EndScene 0 (sync path).
-                // postProcess runs here at UI BeginScene (after Scene 1+) for both HLSL and legacy.
+                // HLSL: Full GPU phase now that ALL scenes are recorded
+                // Flow: Depth(0) → Depth(2) → Replay(0) → Replay(1) → Replay(2) → postProcess
+                if (isHLSLActive() && g_scene.stage0Complete) {
+                    FixedFunctionShader::finalizeAndRenderAllScenes(&frameCtx, g_scene.waterDrawn);
+                    FixedFunctionShader::transitionTo(PhaseTransition::GpuExit);
+                }
+
+                // postProcess runs here for both HLSL and legacy
                 DistantLand::postProcess(&frameCtx);
 
                 // Record state preamble AFTER finalizeAndRender — captures actual device state MW sees
@@ -824,12 +878,12 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
         // ~ If any alpha meshes are visible, they are sorted and drawn in another scene (except those with 'No Sorter' property)
         // ~ If 1st person or sunglare is visible, they are drawn in another scene after a Z clear
         if (g_scene.sceneCount == 0) {
-            // Transition to InterScene after Scene0 ends
+            // Transition to InterScene after Scene0 ends (sceneCount is 0 post-increment from -1)
             g_cmdBufferSet.activeStage = CmdStage::InterScene;
 
             if (isHLSLActive()) {
                 // HLSL path: do GPU work at EndScene 0 (sync, same timing as legacy)
-                // Scene 1+ draws happen after this, so Scene 0 must be complete first.
+                // Scene 1/2 draws happen after this, so Scene 0 must be complete first.
                 if (!g_scene.stage0Complete) {
                     frameCtx = DistantLand::captureStage0Context();
                     g_scene.stage0Complete = true;
@@ -838,14 +892,11 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
                 // Phase transition: RecordingExit - MW state at end of Scene 0
                 FixedFunctionShader::transitionTo(PhaseTransition::RecordingExit);
 
-                // Capture MW device state before replay (for Scene 1+ restoration)
+                // Capture MW device state before replay (for Scene 1/2 restoration)
                 FixedFunctionShader::capturePostRecordingState();
 
-                // Do GPU replay — finalizeAndRender internally saves/restores RT/DS
-                FixedFunctionShader::finalizeAndRender(&frameCtx, g_scene.waterDrawn);
-
-                // Phase transition: GpuExit - must match RecordingExit
-                FixedFunctionShader::transitionTo(PhaseTransition::GpuExit);
+                // DEFERRED: GPU work happens at UI BeginScene after all scenes recorded
+                // finalizeAndRender moved to UI BeginScene
             } else {
                 // Legacy path: interleaved GPU work as before
                 if (!g_scene.stage0Complete) {
@@ -892,14 +943,26 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
     // This ensures HLSL replay happens within the same scene, not deferred to next stage
     FixedFunctionShader::finalizeBatchAndReplay(g_scene.sceneCount);
 
-    // Render depth for Scene 1+ AFTER all geometry has been captured
+    // Render depth for Scene 1/2 - HLSL defers to UI BeginScene, legacy runs here
     if (!g_scene.isFrameComplete && g_scene.sceneCount > 0) {
-        if (isHLSLActive()) {
-            auto& fb = FixedFunctionShader::frameBuffers[FixedFunctionShader::recordingBuffer];
-            DistantLand::renderStage2(&frameCtx, &fb);
-        } else {
+        if (!isHLSLActive()) {
+            // Legacy path only - HLSL defers depth to UI BeginScene
             DistantLand::renderStage2(&frameCtx);
         }
+    }
+
+    // Log per-scene draw characteristics once (to understand what each scene contains)
+    if (!g_sceneStatsLogged && g_scene.sceneCount >= 1 && g_sceneStats[1].total > 0) {
+        LOG::logline("=== SCENE DRAW CHARACTERISTICS (first frame with data) ===");
+        for (int i = 0; i < 4; i++) {
+            auto& s = g_sceneStats[i];
+            if (s.total > 0) {
+                LOG::logline("Scene %d: total=%d, skinned=%d, blended=%d, zWrite=%d, alphaTest=%d",
+                    i, s.total, s.skinned, s.blended, s.zWriting, s.alphaTested);
+            }
+        }
+        LOG::logline("=== END SCENE CHARACTERISTICS ===");
+        g_sceneStatsLogged = true;
     }
 
     // Track offscreen scenes
@@ -1229,14 +1292,53 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
         dipEventType = FrameEvent::DIP_StencilShadow;
         g_dipBinStats.stencilShadow++;
     } else if (g_scene.sceneCount == 0) {
+        // Scene 0 (world) - sceneCount is 0 post-increment from -1
         dipCategory = "DIP_Scene0";
         g_dipScene0++;
         deferEventLog = true;  // Classified downstream by inspect/water/HLSL replay
-    } else if (g_scene.sceneCount > 0) {
+        // Track Scene 0 characteristics
+        auto& s = g_sceneStats[0];
+        s.total++;
+        if (rs.vertexBlendState != 0) s.skinned++;
+        if (rs.blendEnable) s.blended++;
+        if (rs.zWrite) s.zWriting++;
+        if (rs.alphaTest) s.alphaTested++;
+    } else if (g_scene.sceneCount == 1) {
+        // Scene 1 (particles) - sceneCount is 1 post-increment
+        dipCategory = "DIP_Scene1";
+        g_dipScene1++;
+        // Track Scene 1 characteristics
+        auto& s = g_sceneStats[1];
+        s.total++;
+        if (rs.vertexBlendState != 0) s.skinned++;
+        if (rs.blendEnable) s.blended++;
+        if (rs.zWrite) s.zWriting++;
+        if (rs.alphaTest) s.alphaTested++;
+        // Classify for DIP stats
+        if (rs.vertexBlendState != 0) {
+            dipEventType = FrameEvent::DIP_1P_Skinning;
+            g_dipBinStats.firstPersonSkinning++;
+        } else if (rs.blendEnable) {
+            dipEventType = FrameEvent::DIP_1P_Alpha;
+            g_dipBinStats.firstPersonAlpha++;
+        } else {
+            dipEventType = FrameEvent::DIP_1P_Other;
+            g_dipBinStats.firstPersonOther++;
+        }
+    } else if (g_scene.sceneCount >= 2) {
+        // Scene 2+ (hands, etc.) - sceneCount is 2+ post-increment
         snprintf(dipBuf, sizeof(dipBuf), "DIP_Scene%d", g_scene.sceneCount);
         dipCategory = dipBuf;
-        g_dipScene1plus++;
-        // Sub-classify Scene 1+ by render state
+        g_dipScene2++;
+        // Track Scene 2+ characteristics
+        int idx = (g_scene.sceneCount < 4) ? g_scene.sceneCount : 3;
+        auto& s = g_sceneStats[idx];
+        s.total++;
+        if (rs.vertexBlendState != 0) s.skinned++;
+        if (rs.blendEnable) s.blended++;
+        if (rs.zWrite) s.zWriting++;
+        if (rs.alphaTest) s.alphaTested++;
+        // Classify for DIP stats
         if (rs.vertexBlendState != 0) {
             dipEventType = FrameEvent::DIP_1P_Skinning;
             g_dipBinStats.firstPersonSkinning++;
@@ -1284,7 +1386,7 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
     if (!g_scene.isMainView && g_scene.rendertargetNormal && ImGuiManager::GetSuppressUI()) return D3D_OK;
     if (isShadowStencil && ImGuiManager::GetSuppressStencilShadow()) return D3D_OK;
     if (g_scene.sceneCount < 0 && g_scene.rendertargetNormal && ImGuiManager::GetSuppressPreScene()) return D3D_OK;
-    // Scene 1+ per-subcategory suppress
+    // Scene 1/2 per-subcategory suppress (particles/hands)
     if (g_scene.sceneCount > 0 && g_scene.rendertargetNormal && g_scene.isMainView && !isShadowStencil) {
         if (rs.vertexBlendState != 0 && ImGuiManager::GetSuppress1PSkinning()) return D3D_OK;
         if (rs.vertexBlendState == 0 && rs.blendEnable && ImGuiManager::GetSuppress1PAlpha()) return D3D_OK;
@@ -1298,6 +1400,35 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
 
     // Forward deferred scene to real device — AFTER all suppression checks
     ensureSceneActive();
+
+    // Scene 1/2 HLSL suppression — particles and hands are recorded, not drawn immediately
+    // Hands (Scene 2) use a different view matrix, so isMainView=false, but we still record them
+    if (g_scene.sceneCount >= 1 && g_scene.rendertargetNormal && !isShadowStencil
+        && isHLSLActive() && FixedFunctionShader::getIsRecording()) {
+        // Populate primitive fields (normally done in isMainView block)
+        rs.primType = a;
+        rs.baseIndex = baseVertexIndex;
+        rs.minIndex = b;
+        rs.vertCount = c;
+        rs.startIndex = d;
+        rs.primCount = e;
+        // Route through renderMorrowind for recording
+        FixedFunctionShader::renderMorrowind(&rs, &frs, &lightrs, -1);
+        return D3D_OK;  // Suppress MW draw
+    } else if (g_scene.sceneCount >= 1 && g_scene.rendertargetNormal && !isShadowStencil && isHLSLActive()) {
+        // Debug: Why isn't this being recorded?
+        static int scene12SkipLogCount = 0;
+        static int lastFrameLogged = -1;
+        if (lastFrameLogged != g_frameNumber) {
+            scene12SkipLogCount = 0;
+            lastFrameLogged = g_frameNumber;
+        }
+        if (scene12SkipLogCount < 5) {
+            LOG::logline("Scene %d DIP skipped recording: isRecording=%d, prims=%d",
+                g_scene.sceneCount, FixedFunctionShader::getIsRecording(), e);
+            scene12SkipLogCount++;
+        }
+    }
 
     if (DistantLand::ready && g_scene.rendertargetNormal && g_scene.isMainView && !isShadowStencil) {
         rs.primType = a;
@@ -1332,11 +1463,11 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
             if (g_scene.distantWater) {
                 if (!g_scene.waterDrawn) {
                     if (isHLSLActive() && g_scene.sceneCount == 0) {
-                        // HLSL Scene 0: flag for deferred rendering in GPU phase
+                        // HLSL Scene 0 (sceneCount=0 post-increment from -1): flag for deferred rendering in GPU phase
                         g_scene.waterDrawn = true;
                     } else {
-                        // Legacy mode, or HLSL Scene 1+: render water immediately
-                        // (Scene 1+ happens after GPU phase already ran)
+                        // Legacy mode, or HLSL Scene 1/2: render water immediately
+                        // (Scene 1/2 happens after GPU phase already ran)
                         DistantLand::renderStageWater(&frameCtx);
                         g_scene.waterDrawn = true;
                     }

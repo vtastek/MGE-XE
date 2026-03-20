@@ -362,6 +362,19 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         startRecording();
     }
 
+    // Debug: Log Scene 1/2 recording state (first few calls per frame)
+    static int scene12RecLogCount = 0;
+    static int lastRecFrame = -1;
+    if (currentRecordingScene > 0 && lastRecFrame != hlslDiagFrameCounter) {
+        scene12RecLogCount = 0;
+        lastRecFrame = hlslDiagFrameCounter;
+    }
+    if (currentRecordingScene > 0 && scene12RecLogCount < 3) {
+        LOG::logline("Scene %d draw: isRecording=%d, enableRec=%d",
+            currentRecordingScene, isRecording, ImGuiManager::GetEnableRecording());
+        scene12RecLogCount++;
+    }
+
     // If recording is active, record the call for batched replay
     if (isRecording && ImGuiManager::GetEnableRecording()) {
         // Create a copy of rs and add CURRENT shadow world-view-projection matrices for this draw call
@@ -379,21 +392,21 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         return;
     }
 
-    // Immediate path for hands (Scene 1+) and fallback when recording disabled.
+    // Immediate path for Scene 1/2 (particles/hands) and fallback when recording disabled.
     // Uses game's built-in 8 lights via lightrs, but needs shadow matrices computed.
     if (!ImGuiManager::GetEnableImmediateRendering()) {
         return;  // Skip immediate rendering if disabled
     }
 
-    // Debug: Log device state for Scene 1+ immediate draws (first few per frame)
-    static int scene1DrawLogCount = 0;
+    // Debug: Log device state for Scene 1/2 immediate draws (first few per frame)
+    static int scene12DrawLogCount = 0;
     static int lastFrameLogged = -1;
     int currentFrame = hlslDiagFrameCounter;
     if (currentFrame != lastFrameLogged) {
-        scene1DrawLogCount = 0;
+        scene12DrawLogCount = 0;
         lastFrameLogged = currentFrame;
     }
-    if (scene1DrawLogCount < 3) {
+    if (scene12DrawLogCount < 3) {
         D3DXMATRIX proj, view, world;
         device->GetTransform(D3DTS_PROJECTION, &proj);
         device->GetTransform(D3DTS_VIEW, &view);
@@ -406,11 +419,11 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         device->GetRenderState(D3DRS_POINTSCALE_B, &pointScaleB);
         device->GetRenderState(D3DRS_POINTSCALE_C, &pointScaleC);
 
-        LOG::logline(">> Scene1+ Immediate #%d: proj[0][0]=%.3f proj[3][2]=%.3f view[3][2]=%.3f world[3][0]=%.1f",
-            scene1DrawLogCount, proj._11, proj._34, view._34, world._41);
+        LOG::logline(">> Scene %d Immediate #%d: proj[0][0]=%.3f proj[3][2]=%.3f view[3][2]=%.3f world[3][0]=%.1f",
+            currentRecordingScene, scene12DrawLogCount, proj._11, proj._34, view._34, world._41);
         LOG::logline("   PointSprite: size=%08X scaleEnable=%d A=%08X B=%08X C=%08X",
             pointSize, pointScaleEnable, pointScaleA, pointScaleB, pointScaleC);
-        scene1DrawLogCount++;
+        scene12DrawLogCount++;
     }
 
     // Compute shadow world-view-projection matrices for this draw call
@@ -1500,7 +1513,18 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
 }
 
 void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* cmdBuf) {
-    auto& recCalls = currentRecordedCalls();
+    // Select buffer based on sceneCount parameter (not currentRecordingScene)
+    auto& fb = frameBuffers[recordingBuffer];
+    std::vector<HLSLRecordedCall>* recCallsPtr;
+    if (sceneCount == 1) {
+        recCallsPtr = &fb.recordedCallsScene1;
+    } else if (sceneCount >= 2) {
+        recCallsPtr = &fb.recordedCallsScene2;
+    } else {
+        recCallsPtr = &fb.recordedCalls;
+    }
+    auto& recCalls = *recCallsPtr;
+
     {
         if (recCalls.empty()) {
             return;
@@ -1522,7 +1546,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
     D3DXMATRIX currentProj = DistantLand::s_staging.mwProj;
 
     // Set active shadow pointer to recording-time matrices for replay
-    auto& fb = frameBuffers[recordingBuffer];
+    // (fb already declared at function start for buffer selection)
     s_activeShadowVP = fb.shadowViewproj;
 
     // Hi-Z culling statistics (shouldRender pre-set by executeHiZCulling)
@@ -1757,8 +1781,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
     bool firstDrawDone = false;
     for (size_t i = 0; i < numCalls; i++) {
         auto& call = recCalls[i];  // Non-const to update shader key
-        // No Z-clear between scenes: Scene 1+ depth-tests against Scene 0.
-        // Alpha-sorted objects properly occlude behind world geometry.
+        // No Z-clear between scenes: Scene 1/2 depth-tests against Scene 0.
+        // Alpha-sorted particles (Scene 1) properly occlude behind world geometry.
 
         // Track bin statistics
         binCounts[(int)call.bin]++;

@@ -178,7 +178,7 @@ void FixedFunctionShader::executeHiZCulling(const D3DXMATRIX& currentView, const
         int visibleCount = 0, culledCount = 0, noBboxCount = 0;
 
         for (auto& call : recCalls) {
-            // Scene 1+ (hands/alpha after Z-clear): always visible, skip Hi-Z test
+            // Scene 1 (particles) / Scene 2 (hands): always visible, skip Hi-Z test
             if (call.sceneNum > 0) {
                 call.shouldRender = true;
                 if (call.recordMWIndex >= 0 && call.recordMWIndex < (int)visibilityResults.size()) {
@@ -356,10 +356,8 @@ void FixedFunctionShader::matchPreviousFrameCalls(int bufferIndex) {
 void FixedFunctionShader::prepareRecordedCalls(int bufferIndex) {
     MGE_ZoneScopedN("prepareRecordedCalls");
 
-    auto& recCalls = frameBuffers[bufferIndex].recordedCalls;
-    if (recCalls.empty()) {
-        return;
-    }
+    auto& fb = frameBuffers[bufferIndex];
+    auto& recCalls = fb.recordedCalls;
 
     // Compute shader keys and assign render bins (with slow-frame timing)
     LARGE_INTEGER freqQPC, prepStartQPC, prepEndQPC;
@@ -367,6 +365,8 @@ void FixedFunctionShader::prepareRecordedCalls(int bufferIndex) {
     QueryPerformanceCounter(&prepStartQPC);
     {
         MGE_ZoneScopedN("Prepare: Shader Keys + Bins");
+
+        // Scene 0: World geometry
         for (auto& call : recCalls) {
             call.sk = computeShaderKeyWithSuffixes(&call.rs, &call.frs, call.lightrs.get());
             call.prepared = true;
@@ -375,8 +375,34 @@ void FixedFunctionShader::prepareRecordedCalls(int bufferIndex) {
             if (call.sk.hasGrass)              call.bin = RenderBin::Grass;
             else if (call.sk.usesSkinning)     call.bin = RenderBin::Skinning;
             else if (call.rs.blendEnable)      call.bin = RenderBin::Blending;
-            else if (call.rs.alphaTest)         call.bin = RenderBin::AlphaTested;
-            else                                call.bin = RenderBin::Opaque;
+            else if (call.rs.alphaTest)        call.bin = RenderBin::AlphaTested;
+            else                               call.bin = RenderBin::Opaque;
+        }
+
+        // Scene 1: Particles (always visible, no Hi-Z culling)
+        for (auto& call : fb.recordedCallsScene1) {
+            call.sk = computeShaderKeyWithSuffixes(&call.rs, &call.frs, call.lightrs.get());
+            call.prepared = true;
+            call.shouldRender = true;
+
+            if (call.sk.hasGrass)              call.bin = RenderBin::Grass;
+            else if (call.sk.usesSkinning)     call.bin = RenderBin::Skinning;
+            else if (call.rs.blendEnable)      call.bin = RenderBin::Blending;
+            else if (call.rs.alphaTest)        call.bin = RenderBin::AlphaTested;
+            else                               call.bin = RenderBin::Opaque;
+        }
+
+        // Scene 2: Hands (always visible, no Hi-Z culling)
+        for (auto& call : fb.recordedCallsScene2) {
+            call.sk = computeShaderKeyWithSuffixes(&call.rs, &call.frs, call.lightrs.get());
+            call.prepared = true;
+            call.shouldRender = true;
+
+            if (call.sk.hasGrass)              call.bin = RenderBin::Grass;
+            else if (call.sk.usesSkinning)     call.bin = RenderBin::Skinning;
+            else if (call.rs.blendEnable)      call.bin = RenderBin::Blending;
+            else if (call.rs.alphaTest)        call.bin = RenderBin::AlphaTested;
+            else                               call.bin = RenderBin::Opaque;
         }
     }
     QueryPerformanceCounter(&prepEndQPC);

@@ -497,7 +497,7 @@ void D3DCommandBuffer::replayStateOnly(IDirect3DDevice9* device) const {
 // --- CmdStage names ---
 
 const char* CmdStageName(CmdStage s) {
-    static const char* names[] = { "Offscreen", "PreScene", "Scene0", "InterScene", "Scene1Plus", "UI" };
+    static const char* names[] = { "Offscreen", "PreScene", "Scene0", "InterScene", "Scene1", "Scene2", "UI" };
     return ((int)s < (int)CmdStage::Count) ? names[(int)s] : "Unknown";
 }
 

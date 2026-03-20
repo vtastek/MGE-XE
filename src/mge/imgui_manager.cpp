@@ -145,7 +145,7 @@ int ImGuiManager::cmdBufferSizeKB = 0;
 int ImGuiManager::cmdStagePreScene = 0;
 int ImGuiManager::cmdStageScene0 = 0;
 int ImGuiManager::cmdStageInterScene = 0;
-int ImGuiManager::cmdStageScene1Plus = 0;
+int ImGuiManager::cmdStageScene1 = 0;
 int ImGuiManager::cmdStageUI = 0;
 
 bool ImGuiManager::debugKeysEnabled = false;
@@ -397,7 +397,7 @@ void ImGuiManager::RenderDebugInterface() {
 
     if (ImGui::Begin("HLSL Pipeline Debug", &showDebugInterface, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::Checkbox("Enable Debug Hotkeys (F11/U/Y/L/F5/F6/K/O)", &debugKeysEnabled);
-        ImGui::Checkbox("Handover Logging (Scene 0/1+ state)", &handoverLogging);
+        ImGui::Checkbox("Handover Logging (Scene 0/1/2 state)", &handoverLogging);
         ImGui::SameLine();
         if (ImGui::Button("Save Baselines")) {
             FixedFunctionShader::saveCurrentAsBaseline();
@@ -415,7 +415,7 @@ void ImGuiManager::RenderDebugInterface() {
         ImGui::Checkbox("Enable Recording", &enableRecording);
         ImGui::SameLine();
         ImGui::Checkbox("Enable Replay", &enableReplay);
-        ImGui::Checkbox("Enable Immediate Rendering (Scene 1+)", &enableImmediateRendering);
+        ImGui::Checkbox("Enable Immediate Rendering (Scene 1/2)", &enableImmediateRendering);
         ImGui::Checkbox("Enable Depth Pass (recordMW)", &enableDepthPass);
         ImGui::Checkbox("Disable Hi-Z Culling (terrain hole diagnosis)", &disableHiZCulling);
 
@@ -446,7 +446,7 @@ void ImGuiManager::RenderDebugInterface() {
 
         // Depth buffer stats
         ImGui::Text("Depth Buffer (recordMW): %d geometries", debugRecordMWSize);
-        ImGui::Text("Scene 1+ Immediate Renders: %d", debugImmediateCount);
+        ImGui::Text("Scene 1/2 Immediate Renders: %d", debugImmediateCount);
 
         ImGui::Separator();
         ImGui::Text("Bounding Box Visualization");
@@ -502,14 +502,14 @@ void ImGuiManager::RenderDebugInterface() {
         ImGui::SameLine(); ImGui::Text("= %d", disp.water);
         if (suppressWater) { ImGui::SameLine(); ImGui::TextColored(ImVec4(0.5f,0.5f,1.0f,1.0f), "[wireframe]"); }
 
-        ImGui::Text("Scene 1+ (First Person / Alpha):");
-        ImGui::Checkbox("1P Skinning (Hands)##s1", &suppress1PSkinning);
+        ImGui::Text("Scene 1 (Particles) / Scene 2 (Hands):");
+        ImGui::Checkbox("Scene 2 Skinning (Hands)##s1", &suppress1PSkinning);
         ImGui::SameLine(); ImGui::Text("= %d", disp.firstPersonSkinning);
 
-        ImGui::Checkbox("1P Alpha (Sorted/Weather)##s1", &suppress1PAlpha);
+        ImGui::Checkbox("Scene 1 Alpha (Particles)##s1", &suppress1PAlpha);
         ImGui::SameLine(); ImGui::Text("= %d", disp.firstPersonAlpha);
 
-        ImGui::Checkbox("1P Other##s1", &suppress1POther);
+        ImGui::Checkbox("Scene 1/2 Other##s1", &suppress1POther);
         ImGui::SameLine(); ImGui::Text("= %d", disp.firstPersonOther);
 
         ImGui::Text("Pass-through:");
@@ -562,8 +562,8 @@ void ImGuiManager::RenderDebugInterface() {
         ImGui::SetItemTooltip("Suppress Scene 0 MW state calls to device. Uses tracked state for restore. Requires recording.");
         if (cmdBufferRecording || cmdBufferReplay) {
             ImGui::Text("  Commands: %d  Size: %d KB", cmdBufferCmdCount, cmdBufferSizeKB);
-            ImGui::Text("  Pre:%d S0:%d Inter:%d S1+:%d UI:%d",
-                cmdStagePreScene, cmdStageScene0, cmdStageInterScene, cmdStageScene1Plus, cmdStageUI);
+            ImGui::Text("  Pre:%d S0:%d Inter:%d S1/2:%d UI:%d",
+                cmdStagePreScene, cmdStageScene0, cmdStageInterScene, cmdStageScene1, cmdStageUI);
         }
 
         ImGui::Separator();
@@ -611,11 +611,11 @@ void ImGuiManager::UpdateCmdBufferStats(int cmdCount, int sizeKB) {
     cmdBufferSizeKB = sizeKB;
 }
 
-void ImGuiManager::UpdateCmdBufferPerStageStats(int preScene, int scene0, int interScene, int scene1Plus, int ui) {
+void ImGuiManager::UpdateCmdBufferPerStageStats(int preScene, int scene0, int interScene, int scene1, int ui) {
     cmdStagePreScene = preScene;
     cmdStageScene0 = scene0;
     cmdStageInterScene = interScene;
-    cmdStageScene1Plus = scene1Plus;
+    cmdStageScene1 = scene1;
     cmdStageUI = ui;
 }
 

@@ -407,14 +407,14 @@ private:
     static int cmdStagePreScene;          // Per-stage command counts
     static int cmdStageScene0;
     static int cmdStageInterScene;
-    static int cmdStageScene1Plus;
+    static int cmdStageScene1;            // Scene 1 (particles) + Scene 2 (hands) combined
     static int cmdStageUI;
 
     // Debug hotkey gating
     static bool debugKeysEnabled;         // Gate debug hotkeys (F11/U/Y/L/F5/F6) - default false
 
     // Scene handover logging (particle bug diagnostics)
-    static bool handoverLogging;          // Log state at Scene 0/1+ boundaries - default false
+    static bool handoverLogging;          // Log state at Scene 0/1/2 boundaries - default false
 public:
     static bool GetHandoverLogging() { return handoverLogging; }
     static void SetHandoverLogging(bool v) { handoverLogging = v; }
