@@ -759,6 +759,7 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     DWORD savedAlphaBlendEnable = 0, savedAlphaTestEnable = 0;
     DWORD savedZEnable = 0, savedZWriteEnable = 0;
     DWORD savedSpecularEnable = 0, savedLocalViewer = 0, savedNormalizeNormals = 0;
+    DWORD savedAmbientMatSrc = 0, savedDiffuseMatSrc = 0, savedEmissiveMatSrc = 0;
     if (!cmdBuf) {
         device->GetRenderState(D3DRS_ALPHABLENDENABLE, &savedAlphaBlendEnable);
         device->GetRenderState(D3DRS_ALPHATESTENABLE, &savedAlphaTestEnable);
@@ -767,6 +768,9 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         device->GetRenderState(D3DRS_SPECULARENABLE, &savedSpecularEnable);
         device->GetRenderState(D3DRS_LOCALVIEWER, &savedLocalViewer);
         device->GetRenderState(D3DRS_NORMALIZENORMALS, &savedNormalizeNormals);
+        device->GetRenderState(D3DRS_AMBIENTMATERIALSOURCE, &savedAmbientMatSrc);
+        device->GetRenderState(D3DRS_DIFFUSEMATERIALSOURCE, &savedDiffuseMatSrc);
+        device->GetRenderState(D3DRS_EMISSIVEMATERIALSOURCE, &savedEmissiveMatSrc);
     }
 
     // Set shaders
@@ -1622,6 +1626,9 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             device->SetRenderState(D3DRS_SPECULARENABLE, savedSpecularEnable);
             device->SetRenderState(D3DRS_LOCALVIEWER, savedLocalViewer);
             device->SetRenderState(D3DRS_NORMALIZENORMALS, savedNormalizeNormals);
+            device->SetRenderState(D3DRS_AMBIENTMATERIALSOURCE, savedAmbientMatSrc);
+            device->SetRenderState(D3DRS_DIFFUSEMATERIALSOURCE, savedDiffuseMatSrc);
+            device->SetRenderState(D3DRS_EMISSIVEMATERIALSOURCE, savedEmissiveMatSrc);
         }
     }
 
@@ -1659,6 +1666,20 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
     }
 
     isReplaying = true;
+
+    // Save render states before replay to restore after (replay skips per-call restore)
+    DWORD savedAlphaBlend = 0, savedAlphaTest = 0, savedZEnable = 0, savedZWrite = 0, savedZFunc = 0;
+    DWORD savedAmbientMat = 0, savedDiffuseMat = 0, savedEmissiveMat = 0;
+    if (!cmdBuf) {
+        device->GetRenderState(D3DRS_ALPHABLENDENABLE, &savedAlphaBlend);
+        device->GetRenderState(D3DRS_ALPHATESTENABLE, &savedAlphaTest);
+        device->GetRenderState(D3DRS_ZENABLE, &savedZEnable);
+        device->GetRenderState(D3DRS_ZWRITEENABLE, &savedZWrite);
+        device->GetRenderState(D3DRS_ZFUNC, &savedZFunc);
+        device->GetRenderState(D3DRS_AMBIENTMATERIALSOURCE, &savedAmbientMat);
+        device->GetRenderState(D3DRS_DIFFUSEMATERIALSOURCE, &savedDiffuseMat);
+        device->GetRenderState(D3DRS_EMISSIVEMATERIALSOURCE, &savedEmissiveMat);
+    }
 
     // Reset to baseline state at start of each scene replay to prevent cross-scene leaks
     setReplayBaseline(cmdBuf, device);
@@ -2287,6 +2308,18 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
 
     // N-1: Mark rendering buffer as available after replay
     getRenderingBuffer().state = BufferState::Available;
+
+    // Restore render states after replay completes
+    if (!cmdBuf) {
+        device->SetRenderState(D3DRS_ALPHABLENDENABLE, savedAlphaBlend);
+        device->SetRenderState(D3DRS_ALPHATESTENABLE, savedAlphaTest);
+        device->SetRenderState(D3DRS_ZENABLE, savedZEnable);
+        device->SetRenderState(D3DRS_ZWRITEENABLE, savedZWrite);
+        device->SetRenderState(D3DRS_ZFUNC, savedZFunc);
+        device->SetRenderState(D3DRS_AMBIENTMATERIALSOURCE, savedAmbientMat);
+        device->SetRenderState(D3DRS_DIFFUSEMATERIALSOURCE, savedDiffuseMat);
+        device->SetRenderState(D3DRS_EMISSIVEMATERIALSOURCE, savedEmissiveMat);
+    }
 
     isReplaying = false;
 }

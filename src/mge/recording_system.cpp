@@ -1000,12 +1000,16 @@ void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool w
     // Save blend/alpha state - GPU phases will corrupt this
     DWORD savedAlphaBlend, savedSrcBlend, savedDestBlend;
     DWORD savedAlphaTest, savedAlphaRef, savedAlphaFunc;
+    DWORD savedZEnable, savedZWrite, savedZFunc;
     device->GetRenderState(D3DRS_ALPHABLENDENABLE, &savedAlphaBlend);
     device->GetRenderState(D3DRS_SRCBLEND, &savedSrcBlend);
     device->GetRenderState(D3DRS_DESTBLEND, &savedDestBlend);
     device->GetRenderState(D3DRS_ALPHATESTENABLE, &savedAlphaTest);
     device->GetRenderState(D3DRS_ALPHAREF, &savedAlphaRef);
     device->GetRenderState(D3DRS_ALPHAFUNC, &savedAlphaFunc);
+    device->GetRenderState(D3DRS_ZENABLE, &savedZEnable);
+    device->GetRenderState(D3DRS_ZWRITEENABLE, &savedZWrite);
+    device->GetRenderState(D3DRS_ZFUNC, &savedZFunc);
 
     // === RESTORE ENDSCENE(0) STATE ===
     // State was captured at EndScene(0), but MW ran Scene 1/2 since then.
@@ -1205,13 +1209,16 @@ void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool w
     // MW set up UI state before calling BeginScene. Restore it so HUD draws correctly.
     device->SetTransform(D3DTS_VIEW, &savedUIView);
     device->SetTransform(D3DTS_PROJECTION, &savedUIProj);
-    // Restore blend/alpha state (GPU phases corrupted these)
+    // Restore blend/alpha/depth state (GPU phases corrupted these)
     device->SetRenderState(D3DRS_ALPHABLENDENABLE, savedAlphaBlend);
     device->SetRenderState(D3DRS_SRCBLEND, savedSrcBlend);
     device->SetRenderState(D3DRS_DESTBLEND, savedDestBlend);
     device->SetRenderState(D3DRS_ALPHATESTENABLE, savedAlphaTest);
     device->SetRenderState(D3DRS_ALPHAREF, savedAlphaRef);
     device->SetRenderState(D3DRS_ALPHAFUNC, savedAlphaFunc);
+    device->SetRenderState(D3DRS_ZENABLE, savedZEnable);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, savedZWrite);
+    device->SetRenderState(D3DRS_ZFUNC, savedZFunc);
 
     // MW cleared depth buffer before BeginScene, but we filled it with 3D scene.
     // Clear it again so UI draws aren't depth-tested against 3D geometry.
