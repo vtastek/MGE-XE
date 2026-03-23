@@ -79,6 +79,22 @@ DLContext DistantLand::captureStage0Context() {
 void DistantLand::renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuffer* fb) {
     MGE_ZoneScopedN("DL_RenderStage0GPU");
 
+    // N-1 camera debug: Check if first recorded call's worldViewTransform matches ctx->mwView
+    {
+        static int logCount = 0;
+        if (fb && !fb->recordedCalls.empty() && logCount < 5) {
+            // Extract the view translation embedded in worldViewTransforms
+            // worldViewTransforms = world * view, so view._41 component is embedded
+            auto& firstCall = fb->recordedCalls[0];
+            float wvt_41 = firstCall.rs.worldViewTransforms[0]._41;
+            float w_41 = firstCall.rs.worldTransforms[0]._41;
+            // Embedded view contribution = worldView - world (approximate)
+            LOG::logline("[WVT] wvt._41=%.1f world._41=%.1f ctx.view._41=%.1f fb.currentView._41=%.1f",
+                wvt_41, w_41, ctx->mwView._41, fb->currentView._41);
+            logCount++;
+        }
+    }
+
     FixedFunctionShader::transitionTo(PhaseTransition::Stage0Entry);
 
     auto mwBridge = MWBridge::get();
@@ -364,13 +380,6 @@ void DistantLand::renderStage2(DLContext* ctx, FixedFunctionShader::FrameBuffer*
     auto& activeRecordMW = fb ? fb->recordMW : recordMW;
 
     // Count Scene 2 entries in recordMW
-    int s2InRecordMW = 0;
-    for (const auto& m : activeRecordMW) {
-        if (m.sceneNum == 2) s2InRecordMW++;
-    }
-    LOG::logline("[STAGE2] recordMW total=%d, scene2=%d, fb=%p, viewScene2_41=%.2f",
-        (int)activeRecordMW.size(), s2InRecordMW, fb, fb ? fb->viewScene2._41 : -999.0f);
-
     // Early out if nothing is happening
     if (activeRecordMW.empty()) {
         return;
@@ -1189,9 +1198,10 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
     int recordMWIdx = -1;
 
     // Select target recordMW/recordSky: per-buffer in HLSL mode, global static otherwise
+    // N-1: recording goes into recording buffer
     bool hlsl = isHLSLActive();
-    auto& targetRecordMW = hlsl ? FixedFunctionShader::currentFrameBuffer().recordMW : recordMW;
-    auto& targetRecordSky = hlsl ? FixedFunctionShader::currentFrameBuffer().recordSky : recordSky;
+    auto& targetRecordMW = hlsl ? FixedFunctionShader::getRecordingBuffer().recordMW : recordMW;
+    auto& targetRecordSky = hlsl ? FixedFunctionShader::getRecordingBuffer().recordSky : recordSky;
 
     // Capture z-writing draws, plus Hands (for depth texture even if zWrite=0)
     // World: only zWrite draws (skip multi-pass splatting and decals)

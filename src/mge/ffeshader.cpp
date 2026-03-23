@@ -57,8 +57,13 @@ unordered_map<FixedFunctionShader::ShaderKey, FixedFunctionShader::HLSLShader, F
 FixedFunctionShader::HLSLShaderLRU FixedFunctionShader::hlslShaderLRU;
 FixedFunctionShader::HLSLShader FixedFunctionShader::hlslShaderDefaultPurple;
 
-// Triple-buffered FrameBuffer infrastructure
-FixedFunctionShader::FrameBuffer FixedFunctionShader::frameBuffer;
+// N-1 buffered FrameBuffer infrastructure
+// recordingBuffer: currently recording frame N
+// renderingBuffer: contains frame N-1 data for replay
+FixedFunctionShader::FrameBuffer FixedFunctionShader::frameBuffers[2];
+int FixedFunctionShader::recordingBuffer = 0;
+int FixedFunctionShader::renderingBuffer = 1;
+bool FixedFunctionShader::n1Ready = false;  // Set true after first frame swap
 
 // Pipeline phase tracking for GPU call separation verification
 FixedFunctionShader::PipelinePhase FixedFunctionShader::currentPhase = FixedFunctionShader::PipelinePhase::Idle;
@@ -644,30 +649,6 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
     if (isHLSLActive()) {
         renderMorrowindHLSL(rs, frs, lightrs, recordMWIdx);
         return;
-    }
-
-    // Debug: Log device state for PPL particle draws (blendEnable && !zWrite)
-    static int pplParticleIdx = 0;
-    static int pplLastFrameLogged = -1;
-    int currentFrame = g_diagFrameCounter;
-    if (currentFrame != pplLastFrameLogged) {
-        pplParticleIdx = 0;
-        pplLastFrameLogged = currentFrame;
-    }
-    // Log only particle draws (blendEnable && !zWrite)
-    if (rs->blendEnable && !rs->zWrite && pplParticleIdx < 20) {
-        D3DXMATRIX proj, view;
-        device->GetTransform(D3DTS_PROJECTION, &proj);
-        device->GetTransform(D3DTS_VIEW, &view);
-
-        LOG::logline("[PPL] Particle #%d: world[0]=(%.2f,%.2f,%.2f,%.2f) world[1]=(%.2f,%.2f,%.2f,%.2f)",
-            pplParticleIdx,
-            rs->worldTransforms[0]._11, rs->worldTransforms[0]._12, rs->worldTransforms[0]._13, rs->worldTransforms[0]._14,
-            rs->worldTransforms[0]._21, rs->worldTransforms[0]._22, rs->worldTransforms[0]._23, rs->worldTransforms[0]._24);
-        LOG::logline("        view[3]=(%.2f,%.2f,%.2f) proj[0][0]=%.3f VB=%p primCount=%d",
-            view._41, view._42, view._43,
-            proj._11, rs->vb, rs->primCount);
-        pplParticleIdx++;
     }
 
     ID3DXEffect* effectFFE;
@@ -1858,22 +1839,33 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     return hlslShader;
 }
 
-void FixedFunctionShader::release() {
-    // Clear frame buffer first — releases COM refs before D3D device is destroyed
-    // This prevents crashes during DLL unload when static destructors run
-    frameBuffer.clear();
+// N-1 buffer rotation at Present()
+void FixedFunctionShader::swapBuffers() {
+    std::swap(recordingBuffer, renderingBuffer);
+    // Clear the new recording buffer (was just rendered)
+    frameBuffers[recordingBuffer].clear();
+    // After first swap, N-1 data is available in rendering buffer
+    n1Ready = true;
+}
 
-    // Release staging buffers (not released in clear() since they persist across frames)
-    if (frameBuffer.particleStagingVB) {
-        frameBuffer.particleStagingVB->Release();
-        frameBuffer.particleStagingVB = nullptr;
+void FixedFunctionShader::release() {
+    // Clear both frame buffers — releases COM refs before D3D device is destroyed
+    // This prevents crashes during DLL unload when static destructors run
+    for (int i = 0; i < 2; ++i) {
+        frameBuffers[i].clear();
+
+        // Release staging buffers (not released in clear() since they persist across frames)
+        if (frameBuffers[i].particleStagingVB) {
+            frameBuffers[i].particleStagingVB->Release();
+            frameBuffers[i].particleStagingVB = nullptr;
+        }
+        if (frameBuffers[i].particleStagingIB) {
+            frameBuffers[i].particleStagingIB->Release();
+            frameBuffers[i].particleStagingIB = nullptr;
+        }
+        frameBuffers[i].stagingVBSize = 0;
+        frameBuffers[i].stagingIBSize = 0;
     }
-    if (frameBuffer.particleStagingIB) {
-        frameBuffer.particleStagingIB->Release();
-        frameBuffer.particleStagingIB = nullptr;
-    }
-    frameBuffer.stagingVBSize = 0;
-    frameBuffer.stagingIBSize = 0;
 
     // Join precache thread before cleaning up HLSL cache
     if (precacheThread) {
@@ -2164,7 +2156,7 @@ static_assert(true, "Recording system extracted to recording_system.cpp");
 
 // Helper: get current recording buffer's calls vector
 static auto& currentRecordedCalls() {
-    return FixedFunctionShader::frameBuffer.recordedCalls;
+    return FixedFunctionShader::getRecordingBuffer().recordedCalls;
 }
 
 // ====== Full Pipeline A/B Diagnostic Snapshot System ======
@@ -2885,8 +2877,8 @@ static void fillSnapshotState(FrameSnapshot& snap) {
     snap.ffs_manualRecordingControl = FixedFunctionShader::getManualRecordingControl();
     snap.ffs_recordedCallCount = (int)FixedFunctionShader::getRecordedCallsCount();
 
-    // Single buffer state
-    auto& fb = FixedFunctionShader::currentFrameBuffer();
+    // N-1: Read recording buffer for diagnostic snapshot
+    auto& fb = FixedFunctionShader::getRecordingBuffer();
     snap.ffs_bufferState = (int)fb.state;
 
     // Camera and eye position

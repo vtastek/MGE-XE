@@ -12,9 +12,9 @@
 extern float lastPrepareMs;
 extern bool deviceCallsSafeInPrepare;
 
-// Helper to access current recording buffer's recorded calls
+// Helper to access rendering buffer's recorded calls (N-1 data being prepared/rendered)
 static auto& currentRecordedCalls() {
-    return FixedFunctionShader::frameBuffer.recordedCalls;
+    return FixedFunctionShader::getRenderingBuffer().recordedCalls;
 }
 
 // executeHiZCulling - Pure CPU work: bbox computation, occluder rasterization, Hi-Z pyramid build,
@@ -24,13 +24,14 @@ void FixedFunctionShader::executeHiZCulling(const D3DXMATRIX& currentView, const
     MGE_ZoneScopedN("Execute Hi-Z Culling");
 
     // Resize visibility results for this frame (indexed by draw order)
-    // HLSL mode uses frameBuffer, legacy mode uses global static
-    const auto& activeRecordMW = (Configuration.PerPixelLightFlags == 2) ? frameBuffer.recordMW : DistantLand::recordMW;
+    // N-1: HLSL mode uses rendering buffer (previous frame's data), legacy mode uses global static
+    auto& renderBuf = getRenderingBuffer();
+    const auto& activeRecordMW = (Configuration.PerPixelLightFlags == 2) ? renderBuf.recordMW : DistantLand::recordMW;
     visibilityResults.assign(activeRecordMW.size(), -1);  // -1 = not yet tested
 
     // Phase 2a: Compute deferred bboxes and rasterize occluders from recorded HLSL calls
     // This must happen before Hi-Z build so the depth pass benefits from culling
-    auto& recCalls = (Configuration.PerPixelLightFlags == 2) ? frameBuffer.recordedCalls : currentRecordedCalls();
+    auto& recCalls = (Configuration.PerPixelLightFlags == 2) ? renderBuf.recordedCalls : currentRecordedCalls();
     if (!recCalls.empty() && !hiZBuiltThisFrame) {
         // Compute bounding boxes for calls that missed the cache during recording
         {
@@ -54,8 +55,8 @@ void FixedFunctionShader::executeHiZCulling(const D3DXMATRIX& currentView, const
             const float MIN_SCREEN_COVERAGE = 0.01f;
             rasterizedOccluderMeshes.clear();
 
-            // Use single frame buffer
-            auto& activeFb = frameBuffer;
+            // N-1: Use rendering buffer (previous frame's matrices)
+            auto& activeFb = renderBuf;
             D3DXMATRIX viewProj = activeFb.view * activeFb.proj;
 
             for (auto& call : recCalls) {
@@ -138,8 +139,8 @@ void FixedFunctionShader::executeHiZCulling(const D3DXMATRIX& currentView, const
         MGE_ZoneScopedN("Build Hi-Z Pyramid");
         softwareOcclusionCuller.buildHiZPyramid();
         if (ImGuiManager::GetShowHiZInterface()) {
-            // Use single frame buffer's projection matrix
-            const D3DXMATRIX& uploadProj = frameBuffer.proj;
+            // N-1: Use rendering buffer's projection matrix
+            const D3DXMATRIX& uploadProj = renderBuf.proj;
             softwareOcclusionCuller.uploadHiZToTexture(reinterpret_cast<IDirect3DDevice9*>(device), ImGuiManager::GetHiZDisplayMip(), uploadProj, ImGuiManager::GetHiZInvert(), ImGuiManager::GetHiZShowRaycastGrid(), ImGuiManager::GetHiZRaycastStep());
         }
         hiZBuiltThisFrame = true;
@@ -239,8 +240,9 @@ void FixedFunctionShader::applyVisibilityAndFilterRecordMW() {
         return;
     }
 
-    // Use single frame buffer's recordMW in HLSL mode, global static otherwise
-    auto& activeRecordMW = (Configuration.PerPixelLightFlags == 2) ? frameBuffer.recordMW : DistantLand::recordMW;
+    // N-1: Use rendering buffer's recordMW in HLSL mode, global static otherwise
+    auto& renderBuf = getRenderingBuffer();
+    auto& activeRecordMW = (Configuration.PerPixelLightFlags == 2) ? renderBuf.recordMW : DistantLand::recordMW;
 
     int inputCount = (int)activeRecordMW.size();
 
@@ -262,29 +264,32 @@ void FixedFunctionShader::applyVisibilityAndFilterRecordMW() {
 
 // Dirty tracking: simplified for single buffer (no previous frame comparison)
 // Just marks all calls as dirty - can be optimized later if needed
+// N-1: marks rendering buffer's calls (previous frame being prepared)
 void FixedFunctionShader::markAllCallsDirty() {
     MGE_ZoneScopedN("markAllCallsDirty");
 
+    auto& fb = getRenderingBuffer();
     // Scene 0 (world)
-    for (auto& call : frameBuffer.recordedCalls) {
+    for (auto& call : fb.recordedCalls) {
         call.dirtyFlags = DIRTY_ALL;
     }
     // Scene 1 (particles)
-    for (auto& call : frameBuffer.recordedCallsScene1) {
+    for (auto& call : fb.recordedCallsScene1) {
         call.dirtyFlags = DIRTY_ALL;
     }
     // Scene 2 (hands)
-    for (auto& call : frameBuffer.recordedCallsScene2) {
+    for (auto& call : fb.recordedCallsScene2) {
         call.dirtyFlags = DIRTY_ALL;
     }
 }
 
 // Phase 2b: Prepare shader keys — runs after recording completes, before replay.
 // BBox computation and occluder rasterization already done in executeHiZCulling (Phase 2a).
+// N-1: prepares rendering buffer (previous frame's data)
 void FixedFunctionShader::prepareRecordedCalls() {
     MGE_ZoneScopedN("prepareRecordedCalls");
 
-    auto& fb = frameBuffer;
+    auto& fb = getRenderingBuffer();
     auto& recCalls = fb.recordedCalls;
 
     // Compute shader keys and assign render bins (with slow-frame timing)

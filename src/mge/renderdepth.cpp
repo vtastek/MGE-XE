@@ -146,8 +146,6 @@ void DistantLand::renderDepthRecorded(const std::vector<RecordedMWState>& recMW,
             else if (m.sceneNum == 1) s1++;
             else s2++;
         }
-        LOG::logline(">> renderDepthRecorded(sceneFilter=%d): total=%d, scene0=%d, scene1=%d, scene2=%d",
-                     sceneFilter, (int)recMW.size(), s0, s1, s2);
         logCount++;
     }
 

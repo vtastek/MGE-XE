@@ -729,6 +729,7 @@ public:
             stateContract = StateContract();  // Reset to default state
             hlslCmds.clear();
             postProcessData = {};
+            dlContext = DLContext();  // Reset DLContext to prevent garbage values
             valid = false;
             // Initialize matrices to identity to prevent garbage if capture functions aren't called
             D3DXMatrixIdentity(&view);
@@ -747,7 +748,13 @@ public:
         }
     };
 
-    static FrameBuffer frameBuffer;
+    // N-1 buffering: two buffers for frame-latent rendering
+    // recordingBuffer: currently recording frame N
+    // renderingBuffer: contains frame N-1 data for replay
+    static FrameBuffer frameBuffers[2];
+    static int recordingBuffer;   // Index into frameBuffers for recording (0 or 1)
+    static int renderingBuffer;   // Index into frameBuffers for rendering (1 or 0)
+    static bool n1Ready;          // True after first frame completes (N-1 data available)
 
 public:
     // Pipeline phase tracking for GPU call separation verification
@@ -833,7 +840,10 @@ public:
     static void executeCullPass();
     static void executeRenderPass();
 
-    static FrameBuffer& currentFrameBuffer() { return frameBuffer; }
+    // N-1 buffer accessors
+    static FrameBuffer& getRecordingBuffer() { return frameBuffers[recordingBuffer]; }
+    static FrameBuffer& getRenderingBuffer() { return frameBuffers[renderingBuffer]; }
+    static void swapBuffers();  // Called at Present() to rotate buffers
 
     // Debug controls for record/replay system
     static bool getIsRecording() { return isRecording; }
@@ -850,7 +860,7 @@ public:
     static void setReplayingState(bool replaying) { isReplaying = replaying; }
     static void setManualRecordingControl(bool manual) { manualRecordingControl = manual; }
     static bool getManualRecordingControl() { return manualRecordingControl; }
-    static size_t getRecordedCallsCount() { return frameBuffer.recordedCalls.size(); }
+    static size_t getRecordedCallsCount() { return frameBuffers[recordingBuffer].recordedCalls.size(); }
 
     // Visibility results for depth pass (indexed by recordMW)
     static const std::vector<int8_t>& getVisibilityResults() { return visibilityResults; }
@@ -871,7 +881,7 @@ public:
     // Convenience: legacy name for backwards compat
     static void trackGpuCall(const char* callName) { trackDeviceSubmit(callName); }
 
-    static const std::vector<HLSLRecordedCall>& getRecordedCalls() { return frameBuffer.recordedCalls; }
+    static const std::vector<HLSLRecordedCall>& getRecordedCalls() { return frameBuffers[recordingBuffer].recordedCalls; }
 
     // Scene handover debugging (particle bug investigation)
     static void logSceneHandoverState(const char* label);

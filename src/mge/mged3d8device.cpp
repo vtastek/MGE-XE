@@ -583,17 +583,10 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         // Offscreen buffer, not PreScene.
         g_cmdBufferSet.activeStage = CmdStage::Offscreen;
 
-        // Stamp current camera into the FrameBuffer that just finished recording
-        {
-            auto& fb = FixedFunctionShader::currentFrameBuffer();
-            fb.currentView = DistantLand::s_staging.mwView;
-            fb.currentProj = DistantLand::s_staging.mwProj;
-            fb.currentShadowViewproj[0] = DistantLand::s_staging.smViewproj[0];
-            fb.currentShadowViewproj[1] = DistantLand::s_staging.smViewproj[1];
-        }
-
-        // Clear frame buffer for next frame's recording
-        FixedFunctionShader::currentFrameBuffer().clear();
+        // N-1: Swap buffer indices and clear new recording buffer
+        // Recording buffer (frame N) becomes rendering buffer (will be rendered as N-1 next frame)
+        // Rendering buffer (just rendered) becomes recording buffer (cleared for frame N+1)
+        FixedFunctionShader::swapBuffers();
 
         // Reset per-frame flags
         FixedFunctionShader::resetHiZBuiltFlag();
@@ -809,7 +802,6 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                     // Start recording Scene 1 (particles) to separate vector
                     FixedFunctionShader::setCurrentRecordingScene(1);
                     FixedFunctionShader::setRecordingState(true);
-                    LOG::logline("BeginScene(1): Started Scene 1 (particles) recording, isRecording=%d", FixedFunctionShader::getIsRecording());
                 }
             } else if (g_scene.sceneCount == 2) {
                 // Scene 2 (hands) - detected by Z-clear after world
@@ -822,13 +814,11 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                     // Continue recording Scene 2 (hands)
                     FixedFunctionShader::setCurrentRecordingScene(2);
                     FixedFunctionShader::setRecordingState(true);
-                    LOG::logline("BeginScene(2): Started Scene 2 (hands) recording, isRecording=%d", FixedFunctionShader::getIsRecording());
                 }
             } else if (g_scene.sceneCount > 2 && isHLSLActive()) {
                 // Scene 3+: Continue recording (unlikely, but handle gracefully)
                 FixedFunctionShader::setCurrentRecordingScene(g_scene.sceneCount);
                 FixedFunctionShader::setRecordingState(true);
-                LOG::logline("BeginScene(%d): Continued recording, isRecording=%d", g_scene.sceneCount, FixedFunctionShader::getIsRecording());
             }
 
             // Set any custom FOV and check distant water state (Scene 0 = post-increment 0)
@@ -855,9 +845,6 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                 // Stop Scene 1/2 recording before UI
                 if (FixedFunctionShader::getIsRecording()) {
                     FixedFunctionShader::setRecordingState(false);
-                    auto& fb = FixedFunctionShader::currentFrameBuffer();
-                    LOG::logline("Scene 1+2 recording complete: scene1=%d, scene2=%d calls",
-                        fb.recordedCallsScene1.size(), fb.recordedCallsScene2.size());
                 }
                 FixedFunctionShader::transitionTo(PhaseTransition::UIEntry);
             }
@@ -868,6 +855,10 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                 // HLSL: Full GPU phase now that ALL scenes are recorded
                 // Flow: Depth(0) → Depth(2) → Replay(0) → Replay(1) → Replay(2) → postProcess
                 if (isHLSLActive() && g_scene.stage0Complete) {
+                    // N-1: Store current frame's waterSeen into recording buffer
+                    // (will be used next frame when it becomes rendering buffer)
+                    FixedFunctionShader::getRecordingBuffer().waterSeen = g_scene.waterDrawn;
+                    // N-1: finalizeAndRenderAllScenes now uses rendering buffer's stored values
                     FixedFunctionShader::finalizeAndRenderAllScenes(&frameCtx, g_scene.waterDrawn);
                     FixedFunctionShader::transitionTo(PhaseTransition::GpuExit);
                 }
@@ -921,6 +912,12 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
                 if (!g_scene.stage0Complete) {
                     frameCtx = DistantLand::captureStage0Context();
                     g_scene.stage0Complete = true;
+                    // N-1: Store context into recording buffer for rendering next frame
+                    auto& recBuf = FixedFunctionShader::getRecordingBuffer();
+                    recBuf.dlContext = frameCtx;
+                    // N-1: Stamp currentView/currentProj to match dlContext camera
+                    recBuf.currentView = frameCtx.mwView;
+                    recBuf.currentProj = frameCtx.mwProj;
                 }
 
                 // Phase transition: RecordingExit - MW state at end of Scene 0
@@ -1120,7 +1117,6 @@ HRESULT _stdcall MGEProxyDevice::Clear(DWORD a, const D3DRECT* b, DWORD c, D3DCO
 // Projection needs modifying to allow room for distant land
 // NOTE: Transforms are NOT suppressed — device needs correct values for capture/restore
 HRESULT _stdcall MGEProxyDevice::SetTransform(D3DTRANSFORMSTATETYPE a, const D3DMATRIX* b) {
-    captureTransform(a, b);
     ImGuiManager::TraceTransform(g_scene.sceneCount, (DWORD)a, b ? (const float*)b : nullptr);
 
     if (g_scene.rendertargetNormal) {
@@ -1133,12 +1129,16 @@ HRESULT _stdcall MGEProxyDevice::SetTransform(D3DTRANSFORMSTATETYPE a, const D3D
                 view *= camEffectsMatrix;
                 // Store modified view for CPU-side reads (replaces device->GetTransform)
                 DistantLand::s_staging.mwView = view;
+                // N-1: Capture MODIFIED view (with camEffectsMatrix) to match s_staging.mwView
+                captureTransform(a, &view);
                 if (ImGuiManager::GetCmdBufferRecording()) {
                     g_cmdBufferSet.recordAndTrackTransform((DWORD)a, &view);
                 }
                 // Don't suppress transforms — needed for capture/restore
                 return ProxyDevice::SetTransform(a, &view);
             }
+            // Non-main view: capture original
+            captureTransform(a, b);
         } else if (a == D3DTS_PROJECTION) {
             // Only screw with main scene projection
             if (g_scene.isMainView) {
@@ -1160,6 +1160,9 @@ HRESULT _stdcall MGEProxyDevice::SetTransform(D3DTRANSFORMSTATETYPE a, const D3D
             }
         }
     }
+
+    // Capture non-view/proj transforms (WORLD matrices) and fall-through cases
+    captureTransform(a, b);
 
     if (ImGuiManager::GetCmdBufferRecording()) {
         g_cmdBufferSet.recordAndTrackTransform((DWORD)a, b);
@@ -1519,6 +1522,12 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
             if (isHLSLActive()) {
                 // HLSL: CPU-only context capture, GPU work deferred to finalizeAndRender
                 frameCtx = DistantLand::captureStage0Context();
+                // N-1: Store context into recording buffer for rendering next frame
+                auto& recBuf = FixedFunctionShader::getRecordingBuffer();
+                recBuf.dlContext = frameCtx;
+                // N-1: Stamp currentView/currentProj to match dlContext camera
+                recBuf.currentView = frameCtx.mwView;
+                recBuf.currentProj = frameCtx.mwProj;
             } else {
                 // Legacy: interleaved GPU work (distant land renders now)
                 frameCtx = DistantLand::renderStage0();

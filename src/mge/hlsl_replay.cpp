@@ -47,9 +47,9 @@ static std::unordered_map<IDirect3DTexture9*, D3DXVECTOR2> textureResolutionCach
 // Sampler state cache for recording (duplicated from ffeshader.cpp for HLSLRecordedCall ctor)
 static std::unordered_map<IDirect3DBaseTexture9*, std::pair<DWORD, DWORD>> samplerCache;
 
-// Helper: get current frame's recorded calls
+// Helper: get rendering buffer's recorded calls (N-1 data being replayed)
 static auto& currentRecordedCalls() {
-    return FixedFunctionShader::frameBuffer.recordedCalls;
+    return FixedFunctionShader::getRenderingBuffer().recordedCalls;
 }
 
 // Material state cache helper functions
@@ -472,18 +472,19 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     ShaderKey sk;
     if (isReplaying) {
         // During replay, use the recorded ShaderKey with original suffix flags
-        // Search all scene buffers (Scene 0, 1, and 2)
+        // N-1: Search rendering buffer's scene buffers (Scene 0, 1, and 2)
+        auto& fb = getRenderingBuffer();
         bool found = false;
-        for (const auto& call : frameBuffer.recordedCalls) {
+        for (const auto& call : fb.recordedCalls) {
             if (&call.rs == rs) { sk = call.sk; found = true; break; }
         }
         if (!found) {
-            for (const auto& call : frameBuffer.recordedCallsScene1) {
+            for (const auto& call : fb.recordedCallsScene1) {
                 if (&call.rs == rs) { sk = call.sk; found = true; break; }
             }
         }
         if (!found) {
-            for (const auto& call : frameBuffer.recordedCallsScene2) {
+            for (const auto& call : fb.recordedCallsScene2) {
                 if (&call.rs == rs) { sk = call.sk; found = true; break; }
             }
         }
@@ -713,9 +714,10 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
 
     // Get current view matrix and compute inverse (needed for texture lights and shadows)
     // During replay, device may have UI view — use recorded game view instead
+    // N-1: use rendering buffer's currentView (captured at captureStage0Context to match DL)
     D3DXMATRIX currentView;
     if (isReplaying) {
-        currentView = frameBuffer.view;
+        currentView = getRenderingBuffer().currentView;
     } else {
         device->GetTransform(D3DTS_VIEW, &currentView);
     }
@@ -868,9 +870,11 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
 
     // During replay, use ALL recorded matrices to avoid stale matrix issues
     // During normal rendering, get them from the device
+    // N-1: use rendering buffer's currentView/currentProj (captured at captureStage0Context to match DL)
     if (isReplaying) {
-        projMatrix = frameBuffer.proj;
-        viewMatrix = frameBuffer.view;
+        auto& fb = getRenderingBuffer();
+        projMatrix = fb.currentProj;
+        viewMatrix = fb.currentView;
         worldMatrix = rs->worldTransforms[0];
     } else {
         device->GetTransform(D3DTS_PROJECTION, &projMatrix);
@@ -904,16 +908,6 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             psSize = capturedState->pointSize;
         }
 
-        // Log shader info and register layout
-        // cmdBuf path: shader recorded but not yet bound, so don't check device state
-        LOG::logline("[P] VS=%p regWV=%d regProj=%d wv41=%.0f %s prims=%d world41=%.0f",
-            hlslShader.vertexShader, hlslShader.regWorldView.reg, hlslShader.regProj.reg,
-            worldView._41, psState, rs->primCount, rs->worldTransforms[0]._41);
-        // Log matrices separately to verify multiplication
-        LOG::logline("[P-MAT] world=(%.2f,%.2f,%.2f,%.2f) view=(%.2f,%.2f,%.2f,%.2f) wv=(%.2f,%.2f,%.2f,%.2f)",
-            rs->worldTransforms[0]._11, rs->worldTransforms[0]._12, rs->worldTransforms[0]._13, rs->worldTransforms[0]._14,
-            viewMatrix._11, viewMatrix._12, viewMatrix._13, viewMatrix._14,
-            worldView._11, worldView._12, worldView._13, worldView._14);
     }
 
     if (cmdBuf) {
@@ -982,23 +976,6 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         }
     } else if (hlslShader.vsConstantTable) {
         try {
-            // Debug: Pre-SetMatrix logging for particle draws
-            static int preSetMatrixParticleIdx = 0;
-            static int preSetMatrixLastFrame = -1;
-            if (hlslDiagFrameCounter != preSetMatrixLastFrame) {
-                preSetMatrixParticleIdx = 0;
-                preSetMatrixLastFrame = hlslDiagFrameCounter;
-            }
-            bool isParticleDraw = rs->blendEnable && !rs->zWrite;
-            if (isParticleDraw && preSetMatrixParticleIdx < 20) {
-                LOG::logline("[P-PRE] #%d hWVP=%p hWV=%p hProj=%p projReg=%d",
-                    preSetMatrixParticleIdx, hlslShader.hWorldViewProj, hlslShader.hWorldView, hlslShader.hProj,
-                    hlslShader.projRegister);
-                LOG::logline("        proj[0]=(%.2f,%.2f,%.2f,%.2f) proj[1]=(%.2f,%.2f,%.2f,%.2f)",
-                    projMatrix._11, projMatrix._12, projMatrix._13, projMatrix._14,
-                    projMatrix._21, projMatrix._22, projMatrix._23, projMatrix._24);
-                preSetMatrixParticleIdx++;
-            }
             if (hlslShader.hWorldViewProj) {
                 hlslShader.vsConstantTable->SetMatrix(device, hlslShader.hWorldViewProj, &worldViewProj);
             }
@@ -1064,41 +1041,6 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             }
         } catch (...) {
             LOG::logline("!! HLSL Vertex shader constant table access failed - shader may have been edited");
-        }
-    }
-
-    // Debug: Post-SetMatrix readback to verify actual GPU constants for particles
-    // Read from ACTUAL shader registers (regWorldView, regProj), not hardcoded c0/c16
-    {
-        static int postSetMatrixParticleIdx = 0;
-        static int postSetMatrixLastFrame = -1;
-        if (hlslDiagFrameCounter != postSetMatrixLastFrame) {
-            postSetMatrixParticleIdx = 0;
-            postSetMatrixLastFrame = hlslDiagFrameCounter;
-        }
-        if (rs->blendEnable && !rs->zWrite && postSetMatrixParticleIdx < 20) {
-            // Read from actual shader registers (regWorldView=20, regProj=16 for typical particle shader)
-            int wvReg = hlslShader.regWorldView.reg;
-            int projReg = hlslShader.regProj.reg;
-            float wv[16], proj[16];
-            if (wvReg >= 0) {
-                device->GetVertexShaderConstantF(wvReg, wv, 4);
-            } else {
-                memset(wv, 0, sizeof(wv));
-            }
-            if (projReg >= 0) {
-                device->GetVertexShaderConstantF(projReg, proj, 4);
-            } else {
-                memset(proj, 0, sizeof(proj));
-            }
-            // Also read c16 (vertexBlendPalette[0]) - shader actually uses this, not c4!
-            float vbp[16];
-            device->GetVertexShaderConstantF(16, vbp, 4);
-            LOG::logline("[P-POST] #%d c4=(%.2f,%.2f,%.2f,%.2f) c16=(%.2f,%.2f,%.2f,%.2f)",
-                postSetMatrixParticleIdx,
-                wv[0], wv[1], wv[2], wv[3],
-                vbp[0], vbp[1], vbp[2], vbp[3]);
-            postSetMatrixParticleIdx++;
         }
     }
 
@@ -1614,11 +1556,13 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         }
 
         // Use staging buffer for Scene 1/2 snapshot draws, original VB for Scene 0
+        // N-1: use rendering buffer's staging buffers
+        auto& fbStaging = getRenderingBuffer();
         bool useStagingBuffer = replayCall && replayCall->usesSnapshot &&
-                                frameBuffer.particleStagingVB && frameBuffer.particleStagingIB;
+                                fbStaging.particleStagingVB && fbStaging.particleStagingIB;
 
         if (useStagingBuffer) {
-            hr = device->SetStreamSource(0, frameBuffer.particleStagingVB, replayCall->stagingVBOffset, rs->vbStride);
+            hr = device->SetStreamSource(0, fbStaging.particleStagingVB, replayCall->stagingVBOffset, rs->vbStride);
         } else {
             hr = device->SetStreamSource(0, rs->vb, rs->vbOffset, rs->vbStride);
         }
@@ -1630,46 +1574,15 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         device->SetRenderState(D3DRS_DEPTHBIAS, *(DWORD*)&(const float&)-1e-6f);
         device->SetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, *(DWORD*)&(const float&)-1e-6f);
 
-        // Debug: Log actual shader registers RIGHT BEFORE DrawIndexedPrimitive for particles
-        {
-            static int preDrawParticleIdx = 0;
-            static int preDrawLastFrame = -1;
-            if (hlslDiagFrameCounter != preDrawLastFrame) {
-                preDrawParticleIdx = 0;
-                preDrawLastFrame = hlslDiagFrameCounter;
-            }
-            if (rs->blendEnable && !rs->zWrite && preDrawParticleIdx < 20) {
-                int wvReg = hlslShader.regWorldView.reg;
-                int projReg = hlslShader.regProj.reg;
-                float wv[16], proj[16];
-                if (wvReg >= 0) {
-                    device->GetVertexShaderConstantF(wvReg, wv, 4);
-                } else {
-                    memset(wv, 0, sizeof(wv));
-                }
-                if (projReg >= 0) {
-                    device->GetVertexShaderConstantF(projReg, proj, 4);
-                } else {
-                    memset(proj, 0, sizeof(proj));
-                }
-                LOG::logline("[P-DRAW] #%d wv@c%d=(%.2f,%.2f,%.2f,%.2f) proj@c%d=(%.2f,%.2f,%.2f,%.2f) staging=%d",
-                    preDrawParticleIdx,
-                    wvReg, wv[0], wv[1], wv[2], wv[3],
-                    projReg, proj[0], proj[1], proj[2], proj[3],
-                    useStagingBuffer ? 1 : 0);
-                preDrawParticleIdx++;
-            }
-        }
-
         if (rs->ib) {
             if (useStagingBuffer) {
                 // Staging buffer path: IB offset is byte offset, convert to index offset
                 D3DINDEXBUFFER_DESC ibDesc;
-                frameBuffer.particleStagingIB->GetDesc(&ibDesc);
+                fbStaging.particleStagingIB->GetDesc(&ibDesc);
                 UINT indexSize = (ibDesc.Format == D3DFMT_INDEX32) ? 4 : 2;
                 UINT startIndexOffset = replayCall->stagingIBOffset / indexSize;
 
-                hr = device->SetIndices(frameBuffer.particleStagingIB);
+                hr = device->SetIndices(fbStaging.particleStagingIB);
                 if (FAILED(hr)) {
                     LOG::logline("!! HLSL pipeline: failed to set staging index buffer, hr=%x", hr);
                     return;
@@ -1720,8 +1633,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
         hlslDiagFrameCounter++;
     }
 
-    // Select buffer based on sceneCount parameter (not currentRecordingScene)
-    auto& fb = frameBuffer;
+    // N-1: Select rendering buffer (previous frame's recorded data)
+    auto& fb = getRenderingBuffer();
     std::vector<HLSLRecordedCall>* recCallsPtr;
     if (sceneCount == 1) {
         recCallsPtr = &fb.recordedCallsScene1;
@@ -1739,13 +1652,6 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
 
         ImGuiManager::LogFrameEvent(FrameEvent::MGE_HLSLReplay, sceneCount, (int)recCalls.size());
 
-        // Log scene-level state at replay entry (for particle debugging)
-        if (sceneCount == 1) {
-            LOG::logline("[REP-P] Scene1 entry: fb.view41=%.2f viewScene1_41=%.2f staging.mwView41=%.2f calls=%d",
-                fb.view._41, fb.viewScene1._41,
-                DistantLand::s_staging.mwView._41, (int)recCalls.size());
-        }
-
         // Check if replay is disabled via ImGui
         if (!ImGuiManager::GetEnableReplay()) {
             return;
@@ -1757,10 +1663,10 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
     // Reset to baseline state at start of each scene replay to prevent cross-scene leaks
     setReplayBaseline(cmdBuf, device);
 
-    // Use game view/proj for light transforms and debug visualization
-    // In deferred pipeline, device may have UI view — use s_staging which has the game matrices
-    D3DXMATRIX currentView = DistantLand::s_staging.mwView;
-    D3DXMATRIX currentProj = DistantLand::s_staging.mwProj;
+    // N-1: Use rendering buffer's currentView/currentProj (stamped at previous Present())
+    // These matrices represent the camera position when this frame was recorded
+    D3DXMATRIX currentView = fb.currentView;
+    D3DXMATRIX currentProj = fb.currentProj;
 
     // Set active shadow pointer to recording-time matrices for replay
     // (fb already declared at function start for buffer selection)
@@ -2030,24 +1936,6 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
         if (!call.shouldRender) {
             culledCalls++;
             continue;
-        }
-
-        // Debug: Log particle draws (blendEnable && !zWrite)
-        {
-            static int hlslRepParticleIdx = 0;
-            static int hlslRepLastFrame = -1;
-            if (hlslDiagFrameCounter != hlslRepLastFrame) {
-                hlslRepParticleIdx = 0;
-                hlslRepLastFrame = hlslDiagFrameCounter;
-            }
-            if (call.rs.blendEnable && !call.rs.zWrite && hlslRepParticleIdx < 20) {
-                LOG::logline("[REP-P] #%d vbs=%d hl=%d lm=%d world41=%.2f wvt41=%.2f prims=%d",
-                    hlslRepParticleIdx, call.rs.vertexBlendState,
-                    (int)call.sk.heavyLighting, (int)call.sk.lightMode,
-                    call.rs.worldTransforms[0]._41, call.rs.worldViewTransforms[0]._41,
-                    call.rs.primCount);
-                hlslRepParticleIdx++;
-            }
         }
 
         {
@@ -2397,8 +2285,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
 
     // Note: Camera position is already stored above for next frame's velocity calculation
 
-    // Data is already in frameBuffer.recordedCalls (recorded directly there)
-    frameBuffer.state = BufferState::Available;
+    // N-1: Mark rendering buffer as available after replay
+    getRenderingBuffer().state = BufferState::Available;
 
     isReplaying = false;
 }

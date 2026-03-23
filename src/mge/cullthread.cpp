@@ -89,8 +89,8 @@ extern bool deviceCallsSafeInPrepare;
 
 void CullThread::executeCull(int bufferIndex) {
     MGE_ZoneScopedN("executeCull");
-    (void)bufferIndex;  // Single buffer now
-    auto& fb = FixedFunctionShader::currentFrameBuffer();
+    (void)bufferIndex;  // N-1: rendering buffer (previous frame being prepared)
+    auto& fb = FixedFunctionShader::getRenderingBuffer();
     fb.state = FixedFunctionShader::BufferState::Culling;
     deviceCallsSafeInPrepare = false;
     FixedFunctionShader::executeCullPass();

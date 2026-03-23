@@ -24,8 +24,9 @@ static std::unordered_map<IDirect3DBaseTexture9*, std::pair<DWORD, DWORD>> sampl
 
 // Route to correct vector based on current recording scene
 // Scene 0 = world, Scene 1 = particles (alpha sorted), Scene 2 = hands (skinned)
+// Uses recording buffer for N-1 frame buffering
 static auto& currentRecordedCalls() {
-    auto& fb = FixedFunctionShader::frameBuffer;
+    auto& fb = FixedFunctionShader::getRecordingBuffer();
     int scene = FixedFunctionShader::getCurrentRecordingScene();
     if (scene == 1) {
         return fb.recordedCallsScene1;
@@ -370,7 +371,8 @@ void FixedFunctionShader::startRecording() {
 
     // Capture view/projection matrices once at start of recording directly into FrameBuffer
     // Note: World transforms are captured per-call in each RenderedState
-    auto& fb = frameBuffer;
+    // N-1: recording into recording buffer
+    auto& fb = getRecordingBuffer();
     trackDeviceRead("GetTransform(VIEW,PROJ)");
     device->GetTransform(D3DTS_VIEW, &fb.view);
     device->GetTransform(D3DTS_PROJECTION, &fb.proj);
@@ -399,9 +401,10 @@ void FixedFunctionShader::stopRecordingAndReplay() {
 
     // Batch-warm suffix cache — resolve all unique textures and pre-load suffix files
     // before prepare/replay, so neither stalls on hash computation or disk I/O.
+    // N-1: work on rendering buffer (previous frame being rendered)
     {
         MGE_ZoneScopedN("BatchWarmSuffixCache");
-        auto& recCalls = frameBuffer.recordedCalls;
+        auto& recCalls = getRenderingBuffer().recordedCalls;
         std::unordered_set<IDirect3DTexture9*> seen;
         for (const auto& call : recCalls) {
             if (call.rs.texture && seen.insert(call.rs.texture).second) {
@@ -416,7 +419,7 @@ void FixedFunctionShader::stopRecordingAndReplay() {
     // Phase 3: Replay all prepared calls (Hi-Z already built by executeHiZCulling)
     replayRecordedCalls(0);
 
-    // Data is in frameBuffer.recordedCalls — cleared at start of next frame
+    // N-1: Data is in rendering buffer — cleared when it becomes recording buffer at swap
 
     // Clean up HLSL-only texture slots to prevent DXVK descriptor bloat
     // Use raw SetTexture to truly unbind (setCachedTexture substitutes default textures)
@@ -524,9 +527,10 @@ void FixedFunctionShader::finalizeBatchAndSubmitCull() {
     // Resolves all unique textures and pre-loads suffix files so that
     // computeShaderKeyWithSuffixes on the cull thread never hits expensive fallbacks,
     // and replay never stalls on hash computation or disk I/O.
+    // N-1: work on rendering buffer (previous frame being rendered)
     {
         MGE_ZoneScopedN("BatchWarmSuffixCache");
-        auto& recCalls = frameBuffer.recordedCalls;
+        auto& recCalls = getRenderingBuffer().recordedCalls;
         std::unordered_set<IDirect3DTexture9*> seen;
         for (const auto& call : recCalls) {
             if (call.rs.texture && seen.insert(call.rs.texture).second) {
@@ -537,16 +541,17 @@ void FixedFunctionShader::finalizeBatchAndSubmitCull() {
 
     // Prepare recorded calls inline on main thread
     prepareRecordedCalls();
-    frameBuffer.state = BufferState::ReadyToRender;
+    getRenderingBuffer().state = BufferState::ReadyToRender;
 
     recordingCompletedThisFrame = true;
 }
 
 // Step 2: Wait for cull completion and replay (called after renderStageBlend)
+// N-1: rendering from rendering buffer (previous frame's data)
 void FixedFunctionShader::waitCullAndReplay() {
     if (!recordingEnabled) return;
 
-    auto& fb = frameBuffer;
+    auto& fb = getRenderingBuffer();
     if (fb.state != BufferState::ReadyToRender) {
         return;  // Nothing prepared
     }
@@ -583,17 +588,16 @@ void FixedFunctionShader::finalizeBatchAndReplay(int sceneCount) {
             // finalizeAndRender() will do the actual prepare+render later
         } else if (sceneCount == 1) {
             // Scene 1 (particles): log recording count, continue recording
-            auto& fb = frameBuffer;
-            LOG::logline("Scene 1 (particles) recording: %d calls", fb.recordedCallsScene1.size());
+            // N-1: recording buffer
+            auto& fb = getRecordingBuffer();
         } else if (sceneCount >= 2) {
-            // Scene 2+ (hands): log recording count, continue recording
-            auto& fb = frameBuffer;
-            LOG::logline("Scene %d recording: scene2 buffer=%d calls", sceneCount, fb.recordedCallsScene2.size());
+            // Scene 2+ (hands): continue recording
         }
         // sceneCount < 0: pre-scene, ignore
     } else {
         // When recording disabled, still clear calls after potential dump
-        auto& fb = frameBuffer;
+        // N-1: recording buffer
+        auto& fb = getRecordingBuffer();
         fb.recordedCalls.clear();
         fb.recordedCallsScene1.clear();
         fb.recordedCallsScene2.clear();
@@ -603,20 +607,20 @@ void FixedFunctionShader::finalizeBatchAndReplay(int sceneCount) {
 
 // captureScene1Matrices - Capture view/proj for Scene 1 (particles)
 // Camera may move during Scene 0 - particles should use Scene 1's matrices, not Scene 0's
+// N-1: recording buffer
 void FixedFunctionShader::captureScene1Matrices() {
-    auto& fb = frameBuffer;
+    auto& fb = getRecordingBuffer();
     device->GetTransform(D3DTS_VIEW, &fb.viewScene1);
     device->GetTransform(D3DTS_PROJECTION, &fb.projScene1);
-    LOG::logline("Captured Scene 1 matrices (particles view/proj)");
 }
 
 // captureScene2Matrices - Capture view/proj for Scene 2 (hands)
 // Hands use a different view matrix than the world scene - must be captured separately
+// N-1: recording buffer
 void FixedFunctionShader::captureScene2Matrices() {
-    auto& fb = frameBuffer;
+    auto& fb = getRecordingBuffer();
     device->GetTransform(D3DTS_VIEW, &fb.viewScene2);
     device->GetTransform(D3DTS_PROJECTION, &fb.projScene2);
-    LOG::logline("Captured Scene 2 matrices (hands view/proj)");
 }
 
 // Offscreen state save/restore - prevents blend state leak to UI when world rendering is off
@@ -653,10 +657,11 @@ void FixedFunctionShader::restoreOffscreenState() {
 
 // capturePostRecordingState - Capture MW device state at end of Scene 0
 // Recording continues through Scene 1/2; this just saves what we need to restore later.
+// N-1: recording buffer
 void FixedFunctionShader::capturePostRecordingState() {
     if (!isRecording) return;
 
-    auto& fb = frameBuffer;
+    auto& fb = getRecordingBuffer();
 
     if (ImGuiManager::GetStateSuppressionEnabled()) {
         // Suppression ON: use tracked state (device has HLSL values, not MW values)
@@ -786,10 +791,14 @@ void FixedFunctionShader::finalizeAndRender(DLContext* frameCtx, bool waterSeen)
         diagHitKeys.clear();
     }
 
+    // NOTE: finalizeAndRender is a legacy path, not used in main HLSL flow
+    // N-1: Use rendering buffer for prepare/render operations
+    auto& renderFb = getRenderingBuffer();
+
     // Batch-warm suffix cache before prepare
     {
         MGE_ZoneScopedN("BatchWarmSuffixCache");
-        auto& recCalls = frameBuffer.recordedCalls;
+        auto& recCalls = renderFb.recordedCalls;
         std::unordered_set<IDirect3DTexture9*> seen;
         for (const auto& call : recCalls) {
             if (call.rs.texture && seen.insert(call.rs.texture).second) {
@@ -802,7 +811,7 @@ void FixedFunctionShader::finalizeAndRender(DLContext* frameCtx, bool waterSeen)
     {
         static bool loggedOnce = false;
         if (!loggedOnce) {
-            auto& fb = frameBuffer;
+            auto& fb = renderFb;
             int s0 = (int)fb.recordedCalls.size();
             int s1 = (int)fb.recordedCallsScene1.size();
             int s2 = (int)fb.recordedCallsScene2.size();
@@ -812,8 +821,6 @@ void FixedFunctionShader::finalizeAndRender(DLContext* frameCtx, bool waterSeen)
                 else if (m.sceneNum == 1) m1++;
                 else m2++;
             }
-            LOG::logline(">> finalizeAndRender: HLSL scene0=%d, scene1=%d, scene2=%d; recordMW scene0=%d, scene1=%d, scene2=%d",
-                         s0, s1, s2, m0, m1, m2);
             loggedOnce = true;
         }
     }
@@ -825,13 +832,13 @@ void FixedFunctionShader::finalizeAndRender(DLContext* frameCtx, bool waterSeen)
 
         // Prepare recorded calls inline on main thread
         prepareRecordedCalls();
-        frameBuffer.state = BufferState::ReadyToRender;
+        renderFb.state = BufferState::ReadyToRender;
     }
 
     // === RENDER (GPU) ===
     currentPhase = PipelinePhase::GpuRender;
     {
-        auto& fb = frameBuffer;
+        auto& fb = renderFb;
 
         // Store DLContext and waterSeen in FrameBuffer for per-frame isolation
         fb.dlContext = *frameCtx;
@@ -873,7 +880,14 @@ void FixedFunctionShader::finalizeAndRender(DLContext* frameCtx, bool waterSeen)
 void FixedFunctionShader::executeGpuPhase() {
     MGE_ZoneScopedN("Frame_Render");
 
-    auto& fb = frameBuffer;
+    // N-1: First frame check - skip if no previous frame data
+    if (!n1Ready) {
+        LOG::logline("executeGpuPhase: N-1 not ready (first frame), skipping");
+        return;
+    }
+
+    // N-1: rendering from rendering buffer (previous frame's data)
+    auto& fb = getRenderingBuffer();
     DLContext* frameCtx = &fb.dlContext;
     bool waterSeen = fb.waterSeen;
 
@@ -918,8 +932,6 @@ void FixedFunctionShader::executeGpuPhase() {
 
     // Scene 1/2 NOT replayed here — they haven't been recorded yet at EndScene(0)
     // They will be replayed in finalizeAndRenderAllScenes after recording completes
-    LOG::logline("[ORDER] executeGpuPhase: Scene 1 has %d calls (NOT replayed here), Scene 2 has %d calls (NOT replayed here)",
-        (int)fb.recordedCallsScene1.size(), (int)fb.recordedCallsScene2.size());
 
     fb.hlslCmds.replay(device);
     transitionTo(PhaseTransition::ReplayExit);
@@ -960,15 +972,24 @@ void FixedFunctionShader::executeGpuPhase() {
 
 // Full deferred GPU phase at UI BeginScene - all scenes recorded, now render everything
 // Flow: Depth(Scene 0) → Depth(Scene 2) → Replay(0) → Replay(1) → Replay(2)
+// N-1: renders from rendering buffer (previous frame's data)
+// First frame: n1Ready is false until first swap completes, so we skip
 void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool waterSeen) {
     MGE_ZoneScopedN("finalizeAndRenderAllScenes");
 
     if (!recordingEnabled) return;
 
-    auto& fb = frameBuffer;
+    // First frame check: N-1 not ready until first buffer swap at Present()
+    if (!n1Ready) {
+        LOG::logline("finalizeAndRenderAllScenes: N-1 not ready (first frame), skipping render");
+        // On first frame, no previous frame data exists - skip rendering
+        // MW's direct draws will still appear, distant land/water won't render this frame
+        return;
+    }
 
-    LOG::logline("finalizeAndRenderAllScenes: scene0=%d, scene1=%d, scene2=%d",
-        (int)fb.recordedCalls.size(), (int)fb.recordedCallsScene1.size(), (int)fb.recordedCallsScene2.size());
+    // N-1: use rendering buffer (previous frame's recorded data)
+    auto& fb = getRenderingBuffer();
+
 
     // === SAVE UI STATE ===
     // MW set up UI state before calling BeginScene. We need to restore these
@@ -998,14 +1019,15 @@ void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool w
         fb.state = BufferState::ReadyToRender;
     }
 
-    // Store context in FrameBuffer
-    fb.dlContext = *frameCtx;
-    fb.waterSeen = waterSeen;
+    // N-1: Use stored context from rendering buffer (captured when this was recording buffer)
+    // dlContext and waterSeen are already stored in fb from previous frame's recording phase
+    DLContext* renderCtx = &fb.dlContext;
+    bool renderWaterSeen = fb.waterSeen;
 
     // === STAGE 0 GPU: Shadow map, distant land, sky, water reflection, wave sim ===
     {
         MGE_ZoneScopedN("Stage0 GPU");
-        DistantLand::renderStage0GPU(frameCtx, &fb);
+        DistantLand::renderStage0GPU(renderCtx, &fb);
     }
 
     // Update shadow VP in frame buffer — renderShadowMap just computed current frame's
@@ -1023,11 +1045,11 @@ void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool w
         MGE_ZoneScopedN("Depth Passes");
 
         // Use renderStage1 for Scene 0 depth (includes shadows, distant land setup)
-        DistantLand::renderStage1(frameCtx, &fb);
+        DistantLand::renderStage1(renderCtx, &fb);
 
         // Render Scene 2 (hands) depth into the depth texture
         // Filter for sceneNum >= 2 only
-        DistantLand::renderStage2(frameCtx, &fb);
+        DistantLand::renderStage2(renderCtx, &fb);
     }
 
     // === REPLAY ALL SCENES ===
@@ -1036,7 +1058,7 @@ void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool w
         MGE_ZoneScopedN("Replay All Scenes");
 
         // Blend close objects over distant land (before replay)
-        DistantLand::renderStageBlend(frameCtx, &fb);
+        DistantLand::renderStageBlend(renderCtx, &fb);
 
         transitionTo(PhaseTransition::ReplayEntry);
 
@@ -1049,8 +1071,8 @@ void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool w
 
     // Water surface AFTER Scene 0 but BEFORE Scene 1 particles
     // Water writes depth, then particles blend over it
-    if (waterSeen) {
-        DistantLand::renderStageWater(frameCtx);
+    if (renderWaterSeen) {
+        DistantLand::renderStageWater(renderCtx);
     }
 
     // Upload snapshot vertex/index data to staging buffers before Scene 1/2 replay
@@ -1075,9 +1097,6 @@ void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool w
                 totalIBBytes += (UINT)call.indexSnapshot.size();
             }
         }
-
-        LOG::logline("[STAGING] Scene 1 has %d calls, Scene 2 has %d calls, totalVB=%u, totalIB=%u",
-            (int)fb.recordedCallsScene1.size(), (int)fb.recordedCallsScene2.size(), totalVBBytes, totalIBBytes);
 
         // Resize staging VB if needed
         if (totalVBBytes > 0 && totalVBBytes > fb.stagingVBSize) {
@@ -1166,7 +1185,6 @@ void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool w
         fb.proj = fb.projScene2;
 
         isReplaying = true;
-        LOG::logline("[ORDER] finalizeAndRenderAllScenes: Replay Scene 2 (%d calls)", (int)fb.recordedCallsScene2.size());
         replayRecordedCalls(2, nullptr);
         isReplaying = false;
 
@@ -1244,9 +1262,6 @@ void FixedFunctionShader::replayScene1And2(FrameBuffer* fb) {
     if (fb->recordedCallsScene1.empty() && fb->recordedCallsScene2.empty()) {
         return;
     }
-
-    LOG::logline("replayScene1And2: scene1=%d, scene2=%d calls",
-        (int)fb->recordedCallsScene1.size(), (int)fb->recordedCallsScene2.size());
 
     // Upload snapshot vertex/index data to staging buffers before replay
     {
@@ -1635,7 +1650,8 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
             hlslRecLastFrame = hlslDiagFrameCounter;
         }
         if (rs->blendEnable && !rs->zWrite && hlslRecParticleIdx < 20) {
-            auto& recFb = frameBuffer;
+            // N-1: recording buffer for debug logging during recording
+            auto& recFb = getRecordingBuffer();
             size_t callIdx = currentRecordedCalls().size();
             LOG::logline("[REC-P] #%d vbs=%d world41=%.2f wvt41=%.2f view41=%.2f proj11=%.3f prims=%d",
                 hlslRecParticleIdx, rs->vertexBlendState,
