@@ -1497,7 +1497,10 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
         rs.vertCount = c;
         rs.startIndex = d;
         rs.primCount = e;
-        // Route through renderMorrowind for recording
+        // Also record to recordMW for depth texture rendering (hands need depth for SSAO/DOF)
+        // inspectIndexedPrimitive adds to recordMW if is1PDepthCandidate (skinned or opaque)
+        DistantLand::inspectIndexedPrimitive(g_scene.sceneCount, &rs, &frs, &lightrs);
+        // Route through renderMorrowind for HLSL color recording
         FixedFunctionShader::renderMorrowind(&rs, &frs, &lightrs, -1);
         return D3D_OK;  // Suppress MW draw
     }

@@ -363,7 +363,13 @@ void DistantLand::renderStage2(DLContext* ctx, FixedFunctionShader::FrameBuffer*
     // Select recordMW source: per-buffer in HLSL mode, global static otherwise
     auto& activeRecordMW = fb ? fb->recordMW : recordMW;
 
-    ///LOG::logline("Stage 2 prims: %d", activeRecordMW.size());
+    // Count Scene 2 entries in recordMW
+    int s2InRecordMW = 0;
+    for (const auto& m : activeRecordMW) {
+        if (m.sceneNum == 2) s2InRecordMW++;
+    }
+    LOG::logline("[STAGE2] recordMW total=%d, scene2=%d, fb=%p, viewScene2_41=%.2f",
+        (int)activeRecordMW.size(), s2InRecordMW, fb, fb ? fb->viewScene2._41 : -999.0f);
 
     // Early out if nothing is happening
     if (activeRecordMW.empty()) {
@@ -391,7 +397,10 @@ void DistantLand::renderStage2(DLContext* ctx, FixedFunctionShader::FrameBuffer*
         int sceneFilter = (isHLSLActive()) ? 1 : -1;
         effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
         if (ImGuiManager::GetEnableDepthPass()) {
-            renderDepthAdditional(ctx, activeRecordMW, sceneFilter);
+            // Pass hands view matrix for skinned depth rendering (Scene 2 uses different view)
+            // Non-skinned objects use pre-recorded worldViewTransforms, so this mainly affects hands
+            const D3DXMATRIX* viewForDepth = (fb && sceneFilter >= 1) ? &fb->viewScene2 : nullptr;
+            renderDepthAdditional(ctx, activeRecordMW, sceneFilter, viewForDepth);
             g_passBreaks.mge_depthRT += 2; // RenderTargetSwitcher in+out
         }
         effectDepth->End();

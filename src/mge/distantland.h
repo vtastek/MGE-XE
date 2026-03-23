@@ -242,7 +242,7 @@ public:
 
     static void renderDepth(DLContext* ctx, const std::vector<RecordedMWState>& recMW, int sceneFilter = -1);
     static void renderDepthDistantLand(DLContext* ctx);
-    static void renderDepthAdditional(DLContext* ctx, const std::vector<RecordedMWState>& recMW, int sceneFilter = -1);
+    static void renderDepthAdditional(DLContext* ctx, const std::vector<RecordedMWState>& recMW, int sceneFilter = -1, const D3DXMATRIX* viewOverride = nullptr);
     static void renderDepthRecorded(const std::vector<RecordedMWState>& recMW, int sceneFilter = -1, const D3DXMATRIX* gameView = nullptr);
     static void generateHiZMipsGPU();
     static void copyHiZToStaging();

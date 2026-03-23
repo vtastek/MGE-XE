@@ -104,7 +104,7 @@ void DistantLand::renderDepthDistantLand(DLContext* ctx) {
     effect->SetMatrix(ehProj, &ctx->mwProj);
 }
 
-void DistantLand::renderDepthAdditional(DLContext* ctx, const std::vector<RecordedMWState>& recMW, int sceneFilter) {
+void DistantLand::renderDepthAdditional(DLContext* ctx, const std::vector<RecordedMWState>& recMW, int sceneFilter, const D3DXMATRIX* viewOverride) {
     // Switch to render target
     RenderTargetSwitcher rtsw(surfDepthFrameMSAA, surfDepthDepth);
 
@@ -121,8 +121,10 @@ void DistantLand::renderDepthAdditional(DLContext* ctx, const std::vector<Record
 
     // Recorded draw calls with Morrowind near plane
     // Pass game view for skinned object transforms (device may have UI view in deferred pipeline)
+    // Use viewOverride if provided (for hands which use a different view matrix)
+    const D3DXMATRIX* viewToUse = viewOverride ? viewOverride : &ctx->mwView;
     effectDepth->BeginPass(PASS_RENDERMWDEPTH);
-    renderDepthRecorded(recMW, sceneFilter, &ctx->mwView);
+    renderDepthRecorded(recMW, sceneFilter, viewToUse);
     effectDepth->EndPass();
 
     // Reset projection matrix
@@ -153,10 +155,19 @@ void DistantLand::renderDepthRecorded(const std::vector<RecordedMWState>& recMW,
     // recordMW is pre-filtered - only visible objects remain.
 
     // Recorded renders (pre-filtered by executeHiZCulling/applyVisibilityAndFilterRecordMW)
+    int scene2Count = 0;
     for (const auto& i : recMW) {
         // Scene filter: -1 = all, 0 = scene 0 only, 1 = scene 1 only, 2 = scene 2 only, etc.
         if (sceneFilter == 0 && i.sceneNum != 0) continue;
         if (sceneFilter > 0 && i.sceneNum == 0) continue;
+
+        // Log Scene 2 depth draws
+        if (i.sceneNum == 2 && scene2Count < 5) {
+            LOG::logline("[DEPTH-S2] scene=%d vbs=%d prims=%d vb=%p ib=%p gameView41=%.2f wvt41=%.2f world41=%.2f",
+                i.sceneNum, i.vertexBlendState, i.primCount, i.vb, i.ib,
+                gameView ? gameView->_41 : -999.0f, i.worldViewTransforms[0]._41, i.worldTransforms[0]._41);
+            scene2Count++;
+        }
 
         MGE_ZoneScopedN("renderDepth_Draw");
         // Set variables in main effect; variables are shared via effect pool
