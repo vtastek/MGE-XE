@@ -159,7 +159,7 @@ void RenderThread::executeReplayHLSL(int sceneCount) {
     FixedFunctionShader::finalizeBatchAndReplay(sceneCount);
 }
 
-void RenderThread::executeFullFrame(int bufferIndex) {
+void RenderThread::executeFullFrame(int /*bufferIndex*/) {
     MGE_ZoneScopedN("RT_FullFrame");
-    FixedFunctionShader::executeRenderPass(bufferIndex);
+    FixedFunctionShader::executeRenderPass();
 }

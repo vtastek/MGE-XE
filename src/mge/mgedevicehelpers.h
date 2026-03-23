@@ -3,9 +3,33 @@
 #include "proxydx/d3d9header.h"
 #include "imgui_manager.h"
 
+// Scene phase — detected by characteristics, not position
+enum class ScenePhase {
+    Unknown,
+    Offscreen,   // !rendertargetNormal (local map, inventory doll)
+    World,       // isMainView=true, first main scene
+    Particles,   // After world EndScene, before Z-clear
+    Hands,       // After Z-clear, skinned draws
+    UI           // detectMenu() true
+};
+
+// Draw type classification — for per-draw analysis
+enum class DrawType {
+    Unknown,
+    Sky,         // First blended in outdoor, before opaques
+    Water,       // Power == 99999.0f magic marker
+    Terrain,     // Land splat pattern
+    Opaque,      // zWrite, no blend
+    AlphaTested, // zWrite, alpha test
+    Blended,     // blendEnable, no zWrite (particles)
+    Skinned,     // vertexBlendState != 0 (hands)
+    Decal        // texcoordIndex != 0
+};
+
 // Scene state — groups scattered statics from mged3d8device.cpp
 struct SceneState {
-    int sceneCount = -1;
+    int sceneCount = -1;              // Legacy counter (kept for compatibility)
+    ScenePhase phase = ScenePhase::Unknown;  // Characteristic-based phase
     bool rendertargetNormal = true;
     bool isHUDready = false;
     bool isMainView = false;
@@ -19,12 +43,26 @@ struct SceneState {
     bool distantWater = false;
     DWORD stencilRef = 0;
 
+    // Characteristic-based detection state
+    bool worldComplete = false;        // Set at EndScene of World
+    bool hadZClearSinceWorld = false;  // Set in Clear() after world
+    bool skyDrawn = false;             // First sky draw detected
+    bool handsStarted = false;         // Hands scene started
+    DrawType lastDrawType = DrawType::Unknown;
+
     void resetForFrame() {
         sceneCount = -1;
+        phase = ScenePhase::Unknown;
         stage0Complete = false;
         waterDrawn = false;
         isFrameComplete = false;
         isHUDComplete = false;
+        // Reset characteristic detection state
+        worldComplete = false;
+        hadZClearSinceWorld = false;
+        skyDrawn = false;
+        handsStarted = false;
+        lastDrawType = DrawType::Unknown;
     }
 };
 
@@ -212,6 +250,14 @@ struct DeviceStateSnapshot {
 
     // Debug
     DWORD fillMode = D3DFILL_SOLID;
+
+    // Point sprites (particles)
+    float pointSize = 1.0f;
+    DWORD pointSpriteEnable = FALSE;
+    DWORD pointScaleEnable = FALSE;
+    float pointScaleA = 1.0f;
+    float pointScaleB = 0.0f;
+    float pointScaleC = 0.0f;
 };
 
 extern DeviceStateSnapshot g_deviceState;

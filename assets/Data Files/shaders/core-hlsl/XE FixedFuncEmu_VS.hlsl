@@ -2,32 +2,33 @@
 // MGE XE - HLSL Fixed Function Emulation - Vertex Shader
 //============================================================================
 
-// Matrices  
-matrix proj;
-matrix worldview;
-matrix world;
-matrix view;
-matrix vertexBlendPalette[4];      // View-space bone transforms (world * view)
-matrix vertexBlendPaletteWorld[4]; // World-space bone transforms (world only)
-float4 vertexBlendState;
-
-#ifdef HAS_SHADOWS
-// World-to-shadow matrices for proper shadow coordinate calculation
-matrix shadowWorldViewProj[2] : register(c20);
-#endif
+// Matrices - explicit registers for consistent layout regardless of #ifdefs
+matrix proj : register(c0);           // c0-c3
+matrix worldview : register(c4);      // c4-c7
+matrix world : register(c8);          // c8-c11
+matrix view : register(c12);          // c12-c15
+matrix vertexBlendPalette[4] : register(c16);      // c16-c31 View-space bone transforms (world * view)
+matrix vertexBlendPaletteWorld[4] : register(c32); // c32-c47 World-space bone transforms (world only)
+float4 vertexBlendState : register(c48);
 
 // Fog parameters
-float nearFogStart, nearFogRange;
+float nearFogStart : register(c49);
+float nearFogRange : register(c50);
 
 // Animation parameters (available for all geometry)
-float2 windVec;
-float time;
-bool hasAlpha;  // For detecting alpha-tested geometry
+float2 windVec : register(c51);
+float time : register(c52);
+bool hasAlpha : register(c53);  // For detecting alpha-tested geometry
 
 #ifdef HAS_GRASS
 // Additional grass-specific parameters
-float3 eyePos;
-float2 footPos;
+float3 eyePos : register(c54);
+float2 footPos : register(c55);
+#endif
+
+#ifdef HAS_SHADOWS
+// World-to-shadow matrices for proper shadow coordinate calculation
+matrix shadowWorldViewProj[2] : register(c60); // c60-c67
 #endif
 
 //------------------------------------------------------------

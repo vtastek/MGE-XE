@@ -25,7 +25,7 @@ static std::unordered_map<IDirect3DBaseTexture9*, std::pair<DWORD, DWORD>> sampl
 // Route to correct vector based on current recording scene
 // Scene 0 = world, Scene 1 = particles (alpha sorted), Scene 2 = hands (skinned)
 static auto& currentRecordedCalls() {
-    auto& fb = FixedFunctionShader::frameBuffers[FixedFunctionShader::recordingBuffer];
+    auto& fb = FixedFunctionShader::frameBuffer;
     int scene = FixedFunctionShader::getCurrentRecordingScene();
     if (scene == 1) {
         return fb.recordedCallsScene1;
@@ -326,7 +326,7 @@ void FixedFunctionShader::startRecording() {
     // Reset HLSL caches for new recording session
     resetHLSLCaches();
 
-    currentRecordedCalls().reserve(4000);  // Pre-allocate (already cleared by rotateRecordingBuffer)
+    currentRecordedCalls().reserve(4000);  // Pre-allocate (cleared at Present())
     samplerCache.clear();  // Clear sampler cache for new frame
     bboxLookup.clear();  // Clear for new frame (populated during recording)
     // NOTE: Do NOT clear recordMW here - it's populated by inspectIndexedPrimitive()
@@ -370,7 +370,7 @@ void FixedFunctionShader::startRecording() {
 
     // Capture view/projection matrices once at start of recording directly into FrameBuffer
     // Note: World transforms are captured per-call in each RenderedState
-    auto& fb = frameBuffers[recordingBuffer];
+    auto& fb = frameBuffer;
     trackDeviceRead("GetTransform(VIEW,PROJ)");
     device->GetTransform(D3DTS_VIEW, &fb.view);
     device->GetTransform(D3DTS_PROJECTION, &fb.proj);
@@ -401,7 +401,7 @@ void FixedFunctionShader::stopRecordingAndReplay() {
     // before prepare/replay, so neither stalls on hash computation or disk I/O.
     {
         MGE_ZoneScopedN("BatchWarmSuffixCache");
-        auto& recCalls = frameBuffers[recordingBuffer].recordedCalls;
+        auto& recCalls = frameBuffer.recordedCalls;
         std::unordered_set<IDirect3DTexture9*> seen;
         for (const auto& call : recCalls) {
             if (call.rs.texture && seen.insert(call.rs.texture).second) {
@@ -411,13 +411,12 @@ void FixedFunctionShader::stopRecordingAndReplay() {
     }
 
     // Phase 2b: Prepare shader keys (bbox + occluders already done in executeHiZCulling)
-    prepareRecordedCalls(recordingBuffer);
+    prepareRecordedCalls();
 
     // Phase 3: Replay all prepared calls (Hi-Z already built by executeHiZCulling)
     replayRecordedCalls(0);
 
-    // Data is already in frameBuffers[recordingBuffer].recordedCalls (recorded directly there)
-    // No move or clear needed — buffer ownership transfers via rotateRecordingBuffer()
+    // Data is in frameBuffer.recordedCalls — cleared at start of next frame
 
     // Clean up HLSL-only texture slots to prevent DXVK descriptor bloat
     // Use raw SetTexture to truly unbind (setCachedTexture substitutes default textures)
@@ -527,7 +526,7 @@ void FixedFunctionShader::finalizeBatchAndSubmitCull() {
     // and replay never stalls on hash computation or disk I/O.
     {
         MGE_ZoneScopedN("BatchWarmSuffixCache");
-        auto& recCalls = frameBuffers[recordingBuffer].recordedCalls;
+        auto& recCalls = frameBuffer.recordedCalls;
         std::unordered_set<IDirect3DTexture9*> seen;
         for (const auto& call : recCalls) {
             if (call.rs.texture && seen.insert(call.rs.texture).second) {
@@ -537,9 +536,8 @@ void FixedFunctionShader::finalizeBatchAndSubmitCull() {
     }
 
     // Prepare recorded calls inline on main thread
-    int buf = recordingBuffer;
-    prepareRecordedCalls(buf);
-    frameBuffers[buf].state = BufferState::ReadyToRender;
+    prepareRecordedCalls();
+    frameBuffer.state = BufferState::ReadyToRender;
 
     recordingCompletedThisFrame = true;
 }
@@ -548,7 +546,7 @@ void FixedFunctionShader::finalizeBatchAndSubmitCull() {
 void FixedFunctionShader::waitCullAndReplay() {
     if (!recordingEnabled) return;
 
-    auto& fb = frameBuffers[recordingBuffer];
+    auto& fb = frameBuffer;
     if (fb.state != BufferState::ReadyToRender) {
         return;  // Nothing prepared
     }
@@ -585,17 +583,17 @@ void FixedFunctionShader::finalizeBatchAndReplay(int sceneCount) {
             // finalizeAndRender() will do the actual prepare+render later
         } else if (sceneCount == 1) {
             // Scene 1 (particles): log recording count, continue recording
-            auto& fb = frameBuffers[recordingBuffer];
+            auto& fb = frameBuffer;
             LOG::logline("Scene 1 (particles) recording: %d calls", fb.recordedCallsScene1.size());
         } else if (sceneCount >= 2) {
             // Scene 2+ (hands): log recording count, continue recording
-            auto& fb = frameBuffers[recordingBuffer];
+            auto& fb = frameBuffer;
             LOG::logline("Scene %d recording: scene2 buffer=%d calls", sceneCount, fb.recordedCallsScene2.size());
         }
         // sceneCount < 0: pre-scene, ignore
     } else {
         // When recording disabled, still clear calls after potential dump
-        auto& fb = frameBuffers[recordingBuffer];
+        auto& fb = frameBuffer;
         fb.recordedCalls.clear();
         fb.recordedCallsScene1.clear();
         fb.recordedCallsScene2.clear();
@@ -603,12 +601,62 @@ void FixedFunctionShader::finalizeBatchAndReplay(int sceneCount) {
     }
 }
 
+// captureScene1Matrices - Capture view/proj for Scene 1 (particles)
+// Camera may move during Scene 0 - particles should use Scene 1's matrices, not Scene 0's
+void FixedFunctionShader::captureScene1Matrices() {
+    auto& fb = frameBuffer;
+    device->GetTransform(D3DTS_VIEW, &fb.viewScene1);
+    device->GetTransform(D3DTS_PROJECTION, &fb.projScene1);
+    LOG::logline("Captured Scene 1 matrices (particles view/proj)");
+}
+
+// captureScene2Matrices - Capture view/proj for Scene 2 (hands)
+// Hands use a different view matrix than the world scene - must be captured separately
+void FixedFunctionShader::captureScene2Matrices() {
+    auto& fb = frameBuffer;
+    device->GetTransform(D3DTS_VIEW, &fb.viewScene2);
+    device->GetTransform(D3DTS_PROJECTION, &fb.projScene2);
+    LOG::logline("Captured Scene 2 matrices (hands view/proj)");
+}
+
+// Offscreen state save/restore - prevents blend state leak to UI when world rendering is off
+static struct {
+    DWORD alphaBlendEnable;
+    DWORD srcBlend;
+    DWORD destBlend;
+    DWORD alphaTestEnable;
+    DWORD alphaRef;
+    DWORD alphaFunc;
+    bool saved;
+} s_offscreenState = { 0, 0, 0, 0, 0, 0, false };
+
+void FixedFunctionShader::saveOffscreenState() {
+    device->GetRenderState(D3DRS_ALPHABLENDENABLE, &s_offscreenState.alphaBlendEnable);
+    device->GetRenderState(D3DRS_SRCBLEND, &s_offscreenState.srcBlend);
+    device->GetRenderState(D3DRS_DESTBLEND, &s_offscreenState.destBlend);
+    device->GetRenderState(D3DRS_ALPHATESTENABLE, &s_offscreenState.alphaTestEnable);
+    device->GetRenderState(D3DRS_ALPHAREF, &s_offscreenState.alphaRef);
+    device->GetRenderState(D3DRS_ALPHAFUNC, &s_offscreenState.alphaFunc);
+    s_offscreenState.saved = true;
+}
+
+void FixedFunctionShader::restoreOffscreenState() {
+    if (!s_offscreenState.saved) return;
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, s_offscreenState.alphaBlendEnable);
+    device->SetRenderState(D3DRS_SRCBLEND, s_offscreenState.srcBlend);
+    device->SetRenderState(D3DRS_DESTBLEND, s_offscreenState.destBlend);
+    device->SetRenderState(D3DRS_ALPHATESTENABLE, s_offscreenState.alphaTestEnable);
+    device->SetRenderState(D3DRS_ALPHAREF, s_offscreenState.alphaRef);
+    device->SetRenderState(D3DRS_ALPHAFUNC, s_offscreenState.alphaFunc);
+    s_offscreenState.saved = false;
+}
+
 // capturePostRecordingState - Capture MW device state at end of Scene 0
 // Recording continues through Scene 1/2; this just saves what we need to restore later.
 void FixedFunctionShader::capturePostRecordingState() {
     if (!isRecording) return;
 
-    auto& fb = frameBuffers[recordingBuffer];
+    auto& fb = frameBuffer;
 
     if (ImGuiManager::GetStateSuppressionEnabled()) {
         // Suppression ON: use tracked state (device has HLSL values, not MW values)
@@ -741,7 +789,7 @@ void FixedFunctionShader::finalizeAndRender(DLContext* frameCtx, bool waterSeen)
     // Batch-warm suffix cache before prepare
     {
         MGE_ZoneScopedN("BatchWarmSuffixCache");
-        auto& recCalls = frameBuffers[recordingBuffer].recordedCalls;
+        auto& recCalls = frameBuffer.recordedCalls;
         std::unordered_set<IDirect3DTexture9*> seen;
         for (const auto& call : recCalls) {
             if (call.rs.texture && seen.insert(call.rs.texture).second) {
@@ -754,7 +802,7 @@ void FixedFunctionShader::finalizeAndRender(DLContext* frameCtx, bool waterSeen)
     {
         static bool loggedOnce = false;
         if (!loggedOnce) {
-            auto& fb = frameBuffers[recordingBuffer];
+            auto& fb = frameBuffer;
             int s0 = (int)fb.recordedCalls.size();
             int s1 = (int)fb.recordedCallsScene1.size();
             int s2 = (int)fb.recordedCallsScene2.size();
@@ -776,15 +824,14 @@ void FixedFunctionShader::finalizeAndRender(DLContext* frameCtx, bool waterSeen)
         MGE_ZoneScopedN("Frame_Prepare");
 
         // Prepare recorded calls inline on main thread
-        int buf = recordingBuffer;
-        prepareRecordedCalls(buf);
-        frameBuffers[buf].state = BufferState::ReadyToRender;
+        prepareRecordedCalls();
+        frameBuffer.state = BufferState::ReadyToRender;
     }
 
     // === RENDER (GPU) ===
     currentPhase = PipelinePhase::GpuRender;
     {
-        auto& fb = frameBuffers[recordingBuffer];
+        auto& fb = frameBuffer;
 
         // Store DLContext and waterSeen in FrameBuffer for per-frame isolation
         fb.dlContext = *frameCtx;
@@ -813,20 +860,20 @@ void FixedFunctionShader::finalizeAndRender(DLContext* frameCtx, bool waterSeen)
         if (g_renderThread && g_renderThread->isRunning()) {
             RenderThread::SceneWork work;
             work.type = RenderThread::WorkType::RenderFullFrame;
-            work.bufferIndex = recordingBuffer;
+            work.bufferIndex = 0;  // Single buffer
             g_renderThread->submitWork(std::move(work), false);  // wait=false — async for 3b
         } else {
-            executeGpuPhase(recordingBuffer);
+            executeGpuPhase();
         }
     }
 
     currentPhase = PipelinePhase::Idle;
 }
 
-void FixedFunctionShader::executeGpuPhase(int bufferIndex) {
+void FixedFunctionShader::executeGpuPhase() {
     MGE_ZoneScopedN("Frame_Render");
 
-    auto& fb = frameBuffers[bufferIndex];
+    auto& fb = frameBuffer;
     DLContext* frameCtx = &fb.dlContext;
     bool waterSeen = fb.waterSeen;
 
@@ -859,18 +906,20 @@ void FixedFunctionShader::executeGpuPhase(int bufferIndex) {
     DistantLand::renderStageBlend(frameCtx, &fb);
 
     // Build HLSL replay into command buffer, then replay it
-    // Scene 0/1/2 all go through HLSL replay
+    // IMPORTANT: Only replay Scene 0 here! Scene 1/2 are recorded AFTER EndScene(0),
+    // so replaying them here would use STALE data from previous frame (race condition).
+    // Scene 1/2 replay is deferred to finalizeAndRenderAllScenes.
     transitionTo(PhaseTransition::ReplayEntry);
     fb.hlslCmds.clear();
 
-    // Scene 0: World geometry
+    // Scene 0: World geometry (only scene recorded at this point)
+    LOG::logline("[ORDER] executeGpuPhase: Replay Scene 0 (%d calls)", (int)fb.recordedCalls.size());
     replayRecordedCalls(0, &fb.hlslCmds);
 
-    // Scene 1: Particles (alpha sorted, blended)
-    replayRecordedCalls(1, &fb.hlslCmds);
-
-    // Scene 2: Hands (skinned, after Z-clear in MW but we replay without clear)
-    replayRecordedCalls(2, &fb.hlslCmds);
+    // Scene 1/2 NOT replayed here — they haven't been recorded yet at EndScene(0)
+    // They will be replayed in finalizeAndRenderAllScenes after recording completes
+    LOG::logline("[ORDER] executeGpuPhase: Scene 1 has %d calls (NOT replayed here), Scene 2 has %d calls (NOT replayed here)",
+        (int)fb.recordedCallsScene1.size(), (int)fb.recordedCallsScene2.size());
 
     fb.hlslCmds.replay(device);
     transitionTo(PhaseTransition::ReplayExit);
@@ -916,17 +965,26 @@ void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool w
 
     if (!recordingEnabled) return;
 
-    auto& fb = frameBuffers[recordingBuffer];
+    auto& fb = frameBuffer;
 
     LOG::logline("finalizeAndRenderAllScenes: scene0=%d, scene1=%d, scene2=%d",
         (int)fb.recordedCalls.size(), (int)fb.recordedCallsScene1.size(), (int)fb.recordedCallsScene2.size());
 
-    // === SAVE UI TRANSFORMS ===
-    // MW set up UI view/projection before calling BeginScene. We need to restore these
+    // === SAVE UI STATE ===
+    // MW set up UI state before calling BeginScene. We need to restore these
     // after 3D rendering so HUD draws correctly.
     D3DXMATRIX savedUIView, savedUIProj;
     device->GetTransform(D3DTS_VIEW, &savedUIView);
     device->GetTransform(D3DTS_PROJECTION, &savedUIProj);
+    // Save blend/alpha state - GPU phases will corrupt this
+    DWORD savedAlphaBlend, savedSrcBlend, savedDestBlend;
+    DWORD savedAlphaTest, savedAlphaRef, savedAlphaFunc;
+    device->GetRenderState(D3DRS_ALPHABLENDENABLE, &savedAlphaBlend);
+    device->GetRenderState(D3DRS_SRCBLEND, &savedSrcBlend);
+    device->GetRenderState(D3DRS_DESTBLEND, &savedDestBlend);
+    device->GetRenderState(D3DRS_ALPHATESTENABLE, &savedAlphaTest);
+    device->GetRenderState(D3DRS_ALPHAREF, &savedAlphaRef);
+    device->GetRenderState(D3DRS_ALPHAFUNC, &savedAlphaFunc);
 
     // === RESTORE ENDSCENE(0) STATE ===
     // State was captured at EndScene(0), but MW ran Scene 1/2 since then.
@@ -936,13 +994,27 @@ void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool w
     // === PREPARE ALL SCENES ===
     {
         MGE_ZoneScopedN("Prepare All Scenes");
-        prepareRecordedCalls(recordingBuffer);  // This now prepares Scene 0, 1, and 2
+        prepareRecordedCalls();  // This now prepares Scene 0, 1, and 2
         fb.state = BufferState::ReadyToRender;
     }
 
     // Store context in FrameBuffer
     fb.dlContext = *frameCtx;
     fb.waterSeen = waterSeen;
+
+    // === STAGE 0 GPU: Shadow map, distant land, sky, water reflection, wave sim ===
+    {
+        MGE_ZoneScopedN("Stage0 GPU");
+        DistantLand::renderStage0GPU(frameCtx, &fb);
+    }
+
+    // Update shadow VP in frame buffer — renderShadowMap just computed current frame's
+    // shadow matrices and wrote them back to s_staging. The stale previous-frame values
+    // captured at startRecording() would cause shadow shaking on camera movement.
+    {
+        fb.shadowViewproj[0] = DistantLand::s_staging.smViewproj[0];
+        fb.shadowViewproj[1] = DistantLand::s_staging.smViewproj[1];
+    }
 
     // === DEPTH PASSES ===
     // Render depth for Scene 0 (world) and Scene 2 (hands)
@@ -969,20 +1041,137 @@ void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool w
         transitionTo(PhaseTransition::ReplayEntry);
 
         // Replay Scene 0 (world)
+        LOG::logline("[ORDER] finalizeAndRenderAllScenes: Replay Scene 0 (%d calls)", (int)fb.recordedCalls.size());
         replayRecordedCalls(0, nullptr);
-
-        // Replay Scene 1 (particles) - depth tested against Scene 0
-        replayRecordedCalls(1, nullptr);
-
-        // Replay Scene 2 (hands) - rendered on top
-        replayRecordedCalls(2, nullptr);
 
         transitionTo(PhaseTransition::ReplayExit);
     }
 
-    // Water surface AFTER replay
+    // Water surface AFTER Scene 0 but BEFORE Scene 1 particles
+    // Water writes depth, then particles blend over it
     if (waterSeen) {
         DistantLand::renderStageWater(frameCtx);
+    }
+
+    // Upload snapshot vertex/index data to staging buffers before Scene 1/2 replay
+    {
+        MGE_ZoneScopedN("Upload Particle Staging Buffers");
+
+        // Calculate total bytes needed for Scene 1 + Scene 2
+        UINT totalVBBytes = 0, totalIBBytes = 0;
+        for (auto& call : fb.recordedCallsScene1) {
+            if (call.usesSnapshot) {
+                call.stagingVBOffset = totalVBBytes;
+                call.stagingIBOffset = totalIBBytes;
+                totalVBBytes += (UINT)call.vertexSnapshot.size();
+                totalIBBytes += (UINT)call.indexSnapshot.size();
+            }
+        }
+        for (auto& call : fb.recordedCallsScene2) {
+            if (call.usesSnapshot) {
+                call.stagingVBOffset = totalVBBytes;
+                call.stagingIBOffset = totalIBBytes;
+                totalVBBytes += (UINT)call.vertexSnapshot.size();
+                totalIBBytes += (UINT)call.indexSnapshot.size();
+            }
+        }
+
+        LOG::logline("[STAGING] Scene 1 has %d calls, Scene 2 has %d calls, totalVB=%u, totalIB=%u",
+            (int)fb.recordedCallsScene1.size(), (int)fb.recordedCallsScene2.size(), totalVBBytes, totalIBBytes);
+
+        // Resize staging VB if needed
+        if (totalVBBytes > 0 && totalVBBytes > fb.stagingVBSize) {
+            if (fb.particleStagingVB) {
+                fb.particleStagingVB->Release();
+                fb.particleStagingVB = nullptr;
+            }
+            HRESULT hr = device->CreateVertexBuffer(totalVBBytes, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
+                0, D3DPOOL_DEFAULT, &fb.particleStagingVB, nullptr);
+            if (SUCCEEDED(hr)) {
+                fb.stagingVBSize = totalVBBytes;
+                LOG::logline("[STAGING] Created VB %u bytes", totalVBBytes);
+            } else {
+                LOG::logline("!! Failed to create particle staging VB (%u bytes)", totalVBBytes);
+            }
+        }
+
+        // Resize staging IB if needed
+        if (totalIBBytes > 0 && totalIBBytes > fb.stagingIBSize) {
+            if (fb.particleStagingIB) {
+                fb.particleStagingIB->Release();
+                fb.particleStagingIB = nullptr;
+            }
+            HRESULT hr = device->CreateIndexBuffer(totalIBBytes, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
+                D3DFMT_INDEX16, D3DPOOL_DEFAULT, &fb.particleStagingIB, nullptr);
+            if (SUCCEEDED(hr)) {
+                fb.stagingIBSize = totalIBBytes;
+                LOG::logline("[STAGING] Created IB %u bytes", totalIBBytes);
+            } else {
+                LOG::logline("!! Failed to create particle staging IB (%u bytes)", totalIBBytes);
+            }
+        }
+
+        // Batch upload all snapshot data
+        if (totalVBBytes > 0 && fb.particleStagingVB && totalIBBytes > 0 && fb.particleStagingIB) {
+            void* pVB = nullptr;
+            void* pIB = nullptr;
+            if (SUCCEEDED(fb.particleStagingVB->Lock(0, totalVBBytes, &pVB, D3DLOCK_DISCARD)) &&
+                SUCCEEDED(fb.particleStagingIB->Lock(0, totalIBBytes, &pIB, D3DLOCK_DISCARD))) {
+
+                for (auto& call : fb.recordedCallsScene1) {
+                    if (call.usesSnapshot && !call.vertexSnapshot.empty()) {
+                        memcpy((BYTE*)pVB + call.stagingVBOffset, call.vertexSnapshot.data(), call.vertexSnapshot.size());
+                        memcpy((BYTE*)pIB + call.stagingIBOffset, call.indexSnapshot.data(), call.indexSnapshot.size());
+                    }
+                }
+                for (auto& call : fb.recordedCallsScene2) {
+                    if (call.usesSnapshot && !call.vertexSnapshot.empty()) {
+                        memcpy((BYTE*)pVB + call.stagingVBOffset, call.vertexSnapshot.data(), call.vertexSnapshot.size());
+                        memcpy((BYTE*)pIB + call.stagingIBOffset, call.indexSnapshot.data(), call.indexSnapshot.size());
+                    }
+                }
+
+                fb.particleStagingVB->Unlock();
+                fb.particleStagingIB->Unlock();
+                LOG::logline("[STAGING] Uploaded %u VB bytes, %u IB bytes", totalVBBytes, totalIBBytes);
+            }
+        }
+    }
+
+    // Replay Scene 1 (particles) - use Scene 1's view/proj, blend over water
+    {
+        isReplaying = true;
+        D3DXMATRIX savedView = fb.view;
+        D3DXMATRIX savedProj = fb.proj;
+        fb.view = fb.viewScene1;
+        fb.proj = fb.projScene1;
+
+        LOG::logline("[ORDER] finalizeAndRenderAllScenes: Replay Scene 1 (%d calls)", (int)fb.recordedCallsScene1.size());
+        replayRecordedCalls(1, nullptr);
+
+        fb.view = savedView;
+        fb.proj = savedProj;
+        isReplaying = false;
+    }
+
+    // Z-clear before Scene 2: MW clears depth before hands so they render in front
+    device->Clear(0, NULL, D3DCLEAR_ZBUFFER, 0, 1.0f, 0);
+
+    // Replay Scene 2 (hands) - use hands view/proj matrices
+    // Hands use a different view matrix to stay fixed on screen
+    {
+        D3DXMATRIX savedView = fb.view;
+        D3DXMATRIX savedProj = fb.proj;
+        fb.view = fb.viewScene2;
+        fb.proj = fb.projScene2;
+
+        isReplaying = true;
+        LOG::logline("[ORDER] finalizeAndRenderAllScenes: Replay Scene 2 (%d calls)", (int)fb.recordedCallsScene2.size());
+        replayRecordedCalls(2, nullptr);
+        isReplaying = false;
+
+        fb.view = savedView;
+        fb.proj = savedProj;
     }
 
     // Clean up HLSL state (textures, shaders)
@@ -995,9 +1184,16 @@ void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool w
     device->SetPixelShader(NULL);
 
     // === RESTORE UI STATE ===
-    // MW set up UI view/projection before calling BeginScene. Restore them so HUD draws correctly.
+    // MW set up UI state before calling BeginScene. Restore it so HUD draws correctly.
     device->SetTransform(D3DTS_VIEW, &savedUIView);
     device->SetTransform(D3DTS_PROJECTION, &savedUIProj);
+    // Restore blend/alpha state (GPU phases corrupted these)
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, savedAlphaBlend);
+    device->SetRenderState(D3DRS_SRCBLEND, savedSrcBlend);
+    device->SetRenderState(D3DRS_DESTBLEND, savedDestBlend);
+    device->SetRenderState(D3DRS_ALPHATESTENABLE, savedAlphaTest);
+    device->SetRenderState(D3DRS_ALPHAREF, savedAlphaRef);
+    device->SetRenderState(D3DRS_ALPHAFUNC, savedAlphaFunc);
 
     // MW cleared depth buffer before BeginScene, but we filled it with 3D scene.
     // Clear it again so UI draws aren't depth-tested against 3D geometry.
@@ -1051,6 +1247,85 @@ void FixedFunctionShader::replayScene1And2(FrameBuffer* fb) {
 
     LOG::logline("replayScene1And2: scene1=%d, scene2=%d calls",
         (int)fb->recordedCallsScene1.size(), (int)fb->recordedCallsScene2.size());
+
+    // Upload snapshot vertex/index data to staging buffers before replay
+    {
+        MGE_ZoneScopedN("Upload Particle Staging Buffers");
+
+        // Calculate total bytes needed for Scene 1 + Scene 2
+        UINT totalVBBytes = 0, totalIBBytes = 0;
+        for (auto& call : fb->recordedCallsScene1) {
+            if (call.usesSnapshot) {
+                call.stagingVBOffset = totalVBBytes;
+                call.stagingIBOffset = totalIBBytes;
+                totalVBBytes += (UINT)call.vertexSnapshot.size();
+                totalIBBytes += (UINT)call.indexSnapshot.size();
+            }
+        }
+        for (auto& call : fb->recordedCallsScene2) {
+            if (call.usesSnapshot) {
+                call.stagingVBOffset = totalVBBytes;
+                call.stagingIBOffset = totalIBBytes;
+                totalVBBytes += (UINT)call.vertexSnapshot.size();
+                totalIBBytes += (UINT)call.indexSnapshot.size();
+            }
+        }
+
+        // Resize staging VB if needed
+        if (totalVBBytes > 0 && totalVBBytes > fb->stagingVBSize) {
+            if (fb->particleStagingVB) {
+                fb->particleStagingVB->Release();
+                fb->particleStagingVB = nullptr;
+            }
+            HRESULT hr = device->CreateVertexBuffer(totalVBBytes, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
+                0, D3DPOOL_DEFAULT, &fb->particleStagingVB, nullptr);
+            if (SUCCEEDED(hr)) {
+                fb->stagingVBSize = totalVBBytes;
+            } else {
+                LOG::logline("!! Failed to create particle staging VB (%u bytes)", totalVBBytes);
+            }
+        }
+
+        // Resize staging IB if needed
+        if (totalIBBytes > 0 && totalIBBytes > fb->stagingIBSize) {
+            if (fb->particleStagingIB) {
+                fb->particleStagingIB->Release();
+                fb->particleStagingIB = nullptr;
+            }
+            HRESULT hr = device->CreateIndexBuffer(totalIBBytes, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
+                D3DFMT_INDEX16, D3DPOOL_DEFAULT, &fb->particleStagingIB, nullptr);
+            if (SUCCEEDED(hr)) {
+                fb->stagingIBSize = totalIBBytes;
+            } else {
+                LOG::logline("!! Failed to create particle staging IB (%u bytes)", totalIBBytes);
+            }
+        }
+
+        // Batch upload all snapshot data
+        if (totalVBBytes > 0 && fb->particleStagingVB && totalIBBytes > 0 && fb->particleStagingIB) {
+            void* pVB = nullptr;
+            void* pIB = nullptr;
+            if (SUCCEEDED(fb->particleStagingVB->Lock(0, totalVBBytes, &pVB, D3DLOCK_DISCARD)) &&
+                SUCCEEDED(fb->particleStagingIB->Lock(0, totalIBBytes, &pIB, D3DLOCK_DISCARD))) {
+
+                for (auto& call : fb->recordedCallsScene1) {
+                    if (call.usesSnapshot && !call.vertexSnapshot.empty()) {
+                        memcpy((BYTE*)pVB + call.stagingVBOffset, call.vertexSnapshot.data(), call.vertexSnapshot.size());
+                        memcpy((BYTE*)pIB + call.stagingIBOffset, call.indexSnapshot.data(), call.indexSnapshot.size());
+                    }
+                }
+                for (auto& call : fb->recordedCallsScene2) {
+                    if (call.usesSnapshot && !call.vertexSnapshot.empty()) {
+                        memcpy((BYTE*)pVB + call.stagingVBOffset, call.vertexSnapshot.data(), call.vertexSnapshot.size());
+                        memcpy((BYTE*)pIB + call.stagingIBOffset, call.indexSnapshot.data(), call.indexSnapshot.size());
+                    }
+                }
+
+                fb->particleStagingVB->Unlock();
+                fb->particleStagingIB->Unlock();
+            }
+        }
+    }
 
     isReplaying = true;
 
@@ -1223,14 +1498,13 @@ void FixedFunctionShader::validateAgainstBaselines() {
     }
 }
 
-// Triple-buffer pipeline: cull pass (called by CullThread or inline on main thread)
-void FixedFunctionShader::executeCullPass(int bufferIndex) {
+// Single-buffer pipeline: cull pass (called by CullThread or inline on main thread)
+void FixedFunctionShader::executeCullPass() {
     // Cull thread is idle - prepareRecordedCalls moved to main thread
-    (void)bufferIndex;
 }
 
-void FixedFunctionShader::executeRenderPass(int bufferIndex) {
-    executeGpuPhase(bufferIndex);
+void FixedFunctionShader::executeRenderPass() {
+    executeGpuPhase();
 }
 
 // Compare two LightStates for equality (to detect if we can reuse cached state)
@@ -1349,9 +1623,107 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
     // NOTE: DIP events are already logged in mged3d8device.cpp DrawIndexedPrimitive
     // before reaching this recording path. Do NOT log again here to avoid double-counting.
 
+    // Record to current scene's buffer - each scene uses its own captured VIEW matrix
+    // Do NOT reroute blending draws to Scene 1 - that causes VIEW matrix mismatch
+    // (MW computed billboard vertices using current scene's VIEW, not Scene 1's VIEW)
     {
+        // Debug: Log particle draws (blendEnable && !zWrite)
+        static int hlslRecParticleIdx = 0;
+        static int hlslRecLastFrame = -1;
+        if (hlslDiagFrameCounter != hlslRecLastFrame) {
+            hlslRecParticleIdx = 0;
+            hlslRecLastFrame = hlslDiagFrameCounter;
+        }
+        if (rs->blendEnable && !rs->zWrite && hlslRecParticleIdx < 20) {
+            auto& recFb = frameBuffer;
+            size_t callIdx = currentRecordedCalls().size();
+            LOG::logline("[REC-P] #%d vbs=%d world41=%.2f wvt41=%.2f view41=%.2f proj11=%.3f prims=%d",
+                hlslRecParticleIdx, rs->vertexBlendState,
+                rs->worldTransforms[0]._41, rs->worldViewTransforms[0]._41,
+                rs->viewTransform._41, recFb.proj._11, rs->primCount);
+            hlslRecParticleIdx++;
+        }
+
         currentRecordedCalls().emplace_back(rs, frs, sharedLightState, sk, recordMWIdx);
-        currentRecordedCalls().back().sceneNum = currentRecordingScene;
+        auto& newCall = currentRecordedCalls().back();
+        newCall.sceneNum = currentRecordingScene;
+
+        // Snapshot VB/IB data for Scene 1/2 (particles/hands) with dynamic VBs
+        // The shared particle VB may be overwritten by other particles before replay
+        if (currentRecordingScene >= 1 && rs->vb && rs->ib) {
+            newCall.usesSnapshot = true;
+
+            // Snapshot vertex data
+            UINT vbStartByte = rs->baseIndex * rs->vbStride;
+            UINT vbByteCount = rs->vertCount * rs->vbStride;
+            newCall.vertexSnapshot.resize(vbByteCount);
+            void* pVertices = nullptr;
+            HRESULT hr = rs->vb->Lock(vbStartByte, vbByteCount, &pVertices, D3DLOCK_READONLY | D3DLOCK_NOOVERWRITE);
+            if (SUCCEEDED(hr) && pVertices) {
+                memcpy(newCall.vertexSnapshot.data(), pVertices, vbByteCount);
+                rs->vb->Unlock();
+            } else {
+                newCall.usesSnapshot = false;  // Fallback to original VB if lock fails
+                newCall.vertexSnapshot.clear();
+                LOG::logline("[SNAP] VB lock failed scene=%d hr=0x%X", currentRecordingScene, hr);
+            }
+
+            // Snapshot index data (only if vertex snapshot succeeded)
+            if (newCall.usesSnapshot) {
+                // Determine index size from IB format
+                D3DINDEXBUFFER_DESC ibDesc;
+                rs->ib->GetDesc(&ibDesc);
+                UINT indexSize = (ibDesc.Format == D3DFMT_INDEX32) ? 4 : 2;
+                UINT ibStartByte = rs->startIndex * indexSize;
+                UINT ibByteCount = rs->primCount * 3 * indexSize;  // Triangle list
+                newCall.indexSnapshot.resize(ibByteCount);
+                void* pIndices = nullptr;
+                hr = rs->ib->Lock(ibStartByte, ibByteCount, &pIndices, D3DLOCK_READONLY | D3DLOCK_NOOVERWRITE);
+                if (SUCCEEDED(hr) && pIndices) {
+                    memcpy(newCall.indexSnapshot.data(), pIndices, ibByteCount);
+                    rs->ib->Unlock();
+                    // Log first few snapshots per frame
+                    static int snapLogCount = 0;
+                    static int snapLastFrame = -1;
+                    if (hlslDiagFrameCounter != snapLastFrame) {
+                        snapLogCount = 0;
+                        snapLastFrame = hlslDiagFrameCounter;
+                    }
+                    if (snapLogCount < 3) {
+                        LOG::logline("[SNAP] OK scene=%d VB=%u IB=%u stride=%d verts=%d prims=%d",
+                            currentRecordingScene, vbByteCount, ibByteCount, rs->vbStride, rs->vertCount, rs->primCount);
+                        snapLogCount++;
+                    }
+                } else {
+                    newCall.usesSnapshot = false;  // Fallback if lock fails
+                    newCall.vertexSnapshot.clear();
+                    newCall.indexSnapshot.clear();
+                    LOG::logline("[SNAP] IB lock failed scene=%d hr=0x%X", currentRecordingScene, hr);
+                }
+            }
+        } else if (currentRecordingScene >= 1) {
+            // Log why we didn't snapshot
+            static int noSnapLogCount = 0;
+            static int noSnapLastFrame = -1;
+            if (hlslDiagFrameCounter != noSnapLastFrame) {
+                noSnapLogCount = 0;
+                noSnapLastFrame = hlslDiagFrameCounter;
+            }
+            if (noSnapLogCount < 3) {
+                LOG::logline("[SNAP] SKIP scene=%d vb=%p ib=%p", currentRecordingScene, rs->vb, rs->ib);
+                noSnapLogCount++;
+            }
+        }
+
+        // Log recording order for Scene 1/2 (particles/hands)
+        if (currentRecordingScene > 0) {
+            static int orderLogCount = 0;
+            if (orderLogCount < 10) {
+                LOG::logline("[ORDER] Record Scene %d call #%d (world41=%.1f)",
+                    currentRecordingScene, (int)currentRecordedCalls().size(), rs->worldTransforms[0]._41);
+                orderLogCount++;
+            }
+        }
 
         // Immediately populate bboxLookup so depth pass can use current-frame bboxes
         // (executeHiZCulling runs BEFORE finalizeBatchAndReplay)

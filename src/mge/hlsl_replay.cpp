@@ -49,7 +49,7 @@ static std::unordered_map<IDirect3DBaseTexture9*, std::pair<DWORD, DWORD>> sampl
 
 // Helper: get current frame's recorded calls
 static auto& currentRecordedCalls() {
-    return FixedFunctionShader::frameBuffers[FixedFunctionShader::recordingBuffer].recordedCalls;
+    return FixedFunctionShader::frameBuffer.recordedCalls;
 }
 
 // Material state cache helper functions
@@ -181,6 +181,15 @@ static void applyDeviceState(D3DCommandBuffer* cmdBuf, IDirect3DDevice9* device,
 
     // Debug
     setRS(D3DRS_FILLMODE, s.fillMode);
+
+    // Point sprites (particles) - ALWAYS restore ALL states to prevent leaking
+    // Even when disabled, previous draw's scale values can affect next draw
+    setRS(D3DRS_POINTSPRITEENABLE, s.pointSpriteEnable);
+    setRS(D3DRS_POINTSCALEENABLE, s.pointScaleEnable);
+    setRS(D3DRS_POINTSIZE, *(DWORD*)&s.pointSize);
+    setRS(D3DRS_POINTSCALE_A, *(DWORD*)&s.pointScaleA);
+    setRS(D3DRS_POINTSCALE_B, *(DWORD*)&s.pointScaleB);
+    setRS(D3DRS_POINTSCALE_C, *(DWORD*)&s.pointScaleC);
 }
 
 // Set replay baseline — establishes known device state at start of async replay
@@ -197,6 +206,23 @@ static void setReplayBaseline(D3DCommandBuffer* cmdBuf, IDirect3DDevice9* device
             device->SetSamplerState(i, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
             device->SetSamplerState(i, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
         }
+    }
+
+    // Clear VS constants to prevent cross-draw leakage
+    // Shaders may use registers we don't explicitly set — stale values cause rendering bugs
+    static float zeros[32 * 4] = {0};  // c0-c31 (32 registers, 4 floats each)
+    if (cmdBuf) {
+        cmdBuf->recordSetVSConstantF(0, zeros, 32);
+    } else {
+        device->SetVertexShaderConstantF(0, zeros, 32);
+    }
+
+    // Clear PS constants to prevent cross-draw leakage (matching VS clear)
+    // Without this, stale PS constants from previous draws can leak to current draw
+    if (cmdBuf) {
+        cmdBuf->recordSetPSConstantF(0, zeros, 32);
+    } else {
+        device->SetPixelShaderConstantF(0, zeros, 32);
     }
 }
 
@@ -435,7 +461,7 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
     renderMorrowindHLSL_Internal(&rsWithShadows, frs, lightrs);
 }
 
-void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, DWORD dirtyFlags, int callIndex, D3DCommandBuffer* cmdBuf, const DeviceStateSnapshot* capturedState) {
+void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, DWORD dirtyFlags, int callIndex, D3DCommandBuffer* cmdBuf, const DeviceStateSnapshot* capturedState, const HLSLRecordedCall* replayCall) {
 
     // Process any completed async shader compilations
     processAsyncCompletions();
@@ -446,10 +472,19 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     ShaderKey sk;
     if (isReplaying) {
         // During replay, use the recorded ShaderKey with original suffix flags
-        for (const auto& call : frameBuffers[recordingBuffer].recordedCalls) {
-            if (&call.rs == rs) {
-                sk = call.sk;
-                break;
+        // Search all scene buffers (Scene 0, 1, and 2)
+        bool found = false;
+        for (const auto& call : frameBuffer.recordedCalls) {
+            if (&call.rs == rs) { sk = call.sk; found = true; break; }
+        }
+        if (!found) {
+            for (const auto& call : frameBuffer.recordedCallsScene1) {
+                if (&call.rs == rs) { sk = call.sk; found = true; break; }
+            }
+        }
+        if (!found) {
+            for (const auto& call : frameBuffer.recordedCallsScene2) {
+                if (&call.rs == rs) { sk = call.sk; found = true; break; }
             }
         }
     } else {
@@ -680,7 +715,7 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     // During replay, device may have UI view — use recorded game view instead
     D3DXMATRIX currentView;
     if (isReplaying) {
-        currentView = frameBuffers[recordingBuffer].view;
+        currentView = frameBuffer.view;
     } else {
         device->GetTransform(D3DTS_VIEW, &currentView);
     }
@@ -708,8 +743,9 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             shadowTransformValid = shadowMatricesValid;
         }
 
-        setConstantF(cmdBuf, device, true, 20, (float*)&cachedViewToShadowLocal[0], 4); // c20-c23
-        setConstantF(cmdBuf, device, true, 24, (float*)&cachedViewToShadowLocal[1], 4); // c24-c27
+        // Shadow matrices at c60-c67 (explicit register to avoid collision)
+        setConstantF(cmdBuf, device, true, 60, (float*)&cachedViewToShadowLocal[0], 4); // c60-c63
+        setConstantF(cmdBuf, device, true, 64, (float*)&cachedViewToShadowLocal[1], 4); // c64-c67
 
         // Set shadow resolution parameter
         float shadowRcpData[4] = { 1.0f / Configuration.DL.ShadowResolution, 0, 0, 0 };
@@ -806,6 +842,17 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             setCachedRenderState(device, D3DRS_ALPHAREF, rs->alphaRef, materialCache.alphaRef, materialCache.alphaRefValid);
         }
 
+        // Point sprites (particles) - ALWAYS restore ALL states from captured state
+        // Even when disabled, previous draw's scale values can affect next draw
+        if (capturedState) {
+            device->SetRenderState(D3DRS_POINTSPRITEENABLE, capturedState->pointSpriteEnable);
+            device->SetRenderState(D3DRS_POINTSCALEENABLE, capturedState->pointScaleEnable);
+            device->SetRenderState(D3DRS_POINTSIZE, *(DWORD*)&capturedState->pointSize);
+            device->SetRenderState(D3DRS_POINTSCALE_A, *(DWORD*)&capturedState->pointScaleA);
+            device->SetRenderState(D3DRS_POINTSCALE_B, *(DWORD*)&capturedState->pointScaleB);
+            device->SetRenderState(D3DRS_POINTSCALE_C, *(DWORD*)&capturedState->pointScaleC);
+        }
+
         // Set vertex format (legacy DX8 FVF - HLSL input semantics handle layout internally)
         setCachedFVF(device, rs->fvf, materialCache.fvf, materialCache.fvfValid);
 
@@ -822,8 +869,8 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     // During replay, use ALL recorded matrices to avoid stale matrix issues
     // During normal rendering, get them from the device
     if (isReplaying) {
-        projMatrix = frameBuffers[recordingBuffer].proj;
-        viewMatrix = frameBuffers[recordingBuffer].view;
+        projMatrix = frameBuffer.proj;
+        viewMatrix = frameBuffer.view;
         worldMatrix = rs->worldTransforms[0];
     } else {
         device->GetTransform(D3DTS_PROJECTION, &projMatrix);
@@ -834,8 +881,11 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     // During replay, use recorded combined matrices; during normal rendering, calculate them
     D3DXMATRIX worldViewProj, worldView;
     if (isReplaying) {
-        worldViewProj = rs->worldTransforms[0] * frameBuffers[recordingBuffer].view * frameBuffers[recordingBuffer].proj;
-        worldView = rs->worldTransforms[0] * frameBuffers[recordingBuffer].view;
+        // Use precomputed worldViewTransforms from recording time - this has the CORRECT view matrix
+        // that was active when MW issued this draw call. Recomputing with frameBuffer view would
+        // use the wrong view if buffer indices rotated.
+        worldView = rs->worldViewTransforms[0];
+        worldViewProj = rs->worldViewTransforms[0] * projMatrix;
     } else {
         worldViewProj = worldMatrix * viewMatrix * projMatrix;
         worldView = worldMatrix * viewMatrix;
@@ -843,6 +893,29 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
 
     // Set vertex shader constants — command buffer path uses resolved registers,
     // direct path uses constant tables (SetMatrix transposes internally)
+
+    // Debug: Log ALL blended draws (particles)
+    if (rs->blendEnable && !rs->zWrite) {
+        // Check point sprite state from captured state
+        const char* psState = "no-cap";
+        float psSize = 0;
+        if (capturedState) {
+            psState = capturedState->pointSpriteEnable ? "PS-ON" : "PS-off";
+            psSize = capturedState->pointSize;
+        }
+
+        // Log shader info and register layout
+        // cmdBuf path: shader recorded but not yet bound, so don't check device state
+        LOG::logline("[P] VS=%p regWV=%d regProj=%d wv41=%.0f %s prims=%d world41=%.0f",
+            hlslShader.vertexShader, hlslShader.regWorldView.reg, hlslShader.regProj.reg,
+            worldView._41, psState, rs->primCount, rs->worldTransforms[0]._41);
+        // Log matrices separately to verify multiplication
+        LOG::logline("[P-MAT] world=(%.2f,%.2f,%.2f,%.2f) view=(%.2f,%.2f,%.2f,%.2f) wv=(%.2f,%.2f,%.2f,%.2f)",
+            rs->worldTransforms[0]._11, rs->worldTransforms[0]._12, rs->worldTransforms[0]._13, rs->worldTransforms[0]._14,
+            viewMatrix._11, viewMatrix._12, viewMatrix._13, viewMatrix._14,
+            worldView._11, worldView._12, worldView._13, worldView._14);
+    }
+
     if (cmdBuf) {
         if (hlslShader.regWorldViewProj.reg != REG_INVALID)
             setMatrixConstantF(cmdBuf, device, true, hlslShader.regWorldViewProj.reg, worldViewProj);
@@ -852,16 +925,26 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             setMatrixConstantF(cmdBuf, device, true, hlslShader.regProj.reg, projMatrix);
         if (hlslShader.regWorld.reg != REG_INVALID)
             setMatrixConstantF(cmdBuf, device, true, hlslShader.regWorld.reg, rs->worldTransforms[0]);
-        if (hlslShader.regWorldView.reg != REG_INVALID)
-            setMatrixConstantF(cmdBuf, device, true, hlslShader.regWorldView.reg, worldView);
+        if (hlslShader.regWorldView.reg != REG_INVALID) {
+            // For rigid draws (vbs=0), use precomputed worldViewTransforms[0] instead of replay-time worldView
+            // The shader reads from worldview register (c4) for rigid path, not vertexBlendPalette
+            if (rs->vertexBlendState == 0) {
+                setMatrixConstantF(cmdBuf, device, true, hlslShader.regWorldView.reg, rs->worldViewTransforms[0]);
+            } else {
+                setMatrixConstantF(cmdBuf, device, true, hlslShader.regWorldView.reg, worldView);
+            }
+        }
 
         if (hlslShader.regVertexBlendPalette.reg != REG_INVALID) {
             D3DXMATRIX blendMatrices[4];
             if (rs->vertexBlendState > 0) {
+                // Use precomputed worldViewTransforms from recording time
                 for (int i = 0; i < 4; i++)
-                    blendMatrices[i] = rs->worldTransforms[i] * viewMatrix;
+                    blendMatrices[i] = rs->worldViewTransforms[i];
             } else {
-                blendMatrices[0] = worldView;
+                // Rigid path: also use precomputed worldViewTransforms[0] for consistency
+                // Using replay-time worldView would cause mismatch with recorded geometry
+                blendMatrices[0] = rs->worldViewTransforms[0];
                 memset(&blendMatrices[1], 0, sizeof(D3DXMATRIX) * 3);
             }
             // SetMatrixArray transposes each matrix — we must do the same
@@ -874,6 +957,13 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         if (hlslShader.regVertexBlendState.reg != REG_INVALID) {
             float blendState[4] = { (float)rs->vertexBlendState, 0, 0, 0 };
             cmdBuf->recordSetVSConstantF(hlslShader.regVertexBlendState.reg, blendState, 1);
+        } else if (rs->blendEnable && !rs->zWrite) {
+            // Particle without regVertexBlendState - state may be stale!
+            static bool logged = false;
+            if (!logged) {
+                LOG::logline("!! PARTICLE: regVertexBlendState=INVALID, vbs=%d may be stale!", rs->vertexBlendState);
+                logged = true;
+            }
         }
 
         if (hlslShader.regShadowWorldViewProj.reg != REG_INVALID) {
@@ -892,6 +982,23 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         }
     } else if (hlslShader.vsConstantTable) {
         try {
+            // Debug: Pre-SetMatrix logging for particle draws
+            static int preSetMatrixParticleIdx = 0;
+            static int preSetMatrixLastFrame = -1;
+            if (hlslDiagFrameCounter != preSetMatrixLastFrame) {
+                preSetMatrixParticleIdx = 0;
+                preSetMatrixLastFrame = hlslDiagFrameCounter;
+            }
+            bool isParticleDraw = rs->blendEnable && !rs->zWrite;
+            if (isParticleDraw && preSetMatrixParticleIdx < 20) {
+                LOG::logline("[P-PRE] #%d hWVP=%p hWV=%p hProj=%p projReg=%d",
+                    preSetMatrixParticleIdx, hlslShader.hWorldViewProj, hlslShader.hWorldView, hlslShader.hProj,
+                    hlslShader.projRegister);
+                LOG::logline("        proj[0]=(%.2f,%.2f,%.2f,%.2f) proj[1]=(%.2f,%.2f,%.2f,%.2f)",
+                    projMatrix._11, projMatrix._12, projMatrix._13, projMatrix._14,
+                    projMatrix._21, projMatrix._22, projMatrix._23, projMatrix._24);
+                preSetMatrixParticleIdx++;
+            }
             if (hlslShader.hWorldViewProj) {
                 hlslShader.vsConstantTable->SetMatrix(device, hlslShader.hWorldViewProj, &worldViewProj);
             }
@@ -919,18 +1026,22 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             }
 
             if (hlslShader.hWorldView) {
-                hlslShader.vsConstantTable->SetMatrix(device, hlslShader.hWorldView, &worldView);
+                // For rigid draws (vbs=0), use precomputed worldViewTransforms[0] instead of replay-time worldView
+                // The shader reads from worldview register (c4) for rigid path, not vertexBlendPalette
+                if (rs->vertexBlendState == 0) {
+                    hlslShader.vsConstantTable->SetMatrix(device, hlslShader.hWorldView, &rs->worldViewTransforms[0]);
+                } else {
+                    hlslShader.vsConstantTable->SetMatrix(device, hlslShader.hWorldView, &worldView);
+                }
             }
             if (hlslShader.hVertexBlendPalette) {
                 if (rs->vertexBlendState > 0) {
-                    D3DXMATRIX currentWorldViewTransforms[4];
-                    for (int i = 0; i < 4; i++) {
-                        currentWorldViewTransforms[i] = rs->worldTransforms[i] * viewMatrix;
-                    }
-                    hlslShader.vsConstantTable->SetMatrixArray(device, hlslShader.hVertexBlendPalette, currentWorldViewTransforms, 4);
+                    // Use precomputed worldViewTransforms from recording time
+                    hlslShader.vsConstantTable->SetMatrixArray(device, hlslShader.hVertexBlendPalette, rs->worldViewTransforms, 4);
                 } else {
+                    // Rigid path: also use precomputed worldViewTransforms[0] for consistency
                     D3DXMATRIX blendMatrices[4];
-                    blendMatrices[0] = worldView;
+                    blendMatrices[0] = rs->worldViewTransforms[0];
                     memset(&blendMatrices[1], 0, sizeof(D3DXMATRIX) * 3);
                     hlslShader.vsConstantTable->SetMatrixArray(device, hlslShader.hVertexBlendPalette, blendMatrices, 4);
                 }
@@ -955,6 +1066,42 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             LOG::logline("!! HLSL Vertex shader constant table access failed - shader may have been edited");
         }
     }
+
+    // Debug: Post-SetMatrix readback to verify actual GPU constants for particles
+    // Read from ACTUAL shader registers (regWorldView, regProj), not hardcoded c0/c16
+    {
+        static int postSetMatrixParticleIdx = 0;
+        static int postSetMatrixLastFrame = -1;
+        if (hlslDiagFrameCounter != postSetMatrixLastFrame) {
+            postSetMatrixParticleIdx = 0;
+            postSetMatrixLastFrame = hlslDiagFrameCounter;
+        }
+        if (rs->blendEnable && !rs->zWrite && postSetMatrixParticleIdx < 20) {
+            // Read from actual shader registers (regWorldView=20, regProj=16 for typical particle shader)
+            int wvReg = hlslShader.regWorldView.reg;
+            int projReg = hlslShader.regProj.reg;
+            float wv[16], proj[16];
+            if (wvReg >= 0) {
+                device->GetVertexShaderConstantF(wvReg, wv, 4);
+            } else {
+                memset(wv, 0, sizeof(wv));
+            }
+            if (projReg >= 0) {
+                device->GetVertexShaderConstantF(projReg, proj, 4);
+            } else {
+                memset(proj, 0, sizeof(proj));
+            }
+            // Also read c16 (vertexBlendPalette[0]) - shader actually uses this, not c4!
+            float vbp[16];
+            device->GetVertexShaderConstantF(16, vbp, 4);
+            LOG::logline("[P-POST] #%d c4=(%.2f,%.2f,%.2f,%.2f) c16=(%.2f,%.2f,%.2f,%.2f)",
+                postSetMatrixParticleIdx,
+                wv[0], wv[1], wv[2], wv[3],
+                vbp[0], vbp[1], vbp[2], vbp[3]);
+            postSetMatrixParticleIdx++;
+        }
+    }
+
     // Compute lighting data (shared between cmdBuf and device paths)
     const size_t MaxLights = 8;
     D3DXVECTOR4 bufferDiffuse[MaxLights];
@@ -1466,7 +1613,15 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             return;
         }
 
-        hr = device->SetStreamSource(0, rs->vb, rs->vbOffset, rs->vbStride);
+        // Use staging buffer for Scene 1/2 snapshot draws, original VB for Scene 0
+        bool useStagingBuffer = replayCall && replayCall->usesSnapshot &&
+                                frameBuffer.particleStagingVB && frameBuffer.particleStagingIB;
+
+        if (useStagingBuffer) {
+            hr = device->SetStreamSource(0, frameBuffer.particleStagingVB, replayCall->stagingVBOffset, rs->vbStride);
+        } else {
+            hr = device->SetStreamSource(0, rs->vb, rs->vbOffset, rs->vbStride);
+        }
         if (FAILED(hr)) {
             return;
         }
@@ -1475,13 +1630,60 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         device->SetRenderState(D3DRS_DEPTHBIAS, *(DWORD*)&(const float&)-1e-6f);
         device->SetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, *(DWORD*)&(const float&)-1e-6f);
 
-        if (rs->ib) {
-            hr = device->SetIndices(rs->ib);
-            if (FAILED(hr)) {
-                LOG::logline("!! HLSL pipeline: failed to set index buffer, hr=%x", hr);
-                return;
+        // Debug: Log actual shader registers RIGHT BEFORE DrawIndexedPrimitive for particles
+        {
+            static int preDrawParticleIdx = 0;
+            static int preDrawLastFrame = -1;
+            if (hlslDiagFrameCounter != preDrawLastFrame) {
+                preDrawParticleIdx = 0;
+                preDrawLastFrame = hlslDiagFrameCounter;
             }
-            device->DrawIndexedPrimitive(rs->primType, rs->baseIndex, rs->minIndex, rs->vertCount, rs->startIndex, rs->primCount);
+            if (rs->blendEnable && !rs->zWrite && preDrawParticleIdx < 20) {
+                int wvReg = hlslShader.regWorldView.reg;
+                int projReg = hlslShader.regProj.reg;
+                float wv[16], proj[16];
+                if (wvReg >= 0) {
+                    device->GetVertexShaderConstantF(wvReg, wv, 4);
+                } else {
+                    memset(wv, 0, sizeof(wv));
+                }
+                if (projReg >= 0) {
+                    device->GetVertexShaderConstantF(projReg, proj, 4);
+                } else {
+                    memset(proj, 0, sizeof(proj));
+                }
+                LOG::logline("[P-DRAW] #%d wv@c%d=(%.2f,%.2f,%.2f,%.2f) proj@c%d=(%.2f,%.2f,%.2f,%.2f) staging=%d",
+                    preDrawParticleIdx,
+                    wvReg, wv[0], wv[1], wv[2], wv[3],
+                    projReg, proj[0], proj[1], proj[2], proj[3],
+                    useStagingBuffer ? 1 : 0);
+                preDrawParticleIdx++;
+            }
+        }
+
+        if (rs->ib) {
+            if (useStagingBuffer) {
+                // Staging buffer path: IB offset is byte offset, convert to index offset
+                D3DINDEXBUFFER_DESC ibDesc;
+                frameBuffer.particleStagingIB->GetDesc(&ibDesc);
+                UINT indexSize = (ibDesc.Format == D3DFMT_INDEX32) ? 4 : 2;
+                UINT startIndexOffset = replayCall->stagingIBOffset / indexSize;
+
+                hr = device->SetIndices(frameBuffer.particleStagingIB);
+                if (FAILED(hr)) {
+                    LOG::logline("!! HLSL pipeline: failed to set staging index buffer, hr=%x", hr);
+                    return;
+                }
+                // For staging buffer: baseIndex=0 (data is isolated), startIndex=offset into staging IB
+                device->DrawIndexedPrimitive(rs->primType, 0, 0, rs->vertCount, startIndexOffset, rs->primCount);
+            } else {
+                hr = device->SetIndices(rs->ib);
+                if (FAILED(hr)) {
+                    LOG::logline("!! HLSL pipeline: failed to set index buffer, hr=%x", hr);
+                    return;
+                }
+                device->DrawIndexedPrimitive(rs->primType, rs->baseIndex, rs->minIndex, rs->vertCount, rs->startIndex, rs->primCount);
+            }
         } else {
             device->DrawPrimitive(rs->primType, rs->startIndex, rs->primCount);
         }
@@ -1513,8 +1715,13 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
 }
 
 void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* cmdBuf) {
+    // Increment frame counter on Scene 0 replay (once per frame)
+    if (sceneCount == 0) {
+        hlslDiagFrameCounter++;
+    }
+
     // Select buffer based on sceneCount parameter (not currentRecordingScene)
-    auto& fb = frameBuffers[recordingBuffer];
+    auto& fb = frameBuffer;
     std::vector<HLSLRecordedCall>* recCallsPtr;
     if (sceneCount == 1) {
         recCallsPtr = &fb.recordedCallsScene1;
@@ -1532,6 +1739,13 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
 
         ImGuiManager::LogFrameEvent(FrameEvent::MGE_HLSLReplay, sceneCount, (int)recCalls.size());
 
+        // Log scene-level state at replay entry (for particle debugging)
+        if (sceneCount == 1) {
+            LOG::logline("[REP-P] Scene1 entry: fb.view41=%.2f viewScene1_41=%.2f staging.mwView41=%.2f calls=%d",
+                fb.view._41, fb.viewScene1._41,
+                DistantLand::s_staging.mwView._41, (int)recCalls.size());
+        }
+
         // Check if replay is disabled via ImGui
         if (!ImGuiManager::GetEnableReplay()) {
             return;
@@ -1539,6 +1753,9 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
     }
 
     isReplaying = true;
+
+    // Reset to baseline state at start of each scene replay to prevent cross-scene leaks
+    setReplayBaseline(cmdBuf, device);
 
     // Use game view/proj for light transforms and debug visualization
     // In deferred pipeline, device may have UI view — use s_staging which has the game matrices
@@ -1787,14 +2004,14 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
         // Track bin statistics
         binCounts[(int)call.bin]++;
 
-        // Per-bin suppress check
+        // Per-bin suppress check (Scene 0 only - Scene 2 hands have separate 1P checkboxes)
         switch (call.bin) {
-            case RenderBin::Terrain:    if (ImGuiManager::GetSuppressTerrain()) continue; break;
-            case RenderBin::Opaque:     if (ImGuiManager::GetSuppressOpaque()) continue; break;
-            case RenderBin::Skinning:   if (ImGuiManager::GetSuppressSkinning()) continue; break;
-            case RenderBin::Grass:      if (ImGuiManager::GetSuppressGrass()) continue; break;
-            case RenderBin::AlphaTested:if (ImGuiManager::GetSuppressAlphaTested()) continue; break;
-            case RenderBin::Blending:   if (ImGuiManager::GetSuppressBlending()) continue; break;
+            case RenderBin::Terrain:    if (sceneCount == 0 && ImGuiManager::GetSuppressTerrain()) continue; break;
+            case RenderBin::Opaque:     if (sceneCount == 0 && ImGuiManager::GetSuppressOpaque()) continue; break;
+            case RenderBin::Skinning:   if (sceneCount == 0 && ImGuiManager::GetSuppressSkinning()) continue; break;
+            case RenderBin::Grass:      if (sceneCount == 0 && ImGuiManager::GetSuppressGrass()) continue; break;
+            case RenderBin::AlphaTested:if (sceneCount == 0 && ImGuiManager::GetSuppressAlphaTested()) continue; break;
+            case RenderBin::Blending:   if (sceneCount == 0 && ImGuiManager::GetSuppressBlending()) continue; break;
             default: break;
         }
 
@@ -1815,17 +2032,36 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
             continue;
         }
 
+        // Debug: Log particle draws (blendEnable && !zWrite)
         {
-            // Restore sampler states for this call (captured during recording)
-            for (int stage = 0; stage < 8; ++stage) {
-                if (call.samplerStates[stage].captured) {
-                    if (cmdBuf) {
-                        cmdBuf->recordSetSamplerState(stage, D3DSAMP_ADDRESSU, call.samplerStates[stage].addressU);
-                        cmdBuf->recordSetSamplerState(stage, D3DSAMP_ADDRESSV, call.samplerStates[stage].addressV);
-                    } else {
-                        device->SetSamplerState(stage, D3DSAMP_ADDRESSU, call.samplerStates[stage].addressU);
-                        device->SetSamplerState(stage, D3DSAMP_ADDRESSV, call.samplerStates[stage].addressV);
-                    }
+            static int hlslRepParticleIdx = 0;
+            static int hlslRepLastFrame = -1;
+            if (hlslDiagFrameCounter != hlslRepLastFrame) {
+                hlslRepParticleIdx = 0;
+                hlslRepLastFrame = hlslDiagFrameCounter;
+            }
+            if (call.rs.blendEnable && !call.rs.zWrite && hlslRepParticleIdx < 20) {
+                LOG::logline("[REP-P] #%d vbs=%d hl=%d lm=%d world41=%.2f wvt41=%.2f prims=%d",
+                    hlslRepParticleIdx, call.rs.vertexBlendState,
+                    (int)call.sk.heavyLighting, (int)call.sk.lightMode,
+                    call.rs.worldTransforms[0]._41, call.rs.worldViewTransforms[0]._41,
+                    call.rs.primCount);
+                hlslRepParticleIdx++;
+            }
+        }
+
+        {
+            // Restore sampler states for this call - ALWAYS set to prevent leaking
+            // Use captured values if available, otherwise default to WRAP
+            for (int stage = 0; stage < 2; ++stage) {  // Only stages 0-1 are MW textures
+                DWORD addrU = call.samplerStates[stage].captured ? call.samplerStates[stage].addressU : D3DTADDRESS_WRAP;
+                DWORD addrV = call.samplerStates[stage].captured ? call.samplerStates[stage].addressV : D3DTADDRESS_WRAP;
+                if (cmdBuf) {
+                    cmdBuf->recordSetSamplerState(stage, D3DSAMP_ADDRESSU, addrU);
+                    cmdBuf->recordSetSamplerState(stage, D3DSAMP_ADDRESSV, addrV);
+                } else {
+                    device->SetSamplerState(stage, D3DSAMP_ADDRESSU, addrU);
+                    device->SetSamplerState(stage, D3DSAMP_ADDRESSV, addrV);
                 }
             }
 
@@ -1848,7 +2084,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     tintedFrs.material.emissive.g = 0.4f;
                     tintedFrs.material.emissive.b = 0.0f;
                     tintedFrs.material.emissive.a = 1.0f;
-                    renderMorrowindHLSL_Internal(&call.rs, &tintedFrs, call.lightrs.get(), DIRTY_ALL, -1, cmdBuf, &call.deviceState);
+                    renderMorrowindHLSL_Internal(&call.rs, &tintedFrs, call.lightrs.get(), DIRTY_ALL, -1, cmdBuf, &call.deviceState, &call);
                     continue;
                 }
             }
@@ -1867,7 +2103,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                         tintedFrs.material.emissive = {1.0f, 0.0f, 1.0f, 1.0f}; break; // Magenta
                     default: break;
                 }
-                renderMorrowindHLSL_Internal(&call.rs, &tintedFrs, call.lightrs.get(), DIRTY_ALL, -1, cmdBuf, &call.deviceState);
+                renderMorrowindHLSL_Internal(&call.rs, &tintedFrs, call.lightrs.get(), DIRTY_ALL, -1, cmdBuf, &call.deviceState, &call);
                 continue;
             }
 
@@ -1901,7 +2137,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                 }
                 LARGE_INTEGER callStartQPC, callEndQPC;
                 QueryPerformanceCounter(&callStartQPC);
-                renderMorrowindHLSL_Internal(&call.rs, &call.frs, call.lightrs.get(), call.dirtyFlags, (int)i, cmdBuf, &call.deviceState);
+                renderMorrowindHLSL_Internal(&call.rs, &call.frs, call.lightrs.get(), call.dirtyFlags, (int)i, cmdBuf, &call.deviceState, &call);
                 QueryPerformanceCounter(&callEndQPC);
                 float callMs = (callEndQPC.QuadPart - callStartQPC.QuadPart) * 1000.0f / replayFreqQPC.QuadPart;
                 if (callMs > worstCallMs) {
@@ -2161,8 +2397,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
 
     // Note: Camera position is already stored above for next frame's velocity calculation
 
-    // Data is already in frameBuffers[recordingBuffer].recordedCalls (recorded directly there)
-    frameBuffers[recordingBuffer].state = BufferState::Available;
+    // Data is already in frameBuffer.recordedCalls (recorded directly there)
+    frameBuffer.state = BufferState::Available;
 
     isReplaying = false;
 }

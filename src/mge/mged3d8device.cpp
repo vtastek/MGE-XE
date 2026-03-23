@@ -20,6 +20,9 @@
 bool g_tracyActive = false;
 PipelineDiag g_pipelineDiag = {};
 
+// Global frame counter for debug logging (defined in ffeshader.cpp)
+extern int g_diagFrameCounter;
+
 static bool isTracyProfilerRunning() {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return false;
@@ -39,7 +42,7 @@ static bool isTracyProfilerRunning() {
 }
 
 // Grouped state structs (see mgedevicehelpers.h)
-static SceneState g_scene;
+SceneState g_scene;  // Non-static for external access (declared in mged3d8device.h)
 static DeferredSceneState g_deferred;
 static DeferralCounters g_deferralCounters;
 static OffscreenState g_offscreen;
@@ -88,6 +91,7 @@ int getFrameNumber() { return g_frameNumber; }
 
 static void initOnLoad();
 static bool detectMenu(const D3DMATRIX* m);
+static ScenePhase detectScenePhase();
 static void captureRenderState(D3DRENDERSTATETYPE a, DWORD b);
 static void captureFragmentRenderState(DWORD a, D3DTEXTURESTAGESTATETYPE b, DWORD c);
 static void captureTransform(D3DTRANSFORMSTATETYPE a, const D3DMATRIX* b);
@@ -452,6 +456,9 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         }
     }
 
+    // Increment global debug frame counter (works for both HLSL and PPL modes)
+    ++g_diagFrameCounter;
+
     // Log render pass break instrumentation
     {
         static int frameCounter = 0;
@@ -578,15 +585,15 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
 
         // Stamp current camera into the FrameBuffer that just finished recording
         {
-            auto& fb = FixedFunctionShader::getFrameBuffer(FixedFunctionShader::getRecordingBufferIndex());
+            auto& fb = FixedFunctionShader::currentFrameBuffer();
             fb.currentView = DistantLand::s_staging.mwView;
             fb.currentProj = DistantLand::s_staging.mwProj;
             fb.currentShadowViewproj[0] = DistantLand::s_staging.smViewproj[0];
             fb.currentShadowViewproj[1] = DistantLand::s_staging.smViewproj[1];
         }
 
-        // Rotate to next FrameBuffer for the next frame's recording
-        FixedFunctionShader::rotateRecordingBuffer();
+        // Clear frame buffer for next frame's recording
+        FixedFunctionShader::currentFrameBuffer().clear();
 
         // Reset per-frame flags
         FixedFunctionShader::resetHiZBuiltFlag();
@@ -707,6 +714,8 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
         if (!g_offscreen.megaSceneOpen) {
             // First offscreen scene: open device scene, keep it open for all subsequent offscreen work
             FixedFunctionShader::transitionTo(PhaseTransition::OffscreenEntry);
+            // Save blend state before offscreen rendering (restore at OffscreenExit)
+            FixedFunctionShader::saveOffscreenState();
             flushPendingRT();
             if (!shouldSuppressMWState()) {
                 ProxyDevice::BeginScene();
@@ -733,6 +742,8 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
             if (!shouldSuppressMWState()) {
                 ProxyDevice::EndScene();
             }
+            // Restore blend state after offscreen rendering (saved at OffscreenEntry)
+            FixedFunctionShader::restoreOffscreenState();
             g_offscreen.megaSceneOpen = false;
             g_cmdBufferSet.activeStage = CmdStage::PreScene;
         }
@@ -755,6 +766,9 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
             g_scene.isHUDready = true;
         }
 
+        // Detect scene phase by characteristics before processing
+        g_scene.phase = detectScenePhase();
+
         // Scene 1/2 (particles, hands) may use view matrices that trigger detectMenu() false positive.
         // Force main view path for Scene 1/2 after we've had a valid Scene 0.
         // sceneCount starts at -1. After Scene 0 increment it's 0, after Scene 1 it's 1.
@@ -764,6 +778,13 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
             // Track scene count here in BeginScene
             // g_scene.isMainView is not always valid at EndScene if Morrowind draws sunglare
             ++g_scene.sceneCount;
+
+            // Log phase transition for debugging
+            static const char* phaseNames[] = { "Unknown", "Offscreen", "World", "Particles", "Hands", "UI" };
+            if (ImGuiManager::GetHandoverLogging()) {
+                LOG::logline("BeginScene: sceneCount=%d, phase=%s",
+                    g_scene.sceneCount, phaseNames[static_cast<int>(g_scene.phase)]);
+            }
 
             // Stage transitions for per-stage command buffers
             // sceneCount starts at -1; after increment: 0=Scene0, 1=Scene1, 2=Scene2
@@ -782,15 +803,22 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                 if (isHLSLActive()) {
                     FixedFunctionShader::transitionTo(PhaseTransition::Scene1Entry);
 
+                    // Capture Scene 1 view/proj (camera may have moved during Scene 0)
+                    FixedFunctionShader::captureScene1Matrices();
+
                     // Start recording Scene 1 (particles) to separate vector
                     FixedFunctionShader::setCurrentRecordingScene(1);
                     FixedFunctionShader::setRecordingState(true);
                     LOG::logline("BeginScene(1): Started Scene 1 (particles) recording, isRecording=%d", FixedFunctionShader::getIsRecording());
                 }
             } else if (g_scene.sceneCount == 2) {
-                // Scene 2 (hands)
+                // Scene 2 (hands) - detected by Z-clear after world
                 g_cmdBufferSet.activeStage = CmdStage::Scene2;
+                g_scene.handsStarted = true;
+                g_scene.hadZClearSinceWorld = false;  // Consumed
                 if (isHLSLActive()) {
+                    // Capture Scene 2 view/proj (hands use different view matrix than world)
+                    FixedFunctionShader::captureScene2Matrices();
                     // Continue recording Scene 2 (hands)
                     FixedFunctionShader::setCurrentRecordingScene(2);
                     FixedFunctionShader::setRecordingState(true);
@@ -816,12 +844,18 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                 g_scene.distantWater = (Configuration.MGEFlags & USE_DISTANT_LAND) || (Configuration.MGEFlags & USE_DISTANT_WATER);
             }
         } else {
-            // UI scene — frame finalize point
+            // UI scene — frame finalize point (detected by !isMainView after world scenes)
+            g_scene.phase = ScenePhase::UI;
+
+            if (ImGuiManager::GetHandoverLogging()) {
+                LOG::logline("BeginScene: phase=UI (GPU phase trigger)");
+            }
+
             if (isHLSLActive()) {
                 // Stop Scene 1/2 recording before UI
                 if (FixedFunctionShader::getIsRecording()) {
                     FixedFunctionShader::setRecordingState(false);
-                    auto& fb = FixedFunctionShader::frameBuffers[FixedFunctionShader::recordingBuffer];
+                    auto& fb = FixedFunctionShader::currentFrameBuffer();
                     LOG::logline("Scene 1+2 recording complete: scene1=%d, scene2=%d calls",
                         fb.recordedCallsScene1.size(), fb.recordedCallsScene2.size());
                 }
@@ -907,6 +941,13 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
                 DistantLand::renderStage1(&frameCtx);
                 DistantLand::renderStageBlend(&frameCtx);
                 FixedFunctionShader::waitCullAndReplay();
+            }
+
+            // Mark world scene complete — enables particles/hands detection
+            g_scene.worldComplete = true;
+            g_scene.phase = ScenePhase::Particles;  // Default next phase (may become Hands if Z-clear)
+            if (ImGuiManager::GetHandoverLogging()) {
+                LOG::logline("EndScene(0): worldComplete=true, awaiting next scene");
             }
         } else if (!g_scene.isFrameComplete) {
             // Draw water if the Morrowind water plane doesn't appear in view
@@ -1040,6 +1081,17 @@ HRESULT _stdcall MGEProxyDevice::Clear(DWORD a, const D3DRECT* b, DWORD c, D3DCO
     g_passBreaks.raw_clear++;
     ImGuiManager::LogFrameEvent(FrameEvent::Clear, g_scene.sceneCount);
     ImGuiManager::TraceClear(g_scene.sceneCount, c, d, e);
+
+    // Track Z-clear for hands scene detection
+    // Z-clear after world EndScene signals next main scene is hands
+    if ((c & D3DCLEAR_ZBUFFER) && g_scene.rendertargetNormal) {
+        if (g_scene.worldComplete && !g_scene.handsStarted) {
+            g_scene.hadZClearSinceWorld = true;
+            if (ImGuiManager::GetHandoverLogging()) {
+                LOG::logline("Z-clear after world: next scene is Hands");
+            }
+        }
+    }
 
     // Handover logging: Clear calls
     if (ImGuiManager::GetHandoverLogging()) {
@@ -1401,9 +1453,42 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
     // Forward deferred scene to real device — AFTER all suppression checks
     ensureSceneActive();
 
-    // Scene 1/2 HLSL suppression — particles and hands are recorded, not drawn immediately
-    // Hands (Scene 2) use a different view matrix, so isMainView=false, but we still record them
-    if (g_scene.sceneCount >= 1 && g_scene.rendertargetNormal && !isShadowStencil
+    // Water suppression — check BEFORE isParticlesOrHands (water may arrive in any scene phase)
+    // Must suppress MW water regardless of scene phase to avoid double-rendering with shader water
+    if (g_scene.isWaterMaterial && g_scene.rendertargetNormal && DistantLand::ready && g_scene.distantWater) {
+        g_dipBinStats.water++;
+        ImGuiManager::LogFrameEvent(FrameEvent::DIP_Water, g_scene.sceneCount, e);
+        if (ImGuiManager::GetSuppressWater()) {
+            // Render wireframe outline to show water mesh location
+            realDevice->SetRenderState(D3DRS_FILLMODE, D3DFILL_WIREFRAME);
+            HRESULT hr = ProxyDevice::DrawIndexedPrimitive(a, b, c, d, e);
+            realDevice->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
+            return hr;
+        }
+        if (!g_scene.waterDrawn) {
+            bool isWorld = (g_scene.phase == ScenePhase::World) || (g_scene.sceneCount == 0);
+            if (ImGuiManager::GetHandoverLogging()) {
+                LOG::logline("Water DIP: phase=%d, sceneCount=%d, isWorld=%d, isHLSL=%d",
+                    static_cast<int>(g_scene.phase), g_scene.sceneCount, isWorld, isHLSLActive());
+            }
+            if (isHLSLActive() && isWorld) {
+                // HLSL World phase: flag for deferred rendering in GPU phase
+                g_scene.waterDrawn = true;
+            } else {
+                // Legacy mode, or HLSL Particles/Hands: render water immediately
+                DistantLand::renderStageWater(&frameCtx);
+                g_scene.waterDrawn = true;
+            }
+        }
+        return D3D_OK;  // Suppress MW water
+    }
+
+    // Particles/Hands HLSL suppression — recorded, not drawn immediately
+    // Hands use a different view matrix, so isMainView=false, but we still record them
+    // Use phase detection with sceneCount fallback (phase may not be set on first frame)
+    bool isParticlesOrHands = (g_scene.phase == ScenePhase::Particles || g_scene.phase == ScenePhase::Hands)
+                              || (g_scene.sceneCount >= 1 && g_scene.phase != ScenePhase::UI);
+    if (isParticlesOrHands && g_scene.rendertargetNormal && !isShadowStencil
         && isHLSLActive() && FixedFunctionShader::getIsRecording()) {
         // Populate primitive fields (normally done in isMainView block)
         rs.primType = a;
@@ -1415,20 +1500,8 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
         // Route through renderMorrowind for recording
         FixedFunctionShader::renderMorrowind(&rs, &frs, &lightrs, -1);
         return D3D_OK;  // Suppress MW draw
-    } else if (g_scene.sceneCount >= 1 && g_scene.rendertargetNormal && !isShadowStencil && isHLSLActive()) {
-        // Debug: Why isn't this being recorded?
-        static int scene12SkipLogCount = 0;
-        static int lastFrameLogged = -1;
-        if (lastFrameLogged != g_frameNumber) {
-            scene12SkipLogCount = 0;
-            lastFrameLogged = g_frameNumber;
-        }
-        if (scene12SkipLogCount < 5) {
-            LOG::logline("Scene %d DIP skipped recording: isRecording=%d, prims=%d",
-                g_scene.sceneCount, FixedFunctionShader::getIsRecording(), e);
-            scene12SkipLogCount++;
-        }
     }
+    // Note: UI draws arrive with sceneCount >= 1 but phase=UI - they fall through to normal path below
 
     if (DistantLand::ready && g_scene.rendertargetNormal && g_scene.isMainView && !isShadowStencil) {
         rs.primType = a;
@@ -1450,31 +1523,9 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
             g_scene.stage0Complete = true;
         }
 
-        if (g_scene.isWaterMaterial) {
-            g_dipBinStats.water++;
-            ImGuiManager::LogFrameEvent(FrameEvent::DIP_Water, g_scene.sceneCount, e);
-            if (ImGuiManager::GetSuppressWater()) {
-                // Render wireframe outline to show water mesh location
-                realDevice->SetRenderState(D3DRS_FILLMODE, D3DFILL_WIREFRAME);
-                HRESULT hr = ProxyDevice::DrawIndexedPrimitive(a, b, c, d, e);
-                realDevice->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
-                return hr;
-            }
-            if (g_scene.distantWater) {
-                if (!g_scene.waterDrawn) {
-                    if (isHLSLActive() && g_scene.sceneCount == 0) {
-                        // HLSL Scene 0 (sceneCount=0 post-increment from -1): flag for deferred rendering in GPU phase
-                        g_scene.waterDrawn = true;
-                    } else {
-                        // Legacy mode, or HLSL Scene 1/2: render water immediately
-                        // (Scene 1/2 happens after GPU phase already ran)
-                        DistantLand::renderStageWater(&frameCtx);
-                        g_scene.waterDrawn = true;
-                    }
-                }
-                return D3D_OK;
-            }
-        } else {
+        // Water material with distantWater enabled was already handled before this block.
+        // Water material with distantWater disabled falls through to render MW water normally.
+        if (!g_scene.isWaterMaterial) {
             // Let distant land record call and skip if signalled
             if (!DistantLand::inspectIndexedPrimitive(g_scene.sceneCount, &rs, &frs, &lightrs)) {
                 return D3D_OK;
@@ -1572,6 +1623,37 @@ bool detectMenu(const D3DMATRIX* m) {
     }
 
     return false;
+}
+
+// detectScenePhase - Characteristic-based scene detection
+// Detects scene type by signals, not position in frame
+ScenePhase detectScenePhase() {
+    // Offscreen: local map, inventory doll
+    if (!g_scene.rendertargetNormal) {
+        return ScenePhase::Offscreen;
+    }
+
+    // UI: orthographic projection detected
+    if (!g_scene.isMainView) {
+        return ScenePhase::UI;
+    }
+
+    // After world, Z-clear signals hands scene
+    if (g_scene.hadZClearSinceWorld) {
+        return ScenePhase::Hands;
+    }
+
+    // After world EndScene, before Z-clear = particles
+    if (g_scene.worldComplete) {
+        return ScenePhase::Particles;
+    }
+
+    // Main view, world not complete = world scene
+    if (g_scene.isMainView) {
+        return ScenePhase::World;
+    }
+
+    return ScenePhase::Unknown;
 }
 
 // --------------------------------------------------------
@@ -1818,6 +1900,26 @@ void captureRenderState(D3DRENDERSTATETYPE a, DWORD b) {
     // Debug
     case D3DRS_FILLMODE:
         g_deviceState.fillMode = b;
+        break;
+
+    // Point sprites (particles)
+    case D3DRS_POINTSIZE:
+        g_deviceState.pointSize = *(float*)&b;
+        break;
+    case D3DRS_POINTSPRITEENABLE:
+        g_deviceState.pointSpriteEnable = b;
+        break;
+    case D3DRS_POINTSCALEENABLE:
+        g_deviceState.pointScaleEnable = b;
+        break;
+    case D3DRS_POINTSCALE_A:
+        g_deviceState.pointScaleA = *(float*)&b;
+        break;
+    case D3DRS_POINTSCALE_B:
+        g_deviceState.pointScaleB = *(float*)&b;
+        break;
+    case D3DRS_POINTSCALE_C:
+        g_deviceState.pointScaleC = *(float*)&b;
         break;
     }
 }

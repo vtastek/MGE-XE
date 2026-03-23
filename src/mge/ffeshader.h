@@ -637,6 +637,14 @@ public:
         // Complete device state snapshot for async replay (no assumptions)
         DeviceStateSnapshot deviceState;
 
+        // Vertex/Index snapshots for dynamic VB draws (Scene 1/2 particles)
+        // Captures actual vertex bytes at record time since shared VB may be overwritten
+        std::vector<BYTE> vertexSnapshot;
+        std::vector<BYTE> indexSnapshot;
+        bool usesSnapshot = false;  // True for Scene 1/2, false for Scene 0 static geometry
+        UINT stagingVBOffset = 0;   // Offset into staging VB for this call's data
+        UINT stagingIBOffset = 0;   // Offset into staging IB for this call's data
+
         // Constructor to capture render state data with proper resource management
         HLSLRecordedCall(const RenderedState* rs_, const FragmentState* frs_, std::shared_ptr<LightState> lightrs_, const ShaderKey& sk_, int recordMWIdx = -1);
         // Implementation moved to cpp file to handle sampler state capture
@@ -662,8 +670,10 @@ public:
         std::vector<HLSLRecordedCall> recordedCallsScene1;  // Scene 1 (particles, alpha sorted)
         std::vector<HLSLRecordedCall> recordedCallsScene2;  // Scene 2 (hands, skinned)
 
-        // Matrices captured at recording time
-        D3DXMATRIX view, proj;
+        // Matrices captured at recording time (per-scene)
+        D3DXMATRIX view, proj;           // Scene 0 (world)
+        D3DXMATRIX viewScene1, projScene1;  // Scene 1 (particles) - may differ if camera moves during Scene 0
+        D3DXMATRIX viewScene2, projScene2;  // Scene 2 (hands) - different view matrix
         D3DXMATRIX shadowViewproj[2];
 
         // Matrices stamped at Present() for render pass (fresh camera)
@@ -693,6 +703,13 @@ public:
         // Captured MWBridge state for postProcess (render thread safe)
         PostProcessData postProcessData = {};
 
+        // Staging buffers for Scene 1/2 dynamic VB snapshots
+        // Persistent across frames (resized as needed, not released in clear())
+        IDirect3DVertexBuffer9* particleStagingVB = nullptr;
+        IDirect3DIndexBuffer9* particleStagingIB = nullptr;
+        UINT stagingVBSize = 0;  // Current allocated size in bytes
+        UINT stagingIBSize = 0;
+
         bool valid;
         BufferState state;
 
@@ -713,6 +730,14 @@ public:
             hlslCmds.clear();
             postProcessData = {};
             valid = false;
+            // Initialize matrices to identity to prevent garbage if capture functions aren't called
+            D3DXMatrixIdentity(&view);
+            D3DXMatrixIdentity(&proj);
+            D3DXMatrixIdentity(&viewScene1);
+            D3DXMatrixIdentity(&projScene1);
+            D3DXMatrixIdentity(&viewScene2);
+            D3DXMatrixIdentity(&projScene2);
+            memset(shadowViewproj, 0, sizeof(shadowViewproj));
         }
 
         void reserve() {
@@ -722,8 +747,7 @@ public:
         }
     };
 
-    static FrameBuffer frameBuffers[3];
-    static int recordingBuffer;
+    static FrameBuffer frameBuffer;
 
 public:
     // Pipeline phase tracking for GPU call separation verification
@@ -781,12 +805,12 @@ private:
 
     static void startRecording();
     static void stopRecordingAndReplay();
-    static void prepareRecordedCalls(int bufferIndex);
+    static void prepareRecordedCalls();
     static void recordRenderCall(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, const ShaderKey& sk, int recordMWIdx = -1);
     static void replayRecordedCalls(int sceneCount, D3DCommandBuffer* cmdBuf = nullptr);
-    static void renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, DWORD dirtyFlags = DIRTY_ALL, int callIndex = -1, D3DCommandBuffer* cmdBuf = nullptr, const DeviceStateSnapshot* capturedState = nullptr);
+    static void renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, DWORD dirtyFlags = DIRTY_ALL, int callIndex = -1, D3DCommandBuffer* cmdBuf = nullptr, const DeviceStateSnapshot* capturedState = nullptr, const HLSLRecordedCall* replayCall = nullptr);
     static void validateDeviceState(const ExpectedDeviceState& expected, int callIndex);
-    static void matchPreviousFrameCalls(int bufferIndex);
+    static void markAllCallsDirty();
     static ShaderKey computeShaderKeyWithSuffixes(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);
     static bool computeBoundingBox(const RenderedState* rs, D3DXVECTOR3& bboxMin, D3DXVECTOR3& bboxMax);
 
@@ -798,26 +822,18 @@ public:
     static void restorePostRecordingState();   // Clean up device state for Scene 1/2 (shaders, textures)
     static void finalizeAndRender(DLContext* frameCtx, bool waterSeen); // Prepare + render phase at frame finalize point
     static void finalizeAndRenderAllScenes(DLContext* frameCtx, bool waterSeen); // Full deferred GPU phase at UI BeginScene
-    static void executeGpuPhase(int bufferIndex); // GPU render block — called by render thread or inline
+    static void executeGpuPhase(); // GPU render block — called by render thread or inline
     static void replayScene1And2(FrameBuffer* fb);  // Replay Scene 1/2 at UI BeginScene (after recording)
 
     // Scene lifecycle for triple-buffered pipeline
     static void markSceneStart(int sceneNum, bool isUI = false);
     static void markSceneEnd();
 
-    // Triple-buffer pipeline: split cull (CPU) and render (GPU) passes
-    static void executeCullPass(int bufferIndex);
-    static void executeRenderPass(int bufferIndex);
+    // Single-buffer pipeline: split cull (CPU) and render (GPU) passes
+    static void executeCullPass();
+    static void executeRenderPass();
 
-    static FrameBuffer& currentFrameBuffer() { return frameBuffers[recordingBuffer]; }
-    static FrameBuffer& getFrameBuffer(int index) { return frameBuffers[index]; }
-    static int getRecordingBufferIndex() { return recordingBuffer; }
-    static void rotateRecordingBuffer() {
-        recordingBuffer = (recordingBuffer + 1) % 3;
-        // Clear the buffer we're about to record into — releases stale COM refs
-        // from 3 frames ago and frees memory before startRecording() allocates
-        frameBuffers[recordingBuffer].clear();
-    }
+    static FrameBuffer& currentFrameBuffer() { return frameBuffer; }
 
     // Debug controls for record/replay system
     static bool getIsRecording() { return isRecording; }
@@ -826,11 +842,15 @@ public:
     static void resetRecordingCompletedFlag() { recordingCompletedThisFrame = false; currentRecordingScene = 0; }
     static void setCurrentRecordingScene(int scene) { currentRecordingScene = scene; }
     static int getCurrentRecordingScene() { return currentRecordingScene; }
+    static void captureScene1Matrices();  // Capture particles view/proj at Scene 1 start
+    static void captureScene2Matrices();  // Capture hands view/proj at Scene 2 start
+    static void saveOffscreenState();     // Save blend state before offscreen rendering
+    static void restoreOffscreenState();  // Restore blend state after offscreen rendering
     static void resetHiZBuiltFlag() { hiZBuiltThisFrame = false; }
     static void setReplayingState(bool replaying) { isReplaying = replaying; }
     static void setManualRecordingControl(bool manual) { manualRecordingControl = manual; }
     static bool getManualRecordingControl() { return manualRecordingControl; }
-    static size_t getRecordedCallsCount() { return frameBuffers[recordingBuffer].recordedCalls.size(); }
+    static size_t getRecordedCallsCount() { return frameBuffer.recordedCalls.size(); }
 
     // Visibility results for depth pass (indexed by recordMW)
     static const std::vector<int8_t>& getVisibilityResults() { return visibilityResults; }
@@ -851,7 +871,7 @@ public:
     // Convenience: legacy name for backwards compat
     static void trackGpuCall(const char* callName) { trackDeviceSubmit(callName); }
 
-    static const std::vector<HLSLRecordedCall>& getRecordedCalls() { return frameBuffers[recordingBuffer].recordedCalls; }
+    static const std::vector<HLSLRecordedCall>& getRecordedCalls() { return frameBuffer.recordedCalls; }
 
     // Scene handover debugging (particle bug investigation)
     static void logSceneHandoverState(const char* label);
@@ -880,10 +900,9 @@ public:
     // executeHiZCulling: bbox computation, occluder rasterization, Hi-Z pyramid, visibility testing.
     //   Pure CPU work (no D3D device access) — draw thread candidate.
     //   Populates visibilityResults[] and sets shouldRender on recordedCalls.
-    //   fb parameter: explicit FrameBuffer to use (avoids recordingBuffer race condition)
-    static void executeHiZCulling(const D3DXMATRIX& currentView, const D3DXMATRIX& currentProj, FrameBuffer* fb = nullptr);
+    static void executeHiZCulling(const D3DXMATRIX& currentView, const D3DXMATRIX& currentProj);
     // applyVisibilityAndFilterRecordMW: filters recordMW using visibilityResults from executeHiZCulling.
-    static void applyVisibilityAndFilterRecordMW(FrameBuffer* fb = nullptr);
+    static void applyVisibilityAndFilterRecordMW();
 
     static bool init(IDirect3DDevice* d, ID3DXEffectPool* pool);
     static void startEarlyPrecache(IDirect3DDevice* d);

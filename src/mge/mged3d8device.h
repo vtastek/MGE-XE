@@ -1,9 +1,13 @@
 #pragma once
 
 #include "proxydx/d3d8device.h"
+#include "mgedevicehelpers.h"
 
 // Frame number accessor for logging correlation
 int getFrameNumber();
+
+// Global scene state (defined in mged3d8device.cpp)
+extern SceneState g_scene;
 
 class MGEProxyDevice : public ProxyDevice {
 public:

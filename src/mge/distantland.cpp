@@ -274,11 +274,10 @@ void DistantLand::renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer*
         // Hi-Z culling: split into CPU-only visibility testing and lightweight recordMW filter
         // executeHiZCulling: bbox, occluder rasterization, Hi-Z pyramid, visibility test (no D3D device)
         // applyVisibilityAndFilterRecordMW: filters recordMW using visibility results
-        // Pass fb explicitly to avoid recordingBuffer race condition (Present() can rotate buffers)
         {
-            FixedFunctionShader::executeHiZCulling(ctx->mwView, ctx->mwProj, fb);
+            FixedFunctionShader::executeHiZCulling(ctx->mwView, ctx->mwProj);
         }
-        FixedFunctionShader::applyVisibilityAndFilterRecordMW(fb);
+        FixedFunctionShader::applyVisibilityAndFilterRecordMW();
 
         // Single RT switch for all depth rendering (renderDepth + StretchRect + renderDepthDistantLand + MSAA resolve)
         {
@@ -1147,23 +1146,30 @@ void DistantLand::setSunLight(const D3DLIGHT8* s) {
 bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
     auto mwBridge = MWBridge::get();
 
-    // Log ALL Scene 1/2 draws to debug particles/hands (one-time dump)
+    // Phase-based detection with sceneCount fallback for robustness
+    // (phase may not be set correctly on first frame or mode switch)
+    bool isWorldPhase = (g_scene.phase == ScenePhase::World) || (sceneCount == 0);
+    bool isParticlesPhase = (g_scene.phase == ScenePhase::Particles) || (sceneCount == 1 && g_scene.phase != ScenePhase::World);
+    bool isHandsPhase = (g_scene.phase == ScenePhase::Hands) || (sceneCount >= 2 && g_scene.phase != ScenePhase::UI);
+    bool isParticlesOrHands = isParticlesPhase || isHandsPhase;
+
+    // Log ALL Particles/Hands draws to debug (one-time dump)
     static int scene12DrawCount = 0;
     static bool scene12LogDone = false;
-    if (sceneCount >= 1 && !scene12LogDone) {
+    if (isParticlesOrHands && !scene12LogDone) {
         scene12DrawCount++;
-        LOG::logline(">> Scene %d draw #%d: zWrite=%d, blendEnable=%d, alphaTest=%d, vertBlend=%d, prims=%d",
-                     sceneCount, scene12DrawCount, rs->zWrite, rs->blendEnable, rs->alphaTest,
+        LOG::logline(">> %s draw #%d: zWrite=%d, blendEnable=%d, alphaTest=%d, vertBlend=%d, prims=%d",
+                     isParticlesPhase ? "Particles" : "Hands", scene12DrawCount, rs->zWrite, rs->blendEnable, rs->alphaTest,
                      rs->vertexBlendState, rs->primCount);
     }
     // After first frame finalize, stop logging
-    if (sceneCount == 0 && scene12DrawCount > 0) {
+    if (isWorldPhase && scene12DrawCount > 0) {
         scene12LogDone = true;
     }
 
     // Avoid recording landscape alpha blend drawcalls, a form of multi-pass splatting
     static IDirect3DVertexBuffer9* lastVB = nullptr;
-    bool isLandSplat = sceneCount == 0 && rs->vb == lastVB && rs->blendEnable && (rs->fvf & D3DFVF_DIFFUSE) && mwBridge->IsExterior();
+    bool isLandSplat = isWorldPhase && rs->vb == lastVB && rs->blendEnable && (rs->fvf & D3DFVF_DIFFUSE) && mwBridge->IsExterior();
     lastVB = rs->vb;
 
     // Avoid recording decal passes from UV sets >0, shadow rendering only samples alpha from texture 0 with UV 0
@@ -1178,11 +1184,11 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
     auto& targetRecordMW = hlsl ? FixedFunctionShader::currentFrameBuffer().recordMW : recordMW;
     auto& targetRecordSky = hlsl ? FixedFunctionShader::currentFrameBuffer().recordSky : recordSky;
 
-    // Capture z-writing draws, plus Scene 2 hands (for depth texture even if zWrite=0)
-    // Scene 0: only zWrite draws (skip multi-pass splatting and decals)
-    // Scene 1 (particles): vertexBlendState == 0 && blendEnable → skip depth (alpha sorted)
-    // Scene 2 (hands): vertexBlendState != 0 (skinned) or !blendEnable (opaque) → depth for SSAO/DOF
-    bool is1PDepthCandidate = sceneCount > 0 && (rs->vertexBlendState != 0 || !rs->blendEnable);
+    // Capture z-writing draws, plus Hands (for depth texture even if zWrite=0)
+    // World: only zWrite draws (skip multi-pass splatting and decals)
+    // Particles: vertexBlendState == 0 && blendEnable → skip depth (alpha sorted)
+    // Hands: vertexBlendState != 0 (skinned) or !blendEnable (opaque) → depth for SSAO/DOF
+    bool is1PDepthCandidate = isParticlesOrHands && (rs->vertexBlendState != 0 || !rs->blendEnable);
     if ((rs->zWrite && !isLandSplat && !isDecal) || is1PDepthCandidate) {
         targetRecordMW.emplace_back(*rs);
 
@@ -1200,8 +1206,8 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
         recordMWIdx = static_cast<int>(targetRecordMW.size() - 1);
     }
 
-    // Special case, capture sky
-    if (targetRecordMW.empty() && rs->blendEnable && sceneCount == 0 && mwBridge->CellHasWeather()) {
+    // Special case, capture sky (World phase only, before any opaques recorded)
+    if (targetRecordMW.empty() && rs->blendEnable && isWorldPhase && mwBridge->CellHasWeather()) {
         ImGuiManager::LogFrameEvent(FrameEvent::DIP_Sky, sceneCount, rs->primCount);
         ImGuiManager::IncrementSkyStat();
         targetRecordSky.emplace_back(*rs);
@@ -1231,8 +1237,8 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
         // Pass recordMWIdx so HLSL recording can reuse visibility results from depth pass
         FixedFunctionShader::renderMorrowind(rs, frs, lightrs, recordMWIdx);
         return false;
-    } else if (sceneCount >= 1 && isHLSLActive() && FixedFunctionShader::getIsRecording()) {
-        // Scene 1 (particles) / Scene 2 (hands): record to HLSL for deferred replay
+    } else if (isParticlesOrHands && isHLSLActive() && FixedFunctionShader::getIsRecording()) {
+        // Particles/Hands: record to HLSL for deferred replay
         // This path is separate from isPPLActive to allow recording even in non-PPL modes
         FixedFunctionShader::renderMorrowind(rs, frs, lightrs, recordMWIdx);
         return false;

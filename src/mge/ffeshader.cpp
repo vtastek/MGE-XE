@@ -58,8 +58,7 @@ FixedFunctionShader::HLSLShaderLRU FixedFunctionShader::hlslShaderLRU;
 FixedFunctionShader::HLSLShader FixedFunctionShader::hlslShaderDefaultPurple;
 
 // Triple-buffered FrameBuffer infrastructure
-FixedFunctionShader::FrameBuffer FixedFunctionShader::frameBuffers[3];
-int FixedFunctionShader::recordingBuffer = 0;
+FixedFunctionShader::FrameBuffer FixedFunctionShader::frameBuffer;
 
 // Pipeline phase tracking for GPU call separation verification
 FixedFunctionShader::PipelinePhase FixedFunctionShader::currentPhase = FixedFunctionShader::PipelinePhase::Idle;
@@ -120,7 +119,8 @@ float lastPrepareMs = 0.0f;
 // during cull window (recording is stopped, replay hasn't started).
 bool deviceCallsSafeInPrepare = true;
 
-static int hlslDiagFrameCounter = 0;
+// Global frame counter - incremented in Present(), used for debug logging in all modes
+int g_diagFrameCounter = 0;
 std::unordered_set<FixedFunctionShader::ShaderKey, FixedFunctionShader::ShaderKey::hasher> FixedFunctionShader::diagHitKeys;
 
 // Bbox cache: persists across frames for fast object-space bbox lookup
@@ -507,6 +507,16 @@ void FixedFunctionShader::startEarlyPrecache(IDirect3DDevice* d) {
                 };
 
                 ShaderVariant variants[] = {
+                    // UNLIT (lighting=0) — particles, UI, emissive-only objects
+                    // stages=0 variants (particles with no texture stages)
+                    {0,0, 0,0, 0,0, 0,0,0, 0,0}, {0,0, 0,0, 0,0, 0,0,0, 1,0},  // vm=0, fog=0/1
+                    {0,0, 0,1, 0,0, 0,0,0, 0,0}, {0,0, 0,1, 0,0, 0,0,0, 1,0},  // vm=1, fog=0/1
+                    {0,0, 1,2, 0,0, 0,0,0, 0,0}, {0,0, 1,2, 0,0, 0,0,0, 1,0},  // vc=1, fog=0/1
+                    // stages=1 variants (textured unlit)
+                    {0,0, 0,1, 0,0, 0,0,0, 1,1}, {0,0, 1,2, 0,0, 0,0,0, 1,1},
+                    {0,0, 0,1, 0,0, 0,0,0, 0,1}, {0,0, 1,2, 0,0, 0,0,0, 0,1},  // fog=0
+                    {0,0, 0,0, 0,0, 0,0,0, 1,1}, {0,0, 0,0, 0,0, 0,0,0, 0,1},  // vm=0
+
                     // lm=0 (sun only) — base, dp+ph, skinning, vm=1 skinning
                     {1,0, 0,1, 0,0, 0,0,0, 1,1}, {1,0, 1,2, 0,0, 0,0,0, 1,1},
                     {1,0, 0,1, 0,0, 1,1,0, 1,1}, {1,0, 1,2, 0,0, 1,1,0, 1,1},
@@ -552,7 +562,7 @@ void FixedFunctionShader::startEarlyPrecache(IDirect3DDevice* d) {
                     {
                         ShaderKey sk;
                         memset(&sk, 0, sizeof(sk));
-                        sk.uvSets = 1;
+                        sk.uvSets = (v.stages > 0) ? 1 : 0;  // No UV sets if no texture stages
                         sk.useLighting = v.lighting;
                         sk.lightMode = v.lightMode;
                         sk.vertexColour = v.vertexCol;
@@ -636,33 +646,28 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
         return;
     }
 
-    // Debug: Log device state for PPL Scene 1/2 draws (first few per frame)
-    static int pplDrawLogCount = 0;
-    static int lastFrameLogged = -1;
-    int currentFrame = hlslDiagFrameCounter;
-    if (currentFrame != lastFrameLogged) {
-        pplDrawLogCount = 0;
-        lastFrameLogged = currentFrame;
+    // Debug: Log device state for PPL particle draws (blendEnable && !zWrite)
+    static int pplParticleIdx = 0;
+    static int pplLastFrameLogged = -1;
+    int currentFrame = g_diagFrameCounter;
+    if (currentFrame != pplLastFrameLogged) {
+        pplParticleIdx = 0;
+        pplLastFrameLogged = currentFrame;
     }
-    // Log for Scene 1/2 (blend enabled = particles, skinned = hands)
-    if (rs->blendEnable && pplDrawLogCount < 3) {
-        D3DXMATRIX proj, view, world;
+    // Log only particle draws (blendEnable && !zWrite)
+    if (rs->blendEnable && !rs->zWrite && pplParticleIdx < 20) {
+        D3DXMATRIX proj, view;
         device->GetTransform(D3DTS_PROJECTION, &proj);
         device->GetTransform(D3DTS_VIEW, &view);
-        device->GetTransform(D3DTS_WORLD, &world);
 
-        DWORD pointSize, pointScaleEnable, pointScaleA, pointScaleB, pointScaleC;
-        device->GetRenderState(D3DRS_POINTSIZE, &pointSize);
-        device->GetRenderState(D3DRS_POINTSCALEENABLE, &pointScaleEnable);
-        device->GetRenderState(D3DRS_POINTSCALE_A, &pointScaleA);
-        device->GetRenderState(D3DRS_POINTSCALE_B, &pointScaleB);
-        device->GetRenderState(D3DRS_POINTSCALE_C, &pointScaleC);
-
-        LOG::logline(">> PPL Blend #%d: proj[0][0]=%.3f proj[3][2]=%.3f view[3][2]=%.3f world[3][0]=%.1f",
-            pplDrawLogCount, proj._11, proj._34, view._34, world._41);
-        LOG::logline("   PointSprite: size=%08X scaleEnable=%d A=%08X B=%08X C=%08X",
-            pointSize, pointScaleEnable, pointScaleA, pointScaleB, pointScaleC);
-        pplDrawLogCount++;
+        LOG::logline("[PPL] Particle #%d: world[0]=(%.2f,%.2f,%.2f,%.2f) world[1]=(%.2f,%.2f,%.2f,%.2f)",
+            pplParticleIdx,
+            rs->worldTransforms[0]._11, rs->worldTransforms[0]._12, rs->worldTransforms[0]._13, rs->worldTransforms[0]._14,
+            rs->worldTransforms[0]._21, rs->worldTransforms[0]._22, rs->worldTransforms[0]._23, rs->worldTransforms[0]._24);
+        LOG::logline("        view[3]=(%.2f,%.2f,%.2f) proj[0][0]=%.3f VB=%p primCount=%d",
+            view._41, view._42, view._43,
+            proj._11, rs->vb, rs->primCount);
+        pplParticleIdx++;
     }
 
     ID3DXEffect* effectFFE;
@@ -1361,6 +1366,25 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::createPurpleErrorShader() {
                 errorShader.hVertexBlendPalette = errorShader.vsConstantTable->GetConstantByName(NULL, "vertexBlendPalette");
                 errorShader.hVertexBlendState = errorShader.vsConstantTable->GetConstantByName(NULL, "vertexBlendState");
                 errorShader.hShadowWorldViewProj = errorShader.vsConstantTable->GetConstantByName(NULL, "shadowWorldViewProj");
+
+                // Resolve register offsets for error shader (inline since resolveConstReg is defined later)
+                auto resolveReg = [&](D3DXHANDLE h) -> ConstReg {
+                    ConstReg cr;
+                    if (h) {
+                        D3DXCONSTANT_DESC desc;
+                        UINT count = 1;
+                        if (SUCCEEDED(errorShader.vsConstantTable->GetConstantDesc(h, &desc, &count))) {
+                            cr.reg = desc.RegisterIndex;
+                            cr.count = desc.RegisterCount;
+                            cr.regSet = (UINT)desc.RegisterSet;
+                        }
+                    }
+                    return cr;
+                };
+                errorShader.regProj = resolveReg(errorShader.hProj);
+                errorShader.regWorldView = resolveReg(errorShader.hWorldView);
+                errorShader.regView = resolveReg(errorShader.hView);
+                errorShader.regWorld = resolveReg(errorShader.hWorld);
             }
         }
         vsBlob->Release();
@@ -1835,6 +1859,22 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
 }
 
 void FixedFunctionShader::release() {
+    // Clear frame buffer first — releases COM refs before D3D device is destroyed
+    // This prevents crashes during DLL unload when static destructors run
+    frameBuffer.clear();
+
+    // Release staging buffers (not released in clear() since they persist across frames)
+    if (frameBuffer.particleStagingVB) {
+        frameBuffer.particleStagingVB->Release();
+        frameBuffer.particleStagingVB = nullptr;
+    }
+    if (frameBuffer.particleStagingIB) {
+        frameBuffer.particleStagingIB->Release();
+        frameBuffer.particleStagingIB = nullptr;
+    }
+    frameBuffer.stagingVBSize = 0;
+    frameBuffer.stagingIBSize = 0;
+
     // Join precache thread before cleaning up HLSL cache
     if (precacheThread) {
         WaitForSingleObject(precacheThread, INFINITE);
@@ -2121,12 +2161,10 @@ static_assert(true, "Recording system extracted to recording_system.cpp");
 //            executeCullPass, executeRenderPass, compareLightStates, recordRenderCall
 
 // Helper functions still needed by remaining code in ffeshader.cpp
-// (Sampler cache for texture binding optimization)
-static std::unordered_map<IDirect3DBaseTexture9*, std::pair<DWORD, DWORD>> samplerCache;
 
 // Helper: get current recording buffer's calls vector
 static auto& currentRecordedCalls() {
-    return FixedFunctionShader::frameBuffers[FixedFunctionShader::recordingBuffer].recordedCalls;
+    return FixedFunctionShader::frameBuffer.recordedCalls;
 }
 
 // ====== Full Pipeline A/B Diagnostic Snapshot System ======
@@ -2182,14 +2220,7 @@ struct FrameSnapshot {
     bool ffs_isRecording, ffs_isReplaying;
     bool ffs_recordingCompletedThisFrame, ffs_recordingEnabled, ffs_manualRecordingControl;
     int ffs_recordedCallCount;  // static recordedCalls.size()
-    int ffs_recordingBuffer;    // which buffer index was recording
-    // Per-buffer state
-    struct BufferInfo {
-        int callCount;
-        bool valid;
-        int state;  // BufferState enum as int
-    };
-    BufferInfo bufferInfos[3];
+    int ffs_bufferState;        // BufferState enum as int
 
     FrameSnapshot() : valid(false), totalRecordedCalls(0), sceneLightsTotal(0),
         cameraX(0), cameraY(0), cameraZ(0),
@@ -2197,8 +2228,7 @@ struct FrameSnapshot {
         recordCameraX(0), recordCameraY(0), recordCameraZ(0),
         pipeline{}, ffs_isRecording(false), ffs_isReplaying(false),
         ffs_recordingCompletedThisFrame(false), ffs_recordingEnabled(false),
-        ffs_manualRecordingControl(false), ffs_recordedCallCount(0), ffs_recordingBuffer(0),
-        bufferInfos{} {}
+        ffs_manualRecordingControl(false), ffs_recordedCallCount(0), ffs_bufferState(0) {}
 
     bool saveToFile(const char* path) const {
         FILE* f = fopen(path, "w");
@@ -2231,10 +2261,7 @@ struct FrameSnapshot {
             ffs_isRecording, ffs_isReplaying, ffs_recordingCompletedThisFrame,
             ffs_recordingEnabled, ffs_manualRecordingControl);
         fprintf(f, "recordedCalls=%d\n", ffs_recordedCallCount);
-        fprintf(f, "recordingBuffer=%d\n", ffs_recordingBuffer);
-        for (int i = 0; i < 3; i++) {
-            fprintf(f, "buf%d=%d,%d,%d\n", i, bufferInfos[i].callCount, bufferInfos[i].valid, bufferInfos[i].state);
-        }
+        fprintf(f, "bufferState=%d\n", ffs_bufferState);
 
         for (size_t i = 0; i < callInfos.size(); i++) {
             const auto& c = callInfos[i];
@@ -2314,12 +2341,7 @@ struct FrameSnapshot {
                     ffs_isRecording=i0; ffs_isReplaying=i1; ffs_recordingCompletedThisFrame=i2;
                     ffs_recordingEnabled=i3; ffs_manualRecordingControl=i4;
                 } else if (sscanf(line, "recordedCalls=%d", &ffs_recordedCallCount) == 1) {
-                } else if (sscanf(line, "recordingBuffer=%d", &ffs_recordingBuffer) == 1) {
-                } else {
-                    int bi, cc, v, s;
-                    if (sscanf(line, "buf%d=%d,%d,%d", &bi, &cc, &v, &s) == 4 && bi >= 0 && bi < 3) {
-                        bufferInfos[bi].callCount=cc; bufferInfos[bi].valid=v; bufferInfos[bi].state=s;
-                    }
+                } else if (sscanf(line, "bufferState=%d", &ffs_bufferState) == 1) {
                 }
             } else if (currentCall) {
                 unsigned int fvfTmp;
@@ -2477,13 +2499,7 @@ struct FrameSnapshot {
         FFS_DIFF_BOOL(ffs_recordingEnabled, "recordingEnabled");
         FFS_DIFF_BOOL(ffs_manualRecordingControl, "manualRecordingControl");
         FFS_DIFF_INT(ffs_recordedCallCount, "recordedCallCount");
-        FFS_DIFF_INT(ffs_recordingBuffer, "recordingBuffer");
-
-        for (int i = 0; i < 3; i++) {
-            fprintf(out, "Buffer[%d] A: calls=%d valid=%d state=%d  B: calls=%d valid=%d state=%d\n",
-                i, a.bufferInfos[i].callCount, a.bufferInfos[i].valid, a.bufferInfos[i].state,
-                b.bufferInfos[i].callCount, b.bufferInfos[i].valid, b.bufferInfos[i].state);
-        }
+        FFS_DIFF_INT(ffs_bufferState, "bufferState");
 
         #undef DIAG_DIFF_INT
         #undef DIAG_DIFF_BOOL
@@ -2868,15 +2884,10 @@ static void fillSnapshotState(FrameSnapshot& snap) {
     snap.ffs_recordingEnabled = FixedFunctionShader::getRecordingEnabled();
     snap.ffs_manualRecordingControl = FixedFunctionShader::getManualRecordingControl();
     snap.ffs_recordedCallCount = (int)FixedFunctionShader::getRecordedCallsCount();
-    snap.ffs_recordingBuffer = FixedFunctionShader::getRecordingBufferIndex();
 
-    // Per-buffer state
-    for (int i = 0; i < 3; i++) {
-        auto& fb = FixedFunctionShader::getFrameBuffer(i);
-        snap.bufferInfos[i].callCount = (int)fb.recordedCalls.size();
-        snap.bufferInfos[i].valid = fb.valid;
-        snap.bufferInfos[i].state = (int)fb.state;
-    }
+    // Single buffer state
+    auto& fb = FixedFunctionShader::currentFrameBuffer();
+    snap.ffs_bufferState = (int)fb.state;
 
     // Camera and eye position
     snap.eyePosX = DistantLand::s_staging.eyePos.x;
@@ -2884,8 +2895,7 @@ static void fillSnapshotState(FrameSnapshot& snap) {
     snap.eyePosZ = DistantLand::s_staging.eyePos.z;
     snap.sceneLightsTotal = (int)DistantLand::sceneLights.size();
 
-    // Read recorded calls from the recording buffer (already filled before rotation)
-    auto& fb = FixedFunctionShader::getFrameBuffer(snap.ffs_recordingBuffer);
+    // Read recorded calls from the buffer
     snap.totalRecordedCalls = (int)fb.recordedCalls.size();
     snap.callInfos = buildCallSnapshotsFromBuffer(fb.recordedCalls);
 
@@ -3026,25 +3036,14 @@ FixedFunctionShader::HLSLRecordedCall::HLSLRecordedCall(const RenderedState* rs_
     // Capture complete device state snapshot for async replay (no assumptions about prior state)
     deviceState = g_deviceState;
 
-    // Lean recording: capture sampler states for stages 0-1 only (Morrowind-bound textures)
+    // Capture sampler states for stages 0-1 (Morrowind-bound textures)
+    // Always read from device - same texture can have different sampler states at different draws
     // Stages 2+ are HLSL-specific textures bound by MGE XE with known sampler states
-    trackDeviceRead("GetTexture+GetSamplerState(recording)");
+    trackDeviceRead("GetSamplerState(recording)");
     for (int stage = 0; stage < 2; ++stage) {
-        IDirect3DBaseTexture9* texture = nullptr;
-        if (SUCCEEDED(device->GetTexture(stage, &texture)) && texture) {
-            auto cacheIt = samplerCache.find(texture);
-            if (cacheIt != samplerCache.end()) {
-                samplerStates[stage].addressU = cacheIt->second.first;
-                samplerStates[stage].addressV = cacheIt->second.second;
-                samplerStates[stage].captured = true;
-            } else {
-                if (SUCCEEDED(device->GetSamplerState(stage, D3DSAMP_ADDRESSU, &samplerStates[stage].addressU)) &&
-                    SUCCEEDED(device->GetSamplerState(stage, D3DSAMP_ADDRESSV, &samplerStates[stage].addressV))) {
-                    samplerStates[stage].captured = true;
-                    samplerCache[texture] = std::make_pair(samplerStates[stage].addressU, samplerStates[stage].addressV);
-                }
-            }
-            texture->Release();
+        if (SUCCEEDED(device->GetSamplerState(stage, D3DSAMP_ADDRESSU, &samplerStates[stage].addressU)) &&
+            SUCCEEDED(device->GetSamplerState(stage, D3DSAMP_ADDRESSV, &samplerStates[stage].addressV))) {
+            samplerStates[stage].captured = true;
         } else {
             samplerStates[stage].captured = false;
         }

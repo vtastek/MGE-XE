@@ -14,25 +14,23 @@ extern bool deviceCallsSafeInPrepare;
 
 // Helper to access current recording buffer's recorded calls
 static auto& currentRecordedCalls() {
-    return FixedFunctionShader::frameBuffers[FixedFunctionShader::recordingBuffer].recordedCalls;
+    return FixedFunctionShader::frameBuffer.recordedCalls;
 }
 
 // executeHiZCulling - Pure CPU work: bbox computation, occluder rasterization, Hi-Z pyramid build,
 // visibility testing on recordMW and recordedCalls. Takes view/proj as parameters (no D3D device access).
 // This is a draw-thread candidate: touches no GPU state.
-// fb parameter: explicit FrameBuffer to use (HLSL mode). Avoids recordingBuffer global race condition
-// where Present() can rotate buffers between recording and Hi-Z execution.
-void FixedFunctionShader::executeHiZCulling(const D3DXMATRIX& currentView, const D3DXMATRIX& currentProj, FrameBuffer* fb) {
+void FixedFunctionShader::executeHiZCulling(const D3DXMATRIX& currentView, const D3DXMATRIX& currentProj) {
     MGE_ZoneScopedN("Execute Hi-Z Culling");
 
     // Resize visibility results for this frame (indexed by draw order)
-    // HLSL mode: use explicit fb parameter; legacy mode: global static
-    const auto& activeRecordMW = fb ? fb->recordMW : DistantLand::recordMW;
+    // HLSL mode uses frameBuffer, legacy mode uses global static
+    const auto& activeRecordMW = (Configuration.PerPixelLightFlags == 2) ? frameBuffer.recordMW : DistantLand::recordMW;
     visibilityResults.assign(activeRecordMW.size(), -1);  // -1 = not yet tested
 
     // Phase 2a: Compute deferred bboxes and rasterize occluders from recorded HLSL calls
     // This must happen before Hi-Z build so the depth pass benefits from culling
-    auto& recCalls = fb ? fb->recordedCalls : currentRecordedCalls();
+    auto& recCalls = (Configuration.PerPixelLightFlags == 2) ? frameBuffer.recordedCalls : currentRecordedCalls();
     if (!recCalls.empty() && !hiZBuiltThisFrame) {
         // Compute bounding boxes for calls that missed the cache during recording
         {
@@ -56,8 +54,8 @@ void FixedFunctionShader::executeHiZCulling(const D3DXMATRIX& currentView, const
             const float MIN_SCREEN_COVERAGE = 0.01f;
             rasterizedOccluderMeshes.clear();
 
-            // Use explicit fb parameter if provided (HLSL mode), fall back to recordingBuffer (legacy)
-            auto& activeFb = fb ? *fb : frameBuffers[recordingBuffer];
+            // Use single frame buffer
+            auto& activeFb = frameBuffer;
             D3DXMATRIX viewProj = activeFb.view * activeFb.proj;
 
             for (auto& call : recCalls) {
@@ -140,8 +138,8 @@ void FixedFunctionShader::executeHiZCulling(const D3DXMATRIX& currentView, const
         MGE_ZoneScopedN("Build Hi-Z Pyramid");
         softwareOcclusionCuller.buildHiZPyramid();
         if (ImGuiManager::GetShowHiZInterface()) {
-            // Use explicit fb parameter for proj matrix (HLSL mode), fall back to recordingBuffer (legacy)
-            const D3DXMATRIX& uploadProj = fb ? fb->proj : frameBuffers[recordingBuffer].proj;
+            // Use single frame buffer's projection matrix
+            const D3DXMATRIX& uploadProj = frameBuffer.proj;
             softwareOcclusionCuller.uploadHiZToTexture(reinterpret_cast<IDirect3DDevice9*>(device), ImGuiManager::GetHiZDisplayMip(), uploadProj, ImGuiManager::GetHiZInvert(), ImGuiManager::GetHiZShowRaycastGrid(), ImGuiManager::GetHiZRaycastStep());
         }
         hiZBuiltThisFrame = true;
@@ -233,7 +231,7 @@ void FixedFunctionShader::executeHiZCulling(const D3DXMATRIX& currentView, const
 
 // applyVisibilityAndFilterRecordMW - Lightweight filter pass over recordMW using visibilityResults
 // Runs after executeHiZCulling, before renderDepth
-void FixedFunctionShader::applyVisibilityAndFilterRecordMW(FrameBuffer* fb) {
+void FixedFunctionShader::applyVisibilityAndFilterRecordMW() {
     MGE_ZoneScopedN("Apply Visibility Filter to recordMW");
 
     // Non-HLSL mode or culling disabled: nothing to filter
@@ -241,8 +239,8 @@ void FixedFunctionShader::applyVisibilityAndFilterRecordMW(FrameBuffer* fb) {
         return;
     }
 
-    // Select recordMW source: per-buffer in HLSL mode, global static otherwise
-    auto& activeRecordMW = fb ? fb->recordMW : DistantLand::recordMW;
+    // Use single frame buffer's recordMW in HLSL mode, global static otherwise
+    auto& activeRecordMW = (Configuration.PerPixelLightFlags == 2) ? frameBuffer.recordMW : DistantLand::recordMW;
 
     int inputCount = (int)activeRecordMW.size();
 
@@ -262,101 +260,31 @@ void FixedFunctionShader::applyVisibilityAndFilterRecordMW(FrameBuffer* fb) {
                  inputCount, outputCount, inputCount - outputCount);
 }
 
-// Dirty tracking: match current frame calls to previous frame by MeshKey
-void FixedFunctionShader::matchPreviousFrameCalls(int bufferIndex) {
-    MGE_ZoneScopedN("matchPreviousFrameCalls");
+// Dirty tracking: simplified for single buffer (no previous frame comparison)
+// Just marks all calls as dirty - can be optimized later if needed
+void FixedFunctionShader::markAllCallsDirty() {
+    MGE_ZoneScopedN("markAllCallsDirty");
 
-    auto& curCalls = frameBuffers[bufferIndex].recordedCalls;
-
-    // Find previous frame's FrameBuffer (the one before this buffer)
-    int prevBuf = (bufferIndex + 2) % 3;
-    auto& prevCalls = frameBuffers[prevBuf].recordedCalls;
-
-    if (prevCalls.empty()) {
-        // First frame or no previous data — all dirty
-        for (auto& call : curCalls) {
-            call.dirtyFlags = DIRTY_ALL;
-        }
-        return;
+    // Scene 0 (world)
+    for (auto& call : frameBuffer.recordedCalls) {
+        call.dirtyFlags = DIRTY_ALL;
     }
-
-    // Build lookup from previous frame
-    std::unordered_map<MeshKey, int, MeshKeyHash> prevLookup;
-    prevLookup.reserve(prevCalls.size());
-    for (int i = 0; i < (int)prevCalls.size(); ++i) {
-        auto& prev = prevCalls[i];
-        MeshKey key;
-        key.vb = prev.rs.vb;
-        key.ib = prev.rs.ib;
-        key.fvf = prev.rs.fvf;
-        key.baseIndex = prev.rs.baseIndex;
-        key.vertCount = prev.rs.vertCount;
-        key.startIndex = prev.rs.startIndex;
-        key.primCount = prev.rs.primCount;
-        prevLookup[key] = i;  // Last wins for duplicates
+    // Scene 1 (particles)
+    for (auto& call : frameBuffer.recordedCallsScene1) {
+        call.dirtyFlags = DIRTY_ALL;
     }
-
-    for (auto& call : curCalls) {
-        MeshKey key;
-        key.vb = call.rs.vb;
-        key.ib = call.rs.ib;
-        key.fvf = call.rs.fvf;
-        key.baseIndex = call.rs.baseIndex;
-        key.vertCount = call.rs.vertCount;
-        key.startIndex = call.rs.startIndex;
-        key.primCount = call.rs.primCount;
-
-        auto it = prevLookup.find(key);
-        if (it == prevLookup.end()) {
-            call.dirtyFlags = DIRTY_ALL;
-            continue;
-        }
-
-        auto& prev = prevCalls[it->second];
-        DWORD flags = DIRTY_NONE;
-
-        // Compare world transform (object moved?)
-        if (memcmp(&call.rs.worldTransforms[0], &prev.rs.worldTransforms[0], sizeof(D3DXMATRIX)) != 0) {
-            flags |= DIRTY_TRANSFORM;
-        }
-
-        // Compare light state (pointer comparison — shared_ptr reuse)
-        if (call.lightrs.get() != prev.lightrs.get()) {
-            flags |= DIRTY_LIGHT;
-        }
-
-        // Compare material
-        if (memcmp(&call.frs.material, &prev.frs.material, sizeof(FragmentState::Material)) != 0) {
-            flags |= DIRTY_MATERIAL;
-        }
-
-        // Compare shader key
-        if (!(call.sk == prev.sk)) {
-            flags |= DIRTY_SHADER;
-        }
-
-        // Compare blend state
-        if (call.rs.blendEnable != prev.rs.blendEnable ||
-            call.rs.srcBlend != prev.rs.srcBlend ||
-            call.rs.destBlend != prev.rs.destBlend) {
-            flags |= DIRTY_BLEND;
-        }
-
-        // Compare base texture
-        if (call.rs.texture != prev.rs.texture) {
-            flags |= DIRTY_TEXTURE;
-        }
-
-        call.dirtyFlags = flags;
+    // Scene 2 (hands)
+    for (auto& call : frameBuffer.recordedCallsScene2) {
+        call.dirtyFlags = DIRTY_ALL;
     }
 }
 
 // Phase 2b: Prepare shader keys — runs after recording completes, before replay.
 // BBox computation and occluder rasterization already done in executeHiZCulling (Phase 2a).
-void FixedFunctionShader::prepareRecordedCalls(int bufferIndex) {
+void FixedFunctionShader::prepareRecordedCalls() {
     MGE_ZoneScopedN("prepareRecordedCalls");
 
-    auto& fb = frameBuffers[bufferIndex];
+    auto& fb = frameBuffer;
     auto& recCalls = fb.recordedCalls;
 
     // Compute shader keys and assign render bins (with slow-frame timing)
@@ -411,10 +339,9 @@ void FixedFunctionShader::prepareRecordedCalls(int bufferIndex) {
         LOG::logline("SLOW PREPARE: %.1fms for %d calls (Shader Keys + Bins)", lastPrepareMs, (int)recCalls.size());
     }
 
-    // Performance mode: match against previous frame for dirty tracking
-    if (ImGuiManager::GetPerformanceMode()) {
-        matchPreviousFrameCalls(bufferIndex);
-    }
+    // Mark all calls dirty (single buffer - no previous frame comparison)
+    // Can be optimized later with same-frame dirty tracking
+    markAllCallsDirty();
 }
 
 bool FixedFunctionShader::computeBoundingBox(const RenderedState* rs, D3DXVECTOR3& bboxMin, D3DXVECTOR3& bboxMax) {
