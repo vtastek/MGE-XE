@@ -849,8 +849,27 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                 FixedFunctionShader::transitionTo(PhaseTransition::UIEntry);
             }
             g_cmdBufferSet.activeStage = CmdStage::UI;
-            if (DistantLand::ready && g_scene.sceneCount > 0 && !g_scene.isFrameComplete) {
+            if (DistantLand::ready && g_scene.sceneCount >= 0 && !g_scene.isFrameComplete) {
                 ensureSceneActive();
+
+                // Track scene emptiness for debugging
+                if (isHLSLActive()) {
+                    auto& recBuf = FixedFunctionShader::getRecordingBuffer();
+                    g_scene.scene0Empty = recBuf.recordedCalls.empty();
+                    g_scene.scene1Empty = recBuf.recordedCallsScene1.empty();
+                    g_scene.scene2Empty = recBuf.recordedCallsScene2.empty();
+
+                    // Log empty scenes for debugging
+                    if (g_scene.scene0Empty) {
+                        ImGuiManager::LogFrameEvent(FrameEvent::Scene0_Empty, g_scene.sceneCount);
+                    }
+                    if (g_scene.scene1Empty) {
+                        ImGuiManager::LogFrameEvent(FrameEvent::Scene1_Empty, g_scene.sceneCount);
+                    }
+                    if (g_scene.scene2Empty) {
+                        ImGuiManager::LogFrameEvent(FrameEvent::Scene2_Empty, g_scene.sceneCount);
+                    }
+                }
 
                 // HLSL: Full GPU phase now that ALL scenes are recorded
                 // Flow: Depth(0) → Depth(2) → Replay(0) → Replay(1) → Replay(2) → postProcess
@@ -861,14 +880,37 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                     // N-1: finalizeAndRenderAllScenes now uses rendering buffer's stored values
                     FixedFunctionShader::finalizeAndRenderAllScenes(&frameCtx, g_scene.waterDrawn);
                     FixedFunctionShader::transitionTo(PhaseTransition::GpuExit);
+                } else if (isHLSLActive()) {
+                    // Empty scene fallback: no GPU work but still transition for state consistency
+                    FixedFunctionShader::transitionTo(PhaseTransition::GpuExit);
                 }
 
                 // postProcess runs here for both HLSL and legacy
-                DistantLand::postProcess(&frameCtx);
+                if (g_scene.stage0Complete) {
+                    DistantLand::postProcess(&frameCtx);
+                }
 
-                // Record state preamble AFTER finalizeAndRender — captures actual device state MW sees
-                if (g_scene.stage0Complete && isHLSLActive() && ImGuiManager::GetCmdBufferRecording()) {
-                    recordUIStatePreamble(realDevice, g_cmdBufferSet[CmdStage::UI]);
+                // Ensure clean state for UI rendering after GPU phase
+                // MW's UI code ASSUMES these states are set from world rendering - it doesn't
+                // explicitly set them. When scenes are empty, MGE stages leave unknown state.
+                // Frame trace comparison shows UI expects: ALPHABLENDENABLE=0, ZWRITEENABLE=1, FOGENABLE=1
+                if (isHLSLActive()) {
+                    realDevice->SetVertexShader(NULL);
+                    realDevice->SetPixelShader(NULL);
+
+                    // Set render states that UI inherits from world rendering
+                    // Without these, UI blending/depth/fog breaks when scenes are empty
+                    realDevice->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+                    realDevice->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+                    realDevice->SetRenderState(D3DRS_FOGENABLE, TRUE);
+                    realDevice->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
+
+                    // Clear Z buffer so UI isn't hidden behind 3D geometry
+                    realDevice->Clear(0, NULL, D3DCLEAR_ZBUFFER, 0, 1.0f, 0);
+                    g_scene.uiStateCaptured = true;
+                    if (ImGuiManager::GetCmdBufferRecording()) {
+                        ImGuiManager::LogFrameEvent(FrameEvent::UIState_Captured, g_scene.sceneCount);
+                    }
                 }
 
                 // UI command buffer is replayed at EndScene (after all UI draws are recorded)

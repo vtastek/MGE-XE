@@ -66,6 +66,9 @@ struct FrameEvent {
         State_Light, State_Material, State_Viewport, State_ClipPlane,
         State_StreamSource, State_VertexShader, State_IndexBuffer,
         State_MultiplyTransform,
+        // Scene emptiness tracking
+        Scene0_Empty, Scene1_Empty, Scene2_Empty,
+        UIState_Captured, UIState_Skipped,
         Count
     };
     Type type;
@@ -97,7 +100,9 @@ struct FrameEvent {
             "RS", "TSS", "Transform", "Texture",
             "Light", "Material", "Viewport", "ClipPlane",
             "StreamSource", "VertexShader", "IndexBuffer",
-            "MultiplyTransform"
+            "MultiplyTransform",
+            "Scene0_Empty", "Scene1_Empty", "Scene2_Empty",
+            "UIState_Captured", "UIState_Skipped"
         };
         return (t < Count) ? names[t] : "Unknown";
     }

@@ -50,6 +50,12 @@ struct SceneState {
     bool handsStarted = false;         // Hands scene started
     DrawType lastDrawType = DrawType::Unknown;
 
+    // Scene emptiness tracking (set at finalize time)
+    bool scene0Empty = true;
+    bool scene1Empty = true;
+    bool scene2Empty = true;
+    bool uiStateCaptured = false;
+
     void resetForFrame() {
         sceneCount = -1;
         phase = ScenePhase::Unknown;
@@ -63,6 +69,11 @@ struct SceneState {
         skyDrawn = false;
         handsStarted = false;
         lastDrawType = DrawType::Unknown;
+        // Reset scene emptiness tracking
+        scene0Empty = true;
+        scene1Empty = true;
+        scene2Empty = true;
+        uiStateCaptured = false;
     }
 };
 
