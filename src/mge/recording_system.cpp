@@ -372,10 +372,16 @@ void FixedFunctionShader::startRecording() {
     // Capture view/projection matrices once at start of recording directly into FrameBuffer
     // Note: World transforms are captured per-call in each RenderedState
     // N-1: recording into recording buffer
+    // Use MWStateTracker instead of device->GetTransform for async safety
     auto& fb = getRecordingBuffer();
-    trackDeviceRead("GetTransform(VIEW,PROJ)");
-    device->GetTransform(D3DTS_VIEW, &fb.view);
-    device->GetTransform(D3DTS_PROJECTION, &fb.proj);
+    auto& tracker = g_cmdBufferSet.stateTracker();
+    if (!tracker.getTransform(D3DTS_VIEW, &fb.view) || !tracker.getTransform(D3DTS_PROJECTION, &fb.proj)) {
+        // Fallback to device query if tracker doesn't have values (shouldn't happen)
+        LOG::logline("!! startRecording: MWStateTracker missing VIEW/PROJ, falling back to device query");
+        trackDeviceRead("GetTransform(VIEW,PROJ) - fallback");
+        device->GetTransform(D3DTS_VIEW, &fb.view);
+        device->GetTransform(D3DTS_PROJECTION, &fb.proj);
+    }
     fb.shadowViewproj[0] = DistantLand::s_staging.smViewproj[0];
     fb.shadowViewproj[1] = DistantLand::s_staging.smViewproj[1];
     fb.state = BufferState::Recording;
@@ -608,19 +614,31 @@ void FixedFunctionShader::finalizeBatchAndReplay(int sceneCount) {
 // captureScene1Matrices - Capture view/proj for Scene 1 (particles)
 // Camera may move during Scene 0 - particles should use Scene 1's matrices, not Scene 0's
 // N-1: recording buffer
+// Use MWStateTracker instead of device->GetTransform for async safety
 void FixedFunctionShader::captureScene1Matrices() {
     auto& fb = getRecordingBuffer();
-    device->GetTransform(D3DTS_VIEW, &fb.viewScene1);
-    device->GetTransform(D3DTS_PROJECTION, &fb.projScene1);
+    auto& tracker = g_cmdBufferSet.stateTracker();
+    if (!tracker.getTransform(D3DTS_VIEW, &fb.viewScene1) || !tracker.getTransform(D3DTS_PROJECTION, &fb.projScene1)) {
+        LOG::logline("!! captureScene1Matrices: MWStateTracker missing VIEW/PROJ, falling back");
+        trackDeviceRead("GetTransform(Scene1) - fallback");
+        device->GetTransform(D3DTS_VIEW, &fb.viewScene1);
+        device->GetTransform(D3DTS_PROJECTION, &fb.projScene1);
+    }
 }
 
 // captureScene2Matrices - Capture view/proj for Scene 2 (hands)
 // Hands use a different view matrix than the world scene - must be captured separately
 // N-1: recording buffer
+// Use MWStateTracker instead of device->GetTransform for async safety
 void FixedFunctionShader::captureScene2Matrices() {
     auto& fb = getRecordingBuffer();
-    device->GetTransform(D3DTS_VIEW, &fb.viewScene2);
-    device->GetTransform(D3DTS_PROJECTION, &fb.projScene2);
+    auto& tracker = g_cmdBufferSet.stateTracker();
+    if (!tracker.getTransform(D3DTS_VIEW, &fb.viewScene2) || !tracker.getTransform(D3DTS_PROJECTION, &fb.projScene2)) {
+        LOG::logline("!! captureScene2Matrices: MWStateTracker missing VIEW/PROJ, falling back");
+        trackDeviceRead("GetTransform(Scene2) - fallback");
+        device->GetTransform(D3DTS_VIEW, &fb.viewScene2);
+        device->GetTransform(D3DTS_PROJECTION, &fb.projScene2);
+    }
 }
 
 // Offscreen state save/restore - prevents blend state leak to UI when world rendering is off
@@ -916,9 +934,6 @@ void FixedFunctionShader::executeGpuPhase() {
     // Stage 1: grass, shadow overlay, depth
     DistantLand::renderStage1(frameCtx, &fb);
 
-    // Blend close objects over distant land
-    DistantLand::renderStageBlend(frameCtx, &fb);
-
     // Build HLSL replay into command buffer, then replay it
     // IMPORTANT: Only replay Scene 0 here! Scene 1/2 are recorded AFTER EndScene(0),
     // so replaying them here would use STALE data from previous frame (race condition).
@@ -935,6 +950,10 @@ void FixedFunctionShader::executeGpuPhase() {
 
     fb.hlslCmds.replay(device);
     transitionTo(PhaseTransition::ReplayExit);
+
+    // Blend distant land over near objects AFTER replay
+    // (MW/MGE blend uses depth to composite distant land behind near objects)
+    DistantLand::renderStageBlend(frameCtx, &fb);
 
     // Water surface AFTER replay — refraction samples backbuffer which needs scene content
     if (waterSeen) {
@@ -1028,6 +1047,12 @@ void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool w
     DLContext* renderCtx = &fb.dlContext;
     bool renderWaterSeen = fb.waterSeen;
 
+    // Diagnostic: log nearViewRange when retrieved for rendering
+    static int retrieveLogCount = 0;
+    if (retrieveLogCount++ < 10) {
+        LOG::logline("[N1-RETRIEVE] nearViewRange=%.1f from rendering buffer", renderCtx->nearViewRange);
+    }
+
     // === STAGE 0 GPU: Shadow map, distant land, sky, water reflection, wave sim ===
     {
         MGE_ZoneScopedN("Stage0 GPU");
@@ -1061,16 +1086,17 @@ void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool w
     {
         MGE_ZoneScopedN("Replay All Scenes");
 
-        // Blend close objects over distant land (before replay)
-        DistantLand::renderStageBlend(renderCtx, &fb);
-
         transitionTo(PhaseTransition::ReplayEntry);
 
-        // Replay Scene 0 (world)
+        // Replay Scene 0 (world) FIRST - Morrowind near objects
         LOG::logline("[ORDER] finalizeAndRenderAllScenes: Replay Scene 0 (%d calls)", (int)fb.recordedCalls.size());
         replayRecordedCalls(0, nullptr);
 
         transitionTo(PhaseTransition::ReplayExit);
+
+        // Blend distant land over near objects AFTER replay
+        // (MW/MGE blend uses depth to composite distant land behind near objects)
+        DistantLand::renderStageBlend(renderCtx, &fb);
     }
 
     // Water surface AFTER Scene 0 but BEFORE Scene 1 particles
@@ -1452,9 +1478,8 @@ bool FixedFunctionShader::transitionTo(PhaseTransition trans) {
     bool valid = true;
 
     switch (trans) {
-        case PhaseTransition::GpuExit:
         case PhaseTransition::Scene1Entry: {
-            // These must match RecordingExit - that's the invariant
+            // Scene1Entry must match RecordingExit - Scene 1 should see same state as end of recording
             const StateContract& expected = transitionState[static_cast<int>(PhaseTransition::RecordingExit)];
 
             // Check critical render states (not transforms - those are set by replay)
@@ -1481,6 +1506,10 @@ bool FixedFunctionShader::transitionTo(PhaseTransition trans) {
             }
             break;
         }
+        case PhaseTransition::GpuExit:
+            // GpuExit happens after GPU work at UI BeginScene - state is restored for UI, not Scene 0
+            // No validation needed here - state is intentionally different (UI state vs recording state)
+            break;
         default:
             // Other transitions just capture, no validation target yet
             break;

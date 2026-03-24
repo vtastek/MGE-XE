@@ -32,6 +32,9 @@ struct RenderedState {
 
     // Scene number (0=world, 1=particles, 2=hands)
     int sceneNum = 0;
+
+    // Debug flags
+    bool debugWireframe = false;  // Render as wireframe (debug visualization)
 };
 
 // RecordedMWState - RenderedState with COM reference management for deferred rendering.

@@ -14,6 +14,11 @@ TransformedVert transformStaticVert(StatVertIn IN) {
     v.worldpos = mul(IN.pos, world);
     v.viewpos = mul(v.worldpos, view);
     v.pos = mul(v.viewpos, proj);
+
+    // Cull vertices closer than nearViewRange threshold (preserves early-Z, no clip/discard)
+    if (nearViewRange - 1800 > length(v.viewpos))
+        v.pos = float4(0, 0, -10000, 0);
+
     return v;
 }
 

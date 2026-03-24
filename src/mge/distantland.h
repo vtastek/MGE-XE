@@ -210,7 +210,7 @@ public:
     static DLContext s_staging;
     static DLContext captureContext();
 
-    static void renderSky(const std::vector<RecordedMWState>& sky);
+    static void renderSky(const std::vector<RecordedMWState>& sky, bool useAtmScatter = true);
     static DLContext captureStage0Context();
     static void renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuffer* fb = nullptr);
     static DLContext renderStage0();

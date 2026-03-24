@@ -918,6 +918,11 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
                     // N-1: Stamp currentView/currentProj to match dlContext camera
                     recBuf.currentView = frameCtx.mwView;
                     recBuf.currentProj = frameCtx.mwProj;
+                    // Diagnostic: log nearViewRange when stored
+                    static int storeLogCount = 0;
+                    if (storeLogCount++ < 10) {
+                        LOG::logline("[N1-STORE] nearViewRange=%.1f stored to recording buffer", frameCtx.nearViewRange);
+                    }
                 }
 
                 // Phase transition: RecordingExit - MW state at end of Scene 0
@@ -1131,14 +1136,21 @@ HRESULT _stdcall MGEProxyDevice::SetTransform(D3DTRANSFORMSTATETYPE a, const D3D
                 DistantLand::s_staging.mwView = view;
                 // N-1: Capture MODIFIED view (with camEffectsMatrix) to match s_staging.mwView
                 captureTransform(a, &view);
-                if (ImGuiManager::GetCmdBufferRecording()) {
-                    g_cmdBufferSet.recordAndTrackTransform((DWORD)a, &view);
+                // Always track transforms for HLSL async (MWStateTracker used instead of GetTransform)
+                if (ImGuiManager::GetCmdBufferRecording() || isHLSLActive()) {
+                    g_cmdBufferSet.stateTracker().trackTransform((DWORD)a, view);
+                    if (ImGuiManager::GetCmdBufferRecording()) {
+                        g_cmdBufferSet.active().recordSetTransform((DWORD)a, &view);
+                    }
                 }
                 // Don't suppress transforms — needed for capture/restore
                 return ProxyDevice::SetTransform(a, &view);
             }
-            // Non-main view: capture original
+            // Non-main view (Scene 1/2): capture original and track for async
             captureTransform(a, b);
+            if (isHLSLActive()) {
+                g_cmdBufferSet.stateTracker().trackTransform((DWORD)a, *b);
+            }
         } else if (a == D3DTS_PROJECTION) {
             // Only screw with main scene projection
             if (g_scene.isMainView) {
@@ -1152,11 +1164,19 @@ HRESULT _stdcall MGEProxyDevice::SetTransform(D3DTRANSFORMSTATETYPE a, const D3D
 
                 // Store modified projection for CPU-side reads (replaces device->GetTransform)
                 DistantLand::s_staging.mwProj = proj;
-                if (ImGuiManager::GetCmdBufferRecording()) {
-                    g_cmdBufferSet.recordAndTrackTransform((DWORD)a, &proj);
+                // Always track transforms for HLSL async
+                if (ImGuiManager::GetCmdBufferRecording() || isHLSLActive()) {
+                    g_cmdBufferSet.stateTracker().trackTransform((DWORD)a, proj);
+                    if (ImGuiManager::GetCmdBufferRecording()) {
+                        g_cmdBufferSet.active().recordSetTransform((DWORD)a, &proj);
+                    }
                 }
                 // Don't suppress transforms — needed for capture/restore
                 return ProxyDevice::SetTransform(a, &proj);
+            }
+            // Non-main view (Scene 1/2): track for async
+            if (isHLSLActive()) {
+                g_cmdBufferSet.stateTracker().trackTransform((DWORD)a, *b);
             }
         }
     }
@@ -1164,8 +1184,12 @@ HRESULT _stdcall MGEProxyDevice::SetTransform(D3DTRANSFORMSTATETYPE a, const D3D
     // Capture non-view/proj transforms (WORLD matrices) and fall-through cases
     captureTransform(a, b);
 
-    if (ImGuiManager::GetCmdBufferRecording()) {
-        g_cmdBufferSet.recordAndTrackTransform((DWORD)a, b);
+    // Always track transforms for HLSL async
+    if (ImGuiManager::GetCmdBufferRecording() || isHLSLActive()) {
+        g_cmdBufferSet.stateTracker().trackTransform((DWORD)a, *b);
+        if (ImGuiManager::GetCmdBufferRecording()) {
+            g_cmdBufferSet.active().recordSetTransform((DWORD)a, b);
+        }
     }
     // Don't suppress transforms — needed for capture/restore
     return ProxyDevice::SetTransform(a, b);
@@ -1528,6 +1552,11 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
                 // N-1: Stamp currentView/currentProj to match dlContext camera
                 recBuf.currentView = frameCtx.mwView;
                 recBuf.currentProj = frameCtx.mwProj;
+                // Diagnostic: log nearViewRange when stored (DIP path)
+                static int storeLogCountDIP = 0;
+                if (storeLogCountDIP++ < 10) {
+                    LOG::logline("[N1-STORE-DIP] nearViewRange=%.1f stored to recording buffer", frameCtx.nearViewRange);
+                }
             } else {
                 // Legacy: interleaved GPU work (distant land renders now)
                 frameCtx = DistantLand::renderStage0();
@@ -1552,11 +1581,14 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
     }
 
     // In HLSL mode, inspectIndexedPrimitive already returns false (suppressing) for all
-    // draws it records (HLSL scene objects, sky with ATM_SCATTER). Draws that reach here
-    // returned true from inspect — they are NOT part of the HLSL replay pipeline
-    // (e.g. sky without ATM_SCATTER) and must go through to the device.
-    // When suppressing MW state (async GPU overlap), these draws must also be suppressed
-    // since device state is stale. This means ATM_SCATTER must be enabled for full HLSL path.
+    // draws it records (HLSL scene objects, sky). Draws that reach here returned true
+    // from inspect — they are NOT part of the HLSL replay pipeline and must go through
+    // to the device immediately.
+    // Log strays during recording gap so we can identify what needs deferring.
+    if (isHLSLActive() && FixedFunctionShader::getIsRecording() && g_scene.sceneCount <= 2) {
+        LOG::logline("!! Stray DIP during recording: scene=%d prims=%d verts=%d tex=%p",
+            g_scene.sceneCount, e, c, rs.texture);
+    }
     if (shouldSuppressMWState()) return D3D_OK;
     return ProxyDevice::DrawIndexedPrimitive(a, b, c, d, e);
 }

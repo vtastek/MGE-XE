@@ -65,10 +65,8 @@ DLContext DistantLand::captureStage0Context() {
     // Snapshot all per-frame state into context (foundation for threading)
     DLContext ctx = captureContext();
 
-    // setupCommonEffect sets ~20 effect uniforms (effect->SetMatrix/Float/FloatArray)
-    // These are device writes that need to move to render phase for threading
-    FixedFunctionShader::trackDeviceWrite("setupCommonEffect(~20 effect uniforms)");
-    setupCommonEffect(&ctx, &ctx.mwView, &ctx.mwProj);
+    // Note: setupCommonEffect moved to renderStage0GPU for N-1 rendering
+    // It needs to use the rendering buffer's context, not the current capture
     FixedFunctionShader::updateLighting(ctx.lightSunMult, ctx.lightAmbMult);
 
     return ctx;
@@ -96,6 +94,10 @@ void DistantLand::renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuff
     }
 
     FixedFunctionShader::transitionTo(PhaseTransition::Stage0Entry);
+
+    // N-1: Setup effect uniforms with rendering buffer's context (not current frame's capture)
+    // This ensures distant land renders with the same camera as the recorded main scene
+    setupCommonEffect(ctx, &ctx->mwView, &ctx->mwProj);
 
     auto mwBridge = MWBridge::get();
     IDirect3DStateBlock9* stateSaved;
@@ -157,10 +159,15 @@ void DistantLand::renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuff
             }
 
             // Sky scattering and sky objects (should be drawn late as possible)
-            if ((Configuration.MGEFlags & USE_ATM_SCATTER) && mwBridge->CellHasWeather() && !ImGuiManager::GetSuppressSky()) {
+            // In HLSL mode, sky is always deferred here and rendered via shader
+            if (mwBridge->CellHasWeather()) {
                 FixedFunctionShader::transitionTo(PhaseTransition::SkyEntry);
                 const auto& sky = fb ? fb->recordSky : recordSky;
-                renderSky(sky);
+                if (!sky.empty()) {
+                    // Always use shader path - renderSky handles ATM_SCATTER on/off
+                    bool useAtmScatter = (Configuration.MGEFlags & USE_ATM_SCATTER) && !ImGuiManager::GetSuppressSky();
+                    renderSky(sky, useAtmScatter);
+                }
                 FixedFunctionShader::transitionTo(PhaseTransition::SkyExit);
             }
 
@@ -201,6 +208,27 @@ void DistantLand::renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuff
 
             stateSaved->Release();
         } else {
+            // Non-distant cell path (DL off or interior without distant statics)
+
+            // Sky rendering - still needed even without DL
+            if (mwBridge->CellHasWeather()) {
+                // Save state block for sky rendering
+                device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
+                effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
+
+                FixedFunctionShader::transitionTo(PhaseTransition::SkyEntry);
+                const auto& sky = fb ? fb->recordSky : recordSky;
+                if (!sky.empty()) {
+                    bool useAtmScatter = (Configuration.MGEFlags & USE_ATM_SCATTER) && !ImGuiManager::GetSuppressSky();
+                    renderSky(sky, useAtmScatter);
+                }
+                FixedFunctionShader::transitionTo(PhaseTransition::SkyExit);
+
+                effect->End();
+                stateSaved->Apply();
+                stateSaved->Release();
+            }
+
             // Clear water reflection to avoid seeing previous cell environment reflected
             // Must be done every frame to react to lighting changes
             // Skip for cells without water to avoid unnecessary GPU work
@@ -567,6 +595,10 @@ void DistantLand::setupCommonEffect(DLContext* ctx, const D3DXMATRIX* view, cons
     effect->SetFloatArray(ehFogColNear, ctx->nearFogCol, 3);
     effect->SetFloatArray(ehFogColFar, ctx->horizonCol, 3);
     effect->SetFloat(ehNearViewRange, ctx->nearViewRange);
+    static int nvLogCount = 0;
+    if (nvLogCount++ < 10) {
+        LOG::logline("[NVR] setupCommonEffect: nearViewRange=%.1f", ctx->nearViewRange);
+    }
     effect->SetFloat(ehNiceWeather, ctx->niceWeather);
 
     if (ehOutscatter) {
@@ -1236,20 +1268,24 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
             targetRecordSky.back().useLighting = false;
         }
 
-        // Sky suppress: render wireframe outline instead of normal rendering
+        // Mark sky for wireframe debug (rendered in GPU phase, not here)
         if (ImGuiManager::GetSuppressSky()) {
-            FixedFunctionShader::trackGpuCall("SkySuppress_DIP");
-            device->SetRenderState(D3DRS_FILLMODE, D3DFILL_WIREFRAME);
-            device->DrawIndexedPrimitive(rs->primType, rs->baseIndex, rs->minIndex,
-                rs->vertCount, rs->startIndex, rs->primCount);
-            device->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
-            return false;  // Skip normal DIP
+            targetRecordSky.back().debugWireframe = true;
         }
 
-        // If using atmosphere scattering, draw sky later in stage 0
+        // HLSL: Always defer sky for async safety (both ATM_SCATTER and FFP paths)
+        // Sky will be rendered in renderStage0GPU or renderSkyFFP
+        if (isHLSLActive()) {
+            return false;  // Defer to GPU phase
+        }
+
+        // Legacy: defer sky only if using atmosphere scattering
         if ((Configuration.MGEFlags & USE_DISTANT_LAND) && (Configuration.MGEFlags & USE_ATM_SCATTER)) {
             return false;
         }
+
+        // Legacy FFP sky without ATM_SCATTER - fall through to immediate render
+        // (This is expected behavior in legacy mode, not a stray)
     } else if (s_staging.isPPLActive) {
         // Event logging deferred to recordRenderCall where exact RenderBin is known
         // Render Morrowind with replacement shaders

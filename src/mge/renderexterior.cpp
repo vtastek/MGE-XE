@@ -10,43 +10,44 @@
 
 
 
-// renderSky - Render atmosphere scattering sky layer and other recorded draw calls on top
-void DistantLand::renderSky(const std::vector<RecordedMWState>& sky) {
+// renderSky - Render sky with atmosphere scattering (or simple vertex color when disabled)
+// useAtmScatter: true = full atmosphere scattering, false = use vertex colors directly
+void DistantLand::renderSky(const std::vector<RecordedMWState>& sky, bool useAtmScatter) {
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_SkyRender, 0, (int)sky.size());
-    // Recorded renders
-    const auto& recordSky_const = sky;
     const int standardCloudVerts = 65, standardCloudTris = 112;
     const int standardMoonVerts = 4, standardMoonTris = 2;
 
     // Render sky without clouds first
     effect->BeginPass(PASS_RENDERSKY);
-    for (const auto& i : recordSky_const) {
-        // Skip clouds
+    for (const auto& i : sky) {
+        // Skip clouds (rendered separately)
         if (i.texture && i.vertCount == standardCloudVerts && i.primCount == standardCloudTris) {
             continue;
         }
 
-        // Set variables in main effect; variables are shared via effect pool
+        // Debug wireframe mode
+        if (i.debugWireframe) {
+            device->SetRenderState(D3DRS_FILLMODE, D3DFILL_WIREFRAME);
+        }
+
         effect->SetTexture(ehTex0, i.texture);
         if (i.texture) {
-            // Textured object; draw as normal in shader, with exceptions:
-            // - Sun/moon billboards do not use mipmaps
-            // - Moon shadow cutout (prevents stars shining through moons)
-            //   which requires colour to be replaced with atmosphere scattering colour
+            // Textured object (sun/moon/stars)
             bool isBillboard = (i.vertCount == standardMoonVerts && i.primCount == standardMoonTris);
             bool isMoonShadow = i.destBlend == D3DBLEND_INVSRCALPHA && !i.useLighting;
 
             effect->SetBool(ehHasAlpha, true);
             effect->SetBool(ehHasBones, isBillboard);
-            effect->SetBool(ehHasVCol, isMoonShadow);
+            // Moon shadow uses vertex color for atmosphere tinting (only when ATM_SCATTER on)
+            effect->SetBool(ehHasVCol, isMoonShadow && useAtmScatter);
             device->SetRenderState(D3DRS_ALPHABLENDENABLE, 1);
             device->SetRenderState(D3DRS_SRCBLEND, i.srcBlend);
             device->SetRenderState(D3DRS_DESTBLEND, i.destBlend);
             device->SetRenderState(D3DRS_ALPHATESTENABLE, 1);
         } else {
-            // Sky; perform atmosphere scattering in shader
+            // Sky dome - always use vertex colors (atmosphere scattering is in the shader)
             effect->SetBool(ehHasAlpha, false);
-            effect->SetBool(ehHasVCol, true);
+            effect->SetBool(ehHasVCol, true);  // Shader does atmosphere scattering when true
             device->SetRenderState(D3DRS_ALPHABLENDENABLE, 0);
             device->SetRenderState(D3DRS_ALPHATESTENABLE, 0);
         }
@@ -58,15 +59,24 @@ void DistantLand::renderSky(const std::vector<RecordedMWState>& sky) {
         device->SetIndices(i.ib);
         device->SetFVF(i.fvf);
         device->DrawIndexedPrimitive(i.primType, i.baseIndex, i.minIndex, i.vertCount, i.startIndex, i.primCount);
+
+        if (i.debugWireframe) {
+            device->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
+        }
     }
     effect->EndPass();
 
     // Render clouds with a separate shader
     effect->BeginPass(PASS_RENDERCLOUDS);
-    for (const auto& i : recordSky_const) {
+    for (const auto& i : sky) {
         // Clouds only
         if (!(i.texture && i.vertCount == standardCloudVerts && i.primCount == standardCloudTris)) {
             continue;
+        }
+
+        // Debug wireframe mode
+        if (i.debugWireframe) {
+            device->SetRenderState(D3DRS_FILLMODE, D3DFILL_WIREFRAME);
         }
 
         effect->SetTexture(ehTex0, i.texture);
@@ -82,6 +92,10 @@ void DistantLand::renderSky(const std::vector<RecordedMWState>& sky) {
         device->SetIndices(i.ib);
         device->SetFVF(i.fvf);
         device->DrawIndexedPrimitive(i.primType, i.baseIndex, i.minIndex, i.vertCount, i.startIndex, i.primCount);
+
+        if (i.debugWireframe) {
+            device->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
+        }
     }
     effect->EndPass();
 }
@@ -144,6 +158,12 @@ void DistantLand::cullDistantStatics(DLContext* ctx, const D3DXMATRIX* view, con
     float zn = ctx->nearViewRange - 768.0f, zf = zn;
     float cullDist = ctx->fogEnd;
 
+    // Diagnostic: log culling distances
+    static int cullLogCount = 0;
+    if (cullLogCount++ < 10) {
+        LOG::logline("[CULL] cullDistantStatics: nearViewRange=%.1f zn=%.1f fogEnd=%.1f",
+            ctx->nearViewRange, zn, cullDist);
+    }
 
     if (Configuration.UseSharedMemory) {
         visDistantShared.RemoveAll();

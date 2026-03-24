@@ -548,9 +548,10 @@ void FixedFunctionShader::startEarlyPrecache(IDirect3DDevice* d) {
                     {1,2, 0,1, 0,0, 0,0,0, 1,2},  // dual texture
                     {1,2, 1,2, 0,0, 0,0,0, 2,1}, {1,2, 1,2, 1,0, 0,0,0, 2,1},  // fog=2
 
-                    // lm=3 (texture lights, always hl=1) — base, dp+ph, fog=2
+                    // lm=3 (texture lights, always hl=1) — base, dp+ph, skinning, fog=2
                     {1,3, 0,1, 1,0, 0,0,0, 1,1}, {1,3, 1,2, 1,0, 0,0,0, 1,1},
                     {1,3, 0,1, 1,0, 1,1,0, 1,1}, {1,3, 1,2, 1,0, 1,1,0, 1,1},
+                    {1,3, 0,1, 1,1, 0,0,0, 1,1}, {1,3, 1,2, 1,1, 0,0,0, 1,1},  // skinning
                     {1,3, 1,2, 1,0, 0,0,0, 2,1},  // fog=2
                 };
 
