@@ -1029,6 +1029,9 @@ void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool w
     device->GetRenderState(D3DRS_ZENABLE, &savedZEnable);
     device->GetRenderState(D3DRS_ZWRITEENABLE, &savedZWrite);
     device->GetRenderState(D3DRS_ZFUNC, &savedZFunc);
+    // Save FVF - GPU phases use vertex declarations that corrupt UI's expected format
+    DWORD savedFVF;
+    device->GetFVF(&savedFVF);
 
     // === RESTORE ENDSCENE(0) STATE ===
     // State was captured at EndScene(0), but MW ran Scene 1/2 since then.
@@ -1230,6 +1233,7 @@ void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool w
     }
     device->SetVertexShader(NULL);
     device->SetPixelShader(NULL);
+    device->SetFVF(savedFVF);  // Restore vertex format for fixed-function UI
 
     // === RESTORE UI STATE ===
     // MW set up UI state before calling BeginScene. Restore it so HUD draws correctly.
