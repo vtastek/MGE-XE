@@ -54,6 +54,7 @@ public:
     int GetWthrString(int wthr, int offset, char str[]);
     void SetWthrString(int wthr, int offset, char str[]);
     bool CellHasWater();
+    BYTE GetCellWaterFlag();
     bool IsUnderwater(float eyeZ);
     bool WaterReflects(float eyeZ);
     float simulationTime();

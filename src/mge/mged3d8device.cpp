@@ -885,33 +885,30 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                     FixedFunctionShader::transitionTo(PhaseTransition::GpuExit);
                 }
 
-                // postProcess runs here for both HLSL and legacy
-                if (g_scene.stage0Complete) {
-                    DistantLand::postProcess(&frameCtx);
-                }
-
+                DistantLand::postProcess(&frameCtx);
+               
                 // Ensure clean state for UI rendering after GPU phase
                 // MW's UI code ASSUMES these states are set from world rendering - it doesn't
                 // explicitly set them. When scenes are empty, MGE stages leave unknown state.
                 // Frame trace comparison shows UI expects: ALPHABLENDENABLE=0, ZWRITEENABLE=1, FOGENABLE=1
-                if (isHLSLActive()) {
-                    realDevice->SetVertexShader(NULL);
-                    realDevice->SetPixelShader(NULL);
+                //if (isHLSLActive()) {
+                //    realDevice->SetVertexShader(NULL);
+                //    realDevice->SetPixelShader(NULL);
 
-                    // Set render states that UI inherits from world rendering
-                    // Without these, UI blending/depth/fog breaks when scenes are empty
-                    realDevice->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-                    realDevice->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
-                    realDevice->SetRenderState(D3DRS_FOGENABLE, TRUE);
-                    realDevice->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
+                //    // Set render states that UI inherits from world rendering
+                //    // Without these, UI blending/depth/fog breaks when scenes are empty
+                //    realDevice->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+                //    realDevice->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+                //    realDevice->SetRenderState(D3DRS_FOGENABLE, TRUE);
+                //    realDevice->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
 
-                    // Clear Z buffer so UI isn't hidden behind 3D geometry
-                    realDevice->Clear(0, NULL, D3DCLEAR_ZBUFFER, 0, 1.0f, 0);
-                    g_scene.uiStateCaptured = true;
-                    if (ImGuiManager::GetCmdBufferRecording()) {
-                        ImGuiManager::LogFrameEvent(FrameEvent::UIState_Captured, g_scene.sceneCount);
-                    }
-                }
+                //    // Clear Z buffer so UI isn't hidden behind 3D geometry
+                //    realDevice->Clear(0, NULL, D3DCLEAR_ZBUFFER, 0, 1.0f, 0);
+                //    g_scene.uiStateCaptured = true;
+                //    if (ImGuiManager::GetCmdBufferRecording()) {
+                //        ImGuiManager::LogFrameEvent(FrameEvent::UIState_Captured, g_scene.sceneCount);
+                //    }
+                //}
 
                 // UI command buffer is replayed at EndScene (after all UI draws are recorded)
             }
@@ -996,6 +993,8 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
         } else if (!g_scene.isFrameComplete) {
             // Draw water if the Morrowind water plane doesn't appear in view
             // it may be too distant or stencil scene order is non-normative
+            LOG::logline("DW:%d, WD:%d, SS:%d", g_scene.distantWater, g_scene.waterDrawn, g_scene.isStencilScene);
+
             if (g_scene.distantWater && !g_scene.waterDrawn && !g_scene.isStencilScene) {
                 if (isHLSLActive()) {
                     // HLSL: just flag — finalizeAndRender will render water in GPU phase
@@ -1242,6 +1241,10 @@ HRESULT _stdcall MGEProxyDevice::SetTransform(D3DTRANSFORMSTATETYPE a, const D3D
 HRESULT _stdcall MGEProxyDevice::SetMaterial(const D3DMATERIAL8* a) {
     captureMaterial(a);
     g_scene.isWaterMaterial = (a->Power == 99999.0f);
+    if (g_scene.isWaterMaterial && !g_scene.waterDrawn) {
+        LOG::logline("Water material detected: Power=%.1f", a->Power);
+    }
+
     ImGuiManager::TraceMaterial(g_scene.sceneCount, a->Diffuse.r, a->Diffuse.g, a->Diffuse.b, a->Diffuse.a);
 
     if (ImGuiManager::GetCmdBufferRecording()) {

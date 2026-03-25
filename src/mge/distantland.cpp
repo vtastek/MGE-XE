@@ -59,8 +59,18 @@ DLContext DistantLand::captureStage0Context() {
     setView(&s_staging.mwView);
     adjustFog();
 
+    bool wasRenderCached = s_staging.isRenderCached;
     s_staging.isRenderCached &= (Configuration.MGEFlags & USE_MENU_CACHING) && mwBridge->IsMenu();
     s_staging.isPPLActive = (Configuration.MGEFlags & USE_FFESHADER) && !(Configuration.PerPixelLightFlags == 1 && !mwBridge->IntCurCellAddr());
+
+    // Diagnostic: log when isRenderCached changes (no limit)
+    static int captureLogCount = 0;
+    if (captureLogCount < 200 && (wasRenderCached || s_staging.isRenderCached)) {
+        LOG::logline("[CAPTURE] isRenderCached: %d -> %d (IsMenu=%d, USE_MENU_CACHING=%d)",
+            wasRenderCached, s_staging.isRenderCached, mwBridge->IsMenu(),
+            (Configuration.MGEFlags & USE_MENU_CACHING) ? 1 : 0);
+        captureLogCount++;
+    }
 
     // Snapshot all per-frame state into context (foundation for threading)
     DLContext ctx = captureContext();
@@ -103,7 +113,8 @@ void DistantLand::renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuff
     IDirect3DStateBlock9* stateSaved;
     UINT passes;
 
-    if (!ctx->isRenderCached) {
+    // N-1 fix: Use current frame's menu state, not buffered context's stale state
+    if (!s_staging.isRenderCached) {
         if (isDistantCell()) {
             // Save state block manually since we can change FVF/decl
             device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
@@ -280,7 +291,8 @@ void DistantLand::renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer*
 
     ///LOG::logline("Stage 1 prims: %d", recordMW.size());
 
-    if (!ctx->isRenderCached) {
+    // N-1 fix: Use current frame's menu state, not buffered context's stale state
+    if (!s_staging.isRenderCached) {
         // Save state block manually since we can change FVF/decl
         device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
 
@@ -413,7 +425,8 @@ void DistantLand::renderStage2(DLContext* ctx, FixedFunctionShader::FrameBuffer*
         return;
     }
 
-    if (!ctx->isRenderCached) {
+    // N-1 fix: Use current frame's menu state, not buffered context's stale state
+    if (!s_staging.isRenderCached) {
         // Save state block manually since we can change FVF/decl
         device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
 
@@ -463,7 +476,8 @@ void DistantLand::renderStageBlend(DLContext* ctx, FixedFunctionShader::FrameBuf
     IDirect3DStateBlock9* stateSaved;
     UINT passes;
 
-    if (ctx->isRenderCached) {
+    // N-1 fix: Use current frame's menu state, not buffered context's stale state
+    if (s_staging.isRenderCached) {
         return;
     }
 
@@ -521,8 +535,14 @@ void DistantLand::renderStageWater(DLContext* ctx) {
     IDirect3DStateBlock9* stateSaved;
     UINT passes;
 
-    if (ctx->isRenderCached) {
-        return;
+    // Diagnostic: log water state every 60 frames (1 per second at 60fps)
+    static int waterLogFrame = 0;
+    if (++waterLogFrame >= 60) {
+        waterLogFrame = 0;
+        DWORD cellAddr = mwBridge->IntCurCellAddr();
+        BYTE waterFlag = mwBridge->GetCellWaterFlag();
+        LOG::logline("[WATER] CellHasWater=%d flag=0x%02X (masked=0x%02X) addr=0x%08X IsExterior=%d",
+            mwBridge->CellHasWater(), waterFlag, (waterFlag & 0x73), cellAddr, mwBridge->IsExterior());
     }
 
     if (mwBridge->CellHasWater()) {
@@ -820,7 +840,8 @@ void DistantLand::adjustFog() {
 void DistantLand::postProcess(DLContext* ctx) {
     MGE_ZoneScopedN("postProcess");
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_PostProcess, -1);
-    if (!ctx->isRenderCached) {
+    // N-1 fix: Use current frame's menu state, not buffered context's stale state
+    if (!s_staging.isRenderCached) {
         auto mwBridge = MWBridge::get();
 
         // Save state block
@@ -862,6 +883,7 @@ void DistantLand::postProcess(DLContext* ctx) {
 
         // Cache render for first frame of menu mode
         if ((Configuration.MGEFlags & USE_MENU_CACHING) && mwBridge->IsMenu()) {
+            LOG::logline("[RENDERCACHE] Setting isRenderCached=true in postProcess (IsMenu=true)");
             texDistantBlend = PostShaders::borrowBuffer(0);
             s_staging.isRenderCached = true;
         }
@@ -891,7 +913,8 @@ void DistantLand::postProcess(DLContext* ctx) {
 void DistantLand::postProcess(DLContext* ctx, const PostProcessData& ppd) {
     MGE_ZoneScopedN("postProcess");
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_PostProcess, -1);
-    if (!ctx->isRenderCached) {
+    // N-1 fix: Use current frame's menu state, not buffered context's stale state
+    if (!s_staging.isRenderCached) {
         // Save state block
         IDirect3DStateBlock9* stateSaved;
         device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
@@ -910,6 +933,7 @@ void DistantLand::postProcess(DLContext* ctx, const PostProcessData& ppd) {
 
         // Cache render for first frame of menu mode
         if ((Configuration.MGEFlags & USE_MENU_CACHING) && ppd.isMenu) {
+            LOG::logline("[RENDERCACHE] Setting isRenderCached=true in postProcess overload (ppd.isMenu=true)");
             texDistantBlend = PostShaders::borrowBuffer(0);
             // TODO: For async N-1, this write to s_staging must complete before the next frame reads it
             s_staging.isRenderCached = true;

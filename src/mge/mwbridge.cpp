@@ -508,6 +508,14 @@ bool MWBridge::CellHasWater() {
     return true;
 }
 
+BYTE MWBridge::GetCellWaterFlag() {
+    DWORD addr = IntCurCellAddr();
+    if (addr != 0) {
+        return read_byte(addr + 0x18);
+    }
+    return 0xFF;  // Exterior indicator
+}
+
 //-----------------------------------------------------------------------------
 
 bool MWBridge::IsUnderwater(float eyeZ) {
