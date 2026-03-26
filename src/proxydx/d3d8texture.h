@@ -14,6 +14,7 @@ extern std::unordered_map<IDirect3DTexture9*, UploadHash> g_uploadHashMap;
 
 class ProxyTexture : public IDirect3DTexture8 {
 public:
+    DWORD refcount;
     IDirect3DTexture9* realTexture;
     ProxyDevice* proxDevice;
 

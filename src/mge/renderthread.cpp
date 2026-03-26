@@ -161,5 +161,5 @@ void RenderThread::executeReplayHLSL(int sceneCount) {
 
 void RenderThread::executeFullFrame(int /*bufferIndex*/) {
     MGE_ZoneScopedN("RT_FullFrame");
-    FixedFunctionShader::executeRenderPass();
+    FixedFunctionShader::renderFullFrameAsync();
 }

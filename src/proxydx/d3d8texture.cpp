@@ -36,7 +36,7 @@ static unsigned int crc32_upload(const unsigned char* buf, size_t len) {
     return c ^ 0xffffffffL;
 }
 
-ProxyTexture::ProxyTexture(IDirect3DTexture9* real, ProxyDevice* device) : realTexture(real), proxDevice(device), hasActiveLock0(false) {
+ProxyTexture::ProxyTexture(IDirect3DTexture9* real, ProxyDevice* device) : refcount(1), realTexture(real), proxDevice(device), hasActiveLock0(false) {
     pendingLockRect = {};
     ProxyTexture* proxy = this;
     real->SetPrivateData(guid_proxydx, (void*)&proxy, sizeof(proxy), 0);
@@ -50,15 +50,15 @@ HRESULT _stdcall ProxyTexture::QueryInterface(REFIID riid, void** ppvObj) {
     return realTexture->QueryInterface(riid, ppvObj);
 }
 ULONG _stdcall ProxyTexture::AddRef() {
-    return realTexture->AddRef();
+    return ++refcount;
 }
 ULONG _stdcall ProxyTexture::Release() {
-    ULONG refcount = realTexture->Release();
-    if (!refcount) {
+    if (--refcount == 0) {
         if (g_onTextureReleased) {
             g_onTextureReleased(realTexture);
         }
         g_uploadHashMap.erase(realTexture);
+        realTexture->Release();
         delete this;
         return 0;
     }

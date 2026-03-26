@@ -761,6 +761,7 @@ void FixedFunctionShader::finalizeAndRender(DLContext* frameCtx, bool waterSeen)
         DistantLand::renderStageBlend(frameCtx);
         if (waterSeen) {
             DistantLand::renderStageWater(frameCtx);
+            LOG::logline("Water rendered for recording system, all empty scenes?");
         }
         DistantLand::renderStage2(frameCtx);
         return;
@@ -956,8 +957,10 @@ void FixedFunctionShader::executeGpuPhase() {
     DistantLand::renderStageBlend(frameCtx, &fb);
 
     // Water surface AFTER replay — refraction samples backbuffer which needs scene content
+    // Only render if not already drawn (prevents double-render when water rendered in DIP path)
     if (waterSeen) {
         DistantLand::renderStageWater(frameCtx);
+        LOG::logline("Water rendered, weird recording, unused async path?");
     }
 
     // NOTE: renderStage2 (depth for Scene 2 hands) runs at EndScene(1/2) in mged3d8device.cpp
@@ -1106,6 +1109,7 @@ void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool w
     // Water writes depth, then particles blend over it
     if (renderWaterSeen) {
         DistantLand::renderStageWater(renderCtx);
+        LOG::logline("Water is rendered, recording path, empty particles case?");
     }
 
     // Upload snapshot vertex/index data to staging buffers before Scene 1/2 replay
@@ -1560,6 +1564,325 @@ void FixedFunctionShader::executeCullPass() {
 
 void FixedFunctionShader::executeRenderPass() {
     executeGpuPhase();
+}
+
+// Async GPU path: runs on render thread during safe zone.
+// Combines finalizeAndRenderAllScenes + postProcess without UI state save/restore.
+// Main thread handles UI state save/restore around waitForCompletion().
+void FixedFunctionShader::renderFullFrameAsync() {
+    MGE_ZoneScopedN("renderFullFrameAsync");
+
+    if (!recordingEnabled || !n1Ready) return;
+
+    auto& fb = getRenderingBuffer();
+    DLContext* renderCtx = &fb.dlContext;
+    bool renderWaterSeen = fb.waterSeen;
+
+    // Diagnostic: log device state at UI BeginScene to compare suppression ON vs OFF
+    {
+        {
+            DWORD ab, sb, db, at, ar, af, ze, zw, zf, fe, cwe, tf, lit, cv;
+            device->GetRenderState(D3DRS_ALPHABLENDENABLE, &ab);
+            device->GetRenderState(D3DRS_SRCBLEND, &sb);
+            device->GetRenderState(D3DRS_DESTBLEND, &db);
+            device->GetRenderState(D3DRS_ALPHATESTENABLE, &at);
+            device->GetRenderState(D3DRS_ALPHAREF, &ar);
+            device->GetRenderState(D3DRS_ALPHAFUNC, &af);
+            device->GetRenderState(D3DRS_ZENABLE, &ze);
+            device->GetRenderState(D3DRS_ZWRITEENABLE, &zw);
+            device->GetRenderState(D3DRS_ZFUNC, &zf);
+            device->GetRenderState(D3DRS_FOGENABLE, &fe);
+            device->GetRenderState(D3DRS_COLORWRITEENABLE, &cwe);
+            device->GetRenderState(D3DRS_TEXTUREFACTOR, &tf);
+            device->GetRenderState(D3DRS_LIGHTING, &lit);
+            device->GetRenderState(D3DRS_COLORVERTEX, &cv);
+            DWORD fvfVal; device->GetFVF(&fvfVal);
+            DWORD tss0co, tss0ca1, tss0ca2, tss0ao, tss1co;
+            device->GetTextureStageState(0, D3DTSS_COLOROP, &tss0co);
+            device->GetTextureStageState(0, D3DTSS_COLORARG1, &tss0ca1);
+            device->GetTextureStageState(0, D3DTSS_COLORARG2, &tss0ca2);
+            device->GetTextureStageState(0, D3DTSS_ALPHAOP, &tss0ao);
+            device->GetTextureStageState(1, D3DTSS_COLOROP, &tss1co);
+            LOG::logline("[UI_STATE] supp=%d AB=%d SB=%d DB=%d AT=%d AR=%d AF=%d ZE=%d ZW=%d ZF=%d FE=%d CWE=0x%X TF=0x%08X LIT=%d CV=%d FVF=0x%X",
+                ImGuiManager::GetStateSuppressionEnabled() ? 1 : 0,
+                ab, sb, db, at, ar, af, ze, zw, zf, fe, cwe, tf, lit, cv, fvfVal);
+            LOG::logline("[UI_STATE] TSS0: CO=%d CA1=%d CA2=%d AO=%d  TSS1: CO=%d",
+                tss0co, tss0ca1, tss0ca2, tss0ao, tss1co);
+
+            // Extended states for brightness diagnosis
+            DWORD amb, dms, ams, ems;
+            device->GetRenderState(D3DRS_AMBIENT, &amb);
+            device->GetRenderState(D3DRS_DIFFUSEMATERIALSOURCE, &dms);
+            device->GetRenderState(D3DRS_AMBIENTMATERIALSOURCE, &ams);
+            device->GetRenderState(D3DRS_EMISSIVEMATERIALSOURCE, &ems);
+            IDirect3DSurface9* curRT = nullptr;
+            IDirect3DSurface9* backBuf = nullptr;
+            device->GetRenderTarget(0, &curRT);
+            device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuf);
+            bool rtOk = (curRT == backBuf);
+            if (curRT) curRT->Release();
+            if (backBuf) backBuf->Release();
+            LOG::logline("[UI_STATE] AMB=0x%08X DMS=%d AMS=%d EMS=%d RT_OK=%d",
+                amb, dms, ams, ems, rtOk ? 1 : 0);
+
+            // Also log water level for N-1 investigation
+            auto mwb = MWBridge::get();
+            LOG::logline("[UI_STATE] WaterLevel=%.1f CellHasWater=%d eyePos.z=%.1f",
+                mwb->CellHasWater() ? mwb->WaterLevel() : -9999.0f,
+                mwb->CellHasWater() ? 1 : 0, renderCtx->eyePos.z);
+        }
+    }
+    // end diagnostic
+
+      // Fix stale device state from suppressed recording calls.
+    // MUST happen BEFORE state block creation to capture correct state.
+    if (ImGuiManager::GetStateSuppressionEnabled()) {
+        auto& tracker = g_cmdBufferSet.stateTracker();
+        DWORD val;
+        bool abOk = tracker.getRenderState(D3DRS_ALPHABLENDENABLE, &val);
+        DWORD abVal = abOk ? val : 0xDEAD;
+        if (abOk) device->SetRenderState(D3DRS_ALPHABLENDENABLE, val);
+
+        bool inWaterCell = MWBridge::get()->CellHasWater();
+
+        // Restore ZW from tracker - don't override during UI rendering
+        // Water ZW fix will be applied later during actual water rendering
+        bool zwOk = tracker.getRenderState(D3DRS_ZWRITEENABLE, &val);
+        DWORD zwVal = zwOk ? val : 0xDEAD;
+        if (zwOk) device->SetRenderState(D3DRS_ZWRITEENABLE, val);
+
+        bool arOk = tracker.getRenderState(D3DRS_ALPHAREF, &val);
+        DWORD arVal = arOk ? val : 0xDEAD;
+        if (arOk) device->SetRenderState(D3DRS_ALPHAREF, val);
+
+        bool atOk = tracker.getRenderState(D3DRS_ALPHATESTENABLE, &val);
+        DWORD atVal = atOk ? val : 0xDEAD;
+        if (atOk) device->SetRenderState(D3DRS_ALPHATESTENABLE, val);
+
+        bool fvfOk = tracker.getFVF(&val);
+        DWORD fvfVal = fvfOk ? val : 0xDEAD;
+        if (fvfOk) device->SetFVF(val);
+
+        // Fix light enable states — suppressed LightEnable calls leave lights
+        // from 3D scenes leaking into UI (causes bright text via extra lighting)
+        int lightsFixed = 0;
+        for (auto& [index, enable] : tracker.lightEnables) {
+            device->LightEnable(index, enable);
+            lightsFixed++;
+        }
+
+        // Post-fix: read back device state to confirm
+        DWORD postAB, postZW, postAR, postAT, postFVF;
+        device->GetRenderState(D3DRS_ALPHABLENDENABLE, &postAB);
+        device->GetRenderState(D3DRS_ZWRITEENABLE, &postZW);
+        device->GetRenderState(D3DRS_ALPHAREF, &postAR);
+        device->GetRenderState(D3DRS_ALPHATESTENABLE, &postAT);
+        device->GetFVF(&postFVF);
+        BOOL l0 = FALSE, l1 = FALSE;
+        device->GetLightEnable(0, &l0);
+        device->GetLightEnable(1, &l1);
+        LOG::logline("[UI_FIX] tracker: AB=%s(%d) ZW=%s(%d) AR=%s(%d) FVF=%s(0x%X) lights=%d -> device: AB=%d ZW=%d AR=%d FVF=0x%X L0=%d L1=%d",
+            abOk?"Y":"N", abVal, zwOk?"Y":"N", zwVal, arOk?"Y":"N", arVal, fvfOk?"Y":"N", fvfVal, lightsFixed,
+            postAB, postZW, postAR, postFVF, l0, l1);
+    }
+
+  IDirect3DStateBlock9* uiStateBlock = nullptr;
+    device->CreateStateBlock(D3DSBT_ALL, &uiStateBlock);
+
+    // Ensure render target is the back buffer before GPU work.
+    // SetRenderTarget is suppressed during recording, so device may have stale RT.
+    {
+        IDirect3DSurface9* backbuffer;
+        device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backbuffer);
+        device->SetRenderTarget(0, backbuffer);
+        backbuffer->Release();
+    }
+
+    // Apply EndScene(0) state baseline
+    fb.stateContract.applyTo((IDirect3DDevice9*)device);
+
+    // Prepare all scenes (shader keys, render bins)
+    {
+        MGE_ZoneScopedN("Prepare All Scenes");
+        prepareRecordedCalls();
+        fb.state = BufferState::ReadyToRender;
+    }
+
+    // Stage 0 GPU: shadow map, distant land, sky, water reflection
+    {
+        MGE_ZoneScopedN("Stage0 GPU");
+        DistantLand::renderStage0GPU(renderCtx, &fb);
+    }
+
+    // Update shadow VP from freshly computed matrices
+    fb.shadowViewproj[0] = DistantLand::s_staging.smViewproj[0];
+    fb.shadowViewproj[1] = DistantLand::s_staging.smViewproj[1];
+
+    // Depth passes: Scene 0 (world) and Scene 2 (hands)
+    {
+        MGE_ZoneScopedN("Depth Passes");
+        DistantLand::renderStage1(renderCtx, &fb);
+        DistantLand::renderStage2(renderCtx, &fb);
+    }
+
+    // Replay Scene 0
+    isReplaying = true;
+    {
+        MGE_ZoneScopedN("Replay All Scenes");
+        transitionTo(PhaseTransition::ReplayEntry);
+
+        LOG::logline("[ORDER] renderFullFrameAsync: Replay Scene 0 (%d calls)", (int)fb.recordedCalls.size());
+        replayRecordedCalls(0, nullptr);
+
+        transitionTo(PhaseTransition::ReplayExit);
+
+        // Blend distant land over near objects
+        DistantLand::renderStageBlend(renderCtx, &fb);
+    }
+
+    // Water surface after Scene 0, before particles
+    if (renderWaterSeen) {
+        DistantLand::renderStageWater(renderCtx);
+        LOG::logline("Water rendered, recording after scene 0, no particles case?");
+    }
+
+    // Upload snapshot vertex/index data to staging buffers for Scene 1/2
+    {
+        MGE_ZoneScopedN("Upload Particle Staging Buffers");
+
+        UINT totalVBBytes = 0, totalIBBytes = 0;
+        for (auto& call : fb.recordedCallsScene1) {
+            if (call.usesSnapshot) {
+                call.stagingVBOffset = totalVBBytes;
+                call.stagingIBOffset = totalIBBytes;
+                totalVBBytes += (UINT)call.vertexSnapshot.size();
+                totalIBBytes += (UINT)call.indexSnapshot.size();
+            }
+        }
+        for (auto& call : fb.recordedCallsScene2) {
+            if (call.usesSnapshot) {
+                call.stagingVBOffset = totalVBBytes;
+                call.stagingIBOffset = totalIBBytes;
+                totalVBBytes += (UINT)call.vertexSnapshot.size();
+                totalIBBytes += (UINT)call.indexSnapshot.size();
+            }
+        }
+
+        if (totalVBBytes > 0 && totalVBBytes > fb.stagingVBSize) {
+            if (fb.particleStagingVB) { fb.particleStagingVB->Release(); fb.particleStagingVB = nullptr; }
+            HRESULT hr = device->CreateVertexBuffer(totalVBBytes, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
+                0, D3DPOOL_DEFAULT, &fb.particleStagingVB, nullptr);
+            if (SUCCEEDED(hr)) fb.stagingVBSize = totalVBBytes;
+        }
+        if (totalIBBytes > 0 && totalIBBytes > fb.stagingIBSize) {
+            if (fb.particleStagingIB) { fb.particleStagingIB->Release(); fb.particleStagingIB = nullptr; }
+            HRESULT hr = device->CreateIndexBuffer(totalIBBytes, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
+                D3DFMT_INDEX16, D3DPOOL_DEFAULT, &fb.particleStagingIB, nullptr);
+            if (SUCCEEDED(hr)) fb.stagingIBSize = totalIBBytes;
+        }
+
+        if (totalVBBytes > 0 && fb.particleStagingVB && totalIBBytes > 0 && fb.particleStagingIB) {
+            void* pVB = nullptr;
+            void* pIB = nullptr;
+            if (SUCCEEDED(fb.particleStagingVB->Lock(0, totalVBBytes, &pVB, D3DLOCK_DISCARD)) &&
+                SUCCEEDED(fb.particleStagingIB->Lock(0, totalIBBytes, &pIB, D3DLOCK_DISCARD))) {
+                for (auto& call : fb.recordedCallsScene1) {
+                    if (call.usesSnapshot && !call.vertexSnapshot.empty()) {
+                        memcpy((BYTE*)pVB + call.stagingVBOffset, call.vertexSnapshot.data(), call.vertexSnapshot.size());
+                        memcpy((BYTE*)pIB + call.stagingIBOffset, call.indexSnapshot.data(), call.indexSnapshot.size());
+                    }
+                }
+                for (auto& call : fb.recordedCallsScene2) {
+                    if (call.usesSnapshot && !call.vertexSnapshot.empty()) {
+                        memcpy((BYTE*)pVB + call.stagingVBOffset, call.vertexSnapshot.data(), call.vertexSnapshot.size());
+                        memcpy((BYTE*)pIB + call.stagingIBOffset, call.indexSnapshot.data(), call.indexSnapshot.size());
+                    }
+                }
+                fb.particleStagingVB->Unlock();
+                fb.particleStagingIB->Unlock();
+            }
+        }
+    }
+
+    // Replay Scene 1 (particles)
+    {
+        D3DXMATRIX savedView = fb.view, savedProj = fb.proj;
+        fb.view = fb.viewScene1;
+        fb.proj = fb.projScene1;
+        isReplaying = true;
+        replayRecordedCalls(1, nullptr);
+        fb.view = savedView;
+        fb.proj = savedProj;
+        isReplaying = false;
+    }
+
+    // Z-clear before hands
+    device->Clear(0, NULL, D3DCLEAR_ZBUFFER, 0, 1.0f, 0);
+
+    // Replay Scene 2 (hands)
+    {
+        D3DXMATRIX savedView = fb.view, savedProj = fb.proj;
+        fb.view = fb.viewScene2;
+        fb.proj = fb.projScene2;
+        isReplaying = true;
+        replayRecordedCalls(2, nullptr);
+        isReplaying = false;
+        fb.view = savedView;
+        fb.proj = savedProj;
+    }
+
+    // PostProcess using captured PostProcessData (no MWBridge access)
+    DistantLand::postProcess(renderCtx, fb.postProcessData);
+
+    // Clean up HLSL state
+    for (int i = 2; i < 6; i++) {
+        device->SetTexture(i, NULL);
+        textureCache.updateCache(i, nullptr);
+        textureCache.textureValid[i] = false;
+    }
+    device->SetVertexShader(NULL);
+    device->SetPixelShader(NULL);
+
+    isReplaying = false;
+    resetHLSLCaches();
+
+    // Restore ALL device state from state block.
+    // Suppression is OFF by UI BeginScene (only active during recording), so the state block
+    // captured correct MW UI state — no tracker overlay needed.
+    if (uiStateBlock) {
+        uiStateBlock->Apply();
+        uiStateBlock->Release();
+    }
+
+    // Clear depth so UI draws aren't depth-tested against 3D geometry
+    device->Clear(0, NULL, D3DCLEAR_ZBUFFER, 0, 1.0f, 0);
+
+    // Post-restore diagnostic: confirm state block restored correctly
+    if (ImGuiManager::GetStateSuppressionEnabled()) {
+        DWORD ab, zw, ar, fvfVal, amb, lit, cv, dms, ams, ems;
+        device->GetRenderState(D3DRS_ALPHABLENDENABLE, &ab);
+        device->GetRenderState(D3DRS_ZWRITEENABLE, &zw);
+        device->GetRenderState(D3DRS_ALPHAREF, &ar);
+        device->GetFVF(&fvfVal);
+        device->GetRenderState(D3DRS_AMBIENT, &amb);
+        device->GetRenderState(D3DRS_LIGHTING, &lit);
+        device->GetRenderState(D3DRS_COLORVERTEX, &cv);
+        device->GetRenderState(D3DRS_DIFFUSEMATERIALSOURCE, &dms);
+        device->GetRenderState(D3DRS_AMBIENTMATERIALSOURCE, &ams);
+        device->GetRenderState(D3DRS_EMISSIVEMATERIALSOURCE, &ems);
+
+        // Check render target
+        IDirect3DSurface9* curRT = nullptr;
+        IDirect3DSurface9* backBuf = nullptr;
+        device->GetRenderTarget(0, &curRT);
+        device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuf);
+        bool rtIsBackbuf = (curRT == backBuf);
+        if (curRT) curRT->Release();
+        if (backBuf) backBuf->Release();
+
+        LOG::logline("[UI_POST] AB=%d ZW=%d AR=%d FVF=0x%X AMB=0x%08X LIT=%d CV=%d DMS=%d AMS=%d EMS=%d RT_OK=%d",
+            ab, zw, ar, fvfVal, amb, lit, cv, dms, ams, ems, rtIsBackbuf ? 1 : 0);
+    }
 }
 
 // Compare two LightStates for equality (to detect if we can reuse cached state)

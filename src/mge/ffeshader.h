@@ -840,10 +840,15 @@ public:
     static void executeCullPass();
     static void executeRenderPass();
 
+    // Async GPU path: runs on render thread during safe zone
+    // Combines finalizeAndRenderAllScenes + postProcess without UI state save/restore
+    static void renderFullFrameAsync();
+
     // N-1 buffer accessors
     static FrameBuffer& getRecordingBuffer() { return frameBuffers[recordingBuffer]; }
     static FrameBuffer& getRenderingBuffer() { return frameBuffers[renderingBuffer]; }
     static void swapBuffers();  // Called at Present() to rotate buffers
+    static bool isN1Ready() { return n1Ready; }
 
     // Debug controls for record/replay system
     static bool getIsRecording() { return isRecording; }

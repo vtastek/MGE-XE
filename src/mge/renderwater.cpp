@@ -6,6 +6,7 @@
 #include "mwbridge.h"
 #include "postshaders.h"
 #include "imgui_manager.h"
+#include "mge_tracy.h"
 
 
 

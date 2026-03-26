@@ -20,6 +20,32 @@ struct MWStateTracker {
     // Transforms (keyed by D3DTRANSFORMSTATETYPE)
     std::unordered_map<DWORD, D3DMATRIX> transforms;
 
+    // FVF (DX8 vertex shader = FVF code)
+    DWORD fvf = 0;
+    bool fvfTracked = false;
+
+    void trackFVF(DWORD value) { fvf = value; fvfTracked = true; }
+    bool getFVF(DWORD* outValue) const { if (fvfTracked) { *outValue = fvf; return true; } return false; }
+
+    // Light enable states (keyed by light index)
+    std::unordered_map<DWORD, BOOL> lightEnables;
+
+    void trackLightEnable(DWORD index, BOOL enable) {
+        lightEnables[index] = enable;
+    }
+
+    // Texture stage states (non-sampler: ColorOp, AlphaOp, etc.), keyed by stage * 256 + state
+    std::unordered_map<DWORD, DWORD> textureStageStates;
+
+    void trackTextureStageState(DWORD stage, DWORD state, DWORD value) {
+        textureStageStates[stage * 256 + state] = value;
+    }
+    bool getTextureStageState(DWORD stage, DWORD state, DWORD* outValue) const {
+        auto it = textureStageStates.find(stage * 256 + state);
+        if (it != textureStageStates.end()) { *outValue = it->second; return true; }
+        return false;
+    }
+
     // Track a render state change
     void trackRenderState(DWORD state, DWORD value) {
         renderStates[state] = value;
@@ -72,6 +98,10 @@ struct MWStateTracker {
         renderStates.clear();
         samplerStates.clear();
         transforms.clear();
+        textureStageStates.clear();
+        lightEnables.clear();
+        fvf = 0;
+        fvfTracked = false;
     }
 
     // Seed tracker with current device state (call at start of recording)

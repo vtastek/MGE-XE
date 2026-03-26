@@ -608,6 +608,10 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         g_safeZoneStart = std::chrono::high_resolution_clock::now();
         MGE_TracyMessage("RT_SafeZone_START", 17);
 
+        // NOTE: Async GPU submit deferred until recording is device-free.
+        // renderFullFrameAsync() is called synchronously at UI BeginScene for now.
+        // Future: submit here with waitNow=false once MW state suppression is enabled.
+
         // Reset per-frame flags
         FixedFunctionShader::resetHiZBuiltFlag();
         FixedFunctionShader::resetRecordingCompletedFlag();
@@ -912,34 +916,22 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                     }
                 }
 
-                // HLSL: Full GPU phase now that ALL scenes are recorded
-                // Flow: Depth(0) → Depth(2) → Replay(0) → Replay(1) → Replay(2) → postProcess
+                // HLSL: Run full GPU phase synchronously (renderFullFrameAsync on main thread)
+                // Future: this becomes waitForCompletion() once recording is device-free
                 if (isHLSLActive() && g_scene.stage0Complete) {
                     // N-1: Store current frame's waterSeen into recording buffer
-                    // (will be used next frame when it becomes rendering buffer)
                     FixedFunctionShader::getRecordingBuffer().waterSeen = g_scene.waterDrawn;
-                    // N-1: finalizeAndRenderAllScenes now uses rendering buffer's stored values
-                    FixedFunctionShader::finalizeAndRenderAllScenes(&frameCtx, g_scene.waterDrawn);
+
+                    // renderFullFrameAsync handles: UI state save, all GPU work,
+                    // postProcess, UI state restore, and depth clear
+                    FixedFunctionShader::renderFullFrameAsync();
                     FixedFunctionShader::transitionTo(PhaseTransition::GpuExit);
                 } else if (isHLSLActive()) {
-                    // Empty scene fallback: no GPU work but still transition for state consistency
                     FixedFunctionShader::transitionTo(PhaseTransition::GpuExit);
+                } else {
+                    // Non-HLSL: synchronous postProcess
+                    DistantLand::postProcess(&frameCtx);
                 }
-
-                DistantLand::postProcess(&frameCtx);
-               
-                // Ensure clean state for UI rendering after GPU phase
-                // Clear shaders so MW can use fixed-function pipeline for UI
-                if (isHLSLActive()) {
-                    realDevice->SetVertexShader(NULL);
-                    realDevice->SetPixelShader(NULL);
-                    static int clearLogCount = 0;
-                    if (clearLogCount++ < 10) {
-                        LOG::logline("[UI] Cleared VS/PS for fixed-function UI");
-                    }
-                }
-
-                // UI command buffer is replayed at EndScene (after all UI draws are recorded)
             }
 
             // Render user HUD before Morrowind HUD
@@ -995,6 +987,26 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
                     // N-1: Stamp currentView/currentProj to match dlContext camera
                     recBuf.currentView = frameCtx.mwView;
                     recBuf.currentProj = frameCtx.mwProj;
+
+                    // N-1: Capture PostProcessData for render-thread-safe postProcess
+                    {
+                        auto mwb = MWBridge::get();
+                        auto& ppd = recBuf.postProcessData;
+                        ppd.frameTime = mwb->frameTime();
+                        ppd.simulationTime = mwb->simulationTime();
+                        ppd.waterLevel = mwb->CellHasWater() ? mwb->WaterLevel() : -1e9f;
+                        ppd.isMenu = mwb->IsMenu();
+                        ppd.isInterior = !mwb->CellHasWeather();
+                        ppd.isUnderwater = mwb->IsUnderwater(frameCtx.eyePos.z);
+                        int envFlags = 0;
+                        if (!mwb->CellHasWeather()) envFlags |= 1;
+                        if (mwb->IsExterior()) envFlags |= 2;
+                        if (mwb->IntLikeExterior()) envFlags |= 4;
+                        if (ppd.isUnderwater) envFlags |= 8; else envFlags |= 16;
+                        if (frameCtx.sunVis >= 0.001) envFlags |= 32; else envFlags |= 64;
+                        ppd.envFlags = envFlags;
+                    }
+
                     // Diagnostic: log nearViewRange when stored
                     static int storeLogCount = 0;
                     if (storeLogCount++ < 10) {
@@ -1039,6 +1051,7 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
                     g_scene.waterDrawn = true;
                 } else {
                     DistantLand::renderStageWater(&frameCtx);
+                    LOG::logline("Water Rendered for non HLSL for weird scenes.");
                     g_scene.waterDrawn = true;
                 }
             }
@@ -1347,6 +1360,9 @@ HRESULT _stdcall MGEProxyDevice::SetRenderState(D3DRENDERSTATETYPE a, DWORD b) {
 
     if (ImGuiManager::GetCmdBufferRecording()) {
         g_cmdBufferSet.recordAndTrackRenderState((DWORD)a, b);
+    } else if (isHLSLActive()) {
+        // Track render states even outside recording (UI setup calls between EndScene/BeginScene)
+        g_cmdBufferSet.stateTracker().trackRenderState((DWORD)a, b);
     }
 
     // Don't suppress point sprite states — particles need these for correct sizing
@@ -1418,7 +1434,11 @@ HRESULT _stdcall MGEProxyDevice::SetTextureStageState(DWORD a, D3DTEXTURESTAGEST
             g_cmdBufferSet.recordAndTrackSamplerState(a, sampler, c);
         } else {
             g_cmdBufferSet.active().recordSetTextureStageState(a, (DWORD)b, c);
+            g_cmdBufferSet.stateTracker().trackTextureStageState(a, (DWORD)b, c);
         }
+    } else if (isHLSLActive() && !isSamplerState) {
+        // Track non-sampler TSS outside recording (UI setup between EndScene/BeginScene)
+        g_cmdBufferSet.stateTracker().trackTextureStageState(a, (DWORD)b, c);
     }
     // Don't suppress sampler states — needed for UI state capture
     // Non-sampler TSS can be suppressed
@@ -1581,12 +1601,13 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
                 LOG::logline("Water DIP: phase=%d, sceneCount=%d, isWorld=%d, isHLSL=%d",
                     static_cast<int>(g_scene.phase), g_scene.sceneCount, isWorld, isHLSLActive());
             }
-            if (isHLSLActive() && isWorld) {
-                // HLSL World phase: flag for deferred rendering in GPU phase
+            // HLSL mode: always flag for deferred rendering (never render immediately)
+            if (isHLSLActive()) {
                 g_scene.waterDrawn = true;
             } else {
-                // Legacy mode, or HLSL Particles/Hands: render water immediately
+                // Legacy mode: render water immediately
                 DistantLand::renderStageWater(&frameCtx);
+                LOG::logline("Water is rendered for non HLSL, empty world perhaps?");
                 g_scene.waterDrawn = true;
             }
         }
@@ -1830,6 +1851,9 @@ HRESULT _stdcall MGEProxyDevice::SetVertexShader(DWORD a) {
     ImGuiManager::TraceVertexShader(g_scene.sceneCount, a);
     if (ImGuiManager::GetCmdBufferRecording()) {
         g_cmdBufferSet.active().recordSetFVF(a);
+        g_cmdBufferSet.stateTracker().trackFVF(a);
+    } else if (isHLSLActive()) {
+        g_cmdBufferSet.stateTracker().trackFVF(a);
     }
     if (shouldSuppressMWState()) return D3D_OK;
     return ProxyDevice::SetVertexShader(a);
@@ -1872,6 +1896,9 @@ HRESULT _stdcall MGEProxyDevice::LightEnable(DWORD a, BOOL b) {
     }
     if (ImGuiManager::GetCmdBufferRecording()) {
         g_cmdBufferSet.active().recordLightEnable(a, b);
+        g_cmdBufferSet.stateTracker().trackLightEnable(a, b);
+    } else if (isHLSLActive()) {
+        g_cmdBufferSet.stateTracker().trackLightEnable(a, b);
     }
     if (shouldSuppressMWState()) return D3D_OK;
     return ProxyDevice::LightEnable(a, b);

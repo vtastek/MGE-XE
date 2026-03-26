@@ -531,6 +531,7 @@ void DistantLand::renderStageBlend(DLContext* ctx, FixedFunctionShader::FrameBuf
 
 // renderStageWater - Render replacement water plane
 void DistantLand::renderStageWater(DLContext* ctx) {
+    MGE_ZoneScopedN("Water_Stage_DL");
     auto mwBridge = MWBridge::get();
     IDirect3DStateBlock9* stateSaved;
     UINT passes;
