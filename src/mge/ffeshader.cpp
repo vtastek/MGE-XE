@@ -57,13 +57,16 @@ unordered_map<FixedFunctionShader::ShaderKey, FixedFunctionShader::HLSLShader, F
 FixedFunctionShader::HLSLShaderLRU FixedFunctionShader::hlslShaderLRU;
 FixedFunctionShader::HLSLShader FixedFunctionShader::hlslShaderDefaultPurple;
 
-// N-1 buffered FrameBuffer infrastructure
-// recordingBuffer: currently recording frame N
-// renderingBuffer: contains frame N-1 data for replay
-FixedFunctionShader::FrameBuffer FixedFunctionShader::frameBuffers[2];
+// Triple buffered FrameBuffer infrastructure for N / N-1 / N-2 pipeline
+// recordingBuffer: Frame N - main thread records draw calls
+// prepBuffer:      Frame N-1 - CPU prep thread processes (shader keys, bins)
+// renderBuffer:    Frame N-2 - GPU thread renders (what displays)
+FixedFunctionShader::FrameBuffer FixedFunctionShader::frameBuffers[3];
 int FixedFunctionShader::recordingBuffer = 0;
-int FixedFunctionShader::renderingBuffer = 1;
-bool FixedFunctionShader::n1Ready = false;  // Set true after first frame swap
+int FixedFunctionShader::prepBuffer = 1;
+int FixedFunctionShader::renderBuffer = 2;
+bool FixedFunctionShader::n1Ready = false;   // Set true after first frame swap
+bool FixedFunctionShader::n2Ready = false;   // Set true after second frame swap
 
 // Pipeline phase tracking for GPU call separation verification
 FixedFunctionShader::PipelinePhase FixedFunctionShader::currentPhase = FixedFunctionShader::PipelinePhase::Idle;
@@ -130,6 +133,7 @@ std::unordered_set<FixedFunctionShader::ShaderKey, FixedFunctionShader::ShaderKe
 
 // Bbox cache: persists across frames for fast object-space bbox lookup
 std::unordered_map<FixedFunctionShader::MeshKey, FixedFunctionShader::ObjectSpaceBBox, FixedFunctionShader::MeshKeyHash> FixedFunctionShader::bboxCache;
+std::mutex FixedFunctionShader::bboxCacheMutex;
 
 // Bbox lookup: maps VB+IB to world-space bbox (rebuilt each frame from recordedCalls)
 std::unordered_map<FixedFunctionShader::VBIBKey, FixedFunctionShader::ObjectSpaceBBox, FixedFunctionShader::VBIBKeyHash> FixedFunctionShader::bboxLookup;
@@ -1840,19 +1844,34 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     return hlslShader;
 }
 
-// N-1 buffer rotation at Present()
+// Triple buffer rotation at Present()
+// Rotation: Recording(N) -> Prep(N-1) -> Render(N-2) -> Recording(cleared)
 void FixedFunctionShader::swapBuffers() {
-    std::swap(recordingBuffer, renderingBuffer);
+    // Rotate indices: render becomes new recording, prep becomes render, recording becomes prep
+    int newRecording = renderBuffer;   // Was render (N-2), now recording (N)
+    int newPrep = recordingBuffer;     // Was recording (N), now prep (N-1)
+    int newRender = prepBuffer;        // Was prep (N-1), now render (N-2)
+
+    recordingBuffer = newRecording;
+    prepBuffer = newPrep;
+    renderBuffer = newRender;
+
     // Clear the new recording buffer (was just rendered)
     frameBuffers[recordingBuffer].clear();
-    // After first swap, N-1 data is available in rendering buffer
+
+    // After first swap, N-1 data is available in prep buffer
     n1Ready = true;
+    // After second swap, N-2 data is available in render buffer
+    static int swapCount = 0;
+    if (++swapCount >= 2) {
+        n2Ready = true;
+    }
 }
 
 void FixedFunctionShader::release() {
-    // Clear both frame buffers — releases COM refs before D3D device is destroyed
+    // Clear all three frame buffers — releases COM refs before D3D device is destroyed
     // This prevents crashes during DLL unload when static destructors run
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < 3; ++i) {
         frameBuffers[i].clear();
 
         // Release staging buffers (not released in clear() since they persist across frames)
@@ -3058,10 +3077,18 @@ FixedFunctionShader::HLSLRecordedCall::HLSLRecordedCall(const RenderedState* rs_
         key.startIndex = rs_->startIndex;
         key.primCount = rs_->primCount;
 
-        auto it = bboxCache.find(key);
-        if (it != bboxCache.end()) {
+        ObjectSpaceBBox objBBox;
+        bool cacheHit = false;
+        {
+            std::lock_guard<std::mutex> lock(bboxCacheMutex);
+            auto it = bboxCache.find(key);
+            if (it != bboxCache.end()) {
+                objBBox = it->second;
+                cacheHit = true;
+            }
+        }
+        if (cacheHit) {
             // Cache hit — cheap world-space transform
-            const ObjectSpaceBBox& objBBox = it->second;
             D3DXVECTOR3 corners[8] = {
                 D3DXVECTOR3(objBBox.bboxMin.x, objBBox.bboxMin.y, objBBox.bboxMin.z),
                 D3DXVECTOR3(objBBox.bboxMax.x, objBBox.bboxMin.y, objBBox.bboxMin.z),

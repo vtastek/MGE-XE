@@ -715,8 +715,9 @@ public:
 
         bool valid;
         BufferState state;
+        int frameNumber = -1;  // Frame number when this buffer was recorded (-1 = never)
 
-        FrameBuffer() : valid(false), state(BufferState::Available) {}
+        FrameBuffer() : valid(false), state(BufferState::Available), frameNumber(-1) {}
 
         void clear() {
             recordedCalls.clear();
@@ -752,13 +753,16 @@ public:
         }
     };
 
-    // N-1 buffering: two buffers for frame-latent rendering
-    // recordingBuffer: currently recording frame N
-    // renderingBuffer: contains frame N-1 data for replay
-    static FrameBuffer frameBuffers[2];
-    static int recordingBuffer;   // Index into frameBuffers for recording (0 or 1)
-    static int renderingBuffer;   // Index into frameBuffers for rendering (1 or 0)
+    // Triple buffering for N / N-1 / N-2 pipeline:
+    // recordingBuffer: Frame N - main thread records draw calls
+    // prepBuffer:      Frame N-1 - CPU prep thread processes (shader keys, bins, cull)
+    // renderBuffer:    Frame N-2 - GPU thread renders (what actually displays)
+    static FrameBuffer frameBuffers[3];
+    static int recordingBuffer;   // Index for frame N (main thread recording)
+    static int prepBuffer;        // Index for frame N-1 (CPU prep)
+    static int renderBuffer;      // Index for frame N-2 (GPU render)
     static bool n1Ready;          // True after first frame completes (N-1 data available)
+    static bool n2Ready;          // True after second frame completes (N-2 data available)
 
 public:
     // Pipeline phase tracking for GPU call separation verification
@@ -791,7 +795,9 @@ private:
     static bool dumpRequested;  // When true, preserve calls for dump
 
     // Bbox cache: maps mesh identifier to object-space bbox (persists across frames)
+    // Protected by bboxCacheMutex for thread safety (main thread + CpuPrepThread access)
     static std::unordered_map<MeshKey, ObjectSpaceBBox, MeshKeyHash> bboxCache;
+    static std::mutex bboxCacheMutex;
 
     // Bbox lookup: maps VB+IB to world-space bbox (rebuilt each frame from recordedCalls)
     static std::unordered_map<VBIBKey, ObjectSpaceBBox, VBIBKeyHash> bboxLookup;
@@ -816,7 +822,6 @@ private:
 
     static void startRecording();
     static void stopRecordingAndReplay();
-    static void prepareRecordedCalls();
     static void recordRenderCall(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, const ShaderKey& sk, int recordMWIdx = -1);
     static void replayRecordedCalls(int sceneCount, D3DCommandBuffer* cmdBuf = nullptr);
     static void renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, DWORD dirtyFlags = DIRTY_ALL, int callIndex = -1, D3DCommandBuffer* cmdBuf = nullptr, const DeviceStateSnapshot* capturedState = nullptr, const HLSLRecordedCall* replayCall = nullptr);
@@ -826,6 +831,7 @@ private:
     static bool computeBoundingBox(const RenderedState* rs, D3DXVECTOR3& bboxMin, D3DXVECTOR3& bboxMax);
 
 public:
+    static void prepareRecordedCalls();  // CPU-only: compute shader keys, bins (can run async)
     static void finalizeBatchAndReplay(int sceneCount = 0); // Call when HLSL rendering session is complete
     static void finalizeBatchAndSubmitCull();  // Stop recording, submit to cull thread (before renderStage1)
     static void waitCullAndReplay();           // Wait for cull, replay, restore state (after renderStageBlend)
@@ -848,11 +854,13 @@ public:
     // Combines finalizeAndRenderAllScenes + postProcess without UI state save/restore
     static void renderFullFrameAsync();
 
-    // N-1 buffer accessors
-    static FrameBuffer& getRecordingBuffer() { return frameBuffers[recordingBuffer]; }
-    static FrameBuffer& getRenderingBuffer() { return frameBuffers[renderingBuffer]; }
+    // Triple buffer accessors
+    static FrameBuffer& getRecordingBuffer() { return frameBuffers[recordingBuffer]; }  // Frame N
+    static FrameBuffer& getPrepBuffer() { return frameBuffers[prepBuffer]; }            // Frame N-1
+    static FrameBuffer& getRenderingBuffer() { return frameBuffers[renderBuffer]; }     // Frame N-2
     static void swapBuffers();  // Called at Present() to rotate buffers
     static bool isN1Ready() { return n1Ready; }
+    static bool isN2Ready() { return n2Ready; }
 
     // Debug controls for record/replay system
     static bool getIsRecording() { return isRecording; }

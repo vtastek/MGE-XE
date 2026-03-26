@@ -330,10 +330,11 @@ void DistantLand::renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer*
         // Hi-Z culling: split into CPU-only visibility testing and lightweight recordMW filter
         // executeHiZCulling: bbox, occluder rasterization, Hi-Z pyramid, visibility test (no D3D device)
         // applyVisibilityAndFilterRecordMW: filters recordMW using visibility results
-        {
+        // Skip if async enabled - CpuPrepThread already did this work
+        if (!ImGuiManager::GetAsyncGpuThread()) {
             FixedFunctionShader::executeHiZCulling(ctx->mwView, ctx->mwProj);
+            FixedFunctionShader::applyVisibilityAndFilterRecordMW();
         }
-        FixedFunctionShader::applyVisibilityAndFilterRecordMW();
 
         // Single RT switch for all depth rendering (renderDepth + StretchRect + renderDepthDistantLand + MSAA resolve)
         {

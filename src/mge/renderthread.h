@@ -31,7 +31,7 @@ public:
         RenderStage1,
         RenderStage2,
         ReplayHLSL,
-        RenderFullFrame,
+        RenderFullFrame,   // GPU work only - CPU prep done by CpuPrepThread
         Shutdown
     };
 

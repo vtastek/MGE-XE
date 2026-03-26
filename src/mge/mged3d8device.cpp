@@ -16,6 +16,7 @@
 #include "userhud.h"
 #include "videobackground.h"
 #include "d3dcommandbuffer.h"
+#include "cpuprepthread.h"
 #include "renderthread.h"
 
 bool g_tracyActive = false;
@@ -617,14 +618,19 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         g_safeZoneStart = std::chrono::high_resolution_clock::now();
         MGE_TracyMessage("RT_SafeZone_START", 17);
 
-        // Async GPU: submit N-1 rendering to render thread immediately.
-        // Main thread continues recording frame N in parallel.
-        // Sync fallback: renderFullFrameAsync called at UI BeginScene when async is off.
-        if (ImGuiManager::GetAsyncGpuThread() && isHLSLActive() && g_renderThread && g_renderThread->isRunning()) {
-            RenderThread::SceneWork work;
-            work.type = RenderThread::WorkType::RenderFullFrame;
-            g_renderThread->submitWork(std::move(work), false);  // waitNow=false — async!
-            MGE_TracyMessage("RT_AsyncSubmit", 14);
+        // Phase 2: Async CPU Prep - submit PrepareFrame async at Present().
+        // Main thread records frame N while CPU prep thread processes frame N-1.
+        // GPU work is submitted synchronously at UI BeginScene after prep completes.
+        if (ImGuiManager::GetAsyncGpuThread() && isHLSLActive() && g_cpuPrepThread && g_cpuPrepThread->isRunning()) {
+            if (FixedFunctionShader::isN1Ready()) {
+                auto& prepBuf = FixedFunctionShader::getPrepBuffer();
+                CpuPrepThread::PrepWork work;
+                work.type = CpuPrepThread::WorkType::PrepareFrame;
+                work.viewMatrix = prepBuf.view;
+                work.projMatrix = prepBuf.proj;
+                g_cpuPrepThread->submitWork(std::move(work), false);  // waitNow=false — async!
+                MGE_TracyMessage("CPT_PrepSubmit", 14);
+            }
         }
 
         // Reset per-frame flags
@@ -747,10 +753,13 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
         }
 
         MGE_ZoneScopedN("OffscreenRender");
-        // SYNC: Wait for render thread before off-screen rendering touches device.
+        // SYNC: Wait for async threads before off-screen rendering touches device.
         // Off-screen work (local map, inventory doll) needs direct device access.
-        if (isHLSLActive() && g_renderThread && g_renderThread->isRunning()) {
-            g_renderThread->waitForCompletion();
+        if (isHLSLActive()) {
+            if (g_cpuPrepThread && g_cpuPrepThread->isRunning())
+                g_cpuPrepThread->waitForCompletion();
+            if (g_renderThread && g_renderThread->isRunning())
+                g_renderThread->waitForCompletion();
         }
 
         g_cmdBufferSet.activeStage = CmdStage::Offscreen;
@@ -841,10 +850,13 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
             } else if (g_scene.sceneCount == 1) {
                 // Scene 1 (particles)
                 g_cmdBufferSet.activeStage = CmdStage::Scene1;
-                // Step 3b: Sync point for async render thread
-                // Wait for GPU phase to complete before Scene 1 draws
-                if (isHLSLActive() && g_scene.stage0Complete && g_renderThread && g_renderThread->isPending()) {
-                    g_renderThread->waitForCompletion();
+                // Step 3b: Sync point for async threads
+                // Wait for CPU prep and GPU phase to complete before Scene 1 draws
+                if (isHLSLActive() && g_scene.stage0Complete) {
+                    if (g_cpuPrepThread && g_cpuPrepThread->isPending())
+                        g_cpuPrepThread->waitForCompletion();
+                    if (g_renderThread && g_renderThread->isPending())
+                        g_renderThread->waitForCompletion();
                 }
                 // Phase transition: Scene1Entry - validates state matches RecordingExit
                 if (isHLSLActive()) {
@@ -934,18 +946,30 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                     }
                 }
 
-                // HLSL GPU phase: async waits for render thread, sync runs inline
+                // HLSL GPU phase: Phase 2 waits for prep, then submits GPU sync
                 if (isHLSLActive() && g_scene.stage0Complete) {
                     // N-1: Store current frame's waterSeen into recording buffer
                     FixedFunctionShader::getRecordingBuffer().waterSeen = g_scene.waterDrawn;
 
-                    if (ImGuiManager::GetAsyncGpuThread() && g_renderThread && g_renderThread->isRunning()) {
-                        // Async: render thread already working — wait for completion
-                        MGE_ZoneScopedN("WaitForRenderThread");
-                        g_renderThread->waitForCompletion();
-                        MGE_TracyMessage("RT_AsyncComplete", 16);
+                    if (ImGuiManager::GetAsyncGpuThread() && g_cpuPrepThread && g_cpuPrepThread->isRunning()
+                        && g_renderThread && g_renderThread->isRunning()
+                        && FixedFunctionShader::isN2Ready()) {  // Wait for 2-frame warm-up
+                        // Phase 2: Wait for async CPU prep to complete
+                        {
+                            MGE_ZoneScopedN("WaitForCpuPrepThread");
+                            g_cpuPrepThread->waitForCompletion();
+                            MGE_TracyMessage("CPT_PrepComplete", 15);
+                        }
+                        // Now submit GPU work synchronously (prep already done)
+                        {
+                            MGE_ZoneScopedN("SyncGpuWork");
+                            RenderThread::SceneWork work;
+                            work.type = RenderThread::WorkType::RenderFullFrame;
+                            g_renderThread->submitWork(std::move(work), true);  // waitNow=true — sync!
+                            MGE_TracyMessage("RT_GpuComplete", 14);
+                        }
 
-                        // Async state fix: render thread restored a stale state block (from Present time).
+                        // State fix: render thread restored its own state block.
                         // Apply CURRENT frame's tracked state so UI sees what MW expects.
                         auto& tracker = g_cmdBufferSet.stateTracker();
                         DWORD val;
@@ -961,8 +985,16 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                             realDevice->SetFVF(val);
                         for (auto& [index, enable] : tracker.lightEnables)
                             realDevice->LightEnable(index, enable);
+                        // Restore transforms - critical for HUD (UI uses different view/proj)
+                        D3DMATRIX mat;
+                        if (tracker.getTransform(D3DTS_VIEW, &mat))
+                            realDevice->SetTransform(D3DTS_VIEW, &mat);
+                        if (tracker.getTransform(D3DTS_PROJECTION, &mat))
+                            realDevice->SetTransform(D3DTS_PROJECTION, &mat);
+                        if (tracker.getTransform(D3DTS_WORLD, &mat))
+                            realDevice->SetTransform(D3DTS_WORLD, &mat);
                     } else {
-                        // Sync fallback: run GPU phase on main thread
+                        // Async toggle OFF: run GPU phase on main thread
                         FixedFunctionShader::renderFullFrameAsync();
                     }
                     FixedFunctionShader::transitionTo(PhaseTransition::GpuExit);
@@ -1019,12 +1051,18 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
                 // HLSL path: do GPU work at EndScene 0 (sync, same timing as legacy)
                 // Scene 1/2 draws happen after this, so Scene 0 must be complete first.
                 if (!g_scene.stage0Complete) {
-                    // Async: wait for render thread before captureStage0Context.
+                    // Async: wait for async threads before captureStage0Context.
                     // captureStage0Context writes s_staging which DL render functions read.
-                    if (ImGuiManager::GetAsyncGpuThread() && g_renderThread && !g_renderThread->isComplete()) {
-                        MGE_ZoneScopedN("WaitForRT_BeforeCapture");
-                        g_renderThread->waitForCompletion();
-                        MGE_TracyMessage("RT_AsyncComplete_ES0", 20);
+                    if (ImGuiManager::GetAsyncGpuThread()) {
+                        if (g_cpuPrepThread && !g_cpuPrepThread->isComplete()) {
+                            MGE_ZoneScopedN("WaitForCPT_BeforeCapture");
+                            g_cpuPrepThread->waitForCompletion();
+                        }
+                        if (g_renderThread && !g_renderThread->isComplete()) {
+                            MGE_ZoneScopedN("WaitForRT_BeforeCapture");
+                            g_renderThread->waitForCompletion();
+                            MGE_TracyMessage("RT_AsyncComplete_ES0", 20);
+                        }
                     }
                     frameCtx = DistantLand::captureStage0Context();
                     g_scene.stage0Complete = true;
@@ -1746,10 +1784,19 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
     // draws it records (HLSL scene objects, sky). Draws that reach here returned true
     // from inspect — they are NOT part of the HLSL replay pipeline and must go through
     // to the device immediately.
-    // Log strays during recording gap so we can identify what needs deferring.
+    // EXCEPT: with suppression ON, strays must be recorded or they're lost (e.g. fade effects)
     if (isHLSLActive() && FixedFunctionShader::getIsRecording() && g_scene.sceneCount <= 2) {
-        LOG::logline("!! Stray DIP during recording: scene=%d prims=%d verts=%d tex=%p",
-            g_scene.sceneCount, e, c, rs.texture);
+        if (shouldSuppressMWState()) {
+            // Record stray draws (fade effects, overlays) that would otherwise be lost
+            rs.primType = a;
+            rs.baseIndex = baseVertexIndex;
+            rs.minIndex = b;
+            rs.vertCount = c;
+            rs.startIndex = d;
+            rs.primCount = e;
+            FixedFunctionShader::renderMorrowind(&rs, &frs, &lightrs, -1);
+            return D3D_OK;  // Suppressed but now recorded for replay
+        }
     }
     if (shouldSuppressMWState()) return D3D_OK;
     CHECK_DEVICE_RACE("DrawIndexedPrimitive");

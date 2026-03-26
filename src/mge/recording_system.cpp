@@ -13,6 +13,7 @@
 #include "statusoverlay.h"
 #include "distantland.h"
 #include "imgui_manager.h"
+#include "mged3d8device.h"
 
 #include <unordered_set>
 
@@ -313,6 +314,9 @@ bool StateContract::validate(IDirect3DDevice9* dev, const char* context) const {
 #endif
 
 void FixedFunctionShader::startRecording() {
+    // Stamp frame number on recording buffer for pipeline validation
+    getRecordingBuffer().frameNumber = getFrameNumber();
+
     // Capture device state at recording start using StateContract
     trackDeviceRead("StateContract::captureFrom(preRecording)");
     preRecordingContract.captureFrom((IDirect3DDevice9*)device);
@@ -329,7 +333,7 @@ void FixedFunctionShader::startRecording() {
 
     currentRecordedCalls().reserve(4000);  // Pre-allocate (cleared at Present())
     samplerCache.clear();  // Clear sampler cache for new frame
-    bboxLookup.clear();  // Clear for new frame (populated during recording)
+    // Note: bboxLookup is now per-buffer, cleared in FrameBuffer::clear()
     // NOTE: Do NOT clear recordMW here - it's populated by inspectIndexedPrimitive()
     // BEFORE startRecording() is called. recordMW is cleared at end of renderStage1/2.
     lastLightState.reset();  // Clear LightState cache for new recording
@@ -347,12 +351,18 @@ void FixedFunctionShader::startRecording() {
         if (isExterior != lastWasExterior) {
             // Interior ↔ exterior transition: clear geometry caches
             // textureSuffixResolutionCache is now evict-on-release (no bulk clear needed)
-            bboxCache.clear();
+            {
+                std::lock_guard<std::mutex> lock(bboxCacheMutex);
+                bboxCache.clear();
+            }
             softwareOcclusionCuller.clearBlacklist();
             lastWasExterior = isExterior;
         } else if (currentCell != lastPlayerCell) {
             // Any cell change (exterior-to-exterior, interior-to-interior): clear geometry caches
-            bboxCache.clear();
+            {
+                std::lock_guard<std::mutex> lock(bboxCacheMutex);
+                bboxCache.clear();
+            }
             softwareOcclusionCuller.clearBlacklist();
         }
 
@@ -407,10 +417,10 @@ void FixedFunctionShader::stopRecordingAndReplay() {
 
     // Batch-warm suffix cache — resolve all unique textures and pre-load suffix files
     // before prepare/replay, so neither stalls on hash computation or disk I/O.
-    // N-1: work on rendering buffer (previous frame being rendered)
+    // N-1: work on prep buffer (previous frame being prepared)
     {
         MGE_ZoneScopedN("BatchWarmSuffixCache");
-        auto& recCalls = getRenderingBuffer().recordedCalls;
+        auto& recCalls = getPrepBuffer().recordedCalls;
         std::unordered_set<IDirect3DTexture9*> seen;
         for (const auto& call : recCalls) {
             if (call.rs.texture && seen.insert(call.rs.texture).second) {
@@ -533,10 +543,10 @@ void FixedFunctionShader::finalizeBatchAndSubmitCull() {
     // Resolves all unique textures and pre-loads suffix files so that
     // computeShaderKeyWithSuffixes on the cull thread never hits expensive fallbacks,
     // and replay never stalls on hash computation or disk I/O.
-    // N-1: work on rendering buffer (previous frame being rendered)
+    // N-1: work on prep buffer (previous frame being prepared)
     {
         MGE_ZoneScopedN("BatchWarmSuffixCache");
-        auto& recCalls = getRenderingBuffer().recordedCalls;
+        auto& recCalls = getPrepBuffer().recordedCalls;
         std::unordered_set<IDirect3DTexture9*> seen;
         for (const auto& call : recCalls) {
             if (call.rs.texture && seen.insert(call.rs.texture).second) {
@@ -547,7 +557,7 @@ void FixedFunctionShader::finalizeBatchAndSubmitCull() {
 
     // Prepare recorded calls inline on main thread
     prepareRecordedCalls();
-    getRenderingBuffer().state = BufferState::ReadyToRender;
+    getPrepBuffer().state = BufferState::ReadyToRender;
 
     recordingCompletedThisFrame = true;
 }
@@ -899,9 +909,9 @@ void FixedFunctionShader::finalizeAndRender(DLContext* frameCtx, bool waterSeen)
 void FixedFunctionShader::executeGpuPhase() {
     MGE_ZoneScopedN("Frame_Render");
 
-    // N-1: First frame check - skip if no previous frame data
-    if (!n1Ready) {
-        LOG::logline("executeGpuPhase: N-1 not ready (first frame), skipping");
+    // N-2: First frames check - skip if no N-2 data ready yet (2-frame warm-up)
+    if (!n2Ready) {
+        LOG::logline("executeGpuPhase: N-2 not ready (warm-up), skipping");
         return;
     }
 
@@ -994,22 +1004,22 @@ void FixedFunctionShader::executeGpuPhase() {
 
 // Full deferred GPU phase at UI BeginScene - all scenes recorded, now render everything
 // Flow: Depth(Scene 0) → Depth(Scene 2) → Replay(0) → Replay(1) → Replay(2)
-// N-1: renders from rendering buffer (previous frame's data)
-// First frame: n1Ready is false until first swap completes, so we skip
+// N-2: renders from rendering buffer (2 frames back)
+// First 2 frames: n2Ready is false, so we skip
 void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool waterSeen) {
     MGE_ZoneScopedN("finalizeAndRenderAllScenes");
 
     if (!recordingEnabled) return;
 
-    // First frame check: N-1 not ready until first buffer swap at Present()
-    if (!n1Ready) {
-        LOG::logline("finalizeAndRenderAllScenes: N-1 not ready (first frame), skipping render");
-        // On first frame, no previous frame data exists - skip rendering
+    // First frames check: N-2 not ready until 2 buffer swaps (2-frame warm-up)
+    if (!n2Ready) {
+        LOG::logline("finalizeAndRenderAllScenes: N-2 not ready (warm-up), skipping render");
+        // First 2 frames: no N-2 data exists - skip rendering
         // MW's direct draws will still appear, distant land/water won't render this frame
         return;
     }
 
-    // N-1: use rendering buffer (previous frame's recorded data)
+    // N-2: use rendering buffer (2 frames back data)
     auto& fb = getRenderingBuffer();
 
 
@@ -1572,9 +1582,25 @@ void FixedFunctionShader::executeRenderPass() {
 void FixedFunctionShader::renderFullFrameAsync() {
     MGE_ZoneScopedN("renderFullFrameAsync");
 
-    if (!recordingEnabled || !n1Ready) return;
+    if (!recordingEnabled || !n2Ready) {
+        LOG::logline(">> renderFullFrameAsync SKIP (enabled=%d n2=%d)", recordingEnabled, n2Ready);
+        return;
+    }
 
+    // Phase 3: Use renderBuffer (N-2) - prepped by CpuPrepThread when it was N-1
     auto& fb = getRenderingBuffer();
+    int currentFrame = getFrameNumber();
+    int renderFrame = fb.frameNumber;
+
+    // Pipeline validation: render should be N-2 (two frames behind current)
+    int expectedRenderFrame = currentFrame - 2;
+    if (renderFrame != expectedRenderFrame && renderFrame >= 0) {
+        LOG::logline("!! GPU FRAME MISMATCH: current=%d render=%d expected=%d (delta=%d)",
+                     currentFrame, renderFrame, expectedRenderFrame, currentFrame - renderFrame);
+    }
+
+    LOG::logline(">> renderFullFrameAsync frame=%d state=%d calls=%d",
+                 renderFrame, (int)fb.state, (int)fb.recordedCalls.size());
     DLContext* renderCtx = &fb.dlContext;
     bool renderWaterSeen = fb.waterSeen;
 
@@ -1618,7 +1644,8 @@ void FixedFunctionShader::renderFullFrameAsync() {
     fb.stateContract.applyTo((IDirect3DDevice9*)device);
 
     // Prepare all scenes (shader keys, render bins)
-    {
+    // Phase 2: Skip if PrepareFrame already ran async
+    if (fb.state != BufferState::ReadyToRender) {
         MGE_ZoneScopedN("Prepare All Scenes");
         prepareRecordedCalls();
         fb.state = BufferState::ReadyToRender;
@@ -1627,7 +1654,9 @@ void FixedFunctionShader::renderFullFrameAsync() {
     // Stage 0 GPU: shadow map, distant land, sky, water reflection
     {
         MGE_ZoneScopedN("Stage0 GPU");
+        LOG::logline(">> renderFullFrameAsync Stage0GPU start");
         DistantLand::renderStage0GPU(renderCtx, &fb);
+        LOG::logline(">> renderFullFrameAsync Stage0GPU done");
     }
 
     // Update shadow VP from freshly computed matrices
@@ -1637,8 +1666,11 @@ void FixedFunctionShader::renderFullFrameAsync() {
     // Depth passes: Scene 0 (world) and Scene 2 (hands)
     {
         MGE_ZoneScopedN("Depth Passes");
+        LOG::logline(">> renderFullFrameAsync Stage1 start");
         DistantLand::renderStage1(renderCtx, &fb);
+        LOG::logline(">> renderFullFrameAsync Stage1 done, Stage2 start");
         DistantLand::renderStage2(renderCtx, &fb);
+        LOG::logline(">> renderFullFrameAsync Stage2 done");
     }
 
     // Replay Scene 0
@@ -1996,12 +2028,13 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
             }
         }
 
-        // Immediately populate bboxLookup so depth pass can use current-frame bboxes
+        // Immediately populate per-buffer bboxLookup so depth pass can use current-frame bboxes
         // (executeHiZCulling runs BEFORE finalizeBatchAndReplay)
         const auto& call = currentRecordedCalls().back();
         if (call.hasBoundingBox) {
             VBIBKey key{call.rs.vb, call.rs.ib};
-            bboxLookup[key] = {call.bboxMin, call.bboxMax};
+            // Use per-buffer bboxLookup to avoid race with CpuPrepThread
+            getRecordingBuffer().bboxLookup[key] = {call.bboxMin, call.bboxMax};
         }
     }
 

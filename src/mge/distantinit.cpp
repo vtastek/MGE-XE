@@ -4,6 +4,7 @@
 #include "configuration.h"
 #include "distantland.h"
 #include "cullthread.h"
+#include "cpuprepthread.h"
 #include "renderthread.h"
 #include "mge_tracy.h"
 #include "distantshader.h"
@@ -31,6 +32,9 @@ int DistantLand::numWaterVerts, DistantLand::numWaterTris;
 // Cull thread for CPU-side occlusion culling (heap-allocated to avoid
 // std::mutex construction during DLL static init — see MEMORY.md)
 static CullThread* cullThreadPtr = nullptr;
+
+// CPU prep thread for shader compilation, culling (heap-allocated, same reason)
+static CpuPrepThread* cpuPrepThreadPtr = nullptr;
 
 // Render thread for GPU submission (heap-allocated, same reason)
 static RenderThread* renderThreadPtr = nullptr;
@@ -320,6 +324,11 @@ bool DistantLand::init() {
     cullThreadPtr = new CullThread();
     cullThreadPtr->start();
     g_cullThread = cullThreadPtr;
+
+    // Start CPU prep thread for shader compilation, culling
+    cpuPrepThreadPtr = new CpuPrepThread();
+    cpuPrepThreadPtr->start();
+    g_cpuPrepThread = cpuPrepThreadPtr;
 
     // Start render thread for GPU submission
     renderThreadPtr = new RenderThread();
@@ -1572,6 +1581,14 @@ void DistantLand::release() {
         cullThreadPtr = nullptr;
     }
     g_cullThread = nullptr;
+
+    // Stop CPU prep thread
+    if (cpuPrepThreadPtr) {
+        cpuPrepThreadPtr->stop();
+        delete cpuPrepThreadPtr;
+        cpuPrepThreadPtr = nullptr;
+    }
+    g_cpuPrepThread = nullptr;
 
     // Stop render thread (before releasing any D3D9 resources it might use)
     if (renderThreadPtr) {

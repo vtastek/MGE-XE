@@ -128,6 +128,7 @@
     <ClCompile Include="src\mge\recording_system.cpp" />
     <ClCompile Include="src\mge\hlsl_replay.cpp" />
     <ClCompile Include="src\mge\cullthread.cpp" />
+    <ClCompile Include="src\mge\cpuprepthread.cpp" />
     <ClCompile Include="src\mge\renderthread.cpp" />
     <ClCompile Include="src\mge\distantlandhlsl.cpp" />
     <ClCompile Include="src\mge\shader_utils.cpp" />
@@ -220,6 +221,7 @@
     <ClInclude Include="src\mge\renderstate.h" />
     <ClInclude Include="src\mge\meshkey.h" />
     <ClInclude Include="src\mge\cullthread.h" />
+    <ClInclude Include="src\mge\cpuprepthread.h" />
     <ClInclude Include="src\mge\renderthread.h" />
     <ClInclude Include="src\mge\distantlandhlsl.h" />
     <ClInclude Include="src\mge\suffix_texture_support.h" />

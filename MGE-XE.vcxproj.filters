@@ -261,6 +261,9 @@
     <ClCompile Include="src\mge\renderthread.cpp">
       <Filter>Source Files\mge</Filter>
     </ClCompile>
+    <ClCompile Include="src\mge\cpuprepthread.cpp">
+      <Filter>Source Files\mge</Filter>
+    </ClCompile>
     <ClCompile Include="src\mge\renderwater.cpp">
       <Filter>Source Files\mge</Filter>
     </ClCompile>
@@ -522,6 +525,9 @@
       <Filter>Header Files\mge</Filter>
     </ClInclude>
     <ClInclude Include="src\mge\renderthread.h">
+      <Filter>Header Files\mge</Filter>
+    </ClInclude>
+    <ClInclude Include="src\mge\cpuprepthread.h">
       <Filter>Header Files\mge</Filter>
     </ClInclude>
     <ClInclude Include="src\mge\shader_utils.h">

@@ -12,9 +12,9 @@
 extern float lastPrepareMs;
 extern bool deviceCallsSafeInPrepare;
 
-// Helper to access rendering buffer's recorded calls (N-1 data being prepared/rendered)
+// Helper to access prep buffer's recorded calls (N-1 data being prepared)
 static auto& currentRecordedCalls() {
-    return FixedFunctionShader::getRenderingBuffer().recordedCalls;
+    return FixedFunctionShader::getPrepBuffer().recordedCalls;
 }
 
 // executeHiZCulling - Pure CPU work: bbox computation, occluder rasterization, Hi-Z pyramid build,
@@ -24,8 +24,8 @@ void FixedFunctionShader::executeHiZCulling(const D3DXMATRIX& currentView, const
     MGE_ZoneScopedN("Execute Hi-Z Culling");
 
     // Resize visibility results for this frame (indexed by draw order)
-    // N-1: HLSL mode uses rendering buffer (previous frame's data), legacy mode uses global static
-    auto& renderBuf = getRenderingBuffer();
+    // N-1: HLSL mode uses prep buffer (previous frame's data being prepared), legacy mode uses global static
+    auto& renderBuf = getPrepBuffer();
     const auto& activeRecordMW = (Configuration.PerPixelLightFlags == 2) ? renderBuf.recordMW : DistantLand::recordMW;
     visibilityResults.assign(activeRecordMW.size(), -1);  // -1 = not yet tested
 
@@ -41,7 +41,8 @@ void FixedFunctionShader::executeHiZCulling(const D3DXMATRIX& currentView, const
                     call.hasBoundingBox = computeBoundingBox(&call.rs, call.bboxMin, call.bboxMax);
                     if (call.hasBoundingBox) {
                         VBIBKey key{call.rs.vb, call.rs.ib};
-                        bboxLookup[key] = {call.bboxMin, call.bboxMax};
+                        // Use per-buffer bboxLookup to avoid race with main thread
+                        renderBuf.bboxLookup[key] = {call.bboxMin, call.bboxMax};
                     }
                 }
             }
@@ -240,8 +241,8 @@ void FixedFunctionShader::applyVisibilityAndFilterRecordMW() {
         return;
     }
 
-    // N-1: Use rendering buffer's recordMW in HLSL mode, global static otherwise
-    auto& renderBuf = getRenderingBuffer();
+    // N-1: Use prep buffer's recordMW in HLSL mode, global static otherwise
+    auto& renderBuf = getPrepBuffer();
     auto& activeRecordMW = (Configuration.PerPixelLightFlags == 2) ? renderBuf.recordMW : DistantLand::recordMW;
 
     int inputCount = (int)activeRecordMW.size();
@@ -264,11 +265,11 @@ void FixedFunctionShader::applyVisibilityAndFilterRecordMW() {
 
 // Dirty tracking: simplified for single buffer (no previous frame comparison)
 // Just marks all calls as dirty - can be optimized later if needed
-// N-1: marks rendering buffer's calls (previous frame being prepared)
+// N-1: marks prep buffer's calls (previous frame being prepared)
 void FixedFunctionShader::markAllCallsDirty() {
     MGE_ZoneScopedN("markAllCallsDirty");
 
-    auto& fb = getRenderingBuffer();
+    auto& fb = getPrepBuffer();
     // Scene 0 (world)
     for (auto& call : fb.recordedCalls) {
         call.dirtyFlags = DIRTY_ALL;
@@ -285,11 +286,11 @@ void FixedFunctionShader::markAllCallsDirty() {
 
 // Phase 2b: Prepare shader keys — runs after recording completes, before replay.
 // BBox computation and occluder rasterization already done in executeHiZCulling (Phase 2a).
-// N-1: prepares rendering buffer (previous frame's data)
+// Phase 2: prepares prepBuffer (N-1 frame's data)
 void FixedFunctionShader::prepareRecordedCalls() {
     MGE_ZoneScopedN("prepareRecordedCalls");
 
-    auto& fb = getRenderingBuffer();
+    auto& fb = getPrepBuffer();
     auto& recCalls = fb.recordedCalls;
 
     // Compute shader keys and assign render bins (with slow-frame timing)
@@ -404,11 +405,19 @@ bool FixedFunctionShader::computeBoundingBox(const RenderedState* rs, D3DXVECTOR
     key.startIndex = rs->startIndex;
     key.primCount = rs->primCount;
 
-    // Check cache first
-    auto it = bboxCache.find(key);
-    if (it != bboxCache.end()) {
+    // Check cache first (thread-safe access)
+    ObjectSpaceBBox objBBox;
+    bool cacheHit = false;
+    {
+        std::lock_guard<std::mutex> lock(bboxCacheMutex);
+        auto it = bboxCache.find(key);
+        if (it != bboxCache.end()) {
+            objBBox = it->second;
+            cacheHit = true;
+        }
+    }
+    if (cacheHit) {
         // Cache hit! Transform cached object-space bbox to world-space
-        const ObjectSpaceBBox& objBBox = it->second;
 
         // Transform 8 corners of object-space bbox by world matrix
         D3DXVECTOR3 corners[8] = {
@@ -561,11 +570,14 @@ bool FixedFunctionShader::computeBoundingBox(const RenderedState* rs, D3DXVECTOR
         return false;
     }
 
-    // Cache the object-space bbox
+    // Cache the object-space bbox (thread-safe write)
     ObjectSpaceBBox cachedBBox;
     cachedBBox.bboxMin = objBBoxMin;
     cachedBBox.bboxMax = objBBoxMax;
-    bboxCache[key] = cachedBBox;
+    {
+        std::lock_guard<std::mutex> lock(bboxCacheMutex);
+        bboxCache[key] = cachedBBox;
+    }
 
     // Transform 8 corners to world space
     D3DXVECTOR3 corners[8] = {
