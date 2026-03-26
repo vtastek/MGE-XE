@@ -73,6 +73,19 @@ static int g_lastCmdBufferSize = 0;
 static ImGuiManager::DIPBinStats g_dipBinStats = {};
 static int g_dipScene0 = 0, g_dipScene1 = 0, g_dipScene2 = 0;
 
+// Async device ownership: render thread sets this when it owns the device.
+// Main thread checks this to detect illegal device access during async overlap.
+std::atomic<bool> g_renderThreadOwnsDevice{false};
+static std::atomic<int> g_deviceRaceCount{0};  // Count races detected this frame
+
+// Log a device access race (main thread touching device while render thread owns it)
+static void logDeviceRace(const char* caller) {
+    int count = g_deviceRaceCount.fetch_add(1);
+    if (count < 20) {  // Cap to avoid log spam
+        LOG::logline("[RACE] Main thread device call during RT: %s (scene=%d)", caller, g_scene.sceneCount);
+    }
+}
+
 // Safe zone tracking for async GPU thread planning
 // Safe zone = time window where render thread can work without touching main thread's device
 // Normal frames: Present() → UI BeginScene
@@ -151,36 +164,21 @@ static void processImGuiHotkeys() {
 
 // When true, MW state/draw calls record to command buffer only — no device forwarding.
 // Keeps main thread off the device for threading safety.
-// Batch 1: Material, Light, LightEnable, FVF, StreamSource, Indices (low-risk)
-// Batch 2: TSS, Texture, RenderState (medium-risk)
-// Batch 3: Transform, Viewport, Clear (high-risk — affects coordinate system and framebuffer)
-//
-// Suppression phases:
-//   Off-screen (local map, inventory): suppress=false, forward to device
-//   Scene0/1/2 recording:              suppress=true, record only (render thread owns device)
-//   UI/HUD after sync:                 suppress=false, forward to device
 static inline bool shouldSuppressMWState() {
-    // Phase B: Suppression enabled via ImGui toggle for testing.
-    // When enabled:
-    // - Scene 0/1 MW calls record to command buffer only (no device forwarding)
-    // - State capture uses tracked values (MWStateTracker) instead of GetXXX
-    // - State restore replays command buffer to device
-    //
-    // Prerequisites for enabling:
-    // - MWStateTracker must track all state that StateContract cares about
-    // - State restore must replay MW command buffer (Phase C)
-    //
-    // Currently: toggled via "State Suppression" checkbox in ImGui debug panel
     if (!ImGuiManager::GetStateSuppressionEnabled()) {
         return false;
     }
-
     // Suppress during Scene 0, 1, 2 HLSL recording
-    // sceneCount starts at -1, so after increment: Scene 0=0, Scene 1=1, Scene 2=2
+    // Scene -1 calls (viewport, clear, transforms) are NOT suppressed — they're write-only
+    // setup with no draw calls until recording starts, so the RT race is benign.
     return isHLSLActive()
         && FixedFunctionShader::getIsRecording()
         && g_scene.sceneCount <= 2;
 }
+
+// Check for device access race: main thread touching device while render thread owns it
+#define CHECK_DEVICE_RACE(name) \
+    do { if (g_renderThreadOwnsDevice.load(std::memory_order_acquire)) logDeviceRace(name); } while(0)
 
 
 
@@ -578,6 +576,7 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         }
         g_deferralCounters.reset();
         g_offscreen.resetForFrame();
+        g_deviceRaceCount.store(0);
         // Safety: close mega-scene if still open at Present
         if (g_offscreen.megaSceneOpen) {
             if (ImGuiManager::GetCmdBufferRecording() && !ImGuiManager::GetCmdBufferReplay()) {
@@ -593,10 +592,20 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         // Offscreen buffer, not PreScene.
         g_cmdBufferSet.activeStage = CmdStage::Offscreen;
 
+        // Snapshot tracker state into recording buffer BEFORE swap.
+        // After swap, this buffer becomes the rendering buffer — render thread reads it.
+        // Must happen before swap clears the tracker for the new frame.
+        if (isHLSLActive()) {
+            FixedFunctionShader::getRecordingBuffer().trackerSnapshot = g_cmdBufferSet.stateTracker();
+        }
+
         // N-1: Swap buffer indices and clear new recording buffer
         // Recording buffer (frame N) becomes rendering buffer (will be rendered as N-1 next frame)
         // Rendering buffer (just rendered) becomes recording buffer (cleared for frame N+1)
         FixedFunctionShader::swapBuffers();
+
+        // Clear tracker for new frame's recording
+        g_cmdBufferSet.stateTracker().clear();
 
         // Start safe zone for async GPU thread
         // Normal frames: Present() → UI BeginScene
@@ -608,9 +617,15 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         g_safeZoneStart = std::chrono::high_resolution_clock::now();
         MGE_TracyMessage("RT_SafeZone_START", 17);
 
-        // NOTE: Async GPU submit deferred until recording is device-free.
-        // renderFullFrameAsync() is called synchronously at UI BeginScene for now.
-        // Future: submit here with waitNow=false once MW state suppression is enabled.
+        // Async GPU: submit N-1 rendering to render thread immediately.
+        // Main thread continues recording frame N in parallel.
+        // Sync fallback: renderFullFrameAsync called at UI BeginScene when async is off.
+        if (ImGuiManager::GetAsyncGpuThread() && isHLSLActive() && g_renderThread && g_renderThread->isRunning()) {
+            RenderThread::SceneWork work;
+            work.type = RenderThread::WorkType::RenderFullFrame;
+            g_renderThread->submitWork(std::move(work), false);  // waitNow=false — async!
+            MGE_TracyMessage("RT_AsyncSubmit", 14);
+        }
 
         // Reset per-frame flags
         FixedFunctionShader::resetHiZBuiltFlag();
@@ -646,6 +661,7 @@ static HRESULT flushPendingRT() {
 
         // Forward to device — except during Offscreen replay (device calls deferred to buffer)
         if (!shouldSuppressMWState()) {
+            CHECK_DEVICE_RACE("flushPendingRT");
             if (rtSurface) {
                 hr1 = device->SetRenderTarget(0, rtSurface);
             }
@@ -686,6 +702,8 @@ HRESULT _stdcall MGEProxyDevice::SetRenderTarget(IDirect3DSurface8* a, IDirect3D
 
 // Forward deferred RT + BeginScene to real device (call before any draw)
 static HRESULT ensureSceneActive() {
+    if (shouldSuppressMWState()) return D3D_OK;
+    CHECK_DEVICE_RACE("ensureSceneActive");
     flushPendingRT();
     if (g_deferred.scenePending && !g_deferred.sceneForwarded) {
         HRESULT hr = DistantLand::device->BeginScene();
@@ -916,15 +934,37 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                     }
                 }
 
-                // HLSL: Run full GPU phase synchronously (renderFullFrameAsync on main thread)
-                // Future: this becomes waitForCompletion() once recording is device-free
+                // HLSL GPU phase: async waits for render thread, sync runs inline
                 if (isHLSLActive() && g_scene.stage0Complete) {
                     // N-1: Store current frame's waterSeen into recording buffer
                     FixedFunctionShader::getRecordingBuffer().waterSeen = g_scene.waterDrawn;
 
-                    // renderFullFrameAsync handles: UI state save, all GPU work,
-                    // postProcess, UI state restore, and depth clear
-                    FixedFunctionShader::renderFullFrameAsync();
+                    if (ImGuiManager::GetAsyncGpuThread() && g_renderThread && g_renderThread->isRunning()) {
+                        // Async: render thread already working — wait for completion
+                        MGE_ZoneScopedN("WaitForRenderThread");
+                        g_renderThread->waitForCompletion();
+                        MGE_TracyMessage("RT_AsyncComplete", 16);
+
+                        // Async state fix: render thread restored a stale state block (from Present time).
+                        // Apply CURRENT frame's tracked state so UI sees what MW expects.
+                        auto& tracker = g_cmdBufferSet.stateTracker();
+                        DWORD val;
+                        if (tracker.getRenderState(D3DRS_ALPHABLENDENABLE, &val))
+                            realDevice->SetRenderState(D3DRS_ALPHABLENDENABLE, val);
+                        if (tracker.getRenderState(D3DRS_ZWRITEENABLE, &val))
+                            realDevice->SetRenderState(D3DRS_ZWRITEENABLE, val);
+                        if (tracker.getRenderState(D3DRS_ALPHAREF, &val))
+                            realDevice->SetRenderState(D3DRS_ALPHAREF, val);
+                        if (tracker.getRenderState(D3DRS_ALPHATESTENABLE, &val))
+                            realDevice->SetRenderState(D3DRS_ALPHATESTENABLE, val);
+                        if (tracker.getFVF(&val))
+                            realDevice->SetFVF(val);
+                        for (auto& [index, enable] : tracker.lightEnables)
+                            realDevice->LightEnable(index, enable);
+                    } else {
+                        // Sync fallback: run GPU phase on main thread
+                        FixedFunctionShader::renderFullFrameAsync();
+                    }
                     FixedFunctionShader::transitionTo(PhaseTransition::GpuExit);
                 } else if (isHLSLActive()) {
                     FixedFunctionShader::transitionTo(PhaseTransition::GpuExit);
@@ -979,6 +1019,13 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
                 // HLSL path: do GPU work at EndScene 0 (sync, same timing as legacy)
                 // Scene 1/2 draws happen after this, so Scene 0 must be complete first.
                 if (!g_scene.stage0Complete) {
+                    // Async: wait for render thread before captureStage0Context.
+                    // captureStage0Context writes s_staging which DL render functions read.
+                    if (ImGuiManager::GetAsyncGpuThread() && g_renderThread && !g_renderThread->isComplete()) {
+                        MGE_ZoneScopedN("WaitForRT_BeforeCapture");
+                        g_renderThread->waitForCompletion();
+                        MGE_TracyMessage("RT_AsyncComplete_ES0", 20);
+                    }
                     frameCtx = DistantLand::captureStage0Context();
                     g_scene.stage0Complete = true;
                     // N-1: Store context into recording buffer for rendering next frame
@@ -1207,6 +1254,7 @@ HRESULT _stdcall MGEProxyDevice::Clear(DWORD a, const D3DRECT* b, DWORD c, D3DCO
     if (!g_scene.rendertargetNormal && g_offscreen.suppressingCurrentScene) return D3D_OK;
     // Flush pending RT before Clear — Clear needs correct target
     flushPendingRT();
+    CHECK_DEVICE_RACE("Clear");
     return ProxyDevice::Clear(a, b, c, d, e, f);
 }
 
@@ -1235,7 +1283,9 @@ HRESULT _stdcall MGEProxyDevice::SetTransform(D3DTRANSFORMSTATETYPE a, const D3D
                         g_cmdBufferSet.active().recordSetTransform((DWORD)a, &view);
                     }
                 }
-                // Don't suppress transforms — needed for capture/restore
+                // Suppress transform during async — tracker has the value, device not needed
+                if (shouldSuppressMWState()) return D3D_OK;
+                CHECK_DEVICE_RACE("SetTransform_View");
                 return ProxyDevice::SetTransform(a, &view);
             }
             // Non-main view (Scene 1/2): capture original and track for async
@@ -1263,7 +1313,9 @@ HRESULT _stdcall MGEProxyDevice::SetTransform(D3DTRANSFORMSTATETYPE a, const D3D
                         g_cmdBufferSet.active().recordSetTransform((DWORD)a, &proj);
                     }
                 }
-                // Don't suppress transforms — needed for capture/restore
+                // Suppress transform during async — tracker has the value, device not needed
+                if (shouldSuppressMWState()) return D3D_OK;
+                CHECK_DEVICE_RACE("SetTransform_Proj");
                 return ProxyDevice::SetTransform(a, &proj);
             }
             // Non-main view (Scene 1/2): track for async
@@ -1283,7 +1335,9 @@ HRESULT _stdcall MGEProxyDevice::SetTransform(D3DTRANSFORMSTATETYPE a, const D3D
             g_cmdBufferSet.active().recordSetTransform((DWORD)a, b);
         }
     }
-    // Don't suppress transforms — needed for capture/restore
+    // Suppress transform during async — tracker has the value, device not needed
+    if (shouldSuppressMWState()) return D3D_OK;
+    CHECK_DEVICE_RACE("SetTransform");
     return ProxyDevice::SetTransform(a, b);
 }
 
@@ -1302,6 +1356,7 @@ HRESULT _stdcall MGEProxyDevice::SetMaterial(const D3DMATERIAL8* a) {
         g_cmdBufferSet.active().recordSetMaterial(a);
     }
     if (shouldSuppressMWState()) return D3D_OK;
+    CHECK_DEVICE_RACE("SetMaterial");
     return ProxyDevice::SetMaterial(a);
 }
 
@@ -1320,6 +1375,7 @@ HRESULT _stdcall MGEProxyDevice::SetLight(DWORD a, const D3DLIGHT8* b) {
         g_cmdBufferSet.active().recordSetLight(a, b);
     }
     if (shouldSuppressMWState()) return D3D_OK;
+    CHECK_DEVICE_RACE("SetLight");
     return ProxyDevice::SetLight(a, b);
 }
 
@@ -1370,7 +1426,8 @@ HRESULT _stdcall MGEProxyDevice::SetRenderState(D3DRENDERSTATETYPE a, DWORD b) {
                                a == D3DRS_POINTSIZE_MAX || a == D3DRS_POINTSCALEENABLE ||
                                a == D3DRS_POINTSCALE_A || a == D3DRS_POINTSCALE_B ||
                                a == D3DRS_POINTSCALE_C || a == D3DRS_POINTSPRITEENABLE);
-    if (!isPointSpriteState && shouldSuppressMWState()) return D3D_OK;
+    if (shouldSuppressMWState() && (g_renderThreadOwnsDevice.load(std::memory_order_acquire) || !isPointSpriteState)) return D3D_OK;
+    CHECK_DEVICE_RACE("SetRenderState");
     return ProxyDevice::SetRenderState(a, b);
 }
 
@@ -1440,9 +1497,10 @@ HRESULT _stdcall MGEProxyDevice::SetTextureStageState(DWORD a, D3DTEXTURESTAGEST
         // Track non-sampler TSS outside recording (UI setup between EndScene/BeginScene)
         g_cmdBufferSet.stateTracker().trackTextureStageState(a, (DWORD)b, c);
     }
-    // Don't suppress sampler states — needed for UI state capture
-    // Non-sampler TSS can be suppressed
-    if (!isSamplerState && shouldSuppressMWState()) return D3D_OK;
+    // During async overlap, suppress ALL TSS (including sampler states) to avoid device race
+    // Otherwise, only suppress non-sampler TSS during recording (sampler states needed for UI capture)
+    if (shouldSuppressMWState() && (g_renderThreadOwnsDevice.load(std::memory_order_acquire) || !isSamplerState)) return D3D_OK;
+    CHECK_DEVICE_RACE("SetTextureStageState");
     return ProxyDevice::SetTextureStageState(a, b, c);
 }
 
@@ -1694,6 +1752,7 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
             g_scene.sceneCount, e, c, rs.texture);
     }
     if (shouldSuppressMWState()) return D3D_OK;
+    CHECK_DEVICE_RACE("DrawIndexedPrimitive");
     return ProxyDevice::DrawIndexedPrimitive(a, b, c, d, e);
 }
 
@@ -1817,6 +1876,7 @@ HRESULT _stdcall MGEProxyDevice::SetTexture(DWORD a, IDirect3DBaseTexture8* b) {
         g_cmdBufferSet.active().recordSetTexture(a, realTex);
     }
     if (shouldSuppressMWState()) return D3D_OK;
+    CHECK_DEVICE_RACE("SetTexture");
     return ProxyDevice::SetTexture(a, b);
 }
 
@@ -1828,6 +1888,7 @@ HRESULT _stdcall MGEProxyDevice::DrawPrimitive(D3DPRIMITIVETYPE a, UINT b, UINT 
     }
     if (!g_scene.rendertargetNormal && (g_offscreen.suppressingCurrentScene || ImGuiManager::GetSuppressOffscreen())) return D3D_OK;
     if (shouldSuppressMWState()) return D3D_OK;
+    CHECK_DEVICE_RACE("DrawPrimitive");
     ensureSceneActive();
     return ProxyDevice::DrawPrimitive(a, b, c);
 }
@@ -1835,6 +1896,7 @@ HRESULT _stdcall MGEProxyDevice::DrawPrimitive(D3DPRIMITIVETYPE a, UINT b, UINT 
 HRESULT _stdcall MGEProxyDevice::DrawPrimitiveUP(D3DPRIMITIVETYPE a, UINT b, const void* c, UINT d) {
     if (!g_scene.rendertargetNormal && (g_offscreen.suppressingCurrentScene || ImGuiManager::GetSuppressOffscreen())) return D3D_OK;
     if (shouldSuppressMWState()) return D3D_OK;
+    CHECK_DEVICE_RACE("DrawPrimitiveUP");
     ensureSceneActive();
     return ProxyDevice::DrawPrimitiveUP(a, b, c, d);
 }
@@ -1856,6 +1918,7 @@ HRESULT _stdcall MGEProxyDevice::SetVertexShader(DWORD a) {
         g_cmdBufferSet.stateTracker().trackFVF(a);
     }
     if (shouldSuppressMWState()) return D3D_OK;
+    CHECK_DEVICE_RACE("SetVertexShader");
     return ProxyDevice::SetVertexShader(a);
 }
 
@@ -1870,6 +1933,7 @@ HRESULT _stdcall MGEProxyDevice::SetStreamSource(UINT a, IDirect3DVertexBuffer8*
         g_cmdBufferSet.active().recordSetStreamSource(a, (IDirect3DVertexBuffer9*)b, 0, c);
     }
     if (shouldSuppressMWState()) return D3D_OK;
+    CHECK_DEVICE_RACE("SetStreamSource");
     return ProxyDevice::SetStreamSource(a, b, c);
 }
 
@@ -1880,6 +1944,7 @@ HRESULT _stdcall MGEProxyDevice::SetIndices(IDirect3DIndexBuffer8* a, UINT b) {
         g_cmdBufferSet.active().recordSetIndices((IDirect3DIndexBuffer9*)a);
     }
     if (shouldSuppressMWState()) return D3D_OK;
+    CHECK_DEVICE_RACE("SetIndices");
     return ProxyDevice::SetIndices(a, b);
 }
 
@@ -1901,6 +1966,7 @@ HRESULT _stdcall MGEProxyDevice::LightEnable(DWORD a, BOOL b) {
         g_cmdBufferSet.stateTracker().trackLightEnable(a, b);
     }
     if (shouldSuppressMWState()) return D3D_OK;
+    CHECK_DEVICE_RACE("LightEnable");
     return ProxyDevice::LightEnable(a, b);
 }
 
@@ -2204,6 +2270,7 @@ HRESULT _stdcall MGEProxyDevice::SetViewport(const D3DVIEWPORT8* a) {
         }
     }
     if (shouldSuppressMWState()) return D3D_OK;
+    CHECK_DEVICE_RACE("SetViewport");
     return ProxyDevice::SetViewport(a);
 }
 

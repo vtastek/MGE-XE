@@ -140,6 +140,7 @@ int ImGuiManager::frozenSlowCallBin = 0;
 bool ImGuiManager::cmdBufferRecording = false;
 bool ImGuiManager::cmdBufferReplay = false;
 bool ImGuiManager::stateSuppression = false;
+bool ImGuiManager::asyncGpuThread = false;
 int ImGuiManager::cmdBufferCmdCount = 0;
 int ImGuiManager::cmdBufferSizeKB = 0;
 int ImGuiManager::cmdStagePreScene = 0;
@@ -560,6 +561,8 @@ void ImGuiManager::RenderDebugInterface() {
         ImGui::SetItemTooltip("Skip MW forwards, replay entire buffer at Present(). Forces recording on.");
         ImGui::Checkbox("State Suppression (Phase B)", &stateSuppression);
         ImGui::SetItemTooltip("Suppress Scene 0 MW state calls to device. Uses tracked state for restore. Requires recording.");
+        ImGui::Checkbox("Async GPU Thread (Phase C)", &asyncGpuThread);
+        ImGui::SetItemTooltip("Submit GPU work to render thread at Present(). Auto-enables suppression. Wait at UI BeginScene.");
         if (cmdBufferRecording || cmdBufferReplay) {
             ImGui::Text("  Commands: %d  Size: %d KB", cmdBufferCmdCount, cmdBufferSizeKB);
             ImGui::Text("  Pre:%d S0:%d Inter:%d S1/2:%d UI:%d",

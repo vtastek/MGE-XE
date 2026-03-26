@@ -4,6 +4,10 @@
 #include "ffeshader.h"
 #include "support/log.h"
 #include "mge_tracy.h"
+#include <atomic>
+
+// Device ownership flag — set by render thread, checked by main thread for race detection
+extern std::atomic<bool> g_renderThreadOwnsDevice;
 
 RenderThread* g_renderThread = nullptr;
 
@@ -92,7 +96,9 @@ void RenderThread::workerLoop() {
                 executeReplayHLSL(work.sceneCount);
                 break;
             case WorkType::RenderFullFrame:
+                g_renderThreadOwnsDevice.store(true, std::memory_order_release);
                 executeFullFrame(work.bufferIndex);
+                g_renderThreadOwnsDevice.store(false, std::memory_order_release);
                 break;
             case WorkType::Shutdown:
             case WorkType::None:

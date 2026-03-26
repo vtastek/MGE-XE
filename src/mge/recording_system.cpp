@@ -1578,112 +1578,28 @@ void FixedFunctionShader::renderFullFrameAsync() {
     DLContext* renderCtx = &fb.dlContext;
     bool renderWaterSeen = fb.waterSeen;
 
-    // Diagnostic: log device state at UI BeginScene to compare suppression ON vs OFF
-    {
-        {
-            DWORD ab, sb, db, at, ar, af, ze, zw, zf, fe, cwe, tf, lit, cv;
-            device->GetRenderState(D3DRS_ALPHABLENDENABLE, &ab);
-            device->GetRenderState(D3DRS_SRCBLEND, &sb);
-            device->GetRenderState(D3DRS_DESTBLEND, &db);
-            device->GetRenderState(D3DRS_ALPHATESTENABLE, &at);
-            device->GetRenderState(D3DRS_ALPHAREF, &ar);
-            device->GetRenderState(D3DRS_ALPHAFUNC, &af);
-            device->GetRenderState(D3DRS_ZENABLE, &ze);
-            device->GetRenderState(D3DRS_ZWRITEENABLE, &zw);
-            device->GetRenderState(D3DRS_ZFUNC, &zf);
-            device->GetRenderState(D3DRS_FOGENABLE, &fe);
-            device->GetRenderState(D3DRS_COLORWRITEENABLE, &cwe);
-            device->GetRenderState(D3DRS_TEXTUREFACTOR, &tf);
-            device->GetRenderState(D3DRS_LIGHTING, &lit);
-            device->GetRenderState(D3DRS_COLORVERTEX, &cv);
-            DWORD fvfVal; device->GetFVF(&fvfVal);
-            DWORD tss0co, tss0ca1, tss0ca2, tss0ao, tss1co;
-            device->GetTextureStageState(0, D3DTSS_COLOROP, &tss0co);
-            device->GetTextureStageState(0, D3DTSS_COLORARG1, &tss0ca1);
-            device->GetTextureStageState(0, D3DTSS_COLORARG2, &tss0ca2);
-            device->GetTextureStageState(0, D3DTSS_ALPHAOP, &tss0ao);
-            device->GetTextureStageState(1, D3DTSS_COLOROP, &tss1co);
-            LOG::logline("[UI_STATE] supp=%d AB=%d SB=%d DB=%d AT=%d AR=%d AF=%d ZE=%d ZW=%d ZF=%d FE=%d CWE=0x%X TF=0x%08X LIT=%d CV=%d FVF=0x%X",
-                ImGuiManager::GetStateSuppressionEnabled() ? 1 : 0,
-                ab, sb, db, at, ar, af, ze, zw, zf, fe, cwe, tf, lit, cv, fvfVal);
-            LOG::logline("[UI_STATE] TSS0: CO=%d CA1=%d CA2=%d AO=%d  TSS1: CO=%d",
-                tss0co, tss0ca1, tss0ca2, tss0ao, tss1co);
-
-            // Extended states for brightness diagnosis
-            DWORD amb, dms, ams, ems;
-            device->GetRenderState(D3DRS_AMBIENT, &amb);
-            device->GetRenderState(D3DRS_DIFFUSEMATERIALSOURCE, &dms);
-            device->GetRenderState(D3DRS_AMBIENTMATERIALSOURCE, &ams);
-            device->GetRenderState(D3DRS_EMISSIVEMATERIALSOURCE, &ems);
-            IDirect3DSurface9* curRT = nullptr;
-            IDirect3DSurface9* backBuf = nullptr;
-            device->GetRenderTarget(0, &curRT);
-            device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuf);
-            bool rtOk = (curRT == backBuf);
-            if (curRT) curRT->Release();
-            if (backBuf) backBuf->Release();
-            LOG::logline("[UI_STATE] AMB=0x%08X DMS=%d AMS=%d EMS=%d RT_OK=%d",
-                amb, dms, ams, ems, rtOk ? 1 : 0);
-
-            // Also log water level for N-1 investigation
-            auto mwb = MWBridge::get();
-            LOG::logline("[UI_STATE] WaterLevel=%.1f CellHasWater=%d eyePos.z=%.1f",
-                mwb->CellHasWater() ? mwb->WaterLevel() : -9999.0f,
-                mwb->CellHasWater() ? 1 : 0, renderCtx->eyePos.z);
-        }
-    }
-    // end diagnostic
-
-      // Fix stale device state from suppressed recording calls.
+    // Fix stale device state from suppressed recording calls.
     // MUST happen BEFORE state block creation to capture correct state.
+    // Read from rendering buffer's tracker snapshot (thread-safe: no race with main thread).
     if (ImGuiManager::GetStateSuppressionEnabled()) {
-        auto& tracker = g_cmdBufferSet.stateTracker();
+        auto& tracker = fb.trackerSnapshot;
         DWORD val;
-        bool abOk = tracker.getRenderState(D3DRS_ALPHABLENDENABLE, &val);
-        DWORD abVal = abOk ? val : 0xDEAD;
-        if (abOk) device->SetRenderState(D3DRS_ALPHABLENDENABLE, val);
-
-        bool inWaterCell = MWBridge::get()->CellHasWater();
-
-        // Restore ZW from tracker - don't override during UI rendering
-        // Water ZW fix will be applied later during actual water rendering
-        bool zwOk = tracker.getRenderState(D3DRS_ZWRITEENABLE, &val);
-        DWORD zwVal = zwOk ? val : 0xDEAD;
-        if (zwOk) device->SetRenderState(D3DRS_ZWRITEENABLE, val);
-
-        bool arOk = tracker.getRenderState(D3DRS_ALPHAREF, &val);
-        DWORD arVal = arOk ? val : 0xDEAD;
-        if (arOk) device->SetRenderState(D3DRS_ALPHAREF, val);
-
-        bool atOk = tracker.getRenderState(D3DRS_ALPHATESTENABLE, &val);
-        DWORD atVal = atOk ? val : 0xDEAD;
-        if (atOk) device->SetRenderState(D3DRS_ALPHATESTENABLE, val);
-
-        bool fvfOk = tracker.getFVF(&val);
-        DWORD fvfVal = fvfOk ? val : 0xDEAD;
-        if (fvfOk) device->SetFVF(val);
+        if (tracker.getRenderState(D3DRS_ALPHABLENDENABLE, &val))
+            device->SetRenderState(D3DRS_ALPHABLENDENABLE, val);
+        if (tracker.getRenderState(D3DRS_ZWRITEENABLE, &val))
+            device->SetRenderState(D3DRS_ZWRITEENABLE, val);
+        if (tracker.getRenderState(D3DRS_ALPHAREF, &val))
+            device->SetRenderState(D3DRS_ALPHAREF, val);
+        if (tracker.getRenderState(D3DRS_ALPHATESTENABLE, &val))
+            device->SetRenderState(D3DRS_ALPHATESTENABLE, val);
+        if (tracker.getFVF(&val))
+            device->SetFVF(val);
 
         // Fix light enable states — suppressed LightEnable calls leave lights
         // from 3D scenes leaking into UI (causes bright text via extra lighting)
-        int lightsFixed = 0;
         for (auto& [index, enable] : tracker.lightEnables) {
             device->LightEnable(index, enable);
-            lightsFixed++;
         }
-
-        // Post-fix: read back device state to confirm
-        DWORD postAB, postZW, postAR, postAT, postFVF;
-        device->GetRenderState(D3DRS_ALPHABLENDENABLE, &postAB);
-        device->GetRenderState(D3DRS_ZWRITEENABLE, &postZW);
-        device->GetRenderState(D3DRS_ALPHAREF, &postAR);
-        device->GetRenderState(D3DRS_ALPHATESTENABLE, &postAT);
-        device->GetFVF(&postFVF);
-        BOOL l0 = FALSE, l1 = FALSE;
-        device->GetLightEnable(0, &l0);
-        device->GetLightEnable(1, &l1);
-        LOG::logline("[UI_FIX] tracker: AB=%s(%d) ZW=%s(%d) AR=%s(%d) FVF=%s(0x%X) lights=%d -> device: AB=%d ZW=%d AR=%d FVF=0x%X L0=%d L1=%d",
-            abOk?"Y":"N", abVal, zwOk?"Y":"N", zwVal, arOk?"Y":"N", arVal, fvfOk?"Y":"N", fvfVal, lightsFixed,
-            postAB, postZW, postAR, postFVF, l0, l1);
     }
 
   IDirect3DStateBlock9* uiStateBlock = nullptr;
@@ -1856,33 +1772,6 @@ void FixedFunctionShader::renderFullFrameAsync() {
 
     // Clear depth so UI draws aren't depth-tested against 3D geometry
     device->Clear(0, NULL, D3DCLEAR_ZBUFFER, 0, 1.0f, 0);
-
-    // Post-restore diagnostic: confirm state block restored correctly
-    if (ImGuiManager::GetStateSuppressionEnabled()) {
-        DWORD ab, zw, ar, fvfVal, amb, lit, cv, dms, ams, ems;
-        device->GetRenderState(D3DRS_ALPHABLENDENABLE, &ab);
-        device->GetRenderState(D3DRS_ZWRITEENABLE, &zw);
-        device->GetRenderState(D3DRS_ALPHAREF, &ar);
-        device->GetFVF(&fvfVal);
-        device->GetRenderState(D3DRS_AMBIENT, &amb);
-        device->GetRenderState(D3DRS_LIGHTING, &lit);
-        device->GetRenderState(D3DRS_COLORVERTEX, &cv);
-        device->GetRenderState(D3DRS_DIFFUSEMATERIALSOURCE, &dms);
-        device->GetRenderState(D3DRS_AMBIENTMATERIALSOURCE, &ams);
-        device->GetRenderState(D3DRS_EMISSIVEMATERIALSOURCE, &ems);
-
-        // Check render target
-        IDirect3DSurface9* curRT = nullptr;
-        IDirect3DSurface9* backBuf = nullptr;
-        device->GetRenderTarget(0, &curRT);
-        device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuf);
-        bool rtIsBackbuf = (curRT == backBuf);
-        if (curRT) curRT->Release();
-        if (backBuf) backBuf->Release();
-
-        LOG::logline("[UI_POST] AB=%d ZW=%d AR=%d FVF=0x%X AMB=0x%08X LIT=%d CV=%d DMS=%d AMS=%d EMS=%d RT_OK=%d",
-            ab, zw, ar, fvfVal, amb, lit, cv, dms, ams, ems, rtIsBackbuf ? 1 : 0);
-    }
 }
 
 // Compare two LightStates for equality (to detect if we can reuse cached state)
@@ -1996,7 +1885,10 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
     }
 
     // Warm suffix cache on main thread (device calls not safe off main thread)
-    TextureSuffix::warmCache((IDirect3DDevice9*)device, rs->texture);
+    // Skip during async GPU — render thread owns device, warmCache will run in prepareRecordedCalls
+    if (!ImGuiManager::GetAsyncGpuThread()) {
+        TextureSuffix::warmCache((IDirect3DDevice9*)device, rs->texture);
+    }
 
     // NOTE: DIP events are already logged in mged3d8device.cpp DrawIndexedPrimitive
     // before reaching this recording path. Do NOT log again here to avoid double-counting.

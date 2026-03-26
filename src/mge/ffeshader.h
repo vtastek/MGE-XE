@@ -703,6 +703,9 @@ public:
         // Captured MWBridge state for postProcess (render thread safe)
         PostProcessData postProcessData = {};
 
+        // Snapshot of MWStateTracker at end of recording (for render thread state fix)
+        MWStateTracker trackerSnapshot;
+
         // Staging buffers for Scene 1/2 dynamic VB snapshots
         // Persistent across frames (resized as needed, not released in clear())
         IDirect3DVertexBuffer9* particleStagingVB = nullptr;
@@ -729,6 +732,7 @@ public:
             stateContract = StateContract();  // Reset to default state
             hlslCmds.clear();
             postProcessData = {};
+            trackerSnapshot.clear();
             dlContext = DLContext();  // Reset DLContext to prevent garbage values
             valid = false;
             // Initialize matrices to identity to prevent garbage if capture functions aren't called

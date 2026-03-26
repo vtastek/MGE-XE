@@ -264,7 +264,8 @@ public:
     // D3D Command Buffer
     static bool GetCmdBufferRecording() { return cmdBufferRecording || cmdBufferReplay; }
     static bool GetCmdBufferReplay() { return cmdBufferReplay; }
-    static bool GetStateSuppressionEnabled() { return stateSuppression; }
+    static bool GetStateSuppressionEnabled() { return stateSuppression || asyncGpuThread; }
+    static bool GetAsyncGpuThread() { return asyncGpuThread; }
     static void UpdateCmdBufferStats(int cmdCount, int sizeKB);
     static void UpdateCmdBufferPerStageStats(int preScene, int scene0, int interScene, int scene1Plus, int ui);
 
@@ -407,6 +408,7 @@ private:
     static bool cmdBufferRecording;       // Enable command buffer recording - default false
     static bool cmdBufferReplay;          // Enable command buffer replay mode - default false
     static bool stateSuppression;         // Enable MW state suppression for async (Phase B) - default false
+    static bool asyncGpuThread;           // Enable async GPU thread (auto-enables suppression) - default false
     static int cmdBufferCmdCount;         // Last frame's command count
     static int cmdBufferSizeKB;           // Last frame's buffer size in KB
     static int cmdStagePreScene;          // Per-stage command counts
