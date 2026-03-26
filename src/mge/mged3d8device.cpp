@@ -6,6 +6,7 @@
 #include "proxydx/d3d8surface.h"
 
 #include <algorithm>
+#include <chrono>
 #include <tlhelp32.h>
 #include "mgeversion.h"
 #include "configuration.h"
@@ -71,6 +72,15 @@ static int g_lastCmdBufferSize = 0;
 // DIP counters
 static ImGuiManager::DIPBinStats g_dipBinStats = {};
 static int g_dipScene0 = 0, g_dipScene1 = 0, g_dipScene2 = 0;
+
+// Safe zone tracking for async GPU thread planning
+// Safe zone = time window where render thread can work without touching main thread's device
+// Normal frames: Present() → UI BeginScene
+// Offscreen frames: Offscreen End → UI BeginScene (stall during offscreen)
+static bool g_renderThreadSafeZone = false;
+static bool g_safeZoneEndedForOffscreen = false;  // Track if we need to restart after offscreen
+static std::chrono::high_resolution_clock::time_point g_safeZoneStart;
+static float g_lastSafeZoneMs = 0.0f;
 
 // Per-scene draw characteristic tracking (to understand what each scene contains)
 struct SceneDrawStats {
@@ -588,6 +598,16 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         // Rendering buffer (just rendered) becomes recording buffer (cleared for frame N+1)
         FixedFunctionShader::swapBuffers();
 
+        // Start safe zone for async GPU thread
+        // Normal frames: Present() → UI BeginScene
+        // Offscreen frames: stall during offscreen, then Offscreen End → UI BeginScene
+        // During safe zone, main thread only records to FrameBuffer (CPU work)
+        // Render thread can safely submit GPU calls from N-1 data
+        g_renderThreadSafeZone = true;
+        g_safeZoneEndedForOffscreen = false;  // Reset for new frame
+        g_safeZoneStart = std::chrono::high_resolution_clock::now();
+        MGE_TracyMessage("RT_SafeZone_START", 17);
+
         // Reset per-frame flags
         FixedFunctionShader::resetHiZBuiltFlag();
         FixedFunctionShader::resetRecordingCompletedFlag();
@@ -693,6 +713,17 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
     // Offscreen scene collapsing: keep one device-level scene open for all offscreen work
     // This eliminates per-scene DXVK command buffer submissions
     if (!g_scene.rendertargetNormal) {
+        // End safe zone: offscreen rendering needs direct device access
+        // Will restart safe zone after offscreen completes (at mega scene close)
+        if (g_renderThreadSafeZone) {
+            auto elapsed = std::chrono::high_resolution_clock::now() - g_safeZoneStart;
+            g_lastSafeZoneMs = std::chrono::duration<float, std::milli>(elapsed).count();
+            MGE_TracyPlot("RT_SafeZone_ms", g_lastSafeZoneMs);
+            MGE_TracyMessage("RT_SafeZone_STALL_Offscreen", 26);
+            g_renderThreadSafeZone = false;
+            g_safeZoneEndedForOffscreen = true;
+        }
+
         MGE_ZoneScopedN("OffscreenRender");
         // SYNC: Wait for render thread before off-screen rendering touches device.
         // Off-screen work (local map, inventory doll) needs direct device access.
@@ -739,6 +770,7 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
             FixedFunctionShader::restoreOffscreenState();
             g_offscreen.megaSceneOpen = false;
             g_cmdBufferSet.activeStage = CmdStage::PreScene;
+            // Safe zone restart now happens in EndScene (captures gap before Scene 0)
         }
     }
 
@@ -837,6 +869,15 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
             // UI scene — frame finalize point (detected by !isMainView after world scenes)
             g_scene.phase = ScenePhase::UI;
 
+            // End safe zone: UI needs device for menu/HUD rendering
+            if (g_renderThreadSafeZone) {
+                auto elapsed = std::chrono::high_resolution_clock::now() - g_safeZoneStart;
+                g_lastSafeZoneMs = std::chrono::duration<float, std::milli>(elapsed).count();
+                MGE_TracyPlot("RT_SafeZone_ms", g_lastSafeZoneMs);
+                MGE_TracyMessage("RT_SafeZone_END_UI", 18);
+                g_renderThreadSafeZone = false;
+            }
+
             if (ImGuiManager::GetHandoverLogging()) {
                 LOG::logline("BeginScene: phase=UI (GPU phase trigger)");
             }
@@ -918,6 +959,15 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
 // MGE intercepts first scene to draw distant land before it finishes, others it applies shadows to
 HRESULT _stdcall MGEProxyDevice::EndScene() {
     ImGuiManager::LogFrameEvent(FrameEvent::EndScene, g_scene.sceneCount);
+
+    // Restart safe zone after offscreen EndScene - captures gap before Scene 0
+    // Main thread done with offscreen API calls, GPU may still be processing
+    if (!g_scene.rendertargetNormal && g_safeZoneEndedForOffscreen) {
+        g_renderThreadSafeZone = true;
+        g_safeZoneStart = std::chrono::high_resolution_clock::now();
+        g_safeZoneEndedForOffscreen = false;
+        MGE_TracyMessage("RT_SafeZone_START_PostOffscreen", 31);
+    }
 
     if (DistantLand::ready && g_scene.rendertargetNormal) {
         // Ensure real device scene is active before MGE renders anything
