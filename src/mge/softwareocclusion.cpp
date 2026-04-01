@@ -53,6 +53,9 @@ void SoftwareOcclusionCuller::shutdown()
     }
     mNumMipLevels = 0;
 
+    mMeshCache.clear();
+    mBlacklistedMeshes.clear();
+
     if (mHiZVisualizationTexture) {
         mHiZVisualizationTexture->Release();
         mHiZVisualizationTexture = nullptr;
@@ -97,131 +100,142 @@ int SoftwareOcclusionCuller::rasterizeMesh(
     MGE_ZoneScoped;
     if (!vb || !ib) return 0;
 
+    // Only support triangle lists for cached path (most common)
+    if (primType != D3DPT_TRIANGLELIST) return 0;
+
     // Check if FVF has position data
     bool hasPosition = (fvf & D3DFVF_POSITION_MASK) != 0;
     if (!hasPosition) return 0;
 
-    // Track pixels written to measure raster efficiency
-    int pixelsWritten = 0;
+    // Cache key for this mesh
+    MeshCacheKey cacheKey = { vb, ib, vbOffset, vbStride, startIndex, primCount };
 
-    // Lock vertex buffer (use D3DLOCK_READONLY only - DONOTWAIT causes failures during GPU use)
-    void* pVertices = nullptr;
-    HRESULT hr = vb->Lock(vbOffset, 0, &pVertices, D3DLOCK_READONLY);
-    if (FAILED(hr)) {
-        static int vbLockFailCount = 0;
-        if (vbLockFailCount++ < 5) {
-            LOG::logline("!! SoftwareOcclusion: VB lock failed (hr=0x%X)", hr);
+    // Check cache first - avoids expensive VB/IB lock on subsequent frames
+    CachedMeshGeometry* cached = nullptr;
+    auto it = mMeshCache.find(cacheKey);
+    if (it != mMeshCache.end()) {
+        cached = &it->second;
+    } else {
+        // Cache miss - need to lock buffers and read geometry
+        MGE_ZoneScopedN("MeshCache Miss");
+
+        void* pVertices = nullptr;
+        HRESULT hr = vb->Lock(vbOffset, 0, &pVertices, D3DLOCK_READONLY);
+        if (FAILED(hr)) {
+            static int vbLockFailCount = 0;
+            if (vbLockFailCount++ < 5) {
+                LOG::logline("!! SoftwareOcclusion: VB lock failed (hr=0x%X)", hr);
+            }
+            return 0;
         }
-        return 0;
-    }
 
-    // Lock index buffer
-    void* pIndices = nullptr;
-    hr = ib->Lock(0, 0, &pIndices, D3DLOCK_READONLY);
-    if (FAILED(hr)) {
-        static int ibLockFailCount = 0;
-        if (ibLockFailCount++ < 5) {
-            LOG::logline("!! SoftwareOcclusion: IB lock failed (hr=0x%X)", hr);
-        }
-        vb->Unlock();
-        return 0;
-    }
-
-    // Determine index format
-    D3DINDEXBUFFER_DESC ibDesc;
-    ib->GetDesc(&ibDesc);
-    bool is16Bit = (ibDesc.Format == D3DFMT_INDEX16);
-
-    // Compute transforms
-    D3DXMATRIX worldView = world * view;           // For view-space distance check
-    D3DXMATRIX worldViewProj = worldView * proj;   // For final projection
-
-    // Simple distance limits - avoid near-plane clipping complexity
-    const float NEAR_DIST = 0.01f;     // Minimum distance from camera (very small - just reject behind-camera)
-    const float MAX_DIST = 10000.0f;   // Maximum distance (very large - essentially no limit for now)
-
-    // Process triangles based on primitive type
-    UINT indexCount = 0;
-    switch (primType) {
-        case D3DPT_TRIANGLELIST: indexCount = primCount * 3; break;
-        case D3DPT_TRIANGLESTRIP: indexCount = primCount + 2; break;
-        case D3DPT_TRIANGLEFAN: indexCount = primCount + 2; break;
-        default:
-            ib->Unlock();
+        void* pIndices = nullptr;
+        hr = ib->Lock(0, 0, &pIndices, D3DLOCK_READONLY);
+        if (FAILED(hr)) {
+            static int ibLockFailCount = 0;
+            if (ibLockFailCount++ < 5) {
+                LOG::logline("!! SoftwareOcclusion: IB lock failed (hr=0x%X)", hr);
+            }
             vb->Unlock();
             return 0;
-    }
-
-    // Rasterize triangles
-    for (UINT i = 0; i < indexCount; i += 3) {
-        // Get vertex indices
-        UINT idx0, idx1, idx2;
-        if (primType == D3DPT_TRIANGLELIST) {
-            if (is16Bit) {
-                idx0 = ((WORD*)pIndices)[startIndex + i + 0] + ibBase;
-                idx1 = ((WORD*)pIndices)[startIndex + i + 1] + ibBase;
-                idx2 = ((WORD*)pIndices)[startIndex + i + 2] + ibBase;
-            } else {
-                idx0 = ((DWORD*)pIndices)[startIndex + i + 0] + ibBase;
-                idx1 = ((DWORD*)pIndices)[startIndex + i + 1] + ibBase;
-                idx2 = ((DWORD*)pIndices)[startIndex + i + 2] + ibBase;
-            }
-        } else if (primType == D3DPT_TRIANGLESTRIP) {
-            if (is16Bit) {
-                idx0 = ((WORD*)pIndices)[startIndex + i + 0] + ibBase;
-                idx1 = ((WORD*)pIndices)[startIndex + i + 1] + ibBase;
-                idx2 = ((WORD*)pIndices)[startIndex + i + 2] + ibBase;
-            } else {
-                idx0 = ((DWORD*)pIndices)[startIndex + i + 0] + ibBase;
-                idx1 = ((DWORD*)pIndices)[startIndex + i + 1] + ibBase;
-                idx2 = ((DWORD*)pIndices)[startIndex + i + 2] + ibBase;
-            }
-            // Triangle strip winding order alternates
-            if (i & 1) std::swap(idx1, idx2);
-        } else { // D3DPT_TRIANGLEFAN
-            if (is16Bit) {
-                idx0 = ((WORD*)pIndices)[startIndex] + ibBase;
-                idx1 = ((WORD*)pIndices)[startIndex + i + 1] + ibBase;
-                idx2 = ((WORD*)pIndices)[startIndex + i + 2] + ibBase;
-            } else {
-                idx0 = ((DWORD*)pIndices)[startIndex] + ibBase;
-                idx1 = ((DWORD*)pIndices)[startIndex + i + 1] + ibBase;
-                idx2 = ((DWORD*)pIndices)[startIndex + i + 2] + ibBase;
-            }
         }
 
-        // Get vertex positions (position is always first in FVF)
-        D3DXVECTOR3 v0 = *(D3DXVECTOR3*)((BYTE*)pVertices + idx0 * vbStride);
-        D3DXVECTOR3 v1 = *(D3DXVECTOR3*)((BYTE*)pVertices + idx1 * vbStride);
-        D3DXVECTOR3 v2 = *(D3DXVECTOR3*)((BYTE*)pVertices + idx2 * vbStride);
+        // Determine index format
+        D3DINDEXBUFFER_DESC ibDesc;
+        ib->GetDesc(&ibDesc);
+        bool is16Bit = (ibDesc.Format == D3DFMT_INDEX16);
 
-        // Transform to VIEW SPACE first (for distance check)
+        // Read indices and find unique vertex indices
+        UINT indexCount = primCount * 3;
+        CachedMeshGeometry newCache;
+        newCache.is16BitIndices = is16Bit;
+        newCache.indices.reserve(indexCount);
+
+        // Find min/max vertex indices to know range
+        UINT minVertIdx = UINT_MAX, maxVertIdx = 0;
+        for (UINT i = 0; i < indexCount; i++) {
+            UINT vertIdx;
+            if (is16Bit) {
+                vertIdx = ((WORD*)pIndices)[startIndex + i] + ibBase;
+            } else {
+                vertIdx = ((DWORD*)pIndices)[startIndex + i] + ibBase;
+            }
+            newCache.indices.push_back(vertIdx);
+            minVertIdx = std::min(minVertIdx, vertIdx);
+            maxVertIdx = std::max(maxVertIdx, vertIdx);
+        }
+
+        // Read vertex positions for the range we need
+        UINT vertexRange = maxVertIdx - minVertIdx + 1;
+        newCache.positions.resize(vertexRange);
+        for (UINT i = 0; i < vertexRange; i++) {
+            UINT vertIdx = minVertIdx + i;
+            D3DXVECTOR3* pos = (D3DXVECTOR3*)((BYTE*)pVertices + vertIdx * vbStride);
+            newCache.positions[i] = *pos;
+        }
+
+        // Adjust indices to be relative to minVertIdx
+        for (auto& idx : newCache.indices) {
+            idx -= minVertIdx;
+        }
+
+        ib->Unlock();
+        vb->Unlock();
+
+        // Store in cache
+        mMeshCache[cacheKey] = std::move(newCache);
+        cached = &mMeshCache[cacheKey];
+    }
+
+    // Track pixels written
+    int pixelsWritten = 0;
+
+    // Compute transforms
+    D3DXMATRIX worldView = world * view;
+    D3DXMATRIX worldViewProj = worldView * proj;
+
+    const float NEAR_DIST = 0.01f;
+    const float MAX_DIST = 10000.0f;
+
+    UINT mip0Width = mHiZWidth[0];
+    UINT mip0Height = mHiZHeight[0];
+    float* mip0Buffer = mHiZBuffer[0];
+
+    // Rasterize triangles from cached data
+    const auto& positions = cached->positions;
+    const auto& indices = cached->indices;
+    UINT triCount = (UINT)indices.size() / 3;
+
+    for (UINT t = 0; t < triCount; t++) {
+        UINT idx0 = indices[t * 3 + 0];
+        UINT idx1 = indices[t * 3 + 1];
+        UINT idx2 = indices[t * 3 + 2];
+
+        const D3DXVECTOR3& v0 = positions[idx0];
+        const D3DXVECTOR3& v1 = positions[idx1];
+        const D3DXVECTOR3& v2 = positions[idx2];
+
+        // Transform to view space for distance check
         D3DXVECTOR4 vs0, vs1, vs2;
         D3DXVec3Transform(&vs0, &v0, &worldView);
         D3DXVec3Transform(&vs1, &v1, &worldView);
         D3DXVec3Transform(&vs2, &v2, &worldView);
 
-        // Simple rejection: ALL vertices must be within [NEAR_DIST, MAX_DIST]
-        // View space Z is positive looking into screen (D3D convention)
-        // Skip triangles that cross near plane - avoids all clipping complexity
         if (vs0.z < NEAR_DIST || vs1.z < NEAR_DIST || vs2.z < NEAR_DIST) continue;
         if (vs0.z > MAX_DIST  || vs1.z > MAX_DIST  || vs2.z > MAX_DIST)  continue;
 
-        // Now safe to project - no clipping needed, all vertices are in front of camera
+        // Project to clip space
         D3DXVECTOR4 c0, c1, c2;
         D3DXVec3Transform(&c0, &v0, &worldViewProj);
         D3DXVec3Transform(&c1, &v1, &worldViewProj);
         D3DXVec3Transform(&c2, &v2, &worldViewProj);
 
-        // Perspective divide (all w values guaranteed positive now)
+        // Perspective divide
         D3DXVECTOR4 p0 = c0 / c0.w;
         D3DXVECTOR4 p1 = c1 / c1.w;
         D3DXVECTOR4 p2 = c2 / c2.w;
 
-        // Convert to fixed-point screen coordinates (rasterize to mip 0 = half-res)
-        UINT mip0Width = mHiZWidth[0];
-        UINT mip0Height = mHiZHeight[0];
-
+        // Convert to fixed-point screen coordinates
         int fx0 = (int)((p0.x * 0.5f + 0.5f) * mip0Width * 16.0f);
         int fy0 = (int)((1.0f - (p0.y * 0.5f + 0.5f)) * mip0Height * 16.0f);
         float z0 = p0.z;
@@ -234,65 +248,53 @@ int SoftwareOcclusionCuller::rasterizeMesh(
         int fy2 = (int)((1.0f - (p2.y * 0.5f + 0.5f)) * mip0Height * 16.0f);
         float z2 = p2.z;
 
-        // CONSERVATIVE DEPTH: Use max (furthest) depth of triangle vertices
-        // This prevents false occlusions from depth interpolation errors with off-screen vertices
         float conservativeDepth = std::max({z0, z1, z2});
 
-            // Edge function setup
-            int A0 = fy1 - fy2;
-            int B0 = fx2 - fx1;
-            int C0 = fx1 * fy2 - fx2 * fy1;
+        // Edge function setup
+        int A0 = fy1 - fy2;
+        int B0 = fx2 - fx1;
+        int C0 = fx1 * fy2 - fx2 * fy1;
 
-            int A1 = fy2 - fy0;
-            int B1 = fx0 - fx2;
-            int C1 = fx2 * fy0 - fx0 * fy2;
+        int A1 = fy2 - fy0;
+        int B1 = fx0 - fx2;
+        int C1 = fx2 * fy0 - fx0 * fy2;
 
-            int A2 = fy0 - fy1;
-            int B2 = fx1 - fx0;
-            int C2 = fx0 * fy1 - fx1 * fy0;
+        int A2 = fy0 - fy1;
+        int B2 = fx1 - fx0;
+        int C2 = fx0 * fy1 - fx1 * fy0;
 
-            // Triangle area (use absolute value - no backface culling for occluders!)
-            int triArea = B2 * A1 - B1 * A2;
-            if (triArea == 0) continue; // Skip degenerate triangles only
-            triArea = abs(triArea); // Accept both front and back faces
+        int triArea = B2 * A1 - B1 * A2;
+        if (triArea == 0) continue;
 
-            float oneOverTriArea = 1.0f / (float)triArea;
+        // Bounding box
+        int minX = std::max(0, std::min({fx0, fx1, fx2}) >> 4);
+        int maxX = std::min((int)mip0Width - 1, std::max({fx0, fx1, fx2}) >> 4);
+        int minY = std::max(0, std::min({fy0, fy1, fy2}) >> 4);
+        int maxY = std::min((int)mip0Height - 1, std::max({fy0, fy1, fy2}) >> 4);
 
-            // Bounding box (clamp to mip 0 resolution)
-            int minX = std::max(0, std::min({fx0, fx1, fx2}) >> 4);
-            int maxX = std::min((int)mip0Width - 1, std::max({fx0, fx1, fx2}) >> 4);
-            int minY = std::max(0, std::min({fy0, fy1, fy2}) >> 4);
-            int maxY = std::min((int)mip0Height - 1, std::max({fy0, fy1, fy2}) >> 4);
+        // Rasterize
+        for (int y = minY; y <= maxY; y++) {
+            int fy = (y << 4) + 8;
+            for (int x = minX; x <= maxX; x++) {
+                int fx = (x << 4) + 8;
 
-            // Rasterize to mip 0 (half-res Hi-Z buffer)
-            float* mip0Buffer = mHiZBuffer[0];
-            for (int y = minY; y <= maxY; y++) {
-                int fy = (y << 4) + 8;
-                for (int x = minX; x <= maxX; x++) {
-                    int fx = (x << 4) + 8;
+                int e0 = A0 * fx + B0 * fy + C0;
+                int e1 = A1 * fx + B1 * fy + C1;
+                int e2 = A2 * fx + B2 * fy + C2;
 
-                    int e0 = A0 * fx + B0 * fy + C0;
-                    int e1 = A1 * fx + B1 * fy + C1;
-                    int e2 = A2 * fx + B2 * fy + C2;
-
-                    // Accept BOTH windings - front faces have all positive, back faces have all negative
-                    bool frontFace = (e0 >= 0 && e1 >= 0 && e2 >= 0);
-                    bool backFace = (e0 <= 0 && e1 <= 0 && e2 <= 0);
-                    if (frontFace || backFace) {
-                        // Use CONSERVATIVE depth (max of vertices) to avoid false occlusions
-                        // Interpolated depth can be wrong when vertices are off-screen
-                        int idx = y * mip0Width + x;
-                        if (conservativeDepth < mip0Buffer[idx]) {
-                            mip0Buffer[idx] = conservativeDepth;
-                            pixelsWritten++;
-                        }
+                bool frontFace = (e0 >= 0 && e1 >= 0 && e2 >= 0);
+                bool backFace = (e0 <= 0 && e1 <= 0 && e2 <= 0);
+                if (frontFace || backFace) {
+                    int idx = y * mip0Width + x;
+                    if (conservativeDepth < mip0Buffer[idx]) {
+                        mip0Buffer[idx] = conservativeDepth;
+                        pixelsWritten++;
                     }
                 }
             }
-    }  // End of triangle loop
+        }
+    }
 
-    ib->Unlock();
-    vb->Unlock();
     return pixelsWritten;
 }
 
@@ -450,6 +452,11 @@ void SoftwareOcclusionCuller::blacklistMesh(IDirect3DVertexBuffer9* vb, IDirect3
 void SoftwareOcclusionCuller::clearBlacklist()
 {
     mBlacklistedMeshes.clear();
+}
+
+void SoftwareOcclusionCuller::clearMeshCache()
+{
+    mMeshCache.clear();
 }
 
 bool SoftwareOcclusionCuller::testBoundingBox(

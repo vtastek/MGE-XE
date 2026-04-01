@@ -356,6 +356,7 @@ void FixedFunctionShader::startRecording() {
                 bboxCache.clear();
             }
             softwareOcclusionCuller.clearBlacklist();
+            softwareOcclusionCuller.clearMeshCache();
             lastWasExterior = isExterior;
         } else if (currentCell != lastPlayerCell) {
             // Any cell change (exterior-to-exterior, interior-to-interior): clear geometry caches
@@ -364,6 +365,7 @@ void FixedFunctionShader::startRecording() {
                 bboxCache.clear();
             }
             softwareOcclusionCuller.clearBlacklist();
+            softwareOcclusionCuller.clearMeshCache();
         }
 
         lastPlayerCell = currentCell;

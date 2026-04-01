@@ -10,6 +10,40 @@
 // Based on Intel Software Occlusion Culling (blog branch)
 // Eliminates GPU→CPU transfer overhead by rasterizing depth on CPU
 
+// Cached mesh geometry for avoiding repeated VB/IB locks
+struct CachedMeshGeometry {
+    std::vector<D3DXVECTOR3> positions;  // Object-space vertex positions
+    std::vector<UINT> indices;           // Triangle indices (for triangle list)
+    bool is16BitIndices;
+};
+
+// Key for mesh cache lookup
+struct MeshCacheKey {
+    void* vb;
+    void* ib;
+    UINT vbOffset;
+    UINT vbStride;
+    UINT startIndex;
+    UINT primCount;
+
+    bool operator==(const MeshCacheKey& other) const {
+        return vb == other.vb && ib == other.ib &&
+               vbOffset == other.vbOffset && vbStride == other.vbStride &&
+               startIndex == other.startIndex && primCount == other.primCount;
+    }
+};
+
+struct MeshCacheKeyHash {
+    std::size_t operator()(const MeshCacheKey& k) const {
+        size_t h = std::hash<void*>{}(k.vb);
+        h ^= std::hash<void*>{}(k.ib) << 1;
+        h ^= std::hash<UINT>{}(k.vbOffset) << 2;
+        h ^= std::hash<UINT>{}(k.startIndex) << 3;
+        h ^= std::hash<UINT>{}(k.primCount) << 4;
+        return h;
+    }
+};
+
 class SoftwareOcclusionCuller {
 public:
     // Simple mesh identifier for blacklist (vb + ib pointers uniquely identify a mesh)
@@ -84,6 +118,9 @@ public:
     void blacklistMesh(IDirect3DVertexBuffer9* vb, IDirect3DIndexBuffer9* ib);
     void clearBlacklist();
 
+    // Mesh geometry cache: avoids VB/IB locks after first access
+    void clearMeshCache();
+
     // Mesh LOD cache for simplified geometry (public for pre-caching during recording)
     MeshLODCache mLODCache;
 
@@ -110,6 +147,9 @@ private:
 
     // Blacklist of inefficient meshes (thin objects with poor pixel coverage ratio)
     std::unordered_set<MeshID, MeshIDHash> mBlacklistedMeshes;
+
+    // Cache of mesh geometry to avoid VB/IB locks after first access
+    std::unordered_map<MeshCacheKey, CachedMeshGeometry, MeshCacheKeyHash> mMeshCache;
 
     // ImGui visualization texture
     IDirect3DTexture9* mHiZVisualizationTexture;
