@@ -1026,6 +1026,27 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                             realDevice->SetRenderState(D3DRS_ALPHAFUNC, val);
                         if (tracker.getRenderState(D3DRS_CULLMODE, &val))
                             realDevice->SetRenderState(D3DRS_CULLMODE, val);
+                        if (tracker.getRenderState(D3DRS_FOGENABLE, &val))
+                            realDevice->SetRenderState(D3DRS_FOGENABLE, val);
+                        if (tracker.getRenderState(D3DRS_LIGHTING, &val))
+                            realDevice->SetRenderState(D3DRS_LIGHTING, val);
+                        if (tracker.getRenderState(D3DRS_AMBIENTMATERIALSOURCE, &val))
+                            realDevice->SetRenderState(D3DRS_AMBIENTMATERIALSOURCE, val);
+                        if (tracker.getRenderState(D3DRS_DIFFUSEMATERIALSOURCE, &val))
+                            realDevice->SetRenderState(D3DRS_DIFFUSEMATERIALSOURCE, val);
+                        // Texture stage states for UI (stage 0)
+                        if (tracker.getTextureStageState(0, D3DTSS_COLOROP, &val))
+                            realDevice->SetTextureStageState(0, D3DTSS_COLOROP, val);
+                        if (tracker.getTextureStageState(0, D3DTSS_COLORARG1, &val))
+                            realDevice->SetTextureStageState(0, D3DTSS_COLORARG1, val);
+                        if (tracker.getTextureStageState(0, D3DTSS_COLORARG2, &val))
+                            realDevice->SetTextureStageState(0, D3DTSS_COLORARG2, val);
+                        if (tracker.getTextureStageState(0, D3DTSS_ALPHAOP, &val))
+                            realDevice->SetTextureStageState(0, D3DTSS_ALPHAOP, val);
+                        if (tracker.getTextureStageState(0, D3DTSS_ALPHAARG1, &val))
+                            realDevice->SetTextureStageState(0, D3DTSS_ALPHAARG1, val);
+                        if (tracker.getTextureStageState(0, D3DTSS_ALPHAARG2, &val))
+                            realDevice->SetTextureStageState(0, D3DTSS_ALPHAARG2, val);
                         if (tracker.getFVF(&val))
                             realDevice->SetFVF(val);
                         for (auto& [index, enable] : tracker.lightEnables)
