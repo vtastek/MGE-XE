@@ -1743,8 +1743,10 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
 
     // Per-object light packing for mode 3 (saturated Morrowind assignment)
     // Each mode 3 object gets only its spatially-nearby lights packed into the texture.
+    // NOTE: Only run for Scene 0 - runs once per frame, not 3x per scene.
+    // Scene 1/2 use fixed-function 8-light path, not mode 3 per-object lights.
     int numSceneLights = (int)DistantLand::sceneLights.size();
-    {
+    if (sceneCount == 0) {
         MGE_ZoneScopedN("replay_PerObjectLightPack");
         const size_t numCallsForPack = recCalls.size();
         perObjectLightInfo.resize(numCallsForPack);

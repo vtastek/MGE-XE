@@ -996,8 +996,50 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                     } else {
                         // Async toggle OFF: run GPU phase on main thread
                         FixedFunctionShader::renderFullFrameAsync();
+                        // Clear depth so UI isn't depth-tested against 3D geometry
+                        realDevice->Clear(0, NULL, D3DCLEAR_ZBUFFER, 0, 1.0f, 0);
                     }
                     FixedFunctionShader::transitionTo(PhaseTransition::GpuExit);
+                    // Apply tracked state so UI sees what MW expects (sync mode only).
+                    // MUST be after GpuExit: GpuExit.txt sets alphaBlendEnable=0 which would overwrite.
+                    // MW's pre-BeginScene(UI) state calls are suppressed during recording.
+                    if (!ImGuiManager::GetAsyncGpuThread()) {
+                        auto& tracker = g_cmdBufferSet.stateTracker();
+                        DWORD val;
+                        if (tracker.getRenderState(D3DRS_ALPHABLENDENABLE, &val))
+                            realDevice->SetRenderState(D3DRS_ALPHABLENDENABLE, val);
+                        if (tracker.getRenderState(D3DRS_SRCBLEND, &val))
+                            realDevice->SetRenderState(D3DRS_SRCBLEND, val);
+                        if (tracker.getRenderState(D3DRS_DESTBLEND, &val))
+                            realDevice->SetRenderState(D3DRS_DESTBLEND, val);
+                        if (tracker.getRenderState(D3DRS_ZENABLE, &val))
+                            realDevice->SetRenderState(D3DRS_ZENABLE, val);
+                        if (tracker.getRenderState(D3DRS_ZWRITEENABLE, &val))
+                            realDevice->SetRenderState(D3DRS_ZWRITEENABLE, val);
+                        if (tracker.getRenderState(D3DRS_ZFUNC, &val))
+                            realDevice->SetRenderState(D3DRS_ZFUNC, val);
+                        if (tracker.getRenderState(D3DRS_ALPHAREF, &val))
+                            realDevice->SetRenderState(D3DRS_ALPHAREF, val);
+                        if (tracker.getRenderState(D3DRS_ALPHATESTENABLE, &val))
+                            realDevice->SetRenderState(D3DRS_ALPHATESTENABLE, val);
+                        if (tracker.getRenderState(D3DRS_ALPHAFUNC, &val))
+                            realDevice->SetRenderState(D3DRS_ALPHAFUNC, val);
+                        if (tracker.getRenderState(D3DRS_CULLMODE, &val))
+                            realDevice->SetRenderState(D3DRS_CULLMODE, val);
+                        if (tracker.getFVF(&val))
+                            realDevice->SetFVF(val);
+                        for (auto& [index, enable] : tracker.lightEnables)
+                            realDevice->LightEnable(index, enable);
+                        D3DMATRIX mat;
+                        if (tracker.getTransform(D3DTS_VIEW, &mat))
+                            realDevice->SetTransform(D3DTS_VIEW, &mat);
+                        if (tracker.getTransform(D3DTS_PROJECTION, &mat))
+                            realDevice->SetTransform(D3DTS_PROJECTION, &mat);
+                        if (tracker.getTransform(D3DTS_WORLD, &mat))
+                            realDevice->SetTransform(D3DTS_WORLD, &mat);
+                        realDevice->SetVertexShader(NULL);
+                        realDevice->SetPixelShader(NULL);
+                    }
                 } else if (isHLSLActive()) {
                     FixedFunctionShader::transitionTo(PhaseTransition::GpuExit);
                 } else {
