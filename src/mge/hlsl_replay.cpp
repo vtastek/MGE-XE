@@ -466,6 +466,31 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     // Process any completed async shader compilations
     processAsyncCompletions();
 
+    // STRESS TEST: Corrupt device state before HLSL rendering
+    // If visual output is unchanged, proves renderMorrowindHLSL_Internal properly sets all required states
+    if (ImGuiManager::GetStressCorruptState() && !cmdBuf) {
+        device->SetRenderState(D3DRS_ZENABLE, FALSE);
+        device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+        device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+        device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+        device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ZERO);
+        device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ZERO);
+        device->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
+        device->SetRenderState(D3DRS_ALPHAREF, 255);
+        device->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATER);
+        device->SetRenderState(D3DRS_FOGENABLE, TRUE);
+        device->SetRenderState(D3DRS_LIGHTING, FALSE);
+        device->SetRenderState(D3DRS_SPECULARENABLE, FALSE);
+        device->SetRenderState(D3DRS_AMBIENTMATERIALSOURCE, D3DMCS_MATERIAL);
+        device->SetRenderState(D3DRS_DIFFUSEMATERIALSOURCE, D3DMCS_MATERIAL);
+        device->SetVertexShader(nullptr);
+        device->SetPixelShader(nullptr);
+        device->SetFVF(D3DFVF_XYZ);  // Wrong FVF
+        // Set wrong texture stage states
+        device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_DISABLE);
+        device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+    }
+
     HLSLShader hlslShader;
 
     // Get ShaderKey with texture suffix detection

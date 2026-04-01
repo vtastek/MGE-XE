@@ -152,6 +152,13 @@ int ImGuiManager::cmdStageUI = 0;
 bool ImGuiManager::debugKeysEnabled = false;
 bool ImGuiManager::handoverLogging = false;
 
+// Stress testing toggles
+bool ImGuiManager::stressCorruptState = false;
+bool ImGuiManager::stressValidateTracker = false;
+bool ImGuiManager::stressVerifyRestore = false;
+bool ImGuiManager::stressPoisonBuffers = false;
+bool ImGuiManager::stressAsyncDelay = false;
+
 // Hi-Z single object visualization mode
 bool ImGuiManager::hiZSingleObjectMode = false;
 int ImGuiManager::hiZSingleObjectIndex = 0;
@@ -568,6 +575,19 @@ void ImGuiManager::RenderDebugInterface() {
             ImGui::Text("  Pre:%d S0:%d Inter:%d S1/2:%d UI:%d",
                 cmdStagePreScene, cmdStageScene0, cmdStageInterScene, cmdStageScene1, cmdStageUI);
         }
+
+        ImGui::Separator();
+        ImGui::Text("Stress Tests (Sync Path Validation)");
+        ImGui::Checkbox("Corrupt Device State", &stressCorruptState);
+        ImGui::SetItemTooltip("Inject wrong states before HLSL rendering - visual should be identical (proves state is properly set)");
+        ImGui::Checkbox("Validate Tracker", &stressValidateTracker);
+        ImGui::SetItemTooltip("Compare MWStateTracker vs device state at key points - logs mismatches");
+        ImGui::Checkbox("Verify Restore", &stressVerifyRestore);
+        ImGui::SetItemTooltip("Verify state restoration after GpuExit - logs any mismatches");
+        ImGui::Checkbox("Poison Buffers", &stressPoisonBuffers);
+        ImGui::SetItemTooltip("Zero old buffer after swap to catch N-1/N-2 confusion bugs");
+        ImGui::Checkbox("Async Delay Sim", &stressAsyncDelay);
+        ImGui::SetItemTooltip("Insert artificial delays to simulate async race conditions");
 
         ImGui::Separator();
         ImGui::Text("Press G to toggle this interface");

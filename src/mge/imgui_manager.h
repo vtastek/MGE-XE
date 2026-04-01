@@ -422,7 +422,22 @@ private:
 
     // Scene handover logging (particle bug diagnostics)
     static bool handoverLogging;          // Log state at Scene 0/1/2 boundaries - default false
+
+    // Stress testing toggles (sync path validation)
+    static bool stressCorruptState;       // Inject bad states before HLSL rendering - default false
+    static bool stressValidateTracker;    // Validate tracker matches device state - default false
+    static bool stressVerifyRestore;      // Verify state restoration after GpuExit - default false
+    static bool stressPoisonBuffers;      // Poison old buffers to catch N-1/N-2 bugs - default false
+    static bool stressAsyncDelay;         // Simulate async delays for race detection - default false
+
 public:
     static bool GetHandoverLogging() { return handoverLogging; }
     static void SetHandoverLogging(bool v) { handoverLogging = v; }
+
+    // Stress test getters
+    static bool GetStressCorruptState() { return stressCorruptState; }
+    static bool GetStressValidateTracker() { return stressValidateTracker; }
+    static bool GetStressVerifyRestore() { return stressVerifyRestore; }
+    static bool GetStressPoisonBuffers() { return stressPoisonBuffers; }
+    static bool GetStressAsyncDelay() { return stressAsyncDelay; }
 };

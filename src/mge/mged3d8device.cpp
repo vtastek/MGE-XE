@@ -1095,6 +1095,56 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                             realDevice->SetTransform(D3DTS_WORLD, &mat);
                         realDevice->SetVertexShader(NULL);
                         realDevice->SetPixelShader(NULL);
+
+                        // STRESS TEST: Verify state restoration after GpuExit
+                        if (ImGuiManager::GetStressVerifyRestore()) {
+                            DWORD expected, actual;
+                            bool mismatch = false;
+                            #define VERIFY_RS(state) \
+                                if (tracker.getRenderState(state, &expected)) { \
+                                    realDevice->GetRenderState(state, &actual); \
+                                    if (expected != actual) { \
+                                        LOG::logline("!! RESTORE FAILED: " #state " expected=%d actual=%d", expected, actual); \
+                                        mismatch = true; \
+                                    } \
+                                }
+                            VERIFY_RS(D3DRS_ALPHABLENDENABLE);
+                            VERIFY_RS(D3DRS_SRCBLEND);
+                            VERIFY_RS(D3DRS_DESTBLEND);
+                            VERIFY_RS(D3DRS_ZENABLE);
+                            VERIFY_RS(D3DRS_ZWRITEENABLE);
+                            VERIFY_RS(D3DRS_ZFUNC);
+                            VERIFY_RS(D3DRS_ALPHAREF);
+                            VERIFY_RS(D3DRS_ALPHATESTENABLE);
+                            VERIFY_RS(D3DRS_ALPHAFUNC);
+                            VERIFY_RS(D3DRS_CULLMODE);
+                            VERIFY_RS(D3DRS_FOGENABLE);
+                            VERIFY_RS(D3DRS_LIGHTING);
+                            VERIFY_RS(D3DRS_AMBIENTMATERIALSOURCE);
+                            VERIFY_RS(D3DRS_DIFFUSEMATERIALSOURCE);
+                            #undef VERIFY_RS
+
+                            // Verify texture stage states
+                            #define VERIFY_TSS(stage, state) \
+                                if (tracker.getTextureStageState(stage, state, &expected)) { \
+                                    realDevice->GetTextureStageState(stage, state, &actual); \
+                                    if (expected != actual) { \
+                                        LOG::logline("!! RESTORE FAILED: TSS[%d]." #state " expected=%d actual=%d", stage, expected, actual); \
+                                        mismatch = true; \
+                                    } \
+                                }
+                            VERIFY_TSS(0, D3DTSS_COLOROP);
+                            VERIFY_TSS(0, D3DTSS_COLORARG1);
+                            VERIFY_TSS(0, D3DTSS_COLORARG2);
+                            VERIFY_TSS(0, D3DTSS_ALPHAOP);
+                            VERIFY_TSS(0, D3DTSS_ALPHAARG1);
+                            VERIFY_TSS(0, D3DTSS_ALPHAARG2);
+                            #undef VERIFY_TSS
+
+                            if (mismatch) {
+                                LOG::logline("!! State restoration mismatch detected - check mgexe.log");
+                            }
+                        }
                     }
                 } else if (isHLSLActive()) {
                     FixedFunctionShader::transitionTo(PhaseTransition::GpuExit);

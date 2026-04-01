@@ -408,6 +408,71 @@ void FixedFunctionShader::stopRecordingAndReplay() {
         return;
     }
 
+    // STRESS TEST: Validate tracker matches device state at end of recording
+    // This catches any tracking bugs where tracker diverged from actual device state
+    if (ImGuiManager::GetStressValidateTracker()) {
+        auto& tracker = g_cmdBufferSet.stateTracker();
+        DWORD trackedVal, deviceVal;
+        bool mismatch = false;
+
+        #define VALIDATE_RS(state) \
+            if (tracker.getRenderState(state, &trackedVal)) { \
+                device->GetRenderState(state, &deviceVal); \
+                if (trackedVal != deviceVal) { \
+                    LOG::logline("!! TRACKER MISMATCH: " #state " tracked=%d device=%d", trackedVal, deviceVal); \
+                    mismatch = true; \
+                } \
+            }
+        VALIDATE_RS(D3DRS_ALPHABLENDENABLE);
+        VALIDATE_RS(D3DRS_SRCBLEND);
+        VALIDATE_RS(D3DRS_DESTBLEND);
+        VALIDATE_RS(D3DRS_ZENABLE);
+        VALIDATE_RS(D3DRS_ZWRITEENABLE);
+        VALIDATE_RS(D3DRS_ZFUNC);
+        VALIDATE_RS(D3DRS_ALPHAREF);
+        VALIDATE_RS(D3DRS_ALPHATESTENABLE);
+        VALIDATE_RS(D3DRS_ALPHAFUNC);
+        VALIDATE_RS(D3DRS_CULLMODE);
+        VALIDATE_RS(D3DRS_FOGENABLE);
+        VALIDATE_RS(D3DRS_LIGHTING);
+        VALIDATE_RS(D3DRS_AMBIENTMATERIALSOURCE);
+        VALIDATE_RS(D3DRS_DIFFUSEMATERIALSOURCE);
+        VALIDATE_RS(D3DRS_SPECULARENABLE);
+        VALIDATE_RS(D3DRS_NORMALIZENORMALS);
+        #undef VALIDATE_RS
+
+        // Validate texture stage states
+        #define VALIDATE_TSS(stage, state) \
+            if (tracker.getTextureStageState(stage, state, &trackedVal)) { \
+                device->GetTextureStageState(stage, state, &deviceVal); \
+                if (trackedVal != deviceVal) { \
+                    LOG::logline("!! TRACKER MISMATCH: TSS[%d]." #state " tracked=%d device=%d", stage, trackedVal, deviceVal); \
+                    mismatch = true; \
+                } \
+            }
+        VALIDATE_TSS(0, D3DTSS_COLOROP);
+        VALIDATE_TSS(0, D3DTSS_COLORARG1);
+        VALIDATE_TSS(0, D3DTSS_COLORARG2);
+        VALIDATE_TSS(0, D3DTSS_ALPHAOP);
+        VALIDATE_TSS(0, D3DTSS_ALPHAARG1);
+        VALIDATE_TSS(0, D3DTSS_ALPHAARG2);
+        #undef VALIDATE_TSS
+
+        // Validate FVF
+        DWORD trackedFVF, deviceFVF;
+        if (tracker.getFVF(&trackedFVF)) {
+            device->GetFVF(&deviceFVF);
+            if (trackedFVF != deviceFVF) {
+                LOG::logline("!! TRACKER MISMATCH: FVF tracked=%08X device=%08X", trackedFVF, deviceFVF);
+                mismatch = true;
+            }
+        }
+
+        if (mismatch) {
+            LOG::logline("!! State tracker validation failed at end of recording");
+        }
+    }
+
     isRecording = false;
 
     // Capture device state NOW — this is Morrowind's last mesh state (correct end-of-Scene-0 state).

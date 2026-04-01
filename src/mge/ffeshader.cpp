@@ -67,6 +67,7 @@ int FixedFunctionShader::prepBuffer = 1;
 int FixedFunctionShader::renderBuffer = 2;
 bool FixedFunctionShader::n1Ready = false;   // Set true after first frame swap
 bool FixedFunctionShader::n2Ready = false;   // Set true after second frame swap
+int FixedFunctionShader::swapCount = 0;      // Track swaps for warm-up
 
 // Pipeline phase tracking for GPU call separation verification
 FixedFunctionShader::PipelinePhase FixedFunctionShader::currentPhase = FixedFunctionShader::PipelinePhase::Idle;
@@ -1847,6 +1848,22 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
 // Triple buffer rotation at Present()
 // Rotation: Recording(N) -> Prep(N-1) -> Render(N-2) -> Recording(cleared)
 void FixedFunctionShader::swapBuffers() {
+    // STRESS TEST: Poison old buffer BEFORE swap to catch N-1/N-2 confusion
+    // If rendering uses stale data, it will produce obviously wrong results
+    if (ImGuiManager::GetStressPoisonBuffers()) {
+        auto& oldBuf = frameBuffers[renderBuffer];  // Just finished rendering (will become new recording)
+        // Poison matrices with NaN to catch any stale usage
+        memset(&oldBuf.view, 0xFF, sizeof(D3DXMATRIX));
+        memset(&oldBuf.proj, 0xFF, sizeof(D3DXMATRIX));
+        memset(&oldBuf.currentView, 0xFF, sizeof(D3DXMATRIX));
+        memset(&oldBuf.currentProj, 0xFF, sizeof(D3DXMATRIX));
+        memset(&oldBuf.shadowViewproj[0], 0xFF, sizeof(D3DXMATRIX));
+        memset(&oldBuf.shadowViewproj[1], 0xFF, sizeof(D3DXMATRIX));
+        memset(&oldBuf.currentShadowViewproj[0], 0xFF, sizeof(D3DXMATRIX));
+        memset(&oldBuf.currentShadowViewproj[1], 0xFF, sizeof(D3DXMATRIX));
+        oldBuf.frameNumber = -9999;  // Obvious sentinel value
+    }
+
     // Rotate indices: render becomes new recording, prep becomes render, recording becomes prep
     int newRecording = renderBuffer;   // Was render (N-2), now recording (N)
     int newPrep = recordingBuffer;     // Was recording (N), now prep (N-1)
@@ -1862,7 +1879,6 @@ void FixedFunctionShader::swapBuffers() {
     // After first swap, N-1 data is available in prep buffer
     n1Ready = true;
     // After second swap, N-2 data is available in render buffer
-    static int swapCount = 0;
     if (++swapCount >= 2) {
         n2Ready = true;
     }

@@ -763,6 +763,7 @@ public:
     static int renderBuffer;      // Index for frame N-2 (GPU render)
     static bool n1Ready;          // True after first frame completes (N-1 data available)
     static bool n2Ready;          // True after second frame completes (N-2 data available)
+    static int swapCount;         // Track swaps for warm-up (moved from static local)
 
 public:
     // Pipeline phase tracking for GPU call separation verification
