@@ -1035,10 +1035,10 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                         realDevice->Clear(0, NULL, D3DCLEAR_ZBUFFER, 0, 1.0f, 0);
                     }
                     FixedFunctionShader::transitionTo(PhaseTransition::GpuExit);
-                    // Apply tracked state so UI sees what MW expects (sync mode only).
+                    // Apply tracked state so UI sees what MW expects.
                     // MUST be after GpuExit: GpuExit.txt sets alphaBlendEnable=0 which would overwrite.
                     // MW's pre-BeginScene(UI) state calls are suppressed during recording.
-                    if (!ImGuiManager::GetAsyncGpuThread()) {
+                    {
                         auto& tracker = g_cmdBufferSet.stateTracker();
                         DWORD val;
                         if (tracker.getRenderState(D3DRS_ALPHABLENDENABLE, &val))
