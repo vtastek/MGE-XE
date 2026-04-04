@@ -1,9 +1,11 @@
-using System;
-using System.Windows.Forms;
+using MGEgui.DistantLand;
 using SlimDX;
 using SlimDX.Direct3D9;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Windows.Forms;
 using TexCache = System.Collections.Generic.Dictionary<string, SlimDX.Direct3D9.Texture>;
-using MGEgui.DistantLand;
 
 namespace MGEgui.DirectX {
     public class LTEX {
@@ -72,119 +74,147 @@ namespace MGEgui.DirectX {
         }
     }
 
-    class StaticTexCreator {
-        private readonly System.Collections.Generic.List<string> texCache;
-        private readonly int sizeDivisor;
+    class StaticTexCreator
+    {
+        private readonly List<string> texCache;
+        private const int TargetMinDimension = 128;
 
-        public StaticTexCreator(int skipMips) {
-            sizeDivisor = (1 << skipMips);
-            texCache = new System.Collections.Generic.List<string>();
+        public StaticTexCreator(int skipMips)
+        {
+            // skipMips is no longer used as we calculate the target level dynamically
+            texCache = new List<string>();
         }
 
-        public void Dispose() {
+        public void Dispose()
+        {
             texCache.Clear();
         }
 
-        public bool LoadTexture(string path) {
-            if (texCache.Contains(path)) {
-                return true;
-            }
+        public bool LoadTexture(string path)
+        {
+            if (texCache.Contains(path)) return true;
             texCache.Add(path);
 
             byte[] data = MGEgui.DistantLand.BSA.GetTexture(path);
-            if (data == null) {
+            if (data == null || data.Length < 128) return false;
+
+            // Check for DDS Magic Number "DDS "
+            if (data[0] != 0x44 || data[1] != 0x44 || data[2] != 0x53 || data[3] != 0x20)
+            {
+                // If it's not a DDS, we skip it as we cannot slice mips without decoding
                 return false;
             }
 
-            // Work around a loading issue with TGA headers
-            // When ColorMapType == no_palette && ImageType == truecolor, set word ColorMapLength to 0
-            if (data.Length > 6 && data[1] == 0 && (data[2] == 2 || data[2] == 10)) {
-                data[5] = data[6] = 0;
+            // Parse DDS Header (starts at offset 4, magic is 4 bytes)
+            int height = BitConverter.ToInt32(data, 12);
+            int width = BitConverter.ToInt32(data, 16);
+            int pitchOrLinearSize = BitConverter.ToInt32(data, 20);
+            int mipCount = Math.Max(1, BitConverter.ToInt32(data, 28));
+
+            // Pixel Format Info
+            int pfFlags = BitConverter.ToInt32(data, 80);
+            uint fourCC = BitConverter.ToUInt32(data, 84);
+            int bitCount = BitConverter.ToInt32(data, 88);
+
+            // Determine block size for compressed formats
+            int blockSize = 0;
+            bool isCompressed = (pfFlags & 0x4) != 0; // DDPF_FOURCC
+
+            if (isCompressed)
+            {
+                // DXT1 is 8 bytes per block, DXT3/5 are 16 bytes
+                blockSize = (fourCC == 0x31545844) ? 8 : 16; // "DXT1"
+            }
+            else
+            {
+                blockSize = bitCount / 8;
             }
 
-            path = System.IO.Path.ChangeExtension(path, ".dds");
-            ImageInformation imginfo;
-            Format format;
+            if (blockSize == 0) return false;
 
-            try {
-                imginfo = ImageInformation.FromMemory(data);
-            } catch (SlimDXException) {
-                return false;
-            }
- 
-            // Avoid reducing a texture to sizes that aren't DXT block compressible
-            int newWidth = imginfo.Width / sizeDivisor, newHeight = imginfo.Height / sizeDivisor;
-            if (newWidth < 4 || newHeight < 4) {
-                return true;
-            }
+            // Find the mipmap level where the minimum dimension is TargetMinDimension (32)
+            int currentW = width;
+            int currentH = height;
+            int offset = 128; // Header is always 128 bytes
+            int targetMipIndex = 0;
 
-            // Select best compressed DDS format for this texture
-            if (imginfo.Format == Format.Dxt1) {
-                // Mipmaps generate smooth alphas, so any transparency requires DXT3
-                format = isDXT1a(imginfo, data) ? Format.Dxt3 : Format.Dxt1;
-            } else if (imginfo.Format == Format.Dxt3 || imginfo.Format == Format.Dxt5) {
-                format = imginfo.Format;
-            } else if (imginfo.Format == Format.X8R8G8B8) {
-                format = Format.Dxt1;
-            } else {
-                format = Format.Dxt3;
-            }
-
-            // Create distant texture if resized or if format conversion is required
-            if (sizeDivisor > 1 || format != imginfo.Format) {
-                Texture t = null;
-
-                var outputPath = System.IO.Path.Combine(Statics.fn_stattex, path);
-                System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(outputPath));
-
-                try {
-                    if (format == imginfo.Format) {
-                        // Load reduced size texture
-                        t = Texture.FromMemory(DXMain.device, data, newWidth, newHeight, 0, Usage.None, format, Pool.Scratch, Filter.Triangle | Filter.Dither, Filter.Triangle, 0);
-                    } else {
-                        // Recalculate mipmaps
-                        Texture srctex = Texture.FromMemory(DXMain.device, data, newWidth, newHeight, 0, Usage.None, Format.A8B8G8R8, Pool.Scratch, Filter.Triangle | Filter.Dither, Filter.Triangle, 0);
-                        t = new Texture(DXMain.device, newWidth, newHeight, 0, Usage.None, format, Pool.Scratch);
-
-                        srctex.FilterTexture(0, Filter.Triangle | Filter.Srgb);
-                        for (int i = 0; i != t.LevelCount; ++i) {
-                            Surface dest = t.GetSurfaceLevel(i);
-                            Surface src = srctex.GetSurfaceLevel(i);
-                            Surface.FromSurface(dest, src, Filter.Point, 0);
-                            src.Dispose();
-                            dest.Dispose();
-                        }
-
-                        srctex.Dispose();
-                    }
-                    Texture.ToFile(t, outputPath, ImageFileFormat.Dds);
-                    t.Dispose();
-                } catch (SlimDXException) {
-                    if (t != null) {
-                        t.Dispose();
-                    }
-                    return false;
+            for (int i = 0; i < mipCount; i++)
+            {
+                if (Math.Min(currentW, currentH) <= TargetMinDimension)
+                {
+                    targetMipIndex = i;
+                    break;
                 }
+
+                // Calculate size of current mip level to find the start of the next
+                int mipSize;
+                if (isCompressed)
+                {
+                    mipSize = Math.Max(1, (currentW + 3) / 4) * Math.Max(1, (currentH + 3) / 4) * blockSize;
+                }
+                else
+                {
+                    mipSize = currentW * currentH * blockSize;
+                }
+
+                if (offset + mipSize > data.Length) break; // Safety check
+
+                offset += mipSize;
+                targetMipIndex = i;
+                currentW = Math.Max(1, currentW / 2);
+                currentH = Math.Max(1, currentH / 2);
+            }
+
+            // Calculate the size of the specific mip we are extracting
+            int targetMipSize;
+            if (isCompressed)
+            {
+                targetMipSize = Math.Max(1, (currentW + 3) / 4) * Math.Max(1, (currentH + 3) / 4) * blockSize;
+            }
+            else
+            {
+                targetMipSize = currentW * currentH * blockSize;
+            }
+
+            // Create the sliced DDS file
+            var outputPath = Path.Combine(Statics.fn_stattex, Path.ChangeExtension(path, ".dds"));
+            Directory.CreateDirectory(Path.GetDirectoryName(outputPath));
+
+            try
+            {
+                using (FileStream fs = new FileStream(outputPath, FileMode.Create, FileAccess.Write))
+                {
+                    // 1. Write original Header (128 bytes)
+                    byte[] header = new byte[128];
+                    Array.Copy(data, 0, header, 0, 128);
+
+                    // 2. Modify Header for the new dimensions and single mipmap
+                    byte[] hHeight = BitConverter.GetBytes(currentH);
+                    byte[] hWidth = BitConverter.GetBytes(currentW);
+                    byte[] hMips = BitConverter.GetBytes(1);
+                    byte[] hCaps = BitConverter.GetBytes(0x1000); // DDSCAPS_TEXTURE only, remove Mipmap/Complex flags
+
+                    Array.Copy(hHeight, 0, header, 12, 4);
+                    Array.Copy(hWidth, 0, header, 16, 4);
+                    Array.Copy(hMips, 0, header, 28, 4);
+                    Array.Copy(hCaps, 0, header, 108, 4);
+
+                    // Update Pitch/LinearSize for the new mip
+                    byte[] hLinear = BitConverter.GetBytes(targetMipSize);
+                    Array.Copy(hLinear, 0, header, 20, 4);
+
+                    fs.Write(header, 0, 128);
+
+                    // 3. Write sliced mip data
+                    fs.Write(data, offset, Math.Min(targetMipSize, data.Length - offset));
+                }
+            }
+            catch (IOException)
+            {
+                return false;
             }
 
             return true;
-        }
-
-        private bool isDXT1a(ImageInformation imginfo, byte[] data) {
-            int blocks = (imginfo.Width * imginfo.Height) >> 4;
-
-            for (int i = 0; i != blocks; ++i) {
-                int k = 128 + 8 * i;
-                uint c0 = (uint)(data[k + 0] | (data[k + 1] << 8));
-                uint c1 = (uint)(data[k + 2] | (data[k + 3] << 8));
-                uint b = (uint)(data[k + 4] | (data[k + 5] << 8) | (data[k + 6] << 16) | (data[k + 7] << 24));
-
-                if (c0 <= c1 && ((b & 0x55555555) & (b >> 1)) != 0) {
-                    return true;
-                }
-            }
-
-            return false;
         }
     }
 
