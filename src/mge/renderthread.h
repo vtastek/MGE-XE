@@ -61,6 +61,9 @@ private:
 
     IDirect3DDevice9* device = nullptr;
 
+    // Per-object light texture - owned by RenderThread to avoid race with main thread
+    IDirect3DTexture9* texPerObjectLightData = nullptr;
+
     void workerLoop();
 
     void executeRenderStage0();
@@ -85,6 +88,10 @@ public:
     bool isComplete() const;
     bool isPending() const { return !isComplete(); }
     bool isRunning() const { return thread.joinable(); }
+
+    // Per-object light texture accessors - texture owned by RenderThread for thread safety
+    IDirect3DTexture9* getPerObjectLightTexture() { return texPerObjectLightData; }
+    void setPerObjectLightTexture(IDirect3DTexture9* tex) { texPerObjectLightData = tex; }
 };
 
 extern RenderThread* g_renderThread;

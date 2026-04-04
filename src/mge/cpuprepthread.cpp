@@ -2,8 +2,11 @@
 #include "cpuprepthread.h"
 #include "ffeshader.h"
 #include "mged3d8device.h"
+#include "imgui_manager.h"
 #include "support/log.h"
 #include "mge_tracy.h"
+#include <thread>
+#include <chrono>
 
 CpuPrepThread* g_cpuPrepThread = nullptr;
 
@@ -161,4 +164,9 @@ void CpuPrepThread::executePrepareFrame(const D3DXMATRIX& view, const D3DXMATRIX
 
     // Mark buffer ready for GPU
     fb.state = FixedFunctionShader::BufferState::ReadyToRender;
+
+    // Stress test: simulate slow CPU prep to catch race conditions
+    if (ImGuiManager::GetStressAsyncDelay()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    }
 }

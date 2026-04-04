@@ -353,7 +353,7 @@ IDirect3DBaseTexture9* FixedFunctionShader::savedOriginalDetailTexture = nullptr
 // Per-object light packing for mode 3
 std::vector<FixedFunctionShader::PerObjectLightInfo> FixedFunctionShader::perObjectLightInfo;
 float FixedFunctionShader::perObjectTexelSize = 0.0f;
-IDirect3DTexture9* FixedFunctionShader::texPerObjectLightData = nullptr;
+// Note: texPerObjectLightData moved to RenderThread for thread safety
 
 SRWLOCK FixedFunctionShader::hlslCacheLock = SRWLOCK_INIT;
 HANDLE FixedFunctionShader::precacheThread = nullptr;
@@ -1989,11 +1989,7 @@ void FixedFunctionShader::release() {
     // Reset material state cache
     materialCache.reset();
 
-    // Clean up per-object light texture
-    if (texPerObjectLightData) {
-        texPerObjectLightData->Release();
-        texPerObjectLightData = nullptr;
-    }
+    // Note: texPerObjectLightData cleanup moved to RenderThread::stop()
 }
 
 void FixedFunctionShader::resetHLSLCaches() {

@@ -528,7 +528,7 @@ private:
     };
     static std::vector<PerObjectLightInfo> perObjectLightInfo;
     static float perObjectTexelSize;  // 1/totalTexels, computed once per frame
-    static IDirect3DTexture9* texPerObjectLightData;  // Per-object packed light texture
+    // Note: texPerObjectLightData moved to RenderThread for thread safety
 
 
     // Async compilation system

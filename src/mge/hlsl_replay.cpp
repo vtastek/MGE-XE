@@ -331,8 +331,9 @@ void FixedFunctionShader::bindShaderTextures(const ShaderKey& sk, const Rendered
 
     // Slot 5: Light data texture (for texture-based point lighting)
     // Per-object packed texture takes priority (mode 3 spatial query)
-    if (texPerObjectLightData) {
-        setCachedTexture(device, 5, texPerObjectLightData);
+    IDirect3DTexture9* perObjTex = g_renderThread ? g_renderThread->getPerObjectLightTexture() : nullptr;
+    if (perObjTex) {
+        setCachedTexture(device, 5, perObjTex);
     } else if (DistantLand::texLightData) {
         setCachedTexture(device, 5, DistantLand::texLightData);
     }
@@ -420,8 +421,9 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
 
     // Immediate path for Scene 1/2 (particles/hands) and fallback when recording disabled.
     // Uses game's built-in 8 lights via lightrs, but needs shadow matrices computed.
-    if (!ImGuiManager::GetEnableImmediateRendering()) {
-        return;  // Skip immediate rendering if disabled
+    // BLOCKED when async GPU is active - main thread must not touch device during recording
+    if (!ImGuiManager::GetEnableImmediateRendering() || ImGuiManager::GetAsyncGpuThread()) {
+        return;  // Skip immediate rendering if disabled or async mode active
     }
 
     // Debug: Log device state for Scene 1/2 immediate draws (first few per frame)
@@ -464,7 +466,10 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
 void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, DWORD dirtyFlags, int callIndex, D3DCommandBuffer* cmdBuf, const DeviceStateSnapshot* capturedState, const HLSLRecordedCall* replayCall) {
 
     // Process any completed async shader compilations
-    processAsyncCompletions();
+    // Skip when on GPU thread (cmdBuf != null) to avoid race on pendingCompilations
+    if (!cmdBuf) {
+        processAsyncCompletions();
+    }
 
     // STRESS TEST: Corrupt device state before HLSL rendering
     // If visual output is unchanged, proves renderMorrowindHLSL_Internal properly sets all required states
@@ -1871,41 +1876,58 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
         int totalTexels = currentTexelOffset;
         perObjectTexelSize = totalTexels > 0 ? 1.0f / totalTexels : 0.0f;
 
-        // Upload packed light data to per-object texture
-        if (totalTexels > 0) {
+        // Upload packed light data to per-object texture (owned by RenderThread for thread safety)
+        if (totalTexels > 0 && g_renderThread) {
+            IDirect3DTexture9* tex = g_renderThread->getPerObjectLightTexture();
+
             // Create or resize texture if needed
-            if (!texPerObjectLightData) {
+            if (!tex) {
                 HRESULT hr = device->CreateTexture(
                     totalTexels, 1, 1, 0,
                     D3DFMT_A32B32G32R32F, D3DPOOL_MANAGED,
-                    &texPerObjectLightData, nullptr);
+                    &tex, nullptr);
                 if (FAILED(hr)) {
                     LOG::logline("!! Failed to create per-object light texture (hr=0x%X)", hr);
-                    texPerObjectLightData = nullptr;
+                    tex = nullptr;
                 }
+                g_renderThread->setPerObjectLightTexture(tex);
             } else {
                 D3DSURFACE_DESC desc;
-                texPerObjectLightData->GetLevelDesc(0, &desc);
-                if (desc.Width != (UINT)totalTexels) {
-                    texPerObjectLightData->Release();
-                    HRESULT hr = device->CreateTexture(
+                HRESULT hr = tex->GetLevelDesc(0, &desc);
+                if (FAILED(hr)) {
+                    // Texture became invalid (D3D threading issue) - release and recreate
+                    LOG::logline("!! texPerObjectLightData->GetLevelDesc failed (hr=0x%X), recreating", hr);
+                    tex->Release();
+                    tex = nullptr;
+                    hr = device->CreateTexture(
                         totalTexels, 1, 1, 0,
                         D3DFMT_A32B32G32R32F, D3DPOOL_MANAGED,
-                        &texPerObjectLightData, nullptr);
+                        &tex, nullptr);
+                    if (FAILED(hr)) {
+                        LOG::logline("!! Failed to recreate per-object light texture (hr=0x%X)", hr);
+                    }
+                    g_renderThread->setPerObjectLightTexture(tex);
+                } else if (desc.Width != (UINT)totalTexels) {
+                    tex->Release();
+                    hr = device->CreateTexture(
+                        totalTexels, 1, 1, 0,
+                        D3DFMT_A32B32G32R32F, D3DPOOL_MANAGED,
+                        &tex, nullptr);
                     if (FAILED(hr)) {
                         LOG::logline("!! Failed to resize per-object light texture (hr=0x%X)", hr);
-                        texPerObjectLightData = nullptr;
+                        tex = nullptr;
                     }
+                    g_renderThread->setPerObjectLightTexture(tex);
                 }
             }
 
-            if (texPerObjectLightData) {
+            if (tex) {
                 D3DLOCKED_RECT locked;
-                if (SUCCEEDED(texPerObjectLightData->LockRect(0, &locked, nullptr, 0))) {
+                if (SUCCEEDED(tex->LockRect(0, &locked, nullptr, 0))) {
                     memcpy(locked.pBits, packedLightData.data(), totalTexels * 4 * sizeof(float));
-                    texPerObjectLightData->UnlockRect(0);
+                    tex->UnlockRect(0);
                 }
-                device->SetTexture(5, texPerObjectLightData);
+                device->SetTexture(5, tex);
             }
         }
 

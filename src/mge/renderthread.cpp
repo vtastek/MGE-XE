@@ -2,9 +2,12 @@
 #include "renderthread.h"
 #include "distantland.h"
 #include "ffeshader.h"
+#include "imgui_manager.h"
 #include "support/log.h"
 #include "mge_tracy.h"
 #include <atomic>
+#include <thread>
+#include <chrono>
 
 // Device ownership flag — set by render thread, checked by main thread for race detection
 extern std::atomic<bool> g_renderThreadOwnsDevice;
@@ -51,6 +54,13 @@ void RenderThread::stop() {
     workAvailable.notify_one();
 
     thread.join();
+
+    // Clean up per-object light texture
+    if (texPerObjectLightData) {
+        texPerObjectLightData->Release();
+        texPerObjectLightData = nullptr;
+    }
+
     device = nullptr;
 
     LOG::logline("-- RenderThread stopped");
@@ -99,6 +109,10 @@ void RenderThread::workerLoop() {
                 g_renderThreadOwnsDevice.store(true, std::memory_order_release);
                 executeFullFrame(work.bufferIndex);
                 g_renderThreadOwnsDevice.store(false, std::memory_order_release);
+                // Stress test: simulate slow GPU to catch race conditions
+                if (ImGuiManager::GetStressAsyncDelay()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                }
                 break;
             case WorkType::Shutdown:
             case WorkType::None:

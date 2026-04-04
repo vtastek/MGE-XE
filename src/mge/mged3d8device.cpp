@@ -169,9 +169,12 @@ static inline bool shouldSuppressMWState() {
     if (!ImGuiManager::GetStateSuppressionEnabled()) {
         return false;
     }
-    // Suppress during Scene 0, 1, 2 HLSL recording
-    // Scene -1 calls (viewport, clear, transforms) are NOT suppressed — they're write-only
-    // setup with no draw calls until recording starts, so the RT race is benign.
+    // TRUE ASYNC: Suppress ALL device calls when GPU thread owns device
+    // This covers scene -1 setup, scene 0/1/2 recording, everything
+    if (ImGuiManager::GetAsyncGpuThread() && g_renderThreadOwnsDevice.load(std::memory_order_acquire)) {
+        return true;
+    }
+    // SYNC: Suppress during Scene 0, 1, 2 HLSL recording only
     return isHLSLActive()
         && FixedFunctionShader::getIsRecording()
         && g_scene.sceneCount <= 2;
@@ -618,10 +621,25 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         g_safeZoneStart = std::chrono::high_resolution_clock::now();
         MGE_TracyMessage("RT_SafeZone_START", 17);
 
-        // Phase 2: Async CPU Prep - submit PrepareFrame async at Present().
-        // Main thread records frame N while CPU prep thread processes frame N-1.
-        // GPU work is submitted synchronously at UI BeginScene after prep completes.
+        // Phase 3: True Async Overlap - submit both CPU prep and GPU work at Present().
+        // Main thread records frame N while:
+        //   - CPU prep thread processes frame N-1
+        //   - GPU thread renders frame N-2
         if (ImGuiManager::GetAsyncGpuThread() && isHLSLActive() && g_cpuPrepThread && g_cpuPrepThread->isRunning()) {
+            // Wait for previous CPU prep to complete before starting GPU work
+            // This ensures render buffer (N-2) is in ReadyToRender state
+            {
+                MGE_ZoneScopedN("WaitPrevCpuPrep");
+                g_cpuPrepThread->waitForCompletion();
+            }
+            // Submit GPU work async - N-2 buffer now ready, runs in parallel with recording
+            if (g_renderThread && g_renderThread->isRunning() && FixedFunctionShader::isN2Ready()) {
+                RenderThread::SceneWork gpuWork;
+                gpuWork.type = RenderThread::WorkType::RenderFullFrame;
+                g_renderThread->submitWork(std::move(gpuWork), false);  // waitNow=false — async!
+                MGE_TracyMessage("RT_GpuSubmit", 12);
+            }
+            // Submit CPU prep for current frame (N-1) async
             if (FixedFunctionShader::isN1Ready()) {
                 auto& prepBuf = FixedFunctionShader::getPrepBuffer();
                 CpuPrepThread::PrepWork work;
@@ -638,7 +656,10 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         FixedFunctionShader::resetRecordingCompletedFlag();
 
         // Reset HLSL texture caches at frame boundary to prevent stale texture pointers
-        FixedFunctionShader::resetHLSLCaches();
+        // Skip when async GPU is active - GPU thread handles its own cache reset and may still be using resources
+        if (!ImGuiManager::GetAsyncGpuThread()) {
+            FixedFunctionShader::resetHLSLCaches();
+        }
     }
 
     MGE_FrameMark;  // Mark frame boundary at the very end of Present()
@@ -954,80 +975,19 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                     if (ImGuiManager::GetAsyncGpuThread() && g_cpuPrepThread && g_cpuPrepThread->isRunning()
                         && g_renderThread && g_renderThread->isRunning()
                         && FixedFunctionShader::isN2Ready()) {  // Wait for 2-frame warm-up
-                        // Phase 2: Wait for async CPU prep to complete
+                        // Phase 3: Wait for async work submitted at Present()
+                        // GPU has been running in parallel with main thread recording
                         {
                             MGE_ZoneScopedN("WaitForCpuPrepThread");
                             g_cpuPrepThread->waitForCompletion();
                             MGE_TracyMessage("CPT_PrepComplete", 15);
                         }
-                        // Now submit GPU work synchronously (prep already done)
                         {
-                            MGE_ZoneScopedN("SyncGpuWork");
-                            RenderThread::SceneWork work;
-                            work.type = RenderThread::WorkType::RenderFullFrame;
-                            g_renderThread->submitWork(std::move(work), true);  // waitNow=true — sync!
+                            MGE_ZoneScopedN("WaitForGpuWork");
+                            g_renderThread->waitForCompletion();
                             MGE_TracyMessage("RT_GpuComplete", 14);
                         }
-
-                        // State fix: render thread restored its own state block.
-                        // Apply CURRENT frame's tracked state so UI sees what MW expects.
-                        auto& tracker = g_cmdBufferSet.stateTracker();
-                        DWORD val;
-                        if (tracker.getRenderState(D3DRS_ALPHABLENDENABLE, &val))
-                            realDevice->SetRenderState(D3DRS_ALPHABLENDENABLE, val);
-                        if (tracker.getRenderState(D3DRS_SRCBLEND, &val))
-                            realDevice->SetRenderState(D3DRS_SRCBLEND, val);
-                        if (tracker.getRenderState(D3DRS_DESTBLEND, &val))
-                            realDevice->SetRenderState(D3DRS_DESTBLEND, val);
-                        if (tracker.getRenderState(D3DRS_ZENABLE, &val))
-                            realDevice->SetRenderState(D3DRS_ZENABLE, val);
-                        if (tracker.getRenderState(D3DRS_ZWRITEENABLE, &val))
-                            realDevice->SetRenderState(D3DRS_ZWRITEENABLE, val);
-                        if (tracker.getRenderState(D3DRS_ZFUNC, &val))
-                            realDevice->SetRenderState(D3DRS_ZFUNC, val);
-                        if (tracker.getRenderState(D3DRS_ALPHAREF, &val))
-                            realDevice->SetRenderState(D3DRS_ALPHAREF, val);
-                        if (tracker.getRenderState(D3DRS_ALPHATESTENABLE, &val))
-                            realDevice->SetRenderState(D3DRS_ALPHATESTENABLE, val);
-                        if (tracker.getRenderState(D3DRS_ALPHAFUNC, &val))
-                            realDevice->SetRenderState(D3DRS_ALPHAFUNC, val);
-                        if (tracker.getRenderState(D3DRS_CULLMODE, &val))
-                            realDevice->SetRenderState(D3DRS_CULLMODE, val);
-                        if (tracker.getRenderState(D3DRS_FOGENABLE, &val))
-                            realDevice->SetRenderState(D3DRS_FOGENABLE, val);
-                        if (tracker.getRenderState(D3DRS_LIGHTING, &val))
-                            realDevice->SetRenderState(D3DRS_LIGHTING, val);
-                        if (tracker.getRenderState(D3DRS_AMBIENTMATERIALSOURCE, &val))
-                            realDevice->SetRenderState(D3DRS_AMBIENTMATERIALSOURCE, val);
-                        if (tracker.getRenderState(D3DRS_DIFFUSEMATERIALSOURCE, &val))
-                            realDevice->SetRenderState(D3DRS_DIFFUSEMATERIALSOURCE, val);
-                        // Texture stage states for UI (stage 0)
-                        if (tracker.getTextureStageState(0, D3DTSS_COLOROP, &val))
-                            realDevice->SetTextureStageState(0, D3DTSS_COLOROP, val);
-                        if (tracker.getTextureStageState(0, D3DTSS_COLORARG1, &val))
-                            realDevice->SetTextureStageState(0, D3DTSS_COLORARG1, val);
-                        if (tracker.getTextureStageState(0, D3DTSS_COLORARG2, &val))
-                            realDevice->SetTextureStageState(0, D3DTSS_COLORARG2, val);
-                        if (tracker.getTextureStageState(0, D3DTSS_ALPHAOP, &val))
-                            realDevice->SetTextureStageState(0, D3DTSS_ALPHAOP, val);
-                        if (tracker.getTextureStageState(0, D3DTSS_ALPHAARG1, &val))
-                            realDevice->SetTextureStageState(0, D3DTSS_ALPHAARG1, val);
-                        if (tracker.getTextureStageState(0, D3DTSS_ALPHAARG2, &val))
-                            realDevice->SetTextureStageState(0, D3DTSS_ALPHAARG2, val);
-                        if (tracker.getFVF(&val))
-                            realDevice->SetFVF(val);
-                        for (auto& [index, enable] : tracker.lightEnables)
-                            realDevice->LightEnable(index, enable);
-                        // Restore transforms - critical for HUD (UI uses different view/proj)
-                        D3DMATRIX mat;
-                        if (tracker.getTransform(D3DTS_VIEW, &mat))
-                            realDevice->SetTransform(D3DTS_VIEW, &mat);
-                        if (tracker.getTransform(D3DTS_PROJECTION, &mat))
-                            realDevice->SetTransform(D3DTS_PROJECTION, &mat);
-                        if (tracker.getTransform(D3DTS_WORLD, &mat))
-                            realDevice->SetTransform(D3DTS_WORLD, &mat);
-                        realDevice->SetVertexShader(NULL);
-                        realDevice->SetPixelShader(NULL);
+                        // State restoration happens after GpuExit (below) for both paths
                     } else {
                         // Async toggle OFF: run GPU phase on main thread
                         FixedFunctionShader::renderFullFrameAsync();
