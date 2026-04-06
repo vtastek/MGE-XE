@@ -1,7 +1,12 @@
 
 #include "winheader.h"
 #include "log.h"
+
+#ifdef MGE64_HOST
+static int getFrameNumber() { return 0; }
+#else
 #include "mge/mged3d8device.h"
+#endif
 
 #include <cstdarg>
 #include <cctype>
