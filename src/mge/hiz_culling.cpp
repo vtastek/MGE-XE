@@ -142,7 +142,7 @@ void FixedFunctionShader::executeHiZCulling(const D3DXMATRIX& currentView, const
         if (ImGuiManager::GetShowHiZInterface()) {
             // N-1: Use rendering buffer's projection matrix
             const D3DXMATRIX& uploadProj = renderBuf.proj;
-            softwareOcclusionCuller.uploadHiZToTexture(reinterpret_cast<IDirect3DDevice9*>(device), ImGuiManager::GetHiZDisplayMip(), uploadProj, ImGuiManager::GetHiZInvert(), ImGuiManager::GetHiZShowRaycastGrid(), ImGuiManager::GetHiZRaycastStep());
+            softwareOcclusionCuller.uploadHiZToTexture(reinterpret_cast<IDirect3DDevice9*>(device), ImGuiManager::GetHiZDisplayMip(), uploadProj, ImGuiManager::GetHiZInvert());
         }
         hiZBuiltThisFrame = true;
     }

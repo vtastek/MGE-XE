@@ -1727,35 +1727,6 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
     int totalCalls = recCalls.size();
     int culledCalls = 0;
 
-    // Check for debug key press (Y key) - gated behind debug hotkeys toggle
-    static bool debugHiZ = false;
-    static int debugCallCount = 0;
-    if (ImGuiManager::GetDebugKeysEnabled() && (GetAsyncKeyState('Y') & 0x8000)) {
-        static bool wasPressed = false;
-        if (!wasPressed) {
-            debugHiZ = true;
-            debugCallCount = 5; // Log next 5 culled calls
-            LOG::logline(">> Hi-Z Debug: Enabled for next 5 CULLED calls");
-            wasPressed = true;
-        }
-    } else {
-        static bool wasPressed = false;
-        wasPressed = false;
-    }
-
-    // Check for Hi-Z snapshot save key press (L key) - gated behind debug hotkeys toggle
-    if (ImGuiManager::GetDebugKeysEnabled() && (GetAsyncKeyState('L') & 0x8000)) {
-        static bool wasPressed = false;
-        if (!wasPressed) {
-            LOG::logline(">> L key pressed: Saving Hi-Z snapshot...");
-            DistantLand::saveHiZSnapshot();
-            wasPressed = true;
-        }
-    } else {
-        static bool wasPressed = false;
-        wasPressed = false;
-    }
-
     // Calculate camera velocity from previous frame (to compensate for one-frame-behind Hi-Z)
     D3DXVECTOR3 currentCameraPos = D3DXVECTOR3(DistantLand::s_staging.eyePos.x, DistantLand::s_staging.eyePos.y, DistantLand::s_staging.eyePos.z);
     D3DXVECTOR3 cameraVelocity(0.0f, 0.0f, 0.0f);

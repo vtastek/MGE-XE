@@ -22,10 +22,6 @@ float ImGuiManager::pcfBias2 = 0.0045f;          // Second depth bias for lerp
 float ImGuiManager::pcfSlopeBias = 0.001f;       // Slope-based bias to prevent acne on angled surfaces
 
 // Debug interface controls
-bool ImGuiManager::enableRecording = true;
-bool ImGuiManager::enableReplay = true;
-bool ImGuiManager::enableImmediateRendering = true;
-bool ImGuiManager::enableDepthPass = true;
 int ImGuiManager::bboxVisualizationMode = 0;
 bool ImGuiManager::disableHiZCulling = false;
 
@@ -40,8 +36,6 @@ int ImGuiManager::debugImmediateCount = 0;
 // Hi-Z visualization variables
 int ImGuiManager::hiZDisplayMip = 0;
 bool ImGuiManager::hiZInvert = false;
-bool ImGuiManager::hiZShowRaycastGrid = false;
-int ImGuiManager::hiZRaycastStep = 2;
 
 // Hi-Z occluder selection parameters
 int ImGuiManager::occluderMaxCount = 100;
@@ -404,7 +398,7 @@ void ImGuiManager::RenderDebugInterface() {
     ImGui::SetNextWindowSize(ImVec2(450, 400), ImGuiCond_FirstUseEver);
 
     if (ImGui::Begin("HLSL Pipeline Debug", &showDebugInterface, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Checkbox("Enable Debug Hotkeys (F11/U/Y/L/F5/F6/K/O)", &debugKeysEnabled);
+        ImGui::Checkbox("Enable Debug Hotkeys (F11/U/F5/F6)", &debugKeysEnabled);
         ImGui::Checkbox("Handover Logging (Scene 0/1/2 state)", &handoverLogging);
         ImGui::SameLine();
         if (ImGui::Button("Save Baselines")) {
@@ -419,19 +413,17 @@ void ImGuiManager::RenderDebugInterface() {
         ImGui::Text("Recording/Replay System (Scene 0)");
         ImGui::Separator();
 
-        // Pass enable/disable controls
-        ImGui::Checkbox("Enable Recording", &enableRecording);
-        ImGui::SameLine();
-        ImGui::Checkbox("Enable Replay", &enableReplay);
-        ImGui::Checkbox("Enable Immediate Rendering (Scene 1/2)", &enableImmediateRendering);
-        ImGui::Checkbox("Enable Depth Pass (recordMW)", &enableDepthPass);
         ImGui::Checkbox("Disable Hi-Z Culling (terrain hole diagnosis)", &disableHiZCulling);
 
         ImGui::Separator();
         ImGui::Text("Optimization Modes");
-        ImGui::Checkbox("Performance Mode (Dirty Tracking)", &performanceMode);
+        if (ImGui::Checkbox("Performance Mode (Dirty Tracking)", &performanceMode)) {
+            if (performanceMode) stateLeakDetection = false;  // Mutually exclusive
+        }
         ImGui::SetItemTooltip("Skip redundant GPU state updates for unchanged meshes between frames");
-        ImGui::Checkbox("State Leak Detection (Heavy)", &stateLeakDetection);
+        if (ImGui::Checkbox("State Leak Detection (Heavy)", &stateLeakDetection)) {
+            if (stateLeakDetection) performanceMode = false;  // Mutually exclusive
+        }
         ImGui::SetItemTooltip("Query device state before each draw to detect state leaks. Very slow!");
 
         ImGui::Separator();
@@ -607,11 +599,11 @@ void ImGuiManager::ToggleDebugInterface() {
     io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showFrameEventLog;
 }
 
-// Debug control getters
-bool ImGuiManager::GetEnableRecording() { return enableRecording; }
-bool ImGuiManager::GetEnableReplay() { return enableReplay; }
-bool ImGuiManager::GetEnableImmediateRendering() { return enableImmediateRendering; }
-bool ImGuiManager::GetEnableDepthPass() { return enableDepthPass; }
+// Debug control getters (Recording/Replay/Immediate/Depth always enabled)
+bool ImGuiManager::GetEnableRecording() { return true; }
+bool ImGuiManager::GetEnableReplay() { return true; }
+bool ImGuiManager::GetEnableImmediateRendering() { return true; }
+bool ImGuiManager::GetEnableDepthPass() { return true; }
 int ImGuiManager::GetBBoxVisualizationMode() { return bboxVisualizationMode; }
 bool ImGuiManager::GetDisableHiZCulling() { return disableHiZCulling; }
 
@@ -1386,6 +1378,14 @@ void ImGuiManager::RenderHiZInterface() {
     ImGui::SetNextWindowSize(ImVec2(650, 800), ImGuiCond_FirstUseEver);
 
     if (ImGui::Begin("Hi-Z Occlusion Buffer", &showHiZInterface, ImGuiWindowFlags_AlwaysAutoResize)) {
+        // Hi-Z visualization disabled in async mode (buffer access would race with GPU thread)
+        if (asyncGpuThread) {
+            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "Hi-Z visualization disabled in async mode");
+            ImGui::Text("Disable Async GPU Thread to view Hi-Z buffer.");
+            ImGui::End();
+            return;
+        }
+
         auto& culler = FixedFunctionShader::softwareOcclusionCuller;
 
         if (culler.getHiZTexture()) {
@@ -1395,14 +1395,6 @@ void ImGuiManager::RenderHiZInterface() {
             ImGui::Text("Visualization Settings");
             ImGui::SliderInt("Mip Level", &hiZDisplayMip, 0, maxMipLevel);
             ImGui::Checkbox("Invert Depth", &hiZInvert);
-
-            ImGui::Separator();
-            ImGui::Text("Raycast Grid Overlay");
-            ImGui::Checkbox("Show Raycast Grid", &hiZShowRaycastGrid);
-            if (hiZShowRaycastGrid) {
-                ImGui::SliderInt("Grid Step Size", &hiZRaycastStep, 1, 8);
-                ImGui::Text("(Red dots show occlusion test sample points)");
-            }
 
             UINT width = culler.getHiZWidth(hiZDisplayMip);
             UINT height = culler.getHiZHeight(hiZDisplayMip);

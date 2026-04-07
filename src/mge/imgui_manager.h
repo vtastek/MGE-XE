@@ -135,10 +135,10 @@ public:
 
     // Debug interface controls
     static void ToggleDebugInterface();
-    static bool GetEnableRecording();
-    static bool GetEnableReplay();
-    static bool GetEnableImmediateRendering();
-    static bool GetEnableDepthPass();
+    static bool GetEnableRecording();       // Always returns true (feature always enabled)
+    static bool GetEnableReplay();          // Always returns true (feature always enabled)
+    static bool GetEnableImmediateRendering(); // Always returns true (feature always enabled)
+    static bool GetEnableDepthPass();       // Always returns true (feature always enabled)
     static int GetBBoxVisualizationMode();
     static void UpdateDebugStats(int recordedCalls, int renderedCalls, int culledCalls,
                                   int sceneLights, int recordMWSize, int immediateCount);
@@ -152,8 +152,6 @@ public:
     static bool GetShowHiZInterface();
     static int GetHiZDisplayMip() { return hiZDisplayMip; }
     static bool GetHiZInvert() { return hiZInvert; }
-    static bool GetHiZShowRaycastGrid() { return hiZShowRaycastGrid; }
-    static int GetHiZRaycastStep() { return hiZRaycastStep; }
 
     // Hi-Z occluder selection parameters
     static int GetOccluderMaxCount() { return occluderMaxCount; }
@@ -295,10 +293,6 @@ private:
     static float pcfSlopeBias;         // Slope-based bias to prevent acne on angled surfaces
 
     // Debug interface controls
-    static bool enableRecording;
-    static bool enableReplay;
-    static bool enableImmediateRendering;
-    static bool enableDepthPass;
     static int bboxVisualizationMode;  // 0=off, 1=objects, 2=lights
     static bool disableHiZCulling;     // Bypass Hi-Z culling for terrain hole diagnosis
 
@@ -313,8 +307,6 @@ private:
     // Hi-Z visualization variables
     static int hiZDisplayMip;
     static bool hiZInvert;
-    static bool hiZShowRaycastGrid;
-    static int hiZRaycastStep;
 
     // Hi-Z occluder selection parameters
     static int occluderMaxCount;          // Base budget (default 100)

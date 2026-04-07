@@ -543,7 +543,7 @@ bool SoftwareOcclusionCuller::testBoundingBox(
     return false; // Occluded - all depth samples are in front of bbox
 }
 
-void SoftwareOcclusionCuller::uploadHiZToTexture(IDirect3DDevice9* device, int mipLevel, const D3DXMATRIX& proj, bool invert, bool showRaycastGrid, int raycastStep)
+void SoftwareOcclusionCuller::uploadHiZToTexture(IDirect3DDevice9* device, int mipLevel, const D3DXMATRIX& proj, bool invert)
 {
     if (mNumMipLevels == 0 || !mHiZBuffer[0]) return;
 
@@ -599,45 +599,7 @@ void SoftwareOcclusionCuller::uploadHiZToTexture(IDirect3DDevice9* device, int m
             }
 
             BYTE gray = (BYTE)(linear01 * 255.0f);
-
-            // Overlay 5x4 raycast grid visualization (matches ffeshader.cpp raycast pattern)
-            // Grid covers central 80% of screen (10% margin on each edge)
-            bool isRaycastPoint = false;
-            if (showRaycastGrid) {
-                const int gridWidth = 5;
-                const int gridHeight = 4;
-                const float edgeMargin = 0.1f;
-
-                // Calculate exact raycast positions (matching ffeshader.cpp:3635)
-                // u = edgeMargin + (x + 0.5f) / gridWidth * (1.0f - 2.0f * edgeMargin)
-                for (int gy = 0; gy < gridHeight && !isRaycastPoint; gy++) {
-                    for (int gx = 0; gx < gridWidth && !isRaycastPoint; gx++) {
-                        float rayU = edgeMargin + (gx + 0.5f) / gridWidth * (1.0f - 2.0f * edgeMargin);
-                        float rayV = edgeMargin + (gy + 0.5f) / gridHeight * (1.0f - 2.0f * edgeMargin);
-
-                        // Convert to pixel coordinates in Hi-Z texture
-                        float rayPixelX = rayU * width;
-                        float rayPixelY = rayV * height;
-
-                        // Check if current pixel is near this raycast position (larger radius for visibility)
-                        float dx = (float)x - rayPixelX;
-                        float dy = (float)y - rayPixelY;
-                        float distSq = dx * dx + dy * dy;
-
-                        // Use larger radius (5 pixels) to make dots visible
-                        if (distSq < 25.0f) {
-                            isRaycastPoint = true;
-                        }
-                    }
-                }
-            }
-
-            if (isRaycastPoint) {
-                // Red dot for raycast sample points
-                pixels[y * (rect.Pitch / 4) + x] = D3DCOLOR_ARGB(255, 255, 0, 0);
-            } else {
-                pixels[y * (rect.Pitch / 4) + x] = D3DCOLOR_ARGB(255, gray, gray, gray);
-            }
+            pixels[y * (rect.Pitch / 4) + x] = D3DCOLOR_ARGB(255, gray, gray, gray);
         }
     }
 
