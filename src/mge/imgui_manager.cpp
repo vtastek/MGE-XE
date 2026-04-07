@@ -65,6 +65,7 @@ bool ImGuiManager::rasterizeAll = false;
 // Debug/Performance mode toggles
 bool ImGuiManager::stateLeakDetection = false;
 bool ImGuiManager::performanceMode = true;
+bool ImGuiManager::materialSortEnabled = false;
 
 // Per-bin DIP suppression toggles
 bool ImGuiManager::suppressSky = false;
@@ -425,6 +426,8 @@ void ImGuiManager::RenderDebugInterface() {
             if (stateLeakDetection) performanceMode = false;  // Mutually exclusive
         }
         ImGui::SetItemTooltip("Query device state before each draw to detect state leaks. Very slow!");
+        ImGui::Checkbox("Material Sort (Opaque/Grass)", &materialSortEnabled);
+        ImGui::SetItemTooltip("Sort opaque/grass draws by material to minimize state changes. A/B comparison.");
 
         ImGui::Separator();
         ImGui::Text("Statistics");
@@ -441,6 +444,24 @@ void ImGuiManager::RenderDebugInterface() {
         // Lighting stats
         ImGui::Text("Lights:");
         ImGui::Text("  Scene Lights: %d", debugSceneLights);
+
+        ImGui::Separator();
+
+        // Material sorting optimization metrics
+        ImGui::Text("Material Sorting Analysis:");
+        ImGui::Text("  Unique Textures: %d", g_replayMetrics.uniqueTextures);
+        ImGui::Text("  Unique Materials: %d", g_replayMetrics.uniqueMaterialKeys);
+        ImGui::Text("  Material Transitions: %d", g_replayMetrics.materialTransitions);
+        ImGui::Text("  Draw Calls: %d", g_replayMetrics.totalDrawCalls);
+        if (g_replayMetrics.totalDrawCalls > 0 && g_replayMetrics.uniqueMaterialKeys > 0) {
+            int optimalTransitions = g_replayMetrics.uniqueMaterialKeys - 1;
+            int excessTransitions = g_replayMetrics.materialTransitions - optimalTransitions;
+            float sortingEfficiency = optimalTransitions > 0 ?
+                (float)optimalTransitions / g_replayMetrics.materialTransitions * 100.0f : 100.0f;
+            ImGui::Text("  Optimal Transitions: %d", optimalTransitions);
+            ImGui::Text("  Excess Transitions: %d", excessTransitions > 0 ? excessTransitions : 0);
+            ImGui::Text("  Sorting Efficiency: %.1f%%", sortingEfficiency);
+        }
 
         ImGui::Separator();
 

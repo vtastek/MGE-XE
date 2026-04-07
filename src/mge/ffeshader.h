@@ -68,6 +68,40 @@ enum class RenderBin : uint8_t {
     Count
 };
 
+// Material key for grouping draws with identical render state (texture + blend/alpha/z/cull)
+struct MaterialKey {
+    IDirect3DTexture9* texture;
+    uint16_t blendState;   // alphaBlendEnable | (srcBlend << 4) | (destBlend << 8)
+    uint16_t alphaState;   // alphaTestEnable | (alphaFunc << 4) | (alphaRef << 8)
+    uint8_t zState;        // zEnable | (zWriteEnable << 2)
+    uint8_t cullMode;
+    RenderBin bin;
+
+    bool operator==(const MaterialKey& o) const {
+        return texture == o.texture && blendState == o.blendState && alphaState == o.alphaState &&
+               zState == o.zState && cullMode == o.cullMode && bin == o.bin;
+    }
+
+    struct Hasher {
+        size_t operator()(const MaterialKey& k) const {
+            size_t h = reinterpret_cast<size_t>(k.texture);
+            h ^= k.blendState + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= k.alphaState + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= (k.zState | (k.cullMode << 8) | (static_cast<uint8_t>(k.bin) << 16)) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            return h;
+        }
+    };
+};
+
+// Metrics for material sorting optimization analysis
+struct ReplayMetrics {
+    int uniqueTextures;
+    int uniqueMaterialKeys;
+    int materialTransitions;
+    int totalDrawCalls;
+    void reset() { uniqueTextures = uniqueMaterialKeys = materialTransitions = totalDrawCalls = 0; }
+};
+
 // Dirty flags for performance mode (dirty tracking between frames)
 enum DirtyFlags : DWORD {
     DIRTY_NONE      = 0,
@@ -238,6 +272,9 @@ extern PipelineDiag g_pipelineDiag;
 
 // Global callback for texture release notification (set by FixedFunctionShader::init)
 extern void (*g_onTextureReleased)(IDirect3DTexture9* realTexture);
+
+// Replay metrics for material sorting optimization analysis
+extern ReplayMetrics g_replayMetrics;
 
 class FixedFunctionShader {
     struct ShaderKey {

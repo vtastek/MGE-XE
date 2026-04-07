@@ -26,6 +26,7 @@
 #include <cstring>
 #include <climits>
 #include <unordered_map>
+#include <unordered_set>
 
 // File-scope statics used by replay functions (duplicated from ffeshader.cpp)
 // During replay, points to fb.shadowViewproj (recording-time matrices).
@@ -40,6 +41,9 @@ extern bool deviceCallsSafeInPrepare;
 
 // Diagnostic: cache hit/miss logging for first N frames
 static int hlslDiagFrameCounter = 0;
+
+// Replay metrics for material sorting optimization analysis
+ReplayMetrics g_replayMetrics = {};
 
 // Cache for texture resolutions to avoid repeated GetLevelDesc calls
 static std::unordered_map<IDirect3DTexture9*, D3DXVECTOR2> textureResolutionCache;
@@ -1923,6 +1927,14 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
     int binCounts[(int)RenderBin::Count] = {};
     static const char* binNames[] = { "Terrain", "Opaque", "Skinning", "Grass", "AlphaTested", "Blending" };
 
+    // Material sorting metrics collection
+    std::unordered_set<IDirect3DTexture9*> seenTextures;
+    std::unordered_set<MaterialKey, MaterialKey::Hasher> seenMaterials;
+    MaterialKey prevMaterial = {};
+    bool hasPrevMaterial = false;
+    int materialTransitions = 0;
+    int drawCallCount = 0;
+
 #ifdef TRACY_ENABLE
     // Tracy bin zone: manually managed ScopedZone for per-bin profiling regions
     static constexpr tracy::SourceLocationData binZoneSrcLoc { "RenderBin", TracyFunction, TracyFile, (uint32_t)__LINE__, 0 };
@@ -1977,6 +1989,29 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
         if (!call.shouldRender) {
             culledCalls++;
             continue;
+        }
+
+        // Material metrics tracking (for sorting optimization analysis) - Scene 0 only
+        if (sceneCount == 0) {
+            MaterialKey curMaterial;
+            curMaterial.texture = call.rs.texture;
+            curMaterial.blendState = (call.expectedState.captured ? call.expectedState.alphaBlendEnable : 0) |
+                                     ((call.expectedState.captured ? call.expectedState.srcBlend : 0) << 4) |
+                                     ((call.expectedState.captured ? call.expectedState.destBlend : 0) << 8);
+            curMaterial.alphaState = (call.expectedState.captured ? call.expectedState.alphaTestEnable : 0);
+            curMaterial.zState = (uint8_t)((call.expectedState.captured ? call.expectedState.zEnable : 1) |
+                                 ((call.expectedState.captured ? call.expectedState.zWriteEnable : 1) << 2));
+            curMaterial.cullMode = call.expectedState.captured ? (uint8_t)call.expectedState.cullMode : D3DCULL_CW;
+            curMaterial.bin = call.bin;
+
+            seenTextures.insert(call.rs.texture);
+            seenMaterials.insert(curMaterial);
+            if (hasPrevMaterial && !(curMaterial == prevMaterial)) {
+                materialTransitions++;
+            }
+            prevMaterial = curMaterial;
+            hasPrevMaterial = true;
+            drawCallCount++;
         }
 
         {
@@ -2088,6 +2123,14 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
     if (binZone) binZone->~ScopedZone();
 #endif
 
+    // Store material sorting metrics for ImGui display (Scene 0 only)
+    if (sceneCount == 0) {
+        g_replayMetrics.uniqueTextures = (int)seenTextures.size();
+        g_replayMetrics.uniqueMaterialKeys = (int)seenMaterials.size();
+        g_replayMetrics.materialTransitions = materialTransitions;
+        g_replayMetrics.totalDrawCalls = drawCallCount;
+    }
+
     // Slow frame detection: measure total replay time
     QueryPerformanceCounter(&replayEndQPC);
     float replayMs = (replayEndQPC.QuadPart - replayStartQPC.QuadPart) * 1000.0f / replayFreqQPC.QuadPart;
@@ -2152,12 +2195,14 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
             modeCounts[0], modeCounts[1], modeCounts[2], modeCounts[3]);
     }
 
-    // Update ImGui debug stats
-    ImGuiManager::UpdateDebugStats(
-        totalCalls, renderedCalls, culledCalls,
-        (int)DistantLand::sceneLights.size(),
-        (int)DistantLand::recordMW.size(), 0
-    );
+    // Update ImGui debug stats (Scene 0 only)
+    if (sceneCount == 0) {
+        ImGuiManager::UpdateDebugStats(
+            totalCalls, renderedCalls, culledCalls,
+            (int)DistantLand::sceneLights.size(),
+            (int)DistantLand::recordMW.size(), 0
+        );
+    }
 
     // Debug visualization: Render bounding boxes with color-coded status from ImGui
     int debugBBoxMode = ImGuiManager::GetBBoxVisualizationMode();

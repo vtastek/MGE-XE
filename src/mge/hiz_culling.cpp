@@ -8,6 +8,9 @@
 #include "mge_tracy.h"
 #include "texture_suffix.h"
 
+#include <algorithm>
+#include <vector>
+
 // External reference to file-scope variable in ffeshader.cpp
 extern float lastPrepareMs;
 extern bool deviceCallsSafeInPrepare;
@@ -15,6 +18,77 @@ extern bool deviceCallsSafeInPrepare;
 // Helper to access prep buffer's recorded calls (N-1 data being prepared)
 static auto& currentRecordedCalls() {
     return FixedFunctionShader::getPrepBuffer().recordedCalls;
+}
+
+// Compute material hash for sorting (texture + blend/alpha/z state)
+static size_t computeMaterialHash(const FixedFunctionShader::HLSLRecordedCall& call) {
+    size_t h = reinterpret_cast<size_t>(call.rs.texture);
+    // Pack blend state: alphaBlendEnable | (srcBlend << 4) | (destBlend << 8)
+    DWORD blendPacked = (call.expectedState.captured ? call.expectedState.alphaBlendEnable : 0) |
+                        ((call.expectedState.captured ? call.expectedState.srcBlend : 0) << 4) |
+                        ((call.expectedState.captured ? call.expectedState.destBlend : 0) << 8);
+    h ^= blendPacked + 0x9e3779b9 + (h << 6) + (h >> 2);
+    // Pack z state: zEnable | (zWriteEnable << 2)
+    DWORD zPacked = (call.expectedState.captured ? call.expectedState.zEnable : 1) |
+                    ((call.expectedState.captured ? call.expectedState.zWriteEnable : 1) << 2);
+    h ^= zPacked + 0x9e3779b9 + (h << 6) + (h >> 2);
+    // Add cull mode
+    h ^= (call.expectedState.captured ? call.expectedState.cullMode : D3DCULL_CW) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    return h;
+}
+
+// Sort recorded calls by material to minimize state changes
+// Rules:
+// - Sortable bins: Opaque, Grass (no depth dependencies within bin)
+// - Depth-ordered bins: AlphaTested, Blending (preserve relative order)
+// - Excluded: Skinning (bone palette per-object)
+static void sortCallsByMaterial(std::vector<FixedFunctionShader::HLSLRecordedCall>& calls) {
+    MGE_ZoneScopedN("sortCallsByMaterial");
+
+    if (calls.empty()) return;
+
+    // Create sort keys with original index for stability
+    struct SortKey {
+        size_t originalIndex;
+        RenderBin bin;
+        size_t materialHash;
+        bool sortable;  // false for bins that must preserve order
+    };
+
+    std::vector<SortKey> sortKeys;
+    sortKeys.reserve(calls.size());
+
+    for (size_t i = 0; i < calls.size(); i++) {
+        const auto& call = calls[i];
+        SortKey key;
+        key.originalIndex = i;
+        key.bin = call.bin;
+        key.materialHash = computeMaterialHash(call);
+        // Sortable: Opaque, Grass, Terrain
+        // Not sortable: Skinning (bone state), AlphaTested (depth), Blending (depth)
+        key.sortable = (call.bin == RenderBin::Opaque || call.bin == RenderBin::Grass || call.bin == RenderBin::Terrain);
+        sortKeys.push_back(key);
+    }
+
+    // Stable sort: first by bin, then by material hash (for sortable bins), then by original index
+    std::stable_sort(sortKeys.begin(), sortKeys.end(), [](const SortKey& a, const SortKey& b) {
+        // Primary: bin order
+        if (a.bin != b.bin) return static_cast<int>(a.bin) < static_cast<int>(b.bin);
+        // Secondary: for sortable bins, sort by material; otherwise preserve order
+        if (a.sortable && b.sortable) {
+            if (a.materialHash != b.materialHash) return a.materialHash < b.materialHash;
+        }
+        // Tertiary: preserve original order (stable sort guarantees this for equal keys)
+        return a.originalIndex < b.originalIndex;
+    });
+
+    // Reorder calls according to sort keys
+    std::vector<FixedFunctionShader::HLSLRecordedCall> sortedCalls;
+    sortedCalls.reserve(calls.size());
+    for (const auto& key : sortKeys) {
+        sortedCalls.push_back(std::move(calls[key.originalIndex]));
+    }
+    calls = std::move(sortedCalls);
 }
 
 // executeHiZCulling - Pure CPU work: bbox computation, occluder rasterization, Hi-Z pyramid build,
@@ -337,6 +411,11 @@ void FixedFunctionShader::prepareRecordedCalls() {
             else if (call.rs.blendEnable)      call.bin = RenderBin::Blending;
             else if (call.rs.alphaTest)        call.bin = RenderBin::AlphaTested;
             else                               call.bin = RenderBin::Opaque;
+        }
+
+        // Optional material sorting for state change reduction (Scene 0 only)
+        if (ImGuiManager::GetMaterialSortEnabled()) {
+            sortCallsByMaterial(recCalls);
         }
     }
     QueryPerformanceCounter(&prepEndQPC);

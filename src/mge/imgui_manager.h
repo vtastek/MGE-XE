@@ -181,6 +181,7 @@ public:
     // Debug/Performance mode toggles
     static bool GetStateLeakDetection() { return stateLeakDetection; }
     static bool GetPerformanceMode() { return performanceMode; }
+    static bool GetMaterialSortEnabled() { return materialSortEnabled; }
 
     // Per-bin DIP suppression toggles
     static bool GetSuppressSky() { return suppressSky; }
@@ -336,6 +337,7 @@ private:
     // Debug/Performance mode toggles
     static bool stateLeakDetection;       // State leak detection debug mode - default false
     static bool performanceMode;          // Dirty tracking performance mode - default true
+    static bool materialSortEnabled;      // Material sorting for state change reduction - default false
 
     // Per-bin DIP suppression toggles
     static bool suppressSky;
