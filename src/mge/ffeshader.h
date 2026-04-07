@@ -93,13 +93,79 @@ struct MaterialKey {
     };
 };
 
+// Instance key for batching identical geometry+material draws (instancing opportunity analysis)
+// Combines geometry identity (MeshKey) with material identity for GPU instancing
+struct InstanceKey {
+    // Geometry identity (from MeshKey)
+    IDirect3DVertexBuffer9* vb;
+    IDirect3DIndexBuffer9* ib;
+    DWORD fvf;
+    UINT baseIndex;
+    UINT vertCount;
+    UINT startIndex;
+    UINT primCount;
+
+    // Material identity (from MaterialKey)
+    IDirect3DTexture9* texture;
+    uint16_t blendState;
+    uint16_t alphaState;
+    uint8_t zState;
+    uint8_t cullMode;
+
+    bool operator==(const InstanceKey& o) const {
+        return vb == o.vb && ib == o.ib && fvf == o.fvf &&
+               baseIndex == o.baseIndex && vertCount == o.vertCount &&
+               startIndex == o.startIndex && primCount == o.primCount &&
+               texture == o.texture && blendState == o.blendState &&
+               alphaState == o.alphaState && zState == o.zState && cullMode == o.cullMode;
+    }
+
+    struct Hasher {
+        size_t operator()(const InstanceKey& k) const {
+            // Combine geometry hash
+            size_t h = reinterpret_cast<size_t>(k.vb);
+            h ^= reinterpret_cast<size_t>(k.ib) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= k.fvf + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= (k.baseIndex | (k.vertCount << 16)) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= (k.startIndex | (k.primCount << 16)) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            // Combine material hash
+            h ^= reinterpret_cast<size_t>(k.texture) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= (k.blendState | (k.alphaState << 16)) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= (k.zState | (k.cullMode << 8)) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            return h;
+        }
+    };
+};
+
 // Metrics for material sorting optimization analysis
 struct ReplayMetrics {
     int uniqueTextures;
     int uniqueMaterialKeys;
     int materialTransitions;
     int totalDrawCalls;
-    void reset() { uniqueTextures = uniqueMaterialKeys = materialTransitions = totalDrawCalls = 0; }
+    // Instancing metrics
+    int uniqueInstanceKeys;    // Distinct geometry+material combos
+    int potentialBatches;      // InstanceKeys with 2+ draws (could batch)
+    int totalBatchableDraws;   // Draws that could be batched (in groups of 2+)
+    void reset() {
+        uniqueTextures = uniqueMaterialKeys = materialTransitions = totalDrawCalls = 0;
+        uniqueInstanceKeys = potentialBatches = totalBatchableDraws = 0;
+    }
+};
+
+// Instance data for GPU instancing (matches shader TEXCOORD8-10)
+struct InstanceData {
+    float world0[4];  // Row 0 of world matrix (translation in w)
+    float world1[4];  // Row 1 of world matrix
+    float world2[4];  // Row 2 of world matrix
+};
+static_assert(sizeof(InstanceData) == 48, "InstanceData must be 48 bytes");
+
+// Instance batch for grouped rendering
+struct InstanceBatch {
+    InstanceKey key;
+    std::vector<size_t> callIndices;  // Indices into recordedCalls
+    UINT instanceBufferOffset;         // Byte offset into instance buffer
 };
 
 // Dirty flags for performance mode (dirty tracking between frames)
@@ -756,6 +822,9 @@ public:
 
         FrameBuffer() : valid(false), state(BufferState::Available), frameNumber(-1) {}
 
+        // Instance batches for GPU instancing (built during prepareRecordedCalls)
+        std::vector<InstanceBatch> instanceBatches;
+
         void clear() {
             recordedCalls.clear();
             recordedCallsScene1.clear();
@@ -772,6 +841,7 @@ public:
             postProcessData = {};
             trackerSnapshot.clear();
             dlContext = DLContext();  // Reset DLContext to prevent garbage values
+            instanceBatches.clear();
             valid = false;
             // Initialize matrices to identity to prevent garbage if capture functions aren't called
             D3DXMatrixIdentity(&view);
@@ -801,6 +871,12 @@ public:
     static bool n1Ready;          // True after first frame completes (N-1 data available)
     static bool n2Ready;          // True after second frame completes (N-2 data available)
     static int swapCount;         // Track swaps for warm-up (moved from static local)
+
+    // GPU instancing resources
+    static constexpr int MaxFFEInstances = 4096;  // Max instances per frame
+    static constexpr int FFEInstStride = sizeof(InstanceData);  // 48 bytes per instance
+    static IDirect3DVertexBuffer9* vbFFEInstances;  // Dynamic instance buffer
+    static std::unordered_map<DWORD, IDirect3DVertexDeclaration9*> fvfDeclCache;  // FVF -> instanced decl
 
 public:
     // Pipeline phase tracking for GPU call separation verification
@@ -879,6 +955,12 @@ public:
     static void finalizeAndRenderAllScenes(DLContext* frameCtx, bool waterSeen); // Full deferred GPU phase at UI BeginScene
     static void executeGpuPhase(); // GPU render block — called by render thread or inline
     static void replayScene1And2(FrameBuffer* fb);  // Replay Scene 1/2 at UI BeginScene (after recording)
+
+    // GPU instancing
+    static bool initInstancing();  // Create instance buffer and base declarations
+    static void releaseInstancing();  // Release instancing resources
+    static void buildInstanceBatches(FrameBuffer& fb);  // Build batches from InstanceKey groups
+    static IDirect3DVertexDeclaration9* getInstancedDecl(DWORD fvf);  // Get or create instanced decl for FVF
 
     // Scene lifecycle for triple-buffered pipeline
     static void markSceneStart(int sceneNum, bool isUI = false);

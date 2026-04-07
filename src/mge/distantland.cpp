@@ -334,6 +334,10 @@ void DistantLand::renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer*
         if (!ImGuiManager::GetAsyncGpuThread()) {
             FixedFunctionShader::executeHiZCulling(ctx->mwView, ctx->mwProj);
             FixedFunctionShader::applyVisibilityAndFilterRecordMW();
+            // Build instance batches after culling (shouldRender flags now set)
+            if (ImGuiManager::GetInstancingEnabled()) {
+                FixedFunctionShader::buildInstanceBatches(FixedFunctionShader::getPrepBuffer());
+            }
         }
 
         // Single RT switch for all depth rendering (renderDepth + StretchRect + renderDepthDistantLand + MSAA resolve)

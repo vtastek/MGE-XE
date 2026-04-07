@@ -59,6 +59,16 @@ sampler sampFFE5 = sampler_state { texture = <tex5>; };
 float4 rigidVertex(float4 pos) { return mul(pos, worldview); }
 float3 rigidNormal(float3 normal) { return mul(float4(normal, 0), worldview).xyz; }
 
+// Instanced vertex transform: world matrix from instance stream, then view matrix
+float4 instancedVertex(float4 pos, float4 w0, float4 w1, float4 w2) {
+    float4 worldpos = instancedMul(pos, w0, w1, w2);
+    return mul(worldpos, view);
+}
+float3 instancedNormal(float3 normal, float4 w0, float4 w1, float4 w2) {
+    float4 worldnrm = instancedMul(float4(normal, 0), w0, w1, w2);
+    return mul(worldnrm, view).xyz;
+}
+
 float4 skinnedVertex(float4 pos, float4 weights) { return skin(pos, weights); }
 float3 skinnedNormal(float3 normal, float4 weights) { return skin(float4(normal, 0), weights).xyz; }
 
@@ -152,6 +162,19 @@ struct FFEVertIn {
     /* template */ FFE_VB_COUPLING
 };
 
+// Instanced input: same geometry + world matrix from instance stream
+struct FFEVertInstIn {
+    float4 pos : POSITION;
+    float3 nrm : NORMAL;
+
+    /* template */ FFE_VB_COUPLING
+
+    // Instance stream data (world matrix rows)
+    float4 world0 : TEXCOORD8;
+    float4 world1 : TEXCOORD9;
+    float4 world2 : TEXCOORD10;
+};
+
 struct FFEPixel {
     float4 pos : POSITION;
     centroid float4 nrm_fog : NORMAL;
@@ -172,6 +195,34 @@ FFEPixel PerPixelVS(FFEVertIn IN) {
     float4 viewpos;
     float3 normal;
     /* template */ FFE_TRANSFORM_SKIN
+
+    float dist = length(viewpos);
+    OUT.pos = mul(viewpos, proj);
+    OUT.nrm_fog = float4(normal, fogMWScalar(dist));
+
+    // Texcoord routing and texgen
+    /* template */ FFE_TEXCOORDS_TEXGEN
+
+    // Vertex colour
+    /* template */ FFE_VERTEX_COLOUR
+
+    // Point lighting setup, vectorized
+    for(int i = 0; i != LGs; ++i) {
+        OUT.lightvec[3*i + 0] = lightPosition[i + 0] - viewpos.x;
+        OUT.lightvec[3*i + 1] = lightPosition[i + 2] - viewpos.y;
+        OUT.lightvec[3*i + 2] = lightPosition[i + 4] - viewpos.z;
+    }
+
+    return OUT;
+}
+
+// Instanced vertex shader: uses instance stream for world matrix
+FFEPixel PerPixelInstVS(FFEVertInstIn IN) {
+    FFEPixel OUT;
+
+    // Instanced transforms: world from instance stream, then view
+    float4 viewpos = instancedVertex(IN.pos, IN.world0, IN.world1, IN.world2);
+    float3 normal = instancedNormal(IN.nrm, IN.world0, IN.world1, IN.world2);
 
     float dist = length(viewpos);
     OUT.pos = mul(viewpos, proj);
@@ -223,6 +274,13 @@ float4 PerPixelPS(FFEPixel IN) : COLOR0 {
 technique FFE {
     pass {
         VertexShader = compile vs_3_0 PerPixelVS();
+        PixelShader = compile ps_3_0 PerPixelPS();
+    }
+}
+
+technique FFE_Instanced {
+    pass {
+        VertexShader = compile vs_3_0 PerPixelInstVS();
         PixelShader = compile ps_3_0 PerPixelPS();
     }
 }

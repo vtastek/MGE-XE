@@ -417,6 +417,8 @@ void FixedFunctionShader::prepareRecordedCalls() {
         if (ImGuiManager::GetMaterialSortEnabled()) {
             sortCallsByMaterial(recCalls);
         }
+        // Note: buildInstanceBatches is called AFTER executeHiZCulling (in cpuprepthread.cpp)
+        // so that shouldRender flags are already set
     }
     QueryPerformanceCounter(&prepEndQPC);
     lastPrepareMs = (prepEndQPC.QuadPart - prepStartQPC.QuadPart) * 1000.0f / freqQPC.QuadPart;
@@ -693,4 +695,213 @@ bool FixedFunctionShader::computeBoundingBox(const RenderedState* rs, D3DXVECTOR
     }
 
     return true;
+}
+
+//------------------------------------------------------------
+// GPU Instancing Implementation
+
+bool FixedFunctionShader::initInstancing() {
+    if (vbFFEInstances) return true;  // Already initialized
+
+    auto* device = DistantLand::device;
+    if (!device) return false;
+
+    HRESULT hr = device->CreateVertexBuffer(
+        MaxFFEInstances * FFEInstStride,
+        D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
+        0,  // No FVF, using vertex declaration
+        D3DPOOL_DEFAULT,
+        &vbFFEInstances,
+        nullptr
+    );
+
+    if (FAILED(hr)) {
+        LOG::logline("!! Failed to create FFE instance buffer");
+        return false;
+    }
+
+    LOG::logline("-- FFE instancing initialized: %d max instances, %d bytes",
+                 MaxFFEInstances, MaxFFEInstances * FFEInstStride);
+    return true;
+}
+
+void FixedFunctionShader::releaseInstancing() {
+    if (vbFFEInstances) {
+        vbFFEInstances->Release();
+        vbFFEInstances = nullptr;
+    }
+
+    // Release cached vertex declarations
+    for (auto& kv : fvfDeclCache) {
+        if (kv.second) {
+            kv.second->Release();
+        }
+    }
+    fvfDeclCache.clear();
+}
+
+void FixedFunctionShader::buildInstanceBatches(FrameBuffer& fb) {
+    MGE_ZoneScopedN("buildInstanceBatches");
+
+    fb.instanceBatches.clear();
+
+    if (!ImGuiManager::GetInstancingEnabled()) return;
+
+    auto& calls = fb.recordedCalls;
+    if (calls.empty()) return;
+
+    // Group calls by InstanceKey (geometry + material)
+    std::unordered_map<InstanceKey, std::vector<size_t>, InstanceKey::Hasher> instanceGroups;
+
+    for (size_t i = 0; i < calls.size(); i++) {
+        const auto& call = calls[i];
+
+        // Only batch Opaque/Terrain/Grass bins (no Skinning - different bone palettes)
+        if (call.bin != RenderBin::Opaque && call.bin != RenderBin::Terrain && call.bin != RenderBin::Grass)
+            continue;
+
+        // Skip if already culled
+        if (!call.shouldRender) continue;
+
+        InstanceKey key;
+        // Geometry identity
+        key.vb = call.rs.vb;
+        key.ib = call.rs.ib;
+        key.fvf = call.rs.fvf;
+        key.baseIndex = call.rs.baseIndex;
+        key.vertCount = call.rs.vertCount;
+        key.startIndex = call.rs.startIndex;
+        key.primCount = call.rs.primCount;
+        // Material identity
+        key.texture = call.rs.texture;
+        key.blendState = (uint16_t)((call.expectedState.captured ? call.expectedState.alphaBlendEnable : 0) |
+                         ((call.expectedState.captured ? call.expectedState.srcBlend : 0) << 4) |
+                         ((call.expectedState.captured ? call.expectedState.destBlend : 0) << 8));
+        key.alphaState = (uint16_t)(call.expectedState.captured ? call.expectedState.alphaTestEnable : 0);
+        key.zState = (uint8_t)((call.expectedState.captured ? call.expectedState.zEnable : 1) |
+                     ((call.expectedState.captured ? call.expectedState.zWriteEnable : 1) << 2));
+        key.cullMode = call.expectedState.captured ? (uint8_t)call.expectedState.cullMode : D3DCULL_CW;
+
+        instanceGroups[key].push_back(i);
+    }
+
+    // Build batches from groups with 2+ instances
+    for (auto& kv : instanceGroups) {
+        if (kv.second.size() >= 2) {
+            InstanceBatch batch;
+            batch.key = kv.first;
+            batch.callIndices = std::move(kv.second);
+            batch.instanceBufferOffset = 0;  // Will be set when filling instance buffer
+            fb.instanceBatches.push_back(std::move(batch));
+        }
+    }
+
+    // Log batching stats
+    int totalBatched = 0;
+    for (const auto& batch : fb.instanceBatches) {
+        totalBatched += (int)batch.callIndices.size();
+    }
+
+    if (!fb.instanceBatches.empty()) {
+        LOG::logline("Instancing: %d batches, %d batched draws (of %d total)",
+                     (int)fb.instanceBatches.size(), totalBatched, (int)calls.size());
+    }
+}
+
+// Helper: Convert FVF to vertex declaration elements for stream 0
+static bool fvfToElements(DWORD fvf, std::vector<D3DVERTEXELEMENT9>& elements) {
+    WORD offset = 0;
+
+    // Position (required)
+    if (fvf & D3DFVF_XYZRHW) {
+        elements.push_back({0, offset, D3DDECLTYPE_FLOAT4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITIONT, 0});
+        offset += 16;
+    } else if (fvf & D3DFVF_XYZ) {
+        elements.push_back({0, offset, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0});
+        offset += 12;
+    }
+
+    // Blend weights (XYZB1-4)
+    int blendWeights = (fvf >> 1) & 0x7;  // D3DFVF_XYZB1-4 encoding
+    if (blendWeights > 0 && blendWeights <= 4) {
+        BYTE types[] = {D3DDECLTYPE_FLOAT1, D3DDECLTYPE_FLOAT2, D3DDECLTYPE_FLOAT3, D3DDECLTYPE_FLOAT4};
+        elements.push_back({0, offset, types[blendWeights - 1], D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_BLENDWEIGHT, 0});
+        offset += blendWeights * 4;
+    }
+
+    // Normal
+    if (fvf & D3DFVF_NORMAL) {
+        elements.push_back({0, offset, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_NORMAL, 0});
+        offset += 12;
+    }
+
+    // Diffuse color
+    if (fvf & D3DFVF_DIFFUSE) {
+        elements.push_back({0, offset, D3DDECLTYPE_D3DCOLOR, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_COLOR, 0});
+        offset += 4;
+    }
+
+    // Specular color
+    if (fvf & D3DFVF_SPECULAR) {
+        elements.push_back({0, offset, D3DDECLTYPE_D3DCOLOR, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_COLOR, 1});
+        offset += 4;
+    }
+
+    // Texture coordinates
+    int numTexCoords = (fvf & D3DFVF_TEXCOUNT_MASK) >> D3DFVF_TEXCOUNT_SHIFT;
+    for (int i = 0; i < numTexCoords; i++) {
+        // Get texcoord format (default is 2D float)
+        int fmt = (fvf >> (16 + i * 2)) & 0x3;
+        BYTE type = D3DDECLTYPE_FLOAT2;
+        int size = 8;
+        switch (fmt) {
+            case 0: type = D3DDECLTYPE_FLOAT2; size = 8; break;  // D3DFVF_TEXTUREFORMAT2
+            case 1: type = D3DDECLTYPE_FLOAT3; size = 12; break; // D3DFVF_TEXTUREFORMAT3
+            case 2: type = D3DDECLTYPE_FLOAT4; size = 16; break; // D3DFVF_TEXTUREFORMAT4
+            case 3: type = D3DDECLTYPE_FLOAT1; size = 4; break;  // D3DFVF_TEXTUREFORMAT1
+        }
+        elements.push_back({0, offset, type, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, (BYTE)i});
+        offset += size;
+    }
+
+    return !elements.empty();
+}
+
+IDirect3DVertexDeclaration9* FixedFunctionShader::getInstancedDecl(DWORD fvf) {
+    // Check cache first
+    auto it = fvfDeclCache.find(fvf);
+    if (it != fvfDeclCache.end()) {
+        return it->second;
+    }
+
+    // Build declaration elements from FVF
+    std::vector<D3DVERTEXELEMENT9> elements;
+    if (!fvfToElements(fvf, elements)) {
+        LOG::logline("!! Failed to convert FVF 0x%08X to vertex elements", fvf);
+        fvfDeclCache[fvf] = nullptr;
+        return nullptr;
+    }
+
+    // Add instance stream elements (TEXCOORD 8-10 for world matrix rows)
+    elements.push_back({1, 0,  D3DDECLTYPE_FLOAT4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 8});
+    elements.push_back({1, 16, D3DDECLTYPE_FLOAT4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 9});
+    elements.push_back({1, 32, D3DDECLTYPE_FLOAT4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 10});
+
+    // End marker
+    elements.push_back(D3DDECL_END());
+
+    // Create vertex declaration
+    auto* device = DistantLand::device;
+    IDirect3DVertexDeclaration9* decl = nullptr;
+    HRESULT hr = device->CreateVertexDeclaration(elements.data(), &decl);
+
+    if (FAILED(hr)) {
+        LOG::logline("!! Failed to create instanced vertex decl for FVF 0x%08X", fvf);
+        fvfDeclCache[fvf] = nullptr;
+        return nullptr;
+    }
+
+    fvfDeclCache[fvf] = decl;
+    LOG::logline("-- Created instanced vertex decl for FVF 0x%08X", fvf);
+    return decl;
 }

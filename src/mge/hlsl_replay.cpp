@@ -1935,6 +1935,9 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
     int materialTransitions = 0;
     int drawCallCount = 0;
 
+    // Instancing metrics collection (InstanceKey -> draw count)
+    std::unordered_map<InstanceKey, int, InstanceKey::Hasher> instanceKeyCounts;
+
 #ifdef TRACY_ENABLE
     // Tracy bin zone: manually managed ScopedZone for per-bin profiling regions
     static constexpr tracy::SourceLocationData binZoneSrcLoc { "RenderBin", TracyFunction, TracyFile, (uint32_t)__LINE__, 0 };
@@ -1953,9 +1956,116 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
     int worstCallBin = 0;
     float slowCallThreshold = ImGuiManager::GetSlowCallThreshold();
 
+    // Build set of batched call indices to skip in main loop
+    std::unordered_set<size_t> batchedCallIndices;
+    int instancedDrawCalls = 0;
+    int instancedBatches = 0;
+
+    // Issue instanced draws for batches (Scene 0 only)
+    if (sceneCount == 0 && ImGuiManager::GetInstancingEnabled() && !fb.instanceBatches.empty() && vbFFEInstances) {
+        MGE_ZoneScopedN("replay_InstancedDraws");
+
+        // Fill instance buffer with world matrices
+        InstanceData* instData = nullptr;
+        UINT totalInstances = 0;
+        for (const auto& batch : fb.instanceBatches) {
+            totalInstances += (UINT)batch.callIndices.size();
+        }
+
+        if (totalInstances > 0 && totalInstances <= MaxFFEInstances) {
+            HRESULT hr = vbFFEInstances->Lock(0, totalInstances * FFEInstStride, (void**)&instData, D3DLOCK_DISCARD);
+            if (SUCCEEDED(hr) && instData) {
+                UINT instOffset = 0;
+
+                for (auto& batch : fb.instanceBatches) {
+                    // Record buffer offset for this batch
+                    const_cast<InstanceBatch&>(batch).instanceBufferOffset = instOffset * FFEInstStride;
+
+                    // Fill instance data (world matrix rows)
+                    for (size_t idx : batch.callIndices) {
+                        const auto& call = recCalls[idx];
+                        const D3DXMATRIX& world = call.rs.worldTransforms[0];
+
+                        // Row-major to match shader expectations
+                        instData[instOffset].world0[0] = world._11;
+                        instData[instOffset].world0[1] = world._21;
+                        instData[instOffset].world0[2] = world._31;
+                        instData[instOffset].world0[3] = world._41;
+
+                        instData[instOffset].world1[0] = world._12;
+                        instData[instOffset].world1[1] = world._22;
+                        instData[instOffset].world1[2] = world._32;
+                        instData[instOffset].world1[3] = world._42;
+
+                        instData[instOffset].world2[0] = world._13;
+                        instData[instOffset].world2[1] = world._23;
+                        instData[instOffset].world2[2] = world._33;
+                        instData[instOffset].world2[3] = world._43;
+
+                        batchedCallIndices.insert(idx);
+                        instOffset++;
+                    }
+                }
+                vbFFEInstances->Unlock();
+
+                // Issue instanced draws
+                for (const auto& batch : fb.instanceBatches) {
+                    const auto& firstCall = recCalls[batch.callIndices[0]];
+                    UINT instanceCount = (UINT)batch.callIndices.size();
+
+                    // Get instanced vertex declaration for this FVF
+                    IDirect3DVertexDeclaration9* instDecl = getInstancedDecl(firstCall.rs.fvf);
+                    if (!instDecl) continue;
+
+                    // Set material state from first call
+                    // TODO: Full material state setup (texture, blend, etc.)
+                    device->SetTexture(0, firstCall.rs.texture);
+                    if (firstCall.expectedState.captured) {
+                        device->SetRenderState(D3DRS_ALPHABLENDENABLE, firstCall.expectedState.alphaBlendEnable);
+                        device->SetRenderState(D3DRS_ALPHATESTENABLE, firstCall.expectedState.alphaTestEnable);
+                        device->SetRenderState(D3DRS_ZENABLE, firstCall.expectedState.zEnable);
+                        device->SetRenderState(D3DRS_ZWRITEENABLE, firstCall.expectedState.zWriteEnable);
+                        device->SetRenderState(D3DRS_CULLMODE, firstCall.expectedState.cullMode);
+                    }
+
+                    // Set up instanced rendering
+                    device->SetVertexDeclaration(instDecl);
+                    device->SetStreamSource(0, firstCall.rs.vb, firstCall.rs.vbOffset, firstCall.rs.vbStride);
+                    device->SetStreamSourceFreq(0, D3DSTREAMSOURCE_INDEXEDDATA | instanceCount);
+                    device->SetStreamSource(1, vbFFEInstances, batch.instanceBufferOffset, FFEInstStride);
+                    device->SetStreamSourceFreq(1, D3DSTREAMSOURCE_INSTANCEDATA | 1);
+                    device->SetIndices(firstCall.rs.ib);
+
+                    // Draw instanced
+                    device->DrawIndexedPrimitive(
+                        D3DPT_TRIANGLELIST,
+                        firstCall.rs.baseIndex,
+                        firstCall.rs.minIndex,
+                        firstCall.rs.vertCount,
+                        firstCall.rs.startIndex,
+                        firstCall.rs.primCount
+                    );
+
+                    instancedDrawCalls++;
+                    instancedBatches++;
+                }
+
+                // Reset stream frequencies
+                device->SetStreamSourceFreq(0, 1);
+                device->SetStreamSourceFreq(1, 1);
+                device->SetStreamSource(1, nullptr, 0, 0);
+
+                LOG::logline("Instanced: %d batches, %d instances, %d individual draws skipped",
+                             instancedBatches, (int)batchedCallIndices.size(), (int)batchedCallIndices.size());
+            }
+        }
+    }
+
     MGE_ZoneScopedN("replay_MainLoop");
     bool firstDrawDone = false;
     for (size_t i = 0; i < numCalls; i++) {
+        // Skip calls that were handled by instanced draws
+        if (batchedCallIndices.count(i)) continue;
         auto& call = recCalls[i];  // Non-const to update shader key
         // No Z-clear between scenes: Scene 1/2 depth-tests against Scene 0.
         // Alpha-sorted particles (Scene 1) properly occlude behind world geometry.
@@ -1995,10 +2105,10 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
         if (sceneCount == 0) {
             MaterialKey curMaterial;
             curMaterial.texture = call.rs.texture;
-            curMaterial.blendState = (call.expectedState.captured ? call.expectedState.alphaBlendEnable : 0) |
+            curMaterial.blendState = (uint16_t)((call.expectedState.captured ? call.expectedState.alphaBlendEnable : 0) |
                                      ((call.expectedState.captured ? call.expectedState.srcBlend : 0) << 4) |
-                                     ((call.expectedState.captured ? call.expectedState.destBlend : 0) << 8);
-            curMaterial.alphaState = (call.expectedState.captured ? call.expectedState.alphaTestEnable : 0);
+                                     ((call.expectedState.captured ? call.expectedState.destBlend : 0) << 8));
+            curMaterial.alphaState = (uint16_t)(call.expectedState.captured ? call.expectedState.alphaTestEnable : 0);
             curMaterial.zState = (uint8_t)((call.expectedState.captured ? call.expectedState.zEnable : 1) |
                                  ((call.expectedState.captured ? call.expectedState.zWriteEnable : 1) << 2));
             curMaterial.cullMode = call.expectedState.captured ? (uint8_t)call.expectedState.cullMode : D3DCULL_CW;
@@ -2012,6 +2122,27 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
             prevMaterial = curMaterial;
             hasPrevMaterial = true;
             drawCallCount++;
+
+            // Instancing metrics: track geometry+material combos for Opaque bin only
+            // (Skinning excluded - different bone palettes per object)
+            if (call.bin == RenderBin::Opaque || call.bin == RenderBin::Terrain || call.bin == RenderBin::Grass) {
+                InstanceKey instKey;
+                // Geometry identity
+                instKey.vb = call.rs.vb;
+                instKey.ib = call.rs.ib;
+                instKey.fvf = call.rs.fvf;
+                instKey.baseIndex = call.rs.baseIndex;
+                instKey.vertCount = call.rs.vertCount;
+                instKey.startIndex = call.rs.startIndex;
+                instKey.primCount = call.rs.primCount;
+                // Material identity
+                instKey.texture = curMaterial.texture;
+                instKey.blendState = curMaterial.blendState;
+                instKey.alphaState = curMaterial.alphaState;
+                instKey.zState = curMaterial.zState;
+                instKey.cullMode = curMaterial.cullMode;
+                instanceKeyCounts[instKey]++;
+            }
         }
 
         {
@@ -2129,6 +2260,19 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
         g_replayMetrics.uniqueMaterialKeys = (int)seenMaterials.size();
         g_replayMetrics.materialTransitions = materialTransitions;
         g_replayMetrics.totalDrawCalls = drawCallCount;
+
+        // Compute instancing metrics
+        int potentialBatches = 0;
+        int totalBatchableDraws = 0;
+        for (const auto& kv : instanceKeyCounts) {
+            if (kv.second >= 2) {
+                potentialBatches++;
+                totalBatchableDraws += kv.second;
+            }
+        }
+        g_replayMetrics.uniqueInstanceKeys = (int)instanceKeyCounts.size();
+        g_replayMetrics.potentialBatches = potentialBatches;
+        g_replayMetrics.totalBatchableDraws = totalBatchableDraws;
     }
 
     // Slow frame detection: measure total replay time

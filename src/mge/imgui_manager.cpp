@@ -66,6 +66,7 @@ bool ImGuiManager::rasterizeAll = false;
 bool ImGuiManager::stateLeakDetection = false;
 bool ImGuiManager::performanceMode = true;
 bool ImGuiManager::materialSortEnabled = false;
+bool ImGuiManager::instancingEnabled = false;
 
 // Per-bin DIP suppression toggles
 bool ImGuiManager::suppressSky = false;
@@ -428,6 +429,8 @@ void ImGuiManager::RenderDebugInterface() {
         ImGui::SetItemTooltip("Query device state before each draw to detect state leaks. Very slow!");
         ImGui::Checkbox("Material Sort (Opaque/Grass)", &materialSortEnabled);
         ImGui::SetItemTooltip("Sort opaque/grass draws by material to minimize state changes. A/B comparison.");
+        ImGui::Checkbox("GPU Instancing (Experimental)", &instancingEnabled);
+        ImGui::SetItemTooltip("Batch identical geometry+material draws using GPU instancing. Requires material sort.");
 
         ImGui::Separator();
         ImGui::Text("Statistics");
@@ -461,6 +464,21 @@ void ImGuiManager::RenderDebugInterface() {
             ImGui::Text("  Optimal Transitions: %d", optimalTransitions);
             ImGui::Text("  Excess Transitions: %d", excessTransitions > 0 ? excessTransitions : 0);
             ImGui::Text("  Sorting Efficiency: %.1f%%", sortingEfficiency);
+        }
+
+        ImGui::Separator();
+
+        // Instancing opportunity analysis (Opaque/Terrain/Grass bins only)
+        ImGui::Text("Instancing Analysis (Opaque+Terrain+Grass):");
+        ImGui::Text("  Unique InstanceKeys: %d", g_replayMetrics.uniqueInstanceKeys);
+        ImGui::Text("  Potential Batches: %d", g_replayMetrics.potentialBatches);
+        ImGui::Text("  Batchable Draws: %d", g_replayMetrics.totalBatchableDraws);
+        if (g_replayMetrics.uniqueInstanceKeys > 0) {
+            float instanceRatio = (float)g_replayMetrics.totalBatchableDraws / g_replayMetrics.uniqueInstanceKeys;
+            float batchPotential = g_replayMetrics.potentialBatches > 0 ?
+                (1.0f - (float)g_replayMetrics.potentialBatches / g_replayMetrics.totalBatchableDraws) * 100.0f : 0.0f;
+            ImGui::Text("  Instance Ratio: %.2f draws/key", instanceRatio);
+            ImGui::Text("  Draw Call Reduction: %.1f%%", batchPotential);
         }
 
         ImGui::Separator();

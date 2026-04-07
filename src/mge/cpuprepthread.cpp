@@ -162,6 +162,12 @@ void CpuPrepThread::executePrepareFrame(const D3DXMATRIX& view, const D3DXMATRIX
         FixedFunctionShader::applyVisibilityAndFilterRecordMW();
     }
 
+    // Phase 4: Build instance batches (after culling so shouldRender is set)
+    if (ImGuiManager::GetInstancingEnabled()) {
+        MGE_ZoneScopedN("CPT_BuildInstanceBatches");
+        FixedFunctionShader::buildInstanceBatches(fb);
+    }
+
     // Mark buffer ready for GPU
     fb.state = FixedFunctionShader::BufferState::ReadyToRender;
 

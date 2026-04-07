@@ -69,6 +69,10 @@ bool FixedFunctionShader::n1Ready = false;   // Set true after first frame swap
 bool FixedFunctionShader::n2Ready = false;   // Set true after second frame swap
 int FixedFunctionShader::swapCount = 0;      // Track swaps for warm-up
 
+// GPU instancing resources
+IDirect3DVertexBuffer9* FixedFunctionShader::vbFFEInstances = nullptr;
+std::unordered_map<DWORD, IDirect3DVertexDeclaration9*> FixedFunctionShader::fvfDeclCache;
+
 // Pipeline phase tracking for GPU call separation verification
 FixedFunctionShader::PipelinePhase FixedFunctionShader::currentPhase = FixedFunctionShader::PipelinePhase::Idle;
 FixedFunctionShader::PhaseCallCounts FixedFunctionShader::frameCaptureGpuCalls = {};

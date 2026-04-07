@@ -182,6 +182,7 @@ public:
     static bool GetStateLeakDetection() { return stateLeakDetection; }
     static bool GetPerformanceMode() { return performanceMode; }
     static bool GetMaterialSortEnabled() { return materialSortEnabled; }
+    static bool GetInstancingEnabled() { return instancingEnabled; }
 
     // Per-bin DIP suppression toggles
     static bool GetSuppressSky() { return suppressSky; }
@@ -338,6 +339,7 @@ private:
     static bool stateLeakDetection;       // State leak detection debug mode - default false
     static bool performanceMode;          // Dirty tracking performance mode - default true
     static bool materialSortEnabled;      // Material sorting for state change reduction - default false
+    static bool instancingEnabled;        // GPU instancing for draw call reduction - default false
 
     // Per-bin DIP suppression toggles
     static bool suppressSky;
