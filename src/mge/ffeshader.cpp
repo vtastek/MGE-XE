@@ -1584,7 +1584,7 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     }
 
     // Build shader defines based on ShaderKey
-    D3D_SHADER_MACRO defines[10] = {};
+    D3D_SHADER_MACRO defines[12] = {};
     int defineCount = 0;
 
     // Light mode define: 0=sun only, 1=single, 2=few loop, 3=texture
@@ -1624,6 +1624,9 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     if (!sk.useLighting) {
         defines[defineCount++] = {"NOLIT", "1"};
         // LOG::logline("HLSL: Compiling with NOLIT define (unlit shader)");
+    }
+    if (sk.useInstancing) {
+        defines[defineCount++] = {"USE_INSTANCING", "1"};
     }
     defines[defineCount] = {nullptr, nullptr}; // Null terminator
     

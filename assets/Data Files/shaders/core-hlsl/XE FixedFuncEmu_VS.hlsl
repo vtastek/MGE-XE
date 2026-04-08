@@ -39,6 +39,12 @@ struct VS_INPUT {
     float4 color : COLOR0;
     float2 texcoord : TEXCOORD0;
     float4 blendweights : BLENDWEIGHT;
+#ifdef USE_INSTANCING
+    // Instance world matrix columns from stream 1 (using high TEXCOORD indices to avoid conflicts)
+    float4 instWorld0 : TEXCOORD8;   // Column 1: {_11, _21, _31, _41}
+    float4 instWorld1 : TEXCOORD9;   // Column 2: {_12, _22, _32, _42}
+    float4 instWorld2 : TEXCOORD10;  // Column 3: {_13, _23, _33, _43}
+#endif
 };
 
 struct VS_OUTPUT {
@@ -198,6 +204,26 @@ VS_OUTPUT vs_main(VS_INPUT input) {
     else {
         // Rigid vertex
 
+#ifdef USE_INSTANCING
+        // Hardware instancing: read world matrix from vertex stream
+        // Instance data stores columns: world0={_11,_21,_31,_41}, world1={_12,_22,_32,_42}, world2={_13,_23,_33,_43}
+        // For pos * world: result.x = dot(pos, column1), etc.
+        float3 worldpos3;
+        worldpos3.x = dot(input.pos, input.instWorld0);
+        worldpos3.y = dot(input.pos, input.instWorld1);
+        worldpos3.z = dot(input.pos, input.instWorld2);
+        worldpos = float4(worldpos3, 1);
+
+        // Transform normal (use 3x3 rotation part only, w=0)
+        float3 nrm3;
+        nrm3.x = dot(float4(input.normal, 0), input.instWorld0);
+        nrm3.y = dot(float4(input.normal, 0), input.instWorld1);
+        nrm3.z = dot(float4(input.normal, 0), input.instWorld2);
+
+        // Transform to view space
+        viewpos = mul(worldpos, view);
+        normal = mul(float4(nrm3, 0), view).xyz;
+#else
 	#ifdef HAS_GRASS
         // Use grass displacement for grass geometry
         float3 displacement = grassDisplacement(input.pos.xyz, input.pos.z, 2.5);
@@ -214,6 +240,7 @@ VS_OUTPUT vs_main(VS_INPUT input) {
 
         viewpos = mul(input.pos, worldview);
         normal = mul(float4(input.normal, 0), worldview).xyz;
+#endif
 
     }
 

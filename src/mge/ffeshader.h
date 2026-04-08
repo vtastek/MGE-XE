@@ -364,6 +364,7 @@ class FixedFunctionShader {
         DWORD hasShadows : 1;          // Has shadow mapping enabled
         DWORD hasGrass : 1;            // Is grass texture (enables vertex animation and A2C)
         DWORD hasDetail : 1;           // Has detail texture (conditional binding to minimize overhead)
+        DWORD useInstancing : 1;       // Uses hardware instancing (world from vertex stream)
 
         struct Stage {
             DWORD colorOp : 6;

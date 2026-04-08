@@ -2017,8 +2017,172 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     IDirect3DVertexDeclaration9* instDecl = getInstancedDecl(firstCall.rs.fvf);
                     if (!instDecl) continue;
 
+                    // Build ShaderKey with instancing enabled
+                    ShaderKey sk(&firstCall.rs, &firstCall.frs, firstCall.lightrs.get());
+                    sk.useInstancing = 1;
+                    sk.hasShadows = ((Configuration.MGEFlags & USE_SHADOWS) && (Configuration.MGEFlags & USE_DISTANT_LAND)) ? 1 : 0;
+
+                    // Look up instanced shader variant
+                    HLSLShader hlslShader = {};
+                    AcquireSRWLockShared(&hlslCacheLock);
+                    auto iShader = cacheHLSLShaders.find(sk);
+                    if (iShader != cacheHLSLShaders.end()) {
+                        hlslShader = iShader->second;
+                    }
+                    ReleaseSRWLockShared(&hlslCacheLock);
+
+                    // If shader not found, queue compilation and skip this batch
+                    if (!hlslShader.vertexShader || !hlslShader.pixelShader) {
+                        queueShaderCompilation(sk);
+                        // Don't skip batched calls - let them render normally
+                        for (size_t idx : batch.callIndices) {
+                            batchedCallIndices.erase(idx);
+                        }
+                        continue;
+                    }
+
+                    // Set shaders
+                    device->SetVertexShader(hlslShader.vertexShader);
+                    device->SetPixelShader(hlslShader.pixelShader);
+
+                    // Set view/proj matrices (world comes from instance stream)
+                    D3DXMATRIX viewT, projT;
+                    D3DXMatrixTranspose(&viewT, &fb.currentView);
+                    D3DXMatrixTranspose(&projT, &fb.currentProj);
+                    device->SetVertexShaderConstantF(12, (float*)&viewT, 4);  // view at c12
+                    device->SetVertexShaderConstantF(0, (float*)&projT, 4);   // proj at c0
+
+                    // Set vertexBlendState = 0 (rigid geometry)
+                    float blendState[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                    device->SetVertexShaderConstantF(48, blendState, 1);
+
+                    // Set PS constants for materials and lighting via constant table
+                    if (hlslShader.psConstantTable) {
+                        // Material constants
+                        if (hlslShader.hMaterialDiffuse)
+                            hlslShader.psConstantTable->SetVector(device, hlslShader.hMaterialDiffuse, (D3DXVECTOR4*)&firstCall.frs.material.diffuse);
+                        if (hlslShader.hMaterialAmbient)
+                            hlslShader.psConstantTable->SetVector(device, hlslShader.hMaterialAmbient, (D3DXVECTOR4*)&firstCall.frs.material.ambient);
+                        if (hlslShader.hMaterialEmissive)
+                            hlslShader.psConstantTable->SetVector(device, hlslShader.hMaterialEmissive, (D3DXVECTOR4*)&firstCall.frs.material.emissive);
+
+                        // Compute lighting from lightrs - transform to view space
+                        // Use the same transform logic as main loop for consistency
+                        RGBVECTOR instSunDiffuse(0, 0, 0), instAmbient = firstCall.lightrs->globalAmbient;
+                        D3DXVECTOR3 instSunDir(0, 0, 1);
+
+                        // Point light buffers
+                        const size_t MaxLights = 8;
+                        D3DXVECTOR4 instLightDiffuse[MaxLights] = {};
+                        D3DXVECTOR3 instLightPos[MaxLights] = {};
+                        float instLightAmbient[MaxLights] = {};
+                        float instLightFalloffQ[MaxLights] = {};
+                        float instFalloffConst = 0.33f;
+                        size_t instPointLightCount = 0;
+                        bool needPointLights = (sk.lightMode == 1 || sk.lightMode == 2);
+
+                        // Get view matrix for transforms - use recorded viewTransform from first call
+                        const D3DXMATRIX& viewForLights = firstCall.rs.viewTransform;
+
+                        for (DWORD lightId : firstCall.lightrs->active) {
+                            auto lightIt = firstCall.lightrs->lights.find(lightId);
+                            if (lightIt != firstCall.lightrs->lights.end()) {
+                                // Non-const access to allow transform caching
+                                auto& light = const_cast<LightState::Light&>(lightIt->second);
+
+                                // Transform to view space if not already done (same as main loop)
+                                if (firstCall.lightrs->lightsTransformed.find(lightId) == firstCall.lightrs->lightsTransformed.end()) {
+                                    if (light.type == D3DLIGHT_DIRECTIONAL) {
+                                        D3DXVec3TransformNormal((D3DXVECTOR3*)&light.viewspacePos, (D3DXVECTOR3*)&light.position, &viewForLights);
+                                    } else {
+                                        D3DXVec3TransformCoord((D3DXVECTOR3*)&light.viewspacePos, (D3DXVECTOR3*)&light.position, &viewForLights);
+                                    }
+                                    const_cast<LightState*>(firstCall.lightrs.get())->lightsTransformed[lightId] = true;
+                                }
+
+                                if (light.type == D3DLIGHT_DIRECTIONAL) {
+                                    instSunDiffuse = light.diffuse;
+                                    instSunDir = *(D3DXVECTOR3*)&light.viewspacePos;
+                                    instAmbient.r += light.ambient.x;
+                                    instAmbient.g += light.ambient.y;
+                                    instAmbient.b += light.ambient.z;
+                                } else if (light.type == D3DLIGHT_POINT && needPointLights && instPointLightCount < MaxLights) {
+                                    // Copy diffuse first (same as main loop)
+                                    memcpy(&instLightDiffuse[instPointLightCount], &light.diffuse, sizeof(light.diffuse));
+                                    instLightPos[instPointLightCount] = *(D3DXVECTOR3*)&light.viewspacePos;
+
+                                    // Falloff handling (matching main loop logic)
+                                    if (light.falloff.x > 0) {
+                                        instFalloffConst = light.falloff.x;
+                                        instLightFalloffQ[instPointLightCount] = light.falloff.z;
+                                    } else if (light.falloff.z > 0) {
+                                        instLightDiffuse[instPointLightCount].x *= instFalloffConst;
+                                        instLightDiffuse[instPointLightCount].y *= instFalloffConst;
+                                        instLightDiffuse[instPointLightCount].z *= instFalloffConst;
+                                        instLightAmbient[instPointLightCount] = 1.0f + 1e-4f / sqrtf(light.falloff.z);
+                                        instLightFalloffQ[instPointLightCount] = instFalloffConst * light.falloff.z;
+                                    } else if (light.falloff.y == 0.10000001f) {
+                                        instLightFalloffQ[instPointLightCount] = 5e-5f;
+                                    } else if (light.falloff.y > 0) {
+                                        float brightness = 0.25f + 1e-4f / light.falloff.y;
+                                        instLightDiffuse[instPointLightCount] = D3DXVECTOR4(brightness, brightness, brightness, 1.0f);
+                                        instLightAmbient[instPointLightCount] = 1.0f;
+                                        instLightFalloffQ[instPointLightCount] = 0.5555f * light.falloff.y * light.falloff.y;
+                                        instLightPos[instPointLightCount].z += 25.0f;
+                                    }
+                                    instPointLightCount++;
+                                }
+                            }
+                        }
+                        instSunDiffuse *= sunMultiplier;
+                        instAmbient *= ambMultiplier;
+
+                        // Set sun/ambient constants
+                        if (hlslShader.hLightSunDirection)
+                            hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightSunDirection, (const float*)&instSunDir, 3);
+                        if (hlslShader.hLightSunDiffuse)
+                            hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightSunDiffuse, (const float*)&instSunDiffuse, 3);
+                        if (hlslShader.hLightSceneAmbient)
+                            hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightSceneAmbient, (const float*)&instAmbient, 3);
+
+                        // Set point light constants (if lightMode 1 or 2)
+                        if (needPointLights) {
+                            if (hlslShader.hLightDiffuse)
+                                hlslShader.psConstantTable->SetVectorArray(device, hlslShader.hLightDiffuse, instLightDiffuse, MaxLights);
+                            if (hlslShader.hLightPosition)
+                                hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightPosition, (float*)instLightPos, 3 * MaxLights);
+                            if (hlslShader.hLightAmbient)
+                                hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightAmbient, instLightAmbient, MaxLights);
+                            if (hlslShader.hLightFalloffQuadratic)
+                                hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightFalloffQuadratic, instLightFalloffQ, MaxLights);
+                            if (hlslShader.hPointLightCount)
+                                hlslShader.psConstantTable->SetInt(device, hlslShader.hPointLightCount, (int)instPointLightCount);
+                        }
+
+                        // Fog color from staging
+                        D3DXHANDLE hFogColNear = hlslShader.psConstantTable->GetConstantByName(NULL, "fogColNear");
+                        if (hFogColNear) {
+                            float fogColor[4] = { DistantLand::s_staging.nearFogCol.r, DistantLand::s_staging.nearFogCol.g, DistantLand::s_staging.nearFogCol.b, 1.0f };
+                            hlslShader.psConstantTable->SetVector(device, hFogColNear, (D3DXVECTOR4*)fogColor);
+                        }
+
+                        // Shading mode (vertexMaterial in .z component)
+                        D3DXHANDLE hShadingMode = hlslShader.psConstantTable->GetConstantByName(NULL, "shadingMode");
+                        if (hShadingMode) {
+                            float shadingModeData[4] = {0, 0, (float)sk.vertexMaterial, 0};
+                            hlslShader.psConstantTable->SetFloatArray(device, hShadingMode, shadingModeData, 4);
+                        }
+
+                        // Material alpha and vertex color flag
+                        D3DXHANDLE hHasVCol = hlslShader.psConstantTable->GetConstantByName(NULL, "hasVCol");
+                        if (hHasVCol) hlslShader.psConstantTable->SetBool(device, hHasVCol, (firstCall.rs.fvf & D3DFVF_DIFFUSE) != 0);
+                        D3DXHANDLE hMaterialAlpha = hlslShader.psConstantTable->GetConstantByName(NULL, "materialAlpha");
+                        if (hMaterialAlpha) hlslShader.psConstantTable->SetFloat(device, hMaterialAlpha, firstCall.frs.material.diffuse.a);
+                        D3DXHANDLE hAlphaRef = hlslShader.psConstantTable->GetConstantByName(NULL, "alphaRef");
+                        if (hAlphaRef) hlslShader.psConstantTable->SetFloat(device, hAlphaRef, firstCall.rs.alphaRef / 255.0f);
+                    }
+
                     // Set material state from first call
-                    // TODO: Full material state setup (texture, blend, etc.)
                     device->SetTexture(0, firstCall.rs.texture);
                     if (firstCall.expectedState.captured) {
                         device->SetRenderState(D3DRS_ALPHABLENDENABLE, firstCall.expectedState.alphaBlendEnable);
@@ -2123,9 +2287,9 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
             hasPrevMaterial = true;
             drawCallCount++;
 
-            // Instancing metrics: track geometry+material combos for Opaque bin only
-            // (Skinning excluded - different bone palettes per object)
-            if (call.bin == RenderBin::Opaque || call.bin == RenderBin::Terrain || call.bin == RenderBin::Grass) {
+            // Instancing metrics: track geometry+material combos for Opaque/Terrain only
+            // (Skinning excluded - different bone palettes, Grass excluded - not HLSL)
+            if (call.bin == RenderBin::Opaque || call.bin == RenderBin::Terrain) {
                 InstanceKey instKey;
                 // Geometry identity
                 instKey.vb = call.rs.vb;

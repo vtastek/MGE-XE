@@ -756,8 +756,8 @@ void FixedFunctionShader::buildInstanceBatches(FrameBuffer& fb) {
     for (size_t i = 0; i < calls.size(); i++) {
         const auto& call = calls[i];
 
-        // Only batch Opaque/Terrain/Grass bins (no Skinning - different bone palettes)
-        if (call.bin != RenderBin::Opaque && call.bin != RenderBin::Terrain && call.bin != RenderBin::Grass)
+        // Only batch Opaque/Terrain bins (no Skinning - different bone palettes, no Grass - not HLSL)
+        if (call.bin != RenderBin::Opaque && call.bin != RenderBin::Terrain)
             continue;
 
         // Skip if already culled
@@ -822,7 +822,10 @@ static bool fvfToElements(DWORD fvf, std::vector<D3DVERTEXELEMENT9>& elements) {
     }
 
     // Blend weights (XYZB1-4)
-    int blendWeights = (fvf >> 1) & 0x7;  // D3DFVF_XYZB1-4 encoding
+    // FVF position encoding: XYZ=1, XYZRHW=2, XYZB1=3, XYZB2=4, XYZB3=5, XYZB4=6
+    // Blend weight count = position_type - 2 (for types >= 3)
+    int posType = (fvf >> 1) & 0x7;
+    int blendWeights = (posType >= 3) ? (posType - 2) : 0;
     if (blendWeights > 0 && blendWeights <= 4) {
         BYTE types[] = {D3DDECLTYPE_FLOAT1, D3DDECLTYPE_FLOAT2, D3DDECLTYPE_FLOAT3, D3DDECLTYPE_FLOAT4};
         elements.push_back({0, offset, types[blendWeights - 1], D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_BLENDWEIGHT, 0});
