@@ -143,8 +143,9 @@ sampler LightDataSampler : register(s5) = sampler_state {
 float4 lightDataParams : register(c50);
 
 // Read light data from texture
-float4 readLightTexel(int lightIndex, int texelOffset) {
-    float u = (lightDataParams.z + lightIndex * 3 + texelOffset + 0.5) * lightDataParams.y;  // texelOffset + local offset
+// params: {numLights, texelSize, texelOffset, unused}
+float4 readLightTexel(float4 params, int lightIndex, int texelOffset) {
+    float u = (params.z + lightIndex * 3 + texelOffset + 0.5) * params.y;
     return tex2Dlod(LightDataSampler, float4(u, 0.5, 0, 0));
 }
 
@@ -156,18 +157,18 @@ struct PointLightResult {
     float neglight;
 };
 
-PointLightResult evaluatePointLightsPBR(float3 viewPos, float3 normal, float3 V, float3 albedo, float metalness, float roughness, float radius, float3 F0) {
+PointLightResult evaluatePointLightsPBR(float4 lightParams, float3 viewPos, float3 normal, float3 V, float3 albedo, float metalness, float roughness, float radius, float3 F0) {
     PointLightResult result;
     result.diffuse = float3(0, 0, 0);
     result.specular = float3(0, 0, 0);
     result.neglight = 0.0;
 
-    int numLights = (int)lightDataParams.x;
+    int numLights = (int)lightParams.x;
 
     for (int i = 0; i < numLights; i++) {
-        float4 posRadius = readLightTexel(i, 0);
-        float4 color = readLightTexel(i, 1);
-        float4 falloff = readLightTexel(i, 2);
+        float4 posRadius = readLightTexel(lightParams, i, 0);
+        float4 color = readLightTexel(lightParams, i, 1);
+        float4 falloff = readLightTexel(lightParams, i, 2);
 
         float3 lightPos = posRadius.xyz;
         float3 toLight = lightPos - viewPos;
@@ -195,14 +196,14 @@ PointLightResult evaluatePointLightsPBR(float3 viewPos, float3 normal, float3 V,
 }
 
 // Legacy simple diffuse version (kept for compatibility)
-float3 evaluatePointLights(float3 viewPos, float3 normal) {
+float3 evaluatePointLights(float4 lightParams, float3 viewPos, float3 normal) {
     float3 lighting = float3(0, 0, 0);
-    int numLights = (int)lightDataParams.x;
+    int numLights = (int)lightParams.x;
 
     for (int i = 0; i < numLights; i++) {
-        float4 posRadius = readLightTexel(i, 0);
-        float4 color = readLightTexel(i, 1);
-        float4 falloff = readLightTexel(i, 2);
+        float4 posRadius = readLightTexel(lightParams, i, 0);
+        float4 color = readLightTexel(lightParams, i, 1);
+        float4 falloff = readLightTexel(lightParams, i, 2);
 
         float3 lightPos = posRadius.xyz;
         float3 toLight = lightPos - viewPos;

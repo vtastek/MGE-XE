@@ -338,6 +338,10 @@ void DistantLand::renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer*
             if (ImGuiManager::GetInstancingEnabled()) {
                 FixedFunctionShader::buildInstanceBatches(FixedFunctionShader::getPrepBuffer());
             }
+            // Build stateless batches (alternative to instancing)
+            if (ImGuiManager::GetEnableStatelessBatch()) {
+                FixedFunctionShader::buildStatelessBatches(FixedFunctionShader::getPrepBuffer());
+            }
         }
 
         // Single RT switch for all depth rendering (renderDepth + StretchRect + renderDepthDistantLand + MSAA resolve)

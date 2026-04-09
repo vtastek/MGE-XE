@@ -160,7 +160,7 @@ const iniSetting iniSettings[] = {
     {&Configuration.MGEFlags, t_bit, USE_ATM_SCATTER_BIT, siniDL, "Use Atmosphere Scattering", False, &dictBool, DICTONLY, 0, 0},
     {&Configuration.MGEFlags, t_bit, USE_GRASS_BIT, siniDL, "Render Grass", True, &dictBool, DICTONLY, 0, 0},
     {&Configuration.MGEFlags, t_bit, USE_SHADOWS_BIT, siniDL, "Sun Shadows", True, &dictBool, DICTONLY, 0, 0},
-    {&Configuration.MGEFlags, t_bit, USE_FFESHADER_BIT, siniDL, "Per Pixel Shader", False, &dictBool, DICTONLY, 0, 0},
+    {&Configuration.MGEFlags, t_bit, USE_FFESHADER_BIT, siniDL, "Per Pixel Shader", True, &dictBool, DICTONLY, 0, 0},
 
     // Renderer options
     {&Configuration.AALevel, t_uint8, 1, siniGlobGraph, "Antialiasing Level", "None", &dictAA, DICTONLY|DONT_SAVE, 0, 0},
@@ -175,7 +175,7 @@ const iniSetting iniSettings[] = {
     {&Configuration.MGEFlags, t_bit, USE_HW_SHADER_BIT, siniRendState, "Hardware Shader", False, &dictBool, DICTONLY, 0, 0},
     {&Configuration.HDRReactionSpeed, t_float, 1, siniRendState, "HDR Reaction Time", "2", NULL, MINMAX, 0.01, 30},
     {&Configuration.UseDefaultTexturePool, t_bool, 1, siniRendState, "Reduce Texture Memory Use", True, &dictBool, DICTONLY|DONT_SAVE, 0, 0},
-    {&Configuration.PerPixelLightFlags, t_uint32, 1, siniDL, "Per Pixel Shader Flags", "Always", &dictPPLFlags, DICTONLY, 0, 0},
+    {&Configuration.PerPixelLightFlags, t_uint32, 1, siniDL, "Per Pixel Shader Flags", "HLSL", &dictPPLFlags, DICTONLY, 0, 0},
 
     // Generic variables
     {&Configuration.SSFormat, t_uint8, 1, siniRendState, "Screenshot Format", "PNG", &dictSSFormat, DICTONLY|DONT_SAVE, 0, 0},

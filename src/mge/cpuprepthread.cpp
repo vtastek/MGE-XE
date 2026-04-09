@@ -168,6 +168,12 @@ void CpuPrepThread::executePrepareFrame(const D3DXMATRIX& view, const D3DXMATRIX
         FixedFunctionShader::buildInstanceBatches(fb);
     }
 
+    // Phase 4b: Build stateless batches (alternative to instancing)
+    if (ImGuiManager::GetEnableStatelessBatch()) {
+        MGE_ZoneScopedN("CPT_BuildStatelessBatches");
+        FixedFunctionShader::buildStatelessBatches(fb);
+    }
+
     // Mark buffer ready for GPU
     fb.state = FixedFunctionShader::BufferState::ReadyToRender;
 

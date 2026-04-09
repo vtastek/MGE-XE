@@ -24,6 +24,8 @@ float ImGuiManager::pcfSlopeBias = 0.001f;       // Slope-based bias to prevent 
 // Debug interface controls
 int ImGuiManager::bboxVisualizationMode = 0;
 bool ImGuiManager::disableHiZCulling = false;
+bool ImGuiManager::enableStatelessBatch = false;
+bool ImGuiManager::forceLightMode3 = false;
 
 // Debug stats
 int ImGuiManager::debugRecordedCalls = 0;
@@ -416,6 +418,8 @@ void ImGuiManager::RenderDebugInterface() {
         ImGui::Separator();
 
         ImGui::Checkbox("Disable Hi-Z Culling (terrain hole diagnosis)", &disableHiZCulling);
+        ImGui::Checkbox("Force LightMode 3 (texture lights)", &forceLightMode3);
+        ImGui::Checkbox("Enable Stateless Batching (experimental)", &enableStatelessBatch);
 
         ImGui::Separator();
         ImGui::Text("Optimization Modes");
@@ -645,6 +649,8 @@ bool ImGuiManager::GetEnableImmediateRendering() { return true; }
 bool ImGuiManager::GetEnableDepthPass() { return true; }
 int ImGuiManager::GetBBoxVisualizationMode() { return bboxVisualizationMode; }
 bool ImGuiManager::GetDisableHiZCulling() { return disableHiZCulling; }
+bool ImGuiManager::GetEnableStatelessBatch() { return enableStatelessBatch; }
+bool ImGuiManager::GetForceLightMode3() { return forceLightMode3; }
 
 void ImGuiManager::UpdateDebugStats(int recordedCalls, int renderedCalls, int culledCalls,
                                      int sceneLights, int recordMWSize, int immediateCount) {

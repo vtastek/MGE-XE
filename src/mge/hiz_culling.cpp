@@ -738,6 +738,13 @@ void FixedFunctionShader::releaseInstancing() {
         }
     }
     fvfDeclCache.clear();
+
+    for (auto& kv : statelessDeclCache) {
+        if (kv.second) {
+            kv.second->Release();
+        }
+    }
+    statelessDeclCache.clear();
 }
 
 void FixedFunctionShader::buildInstanceBatches(FrameBuffer& fb) {
@@ -805,6 +812,131 @@ void FixedFunctionShader::buildInstanceBatches(FrameBuffer& fb) {
     if (!fb.instanceBatches.empty()) {
         LOG::logline("Instancing: %d batches, %d batched draws (of %d total)",
                      (int)fb.instanceBatches.size(), totalBatched, (int)calls.size());
+    }
+}
+
+// Build stateless batches: groups by geometry + render state (material data in texture)
+void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
+    MGE_ZoneScopedN("buildStatelessBatches");
+
+    fb.statelessBatches.clear();
+    fb.drawDataStaging.clear();
+
+    if (!ImGuiManager::GetEnableStatelessBatch()) return;
+
+    auto& calls = fb.recordedCalls;
+    if (calls.empty()) return;
+
+    // Group calls by StatelessBatchKey (geometry + render state, NOT material)
+    std::unordered_map<StatelessBatchKey, std::vector<size_t>, StatelessBatchKey::Hasher> batchGroups;
+
+    for (size_t i = 0; i < calls.size(); i++) {
+        const auto& call = calls[i];
+
+        // Only batch Opaque/Terrain bins (no Skinning - bone palettes, no Grass)
+        if (call.bin != RenderBin::Opaque && call.bin != RenderBin::Terrain)
+            continue;
+
+        // Skip if already culled
+        if (!call.shouldRender) continue;
+
+        StatelessBatchKey key;
+        // Geometry identity
+        key.vb = call.rs.vb;
+        key.ib = call.rs.ib;
+        key.fvf = call.rs.fvf;
+        key.baseIndex = call.rs.baseIndex;
+        key.vertCount = call.rs.vertCount;
+        key.startIndex = call.rs.startIndex;
+        key.primCount = call.rs.primCount;
+        // Render state (NOT material - that goes in texture)
+        key.texture = call.rs.texture;
+        key.blendState = (uint16_t)((call.expectedState.captured ? call.expectedState.alphaBlendEnable : 0) |
+                         ((call.expectedState.captured ? call.expectedState.srcBlend : 0) << 4) |
+                         ((call.expectedState.captured ? call.expectedState.destBlend : 0) << 8));
+        key.zState = (uint8_t)((call.expectedState.captured ? call.expectedState.zEnable : 1) |
+                     ((call.expectedState.captured ? call.expectedState.zWriteEnable : 1) << 2));
+        key.cullMode = call.expectedState.captured ? (uint8_t)call.expectedState.cullMode : D3DCULL_CW;
+        key.useLighting = call.rs.useLighting ? 1 : 0;
+
+        batchGroups[key].push_back(i);
+    }
+
+    // Build batches from groups with 2+ instances
+    UINT drawDataOffset = 0;
+    for (auto& kv : batchGroups) {
+        if (kv.second.size() >= 2) {
+            StatelessBatch batch;
+            batch.key = kv.first;
+            batch.callIndices = std::move(kv.second);
+            batch.drawDataOffset = drawDataOffset;
+
+            // Fill draw data for each instance in this batch
+            for (size_t callIdx : batch.callIndices) {
+                const auto& call = calls[callIdx];
+                StatelessDrawData data;
+
+                // World matrix rows (transposed for shader row-major access)
+                const D3DXMATRIX& w = call.rs.worldTransforms[0];
+                data.world0[0] = w._11; data.world0[1] = w._21; data.world0[2] = w._31; data.world0[3] = w._41;
+                data.world1[0] = w._12; data.world1[1] = w._22; data.world1[2] = w._32; data.world1[3] = w._42;
+                data.world2[0] = w._13; data.world2[1] = w._23; data.world2[2] = w._33; data.world2[3] = w._43;
+
+                // Material diffuse
+                data.diffuse[0] = call.frs.material.diffuse.r;
+                data.diffuse[1] = call.frs.material.diffuse.g;
+                data.diffuse[2] = call.frs.material.diffuse.b;
+                data.diffuse[3] = call.frs.material.diffuse.a;
+
+                // Material ambient
+                data.ambient[0] = call.frs.material.ambient.r;
+                data.ambient[1] = call.frs.material.ambient.g;
+                data.ambient[2] = call.frs.material.ambient.b;
+                data.ambient[3] = call.frs.material.ambient.a;
+
+                // Material emissive + alphaRef
+                data.emissive[0] = call.frs.material.emissive.r;
+                data.emissive[1] = call.frs.material.emissive.g;
+                data.emissive[2] = call.frs.material.emissive.b;
+                data.emissive[3] = (float)call.rs.alphaRef / 255.0f;
+
+                // Light params (for future texture-based lighting)
+                data.lightParams[0] = 0.0f;  // pointLightCount - TODO
+                data.lightParams[1] = 0.0f;  // lightTexelOffset - TODO
+                data.lightParams[2] = 0.0f;  // texelSize - TODO
+                data.lightParams[3] = 0.0f;
+
+                // Flags
+                data.flags[0] = (float)call.sk.vertexMaterial;
+                data.flags[1] = (call.rs.fvf & D3DFVF_DIFFUSE) ? 1.0f : 0.0f;
+                data.flags[2] = 0.0f;
+                data.flags[3] = 0.0f;
+
+                fb.drawDataStaging.push_back(data);
+                drawDataOffset++;
+            }
+
+            fb.statelessBatches.push_back(std::move(batch));
+        }
+    }
+
+    // Log batching stats
+    int totalBatched = 0;
+    for (const auto& batch : fb.statelessBatches) {
+        totalBatched += (int)batch.callIndices.size();
+    }
+
+    // Count visible calls for accurate reporting
+    int visibleCalls = 0;
+    for (const auto& call : calls) {
+        if (call.shouldRender && (call.bin == RenderBin::Opaque || call.bin == RenderBin::Terrain)) {
+            visibleCalls++;
+        }
+    }
+
+    if (!fb.statelessBatches.empty()) {
+        LOG::logline("StatelessBatch: %d batches, %d batched draws (of %d visible, %d total)",
+                     (int)fb.statelessBatches.size(), totalBatched, visibleCalls, (int)calls.size());
     }
 }
 
@@ -906,5 +1038,44 @@ IDirect3DVertexDeclaration9* FixedFunctionShader::getInstancedDecl(DWORD fvf) {
 
     fvfDeclCache[fvf] = decl;
     LOG::logline("-- Created instanced vertex decl for FVF 0x%08X", fvf);
+    return decl;
+}
+
+// Get or create stateless batch vertex declaration for FVF
+// Similar to getInstancedDecl but stream 1 only has a single float (drawIndex)
+IDirect3DVertexDeclaration9* FixedFunctionShader::getStatelessBatchDecl(DWORD fvf) {
+    // Check cache first
+    auto it = statelessDeclCache.find(fvf);
+    if (it != statelessDeclCache.end()) {
+        return it->second;
+    }
+
+    // Build declaration elements from FVF
+    std::vector<D3DVERTEXELEMENT9> elements;
+    if (!fvfToElements(fvf, elements)) {
+        LOG::logline("!! Failed to convert FVF 0x%08X to vertex elements for stateless batch", fvf);
+        statelessDeclCache[fvf] = nullptr;
+        return nullptr;
+    }
+
+    // Add stateless batch stream element (TEXCOORD8 for drawIndex - single float)
+    elements.push_back({1, 0, D3DDECLTYPE_FLOAT1, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 8});
+
+    // End marker
+    elements.push_back(D3DDECL_END());
+
+    // Create vertex declaration
+    auto* device = DistantLand::device;
+    IDirect3DVertexDeclaration9* decl = nullptr;
+    HRESULT hr = device->CreateVertexDeclaration(elements.data(), &decl);
+
+    if (FAILED(hr)) {
+        LOG::logline("!! Failed to create stateless batch vertex decl for FVF 0x%08X", fvf);
+        statelessDeclCache[fvf] = nullptr;
+        return nullptr;
+    }
+
+    statelessDeclCache[fvf] = decl;
+    LOG::logline("-- Created stateless batch vertex decl for FVF 0x%08X", fvf);
     return decl;
 }

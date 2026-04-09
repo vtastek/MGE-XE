@@ -31,6 +31,20 @@ float2 footPos : register(c55);
 matrix shadowWorldViewProj[2] : register(c60); // c60-c67
 #endif
 
+#ifdef USE_STATELESS_BATCH
+// Draw data texture: 8 texels wide x maxDraws tall, A32B32G32R32F
+// Texel layout per draw (128 bytes = 8 texels):
+//   0-2: World matrix rows (transposed)
+//   3: Material diffuse RGBA
+//   4: Material ambient RGBA
+//   5: Emissive RGB, alphaRef in w
+//   6: Light params
+//   7: Flags
+// Note: Vertex texture sampler uses D3DVERTEXTEXTURESAMPLER0 (sampler 0 in VS)
+sampler sampDrawData : register(s0);
+float4 drawDataParams : register(c70);  // {1/width=0.125, 1/height, 0, 0}
+#endif
+
 //------------------------------------------------------------
 // Vertex Input/Output
 struct VS_INPUT {
@@ -45,6 +59,10 @@ struct VS_INPUT {
     float4 instWorld1 : TEXCOORD9;   // Column 2: {_12, _22, _32, _42}
     float4 instWorld2 : TEXCOORD10;  // Column 3: {_13, _23, _33, _43}
 #endif
+#ifdef USE_STATELESS_BATCH
+    // Draw index for texture lookup (stream 1)
+    float drawIndex : TEXCOORD8;
+#endif
 };
 
 struct VS_OUTPUT {
@@ -57,6 +75,9 @@ struct VS_OUTPUT {
 #ifdef HAS_SHADOWS
     float4 shadow0pos : TEXCOORD4;  // Shadow map 0 position
     float4 shadow1pos : TEXCOORD5;  // Shadow map 1 position
+#endif
+#ifdef USE_STATELESS_BATCH
+    float drawIndex : TEXCOORD6;  // Draw index for PS material lookup
 #endif
 };
 
@@ -223,6 +244,35 @@ VS_OUTPUT vs_main(VS_INPUT input) {
         // Transform to view space
         viewpos = mul(worldpos, view);
         normal = mul(float4(nrm3, 0), view).xyz;
+#elif defined(USE_STATELESS_BATCH)
+        // Stateless batching: read world matrix from texture using drawIndex
+        // Texture is 8 wide (8 texels per draw), height = maxDraws
+        // drawDataParams.x = 1/8 = 0.125 (texel width in UV)
+        // drawDataParams.y = 1/height (texel height in UV)
+        float drawV = (input.drawIndex + 0.5) * drawDataParams.y;  // Center of row
+        float texelW = drawDataParams.x;  // 0.125 for 8-wide texture
+
+        // Sample world matrix rows (texels 0, 1, 2)
+        float4 world0 = tex2Dlod(sampDrawData, float4(0.5 * texelW, drawV, 0, 0));
+        float4 world1 = tex2Dlod(sampDrawData, float4(1.5 * texelW, drawV, 0, 0));
+        float4 world2 = tex2Dlod(sampDrawData, float4(2.5 * texelW, drawV, 0, 0));
+
+        // Transform position: result.x = dot(pos, column1), etc.
+        float3 worldpos3;
+        worldpos3.x = dot(input.pos, world0);
+        worldpos3.y = dot(input.pos, world1);
+        worldpos3.z = dot(input.pos, world2);
+        worldpos = float4(worldpos3, 1);
+
+        // Transform normal (use 3x3 rotation part only, w=0)
+        float3 nrm3;
+        nrm3.x = dot(float4(input.normal, 0), world0);
+        nrm3.y = dot(float4(input.normal, 0), world1);
+        nrm3.z = dot(float4(input.normal, 0), world2);
+
+        // Transform to view space
+        viewpos = mul(worldpos, view);
+        normal = mul(float4(nrm3, 0), view).xyz;
 #else
 	#ifdef HAS_GRASS
         // Use grass displacement for grass geometry
@@ -263,6 +313,11 @@ VS_OUTPUT vs_main(VS_INPUT input) {
     output.shadow1pos = mul(worldpos, shadowWorldViewProj[1]);
     output.shadow0pos.z = output.shadow0pos.z / output.shadow0pos.w;
     output.shadow1pos.z = output.shadow1pos.z / output.shadow1pos.w;
+#endif
+
+#ifdef USE_STATELESS_BATCH
+    // Pass draw index to pixel shader for material lookup
+    output.drawIndex = input.drawIndex;
 #endif
 
     return output;

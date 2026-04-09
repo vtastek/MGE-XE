@@ -72,6 +72,7 @@ int FixedFunctionShader::swapCount = 0;      // Track swaps for warm-up
 // GPU instancing resources
 IDirect3DVertexBuffer9* FixedFunctionShader::vbFFEInstances = nullptr;
 std::unordered_map<DWORD, IDirect3DVertexDeclaration9*> FixedFunctionShader::fvfDeclCache;
+std::unordered_map<DWORD, IDirect3DVertexDeclaration9*> FixedFunctionShader::statelessDeclCache;
 
 // Pipeline phase tracking for GPU call separation verification
 FixedFunctionShader::PipelinePhase FixedFunctionShader::currentPhase = FixedFunctionShader::PipelinePhase::Idle;
@@ -1627,6 +1628,9 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     }
     if (sk.useInstancing) {
         defines[defineCount++] = {"USE_INSTANCING", "1"};
+    }
+    if (sk.useStatelessBatch) {
+        defines[defineCount++] = {"USE_STATELESS_BATCH", "1"};
     }
     defines[defineCount] = {nullptr, nullptr}; // Null terminator
     

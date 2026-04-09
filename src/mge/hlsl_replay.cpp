@@ -302,25 +302,37 @@ void FixedFunctionShader::bindShaderTextures(const ShaderKey& sk, const Rendered
                     bindState.boundParamX = nullptr;
 
                     if (cached->variants) {
+                        // Debug: log suffix binding attempts
+                        static int bindLogCount = 0;
+                        bool shouldLog = (bindLogCount < 5);
+
                         // Slot 2: ParamH (metallic/roughness) - load once per texture change
                         if (sk.hasParamH && cached->variants->hasParamH()) {
                             if (!bindState.boundParamH) {
                                 bindState.boundParamH = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *cached->variants, "paramh");
+                                if (shouldLog) LOG::logline("bindShaderTextures: loaded paramH=%p for %s", bindState.boundParamH, cached->textureName.c_str());
                             }
                             if (bindState.boundParamH) {
                                 setCachedTextureWithSamplerPreservation(device, 2, bindState.boundParamH);
+                                if (shouldLog) LOG::logline("bindShaderTextures: bound paramH to slot 2");
                             }
+                        } else if (shouldLog && sk.hasParamH) {
+                            LOG::logline("bindShaderTextures: sk.hasParamH but variants->hasParamH()=%d", cached->variants->hasParamH());
                         }
 
                         // Slot 3: ParamX (anisotropic) - load once per texture change
                         if (sk.hasParamX && cached->variants->hasParamX()) {
                             if (!bindState.boundParamX) {
                                 bindState.boundParamX = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *cached->variants, "paramx");
+                                if (shouldLog) LOG::logline("bindShaderTextures: loaded paramX=%p for %s", bindState.boundParamX, cached->textureName.c_str());
                             }
                             if (bindState.boundParamX) {
                                 setCachedTextureWithSamplerPreservation(device, 3, bindState.boundParamX);
+                                if (shouldLog) LOG::logline("bindShaderTextures: bound paramX to slot 3");
                             }
                         }
+
+                        if (shouldLog && (sk.hasParamH || sk.hasParamX)) bindLogCount++;
                     }
                 }
                 bindState.lastBaseTexture = rs->texture;
@@ -1764,7 +1776,19 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
         int maxPerObjectLights = 0;
 
         for (size_t i = 0; i < numCallsForPack; i++) {
-            if (recCalls[i].sk.lightMode != 3) continue;
+            // Pack lights for lightMode 3 OR if forced/batching is enabled (which forces mode 3)
+            bool needsLightPack = (recCalls[i].sk.lightMode == 3);
+            // Force lightMode 3 for all lit Opaque/Terrain when toggle is enabled
+            if (ImGuiManager::GetForceLightMode3() && recCalls[i].sk.useLighting &&
+                (recCalls[i].bin == RenderBin::Opaque || recCalls[i].bin == RenderBin::Terrain)) {
+                needsLightPack = true;
+            }
+            // Also pack for stateless batching candidates
+            if (ImGuiManager::GetEnableStatelessBatch() && recCalls[i].sk.useLighting &&
+                (recCalls[i].bin == RenderBin::Opaque || recCalls[i].bin == RenderBin::Terrain)) {
+                needsLightPack = true;
+            }
+            if (!needsLightPack) continue;
 
             const auto& call = recCalls[i];
 
@@ -2225,12 +2249,327 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
         }
     }
 
+    // Issue stateless batch draws (Scene 0 only) - alternative to instancing with per-draw data in texture
+    std::unordered_set<size_t> statelessBatchedIndices;
+    int statelessDrawCalls = 0;
+    int statelessBatchCount = 0;
+
+    if (sceneCount == 0 && ImGuiManager::GetEnableStatelessBatch() && !fb.statelessBatches.empty() && !fb.drawDataStaging.empty()) {
+        MGE_ZoneScopedN("replay_StatelessBatchDraws");
+
+        // Reset suffix texture binding cache - ensures fresh binds for batched draws
+        TextureSuffix::getBindingState().reset();
+
+        UINT totalDraws = (UINT)fb.drawDataStaging.size();
+        const UINT DRAW_DATA_WIDTH = 8;  // 8 texels per draw (128 bytes / 16 bytes per texel)
+
+        // Create or resize draw data texture as needed
+        if (!fb.texDrawData || fb.texDrawDataHeight < totalDraws) {
+            if (fb.texDrawData) {
+                fb.texDrawData->Release();
+                fb.texDrawData = nullptr;
+            }
+            // Round up height to power of 2 for better texture handling
+            UINT newHeight = 1;
+            while (newHeight < totalDraws) newHeight *= 2;
+            if (newHeight < 64) newHeight = 64;  // Minimum 64 draws
+
+            HRESULT hr = device->CreateTexture(
+                DRAW_DATA_WIDTH, newHeight, 1, 0,
+                D3DFMT_A32B32G32R32F, D3DPOOL_MANAGED,
+                &fb.texDrawData, nullptr);
+            if (FAILED(hr)) {
+                LOG::logline("!! Failed to create draw data texture (hr=0x%X)", hr);
+                fb.texDrawData = nullptr;
+            } else {
+                fb.texDrawDataHeight = newHeight;
+                LOG::logline("-- Created draw data texture: %dx%d", DRAW_DATA_WIDTH, newHeight);
+            }
+        }
+
+        if (fb.texDrawData) {
+            // Fill per-object light params from perObjectLightInfo (populated earlier in this function)
+            // drawDataStaging is indexed sequentially; we need to map back to original call indices
+            // Order: {lightCount, texelSize, texelOffset, 0} to match lightDataParams in shader
+            UINT stagingIdx = 0;
+            static bool loggedLightFill = false;
+            int logCount = 0;
+            for (const auto& batch : fb.statelessBatches) {
+                for (size_t callIdx : batch.callIndices) {
+                    if (stagingIdx < fb.drawDataStaging.size() && callIdx < perObjectLightInfo.size()) {
+                        const auto& li = perObjectLightInfo[callIdx];
+                        fb.drawDataStaging[stagingIdx].lightParams[0] = (float)li.lightCount;
+                        fb.drawDataStaging[stagingIdx].lightParams[1] = perObjectTexelSize;
+                        fb.drawDataStaging[stagingIdx].lightParams[2] = (float)li.texelOffset;
+                        fb.drawDataStaging[stagingIdx].lightParams[3] = 0.0f;
+
+                        if (!loggedLightFill && logCount < 5 && li.lightCount > 0) {
+                            LOG::logline("StatelessBatch lightFill: stagingIdx=%d, callIdx=%d, lightCount=%d, texelOffset=%d, texelSize=%.6f",
+                                stagingIdx, (int)callIdx, li.lightCount, li.texelOffset, perObjectTexelSize);
+                            logCount++;
+                        }
+                    }
+                    stagingIdx++;
+                }
+            }
+            if (logCount > 0) loggedLightFill = true;
+
+            // Upload draw data to texture
+            D3DLOCKED_RECT locked;
+            if (SUCCEEDED(fb.texDrawData->LockRect(0, &locked, nullptr, 0))) {
+                // Copy each draw's data as a row of 8 texels
+                float* texData = (float*)locked.pBits;
+                UINT pitch = locked.Pitch / sizeof(float);  // floats per row
+
+                for (UINT d = 0; d < totalDraws; d++) {
+                    const StatelessDrawData& src = fb.drawDataStaging[d];
+                    float* row = texData + d * pitch;
+                    // 8 texels * 4 floats = 32 floats per draw
+                    memcpy(row, &src, sizeof(StatelessDrawData));
+                }
+                fb.texDrawData->UnlockRect(0);
+
+                // Bind draw data texture - use vertex texture sampler for VS, regular for PS
+                // D3DVERTEXTEXTURESAMPLER0 = 256 for vertex shader texture sampling
+                device->SetTexture(D3DVERTEXTEXTURESAMPLER0, fb.texDrawData);
+                device->SetTexture(6, fb.texDrawData);  // Also bind to slot 6 for PS
+
+                // Ensure light texture (slot 5) is bound for texture-based point lighting
+                IDirect3DTexture9* lightTex = g_renderThread ? g_renderThread->getPerObjectLightTexture() : nullptr;
+                if (lightTex) {
+                    device->SetTexture(5, lightTex);
+                }
+
+                // Issue batched draws
+                for (const auto& batch : fb.statelessBatches) {
+                    const auto& firstCall = recCalls[batch.callIndices[0]];
+                    UINT instanceCount = (UINT)batch.callIndices.size();
+
+                    // Get stateless batch vertex declaration for this FVF
+                    IDirect3DVertexDeclaration9* statelessDecl = getStatelessBatchDecl(firstCall.rs.fvf);
+                    if (!statelessDecl) continue;
+
+                    // Use recorded ShaderKey (preserves suffix flags) and modify for stateless batching
+                    ShaderKey sk = firstCall.sk;
+                    sk.useStatelessBatch = 1;
+                    sk.hasShadows = ((Configuration.MGEFlags & USE_SHADOWS) && (Configuration.MGEFlags & USE_DISTANT_LAND)) ? 1 : 0;
+                    // Force lightMode 3 (texture-based) for stateless batching so per-instance lighting works
+                    if (sk.useLighting && sk.lightMode < 3) {
+                        sk.lightMode = 3;
+                    }
+
+                    // Debug: log suffix flags for first few batches
+                    static int suffixLogCount = 0;
+                    if (suffixLogCount < 10 && (sk.hasDiffParam || sk.hasParamH || sk.hasParamX)) {
+                        LOG::logline("StatelessBatch suffix: tex=%p, hasDiffParam=%d, hasParamH=%d, hasParamX=%d",
+                            firstCall.rs.texture, (int)sk.hasDiffParam, (int)sk.hasParamH, (int)sk.hasParamX);
+                        suffixLogCount++;
+                    }
+
+                    // Look up shader variant
+                    HLSLShader hlslShader = {};
+                    AcquireSRWLockShared(&hlslCacheLock);
+                    auto iShader = cacheHLSLShaders.find(sk);
+                    if (iShader != cacheHLSLShaders.end()) {
+                        hlslShader = iShader->second;
+                    }
+                    ReleaseSRWLockShared(&hlslCacheLock);
+
+                    // If shader not found, queue compilation and skip this batch
+                    if (!hlslShader.vertexShader || !hlslShader.pixelShader) {
+                        queueShaderCompilation(sk);
+                        continue;
+                    }
+
+                    // Set shaders
+                    device->SetVertexShader(hlslShader.vertexShader);
+                    device->SetPixelShader(hlslShader.pixelShader);
+
+                    // Set view/proj matrices
+                    D3DXMATRIX viewT, projT;
+                    D3DXMatrixTranspose(&viewT, &fb.currentView);
+                    D3DXMatrixTranspose(&projT, &fb.currentProj);
+                    device->SetVertexShaderConstantF(12, (float*)&viewT, 4);  // view at c12
+                    device->SetVertexShaderConstantF(0, (float*)&projT, 4);   // proj at c0
+
+                    // Set draw data texture params: {1/width, 1/height, 0, 0}
+                    float drawDataParams[4] = { 1.0f / DRAW_DATA_WIDTH, 1.0f / fb.texDrawDataHeight, 0.0f, 0.0f };
+                    device->SetVertexShaderConstantF(70, drawDataParams, 1);
+                    device->SetPixelShaderConstantF(20, drawDataParams, 1);
+
+                    // Set vertexBlendState = 0 (rigid geometry)
+                    float blendState[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                    device->SetVertexShaderConstantF(48, blendState, 1);
+
+                    // Set lighting constants from first call (shared across batch)
+                    static bool loggedOnce = false;
+                    if (!loggedOnce) {
+                        LOG::logline("StatelessBatch shader: psConstantTable=%p, hLightSunDir=%p, hLightSunDiff=%p, hLightAmbient=%p, useLighting=%d, lightMode=%d",
+                            hlslShader.psConstantTable, hlslShader.hLightSunDirection, hlslShader.hLightSunDiffuse, hlslShader.hLightSceneAmbient,
+                            sk.useLighting, sk.lightMode);
+                        loggedOnce = true;
+                    }
+                    if (hlslShader.psConstantTable) {
+                        RGBVECTOR sunDiffuse(0, 0, 0), ambient = firstCall.lightrs->globalAmbient;
+                        D3DXVECTOR3 sunDir(0, 0, 1);
+                        const D3DXMATRIX& viewForLights = firstCall.rs.viewTransform;
+
+                        for (DWORD lightId : firstCall.lightrs->active) {
+                            auto lightIt = firstCall.lightrs->lights.find(lightId);
+                            if (lightIt != firstCall.lightrs->lights.end()) {
+                                auto& light = const_cast<LightState::Light&>(lightIt->second);
+                                if (firstCall.lightrs->lightsTransformed.find(lightId) == firstCall.lightrs->lightsTransformed.end()) {
+                                    if (light.type == D3DLIGHT_DIRECTIONAL) {
+                                        D3DXVec3TransformNormal((D3DXVECTOR3*)&light.viewspacePos, (D3DXVECTOR3*)&light.position, &viewForLights);
+                                    } else {
+                                        D3DXVec3TransformCoord((D3DXVECTOR3*)&light.viewspacePos, (D3DXVECTOR3*)&light.position, &viewForLights);
+                                    }
+                                    const_cast<LightState*>(firstCall.lightrs.get())->lightsTransformed[lightId] = true;
+                                }
+                                if (light.type == D3DLIGHT_DIRECTIONAL) {
+                                    sunDiffuse = light.diffuse;
+                                    sunDir = *(D3DXVECTOR3*)&light.viewspacePos;
+                                    ambient.r += light.ambient.x;
+                                    ambient.g += light.ambient.y;
+                                    ambient.b += light.ambient.z;
+                                }
+                            }
+                        }
+                        sunDiffuse *= sunMultiplier;
+                        ambient *= ambMultiplier;
+
+                        static bool loggedValues = false;
+                        if (!loggedValues) {
+                            LOG::logline("StatelessBatch lighting: sunDir=(%.2f,%.2f,%.2f), sunDiff=(%.2f,%.2f,%.2f), ambient=(%.2f,%.2f,%.2f), activeLights=%d",
+                                sunDir.x, sunDir.y, sunDir.z, sunDiffuse.r, sunDiffuse.g, sunDiffuse.b, ambient.r, ambient.g, ambient.b,
+                                (int)firstCall.lightrs->active.size());
+                            loggedValues = true;
+                        }
+
+                        if (hlslShader.hLightSunDirection)
+                            hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightSunDirection, (const float*)&sunDir, 3);
+                        if (hlslShader.hLightSunDiffuse)
+                            hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightSunDiffuse, (const float*)&sunDiffuse, 3);
+                        if (hlslShader.hLightSceneAmbient)
+                            hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightSceneAmbient, (const float*)&ambient, 3);
+                    }
+
+                    // Bind all textures (base + suffix textures) using the smart binding function
+                    bindShaderTextures(sk, &firstCall.rs);
+
+                    // Set normres for paramH textures (texture resolution for height mapping)
+                    if (sk.hasParamH && hlslShader.psConstantTable) {
+                        IDirect3DBaseTexture9* paramHTexture = nullptr;
+                        device->GetTexture(2, &paramHTexture);
+                        if (paramHTexture && paramHTexture->GetType() == D3DRTYPE_TEXTURE) {
+                            IDirect3DTexture9* tex = static_cast<IDirect3DTexture9*>(paramHTexture);
+                            D3DXVECTOR2 normres;
+                            auto cacheIt = textureResolutionCache.find(tex);
+                            if (cacheIt != textureResolutionCache.end()) {
+                                normres = cacheIt->second;
+                            } else {
+                                D3DSURFACE_DESC desc;
+                                if (SUCCEEDED(tex->GetLevelDesc(0, &desc))) {
+                                    normres = D3DXVECTOR2((float)desc.Width, (float)desc.Height);
+                                    textureResolutionCache[tex] = normres;
+                                } else {
+                                    normres = D3DXVECTOR2(1.0f, 1.0f);
+                                }
+                            }
+                            D3DXHANDLE hNormres = hlslShader.psConstantTable->GetConstantByName(NULL, "normres");
+                            if (hNormres) hlslShader.psConstantTable->SetFloatArray(device, hNormres, (float*)&normres, 2);
+                            paramHTexture->Release();
+                        }
+                    }
+
+                    // Set render state from batch key
+                    device->SetRenderState(D3DRS_ALPHABLENDENABLE, batch.key.blendState & 0x1);
+                    device->SetRenderState(D3DRS_SRCBLEND, (batch.key.blendState >> 4) & 0xF);
+                    device->SetRenderState(D3DRS_DESTBLEND, (batch.key.blendState >> 8) & 0xF);
+                    device->SetRenderState(D3DRS_ZENABLE, batch.key.zState & 0x3);
+                    device->SetRenderState(D3DRS_ZWRITEENABLE, (batch.key.zState >> 2) & 0x1);
+                    device->SetRenderState(D3DRS_CULLMODE, batch.key.cullMode);
+
+                    // Fill instance buffer with draw indices
+                    // Reuse the FFE instance buffer, but we only need 1 float per instance
+                    float* instIndices = nullptr;
+                    if (vbFFEInstances && instanceCount <= MaxFFEInstances) {
+                        HRESULT hr = vbFFEInstances->Lock(0, instanceCount * sizeof(float), (void**)&instIndices, D3DLOCK_DISCARD);
+                        if (SUCCEEDED(hr) && instIndices) {
+                            UINT drawOffset = batch.drawDataOffset;
+                            for (UINT inst = 0; inst < instanceCount; inst++) {
+                                instIndices[inst] = (float)(drawOffset + inst);
+                            }
+                            vbFFEInstances->Unlock();
+
+                            // Debug: check what's bound to slot 2 right before draw
+                            static int drawDebugCount = 0;
+                            if (drawDebugCount < 5 && sk.hasParamH) {
+                                IDirect3DBaseTexture9* boundTex2 = nullptr;
+                                device->GetTexture(2, &boundTex2);
+                                LOG::logline("StatelessBatch preDraw: slot2=%p, sk.hasParamH=%d", boundTex2, (int)sk.hasParamH);
+                                if (boundTex2) boundTex2->Release();
+                                drawDebugCount++;
+                            }
+
+                            // Set up instanced rendering with minimal instance data (just drawIndex)
+                            device->SetVertexDeclaration(statelessDecl);
+                            device->SetStreamSource(0, firstCall.rs.vb, firstCall.rs.vbOffset, firstCall.rs.vbStride);
+                            device->SetStreamSourceFreq(0, D3DSTREAMSOURCE_INDEXEDDATA | instanceCount);
+                            device->SetStreamSource(1, vbFFEInstances, 0, sizeof(float));
+                            device->SetStreamSourceFreq(1, D3DSTREAMSOURCE_INSTANCEDATA | 1);
+                            device->SetIndices(firstCall.rs.ib);
+
+                            // Draw instanced
+                            device->DrawIndexedPrimitive(
+                                D3DPT_TRIANGLELIST,
+                                firstCall.rs.baseIndex,
+                                firstCall.rs.minIndex,
+                                firstCall.rs.vertCount,
+                                firstCall.rs.startIndex,
+                                firstCall.rs.primCount
+                            );
+
+                            // Mark these calls as batched
+                            for (size_t idx : batch.callIndices) {
+                                statelessBatchedIndices.insert(idx);
+                            }
+
+                            statelessDrawCalls++;
+                            statelessBatchCount++;
+                        }
+                    }
+                }
+
+                // Reset stream frequencies and textures
+                device->SetStreamSourceFreq(0, 1);
+                device->SetStreamSourceFreq(1, 1);
+                device->SetStreamSource(1, nullptr, 0, 0);
+                device->SetTexture(D3DVERTEXTEXTURESAMPLER0, nullptr);
+                device->SetTexture(6, nullptr);
+
+                if (statelessBatchCount > 0) {
+                    LOG::logline("StatelessBatch: %d batches, %d instances, %d individual draws skipped",
+                                 statelessBatchCount, (int)statelessBatchedIndices.size(), (int)statelessBatchedIndices.size());
+                }
+            }
+        }
+    }
+
     MGE_ZoneScopedN("replay_MainLoop");
     bool firstDrawDone = false;
     for (size_t i = 0; i < numCalls; i++) {
-        // Skip calls that were handled by instanced draws
+        // Skip calls that were handled by instanced draws or stateless batches
         if (batchedCallIndices.count(i)) continue;
+        if (statelessBatchedIndices.count(i)) continue;
         auto& call = recCalls[i];  // Non-const to update shader key
+
+        // Force lightMode 3 for lit Opaque/Terrain when toggle enabled (before rendering)
+        if (ImGuiManager::GetForceLightMode3() && call.sk.useLighting && call.sk.lightMode < 3 &&
+            (call.bin == RenderBin::Opaque || call.bin == RenderBin::Terrain)) {
+            call.sk.lightMode = 3;
+        }
+
         // No Z-clear between scenes: Scene 1/2 depth-tests against Scene 0.
         // Alpha-sorted particles (Scene 1) properly occlude behind world geometry.
 

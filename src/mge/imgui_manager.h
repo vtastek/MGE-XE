@@ -146,6 +146,12 @@ public:
     // Hi-Z culling bypass for terrain hole diagnosis
     static bool GetDisableHiZCulling();
 
+    // Stateless batching toggle (experimental)
+    static bool GetEnableStatelessBatch();
+
+    // Force lightMode 3 for all lit Opaque/Terrain (debug)
+    static bool GetForceLightMode3();
+
     // Hi-Z visualization interface
     static void RenderHiZInterface();
     static void ToggleHiZInterface();
@@ -297,6 +303,8 @@ private:
     // Debug interface controls
     static int bboxVisualizationMode;  // 0=off, 1=objects, 2=lights
     static bool disableHiZCulling;     // Bypass Hi-Z culling for terrain hole diagnosis
+    static bool enableStatelessBatch;  // Enable stateless batching (experimental)
+    static bool forceLightMode3;       // Force lightMode 3 for all lit Opaque/Terrain
 
     // Debug stats (updated each frame)
     static int debugRecordedCalls;

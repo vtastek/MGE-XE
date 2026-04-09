@@ -168,6 +168,69 @@ struct InstanceBatch {
     UINT instanceBufferOffset;         // Byte offset into instance buffer
 };
 
+// Stateless batch per-draw data: 128 bytes = 8 texels of R32G32B32A32_FLOAT
+// Stored in a texture, sampled by VS/PS using drawIndex
+struct StatelessDrawData {
+    float world0[4];       // Texel 0: World matrix row 0 (translation in w)
+    float world1[4];       // Texel 1: World matrix row 1
+    float world2[4];       // Texel 2: World matrix row 2
+    float diffuse[4];      // Texel 3: Material diffuse RGBA
+    float ambient[4];      // Texel 4: Material ambient RGBA
+    float emissive[4];     // Texel 5: Emissive RGB, alphaRef in w
+    float lightParams[4];  // Texel 6: {pointLightCount, lightTexelOffset, texelSize, 0}
+    float flags[4];        // Texel 7: {vertexMaterial, hasVCol, 0, 0}
+};
+static_assert(sizeof(StatelessDrawData) == 128, "StatelessDrawData must be 128 bytes (8 texels)");
+
+// Simplified batch key: geometry + render state only (material in texture)
+// alphaRef now per-draw in texture, not in key
+struct StatelessBatchKey {
+    // Geometry identity
+    IDirect3DVertexBuffer9* vb;
+    IDirect3DIndexBuffer9* ib;
+    DWORD fvf;
+    UINT baseIndex;
+    UINT vertCount;
+    UINT startIndex;
+    UINT primCount;
+
+    // Render state (forces pipeline state change)
+    IDirect3DTexture9* texture;
+    uint16_t blendState;   // alphaBlendEnable | srcBlend | destBlend
+    uint8_t zState;        // zEnable | zWriteEnable
+    uint8_t cullMode;
+    uint8_t useLighting;   // Shader lighting mode (must match for batch)
+
+    bool operator==(const StatelessBatchKey& o) const {
+        return vb == o.vb && ib == o.ib && fvf == o.fvf &&
+               baseIndex == o.baseIndex && vertCount == o.vertCount &&
+               startIndex == o.startIndex && primCount == o.primCount &&
+               texture == o.texture && blendState == o.blendState &&
+               zState == o.zState && cullMode == o.cullMode &&
+               useLighting == o.useLighting;
+    }
+
+    struct Hasher {
+        size_t operator()(const StatelessBatchKey& k) const {
+            size_t h = reinterpret_cast<size_t>(k.vb);
+            h ^= reinterpret_cast<size_t>(k.ib) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= k.fvf + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= (k.baseIndex | (k.startIndex << 16)) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= (k.vertCount | (k.primCount << 16)) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= reinterpret_cast<size_t>(k.texture) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= (k.blendState | (k.zState << 16) | (k.cullMode << 24) | ((size_t)k.useLighting << 28)) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            return h;
+        }
+    };
+};
+
+// Stateless batch for grouped rendering
+struct StatelessBatch {
+    StatelessBatchKey key;
+    std::vector<size_t> callIndices;  // Indices into recordedCalls
+    UINT drawDataOffset;              // Start index in draw data texture
+};
+
 // Dirty flags for performance mode (dirty tracking between frames)
 enum DirtyFlags : DWORD {
     DIRTY_NONE      = 0,
@@ -365,6 +428,7 @@ class FixedFunctionShader {
         DWORD hasGrass : 1;            // Is grass texture (enables vertex animation and A2C)
         DWORD hasDetail : 1;           // Has detail texture (conditional binding to minimize overhead)
         DWORD useInstancing : 1;       // Uses hardware instancing (world from vertex stream)
+        DWORD useStatelessBatch : 1;   // Uses stateless batching (per-draw data from texture)
 
         struct Stage {
             DWORD colorOp : 6;
@@ -826,6 +890,12 @@ public:
         // Instance batches for GPU instancing (built during prepareRecordedCalls)
         std::vector<InstanceBatch> instanceBatches;
 
+        // Stateless batches for texture-based per-draw data
+        std::vector<StatelessBatch> statelessBatches;
+        IDirect3DTexture9* texDrawData = nullptr;  // 8-wide x maxDraws, A32B32G32R32F
+        UINT texDrawDataHeight = 0;                // Current texture height (draws capacity)
+        std::vector<StatelessDrawData> drawDataStaging;  // CPU-side staging buffer
+
         void clear() {
             recordedCalls.clear();
             recordedCallsScene1.clear();
@@ -843,6 +913,9 @@ public:
             trackerSnapshot.clear();
             dlContext = DLContext();  // Reset DLContext to prevent garbage values
             instanceBatches.clear();
+            statelessBatches.clear();
+            drawDataStaging.clear();
+            // Note: texDrawData is NOT released here - it's reused across frames
             valid = false;
             // Initialize matrices to identity to prevent garbage if capture functions aren't called
             D3DXMatrixIdentity(&view);
@@ -878,6 +951,7 @@ public:
     static constexpr int FFEInstStride = sizeof(InstanceData);  // 48 bytes per instance
     static IDirect3DVertexBuffer9* vbFFEInstances;  // Dynamic instance buffer
     static std::unordered_map<DWORD, IDirect3DVertexDeclaration9*> fvfDeclCache;  // FVF -> instanced decl
+    static std::unordered_map<DWORD, IDirect3DVertexDeclaration9*> statelessDeclCache;  // FVF -> stateless batch decl
 
 public:
     // Pipeline phase tracking for GPU call separation verification
@@ -961,7 +1035,9 @@ public:
     static bool initInstancing();  // Create instance buffer and base declarations
     static void releaseInstancing();  // Release instancing resources
     static void buildInstanceBatches(FrameBuffer& fb);  // Build batches from InstanceKey groups
+    static void buildStatelessBatches(FrameBuffer& fb);  // Build stateless batches (per-draw data in texture)
     static IDirect3DVertexDeclaration9* getInstancedDecl(DWORD fvf);  // Get or create instanced decl for FVF
+    static IDirect3DVertexDeclaration9* getStatelessBatchDecl(DWORD fvf);  // Get or create stateless batch decl for FVF
 
     // Scene lifecycle for triple-buffered pipeline
     static void markSceneStart(int sceneNum, bool isUI = false);

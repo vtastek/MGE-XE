@@ -80,6 +80,20 @@ bool hasAlpha;
 float2 normres;  // Parameter map texture resolution (width, height) for height mapping
 #endif
 
+#ifdef USE_STATELESS_BATCH
+// Draw data texture for per-draw material lookup
+texture texDrawData : register(t6);
+sampler sampDrawData : register(s6) = sampler_state {
+    texture = <texDrawData>;
+    minfilter = point;
+    magfilter = point;
+    mipfilter = none;
+    addressu = clamp;
+    addressv = clamp;
+};
+float4 drawDataParams : register(c20);  // {1/width=0.125, 1/height, 0, 0}
+#endif
+
 //------------------------------------------------------------
 // Vertex Output (matches VS_OUTPUT from vertex shader)
 struct VS_OUTPUT {
@@ -93,6 +107,9 @@ struct VS_OUTPUT {
 	float4 shadow0pos : TEXCOORD4;  // Shadow map 0 position
 	float4 shadow1pos : TEXCOORD5;  // Shadow map 1 position
 #endif
+#ifdef USE_STATELESS_BATCH
+	float drawIndex : TEXCOORD6;  // Draw index for material lookup
+#endif
 };
 
 
@@ -103,6 +120,27 @@ struct VS_OUTPUT {
 //------------------------------------------------------------
 // Pixel Shader Main
 float4 ps_main(VS_OUTPUT input) : COLOR{
+#ifdef USE_STATELESS_BATCH
+	// Sample material and light params from draw data texture (overrides uniform values)
+	float drawV = (input.drawIndex + 0.5) * drawDataParams.y;
+	float texelW = drawDataParams.x;  // 0.125 for 8-wide texture
+
+	// Texels 3,4,5 are diffuse, ambient, emissive
+	float4 matDiffuse = tex2D(sampDrawData, float2(3.5 * texelW, drawV));
+	float4 matAmbient = tex2D(sampDrawData, float2(4.5 * texelW, drawV));
+	float4 matEmissive = tex2D(sampDrawData, float2(5.5 * texelW, drawV));
+	// Note: matEmissive.w contains alphaRef (not used in PS, handled by device state)
+
+	// Texel 6 is light params: {lightCount, texelSize, texelOffset, 0}
+	float4 perDrawLightParams = tex2D(sampDrawData, float2(6.5 * texelW, drawV));
+
+	// Override globals with texture-sampled values
+	#define materialDiffuse matDiffuse
+	#define materialAmbient matAmbient
+	#define materialEmissive matEmissive
+	#define lightDataParams perDrawLightParams
+#endif
+
 	// Enhanced texture sampling with suffix support
 	float3 diffuseParam = float3(1.0, 1.0, 1.0);  // Default white
 	float3 deb = 0;
@@ -341,7 +379,7 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 	#elif defined(LIGHT_MODE) && LIGHT_MODE == 3
 	// Mode 3: Texture-based point light system (>8 lights, rare)
 	{
-		PointLightResult pointLightResult = evaluatePointLightsPBR(input.viewPos, Norm, V, texColor.rgb, metalness, roughness, radius, F0);
+		PointLightResult pointLightResult = evaluatePointLightsPBR(lightDataParams, input.viewPos, Norm, V, texColor.rgb, metalness, roughness, radius, F0);
 		diffuseLight += pointLightResult.diffuse;
 
 		#if defined(HAS_PARAMH) || defined(HAS_NORMAL)
