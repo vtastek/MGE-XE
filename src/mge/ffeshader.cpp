@@ -1642,8 +1642,8 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     ID3DBlob* vsBlob = nullptr;
     ID3DBlob* vsErrors = nullptr;
 
-    // Match D3DX9 effect compilation - no IEEE_STRICTNESS for invariance with depth pass
-    DWORD vsCompileFlags = D3DCOMPILE_PREFER_FLOW_CONTROL;
+    // Use IEEE_STRICTNESS for consistent Z precision across shader permutations (stateless batch vs regular)
+    DWORD vsCompileFlags = D3DCOMPILE_PREFER_FLOW_CONTROL | D3DCOMPILE_IEEE_STRICTNESS;
     if (ShaderUtils::isDXVK()) {
         vsCompileFlags |= D3DCOMPILE_OPTIMIZATION_LEVEL1;
     } else {

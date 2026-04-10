@@ -876,11 +876,11 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
                 const auto& call = calls[callIdx];
                 StatelessDrawData data;
 
-                // World matrix rows (transposed for shader row-major access)
-                const D3DXMATRIX& w = call.rs.worldTransforms[0];
-                data.world0[0] = w._11; data.world0[1] = w._21; data.world0[2] = w._31; data.world0[3] = w._41;
-                data.world1[0] = w._12; data.world1[1] = w._22; data.world1[2] = w._32; data.world1[3] = w._42;
-                data.world2[0] = w._13; data.world2[1] = w._23; data.world2[2] = w._33; data.world2[3] = w._43;
+                // WorldView matrix columns (pre-combined for Z precision matching regular path)
+                const D3DXMATRIX& wv = call.rs.worldViewTransforms[0];
+                data.world0[0] = wv._11; data.world0[1] = wv._21; data.world0[2] = wv._31; data.world0[3] = wv._41;
+                data.world1[0] = wv._12; data.world1[1] = wv._22; data.world1[2] = wv._32; data.world1[3] = wv._42;
+                data.world2[0] = wv._13; data.world2[1] = wv._23; data.world2[2] = wv._33; data.world2[3] = wv._43;
 
                 // Material diffuse
                 data.diffuse[0] = call.frs.material.diffuse.r;
@@ -906,11 +906,11 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
                 data.lightParams[2] = 0.0f;  // texelSize - TODO
                 data.lightParams[3] = 0.0f;
 
-                // Flags
+                // Flags + 4th column of worldView for proper w computation
                 data.flags[0] = (float)call.sk.vertexMaterial;
                 data.flags[1] = (call.rs.fvf & D3DFVF_DIFFUSE) ? 1.0f : 0.0f;
-                data.flags[2] = 0.0f;
-                data.flags[3] = 0.0f;
+                data.flags[2] = wv._34;  // For viewpos.w = pos.z * _34 + pos.w * _44
+                data.flags[3] = wv._44;  // (affine matrices have _14=_24=0, _34=0, _44=1)
 
                 fb.drawDataStaging.push_back(data);
                 drawDataOffset++;

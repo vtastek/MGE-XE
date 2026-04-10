@@ -171,14 +171,14 @@ struct InstanceBatch {
 // Stateless batch per-draw data: 128 bytes = 8 texels of R32G32B32A32_FLOAT
 // Stored in a texture, sampled by VS/PS using drawIndex
 struct StatelessDrawData {
-    float world0[4];       // Texel 0: World matrix row 0 (translation in w)
-    float world1[4];       // Texel 1: World matrix row 1
-    float world2[4];       // Texel 2: World matrix row 2
+    float world0[4];       // Texel 0: WorldView matrix column 0 (pre-combined for Z precision)
+    float world1[4];       // Texel 1: WorldView matrix column 1
+    float world2[4];       // Texel 2: WorldView matrix column 2
     float diffuse[4];      // Texel 3: Material diffuse RGBA
     float ambient[4];      // Texel 4: Material ambient RGBA
     float emissive[4];     // Texel 5: Emissive RGB, alphaRef in w
     float lightParams[4];  // Texel 6: {pointLightCount, lightTexelOffset, texelSize, 0}
-    float flags[4];        // Texel 7: {vertexMaterial, hasVCol, 0, 0}
+    float flags[4];        // Texel 7: {vertexMaterial, hasVCol, wv_34, wv_44}
 };
 static_assert(sizeof(StatelessDrawData) == 128, "StatelessDrawData must be 128 bytes (8 texels)");
 

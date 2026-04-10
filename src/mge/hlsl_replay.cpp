@@ -2332,6 +2332,11 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                 // Bind draw data texture - use vertex texture sampler for VS, regular for PS
                 // D3DVERTEXTEXTURESAMPLER0 = 256 for vertex shader texture sampling
                 device->SetTexture(D3DVERTEXTEXTURESAMPLER0, fb.texDrawData);
+                device->SetSamplerState(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+                device->SetSamplerState(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+                device->SetSamplerState(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+                device->SetSamplerState(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+                device->SetSamplerState(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
                 device->SetTexture(6, fb.texDrawData);  // Also bind to slot 6 for PS
 
                 // Ensure light texture (slot 5) is bound for texture-based point lighting
@@ -2352,7 +2357,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     // Use recorded ShaderKey (preserves suffix flags) and modify for stateless batching
                     ShaderKey sk = firstCall.sk;
                     sk.useStatelessBatch = 1;
-                    sk.hasShadows = ((Configuration.MGEFlags & USE_SHADOWS) && (Configuration.MGEFlags & USE_DISTANT_LAND)) ? 1 : 0;
+                    // Disable shadows for stateless batches (worldpos unavailable - using worldview directly)
+                    sk.hasShadows = 0;
                     // Force lightMode 3 (texture-based) for stateless batching so per-instance lighting works
                     if (sk.useLighting && sk.lightMode < 3) {
                         sk.lightMode = 3;
