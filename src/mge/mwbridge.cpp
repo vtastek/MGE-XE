@@ -3,6 +3,7 @@
 
 #include "mwbridge.h"
 #include "assert.h"
+#include "proxydx/d3d8texture.h"
 
 #include <cmath>
 
@@ -1385,6 +1386,16 @@ static void __stdcall patchLoadTexture2DUpload(NiDX8RendererTextureData* sourceT
         if (SUCCEEDED(d3d8CreateTexture(device, width, height, levels, 0, d3dFormat, D3DPOOL_DEFAULT, &texture))) {
             // Move texture from staging into final texture
             d3d8UpdateTexture(device, stagingTexture, texture);
+
+            // Transfer upload hash from staging to final texture before release
+            // The hash was computed during Lock/Unlock on the staging texture
+            ProxyTexture* stagingProxy = static_cast<ProxyTexture*>(stagingTexture);
+            ProxyTexture* finalProxy = static_cast<ProxyTexture*>(texture);
+            auto hashIt = g_uploadHashMap.find(stagingProxy->realTexture);
+            if (hashIt != g_uploadHashMap.end()) {
+                g_uploadHashMap[finalProxy->realTexture] = hashIt->second;
+            }
+
             sourceTextureData->d3dTexture = texture;
             reinterpret_cast<IUnknown*>(stagingTexture)->Release();
         }

@@ -672,6 +672,87 @@ const TextureSuffixVariants* getTextureSuffixVariants(const char* baseTextureNam
     return (it != textureSuffixDatabase.end()) ? &it->second : nullptr;
 }
 
+// hashLockableTexture - Hash a SYSTEMMEM/MANAGED texture by locking it directly
+// Uses same algorithm as ProxyTexture::UnlockRect for consistency
+static TextureRuntimeHash hashLockableTexture(IDirect3DTexture9* texture) {
+    TextureRuntimeHash hash = {0, 0};
+
+    if (!texture) return hash;
+
+    D3DSURFACE_DESC desc;
+    if (FAILED(texture->GetLevelDesc(0, &desc))) return hash;
+
+    // Only lockable pools
+    if (desc.Pool != D3DPOOL_SYSTEMMEM && desc.Pool != D3DPOOL_MANAGED) return hash;
+
+    D3DLOCKED_RECT lockedRect = {};
+    if (FAILED(texture->LockRect(0, &lockedRect, nullptr, D3DLOCK_READONLY))) return hash;
+
+    if (lockedRect.pBits && lockedRect.Pitch > 0) {
+        // Calculate data size (same logic as d3d8texture.cpp)
+        size_t dataSize = 0;
+        switch (desc.Format) {
+            case D3DFMT_DXT1:
+                dataSize = ((desc.Width + 3) / 4) * ((desc.Height + 3) / 4) * 8;
+                break;
+            case D3DFMT_DXT3:
+            case D3DFMT_DXT5:
+                dataSize = ((desc.Width + 3) / 4) * ((desc.Height + 3) / 4) * 16;
+                break;
+            default:
+                dataSize = (size_t)lockedRect.Pitch * desc.Height;
+                break;
+        }
+
+        if (dataSize > 0 && dataSize < 100 * 1024 * 1024) {
+            const unsigned char* dataPtr = reinterpret_cast<const unsigned char*>(lockedRect.pBits);
+
+            // Replicate exact hash algorithm from d3d8texture.cpp UnlockRect
+            DWORD mipLevels = texture->GetLevelCount();
+            size_t pointSize = 64;
+            size_t metadataSize = 20;
+            unsigned char hashBuffer[212]; // 20 + 3*64
+
+            // Pack metadata
+            DWORD* metadata = reinterpret_cast<DWORD*>(hashBuffer);
+            metadata[0] = desc.Width;
+            metadata[1] = desc.Height;
+            metadata[2] = (DWORD)desc.Format;
+            metadata[3] = mipLevels;
+            metadata[4] = (DWORD)dataSize;
+
+            // Multi-point samples
+            unsigned char* sampleBuf = hashBuffer + metadataSize;
+            memset(sampleBuf, 0, 3 * pointSize);
+
+            // Sample 1: beginning
+            size_t s1 = (pointSize < dataSize) ? pointSize : dataSize;
+            memcpy(sampleBuf, dataPtr, s1);
+
+            // Sample 2: middle
+            if (dataSize > pointSize * 2) {
+                size_t mid = dataSize / 2;
+                size_t s2 = (pointSize < (dataSize - mid)) ? pointSize : (dataSize - mid);
+                memcpy(sampleBuf + pointSize, dataPtr + mid, s2);
+            }
+
+            // Sample 3: end
+            if (dataSize > pointSize * 3) {
+                size_t end = dataSize - pointSize;
+                size_t s3 = (pointSize < (dataSize - end)) ? pointSize : (dataSize - end);
+                memcpy(sampleBuf + (2 * pointSize), dataPtr + end, s3);
+            }
+
+            size_t totalHashSize = metadataSize + (3 * pointSize);
+            hash.crc32 = crc32(hashBuffer, totalHashSize);
+            hash.size = desc.Width * desc.Height;
+        }
+    }
+
+    texture->UnlockRect(0);
+    return hash;
+}
+
 // calculateTextureHash - Calculate runtime hash of a texture for identification
 TextureRuntimeHash calculateTextureHash(IDirect3DDevice9* device, IDirect3DTexture9* texture, bool useCache) {
     TextureRuntimeHash hash = {0, 0};
@@ -721,34 +802,23 @@ TextureRuntimeHash calculateTextureHash(IDirect3DDevice9* device, IDirect3DTextu
     if (isRenderTarget || isDepthStencil) {
         return hash; // Return zero hash for filtered textures
     }
-    
+
     // Access texture data for hashing
     // MANAGED pool: LockRect directly (data is in system memory, no GPU readback)
-    // DEFAULT pool: staging texture + GetRenderTargetData (GPU readback, slower)
-    bool hashSuccess = false;
+    // DEFAULT pool: can't read back without upload hash - GetRenderTargetData only works on render targets
     D3DLOCKED_RECT lockedRect = {};
-    IDirect3DTexture9* stagingTexture = nullptr;
-    IDirect3DSurface9* srcSurface = nullptr;
-    IDirect3DSurface9* dstSurface = nullptr;
     bool lockedDirect = false;
+    bool hashSuccess = false;
 
     if (isManagedPool) {
         // MANAGED: lock the texture directly (zero GPU cost)
         if (SUCCEEDED(texture->LockRect(0, &lockedRect, nullptr, D3DLOCK_READONLY))) {
             lockedDirect = true;
         }
-    } else {
-        // DEFAULT: staging copy via GetRenderTargetData (GPU pipeline drain)
-        HRESULT hr = device->CreateTexture(desc.Width, desc.Height, 1, 0, desc.Format, D3DPOOL_SYSTEMMEM, &stagingTexture, nullptr);
-        if (SUCCEEDED(hr) && stagingTexture) {
-            if (SUCCEEDED(texture->GetSurfaceLevel(0, &srcSurface)) &&
-                SUCCEEDED(stagingTexture->GetSurfaceLevel(0, &dstSurface))) {
-                hr = device->GetRenderTargetData(srcSurface, dstSurface);
-                if (SUCCEEDED(hr)) {
-                    dstSurface->LockRect(&lockedRect, nullptr, D3DLOCK_READONLY);
-                }
-            }
-        }
+    } else if (isDefaultPool) {
+        // DEFAULT pool without upload hash - cannot read back safely
+        // GetRenderTargetData only works on render target surfaces, not regular textures
+        return hash; // Return zero hash
     }
 
     if (lockedRect.pBits && lockedRect.Pitch > 0) {
@@ -811,12 +881,8 @@ TextureRuntimeHash calculateTextureHash(IDirect3DDevice9* device, IDirect3DTextu
     // Cleanup
     if (lockedDirect) {
         texture->UnlockRect(0);
-    } else {
-        if (dstSurface) { dstSurface->UnlockRect(); dstSurface->Release(); }
-        if (srcSurface) srcSurface->Release();
-        if (stagingTexture) stagingTexture->Release();
     }
-    
+
     if (!hashSuccess) {
         return hash;
     }
@@ -1034,79 +1100,30 @@ void buildBSATextureHashDatabase(IDirect3DDevice9* dev) {
         const std::string& baseName = entry.first;
         const TextureSuffixVariants& variants = entry.second;
         
-        IDirect3DTexture9* baseTexture = nullptr;
+        IDirect3DTexture9* hashTexture = nullptr;
         HRESULT hr = E_FAIL;
-        
-        // Load base texture based on source (loose overrides BSA)
-        D3DPOOL initPool = Configuration.UseDefaultTexturePool ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED;
+
+        // Always load into SYSTEMMEM for hashing - avoids GPU readback issues
+        // This matches what runtime textures do via Lock/Unlock
         if (variants.baseTextureSource == "loose") {
-            // Load from loose file using SAME pool as runtime textures
             hr = D3DXCreateTextureFromFileEx(dev, variants.baseTexturePath.c_str(),
                 D3DX_FROM_FILE, D3DX_FROM_FILE, D3DX_FROM_FILE, 0, D3DFMT_UNKNOWN,
-                initPool, D3DX_FILTER_NONE, D3DX_FILTER_NONE, 0, 0, 0, &baseTexture);
+                D3DPOOL_SYSTEMMEM, D3DX_FILTER_NONE, D3DX_FILTER_NONE, 0, 0, 0, &hashTexture);
         }
         else if (variants.baseTextureSource == "bsa") {
-            // Load from BSA file using proven BSALoadFile method
             BSAHash3 hash = hashString(variants.baseTexturePath.c_str());
             EntryData ed = BSALoadFile(hash);
-            
+
             if (ed.valid()) {
-                // Use DirectXTex staging pattern: SYSTEMMEM → DEFAULT via UpdateTexture
-                if (Configuration.UseDefaultTexturePool) {
-                    // Method 1: DirectXTex staging pattern for D3DPOOL_DEFAULT
-                    IDirect3DTexture9* stagingTexture = nullptr;
-                    
-                    // Step 1: Load BSA data into D3DPOOL_SYSTEMMEM staging texture
-                    HRESULT stagingHr = D3DXCreateTextureFromFileInMemoryEx(dev, ed.data.get(), ed.size,
-                        D3DX_FROM_FILE, D3DX_FROM_FILE, D3DX_FROM_FILE,
-                        0, D3DFMT_UNKNOWN, D3DPOOL_SYSTEMMEM, D3DX_DEFAULT, D3DX_DEFAULT, 0, nullptr, nullptr, &stagingTexture);
-                    
-                    if (SUCCEEDED(stagingHr) && stagingTexture) {
-                        // Get staging texture properties
-                        D3DSURFACE_DESC stagingDesc;
-                        if (SUCCEEDED(stagingTexture->GetLevelDesc(0, &stagingDesc))) {
-                            UINT mipLevels = stagingTexture->GetLevelCount();
-                            
-                            // Step 2: Create empty D3DPOOL_DEFAULT final texture
-                            hr = dev->CreateTexture(stagingDesc.Width, stagingDesc.Height, mipLevels,
-                                0, stagingDesc.Format, D3DPOOL_DEFAULT, &baseTexture, nullptr);
-                            
-                            if (SUCCEEDED(hr) && baseTexture) {
-                                // Step 3: Use DirectXTex UpdateTexture transfer (SYSTEMMEM → DEFAULT)
-                                HRESULT updateHr = dev->UpdateTexture(stagingTexture, baseTexture);
-                                
-                                if (!SUCCEEDED(updateHr)) {
-                                    LOG::logline("!! DirectXTex UpdateTexture FAILED: %s (HRESULT: 0x%08x)", baseName.c_str(), updateHr);
-                                    baseTexture->Release();
-                                    baseTexture = nullptr;
-                                }
-                            } else {
-                                LOG::logline("!! Failed to create D3DPOOL_DEFAULT texture: %s (HRESULT: 0x%08x)", baseName.c_str(), hr);
-                            }
-                        }
-                        
-                        stagingTexture->Release();
-                    } else {
-                        LOG::logline("!! Failed to create SYSTEMMEM staging texture: %s (HRESULT: 0x%08x)", baseName.c_str(), stagingHr);
-                        hr = stagingHr;
-                    }
-                } else {
-                    // Method 2: Direct loading for D3DPOOL_MANAGED (no staging needed)
-                    hr = D3DXCreateTextureFromFileInMemoryEx(dev, ed.data.get(), ed.size, 
-                        D3DX_FROM_FILE, D3DX_FROM_FILE, D3DX_FROM_FILE,
-                        0, D3DFMT_UNKNOWN, D3DPOOL_MANAGED, D3DX_DEFAULT, D3DX_DEFAULT, 0, nullptr, nullptr, &baseTexture);
-                    
-                    if (!SUCCEEDED(hr)) {
-                        LOG::logline("!! Direct MANAGED texture creation FAILED: %s (HRESULT: 0x%08x)", baseName.c_str(), hr);
-                    }
-                }
+                hr = D3DXCreateTextureFromFileInMemoryEx(dev, ed.data.get(), ed.size,
+                    D3DX_FROM_FILE, D3DX_FROM_FILE, D3DX_FROM_FILE,
+                    0, D3DFMT_UNKNOWN, D3DPOOL_SYSTEMMEM, D3DX_DEFAULT, D3DX_DEFAULT, 0, nullptr, nullptr, &hashTexture);
             }
         }
-        
-        if (SUCCEEDED(hr) && baseTexture) {
-            
-            // Calculate hash using same method as runtime textures (disable caching for BSA textures)
-            TextureRuntimeHash texHash = calculateTextureHash(dev, baseTexture, false);
+
+        if (SUCCEEDED(hr) && hashTexture) {
+            // Hash by locking directly - same algorithm as runtime UnlockRect
+            TextureRuntimeHash texHash = hashLockableTexture(hashTexture);
             
             if (texHash.crc32 != 0) {
                 // Check for collision before adding
@@ -1126,7 +1143,7 @@ void buildBSATextureHashDatabase(IDirect3DDevice9* dev) {
                 LOG::logline("!! HASH FAILED: %08x (zero hash) for '%s' - texture skipped", texHash.crc32, baseName.c_str());
             }
 
-            baseTexture->Release();
+            hashTexture->Release();
         } else {
             LOG::logline("!! TEXTURE LOAD FAILED: Could not load '%s' from %s", baseName.c_str(), variants.baseTextureSource.c_str());
         }
