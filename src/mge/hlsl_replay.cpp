@@ -307,32 +307,48 @@ void FixedFunctionShader::bindShaderTextures(const ShaderKey& sk, const Rendered
                         bool shouldLog = (bindLogCount < 5);
 
                         // Slot 2: ParamH (metallic/roughness) - load once per texture change
-                        if (sk.hasParamH && cached->variants->hasParamH()) {
-                            if (!bindState.boundParamH) {
-                                bindState.boundParamH = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *cached->variants, "paramh");
-                                if (shouldLog) LOG::logline("bindShaderTextures: loaded paramH=%p for %s", bindState.boundParamH, cached->textureName.c_str());
+                        if (sk.hasParamH) {
+                            if (cached->variants->hasParamH()) {
+                                if (!bindState.boundParamH) {
+                                    bindState.boundParamH = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *cached->variants, "paramh");
+                                    if (shouldLog) LOG::logline("bindShaderTextures: loaded paramH=%p for %s", bindState.boundParamH, cached->textureName.c_str());
+                                }
+                                if (bindState.boundParamH) {
+                                    setCachedTextureWithSamplerPreservation(device, 2, bindState.boundParamH);
+                                    if (shouldLog) LOG::logline("bindShaderTextures: bound paramH to slot 2");
+                                }
+                            } else {
+                                // Bind default paramH texture with neutral PBR values (metalness=0, roughness=0.9)
+                                setCachedTextureWithSamplerPreservation(device, 2, defaultParamHTexture);
                             }
-                            if (bindState.boundParamH) {
-                                setCachedTextureWithSamplerPreservation(device, 2, bindState.boundParamH);
-                                if (shouldLog) LOG::logline("bindShaderTextures: bound paramH to slot 2");
-                            }
-                        } else if (shouldLog && sk.hasParamH) {
-                            LOG::logline("bindShaderTextures: sk.hasParamH but variants->hasParamH()=%d", cached->variants->hasParamH());
                         }
 
                         // Slot 3: ParamX (anisotropic) - load once per texture change
-                        if (sk.hasParamX && cached->variants->hasParamX()) {
-                            if (!bindState.boundParamX) {
-                                bindState.boundParamX = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *cached->variants, "paramx");
-                                if (shouldLog) LOG::logline("bindShaderTextures: loaded paramX=%p for %s", bindState.boundParamX, cached->textureName.c_str());
-                            }
-                            if (bindState.boundParamX) {
-                                setCachedTextureWithSamplerPreservation(device, 3, bindState.boundParamX);
-                                if (shouldLog) LOG::logline("bindShaderTextures: bound paramX to slot 3");
+                        if (sk.hasParamX) {
+                            if (cached->variants->hasParamX()) {
+                                if (!bindState.boundParamX) {
+                                    bindState.boundParamX = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *cached->variants, "paramx");
+                                    if (shouldLog) LOG::logline("bindShaderTextures: loaded paramX=%p for %s", bindState.boundParamX, cached->textureName.c_str());
+                                }
+                                if (bindState.boundParamX) {
+                                    setCachedTextureWithSamplerPreservation(device, 3, bindState.boundParamX);
+                                    if (shouldLog) LOG::logline("bindShaderTextures: bound paramX to slot 3");
+                                }
+                            } else {
+                                // Bind default normal texture for missing paramX
+                                setCachedTextureWithSamplerPreservation(device, 3, defaultNormalTexture);
                             }
                         }
 
                         if (shouldLog && (sk.hasParamH || sk.hasParamX)) bindLogCount++;
+                    }
+                } else if (sk.hasParamH || sk.hasParamX) {
+                    // No variants data but shader expects suffix textures - bind defaults
+                    if (sk.hasParamH) {
+                        setCachedTextureWithSamplerPreservation(device, 2, defaultParamHTexture);
+                    }
+                    if (sk.hasParamX) {
+                        setCachedTextureWithSamplerPreservation(device, 3, defaultNormalTexture);
                     }
                 }
                 bindState.lastBaseTexture = rs->texture;
@@ -2312,6 +2328,20 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     stagingIdx++;
                 }
             }
+
+            // Also fill light params for merged batches (they follow stateless batches in staging buffer)
+            for (const auto& mb : fb.mergedBatches) {
+                for (size_t callIdx : mb.callIndices) {
+                    if (stagingIdx < fb.drawDataStaging.size() && callIdx < perObjectLightInfo.size()) {
+                        const auto& li = perObjectLightInfo[callIdx];
+                        fb.drawDataStaging[stagingIdx].lightParams[0] = (float)li.lightCount;
+                        fb.drawDataStaging[stagingIdx].lightParams[1] = perObjectTexelSize;
+                        fb.drawDataStaging[stagingIdx].lightParams[2] = (float)li.texelOffset;
+                        fb.drawDataStaging[stagingIdx].lightParams[3] = 0.0f;
+                    }
+                    stagingIdx++;
+                }
+            }
             if (logCount > 0) loggedLightFill = true;
 
             // Upload draw data to texture
@@ -2337,7 +2367,15 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                 device->SetSamplerState(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
                 device->SetSamplerState(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
                 device->SetSamplerState(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
-                device->SetTexture(6, fb.texDrawData);  // Also bind to slot 6 for PS
+                // Bind to PS slots 6 and 7 - some drivers need PS binding for VTF to work
+                device->SetTexture(6, fb.texDrawData);
+                device->SetTexture(7, fb.texDrawData);
+                // Set PS sampler states to POINT to prevent filtering across draw data texels
+                for (int slot = 6; slot <= 7; ++slot) {
+                    device->SetSamplerState(slot, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+                    device->SetSamplerState(slot, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+                    device->SetSamplerState(slot, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+                }
 
                 // Ensure light texture (slot 5) is bound for texture-based point lighting
                 IDirect3DTexture9* lightTex = g_renderThread ? g_renderThread->getPerObjectLightTexture() : nullptr;
@@ -2348,29 +2386,40 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                 // Issue batched draws
                 for (const auto& batch : fb.statelessBatches) {
                     const auto& firstCall = recCalls[batch.callIndices[0]];
+
+                    // Check suppress flags based on bin (same logic as main loop)
+                    bool suppressed = false;
+                    switch (firstCall.bin) {
+                        case RenderBin::Terrain:    suppressed = ImGuiManager::GetSuppressTerrain(); break;
+                        case RenderBin::Opaque:     suppressed = ImGuiManager::GetSuppressOpaque(); break;
+                        case RenderBin::Skinning:   suppressed = ImGuiManager::GetSuppressSkinning(); break;
+                        case RenderBin::Grass:      suppressed = ImGuiManager::GetSuppressGrass(); break;
+                        case RenderBin::AlphaTested:suppressed = ImGuiManager::GetSuppressAlphaTested(); break;
+                        case RenderBin::Blending:   suppressed = ImGuiManager::GetSuppressBlending(); break;
+                        default: break;
+                    }
+                    if (suppressed) continue;
+
                     UINT instanceCount = (UINT)batch.callIndices.size();
 
                     // Get stateless batch vertex declaration for this FVF
                     IDirect3DVertexDeclaration9* statelessDecl = getStatelessBatchDecl(firstCall.rs.fvf);
                     if (!statelessDecl) continue;
 
-                    // Use recorded ShaderKey (preserves suffix flags) and modify for stateless batching
+                    // Build normalized ShaderKey for stateless batching
+                    // All material variation (vertexMaterial, suffix textures) handled via texture data + shader branching
                     ShaderKey sk = firstCall.sk;
                     sk.useStatelessBatch = 1;
-                    // Disable shadows for stateless batches (worldpos unavailable - using worldview directly)
-                    sk.hasShadows = 0;
+                    // Enable shadows for stateless batches (use view-to-shadow transform instead of world-to-shadow)
+                    sk.hasShadows = ((Configuration.MGEFlags & USE_SHADOWS) && (Configuration.MGEFlags & USE_DISTANT_LAND)) ? 1 : 0;
                     // Force lightMode 3 (texture-based) for stateless batching so per-instance lighting works
                     if (sk.useLighting && sk.lightMode < 3) {
                         sk.lightMode = 3;
                     }
-
-                    // Debug: log suffix flags for first few batches
-                    static int suffixLogCount = 0;
-                    if (suffixLogCount < 10 && (sk.hasDiffParam || sk.hasParamH || sk.hasParamX)) {
-                        LOG::logline("StatelessBatch suffix: tex=%p, hasDiffParam=%d, hasParamH=%d, hasParamX=%d",
-                            firstCall.rs.texture, (int)sk.hasDiffParam, (int)sk.hasParamH, (int)sk.hasParamX);
-                        suffixLogCount++;
-                    }
+                    // Keep suffix texture flags from first call - don't force them on
+                    // Forcing hasParamH=1 causes parallax to run on objects without height maps
+                    // Batches will split on suffix availability, which is correct behavior
+                    // Note: vertexMaterial is read from texture flags[0] and shader branches on it
 
                     // Look up shader variant
                     HLSLShader hlslShader = {};
@@ -2397,6 +2446,25 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     D3DXMatrixTranspose(&projT, &fb.currentProj);
                     device->SetVertexShaderConstantF(12, (float*)&viewT, 4);  // view at c12
                     device->SetVertexShaderConstantF(0, (float*)&projT, 4);   // proj at c0
+
+                    // Set view-to-shadow matrices for stateless batches (viewpos -> shadow space)
+                    if (sk.hasShadows) {
+                        const auto* svp = s_activeShadowVP ? s_activeShadowVP : DistantLand::s_staging.smViewproj;
+                        D3DXMATRIX viewInverse;
+                        D3DXMatrixInverse(&viewInverse, nullptr, &fb.currentView);
+                        D3DXMATRIX viewToShadow[2];
+                        viewToShadow[0] = viewInverse * svp[0];
+                        viewToShadow[1] = viewInverse * svp[1];
+                        D3DXMATRIX viewToShadowT[2];
+                        D3DXMatrixTranspose(&viewToShadowT[0], &viewToShadow[0]);
+                        D3DXMatrixTranspose(&viewToShadowT[1], &viewToShadow[1]);
+                        device->SetVertexShaderConstantF(60, (float*)&viewToShadowT[0], 4);  // c60-c63
+                        device->SetVertexShaderConstantF(64, (float*)&viewToShadowT[1], 4);  // c64-c67
+
+                        // Set shadow resolution parameter (PS)
+                        float shadowRcpData[4] = { 1.0f / Configuration.DL.ShadowResolution, 0, 0, 0 };
+                        device->SetPixelShaderConstantF(17, shadowRcpData, 1);
+                    }
 
                     // Set draw data texture params: {1/width, 1/height, 0, 0}
                     float drawDataParams[4] = { 1.0f / DRAW_DATA_WIDTH, 1.0f / fb.texDrawDataHeight, 0.0f, 0.0f };
@@ -2562,12 +2630,377 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
         }
     }
 
+    // Issue merged batch draws (Scene 0 only) - collapses singletons into mega-draws by texture
+    std::unordered_set<size_t> mergedBatchIndices;
+    int mergedDrawCalls = 0;
+
+    if (sceneCount == 0 && ImGuiManager::GetEnableStatelessBatch() && !fb.mergedBatches.empty()) {
+        MGE_ZoneScopedN("replay_MergedBatchDraws");
+
+        // Calculate total vertices and indices needed
+        UINT totalMergedVerts = 0;
+        UINT totalMergedIndices = 0;
+        UINT vbSizeNeeded = 0;
+
+        // Compute total VB size accounting for per-batch stride
+        for (const auto& mb : fb.mergedBatches) {
+            totalMergedVerts += mb.totalVertices;
+            totalMergedIndices += mb.totalIndices;
+            // Each batch has its own expanded stride
+            if (!mb.callIndices.empty()) {
+                const auto& call = recCalls[mb.callIndices[0]];
+                UINT batchExpandedStride = call.rs.vbStride + sizeof(float);
+                vbSizeNeeded += mb.totalVertices * batchExpandedStride;
+            }
+        }
+        UINT ibSizeNeeded = totalMergedIndices * sizeof(DWORD);  // 32-bit indices for >64k verts
+
+        // Create/resize dynamic VB if needed
+        if (fb.mergedVB == nullptr || fb.mergedVBSize < vbSizeNeeded) {
+            if (fb.mergedVB) fb.mergedVB->Release();
+            UINT newSize = std::max(vbSizeNeeded, 1024u * 1024u);  // Min 1MB
+            if (SUCCEEDED(device->CreateVertexBuffer(newSize, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
+                                                      0, D3DPOOL_DEFAULT, &fb.mergedVB, nullptr))) {
+                fb.mergedVBSize = newSize;
+                LOG::logline("MergedBatch: Created dynamic VB, %d bytes", newSize);
+            }
+        }
+
+        // Create/resize dynamic IB if needed (32-bit indices to support >64k vertices per batch)
+        if (fb.mergedIB == nullptr || fb.mergedIBSize < totalMergedIndices) {
+            if (fb.mergedIB) fb.mergedIB->Release();
+            UINT newCount = std::max(totalMergedIndices, 256u * 1024u);  // Min 256K indices
+            if (SUCCEEDED(device->CreateIndexBuffer(newCount * sizeof(DWORD), D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
+                                                     D3DFMT_INDEX32, D3DPOOL_DEFAULT, &fb.mergedIB, nullptr))) {
+                fb.mergedIBSize = newCount;
+                LOG::logline("MergedBatch: Created dynamic IB (32-bit), %d indices", newCount);
+            }
+        }
+
+        if (fb.mergedVB && fb.mergedIB && vbSizeNeeded > 0 && ibSizeNeeded > 0) {
+            // Lock entire VB and IB
+            void* vbData = nullptr;
+            void* ibData = nullptr;
+
+            if (SUCCEEDED(fb.mergedVB->Lock(0, vbSizeNeeded, &vbData, D3DLOCK_DISCARD)) &&
+                SUCCEEDED(fb.mergedIB->Lock(0, ibSizeNeeded, &ibData, D3DLOCK_DISCARD))) {
+
+                BYTE* vbDst = static_cast<BYTE*>(vbData);
+                DWORD* ibDst = static_cast<DWORD*>(ibData);  // 32-bit indices
+                UINT vbByteOffset = 0;  // In bytes
+                UINT ibOffset = 0;      // In indices
+
+                // Track per-batch offsets for drawing
+                struct MergedDrawInfo {
+                    UINT vbByteOffset;     // Byte offset into merged VB
+                    UINT ibStartIndex;
+                    UINT vertCount;
+                    UINT primCount;
+                    UINT expandedStride;   // Per-batch stride
+                };
+                std::vector<MergedDrawInfo> drawInfos;
+                drawInfos.reserve(fb.mergedBatches.size());
+
+                for (const auto& mb : fb.mergedBatches) {
+                    if (mb.callIndices.empty()) continue;
+
+                    // Get batch's stride from first call
+                    const auto& firstCall = recCalls[mb.callIndices[0]];
+                    UINT batchStride = firstCall.rs.vbStride;
+                    UINT batchExpandedStride = batchStride + sizeof(float);
+
+                    MergedDrawInfo info;
+                    info.vbByteOffset = vbByteOffset;
+                    info.ibStartIndex = ibOffset;
+                    info.vertCount = 0;
+                    info.primCount = 0;
+                    info.expandedStride = batchExpandedStride;
+
+                    UINT localVertOffset = 0;  // Vertex offset within this batch
+
+                    for (size_t i = 0; i < mb.callIndices.size(); i++) {
+                        size_t callIdx = mb.callIndices[i];
+                        const auto& call = recCalls[callIdx];
+                        UINT drawIndex = mb.drawDataOffset + (UINT)i;  // Index into draw data texture
+
+                        // Copy vertices with drawIndex appended
+                        void* srcVerts = nullptr;
+                        if (call.rs.vb && SUCCEEDED(call.rs.vb->Lock(call.rs.vbOffset,
+                                                    call.rs.vertCount * call.rs.vbStride,
+                                                    &srcVerts, D3DLOCK_READONLY))) {
+                            const BYTE* src = static_cast<const BYTE*>(srcVerts);
+                            for (UINT v = 0; v < call.rs.vertCount; v++) {
+                                // Copy original vertex data
+                                memcpy(vbDst, src, batchStride);
+                                // Append drawIndex as float
+                                float* drawIdxPtr = reinterpret_cast<float*>(vbDst + batchStride);
+                                *drawIdxPtr = (float)drawIndex;
+                                vbDst += batchExpandedStride;
+                                src += batchStride;
+                            }
+                            call.rs.vb->Unlock();
+                        }
+
+                        // Copy indices with offset rebasing (source is 16-bit, dest is 32-bit)
+                        void* srcIndices = nullptr;
+                        UINT indexCount = call.rs.primCount * 3;
+                        if (call.rs.ib && SUCCEEDED(call.rs.ib->Lock(call.rs.startIndex * sizeof(WORD),
+                                                    indexCount * sizeof(WORD),
+                                                    &srcIndices, D3DLOCK_READONLY))) {
+                            const WORD* srcIdx = static_cast<const WORD*>(srcIndices);
+                            for (UINT idx = 0; idx < indexCount; idx++) {
+                                // Rebase index: add local vertex offset within this merged batch
+                                ibDst[idx] = (DWORD)srcIdx[idx] + localVertOffset;
+                            }
+                            ibDst += indexCount;
+                            call.rs.ib->Unlock();
+                        }
+
+                        localVertOffset += call.rs.vertCount;
+                        info.vertCount += call.rs.vertCount;
+                        info.primCount += call.rs.primCount;
+                        vbByteOffset += call.rs.vertCount * batchExpandedStride;
+                        ibOffset += indexCount;
+
+                        // Mark this call as handled
+                        mergedBatchIndices.insert(callIdx);
+                    }
+
+                    drawInfos.push_back(info);
+                }
+
+                fb.mergedVB->Unlock();
+                fb.mergedIB->Unlock();
+
+                // Now issue draw calls for each merged batch
+                static bool loggedMerge = false;
+                if (!loggedMerge) {
+                    loggedMerge = true;
+                    LOG::logline("MergedBatch: %d batches ready, %d total verts, %d total indices",
+                                 (int)fb.mergedBatches.size(), totalMergedVerts, totalMergedIndices);
+                }
+
+                // Cache for merged vertex declarations (FVF -> decl with appended drawIndex)
+                static std::unordered_map<DWORD, IDirect3DVertexDeclaration9*> mergedDeclCache;
+
+                // Helper to get/create merged vertex declaration
+                // Must match FVF layout exactly, including variable-size texture coordinates
+                auto getMergedDecl = [&](DWORD fvf, UINT originalStride) -> IDirect3DVertexDeclaration9* {
+                    auto it = mergedDeclCache.find(fvf);
+                    if (it != mergedDeclCache.end()) return it->second;
+
+                    // Build declaration from FVF + drawIndex at end
+                    std::vector<D3DVERTEXELEMENT9> elements;
+                    WORD offset = 0;
+
+                    // Position (handle XYZRHW for transformed vertices)
+                    if (fvf & D3DFVF_XYZRHW) {
+                        elements.push_back({0, offset, D3DDECLTYPE_FLOAT4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITIONT, 0});
+                        offset += 16;
+                    } else if (fvf & D3DFVF_XYZ) {
+                        elements.push_back({0, offset, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0});
+                        offset += 12;
+                    }
+
+                    // Blend weights (must come after position in FVF order)
+                    int posType = (fvf >> 1) & 0x7;
+                    int blendWeights = (posType >= 3) ? (posType - 2) : 0;
+                    if (blendWeights > 0 && blendWeights <= 4) {
+                        BYTE types[] = {D3DDECLTYPE_FLOAT1, D3DDECLTYPE_FLOAT2, D3DDECLTYPE_FLOAT3, D3DDECLTYPE_FLOAT4};
+                        elements.push_back({0, offset, types[blendWeights-1], D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_BLENDWEIGHT, 0});
+                        offset += blendWeights * 4;
+                    }
+
+                    // Normal
+                    if (fvf & D3DFVF_NORMAL) {
+                        elements.push_back({0, offset, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_NORMAL, 0});
+                        offset += 12;
+                    }
+
+                    // Diffuse color
+                    if (fvf & D3DFVF_DIFFUSE) {
+                        elements.push_back({0, offset, D3DDECLTYPE_D3DCOLOR, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_COLOR, 0});
+                        offset += 4;
+                    }
+
+                    // Specular color
+                    if (fvf & D3DFVF_SPECULAR) {
+                        elements.push_back({0, offset, D3DDECLTYPE_D3DCOLOR, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_COLOR, 1});
+                        offset += 4;
+                    }
+
+                    // Texture coordinates with proper size decoding
+                    int numTex = (fvf & D3DFVF_TEXCOUNT_MASK) >> D3DFVF_TEXCOUNT_SHIFT;
+                    for (int t = 0; t < numTex; t++) {
+                        // Decode texture coordinate format from FVF (2 bits per texcoord starting at bit 16)
+                        int fmt = (fvf >> (16 + t * 2)) & 0x3;
+                        BYTE type = D3DDECLTYPE_FLOAT2;
+                        int size = 8;
+                        switch (fmt) {
+                            case 0: type = D3DDECLTYPE_FLOAT2; size = 8; break;  // D3DFVF_TEXTUREFORMAT2 (default)
+                            case 1: type = D3DDECLTYPE_FLOAT3; size = 12; break; // D3DFVF_TEXTUREFORMAT3
+                            case 2: type = D3DDECLTYPE_FLOAT4; size = 16; break; // D3DFVF_TEXTUREFORMAT4
+                            case 3: type = D3DDECLTYPE_FLOAT1; size = 4; break;  // D3DFVF_TEXTUREFORMAT1
+                        }
+                        elements.push_back({0, offset, type, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, (BYTE)t});
+                        offset += size;
+                    }
+
+                    // DrawIndex at the end (at originalStride offset)
+                    elements.push_back({0, (WORD)originalStride, D3DDECLTYPE_FLOAT1, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 8});
+
+                    // End marker
+                    elements.push_back(D3DDECL_END());
+
+                    IDirect3DVertexDeclaration9* decl = nullptr;
+                    if (SUCCEEDED(device->CreateVertexDeclaration(elements.data(), &decl))) {
+                        mergedDeclCache[fvf] = decl;
+                        LOG::logline("MergedBatch: Created vertex decl for FVF 0x%X, stride %d->%d",
+                                     fvf, originalStride, originalStride + 4);
+                    }
+                    return decl;
+                };
+
+                // Draw each merged batch
+                device->SetIndices(fb.mergedIB);
+
+                for (size_t bi = 0; bi < fb.mergedBatches.size(); bi++) {
+                    const auto& mb = fb.mergedBatches[bi];
+                    const auto& di = drawInfos[bi];
+                    if (di.vertCount == 0 || di.primCount == 0) continue;
+
+                    // Get first call for shader setup
+                    const auto& firstCall = recCalls[mb.callIndices[0]];
+
+                    // Check suppress flags based on bin (same logic as main loop)
+                    bool suppressed = false;
+                    switch (firstCall.bin) {
+                        case RenderBin::Terrain:    suppressed = ImGuiManager::GetSuppressTerrain(); break;
+                        case RenderBin::Opaque:     suppressed = ImGuiManager::GetSuppressOpaque(); break;
+                        case RenderBin::Skinning:   suppressed = ImGuiManager::GetSuppressSkinning(); break;
+                        case RenderBin::Grass:      suppressed = ImGuiManager::GetSuppressGrass(); break;
+                        case RenderBin::AlphaTested:suppressed = ImGuiManager::GetSuppressAlphaTested(); break;
+                        case RenderBin::Blending:   suppressed = ImGuiManager::GetSuppressBlending(); break;
+                        default: break;
+                    }
+                    if (suppressed) continue;
+
+                    UINT originalStride = firstCall.rs.vbStride;
+
+                    // Get or create vertex declaration
+                    IDirect3DVertexDeclaration9* mergedDecl = getMergedDecl(mb.key.fvf, originalStride);
+                    if (!mergedDecl) continue;
+
+                    // Build shader key (same as stateless batch)
+                    ShaderKey sk = firstCall.sk;
+                    sk.useStatelessBatch = true;
+                    sk.useInstancing = false;
+
+                    // Look up shader variant
+                    HLSLShader hlslShader = {};
+                    AcquireSRWLockShared(&hlslCacheLock);
+                    auto iShader = cacheHLSLShaders.find(sk);
+                    if (iShader != cacheHLSLShaders.end()) {
+                        hlslShader = iShader->second;
+                    }
+                    ReleaseSRWLockShared(&hlslCacheLock);
+
+                    // If shader not found, queue compilation and skip this batch
+                    if (!hlslShader.vertexShader || !hlslShader.pixelShader) {
+                        queueShaderCompilation(sk);
+                        continue;
+                    }
+
+                    // Bind shaders
+                    device->SetVertexShader(hlslShader.vertexShader);
+                    device->SetPixelShader(hlslShader.pixelShader);
+
+                    // Set view/proj matrices (same as stateless batch)
+                    D3DXMATRIX viewT, projT;
+                    D3DXMatrixTranspose(&viewT, &fb.currentView);
+                    D3DXMatrixTranspose(&projT, &fb.currentProj);
+                    device->SetVertexShaderConstantF(12, (float*)&viewT, 4);  // view at c12
+                    device->SetVertexShaderConstantF(0, (float*)&projT, 4);   // proj at c0
+
+                    // Set draw data texture params: {1/width, 1/height, 0, 0}
+                    // DRAW_DATA_WIDTH = 8 (8 texels per draw)
+                    float drawDataParams[4] = { 1.0f / 8.0f, 1.0f / fb.texDrawDataHeight, 0.0f, 0.0f };
+                    device->SetVertexShaderConstantF(70, drawDataParams, 1);  // drawDataParams at c70
+
+                    // Bind draw data texture with explicit VTF sampler states
+                    device->SetTexture(D3DVERTEXTEXTURESAMPLER0, fb.texDrawData);
+                    device->SetSamplerState(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+                    device->SetSamplerState(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+                    device->SetSamplerState(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+                    device->SetSamplerState(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+                    device->SetSamplerState(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+                    // Bind to PS slots 6 and 7 for driver compatibility
+                    device->SetTexture(6, fb.texDrawData);
+                    device->SetTexture(7, fb.texDrawData);
+                    // Set PS sampler states to POINT to prevent filtering across draw data texels
+                    for (int slot = 6; slot <= 7; ++slot) {
+                        device->SetSamplerState(slot, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+                        device->SetSamplerState(slot, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+                        device->SetSamplerState(slot, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+                    }
+
+                    // Bind textures using smart binding function
+                    bindShaderTextures(sk, &firstCall.rs);
+
+                    // Set render state
+                    device->SetRenderState(D3DRS_ALPHABLENDENABLE, mb.key.blendState & 0x1);
+                    device->SetRenderState(D3DRS_SRCBLEND, (mb.key.blendState >> 4) & 0xF);
+                    device->SetRenderState(D3DRS_DESTBLEND, (mb.key.blendState >> 8) & 0xF);
+                    device->SetRenderState(D3DRS_ZENABLE, mb.key.zState & 0x3);
+                    device->SetRenderState(D3DRS_ZWRITEENABLE, (mb.key.zState >> 2) & 0x1);
+                    device->SetRenderState(D3DRS_CULLMODE, mb.key.cullMode);
+
+                    // Set up vertex stream - offset 0, use BaseVertexIndex for batch positioning
+                    device->SetVertexDeclaration(mergedDecl);
+                    device->SetStreamSource(0, fb.mergedVB, 0, di.expandedStride);
+                    device->SetStreamSourceFreq(0, 1);  // Not instanced
+                    device->SetStreamSource(1, nullptr, 0, 0);
+
+                    // Draw merged geometry
+                    // Use BaseVertexIndex to offset into merged VB (avoids double-offset with stream offset)
+                    // Indices are local to batch (rebased during copy)
+                    INT baseVertex = (INT)(di.vbByteOffset / di.expandedStride);
+                    device->DrawIndexedPrimitive(
+                        D3DPT_TRIANGLELIST,
+                        baseVertex,           // BaseVertexIndex - added to each index by GPU
+                        0,                    // MinIndex
+                        di.vertCount,
+                        di.ibStartIndex,
+                        di.primCount
+                    );
+
+                    mergedDrawCalls++;
+                }
+
+                // Clean up VTF and PS texture bindings to prevent state leakage
+                device->SetTexture(D3DVERTEXTEXTURESAMPLER0, nullptr);
+                device->SetTexture(6, nullptr);
+                device->SetTexture(7, nullptr);
+            } else {
+                if (vbData) fb.mergedVB->Unlock();
+            }
+        }
+    }
+
+    // Also clean up after stateless batches to prevent state leakage into main loop
+    if (sceneCount == 0 && !fb.statelessBatches.empty()) {
+        device->SetTexture(D3DVERTEXTEXTURESAMPLER0, nullptr);
+        device->SetTexture(6, nullptr);
+        device->SetTexture(7, nullptr);
+    }
+
     MGE_ZoneScopedN("replay_MainLoop");
     bool firstDrawDone = false;
     for (size_t i = 0; i < numCalls; i++) {
-        // Skip calls that were handled by instanced draws or stateless batches
+        // Skip calls that were handled by instanced draws, stateless batches, or merged batches
         if (batchedCallIndices.count(i)) continue;
         if (statelessBatchedIndices.count(i)) continue;
+        if (mergedBatchIndices.count(i)) continue;
         auto& call = recCalls[i];  // Non-const to update shader key
 
         // Force lightMode 3 for lit Opaque/Terrain when toggle enabled (before rendering)
@@ -2707,6 +3140,16 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                         tintedFrs.material.emissive = {1.0f, 0.0f, 1.0f, 1.0f}; break; // Magenta
                     default: break;
                 }
+                renderMorrowindHLSL_Internal(&call.rs, &tintedFrs, call.lightrs.get(), DIRTY_ALL, -1, cmdBuf, &call.deviceState, &call);
+                continue;
+            }
+
+            // Stateless batch singleton highlighting: red tint for unbatched draws
+            if (ImGuiManager::GetHighlightStatelessBatch() && fb.singletonCallIndices.count(i)) {
+                FragmentState tintedFrs = call.frs;
+                tintedFrs.material.diffuse.r = call.frs.material.diffuse.r * 1.0f;
+                tintedFrs.material.diffuse.g = call.frs.material.diffuse.g * 0.3f;
+                tintedFrs.material.diffuse.b = call.frs.material.diffuse.b * 0.3f;
                 renderMorrowindHLSL_Internal(&call.rs, &tintedFrs, call.lightrs.get(), DIRTY_ALL, -1, cmdBuf, &call.deviceState, &call);
                 continue;
             }

@@ -182,13 +182,14 @@ struct StatelessDrawData {
 };
 static_assert(sizeof(StatelessDrawData) == 128, "StatelessDrawData must be 128 bytes (8 texels)");
 
-// Simplified batch key: geometry + render state only (material in texture)
-// alphaRef now per-draw in texture, not in key
+// Simplified batch key: geometry hash + render state
+// Uses geometry content hash instead of VB/IB pointers to batch identical meshes
+// Shader variant flags (vertexMaterial, hasParam*) handled via texture data + branching
 struct StatelessBatchKey {
-    // Geometry identity
-    IDirect3DVertexBuffer9* vb;
+    // Geometry identity - content-based hash allows batching identical meshes in different VBs
+    size_t geometryHash;      // Hash of FVF + vertex data content
+    IDirect3DVertexBuffer9* vb;  // Still needed for actual draw call
     IDirect3DIndexBuffer9* ib;
-    DWORD fvf;
     UINT baseIndex;
     UINT vertCount;
     UINT startIndex;
@@ -199,26 +200,29 @@ struct StatelessBatchKey {
     uint16_t blendState;   // alphaBlendEnable | srcBlend | destBlend
     uint8_t zState;        // zEnable | zWriteEnable
     uint8_t cullMode;
-    uint8_t useLighting;   // Shader lighting mode (must match for batch)
+    uint8_t useLighting;   // Lighting on/off (affects shader structure)
+    uint8_t vertexMaterial; // Shading mode (must match for consistent material handling)
+    uint8_t vertexColour;   // Has vertex color (affects diffuse source)
 
     bool operator==(const StatelessBatchKey& o) const {
-        return vb == o.vb && ib == o.ib && fvf == o.fvf &&
+        // Match on geometry hash + draw params, not VB/IB pointers
+        return geometryHash == o.geometryHash &&
                baseIndex == o.baseIndex && vertCount == o.vertCount &&
                startIndex == o.startIndex && primCount == o.primCount &&
                texture == o.texture && blendState == o.blendState &&
                zState == o.zState && cullMode == o.cullMode &&
-               useLighting == o.useLighting;
+               useLighting == o.useLighting &&
+               vertexMaterial == o.vertexMaterial && vertexColour == o.vertexColour;
     }
 
     struct Hasher {
         size_t operator()(const StatelessBatchKey& k) const {
-            size_t h = reinterpret_cast<size_t>(k.vb);
-            h ^= reinterpret_cast<size_t>(k.ib) + 0x9e3779b9 + (h << 6) + (h >> 2);
-            h ^= k.fvf + 0x9e3779b9 + (h << 6) + (h >> 2);
+            size_t h = k.geometryHash;
             h ^= (k.baseIndex | (k.startIndex << 16)) + 0x9e3779b9 + (h << 6) + (h >> 2);
             h ^= (k.vertCount | (k.primCount << 16)) + 0x9e3779b9 + (h << 6) + (h >> 2);
             h ^= reinterpret_cast<size_t>(k.texture) + 0x9e3779b9 + (h << 6) + (h >> 2);
             h ^= (k.blendState | (k.zState << 16) | (k.cullMode << 24) | ((size_t)k.useLighting << 28)) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= (k.vertexMaterial | (k.vertexColour << 8)) + 0x9e3779b9 + (h << 6) + (h >> 2);
             return h;
         }
     };
@@ -228,6 +232,58 @@ struct StatelessBatchKey {
 struct StatelessBatch {
     StatelessBatchKey key;
     std::vector<size_t> callIndices;  // Indices into recordedCalls
+    UINT drawDataOffset;              // Start index in draw data texture
+};
+
+// ============================================================================
+// Geometry Merging System - collapses singletons into mega-draws
+// ============================================================================
+
+// Cached local-space mesh data (vertices centered at origin)
+struct LocalMeshData {
+    std::vector<BYTE> vertices;     // Vertex data with positions centered
+    std::vector<WORD> indices;      // Index data (copied from IB)
+    float center[3];                // Original center offset (translation to apply)
+    DWORD fvf;
+    UINT stride;
+    UINT vertCount;
+    UINT indexCount;
+    size_t localHash;               // Hash of centered geometry (position-independent)
+};
+
+// Key for merged batches: texture + renderState (bucket by texture, ignore geometry)
+// All singletons with same texture get merged into one mega-draw
+struct MergedBatchKey {
+    IDirect3DTexture9* texture;
+    uint16_t blendState;
+    uint8_t zState;
+    uint8_t cullMode;
+    uint8_t useLighting;
+    DWORD fvf;                      // Must match for merging
+
+    bool operator==(const MergedBatchKey& o) const {
+        return texture == o.texture &&
+               blendState == o.blendState && zState == o.zState &&
+               cullMode == o.cullMode && useLighting == o.useLighting &&
+               fvf == o.fvf;
+    }
+
+    struct Hasher {
+        size_t operator()(const MergedBatchKey& k) const {
+            size_t h = reinterpret_cast<size_t>(k.texture);
+            h ^= (k.blendState | (k.zState << 16) | (k.cullMode << 24)) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= (k.fvf | ((size_t)k.useLighting << 28)) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            return h;
+        }
+    };
+};
+
+// Merged batch: multiple singletons collapsed into one draw
+struct MergedBatch {
+    MergedBatchKey key;
+    std::vector<size_t> callIndices;  // Original call indices
+    UINT totalVertices;               // Sum of all vertex counts
+    UINT totalIndices;                // Sum of all index counts
     UINT drawDataOffset;              // Start index in draw data texture
 };
 
@@ -685,6 +741,7 @@ private:
     static IDirect3DTexture9* defaultWhiteTexture;
     static IDirect3DTexture9* defaultBlackTexture;
     static IDirect3DTexture9* defaultNormalTexture;  // 128,128,255,255 for flat normal
+    static IDirect3DTexture9* defaultParamHTexture;  // R=0 (metal), G=230 (rough), B=128 (IOR)
 
     // Original detail texture storage for frequency optimization
     static IDirect3DBaseTexture9* savedOriginalDetailTexture;
@@ -813,6 +870,10 @@ public:
         UINT stagingVBOffset = 0;   // Offset into staging VB for this call's data
         UINT stagingIBOffset = 0;   // Offset into staging IB for this call's data
 
+        // Geometry hash for batching identical meshes across different VB allocations
+        // Computed from: FVF + vertex count + prim count + first vertex data hash
+        size_t geometryHash = 0;
+
         // Constructor to capture render state data with proper resource management
         HLSLRecordedCall(const RenderedState* rs_, const FragmentState* frs_, std::shared_ptr<LightState> lightrs_, const ShaderKey& sk_, int recordMWIdx = -1);
         // Implementation moved to cpp file to handle sampler state capture
@@ -892,9 +953,17 @@ public:
 
         // Stateless batches for texture-based per-draw data
         std::vector<StatelessBatch> statelessBatches;
+        std::unordered_set<size_t> singletonCallIndices;  // Calls that didn't batch (for highlighting)
         IDirect3DTexture9* texDrawData = nullptr;  // 8-wide x maxDraws, A32B32G32R32F
         UINT texDrawDataHeight = 0;                // Current texture height (draws capacity)
         std::vector<StatelessDrawData> drawDataStaging;  // CPU-side staging buffer
+
+        // Merged batches for singleton geometry merging
+        std::vector<MergedBatch> mergedBatches;
+        IDirect3DVertexBuffer9* mergedVB = nullptr;  // Dynamic VB for merged geometry
+        IDirect3DIndexBuffer9* mergedIB = nullptr;   // Dynamic IB for merged indices
+        UINT mergedVBSize = 0;                       // Current VB capacity in bytes
+        UINT mergedIBSize = 0;                       // Current IB capacity in indices
 
         void clear() {
             recordedCalls.clear();
@@ -914,8 +983,10 @@ public:
             dlContext = DLContext();  // Reset DLContext to prevent garbage values
             instanceBatches.clear();
             statelessBatches.clear();
+            singletonCallIndices.clear();
             drawDataStaging.clear();
-            // Note: texDrawData is NOT released here - it's reused across frames
+            mergedBatches.clear();
+            // Note: texDrawData, mergedVB, mergedIB are NOT released here - reused across frames
             valid = false;
             // Initialize matrices to identity to prevent garbage if capture functions aren't called
             D3DXMatrixIdentity(&view);

@@ -126,13 +126,14 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 	float texelW = drawDataParams.x;  // 0.125 for 8-wide texture
 
 	// Texels 3,4,5 are diffuse, ambient, emissive
-	float4 matDiffuse = tex2D(sampDrawData, float2(3.5 * texelW, drawV));
-	float4 matAmbient = tex2D(sampDrawData, float2(4.5 * texelW, drawV));
-	float4 matEmissive = tex2D(sampDrawData, float2(5.5 * texelW, drawV));
+	// Use tex2Dlod with mip 0 to force point sampling and ignore PS derivatives
+	float4 matDiffuse = tex2Dlod(sampDrawData, float4(3.5 * texelW, drawV, 0, 0));
+	float4 matAmbient = tex2Dlod(sampDrawData, float4(4.5 * texelW, drawV, 0, 0));
+	float4 matEmissive = tex2Dlod(sampDrawData, float4(5.5 * texelW, drawV, 0, 0));
 	// Note: matEmissive.w contains alphaRef (not used in PS, handled by device state)
 
 	// Texel 6 is light params: {lightCount, texelSize, texelOffset, 0}
-	float4 perDrawLightParams = tex2D(sampDrawData, float2(6.5 * texelW, drawV));
+	float4 perDrawLightParams = tex2Dlod(sampDrawData, float4(6.5 * texelW, drawV, 0, 0));
 
 	// Override globals with texture-sampled values
 	#define materialDiffuse matDiffuse
@@ -428,9 +429,9 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 	
 	//c.rgb = diffuseLight.rgb;
 	//c = diffuse * float4(1,1,1,texColor.a);
-	//c.rgb = ToneMap_AgX(c.rgb, 0);
+	c.rgb = ToneMap_AgX(c.rgb, 0);
 	//c.rgb = 0.16;
-	c.rgb = encode3(c.rgb);
+	//c.rgb = encode3(c.rgb);
 
 #ifdef HAS_GRASS
 	// Alpha test early to improve performance

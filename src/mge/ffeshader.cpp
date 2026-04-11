@@ -351,6 +351,7 @@ bool FixedFunctionShader::shadowMatricesValid = false;
 IDirect3DTexture9* FixedFunctionShader::defaultWhiteTexture = nullptr;
 IDirect3DTexture9* FixedFunctionShader::defaultBlackTexture = nullptr;
 IDirect3DTexture9* FixedFunctionShader::defaultNormalTexture = nullptr;
+IDirect3DTexture9* FixedFunctionShader::defaultParamHTexture = nullptr;
 
 // Original detail texture storage
 IDirect3DBaseTexture9* FixedFunctionShader::savedOriginalDetailTexture = nullptr;
@@ -1222,8 +1223,10 @@ void FixedFunctionShader::setCachedTexture(IDirect3DDevice9* device, DWORD stage
     if (!texture) {
         switch (stage) {
             case 0: // Base texture slot
-            case 2: // ParamH slot (metallic/roughness)
                 actualTexture = defaultWhiteTexture;
+                break;
+            case 2: // ParamH slot (metallic/roughness) - use neutral PBR defaults
+                actualTexture = defaultParamHTexture;
                 break;
             case 1: // Normal texture slot
             case 3: // ParamX slot (anisotropic/normal)
@@ -1270,6 +1273,18 @@ void FixedFunctionShader::createDefaultTextures() {
         if (defaultNormalTexture->LockRect(0, &lockedRect, nullptr, 0) == S_OK) {
             *(DWORD*)lockedRect.pBits = 0xFF8080FF; // Normal map: A=255, R=128, G=128, B=255
             defaultNormalTexture->UnlockRect(0);
+        }
+    }
+
+    // Create 1x1 paramH texture with neutral PBR values
+    // R=0 (metalness=0), G=128 (height=0.5 neutral for parallax), B=128 (IOR=0.5), A=255
+    // Note: G=128 gives neutral parallax (no displacement) and roughness=0.5
+    // D3DFMT_A8R8G8B8 packs as 0xAARRGGBB
+    if (device->CreateTexture(1, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &defaultParamHTexture, nullptr) == S_OK) {
+        D3DLOCKED_RECT lockedRect;
+        if (defaultParamHTexture->LockRect(0, &lockedRect, nullptr, 0) == S_OK) {
+            *(DWORD*)lockedRect.pBits = 0xFF008080; // A=255, R=0, G=128, B=128
+            defaultParamHTexture->UnlockRect(0);
         }
     }
 

@@ -257,17 +257,19 @@ VS_OUTPUT vs_main(VS_INPUT input) {
         float4 wv0 = tex2Dlod(sampDrawData, float4(0.5 * texelW, drawV, 0, 0));
         float4 wv1 = tex2Dlod(sampDrawData, float4(1.5 * texelW, drawV, 0, 0));
         float4 wv2 = tex2Dlod(sampDrawData, float4(2.5 * texelW, drawV, 0, 0));
-        // Sample flags texel (7) for 4th column: flags.zw = {wv._34, wv._44}
-        float4 flagsData = tex2Dlod(sampDrawData, float4(7.5 * texelW, drawV, 0, 0));
+        // Sample 4th column from texel 7 for complete w computation
+        float4 wv3 = tex2Dlod(sampDrawData, float4(7.5 * texelW, drawV, 0, 0));
 
         // Transform using dot products - must match mul(pos, worldview) exactly
-        // wv0={_11,_21,_31,_41}, wv1={_12,_22,_32,_42}, wv2={_13,_23,_33,_43}
+        // wv0={_11,_21,_31,_41}, wv1={_12,_22,_32,_42}, wv2={_13,_23,_33,_43}, wv3={_14,_24,_34,_44}
         viewpos.x = dot(input.pos, wv0);
         viewpos.y = dot(input.pos, wv1);
         viewpos.z = dot(input.pos, wv2);
-        // Compute w from 4th column: pos.x*_14 + pos.y*_24 + pos.z*_34 + pos.w*_44
-        // For affine transforms, _14=_24=0, so: w = pos.z*_34 + pos.w*_44
-        viewpos.w = input.pos.z * flagsData.z + input.pos.w * flagsData.w;
+        // Full 4th column dot product for robust w computation
+        viewpos.w = dot(input.pos, wv3);
+
+        // Guard against zero w from texture sampling errors (prevents vertex explosion)
+        if (abs(viewpos.w) < 0.001) viewpos.w = 1.0;
 
         // Transform normal to view space
         normal.x = dot(float4(input.normal, 0), wv0);
@@ -308,9 +310,16 @@ VS_OUTPUT vs_main(VS_INPUT input) {
     output.fog = fogMWScalar(dist);
 
 #ifdef HAS_SHADOWS
-    // Use world-to-shadow transformation for proper shadow coordinates
-    output.shadow0pos = mul(worldpos, shadowWorldViewProj[0]);
-    output.shadow1pos = mul(worldpos, shadowWorldViewProj[1]);
+    // Shadow coordinate calculation
+    #ifdef USE_STATELESS_BATCH
+        // In stateless mode, use view-to-shadow transform (viewpos already in view space)
+        output.shadow0pos = mul(viewpos, shadowWorldViewProj[0]);
+        output.shadow1pos = mul(viewpos, shadowWorldViewProj[1]);
+    #else
+        // In standard mode, use world-to-shadow transform
+        output.shadow0pos = mul(worldpos, shadowWorldViewProj[0]);
+        output.shadow1pos = mul(worldpos, shadowWorldViewProj[1]);
+    #endif
     output.shadow0pos.z = output.shadow0pos.z / output.shadow0pos.w;
     output.shadow1pos.z = output.shadow1pos.z / output.shadow1pos.w;
 #endif

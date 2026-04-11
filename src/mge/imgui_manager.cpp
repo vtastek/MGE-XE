@@ -25,6 +25,8 @@ float ImGuiManager::pcfSlopeBias = 0.001f;       // Slope-based bias to prevent 
 int ImGuiManager::bboxVisualizationMode = 0;
 bool ImGuiManager::disableHiZCulling = false;
 bool ImGuiManager::enableStatelessBatch = false;
+bool ImGuiManager::highlightStatelessBatch = false;
+bool ImGuiManager::dumpStatelessBatchDetail = false;
 bool ImGuiManager::forceLightMode3 = false;
 
 // Debug stats
@@ -420,6 +422,16 @@ void ImGuiManager::RenderDebugInterface() {
         ImGui::Checkbox("Disable Hi-Z Culling (terrain hole diagnosis)", &disableHiZCulling);
         ImGui::Checkbox("Force LightMode 3 (texture lights)", &forceLightMode3);
         ImGui::Checkbox("Enable Stateless Batching (experimental)", &enableStatelessBatch);
+        if (enableStatelessBatch) {
+            ImGui::Indent();
+            ImGui::Checkbox("Highlight Batched Draws", &highlightStatelessBatch);
+            ImGui::SetItemTooltip("Color batched draws: green=batched, red=singleton");
+            if (ImGui::Button("Dump Batch Details")) {
+                dumpStatelessBatchDetail = true;
+            }
+            ImGui::SetItemTooltip("Write detailed batch breakdown to log (one-shot)");
+            ImGui::Unindent();
+        }
 
         ImGui::Separator();
         ImGui::Text("Optimization Modes");
@@ -650,6 +662,12 @@ bool ImGuiManager::GetEnableDepthPass() { return true; }
 int ImGuiManager::GetBBoxVisualizationMode() { return bboxVisualizationMode; }
 bool ImGuiManager::GetDisableHiZCulling() { return disableHiZCulling; }
 bool ImGuiManager::GetEnableStatelessBatch() { return enableStatelessBatch; }
+bool ImGuiManager::GetHighlightStatelessBatch() { return highlightStatelessBatch; }
+bool ImGuiManager::GetAndClearDumpStatelessBatch() {
+    bool val = dumpStatelessBatchDetail;
+    dumpStatelessBatchDetail = false;
+    return val;
+}
 bool ImGuiManager::GetForceLightMode3() { return forceLightMode3; }
 
 void ImGuiManager::UpdateDebugStats(int recordedCalls, int renderedCalls, int culledCalls,
