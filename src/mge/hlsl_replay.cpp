@@ -1975,9 +1975,6 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
     int materialTransitions = 0;
     int drawCallCount = 0;
 
-    // Instancing metrics collection (InstanceKey -> draw count)
-    std::unordered_map<InstanceKey, int, InstanceKey::Hasher> instanceKeyCounts;
-
 #ifdef TRACY_ENABLE
     // Tracy bin zone: manually managed ScopedZone for per-bin profiling regions
     static constexpr tracy::SourceLocationData binZoneSrcLoc { "RenderBin", TracyFunction, TracyFile, (uint32_t)__LINE__, 0 };
@@ -1996,282 +1993,14 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
     int worstCallBin = 0;
     float slowCallThreshold = ImGuiManager::GetSlowCallThreshold();
 
-    // Build set of batched call indices to skip in main loop
-    std::unordered_set<size_t> batchedCallIndices;
-    int instancedDrawCalls = 0;
-    int instancedBatches = 0;
+    // Track merged batch draws (Scene 0 only) - per-draw data in texture
+    std::unordered_set<size_t> mergedBatchIndices;
+    int mergedDrawCalls = 0;
 
-    // Issue instanced draws for batches (Scene 0 only)
-    if (sceneCount == 0 && ImGuiManager::GetInstancingEnabled() && !fb.instanceBatches.empty() && vbFFEInstances) {
-        MGE_ZoneScopedN("replay_InstancedDraws");
-
-        // Fill instance buffer with world matrices
-        InstanceData* instData = nullptr;
-        UINT totalInstances = 0;
-        for (const auto& batch : fb.instanceBatches) {
-            totalInstances += (UINT)batch.callIndices.size();
-        }
-
-        if (totalInstances > 0 && totalInstances <= MaxFFEInstances) {
-            HRESULT hr = vbFFEInstances->Lock(0, totalInstances * FFEInstStride, (void**)&instData, D3DLOCK_DISCARD);
-            if (SUCCEEDED(hr) && instData) {
-                UINT instOffset = 0;
-
-                for (auto& batch : fb.instanceBatches) {
-                    // Record buffer offset for this batch
-                    const_cast<InstanceBatch&>(batch).instanceBufferOffset = instOffset * FFEInstStride;
-
-                    // Fill instance data (world matrix rows)
-                    for (size_t idx : batch.callIndices) {
-                        const auto& call = recCalls[idx];
-                        const D3DXMATRIX& world = call.rs.worldTransforms[0];
-
-                        // Row-major to match shader expectations
-                        instData[instOffset].world0[0] = world._11;
-                        instData[instOffset].world0[1] = world._21;
-                        instData[instOffset].world0[2] = world._31;
-                        instData[instOffset].world0[3] = world._41;
-
-                        instData[instOffset].world1[0] = world._12;
-                        instData[instOffset].world1[1] = world._22;
-                        instData[instOffset].world1[2] = world._32;
-                        instData[instOffset].world1[3] = world._42;
-
-                        instData[instOffset].world2[0] = world._13;
-                        instData[instOffset].world2[1] = world._23;
-                        instData[instOffset].world2[2] = world._33;
-                        instData[instOffset].world2[3] = world._43;
-
-                        batchedCallIndices.insert(idx);
-                        instOffset++;
-                    }
-                }
-                vbFFEInstances->Unlock();
-
-                // Issue instanced draws
-                for (const auto& batch : fb.instanceBatches) {
-                    const auto& firstCall = recCalls[batch.callIndices[0]];
-                    UINT instanceCount = (UINT)batch.callIndices.size();
-
-                    // Get instanced vertex declaration for this FVF
-                    IDirect3DVertexDeclaration9* instDecl = getInstancedDecl(firstCall.rs.fvf);
-                    if (!instDecl) continue;
-
-                    // Build ShaderKey with instancing enabled
-                    ShaderKey sk(&firstCall.rs, &firstCall.frs, firstCall.lightrs.get());
-                    sk.useInstancing = 1;
-                    sk.hasShadows = ((Configuration.MGEFlags & USE_SHADOWS) && (Configuration.MGEFlags & USE_DISTANT_LAND)) ? 1 : 0;
-
-                    // Look up instanced shader variant
-                    HLSLShader hlslShader = {};
-                    AcquireSRWLockShared(&hlslCacheLock);
-                    auto iShader = cacheHLSLShaders.find(sk);
-                    if (iShader != cacheHLSLShaders.end()) {
-                        hlslShader = iShader->second;
-                    }
-                    ReleaseSRWLockShared(&hlslCacheLock);
-
-                    // If shader not found, queue compilation and skip this batch
-                    if (!hlslShader.vertexShader || !hlslShader.pixelShader) {
-                        queueShaderCompilation(sk);
-                        // Don't skip batched calls - let them render normally
-                        for (size_t idx : batch.callIndices) {
-                            batchedCallIndices.erase(idx);
-                        }
-                        continue;
-                    }
-
-                    // Set shaders
-                    device->SetVertexShader(hlslShader.vertexShader);
-                    device->SetPixelShader(hlslShader.pixelShader);
-
-                    // Set view/proj matrices (world comes from instance stream)
-                    D3DXMATRIX viewT, projT;
-                    D3DXMatrixTranspose(&viewT, &fb.currentView);
-                    D3DXMatrixTranspose(&projT, &fb.currentProj);
-                    device->SetVertexShaderConstantF(12, (float*)&viewT, 4);  // view at c12
-                    device->SetVertexShaderConstantF(0, (float*)&projT, 4);   // proj at c0
-
-                    // Set vertexBlendState = 0 (rigid geometry)
-                    float blendState[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-                    device->SetVertexShaderConstantF(48, blendState, 1);
-
-                    // Set PS constants for materials and lighting via constant table
-                    if (hlslShader.psConstantTable) {
-                        // Material constants
-                        if (hlslShader.hMaterialDiffuse)
-                            hlslShader.psConstantTable->SetVector(device, hlslShader.hMaterialDiffuse, (D3DXVECTOR4*)&firstCall.frs.material.diffuse);
-                        if (hlslShader.hMaterialAmbient)
-                            hlslShader.psConstantTable->SetVector(device, hlslShader.hMaterialAmbient, (D3DXVECTOR4*)&firstCall.frs.material.ambient);
-                        if (hlslShader.hMaterialEmissive)
-                            hlslShader.psConstantTable->SetVector(device, hlslShader.hMaterialEmissive, (D3DXVECTOR4*)&firstCall.frs.material.emissive);
-
-                        // Compute lighting from lightrs - transform to view space
-                        // Use the same transform logic as main loop for consistency
-                        RGBVECTOR instSunDiffuse(0, 0, 0), instAmbient = firstCall.lightrs->globalAmbient;
-                        D3DXVECTOR3 instSunDir(0, 0, 1);
-
-                        // Point light buffers
-                        const size_t MaxLights = 8;
-                        D3DXVECTOR4 instLightDiffuse[MaxLights] = {};
-                        D3DXVECTOR3 instLightPos[MaxLights] = {};
-                        float instLightAmbient[MaxLights] = {};
-                        float instLightFalloffQ[MaxLights] = {};
-                        float instFalloffConst = 0.33f;
-                        size_t instPointLightCount = 0;
-                        bool needPointLights = (sk.lightMode == 1 || sk.lightMode == 2);
-
-                        // Get view matrix for transforms - use recorded viewTransform from first call
-                        const D3DXMATRIX& viewForLights = firstCall.rs.viewTransform;
-
-                        for (DWORD lightId : firstCall.lightrs->active) {
-                            auto lightIt = firstCall.lightrs->lights.find(lightId);
-                            if (lightIt != firstCall.lightrs->lights.end()) {
-                                // Non-const access to allow transform caching
-                                auto& light = const_cast<LightState::Light&>(lightIt->second);
-
-                                // Transform to view space if not already done (same as main loop)
-                                if (firstCall.lightrs->lightsTransformed.find(lightId) == firstCall.lightrs->lightsTransformed.end()) {
-                                    if (light.type == D3DLIGHT_DIRECTIONAL) {
-                                        D3DXVec3TransformNormal((D3DXVECTOR3*)&light.viewspacePos, (D3DXVECTOR3*)&light.position, &viewForLights);
-                                    } else {
-                                        D3DXVec3TransformCoord((D3DXVECTOR3*)&light.viewspacePos, (D3DXVECTOR3*)&light.position, &viewForLights);
-                                    }
-                                    const_cast<LightState*>(firstCall.lightrs.get())->lightsTransformed[lightId] = true;
-                                }
-
-                                if (light.type == D3DLIGHT_DIRECTIONAL) {
-                                    instSunDiffuse = light.diffuse;
-                                    instSunDir = *(D3DXVECTOR3*)&light.viewspacePos;
-                                    instAmbient.r += light.ambient.x;
-                                    instAmbient.g += light.ambient.y;
-                                    instAmbient.b += light.ambient.z;
-                                } else if (light.type == D3DLIGHT_POINT && needPointLights && instPointLightCount < MaxLights) {
-                                    // Copy diffuse first (same as main loop)
-                                    memcpy(&instLightDiffuse[instPointLightCount], &light.diffuse, sizeof(light.diffuse));
-                                    instLightPos[instPointLightCount] = *(D3DXVECTOR3*)&light.viewspacePos;
-
-                                    // Falloff handling (matching main loop logic)
-                                    if (light.falloff.x > 0) {
-                                        instFalloffConst = light.falloff.x;
-                                        instLightFalloffQ[instPointLightCount] = light.falloff.z;
-                                    } else if (light.falloff.z > 0) {
-                                        instLightDiffuse[instPointLightCount].x *= instFalloffConst;
-                                        instLightDiffuse[instPointLightCount].y *= instFalloffConst;
-                                        instLightDiffuse[instPointLightCount].z *= instFalloffConst;
-                                        instLightAmbient[instPointLightCount] = 1.0f + 1e-4f / sqrtf(light.falloff.z);
-                                        instLightFalloffQ[instPointLightCount] = instFalloffConst * light.falloff.z;
-                                    } else if (light.falloff.y == 0.10000001f) {
-                                        instLightFalloffQ[instPointLightCount] = 5e-5f;
-                                    } else if (light.falloff.y > 0) {
-                                        float brightness = 0.25f + 1e-4f / light.falloff.y;
-                                        instLightDiffuse[instPointLightCount] = D3DXVECTOR4(brightness, brightness, brightness, 1.0f);
-                                        instLightAmbient[instPointLightCount] = 1.0f;
-                                        instLightFalloffQ[instPointLightCount] = 0.5555f * light.falloff.y * light.falloff.y;
-                                        instLightPos[instPointLightCount].z += 25.0f;
-                                    }
-                                    instPointLightCount++;
-                                }
-                            }
-                        }
-                        instSunDiffuse *= sunMultiplier;
-                        instAmbient *= ambMultiplier;
-
-                        // Set sun/ambient constants
-                        if (hlslShader.hLightSunDirection)
-                            hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightSunDirection, (const float*)&instSunDir, 3);
-                        if (hlslShader.hLightSunDiffuse)
-                            hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightSunDiffuse, (const float*)&instSunDiffuse, 3);
-                        if (hlslShader.hLightSceneAmbient)
-                            hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightSceneAmbient, (const float*)&instAmbient, 3);
-
-                        // Set point light constants (if lightMode 1 or 2)
-                        if (needPointLights) {
-                            if (hlslShader.hLightDiffuse)
-                                hlslShader.psConstantTable->SetVectorArray(device, hlslShader.hLightDiffuse, instLightDiffuse, MaxLights);
-                            if (hlslShader.hLightPosition)
-                                hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightPosition, (float*)instLightPos, 3 * MaxLights);
-                            if (hlslShader.hLightAmbient)
-                                hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightAmbient, instLightAmbient, MaxLights);
-                            if (hlslShader.hLightFalloffQuadratic)
-                                hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightFalloffQuadratic, instLightFalloffQ, MaxLights);
-                            if (hlslShader.hPointLightCount)
-                                hlslShader.psConstantTable->SetInt(device, hlslShader.hPointLightCount, (int)instPointLightCount);
-                        }
-
-                        // Fog color from staging
-                        D3DXHANDLE hFogColNear = hlslShader.psConstantTable->GetConstantByName(NULL, "fogColNear");
-                        if (hFogColNear) {
-                            float fogColor[4] = { DistantLand::s_staging.nearFogCol.r, DistantLand::s_staging.nearFogCol.g, DistantLand::s_staging.nearFogCol.b, 1.0f };
-                            hlslShader.psConstantTable->SetVector(device, hFogColNear, (D3DXVECTOR4*)fogColor);
-                        }
-
-                        // Shading mode (vertexMaterial in .z component)
-                        D3DXHANDLE hShadingMode = hlslShader.psConstantTable->GetConstantByName(NULL, "shadingMode");
-                        if (hShadingMode) {
-                            float shadingModeData[4] = {0, 0, (float)sk.vertexMaterial, 0};
-                            hlslShader.psConstantTable->SetFloatArray(device, hShadingMode, shadingModeData, 4);
-                        }
-
-                        // Material alpha and vertex color flag
-                        D3DXHANDLE hHasVCol = hlslShader.psConstantTable->GetConstantByName(NULL, "hasVCol");
-                        if (hHasVCol) hlslShader.psConstantTable->SetBool(device, hHasVCol, (firstCall.rs.fvf & D3DFVF_DIFFUSE) != 0);
-                        D3DXHANDLE hMaterialAlpha = hlslShader.psConstantTable->GetConstantByName(NULL, "materialAlpha");
-                        if (hMaterialAlpha) hlslShader.psConstantTable->SetFloat(device, hMaterialAlpha, firstCall.frs.material.diffuse.a);
-                        D3DXHANDLE hAlphaRef = hlslShader.psConstantTable->GetConstantByName(NULL, "alphaRef");
-                        if (hAlphaRef) hlslShader.psConstantTable->SetFloat(device, hAlphaRef, firstCall.rs.alphaRef / 255.0f);
-                    }
-
-                    // Set material state from first call
-                    device->SetTexture(0, firstCall.rs.texture);
-                    if (firstCall.expectedState.captured) {
-                        device->SetRenderState(D3DRS_ALPHABLENDENABLE, firstCall.expectedState.alphaBlendEnable);
-                        device->SetRenderState(D3DRS_ALPHATESTENABLE, firstCall.expectedState.alphaTestEnable);
-                        device->SetRenderState(D3DRS_ZENABLE, firstCall.expectedState.zEnable);
-                        device->SetRenderState(D3DRS_ZWRITEENABLE, firstCall.expectedState.zWriteEnable);
-                        device->SetRenderState(D3DRS_CULLMODE, firstCall.expectedState.cullMode);
-                    }
-
-                    // Set up instanced rendering
-                    device->SetVertexDeclaration(instDecl);
-                    device->SetStreamSource(0, firstCall.rs.vb, firstCall.rs.vbOffset, firstCall.rs.vbStride);
-                    device->SetStreamSourceFreq(0, D3DSTREAMSOURCE_INDEXEDDATA | instanceCount);
-                    device->SetStreamSource(1, vbFFEInstances, batch.instanceBufferOffset, FFEInstStride);
-                    device->SetStreamSourceFreq(1, D3DSTREAMSOURCE_INSTANCEDATA | 1);
-                    device->SetIndices(firstCall.rs.ib);
-
-                    // Draw instanced
-                    device->DrawIndexedPrimitive(
-                        D3DPT_TRIANGLELIST,
-                        firstCall.rs.baseIndex,
-                        firstCall.rs.minIndex,
-                        firstCall.rs.vertCount,
-                        firstCall.rs.startIndex,
-                        firstCall.rs.primCount
-                    );
-
-                    instancedDrawCalls++;
-                    instancedBatches++;
-                }
-
-                // Reset stream frequencies
-                device->SetStreamSourceFreq(0, 1);
-                device->SetStreamSourceFreq(1, 1);
-                device->SetStreamSource(1, nullptr, 0, 0);
-
-                LOG::logline("Instanced: %d batches, %d instances, %d individual draws skipped",
-                             instancedBatches, (int)batchedCallIndices.size(), (int)batchedCallIndices.size());
-            }
-        }
-    }
-
-    // Issue stateless batch draws (Scene 0 only) - alternative to instancing with per-draw data in texture
-    std::unordered_set<size_t> statelessBatchedIndices;
-    int statelessDrawCalls = 0;
-    int statelessBatchCount = 0;
-
-    if (sceneCount == 0 && ImGuiManager::GetEnableStatelessBatch() && !fb.statelessBatches.empty() && !fb.drawDataStaging.empty()) {
-        MGE_ZoneScopedN("replay_StatelessBatchDraws");
+    // Merged batch texture setup block - creates and fills draw data texture
+    if (sceneCount == 0 && ImGuiManager::GetEnableStatelessBatch() &&
+        !fb.mergedBatches.empty() && !fb.drawDataStaging.empty()) {
+        MGE_ZoneScopedN("replay_BatchedDraws");
 
         // Reset suffix texture binding cache - ensures fresh binds for batched draws
         TextureSuffix::getBindingState().reset();
@@ -2310,26 +2039,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
             UINT stagingIdx = 0;
             static bool loggedLightFill = false;
             int logCount = 0;
-            for (const auto& batch : fb.statelessBatches) {
-                for (size_t callIdx : batch.callIndices) {
-                    if (stagingIdx < fb.drawDataStaging.size() && callIdx < perObjectLightInfo.size()) {
-                        const auto& li = perObjectLightInfo[callIdx];
-                        fb.drawDataStaging[stagingIdx].lightParams[0] = (float)li.lightCount;
-                        fb.drawDataStaging[stagingIdx].lightParams[1] = perObjectTexelSize;
-                        fb.drawDataStaging[stagingIdx].lightParams[2] = (float)li.texelOffset;
-                        fb.drawDataStaging[stagingIdx].lightParams[3] = 0.0f;
 
-                        if (!loggedLightFill && logCount < 5 && li.lightCount > 0) {
-                            LOG::logline("StatelessBatch lightFill: stagingIdx=%d, callIdx=%d, lightCount=%d, texelOffset=%d, texelSize=%.6f",
-                                stagingIdx, (int)callIdx, li.lightCount, li.texelOffset, perObjectTexelSize);
-                            logCount++;
-                        }
-                    }
-                    stagingIdx++;
-                }
-            }
-
-            // Also fill light params for merged batches (they follow stateless batches in staging buffer)
+            // Fill light params for merged batches
             for (const auto& mb : fb.mergedBatches) {
                 for (size_t callIdx : mb.callIndices) {
                     if (stagingIdx < fb.drawDataStaging.size() && callIdx < perObjectLightInfo.size()) {
@@ -2338,6 +2049,12 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                         fb.drawDataStaging[stagingIdx].lightParams[1] = perObjectTexelSize;
                         fb.drawDataStaging[stagingIdx].lightParams[2] = (float)li.texelOffset;
                         fb.drawDataStaging[stagingIdx].lightParams[3] = 0.0f;
+
+                        if (!loggedLightFill && logCount < 5 && li.lightCount > 0) {
+                            LOG::logline("MergedBatch lightFill: stagingIdx=%d, callIdx=%d, lightCount=%d, texelOffset=%d, texelSize=%.6f",
+                                stagingIdx, (int)callIdx, li.lightCount, li.texelOffset, perObjectTexelSize);
+                            logCount++;
+                        }
                     }
                     stagingIdx++;
                 }
@@ -2367,273 +2084,23 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                 device->SetSamplerState(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
                 device->SetSamplerState(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
                 device->SetSamplerState(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
-                // Bind to PS slots 6 and 7 - some drivers need PS binding for VTF to work
+                // Bind to PS slot 6 only (shader samples from s6)
                 device->SetTexture(6, fb.texDrawData);
-                device->SetTexture(7, fb.texDrawData);
-                // Set PS sampler states to POINT to prevent filtering across draw data texels
-                for (int slot = 6; slot <= 7; ++slot) {
-                    device->SetSamplerState(slot, D3DSAMP_MINFILTER, D3DTEXF_POINT);
-                    device->SetSamplerState(slot, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
-                    device->SetSamplerState(slot, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
-                }
+                device->SetSamplerState(6, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+                device->SetSamplerState(6, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+                device->SetSamplerState(6, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
 
                 // Ensure light texture (slot 5) is bound for texture-based point lighting
                 IDirect3DTexture9* lightTex = g_renderThread ? g_renderThread->getPerObjectLightTexture() : nullptr;
                 if (lightTex) {
                     device->SetTexture(5, lightTex);
                 }
-
-                // Issue batched draws
-                for (const auto& batch : fb.statelessBatches) {
-                    const auto& firstCall = recCalls[batch.callIndices[0]];
-
-                    // Check suppress flags based on bin (same logic as main loop)
-                    bool suppressed = false;
-                    switch (firstCall.bin) {
-                        case RenderBin::Terrain:    suppressed = ImGuiManager::GetSuppressTerrain(); break;
-                        case RenderBin::Opaque:     suppressed = ImGuiManager::GetSuppressOpaque(); break;
-                        case RenderBin::Skinning:   suppressed = ImGuiManager::GetSuppressSkinning(); break;
-                        case RenderBin::Grass:      suppressed = ImGuiManager::GetSuppressGrass(); break;
-                        case RenderBin::AlphaTested:suppressed = ImGuiManager::GetSuppressAlphaTested(); break;
-                        case RenderBin::Blending:   suppressed = ImGuiManager::GetSuppressBlending(); break;
-                        default: break;
-                    }
-                    if (suppressed) continue;
-
-                    UINT instanceCount = (UINT)batch.callIndices.size();
-
-                    // Get stateless batch vertex declaration for this FVF
-                    IDirect3DVertexDeclaration9* statelessDecl = getStatelessBatchDecl(firstCall.rs.fvf);
-                    if (!statelessDecl) continue;
-
-                    // Build normalized ShaderKey for stateless batching
-                    // All material variation (vertexMaterial, suffix textures) handled via texture data + shader branching
-                    ShaderKey sk = firstCall.sk;
-                    sk.useStatelessBatch = 1;
-                    // Enable shadows for stateless batches (use view-to-shadow transform instead of world-to-shadow)
-                    sk.hasShadows = ((Configuration.MGEFlags & USE_SHADOWS) && (Configuration.MGEFlags & USE_DISTANT_LAND)) ? 1 : 0;
-                    // Force lightMode 3 (texture-based) for stateless batching so per-instance lighting works
-                    if (sk.useLighting && sk.lightMode < 3) {
-                        sk.lightMode = 3;
-                    }
-                    // Keep suffix texture flags from first call - don't force them on
-                    // Forcing hasParamH=1 causes parallax to run on objects without height maps
-                    // Batches will split on suffix availability, which is correct behavior
-                    // Note: vertexMaterial is read from texture flags[0] and shader branches on it
-
-                    // Look up shader variant
-                    HLSLShader hlslShader = {};
-                    AcquireSRWLockShared(&hlslCacheLock);
-                    auto iShader = cacheHLSLShaders.find(sk);
-                    if (iShader != cacheHLSLShaders.end()) {
-                        hlslShader = iShader->second;
-                    }
-                    ReleaseSRWLockShared(&hlslCacheLock);
-
-                    // If shader not found, queue compilation and skip this batch
-                    if (!hlslShader.vertexShader || !hlslShader.pixelShader) {
-                        queueShaderCompilation(sk);
-                        continue;
-                    }
-
-                    // Set shaders
-                    device->SetVertexShader(hlslShader.vertexShader);
-                    device->SetPixelShader(hlslShader.pixelShader);
-
-                    // Set view/proj matrices
-                    D3DXMATRIX viewT, projT;
-                    D3DXMatrixTranspose(&viewT, &fb.currentView);
-                    D3DXMatrixTranspose(&projT, &fb.currentProj);
-                    device->SetVertexShaderConstantF(12, (float*)&viewT, 4);  // view at c12
-                    device->SetVertexShaderConstantF(0, (float*)&projT, 4);   // proj at c0
-
-                    // Set view-to-shadow matrices for stateless batches (viewpos -> shadow space)
-                    if (sk.hasShadows) {
-                        const auto* svp = s_activeShadowVP ? s_activeShadowVP : DistantLand::s_staging.smViewproj;
-                        D3DXMATRIX viewInverse;
-                        D3DXMatrixInverse(&viewInverse, nullptr, &fb.currentView);
-                        D3DXMATRIX viewToShadow[2];
-                        viewToShadow[0] = viewInverse * svp[0];
-                        viewToShadow[1] = viewInverse * svp[1];
-                        D3DXMATRIX viewToShadowT[2];
-                        D3DXMatrixTranspose(&viewToShadowT[0], &viewToShadow[0]);
-                        D3DXMatrixTranspose(&viewToShadowT[1], &viewToShadow[1]);
-                        device->SetVertexShaderConstantF(60, (float*)&viewToShadowT[0], 4);  // c60-c63
-                        device->SetVertexShaderConstantF(64, (float*)&viewToShadowT[1], 4);  // c64-c67
-
-                        // Set shadow resolution parameter (PS)
-                        float shadowRcpData[4] = { 1.0f / Configuration.DL.ShadowResolution, 0, 0, 0 };
-                        device->SetPixelShaderConstantF(17, shadowRcpData, 1);
-                    }
-
-                    // Set draw data texture params: {1/width, 1/height, 0, 0}
-                    float drawDataParams[4] = { 1.0f / DRAW_DATA_WIDTH, 1.0f / fb.texDrawDataHeight, 0.0f, 0.0f };
-                    device->SetVertexShaderConstantF(70, drawDataParams, 1);
-                    device->SetPixelShaderConstantF(20, drawDataParams, 1);
-
-                    // Set vertexBlendState = 0 (rigid geometry)
-                    float blendState[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-                    device->SetVertexShaderConstantF(48, blendState, 1);
-
-                    // Set lighting constants from first call (shared across batch)
-                    static bool loggedOnce = false;
-                    if (!loggedOnce) {
-                        LOG::logline("StatelessBatch shader: psConstantTable=%p, hLightSunDir=%p, hLightSunDiff=%p, hLightAmbient=%p, useLighting=%d, lightMode=%d",
-                            hlslShader.psConstantTable, hlslShader.hLightSunDirection, hlslShader.hLightSunDiffuse, hlslShader.hLightSceneAmbient,
-                            sk.useLighting, sk.lightMode);
-                        loggedOnce = true;
-                    }
-                    if (hlslShader.psConstantTable) {
-                        RGBVECTOR sunDiffuse(0, 0, 0), ambient = firstCall.lightrs->globalAmbient;
-                        D3DXVECTOR3 sunDir(0, 0, 1);
-                        const D3DXMATRIX& viewForLights = firstCall.rs.viewTransform;
-
-                        for (DWORD lightId : firstCall.lightrs->active) {
-                            auto lightIt = firstCall.lightrs->lights.find(lightId);
-                            if (lightIt != firstCall.lightrs->lights.end()) {
-                                auto& light = const_cast<LightState::Light&>(lightIt->second);
-                                if (firstCall.lightrs->lightsTransformed.find(lightId) == firstCall.lightrs->lightsTransformed.end()) {
-                                    if (light.type == D3DLIGHT_DIRECTIONAL) {
-                                        D3DXVec3TransformNormal((D3DXVECTOR3*)&light.viewspacePos, (D3DXVECTOR3*)&light.position, &viewForLights);
-                                    } else {
-                                        D3DXVec3TransformCoord((D3DXVECTOR3*)&light.viewspacePos, (D3DXVECTOR3*)&light.position, &viewForLights);
-                                    }
-                                    const_cast<LightState*>(firstCall.lightrs.get())->lightsTransformed[lightId] = true;
-                                }
-                                if (light.type == D3DLIGHT_DIRECTIONAL) {
-                                    sunDiffuse = light.diffuse;
-                                    sunDir = *(D3DXVECTOR3*)&light.viewspacePos;
-                                    ambient.r += light.ambient.x;
-                                    ambient.g += light.ambient.y;
-                                    ambient.b += light.ambient.z;
-                                }
-                            }
-                        }
-                        sunDiffuse *= sunMultiplier;
-                        ambient *= ambMultiplier;
-
-                        static bool loggedValues = false;
-                        if (!loggedValues) {
-                            LOG::logline("StatelessBatch lighting: sunDir=(%.2f,%.2f,%.2f), sunDiff=(%.2f,%.2f,%.2f), ambient=(%.2f,%.2f,%.2f), activeLights=%d",
-                                sunDir.x, sunDir.y, sunDir.z, sunDiffuse.r, sunDiffuse.g, sunDiffuse.b, ambient.r, ambient.g, ambient.b,
-                                (int)firstCall.lightrs->active.size());
-                            loggedValues = true;
-                        }
-
-                        if (hlslShader.hLightSunDirection)
-                            hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightSunDirection, (const float*)&sunDir, 3);
-                        if (hlslShader.hLightSunDiffuse)
-                            hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightSunDiffuse, (const float*)&sunDiffuse, 3);
-                        if (hlslShader.hLightSceneAmbient)
-                            hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightSceneAmbient, (const float*)&ambient, 3);
-                    }
-
-                    // Bind all textures (base + suffix textures) using the smart binding function
-                    bindShaderTextures(sk, &firstCall.rs);
-
-                    // Set normres for paramH textures (texture resolution for height mapping)
-                    if (sk.hasParamH && hlslShader.psConstantTable) {
-                        IDirect3DBaseTexture9* paramHTexture = nullptr;
-                        device->GetTexture(2, &paramHTexture);
-                        if (paramHTexture && paramHTexture->GetType() == D3DRTYPE_TEXTURE) {
-                            IDirect3DTexture9* tex = static_cast<IDirect3DTexture9*>(paramHTexture);
-                            D3DXVECTOR2 normres;
-                            auto cacheIt = textureResolutionCache.find(tex);
-                            if (cacheIt != textureResolutionCache.end()) {
-                                normres = cacheIt->second;
-                            } else {
-                                D3DSURFACE_DESC desc;
-                                if (SUCCEEDED(tex->GetLevelDesc(0, &desc))) {
-                                    normres = D3DXVECTOR2((float)desc.Width, (float)desc.Height);
-                                    textureResolutionCache[tex] = normres;
-                                } else {
-                                    normres = D3DXVECTOR2(1.0f, 1.0f);
-                                }
-                            }
-                            D3DXHANDLE hNormres = hlslShader.psConstantTable->GetConstantByName(NULL, "normres");
-                            if (hNormres) hlslShader.psConstantTable->SetFloatArray(device, hNormres, (float*)&normres, 2);
-                            paramHTexture->Release();
-                        }
-                    }
-
-                    // Set render state from batch key
-                    device->SetRenderState(D3DRS_ALPHABLENDENABLE, batch.key.blendState & 0x1);
-                    device->SetRenderState(D3DRS_SRCBLEND, (batch.key.blendState >> 4) & 0xF);
-                    device->SetRenderState(D3DRS_DESTBLEND, (batch.key.blendState >> 8) & 0xF);
-                    device->SetRenderState(D3DRS_ZENABLE, batch.key.zState & 0x3);
-                    device->SetRenderState(D3DRS_ZWRITEENABLE, (batch.key.zState >> 2) & 0x1);
-                    device->SetRenderState(D3DRS_CULLMODE, batch.key.cullMode);
-
-                    // Fill instance buffer with draw indices
-                    // Reuse the FFE instance buffer, but we only need 1 float per instance
-                    float* instIndices = nullptr;
-                    if (vbFFEInstances && instanceCount <= MaxFFEInstances) {
-                        HRESULT hr = vbFFEInstances->Lock(0, instanceCount * sizeof(float), (void**)&instIndices, D3DLOCK_DISCARD);
-                        if (SUCCEEDED(hr) && instIndices) {
-                            UINT drawOffset = batch.drawDataOffset;
-                            for (UINT inst = 0; inst < instanceCount; inst++) {
-                                instIndices[inst] = (float)(drawOffset + inst);
-                            }
-                            vbFFEInstances->Unlock();
-
-                            // Debug: check what's bound to slot 2 right before draw
-                            static int drawDebugCount = 0;
-                            if (drawDebugCount < 5 && sk.hasParamH) {
-                                IDirect3DBaseTexture9* boundTex2 = nullptr;
-                                device->GetTexture(2, &boundTex2);
-                                LOG::logline("StatelessBatch preDraw: slot2=%p, sk.hasParamH=%d", boundTex2, (int)sk.hasParamH);
-                                if (boundTex2) boundTex2->Release();
-                                drawDebugCount++;
-                            }
-
-                            // Set up instanced rendering with minimal instance data (just drawIndex)
-                            device->SetVertexDeclaration(statelessDecl);
-                            device->SetStreamSource(0, firstCall.rs.vb, firstCall.rs.vbOffset, firstCall.rs.vbStride);
-                            device->SetStreamSourceFreq(0, D3DSTREAMSOURCE_INDEXEDDATA | instanceCount);
-                            device->SetStreamSource(1, vbFFEInstances, 0, sizeof(float));
-                            device->SetStreamSourceFreq(1, D3DSTREAMSOURCE_INSTANCEDATA | 1);
-                            device->SetIndices(firstCall.rs.ib);
-
-                            // Draw instanced
-                            device->DrawIndexedPrimitive(
-                                D3DPT_TRIANGLELIST,
-                                firstCall.rs.baseIndex,
-                                firstCall.rs.minIndex,
-                                firstCall.rs.vertCount,
-                                firstCall.rs.startIndex,
-                                firstCall.rs.primCount
-                            );
-
-                            // Mark these calls as batched
-                            for (size_t idx : batch.callIndices) {
-                                statelessBatchedIndices.insert(idx);
-                            }
-
-                            statelessDrawCalls++;
-                            statelessBatchCount++;
-                        }
-                    }
-                }
-
-                // Reset stream frequencies and textures
-                device->SetStreamSourceFreq(0, 1);
-                device->SetStreamSourceFreq(1, 1);
-                device->SetStreamSource(1, nullptr, 0, 0);
-                device->SetTexture(D3DVERTEXTEXTURESAMPLER0, nullptr);
-                device->SetTexture(6, nullptr);
-
-                if (statelessBatchCount > 0) {
-                    LOG::logline("StatelessBatch: %d batches, %d instances, %d individual draws skipped",
-                                 statelessBatchCount, (int)statelessBatchedIndices.size(), (int)statelessBatchedIndices.size());
-                }
+                // Texture setup complete - merged batch draws happen below
             }
         }
     }
 
-    // Issue merged batch draws (Scene 0 only) - collapses singletons into mega-draws by texture
-    std::unordered_set<size_t> mergedBatchIndices;
-    int mergedDrawCalls = 0;
-
+    // Issue merged batch draws (Scene 0 only) - collapses different geometries sharing same texture into mega-draws
     if (sceneCount == 0 && ImGuiManager::GetEnableStatelessBatch() && !fb.mergedBatches.empty()) {
         MGE_ZoneScopedN("replay_MergedBatchDraws");
 
@@ -2701,6 +2168,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                 std::vector<MergedDrawInfo> drawInfos;
                 drawInfos.reserve(fb.mergedBatches.size());
 
+                static bool loggedMergedDebug = false;
                 for (const auto& mb : fb.mergedBatches) {
                     if (mb.callIndices.empty()) continue;
 
@@ -2708,6 +2176,12 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     const auto& firstCall = recCalls[mb.callIndices[0]];
                     UINT batchStride = firstCall.rs.vbStride;
                     UINT batchExpandedStride = batchStride + sizeof(float);
+
+                    // Debug: log merged batch info once
+                    if (!loggedMergedDebug) {
+                        LOG::logline("MergedBatch DEBUG: calls=%d, batchStride=%d, expandedStride=%d, FVF=0x%X, drawDataOffset=%d",
+                            (int)mb.callIndices.size(), batchStride, batchExpandedStride, mb.key.fvf, mb.drawDataOffset);
+                    }
 
                     MergedDrawInfo info;
                     info.vbByteOffset = vbByteOffset;
@@ -2723,20 +2197,35 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                         const auto& call = recCalls[callIdx];
                         UINT drawIndex = mb.drawDataOffset + (UINT)i;  // Index into draw data texture
 
+                        // Use this call's actual stride for source data (should match batchStride)
+                        UINT srcStride = call.rs.vbStride;
+
+                        // Debug: log first few calls
+                        if (!loggedMergedDebug && i < 3) {
+                            LOG::logline("  Call %d: drawIndex=%d, srcStride=%d, vertCount=%d",
+                                (int)i, drawIndex, srcStride, call.rs.vertCount);
+                        }
+
                         // Copy vertices with drawIndex appended
                         void* srcVerts = nullptr;
                         if (call.rs.vb && SUCCEEDED(call.rs.vb->Lock(call.rs.vbOffset,
-                                                    call.rs.vertCount * call.rs.vbStride,
+                                                    call.rs.vertCount * srcStride,
                                                     &srcVerts, D3DLOCK_READONLY))) {
                             const BYTE* src = static_cast<const BYTE*>(srcVerts);
                             for (UINT v = 0; v < call.rs.vertCount; v++) {
-                                // Copy original vertex data
-                                memcpy(vbDst, src, batchStride);
-                                // Append drawIndex as float
+                                // Copy original vertex data (use min of source and batch stride for safety)
+                                UINT copySize = std::min(srcStride, batchStride);
+                                memcpy(vbDst, src, copySize);
+                                // Append drawIndex as float at batch stride offset
                                 float* drawIdxPtr = reinterpret_cast<float*>(vbDst + batchStride);
                                 *drawIdxPtr = (float)drawIndex;
+                                // Debug: log first vertex of first call
+                                if (!loggedMergedDebug && v == 0 && i == 0) {
+                                    LOG::logline("  DrawIndex write: drawIndex=%d at offset %d, expandedStride=%d, wrote %.1f",
+                                        drawIndex, batchStride, batchExpandedStride, *drawIdxPtr);
+                                }
                                 vbDst += batchExpandedStride;
-                                src += batchStride;
+                                src += srcStride;
                             }
                             call.rs.vb->Unlock();
                         }
@@ -2767,6 +2256,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     }
 
                     drawInfos.push_back(info);
+                    loggedMergedDebug = true;  // Only log first batch
                 }
 
                 fb.mergedVB->Unlock();
@@ -2780,13 +2270,15 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                                  (int)fb.mergedBatches.size(), totalMergedVerts, totalMergedIndices);
                 }
 
-                // Cache for merged vertex declarations (FVF -> decl with appended drawIndex)
-                static std::unordered_map<DWORD, IDirect3DVertexDeclaration9*> mergedDeclCache;
+                // Cache for merged vertex declarations (FVF+stride -> decl with appended drawIndex)
+                // Key combines FVF (low 32 bits) with stride (high 32 bits) to handle edge cases
+                static std::unordered_map<uint64_t, IDirect3DVertexDeclaration9*> mergedDeclCache;
 
                 // Helper to get/create merged vertex declaration
                 // Must match FVF layout exactly, including variable-size texture coordinates
                 auto getMergedDecl = [&](DWORD fvf, UINT originalStride) -> IDirect3DVertexDeclaration9* {
-                    auto it = mergedDeclCache.find(fvf);
+                    uint64_t cacheKey = ((uint64_t)originalStride << 32) | fvf;
+                    auto it = mergedDeclCache.find(cacheKey);
                     if (it != mergedDeclCache.end()) return it->second;
 
                     // Build declaration from FVF + drawIndex at end
@@ -2847,14 +2339,14 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     }
 
                     // DrawIndex at the end (at originalStride offset)
-                    elements.push_back({0, (WORD)originalStride, D3DDECLTYPE_FLOAT1, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 8});
+                    elements.push_back({0, (WORD)originalStride, D3DDECLTYPE_FLOAT1, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 7});
 
                     // End marker
                     elements.push_back(D3DDECL_END());
 
                     IDirect3DVertexDeclaration9* decl = nullptr;
                     if (SUCCEEDED(device->CreateVertexDeclaration(elements.data(), &decl))) {
-                        mergedDeclCache[fvf] = decl;
+                        mergedDeclCache[cacheKey] = decl;
                         LOG::logline("MergedBatch: Created vertex decl for FVF 0x%X, stride %d->%d",
                                      fvf, originalStride, originalStride + 4);
                     }
@@ -2895,6 +2387,12 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     ShaderKey sk = firstCall.sk;
                     sk.useStatelessBatch = true;
                     sk.useInstancing = false;
+                    // Force LightMode 3 for all batches - required for texture-based lighting
+                    // Batches use per-draw light params from draw data texture, which requires
+                    // USE_TEXTURE_LIGHTS to be defined (only true when lightMode == 3)
+                    if (sk.useLighting && sk.lightMode < 3) {
+                        sk.lightMode = 3;
+                    }
 
                     // Look up shader variant
                     HLSLShader hlslShader = {};
@@ -2925,7 +2423,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     // Set draw data texture params: {1/width, 1/height, 0, 0}
                     // DRAW_DATA_WIDTH = 8 (8 texels per draw)
                     float drawDataParams[4] = { 1.0f / 8.0f, 1.0f / fb.texDrawDataHeight, 0.0f, 0.0f };
-                    device->SetVertexShaderConstantF(70, drawDataParams, 1);  // drawDataParams at c70
+                    device->SetVertexShaderConstantF(70, drawDataParams, 1);  // VS: c70
+                    device->SetPixelShaderConstantF(20, drawDataParams, 1);   // PS: c20
 
                     // Bind draw data texture with explicit VTF sampler states
                     device->SetTexture(D3DVERTEXTEXTURESAMPLER0, fb.texDrawData);
@@ -2934,18 +2433,21 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     device->SetSamplerState(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
                     device->SetSamplerState(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
                     device->SetSamplerState(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
-                    // Bind to PS slots 6 and 7 for driver compatibility
+                    // Bind to PS slot 6 only (shader samples from s6)
                     device->SetTexture(6, fb.texDrawData);
-                    device->SetTexture(7, fb.texDrawData);
-                    // Set PS sampler states to POINT to prevent filtering across draw data texels
-                    for (int slot = 6; slot <= 7; ++slot) {
-                        device->SetSamplerState(slot, D3DSAMP_MINFILTER, D3DTEXF_POINT);
-                        device->SetSamplerState(slot, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
-                        device->SetSamplerState(slot, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
-                    }
+                    device->SetSamplerState(6, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+                    device->SetSamplerState(6, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+                    device->SetSamplerState(6, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
 
                     // Bind textures using smart binding function
                     bindShaderTextures(sk, &firstCall.rs);
+
+                    // Ensure light texture (slot 5) is bound after bindShaderTextures
+                    // to prevent it from being overwritten
+                    IDirect3DTexture9* lightTex = g_renderThread ? g_renderThread->getPerObjectLightTexture() : DistantLand::texLightData;
+                    if (lightTex) {
+                        device->SetTexture(5, lightTex);
+                    }
 
                     // Set render state
                     device->SetRenderState(D3DRS_ALPHABLENDENABLE, mb.key.blendState & 0x1);
@@ -2976,30 +2478,23 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
 
                     mergedDrawCalls++;
                 }
-
-                // Clean up VTF and PS texture bindings to prevent state leakage
-                device->SetTexture(D3DVERTEXTEXTURESAMPLER0, nullptr);
-                device->SetTexture(6, nullptr);
-                device->SetTexture(7, nullptr);
+                // NOTE: Texture cleanup moved to consolidated section after both batch types
             } else {
                 if (vbData) fb.mergedVB->Unlock();
             }
         }
     }
 
-    // Also clean up after stateless batches to prevent state leakage into main loop
-    if (sceneCount == 0 && !fb.statelessBatches.empty()) {
+    // Clean up draw data texture after merged batch draws
+    if (sceneCount == 0 && !fb.mergedBatches.empty()) {
         device->SetTexture(D3DVERTEXTEXTURESAMPLER0, nullptr);
         device->SetTexture(6, nullptr);
-        device->SetTexture(7, nullptr);
     }
 
     MGE_ZoneScopedN("replay_MainLoop");
     bool firstDrawDone = false;
     for (size_t i = 0; i < numCalls; i++) {
-        // Skip calls that were handled by instanced draws, stateless batches, or merged batches
-        if (batchedCallIndices.count(i)) continue;
-        if (statelessBatchedIndices.count(i)) continue;
+        // Skip calls that were handled by merged batches
         if (mergedBatchIndices.count(i)) continue;
         auto& call = recCalls[i];  // Non-const to update shader key
 
@@ -3064,27 +2559,6 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
             prevMaterial = curMaterial;
             hasPrevMaterial = true;
             drawCallCount++;
-
-            // Instancing metrics: track geometry+material combos for Opaque/Terrain only
-            // (Skinning excluded - different bone palettes, Grass excluded - not HLSL)
-            if (call.bin == RenderBin::Opaque || call.bin == RenderBin::Terrain) {
-                InstanceKey instKey;
-                // Geometry identity
-                instKey.vb = call.rs.vb;
-                instKey.ib = call.rs.ib;
-                instKey.fvf = call.rs.fvf;
-                instKey.baseIndex = call.rs.baseIndex;
-                instKey.vertCount = call.rs.vertCount;
-                instKey.startIndex = call.rs.startIndex;
-                instKey.primCount = call.rs.primCount;
-                // Material identity
-                instKey.texture = curMaterial.texture;
-                instKey.blendState = curMaterial.blendState;
-                instKey.alphaState = curMaterial.alphaState;
-                instKey.zState = curMaterial.zState;
-                instKey.cullMode = curMaterial.cullMode;
-                instanceKeyCounts[instKey]++;
-            }
         }
 
         {
@@ -3212,19 +2686,10 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
         g_replayMetrics.uniqueMaterialKeys = (int)seenMaterials.size();
         g_replayMetrics.materialTransitions = materialTransitions;
         g_replayMetrics.totalDrawCalls = drawCallCount;
-
-        // Compute instancing metrics
-        int potentialBatches = 0;
-        int totalBatchableDraws = 0;
-        for (const auto& kv : instanceKeyCounts) {
-            if (kv.second >= 2) {
-                potentialBatches++;
-                totalBatchableDraws += kv.second;
-            }
-        }
-        g_replayMetrics.uniqueInstanceKeys = (int)instanceKeyCounts.size();
-        g_replayMetrics.potentialBatches = potentialBatches;
-        g_replayMetrics.totalBatchableDraws = totalBatchableDraws;
+        // Instancing metrics removed - stateless batching doesn't use InstanceKey
+        g_replayMetrics.uniqueInstanceKeys = 0;
+        g_replayMetrics.potentialBatches = 0;
+        g_replayMetrics.totalBatchableDraws = 0;
     }
 
     // Slow frame detection: measure total replay time

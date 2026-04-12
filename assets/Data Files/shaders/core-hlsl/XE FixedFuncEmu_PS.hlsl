@@ -120,6 +120,12 @@ struct VS_OUTPUT {
 //------------------------------------------------------------
 // Pixel Shader Main
 float4 ps_main(VS_OUTPUT input) : COLOR{
+	// Local material variables - either sampled from draw data texture or copied from uniforms
+	float4 useDiffuse;
+	float4 useAmbient;
+	float4 useEmissive;
+	float4 useLightParams;
+
 #ifdef USE_STATELESS_BATCH
 	// Sample material and light params from draw data texture (overrides uniform values)
 	float drawV = (input.drawIndex + 0.5) * drawDataParams.y;
@@ -127,19 +133,23 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 
 	// Texels 3,4,5 are diffuse, ambient, emissive
 	// Use tex2Dlod with mip 0 to force point sampling and ignore PS derivatives
-	float4 matDiffuse = tex2Dlod(sampDrawData, float4(3.5 * texelW, drawV, 0, 0));
-	float4 matAmbient = tex2Dlod(sampDrawData, float4(4.5 * texelW, drawV, 0, 0));
-	float4 matEmissive = tex2Dlod(sampDrawData, float4(5.5 * texelW, drawV, 0, 0));
-	// Note: matEmissive.w contains alphaRef (not used in PS, handled by device state)
+	useDiffuse = tex2Dlod(sampDrawData, float4(3.5 * texelW, drawV, 0, 0));
+	useAmbient = tex2Dlod(sampDrawData, float4(4.5 * texelW, drawV, 0, 0));
+	useEmissive = tex2Dlod(sampDrawData, float4(5.5 * texelW, drawV, 0, 0));
+	// Note: useEmissive.w contains alphaRef (not used in PS, handled by device state)
 
 	// Texel 6 is light params: {lightCount, texelSize, texelOffset, 0}
-	float4 perDrawLightParams = tex2Dlod(sampDrawData, float4(6.5 * texelW, drawV, 0, 0));
-
-	// Override globals with texture-sampled values
-	#define materialDiffuse matDiffuse
-	#define materialAmbient matAmbient
-	#define materialEmissive matEmissive
-	#define lightDataParams perDrawLightParams
+	useLightParams = tex2Dlod(sampDrawData, float4(6.5 * texelW, drawV, 0, 0));
+#else
+	// Use uniform values for non-batched rendering
+	useDiffuse = materialDiffuse;
+	useAmbient = materialAmbient;
+	useEmissive = materialEmissive;
+	#ifdef USE_TEXTURE_LIGHTS
+	useLightParams = lightDataParams;
+	#else
+	useLightParams = float4(0, 0, 0, 0);  // Not used for non-texture light modes
+	#endif
 #endif
 
 	// Enhanced texture sampling with suffix support
@@ -380,7 +390,7 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 	#elif defined(LIGHT_MODE) && LIGHT_MODE == 3
 	// Mode 3: Texture-based point light system (>8 lights, rare)
 	{
-		PointLightResult pointLightResult = evaluatePointLightsPBR(lightDataParams, input.viewPos, Norm, V, texColor.rgb, metalness, roughness, radius, F0);
+		PointLightResult pointLightResult = evaluatePointLightsPBR(useLightParams, input.viewPos, Norm, V, texColor.rgb, metalness, roughness, radius, F0);
 		diffuseLight += pointLightResult.diffuse;
 
 		#if defined(HAS_PARAMH) || defined(HAS_NORMAL)
@@ -413,15 +423,15 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 		#else
 		float3 col = sqrt(input.color.rgb);
 		#endif
-		diffuse = float4(col * (diffuseLight + ambient) + materialEmissive.rgb * materialEmissive.rgb, input.color.a);
+		diffuse = float4(col * (diffuseLight + ambient) + useEmissive.rgb * useEmissive.rgb, input.color.a);
 	}
 	else if (materialMode == 3) {
 		// Mode 3: Use vertex color for emissive
-		diffuse = float4(materialDiffuse.rgb * (diffuseLight + ambient) + input.color.rgb * input.color.rgb, materialDiffuse.a);
+		diffuse = float4(useDiffuse.rgb * (diffuseLight + ambient) + input.color.rgb * input.color.rgb, useDiffuse.a);
 	}
 	else {
 		// Mode 1: Use material constants
-		diffuse = float4(materialDiffuse.rgb * (diffuseLight + ambient) + materialEmissive.rgb * materialEmissive.rgb, materialDiffuse.a);
+		diffuse = float4(useDiffuse.rgb * (diffuseLight + ambient) + useEmissive.rgb * useEmissive.rgb, useDiffuse.a);
 	}
 
 	// Apply correct PBR formula: (diffuse + ambient) * texture + specular

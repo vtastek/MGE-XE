@@ -1018,11 +1018,6 @@ public:
     static int swapCount;         // Track swaps for warm-up (moved from static local)
 
     // GPU instancing resources
-    static constexpr int MaxFFEInstances = 4096;  // Max instances per frame
-    static constexpr int FFEInstStride = sizeof(InstanceData);  // 48 bytes per instance
-    static IDirect3DVertexBuffer9* vbFFEInstances;  // Dynamic instance buffer
-    static std::unordered_map<DWORD, IDirect3DVertexDeclaration9*> fvfDeclCache;  // FVF -> instanced decl
-    static std::unordered_map<DWORD, IDirect3DVertexDeclaration9*> statelessDeclCache;  // FVF -> stateless batch decl
 
 public:
     // Pipeline phase tracking for GPU call separation verification
@@ -1102,13 +1097,8 @@ public:
     static void executeGpuPhase(); // GPU render block — called by render thread or inline
     static void replayScene1And2(FrameBuffer* fb);  // Replay Scene 1/2 at UI BeginScene (after recording)
 
-    // GPU instancing
-    static bool initInstancing();  // Create instance buffer and base declarations
-    static void releaseInstancing();  // Release instancing resources
-    static void buildInstanceBatches(FrameBuffer& fb);  // Build batches from InstanceKey groups
-    static void buildStatelessBatches(FrameBuffer& fb);  // Build stateless batches (per-draw data in texture)
-    static IDirect3DVertexDeclaration9* getInstancedDecl(DWORD fvf);  // Get or create instanced decl for FVF
-    static IDirect3DVertexDeclaration9* getStatelessBatchDecl(DWORD fvf);  // Get or create stateless batch decl for FVF
+    // Merged batching
+    static void buildStatelessBatches(FrameBuffer& fb);  // Build merged batches (per-draw data in texture)
 
     // Scene lifecycle for triple-buffered pipeline
     static void markSceneStart(int sceneNum, bool isUI = false);

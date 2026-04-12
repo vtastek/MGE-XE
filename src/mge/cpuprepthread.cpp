@@ -162,13 +162,7 @@ void CpuPrepThread::executePrepareFrame(const D3DXMATRIX& view, const D3DXMATRIX
         FixedFunctionShader::applyVisibilityAndFilterRecordMW();
     }
 
-    // Phase 4: Build instance batches (after culling so shouldRender is set)
-    if (ImGuiManager::GetInstancingEnabled()) {
-        MGE_ZoneScopedN("CPT_BuildInstanceBatches");
-        FixedFunctionShader::buildInstanceBatches(fb);
-    }
-
-    // Phase 4b: Build stateless batches (alternative to instancing)
+    // Phase 4: Build merged batches (after culling so shouldRender is set)
     if (ImGuiManager::GetEnableStatelessBatch()) {
         MGE_ZoneScopedN("CPT_BuildStatelessBatches");
         FixedFunctionShader::buildStatelessBatches(fb);

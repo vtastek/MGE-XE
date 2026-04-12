@@ -334,11 +334,7 @@ void DistantLand::renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer*
         if (!ImGuiManager::GetAsyncGpuThread()) {
             FixedFunctionShader::executeHiZCulling(ctx->mwView, ctx->mwProj);
             FixedFunctionShader::applyVisibilityAndFilterRecordMW();
-            // Build instance batches after culling (shouldRender flags now set)
-            if (ImGuiManager::GetInstancingEnabled()) {
-                FixedFunctionShader::buildInstanceBatches(FixedFunctionShader::getPrepBuffer());
-            }
-            // Build stateless batches (alternative to instancing)
+            // Build merged batches after culling (shouldRender flags now set)
             if (ImGuiManager::GetEnableStatelessBatch()) {
                 FixedFunctionShader::buildStatelessBatches(FixedFunctionShader::getPrepBuffer());
             }

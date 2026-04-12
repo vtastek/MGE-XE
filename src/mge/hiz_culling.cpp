@@ -882,129 +882,11 @@ bool FixedFunctionShader::computeBoundingBox(const RenderedState* rs, D3DXVECTOR
     return true;
 }
 
-//------------------------------------------------------------
-// GPU Instancing Implementation
-
-bool FixedFunctionShader::initInstancing() {
-    if (vbFFEInstances) return true;  // Already initialized
-
-    auto* device = DistantLand::device;
-    if (!device) return false;
-
-    HRESULT hr = device->CreateVertexBuffer(
-        MaxFFEInstances * FFEInstStride,
-        D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
-        0,  // No FVF, using vertex declaration
-        D3DPOOL_DEFAULT,
-        &vbFFEInstances,
-        nullptr
-    );
-
-    if (FAILED(hr)) {
-        LOG::logline("!! Failed to create FFE instance buffer");
-        return false;
-    }
-
-    LOG::logline("-- FFE instancing initialized: %d max instances, %d bytes",
-                 MaxFFEInstances, MaxFFEInstances * FFEInstStride);
-    return true;
-}
-
-void FixedFunctionShader::releaseInstancing() {
-    if (vbFFEInstances) {
-        vbFFEInstances->Release();
-        vbFFEInstances = nullptr;
-    }
-
-    // Release cached vertex declarations
-    for (auto& kv : fvfDeclCache) {
-        if (kv.second) {
-            kv.second->Release();
-        }
-    }
-    fvfDeclCache.clear();
-
-    for (auto& kv : statelessDeclCache) {
-        if (kv.second) {
-            kv.second->Release();
-        }
-    }
-    statelessDeclCache.clear();
-}
-
-void FixedFunctionShader::buildInstanceBatches(FrameBuffer& fb) {
-    MGE_ZoneScopedN("buildInstanceBatches");
-
-    fb.instanceBatches.clear();
-
-    if (!ImGuiManager::GetInstancingEnabled()) return;
-
-    auto& calls = fb.recordedCalls;
-    if (calls.empty()) return;
-
-    // Group calls by InstanceKey (geometry + material)
-    std::unordered_map<InstanceKey, std::vector<size_t>, InstanceKey::Hasher> instanceGroups;
-
-    for (size_t i = 0; i < calls.size(); i++) {
-        const auto& call = calls[i];
-
-        // Only batch Opaque/Terrain bins (no Skinning - different bone palettes, no Grass - not HLSL)
-        if (call.bin != RenderBin::Opaque && call.bin != RenderBin::Terrain)
-            continue;
-
-        // Skip if already culled
-        if (!call.shouldRender) continue;
-
-        InstanceKey key;
-        // Geometry identity
-        key.vb = call.rs.vb;
-        key.ib = call.rs.ib;
-        key.fvf = call.rs.fvf;
-        key.baseIndex = call.rs.baseIndex;
-        key.vertCount = call.rs.vertCount;
-        key.startIndex = call.rs.startIndex;
-        key.primCount = call.rs.primCount;
-        // Material identity
-        key.texture = call.rs.texture;
-        key.blendState = (uint16_t)((call.expectedState.captured ? call.expectedState.alphaBlendEnable : 0) |
-                         ((call.expectedState.captured ? call.expectedState.srcBlend : 0) << 4) |
-                         ((call.expectedState.captured ? call.expectedState.destBlend : 0) << 8));
-        key.alphaState = (uint16_t)(call.expectedState.captured ? call.expectedState.alphaTestEnable : 0);
-        key.zState = (uint8_t)((call.expectedState.captured ? call.expectedState.zEnable : 1) |
-                     ((call.expectedState.captured ? call.expectedState.zWriteEnable : 1) << 2));
-        key.cullMode = call.expectedState.captured ? (uint8_t)call.expectedState.cullMode : D3DCULL_CW;
-
-        instanceGroups[key].push_back(i);
-    }
-
-    // Build batches from groups with 2+ instances
-    for (auto& kv : instanceGroups) {
-        if (kv.second.size() >= 2) {
-            InstanceBatch batch;
-            batch.key = kv.first;
-            batch.callIndices = std::move(kv.second);
-            batch.instanceBufferOffset = 0;  // Will be set when filling instance buffer
-            fb.instanceBatches.push_back(std::move(batch));
-        }
-    }
-
-    // Log batching stats
-    int totalBatched = 0;
-    for (const auto& batch : fb.instanceBatches) {
-        totalBatched += (int)batch.callIndices.size();
-    }
-
-    if (!fb.instanceBatches.empty()) {
-        LOG::logline("Instancing: %d batches, %d batched draws (of %d total)",
-                     (int)fb.instanceBatches.size(), totalBatched, (int)calls.size());
-    }
-}
-
-// Build stateless batches: groups by geometry + render state (material data in texture)
+// Build merged batches: groups different geometries sharing same texture into mega-draws
+// (Formerly also built stateless batches for instancing, now only does merging)
 void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
-    MGE_ZoneScopedN("buildStatelessBatches");
+    MGE_ZoneScopedN("buildMergedBatches");
 
-    fb.statelessBatches.clear();
     fb.drawDataStaging.clear();
     fb.singletonCallIndices.clear();
     fb.mergedBatches.clear();
@@ -1014,155 +896,44 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
     auto& calls = fb.recordedCalls;
     if (calls.empty()) return;
 
-    // Group calls by StatelessBatchKey (geometry + render state, NOT material)
-    std::unordered_map<StatelessBatchKey, std::vector<size_t>, StatelessBatchKey::Hasher> batchGroups;
+    // Group all batchable calls by MergedBatchKey (texture + render state + FVF)
+    std::unordered_map<MergedBatchKey, std::vector<size_t>, MergedBatchKey::Hasher> mergeGroups;
+    bool highlightBatches = ImGuiManager::GetHighlightStatelessBatch();
 
     for (size_t i = 0; i < calls.size(); i++) {
         const auto& call = calls[i];
 
-        // Only batch Opaque/Terrain bins (no Skinning - bone palettes, no Grass)
+        // Only batch Opaque/Terrain bins (no Skinning, no Grass, no Blending)
         if (call.bin != RenderBin::Opaque && call.bin != RenderBin::Terrain)
             continue;
 
-        // Also skip any geometry with vertex blending (even if classified as Opaque)
-        // This catches animated parts that may not be flagged as skinning
+        // Skip geometry with vertex blending
         if (call.rs.vertexBlendState != 0)
             continue;
 
         // Skip if already culled
         if (!call.shouldRender) continue;
 
-        StatelessBatchKey key = {};  // Zero-initialize all fields
+        // Skip geometry that can't be merged
+        if (call.sk.usesSkinning || call.sk.hasGrass)
+            continue;
 
-        // Compute geometry hash from VB content (identifies identical meshes across different VB allocations)
-        size_t geoHash = computeGeometryHash(call.rs.vb, call.rs.vbOffset, call.rs.vbStride,
-                                              call.rs.vertCount, call.rs.fvf);
-
-        // Geometry identity - use content hash for batching, keep VB for actual draw
-        key.geometryHash = geoHash;
-        key.vb = call.rs.vb;  // Stored for draw, but hash used for matching
-        key.ib = call.rs.ib;
-        key.baseIndex = call.rs.baseIndex;
-        key.vertCount = call.rs.vertCount;
-        key.startIndex = call.rs.startIndex;
-        key.primCount = call.rs.primCount;
-
-        // Render state (NOT material - that goes in texture)
-        key.texture = call.rs.texture;
-        key.blendState = (uint16_t)((call.expectedState.captured ? call.expectedState.alphaBlendEnable : 0) |
+        MergedBatchKey mkey;
+        mkey.texture = call.rs.texture;
+        mkey.blendState = (uint16_t)((call.expectedState.captured ? call.expectedState.alphaBlendEnable : 0) |
                          ((call.expectedState.captured ? call.expectedState.srcBlend : 0) << 4) |
                          ((call.expectedState.captured ? call.expectedState.destBlend : 0) << 8));
-        key.zState = (uint8_t)((call.expectedState.captured ? call.expectedState.zEnable : 1) |
+        mkey.zState = (uint8_t)((call.expectedState.captured ? call.expectedState.zEnable : 1) |
                      ((call.expectedState.captured ? call.expectedState.zWriteEnable : 1) << 2));
-        key.cullMode = call.expectedState.captured ? (uint8_t)call.expectedState.cullMode : D3DCULL_CW;
-        key.useLighting = call.rs.useLighting ? 1 : 0;
-        key.vertexMaterial = (uint8_t)call.sk.vertexMaterial;
-        key.vertexColour = (uint8_t)call.sk.vertexColour;
+        mkey.cullMode = call.expectedState.captured ? (uint8_t)call.expectedState.cullMode : D3DCULL_CW;
+        mkey.useLighting = call.rs.useLighting ? 1 : 0;
+        mkey.fvf = call.rs.fvf;
 
-        batchGroups[key].push_back(i);
+        mergeGroups[mkey].push_back(i);
     }
 
-    // Build batches from groups with 2+ instances
+    // Build MergedBatch entries for groups with 2+ calls
     UINT drawDataOffset = 0;
-    bool highlightBatches = ImGuiManager::GetHighlightStatelessBatch();
-
-    for (auto& kv : batchGroups) {
-        if (kv.second.size() >= 2) {
-            StatelessBatch batch;
-            batch.key = kv.first;
-            batch.callIndices = std::move(kv.second);
-            batch.drawDataOffset = drawDataOffset;
-
-            // Fill draw data for each instance in this batch
-            for (size_t callIdx : batch.callIndices) {
-                const auto& call = calls[callIdx];
-                StatelessDrawData data;
-
-                // WorldView matrix columns (pre-combined for Z precision matching regular path)
-                const D3DXMATRIX& wv = call.rs.worldViewTransforms[0];
-                data.world0[0] = wv._11; data.world0[1] = wv._21; data.world0[2] = wv._31; data.world0[3] = wv._41;
-                data.world1[0] = wv._12; data.world1[1] = wv._22; data.world1[2] = wv._32; data.world1[3] = wv._42;
-                data.world2[0] = wv._13; data.world2[1] = wv._23; data.world2[2] = wv._33; data.world2[3] = wv._43;
-
-                // Material diffuse (tint green if highlight mode)
-                float tintR = highlightBatches ? 0.3f : 1.0f;
-                float tintG = highlightBatches ? 1.0f : 1.0f;
-                float tintB = highlightBatches ? 0.3f : 1.0f;
-                data.diffuse[0] = call.frs.material.diffuse.r * tintR;
-                data.diffuse[1] = call.frs.material.diffuse.g * tintG;
-                data.diffuse[2] = call.frs.material.diffuse.b * tintB;
-                data.diffuse[3] = call.frs.material.diffuse.a;
-
-                // Material ambient
-                data.ambient[0] = call.frs.material.ambient.r;
-                data.ambient[1] = call.frs.material.ambient.g;
-                data.ambient[2] = call.frs.material.ambient.b;
-                data.ambient[3] = call.frs.material.ambient.a;
-
-                // Material emissive + alphaRef
-                data.emissive[0] = call.frs.material.emissive.r;
-                data.emissive[1] = call.frs.material.emissive.g;
-                data.emissive[2] = call.frs.material.emissive.b;
-                data.emissive[3] = (float)call.rs.alphaRef / 255.0f;
-
-                // Light params (for future texture-based lighting)
-                data.lightParams[0] = 0.0f;  // pointLightCount - TODO
-                data.lightParams[1] = 0.0f;  // lightTexelOffset - TODO
-                data.lightParams[2] = 0.0f;  // texelSize - TODO
-                data.lightParams[3] = 0.0f;
-
-                // Full 4th column of worldView for robust w computation via dot product
-                // Note: vertexMaterial and hasVCol are passed via shader uniforms, not texture
-                data.flags[0] = wv._14;
-                data.flags[1] = wv._24;
-                data.flags[2] = wv._34;
-                data.flags[3] = wv._44;
-
-                fb.drawDataStaging.push_back(data);
-                drawDataOffset++;
-            }
-
-            fb.statelessBatches.push_back(std::move(batch));
-        } else if (kv.second.size() == 1) {
-            // Track singletons for highlighting and merging
-            if (highlightBatches) {
-                fb.singletonCallIndices.insert(kv.second[0]);
-            }
-        }
-    }
-
-    // Phase 2: Build merged batches from singletons (bucket by texture + renderState)
-    // This collapses many singletons into one mega-draw per texture
-    std::unordered_map<MergedBatchKey, std::vector<size_t>, MergedBatchKey::Hasher> mergeGroups;
-
-    for (const auto& kv : batchGroups) {
-        if (kv.second.size() == 1) {
-            size_t callIdx = kv.second[0];
-            const auto& call = calls[callIdx];
-
-            // Skip geometry that can't be merged: skinned, grass, blending, vertex blending
-            // These require per-draw state that can't be batched
-            if (call.sk.usesSkinning || call.sk.hasGrass || call.bin == RenderBin::Blending ||
-                call.rs.vertexBlendState != 0) {
-                continue;
-            }
-
-            MergedBatchKey mkey;
-            mkey.texture = call.rs.texture;
-            mkey.blendState = (uint16_t)((call.expectedState.captured ? call.expectedState.alphaBlendEnable : 0) |
-                             ((call.expectedState.captured ? call.expectedState.srcBlend : 0) << 4) |
-                             ((call.expectedState.captured ? call.expectedState.destBlend : 0) << 8));
-            mkey.zState = (uint8_t)((call.expectedState.captured ? call.expectedState.zEnable : 1) |
-                         ((call.expectedState.captured ? call.expectedState.zWriteEnable : 1) << 2));
-            mkey.cullMode = call.expectedState.captured ? (uint8_t)call.expectedState.cullMode : D3DCULL_CW;
-            mkey.useLighting = call.rs.useLighting ? 1 : 0;
-            mkey.fvf = call.rs.fvf;
-
-            mergeGroups[mkey].push_back(callIdx);
-        }
-    }
-
-    // Build MergedBatch entries for groups with 2+ singletons
     for (auto& kv : mergeGroups) {
         if (kv.second.size() >= 2) {
             MergedBatch mbatch;
@@ -1178,7 +949,7 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
                 mbatch.totalVertices += call.rs.vertCount;
                 mbatch.totalIndices += call.rs.primCount * 3;
 
-                // Fill draw data (same as stateless batch)
+                // Fill draw data
                 StatelessDrawData data;
                 const D3DXMATRIX& wv = call.rs.worldViewTransforms[0];
                 data.world0[0] = wv._11; data.world0[1] = wv._21; data.world0[2] = wv._31; data.world0[3] = wv._41;
@@ -1209,7 +980,7 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
                 data.lightParams[2] = 0.0f;
                 data.lightParams[3] = 0.0f;
 
-                // Full 4th column of worldView for robust w computation via dot product
+                // Full 4th column of worldView for robust w computation
                 data.flags[0] = wv._14;
                 data.flags[1] = wv._24;
                 data.flags[2] = wv._34;
@@ -1220,476 +991,32 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
             }
 
             fb.mergedBatches.push_back(std::move(mbatch));
+        } else if (kv.second.size() == 1 && highlightBatches) {
+            // Track singletons for highlighting
+            fb.singletonCallIndices.insert(kv.second[0]);
         }
     }
 
-    // Log batching stats with detailed breakdown
-    int totalBatched = 0;
-    for (const auto& batch : fb.statelessBatches) {
-        totalBatched += (int)batch.callIndices.size();
-    }
-
-    // Count visible calls for accurate reporting
-    int visibleCalls = 0;
-    for (const auto& call : calls) {
-        if (call.shouldRender && (call.bin == RenderBin::Opaque || call.bin == RenderBin::Terrain)) {
-            visibleCalls++;
-        }
-    }
-
-    // Detailed batch breakdown logging (on ImGui button press)
-    bool dumpDetail = ImGuiManager::GetAndClearDumpStatelessBatch();
-    if (dumpDetail && !fb.statelessBatches.empty()) {
-
-        // Count unique textures
-        std::set<IDirect3DTexture9*> uniqueTextures;
-        for (const auto& kv : batchGroups) {
-            uniqueTextures.insert(kv.first.texture);
-        }
-
-        // Analyze batch breakers
-        int singletonCount = 0;  // Groups with only 1 call (not batched)
-        int batchedCount = 0;
-        std::map<std::string, int> breakerCounts;
-
-        for (const auto& kv : batchGroups) {
-            if (kv.second.size() == 1) {
-                singletonCount++;
-            } else {
-                batchedCount++;
-            }
-        }
-
-        // Log unique textures vs batch groups
-        LOG::logline("=== StatelessBatch Breakdown ===");
-        LOG::logline("Unique textures: %d", (int)uniqueTextures.size());
-        LOG::logline("Total batch groups: %d (batched: %d, singletons: %d)",
-                     (int)batchGroups.size(), batchedCount, singletonCount);
-
-        // Analyze what's fragmenting batches by comparing calls with same texture
-        std::map<IDirect3DTexture9*, std::vector<size_t>> callsByTexture;
-        for (size_t i = 0; i < calls.size(); i++) {
-            const auto& call = calls[i];
-            if (call.shouldRender && (call.bin == RenderBin::Opaque || call.bin == RenderBin::Terrain)) {
-                callsByTexture[call.rs.texture].push_back(i);
-            }
-        }
-
-        // Analyze VB vs geometry hash - how many unique VBs vs unique geometry content
-        std::set<IDirect3DVertexBuffer9*> allVBs;
-        std::set<size_t> allGeoHashes;
-        std::map<size_t, std::set<IDirect3DVertexBuffer9*>> vbsByGeoHash;  // Which VBs share same geometry
-
-        // Track what's making hashes unique
-        std::map<DWORD, int> fvfCounts;
-        std::map<UINT, int> vertCountCounts;
-        std::map<UINT, int> offsetCounts;
-        std::map<UINT, int> strideCounts;
-
-        for (size_t i = 0; i < calls.size(); i++) {
-            const auto& call = calls[i];
-            if (call.shouldRender && (call.bin == RenderBin::Opaque || call.bin == RenderBin::Terrain)) {
-                allVBs.insert(call.rs.vb);
-                fvfCounts[call.rs.fvf]++;
-                vertCountCounts[call.rs.vertCount]++;
-                offsetCounts[call.rs.vbOffset]++;
-                strideCounts[call.rs.vbStride]++;
-
-                size_t geoHash = computeGeometryHash(call.rs.vb, call.rs.vbOffset, call.rs.vbStride,
-                                                      call.rs.vertCount, call.rs.fvf);
-                allGeoHashes.insert(geoHash);
-                vbsByGeoHash[geoHash].insert(call.rs.vb);
-            }
-        }
-
-        // Log hash component distributions
-        LOG::logline("Hash components - FVF types: %d, VertCount values: %d, Offsets: %d, Strides: %d",
-                     (int)fvfCounts.size(), (int)vertCountCounts.size(), (int)offsetCounts.size(), (int)strideCounts.size());
-
-        // If few unique FVFs/strides, content must be differentiating
-        if (fvfCounts.size() <= 5) {
-            LOG::logline("  FVF distribution:");
-            for (auto& kv : fvfCounts) {
-                LOG::logline("    FVF 0x%X: %d calls", kv.first, kv.second);
-            }
-        }
-        if (offsetCounts.size() <= 3) {
-            LOG::logline("  All offsets: %s", offsetCounts.count(0) ? "0 (good)" : "varying (problem!)");
-        } else {
-            LOG::logline("  Offset values: %d unique (batching by offset broken!)", (int)offsetCounts.size());
-        }
-
-        // Count duplicate VBs (same geometry hash, different VB pointer)
-        int duplicateVBs = 0;
-        int geoHashesWithDupes = 0;
-        for (const auto& kv : vbsByGeoHash) {
-            if (kv.second.size() > 1) {
-                geoHashesWithDupes++;
-                duplicateVBs += (int)kv.second.size() - 1;
-            }
-        }
-
-        LOG::logline("Unique VBs: %d, Unique geometry hashes: %d", (int)allVBs.size(), (int)allGeoHashes.size());
-        LOG::logline("Duplicate VBs (same geometry): %d across %d meshes", duplicateVBs, geoHashesWithDupes);
-
-        // Find textures where calls aren't batching together
-        int fragmentedTextures = 0;
-        int totalFragmentation = 0;
-        for (const auto& texCalls : callsByTexture) {
-            if (texCalls.second.size() >= 2) {
-                // Count unique geometry hashes for this texture
-                std::set<size_t> geoHashes;
-                for (size_t idx : texCalls.second) {
-                    size_t geoHash = computeGeometryHash(calls[idx].rs.vb, calls[idx].rs.vbOffset,
-                                                          calls[idx].rs.vbStride, calls[idx].rs.vertCount,
-                                                          calls[idx].rs.fvf);
-                    geoHashes.insert(geoHash);
-                }
-                if (geoHashes.size() > 1) {
-                    fragmentedTextures++;
-                    totalFragmentation += (int)geoHashes.size() - 1;
-                }
-            }
-        }
-
-        LOG::logline("Textures fragmented by geometry: %d (extra batches: %d)",
-                     fragmentedTextures, totalFragmentation);
-
-        // Full batch dump
-        LOG::logline("");
-        LOG::logline("=== BATCHED GROUPS (2+ draws) ===");
-        int batchIdx = 0;
-        for (const auto& batch : fb.statelessBatches) {
-            const auto& key = batch.key;
-            LOG::logline("Batch %d: %d draws, tex=%p, vc=%d, pc=%d, blend=0x%X, z=0x%X, cull=%d, lit=%d",
-                batchIdx++, (int)batch.callIndices.size(), key.texture,
-                key.vertCount, key.primCount, key.blendState, key.zState, key.cullMode, key.useLighting);
-        }
-
-        // Singleton analysis - why didn't they batch?
-        LOG::logline("");
-        LOG::logline("=== SINGLETONS (unique geometry per texture) ===");
-
-        // Group singletons by texture to show potential
-        std::map<IDirect3DTexture9*, std::vector<const StatelessBatchKey*>> singletonsByTex;
-        for (const auto& kv : batchGroups) {
-            if (kv.second.size() == 1) {
-                singletonsByTex[kv.first.texture].push_back(&kv.first);
-            }
-        }
-
-        // Show textures with multiple singletons (potential batching if geometry merged)
-        for (const auto& texSingles : singletonsByTex) {
-            if (texSingles.second.size() >= 2) {
-                LOG::logline("Tex %p: %d singletons (could batch if geometry merged)",
-                    texSingles.first, (int)texSingles.second.size());
-                // Show first few
-                int shown = 0;
-                for (const auto* key : texSingles.second) {
-                    if (shown++ >= 5) {
-                        LOG::logline("  ... and %d more", (int)texSingles.second.size() - 5);
-                        break;
-                    }
-                    LOG::logline("  vc=%d pc=%d blend=0x%X z=0x%X cull=%d",
-                        key->vertCount, key->primCount, key->blendState, key->zState, key->cullMode);
-                }
-            }
-        }
-
-        // VertCount distribution (shows mesh variety)
-        LOG::logline("");
-        LOG::logline("=== VERTEX COUNT DISTRIBUTION ===");
-        std::map<UINT, int> vcDist;
-        for (const auto& kv : batchGroups) {
-            vcDist[kv.first.vertCount] += (int)kv.second.size();
-        }
-        // Sort by frequency
-        std::vector<std::pair<int, UINT>> vcSorted;
-        for (const auto& kv : vcDist) {
-            vcSorted.push_back({kv.second, kv.first});
-        }
-        std::sort(vcSorted.rbegin(), vcSorted.rend());
-        LOG::logline("Top 10 vertex counts by draw frequency:");
-        for (int i = 0; i < std::min(10, (int)vcSorted.size()); i++) {
-            LOG::logline("  vc=%d: %d draws", vcSorted[i].second, vcSorted[i].first);
-        }
-
-        // Index Buffer analysis - can we batch by shared IB?
-        LOG::logline("");
-        LOG::logline("=== INDEX BUFFER ANALYSIS ===");
-
-        // Collect all singleton call indices for IB analysis
-        std::vector<size_t> singletonCallIdxs;
-        for (const auto& kv : batchGroups) {
-            if (kv.second.size() == 1) {
-                singletonCallIdxs.push_back(kv.second[0]);
-            }
-        }
-
-        // Group singletons by IB
-        std::map<IDirect3DIndexBuffer9*, std::vector<size_t>> singletonsByIB;
-        std::set<IDirect3DIndexBuffer9*> uniqueIBs;
-        for (size_t idx : singletonCallIdxs) {
-            const auto& call = calls[idx];
-            singletonsByIB[call.rs.ib].push_back(idx);
-            uniqueIBs.insert(call.rs.ib);
-        }
-
-        LOG::logline("Singletons: %d calls, %d unique IBs", (int)singletonCallIdxs.size(), (int)uniqueIBs.size());
-
-        // Find IBs shared by multiple singletons (batching potential without IB merge)
-        int sharedIBCount = 0;
-        int callsWithSharedIB = 0;
-        for (const auto& ibCalls : singletonsByIB) {
-            if (ibCalls.second.size() >= 2) {
-                sharedIBCount++;
-                callsWithSharedIB += (int)ibCalls.second.size();
-            }
-        }
-        LOG::logline("Shared IBs: %d IBs used by %d calls (no merge needed!)", sharedIBCount, callsWithSharedIB);
-
-        // Show top shared IBs with their draw ranges
-        LOG::logline("Top shared IBs:");
-        std::vector<std::pair<int, IDirect3DIndexBuffer9*>> ibSorted;
-        for (const auto& kv : singletonsByIB) {
-            if (kv.second.size() >= 2) {
-                ibSorted.push_back({(int)kv.second.size(), kv.first});
-            }
-        }
-        std::sort(ibSorted.rbegin(), ibSorted.rend());
-
-        for (int i = 0; i < std::min(5, (int)ibSorted.size()); i++) {
-            auto ib = ibSorted[i].second;
-            const auto& callIdxs = singletonsByIB[ib];
-            LOG::logline("  IB %p: %d singletons", ib, (int)callIdxs.size());
-
-            // Show startIndex ranges to verify they use different offsets
-            std::set<IDirect3DTexture9*> textures;
-            UINT minStart = UINT_MAX, maxStart = 0;
-            UINT minPrims = UINT_MAX, maxPrims = 0;
-            for (size_t idx : callIdxs) {
-                const auto& call = calls[idx];
-                textures.insert(call.rs.texture);
-                minStart = std::min(minStart, call.rs.startIndex);
-                maxStart = std::max(maxStart, call.rs.startIndex);
-                minPrims = std::min(minPrims, call.rs.primCount);
-                maxPrims = std::max(maxPrims, call.rs.primCount);
-            }
-            LOG::logline("    textures=%d, startIndex=[%d-%d], primCount=[%d-%d]",
-                (int)textures.size(), minStart, maxStart, minPrims, maxPrims);
-        }
-
-        // Unique IB singletons (would need IB merge)
-        int uniqueIBSingletons = (int)singletonCallIdxs.size() - callsWithSharedIB;
-        LOG::logline("Unique IB singletons: %d (would need IB merge)", uniqueIBSingletons);
-
-        // Local Hash analysis - can centering collapse duplicates?
-        LOG::logline("");
-        LOG::logline("=== LOCAL HASH ANALYSIS (Centered Geometry) ===");
-
-        std::map<size_t, int> localHashCounts;  // localHash -> count
-        std::map<std::pair<size_t, IDirect3DTexture9*>, int> mergedKeyCount;  // (localHash, tex) -> count
-        int localMeshCacheHits = 0;
-        int localMeshCacheMisses = 0;
-
-        for (size_t idx : singletonCallIdxs) {
-            const auto& call = calls[idx];
-
-            // Compute geometry hash first (needed as cache key)
-            size_t geoHash = computeGeometryHash(call.rs.vb, call.rs.vbOffset, call.rs.vbStride,
-                                                  call.rs.vertCount, call.rs.fvf);
-
-            // Get or create local mesh (centered)
-            const LocalMeshData* localMesh = getOrCreateLocalMesh(
-                geoHash, call.rs.vb, call.rs.vbOffset, call.rs.vbStride, call.rs.vertCount, call.rs.fvf,
-                call.rs.ib, call.rs.startIndex, call.rs.primCount);
-
-            if (localMesh) {
-                localHashCounts[localMesh->localHash]++;
-                mergedKeyCount[{localMesh->localHash, call.rs.texture}]++;
-
-                // Check if this was a cache hit (already existed before this frame)
-                // We can't easily tell, so just count total
-            }
-        }
-
-        int uniqueLocalHashes = (int)localHashCounts.size();
-        int potentialMergedBatches = (int)mergedKeyCount.size();
-
-        LOG::logline("Singletons: %d -> %d unique local hashes (%.1fx reduction)",
-            (int)singletonCallIdxs.size(), uniqueLocalHashes,
-            uniqueLocalHashes > 0 ? (float)singletonCallIdxs.size() / uniqueLocalHashes : 0.0f);
-        LOG::logline("Potential merged batches (localHash + texture): %d", potentialMergedBatches);
-
-        // Show top repeated local hashes
-        std::vector<std::pair<int, size_t>> localHashSorted;
-        for (const auto& kv : localHashCounts) {
-            if (kv.second >= 2) {
-                localHashSorted.push_back({kv.second, kv.first});
-            }
-        }
-        std::sort(localHashSorted.rbegin(), localHashSorted.rend());
-
-        if (!localHashSorted.empty()) {
-            LOG::logline("Top repeated local hashes (identical geometry at different positions):");
-            for (int i = 0; i < std::min(5, (int)localHashSorted.size()); i++) {
-                LOG::logline("  localHash %zX: %d instances", localHashSorted[i].second, localHashSorted[i].first);
-            }
-        }
-
-        LOG::logline("================================");
-    }
-
-    // Always log summary
-    if (!fb.statelessBatches.empty() || !fb.mergedBatches.empty()) {
+    // Log batching stats
+    if (!fb.mergedBatches.empty()) {
         int totalMerged = 0;
         for (const auto& mb : fb.mergedBatches) {
             totalMerged += (int)mb.callIndices.size();
         }
-        LOG::logline("Batching: %d stateless (%d draws) + %d merged (%d draws) = %d total draws -> %d GPU calls",
-                     (int)fb.statelessBatches.size(), totalBatched,
-                     (int)fb.mergedBatches.size(), totalMerged,
-                     totalBatched + totalMerged,
-                     (int)fb.statelessBatches.size() + (int)fb.mergedBatches.size());
-    }
-}
-
-// Helper: Convert FVF to vertex declaration elements for stream 0
-static bool fvfToElements(DWORD fvf, std::vector<D3DVERTEXELEMENT9>& elements) {
-    WORD offset = 0;
-
-    // Position (required)
-    if (fvf & D3DFVF_XYZRHW) {
-        elements.push_back({0, offset, D3DDECLTYPE_FLOAT4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITIONT, 0});
-        offset += 16;
-    } else if (fvf & D3DFVF_XYZ) {
-        elements.push_back({0, offset, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0});
-        offset += 12;
+        LOG::logline("MergedBatch: %d batches, %d draws merged -> %d GPU calls",
+                     (int)fb.mergedBatches.size(), totalMerged, (int)fb.mergedBatches.size());
     }
 
-    // Blend weights (XYZB1-4)
-    // FVF position encoding: XYZ=1, XYZRHW=2, XYZB1=3, XYZB2=4, XYZB3=5, XYZB4=6
-    // Blend weight count = position_type - 2 (for types >= 3)
-    int posType = (fvf >> 1) & 0x7;
-    int blendWeights = (posType >= 3) ? (posType - 2) : 0;
-    if (blendWeights > 0 && blendWeights <= 4) {
-        BYTE types[] = {D3DDECLTYPE_FLOAT1, D3DDECLTYPE_FLOAT2, D3DDECLTYPE_FLOAT3, D3DDECLTYPE_FLOAT4};
-        elements.push_back({0, offset, types[blendWeights - 1], D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_BLENDWEIGHT, 0});
-        offset += blendWeights * 4;
-    }
-
-    // Normal
-    if (fvf & D3DFVF_NORMAL) {
-        elements.push_back({0, offset, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_NORMAL, 0});
-        offset += 12;
-    }
-
-    // Diffuse color
-    if (fvf & D3DFVF_DIFFUSE) {
-        elements.push_back({0, offset, D3DDECLTYPE_D3DCOLOR, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_COLOR, 0});
-        offset += 4;
-    }
-
-    // Specular color
-    if (fvf & D3DFVF_SPECULAR) {
-        elements.push_back({0, offset, D3DDECLTYPE_D3DCOLOR, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_COLOR, 1});
-        offset += 4;
-    }
-
-    // Texture coordinates
-    int numTexCoords = (fvf & D3DFVF_TEXCOUNT_MASK) >> D3DFVF_TEXCOUNT_SHIFT;
-    for (int i = 0; i < numTexCoords; i++) {
-        // Get texcoord format (default is 2D float)
-        int fmt = (fvf >> (16 + i * 2)) & 0x3;
-        BYTE type = D3DDECLTYPE_FLOAT2;
-        int size = 8;
-        switch (fmt) {
-            case 0: type = D3DDECLTYPE_FLOAT2; size = 8; break;  // D3DFVF_TEXTUREFORMAT2
-            case 1: type = D3DDECLTYPE_FLOAT3; size = 12; break; // D3DFVF_TEXTUREFORMAT3
-            case 2: type = D3DDECLTYPE_FLOAT4; size = 16; break; // D3DFVF_TEXTUREFORMAT4
-            case 3: type = D3DDECLTYPE_FLOAT1; size = 4; break;  // D3DFVF_TEXTUREFORMAT1
+    // Detailed logging on button press
+    bool dumpDetail = ImGuiManager::GetAndClearDumpStatelessBatch();
+    if (dumpDetail && !fb.mergedBatches.empty()) {
+        LOG::logline("=== MergedBatch Breakdown ===");
+        int batchIdx = 0;
+        for (const auto& mb : fb.mergedBatches) {
+            LOG::logline("Batch %d: %d draws, tex=%p, verts=%d, fvf=0x%X",
+                batchIdx++, (int)mb.callIndices.size(), mb.key.texture, mb.totalVertices, mb.key.fvf);
         }
-        elements.push_back({0, offset, type, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, (BYTE)i});
-        offset += size;
+        LOG::logline("Singletons (not batched): %d", (int)fb.singletonCallIndices.size());
     }
-
-    return !elements.empty();
 }
 
-IDirect3DVertexDeclaration9* FixedFunctionShader::getInstancedDecl(DWORD fvf) {
-    // Check cache first
-    auto it = fvfDeclCache.find(fvf);
-    if (it != fvfDeclCache.end()) {
-        return it->second;
-    }
-
-    // Build declaration elements from FVF
-    std::vector<D3DVERTEXELEMENT9> elements;
-    if (!fvfToElements(fvf, elements)) {
-        LOG::logline("!! Failed to convert FVF 0x%08X to vertex elements", fvf);
-        fvfDeclCache[fvf] = nullptr;
-        return nullptr;
-    }
-
-    // Add instance stream elements (TEXCOORD 8-10 for world matrix rows)
-    elements.push_back({1, 0,  D3DDECLTYPE_FLOAT4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 8});
-    elements.push_back({1, 16, D3DDECLTYPE_FLOAT4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 9});
-    elements.push_back({1, 32, D3DDECLTYPE_FLOAT4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 10});
-
-    // End marker
-    elements.push_back(D3DDECL_END());
-
-    // Create vertex declaration
-    auto* device = DistantLand::device;
-    IDirect3DVertexDeclaration9* decl = nullptr;
-    HRESULT hr = device->CreateVertexDeclaration(elements.data(), &decl);
-
-    if (FAILED(hr)) {
-        LOG::logline("!! Failed to create instanced vertex decl for FVF 0x%08X", fvf);
-        fvfDeclCache[fvf] = nullptr;
-        return nullptr;
-    }
-
-    fvfDeclCache[fvf] = decl;
-    LOG::logline("-- Created instanced vertex decl for FVF 0x%08X", fvf);
-    return decl;
-}
-
-// Get or create stateless batch vertex declaration for FVF
-// Similar to getInstancedDecl but stream 1 only has a single float (drawIndex)
-IDirect3DVertexDeclaration9* FixedFunctionShader::getStatelessBatchDecl(DWORD fvf) {
-    // Check cache first
-    auto it = statelessDeclCache.find(fvf);
-    if (it != statelessDeclCache.end()) {
-        return it->second;
-    }
-
-    // Build declaration elements from FVF
-    std::vector<D3DVERTEXELEMENT9> elements;
-    if (!fvfToElements(fvf, elements)) {
-        LOG::logline("!! Failed to convert FVF 0x%08X to vertex elements for stateless batch", fvf);
-        statelessDeclCache[fvf] = nullptr;
-        return nullptr;
-    }
-
-    // Add stateless batch stream element (TEXCOORD8 for drawIndex - single float)
-    elements.push_back({1, 0, D3DDECLTYPE_FLOAT1, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 8});
-
-    // End marker
-    elements.push_back(D3DDECL_END());
-
-    // Create vertex declaration
-    auto* device = DistantLand::device;
-    IDirect3DVertexDeclaration9* decl = nullptr;
-    HRESULT hr = device->CreateVertexDeclaration(elements.data(), &decl);
-
-    if (FAILED(hr)) {
-        LOG::logline("!! Failed to create stateless batch vertex decl for FVF 0x%08X", fvf);
-        statelessDeclCache[fvf] = nullptr;
-        return nullptr;
-    }
-
-    statelessDeclCache[fvf] = decl;
-    LOG::logline("-- Created stateless batch vertex decl for FVF 0x%08X", fvf);
-    return decl;
-}

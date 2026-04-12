@@ -315,9 +315,6 @@ bool DistantLand::init() {
         return false;
     }
 
-    // Initialize FFE GPU instancing resources
-    FixedFunctionShader::initInstancing();
-
     MWBridge::get()->patchResolveDuringInit(&resolveDynamicVisGroups);
 
     // Wait for priority shaders to be ready before MWSE scripts run
@@ -1681,9 +1678,6 @@ void DistantLand::release() {
     ibWater = nullptr;
     vbGrassInstances->Release();
     vbGrassInstances = nullptr;
-
-    // Release FFE instancing resources
-    FixedFunctionShader::releaseInstancing();
 
     vbFullFrame->Release();
     vbFullFrame = nullptr;
