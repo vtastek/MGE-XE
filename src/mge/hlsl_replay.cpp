@@ -2516,6 +2516,41 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                         device->SetTexture(5, lightTex);
                     }
 
+                    // Set sun/ambient lighting constants (required for exterior lighting)
+                    // Transform sun direction from world space to view space
+                    D3DXVECTOR3 sunDirView;
+                    D3DXVec3TransformNormal(&sunDirView, (const D3DXVECTOR3*)&DistantLand::s_staging.sunVec, &fb.currentView);
+
+                    // Apply lighting multipliers from s_staging
+                    RGBVECTOR sunDiffuse = DistantLand::s_staging.lightSunMult * DistantLand::s_staging.sunCol;
+                    RGBVECTOR sceneAmbient = DistantLand::s_staging.lightAmbMult *
+                        (DistantLand::s_staging.sunAmb + DistantLand::s_staging.ambCol);
+
+                    // Set constants using resolved shader registers
+                    if (hlslShader.regLightSunDirection.reg != REG_INVALID) {
+                        float v[4] = { sunDirView.x, sunDirView.y, sunDirView.z, 0 };
+                        device->SetPixelShaderConstantF(hlslShader.regLightSunDirection.reg, v, 1);
+                    }
+                    if (hlslShader.regLightSunDiffuse.reg != REG_INVALID) {
+                        float v[4] = { sunDiffuse.r, sunDiffuse.g, sunDiffuse.b, 0 };
+                        device->SetPixelShaderConstantF(hlslShader.regLightSunDiffuse.reg, v, 1);
+                    }
+                    if (hlslShader.regLightSceneAmbient.reg != REG_INVALID) {
+                        float v[4] = { sceneAmbient.r, sceneAmbient.g, sceneAmbient.b, 0 };
+                        device->SetPixelShaderConstantF(hlslShader.regLightSceneAmbient.reg, v, 1);
+                    }
+
+                    // Set shadow matrices for stateless batch mode
+                    // Shader expects view-to-shadow transform: viewInverse * shadowVP
+                    if (hlslShader.hShadowWorldViewProj) {
+                        D3DXMATRIX viewInverse;
+                        D3DXMatrixInverse(&viewInverse, nullptr, &fb.currentView);
+                        D3DXMATRIX shadowViewToClip[2];
+                        shadowViewToClip[0] = viewInverse * fb.shadowViewproj[0];
+                        shadowViewToClip[1] = viewInverse * fb.shadowViewproj[1];
+                        hlslShader.vsConstantTable->SetMatrixArray(device, hlslShader.hShadowWorldViewProj, shadowViewToClip, 2);
+                    }
+
                     // Set render state
                     device->SetRenderState(D3DRS_ALPHABLENDENABLE, mb.key.blendState & 0x1);
                     device->SetRenderState(D3DRS_SRCBLEND, (mb.key.blendState >> 4) & 0xF);
