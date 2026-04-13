@@ -928,6 +928,7 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
         mkey.cullMode = call.expectedState.captured ? (uint8_t)call.expectedState.cullMode : D3DCULL_CW;
         mkey.useLighting = call.rs.useLighting ? 1 : 0;
         mkey.fvf = call.rs.fvf;
+        mkey.stride = call.rs.vbStride;
 
         mergeGroups[mkey].push_back(i);
     }

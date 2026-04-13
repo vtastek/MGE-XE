@@ -260,12 +260,13 @@ struct MergedBatchKey {
     uint8_t cullMode;
     uint8_t useLighting;
     DWORD fvf;                      // Must match for merging
+    UINT stride;                    // Vertex stride must match for merging
 
     bool operator==(const MergedBatchKey& o) const {
         return texture == o.texture &&
                blendState == o.blendState && zState == o.zState &&
                cullMode == o.cullMode && useLighting == o.useLighting &&
-               fvf == o.fvf;
+               fvf == o.fvf && stride == o.stride;
     }
 
     struct Hasher {
@@ -273,6 +274,7 @@ struct MergedBatchKey {
             size_t h = reinterpret_cast<size_t>(k.texture);
             h ^= (k.blendState | (k.zState << 16) | (k.cullMode << 24)) + 0x9e3779b9 + (h << 6) + (h >> 2);
             h ^= (k.fvf | ((size_t)k.useLighting << 28)) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= k.stride + 0x9e3779b9 + (h << 6) + (h >> 2);
             return h;
         }
     };

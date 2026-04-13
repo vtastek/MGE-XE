@@ -2377,7 +2377,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     }
                     if (suppressed) continue;
 
-                    UINT originalStride = firstCall.rs.vbStride;
+                    // Use stride from batch key - guaranteed to match all calls in this batch
+                    UINT originalStride = mb.key.stride;
 
                     // Get or create vertex declaration
                     IDirect3DVertexDeclaration9* mergedDecl = getMergedDecl(mb.key.fvf, originalStride);
