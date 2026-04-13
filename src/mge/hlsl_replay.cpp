@@ -2109,7 +2109,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
         UINT totalMergedIndices = 0;
         UINT vbSizeNeeded = 0;
 
-        // Compute total VB size accounting for per-batch stride
+        // Compute total VB size accounting for per-batch stride and alignment padding
         for (const auto& mb : fb.mergedBatches) {
             totalMergedVerts += mb.totalVertices;
             totalMergedIndices += mb.totalIndices;
@@ -2118,6 +2118,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                 const auto& call = recCalls[mb.callIndices[0]];
                 UINT batchExpandedStride = call.rs.vbStride + sizeof(float);
                 vbSizeNeeded += mb.totalVertices * batchExpandedStride;
+                vbSizeNeeded += batchExpandedStride;  // Padding allowance for stride alignment
             }
         }
         UINT ibSizeNeeded = totalMergedIndices * sizeof(DWORD);  // 32-bit indices for >64k verts
@@ -2152,7 +2153,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
             if (SUCCEEDED(fb.mergedVB->Lock(0, vbSizeNeeded, &vbData, D3DLOCK_DISCARD)) &&
                 SUCCEEDED(fb.mergedIB->Lock(0, ibSizeNeeded, &ibData, D3DLOCK_DISCARD))) {
 
-                BYTE* vbDst = static_cast<BYTE*>(vbData);
+                BYTE* vbBase = static_cast<BYTE*>(vbData);  // Keep base pointer
                 DWORD* ibDst = static_cast<DWORD*>(ibData);  // 32-bit indices
                 UINT vbByteOffset = 0;  // In bytes
                 UINT ibOffset = 0;      // In indices
@@ -2176,6 +2177,16 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     const auto& firstCall = recCalls[mb.callIndices[0]];
                     UINT batchStride = firstCall.rs.vbStride;
                     UINT batchExpandedStride = batchStride + sizeof(float);
+
+                    // ALIGNMENT FIX: Ensure vbByteOffset is a perfect multiple of this batch's stride
+                    // This prevents integer truncation in BaseVertexIndex calculation
+                    UINT remainder = vbByteOffset % batchExpandedStride;
+                    if (remainder != 0) {
+                        vbByteOffset += (batchExpandedStride - remainder);
+                    }
+
+                    // Define the specific destination pointer for THIS batch
+                    BYTE* vbDst = vbBase + vbByteOffset;
 
                     // Debug: log merged batch info once
                     if (!loggedMergedDebug) {
@@ -2206,50 +2217,98 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                                 (int)i, drawIndex, srcStride, call.rs.vertCount);
                         }
 
-                        // Copy vertices with drawIndex appended
-                        // Calculate actual start of this object's vertices in the source VB
-                        // Morrowind vertices are at: vbOffset + (baseIndex + minIndex) * stride
-                        UINT srcVertexStart = call.rs.baseIndex + call.rs.minIndex;
-                        UINT srcLockOffset = call.rs.vbOffset + (srcVertexStart * srcStride);
+                        // Detect IB format (16-bit vs 32-bit)
+                        D3DINDEXBUFFER_DESC ibDesc;
+                        call.rs.ib->GetDesc(&ibDesc);
+                        bool is32Bit = (ibDesc.Format == D3DFMT_INDEX32);
+                        UINT idxSize = is32Bit ? 4 : 2;
 
-                        void* srcVerts = nullptr;
-                        if (call.rs.vb && SUCCEEDED(call.rs.vb->Lock(srcLockOffset,
-                                                    call.rs.vertCount * srcStride,
-                                                    &srcVerts, D3DLOCK_READONLY))) {
-                            const BYTE* src = static_cast<const BYTE*>(srcVerts);
-                            for (UINT v = 0; v < call.rs.vertCount; v++) {
-                                // Copy original vertex data (use min of source and batch stride for safety)
-                                UINT copySize = std::min(srcStride, batchStride);
-                                memcpy(vbDst, src, copySize);
-                                // Append drawIndex as float at batch stride offset
-                                float* drawIdxPtr = reinterpret_cast<float*>(vbDst + batchStride);
-                                *drawIdxPtr = (float)drawIndex;
-                                // Debug: log first vertex of first call
-                                if (!loggedMergedDebug && v == 0 && i == 0) {
-                                    LOG::logline("  DrawIndex write: drawIndex=%d at offset %d, expandedStride=%d, wrote %.1f",
-                                        drawIndex, batchStride, batchExpandedStride, *drawIdxPtr);
-                                }
-                                vbDst += batchExpandedStride;
-                                src += srcStride;
-                            }
-                            call.rs.vb->Unlock();
-                        }
-
-                        // Copy indices with offset rebasing (source is 16-bit, dest is 32-bit)
-                        // Source indices are absolute offsets into shared VB (e.g., 10634, 10929)
-                        // We normalize by subtracting minIndex, then add our localVertOffset
-                        void* srcIndices = nullptr;
                         UINT indexCount = call.rs.primCount * 3;
-                        if (call.rs.ib && SUCCEEDED(call.rs.ib->Lock(call.rs.startIndex * sizeof(WORD),
-                                                    indexCount * sizeof(WORD),
-                                                    &srcIndices, D3DLOCK_READONLY))) {
-                            const WORD* srcIdx = static_cast<const WORD*>(srcIndices);
-                            for (UINT idx = 0; idx < indexCount; idx++) {
-                                // Rebase: subtract original minIndex to normalize to 0, then add merged buffer offset
-                                ibDst[idx] = (DWORD)(srcIdx[idx] - call.rs.minIndex) + localVertOffset;
+                        void* srcIndicesRaw = nullptr;
+
+                        if (call.rs.ib && SUCCEEDED(call.rs.ib->Lock(call.rs.startIndex * idxSize,
+                                                    indexCount * idxSize,
+                                                    &srcIndicesRaw, D3DLOCK_READONLY))) {
+
+                            UINT realMaxIdx = 0;
+                            UINT realMinIdx = 0xFFFFFFFF;
+
+                            if (is32Bit) {
+                                const DWORD* srcIdx32 = static_cast<const DWORD*>(srcIndicesRaw);
+
+                                // Find the absolute maximum index used
+                                for (UINT idx = 0; idx < indexCount; idx++) {
+                                    if (srcIdx32[idx] > realMaxIdx) realMaxIdx = srcIdx32[idx];
+                                }
+
+                                // Since we only have 'vertCount' vertices, the min index CANNOT be
+                                // less than (Max - vertCount). This ignores 0-padding/degenerates!
+                                UINT absoluteFloor = (realMaxIdx > call.rs.vertCount) ? (realMaxIdx - call.rs.vertCount) : 0;
+
+                                for (UINT idx = 0; idx < indexCount; idx++) {
+                                    if (srcIdx32[idx] >= absoluteFloor && srcIdx32[idx] < realMinIdx) {
+                                        realMinIdx = srcIdx32[idx];
+                                    }
+                                }
+
+                                // Rebase indices
+                                for (UINT idx = 0; idx < indexCount; idx++) {
+                                    ibDst[idx] = (srcIdx32[idx] - realMinIdx) + localVertOffset;
+                                }
+                            } else {
+                                const WORD* srcIdx16 = static_cast<const WORD*>(srcIndicesRaw);
+
+                                // Find the absolute maximum index used
+                                for (UINT idx = 0; idx < indexCount; idx++) {
+                                    if (srcIdx16[idx] > realMaxIdx) realMaxIdx = srcIdx16[idx];
+                                }
+
+                                // Since we only have 'vertCount' vertices, the min index CANNOT be
+                                // less than (Max - vertCount). This ignores 0-padding/degenerates!
+                                UINT absoluteFloor = (realMaxIdx > call.rs.vertCount) ? (realMaxIdx - call.rs.vertCount) : 0;
+
+                                for (UINT idx = 0; idx < indexCount; idx++) {
+                                    if (srcIdx16[idx] >= absoluteFloor && srcIdx16[idx] < realMinIdx) {
+                                        realMinIdx = srcIdx16[idx];
+                                    }
+                                }
+
+                                // Rebase indices
+                                for (UINT idx = 0; idx < indexCount; idx++) {
+                                    ibDst[idx] = (DWORD)(srcIdx16[idx] - realMinIdx) + localVertOffset;
+                                }
                             }
+
                             ibDst += indexCount;
                             call.rs.ib->Unlock();
+
+                            // Now copy vertices starting at the REAL minimum index
+                            // The real start in the original buffer is baseIndex + realMinIdx
+                            UINT srcVertexStart = call.rs.baseIndex + realMinIdx;
+                            UINT srcLockOffset = call.rs.vbOffset + (srcVertexStart * srcStride);
+
+                            void* srcVerts = nullptr;
+                            if (call.rs.vb && SUCCEEDED(call.rs.vb->Lock(srcLockOffset,
+                                                        call.rs.vertCount * srcStride,
+                                                        &srcVerts, D3DLOCK_READONLY))) {
+                                const BYTE* src = static_cast<const BYTE*>(srcVerts);
+                                for (UINT v = 0; v < call.rs.vertCount; v++) {
+                                    // Copy original vertex data (use min of source and batch stride for safety)
+                                    UINT copySize = std::min(srcStride, batchStride);
+                                    memcpy(vbDst, src, copySize);
+                                    // Append drawIndex as float at batch stride offset
+                                    float* drawIdxPtr = reinterpret_cast<float*>(vbDst + batchStride);
+                                    *drawIdxPtr = (float)drawIndex;
+                                    // Debug: log first vertex of first call
+                                    if (!loggedMergedDebug && v == 0 && i == 0) {
+                                        LOG::logline("  DrawIndex write: drawIndex=%d at offset %d, expandedStride=%d, wrote %.1f",
+                                            drawIndex, batchStride, batchExpandedStride, *drawIdxPtr);
+                                    }
+                                    vbDst += batchExpandedStride;
+                                    src += srcStride;
+                                }
+                                call.rs.vb->Unlock();
+                            }
                         }
 
                         localVertOffset += call.rs.vertCount;
