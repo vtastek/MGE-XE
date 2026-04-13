@@ -154,6 +154,9 @@ public:
     // Force lightMode 3 for all lit Opaque/Terrain (debug)
     static bool GetForceLightMode3();
 
+    // Shader debug visualization mode (0=off, 1-15=debug views)
+    static int GetShaderDebugMode();
+
     // Hi-Z visualization interface
     static void RenderHiZInterface();
     static void ToggleHiZInterface();
@@ -309,6 +312,7 @@ private:
     static bool highlightStatelessBatch; // Highlight batched draws with color
     static bool dumpStatelessBatchDetail; // One-shot flag for detailed batch dump
     static bool forceLightMode3;       // Force lightMode 3 for all lit Opaque/Terrain
+    static int shaderDebugMode;        // Shader debug visualization (0=off, 1-15=debug views)
 
     // Debug stats (updated each frame)
     static int debugRecordedCalls;

@@ -1230,6 +1230,7 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             resolveAndCache(hlslShader.vsConstantTable, "windVec", hlslShader.regWindVec);
             resolveAndCache(hlslShader.vsConstantTable, "time", hlslShader.regTime);
             resolveAndCache(hlslShader.psConstantTable, "normres", hlslShader.regNormres);
+            resolveAndCache(hlslShader.psConstantTable, "debugMode", hlslShader.regDebugMode);
             hlslShader.dynamicConstsResolved = true;
         }
 
@@ -1352,6 +1353,10 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         if (hlslShader.regPCFSlopeBias.reg != REG_INVALID) {
             float v[4] = { ImGuiManager::GetPCFSlopeBias(), 0, 0, 0 };
             cmdBuf->recordSetPSConstantF(hlslShader.regPCFSlopeBias.reg, v, 1);
+        }
+        if (hlslShader.regDebugMode.reg != REG_INVALID) {
+            float v[4] = { (float)ImGuiManager::GetShaderDebugMode(), 0, 0, 0 };
+            cmdBuf->recordSetPSConstantF(hlslShader.regDebugMode.reg, v, 1);
         }
         cmdBuf->recordSetPSConstantF(hlslShader.regFogColNear.reg != REG_INVALID ? hlslShader.regFogColNear.reg : 255, fogColor, 1);
 
@@ -1518,6 +1523,8 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         if (hPCFBias2) hlslShader.psConstantTable->SetFloat(device, hPCFBias2, ImGuiManager::GetPCFBias2());
         D3DXHANDLE hPCFSlopeBias = hlslShader.psConstantTable->GetConstantByName(NULL, "PCF_slopeBias");
         if (hPCFSlopeBias) hlslShader.psConstantTable->SetFloat(device, hPCFSlopeBias, ImGuiManager::GetPCFSlopeBias());
+        D3DXHANDLE hDebugMode = hlslShader.psConstantTable->GetConstantByName(NULL, "debugMode");
+        if (hDebugMode) hlslShader.psConstantTable->SetInt(device, hDebugMode, ImGuiManager::GetShaderDebugMode());
 
         D3DXHANDLE hFogColNear = hlslShader.psConstantTable->GetConstantByName(NULL, "fogColNear");
         if (hFogColNear) hlslShader.psConstantTable->SetVector(device, hFogColNear, (D3DXVECTOR4*)fogColor);
@@ -2006,7 +2013,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
         TextureSuffix::getBindingState().reset();
 
         UINT totalDraws = (UINT)fb.drawDataStaging.size();
-        const UINT DRAW_DATA_WIDTH = 8;  // 8 texels per draw (128 bytes / 16 bytes per texel)
+        const UINT DRAW_DATA_WIDTH = 16;  // 16 texels per draw (256 bytes / 16 bytes per texel)
 
         // Create or resize draw data texture as needed
         if (!fb.texDrawData || fb.texDrawDataHeight < totalDraws) {
@@ -2048,7 +2055,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                         fb.drawDataStaging[stagingIdx].lightParams[0] = (float)li.lightCount;
                         fb.drawDataStaging[stagingIdx].lightParams[1] = perObjectTexelSize;
                         fb.drawDataStaging[stagingIdx].lightParams[2] = (float)li.texelOffset;
-                        fb.drawDataStaging[stagingIdx].lightParams[3] = 0.0f;
+                        // lightParams[3] = vertexMaterial, already set in hiz_culling.cpp - don't overwrite
 
                         if (!loggedLightFill && logCount < 5 && li.lightCount > 0) {
                             LOG::logline("MergedBatch lightFill: stagingIdx=%d, callIdx=%d, lightCount=%d, texelOffset=%d, texelSize=%.6f",
@@ -2488,8 +2495,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     device->SetVertexShaderConstantF(0, (float*)&projT, 4);   // proj at c0
 
                     // Set draw data texture params: {1/width, 1/height, 0, 0}
-                    // DRAW_DATA_WIDTH = 8 (8 texels per draw)
-                    float drawDataParams[4] = { 1.0f / 8.0f, 1.0f / fb.texDrawDataHeight, 0.0f, 0.0f };
+                    // DRAW_DATA_WIDTH = 16 (16 texels per draw)
+                    float drawDataParams[4] = { 1.0f / 16.0f, 1.0f / fb.texDrawDataHeight, 0.0f, 0.0f };
                     device->SetVertexShaderConstantF(70, drawDataParams, 1);  // VS: c70
                     device->SetPixelShaderConstantF(20, drawDataParams, 1);   // PS: c20
 
@@ -2538,6 +2545,11 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     if (hlslShader.regLightSceneAmbient.reg != REG_INVALID) {
                         float v[4] = { sceneAmbient.r, sceneAmbient.g, sceneAmbient.b, 0 };
                         device->SetPixelShaderConstantF(hlslShader.regLightSceneAmbient.reg, v, 1);
+                    }
+                    // Set debug mode for shader visualization (hardcoded c22 - batch shaders skip dynamic resolution)
+                    {
+                        float v[4] = { (float)ImGuiManager::GetShaderDebugMode(), 0, 0, 0 };
+                        device->SetPixelShaderConstantF(22, v, 1);
                     }
 
                     // Set shadow matrices for stateless batch mode

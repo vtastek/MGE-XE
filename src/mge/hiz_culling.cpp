@@ -972,15 +972,38 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
                 data.ambient[2] = call.frs.material.ambient.b;
                 data.ambient[3] = call.frs.material.ambient.a;
 
+                // Store normres (parameter texture resolution) in dedicated texel
+                float normresX = 512.0f, normresY = 512.0f;  // Default fallback
+                if (call.sk.hasParamH && call.rs.texture) {
+                    D3DSURFACE_DESC desc;
+                    if (SUCCEEDED(call.rs.texture->GetLevelDesc(0, &desc))) {
+                        normresX = (float)desc.Width;
+                        normresY = (float)desc.Height;
+                    }
+                }
+                data.normres[0] = normresX;
+                data.normres[1] = normresY;
+                data.normres[2] = 0.0f;
+                data.normres[3] = 0.0f;
+
+                // Zero out reserved texels
+                memset(data.reserved1, 0, sizeof(data.reserved1));
+                memset(data.reserved2, 0, sizeof(data.reserved2));
+                memset(data.reserved3, 0, sizeof(data.reserved3));
+                memset(data.reserved4, 0, sizeof(data.reserved4));
+                memset(data.reserved5, 0, sizeof(data.reserved5));
+                memset(data.reserved6, 0, sizeof(data.reserved6));
+                memset(data.reserved7, 0, sizeof(data.reserved7));
+
                 data.emissive[0] = call.frs.material.emissive.r;
                 data.emissive[1] = call.frs.material.emissive.g;
                 data.emissive[2] = call.frs.material.emissive.b;
                 data.emissive[3] = (float)call.rs.alphaRef / 255.0f;
 
-                data.lightParams[0] = 0.0f;
-                data.lightParams[1] = 0.0f;
-                data.lightParams[2] = 0.0f;
-                data.lightParams[3] = 0.0f;
+                data.lightParams[0] = 0.0f;  // Will be filled with lightCount later
+                data.lightParams[1] = 0.0f;  // Will be filled with texelSize later
+                data.lightParams[2] = 0.0f;  // Will be filled with texelOffset later
+                data.lightParams[3] = (float)call.sk.vertexMaterial;  // Material mode (1/2/3)
 
                 // Full 4th column of worldView for robust w computation
                 data.flags[0] = wv._14;
@@ -1011,14 +1034,52 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
 
     // Detailed logging on button press
     bool dumpDetail = ImGuiManager::GetAndClearDumpStatelessBatch();
-    if (dumpDetail && !fb.mergedBatches.empty()) {
+    if (dumpDetail) {
         LOG::logline("=== MergedBatch Breakdown ===");
         int batchIdx = 0;
         for (const auto& mb : fb.mergedBatches) {
-            LOG::logline("Batch %d: %d draws, tex=%p, verts=%d, fvf=0x%X",
-                batchIdx++, (int)mb.callIndices.size(), mb.key.texture, mb.totalVertices, mb.key.fvf);
+            LOG::logline("Batch %d: %d draws, tex=%p, vb=%p, verts=%d, fvf=0x%X, stride=%d",
+                batchIdx++, (int)mb.callIndices.size(), mb.key.texture, mb.key.vb,
+                mb.totalVertices, mb.key.fvf, mb.key.stride);
         }
         LOG::logline("Singletons (not batched): %d", (int)fb.singletonCallIndices.size());
+
+        // Analyze why singletons didn't batch - group by texture to find near-misses
+        std::unordered_map<IDirect3DTexture9*, std::vector<size_t>> textureSingletons;
+        for (size_t idx : fb.singletonCallIndices) {
+            if (idx < calls.size()) {
+                textureSingletons[calls[idx].rs.texture].push_back(idx);
+            }
+        }
+
+        // Log textures with multiple singletons (could have batched if VB/state matched)
+        int nearMissCount = 0;
+        for (const auto& ts : textureSingletons) {
+            if (ts.second.size() >= 2) {
+                nearMissCount++;
+                if (nearMissCount <= 5) {  // Limit output
+                    LOG::logline("Near-miss tex=%p: %d draws with same texture but different keys:",
+                        ts.first, (int)ts.second.size());
+                    for (size_t i = 0; i < std::min(ts.second.size(), (size_t)3); i++) {
+                        size_t idx = ts.second[i];
+                        const auto& call = calls[idx];
+                        LOG::logline("  [%d] vb=%p fvf=0x%X stride=%d lit=%d blend=0x%X cull=%d",
+                            (int)idx, call.rs.vb, call.rs.fvf, call.rs.vbStride,
+                            call.rs.useLighting ? 1 : 0,
+                            (call.expectedState.captured ? call.expectedState.alphaBlendEnable : 0) |
+                            ((call.expectedState.captured ? call.expectedState.srcBlend : 0) << 4) |
+                            ((call.expectedState.captured ? call.expectedState.destBlend : 0) << 8),
+                            call.expectedState.captured ? call.expectedState.cullMode : D3DCULL_CW);
+                    }
+                }
+            }
+        }
+        if (nearMissCount > 5) {
+            LOG::logline("... and %d more near-miss textures", nearMissCount - 5);
+        }
+        if (nearMissCount > 0) {
+            LOG::logline("Near-misses: %d textures have 2+ draws that could batch if VB/state matched", nearMissCount);
+        }
     }
 }
 

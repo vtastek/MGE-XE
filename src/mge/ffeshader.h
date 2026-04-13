@@ -176,11 +176,19 @@ struct StatelessDrawData {
     float world2[4];       // Texel 2: WorldView matrix column 2
     float diffuse[4];      // Texel 3: Material diffuse RGBA
     float ambient[4];      // Texel 4: Material ambient RGBA
-    float emissive[4];     // Texel 5: Emissive RGB, alphaRef in w
-    float lightParams[4];  // Texel 6: {pointLightCount, lightTexelOffset, texelSize, 0}
-    float flags[4];        // Texel 7: {vertexMaterial, hasVCol, wv_34, wv_44}
+    float emissive[4];     // Texel 5: Emissive RGB, alphaRef in W
+    float lightParams[4];  // Texel 6: {pointLightCount, texelSize, texelOffset, vertexMaterial}
+    float flags[4];        // Texel 7: WorldView matrix 4th column {wv._14, wv._24, wv._34, wv._44}
+    float normres[4];      // Texel 8: {normres.x, normres.y, 0, 0} - parameter texture resolution
+    float reserved1[4];    // Texel 9: Reserved for future use
+    float reserved2[4];    // Texel 10: Reserved for future use
+    float reserved3[4];    // Texel 11: Reserved for future use
+    float reserved4[4];    // Texel 12: Reserved for future use
+    float reserved5[4];    // Texel 13: Reserved for future use
+    float reserved6[4];    // Texel 14: Reserved for future use
+    float reserved7[4];    // Texel 15: Reserved for future use
 };
-static_assert(sizeof(StatelessDrawData) == 128, "StatelessDrawData must be 128 bytes (8 texels)");
+static_assert(sizeof(StatelessDrawData) == 256, "StatelessDrawData must be 256 bytes (16 texels)");
 
 // Simplified batch key: geometry hash + render state
 // Uses geometry content hash instead of VB/IB pointers to batch identical meshes
@@ -599,6 +607,7 @@ private:
         ConstReg regPCFPenumbraScale, regPCFMinPenumbra, regPCFMaxPenumbra;
         ConstReg regPCFBias, regPCFBias2, regPCFSlopeBias;
         ConstReg regWindVec, regTime, regNormres;
+        ConstReg regDebugMode;  // Shader debug visualization mode (0=off, 1-15=debug views)
         bool dynamicConstsResolved;
 
         // Suffix texture support

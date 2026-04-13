@@ -91,8 +91,11 @@ sampler sampDrawData : register(s6) = sampler_state {
     addressu = clamp;
     addressv = clamp;
 };
-float4 drawDataParams : register(c20);  // {1/width=0.125, 1/height, 0, 0}
+float4 drawDataParams : register(c20);  // {1/width=0.0625 for 16-wide, 1/height, 0, 0}
 #endif
+
+// Debug visualization mode (0=off, 1-15=various debug views)
+int debugMode : register(c22);
 
 //------------------------------------------------------------
 // Vertex Output (matches VS_OUTPUT from vertex shader)
@@ -129,7 +132,7 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 #ifdef USE_STATELESS_BATCH
 	// Sample material and light params from draw data texture (overrides uniform values)
 	float drawV = (input.drawIndex + 0.5) * drawDataParams.y;
-	float texelW = drawDataParams.x;  // 0.125 for 8-wide texture
+	float texelW = drawDataParams.x;  // 0.0625 for 16-wide texture
 
 	// Texels 3,4,5 are diffuse, ambient, emissive
 	// Use tex2Dlod with mip 0 to force point sampling and ignore PS derivatives
@@ -196,12 +199,18 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 		#endif
 
 		// Calculate normal from height gradient in green channel
-		
+
 		float deriv = 1.5;
 		// if(parallaxUV.x > 0.5)
 			// deriv = 2.0;
-		
+
+#ifdef USE_STATELESS_BATCH
+		// Sample normres from texel 8 of draw data texture
+		float2 useNormres = tex2Dlod(sampDrawData, float4(8.5 * texelW, drawV, 0, 0)).xy;
+		float2 texel = 1.0 / max(useNormres, 1.0);
+#else
 		float2 texel = 1.0 / normres;
+#endif
 		float hL = tex2D(sampTex2, parallaxUV + float2(-texel.x * deriv, 0)).g; // Green = height
 		float hR = tex2D(sampTex2, parallaxUV + float2(texel.x * deriv, 0)).g;
 		float hD = tex2D(sampTex2, parallaxUV + float2(0, -texel.y * deriv)).g;
@@ -413,25 +422,31 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 #endif
 
 
-	// PBR material calculation following pbr.hlsl pattern
+	// PBR material calculation following PPL pattern (XE FixedFuncEmu.fx)
+	// d = diffuseLight, a = ambient
 	float4 diffuse;
+#ifdef USE_STATELESS_BATCH
+	// Read materialMode from draw data texture (texel 6, lightParams.w = vertexMaterial)
+	int materialMode = (int)useLightParams.w;
+#else
 	int materialMode = (int)shadingMode.z;
+#endif
 	if (materialMode == 2) {
-		// Mode 2: Use vertex color for diffuse/ambient
+		// vertexMaterialDiffAmb: col.rgb * (d + a) + materialEmissive.rgb
 		#ifdef HAS_GRASS
 		float3 col = float3(1.0, 1.0, 1.0);
 		#else
 		float3 col = sqrt(input.color.rgb);
 		#endif
-		diffuse = float4(col * (diffuseLight + ambient) + useEmissive.rgb * useEmissive.rgb, input.color.a);
+		diffuse = float4(col * (diffuseLight + ambient) + useEmissive.rgb, input.color.a);
 	}
 	else if (materialMode == 3) {
-		// Mode 3: Use vertex color for emissive
-		diffuse = float4(useDiffuse.rgb * (diffuseLight + ambient) + input.color.rgb * input.color.rgb, useDiffuse.a);
+		// vertexMaterialEmissive: materialDiffuse.rgb * d + materialAmbient.rgb * a + col.rgb
+		diffuse = float4(useDiffuse.rgb * diffuseLight + useAmbient.rgb * ambient + input.color.rgb, useDiffuse.a);
 	}
 	else {
-		// Mode 1: Use material constants
-		diffuse = float4(useDiffuse.rgb * (diffuseLight + ambient) + useEmissive.rgb * useEmissive.rgb, useDiffuse.a);
+		// vertexMaterialNone (mode 1): materialDiffuse.rgb * d + materialAmbient.rgb * a + materialEmissive.rgb
+		diffuse = float4(useDiffuse.rgb * diffuseLight + useAmbient.rgb * ambient + useEmissive.rgb, useDiffuse.a);
 	}
 
 	// Apply correct PBR formula: (diffuse + ambient) * texture + specular
@@ -448,12 +463,110 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 	c.a = (c.a - 64.0 / 255.0) / max(fwidth(c.a), 0.0001) + 0.5;
 #endif
 
-	// shadows DEBUG
-	// #ifdef HAS_NORMAL
-	// c.rgb = 1.;
-	// #endif
-	// c.rgb = deb;  // DEBUG: Commented out to restore normal lighting 
-	
+	// Debug visualization modes (runtime toggleable via imgui)
+	if (debugMode > 0) {
+		float3 debugColor = float3(1, 0, 1); // Magenta = unknown mode
+
+		if (debugMode == 1) {
+			// Base texture RGB (albedo before lighting)
+			debugColor = texColor.rgb;
+		}
+		else if (debugMode == 2) {
+			// Normals (view-space mapped to 0-1)
+			debugColor = normalVS * 0.5 + 0.5;
+		}
+		else if (debugMode == 3) {
+			// Roughness
+			debugColor = roughness.xxx;
+		}
+		else if (debugMode == 4) {
+			// Metalness
+			debugColor = metalness.xxx;
+		}
+		else if (debugMode == 5) {
+			// Shadows
+			debugColor = shadows.xxx;
+		}
+		else if (debugMode == 6) {
+			// Sun diffuse contribution only
+			#ifndef NOLIT
+			debugColor = sunLR.diffuse * sunIntensity;
+			#else
+			debugColor = float3(0.1, 0.1, 0.1);
+			#endif
+		}
+		else if (debugMode == 7) {
+			// Point light diffuse only (total minus sun)
+			#ifndef NOLIT
+			debugColor = max(0, diffuseLight - sunLR.diffuse * sunIntensity);
+			#else
+			debugColor = float3(0, 0, 0);
+			#endif
+		}
+		else if (debugMode == 8) {
+			// Specular
+			#ifndef NOLIT
+			debugColor = specularLight;
+			#else
+			debugColor = float3(0, 0, 0);
+			#endif
+		}
+		else if (debugMode == 9) {
+			// Ambient term
+			debugColor = ambient;
+		}
+		else if (debugMode == 10) {
+			// UV coordinates (RG)
+			debugColor = float3(frac(parallaxUV), 0);
+		}
+		else if (debugMode == 11) {
+			// View direction (mapped)
+			debugColor = normalize(-input.viewPos) * 0.5 + 0.5;
+		}
+		else if (debugMode == 12) {
+			// Material mode indicator (1=R, 2=G, 3=B)
+			debugColor = float3(materialMode == 1, materialMode == 2, materialMode == 3);
+		}
+		else if (debugMode == 13) {
+			// Light mode indicator
+			#ifdef NOLIT
+			debugColor = float3(0.1, 0.1, 0.1); // Dark gray = NOLIT
+			#elif !defined(LIGHT_MODE) || LIGHT_MODE == 0
+			debugColor = float3(0.3, 0.3, 0.3); // Gray = mode 0 (sun only)
+			#elif LIGHT_MODE == 1
+			debugColor = float3(1, 0.5, 0); // Orange = mode 1 (1 point light)
+			#elif LIGHT_MODE == 2
+			debugColor = float3(1, 1, 0); // Yellow = mode 2 (few point lights)
+			#elif LIGHT_MODE == 3
+			debugColor = float3(1, 1, 1); // White = mode 3 (texture lights)
+			#endif
+		}
+		else if (debugMode == 14) {
+			// Batch mode (batched=green, unbatched=red)
+			#ifdef USE_STATELESS_BATCH
+			debugColor = float3(0, 1, 0); // Green = batched
+			#else
+			debugColor = float3(1, 0, 0); // Red = unbatched
+			#endif
+		}
+		else if (debugMode == 15) {
+			// Texture slots bound (encode as bits: R=detail, G=paramh, B=shadows)
+			float r = 0, g = 0, b = 0;
+			#ifdef HAS_DETAIL
+			r = 1;
+			#endif
+			#ifdef HAS_PARAMH
+			g = 1;
+			#endif
+			#ifdef HAS_SHADOWS
+			b = 1;
+			#endif
+			debugColor = float3(r, g, b);
+		}
+
+		c.rgb = debugColor;
+	}
+
 	// Apply fog --will enable when all rendering goes through HLSL with unified fogging.
 	//c.rgb = lerp(fogColNear, c.rgb , saturate(exp(-0.0002 * length(input.viewPos))));
 	return c;

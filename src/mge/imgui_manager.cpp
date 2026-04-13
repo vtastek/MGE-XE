@@ -28,6 +28,7 @@ bool ImGuiManager::enableStatelessBatch = false;
 bool ImGuiManager::highlightStatelessBatch = false;
 bool ImGuiManager::dumpStatelessBatchDetail = false;
 bool ImGuiManager::forceLightMode3 = false;
+int ImGuiManager::shaderDebugMode = 0;
 
 // Debug stats
 int ImGuiManager::debugRecordedCalls = 0;
@@ -421,6 +422,29 @@ void ImGuiManager::RenderDebugInterface() {
 
         ImGui::Checkbox("Disable Hi-Z Culling (terrain hole diagnosis)", &disableHiZCulling);
         ImGui::Checkbox("Force LightMode 3 (texture lights)", &forceLightMode3);
+
+        // Shader debug visualization mode
+        const char* debugModes[] = {
+            "0: Off",
+            "1: Albedo (base texture)",
+            "2: Normals (view-space)",
+            "3: Roughness",
+            "4: Metalness",
+            "5: Shadows",
+            "6: Sun Diffuse",
+            "7: Point Light Diffuse",
+            "8: Specular",
+            "9: Ambient",
+            "10: UV Coordinates",
+            "11: View Direction",
+            "12: Material Mode (R=1,G=2,B=3)",
+            "13: Light Mode (gray/orange/yellow/white)",
+            "14: Batch Mode (green=batched,red=not)",
+            "15: Texture Slots (R=detail,G=paramh,B=shadow)"
+        };
+        ImGui::Combo("Shader Debug View", &shaderDebugMode, debugModes, 16);
+        ImGui::SetItemTooltip("Override shader output to visualize internal values");
+
         ImGui::Checkbox("Enable Stateless Batching (experimental)", &enableStatelessBatch);
         if (enableStatelessBatch) {
             ImGui::Indent();
@@ -669,6 +693,7 @@ bool ImGuiManager::GetAndClearDumpStatelessBatch() {
     return val;
 }
 bool ImGuiManager::GetForceLightMode3() { return forceLightMode3; }
+int ImGuiManager::GetShaderDebugMode() { return shaderDebugMode; }
 
 void ImGuiManager::UpdateDebugStats(int recordedCalls, int renderedCalls, int culledCalls,
                                      int sceneLights, int recordMWSize, int immediateCount) {
