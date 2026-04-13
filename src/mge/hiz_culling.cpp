@@ -920,6 +920,7 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
 
         MergedBatchKey mkey;
         mkey.texture = call.rs.texture;
+        mkey.vb = call.rs.vb;  // Must match to read vertices from same buffer
         mkey.blendState = (uint16_t)((call.expectedState.captured ? call.expectedState.alphaBlendEnable : 0) |
                          ((call.expectedState.captured ? call.expectedState.srcBlend : 0) << 4) |
                          ((call.expectedState.captured ? call.expectedState.destBlend : 0) << 8));

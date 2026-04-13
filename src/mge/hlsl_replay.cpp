@@ -2207,8 +2207,13 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                         }
 
                         // Copy vertices with drawIndex appended
+                        // Calculate actual start of this object's vertices in the source VB
+                        // Morrowind vertices are at: vbOffset + (baseIndex + minIndex) * stride
+                        UINT srcVertexStart = call.rs.baseIndex + call.rs.minIndex;
+                        UINT srcLockOffset = call.rs.vbOffset + (srcVertexStart * srcStride);
+
                         void* srcVerts = nullptr;
-                        if (call.rs.vb && SUCCEEDED(call.rs.vb->Lock(call.rs.vbOffset,
+                        if (call.rs.vb && SUCCEEDED(call.rs.vb->Lock(srcLockOffset,
                                                     call.rs.vertCount * srcStride,
                                                     &srcVerts, D3DLOCK_READONLY))) {
                             const BYTE* src = static_cast<const BYTE*>(srcVerts);
@@ -2231,6 +2236,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                         }
 
                         // Copy indices with offset rebasing (source is 16-bit, dest is 32-bit)
+                        // Source indices are absolute offsets into shared VB (e.g., 10634, 10929)
+                        // We normalize by subtracting minIndex, then add our localVertOffset
                         void* srcIndices = nullptr;
                         UINT indexCount = call.rs.primCount * 3;
                         if (call.rs.ib && SUCCEEDED(call.rs.ib->Lock(call.rs.startIndex * sizeof(WORD),
@@ -2238,8 +2245,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                                                     &srcIndices, D3DLOCK_READONLY))) {
                             const WORD* srcIdx = static_cast<const WORD*>(srcIndices);
                             for (UINT idx = 0; idx < indexCount; idx++) {
-                                // Rebase index: add local vertex offset within this merged batch
-                                ibDst[idx] = (DWORD)srcIdx[idx] + localVertOffset;
+                                // Rebase: subtract original minIndex to normalize to 0, then add merged buffer offset
+                                ibDst[idx] = (DWORD)(srcIdx[idx] - call.rs.minIndex) + localVertOffset;
                             }
                             ibDst += indexCount;
                             call.rs.ib->Unlock();
