@@ -259,11 +259,10 @@ struct LocalMeshData {
     size_t localHash;               // Hash of centered geometry (position-independent)
 };
 
-// Key for merged batches: texture + renderState (bucket by texture, ignore geometry)
-// All singletons with same texture get merged into one mega-draw
+// Key for merged batches: texture + renderState + FVF (bucket by texture, ignore geometry)
+// All draws with same texture/state/FVF get merged into one mega-draw
 struct MergedBatchKey {
     IDirect3DTexture9* texture;
-    IDirect3DVertexBuffer9* vb;     // Source VB - must match to read from same buffer
     uint16_t blendState;
     uint8_t zState;
     uint8_t cullMode;
@@ -272,7 +271,7 @@ struct MergedBatchKey {
     UINT stride;                    // Vertex stride must match for merging
 
     bool operator==(const MergedBatchKey& o) const {
-        return texture == o.texture && vb == o.vb &&
+        return texture == o.texture &&
                blendState == o.blendState && zState == o.zState &&
                cullMode == o.cullMode && useLighting == o.useLighting &&
                fvf == o.fvf && stride == o.stride;
@@ -281,7 +280,6 @@ struct MergedBatchKey {
     struct Hasher {
         size_t operator()(const MergedBatchKey& k) const {
             size_t h = reinterpret_cast<size_t>(k.texture);
-            h ^= reinterpret_cast<size_t>(k.vb) + 0x9e3779b9 + (h << 6) + (h >> 2);
             h ^= (k.blendState | (k.zState << 16) | (k.cullMode << 24)) + 0x9e3779b9 + (h << 6) + (h >> 2);
             h ^= (k.fvf | ((size_t)k.useLighting << 28)) + 0x9e3779b9 + (h << 6) + (h >> 2);
             h ^= k.stride + 0x9e3779b9 + (h << 6) + (h >> 2);

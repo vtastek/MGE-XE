@@ -920,7 +920,6 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
 
         MergedBatchKey mkey;
         mkey.texture = call.rs.texture;
-        mkey.vb = call.rs.vb;  // Must match to read vertices from same buffer
         mkey.blendState = (uint16_t)((call.expectedState.captured ? call.expectedState.alphaBlendEnable : 0) |
                          ((call.expectedState.captured ? call.expectedState.srcBlend : 0) << 4) |
                          ((call.expectedState.captured ? call.expectedState.destBlend : 0) << 8));
@@ -1036,49 +1035,79 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
     bool dumpDetail = ImGuiManager::GetAndClearDumpStatelessBatch();
     if (dumpDetail) {
         LOG::logline("=== MergedBatch Breakdown ===");
+        LOG::logline("Total recorded calls: %d", (int)calls.size());
+
+        // Count calls by category
+        int batchedCount = 0;
+        for (const auto& mb : fb.mergedBatches) {
+            batchedCount += (int)mb.callIndices.size();
+        }
+
         int batchIdx = 0;
         for (const auto& mb : fb.mergedBatches) {
-            LOG::logline("Batch %d: %d draws, tex=%p, vb=%p, verts=%d, fvf=0x%X, stride=%d",
-                batchIdx++, (int)mb.callIndices.size(), mb.key.texture, mb.key.vb,
+            LOG::logline("Batch %d: %d draws, tex=%p, verts=%d, fvf=0x%X, stride=%d",
+                batchIdx++, (int)mb.callIndices.size(), mb.key.texture,
                 mb.totalVertices, mb.key.fvf, mb.key.stride);
         }
-        LOG::logline("Singletons (not batched): %d", (int)fb.singletonCallIndices.size());
 
-        // Analyze why singletons didn't batch - group by texture to find near-misses
-        std::unordered_map<IDirect3DTexture9*, std::vector<size_t>> textureSingletons;
-        for (size_t idx : fb.singletonCallIndices) {
-            if (idx < calls.size()) {
-                textureSingletons[calls[idx].rs.texture].push_back(idx);
+        // Analyze ALL calls to show why they weren't batched
+        int notOpaqueTerrain = 0, culled = 0, skinning = 0, grass = 0, vertBlend = 0;
+        std::unordered_map<IDirect3DTexture9*, std::vector<size_t>> unbatchedByTexture;
+
+        // Track which calls are in batches
+        std::unordered_set<size_t> batchedIndices;
+        for (const auto& mb : fb.mergedBatches) {
+            for (size_t idx : mb.callIndices) {
+                batchedIndices.insert(idx);
             }
         }
 
-        // Log textures with multiple singletons (could have batched if VB/state matched)
-        int nearMissCount = 0;
-        for (const auto& ts : textureSingletons) {
-            if (ts.second.size() >= 2) {
-                nearMissCount++;
-                if (nearMissCount <= 5) {  // Limit output
-                    LOG::logline("Near-miss tex=%p: %d draws with same texture but different keys:",
-                        ts.first, (int)ts.second.size());
-                    for (size_t i = 0; i < std::min(ts.second.size(), (size_t)3); i++) {
-                        size_t idx = ts.second[i];
-                        const auto& call = calls[idx];
-                        LOG::logline("  [%d] vb=%p fvf=0x%X stride=%d lit=%d blend=0x%X cull=%d",
-                            (int)idx, call.rs.vb, call.rs.fvf, call.rs.vbStride,
-                            call.rs.useLighting ? 1 : 0,
-                            (call.expectedState.captured ? call.expectedState.alphaBlendEnable : 0) |
-                            ((call.expectedState.captured ? call.expectedState.srcBlend : 0) << 4) |
-                            ((call.expectedState.captured ? call.expectedState.destBlend : 0) << 8),
-                            call.expectedState.captured ? call.expectedState.cullMode : D3DCULL_CW);
-                    }
+        for (size_t i = 0; i < calls.size(); i++) {
+            if (batchedIndices.count(i)) continue;  // Already batched
+
+            const auto& call = calls[i];
+
+            // Categorize why not batched
+            if (call.bin != RenderBin::Opaque && call.bin != RenderBin::Terrain) {
+                notOpaqueTerrain++;
+                continue;
+            }
+            if (!call.shouldRender) { culled++; continue; }
+            if (call.rs.vertexBlendState != 0) { vertBlend++; continue; }
+            if (call.sk.usesSkinning) { skinning++; continue; }
+            if (call.sk.hasGrass) { grass++; continue; }
+
+            // This is an unbatched Opaque/Terrain call - track by texture
+            unbatchedByTexture[call.rs.texture].push_back(i);
+        }
+
+        LOG::logline("Batched: %d, Singletons: %d", batchedCount, (int)fb.singletonCallIndices.size());
+        LOG::logline("Excluded: notOpaque/Terrain=%d culled=%d vertBlend=%d skinning=%d grass=%d",
+            notOpaqueTerrain, culled, vertBlend, skinning, grass);
+
+        // Show unbatched opaque/terrain draws grouped by texture
+        int unbatchedOpaqueCount = 0;
+        for (const auto& ut : unbatchedByTexture) {
+            unbatchedOpaqueCount += (int)ut.second.size();
+        }
+        LOG::logline("Unbatched Opaque/Terrain: %d draws across %d textures",
+            unbatchedOpaqueCount, (int)unbatchedByTexture.size());
+
+        // Log textures with multiple unbatched draws (near-misses)
+        int logged = 0;
+        for (const auto& ut : unbatchedByTexture) {
+            if (ut.second.size() >= 2 && logged < 10) {
+                LOG::logline("Tex %p: %d unbatched draws (could batch if same VB/state):",
+                    ut.first, (int)ut.second.size());
+                for (size_t j = 0; j < std::min(ut.second.size(), (size_t)5); j++) {
+                    size_t idx = ut.second[j];
+                    const auto& call = calls[idx];
+                    LOG::logline("  [%d] vb=%p fvf=0x%X stride=%d lit=%d vmat=%d",
+                        (int)idx, call.rs.vb, call.rs.fvf, call.rs.vbStride,
+                        call.rs.useLighting ? 1 : 0, call.sk.vertexMaterial);
                 }
+                logged++;
             }
-        }
-        if (nearMissCount > 5) {
-            LOG::logline("... and %d more near-miss textures", nearMissCount - 5);
-        }
-        if (nearMissCount > 0) {
-            LOG::logline("Near-misses: %d textures have 2+ draws that could batch if VB/state matched", nearMissCount);
         }
     }
 }
