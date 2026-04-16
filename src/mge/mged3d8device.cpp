@@ -2320,6 +2320,14 @@ void captureRenderState(D3DRENDERSTATETYPE a, DWORD b) {
 void captureFragmentRenderState(DWORD a, D3DTEXTURESTAGESTATETYPE b, DWORD c) {
     FragmentState::Stage* s = &frs.stage[a];
 
+    if (a < 8) {
+        if (b == D3DTSS_ADDRESSU) {
+            g_deviceState.samplerAddressU[a] = c;
+        } else if (b == D3DTSS_ADDRESSV) {
+            g_deviceState.samplerAddressV[a] = c;
+        }
+    }
+
     switch (b) {
     case D3DTSS_COLOROP:
         s->colorOp = (BYTE)c;

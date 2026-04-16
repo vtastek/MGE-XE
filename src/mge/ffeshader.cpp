@@ -3268,16 +3268,12 @@ FixedFunctionShader::HLSLRecordedCall::HLSLRecordedCall(const RenderedState* rs_
     deviceState = g_deviceState;
 
     // Capture sampler states for stages 0-1 (Morrowind-bound textures)
-    // Always read from device - same texture can have different sampler states at different draws
-    // Stages 2+ are HLSL-specific textures bound by MGE XE with known sampler states
-    trackDeviceRead("GetSamplerState(recording)");
+    // from proxy shadow state instead of per-draw GetSamplerState() calls.
+    // Stages 2+ are HLSL-specific textures bound by MGE XE with known sampler states.
     for (int stage = 0; stage < 2; ++stage) {
-        if (SUCCEEDED(device->GetSamplerState(stage, D3DSAMP_ADDRESSU, &samplerStates[stage].addressU)) &&
-            SUCCEEDED(device->GetSamplerState(stage, D3DSAMP_ADDRESSV, &samplerStates[stage].addressV))) {
-            samplerStates[stage].captured = true;
-        } else {
-            samplerStates[stage].captured = false;
-        }
+        samplerStates[stage].addressU = deviceState.samplerAddressU[stage];
+        samplerStates[stage].addressV = deviceState.samplerAddressV[stage];
+        samplerStates[stage].captured = true;
     }
     // Stages 2-7: mark as not captured (will use defaults during replay)
     for (int stage = 2; stage < 8; ++stage) {
@@ -3336,26 +3332,23 @@ FixedFunctionShader::HLSLRecordedCall::HLSLRecordedCall(const RenderedState* rs_
     }
 
     // Always capture device state for replay pre-set (prevents state leaks between calls)
-    device->GetRenderState(D3DRS_ALPHABLENDENABLE, &expectedState.alphaBlendEnable);
-    device->GetRenderState(D3DRS_ALPHATESTENABLE, &expectedState.alphaTestEnable);
-    device->GetRenderState(D3DRS_ZENABLE, &expectedState.zEnable);
-    device->GetRenderState(D3DRS_ZWRITEENABLE, &expectedState.zWriteEnable);
-    device->GetRenderState(D3DRS_FOGENABLE, &expectedState.fogEnable);
-    device->GetRenderState(D3DRS_CULLMODE, &expectedState.cullMode);
-    device->GetRenderState(D3DRS_SRCBLEND, &expectedState.srcBlend);
-    device->GetRenderState(D3DRS_DESTBLEND, &expectedState.destBlend);
+    expectedState.alphaBlendEnable = deviceState.alphaBlendEnable;
+    expectedState.alphaTestEnable = deviceState.alphaTestEnable;
+    expectedState.zEnable = deviceState.zEnable;
+    expectedState.zWriteEnable = deviceState.zWriteEnable;
+    expectedState.fogEnable = deviceState.fogEnable;
+    expectedState.cullMode = deviceState.cullMode;
+    expectedState.srcBlend = deviceState.srcBlend;
+    expectedState.destBlend = deviceState.destBlend;
     expectedState.captured = true;
 
     // Debug-only: capture additional state for validation
     if (ImGuiManager::GetStateLeakDetection()) {
-        DWORD dbias, sbias;
-        device->GetRenderState(D3DRS_DEPTHBIAS, &dbias);
-        device->GetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, &sbias);
-        expectedState.depthBias = *(float*)&dbias;
-        expectedState.slopeScaledDepthBias = *(float*)&sbias;
+        expectedState.depthBias = deviceState.depthBias;
+        expectedState.slopeScaledDepthBias = deviceState.slopeScaleDepthBias;
         for (int s = 0; s < 2; ++s) {
-            device->GetSamplerState(s, D3DSAMP_ADDRESSU, &expectedState.samplerAddressU[s]);
-            device->GetSamplerState(s, D3DSAMP_ADDRESSV, &expectedState.samplerAddressV[s]);
+            expectedState.samplerAddressU[s] = deviceState.samplerAddressU[s];
+            expectedState.samplerAddressV[s] = deviceState.samplerAddressV[s];
         }
         for (int s = 0; s < 8; ++s) {
             expectedState.textures[s] = nullptr;

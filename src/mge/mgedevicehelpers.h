@@ -256,6 +256,17 @@ struct DeviceStateSnapshot {
     DWORD ambient = 0;
     DWORD textureFactor = 0xFFFFFFFF;
 
+    // Sampler address modes used by MW texture stages. DX8 exposes these through
+    // SetTextureStageState, but HLSL replay needs the corresponding D3D9 values.
+    DWORD samplerAddressU[8] = {
+        D3DTADDRESS_WRAP, D3DTADDRESS_WRAP, D3DTADDRESS_WRAP, D3DTADDRESS_WRAP,
+        D3DTADDRESS_WRAP, D3DTADDRESS_WRAP, D3DTADDRESS_WRAP, D3DTADDRESS_WRAP
+    };
+    DWORD samplerAddressV[8] = {
+        D3DTADDRESS_WRAP, D3DTADDRESS_WRAP, D3DTADDRESS_WRAP, D3DTADDRESS_WRAP,
+        D3DTADDRESS_WRAP, D3DTADDRESS_WRAP, D3DTADDRESS_WRAP, D3DTADDRESS_WRAP
+    };
+
     // Clip planes
     DWORD clipPlaneEnable = 0;
 

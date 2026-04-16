@@ -348,6 +348,7 @@ struct CachedMergedCallLayout {
     MeshKey mesh;
     UINT vbOffset;
     UINT vbStride;
+    int recordMWIndex;
     MergedBatchKey batchKey;
     D3DXMATRIX worldTransform;
     D3DCOLORVALUE diffuseMaterial;
@@ -357,22 +358,28 @@ struct CachedMergedCallLayout {
     uint8_t vertexMaterial;
 
     bool operator==(const CachedMergedCallLayout& other) const {
-        return mesh == other.mesh &&
-               vbOffset == other.vbOffset &&
-               vbStride == other.vbStride &&
-               batchKey == other.batchKey &&
-               memcmp(&worldTransform, &other.worldTransform, sizeof(worldTransform)) == 0 &&
-               memcmp(&diffuseMaterial, &other.diffuseMaterial, sizeof(diffuseMaterial)) == 0 &&
-               memcmp(&ambientMaterial, &other.ambientMaterial, sizeof(ambientMaterial)) == 0 &&
-               memcmp(&emissiveMaterial, &other.emissiveMaterial, sizeof(emissiveMaterial)) == 0 &&
-               alphaRef == other.alphaRef &&
-               vertexMaterial == other.vertexMaterial;
+        bool sameGeometry = false;
+        if (recordMWIndex >= 0 && other.recordMWIndex >= 0) {
+            sameGeometry = recordMWIndex == other.recordMWIndex &&
+                           mesh.fvf == other.mesh.fvf &&
+                           mesh.vertCount == other.mesh.vertCount &&
+                           mesh.primCount == other.mesh.primCount &&
+                           vbStride == other.vbStride;
+        } else {
+            sameGeometry = mesh == other.mesh &&
+                           vbOffset == other.vbOffset &&
+                           vbStride == other.vbStride;
+        }
+
+        return sameGeometry &&
+               batchKey == other.batchKey;
     }
 };
 
 // Cache entry for one cell's merged batches
 struct CellBatchCache {
     void* cellPtr = nullptr;
+    size_t layoutHash = 0;
     bool valid = false;
     uint64_t lastUsedSerial = 0;
 
@@ -405,6 +412,7 @@ struct CellBatchCache {
         mergedLayout.clear();
         vbSizeBytes = 0;
         ibSizeIndices = 0;
+        layoutHash = 0;
         lastUsedSerial = 0;
         valid = false;
         cellPtr = nullptr;
@@ -1113,6 +1121,7 @@ public:
 
         // Cell batch cache references (set by buildStatelessBatches on cache hit)
         void* cellBatchCacheKey = nullptr;                // Cell pointer the merged batches belong to
+        size_t cellBatchLayoutHash = 0;                    // Layout hash within the cell batch cache
         bool useCachedMergedVB = false;              // True if using cached VB/IB
         IDirect3DVertexBuffer9* cachedMergedVB = nullptr;  // AddRef'd from cache for frame-safe use
         IDirect3DIndexBuffer9* cachedMergedIB = nullptr;   // AddRef'd from cache for frame-safe use
@@ -1144,6 +1153,7 @@ public:
             // Note: texDrawData, mergedVB, mergedIB are NOT released here - reused across frames
             // Reset cache references owned by this frame buffer.
             cellBatchCacheKey = nullptr;
+            cellBatchLayoutHash = 0;
             useCachedMergedVB = false;
             if (cachedMergedVB) {
                 cachedMergedVB->Release();
@@ -1268,7 +1278,7 @@ public:
     static void buildStatelessBatches(FrameBuffer& fb);  // Build merged batches (per-draw data in texture)
     static void invalidateCellBatchCache(void* cellPtr); // Invalidate cache for specific cell
     static void clearAllCellBatchCaches();               // Clear all cell batch caches
-    static void storeCellBatchCacheVB(void* cellPtr, const void* fbPtr, IDirect3DVertexBuffer9* vb, IDirect3DIndexBuffer9* ib,
+    static void storeCellBatchCacheVB(void* cellPtr, size_t layoutHash, IDirect3DVertexBuffer9* vb, IDirect3DIndexBuffer9* ib,
                                       const std::vector<CachedDrawInfo>& drawInfos);  // Store VB/IB in cache
 
     // Scene lifecycle for triple-buffered pipeline

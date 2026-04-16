@@ -331,7 +331,7 @@ void DistantLand::renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer*
         // executeHiZCulling: bbox, occluder rasterization, Hi-Z pyramid, visibility test (no D3D device)
         // applyVisibilityAndFilterRecordMW: filters recordMW using visibility results
         // Skip if async enabled - CpuPrepThread already did this work
-        if (!ImGuiManager::GetAsyncGpuThread()) {
+        if (!ImGuiManager::GetAsyncGpuThread() && isHLSLActive()) {
             FixedFunctionShader::executeHiZCulling(ctx->mwView, ctx->mwProj);
             FixedFunctionShader::applyVisibilityAndFilterRecordMW();
             // Build merged batches after culling (shouldRender flags now set)

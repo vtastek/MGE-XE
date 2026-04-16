@@ -27,6 +27,7 @@
 #include <climits>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 // File-scope statics used by replay functions (duplicated from ffeshader.cpp)
 // During replay, points to fb.shadowViewproj (recording-time matrices).
@@ -2294,6 +2295,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
 
         if (fb.useCachedMergedVB && fb.cachedMergedVB && fb.cachedMergedIB &&
             fb.cachedDrawInfos.size() == fb.mergedBatches.size()) {
+            MGE_ZoneScopedN("MergedBatch_UseCachedGeometry");
             useVB = fb.cachedMergedVB;
             useIB = fb.cachedMergedIB;
             drawInfos = &fb.cachedDrawInfos;
@@ -2302,60 +2304,89 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
             UINT totalMergedIndices = 0;
             UINT vbSizeNeeded = 0;
 
-            for (const auto& mb : fb.mergedBatches) {
-                totalMergedVerts += mb.totalVertices;
-                totalMergedIndices += mb.totalIndices;
-                if (!mb.callIndices.empty()) {
-                    const auto& call = recCalls[mb.callIndices[0]];
-                    UINT batchExpandedStride = call.rs.vbStride + sizeof(float);
-                    vbSizeNeeded += mb.totalVertices * batchExpandedStride;
-                    vbSizeNeeded += batchExpandedStride;
+            {
+                MGE_ZoneScopedN("MergedBatch_CountGeometry");
+                for (const auto& mb : fb.mergedBatches) {
+                    totalMergedVerts += mb.totalVertices;
+                    totalMergedIndices += mb.totalIndices;
+                    if (!mb.callIndices.empty()) {
+                        const auto& call = recCalls[mb.callIndices[0]];
+                        UINT batchExpandedStride = call.rs.vbStride + sizeof(float);
+                        vbSizeNeeded += mb.totalVertices * batchExpandedStride;
+                        vbSizeNeeded += batchExpandedStride;
+                    }
                 }
             }
             UINT ibSizeNeeded = totalMergedIndices * sizeof(DWORD);  // 32-bit indices for >64k verts
 
-            // Track last cell each frame buffer was built for to sever buffer reuse link on cell change
-            // This prevents D3DLOCK_DISCARD from corrupting cached VB/IB when geometry layout changes
-            static std::unordered_map<const void*, void*> s_fbLastBuiltCell;
-            bool cellChanged = false;
-            auto lastCellIt = s_fbLastBuiltCell.find(&fb);
-            if (lastCellIt != s_fbLastBuiltCell.end() && lastCellIt->second != fb.cellBatchCacheKey) {
-                cellChanged = true;
-                LOG::logline("MergedBatch: Cell changed for fb=%p, forcing VB/IB recreation (old=%p, new=%p)",
-                             &fb, lastCellIt->second, fb.cellBatchCacheKey);
-            }
-            s_fbLastBuiltCell[&fb] = fb.cellBatchCacheKey;
-
-            if (fb.mergedVB == nullptr || fb.mergedVBSize < vbSizeNeeded || cellChanged) {
-                if (fb.mergedVB) fb.mergedVB->Release();
-                UINT newSize = std::max(vbSizeNeeded, 1024u * 1024u);
-                if (SUCCEEDED(device->CreateVertexBuffer(newSize, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
-                                                         0, D3DPOOL_DEFAULT, &fb.mergedVB, nullptr))) {
-                    fb.mergedVBSize = newSize;
-                    LOG::logline("MergedBatch: Created dynamic VB, %d bytes", newSize);
+            // Track the last layout each frame buffer wrote into its dynamic VB/IB. Cached layouts
+            // keep AddRef'd references to those buffers, so a different layout needs a fresh object.
+            static std::unordered_map<const void*, std::pair<void*, size_t>> s_fbLastBuiltLayout;
+            bool layoutChanged = false;
+            {
+                MGE_ZoneScopedN("MergedBatch_CellCacheCheck");
+                auto lastLayoutIt = s_fbLastBuiltLayout.find(&fb);
+                if (lastLayoutIt != s_fbLastBuiltLayout.end() &&
+                    (lastLayoutIt->second.first != fb.cellBatchCacheKey ||
+                     lastLayoutIt->second.second != fb.cellBatchLayoutHash)) {
+                    layoutChanged = true;
+                    LOG::logline("MergedBatch: Layout changed for fb=%p, forcing VB/IB recreation (oldCell=%p oldHash=%Ix, newCell=%p newHash=%Ix)",
+                                 &fb, lastLayoutIt->second.first, lastLayoutIt->second.second,
+                                 fb.cellBatchCacheKey, fb.cellBatchLayoutHash);
                 }
+                s_fbLastBuiltLayout[&fb] = std::make_pair(fb.cellBatchCacheKey, fb.cellBatchLayoutHash);
             }
 
-            if (fb.mergedIB == nullptr || fb.mergedIBSize < totalMergedIndices || cellChanged) {
-                if (fb.mergedIB) fb.mergedIB->Release();
-                UINT newCount = std::max(totalMergedIndices, 256u * 1024u);
-                if (SUCCEEDED(device->CreateIndexBuffer(newCount * sizeof(DWORD), D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
-                                                        D3DFMT_INDEX32, D3DPOOL_DEFAULT, &fb.mergedIB, nullptr))) {
-                    fb.mergedIBSize = newCount;
-                    LOG::logline("MergedBatch: Created dynamic IB (32-bit), %d indices", newCount);
+            {
+                MGE_ZoneScopedN("MergedBatch_EnsureBuffers");
+                if (fb.mergedVB == nullptr || fb.mergedVBSize < vbSizeNeeded || layoutChanged) {
+                    if (fb.mergedVB) {
+                        fb.mergedVB->Release();
+                        fb.mergedVB = nullptr;
+                        fb.mergedVBSize = 0;
+                    }
+                    UINT newSize = std::max(vbSizeNeeded, 1024u * 1024u);
+                    if (SUCCEEDED(device->CreateVertexBuffer(newSize, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
+                                                             0, D3DPOOL_DEFAULT, &fb.mergedVB, nullptr))) {
+                        fb.mergedVBSize = newSize;
+                        LOG::logline("MergedBatch: Created dynamic VB, %d bytes", newSize);
+                    }
+                }
+
+                if (fb.mergedIB == nullptr || fb.mergedIBSize < totalMergedIndices || layoutChanged) {
+                    if (fb.mergedIB) {
+                        fb.mergedIB->Release();
+                        fb.mergedIB = nullptr;
+                        fb.mergedIBSize = 0;
+                    }
+                    UINT newCount = std::max(totalMergedIndices, 256u * 1024u);
+                    if (SUCCEEDED(device->CreateIndexBuffer(newCount * sizeof(DWORD), D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
+                                                            D3DFMT_INDEX32, D3DPOOL_DEFAULT, &fb.mergedIB, nullptr))) {
+                        fb.mergedIBSize = newCount;
+                        LOG::logline("MergedBatch: Created dynamic IB (32-bit), %d indices", newCount);
+                    }
                 }
             }
 
             if (fb.mergedVB && fb.mergedIB && vbSizeNeeded > 0 && ibSizeNeeded > 0) {
+                MGE_ZoneScopedN("MergedBatch_RebuildGeometry");
                 void* vbData = nullptr;
                 void* ibData = nullptr;
                 bool vbLocked = false;
                 bool ibLocked = false;
 
-                HRESULT hrVB = fb.mergedVB->Lock(0, vbSizeNeeded, &vbData, D3DLOCK_DISCARD);
+                HRESULT hrVB;
+                {
+                    MGE_ZoneScopedN("MergedBatch_LockTargetVB");
+                    hrVB = fb.mergedVB->Lock(0, vbSizeNeeded, &vbData, D3DLOCK_DISCARD);
+                }
                 if (SUCCEEDED(hrVB)) {
                     vbLocked = true;
-                    HRESULT hrIB = fb.mergedIB->Lock(0, ibSizeNeeded, &ibData, D3DLOCK_DISCARD);
+                    HRESULT hrIB;
+                    {
+                        MGE_ZoneScopedN("MergedBatch_LockTargetIB");
+                        hrIB = fb.mergedIB->Lock(0, ibSizeNeeded, &ibData, D3DLOCK_DISCARD);
+                    }
                     if (SUCCEEDED(hrIB)) {
                         ibLocked = true;
 
@@ -2367,136 +2398,142 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                         builtDrawInfos.reserve(fb.mergedBatches.size());
 
                         static bool loggedMergedDebug = false;
-                        for (const auto& mb : fb.mergedBatches) {
-                            if (mb.callIndices.empty()) continue;
+                        {
+                            MGE_ZoneScopedN("MergedBatch_CopySourceGeometry");
+                            for (const auto& mb : fb.mergedBatches) {
+                                if (mb.callIndices.empty()) continue;
 
-                            const auto& firstCall = recCalls[mb.callIndices[0]];
-                            UINT batchStride = firstCall.rs.vbStride;
-                            UINT batchExpandedStride = batchStride + sizeof(float);
+                                const auto& firstCall = recCalls[mb.callIndices[0]];
+                                UINT batchStride = firstCall.rs.vbStride;
+                                UINT batchExpandedStride = batchStride + sizeof(float);
 
-                            UINT remainder = vbByteOffset % batchExpandedStride;
-                            if (remainder != 0) {
-                                vbByteOffset += (batchExpandedStride - remainder);
-                            }
-
-                            BYTE* vbDst = vbBase + vbByteOffset;
-
-                            if (!loggedMergedDebug) {
-                                LOG::logline("MergedBatch DEBUG: calls=%d, batchStride=%d, expandedStride=%d, FVF=0x%X, drawDataOffset=%d",
-                                    (int)mb.callIndices.size(), batchStride, batchExpandedStride, mb.key.fvf, mb.drawDataOffset);
-                            }
-
-                            CachedDrawInfo info = {};
-                            info.vbByteOffset = vbByteOffset;
-                            info.ibStartIndex = ibOffset;
-                            info.expandedStride = batchExpandedStride;
-
-                            UINT localVertOffset = 0;
-
-                            for (size_t i = 0; i < mb.callIndices.size(); i++) {
-                                size_t callIdx = mb.callIndices[i];
-                                const auto& call = recCalls[callIdx];
-                                UINT drawIndex = mb.drawDataOffset + (UINT)i;
-                                UINT srcStride = call.rs.vbStride;
-
-                                if (!loggedMergedDebug && i < 3) {
-                                    LOG::logline("  Call %d: drawIndex=%d, srcStride=%d, vertCount=%d",
-                                        (int)i, drawIndex, srcStride, call.rs.vertCount);
+                                UINT remainder = vbByteOffset % batchExpandedStride;
+                                if (remainder != 0) {
+                                    vbByteOffset += (batchExpandedStride - remainder);
                                 }
 
-                                D3DINDEXBUFFER_DESC ibDesc = {};
-                                call.rs.ib->GetDesc(&ibDesc);
-                                bool is32Bit = (ibDesc.Format == D3DFMT_INDEX32);
-                                UINT idxSize = is32Bit ? 4 : 2;
+                                BYTE* vbDst = vbBase + vbByteOffset;
 
-                                UINT indexCount = call.rs.primCount * 3;
-                                void* srcIndicesRaw = nullptr;
+                                if (!loggedMergedDebug) {
+                                    LOG::logline("MergedBatch DEBUG: calls=%d, batchStride=%d, expandedStride=%d, FVF=0x%X, drawDataOffset=%d",
+                                        (int)mb.callIndices.size(), batchStride, batchExpandedStride, mb.key.fvf, mb.drawDataOffset);
+                                }
 
-                                if (call.rs.ib && SUCCEEDED(call.rs.ib->Lock(call.rs.startIndex * idxSize,
-                                                                            indexCount * idxSize,
-                                                                            &srcIndicesRaw, D3DLOCK_READONLY))) {
-                                    UINT realMaxIdx = 0;
-                                    UINT realMinIdx = 0xFFFFFFFF;
+                                CachedDrawInfo info = {};
+                                info.vbByteOffset = vbByteOffset;
+                                info.ibStartIndex = ibOffset;
+                                info.expandedStride = batchExpandedStride;
 
-                                    if (is32Bit) {
-                                        const DWORD* srcIdx32 = static_cast<const DWORD*>(srcIndicesRaw);
-                                        for (UINT idx = 0; idx < indexCount; idx++) {
-                                            if (srcIdx32[idx] > realMaxIdx) realMaxIdx = srcIdx32[idx];
-                                        }
+                                UINT localVertOffset = 0;
 
-                                        UINT absoluteFloor = (realMaxIdx > call.rs.vertCount) ? (realMaxIdx - call.rs.vertCount) : 0;
-                                        for (UINT idx = 0; idx < indexCount; idx++) {
-                                            if (srcIdx32[idx] >= absoluteFloor && srcIdx32[idx] < realMinIdx) {
-                                                realMinIdx = srcIdx32[idx];
+                                for (size_t i = 0; i < mb.callIndices.size(); i++) {
+                                    size_t callIdx = mb.callIndices[i];
+                                    const auto& call = recCalls[callIdx];
+                                    UINT drawIndex = mb.drawDataOffset + (UINT)i;
+                                    UINT srcStride = call.rs.vbStride;
+
+                                    if (!loggedMergedDebug && i < 3) {
+                                        LOG::logline("  Call %d: drawIndex=%d, srcStride=%d, vertCount=%d",
+                                            (int)i, drawIndex, srcStride, call.rs.vertCount);
+                                    }
+
+                                    D3DINDEXBUFFER_DESC ibDesc = {};
+                                    call.rs.ib->GetDesc(&ibDesc);
+                                    bool is32Bit = (ibDesc.Format == D3DFMT_INDEX32);
+                                    UINT idxSize = is32Bit ? 4 : 2;
+
+                                    UINT indexCount = call.rs.primCount * 3;
+                                    void* srcIndicesRaw = nullptr;
+
+                                    if (call.rs.ib && SUCCEEDED(call.rs.ib->Lock(call.rs.startIndex * idxSize,
+                                                                                indexCount * idxSize,
+                                                                                &srcIndicesRaw, D3DLOCK_READONLY))) {
+                                        UINT realMaxIdx = 0;
+                                        UINT realMinIdx = 0xFFFFFFFF;
+
+                                        if (is32Bit) {
+                                            const DWORD* srcIdx32 = static_cast<const DWORD*>(srcIndicesRaw);
+                                            for (UINT idx = 0; idx < indexCount; idx++) {
+                                                if (srcIdx32[idx] > realMaxIdx) realMaxIdx = srcIdx32[idx];
+                                            }
+
+                                            UINT absoluteFloor = (realMaxIdx > call.rs.vertCount) ? (realMaxIdx - call.rs.vertCount) : 0;
+                                            for (UINT idx = 0; idx < indexCount; idx++) {
+                                                if (srcIdx32[idx] >= absoluteFloor && srcIdx32[idx] < realMinIdx) {
+                                                    realMinIdx = srcIdx32[idx];
+                                                }
+                                            }
+
+                                            for (UINT idx = 0; idx < indexCount; idx++) {
+                                                ibDst[idx] = (srcIdx32[idx] - realMinIdx) + localVertOffset;
+                                            }
+                                        } else {
+                                            const WORD* srcIdx16 = static_cast<const WORD*>(srcIndicesRaw);
+                                            for (UINT idx = 0; idx < indexCount; idx++) {
+                                                if (srcIdx16[idx] > realMaxIdx) realMaxIdx = srcIdx16[idx];
+                                            }
+
+                                            UINT absoluteFloor = (realMaxIdx > call.rs.vertCount) ? (realMaxIdx - call.rs.vertCount) : 0;
+                                            for (UINT idx = 0; idx < indexCount; idx++) {
+                                                if (srcIdx16[idx] >= absoluteFloor && srcIdx16[idx] < realMinIdx) {
+                                                    realMinIdx = srcIdx16[idx];
+                                                }
+                                            }
+
+                                            for (UINT idx = 0; idx < indexCount; idx++) {
+                                                ibDst[idx] = (DWORD)(srcIdx16[idx] - realMinIdx) + localVertOffset;
                                             }
                                         }
 
-                                        for (UINT idx = 0; idx < indexCount; idx++) {
-                                            ibDst[idx] = (srcIdx32[idx] - realMinIdx) + localVertOffset;
-                                        }
-                                    } else {
-                                        const WORD* srcIdx16 = static_cast<const WORD*>(srcIndicesRaw);
-                                        for (UINT idx = 0; idx < indexCount; idx++) {
-                                            if (srcIdx16[idx] > realMaxIdx) realMaxIdx = srcIdx16[idx];
-                                        }
+                                        ibDst += indexCount;
+                                        call.rs.ib->Unlock();
 
-                                        UINT absoluteFloor = (realMaxIdx > call.rs.vertCount) ? (realMaxIdx - call.rs.vertCount) : 0;
-                                        for (UINT idx = 0; idx < indexCount; idx++) {
-                                            if (srcIdx16[idx] >= absoluteFloor && srcIdx16[idx] < realMinIdx) {
-                                                realMinIdx = srcIdx16[idx];
+                                        UINT srcVertexStart = call.rs.baseIndex + realMinIdx;
+                                        UINT srcLockOffset = call.rs.vbOffset + (srcVertexStart * srcStride);
+
+                                        void* srcVerts = nullptr;
+                                        if (call.rs.vb && SUCCEEDED(call.rs.vb->Lock(srcLockOffset,
+                                                                                    call.rs.vertCount * srcStride,
+                                                                                    &srcVerts, D3DLOCK_READONLY))) {
+                                            const BYTE* src = static_cast<const BYTE*>(srcVerts);
+                                            for (UINT v = 0; v < call.rs.vertCount; v++) {
+                                                UINT copySize = std::min(srcStride, batchStride);
+                                                memcpy(vbDst, src, copySize);
+                                                float* drawIdxPtr = reinterpret_cast<float*>(vbDst + batchStride);
+                                                *drawIdxPtr = (float)drawIndex;
+                                                if (!loggedMergedDebug && v == 0 && i == 0) {
+                                                    LOG::logline("  DrawIndex write: drawIndex=%d at offset %d, expandedStride=%d, wrote %.1f",
+                                                        drawIndex, batchStride, batchExpandedStride, *drawIdxPtr);
+                                                }
+                                                vbDst += batchExpandedStride;
+                                                src += srcStride;
                                             }
-                                        }
-
-                                        for (UINT idx = 0; idx < indexCount; idx++) {
-                                            ibDst[idx] = (DWORD)(srcIdx16[idx] - realMinIdx) + localVertOffset;
+                                            call.rs.vb->Unlock();
                                         }
                                     }
 
-                                    ibDst += indexCount;
-                                    call.rs.ib->Unlock();
-
-                                    UINT srcVertexStart = call.rs.baseIndex + realMinIdx;
-                                    UINT srcLockOffset = call.rs.vbOffset + (srcVertexStart * srcStride);
-
-                                    void* srcVerts = nullptr;
-                                    if (call.rs.vb && SUCCEEDED(call.rs.vb->Lock(srcLockOffset,
-                                                                                call.rs.vertCount * srcStride,
-                                                                                &srcVerts, D3DLOCK_READONLY))) {
-                                        const BYTE* src = static_cast<const BYTE*>(srcVerts);
-                                        for (UINT v = 0; v < call.rs.vertCount; v++) {
-                                            UINT copySize = std::min(srcStride, batchStride);
-                                            memcpy(vbDst, src, copySize);
-                                            float* drawIdxPtr = reinterpret_cast<float*>(vbDst + batchStride);
-                                            *drawIdxPtr = (float)drawIndex;
-                                            if (!loggedMergedDebug && v == 0 && i == 0) {
-                                                LOG::logline("  DrawIndex write: drawIndex=%d at offset %d, expandedStride=%d, wrote %.1f",
-                                                    drawIndex, batchStride, batchExpandedStride, *drawIdxPtr);
-                                            }
-                                            vbDst += batchExpandedStride;
-                                            src += srcStride;
-                                        }
-                                        call.rs.vb->Unlock();
-                                    }
+                                    localVertOffset += call.rs.vertCount;
+                                    info.vertCount += call.rs.vertCount;
+                                    info.primCount += call.rs.primCount;
+                                    vbByteOffset += call.rs.vertCount * batchExpandedStride;
+                                    ibOffset += indexCount;
                                 }
 
-                                localVertOffset += call.rs.vertCount;
-                                info.vertCount += call.rs.vertCount;
-                                info.primCount += call.rs.primCount;
-                                vbByteOffset += call.rs.vertCount * batchExpandedStride;
-                                ibOffset += indexCount;
+                                builtDrawInfos.push_back(info);
+                                loggedMergedDebug = true;
                             }
-
-                            builtDrawInfos.push_back(info);
-                            loggedMergedDebug = true;
                         }
                     }
                 }
 
-                if (ibLocked) {
-                    fb.mergedIB->Unlock();
-                }
-                if (vbLocked) {
-                    fb.mergedVB->Unlock();
+                {
+                    MGE_ZoneScopedN("MergedBatch_UnlockTargets");
+                    if (ibLocked) {
+                        fb.mergedIB->Unlock();
+                    }
+                    if (vbLocked) {
+                        fb.mergedVB->Unlock();
+                    }
                 }
 
                 if (ibLocked && vbLocked && builtDrawInfos.size() == fb.mergedBatches.size()) {
@@ -2504,7 +2541,10 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     useIB = fb.mergedIB;
                     drawInfos = &builtDrawInfos;
 
-                    FixedFunctionShader::storeCellBatchCacheVB(fb.cellBatchCacheKey, &fb, fb.mergedVB, fb.mergedIB, builtDrawInfos);
+                    {
+                        MGE_ZoneScopedN("MergedBatch_StoreCellCache");
+                        FixedFunctionShader::storeCellBatchCacheVB(fb.cellBatchCacheKey, fb.cellBatchLayoutHash, fb.mergedVB, fb.mergedIB, builtDrawInfos);
+                    }
 
                     static bool loggedMerge = false;
                     if (!loggedMerge) {
@@ -2517,9 +2557,12 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
         }
 
         if (useVB && useIB && drawInfos && drawInfos->size() == fb.mergedBatches.size()) {
-            for (const auto& mb : fb.mergedBatches) {
-                for (size_t callIdx : mb.callIndices) {
-                    mergedBatchIndices.insert(callIdx);
+            {
+                MGE_ZoneScopedN("MergedBatch_MarkMergedIndices");
+                for (const auto& mb : fb.mergedBatches) {
+                    for (size_t callIdx : mb.callIndices) {
+                        mergedBatchIndices.insert(callIdx);
+                    }
                 }
             }
 
@@ -2606,33 +2649,41 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     return decl;
                 };
 
-            // Draw each merged batch
-            device->SetIndices(useIB);
-
-            // Hoist loop-invariant calculations (Phase 2 optimization)
             D3DXMATRIX viewT, projT;
-            D3DXMatrixTranspose(&viewT, &fb.currentView);
-            D3DXMatrixTranspose(&projT, &fb.currentProj);
-
-            // Pre-calculate sun direction in view space
             D3DXVECTOR3 sunDirView;
-            D3DXVec3TransformNormal(&sunDirView, (const D3DXVECTOR3*)&DistantLand::s_staging.sunVec, &fb.currentView);
-
-            // Pre-calculate lighting values
-            RGBVECTOR sunDiffuse = DistantLand::s_staging.lightSunMult * DistantLand::s_staging.sunCol;
-            RGBVECTOR sceneAmbient = DistantLand::s_staging.lightAmbMult *
-                (DistantLand::s_staging.sunAmb + DistantLand::s_staging.ambCol);
-
-            // Pre-calculate shadow view-to-clip matrices
-            D3DXMATRIX viewInverse;
-            D3DXMatrixInverse(&viewInverse, nullptr, &fb.currentView);
             D3DXMATRIX shadowViewToClip[2];
-            shadowViewToClip[0] = viewInverse * fb.shadowViewproj[0];
-            shadowViewToClip[1] = viewInverse * fb.shadowViewproj[1];
+            RGBVECTOR sunDiffuse;
+            RGBVECTOR sceneAmbient;
+
+            {
+                MGE_ZoneScopedN("MergedBatch_DrawSetup");
+                // Draw each merged batch
+                device->SetIndices(useIB);
+
+                // Hoist loop-invariant calculations (Phase 2 optimization)
+                D3DXMatrixTranspose(&viewT, &fb.currentView);
+                D3DXMatrixTranspose(&projT, &fb.currentProj);
+
+                // Pre-calculate sun direction in view space
+                D3DXVec3TransformNormal(&sunDirView, (const D3DXVECTOR3*)&DistantLand::s_staging.sunVec, &fb.currentView);
+
+                // Pre-calculate lighting values
+                sunDiffuse = DistantLand::s_staging.lightSunMult * DistantLand::s_staging.sunCol;
+                sceneAmbient = DistantLand::s_staging.lightAmbMult *
+                    (DistantLand::s_staging.sunAmb + DistantLand::s_staging.ambCol);
+
+                // Pre-calculate shadow view-to-clip matrices
+                D3DXMATRIX viewInverse;
+                D3DXMatrixInverse(&viewInverse, nullptr, &fb.currentView);
+                shadowViewToClip[0] = viewInverse * fb.shadowViewproj[0];
+                shadowViewToClip[1] = viewInverse * fb.shadowViewproj[1];
+            }
 
             // Local shader cache to avoid SRW locks in loop
             std::unordered_map<ShaderKey, HLSLShader, ShaderKey::hasher> localShaderCache;
 
+            {
+                MGE_ZoneScopedN("MergedBatch_DrawLoop");
                 for (size_t bi = 0; bi < fb.mergedBatches.size(); bi++) {
                     const auto& mb = fb.mergedBatches[bi];
                     const auto& di = (*drawInfos)[bi];
@@ -2658,7 +2709,11 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     UINT originalStride = mb.key.stride;
 
                     // Get or create vertex declaration
-                    IDirect3DVertexDeclaration9* mergedDecl = getMergedDecl(mb.key.fvf, originalStride);
+                    IDirect3DVertexDeclaration9* mergedDecl = nullptr;
+                    {
+                        MGE_ZoneScopedN("MergedBatch_GetDecl");
+                        mergedDecl = getMergedDecl(mb.key.fvf, originalStride);
+                    }
                     if (!mergedDecl) continue;
 
                     // Build shader key (same as stateless batch)
@@ -2674,17 +2729,20 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
 
                     // Look up shader variant - check local cache first to avoid SRW lock
                     HLSLShader hlslShader = {};
-                    auto localIt = localShaderCache.find(sk);
-                    if (localIt != localShaderCache.end()) {
-                        hlslShader = localIt->second;
-                    } else {
-                        AcquireSRWLockShared(&hlslCacheLock);
-                        auto iShader = cacheHLSLShaders.find(sk);
-                        if (iShader != cacheHLSLShaders.end()) {
-                            hlslShader = iShader->second;
-                            localShaderCache[sk] = hlslShader;
+                    {
+                        MGE_ZoneScopedN("MergedBatch_ShaderLookup");
+                        auto localIt = localShaderCache.find(sk);
+                        if (localIt != localShaderCache.end()) {
+                            hlslShader = localIt->second;
+                        } else {
+                            AcquireSRWLockShared(&hlslCacheLock);
+                            auto iShader = cacheHLSLShaders.find(sk);
+                            if (iShader != cacheHLSLShaders.end()) {
+                                hlslShader = iShader->second;
+                                localShaderCache[sk] = hlslShader;
+                            }
+                            ReleaseSRWLockShared(&hlslCacheLock);
                         }
-                        ReleaseSRWLockShared(&hlslCacheLock);
                     }
 
                     // If shader not found, queue compilation and skip this batch
@@ -2693,95 +2751,114 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                         continue;
                     }
 
-                    // Bind shaders
-                    device->SetVertexShader(hlslShader.vertexShader);
-                    device->SetPixelShader(hlslShader.pixelShader);
-
-                    // Set view/proj matrices using hoisted transposes
-                    device->SetVertexShaderConstantF(12, (float*)&viewT, 4);  // view at c12
-                    device->SetVertexShaderConstantF(0, (float*)&projT, 4);   // proj at c0
-
-                    // Set draw data texture params: {1/width, 1/height, 0, 0}
-                    // DRAW_DATA_WIDTH = 16 (16 texels per draw)
-                    float drawDataParams[4] = { 1.0f / 16.0f, 1.0f / fb.texDrawDataHeight, 0.0f, 0.0f };
-                    device->SetVertexShaderConstantF(70, drawDataParams, 1);  // VS: c70
-                    device->SetPixelShaderConstantF(20, drawDataParams, 1);   // PS: c20
-
-                    // Bind draw data texture with explicit VTF sampler states
-                    device->SetTexture(D3DVERTEXTEXTURESAMPLER0, fb.texDrawData);
-                    device->SetSamplerState(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
-                    device->SetSamplerState(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
-                    device->SetSamplerState(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
-                    device->SetSamplerState(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
-                    device->SetSamplerState(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
-                    // Bind to PS slot 6 only (shader samples from s6)
-                    device->SetTexture(6, fb.texDrawData);
-                    device->SetSamplerState(6, D3DSAMP_MINFILTER, D3DTEXF_POINT);
-                    device->SetSamplerState(6, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
-                    device->SetSamplerState(6, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
-
-                    // Bind textures using smart binding function
-                    bindShaderTextures(sk, &firstCall.rs);
-
-                    // Ensure light texture (slot 5) is bound after bindShaderTextures
-                    // to prevent it from being overwritten
-                    IDirect3DTexture9* lightTex = g_renderThread ? g_renderThread->getPerObjectLightTexture() : DistantLand::texLightData;
-                    if (lightTex) {
-                        device->SetTexture(5, lightTex);
-                    }
-
-                    // Set sun/ambient lighting constants using hoisted values
-                    if (hlslShader.regLightSunDirection.reg != REG_INVALID) {
-                        float v[4] = { sunDirView.x, sunDirView.y, sunDirView.z, 0 };
-                        device->SetPixelShaderConstantF(hlslShader.regLightSunDirection.reg, v, 1);
-                    }
-                    if (hlslShader.regLightSunDiffuse.reg != REG_INVALID) {
-                        float v[4] = { sunDiffuse.r, sunDiffuse.g, sunDiffuse.b, 0 };
-                        device->SetPixelShaderConstantF(hlslShader.regLightSunDiffuse.reg, v, 1);
-                    }
-                    if (hlslShader.regLightSceneAmbient.reg != REG_INVALID) {
-                        float v[4] = { sceneAmbient.r, sceneAmbient.g, sceneAmbient.b, 0 };
-                        device->SetPixelShaderConstantF(hlslShader.regLightSceneAmbient.reg, v, 1);
-                    }
-                    // Set debug mode for shader visualization (hardcoded c22 - batch shaders skip dynamic resolution)
                     {
-                        float v[4] = { (float)ImGuiManager::GetShaderDebugMode(), 0, 0, 0 };
-                        device->SetPixelShaderConstantF(22, v, 1);
+                        MGE_ZoneScopedN("MergedBatch_BindShadersConstants");
+                        // Bind shaders
+                        device->SetVertexShader(hlslShader.vertexShader);
+                        device->SetPixelShader(hlslShader.pixelShader);
+
+                        // Set view/proj matrices using hoisted transposes
+                        device->SetVertexShaderConstantF(12, (float*)&viewT, 4);  // view at c12
+                        device->SetVertexShaderConstantF(0, (float*)&projT, 4);   // proj at c0
                     }
 
-                    // Set shadow matrices using hoisted view-to-shadow transforms
-                    if (hlslShader.hShadowWorldViewProj) {
-                        hlslShader.vsConstantTable->SetMatrixArray(device, hlslShader.hShadowWorldViewProj, shadowViewToClip, 2);
+                    {
+                        MGE_ZoneScopedN("MergedBatch_BindDrawDataTextures");
+                        // Set draw data texture params: {1/width, 1/height, 0, 0}
+                        // DRAW_DATA_WIDTH = 16 (16 texels per draw)
+                        float drawDataParams[4] = { 1.0f / 16.0f, 1.0f / fb.texDrawDataHeight, 0.0f, 0.0f };
+                        device->SetVertexShaderConstantF(70, drawDataParams, 1);  // VS: c70
+                        device->SetPixelShaderConstantF(20, drawDataParams, 1);   // PS: c20
+
+                        // Bind draw data texture with explicit VTF sampler states
+                        device->SetTexture(D3DVERTEXTEXTURESAMPLER0, fb.texDrawData);
+                        device->SetSamplerState(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+                        device->SetSamplerState(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+                        device->SetSamplerState(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+                        device->SetSamplerState(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+                        device->SetSamplerState(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+                        // Bind to PS slot 6 only (shader samples from s6)
+                        device->SetTexture(6, fb.texDrawData);
+                        device->SetSamplerState(6, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+                        device->SetSamplerState(6, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+                        device->SetSamplerState(6, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
                     }
 
-                    // Set render state
-                    device->SetRenderState(D3DRS_ALPHABLENDENABLE, mb.key.blendState & 0x1);
-                    device->SetRenderState(D3DRS_SRCBLEND, (mb.key.blendState >> 4) & 0xF);
-                    device->SetRenderState(D3DRS_DESTBLEND, (mb.key.blendState >> 8) & 0xF);
-                    device->SetRenderState(D3DRS_ZENABLE, mb.key.zState & 0x3);
-                    device->SetRenderState(D3DRS_ZWRITEENABLE, (mb.key.zState >> 2) & 0x1);
-                    device->SetRenderState(D3DRS_CULLMODE, mb.key.cullMode);
+                    {
+                        MGE_ZoneScopedN("MergedBatch_BindMaterialTextures");
+                        // Bind textures using smart binding function
+                        bindShaderTextures(sk, &firstCall.rs);
 
-                // Set up vertex stream - offset 0, use BaseVertexIndex for batch positioning
-                device->SetVertexDeclaration(mergedDecl);
-                device->SetStreamSource(0, useVB, 0, di.expandedStride);
-                device->SetStreamSourceFreq(0, 1);  // Not instanced
-                device->SetStreamSource(1, nullptr, 0, 0);
+                        // Ensure light texture (slot 5) is bound after bindShaderTextures
+                        // to prevent it from being overwritten
+                        IDirect3DTexture9* lightTex = g_renderThread ? g_renderThread->getPerObjectLightTexture() : DistantLand::texLightData;
+                        if (lightTex) {
+                            device->SetTexture(5, lightTex);
+                        }
+                    }
 
-                // Draw merged geometry
-                // Use BaseVertexIndex to offset into merged VB (avoids double-offset with stream offset)
-                // Indices are local to batch (rebased during copy)
-                INT baseVertex = (INT)(di.vbByteOffset / di.expandedStride);
-                device->DrawIndexedPrimitive(
-                    D3DPT_TRIANGLELIST,
-                    baseVertex,           // BaseVertexIndex - added to each index by GPU
-                    0,                    // MinIndex
-                    di.vertCount,
-                    di.ibStartIndex,
-                    di.primCount
-                );
+                    {
+                        MGE_ZoneScopedN("MergedBatch_SetLightConstants");
+                        // Set sun/ambient lighting constants using hoisted values
+                        if (hlslShader.regLightSunDirection.reg != REG_INVALID) {
+                            float v[4] = { sunDirView.x, sunDirView.y, sunDirView.z, 0 };
+                            device->SetPixelShaderConstantF(hlslShader.regLightSunDirection.reg, v, 1);
+                        }
+                        if (hlslShader.regLightSunDiffuse.reg != REG_INVALID) {
+                            float v[4] = { sunDiffuse.r, sunDiffuse.g, sunDiffuse.b, 0 };
+                            device->SetPixelShaderConstantF(hlslShader.regLightSunDiffuse.reg, v, 1);
+                        }
+                        if (hlslShader.regLightSceneAmbient.reg != REG_INVALID) {
+                            float v[4] = { sceneAmbient.r, sceneAmbient.g, sceneAmbient.b, 0 };
+                            device->SetPixelShaderConstantF(hlslShader.regLightSceneAmbient.reg, v, 1);
+                        }
+                        // Set debug mode for shader visualization (hardcoded c22 - batch shaders skip dynamic resolution)
+                        {
+                            float v[4] = { (float)ImGuiManager::GetShaderDebugMode(), 0, 0, 0 };
+                            device->SetPixelShaderConstantF(22, v, 1);
+                        }
 
-                mergedDrawCalls++;
+                        // Set shadow matrices using hoisted view-to-shadow transforms
+                        if (hlslShader.hShadowWorldViewProj) {
+                            hlslShader.vsConstantTable->SetMatrixArray(device, hlslShader.hShadowWorldViewProj, shadowViewToClip, 2);
+                        }
+                    }
+
+                    {
+                        MGE_ZoneScopedN("MergedBatch_SetRenderState");
+                        // Set render state
+                        device->SetRenderState(D3DRS_ALPHABLENDENABLE, mb.key.blendState & 0x1);
+                        device->SetRenderState(D3DRS_SRCBLEND, (mb.key.blendState >> 4) & 0xF);
+                        device->SetRenderState(D3DRS_DESTBLEND, (mb.key.blendState >> 8) & 0xF);
+                        device->SetRenderState(D3DRS_ZENABLE, mb.key.zState & 0x3);
+                        device->SetRenderState(D3DRS_ZWRITEENABLE, (mb.key.zState >> 2) & 0x1);
+                        device->SetRenderState(D3DRS_CULLMODE, mb.key.cullMode);
+                    }
+
+                    {
+                        MGE_ZoneScopedN("MergedBatch_SetStreamsAndSubmit");
+                        // Set up vertex stream - offset 0, use BaseVertexIndex for batch positioning
+                        device->SetVertexDeclaration(mergedDecl);
+                        device->SetStreamSource(0, useVB, 0, di.expandedStride);
+                        device->SetStreamSourceFreq(0, 1);  // Not instanced
+                        device->SetStreamSource(1, nullptr, 0, 0);
+
+                        // Draw merged geometry
+                        // Use BaseVertexIndex to offset into merged VB (avoids double-offset with stream offset)
+                        // Indices are local to batch (rebased during copy)
+                        INT baseVertex = (INT)(di.vbByteOffset / di.expandedStride);
+                        device->DrawIndexedPrimitive(
+                            D3DPT_TRIANGLELIST,
+                            baseVertex,           // BaseVertexIndex - added to each index by GPU
+                            0,                    // MinIndex
+                            di.vertCount,
+                            di.ibStartIndex,
+                            di.primCount
+                        );
+                    }
+
+                    mergedDrawCalls++;
+                }
             }
             // NOTE: Texture cleanup moved to consolidated section after both batch types
         }

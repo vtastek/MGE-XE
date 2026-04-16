@@ -52,20 +52,32 @@ static SRWLOCK s_geometryHashLock = SRWLOCK_INIT;
 static std::unordered_map<size_t, LocalMeshData> s_localMeshCache;
 static SRWLOCK s_localMeshLock = SRWLOCK_INIT;
 
-// Cell batch cache: caches merged VB/IB per cell to avoid regenerating geometry every frame
-// Key is cell pointer from MWBridge::getPlayerCell()
-static std::unordered_map<void*, CellBatchCache> s_cellBatchCaches;
-static SRWLOCK s_cellBatchCacheLock = SRWLOCK_INIT;
-static constexpr size_t MAX_CACHED_CELLS = 4;  // Memory limit for cached cells
-static uint64_t s_cellBatchCacheUseSerial = 0;
+static void hashCombineValue(size_t& h, size_t value) {
+    h ^= value + 0x9e3779b9 + (h << 6) + (h >> 2);
+}
 
-// Layout serial tracking for cell border race condition fix
-// Each cell's batch layout gets a unique serial. Frame buffers store the serial they were built with.
-// On storeCellBatchCacheVB, reject if the frame buffer's serial doesn't match the cell's current serial.
-static std::unordered_map<void*, uint64_t> s_cellBatchLayoutSerials;
-static std::unordered_map<const void*, uint64_t> s_fbLayoutSerials;
-static SRWLOCK s_fbLayoutSerialLock = SRWLOCK_INIT;
-static uint64_t s_nextLayoutSerial = 1;
+// Cell batch cache: caches merged VB/IB per cell+layout to avoid regenerating geometry every frame.
+struct CellBatchCacheKey {
+    void* cellPtr = nullptr;
+    size_t layoutHash = 0;
+
+    bool operator==(const CellBatchCacheKey& other) const {
+        return cellPtr == other.cellPtr && layoutHash == other.layoutHash;
+    }
+};
+
+struct CellBatchCacheKeyHash {
+    size_t operator()(const CellBatchCacheKey& key) const {
+        size_t h = reinterpret_cast<size_t>(key.cellPtr);
+        hashCombineValue(h, key.layoutHash);
+        return h;
+    }
+};
+
+static std::unordered_map<CellBatchCacheKey, CellBatchCache, CellBatchCacheKeyHash> s_cellBatchCaches;
+static SRWLOCK s_cellBatchCacheLock = SRWLOCK_INIT;
+static constexpr size_t MAX_CACHED_CELL_BATCH_LAYOUTS = 16;
+static uint64_t s_cellBatchCacheUseSerial = 0;
 
 static MeshKey makeMeshKey(const FixedFunctionShader::HLSLRecordedCall& call);
 
@@ -87,6 +99,7 @@ static CachedMergedCallLayout makeCachedMergedCallLayout(
     layout.mesh = makeMeshKey(call);
     layout.vbOffset = call.rs.vbOffset;
     layout.vbStride = call.rs.vbStride;
+    layout.recordMWIndex = call.recordMWIndex;
     layout.batchKey = batchKey;
     layout.worldTransform = call.rs.worldTransforms[0];
     layout.diffuseMaterial = call.frs.material.diffuse;
@@ -95,6 +108,87 @@ static CachedMergedCallLayout makeCachedMergedCallLayout(
     layout.alphaRef = call.rs.alphaRef;
     layout.vertexMaterial = (uint8_t)call.sk.vertexMaterial;
     return layout;
+}
+
+static void hashFloatValue(size_t& h, float value) {
+    DWORD bits = 0;
+    memcpy(&bits, &value, sizeof(bits));
+    hashCombineValue(h, bits);
+}
+
+static void hashMeshKeyValue(size_t& h, const MeshKey& key) {
+    hashCombineValue(h, reinterpret_cast<size_t>(key.vb));
+    hashCombineValue(h, reinterpret_cast<size_t>(key.ib));
+    hashCombineValue(h, key.fvf);
+    hashCombineValue(h, key.baseIndex);
+    hashCombineValue(h, key.vertCount);
+    hashCombineValue(h, key.startIndex);
+    hashCombineValue(h, key.primCount);
+}
+
+static void hashMergedBatchKeyValue(size_t& h, const MergedBatchKey& key) {
+    hashCombineValue(h, reinterpret_cast<size_t>(key.texture));
+    hashCombineValue(h, key.blendState);
+    hashCombineValue(h, key.zState);
+    hashCombineValue(h, key.cullMode);
+    hashCombineValue(h, key.useLighting);
+    hashCombineValue(h, key.bin);
+    hashCombineValue(h, key.fvf);
+    hashCombineValue(h, key.stride);
+}
+
+static void hashColorValue(size_t& h, const D3DCOLORVALUE& color) {
+    hashFloatValue(h, color.r);
+    hashFloatValue(h, color.g);
+    hashFloatValue(h, color.b);
+    hashFloatValue(h, color.a);
+}
+
+static void hashMatrixValue(size_t& h, const D3DXMATRIX& matrix) {
+    const float* values = &matrix._11;
+    for (int i = 0; i < 16; ++i) {
+        hashFloatValue(h, values[i]);
+    }
+}
+
+static void hashCachedBatchTemplateValue(size_t& h, const CachedBatchTemplate& templ) {
+    hashMergedBatchKeyValue(h, templ.key);
+    hashCombineValue(h, templ.totalVertices);
+    hashCombineValue(h, templ.totalIndices);
+    hashCombineValue(h, templ.drawDataOffset);
+    hashCombineValue(h, templ.drawCount);
+}
+
+static void hashCachedMergedCallLayoutValue(size_t& h, const CachedMergedCallLayout& layout) {
+    hashCombineValue(h, static_cast<size_t>(layout.recordMWIndex));
+    if (layout.recordMWIndex >= 0) {
+        hashCombineValue(h, layout.mesh.fvf);
+        hashCombineValue(h, layout.mesh.vertCount);
+        hashCombineValue(h, layout.mesh.primCount);
+        hashCombineValue(h, layout.vbStride);
+    } else {
+        hashMeshKeyValue(h, layout.mesh);
+        hashCombineValue(h, layout.vbOffset);
+        hashCombineValue(h, layout.vbStride);
+    }
+    hashMergedBatchKeyValue(h, layout.batchKey);
+}
+
+static size_t computeCellBatchLayoutHash(
+    const std::vector<CachedBatchTemplate>& batchTemplates,
+    const std::vector<CachedMergedCallLayout>& mergedLayout)
+{
+    size_t h = sizeof(size_t) == 8 ? static_cast<size_t>(1469598103934665603ull) : static_cast<size_t>(2166136261u);
+    hashCombineValue(h, batchTemplates.size());
+    for (const auto& templ : batchTemplates) {
+        hashCachedBatchTemplateValue(h, templ);
+    }
+
+    hashCombineValue(h, mergedLayout.size());
+    for (const auto& layout : mergedLayout) {
+        hashCachedMergedCallLayoutValue(h, layout);
+    }
+    return h;
 }
 
 static bool lessMeshKey(const MeshKey& lhs, const MeshKey& rhs) {
@@ -135,30 +229,28 @@ static bool lessMergedBatchKey(const MergedBatchKey& lhs, const MergedBatchKey& 
 }
 
 static bool lessCachedMergedCallLayout(const CachedMergedCallLayout& lhs, const CachedMergedCallLayout& rhs) {
-    // Phase 4 optimization: compare position (translation) early as strong discriminator
-    // Objects at different positions will typically sort apart, avoiding deeper comparisons
-    if (lhs.worldTransform._41 != rhs.worldTransform._41) return lhs.worldTransform._41 < rhs.worldTransform._41;
-    if (lhs.worldTransform._42 != rhs.worldTransform._42) return lhs.worldTransform._42 < rhs.worldTransform._42;
-    if (lhs.worldTransform._43 != rhs.worldTransform._43) return lhs.worldTransform._43 < rhs.worldTransform._43;
+    if (lhs.recordMWIndex != rhs.recordMWIndex)
+        return lhs.recordMWIndex < rhs.recordMWIndex;
 
-    // Mesh key comparison (VB/IB pointers are strong discriminators)
-    if (lhs.mesh.vb != rhs.mesh.vb) return lhs.mesh.vb < rhs.mesh.vb;
-    if (lhs.mesh.ib != rhs.mesh.ib) return lhs.mesh.ib < rhs.mesh.ib;
-
-    // Fast memcmp fallback for remaining struct (struct is zero-initialized via memset in makeCachedMergedCallLayout)
-    // This is faster than field-by-field comparison for large structs
-    return memcmp(&lhs, &rhs, sizeof(CachedMergedCallLayout)) < 0;
+    if (lessMeshKey(lhs.mesh, rhs.mesh)) return true;
+    if (lessMeshKey(rhs.mesh, lhs.mesh)) return false;
+    if (lhs.vbOffset != rhs.vbOffset) return lhs.vbOffset < rhs.vbOffset;
+    if (lhs.vbStride != rhs.vbStride) return lhs.vbStride < rhs.vbStride;
+    if (lessMergedBatchKey(lhs.batchKey, rhs.batchKey)) return true;
+    return false;
 }
 
 // Invalidate cell batch cache for a specific cell
 void FixedFunctionShader::invalidateCellBatchCache(void* cellPtr) {
     AcquireSRWLockExclusive(&s_cellBatchCacheLock);
-    auto it = s_cellBatchCaches.find(cellPtr);
-    if (it != s_cellBatchCaches.end()) {
+    for (auto it = s_cellBatchCaches.begin(); it != s_cellBatchCaches.end(); ) {
+        if (it->first.cellPtr != cellPtr) {
+            ++it;
+            continue;
+        }
         it->second.release();
-        s_cellBatchCaches.erase(it);
+        it = s_cellBatchCaches.erase(it);
     }
-    s_cellBatchLayoutSerials.erase(cellPtr);
     ReleaseSRWLockExclusive(&s_cellBatchCacheLock);
 }
 
@@ -169,24 +261,18 @@ void FixedFunctionShader::clearAllCellBatchCaches() {
         kv.second.release();
     }
     s_cellBatchCaches.clear();
-    s_cellBatchLayoutSerials.clear();
     ReleaseSRWLockExclusive(&s_cellBatchCacheLock);
-
-    // Also clear frame buffer serials
-    AcquireSRWLockExclusive(&s_fbLayoutSerialLock);
-    s_fbLayoutSerials.clear();
-    ReleaseSRWLockExclusive(&s_fbLayoutSerialLock);
 }
 
 // Evict least recently used cache if over limit.
 // Caller must hold s_cellBatchCacheLock exclusively.
-static void evictLRUCellBatchCacheLocked(void* protectedCellPtr) {
-    if (s_cellBatchCaches.size() > MAX_CACHED_CELLS) {
+static void evictLRUCellBatchCacheLocked(const CellBatchCacheKey& protectedKey) {
+    while (s_cellBatchCaches.size() > MAX_CACHED_CELL_BATCH_LAYOUTS) {
         auto victim = s_cellBatchCaches.end();
         uint64_t oldestUse = ~0ull;
 
         for (auto it = s_cellBatchCaches.begin(); it != s_cellBatchCaches.end(); ++it) {
-            if (it->first == protectedCellPtr)
+            if (it->first == protectedKey)
                 continue;
             if (it->second.lastUsedSerial < oldestUse) {
                 oldestUse = it->second.lastUsedSerial;
@@ -195,70 +281,62 @@ static void evictLRUCellBatchCacheLocked(void* protectedCellPtr) {
         }
 
         if (victim != s_cellBatchCaches.end()) {
-            s_cellBatchLayoutSerials.erase(victim->first);
             victim->second.release();
             s_cellBatchCaches.erase(victim);
+        } else {
+            break;
         }
     }
 }
 
 // Store VB/IB in cell batch cache (called by hlsl_replay after building VB/IB)
-void FixedFunctionShader::storeCellBatchCacheVB(void* cellPtr, const void* fbPtr, IDirect3DVertexBuffer9* vb,
+void FixedFunctionShader::storeCellBatchCacheVB(void* cellPtr, size_t layoutHash, IDirect3DVertexBuffer9* vb,
                                                   IDirect3DIndexBuffer9* ib,
                                                   const std::vector<CachedDrawInfo>& drawInfos) {
-    if (!cellPtr || !vb || !ib || drawInfos.empty())
+    if (!cellPtr || layoutHash == 0 || !vb || !ib || drawInfos.empty())
         return;
-
-    // Verify layout serial to prevent race condition at cell borders
-    // The frame buffer's serial must match the cell's current serial
-    AcquireSRWLockShared(&s_fbLayoutSerialLock);
-    auto fbIt = s_fbLayoutSerials.find(fbPtr);
-    uint64_t fbSerial = (fbIt != s_fbLayoutSerials.end()) ? fbIt->second : 0;
-    ReleaseSRWLockShared(&s_fbLayoutSerialLock);
 
     AcquireSRWLockExclusive(&s_cellBatchCacheLock);
 
-    auto cellIt = s_cellBatchLayoutSerials.find(cellPtr);
-    uint64_t cellSerial = (cellIt != s_cellBatchLayoutSerials.end()) ? cellIt->second : 0;
-
-    if (fbSerial != cellSerial || fbSerial == 0) {
-        LOG::logline("CellBatchCache: Rejected VB/IB store - layout mismatch cell=%p fbSerial=%llu cellSerial=%llu",
-                     cellPtr, fbSerial, cellSerial);
+    CellBatchCacheKey cacheKey = { cellPtr, layoutHash };
+    auto it = s_cellBatchCaches.find(cacheKey);
+    if (it == s_cellBatchCaches.end() || !it->second.valid || it->second.layoutHash != layoutHash) {
+        LOG::logline("CellBatchCache: Rejected VB/IB store - missing layout cell=%p hash=%Ix",
+                     cellPtr, layoutHash);
         ReleaseSRWLockExclusive(&s_cellBatchCacheLock);
         return;
     }
 
-    auto it = s_cellBatchCaches.find(cellPtr);
-    if (it != s_cellBatchCaches.end()) {
-        CellBatchCache& cache = it->second;
-        if (cache.mergedVB) {
-            cache.mergedVB->Release();
-            cache.mergedVB = nullptr;
-        }
-        if (cache.mergedIB) {
-            cache.mergedIB->Release();
-            cache.mergedIB = nullptr;
-        }
-
-        if (vb) vb->AddRef();
-        if (ib) ib->AddRef();
-        cache.mergedVB = vb;
-        cache.mergedIB = ib;
-        cache.drawInfos = drawInfos;
-        cache.valid = true;
-        cache.lastUsedSerial = ++s_cellBatchCacheUseSerial;
-
-        UINT vbSizeBytes = 0;
-        UINT ibSizeIndices = 0;
-        for (const auto& info : drawInfos) {
-            vbSizeBytes = std::max(vbSizeBytes, info.vbByteOffset + (info.vertCount * info.expandedStride));
-            ibSizeIndices = std::max(ibSizeIndices, info.ibStartIndex + (info.primCount * 3));
-        }
-        cache.vbSizeBytes = vbSizeBytes;
-        cache.ibSizeIndices = ibSizeIndices;
-
-        LOG::logline("CellBatchCache: Stored VB/IB for cell=%p, %d drawInfos (serial=%llu)", cellPtr, (int)drawInfos.size(), fbSerial);
+    CellBatchCache& cache = it->second;
+    if (cache.mergedVB) {
+        cache.mergedVB->Release();
+        cache.mergedVB = nullptr;
     }
+    if (cache.mergedIB) {
+        cache.mergedIB->Release();
+        cache.mergedIB = nullptr;
+    }
+
+    vb->AddRef();
+    ib->AddRef();
+    cache.mergedVB = vb;
+    cache.mergedIB = ib;
+    cache.drawInfos = drawInfos;
+    cache.valid = true;
+    cache.lastUsedSerial = ++s_cellBatchCacheUseSerial;
+
+    UINT vbSizeBytes = 0;
+    UINT ibSizeIndices = 0;
+    for (const auto& info : drawInfos) {
+        vbSizeBytes = std::max(vbSizeBytes, info.vbByteOffset + (info.vertCount * info.expandedStride));
+        ibSizeIndices = std::max(ibSizeIndices, info.ibStartIndex + (info.primCount * 3));
+    }
+    cache.vbSizeBytes = vbSizeBytes;
+    cache.ibSizeIndices = ibSizeIndices;
+
+    LOG::logline("CellBatchCache: Stored VB/IB for cell=%p hash=%Ix, %d drawInfos",
+                 cellPtr, layoutHash, (int)drawInfos.size());
+
     ReleaseSRWLockExclusive(&s_cellBatchCacheLock);
 }
 
@@ -489,15 +567,22 @@ static void sortCallsByMaterial(std::vector<FixedFunctionShader::HLSLRecordedCal
 void FixedFunctionShader::executeHiZCulling(const D3DXMATRIX& currentView, const D3DXMATRIX& currentProj) {
     MGE_ZoneScopedN("Execute Hi-Z Culling");
 
+    // Hi-Z visibility is only consumed by the HLSL replacement pipeline. Standard/PPL
+    // lighting still replays recordMW for the depth texture, so building a pyramid here
+    // just adds CPU work without filtering any draws.
+    if (Configuration.PerPixelLightFlags != 2) {
+        return;
+    }
+
     // Resize visibility results for this frame (indexed by draw order)
     // N-1: HLSL mode uses prep buffer (previous frame's data being prepared), legacy mode uses global static
     auto& renderBuf = getPrepBuffer();
-    const auto& activeRecordMW = (Configuration.PerPixelLightFlags == 2) ? renderBuf.recordMW : DistantLand::recordMW;
+    const auto& activeRecordMW = renderBuf.recordMW;
     visibilityResults.assign(activeRecordMW.size(), -1);  // -1 = not yet tested
 
     // Phase 2a: Compute deferred bboxes and rasterize occluders from recorded HLSL calls
     // This must happen before Hi-Z build so the depth pass benefits from culling
-    auto& recCalls = (Configuration.PerPixelLightFlags == 2) ? renderBuf.recordedCalls : currentRecordedCalls();
+    auto& recCalls = renderBuf.recordedCalls;
     if (!recCalls.empty() && !hiZBuiltThisFrame) {
         // Compute bounding boxes for calls that missed the cache during recording
         {
@@ -611,14 +696,6 @@ void FixedFunctionShader::executeHiZCulling(const D3DXMATRIX& currentView, const
             softwareOcclusionCuller.uploadHiZToTexture(reinterpret_cast<IDirect3DDevice9*>(device), ImGuiManager::GetHiZDisplayMip(), uploadProj, ImGuiManager::GetHiZInvert());
         }
         hiZBuiltThisFrame = true;
-    }
-
-    // Only do Hi-Z culling in HLSL mode (PerPixelLightFlags == 2)
-    // Non-HLSL modes don't have bboxCache populated, so skip culling
-    if (Configuration.PerPixelLightFlags != 2) {
-        LOG::logline(">> Depth: %d objects (no culling - non-HLSL mode)",
-                     (int)DistantLand::recordMW.size());
-        return;
     }
 
     // Hi-Z bypass toggle for terrain hole diagnosis
@@ -1285,7 +1362,7 @@ static bool isBatchableCall(const FixedFunctionShader::HLSLRecordedCall& call) {
 
 // Create MergedBatchKey from a recorded call
 static MergedBatchKey makeMergedBatchKey(const FixedFunctionShader::HLSLRecordedCall& call) {
-    MergedBatchKey mkey;
+    MergedBatchKey mkey = {};
     mkey.texture = call.rs.texture;
     mkey.blendState = (uint16_t)((call.expectedState.captured ? call.expectedState.alphaBlendEnable : 0) |
                      ((call.expectedState.captured ? call.expectedState.srcBlend : 0) << 4) |
@@ -1317,6 +1394,7 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
     fb.singletonCallIndices.clear();
     fb.mergedBatches.clear();
     fb.cellBatchCacheKey = nullptr;
+    fb.cellBatchLayoutHash = 0;
     fb.useCachedMergedVB = false;
     fb.cachedDrawInfos.clear();
 
@@ -1412,14 +1490,18 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
     }
 
     void* currentCell = MWBridge::get() ? MWBridge::get()->getPlayerCell() : nullptr;
+    size_t layoutHash = computeCellBatchLayoutHash(batchTemplates, mergedLayout);
     fb.cellBatchCacheKey = currentCell;
+    fb.cellBatchLayoutHash = layoutHash;
     if (currentCell && !fb.mergedBatches.empty()) {
         AcquireSRWLockExclusive(&s_cellBatchCacheLock);
 
-        auto it = s_cellBatchCaches.find(currentCell);
+        CellBatchCacheKey cacheKey = { currentCell, layoutHash };
+        auto it = s_cellBatchCaches.find(cacheKey);
         bool layoutMatch = false;
         if (it != s_cellBatchCaches.end()) {
             layoutMatch = it->second.valid &&
+                          it->second.layoutHash == layoutHash &&
                           it->second.batches == batchTemplates &&
                           it->second.mergedLayout == mergedLayout;
         }
@@ -1427,14 +1509,6 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
         if (layoutMatch) {
             CellBatchCache& cache = it->second;
             cache.lastUsedSerial = ++s_cellBatchCacheUseSerial;
-
-            // Copy cell's layout serial to frame buffer for storeCellBatchCacheVB verification
-            auto serialIt = s_cellBatchLayoutSerials.find(currentCell);
-            if (serialIt != s_cellBatchLayoutSerials.end()) {
-                AcquireSRWLockExclusive(&s_fbLayoutSerialLock);
-                s_fbLayoutSerials[&fb] = serialIt->second;
-                ReleaseSRWLockExclusive(&s_fbLayoutSerialLock);
-            }
 
             if (cache.hasGeometry()) {
                 cache.mergedVB->AddRef();
@@ -1453,22 +1527,15 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
                 }
             }
         } else {
-            CellBatchCache& cache = s_cellBatchCaches[currentCell];
+            CellBatchCache& cache = s_cellBatchCaches[cacheKey];
             cache.release();
             cache.cellPtr = currentCell;
+            cache.layoutHash = layoutHash;
             cache.valid = true;
             cache.lastUsedSerial = ++s_cellBatchCacheUseSerial;
             cache.batches = batchTemplates;
             cache.mergedLayout = mergedLayout;
-            evictLRUCellBatchCacheLocked(currentCell);
-
-            // Generate new layout serial for this cell and store for the frame buffer
-            uint64_t newSerial = s_nextLayoutSerial++;
-            s_cellBatchLayoutSerials[currentCell] = newSerial;
-
-            AcquireSRWLockExclusive(&s_fbLayoutSerialLock);
-            s_fbLayoutSerials[&fb] = newSerial;
-            ReleaseSRWLockExclusive(&s_fbLayoutSerialLock);
+            evictLRUCellBatchCacheLocked(cacheKey);
         }
 
         ReleaseSRWLockExclusive(&s_cellBatchCacheLock);
