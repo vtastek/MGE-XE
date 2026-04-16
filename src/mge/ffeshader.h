@@ -1249,7 +1249,7 @@ public:
     static void buildStatelessBatches(FrameBuffer& fb);  // Build merged batches (per-draw data in texture)
     static void invalidateCellBatchCache(void* cellPtr); // Invalidate cache for specific cell
     static void clearAllCellBatchCaches();               // Clear all cell batch caches
-    static void storeCellBatchCacheVB(void* cellPtr, IDirect3DVertexBuffer9* vb, IDirect3DIndexBuffer9* ib,
+    static void storeCellBatchCacheVB(void* cellPtr, const void* fbPtr, IDirect3DVertexBuffer9* vb, IDirect3DIndexBuffer9* ib,
                                       const std::vector<CachedDrawInfo>& drawInfos);  // Store VB/IB in cache
 
     // Scene lifecycle for triple-buffered pipeline

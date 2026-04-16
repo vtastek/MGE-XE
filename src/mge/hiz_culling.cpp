@@ -59,6 +59,14 @@ static SRWLOCK s_cellBatchCacheLock = SRWLOCK_INIT;
 static constexpr size_t MAX_CACHED_CELLS = 4;  // Memory limit for cached cells
 static uint64_t s_cellBatchCacheUseSerial = 0;
 
+// Layout serial tracking for cell border race condition fix
+// Each cell's batch layout gets a unique serial. Frame buffers store the serial they were built with.
+// On storeCellBatchCacheVB, reject if the frame buffer's serial doesn't match the cell's current serial.
+static std::unordered_map<void*, uint64_t> s_cellBatchLayoutSerials;
+static std::unordered_map<const void*, uint64_t> s_fbLayoutSerials;
+static SRWLOCK s_fbLayoutSerialLock = SRWLOCK_INIT;
+static uint64_t s_nextLayoutSerial = 1;
+
 static MeshKey makeMeshKey(const FixedFunctionShader::HLSLRecordedCall& call);
 
 static CachedBatchTemplate makeCachedBatchTemplate(const MergedBatch& batch) {
@@ -153,6 +161,7 @@ void FixedFunctionShader::invalidateCellBatchCache(void* cellPtr) {
         it->second.release();
         s_cellBatchCaches.erase(it);
     }
+    s_cellBatchLayoutSerials.erase(cellPtr);
     ReleaseSRWLockExclusive(&s_cellBatchCacheLock);
 }
 
@@ -163,7 +172,13 @@ void FixedFunctionShader::clearAllCellBatchCaches() {
         kv.second.release();
     }
     s_cellBatchCaches.clear();
+    s_cellBatchLayoutSerials.clear();
     ReleaseSRWLockExclusive(&s_cellBatchCacheLock);
+
+    // Also clear frame buffer serials
+    AcquireSRWLockExclusive(&s_fbLayoutSerialLock);
+    s_fbLayoutSerials.clear();
+    ReleaseSRWLockExclusive(&s_fbLayoutSerialLock);
 }
 
 // Evict least recently used cache if over limit.
@@ -183,6 +198,7 @@ static void evictLRUCellBatchCacheLocked(void* protectedCellPtr) {
         }
 
         if (victim != s_cellBatchCaches.end()) {
+            s_cellBatchLayoutSerials.erase(victim->first);
             victim->second.release();
             s_cellBatchCaches.erase(victim);
         }
@@ -190,13 +206,31 @@ static void evictLRUCellBatchCacheLocked(void* protectedCellPtr) {
 }
 
 // Store VB/IB in cell batch cache (called by hlsl_replay after building VB/IB)
-void FixedFunctionShader::storeCellBatchCacheVB(void* cellPtr, IDirect3DVertexBuffer9* vb,
+void FixedFunctionShader::storeCellBatchCacheVB(void* cellPtr, const void* fbPtr, IDirect3DVertexBuffer9* vb,
                                                   IDirect3DIndexBuffer9* ib,
                                                   const std::vector<CachedDrawInfo>& drawInfos) {
     if (!cellPtr || !vb || !ib || drawInfos.empty())
         return;
 
+    // Verify layout serial to prevent race condition at cell borders
+    // The frame buffer's serial must match the cell's current serial
+    AcquireSRWLockShared(&s_fbLayoutSerialLock);
+    auto fbIt = s_fbLayoutSerials.find(fbPtr);
+    uint64_t fbSerial = (fbIt != s_fbLayoutSerials.end()) ? fbIt->second : 0;
+    ReleaseSRWLockShared(&s_fbLayoutSerialLock);
+
     AcquireSRWLockExclusive(&s_cellBatchCacheLock);
+
+    auto cellIt = s_cellBatchLayoutSerials.find(cellPtr);
+    uint64_t cellSerial = (cellIt != s_cellBatchLayoutSerials.end()) ? cellIt->second : 0;
+
+    if (fbSerial != cellSerial || fbSerial == 0) {
+        LOG::logline("CellBatchCache: Rejected VB/IB store - layout mismatch cell=%p fbSerial=%llu cellSerial=%llu",
+                     cellPtr, fbSerial, cellSerial);
+        ReleaseSRWLockExclusive(&s_cellBatchCacheLock);
+        return;
+    }
+
     auto it = s_cellBatchCaches.find(cellPtr);
     if (it != s_cellBatchCaches.end()) {
         CellBatchCache& cache = it->second;
@@ -226,7 +260,7 @@ void FixedFunctionShader::storeCellBatchCacheVB(void* cellPtr, IDirect3DVertexBu
         cache.vbSizeBytes = vbSizeBytes;
         cache.ibSizeIndices = ibSizeIndices;
 
-        LOG::logline("CellBatchCache: Stored VB/IB for cell=%p, %d drawInfos", cellPtr, (int)drawInfos.size());
+        LOG::logline("CellBatchCache: Stored VB/IB for cell=%p, %d drawInfos (serial=%llu)", cellPtr, (int)drawInfos.size(), fbSerial);
     }
     ReleaseSRWLockExclusive(&s_cellBatchCacheLock);
 }
@@ -1303,6 +1337,14 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
             CellBatchCache& cache = it->second;
             cache.lastUsedSerial = ++s_cellBatchCacheUseSerial;
 
+            // Copy cell's layout serial to frame buffer for storeCellBatchCacheVB verification
+            auto serialIt = s_cellBatchLayoutSerials.find(currentCell);
+            if (serialIt != s_cellBatchLayoutSerials.end()) {
+                AcquireSRWLockExclusive(&s_fbLayoutSerialLock);
+                s_fbLayoutSerials[&fb] = serialIt->second;
+                ReleaseSRWLockExclusive(&s_fbLayoutSerialLock);
+            }
+
             if (cache.hasGeometry()) {
                 cache.mergedVB->AddRef();
                 cache.mergedIB->AddRef();
@@ -1328,6 +1370,14 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
             cache.batches = batchTemplates;
             cache.mergedLayout = mergedLayout;
             evictLRUCellBatchCacheLocked(currentCell);
+
+            // Generate new layout serial for this cell and store for the frame buffer
+            uint64_t newSerial = s_nextLayoutSerial++;
+            s_cellBatchLayoutSerials[currentCell] = newSerial;
+
+            AcquireSRWLockExclusive(&s_fbLayoutSerialLock);
+            s_fbLayoutSerials[&fb] = newSerial;
+            ReleaseSRWLockExclusive(&s_fbLayoutSerialLock);
         }
 
         ReleaseSRWLockExclusive(&s_cellBatchCacheLock);

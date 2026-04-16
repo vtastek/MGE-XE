@@ -2162,7 +2162,19 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
             }
             UINT ibSizeNeeded = totalMergedIndices * sizeof(DWORD);  // 32-bit indices for >64k verts
 
-            if (fb.mergedVB == nullptr || fb.mergedVBSize < vbSizeNeeded) {
+            // Track last cell each frame buffer was built for to sever buffer reuse link on cell change
+            // This prevents D3DLOCK_DISCARD from corrupting cached VB/IB when geometry layout changes
+            static std::unordered_map<const void*, void*> s_fbLastBuiltCell;
+            bool cellChanged = false;
+            auto lastCellIt = s_fbLastBuiltCell.find(&fb);
+            if (lastCellIt != s_fbLastBuiltCell.end() && lastCellIt->second != fb.cellBatchCacheKey) {
+                cellChanged = true;
+                LOG::logline("MergedBatch: Cell changed for fb=%p, forcing VB/IB recreation (old=%p, new=%p)",
+                             &fb, lastCellIt->second, fb.cellBatchCacheKey);
+            }
+            s_fbLastBuiltCell[&fb] = fb.cellBatchCacheKey;
+
+            if (fb.mergedVB == nullptr || fb.mergedVBSize < vbSizeNeeded || cellChanged) {
                 if (fb.mergedVB) fb.mergedVB->Release();
                 UINT newSize = std::max(vbSizeNeeded, 1024u * 1024u);
                 if (SUCCEEDED(device->CreateVertexBuffer(newSize, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
@@ -2172,7 +2184,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                 }
             }
 
-            if (fb.mergedIB == nullptr || fb.mergedIBSize < totalMergedIndices) {
+            if (fb.mergedIB == nullptr || fb.mergedIBSize < totalMergedIndices || cellChanged) {
                 if (fb.mergedIB) fb.mergedIB->Release();
                 UINT newCount = std::max(totalMergedIndices, 256u * 1024u);
                 if (SUCCEEDED(device->CreateIndexBuffer(newCount * sizeof(DWORD), D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
@@ -2340,7 +2352,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     useIB = fb.mergedIB;
                     drawInfos = &builtDrawInfos;
 
-                    FixedFunctionShader::storeCellBatchCacheVB(fb.cellBatchCacheKey, fb.mergedVB, fb.mergedIB, builtDrawInfos);
+                    FixedFunctionShader::storeCellBatchCacheVB(fb.cellBatchCacheKey, &fb, fb.mergedVB, fb.mergedIB, builtDrawInfos);
 
                     static bool loggedMerge = false;
                     if (!loggedMerge) {
