@@ -337,12 +337,24 @@ struct CachedMergedCallLayout {
     UINT vbOffset;
     UINT vbStride;
     MergedBatchKey batchKey;
+    D3DXMATRIX worldTransform;
+    D3DCOLORVALUE diffuseMaterial;
+    D3DCOLORVALUE ambientMaterial;
+    D3DCOLORVALUE emissiveMaterial;
+    BYTE alphaRef;
+    uint8_t vertexMaterial;
 
     bool operator==(const CachedMergedCallLayout& other) const {
         return mesh == other.mesh &&
                vbOffset == other.vbOffset &&
                vbStride == other.vbStride &&
-               batchKey == other.batchKey;
+               batchKey == other.batchKey &&
+               memcmp(&worldTransform, &other.worldTransform, sizeof(worldTransform)) == 0 &&
+               memcmp(&diffuseMaterial, &other.diffuseMaterial, sizeof(diffuseMaterial)) == 0 &&
+               memcmp(&ambientMaterial, &other.ambientMaterial, sizeof(ambientMaterial)) == 0 &&
+               memcmp(&emissiveMaterial, &other.emissiveMaterial, sizeof(emissiveMaterial)) == 0 &&
+               alphaRef == other.alphaRef &&
+               vertexMaterial == other.vertexMaterial;
     }
 };
 

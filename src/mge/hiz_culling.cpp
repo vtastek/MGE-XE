@@ -80,7 +80,69 @@ static CachedMergedCallLayout makeCachedMergedCallLayout(
     layout.vbOffset = call.rs.vbOffset;
     layout.vbStride = call.rs.vbStride;
     layout.batchKey = batchKey;
+    layout.worldTransform = call.rs.worldTransforms[0];
+    layout.diffuseMaterial = call.frs.material.diffuse;
+    layout.ambientMaterial = call.frs.material.ambient;
+    layout.emissiveMaterial = call.frs.material.emissive;
+    layout.alphaRef = call.rs.alphaRef;
+    layout.vertexMaterial = (uint8_t)call.sk.vertexMaterial;
     return layout;
+}
+
+static bool lessMeshKey(const MeshKey& lhs, const MeshKey& rhs) {
+    if (lhs.vb != rhs.vb) return lhs.vb < rhs.vb;
+    if (lhs.ib != rhs.ib) return lhs.ib < rhs.ib;
+    if (lhs.fvf != rhs.fvf) return lhs.fvf < rhs.fvf;
+    if (lhs.baseIndex != rhs.baseIndex) return lhs.baseIndex < rhs.baseIndex;
+    if (lhs.vertCount != rhs.vertCount) return lhs.vertCount < rhs.vertCount;
+    if (lhs.startIndex != rhs.startIndex) return lhs.startIndex < rhs.startIndex;
+    return lhs.primCount < rhs.primCount;
+}
+
+static bool lessColorValue(const D3DCOLORVALUE& lhs, const D3DCOLORVALUE& rhs) {
+    if (lhs.r != rhs.r) return lhs.r < rhs.r;
+    if (lhs.g != rhs.g) return lhs.g < rhs.g;
+    if (lhs.b != rhs.b) return lhs.b < rhs.b;
+    return lhs.a < rhs.a;
+}
+
+static bool lessMatrix(const D3DXMATRIX& lhs, const D3DXMATRIX& rhs) {
+    const float* l = &lhs._11;
+    const float* r = &rhs._11;
+    for (int i = 0; i < 16; ++i) {
+        if (l[i] != r[i]) return l[i] < r[i];
+    }
+    return false;
+}
+
+static bool lessMergedBatchKey(const MergedBatchKey& lhs, const MergedBatchKey& rhs) {
+    if (lhs.texture != rhs.texture) return lhs.texture < rhs.texture;
+    if (lhs.blendState != rhs.blendState) return lhs.blendState < rhs.blendState;
+    if (lhs.zState != rhs.zState) return lhs.zState < rhs.zState;
+    if (lhs.cullMode != rhs.cullMode) return lhs.cullMode < rhs.cullMode;
+    if (lhs.useLighting != rhs.useLighting) return lhs.useLighting < rhs.useLighting;
+    if (lhs.bin != rhs.bin) return lhs.bin < rhs.bin;
+    if (lhs.fvf != rhs.fvf) return lhs.fvf < rhs.fvf;
+    return lhs.stride < rhs.stride;
+}
+
+static bool lessCachedMergedCallLayout(const CachedMergedCallLayout& lhs, const CachedMergedCallLayout& rhs) {
+    if (lessMeshKey(lhs.mesh, rhs.mesh)) return true;
+    if (lessMeshKey(rhs.mesh, lhs.mesh)) return false;
+    if (lhs.vbOffset != rhs.vbOffset) return lhs.vbOffset < rhs.vbOffset;
+    if (lhs.vbStride != rhs.vbStride) return lhs.vbStride < rhs.vbStride;
+    if (lessMergedBatchKey(lhs.batchKey, rhs.batchKey)) return true;
+    if (lessMergedBatchKey(rhs.batchKey, lhs.batchKey)) return false;
+    if (lessMatrix(lhs.worldTransform, rhs.worldTransform)) return true;
+    if (lessMatrix(rhs.worldTransform, lhs.worldTransform)) return false;
+    if (lessColorValue(lhs.diffuseMaterial, rhs.diffuseMaterial)) return true;
+    if (lessColorValue(rhs.diffuseMaterial, lhs.diffuseMaterial)) return false;
+    if (lessColorValue(lhs.ambientMaterial, rhs.ambientMaterial)) return true;
+    if (lessColorValue(rhs.ambientMaterial, lhs.ambientMaterial)) return false;
+    if (lessColorValue(lhs.emissiveMaterial, rhs.emissiveMaterial)) return true;
+    if (lessColorValue(rhs.emissiveMaterial, lhs.emissiveMaterial)) return false;
+    if (lhs.alphaRef != rhs.alphaRef) return lhs.alphaRef < rhs.alphaRef;
+    return lhs.vertexMaterial < rhs.vertexMaterial;
 }
 
 // Invalidate cell batch cache for a specific cell
@@ -1169,13 +1231,35 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
         group.totalIndices += call.rs.primCount * 3;
     }
 
+    std::sort(mergeGroups.begin(), mergeGroups.end(),
+        [](const PendingMergedGroup& lhs, const PendingMergedGroup& rhs) {
+            return lessMergedBatchKey(lhs.key, rhs.key);
+        });
+
     std::vector<CachedBatchTemplate> batchTemplates;
     std::vector<CachedMergedCallLayout> mergedLayout;
 
     // Build MergedBatch entries for groups with 2+ calls. Hidden calls remain in the batch
     // with visibility encoded in drawDataStaging so geometry can be reused across frames.
     UINT drawDataOffset = 0;
-    for (const auto& group : mergeGroups) {
+    for (auto& group : mergeGroups) {
+        std::vector<std::pair<CachedMergedCallLayout, size_t>> sortedCalls;
+        sortedCalls.reserve(group.callIndices.size());
+        for (size_t callIdx : group.callIndices) {
+            sortedCalls.push_back(std::make_pair(makeCachedMergedCallLayout(calls[callIdx], group.key), callIdx));
+        }
+        std::sort(sortedCalls.begin(), sortedCalls.end(),
+            [](const std::pair<CachedMergedCallLayout, size_t>& lhs,
+               const std::pair<CachedMergedCallLayout, size_t>& rhs) {
+                return lessCachedMergedCallLayout(lhs.first, rhs.first);
+            });
+
+        group.callIndices.clear();
+        group.callIndices.reserve(sortedCalls.size());
+        for (const auto& sortedCall : sortedCalls) {
+            group.callIndices.push_back(sortedCall.second);
+        }
+
         if (group.callIndices.size() >= 2) {
             MergedBatch mbatch;
             mbatch.key = group.key;
@@ -1184,12 +1268,13 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
             mbatch.totalVertices = group.totalVertices;
             mbatch.totalIndices = group.totalIndices;
 
-            for (size_t callIdx : mbatch.callIndices) {
+            for (size_t i = 0; i < mbatch.callIndices.size(); ++i) {
+                size_t callIdx = mbatch.callIndices[i];
                 const auto& call = calls[callIdx];
                 StatelessDrawData data;
                 fillDrawData(data, call, highlightBatches, call.shouldRender);
                 fb.drawDataStaging.push_back(data);
-                mergedLayout.push_back(makeCachedMergedCallLayout(call, group.key));
+                mergedLayout.push_back(sortedCalls[i].first);
                 drawDataOffset++;
             }
 
