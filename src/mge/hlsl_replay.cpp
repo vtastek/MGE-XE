@@ -2096,14 +2096,13 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
             // Upload draw data to texture
             D3DLOCKED_RECT locked;
             if (SUCCEEDED(fb.texDrawData->LockRect(0, &locked, nullptr, 0))) {
-                // Copy each draw's data as a row of 8 texels
+                // Copy each draw's data as one 16-texel row.
                 float* texData = (float*)locked.pBits;
                 UINT pitch = locked.Pitch / sizeof(float);  // floats per row
 
                 for (UINT d = 0; d < totalDraws; d++) {
                     const StatelessDrawData& src = fb.drawDataStaging[d];
                     float* row = texData + d * pitch;
-                    // 8 texels * 4 floats = 32 floats per draw
                     memcpy(row, &src, sizeof(StatelessDrawData));
                 }
                 fb.texDrawData->UnlockRect(0);
@@ -2136,237 +2135,229 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
     if (sceneCount == 0 && ImGuiManager::GetEnableStatelessBatch() && !fb.mergedBatches.empty()) {
         MGE_ZoneScopedN("replay_MergedBatchDraws");
 
-        // Calculate total vertices and indices needed
-        UINT totalMergedVerts = 0;
-        UINT totalMergedIndices = 0;
-        UINT vbSizeNeeded = 0;
+        IDirect3DVertexBuffer9* useVB = nullptr;
+        IDirect3DIndexBuffer9* useIB = nullptr;
+        const std::vector<CachedDrawInfo>* drawInfos = nullptr;
+        std::vector<CachedDrawInfo> builtDrawInfos;
 
-        // Compute total VB size accounting for per-batch stride and alignment padding
-        for (const auto& mb : fb.mergedBatches) {
-            totalMergedVerts += mb.totalVertices;
-            totalMergedIndices += mb.totalIndices;
-            // Each batch has its own expanded stride
-            if (!mb.callIndices.empty()) {
-                const auto& call = recCalls[mb.callIndices[0]];
-                UINT batchExpandedStride = call.rs.vbStride + sizeof(float);
-                vbSizeNeeded += mb.totalVertices * batchExpandedStride;
-                vbSizeNeeded += batchExpandedStride;  // Padding allowance for stride alignment
+        if (fb.useCachedMergedVB && fb.cachedMergedVB && fb.cachedMergedIB &&
+            fb.cachedDrawInfos.size() == fb.mergedBatches.size()) {
+            useVB = fb.cachedMergedVB;
+            useIB = fb.cachedMergedIB;
+            drawInfos = &fb.cachedDrawInfos;
+        } else {
+            UINT totalMergedVerts = 0;
+            UINT totalMergedIndices = 0;
+            UINT vbSizeNeeded = 0;
+
+            for (const auto& mb : fb.mergedBatches) {
+                totalMergedVerts += mb.totalVertices;
+                totalMergedIndices += mb.totalIndices;
+                if (!mb.callIndices.empty()) {
+                    const auto& call = recCalls[mb.callIndices[0]];
+                    UINT batchExpandedStride = call.rs.vbStride + sizeof(float);
+                    vbSizeNeeded += mb.totalVertices * batchExpandedStride;
+                    vbSizeNeeded += batchExpandedStride;
+                }
             }
-        }
-        UINT ibSizeNeeded = totalMergedIndices * sizeof(DWORD);  // 32-bit indices for >64k verts
+            UINT ibSizeNeeded = totalMergedIndices * sizeof(DWORD);  // 32-bit indices for >64k verts
 
-        // Create/resize dynamic VB if needed
-        if (fb.mergedVB == nullptr || fb.mergedVBSize < vbSizeNeeded) {
-            if (fb.mergedVB) fb.mergedVB->Release();
-            UINT newSize = std::max(vbSizeNeeded, 1024u * 1024u);  // Min 1MB
-            if (SUCCEEDED(device->CreateVertexBuffer(newSize, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
-                                                      0, D3DPOOL_DEFAULT, &fb.mergedVB, nullptr))) {
-                fb.mergedVBSize = newSize;
-                LOG::logline("MergedBatch: Created dynamic VB, %d bytes", newSize);
+            if (fb.mergedVB == nullptr || fb.mergedVBSize < vbSizeNeeded) {
+                if (fb.mergedVB) fb.mergedVB->Release();
+                UINT newSize = std::max(vbSizeNeeded, 1024u * 1024u);
+                if (SUCCEEDED(device->CreateVertexBuffer(newSize, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
+                                                         0, D3DPOOL_DEFAULT, &fb.mergedVB, nullptr))) {
+                    fb.mergedVBSize = newSize;
+                    LOG::logline("MergedBatch: Created dynamic VB, %d bytes", newSize);
+                }
             }
-        }
 
-        // Create/resize dynamic IB if needed (32-bit indices to support >64k vertices per batch)
-        if (fb.mergedIB == nullptr || fb.mergedIBSize < totalMergedIndices) {
-            if (fb.mergedIB) fb.mergedIB->Release();
-            UINT newCount = std::max(totalMergedIndices, 256u * 1024u);  // Min 256K indices
-            if (SUCCEEDED(device->CreateIndexBuffer(newCount * sizeof(DWORD), D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
-                                                     D3DFMT_INDEX32, D3DPOOL_DEFAULT, &fb.mergedIB, nullptr))) {
-                fb.mergedIBSize = newCount;
-                LOG::logline("MergedBatch: Created dynamic IB (32-bit), %d indices", newCount);
+            if (fb.mergedIB == nullptr || fb.mergedIBSize < totalMergedIndices) {
+                if (fb.mergedIB) fb.mergedIB->Release();
+                UINT newCount = std::max(totalMergedIndices, 256u * 1024u);
+                if (SUCCEEDED(device->CreateIndexBuffer(newCount * sizeof(DWORD), D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
+                                                        D3DFMT_INDEX32, D3DPOOL_DEFAULT, &fb.mergedIB, nullptr))) {
+                    fb.mergedIBSize = newCount;
+                    LOG::logline("MergedBatch: Created dynamic IB (32-bit), %d indices", newCount);
+                }
             }
-        }
 
-        if (fb.mergedVB && fb.mergedIB && vbSizeNeeded > 0 && ibSizeNeeded > 0) {
-            // Lock entire VB and IB
-            void* vbData = nullptr;
-            void* ibData = nullptr;
+            if (fb.mergedVB && fb.mergedIB && vbSizeNeeded > 0 && ibSizeNeeded > 0) {
+                void* vbData = nullptr;
+                void* ibData = nullptr;
+                bool vbLocked = false;
+                bool ibLocked = false;
 
-            if (SUCCEEDED(fb.mergedVB->Lock(0, vbSizeNeeded, &vbData, D3DLOCK_DISCARD)) &&
-                SUCCEEDED(fb.mergedIB->Lock(0, ibSizeNeeded, &ibData, D3DLOCK_DISCARD))) {
+                HRESULT hrVB = fb.mergedVB->Lock(0, vbSizeNeeded, &vbData, D3DLOCK_DISCARD);
+                if (SUCCEEDED(hrVB)) {
+                    vbLocked = true;
+                    HRESULT hrIB = fb.mergedIB->Lock(0, ibSizeNeeded, &ibData, D3DLOCK_DISCARD);
+                    if (SUCCEEDED(hrIB)) {
+                        ibLocked = true;
 
-                BYTE* vbBase = static_cast<BYTE*>(vbData);  // Keep base pointer
-                DWORD* ibDst = static_cast<DWORD*>(ibData);  // 32-bit indices
-                UINT vbByteOffset = 0;  // In bytes
-                UINT ibOffset = 0;      // In indices
+                        BYTE* vbBase = static_cast<BYTE*>(vbData);
+                        DWORD* ibDst = static_cast<DWORD*>(ibData);
+                        UINT vbByteOffset = 0;
+                        UINT ibOffset = 0;
 
-                // Track per-batch offsets for drawing
-                struct MergedDrawInfo {
-                    UINT vbByteOffset;     // Byte offset into merged VB
-                    UINT ibStartIndex;
-                    UINT vertCount;
-                    UINT primCount;
-                    UINT expandedStride;   // Per-batch stride
-                };
-                std::vector<MergedDrawInfo> drawInfos;
-                drawInfos.reserve(fb.mergedBatches.size());
+                        builtDrawInfos.reserve(fb.mergedBatches.size());
 
-                static bool loggedMergedDebug = false;
-                for (const auto& mb : fb.mergedBatches) {
-                    if (mb.callIndices.empty()) continue;
+                        static bool loggedMergedDebug = false;
+                        for (const auto& mb : fb.mergedBatches) {
+                            if (mb.callIndices.empty()) continue;
 
-                    // Get batch's stride from first call
-                    const auto& firstCall = recCalls[mb.callIndices[0]];
-                    UINT batchStride = firstCall.rs.vbStride;
-                    UINT batchExpandedStride = batchStride + sizeof(float);
+                            const auto& firstCall = recCalls[mb.callIndices[0]];
+                            UINT batchStride = firstCall.rs.vbStride;
+                            UINT batchExpandedStride = batchStride + sizeof(float);
 
-                    // ALIGNMENT FIX: Ensure vbByteOffset is a perfect multiple of this batch's stride
-                    // This prevents integer truncation in BaseVertexIndex calculation
-                    UINT remainder = vbByteOffset % batchExpandedStride;
-                    if (remainder != 0) {
-                        vbByteOffset += (batchExpandedStride - remainder);
-                    }
-
-                    // Define the specific destination pointer for THIS batch
-                    BYTE* vbDst = vbBase + vbByteOffset;
-
-                    // Debug: log merged batch info once
-                    if (!loggedMergedDebug) {
-                        LOG::logline("MergedBatch DEBUG: calls=%d, batchStride=%d, expandedStride=%d, FVF=0x%X, drawDataOffset=%d",
-                            (int)mb.callIndices.size(), batchStride, batchExpandedStride, mb.key.fvf, mb.drawDataOffset);
-                    }
-
-                    MergedDrawInfo info;
-                    info.vbByteOffset = vbByteOffset;
-                    info.ibStartIndex = ibOffset;
-                    info.vertCount = 0;
-                    info.primCount = 0;
-                    info.expandedStride = batchExpandedStride;
-
-                    UINT localVertOffset = 0;  // Vertex offset within this batch
-
-                    for (size_t i = 0; i < mb.callIndices.size(); i++) {
-                        size_t callIdx = mb.callIndices[i];
-                        const auto& call = recCalls[callIdx];
-                        UINT drawIndex = mb.drawDataOffset + (UINT)i;  // Index into draw data texture
-
-                        // Use this call's actual stride for source data (should match batchStride)
-                        UINT srcStride = call.rs.vbStride;
-
-                        // Debug: log first few calls
-                        if (!loggedMergedDebug && i < 3) {
-                            LOG::logline("  Call %d: drawIndex=%d, srcStride=%d, vertCount=%d",
-                                (int)i, drawIndex, srcStride, call.rs.vertCount);
-                        }
-
-                        // Detect IB format (16-bit vs 32-bit)
-                        D3DINDEXBUFFER_DESC ibDesc;
-                        call.rs.ib->GetDesc(&ibDesc);
-                        bool is32Bit = (ibDesc.Format == D3DFMT_INDEX32);
-                        UINT idxSize = is32Bit ? 4 : 2;
-
-                        UINT indexCount = call.rs.primCount * 3;
-                        void* srcIndicesRaw = nullptr;
-
-                        if (call.rs.ib && SUCCEEDED(call.rs.ib->Lock(call.rs.startIndex * idxSize,
-                                                    indexCount * idxSize,
-                                                    &srcIndicesRaw, D3DLOCK_READONLY))) {
-
-                            UINT realMaxIdx = 0;
-                            UINT realMinIdx = 0xFFFFFFFF;
-
-                            if (is32Bit) {
-                                const DWORD* srcIdx32 = static_cast<const DWORD*>(srcIndicesRaw);
-
-                                // Find the absolute maximum index used
-                                for (UINT idx = 0; idx < indexCount; idx++) {
-                                    if (srcIdx32[idx] > realMaxIdx) realMaxIdx = srcIdx32[idx];
-                                }
-
-                                // Since we only have 'vertCount' vertices, the min index CANNOT be
-                                // less than (Max - vertCount). This ignores 0-padding/degenerates!
-                                UINT absoluteFloor = (realMaxIdx > call.rs.vertCount) ? (realMaxIdx - call.rs.vertCount) : 0;
-
-                                for (UINT idx = 0; idx < indexCount; idx++) {
-                                    if (srcIdx32[idx] >= absoluteFloor && srcIdx32[idx] < realMinIdx) {
-                                        realMinIdx = srcIdx32[idx];
-                                    }
-                                }
-
-                                // Rebase indices
-                                for (UINT idx = 0; idx < indexCount; idx++) {
-                                    ibDst[idx] = (srcIdx32[idx] - realMinIdx) + localVertOffset;
-                                }
-                            } else {
-                                const WORD* srcIdx16 = static_cast<const WORD*>(srcIndicesRaw);
-
-                                // Find the absolute maximum index used
-                                for (UINT idx = 0; idx < indexCount; idx++) {
-                                    if (srcIdx16[idx] > realMaxIdx) realMaxIdx = srcIdx16[idx];
-                                }
-
-                                // Since we only have 'vertCount' vertices, the min index CANNOT be
-                                // less than (Max - vertCount). This ignores 0-padding/degenerates!
-                                UINT absoluteFloor = (realMaxIdx > call.rs.vertCount) ? (realMaxIdx - call.rs.vertCount) : 0;
-
-                                for (UINT idx = 0; idx < indexCount; idx++) {
-                                    if (srcIdx16[idx] >= absoluteFloor && srcIdx16[idx] < realMinIdx) {
-                                        realMinIdx = srcIdx16[idx];
-                                    }
-                                }
-
-                                // Rebase indices
-                                for (UINT idx = 0; idx < indexCount; idx++) {
-                                    ibDst[idx] = (DWORD)(srcIdx16[idx] - realMinIdx) + localVertOffset;
-                                }
+                            UINT remainder = vbByteOffset % batchExpandedStride;
+                            if (remainder != 0) {
+                                vbByteOffset += (batchExpandedStride - remainder);
                             }
 
-                            ibDst += indexCount;
-                            call.rs.ib->Unlock();
+                            BYTE* vbDst = vbBase + vbByteOffset;
 
-                            // Now copy vertices starting at the REAL minimum index
-                            // The real start in the original buffer is baseIndex + realMinIdx
-                            UINT srcVertexStart = call.rs.baseIndex + realMinIdx;
-                            UINT srcLockOffset = call.rs.vbOffset + (srcVertexStart * srcStride);
-
-                            void* srcVerts = nullptr;
-                            if (call.rs.vb && SUCCEEDED(call.rs.vb->Lock(srcLockOffset,
-                                                        call.rs.vertCount * srcStride,
-                                                        &srcVerts, D3DLOCK_READONLY))) {
-                                const BYTE* src = static_cast<const BYTE*>(srcVerts);
-                                for (UINT v = 0; v < call.rs.vertCount; v++) {
-                                    // Copy original vertex data (use min of source and batch stride for safety)
-                                    UINT copySize = std::min(srcStride, batchStride);
-                                    memcpy(vbDst, src, copySize);
-                                    // Append drawIndex as float at batch stride offset
-                                    float* drawIdxPtr = reinterpret_cast<float*>(vbDst + batchStride);
-                                    *drawIdxPtr = (float)drawIndex;
-                                    // Debug: log first vertex of first call
-                                    if (!loggedMergedDebug && v == 0 && i == 0) {
-                                        LOG::logline("  DrawIndex write: drawIndex=%d at offset %d, expandedStride=%d, wrote %.1f",
-                                            drawIndex, batchStride, batchExpandedStride, *drawIdxPtr);
-                                    }
-                                    vbDst += batchExpandedStride;
-                                    src += srcStride;
-                                }
-                                call.rs.vb->Unlock();
+                            if (!loggedMergedDebug) {
+                                LOG::logline("MergedBatch DEBUG: calls=%d, batchStride=%d, expandedStride=%d, FVF=0x%X, drawDataOffset=%d",
+                                    (int)mb.callIndices.size(), batchStride, batchExpandedStride, mb.key.fvf, mb.drawDataOffset);
                             }
+
+                            CachedDrawInfo info = {};
+                            info.vbByteOffset = vbByteOffset;
+                            info.ibStartIndex = ibOffset;
+                            info.expandedStride = batchExpandedStride;
+
+                            UINT localVertOffset = 0;
+
+                            for (size_t i = 0; i < mb.callIndices.size(); i++) {
+                                size_t callIdx = mb.callIndices[i];
+                                const auto& call = recCalls[callIdx];
+                                UINT drawIndex = mb.drawDataOffset + (UINT)i;
+                                UINT srcStride = call.rs.vbStride;
+
+                                if (!loggedMergedDebug && i < 3) {
+                                    LOG::logline("  Call %d: drawIndex=%d, srcStride=%d, vertCount=%d",
+                                        (int)i, drawIndex, srcStride, call.rs.vertCount);
+                                }
+
+                                D3DINDEXBUFFER_DESC ibDesc = {};
+                                call.rs.ib->GetDesc(&ibDesc);
+                                bool is32Bit = (ibDesc.Format == D3DFMT_INDEX32);
+                                UINT idxSize = is32Bit ? 4 : 2;
+
+                                UINT indexCount = call.rs.primCount * 3;
+                                void* srcIndicesRaw = nullptr;
+
+                                if (call.rs.ib && SUCCEEDED(call.rs.ib->Lock(call.rs.startIndex * idxSize,
+                                                                            indexCount * idxSize,
+                                                                            &srcIndicesRaw, D3DLOCK_READONLY))) {
+                                    UINT realMaxIdx = 0;
+                                    UINT realMinIdx = 0xFFFFFFFF;
+
+                                    if (is32Bit) {
+                                        const DWORD* srcIdx32 = static_cast<const DWORD*>(srcIndicesRaw);
+                                        for (UINT idx = 0; idx < indexCount; idx++) {
+                                            if (srcIdx32[idx] > realMaxIdx) realMaxIdx = srcIdx32[idx];
+                                        }
+
+                                        UINT absoluteFloor = (realMaxIdx > call.rs.vertCount) ? (realMaxIdx - call.rs.vertCount) : 0;
+                                        for (UINT idx = 0; idx < indexCount; idx++) {
+                                            if (srcIdx32[idx] >= absoluteFloor && srcIdx32[idx] < realMinIdx) {
+                                                realMinIdx = srcIdx32[idx];
+                                            }
+                                        }
+
+                                        for (UINT idx = 0; idx < indexCount; idx++) {
+                                            ibDst[idx] = (srcIdx32[idx] - realMinIdx) + localVertOffset;
+                                        }
+                                    } else {
+                                        const WORD* srcIdx16 = static_cast<const WORD*>(srcIndicesRaw);
+                                        for (UINT idx = 0; idx < indexCount; idx++) {
+                                            if (srcIdx16[idx] > realMaxIdx) realMaxIdx = srcIdx16[idx];
+                                        }
+
+                                        UINT absoluteFloor = (realMaxIdx > call.rs.vertCount) ? (realMaxIdx - call.rs.vertCount) : 0;
+                                        for (UINT idx = 0; idx < indexCount; idx++) {
+                                            if (srcIdx16[idx] >= absoluteFloor && srcIdx16[idx] < realMinIdx) {
+                                                realMinIdx = srcIdx16[idx];
+                                            }
+                                        }
+
+                                        for (UINT idx = 0; idx < indexCount; idx++) {
+                                            ibDst[idx] = (DWORD)(srcIdx16[idx] - realMinIdx) + localVertOffset;
+                                        }
+                                    }
+
+                                    ibDst += indexCount;
+                                    call.rs.ib->Unlock();
+
+                                    UINT srcVertexStart = call.rs.baseIndex + realMinIdx;
+                                    UINT srcLockOffset = call.rs.vbOffset + (srcVertexStart * srcStride);
+
+                                    void* srcVerts = nullptr;
+                                    if (call.rs.vb && SUCCEEDED(call.rs.vb->Lock(srcLockOffset,
+                                                                                call.rs.vertCount * srcStride,
+                                                                                &srcVerts, D3DLOCK_READONLY))) {
+                                        const BYTE* src = static_cast<const BYTE*>(srcVerts);
+                                        for (UINT v = 0; v < call.rs.vertCount; v++) {
+                                            UINT copySize = std::min(srcStride, batchStride);
+                                            memcpy(vbDst, src, copySize);
+                                            float* drawIdxPtr = reinterpret_cast<float*>(vbDst + batchStride);
+                                            *drawIdxPtr = (float)drawIndex;
+                                            if (!loggedMergedDebug && v == 0 && i == 0) {
+                                                LOG::logline("  DrawIndex write: drawIndex=%d at offset %d, expandedStride=%d, wrote %.1f",
+                                                    drawIndex, batchStride, batchExpandedStride, *drawIdxPtr);
+                                            }
+                                            vbDst += batchExpandedStride;
+                                            src += srcStride;
+                                        }
+                                        call.rs.vb->Unlock();
+                                    }
+                                }
+
+                                localVertOffset += call.rs.vertCount;
+                                info.vertCount += call.rs.vertCount;
+                                info.primCount += call.rs.primCount;
+                                vbByteOffset += call.rs.vertCount * batchExpandedStride;
+                                ibOffset += indexCount;
+                            }
+
+                            builtDrawInfos.push_back(info);
+                            loggedMergedDebug = true;
                         }
-
-                        localVertOffset += call.rs.vertCount;
-                        info.vertCount += call.rs.vertCount;
-                        info.primCount += call.rs.primCount;
-                        vbByteOffset += call.rs.vertCount * batchExpandedStride;
-                        ibOffset += indexCount;
-
-                        // Mark this call as handled
-                        mergedBatchIndices.insert(callIdx);
                     }
-
-                    drawInfos.push_back(info);
-                    loggedMergedDebug = true;  // Only log first batch
                 }
 
-                fb.mergedVB->Unlock();
-                fb.mergedIB->Unlock();
-
-                // Now issue draw calls for each merged batch
-                static bool loggedMerge = false;
-                if (!loggedMerge) {
-                    loggedMerge = true;
-                    LOG::logline("MergedBatch: %d batches ready, %d total verts, %d total indices",
-                                 (int)fb.mergedBatches.size(), totalMergedVerts, totalMergedIndices);
+                if (ibLocked) {
+                    fb.mergedIB->Unlock();
                 }
+                if (vbLocked) {
+                    fb.mergedVB->Unlock();
+                }
+
+                if (ibLocked && vbLocked && builtDrawInfos.size() == fb.mergedBatches.size()) {
+                    useVB = fb.mergedVB;
+                    useIB = fb.mergedIB;
+                    drawInfos = &builtDrawInfos;
+
+                    FixedFunctionShader::storeCellBatchCacheVB(fb.cellBatchCacheKey, fb.mergedVB, fb.mergedIB, builtDrawInfos);
+
+                    static bool loggedMerge = false;
+                    if (!loggedMerge) {
+                        loggedMerge = true;
+                        LOG::logline("MergedBatch: %d batches ready, %d total verts, %d total indices (stored in cache)",
+                                     (int)fb.mergedBatches.size(), totalMergedVerts, totalMergedIndices);
+                    }
+                }
+            }
+        }
+
+        if (useVB && useIB && drawInfos && drawInfos->size() == fb.mergedBatches.size()) {
+            for (const auto& mb : fb.mergedBatches) {
+                for (size_t callIdx : mb.callIndices) {
+                    mergedBatchIndices.insert(callIdx);
+                }
+            }
 
                 // Cache for merged vertex declarations (FVF+stride -> decl with appended drawIndex)
                 // Key combines FVF (low 32 bits) with stride (high 32 bits) to handle edge cases
@@ -2451,12 +2442,12 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     return decl;
                 };
 
-                // Draw each merged batch
-                device->SetIndices(fb.mergedIB);
+            // Draw each merged batch
+            device->SetIndices(useIB);
 
                 for (size_t bi = 0; bi < fb.mergedBatches.size(); bi++) {
                     const auto& mb = fb.mergedBatches[bi];
-                    const auto& di = drawInfos[bi];
+                    const auto& di = (*drawInfos)[bi];
                     if (di.vertCount == 0 || di.primCount == 0) continue;
 
                     // Get first call for shader setup
@@ -2596,31 +2587,28 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     device->SetRenderState(D3DRS_ZWRITEENABLE, (mb.key.zState >> 2) & 0x1);
                     device->SetRenderState(D3DRS_CULLMODE, mb.key.cullMode);
 
-                    // Set up vertex stream - offset 0, use BaseVertexIndex for batch positioning
-                    device->SetVertexDeclaration(mergedDecl);
-                    device->SetStreamSource(0, fb.mergedVB, 0, di.expandedStride);
-                    device->SetStreamSourceFreq(0, 1);  // Not instanced
-                    device->SetStreamSource(1, nullptr, 0, 0);
+                // Set up vertex stream - offset 0, use BaseVertexIndex for batch positioning
+                device->SetVertexDeclaration(mergedDecl);
+                device->SetStreamSource(0, useVB, 0, di.expandedStride);
+                device->SetStreamSourceFreq(0, 1);  // Not instanced
+                device->SetStreamSource(1, nullptr, 0, 0);
 
-                    // Draw merged geometry
-                    // Use BaseVertexIndex to offset into merged VB (avoids double-offset with stream offset)
-                    // Indices are local to batch (rebased during copy)
-                    INT baseVertex = (INT)(di.vbByteOffset / di.expandedStride);
-                    device->DrawIndexedPrimitive(
-                        D3DPT_TRIANGLELIST,
-                        baseVertex,           // BaseVertexIndex - added to each index by GPU
-                        0,                    // MinIndex
-                        di.vertCount,
-                        di.ibStartIndex,
-                        di.primCount
-                    );
+                // Draw merged geometry
+                // Use BaseVertexIndex to offset into merged VB (avoids double-offset with stream offset)
+                // Indices are local to batch (rebased during copy)
+                INT baseVertex = (INT)(di.vbByteOffset / di.expandedStride);
+                device->DrawIndexedPrimitive(
+                    D3DPT_TRIANGLELIST,
+                    baseVertex,           // BaseVertexIndex - added to each index by GPU
+                    0,                    // MinIndex
+                    di.vertCount,
+                    di.ibStartIndex,
+                    di.primCount
+                );
 
-                    mergedDrawCalls++;
-                }
-                // NOTE: Texture cleanup moved to consolidated section after both batch types
-            } else {
-                if (vbData) fb.mergedVB->Unlock();
+                mergedDrawCalls++;
             }
+            // NOTE: Texture cleanup moved to consolidated section after both batch types
         }
     }
 

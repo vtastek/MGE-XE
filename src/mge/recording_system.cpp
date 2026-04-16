@@ -357,6 +357,8 @@ void FixedFunctionShader::startRecording() {
             }
             softwareOcclusionCuller.clearBlacklist();
             softwareOcclusionCuller.clearMeshCache();
+            // Clear cell batch caches - VB pointers may be reused across int/ext boundary
+            FixedFunctionShader::clearAllCellBatchCaches();
             lastWasExterior = isExterior;
         } else if (currentCell != lastPlayerCell) {
             // Any cell change (exterior-to-exterior, interior-to-interior): clear geometry caches

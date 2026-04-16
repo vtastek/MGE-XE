@@ -179,7 +179,7 @@ struct StatelessDrawData {
     float emissive[4];     // Texel 5: Emissive RGB, alphaRef in W
     float lightParams[4];  // Texel 6: {pointLightCount, texelSize, texelOffset, vertexMaterial}
     float flags[4];        // Texel 7: WorldView matrix 4th column {wv._14, wv._24, wv._34, wv._44}
-    float normres[4];      // Texel 8: {normres.x, normres.y, 0, 0} - parameter texture resolution
+    float normres[4];      // Texel 8: {normres.x, normres.y, 0, visibility} - parameter texture resolution, visibility flag (1.0=visible, 0.0=hidden)
     float reserved1[4];    // Texel 9: Reserved for future use
     float reserved2[4];    // Texel 10: Reserved for future use
     float reserved3[4];    // Texel 11: Reserved for future use
@@ -267,6 +267,7 @@ struct MergedBatchKey {
     uint8_t zState;
     uint8_t cullMode;
     uint8_t useLighting;
+    uint8_t bin;                    // Keep Opaque/Terrain separate for suppression/debugging
     DWORD fvf;                      // Must match for merging
     UINT stride;                    // Vertex stride must match for merging
 
@@ -274,6 +275,7 @@ struct MergedBatchKey {
         return texture == o.texture &&
                blendState == o.blendState && zState == o.zState &&
                cullMode == o.cullMode && useLighting == o.useLighting &&
+               bin == o.bin &&
                fvf == o.fvf && stride == o.stride;
     }
 
@@ -281,7 +283,8 @@ struct MergedBatchKey {
         size_t operator()(const MergedBatchKey& k) const {
             size_t h = reinterpret_cast<size_t>(k.texture);
             h ^= (k.blendState | (k.zState << 16) | (k.cullMode << 24)) + 0x9e3779b9 + (h << 6) + (h >> 2);
-            h ^= (k.fvf | ((size_t)k.useLighting << 28)) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= k.fvf + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= (k.useLighting | ((size_t)k.bin << 8)) + 0x9e3779b9 + (h << 6) + (h >> 2);
             h ^= k.stride + 0x9e3779b9 + (h << 6) + (h >> 2);
             return h;
         }
@@ -295,6 +298,93 @@ struct MergedBatch {
     UINT totalVertices;               // Sum of all vertex counts
     UINT totalIndices;                // Sum of all index counts
     UINT drawDataOffset;              // Start index in draw data texture
+};
+
+// ============================================================================
+// Cell-Based Batch Cache - caches merged VB/IB per cell for static geometry
+// ============================================================================
+
+// Info about each draw in a cached batch (for rendering)
+struct CachedDrawInfo {
+    UINT vbByteOffset;     // Byte offset into merged VB for this batch
+    UINT ibStartIndex;     // Start index into merged IB for this batch
+    UINT vertCount;        // Total vertices in this batch
+    UINT primCount;        // Total primitives in this batch
+    UINT expandedStride;   // Vertex stride (original + drawIndex float)
+};
+
+// Cached batch metadata used to validate that a cell's merged layout is unchanged.
+struct CachedBatchTemplate {
+    MergedBatchKey key;
+    UINT totalVertices;
+    UINT totalIndices;
+    UINT drawDataOffset;
+    UINT drawCount;
+
+    bool operator==(const CachedBatchTemplate& other) const {
+        return key == other.key &&
+               totalVertices == other.totalVertices &&
+               totalIndices == other.totalIndices &&
+               drawDataOffset == other.drawDataOffset &&
+               drawCount == other.drawCount;
+    }
+};
+
+// Geometry/layout identity for one merged draw entry inside a cached cell batch.
+// Includes vbOffset because MeshKey alone does not distinguish subranges in a shared VB.
+struct CachedMergedCallLayout {
+    MeshKey mesh;
+    UINT vbOffset;
+    UINT vbStride;
+    MergedBatchKey batchKey;
+
+    bool operator==(const CachedMergedCallLayout& other) const {
+        return mesh == other.mesh &&
+               vbOffset == other.vbOffset &&
+               vbStride == other.vbStride &&
+               batchKey == other.batchKey;
+    }
+};
+
+// Cache entry for one cell's merged batches
+struct CellBatchCache {
+    void* cellPtr = nullptr;
+    bool valid = false;
+    uint64_t lastUsedSerial = 0;
+
+    // Cached geometry (owned by cache, not FrameBuffer)
+    IDirect3DVertexBuffer9* mergedVB = nullptr;
+    IDirect3DIndexBuffer9* mergedIB = nullptr;
+    UINT vbSizeBytes = 0;
+    UINT ibSizeIndices = 0;
+
+    // Cached batch structure (texture + state per batch)
+    std::vector<CachedBatchTemplate> batches;
+
+    // Draw info for rendering (one per batch)
+    std::vector<CachedDrawInfo> drawInfos;
+
+    // Layout signature for all merged draw entries in batch/draw order.
+    std::vector<CachedMergedCallLayout> mergedLayout;
+
+    bool hasGeometry() const {
+        return valid && mergedVB && mergedIB && drawInfos.size() == batches.size() && !batches.empty();
+    }
+
+    void invalidate() { release(); }
+
+    void release() {
+        if (mergedVB) { mergedVB->Release(); mergedVB = nullptr; }
+        if (mergedIB) { mergedIB->Release(); mergedIB = nullptr; }
+        batches.clear();
+        drawInfos.clear();
+        mergedLayout.clear();
+        vbSizeBytes = 0;
+        ibSizeIndices = 0;
+        lastUsedSerial = 0;
+        valid = false;
+        cellPtr = nullptr;
+    }
 };
 
 // Dirty flags for performance mode (dirty tracking between frames)
@@ -992,6 +1082,13 @@ public:
         UINT mergedVBSize = 0;                       // Current VB capacity in bytes
         UINT mergedIBSize = 0;                       // Current IB capacity in indices
 
+        // Cell batch cache references (set by buildStatelessBatches on cache hit)
+        void* cellBatchCacheKey = nullptr;                // Cell pointer the merged batches belong to
+        bool useCachedMergedVB = false;              // True if using cached VB/IB
+        IDirect3DVertexBuffer9* cachedMergedVB = nullptr;  // AddRef'd from cache for frame-safe use
+        IDirect3DIndexBuffer9* cachedMergedIB = nullptr;   // AddRef'd from cache for frame-safe use
+        std::vector<CachedDrawInfo> cachedDrawInfos;       // Draw info for cached batches
+
         void clear() {
             recordedCalls.clear();
             recordedCallsScene1.clear();
@@ -1014,6 +1111,18 @@ public:
             drawDataStaging.clear();
             mergedBatches.clear();
             // Note: texDrawData, mergedVB, mergedIB are NOT released here - reused across frames
+            // Reset cache references owned by this frame buffer.
+            cellBatchCacheKey = nullptr;
+            useCachedMergedVB = false;
+            if (cachedMergedVB) {
+                cachedMergedVB->Release();
+                cachedMergedVB = nullptr;
+            }
+            if (cachedMergedIB) {
+                cachedMergedIB->Release();
+                cachedMergedIB = nullptr;
+            }
+            cachedDrawInfos.clear();
             valid = false;
             // Initialize matrices to identity to prevent garbage if capture functions aren't called
             D3DXMatrixIdentity(&view);
@@ -1126,6 +1235,10 @@ public:
 
     // Merged batching
     static void buildStatelessBatches(FrameBuffer& fb);  // Build merged batches (per-draw data in texture)
+    static void invalidateCellBatchCache(void* cellPtr); // Invalidate cache for specific cell
+    static void clearAllCellBatchCaches();               // Clear all cell batch caches
+    static void storeCellBatchCacheVB(void* cellPtr, IDirect3DVertexBuffer9* vb, IDirect3DIndexBuffer9* ib,
+                                      const std::vector<CachedDrawInfo>& drawInfos);  // Store VB/IB in cache
 
     // Scene lifecycle for triple-buffered pipeline
     static void markSceneStart(int sceneNum, bool isUI = false);

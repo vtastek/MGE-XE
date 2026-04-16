@@ -7,6 +7,7 @@
 #include "imgui_manager.h"
 #include "mge_tracy.h"
 #include "texture_suffix.h"
+#include "mwbridge.h"
 
 #include <algorithm>
 #include <vector>
@@ -50,6 +51,123 @@ static SRWLOCK s_geometryHashLock = SRWLOCK_INIT;
 // Allows recognizing identical geometry at different world positions
 static std::unordered_map<size_t, LocalMeshData> s_localMeshCache;
 static SRWLOCK s_localMeshLock = SRWLOCK_INIT;
+
+// Cell batch cache: caches merged VB/IB per cell to avoid regenerating geometry every frame
+// Key is cell pointer from MWBridge::getPlayerCell()
+static std::unordered_map<void*, CellBatchCache> s_cellBatchCaches;
+static SRWLOCK s_cellBatchCacheLock = SRWLOCK_INIT;
+static constexpr size_t MAX_CACHED_CELLS = 4;  // Memory limit for cached cells
+static uint64_t s_cellBatchCacheUseSerial = 0;
+
+static MeshKey makeMeshKey(const FixedFunctionShader::HLSLRecordedCall& call);
+
+static CachedBatchTemplate makeCachedBatchTemplate(const MergedBatch& batch) {
+    CachedBatchTemplate templ = {};
+    templ.key = batch.key;
+    templ.totalVertices = batch.totalVertices;
+    templ.totalIndices = batch.totalIndices;
+    templ.drawDataOffset = batch.drawDataOffset;
+    templ.drawCount = (UINT)batch.callIndices.size();
+    return templ;
+}
+
+static CachedMergedCallLayout makeCachedMergedCallLayout(
+    const FixedFunctionShader::HLSLRecordedCall& call,
+    const MergedBatchKey& batchKey)
+{
+    CachedMergedCallLayout layout = {};
+    layout.mesh = makeMeshKey(call);
+    layout.vbOffset = call.rs.vbOffset;
+    layout.vbStride = call.rs.vbStride;
+    layout.batchKey = batchKey;
+    return layout;
+}
+
+// Invalidate cell batch cache for a specific cell
+void FixedFunctionShader::invalidateCellBatchCache(void* cellPtr) {
+    AcquireSRWLockExclusive(&s_cellBatchCacheLock);
+    auto it = s_cellBatchCaches.find(cellPtr);
+    if (it != s_cellBatchCaches.end()) {
+        it->second.release();
+        s_cellBatchCaches.erase(it);
+    }
+    ReleaseSRWLockExclusive(&s_cellBatchCacheLock);
+}
+
+// Clear all cell batch caches (called on interior/exterior transition)
+void FixedFunctionShader::clearAllCellBatchCaches() {
+    AcquireSRWLockExclusive(&s_cellBatchCacheLock);
+    for (auto& kv : s_cellBatchCaches) {
+        kv.second.release();
+    }
+    s_cellBatchCaches.clear();
+    ReleaseSRWLockExclusive(&s_cellBatchCacheLock);
+}
+
+// Evict least recently used cache if over limit.
+// Caller must hold s_cellBatchCacheLock exclusively.
+static void evictLRUCellBatchCacheLocked(void* protectedCellPtr) {
+    if (s_cellBatchCaches.size() > MAX_CACHED_CELLS) {
+        auto victim = s_cellBatchCaches.end();
+        uint64_t oldestUse = ~0ull;
+
+        for (auto it = s_cellBatchCaches.begin(); it != s_cellBatchCaches.end(); ++it) {
+            if (it->first == protectedCellPtr)
+                continue;
+            if (it->second.lastUsedSerial < oldestUse) {
+                oldestUse = it->second.lastUsedSerial;
+                victim = it;
+            }
+        }
+
+        if (victim != s_cellBatchCaches.end()) {
+            victim->second.release();
+            s_cellBatchCaches.erase(victim);
+        }
+    }
+}
+
+// Store VB/IB in cell batch cache (called by hlsl_replay after building VB/IB)
+void FixedFunctionShader::storeCellBatchCacheVB(void* cellPtr, IDirect3DVertexBuffer9* vb,
+                                                  IDirect3DIndexBuffer9* ib,
+                                                  const std::vector<CachedDrawInfo>& drawInfos) {
+    if (!cellPtr || !vb || !ib || drawInfos.empty())
+        return;
+
+    AcquireSRWLockExclusive(&s_cellBatchCacheLock);
+    auto it = s_cellBatchCaches.find(cellPtr);
+    if (it != s_cellBatchCaches.end()) {
+        CellBatchCache& cache = it->second;
+        if (cache.mergedVB) {
+            cache.mergedVB->Release();
+            cache.mergedVB = nullptr;
+        }
+        if (cache.mergedIB) {
+            cache.mergedIB->Release();
+            cache.mergedIB = nullptr;
+        }
+
+        if (vb) vb->AddRef();
+        if (ib) ib->AddRef();
+        cache.mergedVB = vb;
+        cache.mergedIB = ib;
+        cache.drawInfos = drawInfos;
+        cache.valid = true;
+        cache.lastUsedSerial = ++s_cellBatchCacheUseSerial;
+
+        UINT vbSizeBytes = 0;
+        UINT ibSizeIndices = 0;
+        for (const auto& info : drawInfos) {
+            vbSizeBytes = std::max(vbSizeBytes, info.vbByteOffset + (info.vertCount * info.expandedStride));
+            ibSizeIndices = std::max(ibSizeIndices, info.ibStartIndex + (info.primCount * 3));
+        }
+        cache.vbSizeBytes = vbSizeBytes;
+        cache.ibSizeIndices = ibSizeIndices;
+
+        LOG::logline("CellBatchCache: Stored VB/IB for cell=%p, %d drawInfos", cellPtr, (int)drawInfos.size());
+    }
+    ReleaseSRWLockExclusive(&s_cellBatchCacheLock);
+}
 
 // Compute geometry hash from VB content (samples first N vertices for speed)
 static size_t computeGeometryHash(IDirect3DVertexBuffer9* vb, UINT offset, UINT stride,
@@ -882,143 +1000,252 @@ bool FixedFunctionShader::computeBoundingBox(const RenderedState* rs, D3DXVECTOR
     return true;
 }
 
+// Helper to create MeshKey from recorded call
+static MeshKey makeMeshKey(const FixedFunctionShader::HLSLRecordedCall& call) {
+    MeshKey key;
+    key.vb = call.rs.vb;
+    key.ib = call.rs.ib;
+    key.fvf = call.rs.fvf;
+    key.baseIndex = call.rs.baseIndex;
+    key.vertCount = call.rs.vertCount;
+    key.startIndex = call.rs.startIndex;
+    key.primCount = call.rs.primCount;
+    return key;
+}
+
+// Helper to fill StatelessDrawData from a recorded call
+static void fillDrawData(StatelessDrawData& data, const FixedFunctionShader::HLSLRecordedCall& call,
+                         bool highlightBatches, bool isVisible) {
+    const D3DXMATRIX& wv = call.rs.worldViewTransforms[0];
+    data.world0[0] = wv._11; data.world0[1] = wv._21; data.world0[2] = wv._31; data.world0[3] = wv._41;
+    data.world1[0] = wv._12; data.world1[1] = wv._22; data.world1[2] = wv._32; data.world1[3] = wv._42;
+    data.world2[0] = wv._13; data.world2[1] = wv._23; data.world2[2] = wv._33; data.world2[3] = wv._43;
+
+    // Material (tint green if highlighting)
+    float tintR = highlightBatches ? 0.3f : 1.0f;
+    float tintG = highlightBatches ? 1.0f : 1.0f;
+    float tintB = highlightBatches ? 0.3f : 1.0f;
+    data.diffuse[0] = call.frs.material.diffuse.r * tintR;
+    data.diffuse[1] = call.frs.material.diffuse.g * tintG;
+    data.diffuse[2] = call.frs.material.diffuse.b * tintB;
+    data.diffuse[3] = call.frs.material.diffuse.a;
+
+    data.ambient[0] = call.frs.material.ambient.r;
+    data.ambient[1] = call.frs.material.ambient.g;
+    data.ambient[2] = call.frs.material.ambient.b;
+    data.ambient[3] = call.frs.material.ambient.a;
+
+    // Store normres (parameter texture resolution) and visibility flag
+    float normresX = 512.0f, normresY = 512.0f;  // Default fallback
+    if (call.sk.hasParamH && call.rs.texture) {
+        D3DSURFACE_DESC desc;
+        if (SUCCEEDED(call.rs.texture->GetLevelDesc(0, &desc))) {
+            normresX = (float)desc.Width;
+            normresY = (float)desc.Height;
+        }
+    }
+    data.normres[0] = normresX;
+    data.normres[1] = normresY;
+    data.normres[2] = 0.0f;
+    data.normres[3] = isVisible ? 1.0f : 0.0f;  // Visibility flag
+
+    // Zero out reserved texels
+    memset(data.reserved1, 0, sizeof(data.reserved1));
+    memset(data.reserved2, 0, sizeof(data.reserved2));
+    memset(data.reserved3, 0, sizeof(data.reserved3));
+    memset(data.reserved4, 0, sizeof(data.reserved4));
+    memset(data.reserved5, 0, sizeof(data.reserved5));
+    memset(data.reserved6, 0, sizeof(data.reserved6));
+    memset(data.reserved7, 0, sizeof(data.reserved7));
+
+    data.emissive[0] = call.frs.material.emissive.r;
+    data.emissive[1] = call.frs.material.emissive.g;
+    data.emissive[2] = call.frs.material.emissive.b;
+    data.emissive[3] = (float)call.rs.alphaRef / 255.0f;
+
+    data.lightParams[0] = 0.0f;  // Will be filled with lightCount later
+    data.lightParams[1] = 0.0f;  // Will be filled with texelSize later
+    data.lightParams[2] = 0.0f;  // Will be filled with texelOffset later
+    data.lightParams[3] = (float)call.sk.vertexMaterial;  // Material mode (1/2/3)
+
+    // Full 4th column of worldView for robust w computation
+    data.flags[0] = wv._14;
+    data.flags[1] = wv._24;
+    data.flags[2] = wv._34;
+    data.flags[3] = wv._44;
+}
+
+// Check if a call is batchable (Opaque/Terrain, no skinning/grass/vertexBlending)
+static bool isBatchableCall(const FixedFunctionShader::HLSLRecordedCall& call) {
+    // Merged batches rebuild indexed triangle-list geometry into a new VB/IB.
+    if (call.rs.primType != D3DPT_TRIANGLELIST || !call.rs.vb || !call.rs.ib)
+        return false;
+
+    // Only batch Opaque/Terrain bins (no Skinning, no Grass, no Blending)
+    if (call.bin != RenderBin::Opaque && call.bin != RenderBin::Terrain)
+        return false;
+
+    // Skip geometry with vertex blending
+    if (call.rs.vertexBlendState != 0)
+        return false;
+
+    // Skip geometry that can't be merged
+    if (call.sk.usesSkinning || call.sk.hasGrass)
+        return false;
+
+    return true;
+}
+
+// Create MergedBatchKey from a recorded call
+static MergedBatchKey makeMergedBatchKey(const FixedFunctionShader::HLSLRecordedCall& call) {
+    MergedBatchKey mkey;
+    mkey.texture = call.rs.texture;
+    mkey.blendState = (uint16_t)((call.expectedState.captured ? call.expectedState.alphaBlendEnable : 0) |
+                     ((call.expectedState.captured ? call.expectedState.srcBlend : 0) << 4) |
+                     ((call.expectedState.captured ? call.expectedState.destBlend : 0) << 8));
+    mkey.zState = (uint8_t)((call.expectedState.captured ? call.expectedState.zEnable : 1) |
+                 ((call.expectedState.captured ? call.expectedState.zWriteEnable : 1) << 2));
+    mkey.cullMode = call.expectedState.captured ? (uint8_t)call.expectedState.cullMode : D3DCULL_CW;
+    mkey.useLighting = call.rs.useLighting ? 1 : 0;
+    mkey.bin = (uint8_t)call.bin;
+    mkey.fvf = call.rs.fvf;
+    mkey.stride = call.rs.vbStride;
+    return mkey;
+}
+
 // Build merged batches: groups different geometries sharing same texture into mega-draws
-// (Formerly also built stateless batches for instancing, now only does merging)
 void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
     MGE_ZoneScopedN("buildMergedBatches");
+
+    if (fb.cachedMergedVB) {
+        fb.cachedMergedVB->Release();
+        fb.cachedMergedVB = nullptr;
+    }
+    if (fb.cachedMergedIB) {
+        fb.cachedMergedIB->Release();
+        fb.cachedMergedIB = nullptr;
+    }
 
     fb.drawDataStaging.clear();
     fb.singletonCallIndices.clear();
     fb.mergedBatches.clear();
+    fb.cellBatchCacheKey = nullptr;
+    fb.useCachedMergedVB = false;
+    fb.cachedDrawInfos.clear();
 
     if (!ImGuiManager::GetEnableStatelessBatch()) return;
 
     auto& calls = fb.recordedCalls;
     if (calls.empty()) return;
 
-    // Group all batchable calls by MergedBatchKey (texture + render state + FVF)
-    std::unordered_map<MergedBatchKey, std::vector<size_t>, MergedBatchKey::Hasher> mergeGroups;
+    struct PendingMergedGroup {
+        MergedBatchKey key = {};
+        std::vector<size_t> callIndices;
+        UINT totalVertices = 0;
+        UINT totalIndices = 0;
+    };
+
+    // Group all batchable Scene 0 calls deterministically by first-seen MergedBatchKey.
+    std::unordered_map<MergedBatchKey, size_t, MergedBatchKey::Hasher> mergeGroupLookup;
+    std::vector<PendingMergedGroup> mergeGroups;
     bool highlightBatches = ImGuiManager::GetHighlightStatelessBatch();
 
     for (size_t i = 0; i < calls.size(); i++) {
         const auto& call = calls[i];
 
-        // Only batch Opaque/Terrain bins (no Skinning, no Grass, no Blending)
-        if (call.bin != RenderBin::Opaque && call.bin != RenderBin::Terrain)
+        if (call.sceneNum != 0 || !isBatchableCall(call))
             continue;
 
-        // Skip geometry with vertex blending
-        if (call.rs.vertexBlendState != 0)
-            continue;
+        MergedBatchKey mkey = makeMergedBatchKey(call);
+        auto insertResult = mergeGroupLookup.emplace(mkey, mergeGroups.size());
+        if (insertResult.second) {
+            mergeGroups.push_back(PendingMergedGroup());
+            mergeGroups.back().key = mkey;
+        }
 
-        // Skip if already culled
-        if (!call.shouldRender) continue;
-
-        // Skip geometry that can't be merged
-        if (call.sk.usesSkinning || call.sk.hasGrass)
-            continue;
-
-        MergedBatchKey mkey;
-        mkey.texture = call.rs.texture;
-        mkey.blendState = (uint16_t)((call.expectedState.captured ? call.expectedState.alphaBlendEnable : 0) |
-                         ((call.expectedState.captured ? call.expectedState.srcBlend : 0) << 4) |
-                         ((call.expectedState.captured ? call.expectedState.destBlend : 0) << 8));
-        mkey.zState = (uint8_t)((call.expectedState.captured ? call.expectedState.zEnable : 1) |
-                     ((call.expectedState.captured ? call.expectedState.zWriteEnable : 1) << 2));
-        mkey.cullMode = call.expectedState.captured ? (uint8_t)call.expectedState.cullMode : D3DCULL_CW;
-        mkey.useLighting = call.rs.useLighting ? 1 : 0;
-        mkey.fvf = call.rs.fvf;
-        mkey.stride = call.rs.vbStride;
-
-        mergeGroups[mkey].push_back(i);
+        PendingMergedGroup& group = mergeGroups[insertResult.first->second];
+        group.callIndices.push_back(i);
+        group.totalVertices += call.rs.vertCount;
+        group.totalIndices += call.rs.primCount * 3;
     }
 
-    // Build MergedBatch entries for groups with 2+ calls
-    UINT drawDataOffset = 0;
-    for (auto& kv : mergeGroups) {
-        if (kv.second.size() >= 2) {
-            MergedBatch mbatch;
-            mbatch.key = kv.first;
-            mbatch.callIndices = std::move(kv.second);
-            mbatch.drawDataOffset = drawDataOffset;
-            mbatch.totalVertices = 0;
-            mbatch.totalIndices = 0;
+    std::vector<CachedBatchTemplate> batchTemplates;
+    std::vector<CachedMergedCallLayout> mergedLayout;
 
-            // Calculate totals and fill draw data for each call
+    // Build MergedBatch entries for groups with 2+ calls. Hidden calls remain in the batch
+    // with visibility encoded in drawDataStaging so geometry can be reused across frames.
+    UINT drawDataOffset = 0;
+    for (const auto& group : mergeGroups) {
+        if (group.callIndices.size() >= 2) {
+            MergedBatch mbatch;
+            mbatch.key = group.key;
+            mbatch.callIndices = group.callIndices;
+            mbatch.drawDataOffset = drawDataOffset;
+            mbatch.totalVertices = group.totalVertices;
+            mbatch.totalIndices = group.totalIndices;
+
             for (size_t callIdx : mbatch.callIndices) {
                 const auto& call = calls[callIdx];
-                mbatch.totalVertices += call.rs.vertCount;
-                mbatch.totalIndices += call.rs.primCount * 3;
-
-                // Fill draw data
                 StatelessDrawData data;
-                const D3DXMATRIX& wv = call.rs.worldViewTransforms[0];
-                data.world0[0] = wv._11; data.world0[1] = wv._21; data.world0[2] = wv._31; data.world0[3] = wv._41;
-                data.world1[0] = wv._12; data.world1[1] = wv._22; data.world1[2] = wv._32; data.world1[3] = wv._42;
-                data.world2[0] = wv._13; data.world2[1] = wv._23; data.world2[2] = wv._33; data.world2[3] = wv._43;
-
-                // Material (tint green if highlighting)
-                float tintR = highlightBatches ? 0.3f : 1.0f;
-                float tintG = highlightBatches ? 1.0f : 1.0f;
-                float tintB = highlightBatches ? 0.3f : 1.0f;
-                data.diffuse[0] = call.frs.material.diffuse.r * tintR;
-                data.diffuse[1] = call.frs.material.diffuse.g * tintG;
-                data.diffuse[2] = call.frs.material.diffuse.b * tintB;
-                data.diffuse[3] = call.frs.material.diffuse.a;
-
-                data.ambient[0] = call.frs.material.ambient.r;
-                data.ambient[1] = call.frs.material.ambient.g;
-                data.ambient[2] = call.frs.material.ambient.b;
-                data.ambient[3] = call.frs.material.ambient.a;
-
-                // Store normres (parameter texture resolution) in dedicated texel
-                float normresX = 512.0f, normresY = 512.0f;  // Default fallback
-                if (call.sk.hasParamH && call.rs.texture) {
-                    D3DSURFACE_DESC desc;
-                    if (SUCCEEDED(call.rs.texture->GetLevelDesc(0, &desc))) {
-                        normresX = (float)desc.Width;
-                        normresY = (float)desc.Height;
-                    }
-                }
-                data.normres[0] = normresX;
-                data.normres[1] = normresY;
-                data.normres[2] = 0.0f;
-                data.normres[3] = 0.0f;
-
-                // Zero out reserved texels
-                memset(data.reserved1, 0, sizeof(data.reserved1));
-                memset(data.reserved2, 0, sizeof(data.reserved2));
-                memset(data.reserved3, 0, sizeof(data.reserved3));
-                memset(data.reserved4, 0, sizeof(data.reserved4));
-                memset(data.reserved5, 0, sizeof(data.reserved5));
-                memset(data.reserved6, 0, sizeof(data.reserved6));
-                memset(data.reserved7, 0, sizeof(data.reserved7));
-
-                data.emissive[0] = call.frs.material.emissive.r;
-                data.emissive[1] = call.frs.material.emissive.g;
-                data.emissive[2] = call.frs.material.emissive.b;
-                data.emissive[3] = (float)call.rs.alphaRef / 255.0f;
-
-                data.lightParams[0] = 0.0f;  // Will be filled with lightCount later
-                data.lightParams[1] = 0.0f;  // Will be filled with texelSize later
-                data.lightParams[2] = 0.0f;  // Will be filled with texelOffset later
-                data.lightParams[3] = (float)call.sk.vertexMaterial;  // Material mode (1/2/3)
-
-                // Full 4th column of worldView for robust w computation
-                data.flags[0] = wv._14;
-                data.flags[1] = wv._24;
-                data.flags[2] = wv._34;
-                data.flags[3] = wv._44;
-
+                fillDrawData(data, call, highlightBatches, call.shouldRender);
                 fb.drawDataStaging.push_back(data);
+                mergedLayout.push_back(makeCachedMergedCallLayout(call, group.key));
                 drawDataOffset++;
             }
 
             fb.mergedBatches.push_back(std::move(mbatch));
-        } else if (kv.second.size() == 1 && highlightBatches) {
+            batchTemplates.push_back(makeCachedBatchTemplate(fb.mergedBatches.back()));
+        } else if (group.callIndices.size() == 1 && highlightBatches) {
             // Track singletons for highlighting
-            fb.singletonCallIndices.insert(kv.second[0]);
+            fb.singletonCallIndices.insert(group.callIndices[0]);
         }
+    }
+
+    void* currentCell = MWBridge::get() ? MWBridge::get()->getPlayerCell() : nullptr;
+    fb.cellBatchCacheKey = currentCell;
+    if (currentCell && !fb.mergedBatches.empty()) {
+        AcquireSRWLockExclusive(&s_cellBatchCacheLock);
+
+        auto it = s_cellBatchCaches.find(currentCell);
+        bool layoutMatch = false;
+        if (it != s_cellBatchCaches.end()) {
+            layoutMatch = it->second.valid &&
+                          it->second.batches == batchTemplates &&
+                          it->second.mergedLayout == mergedLayout;
+        }
+
+        if (layoutMatch) {
+            CellBatchCache& cache = it->second;
+            cache.lastUsedSerial = ++s_cellBatchCacheUseSerial;
+
+            if (cache.hasGeometry()) {
+                cache.mergedVB->AddRef();
+                cache.mergedIB->AddRef();
+                fb.cachedMergedVB = cache.mergedVB;
+                fb.cachedMergedIB = cache.mergedIB;
+                fb.cachedDrawInfos = cache.drawInfos;
+                fb.useCachedMergedVB = (fb.cachedDrawInfos.size() == fb.mergedBatches.size());
+
+                if (!fb.useCachedMergedVB) {
+                    fb.cachedMergedVB->Release();
+                    fb.cachedMergedIB->Release();
+                    fb.cachedMergedVB = nullptr;
+                    fb.cachedMergedIB = nullptr;
+                    fb.cachedDrawInfos.clear();
+                }
+            }
+        } else {
+            CellBatchCache& cache = s_cellBatchCaches[currentCell];
+            cache.release();
+            cache.cellPtr = currentCell;
+            cache.valid = true;
+            cache.lastUsedSerial = ++s_cellBatchCacheUseSerial;
+            cache.batches = batchTemplates;
+            cache.mergedLayout = mergedLayout;
+            evictLRUCellBatchCacheLocked(currentCell);
+        }
+
+        ReleaseSRWLockExclusive(&s_cellBatchCacheLock);
     }
 
     // Log batching stats
@@ -1111,4 +1338,3 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
         }
     }
 }
-

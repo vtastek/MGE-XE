@@ -228,11 +228,16 @@ VS_OUTPUT vs_main(VS_INPUT input) {
 #ifdef USE_STATELESS_BATCH
         // Stateless batching: read worldView matrix from texture using drawIndex
         // WorldView is pre-combined on CPU for better precision at distance
-        // Texture is 8 wide (8 texels per draw), height = maxDraws
-        // drawDataParams.x = 1/8 = 0.125 (texel width in UV)
+        // Texture is 16 wide (16 texels per draw), height = maxDraws
+        // drawDataParams.x = 1/16 = 0.0625 (texel width in UV)
         // drawDataParams.y = 1/height (texel height in UV)
         float drawV = (input.drawIndex + 0.5) * drawDataParams.y;  // Center of row
-        float texelW = drawDataParams.x;  // 0.125 for 8-wide texture
+        float texelW = drawDataParams.x;  // 0.0625 for 16-wide texture
+
+        // Sample visibility flag from texel 8 (normres.w)
+        // If visibility == 0, output degenerate position to cull this draw
+        float4 normresData = tex2Dlod(sampDrawData, float4(8.5 * texelW, drawV, 0, 0));
+        float visibility = normresData.w;
 
         // Sample worldview matrix columns (texels 0, 1, 2) - pre-combined for Z precision
         float4 wv0 = tex2Dlod(sampDrawData, float4(0.5 * texelW, drawV, 0, 0));
@@ -251,6 +256,12 @@ VS_OUTPUT vs_main(VS_INPUT input) {
 
         // Guard against zero w from texture sampling errors (prevents vertex explosion)
         if (abs(viewpos.w) < 0.001) viewpos.w = 1.0;
+
+        // Cull invisible draws by setting position behind camera (will be clipped)
+        // This is more efficient than clip() in PS because entire triangles are culled early
+        if (visibility < 0.5) {
+            viewpos.z = -10000.0;  // Far behind near plane, will be clipped
+        }
 
         // Transform normal to view space
         normal.x = dot(float4(input.normal, 0), wv0);
