@@ -119,6 +119,7 @@ IDirect3DVertexBuffer9* DistantLand::vbWaveSim;
 
 IDirect3DTexture9* DistantLand::texShadow;
 IDirect3DTexture9* DistantLand::texSoftShadow;
+IDirect3DTexture9* DistantLand::texBlueNoise;
 IDirect3DSurface9* DistantLand::surfShadowZ;
 IDirect3DVertexBuffer9* DistantLand::vbFullFrame;
 IDirect3DVertexBuffer9* DistantLand::vbClipCube;
@@ -1113,6 +1114,49 @@ bool DistantLand::initShadow() {
     v[13] = D3DXVECTOR3(-u, -u, 1.0f);
     vbClipCube->Unlock();
 
+    // Create blue noise texture for shadow PCF (34x1, R16G16F)
+    // Texels 0-24: 25-sample pattern, Texels 25-33: 9-sample pattern
+    hr = device->CreateTexture(34, 1, 1, 0, D3DFMT_G16R16F, D3DPOOL_MANAGED, &texBlueNoise, NULL);
+    if (hr != D3D_OK) {
+        LOG::logline("!! Failed to create blue noise texture");
+        return false;
+    }
+
+    // Blue noise patterns (pre-computed, optimized distribution)
+    static const float BLUE_NOISE_25[25][2] = {
+        {-0.4706f,  0.2941f}, { 0.0588f, -0.4706f}, { 0.4118f,  0.1765f},
+        {-0.1765f, -0.2353f}, { 0.2353f,  0.4118f}, {-0.3529f, -0.4118f},
+        { 0.4706f, -0.1176f}, {-0.0588f,  0.3529f}, { 0.1176f, -0.3529f},
+        {-0.4118f,  0.0588f}, { 0.3529f, -0.2941f}, {-0.2353f,  0.4706f},
+        { 0.0000f,  0.1176f}, { 0.2941f, -0.4706f}, {-0.4706f, -0.0588f},
+        { 0.4118f,  0.3529f}, {-0.1176f, -0.4118f}, { 0.1765f,  0.2353f},
+        {-0.3529f,  0.1176f}, { 0.4706f, -0.3529f}, {-0.0588f, -0.1765f},
+        { 0.2353f,  0.0588f}, {-0.2941f,  0.4118f}, { 0.3529f, -0.0588f},
+        {-0.1765f,  0.3529f}
+    };
+    static const float BLUE_NOISE_9[9][2] = {
+        {-0.3333f,  0.3333f}, { 0.1111f, -0.4444f}, { 0.4444f,  0.1111f},
+        {-0.1111f, -0.3333f}, { 0.3333f,  0.4444f}, {-0.4444f, -0.1111f},
+        { 0.0000f,  0.2222f}, { 0.2222f, -0.2222f}, {-0.2222f,  0.0000f}
+    };
+
+    D3DLOCKED_RECT lockedRect;
+    hr = texBlueNoise->LockRect(0, &lockedRect, NULL, 0);
+    if (hr == D3D_OK) {
+        D3DXFLOAT16* data = (D3DXFLOAT16*)lockedRect.pBits;
+        // Fill texels 0-24 with 25-sample pattern
+        for (int i = 0; i < 25; i++) {
+            data[i * 2 + 0] = D3DXFLOAT16(BLUE_NOISE_25[i][0]);
+            data[i * 2 + 1] = D3DXFLOAT16(BLUE_NOISE_25[i][1]);
+        }
+        // Fill texels 25-33 with 9-sample pattern
+        for (int i = 0; i < 9; i++) {
+            data[(25 + i) * 2 + 0] = D3DXFLOAT16(BLUE_NOISE_9[i][0]);
+            data[(25 + i) * 2 + 1] = D3DXFLOAT16(BLUE_NOISE_9[i][1]);
+        }
+        texBlueNoise->UnlockRect(0);
+    }
+
     return true;
 }
 
@@ -1663,6 +1707,10 @@ void DistantLand::release() {
     texShadow = nullptr;
     texSoftShadow->Release();
     texSoftShadow = nullptr;
+    if (texBlueNoise) {
+        texBlueNoise->Release();
+        texBlueNoise = nullptr;
+    }
     surfShadowZ->Release();
     surfShadowZ = nullptr;
 

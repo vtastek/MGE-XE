@@ -359,6 +359,10 @@ void FixedFunctionShader::bindShaderTextures(const ShaderKey& sk, const Rendered
     // Slot 4: Shadow map
     if (sk.hasShadows) {
         setCachedTexture(device, 4, DistantLand::texSoftShadow);
+        // Slot 7: Blue noise texture for shadow PCF
+        if (DistantLand::texBlueNoise) {
+            setCachedTexture(device, 7, DistantLand::texBlueNoise);
+        }
     }
 
     // Slot 5: Light data texture (for texture-based point lighting)
@@ -583,6 +587,20 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             exactHit = true;
             if (hlslDiagFrameCounter <= 5) {
                 diagHitKeys.insert(sk);
+            }
+            // Log cache hits on early frames for debugging
+            if (hlslDiagFrameCounter <= 3) {
+                char buf[512];
+                snprintf(buf, sizeof(buf),
+                    "CACHE HIT frame=%d: lm=%d lit=%d vc=%d vm=%d hl=%d skin=%d fog=%d uv=%d stages=%d shadow=%d detail=%d dp=%d ph=%d px=%d grass=%d",
+                    hlslDiagFrameCounter,
+                    (int)sk.lightMode, (int)sk.useLighting, (int)sk.vertexColour,
+                    (int)sk.vertexMaterial, (int)sk.heavyLighting,
+                    (int)sk.usesSkinning, (int)sk.fogMode, (int)sk.uvSets,
+                    (int)sk.activeStages,
+                    (int)sk.hasShadows, (int)sk.hasDetail, (int)sk.hasDiffParam,
+                    (int)sk.hasParamH, (int)sk.hasParamX, (int)sk.hasGrass);
+                LOG::logline("%s", buf);
             }
         }
 
@@ -1707,6 +1725,13 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
     // Increment frame counter on Scene 0 replay (once per frame)
     if (sceneCount == 0) {
         hlslDiagFrameCounter++;
+
+        // After 5 frames, start O3 recompilation in background
+        // (O1 shaders compiled during precache, now upgrade to O3 while playing)
+        if (hlslDiagFrameCounter == 5) {
+            queueAllO3Recompiles();
+            startO3RecompileThread();
+        }
     }
 
     // N-1: Select rendering buffer (previous frame's recorded data)

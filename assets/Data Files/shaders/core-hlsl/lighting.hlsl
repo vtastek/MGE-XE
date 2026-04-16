@@ -76,23 +76,41 @@ float3 LambertDiffuse(float3 kD)
 	return kD / PI;
 }
 
-float3 OrenNayarDiffuse(float3 L, float3 V, float3 N, float roughness, float3 kD)
+// EON (Energy-conserving Oren-Nayar) constants
+static const float constant1_FON = 0.5f * (PI - 1.0f);  // ~1.0708
+static const float constant2_FON = 0.25f * (PI - 1.0f); // ~0.5354
+
+// FON directional albedo approximation
+float E_FON_approx2(float mu, float r)
+{
+	// Polynomial fit for directional albedo
+	float r2 = r * r;
+	return 1.0f - r * (0.5f - 0.5f * mu) - r2 * (0.25f - 0.75f * mu + 0.5f * mu * mu);
+}
+
+// Energy-conserving Oren-Nayar diffuse (EON) - much faster than classic ON
+float3 OrenNayarDiffuse(float3 L, float3 V, float3 N, float roughness, float3 rho)
 {
 	float NdotL = max(dot(N, L), 0.0f);
 	float NdotV = max(dot(N, V), 0.0f);
-	float3 Vproj = normalize(V - N * NdotV);
-	float3 Lproj = normalize(L - N * NdotL);
-	float gamma = max(0.0f, dot(Vproj, Lproj));
-	float alpha = max(acos(NdotV), acos(NdotL));
-	float beta = min(acos(NdotV), acos(NdotL));
-	float sigma2 = roughness * roughness;
-	float At = 1.0f - 0.5f * sigma2 / (sigma2 + 0.33f);
-	float Bt = 0.45f * sigma2 / (sigma2 + 0.09f);
-	if (gamma >= 0)
-		Bt *= sin(alpha) * clamp(tan(beta), -PI_DIV2, PI_DIV2);
-	else
-		Bt = 0.0f;
-	return (At + Bt) * kD / PI;
+	float LdotV = dot(L, V);
+
+	float s = LdotV - NdotL * NdotV;  // QON s term
+	float sovertF = s > 0.0f ? s / max(NdotV, NdotL) : s;  // FON s/t
+	float AF = 1.0f / (1.0f + constant1_FON * roughness);  // FON A coeff
+	float3 f_ss = rho * AF * (1.0f + roughness * sovertF);  // single-scatter
+
+	float EFo = E_FON_approx2(NdotV, roughness) * AF;
+	float EFi = E_FON_approx2(NdotL, roughness) * AF;
+
+	float avgEF = AF * (1.0f + constant2_FON * roughness);
+	float3 rho_ms = (rho * rho) / (1.0f - rho * (1.0f - avgEF));
+
+	// Multi-scatter lobe
+	const float eps = 1.0e-7f;
+	float3 f_ms = rho_ms * (avgEF * (1.0f - EFo) * (1.0f - EFi) / max(eps, 1.0f - avgEF));
+
+	return (f_ss + f_ms) / PI;
 }
 
 LightResult BRDF(float3 N, float3 V, float3 L, float3 albedo, float metalness, float roughness, float roughnessPrime, float radius, float3 F0, int isOrenNayar, float shadows)

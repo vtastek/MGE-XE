@@ -612,6 +612,9 @@ private:
         IDirect3DTexture9* diffparamTexture;
         IDirect3DTexture9* normalTexture;
         bool hasSuffixSupport;
+
+        // Optimization level: 1=O1 (fast compile), 3=O3 (optimized)
+        uint8_t optimizationLevel;
     };
 
     struct HLSLShaderLRU {
@@ -628,6 +631,8 @@ private:
 
     static SRWLOCK hlslCacheLock;  // Protects cacheHLSLShaders (zero-init = valid)
     static HANDLE precacheThread;  // Joinable precache thread handle
+    static std::atomic<int> precacheCompleted;  // Progress counter for loading bar
+    static std::atomic<int> precacheTotal;      // Total shaders to compile
 
     // Material state cache to minimize redundant SetRenderState calls
     struct MaterialStateCache {
@@ -783,6 +788,17 @@ private:
     static std::atomic<bool> shutdownCompiler;
     static std::unordered_map<ShaderKey, std::shared_ptr<AsyncShaderRequest>, ShaderKey::hasher> pendingCompilations;
 
+    // O3 recompilation system - upgrades O1 shaders to O3 after game starts
+    static std::queue<ShaderKey> o3RecompileQueue;
+    static std::mutex o3QueueMutex;
+    static std::atomic<bool> o3RecompileActive;
+    static std::thread o3RecompileThread;
+    static std::atomic<bool> o3RecompileStarted;  // Ensures we only start once
+
+    static void queueAllO3Recompiles();
+    static void startO3RecompileThread();
+    static void stopO3RecompileThread();
+
     // Vertex shader caching (vertex shaders don't use texture suffix defines)
     struct VertexShaderKey {
         DWORD useLighting : 1;
@@ -803,7 +819,7 @@ private:
     
     static std::unordered_map<VertexShaderKey, IDirect3DVertexShader9*, VertexShaderKey::hasher> vertexShaderCache;
 
-    static HLSLShader generateMWShaderHLSL(const ShaderKey& sk);
+    static HLSLShader generateMWShaderHLSL(const ShaderKey& sk, uint8_t optLevel = 1);
     static HLSLShader createPurpleErrorShader();
     static void captureAndDumpTexture(IDirect3DTexture9* texture);
 

@@ -24,6 +24,7 @@
 #include <climits>
 #include <unordered_map>
 #include <random>
+#include <vector>
 
 using std::string;
 using std::stringstream;
@@ -368,6 +369,17 @@ std::atomic<bool> FixedFunctionShader::shutdownCompiler(false);
 std::unordered_map<FixedFunctionShader::ShaderKey, std::shared_ptr<FixedFunctionShader::AsyncShaderRequest>, FixedFunctionShader::ShaderKey::hasher> FixedFunctionShader::pendingCompilations;
 std::unordered_map<FixedFunctionShader::VertexShaderKey, IDirect3DVertexShader9*, FixedFunctionShader::VertexShaderKey::hasher> FixedFunctionShader::vertexShaderCache;
 
+// O3 recompilation system - upgrades O1 shaders to O3 after game starts
+std::queue<FixedFunctionShader::ShaderKey> FixedFunctionShader::o3RecompileQueue;
+std::mutex FixedFunctionShader::o3QueueMutex;
+std::atomic<bool> FixedFunctionShader::o3RecompileActive{false};
+std::thread FixedFunctionShader::o3RecompileThread;
+std::atomic<bool> FixedFunctionShader::o3RecompileStarted{false};
+
+// Precache progress counters for loading bar
+std::atomic<int> FixedFunctionShader::precacheCompleted{0};
+std::atomic<int> FixedFunctionShader::precacheTotal{0};
+
 // Cache for texture resolutions to avoid repeated GetLevelDesc calls
 
 // Texture release callback (evicts from suffix cache on texture free)
@@ -376,9 +388,21 @@ void (*g_onTextureReleased)(IDirect3DTexture9* realTexture) = nullptr;
 static string buildArgString(DWORD arg, const string& mask, const string& sampler);
 
 bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
-    // Join precache thread — it ran during BSA/distant land init, should be nearly done
+    // Wait for precache thread with animated loading bar updates
     if (precacheThread) {
-        WaitForSingleObject(precacheThread, INFINITE);
+        auto mwBridge = MWBridge::get();
+        char buffer[64];
+
+        // Poll with timeout, updating loading bar each iteration
+        while (WaitForSingleObject(precacheThread, 100) == WAIT_TIMEOUT) {
+            int done = precacheCompleted.load();
+            int total = precacheTotal.load();
+            if (total > 0) {
+                std::snprintf(buffer, sizeof(buffer), "Loading MGE XE... (%d/%d shaders)", done, total);
+                mwBridge->showLoadingBar(buffer, 95.0f);
+            }
+        }
+
         CloseHandle(precacheThread);
         precacheThread = nullptr;
         LOG::logline("-- Precache thread joined, %d shaders in cache", (int)cacheHLSLShaders.size());
@@ -493,128 +517,130 @@ void FixedFunctionShader::startEarlyPrecache(IDirect3DDevice* d) {
     // Set device early and start immediate precaching in a tracked thread
     if (!device && d) {
         device = d;
-        LOG::logline("-- Starting immediate HLSL shader precaching (tracked thread)");
+        LOG::logline("-- Starting immediate HLSL shader precaching (multithreaded)");
 
-        // Launch a joinable Win32 thread (can be stopped on cell change / shutdown)
+        // Launch coordinator thread that spawns worker threads
         precacheThread = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
             bool hlslMode = (Configuration.PerPixelLightFlags == 2);
 
             if (hlslMode) {
                 LOG::logline("-- Precache thread started");
 
-                int hlslVariants = 0;
-
-                auto updateStatus = [&](int current, int total) {
-                    char progressText[128];
-                    std::snprintf(progressText, sizeof(progressText), "Compiling HLSL shaders: %d/%d", current, total);
-                    StatusOverlay::setStatus(progressText);
-                };
-
                 // Variant struct: {lighting, lightMode, vertexCol, vertexMat, heavyLighting, skinning, dp, ph, px, fogMode, stages}
-                // Derived from runtime hit data — only variants actually seen in gameplay
                 struct ShaderVariant {
                     int lighting, lightMode, vertexCol, vertexMat, heavyLighting, skinning;
                     int hasDiffParam, hasParamH, hasParamX, fogMode, stages;
                 };
 
+                // Order: lm=3 first (most complex/likely needed), then lm=2, lm=1, lm=0, unlit last
                 ShaderVariant variants[] = {
-                    // UNLIT (lighting=0) — particles, UI, emissive-only objects
-                    // stages=0 variants (particles with no texture stages)
-                    {0,0, 0,0, 0,0, 0,0,0, 0,0}, {0,0, 0,0, 0,0, 0,0,0, 1,0},  // vm=0, fog=0/1
-                    {0,0, 0,1, 0,0, 0,0,0, 0,0}, {0,0, 0,1, 0,0, 0,0,0, 1,0},  // vm=1, fog=0/1
-                    {0,0, 1,2, 0,0, 0,0,0, 0,0}, {0,0, 1,2, 0,0, 0,0,0, 1,0},  // vc=1, fog=0/1
-                    // stages=1 variants (textured unlit)
-                    {0,0, 0,1, 0,0, 0,0,0, 1,1}, {0,0, 1,2, 0,0, 0,0,0, 1,1},
-                    {0,0, 0,1, 0,0, 0,0,0, 0,1}, {0,0, 1,2, 0,0, 0,0,0, 0,1},  // fog=0
-                    {0,0, 0,0, 0,0, 0,0,0, 1,1}, {0,0, 0,0, 0,0, 0,0,0, 0,1},  // vm=0
+                    // lm=3 (texture lights) — FIRST: most complex, most likely to be needed
+                    {1,3, 0,1, 0,0, 0,0,0, 1,1}, {1,3, 1,2, 0,0, 0,0,0, 1,1},  // hl=0 base
+                    {1,3, 0,1, 0,0, 1,1,0, 1,1}, {1,3, 1,2, 0,0, 1,1,0, 1,1},  // hl=0 dp+ph
+                    {1,3, 0,1, 0,1, 0,0,0, 1,1}, {1,3, 1,2, 0,1, 0,0,0, 1,1},  // hl=0 skin
+                    {1,3, 0,1, 1,0, 0,0,0, 1,1}, {1,3, 1,2, 1,0, 0,0,0, 1,1},  // hl=1 base
+                    {1,3, 0,1, 1,0, 1,1,0, 1,1}, {1,3, 1,2, 1,0, 1,1,0, 1,1},  // hl=1 dp+ph
+                    {1,3, 0,1, 1,1, 0,0,0, 1,1}, {1,3, 1,2, 1,1, 0,0,0, 1,1},  // hl=1 skin
+                    {1,3, 1,2, 0,0, 0,0,0, 2,1}, {1,3, 1,2, 1,0, 0,0,0, 2,1},  // fog=2
 
-                    // lm=0 (sun only) — base, dp+ph, skinning, vm=1 skinning
-                    {1,0, 0,1, 0,0, 0,0,0, 1,1}, {1,0, 1,2, 0,0, 0,0,0, 1,1},
-                    {1,0, 0,1, 0,0, 1,1,0, 1,1}, {1,0, 1,2, 0,0, 1,1,0, 1,1},
-                    {1,0, 0,1, 0,1, 0,0,0, 1,1}, {1,0, 1,2, 0,1, 0,0,0, 1,1},
-                    {1,0, 1,1, 0,0, 0,0,0, 1,1}, {1,0, 1,1, 0,1, 0,0,0, 1,1},
-                    {1,0, 1,1, 0,1, 1,1,0, 1,1},
-                    {1,0, 0,1, 0,0, 0,0,0, 1,2},  // dual texture
-
-                    // lm=1 (single point light) — base, dp+ph, skinning, vm=1 skinning
-                    {1,1, 0,1, 0,0, 0,0,0, 1,1}, {1,1, 1,2, 0,0, 0,0,0, 1,1},
-                    {1,1, 0,1, 0,0, 1,1,0, 1,1}, {1,1, 1,2, 0,0, 1,1,0, 1,1},
-                    {1,1, 0,1, 0,1, 0,0,0, 1,1},
-                    {1,1, 1,1, 0,1, 0,0,0, 1,1}, {1,1, 1,1, 0,1, 1,1,0, 1,1},
-                    {1,1, 1,2, 0,0, 0,0,0, 2,1},  // fog=2
-
-                    // lm=2 (few lights) — hl=0 and hl=1, base, dp+ph, skinning
+                    // lm=2 (few lights)
                     {1,2, 0,1, 0,0, 0,0,0, 1,1}, {1,2, 0,1, 1,0, 0,0,0, 1,1},
                     {1,2, 1,2, 0,0, 0,0,0, 1,1}, {1,2, 1,2, 1,0, 0,0,0, 1,1},
                     {1,2, 0,1, 0,0, 1,1,0, 1,1}, {1,2, 0,1, 1,0, 1,1,0, 1,1},
                     {1,2, 1,2, 0,0, 1,1,0, 1,1}, {1,2, 1,2, 1,0, 1,1,0, 1,1},
                     {1,2, 0,1, 0,1, 0,0,0, 1,1}, {1,2, 0,1, 1,1, 0,0,0, 1,1},
                     {1,2, 1,2, 0,1, 0,0,0, 1,1}, {1,2, 1,2, 1,1, 0,0,0, 1,1},
-                    {1,2, 1,1, 0,1, 1,1,0, 1,1},  // vm=1 skinning dp+ph
-                    {1,2, 0,1, 0,0, 0,0,0, 1,2},  // dual texture
-                    {1,2, 1,2, 0,0, 0,0,0, 2,1}, {1,2, 1,2, 1,0, 0,0,0, 2,1},  // fog=2
+                    {1,2, 1,1, 0,1, 1,1,0, 1,1}, {1,2, 0,1, 0,0, 0,0,0, 1,2},
+                    {1,2, 1,2, 0,0, 0,0,0, 2,1}, {1,2, 1,2, 1,0, 0,0,0, 2,1},
 
-                    // lm=3 (texture lights, always hl=1) — base, dp+ph, skinning, fog=2
-                    {1,3, 0,1, 1,0, 0,0,0, 1,1}, {1,3, 1,2, 1,0, 0,0,0, 1,1},
-                    {1,3, 0,1, 1,0, 1,1,0, 1,1}, {1,3, 1,2, 1,0, 1,1,0, 1,1},
-                    {1,3, 0,1, 1,1, 0,0,0, 1,1}, {1,3, 1,2, 1,1, 0,0,0, 1,1},  // skinning
-                    {1,3, 1,2, 1,0, 0,0,0, 2,1},  // fog=2
+                    // lm=1 (single point light)
+                    {1,1, 0,1, 0,0, 0,0,0, 1,1}, {1,1, 1,2, 0,0, 0,0,0, 1,1},
+                    {1,1, 0,1, 0,0, 1,1,0, 1,1}, {1,1, 1,2, 0,0, 1,1,0, 1,1},
+                    {1,1, 0,1, 0,1, 0,0,0, 1,1},
+                    {1,1, 1,1, 0,1, 0,0,0, 1,1}, {1,1, 1,1, 0,1, 1,1,0, 1,1},
+                    {1,1, 1,2, 0,0, 0,0,0, 2,1},
+
+                    // lm=0 (sun only)
+                    {1,0, 0,1, 0,0, 0,0,0, 1,1}, {1,0, 1,2, 0,0, 0,0,0, 1,1},
+                    {1,0, 0,1, 0,0, 1,1,0, 1,1}, {1,0, 1,2, 0,0, 1,1,0, 1,1},
+                    {1,0, 0,1, 0,1, 0,0,0, 1,1}, {1,0, 1,2, 0,1, 0,0,0, 1,1},
+                    {1,0, 1,1, 0,0, 0,0,0, 1,1}, {1,0, 1,1, 0,1, 0,0,0, 1,1},
+                    {1,0, 1,1, 0,1, 1,1,0, 1,1}, {1,0, 0,1, 0,0, 0,0,0, 1,2},
+
+                    // UNLIT (lighting=0) — particles, UI, emissive-only objects (last)
+                    {0,0, 0,0, 0,0, 0,0,0, 0,0}, {0,0, 0,0, 0,0, 0,0,0, 1,0},
+                    {0,0, 0,1, 0,0, 0,0,0, 0,0}, {0,0, 0,1, 0,0, 0,0,0, 1,0},
+                    {0,0, 1,2, 0,0, 0,0,0, 0,0}, {0,0, 1,2, 0,0, 0,0,0, 1,0},
+                    {0,0, 0,1, 0,0, 0,0,0, 1,1}, {0,0, 1,2, 0,0, 0,0,0, 1,1},
+                    {0,0, 0,1, 0,0, 0,0,0, 0,1}, {0,0, 1,2, 0,0, 0,0,0, 0,1},
+                    {0,0, 0,0, 0,0, 0,0,0, 1,1}, {0,0, 0,0, 0,0, 0,0,0, 0,1},
                 };
+                const int numVariants = sizeof(variants) / sizeof(variants[0]);
 
-                const int totalVariants = sizeof(variants) / sizeof(variants[0]);
-                LOG::logline("-- Precaching %d HLSL shader variants (tracked thread)", totalVariants);
+                // Build vector of all ShaderKeys
+                std::vector<ShaderKey> allKeys;
+                allKeys.reserve(numVariants + 4);
+                int hasShadows = ((Configuration.MGEFlags & USE_SHADOWS) && (Configuration.MGEFlags & USE_DISTANT_LAND)) ? 1 : 0;
 
-                for (int i = 0; i < totalVariants; i++) {
+                for (int i = 0; i < numVariants; i++) {
                     const auto& v = variants[i];
-
-                    if (i % 5 == 0 || i == totalVariants - 1) {
-                        updateStatus(i + 1, totalVariants);
+                    ShaderKey sk;
+                    memset(&sk, 0, sizeof(sk));
+                    sk.uvSets = (v.stages > 0) ? 1 : 0;
+                    sk.useLighting = v.lighting;
+                    sk.lightMode = v.lightMode;
+                    sk.vertexColour = v.vertexCol;
+                    sk.vertexMaterial = v.vertexMat;
+                    sk.usesSkinning = v.skinning;
+                    sk.heavyLighting = v.heavyLighting;
+                    sk.hasDiffParam = v.hasDiffParam;
+                    sk.hasParamH = v.hasParamH;
+                    sk.hasParamX = v.hasParamX;
+                    sk.hasGrass = 0;
+                    sk.hasShadows = hasShadows;
+                    sk.fogMode = v.fogMode;
+                    sk.activeStages = v.stages;
+                    sk.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
+                    if (v.stages > 1) {
+                        sk.stage[1] = { D3DTOP_ADD, D3DTA_TEXTURE, D3DTA_CURRENT, D3DTA_CURRENT, 0, 0, 0, 0 };
                     }
-
-                    {
-                        ShaderKey sk;
-                        memset(&sk, 0, sizeof(sk));
-                        sk.uvSets = (v.stages > 0) ? 1 : 0;  // No UV sets if no texture stages
-                        sk.useLighting = v.lighting;
-                        sk.lightMode = v.lightMode;
-                        sk.vertexColour = v.vertexCol;
-                        sk.vertexMaterial = v.vertexMat;
-                        sk.usesSkinning = v.skinning;
-                        sk.heavyLighting = v.heavyLighting;
-                        sk.hasDiffParam = v.hasDiffParam;
-                        sk.hasParamH = v.hasParamH;
-                        sk.hasParamX = v.hasParamX;
-                        sk.hasGrass = 0;
-                        sk.hasShadows = ((Configuration.MGEFlags & USE_SHADOWS) && (Configuration.MGEFlags & USE_DISTANT_LAND)) ? 1 : 0;
-                        sk.fogMode = v.fogMode;
-                        sk.activeStages = v.stages;
-
-                        sk.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
-                        if (v.stages > 1) {
-                            sk.stage[1] = { D3DTOP_ADD, D3DTA_TEXTURE, D3DTA_CURRENT, D3DTA_CURRENT, 0, 0, 0, 0 };
-                        }
-                        memset(&sk.stage[v.stages], 0, sizeof(sk.stage[0]) * (8 - v.stages));
-
-                        // Compile shader (no lock needed for generateMWShaderHLSL — it no longer writes cache)
-                        HLSLShader shader = generateMWShaderHLSL(sk);
-
-                        // Insert under exclusive lock
-                        AcquireSRWLockExclusive(&hlslCacheLock);
-                        if (cacheHLSLShaders.find(sk) == cacheHLSLShaders.end()) {
-                            cacheHLSLShaders[sk] = shader;
-                            hlslVariants++;
-                        }
-                        ReleaseSRWLockExclusive(&hlslCacheLock);
-                    }
+                    memset(&sk.stage[v.stages], 0, sizeof(sk.stage[0]) * (8 - v.stages));
+                    allKeys.push_back(sk);
                 }
 
-                // Grass variants (hasGrass=1) — separate because main loop hardcodes hasGrass=0
-                // From cache miss log: lm=0 vc=0/1, lm=1 vc=1
-                struct GrassVariant { int lightMode, vertexCol, vertexMat; };
-                GrassVariant grassVariants[] = {
-                    {0, 0, 1}, {0, 1, 2},
-                    {1, 0, 1}, {1, 1, 2},
+                // Stateless batch variants (lm=3 priority, then lm=2, lm=1, lm=0)
+                // These use useStatelessBatch=1 for batched rendering
+                struct StatelessVariant { int lightMode, vertexCol, vertexMat, heavyLighting; };
+                StatelessVariant statelessVariants[] = {
+                    // lm=3 stateless (highest priority - texture lights)
+                    {3, 0, 1, 0}, {3, 1, 2, 0}, {3, 0, 1, 1}, {3, 1, 2, 1},
+                    // lm=2 stateless
+                    {2, 0, 1, 0}, {2, 1, 2, 0}, {2, 0, 1, 1}, {2, 1, 2, 1},
+                    // lm=1 stateless
+                    {1, 0, 1, 0}, {1, 1, 2, 0},
+                    // lm=0 stateless
+                    {0, 0, 1, 0}, {0, 1, 2, 0},
                 };
+                for (const auto& sv : statelessVariants) {
+                    ShaderKey sk;
+                    memset(&sk, 0, sizeof(sk));
+                    sk.uvSets = 1;
+                    sk.useLighting = 1;
+                    sk.lightMode = sv.lightMode;
+                    sk.vertexColour = sv.vertexCol;
+                    sk.vertexMaterial = sv.vertexMat;
+                    sk.heavyLighting = sv.heavyLighting;
+                    sk.fogMode = 1;
+                    sk.activeStages = 1;
+                    sk.hasShadows = hasShadows;
+                    sk.useStatelessBatch = 1;  // Key: stateless batch mode
+                    sk.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
+                    allKeys.push_back(sk);
+                }
+
+                // Grass variants
+                struct GrassVariant { int lightMode, vertexCol, vertexMat; };
+                GrassVariant grassVariants[] = { {0, 0, 1}, {0, 1, 2}, {1, 0, 1}, {1, 1, 2} };
                 for (const auto& gv : grassVariants) {
                     ShaderKey sk;
                     memset(&sk, 0, sizeof(sk));
@@ -626,20 +652,58 @@ void FixedFunctionShader::startEarlyPrecache(IDirect3DDevice* d) {
                     sk.fogMode = 1;
                     sk.activeStages = 1;
                     sk.hasGrass = 1;
-                    sk.hasShadows = ((Configuration.MGEFlags & USE_SHADOWS) && (Configuration.MGEFlags & USE_DISTANT_LAND)) ? 1 : 0;
+                    sk.hasShadows = hasShadows;
                     sk.stage[0] = { D3DTOP_MODULATE, D3DTA_TEXTURE, D3DTA_DIFFUSE, D3DTA_CURRENT, 1, 0, 0, 0 };
+                    allKeys.push_back(sk);
+                }
 
-                    HLSLShader shader = generateMWShaderHLSL(sk);
-                    AcquireSRWLockExclusive(&hlslCacheLock);
-                    if (cacheHLSLShaders.find(sk) == cacheHLSLShaders.end()) {
-                        cacheHLSLShaders[sk] = shader;
-                        hlslVariants++;
+                const int totalShaders = (int)allKeys.size();
+                precacheTotal.store(totalShaders);
+                precacheCompleted.store(0);
+
+                LOG::logline("-- Precaching %d HLSL shader variants", totalShaders);
+
+                // Atomic index for work distribution
+                std::atomic<int> nextIndex(0);
+                std::atomic<int> compiledCount(0);
+
+                // Worker function - each thread pulls work via atomic index
+                auto workerFunc = [&]() {
+                    while (true) {
+                        int idx = nextIndex.fetch_add(1);
+                        if (idx >= totalShaders) break;
+
+                        const ShaderKey& sk = allKeys[idx];
+                        HLSLShader shader = generateMWShaderHLSL(sk);
+
+                        AcquireSRWLockExclusive(&hlslCacheLock);
+                        if (cacheHLSLShaders.find(sk) == cacheHLSLShaders.end()) {
+                            cacheHLSLShaders[sk] = shader;
+                        }
+                        ReleaseSRWLockExclusive(&hlslCacheLock);
+
+                        compiledCount.fetch_add(1);
+                        precacheCompleted.store(compiledCount.load());
                     }
-                    ReleaseSRWLockExclusive(&hlslCacheLock);
+                };
+
+                // Launch worker threads (cap at 4 to avoid device contention)
+                int numThreads = std::min(4, (int)std::thread::hardware_concurrency());
+                if (numThreads < 1) numThreads = 1;
+                LOG::logline("-- Using %d compile threads", numThreads);
+
+                std::vector<std::thread> workers;
+                for (int t = 0; t < numThreads; t++) {
+                    workers.emplace_back(workerFunc);
+                }
+
+                // Wait for all workers
+                for (auto& w : workers) {
+                    w.join();
                 }
 
                 StatusOverlay::setStatus("HLSL shader precaching complete");
-                LOG::logline("-- Precache thread completed: %d shaders compiled", hlslVariants);
+                LOG::logline("-- Precache complete: %d shaders compiled", compiledCount.load());
             }
             return 0;
         }, nullptr, 0, nullptr);
@@ -1518,6 +1582,98 @@ void FixedFunctionShader::stopAsyncCompiler() {
     pendingCompilations.clear();
 }
 
+// O3 Recompilation System - upgrades O1 shaders to O3 after game starts
+void FixedFunctionShader::queueAllO3Recompiles() {
+    // Scan cache under shared lock, queue all non-O3 shaders for O3 recompile
+    std::lock_guard<std::mutex> queueLock(o3QueueMutex);
+    AcquireSRWLockShared(&hlslCacheLock);
+
+    int queued = 0;
+    for (const auto& entry : cacheHLSLShaders) {
+        if (entry.second.optimizationLevel < 3) {
+            o3RecompileQueue.push(entry.first);
+            queued++;
+        }
+    }
+
+    ReleaseSRWLockShared(&hlslCacheLock);
+    LOG::logline("-- O3 recompile: queued %d shaders for upgrade", queued);
+}
+
+void FixedFunctionShader::startO3RecompileThread() {
+    // Only start once
+    if (o3RecompileStarted.exchange(true)) {
+        return;
+    }
+
+    o3RecompileActive = true;
+    o3RecompileThread = std::thread([]() {
+        LOG::logline("-- O3 recompile thread started");
+
+        int compiled = 0;
+        while (o3RecompileActive) {
+            ShaderKey key;
+            bool hasWork = false;
+
+            // Pop from queue
+            {
+                std::lock_guard<std::mutex> lock(o3QueueMutex);
+                if (!o3RecompileQueue.empty()) {
+                    key = o3RecompileQueue.front();
+                    o3RecompileQueue.pop();
+                    hasWork = true;
+                }
+            }
+
+            if (!hasWork) {
+                break;  // Queue empty, done
+            }
+
+            // Compile at O3 (this is the slow part)
+            HLSLShader newShader = generateMWShaderHLSL(key, 3);
+
+            // Replace O1 entry in cache (release old shaders first)
+            AcquireSRWLockExclusive(&hlslCacheLock);
+            auto it = cacheHLSLShaders.find(key);
+            if (it != cacheHLSLShaders.end()) {
+                // Release old O1 shaders
+                if (it->second.vertexShader) it->second.vertexShader->Release();
+                if (it->second.pixelShader) it->second.pixelShader->Release();
+                if (it->second.vsConstantTable) it->second.vsConstantTable->Release();
+                if (it->second.psConstantTable) it->second.psConstantTable->Release();
+                // Replace with new O3 shader
+                it->second = newShader;
+            }
+            ReleaseSRWLockExclusive(&hlslCacheLock);
+
+            compiled++;
+
+            // Leisurely pace: 50ms between compiles to avoid impacting gameplay
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+
+        // Invalidate LRU so next draw picks up O3 shaders
+        hlslShaderLRU.last_sk = ShaderKey();
+
+        LOG::logline("-- O3 recompile thread finished: %d shaders upgraded", compiled);
+        o3RecompileActive = false;
+    });
+}
+
+void FixedFunctionShader::stopO3RecompileThread() {
+    o3RecompileActive = false;
+
+    if (o3RecompileThread.joinable()) {
+        o3RecompileThread.join();
+    }
+
+    // Clear any remaining queue
+    std::lock_guard<std::mutex> lock(o3QueueMutex);
+    while (!o3RecompileQueue.empty()) {
+        o3RecompileQueue.pop();
+    }
+}
+
 void FixedFunctionShader::queueShaderCompilation(const ShaderKey& key) {
     // Check if already pending
     if (pendingCompilations.find(key) != pendingCompilations.end()) {
@@ -1576,7 +1732,7 @@ static FixedFunctionShader::ConstReg resolveConstReg(ID3DXConstantTable* table, 
     return cr;
 }
 
-FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const ShaderKey& sk) {
+FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const ShaderKey& sk, uint8_t optLevel) {
     HLSLShader hlslShader = {};
     
     // Shader entry points
@@ -1654,8 +1810,11 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
 
     // Use IEEE_STRICTNESS for consistent Z precision across shader permutations (stateless batch vs regular)
     DWORD vsCompileFlags = D3DCOMPILE_PREFER_FLOW_CONTROL | D3DCOMPILE_IEEE_STRICTNESS;
-    if (ShaderUtils::isDXVK()) {
+    // Use optimization level based on optLevel parameter (1=O1, 2=O2, 3=O3)
+    if (optLevel == 1) {
         vsCompileFlags |= D3DCOMPILE_OPTIMIZATION_LEVEL1;
+    } else if (optLevel == 2) {
+        vsCompileFlags |= D3DCOMPILE_OPTIMIZATION_LEVEL2;
     } else {
         vsCompileFlags |= D3DCOMPILE_OPTIMIZATION_LEVEL3;
     }
@@ -1748,8 +1907,11 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
 
     // Match D3DX9 effect compilation - no IEEE_STRICTNESS for invariance with depth pass
     DWORD psCompileFlags = D3DCOMPILE_PREFER_FLOW_CONTROL;
-    if (ShaderUtils::isDXVK()) {
+    // Use optimization level based on optLevel parameter (1=O1, 2=O2, 3=O3)
+    if (optLevel == 1) {
         psCompileFlags |= D3DCOMPILE_OPTIMIZATION_LEVEL1;
+    } else if (optLevel == 2) {
+        psCompileFlags |= D3DCOMPILE_OPTIMIZATION_LEVEL2;
     } else {
         psCompileFlags |= D3DCOMPILE_OPTIMIZATION_LEVEL3;
     }
@@ -1859,10 +2021,10 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     // Clean up shader sources
     delete[] vertexShaderSource;
     delete[] pixelShaderSource;
-    
-    // Log shader key details
-    // LOG::logline("-- HLSL ShaderKey: hasDiffParam=%d hasNormal=%d hasParam=%d", sk.hasDiffParam, sk.hasNormal, sk.hasParam);
-    
+
+    // Record optimization level used for this shader
+    hlslShader.optimizationLevel = optLevel;
+
     return hlslShader;
 }
 
@@ -1931,9 +2093,12 @@ void FixedFunctionShader::release() {
         precacheThread = nullptr;
     }
 
+    // Stop O3 recompile thread
+    stopO3RecompileThread();
+
     // Stop async compiler thread
     stopAsyncCompiler();
-    
+
     // Clean up D3DXEffect cache
     for (auto& i : cacheEffects) {
         if (i.second) {
