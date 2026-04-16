@@ -57,6 +57,18 @@ struct PostProcessData {
     bool isMenu, isInterior, isUnderwater;
 };
 
+// Point light data extracted once per recorded frame for HLSL mode.
+// Stored in FrameBuffer so N/N-1/N-2 pipeline phases never share a mutable list.
+struct HLSLSceneLight {
+    DWORD id;
+    D3DXVECTOR3 position;
+    D3DCOLORVALUE diffuse;
+    float radius;
+    D3DXVECTOR3 falloff;
+    bool isVisible;
+    int lastSeenFrame;
+};
+
 // Render bin classification for Tracy profiling and debug visualization
 enum class RenderBin : uint8_t {
     Terrain,      // Landscape verts (future: detected by land splat pattern)
@@ -573,6 +585,9 @@ extern void (*g_onTextureReleased)(IDirect3DTexture9* realTexture);
 // Replay metrics for material sorting optimization analysis
 extern ReplayMetrics g_replayMetrics;
 
+// Light state generation counter - incremented only when light data actually changes
+extern uint32_t g_lightStateGen;
+
 class FixedFunctionShader {
     struct ShaderKey {
         DWORD uvSets : 4;
@@ -1046,6 +1061,8 @@ public:
 
         // Per-buffer LightState cache for recording
         std::shared_ptr<LightState> lastLightState;
+        std::vector<HLSLSceneLight> sceneLights;
+        std::unordered_map<int, size_t> sceneLightIndexMap;
 
         // Per-buffer scene data (HLSL mode only — isolates record/render phases)
         std::vector<RecordedMWState> recordMW;
@@ -1108,6 +1125,8 @@ public:
             rasterizedOccluderMeshes.clear();
             bboxLookup.clear();
             lastLightState.reset();
+            sceneLights.clear();
+            sceneLightIndexMap.clear();
             recordMW.clear();
             recordSky.clear();
             waterSeen = false;

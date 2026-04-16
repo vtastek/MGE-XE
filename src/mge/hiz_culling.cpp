@@ -135,22 +135,19 @@ static bool lessMergedBatchKey(const MergedBatchKey& lhs, const MergedBatchKey& 
 }
 
 static bool lessCachedMergedCallLayout(const CachedMergedCallLayout& lhs, const CachedMergedCallLayout& rhs) {
-    if (lessMeshKey(lhs.mesh, rhs.mesh)) return true;
-    if (lessMeshKey(rhs.mesh, lhs.mesh)) return false;
-    if (lhs.vbOffset != rhs.vbOffset) return lhs.vbOffset < rhs.vbOffset;
-    if (lhs.vbStride != rhs.vbStride) return lhs.vbStride < rhs.vbStride;
-    if (lessMergedBatchKey(lhs.batchKey, rhs.batchKey)) return true;
-    if (lessMergedBatchKey(rhs.batchKey, lhs.batchKey)) return false;
-    if (lessMatrix(lhs.worldTransform, rhs.worldTransform)) return true;
-    if (lessMatrix(rhs.worldTransform, lhs.worldTransform)) return false;
-    if (lessColorValue(lhs.diffuseMaterial, rhs.diffuseMaterial)) return true;
-    if (lessColorValue(rhs.diffuseMaterial, lhs.diffuseMaterial)) return false;
-    if (lessColorValue(lhs.ambientMaterial, rhs.ambientMaterial)) return true;
-    if (lessColorValue(rhs.ambientMaterial, lhs.ambientMaterial)) return false;
-    if (lessColorValue(lhs.emissiveMaterial, rhs.emissiveMaterial)) return true;
-    if (lessColorValue(rhs.emissiveMaterial, lhs.emissiveMaterial)) return false;
-    if (lhs.alphaRef != rhs.alphaRef) return lhs.alphaRef < rhs.alphaRef;
-    return lhs.vertexMaterial < rhs.vertexMaterial;
+    // Phase 4 optimization: compare position (translation) early as strong discriminator
+    // Objects at different positions will typically sort apart, avoiding deeper comparisons
+    if (lhs.worldTransform._41 != rhs.worldTransform._41) return lhs.worldTransform._41 < rhs.worldTransform._41;
+    if (lhs.worldTransform._42 != rhs.worldTransform._42) return lhs.worldTransform._42 < rhs.worldTransform._42;
+    if (lhs.worldTransform._43 != rhs.worldTransform._43) return lhs.worldTransform._43 < rhs.worldTransform._43;
+
+    // Mesh key comparison (VB/IB pointers are strong discriminators)
+    if (lhs.mesh.vb != rhs.mesh.vb) return lhs.mesh.vb < rhs.mesh.vb;
+    if (lhs.mesh.ib != rhs.mesh.ib) return lhs.mesh.ib < rhs.mesh.ib;
+
+    // Fast memcmp fallback for remaining struct (struct is zero-initialized via memset in makeCachedMergedCallLayout)
+    // This is faster than field-by-field comparison for large structs
+    return memcmp(&lhs, &rhs, sizeof(CachedMergedCallLayout)) < 0;
 }
 
 // Invalidate cell batch cache for a specific cell
@@ -753,6 +750,86 @@ void FixedFunctionShader::markAllCallsDirty() {
     }
 }
 
+static void extractLightStateLights(
+    const LightState* lightrs,
+    const D3DXVECTOR4& eyePos,
+    std::vector<HLSLSceneLight>& sceneLights,
+    std::unordered_map<int, size_t>& sceneLightIndexMap)
+{
+    if (!lightrs) return;
+
+    // Only process ACTIVE lights — lightrs->lights accumulates all SetLight() calls
+    // across the session and never removes entries, so inactive/stale lights persist.
+    for (DWORD id : lightrs->active) {
+        auto lightIt = lightrs->lights.find(id);
+        if (lightIt == lightrs->lights.end()) continue;
+        const auto& light = lightIt->second;
+
+        // Skip directional lights (sun) — only point lights for scene lighting
+        if (light.type != D3DLIGHT_POINT) continue;
+
+        // Distance filter: reject lights far from camera (stale interior lights after cell change)
+        float dx = light.position.x - eyePos.x;
+        float dy = light.position.y - eyePos.y;
+        float dz = light.position.z - eyePos.z;
+        float distSq = dx*dx + dy*dy + dz*dz;
+        const float MAX_LIGHT_DIST_SQ = 8192.0f * 8192.0f;
+        if (distSq > MAX_LIGHT_DIST_SQ) continue;
+
+        // Check if light already exists using O(1) hash map lookup
+        auto mapIt = sceneLightIndexMap.find(id);
+
+        if (mapIt == sceneLightIndexMap.end()) {
+            // New light - add to scene
+            size_t newIndex = sceneLights.size();
+            HLSLSceneLight sl;
+            sl.id = id;
+            sl.position = light.position;
+            sl.diffuse = light.diffuse;
+            sl.falloff = light.falloff;  // (constant, linear, quadratic)
+            sl.radius = DistantLand::computeLightRadius(sl.falloff.x, sl.falloff.y, sl.falloff.z);
+            sl.isVisible = false;
+            sl.lastSeenFrame = 0;
+            sceneLights.push_back(sl);
+            sceneLightIndexMap[id] = newIndex;  // Add to index map
+        } else {
+            // Update dynamic properties (color may pulse)
+            size_t index = mapIt->second;
+            sceneLights[index].position = light.position;
+            sceneLights[index].diffuse = light.diffuse;
+            sceneLights[index].falloff = light.falloff;
+            sceneLights[index].radius = DistantLand::computeLightRadius(
+                light.falloff.x, light.falloff.y, light.falloff.z);
+        }
+    }
+}
+
+// Extract lights once per frame instead of during every DrawIndexedPrimitive.
+// Union all recorded draw-call light states; Morrowind changes active light slots
+// per object, so the final frame state alone can miss lights used earlier.
+static void extractFrameLights(
+    const std::vector<FixedFunctionShader::HLSLRecordedCall>& calls,
+    const LightState* fallbackLightState,
+    const D3DXVECTOR4& eyePos,
+    std::vector<HLSLSceneLight>& sceneLights,
+    std::unordered_map<int, size_t>& sceneLightIndexMap)
+{
+    MGE_ZoneScopedN("extractFrameLights");
+    sceneLights.clear();
+    sceneLightIndexMap.clear();
+
+    std::unordered_set<const LightState*> seenLightStates;
+    for (const auto& call : calls) {
+        const LightState* lightrs = call.lightrs.get();
+        if (!lightrs || !seenLightStates.insert(lightrs).second) continue;
+        extractLightStateLights(lightrs, eyePos, sceneLights, sceneLightIndexMap);
+    }
+
+    if (sceneLights.empty()) {
+        extractLightStateLights(fallbackLightState, eyePos, sceneLights, sceneLightIndexMap);
+    }
+}
+
 // Phase 2b: Prepare shader keys — runs after recording completes, before replay.
 // BBox computation and occluder rasterization already done in executeHiZCulling (Phase 2a).
 // Phase 2: prepares prepBuffer (N-1 frame's data)
@@ -761,6 +838,20 @@ void FixedFunctionShader::prepareRecordedCalls() {
 
     auto& fb = getPrepBuffer();
     auto& recCalls = fb.recordedCalls;
+
+    // Extract lights once per frame by unioning the recorded per-call light states.
+    // Sampling only fb.lastLightState is not enough: Morrowind changes active light
+    // slots per object, so the final state can miss lights used earlier in the frame.
+    // Derive eye pos from fb.view (frame N-1 view) instead of DistantLand::s_staging.eyePos,
+    // which has already been advanced to the next frame by the time we run here.
+    D3DXVECTOR4 fbEyePos;
+    {
+        D3DXMATRIX invView;
+        D3DXMatrixInverse(&invView, nullptr, &fb.view);
+        D3DXVECTOR4 origin(0.0f, 0.0f, 0.0f, 1.0f);
+        D3DXVec4Transform(&fbEyePos, &origin, &invView);
+    }
+    extractFrameLights(recCalls, fb.lastLightState.get(), fbEyePos, fb.sceneLights, fb.sceneLightIndexMap);
 
     // Compute shader keys and assign render bins (with slow-frame timing)
     LARGE_INTEGER freqQPC, prepStartQPC, prepEndQPC;

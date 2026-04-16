@@ -2031,6 +2031,12 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
 // Triple buffer rotation at Present()
 // Rotation: Recording(N) -> Prep(N-1) -> Render(N-2) -> Recording(cleared)
 void FixedFunctionShader::swapBuffers() {
+    // Snapshot final light state into recording buffer BEFORE swap.
+    // After swap, this buffer becomes the prep buffer — prepareRecordedCalls() reads it
+    // off the worker thread. Per-frame snapshot avoids main-thread/worker-thread races
+    // and frame N vs N-1 pipeline mismatch (which caused light flicker on camera move).
+    frameBuffers[recordingBuffer].lastLightState = lastLightState;
+
     // STRESS TEST: Poison old buffer BEFORE swap to catch N-1/N-2 confusion
     // If rendering uses stale data, it will produce obviously wrong results
     if (ImGuiManager::GetStressPoisonBuffers()) {
@@ -2212,18 +2218,33 @@ FixedFunctionShader::ShaderKey::ShaderKey(const RenderedState* rs, const Fragmen
     useLighting = rs->useLighting ? 1 : 0;
     
     // Count point lights specifically (exclude directional lights like sun)
+    // Thread-local cache to skip iteration if lightrs pointer unchanged (Phase 3 optimization)
+    static thread_local const LightState* s_cachedLightPtr = nullptr;
+    static thread_local int s_cachedPointCount = 0;
+    static thread_local int s_cachedDirCount = 0;
+
     int pointLightCount = 0;
     int directionalLightCount = 0;
-    if (rs->useLighting) {
-        for (DWORD lightId : lightrs->active) {
-            auto lightIt = lightrs->lights.find(lightId);
-            if (lightIt != lightrs->lights.end()) {
-                if (lightIt->second.type == D3DLIGHT_POINT) {
-                    pointLightCount++;
-                } else if (lightIt->second.type == D3DLIGHT_DIRECTIONAL) {
-                    directionalLightCount++;
+    if (rs->useLighting && lightrs) {
+        if (lightrs == s_cachedLightPtr) {
+            // Fast path: same light state, reuse cached counts
+            pointLightCount = s_cachedPointCount;
+            directionalLightCount = s_cachedDirCount;
+        } else {
+            // Slow path: iterate and cache
+            for (DWORD lightId : lightrs->active) {
+                auto lightIt = lightrs->lights.find(lightId);
+                if (lightIt != lightrs->lights.end()) {
+                    if (lightIt->second.type == D3DLIGHT_POINT) {
+                        pointLightCount++;
+                    } else if (lightIt->second.type == D3DLIGHT_DIRECTIONAL) {
+                        directionalLightCount++;
+                    }
                 }
             }
+            s_cachedLightPtr = lightrs;
+            s_cachedPointCount = pointLightCount;
+            s_cachedDirCount = directionalLightCount;
         }
     }
     if (!rs->useLighting || pointLightCount == 0) lightMode = 0;
@@ -3103,7 +3124,7 @@ static void fillSnapshotState(FrameSnapshot& snap) {
     snap.eyePosX = DistantLand::s_staging.eyePos.x;
     snap.eyePosY = DistantLand::s_staging.eyePos.y;
     snap.eyePosZ = DistantLand::s_staging.eyePos.z;
-    snap.sceneLightsTotal = (int)DistantLand::sceneLights.size();
+    snap.sceneLightsTotal = (int)fb.sceneLights.size();
 
     // Read recorded calls from the buffer
     snap.totalRecordedCalls = (int)fb.recordedCalls.size();

@@ -373,9 +373,6 @@ void FixedFunctionShader::startRecording() {
         lastPlayerCell = currentCell;
     }
 
-    // Clear lights from previous frame (simple approach, no persistence)
-    DistantLand::sceneLights.clear();
-    DistantLand::sceneLightIndexMap.clear();
     isRecording = true;
     isReplaying = false;
     recordingCompletedThisFrame = false;  // Allow recording to proceed
@@ -499,6 +496,7 @@ void FixedFunctionShader::stopRecordingAndReplay() {
     }
 
     // Phase 2b: Prepare shader keys (bbox + occluders already done in executeHiZCulling)
+    // Note: extractFrameLights() is now called inside prepareRecordedCalls() to cover all code paths
     prepareRecordedCalls();
 
     // Phase 3: Replay all prepared calls (Hi-Z already built by executeHiZCulling)
@@ -1922,66 +1920,24 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
         }
     }
 
-    // Extract lights for texture-based lighting system (all objects, even if culled)
-    // Lights from culled objects can still illuminate visible geometry
-    // Only process ACTIVE lights — lightrs->lights accumulates all SetLight() calls
-    // across the session and never removes entries, so inactive/stale lights persist.
-    for (DWORD id : lightrs->active) {
-        auto lightIt = lightrs->lights.find(id);
-        if (lightIt == lightrs->lights.end()) continue;
-        const auto& light = lightIt->second;
-
-        // Skip directional lights (sun) — only point lights for scene lighting
-        if (light.type != D3DLIGHT_POINT) continue;
-
-        // Distance filter: reject lights far from camera (stale interior lights after cell change)
-        float dx = light.position.x - DistantLand::s_staging.eyePos.x;
-        float dy = light.position.y - DistantLand::s_staging.eyePos.y;
-        float dz = light.position.z - DistantLand::s_staging.eyePos.z;
-        float distSq = dx*dx + dy*dy + dz*dz;
-        const float MAX_LIGHT_DIST_SQ = 8192.0f * 8192.0f;
-        if (distSq > MAX_LIGHT_DIST_SQ) continue;
-
-        // Check if light already exists using O(1) hash map lookup
-        auto mapIt = DistantLand::sceneLightIndexMap.find(id);
-
-        if (mapIt == DistantLand::sceneLightIndexMap.end()) {
-            // New light - add to scene
-            size_t newIndex = DistantLand::sceneLights.size();
-            DistantLand::SceneLight sl;
-            sl.id = id;
-            sl.position = light.position;
-            sl.diffuse = light.diffuse;
-            sl.falloff = light.falloff;  // (constant, linear, quadratic)
-            sl.radius = DistantLand::computeLightRadius(sl.falloff.x, sl.falloff.y, sl.falloff.z);
-            sl.isVisible = false;
-            sl.lastSeenFrame = 0;
-            DistantLand::sceneLights.push_back(sl);
-            DistantLand::sceneLightIndexMap[id] = newIndex;  // Add to index map
-        } else {
-            // Update dynamic properties (color may pulse)
-            size_t index = mapIt->second;
-            DistantLand::sceneLights[index].diffuse = light.diffuse;
-        }
-    }
+    // Light extraction moved to extractFrameLights() - called once per frame
+    // instead of per-call (~2000+ times/frame), saving 8,000-80,000 operations/frame
 
     // Reuse last LightState if identical to avoid allocation overhead
-    // NOTE: Cannot use raw pointer comparison here! lightrs is a file-scope static in
-    // mged3d8device.cpp — its address never changes, but Morrowind mutates it in-place
-    // between draw calls via LightEnable(). Pointer equality always returns true,
-    // causing ALL calls to share the first call's light config.
+    // Use generation counter for fast-path: if generation matches, lights are unchanged
+    static uint32_t s_lastCapturedLightGen = 0;
     std::shared_ptr<LightState> sharedLightState;
     {
         MGE_ZoneScopedN("record_LightStateCache");
-        // Content comparison: reuse if lights haven't changed since last call
-        if (lastLightState && compareLightStates(lastLightState.get(), lightrs)) {
-            // Reuse existing shared_ptr (no allocation)
+        // Fast path: generation counter says lights haven't changed
+        if (lastLightState && s_lastCapturedLightGen == g_lightStateGen) {
             sharedLightState = lastLightState;
         }
-        // Different lights: create new copy
+        // Slow path: generation changed, need new copy
         else {
             sharedLightState = std::make_shared<LightState>(*lightrs);
             lastLightState = sharedLightState;
+            s_lastCapturedLightGen = g_lightStateGen;
         }
     }
 

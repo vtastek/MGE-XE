@@ -60,6 +60,7 @@ static float crosshairTimeout;
 static RenderedState rs;
 static FragmentState frs;
 static LightState lightrs;
+uint32_t g_lightStateGen = 1;  // Generation counter - incremented only when light data actually changes
 DeviceStateSnapshot g_deviceState;
 
 // ImGui state
@@ -125,7 +126,7 @@ static float calcFPS();
 
 // Helper: process debug hotkeys when ImGui is initialized
 static void processImGuiHotkeys() {
-    static bool f11Pressed = false, gPressed = false, uPressed = false, ePressed = false;
+    static bool f11Pressed = false, gPressed = false, uPressed = false, ePressed = false, lPressed = false;
 
     // F11: Toggle PCF interface (gated)
     if (ImGuiManager::GetDebugKeysEnabled()) {
@@ -160,6 +161,16 @@ static void processImGuiHotkeys() {
             ImGuiManager::ToggleFrameEventLog();
         }
         ePressed = eState;
+    }
+
+    // L: Dump current HLSL light snapshot (gated)
+    if (ImGuiManager::GetDebugKeysEnabled()) {
+        bool lState = (GetAsyncKeyState('L') & 0x8000) != 0;
+        if (lState && !lPressed) {
+            LOG::logline(">> L key pressed, requesting light snapshot dump");
+            ImGuiManager::RequestLightSnapshotDump();
+        }
+        lPressed = lState;
     }
 }
 
@@ -1554,9 +1565,14 @@ HRESULT _stdcall MGEProxyDevice::SetRenderState(D3DRENDERSTATETYPE a, DWORD b) {
             // Save real ambient, can be used in future frames if no draw calls are provoked
             RGBVECTOR amb = D3DCOLOR(b);
             DistantLand::setAmbientColour(amb);
-            lightrs.globalAmbient.r = amb.r;
-            lightrs.globalAmbient.g = amb.g;
-            lightrs.globalAmbient.b = amb.b;
+            if (lightrs.globalAmbient.r != amb.r ||
+                lightrs.globalAmbient.g != amb.g ||
+                lightrs.globalAmbient.b != amb.b) {
+                lightrs.globalAmbient.r = amb.r;
+                lightrs.globalAmbient.g = amb.g;
+                lightrs.globalAmbient.b = amb.b;
+                ++g_lightStateGen;
+            }
         }
     }
 
@@ -2108,10 +2124,12 @@ HRESULT _stdcall MGEProxyDevice::LightEnable(DWORD a, BOOL b) {
     if (b) {
         if (std::find(lightrs.active.begin(), lightrs.active.end(), a) == lightrs.active.end()) {
             lightrs.active.push_back(a);
+            ++g_lightStateGen;  // Actually adding a light
         }
     } else {
         if (std::remove(lightrs.active.begin(), lightrs.active.end(), a) != lightrs.active.end()) {
             lightrs.active.pop_back();
+            ++g_lightStateGen;  // Actually removing a light
         }
     }
     if (ImGuiManager::GetCmdBufferRecording()) {
@@ -2384,14 +2402,11 @@ void captureTransform(D3DTRANSFORMSTATETYPE a, const D3DMATRIX* b) {
 
 void captureLight(DWORD a, const D3DLIGHT8* b) {
     // Morrowind uses non-contigous light IDs up to a large number (>512)
+    // Capture data changes as well as enable changes; the per-frame light snapshot
+    // cache depends on this generation to know when an in-place LightState mutated.
     LightState::Light* light = &lightrs.lights[a];
-
-    // Copy values relevant to Morrowind
-    // i.e. Morrowind has no spotlights and always sets range to FLT_MAX
-    // The only light source with ambient is sunlight
     light->type = b->Type;
     light->diffuse = b->Diffuse;
-
     if (b->Type == D3DLIGHT_POINT) {
         light->position = b->Position;
         light->falloff.x = b->Attenuation0;
@@ -2399,10 +2414,11 @@ void captureLight(DWORD a, const D3DLIGHT8* b) {
         light->falloff.z = b->Attenuation2;
     } else {
         D3DXVec3Normalize((D3DXVECTOR3*)&light->position, (D3DXVECTOR3*)&b->Direction);
-        light->ambient.x = b->Ambient.r;
-        light->ambient.y = b->Ambient.g;
-        light->ambient.z = b->Ambient.b;
+        light->falloff.x = b->Ambient.r;  // Union with ambient
+        light->falloff.y = b->Ambient.g;
+        light->falloff.z = b->Ambient.b;
     }
+    ++g_lightStateGen;
 }
 
 void captureMaterial(const D3DMATERIAL8* a) {

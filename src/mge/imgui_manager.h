@@ -150,9 +150,11 @@ public:
     static bool GetEnableStatelessBatch();
     static bool GetHighlightStatelessBatch();
     static bool GetAndClearDumpStatelessBatch(); // Returns true once, then clears
+    static bool GetAndClearDumpLightSnapshot();  // Returns true once, then clears
 
     // Force lightMode 3 for all lit Opaque/Terrain (debug)
     static bool GetForceLightMode3();
+    static void RequestLightSnapshotDump();
 
     // Shader debug visualization mode (0=off, 1-15=debug views)
     static int GetShaderDebugMode();
@@ -311,6 +313,7 @@ private:
     static bool enableStatelessBatch;  // Enable stateless batching (experimental)
     static bool highlightStatelessBatch; // Highlight batched draws with color
     static bool dumpStatelessBatchDetail; // One-shot flag for detailed batch dump
+    static bool dumpLightSnapshot;       // One-shot flag for per-frame light diagnostics
     static bool forceLightMode3;       // Force lightMode 3 for all lit Opaque/Terrain
     static int shaderDebugMode;        // Shader debug visualization (0=off, 1-15=debug views)
 

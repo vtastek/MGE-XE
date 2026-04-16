@@ -1810,7 +1810,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
     // Each mode 3 object gets only its spatially-nearby lights packed into the texture.
     // NOTE: Only run for Scene 0 - runs once per frame, not 3x per scene.
     // Scene 1/2 use fixed-function 8-light path, not mode 3 per-object lights.
-    int numSceneLights = (int)DistantLand::sceneLights.size();
+    const auto& sceneLights = fb.sceneLights;
+    int numSceneLights = (int)sceneLights.size();
     if (sceneCount == 0) {
         MGE_ZoneScopedN("replay_PerObjectLightPack");
         const size_t numCallsForPack = recCalls.size();
@@ -1856,7 +1857,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
 
             int count = 0;
 
-            for (const auto& light : DistantLand::sceneLights) {
+            for (const auto& light : sceneLights) {
                 // Sphere-AABB intersection: closest point on bbox to light center
                 float cx = (light.position.x < bMin.x) ? bMin.x : (light.position.x > bMax.x) ? bMax.x : light.position.x;
                 float cy = (light.position.y < bMin.y) ? bMin.y : (light.position.y > bMax.y) ? bMax.y : light.position.y;
@@ -1898,12 +1899,12 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
             currentTexelOffset += count * 3;  // 3 texels per light
 
             // Diagnostic: log first mode 3 object's bbox and nearest light (sphere-AABB distance)
-            if (mode3Count == 0 && !DistantLand::sceneLights.empty()) {
+            if (mode3Count == 0 && !sceneLights.empty()) {
                 float nearestDist = FLT_MAX;
                 int nearestIdx = -1;
                 float nearestRadius = 0;
-                for (int li = 0; li < (int)DistantLand::sceneLights.size(); li++) {
-                    const auto& light = DistantLand::sceneLights[li];
+                for (int li = 0; li < (int)sceneLights.size(); li++) {
+                    const auto& light = sceneLights[li];
                     float cx = (light.position.x < bMin.x) ? bMin.x : (light.position.x > bMax.x) ? bMax.x : light.position.x;
                     float cy = (light.position.y < bMin.y) ? bMin.y : (light.position.y > bMax.y) ? bMax.y : light.position.y;
                     float cz = (light.position.z < bMin.z) ? bMin.z : (light.position.z > bMax.z) ? bMax.z : light.position.z;
@@ -1922,6 +1923,157 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
 
         int totalTexels = currentTexelOffset;
         perObjectTexelSize = totalTexels > 0 ? 1.0f / totalTexels : 0.0f;
+
+        if (ImGuiManager::GetAndClearDumpLightSnapshot()) {
+            static int s_lightDumpSeq = 0;
+            ++s_lightDumpSeq;
+
+            int rawActive = 0;
+            int rawPoint = 0;
+            int rawDirectional = 0;
+            if (fb.lastLightState) {
+                rawActive = (int)fb.lastLightState->active.size();
+                for (DWORD id : fb.lastLightState->active) {
+                    auto it = fb.lastLightState->lights.find(id);
+                    if (it == fb.lastLightState->lights.end()) continue;
+                    if (it->second.type == D3DLIGHT_POINT) ++rawPoint;
+                    else if (it->second.type == D3DLIGHT_DIRECTIONAL) ++rawDirectional;
+                }
+            }
+
+            int packedObjects = 0;
+            int packedZero = 0;
+            int packedMin = INT_MAX;
+            int packedMax = 0;
+            int packedSum = 0;
+            int lightModeCounts[4] = {0, 0, 0, 0};
+            for (size_t i = 0; i < numCallsForPack; ++i) {
+                const auto& call = recCalls[i];
+                if (call.sk.lightMode < 4) ++lightModeCounts[call.sk.lightMode];
+                bool needsLightPack = (call.sk.lightMode == 3);
+                if (ImGuiManager::GetForceLightMode3() && call.sk.useLighting &&
+                    (call.bin == RenderBin::Opaque || call.bin == RenderBin::Terrain)) {
+                    needsLightPack = true;
+                }
+                if (ImGuiManager::GetEnableStatelessBatch() && call.sk.useLighting &&
+                    (call.bin == RenderBin::Opaque || call.bin == RenderBin::Terrain)) {
+                    needsLightPack = true;
+                }
+                if (!needsLightPack) continue;
+
+                int count = perObjectLightInfo[i].lightCount;
+                ++packedObjects;
+                if (count == 0) ++packedZero;
+                if (count < packedMin) packedMin = count;
+                if (count > packedMax) packedMax = count;
+                packedSum += count;
+            }
+            if (packedObjects == 0) packedMin = 0;
+
+            LOG::logline("=== LIGHT SNAPSHOT %d BEGIN ===", s_lightDumpSeq);
+            LOG::logline("LightSnapshot frame=%d scene=%d calls=%d renderedFb=%p camera=(%.2f,%.2f,%.2f) rawActive=%d rawPoint=%d rawDirectional=%d sceneLights=%d mode3Objects=%d zeroPacked=%d packedMin=%d packedMax=%d packedAvg=%.2f texels=%d texelSize=%.8f lightModes=[%d,%d,%d,%d]",
+                fb.frameNumber, sceneCount, (int)recCalls.size(), &fb,
+                currentCameraPos.x, currentCameraPos.y, currentCameraPos.z,
+                rawActive, rawPoint, rawDirectional, numSceneLights,
+                packedObjects, packedZero, packedMin, packedMax,
+                packedObjects > 0 ? (float)packedSum / packedObjects : 0.0f,
+                totalTexels, perObjectTexelSize,
+                lightModeCounts[0], lightModeCounts[1], lightModeCounts[2], lightModeCounts[3]);
+
+            if (fb.lastLightState) {
+                int rawLogged = 0;
+                for (DWORD id : fb.lastLightState->active) {
+                    auto it = fb.lastLightState->lights.find(id);
+                    if (it == fb.lastLightState->lights.end()) {
+                        LOG::logline("LightSnapshot raw[%d] id=%u missing", rawLogged, id);
+                    } else {
+                        const auto& light = it->second;
+                        LOG::logline("LightSnapshot raw[%d] id=%u type=%d pos=(%.2f,%.2f,%.2f) diffuse=(%.4f,%.4f,%.4f) falloff=(%.6f,%.6f,%.6f)",
+                            rawLogged, id, (int)light.type,
+                            light.position.x, light.position.y, light.position.z,
+                            light.diffuse.r, light.diffuse.g, light.diffuse.b,
+                            light.falloff.x, light.falloff.y, light.falloff.z);
+                    }
+                    if (++rawLogged >= 64) {
+                        LOG::logline("LightSnapshot raw: truncated after 64 active lights");
+                        break;
+                    }
+                }
+            } else {
+                LOG::logline("LightSnapshot raw: no fb.lastLightState");
+            }
+
+            for (int li = 0; li < (int)sceneLights.size() && li < 64; ++li) {
+                const auto& light = sceneLights[li];
+                float dx = light.position.x - currentCameraPos.x;
+                float dy = light.position.y - currentCameraPos.y;
+                float dz = light.position.z - currentCameraPos.z;
+                float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+                LOG::logline("LightSnapshot scene[%d] id=%u pos=(%.2f,%.2f,%.2f) camDist=%.2f radius=%.2f diffuse=(%.4f,%.4f,%.4f) falloff=(%.6f,%.6f,%.6f)",
+                    li, light.id, light.position.x, light.position.y, light.position.z,
+                    dist, light.radius, light.diffuse.r, light.diffuse.g, light.diffuse.b,
+                    light.falloff.x, light.falloff.y, light.falloff.z);
+            }
+            if (sceneLights.size() > 64) {
+                LOG::logline("LightSnapshot scene: truncated after 64 of %d lights", (int)sceneLights.size());
+            }
+
+            int objectLogged = 0;
+            for (size_t i = 0; i < numCallsForPack && objectLogged < 96; ++i) {
+                const auto& call = recCalls[i];
+                bool needsLightPack = (call.sk.lightMode == 3);
+                if (ImGuiManager::GetForceLightMode3() && call.sk.useLighting &&
+                    (call.bin == RenderBin::Opaque || call.bin == RenderBin::Terrain)) {
+                    needsLightPack = true;
+                }
+                if (ImGuiManager::GetEnableStatelessBatch() && call.sk.useLighting &&
+                    (call.bin == RenderBin::Opaque || call.bin == RenderBin::Terrain)) {
+                    needsLightPack = true;
+                }
+                if (!needsLightPack) continue;
+
+                D3DXVECTOR3 bMin, bMax;
+                if (call.hasBoundingBox) {
+                    bMin = call.bboxMin;
+                    bMax = call.bboxMax;
+                } else {
+                    float ox = call.rs.worldTransforms[0]._41;
+                    float oy = call.rs.worldTransforms[0]._42;
+                    float oz = call.rs.worldTransforms[0]._43;
+                    bMin = bMax = D3DXVECTOR3(ox, oy, oz);
+                }
+
+                float nearestDist = FLT_MAX;
+                DWORD nearestId = 0;
+                float nearestRadius = 0.0f;
+                for (const auto& light : sceneLights) {
+                    float cx = (light.position.x < bMin.x) ? bMin.x : (light.position.x > bMax.x) ? bMax.x : light.position.x;
+                    float cy = (light.position.y < bMin.y) ? bMin.y : (light.position.y > bMax.y) ? bMax.y : light.position.y;
+                    float cz = (light.position.z < bMin.z) ? bMin.z : (light.position.z > bMax.z) ? bMax.z : light.position.z;
+                    float dx = light.position.x - cx;
+                    float dy = light.position.y - cy;
+                    float dz = light.position.z - cz;
+                    float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+                    if (dist < nearestDist) {
+                        nearestDist = dist;
+                        nearestId = light.id;
+                        nearestRadius = light.radius;
+                    }
+                }
+
+                LOG::logline("LightSnapshot obj[%d] call=%d bin=%d lm=%d lighting=%d count=%d texelOffset=%d bbox=(%.1f,%.1f,%.1f)-(%.1f,%.1f,%.1f) nearestId=%u nearestDist=%.2f nearestRadius=%.2f tex=%p vb=%p ib=%p",
+                    objectLogged, (int)i, (int)call.bin, (int)call.sk.lightMode, (int)call.sk.useLighting,
+                    perObjectLightInfo[i].lightCount, perObjectLightInfo[i].texelOffset,
+                    bMin.x, bMin.y, bMin.z, bMax.x, bMax.y, bMax.z,
+                    nearestId, nearestDist, nearestRadius,
+                    call.rs.texture, call.rs.vb, call.rs.ib);
+                ++objectLogged;
+            }
+            if (packedObjects > objectLogged) {
+                LOG::logline("LightSnapshot obj: truncated after %d of %d packable objects", objectLogged, packedObjects);
+            }
+            LOG::logline("=== LIGHT SNAPSHOT %d END ===", s_lightDumpSeq);
+        }
 
         // Upload packed light data to per-object texture (owned by RenderThread for thread safety)
         if (totalTexels > 0 && g_renderThread) {
@@ -2457,6 +2609,30 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
             // Draw each merged batch
             device->SetIndices(useIB);
 
+            // Hoist loop-invariant calculations (Phase 2 optimization)
+            D3DXMATRIX viewT, projT;
+            D3DXMatrixTranspose(&viewT, &fb.currentView);
+            D3DXMatrixTranspose(&projT, &fb.currentProj);
+
+            // Pre-calculate sun direction in view space
+            D3DXVECTOR3 sunDirView;
+            D3DXVec3TransformNormal(&sunDirView, (const D3DXVECTOR3*)&DistantLand::s_staging.sunVec, &fb.currentView);
+
+            // Pre-calculate lighting values
+            RGBVECTOR sunDiffuse = DistantLand::s_staging.lightSunMult * DistantLand::s_staging.sunCol;
+            RGBVECTOR sceneAmbient = DistantLand::s_staging.lightAmbMult *
+                (DistantLand::s_staging.sunAmb + DistantLand::s_staging.ambCol);
+
+            // Pre-calculate shadow view-to-clip matrices
+            D3DXMATRIX viewInverse;
+            D3DXMatrixInverse(&viewInverse, nullptr, &fb.currentView);
+            D3DXMATRIX shadowViewToClip[2];
+            shadowViewToClip[0] = viewInverse * fb.shadowViewproj[0];
+            shadowViewToClip[1] = viewInverse * fb.shadowViewproj[1];
+
+            // Local shader cache to avoid SRW locks in loop
+            std::unordered_map<ShaderKey, HLSLShader, ShaderKey::hasher> localShaderCache;
+
                 for (size_t bi = 0; bi < fb.mergedBatches.size(); bi++) {
                     const auto& mb = fb.mergedBatches[bi];
                     const auto& di = (*drawInfos)[bi];
@@ -2496,14 +2672,20 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                         sk.lightMode = 3;
                     }
 
-                    // Look up shader variant
+                    // Look up shader variant - check local cache first to avoid SRW lock
                     HLSLShader hlslShader = {};
-                    AcquireSRWLockShared(&hlslCacheLock);
-                    auto iShader = cacheHLSLShaders.find(sk);
-                    if (iShader != cacheHLSLShaders.end()) {
-                        hlslShader = iShader->second;
+                    auto localIt = localShaderCache.find(sk);
+                    if (localIt != localShaderCache.end()) {
+                        hlslShader = localIt->second;
+                    } else {
+                        AcquireSRWLockShared(&hlslCacheLock);
+                        auto iShader = cacheHLSLShaders.find(sk);
+                        if (iShader != cacheHLSLShaders.end()) {
+                            hlslShader = iShader->second;
+                            localShaderCache[sk] = hlslShader;
+                        }
+                        ReleaseSRWLockShared(&hlslCacheLock);
                     }
-                    ReleaseSRWLockShared(&hlslCacheLock);
 
                     // If shader not found, queue compilation and skip this batch
                     if (!hlslShader.vertexShader || !hlslShader.pixelShader) {
@@ -2515,10 +2697,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     device->SetVertexShader(hlslShader.vertexShader);
                     device->SetPixelShader(hlslShader.pixelShader);
 
-                    // Set view/proj matrices (same as stateless batch)
-                    D3DXMATRIX viewT, projT;
-                    D3DXMatrixTranspose(&viewT, &fb.currentView);
-                    D3DXMatrixTranspose(&projT, &fb.currentProj);
+                    // Set view/proj matrices using hoisted transposes
                     device->SetVertexShaderConstantF(12, (float*)&viewT, 4);  // view at c12
                     device->SetVertexShaderConstantF(0, (float*)&projT, 4);   // proj at c0
 
@@ -2551,17 +2730,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                         device->SetTexture(5, lightTex);
                     }
 
-                    // Set sun/ambient lighting constants (required for exterior lighting)
-                    // Transform sun direction from world space to view space
-                    D3DXVECTOR3 sunDirView;
-                    D3DXVec3TransformNormal(&sunDirView, (const D3DXVECTOR3*)&DistantLand::s_staging.sunVec, &fb.currentView);
-
-                    // Apply lighting multipliers from s_staging
-                    RGBVECTOR sunDiffuse = DistantLand::s_staging.lightSunMult * DistantLand::s_staging.sunCol;
-                    RGBVECTOR sceneAmbient = DistantLand::s_staging.lightAmbMult *
-                        (DistantLand::s_staging.sunAmb + DistantLand::s_staging.ambCol);
-
-                    // Set constants using resolved shader registers
+                    // Set sun/ambient lighting constants using hoisted values
                     if (hlslShader.regLightSunDirection.reg != REG_INVALID) {
                         float v[4] = { sunDirView.x, sunDirView.y, sunDirView.z, 0 };
                         device->SetPixelShaderConstantF(hlslShader.regLightSunDirection.reg, v, 1);
@@ -2580,14 +2749,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                         device->SetPixelShaderConstantF(22, v, 1);
                     }
 
-                    // Set shadow matrices for stateless batch mode
-                    // Shader expects view-to-shadow transform: viewInverse * shadowVP
+                    // Set shadow matrices using hoisted view-to-shadow transforms
                     if (hlslShader.hShadowWorldViewProj) {
-                        D3DXMATRIX viewInverse;
-                        D3DXMatrixInverse(&viewInverse, nullptr, &fb.currentView);
-                        D3DXMATRIX shadowViewToClip[2];
-                        shadowViewToClip[0] = viewInverse * fb.shadowViewproj[0];
-                        shadowViewToClip[1] = viewInverse * fb.shadowViewproj[1];
                         hlslShader.vsConstantTable->SetMatrixArray(device, hlslShader.hShadowWorldViewProj, shadowViewToClip, 2);
                     }
 
@@ -2890,7 +3053,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
         }
         if (litCalls == 0) minPL = 0;
         LOG::logline("Lights: %d scene, perObj: min=%d max=%d avg=%.1f (%d calls) modes:[%d,%d,%d,%d]",
-            (int)DistantLand::sceneLights.size(), minPL, maxPL,
+            (int)sceneLights.size(), minPL, maxPL,
             litCalls > 0 ? sumPL / litCalls : 0.0, litCalls,
             modeCounts[0], modeCounts[1], modeCounts[2], modeCounts[3]);
     }
@@ -2899,7 +3062,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
     if (sceneCount == 0) {
         ImGuiManager::UpdateDebugStats(
             totalCalls, renderedCalls, culledCalls,
-            (int)DistantLand::sceneLights.size(),
+            (int)sceneLights.size(),
             (int)DistantLand::recordMW.size(), 0
         );
     }
@@ -2978,7 +3141,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
 
         // Mode 2: Show culled lights only (red boxes)
         if (debugBBoxMode == 2) {
-            for (const auto& light : DistantLand::sceneLights) {
+            for (const auto& light : sceneLights) {
                 if (!light.isVisible) {  // Only show culled lights
                     D3DXVECTOR3 bmin = light.position - D3DXVECTOR3(light.radius, light.radius, light.radius);
                     D3DXVECTOR3 bmax = light.position + D3DXVECTOR3(light.radius, light.radius, light.radius);

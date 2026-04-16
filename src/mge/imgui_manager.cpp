@@ -27,6 +27,7 @@ bool ImGuiManager::disableHiZCulling = false;
 bool ImGuiManager::enableStatelessBatch = false;
 bool ImGuiManager::highlightStatelessBatch = false;
 bool ImGuiManager::dumpStatelessBatchDetail = false;
+bool ImGuiManager::dumpLightSnapshot = false;
 bool ImGuiManager::forceLightMode3 = false;
 int ImGuiManager::shaderDebugMode = 0;
 
@@ -405,7 +406,7 @@ void ImGuiManager::RenderDebugInterface() {
     ImGui::SetNextWindowSize(ImVec2(450, 400), ImGuiCond_FirstUseEver);
 
     if (ImGui::Begin("HLSL Pipeline Debug", &showDebugInterface, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Checkbox("Enable Debug Hotkeys (F11/U/F5/F6)", &debugKeysEnabled);
+        ImGui::Checkbox("Enable Debug Hotkeys (F11/U/E/L/F5/F6)", &debugKeysEnabled);
         ImGui::Checkbox("Handover Logging (Scene 0/1/2 state)", &handoverLogging);
         ImGui::SameLine();
         if (ImGui::Button("Save Baselines")) {
@@ -487,6 +488,10 @@ void ImGuiManager::RenderDebugInterface() {
         // Lighting stats
         ImGui::Text("Lights:");
         ImGui::Text("  Scene Lights: %d", debugSceneLights);
+        if (ImGui::Button("Dump Light Snapshot")) {
+            dumpLightSnapshot = true;
+        }
+        ImGui::SetItemTooltip("One-shot log of active Morrowind lights, extracted scene lights, and per-object packed light counts. Hotkey: L when debug hotkeys are enabled.");
 
         ImGui::Separator();
 
@@ -691,6 +696,16 @@ bool ImGuiManager::GetAndClearDumpStatelessBatch() {
     bool val = dumpStatelessBatchDetail;
     dumpStatelessBatchDetail = false;
     return val;
+}
+
+bool ImGuiManager::GetAndClearDumpLightSnapshot() {
+    bool val = dumpLightSnapshot;
+    dumpLightSnapshot = false;
+    return val;
+}
+
+void ImGuiManager::RequestLightSnapshotDump() {
+    dumpLightSnapshot = true;
 }
 bool ImGuiManager::GetForceLightMode3() { return forceLightMode3; }
 int ImGuiManager::GetShaderDebugMode() { return shaderDebugMode; }
@@ -1575,4 +1590,3 @@ void ImGuiManager::ToggleHiZInterface() {
 bool ImGuiManager::GetShowHiZInterface() {
     return showHiZInterface;
 }
-
