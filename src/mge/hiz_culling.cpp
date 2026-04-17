@@ -1415,6 +1415,15 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
     std::vector<PendingMergedGroup> mergeGroups;
     bool highlightBatches = ImGuiManager::GetHighlightStatelessBatch();
 
+    // Mirror/capture diagnostic counters (per frame)
+    int diagBatchable = 0;
+    int diagUncaptured = 0;
+    int diagMirrored = 0;
+    int diagMirroredCW = 0;
+    int diagMirroredCCW = 0;
+    int diagMirroredNone = 0;
+    int diagMirroredUncaptured = 0;
+
     for (size_t i = 0; i < calls.size(); i++) {
         const auto& call = calls[i];
 
@@ -1432,6 +1441,39 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
         group.callIndices.push_back(i);
         group.totalVertices += call.rs.vertCount;
         group.totalIndices += call.rs.primCount * 3;
+
+        // Diagnostic: detect mirrored draws and how they're getting keyed
+        diagBatchable++;
+        if (!call.expectedState.captured) diagUncaptured++;
+        const D3DXMATRIX& w = call.rs.worldTransforms[0];
+        float det3 = w._11 * (w._22 * w._33 - w._23 * w._32)
+                   - w._12 * (w._21 * w._33 - w._23 * w._31)
+                   + w._13 * (w._21 * w._32 - w._22 * w._31);
+        if (det3 < 0.0f) {
+            diagMirrored++;
+            if (!call.expectedState.captured) {
+                diagMirroredUncaptured++;
+            } else {
+                switch (mkey.cullMode) {
+                    case D3DCULL_CW:   diagMirroredCW++; break;
+                    case D3DCULL_CCW:  diagMirroredCCW++; break;
+                    case D3DCULL_NONE: diagMirroredNone++; break;
+                    default: break;
+                }
+            }
+        }
+    }
+
+    // Log diagnostic once per second to avoid spam
+    if (diagMirrored > 0 || diagUncaptured > 0) {
+        static DWORD lastDiagTick = 0;
+        DWORD nowTick = GetTickCount();
+        if (nowTick - lastDiagTick >= 1000) {
+            lastDiagTick = nowTick;
+            LOG::logline("StatelessBatch diag: batchable=%d uncap=%d mirrored=%d (mirCW=%d mirCCW=%d mirNone=%d mirUncap=%d)",
+                         diagBatchable, diagUncaptured, diagMirrored,
+                         diagMirroredCW, diagMirroredCCW, diagMirroredNone, diagMirroredUncaptured);
+        }
     }
 
     std::sort(mergeGroups.begin(), mergeGroups.end(),
