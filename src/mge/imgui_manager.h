@@ -148,7 +148,6 @@ public:
 
     // Stateless batching toggle (experimental)
     static bool GetEnableStatelessBatch();
-    static bool GetHighlightStatelessBatch();
     static bool GetAndClearDumpStatelessBatch(); // Returns true once, then clears
     static bool GetAndClearDumpLightSnapshot();  // Returns true once, then clears
 
@@ -311,7 +310,6 @@ private:
     static int bboxVisualizationMode;  // 0=off, 1=objects, 2=lights
     static bool disableHiZCulling;     // Bypass Hi-Z culling for terrain hole diagnosis
     static bool enableStatelessBatch;  // Enable stateless batching (experimental)
-    static bool highlightStatelessBatch; // Highlight batched draws with color
     static bool dumpStatelessBatchDetail; // One-shot flag for detailed batch dump
     static bool dumpLightSnapshot;       // One-shot flag for per-frame light diagnostics
     static bool forceLightMode3;       // Force lightMode 3 for all lit Opaque/Terrain

@@ -10,6 +10,7 @@
 #include "mwbridge.h"
 
 #include <algorithm>
+#include <cmath>
 #include <vector>
 #include <set>
 #include <map>
@@ -128,6 +129,7 @@ static void hashMeshKeyValue(size_t& h, const MeshKey& key) {
 
 static void hashMergedBatchKeyValue(size_t& h, const MergedBatchKey& key) {
     hashCombineValue(h, reinterpret_cast<size_t>(key.texture));
+    hashCombineValue(h, reinterpret_cast<size_t>(key.overlayTexture));
     hashCombineValue(h, key.blendState);
     hashCombineValue(h, key.zState);
     hashCombineValue(h, key.cullMode);
@@ -217,8 +219,29 @@ static bool lessMatrix(const D3DXMATRIX& lhs, const D3DXMATRIX& rhs) {
     return false;
 }
 
+// Draw-order priority per bin. Lower = drawn earlier. Small opaques drain first
+// so terrain (large screen coverage) gets early-Z rejection; TerrainBlend follows
+// Terrain so overlay blending reads the base tile from the framebuffer; translucent
+// Blending drains last.
+static int binDrawPriority(RenderBin bin) {
+    switch (bin) {
+        case RenderBin::Opaque:       return 0;
+        case RenderBin::Skinning:     return 1;
+        case RenderBin::AlphaTested:  return 2;
+        case RenderBin::Grass:        return 3;
+        case RenderBin::Terrain:      return 4;
+        case RenderBin::TerrainBlend: return 5;
+        case RenderBin::Blending:     return 6;
+        default:                      return 7;
+    }
+}
+
 static bool lessMergedBatchKey(const MergedBatchKey& lhs, const MergedBatchKey& rhs) {
+    int lp = binDrawPriority(static_cast<RenderBin>(lhs.bin));
+    int rp = binDrawPriority(static_cast<RenderBin>(rhs.bin));
+    if (lp != rp) return lp < rp;
     if (lhs.texture != rhs.texture) return lhs.texture < rhs.texture;
+    if (lhs.overlayTexture != rhs.overlayTexture) return lhs.overlayTexture < rhs.overlayTexture;
     if (lhs.blendState != rhs.blendState) return lhs.blendState < rhs.blendState;
     if (lhs.zState != rhs.zState) return lhs.zState < rhs.zState;
     if (lhs.cullMode != rhs.cullMode) return lhs.cullMode < rhs.cullMode;
@@ -536,7 +559,10 @@ static void sortCallsByMaterial(std::vector<FixedFunctionShader::HLSLRecordedCal
         key.materialHash = computeMaterialHash(call);
         // Sortable: Opaque, Grass, Terrain
         // Not sortable: Skinning (bone state), AlphaTested (depth), Blending (depth)
-        key.sortable = (call.bin == RenderBin::Opaque || call.bin == RenderBin::Grass || call.bin == RenderBin::Terrain);
+        key.sortable = (call.bin == RenderBin::Opaque ||
+                        call.bin == RenderBin::Grass ||
+                        call.bin == RenderBin::Terrain ||
+                        call.bin == RenderBin::TerrainBlend);
         sortKeys.push_back(key);
     }
 
@@ -937,21 +963,122 @@ void FixedFunctionShader::prepareRecordedCalls() {
     {
         MGE_ZoneScopedN("Prepare: Shader Keys + Bins");
 
-        // Scene 0: World geometry
+        // Scene 0: World geometry — two-pass classifier.
+        //   Pass 1: assign Grass/Skinning/AlphaTested/TerrainBlend/Blending; everything else tentatively Opaque.
+        //   Pass 2: promote any tentative Opaque whose {fvf, stride, vertCount} matches a TerrainBlend tile to Terrain.
+        // Rationale: TerrainBlend tiles in Scene 0 are by definition the terrain overlays (the only blending
+        // calls in Scene 0). Their geometry signature is the canonical "shape of terrain" for the frame,
+        // so opaque tiles sharing that signature are the underlying terrain bases.
+        struct TerrainSig {
+            DWORD fvf;
+            UINT stride;
+            UINT vertCount;
+            bool operator==(const TerrainSig& o) const {
+                return fvf == o.fvf && stride == o.stride && vertCount == o.vertCount;
+            }
+        };
+        struct TerrainSigHash {
+            size_t operator()(const TerrainSig& s) const {
+                size_t h = s.fvf;
+                h ^= ((size_t)s.stride << 1) + 0x9e3779b9 + (h << 6) + (h >> 2);
+                h ^= ((size_t)s.vertCount << 2) + 0x9e3779b9 + (h << 6) + (h >> 2);
+                return h;
+            }
+        };
+        std::unordered_set<TerrainSig, TerrainSigHash> terrainSigs;
+
         for (auto& call : recCalls) {
             call.sk = computeShaderKeyWithSuffixes(&call.rs, &call.frs, call.lightrs.get());
             call.prepared = true;
 
-            // Classify into render bin
-            // Terrain: large vertex count (typically 500+ verts), not skinned/grass/alpha
-            const UINT TERRAIN_VERT_THRESHOLD = 500;
             if (call.sk.hasGrass)              call.bin = RenderBin::Grass;
             else if (call.sk.usesSkinning)     call.bin = RenderBin::Skinning;
+            else if (call.rs.alphaTest && !call.rs.blendEnable)
+                                               call.bin = RenderBin::AlphaTested;
+            else if (call.rs.blendEnable && !call.rs.alphaTest) {
+                // Scene 0 blending == terrain overlay tile. Record signature for Pass 2.
+                call.bin = RenderBin::TerrainBlend;
+                terrainSigs.insert({call.rs.fvf, call.rs.vbStride, call.rs.vertCount});
+            }
             else if (call.rs.blendEnable)      call.bin = RenderBin::Blending;
-            else if (call.rs.alphaTest)        call.bin = RenderBin::AlphaTested;
-            else if (call.rs.vertCount >= TERRAIN_VERT_THRESHOLD)
-                                               call.bin = RenderBin::Terrain;
             else                               call.bin = RenderBin::Opaque;
+        }
+
+        if (!terrainSigs.empty()) {
+            for (auto& call : recCalls) {
+                if (call.bin != RenderBin::Opaque) continue;
+                TerrainSig sig{call.rs.fvf, call.rs.vbStride, call.rs.vertCount};
+                if (terrainSigs.find(sig) != terrainSigs.end()) {
+                    call.bin = RenderBin::Terrain;
+                }
+            }
+
+            // Pair each TerrainBlend tile with its underlying Terrain tile.
+            // Match: same geometry signature + same world translation, quantized to a 16-unit
+            // grid to tolerate the float drift on mirrored/rebuilt matrices.
+            // Quantization step rationale: Morrowind terrain tiles sit on a regular grid an
+            // order of magnitude larger than 16 world units, so 16-unit rounding cannot collide
+            // distinct tiles while still surviving small per-frame matrix recomputation noise.
+            // Phase 6 iteration: pairing key is (VB, IB). Morrowind gives each landscape patch
+            // its own VB+IB and draws the decal pass on the SAME VB (which carries the 5×5
+            // AlphaGrid in vertex-color alpha per spec §4). World translation is the cell
+            // origin — shared by every patch in the cell — so it can't distinguish patches.
+            // VB+IB pointer is the patch identity.
+            struct PatchKey {
+                IDirect3DVertexBuffer9* vb;
+                IDirect3DIndexBuffer9*  ib;
+                bool operator==(const PatchKey& o) const { return vb == o.vb && ib == o.ib; }
+            };
+            struct PatchKeyHash {
+                size_t operator()(const PatchKey& k) const {
+                    size_t h = (size_t)(uintptr_t)k.vb;
+                    h ^= (size_t)(uintptr_t)k.ib + 0x9e3779b9 + (h << 6) + (h >> 2);
+                    return h;
+                }
+            };
+            auto makePatchKey = [](const FixedFunctionShader::HLSLRecordedCall& c) {
+                return PatchKey{c.rs.vb, c.rs.ib};
+            };
+
+            std::unordered_map<PatchKey, size_t, PatchKeyHash> terrainAtPos;
+            terrainAtPos.reserve(recCalls.size());
+            for (size_t i = 0; i < recCalls.size(); ++i) {
+                if (recCalls[i].bin != RenderBin::Terrain) continue;
+                terrainAtPos.emplace(makePatchKey(recCalls[i]), i);
+            }
+            int orphanCount = 0;
+            const FixedFunctionShader::HLSLRecordedCall* firstOrphan = nullptr;
+            for (size_t i = 0; i < recCalls.size(); ++i) {
+                if (recCalls[i].bin != RenderBin::TerrainBlend) continue;
+                auto it = terrainAtPos.find(makePatchKey(recCalls[i]));
+                recCalls[i].basePairIdx = (it != terrainAtPos.end()) ? it->second : SIZE_MAX;
+
+                // Phase 5A absorption: stamp the overlay texture onto the paired Terrain
+                // base so the pair renders as a single draw via sampler s5 + HAS_OVERLAY.
+                if (recCalls[i].basePairIdx != SIZE_MAX) {
+                    auto& base = recCalls[recCalls[i].basePairIdx];
+                    base.overlayTexture = recCalls[i].rs.texture;
+                    // Select HAS_OVERLAY shader variant for the absorbed pair, whether it ends up
+                    // in a merged batch or the main-replay path. The merged-batch path derives this
+                    // from mb.key.overlayTexture; the main-replay path reads call.sk directly.
+                    base.sk.hasOverlay = 1;
+                    recCalls[i].absorbed = true;
+                    recCalls[i].shouldRender = false;
+                } else {
+                    ++orphanCount;
+                    if (!firstOrphan) firstOrphan = &recCalls[i];
+                }
+            }
+            if (orphanCount > 0) {
+                static DWORD lastOrphanTick = 0;
+                DWORD nowTick = GetTickCount();
+                if (nowTick - lastOrphanTick >= 1000) {
+                    lastOrphanTick = nowTick;
+                    const D3DXMATRIX& w = firstOrphan->rs.worldTransforms[0];
+                    LOG::logline("TerrainBlend ORPHAN count=%d first tile at (%.2f, %.2f, %.2f)",
+                                 orphanCount, w._41, w._42, w._43);
+                }
+            }
         }
 
         // Scene 1: Particles (always visible, no Hi-Z culling)
@@ -1277,21 +1404,29 @@ static MeshKey makeMeshKey(const FixedFunctionShader::HLSLRecordedCall& call) {
     return key;
 }
 
-// Helper to fill StatelessDrawData from a recorded call
+// Helper: read a call's parameter texture resolution (used for normres + Phase-4 base pair).
+static void readNormres(const FixedFunctionShader::HLSLRecordedCall& call, float& outX, float& outY) {
+    outX = 512.0f; outY = 512.0f;
+    if (call.sk.hasParamH && call.rs.texture) {
+        D3DSURFACE_DESC desc;
+        if (SUCCEEDED(call.rs.texture->GetLevelDesc(0, &desc))) {
+            outX = (float)desc.Width;
+            outY = (float)desc.Height;
+        }
+    }
+}
+
+// Helper to fill StatelessDrawData from a recorded call.
 static void fillDrawData(StatelessDrawData& data, const FixedFunctionShader::HLSLRecordedCall& call,
-                         bool highlightBatches, bool isVisible) {
+                         bool isVisible) {
     const D3DXMATRIX& wv = call.rs.worldViewTransforms[0];
     data.world0[0] = wv._11; data.world0[1] = wv._21; data.world0[2] = wv._31; data.world0[3] = wv._41;
     data.world1[0] = wv._12; data.world1[1] = wv._22; data.world1[2] = wv._32; data.world1[3] = wv._42;
     data.world2[0] = wv._13; data.world2[1] = wv._23; data.world2[2] = wv._33; data.world2[3] = wv._43;
 
-    // Material (tint green if highlighting)
-    float tintR = highlightBatches ? 0.3f : 1.0f;
-    float tintG = highlightBatches ? 1.0f : 1.0f;
-    float tintB = highlightBatches ? 0.3f : 1.0f;
-    data.diffuse[0] = call.frs.material.diffuse.r * tintR;
-    data.diffuse[1] = call.frs.material.diffuse.g * tintG;
-    data.diffuse[2] = call.frs.material.diffuse.b * tintB;
+    data.diffuse[0] = call.frs.material.diffuse.r;
+    data.diffuse[1] = call.frs.material.diffuse.g;
+    data.diffuse[2] = call.frs.material.diffuse.b;
     data.diffuse[3] = call.frs.material.diffuse.a;
 
     data.ambient[0] = call.frs.material.ambient.r;
@@ -1300,14 +1435,8 @@ static void fillDrawData(StatelessDrawData& data, const FixedFunctionShader::HLS
     data.ambient[3] = call.frs.material.ambient.a;
 
     // Store normres (parameter texture resolution) and visibility flag
-    float normresX = 512.0f, normresY = 512.0f;  // Default fallback
-    if (call.sk.hasParamH && call.rs.texture) {
-        D3DSURFACE_DESC desc;
-        if (SUCCEEDED(call.rs.texture->GetLevelDesc(0, &desc))) {
-            normresX = (float)desc.Width;
-            normresY = (float)desc.Height;
-        }
-    }
+    float normresX, normresY;
+    readNormres(call, normresX, normresY);
     data.normres[0] = normresX;
     data.normres[1] = normresY;
     data.normres[2] = 0.0f;
@@ -1345,8 +1474,10 @@ static bool isBatchableCall(const FixedFunctionShader::HLSLRecordedCall& call) {
     if (call.rs.primType != D3DPT_TRIANGLELIST || !call.rs.vb || !call.rs.ib)
         return false;
 
-    // Only batch Opaque/Terrain bins (no Skinning, no Grass, no Blending)
-    if (call.bin != RenderBin::Opaque && call.bin != RenderBin::Terrain)
+    // Only batch Opaque / Terrain (TerrainBlend is absorbed into its paired Terrain
+    // draw via overlayTexture — never drawn standalone).
+    if (call.bin != RenderBin::Opaque &&
+        call.bin != RenderBin::Terrain)
         return false;
 
     // Skip geometry with vertex blending
@@ -1364,6 +1495,7 @@ static bool isBatchableCall(const FixedFunctionShader::HLSLRecordedCall& call) {
 static MergedBatchKey makeMergedBatchKey(const FixedFunctionShader::HLSLRecordedCall& call) {
     MergedBatchKey mkey = {};
     mkey.texture = call.rs.texture;
+    mkey.overlayTexture = call.overlayTexture;
     mkey.blendState = (uint16_t)((call.expectedState.captured ? call.expectedState.alphaBlendEnable : 0) |
                      ((call.expectedState.captured ? call.expectedState.srcBlend : 0) << 4) |
                      ((call.expectedState.captured ? call.expectedState.destBlend : 0) << 8));
@@ -1413,7 +1545,6 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
     // Group all batchable Scene 0 calls deterministically by first-seen MergedBatchKey.
     std::unordered_map<MergedBatchKey, size_t, MergedBatchKey::Hasher> mergeGroupLookup;
     std::vector<PendingMergedGroup> mergeGroups;
-    bool highlightBatches = ImGuiManager::GetHighlightStatelessBatch();
 
     // Mirror/capture diagnostic counters (per frame)
     int diagBatchable = 0;
@@ -1517,7 +1648,7 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
                 size_t callIdx = mbatch.callIndices[i];
                 const auto& call = calls[callIdx];
                 StatelessDrawData data;
-                fillDrawData(data, call, highlightBatches, call.shouldRender);
+                fillDrawData(data, call, call.shouldRender);
                 fb.drawDataStaging.push_back(data);
                 mergedLayout.push_back(sortedCalls[i].first);
                 drawDataOffset++;
@@ -1525,8 +1656,8 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
 
             fb.mergedBatches.push_back(std::move(mbatch));
             batchTemplates.push_back(makeCachedBatchTemplate(fb.mergedBatches.back()));
-        } else if (group.callIndices.size() == 1 && highlightBatches) {
-            // Track singletons for highlighting
+        } else if (group.callIndices.size() == 1) {
+            // Track singletons unconditionally for accounting (see MergedBatch Breakdown log).
             fb.singletonCallIndices.insert(group.callIndices[0]);
         }
     }
@@ -1593,79 +1724,200 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
                      (int)fb.mergedBatches.size(), totalMerged, (int)fb.mergedBatches.size());
     }
 
+    // === MergedBatch accounting (always computed; B + S + E must equal N) ===
+    int totalRecorded = (int)calls.size();
+    int batchedCount = 0;
+    std::unordered_set<size_t> batchedIndices;
+    for (const auto& mb : fb.mergedBatches) {
+        batchedCount += (int)mb.callIndices.size();
+        for (size_t idx : mb.callIndices) batchedIndices.insert(idx);
+    }
+    int singletonsCount = (int)fb.singletonCallIndices.size();
+
+    int exNotBatchableBin = 0, exCulled = 0;
+    int exVertBlend = 0, exSkinning = 0, exGrass = 0;
+    int exNonTrilist = 0, exNoBuffers = 0;
+
+    // TerrainBlend pairing diagnostic — orphans are the prime suspect for the "missing tile" symptom.
+    int terrainBlendCount = 0, terrainBlendPaired = 0, terrainBlendOrphan = 0;
+    for (const auto& call : calls) {
+        if (call.bin != RenderBin::TerrainBlend) continue;
+        terrainBlendCount++;
+        if (call.basePairIdx != SIZE_MAX) terrainBlendPaired++;
+        else terrainBlendOrphan++;
+    }
+
+    for (size_t i = 0; i < calls.size(); i++) {
+        if (batchedIndices.count(i) || fb.singletonCallIndices.count(i)) continue;
+        const auto& call = calls[i];
+        // Categorize in the same order isBatchableCall rejects.
+        if (call.rs.primType != D3DPT_TRIANGLELIST) { exNonTrilist++; continue; }
+        if (!call.rs.vb || !call.rs.ib)             { exNoBuffers++; continue; }
+        if (call.bin != RenderBin::Opaque &&
+            call.bin != RenderBin::Terrain &&
+            call.bin != RenderBin::TerrainBlend) {
+            exNotBatchableBin++; continue;
+        }
+        if (call.rs.vertexBlendState != 0)          { exVertBlend++; continue; }
+        if (call.sk.usesSkinning)                   { exSkinning++; continue; }
+        if (call.sk.hasGrass)                       { exGrass++; continue; }
+        if (!call.shouldRender)                     { exCulled++; continue; }
+        // Anything that reaches here is a true accounting residual (should be impossible).
+    }
+    int excludedCount = exNotBatchableBin + exCulled + exVertBlend +
+                        exSkinning + exGrass + exNonTrilist + exNoBuffers;
+    int residual = totalRecorded - batchedCount - singletonsCount - excludedCount;
+
+    // Phase 6A: terminal-bucket categorization that mirrors the actual draw path,
+    // so residuals in the batching accounting above can be reconciled against where
+    // each call actually ends up at replay time. Buckets MUST sum to totalRecorded.
+    int termDrawnInBatch = 0;              // in mergedBatchIndices
+    int termDrawnInMain = 0;               // not in batch, shouldRender=true, bin != TerrainBlend
+    int termCulled = 0;                    // shouldRender=false, bin != TerrainBlend (visibility-culled)
+    int termSkippedTerrainBlend = 0;       // bin == TerrainBlend (absorbed OR orphan — replay loop skips both)
+    int termUnaccounted = 0;
+    for (size_t i = 0; i < calls.size(); i++) {
+        const auto& call = calls[i];
+        if (call.bin == RenderBin::TerrainBlend) {
+            termSkippedTerrainBlend++;
+        } else if (batchedIndices.count(i)) {
+            termDrawnInBatch++;
+        } else if (!call.shouldRender) {
+            termCulled++;
+        } else {
+            termDrawnInMain++;   // covers singletons + residuals from the legacy accounting
+        }
+    }
+    termUnaccounted = totalRecorded -
+                      (termDrawnInBatch + termDrawnInMain + termCulled + termSkippedTerrainBlend);
+
+    // Rate-limited per-frame one-liner whenever any calls were excluded or accounting drifts.
+    if (excludedCount > 0 || residual != 0) {
+        static DWORD lastSummaryTick = 0;
+        DWORD nowTick = GetTickCount();
+        if (nowTick - lastSummaryTick >= 1000) {
+            lastSummaryTick = nowTick;
+            LOG::logline("MergedBatch: Total=%d Batched=%d Singletons=%d Excluded=%d (Scene1=%d Scene2=%d)",
+                         totalRecorded, batchedCount, singletonsCount, excludedCount,
+                         (int)fb.recordedCallsScene1.size(), (int)fb.recordedCallsScene2.size());
+            LOG::logline("  Terminal: drawnBatch=%d drawnMain=%d culled=%d tblendSkipped=%d unaccounted=%d",
+                         termDrawnInBatch, termDrawnInMain, termCulled,
+                         termSkippedTerrainBlend, termUnaccounted);
+            if (terrainBlendOrphan > 0) {
+                LOG::logline("  TerrainBlend: %d (paired %d / orphan %d)",
+                             terrainBlendCount, terrainBlendPaired, terrainBlendOrphan);
+            }
+            if (residual != 0) {
+                LOG::logline("  MergedBatch ACCOUNTING MISMATCH: residual=%d (B+S+E=%d, N=%d)",
+                             residual, batchedCount + singletonsCount + excludedCount, totalRecorded);
+            }
+        }
+    }
+
     // Detailed logging on button press
     bool dumpDetail = ImGuiManager::GetAndClearDumpStatelessBatch();
     if (dumpDetail) {
         LOG::logline("=== MergedBatch Breakdown ===");
-        LOG::logline("Total recorded calls: %d", (int)calls.size());
-
-        // Count calls by category
-        int batchedCount = 0;
-        for (const auto& mb : fb.mergedBatches) {
-            batchedCount += (int)mb.callIndices.size();
+        LOG::logline("Total recorded (Scene 0): %d  (Scene 1: %d, Scene 2: %d)",
+                     totalRecorded, (int)fb.recordedCallsScene1.size(), (int)fb.recordedCallsScene2.size());
+        LOG::logline("  Batched:    %d  (sum of mergedBatches[*].callIndices.size())", batchedCount);
+        LOG::logline("  Singletons: %d  (groups of size 1)", singletonsCount);
+        LOG::logline("  Excluded:   %d  = N - B - S", excludedCount);
+        LOG::logline("  TerrainBlend: %d (paired %d / orphan %d)",
+                     terrainBlendCount, terrainBlendPaired, terrainBlendOrphan);
+        LOG::logline("    not Opaque/Terrain:           %d", exNotBatchableBin);
+        LOG::logline("    culled (shouldRender=false):  %d", exCulled);
+        LOG::logline("    vertBlend:                    %d", exVertBlend);
+        LOG::logline("    skinning:                     %d", exSkinning);
+        LOG::logline("    grass:                        %d", exGrass);
+        LOG::logline("    non-TRILIST:                  %d", exNonTrilist);
+        LOG::logline("    missing VB-IB:                %d", exNoBuffers);
+        if (residual != 0) {
+            LOG::logline("  MergedBatch ACCOUNTING MISMATCH: residual=%d (B+S+E=%d, N=%d)",
+                         residual, batchedCount + singletonsCount + excludedCount, totalRecorded);
         }
 
         int batchIdx = 0;
         for (const auto& mb : fb.mergedBatches) {
-            LOG::logline("Batch %d: %d draws, tex=%p, verts=%d, fvf=0x%X, stride=%d",
+            LOG::logline("Batch %d: %d draws, tex=%p, verts=%d, fvf=0x%X, stride=%d, bin=%d",
                 batchIdx++, (int)mb.callIndices.size(), mb.key.texture,
-                mb.totalVertices, mb.key.fvf, mb.key.stride);
+                mb.totalVertices, mb.key.fvf, mb.key.stride, (int)mb.key.bin);
         }
 
-        // Analyze ALL calls to show why they weren't batched
-        int notOpaqueTerrain = 0, culled = 0, skinning = 0, grass = 0, vertBlend = 0;
-        std::unordered_map<IDirect3DTexture9*, std::vector<size_t>> unbatchedByTexture;
+        // Overlay absorption diagnostic: lists every Terrain that has an absorbed overlay
+        // plus every TerrainBlend grouped by pairing status. Works for both batched and
+        // non-batched mode (the log is gathered from recordedCalls, not the batch list).
+        {
+            int terrainTotal = 0, terrainWithOverlay = 0;
+            int tbAbsorbed = 0, tbOrphan = 0;
+            for (const auto& call : calls) {
+                if (call.bin == RenderBin::Terrain) {
+                    terrainTotal++;
+                    if (call.overlayTexture) terrainWithOverlay++;
+                } else if (call.bin == RenderBin::TerrainBlend) {
+                    if (call.absorbed) tbAbsorbed++;
+                    else tbOrphan++;
+                }
+            }
+            LOG::logline("  Overlay absorption: Terrain=%d (withOverlay=%d) TerrainBlend=%d (absorbed=%d orphan=%d)",
+                         terrainTotal, terrainWithOverlay,
+                         tbAbsorbed + tbOrphan, tbAbsorbed, tbOrphan);
 
-        // Track which calls are in batches
-        std::unordered_set<size_t> batchedIndices;
-        for (const auto& mb : fb.mergedBatches) {
-            for (size_t idx : mb.callIndices) {
-                batchedIndices.insert(idx);
+            // First ~10 orphans: dump position + FVF/stride/vertCount so we can see whether
+            // a base with the same quantized position exists with different mesh metadata.
+            int orphansLogged = 0;
+            for (size_t i = 0; i < calls.size() && orphansLogged < 10; ++i) {
+                const auto& call = calls[i];
+                if (call.bin != RenderBin::TerrainBlend) continue;
+                if (call.basePairIdx != SIZE_MAX) continue;
+                const D3DXMATRIX& w = call.rs.worldTransforms[0];
+                LOG::logline("  Orphan TB [%d]: pos=(%.1f,%.1f,%.1f) fvf=0x%X stride=%d verts=%d tex=%p",
+                             (int)i, w._41, w._42, w._43,
+                             call.rs.fvf, call.rs.vbStride, call.rs.vertCount, call.rs.texture);
+                orphansLogged++;
+            }
+
+            // Full landscape dump: every Terrain and TerrainBlend. Include VB/IB identity and
+            // startIndex so we can see what actually distinguishes one patch from another when
+            // the world-space translation is shared across the whole cell.
+            LOG::logline("  --- Terrain/TerrainBlend dump ---");
+            for (size_t i = 0; i < calls.size(); ++i) {
+                const auto& call = calls[i];
+                if (call.bin != RenderBin::Terrain && call.bin != RenderBin::TerrainBlend) continue;
+                const D3DXMATRIX& w = call.rs.worldTransforms[0];
+                const char* binStr = (call.bin == RenderBin::Terrain) ? "Terr " : "TBlnd";
+                if (call.bin == RenderBin::Terrain) {
+                    LOG::logline("    [%2d] %s vb=%p ib=%p base=%u start=%u verts=%d tex=%p overlay=%p w41=%.1f w42=%.1f w43=%.1f",
+                                 (int)i, binStr, call.rs.vb, call.rs.ib,
+                                 call.rs.baseIndex, call.rs.startIndex,
+                                 call.rs.vertCount, call.rs.texture, call.overlayTexture,
+                                 w._41, w._42, w._43);
+                } else {
+                    LOG::logline("    [%2d] %s vb=%p ib=%p base=%u start=%u verts=%d tex=%p pairIdx=%d w41=%.1f w42=%.1f w43=%.1f",
+                                 (int)i, binStr, call.rs.vb, call.rs.ib,
+                                 call.rs.baseIndex, call.rs.startIndex,
+                                 call.rs.vertCount, call.rs.texture,
+                                 call.basePairIdx == SIZE_MAX ? -1 : (int)call.basePairIdx,
+                                 w._41, w._42, w._43);
+                }
             }
         }
 
-        for (size_t i = 0; i < calls.size(); i++) {
-            if (batchedIndices.count(i)) continue;  // Already batched
-
-            const auto& call = calls[i];
-
-            // Categorize why not batched
-            if (call.bin != RenderBin::Opaque && call.bin != RenderBin::Terrain) {
-                notOpaqueTerrain++;
-                continue;
-            }
-            if (!call.shouldRender) { culled++; continue; }
-            if (call.rs.vertexBlendState != 0) { vertBlend++; continue; }
-            if (call.sk.usesSkinning) { skinning++; continue; }
-            if (call.sk.hasGrass) { grass++; continue; }
-
-            // This is an unbatched Opaque/Terrain call - track by texture
-            unbatchedByTexture[call.rs.texture].push_back(i);
+        // Singletons grouped by texture: textures with multiple singletons indicate near-miss batching opportunities.
+        std::unordered_map<IDirect3DTexture9*, std::vector<size_t>> singletonsByTexture;
+        for (size_t idx : fb.singletonCallIndices) {
+            singletonsByTexture[calls[idx].rs.texture].push_back(idx);
         }
-
-        LOG::logline("Batched: %d, Singletons: %d", batchedCount, (int)fb.singletonCallIndices.size());
-        LOG::logline("Excluded: notOpaque/Terrain=%d culled=%d vertBlend=%d skinning=%d grass=%d",
-            notOpaqueTerrain, culled, vertBlend, skinning, grass);
-
-        // Show unbatched opaque/terrain draws grouped by texture
-        int unbatchedOpaqueCount = 0;
-        for (const auto& ut : unbatchedByTexture) {
-            unbatchedOpaqueCount += (int)ut.second.size();
-        }
-        LOG::logline("Unbatched Opaque/Terrain: %d draws across %d textures",
-            unbatchedOpaqueCount, (int)unbatchedByTexture.size());
-
-        // Log textures with multiple unbatched draws (near-misses)
         int logged = 0;
-        for (const auto& ut : unbatchedByTexture) {
+        for (const auto& ut : singletonsByTexture) {
             if (ut.second.size() >= 2 && logged < 10) {
-                LOG::logline("Tex %p: %d unbatched draws (could batch if same VB/state):",
+                LOG::logline("Tex %p: %d singletons (could batch if same VB/state):",
                     ut.first, (int)ut.second.size());
                 for (size_t j = 0; j < std::min(ut.second.size(), (size_t)5); j++) {
                     size_t idx = ut.second[j];
                     const auto& call = calls[idx];
-                    LOG::logline("  [%d] vb=%p fvf=0x%X stride=%d lit=%d vmat=%d",
-                        (int)idx, call.rs.vb, call.rs.fvf, call.rs.vbStride,
+                    LOG::logline("  [%d] bin=%d vb=%p fvf=0x%X stride=%d lit=%d vmat=%d",
+                        (int)idx, (int)call.bin, call.rs.vb, call.rs.fvf, call.rs.vbStride,
                         call.rs.useLighting ? 1 : 0, call.sk.vertexMaterial);
                 }
                 logged++;

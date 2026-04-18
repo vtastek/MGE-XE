@@ -781,6 +781,20 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     // DXVK-optimized texture binding - only touches slots the shader actually uses
     bindShaderTextures(sk, rs);
 
+    // Phase 6A: bind absorbed TerrainBlend overlay to sampler s8 for the main-replay
+    // (non-batched / singleton) path. Mirrors the merged-batch bind below.
+    bool boundOverlay = false;
+    if (replayCall && replayCall->overlayTexture) {
+        device->SetTexture(8, replayCall->overlayTexture);
+        device->SetSamplerState(8, D3DSAMP_MINFILTER, D3DTEXF_ANISOTROPIC);
+        device->SetSamplerState(8, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+        device->SetSamplerState(8, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
+        device->SetSamplerState(8, D3DSAMP_MAXANISOTROPY, 16);
+        device->SetSamplerState(8, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+        device->SetSamplerState(8, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+        boundOverlay = true;
+    }
+
     // When building command buffer, snapshot bound textures into the buffer
     // (bindShaderTextures sets device textures; we need them in the command buffer
     //  so they replay correctly in order with other commands)
@@ -1720,6 +1734,11 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         }
     }
 
+    // Phase 6A: release sampler s8 if we bound an overlay on this call so the slot
+    // doesn't leak into subsequent draws that don't have HAS_OVERLAY.
+    if (boundOverlay) {
+        device->SetTexture(8, nullptr);
+    }
 }
 
 void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* cmdBuf) {
@@ -1830,12 +1849,16 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
             bool needsLightPack = (recCalls[i].sk.lightMode == 3);
             // Force lightMode 3 for all lit Opaque/Terrain when toggle is enabled
             if (ImGuiManager::GetForceLightMode3() && recCalls[i].sk.useLighting &&
-                (recCalls[i].bin == RenderBin::Opaque || recCalls[i].bin == RenderBin::Terrain)) {
+                (recCalls[i].bin == RenderBin::Opaque ||
+                 recCalls[i].bin == RenderBin::Terrain ||
+                 recCalls[i].bin == RenderBin::TerrainBlend)) {
                 needsLightPack = true;
             }
             // Also pack for stateless batching candidates
             if (ImGuiManager::GetEnableStatelessBatch() && recCalls[i].sk.useLighting &&
-                (recCalls[i].bin == RenderBin::Opaque || recCalls[i].bin == RenderBin::Terrain)) {
+                (recCalls[i].bin == RenderBin::Opaque ||
+                 recCalls[i].bin == RenderBin::Terrain ||
+                 recCalls[i].bin == RenderBin::TerrainBlend)) {
                 needsLightPack = true;
             }
             if (!needsLightPack) continue;
@@ -1953,11 +1976,15 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                 if (call.sk.lightMode < 4) ++lightModeCounts[call.sk.lightMode];
                 bool needsLightPack = (call.sk.lightMode == 3);
                 if (ImGuiManager::GetForceLightMode3() && call.sk.useLighting &&
-                    (call.bin == RenderBin::Opaque || call.bin == RenderBin::Terrain)) {
+                    (call.bin == RenderBin::Opaque ||
+                     call.bin == RenderBin::Terrain ||
+                     call.bin == RenderBin::TerrainBlend)) {
                     needsLightPack = true;
                 }
                 if (ImGuiManager::GetEnableStatelessBatch() && call.sk.useLighting &&
-                    (call.bin == RenderBin::Opaque || call.bin == RenderBin::Terrain)) {
+                    (call.bin == RenderBin::Opaque ||
+                     call.bin == RenderBin::Terrain ||
+                     call.bin == RenderBin::TerrainBlend)) {
                     needsLightPack = true;
                 }
                 if (!needsLightPack) continue;
@@ -2024,11 +2051,15 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                 const auto& call = recCalls[i];
                 bool needsLightPack = (call.sk.lightMode == 3);
                 if (ImGuiManager::GetForceLightMode3() && call.sk.useLighting &&
-                    (call.bin == RenderBin::Opaque || call.bin == RenderBin::Terrain)) {
+                    (call.bin == RenderBin::Opaque ||
+                     call.bin == RenderBin::Terrain ||
+                     call.bin == RenderBin::TerrainBlend)) {
                     needsLightPack = true;
                 }
                 if (ImGuiManager::GetEnableStatelessBatch() && call.sk.useLighting &&
-                    (call.bin == RenderBin::Opaque || call.bin == RenderBin::Terrain)) {
+                    (call.bin == RenderBin::Opaque ||
+                     call.bin == RenderBin::Terrain ||
+                     call.bin == RenderBin::TerrainBlend)) {
                     needsLightPack = true;
                 }
                 if (!needsLightPack) continue;
@@ -2695,7 +2726,9 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     // Check suppress flags based on bin (same logic as main loop)
                     bool suppressed = false;
                     switch (firstCall.bin) {
-                        case RenderBin::Terrain:    suppressed = ImGuiManager::GetSuppressTerrain(); break;
+                        case RenderBin::Terrain:
+                        case RenderBin::TerrainBlend:
+                                                    suppressed = ImGuiManager::GetSuppressTerrain(); break;
                         case RenderBin::Opaque:     suppressed = ImGuiManager::GetSuppressOpaque(); break;
                         case RenderBin::Skinning:   suppressed = ImGuiManager::GetSuppressSkinning(); break;
                         case RenderBin::Grass:      suppressed = ImGuiManager::GetSuppressGrass(); break;
@@ -2726,6 +2759,9 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     if (sk.useLighting && sk.lightMode < 3) {
                         sk.lightMode = 3;
                     }
+                    // Phase 5B: Terrain tiles that absorbed a TerrainBlend overlay need the
+                    // HAS_OVERLAY variant — PS samples s8 and composites over the base color.
+                    sk.hasOverlay = (mb.key.overlayTexture != nullptr) ? 1 : 0;
 
                     // Look up shader variant - check local cache first to avoid SRW lock
                     HLSLShader hlslShader = {};
@@ -2795,6 +2831,18 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                         if (lightTex) {
                             device->SetTexture(5, lightTex);
                         }
+
+                        // Phase 5B: bind absorbed TerrainBlend overlay texture to sampler s8.
+                        // The PS samples s8 under HAS_OVERLAY and composites overlay over base.
+                        if (mb.key.overlayTexture) {
+                            device->SetTexture(8, mb.key.overlayTexture);
+                            device->SetSamplerState(8, D3DSAMP_MINFILTER, D3DTEXF_ANISOTROPIC);
+                            device->SetSamplerState(8, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+                            device->SetSamplerState(8, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
+                            device->SetSamplerState(8, D3DSAMP_MAXANISOTROPY, 16);
+                            device->SetSamplerState(8, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+                            device->SetSamplerState(8, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+                        }
                     }
 
                     {
@@ -2833,6 +2881,12 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                         device->SetRenderState(D3DRS_ZENABLE, mb.key.zState & 0x3);
                         device->SetRenderState(D3DRS_ZWRITEENABLE, (mb.key.zState >> 2) & 0x1);
                         device->SetRenderState(D3DRS_CULLMODE, mb.key.cullMode);
+                        // Match non-batch path's state surface: without these, stale ALPHATESTENABLE
+                        // from a preceding alpha-tested draw kills partial-alpha TerrainBlend overlays.
+                        if (firstCall.expectedState.captured) {
+                            device->SetRenderState(D3DRS_ALPHATESTENABLE, firstCall.expectedState.alphaTestEnable);
+                            device->SetRenderState(D3DRS_FOGENABLE, firstCall.expectedState.fogEnable);
+                        }
                     }
 
                     {
@@ -2868,6 +2922,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
     if (sceneCount == 0 && !fb.mergedBatches.empty()) {
         device->SetTexture(D3DVERTEXTEXTURESAMPLER0, nullptr);
         device->SetTexture(6, nullptr);
+        device->SetTexture(8, nullptr);
     }
 
     MGE_ZoneScopedN("replay_MainLoop");
@@ -2877,9 +2932,16 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
         if (mergedBatchIndices.count(i)) continue;
         auto& call = recCalls[i];  // Non-const to update shader key
 
+        // Phase 5A: TerrainBlend overlays are absorbed into their paired Terrain draws;
+        // the blend color is composited in the pixel shader via sampler s8. Never draw
+        // the blend tile as a separate geometry pass.
+        if (call.bin == RenderBin::TerrainBlend) continue;
+
         // Force lightMode 3 for lit Opaque/Terrain when toggle enabled (before rendering)
         if (ImGuiManager::GetForceLightMode3() && call.sk.useLighting && call.sk.lightMode < 3 &&
-            (call.bin == RenderBin::Opaque || call.bin == RenderBin::Terrain)) {
+            (call.bin == RenderBin::Opaque ||
+             call.bin == RenderBin::Terrain ||
+             call.bin == RenderBin::TerrainBlend)) {
             call.sk.lightMode = 3;
         }
 
@@ -2891,7 +2953,9 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
 
         // Per-bin suppress check (Scene 0 only - Scene 2 hands have separate 1P checkboxes)
         switch (call.bin) {
-            case RenderBin::Terrain:    if (sceneCount == 0 && ImGuiManager::GetSuppressTerrain()) continue; break;
+            case RenderBin::Terrain:
+            case RenderBin::TerrainBlend:
+                                        if (sceneCount == 0 && ImGuiManager::GetSuppressTerrain()) continue; break;
             case RenderBin::Opaque:     if (sceneCount == 0 && ImGuiManager::GetSuppressOpaque()) continue; break;
             case RenderBin::Skinning:   if (sceneCount == 0 && ImGuiManager::GetSuppressSkinning()) continue; break;
             case RenderBin::Grass:      if (sceneCount == 0 && ImGuiManager::GetSuppressGrass()) continue; break;
@@ -2997,16 +3061,6 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                 continue;
             }
 
-            // Stateless batch singleton highlighting: red tint for unbatched draws
-            if (ImGuiManager::GetHighlightStatelessBatch() && fb.singletonCallIndices.count(i)) {
-                FragmentState tintedFrs = call.frs;
-                tintedFrs.material.diffuse.r = call.frs.material.diffuse.r * 1.0f;
-                tintedFrs.material.diffuse.g = call.frs.material.diffuse.g * 0.3f;
-                tintedFrs.material.diffuse.b = call.frs.material.diffuse.b * 0.3f;
-                renderMorrowindHLSL_Internal(&call.rs, &tintedFrs, call.lightrs.get(), DIRTY_ALL, -1, cmdBuf, &call.deviceState, &call);
-                continue;
-            }
-
             {
                 MGE_ZoneScopedN("replay_RenderCall");
                 // Restore Morrowind-recorded device state before each replay call
@@ -3094,15 +3148,16 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                  renderedCalls);
 
     // Log bin statistics
-    LOG::logline("Bins: Terrain=%d Opaque=%d Skinning=%d Grass=%d AlphaTested=%d Blending=%d",
+    LOG::logline("Bins: Terrain=%d TerrainBlend=%d Opaque=%d Skinning=%d Grass=%d AlphaTested=%d Blending=%d",
                  binCounts[(int)RenderBin::Terrain],
+                 binCounts[(int)RenderBin::TerrainBlend],
                  binCounts[(int)RenderBin::Opaque], binCounts[(int)RenderBin::Skinning],
                  binCounts[(int)RenderBin::Grass], binCounts[(int)RenderBin::AlphaTested],
                  binCounts[(int)RenderBin::Blending]);
 
-    // Feed per-bin counts back to ImGui DIP stats (these replace the coarse Scene0 count)
+    // Feed per-bin counts back to ImGui DIP stats (TerrainBlend rolls into the terrain bucket — same suppression toggle)
     ImGuiManager::UpdateReplayBinCounts(
-        binCounts[(int)RenderBin::Terrain],
+        binCounts[(int)RenderBin::Terrain] + binCounts[(int)RenderBin::TerrainBlend],
         binCounts[(int)RenderBin::Opaque],
         binCounts[(int)RenderBin::Skinning],
         binCounts[(int)RenderBin::Grass],

@@ -71,7 +71,8 @@ struct HLSLSceneLight {
 
 // Render bin classification for Tracy profiling and debug visualization
 enum class RenderBin : uint8_t {
-    Terrain,      // Landscape verts (future: detected by land splat pattern)
+    Terrain,      // Opaque tile whose geometry signature matches a TerrainBlend tile this frame
+    TerrainBlend, // Scene 0 blending tile (terrain overlay) — paired with an opaque base in Phase 4
     Opaque,       // Z-write, no blend, no skin, no grass
     Skinning,     // sk.usesSkinning
     Grass,        // sk.hasGrass
@@ -275,6 +276,7 @@ struct LocalMeshData {
 // All draws with same texture/state/FVF get merged into one mega-draw
 struct MergedBatchKey {
     IDirect3DTexture9* texture;
+    IDirect3DTexture9* overlayTexture;  // Absorbed TerrainBlend overlay (null = no overlay)
     uint16_t blendState;
     uint8_t zState;
     uint8_t cullMode;
@@ -285,6 +287,7 @@ struct MergedBatchKey {
 
     bool operator==(const MergedBatchKey& o) const {
         return texture == o.texture &&
+               overlayTexture == o.overlayTexture &&
                blendState == o.blendState && zState == o.zState &&
                cullMode == o.cullMode && useLighting == o.useLighting &&
                bin == o.bin &&
@@ -294,6 +297,7 @@ struct MergedBatchKey {
     struct Hasher {
         size_t operator()(const MergedBatchKey& k) const {
             size_t h = reinterpret_cast<size_t>(k.texture);
+            h ^= reinterpret_cast<size_t>(k.overlayTexture) + 0x9e3779b9 + (h << 6) + (h >> 2);
             h ^= (k.blendState | (k.zState << 16) | (k.cullMode << 24)) + 0x9e3779b9 + (h << 6) + (h >> 2);
             h ^= k.fvf + 0x9e3779b9 + (h << 6) + (h >> 2);
             h ^= (k.useLighting | ((size_t)k.bin << 8)) + 0x9e3779b9 + (h << 6) + (h >> 2);
@@ -620,6 +624,7 @@ class FixedFunctionShader {
         DWORD hasDetail : 1;           // Has detail texture (conditional binding to minimize overhead)
         DWORD useInstancing : 1;       // Uses hardware instancing (world from vertex stream)
         DWORD useStatelessBatch : 1;   // Uses stateless batching (per-draw data from texture)
+        DWORD hasOverlay : 1;          // Has absorbed TerrainBlend overlay (composited via sampler s8)
 
         struct Stage {
             DWORD colorOp : 6;
@@ -1026,6 +1031,18 @@ public:
         // Computed from: FVF + vertex count + prim count + first vertex data hash
         size_t geometryHash = 0;
 
+        // Index of the paired Terrain (opaque base) call when this call is a TerrainBlend overlay.
+        // SIZE_MAX = unpaired (no opaque tile at this position with matching geometry signature).
+        size_t basePairIdx = SIZE_MAX;
+
+        // Overlay texture absorbed from a paired TerrainBlend onto the opaque Terrain base
+        // (Phase 5A). Non-null on a Terrain call means one draw covers both surfaces via s5.
+        IDirect3DTexture9* overlayTexture = nullptr;
+
+        // True on a TerrainBlend call whose texture has been absorbed by its paired Terrain
+        // base. Absorbed calls must not be drawn in the main replay or batch-build paths.
+        bool absorbed = false;
+
         // Constructor to capture render state data with proper resource management
         HLSLRecordedCall(const RenderedState* rs_, const FragmentState* frs_, std::shared_ptr<LightState> lightrs_, const ShaderKey& sk_, int recordMWIdx = -1);
         // Implementation moved to cpp file to handle sampler state capture
@@ -1107,7 +1124,7 @@ public:
 
         // Stateless batches for texture-based per-draw data
         std::vector<StatelessBatch> statelessBatches;
-        std::unordered_set<size_t> singletonCallIndices;  // Calls that didn't batch (for highlighting)
+        std::unordered_set<size_t> singletonCallIndices;  // Calls that didn't batch — accounting aid for the MergedBatch breakdown log
         IDirect3DTexture9* texDrawData = nullptr;  // 8-wide x maxDraws, A32B32G32R32F
         UINT texDrawDataHeight = 0;                // Current texture height (draws capacity)
         std::vector<StatelessDrawData> drawDataStaging;  // CPU-side staging buffer

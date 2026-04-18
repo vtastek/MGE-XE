@@ -25,7 +25,6 @@ float ImGuiManager::pcfSlopeBias = 0.001f;       // Slope-based bias to prevent 
 int ImGuiManager::bboxVisualizationMode = 0;
 bool ImGuiManager::disableHiZCulling = false;
 bool ImGuiManager::enableStatelessBatch = false;
-bool ImGuiManager::highlightStatelessBatch = false;
 bool ImGuiManager::dumpStatelessBatchDetail = false;
 bool ImGuiManager::dumpLightSnapshot = false;
 bool ImGuiManager::forceLightMode3 = false;
@@ -449,8 +448,6 @@ void ImGuiManager::RenderDebugInterface() {
         ImGui::Checkbox("Enable Stateless Batching (experimental)", &enableStatelessBatch);
         if (enableStatelessBatch) {
             ImGui::Indent();
-            ImGui::Checkbox("Highlight Batched Draws", &highlightStatelessBatch);
-            ImGui::SetItemTooltip("Color batched draws: green=batched, red=singleton");
             if (ImGui::Button("Dump Batch Details")) {
                 dumpStatelessBatchDetail = true;
             }
@@ -691,7 +688,6 @@ bool ImGuiManager::GetEnableDepthPass() { return true; }
 int ImGuiManager::GetBBoxVisualizationMode() { return bboxVisualizationMode; }
 bool ImGuiManager::GetDisableHiZCulling() { return disableHiZCulling; }
 bool ImGuiManager::GetEnableStatelessBatch() { return enableStatelessBatch; }
-bool ImGuiManager::GetHighlightStatelessBatch() { return highlightStatelessBatch; }
 bool ImGuiManager::GetAndClearDumpStatelessBatch() {
     bool val = dumpStatelessBatchDetail;
     dumpStatelessBatchDetail = false;

@@ -1751,7 +1751,7 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     }
 
     // Build shader defines based on ShaderKey
-    D3D_SHADER_MACRO defines[12] = {};
+    D3D_SHADER_MACRO defines[14] = {};
     int defineCount = 0;
 
     // Light mode define: 0=sun only, 1=single, 2=few loop, 3=texture
@@ -1797,6 +1797,9 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     }
     if (sk.useStatelessBatch) {
         defines[defineCount++] = {"USE_STATELESS_BATCH", "1"};
+    }
+    if (sk.hasOverlay) {
+        defines[defineCount++] = {"HAS_OVERLAY", "1"};
     }
     defines[defineCount] = {nullptr, nullptr}; // Null terminator
     
@@ -2329,9 +2332,13 @@ bool FixedFunctionShader::ShaderKey::operator==(const ShaderKey& other) const {
 }
 
 std::size_t FixedFunctionShader::ShaderKey::hasher::operator()(const ShaderKey& k) const {
-    DWORD z[9];
+    static_assert(sizeof(ShaderKey) % sizeof(DWORD) == 0, "ShaderKey size must be DWORD-aligned");
+    constexpr size_t N = sizeof(ShaderKey) / sizeof(DWORD);
+    DWORD z[N];
     memcpy(&z, &k, sizeof(z));
-    return (z[0] << 16) ^ z[1] ^ z[2] ^ z[3] ^ z[4] ^ z[5] ^ z[6] ^ z[7] ^ z[8];
+    size_t h = z[0] << 16;
+    for (size_t i = 1; i < N; ++i) h ^= z[i];
+    return h;
 }
 
 void FixedFunctionShader::ShaderKey::log() const {

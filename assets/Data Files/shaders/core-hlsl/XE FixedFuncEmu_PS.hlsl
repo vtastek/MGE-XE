@@ -57,6 +57,12 @@ sampler sampTex3 : register(s3) = sampler_state{ texture = <tex3>; minfilter = a
 #if defined(HAS_SHADOWS)
 sampler sampShadow : register(s4) = sampler_state{ texture = <tex4>; addressu = border; addressv = border; bordercolor = 0xffffffff; minfilter = linear; magfilter = linear; }; // Shadow map (original slot)
 #endif
+#if defined(HAS_OVERLAY)
+// Absorbed TerrainBlend overlay texture (Phase 5B). Composited over the base texture
+// in the single-surface Terrain draw, replacing the original two-draw base+blend pair.
+texture tex8 : register(t8);
+sampler sampOverlay : register(s8) = sampler_state{ texture = <tex8>; minfilter = anisotropic; magfilter = linear; mipfilter = linear; maxanisotropy = 16; };
+#endif
 
 // View inverse matrix for converting view-space to world space (used by texture lights and shadows)
 matrix viewInverse : register(c18);
@@ -242,6 +248,15 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 	// Note: When HAS_DIFFPARAM is defined, sampTex0 contains the _diffparam/_diffparam_t texture
 	#ifdef HAS_DIFFPARAM
 	texColor.a = 1.0; // Ignore alpha from _diffparam texture
+	#endif
+
+	#if defined(HAS_OVERLAY)
+	// Composite the absorbed TerrainBlend overlay. Per LANDSCAPE_MESH_SPECIFICATION.md §4/§6,
+	// Morrowind's landscape blend is driven by the per-vertex color alpha (discrete 0/127/255
+	// AlphaGrid) — NOT the decal texture's alpha (which may carry _diffparam roughness).
+	float4 overlaySample = tex2D(sampOverlay, parallaxUV);
+	overlaySample.rgb = max(0.0, toLinear(overlaySample.rgb));
+	texColor.rgb = lerp(texColor.rgb, overlaySample.rgb, input.color.a);
 	#endif
 
 	// PBR lighting calculation
