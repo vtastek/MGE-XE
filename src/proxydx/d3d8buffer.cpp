@@ -1,6 +1,10 @@
 #include "d3d8buffer.h"
 #include "mge/resource_tracker.h"
 
+// Declared in ffeshader.h — evict-on-release for bboxCache + PatchDisplacement.
+extern void (*g_onVertexBufferReleased)(IDirect3DVertexBuffer9* realBuffer);
+extern void (*g_onIndexBufferReleased)(IDirect3DIndexBuffer9* realBuffer);
+
 //-----------------------------------------------------------------------------
 // ProxyVertexBuffer
 //-----------------------------------------------------------------------------
@@ -20,6 +24,9 @@ ULONG _stdcall ProxyVertexBuffer::Release(void) {
     if (--refcount == 0) {
         // Untrack from resource tracker before releasing
         ResourceTracker::getInstance().untrackVertexBuffer(realBuffer);
+        if (g_onVertexBufferReleased) {
+            g_onVertexBufferReleased(realBuffer);
+        }
         realBuffer->Release();
         delete this;
         return 0;
@@ -98,6 +105,9 @@ ULONG _stdcall ProxyIndexBuffer::Release(void) {
     if (--refcount == 0) {
         // Untrack from resource tracker before releasing
         ResourceTracker::getInstance().untrackIndexBuffer(realBuffer);
+        if (g_onIndexBufferReleased) {
+            g_onIndexBufferReleased(realBuffer);
+        }
         realBuffer->Release();
         delete this;
         return 0;

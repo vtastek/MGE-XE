@@ -14,6 +14,7 @@
 #include "imgui_manager.h"
 #include "hlsl_shader_manager.h"
 #include "shader_utils.h"
+#include "patch_displacement.h"
 
 #include <algorithm>
 #include <sstream>
@@ -385,6 +386,10 @@ std::atomic<int> FixedFunctionShader::precacheTotal{0};
 // Texture release callback (evicts from suffix cache on texture free)
 void (*g_onTextureReleased)(IDirect3DTexture9* realTexture) = nullptr;
 
+// VB/IB release callbacks (evict bboxCache + PatchDisplacement on buffer free).
+void (*g_onVertexBufferReleased)(IDirect3DVertexBuffer9* realBuffer) = nullptr;
+void (*g_onIndexBufferReleased)(IDirect3DIndexBuffer9* realBuffer) = nullptr;
+
 static string buildArgString(DWORD arg, const string& mask, const string& sampler);
 
 bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
@@ -486,6 +491,20 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
 
     // Register texture release callback for evict-on-release cache management
     g_onTextureReleased = TextureSuffix::onTextureReleased;
+
+    // Register VB/IB release callbacks. Both bboxCache and PatchDisplacement
+    // are keyed on VB/IB pointers; releasing them must invalidate cache entries
+    // before Morrowind reuses the pointer. Replaces the bboxCache.clear() that
+    // ran on every cell change (which left the first post-transition frame
+    // with no displacement → flat terrain).
+    g_onVertexBufferReleased = [](IDirect3DVertexBuffer9* vb) {
+        FixedFunctionShader::onVertexBufferReleased(vb);
+        PatchDisplacement::onVertexBufferReleased(vb);
+    };
+    g_onIndexBufferReleased = [](IDirect3DIndexBuffer9* ib) {
+        FixedFunctionShader::onIndexBufferReleased(ib);
+        PatchDisplacement::onIndexBufferReleased(ib);
+    };
 
     // Create default textures to avoid null binds that cause DXVK descriptor updates
     createDefaultTextures();

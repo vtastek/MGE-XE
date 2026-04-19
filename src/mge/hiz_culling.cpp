@@ -295,6 +295,28 @@ void FixedFunctionShader::clearAllCellBatchCaches() {
     PatchDisplacement::clearAll();
 }
 
+// Evict-on-release for bboxCache. Wired through g_onVertexBufferReleased
+// (proxydx fires when Morrowind releases a VB). Replaces the cell-change
+// bboxCache.clear() heuristic, which raced D3DLOCK_DONOTWAIT on the first
+// frame after a transition and produced one-frame flat terrain.
+void FixedFunctionShader::onVertexBufferReleased(IDirect3DVertexBuffer9* vb) {
+    if (!vb) return;
+    std::lock_guard<std::mutex> lock(bboxCacheMutex);
+    for (auto it = bboxCache.begin(); it != bboxCache.end(); ) {
+        if (it->first.vb == vb) it = bboxCache.erase(it);
+        else                    ++it;
+    }
+}
+
+void FixedFunctionShader::onIndexBufferReleased(IDirect3DIndexBuffer9* ib) {
+    if (!ib) return;
+    std::lock_guard<std::mutex> lock(bboxCacheMutex);
+    for (auto it = bboxCache.begin(); it != bboxCache.end(); ) {
+        if (it->first.ib == ib) it = bboxCache.erase(it);
+        else                    ++it;
+    }
+}
+
 // Evict least recently used cache if over limit.
 // Caller must hold s_cellBatchCacheLock exclusively.
 static void evictLRUCellBatchCacheLocked(const CellBatchCacheKey& protectedKey) {
@@ -1820,6 +1842,22 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
                 const auto& call = calls[callIdx];
                 StatelessDrawData data;
                 fillDrawData(data, call, call.shouldRender);
+                // Mirror the cosmetic displacement drop from the main-replay Terrain path
+                // so batched terrain lands at the same baseline as non-batched tiles.
+                if (call.bin == RenderBin::Terrain && fb.nearPatchCount > 0 &&
+                    ImGuiManager::GetEnableNearDisplacement()) {
+                    float drop = ImGuiManager::GetDisplacementScale();
+                    if (drop != 0.0f) {
+                        D3DXMATRIX wt = call.rs.worldTransforms[0];
+                        wt._43 -= drop;
+                        D3DXMATRIX wv;
+                        D3DXMatrixMultiply(&wv, &wt, &fb.view);
+                        data.world0[0] = wv._11; data.world0[1] = wv._21; data.world0[2] = wv._31; data.world0[3] = wv._41;
+                        data.world1[0] = wv._12; data.world1[1] = wv._22; data.world1[2] = wv._32; data.world1[3] = wv._42;
+                        data.world2[0] = wv._13; data.world2[1] = wv._23; data.world2[2] = wv._33; data.world2[3] = wv._43;
+                        data.flags[0] = wv._14; data.flags[1] = wv._24; data.flags[2] = wv._34; data.flags[3] = wv._44;
+                    }
+                }
                 fb.drawDataStaging.push_back(data);
                 mergedLayout.push_back(sortedCalls[i].first);
                 drawDataOffset++;

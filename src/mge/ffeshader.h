@@ -598,6 +598,13 @@ extern PipelineDiag g_pipelineDiag;
 // Global callback for texture release notification (set by FixedFunctionShader::init)
 extern void (*g_onTextureReleased)(IDirect3DTexture9* realTexture);
 
+// Global callbacks for VB/IB release notification — drive evict-on-release for
+// pointer-keyed caches (bboxCache, PatchDisplacement) so we don't have to clear
+// them heuristically on cell change (which races D3DLOCK_DONOTWAIT and produces
+// a one-frame flat terrain).
+extern void (*g_onVertexBufferReleased)(IDirect3DVertexBuffer9* realBuffer);
+extern void (*g_onIndexBufferReleased)(IDirect3DIndexBuffer9* realBuffer);
+
 // Replay metrics for material sorting optimization analysis
 extern ReplayMetrics g_replayMetrics;
 
@@ -1354,6 +1361,13 @@ public:
     static void finalizeAndRenderAllScenes(DLContext* frameCtx, bool waterSeen); // Full deferred GPU phase at UI BeginScene
     static void executeGpuPhase(); // GPU render block — called by render thread or inline
     static void replayScene1And2(FrameBuffer* fb);  // Replay Scene 1/2 at UI BeginScene (after recording)
+
+    // Evict stale bboxCache entries when the underlying VB/IB is released by
+    // Morrowind (see g_onVertexBufferReleased wiring in init). Replaces the
+    // cell-change bboxCache.clear() heuristic — release-driven eviction is
+    // race-free against the prepare thread's D3DLOCK_DONOTWAIT path.
+    static void onVertexBufferReleased(IDirect3DVertexBuffer9* vb);
+    static void onIndexBufferReleased(IDirect3DIndexBuffer9* ib);
 
     // Merged batching
     static void buildStatelessBatches(FrameBuffer& fb);  // Build merged batches (per-draw data in texture)

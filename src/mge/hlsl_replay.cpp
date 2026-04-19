@@ -3229,9 +3229,9 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                             rsDisp.vertCount = sp->vertCount;
                             rsDisp.startIndex = 0;
                             rsDisp.primCount = sp->primCount;
-                            // Phase 8.3: lower the entire terrain patch by displacement scale in
-                            // world Z. The VS then displaces upward so peaks reach the original
-                            // Z and edge-locked verts stay at the baseline, matching neighbors.
+                            // Displacement is cosmetic-only: lower the rendered world so
+                            // the shader displaces upward from a -scale baseline back to the
+                            // original ground. Hi-Z and bbox paths keep the un-lowered world.
                             float drop = ImGuiManager::GetDisplacementScale();
                             rsDisp.worldTransforms[0]._43 -= drop;
                             D3DXMatrixMultiply(&rsDisp.worldViewTransforms[0],
@@ -3245,22 +3245,16 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     }
                 }
                 if (!renderedDisplaced) {
-                    // Phase 8.3: non-subdivided Terrain draws drop by displacement scale
-                    // so they match the baseline of subdivided edge-locked verts — crack-free
-                    // seams between near (subdivided) and far (non-subdivided) terrain.
-                    // Phase 8.4: skip the drop entirely when nothing is subdivided this
-                    // frame (e.g. cell-transition prepare-frame where bboxes aren't ready).
-                    // Otherwise every Terrain tile sinks by `scale` with no compensating
-                    // upward displacement — a visible one-frame collapse at cell borders.
+                    // Cosmetic drop for non-subdivided Terrain so the flat baseline meets
+                    // the subdivided neighbors at -scale. Only when displacement is active
+                    // this frame (nearPatchCount > 0). Hi-Z/bbox keep the original world.
                     if (call.bin == RenderBin::Terrain && fb.nearPatchCount > 0) {
                         float drop = ImGuiManager::GetDisplacementScale();
-                        RenderedState rsOffset = call.rs;
-                        rsOffset.worldTransforms[0]._43 -= drop;
-                        D3DXMatrixMultiply(&rsOffset.worldViewTransforms[0],
-                                           &rsOffset.worldTransforms[0], &fb.currentView);
-                        rsOffset.shadowWorldViewProj[0] = rsOffset.worldTransforms[0] * DistantLand::s_staging.smViewproj[0];
-                        rsOffset.shadowWorldViewProj[1] = rsOffset.worldTransforms[0] * DistantLand::s_staging.smViewproj[1];
-                        renderMorrowindHLSL_Internal(&rsOffset, &call.frs, call.lightrs.get(), call.dirtyFlags, (int)i, cmdBuf, &call.deviceState, &call);
+                        RenderedState rsLowered = call.rs;
+                        rsLowered.worldTransforms[0]._43 -= drop;
+                        D3DXMatrixMultiply(&rsLowered.worldViewTransforms[0],
+                                           &rsLowered.worldTransforms[0], &fb.currentView);
+                        renderMorrowindHLSL_Internal(&rsLowered, &call.frs, call.lightrs.get(), call.dirtyFlags, (int)i, cmdBuf, &call.deviceState, &call);
                     } else {
                         renderMorrowindHLSL_Internal(&call.rs, &call.frs, call.lightrs.get(), call.dirtyFlags, (int)i, cmdBuf, &call.deviceState, &call);
                     }
