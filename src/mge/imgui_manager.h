@@ -196,6 +196,17 @@ public:
     static bool GetMaterialSortEnabled() { return materialSortEnabled; }
     static bool GetInstancingEnabled() { return instancingEnabled; }
 
+    // Phase 7/8: Near-camera landscape displacement LOD accessors
+    // Mode: 0 = CPU baker (Phase 7), 1 = GPU VTF (Phase 8D). Only used when
+    // enableNearDisplacement is true. Selected via ImGui for A/B comparison.
+    enum DisplacementMode : int { DisplacementModeCPU = 0, DisplacementModeVTF = 1 };
+    static bool GetEnableNearDisplacement() { return enableNearDisplacement; }
+    static int  GetDisplacementMode() { return displacementMode; }
+    static float GetDisplacementScale() { return displacementScale; }
+    static float GetHeightBlendStrength() { return heightBlendStrength; }
+    static float GetHeightBlendContrast() { return heightBlendContrast; }
+    static bool GetDebugHighlightNearPatches() { return debugHighlightNearPatches; }
+
     // Per-bin DIP suppression toggles
     static bool GetSuppressSky() { return suppressSky; }
     static bool GetSuppressTerrain() { return suppressTerrain; }
@@ -357,6 +368,14 @@ private:
     static bool performanceMode;          // Dirty tracking performance mode - default true
     static bool materialSortEnabled;      // Material sorting for state change reduction - default false
     static bool instancingEnabled;        // GPU instancing for draw call reduction - default false
+
+    // Phase 7/8: Near-camera landscape displacement LOD
+    static bool enableNearDisplacement;   // Master toggle for 2x2 near-camera patch displacement
+    static int  displacementMode;         // 0 = CPU baker (Phase 7), 1 = GPU VTF (Phase 8D)
+    static float displacementScale;       // World-unit scale applied to _paramh heights (0..64)
+    static float heightBlendStrength;     // Lerp between AlphaGrid and height-biased mask in PS (0..1)
+    static float heightBlendContrast;     // Sharpness of the height pick (0..1)
+    static bool debugHighlightNearPatches; // Tint the 4 selected near patches yellow for selection QA
 
     // Per-bin DIP suppression toggles
     static bool suppressSky;

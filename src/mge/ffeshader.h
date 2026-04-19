@@ -17,6 +17,7 @@
 #include <queue>
 #include <memory>
 #include <atomic>
+#include <array>
 
 // Per-frame rendering context — snapshotted at start of Stage0, passed through all stages.
 struct DLContext {
@@ -277,6 +278,7 @@ struct LocalMeshData {
 struct MergedBatchKey {
     IDirect3DTexture9* texture;
     IDirect3DTexture9* overlayTexture;  // Absorbed TerrainBlend overlay (null = no overlay)
+    IDirect3DTexture9* overlayParamHTexture;  // Phase 8A: overlay's _paramh (null = base-only paramh)
     uint16_t blendState;
     uint8_t zState;
     uint8_t cullMode;
@@ -288,6 +290,7 @@ struct MergedBatchKey {
     bool operator==(const MergedBatchKey& o) const {
         return texture == o.texture &&
                overlayTexture == o.overlayTexture &&
+               overlayParamHTexture == o.overlayParamHTexture &&
                blendState == o.blendState && zState == o.zState &&
                cullMode == o.cullMode && useLighting == o.useLighting &&
                bin == o.bin &&
@@ -298,6 +301,7 @@ struct MergedBatchKey {
         size_t operator()(const MergedBatchKey& k) const {
             size_t h = reinterpret_cast<size_t>(k.texture);
             h ^= reinterpret_cast<size_t>(k.overlayTexture) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= reinterpret_cast<size_t>(k.overlayParamHTexture) + 0x9e3779b9 + (h << 6) + (h >> 2);
             h ^= (k.blendState | (k.zState << 16) | (k.cullMode << 24)) + 0x9e3779b9 + (h << 6) + (h >> 2);
             h ^= k.fvf + 0x9e3779b9 + (h << 6) + (h >> 2);
             h ^= (k.useLighting | ((size_t)k.bin << 8)) + 0x9e3779b9 + (h << 6) + (h >> 2);
@@ -625,6 +629,9 @@ class FixedFunctionShader {
         DWORD useInstancing : 1;       // Uses hardware instancing (world from vertex stream)
         DWORD useStatelessBatch : 1;   // Uses stateless batching (per-draw data from texture)
         DWORD hasOverlay : 1;          // Has absorbed TerrainBlend overlay (composited via sampler s8)
+        DWORD hasOverlayParamH : 1;    // Phase 8A: overlay has its own _paramh (PS blends via sampler s9)
+        DWORD hasDisplacement : 1;     // Near-camera landscape patch uses subdivided VB with pre-baked heights (Phase 7)
+        DWORD useVTFDisplacement : 1;  // Phase 8D: displacement samples _paramh via VS VTF instead of CPU-baked heights
 
         struct Stage {
             DWORD colorOp : 6;
@@ -788,12 +795,18 @@ private:
         DWORD fvf;
         bool fvfValid;
 
+        // Fill mode (solid / wireframe). Needed so the `twf` debug command actually
+        // flips polygons to wireframe in HLSL mode — postshaders force SOLID between
+        // scenes, so we have to re-apply the captured value every draw.
+        DWORD fillMode;
+        bool fillModeValid;
+
         MaterialStateCache() : initialized(false),
             zEnableValid(false), zWriteEnableValid(false), zFuncValid(false), cullModeValid(false),
             alphaBlendEnableValid(false), srcBlendValid(false), destBlendValid(false),
             alphaTestEnableValid(false), alphaFuncValid(false), alphaRefValid(false),
             specularEnableValid(false), localViewerValid(false), normalizeNormalsValid(false),
-            fvfValid(false) {}
+            fvfValid(false), fillModeValid(false) {}
 
         void reset() {
             initialized = false;
@@ -802,6 +815,7 @@ private:
             alphaTestEnableValid = alphaFuncValid = alphaRefValid = false;
             specularEnableValid = localViewerValid = normalizeNormalsValid = false;
             fvfValid = false;
+            fillModeValid = false;
         }
     };
     static MaterialStateCache materialCache;
@@ -1039,6 +1053,28 @@ public:
         // (Phase 5A). Non-null on a Terrain call means one draw covers both surfaces via s5.
         IDirect3DTexture9* overlayTexture = nullptr;
 
+        // Phase 8A: overlay's _paramh sibling, resolved during absorption. Non-null only on
+        // an absorbed Terrain base whose paired TerrainBlend had a _paramh. Bound to PS s9.
+        IDirect3DTexture9* overlayParamHTexture = nullptr;
+
+        // Phase 8.1: base's _paramh sibling, resolved on prepare thread when bin=Terrain
+        // is assigned. Consumed on replay thread by patch_displacement / VTF build so
+        // they never need to run TextureSuffix resolution on the replay side.
+        IDirect3DTexture9* baseParamHTexture = nullptr;
+
+        // Phase 8.2: world-direction bitmask identifying which cardinal neighbors of this
+        // patch are also in the subdivided near-set. Bits: 0=+X (east), 1=-X (west),
+        // 2=+Y (north), 3=-Y (south). Only set on Terrain calls selected for subdivision.
+        // An edge that points at a subdivided neighbor participates in displacement; an
+        // edge pointing at a non-subdivided (source-resolution) neighbor stays locked to
+        // the source Z so the seam remains crack-free.
+        uint8_t subdivNeighborDirMask = 0;
+
+        // Phase 8.4: which subdivision tier this call uses when hasDisplacement is set.
+        // 0 = inner tier (65x65 grid, closest tiles), 1 = outer tier (33x33, ring).
+        // Unused when hasDisplacement == 0.
+        uint8_t subdivTier = 0;
+
         // True on a TerrainBlend call whose texture has been absorbed by its paired Terrain
         // base. Absorbed calls must not be drawn in the main replay or batch-build paths.
         bool absorbed = false;
@@ -1052,6 +1088,24 @@ public:
     // Type aliases for VB+IB key (definitions in meshkey.h)
     using VBIBKey = ::VBIBKey;
     using VBIBKeyHash = ::VBIBKeyHash;
+
+    // Identity of a landscape patch: VB+IB pointer pair.
+    // Morrowind gives each landscape patch its own VB+IB (spec §stride-4); world translation
+    // is the cell origin and so can't distinguish patches within the same cell.
+    struct TerrainPatchKey {
+        IDirect3DVertexBuffer9* vb = nullptr;
+        IDirect3DIndexBuffer9*  ib = nullptr;
+        bool empty() const { return vb == nullptr && ib == nullptr; }
+        bool operator==(const TerrainPatchKey& o) const { return vb == o.vb && ib == o.ib; }
+        bool operator!=(const TerrainPatchKey& o) const { return !(*this == o); }
+    };
+    struct TerrainPatchKeyHash {
+        size_t operator()(const TerrainPatchKey& k) const {
+            size_t h = (size_t)(uintptr_t)k.vb;
+            h ^= (size_t)(uintptr_t)k.ib + 0x9e3779b9 + (h << 6) + (h >> 2);
+            return h;
+        }
+    };
 
     // Buffer lifecycle states for triple-buffered pipeline
     enum class BufferState {
@@ -1136,6 +1190,15 @@ public:
         UINT mergedVBSize = 0;                       // Current VB capacity in bytes
         UINT mergedIBSize = 0;                       // Current IB capacity in indices
 
+        // Phase 7 / 8.4: near-camera Terrain patches this frame (VB+IB identity).
+        // Populated in prepareRecordedCalls after Terrain/TerrainBlend absorption.
+        // Two-tier: up to 8 inner (tier 0, 65x65) + up to 24 outer (tier 1, 33x33).
+        // Selection also frustum-biased (tiles behind the eye are skipped) so the
+        // budget concentrates on visible area.
+        // nearPatchCount <= 32; slots past nearPatchCount are undefined.
+        std::array<TerrainPatchKey, 32> nearPatches{};
+        uint32_t nearPatchCount = 0;
+
         // Cell batch cache references (set by buildStatelessBatches on cache hit)
         void* cellBatchCacheKey = nullptr;                // Cell pointer the merged batches belong to
         size_t cellBatchLayoutHash = 0;                    // Layout hash within the cell batch cache
@@ -1181,6 +1244,8 @@ public:
                 cachedMergedIB = nullptr;
             }
             cachedDrawInfos.clear();
+            for (auto& k : nearPatches) k = TerrainPatchKey{};
+            nearPatchCount = 0;
             valid = false;
             // Initialize matrices to identity to prevent garbage if capture functions aren't called
             D3DXMatrixIdentity(&view);

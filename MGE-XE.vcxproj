@@ -138,6 +138,8 @@
     <ClCompile Include="src\mge\async_shader_compiler.cpp" />
     <ClCompile Include="src\mge\softwareocclusion.cpp" />
     <ClCompile Include="src\mge\meshlodcache.cpp" />
+    <ClCompile Include="src\mge\patch_displacement.cpp" />
+    <ClCompile Include="src\mge\paramh_vtf_cache.cpp" />
     <ClCompile Include="src\mge\ffe_core_rendering.cpp" />
     <ClCompile Include="src\mge\d3dcommandbuffer.cpp" />
     <ClCompile Include="src\mge\imgui_manager.cpp" />
@@ -226,6 +228,8 @@
     <ClInclude Include="src\mge\distantlandhlsl.h" />
     <ClInclude Include="src\mge\suffix_texture_support.h" />
     <ClInclude Include="src\mge\texture_suffix.h" />
+    <ClInclude Include="src\mge\patch_displacement.h" />
+    <ClInclude Include="src\mge\paramh_vtf_cache.h" />
     <ClInclude Include="src\mge\hlsl_shader_manager.h" />
     <ClInclude Include="src\mge\async_shader_compiler.h" />
     <ClInclude Include="src\mge\ffe_core_rendering.h" />

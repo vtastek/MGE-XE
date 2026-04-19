@@ -329,6 +329,34 @@ float ParallaxSoftShadow(
 	return shadowpara;
 }
 
+// Phase 8.5: dual-sampler soft parallax shadow. Traces against the height-blended
+// surface (base lerp overlay, weighted by mask) so the shadow follows the same
+// profile the eye sees (albedo/normal/PBR blend). Green channel only — _paramh
+// always stores height in green.
+float ParallaxSoftShadowBlend(
+	sampler2D hmapBase,
+	sampler2D hmapOverlay,
+	float mask,
+	float2 uv,
+	float2 lightDirTS,
+	float soften,
+	float scale)
+{
+	float2 lDir = -lightDirTS * scale;
+	float h0 = 1.0 - lerp(tex2D(hmapBase, uv).g,
+	                      tex2D(hmapOverlay, uv).g, mask);
+	float h1 = 1.0 - lerp(tex2D(hmapBase, uv + 0.20 * lDir).g,
+	                      tex2D(hmapOverlay, uv + 0.20 * lDir).g, mask);
+	float h2 = 1.0 - lerp(tex2D(hmapBase, uv + 0.35 * lDir).g,
+	                      tex2D(hmapOverlay, uv + 0.35 * lDir).g, mask);
+	float h3 = 1.0 - lerp(tex2D(hmapBase, uv + 0.45 * lDir).g,
+	                      tex2D(hmapOverlay, uv + 0.45 * lDir).g, mask);
+	float h4 = 1.0 - lerp(tex2D(hmapBase, uv + 0.55 * lDir).g,
+	                      tex2D(hmapOverlay, uv + 0.55 * lDir).g, mask);
+	float h = min(min(min(h1, h2), min(h3, h4)), 1.0);
+	return min(1.0, 1.0 - saturate((h0 - h) * soften));
+}
+
 
 #endif
 

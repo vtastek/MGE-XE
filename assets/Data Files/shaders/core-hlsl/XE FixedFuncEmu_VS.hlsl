@@ -45,6 +45,24 @@ sampler sampDrawData : register(s0);
 float4 drawDataParams : register(c70);  // {1/width=0.125, 1/height, 0, 0}
 #endif
 
+#ifdef USE_VTF_DISPLACEMENT
+// Phase 8D: sample base/overlay _paramh R16F directly in the VS via VTF.
+// Slot 2/3 avoid the stateless-batch sampler at VS s0.
+sampler sampVSBaseH    : register(s2);
+  #ifdef HAS_OVERLAY
+sampler sampVSOverlayH : register(s3);
+  #endif
+float  displacementScaleVS : register(c72);
+#endif
+
+#ifdef HAS_DISPLACEMENT
+// Phase 8.4: XY = (R_outer, R_inner) in world units; ZW = world-space camera XY.
+// Smoothstep from R_inner->R_outer fades displacement to 0 at the outer boundary
+// so subdivided tiles land on the -scale baseline and join seamlessly with the
+// flat (non-subdivided) terrain beyond.
+float4 displacementFalloffVS : register(c73);
+#endif
+
 //------------------------------------------------------------
 // Vertex Input/Output
 struct VS_INPUT {
@@ -59,6 +77,14 @@ struct VS_INPUT {
     // Draw index for texture lookup (appended to vertex data)
     // Note: Using TEXCOORD7 as TEXCOORD8+ may not work reliably on all hardware
     float drawIndex : TEXCOORD7;
+#endif
+#ifdef HAS_DISPLACEMENT
+    // Phase 7: pre-baked per-vertex heights on the subdivided near-camera patch.
+    // x=baseH, y=overlayH. Perimeter verts carry 0 (crack-free, CPU path).
+    float2 heights : TEXCOORD1;
+    // Phase 8D: 0 on perimeter, 1 interior. VTF path multiplies by this so
+    // shared edges contribute no offset (CPU path already has zeroed heights).
+    float displaceWeight : TEXCOORD2;
 #endif
 };
 
@@ -203,6 +229,49 @@ VS_OUTPUT vs_main(VS_INPUT input) {
     float4 worldpos;
     float4 viewpos;
     float3 normal;
+
+#ifdef HAS_DISPLACEMENT
+  #ifdef USE_VTF_DISPLACEMENT
+    // Phase 8D: sample R16F _paramh directly in the VS via tex2Dlod.
+    // Samplers are point-filter, clamp — baseline VTF support on D3D9 SM3.
+    // Phase 8.3 positive displacement: sample*scale pushes verts UP from the
+    // lowered baseline (hlsl_replay drops every Terrain draw by -scale in world
+    // Z). paramh=1 reaches the original Z; paramh=0 stays at baseline.
+    float baseH = tex2Dlod(sampVSBaseH, float4(input.texcoord, 0, 0)).r * displacementScaleVS;
+    #ifdef HAS_OVERLAY
+    float overlayH = tex2Dlod(sampVSOverlayH, float4(input.texcoord, 0, 0)).r * displacementScaleVS;
+    float _displaceH = lerp(baseH, overlayH, input.color.a);
+    #else
+    float _displaceH = baseH;
+    #endif
+    // displaceWeight=0 on edges facing a non-subdivided neighbor pins them to
+    // the dropped baseline (matches non-subdivided neighbors → no cracks).
+    // Interior + edges shared with another subdivided patch get weight=1.
+    _displaceH *= input.displaceWeight;
+  #else
+    // Phase 7 CPU path: heights pre-baked into the VB in [0, scale];
+    // edge-locked verts carry 0 so they rest at the dropped baseline.
+    #ifdef HAS_OVERLAY
+    float _displaceH = lerp(input.heights.x, input.heights.y, input.color.a);
+    #else
+    float _displaceH = input.heights.x;
+    #endif
+  #endif
+    // Phase 8.4: planar XY distance from camera, smoothstep fade R_inner->R_outer.
+    // Inside R_inner: full displacement. Past R_outer: zero, so the outer ring
+    // lands at the -scale baseline and joins the flat non-subdivided terrain.
+    float2 worldXY = mul(float4(input.pos.xyz, 1), world).xy;
+    float distXY = length(worldXY - displacementFalloffVS.zw);
+    float fall = 1.0 - smoothstep(displacementFalloffVS.y, displacementFalloffVS.x, distXY);
+    _displaceH *= fall;
+
+    // Phase 8.3: displace along object-space +Z (world up — terrain has no
+    // rotation) rather than normalize(input.normal). Adjacent patches have
+    // distinct per-vertex normals at the shared edge; normalizing them produces
+    // different directions for the same height, cracking the seam. Pure +Z
+    // guarantees identical offsets from identical heights → seamless.
+    input.pos.z += _displaceH;
+#endif
 
     // Calculate world position first (needed for shadows)
     worldpos = float4(input.pos.xyz, 1);

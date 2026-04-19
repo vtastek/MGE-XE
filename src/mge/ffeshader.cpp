@@ -1801,6 +1801,15 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     if (sk.hasOverlay) {
         defines[defineCount++] = {"HAS_OVERLAY", "1"};
     }
+    if (sk.hasOverlayParamH) {
+        defines[defineCount++] = {"HAS_OVERLAY_PARAMH", "1"};
+    }
+    if (sk.hasDisplacement) {
+        defines[defineCount++] = {"HAS_DISPLACEMENT", "1"};
+    }
+    if (sk.useVTFDisplacement) {
+        defines[defineCount++] = {"USE_VTF_DISPLACEMENT", "1"};
+    }
     defines[defineCount] = {nullptr, nullptr}; // Null terminator
     
     // LOG::logline("HLSL: Compiling shader with %d defines", defineCount);

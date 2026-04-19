@@ -7,7 +7,10 @@
 #include "imgui_manager.h"
 #include "mge_tracy.h"
 #include "texture_suffix.h"
+#include "morrowindbsa.h"
 #include "mwbridge.h"
+#include "patch_displacement.h"
+#include "paramh_vtf_cache.h"
 
 #include <algorithm>
 #include <cmath>
@@ -130,6 +133,7 @@ static void hashMeshKeyValue(size_t& h, const MeshKey& key) {
 static void hashMergedBatchKeyValue(size_t& h, const MergedBatchKey& key) {
     hashCombineValue(h, reinterpret_cast<size_t>(key.texture));
     hashCombineValue(h, reinterpret_cast<size_t>(key.overlayTexture));
+    hashCombineValue(h, reinterpret_cast<size_t>(key.overlayParamHTexture));
     hashCombineValue(h, key.blendState);
     hashCombineValue(h, key.zState);
     hashCombineValue(h, key.cullMode);
@@ -242,6 +246,7 @@ static bool lessMergedBatchKey(const MergedBatchKey& lhs, const MergedBatchKey& 
     if (lp != rp) return lp < rp;
     if (lhs.texture != rhs.texture) return lhs.texture < rhs.texture;
     if (lhs.overlayTexture != rhs.overlayTexture) return lhs.overlayTexture < rhs.overlayTexture;
+    if (lhs.overlayParamHTexture != rhs.overlayParamHTexture) return lhs.overlayParamHTexture < rhs.overlayParamHTexture;
     if (lhs.blendState != rhs.blendState) return lhs.blendState < rhs.blendState;
     if (lhs.zState != rhs.zState) return lhs.zState < rhs.zState;
     if (lhs.cullMode != rhs.cullMode) return lhs.cullMode < rhs.cullMode;
@@ -285,6 +290,13 @@ void FixedFunctionShader::clearAllCellBatchCaches() {
     }
     s_cellBatchCaches.clear();
     ReleaseSRWLockExclusive(&s_cellBatchCacheLock);
+    // Phase 7: subdivided near-patch cache is keyed on VB/IB identity, which
+    // Morrowind reuses across cells. Drop everything on transition so we never
+    // render stale subdivided geometry against a reallocated source VB.
+    PatchDisplacement::clearAll();
+    // Phase 8C: same reasoning for the VTF height texture cache — paramh pointers
+    // can be reused across cells once Morrowind releases the source.
+    ParamHVTF::clearAll();
 }
 
 // Evict least recently used cache if over limit.
@@ -1010,6 +1022,20 @@ void FixedFunctionShader::prepareRecordedCalls() {
                 TerrainSig sig{call.rs.fvf, call.rs.vbStride, call.rs.vertCount};
                 if (terrainSigs.find(sig) != terrainSigs.end()) {
                     call.bin = RenderBin::Terrain;
+
+                    // Phase 8.1: resolve the base's _paramh sibling on the prepare thread
+                    // so the VS displacement paths (CPU subdivide + VTF) can read a valid
+                    // pointer directly without a replay-thread QueryInterface round-trip.
+                    if (call.rs.texture && DistantLand::device) {
+                        const TextureSuffix::ResolutionCache* res =
+                            TextureSuffix::getOrCreateResolution(
+                                DistantLand::device, call.rs.texture, /*allowDeviceCalls*/ true);
+                        if (res && res->variants && res->variants->hasParamH()) {
+                            IDirect3DTexture9* basePH = BSA::loadSuffixTexture(
+                                DistantLand::device, *res->variants, "paramh");
+                            if (basePH) call.baseParamHTexture = basePH;
+                        }
+                    }
                 }
             }
 
@@ -1055,6 +1081,10 @@ void FixedFunctionShader::prepareRecordedCalls() {
 
                 // Phase 5A absorption: stamp the overlay texture onto the paired Terrain
                 // base so the pair renders as a single draw via sampler s5 + HAS_OVERLAY.
+                // NOTE: keep the ORIGINAL overlay pointer here — downstream resolution
+                // (overlay _paramh in patch_displacement, overlay _paramh on s9) keys on
+                // the original to find sibling suffixes via TextureSuffix. The slot-8
+                // _diffparam_t swap happens at bind time in hlsl_replay (mirrors slot 0).
                 if (recCalls[i].basePairIdx != SIZE_MAX) {
                     auto& base = recCalls[recCalls[i].basePairIdx];
                     base.overlayTexture = recCalls[i].rs.texture;
@@ -1062,6 +1092,24 @@ void FixedFunctionShader::prepareRecordedCalls() {
                     // in a merged batch or the main-replay path. The merged-batch path derives this
                     // from mb.key.overlayTexture; the main-replay path reads call.sk directly.
                     base.sk.hasOverlay = 1;
+
+                    // Phase 8A: resolve the overlay's _paramh sibling so the PS can blend
+                    // paramh between base and overlay (same AlphaGrid factor used for albedo).
+                    if (recCalls[i].rs.texture && DistantLand::device) {
+                        const TextureSuffix::ResolutionCache* res =
+                            TextureSuffix::getOrCreateResolution(
+                                DistantLand::device,
+                                recCalls[i].rs.texture,
+                                /*allowDeviceCalls*/ true);
+                        if (res && res->variants && res->variants->hasParamH()) {
+                            IDirect3DTexture9* overlayPH = BSA::loadSuffixTexture(
+                                DistantLand::device, *res->variants, "paramh");
+                            if (overlayPH) {
+                                base.overlayParamHTexture = overlayPH;
+                                base.sk.hasOverlayParamH = 1;
+                            }
+                        }
+                    }
                     recCalls[i].absorbed = true;
                     recCalls[i].shouldRender = false;
                 } else {
@@ -1078,6 +1126,132 @@ void FixedFunctionShader::prepareRecordedCalls() {
                     LOG::logline("TerrainBlend ORPHAN count=%d first tile at (%.2f, %.2f, %.2f)",
                                  orphanCount, w._41, w._42, w._43);
                 }
+            }
+
+            // Phase 7 / 8.4: two-tier near-camera Terrain selection (XY distance).
+            // Inner tier (0): up to 8 tiles within R_inner (~20 m, 65x65 subdivision).
+            // Outer tier (1): up to 24 tiles within R_outer (~40 m, 33x33 subdivision).
+            // Frustum-biased: tiles behind the eye are skipped (dot-product against
+            // the camera's forward XY), concentrating the budget on visible ground
+            // so mid-disc tiles don't fall through to flat and create gaps.
+            // Gated by ImGui toggle so we can F5/F6 A/B against off.
+            fb.nearPatchCount = 0;
+            if (ImGuiManager::GetEnableNearDisplacement()) {
+                constexpr float kRInner2 = 1280.0f * 1280.0f;  // ~20 m in world units
+                constexpr float kROuter2 = 2560.0f * 2560.0f;  // ~40 m, < half a cell
+                constexpr int kInnerCap = 8;
+                constexpr int kOuterCap = 24;
+                // One tile's worth (~512 u = 8 m) of slack behind the eye so patches
+                // at the feet stay subdivided when the player pans slightly.
+                constexpr float kBehindThreshold = -512.0f;
+                struct Slot { float dist2; size_t callIdx; };
+                Slot innerSlots[kInnerCap];
+                Slot outerSlots[kOuterCap];
+                int innerCount = 0, outerCount = 0;
+                const float eyeX = fbEyePos.x;
+                const float eyeY = fbEyePos.y;
+
+                // Camera forward in world space (XY). fb.view is world->view, so
+                // invView transforms view-space forward (0,0,1,0) into world.
+                D3DXMATRIX invView;
+                D3DXMatrixInverse(&invView, nullptr, &fb.view);
+                D3DXVECTOR4 fwdView(0.0f, 0.0f, 1.0f, 0.0f);
+                D3DXVECTOR4 fwdWorld;
+                D3DXVec4Transform(&fwdWorld, &fwdView, &invView);
+                const float fwdX = fwdWorld.x;
+                const float fwdY = fwdWorld.y;
+
+                auto tryInsertOuter = [&](float d2, size_t idx) {
+                    if (outerCount < kOuterCap) {
+                        int k = outerCount++;
+                        while (k > 0 && outerSlots[k - 1].dist2 > d2) { outerSlots[k] = outerSlots[k - 1]; --k; }
+                        outerSlots[k] = {d2, idx};
+                    } else if (d2 < outerSlots[kOuterCap - 1].dist2) {
+                        int k = kOuterCap - 1;
+                        while (k > 0 && outerSlots[k - 1].dist2 > d2) { outerSlots[k] = outerSlots[k - 1]; --k; }
+                        outerSlots[k] = {d2, idx};
+                    }
+                };
+
+                for (size_t i = 0; i < recCalls.size(); ++i) {
+                    auto& c = recCalls[i];
+                    if (c.bin != RenderBin::Terrain) continue;
+                    if (!c.hasBoundingBox) continue;
+                    // bboxMin/bboxMax are already world-space (see computeBoundingBox in hiz_culling.cpp
+                    // and the world-corner transform in hiz_culling.cpp:1250-1259).
+                    float cx = 0.5f * (c.bboxMin.x + c.bboxMax.x);
+                    float cy = 0.5f * (c.bboxMin.y + c.bboxMax.y);
+                    float dx = cx - eyeX, dy = cy - eyeY;
+                    float forwardProj = dx * fwdX + dy * fwdY;
+                    if (forwardProj < kBehindThreshold) continue;  // behind the camera
+                    float d2 = dx * dx + dy * dy;
+                    if (d2 < kRInner2) {
+                        // Inner candidate. If we can't fit in the inner cap, demote
+                        // to outer rather than dropping — otherwise mid-disc tiles
+                        // fall through to flat and leave visible gaps.
+                        if (innerCount < kInnerCap) {
+                            int k = innerCount++;
+                            while (k > 0 && innerSlots[k - 1].dist2 > d2) { innerSlots[k] = innerSlots[k - 1]; --k; }
+                            innerSlots[k] = {d2, i};
+                        } else if (d2 < innerSlots[kInnerCap - 1].dist2) {
+                            // Beat the worst inner slot; demote the evicted tile to outer.
+                            Slot evicted = innerSlots[kInnerCap - 1];
+                            int k = kInnerCap - 1;
+                            while (k > 0 && innerSlots[k - 1].dist2 > d2) { innerSlots[k] = innerSlots[k - 1]; --k; }
+                            innerSlots[k] = {d2, i};
+                            tryInsertOuter(evicted.dist2, evicted.callIdx);
+                        } else {
+                            // Inner-radius but rank > kInnerCap — still subdivided,
+                            // just at outer density. Prevents flat gaps in the disc.
+                            tryInsertOuter(d2, i);
+                        }
+                    } else if (d2 < kROuter2) {
+                        tryInsertOuter(d2, i);
+                    }
+                }
+                // Merge into a single scan list so adjacency works across inner+outer.
+                Slot merged[kInnerCap + kOuterCap];
+                uint8_t tiers[kInnerCap + kOuterCap];
+                int total = 0;
+                for (int i = 0; i < innerCount; ++i) { merged[total] = innerSlots[i]; tiers[total] = 0; ++total; }
+                for (int i = 0; i < outerCount; ++i) { merged[total] = outerSlots[i]; tiers[total] = 1; ++total; }
+
+                // Phase 8D: the A/B ImGui toggle picks CPU vs VTF source of per-vertex heights.
+                // The VTF variant only compiles if the device supports R16F vertex-texture fetch.
+                bool wantVTF = (ImGuiManager::GetDisplacementMode() ==
+                                ImGuiManager::DisplacementModeVTF)
+                            && ParamHVTF::isSupported(DistantLand::device);
+                for (int i = 0; i < total; ++i) {
+                    auto& c = recCalls[merged[i].callIdx];
+                    fb.nearPatches[i] = FixedFunctionShader::TerrainPatchKey{c.rs.vb, c.rs.ib};
+                    c.sk.hasDisplacement = 1;
+                    c.sk.useVTFDisplacement = wantVTF ? 1 : 0;
+                    c.subdivTier = tiers[i];
+
+                    // Phase 8.2/8.4: compute which of our 4 cardinal neighbors are also in
+                    // the subdivided near-set (either tier). Edges facing a subdivided
+                    // neighbor displace; edges facing non-subdivided stay edge-locked.
+                    uint8_t mask = 0;
+                    if (c.hasBoundingBox) {
+                        const float eps = 1.0f;  // one world unit slack on bbox-edge match
+                        for (int j = 0; j < total; ++j) {
+                            if (j == i) continue;
+                            auto& o = recCalls[merged[j].callIdx];
+                            if (!o.hasBoundingBox) continue;
+                            // Require Y/X extent overlap so diagonal patches don't score.
+                            bool yOverlap = !(o.bboxMax.y < c.bboxMin.y - eps
+                                           || o.bboxMin.y > c.bboxMax.y + eps);
+                            bool xOverlap = !(o.bboxMax.x < c.bboxMin.x - eps
+                                           || o.bboxMin.x > c.bboxMax.x + eps);
+                            if (yOverlap && fabsf(o.bboxMin.x - c.bboxMax.x) < eps) mask |= (1u << 0);  // +X
+                            if (yOverlap && fabsf(o.bboxMax.x - c.bboxMin.x) < eps) mask |= (1u << 1);  // -X
+                            if (xOverlap && fabsf(o.bboxMin.y - c.bboxMax.y) < eps) mask |= (1u << 2);  // +Y
+                            if (xOverlap && fabsf(o.bboxMax.y - c.bboxMin.y) < eps) mask |= (1u << 3);  // -Y
+                        }
+                    }
+                    c.subdivNeighborDirMask = mask;
+                }
+                fb.nearPatchCount = (uint32_t)total;
             }
         }
 
@@ -1496,6 +1670,7 @@ static MergedBatchKey makeMergedBatchKey(const FixedFunctionShader::HLSLRecorded
     MergedBatchKey mkey = {};
     mkey.texture = call.rs.texture;
     mkey.overlayTexture = call.overlayTexture;
+    mkey.overlayParamHTexture = call.overlayParamHTexture;
     mkey.blendState = (uint16_t)((call.expectedState.captured ? call.expectedState.alphaBlendEnable : 0) |
                      ((call.expectedState.captured ? call.expectedState.srcBlend : 0) << 4) |
                      ((call.expectedState.captured ? call.expectedState.destBlend : 0) << 8));
@@ -1560,6 +1735,12 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
 
         if (call.sceneNum != 0 || !isBatchableCall(call))
             continue;
+
+        // Phase 7: near-camera displacement patches use a widened vertex layout
+        // (original stride + 8 bytes of per-vertex heights on TEXCOORD1), which
+        // does not share a stream format with the regular merged layout. Exclude
+        // them from the merged batch and let the main loop render them singly.
+        if (call.sk.hasDisplacement) continue;
 
         MergedBatchKey mkey = makeMergedBatchKey(call);
         auto insertResult = mergeGroupLookup.emplace(mkey, mergeGroups.size());

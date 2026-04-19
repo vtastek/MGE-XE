@@ -63,6 +63,12 @@ sampler sampShadow : register(s4) = sampler_state{ texture = <tex4>; addressu = 
 texture tex8 : register(t8);
 sampler sampOverlay : register(s8) = sampler_state{ texture = <tex8>; minfilter = anisotropic; magfilter = linear; mipfilter = linear; maxanisotropy = 16; };
 #endif
+#if defined(HAS_OVERLAY_PARAMH)
+// Phase 8A: overlay's _paramh — PS blends PBR params/height gradient with the base's _paramh
+// proportionally to input.color.a (same AlphaGrid factor used for albedo in HAS_OVERLAY).
+texture tex9 : register(t9);
+sampler sampOverlayParamH : register(s9) = sampler_state{ texture = <tex9>; minfilter = anisotropic; magfilter = linear; mipfilter = linear; maxanisotropy = 16; };
+#endif
 
 // View inverse matrix for converting view-space to world space (used by texture lights and shadows)
 matrix viewInverse : register(c18);
@@ -102,6 +108,11 @@ float4 drawDataParams : register(c20);  // {1/width=0.0625 for 16-wide, 1/height
 
 // Debug visualization mode (0=off, 1-15=various debug views)
 int debugMode : register(c22);
+
+// Phase 8.5: Height-based overlay blending.
+// .x = strength (0=plain AlphaGrid, 1=full height pick)
+// .y = contrast (sharpness — higher makes the taller material win more aggressively)
+float4 heightBlendParams : register(c23);
 
 //------------------------------------------------------------
 // Vertex Output (matches VS_OUTPUT from vertex shader)
@@ -166,6 +177,9 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 	float3 deb = 0;
 	float2 parallaxUV = input.texcoord;
 	float3 normalVS = normalize(input.normal);
+	// Phase 8.5: overlay blend mask — defaults to the Morrowind AlphaGrid factor; gets
+	// biased by per-pixel height when both base and overlay _paramh are available.
+	float overlayMask = input.color.a;
 	
 	float3 ambient = INTENSITY * pow((lightSceneAmbient) + EPS, 2.2) / PI;
 	float shadows = 1.0;
@@ -204,6 +218,26 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 		parallaxUV = Parallax(sampTex2, parallaxUV, Vts, 0.000015 * 1.33, 1); // heightScale, green channel
 		#endif
 
+		#if defined(HAS_OVERLAY) && defined(HAS_OVERLAY_PARAMH)
+		// Phase 8.5: height-biased overlay mask (sand settles into stone cracks).
+		// Canonical additive Witcher blend — t is added to the layer's own height so
+		// endpoints are exact regardless of heightmap range:
+		//   t=0 → mask=0, t=1 → mask=1 (no leakage when overlay green is below contrast).
+		{
+			float hBaseC = tex2D(sampTex2, parallaxUV).g;
+			float hOverC = tex2D(sampOverlayParamH, parallaxUV).g;
+			float t = input.color.a;
+			float hbContrast = max(heightBlendParams.y, 1e-4);
+			float b1 = hBaseC + (1.0 - t);
+			float b2 = hOverC + t;
+			float ma = max(b1, b2) - hbContrast;
+			float b1c = max(b1 - ma, 0.0);
+			float b2c = max(b2 - ma, 0.0);
+			float hMask = b2c / max(b1c + b2c, 1e-4);
+			overlayMask = lerp(t, hMask, heightBlendParams.x);
+		}
+		#endif
+
 		// Calculate normal from height gradient in green channel
 
 		float deriv = 1.5;
@@ -221,6 +255,18 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 		float hR = tex2D(sampTex2, parallaxUV + float2(texel.x * deriv, 0)).g;
 		float hD = tex2D(sampTex2, parallaxUV + float2(0, -texel.y * deriv)).g;
 		float hU = tex2D(sampTex2, parallaxUV + float2(0,  texel.y * deriv)).g;
+		#if defined(HAS_OVERLAY_PARAMH)
+		// Phase 8A: blend gradient heights between base and overlay. Parallax() itself stays
+		// on the base sampler — the UV-offset delta from dual-sampling there is not worth
+		// doubling the iterative cost for.
+		float hL2 = tex2D(sampOverlayParamH, parallaxUV + float2(-texel.x * deriv, 0)).g;
+		float hR2 = tex2D(sampOverlayParamH, parallaxUV + float2( texel.x * deriv, 0)).g;
+		float hD2 = tex2D(sampOverlayParamH, parallaxUV + float2(0, -texel.y * deriv)).g;
+		float hU2 = tex2D(sampOverlayParamH, parallaxUV + float2(0,  texel.y * deriv)).g;
+		float overlayBlend = overlayMask;
+		hL = lerp(hL, hL2, overlayBlend); hR = lerp(hR, hR2, overlayBlend);
+		hD = lerp(hD, hD2, overlayBlend); hU = lerp(hU, hU2, overlayBlend);
+		#endif
 		float dhdu = (hR - hL);
 		float dhdv = (hU - hD);
 
@@ -232,7 +278,14 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 			float3 lightDirVS = -lightSunDirection;
 			float3 lightDirTS = mul(lightDirVS, TBN_T);
 				#ifdef USE_PARALLAX_SHADOWS
+					#if defined(HAS_OVERLAY) && defined(HAS_OVERLAY_PARAMH)
+					// Trace against the height-blended surface so soft shadows track the
+					// same profile as normals/albedo (sand-in-stone-cracks look).
+					float shadowpara = ParallaxSoftShadowBlend(sampTex2, sampOverlayParamH, overlayMask,
+					                                           input.texcoord, lightDirTS.xy, 5.0, 0.04 * 0.75);
+					#else
 					float shadowpara = ParallaxSoftShadow(sampTex2, input.texcoord, lightDirTS.xy, 5.0, 0.04 * 0.75, 1); // green channel
+					#endif
 					shadows *= shadowpara;
 				#endif
 			#endif
@@ -256,7 +309,7 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 	// AlphaGrid) — NOT the decal texture's alpha (which may carry _diffparam roughness).
 	float4 overlaySample = tex2D(sampOverlay, parallaxUV);
 	overlaySample.rgb = max(0.0, toLinear(overlaySample.rgb));
-	texColor.rgb = lerp(texColor.rgb, overlaySample.rgb, input.color.a);
+	texColor.rgb = lerp(texColor.rgb, overlaySample.rgb, overlayMask);
 	#endif
 
 	// PBR lighting calculation
@@ -272,6 +325,12 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 	// PBR parameter system with Disney parametrization
 #ifdef HAS_PARAMH
 	float4 paramh = tex2D(sampTex2, parallaxUV);
+	#ifdef HAS_OVERLAY_PARAMH
+	// Phase 8A: blend PBR params between base and overlay _paramh — decal regions now
+	// reflect the overlay's metalness/roughness/IOR proportionally to AlphaGrid.
+	float4 paramh2 = tex2D(sampOverlayParamH, parallaxUV);
+	paramh = lerp(paramh, paramh2, overlayMask);
+	#endif
 	metalness = paramh.r;  // Red = metalness
 	// Green = height (already used for parallax above)
 	float ior_param = paramh.b;  // Blue = IOR parameter (Disney parametrization)

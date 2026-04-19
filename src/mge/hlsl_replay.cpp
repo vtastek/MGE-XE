@@ -21,6 +21,8 @@
 #include "distantland.h"
 #include "imgui_manager.h"
 #include "hlsl_shader_manager.h"
+#include "patch_displacement.h"
+#include "paramh_vtf_cache.h"
 
 #include <algorithm>
 #include <cstring>
@@ -555,6 +557,10 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
                 if (&call.rs == rs) { sk = call.sk; found = true; break; }
             }
         }
+        // Phase 7: callers that pass a patched RenderedState (rsDisplaced) won't
+        // match any &call.rs in the buffer. Fall back to the provided replayCall's
+        // recorded ShaderKey so the shader variant (incl. HAS_DISPLACEMENT) is correct.
+        if (!found && replayCall) { sk = replayCall->sk; found = true; }
     } else {
         // During normal rendering, compute ShaderKey with texture suffix detection
         sk = computeShaderKeyWithSuffixes(rs, frs, lightrs);
@@ -783,9 +789,25 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
 
     // Phase 6A: bind absorbed TerrainBlend overlay to sampler s8 for the main-replay
     // (non-batched / singleton) path. Mirrors the merged-batch bind below.
+    // Phase 8.5: swap to overlay's _diffparam_t/_diffparam variant if present, mirroring
+    // the slot-0 swap that bindShaderTextures performs for the base. Keep the original
+    // pointer on the call so downstream _paramh resolution still works.
     bool boundOverlay = false;
     if (replayCall && replayCall->overlayTexture) {
-        device->SetTexture(8, replayCall->overlayTexture);
+        IDirect3DTexture9* overlayBind = static_cast<IDirect3DTexture9*>(replayCall->overlayTexture);
+        const auto* dpRes = TextureSuffix::getOrCreateResolution(
+            (IDirect3DDevice9*)device, overlayBind, /*allowDeviceCalls*/ true);
+        if (dpRes && dpRes->variants) {
+            IDirect3DTexture9* dp = nullptr;
+            if (dpRes->variants->hasDiffParamT()) {
+                dp = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *dpRes->variants, "diffparam_t");
+            }
+            if (!dp && dpRes->variants->hasDiffParam()) {
+                dp = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *dpRes->variants, "diffparam");
+            }
+            if (dp) overlayBind = dp;
+        }
+        device->SetTexture(8, overlayBind);
         device->SetSamplerState(8, D3DSAMP_MINFILTER, D3DTEXF_ANISOTROPIC);
         device->SetSamplerState(8, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
         device->SetSamplerState(8, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
@@ -793,6 +815,18 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         device->SetSamplerState(8, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
         device->SetSamplerState(8, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
         boundOverlay = true;
+    }
+
+    // Phase 8A: bind overlay's _paramh to sampler s9 so the PS can blend paramh
+    // between base and overlay by the same AlphaGrid factor used for albedo.
+    if (replayCall && replayCall->overlayParamHTexture) {
+        device->SetTexture(9, replayCall->overlayParamHTexture);
+        device->SetSamplerState(9, D3DSAMP_MINFILTER, D3DTEXF_ANISOTROPIC);
+        device->SetSamplerState(9, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+        device->SetSamplerState(9, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
+        device->SetSamplerState(9, D3DSAMP_MAXANISOTROPY, 16);
+        device->SetSamplerState(9, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+        device->SetSamplerState(9, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
     }
 
     // When building command buffer, snapshot bound textures into the buffer
@@ -941,6 +975,14 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         if (rs->alphaTest) {
             setCachedRenderState(device, D3DRS_ALPHAFUNC, rs->alphaFunc, materialCache.alphaFunc, materialCache.alphaFuncValid);
             setCachedRenderState(device, D3DRS_ALPHAREF, rs->alphaRef, materialCache.alphaRef, materialCache.alphaRefValid);
+        }
+
+        // Fill mode: re-apply the captured value every draw so `twf` wireframe
+        // survives the postshaders-forced SOLID between scenes. Falls back to
+        // SOLID when we have no captured state (legacy/non-recorded calls).
+        {
+            DWORD fm = capturedState ? capturedState->fillMode : D3DFILL_SOLID;
+            setCachedRenderState(device, D3DRS_FILLMODE, fm, materialCache.fillMode, materialCache.fillModeValid);
         }
 
         // Point sprites (particles) - ALWAYS restore ALL states from captured state
@@ -1558,6 +1600,12 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         if (hPCFSlopeBias) hlslShader.psConstantTable->SetFloat(device, hPCFSlopeBias, ImGuiManager::GetPCFSlopeBias());
         D3DXHANDLE hDebugMode = hlslShader.psConstantTable->GetConstantByName(NULL, "debugMode");
         if (hDebugMode) hlslShader.psConstantTable->SetInt(device, hDebugMode, ImGuiManager::GetShaderDebugMode());
+        D3DXHANDLE hHeightBlendParams = hlslShader.psConstantTable->GetConstantByName(NULL, "heightBlendParams");
+        if (hHeightBlendParams) {
+            D3DXVECTOR4 hb(ImGuiManager::GetHeightBlendStrength(),
+                           ImGuiManager::GetHeightBlendContrast(), 0.0f, 0.0f);
+            hlslShader.psConstantTable->SetVector(device, hHeightBlendParams, &hb);
+        }
 
         D3DXHANDLE hFogColNear = hlslShader.psConstantTable->GetConstantByName(NULL, "fogColNear");
         if (hFogColNear) hlslShader.psConstantTable->SetVector(device, hFogColNear, (D3DXVECTOR4*)fogColor);
@@ -2762,6 +2810,9 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     // Phase 5B: Terrain tiles that absorbed a TerrainBlend overlay need the
                     // HAS_OVERLAY variant — PS samples s8 and composites over the base color.
                     sk.hasOverlay = (mb.key.overlayTexture != nullptr) ? 1 : 0;
+                    // Phase 8A: if the overlay carries its own _paramh, PS samples s9 and
+                    // blends paramh with the base by the same AlphaGrid factor.
+                    sk.hasOverlayParamH = (mb.key.overlayParamHTexture != nullptr) ? 1 : 0;
 
                     // Look up shader variant - check local cache first to avoid SRW lock
                     HLSLShader hlslShader = {};
@@ -2834,14 +2885,40 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
 
                         // Phase 5B: bind absorbed TerrainBlend overlay texture to sampler s8.
                         // The PS samples s8 under HAS_OVERLAY and composites overlay over base.
+                        // Phase 8.5: swap to overlay's _diffparam_t/_diffparam variant if present
+                        // (mirrors slot-0 swap in bindShaderTextures). The original pointer stays
+                        // on the key so downstream _paramh resolution still finds the right siblings.
                         if (mb.key.overlayTexture) {
-                            device->SetTexture(8, mb.key.overlayTexture);
+                            IDirect3DTexture9* overlayBind = mb.key.overlayTexture;
+                            const auto* dpRes = TextureSuffix::getOrCreateResolution(
+                                (IDirect3DDevice9*)device, mb.key.overlayTexture, /*allowDeviceCalls*/ true);
+                            if (dpRes && dpRes->variants) {
+                                IDirect3DTexture9* dp = nullptr;
+                                if (dpRes->variants->hasDiffParamT()) {
+                                    dp = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *dpRes->variants, "diffparam_t");
+                                }
+                                if (!dp && dpRes->variants->hasDiffParam()) {
+                                    dp = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *dpRes->variants, "diffparam");
+                                }
+                                if (dp) overlayBind = dp;
+                            }
+                            device->SetTexture(8, overlayBind);
                             device->SetSamplerState(8, D3DSAMP_MINFILTER, D3DTEXF_ANISOTROPIC);
                             device->SetSamplerState(8, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
                             device->SetSamplerState(8, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
                             device->SetSamplerState(8, D3DSAMP_MAXANISOTROPY, 16);
                             device->SetSamplerState(8, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
                             device->SetSamplerState(8, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+                        }
+                        // Phase 8A: bind overlay's _paramh to sampler s9 so PS can blend paramh.
+                        if (mb.key.overlayParamHTexture) {
+                            device->SetTexture(9, mb.key.overlayParamHTexture);
+                            device->SetSamplerState(9, D3DSAMP_MINFILTER, D3DTEXF_ANISOTROPIC);
+                            device->SetSamplerState(9, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+                            device->SetSamplerState(9, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
+                            device->SetSamplerState(9, D3DSAMP_MAXANISOTROPY, 16);
+                            device->SetSamplerState(9, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+                            device->SetSamplerState(9, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
                         }
                     }
 
@@ -2865,6 +2942,10 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                             float v[4] = { (float)ImGuiManager::GetShaderDebugMode(), 0, 0, 0 };
                             device->SetPixelShaderConstantF(22, v, 1);
                         }
+                        {
+                            float v[4] = { ImGuiManager::GetHeightBlendStrength(), ImGuiManager::GetHeightBlendContrast(), 0, 0 };
+                            device->SetPixelShaderConstantF(23, v, 1);
+                        }
 
                         // Set shadow matrices using hoisted view-to-shadow transforms
                         if (hlslShader.hShadowWorldViewProj) {
@@ -2887,6 +2968,9 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                             device->SetRenderState(D3DRS_ALPHATESTENABLE, firstCall.expectedState.alphaTestEnable);
                             device->SetRenderState(D3DRS_FOGENABLE, firstCall.expectedState.fogEnable);
                         }
+                        // Fill mode: `twf` flips this to WIREFRAME globally, but postshaders
+                        // force SOLID between scenes so we re-apply from the captured state.
+                        device->SetRenderState(D3DRS_FILLMODE, firstCall.deviceState.fillMode);
                     }
 
                     {
@@ -2926,6 +3010,22 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
     }
 
     MGE_ZoneScopedN("replay_MainLoop");
+
+    // Phase 8.4: push displacement falloff (c73) once per replay invocation.
+    // XY = (R_outer, R_inner), ZW = world-space camera XY. VS samples this only
+    // under HAS_DISPLACEMENT, so pushing unconditionally is safe; non-displaced
+    // draws ignore it. Eye XY derived from fb.currentView for N-1 consistency,
+    // matching the selector in hiz_culling.cpp.
+    {
+        D3DXMATRIX invView;
+        D3DXMatrixInverse(&invView, nullptr, &fb.currentView);
+        D3DXVECTOR4 origin(0.0f, 0.0f, 0.0f, 1.0f);
+        D3DXVECTOR4 eyeW;
+        D3DXVec4Transform(&eyeW, &origin, &invView);
+        float falloff[4] = { 2560.0f, 1280.0f, eyeW.x, eyeW.y };
+        device->SetVertexShaderConstantF(73, falloff, 1);
+    }
+
     bool firstDrawDone = false;
     for (size_t i = 0; i < numCalls; i++) {
         // Skip calls that were handled by merged batches
@@ -3091,7 +3191,124 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                 }
                 LARGE_INTEGER callStartQPC, callEndQPC;
                 QueryPerformanceCounter(&callStartQPC);
-                renderMorrowindHLSL_Internal(&call.rs, &call.frs, call.lightrs.get(), call.dirtyFlags, (int)i, cmdBuf, &call.deviceState, &call);
+
+                // Phase 7: near-camera landscape patch — swap in the dense subdivided
+                // VB/IB and use the HAS_DISPLACEMENT shader variant. The
+                // subdivided perimeter carries zero heights, so shared edges with
+                // non-subdivided neighbors still sit on the original Z — no cracks.
+                // Only Terrain calls flagged hasDisplacement during prepare land here.
+                bool renderedDisplaced = false;
+                if (call.sk.hasDisplacement && !cmdBuf) {
+                    FixedFunctionShader::TerrainPatchKey pk{call.rs.vb, call.rs.ib};
+                    bool inSet = false;
+                    for (uint32_t s = 0; s < fb.nearPatchCount; ++s) {
+                        if (fb.nearPatches[s] == pk) { inSet = true; break; }
+                    }
+                    if (inSet) {
+                        // Phase 8D: when VTF mode is active, we still rebuild the subdivided
+                        // geometry (CPU path baked heights are no-ops against displaceWeight*0
+                        // VTF path and the VB holds both attributes), but we also need to push
+                        // the VTF heightmap samplers + scale constant before draw.
+                        PatchDisplacement::SubdivPatch* sp = PatchDisplacement::getOrBuild(
+                            device, pk, call, call.overlayTexture,
+                            ImGuiManager::GetDisplacementScale(),
+                            call.subdivTier);
+                        if (sp) {
+                            if (call.sk.useVTFDisplacement) {
+                                // Phase 8.1: base/overlay _paramh pointers are stamped on
+                                // the call at prepare time (hiz_culling.cpp). Reuse them
+                                // directly; no replay-thread TextureSuffix lookup.
+                                IDirect3DTexture9* baseVTF = nullptr;
+                                IDirect3DTexture9* overlayVTF = nullptr;
+                                if (call.baseParamHTexture) {
+                                    baseVTF = ParamHVTF::getOrBuild(device, call.baseParamHTexture);
+                                }
+                                if (call.overlayParamHTexture) {
+                                    overlayVTF = ParamHVTF::getOrBuild(device, call.overlayParamHTexture);
+                                }
+                                // Bind base to VS s2; overlay to VS s3 when present. Point-filter
+                                // + clamp — R16F linear-filter is not guaranteed for VTF on SM3.
+                                if (baseVTF) {
+                                    device->SetTexture(D3DVERTEXTEXTURESAMPLER2, baseVTF);
+                                    device->SetSamplerState(D3DVERTEXTEXTURESAMPLER2, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+                                    device->SetSamplerState(D3DVERTEXTEXTURESAMPLER2, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+                                    device->SetSamplerState(D3DVERTEXTEXTURESAMPLER2, D3DSAMP_MIPFILTER, D3DTEXF_POINT);
+                                    device->SetSamplerState(D3DVERTEXTEXTURESAMPLER2, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+                                    device->SetSamplerState(D3DVERTEXTEXTURESAMPLER2, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+                                }
+                                if (overlayVTF) {
+                                    device->SetTexture(D3DVERTEXTEXTURESAMPLER3, overlayVTF);
+                                    device->SetSamplerState(D3DVERTEXTEXTURESAMPLER3, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+                                    device->SetSamplerState(D3DVERTEXTEXTURESAMPLER3, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+                                    device->SetSamplerState(D3DVERTEXTEXTURESAMPLER3, D3DSAMP_MIPFILTER, D3DTEXF_POINT);
+                                    device->SetSamplerState(D3DVERTEXTEXTURESAMPLER3, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+                                    device->SetSamplerState(D3DVERTEXTEXTURESAMPLER3, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+                                }
+                                // Push displacement scale (c72) — CPU path bakes scale at build time.
+                                float scale[4] = { ImGuiManager::GetDisplacementScale(), 0, 0, 0 };
+                                device->SetVertexShaderConstantF(72, scale, 1);
+                            }
+
+                            // Optional debug tint: yellow emissive so the 4 near patches are
+                            // visually obvious and we can confirm selection tracks the camera.
+                            FragmentState tintedFrs = call.frs;
+                            if (ImGuiManager::GetDebugHighlightNearPatches()) {
+                                tintedFrs.material.emissive = {1.0f, 1.0f, 0.0f, 1.0f};
+                            }
+                            RenderedState rsDisp = call.rs;
+                            rsDisp.vb = sp->vb;
+                            rsDisp.vbOffset = 0;
+                            rsDisp.vbStride = sp->stride;
+                            rsDisp.ib = sp->ib;
+                            rsDisp.fvf = sp->fvf;
+                            rsDisp.ibBase = 0;
+                            rsDisp.baseIndex = 0;
+                            rsDisp.minIndex = 0;
+                            rsDisp.vertCount = sp->vertCount;
+                            rsDisp.startIndex = 0;
+                            rsDisp.primCount = sp->primCount;
+                            // Phase 8.3: lower the entire terrain patch by displacement scale in
+                            // world Z. The VS then displaces upward so peaks reach the original
+                            // Z and edge-locked verts stay at the baseline, matching neighbors.
+                            float drop = ImGuiManager::GetDisplacementScale();
+                            rsDisp.worldTransforms[0]._43 -= drop;
+                            D3DXMatrixMultiply(&rsDisp.worldViewTransforms[0],
+                                               &rsDisp.worldTransforms[0], &fb.currentView);
+                            rsDisp.shadowWorldViewProj[0] = rsDisp.worldTransforms[0] * DistantLand::s_staging.smViewproj[0];
+                            rsDisp.shadowWorldViewProj[1] = rsDisp.worldTransforms[0] * DistantLand::s_staging.smViewproj[1];
+                            renderMorrowindHLSL_Internal(&rsDisp, &tintedFrs, call.lightrs.get(),
+                                                         DIRTY_ALL, (int)i, cmdBuf, &call.deviceState, &call);
+
+                            if (call.sk.useVTFDisplacement) {
+                                // Unbind so VS textures don't leak to neighboring draws.
+                                device->SetTexture(D3DVERTEXTEXTURESAMPLER2, nullptr);
+                                device->SetTexture(D3DVERTEXTEXTURESAMPLER3, nullptr);
+                            }
+                            renderedDisplaced = true;
+                        }
+                    }
+                }
+                if (!renderedDisplaced) {
+                    // Phase 8.3: non-subdivided Terrain draws drop by displacement scale
+                    // so they match the baseline of subdivided edge-locked verts — crack-free
+                    // seams between near (subdivided) and far (non-subdivided) terrain.
+                    // Phase 8.4: skip the drop entirely when nothing is subdivided this
+                    // frame (e.g. cell-transition prepare-frame where bboxes aren't ready).
+                    // Otherwise every Terrain tile sinks by `scale` with no compensating
+                    // upward displacement — a visible one-frame collapse at cell borders.
+                    if (call.bin == RenderBin::Terrain && fb.nearPatchCount > 0) {
+                        float drop = ImGuiManager::GetDisplacementScale();
+                        RenderedState rsOffset = call.rs;
+                        rsOffset.worldTransforms[0]._43 -= drop;
+                        D3DXMatrixMultiply(&rsOffset.worldViewTransforms[0],
+                                           &rsOffset.worldTransforms[0], &fb.currentView);
+                        rsOffset.shadowWorldViewProj[0] = rsOffset.worldTransforms[0] * DistantLand::s_staging.smViewproj[0];
+                        rsOffset.shadowWorldViewProj[1] = rsOffset.worldTransforms[0] * DistantLand::s_staging.smViewproj[1];
+                        renderMorrowindHLSL_Internal(&rsOffset, &call.frs, call.lightrs.get(), call.dirtyFlags, (int)i, cmdBuf, &call.deviceState, &call);
+                    } else {
+                        renderMorrowindHLSL_Internal(&call.rs, &call.frs, call.lightrs.get(), call.dirtyFlags, (int)i, cmdBuf, &call.deviceState, &call);
+                    }
+                }
                 QueryPerformanceCounter(&callEndQPC);
                 float callMs = (callEndQPC.QuadPart - callStartQPC.QuadPart) * 1000.0f / replayFreqQPC.QuadPart;
                 if (callMs > worstCallMs) {

@@ -216,6 +216,12 @@
     <ClCompile Include="src\mge\meshlodcache.cpp">
       <Filter>Source Files\mge</Filter>
     </ClCompile>
+    <ClCompile Include="src\mge\patch_displacement.cpp">
+      <Filter>Source Files\mge</Filter>
+    </ClCompile>
+    <ClCompile Include="src\mge\paramh_vtf_cache.cpp">
+      <Filter>Source Files\mge</Filter>
+    </ClCompile>
     <ClCompile Include="src\mge\mged3d8device.cpp">
       <Filter>Source Files\mge</Filter>
     </ClCompile>
@@ -483,6 +489,12 @@
       <Filter>Header Files\mge</Filter>
     </ClInclude>
     <ClInclude Include="src\mge\meshlodcache.h">
+      <Filter>Header Files\mge</Filter>
+    </ClInclude>
+    <ClInclude Include="src\mge\patch_displacement.h">
+      <Filter>Header Files\mge</Filter>
+    </ClInclude>
+    <ClInclude Include="src\mge\paramh_vtf_cache.h">
       <Filter>Header Files\mge</Filter>
     </ClInclude>
     <ClInclude Include="src\mge\MGEAPI.h">

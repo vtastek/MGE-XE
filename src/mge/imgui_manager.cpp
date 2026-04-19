@@ -3,6 +3,8 @@
 #include "configuration.h"
 #include "ffeshader.h"
 #include "mwbridge.h"
+#include "paramh_vtf_cache.h"
+#include "distantland.h"
 #include <cstdio>
 
 bool ImGuiManager::initialized = false;
@@ -72,6 +74,14 @@ bool ImGuiManager::stateLeakDetection = false;
 bool ImGuiManager::performanceMode = true;
 bool ImGuiManager::materialSortEnabled = false;
 bool ImGuiManager::instancingEnabled = false;
+
+// Phase 7/8: Near-camera landscape displacement LOD
+bool ImGuiManager::enableNearDisplacement = false;
+int  ImGuiManager::displacementMode = 0;  // 0 = CPU baker, 1 = GPU VTF
+float ImGuiManager::displacementScale = 16.0f;
+float ImGuiManager::heightBlendStrength = 0.5f;
+float ImGuiManager::heightBlendContrast = 0.3f;
+bool ImGuiManager::debugHighlightNearPatches = false;
 
 // Per-bin DIP suppression toggles
 bool ImGuiManager::suppressSky = false;
@@ -469,6 +479,39 @@ void ImGuiManager::RenderDebugInterface() {
         ImGui::SetItemTooltip("Sort opaque/grass draws by material to minimize state changes. A/B comparison.");
         ImGui::Checkbox("GPU Instancing (Experimental)", &instancingEnabled);
         ImGui::SetItemTooltip("Batch identical geometry+material draws using GPU instancing. Requires material sort.");
+
+        // Phase 7/8: Near-camera landscape displacement LOD
+        ImGui::Checkbox("Near-camera Displacement LOD", &enableNearDisplacement);
+        ImGui::SetItemTooltip("Subdivide the 4 closest landscape patches 5x5 -> 33x33 and displace using _paramh heights.");
+        if (enableNearDisplacement) {
+            ImGui::Indent();
+            // Phase 8D: A/B mode switch between CPU-baked and GPU VTF. VTF option
+            // is grayed if the device doesn't support R16F vertex textures.
+            const bool vtfOk = ParamHVTF::isSupported(DistantLand::device);
+            ImGui::RadioButton("CPU baker (Phase 7)", &displacementMode,
+                               DisplacementModeCPU);
+            ImGui::SetItemTooltip("Decode _paramh green on CPU per cell transition, bake per-vertex heights.");
+            if (!vtfOk) ImGui::BeginDisabled();
+            ImGui::RadioButton("GPU VTF (Phase 8D)", &displacementMode,
+                               DisplacementModeVTF);
+            if (!vtfOk) ImGui::EndDisabled();
+            ImGui::SetItemTooltip(vtfOk
+                ? "Sample _paramh via VS tex2Dlod each vertex; no per-cell CPU bake."
+                : "Disabled: device reports no D3DFMT_R16F vertex-texture support.");
+            ImGui::Unindent();
+        }
+        ImGui::SliderFloat("Displacement Scale", &displacementScale, 0.0f, 64.0f, "%.1f");
+        ImGui::SetItemTooltip("World-unit scale applied to _paramh (base vs overlay) heights. Default 16.");
+        ImGui::SliderFloat("Height Blend Strength", &heightBlendStrength, 0.0f, 1.0f, "%.2f");
+        ImGui::SetItemTooltip("Lerp between plain AlphaGrid blend (0) and height-biased blend (1). Keeps large transitions with rocks poking through.");
+        ImGui::SliderFloat("Height Blend Contrast", &heightBlendContrast, 0.0f, 1.0f, "%.2f");
+        ImGui::SetItemTooltip("Sharpness of the height pick. Higher = crisper edges where the taller material wins.");
+        ImGui::Checkbox("Highlight Near Patches (debug)", &debugHighlightNearPatches);
+        ImGui::SetItemTooltip("Tint the 4 selected near patches yellow for selection QA.");
+        if (enableNearDisplacement) {
+            ImGui::Text("VTF build: %u textures, %.2f ms total",
+                        ParamHVTF::getBuildCount(), ParamHVTF::getTotalBuildMs());
+        }
 
         ImGui::Separator();
         ImGui::Text("Statistics");
