@@ -10,7 +10,6 @@
 #include "morrowindbsa.h"
 #include "mwbridge.h"
 #include "patch_displacement.h"
-#include "paramh_vtf_cache.h"
 
 #include <algorithm>
 #include <cmath>
@@ -294,9 +293,6 @@ void FixedFunctionShader::clearAllCellBatchCaches() {
     // Morrowind reuses across cells. Drop everything on transition so we never
     // render stale subdivided geometry against a reallocated source VB.
     PatchDisplacement::clearAll();
-    // Phase 8C: same reasoning for the VTF height texture cache — paramh pointers
-    // can be reused across cells once Morrowind releases the source.
-    ParamHVTF::clearAll();
 }
 
 // Evict least recently used cache if over limit.
@@ -1216,16 +1212,10 @@ void FixedFunctionShader::prepareRecordedCalls() {
                 for (int i = 0; i < innerCount; ++i) { merged[total] = innerSlots[i]; tiers[total] = 0; ++total; }
                 for (int i = 0; i < outerCount; ++i) { merged[total] = outerSlots[i]; tiers[total] = 1; ++total; }
 
-                // Phase 8D: the A/B ImGui toggle picks CPU vs VTF source of per-vertex heights.
-                // The VTF variant only compiles if the device supports R16F vertex-texture fetch.
-                bool wantVTF = (ImGuiManager::GetDisplacementMode() ==
-                                ImGuiManager::DisplacementModeVTF)
-                            && ParamHVTF::isSupported(DistantLand::device);
                 for (int i = 0; i < total; ++i) {
                     auto& c = recCalls[merged[i].callIdx];
                     fb.nearPatches[i] = FixedFunctionShader::TerrainPatchKey{c.rs.vb, c.rs.ib};
                     c.sk.hasDisplacement = 1;
-                    c.sk.useVTFDisplacement = wantVTF ? 1 : 0;
                     c.subdivTier = tiers[i];
 
                     // Phase 8.2/8.4: compute which of our 4 cardinal neighbors are also in

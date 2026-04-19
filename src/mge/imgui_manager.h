@@ -196,13 +196,12 @@ public:
     static bool GetMaterialSortEnabled() { return materialSortEnabled; }
     static bool GetInstancingEnabled() { return instancingEnabled; }
 
-    // Phase 7/8: Near-camera landscape displacement LOD accessors
-    // Mode: 0 = CPU baker (Phase 7), 1 = GPU VTF (Phase 8D). Only used when
-    // enableNearDisplacement is true. Selected via ImGui for A/B comparison.
-    enum DisplacementMode : int { DisplacementModeCPU = 0, DisplacementModeVTF = 1 };
+    // Phase 7/8: Near-camera landscape displacement LOD accessors.
+    // CPU baker only — VTF path was dropped (too slow for the quality it bought).
     static bool GetEnableNearDisplacement() { return enableNearDisplacement; }
-    static int  GetDisplacementMode() { return displacementMode; }
     static float GetDisplacementScale() { return displacementScale; }
+    static float GetDisplacementGamma() { return displacementGamma; }
+    static float GetDisplacementPivot() { return displacementPivot; }
     static float GetHeightBlendStrength() { return heightBlendStrength; }
     static float GetHeightBlendContrast() { return heightBlendContrast; }
     static bool GetDebugHighlightNearPatches() { return debugHighlightNearPatches; }
@@ -371,8 +370,13 @@ private:
 
     // Phase 7/8: Near-camera landscape displacement LOD
     static bool enableNearDisplacement;   // Master toggle for 2x2 near-camera patch displacement
-    static int  displacementMode;         // 0 = CPU baker (Phase 7), 1 = GPU VTF (Phase 8D)
     static float displacementScale;       // World-unit scale applied to _paramh heights (0..64)
+    // Height remap applied in the CPU baker: bake = saturate(pow(h, 1/gamma) / pivot) * scale.
+    // gamma < 1 brightens (weight toward holes); pivot < 1 saturates high values so the
+    // plateau rides at the original Z and only crevices dip into the -scale baseline —
+    // fixes "objects sit on air" when the raw _paramh average is low.
+    static float displacementGamma;
+    static float displacementPivot;
     static float heightBlendStrength;     // Lerp between AlphaGrid and height-biased mask in PS (0..1)
     static float heightBlendContrast;     // Sharpness of the height pick (0..1)
     static bool debugHighlightNearPatches; // Tint the 4 selected near patches yellow for selection QA

@@ -90,6 +90,9 @@ struct PatchCacheEntry {
     // player moves through the inner/outer radii, so we must rebuild when it
     // changes.
     uint8_t subdivTier = 0;
+    // Displacement curve (gamma/pivot) at build time; a slider change forces rebuild.
+    float dispGamma = 1.0f;
+    float dispPivot = 1.0f;
 };
 
 // Patch cache — key is VB+IB identity, value is the latest built patch.
@@ -174,9 +177,17 @@ const HeightMap* getOrDecodeHeight(IDirect3DDevice9* device, IDirect3DBaseTextur
     return r;
 }
 
-// Sample a heightmap with bilinear interpolation, wrapping UVs.
-// Returns [0, 1] * scale (unsigned), matching the plan's convention.
-float sampleHeight(const HeightMap* hm, float u, float v, float scale) {
+// Sample a heightmap with bilinear interpolation, wrapping UVs, and apply the
+// displacement curve. Returns [0, scale] (unsigned).
+//
+//   h01 = bilinear(_paramh.g) / 255
+//   hg  = pow(h01, 1/gamma)        // gamma<1 brightens (weight toward holes)
+//   hp  = saturate(hg / pivot)     // pivot<1 saturates high values so the
+//                                  // plateau rides at the original Z and only
+//                                  // crevices dip into the -scale baseline
+//   out = hp * scale
+float sampleHeight(const HeightMap* hm, float u, float v, float scale,
+                   float gamma, float pivot) {
     if (!hm) return 0.0f;
     // Wrap UV
     u -= floorf(u);
@@ -199,7 +210,10 @@ float sampleHeight(const HeightMap* hm, float u, float v, float scale) {
     auto g = [&](int xi, int yi) { return (float)hm->green[(size_t)yi * hm->width + xi] / 255.0f; };
     float a = g(xa, ya) * (1 - tx) + g(xb, ya) * tx;
     float b = g(xa, yb) * (1 - tx) + g(xb, yb) * tx;
-    return (a * (1 - ty) + b * ty) * scale;
+    float h01 = a * (1 - ty) + b * ty;
+    float hg = powf(std::max(h01, 0.0f), 1.0f / std::max(gamma, 1e-4f));
+    float hp = std::min(1.0f, hg / std::max(pivot, 1e-4f));
+    return hp * scale;
 }
 
 // Locate _paramh for the base color texture via TextureSuffix's existing
@@ -300,7 +314,9 @@ SubdivPatch* getOrBuild(IDirect3DDevice9* device,
                         const FixedFunctionShader::HLSLRecordedCall& call,
                         IDirect3DBaseTexture9* overlayTex,
                         float heightScale,
-                        uint8_t subdivTier)
+                        uint8_t subdivTier,
+                        float dispGamma,
+                        float dispPivot)
 {
     MGE_ZoneScopedN("PatchDisplacement_getOrBuild");
     if (!device || !key.vb || !key.ib) return nullptr;
@@ -319,7 +335,9 @@ SubdivPatch* getOrBuild(IDirect3DDevice9* device,
         && cit->second.overlayTexture == overlayTex
         && cit->second.heightScale == heightScale
         && cit->second.subdivNeighborDirMask == call.subdivNeighborDirMask
-        && cit->second.subdivTier == subdivTier)
+        && cit->second.subdivTier == subdivTier
+        && cit->second.dispGamma == dispGamma
+        && cit->second.dispPivot == dispPivot)
     {
         SubdivPatch* r = cit->second.patch.get();
         ReleaseSRWLockShared(&s_lock);
@@ -387,17 +405,15 @@ SubdivPatch* getOrBuild(IDirect3DDevice9* device,
     const bool rowMaxIsSub = (neighborMask & (1u << rowMaxBit)) != 0;
     const bool rowMinIsSub = (neighborMask & (1u << rowMinBit)) != 0;
 
-    // Output layout: same fields, plus two extra TEXCOORDs.
-    //   TEXCOORD1 (float2) — Phase 7 pre-baked baseH/overlayH (CPU path).
-    //   TEXCOORD2 (float1) — Phase 8D displaceWeight: 0 on perimeter, 1 interior.
-    // Both exist in every VB so CPU<->VTF mode switching never rebuilds the mesh.
+    // Output layout: same fields plus one extra TEXCOORD.
+    //   TEXCOORD1 (float2) — pre-baked baseH/overlayH; perimeter edge-locked verts
+    //   carry 0 so shared edges with non-subdivided neighbors stay crack-free.
     VertexLayout dstLayout = srcLayout;
     UINT heightOff = srcLayout.stride;
-    UINT weightOff = srcLayout.stride + 8;
-    UINT dstStride = srcLayout.stride + 12;
+    UINT dstStride = srcLayout.stride + 8;
     dstLayout.stride = dstStride;
-    DWORD dstFvf = (rs.fvf & ~D3DFVF_TEXCOUNT_MASK) | D3DFVF_TEX3
-                 | D3DFVF_TEXCOORDSIZE1(2);  // TEXCOORD2 is a single float
+    DWORD dstFvf = (rs.fvf & ~D3DFVF_TEXCOUNT_MASK) | D3DFVF_TEX2;
+    // TEXCOORD0 and TEXCOORD1 both use the default size 2.
 
     // Resolve _paramh heights. Base always; overlay only if present.
     // Phase 8.1: base pointer is stamped on the call at prepare time, so the replay
@@ -460,23 +476,18 @@ SubdivPatch* getOrBuild(IDirect3DDevice9* device,
             // every Terrain-bin draw by a flat -scale in world Z, so the final
             // displaced world Z sits between (original - scale) and original.
             // Edge-locked verts bake 0, matching the dropped baseline of non-
-            // subdivided neighbors — crack-free. Peaks (sample=1) reach the
-            // original Z, valleys (sample=0) stay at the drop. Terrain never
-            // pokes above the original mesh so embedded objects (carpets) clear.
+            // subdivided neighbors — crack-free. The gamma/pivot curve in
+            // sampleHeight remaps the sample so the average surface rides near
+            // the original Z and only crevices dip down.
             float baseH = 0.0f, overlayH = 0.0f;
             if (canDisplace) {
                 const float* uv = (const float*)(dstV + dstLayout.uvOffset);
-                baseH    = sampleHeight(baseHM,    uv[0], uv[1], heightScale);
-                overlayH = overlayHM ? sampleHeight(overlayHM, uv[0], uv[1], heightScale) : 0.0f;
+                baseH    = sampleHeight(baseHM,    uv[0], uv[1], heightScale, dispGamma, dispPivot);
+                overlayH = overlayHM ? sampleHeight(overlayHM, uv[0], uv[1], heightScale, dispGamma, dispPivot) : 0.0f;
             }
             float* h = (float*)(dstV + heightOff);
             h[0] = baseH;
             h[1] = overlayH;
-            // displaceWeight = 1 for displacing verts, 0 for edge-locked. VTF
-            // mode multiplies the sampled offset by this; 0 yields no offset,
-            // preserving the source Z exactly for locked verts.
-            float* w = (float*)(dstV + weightOff);
-            w[0] = canDisplace ? 1.0f : 0.0f;
         }
     }
 
@@ -533,6 +544,8 @@ SubdivPatch* getOrBuild(IDirect3DDevice9* device,
     entry.overlayParamH = overlayParamH;
     entry.subdivNeighborDirMask = call.subdivNeighborDirMask;
     entry.subdivTier = subdivTier;
+    entry.dispGamma = dispGamma;
+    entry.dispPivot = dispPivot;
     SubdivPatch* ret = entry.patch.get();
     AcquireSRWLockExclusive(&s_lock);
     s_patchCache[key] = std::move(entry);

@@ -630,8 +630,7 @@ class FixedFunctionShader {
         DWORD useStatelessBatch : 1;   // Uses stateless batching (per-draw data from texture)
         DWORD hasOverlay : 1;          // Has absorbed TerrainBlend overlay (composited via sampler s8)
         DWORD hasOverlayParamH : 1;    // Phase 8A: overlay has its own _paramh (PS blends via sampler s9)
-        DWORD hasDisplacement : 1;     // Near-camera landscape patch uses subdivided VB with pre-baked heights (Phase 7)
-        DWORD useVTFDisplacement : 1;  // Phase 8D: displacement samples _paramh via VS VTF instead of CPU-baked heights
+        DWORD hasDisplacement : 1;     // Near-camera landscape patch uses subdivided VB with pre-baked heights
 
         struct Stage {
             DWORD colorOp : 6;

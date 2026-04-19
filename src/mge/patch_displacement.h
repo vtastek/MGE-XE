@@ -46,7 +46,9 @@ SubdivPatch* getOrBuild(IDirect3DDevice9* device,
                         const FixedFunctionShader::HLSLRecordedCall& call,
                         IDirect3DBaseTexture9* overlayTex,
                         float heightScale,
-                        uint8_t subdivTier);
+                        uint8_t subdivTier,
+                        float dispGamma,
+                        float dispPivot);
 
 // Evict all cached patches. Called from FixedFunctionShader::clearAllCellBatchCaches
 // on cell / interior-exterior transitions, since landscape VBs are reallocated there.

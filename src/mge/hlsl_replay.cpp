@@ -22,7 +22,6 @@
 #include "imgui_manager.h"
 #include "hlsl_shader_manager.h"
 #include "patch_displacement.h"
-#include "paramh_vtf_cache.h"
 
 #include <algorithm>
 #include <cstring>
@@ -3205,50 +3204,13 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                         if (fb.nearPatches[s] == pk) { inSet = true; break; }
                     }
                     if (inSet) {
-                        // Phase 8D: when VTF mode is active, we still rebuild the subdivided
-                        // geometry (CPU path baked heights are no-ops against displaceWeight*0
-                        // VTF path and the VB holds both attributes), but we also need to push
-                        // the VTF heightmap samplers + scale constant before draw.
                         PatchDisplacement::SubdivPatch* sp = PatchDisplacement::getOrBuild(
                             device, pk, call, call.overlayTexture,
                             ImGuiManager::GetDisplacementScale(),
-                            call.subdivTier);
+                            call.subdivTier,
+                            ImGuiManager::GetDisplacementGamma(),
+                            ImGuiManager::GetDisplacementPivot());
                         if (sp) {
-                            if (call.sk.useVTFDisplacement) {
-                                // Phase 8.1: base/overlay _paramh pointers are stamped on
-                                // the call at prepare time (hiz_culling.cpp). Reuse them
-                                // directly; no replay-thread TextureSuffix lookup.
-                                IDirect3DTexture9* baseVTF = nullptr;
-                                IDirect3DTexture9* overlayVTF = nullptr;
-                                if (call.baseParamHTexture) {
-                                    baseVTF = ParamHVTF::getOrBuild(device, call.baseParamHTexture);
-                                }
-                                if (call.overlayParamHTexture) {
-                                    overlayVTF = ParamHVTF::getOrBuild(device, call.overlayParamHTexture);
-                                }
-                                // Bind base to VS s2; overlay to VS s3 when present. Point-filter
-                                // + clamp — R16F linear-filter is not guaranteed for VTF on SM3.
-                                if (baseVTF) {
-                                    device->SetTexture(D3DVERTEXTEXTURESAMPLER2, baseVTF);
-                                    device->SetSamplerState(D3DVERTEXTEXTURESAMPLER2, D3DSAMP_MINFILTER, D3DTEXF_POINT);
-                                    device->SetSamplerState(D3DVERTEXTEXTURESAMPLER2, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
-                                    device->SetSamplerState(D3DVERTEXTEXTURESAMPLER2, D3DSAMP_MIPFILTER, D3DTEXF_POINT);
-                                    device->SetSamplerState(D3DVERTEXTEXTURESAMPLER2, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
-                                    device->SetSamplerState(D3DVERTEXTEXTURESAMPLER2, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
-                                }
-                                if (overlayVTF) {
-                                    device->SetTexture(D3DVERTEXTEXTURESAMPLER3, overlayVTF);
-                                    device->SetSamplerState(D3DVERTEXTEXTURESAMPLER3, D3DSAMP_MINFILTER, D3DTEXF_POINT);
-                                    device->SetSamplerState(D3DVERTEXTEXTURESAMPLER3, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
-                                    device->SetSamplerState(D3DVERTEXTEXTURESAMPLER3, D3DSAMP_MIPFILTER, D3DTEXF_POINT);
-                                    device->SetSamplerState(D3DVERTEXTEXTURESAMPLER3, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
-                                    device->SetSamplerState(D3DVERTEXTEXTURESAMPLER3, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
-                                }
-                                // Push displacement scale (c72) — CPU path bakes scale at build time.
-                                float scale[4] = { ImGuiManager::GetDisplacementScale(), 0, 0, 0 };
-                                device->SetVertexShaderConstantF(72, scale, 1);
-                            }
-
                             // Optional debug tint: yellow emissive so the 4 near patches are
                             // visually obvious and we can confirm selection tracks the camera.
                             FragmentState tintedFrs = call.frs;
@@ -3278,12 +3240,6 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                             rsDisp.shadowWorldViewProj[1] = rsDisp.worldTransforms[0] * DistantLand::s_staging.smViewproj[1];
                             renderMorrowindHLSL_Internal(&rsDisp, &tintedFrs, call.lightrs.get(),
                                                          DIRTY_ALL, (int)i, cmdBuf, &call.deviceState, &call);
-
-                            if (call.sk.useVTFDisplacement) {
-                                // Unbind so VS textures don't leak to neighboring draws.
-                                device->SetTexture(D3DVERTEXTEXTURESAMPLER2, nullptr);
-                                device->SetTexture(D3DVERTEXTEXTURESAMPLER3, nullptr);
-                            }
                             renderedDisplaced = true;
                         }
                     }
