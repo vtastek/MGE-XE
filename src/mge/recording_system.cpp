@@ -340,10 +340,7 @@ void FixedFunctionShader::startRecording() {
 
     // Clear pointer-keyed caches on cell transitions.
     // Morrowind reuses freed VB/IB/texture pointers for different data after cell changes,
-    // so pointer-keyed caches need to drop stale entries. bboxCache and PatchDisplacement
-    // are now evict-on-release (g_onVertexBufferReleased / g_onIndexBufferReleased), so no
-    // bulk clear is needed here — bulk clearing raced D3DLOCK_DONOTWAIT on the first
-    // post-transition frame and produced one-frame flat terrain.
+    // so pointer-keyed caches (bboxCache, textureSuffixResolutionCache, blacklist) return stale data.
     {
         static bool lastWasExterior = false;
         static void* lastPlayerCell = nullptr;
@@ -352,14 +349,23 @@ void FixedFunctionShader::startRecording() {
         void* currentCell = MWBridge::get()->getPlayerCell();
 
         if (isExterior != lastWasExterior) {
-            // Interior ↔ exterior transition: clear caches that aren't evict-on-release.
+            // Interior ↔ exterior transition: clear geometry caches
+            // textureSuffixResolutionCache is now evict-on-release (no bulk clear needed)
+            {
+                std::lock_guard<std::mutex> lock(bboxCacheMutex);
+                bboxCache.clear();
+            }
             softwareOcclusionCuller.clearBlacklist();
             softwareOcclusionCuller.clearMeshCache();
             // Clear cell batch caches - VB pointers may be reused across int/ext boundary
             FixedFunctionShader::clearAllCellBatchCaches();
             lastWasExterior = isExterior;
         } else if (currentCell != lastPlayerCell) {
-            // Exterior-to-exterior / interior-to-interior cell change.
+            // Any cell change (exterior-to-exterior, interior-to-interior): clear geometry caches
+            {
+                std::lock_guard<std::mutex> lock(bboxCacheMutex);
+                bboxCache.clear();
+            }
             softwareOcclusionCuller.clearBlacklist();
             softwareOcclusionCuller.clearMeshCache();
         }

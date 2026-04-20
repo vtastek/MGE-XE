@@ -1362,13 +1362,6 @@ public:
     static void executeGpuPhase(); // GPU render block — called by render thread or inline
     static void replayScene1And2(FrameBuffer* fb);  // Replay Scene 1/2 at UI BeginScene (after recording)
 
-    // Evict stale bboxCache entries when the underlying VB/IB is released by
-    // Morrowind (see g_onVertexBufferReleased wiring in init). Replaces the
-    // cell-change bboxCache.clear() heuristic — release-driven eviction is
-    // race-free against the prepare thread's D3DLOCK_DONOTWAIT path.
-    static void onVertexBufferReleased(IDirect3DVertexBuffer9* vb);
-    static void onIndexBufferReleased(IDirect3DIndexBuffer9* ib);
-
     // Merged batching
     static void buildStatelessBatches(FrameBuffer& fb);  // Build merged batches (per-draw data in texture)
     static void invalidateCellBatchCache(void* cellPtr); // Invalidate cache for specific cell

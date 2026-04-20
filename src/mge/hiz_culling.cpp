@@ -295,28 +295,6 @@ void FixedFunctionShader::clearAllCellBatchCaches() {
     PatchDisplacement::clearAll();
 }
 
-// Evict-on-release for bboxCache. Wired through g_onVertexBufferReleased
-// (proxydx fires when Morrowind releases a VB). Replaces the cell-change
-// bboxCache.clear() heuristic, which raced D3DLOCK_DONOTWAIT on the first
-// frame after a transition and produced one-frame flat terrain.
-void FixedFunctionShader::onVertexBufferReleased(IDirect3DVertexBuffer9* vb) {
-    if (!vb) return;
-    std::lock_guard<std::mutex> lock(bboxCacheMutex);
-    for (auto it = bboxCache.begin(); it != bboxCache.end(); ) {
-        if (it->first.vb == vb) it = bboxCache.erase(it);
-        else                    ++it;
-    }
-}
-
-void FixedFunctionShader::onIndexBufferReleased(IDirect3DIndexBuffer9* ib) {
-    if (!ib) return;
-    std::lock_guard<std::mutex> lock(bboxCacheMutex);
-    for (auto it = bboxCache.begin(); it != bboxCache.end(); ) {
-        if (it->first.ib == ib) it = bboxCache.erase(it);
-        else                    ++it;
-    }
-}
-
 // Evict least recently used cache if over limit.
 // Caller must hold s_cellBatchCacheLock exclusively.
 static void evictLRUCellBatchCacheLocked(const CellBatchCacheKey& protectedKey) {
