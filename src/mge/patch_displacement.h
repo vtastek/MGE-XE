@@ -1,15 +1,23 @@
 // Phase 7: near-camera landscape patch subdivision with pre-baked height offsets.
-// For each selected Terrain patch (5x5 / 32 tris) within the 2x2 camera ring we
-// produce a dense 33x33 / 2048-tri subdivided copy.
+// For each selected Terrain patch (5x5 / 32 tris) within the near-set we produce
+// a dense 65x65 (inner tier) or 33x33 (outer tier) subdivided copy.
 // Each vertex carries two extra floats (baseH, overlayH) decoded once from the
 // _paramh textures of the base and the absorbed overlay (may be null for
 // non-overlay tiles). The VS lerps between them using input.color.a (the same
 // AlphaGrid factor that drives the PS albedo blend), so the silhouette matches
 // the material actually visible on the tile.
 //
-// Perimeter vertices of the 33x33 grid carry 0 on both heights so the rendered
-// boundary sits exactly on the original patch's Z — no cracks with the
-// non-subdivided neighbors that share those edge verts (spec §stride-4).
+// Phase 8.2: perimeter verts facing a non-subdivided neighbor bake 0 on both
+// heights so they meet the dropped -scale baseline and stay crack-free.
+//
+// Phase 8.7: perimeter verts facing a subdivided neighbor read from a coalesced
+// per-frame edge-height map built by coalesceEdgeHeights(). Every near-set tile
+// contributes samples along all 4 of its edges; adjacent tiles contribute at
+// the same quantized world position, and the map averages them. Both sides then
+// read the same value at their shared edge. Intermediate inner-tier verts with
+// no matching outer-tier contributor are linearly interpolated between the two
+// nearest matched positions — this makes inner's edge sit exactly on outer's
+// piecewise-linear segment, eliminating LOD T-junction cracks.
 #pragma once
 
 #include "proxydx/d3d9header.h"
@@ -17,14 +25,15 @@
 
 namespace PatchDisplacement {
 
+using NearPatchEdgeHeights = FixedFunctionShader::NearPatchEdgeHeights;
+
 struct SubdivPatch {
-    IDirect3DVertexBuffer9* vb = nullptr;   // vertCount verts, stride = origStride + 8
-    IDirect3DIndexBuffer9*  ib = nullptr;   // primCount tris, 16-bit
-    UINT stride = 0;                        // origStride + 8
-    DWORD fvf = 0;                          // origFvf | D3DFVF_TEX2 (heights on TEXCOORD1)
-    UINT vertCount = 0;                     // dst grid verts (1089 for 33x33)
-    UINT primCount = 0;                     // dst grid tris  (2048 for 33x33)
-    // For invalidation — if the overlay texture pointer flips we rebuild.
+    IDirect3DVertexBuffer9* vb = nullptr;
+    IDirect3DIndexBuffer9*  ib = nullptr;
+    UINT stride = 0;
+    DWORD fvf = 0;
+    UINT vertCount = 0;
+    UINT primCount = 0;
     IDirect3DBaseTexture9* overlayTexture = nullptr;
 
     ~SubdivPatch();
@@ -33,14 +42,28 @@ struct SubdivPatch {
     SubdivPatch& operator=(const SubdivPatch&) = delete;
 };
 
+// Phase 8.7: per-frame edge-height coalescing pass. Iterates every near-set
+// Terrain call in `calls`, locks its source VB, samples per-edge heights at the
+// tile's own density (inner 65 / outer 33), and accumulates into `outMap` keyed
+// by quantized world (X, Y). After accumulation the map is normalized so each
+// entry's avgBase/avgOverlay is the average across distinct contributing tiles.
+//
+// Must be called once per frame on the render thread BEFORE any getOrBuild,
+// because getOrBuild reads this map to resolve shared-edge heights. Safe to
+// re-enter across scenes since the map is cleared at the start.
+void coalesceEdgeHeights(IDirect3DDevice9* device,
+                         NearPatchEdgeHeights& outMap,
+                         const std::vector<FixedFunctionShader::HLSLRecordedCall>& calls,
+                         float heightScale,
+                         float dispGamma,
+                         float dispPivot);
+
 // Build or return a cached subdivided near patch for `call`. Returns nullptr if
 // the source VB/IB can't be locked this frame (retry next frame) or the patch
 // geometry isn't a stride-4 5x5 grid.
 //
-// overlayTex may be null (non-overlay patch). Passing a different overlayTex
-// than the cached entry invalidates and rebuilds.
-//
-// Thread: render/replay thread only (locks the device VB/IB).
+// `edgeHeights` is the coalesced edge map produced by coalesceEdgeHeights for
+// this frame; may be nullptr for diagnostic paths but normally required.
 SubdivPatch* getOrBuild(IDirect3DDevice9* device,
                         const FixedFunctionShader::TerrainPatchKey& key,
                         const FixedFunctionShader::HLSLRecordedCall& call,
@@ -48,17 +71,12 @@ SubdivPatch* getOrBuild(IDirect3DDevice9* device,
                         float heightScale,
                         uint8_t subdivTier,
                         float dispGamma,
-                        float dispPivot);
+                        float dispPivot,
+                        const NearPatchEdgeHeights* edgeHeights);
 
-// Evict all cached patches. Called from FixedFunctionShader::clearAllCellBatchCaches
-// on cell / interior-exterior transitions, since landscape VBs are reallocated there.
 void clearAll();
-
-// Evict a single entry when its source VB/IB is being released.
 void onVertexBufferReleased(IDirect3DVertexBuffer9* vb);
 void onIndexBufferReleased(IDirect3DIndexBuffer9* ib);
-
-// Evict _paramh height caches when a texture is released.
 void onTextureReleased(IDirect3DBaseTexture9* tex);
 
 } // namespace PatchDisplacement

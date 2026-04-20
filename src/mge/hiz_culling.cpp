@@ -1221,7 +1221,13 @@ void FixedFunctionShader::prepareRecordedCalls() {
                     // Phase 8.2/8.4: compute which of our 4 cardinal neighbors are also in
                     // the subdivided near-set (either tier). Edges facing a subdivided
                     // neighbor displace; edges facing non-subdivided stay edge-locked.
-                    uint8_t mask = 0;
+                    // Phase 8.7: accumulate edgeContextHash from each near-set neighbor's
+                    // (baseParamH, overlayParamH) pair. This is the cache-invalidation
+                    // key for the coalesced edge map — when any neighbor's textures
+                    // change, the averaged edge heights change, and the cached subdiv
+                    // patch must rebuild.
+                    uint8_t  mask    = 0;
+                    uint32_t ctxHash = 0;
                     if (c.hasBoundingBox) {
                         const float eps = 1.0f;  // one world unit slack on bbox-edge match
                         for (int j = 0; j < total; ++j) {
@@ -1233,13 +1239,22 @@ void FixedFunctionShader::prepareRecordedCalls() {
                                            || o.bboxMin.y > c.bboxMax.y + eps);
                             bool xOverlap = !(o.bboxMax.x < c.bboxMin.x - eps
                                            || o.bboxMin.x > c.bboxMax.x + eps);
-                            if (yOverlap && fabsf(o.bboxMin.x - c.bboxMax.x) < eps) mask |= (1u << 0);  // +X
-                            if (yOverlap && fabsf(o.bboxMax.x - c.bboxMin.x) < eps) mask |= (1u << 1);  // -X
-                            if (xOverlap && fabsf(o.bboxMin.y - c.bboxMax.y) < eps) mask |= (1u << 2);  // +Y
-                            if (xOverlap && fabsf(o.bboxMax.y - c.bboxMin.y) < eps) mask |= (1u << 3);  // -Y
+                            uint8_t dirBit = 0xFF;
+                            if      (yOverlap && fabsf(o.bboxMin.x - c.bboxMax.x) < eps) dirBit = 0;  // +X
+                            else if (yOverlap && fabsf(o.bboxMax.x - c.bboxMin.x) < eps) dirBit = 1;  // -X
+                            else if (xOverlap && fabsf(o.bboxMin.y - c.bboxMax.y) < eps) dirBit = 2;  // +Y
+                            else if (xOverlap && fabsf(o.bboxMax.y - c.bboxMin.y) < eps) dirBit = 3;  // -Y
+                            if (dirBit == 0xFF) continue;
+                            mask |= (uint8_t)(1u << dirBit);
+                            const uint32_t bh = (uint32_t)(uintptr_t)o.baseParamHTexture;
+                            const uint32_t oh = (uint32_t)(uintptr_t)o.overlayParamHTexture;
+                            const uint32_t dh = bh * 0x9E3779B1u + oh * 0x85EBCA77u
+                                              + ((uint32_t)dirBit << 16);
+                            ctxHash ^= dh;
                         }
                     }
                     c.subdivNeighborDirMask = mask;
+                    c.edgeContextHash       = ctxHash;
                 }
                 fb.nearPatchCount = (uint32_t)total;
             }

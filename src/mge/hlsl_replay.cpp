@@ -3010,6 +3010,21 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
 
     MGE_ZoneScopedN("replay_MainLoop");
 
+    // Phase 8.7: coalesce per-frame near-patch edge heights once per frame
+    // (Scene 0 only). Each near-set Terrain tile samples its own edges at tier
+    // density and accumulates averaged (base, overlay) heights keyed by
+    // quantized world (X, Y). Subsequent getOrBuild calls read this map so both
+    // sides of any shared edge bake identical heights — kills T-junction cracks
+    // at inner↔outer tier boundaries and seams at texture discontinuities.
+    if (sceneCount == 0 && fb.nearPatchCount > 0) {
+        MGE_ZoneScopedN("replay_CoalesceEdgeHeights");
+        PatchDisplacement::coalesceEdgeHeights(
+            device, fb.nearPatchEdgeHeights, recCalls,
+            ImGuiManager::GetDisplacementScale(),
+            ImGuiManager::GetDisplacementGamma(),
+            ImGuiManager::GetDisplacementPivot());
+    }
+
     // Phase 8.4: push displacement falloff (c73) once per replay invocation.
     // XY = (R_outer, R_inner), ZW = world-space camera XY. VS samples this only
     // under HAS_DISPLACEMENT, so pushing unconditionally is safe; non-displaced
@@ -3209,7 +3224,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                             ImGuiManager::GetDisplacementScale(),
                             call.subdivTier,
                             ImGuiManager::GetDisplacementGamma(),
-                            ImGuiManager::GetDisplacementPivot());
+                            ImGuiManager::GetDisplacementPivot(),
+                            &fb.nearPatchEdgeHeights);
                         if (sp) {
                             // Optional debug tint: yellow emissive so the 4 near patches are
                             // visually obvious and we can confirm selection tracks the camera.

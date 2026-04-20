@@ -1081,6 +1081,13 @@ public:
         // Unused when hasDisplacement == 0.
         uint8_t subdivTier = 0;
 
+        // Phase 8.7: hash of this tile's neighbor-paramh context used for edge
+        // coalescing. Captures every near-set neighbor's (baseParamH, overlayParamH)
+        // pair on directions present in subdivNeighborDirMask. When any neighbor's
+        // textures change, this hash flips and the cached subdiv patch rebuilds
+        // so its baked edge heights match the new coalesced map.
+        uint32_t edgeContextHash = 0;
+
         // True on a TerrainBlend call whose texture has been absorbed by its paired Terrain
         // base. Absorbed calls must not be drawn in the main replay or batch-build paths.
         bool absorbed = false;
@@ -1112,6 +1119,32 @@ public:
             return h;
         }
     };
+
+    // Phase 8.7: edge-height coalescing map. Keyed on quantized world XY (1-unit
+    // grid). First-write-wins: the first near-set tile to contribute at a world
+    // position stores its locally-sampled (base, overlay) pair; subsequent tiles
+    // only bump `count` for matched-position detection and leave the stored
+    // value untouched. Both sides of any shared edge therefore read the EXACT
+    // same number — no averaging, no half-step, no seam.
+    struct EdgeHeightKey {
+        int32_t wx = 0;
+        int32_t wy = 0;
+        bool operator==(const EdgeHeightKey& o) const noexcept { return wx == o.wx && wy == o.wy; }
+    };
+    struct EdgeHeightKeyHash {
+        size_t operator()(const EdgeHeightKey& k) const noexcept {
+            uint64_t h = (uint64_t)(uint32_t)k.wx * 0x9E3779B97F4A7C15ull
+                       ^ (uint64_t)(uint32_t)k.wy;
+            h ^= h >> 33; h *= 0xff51afd7ed558ccdULL; h ^= h >> 33;
+            return (size_t)h;
+        }
+    };
+    struct EdgeHeightValue {
+        uint16_t count = 0;       // distinct contributing tiles
+        float avgBase = 0.0f;     // first-write value (name kept for caller symmetry)
+        float avgOverlay = 0.0f;
+    };
+    using NearPatchEdgeHeights = std::unordered_map<EdgeHeightKey, EdgeHeightValue, EdgeHeightKeyHash>;
 
     // Buffer lifecycle states for triple-buffered pipeline
     enum class BufferState {
@@ -1205,6 +1238,12 @@ public:
         std::array<TerrainPatchKey, 32> nearPatches{};
         uint32_t nearPatchCount = 0;
 
+        // Phase 8.7: per-frame coalesced edge heights for the near set. Filled
+        // by PatchDisplacement::coalesceEdgeHeights on the render thread before
+        // any subdiv patch is baked; read inside getOrBuild to resolve shared
+        // edges consistently on every adjacent tile.
+        NearPatchEdgeHeights nearPatchEdgeHeights;
+
         // Cell batch cache references (set by buildStatelessBatches on cache hit)
         void* cellBatchCacheKey = nullptr;                // Cell pointer the merged batches belong to
         size_t cellBatchLayoutHash = 0;                    // Layout hash within the cell batch cache
@@ -1252,6 +1291,7 @@ public:
             cachedDrawInfos.clear();
             for (auto& k : nearPatches) k = TerrainPatchKey{};
             nearPatchCount = 0;
+            nearPatchEdgeHeights.clear();
             valid = false;
             // Initialize matrices to identity to prevent garbage if capture functions aren't called
             D3DXMatrixIdentity(&view);
