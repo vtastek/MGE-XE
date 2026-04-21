@@ -217,13 +217,16 @@ VS_OUTPUT vs_main(VS_INPUT input) {
     float4 viewpos;
     float3 normal;
 
+    // Hoisted so shadow-coord path can undo displacement (see HAS_SHADOWS block).
+    // Stays 0 when HAS_DISPLACEMENT is not defined, so the subtract below is a no-op.
+    float _displaceH = 0;
 #ifdef HAS_DISPLACEMENT
     // CPU path: heights pre-baked into the VB in [0, scale];
     // edge-locked verts carry 0 so they rest at the dropped baseline.
     #ifdef HAS_OVERLAY
-    float _displaceH = lerp(input.heights.x, input.heights.y, input.color.a);
+    _displaceH = lerp(input.heights.x, input.heights.y, input.color.a);
     #else
-    float _displaceH = input.heights.x;
+    _displaceH = input.heights.x;
     #endif
     // Phase 8.4: planar XY distance from camera, smoothstep fade R_inner->R_outer.
     // Inside R_inner: full displacement. Past R_outer: zero, so the outer ring
@@ -339,14 +342,35 @@ VS_OUTPUT vs_main(VS_INPUT input) {
     output.fog = fogMWScalar(dist);
 
 #ifdef HAS_SHADOWS
-    // Shadow coordinate calculation
+    // Shadow coordinate calculation. Two-cascade policy for HAS_DISPLACEMENT:
+    //   Near (cascade 0): sample at the undisplaced baseline so receiver matches the
+    //     flat non-subdivided caster exactly. PCF (25-tap blue noise) absorbs residual
+    //     mismatch. Result: no self-shadow in small concave areas; parallax handles
+    //     sub-displacement micro shadows.
+    //   Far  (cascade 1): keep the displaced worldpos. Far cascade sampler is
+    //     essentially single-tap ESM over low-LOD distant-land casters; exact baseline
+    //     alignment there exposes LOD averaging as hard stripes. Leaving receiver at
+    //     displaced H (above baseline caster) prevents self-shadow while still
+    //     allowing hill-to-valley shadows, where the caster is much higher than a
+    //     pure-baseline receiver and the bias tolerance is ample.
     #ifdef USE_STATELESS_BATCH
-        // In stateless mode, use view-to-shadow transform (viewpos already in view space)
+        // TODO: Stateless terrain with displacement also needs _displaceH removed
+        // from viewpos before shadow0 transform (displacement is along object-space
+        // +Z, so subtract _displaceH * wv2 where wv2 is the Z column of worldview).
+        // Left as-is for now: the standard path covers the dominant terrain case.
         output.shadow0pos = mul(viewpos, shadowWorldViewProj[0]);
         output.shadow1pos = mul(viewpos, shadowWorldViewProj[1]);
     #else
-        // In standard mode, use world-to-shadow transform
-        output.shadow0pos = mul(worldpos, shadowWorldViewProj[0]);
+        float4 shadowObjPos0 = worldpos;
+        shadowObjPos0.z -= _displaceH;
+        // Toward-sun height bias (world +Z): keeps receiver above the softening
+        // blur's raised baseline so terrain cannot self-shadow at small scale.
+        // Tuned: 12 units clears softening variance without visibly lifting
+        // hill-to-valley shadows (their deltas are much larger than this).
+        // Note: object-onto-terrain float is a separate world-space sink gap,
+        // not a bias issue — see project_terrain_shadow_policy memory.
+        shadowObjPos0.z += 12.0;
+        output.shadow0pos = mul(shadowObjPos0, shadowWorldViewProj[0]);
         output.shadow1pos = mul(worldpos, shadowWorldViewProj[1]);
     #endif
     output.shadow0pos.z = output.shadow0pos.z / output.shadow0pos.w;

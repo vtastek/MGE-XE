@@ -1738,6 +1738,8 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
                 hr = device->SetIndices(fbStaging.particleStagingIB);
                 if (FAILED(hr)) {
                     LOG::logline("!! HLSL pipeline: failed to set staging index buffer, hr=%x", hr);
+                    device->SetRenderState(D3DRS_DEPTHBIAS, 0);
+                    device->SetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, 0);
                     return;
                 }
                 // For staging buffer: baseIndex=0 (data is isolated), startIndex=offset into staging IB
@@ -1746,6 +1748,8 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
                 hr = device->SetIndices(rs->ib);
                 if (FAILED(hr)) {
                     LOG::logline("!! HLSL pipeline: failed to set index buffer, hr=%x", hr);
+                    device->SetRenderState(D3DRS_DEPTHBIAS, 0);
+                    device->SetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, 0);
                     return;
                 }
                 device->DrawIndexedPrimitive(rs->primType, rs->baseIndex, rs->minIndex, rs->vertCount, rs->startIndex, rs->primCount);
