@@ -14,13 +14,13 @@ bool ImGuiManager::showHiZInterface = false;
 HWND ImGuiManager::windowHandle = nullptr;
 
 // PCF filtering variables
-float ImGuiManager::pcfFilterSize = 3.0f;        // Base filter size in texels
-float ImGuiManager::pcfPenumbraScale = 1.0f;     // Scale factor for distance-based penumbra
-float ImGuiManager::pcfMinPenumbra = 2.0f;       // Minimum penumbra size
-float ImGuiManager::pcfMaxPenumbra = 5.0f;       // Maximum penumbra size
-float ImGuiManager::pcfBias = 0.0015f;           // Depth bias to prevent acne
-float ImGuiManager::pcfBias2 = 0.0045f;          // Second depth bias for lerp
-float ImGuiManager::pcfSlopeBias = 0.001f;       // Slope-based bias to prevent acne on angled surfaces
+float ImGuiManager::pcfFilterSize = 4.6f;        // Base filter size in texels
+float ImGuiManager::pcfPenumbraScale = 1.47f;    // Scale factor for distance-based penumbra
+float ImGuiManager::pcfMinPenumbra = 3.3f;       // Minimum penumbra size
+float ImGuiManager::pcfMaxPenumbra = 3.7f;       // Maximum penumbra size
+float ImGuiManager::pcfBias = 0.0037f;           // Depth bias to prevent acne
+float ImGuiManager::pcfBias2 = 0.0037f;          // Second depth bias for lerp
+float ImGuiManager::pcfSlopeBias = 0.0061f;      // Slope-based bias to prevent acne on angled surfaces
 
 // Debug interface controls
 int ImGuiManager::bboxVisualizationMode = 0;
