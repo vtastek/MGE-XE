@@ -246,6 +246,7 @@ bool DistantLand::init() {
         return true;
     }
     if (!device) {
+        LOG::logline("!! DistantLand::init aborted: device is null");
         return false;
     }
 
@@ -264,14 +265,17 @@ bool DistantLand::init() {
     
 
     if (Configuration.UseSharedMemory && !initIpc()) {
+        LOG::logline("!! DistantLand::init failed at initIpc");
         return false;
     }
 
     if (!initShader()) {
+        LOG::logline("!! DistantLand::init failed at initShader");
         return false;
     }
 
     if (!FixedFunctionShader::init(device, effectPool)) {
+        LOG::logline("!! DistantLand::init failed at FixedFunctionShader::init");
         return false;
     }
     
@@ -285,34 +289,44 @@ bool DistantLand::init() {
     PostShaders::startPriorityShaderLoading();
 
     if (!PostShaders::init(device)) {
+        LOG::logline("!! DistantLand::init failed at PostShaders::init");
         return false;
     }
 
     if (!initDepth()) {
+        LOG::logline("!! DistantLand::init failed at initDepth");
         return false;
     }
 
-    if (!initHiZ()) {
-        return false;
-    }
+    // GPU Hi-Z pyramid is dormant — generateHiZMipsGPU() is disabled and CPU culling
+    // (executeHiZCulling) builds its own pyramid. Skip init to avoid the shader-load failure.
+    // if (!initHiZ()) {
+    //     LOG::logline("!! DistantLand::init failed at initHiZ");
+    //     return false;
+    // }
 
     if (!initShadow()) {
+        LOG::logline("!! DistantLand::init failed at initShadow");
         return false;
     }
 
     if (!initWater()) {
+        LOG::logline("!! DistantLand::init failed at initWater");
         return false;
     }
 
     if (!initLandscape()) {
+        LOG::logline("!! DistantLand::init failed at initLandscape");
         return false;
     }
 
     if (!initDistantStaticsClient()) {
+        LOG::logline("!! DistantLand::init failed at initDistantStaticsClient");
         return false;
     }
 
     if (!initGrass()) {
+        LOG::logline("!! DistantLand::init failed at initGrass");
         return false;
     }
 
@@ -355,12 +369,14 @@ bool DistantLand::initIpc() {
     }
 
     if (!ipcClient.startServer("mgeHost64.exe")) {
+        LOG::logline("!! initIpc failed: ipcClient.startServer(\"mgeHost64.exe\") returned false");
         return false;
     }
 
     // allocate shared vectors that will be reused for the duration of the program
     auto maybeLandVec = ipcClient.allocVecBlocking<RenderMesh>(1, 200000, 1);
     if (!maybeLandVec.has_value()) {
+        LOG::logline("!! initIpc failed: allocVecBlocking for land vector returned empty");
         return false;
     }
     auto& landVec = maybeLandVec.value();
@@ -369,6 +385,7 @@ bool DistantLand::initIpc() {
 
     auto maybeDistantVec = ipcClient.allocVecBlocking<RenderMesh>(1, 200000, 1);
     if (!maybeDistantVec.has_value()) {
+        LOG::logline("!! initIpc failed: allocVecBlocking for distant vector returned empty");
         return false;
     }
     auto& distantVec = maybeDistantVec.value();
@@ -380,6 +397,7 @@ bool DistantLand::initIpc() {
     // rendering grass.
     auto maybeGrassVec = ipcClient.allocVecBlocking<RenderMesh>(MaxGrassElements, MaxGrassElements, MaxGrassElements);
     if (!maybeGrassVec.has_value()) {
+        LOG::logline("!! initIpc failed: allocVecBlocking for grass vector returned empty");
         return false;
     }
     auto& grassVec = maybeGrassVec.value();
@@ -388,6 +406,7 @@ bool DistantLand::initIpc() {
 
     auto maybeExtraVec = ipcClient.allocVecBlocking<RenderMesh>(1, 200000, 1);
     if (!maybeExtraVec.has_value()) {
+        LOG::logline("!! initIpc failed: allocVecBlocking for extra vector returned empty");
         return false;
     }
     auto& extraVec = maybeExtraVec.value();
@@ -396,6 +415,7 @@ bool DistantLand::initIpc() {
 
     auto maybeDynVisVec = ipcClient.allocVecBlocking<IPC::DynVisFlag>(1, 1000, 1);
     if (!maybeDynVisVec.has_value()) {
+        LOG::logline("!! initIpc failed: allocVecBlocking for dynVis vector returned empty");
         return false;
     }
     auto& dynVisVec = maybeDynVisVec.value();
