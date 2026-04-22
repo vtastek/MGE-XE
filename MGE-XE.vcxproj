@@ -65,7 +65,7 @@
       <WarningLevel>Level3</WarningLevel>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <Optimization>Disabled</Optimization>
-      <AdditionalIncludeDirectories>./src;./src\imgui;./src\imgui/backends;./src\tracy;./3rdparty/meshoptimizer/src</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>./src;./src\imgui;./src\imgui/backends;./3rdparty\tracy\public;./3rdparty/meshoptimizer/src</AdditionalIncludeDirectories>
       <EnableEnhancedInstructionSet>StreamingSIMDExtensions2</EnableEnhancedInstructionSet>
       <FloatingPointModel>Fast</FloatingPointModel>
       <EnforceTypeConversionRules>true</EnforceTypeConversionRules>
@@ -91,7 +91,7 @@
       <Optimization>MaxSpeed</Optimization>
       <EnableEnhancedInstructionSet>StreamingSIMDExtensions2</EnableEnhancedInstructionSet>
       <FloatingPointModel>Fast</FloatingPointModel>
-      <AdditionalIncludeDirectories>./src;./src\imgui;./src\imgui/backends;./src\tracy;./3rdparty/meshoptimizer/src</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>./src;./src\imgui;./src\imgui/backends;./3rdparty\tracy\public;./3rdparty/meshoptimizer/src</AdditionalIncludeDirectories>
       <EnforceTypeConversionRules>true</EnforceTypeConversionRules>
       <RuntimeTypeInfo>false</RuntimeTypeInfo>
       <LanguageStandard>stdcpp17</LanguageStandard>
@@ -191,7 +191,7 @@
     <ClCompile Include="src\imgui\imgui_widgets.cpp" />
     <ClCompile Include="src\imgui\backends\imgui_impl_dx9.cpp" />
     <ClCompile Include="src\imgui\backends\imgui_impl_win32.cpp" />
-    <ClCompile Include="src\tracy\TracyClient.cpp" />
+    <ClCompile Include="3rdparty\tracy\public\TracyClient.cpp" />
     <ClCompile Include="3rdparty\meshoptimizer\src\simplifier.cpp" />
     <ClCompile Include="3rdparty\meshoptimizer\src\clusterizer.cpp" />
     <ClCompile Include="3rdparty\meshoptimizer\src\vcacheoptimizer.cpp" />
