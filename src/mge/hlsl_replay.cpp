@@ -47,9 +47,6 @@ static int hlslDiagFrameCounter = 0;
 // Replay metrics for material sorting optimization analysis
 ReplayMetrics g_replayMetrics = {};
 
-// Cache for texture resolutions to avoid repeated GetLevelDesc calls
-static std::unordered_map<IDirect3DTexture9*, D3DXVECTOR2> textureResolutionCache;
-
 // Sampler state cache for recording (duplicated from ffeshader.cpp for HLSLRecordedCall ctor)
 static std::unordered_map<IDirect3DBaseTexture9*, std::pair<DWORD, DWORD>> samplerCache;
 
@@ -345,12 +342,20 @@ void FixedFunctionShader::bindShaderTextures(const ShaderKey& sk, const Rendered
                         if (shouldLog && (sk.hasParamH || sk.hasParamX)) bindLogCount++;
                     }
                 } else if (sk.hasParamH || sk.hasParamX) {
-                    // No variants data but shader expects suffix textures - bind defaults
+                    // Same resolved name as the previous bind but a new base pointer
+                    // (Morrowind reuses resource pointers across draws). The suffix
+                    // textures loaded for this name are still the right content, so
+                    // re-bind from bindState. Only fall back to defaults when no
+                    // real suffix was ever loaded for this name — binding the
+                    // default here unconditionally stomps the paramH slot on every
+                    // pointer-churned draw and flattens height mapping on the tile.
                     if (sk.hasParamH) {
-                        setCachedTextureWithSamplerPreservation(device, 2, defaultParamHTexture);
+                        setCachedTextureWithSamplerPreservation(device, 2,
+                            bindState.boundParamH ? bindState.boundParamH : defaultParamHTexture);
                     }
                     if (sk.hasParamX) {
-                        setCachedTextureWithSamplerPreservation(device, 3, defaultNormalTexture);
+                        setCachedTextureWithSamplerPreservation(device, 3,
+                            bindState.boundParamX ? bindState.boundParamX : defaultNormalTexture);
                     }
                 }
                 bindState.lastBaseTexture = rs->texture;
@@ -1490,29 +1495,13 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             cmdBuf->recordSetPSConstantF(hlslShader.regAlphaRef.reg, v, 1);
         }
 
-        // Normres for paramH textures
+        // Normres for paramH textures — read dims the suffix cache captured at load.
+        // Reading slot 2 via GetTexture is unreliable: bindShaderTextures skips rebinding
+        // when rs->texture is unchanged, so slot 2 can carry a foreign texture across draws.
         if (sk.hasParamH && hlslShader.regNormres.reg != REG_INVALID) {
-            IDirect3DBaseTexture9* normalTexture;
-            device->GetTexture(2, &normalTexture);
-            if (normalTexture && normalTexture->GetType() == D3DRTYPE_TEXTURE) {
-                IDirect3DTexture9* tex = static_cast<IDirect3DTexture9*>(normalTexture);
-                D3DXVECTOR2 normres;
-                auto cacheIt = textureResolutionCache.find(tex);
-                if (cacheIt != textureResolutionCache.end()) {
-                    normres = cacheIt->second;
-                } else {
-                    D3DSURFACE_DESC desc;
-                    if (SUCCEEDED(tex->GetLevelDesc(0, &desc))) {
-                        normres = D3DXVECTOR2((float)desc.Width, (float)desc.Height);
-                        textureResolutionCache[tex] = normres;
-                    } else {
-                        normres = D3DXVECTOR2(1.0f, 1.0f);
-                    }
-                }
-                float v[4] = { normres.x, normres.y, 0, 0 };
-                cmdBuf->recordSetPSConstantF(hlslShader.regNormres.reg, v, 1);
-                normalTexture->Release();
-            }
+            const auto* r = TextureSuffix::getCachedResolution(rs->texture);
+            float v[4] = { r ? r->paramHWidth : 0.0f, r ? r->paramHHeight : 0.0f, 0.0f, 0.0f };
+            cmdBuf->recordSetPSConstantF(hlslShader.regNormres.reg, v, 1);
         }
     } else if (hlslShader.psConstantTable) {
         // Device path: use constant tables (SetMatrix transposes internally)
@@ -1652,27 +1641,10 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         if (hAlphaRef) hlslShader.psConstantTable->SetFloat(device, hAlphaRef, rs->alphaRef / 255.0f);
 
         if (sk.hasParamH) {
-            IDirect3DBaseTexture9* normalTexture;
-            device->GetTexture(2, &normalTexture);
-            if (normalTexture && normalTexture->GetType() == D3DRTYPE_TEXTURE) {
-                IDirect3DTexture9* tex = static_cast<IDirect3DTexture9*>(normalTexture);
-                D3DXVECTOR2 normres;
-                auto cacheIt = textureResolutionCache.find(tex);
-                if (cacheIt != textureResolutionCache.end()) {
-                    normres = cacheIt->second;
-                } else {
-                    D3DSURFACE_DESC desc;
-                    if (SUCCEEDED(tex->GetLevelDesc(0, &desc))) {
-                        normres = D3DXVECTOR2((float)desc.Width, (float)desc.Height);
-                        textureResolutionCache[tex] = normres;
-                    } else {
-                        normres = D3DXVECTOR2(1.0f, 1.0f);
-                    }
-                }
-                D3DXHANDLE hNormres = hlslShader.psConstantTable->GetConstantByName(NULL, "normres");
-                if (hNormres) hlslShader.psConstantTable->SetFloatArray(device, hNormres, (float*)&normres, 2);
-                normalTexture->Release();
-            }
+            const auto* r = TextureSuffix::getCachedResolution(rs->texture);
+            float v[2] = { r ? r->paramHWidth : 0.0f, r ? r->paramHHeight : 0.0f };
+            D3DXHANDLE hNormres = hlslShader.psConstantTable->GetConstantByName(NULL, "normres");
+            if (hNormres) hlslShader.psConstantTable->SetFloatArray(device, hNormres, v, 2);
         }
         } catch (...) {
             LOG::logline("!! HLSL Pixel shader constant table access failed");

@@ -249,7 +249,9 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 		float2 useNormres = tex2Dlod(sampDrawData, float4(8.5 * texelW, drawV, 0, 0)).xy;
 		float2 texel = 1.0 / max(useNormres, 1.0);
 #else
-		float2 texel = 1.0 / normres;
+		// max() guards against a 0 or stale constant reaching this path — a 0 normres
+		// would produce INF texel offsets and blow up the gradient sample.
+		float2 texel = 1.0 / max(normres, 1.0);
 #endif
 		float hL = tex2D(sampTex2, parallaxUV + float2(-texel.x * deriv, 0)).g; // Green = height
 		float hR = tex2D(sampTex2, parallaxUV + float2(texel.x * deriv, 0)).g;
@@ -636,6 +638,29 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 			b = 1;
 			#endif
 			debugColor = float3(r, g, b);
+		}
+		else if (debugMode == 16) {
+			// Normres (paramH dims) — log2 mapping: 512→0.25, 1024→0.5, 2048→0.75, 4096→1.0
+			// Blue flag if HAS_PARAMH isn't even defined for this variant.
+			#if defined(HAS_PARAMH)
+			#ifdef USE_STATELESS_BATCH
+			float nr = tex2Dlod(sampDrawData, float4(8.5 * texelW, drawV, 0, 0)).x;
+			#else
+			float nr = normres.x;
+			#endif
+			float vis = saturate((log2(max(nr, 1.0)) - 8.0) / 4.0);
+			debugColor = vis.xxx;
+			#else
+			debugColor = float3(0, 0, 1);
+			#endif
+		}
+		else if (debugMode == 17) {
+			// Height (paramH green channel). Blue = no paramH in this variant.
+			#if defined(HAS_PARAMH)
+			debugColor = tex2D(sampTex2, parallaxUV).ggg;
+			#else
+			debugColor = float3(0, 0, 1);
+			#endif
 		}
 
 		c.rgb = debugColor;

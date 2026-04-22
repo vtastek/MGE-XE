@@ -23,8 +23,10 @@ struct ResolutionCache {
     std::string textureName;
     bool hasValidName;
     const BSA::TextureSuffixVariants* variants;
+    float paramHWidth;   // paramH texture dims in texels; 0 if no paramH variant / not yet resolved
+    float paramHHeight;
 
-    ResolutionCache() : hasValidName(false), variants(nullptr) {}
+    ResolutionCache() : hasValidName(false), variants(nullptr), paramHWidth(0.0f), paramHHeight(0.0f) {}
 };
 
 // Suffix texture binding state (for caching bound textures)

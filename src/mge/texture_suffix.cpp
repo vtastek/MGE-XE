@@ -48,7 +48,14 @@ void warmCache(IDirect3DDevice9* device, IDirect3DTexture9* texture) {
                 BSA::loadSuffixTexture(device, *entry.variants, "diffparam");
             }
             if (entry.variants->hasParamH()) {
-                BSA::loadSuffixTexture(device, *entry.variants, "paramh");
+                IDirect3DTexture9* ph = BSA::loadSuffixTexture(device, *entry.variants, "paramh");
+                if (ph) {
+                    D3DSURFACE_DESC d;
+                    if (SUCCEEDED(ph->GetLevelDesc(0, &d))) {
+                        entry.paramHWidth = (float)d.Width;
+                        entry.paramHHeight = (float)d.Height;
+                    }
+                }
             }
             if (entry.variants->hasParamX()) {
                 BSA::loadSuffixTexture(device, *entry.variants, "paramx");
@@ -140,6 +147,19 @@ const ResolutionCache* getOrCreateResolution(IDirect3DDevice9* device, IDirect3D
         entry.textureName = *textureName;
         entry.hasValidName = true;
         entry.variants = BSA::getTextureSuffixVariants(textureName->c_str());
+
+        // Mirror warmCache's paramH dim capture so paths that bypass warmCache
+        // (e.g. device-call-allowed prepare lookups) still carry normres data.
+        if (entry.variants && entry.variants->hasParamH()) {
+            IDirect3DTexture9* ph = BSA::loadSuffixTexture(device, *entry.variants, "paramh");
+            if (ph) {
+                D3DSURFACE_DESC d;
+                if (SUCCEEDED(ph->GetLevelDesc(0, &d))) {
+                    entry.paramHWidth = (float)d.Width;
+                    entry.paramHHeight = (float)d.Height;
+                }
+            }
+        }
     } else {
         entry.hasValidName = false;
         entry.variants = nullptr;

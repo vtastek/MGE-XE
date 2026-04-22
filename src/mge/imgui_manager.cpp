@@ -450,9 +450,11 @@ void ImGuiManager::RenderDebugInterface() {
             "12: Material Mode (R=1,G=2,B=3)",
             "13: Light Mode (gray/orange/yellow/white)",
             "14: Batch Mode (green=batched,red=not)",
-            "15: Texture Slots (R=detail,G=paramh,B=shadow)"
+            "15: Texture Slots (R=detail,G=paramh,B=shadow)",
+            "16: Normres (512=.25 1024=.5 2048=.75 4096=1.0, blue=no paramH)",
+            "17: Height (paramH.g, blue=no paramH)"
         };
-        ImGui::Combo("Shader Debug View", &shaderDebugMode, debugModes, 16);
+        ImGui::Combo("Shader Debug View", &shaderDebugMode, debugModes, 18);
         ImGui::SetItemTooltip("Override shader output to visualize internal values");
 
         ImGui::Checkbox("Enable Stateless Batching (experimental)", &enableStatelessBatch);

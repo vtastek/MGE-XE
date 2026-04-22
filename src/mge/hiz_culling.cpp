@@ -1583,15 +1583,16 @@ static MeshKey makeMeshKey(const FixedFunctionShader::HLSLRecordedCall& call) {
     return key;
 }
 
-// Helper: read a call's parameter texture resolution (used for normres + Phase-4 base pair).
+// Helper: read a call's paramH texture resolution for normres (shader reconstructs
+// tangent-space normal by central-differencing green-channel height).
+// Reads the dims the suffix cache captured when paramH was first loaded — using
+// call.rs.texture directly would yield the diffuse (slot 0) dims, not paramH (slot 2).
 static void readNormres(const FixedFunctionShader::HLSLRecordedCall& call, float& outX, float& outY) {
-    outX = 512.0f; outY = 512.0f;
-    if (call.sk.hasParamH && call.rs.texture) {
-        D3DSURFACE_DESC desc;
-        if (SUCCEEDED(call.rs.texture->GetLevelDesc(0, &desc))) {
-            outX = (float)desc.Width;
-            outY = (float)desc.Height;
-        }
+    outX = 0.0f; outY = 0.0f;
+    if (!call.sk.hasParamH || !call.rs.texture) return;
+    if (const auto* r = TextureSuffix::getCachedResolution(call.rs.texture)) {
+        outX = r->paramHWidth;
+        outY = r->paramHHeight;
     }
 }
 
