@@ -11,6 +11,8 @@
 #include "ffeshader.h"
 #include "imgui_manager.h"
 
+#include <algorithm>
+
 
 
 using std::string;
@@ -424,9 +426,14 @@ void DistantLand::renderStage2(DLContext* ctx, FixedFunctionShader::FrameBuffer*
     // Select recordMW source: per-buffer in HLSL mode, global static otherwise
     auto& activeRecordMW = fb ? fb->recordMW : recordMW;
 
-    // Count Scene 2 entries in recordMW
-    // Early out if nothing is happening
-    if (activeRecordMW.empty()) {
+    // Legacy path reuses global recordMW for Scene 1/2 additions.
+    // HLSL path only wants Scene 2+ here (hands and any later 1P passes).
+    bool hasStage2Depth = !activeRecordMW.empty();
+    if (hasStage2Depth && isHLSLActive()) {
+        hasStage2Depth = std::any_of(activeRecordMW.begin(), activeRecordMW.end(),
+            [](const RecordedMWState& call) { return call.sceneNum >= 2; });
+    }
+    if (!hasStage2Depth) {
         return;
     }
 
@@ -446,16 +453,26 @@ void DistantLand::renderStage2(DLContext* ctx, FixedFunctionShader::FrameBuffer*
             }
         }
 
-        // Depth texture from recorded renders
-        // HLSL path: render Scene 2 (hands) depth only (Scene 0 done in renderStage1)
-        // sceneFilter=1 means "scenes >= 1", so both particles (1) and hands (2) if any
-        int sceneFilter = (isHLSLActive()) ? 1 : -1;
+        // Depth texture from recorded renders.
+        // HLSL path: render Scene 2+ (hands and any later 1P passes); Scene 0 was already done in renderStage1.
+        int sceneFilter = (isHLSLActive()) ? 2 : -1;
         effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
         if (ImGuiManager::GetEnableDepthPass()) {
             // Pass hands view matrix for skinned depth rendering (Scene 2 uses different view)
-            // Non-skinned objects use pre-recorded worldViewTransforms, so this mainly affects hands
-            const D3DXMATRIX* viewForDepth = (fb && sceneFilter >= 1) ? &fb->viewScene2 : nullptr;
-            renderDepthAdditional(ctx, activeRecordMW, sceneFilter, viewForDepth);
+            // Non-skinned objects use pre-recorded worldViewTransforms, so this mainly affects hands.
+            const D3DXMATRIX* viewForDepth = (fb && sceneFilter >= 2) ? &fb->viewScene2 : nullptr;
+            if (isHLSLActive() && Configuration.AALevel > 0) {
+                // Stage 1 already resolved world depth into texDepthFrame.
+                // Append Scene 2+ directly there with a fresh non-MSAA Z buffer so we don't rely on
+                // the MSAA RT preserving its contents across the Stage 1 -> Stage 2 RT switch.
+                IDirect3DSurface9* texDepthFrameSurface = nullptr;
+                texDepthFrame->GetSurfaceLevel(0, &texDepthFrameSurface);
+                renderDepthAdditional(ctx, activeRecordMW, sceneFilter, viewForDepth,
+                    texDepthFrameSurface, surfDepthDepthResolved, true);
+                texDepthFrameSurface->Release();
+            } else {
+                renderDepthAdditional(ctx, activeRecordMW, sceneFilter, viewForDepth);
+            }
             g_passBreaks.mge_depthRT += 2; // RenderTargetSwitcher in+out
         }
         effectDepth->End();

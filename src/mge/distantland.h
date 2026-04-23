@@ -100,6 +100,7 @@ public:
     static IDirect3DTexture9* texDepthFrame;
     static IDirect3DSurface9* surfDepthFrameMSAA; // Phase A: MSAA render target for depth frame
     static IDirect3DSurface9* surfDepthDepth;
+    static IDirect3DSurface9* surfDepthDepthResolved; // Non-MSAA depth buffer for direct writes into texDepthFrame
     static IDirect3DTexture9* texCullDepth; // Cull-only depth (recordMW only, for Hi-Z)
     static IDirect3DTexture9* texHiZ; // Hi-Z pyramid - even mips (0,2,4...) for ping-pong generation
     static IDirect3DTexture9* texHiZPrev; // Hi-Z pyramid - odd mips (1,3,5...) for ping-pong generation
@@ -243,7 +244,8 @@ public:
 
     static void renderDepth(DLContext* ctx, const std::vector<RecordedMWState>& recMW, int sceneFilter = -1);
     static void renderDepthDistantLand(DLContext* ctx);
-    static void renderDepthAdditional(DLContext* ctx, const std::vector<RecordedMWState>& recMW, int sceneFilter = -1, const D3DXMATRIX* viewOverride = nullptr);
+    static void renderDepthAdditional(DLContext* ctx, const std::vector<RecordedMWState>& recMW, int sceneFilter = -1, const D3DXMATRIX* viewOverride = nullptr,
+        IDirect3DSurface9* targetOverride = nullptr, IDirect3DSurface9* depthStencilOverride = nullptr, bool clearZ = false);
     static void renderDepthRecorded(const std::vector<RecordedMWState>& recMW, int sceneFilter = -1, const D3DXMATRIX* gameView = nullptr);
     static void generateHiZMipsGPU();
     static void copyHiZToStaging();

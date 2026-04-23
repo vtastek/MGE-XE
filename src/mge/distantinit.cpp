@@ -80,6 +80,7 @@ IDirect3DTexture9* DistantLand::texWorldColour, *DistantLand::texWorldNormals, *
 IDirect3DTexture9* DistantLand::texDepthFrame;
 IDirect3DSurface9* DistantLand::surfDepthFrameMSAA;
 IDirect3DSurface9* DistantLand::surfDepthDepth;
+IDirect3DSurface9* DistantLand::surfDepthDepthResolved;
 IDirect3DTexture9* DistantLand::texCullDepth;
 IDirect3DTexture9* DistantLand::texHiZ;
 IDirect3DTexture9* DistantLand::texHiZPrev;
@@ -727,6 +728,20 @@ bool DistantLand::initDepth() {
     if (hr != D3D_OK) {
         LOG::logline("!! Failed to create depth target z-buffer");
         return false;
+    }
+
+    // Create a non-MSAA depth buffer for direct writes into the resolved depth texture.
+    // HLSL Scene 2 (hands) is appended after Morrowind's Z-clear, so it can render with a fresh
+    // depth buffer while preserving Stage 1's world depth already stored in texDepthFrame.
+    if (msaaSamples != D3DMULTISAMPLE_NONE) {
+        hr = device->CreateDepthStencilSurface(vp.Width, vp.Height, D3DFMT_D24X8, D3DMULTISAMPLE_NONE, 0, FALSE, &surfDepthDepthResolved, NULL);
+        if (hr != D3D_OK) {
+            LOG::logline("!! Failed to create resolved depth target z-buffer");
+            return false;
+        }
+    } else {
+        surfDepthDepthResolved = surfDepthDepth;
+        surfDepthDepthResolved->AddRef();
     }
 
     // Create cull depth texture (non-MSAA, recordMW only, for Hi-Z culling)
@@ -1758,6 +1773,8 @@ void DistantLand::release() {
     surfDepthFrameMSAA = nullptr;
     surfDepthDepth->Release();
     surfDepthDepth = nullptr;
+    surfDepthDepthResolved->Release();
+    surfDepthDepthResolved = nullptr;
 
     if (texCullDepth) {
         texCullDepth->Release();

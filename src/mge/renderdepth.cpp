@@ -104,9 +104,16 @@ void DistantLand::renderDepthDistantLand(DLContext* ctx) {
     effect->SetMatrix(ehProj, &ctx->mwProj);
 }
 
-void DistantLand::renderDepthAdditional(DLContext* ctx, const std::vector<RecordedMWState>& recMW, int sceneFilter, const D3DXMATRIX* viewOverride) {
+void DistantLand::renderDepthAdditional(DLContext* ctx, const std::vector<RecordedMWState>& recMW, int sceneFilter, const D3DXMATRIX* viewOverride,
+    IDirect3DSurface9* targetOverride, IDirect3DSurface9* depthStencilOverride, bool clearZ) {
     // Switch to render target
-    RenderTargetSwitcher rtsw(surfDepthFrameMSAA, surfDepthDepth);
+    RenderTargetSwitcher rtsw(targetOverride ? targetOverride : surfDepthFrameMSAA,
+        depthStencilOverride ? depthStencilOverride : surfDepthDepth);
+
+    if (clearZ) {
+        device->Clear(0, 0, D3DCLEAR_ZBUFFER, 0, 1.0f, 0);
+        g_passBreaks.raw_clear++;
+    }
 
     // Unbind depth sampler
     effect->SetTexture(ehTex3, NULL);
@@ -155,9 +162,9 @@ void DistantLand::renderDepthRecorded(const std::vector<RecordedMWState>& recMW,
     // Recorded renders (pre-filtered by executeHiZCulling/applyVisibilityAndFilterRecordMW)
     int scene2Count = 0;
     for (const auto& i : recMW) {
-        // Scene filter: -1 = all, 0 = scene 0 only, 1 = scene 1 only, 2 = scene 2 only, etc.
+        // Scene filter: -1 = all, 0 = Scene 0 only, N>0 = Scene N and later.
         if (sceneFilter == 0 && i.sceneNum != 0) continue;
-        if (sceneFilter > 0 && i.sceneNum == 0) continue;
+        if (sceneFilter > 0 && i.sceneNum < sceneFilter) continue;
 
         // Log Scene 2 depth draws
         if (i.sceneNum == 2 && scene2Count < 5) {
