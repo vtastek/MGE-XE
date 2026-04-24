@@ -89,6 +89,7 @@ struct VS_OUTPUT {
 #ifdef USE_STATELESS_BATCH
     float drawIndex : TEXCOORD6;  // Draw index for PS material lookup
 #endif
+    float2 screenUV : TEXCOORD7;  // Screen-space UV for forward prepass sampling
 };
 
 //------------------------------------------------------------
@@ -330,6 +331,7 @@ VS_OUTPUT vs_main(VS_INPUT input) {
 
     // Project to screen
     output.position = mul(viewpos, proj);
+    output.screenUV = output.position.xy / max(output.position.w, 1e-6) * float2(0.5, -0.5) + 0.5;
 
     // Pass through data
     output.normal = normalize(normal);

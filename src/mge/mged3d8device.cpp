@@ -123,6 +123,38 @@ static void captureTransform(D3DTRANSFORMSTATETYPE a, const D3DMATRIX* b);
 static void captureLight(DWORD a, const D3DLIGHT8* b);
 static void captureMaterial(const D3DMATERIAL8* a);
 static float calcFPS();
+static void capturePostProcessData(FixedFunctionShader::FrameBuffer& fb, const DLContext& ctx, const char* source);
+
+static void capturePostProcessData(FixedFunctionShader::FrameBuffer& fb, const DLContext& ctx, const char* source) {
+    auto mwb = MWBridge::get();
+    auto& ppd = fb.postProcessData;
+    ppd.frameTime = mwb->frameTime();
+    ppd.simulationTime = mwb->simulationTime();
+    ppd.waterLevel = mwb->CellHasWater() ? mwb->WaterLevel() : -1e9f;
+    ppd.isMenu = mwb->IsMenu();
+    ppd.isInterior = !mwb->CellHasWeather();
+    ppd.isUnderwater = mwb->IsUnderwater(ctx.eyePos.z);
+
+    int envFlags = 0;
+    if (!mwb->CellHasWeather()) envFlags |= 1;
+    if (mwb->IsExterior()) envFlags |= 2;
+    if (mwb->IntLikeExterior()) envFlags |= 4;
+    if (ppd.isUnderwater) envFlags |= 8; else envFlags |= 16;
+    if (ctx.sunVis >= 0.001f) envFlags |= 32; else envFlags |= 64;
+    ppd.envFlags = envFlags;
+
+    static int logCount = 0;
+    if (logCount++ < 12) {
+        LOG::logline(
+            "[PPDCAP][%s] cell=0x%08X water=%.2f env=0x%02X interior=%d underwater=%d",
+            source ? source : "?",
+            mwb->IntCurCellAddr(),
+            ppd.waterLevel,
+            ppd.envFlags,
+            ppd.isInterior ? 1 : 0,
+            ppd.isUnderwater ? 1 : 0);
+    }
+}
 
 // Helper: process debug hotkeys when ImGui is initialized
 static void processImGuiHotkeys() {
@@ -1191,25 +1223,7 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
                     // N-1: Stamp currentView/currentProj to match dlContext camera
                     recBuf.currentView = frameCtx.mwView;
                     recBuf.currentProj = frameCtx.mwProj;
-
-                    // N-1: Capture PostProcessData for render-thread-safe postProcess
-                    {
-                        auto mwb = MWBridge::get();
-                        auto& ppd = recBuf.postProcessData;
-                        ppd.frameTime = mwb->frameTime();
-                        ppd.simulationTime = mwb->simulationTime();
-                        ppd.waterLevel = mwb->CellHasWater() ? mwb->WaterLevel() : -1e9f;
-                        ppd.isMenu = mwb->IsMenu();
-                        ppd.isInterior = !mwb->CellHasWeather();
-                        ppd.isUnderwater = mwb->IsUnderwater(frameCtx.eyePos.z);
-                        int envFlags = 0;
-                        if (!mwb->CellHasWeather()) envFlags |= 1;
-                        if (mwb->IsExterior()) envFlags |= 2;
-                        if (mwb->IntLikeExterior()) envFlags |= 4;
-                        if (ppd.isUnderwater) envFlags |= 8; else envFlags |= 16;
-                        if (frameCtx.sunVis >= 0.001) envFlags |= 32; else envFlags |= 64;
-                        ppd.envFlags = envFlags;
-                    }
+                    capturePostProcessData(recBuf, frameCtx, "ENDSCENE");
 
                     // Diagnostic: log nearViewRange when stored
                     static int storeLogCount = 0;
@@ -1876,6 +1890,7 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
                 // N-1: Stamp currentView/currentProj to match dlContext camera
                 recBuf.currentView = frameCtx.mwView;
                 recBuf.currentProj = frameCtx.mwProj;
+                capturePostProcessData(recBuf, frameCtx, "DIP");
                 // Diagnostic: log nearViewRange when stored (DIP path)
                 static int storeLogCountDIP = 0;
                 if (storeLogCountDIP++ < 10) {
