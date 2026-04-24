@@ -1159,11 +1159,14 @@ void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool w
 
         // Use renderStage1 for Scene 0 depth (includes shadows, distant land setup)
         DistantLand::renderStage1(renderCtx, &fb);
-        DistantLand::renderForwardPrepassChain(renderCtx, &fb.postProcessData);
 
         // Render Scene 2 (hands) depth into the depth texture
         // Filter for sceneNum >= 2 only
         DistantLand::renderStage2(renderCtx, &fb);
+
+        // Forward prepass reads texDepthFrame; run after Stage 2 so hand depth
+        // contributes to SSAO.
+        DistantLand::renderForwardPrepassChain(renderCtx, &fb.postProcessData);
     }
 
     // === REPLAY ALL SCENES ===
@@ -1737,10 +1740,12 @@ void FixedFunctionShader::renderFullFrameAsync() {
         MGE_ZoneScopedN("Depth Passes");
         LOG::logline(">> renderFullFrameAsync Stage1 start");
         DistantLand::renderStage1(renderCtx, &fb);
-        DistantLand::renderForwardPrepassChain(renderCtx, &fb.postProcessData);
-        LOG::logline(">> renderFullFrameAsync Stage1 done, ForwardPrepass done, Stage2 start");
+        LOG::logline(">> renderFullFrameAsync Stage1 done, Stage2 start");
         DistantLand::renderStage2(renderCtx, &fb);
-        LOG::logline(">> renderFullFrameAsync Stage2 done");
+        // Forward prepass reads texDepthFrame; run after Stage 2 so hand depth
+        // contributes to SSAO.
+        DistantLand::renderForwardPrepassChain(renderCtx, &fb.postProcessData);
+        LOG::logline(">> renderFullFrameAsync Stage2 done, ForwardPrepass done");
     }
 
     // Replay Scene 0
