@@ -713,7 +713,9 @@ bool MWBridge::IntHasWater() {
 float MWBridge::WaterLevel() {
     assert(m_loaded);
     DWORD addr = IntCurCellAddr();
-    if (addr != 0 && ((read_byte(addr + 0x18) & 0xF3) == 0x13)) {
+    // Must match CellHasWater(): interior-like-exterior cells with water use a
+    // different high bit pattern, but still store a valid per-cell water level.
+    if (addr != 0 && ((read_byte(addr + 0x18) & 0x73) == 0x13)) {
         return read_float(addr + 0x90);
     }
     return 0.0f;

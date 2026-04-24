@@ -16,6 +16,7 @@
 #include "mgeversion.h"
 #include "statusoverlay.h"
 #include "shader_utils.h"
+#include "hlsl_shader_manager.h"
 #include "ipc/dlshare.h"
 #include <memory>
 #include <optional>
@@ -81,6 +82,15 @@ IDirect3DTexture9* DistantLand::texDepthFrame;
 IDirect3DSurface9* DistantLand::surfDepthFrameMSAA;
 IDirect3DSurface9* DistantLand::surfDepthDepth;
 IDirect3DSurface9* DistantLand::surfDepthDepthResolved;
+IDirect3DTexture9* DistantLand::texForwardSSAORaw = nullptr;
+IDirect3DSurface9* DistantLand::surfForwardSSAORaw = nullptr;
+IDirect3DTexture9* DistantLand::texForwardSSAO = nullptr;
+IDirect3DSurface9* DistantLand::surfForwardSSAO = nullptr;
+IDirect3DTexture9* DistantLand::texForwardSSAONoise = nullptr;
+IDirect3DPixelShader9* DistantLand::psForwardSSAO = nullptr;
+IDirect3DPixelShader9* DistantLand::psForwardSSAOBlur = nullptr;
+IDirect3DVertexBuffer9* DistantLand::vbForwardPrepass = nullptr;
+bool DistantLand::forwardSSAOActive = false;
 IDirect3DTexture9* DistantLand::texCullDepth;
 IDirect3DTexture9* DistantLand::texHiZ;
 IDirect3DTexture9* DistantLand::texHiZPrev;
@@ -103,6 +113,9 @@ std::vector<DistantLand::SceneLight> DistantLand::sceneLights;
 std::unordered_map<int, size_t> DistantLand::sceneLightIndexMap;
 IDirect3DTexture9* DistantLand::texLightData = nullptr;
 IDirect3DTexture9* DistantLand::texDistantBlend;
+IDirect3DTexture9* DistantLand::texMenuCache = nullptr;
+IDirect3DSurface9* DistantLand::surfMenuCache = nullptr;
+bool DistantLand::menuCacheValid = false;
 IDirect3DTexture9* DistantLand::texReflection;
 IDirect3DSurface9* DistantLand::surfReflectionZ;
 IDirect3DVolumeTexture9* DistantLand::texWater;
@@ -128,6 +141,8 @@ IDirect3DVertexBuffer9* DistantLand::vbClipCube;
 DLContext DistantLand::s_staging = {
     {}, {},                                              // mwView, mwProj
     {}, {},                                              // eyeVec, eyePos
+    0,                                                   // postEnvFlags
+    -1e9f,                                               // waterLevel
     {}, {},                                              // sunVec, sunPos
     0,                                                   // sunVis
     {}, {}, {},                                          // sunCol, sunAmb, ambCol
@@ -308,6 +323,11 @@ bool DistantLand::init() {
 
     if (!initShadow()) {
         LOG::logline("!! DistantLand::init failed at initShadow");
+        return false;
+    }
+
+    if (!initForwardPrepass()) {
+        LOG::logline("!! DistantLand::init failed at initForwardPrepass");
         return false;
     }
 
@@ -752,6 +772,261 @@ bool DistantLand::initDepth() {
     }
     LOG::logline(">> Cull depth texture created: %dx%d R32F", vp.Width, vp.Height);
 
+    if (surfMenuCache) {
+        surfMenuCache->Release();
+        surfMenuCache = nullptr;
+    }
+    if (texMenuCache) {
+        texMenuCache->Release();
+        texMenuCache = nullptr;
+    }
+    menuCacheValid = false;
+
+    hr = device->CreateTexture(vp.Width, vp.Height, 1, D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &texMenuCache, nullptr);
+    if (hr != D3D_OK) {
+        LOG::logline("!! Failed to create HLSL menu cache texture");
+        return false;
+    }
+    texMenuCache->GetSurfaceLevel(0, &surfMenuCache);
+
+    return true;
+}
+
+static bool compileForwardPrepassStage(const char* entryPoint, const char* profile, ID3DBlob** outBlob) {
+    DWORD fileSize = 0;
+    char* shaderSource = HLSLShaderManager::loadHLSLShaderFile(
+        "Data Files\\shaders\\core-hlsl\\XE ForwardPrepass.hlsl", &fileSize);
+    if (!shaderSource) {
+        LOG::logline("!! Forward prepass: failed to load XE ForwardPrepass.hlsl");
+        return false;
+    }
+
+    ID3DBlob* errors = nullptr;
+    const UINT compileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_PREFER_FLOW_CONTROL;
+    HRESULT hr = D3DCompile(
+        shaderSource,
+        fileSize,
+        "XE ForwardPrepass.hlsl",
+        nullptr,
+        HLSLShaderManager::getIncludeHandler(),
+        entryPoint,
+        profile,
+        compileFlags,
+        0,
+        outBlob,
+        &errors);
+
+    delete[] shaderSource;
+
+    if (FAILED(hr)) {
+        if (errors) {
+            LOG::write("!! Forward prepass compile errors:\n");
+            LOG::write(reinterpret_cast<const char*>(errors->GetBufferPointer()));
+            LOG::write("\n");
+            errors->Release();
+        }
+        LOG::logline("!! Forward prepass: compile failed for %s (%s)", entryPoint, profile);
+        return false;
+    }
+
+    if (errors) {
+        errors->Release();
+    }
+    return true;
+}
+
+static const DWORD fvfForwardPrepass = D3DFVF_XYZRHW | D3DFVF_TEX1;
+
+struct ForwardPrepassVertex {
+    float x, y, z, w;
+    float u, v;
+};
+
+static void releaseForwardPrepassShaders() {
+    if (DistantLand::psForwardSSAO) {
+        DistantLand::psForwardSSAO->Release();
+        DistantLand::psForwardSSAO = nullptr;
+    }
+    if (DistantLand::psForwardSSAOBlur) {
+        DistantLand::psForwardSSAOBlur->Release();
+        DistantLand::psForwardSSAOBlur = nullptr;
+    }
+    DistantLand::forwardSSAOActive = false;
+}
+
+static void releaseForwardPrepassAux() {
+    if (DistantLand::vbForwardPrepass) {
+        DistantLand::vbForwardPrepass->Release();
+        DistantLand::vbForwardPrepass = nullptr;
+    }
+    if (DistantLand::texForwardSSAONoise) {
+        DistantLand::texForwardSSAONoise->Release();
+        DistantLand::texForwardSSAONoise = nullptr;
+    }
+}
+
+static void releaseForwardPrepassTargets() {
+    if (DistantLand::surfForwardSSAORaw) {
+        DistantLand::surfForwardSSAORaw->Release();
+        DistantLand::surfForwardSSAORaw = nullptr;
+    }
+    if (DistantLand::surfForwardSSAO) {
+        DistantLand::surfForwardSSAO->Release();
+        DistantLand::surfForwardSSAO = nullptr;
+    }
+    if (DistantLand::texForwardSSAORaw) {
+        DistantLand::texForwardSSAORaw->Release();
+        DistantLand::texForwardSSAORaw = nullptr;
+    }
+    if (DistantLand::texForwardSSAO) {
+        DistantLand::texForwardSSAO->Release();
+        DistantLand::texForwardSSAO = nullptr;
+    }
+    DistantLand::forwardSSAOActive = false;
+}
+
+static bool buildForwardPrepassShaders(
+    IDirect3DPixelShader9** outSSAO,
+    IDirect3DPixelShader9** outBlur) {
+    ID3DBlob* psSSAOBlob = nullptr;
+    ID3DBlob* psBlurBlob = nullptr;
+    IDirect3DPixelShader9* newSSAO = nullptr;
+    IDirect3DPixelShader9* newBlur = nullptr;
+
+    if (!compileForwardPrepassStage("ps_forward_ssao", "ps_3_0", &psSSAOBlob) ||
+        !compileForwardPrepassStage("ps_forward_ssao_blur", "ps_3_0", &psBlurBlob)) {
+        if (psSSAOBlob) psSSAOBlob->Release();
+        if (psBlurBlob) psBlurBlob->Release();
+        return false;
+    }
+
+    HRESULT hr = DistantLand::device->CreatePixelShader(
+        reinterpret_cast<DWORD*>(psSSAOBlob->GetBufferPointer()), &newSSAO);
+    if (FAILED(hr)) {
+        LOG::logline("!! Failed to create forward SSAO shader");
+        psSSAOBlob->Release();
+        psBlurBlob->Release();
+        return false;
+    }
+
+    hr = DistantLand::device->CreatePixelShader(
+        reinterpret_cast<DWORD*>(psBlurBlob->GetBufferPointer()), &newBlur);
+    if (FAILED(hr)) {
+        LOG::logline("!! Failed to create forward SSAO blur shader");
+        newSSAO->Release();
+        psSSAOBlob->Release();
+        psBlurBlob->Release();
+        return false;
+    }
+
+    psSSAOBlob->Release();
+    psBlurBlob->Release();
+
+    *outSSAO = newSSAO;
+    *outBlur = newBlur;
+    return true;
+}
+
+static bool initForwardPrepassAux(const D3DVIEWPORT9& vp) {
+    releaseForwardPrepassAux();
+
+    HRESULT hr = DistantLand::device->CreateVertexBuffer(
+        4 * sizeof(ForwardPrepassVertex), 0, fvfForwardPrepass, D3DPOOL_MANAGED,
+        &DistantLand::vbForwardPrepass, nullptr);
+    if (FAILED(hr)) {
+        LOG::logline("!! Failed to create forward SSAO fullscreen verts");
+        return false;
+    }
+
+    ForwardPrepassVertex* v = nullptr;
+    DistantLand::vbForwardPrepass->Lock(0, 0, reinterpret_cast<void**>(&v), D3DLOCK_DISCARD);
+    v[0] = { -0.5f, static_cast<float>(vp.Height) - 0.5f, 0.0f, 1.0f, 0.0f, 1.0f };
+    v[1] = { -0.5f, -0.5f, 0.0f, 1.0f, 0.0f, 0.0f };
+    v[2] = { static_cast<float>(vp.Width) - 0.5f, static_cast<float>(vp.Height) - 0.5f, 0.0f, 1.0f, 1.0f, 1.0f };
+    v[3] = { static_cast<float>(vp.Width) - 0.5f, -0.5f, 0.0f, 1.0f, 1.0f, 0.0f };
+    DistantLand::vbForwardPrepass->Unlock();
+
+    hr = D3DXCreateTextureFromFileEx(
+        DistantLand::device,
+        "Data Files\\textures\\MGE\\poisson_nrm.dds",
+        D3DX_FROM_FILE, D3DX_FROM_FILE, D3DX_FROM_FILE,
+        0, D3DFMT_UNKNOWN, D3DPOOL_MANAGED,
+        D3DX_DEFAULT, D3DX_DEFAULT, 0,
+        nullptr, nullptr, &DistantLand::texForwardSSAONoise);
+    if (FAILED(hr)) {
+        LOG::logline("!! Failed to load forward SSAO rotation texture");
+        releaseForwardPrepassAux();
+        return false;
+    }
+
+    return true;
+}
+
+bool DistantLand::initForwardPrepass() {
+    HRESULT hr;
+    D3DVIEWPORT9 vp;
+    device->GetViewport(&vp);
+
+    releaseForwardPrepassTargets();
+
+    hr = device->CreateTexture(vp.Width, vp.Height, 1, D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &texForwardSSAORaw, nullptr);
+    if (hr != D3D_OK) {
+        LOG::logline("!! Failed to create forward SSAO raw texture");
+        releaseForwardPrepassTargets();
+        return false;
+    }
+
+    hr = device->CreateTexture(vp.Width, vp.Height, 1, D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &texForwardSSAO, nullptr);
+    if (hr != D3D_OK) {
+        LOG::logline("!! Failed to create forward SSAO blur texture");
+        releaseForwardPrepassTargets();
+        return false;
+    }
+
+    texForwardSSAORaw->GetSurfaceLevel(0, &surfForwardSSAORaw);
+    texForwardSSAO->GetSurfaceLevel(0, &surfForwardSSAO);
+
+    IDirect3DPixelShader9* newSSAO = nullptr;
+    IDirect3DPixelShader9* newBlur = nullptr;
+    if (!buildForwardPrepassShaders(&newSSAO, &newBlur) || !initForwardPrepassAux(vp)) {
+        releaseForwardPrepassTargets();
+        if (newSSAO) newSSAO->Release();
+        if (newBlur) newBlur->Release();
+        return false;
+    }
+
+    releaseForwardPrepassShaders();
+    psForwardSSAO = newSSAO;
+    psForwardSSAOBlur = newBlur;
+
+    LOG::logline(">> Forward SSAO prepass initialized: %ux%u", vp.Width, vp.Height);
+    return true;
+}
+
+bool DistantLand::reloadForwardPrepass() {
+    if (!ready || !device) {
+        return false;
+    }
+
+    if (!texForwardSSAORaw || !texForwardSSAO || !surfForwardSSAORaw || !surfForwardSSAO ||
+        !vbForwardPrepass || !texForwardSSAONoise) {
+        return initForwardPrepass();
+    }
+
+    IDirect3DPixelShader9* newSSAO = nullptr;
+    IDirect3DPixelShader9* newBlur = nullptr;
+    if (!buildForwardPrepassShaders(&newSSAO, &newBlur)) {
+        return false;
+    }
+
+    releaseForwardPrepassShaders();
+    psForwardSSAO = newSSAO;
+    psForwardSSAOBlur = newBlur;
+
+    LOG::logline("-- Forward SSAO prepass shaders reloaded");
     return true;
 }
 
@@ -1767,6 +2042,16 @@ void DistantLand::release() {
     vbClipCube->Release();
     vbClipCube = nullptr;
 
+    if (surfMenuCache) {
+        surfMenuCache->Release();
+        surfMenuCache = nullptr;
+    }
+    if (texMenuCache) {
+        texMenuCache->Release();
+        texMenuCache = nullptr;
+    }
+    menuCacheValid = false;
+
     texDepthFrame->Release();
     texDepthFrame = nullptr;
     surfDepthFrameMSAA->Release();
@@ -1775,6 +2060,9 @@ void DistantLand::release() {
     surfDepthDepth = nullptr;
     surfDepthDepthResolved->Release();
     surfDepthDepthResolved = nullptr;
+    releaseForwardPrepassShaders();
+    releaseForwardPrepassTargets();
+    releaseForwardPrepassAux();
 
     if (texCullDepth) {
         texCullDepth->Release();

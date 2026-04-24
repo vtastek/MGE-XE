@@ -101,6 +101,15 @@ public:
     static IDirect3DSurface9* surfDepthFrameMSAA; // Phase A: MSAA render target for depth frame
     static IDirect3DSurface9* surfDepthDepth;
     static IDirect3DSurface9* surfDepthDepthResolved; // Non-MSAA depth buffer for direct writes into texDepthFrame
+    static IDirect3DTexture9* texForwardSSAORaw;
+    static IDirect3DSurface9* surfForwardSSAORaw;
+    static IDirect3DTexture9* texForwardSSAO;
+    static IDirect3DSurface9* surfForwardSSAO;
+    static IDirect3DTexture9* texForwardSSAONoise;
+    static IDirect3DPixelShader9* psForwardSSAO;
+    static IDirect3DPixelShader9* psForwardSSAOBlur;
+    static IDirect3DVertexBuffer9* vbForwardPrepass;
+    static bool forwardSSAOActive;
     static IDirect3DTexture9* texCullDepth; // Cull-only depth (recordMW only, for Hi-Z)
     static IDirect3DTexture9* texHiZ; // Hi-Z pyramid - even mips (0,2,4...) for ping-pong generation
     static IDirect3DTexture9* texHiZPrev; // Hi-Z pyramid - odd mips (1,3,5...) for ping-pong generation
@@ -119,6 +128,9 @@ public:
     static int hiZValidMips; // Number of actually generated mips (stops at 8x8 minimum)
 
     static IDirect3DTexture9* texDistantBlend;
+    static IDirect3DTexture9* texMenuCache;
+    static IDirect3DSurface9* surfMenuCache;
+    static bool menuCacheValid;
     static IDirect3DTexture9* texReflection;
     static IDirect3DSurface9* surfReflectionZ;
     static IDirect3DVolumeTexture9* texWater;
@@ -177,6 +189,8 @@ public:
     static bool initIpc();
     static bool initShader();
     static bool initDepth();
+    static bool initForwardPrepass();
+    static bool reloadForwardPrepass();
     static bool initHiZ();
     static bool initWater();
     static bool initDynamicWaves();
@@ -247,6 +261,7 @@ public:
     static void renderDepthAdditional(DLContext* ctx, const std::vector<RecordedMWState>& recMW, int sceneFilter = -1, const D3DXMATRIX* viewOverride = nullptr,
         IDirect3DSurface9* targetOverride = nullptr, IDirect3DSurface9* depthStencilOverride = nullptr, bool clearZ = false);
     static void renderDepthRecorded(const std::vector<RecordedMWState>& recMW, int sceneFilter = -1, const D3DXMATRIX* gameView = nullptr);
+    static void renderForwardPrepassChain(DLContext* ctx, const PostProcessData* ppd = nullptr);
     static void generateHiZMipsGPU();
     static void copyHiZToStaging();
     static void lockRemainingHiZMips();
@@ -267,6 +282,7 @@ public:
     static void postProcess(DLContext* ctx);
     static void postProcess(DLContext* ctx, const PostProcessData& ppd);
     static void updatePostShader(MGEShader* shader);
+    static void logWaterDiagnostics(const char* tag, const DLContext* ctx, const PostProcessData* ppd = nullptr);
 
     static void requestCapture(std::function<void(IDirect3DSurface9*)> handler, bool captureWithUI);
     static void checkCaptureScreenshot(bool isUIDrawn);

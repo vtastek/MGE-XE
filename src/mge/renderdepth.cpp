@@ -6,6 +6,7 @@
 #include "mwbridge.h"
 #include "proxydx/d3d8header.h"
 #include "imgui_manager.h"
+#include "postshaders.h"
 #include "support/log.h"
 #include "mge_tracy.h"
 
@@ -136,6 +137,133 @@ void DistantLand::renderDepthAdditional(DLContext* ctx, const std::vector<Record
 
     // Reset projection matrix
     effect->SetMatrix(ehProj, &ctx->mwProj);
+}
+
+void DistantLand::renderForwardPrepassChain(DLContext* ctx, const PostProcessData* ppd) {
+    forwardSSAOActive = false;
+    static const DWORD fvfForwardPrepass = D3DFVF_XYZRHW | D3DFVF_TEX1;
+
+    const int prepassEnvFlags = ppd ? ppd->envFlags : (ctx ? ctx->postEnvFlags : 0);
+
+    if (!ctx || !isHLSLActive() || !PostShaders::usesForwardSSAO(prepassEnvFlags)) {
+        return;
+    }
+    if (!texDepthFrame || !texForwardSSAORaw || !texForwardSSAO ||
+        !surfForwardSSAORaw || !surfForwardSSAO ||
+        !texForwardSSAONoise || !psForwardSSAO || !psForwardSSAOBlur || !vbForwardPrepass) {
+        return;
+    }
+
+    DistantLand::logWaterDiagnostics("PREPASS", ctx, ppd);
+
+    MGE_ZoneScopedN("renderForwardPrepassChain");
+
+    IDirect3DStateBlock9* stateSaved = nullptr;
+    if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &stateSaved)) || !stateSaved) {
+        LOG::logline("!! Forward prepass: failed to capture state block");
+        return;
+    }
+
+    IDirect3DSurface9* savedRT0 = nullptr;
+    IDirect3DSurface9* savedDepthStencil = nullptr;
+    D3DVIEWPORT9 savedViewport{};
+    device->GetRenderTarget(0, &savedRT0);
+    device->GetDepthStencilSurface(&savedDepthStencil);
+    device->GetViewport(&savedViewport);
+
+    const float zoom = (Configuration.MGEFlags & ZOOM_ASPECT) ? Configuration.CameraEffects.zoom : 1.0f;
+    const float fov = Configuration.ScreenFOV / zoom;
+    const float viewportWidth = std::max(static_cast<float>(savedViewport.Width), 1.0f);
+    const float viewportHeight = std::max(static_cast<float>(savedViewport.Height), 1.0f);
+    float ssaoParams[4] = {
+        1.0f / viewportWidth,
+        1.0f / viewportHeight,
+        fov,
+        0.0f
+    };
+
+    auto setupFullscreenPass = [&]() {
+        device->SetViewport(&savedViewport);
+        device->SetVertexShader(nullptr);
+        device->SetFVF(fvfForwardPrepass);
+        device->SetStreamSource(0, vbForwardPrepass, 0, 24);
+        device->SetRenderState(D3DRS_ZENABLE, FALSE);
+        device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+        device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+        device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+        device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+    };
+
+    {
+        RenderTargetSwitcher rt(surfForwardSSAO, nullptr);
+        setupFullscreenPass();
+        device->SetPixelShader(psForwardSSAO);
+        device->SetPixelShaderConstantF(0, ssaoParams, 1);
+        device->SetTexture(0, texDepthFrame);
+        device->SetTexture(1, texForwardSSAONoise);
+        device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+        device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+        device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+        device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+        device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+        device->SetSamplerState(1, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+        device->SetSamplerState(1, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+        device->SetSamplerState(1, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+        device->SetSamplerState(1, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+        device->SetSamplerState(1, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+        device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+        device->SetTexture(0, nullptr);
+        device->SetTexture(1, nullptr);
+    }
+
+    {
+        RenderTargetSwitcher rt(surfForwardSSAORaw, nullptr);
+        setupFullscreenPass();
+        device->SetPixelShader(psForwardSSAOBlur);
+        device->SetPixelShaderConstantF(0, ssaoParams, 1);
+        device->SetTexture(0, texForwardSSAO);
+        device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+        device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+        device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+        device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_MIRROR);
+        device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_MIRROR);
+        device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+        device->SetTexture(0, nullptr);
+    }
+
+    {
+        RenderTargetSwitcher rt(surfForwardSSAO, nullptr);
+        setupFullscreenPass();
+        device->SetPixelShader(psForwardSSAOBlur);
+        device->SetPixelShaderConstantF(0, ssaoParams, 1);
+        device->SetTexture(0, texForwardSSAORaw);
+        device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+        device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+        device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+        device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_MIRROR);
+        device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_MIRROR);
+        device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+        device->SetTexture(0, nullptr);
+    }
+
+    if (stateSaved) {
+        stateSaved->Apply();
+        stateSaved->Release();
+    }
+
+    device->SetRenderTarget(0, savedRT0);
+    device->SetDepthStencilSurface(savedDepthStencil);
+    device->SetViewport(&savedViewport);
+
+    if (savedRT0) {
+        savedRT0->Release();
+    }
+    if (savedDepthStencil) {
+        savedDepthStencil->Release();
+    }
+
+    FixedFunctionShader::resetHLSLCaches();
+    forwardSSAOActive = true;
 }
 
 void DistantLand::renderDepthRecorded(const std::vector<RecordedMWState>& recMW, int sceneFilter, const D3DXMATRIX* gameView) {

@@ -12,6 +12,8 @@
 #include "imgui_manager.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <cstring>
 
 
 
@@ -24,6 +26,76 @@ PassBreakCounters g_passBreaks;
 static DLContext* s_postShaderCtx = nullptr;
 // File-scope pointer for updatePostShader to access captured MWBridge state
 static const PostProcessData* s_postProcessData = nullptr;
+
+void DistantLand::logWaterDiagnostics(const char* tag, const DLContext* ctx, const PostProcessData* ppd) {
+    auto mwBridge = MWBridge::get();
+    if (!mwBridge || !mwBridge->IsLoaded() || mwBridge->IsExterior()) {
+        return;
+    }
+
+    static int postLiveCounter = 0;
+    static int postPpdCounter = 0;
+    static int prepassCounter = 0;
+    int* counter = &postPpdCounter;
+
+    if (tag && std::strcmp(tag, "PREPASS") == 0) {
+        counter = &prepassCounter;
+    } else if (tag && std::strcmp(tag, "POST-LIVE") == 0) {
+        counter = &postLiveCounter;
+    }
+
+    if (++(*counter) < 60) {
+        return;
+    }
+    *counter = 0;
+
+    const DWORD envCell = mwBridge->IntCurCellAddr();
+    const BYTE envFlag = mwBridge->GetCellWaterFlag();
+    const BYTE envMask73 = envFlag & 0x73;
+    const BYTE envMaskF3 = envFlag & 0xF3;
+
+    const DWORD playerCell = static_cast<DWORD>(reinterpret_cast<uintptr_t>(mwBridge->getPlayerCell()));
+    BYTE playerFlag = 0xFF;
+    BYTE playerMask73 = 0xFF;
+    BYTE playerMaskF3 = 0xFF;
+    int playerHasWater = -1;
+    int playerHasWeather = -1;
+    int playerLikeExterior = -1;
+    float playerWaterLevel = -1e9f;
+
+    if (playerCell != 0) {
+        playerFlag = *reinterpret_cast<const BYTE*>(playerCell + 0x18);
+        playerMask73 = playerFlag & 0x73;
+        playerMaskF3 = playerFlag & 0xF3;
+        playerHasWater = (playerMask73 == 0x13) ? 1 : 0;
+        playerHasWeather = (playerMaskF3 == 0x93) ? 1 : 0;
+        playerLikeExterior = (playerMaskF3 == 0x93) ? 1 : 0;
+        if (playerHasWater) {
+            playerWaterLevel = *reinterpret_cast<const float*>(playerCell + 0x90);
+        }
+    }
+
+    const float playerZ = mwBridge->PlayerPositionZ();
+    const float playerEyeEstimate = playerZ + 125.0f * mwBridge->PlayerHeight();
+    const float eyeZ = ctx ? ctx->eyePos.z : playerEyeEstimate;
+    const float ctxWater = ctx ? ctx->waterLevel : -1e9f;
+    const int ctxEnvFlags = ctx ? ctx->postEnvFlags : 0;
+    const float ppdWater = ppd ? ppd->waterLevel : -1e9f;
+    const int ppdEnvFlags = ppd ? ppd->envFlags : 0;
+    const int ppdInterior = ppd ? (ppd->isInterior ? 1 : 0) : -1;
+    const int ppdUnderwater = ppd ? (ppd->isUnderwater ? 1 : 0) : -1;
+    const char* interiorName = mwBridge->getInteriorName();
+
+    LOG::logline(
+        "[WATERDIAG][%s] cell='%s' isExt=%d envCell=0x%08X envFlag=0x%02X mask73=0x%02X maskF3=0x%02X cellHasWater=%d cellHasWeather=%d intLikeExt=%d intHasWater=%d water=%.2f",
+        tag ? tag : "?", interiorName ? interiorName : "<ext>", mwBridge->IsExterior(), envCell, envFlag, envMask73, envMaskF3,
+        mwBridge->CellHasWater(), mwBridge->CellHasWeather(), mwBridge->IntLikeExterior(), mwBridge->IntHasWater(), mwBridge->WaterLevel());
+    LOG::logline(
+        "[WATERDIAG][%s] playerCell=0x%08X playerFlag=0x%02X mask73=0x%02X maskF3=0x%02X playerHasWater=%d playerHasWeather=%d playerLikeExt=%d playerWater=%.2f eyeZ=%.2f playerZ=%.2f playerEye=%.2f underEye=%d underPlayerEye=%d ctxWater=%.2f ctxEnv=0x%02X ppdWater=%.2f ppdEnv=0x%02X ppdInt=%d ppdUnder=%d",
+        tag ? tag : "?", playerCell, playerFlag, playerMask73, playerMaskF3, playerHasWater, playerHasWeather,
+        playerLikeExterior, playerWaterLevel, eyeZ, playerZ, playerEyeEstimate, mwBridge->IsUnderwater(eyeZ),
+        mwBridge->IsUnderwater(playerEyeEstimate), ctxWater, ctxEnvFlags, ppdWater, ppdEnvFlags, ppdInterior, ppdUnderwater);
+}
 
 // captureContext - Snapshot staging into a DLContext for this frame
 DLContext DistantLand::captureContext() {
@@ -60,6 +132,7 @@ DLContext DistantLand::captureStage0Context() {
     // Set variables derived from current game state and camera configuration
     setView(&s_staging.mwView);
     adjustFog();
+    forwardSSAOActive = false;
 
     bool wasRenderCached = s_staging.isRenderCached;
     s_staging.isRenderCached &= (Configuration.MGEFlags & USE_MENU_CACHING) && mwBridge->IsMenu();
@@ -73,6 +146,29 @@ DLContext DistantLand::captureStage0Context() {
             (Configuration.MGEFlags & USE_MENU_CACHING) ? 1 : 0);
         captureLogCount++;
     }
+
+    // Snapshot all per-frame state into context (foundation for threading)
+    s_staging.postEnvFlags = 0;
+    if (!mwBridge->CellHasWeather()) {
+        s_staging.postEnvFlags |= 1;
+    }
+    if (mwBridge->IsExterior()) {
+        s_staging.postEnvFlags |= 2;
+    }
+    if (mwBridge->IntLikeExterior()) {
+        s_staging.postEnvFlags |= 4;
+    }
+    if (mwBridge->IsUnderwater(s_staging.eyePos.z)) {
+        s_staging.postEnvFlags |= 8;
+    } else {
+        s_staging.postEnvFlags |= 16;
+    }
+    if (s_staging.sunVis >= 0.001f) {
+        s_staging.postEnvFlags |= 32;
+    } else {
+        s_staging.postEnvFlags |= 64;
+    }
+    s_staging.waterLevel = mwBridge->CellHasWater() ? mwBridge->WaterLevel() : -1e9f;
 
     // Snapshot all per-frame state into context (foundation for threading)
     DLContext ctx = captureContext();
@@ -897,6 +993,7 @@ void DistantLand::postProcess(DLContext* ctx) {
 
             // Run all shaders (with callback to set changed vars)
             s_postShaderCtx = ctx;
+            logWaterDiagnostics("POST-LIVE", ctx, nullptr);
             PostShaders::shaderTime(&updatePostShader, envFlags, mwBridge->frameTime());
             s_postShaderCtx = nullptr;
         }
@@ -936,7 +1033,6 @@ void DistantLand::postProcess(DLContext* ctx) {
 void DistantLand::postProcess(DLContext* ctx, const PostProcessData& ppd) {
     MGE_ZoneScopedN("postProcess");
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_PostProcess, -1);
-    // N-1 fix: Use current frame's menu state, not buffered context's stale state
     if (!s_staging.isRenderCached) {
         // Save state block
         IDirect3DStateBlock9* stateSaved;
@@ -946,6 +1042,7 @@ void DistantLand::postProcess(DLContext* ctx, const PostProcessData& ppd) {
             // Run all shaders (with callback to set changed vars)
             s_postShaderCtx = ctx;
             s_postProcessData = &ppd;
+            logWaterDiagnostics("POST-PPD", ctx, &ppd);
             PostShaders::shaderTime(&updatePostShader, ppd.envFlags, ppd.frameTime);
             s_postProcessData = nullptr;
             s_postShaderCtx = nullptr;
@@ -954,12 +1051,30 @@ void DistantLand::postProcess(DLContext* ctx, const PostProcessData& ppd) {
         // Capture pre-UI screenshots here
         checkCaptureScreenshot(false);
 
-        // Cache render for first frame of menu mode
-        if ((Configuration.MGEFlags & USE_MENU_CACHING) && ppd.isMenu) {
-            LOG::logline("[RENDERCACHE] Setting isRenderCached=true in postProcess overload (ppd.isMenu=true)");
-            texDistantBlend = PostShaders::borrowBuffer(0);
-            // TODO: For async N-1, this write to s_staging must complete before the next frame reads it
-            s_staging.isRenderCached = true;
+        // Deferred menu caching uses a dedicated texture that preserves the last fully composed
+        // non-menu frame, avoiding transient ping-pong buffers and partial menu-open frames.
+        if ((Configuration.MGEFlags & USE_MENU_CACHING) && surfMenuCache) {
+            IDirect3DSurface9* backbuffer = nullptr;
+            device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backbuffer);
+            if (backbuffer) {
+                if (!ppd.isMenu) {
+                    HRESULT hr = device->StretchRect(backbuffer, nullptr, surfMenuCache, nullptr, D3DTEXF_NONE);
+                    if (SUCCEEDED(hr)) {
+                        menuCacheValid = true;
+                    }
+                } else if (menuCacheValid) {
+                    LOG::logline("[RENDERCACHE] Enabling deferred HLSL menu cache from last live frame");
+                    s_staging.isRenderCached = true;
+                } else {
+                    HRESULT hr = device->StretchRect(backbuffer, nullptr, surfMenuCache, nullptr, D3DTEXF_NONE);
+                    if (SUCCEEDED(hr)) {
+                        menuCacheValid = true;
+                        LOG::logline("[RENDERCACHE] Primed deferred HLSL menu cache from current frame");
+                        s_staging.isRenderCached = true;
+                    }
+                }
+                backbuffer->Release();
+            }
         }
 
         // Restore state
@@ -967,12 +1082,14 @@ void DistantLand::postProcess(DLContext* ctx, const PostProcessData& ppd) {
         stateSaved->Release();
     } else {
         // Blit cached frame to screen
-        IDirect3DSurface9* backbuffer, *surfDistant;
+        IDirect3DSurface9* backbuffer = nullptr;
         device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backbuffer);
-        texDistantBlend->GetSurfaceLevel(0, &surfDistant);
-        device->StretchRect(surfDistant, 0, backbuffer, 0, D3DTEXF_NONE);
-        surfDistant->Release();
-        backbuffer->Release();
+        if (backbuffer && surfMenuCache && menuCacheValid) {
+            device->StretchRect(surfMenuCache, nullptr, backbuffer, nullptr, D3DTEXF_NONE);
+        }
+        if (backbuffer) {
+            backbuffer->Release();
+        }
 
         // Cache expires for frame after mouse click, so as not to affect click response time
         s_staging.isRenderCached &= !MGEProxyDirectInput::mouseClick;

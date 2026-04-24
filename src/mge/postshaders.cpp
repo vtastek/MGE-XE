@@ -47,6 +47,21 @@ IDirect3DSurface9* PostShaders::surfReadqueue, *PostShaders::surfReadback;
 D3DXVECTOR4 PostShaders::adaptPoint;
 float PostShaders::rcpRes[2];
 
+bool PostShaders::usesForwardSSAO(int environmentFlags) {
+    if (!isHLSLActive()) {
+        return false;
+    }
+    for (const auto& s : shaders) {
+        if (!s->enabled || (s->disableFlags & environmentFlags)) {
+            continue;
+        }
+        if (s->name == "SSAO Fast" || s->name == "SSAO HQ") {
+            return true;
+        }
+    }
+    return false;
+}
+
 
 
 // init - Initialize post-processing shader system
@@ -273,6 +288,10 @@ bool PostShaders::updateShaderChain() {
 
     if (updated) {
         orderShaders();
+    }
+
+    if (DistantLand::reloadForwardPrepass()) {
+        updated = true;
     }
 
     return updated;

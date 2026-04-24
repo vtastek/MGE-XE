@@ -75,6 +75,7 @@ public:
     static bool setShaderVar(const char* shaderName, const char* varName, float x);
     static bool setShaderVar(const char* shaderName, const char* varName, float* v);
     static bool setShaderEnable(const char* shaderName, bool enable);
+    static bool usesForwardSSAO(int environmentFlags);
 
     static void evalAdaptHDR(IDirect3DSurface9* source, int environmentFlags, float dt);
     enum HDRReadbackState {

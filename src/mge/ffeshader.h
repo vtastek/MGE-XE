@@ -24,6 +24,8 @@ struct DLContext {
     // Camera
     D3DXMATRIX mwView, mwProj;
     D3DXVECTOR4 eyeVec, eyePos;
+    int postEnvFlags;
+    float waterLevel;
 
     // Lighting
     D3DXVECTOR4 sunVec, sunPos;

@@ -11,6 +11,7 @@ bool ImGuiManager::showDemo = false;
 bool ImGuiManager::showPCFInterface = false;
 bool ImGuiManager::showDebugInterface = false;
 bool ImGuiManager::showHiZInterface = false;
+bool ImGuiManager::showSSAOInterface = false;
 HWND ImGuiManager::windowHandle = nullptr;
 
 // PCF filtering variables
@@ -202,7 +203,7 @@ bool ImGuiManager::Initialize(HWND hwnd, IDirect3DDevice9* device) {
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
     
     // Enable ImGui to draw its own cursor when interface is showing
-    io.MouseDrawCursor = showPCFInterface;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showFrameEventLog;
 
     // Setup Dear ImGui style
     ImGui::StyleColorsDark();
@@ -289,6 +290,11 @@ void ImGuiManager::Render() {
         RenderHiZInterface();
     }
 
+    // Show forward SSAO visualization interface
+    if (showSSAOInterface) {
+        RenderSSAOInterface();
+    }
+
     // Show frame event log
     if (showFrameEventLog) {
         RenderFrameEventLog();
@@ -351,7 +357,7 @@ void ImGuiManager::RenderPCFFilteringInterface() {
     
     // Update mouse cursor visibility based on interface state
     ImGuiIO& io = ImGui::GetIO();
-    io.MouseDrawCursor = showPCFInterface;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showFrameEventLog;
 }
 
 // Getter functions for shader constants
@@ -370,7 +376,7 @@ void ImGuiManager::TogglePCFInterface() {
     
     // Update mouse cursor visibility
     ImGuiIO& io = ImGui::GetIO();
-    io.MouseDrawCursor = showPCFInterface;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showFrameEventLog;
     
     // Save PCF settings when interface is being closed
     if (wasShowing && !showPCFInterface) {
@@ -558,6 +564,12 @@ void ImGuiManager::RenderDebugInterface() {
         ImGui::Text("Scene 1/2 Immediate Renders: %d", debugImmediateCount);
 
         ImGui::Separator();
+        ImGui::Text("Forward SSAO Prepass");
+        ImGui::Text("  Status: %s", DistantLand::forwardSSAOActive ? "Active" : "Inactive");
+        ImGui::Checkbox("Show SSAO Viewer", &showSSAOInterface);
+        ImGui::SetItemTooltip("Preview the raw or blurred SSAO texture generated before Scene 0 replay.");
+
+        ImGui::Separator();
         ImGui::Text("Bounding Box Visualization");
 
         const char* bboxModes[] = { "OFF", "Objects (Green=Rendered, Red=Culled)", "Lights (Green=Visible, Red=Culled)" };
@@ -697,7 +709,7 @@ void ImGuiManager::RenderDebugInterface() {
 
     // Update mouse cursor visibility based on interface state
     ImGuiIO& io = ImGui::GetIO();
-    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showFrameEventLog;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showFrameEventLog;
 }
 
 void ImGuiManager::ToggleDebugInterface() {
@@ -705,7 +717,7 @@ void ImGuiManager::ToggleDebugInterface() {
 
     // Update mouse cursor visibility
     ImGuiIO& io = ImGui::GetIO();
-    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showFrameEventLog;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showFrameEventLog;
 }
 
 // Debug control getters (Recording/Replay/Immediate/Depth always enabled)
@@ -1142,7 +1154,7 @@ void ImGuiManager::ToggleFrameEventLog() {
     showFrameEventLog = !showFrameEventLog;
 
     ImGuiIO& io = ImGui::GetIO();
-    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showFrameEventLog;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showFrameEventLog;
 }
 
 void ImGuiManager::RenderFrameEventLog() {
@@ -1600,7 +1612,7 @@ void ImGuiManager::RenderHiZInterface() {
 
     // Update mouse cursor visibility based on interface state
     ImGuiIO& io = ImGui::GetIO();
-    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showFrameEventLog;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showFrameEventLog;
 }
 
 void ImGuiManager::ToggleHiZInterface() {
@@ -1608,9 +1620,61 @@ void ImGuiManager::ToggleHiZInterface() {
 
     // Update mouse cursor visibility
     ImGuiIO& io = ImGui::GetIO();
-    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showFrameEventLog;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showFrameEventLog;
 }
 
 bool ImGuiManager::GetShowHiZInterface() {
     return showHiZInterface;
+}
+
+void ImGuiManager::RenderSSAOInterface() {
+    ImGui::SetNextWindowPos(ImVec2(1120, 10), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(700, 700), ImGuiCond_FirstUseEver);
+
+    if (ImGui::Begin("Forward SSAO Buffer", &showSSAOInterface)) {
+        static bool showRawSSAO = false;
+        static float ssaoZoom = 1.0f;
+
+        IDirect3DTexture9* texture = showRawSSAO ? DistantLand::texForwardSSAORaw : DistantLand::texForwardSSAO;
+        const char* textureLabel = showRawSSAO ? "Intermediate SSAO (between blur passes)" : "Final SSAO (forward replay input)";
+
+        ImGui::Text("Status: %s", DistantLand::forwardSSAOActive ? "Active this frame" : "Inactive this frame");
+        ImGui::Checkbox("Show Intermediate SSAO", &showRawSSAO);
+        ImGui::SetItemTooltip("Switch between the final forward SSAO texture and the intermediate buffer used between blur passes.");
+        ImGui::SliderFloat("Zoom", &ssaoZoom, 0.25f, 2.0f, "%.2fx");
+        ImGui::Text("%s", textureLabel);
+        ImGui::Separator();
+
+        if (texture) {
+            D3DSURFACE_DESC desc = {};
+            if (SUCCEEDED(texture->GetLevelDesc(0, &desc))) {
+                ImGui::Text("Resolution: %ux%u", desc.Width, desc.Height);
+                ImGui::BeginChild("ForwardSSAOTexture", ImVec2(0.0f, 0.0f), true, ImGuiWindowFlags_HorizontalScrollbar);
+
+                ImVec2 avail = ImGui::GetContentRegionAvail();
+                float fitScaleX = desc.Width > 0 ? avail.x / (float)desc.Width : 1.0f;
+                float fitScaleY = desc.Height > 0 ? avail.y / (float)desc.Height : 1.0f;
+                float fitScale = fitScaleX < fitScaleY ? fitScaleX : fitScaleY;
+                if (fitScale > 1.0f) {
+                    fitScale = 1.0f;
+                }
+                if (fitScale <= 0.0f) {
+                    fitScale = 1.0f;
+                }
+
+                float displayScale = fitScale * ssaoZoom;
+                ImGui::Image((void*)texture, ImVec2(desc.Width * displayScale, desc.Height * displayScale));
+                ImGui::EndChild();
+            } else {
+                ImGui::Text("Unable to query SSAO texture description.");
+            }
+        } else {
+            ImGui::Text("No forward SSAO texture available yet.");
+            ImGui::Text("Enable HLSL and an SSAO preset, then render Scene 0.");
+        }
+    }
+    ImGui::End();
+
+    ImGuiIO& io = ImGui::GetIO();
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showFrameEventLog;
 }

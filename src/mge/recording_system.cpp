@@ -507,8 +507,8 @@ void FixedFunctionShader::stopRecordingAndReplay() {
     // Clean up HLSL-only texture slots to prevent DXVK descriptor bloat
     // Use raw SetTexture to truly unbind (setCachedTexture substitutes default textures)
     // Slots 0-1 are used by Morrowind normally, don't touch them
-    // Slots 2-5 are HLSL-specific (paramH, paramX, shadow, lightData)
-    for (int i = 2; i < 6; i++) {
+    // Slots 2-10 are HLSL-specific (suffix maps, light data, draw data, overlay, forward SSAO)
+    for (int i = 2; i < 11; i++) {
         device->SetTexture(i, NULL);
         textureCache.updateCache(i, nullptr);
         textureCache.textureValid[i] = false;
@@ -644,7 +644,7 @@ void FixedFunctionShader::waitCullAndReplay() {
     replayRecordedCalls(0);
 
     // Clean up HLSL-only texture slots to prevent DXVK descriptor bloat
-    for (int i = 2; i < 6; i++) {
+    for (int i = 2; i < 11; i++) {
         device->SetTexture(i, NULL);
         textureCache.updateCache(i, nullptr);
         textureCache.textureValid[i] = false;
@@ -791,7 +791,7 @@ void FixedFunctionShader::restorePostRecordingState() {
     isRecording = false;
 
     // Clean up HLSL-only texture slots
-    for (int i = 2; i < 6; i++) {
+    for (int i = 2; i < 11; i++) {
         device->SetTexture(i, NULL);
         textureCache.updateCache(i, nullptr);
         textureCache.textureValid[i] = false;
@@ -1011,6 +1011,7 @@ void FixedFunctionShader::executeGpuPhase() {
 
     // Stage 1: grass, shadow overlay, depth
     DistantLand::renderStage1(frameCtx, &fb);
+    DistantLand::renderForwardPrepassChain(frameCtx, &fb.postProcessData);
 
     // Build HLSL replay into command buffer, then replay it
     // IMPORTANT: Only replay Scene 0 here! Scene 1/2 are recorded AFTER EndScene(0),
@@ -1046,7 +1047,7 @@ void FixedFunctionShader::executeGpuPhase() {
     // NOTE: postProcess moved to UI BeginScene to avoid RT/DS state corruption for Scene 1/2
 
     // Clean up HLSL-only texture slots to prevent DXVK descriptor bloat
-    for (int i = 2; i < 6; i++) {
+    for (int i = 2; i < 11; i++) {
         device->SetTexture(i, NULL);
         textureCache.updateCache(i, nullptr);
         textureCache.textureValid[i] = false;
@@ -1158,6 +1159,7 @@ void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool w
 
         // Use renderStage1 for Scene 0 depth (includes shadows, distant land setup)
         DistantLand::renderStage1(renderCtx, &fb);
+        DistantLand::renderForwardPrepassChain(renderCtx, &fb.postProcessData);
 
         // Render Scene 2 (hands) depth into the depth texture
         // Filter for sceneNum >= 2 only
@@ -1307,7 +1309,7 @@ void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool w
     }
 
     // Clean up HLSL state (textures, shaders)
-    for (int i = 2; i < 6; i++) {
+    for (int i = 2; i < 11; i++) {
         device->SetTexture(i, NULL);
         textureCache.updateCache(i, nullptr);
         textureCache.textureValid[i] = false;
@@ -1735,7 +1737,8 @@ void FixedFunctionShader::renderFullFrameAsync() {
         MGE_ZoneScopedN("Depth Passes");
         LOG::logline(">> renderFullFrameAsync Stage1 start");
         DistantLand::renderStage1(renderCtx, &fb);
-        LOG::logline(">> renderFullFrameAsync Stage1 done, Stage2 start");
+        DistantLand::renderForwardPrepassChain(renderCtx, &fb.postProcessData);
+        LOG::logline(">> renderFullFrameAsync Stage1 done, ForwardPrepass done, Stage2 start");
         DistantLand::renderStage2(renderCtx, &fb);
         LOG::logline(">> renderFullFrameAsync Stage2 done");
     }
@@ -1850,7 +1853,7 @@ void FixedFunctionShader::renderFullFrameAsync() {
     DistantLand::postProcess(renderCtx, fb.postProcessData);
 
     // Clean up HLSL state
-    for (int i = 2; i < 6; i++) {
+    for (int i = 2; i < 11; i++) {
         device->SetTexture(i, NULL);
         textureCache.updateCache(i, nullptr);
         textureCache.textureValid[i] = false;

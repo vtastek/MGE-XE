@@ -382,6 +382,44 @@ void FixedFunctionShader::bindShaderTextures(const ShaderKey& sk, const Rendered
     }
 }
 
+static void bindForwardSSAOSlot(IDirect3DDevice9* device, D3DCommandBuffer* cmdBuf, bool enabled) {
+    IDirect3DBaseTexture9* tex = enabled ? DistantLand::texForwardSSAO : nullptr;
+    device->SetTexture(10, tex);
+    device->SetSamplerState(10, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+    device->SetSamplerState(10, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    device->SetSamplerState(10, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+    device->SetSamplerState(10, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+    device->SetSamplerState(10, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+
+    if (cmdBuf) {
+        cmdBuf->recordSetTexture(10, tex);
+        cmdBuf->recordSetSamplerState(10, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+        cmdBuf->recordSetSamplerState(10, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+        cmdBuf->recordSetSamplerState(10, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+        cmdBuf->recordSetSamplerState(10, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+        cmdBuf->recordSetSamplerState(10, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+    }
+}
+
+static void setForwardSSAOParams(IDirect3DDevice9* device, D3DCommandBuffer* cmdBuf, bool enabled) {
+    D3DVIEWPORT9 vp{};
+    if (FAILED(device->GetViewport(&vp))) {
+        float v[4] = { enabled ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f };
+        setConstantF(cmdBuf, device, false, 24, v, 1);
+        return;
+    }
+
+    const float width = std::max(static_cast<float>(vp.Width), 1.0f);
+    const float height = std::max(static_cast<float>(vp.Height), 1.0f);
+    float v[4] = {
+        enabled ? 1.0f : 0.0f,
+        1.0f / width,
+        1.0f / height,
+        0.0f
+    };
+    setConstantF(cmdBuf, device, false, 24, v, 1);
+}
+
 
 // Helper function to compute ShaderKey with texture suffix detection
 FixedFunctionShader::ShaderKey FixedFunctionShader::computeShaderKeyWithSuffixes(const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
@@ -832,6 +870,11 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         device->SetSamplerState(9, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
         device->SetSamplerState(9, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
     }
+
+    const bool useForwardSSAO = DistantLand::forwardSSAOActive && replayCall &&
+        (replayCall->sceneNum == 0 || replayCall->sceneNum == 2);
+    bindForwardSSAOSlot(device, cmdBuf, useForwardSSAO);
+    setForwardSSAOParams(device, cmdBuf, useForwardSSAO);
 
     // When building command buffer, snapshot bound textures into the buffer
     // (bindShaderTextures sets device textures; we need them in the command buffer
@@ -1334,7 +1377,6 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             float v[4] = { ambient.r, ambient.g, ambient.b, 0 };
             cmdBuf->recordSetPSConstantF(hlslShader.regLightSceneAmbient.reg, v, 1);
         }
-
         // Point lights
         if (needPointLightBuffers) {
             if (hlslShader.regLightDiffuse.reg != REG_INVALID)
@@ -1526,7 +1568,6 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         if (hlslShader.hLightSceneAmbient) {
             hlslShader.psConstantTable->SetFloatArray(device, hlslShader.hLightSceneAmbient, (const float*)&ambient, 3);
         }
-
         // Point light uniforms — only for lightMode 1 (single) and 2 (few loop)
         if (needPointLightBuffers) {
             if (hlslShader.hLightDiffuse)
@@ -2895,6 +2936,11 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                             device->SetSamplerState(9, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
                             device->SetSamplerState(9, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
                         }
+
+                        const bool useForwardSSAO = DistantLand::forwardSSAOActive &&
+                            (firstCall.sceneNum == 0 || firstCall.sceneNum == 2);
+                        bindForwardSSAOSlot(device, nullptr, useForwardSSAO);
+                        setForwardSSAOParams(device, nullptr, useForwardSSAO);
                     }
 
                     {
@@ -2921,7 +2967,6 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                             float v[4] = { ImGuiManager::GetHeightBlendStrength(), ImGuiManager::GetHeightBlendContrast(), 0, 0 };
                             device->SetPixelShaderConstantF(23, v, 1);
                         }
-
                         // Set shadow matrices using hoisted view-to-shadow transforms
                         if (hlslShader.hShadowWorldViewProj) {
                             hlslShader.vsConstantTable->SetMatrixArray(device, hlslShader.hShadowWorldViewProj, shadowViewToClip, 2);

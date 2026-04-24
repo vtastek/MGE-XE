@@ -29,6 +29,7 @@ int pointLightCount;
 
 // Fog
 float3 fogColNear;
+float4 forwardSSAOParams : register(c24); // x = enabled, yz = 1 / viewport resolution
 
 // Textures with explicit register bindings for DX9 HLSL (original slot order)
 texture tex0 : register(t0);  // Base texture (or _diffparam when diffparam replaces base)
@@ -69,6 +70,8 @@ sampler sampOverlay : register(s8) = sampler_state{ texture = <tex8>; minfilter 
 texture tex9 : register(t9);
 sampler sampOverlayParamH : register(s9) = sampler_state{ texture = <tex9>; minfilter = anisotropic; magfilter = linear; mipfilter = linear; maxanisotropy = 16; };
 #endif
+texture tex10 : register(t10);
+sampler sampForwardSSAO : register(s10) = sampler_state{ texture = <tex10>; minfilter = linear; magfilter = linear; mipfilter = none; addressu = clamp; addressv = clamp; };
 
 // View inverse matrix for converting view-space to world space (used by texture lights and shadows)
 matrix viewInverse : register(c18);
@@ -130,6 +133,7 @@ struct VS_OUTPUT {
 #ifdef USE_STATELESS_BATCH
 	float drawIndex : TEXCOORD6;  // Draw index for material lookup
 #endif
+	float2 screenUV : TEXCOORD7;
 };
 
 
@@ -139,7 +143,7 @@ struct VS_OUTPUT {
 
 //------------------------------------------------------------
 // Pixel Shader Main
-float4 ps_main(VS_OUTPUT input) : COLOR{
+float4 ps_main(VS_OUTPUT input, float2 pixelPos : VPOS) : COLOR{
 	// Local material variables - either sampled from draw data texture or copied from uniforms
 	float4 useDiffuse;
 	float4 useAmbient;
@@ -182,6 +186,13 @@ float4 ps_main(VS_OUTPUT input) : COLOR{
 	float overlayMask = input.color.a;
 	
 	float3 ambient = INTENSITY * pow((lightSceneAmbient) + EPS, 2.2) / PI;
+	if (forwardSSAOParams.x > 0.5) {
+		// Screen-space AO must be sampled from per-pixel window coordinates, not a
+		// UV pre-divided by clip.w in the VS, or it will project across triangles.
+		float2 forwardSSAOUV = (pixelPos + 0.5.xx) * forwardSSAOParams.yz;
+		float forwardAO = saturate(1.0 - 1.8 * tex2D(sampForwardSSAO, forwardSSAOUV).r);
+		ambient *= forwardAO;
+	}
 	float shadows = 1.0;
 	#ifdef HAS_SHADOWS
 		float ndotlgeo = 1;

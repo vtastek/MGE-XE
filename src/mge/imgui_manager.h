@@ -165,6 +165,9 @@ public:
     static int GetHiZDisplayMip() { return hiZDisplayMip; }
     static bool GetHiZInvert() { return hiZInvert; }
 
+    // Forward SSAO visualization interface
+    static void RenderSSAOInterface();
+
     // Hi-Z occluder selection parameters
     static int GetOccluderMaxCount() { return occluderMaxCount; }
     static int GetOccluderP0ExtraBudget() { return occluderP0ExtraBudget; }
@@ -305,6 +308,7 @@ private:
     static bool showPCFInterface;
     static bool showDebugInterface;
     static bool showHiZInterface;
+    static bool showSSAOInterface;
     static HWND windowHandle;
 
     // PCF filtering variables for tweaking
