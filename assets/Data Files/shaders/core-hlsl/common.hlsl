@@ -267,9 +267,9 @@ float2 Parallax(
 	float4 hmapSample = tex2D(hmap, uv);
 	float h;
 	if (channel == 0) h = hmapSample.r;
-	else if (channel == 1) h = hmapSample.g;  // _paramh uses green for height
+	else if (channel == 1) h = hmapSample.g;
 	else if (channel == 2) h = hmapSample.b;
-	else h = hmapSample.a;  // Legacy _nh uses alpha for height
+	else h = hmapSample.a;  // _paramh (DXT5) and legacy _nh both store height in alpha
 
 	h = 2 * (1 - h) - 1;
 	float2 offset = (h * hs) * (-Vts.xy / max(Vts.z, 1e-3));
@@ -290,9 +290,9 @@ float ParallaxSoftShadow(
 	float h0, h;
 	float4 sample0 = tex2D(hmap, uv);
 	if (channel == 0) h0 = 1.0 - sample0.r;
-	else if (channel == 1) h0 = 1.0 - sample0.g;  // _paramh uses green for height
+	else if (channel == 1) h0 = 1.0 - sample0.g;
 	else if (channel == 2) h0 = 1.0 - sample0.b;
-	else h0 = 1.0 - sample0.a;  // Legacy _nh uses alpha for height
+	else h0 = 1.0 - sample0.a;  // _paramh (DXT5) and legacy _nh both store height in alpha
 
 	h = h0;
 	float2 lDir = -lightDirTS * scale;
@@ -331,8 +331,8 @@ float ParallaxSoftShadow(
 
 // Phase 8.5: dual-sampler soft parallax shadow. Traces against the height-blended
 // surface (base lerp overlay, weighted by mask) so the shadow follows the same
-// profile the eye sees (albedo/normal/PBR blend). Green channel only — _paramh
-// always stores height in green.
+// profile the eye sees (albedo/normal/PBR blend). Alpha channel only — _paramh
+// (DXT5) always stores height in alpha.
 float ParallaxSoftShadowBlend(
 	sampler2D hmapBase,
 	sampler2D hmapOverlay,
@@ -343,16 +343,16 @@ float ParallaxSoftShadowBlend(
 	float scale)
 {
 	float2 lDir = -lightDirTS * scale;
-	float h0 = 1.0 - lerp(tex2D(hmapBase, uv).g,
-	                      tex2D(hmapOverlay, uv).g, mask);
-	float h1 = 1.0 - lerp(tex2D(hmapBase, uv + 0.20 * lDir).g,
-	                      tex2D(hmapOverlay, uv + 0.20 * lDir).g, mask);
-	float h2 = 1.0 - lerp(tex2D(hmapBase, uv + 0.35 * lDir).g,
-	                      tex2D(hmapOverlay, uv + 0.35 * lDir).g, mask);
-	float h3 = 1.0 - lerp(tex2D(hmapBase, uv + 0.45 * lDir).g,
-	                      tex2D(hmapOverlay, uv + 0.45 * lDir).g, mask);
-	float h4 = 1.0 - lerp(tex2D(hmapBase, uv + 0.55 * lDir).g,
-	                      tex2D(hmapOverlay, uv + 0.55 * lDir).g, mask);
+	float h0 = 1.0 - lerp(tex2D(hmapBase, uv).a,
+	                      tex2D(hmapOverlay, uv).a, mask);
+	float h1 = 1.0 - lerp(tex2D(hmapBase, uv + 0.20 * lDir).a,
+	                      tex2D(hmapOverlay, uv + 0.20 * lDir).a, mask);
+	float h2 = 1.0 - lerp(tex2D(hmapBase, uv + 0.35 * lDir).a,
+	                      tex2D(hmapOverlay, uv + 0.35 * lDir).a, mask);
+	float h3 = 1.0 - lerp(tex2D(hmapBase, uv + 0.45 * lDir).a,
+	                      tex2D(hmapOverlay, uv + 0.45 * lDir).a, mask);
+	float h4 = 1.0 - lerp(tex2D(hmapBase, uv + 0.55 * lDir).a,
+	                      tex2D(hmapOverlay, uv + 0.55 * lDir).a, mask);
 	float h = min(min(min(h1, h2), min(h3, h4)), 1.0);
 	return min(1.0, 1.0 - saturate((h0 - h) * soften));
 }

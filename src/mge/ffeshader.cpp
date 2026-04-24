@@ -541,54 +541,54 @@ void FixedFunctionShader::startEarlyPrecache(IDirect3DDevice* d) {
             if (hlslMode) {
                 LOG::logline("-- Precache thread started");
 
-                // Variant struct: {lighting, lightMode, vertexCol, vertexMat, heavyLighting, skinning, dp, ph, px, fogMode, stages}
+                // Variant struct: {lighting, lightMode, vertexCol, vertexMat, heavyLighting, skinning, ph, px, fogMode, stages}
                 struct ShaderVariant {
                     int lighting, lightMode, vertexCol, vertexMat, heavyLighting, skinning;
-                    int hasDiffParam, hasParamH, hasParamX, fogMode, stages;
+                    int hasParamH, hasParamX, fogMode, stages;
                 };
 
                 // Order: lm=3 first (most complex/likely needed), then lm=2, lm=1, lm=0, unlit last
                 ShaderVariant variants[] = {
                     // lm=3 (texture lights) — FIRST: most complex, most likely to be needed
-                    {1,3, 0,1, 0,0, 0,0,0, 1,1}, {1,3, 1,2, 0,0, 0,0,0, 1,1},  // hl=0 base
-                    {1,3, 0,1, 0,0, 1,1,0, 1,1}, {1,3, 1,2, 0,0, 1,1,0, 1,1},  // hl=0 dp+ph
-                    {1,3, 0,1, 0,1, 0,0,0, 1,1}, {1,3, 1,2, 0,1, 0,0,0, 1,1},  // hl=0 skin
-                    {1,3, 0,1, 1,0, 0,0,0, 1,1}, {1,3, 1,2, 1,0, 0,0,0, 1,1},  // hl=1 base
-                    {1,3, 0,1, 1,0, 1,1,0, 1,1}, {1,3, 1,2, 1,0, 1,1,0, 1,1},  // hl=1 dp+ph
-                    {1,3, 0,1, 1,1, 0,0,0, 1,1}, {1,3, 1,2, 1,1, 0,0,0, 1,1},  // hl=1 skin
-                    {1,3, 1,2, 0,0, 0,0,0, 2,1}, {1,3, 1,2, 1,0, 0,0,0, 2,1},  // fog=2
+                    {1,3, 0,1, 0,0, 0,0, 1,1}, {1,3, 1,2, 0,0, 0,0, 1,1},  // hl=0 base
+                    {1,3, 0,1, 0,0, 1,0, 1,1}, {1,3, 1,2, 0,0, 1,0, 1,1},  // hl=0 ph
+                    {1,3, 0,1, 0,1, 0,0, 1,1}, {1,3, 1,2, 0,1, 0,0, 1,1},  // hl=0 skin
+                    {1,3, 0,1, 1,0, 0,0, 1,1}, {1,3, 1,2, 1,0, 0,0, 1,1},  // hl=1 base
+                    {1,3, 0,1, 1,0, 1,0, 1,1}, {1,3, 1,2, 1,0, 1,0, 1,1},  // hl=1 ph
+                    {1,3, 0,1, 1,1, 0,0, 1,1}, {1,3, 1,2, 1,1, 0,0, 1,1},  // hl=1 skin
+                    {1,3, 1,2, 0,0, 0,0, 2,1}, {1,3, 1,2, 1,0, 0,0, 2,1},  // fog=2
 
                     // lm=2 (few lights)
-                    {1,2, 0,1, 0,0, 0,0,0, 1,1}, {1,2, 0,1, 1,0, 0,0,0, 1,1},
-                    {1,2, 1,2, 0,0, 0,0,0, 1,1}, {1,2, 1,2, 1,0, 0,0,0, 1,1},
-                    {1,2, 0,1, 0,0, 1,1,0, 1,1}, {1,2, 0,1, 1,0, 1,1,0, 1,1},
-                    {1,2, 1,2, 0,0, 1,1,0, 1,1}, {1,2, 1,2, 1,0, 1,1,0, 1,1},
-                    {1,2, 0,1, 0,1, 0,0,0, 1,1}, {1,2, 0,1, 1,1, 0,0,0, 1,1},
-                    {1,2, 1,2, 0,1, 0,0,0, 1,1}, {1,2, 1,2, 1,1, 0,0,0, 1,1},
-                    {1,2, 1,1, 0,1, 1,1,0, 1,1}, {1,2, 0,1, 0,0, 0,0,0, 1,2},
-                    {1,2, 1,2, 0,0, 0,0,0, 2,1}, {1,2, 1,2, 1,0, 0,0,0, 2,1},
+                    {1,2, 0,1, 0,0, 0,0, 1,1}, {1,2, 0,1, 1,0, 0,0, 1,1},
+                    {1,2, 1,2, 0,0, 0,0, 1,1}, {1,2, 1,2, 1,0, 0,0, 1,1},
+                    {1,2, 0,1, 0,0, 1,0, 1,1}, {1,2, 0,1, 1,0, 1,0, 1,1},
+                    {1,2, 1,2, 0,0, 1,0, 1,1}, {1,2, 1,2, 1,0, 1,0, 1,1},
+                    {1,2, 0,1, 0,1, 0,0, 1,1}, {1,2, 0,1, 1,1, 0,0, 1,1},
+                    {1,2, 1,2, 0,1, 0,0, 1,1}, {1,2, 1,2, 1,1, 0,0, 1,1},
+                    {1,2, 1,1, 0,1, 1,0, 1,1}, {1,2, 0,1, 0,0, 0,0, 1,2},
+                    {1,2, 1,2, 0,0, 0,0, 2,1}, {1,2, 1,2, 1,0, 0,0, 2,1},
 
                     // lm=1 (single point light)
-                    {1,1, 0,1, 0,0, 0,0,0, 1,1}, {1,1, 1,2, 0,0, 0,0,0, 1,1},
-                    {1,1, 0,1, 0,0, 1,1,0, 1,1}, {1,1, 1,2, 0,0, 1,1,0, 1,1},
-                    {1,1, 0,1, 0,1, 0,0,0, 1,1},
-                    {1,1, 1,1, 0,1, 0,0,0, 1,1}, {1,1, 1,1, 0,1, 1,1,0, 1,1},
-                    {1,1, 1,2, 0,0, 0,0,0, 2,1},
+                    {1,1, 0,1, 0,0, 0,0, 1,1}, {1,1, 1,2, 0,0, 0,0, 1,1},
+                    {1,1, 0,1, 0,0, 1,0, 1,1}, {1,1, 1,2, 0,0, 1,0, 1,1},
+                    {1,1, 0,1, 0,1, 0,0, 1,1},
+                    {1,1, 1,1, 0,1, 0,0, 1,1}, {1,1, 1,1, 0,1, 1,0, 1,1},
+                    {1,1, 1,2, 0,0, 0,0, 2,1},
 
                     // lm=0 (sun only)
-                    {1,0, 0,1, 0,0, 0,0,0, 1,1}, {1,0, 1,2, 0,0, 0,0,0, 1,1},
-                    {1,0, 0,1, 0,0, 1,1,0, 1,1}, {1,0, 1,2, 0,0, 1,1,0, 1,1},
-                    {1,0, 0,1, 0,1, 0,0,0, 1,1}, {1,0, 1,2, 0,1, 0,0,0, 1,1},
-                    {1,0, 1,1, 0,0, 0,0,0, 1,1}, {1,0, 1,1, 0,1, 0,0,0, 1,1},
-                    {1,0, 1,1, 0,1, 1,1,0, 1,1}, {1,0, 0,1, 0,0, 0,0,0, 1,2},
+                    {1,0, 0,1, 0,0, 0,0, 1,1}, {1,0, 1,2, 0,0, 0,0, 1,1},
+                    {1,0, 0,1, 0,0, 1,0, 1,1}, {1,0, 1,2, 0,0, 1,0, 1,1},
+                    {1,0, 0,1, 0,1, 0,0, 1,1}, {1,0, 1,2, 0,1, 0,0, 1,1},
+                    {1,0, 1,1, 0,0, 0,0, 1,1}, {1,0, 1,1, 0,1, 0,0, 1,1},
+                    {1,0, 1,1, 0,1, 1,0, 1,1}, {1,0, 0,1, 0,0, 0,0, 1,2},
 
                     // UNLIT (lighting=0) — particles, UI, emissive-only objects (last)
-                    {0,0, 0,0, 0,0, 0,0,0, 0,0}, {0,0, 0,0, 0,0, 0,0,0, 1,0},
-                    {0,0, 0,1, 0,0, 0,0,0, 0,0}, {0,0, 0,1, 0,0, 0,0,0, 1,0},
-                    {0,0, 1,2, 0,0, 0,0,0, 0,0}, {0,0, 1,2, 0,0, 0,0,0, 1,0},
-                    {0,0, 0,1, 0,0, 0,0,0, 1,1}, {0,0, 1,2, 0,0, 0,0,0, 1,1},
-                    {0,0, 0,1, 0,0, 0,0,0, 0,1}, {0,0, 1,2, 0,0, 0,0,0, 0,1},
-                    {0,0, 0,0, 0,0, 0,0,0, 1,1}, {0,0, 0,0, 0,0, 0,0,0, 0,1},
+                    {0,0, 0,0, 0,0, 0,0, 0,0}, {0,0, 0,0, 0,0, 0,0, 1,0},
+                    {0,0, 0,1, 0,0, 0,0, 0,0}, {0,0, 0,1, 0,0, 0,0, 1,0},
+                    {0,0, 1,2, 0,0, 0,0, 0,0}, {0,0, 1,2, 0,0, 0,0, 1,0},
+                    {0,0, 0,1, 0,0, 0,0, 1,1}, {0,0, 1,2, 0,0, 0,0, 1,1},
+                    {0,0, 0,1, 0,0, 0,0, 0,1}, {0,0, 1,2, 0,0, 0,0, 0,1},
+                    {0,0, 0,0, 0,0, 0,0, 1,1}, {0,0, 0,0, 0,0, 0,0, 0,1},
                 };
                 const int numVariants = sizeof(variants) / sizeof(variants[0]);
 
@@ -608,7 +608,6 @@ void FixedFunctionShader::startEarlyPrecache(IDirect3DDevice* d) {
                     sk.vertexMaterial = v.vertexMat;
                     sk.usesSkinning = v.skinning;
                     sk.heavyLighting = v.heavyLighting;
-                    sk.hasDiffParam = v.hasDiffParam;
                     sk.hasParamH = v.hasParamH;
                     sk.hasParamX = v.hasParamX;
                     sk.hasGrass = 0;
@@ -1350,14 +1349,14 @@ void FixedFunctionShader::createDefaultTextures() {
         }
     }
 
-    // Create 1x1 paramH texture with neutral PBR values
-    // R=0 (metalness=0), G=128 (height=0.5 neutral for parallax), B=128 (IOR=0.5), A=255
-    // Note: G=128 gives neutral parallax (no displacement) and roughness=0.5
-    // D3DFMT_A8R8G8B8 packs as 0xAARRGGBB
+    // Create 1x1 paramH texture with neutral PBR values (new DXT5 packing semantics)
+    // R=0 metalness, G=128 roughness(0.5), B=128 IOR(0.5), A=0 height (no parallax)
+    // D3DFMT_A8R8G8B8 packs as 0xAARRGGBB. Defensive default only — with HAS_PARAMH
+    // set, a real paramh is always bound.
     if (device->CreateTexture(1, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &defaultParamHTexture, nullptr) == S_OK) {
         D3DLOCKED_RECT lockedRect;
         if (defaultParamHTexture->LockRect(0, &lockedRect, nullptr, 0) == S_OK) {
-            *(DWORD*)lockedRect.pBits = 0xFF008080; // A=255, R=0, G=128, B=128
+            *(DWORD*)lockedRect.pBits = 0x00008080; // A=0, R=0, G=128, B=128
             defaultParamHTexture->UnlockRect(0);
         }
     }
@@ -1572,8 +1571,8 @@ void FixedFunctionShader::startAsyncCompiler() {
                 request->result = generateMWShaderHLSL(request->key);
                 request->completed = true;
                 
-                // LOG::logline("-- HLSL Async compiled shader with flags diffparam=%d normal=%d param=%d", 
-                //            request->key.hasDiffParam, request->key.hasNormal, request->key.hasParam);
+                // LOG::logline("-- HLSL Async compiled shader with flags paramh=%d paramx=%d",
+                //            request->key.hasParamH, request->key.hasParamX);
             }
         }
         
@@ -1704,8 +1703,8 @@ void FixedFunctionShader::queueShaderCompilation(const ShaderKey& key) {
     }
     queueCondition.notify_one();
     
-    // LOG::logline("-- HLSL Queued async compilation for shader with flags diffparam=%d normal=%d param=%d", 
-    //            key.hasDiffParam, key.hasNormal, key.hasParam);
+    // LOG::logline("-- HLSL Queued async compilation for shader with flags paramh=%d paramx=%d",
+    //            key.hasParamH, key.hasParamX);
 }
 
 void FixedFunctionShader::processAsyncCompletions() {
@@ -1779,13 +1778,12 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         defines[defineCount++] = {"USE_TEXTURE_LIGHTS", "1"};
     }
 
-    if (sk.hasDiffParam) {
-        defines[defineCount++] = {"HAS_DIFFPARAM", "1"};
-        // LOG::logline("HLSL: Compiling with HAS_DIFFPARAM define");
-    }
     if (sk.hasParamH) {
         defines[defineCount++] = {"HAS_PARAMH", "1"};
         // LOG::logline("HLSL: Compiling with HAS_PARAMH define");
+    }
+    if (sk.disableParallax) {
+        defines[defineCount++] = {"SKIP_PARALLAX", "1"};
     }
     if (sk.hasParamX) {
         defines[defineCount++] = {"HAS_PARAMX", "1"};
@@ -1827,7 +1825,7 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     // LOG::logline("HLSL: Compiling shader with %d defines", defineCount);
     
     // Compile vertex shader
-    // TODO: Optimize - vertex shaders don't use texture suffix defines (HAS_DIFFPARAM, HAS_NORMAL, HAS_PARAM)
+    // TODO: Optimize - vertex shaders don't use texture suffix defines (HAS_PARAMH, HAS_PARAMX)
     // Many vertex shaders could be cached and reused across pixel shader variants
     ID3DBlob* vsBlob = nullptr;
     ID3DBlob* vsErrors = nullptr;
@@ -2915,7 +2913,7 @@ struct FrameSnapshot {
                 nullptr, nullptr, nullptr,  // 18-20: bumpmapStage
                 "usesTexgen", "projectiveTexgen",  // 21-22
                 nullptr, nullptr, nullptr,  // 23-25: texgenStage
-                "hasDiffParam", "hasParamH", "hasParamX",  // 26-28
+                "hasParamH", "disableParallax", "hasParamX",  // 26-28
                 "hasShadows", "hasGrass", "hasDetail"  // 29-31
             };
             for (const auto& [xorBits, count] : shaderXorHistogram) {

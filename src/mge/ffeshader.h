@@ -629,8 +629,8 @@ class FixedFunctionShader {
         DWORD usesTexgen : 1;
         DWORD projectiveTexgen : 1;
         DWORD texgenStage : 3;
-        DWORD hasDiffParam : 1;        // Has diffuse parameter texture (_diffparam)
-        DWORD hasParamH : 1;           // Has parameter texture (_paramh: metallic/roughness|height/IOR)
+        DWORD hasParamH : 1;           // Has parameter texture (_paramh DXT5: R=metal, G=rough, B=IOR, A=height)
+        DWORD disableParallax : 1;     // paramh authored as _paramh_np: use height for normal gradient only, skip parallax
         DWORD hasParamX : 1;           // Has anisotropic texture (_paramx: aniso rotation/strength/metallic)
         DWORD hasShadows : 1;          // Has shadow mapping enabled
         DWORD hasGrass : 1;            // Is grass texture (enables vertex animation and A2C)
@@ -754,7 +754,6 @@ private:
         bool dynamicConstsResolved;
 
         // Suffix texture support
-        IDirect3DTexture9* diffparamTexture;
         IDirect3DTexture9* normalTexture;
         bool hasSuffixSupport;
 

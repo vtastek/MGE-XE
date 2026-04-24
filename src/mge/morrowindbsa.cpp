@@ -385,21 +385,18 @@ static std::string normalizeTexturePath(const char* texPath) {
     return normalized;
 }
 
-// Extract base name from texture path (removes suffix like _diffparam, _nh, etc)
+// Extract base name from texture path (removes known suffixes like _paramh/_paramh_np/_paramx).
+// Check longest suffixes first so _paramh_np isn't treated as _paramh leftovers.
 static std::string extractBaseName(const std::string& texPath) {
     std::string baseName = texPath;
-    
+
     // Remove file extension
     size_t dotPos = baseName.find_last_of('.');
     if (dotPos != std::string::npos) {
         baseName = baseName.substr(0, dotPos);
     }
-    
-    // Check for known suffixes and remove them (order matters - check longer suffixes first)
-    if (baseName.length() > 12 && baseName.substr(baseName.length() - 12) == "_diffparam_t") {
-        return baseName.substr(0, baseName.length() - 12);
-    }
-    if (baseName.length() > 10 && baseName.substr(baseName.length() - 10) == "_diffparam") {
+
+    if (baseName.length() > 10 && baseName.substr(baseName.length() - 10) == "_paramh_np") {
         return baseName.substr(0, baseName.length() - 10);
     }
     if (baseName.length() > 7 && baseName.substr(baseName.length() - 7) == "_paramh") {
@@ -408,25 +405,22 @@ static std::string extractBaseName(const std::string& texPath) {
     if (baseName.length() > 7 && baseName.substr(baseName.length() - 7) == "_paramx") {
         return baseName.substr(0, baseName.length() - 7);
     }
-    
+
     return baseName;
 }
 
-// Check if texture name has a known suffix
+// Check if texture name has a known suffix. Longest-first match order.
 static const char* getSuffixType(const std::string& texPath) {
     std::string baseName = texPath;
-    
+
     // Remove file extension
     size_t dotPos = baseName.find_last_of('.');
     if (dotPos != std::string::npos) {
         baseName = baseName.substr(0, dotPos);
     }
-    
-    if (baseName.length() > 12 && baseName.substr(baseName.length() - 12) == "_diffparam_t") {
-        return "diffparam_t";
-    }
-    if (baseName.length() > 10 && baseName.substr(baseName.length() - 10) == "_diffparam") {
-        return "diffparam";
+
+    if (baseName.length() > 10 && baseName.substr(baseName.length() - 10) == "_paramh_np") {
+        return "paramh_np";
     }
     if (baseName.length() > 7 && baseName.substr(baseName.length() - 7) == "_paramh") {
         return "paramh";
@@ -434,7 +428,7 @@ static const char* getSuffixType(const std::string& texPath) {
     if (baseName.length() > 7 && baseName.substr(baseName.length() - 7) == "_paramx") {
         return "paramx";
     }
-    
+
     return nullptr; // Base texture
 }
 
@@ -485,13 +479,10 @@ static void scanDirectoryForSuffixes(const std::string& basePath, const std::str
             // Check for suffix patterns (check longer suffixes first)
             bool isSuffixFile = false;
             std::string suffixType;
-            
-            if (filename.length() > 15 && filename.substr(filename.length() - 16) == "_diffparam_t.dds") {
+
+            if (filename.length() > 13 && filename.substr(filename.length() - 14) == "_paramh_np.dds") {
                 isSuffixFile = true;
-                suffixType = "diffparam_t";
-            } else if (filename.length() > 13 && filename.substr(filename.length() - 14) == "_diffparam.dds") {
-                isSuffixFile = true;
-                suffixType = "diffparam";
+                suffixType = "paramh_np";
             } else if (filename.length() > 10 && filename.substr(filename.length() - 11) == "_paramh.dds") {
                 isSuffixFile = true;
                 suffixType = "paramh";
@@ -499,26 +490,25 @@ static void scanDirectoryForSuffixes(const std::string& basePath, const std::str
                 isSuffixFile = true;
                 suffixType = "paramx";
             }
-            
+
             if (isSuffixFile) {
                 std::string normalizedPath = normalizeTexturePath(fullRelativePath.c_str());
                 std::string baseName = extractBaseName(normalizedPath);
-                
+
                 TextureSuffixVariants& variants = suffixMap[baseName];
                 variants.baseName = baseName;
                 variants.isGrassTexture = false;
-                
-                if (suffixType == "diffparam") {
-                    variants.diffparam = fullRelativePath;
-                    LOG::logline("DEBUG: Storing _diffparam variant for base %s: %s", baseName.c_str(), variants.diffparam.c_str());
-                } else if (suffixType == "diffparam_t") {
-                    variants.diffparam_t = fullRelativePath;
+
+                if (suffixType == "paramh_np") {
+                    variants.paramh = fullRelativePath;
+                    variants.paramhNoParallax = true;
                 } else if (suffixType == "paramh") {
                     variants.paramh = fullRelativePath;
+                    variants.paramhNoParallax = false;
                 } else if (suffixType == "paramx") {
                     variants.paramx = fullRelativePath;
                 }
-                
+
                 suffixFilesFound++;
             }
             
@@ -594,9 +584,7 @@ void buildTextureSuffixDatabase() {
         
         // Extract the directory path from one of the suffix files to know where to look for base texture
         std::string suffixPath;
-        if (!variants.diffparam.empty()) {
-            suffixPath = variants.diffparam;
-        } else if (!variants.paramh.empty()) {
+        if (!variants.paramh.empty()) {
             suffixPath = variants.paramh;
         } else if (!variants.paramx.empty()) {
             suffixPath = variants.paramx;
@@ -905,11 +893,7 @@ const std::string* resolveTextureNameFromHash(const TextureRuntimeHash& hash) {
 IDirect3DTexture9* loadSuffixTexture(IDirect3DDevice9* dev, const TextureSuffixVariants& variants, const char* suffixType) {
     const char* texturePath = nullptr;
     
-    if (strcmp(suffixType, "diffparam") == 0 && variants.hasDiffParam()) {
-        texturePath = variants.diffparam.c_str();
-    } else if (strcmp(suffixType, "diffparam_t") == 0 && variants.hasDiffParamT()) {
-        texturePath = variants.diffparam_t.c_str();
-    } else if (strcmp(suffixType, "paramh") == 0 && variants.hasParamH()) {
+    if (strcmp(suffixType, "paramh") == 0 && variants.hasParamH()) {
         texturePath = variants.paramh.c_str();
     } else if (strcmp(suffixType, "paramx") == 0 && variants.hasParamX()) {
         texturePath = variants.paramx.c_str();

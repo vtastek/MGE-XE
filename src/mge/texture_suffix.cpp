@@ -42,11 +42,6 @@ void warmCache(IDirect3DDevice9* device, IDirect3DTexture9* texture) {
 
         // Pre-load suffix textures so bindShaderTextures never stalls on disk I/O
         if (entry.variants) {
-            if (entry.variants->hasDiffParamT()) {
-                BSA::loadSuffixTexture(device, *entry.variants, "diffparam_t");
-            } else if (entry.variants->hasDiffParam()) {
-                BSA::loadSuffixTexture(device, *entry.variants, "diffparam");
-            }
             if (entry.variants->hasParamH()) {
                 IDirect3DTexture9* ph = BSA::loadSuffixTexture(device, *entry.variants, "paramh");
                 if (ph) {
@@ -72,7 +67,7 @@ void warmCache(IDirect3DDevice9* device, IDirect3DTexture9* texture) {
 }
 
 SuffixTextureFlags getFlagsForTexture(IDirect3DDevice9* device, IDirect3DTexture9* texture) {
-    SuffixTextureFlags flags = {false, false, false, false};
+    SuffixTextureFlags flags = {};
 
     if (!texture || Configuration.PerPixelLightFlags != 2) {
         return flags;
@@ -93,11 +88,11 @@ SuffixTextureFlags getFlagsForTexture(IDirect3DDevice9* device, IDirect3DTexture
             LOG::logline("RUNTIME HASH MATCH: %08x -> %s", texHash.crc32, textureName->c_str());
 
             const BSA::TextureSuffixVariants* variants = BSA::getTextureSuffixVariants(textureName->c_str());
-            if (variants && (variants->hasDiffParam() || variants->hasParamH() || variants->hasParamX() || variants->hasGrass())) {
-                flags.hasDiffParam = variants->hasDiffParam() || variants->hasDiffParamT();
+            if (variants && (variants->hasParamH() || variants->hasParamX() || variants->hasGrass())) {
                 flags.hasParamH = variants->hasParamH();
                 flags.hasParamX = variants->hasParamX();
                 flags.hasGrass = variants->hasGrass();
+                flags.paramhNoParallax = variants->paramhNoParallax;
             }
         } else {
             LOG::logline("RUNTIME HASH FAILED: %08x -> NO MATCH FOUND", texHash.crc32);

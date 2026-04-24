@@ -591,13 +591,13 @@ void FixedFunctionShader::finalizeBatchAndSubmitCull() {
             bool hit = diagHitKeys.count(k) > 0;
             char buf[256];
             snprintf(buf, sizeof(buf),
-                "%s lm=%d lit=%d vc=%d vm=%d hl=%d skin=%d fog=%d uv=%d stg=%d shd=%d det=%d dp=%d ph=%d px=%d gr=%d bm=%d tg=%d",
+                "%s lm=%d lit=%d vc=%d vm=%d hl=%d skin=%d fog=%d uv=%d stg=%d shd=%d det=%d ph=%d px=%d gr=%d bm=%d tg=%d",
                 hit ? "HIT " : "UNUSED",
                 (int)k.lightMode, (int)k.useLighting, (int)k.vertexColour,
                 (int)k.vertexMaterial, (int)k.heavyLighting,
                 (int)k.usesSkinning, (int)k.fogMode, (int)k.uvSets,
                 (int)k.activeStages,
-                (int)k.hasShadows, (int)k.hasDetail, (int)k.hasDiffParam,
+                (int)k.hasShadows, (int)k.hasDetail,
                 (int)k.hasParamH, (int)k.hasParamX, (int)k.hasGrass,
                 (int)k.usesBumpmap, (int)k.usesTexgen);
             LOG::logline("%s", buf);
@@ -872,13 +872,13 @@ void FixedFunctionShader::finalizeAndRender(DLContext* frameCtx, bool waterSeen)
             bool hit = diagHitKeys.count(k) > 0;
             char buf[256];
             snprintf(buf, sizeof(buf),
-                "%s lm=%d lit=%d vc=%d vm=%d hl=%d skin=%d fog=%d uv=%d stg=%d shd=%d det=%d dp=%d ph=%d px=%d gr=%d bm=%d tg=%d",
+                "%s lm=%d lit=%d vc=%d vm=%d hl=%d skin=%d fog=%d uv=%d stg=%d shd=%d det=%d ph=%d px=%d gr=%d bm=%d tg=%d",
                 hit ? "HIT " : "UNUSED",
                 (int)k.lightMode, (int)k.useLighting, (int)k.vertexColour,
                 (int)k.vertexMaterial, (int)k.heavyLighting,
                 (int)k.usesSkinning, (int)k.fogMode, (int)k.uvSets,
                 (int)k.activeStages,
-                (int)k.hasShadows, (int)k.hasDetail, (int)k.hasDiffParam,
+                (int)k.hasShadows, (int)k.hasDetail,
                 (int)k.hasParamH, (int)k.hasParamX, (int)k.hasGrass,
                 (int)k.usesBumpmap, (int)k.usesTexgen);
             LOG::logline("%s", buf);
@@ -2074,3 +2074,4 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
     // Occluder selection and rasterization deferred to prepareRecordedCalls()
     // This removes the heaviest per-draw work from the recording hot path
 }
+\r

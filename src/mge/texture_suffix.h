@@ -1,5 +1,5 @@
 // Texture suffix resolution and caching system
-// Handles BSA texture suffix detection (_diffparam, _paramh, _paramx, _grass)
+// Handles BSA texture suffix detection (_paramh, _paramx, _grass)
 #pragma once
 
 #include "proxydx/d3d8header.h"
@@ -11,10 +11,10 @@ namespace TextureSuffix {
 
 // Texture suffix flags for shader variant selection
 struct SuffixTextureFlags {
-    bool hasDiffParam = false;
     bool hasParamH = false;
     bool hasParamX = false;
     bool hasGrass = false;
+    bool paramhNoParallax = false;  // paramh authored as _paramh_np: height-derived normal only, no parallax step
 };
 
 // Cached texture resolution data (avoids repeated hash calculations)
@@ -33,16 +33,14 @@ struct ResolutionCache {
 struct BindingState {
     IDirect3DTexture9* lastBaseTexture;  // Texture pointer for fast comparison
     std::string currentBaseTextureName;
-    IDirect3DTexture9* boundDiffParam;
     IDirect3DTexture9* boundParamH;
     IDirect3DTexture9* boundParamX;
 
-    BindingState() : lastBaseTexture(nullptr), boundDiffParam(nullptr), boundParamH(nullptr), boundParamX(nullptr) {}
+    BindingState() : lastBaseTexture(nullptr), boundParamH(nullptr), boundParamX(nullptr) {}
 
     void reset() {
         lastBaseTexture = nullptr;
         currentBaseTextureName.clear();
-        boundDiffParam = nullptr;
         boundParamH = nullptr;
         boundParamX = nullptr;
     }

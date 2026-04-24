@@ -240,45 +240,10 @@ void FixedFunctionShader::bindShaderTextures(const ShaderKey& sk, const Rendered
 
     auto& bindState = TextureSuffix::getBindingState();
 
-    // Slot 0: Base texture or diffparam replacement (always used by HLSL shaders)
+    // Slot 0: Base texture (always used by HLSL shaders)
+    // Morrowind-mode packing: base color is the plain `<name>.dds` Morrowind binds.
     IDirect3DTexture9* baseTexture = rs->texture;
-
-    // Check for diffparam replacement if shader supports it
-    if (sk.hasDiffParam) {
-        const auto* cached = TextureSuffix::getCachedResolution(rs->texture);
-        if (cached && cached->hasValidName && cached->variants) {
-            // Use cached diffparam replacement or load once per texture change
-            if (bindState.currentBaseTextureName == cached->textureName &&
-                bindState.boundDiffParam) {
-                // Use cached replacement
-                baseTexture = bindState.boundDiffParam;
-            } else {
-                // Load replacement texture once for this base texture
-                IDirect3DTexture9* replacementTexture = nullptr;
-                if (cached->variants->hasDiffParamT()) {
-                    replacementTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device,
-                                                              *cached->variants, "diffparam_t");
-                }
-                if (!replacementTexture && cached->variants->hasDiffParam()) {
-                    replacementTexture = BSA::loadSuffixTexture((IDirect3DDevice9*)device,
-                                                              *cached->variants, "diffparam");
-                }
-
-                if (replacementTexture) {
-                    baseTexture = replacementTexture;
-                    // Cache this replacement for future use with same base texture
-                    bindState.boundDiffParam = replacementTexture;
-                }
-            }
-        }
-    }
-
-    // Use sampler preservation if base texture is a diffparam replacement
-    if (sk.hasDiffParam && baseTexture != rs->texture) {
-        setCachedTextureWithSamplerPreservation(device, 0, baseTexture);
-    } else {
-        setCachedTexture(device, 0, baseTexture);
-    }
+    setCachedTexture(device, 0, baseTexture);
 
     // Slot 1: Detail texture (conditional only - with ifdef support)
     if (sk.hasDetail && savedOriginalDetailTexture) {
@@ -286,7 +251,7 @@ void FixedFunctionShader::bindShaderTextures(const ShaderKey& sk, const Rendered
     }
 
     // Slots 2-3: Suffix textures (only if shader has suffix support)
-    if (sk.hasDiffParam || sk.hasParamH || sk.hasParamX) {
+    if (sk.hasParamH || sk.hasParamX) {
         // Fast check: if same texture pointer, skip all expensive operations
         if (bindState.lastBaseTexture != rs->texture) {
             // Get or create resolution cache entry (may perform expensive hash calculation)
@@ -296,7 +261,6 @@ void FixedFunctionShader::bindShaderTextures(const ShaderKey& sk, const Rendered
                 if (bindState.currentBaseTextureName != cached->textureName) {
                     // Reset cache when texture changes
                     bindState.currentBaseTextureName = cached->textureName;
-                    bindState.boundDiffParam = nullptr;
                     bindState.boundParamH = nullptr;
                     bindState.boundParamX = nullptr;
 
@@ -425,7 +389,7 @@ static void setForwardSSAOParams(IDirect3DDevice9* device, D3DCommandBuffer* cmd
 FixedFunctionShader::ShaderKey FixedFunctionShader::computeShaderKeyWithSuffixes(const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
 
     // Step 1: Determine texture suffix availability
-    bool hasDiffParam = false, hasParamH = false, hasParamX = false, hasGrass = false;
+    bool hasParamH = false, hasParamX = false, hasGrass = false, disableParallax = false;
 
     if (rs->texture) {
         // Use TextureSuffix module for thread-safe cache lookup/creation
@@ -434,19 +398,19 @@ FixedFunctionShader::ShaderKey FixedFunctionShader::computeShaderKeyWithSuffixes
             (IDirect3DDevice9*)device, rs->texture, deviceCallsSafeInPrepare);
 
         if (cached && cached->hasValidName && cached->variants) {
-            hasDiffParam = cached->variants->hasDiffParam() || cached->variants->hasDiffParamT();
             hasParamH = cached->variants->hasParamH();
             hasParamX = cached->variants->hasParamX();
             hasGrass = cached->variants->hasGrass();
+            disableParallax = cached->variants->paramhNoParallax;
         }
     }
 
     // Step 2: Create ShaderKey with suffix flags
     ShaderKey sk(rs, frs, lightrs);
-    sk.hasDiffParam = hasDiffParam;
     sk.hasParamH = hasParamH;
     sk.hasParamX = hasParamX;
     sk.hasGrass = hasGrass;
+    sk.disableParallax = disableParallax;
 
     // Set shadow flag based on MGE configuration
     sk.hasShadows = ((Configuration.MGEFlags & USE_SHADOWS) && (Configuration.MGEFlags & USE_DISTANT_LAND)) ? 1 : 0;
@@ -641,13 +605,13 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             if (hlslDiagFrameCounter <= 3) {
                 char buf[512];
                 snprintf(buf, sizeof(buf),
-                    "CACHE HIT frame=%d: lm=%d lit=%d vc=%d vm=%d hl=%d skin=%d fog=%d uv=%d stages=%d shadow=%d detail=%d dp=%d ph=%d px=%d grass=%d",
+                    "CACHE HIT frame=%d: lm=%d lit=%d vc=%d vm=%d hl=%d skin=%d fog=%d uv=%d stages=%d shadow=%d detail=%d ph=%d px=%d grass=%d",
                     hlslDiagFrameCounter,
                     (int)sk.lightMode, (int)sk.useLighting, (int)sk.vertexColour,
                     (int)sk.vertexMaterial, (int)sk.heavyLighting,
                     (int)sk.usesSkinning, (int)sk.fogMode, (int)sk.uvSets,
                     (int)sk.activeStages,
-                    (int)sk.hasShadows, (int)sk.hasDetail, (int)sk.hasDiffParam,
+                    (int)sk.hasShadows, (int)sk.hasDetail,
                     (int)sk.hasParamH, (int)sk.hasParamX, (int)sk.hasGrass);
                 LOG::logline("%s", buf);
             }
@@ -658,13 +622,13 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             if (hlslDiagFrameCounter <= 3) {
                 char buf[512];
                 snprintf(buf, sizeof(buf),
-                    "CACHE MISS frame=%d: lm=%d lit=%d vc=%d vm=%d hl=%d skin=%d fog=%d uv=%d stages=%d shadow=%d detail=%d dp=%d ph=%d px=%d grass=%d bump=%d tg=%d",
+                    "CACHE MISS frame=%d: lm=%d lit=%d vc=%d vm=%d hl=%d skin=%d fog=%d uv=%d stages=%d shadow=%d detail=%d ph=%d px=%d grass=%d bump=%d tg=%d",
                     hlslDiagFrameCounter,
                     (int)sk.lightMode, (int)sk.useLighting, (int)sk.vertexColour,
                     (int)sk.vertexMaterial, (int)sk.heavyLighting,
                     (int)sk.usesSkinning, (int)sk.fogMode, (int)sk.uvSets,
                     (int)sk.activeStages,
-                    (int)sk.hasShadows, (int)sk.hasDetail, (int)sk.hasDiffParam,
+                    (int)sk.hasShadows, (int)sk.hasDetail,
                     (int)sk.hasParamH, (int)sk.hasParamX, (int)sk.hasGrass,
                     (int)sk.usesBumpmap, (int)sk.usesTexgen);
                 LOG::logline("%s", buf);
@@ -712,43 +676,16 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             }
 
             // If no point light fallback found, try texture suffix fallbacks
-            if (!foundFallback && (sk.hasDiffParam || sk.hasParamH || sk.hasParamX)) {
+            if (!foundFallback && (sk.hasParamH || sk.hasParamX)) {
                 ShaderKey textureFallbackSk = sk;
                 normalizeAlpha(textureFallbackSk);
-
-                if (sk.hasDiffParam && !foundFallback) {
-                    textureFallbackSk.hasDiffParam = 0;
-                    auto fallbackIter = cacheHLSLShaders.find(textureFallbackSk);
-                    if (fallbackIter != cacheHLSLShaders.end()) {
-                        fallbackShader = fallbackIter->second;
-                        foundFallback = true;
-                    }
-                }
-
-                if (sk.hasParamH && !foundFallback) {
-                    textureFallbackSk = sk;
-                    normalizeAlpha(textureFallbackSk);
-                    textureFallbackSk.hasDiffParam = 0;
-                    textureFallbackSk.hasParamH = 0;
-                    textureFallbackSk.hasParamX = 0;
-                    auto fallbackIter = cacheHLSLShaders.find(textureFallbackSk);
-                    if (fallbackIter != cacheHLSLShaders.end()) {
-                        fallbackShader = fallbackIter->second;
-                        foundFallback = true;
-                    }
-                }
-
-                if (!foundFallback) {
-                    textureFallbackSk = sk;
-                    normalizeAlpha(textureFallbackSk);
-                    textureFallbackSk.hasDiffParam = 0;
-                    textureFallbackSk.hasParamH = 0;
-                    textureFallbackSk.hasParamX = 0;
-                    auto fallbackIter = cacheHLSLShaders.find(textureFallbackSk);
-                    if (fallbackIter != cacheHLSLShaders.end()) {
-                        fallbackShader = fallbackIter->second;
-                        foundFallback = true;
-                    }
+                textureFallbackSk.hasParamH = 0;
+                textureFallbackSk.hasParamX = 0;
+                textureFallbackSk.disableParallax = 0;
+                auto fallbackIter = cacheHLSLShaders.find(textureFallbackSk);
+                if (fallbackIter != cacheHLSLShaders.end()) {
+                    fallbackShader = fallbackIter->second;
+                    foundFallback = true;
                 }
             }
 
@@ -757,9 +694,9 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
                 ShaderKey universalSk = sk;
                 normalizeAlpha(universalSk);
                 universalSk.heavyLighting = 0;
-                universalSk.hasDiffParam = 0;
                 universalSk.hasParamH = 0;
                 universalSk.hasParamX = 0;
+                universalSk.disableParallax = 0;
 
                 for (int lm = 0; lm <= 2 && !foundFallback; ++lm) {
                     for (int vertCol = 0; vertCol <= 1 && !foundFallback; ++vertCol) {
@@ -831,24 +768,9 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
 
     // Phase 6A: bind absorbed TerrainBlend overlay to sampler s8 for the main-replay
     // (non-batched / singleton) path. Mirrors the merged-batch bind below.
-    // Phase 8.5: swap to overlay's _diffparam_t/_diffparam variant if present, mirroring
-    // the slot-0 swap that bindShaderTextures performs for the base. Keep the original
-    // pointer on the call so downstream _paramh resolution still works.
     bool boundOverlay = false;
     if (replayCall && replayCall->overlayTexture) {
         IDirect3DTexture9* overlayBind = static_cast<IDirect3DTexture9*>(replayCall->overlayTexture);
-        const auto* dpRes = TextureSuffix::getOrCreateResolution(
-            (IDirect3DDevice9*)device, overlayBind, /*allowDeviceCalls*/ true);
-        if (dpRes && dpRes->variants) {
-            IDirect3DTexture9* dp = nullptr;
-            if (dpRes->variants->hasDiffParamT()) {
-                dp = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *dpRes->variants, "diffparam_t");
-            }
-            if (!dp && dpRes->variants->hasDiffParam()) {
-                dp = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *dpRes->variants, "diffparam");
-            }
-            if (dp) overlayBind = dp;
-        }
         device->SetTexture(8, overlayBind);
         device->SetSamplerState(8, D3DSAMP_MINFILTER, D3DTEXF_ANISOTROPIC);
         device->SetSamplerState(8, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
@@ -2901,23 +2823,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
 
                         // Phase 5B: bind absorbed TerrainBlend overlay texture to sampler s8.
                         // The PS samples s8 under HAS_OVERLAY and composites overlay over base.
-                        // Phase 8.5: swap to overlay's _diffparam_t/_diffparam variant if present
-                        // (mirrors slot-0 swap in bindShaderTextures). The original pointer stays
-                        // on the key so downstream _paramh resolution still finds the right siblings.
                         if (mb.key.overlayTexture) {
                             IDirect3DTexture9* overlayBind = mb.key.overlayTexture;
-                            const auto* dpRes = TextureSuffix::getOrCreateResolution(
-                                (IDirect3DDevice9*)device, mb.key.overlayTexture, /*allowDeviceCalls*/ true);
-                            if (dpRes && dpRes->variants) {
-                                IDirect3DTexture9* dp = nullptr;
-                                if (dpRes->variants->hasDiffParamT()) {
-                                    dp = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *dpRes->variants, "diffparam_t");
-                                }
-                                if (!dp && dpRes->variants->hasDiffParam()) {
-                                    dp = BSA::loadSuffixTexture((IDirect3DDevice9*)device, *dpRes->variants, "diffparam");
-                                }
-                                if (dp) overlayBind = dp;
-                            }
                             device->SetTexture(8, overlayBind);
                             device->SetSamplerState(8, D3DSAMP_MINFILTER, D3DTEXF_ANISOTROPIC);
                             device->SetSamplerState(8, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
@@ -3587,3 +3494,4 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
 
     isReplaying = false;
 }
+\r

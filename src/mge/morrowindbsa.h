@@ -12,16 +12,13 @@ namespace BSA {
     // Texture suffix variants structure
     struct TextureSuffixVariants {
         std::string baseName;
-        std::string diffparam;         // _diffparam texture path
-        std::string diffparam_t;       // _diffparam_t texture path (terrain)
-        std::string paramh;            // _paramh texture path (metallic/roughness/IOR or metallic/height/IOR)
+        std::string paramh;            // _paramh or _paramh_np texture path (metal/rough/IOR + height in alpha, DXT5)
         std::string paramx;            // _paramx texture path (aniso rotation/strength/metallic)
         std::string baseTextureSource; // "loose" or "bsa"
         std::string baseTexturePath;   // Full path to base texture
-        bool isGrassTexture;           // True if texture is in grass folder
+        bool isGrassTexture = false;   // True if texture is in grass folder
+        bool paramhNoParallax = false; // True if paramh was authored as _paramh_np (normal-from-height only, no parallax)
 
-        bool hasDiffParam() const { return !diffparam.empty(); }
-        bool hasDiffParamT() const { return !diffparam_t.empty(); }
         bool hasParamH() const { return !paramh.empty(); }
         bool hasParamX() const { return !paramx.empty(); }
         bool hasGrass() const { return isGrassTexture; }

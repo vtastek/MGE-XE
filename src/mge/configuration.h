@@ -109,7 +109,7 @@ struct ConfigurationStruct {
     int WindowAlignX, WindowAlignY;
     bool UseSharedMemory;
     bool UseHLSLPipeline;  // Use new HLSL compilation instead of ID3DXEffect
-    bool EnableTextureSuffixes;  // Enable _diffparam and _nh texture suffix support
+    bool EnableTextureSuffixes;  // Enable _paramh / _paramx texture suffix support
     bool UseDistantLandHLSL;  // Use HLSL shaders for Distant Land rendering (Phase 8)
 
     struct {

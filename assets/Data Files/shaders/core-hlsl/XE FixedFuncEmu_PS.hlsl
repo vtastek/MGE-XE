@@ -32,12 +32,12 @@ float3 fogColNear;
 float4 forwardSSAOParams : register(c24); // x = enabled, yz = 1 / viewport resolution
 
 // Textures with explicit register bindings for DX9 HLSL (original slot order)
-texture tex0 : register(t0);  // Base texture (or _diffparam when diffparam replaces base)
+texture tex0 : register(t0);  // Base texture (diffuse / base color)
 #if defined(HAS_DETAIL)
 texture tex1 : register(t1);  // Detail texture (conditional only)
 #endif
 #if defined(HAS_PARAMH)
-texture tex2 : register(t2);  // Parameter map (_paramh: metallic/roughness|height/IOR)
+texture tex2 : register(t2);  // Parameter map (_paramh: metal/rough/IOR + height in alpha, DXT5)
 #endif
 #if defined(HAS_PARAMX)
 texture tex3 : register(t3);  // Anisotropic map (_paramx: aniso rotation/strength/metallic)
@@ -45,7 +45,7 @@ texture tex3 : register(t3);  // Anisotropic map (_paramx: aniso rotation/streng
 #if defined(HAS_SHADOWS)
 texture tex4 : register(t4);  // Shadow map (original slot)
 #endif
-sampler sampTex0 : register(s0) = sampler_state{ texture = <tex0>; minfilter = anisotropic; magfilter = linear; mipfilter = linear; maxanisotropy = 16; };  // Base or diffparam texture
+sampler sampTex0 : register(s0) = sampler_state{ texture = <tex0>; minfilter = anisotropic; magfilter = linear; mipfilter = linear; maxanisotropy = 16; };  // Base / diffuse texture
 #if defined(HAS_DETAIL)
 sampler sampDetail : register(s1) = sampler_state{ texture = <tex1>; minfilter = anisotropic; magfilter = linear; mipfilter = linear; maxanisotropy = 16; }; // Detail texture (conditional)
 #endif
@@ -85,12 +85,16 @@ float shadowRcpRes : register(c10);
 bool hasAlpha;
 
 // Texture suffix support - using preprocessor defines
-//#define HAS_DIFFPARAM  // _diffparam/_diffparam_t replaces base texture (tex0)
-//#define HAS_PARAMH     // _paramh metallic/roughness|height/IOR (tex2)
+//#define HAS_PARAMH     // _paramh metal/rough/IOR + height in alpha (tex2, DXT5)
 //#define HAS_PARAMX     // _paramx aniso rotation/strength/metallic (tex3)
 
+// SKIP_PARALLAX is set by the C++ shader-key path when the paramh texture was
+// authored as _paramh_np: the height channel is still used for normal gradient,
+// but the iterative parallax step and parallax soft shadows are skipped.
+#ifndef SKIP_PARALLAX
 #define USE_PARALLAX // Enable this for simple offset parallax mapping
 #define USE_PARALLAX_SHADOWS // Enable this for simple offset parallax mapping
+#endif
 #ifdef HAS_PARAMH
 float2 normres;  // Parameter map texture resolution (width, height) for height mapping
 #endif
@@ -222,11 +226,11 @@ float4 ps_main(VS_OUTPUT input, float2 pixelPos : VPOS) : COLOR{
 	float3x3 TBN_T = transpose(TBN);
 	float3 Vts = mul(Vvs, TBN_T);
 
-	// Height mapping and normal calculation using _paramh green channel
+	// Height mapping and normal calculation using _paramh alpha channel (DXT5 8-bit height)
 	#if defined(HAS_PARAMH)
 		#if defined(USE_PARALLAX)
-		// Use height from green channel of _paramh texture
-		parallaxUV = Parallax(sampTex2, parallaxUV, Vts, 0.000015 * 1.33, 1); // heightScale, green channel
+		// Height lives in _paramh alpha; Parallax() defaults to channel 3 (alpha).
+		parallaxUV = Parallax(sampTex2, parallaxUV, Vts, 0.000015 * 1.33);
 		#endif
 
 		#if defined(HAS_OVERLAY) && defined(HAS_OVERLAY_PARAMH)
@@ -235,8 +239,8 @@ float4 ps_main(VS_OUTPUT input, float2 pixelPos : VPOS) : COLOR{
 		// endpoints are exact regardless of heightmap range:
 		//   t=0 → mask=0, t=1 → mask=1 (no leakage when overlay green is below contrast).
 		{
-			float hBaseC = tex2D(sampTex2, parallaxUV).g;
-			float hOverC = tex2D(sampOverlayParamH, parallaxUV).g;
+			float hBaseC = tex2D(sampTex2, parallaxUV).a;
+			float hOverC = tex2D(sampOverlayParamH, parallaxUV).a;
 			float t = input.color.a;
 			float hbContrast = max(heightBlendParams.y, 1e-4);
 			float b1 = hBaseC + (1.0 - t);
@@ -249,7 +253,7 @@ float4 ps_main(VS_OUTPUT input, float2 pixelPos : VPOS) : COLOR{
 		}
 		#endif
 
-		// Calculate normal from height gradient in green channel
+		// Calculate normal from height gradient in alpha channel
 
 		float deriv = 1.5;
 		// if(parallaxUV.x > 0.5)
@@ -264,18 +268,18 @@ float4 ps_main(VS_OUTPUT input, float2 pixelPos : VPOS) : COLOR{
 		// would produce INF texel offsets and blow up the gradient sample.
 		float2 texel = 1.0 / max(normres, 1.0);
 #endif
-		float hL = tex2D(sampTex2, parallaxUV + float2(-texel.x * deriv, 0)).g; // Green = height
-		float hR = tex2D(sampTex2, parallaxUV + float2(texel.x * deriv, 0)).g;
-		float hD = tex2D(sampTex2, parallaxUV + float2(0, -texel.y * deriv)).g;
-		float hU = tex2D(sampTex2, parallaxUV + float2(0,  texel.y * deriv)).g;
+		float hL = tex2D(sampTex2, parallaxUV + float2(-texel.x * deriv, 0)).a; // Alpha = height
+		float hR = tex2D(sampTex2, parallaxUV + float2(texel.x * deriv, 0)).a;
+		float hD = tex2D(sampTex2, parallaxUV + float2(0, -texel.y * deriv)).a;
+		float hU = tex2D(sampTex2, parallaxUV + float2(0,  texel.y * deriv)).a;
 		#if defined(HAS_OVERLAY_PARAMH)
 		// Phase 8A: blend gradient heights between base and overlay. Parallax() itself stays
 		// on the base sampler — the UV-offset delta from dual-sampling there is not worth
 		// doubling the iterative cost for.
-		float hL2 = tex2D(sampOverlayParamH, parallaxUV + float2(-texel.x * deriv, 0)).g;
-		float hR2 = tex2D(sampOverlayParamH, parallaxUV + float2( texel.x * deriv, 0)).g;
-		float hD2 = tex2D(sampOverlayParamH, parallaxUV + float2(0, -texel.y * deriv)).g;
-		float hU2 = tex2D(sampOverlayParamH, parallaxUV + float2(0,  texel.y * deriv)).g;
+		float hL2 = tex2D(sampOverlayParamH, parallaxUV + float2(-texel.x * deriv, 0)).a;
+		float hR2 = tex2D(sampOverlayParamH, parallaxUV + float2( texel.x * deriv, 0)).a;
+		float hD2 = tex2D(sampOverlayParamH, parallaxUV + float2(0, -texel.y * deriv)).a;
+		float hU2 = tex2D(sampOverlayParamH, parallaxUV + float2(0,  texel.y * deriv)).a;
 		float overlayBlend = overlayMask;
 		hL = lerp(hL, hL2, overlayBlend); hR = lerp(hR, hR2, overlayBlend);
 		hD = lerp(hD, hD2, overlayBlend); hU = lerp(hU, hU2, overlayBlend);
@@ -297,7 +301,7 @@ float4 ps_main(VS_OUTPUT input, float2 pixelPos : VPOS) : COLOR{
 					float shadowpara = ParallaxSoftShadowBlend(sampTex2, sampOverlayParamH, overlayMask,
 					                                           input.texcoord, lightDirTS.xy, 5.0, 0.04 * 0.75);
 					#else
-					float shadowpara = ParallaxSoftShadow(sampTex2, input.texcoord, lightDirTS.xy, 5.0, 0.04 * 0.75, 1); // green channel
+					float shadowpara = ParallaxSoftShadow(sampTex2, input.texcoord, lightDirTS.xy, 5.0, 0.04 * 0.75); // height from alpha (default)
 					#endif
 					shadows *= shadowpara;
 				#endif
@@ -311,15 +315,11 @@ float4 ps_main(VS_OUTPUT input, float2 pixelPos : VPOS) : COLOR{
 	float4 texColor = tex2D(sampTex0, parallaxUV);
 	texColor.rgb = max(0.0, toLinear(texColor.rgb));
 	//texColor.rgb = 0.18;
-	// Note: When HAS_DIFFPARAM is defined, sampTex0 contains the _diffparam/_diffparam_t texture
-	#ifdef HAS_DIFFPARAM
-	texColor.a = 1.0; // Ignore alpha from _diffparam texture
-	#endif
 
 	#if defined(HAS_OVERLAY)
 	// Composite the absorbed TerrainBlend overlay. Per LANDSCAPE_MESH_SPECIFICATION.md §4/§6,
 	// Morrowind's landscape blend is driven by the per-vertex color alpha (discrete 0/127/255
-	// AlphaGrid) — NOT the decal texture's alpha (which may carry _diffparam roughness).
+	// AlphaGrid) — NOT the decal texture's alpha.
 	float4 overlaySample = tex2D(sampOverlay, parallaxUV);
 	overlaySample.rgb = max(0.0, toLinear(overlaySample.rgb));
 	texColor.rgb = lerp(texColor.rgb, overlaySample.rgb, overlayMask);
@@ -345,16 +345,9 @@ float4 ps_main(VS_OUTPUT input, float2 pixelPos : VPOS) : COLOR{
 	paramh = lerp(paramh, paramh2, overlayMask);
 	#endif
 	metalness = paramh.r;  // Red = metalness
-	// Green = height (already used for parallax above)
+	roughness = paramh.g;  // Green = roughness
+	// Alpha = height (already used for parallax/gradient above)
 	float ior_param = paramh.b;  // Blue = IOR parameter (Disney parametrization)
-
-	// Check if base texture has alpha for roughness
-	#ifndef HAS_DIFFPARAM
-		// Base texture has alpha, use _paramh green for roughness
-		if (texColor.a > 0.0) {
-			roughness = paramh.g;  // Green = roughness when base has alpha
-		}
-	#endif
 
 	// Disney F0 parametrization: 0.5 maps to standard dielectric values
 	float ior_factor = ior_param * ior_param;  // Square for better control
@@ -371,17 +364,6 @@ float4 ps_main(VS_OUTPUT input, float2 pixelPos : VPOS) : COLOR{
 	// Apply metallic workflow: F0 = lerp(dielectric_F0, albedo, metalness)
 	F0 = lerp(F0, albedo, metalness);
 	ao = 1.0;  // Full AO for _paramh textures
-#endif
-
-#ifdef HAS_DIFFPARAM
-	// Basic PBR mode: _diffparam texture with fixed material properties
-	// RGB = albedo, A = roughness. Fixed: metalness=0, specular=0.5, AO=1
-	// Sample diffparam alpha directly for roughness (before texColor.a was overwritten with original alpha)
-	float diffparamAlpha = tex2D(sampTex0, parallaxUV).a;
-	roughness = diffparamAlpha;
-	metalness = 0.0;         // Non-metallic materials
-	F0 = 0.08 * 0.5;         // Fixed specular reflectance = 0.5
-	ao = 1.0;                // Full ambient occlusion
 #endif
 
 #ifndef NOLIT
@@ -666,9 +648,9 @@ float4 ps_main(VS_OUTPUT input, float2 pixelPos : VPOS) : COLOR{
 			#endif
 		}
 		else if (debugMode == 17) {
-			// Height (paramH green channel). Blue = no paramH in this variant.
+			// Height (paramH alpha channel, DXT5). Blue = no paramH in this variant.
 			#if defined(HAS_PARAMH)
-			debugColor = tex2D(sampTex2, parallaxUV).ggg;
+			debugColor = tex2D(sampTex2, parallaxUV).aaa;
 			#else
 			debugColor = float3(0, 0, 1);
 			#endif

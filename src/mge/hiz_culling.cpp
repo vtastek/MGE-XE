@@ -1079,8 +1079,7 @@ void FixedFunctionShader::prepareRecordedCalls() {
                 // base so the pair renders as a single draw via sampler s5 + HAS_OVERLAY.
                 // NOTE: keep the ORIGINAL overlay pointer here — downstream resolution
                 // (overlay _paramh in patch_displacement, overlay _paramh on s9) keys on
-                // the original to find sibling suffixes via TextureSuffix. The slot-8
-                // _diffparam_t swap happens at bind time in hlsl_replay (mirrors slot 0).
+                // the original to find sibling suffixes via TextureSuffix.
                 if (recCalls[i].basePairIdx != SIZE_MAX) {
                     auto& base = recCalls[recCalls[i].basePairIdx];
                     base.overlayTexture = recCalls[i].rs.texture;
