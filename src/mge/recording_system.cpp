@@ -2074,4 +2074,3 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
     // Occluder selection and rasterization deferred to prepareRecordedCalls()
     // This removes the heaviest per-draw work from the recording hot path
 }
-\r

@@ -116,6 +116,10 @@ public:
     static void Render();
     static bool WantCaptureMouse();
     static bool WantCaptureKeyboard();
+    // True if any ImGui item was active this frame or the previous one.
+    // Consumed by the menu render cache to bypass it for one frame so debug
+    // changes apply while paused. Resets after read.
+    static bool ConsumeRenderInvalidation();
     static void RenderPCFFilteringInterface();
     static void RenderDebugInterface();
     static LRESULT HandleWindowMessage(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);

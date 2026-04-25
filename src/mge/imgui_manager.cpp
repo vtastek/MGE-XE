@@ -14,6 +14,8 @@ bool ImGuiManager::showHiZInterface = false;
 bool ImGuiManager::showSSAOInterface = false;
 HWND ImGuiManager::windowHandle = nullptr;
 
+static bool s_renderInvalidationLatched = false;
+
 // PCF filtering variables
 float ImGuiManager::pcfFilterSize = 4.6f;        // Base filter size in texels
 float ImGuiManager::pcfPenumbraScale = 1.47f;    // Scale factor for distance-based penumbra
@@ -300,8 +302,27 @@ void ImGuiManager::Render() {
         RenderFrameEventLog();
     }
 
+    // Track ImGui interaction so the menu render cache can bypass for one frame.
+    // Active-now covers slider drags and combo open; previous-frame lookback
+    // catches the post-release frame where a combo selection or checkbox toggle
+    // actually lands as a value change.
+    {
+        static bool s_anyItemActiveLast = false;
+        bool anyItemActiveNow = ImGui::IsAnyItemActive();
+        if (anyItemActiveNow || s_anyItemActiveLast) {
+            s_renderInvalidationLatched = true;
+        }
+        s_anyItemActiveLast = anyItemActiveNow;
+    }
+
     ImGui::Render();
     ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
+}
+
+bool ImGuiManager::ConsumeRenderInvalidation() {
+    bool was = s_renderInvalidationLatched;
+    s_renderInvalidationLatched = false;
+    return was;
 }
 
 bool ImGuiManager::WantCaptureMouse() {

@@ -3494,4 +3494,3 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
 
     isReplaying = false;
 }
-\r

@@ -1024,8 +1024,11 @@ void DistantLand::postProcess(DLContext* ctx) {
         surfDistant->Release();
         backbuffer->Release();
 
-        // Cache expires for frame after mouse click, so as not to affect click response time
-        s_staging.isRenderCached &= !MGEProxyDirectInput::mouseClick;
+        // Cache expires for frame after mouse click, so as not to affect click response time.
+        // Also expires for one frame after any ImGui debug widget interaction, so changes
+        // made in the debug window apply while the game is paused.
+        s_staging.isRenderCached &= !MGEProxyDirectInput::mouseClick
+                                  && !ImGuiManager::ConsumeRenderInvalidation();
     }
 }
 
@@ -1051,25 +1054,18 @@ void DistantLand::postProcess(DLContext* ctx, const PostProcessData& ppd) {
         // Capture pre-UI screenshots here
         checkCaptureScreenshot(false);
 
-        // Deferred menu caching uses a dedicated texture that preserves the last fully composed
-        // non-menu frame, avoiding transient ping-pong buffers and partial menu-open frames.
+        // Deferred menu caching: this block runs only after a live render (isRenderCached
+        // was false this frame), so the backbuffer holds fresh post-process content.
+        // Always copy it into surfMenuCache — this also refreshes the cache after a
+        // mid-menu invalidation (mouse click, ImGui debug change), so re-renders persist.
         if ((Configuration.MGEFlags & USE_MENU_CACHING) && surfMenuCache) {
             IDirect3DSurface9* backbuffer = nullptr;
             device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backbuffer);
             if (backbuffer) {
-                if (!ppd.isMenu) {
-                    HRESULT hr = device->StretchRect(backbuffer, nullptr, surfMenuCache, nullptr, D3DTEXF_NONE);
-                    if (SUCCEEDED(hr)) {
-                        menuCacheValid = true;
-                    }
-                } else if (menuCacheValid) {
-                    LOG::logline("[RENDERCACHE] Enabling deferred HLSL menu cache from last live frame");
-                    s_staging.isRenderCached = true;
-                } else {
-                    HRESULT hr = device->StretchRect(backbuffer, nullptr, surfMenuCache, nullptr, D3DTEXF_NONE);
-                    if (SUCCEEDED(hr)) {
-                        menuCacheValid = true;
-                        LOG::logline("[RENDERCACHE] Primed deferred HLSL menu cache from current frame");
+                HRESULT hr = device->StretchRect(backbuffer, nullptr, surfMenuCache, nullptr, D3DTEXF_NONE);
+                if (SUCCEEDED(hr)) {
+                    menuCacheValid = true;
+                    if (ppd.isMenu) {
                         s_staging.isRenderCached = true;
                     }
                 }
@@ -1091,8 +1087,11 @@ void DistantLand::postProcess(DLContext* ctx, const PostProcessData& ppd) {
             backbuffer->Release();
         }
 
-        // Cache expires for frame after mouse click, so as not to affect click response time
-        s_staging.isRenderCached &= !MGEProxyDirectInput::mouseClick;
+        // Cache expires for frame after mouse click, so as not to affect click response time.
+        // Also expires for one frame after any ImGui debug widget interaction, so changes
+        // made in the debug window apply while the game is paused.
+        s_staging.isRenderCached &= !MGEProxyDirectInput::mouseClick
+                                  && !ImGuiManager::ConsumeRenderInvalidation();
     }
 }
 
