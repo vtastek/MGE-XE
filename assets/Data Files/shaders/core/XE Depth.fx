@@ -78,6 +78,53 @@ float4 DepthNearPS(DepthVertOut IN) : COLOR0 {
     return IN.depth;
 }
 
+//------------------------------------------------------------
+// Displaced terrain depth (near-patch subdivision path)
+//
+// Mirrors the displacement block in core-hlsl/XE FixedFuncEmu_VS.hlsl so the
+// depth buffer Z matches the color pass exactly. Required for SSAO/DOF on
+// displaced ground: with a flat depth, sub-surface rocks would appear in front
+// of terrain in depth-only checks, producing AO halos and DoF wrong-occlusion.
+//
+// Input vertices come from the same VB the color path uses (sp->vb): standard
+// FVF + an extra TEXCOORD1 float2 carrying base/overlay heights pre-baked by
+// patch_displacement.cpp. `world` and `displacementFalloff` are set per-draw /
+// per-frame on the shared effect pool (see renderdepth.cpp).
+struct DepthDispVertIn {
+    float4 pos : POSITION;
+    float4 normal : NORMAL;
+    float4 color : COLOR0;
+    float2 texcoords : TEXCOORD0;
+    float2 heights : TEXCOORD1;
+};
+
+DepthVertOut DepthMWDisplacedVS(DepthDispVertIn IN) {
+    DepthVertOut OUT;
+    float4 pos = IN.pos;
+
+    // Lerp base/overlay heights by alpha grid (matches color VS HAS_OVERLAY path).
+    // Edge verts facing non-subdivided neighbors carry zeroed heights, so they
+    // collapse to the original surface and stay crack-free.
+    float displaceH = lerp(IN.heights.x, IN.heights.y, IN.color.a);
+
+    // Same camera-distance falloff as color VS: full displacement inside R_inner,
+    // smooth ramp to zero at R_outer. distXY uses the world matrix set per-draw.
+    float2 worldXY = mul(float4(pos.xyz, 1), world).xy;
+    float distXY = length(worldXY - displacementFalloff.zw);
+    float fall = 1.0 - smoothstep(displacementFalloff.y, displacementFalloff.x, distXY);
+    pos.z += displaceH * fall;
+
+    // Rigid transform via worldview (terrain is non-skinned).
+    float4 viewpos = mul(pos, vertexBlendPalette[0]);
+
+    OUT.alpha = 1.0;
+    OUT.pos = mul(viewpos, proj);
+    OUT.depth = OUT.pos.w;
+    OUT.texcoords = IN.texcoords;
+
+    return OUT;
+}
+
 //-----------------------------------------------------------------------------
 
 Technique T0 {
@@ -146,6 +193,25 @@ Technique T0 {
         CullMode = none;
 
         VertexShader = compile vs_3_0 DepthGrassInstVS();
+        PixelShader = compile ps_3_0 DepthNearPS();
+    }
+   //------------------------------------------------------------
+   // Used for rendering displaced near-patch terrain depth
+    Pass D5 {
+        ZEnable = true;
+        ZWriteEnable = true;
+        ZFunc = LessEqual;
+        CullMode = CW;
+        ClipPlaneEnable = 0;
+        FillMode = Solid;
+
+        AlphaBlendEnable = false;
+        AlphaTestEnable = false;
+        StencilEnable = false;
+        FogEnable = false;
+        Lighting = false;
+
+        VertexShader = compile vs_3_0 DepthMWDisplacedVS();
         PixelShader = compile ps_3_0 DepthNearPS();
     }
    //------------------------------------------------------------

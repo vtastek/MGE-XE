@@ -203,6 +203,7 @@ D3DXHANDLE DistantLand::ehNiceWeather;
 D3DXHANDLE DistantLand::ehTime;
 D3DXHANDLE DistantLand::ehRippleOrigin;
 D3DXHANDLE DistantLand::ehWaveHeight;
+D3DXHANDLE DistantLand::ehDisplacementFalloff;
 
 std::function<void(IDirect3DSurface9*)> DistantLand::captureScreenHandler = nullptr;
 bool DistantLand::captureScreenWithUI;
@@ -672,6 +673,7 @@ bool DistantLand::initShader() {
     ehWindVec = effect->GetParameterByName(0, "windVec");
     ehNiceWeather = effect->GetParameterByName(0, "niceWeather");
     ehTime = effect->GetParameterByName(0, "time");
+    ehDisplacementFalloff = effect->GetParameterByName(0, "displacementFalloff");
 
     D3DVIEWPORT9 vp;
     device->GetViewport(&vp);

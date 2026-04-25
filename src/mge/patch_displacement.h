@@ -29,7 +29,6 @@ using NearPatchEdgeHeights = FixedFunctionShader::NearPatchEdgeHeights;
 
 struct SubdivPatch {
     IDirect3DVertexBuffer9* vb = nullptr;
-    IDirect3DVertexBuffer9* depthVB = nullptr; // Same layout, POSITION.z pre-displaced for depth prepass.
     IDirect3DIndexBuffer9*  ib = nullptr;
     UINT stride = 0;
     DWORD fvf = 0;
@@ -74,6 +73,31 @@ SubdivPatch* getOrBuild(IDirect3DDevice9* device,
                         float dispGamma,
                         float dispPivot,
                         const NearPatchEdgeHeights* edgeHeights);
+
+// Lookup-only sibling of getOrBuild. Returns the cached patch if all key params
+// match (vb/ib/overlay/scale/tier/neighborMask/edgeContextHash/gamma/pivot),
+// nullptr otherwise. Never builds. Used by both the depth prepass and the color
+// replay so they can never race the single per-frame cache builder.
+SubdivPatch* findCached(const FixedFunctionShader::TerrainPatchKey& key,
+                        const FixedFunctionShader::HLSLRecordedCall& call,
+                        IDirect3DBaseTexture9* overlayTex,
+                        float heightScale,
+                        uint8_t subdivTier,
+                        float dispGamma,
+                        float dispPivot);
+
+// One-shot per-frame cache prep. Coalesces the edge-height map across all
+// near-set displaced terrain calls, then calls getOrBuild for every near-set
+// tile so the cache is fully populated before any consumer uses it. Both the
+// depth prepass and the color replay then use findCached only — no builds,
+// no edge-map mutations, so they cannot race each other or produce stale
+// edge data. Call this from renderStage1 immediately after Hi-Z culling
+// finalizes fb->recordedCalls and fb->nearPatches.
+void prebuildNearPatches(IDirect3DDevice9* device,
+                         FixedFunctionShader::FrameBuffer& fb,
+                         float heightScale,
+                         float dispGamma,
+                         float dispPivot);
 
 void clearAll();
 void onVertexBufferReleased(IDirect3DVertexBuffer9* vb);

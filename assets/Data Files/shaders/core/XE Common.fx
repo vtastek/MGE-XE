@@ -30,6 +30,12 @@ shared float2 windVec;
 shared float niceWeather;
 shared float time;
 
+// Phase 8.4: near-patch displacement camera-distance falloff.
+// xy = (R_outer, R_inner) world units; zw = camera world XY.
+// Mirrors the c73 constant pushed into the HLSL color VS in hlsl_replay.cpp,
+// so the depth shader and the color shader compute identical displacement.
+shared float4 displacementFalloff;
+
 
 //------------------------------------------------------------
 // Textures

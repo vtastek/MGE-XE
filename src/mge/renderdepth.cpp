@@ -51,11 +51,32 @@ void DistantLand::renderDepth(DLContext* ctx, const std::vector<RecordedMWState>
     device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
     effectDepth->EndPass();
 
+    // Push displacement falloff (matches the c73 constant set in hlsl_replay.cpp
+    // for the color path). xy = (R_outer, R_inner); zw = camera world XY derived
+    // from the inverse of the current view matrix.
+    {
+        D3DXMATRIX invView;
+        D3DXMatrixInverse(&invView, nullptr, &ctx->mwView);
+        D3DXVECTOR4 origin(0.0f, 0.0f, 0.0f, 1.0f);
+        D3DXVECTOR4 eyeW;
+        D3DXVec4Transform(&eyeW, &origin, &invView);
+        D3DXVECTOR4 falloff(2560.0f, 1280.0f, eyeW.x, eyeW.y);
+        effect->SetVector(ehDisplacementFalloff, &falloff);
+    }
+
     // Recorded draw calls with Morrowind near plane
     // Pass game view for skinned object transforms (device may have UI view in deferred pipeline)
     effectDepth->BeginPass(PASS_RENDERMWDEPTH);
     renderDepthRecorded(recMW, sceneFilter, &ctx->mwView, fb);
     effectDepth->EndPass();
+
+    // Phase 8.4: emit displaced near-patch terrain depth in a separate pass that
+    // mirrors the color VS displacement+falloff so SSAO/DOF see the same Z.
+    if (fb && fb->nearPatchCount > 0 && sceneFilter == 0) {
+        effectDepth->BeginPass(PASS_RENDERMWDEPTHDISPLACED);
+        renderDepthRecordedDisplaced(recMW, fb);
+        effectDepth->EndPass();
+    }
 
     // Reset projection matrix
     effect->SetMatrix(ehProj, &ctx->mwProj);
@@ -292,6 +313,32 @@ void DistantLand::renderDepthRecorded(const std::vector<RecordedMWState>& recMW,
     int scene2Count = 0;
     const bool allowDisplacedDepth = fb && sceneFilter == 0 && fb->nearPatchCount > 0;
     bool edgeHeightsReady = false;
+
+    // Phase 1 skip set: near-set displaced terrain VB/IBs that have a cached
+    // SubdivPatch and will be rendered by Phase 2. We index by VB/IB pointer
+    // because applyVisibilityAndFilterRecordMW renumbers recMW after filtering,
+    // so call.recordMWIndex no longer matches our recIdx — matching by buffer
+    // pointer is the only reliable correlation.
+    std::vector<FixedFunctionShader::TerrainPatchKey> skipPhase1;
+    if (allowDisplacedDepth) {
+        skipPhase1.reserve(fb->nearPatchCount);
+        for (const auto& call : fb->recordedCalls) {
+            if (!call.sk.hasDisplacement || call.bin != RenderBin::Terrain) continue;
+            FixedFunctionShader::TerrainPatchKey pk{call.rs.vb, call.rs.ib};
+            bool inSet = false;
+            for (uint32_t s = 0; s < fb->nearPatchCount; ++s) {
+                if (fb->nearPatches[s] == pk) { inSet = true; break; }
+            }
+            if (!inSet) continue;
+            PatchDisplacement::SubdivPatch* sp = PatchDisplacement::findCached(
+                pk, call, call.overlayTexture,
+                ImGuiManager::GetDisplacementScale(),
+                call.subdivTier,
+                ImGuiManager::GetDisplacementGamma(),
+                ImGuiManager::GetDisplacementPivot());
+            if (sp) skipPhase1.push_back(pk);
+        }
+    }
     for (size_t recIdx = 0; recIdx < recMW.size(); ++recIdx) {
         const auto& i = recMW[recIdx];
         // Scene filter: -1 = all, 0 = Scene 0 only, N>0 = Scene N and later.
@@ -381,70 +428,82 @@ void DistantLand::renderDepthRecorded(const std::vector<RecordedMWState>& recMW,
             }
         }
 
-        IDirect3DVertexBuffer9* drawVB = i.vb;
-        IDirect3DIndexBuffer9* drawIB = i.ib;
-        UINT drawVBOffset = i.vbOffset;
-        UINT drawVBStride = i.vbStride;
-        DWORD drawFVF = i.fvf;
-        INT drawBaseIndex = i.baseIndex;
-        UINT drawMinIndex = i.minIndex;
-        UINT drawVertCount = i.vertCount;
-        UINT drawStartIndex = i.startIndex;
-        UINT drawPrimCount = i.primCount;
-
-        if (allowDisplacedDepth && i.sceneNum == 0) {
-            const FixedFunctionShader::HLSLRecordedCall* depthCall = nullptr;
-            for (const auto& call : fb->recordedCalls) {
-                if (call.recordMWIndex == (int)recIdx && call.sk.hasDisplacement && call.bin == RenderBin::Terrain) {
-                    depthCall = &call;
-                    break;
-                }
+        // Skip if this draw's VB/IB is in the Phase-2 displaced set (cached and
+        // ready). If it's a near-set displaced tile but the cache miss left it
+        // out of skipPhase1, we fall through and render the original flat VB
+        // here so depth stays continuous; Phase 2 will pick it up next frame.
+        if (allowDisplacedDepth && i.sceneNum == 0 && !skipPhase1.empty()) {
+            bool deferToDisplacedPhase = false;
+            for (const auto& sk : skipPhase1) {
+                if (sk.vb == i.vb && sk.ib == i.ib) { deferToDisplacedPhase = true; break; }
             }
-            if (depthCall) {
-                if (!edgeHeightsReady) {
-                    PatchDisplacement::coalesceEdgeHeights(
-                        device, fb->nearPatchEdgeHeights, fb->recordedCalls,
-                        ImGuiManager::GetDisplacementScale(),
-                        ImGuiManager::GetDisplacementGamma(),
-                        ImGuiManager::GetDisplacementPivot());
-                    edgeHeightsReady = true;
-                }
-
-                FixedFunctionShader::TerrainPatchKey pk{depthCall->rs.vb, depthCall->rs.ib};
-                bool inSet = false;
-                for (uint32_t s = 0; s < fb->nearPatchCount; ++s) {
-                    if (fb->nearPatches[s] == pk) { inSet = true; break; }
-                }
-                if (inSet) {
-                    PatchDisplacement::SubdivPatch* sp = PatchDisplacement::getOrBuild(
-                        device, pk, *depthCall, depthCall->overlayTexture,
-                        ImGuiManager::GetDisplacementScale(),
-                        depthCall->subdivTier,
-                        ImGuiManager::GetDisplacementGamma(),
-                        ImGuiManager::GetDisplacementPivot(),
-                        &fb->nearPatchEdgeHeights);
-                    if (sp && sp->depthVB) {
-                        drawVB = sp->depthVB;
-                        drawIB = sp->ib;
-                        drawVBOffset = 0;
-                        drawVBStride = sp->stride;
-                        drawFVF = sp->fvf;
-                        drawBaseIndex = 0;
-                        drawMinIndex = 0;
-                        drawVertCount = sp->vertCount;
-                        drawStartIndex = 0;
-                        drawPrimCount = sp->primCount;
-                    }
-                }
-            }
+            if (deferToDisplacedPhase) continue;
         }
 
-        device->SetStreamSource(0, drawVB, drawVBOffset, drawVBStride);
-        device->SetIndices(drawIB);
-        device->SetFVF(drawFVF);
-        device->DrawIndexedPrimitive(i.primType, drawBaseIndex, drawMinIndex, drawVertCount, drawStartIndex, drawPrimCount);
+        device->SetStreamSource(0, i.vb, i.vbOffset, i.vbStride);
+        device->SetIndices(i.ib);
+        device->SetFVF(i.fvf);
+        device->DrawIndexedPrimitive(i.primType, i.baseIndex, i.minIndex, i.vertCount, i.startIndex, i.primCount);
     }
     // Note: Culling stats are now logged in executeHiZCulling/applyVisibilityAndFilterRecordMW()
+}
+
+void DistantLand::renderDepthRecordedDisplaced(const std::vector<RecordedMWState>& recMW, FixedFunctionShader::FrameBuffer* fb) {
+    if (!fb || fb->nearPatchCount == 0) return;
+
+    // Lookup-only: never call coalesceEdgeHeights or getOrBuild from depth.
+    // The color phase is the sole owner of cache builds and edge-map updates.
+    // This eliminates the race where depth-phase build would bake a partial
+    // edge map into a SubdivPatch that color-phase getOrBuild then cache-hit
+    // on, propagating stale edges into the color render (visible as cracks).
+    //
+    // Iterate fb->recordedCalls directly (not the filtered recMW). After
+    // applyVisibilityAndFilterRecordMW renumbers recMW, call.recordMWIndex no
+    // longer maps to recIdx, so cross-referencing is impossible. Each call
+    // already carries everything needed (rs.worldTransforms, cullMode, etc.).
+
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+
+    for (const auto& call : fb->recordedCalls) {
+        if (!call.sk.hasDisplacement) continue;
+        if (call.bin != RenderBin::Terrain) continue;
+
+        FixedFunctionShader::TerrainPatchKey pk{call.rs.vb, call.rs.ib};
+        bool inSet = false;
+        for (uint32_t s = 0; s < fb->nearPatchCount; ++s) {
+            if (fb->nearPatches[s] == pk) { inSet = true; break; }
+        }
+        if (!inSet) continue;
+
+        PatchDisplacement::SubdivPatch* sp = PatchDisplacement::findCached(
+            pk, call, call.overlayTexture,
+            ImGuiManager::GetDisplacementScale(),
+            call.subdivTier,
+            ImGuiManager::GetDisplacementGamma(),
+            ImGuiManager::GetDisplacementPivot());
+        if (!sp || !sp->vb) continue;
+
+        // Recompute worldview from the current frame's view (call.rs.worldView
+        // was captured at recording time, which can be the previous frame in
+        // N-1 mode). Mirrors the color path's recompute in hlsl_replay.cpp.
+        D3DXMATRIX worldView;
+        D3DXMatrixMultiply(&worldView, &call.rs.worldTransforms[0], &fb->currentView);
+        D3DXMATRIX wvPalette[4] = { worldView, worldView, worldView, worldView };
+
+        effect->SetMatrix(ehWorld, &call.rs.worldTransforms[0]);
+        effect->SetMatrixArray(ehVertexBlendPalette, wvPalette, 4);
+        effect->SetBool(ehHasAlpha, false);
+        effect->SetFloat(ehAlphaRef, -1.0f);
+        effectDepth->CommitChanges();
+
+        device->SetRenderState(D3DRS_CULLMODE, call.rs.cullMode);
+
+        device->SetStreamSource(0, sp->vb, 0, sp->stride);
+        device->SetIndices(sp->ib);
+        device->SetFVF(sp->fvf);
+        device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, sp->vertCount, 0, sp->primCount);
+    }
 }
 
 // GPU-only Hi-Z mip generation (non-blocking, ~0.5ms)

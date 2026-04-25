@@ -311,8 +311,33 @@ void bilerpBytes(const uint8_t* src, int sstride,
 
 SubdivPatch::~SubdivPatch() {
     if (vb) { vb->Release(); vb = nullptr; }
-    if (depthVB) { depthVB->Release(); depthVB = nullptr; }
     if (ib) { ib->Release(); ib = nullptr; }
+}
+
+SubdivPatch* findCached(const FixedFunctionShader::TerrainPatchKey& key,
+                        const FixedFunctionShader::HLSLRecordedCall& call,
+                        IDirect3DBaseTexture9* overlayTex,
+                        float heightScale,
+                        uint8_t subdivTier,
+                        float dispGamma,
+                        float dispPivot)
+{
+    AcquireSRWLockShared(&s_lock);
+    auto cit = s_patchCache.find(key);
+    SubdivPatch* r = nullptr;
+    if (cit != s_patchCache.end()
+        && cit->second.overlayTexture == overlayTex
+        && cit->second.heightScale == heightScale
+        && cit->second.subdivNeighborDirMask == call.subdivNeighborDirMask
+        && cit->second.subdivTier == subdivTier
+        && cit->second.edgeContextHash == call.edgeContextHash
+        && cit->second.dispGamma == dispGamma
+        && cit->second.dispPivot == dispPivot)
+    {
+        r = cit->second.patch.get();
+    }
+    ReleaseSRWLockShared(&s_lock);
+    return r;
 }
 
 SubdivPatch* getOrBuild(IDirect3DDevice9* device,
@@ -373,11 +398,19 @@ SubdivPatch* getOrBuild(IDirect3DDevice9* device,
     // we never stall if Morrowind happens to own the buffer this frame.
     void* srcVbPtr = nullptr;
     HRESULT hr = key.vb->Lock(rs.vbOffset, 0, &srcVbPtr, D3DLOCK_READONLY | D3DLOCK_DONOTWAIT);
-    if (FAILED(hr) || !srcVbPtr) return nullptr;
+    if (FAILED(hr) || !srcVbPtr) {
+        LOG::logline("[DISPCACHE][BUILD-LOCK-FAIL] phase=VB vb=%p ib=%p hr=0x%08x ptr=%p tier=%u neigh=%02x",
+                     key.vb, key.ib, (unsigned)hr, srcVbPtr,
+                     (unsigned)call.subdivTier, (unsigned)call.subdivNeighborDirMask);
+        return nullptr;
+    }
 
     void* srcIbPtr = nullptr;
     hr = key.ib->Lock(0, 0, &srcIbPtr, D3DLOCK_READONLY | D3DLOCK_DONOTWAIT);
     if (FAILED(hr) || !srcIbPtr) {
+        LOG::logline("[DISPCACHE][BUILD-LOCK-FAIL] phase=IB vb=%p ib=%p hr=0x%08x ptr=%p tier=%u neigh=%02x",
+                     key.vb, key.ib, (unsigned)hr, srcIbPtr,
+                     (unsigned)call.subdivTier, (unsigned)call.subdivNeighborDirMask);
         key.vb->Unlock();
         return nullptr;
     }
@@ -642,20 +675,6 @@ SubdivPatch* getOrBuild(IDirect3DDevice9* device,
         }
     }
 
-    // Depth prepass uses the legacy depth effect, which does not know about the
-    // extra TEXCOORD heights. Bake the same final visible displacement directly
-    // into POSITION.z for a depth-only VB. Color replay still uses `vb` and lets
-    // the HLSL vertex shader apply heights, so shadows can continue to undo them.
-    std::vector<uint8_t> depthVerts = dstVerts;
-    for (UINT vi = 0; vi < kDstVerts; ++vi) {
-        uint8_t* depthV = depthVerts.data() + (size_t)vi * dstStride;
-        float* p = (float*)(depthV + dstLayout.posOffset);
-        const float* h = (const float*)(depthV + heightOff);
-        const DWORD color = *(const DWORD*)(depthV + dstLayout.colorOffset);
-        const float alpha = (float)((color >> 24) & 0xff) / 255.0f;
-        p[2] += h[0] * (1.0f - alpha) + h[1] * alpha;
-    }
-
     key.ib->Unlock();
     key.vb->Unlock();
 
@@ -689,14 +708,6 @@ SubdivPatch* getOrBuild(IDirect3DDevice9* device,
     if (FAILED(hr)) { return nullptr; }
     std::memcpy(vbData, dstVerts.data(), vbBytes);
     patch->vb->Unlock();
-
-    hr = device->CreateVertexBuffer(vbBytes, D3DUSAGE_WRITEONLY, 0, D3DPOOL_MANAGED, &patch->depthVB, nullptr);
-    if (FAILED(hr) || !patch->depthVB) return nullptr;
-    void* depthVbData = nullptr;
-    hr = patch->depthVB->Lock(0, 0, &depthVbData, 0);
-    if (FAILED(hr)) { return nullptr; }
-    std::memcpy(depthVbData, depthVerts.data(), vbBytes);
-    patch->depthVB->Unlock();
 
     UINT ibBytes = (UINT)(ibBuf.size() * sizeof(uint16_t));
     hr = device->CreateIndexBuffer(ibBytes, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_MANAGED, &patch->ib, nullptr);
@@ -783,7 +794,18 @@ void coalesceEdgeHeights(IDirect3DDevice9* device,
         void* srcVbPtr = nullptr;
         HRESULT hr = rs.vb->Lock(rs.vbOffset, 0, &srcVbPtr,
                                  D3DLOCK_READONLY | D3DLOCK_DONOTWAIT);
-        if (FAILED(hr) || !srcVbPtr) continue;
+        if (FAILED(hr) || !srcVbPtr) {
+            // Silent skip means this tile contributes NO edge samples to the
+            // coalesced map; adjacent near-set tiles will see count=1 at the
+            // shared boundary and fall through to local-sample fallback,
+            // producing crack-shaped Z mismatches at the seam.
+            LOG::logline("[DISPCACHE][COALESCE-LOCK-FAIL] vb=%p ib=%p hr=0x%08x ptr=%p tier=%u neigh=%02x ctxHash=%08x",
+                         rs.vb, rs.ib, (unsigned)hr, srcVbPtr,
+                         (unsigned)call.subdivTier,
+                         (unsigned)call.subdivNeighborDirMask,
+                         (unsigned)call.edgeContextHash);
+            continue;
+        }
         const uint8_t* srcV = (const uint8_t*)srcVbPtr + rs.baseIndex * rs.vbStride;
 
         // Linearly interpolate the source edge between two 5x5 corner verts.
@@ -855,6 +877,44 @@ void coalesceEdgeHeights(IDirect3DDevice9* device,
             } else {
                 it->second.count += 1;
             }
+        }
+    }
+}
+
+void prebuildNearPatches(IDirect3DDevice9* device,
+                         FixedFunctionShader::FrameBuffer& fb,
+                         float heightScale,
+                         float dispGamma,
+                         float dispPivot)
+{
+    MGE_ZoneScopedN("PatchDisplacement_prebuildNearPatches");
+    if (!device) return;
+    if (fb.nearPatchCount == 0) return;
+
+    coalesceEdgeHeights(device, fb.nearPatchEdgeHeights, fb.recordedCalls,
+                        heightScale, dispGamma, dispPivot);
+
+    for (const auto& call : fb.recordedCalls) {
+        if (!call.sk.hasDisplacement) continue;
+        if (call.bin != RenderBin::Terrain) continue;
+
+        FixedFunctionShader::TerrainPatchKey pk{call.rs.vb, call.rs.ib};
+        bool inSet = false;
+        for (uint32_t s = 0; s < fb.nearPatchCount; ++s) {
+            if (fb.nearPatches[s] == pk) { inSet = true; break; }
+        }
+        if (!inSet) continue;
+
+        SubdivPatch* sp = getOrBuild(device, pk, call, call.overlayTexture,
+                                     heightScale, call.subdivTier,
+                                     dispGamma, dispPivot,
+                                     &fb.nearPatchEdgeHeights);
+        if (!sp) {
+            LOG::logline("[DISPCACHE][PREBUILD-FAIL] vb=%p ib=%p tier=%u neigh=%02x ctxHash=%08x scale=%.2f gamma=%.2f pivot=%.2f overlay=%p",
+                         call.rs.vb, call.rs.ib, (unsigned)call.subdivTier,
+                         (unsigned)call.subdivNeighborDirMask,
+                         (unsigned)call.edgeContextHash,
+                         heightScale, dispGamma, dispPivot, call.overlayTexture);
         }
     }
 }

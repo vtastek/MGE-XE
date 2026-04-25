@@ -10,6 +10,7 @@
 #include "mwbridge.h"
 #include "ffeshader.h"
 #include "imgui_manager.h"
+#include "patch_displacement.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -436,6 +437,19 @@ void DistantLand::renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer*
             if (ImGuiManager::GetEnableStatelessBatch()) {
                 FixedFunctionShader::buildStatelessBatches(FixedFunctionShader::getPrepBuffer());
             }
+        }
+
+        // Phase 8.4: build the near-patch SubdivPatch cache once per frame, here,
+        // after Hi-Z culling has finalized fb->recordedCalls and fb->nearPatches
+        // and BEFORE both the depth prepass (renderDepth below) and the color
+        // replay (renderStage2). Both consumers then use findCached only — no
+        // build races, one consistent edge map, no menu-mode flicker.
+        if (fb && isHLSLActive()) {
+            PatchDisplacement::prebuildNearPatches(
+                device, *fb,
+                ImGuiManager::GetDisplacementScale(),
+                ImGuiManager::GetDisplacementGamma(),
+                ImGuiManager::GetDisplacementPivot());
         }
 
         // Single RT switch for all depth rendering (renderDepth + StretchRect + renderDepthDistantLand + MSAA resolve)

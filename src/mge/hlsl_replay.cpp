@@ -2938,20 +2938,10 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
 
     MGE_ZoneScopedN("replay_MainLoop");
 
-    // Phase 8.7: coalesce per-frame near-patch edge heights once per frame
-    // (Scene 0 only). Each near-set Terrain tile samples its own edges at tier
-    // density and accumulates averaged (base, overlay) heights keyed by
-    // quantized world (X, Y). Subsequent getOrBuild calls read this map so both
-    // sides of any shared edge bake identical heights — kills T-junction cracks
-    // at inner↔outer tier boundaries and seams at texture discontinuities.
-    if (sceneCount == 0 && fb.nearPatchCount > 0) {
-        MGE_ZoneScopedN("replay_CoalesceEdgeHeights");
-        PatchDisplacement::coalesceEdgeHeights(
-            device, fb.nearPatchEdgeHeights, recCalls,
-            ImGuiManager::GetDisplacementScale(),
-            ImGuiManager::GetDisplacementGamma(),
-            ImGuiManager::GetDisplacementPivot());
-    }
+    // Phase 8.7: per-frame edge-height coalescing and SubdivPatch builds are now
+    // done once in renderStage1 via PatchDisplacement::prebuildNearPatches(),
+    // before both the depth prepass and this color replay. This loop only does
+    // findCached lookups so depth and color cannot race the cache builder.
 
     // Phase 8.4: push displacement falloff (c73) once per replay invocation.
     // XY = (R_outer, R_inner), ZW = world-space camera XY. VS samples this only
@@ -3154,13 +3144,28 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                         if (fb.nearPatches[s] == pk) { inSet = true; break; }
                     }
                     if (inSet) {
-                        PatchDisplacement::SubdivPatch* sp = PatchDisplacement::getOrBuild(
-                            device, pk, call, call.overlayTexture,
+                        PatchDisplacement::SubdivPatch* sp = PatchDisplacement::findCached(
+                            pk, call, call.overlayTexture,
                             ImGuiManager::GetDisplacementScale(),
                             call.subdivTier,
                             ImGuiManager::GetDisplacementGamma(),
-                            ImGuiManager::GetDisplacementPivot(),
-                            &fb.nearPatchEdgeHeights);
+                            ImGuiManager::GetDisplacementPivot());
+                        if (!sp) {
+                            ++cellxDisplacementBuildNull;
+                            // Cache miss in color path. Prebuild in renderStage1
+                            // is the sole builder, so a miss here means key
+                            // params changed between prebuild and replay (or
+                            // the tile entered the near-set after prebuild).
+                            LOG::logline("[DISPCACHE][COLOR-MISS] idx=%u vb=%p ib=%p tier=%u neigh=%02x ctxHash=%08x scale=%.2f gamma=%.2f pivot=%.2f overlay=%p",
+                                         (unsigned)i, call.rs.vb, call.rs.ib,
+                                         (unsigned)call.subdivTier,
+                                         (unsigned)call.subdivNeighborDirMask,
+                                         (unsigned)call.edgeContextHash,
+                                         ImGuiManager::GetDisplacementScale(),
+                                         ImGuiManager::GetDisplacementGamma(),
+                                         ImGuiManager::GetDisplacementPivot(),
+                                         call.overlayTexture);
+                        }
                         if (sp) {
                             // Optional debug tint: yellow emissive so the 4 near patches are
                             // visually obvious and we can confirm selection tracks the camera.
@@ -3188,17 +3193,15 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                                                          DIRTY_ALL, (int)i, cmdBuf, &call.deviceState, &call);
                             renderedDisplaced = true;
                             ++cellxRenderedDisplaced;
-                        } else if (FixedFunctionShader::cellCrossDiagnosticsActive()) {
-                            ++cellxDisplacementBuildNull;
-                            LOG::logline("[CELLX][REPLAY0] getOrBuild-null idx=%u vb=%p ib=%p tier=%u neigh=%02x baseH=%p overlay=%p overlayH=%p",
-                                         (unsigned)i, call.rs.vb, call.rs.ib,
-                                         (unsigned)call.subdivTier, (unsigned)call.subdivNeighborDirMask,
-                                         call.baseParamHTexture, call.overlayTexture, call.overlayParamHTexture);
                         }
-                    } else if (FixedFunctionShader::cellCrossDiagnosticsActive()) {
+                        // Cache-miss tally + diagnostics now handled in the !sp
+                        // block above (always-on, not gated on cellCross).
+                    } else {
                         ++cellxDisplacementNotInSet;
-                        LOG::logline("[CELLX][REPLAY0] disp-not-in-near-set idx=%u vb=%p ib=%p near=%u",
-                                     (unsigned)i, call.rs.vb, call.rs.ib, fb.nearPatchCount);
+                        if (FixedFunctionShader::cellCrossDiagnosticsActive()) {
+                            LOG::logline("[CELLX][REPLAY0] disp-not-in-near-set idx=%u vb=%p ib=%p near=%u",
+                                         (unsigned)i, call.rs.vb, call.rs.ib, fb.nearPatchCount);
+                        }
                     }
                 }
                 if (!renderedDisplaced) {
@@ -3232,6 +3235,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                      cellxDisplacementNotInSet, cellxLoweredTerrain,
                      cellxFlatTerrain, fb.nearPatchCount);
     }
+
 
     // Store material sorting metrics for ImGui display (Scene 0 only)
     if (sceneCount == 0) {

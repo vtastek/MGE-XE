@@ -181,6 +181,7 @@ public:
     static D3DXHANDLE ehTime;
     static D3DXHANDLE ehRippleOrigin;
     static D3DXHANDLE ehWaveHeight;
+    static D3DXHANDLE ehDisplacementFalloff;
 
     static std::function<void(IDirect3DSurface9*)> captureScreenHandler;
     static bool captureScreenWithUI;
@@ -261,6 +262,11 @@ public:
     static void renderDepthAdditional(DLContext* ctx, const std::vector<RecordedMWState>& recMW, int sceneFilter = -1, const D3DXMATRIX* viewOverride = nullptr,
         IDirect3DSurface9* targetOverride = nullptr, IDirect3DSurface9* depthStencilOverride = nullptr, bool clearZ = false);
     static void renderDepthRecorded(const std::vector<RecordedMWState>& recMW, int sceneFilter = -1, const D3DXMATRIX* gameView = nullptr, FixedFunctionShader::FrameBuffer* fb = nullptr);
+    // Phase 8.4 displaced-depth pass. Iterates recMW, only emits displaced
+    // terrain tiles using the color-path VB so the new DepthMWDisplacedVS can
+    // apply the same camera-distance falloff. Caller must have entered
+    // PASS_RENDERMWDEPTHDISPLACED and set displacementFalloff.
+    static void renderDepthRecordedDisplaced(const std::vector<RecordedMWState>& recMW, FixedFunctionShader::FrameBuffer* fb);
     static void renderForwardPrepassChain(DLContext* ctx, const PostProcessData* ppd = nullptr);
     static void generateHiZMipsGPU();
     static void copyHiZToStaging();
