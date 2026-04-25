@@ -225,7 +225,7 @@ float3 GetSafeNormal(float3 viewPos, float3 inputNormal)
 	return normalize(lerp(inputNormal, pseudoNormal, factor));
 }
 
-// Per-pixel TBN from screen-space derivatives (view space)
+// Per-pixel cotangent frame from screen-space derivatives (view space).
 void BuildPerPixelTBN(
 	float3 normalVS,
 	float3 viewPos,
@@ -236,23 +236,26 @@ void BuildPerPixelTBN(
 {
 	N = normalize(normalVS);
 
-	float3 dpdx = ddx(-viewPos);
-	float3 dpdy = ddy(-viewPos);
-	float2 dtdx = ddx(uv);
-	float2 dtdy = ddy(uv);
+	float3 dp1 = ddx(viewPos);
+	float3 dp2 = ddy(viewPos);
+	float2 duv1 = ddx(uv);
+	float2 duv2 = ddy(uv);
 
-	float det = dtdx.x * dtdy.y - dtdx.y * dtdy.x;
-	float invDet = (abs(det) > 1e-8) ? (1.0 / det) : 0.0;
+	float3 dp2perp = cross(dp2, N);
+	float3 dp1perp = cross(N, dp1);
+	T = dp2perp * duv1.x + dp1perp * duv2.x;
+	B = dp2perp * duv1.y + dp1perp * duv2.y;
 
-	T = normalize((dpdx * dtdy.y - dpdy * dtdx.y) * invDet);
-	B = normalize((-dpdx * dtdy.x + dpdy * dtdx.x) * invDet);
+	float invMax = rsqrt(max(dot(T, T), dot(B, B)));
+	T *= invMax;
+	B *= invMax;
 }
 
 #if defined(HAS_NORMAL) || defined(HAS_PARAMH)
 // Parallax height and normal parameters
-static const float parallaxScale = 10.2;
-static const float parallaxBias = 0.00005;
-static const float heightScale = -16;
+static const float parallaxScale = 0.006;
+static const float parallaxBias = 0.005;
+static const float heightScale = 16;
 
 #ifdef USE_PARALLAX
 // Simple offset parallax mapping (no raymarch, just single offset)
@@ -295,7 +298,7 @@ float ParallaxSoftShadow(
 	else h0 = 1.0 - sample0.a;  // _paramh (DXT5) and legacy _nh both store height in alpha
 
 	h = h0;
-	float2 lDir = -lightDirTS * scale;
+	float2 lDir = lightDirTS * scale;
 
 	// Sample height at multiple points along light direction
 	float4 sample1 = tex2D(hmap, uv + 0.20 * lDir);
@@ -342,7 +345,7 @@ float ParallaxSoftShadowBlend(
 	float soften,
 	float scale)
 {
-	float2 lDir = -lightDirTS * scale;
+	float2 lDir = lightDirTS * scale;
 	float h0 = 1.0 - lerp(tex2D(hmapBase, uv).a,
 	                      tex2D(hmapOverlay, uv).a, mask);
 	float h1 = 1.0 - lerp(tex2D(hmapBase, uv + 0.20 * lDir).a,

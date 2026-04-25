@@ -15,6 +15,7 @@
 #include "hlsl_shader_manager.h"
 #include "shader_utils.h"
 #include "patch_displacement.h"
+#include "mged3d8device.h"
 
 #include <algorithm>
 #include <sstream>
@@ -76,6 +77,13 @@ FixedFunctionShader::PipelinePhase FixedFunctionShader::currentPhase = FixedFunc
 FixedFunctionShader::PhaseCallCounts FixedFunctionShader::frameCaptureGpuCalls = {};
 FixedFunctionShader::PhaseCallCounts FixedFunctionShader::recordingGpuCalls = {};
 
+static int s_cellCrossDiagStartFrame = -1;
+static int s_cellCrossDiagEndFrame = -1;
+static void* s_cellCrossOldCell = nullptr;
+static void* s_cellCrossNewCell = nullptr;
+static bool s_cellCrossOldExterior = false;
+static bool s_cellCrossNewExterior = false;
+
 static FixedFunctionShader::PhaseCallCounts* getActiveCounters() {
     auto phase = FixedFunctionShader::getPhase();
     if (phase == FixedFunctionShader::PipelinePhase::FrameCapture)
@@ -109,6 +117,103 @@ void FixedFunctionShader::trackDeviceSubmit(const char* callName) {
             callName,
             currentPhase == PipelinePhase::FrameCapture ? "FrameCapture" : "Recording",
             c->deviceSubmits);
+    }
+}
+
+void FixedFunctionShader::beginCellCrossDiagnostics(void* oldCell, void* newCell, bool oldExterior, bool newExterior) {
+    int frame = getFrameNumber();
+    s_cellCrossDiagStartFrame = frame;
+    // Covers recording at crossing and the N-1/N-2 prepare/replay frames that follow.
+    s_cellCrossDiagEndFrame = frame + 8;
+    s_cellCrossOldCell = oldCell;
+    s_cellCrossNewCell = newCell;
+    s_cellCrossOldExterior = oldExterior;
+    s_cellCrossNewExterior = newExterior;
+
+    LOG::logline("[CELLX] BEGIN frame=%d oldCell=%p newCell=%p oldExt=%d newExt=%d window=[%d,%d]",
+                 frame, oldCell, newCell, oldExterior ? 1 : 0, newExterior ? 1 : 0,
+                 s_cellCrossDiagStartFrame, s_cellCrossDiagEndFrame);
+}
+
+bool FixedFunctionShader::cellCrossDiagnosticsActive() {
+    int frame = getFrameNumber();
+    return s_cellCrossDiagEndFrame >= 0 &&
+           frame >= s_cellCrossDiagStartFrame &&
+           frame <= s_cellCrossDiagEndFrame;
+}
+
+void FixedFunctionShader::logCellCrossFrame(const char* phase, const FrameBuffer& fb) {
+    if (!cellCrossDiagnosticsActive()) return;
+
+    int terrain = 0, terrainBlend = 0, opaque = 0, blending = 0;
+    int disp = 0, renderableDisp = 0, baseH = 0, overlay = 0, overlayH = 0;
+    int shouldRender = 0, absorbed = 0, bbox = 0;
+    for (const auto& call : fb.recordedCalls) {
+        if (call.shouldRender) ++shouldRender;
+        if (call.absorbed) ++absorbed;
+        if (call.hasBoundingBox) ++bbox;
+        if (call.bin == RenderBin::Terrain) {
+            ++terrain;
+            if (call.baseParamHTexture) ++baseH;
+            if (call.overlayTexture) ++overlay;
+            if (call.overlayParamHTexture) ++overlayH;
+            if (call.sk.hasDisplacement) {
+                ++disp;
+                if (call.shouldRender && !call.absorbed) ++renderableDisp;
+            }
+        } else if (call.bin == RenderBin::TerrainBlend) {
+            ++terrainBlend;
+        } else if (call.bin == RenderBin::Opaque) {
+            ++opaque;
+        } else if (call.bin == RenderBin::Blending) {
+            ++blending;
+        }
+    }
+
+    D3DXMATRIX invView, invCurrentView;
+    D3DXVECTOR4 origin(0.0f, 0.0f, 0.0f, 1.0f), eye(0.0f, 0.0f, 0.0f, 1.0f), currentEye(0.0f, 0.0f, 0.0f, 1.0f);
+    D3DXMatrixInverse(&invView, nullptr, &fb.view);
+    D3DXVec4Transform(&eye, &origin, &invView);
+    D3DXMatrixInverse(&invCurrentView, nullptr, &fb.currentView);
+    D3DXVec4Transform(&currentEye, &origin, &invCurrentView);
+
+    LOG::logline("[CELLX][%s] curFrame=%d fbFrame=%d oldCell=%p newCell=%p ext=%d->%d calls=%d should=%d bbox=%d terrain=%d blend=%d opaque=%d blending=%d disp=%d renderDisp=%d near=%u baseH=%d overlay=%d overlayH=%d cellBatch=%p/%Ix cached=%d",
+                 phase ? phase : "?",
+                 getFrameNumber(), fb.frameNumber, s_cellCrossOldCell, s_cellCrossNewCell,
+                 s_cellCrossOldExterior ? 1 : 0, s_cellCrossNewExterior ? 1 : 0,
+                 (int)fb.recordedCalls.size(), shouldRender, bbox, terrain, terrainBlend,
+                 opaque, blending, disp, renderableDisp, fb.nearPatchCount,
+                 baseH, overlay, overlayH, fb.cellBatchCacheKey, fb.cellBatchLayoutHash,
+                 fb.useCachedMergedVB ? 1 : 0);
+    LOG::logline("[CELLX][%s] eye(record)=%.1f,%.1f,%.1f eye(current)=%.1f,%.1f,%.1f deltaXY=%.1f,%.1f absorbed=%d",
+                 phase ? phase : "?",
+                 eye.x, eye.y, eye.z, currentEye.x, currentEye.y, currentEye.z,
+                 currentEye.x - eye.x, currentEye.y - eye.y, absorbed);
+
+    int emitted = 0;
+    for (size_t i = 0; i < fb.recordedCalls.size() && emitted < 8; ++i) {
+        const auto& call = fb.recordedCalls[i];
+        if (call.bin != RenderBin::Terrain) continue;
+        if (!call.sk.hasDisplacement && emitted >= 4) continue;
+
+        float cx = 0.0f, cy = 0.0f, cz = 0.0f, d2 = -1.0f;
+        if (call.hasBoundingBox) {
+            cx = 0.5f * (call.bboxMin.x + call.bboxMax.x);
+            cy = 0.5f * (call.bboxMin.y + call.bboxMax.y);
+            cz = 0.5f * (call.bboxMin.z + call.bboxMax.z);
+            float dx = cx - eye.x;
+            float dy = cy - eye.y;
+            d2 = dx * dx + dy * dy;
+        }
+
+        LOG::logline("[CELLX][%s] tile idx=%u disp=%d should=%d tier=%u neigh=%02x edgeHash=%08x vb=%p ib=%p tex=%p baseH=%p overlay=%p overlayH=%p center=%.1f,%.1f,%.1f d2=%.0f",
+                     phase ? phase : "?",
+                     (unsigned)i, call.sk.hasDisplacement ? 1 : 0, call.shouldRender ? 1 : 0,
+                     (unsigned)call.subdivTier, (unsigned)call.subdivNeighborDirMask,
+                     call.edgeContextHash, call.rs.vb, call.rs.ib, call.rs.texture,
+                     call.baseParamHTexture, call.overlayTexture, call.overlayParamHTexture,
+                     cx, cy, cz, d2);
+        ++emitted;
     }
 }
 

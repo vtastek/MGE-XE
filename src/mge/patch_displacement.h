@@ -29,6 +29,7 @@ using NearPatchEdgeHeights = FixedFunctionShader::NearPatchEdgeHeights;
 
 struct SubdivPatch {
     IDirect3DVertexBuffer9* vb = nullptr;
+    IDirect3DVertexBuffer9* depthVB = nullptr; // Same layout, POSITION.z pre-displaced for depth prepass.
     IDirect3DIndexBuffer9*  ib = nullptr;
     UINT stride = 0;
     DWORD fvf = 0;

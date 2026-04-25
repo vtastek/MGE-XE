@@ -449,7 +449,7 @@ void DistantLand::renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer*
             FixedFunctionShader::transitionTo(PhaseTransition::DepthEntry);
             effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
             if (ImGuiManager::GetEnableDepthPass()) {
-                renderDepth(ctx, activeRecordMW, sceneFilter);
+                renderDepth(ctx, activeRecordMW, sceneFilter, fb);
             }
             effectDepth->End();
             FixedFunctionShader::transitionTo(PhaseTransition::DepthExit);

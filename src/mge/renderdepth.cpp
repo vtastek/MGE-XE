@@ -6,6 +6,7 @@
 #include "mwbridge.h"
 #include "proxydx/d3d8header.h"
 #include "imgui_manager.h"
+#include "patch_displacement.h"
 #include "postshaders.h"
 #include "support/log.h"
 #include "mge_tracy.h"
@@ -15,7 +16,7 @@
 
 
 
-void DistantLand::renderDepth(DLContext* ctx, const std::vector<RecordedMWState>& recMW, int sceneFilter) {
+void DistantLand::renderDepth(DLContext* ctx, const std::vector<RecordedMWState>& recMW, int sceneFilter, FixedFunctionShader::FrameBuffer* fb) {
     MGE_ZoneScopedN("renderDepth");
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_Depth, 0, (int)recMW.size());
     auto mwBridge = MWBridge::get();
@@ -53,7 +54,7 @@ void DistantLand::renderDepth(DLContext* ctx, const std::vector<RecordedMWState>
     // Recorded draw calls with Morrowind near plane
     // Pass game view for skinned object transforms (device may have UI view in deferred pipeline)
     effectDepth->BeginPass(PASS_RENDERMWDEPTH);
-    renderDepthRecorded(recMW, sceneFilter, &ctx->mwView);
+    renderDepthRecorded(recMW, sceneFilter, &ctx->mwView, fb);
     effectDepth->EndPass();
 
     // Reset projection matrix
@@ -266,7 +267,7 @@ void DistantLand::renderForwardPrepassChain(DLContext* ctx, const PostProcessDat
     forwardSSAOActive = true;
 }
 
-void DistantLand::renderDepthRecorded(const std::vector<RecordedMWState>& recMW, int sceneFilter, const D3DXMATRIX* gameView) {
+void DistantLand::renderDepthRecorded(const std::vector<RecordedMWState>& recMW, int sceneFilter, const D3DXMATRIX* gameView, FixedFunctionShader::FrameBuffer* fb) {
     // Use an alpha threshold for solidity that isn't precisely equal to a commonly used value (such as 0.5).
     // Vertex interpolators can be slightly inaccurate and cause a value that should be constant across a triangle
     // to have interpolated fragment values that vary either side of the threshold and cause noise.
@@ -289,7 +290,10 @@ void DistantLand::renderDepthRecorded(const std::vector<RecordedMWState>& recMW,
 
     // Recorded renders (pre-filtered by executeHiZCulling/applyVisibilityAndFilterRecordMW)
     int scene2Count = 0;
-    for (const auto& i : recMW) {
+    const bool allowDisplacedDepth = fb && sceneFilter == 0 && fb->nearPatchCount > 0;
+    bool edgeHeightsReady = false;
+    for (size_t recIdx = 0; recIdx < recMW.size(); ++recIdx) {
+        const auto& i = recMW[recIdx];
         // Scene filter: -1 = all, 0 = Scene 0 only, N>0 = Scene N and later.
         if (sceneFilter == 0 && i.sceneNum != 0) continue;
         if (sceneFilter > 0 && i.sceneNum < sceneFilter) continue;
@@ -377,10 +381,68 @@ void DistantLand::renderDepthRecorded(const std::vector<RecordedMWState>& recMW,
             }
         }
 
-        device->SetStreamSource(0, i.vb, i.vbOffset, i.vbStride);
-        device->SetIndices(i.ib);
-        device->SetFVF(i.fvf);
-        device->DrawIndexedPrimitive(i.primType, i.baseIndex, i.minIndex, i.vertCount, i.startIndex, i.primCount);
+        IDirect3DVertexBuffer9* drawVB = i.vb;
+        IDirect3DIndexBuffer9* drawIB = i.ib;
+        UINT drawVBOffset = i.vbOffset;
+        UINT drawVBStride = i.vbStride;
+        DWORD drawFVF = i.fvf;
+        INT drawBaseIndex = i.baseIndex;
+        UINT drawMinIndex = i.minIndex;
+        UINT drawVertCount = i.vertCount;
+        UINT drawStartIndex = i.startIndex;
+        UINT drawPrimCount = i.primCount;
+
+        if (allowDisplacedDepth && i.sceneNum == 0) {
+            const FixedFunctionShader::HLSLRecordedCall* depthCall = nullptr;
+            for (const auto& call : fb->recordedCalls) {
+                if (call.recordMWIndex == (int)recIdx && call.sk.hasDisplacement && call.bin == RenderBin::Terrain) {
+                    depthCall = &call;
+                    break;
+                }
+            }
+            if (depthCall) {
+                if (!edgeHeightsReady) {
+                    PatchDisplacement::coalesceEdgeHeights(
+                        device, fb->nearPatchEdgeHeights, fb->recordedCalls,
+                        ImGuiManager::GetDisplacementScale(),
+                        ImGuiManager::GetDisplacementGamma(),
+                        ImGuiManager::GetDisplacementPivot());
+                    edgeHeightsReady = true;
+                }
+
+                FixedFunctionShader::TerrainPatchKey pk{depthCall->rs.vb, depthCall->rs.ib};
+                bool inSet = false;
+                for (uint32_t s = 0; s < fb->nearPatchCount; ++s) {
+                    if (fb->nearPatches[s] == pk) { inSet = true; break; }
+                }
+                if (inSet) {
+                    PatchDisplacement::SubdivPatch* sp = PatchDisplacement::getOrBuild(
+                        device, pk, *depthCall, depthCall->overlayTexture,
+                        ImGuiManager::GetDisplacementScale(),
+                        depthCall->subdivTier,
+                        ImGuiManager::GetDisplacementGamma(),
+                        ImGuiManager::GetDisplacementPivot(),
+                        &fb->nearPatchEdgeHeights);
+                    if (sp && sp->depthVB) {
+                        drawVB = sp->depthVB;
+                        drawIB = sp->ib;
+                        drawVBOffset = 0;
+                        drawVBStride = sp->stride;
+                        drawFVF = sp->fvf;
+                        drawBaseIndex = 0;
+                        drawMinIndex = 0;
+                        drawVertCount = sp->vertCount;
+                        drawStartIndex = 0;
+                        drawPrimCount = sp->primCount;
+                    }
+                }
+            }
+        }
+
+        device->SetStreamSource(0, drawVB, drawVBOffset, drawVBStride);
+        device->SetIndices(drawIB);
+        device->SetFVF(drawFVF);
+        device->DrawIndexedPrimitive(i.primType, drawBaseIndex, drawMinIndex, drawVertCount, drawStartIndex, drawPrimCount);
     }
     // Note: Culling stats are now logged in executeHiZCulling/applyVisibilityAndFilterRecordMW()
 }

@@ -1410,6 +1410,11 @@ public:
     static void storeCellBatchCacheVB(void* cellPtr, size_t layoutHash, IDirect3DVertexBuffer9* vb, IDirect3DIndexBuffer9* ib,
                                       const std::vector<CachedDrawInfo>& drawInfos);  // Store VB/IB in cache
 
+    // Short-lived diagnostics around player cell pointer changes. Emits to mgexe.log.
+    static void beginCellCrossDiagnostics(void* oldCell, void* newCell, bool oldExterior, bool newExterior);
+    static bool cellCrossDiagnosticsActive();
+    static void logCellCrossFrame(const char* phase, const FrameBuffer& fb);
+
     // Scene lifecycle for triple-buffered pipeline
     static void markSceneStart(int sceneNum, bool isUI = false);
     static void markSceneEnd();

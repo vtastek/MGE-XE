@@ -378,11 +378,9 @@ private:
 
     // Phase 7/8: Near-camera landscape displacement LOD
     static bool enableNearDisplacement;   // Master toggle for 2x2 near-camera patch displacement
-    static float displacementScale;       // World-unit scale applied to _paramh heights (0..64)
-    // Height remap applied in the CPU baker: bake = saturate(pow(h, 1/gamma) / pivot) * scale.
-    // gamma < 1 brightens (weight toward holes); pivot < 1 saturates high values so the
-    // plateau rides at the original Z and only crevices dip into the -scale baseline —
-    // fixes "objects sit on air" when the raw _paramh average is low.
+    static float displacementScale;       // World-unit crevice depth from _paramh alpha.
+    // CPU baker remap: alpha 1 stays at original height; alpha 0 reaches full negative scale.
+    // gamma shapes full-range depth; pivot saturates magnitude before scale.
     static float displacementGamma;
     static float displacementPivot;
     static float heightBlendStrength;     // Lerp between AlphaGrid and height-biased mask in PS (0..1)

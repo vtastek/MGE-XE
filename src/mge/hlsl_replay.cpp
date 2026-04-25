@@ -2968,7 +2968,14 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
         device->SetVertexShaderConstantF(73, falloff, 1);
     }
 
+    FixedFunctionShader::logCellCrossFrame(sceneCount == 0 ? "REPLAY0-BEGIN" : "REPLAY-BEGIN", fb);
+
     bool firstDrawDone = false;
+    int cellxRenderedDisplaced = 0;
+    int cellxDisplacementNotInSet = 0;
+    int cellxDisplacementBuildNull = 0;
+    int cellxLoweredTerrain = 0;
+    int cellxFlatTerrain = 0;
     for (size_t i = 0; i < numCalls; i++) {
         // Skip calls that were handled by merged batches
         if (mergedBatchIndices.count(i)) continue;
@@ -3173,11 +3180,6 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                             rsDisp.vertCount = sp->vertCount;
                             rsDisp.startIndex = 0;
                             rsDisp.primCount = sp->primCount;
-                            // Displacement is cosmetic-only: lower the rendered world so
-                            // the shader displaces upward from a -scale baseline back to the
-                            // original ground. Hi-Z and bbox paths keep the un-lowered world.
-                            float drop = ImGuiManager::GetDisplacementScale();
-                            rsDisp.worldTransforms[0]._43 -= drop;
                             D3DXMatrixMultiply(&rsDisp.worldViewTransforms[0],
                                                &rsDisp.worldTransforms[0], &fb.currentView);
                             rsDisp.shadowWorldViewProj[0] = rsDisp.worldTransforms[0] * DistantLand::s_staging.smViewproj[0];
@@ -3185,23 +3187,23 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                             renderMorrowindHLSL_Internal(&rsDisp, &tintedFrs, call.lightrs.get(),
                                                          DIRTY_ALL, (int)i, cmdBuf, &call.deviceState, &call);
                             renderedDisplaced = true;
+                            ++cellxRenderedDisplaced;
+                        } else if (FixedFunctionShader::cellCrossDiagnosticsActive()) {
+                            ++cellxDisplacementBuildNull;
+                            LOG::logline("[CELLX][REPLAY0] getOrBuild-null idx=%u vb=%p ib=%p tier=%u neigh=%02x baseH=%p overlay=%p overlayH=%p",
+                                         (unsigned)i, call.rs.vb, call.rs.ib,
+                                         (unsigned)call.subdivTier, (unsigned)call.subdivNeighborDirMask,
+                                         call.baseParamHTexture, call.overlayTexture, call.overlayParamHTexture);
                         }
+                    } else if (FixedFunctionShader::cellCrossDiagnosticsActive()) {
+                        ++cellxDisplacementNotInSet;
+                        LOG::logline("[CELLX][REPLAY0] disp-not-in-near-set idx=%u vb=%p ib=%p near=%u",
+                                     (unsigned)i, call.rs.vb, call.rs.ib, fb.nearPatchCount);
                     }
                 }
                 if (!renderedDisplaced) {
-                    // Cosmetic drop for non-subdivided Terrain so the flat baseline meets
-                    // the subdivided neighbors at -scale. Only when displacement is active
-                    // this frame (nearPatchCount > 0). Hi-Z/bbox keep the original world.
-                    if (call.bin == RenderBin::Terrain && fb.nearPatchCount > 0) {
-                        float drop = ImGuiManager::GetDisplacementScale();
-                        RenderedState rsLowered = call.rs;
-                        rsLowered.worldTransforms[0]._43 -= drop;
-                        D3DXMatrixMultiply(&rsLowered.worldViewTransforms[0],
-                                           &rsLowered.worldTransforms[0], &fb.currentView);
-                        renderMorrowindHLSL_Internal(&rsLowered, &call.frs, call.lightrs.get(), call.dirtyFlags, (int)i, cmdBuf, &call.deviceState, &call);
-                    } else {
-                        renderMorrowindHLSL_Internal(&call.rs, &call.frs, call.lightrs.get(), call.dirtyFlags, (int)i, cmdBuf, &call.deviceState, &call);
-                    }
+                    renderMorrowindHLSL_Internal(&call.rs, &call.frs, call.lightrs.get(), call.dirtyFlags, (int)i, cmdBuf, &call.deviceState, &call);
+                    if (call.bin == RenderBin::Terrain) ++cellxFlatTerrain;
                 }
                 QueryPerformanceCounter(&callEndQPC);
                 float callMs = (callEndQPC.QuadPart - callStartQPC.QuadPart) * 1000.0f / replayFreqQPC.QuadPart;
@@ -3223,6 +3225,13 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
     // Close final bin zone
     if (binZone) binZone->~ScopedZone();
 #endif
+
+    if (sceneCount == 0 && FixedFunctionShader::cellCrossDiagnosticsActive()) {
+        LOG::logline("[CELLX][REPLAY0-END] renderedDisp=%d buildNull=%d notInNearSet=%d loweredTerrain=%d flatTerrain=%d near=%u",
+                     cellxRenderedDisplaced, cellxDisplacementBuildNull,
+                     cellxDisplacementNotInSet, cellxLoweredTerrain,
+                     cellxFlatTerrain, fb.nearPatchCount);
+    }
 
     // Store material sorting metrics for ImGui display (Scene 0 only)
     if (sceneCount == 0) {

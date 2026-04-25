@@ -342,13 +342,19 @@ void FixedFunctionShader::startRecording() {
     // Morrowind reuses freed VB/IB/texture pointers for different data after cell changes,
     // so pointer-keyed caches (bboxCache, textureSuffixResolutionCache, blacklist) return stale data.
     {
+        static bool cellTrackInitialized = false;
         static bool lastWasExterior = false;
         static void* lastPlayerCell = nullptr;
 
         bool isExterior = MWBridge::get()->IsExterior();
         void* currentCell = MWBridge::get()->getPlayerCell();
 
-        if (isExterior != lastWasExterior) {
+        if (!cellTrackInitialized) {
+            cellTrackInitialized = true;
+            lastWasExterior = isExterior;
+            lastPlayerCell = currentCell;
+        } else if (isExterior != lastWasExterior) {
+            FixedFunctionShader::beginCellCrossDiagnostics(lastPlayerCell, currentCell, lastWasExterior, isExterior);
             // Interior ↔ exterior transition: clear geometry caches
             // textureSuffixResolutionCache is now evict-on-release (no bulk clear needed)
             {
@@ -361,13 +367,20 @@ void FixedFunctionShader::startRecording() {
             FixedFunctionShader::clearAllCellBatchCaches();
             lastWasExterior = isExterior;
         } else if (currentCell != lastPlayerCell) {
-            // Any cell change (exterior-to-exterior, interior-to-interior): clear geometry caches
-            {
-                std::lock_guard<std::mutex> lock(bboxCacheMutex);
-                bboxCache.clear();
+            FixedFunctionShader::beginCellCrossDiagnostics(lastPlayerCell, currentCell, lastWasExterior, isExterior);
+            // Keep exterior-to-exterior caches while crossing normal cell boundaries:
+            // the player is still surrounded by mostly the same loaded tiles, and
+            // clearing bboxCache here creates a one-frame displacement selection gap.
+            if (!(lastWasExterior && isExterior)) {
+                // Interior-to-interior cell changes can swap the whole scene; clear
+                // pointer-keyed geometry caches there.
+                {
+                    std::lock_guard<std::mutex> lock(bboxCacheMutex);
+                    bboxCache.clear();
+                }
+                softwareOcclusionCuller.clearBlacklist();
+                softwareOcclusionCuller.clearMeshCache();
             }
-            softwareOcclusionCuller.clearBlacklist();
-            softwareOcclusionCuller.clearMeshCache();
         }
 
         lastPlayerCell = currentCell;

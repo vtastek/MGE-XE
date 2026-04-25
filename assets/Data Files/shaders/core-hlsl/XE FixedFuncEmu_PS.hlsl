@@ -184,10 +184,12 @@ float4 ps_main(VS_OUTPUT input, float2 pixelPos : VPOS) : COLOR{
 	float3 diffuseParam = float3(1.0, 1.0, 1.0);  // Default white
 	float3 deb = 0;
 	float2 parallaxUV = input.texcoord;
+	float2 normalUV = input.texcoord;
 	float3 normalVS = normalize(input.normal);
 	// Phase 8.5: overlay blend mask — defaults to the Morrowind AlphaGrid factor; gets
 	// biased by per-pixel height when both base and overlay _paramh are available.
 	float overlayMask = input.color.a;
+	float normalOverlayMask = input.color.a;
 	
 	float3 ambient = INTENSITY * pow((lightSceneAmbient) + EPS, 2.2) / PI;
 	if (forwardSSAOParams.x > 0.5) {
@@ -209,19 +211,13 @@ float4 ps_main(VS_OUTPUT input, float2 pixelPos : VPOS) : COLOR{
 		#endif
 	#endif
 
-	#if defined(HAS_NORMAL) || defined(HAS_PARAMH)
-	float3 inputVS = GetSafeNormal(input.viewPos, input.normal);
-	#else
-	float3 inputVS = input.normal;
-	#endif
+	float3 inputVS = normalVS;
 
 	float bumpIntensity = 5.5;
 	float3 T, B, N;
 	BuildPerPixelTBN(inputVS, input.viewPos, parallaxUV, T, B, N);
 
-	float3 Vvs = normalize(input.viewPos);
-	float handedness = (dot(cross(T, B), N) < 0) ? -1.0 : 1.0;
-	//B *= handedness;
+	float3 Vvs = normalize(-input.viewPos);
 	float3x3 TBN = float3x3(T, B, N);
 	float3x3 TBN_T = transpose(TBN);
 	float3 Vts = mul(Vvs, TBN_T);
@@ -230,7 +226,7 @@ float4 ps_main(VS_OUTPUT input, float2 pixelPos : VPOS) : COLOR{
 	#if defined(HAS_PARAMH)
 		#if defined(USE_PARALLAX)
 		// Height lives in _paramh alpha; Parallax() defaults to channel 3 (alpha).
-		parallaxUV = Parallax(sampTex2, parallaxUV, Vts, 0.000015 * 1.33);
+		parallaxUV = Parallax(sampTex2, parallaxUV, Vts, parallaxScale);
 		#endif
 
 		#if defined(HAS_OVERLAY) && defined(HAS_OVERLAY_PARAMH)
@@ -250,6 +246,16 @@ float4 ps_main(VS_OUTPUT input, float2 pixelPos : VPOS) : COLOR{
 			float b2c = max(b2 - ma, 0.0);
 			float hMask = b2c / max(b1c + b2c, 1e-4);
 			overlayMask = lerp(t, hMask, heightBlendParams.x);
+
+			float hBaseN = tex2D(sampTex2, normalUV).a;
+			float hOverN = tex2D(sampOverlayParamH, normalUV).a;
+			float n1 = hBaseN + (1.0 - t);
+			float n2 = hOverN + t;
+			float na = max(n1, n2) - hbContrast;
+			float n1c = max(n1 - na, 0.0);
+			float n2c = max(n2 - na, 0.0);
+			float hMaskN = n2c / max(n1c + n2c, 1e-4);
+			normalOverlayMask = lerp(t, hMaskN, heightBlendParams.x);
 		}
 		#endif
 
@@ -268,26 +274,26 @@ float4 ps_main(VS_OUTPUT input, float2 pixelPos : VPOS) : COLOR{
 		// would produce INF texel offsets and blow up the gradient sample.
 		float2 texel = 1.0 / max(normres, 1.0);
 #endif
-		float hL = tex2D(sampTex2, parallaxUV + float2(-texel.x * deriv, 0)).a; // Alpha = height
-		float hR = tex2D(sampTex2, parallaxUV + float2(texel.x * deriv, 0)).a;
-		float hD = tex2D(sampTex2, parallaxUV + float2(0, -texel.y * deriv)).a;
-		float hU = tex2D(sampTex2, parallaxUV + float2(0,  texel.y * deriv)).a;
+		float hL = tex2D(sampTex2, normalUV + float2(-texel.x * deriv, 0)).a; // Alpha = height
+		float hR = tex2D(sampTex2, normalUV + float2(texel.x * deriv, 0)).a;
+		float hD = tex2D(sampTex2, normalUV + float2(0, -texel.y * deriv)).a;
+		float hU = tex2D(sampTex2, normalUV + float2(0,  texel.y * deriv)).a;
 		#if defined(HAS_OVERLAY_PARAMH)
 		// Phase 8A: blend gradient heights between base and overlay. Parallax() itself stays
 		// on the base sampler — the UV-offset delta from dual-sampling there is not worth
 		// doubling the iterative cost for.
-		float hL2 = tex2D(sampOverlayParamH, parallaxUV + float2(-texel.x * deriv, 0)).a;
-		float hR2 = tex2D(sampOverlayParamH, parallaxUV + float2( texel.x * deriv, 0)).a;
-		float hD2 = tex2D(sampOverlayParamH, parallaxUV + float2(0, -texel.y * deriv)).a;
-		float hU2 = tex2D(sampOverlayParamH, parallaxUV + float2(0,  texel.y * deriv)).a;
-		float overlayBlend = overlayMask;
+		float hL2 = tex2D(sampOverlayParamH, normalUV + float2(-texel.x * deriv, 0)).a;
+		float hR2 = tex2D(sampOverlayParamH, normalUV + float2( texel.x * deriv, 0)).a;
+		float hD2 = tex2D(sampOverlayParamH, normalUV + float2(0, -texel.y * deriv)).a;
+		float hU2 = tex2D(sampOverlayParamH, normalUV + float2(0,  texel.y * deriv)).a;
+		float overlayBlend = normalOverlayMask;
 		hL = lerp(hL, hL2, overlayBlend); hR = lerp(hR, hR2, overlayBlend);
 		hD = lerp(hD, hD2, overlayBlend); hU = lerp(hU, hU2, overlayBlend);
 		#endif
 		float dhdu = (hR - hL);
 		float dhdv = (hU - hD);
 
-		float3 nTS = normalize(float3(-dhdu * heightScale, dhdv * heightScale, 1.0));
+		float3 nTS = normalize(float3(-dhdu * heightScale, -dhdv * heightScale, 1.0));
 
 		normalVS = normalize(mul(nTS, TBN));
 		// Soft parallax shadowing (only if lighting is enabled)

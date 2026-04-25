@@ -256,11 +256,11 @@ public:
     static void simulateDynamicWaves();
     static void renderWaterPlane(DLContext* ctx);
 
-    static void renderDepth(DLContext* ctx, const std::vector<RecordedMWState>& recMW, int sceneFilter = -1);
+    static void renderDepth(DLContext* ctx, const std::vector<RecordedMWState>& recMW, int sceneFilter = -1, FixedFunctionShader::FrameBuffer* fb = nullptr);
     static void renderDepthDistantLand(DLContext* ctx);
     static void renderDepthAdditional(DLContext* ctx, const std::vector<RecordedMWState>& recMW, int sceneFilter = -1, const D3DXMATRIX* viewOverride = nullptr,
         IDirect3DSurface9* targetOverride = nullptr, IDirect3DSurface9* depthStencilOverride = nullptr, bool clearZ = false);
-    static void renderDepthRecorded(const std::vector<RecordedMWState>& recMW, int sceneFilter = -1, const D3DXMATRIX* gameView = nullptr);
+    static void renderDepthRecorded(const std::vector<RecordedMWState>& recMW, int sceneFilter = -1, const D3DXMATRIX* gameView = nullptr, FixedFunctionShader::FrameBuffer* fb = nullptr);
     static void renderForwardPrepassChain(DLContext* ctx, const PostProcessData* ppd = nullptr);
     static void generateHiZMipsGPU();
     static void copyHiZToStaging();

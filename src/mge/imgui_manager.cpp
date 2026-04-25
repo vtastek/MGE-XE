@@ -4,6 +4,7 @@
 #include "ffeshader.h"
 #include "mwbridge.h"
 #include "distantland.h"
+#include "patch_displacement.h"
 #include <cstdio>
 
 bool ImGuiManager::initialized = false;
@@ -79,11 +80,11 @@ bool ImGuiManager::instancingEnabled = false;
 
 // Phase 7/8: Near-camera landscape displacement LOD
 bool ImGuiManager::enableNearDisplacement = false;
-float ImGuiManager::displacementScale = 16.0f;
-float ImGuiManager::displacementGamma = 1.0f;  // 1.0 = identity
+float ImGuiManager::displacementScale = 6.0f;
+float ImGuiManager::displacementGamma = 0.25f;
 float ImGuiManager::displacementPivot = 1.0f;  // 1.0 = identity
-float ImGuiManager::heightBlendStrength = 0.5f;
-float ImGuiManager::heightBlendContrast = 0.3f;
+float ImGuiManager::heightBlendStrength = 1.0f;
+float ImGuiManager::heightBlendContrast = 0.06f;
 bool ImGuiManager::debugHighlightNearPatches = false;
 
 // Per-bin DIP suppression toggles
@@ -512,12 +513,18 @@ void ImGuiManager::RenderDebugInterface() {
         // Phase 7/8: Near-camera landscape displacement LOD
         ImGui::Checkbox("Near-camera Displacement LOD", &enableNearDisplacement);
         ImGui::SetItemTooltip("Subdivide the closest landscape patches and displace using _paramh heights.");
-        ImGui::SliderFloat("Displacement Scale", &displacementScale, 0.0f, 64.0f, "%.1f");
-        ImGui::SetItemTooltip("World-unit scale applied to _paramh heights. Default 16.");
-        ImGui::SliderFloat("Displacement Gamma", &displacementGamma, 0.25f, 4.0f, "%.2f");
-        ImGui::SetItemTooltip("gamma < 1 brightens heights (weight toward holes); gamma > 1 darkens. 1.0 = identity.");
-        ImGui::SliderFloat("Displacement Pivot", &displacementPivot, 0.1f, 1.0f, "%.2f");
-        ImGui::SetItemTooltip("Heights above this saturate to full scale. Lower pivot lifts the plateau so placed objects no longer sit on air. 1.0 = identity.");
+        bool displacementChanged = false;
+        displacementChanged |= ImGui::SliderFloat("Displacement Scale", &displacementScale, 0.0f, 64.0f, "%.1f");
+        ImGui::SetItemTooltip("World-unit crevice depth from _paramh alpha. 1 stays at original height; 0 reaches full depth.");
+        displacementChanged |= ImGui::SliderFloat("Displacement Gamma", &displacementGamma, 0.25f, 4.0f, "%.2f");
+        ImGui::SetItemTooltip("Shapes crevice depth across the full alpha range. 1.0 = linear.");
+        displacementChanged |= ImGui::SliderFloat("Displacement Pivot", &displacementPivot, 0.1f, 1.0f, "%.2f");
+        ImGui::SetItemTooltip("Saturates crevice depth. Lower pivot reaches full scale sooner.");
+        if (displacementChanged) {
+            PatchDisplacement::clearAll();
+            LOG::logline("PatchDisplacement: UI changed scale=%.2f gamma=%.2f pivot=%.2f; cleared patch cache",
+                         displacementScale, displacementGamma, displacementPivot);
+        }
         ImGui::SliderFloat("Height Blend Strength", &heightBlendStrength, 0.0f, 1.0f, "%.2f");
         ImGui::SetItemTooltip("Lerp between plain AlphaGrid blend (0) and height-biased blend (1). Keeps large transitions with rocks poking through.");
         ImGui::SliderFloat("Height Blend Contrast", &heightBlendContrast, 0.0f, 1.0f, "%.2f");

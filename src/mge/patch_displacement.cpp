@@ -1,7 +1,7 @@
 // Phase 7: near-camera subdivided landscape patch builder + cache.
 // See header for design intent. This file is all CPU work: lock source VB/IB,
-// expand the 5x5 grid to 9x9, sample _paramh green channel for per-vertex
-// displacement offsets, zero the perimeter, and upload to managed VB/IB.
+// expand the 5x5 grid, sample _paramh alpha channel for per-vertex signed
+// displacement, zero the perimeter, and upload to managed VB/IB.
 #include "patch_displacement.h"
 
 #include "support/log.h"
@@ -55,7 +55,7 @@ struct VertexLayout {
 };
 
 struct HeightMap {
-    std::vector<uint8_t> green;
+    std::vector<uint8_t> alpha;
     int width = 0;
     int height = 0;
 };
@@ -110,7 +110,7 @@ std::unordered_map<HeightCacheKey, HeightMap, HeightCacheKeyHash> s_heightCache;
 
 SRWLOCK s_lock = SRWLOCK_INIT;
 
-// Decode a heightmap to a cached 8-bit green-channel buffer. Top-mip is
+// Decode a heightmap to a cached 8-bit alpha-channel buffer. Top-mip is
 // converted to A8R8G8B8 via D3DXLoadSurfaceFromSurface which handles any
 // source format (uncompressed, DXT1/3/5, etc.) — much simpler than writing
 // format-specific decoders. We clamp the readback to 256x256; we only sample
@@ -161,13 +161,13 @@ const HeightMap* getOrDecodeHeight(IDirect3DDevice9* device, IDirect3DBaseTextur
     HeightMap hm;
     hm.width = (int)w;
     hm.height = (int)h;
-    hm.green.resize((size_t)w * h);
+    hm.alpha.resize((size_t)w * h);
     for (UINT y = 0; y < h; ++y) {
         const uint8_t* row = (const uint8_t*)lr.pBits + y * lr.Pitch;
         for (UINT x = 0; x < w; ++x) {
             // A8R8G8B8 in D3D is 0xAARRGGBB stored little-endian as B,G,R,A.
-            // Green sits at byte offset 1.
-            hm.green[(size_t)y * w + x] = row[x * 4 + 1];
+            // _paramh height is alpha, which sits at byte offset 3.
+            hm.alpha[(size_t)y * w + x] = row[x * 4 + 3];
         }
     }
     dstSurf->UnlockRect();
@@ -182,15 +182,14 @@ const HeightMap* getOrDecodeHeight(IDirect3DDevice9* device, IDirect3DBaseTextur
     return r;
 }
 
-// Sample a heightmap with bilinear interpolation, wrapping UVs, and apply the
-// displacement curve. Returns [0, scale] (unsigned).
+// Sample a heightmap with bilinear interpolation, wrapping UVs, and apply a
+// one-sided crevice displacement. Alpha 1 keeps original terrain height; alpha
+// 0 pushes down by the full scale.
 //
-//   h01 = bilinear(_paramh.g) / 255
-//   hg  = pow(h01, 1/gamma)        // gamma<1 brightens (weight toward holes)
-//   hp  = saturate(hg / pivot)     // pivot<1 saturates high values so the
-//                                  // plateau rides at the original Z and only
-//                                  // crevices dip into the -scale baseline
-//   out = hp * scale
+//   h01 = bilinear(_paramh.a) / 255
+//   depth01 = 1 - h01
+//   shaped = pow(depth01, 1/gamma) / pivot
+//   out = -saturate(shaped) * scale
 float sampleHeight(const HeightMap* hm, float u, float v, float scale,
                    float gamma, float pivot) {
     if (!hm) return 0.0f;
@@ -212,13 +211,14 @@ float sampleHeight(const HeightMap* hm, float u, float v, float scale,
     int xb = wrap(x0 + 1, hm->width);
     int ya = wrap(y0,     hm->height);
     int yb = wrap(y0 + 1, hm->height);
-    auto g = [&](int xi, int yi) { return (float)hm->green[(size_t)yi * hm->width + xi] / 255.0f; };
-    float a = g(xa, ya) * (1 - tx) + g(xb, ya) * tx;
-    float b = g(xa, yb) * (1 - tx) + g(xb, yb) * tx;
+    auto heightAt = [&](int xi, int yi) { return (float)hm->alpha[(size_t)yi * hm->width + xi] / 255.0f; };
+    float a = heightAt(xa, ya) * (1 - tx) + heightAt(xb, ya) * tx;
+    float b = heightAt(xa, yb) * (1 - tx) + heightAt(xb, yb) * tx;
     float h01 = a * (1 - ty) + b * ty;
-    float hg = powf(std::max(h01, 0.0f), 1.0f / std::max(gamma, 1e-4f));
-    float hp = std::min(1.0f, hg / std::max(pivot, 1e-4f));
-    return hp * scale;
+    float depth01 = std::min(1.0f, std::max(0.0f, 1.0f - h01));
+    float mag = powf(depth01, 1.0f / std::max(gamma, 1e-4f));
+    mag = std::min(1.0f, mag / std::max(pivot, 1e-4f));
+    return -mag * scale;
 }
 
 // Locate _paramh for the base color texture via TextureSuffix's existing
@@ -311,6 +311,7 @@ void bilerpBytes(const uint8_t* src, int sstride,
 
 SubdivPatch::~SubdivPatch() {
     if (vb) { vb->Release(); vb = nullptr; }
+    if (depthVB) { depthVB->Release(); depthVB = nullptr; }
     if (ib) { ib->Release(); ib = nullptr; }
 }
 
@@ -413,8 +414,8 @@ SubdivPatch* getOrBuild(IDirect3DDevice9* device,
     const bool rowMinIsSub = (neighborMask & (1u << rowMinBit)) != 0;
 
     // Output layout: same fields plus one extra TEXCOORD.
-    //   TEXCOORD1 (float2) — pre-baked baseH/overlayH; perimeter edge-locked verts
-    //   carry 0 so shared edges with non-subdivided neighbors stay crack-free.
+    //   TEXCOORD1 (float2) — pre-baked base/overlay signed displacements;
+    //   perimeter edge-locked verts carry 0 so shared edges keep original terrain height.
     VertexLayout dstLayout = srcLayout;
     UINT heightOff = srcLayout.stride;
     UINT dstStride = srcLayout.stride + 8;
@@ -444,7 +445,7 @@ SubdivPatch* getOrBuild(IDirect3DDevice9* device,
     std::vector<uint8_t> dstVerts((size_t)kDstVerts * dstStride, 0);
 
     // Pass 1: bilerp P/N/C/UV into every dst vert, and for interior verts
-    // sample heights locally from the paramhs. Edge verts get h=0 placeholders
+    // sample signed displacements locally from the paramhs. Edge verts get 0 placeholders
     // and are resolved in a post-pass against the coalesced edge map.
     for (UINT r = 0; r < kDstGrid; ++r) {
         for (UINT c = 0; c < kDstGrid; ++c) {
@@ -577,8 +578,8 @@ SubdivPatch* getOrBuild(IDirect3DDevice9* device,
     interpolateEdge(edgeCol0);
     interpolateEdge(edgeColMax);
 
-    // Pass 3: overwrite edge vert heights. An edge vert on a non-subdivided
-    // neighbor edge bakes h=0 (meets the dropped -scale baseline crack-free).
+    // Pass 3: overwrite edge vert displacements. An edge vert on a non-subdivided
+    // neighbor edge bakes 0 (keeps original terrain height crack-free).
     // An edge vert on a subdivided neighbor edge reads from the appropriate
     // edge array. Corner verts inherit h=0 if ANY adjacent edge is non-sub.
     auto writeH = [&](UINT vi, float b, float o) {
@@ -609,10 +610,10 @@ SubdivPatch* getOrBuild(IDirect3DDevice9* device,
             //
             // Phase 8.7c: at shared edges the VS lerp must be inert (base only)
             // so neighbors with different overlay signatures still displace to
-            // the same height. One side might be "texture A pure base" and the
-            // other "texture A with overlay B"; their baseH at the shared edge
-            // agrees (same paramh_A), their overlayH does not. Writing
-            // h[1] = h[0] makes lerp(baseH, overlayH, alpha) = baseH regardless
+            // the same displacement. One side might be "texture A pure base" and
+            // the other "texture A with overlay B"; their base displacement at
+            // the shared edge agrees (same paramh_A), their overlay does not. Writing
+            // h[1] = h[0] makes lerp(base, overlay, alpha) = base regardless
             // of each side's alpha grid, so the edge matches across the seam.
             float b = 0.0f;
             if      (onRow0)   { b = edgeRow0.base[c];   }
@@ -621,6 +622,38 @@ SubdivPatch* getOrBuild(IDirect3DDevice9* device,
             else               { b = edgeColMax.base[r]; }
             writeH(r * kDstGrid + c, b, b);
         }
+    }
+
+    bool haveBakedDisplacement = false;
+    float minBaseDisp = 0.0f, maxBaseDisp = 0.0f;
+    float minOverlayDisp = 0.0f, maxOverlayDisp = 0.0f;
+    for (UINT vi = 0; vi < kDstVerts; ++vi) {
+        const uint8_t* dstV = dstVerts.data() + (size_t)vi * dstStride;
+        const float* h = (const float*)(dstV + heightOff);
+        if (!haveBakedDisplacement) {
+            minBaseDisp = maxBaseDisp = h[0];
+            minOverlayDisp = maxOverlayDisp = h[1];
+            haveBakedDisplacement = true;
+        } else {
+            minBaseDisp = std::min(minBaseDisp, h[0]);
+            maxBaseDisp = std::max(maxBaseDisp, h[0]);
+            minOverlayDisp = std::min(minOverlayDisp, h[1]);
+            maxOverlayDisp = std::max(maxOverlayDisp, h[1]);
+        }
+    }
+
+    // Depth prepass uses the legacy depth effect, which does not know about the
+    // extra TEXCOORD heights. Bake the same final visible displacement directly
+    // into POSITION.z for a depth-only VB. Color replay still uses `vb` and lets
+    // the HLSL vertex shader apply heights, so shadows can continue to undo them.
+    std::vector<uint8_t> depthVerts = dstVerts;
+    for (UINT vi = 0; vi < kDstVerts; ++vi) {
+        uint8_t* depthV = depthVerts.data() + (size_t)vi * dstStride;
+        float* p = (float*)(depthV + dstLayout.posOffset);
+        const float* h = (const float*)(depthV + heightOff);
+        const DWORD color = *(const DWORD*)(depthV + dstLayout.colorOffset);
+        const float alpha = (float)((color >> 24) & 0xff) / 255.0f;
+        p[2] += h[0] * (1.0f - alpha) + h[1] * alpha;
     }
 
     key.ib->Unlock();
@@ -657,6 +690,14 @@ SubdivPatch* getOrBuild(IDirect3DDevice9* device,
     std::memcpy(vbData, dstVerts.data(), vbBytes);
     patch->vb->Unlock();
 
+    hr = device->CreateVertexBuffer(vbBytes, D3DUSAGE_WRITEONLY, 0, D3DPOOL_MANAGED, &patch->depthVB, nullptr);
+    if (FAILED(hr) || !patch->depthVB) return nullptr;
+    void* depthVbData = nullptr;
+    hr = patch->depthVB->Lock(0, 0, &depthVbData, 0);
+    if (FAILED(hr)) { return nullptr; }
+    std::memcpy(depthVbData, depthVerts.data(), vbBytes);
+    patch->depthVB->Unlock();
+
     UINT ibBytes = (UINT)(ibBuf.size() * sizeof(uint16_t));
     hr = device->CreateIndexBuffer(ibBytes, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_MANAGED, &patch->ib, nullptr);
     if (FAILED(hr) || !patch->ib) return nullptr;
@@ -685,9 +726,11 @@ SubdivPatch* getOrBuild(IDirect3DDevice9* device,
     ReleaseSRWLockExclusive(&s_lock);
 
     LOG::logline("PatchDisplacement: built subdivided patch vb=%p ib=%p overlay=%p "
-                 "baseH=%s overlayH=%s scale=%.1f tier=%u grid=%ux%u",
+                 "baseH=%s overlayH=%s scale=%.2f gamma=%.2f pivot=%.2f "
+                 "baseRange=[%.2f,%.2f] overlayRange=[%.2f,%.2f] tier=%u grid=%ux%u",
                  key.vb, key.ib, overlayTex,
-                 baseHM ? "y" : "n", overlayHM ? "y" : "n", heightScale,
+                 baseHM ? "y" : "n", overlayHM ? "y" : "n", heightScale, dispGamma, dispPivot,
+                 minBaseDisp, maxBaseDisp, minOverlayDisp, maxOverlayDisp,
                  (unsigned)subdivTier, (unsigned)kDstGrid, (unsigned)kDstGrid);
     return ret;
 }

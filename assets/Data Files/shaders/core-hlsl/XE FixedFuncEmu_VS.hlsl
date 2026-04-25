@@ -47,9 +47,8 @@ float4 drawDataParams : register(c70);  // {1/width=0.125, 1/height, 0, 0}
 
 #ifdef HAS_DISPLACEMENT
 // Phase 8.4: XY = (R_outer, R_inner) in world units; ZW = world-space camera XY.
-// Smoothstep from R_inner->R_outer fades displacement to 0 at the outer boundary
-// so subdivided tiles land on the -scale baseline and join seamlessly with the
-// flat (non-subdivided) terrain beyond.
+// Smoothstep from R_inner->R_outer fades signed displacement to 0 at the outer boundary
+// so subdivided tiles keep original terrain height where they meet flat terrain.
 float4 displacementFalloffVS : register(c73);
 #endif
 
@@ -69,8 +68,8 @@ struct VS_INPUT {
     float drawIndex : TEXCOORD7;
 #endif
 #ifdef HAS_DISPLACEMENT
-    // Pre-baked per-vertex heights on the subdivided near-camera patch.
-    // x=baseH, y=overlayH. Perimeter edge-locked verts carry 0 (crack-free).
+    // Pre-baked per-vertex signed displacement on the subdivided near-camera patch.
+    // x=base displacement, y=overlay displacement. Perimeter edge-locked verts carry 0.
     float2 heights : TEXCOORD1;
 #endif
 };
@@ -222,26 +221,26 @@ VS_OUTPUT vs_main(VS_INPUT input) {
     // Stays 0 when HAS_DISPLACEMENT is not defined, so the subtract below is a no-op.
     float _displaceH = 0;
 #ifdef HAS_DISPLACEMENT
-    // CPU path: heights pre-baked into the VB in [0, scale];
-    // edge-locked verts carry 0 so they rest at the dropped baseline.
+    // CPU path: signed displacements pre-baked into the VB in [-scale, scale];
+    // edge-locked verts carry 0 so original terrain height is preserved.
     #ifdef HAS_OVERLAY
     _displaceH = lerp(input.heights.x, input.heights.y, input.color.a);
     #else
     _displaceH = input.heights.x;
     #endif
     // Phase 8.4: planar XY distance from camera, smoothstep fade R_inner->R_outer.
-    // Inside R_inner: full displacement. Past R_outer: zero, so the outer ring
-    // lands at the -scale baseline and joins the flat non-subdivided terrain.
+    // Inside R_inner: full signed displacement. Past R_outer: zero, so the outer ring
+    // joins the flat non-subdivided terrain at the original height.
     float2 worldXY = mul(float4(input.pos.xyz, 1), world).xy;
     float distXY = length(worldXY - displacementFalloffVS.zw);
     float fall = 1.0 - smoothstep(displacementFalloffVS.y, displacementFalloffVS.x, distXY);
     _displaceH *= fall;
 
-    // Phase 8.3: displace along object-space +Z (world up — terrain has no
+    // Phase 8.3: displace along object-space Z (world up/down — terrain has no
     // rotation) rather than normalize(input.normal). Adjacent patches have
     // distinct per-vertex normals at the shared edge; normalizing them produces
-    // different directions for the same height, cracking the seam. Pure +Z
-    // guarantees identical offsets from identical heights → seamless.
+    // different directions for the same value, cracking the seam. Pure Z
+    // guarantees identical offsets from identical values -> seamless.
     input.pos.z += _displaceH;
 #endif
 
@@ -345,20 +344,15 @@ VS_OUTPUT vs_main(VS_INPUT input) {
 
 #ifdef HAS_SHADOWS
     // Shadow coordinate calculation. Two-cascade policy for HAS_DISPLACEMENT:
-    //   Near (cascade 0): sample at the undisplaced baseline so receiver matches the
-    //     flat non-subdivided caster exactly. PCF (25-tap blue noise) absorbs residual
-    //     mismatch. Result: no self-shadow in small concave areas; parallax handles
-    //     sub-displacement micro shadows.
+    //   Near (cascade 0): sample at the original terrain height so receiver matches
+    //     flat non-subdivided terrain exactly. PCF absorbs residual mismatch.
     //   Far  (cascade 1): keep the displaced worldpos. Far cascade sampler is
     //     essentially single-tap ESM over low-LOD distant-land casters; exact baseline
-    //     alignment there exposes LOD averaging as hard stripes. Leaving receiver at
-    //     displaced H (above baseline caster) prevents self-shadow while still
-    //     allowing hill-to-valley shadows, where the caster is much higher than a
-    //     pure-baseline receiver and the bias tolerance is ample.
+    //     alignment there exposes LOD averaging as hard stripes.
     #ifdef USE_STATELESS_BATCH
         // TODO: Stateless terrain with displacement also needs _displaceH removed
         // from viewpos before shadow0 transform (displacement is along object-space
-        // +Z, so subtract _displaceH * wv2 where wv2 is the Z column of worldview).
+        // Z, so subtract _displaceH * wv2 where wv2 is the Z column of worldview).
         // Left as-is for now: the standard path covers the dominant terrain case.
         output.shadow0pos = mul(viewpos, shadowWorldViewProj[0]);
         output.shadow1pos = mul(viewpos, shadowWorldViewProj[1]);

@@ -1123,6 +1123,25 @@ void FixedFunctionShader::prepareRecordedCalls() {
                 }
             }
 
+            // Near-displacement selection needs world-space bboxes immediately.
+            // On cell-cross frames, bboxCache may miss for newly recorded terrain;
+            // executeHiZCulling fills those later, which is too late for the
+            // hasDisplacement/nearPatchCount decision in this prepare pass.
+            int terrainBboxFilled = 0;
+            for (auto& call : recCalls) {
+                if (call.bin != RenderBin::Terrain || call.hasBoundingBox) continue;
+                call.hasBoundingBox = computeBoundingBox(&call.rs, call.bboxMin, call.bboxMax);
+                if (call.hasBoundingBox) {
+                    VBIBKey key{call.rs.vb, call.rs.ib};
+                    fb.bboxLookup[key] = {call.bboxMin, call.bboxMax};
+                    ++terrainBboxFilled;
+                }
+            }
+            if (terrainBboxFilled > 0 && cellCrossDiagnosticsActive()) {
+                LOG::logline("[CELLX][PREP] filledTerrainBbox=%d before near-displacement selection",
+                             terrainBboxFilled);
+            }
+
             // Phase 7 / 8.4: two-tier near-camera Terrain selection (XY distance).
             // Inner tier (0): up to 8 tiles within R_inner (~20 m, 65x65 subdivision).
             // Outer tier (1): up to 24 tiles within R_outer (~40 m, 33x33 subdivision).
@@ -1292,6 +1311,7 @@ void FixedFunctionShader::prepareRecordedCalls() {
         // Note: buildInstanceBatches is called AFTER executeHiZCulling (in cpuprepthread.cpp)
         // so that shouldRender flags are already set
     }
+    logCellCrossFrame("PREP-END", fb);
     QueryPerformanceCounter(&prepEndQPC);
     lastPrepareMs = (prepEndQPC.QuadPart - prepStartQPC.QuadPart) * 1000.0f / freqQPC.QuadPart;
     if (lastPrepareMs > ImGuiManager::GetSlowFrameThreshold()) {
@@ -1835,22 +1855,6 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
                 const auto& call = calls[callIdx];
                 StatelessDrawData data;
                 fillDrawData(data, call, call.shouldRender);
-                // Mirror the cosmetic displacement drop from the main-replay Terrain path
-                // so batched terrain lands at the same baseline as non-batched tiles.
-                if (call.bin == RenderBin::Terrain && fb.nearPatchCount > 0 &&
-                    ImGuiManager::GetEnableNearDisplacement()) {
-                    float drop = ImGuiManager::GetDisplacementScale();
-                    if (drop != 0.0f) {
-                        D3DXMATRIX wt = call.rs.worldTransforms[0];
-                        wt._43 -= drop;
-                        D3DXMATRIX wv;
-                        D3DXMatrixMultiply(&wv, &wt, &fb.view);
-                        data.world0[0] = wv._11; data.world0[1] = wv._21; data.world0[2] = wv._31; data.world0[3] = wv._41;
-                        data.world1[0] = wv._12; data.world1[1] = wv._22; data.world1[2] = wv._32; data.world1[3] = wv._42;
-                        data.world2[0] = wv._13; data.world2[1] = wv._23; data.world2[2] = wv._33; data.world2[3] = wv._43;
-                        data.flags[0] = wv._14; data.flags[1] = wv._24; data.flags[2] = wv._34; data.flags[3] = wv._44;
-                    }
-                }
                 fb.drawDataStaging.push_back(data);
                 mergedLayout.push_back(sortedCalls[i].first);
                 drawDataOffset++;
