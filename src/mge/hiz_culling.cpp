@@ -608,6 +608,13 @@ void FixedFunctionShader::executeHiZCulling(const D3DXMATRIX& currentView, const
         return;
     }
 
+    // Full Hi-Z bypass: skip bbox compute, occluder rasterization, pyramid build, and tests.
+    // recordedCalls.shouldRender defaults to true and applyVisibilityAndFilterRecordMW()
+    // also early-returns on this toggle, so leaving visibilityResults empty is safe.
+    if (ImGuiManager::GetDisableHiZCulling()) {
+        return;
+    }
+
     // Resize visibility results for this frame (indexed by draw order)
     // N-1: HLSL mode uses prep buffer (previous frame's data being prepared), legacy mode uses global static
     auto& renderBuf = getPrepBuffer();
@@ -730,19 +737,6 @@ void FixedFunctionShader::executeHiZCulling(const D3DXMATRIX& currentView, const
             softwareOcclusionCuller.uploadHiZToTexture(reinterpret_cast<IDirect3DDevice9*>(device), ImGuiManager::GetHiZDisplayMip(), uploadProj, ImGuiManager::GetHiZInvert());
         }
         hiZBuiltThisFrame = true;
-    }
-
-    // Hi-Z bypass toggle for terrain hole diagnosis
-    if (ImGuiManager::GetDisableHiZCulling()) {
-        for (size_t i = 0; i < visibilityResults.size(); i++)
-            visibilityResults[i] = 1;
-        // Mark all recordedCalls visible when culling disabled
-        for (auto& call : recCalls) {
-            call.shouldRender = true;
-        }
-        LOG::logline(">> Depth: %d objects (Hi-Z culling DISABLED by toggle)",
-                     (int)DistantLand::recordMW.size());
-        return;
     }
 
     // Unified Hi-Z visibility pass over recordedCalls (pure CPU, no device access)

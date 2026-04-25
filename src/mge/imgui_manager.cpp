@@ -458,7 +458,8 @@ void ImGuiManager::RenderDebugInterface() {
         ImGui::Text("Recording/Replay System (Scene 0)");
         ImGui::Separator();
 
-        ImGui::Checkbox("Disable Hi-Z Culling (terrain hole diagnosis)", &disableHiZCulling);
+        ImGui::Checkbox("Disable Hi-Z Culling (no rasterization, no test)", &disableHiZCulling);
+        ImGui::SetItemTooltip("Skips occluder rasterization, pyramid build, and visibility test entirely. Zero CPU cost.");
         ImGui::Checkbox("Force LightMode 3 (texture lights)", &forceLightMode3);
 
         // Shader debug visualization mode
