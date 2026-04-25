@@ -1,0 +1,27 @@
+# Auto-detect text files and force LF in the index and working tree.
+* text=auto eol=lf
+
+# Explicit binary markers (assets and build artifacts).
+*.dds   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.bmp   binary
+*.tga   binary
+*.nif   binary
+*.esp   binary
+*.esm   binary
+*.bsa   binary
+*.exe   binary
+*.dll   binary
+*.lib   binary
+*.pdb   binary
+*.obj   binary
+*.bin   binary
+*.zip   binary
+*.7z    binary
+*.wav   binary
+*.mp3   binary
+*.ogg   binary
+*.fbx   binary
