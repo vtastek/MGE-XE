@@ -70,12 +70,25 @@ void DistantLand::renderStage0() {
 
                 // Draw distant statics, with alpha dissolve as they pass the near view boundary
                 if (Configuration.MGEFlags & USE_DISTANT_STATICS) {
-                    DWORD p = mwBridge->CellHasWeather() ? PASS_RENDERSTATICSEXTERIOR : PASS_RENDERSTATICSINTERIOR;
+                    // MOREFPS phase 4: dispatch between per-object and instanced paths.
+                    // cullDistantStatics populates batchedStatics when the flag is set,
+                    // so the instanced path just has to issue the draws.
+                    const bool useInstancing = Configuration.UseStaticInstancing;
+                    DWORD p;
+                    if (useInstancing) {
+                        p = mwBridge->CellHasWeather() ? PASS_RENDERSTATICSEXTERIOR_INST : PASS_RENDERSTATICSINTERIOR_INST;
+                    } else {
+                        p = mwBridge->CellHasWeather() ? PASS_RENDERSTATICSEXTERIOR : PASS_RENDERSTATICSINTERIOR;
+                    }
                     effect->BeginPass(p);
                     vsr.beginAlphaToCoverage(device);
 
                     cullDistantStatics(&mwView, &distProj);
-                    renderDistantStatics();
+                    if (useInstancing) {
+                        renderDistantStaticsInstanced();
+                    } else {
+                        renderDistantStatics();
+                    }
 
                     vsr.endAlphaToCoverage(device);
                     effect->EndPass();

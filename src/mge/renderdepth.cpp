@@ -45,14 +45,23 @@ void DistantLand::renderDepth() {
             }
 
             // Distant statics
-            effectDepth->BeginPass(PASS_RENDERSTATICSDEPTH);
-            device->SetVertexDeclaration(StaticDecl);
-            if (Configuration.UseSharedMemory) {
-                visDistantShared.Render(device, effectDepth, effect, &ehTex0, &ehHasAlpha, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT);
+            // MOREFPS phase 4: route to the instanced depth pass when the flag is set.
+            // cullDistantStatics (run earlier from the color path) has already populated
+            // batchedStatics, so the instanced path just has to issue the draws.
+            if (Configuration.UseStaticInstancing) {
+                effectDepth->BeginPass(PASS_RENDERSTATICSDEPTH_INST);
+                renderDistantStaticsInstancedZ();
+                effectDepth->EndPass();
             } else {
-                visDistant.Render(device, effectDepth, effect, &ehTex0, &ehHasAlpha, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT);
+                effectDepth->BeginPass(PASS_RENDERSTATICSDEPTH);
+                device->SetVertexDeclaration(StaticDecl);
+                if (Configuration.UseSharedMemory) {
+                    visDistantShared.Render(device, effectDepth, effect, &ehTex0, &ehHasAlpha, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT);
+                } else {
+                    visDistant.Render(device, effectDepth, effect, &ehTex0, &ehHasAlpha, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT);
+                }
+                effectDepth->EndPass();
             }
-            effectDepth->EndPass();
         }
 
         if (Configuration.MGEFlags & USE_GRASS) {

@@ -18,7 +18,10 @@ enum RenderPassID {
     PASS_DEBUGSHADOW,
     PASS_PLAYERWAVE,
     PASS_WAVESTEP,
-    PASS_WORKAROUND
+    PASS_WORKAROUND,
+    // MOREFPS phase 3: appended so existing pass indices stay stable.
+    PASS_RENDERSTATICSEXTERIOR_INST,
+    PASS_RENDERSTATICSINTERIOR_INST
 };
 
 enum RenderShadowMapID {
@@ -33,7 +36,9 @@ enum RenderDepthID {
     PASS_RENDERMWDEPTH,
     PASS_RENDERLANDDEPTH,
     PASS_RENDERSTATICSDEPTH,
-    PASS_RENDERGRASSDEPTHINST
+    PASS_RENDERGRASSDEPTHINST,
+    // MOREFPS phase 3: appended so existing pass indices stay stable.
+    PASS_RENDERSTATICSDEPTH_INST
 };
 
 static const int SIZEOFSTATICVERT = 20;

@@ -107,6 +107,7 @@ struct ConfigurationStruct {
     float UIScale;
     int WindowAlignX, WindowAlignY;
     bool UseSharedMemory;
+    bool UseStaticInstancing;  // MOREFPS: gate distant-static instanced draws (phase 2+)
 
     struct {
         float zoom, zoomRate, zoomRateTarget;

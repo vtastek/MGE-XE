@@ -71,15 +71,24 @@ QuadTreeMesh::QuadTreeMesh(const QuadTreeMesh& rh) {
 //-----------------------------------------------------------------------------
 
 bool QuadTreeMesh::CompareByState(const RenderMesh& lh, const RenderMesh& rh) {
-    if (lh.tex < rh.tex) {
-        return true;
+    // Sort key is a tuple: (tex, vBuffer, hasAlpha, animateUV).
+    //
+    // MOREFPS phase 4 extended this beyond the original (tex, vBuffer) so the
+    // per-frame grouping in buildStaticInstanceVB forms maximally-sized batches
+    // (groups break when any of these four fields differ). This also helps the
+    // non-instanced VisibleSet::Render path: hasAlpha / animateUV now cluster
+    // consecutively, so the per-draw SetRenderState(ALPHATESTENABLE) and
+    // SetBool(animateUV) calls trigger less often.
+    if (lh.tex != rh.tex) {
+        return lh.tex < rh.tex;
     }
-
-    if (lh.tex == rh.tex && lh.vBuffer < rh.vBuffer) {
-        return true;
+    if (lh.vBuffer != rh.vBuffer) {
+        return lh.vBuffer < rh.vBuffer;
     }
-
-    return false;
+    if (lh.hasAlpha != rh.hasAlpha) {
+        return lh.hasAlpha < rh.hasAlpha;
+    }
+    return lh.animateUV < rh.animateUV;
 }
 
 //-----------------------------------------------------------------------------

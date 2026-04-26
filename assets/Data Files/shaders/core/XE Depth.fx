@@ -132,5 +132,16 @@ Technique T0 {
         VertexShader = compile vs_3_0 DepthGrassInstVS();
         PixelShader = compile ps_3_0 DepthNearPS();
     }
+    //------------------------------------------------------------
+    // MOREFPS phase 3: instanced distant-statics depth pass.
+    // Matches D3 render state; only the vertex shader differs.
+    Pass D3i {
+        ZEnable = true;
+        ZWriteEnable = true;
+        CullMode = CW;
+
+        VertexShader = compile vs_3_0 DepthStaticInstVS();
+        PixelShader = compile ps_3_0 DepthStaticPS();
+    }
    //------------------------------------------------------------
 }

@@ -53,6 +53,8 @@ public:
     static constexpr float waveTexWorldRes = 2.5f;
     static constexpr int GrassInstStride = 48;
     static constexpr int MaxGrassElements = 8192;
+    static constexpr int StaticInstStride = 48;
+    static constexpr int MaxStaticInstances = 32768;
     static constexpr float kCellSize = 8192.0f;
     static constexpr float kDistantZBias = 5e-6f;
     static constexpr float kDistantNearPlane = 4.0f;
@@ -99,6 +101,14 @@ public:
     static std::vector<RecordedState> recordMW;
     static std::vector<RecordedState> recordSky;
     static std::vector< std::pair<const RenderMesh*, int> > batchedGrass;
+    // batchedStatics stores RenderMesh by VALUE, not by pointer.
+    // Reason: when shared memory IPC is enabled, visDistantShared is a
+    // window over shared memory with windowSize=1 (distantinit.cpp) — the
+    // window re-maps on every iterator advance, invalidating any pointer
+    // we captured into the source storage. See rendergrass.cpp for the
+    // grass equivalent, which is safe only because the grass IPC vector
+    // is allocated with window size = MaxGrassElements.
+    static std::vector< std::pair<RenderMesh, int> > batchedStatics;
 
     static IDirect3DTexture9* texWorldColour, *texWorldNormals, *texWorldDetail;
     static IDirect3DTexture9* texDepthFrame;
@@ -110,6 +120,7 @@ public:
     static IDirect3DVertexBuffer9* vbWater;
     static IDirect3DIndexBuffer9* ibWater;
     static IDirect3DVertexBuffer9* vbGrassInstances;
+    static IDirect3DVertexBuffer9* vbStaticInstances;
 
     static IDirect3DTexture9* texRain, *texRipples, *texRippleBuffer;
     static IDirect3DSurface9* surfRain, *surfRipples, *surfRippleBuffer;
@@ -205,6 +216,11 @@ public:
     static void renderDistantLandZ();
     static void cullDistantStatics(const D3DXMATRIX* view, const D3DXMATRIX* proj);
     static void renderDistantStatics();
+    template<class T>
+    static void buildStaticInstanceVB(VisibleSet<T>& staticSet);
+    static void renderDistantStaticsInstanced();
+    static void renderDistantStaticsInstancedZ();
+    static void renderDistantStaticsInstancedCommon(ID3DXEffect* e);
     static void cullGrass(const D3DXMATRIX* view, const D3DXMATRIX* proj);
     template<class T>
     static void buildGrassInstanceVB(VisibleSet<T>& grassSet);

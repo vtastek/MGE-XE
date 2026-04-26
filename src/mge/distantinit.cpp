@@ -61,6 +61,7 @@ IPC::VecId DistantLand::dynVisFlagsSharedId = IPC::InvalidVector;
 vector<DistantLand::RecordedState> DistantLand::recordMW;
 vector<DistantLand::RecordedState> DistantLand::recordSky;
 vector< std::pair<const RenderMesh*, int> > DistantLand::batchedGrass;
+vector< std::pair<RenderMesh, int> > DistantLand::batchedStatics;
 
 IDirect3DTexture9* DistantLand::texWorldColour, *DistantLand::texWorldNormals, *DistantLand::texWorldDetail;
 IDirect3DTexture9* DistantLand::texDepthFrame;
@@ -72,6 +73,7 @@ IDirect3DVolumeTexture9* DistantLand::texWater;
 IDirect3DVertexBuffer9* DistantLand::vbWater;
 IDirect3DIndexBuffer9* DistantLand::ibWater;
 IDirect3DVertexBuffer9* DistantLand::vbGrassInstances;
+IDirect3DVertexBuffer9* DistantLand::vbStaticInstances;
 
 IDirect3DTexture9* DistantLand::texRain;
 IDirect3DTexture9* DistantLand::texRipples;
@@ -1285,6 +1287,15 @@ bool DistantLand::initGrass() {
         return false;
     }
 
+    // MOREFPS scaffold: dynamic VB for distant-statics instancing (wired up in phase 2).
+    // Format mirrors vbGrassInstances: 12 floats = 4x3 transposed transform per instance.
+    // Reuses GrassDecl in phase 2 since the vertex layout (base + instance transform) is identical.
+    hr = device->CreateVertexBuffer(MaxStaticInstances * StaticInstStride, D3DUSAGE_DYNAMIC|D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT, &vbStaticInstances, NULL);
+    if (hr != D3D_OK) {
+        LOG::logline("!! Failed to create static instance buffer");
+        return false;
+    }
+
     return true;
 }
 
@@ -1374,6 +1385,8 @@ void DistantLand::release() {
     ibWater = nullptr;
     vbGrassInstances->Release();
     vbGrassInstances = nullptr;
+    vbStaticInstances->Release();
+    vbStaticInstances = nullptr;
     vbFullFrame->Release();
     vbFullFrame = nullptr;
     vbClipCube->Release();

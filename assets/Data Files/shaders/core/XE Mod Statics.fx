@@ -112,3 +112,88 @@ float4 DepthStaticPS (DepthVertOut IN) : COLOR0 {
     }
     return IN.depth;
 }
+
+//------------------------------------------------------------
+// MOREFPS phase 3: instanced variants of the static vertex shaders.
+//
+// Transforms read the world matrix from per-instance input (world0/1/2
+// in stream 1 via StatVertInstIn) instead of the `world` uniform. The
+// rest of the pipeline (lighting, texcoord modifier, fogging) matches
+// the non-instanced variants byte-for-byte so visual output is identical.
+//
+// These are used only when the C++ caller issues DrawIndexedPrimitive
+// with D3DSTREAMSOURCE_INSTANCEDATA bound on stream 1 (see
+// DistantLand::renderDistantStaticsInstanced). The non-instanced
+// variants above remain the default path until phase 4 flips the
+// UseStaticInstancing flag.
+
+TransformedVert transformStaticVertInst(StatVertInstIn IN) {
+    TransformedVert v;
+
+    v.worldpos = instancedMul(IN.pos, IN.world0, IN.world1, IN.world2);
+    v.viewpos = mul(v.worldpos, view);
+    v.pos = mul(v.viewpos, proj);
+    return v;
+}
+
+float4 lightStaticVertInst(StatVertInstIn IN) {
+    // Decompress normal; transform through the per-instance matrix.
+    float4 normal = float4(normalize(2 * IN.normal.xyz - 1), 0);
+    normal = instancedMul(normal, IN.world0, IN.world1, IN.world2);
+
+    // Emissive is stored in the 4th value of the normal vector
+    float emissive = IN.normal.w;
+    float3 light = sunCol * saturate(dot(normal.xyz, -sunVec)) + sunAmb + emissive;
+
+    return float4(IN.color.rgb * light, IN.color.a);
+}
+
+float2 texcoordsModifierInst(StatVertInstIn IN) {
+    float2 tc = IN.texcoords;
+
+    if (hasVCol) {
+        // Linked to animateUV static flag; same scrolling as non-instanced path.
+        tc.y += fmod(0.08 * time, 1);
+    }
+    return tc;
+}
+
+StatVertOut StaticExteriorInstVS(StatVertInstIn IN) {
+    StatVertOut OUT;
+    TransformedVert v = transformStaticVertInst(IN);
+    OUT.pos = v.pos;
+    OUT.color = lightStaticVertInst(IN);
+
+    float3 eyevec = v.worldpos.xyz - eyePos.xyz;
+    float dist = length(eyevec);
+    OUT.fog = fogColour(eyevec / dist, dist);
+
+    OUT.texcoords_range = float3(texcoordsModifierInst(IN), dist);
+    return OUT;
+}
+
+StatVertOut StaticInteriorInstVS(StatVertInstIn IN) {
+    StatVertOut OUT;
+    TransformedVert v = transformStaticVertInst(IN);
+    OUT.pos = v.pos;
+    OUT.color = lightStaticVertInst(IN);
+
+    float dist = length(v.viewpos.xyz);
+    OUT.fog = fogMWColour(dist);
+
+    OUT.texcoords_range = float3(texcoordsModifierInst(IN), dist);
+    return OUT;
+}
+
+DepthVertOut DepthStaticInstVS(StatVertInstIn IN) {
+    DepthVertOut OUT;
+
+    TransformedVert v = transformStaticVertInst(IN);
+    OUT.pos = v.pos;
+
+    OUT.depth = OUT.pos.w;
+    OUT.alpha = 1;
+    OUT.texcoords = texcoordsModifierInst(IN);
+
+    return OUT;
+}
