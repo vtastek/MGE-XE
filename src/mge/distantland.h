@@ -110,6 +110,29 @@ public:
     // is allocated with window size = MaxGrassElements.
     static std::vector< std::pair<RenderMesh, int> > batchedStatics;
 
+    // MOREFPS phase 7 (occluder injection / Phase D): full CPU-side
+    // copy of each distant-land tile's triangle mesh, captured during
+    // initLandscape before the VB/IB Unlocks. Used by
+    // contributeDistantLandOccluders to feed the plugin's MSOC mask
+    // the real terrain surface. Earlier phases (subsampled 9x9 grids)
+    // produced bad silhouettes because MGE-XE's ROAM tessellator
+    // outputs adaptive, irregular meshes — they fight any regular-grid
+    // sampling scheme. Storing the full mesh removes that entire class
+    // of sampling artifact; the cost is ~20 MB extra RAM per worldspace,
+    // well within budget for a 32-bit process with a 2-4 GB heap.
+    //
+    // Keyed by the tile's VB pointer (the vBuffer field each RenderMesh
+    // in visLand / visLandShared carries).
+    //
+    // Indices are stored uniformly as uint32 regardless of the on-disk
+    // format (16-bit for small tiles, 32-bit for large) so the runtime
+    // rebase path doesn't have to branch.
+    struct LandMeshCache {
+        std::vector<D3DXVECTOR3>   positions;   // POSITION float3 only; UVs discarded
+        std::vector<std::uint32_t> indices;     // promoted to uint32 uniformly
+    };
+    static std::unordered_map<IDirect3DVertexBuffer9*, LandMeshCache> landMeshes;
+
     static IDirect3DTexture9* texWorldColour, *texWorldNormals, *texWorldDetail;
     static IDirect3DTexture9* texDepthFrame;
     static IDirect3DSurface9* surfDepthDepth;
@@ -214,6 +237,12 @@ public:
 
     static void renderDistantLand(ID3DXEffect* e, const D3DXMATRIX* view, const D3DXMATRIX* proj);
     static void renderDistantLandZ();
+    // MOREFPS phase 7: feed distant-land tile OBBs into the MSOC mask
+    // via mwse_addOccluder so the mask has horizon coverage (otherwise
+    // the upper half of the mask is empty and giants at the skyline
+    // never cull). Called from renderDistantLand after visLand is
+    // materialized; submissions land in next frame's mask.
+    static void contributeDistantLandOccluders();
     static void cullDistantStatics(const D3DXMATRIX* view, const D3DXMATRIX* proj);
     static void renderDistantStatics();
     template<class T>

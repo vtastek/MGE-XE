@@ -10,8 +10,9 @@
 
 
 struct QuadTreeMesh: public RenderMesh {
-    BoundingSphere sphere;
-    BoundingBox box;
+    // sphere and box are inherited from RenderMesh — promoted up so
+    // the IPC wire format carries them (occlusion test + any other
+    // consumer needing real per-mesh bounds on the client side).
 
     QuadTreeMesh(
         const BoundingSphere& b_sphere,

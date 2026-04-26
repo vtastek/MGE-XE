@@ -130,8 +130,10 @@
     <ClCompile Include="src\mge\mgedirect3d8.cpp" />
     <ClCompile Include="src\mge\mgedxwrap.cpp" />
     <ClCompile Include="src\mge\morrowindbsa.cpp" />
+    <ClCompile Include="src\mge\msocclient.cpp" />
     <ClCompile Include="src\mge\mwbridge.cpp" />
     <ClCompile Include="src\mge\mwinitpatch.cpp" />
+    <ClCompile Include="src\mge\phasetimers.cpp" />
     <ClCompile Include="src\mge\postshaders.cpp" />
     <ClCompile Include="src\mge\quadtree.cpp" />
     <ClCompile Include="src\mge\renderdepth.cpp" />
@@ -196,8 +198,10 @@
     <ClInclude Include="src\mge\mgeversion.h" />
     <ClInclude Include="src\mge\mmefunctiondefs.h" />
     <ClInclude Include="src\mge\morrowindbsa.h" />
+    <ClInclude Include="src\mge\msocclient.h" />
     <ClInclude Include="src\mge\mwbridge.h" />
     <ClInclude Include="src\mge\mwinitpatch.h" />
+    <ClInclude Include="src\mge\phasetimers.h" />
     <ClInclude Include="src\mge\postshaders.h" />
     <ClInclude Include="src\mge\quadtree.h" />
     <ClInclude Include="src\mge\specificrender.h" />

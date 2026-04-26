@@ -3,12 +3,14 @@
 #include "distantland.h"
 #include "distantshader.h"
 #include "mwbridge.h"
+#include "phasetimers.h"
 #include "proxydx/d3d8header.h"
 #include "support/log.h"
 
 
 
 void DistantLand::renderDepth() {
+    MGE_SCOPED_TIMER("renderDepth");
     auto mwBridge = MWBridge::get();
 
     // Switch to render target

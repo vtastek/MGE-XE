@@ -108,6 +108,7 @@ struct ConfigurationStruct {
     int WindowAlignX, WindowAlignY;
     bool UseSharedMemory;
     bool UseStaticInstancing;  // MOREFPS: gate distant-static instanced draws (phase 2+)
+    bool UseOcclusionCulling;  // MOREFPS: reuse msoc.dll's CPU occlusion mask for distant statics
 
     struct {
         float zoom, zoomRate, zoomRateTarget;

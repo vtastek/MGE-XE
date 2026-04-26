@@ -7,10 +7,13 @@
 #include "dlformat.h"
 #include "postshaders.h"
 #include "morrowindbsa.h"
+#include "msocclient.h"
 #include "mwbridge.h"
 #include "mgeversion.h"
 #include "statusoverlay.h"
 #include "ipc/dlshare.h"
+#include <algorithm>
+#include <cmath>
 #include <memory>
 #include <optional>
 
@@ -62,6 +65,7 @@ vector<DistantLand::RecordedState> DistantLand::recordMW;
 vector<DistantLand::RecordedState> DistantLand::recordSky;
 vector< std::pair<const RenderMesh*, int> > DistantLand::batchedGrass;
 vector< std::pair<RenderMesh, int> > DistantLand::batchedStatics;
+std::unordered_map<IDirect3DVertexBuffer9*, DistantLand::LandMeshCache> DistantLand::landMeshes;
 
 IDirect3DTexture9* DistantLand::texWorldColour, *DistantLand::texWorldNormals, *DistantLand::texWorldDetail;
 IDirect3DTexture9* DistantLand::texDepthFrame;
@@ -165,6 +169,69 @@ struct MeshResources {
 static vector<MeshResources> meshCollectionLand;
 static vector<MeshResources> meshCollectionStatics;
 
+// MOREFPS phase 7 (Phase D): capture the full triangle mesh of a
+// distant-land tile so it can be re-submitted to the MSOC mask
+// verbatim as an occluder. Earlier phases tried subsampling, but
+// MGE-XE's ROAM tessellator produces irregular, cache-optimized
+// meshes that don't subsample cleanly — capturing and submitting
+// the native geometry avoids that whole failure mode.
+//
+// Called inside the Lock/Unlock window during initLandscape /
+// initLandscapeClient. Caller supplies CPU-side pointers to already-
+// staged vertex and index bytes (we do NOT read from the WRITEONLY
+// lock region — that's pathologically slow on DXVK).
+//
+//   vbBytes    : pointer to `verts` * SIZEOFLANDVERT bytes, each
+//                vertex being POSITION float3 + TEXCOORD short2.
+//   ibBytes    : pointer to `faces` * (large ? 12 : 6) bytes of
+//                triangle indices.
+//   large      : true if indices are uint32, false if uint16.
+//
+// We keep only the float3 position per vertex (UVs discarded) and
+// promote all indices to uint32 so the runtime emit path has a
+// single format to handle.
+static void captureLandMesh(
+    IDirect3DVertexBuffer9* vb,
+    const void* vbBytes, unsigned verts,
+    const void* ibBytes, unsigned faces, bool large)
+{
+    if (!vb || !vbBytes || !ibBytes || verts < 3 || faces == 0) return;
+
+    DistantLand::LandMeshCache entry;
+    entry.positions.resize(verts);
+    entry.indices.resize(static_cast<size_t>(faces) * 3);
+
+    // Extract POSITION float3 from each vertex. Stride is SIZEOFLANDVERT
+    // (16 bytes: 12 position + 4 texcoord); position is at offset 0.
+    const auto* vbytes = static_cast<const char*>(vbBytes);
+    for (unsigned i = 0; i < verts; ++i) {
+        const auto* pos = reinterpret_cast<const float*>(vbytes + i * SIZEOFLANDVERT);
+        entry.positions[i] = D3DXVECTOR3(pos[0], pos[1], pos[2]);
+    }
+
+    // Promote indices to uint32. For the small-tile path (16-bit
+    // indices), widen in-place as we copy.
+    if (large) {
+        std::memcpy(entry.indices.data(), ibBytes,
+                    static_cast<size_t>(faces) * 3 * sizeof(std::uint32_t));
+    } else {
+        const auto* src = static_cast<const std::uint16_t*>(ibBytes);
+        for (size_t i = 0; i < entry.indices.size(); ++i) {
+            entry.indices[i] = src[i];
+        }
+    }
+
+    DistantLand::landMeshes.emplace(vb, std::move(entry));
+
+    // One-time log so we can tell capture is firing at all.
+    static bool loggedOnce = false;
+    if (!loggedOnce) {
+        loggedOnce = true;
+        LOG::logline("-- MSOC capture: first land tile captured (verts=%u tris=%u large=%s)",
+                     verts, faces, large ? "u32" : "u16");
+    }
+}
+
 
 
 
@@ -255,6 +322,12 @@ bool DistantLand::init() {
     if (!initGrass()) {
         return false;
     }
+
+    // MOREFPS: probe msoc.dll for the CPU occlusion mask. Must run after
+    // the rest of distant-land is wired up — the log line then lands in
+    // a predictable place in mgeXE.log next to other init banners.
+    // Soft dependency: returns silently if the plugin isn't installed.
+    MSOCClient::init();
 
     MWBridge::get()->patchResolveDuringInit(&resolveDynamicVisGroups);
 
@@ -1134,15 +1207,29 @@ bool DistantLand::initLandscapeClient() {
             ReadFile(file, &faces, 4, &unused, 0);
             bool large = (verts > 0xFFFF || faces > 0xFFFF);
 
+            // MOREFPS: stage both VB and IB bytes into CPU-side
+            // buffers so we can (a) hand them to the MSOC mesh capture
+            // and (b) push to the GPU via memcpy. Reading WRITEONLY
+            // locked memory goes through uncached slow paths on DXVK
+            // — staging avoids that entirely.
             device->CreateVertexBuffer(verts * SIZEOFLANDVERT, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT, &vb, 0);
-            vb->Lock(0, 0, &lockdata, 0);
-            ReadFile(file, lockdata, verts * SIZEOFLANDVERT, &unused, 0);
-            vb->Unlock();
-
             device->CreateIndexBuffer(faces * (large ? 12 : 6), D3DUSAGE_WRITEONLY, large ? D3DFMT_INDEX32 : D3DFMT_INDEX16, D3DPOOL_DEFAULT, &ib, 0);
-            ib->Lock(0, 0, &lockdata, 0);
-            ReadFile(file, lockdata, faces * (large ? 12 : 6), &unused, 0);
-            ib->Unlock();
+            {
+                std::vector<char> cpuVerts(static_cast<size_t>(verts) * SIZEOFLANDVERT);
+                std::vector<char> cpuIndices(static_cast<size_t>(faces) * (large ? 12 : 6));
+                ReadFile(file, cpuVerts.data(),   (DWORD)cpuVerts.size(),   &unused, 0);
+                ReadFile(file, cpuIndices.data(), (DWORD)cpuIndices.size(), &unused, 0);
+
+                captureLandMesh(vb, cpuVerts.data(), verts, cpuIndices.data(), faces, large);
+
+                vb->Lock(0, 0, &lockdata, 0);
+                std::memcpy(lockdata, cpuVerts.data(), cpuVerts.size());
+                vb->Unlock();
+
+                ib->Lock(0, 0, &lockdata, 0);
+                std::memcpy(lockdata, cpuIndices.data(), cpuIndices.size());
+                ib->Unlock();
+            }
 
             buffers.push_back({ vb, ib });
 
@@ -1235,15 +1322,29 @@ bool DistantLand::initLandscape() {
             IDirect3DIndexBuffer9* ib;
             void* lockdata;
 
+            // MOREFPS: same CPU-staging + full-mesh capture pattern as
+            // the IPC path above. We stage vertex and index bytes into
+            // plain std::vector buffers so we can hand them to the
+            // MSOC mesh capture and then push to the GPU via memcpy —
+            // avoiding any reads from WRITEONLY-locked driver memory.
             device->CreateVertexBuffer(i.verts * SIZEOFLANDVERT, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT, &vb, 0);
-            vb->Lock(0, 0, &lockdata, 0);
-            ReadFile(file, lockdata, i.verts * SIZEOFLANDVERT, &unused, 0);
-            vb->Unlock();
-
             device->CreateIndexBuffer(i.faces * (large ? 12 : 6), D3DUSAGE_WRITEONLY, large ? D3DFMT_INDEX32 : D3DFMT_INDEX16, D3DPOOL_DEFAULT, &ib, 0);
-            ib->Lock(0, 0, &lockdata, 0);
-            ReadFile(file, lockdata, i.faces * (large ? 12 : 6), &unused, 0);
-            ib->Unlock();
+            {
+                std::vector<char> cpuVerts(static_cast<size_t>(i.verts) * SIZEOFLANDVERT);
+                std::vector<char> cpuIndices(static_cast<size_t>(i.faces) * (large ? 12 : 6));
+                ReadFile(file, cpuVerts.data(),   (DWORD)cpuVerts.size(),   &unused, 0);
+                ReadFile(file, cpuIndices.data(), (DWORD)cpuIndices.size(), &unused, 0);
+
+                captureLandMesh(vb, cpuVerts.data(), i.verts, cpuIndices.data(), i.faces, large);
+
+                vb->Lock(0, 0, &lockdata, 0);
+                std::memcpy(lockdata, cpuVerts.data(), cpuVerts.size());
+                vb->Unlock();
+
+                ib->Lock(0, 0, &lockdata, 0);
+                std::memcpy(lockdata, cpuIndices.data(), cpuIndices.size());
+                ib->Unlock();
+            }
 
             i.vbuffer = vb;
             i.ibuffer = ib;

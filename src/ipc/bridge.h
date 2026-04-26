@@ -40,6 +40,18 @@ struct RenderMesh {
     ptr32<IDirect3DVertexBuffer9> vBuffer;
     int faces;
     ptr32<IDirect3DIndexBuffer9> iBuffer;
+
+    // World-space bounding sphere (post-transform). Promoted from
+    // QuadTreeMesh so it survives the IPC wire copy — consumers need
+    // real per-mesh bounds for occlusion tests and anything else that
+    // can't rely on a conservative global radius. 16 bytes at pack(4).
+    BoundingSphere sphere;
+
+    // World-space oriented bounding box (post-transform). Promoted
+    // alongside sphere so the occlusion path can escalate to a tighter
+    // 12-triangle test for giants whose sphere is too loose to resolve
+    // as OCCLUDED. center + (vx, vy, vz) axis half-extents; 52 bytes.
+    BoundingBox box;
 };
 
 struct ViewFrustum {

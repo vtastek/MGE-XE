@@ -3,6 +3,7 @@
 #include "distantshader.h"
 #include "configuration.h"
 #include "mged3d8device.h"
+#include "phasetimers.h"
 #include "support/log.h"
 
 #include <algorithm>
@@ -10,6 +11,7 @@
 
 
 void DistantLand::cullGrass(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
+    MGE_SCOPED_TIMER("cullGrass");
     D3DXMATRIX ds_proj = *proj, ds_viewproj;
     float zn = 4.0f, zf = nearViewRange;
 
@@ -38,6 +40,22 @@ void DistantLand::cullGrass(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
         DistantLandShare::currentWorldSpace->GrassStatics->GetVisibleMeshesCoarse(range_frustum, visGrass);
         visGrass.SortByState();
         buildGrassInstanceVB(visGrass);
+    }
+
+    // MOREFPS diagnostic: grass visible-set size after frustum cull.
+    // Grass uses a coarser cull (sphere-only via GetVisibleMeshesCoarse)
+    // and doesn't hit MSOC; this is just "how many grass instances are
+    // we about to rasterize this frame?"
+    {
+        static int diagFrameCounter = 0;
+        if ((diagFrameCounter++ % 60) == 0) {
+            const unsigned count = Configuration.UseSharedMemory
+                ? (unsigned)visGrassShared.Size()
+                : (unsigned)visGrass.Size();
+            LOG::logline("-- DL grass: count=%u  batches=%u  (limit=%u)",
+                         count, (unsigned)batchedGrass.size(),
+                         (unsigned)MaxGrassElements);
+        }
     }
 }
 
@@ -112,6 +130,7 @@ bool DistantLand::hasVisibleGrass() {
 
 // renderGrassInst - instanced grass with shadows
 void DistantLand::renderGrassInst() {
+    MGE_SCOPED_TIMER("renderGrassInst");
     if (!hasVisibleGrass()) {
         return;
     }
@@ -125,6 +144,7 @@ void DistantLand::renderGrassInst() {
 
 // renderGrassInstZ - Z only pass
 void DistantLand::renderGrassInstZ() {
+    MGE_SCOPED_TIMER("renderGrassInstZ");
     if (!hasVisibleGrass()) {
         return;
     }
