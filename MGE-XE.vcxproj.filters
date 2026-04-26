@@ -147,6 +147,9 @@
     <ClCompile Include="src\mge\terrain_horizon_occluder.cpp">
       <Filter>Source Files\mge</Filter>
     </ClCompile>
+    <ClCompile Include="src\mge\staticinstancing.cpp">
+      <Filter>Source Files\mge</Filter>
+    </ClCompile>
     <ClCompile Include="src\mge\postshaders.cpp">
       <Filter>Source Files\mge</Filter>
     </ClCompile>
@@ -330,6 +333,9 @@
       <Filter>Header Files\mge</Filter>
     </ClInclude>
     <ClInclude Include="src\mge\terrain_horizon_occluder.h">
+      <Filter>Header Files\mge</Filter>
+    </ClInclude>
+    <ClInclude Include="src\mge\staticinstancing.h">
       <Filter>Header Files\mge</Filter>
     </ClInclude>
     <ClInclude Include="src\mge\postshaders.h">

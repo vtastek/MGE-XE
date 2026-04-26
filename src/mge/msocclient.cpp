@@ -31,12 +31,12 @@ FnIsMaskReady g_isMaskReady       = nullptr;
 FnTestSphere  g_testSphere        = nullptr;
 FnTestOBB     g_testOBB           = nullptr;  // optional; older plugins don't export it
 FnDumpMask    g_dumpMask          = nullptr;  // optional; likewise
-FnTestSphereBatch     g_testSphereBatch  = nullptr;  // optional; Phase A expansion
+FnTestSphereBatch     g_testSphereBatch  = nullptr;  // optional
 FnGetSnapshotViewProj g_getViewProj      = nullptr;  // optional
 FnGetSnapshotAgeMs    g_getAgeMs         = nullptr;  // optional
 FnGetMaskResolution   g_getMaskRes       = nullptr;  // optional
-FnAddOccluder         g_addOccluder      = nullptr;  // optional; Phase B expansion
-FnAddPreTransformedOccluder g_addPreTransformedOccluder = nullptr;  // optional; Phase E
+FnAddOccluder         g_addOccluder      = nullptr;  // optional
+FnAddPreTransformedOccluder g_addPreTransformedOccluder = nullptr;  // optional
 bool          g_probed             = false;
 
 // Frozen ABI codes from the plugin. Match PatchOcclusionCulling.h.

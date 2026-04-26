@@ -7,6 +7,7 @@
 #include "ipc/client.h"
 #include "ipc/dlshare.h"
 
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -53,8 +54,6 @@ public:
     static constexpr float waveTexWorldRes = 2.5f;
     static constexpr int GrassInstStride = 48;
     static constexpr int MaxGrassElements = 8192;
-    static constexpr int StaticInstStride = 48;
-    static constexpr int MaxStaticInstances = 32768;
     static constexpr float kCellSize = 8192.0f;
     static constexpr float kDistantZBias = 5e-6f;
     static constexpr float kDistantNearPlane = 4.0f;
@@ -101,25 +100,14 @@ public:
     static std::vector<RecordedState> recordMW;
     static std::vector<RecordedState> recordSky;
     static std::vector< std::pair<const RenderMesh*, int> > batchedGrass;
-    // batchedStatics stores RenderMesh by VALUE, not by pointer.
-    // Reason: when shared memory IPC is enabled, visDistantShared is a
-    // window over shared memory with windowSize=1 (distantinit.cpp) — the
-    // window re-maps on every iterator advance, invalidating any pointer
-    // we captured into the source storage. See rendergrass.cpp for the
-    // grass equivalent, which is safe only because the grass IPC vector
-    // is allocated with window size = MaxGrassElements.
-    static std::vector< std::pair<RenderMesh, int> > batchedStatics;
 
-    // MOREFPS phase 7 (occluder injection / Phase D): full CPU-side
-    // copy of each distant-land tile's triangle mesh, captured during
-    // initLandscape before the VB/IB Unlocks. Used by
-    // contributeDistantLandOccluders to feed the plugin's MSOC mask
-    // the real terrain surface. Earlier phases (subsampled 9x9 grids)
-    // produced bad silhouettes because MGE-XE's ROAM tessellator
-    // outputs adaptive, irregular meshes — they fight any regular-grid
-    // sampling scheme. Storing the full mesh removes that entire class
-    // of sampling artifact; the cost is ~20 MB extra RAM per worldspace,
-    // well within budget for a 32-bit process with a 2-4 GB heap.
+    // CPU-side copy of each distant-land tile's triangle mesh, captured
+    // during initLandscape before the VB/IB Unlocks. Used by
+    // contributeDistantLandOccluders to feed the plugin's MSOC mask the
+    // real terrain surface — sampled subsets (regular grids etc.) fight
+    // ROAM's adaptive tessellation and produce poor silhouettes, so we
+    // store the full mesh. Cost: ~20 MB extra RAM per worldspace, well
+    // within budget for a 32-bit process with a 2-4 GB heap.
     //
     // Keyed by the tile's VB pointer (the vBuffer field each RenderMesh
     // in visLand / visLandShared carries).
@@ -143,7 +131,6 @@ public:
     static IDirect3DVertexBuffer9* vbWater;
     static IDirect3DIndexBuffer9* ibWater;
     static IDirect3DVertexBuffer9* vbGrassInstances;
-    static IDirect3DVertexBuffer9* vbStaticInstances;
 
     static IDirect3DTexture9* texRain, *texRipples, *texRippleBuffer;
     static IDirect3DSurface9* surfRain, *surfRipples, *surfRippleBuffer;
@@ -237,19 +224,37 @@ public:
 
     static void renderDistantLand(ID3DXEffect* e, const D3DXMATRIX* view, const D3DXMATRIX* proj);
     static void renderDistantLandZ();
-    // MOREFPS phase 7: feed distant-land tile OBBs into the MSOC mask
-    // via mwse_addOccluder so the mask has horizon coverage (otherwise
-    // the upper half of the mask is empty and giants at the skyline
-    // never cull). Called from renderDistantLand after visLand is
-    // materialized; submissions land in next frame's mask.
+    // Build a horizon-curtain occluder from the visible distant-land
+    // tiles and feed it to the plugin's MSOC mask via the pre-
+    // transformed occluder ABI. Without this, the upper half of the
+    // mask is empty and giants at the skyline never cull. Called from
+    // renderStage0 after visLand is materialized; submissions land in
+    // the next frame's mask (one-frame latency by design).
     static void contributeDistantLandOccluders();
+
+    // Free the horizon-curtain workspace (the lazily-allocated state in
+    // renderexterior.cpp). Called from release() so the malloc'd buffers
+    // don't leak across renderer init/release cycles.
+    static void shutdownHorizonWorkspace();
     static void cullDistantStatics(const D3DXMATRIX* view, const D3DXMATRIX* proj);
     static void renderDistantStatics();
+    // Distant-statics instancing lives in namespace StaticInstancing
+    // (staticinstancing.h) — buildVB / renderColor / renderDepth.
+
+    // MSOC occlusion verdict pass — walks the visible set, runs the
+    // batched sphere query, applies far/handoff gates and temporal
+    // hysteresis, fills msocOccluded with a per-instance cull mask
+    // (1 = cull, 0 = render). Both the instanced and non-instanced
+    // render paths consume this mask, so MSOC works the same way
+    // regardless of which rendering path is active.
     template<class T>
-    static void buildStaticInstanceVB(VisibleSet<T>& staticSet);
-    static void renderDistantStaticsInstanced();
-    static void renderDistantStaticsInstancedZ();
-    static void renderDistantStaticsInstancedCommon(ID3DXEffect* e);
+    static void applyMSOCToDistantStatics(VisibleSet<T>& staticSet);
+
+    // Per-instance MSOC verdict, indexed in lockstep with the visible
+    // set's iteration order. Sized = visible set size, filled by
+    // applyMSOCToDistantStatics. 1 = cull this instance, 0 = render.
+    // Empty when MSOC is unavailable / occlusion disabled.
+    static std::vector<std::uint8_t> msocOccluded;
     static void cullGrass(const D3DXMATRIX* view, const D3DXMATRIX* proj);
     template<class T>
     static void buildGrassInstanceVB(VisibleSet<T>& grassSet);

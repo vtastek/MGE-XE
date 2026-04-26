@@ -107,8 +107,11 @@ struct ConfigurationStruct {
     float UIScale;
     int WindowAlignX, WindowAlignY;
     bool UseSharedMemory;
-    bool UseStaticInstancing;  // MOREFPS: gate distant-static instanced draws (phase 2+)
-    bool UseOcclusionCulling;  // MOREFPS: reuse msoc.dll's CPU occlusion mask for distant statics
+    bool UseStaticInstancing;  // gate distant-static instanced draws
+    bool UseOcclusionCulling;  // reuse msoc.dll's CPU occlusion mask for distant statics
+    int OcclusionHysteresisFrames;  // consecutive OCCLUDED frames before a static actually culls
+    float OcclusionSphereInflate;   // per-instance sphere/OBB radius scale for verdict stability
+    bool LogDistantPipeline;        // gate per-frame diagnostic loglines + phase-timer reports + Numpad-5 mask dump
 
     struct {
         float zoom, zoomRate, zoomRateTarget;

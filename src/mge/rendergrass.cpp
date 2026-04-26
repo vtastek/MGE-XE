@@ -42,11 +42,11 @@ void DistantLand::cullGrass(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
         buildGrassInstanceVB(visGrass);
     }
 
-    // MOREFPS diagnostic: grass visible-set size after frustum cull.
+    // Grass visible-set size diagnostic, gated by LogDistantPipeline.
     // Grass uses a coarser cull (sphere-only via GetVisibleMeshesCoarse)
     // and doesn't hit MSOC; this is just "how many grass instances are
     // we about to rasterize this frame?"
-    {
+    if (Configuration.LogDistantPipeline) {
         static int diagFrameCounter = 0;
         if ((diagFrameCounter++ % 60) == 0) {
             const unsigned count = Configuration.UseSharedMemory

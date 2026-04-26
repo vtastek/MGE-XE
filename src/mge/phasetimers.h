@@ -1,17 +1,21 @@
 #pragma once
 
-// MOREFPS: temporary lightweight phase-timing instrumentation.
+// Lightweight phase-timing instrumentation. Reports gated by the
+// "Log Distant Pipeline" mge.ini flag — off by default, so the
+// scoped timers accumulate but no per-frame log output is produced
+// unless the user opts into pipeline logging.
 //
 // Usage: at the top of any scope you want to measure, write
 //     MGE_SCOPED_TIMER("cullDistantStatics");
 // and the RAII destructor will add the elapsed microseconds into a
-// named accumulator at scope exit. Call MGEPhaseTimers::report() once
-// per second (e.g., piggy-backed on an existing 60-frame diagnostic)
-// to flush a one-line-per-bucket summary into mgeXE.log and reset.
+// named accumulator at scope exit. MGEPhaseTimers::report() flushes a
+// one-line-per-bucket summary into mgeXE.log and resets the counters;
+// it's called from the per-frame diagnostic block in cullDistantStatics
+// when LogDistantPipeline is enabled.
 //
-// Explicitly "temporary" — everything lives in two files and is
-// grep-visible via the MGE_SCOPED_TIMER / MGEPhaseTimers tokens.
-// Can be ripped out in a single commit once we're done profiling.
+// Everything lives in two files and is grep-visible via the
+// MGE_SCOPED_TIMER / MGEPhaseTimers tokens, so the instrumentation
+// can be removed cleanly if it's ever no longer needed.
 
 #include <chrono>
 #include <cstdint>

@@ -19,7 +19,8 @@ enum RenderPassID {
     PASS_PLAYERWAVE,
     PASS_WAVESTEP,
     PASS_WORKAROUND,
-    // MOREFPS phase 3: appended so existing pass indices stay stable.
+    // Instanced distant-static color passes. Appended so existing pass
+    // indices remain stable.
     PASS_RENDERSTATICSEXTERIOR_INST,
     PASS_RENDERSTATICSINTERIOR_INST
 };
@@ -37,7 +38,8 @@ enum RenderDepthID {
     PASS_RENDERLANDDEPTH,
     PASS_RENDERSTATICSDEPTH,
     PASS_RENDERGRASSDEPTHINST,
-    // MOREFPS phase 3: appended so existing pass indices stay stable.
+    // Instanced distant-static depth pass. Appended so existing pass
+    // indices remain stable.
     PASS_RENDERSTATICSDEPTH_INST
 };
 

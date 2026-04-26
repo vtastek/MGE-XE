@@ -133,7 +133,7 @@ Technique T0 {
         PixelShader = compile ps_3_0 DepthNearPS();
     }
     //------------------------------------------------------------
-    // MOREFPS phase 3: instanced distant-statics depth pass.
+    // Instanced distant-statics depth pass.
     // Matches D3 render state; only the vertex shader differs.
     Pass D3i {
         ZEnable = true;

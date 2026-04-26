@@ -9,6 +9,9 @@
 #include "morrowindbsa.h"
 #include "msocclient.h"
 #include "mwbridge.h"
+// Lifecycle entry points for the static-instancing TU.
+// MOREFPS-INSTANCING: drop this include + the initVB/shutdownVB calls below to remove instancing.
+#include "staticinstancing.h"
 #include "mgeversion.h"
 #include "statusoverlay.h"
 #include "ipc/dlshare.h"
@@ -64,8 +67,8 @@ IPC::VecId DistantLand::dynVisFlagsSharedId = IPC::InvalidVector;
 vector<DistantLand::RecordedState> DistantLand::recordMW;
 vector<DistantLand::RecordedState> DistantLand::recordSky;
 vector< std::pair<const RenderMesh*, int> > DistantLand::batchedGrass;
-vector< std::pair<RenderMesh, int> > DistantLand::batchedStatics;
 std::unordered_map<IDirect3DVertexBuffer9*, DistantLand::LandMeshCache> DistantLand::landMeshes;
+std::vector<std::uint8_t> DistantLand::msocOccluded;
 
 IDirect3DTexture9* DistantLand::texWorldColour, *DistantLand::texWorldNormals, *DistantLand::texWorldDetail;
 IDirect3DTexture9* DistantLand::texDepthFrame;
@@ -77,7 +80,6 @@ IDirect3DVolumeTexture9* DistantLand::texWater;
 IDirect3DVertexBuffer9* DistantLand::vbWater;
 IDirect3DIndexBuffer9* DistantLand::ibWater;
 IDirect3DVertexBuffer9* DistantLand::vbGrassInstances;
-IDirect3DVertexBuffer9* DistantLand::vbStaticInstances;
 
 IDirect3DTexture9* DistantLand::texRain;
 IDirect3DTexture9* DistantLand::texRipples;
@@ -169,12 +171,11 @@ struct MeshResources {
 static vector<MeshResources> meshCollectionLand;
 static vector<MeshResources> meshCollectionStatics;
 
-// MOREFPS phase 7 (Phase D): capture the full triangle mesh of a
-// distant-land tile so it can be re-submitted to the MSOC mask
-// verbatim as an occluder. Earlier phases tried subsampling, but
-// MGE-XE's ROAM tessellator produces irregular, cache-optimized
-// meshes that don't subsample cleanly — capturing and submitting
-// the native geometry avoids that whole failure mode.
+// Capture the full triangle mesh of a distant-land tile so it can be
+// re-used to build a horizon-curtain occluder for the MSOC mask.
+// Subsampling fights MGE-XE's ROAM tessellator (irregular, cache-
+// optimized meshes don't subsample cleanly), so we keep the native
+// geometry; horizon construction reads it back at render time.
 //
 // Called inside the Lock/Unlock window during initLandscape /
 // initLandscapeClient. Caller supplies CPU-side pointers to already-
@@ -323,10 +324,10 @@ bool DistantLand::init() {
         return false;
     }
 
-    // MOREFPS: probe msoc.dll for the CPU occlusion mask. Must run after
-    // the rest of distant-land is wired up — the log line then lands in
-    // a predictable place in mgeXE.log next to other init banners.
-    // Soft dependency: returns silently if the plugin isn't installed.
+    // Probe msoc.dll for the CPU occlusion mask. Soft dependency:
+    // returns silently if the plugin isn't installed. Must run after
+    // the rest of distant-land is wired up so the resulting log banner
+    // lands next to other distant-land init lines in mgeXE.log.
     MSOCClient::init();
 
     MWBridge::get()->patchResolveDuringInit(&resolveDynamicVisGroups);
@@ -1207,11 +1208,11 @@ bool DistantLand::initLandscapeClient() {
             ReadFile(file, &faces, 4, &unused, 0);
             bool large = (verts > 0xFFFF || faces > 0xFFFF);
 
-            // MOREFPS: stage both VB and IB bytes into CPU-side
-            // buffers so we can (a) hand them to the MSOC mesh capture
-            // and (b) push to the GPU via memcpy. Reading WRITEONLY
-            // locked memory goes through uncached slow paths on DXVK
-            // — staging avoids that entirely.
+            // Stage both VB and IB bytes into CPU-side buffers so we
+            // can (a) hand them to the land-mesh capture and (b) push
+            // to the GPU via memcpy. Reading WRITEONLY locked memory
+            // goes through uncached slow paths on DXVK — staging
+            // avoids that entirely.
             device->CreateVertexBuffer(verts * SIZEOFLANDVERT, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT, &vb, 0);
             device->CreateIndexBuffer(faces * (large ? 12 : 6), D3DUSAGE_WRITEONLY, large ? D3DFMT_INDEX32 : D3DFMT_INDEX16, D3DPOOL_DEFAULT, &ib, 0);
             {
@@ -1322,11 +1323,11 @@ bool DistantLand::initLandscape() {
             IDirect3DIndexBuffer9* ib;
             void* lockdata;
 
-            // MOREFPS: same CPU-staging + full-mesh capture pattern as
-            // the IPC path above. We stage vertex and index bytes into
-            // plain std::vector buffers so we can hand them to the
-            // MSOC mesh capture and then push to the GPU via memcpy —
-            // avoiding any reads from WRITEONLY-locked driver memory.
+            // Same CPU-staging + full-mesh capture pattern as the IPC
+            // path above. Stage vertex and index bytes into plain
+            // std::vector buffers so we can hand them to the land-mesh
+            // capture and then push to the GPU via memcpy — avoiding
+            // any reads from WRITEONLY-locked driver memory.
             device->CreateVertexBuffer(i.verts * SIZEOFLANDVERT, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT, &vb, 0);
             device->CreateIndexBuffer(i.faces * (large ? 12 : 6), D3DUSAGE_WRITEONLY, large ? D3DFMT_INDEX32 : D3DFMT_INDEX16, D3DPOOL_DEFAULT, &ib, 0);
             {
@@ -1388,12 +1389,12 @@ bool DistantLand::initGrass() {
         return false;
     }
 
-    // MOREFPS scaffold: dynamic VB for distant-statics instancing (wired up in phase 2).
-    // Format mirrors vbGrassInstances: 12 floats = 4x3 transposed transform per instance.
-    // Reuses GrassDecl in phase 2 since the vertex layout (base + instance transform) is identical.
-    hr = device->CreateVertexBuffer(MaxStaticInstances * StaticInstStride, D3DUSAGE_DYNAMIC|D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT, &vbStaticInstances, NULL);
-    if (hr != D3D_OK) {
-        LOG::logline("!! Failed to create static instance buffer");
+    // Dynamic VB for distant-statics instancing, owned by the
+    // StaticInstancing namespace. Vertex layout is the same as
+    // vbGrassInstances (4x3 transposed transform per instance,
+    // consumed via GrassDecl).
+    // MOREFPS-INSTANCING: drop this initVB call to remove instancing.
+    if (!StaticInstancing::initVB(device)) {
         return false;
     }
 
@@ -1429,6 +1430,14 @@ void DistantLand::release() {
         // A shared texture is used for land, and is released below
     }
     meshCollectionLand.clear();
+
+    // Drop the per-tile mesh cache so its position + index buffers
+    // don't leak across release/init cycles. Map keys are the now-
+    // released VB pointers, so any survivor would also be a dangling-
+    // pointer hazard. Paired with the horizon-curtain workspace
+    // teardown below.
+    landMeshes.clear();
+    shutdownHorizonWorkspace();
 
     if (texWorldColour) {
         texWorldColour->Release();
@@ -1486,8 +1495,9 @@ void DistantLand::release() {
     ibWater = nullptr;
     vbGrassInstances->Release();
     vbGrassInstances = nullptr;
-    vbStaticInstances->Release();
-    vbStaticInstances = nullptr;
+    // Static instance VB lifecycle owned by the StaticInstancing namespace.
+    // MOREFPS-INSTANCING: drop this shutdownVB call to remove instancing.
+    StaticInstancing::shutdownVB();
     vbFullFrame->Release();
     vbFullFrame = nullptr;
     vbClipCube->Release();

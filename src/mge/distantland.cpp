@@ -6,6 +6,8 @@
 #include "distantshader.h"
 #include "postshaders.h"
 #include "mwbridge.h"
+// MOREFPS-INSTANCING: opt-in path — drop the include + StaticInstancing dispatch below to remove instancing entirely.
+#include "staticinstancing.h"
 
 
 
@@ -67,20 +69,22 @@ void DistantLand::renderStage0() {
                     renderDistantLand(effect, &mwView, &distProj);
                     effect->EndPass();
 
-                    // Phase E: feed horizon-curtain occluder into MSOC's
-                    // mask for next frame. Placed here (not inside
+                    // Feed the horizon-curtain occluder into MSOC's mask
+                    // for the next frame. Placed here (not inside
                     // renderDistantLand) because renderDistantLand also
-                    // fires for water reflection and shadow passes, where
-                    // the view differs but our contribution always uses
-                    // mwView — running it once per frame is enough.
+                    // fires for water reflection and shadow passes; the
+                    // contribution always uses mwView, so running it once
+                    // per frame is enough.
                     contributeDistantLandOccluders();
                 }
 
                 // Draw distant statics, with alpha dissolve as they pass the near view boundary
                 if (Configuration.MGEFlags & USE_DISTANT_STATICS) {
-                    // MOREFPS phase 4: dispatch between per-object and instanced paths.
-                    // cullDistantStatics populates batchedStatics when the flag is set,
-                    // so the instanced path just has to issue the draws.
+                    // Dispatch between per-object and instanced paths.
+                    // applyMSOCToDistantStatics (inside cullDistantStatics) populates
+                    // msocOccluded for both paths; the instanced path additionally builds
+                    // batchedStatics inside StaticInstancing::buildVB.
+                    // MOREFPS-INSTANCING: collapse this branch to the non-instanced arm to remove instancing.
                     const bool useInstancing = Configuration.UseStaticInstancing;
                     DWORD p;
                     if (useInstancing) {
@@ -93,7 +97,7 @@ void DistantLand::renderStage0() {
 
                     cullDistantStatics(&mwView, &distProj);
                     if (useInstancing) {
-                        renderDistantStaticsInstanced();
+                        StaticInstancing::renderColor();
                     } else {
                         renderDistantStatics();
                     }

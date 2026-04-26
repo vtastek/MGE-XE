@@ -1,9 +1,9 @@
 #pragma once
 
-// MOREFPS: client shim for msoc.dll (Masked Software Occlusion Culling
-// plugin, ships with MWSE installs). The plugin builds a CPU occlusion
-// mask from Morrowind's own near-scene occluders; we reuse that mask
-// to cull distant statics before we submit them.
+// Client shim for msoc.dll (Masked Software Occlusion Culling plugin,
+// ships separately as an MWSE plugin). The plugin builds a CPU
+// occlusion mask from Morrowind's own near-scene occluders; we reuse
+// that mask to cull distant statics before we submit them.
 //
 // This is a RUNTIME soft dependency. If msoc.dll is not present, not
 // the expected version, or the user has disabled it in mge.ini, every

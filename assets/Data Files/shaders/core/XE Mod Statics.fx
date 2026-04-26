@@ -114,18 +114,18 @@ float4 DepthStaticPS (DepthVertOut IN) : COLOR0 {
 }
 
 //------------------------------------------------------------
-// MOREFPS phase 3: instanced variants of the static vertex shaders.
+// Instanced variants of the static vertex shaders.
 //
 // Transforms read the world matrix from per-instance input (world0/1/2
 // in stream 1 via StatVertInstIn) instead of the `world` uniform. The
 // rest of the pipeline (lighting, texcoord modifier, fogging) matches
 // the non-instanced variants byte-for-byte so visual output is identical.
 //
-// These are used only when the C++ caller issues DrawIndexedPrimitive
-// with D3DSTREAMSOURCE_INSTANCEDATA bound on stream 1 (see
-// DistantLand::renderDistantStaticsInstanced). The non-instanced
-// variants above remain the default path until phase 4 flips the
-// UseStaticInstancing flag.
+// Used only when the C++ caller issues DrawIndexedPrimitive with
+// D3DSTREAMSOURCE_INSTANCEDATA bound on stream 1 (see
+// StaticInstancing::renderColor / renderDepth). The non-instanced
+// variants above remain the default path; whether instancing is used
+// is gated on Configuration.UseStaticInstancing.
 
 TransformedVert transformStaticVertInst(StatVertInstIn IN) {
     TransformedVert v;

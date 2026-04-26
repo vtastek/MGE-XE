@@ -5,6 +5,8 @@
 #include "mwbridge.h"
 #include "phasetimers.h"
 #include "proxydx/d3d8header.h"
+// MOREFPS-INSTANCING: drop this include + the StaticInstancing dispatch in renderDepth to remove instancing.
+#include "staticinstancing.h"
 #include "support/log.h"
 
 
@@ -46,21 +48,26 @@ void DistantLand::renderDepth() {
                 effectDepth->EndPass();
             }
 
-            // Distant statics
-            // MOREFPS phase 4: route to the instanced depth pass when the flag is set.
-            // cullDistantStatics (run earlier from the color path) has already populated
-            // batchedStatics, so the instanced path just has to issue the draws.
+            // Distant statics. Route to the instanced depth pass when
+            // the flag is set; cullDistantStatics (run earlier from the
+            // color path) has already populated batchedStatics, so the
+            // instanced path just has to issue the draws.
+            // MOREFPS-INSTANCING: collapse this branch to the non-instanced arm to remove instancing.
             if (Configuration.UseStaticInstancing) {
                 effectDepth->BeginPass(PASS_RENDERSTATICSDEPTH_INST);
-                renderDistantStaticsInstancedZ();
+                StaticInstancing::renderDepth();
                 effectDepth->EndPass();
             } else {
                 effectDepth->BeginPass(PASS_RENDERSTATICSDEPTH);
                 device->SetVertexDeclaration(StaticDecl);
+                // Same MSOC cull mask as the color path. Both passes
+                // consume the prebuilt msocOccluded so depth and color
+                // are guaranteed to agree on which instances are present.
+                const std::uint8_t* skipMask = msocOccluded.empty() ? nullptr : msocOccluded.data();
                 if (Configuration.UseSharedMemory) {
-                    visDistantShared.Render(device, effectDepth, effect, &ehTex0, &ehHasAlpha, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT);
+                    visDistantShared.Render(device, effectDepth, effect, &ehTex0, &ehHasAlpha, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT, false, skipMask);
                 } else {
-                    visDistant.Render(device, effectDepth, effect, &ehTex0, &ehHasAlpha, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT);
+                    visDistant.Render(device, effectDepth, effect, &ehTex0, &ehHasAlpha, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT, false, skipMask);
                 }
                 effectDepth->EndPass();
             }

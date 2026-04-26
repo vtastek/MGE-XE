@@ -5,6 +5,7 @@
 #include "ipc/bridge.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <vector>
 
 
@@ -79,7 +80,8 @@ public:
                 const D3DXHANDLE* animate_uv_handle,
                 const D3DXHANDLE* world_matrix_handle,
                 unsigned int vertex_size,
-                bool parallelRead = false) {
+                bool parallelRead = false,
+                const std::uint8_t* skipMask = nullptr) {
         IDirect3DTexture9* last_texture = nullptr;
         IDirect3DVertexBuffer9* last_buffer = nullptr;
         bool last_animateUV = false;
@@ -94,8 +96,19 @@ public:
             visible_set.start_read();
         }
         visible_set.restart();
+        std::size_t idx = 0;
         while (!visible_set.at_end()) {
             const RenderMesh& mesh = visible_set.next();
+
+            // Optional MSOC skip mask. When provided, skipMask[idx] != 0
+            // means this instance was reported OCCLUDED by the plugin
+            // (and survived all gates + hysteresis); skip rendering it.
+            // Mask order matches the visible set iteration order, so
+            // idx is the key.
+            if (skipMask && skipMask[idx]) {
+                ++idx;
+                continue;
+            }
 
             // Set texture and texture related variables if it has changed
             if (texture_handle && last_texture != mesh.tex) {
@@ -130,6 +143,7 @@ public:
 
             effect->CommitChanges();
             device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, mesh.verts, 0, mesh.faces);
+            ++idx;
         }
 
         if (parallelRead) {

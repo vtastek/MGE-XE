@@ -6,11 +6,65 @@
 #include "mwbridge.h"
 #include "phasetimers.h"
 #include "proxydx/d3d8header.h"
+// MOREFPS-INSTANCING: drop this include + the StaticInstancing::buildVB dispatch in cullDistantStatics to remove instancing.
+#include "staticinstancing.h"
 #include "support/log.h"
 #include "terrain_horizon_occluder.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <unordered_map>
 #include <vector>
+
+// MSOC temporal hysteresis.
+// MSOC verdicts can be unstable for small / distant statics whose
+// projected rect is a few pixels wide — a 1-2 px camera jitter flips
+// the verdict frame-to-frame, producing visible flicker.
+//
+// Fix: track per-static "consecutive OCCLUDED" counter. Only cull once
+// the static has been reported OCCLUDED for the user-configured number
+// of frames in a row (mge.ini [Misc] "Occlusion Hysteresis Frames",
+// default 8). A single VISIBLE verdict resets the counter, so brief
+// cull spikes don't translate into visible flicker.
+//
+// Key = packed hash of sphere center XYZ. Statics don't move, so the
+// position is stable across frames and across the IPC boundary (sphere
+// data comes from the wire format, identical on both sides). Collisions
+// would mean two statics at the exact same XYZ share a counter — rare
+// in practice; worst outcome is "they cull together," still safer than
+// flicker.
+namespace {
+struct MsocHysteresisState {
+    std::uint8_t  consecutiveOccluded;
+    std::uint32_t lastSeenFrame;
+};
+std::unordered_map<std::uint64_t, MsocHysteresisState> g_msocHysteresis;
+std::uint32_t g_msocHysteresisFrame = 0;
+constexpr std::uint32_t kHysteresisAgeOutFrames = 60;
+
+inline std::uint64_t hashStaticKey(float x, float y, float z) {
+    std::uint32_t ix, iy, iz;
+    std::memcpy(&ix, &x, 4);
+    std::memcpy(&iy, &y, 4);
+    std::memcpy(&iz, &z, 4);
+    // splitmix-style mixing. Three primes are odd / coprime; XOR
+    // combine spreads bits across the 64-bit hash so close-XYZ
+    // statics don't collapse into the same bucket.
+    std::uint64_t h = (std::uint64_t)ix * 0x9E3779B97F4A7C15ull;
+    h ^= (std::uint64_t)iy * 0xBF58476D1CE4E5B9ull;
+    h ^= (std::uint64_t)iz * 0x94D049BB133111EBull;
+    return h;
+}
+
+// Horizon-curtain workspace. Lives at file scope so
+// DistantLand::shutdownHorizonWorkspace can free it on release. Lazily
+// initialized on first call to contributeDistantLandOccluders.
+thc_horizon_t           g_horizon{};
+thc_simplify_workspace_t g_horizonWs{};
+bool                    g_horizonInitialized = false;
+} // namespace
 
 
 
@@ -124,12 +178,13 @@ void DistantLand::renderDistantLand(ID3DXEffect* e, const D3DXMATRIX* view, cons
         visLand.Render(device, SIZEOFLANDVERT);
     }
 
-    // MOREFPS diagnostic: land-tile count after frustum culling.
+    // Visible land-tile count diagnostic.
+    // Visible land-tile count diagnostic. Gated by LogDistantPipeline.
     // Logged AFTER Render, because in IPC mode getVisibleMeshes is
     // async and the size isn't unpacked until the parallel-read pass
     // inside Render. Sampling before that returns 0 regardless of
     // how many tiles are actually visible.
-    {
+    if (Configuration.LogDistantPipeline) {
         static int diagFrameCounter = 0;
         if ((diagFrameCounter++ % 60) == 0) {
             const unsigned tiles = Configuration.UseSharedMemory
@@ -139,32 +194,15 @@ void DistantLand::renderDistantLand(ID3DXEffect* e, const D3DXMATRIX* view, cons
         }
     }
 
-    // MOREFPS phase 7 / E: horizon-curtain occluder contribution moved
-    // OUT of this function — renderDistantLand is also called for the
-    // water-reflection and shadow-cast passes, which use different view
-    // matrices but our contribution always projects through mwView. We
-    // were rebuilding the same curtain 3-4× per frame and submitting all
-    // of them to the plugin's queue, which then rasterized duplicates.
-    // The call site moved to the main exterior render path in
-    // renderStage0 / renderStage1 so it fires exactly once per frame
-    // after visLand is populated.
+    // Horizon-curtain occluder contribution lives in renderStage0 (the
+    // main exterior render path), NOT here, because renderDistantLand
+    // also fires for the water-reflection and shadow-cast passes with
+    // different view matrices. The contribution always projects through
+    // mwView, so running it once per frame from the main path is enough
+    // — running it from here too would submit duplicate curtains.
 }
 
-// Phase D (replaces the subsample-based Phase C): submit each visible
-// tile's NATIVE triangle mesh verbatim into the MSOC mask. Phase C's
-// 9x9 subsample produced either a "canopy" over-cull or a banded flat
-// mask that missed real terrain silhouettes. Root cause: MGE-XE's
-// ROAM-tessellated distant-land is adaptive and cache-reordered, so
-// any regular sampling pattern fights the data. Submitting the real
-// triangles eliminates that entire failure mode — the mask gets the
-// actual terrain surface, exactly where the tessellator put detail.
-//
-// Budget: plugin caps external tris at OcclusionOccluderMaxTriangles
-// (default 4096). Closest-first greedy fill: take each nearest tile's
-// whole mesh until the running total would exceed the cap, then stop.
-// A typical Morrowind draw distance puts 1-9 tiles (32768x32768 each)
-// in view, so budget usually covers most or all of them.
-// Phase E: horizon-curtain terrain occluder.
+// Horizon-curtain terrain occluder.
 //
 // Instead of rasterizing raw terrain triangles (which over-culls statics
 // sitting ON the hill surface, because MOC's min-depth test on a filled
@@ -188,7 +226,9 @@ void DistantLand::contributeDistantLandOccluders() {
     MGE_SCOPED_TIMER("contributeDistantLandOccluders");
 
     static int diagGuardFrame = 0;
-    const bool emitDiag = (diagGuardFrame++ % 60) == 0;
+    // Diagnostic loglines fire every 60th call AND only when the user
+    // opted into pipeline logging via mge.ini [Misc] "Log Distant Pipeline".
+    const bool emitDiag = ((diagGuardFrame++ % 60) == 0) && Configuration.LogDistantPipeline;
 
     if (!Configuration.UseOcclusionCulling) {
         if (emitDiag) LOG::logline("-- MSOC occluder: horizon skipped — UseOcclusionCulling=false");
@@ -224,23 +264,20 @@ void DistantLand::contributeDistantLandOccluders() {
     constexpr float kYSafetyMargin = 0.04f;
     constexpr float kWSafetyFactor = 1.10f;
 
-    static thc_horizon_t horizon{};
-    static thc_simplify_workspace_t ws{};
-    static bool horizonInitialized = false;
-    if (!horizonInitialized) {
-        if (thc_horizon_init(&horizon, kHorizonResolution, nullptr, nullptr) != 0) {
+    if (!g_horizonInitialized) {
+        if (thc_horizon_init(&g_horizon, kHorizonResolution, nullptr, nullptr) != 0) {
             LOG::logline("-- MSOC occluder: thc_horizon_init failed; disabling horizon path");
             return;
         }
-        ws.size_bytes = thc_simplify_workspace_required_bytes(kHorizonResolution, kMaxSamples);
-        ws.memory = malloc(ws.size_bytes);
-        if (!ws.memory) {
+        g_horizonWs.size_bytes = thc_simplify_workspace_required_bytes(kHorizonResolution, kMaxSamples);
+        g_horizonWs.memory = malloc(g_horizonWs.size_bytes);
+        if (!g_horizonWs.memory) {
             LOG::logline("-- MSOC occluder: simplify workspace alloc failed; disabling horizon path");
             return;
         }
-        horizonInitialized = true;
+        g_horizonInitialized = true;
     }
-    thc_horizon_reset(&horizon);
+    thc_horizon_reset(&g_horizon);
 
     // World-to-clip matrix (row-major D3DX convention, row-vector * M).
     // clip = world * view * proj; we pre-multiply once per frame.
@@ -331,7 +368,7 @@ void DistantLand::contributeDistantLandOccluders() {
             proj.y_upper   = tileMaxY[col];
             proj.far_depth = tileMaxW[col] * kWSafetyFactor;
 
-            if (thc_horizon_test_and_update(&horizon, &proj)) {
+            if (thc_horizon_test_and_update(&g_horizon, &proj)) {
                 ++columnsPruned;
             } else {
                 ++columnsUpdated;
@@ -362,7 +399,7 @@ void DistantLand::contributeDistantLandOccluders() {
     // alignment so each curtain quad spans a whole HiZ tile column.
     static thc_sample_t samples[kMaxSamples];
     const int nSamples = thc_horizon_simplify(
-        &horizon, &ws, samples, kMaxSamples, kEpsH, kEpsD, kTileAlign);
+        &g_horizon, &g_horizonWs, samples, kMaxSamples, kEpsH, kEpsD, kTileAlign);
     if (nSamples < 2) return;
 
     // Apply y safety margin: pull the silhouette top down by a small
@@ -413,13 +450,27 @@ void DistantLand::contributeDistantLandOccluders() {
         curtainIdx.data(), triCount);
 
     static int diagFrameCounter = 0;
-    if ((diagFrameCounter++ % 60) == 0) {
+    if (Configuration.LogDistantPipeline && (diagFrameCounter++ % 60) == 0) {
         LOG::logline("-- MSOC occluder: horizon %s — tiles=%d verts=%d colsUpdated=%d colsPruned=%d samples=%d curtainTris=%d",
                      ok ? "submitted" : "REJECTED",
                      visibleLandTiles, verticesFed,
                      columnsUpdated, columnsPruned,
                      nSamples, triCount);
     }
+}
+
+// Free the horizon-curtain workspace allocated lazily in
+// contributeDistantLandOccluders. Safe to call when uninitialized.
+// Called from DistantLand::release().
+void DistantLand::shutdownHorizonWorkspace() {
+    if (!g_horizonInitialized) {
+        return;
+    }
+    thc_horizon_free(&g_horizon, nullptr);
+    free(g_horizonWs.memory);
+    g_horizonWs.memory = nullptr;
+    g_horizonWs.size_bytes = 0;
+    g_horizonInitialized = false;
 }
 
 void DistantLand::renderDistantLandZ() {
@@ -452,7 +503,7 @@ void DistantLand::cullDistantStatics(const D3DXMATRIX* view, const D3DXMATRIX* p
         visDistant.RemoveAll();
     }
 
-    // MOREFPS diagnostics: per-bucket counts only available in the
+    // Per-bucket diagnostics: counts only available in the
     // non-IPC path (GetVisibleMeshes is synchronous). In IPC mode
     // getVisibleMeshes is async and the totals only materialize after
     // waitForCompletion below — we then log the total without a
@@ -514,10 +565,11 @@ void DistantLand::cullDistantStatics(const D3DXMATRIX* view, const D3DXMATRIX* p
         visDistant.SortByState();
     }
 
-    // Per-frame cull summary. IPC path logs total only (async fetches
-    // mean per-bucket isn't meaningful at delivery time); non-IPC logs
-    // the breakdown.
-    {
+    // Per-frame cull summary + phase-timer flush. Gated by the
+    // LogDistantPipeline config flag — off by default. IPC path logs
+    // total only (async fetches mean per-bucket isn't meaningful at
+    // delivery time); non-IPC logs the breakdown.
+    if (Configuration.LogDistantPipeline) {
         static int diagFrameCounter = 0;
         if ((diagFrameCounter++ % 60) == 0) {
             const unsigned total = useIpc
@@ -529,23 +581,27 @@ void DistantLand::cullDistantStatics(const D3DXMATRIX* view, const D3DXMATRIX* p
                 LOG::logline("-- DL statics: total=%u  near=%u  far=%u  veryFar=%u",
                              total, diagNearCount, diagFarCount, diagVeryFarCount);
             }
-            // MOREFPS temporary phase-timer flush. Piggy-backs on the
-            // 60-frame diagnostic cadence already in use above. Dumps
-            // each scope's accumulated µs + call count as `-- PHASE: ...`
-            // lines in mgeXE.log, then resets for the next sampling
-            // window. Remove these two lines (and the MGE_SCOPED_TIMER
-            // call sites) to rip the instrumentation out entirely.
             MGEPhaseTimers::report();
         }
     }
 
-    // MOREFPS phase 4: build the per-frame instance VB when instancing is enabled.
-    // Must run after the sort so groups form over consecutive same-state meshes.
+    // MSOC verdict pass runs unconditionally so both instanced AND
+    // non-instanced render paths consume the same cull mask. Must run
+    // after the sort so msocOccluded[idx] aligns with each render
+    // path's visible-set iteration order.
+    if (Configuration.UseSharedMemory) {
+        applyMSOCToDistantStatics(visDistantShared);
+    } else {
+        applyMSOCToDistantStatics(visDistant);
+    }
+
+    // Build the per-frame instance VB when instancing is enabled.
+    // MOREFPS-INSTANCING: drop this whole block to remove instancing.
     if (Configuration.UseStaticInstancing) {
         if (Configuration.UseSharedMemory) {
-            buildStaticInstanceVB(visDistantShared);
+            StaticInstancing::buildVB(visDistantShared);
         } else {
-            buildStaticInstanceVB(visDistant);
+            StaticInstancing::buildVB(visDistant);
         }
     }
 }
@@ -563,115 +619,223 @@ void DistantLand::renderDistantStatics() {
 
     device->SetVertexDeclaration(StaticDecl);
 
+    // Pass the prebuilt MSOC cull mask through the render helper's
+    // optional skipMask parameter. Empty mask = no culling.
+    const std::uint8_t* skipMask = msocOccluded.empty() ? nullptr : msocOccluded.data();
     if (Configuration.UseSharedMemory) {
-        visDistantShared.Render(device, effect, effect, &ehTex0, nullptr, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT);
+        visDistantShared.Render(device, effect, effect, &ehTex0, nullptr, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT, false, skipMask);
     } else {
-        visDistant.Render(device, effect, effect, &ehTex0, nullptr, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT);
+        visDistant.Render(device, effect, effect, &ehTex0, nullptr, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT, false, skipMask);
     }
 
     device->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
 }
 
-// MOREFPS phase 2: distant-statics instancing helpers.
-//
-// buildStaticInstanceVB walks the sorted visible set, groups consecutive
-// meshes sharing (vBuffer, tex, hasAlpha, animateUV), and packs each
-// group's transforms as transposed 4x3 matrices into vbStaticInstances.
-// batchedStatics is populated with (firstMesh, instanceCount) pairs.
-//
-// Mirrors buildGrassInstanceVB (rendergrass.cpp). Difference: grass
-// groups only on vBuffer since grass shares texture/pipeline state;
-// statics require a wider group key because each static can have its
-// own texture/alpha/uv-anim state.
-//
-// NOTE: the sort key in QuadTreeMesh::CompareByState is currently
-// (tex, vBuffer). For optimal grouping, phase 4 will extend it to
-// (tex, vBuffer, hasAlpha, animateUV). Until then, this function
-// will still produce correct output, just with smaller batches when
-// hasAlpha/animateUV vary within a (tex, vBuffer) cluster.
-template<class T>
-void DistantLand::buildStaticInstanceVB(VisibleSet<T>& staticSet) {
-    MGE_SCOPED_TIMER("buildStaticInstanceVB");
-    batchedStatics.clear();
+// Distant-statics instancing implementations live in
+// staticinstancing.cpp (namespace StaticInstancing). Only
+// applyMSOCToDistantStatics (below) lives here — it's path-agnostic
+// and consumed by both the instanced and non-instanced render paths.
 
+// MSOC verdict pass — populates `msocOccluded` with a per-instance
+// cull mask. Both the instanced and non-instanced render paths consume
+// this mask, so culling behaves the same regardless of which rendering
+// pipeline is active.
+//
+// Walks the visible set, runs the batched sphere query, optionally
+// escalates large statics to the OBB test, then applies far-distance
+// gate / engine-handoff gate / temporal hysteresis to produce the
+// final per-instance cull decision.
+template<class T>
+void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
+    MGE_SCOPED_TIMER("applyMSOCToDistantStatics");
+
+    msocOccluded.clear();
     if (staticSet.Empty()) {
         return;
     }
 
-    if (staticSet.Size() > MaxStaticInstances) {
-        static bool warnOnce = true;
-        if (warnOnce) {
-            LOG::logline("!! Too many distant-static instances. (%d elements, limit %d)", staticSet.Size(), MaxStaticInstances);
-            LOG::logline("!! Some distant statics will not render. Reduce draw distance or lower static density.");
-            warnOnce = false;
-        }
-        staticSet.Truncate(MaxStaticInstances);
-    }
-
-    // Snapshot the group head BY VALUE. We can't hold a pointer into the
-    // source visible-set: with shared-memory IPC, visDistantShared iterates
-    // through a remapping window (see IpcClientVector::next()), so any
-    // reference into the source is invalidated on the next advance.
-    RenderMesh groupHead{};
-    bool haveGroupHead = false;
-    float* vbwrite = nullptr;
-    int instanceCount = 0;
-
-    HRESULT hr = vbStaticInstances->Lock(0, StaticInstStride * staticSet.Size(), (void**)&vbwrite, D3DLOCK_DISCARD);
-    if (hr != D3D_OK || vbwrite == 0) {
+    // Skip MSOC entirely in interior cells. The horizon curtain
+    // produces nothing useful indoors (no terrain horizon), and the
+    // ~228 us/frame the verdict pass costs is pure waste. The
+    // distant-statics rendering path is still active in interiors
+    // (via NoInteriorDL=False) but we don't bother culling it.
+    if (!MWBridge::get()->IsExterior()) {
         return;
     }
 
-    // MOREFPS: decide ONCE whether we'll consult the msoc.dll mask this
-    // frame. The readiness flag flips false at the start of every frame
-    // (before the plugin re-renders occluders), so a stale-read here is
-    // safe either way: either we skip the test, or we cache "ready" and
-    // every test returns kNotReady → visible.
-    //
-    // Conservative radius: RenderMesh doesn't carry bounding-sphere data
-    // through the IPC wire format (only QuadTreeMesh does, which is on the
-    // server side). 1024 is ~half a cell and comfortably larger than
-    // typical static bounds — it under-culls rather than over-culls, so
-    // false positives (incorrectly hiding a visible mesh) can't happen.
-    // TODO: plumb QuadTreeMesh::sphere.radius through RenderMesh for a
-    // tighter test and higher cull rate.
     const bool cullByOcclusion =
         Configuration.UseOcclusionCulling
         && MSOCClient::isAvailable()
         && MSOCClient::isMaskReady();
+    if (!cullByOcclusion) {
+        return;   // empty mask = nothing culled
+    }
 
-    // MOREFPS debug: Numpad 5 dumps the MSOC mask to a PFM in the install
-    // root. Numpad 5 is picked because nothing in Morrowind or MGE-XE
-    // consumes it — F10 (previous binding) doubled as Win32's menu-
-    // focus key and was flaky.
+    const unsigned setSize = (unsigned)staticSet.Size();
+    msocOccluded.resize(setSize, 0);
+
+    // Constants — same values as the original implementation in
+    // buildStaticInstanceVB; kept here as the single source of truth.
     //
-    // Detection uses GetAsyncKeyState's 0x0001 bit — the "has been
-    // pressed since the last call" transient — instead of the 0x8000
-    // "is down right now" bit. The 0x0001 latch survives between polls,
-    // so a tap that happens during a gap in polling (interior cell,
-    // menu open, cull pass skipped) still registers on the next call.
-    // The 0x8000 approach we used before could silently miss presses.
-    //
-    // Latches a "pending" flag and services it only on a frame where
-    // the mask is actually ready — the plugin flips g_maskReady true
-    // mid-frame, so dispatching immediately could fail "mask not ready".
-    // One press → one dump regardless of which frame the key registered.
-    if (MSOCClient::isAvailable()) {
+    // OBB escalation disabled (threshold bumped to "never"). The OBB
+    // test was added to resolve giants whose loose bounding sphere
+    // couldn't return OCCLUDED, but for tall-thin statics like the
+    // Telvanni mushroom towers, the OBB box may exclude the spire (or
+    // have tight Z), so the OBB triangles project entirely within the
+    // curtain region while the real geometry extends above the
+    // silhouette. Result: tower wrongly reports OCCLUDED while the
+    // sphere correctly reports VISIBLE. Sphere-only is more
+    // conservative and under-culls in the right direction; the cull
+    // rate hit is small now that the horizon curtain gives the sphere
+    // test enough mask coverage to resolve real occlusion.
+    constexpr float kOBBRadiusThreshold = std::numeric_limits<float>::max();
+    constexpr float kHandoffMargin      = 512.0f;
+    // User-tunable knobs (mge.ini, [Misc]):
+    //   "Occlusion Sphere Inflate"   — radius multiplier for verdict stability
+    //   "Occlusion Hysteresis Frames" — consecutive OCCLUDED frames before cull
+    const float kSphereInflate          = Configuration.OcclusionSphereInflate;
+    const std::uint8_t hysteresisFrames =
+        (std::uint8_t)Configuration.OcclusionHysteresisFrames;
+    const float farMSOCLimit   = Configuration.DL.FarStaticEnd * kCellSize;
+    const float farMSOCLimitSq = farMSOCLimit * farMSOCLimit;
+
+    // Bump per-frame counter once per MSOC pass for hysteresis aging.
+    ++g_msocHysteresisFrame;
+
+    // Batched sphere test — pack all spheres into one buffer, issue
+    // a single DLL call instead of N. Saves the per-sphere
+    // boundary-crossing overhead.
+    static std::vector<float> sphereScratch;
+    static std::vector<MSOCClient::TestResult> verdictScratch;
+    sphereScratch.clear();
+    verdictScratch.clear();
+    sphereScratch.reserve(setSize * 4);
+    verdictScratch.resize(setSize, MSOCClient::ResultVisible);
+    {
+        MGE_SCOPED_TIMER("applyMSOCToDistantStatics:sphereBatch");
+        staticSet.Reset();
+        while (!staticSet.AtEnd()) {
+            const auto& m = staticSet.Next();
+            sphereScratch.push_back(m.sphere.center.x);
+            sphereScratch.push_back(m.sphere.center.y);
+            sphereScratch.push_back(m.sphere.center.z);
+            sphereScratch.push_back(m.sphere.radius * kSphereInflate);
+        }
+        MSOCClient::classifySphereBatch(
+            sphereScratch.data(), (int)setSize, verdictScratch.data());
+    }
+
+    int diagTested = 0, diagVisible = 0, diagOccluded = 0;
+    int diagViewCulled = 0, diagNotReady = 0;
+    int diagOBBCalls = 0, diagOBBOccluded = 0;
+    int diagHandoffSpared = 0, diagFarSpared = 0, diagHysteresisSpared = 0;
+
+    staticSet.Reset();
+    unsigned idx = 0;
+    while (!staticSet.AtEnd()) {
+        const auto& m = staticSet.Next();
+        ++diagTested;
+
+        MSOCClient::TestResult verdict = verdictScratch[idx];
+
+        // OBB escalation for giants (radius > kOBBRadiusThreshold).
+        if (m.sphere.radius > kOBBRadiusThreshold
+            && verdict == MSOCClient::ResultVisible)
+        {
+            ++diagOBBCalls;
+            const auto obbVerdict = MSOCClient::classifyOBB(
+                m.box.center.x, m.box.center.y, m.box.center.z,
+                m.box.vx.x * kSphereInflate, m.box.vx.y * kSphereInflate, m.box.vx.z * kSphereInflate,
+                m.box.vy.x * kSphereInflate, m.box.vy.y * kSphereInflate, m.box.vy.z * kSphereInflate,
+                m.box.vz.x * kSphereInflate, m.box.vz.y * kSphereInflate, m.box.vz.z * kSphereInflate);
+            if (obbVerdict != MSOCClient::ResultNotReady) {
+                verdict = obbVerdict;
+                if (verdict == MSOCClient::ResultOccluded) ++diagOBBOccluded;
+            }
+        }
+
+        switch (verdict) {
+        case MSOCClient::ResultVisible:    ++diagVisible;    break;
+        case MSOCClient::ResultOccluded:   ++diagOccluded;   break;
+        case MSOCClient::ResultViewCulled: ++diagViewCulled; break;
+        case MSOCClient::ResultNotReady:   ++diagNotReady;   break;
+        }
+
+        // Hysteresis state lookup.
+        const std::uint64_t hKey = hashStaticKey(
+            m.sphere.center.x, m.sphere.center.y, m.sphere.center.z);
+        auto& hState = g_msocHysteresis[hKey];
+        hState.lastSeenFrame = g_msocHysteresisFrame;
+
+        if (verdict != MSOCClient::ResultOccluded) {
+            hState.consecutiveOccluded = 0;
+            // msocOccluded[idx] stays 0 (render).
+            ++idx;
+            continue;
+        }
+
+        // verdict == OCCLUDED. Apply gates + hysteresis to decide
+        // whether to actually cull.
+        const float dx = m.sphere.center.x - eyePos.x;
+        const float dy = m.sphere.center.y - eyePos.y;
+        const float dz = m.sphere.center.z - eyePos.z;
+        const float distSq = dx * dx + dy * dy + dz * dz;
+
+        if (distSq > farMSOCLimitSq) {
+            ++diagFarSpared;
+            // Far gate spares — render.
+        }
+        else {
+            const float thresh = nearViewRange + m.sphere.radius + kHandoffMargin;
+            if (distSq < thresh * thresh) {
+                ++diagHandoffSpared;
+                // Handoff gate spares — render.
+            }
+            else if (hState.consecutiveOccluded < hysteresisFrames) {
+                ++hState.consecutiveOccluded;
+                ++diagHysteresisSpared;
+                // Hysteresis still in warmup — render.
+            }
+            else {
+                // Sustained OCCLUDED past all gates — actually cull.
+                msocOccluded[idx] = 1;
+            }
+        }
+        ++idx;
+    }
+
+    // Hysteresis age-prune. Drop entries not touched in the last
+    // kHysteresisAgeOutFrames frames. Run once per 60 frames so per-
+    // frame cost stays trivial.
+    if ((g_msocHysteresisFrame % 60) == 0) {
+        for (auto it = g_msocHysteresis.begin(); it != g_msocHysteresis.end();) {
+            if (g_msocHysteresisFrame - it->second.lastSeenFrame > kHysteresisAgeOutFrames) {
+                it = g_msocHysteresis.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // Numpad-5 mask dump (debug feature, gated by LogDistantPipeline).
+    // Latched once-per-frame and only services on a frame where the
+    // mask is ready, so a tap that lands during a non-cull frame still
+    // dumps on the next eligible one.
+    if (Configuration.LogDistantPipeline) {
         static bool dumpPending = false;
-        static int  dumpIndex = 0;
+        static int  dumpIndex   = 0;
         if (GetAsyncKeyState(VK_NUMPAD5) & 0x0001) {
             dumpPending = true;
         }
-
-        if (dumpPending && cullByOcclusion) {
+        if (dumpPending) {
             char exePath[MAX_PATH] = {};
             GetModuleFileNameA(NULL, exePath, MAX_PATH);
             if (char* lastSlash = strrchr(exePath, '\\')) {
                 *lastSlash = '\0';
             }
             char fullPath[MAX_PATH];
-            snprintf(fullPath, sizeof(fullPath), "%s\\msoc_mask_%03d.pfm",
-                     exePath, dumpIndex++);
+            std::snprintf(fullPath, sizeof(fullPath), "%s\\msoc_mask_%03d.pfm",
+                          exePath, dumpIndex++);
             const bool ok = MSOCClient::dumpMask(fullPath);
             LOG::logline("-- MSOC: Numpad5 mask dump %s %s",
                          ok ? "->" : "FAILED for", fullPath);
@@ -679,270 +843,20 @@ void DistantLand::buildStaticInstanceVB(VisibleSet<T>& staticSet) {
         }
     }
 
-    // Radius above which the sphere test is too loose to resolve big
-    // architectural statics (Vivec Ministry, Telvanni towers, etc.) —
-    // escalate to the 12-triangle OBB test for these. Below threshold
-    // the sphere path is fast (~100ns) and accurate enough. Tuned
-    // conservatively — raise if OBB call cost starts dominating.
-    constexpr float kOBBRadiusThreshold = 2048.0f;
-
-    // MOREFPS diagnostics: bucket plugin verdicts so we can see why the
-    // cull rate is low. Sphere and OBB paths are tracked separately so
-    // we can judge whether the giants escalation is actually producing
-    // culls (a zero obbOccluded with nonzero obbCalls signals a problem
-    // in the OBB code path or the box data feeding it).
-    int diagTested = 0, diagVisible = 0, diagOccluded = 0;
-    int diagViewCulled = 0, diagNotReady = 0;
-    int diagOBBCalls = 0, diagOBBOccluded = 0;
-
-    // Batch sphere test (Phase A). Pre-walk the set once to pack the
-    // (x, y, z, r) tuples into a scratch buffer, call the plugin once,
-    // then consult the results array during the main pack loop. Saves
-    // ~2000 DLL-boundary crossings per cull pass. When batch export is
-    // unavailable or occlusion is off, the scratch buffers stay empty
-    // and the pack loop falls back to per-instance classifySphere calls.
-    //
-    // The scratch vectors are function-static to avoid per-frame heap
-    // allocation — capacity grows to peak set size once and stays put.
-    static std::vector<float> sphereScratch;
-    static std::vector<MSOCClient::TestResult> verdictScratch;
-    sphereScratch.clear();
-    verdictScratch.clear();
-    const unsigned sizeAfterTruncate = (unsigned)staticSet.Size();
-
-    if (cullByOcclusion) {
-        MGE_SCOPED_TIMER("buildStaticInstanceVB:sphereBatch");
-        sphereScratch.reserve(sizeAfterTruncate * 4);
-        verdictScratch.resize(sizeAfterTruncate, MSOCClient::ResultVisible);
-        staticSet.Reset();
-        while (!staticSet.AtEnd()) {
-            const auto& m = staticSet.Next();
-            sphereScratch.push_back(m.sphere.center.x);
-            sphereScratch.push_back(m.sphere.center.y);
-            sphereScratch.push_back(m.sphere.center.z);
-            sphereScratch.push_back(m.sphere.radius);
-        }
-        MSOCClient::classifySphereBatch(
-            sphereScratch.data(),
-            (int)sizeAfterTruncate,
-            verdictScratch.data());
-    }
-
-    staticSet.Reset();
-    unsigned idx = 0;
-    while (!staticSet.AtEnd()) {
-        const auto& m = staticSet.Next();
-
-        // Per-instance occlusion decision. Sphere verdict (from the batch
-        // pass above) is the starting point. Giants with radius above
-        // kOBBRadiusThreshold escalate to the tighter OBB test when
-        // their sphere said Visible — OBB's tighter silhouette may
-        // resolve them as Occluded even when the loose sphere couldn't.
-        // Occluded / VIEW_CULLED from sphere are kept as-is: already a
-        // cull-equivalent outcome, no need for the more expensive test.
-        if (cullByOcclusion) {
-            ++diagTested;
-            MSOCClient::TestResult verdict = verdictScratch[idx];
-
-            if (m.sphere.radius > kOBBRadiusThreshold
-                && verdict == MSOCClient::ResultVisible)
-            {
-                ++diagOBBCalls;
-                const auto obbVerdict = MSOCClient::classifyOBB(
-                    m.box.center.x, m.box.center.y, m.box.center.z,
-                    m.box.vx.x, m.box.vx.y, m.box.vx.z,
-                    m.box.vy.x, m.box.vy.y, m.box.vy.z,
-                    m.box.vz.x, m.box.vz.y, m.box.vz.z);
-                // Only upgrade to OBB's verdict if the plugin actually
-                // answered — ResultNotReady means OBB export is absent
-                // in an older plugin, in which case the sphere verdict
-                // stands.
-                if (obbVerdict != MSOCClient::ResultNotReady) {
-                    verdict = obbVerdict;
-                    if (verdict == MSOCClient::ResultOccluded) {
-                        ++diagOBBOccluded;
-                    }
-                }
-            }
-
-            switch (verdict) {
-            case MSOCClient::ResultVisible:    ++diagVisible;    break;
-            case MSOCClient::ResultOccluded:   ++diagOccluded;   break;
-            case MSOCClient::ResultViewCulled: ++diagViewCulled; break;
-            case MSOCClient::ResultNotReady:   ++diagNotReady;   break;
-            }
-            if (verdict == MSOCClient::ResultOccluded) {
-                ++idx;
-                continue;
-            }
-        }
-
-        if (!haveGroupHead) {
-            groupHead = m;
-            haveGroupHead = true;
-        } else if (groupHead.vBuffer != m.vBuffer
-                   || groupHead.tex != m.tex
-                   || groupHead.hasAlpha != m.hasAlpha
-                   || groupHead.animateUV != m.animateUV) {
-            batchedStatics.push_back(std::make_pair(groupHead, instanceCount));
-            groupHead = m;
-            instanceCount = 0;
-        }
-
-        // Pack per-instance transform as a transposed 4x3 matrix (12 floats).
-        // Layout matches vbGrassInstances, so GrassDecl's stream 1 elements
-        // (TEXCOORD1/2/3, three FLOAT4 rows) can consume it directly.
-        const D3DMATRIX* world = &m.transform;
-        vbwrite[0]  = world->_11; vbwrite[1]  = world->_21; vbwrite[2]  = world->_31; vbwrite[3]  = world->_41;
-        vbwrite[4]  = world->_12; vbwrite[5]  = world->_22; vbwrite[6]  = world->_32; vbwrite[7]  = world->_42;
-        vbwrite[8]  = world->_13; vbwrite[9]  = world->_23; vbwrite[10] = world->_33; vbwrite[11] = world->_43;
-        vbwrite += 12;
-        instanceCount++;
-        ++idx;
-    }
-    if (haveGroupHead) {
-        batchedStatics.push_back(std::make_pair(groupHead, instanceCount));
-    }
-
-    vbStaticInstances->Unlock();
-
-    // MOREFPS: log the per-frame cull breakdown. Rate-limited to one
-    // line every 60 cull passes (≈ once per second at 60fps) so it's
-    // non-spammy. Remove once the cull rate is understood.
-    if (cullByOcclusion) {
-        static int diagFrameCounter = 0;
-        if ((diagFrameCounter++ % 60) == 0) {
-            const int rateNum = diagTested > 0 ? (diagOccluded * 100) / diagTested : 0;
-            // Batch-size stats over the instanced draws we're about to
-            // issue (min/max/avg instance count per DrawIndexedPrimitive
-            // call). High avg = efficient instancing; many small batches
-            // = sort/group isn't coalescing as well as it could.
-            int batchMin = 0, batchMax = 0, batchSum = 0;
-            if (!batchedStatics.empty()) {
-                batchMin = batchedStatics[0].second;
-                batchMax = batchedStatics[0].second;
-                for (const auto& b : batchedStatics) {
-                    if (b.second < batchMin) batchMin = b.second;
-                    if (b.second > batchMax) batchMax = b.second;
-                    batchSum += b.second;
-                }
-            }
-            const int batchAvg = !batchedStatics.empty()
-                ? batchSum / (int)batchedStatics.size() : 0;
-            LOG::logline(
-                "-- MSOC cull: tested=%d  occluded=%d (%d%%)  visible=%d  viewCulled=%d  notReady=%d  obb=%d/%d",
-                diagTested, diagOccluded, rateNum,
-                diagVisible, diagViewCulled, diagNotReady,
-                diagOBBOccluded, diagOBBCalls);
-            LOG::logline(
-                "-- DL batches: count=%u  instances=%d  min=%d  avg=%d  max=%d",
-                (unsigned)batchedStatics.size(),
-                batchSum, batchMin, batchAvg, batchMax);
-        }
+    static int diagFrameCounter = 0;
+    if (Configuration.LogDistantPipeline && (diagFrameCounter++ % 60) == 0) {
+        const int rateNum = diagTested > 0 ? (diagOccluded * 100) / diagTested : 0;
+        LOG::logline(
+            "-- MSOC cull: tested=%d  occluded=%d (%d%%)  visible=%d  viewCulled=%d  notReady=%d  obb=%d/%d  handoffSpared=%d  farSpared=%d  hystSpared=%d  hystSize=%u",
+            diagTested, diagOccluded, rateNum,
+            diagVisible, diagViewCulled, diagNotReady,
+            diagOBBOccluded, diagOBBCalls, diagHandoffSpared, diagFarSpared,
+            diagHysteresisSpared, (unsigned)g_msocHysteresis.size());
     }
 }
 
-// Explicit instantiations for the two VisibleSet container variants (StlVector / IpcClientVector).
-// Mirrors buildGrassInstanceVB's implicit instantiation via direct callers in rendergrass.cpp.
-// Not strictly required yet (no callers), but keeps phase 4 wire-up from producing surprise
-// linker errors and lets the linker strip this code as dead until that wire-up lands.
-template void DistantLand::buildStaticInstanceVB(VisibleSet<StlVector>& staticSet);
-template void DistantLand::buildStaticInstanceVB(VisibleSet<IpcClientVector>& staticSet);
+template void DistantLand::applyMSOCToDistantStatics(VisibleSet<StlVector>& staticSet);
+template void DistantLand::applyMSOCToDistantStatics(VisibleSet<IpcClientVector>& staticSet);
 
-// Common core of the two instanced-statics entry points.
-// Iterates batchedStatics, rebinds per-group state (texture, alpha test,
-// animate-uv), and issues one instanced DrawIndexedPrimitive per group.
-//
-// Effect-variable writes go through `effect` (the main effect that owns
-// the shared effect-pool parameters ehTex0 / ehHasVCol). CommitChanges
-// is called on `e` so the currently-running pass (which may live in
-// `effect` OR `effectDepth`) picks them up. Mirrors the pattern used in
-// renderGrassCommon.
-void DistantLand::renderDistantStaticsInstancedCommon(ID3DXEffect* e) {
-    MGE_SCOPED_TIMER("renderDistantStaticsInstancedCommon");
-    device->SetVertexDeclaration(GrassDecl);
-
-    // Reset animate_uv so the first group picks up a fresh state.
-    effect->SetBool(ehHasVCol, false);
-    e->CommitChanges();
-
-    IDirect3DTexture9* lastTexture = nullptr;
-    bool lastAnimateUV = false;
-    bool lastHasAlpha = false;
-    int firstInstance = 0;
-
-    for (const auto& batch : batchedStatics) {
-        const RenderMesh& mesh = batch.first;
-        int count = batch.second;
-
-        // Per-group state setup (rebind-filtered by the sort + group boundary rules).
-        if (lastTexture != mesh.tex) {
-            effect->SetTexture(ehTex0, mesh.tex);
-            device->SetRenderState(D3DRS_ALPHATESTENABLE, mesh.hasAlpha);
-            lastTexture = mesh.tex;
-            lastHasAlpha = mesh.hasAlpha;
-        } else if (lastHasAlpha != mesh.hasAlpha) {
-            device->SetRenderState(D3DRS_ALPHATESTENABLE, mesh.hasAlpha);
-            lastHasAlpha = mesh.hasAlpha;
-        }
-
-        if (lastAnimateUV != mesh.animateUV) {
-            effect->SetBool(ehHasVCol, mesh.animateUV);
-            lastAnimateUV = mesh.animateUV;
-        }
-
-        e->CommitChanges();
-
-        // Bind per-group static VB + shared instance VB and issue one instanced draw.
-        device->SetIndices(mesh.iBuffer);
-        device->SetStreamSourceFreq(0, D3DSTREAMSOURCE_INDEXEDDATA | count);
-        device->SetStreamSource(0, mesh.vBuffer, 0, SIZEOFSTATICVERT);
-        device->SetStreamSourceFreq(1, D3DSTREAMSOURCE_INSTANCEDATA | 1);
-        device->SetStreamSource(1, vbStaticInstances, StaticInstStride * firstInstance, StaticInstStride);
-        device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, mesh.verts, 0, mesh.faces);
-
-        firstInstance += count;
-    }
-
-    // Restore non-instanced state so later unrelated draws don't inherit the instance freq.
-    device->SetStreamSourceFreq(0, 1);
-    device->SetStreamSourceFreq(1, 1);
-    device->SetStreamSource(1, NULL, 0, 0);
-}
-
-// Render the sets built by buildStaticInstanceVB as instanced draws in the
-// main color pass. Caller is expected to have invoked BeginPass with either
-// PASS_RENDERSTATICSEXTERIOR_INST or PASS_RENDERSTATICSINTERIOR_INST.
-// Uses GrassDecl (the layout static-stream + per-instance-transform-stream
-// is identical to grass's).
-void DistantLand::renderDistantStaticsInstanced() {
-    MGE_SCOPED_TIMER("renderDistantStaticsInstanced");
-    if (batchedStatics.empty()) {
-        return;
-    }
-
-    if (!MWBridge::get()->IsExterior()) {
-        // Same architectural clip-plane workaround as renderDistantStatics.
-        float clipAt = nearViewRange - 768.0f;
-        D3DXPLANE clipPlane(0, 0, clipAt, -(mwProj._33 * clipAt + mwProj._43));
-        device->SetClipPlane(0, clipPlane);
-        device->SetRenderState(D3DRS_CLIPPLANEENABLE, 1);
-    }
-
-    renderDistantStaticsInstancedCommon(effect);
-
-    device->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
-}
-
-// Render the sets built by buildStaticInstanceVB into the depth pre-pass.
-// Caller is expected to have invoked effectDepth->BeginPass with
-// PASS_RENDERSTATICSDEPTH_INST. No clip-plane handling here — the
-// existing non-instanced depth path doesn't do that either.
-void DistantLand::renderDistantStaticsInstancedZ() {
-    MGE_SCOPED_TIMER("renderDistantStaticsInstancedZ");
-    if (batchedStatics.empty()) {
-        return;
-    }
-
-    renderDistantStaticsInstancedCommon(effectDepth);
-}
+// (Instanced render path moved to StaticInstancing::renderColor /
+// renderDepth in staticinstancing.cpp.)

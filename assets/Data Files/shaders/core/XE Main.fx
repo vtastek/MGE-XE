@@ -445,7 +445,7 @@ Technique T0 {
         PixelShader = compile ps_3_0 NullPS();
     }
     //------------------------------------------------------------
-    // MOREFPS phase 3: instanced distant statics (exterior).
+    // Instanced distant statics (exterior).
     // Matches P4ext render state; only the vertex shader differs.
     Pass P4extInst {
         ZEnable = true;
@@ -462,7 +462,7 @@ Technique T0 {
         PixelShader = compile ps_3_0 StaticPS();
     }
     //------------------------------------------------------------
-    // MOREFPS phase 3: instanced distant statics (interior / underwater).
+    // Instanced distant statics (interior / underwater).
     // Matches P4int render state; only the vertex shader differs.
     Pass P4intInst {
         ZEnable = true;
