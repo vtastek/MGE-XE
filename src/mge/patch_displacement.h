@@ -58,6 +58,12 @@ void coalesceEdgeHeights(IDirect3DDevice9* device,
                          float dispGamma,
                          float dispPivot);
 
+// Cheap predicate: does this Terrain draw match the stride-4 5x5 contract that
+// getOrBuild expects (25 verts / 32 tris / TRIANGLELIST / FVF carries
+// POS+NORMAL+COLOR+UV)? Cell selectors should gate near-set inclusion on this so
+// they don't enqueue meshes the validator will silently reject every frame.
+bool canSubdivide(const RenderedState& rs);
+
 // Build or return a cached subdivided near patch for `call`. Returns nullptr if
 // the source VB/IB can't be locked this frame (retry next frame) or the patch
 // geometry isn't a stride-4 5x5 grid.

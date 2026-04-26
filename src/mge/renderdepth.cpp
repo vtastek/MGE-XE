@@ -346,7 +346,7 @@ void DistantLand::renderDepthRecorded(const std::vector<RecordedMWState>& recMW,
         if (sceneFilter > 0 && i.sceneNum < sceneFilter) continue;
 
         // Log Scene 2 depth draws
-        if (i.sceneNum == 2 && scene2Count < 5) {
+        if (i.sceneNum == 2 && scene2Count < 5 && LOG::catEnabled(LOG::Cat_Recording)) {
             LOG::logline("[DEPTH-S2] scene=%d vbs=%d prims=%d vb=%p ib=%p gameView41=%.2f wvt41=%.2f world41=%.2f",
                 i.sceneNum, i.vertexBlendState, i.primCount, i.vb, i.ib,
                 gameView ? gameView->_41 : -999.0f, i.worldViewTransforms[0]._41, i.worldTransforms[0]._41);

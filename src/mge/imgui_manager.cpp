@@ -732,6 +732,42 @@ void ImGuiManager::RenderDebugInterface() {
         ImGui::SetItemTooltip("Insert artificial delays to simulate async race conditions");
 
         ImGui::Separator();
+        if (ImGui::CollapsingHeader("Log Filters (mgexe.log spam)")) {
+            ImGui::TextWrapped("Each category gates a class of per-frame / per-texture diagnostic lines. Defaults are off; toggling here applies live and persists to mge.ini on save.");
+            struct CatRow { const char* label; unsigned bit; const char* tip; };
+            static const CatRow rows[] = {
+                {"Hash Database",   LOG::Cat_HashDB,      "Texture hash DB build + collision lines (~1k lines at startup)"},
+                {"Frame Stats",     LOG::Cat_FrameStats,  "DXVK pass breaks, DIP bin counters, water material, DW/WD/SS"},
+                {"Hi-Z Culling",    LOG::Cat_HiZ,         ">> Hi-Z visible/culled, recordMW filter results"},
+                {"Recording",       LOG::Cat_Recording,   "renderFullFrameAsync stages, [ORDER] replay, [REC-P] particles"},
+                {"HLSL Replay",     LOG::Cat_HLSLReplay,  "CACHE HIT, Bins, per-frame Lights summary, bindShaderTextures"},
+                {"Mode3 Lighting",  LOG::Cat_Mode3,       "Mode3 packing/diag — only fires when Force LightMode 3 is on"},
+                {"Distant Land",    LOG::Cat_DistantLand, "[WVT] [WATER] [NVR] [N1-STORE] [PPDCAP] particles draw"},
+            };
+            for (const auto& r : rows) {
+                bool on = (LOG::g_categoryMask & r.bit) != 0;
+                if (ImGui::Checkbox(r.label, &on)) {
+                    if (on) LOG::g_categoryMask |= r.bit;
+                    else    LOG::g_categoryMask &= ~r.bit;
+                }
+                ImGui::SetItemTooltip("%s", r.tip);
+            }
+            ImGui::Separator();
+            if (ImGui::Button("All On")) {
+                for (const auto& r : rows) LOG::g_categoryMask |= r.bit;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("All Off")) {
+                for (const auto& r : rows) LOG::g_categoryMask &= ~r.bit;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Save to mge.ini")) {
+                Configuration.SaveSettings();
+                LOG::logline("-- Log filter mask saved to mge.ini: 0x%02x", LOG::g_categoryMask);
+            }
+        }
+
+        ImGui::Separator();
         ImGui::Text("Press G to toggle this interface");
     }
     ImGui::End();

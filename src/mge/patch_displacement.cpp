@@ -340,6 +340,17 @@ SubdivPatch* findCached(const FixedFunctionShader::TerrainPatchKey& key,
     return r;
 }
 
+bool canSubdivide(const RenderedState& rs) {
+    if (rs.primType != D3DPT_TRIANGLELIST) return false;
+    if (rs.vertCount != kSrcVerts || rs.primCount != kSrcTris) return false;
+    VertexLayout layout;
+    if (!layout.parse(rs.fvf, rs.vbStride)) return false;
+    return layout.posOffset >= 0
+        && layout.normalOffset >= 0
+        && layout.colorOffset >= 0
+        && layout.uvOffset >= 0;
+}
+
 SubdivPatch* getOrBuild(IDirect3DDevice9* device,
                         const FixedFunctionShader::TerrainPatchKey& key,
                         const FixedFunctionShader::HLSLRecordedCall& call,
@@ -378,21 +389,13 @@ SubdivPatch* getOrBuild(IDirect3DDevice9* device,
     }
     ReleaseSRWLockShared(&s_lock);
 
-    // Validate source shape. Morrowind landscape patches are 25 verts / 32 tris
-    // per spec §stride-4. Bail quietly on anything else (grass, custom meshes).
+    // Validate source shape via the shared canSubdivide predicate so the cell
+    // selector and this builder cannot disagree about which meshes qualify.
     const auto& rs = call.rs;
-    if (rs.vertCount != kSrcVerts || rs.primCount != kSrcTris) return nullptr;
-    if (rs.primType != D3DPT_TRIANGLELIST) return nullptr;
+    if (!canSubdivide(rs)) return nullptr;
 
     VertexLayout srcLayout;
-    if (!srcLayout.parse(rs.fvf, rs.vbStride)) return nullptr;
-    // Must have POSITION + COLOR at minimum (blend mask lives in color.a) and a UV
-    // (needed for _paramh sampling). NORMAL is needed for VS displacement axis.
-    if (srcLayout.posOffset < 0 || srcLayout.colorOffset < 0
-        || srcLayout.uvOffset < 0 || srcLayout.normalOffset < 0)
-    {
-        return nullptr;
-    }
+    srcLayout.parse(rs.fvf, rs.vbStride);  // already validated by canSubdivide
 
     // Lock source VB read-only. Mirror the meshlodcache pattern — DONOTWAIT so
     // we never stall if Morrowind happens to own the buffer this frame.
@@ -736,7 +739,7 @@ SubdivPatch* getOrBuild(IDirect3DDevice9* device,
     s_patchCache[key] = std::move(entry);
     ReleaseSRWLockExclusive(&s_lock);
 
-    LOG::logline("PatchDisplacement: built subdivided patch vb=%p ib=%p overlay=%p "
+    LOG_CAT(LOG::Cat_DistantLand, "PatchDisplacement: built subdivided patch vb=%p ib=%p overlay=%p "
                  "baseH=%s overlayH=%s scale=%.2f gamma=%.2f pivot=%.2f "
                  "baseRange=[%.2f,%.2f] overlayRange=[%.2f,%.2f] tier=%u grid=%ux%u",
                  key.vb, key.ib, overlayTex,
@@ -770,16 +773,10 @@ void coalesceEdgeHeights(IDirect3DDevice9* device,
         if (call.bin != RenderBin::Terrain) continue;
 
         const auto& rs = call.rs;
-        if (rs.vertCount != kSrcVerts || rs.primCount != kSrcTris) continue;
-        if (rs.primType != D3DPT_TRIANGLELIST) continue;
+        if (!canSubdivide(rs)) continue;
 
         VertexLayout srcLayout;
-        if (!srcLayout.parse(rs.fvf, rs.vbStride)) continue;
-        if (srcLayout.posOffset < 0 || srcLayout.colorOffset < 0
-            || srcLayout.uvOffset < 0 || srcLayout.normalOffset < 0)
-        {
-            continue;
-        }
+        srcLayout.parse(rs.fvf, rs.vbStride);  // already validated by canSubdivide
 
         const UINT kDstGrid = (call.subdivTier == 0) ? 65u : 33u;
         const float kStep   = float(kSrcGrid - 1) / float(kDstGrid - 1);

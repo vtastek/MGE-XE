@@ -267,7 +267,7 @@ void FixedFunctionShader::bindShaderTextures(const ShaderKey& sk, const Rendered
                     if (cached->variants) {
                         // Debug: log suffix binding attempts
                         static int bindLogCount = 0;
-                        bool shouldLog = (bindLogCount < 5);
+                        bool shouldLog = LOG::catEnabled(LOG::Cat_HLSLReplay) && (bindLogCount < 5);
 
                         // Slot 2: ParamH (metallic/roughness) - load once per texture change
                         if (sk.hasParamH) {
@@ -442,7 +442,7 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         lastRecFrame = hlslDiagFrameCounter;
     }
     if (currentRecordingScene > 0 && scene12RecLogCount < 3) {
-        LOG::logline("Scene %d draw: isRecording=%d, enableRec=%d",
+        LOG_CAT(LOG::Cat_HLSLReplay, "Scene %d draw: isRecording=%d, enableRec=%d",
             currentRecordingScene, isRecording, ImGuiManager::GetEnableRecording());
         scene12RecLogCount++;
     }
@@ -602,7 +602,7 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
                 diagHitKeys.insert(sk);
             }
             // Log cache hits on early frames for debugging
-            if (hlslDiagFrameCounter <= 3) {
+            if (hlslDiagFrameCounter <= 3 && LOG::catEnabled(LOG::Cat_HLSLReplay)) {
                 char buf[512];
                 snprintf(buf, sizeof(buf),
                     "CACHE HIT frame=%d: lm=%d lit=%d vc=%d vm=%d hl=%d skin=%d fog=%d uv=%d stages=%d shadow=%d detail=%d ph=%d px=%d grass=%d",
@@ -619,7 +619,7 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
 
         if (!exactHit) {
             // Diagnostic: log cache misses on early frames to identify precache gaps
-            if (hlslDiagFrameCounter <= 3) {
+            if (hlslDiagFrameCounter <= 3 && LOG::catEnabled(LOG::Cat_HLSLReplay)) {
                 char buf[512];
                 snprintf(buf, sizeof(buf),
                     "CACHE MISS frame=%d: lm=%d lit=%d vc=%d vm=%d hl=%d skin=%d fog=%d uv=%d stages=%d shadow=%d detail=%d ph=%d px=%d grass=%d bump=%d tg=%d",
@@ -1909,7 +1909,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
             currentTexelOffset += count * 3;  // 3 texels per light
 
             // Diagnostic: log first mode 3 object's bbox and nearest light (sphere-AABB distance)
-            if (mode3Count == 0 && !sceneLights.empty()) {
+            if (mode3Count == 0 && !sceneLights.empty() && LOG::catEnabled(LOG::Cat_Mode3)) {
                 float nearestDist = FLT_MAX;
                 int nearestIdx = -1;
                 float nearestRadius = 0;
@@ -2149,7 +2149,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
         }
 
         if (mode3Count > 0) {
-            LOG::logline("Mode3 packing: %d objects, maxLights/obj=%d, totalTexels=%d (from %d scene)",
+            LOG_CAT(LOG::Cat_Mode3, "Mode3 packing: %d objects, maxLights/obj=%d, totalTexels=%d (from %d scene)",
                 mode3Count, maxPerObjectLights, totalTexels, numSceneLights);
         }
     }
@@ -2347,7 +2347,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     (lastLayoutIt->second.first != fb.cellBatchCacheKey ||
                      lastLayoutIt->second.second != fb.cellBatchLayoutHash)) {
                     layoutChanged = true;
-                    LOG::logline("MergedBatch: Layout changed for fb=%p, forcing VB/IB recreation (oldCell=%p oldHash=%Ix, newCell=%p newHash=%Ix)",
+                    LOG_CAT(LOG::Cat_HLSLReplay, "MergedBatch: Layout changed for fb=%p, forcing VB/IB recreation (oldCell=%p oldHash=%Ix, newCell=%p newHash=%Ix)",
                                  &fb, lastLayoutIt->second.first, lastLayoutIt->second.second,
                                  fb.cellBatchCacheKey, fb.cellBatchLayoutHash);
                 }
@@ -2366,7 +2366,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     if (SUCCEEDED(device->CreateVertexBuffer(newSize, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
                                                              0, D3DPOOL_DEFAULT, &fb.mergedVB, nullptr))) {
                         fb.mergedVBSize = newSize;
-                        LOG::logline("MergedBatch: Created dynamic VB, %d bytes", newSize);
+                        LOG_CAT(LOG::Cat_HLSLReplay, "MergedBatch: Created dynamic VB, %d bytes", newSize);
                     }
                 }
 
@@ -2380,7 +2380,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     if (SUCCEEDED(device->CreateIndexBuffer(newCount * sizeof(DWORD), D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
                                                             D3DFMT_INDEX32, D3DPOOL_DEFAULT, &fb.mergedIB, nullptr))) {
                         fb.mergedIBSize = newCount;
-                        LOG::logline("MergedBatch: Created dynamic IB (32-bit), %d indices", newCount);
+                        LOG_CAT(LOG::Cat_HLSLReplay, "MergedBatch: Created dynamic IB (32-bit), %d indices", newCount);
                     }
                 }
             }
@@ -2564,7 +2564,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     }
 
                     static bool loggedMerge = false;
-                    if (!loggedMerge) {
+                    if (!loggedMerge && LOG::catEnabled(LOG::Cat_HLSLReplay)) {
                         loggedMerge = true;
                         LOG::logline("MergedBatch: %d batches ready, %d total verts, %d total indices (stored in cache)",
                                      (int)fb.mergedBatches.size(), totalMergedVerts, totalMergedIndices);
@@ -2660,7 +2660,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                     IDirect3DVertexDeclaration9* decl = nullptr;
                     if (SUCCEEDED(device->CreateVertexDeclaration(elements.data(), &decl))) {
                         mergedDeclCache[cacheKey] = decl;
-                        LOG::logline("MergedBatch: Created vertex decl for FVF 0x%X, stride %d->%d",
+                        LOG_CAT(LOG::Cat_HLSLReplay, "MergedBatch: Created vertex decl for FVF 0x%X, stride %d->%d",
                                      fvf, originalStride, originalStride + 4);
                     }
                     return decl;
@@ -3266,13 +3266,13 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
 
     // Log culling statistics (shouldRender pre-set by executeHiZCulling)
     int renderedCalls = totalCalls - culledCalls;
-    LOG::logline("Hi-Z Replay: %d total, %d culled (%.1f%%), %d rendered",
+    LOG_CAT(LOG::Cat_HLSLReplay, "Hi-Z Replay: %d total, %d culled (%.1f%%), %d rendered",
                  totalCalls, culledCalls,
                  totalCalls > 0 ? (culledCalls * 100.0f) / totalCalls : 0.0f,
                  renderedCalls);
 
     // Log bin statistics
-    LOG::logline("Bins: Terrain=%d TerrainBlend=%d Opaque=%d Skinning=%d Grass=%d AlphaTested=%d Blending=%d",
+    LOG_CAT(LOG::Cat_HLSLReplay, "Bins: Terrain=%d TerrainBlend=%d Opaque=%d Skinning=%d Grass=%d AlphaTested=%d Blending=%d",
                  binCounts[(int)RenderBin::Terrain],
                  binCounts[(int)RenderBin::TerrainBlend],
                  binCounts[(int)RenderBin::Opaque], binCounts[(int)RenderBin::Skinning],
@@ -3289,7 +3289,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
         binCounts[(int)RenderBin::Blending]);
 
     // Per-frame light summary: scan all calls for point light statistics and mode distribution
-    {
+    if (LOG::catEnabled(LOG::Cat_HLSLReplay)) {
         int minPL = INT_MAX, maxPL = 0;
         double sumPL = 0;
         int litCalls = 0;

@@ -1,5 +1,6 @@
 
 #include "proxydx/d3d8header.h"
+#include "support/log.h"
 #include "mgedinput.h"
 #include "configuration.h"
 #include "distantland.h"
@@ -29,6 +30,9 @@ static DLContext* s_postShaderCtx = nullptr;
 static const PostProcessData* s_postProcessData = nullptr;
 
 void DistantLand::logWaterDiagnostics(const char* tag, const DLContext* ctx, const PostProcessData* ppd) {
+    if (!LOG::catEnabled(LOG::Cat_DistantLand)) {
+        return;
+    }
     auto mwBridge = MWBridge::get();
     if (!mwBridge || !mwBridge->IsLoaded() || mwBridge->IsExterior()) {
         return;
@@ -108,7 +112,11 @@ DLContext DistantLand::captureContext() {
 DLContext DistantLand::captureStage0Context() {
     MGE_ZoneScopedN("DL_CaptureStage0");
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_Stage0, 0);
-    LOG::logline("======== FRAME %d START (Scene 0) ========", getFrameNumber());
+    // Frame header is only useful as a delimiter for spammy per-frame diagnostics.
+    // Skip it when all log categories are off so an idle log isn't filled with empty headers.
+    if (LOG::g_categoryMask != 0) {
+        LOG::logline("======== FRAME %d START (Scene 0) ========", getFrameNumber());
+    }
     FixedFunctionShader::transitionTo(PhaseTransition::RecordingEntry);
 
     // Phase tracking: mark frame capture start (effect uniforms, camera reads)
@@ -140,12 +148,14 @@ DLContext DistantLand::captureStage0Context() {
     s_staging.isPPLActive = (Configuration.MGEFlags & USE_FFESHADER) && !(Configuration.PerPixelLightFlags == 1 && !mwBridge->IntCurCellAddr());
 
     // Diagnostic: log when isRenderCached changes (no limit)
-    static int captureLogCount = 0;
-    if (captureLogCount < 200 && (wasRenderCached || s_staging.isRenderCached)) {
-        LOG::logline("[CAPTURE] isRenderCached: %d -> %d (IsMenu=%d, USE_MENU_CACHING=%d)",
-            wasRenderCached, s_staging.isRenderCached, mwBridge->IsMenu(),
-            (Configuration.MGEFlags & USE_MENU_CACHING) ? 1 : 0);
-        captureLogCount++;
+    if (LOG::catEnabled(LOG::Cat_DistantLand)) {
+        static int captureLogCount = 0;
+        if (captureLogCount < 200 && (wasRenderCached || s_staging.isRenderCached)) {
+            LOG::logline("[CAPTURE] isRenderCached: %d -> %d (IsMenu=%d, USE_MENU_CACHING=%d)",
+                wasRenderCached, s_staging.isRenderCached, mwBridge->IsMenu(),
+                (Configuration.MGEFlags & USE_MENU_CACHING) ? 1 : 0);
+            captureLogCount++;
+        }
     }
 
     // Snapshot all per-frame state into context (foundation for threading)
@@ -187,7 +197,7 @@ void DistantLand::renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuff
     MGE_ZoneScopedN("DL_RenderStage0GPU");
 
     // N-1 camera debug: Check if first recorded call's worldViewTransform matches ctx->mwView
-    {
+    if (LOG::catEnabled(LOG::Cat_DistantLand)) {
         static int logCount = 0;
         if (fb && !fb->recordedCalls.empty() && logCount < 5) {
             // Extract the view translation embedded in worldViewTransforms
@@ -669,13 +679,15 @@ void DistantLand::renderStageWater(DLContext* ctx) {
     UINT passes;
 
     // Diagnostic: log water state every 60 frames (1 per second at 60fps)
-    static int waterLogFrame = 0;
-    if (++waterLogFrame >= 60) {
-        waterLogFrame = 0;
-        DWORD cellAddr = mwBridge->IntCurCellAddr();
-        BYTE waterFlag = mwBridge->GetCellWaterFlag();
-        LOG::logline("[WATER] CellHasWater=%d flag=0x%02X (masked=0x%02X) addr=0x%08X IsExterior=%d",
-            mwBridge->CellHasWater(), waterFlag, (waterFlag & 0x73), cellAddr, mwBridge->IsExterior());
+    if (LOG::catEnabled(LOG::Cat_DistantLand)) {
+        static int waterLogFrame = 0;
+        if (++waterLogFrame >= 60) {
+            waterLogFrame = 0;
+            DWORD cellAddr = mwBridge->IntCurCellAddr();
+            BYTE waterFlag = mwBridge->GetCellWaterFlag();
+            LOG::logline("[WATER] CellHasWater=%d flag=0x%02X (masked=0x%02X) addr=0x%08X IsExterior=%d",
+                mwBridge->CellHasWater(), waterFlag, (waterFlag & 0x73), cellAddr, mwBridge->IsExterior());
+        }
     }
 
     if (mwBridge->CellHasWater()) {
@@ -748,9 +760,11 @@ void DistantLand::setupCommonEffect(DLContext* ctx, const D3DXMATRIX* view, cons
     effect->SetFloatArray(ehFogColNear, ctx->nearFogCol, 3);
     effect->SetFloatArray(ehFogColFar, ctx->horizonCol, 3);
     effect->SetFloat(ehNearViewRange, ctx->nearViewRange);
-    static int nvLogCount = 0;
-    if (nvLogCount++ < 10) {
-        LOG::logline("[NVR] setupCommonEffect: nearViewRange=%.1f", ctx->nearViewRange);
+    if (LOG::catEnabled(LOG::Cat_DistantLand)) {
+        static int nvLogCount = 0;
+        if (nvLogCount++ < 10) {
+            LOG::logline("[NVR] setupCommonEffect: nearViewRange=%.1f", ctx->nearViewRange);
+        }
     }
     effect->SetFloat(ehNiceWeather, ctx->niceWeather);
 
@@ -1017,7 +1031,7 @@ void DistantLand::postProcess(DLContext* ctx) {
 
         // Cache render for first frame of menu mode
         if ((Configuration.MGEFlags & USE_MENU_CACHING) && mwBridge->IsMenu()) {
-            LOG::logline("[RENDERCACHE] Setting isRenderCached=true in postProcess (IsMenu=true)");
+            LOG_CAT(LOG::Cat_DistantLand, "[RENDERCACHE] Setting isRenderCached=true in postProcess (IsMenu=true)");
             texDistantBlend = PostShaders::borrowBuffer(0);
             s_staging.isRenderCached = true;
         }
@@ -1385,7 +1399,7 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
     static bool scene12LogDone = false;
     if (isParticlesOrHands && !scene12LogDone) {
         scene12DrawCount++;
-        LOG::logline(">> %s draw #%d: zWrite=%d, blendEnable=%d, alphaTest=%d, vertBlend=%d, prims=%d",
+        LOG_CAT(LOG::Cat_DistantLand, ">> %s draw #%d: zWrite=%d, blendEnable=%d, alphaTest=%d, vertBlend=%d, prims=%d",
                      isParticlesPhase ? "Particles" : "Hands", scene12DrawCount, rs->zWrite, rs->blendEnable, rs->alphaTest,
                      rs->vertexBlendState, rs->primCount);
     }

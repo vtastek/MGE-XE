@@ -130,12 +130,15 @@ void FixedFunctionShader::beginCellCrossDiagnostics(void* oldCell, void* newCell
     s_cellCrossOldExterior = oldExterior;
     s_cellCrossNewExterior = newExterior;
 
-    LOG::logline("[CELLX] BEGIN frame=%d oldCell=%p newCell=%p oldExt=%d newExt=%d window=[%d,%d]",
+    LOG_CAT(LOG::Cat_Recording, "[CELLX] BEGIN frame=%d oldCell=%p newCell=%p oldExt=%d newExt=%d window=[%d,%d]",
                  frame, oldCell, newCell, oldExterior ? 1 : 0, newExterior ? 1 : 0,
                  s_cellCrossDiagStartFrame, s_cellCrossDiagEndFrame);
 }
 
 bool FixedFunctionShader::cellCrossDiagnosticsActive() {
+    if (!LOG::catEnabled(LOG::Cat_Recording)) {
+        return false;
+    }
     int frame = getFrameNumber();
     return s_cellCrossDiagEndFrame >= 0 &&
            frame >= s_cellCrossDiagStartFrame &&

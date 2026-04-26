@@ -1114,13 +1114,13 @@ void buildBSATextureHashDatabase(IDirect3DDevice9* dev) {
                 auto existingEntry = textureHashToName.find(texHash);
                 if (existingEntry != textureHashToName.end()) {
                     hashCollisions++;
-                    LOG::logline("!! HASH COLLISION: %08x -> '%s' conflicts with existing '%s' - DROPPING TEXTURE",
+                    LOG_CAT(LOG::Cat_HashDB, "!! HASH COLLISION: %08x -> '%s' conflicts with existing '%s' - DROPPING TEXTURE",
                                texHash.crc32, baseName.c_str(), existingEntry->second.c_str());
                 } else {
                     // Add to hash database
                     textureHashToName[texHash] = baseName;
                     texturesMatched++;
-                    LOG::logline("Hash stored: %08x -> '%s'", texHash.crc32, baseName.c_str());
+                    LOG_CAT(LOG::Cat_HashDB, "Hash stored: %08x -> '%s'", texHash.crc32, baseName.c_str());
                 }
 
             } else {

@@ -20,6 +20,8 @@ namespace LOG {
     static LARGE_INTEGER startTime;
     static LARGE_INTEGER perfFreq;
 
+    unsigned g_categoryMask = 0;
+
     // Prepend elapsed timestamp and frame number to a buffer, returns chars written
     static int prependTimestamp(char* buf, std::size_t bufSize) {
         LARGE_INTEGER now;

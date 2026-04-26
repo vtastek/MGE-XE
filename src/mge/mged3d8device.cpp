@@ -4,6 +4,7 @@
 #include "mge_tracy.h"
 #include "proxydx/d3d8texture.h"
 #include "proxydx/d3d8surface.h"
+#include "support/log.h"
 
 #include <algorithm>
 #include <chrono>
@@ -143,16 +144,18 @@ static void capturePostProcessData(FixedFunctionShader::FrameBuffer& fb, const D
     if (ctx.sunVis >= 0.001f) envFlags |= 32; else envFlags |= 64;
     ppd.envFlags = envFlags;
 
-    static int logCount = 0;
-    if (logCount++ < 12) {
-        LOG::logline(
-            "[PPDCAP][%s] cell=0x%08X water=%.2f env=0x%02X interior=%d underwater=%d",
-            source ? source : "?",
-            mwb->IntCurCellAddr(),
-            ppd.waterLevel,
-            ppd.envFlags,
-            ppd.isInterior ? 1 : 0,
-            ppd.isUnderwater ? 1 : 0);
+    if (LOG::catEnabled(LOG::Cat_DistantLand)) {
+        static int logCount = 0;
+        if (logCount++ < 12) {
+            LOG::logline(
+                "[PPDCAP][%s] cell=0x%08X water=%.2f env=0x%02X interior=%d underwater=%d",
+                source ? source : "?",
+                mwb->IntCurCellAddr(),
+                ppd.waterLevel,
+                ppd.envFlags,
+                ppd.isInterior ? 1 : 0,
+                ppd.isUnderwater ? 1 : 0);
+        }
     }
 }
 
@@ -517,7 +520,7 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
     // Log render pass break instrumentation
     {
         static int frameCounter = 0;
-        if (++frameCounter <= 60 || frameCounter % 300 == 0) {
+        if (LOG::catEnabled(LOG::Cat_FrameStats) && (++frameCounter <= 60 || frameCounter % 300 == 0)) {
             LOG::logline("DXVK passes: raw[RT=%d DS=%d Clear=%d Stretch=%d] cat[MW_Clear=%d depth=%d shadow=%d water=%d post=%d stretch=%d other=%d =%d]",
                 g_passBreaks.raw_setRT, g_passBreaks.raw_setDS,
                 g_passBreaks.raw_clear, g_passBreaks.raw_stretchRect,
@@ -536,7 +539,11 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         if (dipTotal > 0) {
             static int dipLogCounter = 0;
             bool isSpike = dipTotal >= ImGuiManager::GetDIPSpikeThreshold();
-            if (++dipLogCounter <= 60 || dipLogCounter % 300 == 0 || isSpike) {
+            // Both spike alerts and periodic stats gated by FrameStats — local-map
+            // frames trip the spike threshold every time and aren't actionable.
+            bool wantLog = LOG::catEnabled(LOG::Cat_FrameStats)
+                           && (isSpike || ++dipLogCounter <= 60 || dipLogCounter % 300 == 0);
+            if (wantLog) {
                 LOG::logline("%sDIPs: Sky=%d Ter=%d Opq=%d Skin=%d Grass=%d AT=%d Blend=%d 1PS=%d 1PA=%d 1PO=%d Wat=%d Off=%d UI=%d Sten=%d Pre=%d T=%d",
                     isSpike ? "DIP SPIKE! " : "",
                     g_dipBinStats.sky, g_dipBinStats.terrain, g_dipBinStats.opaque,
@@ -613,8 +620,9 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         g_scene.resetForFrame();
         g_deferred.reset();
 
-        // Log deferral stats on frames with offscreen scenes
-        if (g_offscreen.scenesThisFrame > 0 || g_deferralCounters.copyRectsTotal > 0) {
+        // Log deferral stats on frames with offscreen scenes (FrameStats category).
+        if ((g_offscreen.scenesThisFrame > 0 || g_deferralCounters.copyRectsTotal > 0)
+            && LOG::catEnabled(LOG::Cat_FrameStats)) {
             LOG::logline("Deferral: scenes %d/%d/%d RT %d/%d/%d offscreen %d (mega-scene) CopyRects %d/%d",
                 g_deferralCounters.scenesRequested, g_deferralCounters.scenesForwarded, g_deferralCounters.scenesSuppressed,
                 g_deferralCounters.rtRequested, g_deferralCounters.rtForwarded, g_deferralCounters.rtSuppressed,
@@ -956,7 +964,9 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                 // Log offscreen local map timing if any offscreen work happened
                 if (g_offscreen.timingActive) {
                     float totalMs = g_offscreen.stopTimingMs();
-                    LOG::logline("Local map: %.1fms, %d DIPs, %d scenes", totalMs, g_offscreen.dipCount, g_offscreen.sceneCount);
+                    if (LOG::catEnabled(LOG::Cat_FrameStats)) {
+                        LOG::logline("Local map: %.1fms, %d DIPs, %d scenes", totalMs, g_offscreen.dipCount, g_offscreen.sceneCount);
+                    }
                 }
                 if (Configuration.ScreenFOV > 0) {
                     mwBridge->SetFOV(Configuration.ScreenFOV);
@@ -1226,9 +1236,11 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
                     capturePostProcessData(recBuf, frameCtx, "ENDSCENE");
 
                     // Diagnostic: log nearViewRange when stored
-                    static int storeLogCount = 0;
-                    if (storeLogCount++ < 10) {
-                        LOG::logline("[N1-STORE] nearViewRange=%.1f stored to recording buffer", frameCtx.nearViewRange);
+                    if (LOG::catEnabled(LOG::Cat_DistantLand)) {
+                        static int storeLogCount = 0;
+                        if (storeLogCount++ < 10) {
+                            LOG::logline("[N1-STORE] nearViewRange=%.1f stored to recording buffer", frameCtx.nearViewRange);
+                        }
                     }
                 }
 
@@ -1261,7 +1273,7 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
         } else if (!g_scene.isFrameComplete) {
             // Draw water if the Morrowind water plane doesn't appear in view
             // it may be too distant or stencil scene order is non-normative
-            LOG::logline("DW:%d, WD:%d, SS:%d", g_scene.distantWater, g_scene.waterDrawn, g_scene.isStencilScene);
+            LOG_CAT(LOG::Cat_FrameStats, "DW:%d, WD:%d, SS:%d", g_scene.distantWater, g_scene.waterDrawn, g_scene.isStencilScene);
 
             if (g_scene.distantWater && !g_scene.waterDrawn && !g_scene.isStencilScene) {
                 if (isHLSLActive()) {
@@ -1518,7 +1530,7 @@ HRESULT _stdcall MGEProxyDevice::SetMaterial(const D3DMATERIAL8* a) {
     captureMaterial(a);
     g_scene.isWaterMaterial = (a->Power == 99999.0f);
     if (g_scene.isWaterMaterial && !g_scene.waterDrawn) {
-        LOG::logline("Water material detected: Power=%.1f", a->Power);
+        LOG_CAT(LOG::Cat_FrameStats, "Water material detected: Power=%.1f", a->Power);
     }
 
     ImGuiManager::TraceMaterial(g_scene.sceneCount, a->Diffuse.r, a->Diffuse.g, a->Diffuse.b, a->Diffuse.a);
@@ -1892,9 +1904,11 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
                 recBuf.currentProj = frameCtx.mwProj;
                 capturePostProcessData(recBuf, frameCtx, "DIP");
                 // Diagnostic: log nearViewRange when stored (DIP path)
-                static int storeLogCountDIP = 0;
-                if (storeLogCountDIP++ < 10) {
-                    LOG::logline("[N1-STORE-DIP] nearViewRange=%.1f stored to recording buffer", frameCtx.nearViewRange);
+                if (LOG::catEnabled(LOG::Cat_DistantLand)) {
+                    static int storeLogCountDIP = 0;
+                    if (storeLogCountDIP++ < 10) {
+                        LOG::logline("[N1-STORE-DIP] nearViewRange=%.1f stored to recording buffer", frameCtx.nearViewRange);
+                    }
                 }
             } else {
                 // Legacy: interleaved GPU work (distant land renders now)

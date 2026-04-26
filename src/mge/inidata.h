@@ -4,6 +4,7 @@
 #define _INIDATA_H_
 
 #include "configinternal.h"
+#include "support/log.h"
 
 
 
@@ -21,7 +22,8 @@ const char* sections[] = {
     "Macros",
     "MacrosDesc",
     "InputTriggers",
-    "InputRemap"
+    "InputRemap",
+    "Logging"
 };
 
 const char* siniGlobGraph = sections[0];
@@ -35,6 +37,7 @@ const char* siniPPLighting = sections[7];
 const char* siniMacros = sections[8];
 const char* siniTriggers = sections[10];
 const char* siniRemap = sections[11];
+const char* siniLogging = sections[12];
 
 const tdictent dictentBool [] = {
     {"False", 0},
@@ -271,6 +274,16 @@ const iniSetting iniSettings[] = {
     {&Configuration.Input.Macros, t_set, sizeof(Configuration.Input.Macros), siniMacros, NULL, NULL, NULL, DONT_SAVE, 0, 0},
     {&Configuration.Input.Triggers, t_set, sizeof(Configuration.Input.Triggers), siniTriggers, NULL, NULL, NULL, DONT_SAVE, 0, 0},
     {&Configuration.Input.Remap, t_set, sizeof(Configuration.Input.Remap), siniRemap, NULL, NULL, NULL, DONT_SAVE, 0, 0},
+
+    // Logging — per-category gating for spammy diagnostic lines (default off).
+    // bit_size is the bit index into LOG::g_categoryMask; values match LOG::Category.
+    {&LOG::g_categoryMask, t_bit, 0, siniLogging, "Hash Database",   False, &dictBool, DICTONLY, 0, 0},
+    {&LOG::g_categoryMask, t_bit, 1, siniLogging, "Frame Stats",     False, &dictBool, DICTONLY, 0, 0},
+    {&LOG::g_categoryMask, t_bit, 2, siniLogging, "Hi-Z Culling",    False, &dictBool, DICTONLY, 0, 0},
+    {&LOG::g_categoryMask, t_bit, 3, siniLogging, "Recording",       False, &dictBool, DICTONLY, 0, 0},
+    {&LOG::g_categoryMask, t_bit, 4, siniLogging, "HLSL Replay",     False, &dictBool, DICTONLY, 0, 0},
+    {&LOG::g_categoryMask, t_bit, 5, siniLogging, "Mode3 Lighting",  False, &dictBool, DICTONLY, 0, 0},
+    {&LOG::g_categoryMask, t_bit, 6, siniLogging, "Distant Land",    False, &dictBool, DICTONLY, 0, 0},
 
     // PCF Shadow Parameters
     {&Configuration.PCF.FilterSize, t_float, 1, siniRendState, "PCF Filter Size", "4.6", NULL, MINMAX, 1.0, 8.0},

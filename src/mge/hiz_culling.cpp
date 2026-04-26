@@ -332,7 +332,7 @@ void FixedFunctionShader::storeCellBatchCacheVB(void* cellPtr, size_t layoutHash
     CellBatchCacheKey cacheKey = { cellPtr, layoutHash };
     auto it = s_cellBatchCaches.find(cacheKey);
     if (it == s_cellBatchCaches.end() || !it->second.valid || it->second.layoutHash != layoutHash) {
-        LOG::logline("CellBatchCache: Rejected VB/IB store - missing layout cell=%p hash=%Ix",
+        LOG_CAT(LOG::Cat_HLSLReplay, "CellBatchCache: Rejected VB/IB store - missing layout cell=%p hash=%Ix",
                      cellPtr, layoutHash);
         ReleaseSRWLockExclusive(&s_cellBatchCacheLock);
         return;
@@ -365,7 +365,7 @@ void FixedFunctionShader::storeCellBatchCacheVB(void* cellPtr, size_t layoutHash
     cache.vbSizeBytes = vbSizeBytes;
     cache.ibSizeIndices = ibSizeIndices;
 
-    LOG::logline("CellBatchCache: Stored VB/IB for cell=%p hash=%Ix, %d drawInfos",
+    LOG_CAT(LOG::Cat_HLSLReplay, "CellBatchCache: Stored VB/IB for cell=%p hash=%Ix, %d drawInfos",
                  cellPtr, layoutHash, (int)drawInfos.size());
 
     ReleaseSRWLockExclusive(&s_cellBatchCacheLock);
@@ -796,7 +796,7 @@ void FixedFunctionShader::executeHiZCulling(const D3DXMATRIX& currentView, const
             if (isVisible) visibleCount++; else culledCount++;
         }
 
-        LOG::logline(">> Hi-Z: %d visible, %d culled, %d no bbox (of %d calls)",
+        LOG_CAT(LOG::Cat_HiZ, ">> Hi-Z: %d visible, %d culled, %d no bbox (of %d calls)",
                      visibleCount, culledCount, noBboxCount,
                      visibleCount + culledCount + noBboxCount);
     }
@@ -830,7 +830,7 @@ void FixedFunctionShader::applyVisibilityAndFilterRecordMW() {
     activeRecordMW = std::move(filteredRecordMW);
 
     int outputCount = (int)activeRecordMW.size();
-    LOG::logline(">> Filter recordMW: %d in, %d out, %d culled",
+    LOG_CAT(LOG::Cat_HiZ, ">> Filter recordMW: %d in, %d out, %d culled",
                  inputCount, outputCount, inputCount - outputCount);
 }
 
@@ -1185,6 +1185,11 @@ void FixedFunctionShader::prepareRecordedCalls() {
                     auto& c = recCalls[i];
                     if (c.bin != RenderBin::Terrain) continue;
                     if (!c.hasBoundingBox) continue;
+                    // Mirror the validator's shape/layout contract so non-conforming
+                    // meshes (custom landscape mods, anything not stride-4 5x5) never
+                    // enter the near set — getOrBuild would silently reject them
+                    // every frame otherwise.
+                    if (!PatchDisplacement::canSubdivide(c.rs)) continue;
                     // bboxMin/bboxMax are already world-space (see computeBoundingBox in hiz_culling.cpp
                     // and the world-corner transform in hiz_culling.cpp:1250-1259).
                     float cx = 0.5f * (c.bboxMin.x + c.bboxMax.x);
@@ -1795,8 +1800,9 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
         }
     }
 
-    // Log diagnostic once per second to avoid spam
-    if (diagMirrored > 0 || diagUncaptured > 0) {
+    // Log diagnostic once per second to avoid spam. Gated on HLSLReplay since
+    // mirrored/uncaptured counts are normal (they fire constantly outdoors).
+    if ((diagMirrored > 0 || diagUncaptured > 0) && LOG::catEnabled(LOG::Cat_HLSLReplay)) {
         static DWORD lastDiagTick = 0;
         DWORD nowTick = GetTickCount();
         if (nowTick - lastDiagTick >= 1000) {
@@ -1920,11 +1926,11 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
         for (const auto& mb : fb.mergedBatches) {
             totalMerged += (int)mb.callIndices.size();
         }
-        LOG::logline("MergedBatch: %d batches, %d draws merged -> %d GPU calls",
+        LOG_CAT(LOG::Cat_HLSLReplay, "MergedBatch: %d batches, %d draws merged -> %d GPU calls",
                      (int)fb.mergedBatches.size(), totalMerged, (int)fb.mergedBatches.size());
     }
 
-    // === MergedBatch accounting (always computed; B + S + E must equal N) ===
+    // === MergedBatch terminal-bucket accounting (buckets MUST sum to totalRecorded) ===
     int totalRecorded = (int)calls.size();
     int batchedCount = 0;
     std::unordered_set<size_t> batchedIndices;
@@ -1934,11 +1940,6 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
     }
     int singletonsCount = (int)fb.singletonCallIndices.size();
 
-    int exNotBatchableBin = 0, exCulled = 0;
-    int exVertBlend = 0, exSkinning = 0, exGrass = 0;
-    int exNonTrilist = 0, exNoBuffers = 0;
-
-    // TerrainBlend pairing diagnostic — orphans are the prime suspect for the "missing tile" symptom.
     int terrainBlendCount = 0, terrainBlendPaired = 0, terrainBlendOrphan = 0;
     for (const auto& call : calls) {
         if (call.bin != RenderBin::TerrainBlend) continue;
@@ -1947,35 +1948,10 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
         else terrainBlendOrphan++;
     }
 
-    for (size_t i = 0; i < calls.size(); i++) {
-        if (batchedIndices.count(i) || fb.singletonCallIndices.count(i)) continue;
-        const auto& call = calls[i];
-        // Categorize in the same order isBatchableCall rejects.
-        if (call.rs.primType != D3DPT_TRIANGLELIST) { exNonTrilist++; continue; }
-        if (!call.rs.vb || !call.rs.ib)             { exNoBuffers++; continue; }
-        if (call.bin != RenderBin::Opaque &&
-            call.bin != RenderBin::Terrain &&
-            call.bin != RenderBin::TerrainBlend) {
-            exNotBatchableBin++; continue;
-        }
-        if (call.rs.vertexBlendState != 0)          { exVertBlend++; continue; }
-        if (call.sk.usesSkinning)                   { exSkinning++; continue; }
-        if (call.sk.hasGrass)                       { exGrass++; continue; }
-        if (!call.shouldRender)                     { exCulled++; continue; }
-        // Anything that reaches here is a true accounting residual (should be impossible).
-    }
-    int excludedCount = exNotBatchableBin + exCulled + exVertBlend +
-                        exSkinning + exGrass + exNonTrilist + exNoBuffers;
-    int residual = totalRecorded - batchedCount - singletonsCount - excludedCount;
-
-    // Phase 6A: terminal-bucket categorization that mirrors the actual draw path,
-    // so residuals in the batching accounting above can be reconciled against where
-    // each call actually ends up at replay time. Buckets MUST sum to totalRecorded.
     int termDrawnInBatch = 0;              // in mergedBatchIndices
-    int termDrawnInMain = 0;               // not in batch, shouldRender=true, bin != TerrainBlend
-    int termCulled = 0;                    // shouldRender=false, bin != TerrainBlend (visibility-culled)
+    int termDrawnInMain = 0;               // not in batch, shouldRender=true, bin != TerrainBlend (includes singletons)
+    int termCulled = 0;                    // shouldRender=false, bin != TerrainBlend
     int termSkippedTerrainBlend = 0;       // bin == TerrainBlend (absorbed OR orphan — replay loop skips both)
-    int termUnaccounted = 0;
     for (size_t i = 0; i < calls.size(); i++) {
         const auto& call = calls[i];
         if (call.bin == RenderBin::TerrainBlend) {
@@ -1985,31 +1961,25 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
         } else if (!call.shouldRender) {
             termCulled++;
         } else {
-            termDrawnInMain++;   // covers singletons + residuals from the legacy accounting
+            termDrawnInMain++;
         }
     }
-    termUnaccounted = totalRecorded -
-                      (termDrawnInBatch + termDrawnInMain + termCulled + termSkippedTerrainBlend);
+    int termUnaccounted = totalRecorded -
+                          (termDrawnInBatch + termDrawnInMain + termCulled + termSkippedTerrainBlend);
 
-    // Rate-limited per-frame one-liner whenever any calls were excluded or accounting drifts.
-    if (excludedCount > 0 || residual != 0) {
+    // Alert fires only on real accounting drift (buckets don't sum to N). Rate-limited.
+    if (termUnaccounted != 0) {
         static DWORD lastSummaryTick = 0;
         DWORD nowTick = GetTickCount();
         if (nowTick - lastSummaryTick >= 1000) {
             lastSummaryTick = nowTick;
-            LOG::logline("MergedBatch: Total=%d Batched=%d Singletons=%d Excluded=%d (Scene1=%d Scene2=%d)",
-                         totalRecorded, batchedCount, singletonsCount, excludedCount,
+            LOG::logline("MergedBatch UNACCOUNTED=%d  Total=%d batch=%d main=%d culled=%d tblend=%d  (Scene1=%d Scene2=%d)",
+                         termUnaccounted, totalRecorded,
+                         termDrawnInBatch, termDrawnInMain, termCulled, termSkippedTerrainBlend,
                          (int)fb.recordedCallsScene1.size(), (int)fb.recordedCallsScene2.size());
-            LOG::logline("  Terminal: drawnBatch=%d drawnMain=%d culled=%d tblendSkipped=%d unaccounted=%d",
-                         termDrawnInBatch, termDrawnInMain, termCulled,
-                         termSkippedTerrainBlend, termUnaccounted);
             if (terrainBlendOrphan > 0) {
                 LOG::logline("  TerrainBlend: %d (paired %d / orphan %d)",
                              terrainBlendCount, terrainBlendPaired, terrainBlendOrphan);
-            }
-            if (residual != 0) {
-                LOG::logline("  MergedBatch ACCOUNTING MISMATCH: residual=%d (B+S+E=%d, N=%d)",
-                             residual, batchedCount + singletonsCount + excludedCount, totalRecorded);
             }
         }
     }
@@ -2020,22 +1990,17 @@ void FixedFunctionShader::buildStatelessBatches(FrameBuffer& fb) {
         LOG::logline("=== MergedBatch Breakdown ===");
         LOG::logline("Total recorded (Scene 0): %d  (Scene 1: %d, Scene 2: %d)",
                      totalRecorded, (int)fb.recordedCallsScene1.size(), (int)fb.recordedCallsScene2.size());
-        LOG::logline("  Batched:    %d  (sum of mergedBatches[*].callIndices.size())", batchedCount);
-        LOG::logline("  Singletons: %d  (groups of size 1)", singletonsCount);
-        LOG::logline("  Excluded:   %d  = N - B - S", excludedCount);
+        LOG::logline("  Batched:           %d  (sum of mergedBatches[*].callIndices.size())", batchedCount);
+        LOG::logline("  Singletons:        %d  (subset of Drawn-in-main: groups of size 1)", singletonsCount);
+        LOG::logline("  Drawn in batch:    %d", termDrawnInBatch);
+        LOG::logline("  Drawn in main:     %d  (not batched, shouldRender=true, bin != TerrainBlend)", termDrawnInMain);
+        LOG::logline("  Culled:            %d  (shouldRender=false, bin != TerrainBlend)", termCulled);
+        LOG::logline("  TerrainBlend skip: %d  (absorbed via overlay or orphan)", termSkippedTerrainBlend);
+        if (termUnaccounted != 0) {
+            LOG::logline("  UNACCOUNTED:       %d", termUnaccounted);
+        }
         LOG::logline("  TerrainBlend: %d (paired %d / orphan %d)",
                      terrainBlendCount, terrainBlendPaired, terrainBlendOrphan);
-        LOG::logline("    not Opaque/Terrain:           %d", exNotBatchableBin);
-        LOG::logline("    culled (shouldRender=false):  %d", exCulled);
-        LOG::logline("    vertBlend:                    %d", exVertBlend);
-        LOG::logline("    skinning:                     %d", exSkinning);
-        LOG::logline("    grass:                        %d", exGrass);
-        LOG::logline("    non-TRILIST:                  %d", exNonTrilist);
-        LOG::logline("    missing VB-IB:                %d", exNoBuffers);
-        if (residual != 0) {
-            LOG::logline("  MergedBatch ACCOUNTING MISMATCH: residual=%d (B+S+E=%d, N=%d)",
-                         residual, batchedCount + singletonsCount + excludedCount, totalRecorded);
-        }
 
         int batchIdx = 0;
         for (const auto& mb : fb.mergedBatches) {

@@ -412,7 +412,7 @@ void FixedFunctionShader::startRecording() {
     fb.valid = true;
 
     currentPhase = PipelinePhase::Recording;
-    LOG::logline("HLSL Recording: Started recording render dispatches");
+    LOG_CAT(LOG::Cat_Recording, "HLSL Recording: Started recording render dispatches");
 }
 
 void FixedFunctionShader::stopRecordingAndReplay() {
@@ -1034,7 +1034,7 @@ void FixedFunctionShader::executeGpuPhase() {
     fb.hlslCmds.clear();
 
     // Scene 0: World geometry (only scene recorded at this point)
-    LOG::logline("[ORDER] executeGpuPhase: Replay Scene 0 (%d calls)", (int)fb.recordedCalls.size());
+    LOG_CAT(LOG::Cat_Recording, "[ORDER] executeGpuPhase: Replay Scene 0 (%d calls)", (int)fb.recordedCalls.size());
     replayRecordedCalls(0, &fb.hlslCmds);
 
     // Scene 1/2 NOT replayed here — they haven't been recorded yet at EndScene(0)
@@ -1190,7 +1190,7 @@ void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool w
         transitionTo(PhaseTransition::ReplayEntry);
 
         // Replay Scene 0 (world) FIRST - Morrowind near objects
-        LOG::logline("[ORDER] finalizeAndRenderAllScenes: Replay Scene 0 (%d calls)", (int)fb.recordedCalls.size());
+        LOG_CAT(LOG::Cat_Recording, "[ORDER] finalizeAndRenderAllScenes: Replay Scene 0 (%d calls)", (int)fb.recordedCalls.size());
         replayRecordedCalls(0, nullptr);
 
         transitionTo(PhaseTransition::ReplayExit);
@@ -1297,7 +1297,7 @@ void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool w
         fb.view = fb.viewScene1;
         fb.proj = fb.projScene1;
 
-        LOG::logline("[ORDER] finalizeAndRenderAllScenes: Replay Scene 1 (%d calls)", (int)fb.recordedCallsScene1.size());
+        LOG_CAT(LOG::Cat_Recording, "[ORDER] finalizeAndRenderAllScenes: Replay Scene 1 (%d calls)", (int)fb.recordedCallsScene1.size());
         replayRecordedCalls(1, nullptr);
 
         fb.view = savedView;
@@ -1668,7 +1668,7 @@ void FixedFunctionShader::renderFullFrameAsync() {
     MGE_ZoneScopedN("renderFullFrameAsync");
 
     if (!recordingEnabled || !n2Ready) {
-        LOG::logline(">> renderFullFrameAsync SKIP (enabled=%d n2=%d)", recordingEnabled, n2Ready);
+        LOG_CAT(LOG::Cat_Recording, ">> renderFullFrameAsync SKIP (enabled=%d n2=%d)", recordingEnabled, n2Ready);
         return;
     }
 
@@ -1684,7 +1684,7 @@ void FixedFunctionShader::renderFullFrameAsync() {
                      currentFrame, renderFrame, expectedRenderFrame, currentFrame - renderFrame);
     }
 
-    LOG::logline(">> renderFullFrameAsync frame=%d state=%d calls=%d",
+    LOG_CAT(LOG::Cat_Recording, ">> renderFullFrameAsync frame=%d state=%d calls=%d",
                  renderFrame, (int)fb.state, (int)fb.recordedCalls.size());
     DLContext* renderCtx = &fb.dlContext;
     bool renderWaterSeen = fb.waterSeen;
@@ -1739,9 +1739,9 @@ void FixedFunctionShader::renderFullFrameAsync() {
     // Stage 0 GPU: shadow map, distant land, sky, water reflection
     {
         MGE_ZoneScopedN("Stage0 GPU");
-        LOG::logline(">> renderFullFrameAsync Stage0GPU start");
+        LOG_CAT(LOG::Cat_Recording, ">> renderFullFrameAsync Stage0GPU start");
         DistantLand::renderStage0GPU(renderCtx, &fb);
-        LOG::logline(">> renderFullFrameAsync Stage0GPU done");
+        LOG_CAT(LOG::Cat_Recording, ">> renderFullFrameAsync Stage0GPU done");
     }
 
     // Update shadow VP from freshly computed matrices
@@ -1751,14 +1751,14 @@ void FixedFunctionShader::renderFullFrameAsync() {
     // Depth passes: Scene 0 (world) and Scene 2 (hands)
     {
         MGE_ZoneScopedN("Depth Passes");
-        LOG::logline(">> renderFullFrameAsync Stage1 start");
+        LOG_CAT(LOG::Cat_Recording, ">> renderFullFrameAsync Stage1 start");
         DistantLand::renderStage1(renderCtx, &fb);
-        LOG::logline(">> renderFullFrameAsync Stage1 done, Stage2 start");
+        LOG_CAT(LOG::Cat_Recording, ">> renderFullFrameAsync Stage1 done, Stage2 start");
         DistantLand::renderStage2(renderCtx, &fb);
         // Forward prepass reads texDepthFrame; run after Stage 2 so hand depth
         // contributes to SSAO.
         DistantLand::renderForwardPrepassChain(renderCtx, &fb.postProcessData);
-        LOG::logline(">> renderFullFrameAsync Stage2 done, ForwardPrepass done");
+        LOG_CAT(LOG::Cat_Recording, ">> renderFullFrameAsync Stage2 done, ForwardPrepass done");
     }
 
     // Replay Scene 0
@@ -1767,7 +1767,7 @@ void FixedFunctionShader::renderFullFrameAsync() {
         MGE_ZoneScopedN("Replay All Scenes");
         transitionTo(PhaseTransition::ReplayEntry);
 
-        LOG::logline("[ORDER] renderFullFrameAsync: Replay Scene 0 (%d calls)", (int)fb.recordedCalls.size());
+        LOG_CAT(LOG::Cat_Recording, "[ORDER] renderFullFrameAsync: Replay Scene 0 (%d calls)", (int)fb.recordedCalls.size());
         replayRecordedCalls(0, nullptr);
 
         transitionTo(PhaseTransition::ReplayExit);
@@ -1779,7 +1779,6 @@ void FixedFunctionShader::renderFullFrameAsync() {
     // Water surface after Scene 0, before particles
     if (renderWaterSeen) {
         DistantLand::renderStageWater(renderCtx);
-        LOG::logline("Water rendered, recording after scene 0, no particles case?");
     }
 
     // Upload snapshot vertex/index data to staging buffers for Scene 1/2
@@ -1986,7 +1985,7 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
             // N-1: recording buffer for debug logging during recording
             auto& recFb = getRecordingBuffer();
             size_t callIdx = currentRecordedCalls().size();
-            LOG::logline("[REC-P] #%d vbs=%d world41=%.2f wvt41=%.2f view41=%.2f proj11=%.3f prims=%d",
+            LOG_CAT(LOG::Cat_Recording, "[REC-P] #%d vbs=%d world41=%.2f wvt41=%.2f view41=%.2f proj11=%.3f prims=%d",
                 hlslRecParticleIdx, rs->vertexBlendState,
                 rs->worldTransforms[0]._41, rs->worldViewTransforms[0]._41,
                 rs->viewTransform._41, recFb.proj._11, rs->primCount);
@@ -2039,7 +2038,7 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
                         snapLastFrame = hlslDiagFrameCounter;
                     }
                     if (snapLogCount < 3) {
-                        LOG::logline("[SNAP] OK scene=%d VB=%u IB=%u stride=%d verts=%d prims=%d",
+                        LOG_CAT(LOG::Cat_Recording, "[SNAP] OK scene=%d VB=%u IB=%u stride=%d verts=%d prims=%d",
                             currentRecordingScene, vbByteCount, ibByteCount, rs->vbStride, rs->vertCount, rs->primCount);
                         snapLogCount++;
                     }
@@ -2059,7 +2058,7 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
                 noSnapLastFrame = hlslDiagFrameCounter;
             }
             if (noSnapLogCount < 3) {
-                LOG::logline("[SNAP] SKIP scene=%d vb=%p ib=%p", currentRecordingScene, rs->vb, rs->ib);
+                LOG_CAT(LOG::Cat_Recording, "[SNAP] SKIP scene=%d vb=%p ib=%p", currentRecordingScene, rs->vb, rs->ib);
                 noSnapLogCount++;
             }
         }
@@ -2068,7 +2067,7 @@ void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const Fragme
         if (currentRecordingScene > 0) {
             static int orderLogCount = 0;
             if (orderLogCount < 10) {
-                LOG::logline("[ORDER] Record Scene %d call #%d (world41=%.1f)",
+                LOG_CAT(LOG::Cat_Recording, "[ORDER] Record Scene %d call #%d (world41=%.1f)",
                     currentRecordingScene, (int)currentRecordedCalls().size(), rs->worldTransforms[0]._41);
                 orderLogCount++;
             }
