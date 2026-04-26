@@ -355,7 +355,23 @@ VS_OUTPUT vs_main(VS_INPUT input) {
         // Z, so subtract _displaceH * wv2 where wv2 is the Z column of worldview).
         // Left as-is for now: the standard path covers the dominant terrain case.
         output.shadow0pos = mul(viewpos, shadowWorldViewProj[0]);
-        output.shadow1pos = mul(viewpos, shadowWorldViewProj[1]);
+
+        // Far cascade: use per-draw (world × shadowViewproj[1]) baked into the
+        // draw-data texture (texels 9-12). Avoids the worldview→inverseView round
+        // trip used by the global c64-c67 constant — that path drops FP32 bits at
+        // Morrowind-scale translations and shows up as far-cascade bias artifacts.
+        // input.pos is post-displacement (HAS_DISPLACEMENT branch above), matching
+        // non-stateless policy of keeping displaced position on the far cascade.
+        float texelW_s = drawDataParams.x;
+        float drawV_s = (input.drawIndex + 0.5) * drawDataParams.y;
+        float4 ws0 = tex2Dlod(sampDrawData, float4( 9.5 * texelW_s, drawV_s, 0, 0));
+        float4 ws1 = tex2Dlod(sampDrawData, float4(10.5 * texelW_s, drawV_s, 0, 0));
+        float4 ws2 = tex2Dlod(sampDrawData, float4(11.5 * texelW_s, drawV_s, 0, 0));
+        float4 ws3 = tex2Dlod(sampDrawData, float4(12.5 * texelW_s, drawV_s, 0, 0));
+        output.shadow1pos.x = dot(input.pos, ws0);
+        output.shadow1pos.y = dot(input.pos, ws1);
+        output.shadow1pos.z = dot(input.pos, ws2);
+        output.shadow1pos.w = dot(input.pos, ws3);
     #else
         float4 shadowObjPos0 = worldpos;
         shadowObjPos0.z -= _displaceH;

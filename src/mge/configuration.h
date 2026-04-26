@@ -149,6 +149,7 @@ struct ConfigurationStruct {
         float Bias;
         float Bias2;
         float SlopeBias;
+        float TerrainBias;  // Extra bias added only to terrain receivers in near cascade
     } PCF;
 
     struct {

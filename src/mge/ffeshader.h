@@ -196,10 +196,14 @@ struct StatelessDrawData {
     float lightParams[4];  // Texel 6: {pointLightCount, texelSize, texelOffset, vertexMaterial}
     float flags[4];        // Texel 7: WorldView matrix 4th column {wv._14, wv._24, wv._34, wv._44}
     float normres[4];      // Texel 8: {normres.x, normres.y, 0, visibility} - parameter texture resolution, visibility flag (1.0=visible, 0.0=hidden)
-    float reserved1[4];    // Texel 9: Reserved for future use
-    float reserved2[4];    // Texel 10: Reserved for future use
-    float reserved3[4];    // Texel 11: Reserved for future use
-    float reserved4[4];    // Texel 12: Reserved for future use
+    // Texels 9-12: per-draw (world × shadowViewproj[1]) for far cascade. Baked on
+    // CPU to avoid the view-space round trip used in the global path, which loses
+    // FP32 precision under Morrowind's large translations and shows up as far
+    // cascade bias artifacts. Columns stored to match worldview layout.
+    float worldShadow1_0[4];  // Texel 9:  column 0 of M
+    float worldShadow1_1[4];  // Texel 10: column 1 of M
+    float worldShadow1_2[4];  // Texel 11: column 2 of M
+    float worldShadow1_3[4];  // Texel 12: column 3 of M
     float reserved5[4];    // Texel 13: Reserved for future use
     float reserved6[4];    // Texel 14: Reserved for future use
     float reserved7[4];    // Texel 15: Reserved for future use

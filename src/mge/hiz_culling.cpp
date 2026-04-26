@@ -1615,6 +1615,11 @@ static void readNormres(const FixedFunctionShader::HLSLRecordedCall& call, float
 }
 
 // Helper to fill StatelessDrawData from a recorded call.
+// worldShadow1 (texels 9-12) is intentionally NOT filled here — that matrix
+// depends on fb.shadowViewproj[1], which CPT can see only as a stale (N-1
+// recording-time) value. The render thread bakes those columns just before
+// uploading drawDataStaging, using fresh shadowViewproj[1] from the current
+// frame's renderShadowMap pass.
 static void fillDrawData(StatelessDrawData& data, const FixedFunctionShader::HLSLRecordedCall& call,
                          bool isVisible) {
     const D3DXMATRIX& wv = call.rs.worldViewTransforms[0];
@@ -1641,10 +1646,6 @@ static void fillDrawData(StatelessDrawData& data, const FixedFunctionShader::HLS
     data.normres[3] = isVisible ? 1.0f : 0.0f;  // Visibility flag
 
     // Zero out reserved texels
-    memset(data.reserved1, 0, sizeof(data.reserved1));
-    memset(data.reserved2, 0, sizeof(data.reserved2));
-    memset(data.reserved3, 0, sizeof(data.reserved3));
-    memset(data.reserved4, 0, sizeof(data.reserved4));
     memset(data.reserved5, 0, sizeof(data.reserved5));
     memset(data.reserved6, 0, sizeof(data.reserved6));
     memset(data.reserved7, 0, sizeof(data.reserved7));

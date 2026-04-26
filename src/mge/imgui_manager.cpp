@@ -18,13 +18,14 @@ HWND ImGuiManager::windowHandle = nullptr;
 static bool s_renderInvalidationLatched = false;
 
 // PCF filtering variables
-float ImGuiManager::pcfFilterSize = 4.6f;        // Base filter size in texels
-float ImGuiManager::pcfPenumbraScale = 1.47f;    // Scale factor for distance-based penumbra
-float ImGuiManager::pcfMinPenumbra = 3.3f;       // Minimum penumbra size
-float ImGuiManager::pcfMaxPenumbra = 3.7f;       // Maximum penumbra size
-float ImGuiManager::pcfBias = 0.0037f;           // Depth bias to prevent acne
-float ImGuiManager::pcfBias2 = 0.0037f;          // Second depth bias for lerp
-float ImGuiManager::pcfSlopeBias = 0.0061f;      // Slope-based bias to prevent acne on angled surfaces
+float ImGuiManager::pcfFilterSize = 5.5f;        // Base filter size in texels
+float ImGuiManager::pcfPenumbraScale = 1.44f;    // Scale factor for distance-based penumbra
+float ImGuiManager::pcfMinPenumbra = 1.5f;       // Minimum penumbra size
+float ImGuiManager::pcfMaxPenumbra = 3.4f;       // Maximum penumbra size
+float ImGuiManager::pcfBias = 0.0031f;           // Depth bias to prevent acne
+float ImGuiManager::pcfBias2 = 0.0038f;          // Second depth bias for lerp
+float ImGuiManager::pcfSlopeBias = 0.0047f;      // Slope-based bias to prevent acne on angled surfaces
+float ImGuiManager::pcfTerrainBias = 0.02f;      // Extra bias for terrain receivers (near cascade, all modes)
 
 // Debug interface controls
 int ImGuiManager::bboxVisualizationMode = 0;
@@ -195,6 +196,7 @@ bool ImGuiManager::Initialize(HWND hwnd, IDirect3DDevice9* device) {
     pcfBias = Configuration.PCF.Bias;
     pcfBias2 = Configuration.PCF.Bias2;
     pcfSlopeBias = Configuration.PCF.SlopeBias;
+    pcfTerrainBias = Configuration.PCF.TerrainBias;
     
 
     IMGUI_CHECKVERSION();
@@ -357,6 +359,7 @@ void ImGuiManager::RenderPCFFilteringInterface() {
         ImGui::SliderFloat("Depth Bias", &pcfBias, 0.0f, 0.01f, "%.4f");
         ImGui::SliderFloat("Depth Bias 2", &pcfBias2, 0.0f, 0.01f, "%.4f");
         ImGui::SliderFloat("Slope Bias", &pcfSlopeBias, 0.0f, 0.01f, "%.4f");
+        ImGui::SliderFloat("Terrain Bias (near)", &pcfTerrainBias, 0.0f, 0.02f, "%.4f");
 
         ImGui::Separator();
         ImGui::Checkbox("Show Demo Window", &showDemo);
@@ -374,9 +377,10 @@ void ImGuiManager::RenderPCFFilteringInterface() {
         Configuration.PCF.Bias = pcfBias;
         Configuration.PCF.Bias2 = pcfBias2;
         Configuration.PCF.SlopeBias = pcfSlopeBias;
+        Configuration.PCF.TerrainBias = pcfTerrainBias;
         Configuration.SaveSettings();
     }
-    
+
     // Update mouse cursor visibility based on interface state
     ImGuiIO& io = ImGui::GetIO();
     io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showFrameEventLog;
@@ -390,6 +394,7 @@ float ImGuiManager::GetPCFMaxPenumbra() { return pcfMaxPenumbra; }
 float ImGuiManager::GetPCFBias() { return pcfBias; }
 float ImGuiManager::GetPCFBias2() { return pcfBias2; }
 float ImGuiManager::GetPCFSlopeBias() { return pcfSlopeBias; }
+float ImGuiManager::GetPCFTerrainBias() { return pcfTerrainBias; }
 bool ImGuiManager::GetShowPCFInterface() { return showPCFInterface; }
 
 void ImGuiManager::TogglePCFInterface() { 
@@ -409,6 +414,7 @@ void ImGuiManager::TogglePCFInterface() {
         Configuration.PCF.Bias = pcfBias;
         Configuration.PCF.Bias2 = pcfBias2;
         Configuration.PCF.SlopeBias = pcfSlopeBias;
+        Configuration.PCF.TerrainBias = pcfTerrainBias;
         Configuration.SaveSettings();
     }
 }

@@ -1397,6 +1397,13 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             float v[4] = { ImGuiManager::GetPCFSlopeBias(), 0, 0, 0 };
             cmdBuf->recordSetPSConstantF(hlslShader.regPCFSlopeBias.reg, v, 1);
         }
+        // Terrain shadow params at c25 (statically declared in shadows.hlsl).
+        // .x = isTerrain (per-draw), .y = bias (global from imgui).
+        {
+            float isTerrain = (replayCall && replayCall->bin == RenderBin::Terrain) ? 1.0f : 0.0f;
+            float v[4] = { isTerrain, ImGuiManager::GetPCFTerrainBias(), 0, 0 };
+            cmdBuf->recordSetPSConstantF(25, v, 1);
+        }
         if (hlslShader.regDebugMode.reg != REG_INVALID) {
             float v[4] = { (float)ImGuiManager::GetShaderDebugMode(), 0, 0, 0 };
             cmdBuf->recordSetPSConstantF(hlslShader.regDebugMode.reg, v, 1);
@@ -1549,6 +1556,12 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         if (hPCFBias2) hlslShader.psConstantTable->SetFloat(device, hPCFBias2, ImGuiManager::GetPCFBias2());
         D3DXHANDLE hPCFSlopeBias = hlslShader.psConstantTable->GetConstantByName(NULL, "PCF_slopeBias");
         if (hPCFSlopeBias) hlslShader.psConstantTable->SetFloat(device, hPCFSlopeBias, ImGuiManager::GetPCFSlopeBias());
+        // Terrain shadow params at c25 (static register in shadows.hlsl).
+        {
+            float isTerrain = (replayCall && replayCall->bin == RenderBin::Terrain) ? 1.0f : 0.0f;
+            float v[4] = { isTerrain, ImGuiManager::GetPCFTerrainBias(), 0, 0 };
+            device->SetPixelShaderConstantF(25, v, 1);
+        }
         D3DXHANDLE hDebugMode = hlslShader.psConstantTable->GetConstantByName(NULL, "debugMode");
         if (hDebugMode) hlslShader.psConstantTable->SetInt(device, hDebugMode, ImGuiManager::GetShaderDebugMode());
         D3DXHANDLE hHeightBlendParams = hlslShader.psConstantTable->GetConstantByName(NULL, "heightBlendParams");
@@ -2242,20 +2255,38 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
             static bool loggedLightFill = false;
             int logCount = 0;
 
-            // Fill light params for merged batches
+            // Far-cascade shadow matrix: fb.shadowViewproj[1] is updated by Stage0GPU's
+            // renderShadowMap pass each frame, so we bake (world × shadowVP1) here on
+            // the render thread instead of in CPT (where shadowVP1 would be the previous
+            // frame's value, producing visible biasing in the far cascade).
+            const D3DXMATRIX& shadowVP1 = fb.shadowViewproj[1];
+
+            // Fill light params + far-shadow matrix for merged batches
             for (const auto& mb : fb.mergedBatches) {
                 for (size_t callIdx : mb.callIndices) {
-                    if (stagingIdx < fb.drawDataStaging.size() && callIdx < perObjectLightInfo.size()) {
-                        const auto& li = perObjectLightInfo[callIdx];
-                        fb.drawDataStaging[stagingIdx].lightParams[0] = (float)li.lightCount;
-                        fb.drawDataStaging[stagingIdx].lightParams[1] = perObjectTexelSize;
-                        fb.drawDataStaging[stagingIdx].lightParams[2] = (float)li.texelOffset;
-                        // lightParams[3] = vertexMaterial, already set in hiz_culling.cpp - don't overwrite
+                    if (stagingIdx < fb.drawDataStaging.size()) {
+                        StatelessDrawData& dd = fb.drawDataStaging[stagingIdx];
 
-                        if (!loggedLightFill && logCount < 5 && li.lightCount > 0) {
-                            LOG::logline("MergedBatch lightFill: stagingIdx=%d, callIdx=%d, lightCount=%d, texelOffset=%d, texelSize=%.6f",
-                                stagingIdx, (int)callIdx, li.lightCount, li.texelOffset, perObjectTexelSize);
-                            logCount++;
+                        // Bake far-cascade shadow matrix unconditionally — it depends only
+                        // on the call's world transform and this frame's shadowVP1.
+                        const D3DXMATRIX m = recCalls[callIdx].rs.worldTransforms[0] * shadowVP1;
+                        dd.worldShadow1_0[0] = m._11; dd.worldShadow1_0[1] = m._21; dd.worldShadow1_0[2] = m._31; dd.worldShadow1_0[3] = m._41;
+                        dd.worldShadow1_1[0] = m._12; dd.worldShadow1_1[1] = m._22; dd.worldShadow1_1[2] = m._32; dd.worldShadow1_1[3] = m._42;
+                        dd.worldShadow1_2[0] = m._13; dd.worldShadow1_2[1] = m._23; dd.worldShadow1_2[2] = m._33; dd.worldShadow1_2[3] = m._43;
+                        dd.worldShadow1_3[0] = m._14; dd.worldShadow1_3[1] = m._24; dd.worldShadow1_3[2] = m._34; dd.worldShadow1_3[3] = m._44;
+
+                        if (callIdx < perObjectLightInfo.size()) {
+                            const auto& li = perObjectLightInfo[callIdx];
+                            dd.lightParams[0] = (float)li.lightCount;
+                            dd.lightParams[1] = perObjectTexelSize;
+                            dd.lightParams[2] = (float)li.texelOffset;
+                            // lightParams[3] = vertexMaterial, already set in hiz_culling.cpp - don't overwrite
+
+                            if (!loggedLightFill && logCount < 5 && li.lightCount > 0) {
+                                LOG::logline("MergedBatch lightFill: stagingIdx=%d, callIdx=%d, lightCount=%d, texelOffset=%d, texelSize=%.6f",
+                                    stagingIdx, (int)callIdx, li.lightCount, li.texelOffset, perObjectTexelSize);
+                                logCount++;
+                            }
                         }
                     }
                     stagingIdx++;
@@ -2877,6 +2908,31 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                         // Set shadow matrices using hoisted view-to-shadow transforms
                         if (hlslShader.hShadowWorldViewProj) {
                             hlslShader.vsConstantTable->SetMatrixArray(device, hlslShader.hShadowWorldViewProj, shadowViewToClip, 2);
+                        }
+
+                        // Shadow PS constants (c10-c17). Batch shaders skip dynamic resolution,
+                        // and setReplayBaseline zeroes c0-c31 each replay, so without this
+                        // every batched draw sees PCF_filterSize/PCF_bias = 0 → boxy shadows
+                        // and self-shadowing. Registers are statically declared in shadows.hlsl
+                        // and XE FixedFuncEmu_PS.hlsl, matching the per-draw cmdBuf path.
+                        if (sk.hasShadows) {
+                            float shadowConsts[8 * 4] = {
+                                1.0f / Configuration.DL.ShadowResolution, 0, 0, 0,  // c10 shadowRcpRes
+                                ImGuiManager::GetPCFBias(),          0, 0, 0,         // c11
+                                ImGuiManager::GetPCFBias2(),         0, 0, 0,         // c12
+                                ImGuiManager::GetPCFFilterSize(),    0, 0, 0,         // c13
+                                ImGuiManager::GetPCFPenumbraScale(), 0, 0, 0,         // c14
+                                ImGuiManager::GetPCFMinPenumbra(),   0, 0, 0,         // c15
+                                ImGuiManager::GetPCFMaxPenumbra(),   0, 0, 0,         // c16
+                                ImGuiManager::GetPCFSlopeBias(),     0, 0, 0,         // c17
+                            };
+                            device->SetPixelShaderConstantF(10, shadowConsts, 8);
+
+                            // Terrain shadow params at c25. mb.key.bin is uniform across
+                            // a merged batch (Terrain and Opaque are separate keys).
+                            float isTerrain = (mb.key.bin == (uint8_t)RenderBin::Terrain) ? 1.0f : 0.0f;
+                            float terrainConsts[4] = { isTerrain, ImGuiManager::GetPCFTerrainBias(), 0, 0 };
+                            device->SetPixelShaderConstantF(25, terrainConsts, 1);
                         }
                     }
 

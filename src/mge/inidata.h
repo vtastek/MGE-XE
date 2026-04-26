@@ -286,13 +286,14 @@ const iniSetting iniSettings[] = {
     {&LOG::g_categoryMask, t_bit, 6, siniLogging, "Distant Land",    False, &dictBool, DICTONLY, 0, 0},
 
     // PCF Shadow Parameters
-    {&Configuration.PCF.FilterSize, t_float, 1, siniRendState, "PCF Filter Size", "4.6", NULL, MINMAX, 1.0, 8.0},
-    {&Configuration.PCF.PenumbraScale, t_float, 1, siniRendState, "PCF Penumbra Scale", "1.47", NULL, MINMAX, 0.1, 3.0},
-    {&Configuration.PCF.MinPenumbra, t_float, 1, siniRendState, "PCF Min Penumbra", "3.3", NULL, MINMAX, 0.5, 5.0},
-    {&Configuration.PCF.MaxPenumbra, t_float, 1, siniRendState, "PCF Max Penumbra", "3.7", NULL, MINMAX, 2.0, 15.0},
-    {&Configuration.PCF.Bias, t_float, 1, siniRendState, "PCF Depth Bias", "0.0037", NULL, MINMAX, 0.0, 0.01},
-    {&Configuration.PCF.Bias2, t_float, 1, siniRendState, "PCF Depth Bias 2", "0.0037", NULL, MINMAX, 0.0, 0.01},
-    {&Configuration.PCF.SlopeBias, t_float, 1, siniRendState, "PCF Slope Bias", "0.0061", NULL, MINMAX, 0.0, 0.01},
+    {&Configuration.PCF.FilterSize, t_float, 1, siniRendState, "PCF Filter Size", "5.5", NULL, MINMAX, 1.0, 8.0},
+    {&Configuration.PCF.PenumbraScale, t_float, 1, siniRendState, "PCF Penumbra Scale", "1.44", NULL, MINMAX, 0.1, 3.0},
+    {&Configuration.PCF.MinPenumbra, t_float, 1, siniRendState, "PCF Min Penumbra", "1.5", NULL, MINMAX, 0.5, 5.0},
+    {&Configuration.PCF.MaxPenumbra, t_float, 1, siniRendState, "PCF Max Penumbra", "3.4", NULL, MINMAX, 2.0, 15.0},
+    {&Configuration.PCF.Bias, t_float, 1, siniRendState, "PCF Depth Bias", "0.0031", NULL, MINMAX, 0.0, 0.01},
+    {&Configuration.PCF.Bias2, t_float, 1, siniRendState, "PCF Depth Bias 2", "0.0038", NULL, MINMAX, 0.0, 0.01},
+    {&Configuration.PCF.SlopeBias, t_float, 1, siniRendState, "PCF Slope Bias", "0.0047", NULL, MINMAX, 0.0, 0.01},
+    {&Configuration.PCF.TerrainBias, t_float, 1, siniRendState, "PCF Terrain Bias", "0.02", NULL, MINMAX, 0.0, 0.02},
 };
 
 #endif /* _INIDATA_H_ */

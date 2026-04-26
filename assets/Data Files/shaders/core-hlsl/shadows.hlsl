@@ -27,6 +27,14 @@ float PCF_penumbraScale : register(c14);
 float PCF_minPenumbra : register(c15);
 float PCF_maxPenumbra : register(c16);
 float PCF_slopeBias : register(c17);
+// Terrain receiver hint + extra near-cascade bias.
+//   .x = isTerrain (0 or 1, set per-draw / per-merged-batch on C++ side)
+//   .y = terrain bias amount (global, from imgui PCF window)
+// Terrain self-occludes more visibly than other geometry in the near cascade
+// across all rendering modes; this lets us bump bias for terrain receivers
+// without inflating the global PCF_bias and softening contact shadows on
+// non-terrain meshes.
+float4 terrainShadowParams : register(c25);
 
 // Shadow constants
 static const int shadowCascades = 2;
@@ -101,6 +109,7 @@ float shadowSamplePCF(float4 shadowPos, float2 shadowUV, int cascade, float rece
     float biasedDepth = receiverDepth - min(fractionalSamplingError, 0.01f);
 
     float finalBias = lerp(PCF_bias, PCF_bias2, step(0.7, ndotlgeo)) + dynamicSlopeBias;
+    finalBias += terrainShadowParams.x * terrainShadowParams.y;
     biasedDepth -= finalBias;
 
 
@@ -133,15 +142,15 @@ float shadowSampleESM(float4 shadowPos, float2 shadowUV, int cascade, float rece
     float slopeFactor = 1.0 - pow(ndotlgeo, 11); // 0 for parallel surfaces, 1 for perpendicular
     float dynamicSlopeBias = PCF_slopeBias * slopeFactor;
 
-    float biasLerp = lerp(PCF_bias * 2, PCF_bias2 * 2, step(0.4, ndotlgeo)) + dynamicSlopeBias;
+    float biasLerp = lerp(PCF_bias, PCF_bias2, step(0.4, ndotlgeo)) + dynamicSlopeBias;
     float shadow = 0.0;
     float sampleCount = 0.0;
 
     // Use blue noise sampling pattern for ESM
     for (int i = 0; i < 9; i++) {
-        float2 offset = sampleBlueNoise9(i) * shadowRcpRes * 0.5; // Blue noise within small radius
+        float2 offset = sampleBlueNoise9(i) * shadowRcpRes * 2.0; // Blue noise within small radius
         // Use tex2D with hardware bilinear filtering instead of tex2Dlod
-        float sampledDepth = tex2D(sampShadow, mapShadowToAtlas(shadowUV + offset * 0, cascade).xy).r / ESM_scale;
+        float sampledDepth = tex2D(sampShadow, mapShadowToAtlas(shadowUV + offset, cascade).xy).r / ESM_scale;
         shadow += (sampledDepth >= receiverDepth - biasLerp) ? 1.0 : 0.0;
         sampleCount += 1.0;
     }

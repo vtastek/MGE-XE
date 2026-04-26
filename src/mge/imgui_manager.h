@@ -134,6 +134,7 @@ public:
     static float GetPCFBias();
     static float GetPCFBias2();
     static float GetPCFSlopeBias();
+    static float GetPCFTerrainBias();
     static bool GetShowPCFInterface();
     static void TogglePCFInterface();
 
@@ -323,6 +324,7 @@ private:
     static float pcfBias;              // Depth bias to prevent acne
     static float pcfBias2;             // Second depth bias for lerp
     static float pcfSlopeBias;         // Slope-based bias to prevent acne on angled surfaces
+    static float pcfTerrainBias;       // Extra bias added only to terrain receivers (near cascade, all modes)
 
     // Debug interface controls
     static int bboxVisualizationMode;  // 0=off, 1=objects, 2=lights
