@@ -82,6 +82,18 @@ float4 LandscapePS(LandVertOut IN) : COLOR0 {
     float detail = tex2D(sampDetail, IN.texcoord * 333).g + 0.5;
     detail *= 0.5 * tex2D(sampDetail, IN.texcoord * 90).g + 0.75;
 
+#ifdef USE_HLSL_PIPELINE
+    // Linearize albedo, sun, ambient. Keep N·L lighting math; it operates on
+    // whatever space we feed it. Final brightness scaled by intensityScalar
+    // (shared with core-hlsl) so DL and FFE move together.
+    float3 albedoLin = toLinearSrgb(result);
+    float3 sunColLin = toLinearSrgb(sunCol);
+    float3 sunAmbLin = toLinearSrgb(sunAmb);
+    float3 lit = albedoLin * (sunColLin * saturate(dot(-sunVec, normal)) + sunAmbLin) * detail;
+    lit *= intensityScalar;
+    result = fogApplyLinearAgX(lit, toLinearSrgb(fogColFar), IN.fog.a);
+    return float4(result, 1);
+#else
     // Lighting
     result *= sunCol * saturate(dot(-sunVec, normal)) + sunAmb;
     result *= detail;
@@ -89,6 +101,7 @@ float4 LandscapePS(LandVertOut IN) : COLOR0 {
     // Fogging
     result = fogApply(result, IN.fog);
     return float4(result, 1);
+#endif
 }
 
 DepthVertOut DepthLandVS(float4 pos: POSITION, float2 texcoord: TEXCOORD0) {

@@ -153,6 +153,11 @@ struct ConfigurationStruct {
         float TerrainBias;  // Extra bias added only to terrain receivers in near cascade
     } PCF;
 
+    // Linear-light intensity multiplier shared by HLSL FFE and DL HLSL-pipeline
+    // branches. Tunes how much headroom AgX gets before the sigmoid; legacy
+    // paths ignore this.
+    float IntensityScalar;
+
     struct {
         float SunMult[10];
         float AmbMult[10];

@@ -1276,6 +1276,7 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             resolveAndCache(hlslShader.vsConstantTable, "time", hlslShader.regTime);
             resolveAndCache(hlslShader.psConstantTable, "normres", hlslShader.regNormres);
             resolveAndCache(hlslShader.psConstantTable, "debugMode", hlslShader.regDebugMode);
+            resolveAndCache(hlslShader.psConstantTable, "intensityScalar", hlslShader.regIntensityScalar);
             hlslShader.dynamicConstsResolved = true;
         }
 
@@ -1409,6 +1410,10 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             cmdBuf->recordSetPSConstantF(hlslShader.regDebugMode.reg, v, 1);
         }
         cmdBuf->recordSetPSConstantF(hlslShader.regFogColNear.reg != REG_INVALID ? hlslShader.regFogColNear.reg : 255, fogColor, 1);
+        if (hlslShader.regIntensityScalar.reg != REG_INVALID) {
+            float v[4] = { ImGuiManager::GetIntensityScalar(), 0, 0, 0 };
+            cmdBuf->recordSetPSConstantF(hlslShader.regIntensityScalar.reg, v, 1);
+        }
 
         // VS dynamic constants
         if (hlslShader.regTexgenTransform.reg != REG_INVALID) {
@@ -1573,6 +1578,8 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
 
         D3DXHANDLE hFogColNear = hlslShader.psConstantTable->GetConstantByName(NULL, "fogColNear");
         if (hFogColNear) hlslShader.psConstantTable->SetVector(device, hFogColNear, (D3DXVECTOR4*)fogColor);
+        D3DXHANDLE hIntensityScalar = hlslShader.psConstantTable->GetConstantByName(NULL, "intensityScalar");
+        if (hIntensityScalar) hlslShader.psConstantTable->SetFloat(device, hIntensityScalar, ImGuiManager::GetIntensityScalar());
 
         D3DXHANDLE hTexgenTransform = hlslShader.vsConstantTable->GetConstantByName(NULL, "texgenTransform");
         if (hTexgenTransform) {
@@ -2905,6 +2912,12 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                             float v[4] = { ImGuiManager::GetHeightBlendStrength(), ImGuiManager::GetHeightBlendContrast(), 0, 0 };
                             device->SetPixelShaderConstantF(23, v, 1);
                         }
+                        // c26 intensityScalar (statically declared in common.hlsl). Batch
+                        // shaders skip dynamic resolution, so push by register here.
+                        {
+                            float v[4] = { ImGuiManager::GetIntensityScalar(), 0, 0, 0 };
+                            device->SetPixelShaderConstantF(26, v, 1);
+                        }
                         // Set shadow matrices using hoisted view-to-shadow transforms
                         if (hlslShader.hShadowWorldViewProj) {
                             hlslShader.vsConstantTable->SetMatrixArray(device, hlslShader.hShadowWorldViewProj, shadowViewToClip, 2);
@@ -3012,6 +3025,18 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
         D3DXVec4Transform(&eyeW, &origin, &invView);
         float falloff[4] = { 2560.0f, 1280.0f, eyeW.x, eyeW.y };
         device->SetVertexShaderConstantF(73, falloff, 1);
+    }
+
+    // Push HLSL FFE near-fog params (c49=nearFogStart, c50=nearFogRange) per
+    // replay so XE FixedFuncEmu_VS::fogMWScalar reaches 0 at MW view distance
+    // — same point DL begins blending. Without this push the registers stay
+    // stale and input.fog falls apart, mismatching the DL horizon.
+    {
+        float fogParams[8] = {
+            DistantLand::s_staging.fogNearStart, 0, 0, 0,
+            DistantLand::s_staging.fogNearEnd,   0, 0, 0,
+        };
+        device->SetVertexShaderConstantF(49, fogParams, 2);
     }
 
     FixedFunctionShader::logCellCrossFrame(sceneCount == 0 ? "REPLAY0-BEGIN" : "REPLAY-BEGIN", fb);

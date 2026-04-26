@@ -52,11 +52,31 @@ float4 SkyPS(SkyVertOut IN, float2 vpos : VPOS) : COLOR0 {
         c *= IN.color;
     }
 
+#ifdef USE_HLSL_PIPELINE
+    // Sky is the horizon reference everything else lerps toward, so the gradient
+    // and any sun/moon billboard need to live in the same linear → AgX chain
+    // the FFE near-field uses. Skip USE_SCATTERING — simple horizon-to-zenith
+    // lerp like the non-scattering branch of fogColourSky.
+    if (hasAlpha) {
+        c.rgb = toLinearSrgb(c.rgb);
+    }
+    if (hasVCol) {
+        float3 dir = normalize(IN.skypos.xyz);
+        float3 fogFarLin = toLinearSrgb(fogColFar);
+        float3 skyColLin = toLinearSrgb(skyCol);
+        float t = 1 - pow(saturate(1 - 2.22 * saturate(dir.z - 0.075)), 1.15);
+        c.rgb = lerp(fogFarLin, skyColLin, t);
+        c.rgb += ditherSky[vpos.x % 4][vpos.y % 4];
+    }
+    c.rgb *= intensityScalar;
+    c.rgb = ToneMap_AgX_Linear(c.rgb);
+#else
     if(hasVCol) {
         // Moon shadow cutout. Use colour from scattering for sky (but preserves alpha)
         float4 f = fogColourSky(normalize(IN.skypos.xyz));
         c.rgb = f.rgb + ditherSky[vpos.x % 4][vpos.y % 4];
     }
+#endif
 
     return c;
 }
@@ -70,5 +90,9 @@ SkyVertOut CloudsVS(StatVertIn IN) {
 
 float4 CloudsPS(SkyVertOut IN) : COLOR0 {
     float4 c = IN.color * tex2D(sampBaseTex, IN.texcoords);
+#ifdef USE_HLSL_PIPELINE
+    c.rgb = toLinearSrgb(c.rgb) * intensityScalar;
+    c.rgb = ToneMap_AgX_Linear(c.rgb);
+#endif
     return c;
 }

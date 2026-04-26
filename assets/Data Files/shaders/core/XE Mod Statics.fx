@@ -83,8 +83,19 @@ float4 StaticPS (StatVertOut IN): COLOR0 {
     float range = IN.texcoords_range.z;
 
     float4 result = tex2D(sampBaseTex, texcoords);
+
+#ifdef USE_HLSL_PIPELINE
+    // IN.color.rgb is the VS-baked product (vertex color × per-vertex sun/ambient lighting).
+    // Re-gamma it to approximate linear so AgX consumes scene-referred values matching
+    // the FFE near-field path. Same density-driven fog factor as legacy (IN.fog.a).
+    float3 albedoLin = toLinearSrgb(result.rgb);
+    float3 lightLin = pow(IN.color.rgb + 1e-6, 2.2);
+    float3 lit = albedoLin * lightLin * intensityScalar;
+    result.rgb = fogApplyLinearAgX(lit, toLinearSrgb(fogColFar), IN.fog.a);
+#else
     result.rgb *= IN.color.rgb;
     result.rgb = fogApply(result.rgb, IN.fog);
+#endif
 
     // Alpha to coverage conversion
     result.a = calc_coverage(result.a, 133.0/255.0, 2.0);

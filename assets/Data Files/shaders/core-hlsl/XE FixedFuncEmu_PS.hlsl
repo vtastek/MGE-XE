@@ -529,6 +529,13 @@ float4 ps_main(VS_OUTPUT input, float2 pixelPos : VPOS) : COLOR{
 	
 	//c.rgb = diffuseLight.rgb;
 	//c = diffuse * float4(1,1,1,texColor.a);
+
+	// Linear near fog applied in linear color before AgX. input.fog is the linear
+	// MW ramp from the VS (nearFogStart/nearFogRange driven), reaching 0 at MW
+	// view distance — the same point DL begins blending — so near scene and DL
+	// share a horizon color under AgX.
+	c.rgb = lerp(toLinear(fogColNear), c.rgb, input.fog);
+
 	c.rgb = ToneMap_AgX(c.rgb, 0);
 	//c.rgb = 0.16;
 	//c.rgb = encode3(c.rgb);
@@ -665,7 +672,5 @@ float4 ps_main(VS_OUTPUT input, float2 pixelPos : VPOS) : COLOR{
 		c.rgb = debugColor;
 	}
 
-	// Apply fog --will enable when all rendering goes through HLSL with unified fogging.
-	//c.rgb = lerp(fogColNear, c.rgb , saturate(exp(-0.0002 * length(input.viewPos))));
 	return c;
 }

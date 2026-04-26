@@ -182,6 +182,7 @@ public:
     static D3DXHANDLE ehRippleOrigin;
     static D3DXHANDLE ehWaveHeight;
     static D3DXHANDLE ehDisplacementFalloff;
+    static D3DXHANDLE ehIntensityScalar;
 
     static std::function<void(IDirect3DSurface9*)> captureScreenHandler;
     static bool captureScreenWithUI;

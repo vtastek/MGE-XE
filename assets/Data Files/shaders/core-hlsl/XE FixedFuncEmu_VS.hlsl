@@ -159,9 +159,12 @@ float4 skinWorld(float4 pos, float4 blend) {
 
 
 
-// Fog calculation
+// Fog calculation. Linear ramp matching DL's near-fog formula (and MW's classic
+// linear fog), so the horizon reaches full fog at MW view distance — same point
+// DL begins blending in. nearFogStart/nearFogRange come from c49/c50 pushed
+// per-replay from s_staging.fogNearStart / fogNearEnd.
 float fogMWScalar(float dist) {
-    return saturate((nearFogRange - dist) / (nearFogRange - nearFogStart));
+    return saturate((nearFogRange - dist) / max(nearFogRange - nearFogStart, 1.0));
 }
 
 #ifdef HAS_GRASS

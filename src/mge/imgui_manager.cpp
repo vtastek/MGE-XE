@@ -27,6 +27,8 @@ float ImGuiManager::pcfBias2 = 0.0038f;          // Second depth bias for lerp
 float ImGuiManager::pcfSlopeBias = 0.0047f;      // Slope-based bias to prevent acne on angled surfaces
 float ImGuiManager::pcfTerrainBias = 0.02f;      // Extra bias for terrain receivers (near cascade, all modes)
 
+float ImGuiManager::intensityScalar = 10.0f;     // HLSL-pipeline unified-look intensity multiplier
+
 // Debug interface controls
 int ImGuiManager::bboxVisualizationMode = 0;
 bool ImGuiManager::disableHiZCulling = false;
@@ -198,7 +200,9 @@ bool ImGuiManager::Initialize(HWND hwnd, IDirect3DDevice9* device) {
     pcfBias2 = Configuration.PCF.Bias2;
     pcfSlopeBias = Configuration.PCF.SlopeBias;
     pcfTerrainBias = Configuration.PCF.TerrainBias;
-    
+    intensityScalar = Configuration.IntensityScalar;
+
+
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -363,6 +367,10 @@ void ImGuiManager::RenderPCFFilteringInterface() {
         ImGui::SliderFloat("Terrain Bias (near)", &pcfTerrainBias, 0.0f, 0.02f, "%.4f");
 
         ImGui::Separator();
+        ImGui::Text("HLSL Unified Look");
+        ImGui::SliderFloat("Intensity", &intensityScalar, 0.5f, 30.0f, "%.2f");
+
+        ImGui::Separator();
         ImGui::Checkbox("Show Demo Window", &showDemo);
         
         ImGui::Text("Press F11 to toggle this interface");
@@ -379,6 +387,7 @@ void ImGuiManager::RenderPCFFilteringInterface() {
         Configuration.PCF.Bias2 = pcfBias2;
         Configuration.PCF.SlopeBias = pcfSlopeBias;
         Configuration.PCF.TerrainBias = pcfTerrainBias;
+        Configuration.IntensityScalar = intensityScalar;
         Configuration.SaveSettings();
     }
 
@@ -396,6 +405,7 @@ float ImGuiManager::GetPCFBias() { return pcfBias; }
 float ImGuiManager::GetPCFBias2() { return pcfBias2; }
 float ImGuiManager::GetPCFSlopeBias() { return pcfSlopeBias; }
 float ImGuiManager::GetPCFTerrainBias() { return pcfTerrainBias; }
+float ImGuiManager::GetIntensityScalar() { return intensityScalar; }
 bool ImGuiManager::GetShowPCFInterface() { return showPCFInterface; }
 
 void ImGuiManager::TogglePCFInterface() { 
@@ -416,6 +426,7 @@ void ImGuiManager::TogglePCFInterface() {
         Configuration.PCF.Bias2 = pcfBias2;
         Configuration.PCF.SlopeBias = pcfSlopeBias;
         Configuration.PCF.TerrainBias = pcfTerrainBias;
+        Configuration.IntensityScalar = intensityScalar;
         Configuration.SaveSettings();
     }
 }

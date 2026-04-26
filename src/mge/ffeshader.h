@@ -749,6 +749,7 @@ private:
 
         // Dynamic PS constants resolved on first use
         ConstReg regShadingMode, regFogColNear, regMaterialAlpha, regAlphaRef;
+        ConstReg regIntensityScalar;
         ConstReg regHasVCol, regHasAlpha, regHasBones, regHasAlphaVS;
         ConstReg regTexgenTransform, regBumpMatrix, regBumpLumiScaleBias;
         ConstReg regPCFPenumbraScale, regPCFMinPenumbra, regPCFMaxPenumbra;

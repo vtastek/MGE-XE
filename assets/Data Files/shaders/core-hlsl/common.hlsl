@@ -9,7 +9,13 @@
 // Mathematical constants
 #define PI 3.14159
 #define PI_DIV2 1.57079632679
-#define INTENSITY 10.0
+
+// Linear-light intensity multiplier on lit terms before AgX. Matches DL-side
+// uniform of the same name so near and far scenes scale together. Pinned so
+// the merged-batch replay path (which skips dynamic constant resolution) can
+// push it to a known register.
+uniform float intensityScalar : register(c26);
+#define INTENSITY intensityScalar
 
 // Luminance calculation (ITU-R BT.709)
 float luminance(float3 color) {
