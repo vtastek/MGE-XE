@@ -22,6 +22,9 @@ using FnAddOccluder         = int  (__cdecl*)(
     const float* verts, int vtxCount, int stride, int offY, int offW,
     const unsigned int* tris, int triCount,
     const float* modelMatrix16);
+using FnAddPreTransformedOccluder = int  (__cdecl*)(
+    const float* verts, int vtxCount, int stride, int offY, int offW,
+    const unsigned int* tris, int triCount);
 
 HMODULE       g_module            = nullptr;
 FnIsMaskReady g_isMaskReady       = nullptr;
@@ -33,6 +36,7 @@ FnGetSnapshotViewProj g_getViewProj      = nullptr;  // optional
 FnGetSnapshotAgeMs    g_getAgeMs         = nullptr;  // optional
 FnGetMaskResolution   g_getMaskRes       = nullptr;  // optional
 FnAddOccluder         g_addOccluder      = nullptr;  // optional; Phase B expansion
+FnAddPreTransformedOccluder g_addPreTransformedOccluder = nullptr;  // optional; Phase E
 bool          g_probed             = false;
 
 // Frozen ABI codes from the plugin. Match PatchOcclusionCulling.h.
@@ -87,6 +91,8 @@ void MSOCClient::init() {
         GetProcAddress(g_module, "mwse_getMaskResolution"));
     g_addOccluder = reinterpret_cast<FnAddOccluder>(
         GetProcAddress(g_module, "mwse_addOccluder"));
+    g_addPreTransformedOccluder = reinterpret_cast<FnAddPreTransformedOccluder>(
+        GetProcAddress(g_module, "mwse_addPreTransformedOccluder"));
 
     if (!g_isMaskReady || !g_testSphere) {
         LOG::logline("-- MSOC: msoc.dll loaded but required exports missing; disabling");
@@ -101,13 +107,15 @@ void MSOCClient::init() {
         g_getAgeMs = nullptr;
         g_getMaskRes = nullptr;
         g_addOccluder = nullptr;
+        g_addPreTransformedOccluder = nullptr;
         return;
     }
 
-    LOG::logline("-- MSOC: msoc.dll loaded, distant-statics occlusion active%s%s%s",
+    LOG::logline("-- MSOC: msoc.dll loaded, distant-statics occlusion active%s%s%s%s",
                  g_testOBB         ? " (OBB escalation available)" : " (sphere-only plugin)",
                  g_testSphereBatch ? " (batch query available)"    : "",
-                 g_addOccluder     ? " (addOccluder available)"    : "");
+                 g_addOccluder     ? " (addOccluder available)"    : "",
+                 g_addPreTransformedOccluder ? " (pre-transformed occluder available)" : "");
 }
 
 bool MSOCClient::isAvailable() {
@@ -245,4 +253,16 @@ bool MSOCClient::addOccluder(
         verts, vtxCount, stride, offY, offW,
         tris, triCount,
         modelMatrix16) != 0;
+}
+
+bool MSOCClient::addPreTransformedOccluder(
+    const float* verts, int vtxCount, int stride, int offY, int offW,
+    const unsigned int* tris, int triCount)
+{
+    if (!g_addPreTransformedOccluder) {
+        return false;
+    }
+    return g_addPreTransformedOccluder(
+        verts, vtxCount, stride, offY, offW,
+        tris, triCount) != 0;
 }

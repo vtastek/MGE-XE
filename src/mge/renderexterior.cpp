@@ -7,6 +7,7 @@
 #include "phasetimers.h"
 #include "proxydx/d3d8header.h"
 #include "support/log.h"
+#include "terrain_horizon_occluder.h"
 
 #include <algorithm>
 #include <vector>
@@ -138,12 +139,15 @@ void DistantLand::renderDistantLand(ID3DXEffect* e, const D3DXMATRIX* view, cons
         }
     }
 
-    // MOREFPS phase 7: feed tile OBBs into MSOC's mask for NEXT frame.
-    // Runs after Render to guarantee (in IPC mode) that visLandShared's
-    // async fetch has completed. Submissions queued here become part of
-    // frame N+1's mask, matching the existing double-buffer snapshot
-    // one-frame-latency contract.
-    contributeDistantLandOccluders();
+    // MOREFPS phase 7 / E: horizon-curtain occluder contribution moved
+    // OUT of this function — renderDistantLand is also called for the
+    // water-reflection and shadow-cast passes, which use different view
+    // matrices but our contribution always projects through mwView. We
+    // were rebuilding the same curtain 3-4× per frame and submitting all
+    // of them to the plugin's queue, which then rasterized duplicates.
+    // The call site moved to the main exterior render path in
+    // renderStage0 / renderStage1 so it fires exactly once per frame
+    // after visLand is populated.
 }
 
 // Phase D (replaces the subsample-based Phase C): submit each visible
@@ -160,136 +164,261 @@ void DistantLand::renderDistantLand(ID3DXEffect* e, const D3DXMATRIX* view, cons
 // whole mesh until the running total would exceed the cap, then stop.
 // A typical Morrowind draw distance puts 1-9 tiles (32768x32768 each)
 // in view, so budget usually covers most or all of them.
+// Phase E: horizon-curtain terrain occluder.
+//
+// Instead of rasterizing raw terrain triangles (which over-culls statics
+// sitting ON the hill surface, because MOC's min-depth test on a filled
+// hill-top volume buries anything with a nearer center), we build a 1D
+// screen-space silhouette and emit a ~120-triangle "curtain" that hangs
+// from the silhouette to the screen bottom at the terrain's FAR depth.
+//
+// Why this is conservative in the right direction: a static on top of a
+// hill projects ABOVE the silhouette (y > h[c]) so is never tested
+// against the curtain. A static behind the hill projects BELOW the
+// silhouette and has center depth < terrain-far, so it's correctly
+// reported OCCLUDED.
+//
+// Algorithm: reference impl in terrain_horizon_occluder.{h,cpp} (dropped
+// from D:/Modding/horizon/). We drive the "horizon build" phase ourselves
+// by projecting each cached tile's triangles through the current view-
+// projection and feeding `thc_horizon_test_and_update` once per triangle,
+// then call the reference's simplify + emit, fix up the vertex layout for
+// MOC's consumption, and submit via mwse_addPreTransformedOccluder.
 void DistantLand::contributeDistantLandOccluders() {
     MGE_SCOPED_TIMER("contributeDistantLandOccluders");
 
-    // Rate-limited diagnostic: log which early-return guard fired so
-    // we can tell why no occluder submission is happening. Sampled
-    // every 60th invocation to stay quiet on the steady state.
     static int diagGuardFrame = 0;
     const bool emitDiag = (diagGuardFrame++ % 60) == 0;
 
     if (!Configuration.UseOcclusionCulling) {
-        if (emitDiag) LOG::logline("-- MSOC occluder: land skipped — UseOcclusionCulling=false");
+        if (emitDiag) LOG::logline("-- MSOC occluder: horizon skipped — UseOcclusionCulling=false");
         return;
     }
     if (!MSOCClient::isAvailable()) {
-        if (emitDiag) LOG::logline("-- MSOC occluder: land skipped — MSOCClient not available");
+        if (emitDiag) LOG::logline("-- MSOC occluder: horizon skipped — MSOCClient not available");
         return;
     }
     if (landMeshes.empty()) {
-        if (emitDiag) LOG::logline("-- MSOC occluder: land skipped — landMeshes map is empty");
+        if (emitDiag) LOG::logline("-- MSOC occluder: horizon skipped — landMeshes map is empty");
         return;
     }
 
-    // Small safety margin under the plugin cap so other consumers (if
-    // any arrive) still have room to submit. 3800 / 4096 ≈ 93%.
-    constexpr int kTriBudget = 3800;
+    // Horizon state persists across frames (reset at the top of each
+    // contribution). One allocation at first-call, reused thereafter.
+    constexpr int   kHorizonResolution = 512;
+    constexpr int   kMaxSamples        = 60;
+    constexpr float kEpsH              = 0.01f;  // ~1% of clip-y range per sample
+    constexpr float kEpsD              = 1.0e30f; // effectively disable depth-driven splits
+    constexpr int   kTileAlign         = 16;     // 32-px HiZ tiles on a 512-col horizon
+    constexpr float kNdcYBottom        = -1.1f;  // curtain bottom slightly off-screen
 
-    // Gather each visible tile + its planar distance, so we can pick
-    // the closest-N under the tri budget. Tiles without a captured
-    // mesh (shouldn't happen for land tiles, but defensive) fall
-    // through — one fewer contribution, no correctness risk.
-    struct Candidate {
-        const LandMeshCache* mesh;
-        float                distSq;
-    };
-    static std::vector<Candidate> candidates;
-    candidates.clear();
+    // Conservatism knobs — both push the curtain in the "under-cull"
+    // direction. Statics close to the silhouette or close to terrain's
+    // far depth stay tested instead of culled.
+    //   - y safety: lower the curtain top by this clip-y amount (NDC).
+    //     0.04 ≈ 5 pixels on a 256-row mask — enough to cover projection
+    //     noise + ROAM tessellation edge approximations.
+    //   - w safety: multiply max clip-w (depth) by this factor so the
+    //     curtain rasterizes "deeper" than measured, preventing culls
+    //     when a static happens to share terrain's far depth.
+    constexpr float kYSafetyMargin = 0.04f;
+    constexpr float kWSafetyFactor = 1.10f;
 
+    static thc_horizon_t horizon{};
+    static thc_simplify_workspace_t ws{};
+    static bool horizonInitialized = false;
+    if (!horizonInitialized) {
+        if (thc_horizon_init(&horizon, kHorizonResolution, nullptr, nullptr) != 0) {
+            LOG::logline("-- MSOC occluder: thc_horizon_init failed; disabling horizon path");
+            return;
+        }
+        ws.size_bytes = thc_simplify_workspace_required_bytes(kHorizonResolution, kMaxSamples);
+        ws.memory = malloc(ws.size_bytes);
+        if (!ws.memory) {
+            LOG::logline("-- MSOC occluder: simplify workspace alloc failed; disabling horizon path");
+            return;
+        }
+        horizonInitialized = true;
+    }
+    thc_horizon_reset(&horizon);
+
+    // World-to-clip matrix (row-major D3DX convention, row-vector * M).
+    // clip = world * view * proj; we pre-multiply once per frame.
+    const D3DXMATRIX viewProj = mwView * mwProj;
+
+    // Per-vertex horizon build (replaces per-triangle for cost).
+    //
+    // Each tile's projected verts are dropped into a per-tile per-column
+    // scratch (max-y, max-w per column the tile spans). After the scan,
+    // submit one horizon update per active column. Per-vertex misses
+    // triangle-interior silhouette contributions (a vert mid-edge of a
+    // peak triangle isn't sampled), but that's strictly UNDER-cull —
+    // safer direction. ROAM puts vertex density on silhouettes, so the
+    // visual result is essentially the same with a fraction of the work.
     int visibleLandTiles = 0;
     int lookupMisses = 0;
-    auto collectWithDiag = [&](const RenderMesh& m) {
+    int verticesFed = 0;
+    int columnsUpdated = 0;
+    int columnsPruned = 0;
+
+    // Per-tile column scratch. Sized to the horizon resolution so any
+    // tile, however wide, fits without resizing. Reset per tile by only
+    // touching the columns this tile contributes to (tracked in
+    // tileTouchedCols).
+    static std::vector<float>    tileMaxY;       // [resolution]
+    static std::vector<float>    tileMaxW;       // [resolution]
+    static std::vector<uint16_t> tileTouchedCols; // sparse list of cols updated this tile
+    if ((int)tileMaxY.size() < kHorizonResolution) {
+        tileMaxY.assign(kHorizonResolution, -1e30f);
+        tileMaxW.assign(kHorizonResolution, -1e30f);
+        tileTouchedCols.reserve(kHorizonResolution);
+    }
+
+    const float halfSpan = 0.5f * (float)(kHorizonResolution - 1);
+
+    auto feedTile = [&](const RenderMesh& m) {
         ++visibleLandTiles;
         auto it = landMeshes.find(m.vBuffer);
         if (it == landMeshes.end()) {
             ++lookupMisses;
             return;
         }
-        const float dx = m.sphere.center.x - eyePos.x;
-        const float dy = m.sphere.center.y - eyePos.y;
-        candidates.push_back({ &it->second, dx * dx + dy * dy });
+        const LandMeshCache& mesh = it->second;
+        if (mesh.positions.empty()) return;
+
+        tileTouchedCols.clear();
+
+        // Project each vertex; bin into per-column max-y / max-w for
+        // this tile.
+        for (const D3DXVECTOR3& p : mesh.positions) {
+            // D3DX row-major: clip = (p.x, p.y, p.z, 1) * viewProj
+            const float cx = p.x * viewProj._11 + p.y * viewProj._21 + p.z * viewProj._31 + viewProj._41;
+            const float cy = p.x * viewProj._12 + p.y * viewProj._22 + p.z * viewProj._32 + viewProj._42;
+            const float cw = p.x * viewProj._14 + p.y * viewProj._24 + p.z * viewProj._34 + viewProj._44;
+            if (cw <= 1.0e-4f) continue;       // behind camera
+
+            const float inv = 1.0f / cw;
+            const float ndcX = cx * inv;
+            const float ndcY = cy * inv;
+
+            if (ndcX < -1.0f || ndcX > 1.0f) continue;  // off-screen X
+            if (ndcY < -1.0f) continue;                  // below screen
+            const float clampedY = (ndcY > 1.0f) ? 1.0f : ndcY;
+
+            int col = (int)floorf((ndcX + 1.0f) * halfSpan);
+            if (col < 0) col = 0;
+            if (col >= kHorizonResolution) col = kHorizonResolution - 1;
+
+            ++verticesFed;
+            // First-touch tracking: empty marker is -1e30, anything
+            // above counts as "touched this tile."
+            if (tileMaxY[col] < -1e29f) {
+                tileTouchedCols.push_back((uint16_t)col);
+                tileMaxY[col] = clampedY;
+                tileMaxW[col] = cw;
+            } else {
+                if (clampedY > tileMaxY[col]) tileMaxY[col] = clampedY;
+                if (cw > tileMaxW[col])       tileMaxW[col] = cw;
+            }
+        }
+
+        // Submit one horizon update per touched column. Reset scratch
+        // back to sentinel as we go so the next tile starts clean.
+        for (uint16_t col : tileTouchedCols) {
+            thc_node_projection_t proj;
+            proj.c0        = (int)col;
+            proj.c1        = (int)col;
+            proj.y_upper   = tileMaxY[col];
+            proj.far_depth = tileMaxW[col] * kWSafetyFactor;
+
+            if (thc_horizon_test_and_update(&horizon, &proj)) {
+                ++columnsPruned;
+            } else {
+                ++columnsUpdated;
+            }
+            tileMaxY[col] = -1e30f;   // reset for next tile
+            tileMaxW[col] = -1e30f;
+        }
     };
 
     if (Configuration.UseSharedMemory) {
         visLandShared.Reset();
-        while (!visLandShared.AtEnd()) collectWithDiag(visLandShared.Next());
+        while (!visLandShared.AtEnd()) feedTile(visLandShared.Next());
     } else {
         visLand.Reset();
-        while (!visLand.AtEnd()) collectWithDiag(visLand.Next());
+        while (!visLand.AtEnd()) feedTile(visLand.Next());
     }
 
-    if (candidates.empty()) {
+    if (verticesFed == 0) {
         if (emitDiag) {
             LOG::logline(
-                "-- MSOC occluder: land skipped — no candidates (visible=%d lookupMisses=%d mapSize=%u)",
-                visibleLandTiles, lookupMisses, (unsigned)landMeshes.size());
+                "-- MSOC occluder: horizon empty — visibleTiles=%d lookupMisses=%d",
+                visibleLandTiles, lookupMisses);
         }
         return;
     }
 
-    // Closest-first sort — nearest silhouettes matter most for
-    // occluding statics at mid-distance; far tiles are discretionary.
-    std::sort(candidates.begin(), candidates.end(),
-              [](const Candidate& a, const Candidate& b) { return a.distSq < b.distSq; });
+    // Simplify to ~60 adaptive samples, snapping to 16-column (~32 pixel)
+    // alignment so each curtain quad spans a whole HiZ tile column.
+    static thc_sample_t samples[kMaxSamples];
+    const int nSamples = thc_horizon_simplify(
+        &horizon, &ws, samples, kMaxSamples, kEpsH, kEpsD, kTileAlign);
+    if (nSamples < 2) return;
 
-    // Build one combined vertex + index buffer across selected tiles.
-    // Static scratch to avoid reallocation each frame.
-    static std::vector<float>    vertScratch;   // (x, y, z, w) stride 16
-    static std::vector<uint32_t> triScratch;    // 3 indices per triangle
-    vertScratch.clear();
-    triScratch.clear();
-
-    int totalTris  = 0;
-    int tilesTaken = 0;
-    for (const auto& cand : candidates) {
-        const LandMeshCache& mesh = *cand.mesh;
-        const int tileTris = (int)(mesh.indices.size() / 3);
-        if (tileTris <= 0) continue;
-
-        // Greedy cap: once a tile would push us past budget, stop.
-        // Far tiles beyond that point contribute nothing this frame,
-        // which is safe — missing horizon coverage is under-cull, not
-        // over-cull.
-        if (totalTris + tileTris > kTriBudget) break;
-
-        const uint32_t baseVtx = (uint32_t)(vertScratch.size() / 4);
-
-        // Append positions padded to (x, y, z, w=1) matching the
-        // stride=16 / offY=4 / offW=12 layout we pass to addOccluder.
-        for (const auto& p : mesh.positions) {
-            vertScratch.push_back(p.x);
-            vertScratch.push_back(p.y);
-            vertScratch.push_back(p.z);
-            vertScratch.push_back(1.0f);
+    // Apply y safety margin: pull the silhouette top down by a small
+    // clip-y amount so the curtain hangs strictly below the measured
+    // horizon. Statics whose tops are within `kYSafetyMargin` of the
+    // silhouette stay tested instead of culled. Skip the sentinel
+    // (THC_Y_BELOW) — those columns saw no terrain, no margin needed.
+    for (int i = 0; i < nSamples; ++i) {
+        if (samples[i].h > -1e29f) {
+            samples[i].h -= kYSafetyMargin;
         }
-
-        // Rebase and copy the index list into the combined buffer.
-        // baseVtx is the offset of this tile's first vertex in the
-        // combined vertex array.
-        for (uint32_t idx : mesh.indices) {
-            triScratch.push_back(baseVtx + idx);
-        }
-
-        totalTris  += tileTris;
-        tilesTaken += 1;
     }
 
-    if (totalTris == 0) return;
+    // Emit curtain triangles in the reference's {x, y, z_depth, w=1} layout.
+    // Capacity: 6 verts per segment × (nSamples - 1) segments.
+    static std::vector<thc_curtain_vertex_t> curtainVerts;
+    curtainVerts.resize(6 * (nSamples - 1));
+    const int triCount = thc_emit_curtains(
+        samples, nSamples, kNdcYBottom,
+        curtainVerts.data(), (int)curtainVerts.size());
+    if (triCount <= 0) return;
 
-    const int vtxCount = (int)(vertScratch.size() / 4);
-    const bool ok = MSOCClient::addOccluder(
-        vertScratch.data(), vtxCount,
+    // Layout fixup for MOC: the reference emits NDC x,y with w=1 and the
+    // curtain depth in z. MOC with matrix=nullptr expects clip-space
+    // (x, y, w) where x/w = NDC_x internally, and depth = 1/w. Convert:
+    //   stored_x = ndc_x * depth_w
+    //   stored_y = y_top * depth_w
+    //   stored_w = depth_w
+    // (z slot ignored by MOC with the default stride=16, offW=12 layout.)
+    const int vtxCount = triCount * 3;
+    for (int i = 0; i < vtxCount; ++i) {
+        thc_curtain_vertex_t& v = curtainVerts[i];
+        const float d = v.z;
+        v.x *= d;
+        v.y *= d;
+        v.w  = d;
+    }
+
+    // Build index buffer once (straight 0..vtxCount-1 — emit_curtains
+    // writes tris as consecutive 3-vert groups, no index sharing).
+    static std::vector<uint32_t> curtainIdx;
+    curtainIdx.resize(vtxCount);
+    for (int i = 0; i < vtxCount; ++i) curtainIdx[i] = (uint32_t)i;
+
+    const bool ok = MSOCClient::addPreTransformedOccluder(
+        reinterpret_cast<const float*>(curtainVerts.data()), vtxCount,
         /*stride*/ 16, /*offY*/ 4, /*offW*/ 12,
-        triScratch.data(), totalTris,
-        /*modelMatrix*/ nullptr);   // positions are world-space already
+        curtainIdx.data(), triCount);
 
     static int diagFrameCounter = 0;
     if ((diagFrameCounter++ % 60) == 0) {
-        LOG::logline("-- MSOC occluder: land %s — tiles=%d/%u tris=%d verts=%d",
+        LOG::logline("-- MSOC occluder: horizon %s — tiles=%d verts=%d colsUpdated=%d colsPruned=%d samples=%d curtainTris=%d",
                      ok ? "submitted" : "REJECTED",
-                     tilesTaken, (unsigned)candidates.size(),
-                     totalTris, vtxCount);
+                     visibleLandTiles, verticesFed,
+                     columnsUpdated, columnsPruned,
+                     nSamples, triCount);
     }
 }
 

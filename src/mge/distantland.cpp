@@ -66,6 +66,14 @@ void DistantLand::renderStage0() {
                     effect->BeginPass(PASS_RENDERLAND);
                     renderDistantLand(effect, &mwView, &distProj);
                     effect->EndPass();
+
+                    // Phase E: feed horizon-curtain occluder into MSOC's
+                    // mask for next frame. Placed here (not inside
+                    // renderDistantLand) because renderDistantLand also
+                    // fires for water reflection and shadow passes, where
+                    // the view differs but our contribution always uses
+                    // mwView — running it once per frame is enough.
+                    contributeDistantLandOccluders();
                 }
 
                 // Draw distant statics, with alpha dissolve as they pass the near view boundary

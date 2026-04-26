@@ -110,4 +110,23 @@ public:
         const float* verts, int vtxCount, int stride, int offY, int offW,
         const unsigned int* tris, int triCount,
         const float* modelMatrix16 = nullptr);
+
+    // Submit triangles already in homogeneous clip space. Plugin skips
+    // the world-to-clip multiply. Use for screen-space occluder
+    // producers like horizon-curtain terrain silhouettes; avoids the
+    // round-trip of transforming clip-space geometry back to world
+    // space just so the plugin can transform it forward again.
+    //
+    // Vertex layout: stride must match a memory pattern MOC can read
+    // directly. Typical is {x, y, z_ignored, w} at stride=16, offY=4,
+    // offW=12 — the MOC default. Depth is derived from 1/w internally,
+    // so `w` carries the clip-space depth the curtain should rasterize
+    // at.
+    //
+    // Returns true if queued, false if the plugin rejected it (over
+    // budget, invalid args, or pre-transformed export absent on an
+    // older plugin).
+    static bool addPreTransformedOccluder(
+        const float* verts, int vtxCount, int stride, int offY, int offW,
+        const unsigned int* tris, int triCount);
 };
