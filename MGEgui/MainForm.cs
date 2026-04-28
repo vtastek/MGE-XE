@@ -300,7 +300,8 @@ namespace MGEgui {
 
         private static Dictionary<string, double> pplFlagsDict = new Dictionary<string, double> {
             { "Always", 0 },
-            { "Interiors only", 1 }
+            { "Interiors only", 1 },
+            { "HLSL", 2 }
         };
         
         private static Dictionary<string, double> windowAlignDict = new Dictionary<string, double> {
@@ -365,6 +366,8 @@ namespace MGEgui {
         private static INIFile.INIVariableDef iniSSName = new INIFile.INIVariableDef("SSName", siniRendState, "Screenshot Name Prefix", INIFile.INIVariableType.String, "Morrowind");
         private static INIFile.INIVariableDef iniSSDir = new INIFile.INIVariableDef("SSDir", siniRendState, "Screenshot Output Directory", INIFile.INIVariableType.String, "");
         private static INIFile.INIVariableDef iniUseSharedMemory = new INIFile.INIVariableDef("UseSharedMemory", siniMisc, "Use Shared Memory", INIFile.INIBoolType.Text, "False");
+        private static INIFile.INIVariableDef iniUseHLSLPipeline = new INIFile.INIVariableDef("UseHLSLPipeline", siniMisc, "Use HLSL Pipeline", INIFile.INIBoolType.Text, "True");
+        private static INIFile.INIVariableDef iniEnableTextureSuffixes = new INIFile.INIVariableDef("EnableTextureSuffixes", siniMisc, "Enable Texture Suffixes", INIFile.INIBoolType.Text, "True");
         // In-game
         private static INIFile.INIVariableDef iniDisableMGE = new INIFile.INIVariableDef("DisableMGE", siniMisc, "MGE Disabled", INIFile.INIBoolType.Text, "False");
         private static INIFile.INIVariableDef iniDisableMWSE = new INIFile.INIVariableDef("DisableMWSE", siniMisc, "Internal MWSE Disabled", INIFile.INIBoolType.Text, "False");
@@ -407,8 +410,8 @@ namespace MGEgui {
         private static INIFile.INIVariableDef iniCaustics = new INIFile.INIVariableDef("Caustics", siniDL, "Water Caustics Intensity", INIFile.INIVariableType.Byte, "50", 0, 100);
         private static INIFile.INIVariableDef iniShadows = new INIFile.INIVariableDef("SunShadows", siniDL, "Sun Shadows", INIFile.INIBoolType.OnOff, "On");
         private static INIFile.INIVariableDef iniShadowDetail = new INIFile.INIVariableDef("SunShadowDetail", siniDL, "Sun Shadow Map Resolution", INIFile.INIVariableType.UInt32, "2048", 1024, 2048);
-        private static INIFile.INIVariableDef iniPixelLighting = new INIFile.INIVariableDef("PPLighting", siniDL, "Per Pixel Shader", INIFile.INIBoolType.OnOff, "Off");
-        private static INIFile.INIVariableDef iniPixelLightingFlags = new INIFile.INIVariableDef("PPLightingFlags", siniDL, "Per Pixel Shader Flags", INIFile.INIVariableType.Dictionary, "Always", pplFlagsDict);
+        private static INIFile.INIVariableDef iniPixelLighting = new INIFile.INIVariableDef("PPLighting", siniDL, "Per Pixel Shader", INIFile.INIBoolType.OnOff, "On");
+        private static INIFile.INIVariableDef iniPixelLightingFlags = new INIFile.INIVariableDef("PPLightingFlags", siniDL, "Per Pixel Shader Flags", INIFile.INIVariableType.Dictionary, "HLSL", pplFlagsDict);
 #endregion
 
         private static INIFile.INIVariableDef[] iniSettings = {
@@ -420,6 +423,7 @@ namespace MGEgui {
             iniFOVAuto, iniFOV, iniUIScale, iniWindowAlignX, iniWindowAlignY,
             iniFogMode, iniHWShader, iniHDRTime, iniFPSCount, iniReduceTexMemUse,
             iniSSFormat, iniSSSuffix, iniSSName, iniSSDir, iniUseSharedMemory,
+            iniUseHLSLPipeline, iniEnableTextureSuffixes,
             // In-game
             iniDisableMGE, iniDisableMWSE, iniD3D8To9Only,
             iniSkipIntro, iniAltCombat,
@@ -1701,6 +1705,7 @@ namespace MGEgui {
 
         private void cbPerPixelLighting_CheckedChanged(object sender, EventArgs e) {
             cmbPerPixelLightFlags.Enabled = cbPerPixelLighting.Enabled;
+            ApplyHLSLTextureMemoryConstraint();
             if (loading) {
                 return;
             }
@@ -1711,6 +1716,34 @@ namespace MGEgui {
                 MessageBox.Show(strings["LightOverrideOff"], Statics.strings["Warning"]);
             }
             bMWLightingReset_Click(null, null);
+        }
+
+        private bool hlslTexMemWarningShown = false;
+
+        private bool IsHLSLModeSelected() {
+            return cbPerPixelLighting.Checked && cmbPerPixelLightFlags.SelectedIndex == 2;
+        }
+
+        private void ApplyHLSLTextureMemoryConstraint() {
+            if (IsHLSLModeSelected()) {
+                cbReduceTextureMemUse.Checked = false;
+                cbReduceTextureMemUse.Enabled = false;
+                if (!loading && !hlslTexMemWarningShown) {
+                    MessageBox.Show(
+                        "HLSL pipeline requires Reduce Texture Memory Use to be OFF. " +
+                        "The texture suffix system needs textures in the managed pool. " +
+                        "The setting has been disabled.",
+                        Statics.strings["Warning"]);
+                    hlslTexMemWarningShown = true;
+                }
+            } else {
+                cbReduceTextureMemUse.Enabled = true;
+                hlslTexMemWarningShown = false;
+            }
+        }
+
+        private void cmbPerPixelLightFlags_SelectedIndexChanged(object sender, EventArgs e) {
+            ApplyHLSLTextureMemoryConstraint();
         }
 
         private void bReportingShowLog_Click(object sender, EventArgs e) {

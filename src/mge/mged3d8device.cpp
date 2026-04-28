@@ -173,12 +173,16 @@ static void processImGuiHotkeys() {
         f11Pressed = f11State;
     }
 
-    // G key: Toggle debug interface (always active)
-    bool gState = (GetAsyncKeyState('G') & 0x8000) != 0;
-    if (gState && !gPressed) {
-        ImGuiManager::ToggleDebugInterface();
+    // G key: Toggle debug interface (gated by hidden mge.ini option, default off)
+    if (Configuration.EnableDebugInterfaceKey) {
+        bool gState = (GetAsyncKeyState('G') & 0x8000) != 0;
+        if (gState && !gPressed) {
+            ImGuiManager::ToggleDebugInterface();
+        }
+        gPressed = gState;
+    } else {
+        gPressed = false;
     }
-    gPressed = gState;
 
     // U: Toggle Hi-Z interface (gated)
     if (ImGuiManager::GetDebugKeysEnabled()) {
@@ -1295,7 +1299,11 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
 
         // Render status overlay
         StatusOverlay::setFPS(calcFPS());
-        StatusOverlay::setFrameNumber(g_frameNumber);
+        if (ImGuiManager::GetShowFrameNumber()) {
+            StatusOverlay::setFrameNumber(g_frameNumber);
+        } else {
+            StatusOverlay::clearFrameNumber();
+        }
         StatusOverlay::show(realDevice);
 
         g_scene.isHUDComplete = true;

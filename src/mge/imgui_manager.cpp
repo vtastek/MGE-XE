@@ -166,6 +166,7 @@ int ImGuiManager::cmdStageScene1 = 0;
 int ImGuiManager::cmdStageUI = 0;
 
 bool ImGuiManager::debugKeysEnabled = false;
+bool ImGuiManager::showFrameNumber = false;
 bool ImGuiManager::handoverLogging = false;
 
 // Stress testing toggles
@@ -443,6 +444,7 @@ void ImGuiManager::OnResetDevice() {
 }
 
 bool ImGuiManager::GetDebugKeysEnabled() { return debugKeysEnabled; }
+bool ImGuiManager::GetShowFrameNumber() { return showFrameNumber; }
 
 void ImGuiManager::RenderDebugInterface() {
     ImGui::SetNextWindowPos(ImVec2(400, 10), ImGuiCond_FirstUseEver);
@@ -450,6 +452,7 @@ void ImGuiManager::RenderDebugInterface() {
 
     if (ImGui::Begin("HLSL Pipeline Debug", &showDebugInterface, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::Checkbox("Enable Debug Hotkeys (F11/U/E/L/F5/F6)", &debugKeysEnabled);
+        ImGui::Checkbox("Show Frame Number Overlay", &showFrameNumber);
         ImGui::Checkbox("Handover Logging (Scene 0/1/2 state)", &handoverLogging);
         ImGui::SameLine();
         if (ImGui::Button("Save Baselines")) {

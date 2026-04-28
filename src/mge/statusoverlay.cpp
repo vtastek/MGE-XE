@@ -91,6 +91,10 @@ void StatusOverlay::setFrameNumber(int frameNum) {
     std::snprintf(frameNumText, sizeof(frameNumText), "F:%d", frameNum);
 }
 
+void StatusOverlay::clearFrameNumber() {
+    frameNumText[0] = 0;
+}
+
 void StatusOverlay::showLastStatus() {
     statusTimeout = GetTickCount() + Configuration.StatusTimeout;
 }

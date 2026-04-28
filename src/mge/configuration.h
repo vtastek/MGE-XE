@@ -111,6 +111,7 @@ struct ConfigurationStruct {
     bool UseHLSLPipeline;  // Use new HLSL compilation instead of ID3DXEffect
     bool EnableTextureSuffixes;  // Enable _paramh / _paramx texture suffix support
     bool UseDistantLandHLSL;  // Use HLSL shaders for Distant Land rendering (Phase 8)
+    bool EnableDebugInterfaceKey;  // Gate the G hotkey that opens the ImGui debug window
 
     struct {
         float zoom, zoomRate, zoomRateTarget;

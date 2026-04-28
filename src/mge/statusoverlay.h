@@ -15,5 +15,6 @@ namespace StatusOverlay {
     void setStatus(const char* s, int priority = PriorityNormal);
     void setFPS(float fps);
     void setFrameNumber(int frameNum);
+    void clearFrameNumber();
     void showLastStatus();
 };

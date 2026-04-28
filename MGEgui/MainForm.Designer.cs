@@ -1017,7 +1017,7 @@ namespace MGEgui {
             this.tpGlobal.Location = new System.Drawing.Point(4, 34);
             this.tpGlobal.Margin = new System.Windows.Forms.Padding(4, 4, 4, 4);
             this.tpGlobal.Name = "tpGlobal";
-            this.tpGlobal.Size = new System.Drawing.Size(1078, 714);
+            this.tpGlobal.Size = new System.Drawing.Size(1078, 746);
             this.tpGlobal.TabIndex = 1;
             this.tpGlobal.Text = "Graphics";
             this.tpGlobal.ToolTipText = "Contains graphics settings like screen size, \nrefresh rate, anti-aliasing, and sh" +
@@ -1029,7 +1029,7 @@ namespace MGEgui {
             this.gbSShot.Anchor = ((System.Windows.Forms.AnchorStyles)(((System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Left) 
             | System.Windows.Forms.AnchorStyles.Right)));
             this.gbSShot.Controls.Add(this.tableLayoutScreenshots);
-            this.gbSShot.Location = new System.Drawing.Point(12, 435);
+            this.gbSShot.Location = new System.Drawing.Point(12, 467);
             this.gbSShot.Margin = new System.Windows.Forms.Padding(4, 4, 4, 4);
             this.gbSShot.Name = "gbSShot";
             this.gbSShot.Padding = new System.Windows.Forms.Padding(4, 4, 4, 4);
@@ -1214,6 +1214,9 @@ namespace MGEgui {
             | System.Windows.Forms.AnchorStyles.Right)));
             this.gbScene.Controls.Add(this.cbUseSharedMemory);
             this.gbScene.Controls.Add(this.cbReduceTextureMemUse);
+            this.gbScene.Controls.Add(this.cbPerPixelLighting);
+            this.gbScene.Controls.Add(this.cmbPerPixelLightFlags);
+            this.gbScene.Controls.Add(this.bMWLightSettings);
             this.gbScene.Controls.Add(this.cbAutoFOV);
             this.gbScene.Controls.Add(this.udUIScale);
             this.gbScene.Controls.Add(this.lUIScale);
@@ -1230,7 +1233,7 @@ namespace MGEgui {
             this.gbScene.Margin = new System.Windows.Forms.Padding(4, 4, 4, 4);
             this.gbScene.Name = "gbScene";
             this.gbScene.Padding = new System.Windows.Forms.Padding(4, 4, 4, 4);
-            this.gbScene.Size = new System.Drawing.Size(1050, 213);
+            this.gbScene.Size = new System.Drawing.Size(1050, 245);
             this.gbScene.TabIndex = 1;
             this.gbScene.TabStop = false;
             this.gbScene.Text = "Renderer";
@@ -1871,7 +1874,7 @@ namespace MGEgui {
             this.tabControl.Name = "tabControl";
             this.tabControl.SelectedIndex = 0;
             this.tabControl.ShowToolTips = true;
-            this.tabControl.Size = new System.Drawing.Size(1086, 752);
+            this.tabControl.Size = new System.Drawing.Size(1086, 784);
             this.tabControl.TabIndex = 0;
             // 
             // tpDL
@@ -1963,9 +1966,6 @@ namespace MGEgui {
             // 
             this.gbXEFeatures.Controls.Add(this.cbDLSunShadows);
             this.gbXEFeatures.Controls.Add(this.cmbDLShadowDetail);
-            this.gbXEFeatures.Controls.Add(this.cmbPerPixelLightFlags);
-            this.gbXEFeatures.Controls.Add(this.cbPerPixelLighting);
-            this.gbXEFeatures.Controls.Add(this.bMWLightSettings);
             this.gbXEFeatures.Dock = System.Windows.Forms.DockStyle.Fill;
             this.gbXEFeatures.Location = new System.Drawing.Point(4, 468);
             this.gbXEFeatures.Margin = new System.Windows.Forms.Padding(4, 4, 4, 4);
@@ -2003,38 +2003,39 @@ namespace MGEgui {
             // 
             // cmbPerPixelLightFlags
             // 
-            this.cmbPerPixelLightFlags.Anchor = ((System.Windows.Forms.AnchorStyles)((System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right)));
             this.cmbPerPixelLightFlags.Enabled = false;
             this.cmbPerPixelLightFlags.FormattingEnabled = true;
             this.cmbPerPixelLightFlags.Items.AddRange(new object[] {
             "always on",
-            "interiors only"});
-            this.cmbPerPixelLightFlags.Location = new System.Drawing.Point(304, 88);
+            "interiors only",
+            "HLSL"});
+            this.cmbPerPixelLightFlags.Location = new System.Drawing.Point(300, 200);
             this.cmbPerPixelLightFlags.Margin = new System.Windows.Forms.Padding(4, 4, 4, 4);
             this.cmbPerPixelLightFlags.Name = "cmbPerPixelLightFlags";
-            this.cmbPerPixelLightFlags.Size = new System.Drawing.Size(200, 33);
-            this.cmbPerPixelLightFlags.TabIndex = 11;
+            this.cmbPerPixelLightFlags.Size = new System.Drawing.Size(180, 33);
+            this.cmbPerPixelLightFlags.TabIndex = 26;
             this.cmbPerPixelLightFlags.Text = "always on";
-            // 
+            this.cmbPerPixelLightFlags.SelectedIndexChanged += new System.EventHandler(this.cmbPerPixelLightFlags_SelectedIndexChanged);
+            //
             // cbPerPixelLighting
-            // 
-            this.cbPerPixelLighting.Location = new System.Drawing.Point(27, 78);
+            //
+            this.cbPerPixelLighting.AutoSize = true;
+            this.cbPerPixelLighting.Location = new System.Drawing.Point(18, 205);
             this.cbPerPixelLighting.Margin = new System.Windows.Forms.Padding(4, 4, 4, 4);
             this.cbPerPixelLighting.Name = "cbPerPixelLighting";
-            this.cbPerPixelLighting.Size = new System.Drawing.Size(248, 54);
-            this.cbPerPixelLighting.TabIndex = 1;
+            this.cbPerPixelLighting.Size = new System.Drawing.Size(250, 29);
+            this.cbPerPixelLighting.TabIndex = 25;
             this.cbPerPixelLighting.Text = "Per-pixel lighting shader";
             this.cbPerPixelLighting.UseVisualStyleBackColor = true;
             this.cbPerPixelLighting.CheckedChanged += new System.EventHandler(this.cbPerPixelLighting_CheckedChanged);
-            // 
+            //
             // bMWLightSettings
-            // 
-            this.bMWLightSettings.Anchor = System.Windows.Forms.AnchorStyles.Bottom;
-            this.bMWLightSettings.Location = new System.Drawing.Point(136, 153);
+            //
+            this.bMWLightSettings.Location = new System.Drawing.Point(500, 200);
             this.bMWLightSettings.Margin = new System.Windows.Forms.Padding(4, 4, 4, 4);
             this.bMWLightSettings.Name = "bMWLightSettings";
-            this.bMWLightSettings.Size = new System.Drawing.Size(240, 38);
-            this.bMWLightSettings.TabIndex = 10;
+            this.bMWLightSettings.Size = new System.Drawing.Size(190, 33);
+            this.bMWLightSettings.TabIndex = 27;
             this.bMWLightSettings.Text = "Light Settings...";
             this.bMWLightSettings.UseVisualStyleBackColor = true;
             this.bMWLightSettings.Click += new System.EventHandler(this.bMWLightSettings_Click);
@@ -3333,7 +3334,7 @@ namespace MGEgui {
             // 
             this.AutoScaleDimensions = new System.Drawing.SizeF(144F, 144F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Dpi;
-            this.ClientSize = new System.Drawing.Size(1086, 752);
+            this.ClientSize = new System.Drawing.Size(1086, 784);
             this.Controls.Add(this.tabControl);
             this.Font = new System.Drawing.Font("Segoe UI", 9F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
             this.Icon = global::MGEgui.Properties.Resources.AppIcon;

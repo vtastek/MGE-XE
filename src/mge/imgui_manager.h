@@ -148,6 +148,9 @@ public:
     static void UpdateDebugStats(int recordedCalls, int renderedCalls, int culledCalls,
                                   int sceneLights, int recordMWSize, int immediateCount);
 
+    // Frame number overlay toggle
+    static bool GetShowFrameNumber();
+
     // Hi-Z culling bypass for terrain hole diagnosis
     static bool GetDisableHiZCulling();
 
@@ -463,6 +466,9 @@ private:
 
     // Debug hotkey gating
     static bool debugKeysEnabled;         // Gate debug hotkeys (F11/U/Y/L/F5/F6) - default false
+
+    // On-screen frame number overlay - default false
+    static bool showFrameNumber;
 
     // Scene handover logging (particle bug diagnostics)
     static bool handoverLogging;          // Log state at Scene 0/1/2 boundaries - default false
