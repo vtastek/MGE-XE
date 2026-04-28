@@ -752,7 +752,7 @@ private:
         ConstReg regHasVCol, regHasAlpha, regHasBones, regHasAlphaVS;
         ConstReg regTexgenTransform, regBumpMatrix, regBumpLumiScaleBias;
         ConstReg regPCFPenumbraScale, regPCFMinPenumbra, regPCFMaxPenumbra;
-        ConstReg regPCFBias, regPCFBias2, regPCFSlopeBias;
+        ConstReg regPCFBias, regPCFBias2, regPCFSlopeBias, regTerrainShadowParams;
         ConstReg regWindVec, regTime, regNormres;
         ConstReg regDebugMode;  // Shader debug visualization mode (0=off, 1-15=debug views)
         bool dynamicConstsResolved;

@@ -366,8 +366,8 @@ namespace MGEgui {
         private static INIFile.INIVariableDef iniSSName = new INIFile.INIVariableDef("SSName", siniRendState, "Screenshot Name Prefix", INIFile.INIVariableType.String, "Morrowind");
         private static INIFile.INIVariableDef iniSSDir = new INIFile.INIVariableDef("SSDir", siniRendState, "Screenshot Output Directory", INIFile.INIVariableType.String, "");
         private static INIFile.INIVariableDef iniUseSharedMemory = new INIFile.INIVariableDef("UseSharedMemory", siniMisc, "Use Shared Memory", INIFile.INIBoolType.Text, "False");
-        private static INIFile.INIVariableDef iniUseHLSLPipeline = new INIFile.INIVariableDef("UseHLSLPipeline", siniMisc, "Use HLSL Pipeline", INIFile.INIBoolType.Text, "True");
-        private static INIFile.INIVariableDef iniEnableTextureSuffixes = new INIFile.INIVariableDef("EnableTextureSuffixes", siniMisc, "Enable Texture Suffixes", INIFile.INIBoolType.Text, "True");
+        private static INIFile.INIVariableDef iniUseHLSLPipeline = new INIFile.INIVariableDef("UseHLSLPipeline", siniMisc, "Use HLSL Pipeline", INIFile.INIBoolType.Text, "False");
+        private static INIFile.INIVariableDef iniEnableTextureSuffixes = new INIFile.INIVariableDef("EnableTextureSuffixes", siniMisc, "Enable Texture Suffixes", INIFile.INIBoolType.Text, "False");
         // In-game
         private static INIFile.INIVariableDef iniDisableMGE = new INIFile.INIVariableDef("DisableMGE", siniMisc, "MGE Disabled", INIFile.INIBoolType.Text, "False");
         private static INIFile.INIVariableDef iniDisableMWSE = new INIFile.INIVariableDef("DisableMWSE", siniMisc, "Internal MWSE Disabled", INIFile.INIBoolType.Text, "False");
@@ -411,7 +411,7 @@ namespace MGEgui {
         private static INIFile.INIVariableDef iniShadows = new INIFile.INIVariableDef("SunShadows", siniDL, "Sun Shadows", INIFile.INIBoolType.OnOff, "On");
         private static INIFile.INIVariableDef iniShadowDetail = new INIFile.INIVariableDef("SunShadowDetail", siniDL, "Sun Shadow Map Resolution", INIFile.INIVariableType.UInt32, "2048", 1024, 2048);
         private static INIFile.INIVariableDef iniPixelLighting = new INIFile.INIVariableDef("PPLighting", siniDL, "Per Pixel Shader", INIFile.INIBoolType.OnOff, "On");
-        private static INIFile.INIVariableDef iniPixelLightingFlags = new INIFile.INIVariableDef("PPLightingFlags", siniDL, "Per Pixel Shader Flags", INIFile.INIVariableType.Dictionary, "HLSL", pplFlagsDict);
+        private static INIFile.INIVariableDef iniPixelLightingFlags = new INIFile.INIVariableDef("PPLightingFlags", siniDL, "Per Pixel Shader Flags", INIFile.INIVariableType.Dictionary, "Always", pplFlagsDict);
 #endregion
 
         private static INIFile.INIVariableDef[] iniSettings = {
@@ -636,6 +636,10 @@ namespace MGEgui {
             iniFile.setKey("SunShadowDetail", cmbDLShadowDetail.SelectedIndex == 1 ? 2048 : 1024);
             iniFile.setKey("PPLighting", cbPerPixelLighting.Checked);
             iniFile.setKey("PPLightingFlags", cmbPerPixelLightFlags.SelectedIndex);
+            // HLSL pipeline requires these settings
+            bool hlslSelected = cbPerPixelLighting.Checked && cmbPerPixelLightFlags.SelectedIndex == 2;
+            iniFile.setKey("UseHLSLPipeline", hlslSelected);
+            iniFile.setKey("EnableTextureSuffixes", hlslSelected);
             iniFile.save();
             try {
                 RegistryKey key = Registry.LocalMachine.OpenSubKey(Statics.reg_mw, true);

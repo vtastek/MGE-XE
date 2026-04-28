@@ -1271,6 +1271,7 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             resolveAndCache(hlslShader.psConstantTable, "PCF_bias", hlslShader.regPCFBias);
             resolveAndCache(hlslShader.psConstantTable, "PCF_bias2", hlslShader.regPCFBias2);
             resolveAndCache(hlslShader.psConstantTable, "PCF_slopeBias", hlslShader.regPCFSlopeBias);
+            resolveAndCache(hlslShader.psConstantTable, "terrainShadowParams", hlslShader.regTerrainShadowParams);
             resolveAndCache(hlslShader.vsConstantTable, "windVec", hlslShader.regWindVec);
             resolveAndCache(hlslShader.vsConstantTable, "time", hlslShader.regTime);
             resolveAndCache(hlslShader.psConstantTable, "normres", hlslShader.regNormres);
@@ -1397,12 +1398,11 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             float v[4] = { ImGuiManager::GetPCFSlopeBias(), 0, 0, 0 };
             cmdBuf->recordSetPSConstantF(hlslShader.regPCFSlopeBias.reg, v, 1);
         }
-        // Terrain shadow params at c25 (statically declared in shadows.hlsl).
-        // .x = isTerrain (per-draw), .y = bias (global from imgui).
-        {
+        // Terrain shadow params (only set if shader has shadows enabled).
+        if (hlslShader.regTerrainShadowParams.reg != REG_INVALID) {
             float isTerrain = (replayCall && replayCall->bin == RenderBin::Terrain) ? 1.0f : 0.0f;
             float v[4] = { isTerrain, ImGuiManager::GetPCFTerrainBias(), 0, 0 };
-            cmdBuf->recordSetPSConstantF(25, v, 1);
+            cmdBuf->recordSetPSConstantF(hlslShader.regTerrainShadowParams.reg, v, 1);
         }
         if (hlslShader.regDebugMode.reg != REG_INVALID) {
             float v[4] = { (float)ImGuiManager::GetShaderDebugMode(), 0, 0, 0 };
@@ -1556,11 +1556,11 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         if (hPCFBias2) hlslShader.psConstantTable->SetFloat(device, hPCFBias2, ImGuiManager::GetPCFBias2());
         D3DXHANDLE hPCFSlopeBias = hlslShader.psConstantTable->GetConstantByName(NULL, "PCF_slopeBias");
         if (hPCFSlopeBias) hlslShader.psConstantTable->SetFloat(device, hPCFSlopeBias, ImGuiManager::GetPCFSlopeBias());
-        // Terrain shadow params at c25 (static register in shadows.hlsl).
-        {
+        // Terrain shadow params (only set if shader has shadows enabled).
+        if (hlslShader.regTerrainShadowParams.reg != REG_INVALID) {
             float isTerrain = (replayCall && replayCall->bin == RenderBin::Terrain) ? 1.0f : 0.0f;
             float v[4] = { isTerrain, ImGuiManager::GetPCFTerrainBias(), 0, 0 };
-            device->SetPixelShaderConstantF(25, v, 1);
+            device->SetPixelShaderConstantF(hlslShader.regTerrainShadowParams.reg, v, 1);
         }
         D3DXHANDLE hDebugMode = hlslShader.psConstantTable->GetConstantByName(NULL, "debugMode");
         if (hDebugMode) hlslShader.psConstantTable->SetInt(device, hDebugMode, ImGuiManager::GetShaderDebugMode());
@@ -2910,29 +2910,29 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                             hlslShader.vsConstantTable->SetMatrixArray(device, hlslShader.hShadowWorldViewProj, shadowViewToClip, 2);
                         }
 
-                        // Shadow PS constants (c10-c17). Batch shaders skip dynamic resolution,
-                        // and setReplayBaseline zeroes c0-c31 each replay, so without this
-                        // every batched draw sees PCF_filterSize/PCF_bias = 0 → boxy shadows
-                        // and self-shadowing. Registers are statically declared in shadows.hlsl
-                        // and XE FixedFuncEmu_PS.hlsl, matching the per-draw cmdBuf path.
+                        // Shadow PS constants - use resolved registers to avoid conflicts.
+                        // Only set if shader has shadow constants (sk.hasShadows matches HAS_SHADOWS).
                         if (sk.hasShadows) {
-                            float shadowConsts[8 * 4] = {
-                                1.0f / Configuration.DL.ShadowResolution, 0, 0, 0,  // c10 shadowRcpRes
-                                ImGuiManager::GetPCFBias(),          0, 0, 0,         // c11
-                                ImGuiManager::GetPCFBias2(),         0, 0, 0,         // c12
-                                ImGuiManager::GetPCFFilterSize(),    0, 0, 0,         // c13
-                                ImGuiManager::GetPCFPenumbraScale(), 0, 0, 0,         // c14
-                                ImGuiManager::GetPCFMinPenumbra(),   0, 0, 0,         // c15
-                                ImGuiManager::GetPCFMaxPenumbra(),   0, 0, 0,         // c16
-                                ImGuiManager::GetPCFSlopeBias(),     0, 0, 0,         // c17
+                            // Use resolved registers when available, hardcoded as fallback
+                            auto setIfValid = [&](ConstReg reg, int fallback, float val) {
+                                float v[4] = { val, 0, 0, 0 };
+                                device->SetPixelShaderConstantF(reg.reg != REG_INVALID ? reg.reg : fallback, v, 1);
                             };
-                            device->SetPixelShaderConstantF(10, shadowConsts, 8);
+                            setIfValid(hlslShader.regShadowRcpRes, 10, 1.0f / Configuration.DL.ShadowResolution);
+                            setIfValid(hlslShader.regPCFBias, 11, ImGuiManager::GetPCFBias());
+                            setIfValid(hlslShader.regPCFBias2, 12, ImGuiManager::GetPCFBias2());
+                            setIfValid(hlslShader.regPCFFilterSize, 13, ImGuiManager::GetPCFFilterSize());
+                            setIfValid(hlslShader.regPCFPenumbraScale, 14, ImGuiManager::GetPCFPenumbraScale());
+                            setIfValid(hlslShader.regPCFMinPenumbra, 15, ImGuiManager::GetPCFMinPenumbra());
+                            setIfValid(hlslShader.regPCFMaxPenumbra, 16, ImGuiManager::GetPCFMaxPenumbra());
+                            setIfValid(hlslShader.regPCFSlopeBias, 17, ImGuiManager::GetPCFSlopeBias());
 
-                            // Terrain shadow params at c25. mb.key.bin is uniform across
-                            // a merged batch (Terrain and Opaque are separate keys).
-                            float isTerrain = (mb.key.bin == (uint8_t)RenderBin::Terrain) ? 1.0f : 0.0f;
-                            float terrainConsts[4] = { isTerrain, ImGuiManager::GetPCFTerrainBias(), 0, 0 };
-                            device->SetPixelShaderConstantF(25, terrainConsts, 1);
+                            // Terrain shadow params
+                            if (hlslShader.regTerrainShadowParams.reg != REG_INVALID) {
+                                float isTerrain = (mb.key.bin == (uint8_t)RenderBin::Terrain) ? 1.0f : 0.0f;
+                                float terrainConsts[4] = { isTerrain, ImGuiManager::GetPCFTerrainBias(), 0, 0 };
+                                device->SetPixelShaderConstantF(hlslShader.regTerrainShadowParams.reg, terrainConsts, 1);
+                            }
                         }
                     }
 
