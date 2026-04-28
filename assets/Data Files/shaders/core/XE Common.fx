@@ -76,6 +76,9 @@ struct StatVertOut {
     centroid float4 color : COLOR0;
     centroid float4 fog : TEXCOORD0;
     float3 texcoords_range : TEXCOORD1;
+#ifdef USE_HLSL_PIPELINE
+    float4 normalEmissive : TEXCOORD2;  // .xyz = world normal, .w = emissive
+#endif
 };
 
 //------------------------------------------------------------
@@ -235,6 +238,7 @@ float3 fogApply(float3 c, float4 f) {
 
 #ifdef USE_HLSL_PIPELINE
 shared float intensityScalar;
+#define PI 3.14159
 
 float3 toLinearSrgb(float3 c) {
     float3 low = c / 12.92;
@@ -256,7 +260,7 @@ float3 ToneMap_AgX_Linear(float3 linCol) {
     );
     float min_ev = -12.47393;
     float max_ev = 4.026069;
-    float3 val = mul(linCol, agx_mat);
+    float3 val = mul(linCol * PI, agx_mat);  // exposureBias = PI compensates for /PI on ambient
     val = clamp(log2(val), min_ev, max_ev);
     val = (val - min_ev) / (max_ev - min_ev);
     val = ((((((((((15.5 * val) - 40.14) * val) + 31.96) * val) - 6.868) * val) + 0.4298) * val) + 0.1191) * val - 0.00232;

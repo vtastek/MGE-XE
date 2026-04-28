@@ -765,6 +765,10 @@ void DistantLand::setupCommonEffect(DLContext* ctx, const D3DXMATRIX* view, cons
         // parameter is only declared inside USE_HLSL_PIPELINE in the FX, so the
         // handle is null on legacy effect compiles and this is a no-op.
         effect->SetFloat(ehIntensityScalar, ImGuiManager::GetIntensityScalar());
+        // Debug mode for shader visualization (shared between HLSL and PPL paths)
+        if (ehDebugMode) {
+            effect->SetInt(ehDebugMode, ImGuiManager::GetShaderDebugMode());
+        }
     }
     if (LOG::catEnabled(LOG::Cat_DistantLand)) {
         static int nvLogCount = 0;

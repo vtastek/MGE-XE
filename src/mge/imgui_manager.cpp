@@ -27,7 +27,11 @@ float ImGuiManager::pcfBias2 = 0.0038f;          // Second depth bias for lerp
 float ImGuiManager::pcfSlopeBias = 0.0047f;      // Slope-based bias to prevent acne on angled surfaces
 float ImGuiManager::pcfTerrainBias = 0.02f;      // Extra bias for terrain receivers (near cascade, all modes)
 
-float ImGuiManager::intensityScalar = 10.0f;     // HLSL-pipeline unified-look intensity multiplier
+float ImGuiManager::intensityScalar = 1.0f;      // HLSL-pipeline unified-look intensity multiplier
+float ImGuiManager::attenuationMultiplier = 40000.0f;   // Point light attenuation multiplier (inverse-square)
+float ImGuiManager::attenuationCutoffDist = 1000.0f;    // Point light cutoff distance
+float ImGuiManager::parallaxScale = 0.008f;      // Parallax mapping scale
+float ImGuiManager::parallaxBias = 0.5f;         // Parallax mapping bias
 
 // Debug interface controls
 int ImGuiManager::bboxVisualizationMode = 0;
@@ -368,7 +372,11 @@ void ImGuiManager::RenderPCFFilteringInterface() {
 
         ImGui::Separator();
         ImGui::Text("HLSL Unified Look");
-        ImGui::SliderFloat("Intensity", &intensityScalar, 0.5f, 30.0f, "%.2f");
+        ImGui::SliderFloat("Intensity", &intensityScalar, 0.1f, 10.0f, "%.2f");
+        ImGui::SliderFloat("Atten Multiplier", &attenuationMultiplier, 1.0f, 100000.0f, "%.0f", ImGuiSliderFlags_Logarithmic);
+        ImGui::SliderFloat("Atten Cutoff Dist", &attenuationCutoffDist, 1.0f, 5000.0f, "%.0f");
+        ImGui::SliderFloat("Parallax Scale", &parallaxScale, 0.001f, 0.1f, "%.3f");
+        ImGui::SliderFloat("Parallax Bias", &parallaxBias, 0.01f, 1.0f, "%.2f");
 
         ImGui::Separator();
         ImGui::Checkbox("Show Demo Window", &showDemo);
@@ -406,6 +414,10 @@ float ImGuiManager::GetPCFBias2() { return pcfBias2; }
 float ImGuiManager::GetPCFSlopeBias() { return pcfSlopeBias; }
 float ImGuiManager::GetPCFTerrainBias() { return pcfTerrainBias; }
 float ImGuiManager::GetIntensityScalar() { return intensityScalar; }
+float ImGuiManager::GetAttenuationMultiplier() { return attenuationMultiplier; }
+float ImGuiManager::GetAttenuationCutoffDist() { return attenuationCutoffDist; }
+float ImGuiManager::GetParallaxScale() { return parallaxScale; }
+float ImGuiManager::GetParallaxBias() { return parallaxBias; }
 bool ImGuiManager::GetShowPCFInterface() { return showPCFInterface; }
 
 void ImGuiManager::TogglePCFInterface() { 
@@ -501,9 +513,12 @@ void ImGuiManager::RenderDebugInterface() {
             "14: Batch Mode (green=batched,red=not)",
             "15: Texture Slots (R=detail,G=paramh,B=shadow)",
             "16: Normres (512=.25 1024=.5 2048=.75 4096=1.0, blue=no paramH)",
-            "17: Height (paramH.g, blue=no paramH)"
+            "17: Height (paramH.g, blue=no paramH)",
+            "18: Raw Sun Color (input)",
+            "19: Raw Ambient Color (input)",
+            "20: Middle Gray (0.18 lin / 0.5 gamma)"
         };
-        ImGui::Combo("Shader Debug View", &shaderDebugMode, debugModes, 18);
+        ImGui::Combo("Shader Debug View", &shaderDebugMode, debugModes, 21);
         ImGui::SetItemTooltip("Override shader output to visualize internal values");
 
         ImGui::Checkbox("Enable Stateless Batching (experimental)", &enableStatelessBatch);

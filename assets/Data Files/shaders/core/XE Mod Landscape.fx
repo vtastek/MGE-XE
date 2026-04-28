@@ -83,12 +83,12 @@ float4 LandscapePS(LandVertOut IN) : COLOR0 {
     detail *= 0.5 * tex2D(sampDetail, IN.texcoord * 90).g + 0.75;
 
 #ifdef USE_HLSL_PIPELINE
-    // Linearize albedo, sun, ambient. Keep N·L lighting math; it operates on
-    // whatever space we feed it. Final brightness scaled by intensityScalar
-    // (shared with core-hlsl) so DL and FFE move together.
+    // Linearize albedo, sun, ambient. Divide-by-PI on ambient matches FFE
+    // (sun keeps full intensity for Lambertian diffuse). intensityScalar
+    // shared with core-hlsl so DL and FFE brightness moves together.
     float3 albedoLin = toLinearSrgb(result);
     float3 sunColLin = toLinearSrgb(sunCol);
-    float3 sunAmbLin = toLinearSrgb(sunAmb);
+    float3 sunAmbLin = toLinearSrgb(sunAmb) / PI;
     float3 lit = albedoLin * (sunColLin * saturate(dot(-sunVec, normal)) + sunAmbLin) * detail;
     lit *= intensityScalar;
     result = fogApplyLinearAgX(lit, toLinearSrgb(fogColFar), IN.fog.a);

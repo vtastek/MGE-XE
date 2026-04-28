@@ -1277,6 +1277,10 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             resolveAndCache(hlslShader.psConstantTable, "normres", hlslShader.regNormres);
             resolveAndCache(hlslShader.psConstantTable, "debugMode", hlslShader.regDebugMode);
             resolveAndCache(hlslShader.psConstantTable, "intensityScalar", hlslShader.regIntensityScalar);
+            resolveAndCache(hlslShader.psConstantTable, "attenuationMultiplier", hlslShader.regAttenuationMultiplier);
+            resolveAndCache(hlslShader.psConstantTable, "attenuationCutoffDist", hlslShader.regAttenuationCutoffDist);
+            resolveAndCache(hlslShader.psConstantTable, "parallaxScale", hlslShader.regParallaxScale);
+            resolveAndCache(hlslShader.psConstantTable, "parallaxBias", hlslShader.regParallaxBias);
             hlslShader.dynamicConstsResolved = true;
         }
 
@@ -1413,6 +1417,22 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         if (hlslShader.regIntensityScalar.reg != REG_INVALID) {
             float v[4] = { ImGuiManager::GetIntensityScalar(), 0, 0, 0 };
             cmdBuf->recordSetPSConstantF(hlslShader.regIntensityScalar.reg, v, 1);
+        }
+        if (hlslShader.regAttenuationMultiplier.reg != REG_INVALID) {
+            float v[4] = { ImGuiManager::GetAttenuationMultiplier(), 0, 0, 0 };
+            cmdBuf->recordSetPSConstantF(hlslShader.regAttenuationMultiplier.reg, v, 1);
+        }
+        if (hlslShader.regAttenuationCutoffDist.reg != REG_INVALID) {
+            float v[4] = { ImGuiManager::GetAttenuationCutoffDist(), 0, 0, 0 };
+            cmdBuf->recordSetPSConstantF(hlslShader.regAttenuationCutoffDist.reg, v, 1);
+        }
+        if (hlslShader.regParallaxScale.reg != REG_INVALID) {
+            float v[4] = { ImGuiManager::GetParallaxScale(), 0, 0, 0 };
+            cmdBuf->recordSetPSConstantF(hlslShader.regParallaxScale.reg, v, 1);
+        }
+        if (hlslShader.regParallaxBias.reg != REG_INVALID) {
+            float v[4] = { ImGuiManager::GetParallaxBias(), 0, 0, 0 };
+            cmdBuf->recordSetPSConstantF(hlslShader.regParallaxBias.reg, v, 1);
         }
 
         // VS dynamic constants
@@ -1580,6 +1600,14 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         if (hFogColNear) hlslShader.psConstantTable->SetVector(device, hFogColNear, (D3DXVECTOR4*)fogColor);
         D3DXHANDLE hIntensityScalar = hlslShader.psConstantTable->GetConstantByName(NULL, "intensityScalar");
         if (hIntensityScalar) hlslShader.psConstantTable->SetFloat(device, hIntensityScalar, ImGuiManager::GetIntensityScalar());
+        D3DXHANDLE hAttenuationMultiplier = hlslShader.psConstantTable->GetConstantByName(NULL, "attenuationMultiplier");
+        if (hAttenuationMultiplier) hlslShader.psConstantTable->SetFloat(device, hAttenuationMultiplier, ImGuiManager::GetAttenuationMultiplier());
+        D3DXHANDLE hAttenuationCutoffDist = hlslShader.psConstantTable->GetConstantByName(NULL, "attenuationCutoffDist");
+        if (hAttenuationCutoffDist) hlslShader.psConstantTable->SetFloat(device, hAttenuationCutoffDist, ImGuiManager::GetAttenuationCutoffDist());
+        D3DXHANDLE hParallaxScale = hlslShader.psConstantTable->GetConstantByName(NULL, "parallaxScale");
+        if (hParallaxScale) hlslShader.psConstantTable->SetFloat(device, hParallaxScale, ImGuiManager::GetParallaxScale());
+        D3DXHANDLE hParallaxBias = hlslShader.psConstantTable->GetConstantByName(NULL, "parallaxBias");
+        if (hParallaxBias) hlslShader.psConstantTable->SetFloat(device, hParallaxBias, ImGuiManager::GetParallaxBias());
 
         D3DXHANDLE hTexgenTransform = hlslShader.vsConstantTable->GetConstantByName(NULL, "texgenTransform");
         if (hTexgenTransform) {
@@ -2912,11 +2940,28 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                             float v[4] = { ImGuiManager::GetHeightBlendStrength(), ImGuiManager::GetHeightBlendContrast(), 0, 0 };
                             device->SetPixelShaderConstantF(23, v, 1);
                         }
-                        // c26 intensityScalar (statically declared in common.hlsl). Batch
-                        // shaders skip dynamic resolution, so push by register here.
+                        // c26 intensityScalar, c27 attenuationMultiplier, c28 attenuationCutoffDist
+                        // c29 parallaxScale, c30 parallaxBias
+                        // (statically declared in common.hlsl). Batch shaders skip dynamic resolution.
                         {
                             float v[4] = { ImGuiManager::GetIntensityScalar(), 0, 0, 0 };
                             device->SetPixelShaderConstantF(26, v, 1);
+                        }
+                        {
+                            float v[4] = { ImGuiManager::GetAttenuationMultiplier(), 0, 0, 0 };
+                            device->SetPixelShaderConstantF(27, v, 1);
+                        }
+                        {
+                            float v[4] = { ImGuiManager::GetAttenuationCutoffDist(), 0, 0, 0 };
+                            device->SetPixelShaderConstantF(28, v, 1);
+                        }
+                        {
+                            float v[4] = { ImGuiManager::GetParallaxScale(), 0, 0, 0 };
+                            device->SetPixelShaderConstantF(29, v, 1);
+                        }
+                        {
+                            float v[4] = { ImGuiManager::GetParallaxBias(), 0, 0, 0 };
+                            device->SetPixelShaderConstantF(30, v, 1);
                         }
                         // Set shadow matrices using hoisted view-to-shadow transforms
                         if (hlslShader.hShadowWorldViewProj) {

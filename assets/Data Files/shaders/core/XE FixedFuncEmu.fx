@@ -17,6 +17,7 @@ shared float lightFalloffConstant;
 shared matrix texgenTransform;
 shared float4 bumpMatrix;
 shared float2 bumpLumiScaleBias;
+shared int debugMode;  // Debug visualization mode (matches HLSL shader)
 
 sampler sampFFE0 = sampler_state { texture = <tex0>; };
 sampler sampFFE1 = sampler_state { texture = <tex1>; };
@@ -259,12 +260,23 @@ float4 PerPixelPS(FFEPixel IN) : COLOR0 {
     /* template */ FFE_VERTEX_MATERIAL
 
     // Texturing and combinators
+    float3 temp_diff = diffuse.rgb;
     float4 c = diffuse;
     /* template */ FFE_TEXTURING
+
+    // Debug mode 20: replace albedo with middle gray (0.5 gamma ≈ 0.18 linear)
+    // c.rgb = temp_diff * albedo after texturing, so albedo = c.rgb / temp_diff
+    if (debugMode == 20) {
+        c.rgb = temp_diff * 0.5;
+    }
 
     // Static tonemap and final fogging
     c.rgb = tonemap(c.rgb);
     /* template */ FFE_FOG_APPLICATION
+
+    // Debug visualization modes (compare with HLSL shader)
+    if (debugMode == 18) c.rgb = lightSunDiffuse;      // Raw sun color
+    else if (debugMode == 19) c.rgb = lightSceneAmbient;  // Raw ambient color
 
     return c;
 }

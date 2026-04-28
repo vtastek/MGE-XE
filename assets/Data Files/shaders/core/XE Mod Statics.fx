@@ -35,6 +35,16 @@ float4 lightStaticVert(StatVertIn IN) {
     return float4(IN.color.rgb * light, IN.color.a);
 }
 
+#ifdef USE_HLSL_PIPELINE
+// HLSL path: return vertex color only, lighting done in PS
+float4 lightStaticVertHLSL(StatVertIn IN, out float4 normalEmissive) {
+    float4 normal = float4(normalize(2 * IN.normal.xyz - 1), 0);
+    normal = mul(normal, world);
+    normalEmissive = float4(normal.xyz, IN.normal.w);
+    return IN.color;
+}
+#endif
+
 float2 texcoordsModifier(StatVertIn IN) {
     float2 tc = IN.texcoords;
 
@@ -53,7 +63,11 @@ StatVertOut StaticExteriorVS(StatVertIn IN) {
     StatVertOut OUT;
     TransformedVert v = transformStaticVert(IN);
     OUT.pos = v.pos;
+#ifdef USE_HLSL_PIPELINE
+    OUT.color = lightStaticVertHLSL(IN, OUT.normalEmissive);
+#else
     OUT.color = lightStaticVert(IN);
+#endif
 
     // Fogging (exterior)
     float3 eyevec = v.worldpos.xyz - eyePos.xyz;
@@ -68,7 +82,11 @@ StatVertOut StaticInteriorVS (StatVertIn IN) {
     StatVertOut OUT;
     TransformedVert v = transformStaticVert(IN);
     OUT.pos = v.pos;
+#ifdef USE_HLSL_PIPELINE
+    OUT.color = lightStaticVertHLSL(IN, OUT.normalEmissive);
+#else
     OUT.color = lightStaticVert(IN);
+#endif
 
     // Fogging (interior)
     float dist = length(v.viewpos.xyz);
@@ -85,12 +103,19 @@ float4 StaticPS (StatVertOut IN): COLOR0 {
     float4 result = tex2D(sampBaseTex, texcoords);
 
 #ifdef USE_HLSL_PIPELINE
-    // IN.color.rgb is the VS-baked product (vertex color × per-vertex sun/ambient lighting).
-    // Re-gamma it to approximate linear so AgX consumes scene-referred values matching
-    // the FFE near-field path. Same density-driven fog factor as legacy (IN.fog.a).
+    // Per-pixel lighting in linear space matching FFE/landscape.
+    // IN.color.rgb = vertex color, IN.normalEmissive = world normal + emissive.
+    float3 normal = normalize(IN.normalEmissive.xyz);
+    float emissive = IN.normalEmissive.w;
+    float NdotL = saturate(dot(normal, -sunVec));
+
     float3 albedoLin = toLinearSrgb(result.rgb);
-    float3 lightLin = pow(IN.color.rgb + 1e-6, 2.2);
-    float3 lit = albedoLin * lightLin * intensityScalar;
+    float3 vertColLin = toLinearSrgb(IN.color.rgb);
+    float3 sunColLin = toLinearSrgb(sunCol);
+    float3 sunAmbLin = toLinearSrgb(sunAmb) / PI;
+
+    float3 lit = albedoLin * vertColLin * (sunColLin * NdotL + sunAmbLin + emissive);
+    lit *= intensityScalar;
     result.rgb = fogApplyLinearAgX(lit, toLinearSrgb(fogColFar), IN.fog.a);
 #else
     result.rgb *= IN.color.rgb;

@@ -297,7 +297,7 @@ const iniSetting iniSettings[] = {
     {&Configuration.PCF.TerrainBias, t_float, 1, siniRendState, "PCF Terrain Bias", "0.02", NULL, MINMAX, 0.0, 0.02},
 
     // HLSL-pipeline unified-look exposure scalar
-    {&Configuration.IntensityScalar, t_float, 1, siniRendState, "Intensity Scalar", "10.0", NULL, MINMAX, 0.5, 30.0},
+    {&Configuration.IntensityScalar, t_float, 1, siniRendState, "Intensity Scalar", "1.0", NULL, MINMAX, 0.1, 10.0},
 };
 
 #endif /* _INIDATA_H_ */

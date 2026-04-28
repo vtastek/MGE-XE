@@ -136,6 +136,10 @@ public:
     static float GetPCFSlopeBias();
     static float GetPCFTerrainBias();
     static float GetIntensityScalar();
+    static float GetAttenuationMultiplier();
+    static float GetAttenuationCutoffDist();
+    static float GetParallaxScale();
+    static float GetParallaxBias();
     static bool GetShowPCFInterface();
     static void TogglePCFInterface();
 
@@ -332,6 +336,14 @@ private:
 
     // HLSL-pipeline unified-look intensity multiplier (mirrors Configuration.IntensityScalar).
     static float intensityScalar;
+
+    // Point light attenuation parameters (debug tunable)
+    static float attenuationMultiplier;   // range 1-100000, default 40000
+    static float attenuationCutoffDist;   // range 1-5000, default 1000
+
+    // Parallax mapping parameters (debug tunable)
+    static float parallaxScale;           // default 0.026
+    static float parallaxBias;            // default 0.3
 
     // Debug interface controls
     static int bboxVisualizationMode;  // 0=off, 1=objects, 2=lights

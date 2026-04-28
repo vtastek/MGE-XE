@@ -686,6 +686,7 @@ class FixedFunctionShader {
     static D3DXHANDLE ehLightDiffuse, ehLightAmbient, ehLightPosition;
     static D3DXHANDLE ehLightFalloffQuadratic, ehLightFalloffLinear, ehLightFalloffConstant;
     static D3DXHANDLE ehTexgenTransform, ehBumpMatrix, ehBumpLumiScaleBias;
+    static D3DXHANDLE ehDebugMode;
 
     static float sunMultiplier, ambMultiplier;
 
@@ -750,6 +751,8 @@ private:
         // Dynamic PS constants resolved on first use
         ConstReg regShadingMode, regFogColNear, regMaterialAlpha, regAlphaRef;
         ConstReg regIntensityScalar;
+        ConstReg regAttenuationMultiplier, regAttenuationCutoffDist;
+        ConstReg regParallaxScale, regParallaxBias;
         ConstReg regHasVCol, regHasAlpha, regHasBones, regHasAlphaVS;
         ConstReg regTexgenTransform, regBumpMatrix, regBumpLumiScaleBias;
         ConstReg regPCFPenumbraScale, regPCFMinPenumbra, regPCFMaxPenumbra;

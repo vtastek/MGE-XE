@@ -193,21 +193,19 @@ PointLightResult evaluatePointLightsPBR(float4 lightParams, float3 viewPos, floa
         float dist = length(toLight);
         float3 L = toLight / dist;
 
-        float falloffValue = 40.0 * falloff.z * dist * dist + falloff.x;
-        float t = saturate(dist / 350.0);
-        float cutoff = 1.0 - t * t * t * t;
-        float attenuation = (falloffValue > 0.0) ? (1.0 / falloffValue) * cutoff : 0.0;
+        float attenuation = pointLightAttenuation(dist);
 
         LightResult pointLR = BRDF(normal, V, L, albedo, metalness, roughness, roughness, radius, F0, 0, 1.0);
 
         float dotpoint = dot(normal, L);
         float NdotL_point = max(dotpoint, 0.0);
 
-        float3 pointIntensity = 10 * INTENSITY * pow(max(0.0, color.rgb) + EPS, 2.2) * NdotL_point * attenuation;
+        float3 pointIntensity = INTENSITY * pow(max(0.0, color.rgb) + EPS, 2.2) * NdotL_point * attenuation;
 
         result.diffuse += pointLR.diffuse * pointIntensity;
         result.specular += pointLR.specular * pointIntensity;
-        result.neglight -= max(0.0, -color.r) * 1 / pow(falloffValue, 1 / 3.2);
+        float dist2 = max(dist * dist, 1.0);
+        result.neglight -= max(0.0, -color.r) * 1 / pow(dist2, 1 / 3.2);
     }
 
     return result;
@@ -228,10 +226,7 @@ float3 evaluatePointLights(float4 lightParams, float3 viewPos, float3 normal) {
         float dist = length(toLight);
         float3 L = toLight / dist;
 
-        float falloffValue = 40.0 * falloff.z * dist * dist + falloff.x;
-        float t = saturate(dist / 350.0);
-        float cutoff = 1.0 - t * t * t * t;
-        float attenuation = (falloffValue > 0.0) ? (1.0 / falloffValue) * cutoff : 0.0;
+        float attenuation = pointLightAttenuation(dist);
 
         float NdotL = max(0, dot(normal, L));
         lighting += color.rgb * attenuation * NdotL;

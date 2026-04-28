@@ -49,6 +49,7 @@ D3DXHANDLE FixedFunctionShader::ehLightSceneAmbient, FixedFunctionShader::ehLigh
 D3DXHANDLE FixedFunctionShader::ehLightSunDirection, FixedFunctionShader::ehLightPosition, FixedFunctionShader::ehLightAmbient;
 D3DXHANDLE FixedFunctionShader::ehLightFalloffQuadratic, FixedFunctionShader::ehLightFalloffLinear, FixedFunctionShader::ehLightFalloffConstant;
 D3DXHANDLE FixedFunctionShader::ehTexgenTransform, FixedFunctionShader::ehBumpMatrix, FixedFunctionShader::ehBumpLumiScaleBias;
+D3DXHANDLE FixedFunctionShader::ehDebugMode;
 
 float FixedFunctionShader::sunMultiplier, FixedFunctionShader::ambMultiplier;
 
@@ -567,6 +568,7 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
     ehTexgenTransform = effect->GetParameterByName(0, "texgenTransform");
     ehBumpMatrix = effect->GetParameterByName(0, "bumpMatrix");
     ehBumpLumiScaleBias = effect->GetParameterByName(0, "bumpLumiScaleBias");
+    ehDebugMode = effect->GetParameterByName(0, "debugMode");
 
     effectDefaultPurple = effect;
     sunMultiplier = ambMultiplier = 1.0;
@@ -1014,6 +1016,11 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
     } else {
         effectFFE->SetMatrix(ehWorld, &rs->worldTransforms[0]);
         effectFFE->SetMatrix(ehWorldView, &rs->worldViewTransforms[0]);
+    }
+
+    // Debug visualization mode (shared with HLSL path)
+    if (ehDebugMode) {
+        effectFFE->SetInt(ehDebugMode, ImGuiManager::GetShaderDebugMode());
     }
 
     UINT passes;

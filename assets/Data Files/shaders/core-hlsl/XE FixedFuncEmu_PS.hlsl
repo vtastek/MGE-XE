@@ -227,6 +227,7 @@ float4 ps_main(VS_OUTPUT input, float2 pixelPos : VPOS) : COLOR{
 		#if defined(USE_PARALLAX)
 		// Height lives in _paramh alpha; Parallax() defaults to channel 3 (alpha).
 		parallaxUV = Parallax(sampTex2, parallaxUV, Vts, parallaxScale);
+		normalUV = parallaxUV;  // Normal gradient must use parallax-adjusted UV
 		#endif
 
 		#if defined(HAS_OVERLAY) && defined(HAS_OVERLAY_PARAMH)
@@ -320,7 +321,7 @@ float4 ps_main(VS_OUTPUT input, float2 pixelPos : VPOS) : COLOR{
 
 	float4 texColor = tex2D(sampTex0, parallaxUV);
 	texColor.rgb = max(0.0, toLinear(texColor.rgb));
-	//texColor.rgb = 0.18;
+	if (debugMode == 20) texColor.rgb = 0.18;  // Middle gray for lighting comparison
 
 	#if defined(HAS_OVERLAY)
 	// Composite the absorbed TerrainBlend overlay. Per LANDSCAPE_MESH_SPECIFICATION.md §4/§6,
@@ -417,10 +418,7 @@ float4 ps_main(VS_OUTPUT input, float2 pixelPos : VPOS) : COLOR{
 		float dist = length(L);
 		L = L / dist;
 
-		float falloff = 40 * lightFalloffQuadratic[0] * dist * dist + lightFalloffConstant;
-		float t = saturate(dist / 350.0);
-		float cutoff = 1.0 - t * t * t * t;
-		float attenuation = (falloff > 0.0) ? (1.0 / falloff) * cutoff : 0.0;
+		float attenuation = pointLightAttenuation(dist);
 		LightResult pointLR = BRDF(Norm, V, L, texColor.rgb, metalness, roughness, roughness, radius, F0, 0, 1.0);
 		float dotpoint = dot(Norm, L);
 		float NdotL_point = max(dotpoint, 0.0);
@@ -432,13 +430,14 @@ float4 ps_main(VS_OUTPUT input, float2 pixelPos : VPOS) : COLOR{
 			NdotL_point = 3.14 * lambert;
 		#endif
 
-		float3 pointIntensity = 10 * INTENSITY * pow(max(0.0, lightDiffuse[0].rgb) + EPS, 2.2) * NdotL_point * attenuation;
+		float3 pointIntensity = INTENSITY * pow(max(0.0, lightDiffuse[0].rgb) + EPS, 2.2) * NdotL_point * attenuation;
 		diffuseLight += pointLR.diffuse * pointIntensity;
 
 		#if defined(HAS_PARAMH) || defined(HAS_NORMAL)
 		specularLight += pointLR.specular * pointIntensity;
 		#endif
-		neglight -= max(0.0, -lightDiffuse[0].r) * 1 / pow(falloff, 1 / 3.2);
+		float dist2 = max(dist * dist, 1.0);
+		neglight -= max(0.0, -lightDiffuse[0].r) * 1 / pow(dist2, 1 / 3.2);
 	}
 	#elif defined(LIGHT_MODE) && LIGHT_MODE == 2
 	// Mode 2: Few point lights — loop up to pointLightCount (max 8)
@@ -448,10 +447,7 @@ float4 ps_main(VS_OUTPUT input, float2 pixelPos : VPOS) : COLOR{
 		float dist = length(L);
 		L = L / dist;
 
-		float falloff = 40 * lightFalloffQuadratic[i] * dist * dist + lightFalloffConstant;
-		float t = saturate(dist / 350.0);
-		float cutoff = 1.0 - t * t * t * t;
-		float attenuation = (falloff > 0.0) ? (1.0 / falloff) * cutoff : 0.0;
+		float attenuation = pointLightAttenuation(dist);
 		LightResult pointLR = BRDF(Norm, V, L, texColor.rgb, metalness, roughness, roughness, radius, F0, 0, 1.0);
 		float dotpoint = dot(Norm, L);
 		float NdotL_point = max(dotpoint, 0.0);
@@ -463,13 +459,14 @@ float4 ps_main(VS_OUTPUT input, float2 pixelPos : VPOS) : COLOR{
 			NdotL_point = 3.14 * lambert;
 		#endif
 
-		float3 pointIntensity = 10 * INTENSITY * pow(max(0.0, lightDiffuse[i].rgb) + EPS, 2.2) * NdotL_point * attenuation;
+		float3 pointIntensity = INTENSITY * pow(max(0.0, lightDiffuse[i].rgb) + EPS, 2.2) * NdotL_point * attenuation;
 		diffuseLight += pointLR.diffuse * pointIntensity;
 
 		#if defined(HAS_PARAMH) || defined(HAS_NORMAL)
 		specularLight += pointLR.specular * pointIntensity;
 		#endif
-		neglight -= max(0.0, -lightDiffuse[i].r) * 1 / pow(falloff, 1 / 3.2);
+		float dist2 = max(dist * dist, 1.0);
+		neglight -= max(0.0, -lightDiffuse[i].r) * 1 / pow(dist2, 1 / 3.2);
 	}
 	#elif defined(LIGHT_MODE) && LIGHT_MODE == 3
 	// Mode 3: Texture-based point light system (>8 lights, rare)
@@ -546,7 +543,8 @@ float4 ps_main(VS_OUTPUT input, float2 pixelPos : VPOS) : COLOR{
 #endif
 
 	// Debug visualization modes (runtime toggleable via imgui)
-	if (debugMode > 0) {
+	// Mode 20 (middle gray) is handled early and passes through normal lighting
+	if (debugMode > 0 && debugMode != 20) {
 		float3 debugColor = float3(1, 0, 1); // Magenta = unknown mode
 
 		if (debugMode == 1) {
@@ -668,6 +666,15 @@ float4 ps_main(VS_OUTPUT input, float2 pixelPos : VPOS) : COLOR{
 			debugColor = float3(0, 0, 1);
 			#endif
 		}
+		else if (debugMode == 18) {
+			// Raw sun color (gamma-space input from Morrowind)
+			debugColor = lightSunDiffuse;
+		}
+		else if (debugMode == 19) {
+			// Raw ambient color (gamma-space input from Morrowind)
+			debugColor = lightSceneAmbient;
+		}
+		// debugMode == 20: Middle gray albedo (0.18) - handled early, passes through normal lighting
 
 		c.rgb = debugColor;
 	}

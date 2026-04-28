@@ -17,6 +17,18 @@
 uniform float intensityScalar : register(c26);
 #define INTENSITY intensityScalar
 
+// Point light attenuation parameters (debug tunable via ImGui)
+uniform float attenuationMultiplier : register(c27);  // range 1-100000
+uniform float attenuationCutoffDist : register(c28);  // range 1-5000
+
+// Inverse-square point light attenuation with smooth cutoff
+float pointLightAttenuation(float dist) {
+    float dist2 = max(dist * dist, 1.0);
+    float t = saturate(dist / attenuationCutoffDist);
+    float cutoff = 1.0 - t * t * t * t;
+    return (attenuationMultiplier / dist2) * cutoff;
+}
+
 // Luminance calculation (ITU-R BT.709)
 float luminance(float3 color) {
     return dot(color, float3(0.2126, 0.7152, 0.0722));
@@ -76,10 +88,10 @@ float3 ToneMap_AgX(float3 linCol, int lookMode)
 
 	float min_ev = -12.47393;
 	float max_ev = 4.026069;
-	float bias = 1.0;
+	float exposureBias = PI;  // Compensate for /PI on ambient in Lambertian diffuse
 
 	// Input transform
-	float3 val = mul((linCol * bias), agx_mat);
+	float3 val = mul((linCol * exposureBias), agx_mat);
 
 	// Log2 space encoding
 	val = clamp(log2(val), min_ev, max_ev);
@@ -258,31 +270,37 @@ void BuildPerPixelTBN(
 }
 
 #if defined(HAS_NORMAL) || defined(HAS_PARAMH)
-// Parallax height and normal parameters
-static const float parallaxScale = 0.006;
-static const float parallaxBias = 0.005;
+// Parallax height and normal parameters (tunable via ImGui)
+uniform float parallaxScale : register(c29);  // default 0.026
+uniform float parallaxBias : register(c30);   // default 0.3
 static const float heightScale = 16;
 
 #ifdef USE_PARALLAX
-// Simple offset parallax mapping (no raymarch, just single offset)
-// Added channel parameter: 0=r, 1=g, 2=b, 3=a
+// Maximum quality single-offset Parallax with AF/Mipmap fix
 float2 Parallax(
-	sampler2D hmap,
-	float2 uv,
-	float3 Vts,
-	float hs,
-	int channel = 3)  // Default to alpha channel for backward compatibility
+    sampler2D hmap,
+    float2 uv,
+    float3 Vts,
+    float hs,
+    int channel = 3)
 {
-	float4 hmapSample = tex2D(hmap, uv);
-	float h;
-	if (channel == 0) h = hmapSample.r;
-	else if (channel == 1) h = hmapSample.g;
-	else if (channel == 2) h = hmapSample.b;
-	else h = hmapSample.a;  // _paramh (DXT5) and legacy _nh both store height in alpha
+    float2 dx = ddx(uv);
+    float2 dy = ddy(uv);
 
-	h = 2 * (1 - h) - 1;
-	float2 offset = (h * hs) * (-Vts.xy / max(Vts.z, 1e-3));
-	return uv + offset;
+    float4 hmapSample = tex2Dgrad(hmap, uv, dx, dy);
+
+    float h;
+    if (channel == 0) h = hmapSample.r;
+    else if (channel == 1) h = hmapSample.g;
+    else if (channel == 2) h = hmapSample.b;
+    else h = hmapSample.a;
+
+    // Normalize height to -1..1 range
+    h = h * 2.0 - 1.0;
+
+    float2 offset = (h * hs) * (Vts.xy / (Vts.z + parallaxBias));
+
+    return uv + offset;
 }
 #endif
 

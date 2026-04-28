@@ -33,6 +33,9 @@ struct GrassVertOut {
 
     float4 shadow0pos : TEXCOORD1;
     float4 shadow1pos : TEXCOORD2;
+#ifdef USE_HLSL_PIPELINE
+    float4 normalFacing : TEXCOORD3;  // .xyz = world normal, .w = facing sign for two-sided
+#endif
 };
 
 GrassVertOut GrassInstVS(StatVertInstIn IN) {
@@ -43,15 +46,22 @@ GrassVertOut GrassInstVS(StatVertInstIn IN) {
     OUT.pos = v.pos;
     OUT.fog = fogMWColour(length(eyevec));
 
-    // Lighting for two-sided rendering, no emissive
-    float lambert = dot(v.normal.xyz, -sunVec) * -sign(dot(eyevec, v.normal.xyz));
-    // Backscatter through thin cover
-    if(lambert < 0) {
-        lambert *= -0.3;
-    }
+    // Two-sided facing sign for grass (flip normal based on view direction)
+    float facingSign = -sign(dot(eyevec, v.normal.xyz));
 
-    // Ignoring vertex colour due to problem with some grass mods
+#ifdef USE_HLSL_PIPELINE
+    // Pass normal and facing sign to PS for per-pixel lighting
+    OUT.normalFacing = float4(v.normal.xyz, facingSign);
+    // color.rgb unused in HLSL PS (lighting computed there), but set for shadow estimate
+    float lambert = dot(v.normal.xyz, -sunVec) * facingSign;
+    if(lambert < 0) lambert *= -0.3;
+    OUT.color.rgb = float3(1, 1, 1);  // placeholder, lighting done in PS
+#else
+    // Lighting for two-sided rendering, no emissive
+    float lambert = dot(v.normal.xyz, -sunVec) * facingSign;
+    if(lambert < 0) lambert *= -0.3;
     OUT.color.rgb = sunCol * lambert + sunAmb;
+#endif
 
     // Non-standard shadow luminance, to create sufficient contrast when ambient is high
     OUT.color.a = shadowSunEstimate(lambert);
@@ -68,24 +78,45 @@ GrassVertOut GrassInstVS(StatVertInstIn IN) {
 
 float4 GrassPS(GrassVertOut IN): COLOR0 {
     float4 result = tex2D(sampBaseTex, IN.texcoords);
-    result.rgb *= IN.color.rgb;
 
     // Alpha test early
-    // Note: clip is not used here because at certain optimization levels,
-    // the texkill is pushed to the very end of the function
     if(result.a < 64.0/255.0)
         discard;
 
     // Soft shadowing
     float dz = shadowDeltaZ(IN.shadow0pos, IN.shadow1pos);
     float v = shadowESM(dz);
+    v *= IN.color.a;
+
+#ifdef USE_HLSL_PIPELINE
+    // Per-pixel lighting in linear space matching FFE/landscape.
+    float3 normal = normalize(IN.normalFacing.xyz);
+    float facingSign = IN.normalFacing.w;
+
+    // Two-sided lambert with backscatter
+    float lambert = dot(normal, -sunVec) * facingSign;
+    if(lambert < 0) lambert *= -0.3;
+
+    float3 albedoLin = toLinearSrgb(result.rgb);
+    float3 sunColLin = toLinearSrgb(sunCol);
+    float3 sunAmbLin = toLinearSrgb(sunAmb) / PI;
+
+    float3 lit = albedoLin * (sunColLin * lambert + sunAmbLin);
+    lit *= intensityScalar;
+
+    // Apply shadow darkening (towards blue like legacy)
+    lit *= 1 - v * shadecolor;
+
+    result.rgb = fogApplyLinearAgX(lit, toLinearSrgb(fogColFar), IN.fog.a);
+#else
+    result.rgb *= IN.color.rgb;
 
     // Darken shadow area according to existing lighting (slightly towards blue)
-    v *= IN.color.a;
     result.rgb *= 1 - v * shadecolor;
 
     // Fogging
     result.rgb = fogApply(result.rgb, IN.fog);
+#endif
 
     // Alpha to coverage conversion
     result.a = calc_coverage(result.a, 128.0/255.0, 4.0);
