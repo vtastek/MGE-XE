@@ -151,7 +151,7 @@ public:
     static bool GetEnableDepthPass();       // Always returns true (feature always enabled)
     static int GetBBoxVisualizationMode();
     static void UpdateDebugStats(int recordedCalls, int renderedCalls, int culledCalls,
-                                  int sceneLights, int recordMWSize, int immediateCount);
+                                  int sceneLights, int culledLights, int recordMWSize, int immediateCount);
 
     // Frame number overlay toggle
     static bool GetShowFrameNumber();
@@ -177,6 +177,7 @@ public:
     static bool GetShowHiZInterface();
     static int GetHiZDisplayMip() { return hiZDisplayMip; }
     static bool GetHiZInvert() { return hiZInvert; }
+    static float GetBboxExpansion() { return bboxExpansion; }
 
     // Forward SSAO visualization interface
     static void RenderSSAOInterface();
@@ -359,12 +360,14 @@ private:
     static int debugRenderedCalls;
     static int debugCulledCalls;
     static int debugSceneLights;
+    static int debugCulledLights;
     static int debugRecordMWSize;
     static int debugImmediateCount;
 
     // Hi-Z visualization variables
     static int hiZDisplayMip;
     static bool hiZInvert;
+    static float bboxExpansion;
 
     // Hi-Z occluder selection parameters
     static int occluderMaxCount;          // Base budget (default 100)

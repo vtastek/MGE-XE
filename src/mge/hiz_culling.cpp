@@ -295,6 +295,16 @@ void FixedFunctionShader::clearAllCellBatchCaches() {
     PatchDisplacement::clearAll();
 }
 
+void FixedFunctionShader::clearGeometryCaches() {
+    AcquireSRWLockExclusive(&s_geometryHashLock);
+    s_geometryHashCache.clear();
+    ReleaseSRWLockExclusive(&s_geometryHashLock);
+
+    AcquireSRWLockExclusive(&s_localMeshLock);
+    s_localMeshCache.clear();
+    ReleaseSRWLockExclusive(&s_localMeshLock);
+}
+
 // Evict least recently used cache if over limit.
 // Caller must hold s_cellBatchCacheLock exclusively.
 static void evictLRUCellBatchCacheLocked(const CellBatchCacheKey& protectedKey) {
@@ -612,6 +622,11 @@ void FixedFunctionShader::executeHiZCulling(const D3DXMATRIX& currentView, const
     // recordedCalls.shouldRender defaults to true and applyVisibilityAndFilterRecordMW()
     // also early-returns on this toggle, so leaving visibilityResults empty is safe.
     if (ImGuiManager::GetDisableHiZCulling()) {
+        // Mark all lights visible when culling is disabled
+        auto& renderBuf = getPrepBuffer();
+        for (auto& light : renderBuf.sceneLights) {
+            light.isVisible = true;
+        }
         return;
     }
 
@@ -630,7 +645,9 @@ void FixedFunctionShader::executeHiZCulling(const D3DXMATRIX& currentView, const
             MGE_ZoneScopedN("Prepare: BBox Cache Misses");
             for (auto& call : recCalls) {
                 if (!call.hasBoundingBox) {
-                    call.hasBoundingBox = computeBoundingBox(&call.rs, call.bboxMin, call.bboxMax);
+                    // Skip bbox cache for terrain - Morrowind reuses VB/IB with different geometry
+                    bool isTerrain = (call.bin == RenderBin::Terrain || call.bin == RenderBin::TerrainBlend);
+                    call.hasBoundingBox = computeBoundingBox(&call.rs, call.bboxMin, call.bboxMax, isTerrain);
                     if (call.hasBoundingBox) {
                         VBIBKey key{call.rs.vb, call.rs.ib};
                         // Use per-buffer bboxLookup to avoid race with main thread
@@ -783,8 +800,12 @@ void FixedFunctionShader::executeHiZCulling(const D3DXMATRIX& currentView, const
             }
 
             // Hi-Z test using current matrices (all CPU, no device access)
+            // Apply bbox expansion to reduce false positives
+            float expansion = ImGuiManager::GetBboxExpansion();
+            D3DXVECTOR3 expandedMin = call.bboxMin - D3DXVECTOR3(expansion, expansion, expansion);
+            D3DXVECTOR3 expandedMax = call.bboxMax + D3DXVECTOR3(expansion, expansion, expansion);
             bool isVisible = softwareOcclusionCuller.testBoundingBox(
-                call.bboxMin, call.bboxMax, currentView, currentProj);
+                expandedMin, expandedMax, currentView, currentProj);
 
             call.shouldRender = isVisible;
 
@@ -799,6 +820,27 @@ void FixedFunctionShader::executeHiZCulling(const D3DXMATRIX& currentView, const
         LOG_CAT(LOG::Cat_HiZ, ">> Hi-Z: %d visible, %d culled, %d no bbox (of %d calls)",
                      visibleCount, culledCount, noBboxCount,
                      visibleCount + culledCount + noBboxCount);
+    }
+
+    // Hi-Z test for scene lights
+    {
+        MGE_ZoneScopedN("Hi-Z Test sceneLights");
+        auto& sceneLights = renderBuf.sceneLights;
+        float expansion = ImGuiManager::GetBboxExpansion();
+        int lightVisibleCount = 0, lightCulledCount = 0;
+
+        for (auto& light : sceneLights) {
+            D3DXVECTOR3 bboxMin = light.position - D3DXVECTOR3(light.radius + expansion, light.radius + expansion, light.radius + expansion);
+            D3DXVECTOR3 bboxMax = light.position + D3DXVECTOR3(light.radius + expansion, light.radius + expansion, light.radius + expansion);
+
+            light.isVisible = softwareOcclusionCuller.testBoundingBox(
+                bboxMin, bboxMax, currentView, currentProj);
+
+            if (light.isVisible) lightVisibleCount++; else lightCulledCount++;
+        }
+
+        LOG_CAT(LOG::Cat_HiZ, ">> Hi-Z lights: %d visible, %d culled",
+                     lightVisibleCount, lightCulledCount);
     }
 }
 
@@ -1124,7 +1166,8 @@ void FixedFunctionShader::prepareRecordedCalls() {
             int terrainBboxFilled = 0;
             for (auto& call : recCalls) {
                 if (call.bin != RenderBin::Terrain || call.hasBoundingBox) continue;
-                call.hasBoundingBox = computeBoundingBox(&call.rs, call.bboxMin, call.bboxMax);
+                // Skip bbox cache for terrain - Morrowind reuses VB/IB with different geometry
+                call.hasBoundingBox = computeBoundingBox(&call.rs, call.bboxMin, call.bboxMax, /*skipCache*/ true);
                 if (call.hasBoundingBox) {
                     VBIBKey key{call.rs.vb, call.rs.ib};
                     fb.bboxLookup[key] = {call.bboxMin, call.bboxMax};
@@ -1322,7 +1365,7 @@ void FixedFunctionShader::prepareRecordedCalls() {
     markAllCallsDirty();
 }
 
-bool FixedFunctionShader::computeBoundingBox(const RenderedState* rs, D3DXVECTOR3& bboxMin, D3DXVECTOR3& bboxMax) {
+bool FixedFunctionShader::computeBoundingBox(const RenderedState* rs, D3DXVECTOR3& bboxMin, D3DXVECTOR3& bboxMax, bool skipCache) {
     static bool debugBBox = false;
     static int debugCount = 0;
     static bool keyCheckedThisRecording = false;
@@ -1377,10 +1420,10 @@ bool FixedFunctionShader::computeBoundingBox(const RenderedState* rs, D3DXVECTOR
     key.startIndex = rs->startIndex;
     key.primCount = rs->primCount;
 
-    // Check cache first (thread-safe access)
+    // Check cache first (thread-safe access) - skip for terrain (VB/IB reused with different geometry)
     ObjectSpaceBBox objBBox;
     bool cacheHit = false;
-    {
+    if (!skipCache) {
         std::lock_guard<std::mutex> lock(bboxCacheMutex);
         auto it = bboxCache.find(key);
         if (it != bboxCache.end()) {
@@ -1542,11 +1585,11 @@ bool FixedFunctionShader::computeBoundingBox(const RenderedState* rs, D3DXVECTOR
         return false;
     }
 
-    // Cache the object-space bbox (thread-safe write)
-    ObjectSpaceBBox cachedBBox;
-    cachedBBox.bboxMin = objBBoxMin;
-    cachedBBox.bboxMax = objBBoxMax;
-    {
+    // Cache the object-space bbox (thread-safe write) - skip for terrain
+    if (!skipCache) {
+        ObjectSpaceBBox cachedBBox;
+        cachedBBox.bboxMin = objBBoxMin;
+        cachedBBox.bboxMax = objBBoxMax;
         std::lock_guard<std::mutex> lock(bboxCacheMutex);
         bboxCache[key] = cachedBBox;
     }

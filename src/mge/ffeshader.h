@@ -1397,7 +1397,7 @@ private:
     static void validateDeviceState(const ExpectedDeviceState& expected, int callIndex);
     static void markAllCallsDirty();
     static ShaderKey computeShaderKeyWithSuffixes(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);
-    static bool computeBoundingBox(const RenderedState* rs, D3DXVECTOR3& bboxMin, D3DXVECTOR3& bboxMax);
+    static bool computeBoundingBox(const RenderedState* rs, D3DXVECTOR3& bboxMin, D3DXVECTOR3& bboxMax, bool skipCache = false);
 
 public:
     static void prepareRecordedCalls();  // CPU-only: compute shader keys, bins (can run async)
@@ -1415,6 +1415,7 @@ public:
     static void buildStatelessBatches(FrameBuffer& fb);  // Build merged batches (per-draw data in texture)
     static void invalidateCellBatchCache(void* cellPtr); // Invalidate cache for specific cell
     static void clearAllCellBatchCaches();               // Clear all cell batch caches
+    static void clearGeometryCaches();                   // Clear geometry hash and local mesh caches
     static void storeCellBatchCacheVB(void* cellPtr, size_t layoutHash, IDirect3DVertexBuffer9* vb, IDirect3DIndexBuffer9* ib,
                                       const std::vector<CachedDrawInfo>& drawInfos);  // Store VB/IB in cache
 

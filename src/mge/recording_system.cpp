@@ -363,24 +363,21 @@ void FixedFunctionShader::startRecording() {
             }
             softwareOcclusionCuller.clearBlacklist();
             softwareOcclusionCuller.clearMeshCache();
+            clearGeometryCaches();
             // Clear cell batch caches - VB pointers may be reused across int/ext boundary
             FixedFunctionShader::clearAllCellBatchCaches();
             lastWasExterior = isExterior;
         } else if (currentCell != lastPlayerCell) {
             FixedFunctionShader::beginCellCrossDiagnostics(lastPlayerCell, currentCell, lastWasExterior, isExterior);
-            // Keep exterior-to-exterior caches while crossing normal cell boundaries:
-            // the player is still surrounded by mostly the same loaded tiles, and
-            // clearing bboxCache here creates a one-frame displacement selection gap.
-            if (!(lastWasExterior && isExterior)) {
-                // Interior-to-interior cell changes can swap the whole scene; clear
-                // pointer-keyed geometry caches there.
-                {
-                    std::lock_guard<std::mutex> lock(bboxCacheMutex);
-                    bboxCache.clear();
-                }
-                softwareOcclusionCuller.clearBlacklist();
-                softwareOcclusionCuller.clearMeshCache();
+            // Clear pointer-keyed geometry caches on ALL cell changes - Morrowind
+            // reuses VB/IB buffers with different geometry when loading new cells
+            {
+                std::lock_guard<std::mutex> lock(bboxCacheMutex);
+                bboxCache.clear();
             }
+            softwareOcclusionCuller.clearBlacklist();
+            softwareOcclusionCuller.clearMeshCache();
+            clearGeometryCaches();
         }
 
         lastPlayerCell = currentCell;
@@ -392,6 +389,7 @@ void FixedFunctionShader::startRecording() {
 
     // Clear CPU depth buffer for new frame (replaces GPU Hi-Z readback)
     softwareOcclusionCuller.clear();
+
 
     // Capture view/projection matrices once at start of recording directly into FrameBuffer
     // Note: World transforms are captured per-call in each RenderedState

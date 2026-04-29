@@ -1916,6 +1916,9 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
             int count = 0;
 
             for (const auto& light : sceneLights) {
+                // Skip lights culled by Hi-Z
+                if (!light.isVisible) continue;
+
                 // Sphere-AABB intersection: closest point on bbox to light center
                 float cx = (light.position.x < bMin.x) ? bMin.x : (light.position.x > bMax.x) ? bMax.x : light.position.x;
                 float cy = (light.position.y < bMin.y) ? bMin.y : (light.position.y > bMax.y) ? bMax.y : light.position.y;
@@ -3442,9 +3445,14 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
 
     // Update ImGui debug stats (Scene 0 only)
     if (sceneCount == 0) {
+        int visibleLights = 0;
+        for (const auto& light : sceneLights) {
+            if (light.isVisible) visibleLights++;
+        }
+        int culledLights = (int)sceneLights.size() - visibleLights;
         ImGuiManager::UpdateDebugStats(
             totalCalls, renderedCalls, culledCalls,
-            (int)sceneLights.size(),
+            (int)sceneLights.size(), culledLights,
             (int)DistantLand::recordMW.size(), 0
         );
     }

@@ -47,12 +47,14 @@ int ImGuiManager::debugRecordedCalls = 0;
 int ImGuiManager::debugRenderedCalls = 0;
 int ImGuiManager::debugCulledCalls = 0;
 int ImGuiManager::debugSceneLights = 0;
+int ImGuiManager::debugCulledLights = 0;
 int ImGuiManager::debugRecordMWSize = 0;
 int ImGuiManager::debugImmediateCount = 0;
 
 // Hi-Z visualization variables
 int ImGuiManager::hiZDisplayMip = 0;
 bool ImGuiManager::hiZInvert = false;
+float ImGuiManager::bboxExpansion = 64.0f;
 
 // Hi-Z occluder selection parameters
 int ImGuiManager::occluderMaxCount = 100;
@@ -582,7 +584,7 @@ void ImGuiManager::RenderDebugInterface() {
 
         // Lighting stats
         ImGui::Text("Lights:");
-        ImGui::Text("  Scene Lights: %d", debugSceneLights);
+        ImGui::Text("  Scene Lights: %d (%d culled)", debugSceneLights, debugCulledLights);
         if (ImGui::Button("Dump Light Snapshot")) {
             dumpLightSnapshot = true;
         }
@@ -847,11 +849,12 @@ bool ImGuiManager::GetForceLightMode3() { return forceLightMode3; }
 int ImGuiManager::GetShaderDebugMode() { return shaderDebugMode; }
 
 void ImGuiManager::UpdateDebugStats(int recordedCalls, int renderedCalls, int culledCalls,
-                                     int sceneLights, int recordMWSize, int immediateCount) {
+                                     int sceneLights, int culledLights, int recordMWSize, int immediateCount) {
     debugRecordedCalls = recordedCalls;
     debugRenderedCalls = renderedCalls;
     debugCulledCalls = culledCalls;
     debugSceneLights = sceneLights;
+    debugCulledLights = culledLights;
     debugRecordMWSize = recordMWSize;
     debugImmediateCount = immediateCount;
 }
@@ -1634,6 +1637,8 @@ void ImGuiManager::RenderHiZInterface() {
             ImGui::Text("Visualization Settings");
             ImGui::SliderInt("Mip Level", &hiZDisplayMip, 0, maxMipLevel);
             ImGui::Checkbox("Invert Depth", &hiZInvert);
+            ImGui::SliderFloat("BBox Expansion", &bboxExpansion, 0.0f, 64.0f, "%.1f units");
+            ImGui::SetItemTooltip("Expand bounding boxes before Hi-Z test to reduce false positives");
 
             UINT width = culler.getHiZWidth(hiZDisplayMip);
             UINT height = culler.getHiZHeight(hiZDisplayMip);
