@@ -51,15 +51,22 @@ bool PostShaders::usesForwardSSAO(int environmentFlags) {
     if (!isHLSLActive()) {
         return false;
     }
-    for (const auto& s : shaders) {
-        if (!s->enabled || (s->disableFlags & environmentFlags)) {
-            continue;
-        }
-        if (s->name == "SSAO Fast" || s->name == "SSAO HQ") {
-            return true;
+
+    static bool warnedPostSSAO = false;
+    if (!warnedPostSSAO) {
+        for (const auto& s : shaders) {
+            if (!s->enabled || (s->disableFlags & environmentFlags)) {
+                continue;
+            }
+            if (s->name == "SSAO Fast" || s->name == "SSAO HQ") {
+                LOG::logline("!! Warning: Post-process SSAO shader '%s' is active alongside prepass SSAO", s->name.c_str());
+                warnedPostSSAO = true;
+                break;
+            }
         }
     }
-    return false;
+
+    return true;
 }
 
 

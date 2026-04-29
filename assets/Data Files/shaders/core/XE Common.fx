@@ -269,9 +269,10 @@ float3 ToneMap_AgX_Linear(float3 linCol) {
 
 // Linear-space exponential fog (matches fogScalar shape). fogFactor in [0,1]:
 // 1 = no fog (full color), 0 = full fog. Applied before AgX so the horizon
-// dissolve happens in scene-referred linear space.
+// dissolve happens in scene-referred linear space. Fog is divided by PI to
+// cancel AgX's internal exposure bias (meant for lit content), matching sky.
 float3 fogApplyLinearAgX(float3 cLin, float3 fogColLin, float fogFactor) {
-    float3 lit = lerp(fogColLin, cLin, fogFactor);
+    float3 lit = lerp(fogColLin / PI, cLin, fogFactor);
     return ToneMap_AgX_Linear(lit);
 }
 #endif
