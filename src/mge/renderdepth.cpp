@@ -13,8 +13,42 @@
 
 #include <algorithm>
 #include <cmath>
+#include <unordered_map>
 
+// Cache for previous frame's world matrices (for velocity buffer)
+// Key uses geometry hash + draw params + position + mirror flag to identify unique instances
+struct VelocityGeometryKey {
+    size_t geometryHash;  // Content-based hash from vertex data
+    UINT primCount;       // Distinguishes sub-meshes within same VB (e.g., palm vs fingers)
+    UINT startIndex;      // Index buffer offset for this draw
+    int posX, posY, posZ;  // Coarse position bucket (64 units)
+    int rotBucket;        // Rotation bucket (8 directions, 45° each) to distinguish rotated instances
+    bool mirrored;        // True if world matrix has negative determinant (left/right distinction)
 
+    bool operator==(const VelocityGeometryKey& o) const {
+        return geometryHash == o.geometryHash &&
+               primCount == o.primCount && startIndex == o.startIndex &&
+               posX == o.posX && posY == o.posY && posZ == o.posZ &&
+               rotBucket == o.rotBucket && mirrored == o.mirrored;
+    }
+};
+
+struct VelocityGeometryKeyHash {
+    size_t operator()(const VelocityGeometryKey& k) const {
+        size_t h = k.geometryHash;
+        h ^= k.primCount + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= k.startIndex + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= (size_t)k.posX + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= (size_t)k.posY + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= (size_t)k.posZ + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= (size_t)k.rotBucket + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= (size_t)k.mirrored + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+static std::unordered_map<VelocityGeometryKey, D3DXMATRIX, VelocityGeometryKeyHash> s_prevWorldCache;
+static std::unordered_map<VelocityGeometryKey, D3DXMATRIX, VelocityGeometryKeyHash> s_curWorldCache;
 
 void DistantLand::renderDepth(DLContext* ctx, const std::vector<RecordedMWState>& recMW, int sceneFilter, FixedFunctionShader::FrameBuffer* fb) {
     MGE_ZoneScopedN("renderDepth");
@@ -133,6 +167,12 @@ void DistantLand::renderDepthAdditional(DLContext* ctx, const std::vector<Record
     RenderTargetSwitcher rtsw(targetOverride ? targetOverride : surfDepthFrameMSAA,
         depthStencilOverride ? depthStencilOverride : surfDepthDepth);
 
+    // Set RT1 for velocity buffer (MRT with depth) - only if not using custom target
+    bool useVelocityMRT = velocityBufferEnabled && surfVelocityMSAA && !targetOverride;
+    if (useVelocityMRT) {
+        device->SetRenderTarget(1, surfVelocityMSAA);
+    }
+
     if (clearZ) {
         device->Clear(0, 0, D3DCLEAR_ZBUFFER, 0, 1.0f, 0);
         g_passBreaks.raw_clear++;
@@ -156,6 +196,11 @@ void DistantLand::renderDepthAdditional(DLContext* ctx, const std::vector<Record
     effectDepth->BeginPass(PASS_RENDERMWDEPTH);
     renderDepthRecorded(recMW, sceneFilter, viewToUse);
     effectDepth->EndPass();
+
+    // Clear RT1 after rendering
+    if (useVelocityMRT) {
+        device->SetRenderTarget(1, nullptr);
+    }
 
     // Reset projection matrix
     effect->SetMatrix(ehProj, &ctx->mwProj);
@@ -294,6 +339,17 @@ void DistantLand::renderDepthRecorded(const std::vector<RecordedMWState>& recMW,
     // to have interpolated fragment values that vary either side of the threshold and cause noise.
     const float solidThreshold = 0.499f;
 
+    // Swap world matrix caches for velocity buffer (once per frame on Scene 0)
+    static int lastFrameSwapped = -1;
+    if (sceneFilter == 0 && velocityBufferEnabled) {
+        int curFrame = FixedFunctionShader::getRenderingBuffer().frameNumber;
+        if (curFrame != lastFrameSwapped) {
+            s_prevWorldCache = std::move(s_curWorldCache);
+            s_curWorldCache.clear();
+            lastFrameSwapped = curFrame;
+        }
+    }
+
     // DEBUG: Log renderDepthRecorded call and scene filter breakdown
     static int logCount = 0;
     if (logCount < 4) {
@@ -377,12 +433,14 @@ void DistantLand::renderDepthRecorded(const std::vector<RecordedMWState>& recMW,
         effect->SetInt(ehVertexBlendState, i.vertexBlendState);
 
         // Recalculate skinned transforms with game view matrix (not device view, which may be UI)
+        D3DXMATRIX currentWorldViewForCache = i.worldViewTransforms[0];
         if (i.vertexBlendState > 0 && gameView) {
             D3DXMATRIX currentWorldViewTransforms[4];
             for (int j = 0; j < 4; j++) {
                 currentWorldViewTransforms[j] = i.worldTransforms[j] * (*gameView);
             }
             effect->SetMatrixArray(ehVertexBlendPalette, currentWorldViewTransforms, 4);
+            currentWorldViewForCache = currentWorldViewTransforms[0];
         } else if (i.vertexBlendState > 0) {
             // Fallback: use staging view (device may not have current transforms with state suppression)
             D3DXMATRIX currentView, currentWorldViewTransforms[4];
@@ -391,9 +449,100 @@ void DistantLand::renderDepthRecorded(const std::vector<RecordedMWState>& recMW,
                 currentWorldViewTransforms[j] = i.worldTransforms[j] * currentView;
             }
             effect->SetMatrixArray(ehVertexBlendPalette, currentWorldViewTransforms, 4);
+            currentWorldViewForCache = currentWorldViewTransforms[0];
         } else {
             effect->SetMatrixArray(ehVertexBlendPalette, i.worldViewTransforms, 4);
         }
+
+        // Velocity buffer: cache WORLD matrices (not worldview) so camera motion cancels out.
+        // prevWorldView = prev_world * current_view, so only object motion produces velocity.
+        // Key uses geometry hash + coarse position + mirror flag (for left/right body parts).
+        if (velocityBufferEnabled && gameView) {
+            const int kPosBucketSize = 8;  // ~6cm buckets to separate nearby instances
+            size_t geoHash = computeGeometryHash(i.vb, i.vbOffset, i.vbStride, i.vertCount, i.fvf);
+
+            // Compute 3x3 determinant to detect mirrored meshes (negative scale)
+            const D3DXMATRIX& w = i.worldTransforms[0];
+            float det3 = w._11 * (w._22 * w._33 - w._23 * w._32)
+                       - w._12 * (w._21 * w._33 - w._23 * w._31)
+                       + w._13 * (w._21 * w._32 - w._22 * w._31);
+            bool mirrored = det3 < 0;
+
+            // Quantize rotation to 8 buckets (45° each) based on local X axis direction in world XY
+            // This distinguishes objects at same position but rotated around Z (vertical axis)
+            // Row 1 of world matrix (_11, _12) = where local X axis points in world XY
+            int rotBucket = 0;
+            float rightX = w._11, rightY = w._12;  // Local X axis in world XY (how mesh "faces")
+            if (rightX != 0 || rightY != 0) {
+                float angle = atan2f(rightY, rightX);  // -PI to PI
+                rotBucket = (int)((angle + 3.14159265f) / (6.28318530f / 8.0f));  // 0-8
+                rotBucket = rotBucket & 7;  // Wrap to 0-7
+            }
+
+            VelocityGeometryKey vkey{
+                geoHash,
+                i.primCount,
+                i.startIndex,
+                (int)(w._41 / kPosBucketSize),
+                (int)(w._42 / kPosBucketSize),
+                (int)(w._43 / kPosBucketSize),
+                rotBucket,
+                mirrored
+            };
+            D3DXMATRIX prevWorldView[4];
+
+            auto it = s_prevWorldCache.find(vkey);
+            if (it != s_prevWorldCache.end()) {
+                // Sanity check: reject if prev world position is wildly different (collision)
+                float dx = it->second._41 - i.worldTransforms[0]._41;
+                float dy = it->second._42 - i.worldTransforms[0]._42;
+                float dz = it->second._43 - i.worldTransforms[0]._43;
+                float distSq = dx*dx + dy*dy + dz*dz;
+
+                // Max 300 units movement per frame (generous for fast objects)
+                if (distSq < 300.0f * 300.0f) {
+                    // Found valid previous world matrix - multiply by CURRENT view
+                    D3DXMatrixMultiply(&prevWorldView[0], &it->second, gameView);
+                } else {
+                    // Cache collision - use current (no velocity)
+                    prevWorldView[0] = currentWorldViewForCache;
+                }
+            } else {
+                // No prev, use current worldview (no velocity on first frame)
+                prevWorldView[0] = currentWorldViewForCache;
+            }
+            for (int j = 1; j < 4; j++) {
+                prevWorldView[j] = prevWorldView[0];  // Copy for skinned (simplified)
+            }
+            effect->SetMatrixArray(ehPrevVertexBlendPalette, prevWorldView, 4);
+
+            // Store WORLD matrix (not worldview) for next frame
+            s_curWorldCache[vkey] = i.worldTransforms[0];
+
+            // Debug: log first few velocity lookups
+            static int velLogCount = 0;
+            if (velLogCount < 5 && it != s_prevWorldCache.end()) {
+                float curW41 = currentWorldViewForCache._41;
+                float prevW41 = prevWorldView[0]._41;
+                float diff = curW41 - prevW41;
+                if (std::abs(diff) > 0.01f) {
+                    LOG::logline(">> Velocity: vb=%p diff=%.3f (cur=%.2f prev=%.2f) - object moving",
+                        i.vb, diff, curW41, prevW41);
+                    velLogCount++;
+                }
+            }
+        } else if (velocityBufferEnabled) {
+            // No gameView available - use identity for prev (will show some velocity)
+            LOG::logline("!! Velocity: gameView is null for vb=%p", i.vb);
+            effect->SetMatrixArray(ehPrevVertexBlendPalette, i.worldViewTransforms, 4);
+        }
+
+        // Always set prevVertexBlendPalette to avoid undefined shader behavior
+        // (shader always reads it, even if velocity buffer is disabled)
+        if (!velocityBufferEnabled) {
+            effect->SetMatrixArray(ehPrevVertexBlendPalette, i.worldViewTransforms, 4);
+        }
+
         effectDepth->CommitChanges();
 
         // Scene 2 objects (hands): force opaque depth write

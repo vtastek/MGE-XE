@@ -382,8 +382,9 @@ void FixedFunctionShader::storeCellBatchCacheVB(void* cellPtr, size_t layoutHash
 }
 
 // Compute geometry hash from VB content (samples first N vertices for speed)
-static size_t computeGeometryHash(IDirect3DVertexBuffer9* vb, UINT offset, UINT stride,
-                                   UINT vertCount, DWORD fvf) {
+// Non-static: also used by renderdepth.cpp for velocity buffer tracking
+size_t computeGeometryHash(IDirect3DVertexBuffer9* vb, UINT offset, UINT stride,
+                           UINT vertCount, DWORD fvf) {
     // Check cache first
     VBGeometryKey key = { vb, offset, stride, vertCount, fvf };
 

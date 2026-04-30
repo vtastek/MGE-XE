@@ -192,11 +192,12 @@ float4 ps_main(VS_OUTPUT input, float2 pixelPos : VPOS) : COLOR{
 	float normalOverlayMask = input.color.a;
 	
 	float3 ambient = INTENSITY * pow((lightSceneAmbient) + EPS, 2.2) / PI;
+	float forwardAO = 1.0;
 	if (forwardSSAOParams.x > 0.5) {
 		// Screen-space AO must be sampled from per-pixel window coordinates, not a
 		// UV pre-divided by clip.w in the VS, or it will project across triangles.
 		float2 forwardSSAOUV = (pixelPos + 0.5.xx) * forwardSSAOParams.yz;
-		float forwardAO = saturate(1.0 - 1.8 * tex2D(sampForwardSSAO, forwardSSAOUV).r);
+		forwardAO = saturate(1.0 - 1.8 * tex2D(sampForwardSSAO, forwardSSAOUV).r);
 		ambient *= forwardAO;
 	}
 	float shadows = 1.0;
@@ -318,6 +319,13 @@ float4 ps_main(VS_OUTPUT input, float2 pixelPos : VPOS) : COLOR{
 		normalVS = inputVS;
 	#endif
 
+	// Bent normal: lerp toward view direction in occluded areas for smoother contact transitions
+	if (forwardSSAOParams.x > 0.5 && forwardSSAOParams.w > 0.5) {
+		float3 viewDir = normalize(-input.viewPos);
+		float occlusion = 1.0 - forwardAO;
+		float bendStrength = 0.4;
+		normalVS = normalize(lerp(normalVS, viewDir, occlusion * bendStrength));
+	}
 
 	float4 texColor = tex2D(sampTex0, parallaxUV);
 	texColor.rgb = max(0.0, toLinear(texColor.rgb));
@@ -668,7 +676,11 @@ float4 ps_main(VS_OUTPUT input, float2 pixelPos : VPOS) : COLOR{
 		}
 		else if (debugMode == 18) {
 			// Raw sun color (gamma-space input from Morrowind)
+			#ifndef NOLIT
 			debugColor = lightSunDiffuse;
+			#else
+			debugColor = float3(0.2, 0.2, 0.2); // Gray = NOLIT variant
+			#endif
 		}
 		else if (debugMode == 19) {
 			// Raw ambient color (gamma-space input from Morrowind)

@@ -116,6 +116,10 @@ DepthVertOut DepthLandVS(float4 pos: POSITION, float2 texcoord: TEXCOORD0) {
     OUT.alpha = 1;
     OUT.texcoords = texcoord;
 
+    // Static distant land has no velocity
+    OUT.curClip = OUT.pos;
+    OUT.prevClip = OUT.pos;
+
     return OUT;
 }
 

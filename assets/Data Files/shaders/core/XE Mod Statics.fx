@@ -141,6 +141,10 @@ DepthVertOut DepthStaticVS (StatVertIn IN) {
     OUT.alpha = 1;
     OUT.texcoords = texcoordsModifier(IN);
 
+    // Static distant statics have no velocity
+    OUT.curClip = OUT.pos;
+    OUT.prevClip = OUT.pos;
+
     return OUT;
 }
 

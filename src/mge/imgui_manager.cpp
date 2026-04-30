@@ -13,6 +13,7 @@ bool ImGuiManager::showPCFInterface = false;
 bool ImGuiManager::showDebugInterface = false;
 bool ImGuiManager::showHiZInterface = false;
 bool ImGuiManager::showSSAOInterface = false;
+bool ImGuiManager::showVelocityInterface = false;
 HWND ImGuiManager::windowHandle = nullptr;
 
 static bool s_renderInvalidationLatched = false;
@@ -219,7 +220,7 @@ bool ImGuiManager::Initialize(HWND hwnd, IDirect3DDevice9* device) {
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
     
     // Enable ImGui to draw its own cursor when interface is showing
-    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showFrameEventLog;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showVelocityInterface || showFrameEventLog;
 
     // Setup Dear ImGui style
     ImGui::StyleColorsDark();
@@ -403,7 +404,7 @@ void ImGuiManager::RenderPCFFilteringInterface() {
 
     // Update mouse cursor visibility based on interface state
     ImGuiIO& io = ImGui::GetIO();
-    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showFrameEventLog;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showVelocityInterface || showFrameEventLog;
 }
 
 // Getter functions for shader constants
@@ -428,7 +429,7 @@ void ImGuiManager::TogglePCFInterface() {
     
     // Update mouse cursor visibility
     ImGuiIO& io = ImGui::GetIO();
-    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showFrameEventLog;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showVelocityInterface || showFrameEventLog;
     
     // Save PCF settings when interface is being closed
     if (wasShowing && !showPCFInterface) {
@@ -636,6 +637,13 @@ void ImGuiManager::RenderDebugInterface() {
         ImGui::SetItemTooltip("Preview the raw or blurred SSAO texture generated before Scene 0 replay.");
 
         ImGui::Separator();
+        ImGui::Text("Velocity Buffer");
+        ImGui::Checkbox("Enable Velocity Buffer", &DistantLand::velocityBufferEnabled);
+        ImGui::SetItemTooltip("Compute per-pixel velocity for motion blur (object motion only, camera excluded).");
+        ImGui::Checkbox("Show Velocity Viewer", &showVelocityInterface);
+        ImGui::SetItemTooltip("Preview the velocity buffer texture.");
+
+        ImGui::Separator();
         ImGui::Text("Bounding Box Visualization");
 
         const char* bboxModes[] = { "OFF", "Objects (Green=Rendered, Red=Culled)", "Lights (Green=Visible, Red=Culled)" };
@@ -811,7 +819,7 @@ void ImGuiManager::RenderDebugInterface() {
 
     // Update mouse cursor visibility based on interface state
     ImGuiIO& io = ImGui::GetIO();
-    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showFrameEventLog;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showVelocityInterface || showFrameEventLog;
 }
 
 void ImGuiManager::ToggleDebugInterface() {
@@ -819,7 +827,7 @@ void ImGuiManager::ToggleDebugInterface() {
 
     // Update mouse cursor visibility
     ImGuiIO& io = ImGui::GetIO();
-    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showFrameEventLog;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showVelocityInterface || showFrameEventLog;
 }
 
 // Debug control getters (Recording/Replay/Immediate/Depth always enabled)
@@ -1257,7 +1265,7 @@ void ImGuiManager::ToggleFrameEventLog() {
     showFrameEventLog = !showFrameEventLog;
 
     ImGuiIO& io = ImGui::GetIO();
-    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showFrameEventLog;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showVelocityInterface || showFrameEventLog;
 }
 
 void ImGuiManager::RenderFrameEventLog() {
@@ -1717,7 +1725,7 @@ void ImGuiManager::RenderHiZInterface() {
 
     // Update mouse cursor visibility based on interface state
     ImGuiIO& io = ImGui::GetIO();
-    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showFrameEventLog;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showVelocityInterface || showFrameEventLog;
 }
 
 void ImGuiManager::ToggleHiZInterface() {
@@ -1725,7 +1733,7 @@ void ImGuiManager::ToggleHiZInterface() {
 
     // Update mouse cursor visibility
     ImGuiIO& io = ImGui::GetIO();
-    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showFrameEventLog;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showVelocityInterface || showFrameEventLog;
 }
 
 bool ImGuiManager::GetShowHiZInterface() {
@@ -1744,6 +1752,9 @@ void ImGuiManager::RenderSSAOInterface() {
         const char* textureLabel = showRawSSAO ? "Intermediate SSAO (between blur passes)" : "Final SSAO (forward replay input)";
 
         ImGui::Text("Status: %s", DistantLand::forwardSSAOActive ? "Active this frame" : "Inactive this frame");
+        ImGui::Checkbox("Enable SSAO", &DistantLand::forwardSSAOEnabled);
+        ImGui::Checkbox("Bend Normals", &DistantLand::forwardSSAOBendNormals);
+        ImGui::SetItemTooltip("Lerp normals toward view direction in occluded areas for smoother contact transitions.");
         ImGui::Checkbox("Show Intermediate SSAO", &showRawSSAO);
         ImGui::SetItemTooltip("Switch between the final forward SSAO texture and the intermediate buffer used between blur passes.");
         ImGui::SliderFloat("Zoom", &ssaoZoom, 0.25f, 2.0f, "%.2fx");
@@ -1780,6 +1791,48 @@ void ImGuiManager::RenderSSAOInterface() {
     }
     ImGui::End();
 
+    // Velocity Buffer Viewer Window
+    if (showVelocityInterface) {
+        ImGui::SetNextWindowSize(ImVec2(400, 450), ImGuiCond_FirstUseEver);
+        ImGui::Begin("Velocity Buffer", &showVelocityInterface);
+
+        static float velocityZoom = 1.0f;
+        static float velocityScale = 10.0f;
+
+        ImGui::Checkbox("Enable Velocity Buffer", &DistantLand::velocityBufferEnabled);
+        ImGui::SliderFloat("Zoom", &velocityZoom, 0.25f, 2.0f, "%.2fx");
+        ImGui::SliderFloat("Display Scale", &velocityScale, 1.0f, 50.0f, "%.1f");
+        ImGui::SetItemTooltip("Amplify velocity visualization (actual values are typically small).");
+        ImGui::Separator();
+
+        IDirect3DTexture9* texture = DistantLand::texVelocity;
+        if (texture && DistantLand::velocityBufferEnabled) {
+            D3DSURFACE_DESC desc = {};
+            if (SUCCEEDED(texture->GetLevelDesc(0, &desc))) {
+                ImGui::Text("Resolution: %ux%u (G16R16F)", desc.Width, desc.Height);
+                ImGui::Text("Red = X velocity, Green = Y velocity");
+                ImGui::BeginChild("VelocityTexture", ImVec2(0.0f, 0.0f), true, ImGuiWindowFlags_HorizontalScrollbar);
+                ImVec2 contentSize = ImGui::GetContentRegionAvail();
+                float fitScale = 1.0f;
+                if (desc.Width > 0 && desc.Height > 0) {
+                    fitScale = std::min(contentSize.x / (float)desc.Width, contentSize.y / (float)desc.Height);
+                }
+                if (fitScale <= 0.0f) {
+                    fitScale = 1.0f;
+                }
+                float displayScale = fitScale * velocityZoom;
+                ImGui::Image((void*)texture, ImVec2(desc.Width * displayScale, desc.Height * displayScale));
+                ImGui::EndChild();
+            } else {
+                ImGui::Text("Unable to query velocity texture description.");
+            }
+        } else {
+            ImGui::Text("No velocity texture available.");
+            ImGui::Text("Enable velocity buffer and HLSL mode to generate.");
+        }
+        ImGui::End();
+    }
+
     ImGuiIO& io = ImGui::GetIO();
-    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showFrameEventLog;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showVelocityInterface || showFrameEventLog;
 }

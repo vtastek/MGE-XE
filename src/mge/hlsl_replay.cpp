@@ -368,7 +368,7 @@ static void bindForwardSSAOSlot(IDirect3DDevice9* device, D3DCommandBuffer* cmdB
 static void setForwardSSAOParams(IDirect3DDevice9* device, D3DCommandBuffer* cmdBuf, bool enabled) {
     D3DVIEWPORT9 vp{};
     if (FAILED(device->GetViewport(&vp))) {
-        float v[4] = { enabled ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f };
+        float v[4] = { enabled ? 1.0f : 0.0f, 0.0f, 0.0f, DistantLand::forwardSSAOBendNormals ? 1.0f : 0.0f };
         setConstantF(cmdBuf, device, false, 24, v, 1);
         return;
     }
@@ -379,7 +379,7 @@ static void setForwardSSAOParams(IDirect3DDevice9* device, D3DCommandBuffer* cmd
         enabled ? 1.0f : 0.0f,
         1.0f / width,
         1.0f / height,
-        0.0f
+        DistantLand::forwardSSAOBendNormals ? 1.0f : 0.0f
     };
     setConstantF(cmdBuf, device, false, 24, v, 1);
 }
@@ -793,7 +793,7 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         device->SetSamplerState(9, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
     }
 
-    const bool useForwardSSAO = DistantLand::forwardSSAOActive && replayCall &&
+    const bool useForwardSSAO = DistantLand::forwardSSAOEnabled && DistantLand::forwardSSAOActive && replayCall &&
         (replayCall->sceneNum == 0 || replayCall->sceneNum == 2);
     bindForwardSSAOSlot(device, cmdBuf, useForwardSSAO);
     setForwardSSAOParams(device, cmdBuf, useForwardSSAO);
@@ -2913,7 +2913,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                             device->SetSamplerState(9, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
                         }
 
-                        const bool useForwardSSAO = DistantLand::forwardSSAOActive &&
+                        const bool useForwardSSAO = DistantLand::forwardSSAOEnabled && DistantLand::forwardSSAOActive &&
                             (firstCall.sceneNum == 0 || firstCall.sceneNum == 2);
                         bindForwardSSAOSlot(device, nullptr, useForwardSSAO);
                         setForwardSSAOParams(device, nullptr, useForwardSSAO);

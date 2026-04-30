@@ -13,7 +13,10 @@
 #include <functional>
 #include <memory>
 
-
+// Geometry hash function (defined in hiz_culling.cpp)
+// Computes a content-based hash from vertex buffer data for identifying identical meshes
+size_t computeGeometryHash(IDirect3DVertexBuffer9* vb, UINT offset, UINT stride,
+                           UINT vertCount, DWORD fvf);
 
 struct MGEShader;
 
@@ -101,6 +104,9 @@ public:
     static IDirect3DSurface9* surfDepthFrameMSAA; // Phase A: MSAA render target for depth frame
     static IDirect3DSurface9* surfDepthDepth;
     static IDirect3DSurface9* surfDepthDepthResolved; // Non-MSAA depth buffer for direct writes into texDepthFrame
+    static IDirect3DTexture9* texVelocity;
+    static IDirect3DSurface9* surfVelocityMSAA; // MSAA render target for velocity buffer
+    static bool velocityBufferEnabled;
     static IDirect3DTexture9* texForwardSSAORaw;
     static IDirect3DSurface9* surfForwardSSAORaw;
     static IDirect3DTexture9* texForwardSSAO;
@@ -110,6 +116,8 @@ public:
     static IDirect3DPixelShader9* psForwardSSAOBlur;
     static IDirect3DVertexBuffer9* vbForwardPrepass;
     static bool forwardSSAOActive;
+    static bool forwardSSAOEnabled;
+    static bool forwardSSAOBendNormals;
     static IDirect3DTexture9* texCullDepth; // Cull-only depth (recordMW only, for Hi-Z)
     static IDirect3DTexture9* texHiZ; // Hi-Z pyramid - even mips (0,2,4...) for ping-pong generation
     static IDirect3DTexture9* texHiZPrev; // Hi-Z pyramid - odd mips (1,3,5...) for ping-pong generation
@@ -164,7 +172,7 @@ public:
     static D3DXHANDLE ehRcpRes, ehShadowRcpRes;
     static D3DXHANDLE ehWorld, ehView, ehProj;
     static D3DXHANDLE ehShadowViewproj;
-    static D3DXHANDLE ehVertexBlendState, ehVertexBlendPalette;
+    static D3DXHANDLE ehVertexBlendState, ehVertexBlendPalette, ehPrevVertexBlendPalette;
     static D3DXHANDLE ehAlphaRef, ehMaterialAlpha;
     static D3DXHANDLE ehHasAlpha, ehHasBones, ehHasVCol;
     static D3DXHANDLE ehTex0, ehTex1, ehTex2, ehTex3, ehTex4, ehTex5;

@@ -82,6 +82,9 @@ IDirect3DTexture9* DistantLand::texDepthFrame;
 IDirect3DSurface9* DistantLand::surfDepthFrameMSAA;
 IDirect3DSurface9* DistantLand::surfDepthDepth;
 IDirect3DSurface9* DistantLand::surfDepthDepthResolved;
+IDirect3DTexture9* DistantLand::texVelocity = nullptr;
+IDirect3DSurface9* DistantLand::surfVelocityMSAA = nullptr;
+bool DistantLand::velocityBufferEnabled = true;
 IDirect3DTexture9* DistantLand::texForwardSSAORaw = nullptr;
 IDirect3DSurface9* DistantLand::surfForwardSSAORaw = nullptr;
 IDirect3DTexture9* DistantLand::texForwardSSAO = nullptr;
@@ -91,6 +94,8 @@ IDirect3DPixelShader9* DistantLand::psForwardSSAO = nullptr;
 IDirect3DPixelShader9* DistantLand::psForwardSSAOBlur = nullptr;
 IDirect3DVertexBuffer9* DistantLand::vbForwardPrepass = nullptr;
 bool DistantLand::forwardSSAOActive = false;
+bool DistantLand::forwardSSAOEnabled = true;
+bool DistantLand::forwardSSAOBendNormals = true;
 IDirect3DTexture9* DistantLand::texCullDepth;
 IDirect3DTexture9* DistantLand::texHiZ;
 IDirect3DTexture9* DistantLand::texHiZPrev;
@@ -168,6 +173,7 @@ D3DXHANDLE DistantLand::ehProj;
 D3DXHANDLE DistantLand::ehShadowViewproj;
 D3DXHANDLE DistantLand::ehVertexBlendState;
 D3DXHANDLE DistantLand::ehVertexBlendPalette;
+D3DXHANDLE DistantLand::ehPrevVertexBlendPalette;
 D3DXHANDLE DistantLand::ehAlphaRef;
 D3DXHANDLE DistantLand::ehMaterialAlpha;
 D3DXHANDLE DistantLand::ehHasAlpha;
@@ -647,6 +653,12 @@ bool DistantLand::initShader() {
     ehShadowViewproj = effect->GetParameterByName(0, "shadowViewProj");
     ehVertexBlendState = effect->GetParameterByName(0, "vertexBlendState");
     ehVertexBlendPalette = effect->GetParameterByName(0, "vertexBlendPalette");
+    ehPrevVertexBlendPalette = effect->GetParameterByName(0, "prevVertexBlendPalette");
+    if (!ehPrevVertexBlendPalette) {
+        LOG::logline("!! Warning: prevVertexBlendPalette handle is NULL - velocity buffer may not work");
+    } else {
+        LOG::logline(">> prevVertexBlendPalette handle acquired successfully");
+    }
     ehAlphaRef = effect->GetParameterByName(0, "alphaRef");
     ehMaterialAlpha = effect->GetParameterByName(0, "materialAlpha");
     ehHasAlpha = effect->GetParameterByName(0, "hasAlpha");
@@ -769,6 +781,24 @@ bool DistantLand::initDepth() {
         surfDepthDepthResolved = surfDepthDepth;
         surfDepthDepthResolved->AddRef();
     }
+
+    // Create velocity buffer for motion blur (R16G16F for signed screen-space velocity)
+    hr = device->CreateTexture(vp.Width, vp.Height, 1, D3DUSAGE_RENDERTARGET, D3DFMT_G16R16F, D3DPOOL_DEFAULT, &texVelocity, NULL);
+    if (hr != D3D_OK) {
+        LOG::logline("!! Failed to create velocity texture");
+        return false;
+    }
+
+    if (msaaSamples != D3DMULTISAMPLE_NONE) {
+        hr = device->CreateRenderTarget(vp.Width, vp.Height, D3DFMT_G16R16F, msaaSamples, msaaQuality, FALSE, &surfVelocityMSAA, NULL);
+        if (hr != D3D_OK) {
+            LOG::logline("!! Failed to create MSAA velocity render target");
+            return false;
+        }
+    } else {
+        texVelocity->GetSurfaceLevel(0, &surfVelocityMSAA);
+    }
+    LOG::logline(">> Velocity buffer created: %dx%d G16R16F", vp.Width, vp.Height);
 
     // Create cull depth texture (non-MSAA, recordMW only, for Hi-Z culling)
     hr = device->CreateTexture(vp.Width, vp.Height, 1, D3DUSAGE_RENDERTARGET, D3DFMT_R32F, D3DPOOL_DEFAULT, &texCullDepth, NULL);
@@ -2066,6 +2096,14 @@ void DistantLand::release() {
     surfDepthDepth = nullptr;
     surfDepthDepthResolved->Release();
     surfDepthDepthResolved = nullptr;
+    if (texVelocity) {
+        texVelocity->Release();
+        texVelocity = nullptr;
+    }
+    if (surfVelocityMSAA) {
+        surfVelocityMSAA->Release();
+        surfVelocityMSAA = nullptr;
+    }
     releaseForwardPrepassShaders();
     releaseForwardPrepassTargets();
     releaseForwardPrepassAux();

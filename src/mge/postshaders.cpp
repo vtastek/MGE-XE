@@ -20,7 +20,7 @@
 
 // Must match enum EffectVariableID in postshaders.h
 const char* effectVariableList[] = {
-    "lastshader", "lastpass", "depthframe", "watertexture",
+    "lastshader", "lastpass", "depthframe", "watertexture", "velocityframe",
     "eyevec", "eyepos", "sunvec", "suncol", "sunamb", "sunpos", "sunvis", "HDR",
     "mview", "mproj", "fogcol", "fognearcol", "fogstart", "fogrange", "fognearstart", "fognearrange",
     "rcpres", "fov", "time", "waterlevel", "isInterior", "isUnderwater"

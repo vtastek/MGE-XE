@@ -137,5 +137,9 @@ DepthVertOut DepthGrassInstVS(StatVertInstIn IN) {
     OUT.alpha = 1;
     OUT.texcoords = IN.texcoords;
 
+    // Grass is static (sway is cosmetic), no velocity
+    OUT.curClip = OUT.pos;
+    OUT.prevClip = OUT.pos;
+
     return OUT;
 }

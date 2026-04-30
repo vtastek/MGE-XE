@@ -323,6 +323,7 @@ private:
     static bool showDebugInterface;
     static bool showHiZInterface;
     static bool showSSAOInterface;
+    static bool showVelocityInterface;
     static HWND windowHandle;
 
     // PCF filtering variables for tweaking

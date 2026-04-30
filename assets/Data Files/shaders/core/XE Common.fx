@@ -12,6 +12,7 @@ shared float2 rcpRes;
 shared float shadowRcpRes;
 shared matrix world, view, proj;
 shared matrix vertexBlendPalette[4];
+shared matrix prevVertexBlendPalette[4];  // Previous frame's worldview for velocity
 shared matrix shadowViewProj[2];
 shared bool hasAlpha, hasBones, hasVCol;
 shared float alphaRef, materialAlpha;
@@ -89,6 +90,8 @@ struct DepthVertOut {
     float alpha : COLOR0;
 	half2 texcoords : TEXCOORD0;
     float depth : TEXCOORD1;
+    float4 curClip : TEXCOORD2;   // Current clip position for velocity
+    float4 prevClip : TEXCOORD3;  // Previous clip position for velocity
 };
 
 //------------------------------------------------------------

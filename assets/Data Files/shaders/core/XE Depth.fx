@@ -18,12 +18,20 @@
 //------------------------------------------------------------
 // Floating point clears
 
+struct DepthClearOut {
+    float4 depth : COLOR0;
+    float4 velocity : COLOR1;
+};
+
 float4 DepthClearVS(float4 pos : POSITION) : POSITION {
     return pos;
 }
 
-float4 DepthClearPS(float4 pos : POSITION) : COLOR0 {
-    return 1.0e38;
+DepthClearOut DepthClearPS(float4 pos : POSITION) {
+    DepthClearOut OUT;
+    OUT.depth = 1.0e38;
+    OUT.velocity = float4(0, 0, 0, 0);  // Zero velocity
+    return OUT;
 }
 
 //------------------------------------------------------------
@@ -31,7 +39,7 @@ float4 DepthClearPS(float4 pos : POSITION) : COLOR0 {
 
 DepthVertOut DepthMWVS(MorrowindVertIn IN) {
     DepthVertOut OUT;
-    float4 viewpos;
+    float4 viewpos, prevViewpos;
     float4 pos = IN.pos;
 
     // Apply wind animation to match HLSL pipeline exactly
@@ -50,10 +58,18 @@ DepthVertOut DepthMWVS(MorrowindVertIn IN) {
     }
 
     // Skin mesh if required
-    if(hasBones)
+    if(hasBones) {
         viewpos = skin(pos, IN.blendweights);
-    else
+        // For skinned: track world motion by computing delta between current and prev world position
+        // skin() applies bones in view space, so we compute world motion separately
+        float4 curOrigin = mul(float4(0,0,0,1), vertexBlendPalette[0]);
+        float4 prevOrigin = mul(float4(0,0,0,1), prevVertexBlendPalette[0]);
+        float4 worldDelta = curOrigin - prevOrigin;
+        prevViewpos = viewpos - worldDelta;  // Apply inverse of world motion
+    } else {
         viewpos = mul(pos, vertexBlendPalette[0]);
+        prevViewpos = mul(pos, prevVertexBlendPalette[0]);
+    }
 
     // Fragment colour routing
     OUT.alpha = vertexMaterial(IN.color).a;
@@ -63,10 +79,21 @@ DepthVertOut DepthMWVS(MorrowindVertIn IN) {
     OUT.depth = OUT.pos.w;
     OUT.texcoords = IN.texcoords;
 
+    // Velocity: current and previous clip positions
+    OUT.curClip = OUT.pos;
+    OUT.prevClip = mul(prevViewpos, proj);
+
     return OUT;
 }
 
-float4 DepthNearPS(DepthVertOut IN) : COLOR0 {
+struct DepthVelocityOut {
+    float4 depth : COLOR0;
+    float4 velocity : COLOR1;
+};
+
+DepthVelocityOut DepthNearPS(DepthVertOut IN) {
+    DepthVelocityOut OUT;
+
     clip(nearViewRange + 64.0 - IN.depth);
 
     // Respect alpha test
@@ -75,7 +102,22 @@ float4 DepthNearPS(DepthVertOut IN) : COLOR0 {
         clip(alpha - alphaRef);
     }
 
-    return IN.depth;
+    OUT.depth = IN.depth;
+
+    // Compute screen-space velocity (in NDC, range -1 to 1)
+    float2 curScreen = IN.curClip.xy / IN.curClip.w;
+    float2 prevScreen = IN.prevClip.xy / IN.prevClip.w;
+    float2 velocity = curScreen - prevScreen;
+
+    // Encode velocity with pow3 for better small-velocity precision (John Chapman technique)
+    // This redistributes precision toward small velocities where banding is most visible
+    float2 sign_v = sign(velocity);
+    float2 encoded = sign_v * pow(abs(velocity), 3.0);
+
+    // Scale for storage (decoded in post-process shader)
+    OUT.velocity = float4(encoded * 50.0, 0, 1);
+
+    return OUT;
 }
 
 //------------------------------------------------------------
@@ -116,11 +158,16 @@ DepthVertOut DepthMWDisplacedVS(DepthDispVertIn IN) {
 
     // Rigid transform via worldview (terrain is non-skinned).
     float4 viewpos = mul(pos, vertexBlendPalette[0]);
+    float4 prevViewpos = mul(pos, prevVertexBlendPalette[0]);
 
     OUT.alpha = 1.0;
     OUT.pos = mul(viewpos, proj);
     OUT.depth = OUT.pos.w;
     OUT.texcoords = IN.texcoords;
+
+    // Velocity (terrain is static, so this should be zero)
+    OUT.curClip = OUT.pos;
+    OUT.prevClip = mul(prevViewpos, proj);
 
     return OUT;
 }

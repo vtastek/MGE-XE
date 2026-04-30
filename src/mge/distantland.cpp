@@ -467,6 +467,11 @@ void DistantLand::renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer*
             RenderTargetSwitcher rtsw(surfDepthFrameMSAA, surfDepthDepth);
             g_passBreaks.mge_depthRT += 2; // Single RenderTargetSwitcher in+out for entire depth section
 
+            // Set RT1 for velocity buffer (MRT with depth)
+            if (velocityBufferEnabled && surfVelocityMSAA) {
+                device->SetRenderTarget(1, surfVelocityMSAA);
+            }
+
             // Depth texture from recorded renders
             // HLSL path: only render Scene 0 depth (Scene 2 hands handled by renderStage2)
             int sceneFilter = (isHLSLActive()) ? 0 : -1;
@@ -477,6 +482,11 @@ void DistantLand::renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer*
             }
             effectDepth->End();
             FixedFunctionShader::transitionTo(PhaseTransition::DepthExit);
+
+            // Clear RT1 after depth pass (distant land doesn't need velocity)
+            if (velocityBufferEnabled && surfVelocityMSAA) {
+                device->SetRenderTarget(1, nullptr);
+            }
 
             // Copy recordMW to Hi-Z for culling (before distant land adds to depth)
             // Disabled: Hi-Z generation is disabled, so this StretchRect is wasted
@@ -514,6 +524,16 @@ void DistantLand::renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer*
                 g_passBreaks.mge_stretchRect++;
                 g_passBreaks.raw_stretchRect++;
                 texDepthFrameSurface->Release();
+
+                // Resolve MSAA velocity buffer
+                if (velocityBufferEnabled && texVelocity && surfVelocityMSAA) {
+                    IDirect3DSurface9* texVelocitySurface;
+                    texVelocity->GetSurfaceLevel(0, &texVelocitySurface);
+                    device->StretchRect(surfVelocityMSAA, NULL, texVelocitySurface, NULL, D3DTEXF_NONE);
+                    g_passBreaks.mge_stretchRect++;
+                    g_passBreaks.raw_stretchRect++;
+                    texVelocitySurface->Release();
+                }
             }
         }
 
@@ -1141,6 +1161,9 @@ void DistantLand::updatePostShader(MGEShader* shader) {
     // TODO: Should be set once at init time
     shader->SetTexture(EV_depthframe, texDepthFrame);
     shader->SetTexture(EV_watertexture, texWater);
+    if (velocityBufferEnabled && texVelocity) {
+        shader->SetTexture(EV_velocityframe, texVelocity);
+    }
 
     // View position
     float zoom = (Configuration.MGEFlags & ZOOM_ASPECT) ? Configuration.CameraEffects.zoom : 1.0f;
