@@ -107,6 +107,7 @@ public:
     static IDirect3DTexture9* texVelocity;
     static IDirect3DSurface9* surfVelocityMSAA; // MSAA render target for velocity buffer
     static bool velocityBufferEnabled;
+    static bool shouldSkipVelocityBuffer();  // True on first frame after menu exit
     static IDirect3DTexture9* texForwardSSAORaw;
     static IDirect3DSurface9* surfForwardSSAORaw;
     static IDirect3DTexture9* texForwardSSAO;

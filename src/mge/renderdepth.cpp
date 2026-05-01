@@ -168,7 +168,8 @@ void DistantLand::renderDepthAdditional(DLContext* ctx, const std::vector<Record
         depthStencilOverride ? depthStencilOverride : surfDepthDepth);
 
     // Set RT1 for velocity buffer (MRT with depth) - only if not using custom target
-    bool useVelocityMRT = velocityBufferEnabled && surfVelocityMSAA && !targetOverride;
+    // Skip on first frame after menu exit to preserve motion blur from before menu
+    bool useVelocityMRT = velocityBufferEnabled && surfVelocityMSAA && !targetOverride && !shouldSkipVelocityBuffer();
     if (useVelocityMRT) {
         device->SetRenderTarget(1, surfVelocityMSAA);
     }
@@ -340,12 +341,20 @@ void DistantLand::renderDepthRecorded(const std::vector<RecordedMWState>& recMW,
     const float solidThreshold = 0.499f;
 
     // Swap world matrix caches for velocity buffer (once per frame on Scene 0)
+    // Skip entirely when velocity buffer writes are disabled (menu exit frame)
     static int lastFrameSwapped = -1;
-    if (sceneFilter == 0 && velocityBufferEnabled) {
+    if (sceneFilter == 0 && velocityBufferEnabled && !shouldSkipVelocityBuffer()) {
         int curFrame = FixedFunctionShader::getRenderingBuffer().frameNumber;
         if (curFrame != lastFrameSwapped) {
-            s_prevWorldCache = std::move(s_curWorldCache);
-            s_curWorldCache.clear();
+            // If more than 1 frame gap, prev cache is stale - clear both to avoid velocity spikes
+            bool frameGap = (lastFrameSwapped >= 0 && curFrame - lastFrameSwapped > 1);
+            if (frameGap) {
+                s_prevWorldCache.clear();
+                s_curWorldCache.clear();
+            } else {
+                s_prevWorldCache = std::move(s_curWorldCache);
+                s_curWorldCache.clear();
+            }
             lastFrameSwapped = curFrame;
         }
     }

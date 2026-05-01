@@ -9,6 +9,7 @@
 // - replayRecordedCalls: Batched draw call replay with Hi-Z culling
 
 #include "ffeshader.h"
+#include "distantlandhlsl.h"
 #include "texture_suffix.h"
 #include "cullthread.h"
 #include "renderthread.h"
@@ -1785,6 +1786,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
         if (hlslDiagFrameCounter == 5) {
             queueAllO3Recompiles();
             startO3RecompileThread();
+            DistantLandHLSL::startO3RecompileThread();
         }
     }
 
@@ -1916,8 +1918,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
             int count = 0;
 
             for (const auto& light : sceneLights) {
-                // Skip lights culled by Hi-Z
-                if (!light.isVisible) continue;
+                // Skip lights culled by Hi-Z (but not during menu mode - Hi-Z uses stale matrices)
+                if (!light.isVisible && !fb.dlContext.isRenderCached && !fb.postProcessData.isMenu) continue;
 
                 // Sphere-AABB intersection: closest point on bbox to light center
                 float cx = (light.position.x < bMin.x) ? bMin.x : (light.position.x > bMax.x) ? bMax.x : light.position.x;
@@ -2218,7 +2220,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
 
     // Bin statistics
     int binCounts[(int)RenderBin::Count] = {};
-    static const char* binNames[] = { "Terrain", "Opaque", "Skinning", "Grass", "AlphaTested", "Blending" };
+    static const char* binNames[] = { "Terrain", "TerrainBlend", "Opaque", "Skinning", "Grass", "AlphaTested", "Blending" };
 
     // Material sorting metrics collection
     std::unordered_set<IDirect3DTexture9*> seenTextures;
@@ -3446,8 +3448,13 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
     // Update ImGui debug stats (Scene 0 only)
     if (sceneCount == 0) {
         int visibleLights = 0;
-        for (const auto& light : sceneLights) {
-            if (light.isVisible) visibleLights++;
+        // During menu mode, Hi-Z culling uses stale matrices - treat all lights as visible for display
+        if (fb.dlContext.isRenderCached || fb.postProcessData.isMenu) {
+            visibleLights = (int)sceneLights.size();
+        } else {
+            for (const auto& light : sceneLights) {
+                if (light.isVisible) visibleLights++;
+            }
         }
         int culledLights = (int)sceneLights.size() - visibleLights;
         ImGuiManager::UpdateDebugStats(

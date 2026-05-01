@@ -28,6 +28,12 @@ PassBreakCounters g_passBreaks;
 static DLContext* s_postShaderCtx = nullptr;
 // File-scope pointer for updatePostShader to access captured MWBridge state
 static const PostProcessData* s_postProcessData = nullptr;
+// Skip velocity buffer writes on first frame after menu exit to preserve motion blur
+static bool s_skipVelocityBufferThisFrame = false;
+
+bool DistantLand::shouldSkipVelocityBuffer() {
+    return s_skipVelocityBufferThisFrame;
+}
 
 void DistantLand::logWaterDiagnostics(const char* tag, const DLContext* ctx, const PostProcessData* ppd) {
     if (!LOG::catEnabled(LOG::Cat_DistantLand)) {
@@ -147,6 +153,18 @@ DLContext DistantLand::captureStage0Context() {
     s_staging.isRenderCached &= (Configuration.MGEFlags & USE_MENU_CACHING) && mwBridge->IsMenu();
     s_staging.isPPLActive = (Configuration.MGEFlags & USE_FFESHADER) && !(Configuration.PerPixelLightFlags == 1 && !mwBridge->IntCurCellAddr());
 
+    // Menu caching with motion blur preservation:
+    // On first menu frame, use the cached frame from N-1 (which has correct blur) instead of
+    // rendering a new frame with mismatched depth/velocity buffers.
+    bool isFirstMenuFrame = !wasRenderCached && mwBridge->IsMenu() && (Configuration.MGEFlags & USE_MENU_CACHING);
+    if (isFirstMenuFrame && menuCacheValid) {
+        s_staging.isRenderCached = true;  // Use existing cache, skip rendering
+    }
+
+    // Skip velocity buffer writes on menu exit frame to preserve blur for click-to-advance
+    bool isMenuExitFrame = wasRenderCached && !s_staging.isRenderCached;
+    s_skipVelocityBufferThisFrame = isMenuExitFrame;
+
     // Diagnostic: log when isRenderCached changes (no limit)
     if (LOG::catEnabled(LOG::Cat_DistantLand)) {
         static int captureLogCount = 0;
@@ -226,13 +244,17 @@ void DistantLand::renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuff
     if (!s_staging.isRenderCached) {
         if (isDistantCell()) {
             // Save state block manually since we can change FVF/decl
-            device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
+            {
+                MGE_ZoneScopedN("DL_CreateStateBlock");
+                device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
+            }
             effect->BeginPass(PASS_SETUP);
             effect->EndPass();
 
             // Shadow map early render
             if (Configuration.MGEFlags & USE_SHADOWS) {
                 if (mwBridge->CellHasWeather() && !mwBridge->IsMenu()) {
+                    MGE_ZoneScopedN("DL_ShadowMap");
                     FixedFunctionShader::transitionTo(PhaseTransition::ShadowEntry);
                     effectShadow->Begin(&passes, D3DXFX_DONOTSAVESTATE);
                     renderShadowMap(ctx);
@@ -256,6 +278,7 @@ void DistantLand::renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuff
             if (!mwBridge->IsUnderwater(ctx->eyePos.z)) {
                 // Draw distant landscape
                 if (mwBridge->IsExterior()) {
+                    MGE_ZoneScopedN("DL_Land");
                     effect->BeginPass(PASS_RENDERLAND);
                     renderDistantLand(ctx, effect, &ctx->mwView, &distProj);
                     effect->EndPass();
@@ -263,6 +286,7 @@ void DistantLand::renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuff
 
                 // Draw distant statics, with alpha dissolve as they pass the near view boundary
                 if (Configuration.MGEFlags & USE_DISTANT_STATICS) {
+                    MGE_ZoneScopedN("DL_Statics");
                     DWORD p = mwBridge->CellHasWeather() ? PASS_RENDERSTATICSEXTERIOR : PASS_RENDERSTATICSINTERIOR;
                     effect->BeginPass(p);
                     vsr.beginAlphaToCoverage(device);
@@ -281,6 +305,7 @@ void DistantLand::renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuff
             // Sky scattering and sky objects (should be drawn late as possible)
             // In HLSL mode, sky is always deferred here and rendered via shader
             if (mwBridge->CellHasWeather()) {
+                MGE_ZoneScopedN("DL_Sky");
                 FixedFunctionShader::transitionTo(PhaseTransition::SkyEntry);
                 const auto& sky = fb ? fb->recordSky : recordSky;
                 if (!sky.empty()) {
@@ -293,6 +318,7 @@ void DistantLand::renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuff
 
             // Update reflection
             if (mwBridge->CellHasWater()) {
+                MGE_ZoneScopedN("DL_WaterRefl");
                 FixedFunctionShader::transitionTo(PhaseTransition::WaterReflEntry);
                 const auto* sky = fb ? &fb->recordSky : nullptr;
                 renderWaterReflection(ctx, &ctx->mwView, &distProj, sky);
@@ -302,6 +328,7 @@ void DistantLand::renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuff
 
             // Update water simulation
             if (Configuration.MGEFlags & DYNAMIC_RIPPLES) {
+                MGE_ZoneScopedN("DL_WaterSim");
                 simulateDynamicWaves();
                 g_passBreaks.mge_waterRT += 4;
             }
@@ -324,8 +351,10 @@ void DistantLand::renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuff
             }
 
             // Restore render state
-            stateSaved->Apply();
-
+            {
+                MGE_ZoneScopedN("DL_StateRestore");
+                stateSaved->Apply();
+            }
             stateSaved->Release();
         } else {
             // Non-distant cell path (DL off or interior without distant statics)
@@ -468,7 +497,8 @@ void DistantLand::renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer*
             g_passBreaks.mge_depthRT += 2; // Single RenderTargetSwitcher in+out for entire depth section
 
             // Set RT1 for velocity buffer (MRT with depth)
-            if (velocityBufferEnabled && surfVelocityMSAA) {
+            // Skip on first frame after menu exit to preserve motion blur from before menu
+            if (velocityBufferEnabled && surfVelocityMSAA && !s_skipVelocityBufferThisFrame) {
                 device->SetRenderTarget(1, surfVelocityMSAA);
             }
 
@@ -484,7 +514,7 @@ void DistantLand::renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer*
             FixedFunctionShader::transitionTo(PhaseTransition::DepthExit);
 
             // Clear RT1 after depth pass (distant land doesn't need velocity)
-            if (velocityBufferEnabled && surfVelocityMSAA) {
+            if (velocityBufferEnabled && surfVelocityMSAA && !s_skipVelocityBufferThisFrame) {
                 device->SetRenderTarget(1, nullptr);
             }
 

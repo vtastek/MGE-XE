@@ -830,14 +830,26 @@ void FixedFunctionShader::executeHiZCulling(const D3DXMATRIX& currentView, const
         float expansion = ImGuiManager::GetBboxExpansion();
         int lightVisibleCount = 0, lightCulledCount = 0;
 
-        for (auto& light : sceneLights) {
-            D3DXVECTOR3 bboxMin = light.position - D3DXVECTOR3(light.radius + expansion, light.radius + expansion, light.radius + expansion);
-            D3DXVECTOR3 bboxMax = light.position + D3DXVECTOR3(light.radius + expansion, light.radius + expansion, light.radius + expansion);
+        // Skip Hi-Z culling for lights when:
+        // 1. No recorded calls (empty frame)
+        // 2. Menu mode (stale view/proj matrices would incorrectly cull everything)
+        bool skipCulling = recCalls.empty() || renderBuf.dlContext.isRenderCached || renderBuf.postProcessData.isMenu;
 
-            light.isVisible = softwareOcclusionCuller.testBoundingBox(
-                bboxMin, bboxMax, currentView, currentProj);
+        if (skipCulling) {
+            for (auto& light : sceneLights) {
+                light.isVisible = true;
+                lightVisibleCount++;
+            }
+        } else {
+            for (auto& light : sceneLights) {
+                D3DXVECTOR3 bboxMin = light.position - D3DXVECTOR3(light.radius + expansion, light.radius + expansion, light.radius + expansion);
+                D3DXVECTOR3 bboxMax = light.position + D3DXVECTOR3(light.radius + expansion, light.radius + expansion, light.radius + expansion);
 
-            if (light.isVisible) lightVisibleCount++; else lightCulledCount++;
+                light.isVisible = softwareOcclusionCuller.testBoundingBox(
+                    bboxMin, bboxMax, currentView, currentProj);
+
+                if (light.isVisible) lightVisibleCount++; else lightCulledCount++;
+            }
         }
 
         LOG_CAT(LOG::Cat_HiZ, ">> Hi-Z lights: %d visible, %d culled",
