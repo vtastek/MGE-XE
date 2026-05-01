@@ -3,6 +3,7 @@
 #include "configuration.h"
 #include "support/log.h"
 #include "hlsl_shader_manager.h"
+#include "mge_tracy.h"
 
 #include <vector>
 #include <string>
@@ -12,6 +13,13 @@
 IDirect3DDevice9* DistantLandHLSL::device = nullptr;
 bool DistantLandHLSL::enabled = false;
 DistantLandHLSL::ShaderCache DistantLandHLSL::shaderCaches[SHADER_COUNT];
+
+// O3 background recompile system
+std::queue<DistantLandHLSL::O3RecompileKey> DistantLandHLSL::o3RecompileQueue;
+std::mutex DistantLandHLSL::o3QueueMutex;
+std::thread DistantLandHLSL::o3RecompileThread;
+std::atomic<bool> DistantLandHLSL::o3RecompileActive{false};
+std::atomic<bool> DistantLandHLSL::o3RecompileStarted{false};
 
 D3DXHANDLE DistantLandHLSL::ehWorld, DistantLandHLSL::ehView, DistantLandHLSL::ehProj;
 D3DXHANDLE DistantLandHLSL::ehEyePos, DistantLandHLSL::ehSunVec, DistantLandHLSL::ehSunCol, DistantLandHLSL::ehSunAmb;
@@ -52,11 +60,75 @@ bool DistantLandHLSL::init(IDirect3DDevice9* d) {
 }
 
 void DistantLandHLSL::release() {
+    stopO3RecompileThread();
     for (int i = 0; i < SHADER_COUNT; i++) {
         shaderCaches[i].clear();
     }
     enabled = false;
     device = nullptr;
+}
+
+void DistantLandHLSL::startO3RecompileThread() {
+    if (o3RecompileStarted.exchange(true)) {
+        return;
+    }
+
+    o3RecompileActive = true;
+    o3RecompileThread = std::thread([]() {
+        LOG::logline("-- DL HLSL O3 recompile thread started");
+
+        int compiled = 0;
+        while (o3RecompileActive) {
+            O3RecompileKey key;
+            bool hasWork = false;
+
+            {
+                std::lock_guard<std::mutex> lock(o3QueueMutex);
+                if (!o3RecompileQueue.empty()) {
+                    key = o3RecompileQueue.front();
+                    o3RecompileQueue.pop();
+                    hasWork = true;
+                }
+            }
+
+            if (!hasWork) {
+                break;
+            }
+
+            // Compile at O3
+            {
+                MGE_ZoneScopedN("DL_HLSL_O3_Compile");
+                auto newShader = compileShader(key.type, key.perm, 3);
+                if (newShader && newShader->isValid()) {
+                    auto& cache = shaderCaches[key.type];
+                    auto it = cache.find(key.perm);
+                    if (it != cache.end() && it->second->optimizationLevel < 3) {
+                        it->second = std::move(newShader);
+                    }
+                }
+            }
+
+            compiled++;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+
+        LOG::logline("-- DL HLSL O3 recompile thread finished: %d shaders upgraded", compiled);
+        o3RecompileActive = false;
+    });
+}
+
+void DistantLandHLSL::stopO3RecompileThread() {
+    o3RecompileActive = false;
+
+    if (o3RecompileThread.joinable()) {
+        o3RecompileThread.join();
+    }
+
+    std::lock_guard<std::mutex> lock(o3QueueMutex);
+    while (!o3RecompileQueue.empty()) {
+        o3RecompileQueue.pop();
+    }
+    o3RecompileStarted = false;
 }
 
 char* DistantLandHLSL::loadShaderFile(const char* filename, DWORD* outFileSize) {
@@ -155,19 +227,30 @@ const char* DistantLandHLSL::getShaderFilename(ShaderType type, bool isVertexSha
     }
 }
 
-std::unique_ptr<DistantLandHLSL::CompiledShader> DistantLandHLSL::compileShader(ShaderType type, const ShaderPermutation& perm) {
+std::unique_ptr<DistantLandHLSL::CompiledShader> DistantLandHLSL::compileShader(ShaderType type, const ShaderPermutation& perm, uint8_t optLevel) {
     std::vector<D3DXMACRO> d3dxDefines;
     generateDefines(type, perm, d3dxDefines);
-    
+
     // Convert D3DXMACRO to D3D_SHADER_MACRO for D3DCompile
     std::vector<D3D_SHADER_MACRO> defines;
     for (const auto& d3dxDefine : d3dxDefines) {
         D3D_SHADER_MACRO macro = { d3dxDefine.Name, d3dxDefine.Definition };
         defines.push_back(macro);
     }
-    
+
     auto shader = std::make_unique<CompiledShader>();
-    
+    shader->optimizationLevel = optLevel;
+
+    // Compile flags based on optimization level
+    DWORD compileFlags = 0;
+    if (optLevel == 1) {
+        compileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL1;
+    } else if (optLevel == 2) {
+        compileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL2;
+    } else {
+        compileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
+    }
+
     // Load and compile vertex shader
     DWORD vsSize;
     char* vsSource = loadShaderFile(getShaderFilename(type, true), &vsSize);
@@ -175,14 +258,14 @@ std::unique_ptr<DistantLandHLSL::CompiledShader> DistantLandHLSL::compileShader(
         LOG::logline("!! Failed to load vertex shader for type %d", type);
         return nullptr;
     }
-    
+
     ID3DBlob* vsBlob = nullptr;
     ID3DBlob* vsBlobErrors = nullptr;
-    
+
     HRESULT hr = D3DCompile(
-        vsSource, vsSize, getShaderFilename(type, true), defines.data(), 
+        vsSource, vsSize, getShaderFilename(type, true), defines.data(),
         HLSLShaderManager::getIncludeHandler(), "main", "vs_3_0",
-        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vsBlob, &vsBlobErrors
+        compileFlags, 0, &vsBlob, &vsBlobErrors
     );
     
     if (SUCCEEDED(hr)) {
@@ -220,9 +303,9 @@ std::unique_ptr<DistantLandHLSL::CompiledShader> DistantLandHLSL::compileShader(
     ID3DBlob* psBlobErrors = nullptr;
     
     hr = D3DCompile(
-        psSource, psSize, getShaderFilename(type, false), defines.data(), 
+        psSource, psSize, getShaderFilename(type, false), defines.data(),
         HLSLShaderManager::getIncludeHandler(), "main", "ps_3_0",
-        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &psBlob, &psBlobErrors
+        compileFlags, 0, &psBlob, &psBlobErrors
     );
     
     if (FAILED(hr)) {
@@ -247,7 +330,7 @@ std::unique_ptr<DistantLandHLSL::CompiledShader> DistantLandHLSL::compileShader(
         return nullptr;
     }
     
-    LOG::logline("-- Compiled HLSL shader for type %d with permutation flags: 0x%08X", type, *(DWORD*)&perm);
+    LOG::logline("-- Compiled DL HLSL shader type %d perm 0x%08X O%d", type, *(DWORD*)&perm, optLevel);
     return shader;
 }
 
@@ -255,22 +338,29 @@ DistantLandHLSL::CompiledShader* DistantLandHLSL::getShader(ShaderType type, con
     if (!enabled || type >= SHADER_COUNT) {
         return nullptr;
     }
-    
+
     auto& cache = shaderCaches[type];
     auto it = cache.find(perm);
-    
+
     if (it != cache.end()) {
         return it->second.get();
     }
-    
-    // Compile new shader
-    auto compiledShader = compileShader(type, perm);
+
+    // Compile new shader at O1 for fast startup
+    auto compiledShader = compileShader(type, perm, 1);
     if (!compiledShader || !compiledShader->isValid()) {
         return nullptr;
     }
-    
+
     CompiledShader* result = compiledShader.get();
     cache[perm] = std::move(compiledShader);
+
+    // Queue O3 recompile for background
+    {
+        std::lock_guard<std::mutex> lock(o3QueueMutex);
+        o3RecompileQueue.push({type, perm});
+    }
+
     return result;
 }
 

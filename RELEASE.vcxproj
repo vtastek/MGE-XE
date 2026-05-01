@@ -128,7 +128,8 @@ del "$(OutDir)MGEXEgui.exe.Backup"</Command>
     </Link>
     <PostBuildEvent />
     <PreBuildEvent>
-      <Command>robocopy "$(SolutionDir)assets" "$(OutDir)." /E
+      <Command>msbuild "$(SolutionDir)MGE-XE.vcxproj" /p:Configuration=Release-Tracy /p:Platform=Win32 /v:minimal
+robocopy "$(SolutionDir)assets" "$(OutDir)." /E
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\mgeHost64.exe" "$(OutDir)"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\MGEXEgui.exe" "$(OutDir)"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\d3d8.dll" "$(OutDir)"
@@ -182,7 +183,8 @@ del "$(OutDir)MGEXEgui.exe.Backup"</Command>
     </Link>
     <PostBuildEvent />
     <PreBuildEvent>
-      <Command>robocopy "$(SolutionDir)assets" "$(OutDir)." /E
+      <Command>msbuild "$(SolutionDir)MGE-XE.vcxproj" /p:Configuration=Release-Tracy /p:Platform=Win32 /v:minimal
+robocopy "$(SolutionDir)assets" "$(OutDir)." /E
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\mgeHost64.exe" "$(OutDir)"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\MGEXEgui.exe" "$(OutDir)"
 copy "$(SolutionDir)bin\MSVC-$(Configuration)\d3d8.dll" "$(OutDir)"

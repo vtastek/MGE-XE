@@ -3,6 +3,10 @@
 #include "proxydx/d3d8header.h"
 #include <unordered_map>
 #include <memory>
+#include <queue>
+#include <mutex>
+#include <thread>
+#include <atomic>
 
 // DistantLandHLSL - HLSL conversion system for Distant Land effects
 // Phase 8: Convert Distant Land effects pipeline to HLSL with simplified permutations via ifdefs
@@ -45,9 +49,11 @@ public:
         IDirect3DPixelShader9* pixelShader;
         ID3DXConstantTable* vsConstantTable;
         ID3DXConstantTable* psConstantTable;
-        
-        CompiledShader() : vertexShader(nullptr), pixelShader(nullptr), 
-                          vsConstantTable(nullptr), psConstantTable(nullptr) {}
+        uint8_t optimizationLevel;
+
+        CompiledShader() : vertexShader(nullptr), pixelShader(nullptr),
+                          vsConstantTable(nullptr), psConstantTable(nullptr),
+                          optimizationLevel(0) {}
         
         ~CompiledShader() {
             if (vertexShader) vertexShader->Release();
@@ -63,19 +69,31 @@ public:
 
     using ShaderCache = std::unordered_map<ShaderPermutation, std::unique_ptr<CompiledShader>, ShaderPermutation::hasher>;
 
+    struct O3RecompileKey {
+        ShaderType type;
+        ShaderPermutation perm;
+    };
+
 private:
     static IDirect3DDevice9* device;
     static bool enabled;
     static ShaderCache shaderCaches[SHADER_COUNT];
-    
+
+    // O3 background recompile system
+    static std::queue<O3RecompileKey> o3RecompileQueue;
+    static std::mutex o3QueueMutex;
+    static std::thread o3RecompileThread;
+    static std::atomic<bool> o3RecompileActive;
+    static std::atomic<bool> o3RecompileStarted;
+
     // Shader constant handles
     static D3DXHANDLE ehWorld, ehView, ehProj;
     static D3DXHANDLE ehEyePos, ehSunVec, ehSunCol, ehSunAmb;
     static D3DXHANDLE ehFogColNear, ehFogColFar, ehFogStart, ehFogRange;
     static D3DXHANDLE ehTime, ehWindVec, ehNiceWeather;
-    
+
     static char* loadShaderFile(const char* filename, DWORD* outFileSize);
-    static std::unique_ptr<CompiledShader> compileShader(ShaderType type, const ShaderPermutation& perm);
+    static std::unique_ptr<CompiledShader> compileShader(ShaderType type, const ShaderPermutation& perm, uint8_t optLevel = 1);
     static void generateDefines(ShaderType type, const ShaderPermutation& perm, std::vector<D3DXMACRO>& defines);
     static const char* getShaderFilename(ShaderType type, bool isVertexShader);
 
@@ -83,6 +101,10 @@ public:
     static bool init(IDirect3DDevice9* d);
     static void release();
     static bool isEnabled() { return enabled; }
+
+    // O3 background recompile system
+    static void startO3RecompileThread();
+    static void stopO3RecompileThread();
     
     // Get or compile shader for given type and permutation
     static CompiledShader* getShader(ShaderType type, const ShaderPermutation& perm);

@@ -1759,7 +1759,11 @@ void FixedFunctionShader::startO3RecompileThread() {
             }
 
             // Compile at O3 (this is the slow part)
-            HLSLShader newShader = generateMWShaderHLSL(key, 3);
+            HLSLShader newShader;
+            {
+                MGE_ZoneScopedN("FFE_HLSL_O3_Compile");
+                newShader = generateMWShaderHLSL(key, 3);
+            }
 
             // Replace O1 entry in cache (release old shaders first)
             AcquireSRWLockExclusive(&hlslCacheLock);

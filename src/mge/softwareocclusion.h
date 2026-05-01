@@ -130,6 +130,9 @@ public:
     int getHiZMipLevels() const { return mNumMipLevels; }
     UINT getHiZWidth(int mip) const { return (mip < mNumMipLevels) ? mHiZWidth[mip] : 0; }
     UINT getHiZHeight(int mip) const { return (mip < mNumMipLevels) ? mHiZHeight[mip] : 0; }
+    float* getMip0Buffer() const { return mHiZBuffer[0]; }
+    UINT getMip0Width() const { return mHiZWidth[0]; }
+    UINT getMip0Height() const { return mHiZHeight[0]; }
 
 private:
     UINT mWidth;
