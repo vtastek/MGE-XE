@@ -16,39 +16,76 @@
 #include <unordered_map>
 
 // Cache for previous frame's world matrices (for velocity buffer)
-// Key uses geometry hash + draw params + position + mirror flag to identify unique instances
+// Proximity-based tracking: key by mesh identity, match by nearest position
+// Non-skinned objects: VB/IB + geometry hash + mirrored flag
 struct VelocityGeometryKey {
+    IDirect3DVertexBuffer9* vb;
+    IDirect3DIndexBuffer9* ib;
     size_t geometryHash;  // Content-based hash from vertex data
-    UINT primCount;       // Distinguishes sub-meshes within same VB (e.g., palm vs fingers)
-    UINT startIndex;      // Index buffer offset for this draw
-    int posX, posY, posZ;  // Coarse position bucket (64 units)
-    int rotBucket;        // Rotation bucket (8 directions, 45° each) to distinguish rotated instances
-    bool mirrored;        // True if world matrix has negative determinant (left/right distinction)
+    UINT startIndex;      // Index buffer offset
+    bool mirrored;        // Left/right distinction (determinant < 0)
 
     bool operator==(const VelocityGeometryKey& o) const {
-        return geometryHash == o.geometryHash &&
-               primCount == o.primCount && startIndex == o.startIndex &&
-               posX == o.posX && posY == o.posY && posZ == o.posZ &&
-               rotBucket == o.rotBucket && mirrored == o.mirrored;
+        return vb == o.vb && ib == o.ib && geometryHash == o.geometryHash &&
+               startIndex == o.startIndex && mirrored == o.mirrored;
     }
 };
 
 struct VelocityGeometryKeyHash {
     size_t operator()(const VelocityGeometryKey& k) const {
-        size_t h = k.geometryHash;
-        h ^= k.primCount + 0x9e3779b9 + (h << 6) + (h >> 2);
+        size_t h = reinterpret_cast<size_t>(k.vb);
+        h ^= reinterpret_cast<size_t>(k.ib) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= k.geometryHash + 0x9e3779b9 + (h << 6) + (h >> 2);
         h ^= k.startIndex + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= (size_t)k.posX + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= (size_t)k.posY + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= (size_t)k.posZ + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= (size_t)k.rotBucket + 0x9e3779b9 + (h << 6) + (h >> 2);
         h ^= (size_t)k.mirrored + 0x9e3779b9 + (h << 6) + (h >> 2);
         return h;
     }
 };
 
-static std::unordered_map<VelocityGeometryKey, D3DXMATRIX, VelocityGeometryKeyHash> s_prevWorldCache;
-static std::unordered_map<VelocityGeometryKey, D3DXMATRIX, VelocityGeometryKeyHash> s_curWorldCache;
+// Instance with position for proximity matching
+struct WorldInstance {
+    D3DXMATRIX matrix;
+    D3DXVECTOR3 pos;
+};
+
+static std::unordered_map<VelocityGeometryKey, std::vector<WorldInstance>, VelocityGeometryKeyHash> s_prevWorldCache;
+static std::unordered_map<VelocityGeometryKey, std::vector<WorldInstance>, VelocityGeometryKeyHash> s_curWorldCache;
+
+// Skinned object cache: VB/IB + startIndex + mirrored flag
+struct SkinnedVelocityKey {
+    IDirect3DVertexBuffer9* vb;
+    IDirect3DIndexBuffer9* ib;
+    UINT startIndex;       // Distinguishes sub-meshes within same VB/IB
+    bool mirrored;         // Left/right distinction
+
+    bool operator==(const SkinnedVelocityKey& o) const {
+        return vb == o.vb && ib == o.ib && startIndex == o.startIndex &&
+               mirrored == o.mirrored;
+    }
+};
+
+struct SkinnedVelocityKeyHash {
+    size_t operator()(const SkinnedVelocityKey& k) const {
+        size_t h = reinterpret_cast<size_t>(k.vb);
+        h ^= reinterpret_cast<size_t>(k.ib) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= k.startIndex + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= (size_t)k.mirrored + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+struct SkinnedMatrixData {
+    D3DXMATRIX worldTransforms[4];  // All 4 bone matrices
+};
+
+// Skinned instance with position for proximity matching
+struct SkinnedInstance {
+    SkinnedMatrixData data;
+    D3DXVECTOR3 pos;
+};
+
+static std::unordered_map<SkinnedVelocityKey, std::vector<SkinnedInstance>, SkinnedVelocityKeyHash> s_prevSkinnedCache;
+static std::unordered_map<SkinnedVelocityKey, std::vector<SkinnedInstance>, SkinnedVelocityKeyHash> s_curSkinnedCache;
 
 void DistantLand::renderDepth(DLContext* ctx, const std::vector<RecordedMWState>& recMW, int sceneFilter, FixedFunctionShader::FrameBuffer* fb) {
     MGE_ZoneScopedN("renderDepth");
@@ -351,9 +388,13 @@ void DistantLand::renderDepthRecorded(const std::vector<RecordedMWState>& recMW,
             if (frameGap) {
                 s_prevWorldCache.clear();
                 s_curWorldCache.clear();
+                s_prevSkinnedCache.clear();
+                s_curSkinnedCache.clear();
             } else {
                 s_prevWorldCache = std::move(s_curWorldCache);
                 s_curWorldCache.clear();
+                s_prevSkinnedCache = std::move(s_curSkinnedCache);
+                s_curSkinnedCache.clear();
             }
             lastFrameSwapped = curFrame;
         }
@@ -465,84 +506,118 @@ void DistantLand::renderDepthRecorded(const std::vector<RecordedMWState>& recMW,
 
         // Velocity buffer: cache WORLD matrices (not worldview) so camera motion cancels out.
         // prevWorldView = prev_world * current_view, so only object motion produces velocity.
-        // Key uses geometry hash + coarse position + mirror flag (for left/right body parts).
+        // Skinned objects use VB/IB pointer + fine position for better instance separation.
+        // Non-skinned objects use geometry hash + coarse position + rotation.
         if (velocityBufferEnabled && gameView) {
-            const int kPosBucketSize = 8;  // ~6cm buckets to separate nearby instances
-            size_t geoHash = computeGeometryHash(i.vb, i.vbOffset, i.vbStride, i.vertCount, i.fvf);
-
-            // Compute 3x3 determinant to detect mirrored meshes (negative scale)
             const D3DXMATRIX& w = i.worldTransforms[0];
-            float det3 = w._11 * (w._22 * w._33 - w._23 * w._32)
-                       - w._12 * (w._21 * w._33 - w._23 * w._31)
-                       + w._13 * (w._21 * w._32 - w._22 * w._31);
-            bool mirrored = det3 < 0;
+            D3DXMATRIX prevWorldView[4];
+            bool foundPrev = false;
 
-            // Quantize rotation to 8 buckets (45° each) based on local X axis direction in world XY
-            // This distinguishes objects at same position but rotated around Z (vertical axis)
-            // Row 1 of world matrix (_11, _12) = where local X axis points in world XY
-            int rotBucket = 0;
-            float rightX = w._11, rightY = w._12;  // Local X axis in world XY (how mesh "faces")
-            if (rightX != 0 || rightY != 0) {
-                float angle = atan2f(rightY, rightX);  // -PI to PI
-                rotBucket = (int)((angle + 3.14159265f) / (6.28318530f / 8.0f));  // 0-8
-                rotBucket = rotBucket & 7;  // Wrap to 0-7
+            if (i.vertexBlendState > 0) {
+                // SKINNED OBJECT: Proximity-based tracking
+                // Key by mesh identity (VB/IB/startIndex/mirrored), match by nearest position
+                D3DXVECTOR3 currentPos(w._41, w._42, w._43);
+
+                // Compute mirror flag from determinant
+                float det3 = w._11 * (w._22 * w._33 - w._23 * w._32)
+                           - w._12 * (w._21 * w._33 - w._23 * w._31)
+                           + w._13 * (w._21 * w._32 - w._22 * w._31);
+
+                SkinnedVelocityKey skey{ i.vb, i.ib, i.startIndex, det3 < 0 };
+
+                auto it = s_prevSkinnedCache.find(skey);
+                if (it != s_prevSkinnedCache.end() && !it->second.empty()) {
+                    // Find nearest instance from previous frame
+                    const float kMaxSearchDist = 256.0f;  // ~4 meters max search radius
+                    float bestDistSq = kMaxSearchDist * kMaxSearchDist;
+                    int bestIdx = -1;
+
+                    for (size_t inst = 0; inst < it->second.size(); ++inst) {
+                        float dx = it->second[inst].pos.x - currentPos.x;
+                        float dy = it->second[inst].pos.y - currentPos.y;
+                        float dz = it->second[inst].pos.z - currentPos.z;
+                        float d2 = dx*dx + dy*dy + dz*dz;
+                        if (d2 < bestDistSq) {
+                            bestDistSq = d2;
+                            bestIdx = (int)inst;
+                        }
+                    }
+
+                    if (bestIdx != -1) {
+                        // Found previous frame's matrices for this instance
+                        for (int j = 0; j < 4; j++) {
+                            D3DXMatrixMultiply(&prevWorldView[j], &it->second[bestIdx].data.worldTransforms[j], gameView);
+                        }
+                        foundPrev = true;
+                        // Remove used instance so 2 pauldrons don't claim the same previous matrix
+                        it->second.erase(it->second.begin() + bestIdx);
+                    }
+                }
+
+                // Store for next frame
+                SkinnedMatrixData sdata;
+                for (int j = 0; j < 4; j++) {
+                    sdata.worldTransforms[j] = i.worldTransforms[j];
+                }
+                s_curSkinnedCache[skey].push_back({ sdata, currentPos });
+
+            } else {
+                // NON-SKINNED OBJECT: Proximity-based tracking
+                // Key by mesh identity (VB/IB/geoHash/startIndex/mirrored), match by nearest position
+                D3DXVECTOR3 currentPos(w._41, w._42, w._43);
+                size_t geoHash = computeGeometryHash(i.vb, i.vbOffset, i.vbStride, i.vertCount, i.fvf);
+
+                // Compute mirror flag
+                float det3 = w._11 * (w._22 * w._33 - w._23 * w._32)
+                           - w._12 * (w._21 * w._33 - w._23 * w._31)
+                           + w._13 * (w._21 * w._32 - w._22 * w._31);
+
+                VelocityGeometryKey vkey{ i.vb, i.ib, geoHash, i.startIndex, det3 < 0 };
+
+                auto it = s_prevWorldCache.find(vkey);
+                if (it != s_prevWorldCache.end() && !it->second.empty()) {
+                    // Find nearest instance from previous frame
+                    const float kMaxSearchDist = 256.0f;  // ~4 meters max search radius
+                    float bestDistSq = kMaxSearchDist * kMaxSearchDist;
+                    int bestIdx = -1;
+
+                    for (size_t inst = 0; inst < it->second.size(); ++inst) {
+                        float dx = it->second[inst].pos.x - currentPos.x;
+                        float dy = it->second[inst].pos.y - currentPos.y;
+                        float dz = it->second[inst].pos.z - currentPos.z;
+                        float d2 = dx*dx + dy*dy + dz*dz;
+                        if (d2 < bestDistSq) {
+                            bestDistSq = d2;
+                            bestIdx = (int)inst;
+                        }
+                    }
+
+                    if (bestIdx != -1) {
+                        D3DXMatrixMultiply(&prevWorldView[0], &it->second[bestIdx].matrix, gameView);
+                        foundPrev = true;
+                        // Remove used instance so identical meshes don't claim same previous matrix
+                        it->second.erase(it->second.begin() + bestIdx);
+                    }
+                }
+
+                // Store for next frame
+                s_curWorldCache[vkey].push_back({ i.worldTransforms[0], currentPos });
             }
 
-            VelocityGeometryKey vkey{
-                geoHash,
-                i.primCount,
-                i.startIndex,
-                (int)(w._41 / kPosBucketSize),
-                (int)(w._42 / kPosBucketSize),
-                (int)(w._43 / kPosBucketSize),
-                rotBucket,
-                mirrored
-            };
-            D3DXMATRIX prevWorldView[4];
-
-            auto it = s_prevWorldCache.find(vkey);
-            if (it != s_prevWorldCache.end()) {
-                // Sanity check: reject if prev world position is wildly different (collision)
-                float dx = it->second._41 - i.worldTransforms[0]._41;
-                float dy = it->second._42 - i.worldTransforms[0]._42;
-                float dz = it->second._43 - i.worldTransforms[0]._43;
-                float distSq = dx*dx + dy*dy + dz*dz;
-
-                // Max 300 units movement per frame (generous for fast objects)
-                if (distSq < 300.0f * 300.0f) {
-                    // Found valid previous world matrix - multiply by CURRENT view
-                    D3DXMatrixMultiply(&prevWorldView[0], &it->second, gameView);
-                } else {
-                    // Cache collision - use current (no velocity)
-                    prevWorldView[0] = currentWorldViewForCache;
-                }
-            } else {
-                // No prev, use current worldview (no velocity on first frame)
+            // If no valid previous found, use current (no velocity)
+            if (!foundPrev) {
                 prevWorldView[0] = currentWorldViewForCache;
             }
-            for (int j = 1; j < 4; j++) {
-                prevWorldView[j] = prevWorldView[0];  // Copy for skinned (simplified)
-            }
-            effect->SetMatrixArray(ehPrevVertexBlendPalette, prevWorldView, 4);
-
-            // Store WORLD matrix (not worldview) for next frame
-            s_curWorldCache[vkey] = i.worldTransforms[0];
-
-            // Debug: log first few velocity lookups
-            static int velLogCount = 0;
-            if (velLogCount < 5 && it != s_prevWorldCache.end()) {
-                float curW41 = currentWorldViewForCache._41;
-                float prevW41 = prevWorldView[0]._41;
-                float diff = curW41 - prevW41;
-                if (std::abs(diff) > 0.01f) {
-                    LOG::logline(">> Velocity: vb=%p diff=%.3f (cur=%.2f prev=%.2f) - object moving",
-                        i.vb, diff, curW41, prevW41);
-                    velLogCount++;
+            // For non-skinned or fallback, copy bone 0 to all slots
+            if (i.vertexBlendState == 0 || !foundPrev) {
+                for (int j = 1; j < 4; j++) {
+                    prevWorldView[j] = prevWorldView[0];
                 }
             }
+
+            effect->SetMatrixArray(ehPrevVertexBlendPalette, prevWorldView, 4);
         } else if (velocityBufferEnabled) {
-            // No gameView available - use identity for prev (will show some velocity)
-            LOG::logline("!! Velocity: gameView is null for vb=%p", i.vb);
+            // No gameView available - use current transforms (no velocity)
             effect->SetMatrixArray(ehPrevVertexBlendPalette, i.worldViewTransforms, 4);
         }
 
