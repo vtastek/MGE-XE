@@ -951,7 +951,7 @@ private:
     static std::queue<ShaderKey> o3RecompileQueue;
     static std::mutex o3QueueMutex;
     static std::atomic<bool> o3RecompileActive;
-    static std::thread o3RecompileThread;
+    static std::vector<std::thread> o3RecompileWorkers;
     static std::atomic<bool> o3RecompileStarted;  // Ensures we only start once
 
     static void queueAllO3Recompiles();

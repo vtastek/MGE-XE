@@ -1780,14 +1780,6 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
     // Increment frame counter on Scene 0 replay (once per frame)
     if (sceneCount == 0) {
         hlslDiagFrameCounter++;
-
-        // After 5 frames, start O3 recompilation in background
-        // (O1 shaders compiled during precache, now upgrade to O3 while playing)
-        if (hlslDiagFrameCounter == 5) {
-            queueAllO3Recompiles();
-            startO3RecompileThread();
-            DistantLandHLSL::startO3RecompileThread();
-        }
     }
 
     // N-1: Select rendering buffer (previous frame's recorded data)

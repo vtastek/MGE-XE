@@ -17,7 +17,7 @@ DistantLandHLSL::ShaderCache DistantLandHLSL::shaderCaches[SHADER_COUNT];
 // O3 background recompile system
 std::queue<DistantLandHLSL::O3RecompileKey> DistantLandHLSL::o3RecompileQueue;
 std::mutex DistantLandHLSL::o3QueueMutex;
-std::thread DistantLandHLSL::o3RecompileThread;
+std::vector<std::thread> DistantLandHLSL::o3RecompileWorkers;
 std::atomic<bool> DistantLandHLSL::o3RecompileActive{false};
 std::atomic<bool> DistantLandHLSL::o3RecompileStarted{false};
 
@@ -74,8 +74,13 @@ void DistantLandHLSL::startO3RecompileThread() {
     }
 
     o3RecompileActive = true;
-    o3RecompileThread = std::thread([]() {
-        LOG::logline("-- DL HLSL O3 recompile thread started");
+
+    constexpr int numWorkers = 2;
+    static std::atomic<int> totalCompiled{0};
+    totalCompiled = 0;
+
+    auto workerFunc = []() {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 
         int compiled = 0;
         while (o3RecompileActive) {
@@ -109,20 +114,35 @@ void DistantLandHLSL::startO3RecompileThread() {
             }
 
             compiled++;
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
 
-        LOG::logline("-- DL HLSL O3 recompile thread finished: %d shaders upgraded", compiled);
+        totalCompiled += compiled;
+    };
+
+    LOG::logline("-- DL HLSL O3 recompile: starting %d workers", numWorkers);
+    for (int i = 0; i < numWorkers; i++) {
+        o3RecompileWorkers.emplace_back(workerFunc);
+    }
+
+    // Detach a monitor thread to log completion
+    std::thread([numWorkers]() {
+        for (auto& w : o3RecompileWorkers) {
+            if (w.joinable()) w.join();
+        }
+        o3RecompileWorkers.clear();
+
+        LOG::logline("-- DL HLSL O3 recompile finished: %d shaders upgraded", totalCompiled.load());
         o3RecompileActive = false;
-    });
+    }).detach();
 }
 
 void DistantLandHLSL::stopO3RecompileThread() {
     o3RecompileActive = false;
 
-    if (o3RecompileThread.joinable()) {
-        o3RecompileThread.join();
+    for (auto& w : o3RecompileWorkers) {
+        if (w.joinable()) w.join();
     }
+    o3RecompileWorkers.clear();
 
     std::lock_guard<std::mutex> lock(o3QueueMutex);
     while (!o3RecompileQueue.empty()) {

@@ -11,6 +11,7 @@
 #include "morrowindbsa.h"
 #include "statusoverlay.h"
 #include "distantland.h"
+#include "distantlandhlsl.h"
 #include "imgui_manager.h"
 #include "hlsl_shader_manager.h"
 #include "shader_utils.h"
@@ -483,7 +484,7 @@ std::unordered_map<FixedFunctionShader::VertexShaderKey, IDirect3DVertexShader9*
 std::queue<FixedFunctionShader::ShaderKey> FixedFunctionShader::o3RecompileQueue;
 std::mutex FixedFunctionShader::o3QueueMutex;
 std::atomic<bool> FixedFunctionShader::o3RecompileActive{false};
-std::thread FixedFunctionShader::o3RecompileThread;
+std::vector<std::thread> FixedFunctionShader::o3RecompileWorkers;
 std::atomic<bool> FixedFunctionShader::o3RecompileStarted{false};
 
 // Precache progress counters for loading bar
@@ -828,6 +829,11 @@ void FixedFunctionShader::startEarlyPrecache(IDirect3DDevice* d) {
 
                 StatusOverlay::setStatus("HLSL shader precaching complete");
                 LOG::logline("-- Precache complete: %d shaders compiled", compiledCount.load());
+
+                // Start O3 recompilation immediately after precache
+                queueAllO3Recompiles();
+                startO3RecompileThread();
+                DistantLandHLSL::startO3RecompileThread();
             }
             return 0;
         }, nullptr, 0, nullptr);
@@ -1736,8 +1742,13 @@ void FixedFunctionShader::startO3RecompileThread() {
     }
 
     o3RecompileActive = true;
-    o3RecompileThread = std::thread([]() {
-        LOG::logline("-- O3 recompile thread started");
+
+    constexpr int numWorkers = 2;
+    static std::atomic<int> totalCompiled{0};
+    totalCompiled = 0;
+
+    auto workerFunc = []() {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 
         int compiled = 0;
         while (o3RecompileActive) {
@@ -1780,25 +1791,38 @@ void FixedFunctionShader::startO3RecompileThread() {
             ReleaseSRWLockExclusive(&hlslCacheLock);
 
             compiled++;
-
-            // Leisurely pace: 50ms between compiles to avoid impacting gameplay
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
+
+        totalCompiled += compiled;
+    };
+
+    LOG::logline("-- O3 recompile: starting %d workers", numWorkers);
+    for (int i = 0; i < numWorkers; i++) {
+        o3RecompileWorkers.emplace_back(workerFunc);
+    }
+
+    // Detach a monitor thread to log completion and invalidate LRU
+    std::thread([numWorkers]() {
+        for (auto& w : o3RecompileWorkers) {
+            if (w.joinable()) w.join();
+        }
+        o3RecompileWorkers.clear();
 
         // Invalidate LRU so next draw picks up O3 shaders
         hlslShaderLRU.last_sk = ShaderKey();
 
-        LOG::logline("-- O3 recompile thread finished: %d shaders upgraded", compiled);
+        LOG::logline("-- O3 recompile finished: %d shaders upgraded", totalCompiled.load());
         o3RecompileActive = false;
-    });
+    }).detach();
 }
 
 void FixedFunctionShader::stopO3RecompileThread() {
     o3RecompileActive = false;
 
-    if (o3RecompileThread.joinable()) {
-        o3RecompileThread.join();
+    for (auto& w : o3RecompileWorkers) {
+        if (w.joinable()) w.join();
     }
+    o3RecompileWorkers.clear();
 
     // Clear any remaining queue
     std::lock_guard<std::mutex> lock(o3QueueMutex);

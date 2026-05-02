@@ -82,7 +82,7 @@ private:
     // O3 background recompile system
     static std::queue<O3RecompileKey> o3RecompileQueue;
     static std::mutex o3QueueMutex;
-    static std::thread o3RecompileThread;
+    static std::vector<std::thread> o3RecompileWorkers;
     static std::atomic<bool> o3RecompileActive;
     static std::atomic<bool> o3RecompileStarted;
 
