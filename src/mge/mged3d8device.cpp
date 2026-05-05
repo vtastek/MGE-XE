@@ -711,6 +711,22 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
             }
         }
 
+        // Sync mode: Submit CPU prep at frame start (async), GPU render waits at BeginScene UI
+        const bool useSyncGpuThread = ImGuiManager::GetSyncGpuThread()
+                                      && isHLSLActive() && g_cpuPrepThread && g_cpuPrepThread->isRunning();
+        if (useSyncGpuThread) {
+            // Submit CPU prep for prepBuffer (N-1) async - runs during MW recording
+            if (FixedFunctionShader::isN1Ready()) {
+                auto& prepBuf = FixedFunctionShader::getPrepBuffer();
+                CpuPrepThread::PrepWork work;
+                work.type = CpuPrepThread::WorkType::PrepareFrame;
+                work.viewMatrix = prepBuf.view;
+                work.projMatrix = prepBuf.proj;
+                g_cpuPrepThread->submitWork(std::move(work), false);  // async!
+                MGE_TracyMessage("SyncCPT_PrepSubmit", 18);
+            }
+        }
+
         // Reset per-frame flags
         FixedFunctionShader::resetHiZBuiltFlag();
         FixedFunctionShader::resetRecordingCompletedFlag();
@@ -1055,29 +1071,17 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                         // Clear depth so UI isn't depth-tested against 3D geometry
                         realDevice->Clear(0, NULL, D3DCLEAR_ZBUFFER, 0, 1.0f, 0);
                     } else if (ImGuiManager::GetSyncGpuThread() && threadsReady) {
-                        // N-1 Sync mode: CPU prep and GPU render both use prepBuffer (N-1)
-                        // Both operations are sync (wait immediately) but use their respective threads
+                        // N-1 Sync mode: CPU prep started at Present(), GPU render here
                         MGE_TracyMessage("SyncN1_Start", 13);
 
-                        // Wait for any pending thread work from previous frame
+                        // Wait for CPU prep (submitted at Present) and any prior GPU work
                         {
-                            MGE_ZoneScopedN("WaitPrevWork_Sync");
+                            MGE_ZoneScopedN("WaitCpuPrep_Sync");
                             g_cpuPrepThread->waitForCompletion();
                             g_renderThread->waitForCompletion();
                         }
 
-                        // Step 1: CPU prep for prepBuffer (N-1)
-                        if (FixedFunctionShader::isN1Ready()) {
-                            auto& prepBuf = FixedFunctionShader::getPrepBuffer();
-                            CpuPrepThread::PrepWork cpuWork;
-                            cpuWork.type = CpuPrepThread::WorkType::PrepareFrame;
-                            cpuWork.viewMatrix = prepBuf.view;
-                            cpuWork.projMatrix = prepBuf.proj;
-                            MGE_ZoneScopedN("SyncCpuPrep");
-                            g_cpuPrepThread->submitWork(std::move(cpuWork), true);  // sync wait
-                        }
-
-                        // Step 2: GPU render for prepBuffer (N-1) - uses prepped data
+                        // GPU render for prepBuffer (N-1) - CPU prep already done
                         {
                             RenderThread::SceneWork gpuWork;
                             gpuWork.type = RenderThread::WorkType::RenderFullFrame;
