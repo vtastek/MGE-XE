@@ -40,6 +40,7 @@ public:
         int sceneCount = 0;
         int bufferIndex = -1;
         DLContext* ctx = nullptr;
+        bool useN1Buffer = false;  // N-1 mode: use prepBuffer instead of renderBuffer
     };
 
     enum class State {
@@ -70,7 +71,7 @@ private:
     void executeRenderStage1(DLContext* ctx);
     void executeRenderStage2(DLContext* ctx);
     void executeReplayHLSL(int sceneCount);
-    void executeFullFrame(int bufferIndex);
+    void executeFullFrame(int bufferIndex, bool useN1Buffer);
 
 public:
     RenderThread() = default;

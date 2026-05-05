@@ -225,6 +225,7 @@ void FixedFunctionShader::logCellCrossFrame(const char* phase, const FrameBuffer
 // HLSL Render Dispatch Recording System
 bool FixedFunctionShader::isRecording = false;
 bool FixedFunctionShader::isReplaying = false;
+bool FixedFunctionShader::usingN1Buffer = false;
 bool FixedFunctionShader::manualRecordingControl = false;
 bool FixedFunctionShader::recordingEnabled = true;
 bool FixedFunctionShader::recordingCompletedThisFrame = false;
@@ -2229,6 +2230,10 @@ void FixedFunctionShader::swapBuffers() {
 
     // Clear the new recording buffer (was just rendered)
     frameBuffers[recordingBuffer].clear();
+
+    // Reset prep buffer state: was recording, now needs prep work
+    // Without this, stale ReadyToRender state from previous rotation causes CPU prep to skip
+    frameBuffers[prepBuffer].state = BufferState::Recording;
 
     // After first swap, N-1 data is available in prep buffer
     n1Ready = true;

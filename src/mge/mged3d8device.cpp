@@ -676,11 +676,16 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         g_safeZoneStart = std::chrono::high_resolution_clock::now();
         MGE_TracyMessage("RT_SafeZone_START", 17);
 
-        // Phase 3: True Async Overlap - submit both CPU prep and GPU work at Present().
+        // Phase 3: Async GPU thread submission at Present().
+        // Sync mode (B2) submits at BeginScene UI instead - same timing as non-threading.
+        // Async mode (C): submit work here and continue - true parallel execution.
         // Main thread records frame N while:
         //   - CPU prep thread processes frame N-1
         //   - GPU thread renders frame N-2
-        if (ImGuiManager::GetAsyncGpuThread() && isHLSLActive() && g_cpuPrepThread && g_cpuPrepThread->isRunning()) {
+        const bool useAsyncGpuThread = ImGuiManager::GetAsyncGpuThread()
+                                       && isHLSLActive() && g_cpuPrepThread && g_cpuPrepThread->isRunning();
+
+        if (useAsyncGpuThread) {
             // Wait for previous CPU prep to complete before starting GPU work
             // This ensures render buffer (N-2) is in ReadyToRender state
             {
@@ -711,7 +716,8 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         FixedFunctionShader::resetRecordingCompletedFlag();
 
         // Reset HLSL texture caches at frame boundary to prevent stale texture pointers
-        // Skip when async GPU is active - GPU thread handles its own cache reset and may still be using resources
+        // Skip when async GPU thread is active - GPU thread handles its own cache reset and may still be using resources
+        // Sync mode runs at BeginScene (after Present), so reset is safe here
         if (!ImGuiManager::GetAsyncGpuThread()) {
             FixedFunctionShader::resetHLSLCaches();
         }
@@ -1029,10 +1035,12 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                     // N-1: Store current frame's waterSeen into recording buffer
                     FixedFunctionShader::getRecordingBuffer().waterSeen = g_scene.waterDrawn;
 
-                    if (ImGuiManager::GetAsyncGpuThread() && g_cpuPrepThread && g_cpuPrepThread->isRunning()
+                    const bool threadsReady = g_cpuPrepThread && g_cpuPrepThread->isRunning()
                         && g_renderThread && g_renderThread->isRunning()
-                        && FixedFunctionShader::isN2Ready()) {  // Wait for 2-frame warm-up
-                        // Phase 3: Wait for async work submitted at Present()
+                        && FixedFunctionShader::isN2Ready();  // Wait for 2-frame warm-up
+
+                    if (ImGuiManager::GetAsyncGpuThread() && threadsReady) {
+                        // Async mode: Wait for async work submitted at Present()
                         // GPU has been running in parallel with main thread recording
                         {
                             MGE_ZoneScopedN("WaitForCpuPrepThread");
@@ -1044,9 +1052,45 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                             g_renderThread->waitForCompletion();
                             MGE_TracyMessage("RT_GpuComplete", 14);
                         }
-                        // State restoration happens after GpuExit (below) for both paths
+                        // Clear depth so UI isn't depth-tested against 3D geometry
+                        realDevice->Clear(0, NULL, D3DCLEAR_ZBUFFER, 0, 1.0f, 0);
+                    } else if (ImGuiManager::GetSyncGpuThread() && threadsReady) {
+                        // N-1 Sync mode: CPU prep and GPU render both use prepBuffer (N-1)
+                        // Both operations are sync (wait immediately) but use their respective threads
+                        MGE_TracyMessage("SyncN1_Start", 13);
+
+                        // Wait for any pending thread work from previous frame
+                        {
+                            MGE_ZoneScopedN("WaitPrevWork_Sync");
+                            g_cpuPrepThread->waitForCompletion();
+                            g_renderThread->waitForCompletion();
+                        }
+
+                        // Step 1: CPU prep for prepBuffer (N-1)
+                        if (FixedFunctionShader::isN1Ready()) {
+                            auto& prepBuf = FixedFunctionShader::getPrepBuffer();
+                            CpuPrepThread::PrepWork cpuWork;
+                            cpuWork.type = CpuPrepThread::WorkType::PrepareFrame;
+                            cpuWork.viewMatrix = prepBuf.view;
+                            cpuWork.projMatrix = prepBuf.proj;
+                            MGE_ZoneScopedN("SyncCpuPrep");
+                            g_cpuPrepThread->submitWork(std::move(cpuWork), true);  // sync wait
+                        }
+
+                        // Step 2: GPU render for prepBuffer (N-1) - uses prepped data
+                        {
+                            RenderThread::SceneWork gpuWork;
+                            gpuWork.type = RenderThread::WorkType::RenderFullFrame;
+                            gpuWork.useN1Buffer = true;  // Use prepBuffer, not renderBuffer
+                            MGE_ZoneScopedN("SyncGpuRender");
+                            g_renderThread->submitWork(std::move(gpuWork), true);  // sync wait
+                        }
+
+                        MGE_TracyMessage("SyncN1_Done", 12);
+                        // Clear depth so UI isn't depth-tested against 3D geometry
+                        realDevice->Clear(0, NULL, D3DCLEAR_ZBUFFER, 0, 1.0f, 0);
                     } else {
-                        // Async toggle OFF: run GPU phase on main thread
+                        // No threading: run GPU phase on main thread
                         FixedFunctionShader::renderFullFrameAsync();
                         // Clear depth so UI isn't depth-tested against 3D geometry
                         realDevice->Clear(0, NULL, D3DCLEAR_ZBUFFER, 0, 1.0f, 0);

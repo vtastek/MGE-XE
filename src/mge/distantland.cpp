@@ -468,8 +468,8 @@ void DistantLand::renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer*
         // Hi-Z culling: split into CPU-only visibility testing and lightweight recordMW filter
         // executeHiZCulling: bbox, occluder rasterization, Hi-Z pyramid, visibility test (no D3D device)
         // applyVisibilityAndFilterRecordMW: filters recordMW using visibility results
-        // Skip if async enabled - CpuPrepThread already did this work
-        if (!ImGuiManager::GetAsyncGpuThread() && isHLSLActive()) {
+        // Skip if async or sync threading enabled - CpuPrepThread already did this work
+        if (!ImGuiManager::GetAsyncGpuThread() && !ImGuiManager::GetSyncGpuThread() && isHLSLActive()) {
             FixedFunctionShader::executeHiZCulling(ctx->mwView, ctx->mwProj);
             FixedFunctionShader::applyVisibilityAndFilterRecordMW();
             // Build merged batches after culling (shouldRender flags now set)
@@ -493,6 +493,7 @@ void DistantLand::renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer*
 
         // Single RT switch for all depth rendering (renderDepth + StretchRect + renderDepthDistantLand + MSAA resolve)
         {
+            MGE_ZoneScopedN("DL_DepthSection");
             RenderTargetSwitcher rtsw(surfDepthFrameMSAA, surfDepthDepth);
             g_passBreaks.mge_depthRT += 2; // Single RenderTargetSwitcher in+out for entire depth section
 
@@ -548,6 +549,7 @@ void DistantLand::renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer*
 
             // Phase A: Resolve MSAA depth frame to non-MSAA texture for post-processing
             if (Configuration.AALevel > 0) {
+                MGE_ZoneScopedN("DL_DepthMSAAResolve");
                 IDirect3DSurface9* texDepthFrameSurface;
                 texDepthFrame->GetSurfaceLevel(0, &texDepthFrameSurface);
                 device->StretchRect(surfDepthFrameMSAA, NULL, texDepthFrameSurface, NULL, D3DTEXF_NONE);

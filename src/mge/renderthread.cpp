@@ -107,7 +107,7 @@ void RenderThread::workerLoop() {
                 break;
             case WorkType::RenderFullFrame:
                 g_renderThreadOwnsDevice.store(true, std::memory_order_release);
-                executeFullFrame(work.bufferIndex);
+                executeFullFrame(work.bufferIndex, work.useN1Buffer);
                 g_renderThreadOwnsDevice.store(false, std::memory_order_release);
                 // Stress test: simulate slow GPU to catch race conditions
                 if (ImGuiManager::GetStressAsyncDelay()) {
@@ -179,7 +179,14 @@ void RenderThread::executeReplayHLSL(int sceneCount) {
     FixedFunctionShader::finalizeBatchAndReplay(sceneCount);
 }
 
-void RenderThread::executeFullFrame(int /*bufferIndex*/) {
+void RenderThread::executeFullFrame(int /*bufferIndex*/, bool useN1Buffer) {
     MGE_ZoneScopedN("RT_FullFrame");
-    FixedFunctionShader::renderFullFrameAsync();
+    static int fullFrameLogCount = 0;
+    if (fullFrameLogCount++ < 20) {
+        LOG::logline("[RT] executeFullFrame: starting renderFullFrameAsync (N1=%d)", useN1Buffer ? 1 : 0);
+    }
+    FixedFunctionShader::renderFullFrameAsync(useN1Buffer);
+    if (fullFrameLogCount <= 20) {
+        LOG::logline("[RT] executeFullFrame: completed");
+    }
 }

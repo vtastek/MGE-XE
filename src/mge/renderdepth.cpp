@@ -154,6 +154,7 @@ void DistantLand::renderDepth(DLContext* ctx, const std::vector<RecordedMWState>
 }
 
 void DistantLand::renderDepthDistantLand(DLContext* ctx) {
+    MGE_ZoneScopedN("renderDepthDistantLand");
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_DepthDistant, 0);
     auto mwBridge = MWBridge::get();
 
@@ -381,7 +382,10 @@ void DistantLand::renderDepthRecorded(const std::vector<RecordedMWState>& recMW,
     // Skip entirely when velocity buffer writes are disabled (menu exit frame)
     static int lastFrameSwapped = -1;
     if (sceneFilter == 0 && velocityBufferEnabled && !shouldSkipVelocityBuffer()) {
-        int curFrame = FixedFunctionShader::getRenderingBuffer().frameNumber;
+        auto& fb = FixedFunctionShader::isUsingN1Buffer()
+            ? FixedFunctionShader::getPrepBuffer()
+            : FixedFunctionShader::getRenderingBuffer();
+        int curFrame = fb.frameNumber;
         if (curFrame != lastFrameSwapped) {
             // If more than 1 frame gap, prev cache is stale - clear both to avoid velocity spikes
             bool frameGap = (lastFrameSwapped >= 0 && curFrame - lastFrameSwapped > 1);

@@ -1662,24 +1662,30 @@ void FixedFunctionShader::executeRenderPass() {
 // Async GPU path: runs on render thread during safe zone.
 // Combines finalizeAndRenderAllScenes + postProcess without UI state save/restore.
 // Main thread handles UI state save/restore around waitForCompletion().
-void FixedFunctionShader::renderFullFrameAsync() {
+// useN1Buffer: true = N-1 mode (use prepBuffer), false = N-2 mode (use renderBuffer)
+void FixedFunctionShader::renderFullFrameAsync(bool useN1Buffer) {
     MGE_ZoneScopedN("renderFullFrameAsync");
 
-    if (!recordingEnabled || !n2Ready) {
-        LOG_CAT(LOG::Cat_Recording, ">> renderFullFrameAsync SKIP (enabled=%d n2=%d)", recordingEnabled, n2Ready);
+    // Check appropriate ready flag based on mode
+    bool isReady = useN1Buffer ? n1Ready : n2Ready;
+    if (!recordingEnabled || !isReady) {
+        LOG_CAT(LOG::Cat_Recording, ">> renderFullFrameAsync SKIP (enabled=%d ready=%d N1mode=%d)",
+                recordingEnabled, isReady, useN1Buffer ? 1 : 0);
         return;
     }
 
-    // Phase 3: Use renderBuffer (N-2) - prepped by CpuPrepThread when it was N-1
-    auto& fb = getRenderingBuffer();
+    // N-1 mode: use prepBuffer (just prepped this frame)
+    // N-2 mode: use renderBuffer (prepped last frame)
+    usingN1Buffer = useN1Buffer;  // Set flag for replayRecordedCalls to use correct buffer
+    auto& fb = useN1Buffer ? getPrepBuffer() : getRenderingBuffer();
     int currentFrame = getFrameNumber();
     int renderFrame = fb.frameNumber;
 
-    // Pipeline validation: render should be N-2 (two frames behind current)
-    int expectedRenderFrame = currentFrame - 2;
+    // Pipeline validation
+    int expectedRenderFrame = useN1Buffer ? (currentFrame - 1) : (currentFrame - 2);
     if (renderFrame != expectedRenderFrame && renderFrame >= 0) {
-        LOG::logline("!! GPU FRAME MISMATCH: current=%d render=%d expected=%d (delta=%d)",
-                     currentFrame, renderFrame, expectedRenderFrame, currentFrame - renderFrame);
+        LOG::logline("!! GPU FRAME MISMATCH: current=%d render=%d expected=%d (delta=%d, N1=%d)",
+                     currentFrame, renderFrame, expectedRenderFrame, currentFrame - renderFrame, useN1Buffer ? 1 : 0);
     }
 
     LOG_CAT(LOG::Cat_Recording, ">> renderFullFrameAsync frame=%d state=%d calls=%d",

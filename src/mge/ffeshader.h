@@ -1302,6 +1302,7 @@ public:
             nearPatchCount = 0;
             nearPatchEdgeHeights.clear();
             valid = false;
+            state = BufferState::Recording;  // Reset state for fresh recording
             // Initialize matrices to identity to prevent garbage if capture functions aren't called
             D3DXMatrixIdentity(&view);
             D3DXMatrixIdentity(&proj);
@@ -1356,6 +1357,7 @@ public:
 private:
     static bool isRecording;
     static bool isReplaying;
+    static bool usingN1Buffer;  // N-1 mode: use prepBuffer instead of renderBuffer for replay
     static bool manualRecordingControl;  // When true, user controls recording via K key
     static bool recordingEnabled;  // Global toggle for entire recording system
     static bool recordingCompletedThisFrame;  // Prevents restarting recording after Scene 0
@@ -1434,7 +1436,7 @@ public:
 
     // Async GPU path: runs on render thread during safe zone
     // Combines finalizeAndRenderAllScenes + postProcess without UI state save/restore
-    static void renderFullFrameAsync();
+    static void renderFullFrameAsync(bool useN1Buffer = false);
 
     // Triple buffer accessors
     static FrameBuffer& getRecordingBuffer() { return frameBuffers[recordingBuffer]; }  // Frame N
@@ -1447,6 +1449,7 @@ public:
     // Debug controls for record/replay system
     static bool getIsRecording() { return isRecording; }
     static bool getIsReplaying() { return isReplaying; }
+    static bool isUsingN1Buffer() { return usingN1Buffer; }
     static void setRecordingState(bool recording) { isRecording = recording; }
     static void resetRecordingCompletedFlag() { recordingCompletedThisFrame = false; currentRecordingScene = 0; }
     static void setCurrentRecordingScene(int scene) { currentRecordingScene = scene; }

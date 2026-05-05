@@ -51,9 +51,11 @@ ReplayMetrics g_replayMetrics = {};
 // Sampler state cache for recording (duplicated from ffeshader.cpp for HLSLRecordedCall ctor)
 static std::unordered_map<IDirect3DBaseTexture9*, std::pair<DWORD, DWORD>> samplerCache;
 
-// Helper: get rendering buffer's recorded calls (N-1 data being replayed)
+// Helper: get current buffer's recorded calls (respects N-1 mode)
 static auto& currentRecordedCalls() {
-    return FixedFunctionShader::getRenderingBuffer().recordedCalls;
+    return FixedFunctionShader::isUsingN1Buffer()
+        ? FixedFunctionShader::getPrepBuffer().recordedCalls
+        : FixedFunctionShader::getRenderingBuffer().recordedCalls;
 }
 
 // Material state cache helper functions
@@ -548,8 +550,8 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     ShaderKey sk;
     if (isReplaying) {
         // During replay, use the recorded ShaderKey with original suffix flags
-        // N-1: Search rendering buffer's scene buffers (Scene 0, 1, and 2)
-        auto& fb = getRenderingBuffer();
+        // Select buffer based on mode: N-1 uses prepBuffer, N-2 uses renderBuffer
+        auto& fb = usingN1Buffer ? getPrepBuffer() : getRenderingBuffer();
         bool found = false;
         for (const auto& call : fb.recordedCalls) {
             if (&call.rs == rs) { sk = call.sk; found = true; break; }
@@ -813,10 +815,11 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
 
     // Get current view matrix and compute inverse (needed for texture lights and shadows)
     // During replay, device may have UI view — use recorded game view instead
-    // N-1: use rendering buffer's currentView (captured at captureStage0Context to match DL)
+    // Select buffer based on mode: N-1 uses prepBuffer, N-2 uses renderBuffer
     D3DXMATRIX currentView;
     if (isReplaying) {
-        currentView = getRenderingBuffer().currentView;
+        auto& fb = usingN1Buffer ? getPrepBuffer() : getRenderingBuffer();
+        currentView = fb.currentView;
     } else {
         device->GetTransform(D3DTS_VIEW, &currentView);
     }
@@ -981,9 +984,9 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
 
     // During replay, use ALL recorded matrices to avoid stale matrix issues
     // During normal rendering, get them from the device
-    // N-1: use rendering buffer's currentView/currentProj (captured at captureStage0Context to match DL)
+    // Select buffer based on mode: N-1 uses prepBuffer, N-2 uses renderBuffer
     if (isReplaying) {
-        auto& fb = getRenderingBuffer();
+        auto& fb = usingN1Buffer ? getPrepBuffer() : getRenderingBuffer();
         projMatrix = fb.currentProj;
         viewMatrix = fb.currentView;
         worldMatrix = rs->worldTransforms[0];
@@ -1693,8 +1696,8 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         }
 
         // Use staging buffer for Scene 1/2 snapshot draws, original VB for Scene 0
-        // N-1: use rendering buffer's staging buffers
-        auto& fbStaging = getRenderingBuffer();
+        // Select buffer based on mode: N-1 uses prepBuffer, N-2 uses renderBuffer
+        auto& fbStaging = usingN1Buffer ? getPrepBuffer() : getRenderingBuffer();
         bool useStagingBuffer = replayCall && replayCall->usesSnapshot &&
                                 fbStaging.particleStagingVB && fbStaging.particleStagingIB;
 
@@ -1782,8 +1785,8 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
         hlslDiagFrameCounter++;
     }
 
-    // N-1: Select rendering buffer (previous frame's recorded data)
-    auto& fb = getRenderingBuffer();
+    // Select buffer based on mode: N-1 uses prepBuffer, N-2 uses renderBuffer
+    auto& fb = usingN1Buffer ? getPrepBuffer() : getRenderingBuffer();
     std::vector<HLSLRecordedCall>* recCallsPtr;
     if (sceneCount == 1) {
         recCallsPtr = &fb.recordedCallsScene1;
@@ -3623,8 +3626,9 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
 
     // Note: Camera position is already stored above for next frame's velocity calculation
 
-    // N-1: Mark rendering buffer as available after replay
-    getRenderingBuffer().state = BufferState::Available;
+    // Mark buffer as available after replay (correct buffer based on mode)
+    auto& completedFb = usingN1Buffer ? getPrepBuffer() : getRenderingBuffer();
+    completedFb.state = BufferState::Available;
 
     // Restore render states after replay completes
     if (!cmdBuf) {
