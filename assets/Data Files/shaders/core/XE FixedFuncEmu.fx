@@ -13,7 +13,7 @@ shared float4 lightAmbient[2];
 shared float3 lightSunDirection;
 shared float4 lightPosition[6];
 shared float4 lightFalloffQuadratic[2], lightFalloffLinear[2];
-shared float lightFalloffConstant;
+shared float4 lightFalloffConstant[2];
 shared matrix texgenTransform;
 shared float4 bumpMatrix;
 shared float2 bumpLumiScaleBias;
@@ -74,6 +74,114 @@ float3 texgenSphere(float2 tex) { return float3(0.5 * tex + 0.5, 0); }
 // Number of light groups; lights are vectorized into groups of 4
 static const int LGs = max(1, ceil(FFE_LIGHTS_ACTIVE / 4.0));
 
+//------------------------------------------------------------
+// Texture-based point light path. Lights packed into a dynamic 1D
+// texture (3 texels per light), iterated by runtime count in
+// lightDataParams.x. Format mirrors vtastek's core-hlsl/lighting.hlsl
+// evaluatePointLights — same general layout, parameters register, and
+// sampler slot — so we can later converge with that path if it lands
+// upstream.
+//
+// Wire format per light (3 texels, R32G32B32A32F):
+//   texel 0: (posX, posY, posZ, ambient)  — view-space pos + per-light ambient
+//   texel 1: (diffR, diffG, diffB, _)     — engine-derived diffuse (× dimmer)
+//   texel 2: (k0, k1, k2, radius)         — falloff const/lin/quad + radius
+//
+// Texel-0.w carries the engine-derived per-light ambient term so the
+// textured path matches the constant-array path's
+// (lambert + ambient) * att behaviour for MCP magic / spell-effect
+// lights (where bufferAmbient is non-zero).
+// Texel-2.w carries Bethesda's modder-set radius (NI::Light::specular.r).
+// The shader uses it as the inner edge of a smoothstep window that
+// drives attenuation to exactly 0 at 2×radius, masking the seam from
+// the CPU's per-mesh sphere-AABB cull (also at 2×radius).
+//
+// lightDataParams (constant register c50):
+//   .x = number of lights to iterate (runtime)
+//   .y = 1.0 / textureWidth        (texel U coordinate stride)
+//   .z = first-light texel offset  (always 0 in our scene-wide setup)
+//   .w = unused
+// Sampler slot diverges from vtastek's s5: the FFE shader already
+// declares sampFFE5 at s5 (mapped to engine's tex5), so we can't reuse
+// that slot. s7 is unused by FFE and safely above MGE's other shader
+// paths.
+shared texture texLightData;
+sampler LightDataSampler : register(s7) = sampler_state {
+    texture   = <texLightData>;
+    MinFilter = POINT;
+    MagFilter = POINT;
+    MipFilter = NONE;
+    AddressU  = CLAMP;
+    AddressV  = CLAMP;
+};
+shared float4 lightDataParams;
+// Per-mesh light indices (selected via sphere-AABB on CPU, ranked by
+// dist²/radius²). Each float4 packs 4 indices. 8 float4s give us
+// kMaxIndicesPerMesh=32 indices per mesh. lightDataParams.x is the
+// runtime-bounded loop count over these indices.
+shared float4 lightIndices[8];
+#ifdef USE_TEXTURE_LIGHTS
+
+float3 evaluatePointLightsTextured(float3 viewPos, float3 normal) {
+    float3 acc = 0;
+    int numLights = (int)lightDataParams.x;
+    float stride  = lightDataParams.y;
+
+    for (int i = 0; i < numLights; ++i) {
+        // Resolve i -> texture index via the per-mesh selection list.
+        // lightIndices is a float4[8] holding 32 packed indices; lane
+        // selection via i/4 row, i%4 column.
+        float idxF = lightIndices[i / 4][i % 4];
+
+        // Strength-reduced texel U coordinates: compute u0 once, derive
+        // u1/u2 by adding stride. Saves two multiplies per light vs.
+        // recomputing (idx*3 + offset + 0.5) * stride for each texel.
+        float u0 = (idxF * 3.0 + 0.5) * stride;
+        float u1 = u0 + stride;
+        float u2 = u0 + stride * 2.0;
+
+        float4 pos     = tex2Dlod(LightDataSampler, float4(u0, 0.5, 0, 0));
+        float4 color   = tex2Dlod(LightDataSampler, float4(u1, 0.5, 0, 0));
+        float4 falloff = tex2Dlod(LightDataSampler, float4(u2, 0.5, 0, 0));
+        float ambient  = pos.w;
+        float radius   = falloff.w;
+
+        float3 toLight = pos.xyz - viewPos;
+        float dist2    = dot(toLight, toLight);
+        // rsqrt + dist2 * invDist beats sqrt + 1/sqrt on modern HW.
+        float invDist  = rsqrt(dist2);
+        float dist     = dist2 * invDist;
+
+        // Match FFE's attenuation formula (quadratic + constant; linear
+        // ignored as in calcLighting4 above). max() guards against the
+        // singular case where both k0 and dist² are 0 (script-spawned
+        // lights with degenerate falloff would otherwise inf the result).
+        float att = 1.0 / max(falloff.z * dist2 + falloff.x, 1e-4);
+
+        // Soft-cutoff window. The engine's 1/(C + L*d + Q*d²) never
+        // reaches 0; without bounding it, the per-mesh CPU cull (which
+        // IS binary) creates visible hard seams wherever a mesh sits
+        // on the cull boundary. Multiply attenuation by a smoothstep
+        // that ramps from 1 at d == radius down to 0 at d == 2*radius —
+        // same 2×radius point the CPU uses for cull, so the two
+        // boundaries align and the seam disappears. Pattern from
+        // OpenMW's PerObjectUniform mode (lighting_util.glsl).
+        att *= 1.0 - smoothstep(radius, 2.0 * radius, dist);
+
+        // Lambert (saturate(N · L) — matches FFE convention).
+        // dot(N, L) = dot(N, toLight) / dist; we already have invDist,
+        // so skip forming the explicit L vector — saves a vec3 divide.
+        float lambert = saturate(dot(normal, toLight) * invDist);
+
+        // (lambert + ambient) * att * color — mirrors calcLighting4's
+        // (lambert + lightAmbient[group]) * att for parity with the
+        // constant-array path on MCP magic / spell-effect lights.
+        acc += (lambert + ambient) * att * color.rgb;
+    }
+    return acc;
+}
+#endif
+
 // Point lights
 float4 calcLighting4(float4 lightvec[3*LGs], int group, float3 normal) {
     float4 dist2 = 0, lambert = 0;
@@ -91,8 +199,8 @@ float4 calcLighting4(float4 lightvec[3*LGs], int group, float3 normal) {
     lambert = saturate(lambert / dist);
 
     // Attenuation
-    float4 att = 1.0 / (lightFalloffQuadratic[group] * dist2 + lightFalloffConstant);
-    // (slower) float4 att = 1.0 / (lightFalloffQuadratic[group] * dist2 + lightFalloffLinear[group] * dist + lightFalloffConstant);
+    float4 att = 1.0 / (lightFalloffQuadratic[group] * dist2 + lightFalloffConstant[group]);
+    // (slower) float4 att = 1.0 / (lightFalloffQuadratic[group] * dist2 + lightFalloffLinear[group] * dist + lightFalloffConstant[group]);
     return (lambert + lightAmbient[group]) * att;
 }
 
@@ -158,13 +266,13 @@ struct FFEPixel {
 
     /* template */ FFE_SHADER_COUPLING
 
-    float4 lightvec[3*LGs] : TEXCOORD2;
+    float3 viewpos : TEXCOORD2;
 };
 
 //------------------------------------------------------------
 // Shader framework
 
-// Relatively simple, notably passes lighting vectors in interpolators
+// Passes view-space position; per-light vectors are reconstructed in PS
 FFEPixel PerPixelVS(FFEVertIn IN) {
     FFEPixel OUT;
 
@@ -183,12 +291,8 @@ FFEPixel PerPixelVS(FFEVertIn IN) {
     // Vertex colour
     /* template */ FFE_VERTEX_COLOUR
 
-    // Point lighting setup, vectorized
-    for(int i = 0; i != LGs; ++i) {
-        OUT.lightvec[3*i + 0] = lightPosition[i + 0] - viewpos.x;
-        OUT.lightvec[3*i + 1] = lightPosition[i + 2] - viewpos.y;
-        OUT.lightvec[3*i + 2] = lightPosition[i + 4] - viewpos.z;
-    }
+    // Pass view-space position for per-pixel light-vector reconstruction
+    OUT.viewpos = viewpos.xyz;
 
     return OUT;
 }
@@ -201,7 +305,24 @@ float4 PerPixelPS(FFEPixel IN) : COLOR0 {
     // Standard morrowind lighting: sun, ambient, and point lights
     float3 d = lightSunDiffuse * saturate(dot(normal, -lightSunDirection));
     float3 a = lightSceneAmbient;
-    d += calcPointLighting(FFE_LIGHTS_ACTIVE, IN.lightvec, normal);
+
+#ifdef USE_TEXTURE_LIGHTS
+    // _Claude_ Phase 2 texture-light path. Lights packed into a 1D
+    // texture (3 texels per light); shader iterates lightDataParams.x
+    // lights (runtime count, no compile-time array). See
+    // evaluatePointLightsTextured below.
+    d += evaluatePointLightsTextured(IN.viewpos, normal);
+#else
+    // Reconstruct per-light L vectors from view-space position. Was per-vertex
+    // via interpolators; moved here to lift the interpolator-budget cap on light count.
+    float4 lightvec[3*LGs];
+    for (int i = 0; i != LGs; ++i) {
+        lightvec[3*i + 0] = lightPosition[i + 0] - IN.viewpos.x;
+        lightvec[3*i + 1] = lightPosition[i + 2] - IN.viewpos.y;
+        lightvec[3*i + 2] = lightPosition[i + 4] - IN.viewpos.z;
+    }
+    d += calcPointLighting(FFE_LIGHTS_ACTIVE, lightvec, normal);
+#endif
 
     // Material
     float4 diffuse;

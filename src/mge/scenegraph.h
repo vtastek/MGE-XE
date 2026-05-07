@@ -27,9 +27,27 @@ namespace MGE::SceneGraph {
     void* getDataHandler();
     void  onFrameReady();
 
-    // Consumer views. References remain valid until the next onFrameReady().
+    // Consumer views over the typed scene-graph capture. References
+    // remain valid until the next onFrameReady().
     const std::vector<NI::Light*>&    lights();
     const std::vector<NI::AVObject*>& nodes();
+
+    // Pre-extracted POD view of point lights, suitable for consumers
+    // that do not include SharedSE NI headers (e.g. ffeshader.cpp,
+    // which can't take the prelude due to d3dx9 SDK conflicts). All
+    // fields are computed during onFrameReady() with the same engine
+    // branching the 8-light constant path applies (standard / MCP
+    // magic / projectile / spell-effect light variants), so the
+    // texture-light path matches what the engine would have done for
+    // these same lights.
+    struct PointLight {
+        float worldPos[3];   // worldTransform.translation
+        float diffuse[3];    // engine-derived diffuse, pre-multiplied by dimmer
+        float ambient;       // engine-derived per-light ambient term
+        float falloff[3];    // engine-derived (constant, linear, quadratic)
+        float radius;        // specular.r — Bethesda's modder-set fade radius
+    };
+    const std::vector<PointLight>& pointLights();
 
     // Increments each time onFrameReady() actually rebuilds the cache
     // (skipped rebuilds do not bump it). Consumers can use this as a

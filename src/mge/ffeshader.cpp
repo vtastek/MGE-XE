@@ -1,8 +1,10 @@
 
 #include "ffeshader.h"
 #include "configuration.h"
+#include "scenegraph.h"
 #include "support/log.h"
 
+#include <Windows.h>
 #include <algorithm>
 #include <sstream>
 #include <thread>
@@ -18,6 +20,11 @@ ID3DXEffectPool* FixedFunctionShader::constantPool;
 unordered_map<FixedFunctionShader::ShaderKey, ID3DXEffect*, FixedFunctionShader::ShaderKey::hasher> FixedFunctionShader::cacheEffects;
 FixedFunctionShader::ShaderLRU FixedFunctionShader::shaderLRU;
 ID3DXEffect* FixedFunctionShader::effectDefaultPurple;
+IDirect3DTexture9* FixedFunctionShader::texLightData = nullptr;
+uint64_t FixedFunctionShader::lastUploadedRevision = (uint64_t)-1;
+unsigned int FixedFunctionShader::lastUploadedPointCount = 0;
+std::unordered_map<FixedFunctionShader::MeshKey, FixedFunctionShader::ObjectSpaceBBox,
+                   FixedFunctionShader::MeshKeyHash> FixedFunctionShader::bboxCache;
 
 D3DXHANDLE FixedFunctionShader::ehWorld, FixedFunctionShader::ehWorldView;
 D3DXHANDLE FixedFunctionShader::ehVertexBlendState, FixedFunctionShader::ehVertexBlendPalette;
@@ -26,6 +33,7 @@ D3DXHANDLE FixedFunctionShader::ehMaterialDiffuse, FixedFunctionShader::ehMateri
 D3DXHANDLE FixedFunctionShader::ehLightSceneAmbient, FixedFunctionShader::ehLightSunDiffuse, FixedFunctionShader::ehLightDiffuse;
 D3DXHANDLE FixedFunctionShader::ehLightSunDirection, FixedFunctionShader::ehLightPosition, FixedFunctionShader::ehLightAmbient;
 D3DXHANDLE FixedFunctionShader::ehLightFalloffQuadratic, FixedFunctionShader::ehLightFalloffLinear, FixedFunctionShader::ehLightFalloffConstant;
+D3DXHANDLE FixedFunctionShader::ehTexLightData, FixedFunctionShader::ehLightDataParams, FixedFunctionShader::ehLightIndices;
 D3DXHANDLE FixedFunctionShader::ehTexgenTransform, FixedFunctionShader::ehBumpMatrix, FixedFunctionShader::ehBumpLumiScaleBias;
 
 float FixedFunctionShader::sunMultiplier, FixedFunctionShader::ambMultiplier;
@@ -78,12 +86,45 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
     ehLightFalloffQuadratic = effect->GetParameterByName(0, "lightFalloffQuadratic");
     ehLightFalloffLinear = effect->GetParameterByName(0, "lightFalloffLinear");
     ehLightFalloffConstant = effect->GetParameterByName(0, "lightFalloffConstant");
+    ehTexLightData = effect->GetParameterByName(0, "texLightData");
+    ehLightDataParams = effect->GetParameterByName(0, "lightDataParams");
+    ehLightIndices = effect->GetParameterByName(0, "lightIndices");
     ehTexgenTransform = effect->GetParameterByName(0, "texgenTransform");
     ehBumpMatrix = effect->GetParameterByName(0, "bumpMatrix");
     ehBumpLumiScaleBias = effect->GetParameterByName(0, "bumpLumiScaleBias");
 
     effectDefaultPurple = effect;
     sunMultiplier = ambMultiplier = 1.0;
+
+    // _Claude_ Phase 2: allocate the dynamic light texture for the
+    // USE_TEXTURE_LIGHTS shader path. Width = kTexelsPerLight * kMaxTexLights
+    // = 192 texels at default; height = 1; R32G32B32A32F so each texel
+    // holds 4 floats. D3DUSAGE_DYNAMIC + D3DPOOL_DEFAULT = update via
+    // LockRect with LOCKED_DISCARD on the render thread without driver
+    // flush stalls. Sampler binding happens in renderMorrowind per draw
+    // when sk.useTextureLightVariant is set.
+    if (texLightData) {
+        texLightData->Release();
+        texLightData = nullptr;
+    }
+    {
+        const UINT texW = kTexelsPerLight * kMaxTexLights;
+        HRESULT thr = device->CreateTexture(texW, 1, 1,
+            D3DUSAGE_DYNAMIC, D3DFMT_A32B32G32R32F,
+            D3DPOOL_DEFAULT, &texLightData, nullptr);
+        if (thr != D3D_OK) {
+            LOG::logline("!! FFE light texture create failed: 0x%08x", (unsigned)thr);
+            texLightData = nullptr;
+        } else {
+            LOG::logline("-- FFE light texture created: %ux1, %u lights * %u texels",
+                         texW, kMaxTexLights, kTexelsPerLight);
+        }
+    }
+    lastUploadedRevision = (unsigned int)-1;
+    lastUploadedPointCount = 0;
+    // _Claude_ Bbox cache is keyed by D3D resource pointers; pointers
+    // become invalid after device reset, so wipe.
+    bboxCache.clear();
 
     // Clear cache and LRU, important if the renderer resets
     shaderLRU.effect = nullptr;
@@ -114,8 +155,13 @@ void FixedFunctionShader::precacheAsync() {
             skCommon.vertexColour = vertexCol;
             skCommon.vertexMaterial = vertexCol + 1;
 
-            for (int heavyLighting = 0; heavyLighting <= 1; ++heavyLighting) {
-                skCommon.heavyLighting = heavyLighting;
+            // _Claude_ Light bucket sweep: 0 = 4 lights (heavyLighting=0),
+            // 1 = 8 lights (heavyLighting=1), 2 = 64 lights (useTextureLightVariant=1).
+            // The 64-light variant only fires when msoc emits lights, but we
+            // pre-compile it so the first dense-interior frame doesn't stutter.
+            for (int lightBucket = 0; lightBucket <= 2; ++lightBucket) {
+                skCommon.heavyLighting = (lightBucket == 1) ? 1 : 0;
+                skCommon.useTextureLightVariant = (lightBucket == 2) ? 1 : 0;
 
                 for (int skinning = 0; skinning <= 1; ++skinning) {
                     skCommon.usesSkinning = skinning;
@@ -188,8 +234,90 @@ void FixedFunctionShader::updateLighting(float sunMult, float ambMult) {
 void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
     ID3DXEffect* effectFFE;
 
+    // Instrument: per-draw stats — engine lightrs.active.size(), msoc snapshot
+    // size, and per-variant timing (QPC delta around the function body).
+    // Variant buckets: 0 = no point lights, 1 = 4-light shader, 2 = 8-light,
+    // 3 = 64-light (msoc-emit). Per-variant ns totals + call counts let us
+    // measure the cost delta when msoc-emit fires the 64-light path vs the
+    // existing 4/8 buckets. QPC overhead is ~80 ns/call * 2 calls/draw =
+    // ~240 us/frame at 1500 draws — diagnostic-grade, not free.
+    static size_t s_peakLights = 0;
+    static size_t s_peakMsoc = 0;
+    static unsigned long long s_callCount = 0;
+    static unsigned long long s_lastReportCall = 0;
+    static unsigned long long s_engineBuckets[6] = {0};
+    static unsigned long long s_msocBuckets[8] = {0};
+    static unsigned long long s_variantCalls[4] = {0};
+    static unsigned long long s_variantTotalNs[4] = {0};
+    // _Claude_ Per-mesh selection cost. Wraps the bbox-compute +
+    // sphere-AABB loop + partial_sort + constant-push block. Use to
+    // judge whether MeshKey-based selection caching (#1) or
+    // light frustum-precull (#2) is worth implementing — if avgNs is
+    // a few hundred per draw, selection is the bottleneck; if it's
+    // <50 ns/draw, look elsewhere.
+    static unsigned long long s_selectionCalls = 0;
+    static unsigned long long s_selectionTotalNs = 0;
+    static LARGE_INTEGER s_qpcFreq = {};
+    if (s_qpcFreq.QuadPart == 0) QueryPerformanceFrequency(&s_qpcFreq);
+
+    LARGE_INTEGER tsBegin;
+    QueryPerformanceCounter(&tsBegin);
+
+    {
+        const size_t activeSize = lightrs->active.size();
+        ++s_callCount;
+        if (activeSize <= 4) ++s_engineBuckets[0];
+        else if (activeSize <= 7) ++s_engineBuckets[1];
+        else if (activeSize == 8) ++s_engineBuckets[2];
+        else if (activeSize <= 12) ++s_engineBuckets[3];
+        else if (activeSize <= 16) ++s_engineBuckets[4];
+        else ++s_engineBuckets[5];
+
+        if (activeSize > s_peakLights) {
+            s_peakLights = activeSize;
+            LOG::logline("-- [LIGHTS-INSTR] new peak lightrs.active.size = %zu", activeSize);
+        }
+    }
+
+    // Many-lights consumer (texture-backed). MGE::SceneGraph captures every
+    // NiLight in worldObjectRoot + worldPickObjectRoot + sgSunlight each
+    // throttled rebuild and pre-extracts point-light fields into a POD
+    // vector (engine branching for standard / MCP magic / projectile /
+    // spell-effect lights applied SceneGraph-side). When non-empty, we
+    // pack the POD entries into texLightData (3 texels per light) once
+    // per revision, bind that texture to sampler 7 + push lightDataParams,
+    // and let the shader's USE_TEXTURE_LIGHTS variant iterate
+    // runtime-bounded lights with per-pixel attenuation.
+    //
+    // Directional sun handling stays via the engine loop below — the sun
+    // is set up via MGEProxyDevice::SetLight intercept and threaded
+    // through lightrs->active. Only point-light fill is replaced.
+    const auto& snapshotLights = MGE::SceneGraph::pointLights();
+    const unsigned int snapshotCount =
+        std::min<unsigned int>(static_cast<unsigned int>(snapshotLights.size()), kMaxTexLights);
+    const bool useTextureLights = (snapshotCount > 0) && (texLightData != nullptr);
+
+    // Instrument: snapshot size distribution.
+    if (snapshotCount == 0)         ++s_msocBuckets[0];
+    else if (snapshotCount <= 8)    ++s_msocBuckets[1];
+    else if (snapshotCount <= 16)   ++s_msocBuckets[2];
+    else if (snapshotCount <= 32)   ++s_msocBuckets[3];
+    else if (snapshotCount <= 48)   ++s_msocBuckets[4];
+    else if (snapshotCount <= 64)   ++s_msocBuckets[5];
+    else if (snapshotCount <= 128)  ++s_msocBuckets[6];
+    else                            ++s_msocBuckets[7];
+    if (snapshotCount > s_peakMsoc) {
+        s_peakMsoc = snapshotCount;
+        LOG::logline("-- [LIGHTS-INSTR] new peak snapshotCount = %zu", (size_t)snapshotCount);
+    }
+
     // Check if state matches last used effect
     ShaderKey sk(rs, frs, lightrs);
+    if (useTextureLights) {
+        // Select the 64-light shader variant; per-pixel attenuation
+        // will dim out lights that don't affect a given fragment.
+        sk.useTextureLightVariant = 1;
+    }
 
     if (sk == shaderLRU.last_sk) {
         effectFFE = shaderLRU.effect;
@@ -212,19 +340,33 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
     effectFFE->SetVector(ehMaterialAmbient, (D3DXVECTOR4*)&frs->material.ambient);
     effectFFE->SetVector(ehMaterialEmissive, (D3DXVECTOR4*)&frs->material.emissive);
 
-    // Set up lighting
+    // Set up lighting (constant-array path — used when msoc-emit is off,
+    // unchanged from upstream MGE-XE).
     const size_t MaxLights = 8;
+    // Morrowind's conventional constant attenuation, used as the per-slot default
+    // and as the multiplier for MCP-patched magic lights.
+    const float kDefaultFalloffConstant = 0.33f;
     D3DXVECTOR4 bufferDiffuse[MaxLights];
     float bufferAmbient[MaxLights];
     float bufferPosition[3 * MaxLights];
-    float bufferFalloffQuadratic[MaxLights], bufferFalloffLinear[MaxLights], bufferFalloffConstant;
+    float bufferFalloffQuadratic[MaxLights], bufferFalloffLinear[MaxLights], bufferFalloffConstant[MaxLights];
 
-    memset(&bufferDiffuse, 0, sizeof(bufferDiffuse));
-    memset(&bufferAmbient, 0, sizeof(bufferAmbient));
-    memset(&bufferPosition, 0, sizeof(bufferPosition));
-    memset(&bufferFalloffQuadratic, 0, sizeof(bufferFalloffQuadratic));
-    memset(&bufferFalloffLinear, 0, sizeof(bufferFalloffLinear));
-    bufferFalloffConstant = 0.33;
+    // _Claude_ The 8-slot constant arrays below are read only by the
+    // engine-emulating shader paths (4-light / 8-light). When the
+    // texture-light variant (useTextureLights) is active, the compiled
+    // shader doesn't reference them, and the matching SetFloatArray
+    // pushes near the bottom of this function are skipped — so the
+    // zero-init is dead work too. Keep the buffers declared so the
+    // skipped SetFloatArray block is the only conditional, but skip
+    // the memsets to save ~50 ns/draw on the v3 path.
+    if (!useTextureLights) {
+        memset(&bufferDiffuse, 0, sizeof(bufferDiffuse));
+        memset(&bufferAmbient, 0, sizeof(bufferAmbient));
+        memset(&bufferPosition, 0, sizeof(bufferPosition));
+        memset(&bufferFalloffQuadratic, 0, sizeof(bufferFalloffQuadratic));
+        memset(&bufferFalloffLinear, 0, sizeof(bufferFalloffLinear));
+        for (size_t i = 0; i != MaxLights; ++i) bufferFalloffConstant[i] = kDefaultFalloffConstant;
+    }
 
     // Check each active light
     RGBVECTOR sunDiffuse(0, 0, 0), ambient = lightrs->globalAmbient;
@@ -245,6 +387,12 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
         }
 
         if (light->type == D3DLIGHT_POINT) {
+            // _Claude_ Phase 2 wire-in: skip engine-emit point lights when
+            // msoc is feeding us the snapshot. Directional handling below
+            // still runs (sun must come from the engine — it's set up via
+            // MGEProxyDevice::SetLight intercept).
+            if (useTextureLights) continue;
+
             memcpy(&bufferDiffuse[pointLightCount], &light->diffuse, sizeof(light->diffuse));
 
             // Scatter position vectors for vectorization
@@ -254,8 +402,8 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
 
             // Scatter attenuation factors for vectorization
             if (light->falloff.x > 0) {
-                // Standard point light source (falloffConstant doesn't vary per light)
-                bufferFalloffConstant = light->falloff.x;
+                // Standard point light source
+                bufferFalloffConstant[pointLightCount] = light->falloff.x;
                 bufferFalloffLinear[pointLightCount] = light->falloff.y;
                 bufferFalloffQuadratic[pointLightCount] = light->falloff.z;
             } else if (light->falloff.z > 0) {
@@ -264,11 +412,11 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
                 // modified to account for the standard falloffConstant
                 // Diffuse colour is correctly specified with the patch
                 // Some overbrightness is applied to diffuse to cause glowing
-                bufferDiffuse[pointLightCount].x *= bufferFalloffConstant;
-                bufferDiffuse[pointLightCount].y *= bufferFalloffConstant;
-                bufferDiffuse[pointLightCount].z *= bufferFalloffConstant;
+                bufferDiffuse[pointLightCount].x *= kDefaultFalloffConstant;
+                bufferDiffuse[pointLightCount].y *= kDefaultFalloffConstant;
+                bufferDiffuse[pointLightCount].z *= kDefaultFalloffConstant;
                 bufferAmbient[pointLightCount] = 1.0f + 1e-4f / sqrt(light->falloff.z);
-                bufferFalloffQuadratic[pointLightCount] = bufferFalloffConstant * light->falloff.z;
+                bufferFalloffQuadratic[pointLightCount] = kDefaultFalloffConstant * light->falloff.z;
             } else if (light->falloff.y == 0.10000001f) {
                 // Projectile light source, normally hard coded by Morrowind to { 0, 3 * (1/30), 0 }
                 // This falloff value cannot be produced by other magic effects
@@ -300,6 +448,274 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
         }
     }
 
+    // _Claude_ Phase 2 wire-in: msoc-emit texture-light path. The engine
+    // point-light branch above was skipped via `continue` when useTextureLights;
+    // we own the GPU light data via texLightData (scene-wide pool) plus
+    // a per-draw indices constant (per-mesh selection by sphere-AABB).
+    //
+    // Layout mirrors vtastek's lighting.hlsl pattern:
+    //   - Scene-wide pool stored in texLightData (3 texels per POINT light)
+    //   - Per-draw lightDataParams.x = number of indices, .y = 1/textureWidth
+    //   - Per-draw lightIndices[4] = up to kMaxIndicesPerMesh (=16) packed
+    //     int indices into texLightData
+    //
+    // Upload trigger: snapshot revision changed OR view matrix changed.
+    // View matrix changes within a frame (multi-camera passes for shadow/
+    // water) force re-upload because the texture stores VIEW-space light
+    // positions; alternative would be world-space + per-pixel transform,
+    // which costs more shader ALU than re-uploading ~3 KB.
+    //
+    // Per-mesh selection (vtastek pattern):
+    //   1. computeBoundingBox(rs) → world-space AABB (cached by mesh ID)
+    //   2. For each POINT msoc light: sphere-AABB intersection test, where
+    //      sphere radius² is the 1% brightness distance from the falloff.
+    //   3. Survivors get partial_sorted by closest-point distance² and
+    //      truncated to kMaxIndicesPerMesh.
+    if (useTextureLights) {
+        // Per-draw selection scratch (no allocation in the hot path).
+        // s_msocToTex maps original snapshot index → texture row index
+        // (or UINT_MAX for non-points). s_lightWorldPos caches world
+        // positions used by the per-mesh selection's sphere-AABB test.
+        // s_lastUploadedView lets us detect view-matrix change (camera
+        // moved/rotated since the texture was packed).
+        // s_lightAlive flags lights whose 2*radius influence sphere
+        // intersects the camera frustum (precull populated alongside
+        // the texture upload — same trigger).
+        static unsigned int s_msocToTex[kMaxTexLights];
+        static D3DXVECTOR3 s_lightWorldPos[kMaxTexLights];
+        static bool        s_lightAlive[kMaxTexLights];
+        static D3DXMATRIX  s_lastUploadedView = {};
+
+        const uint64_t currentRev = MGE::SceneGraph::frameRevision();
+        const bool viewChanged = (memcmp(&s_lastUploadedView, &rs->viewTransform,
+                                          sizeof(D3DXMATRIX)) != 0);
+        const bool needUpload = (currentRev != lastUploadedRevision) || viewChanged;
+
+        if (needUpload && texLightData) {
+            D3DLOCKED_RECT locked;
+            if (SUCCEEDED(texLightData->LockRect(0, &locked, nullptr, D3DLOCK_DISCARD))) {
+                float* dst = (float*)locked.pBits;
+                memset(dst, 0, kTexelsPerLight * kMaxTexLights * 4 * sizeof(float));
+
+                // SceneGraph::pointLights() is already filtered to NI::PointLight
+                // and capped via snapshotCount; every entry in [0, snapshotCount)
+                // packs to texture row [0, snapshotCount) directly, so the
+                // s_msocToTex map is the identity here. Kept as a separate
+                // table for forward-compat with future filters.
+                for (unsigned int i = 0; i < snapshotCount; ++i) {
+                    const auto& pl = snapshotLights[i];
+                    s_lightWorldPos[i] = D3DXVECTOR3(pl.worldPos[0], pl.worldPos[1], pl.worldPos[2]);
+                    D3DXVECTOR3 viewPos;
+                    D3DXVec3TransformCoord(&viewPos, &s_lightWorldPos[i], &rs->viewTransform);
+
+                    const unsigned int t = i * kTexelsPerLight * 4;
+                    // Texel 0: view-space position + per-light ambient (.w).
+                    // The .w slot carries the engine-derived per-light ambient
+                    // term — the shader's textured lighting equation uses
+                    // (lambert + ambient) * att * diffuse to match the
+                    // constant-array path's behaviour for MCP magic / spell
+                    // lights (where bufferAmbient was non-zero).
+                    dst[t + 0] = viewPos.x;
+                    dst[t + 1] = viewPos.y;
+                    dst[t + 2] = viewPos.z;
+                    dst[t + 3] = pl.ambient;
+                    // Texel 1: diffuse (already pre-multiplied by dimmer +
+                    // engine branching in SceneGraph::extractPointLight).
+                    dst[t + 4] = pl.diffuse[0];
+                    dst[t + 5] = pl.diffuse[1];
+                    dst[t + 6] = pl.diffuse[2];
+                    // Texel 2: falloff (constant, linear, quadratic) + radius.
+                    // The .w slot carries Bethesda's modder-set radius
+                    // (NI::Light::specular.r). The pixel shader uses it as
+                    // the inner edge of a smoothstep window that drives
+                    // attenuation to exactly 0 at 2*radius — masks the seam
+                    // from the per-mesh sphere-AABB cull, which happens at
+                    // the same 2*radius boundary on the CPU.
+                    dst[t + 8]  = pl.falloff[0];
+                    dst[t + 9]  = pl.falloff[1];
+                    dst[t + 10] = pl.falloff[2];
+                    dst[t + 11] = pl.radius;
+
+                    s_msocToTex[i] = i;
+                }
+                texLightData->UnlockRect(0);
+
+                // _Claude_ Light frustum precull. Same trigger as the
+                // texture upload (view changed OR snapshot revision
+                // changed), so it pairs naturally and runs once per
+                // change rather than per draw. Marks each light "alive"
+                // if its 2*radius influence sphere intersects the
+                // camera frustum. The 2*radius matches the per-mesh
+                // sphere-AABB cull AND the shader's smoothstep zero
+                // point — three boundaries coincide, so a light killed
+                // here is one whose contribution would have been 0 for
+                // every visible pixel anyway. No new seam mechanism.
+                //
+                // Per-mesh loop below early-outs on `!s_lightAlive[i]`,
+                // so the inner sphere-AABB scan only iterates the live
+                // set. From earlier interior/exterior comparison data,
+                // halving the candidate count saved ~300 ns/draw.
+                {
+                    D3DMATRIX projTransform;
+                    device->GetTransform(D3DTS_PROJECTION, &projTransform);
+                    D3DXMATRIX viewProj;
+                    D3DXMatrixMultiply(&viewProj,
+                        (const D3DXMATRIX*)&rs->viewTransform,
+                        (const D3DXMATRIX*)&projTransform);
+                    // Gribb-Hartmann frustum-plane extraction. Normals
+                    // point INWARD; a point inside the frustum has
+                    // positive distance from every plane.
+                    D3DXPLANE planes[6] = {
+                        D3DXPLANE(viewProj._14 + viewProj._11, viewProj._24 + viewProj._21,
+                                  viewProj._34 + viewProj._31, viewProj._44 + viewProj._41), // L
+                        D3DXPLANE(viewProj._14 - viewProj._11, viewProj._24 - viewProj._21,
+                                  viewProj._34 - viewProj._31, viewProj._44 - viewProj._41), // R
+                        D3DXPLANE(viewProj._14 - viewProj._12, viewProj._24 - viewProj._22,
+                                  viewProj._34 - viewProj._32, viewProj._44 - viewProj._42), // T
+                        D3DXPLANE(viewProj._14 + viewProj._12, viewProj._24 + viewProj._22,
+                                  viewProj._34 + viewProj._32, viewProj._44 + viewProj._42), // B
+                        D3DXPLANE(viewProj._13, viewProj._23, viewProj._33, viewProj._43), // N
+                        D3DXPLANE(viewProj._14 - viewProj._13, viewProj._24 - viewProj._23,
+                                  viewProj._34 - viewProj._33, viewProj._44 - viewProj._43), // F
+                    };
+                    for (int p = 0; p < 6; ++p) D3DXPlaneNormalize(&planes[p], &planes[p]);
+
+                    for (unsigned int i = 0; i < snapshotCount; ++i) {
+                        const float r = snapshotLights[i].radius * 2.0f;
+                        const D3DXVECTOR3& lp = s_lightWorldPos[i];
+                        bool alive = true;
+                        for (int p = 0; p < 6; ++p) {
+                            const float d = D3DXPlaneDotCoord(&planes[p], &lp);
+                            if (d < -r) { alive = false; break; }
+                        }
+                        s_lightAlive[i] = alive;
+                    }
+                }
+
+                lastUploadedRevision = currentRev;
+                lastUploadedPointCount = snapshotCount;
+                s_lastUploadedView = rs->viewTransform;
+            }
+        }
+
+        if (lastUploadedPointCount > 0) {
+            // _Claude_ Per-draw selection-cost timer. Wraps everything
+            // from bbox compute through constant-push so the result
+            // includes computeBoundingBox (cache hit/miss is dominant
+            // cost amortisation), the inner sphere-AABB loop, the
+            // partial_sort when over-cap, and the index-pack + state
+            // pushes. QPC adds ~80 ns/call * 2 calls = ~160 ns
+            // overhead per per-draw timed — same envelope as the
+            // existing variant timer.
+            LARGE_INTEGER selBegin;
+            QueryPerformanceCounter(&selBegin);
+            // Per-mesh selection: world-space AABB → sphere-AABB cull → top-K.
+            D3DXVECTOR3 bMin, bMax;
+            if (!computeBoundingBox(rs, bMin, bMax)) {
+                // Fallback: treat the mesh as a point at its world transform
+                // translation (degenerate AABB). Better than skipping — small
+                // meshes near a light still get selected; large meshes
+                // (terrain, hulls) where this fallback fires are exactly the
+                // reason we want the proper bbox path, but a fallback is
+                // safer than crashing on a missing VB.
+                const D3DXMATRIX& wt = rs->worldTransforms[0];
+                bMin = bMax = D3DXVECTOR3(wt._41, wt._42, wt._43);
+            }
+
+            // _Claude_ Cand carries `dist2OverR2 = dist² / radius²`. This
+            // is the OpenMW-style ranking metric — equivalent to
+            // sorting by `radius/dist` descending. It correctly favors
+            // brighter / larger lights over tiny nearby ones at the
+            // top-K cutoff, which a pure dist² sort gets backwards
+            // for the wall-with-multiple-lights case (a 50-unit candle
+            // would outrank a 100-unit chandelier under pure-distance,
+            // but the chandelier is the dominant illuminator).
+            struct Cand { unsigned int texIdx; float dist2OverR2; };
+            Cand candidates[kMaxTexLights];
+            unsigned int candidateCount = 0;
+
+            for (unsigned int i = 0; i < snapshotCount; ++i) {
+                // Frustum-precull early-out. s_lightAlive[i] is true only
+                // when the light's 2*radius influence sphere intersects the
+                // camera frustum (precull populated at the top of the
+                // upload block, same trigger). Skipping dead lights here
+                // cuts the inner sphere-AABB scan to the live set — the
+                // main per-frame win on this branch.
+                if (!s_lightAlive[i]) continue;
+                const auto& pl = snapshotLights[i];
+                // CPU cull radius = 2 × engine radius. This matches the
+                // pixel shader's smoothstep window (which drives
+                // attenuation to 0 at 2 × radius). The two boundaries
+                // coincide so the cull never excludes a mesh whose
+                // per-pixel contribution would still be non-zero — the
+                // visible seam from the previous 1×radius cull is masked
+                // by the shader's window having already faded to 0 at
+                // the cull boundary. Pattern matches OpenMW's
+                // PerObjectUniform mode + pointLightRadiusMultiplier
+                // (default ~1.65–2.0).
+                if (pl.radius <= 0.0f) continue;
+                const float effR  = pl.radius * 2.0f;
+                const float effR2 = effR * effR;
+
+                // Sphere-AABB intersection: closest point on bbox to light pos.
+                const D3DXVECTOR3& lp = s_lightWorldPos[i];
+                const float cx = std::max(bMin.x, std::min(bMax.x, lp.x));
+                const float cy = std::max(bMin.y, std::min(bMax.y, lp.y));
+                const float cz = std::max(bMin.z, std::min(bMax.z, lp.z));
+                const float dx = lp.x - cx, dy = lp.y - cy, dz = lp.z - cz;
+                const float dist2 = dx*dx + dy*dy + dz*dz;
+
+                if (dist2 < effR2) {
+                    candidates[candidateCount].texIdx = i;
+                    // dist² / radius² — both squared so we avoid an
+                    // sqrt. Range-normalised so a small light at 0
+                    // distance ties a big light at the same distance,
+                    // and at the same distance the bigger light wins.
+                    const float r2 = pl.radius * pl.radius;
+                    candidates[candidateCount].dist2OverR2 = dist2 / r2;
+                    ++candidateCount;
+                }
+            }
+
+            if (candidateCount > kMaxIndicesPerMesh) {
+                std::partial_sort(
+                    candidates, candidates + kMaxIndicesPerMesh,
+                    candidates + candidateCount,
+                    [](const Cand& a, const Cand& b) {
+                        return a.dist2OverR2 < b.dist2OverR2;
+                    });
+                candidateCount = kMaxIndicesPerMesh;
+            }
+
+            // _Claude_ Pack indices into 8 float4s (32 slots = kMaxIndicesPerMesh).
+            float idxFloats[8 * 4] = { 0 };
+            for (unsigned int j = 0; j < candidateCount; ++j) {
+                idxFloats[j] = (float)candidates[j].texIdx;
+            }
+
+            const float texelSize = 1.0f / (float)(kTexelsPerLight * kMaxTexLights);
+            D3DXVECTOR4 lightDataParams_v(
+                (float)candidateCount,  // .x = runtime loop count
+                texelSize,              // .y = 1/textureWidth (texel U stride)
+                0.0f,                   // .z = unused (we use indices, not slices)
+                0.0f);                  // .w = unused
+
+            if (ehTexLightData) effectFFE->SetTexture(ehTexLightData, texLightData);
+            if (ehLightDataParams) effectFFE->SetVector(ehLightDataParams, &lightDataParams_v);
+            if (ehLightIndices) effectFFE->SetVectorArray(ehLightIndices, (D3DXVECTOR4*)idxFloats, 8);
+
+            LARGE_INTEGER selEnd;
+            QueryPerformanceCounter(&selEnd);
+            const unsigned long long selDeltaTicks =
+                (unsigned long long)(selEnd.QuadPart - selBegin.QuadPart);
+            if (s_qpcFreq.QuadPart > 0) {
+                s_selectionTotalNs +=
+                    selDeltaTicks * 1000000000ULL / (unsigned long long)s_qpcFreq.QuadPart;
+            }
+            ++s_selectionCalls;
+        }
+    }
+
     // Apply light multipliers, for HDR light levels
     sunDiffuse *= sunMultiplier;
     ambient *= ambMultiplier;
@@ -315,14 +731,27 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
         sunDiffuse.r = sunDiffuse.g = sunDiffuse.b = 0.0;
     }
 
+    // Sun + scene-ambient are read by every shader variant (texture-light
+    // path uses them too — sun direction and global ambient are mixed in
+    // before the per-light loop in the pixel shader). Always push.
     effectFFE->SetFloatArray(ehLightSceneAmbient, ambient, 3);
     effectFFE->SetFloatArray(ehLightSunDiffuse, sunDiffuse, 3);
-    effectFFE->SetVectorArray(ehLightDiffuse, bufferDiffuse, MaxLights);
-    effectFFE->SetFloatArray(ehLightAmbient, bufferAmbient, MaxLights);
-    effectFFE->SetFloatArray(ehLightPosition, bufferPosition, 3 * MaxLights);
-    effectFFE->SetFloatArray(ehLightFalloffQuadratic, bufferFalloffQuadratic, MaxLights);
-    effectFFE->SetFloatArray(ehLightFalloffLinear, bufferFalloffLinear, MaxLights);
-    effectFFE->SetFloat(ehLightFalloffConstant, bufferFalloffConstant);
+    // _Claude_ Engine 8-light constant arrays. Only read by the
+    // engine-emulating shader paths (calcLighting4 / calcLighting8).
+    // The texture-light variant ignores them — skipping these 6 D3DX9
+    // parameter pushes saves ~600 ns/draw on the v3 path. The
+    // SetFloatArray boundary itself is the cost (~100 ns each, includes
+    // parameter handle resolution + constant-table write); the
+    // compiled shader's eliminated-as-dead status doesn't make the
+    // framework call free.
+    if (!useTextureLights) {
+        effectFFE->SetVectorArray(ehLightDiffuse, bufferDiffuse, MaxLights);
+        effectFFE->SetFloatArray(ehLightAmbient, bufferAmbient, MaxLights);
+        effectFFE->SetFloatArray(ehLightPosition, bufferPosition, 3 * MaxLights);
+        effectFFE->SetFloatArray(ehLightFalloffQuadratic, bufferFalloffQuadratic, MaxLights);
+        effectFFE->SetFloatArray(ehLightFalloffLinear, bufferFalloffLinear, MaxLights);
+        effectFFE->SetFloatArray(ehLightFalloffConstant, bufferFalloffConstant, MaxLights);
+    }
 
     // Bump mapping state
     if (sk.usesBumpmap) {
@@ -367,6 +796,53 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
 
     device->SetVertexShader(NULL);
     device->SetPixelShader(NULL);
+
+    // Instrument: end QPC, attribute the elapsed time to the variant bucket
+    // selected for this draw, and emit a periodic histogram + per-variant
+    // averages. variantIdx mirrors the precache labelling: 0=no point lights,
+    // 1=4 lights, 2=8 lights, 3=64 (msoc-emit).
+    {
+        LARGE_INTEGER tsEnd;
+        QueryPerformanceCounter(&tsEnd);
+        const unsigned long long deltaTicks =
+            (unsigned long long)(tsEnd.QuadPart - tsBegin.QuadPart);
+        const unsigned long long deltaNs =
+            (s_qpcFreq.QuadPart > 0)
+                ? (deltaTicks * 1000000000ULL / (unsigned long long)s_qpcFreq.QuadPart)
+                : 0ULL;
+        unsigned int variantIdx;
+        if (sk.vertexMaterial == 0)        variantIdx = 0;
+        else if (sk.useTextureLightVariant)   variantIdx = 3;
+        else if (sk.heavyLighting)         variantIdx = 2;
+        else                               variantIdx = 1;
+        ++s_variantCalls[variantIdx];
+        s_variantTotalNs[variantIdx] += deltaNs;
+
+        if (s_callCount - s_lastReportCall >= 100000) {
+            LOG::logline(
+                "-- [LIGHTS-INSTR] calls=%llu peak=%zu peakMsoc=%zu engine[0-4|5-7|8|9-12|13-16|17+]=%llu|%llu|%llu|%llu|%llu|%llu msoc[0|1-8|9-16|17-32|33-48|49-64|65-128|129+]=%llu|%llu|%llu|%llu|%llu|%llu|%llu|%llu",
+                s_callCount, s_peakLights, s_peakMsoc,
+                s_engineBuckets[0], s_engineBuckets[1], s_engineBuckets[2],
+                s_engineBuckets[3], s_engineBuckets[4], s_engineBuckets[5],
+                s_msocBuckets[0], s_msocBuckets[1], s_msocBuckets[2], s_msocBuckets[3],
+                s_msocBuckets[4], s_msocBuckets[5], s_msocBuckets[6], s_msocBuckets[7]);
+            LOG::logline(
+                "-- [VARIANT-TIMING] v0(none)=%llu/%lluns(%.0f) v1(4)=%llu/%lluns(%.0f) v2(8)=%llu/%lluns(%.0f) v3(64)=%llu/%lluns(%.0f)",
+                s_variantCalls[0], s_variantTotalNs[0],
+                s_variantCalls[0] ? (double)s_variantTotalNs[0] / s_variantCalls[0] : 0.0,
+                s_variantCalls[1], s_variantTotalNs[1],
+                s_variantCalls[1] ? (double)s_variantTotalNs[1] / s_variantCalls[1] : 0.0,
+                s_variantCalls[2], s_variantTotalNs[2],
+                s_variantCalls[2] ? (double)s_variantTotalNs[2] / s_variantCalls[2] : 0.0,
+                s_variantCalls[3], s_variantTotalNs[3],
+                s_variantCalls[3] ? (double)s_variantTotalNs[3] / s_variantCalls[3] : 0.0);
+            LOG::logline(
+                "-- [SELECTION-TIMING] calls=%llu totalNs=%llu avgNs=%.0f",
+                s_selectionCalls, s_selectionTotalNs,
+                s_selectionCalls ? (double)s_selectionTotalNs / s_selectionCalls : 0.0);
+            s_lastReportCall = s_callCount;
+        }
+    }
 }
 
 ID3DXEffect* FixedFunctionShader::generateMWShader(const ShaderKey& sk) {
@@ -514,7 +990,16 @@ ID3DXEffect* FixedFunctionShader::generateMWShader(const ShaderKey& sk) {
     genVertexColour = buf.str();
 
     // Lighting
+    // _Claude_ msoc-emit path: USE_TEXTURE_LIGHTS macro switches the
+    // shader to read lights from a 1D texture (3 texels per light) with
+    // a runtime loop count. Non-msoc draws still pick the 4/8 buckets
+    // via heavyLighting below. The FFE_LIGHTS_ACTIVE value is moot when
+    // USE_TEXTURE_LIGHTS is defined (the constant-array path is #ifdef'd
+    // out), but pick "0" so the unused per-vertex/per-light loops fold
+    // away cleanly during compile.
     if (sk.vertexMaterial == 0) {
+        genLightCount = "0";
+    } else if (sk.useTextureLightVariant) {
         genLightCount = "0";
     } else {
         genLightCount = sk.heavyLighting ? "8" : "4";
@@ -662,6 +1147,12 @@ ID3DXEffect* FixedFunctionShader::generateMWShader(const ShaderKey& sk) {
     genFog = buf.str();
 
     // Compile HLSL through insertions into a template file
+    // _Claude_ Phase 2: USE_TEXTURE_LIGHTS macro present (with value "1")
+    // only for the msoc-emit variant. For all other variants we omit it
+    // so the shader's #ifdef branch falls through to the constant-array
+    // path. Using #ifdef rather than #if 0/1 because that's the convention
+    // already used in this file (FFE_ERROR_MATERIAL, VERIFY).
+    const char* useTextureLightsValue = sk.useTextureLightVariant ? "1" : nullptr;
     const D3DXMACRO generatedCode[] = {
         "FFE_VB_COUPLING", genVBCoupling.c_str(),
         "FFE_SHADER_COUPLING", genPSCoupling.c_str(),
@@ -672,6 +1163,10 @@ ID3DXEffect* FixedFunctionShader::generateMWShader(const ShaderKey& sk) {
         "FFE_VERTEX_MATERIAL", genMaterial.c_str(),
         "FFE_TEXTURING", genTexturing.c_str(),
         "FFE_FOG_APPLICATION", genFog.c_str(),
+        // Conditional macro — appears with value "1" iff the texture-
+        // light variant is being generated. Pre-terminator entry; the
+        // real terminator is the {0, 0} below.
+        useTextureLightsValue ? "USE_TEXTURE_LIGHTS" : nullptr, useTextureLightsValue,
         0, 0
     };
 
@@ -733,6 +1228,127 @@ void FixedFunctionShader::release() {
     shaderLRU.last_sk = ShaderKey();
     cacheEffects.clear();
     effectDefaultPurple->Release();
+    if (texLightData) {
+        texLightData->Release();
+        texLightData = nullptr;
+    }
+    lastUploadedRevision = (unsigned int)-1;
+    lastUploadedPointCount = 0;
+    bboxCache.clear();
+}
+
+// _Claude_ Vertex-buffer-derived per-mesh world-space AABB. Ported from
+// vtastek's hiz_culling.cpp::computeBoundingBox with simplifications
+// (no debug-key gating, no recording-thread coordination — we run on
+// the render thread). Cache hit: 8-corner transform by worldTransforms[0]
+// (~50 ALU). Cache miss: lock VB (READONLY+DONOTWAIT), walk verts/
+// indices, find object-space min/max, cache, then transform.
+//
+// Lock failures fall through gracefully — we return false and the
+// caller falls back to scene-wide flat (treats every msoc light as
+// affecting this draw).
+bool FixedFunctionShader::computeBoundingBox(const RenderedState* rs,
+    D3DXVECTOR3& outMin, D3DXVECTOR3& outMax)
+{
+    if (!rs->vb) return false;
+    if ((rs->fvf & D3DFVF_POSITION_MASK) == 0) return false;
+
+    MeshKey key{ rs->vb, rs->ib, rs->fvf,
+                 rs->baseIndex, rs->vertCount, rs->startIndex, rs->primCount };
+
+    auto transformBoxToWorld = [&](const ObjectSpaceBBox& b) {
+        const D3DXVECTOR3 corners[8] = {
+            { b.minX, b.minY, b.minZ }, { b.maxX, b.minY, b.minZ },
+            { b.minX, b.maxY, b.minZ }, { b.maxX, b.maxY, b.minZ },
+            { b.minX, b.minY, b.maxZ }, { b.maxX, b.minY, b.maxZ },
+            { b.minX, b.maxY, b.maxZ }, { b.maxX, b.maxY, b.maxZ },
+        };
+        outMin = D3DXVECTOR3( 1e30f,  1e30f,  1e30f);
+        outMax = D3DXVECTOR3(-1e30f, -1e30f, -1e30f);
+        for (int i = 0; i != 8; ++i) {
+            D3DXVECTOR3 wc;
+            D3DXVec3TransformCoord(&wc, &corners[i], &rs->worldTransforms[0]);
+            outMin.x = std::min(outMin.x, wc.x);
+            outMin.y = std::min(outMin.y, wc.y);
+            outMin.z = std::min(outMin.z, wc.z);
+            outMax.x = std::max(outMax.x, wc.x);
+            outMax.y = std::max(outMax.y, wc.y);
+            outMax.z = std::max(outMax.z, wc.z);
+        }
+    };
+
+    auto it = bboxCache.find(key);
+    if (it != bboxCache.end()) {
+        transformBoxToWorld(it->second);
+        return true;
+    }
+
+    // Cache miss — lock VB and (if indexed) IB, find min/max.
+    UINT stride = rs->vbStride;
+    if (stride == 0) return false;
+
+    void* pVerts = nullptr;
+    if (FAILED(rs->vb->Lock(rs->vbOffset, 0, &pVerts,
+                            D3DLOCK_READONLY | D3DLOCK_NOSYSLOCK))) {
+        return false;
+    }
+
+    ObjectSpaceBBox bb;
+    bb.minX = bb.minY = bb.minZ =  1e30f;
+    bb.maxX = bb.maxY = bb.maxZ = -1e30f;
+
+    if (rs->ib) {
+        void* pIdx = nullptr;
+        if (FAILED(rs->ib->Lock(0, 0, &pIdx,
+                                D3DLOCK_READONLY | D3DLOCK_NOSYSLOCK))) {
+            rs->vb->Unlock();
+            return false;
+        }
+        D3DINDEXBUFFER_DESC ibd;
+        rs->ib->GetDesc(&ibd);
+        const bool is16 = (ibd.Format == D3DFMT_INDEX16);
+
+        UINT idxCount = 0;
+        switch (rs->primType) {
+        case D3DPT_TRIANGLELIST:  idxCount = rs->primCount * 3; break;
+        case D3DPT_TRIANGLESTRIP: idxCount = rs->primCount + 2; break;
+        case D3DPT_TRIANGLEFAN:   idxCount = rs->primCount + 2; break;
+        default:
+            rs->ib->Unlock();
+            rs->vb->Unlock();
+            return false;
+        }
+
+        for (UINT i = 0; i != idxCount; ++i) {
+            UINT vi;
+            if (is16) vi = ((WORD*)pIdx)[rs->startIndex + i] + rs->baseIndex;
+            else      vi = ((DWORD*)pIdx)[rs->startIndex + i] + rs->baseIndex;
+            const float* p = (const float*)((BYTE*)pVerts + vi * stride);
+            bb.minX = std::min(bb.minX, p[0]);
+            bb.minY = std::min(bb.minY, p[1]);
+            bb.minZ = std::min(bb.minZ, p[2]);
+            bb.maxX = std::max(bb.maxX, p[0]);
+            bb.maxY = std::max(bb.maxY, p[1]);
+            bb.maxZ = std::max(bb.maxZ, p[2]);
+        }
+        rs->ib->Unlock();
+    } else {
+        for (UINT i = 0; i != rs->vertCount; ++i) {
+            const float* p = (const float*)((BYTE*)pVerts + (rs->baseIndex + i) * stride);
+            bb.minX = std::min(bb.minX, p[0]);
+            bb.minY = std::min(bb.minY, p[1]);
+            bb.minZ = std::min(bb.minZ, p[2]);
+            bb.maxX = std::max(bb.maxX, p[0]);
+            bb.maxY = std::max(bb.maxY, p[1]);
+            bb.maxZ = std::max(bb.maxZ, p[2]);
+        }
+    }
+    rs->vb->Unlock();
+
+    if (bb.minX > bb.maxX) return false;  // never wrote (zero verts)
+    bboxCache[key] = bb;
+    transformBoxToWorld(bb);
+    return true;
 }
 
 
@@ -843,7 +1459,7 @@ void FixedFunctionShader::ShaderKey::log() const {
     }
     LOG::logline("%s", stream.str().c_str());
 
-    LOG::logline("   Input state: UVs:%d skin:%d vcol:%d lights:%d vmat:%d fogm:%d", uvSets, usesSkinning, vertexColour, vertexMaterial ? (heavyLighting ? 8 : 4) : 0, vertexMaterial, fogMode);
+    LOG::logline("   Input state: UVs:%d skin:%d vcol:%d lights:%d vmat:%d fogm:%d", uvSets, usesSkinning, vertexColour, vertexMaterial ? (useTextureLightVariant ? 64 : (heavyLighting ? 8 : 4)) : 0, vertexMaterial, fogMode);
     LOG::logline("   Texture stages:");
     for (int i = 0; i != activeStages; ++i) {
         const auto& s = stage[i];
