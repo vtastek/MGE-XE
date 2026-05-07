@@ -223,12 +223,13 @@ void FixedFunctionShader::logCellCrossFrame(const char* phase, const FrameBuffer
 }
 
 // HLSL Render Dispatch Recording System
-bool FixedFunctionShader::isRecording = false;
-bool FixedFunctionShader::isReplaying = false;
+std::atomic<bool> FixedFunctionShader::isRecording{false};
+std::atomic<bool> FixedFunctionShader::isReplaying{false};
 bool FixedFunctionShader::usingN1Buffer = false;
 bool FixedFunctionShader::manualRecordingControl = false;
 bool FixedFunctionShader::recordingEnabled = true;
 bool FixedFunctionShader::recordingCompletedThisFrame = false;
+bool FixedFunctionShader::recordingStartedThisFrame = false;
 int FixedFunctionShader::currentRecordingScene = 0;
 bool FixedFunctionShader::hiZBuiltThisFrame = false;
 bool FixedFunctionShader::dumpRequested = false;
@@ -2241,6 +2242,9 @@ void FixedFunctionShader::swapBuffers() {
     if (++swapCount >= 2) {
         n2Ready = true;
     }
+
+    // Reset Stage0Early flag for next frame's split render path
+    resetStage0EarlyFlag();
 }
 
 void FixedFunctionShader::release() {

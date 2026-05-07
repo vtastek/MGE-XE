@@ -20,8 +20,18 @@
 // Per-stage command buffer set (defined in mged3d8device.cpp)
 extern D3DCommandBufferSet g_cmdBufferSet;
 
+// Render thread device ownership flag (defined in mged3d8device.cpp)
+extern std::atomic<bool> g_renderThreadOwnsDevice;
+
 // File-scope helpers for recording system
 static std::unordered_map<IDirect3DBaseTexture9*, std::pair<DWORD, DWORD>> samplerCache;
+
+// Track if Stage0Early completed (reset at swapBuffers, set after Stage0Early finishes)
+static bool stage0EarlyCompleted = false;
+
+void FixedFunctionShader::resetStage0EarlyFlag() {
+    stage0EarlyCompleted = false;
+}
 
 // Route to correct vector based on current recording scene
 // Scene 0 = world, Scene 1 = particles (alpha sorted), Scene 2 = hands (skinned)
@@ -383,9 +393,20 @@ void FixedFunctionShader::startRecording() {
         lastPlayerCell = currentCell;
     }
 
-    isRecording = true;
-    isReplaying = false;
+    isRecording.store(true, std::memory_order_release);
+    isReplaying.store(false, std::memory_order_release);
     recordingCompletedThisFrame = false;  // Allow recording to proceed
+    recordingStartedThisFrame = true;     // Mark that recording happened this frame
+
+    // Log when recording resumes after a gap (cell transition detection)
+    static DWORD lastRecordFrame = 0;
+    DWORD currentFrame = getFrameNumber();
+    if (lastRecordFrame > 0 && currentFrame > lastRecordFrame + 1) {
+        LOG::logline("[startRecording] RESUME frame=%u lastRec=%u gap=%u prepFN=%u",
+            currentFrame, lastRecordFrame, currentFrame - lastRecordFrame,
+            getPrepBuffer().frameNumber);
+    }
+    lastRecordFrame = currentFrame;
 
     // Clear CPU depth buffer for new frame (replaces GPU Hi-Z readback)
     softwareOcclusionCuller.clear();
@@ -414,7 +435,7 @@ void FixedFunctionShader::startRecording() {
 }
 
 void FixedFunctionShader::stopRecordingAndReplay() {
-    if (!isRecording) {
+    if (!isRecording.load(std::memory_order_acquire)) {
         return;
     }
 
@@ -483,7 +504,7 @@ void FixedFunctionShader::stopRecordingAndReplay() {
         }
     }
 
-    isRecording = false;
+    isRecording.store(false, std::memory_order_release);
 
     // Capture device state NOW — this is Morrowind's last mesh state (correct end-of-Scene-0 state).
     // We restore this after replay instead of preRecordingContract (which was the FIRST mesh's state
@@ -535,7 +556,7 @@ void FixedFunctionShader::stopRecordingAndReplay() {
 
     // Reset state to allow new recording sessions
     // Note: isRecording stays false until next startRecording() call
-    isReplaying = false;
+    isReplaying.store(false, std::memory_order_release);
 }
 
 // Step 2: Submit recording to cull thread for async prepare (called before renderStage1)
@@ -571,14 +592,14 @@ void FixedFunctionShader::finalizeBatchAndSubmitCull() {
         dumpRequested = false;
     }
 
-    if (!recordingEnabled || !isRecording || currentRecordedCalls().empty()) {
+    if (!recordingEnabled || !isRecording.load(std::memory_order_acquire) || currentRecordedCalls().empty()) {
         // Nothing to cull — just mark Scene 0 as done
-        isRecording = false;
+        isRecording.store(false, std::memory_order_release);
         recordingCompletedThisFrame = true;
         return;
     }
 
-    isRecording = false;
+    isRecording.store(false, std::memory_order_release);
 
     // Capture Morrowind's end-of-Scene-0 device state for restoration after replay
     if (ImGuiManager::GetStateSuppressionEnabled()) {
@@ -667,7 +688,7 @@ void FixedFunctionShader::waitCullAndReplay() {
     postRecordingContract.applyRenderStatesTo((IDirect3DDevice9*)device);
 
 
-    isReplaying = false;
+    isReplaying.store(false, std::memory_order_release);
 
     // Reset HLSL caches after rendering session completes
     resetHLSLCaches();
@@ -765,7 +786,7 @@ void FixedFunctionShader::restoreOffscreenState() {
 // Recording continues through Scene 1/2; this just saves what we need to restore later.
 // N-1: recording buffer
 void FixedFunctionShader::capturePostRecordingState() {
-    if (!isRecording) return;
+    if (!isRecording.load(std::memory_order_acquire)) return;
 
     auto& fb = getRecordingBuffer();
 
@@ -795,11 +816,11 @@ void FixedFunctionShader::capturePostRecordingState() {
 // Called at EndScene 0 in deferred HLSL mode so particles/hands render correctly.
 // NOTE: State restoration for suppression mode now happens in executeGpuPhase().
 void FixedFunctionShader::restorePostRecordingState() {
-    if (!isRecording) return;
+    if (!isRecording.load(std::memory_order_acquire)) return;
 
     // Stop recording - Scene 0 calls are captured, Scene 1/2 will use immediate path
     // Recording will be finalized at finalizeAndRender
-    isRecording = false;
+    isRecording.store(false, std::memory_order_release);
 
     // Clean up HLSL-only texture slots
     for (int i = 2; i < 11; i++) {
@@ -838,9 +859,9 @@ void FixedFunctionShader::finalizeAndRender(DLContext* frameCtx, bool waterSeen)
     }
 
     // === STOP RECORDING ===
-    if (!recordingEnabled || !isRecording) {
+    if (!recordingEnabled || !isRecording.load(std::memory_order_acquire)) {
         // Nothing recorded — still need to run GPU stages
-        isRecording = false;
+        isRecording.store(false, std::memory_order_release);
         recordingCompletedThisFrame = true;
 
         // GPU stages even without HLSL recording
@@ -868,7 +889,7 @@ void FixedFunctionShader::finalizeAndRender(DLContext* frameCtx, bool waterSeen)
     }
     currentPhase = PipelinePhase::Idle;
 
-    isRecording = false;
+    isRecording.store(false, std::memory_order_release);
     recordingCompletedThisFrame = true;
 
     // Diagnostic: increment frame counter for cache miss/hit logging
@@ -1077,7 +1098,7 @@ void FixedFunctionShader::executeGpuPhase() {
     }
 
 
-    isReplaying = false;
+    isReplaying.store(false, std::memory_order_release);
     resetHLSLCaches();
 }
 
@@ -1181,7 +1202,7 @@ void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool w
     }
 
     // === REPLAY ALL SCENES ===
-    isReplaying = true;
+    isReplaying.store(true, std::memory_order_release);
     {
         MGE_ZoneScopedN("Replay All Scenes");
 
@@ -1289,7 +1310,7 @@ void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool w
 
     // Replay Scene 1 (particles) - use Scene 1's view/proj, blend over water
     {
-        isReplaying = true;
+        isReplaying.store(true, std::memory_order_release);
         D3DXMATRIX savedView = fb.view;
         D3DXMATRIX savedProj = fb.proj;
         fb.view = fb.viewScene1;
@@ -1300,7 +1321,7 @@ void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool w
 
         fb.view = savedView;
         fb.proj = savedProj;
-        isReplaying = false;
+        isReplaying.store(false, std::memory_order_release);
     }
 
     // Z-clear before Scene 2: MW clears depth before hands so they render in front
@@ -1314,9 +1335,9 @@ void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool w
         fb.view = fb.viewScene2;
         fb.proj = fb.projScene2;
 
-        isReplaying = true;
+        isReplaying.store(true, std::memory_order_release);
         replayRecordedCalls(2, nullptr);
-        isReplaying = false;
+        isReplaying.store(false, std::memory_order_release);
 
         fb.view = savedView;
         fb.proj = savedProj;
@@ -1351,7 +1372,7 @@ void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool w
     // Clear it again so UI draws aren't depth-tested against 3D geometry.
     device->Clear(0, NULL, D3DCLEAR_ZBUFFER, 0, 1.0f, 0);
 
-    isReplaying = false;
+    isReplaying.store(false, std::memory_order_release);
     resetHLSLCaches();
 }
 
@@ -1476,7 +1497,7 @@ void FixedFunctionShader::replayScene1And2(FrameBuffer* fb) {
         }
     }
 
-    isReplaying = true;
+    isReplaying.store(true, std::memory_order_release);
 
     // Replay Scene 1 (particles)
     replayRecordedCalls(1, nullptr);
@@ -1484,7 +1505,7 @@ void FixedFunctionShader::replayScene1And2(FrameBuffer* fb) {
     // Replay Scene 2 (hands)
     replayRecordedCalls(2, nullptr);
 
-    isReplaying = false;
+    isReplaying.store(false, std::memory_order_release);
 }
 
 // Scene lifecycle stubs for triple-buffered pipeline (Step 1: no-op, infrastructure only)
@@ -1766,7 +1787,7 @@ void FixedFunctionShader::renderFullFrameAsync(bool useN1Buffer) {
     }
 
     // Replay Scene 0
-    isReplaying = true;
+    isReplaying.store(true, std::memory_order_release);
     {
         MGE_ZoneScopedN("Replay All Scenes");
         transitionTo(PhaseTransition::ReplayEntry);
@@ -1848,11 +1869,11 @@ void FixedFunctionShader::renderFullFrameAsync(bool useN1Buffer) {
         D3DXMATRIX savedView = fb.view, savedProj = fb.proj;
         fb.view = fb.viewScene1;
         fb.proj = fb.projScene1;
-        isReplaying = true;
+        isReplaying.store(true, std::memory_order_release);
         replayRecordedCalls(1, nullptr);
         fb.view = savedView;
         fb.proj = savedProj;
-        isReplaying = false;
+        isReplaying.store(false, std::memory_order_release);
     }
 
     // Z-clear before hands
@@ -1863,9 +1884,9 @@ void FixedFunctionShader::renderFullFrameAsync(bool useN1Buffer) {
         D3DXMATRIX savedView = fb.view, savedProj = fb.proj;
         fb.view = fb.viewScene2;
         fb.proj = fb.projScene2;
-        isReplaying = true;
+        isReplaying.store(true, std::memory_order_release);
         replayRecordedCalls(2, nullptr);
-        isReplaying = false;
+        isReplaying.store(false, std::memory_order_release);
         fb.view = savedView;
         fb.proj = savedProj;
     }
@@ -1882,7 +1903,7 @@ void FixedFunctionShader::renderFullFrameAsync(bool useN1Buffer) {
     device->SetVertexShader(NULL);
     device->SetPixelShader(NULL);
 
-    isReplaying = false;
+    isReplaying.store(false, std::memory_order_release);
     resetHLSLCaches();
 
     // Restore ALL device state from state block.
@@ -1891,6 +1912,295 @@ void FixedFunctionShader::renderFullFrameAsync(bool useN1Buffer) {
     if (uiStateBlock) {
         uiStateBlock->Apply();
         uiStateBlock->Release();
+    }
+
+    // Clear depth so UI draws aren't depth-tested against 3D geometry
+    device->Clear(0, NULL, D3DCLEAR_ZBUFFER, 0, 1.0f, 0);
+}
+
+// Split rendering: Stage0 only (shadows, water sim, sky) - runs after CPU prep
+// Safe to run while recording is active because:
+// 1. Stage0Early uses prepBuffer (N-1), not recordingBuffer
+// 2. g_renderThreadOwnsDevice suppresses MW state calls during Stage0Early GPU work
+// 3. MW draw calls during recording don't touch device when state suppression is enabled
+void FixedFunctionShader::renderStage0Early(bool useN1Buffer) {
+    MGE_ZoneScopedN("renderStage0Early");
+    int frame = getFrameNumber();
+
+    LOG_CAT(LOG::Cat_SyncThread, "[S0E] F=%d ENTER N1=%d rec=%d", frame, useN1Buffer ? 1 : 0,
+        isRecording.load(std::memory_order_relaxed) ? 1 : 0);
+
+    bool isReady = useN1Buffer ? n1Ready : n2Ready;
+    if (!recordingEnabled || !isReady) {
+        LOG_CAT(LOG::Cat_SyncThread, "[S0E] F=%d SKIP enabled=%d ready=%d", frame, recordingEnabled, isReady);
+        return;
+    }
+
+    usingN1Buffer = useN1Buffer;
+    auto& fb = useN1Buffer ? getPrepBuffer() : getRenderingBuffer();
+    DLContext* renderCtx = &fb.dlContext;
+
+    LOG_CAT(LOG::Cat_SyncThread, "[S0E] F=%d STATE_RESTORE", frame);
+
+    // Fix stale device state from suppressed recording calls
+    if (ImGuiManager::GetStateSuppressionEnabled()) {
+        auto& tracker = fb.trackerSnapshot;
+        DWORD val;
+        if (tracker.getRenderState(D3DRS_ALPHABLENDENABLE, &val))
+            device->SetRenderState(D3DRS_ALPHABLENDENABLE, val);
+        if (tracker.getRenderState(D3DRS_ZWRITEENABLE, &val))
+            device->SetRenderState(D3DRS_ZWRITEENABLE, val);
+        if (tracker.getRenderState(D3DRS_ALPHAREF, &val))
+            device->SetRenderState(D3DRS_ALPHAREF, val);
+        if (tracker.getRenderState(D3DRS_ALPHATESTENABLE, &val))
+            device->SetRenderState(D3DRS_ALPHATESTENABLE, val);
+        if (tracker.getFVF(&val))
+            device->SetFVF(val);
+        for (auto& [index, enable] : tracker.lightEnables) {
+            device->LightEnable(index, enable);
+        }
+    }
+
+    LOG_CAT(LOG::Cat_SyncThread, "[S0E] F=%d CREATE_STATEBLOCK", frame);
+
+    // Create state block to restore after RemainingStages
+    if (fb.uiStateBlock) {
+        fb.uiStateBlock->Release();
+        fb.uiStateBlock = nullptr;
+    }
+    device->CreateStateBlock(D3DSBT_ALL, &fb.uiStateBlock);
+
+    LOG_CAT(LOG::Cat_SyncThread, "[S0E] F=%d SET_RT", frame);
+
+    // Ensure render target is back buffer
+    {
+        IDirect3DSurface9* backbuffer;
+        device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backbuffer);
+        device->SetRenderTarget(0, backbuffer);
+        backbuffer->Release();
+    }
+
+    LOG_CAT(LOG::Cat_SyncThread, "[S0E] F=%d APPLY_CONTRACT", frame);
+
+    // Apply EndScene(0) state baseline
+    fb.stateContract.applyTo((IDirect3DDevice9*)device);
+
+    LOG_CAT(LOG::Cat_SyncThread, "[S0E] F=%d PRE_GPU", frame);
+
+    // Stage 0 GPU: shadow map, distant land, sky, water reflection
+    {
+        MGE_ZoneScopedN("Stage0 GPU");
+        DistantLand::renderStage0GPU(renderCtx, &fb);
+    }
+
+    LOG_CAT(LOG::Cat_SyncThread, "[S0E] F=%d POST_GPU", frame);
+
+    // Update shadow VP from freshly computed matrices
+    fb.shadowViewproj[0] = DistantLand::s_staging.smViewproj[0];
+    fb.shadowViewproj[1] = DistantLand::s_staging.smViewproj[1];
+
+    stage0EarlyCompleted = true;
+    LOG_CAT(LOG::Cat_SyncThread, "[S0E] F=%d DONE", frame);
+}
+
+// Split rendering: remaining stages (Stage1/2/replay) - runs after recording complete
+void FixedFunctionShader::renderRemainingStages(bool useN1Buffer) {
+    MGE_ZoneScopedN("renderRemainingStages");
+
+    bool isReady = useN1Buffer ? n1Ready : n2Ready;
+    if (!recordingEnabled || !isReady) {
+        return;
+    }
+
+    usingN1Buffer = useN1Buffer;
+    auto& fb = useN1Buffer ? getPrepBuffer() : getRenderingBuffer();
+    DLContext* renderCtx = &fb.dlContext;
+    bool renderWaterSeen = fb.waterSeen;
+
+    // If Stage0Early didn't run (aborted due to late timing), do Stage0 now
+    if (!stage0EarlyCompleted) {
+        LOG_CAT(LOG::Cat_SyncThread, "[RemainingStages] Stage0Early missed - running Stage0 here");
+
+        // State setup (from Stage0Early)
+        if (ImGuiManager::GetStateSuppressionEnabled()) {
+            auto& tracker = fb.trackerSnapshot;
+            DWORD val;
+            if (tracker.getRenderState(D3DRS_ALPHABLENDENABLE, &val))
+                device->SetRenderState(D3DRS_ALPHABLENDENABLE, val);
+            if (tracker.getRenderState(D3DRS_ZWRITEENABLE, &val))
+                device->SetRenderState(D3DRS_ZWRITEENABLE, val);
+            if (tracker.getRenderState(D3DRS_ALPHAREF, &val))
+                device->SetRenderState(D3DRS_ALPHAREF, val);
+            if (tracker.getRenderState(D3DRS_ALPHATESTENABLE, &val))
+                device->SetRenderState(D3DRS_ALPHATESTENABLE, val);
+            if (tracker.getFVF(&val))
+                device->SetFVF(val);
+            for (auto& [index, enable] : tracker.lightEnables) {
+                device->LightEnable(index, enable);
+            }
+        }
+
+        // Create state block
+        if (fb.uiStateBlock) {
+            fb.uiStateBlock->Release();
+            fb.uiStateBlock = nullptr;
+        }
+        device->CreateStateBlock(D3DSBT_ALL, &fb.uiStateBlock);
+
+        // RT setup
+        {
+            IDirect3DSurface9* backbuffer;
+            device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backbuffer);
+            device->SetRenderTarget(0, backbuffer);
+            backbuffer->Release();
+        }
+
+        fb.stateContract.applyTo((IDirect3DDevice9*)device);
+
+        // Stage 0 GPU
+        {
+            MGE_ZoneScopedN("Stage0 GPU Fallback");
+            DistantLand::renderStage0GPU(renderCtx, &fb);
+        }
+
+        fb.shadowViewproj[0] = DistantLand::s_staging.smViewproj[0];
+        fb.shadowViewproj[1] = DistantLand::s_staging.smViewproj[1];
+    }
+
+    // Prepare all scenes if not already done by CPU prep
+    if (fb.state != BufferState::ReadyToRender) {
+        MGE_ZoneScopedN("Prepare All Scenes");
+        prepareRecordedCalls();
+        fb.state = BufferState::ReadyToRender;
+    }
+
+    // Depth passes: Scene 0 (world) and Scene 2 (hands)
+    {
+        MGE_ZoneScopedN("Depth Passes");
+        DistantLand::renderStage1(renderCtx, &fb);
+        DistantLand::renderStage2(renderCtx, &fb);
+        DistantLand::renderForwardPrepassChain(renderCtx, &fb.postProcessData);
+    }
+
+    // Replay Scene 0
+    isReplaying.store(true, std::memory_order_release);
+    {
+        MGE_ZoneScopedN("Replay All Scenes");
+        transitionTo(PhaseTransition::ReplayEntry);
+        replayRecordedCalls(0, nullptr);
+        transitionTo(PhaseTransition::ReplayExit);
+        DistantLand::renderStageBlend(renderCtx, &fb);
+    }
+
+    // Water surface after Scene 0, before particles
+    if (renderWaterSeen) {
+        DistantLand::renderStageWater(renderCtx);
+    }
+
+    // Upload snapshot vertex/index data to staging buffers for Scene 1/2
+    {
+        MGE_ZoneScopedN("Upload Particle Staging Buffers");
+        UINT totalVBBytes = 0, totalIBBytes = 0;
+        for (auto& call : fb.recordedCallsScene1) {
+            if (call.usesSnapshot) {
+                call.stagingVBOffset = totalVBBytes;
+                call.stagingIBOffset = totalIBBytes;
+                totalVBBytes += (UINT)call.vertexSnapshot.size();
+                totalIBBytes += (UINT)call.indexSnapshot.size();
+            }
+        }
+        for (auto& call : fb.recordedCallsScene2) {
+            if (call.usesSnapshot) {
+                call.stagingVBOffset = totalVBBytes;
+                call.stagingIBOffset = totalIBBytes;
+                totalVBBytes += (UINT)call.vertexSnapshot.size();
+                totalIBBytes += (UINT)call.indexSnapshot.size();
+            }
+        }
+
+        if (totalVBBytes > 0 && totalVBBytes > fb.stagingVBSize) {
+            if (fb.particleStagingVB) { fb.particleStagingVB->Release(); fb.particleStagingVB = nullptr; }
+            HRESULT hr = device->CreateVertexBuffer(totalVBBytes, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
+                0, D3DPOOL_DEFAULT, &fb.particleStagingVB, nullptr);
+            if (SUCCEEDED(hr)) fb.stagingVBSize = totalVBBytes;
+        }
+        if (totalIBBytes > 0 && totalIBBytes > fb.stagingIBSize) {
+            if (fb.particleStagingIB) { fb.particleStagingIB->Release(); fb.particleStagingIB = nullptr; }
+            HRESULT hr = device->CreateIndexBuffer(totalIBBytes, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
+                D3DFMT_INDEX16, D3DPOOL_DEFAULT, &fb.particleStagingIB, nullptr);
+            if (SUCCEEDED(hr)) fb.stagingIBSize = totalIBBytes;
+        }
+
+        if (totalVBBytes > 0 && fb.particleStagingVB && totalIBBytes > 0 && fb.particleStagingIB) {
+            void* pVB = nullptr;
+            void* pIB = nullptr;
+            if (SUCCEEDED(fb.particleStagingVB->Lock(0, totalVBBytes, &pVB, D3DLOCK_DISCARD)) &&
+                SUCCEEDED(fb.particleStagingIB->Lock(0, totalIBBytes, &pIB, D3DLOCK_DISCARD))) {
+                for (auto& call : fb.recordedCallsScene1) {
+                    if (call.usesSnapshot && !call.vertexSnapshot.empty()) {
+                        memcpy((BYTE*)pVB + call.stagingVBOffset, call.vertexSnapshot.data(), call.vertexSnapshot.size());
+                        memcpy((BYTE*)pIB + call.stagingIBOffset, call.indexSnapshot.data(), call.indexSnapshot.size());
+                    }
+                }
+                for (auto& call : fb.recordedCallsScene2) {
+                    if (call.usesSnapshot && !call.vertexSnapshot.empty()) {
+                        memcpy((BYTE*)pVB + call.stagingVBOffset, call.vertexSnapshot.data(), call.vertexSnapshot.size());
+                        memcpy((BYTE*)pIB + call.stagingIBOffset, call.indexSnapshot.data(), call.indexSnapshot.size());
+                    }
+                }
+                fb.particleStagingVB->Unlock();
+                fb.particleStagingIB->Unlock();
+            }
+        }
+    }
+
+    // Replay Scene 1 (particles)
+    {
+        D3DXMATRIX savedView = fb.view, savedProj = fb.proj;
+        fb.view = fb.viewScene1;
+        fb.proj = fb.projScene1;
+        isReplaying.store(true, std::memory_order_release);
+        replayRecordedCalls(1, nullptr);
+        fb.view = savedView;
+        fb.proj = savedProj;
+        isReplaying.store(false, std::memory_order_release);
+    }
+
+    // Z-clear before hands
+    device->Clear(0, NULL, D3DCLEAR_ZBUFFER, 0, 1.0f, 0);
+
+    // Replay Scene 2 (hands)
+    {
+        D3DXMATRIX savedView = fb.view, savedProj = fb.proj;
+        fb.view = fb.viewScene2;
+        fb.proj = fb.projScene2;
+        isReplaying.store(true, std::memory_order_release);
+        replayRecordedCalls(2, nullptr);
+        isReplaying.store(false, std::memory_order_release);
+        fb.view = savedView;
+        fb.proj = savedProj;
+    }
+
+    // PostProcess using captured PostProcessData (no MWBridge access)
+    DistantLand::postProcess(renderCtx, fb.postProcessData);
+
+    // Clean up HLSL state
+    for (int i = 2; i < 11; i++) {
+        device->SetTexture(i, NULL);
+        textureCache.updateCache(i, nullptr);
+        textureCache.textureValid[i] = false;
+    }
+    device->SetVertexShader(NULL);
+    device->SetPixelShader(NULL);
+
+    isReplaying.store(false, std::memory_order_release);
+    resetHLSLCaches();
+
+    // Restore UI state from state block (created in Stage0Early)
+    if (fb.uiStateBlock) {
+        fb.uiStateBlock->Apply();
+        fb.uiStateBlock->Release();
+        fb.uiStateBlock = nullptr;
     }
 
     // Clear depth so UI draws aren't depth-tested against 3D geometry
@@ -1921,7 +2231,7 @@ bool FixedFunctionShader::compareLightStates(const LightState* a, const LightSta
 
 void FixedFunctionShader::recordRenderCall(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, const ShaderKey& sk, int recordMWIdx) {
     {
-        if (isReplaying) {
+        if (isReplaying.load(std::memory_order_acquire)) {
             return;  // Don't record during replay to avoid recursion
         }
     }

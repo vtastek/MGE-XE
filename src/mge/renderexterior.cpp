@@ -158,20 +158,29 @@ void DistantLand::cullDistantStatics(DLContext* ctx, const D3DXMATRIX* view, con
     float zn = ctx->nearViewRange - 768.0f, zf = zn;
     float cullDist = ctx->fogEnd;
 
-    // Diagnostic: log culling distances
-    static int cullLogCount = 0;
-    if (cullLogCount++ < 10) {
-        LOG::logline("[CULL] cullDistantStatics: nearViewRange=%.1f zn=%.1f fogEnd=%.1f",
-            ctx->nearViewRange, zn, cullDist);
-    }
+    // Use snapshotted worldSpace from ctx (thread-safe vs global race with selectDistantCell)
+    auto worldSpace = static_cast<const DistantLandShare::WorldSpace*>(ctx->worldSpace);
 
+    // Diagnostic: log culling distances
+    LOG_CAT(LOG::Cat_SyncThread, "[CULL] cullDistantStatics: nearViewRange=%.1f zn=%.1f fogEnd=%.1f sharedMem=%d",
+        ctx->nearViewRange, zn, cullDist, Configuration.UseSharedMemory ? 1 : 0);
+
+    LOG_CAT(LOG::Cat_SyncThread, "[CULL] RemoveAll");
     if (Configuration.UseSharedMemory) {
         visDistantShared.RemoveAll();
     } else {
         visDistant.RemoveAll();
     }
+    LOG_CAT(LOG::Cat_SyncThread, "[CULL] RemoveAll done, checking worldSpace=%p (ctx)", (void*)worldSpace);
+
+    // Check if world space is valid (use ctx snapshot, not global)
+    if (!worldSpace) {
+        LOG_CAT(LOG::Cat_SyncThread, "[CULL] ERROR: ctx->worldSpace is NULL!");
+        return;
+    }
 
     zf = std::min(Configuration.DL.NearStaticEnd * kCellSize, cullDist);
+    LOG_CAT(LOG::Cat_SyncThread, "[CULL] Near zn=%.1f zf=%.1f", zn, zf);
     if (zn < zf) {
         // For ultra-wide FOV, use original projection matrix to avoid overly restrictive frustum planes
         if (Configuration.ScreenFOV > 90.0f) {
@@ -180,13 +189,16 @@ void DistantLand::cullDistantStatics(DLContext* ctx, const D3DXMATRIX* view, con
             editProjectionZ(&ds_proj, zn, zf);
             ds_viewproj = (*view) * ds_proj;
         }
+        LOG_CAT(LOG::Cat_SyncThread, "[CULL] Near frustum computed");
         ViewFrustum range_frustum(&ds_viewproj);
         viewsphere.w = zf;
+        LOG_CAT(LOG::Cat_SyncThread, "[CULL] Near GetVisibleMeshes NearStatics=%p", (void*)worldSpace->NearStatics.get());
         if (Configuration.UseSharedMemory) {
             ipcClient.getVisibleMeshes(visDistantSharedId, range_frustum, viewsphere, VIS_NEAR);
         } else {
-            DistantLandShare::currentWorldSpace->NearStatics->GetVisibleMeshes(range_frustum, viewsphere, visDistant);
+            worldSpace->NearStatics->GetVisibleMeshes(range_frustum, viewsphere, visDistant);
         }
+        LOG_CAT(LOG::Cat_SyncThread, "[CULL] Near done");
     }
 
     zf = std::min(Configuration.DL.FarStaticEnd * kCellSize, cullDist);
@@ -203,7 +215,7 @@ void DistantLand::cullDistantStatics(DLContext* ctx, const D3DXMATRIX* view, con
         if (Configuration.UseSharedMemory) {
             ipcClient.getVisibleMeshes(visDistantSharedId, range_frustum, viewsphere, VIS_FAR);
         } else {
-            DistantLandShare::currentWorldSpace->FarStatics->GetVisibleMeshes(range_frustum, viewsphere, visDistant);
+            worldSpace->FarStatics->GetVisibleMeshes(range_frustum, viewsphere, visDistant);
         }
     }
 
@@ -221,7 +233,7 @@ void DistantLand::cullDistantStatics(DLContext* ctx, const D3DXMATRIX* view, con
         if (Configuration.UseSharedMemory) {
             ipcClient.getVisibleMeshes(visDistantSharedId, range_frustum, viewsphere, VIS_VERY_FAR);
         } else {
-            DistantLandShare::currentWorldSpace->VeryFarStatics->GetVisibleMeshes(range_frustum, viewsphere, visDistant);
+            worldSpace->VeryFarStatics->GetVisibleMeshes(range_frustum, viewsphere, visDistant);
         }
     }
 
@@ -235,6 +247,16 @@ void DistantLand::cullDistantStatics(DLContext* ctx, const D3DXMATRIX* view, con
 
 void DistantLand::renderDistantStatics(DLContext* ctx) {
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_DistantStatics, 0);
+
+    // Use snapshotted worldSpace from ctx (thread-safe vs global race with selectDistantCell)
+    auto worldSpace = static_cast<const DistantLandShare::WorldSpace*>(ctx->worldSpace);
+
+    // Skip if worldSpace not loaded (e.g., during cell transition)
+    if (!worldSpace) {
+        LOG::logline("[RENDER] renderDistantStatics SKIP: ctx->worldSpace is NULL");
+        return;
+    }
+
     if (!MWBridge::get()->IsExterior()) {
         // Set clipping to stop large architectural meshes (that don't match exactly)
         // from visible overdrawing and causing z-buffer occlusion

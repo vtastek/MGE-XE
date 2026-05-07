@@ -27,6 +27,12 @@ struct DLContext {
     int postEnvFlags;
     float waterLevel;
 
+    // WorldSpace snapshot for async Stage0Early (avoids global race with selectDistantCell)
+    // Stored as void* to avoid circular include with dlshare.h; cast to
+    // const DistantLandShare::WorldSpace* in renderexterior.cpp / rendershadow.cpp
+    const void* worldSpace = nullptr;
+    bool hasWorldSpace = false;
+
     // Lighting
     D3DXVECTOR4 sunVec, sunPos;
     float sunVis;
@@ -51,6 +57,13 @@ struct DLContext {
     // Flags
     bool isRenderCached;
     bool isPPLActive;
+
+    // Environment state snapshot (for N-1 rendering thread safety)
+    bool cellHasWater;
+    bool cellHasWeather;
+    bool isExterior;
+    bool isUnderwater;
+    bool isMenu;
 };
 
 // Captured MWBridge state for postProcess — allows render thread execution without MWBridge access
@@ -1219,7 +1232,10 @@ public:
         BufferState state;
         int frameNumber = -1;  // Frame number when this buffer was recorded (-1 = never)
 
-        FrameBuffer() : valid(false), state(BufferState::Available), frameNumber(-1) {}
+        // State block for split rendering (Stage0Early creates, RemainingStages restores)
+        IDirect3DStateBlock9* uiStateBlock = nullptr;
+
+        FrameBuffer() : valid(false), state(BufferState::Available), frameNumber(-1), uiStateBlock(nullptr) {}
 
         // Instance batches for GPU instancing (built during prepareRecordedCalls)
         std::vector<InstanceBatch> instanceBatches;
@@ -1355,12 +1371,13 @@ public:
     static PhaseCallCounts recordingGpuCalls;
 
 private:
-    static bool isRecording;
-    static bool isReplaying;
+    static std::atomic<bool> isRecording;
+    static std::atomic<bool> isReplaying;
     static bool usingN1Buffer;  // N-1 mode: use prepBuffer instead of renderBuffer for replay
     static bool manualRecordingControl;  // When true, user controls recording via K key
     static bool recordingEnabled;  // Global toggle for entire recording system
     static bool recordingCompletedThisFrame;  // Prevents restarting recording after Scene 0
+    static bool recordingStartedThisFrame;   // True if startRecording() was called this frame
     static int currentRecordingScene;  // Scene number being recorded (0=world, 1=particles, 2=hands)
     static bool hiZBuiltThisFrame;  // Prevents rebuilding Hi-Z pyramid multiple times per frame
     static bool dumpRequested;  // When true, preserve calls for dump
@@ -1438,6 +1455,12 @@ public:
     // Combines finalizeAndRenderAllScenes + postProcess without UI state save/restore
     static void renderFullFrameAsync(bool useN1Buffer = false);
 
+    // Split async path for overlapped execution:
+    // Stage0Early: runs after CPU prep, does DL Stage0 (shadows/water/sky)
+    // RemainingStages: runs after recording, does Stage1/Stage2/replay
+    static void renderStage0Early(bool useN1Buffer);
+    static void renderRemainingStages(bool useN1Buffer);
+
     // Triple buffer accessors
     static FrameBuffer& getRecordingBuffer() { return frameBuffers[recordingBuffer]; }  // Frame N
     static FrameBuffer& getPrepBuffer() { return frameBuffers[prepBuffer]; }            // Frame N-1
@@ -1446,12 +1469,15 @@ public:
     static bool isN1Ready() { return n1Ready; }
     static bool isN2Ready() { return n2Ready; }
 
-    // Debug controls for record/replay system
-    static bool getIsRecording() { return isRecording; }
-    static bool getIsReplaying() { return isReplaying; }
+    // Debug controls for record/replay system (atomic for thread safety)
+    static bool getIsRecording() { return isRecording.load(std::memory_order_acquire); }
+    static bool getIsReplaying() { return isReplaying.load(std::memory_order_acquire); }
     static bool isUsingN1Buffer() { return usingN1Buffer; }
-    static void setRecordingState(bool recording) { isRecording = recording; }
+    static void setRecordingState(bool recording) { isRecording.store(recording, std::memory_order_release); }
     static void resetRecordingCompletedFlag() { recordingCompletedThisFrame = false; currentRecordingScene = 0; }
+    static bool getRecordingStartedThisFrame() { return recordingStartedThisFrame; }
+    static void resetRecordingStartedFlag() { recordingStartedThisFrame = false; }
+    static void resetStage0EarlyFlag();  // Reset at swapBuffers for split render path
     static void setCurrentRecordingScene(int scene) { currentRecordingScene = scene; }
     static int getCurrentRecordingScene() { return currentRecordingScene; }
     static void captureScene1Matrices();  // Capture particles view/proj at Scene 1 start
@@ -1459,7 +1485,7 @@ public:
     static void saveOffscreenState();     // Save blend state before offscreen rendering
     static void restoreOffscreenState();  // Restore blend state after offscreen rendering
     static void resetHiZBuiltFlag() { hiZBuiltThisFrame = false; }
-    static void setReplayingState(bool replaying) { isReplaying = replaying; }
+    static void setReplayingState(bool replaying) { isReplaying.store(replaying, std::memory_order_release); }
     static void setManualRecordingControl(bool manual) { manualRecordingControl = manual; }
     static bool getManualRecordingControl() { return manualRecordingControl; }
     static size_t getRecordedCallsCount() { return frameBuffers[recordingBuffer].recordedCalls.size(); }

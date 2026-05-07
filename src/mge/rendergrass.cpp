@@ -29,14 +29,20 @@ void DistantLand::cullGrass(DLContext* ctx, const D3DXMATRIX* view, const D3DXMA
     // Cull and sort
     ViewFrustum range_frustum(&ds_viewproj);
 
+    // Use snapshotted worldSpace from ctx (thread-safe vs global race with selectDistantCell)
+    auto worldSpace = static_cast<const DistantLandShare::WorldSpace*>(ctx->worldSpace);
+
     if (Configuration.UseSharedMemory) {
         visGrassShared.RemoveAll();
         ipcClient.getVisibleMeshesCoarse(visGrassSharedId, range_frustum, VIS_GRASS, VisibleSetSort::ByState);
         ipcClient.waitForCompletion();
         buildGrassInstanceVB(visGrassShared);
     } else {
+        if (!worldSpace) {
+            return;  // No worldSpace during cell transition
+        }
         visGrass.RemoveAll();
-        DistantLandShare::currentWorldSpace->GrassStatics->GetVisibleMeshesCoarse(range_frustum, visGrass);
+        worldSpace->GrassStatics->GetVisibleMeshesCoarse(range_frustum, visGrass);
         visGrass.SortByState();
         buildGrassInstanceVB(visGrass);
     }

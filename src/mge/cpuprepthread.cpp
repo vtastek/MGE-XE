@@ -1,12 +1,18 @@
 
 #include "cpuprepthread.h"
+#include "configuration.h"
+#include "distantland.h"
 #include "ffeshader.h"
 #include "mged3d8device.h"
+#include "renderthread.h"
 #include "imgui_manager.h"
 #include "support/log.h"
 #include "mge_tracy.h"
 #include <thread>
 #include <chrono>
+
+extern RenderThread* g_renderThread;
+extern std::atomic<bool> g_skipSplitPathThisFrame;
 
 CpuPrepThread* g_cpuPrepThread = nullptr;
 
@@ -82,6 +88,11 @@ void CpuPrepThread::workerLoop() {
             switch (work.type) {
             case WorkType::PrepareFrame:
                 executePrepareFrame(work.viewMatrix, work.projMatrix);
+                // Stage0Early chaining DISABLED for sync mode
+                // Reason: Stage0Early runs before Clear, which wipes depth buffer.
+                // The fallback in renderRemainingStages runs after Clear, preserving depth.
+                // Sync mode relies on the fallback path for correct depth ordering.
+                // (Async mode doesn't use this code path - it submits GPU work at Present)
                 break;
             case WorkType::Shutdown:
             case WorkType::None:
@@ -134,8 +145,10 @@ void CpuPrepThread::executePrepareFrame(const D3DXMATRIX& view, const D3DXMATRIX
     // Pipeline validation: prep should be N-1 (one frame behind current)
     int expectedPrepFrame = currentFrame - 1;
     if (prepFrame != expectedPrepFrame && prepFrame >= 0) {
-        LOG::logline("!! CPT FRAME MISMATCH: current=%d prep=%d expected=%d (delta=%d)",
-                     currentFrame, prepFrame, expectedPrepFrame, currentFrame - prepFrame);
+        extern std::atomic<bool> g_skipSplitPathThisFrame;
+        LOG::logline("!! CPT FRAME MISMATCH: current=%d prep=%d expected=%d (delta=%d) skipSplit=%d",
+                     currentFrame, prepFrame, expectedPrepFrame, currentFrame - prepFrame,
+                     g_skipSplitPathThisFrame.load(std::memory_order_acquire) ? 1 : 0);
     }
 
     // Skip if already prepared

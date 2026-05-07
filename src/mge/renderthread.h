@@ -28,10 +28,12 @@ public:
     enum class WorkType {
         None,
         RenderStage0,
+        RenderStage0Early,  // Just DL Stage0 (shadows/water/sky) - runs after CPU prep
         RenderStage1,
         RenderStage2,
         ReplayHLSL,
         RenderFullFrame,   // GPU work only - CPU prep done by CpuPrepThread
+        RenderRemaining,   // Stage1 + Stage2 + replay - runs after Stage0Early
         Shutdown
     };
 
@@ -51,6 +53,7 @@ public:
 
 private:
     std::thread thread;
+    std::thread::id threadId;  // Stored for thread identification
     mutable std::mutex mutex;
     std::condition_variable workAvailable;
     std::condition_variable workComplete;
@@ -68,10 +71,12 @@ private:
     void workerLoop();
 
     void executeRenderStage0();
+    void executeRenderStage0Early(bool useN1Buffer);  // DL Stage0 only
     void executeRenderStage1(DLContext* ctx);
     void executeRenderStage2(DLContext* ctx);
     void executeReplayHLSL(int sceneCount);
     void executeFullFrame(int bufferIndex, bool useN1Buffer);
+    void executeRenderRemaining(bool useN1Buffer);  // Stage1 + Stage2 + replay
 
 public:
     RenderThread() = default;
@@ -89,6 +94,7 @@ public:
     bool isComplete() const;
     bool isPending() const { return !isComplete(); }
     bool isRunning() const { return thread.joinable(); }
+    std::thread::id getThreadId() const { return threadId; }
 
     // Per-object light texture accessors - texture owned by RenderThread for thread safety
     IDirect3DTexture9* getPerObjectLightTexture() { return texPerObjectLightData; }

@@ -151,8 +151,8 @@ static DWORD s_tssState[8][32] = {};
 // Slow frame detection state
 bool ImGuiManager::slowFrameFrozen = false;
 bool ImGuiManager::slowFrameAutoFreeze = true;
-float ImGuiManager::slowFrameThreshold = 5.0f;
-float ImGuiManager::slowCallThreshold = 5.0f;
+float ImGuiManager::slowFrameThreshold = 16.0f;
+float ImGuiManager::slowCallThreshold = 0.5f;
 float ImGuiManager::frozenPrepareMs = 0.0f;
 float ImGuiManager::frozenReplayMs = 0.0f;
 int ImGuiManager::frozenSlowCallIndex = -1;
@@ -746,7 +746,7 @@ void ImGuiManager::RenderDebugInterface() {
 
         ImGui::Checkbox("Auto-freeze on slow frame", &slowFrameAutoFreeze);
         ImGui::SliderFloat("Frame threshold (ms)", &slowFrameThreshold, 1.0f, 50.0f, "%.1f");
-        ImGui::SliderFloat("Call threshold (ms)", &slowCallThreshold, 1.0f, 50.0f, "%.1f");
+        ImGui::SliderFloat("Call threshold (ms)", &slowCallThreshold, 0.1f, 50.0f, "%.1f");
 
         ImGui::Separator();
         ImGui::Text("D3D Command Buffer");
@@ -791,6 +791,7 @@ void ImGuiManager::RenderDebugInterface() {
                 {"HLSL Replay",     LOG::Cat_HLSLReplay,  "CACHE HIT, Bins, per-frame Lights summary, bindShaderTextures"},
                 {"Mode3 Lighting",  LOG::Cat_Mode3,       "Mode3 packing/diag — only fires when Force LightMode 3 is on"},
                 {"Distant Land",    LOG::Cat_DistantLand, "[WVT] [WATER] [NVR] [N1-STORE] [PPDCAP] particles draw"},
+                {"Sync Threading",  LOG::Cat_SyncThread,  "[SN1] [S0E] [S0GPU] [FSTATE] [SHADOW] [CULL] [BLEND] sync mode"},
             };
             for (const auto& r : rows) {
                 bool on = (LOG::g_categoryMask & r.bit) != 0;

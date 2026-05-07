@@ -26,10 +26,137 @@ PassBreakCounters g_passBreaks;
 
 // File-scope ctx pointer for updatePostShader callback (set/cleared in postProcess)
 static DLContext* s_postShaderCtx = nullptr;
+
+// ============================================================================
+// Frame State Logging - Auto-diff system to track state changes across frames
+// ============================================================================
+struct FrameStateSnapshot {
+    int frameNum;
+    // Menu/cache state
+    bool isMenu;
+    bool isRenderCached;
+    // Environment state (captured)
+    bool cellHasWater;
+    bool cellHasWeather;
+    bool isExterior;
+    bool isUnderwater;
+    float waterLevel;
+    int postEnvFlags;
+    bool hasWorldSpace;
+    // Camera position
+    float eyeZ;
+    // Live mwBridge state (for comparison)
+    bool live_isMenu;
+    bool live_cellHasWater;
+    bool live_cellHasWeather;
+    bool live_isExterior;
+    bool live_isUnderwater;
+    float live_waterLevel;
+
+    void clear() { memset(this, 0, sizeof(*this)); frameNum = -1; }
+};
+
+static FrameStateSnapshot s_prevState = {};
+static FrameStateSnapshot s_currState = {};
+static int s_frameStateLogCount = 0;
+
+static void logFrameStateDiff(const char* tag, const DLContext* ctx) {
+    auto mwBridge = MWBridge::get();
+    if (!mwBridge || !mwBridge->IsLoaded()) {
+        return;
+    }
+
+    int frameNum = getFrameNumber();
+
+    // Capture current state
+    s_currState.frameNum = frameNum;
+    s_currState.isMenu = ctx ? ctx->isMenu : false;
+    s_currState.isRenderCached = DistantLand::s_staging.isRenderCached;
+    s_currState.cellHasWater = ctx ? ctx->cellHasWater : false;
+    s_currState.cellHasWeather = ctx ? ctx->cellHasWeather : false;
+    s_currState.isExterior = ctx ? ctx->isExterior : false;
+    s_currState.isUnderwater = ctx ? ctx->isUnderwater : false;
+    s_currState.waterLevel = ctx ? ctx->waterLevel : -1e9f;
+    s_currState.postEnvFlags = ctx ? ctx->postEnvFlags : 0;
+    s_currState.hasWorldSpace = ctx ? ctx->hasWorldSpace : false;
+    s_currState.eyeZ = ctx ? ctx->eyePos.z : 0;
+
+    // Capture live state
+    s_currState.live_isMenu = mwBridge->IsMenu();
+    s_currState.live_cellHasWater = mwBridge->CellHasWater();
+    s_currState.live_cellHasWeather = mwBridge->CellHasWeather();
+    s_currState.live_isExterior = mwBridge->IsExterior();
+    s_currState.live_isUnderwater = mwBridge->IsUnderwater(ctx ? ctx->eyePos.z : 0);
+    s_currState.live_waterLevel = mwBridge->CellHasWater() ? mwBridge->WaterLevel() : -1e9f;
+
+    // Check for any differences from previous frame
+    bool frameDiff = (s_prevState.frameNum != -1 && s_prevState.frameNum != s_currState.frameNum - 1);
+    bool menuDiff = (s_prevState.frameNum != -1 && s_prevState.isMenu != s_currState.isMenu);
+    bool cacheDiff = (s_prevState.frameNum != -1 && s_prevState.isRenderCached != s_currState.isRenderCached);
+    bool waterDiff = (s_prevState.frameNum != -1 && s_prevState.cellHasWater != s_currState.cellHasWater);
+    bool weatherDiff = (s_prevState.frameNum != -1 && s_prevState.cellHasWeather != s_currState.cellHasWeather);
+    bool extDiff = (s_prevState.frameNum != -1 && s_prevState.isExterior != s_currState.isExterior);
+    bool underDiff = (s_prevState.frameNum != -1 && s_prevState.isUnderwater != s_currState.isUnderwater);
+    bool envFlagDiff = (s_prevState.frameNum != -1 && s_prevState.postEnvFlags != s_currState.postEnvFlags);
+    bool worldDiff = (s_prevState.frameNum != -1 && s_prevState.hasWorldSpace != s_currState.hasWorldSpace);
+
+    // Check for ctx vs live mismatches (the actual bug we're looking for)
+    bool menuMismatch = (s_currState.isMenu != s_currState.live_isMenu);
+    bool waterMismatch = (s_currState.cellHasWater != s_currState.live_cellHasWater);
+    bool weatherMismatch = (s_currState.cellHasWeather != s_currState.live_cellHasWeather);
+    bool extMismatch = (s_currState.isExterior != s_currState.live_isExterior);
+    bool underMismatch = (s_currState.isUnderwater != s_currState.live_isUnderwater);
+
+    bool anyDiff = frameDiff || menuDiff || cacheDiff || waterDiff || weatherDiff || extDiff || underDiff || envFlagDiff || worldDiff;
+    bool anyMismatch = menuMismatch || waterMismatch || weatherMismatch || extMismatch || underMismatch;
+
+    // Log on state change or mismatch (gated by SyncThread category)
+    if (anyDiff || anyMismatch) {
+        LOG_CAT(LOG::Cat_SyncThread, "[FSTATE][%s] frame=%d ctx: menu=%d cache=%d water=%d weather=%d ext=%d under=%d envFlags=0x%02X world=%d waterLvl=%.1f eyeZ=%.1f",
+            tag, frameNum, s_currState.isMenu, s_currState.isRenderCached,
+            s_currState.cellHasWater, s_currState.cellHasWeather, s_currState.isExterior, s_currState.isUnderwater,
+            s_currState.postEnvFlags, s_currState.hasWorldSpace, s_currState.waterLevel, s_currState.eyeZ);
+
+        LOG_CAT(LOG::Cat_SyncThread, "[FSTATE][%s] frame=%d LIVE: menu=%d water=%d weather=%d ext=%d under=%d waterLvl=%.1f",
+            tag, frameNum, s_currState.live_isMenu, s_currState.live_cellHasWater,
+            s_currState.live_cellHasWeather, s_currState.live_isExterior, s_currState.live_isUnderwater,
+            s_currState.live_waterLevel);
+
+        if (anyDiff && s_prevState.frameNum != -1) {
+            LOG_CAT(LOG::Cat_SyncThread, "[FSTATE][%s] DIFF from frame %d: %s%s%s%s%s%s%s%s%s",
+                tag, s_prevState.frameNum,
+                frameDiff ? "FRAME_SKIP " : "",
+                menuDiff ? "menu " : "",
+                cacheDiff ? "cache " : "",
+                waterDiff ? "water " : "",
+                weatherDiff ? "weather " : "",
+                extDiff ? "exterior " : "",
+                underDiff ? "underwater " : "",
+                envFlagDiff ? "envFlags " : "",
+                worldDiff ? "world " : "");
+        }
+
+        if (anyMismatch) {
+            LOG_CAT(LOG::Cat_SyncThread, "[FSTATE][%s] *** MISMATCH ctx!=live: %s%s%s%s%s ***",
+                tag,
+                menuMismatch ? "MENU " : "",
+                waterMismatch ? "WATER " : "",
+                weatherMismatch ? "WEATHER " : "",
+                extMismatch ? "EXTERIOR " : "",
+                underMismatch ? "UNDERWATER " : "");
+        }
+    }
+
+    // Copy current to previous
+    s_prevState = s_currState;
+}
 // File-scope pointer for updatePostShader to access captured MWBridge state
 static const PostProcessData* s_postProcessData = nullptr;
 // Skip velocity buffer writes on first frame after menu exit to preserve motion blur
 static bool s_skipVelocityBufferThisFrame = false;
+// Frame-consistent render decision - snapshotted at S0GPU entry, used by all stages
+// Prevents mid-frame inconsistency when s_staging.isRenderCached changes during capture
+static bool s_frameRenderCached = false;
 
 bool DistantLand::shouldSkipVelocityBuffer() {
     return s_skipVelocityBufferThisFrame;
@@ -141,6 +268,10 @@ DLContext DistantLand::captureStage0Context() {
     // Update current cell and select distant static set
     selectDistantCell();
 
+    // Capture worldSpace into staging context for async Stage0Early (avoids global race)
+    s_staging.worldSpace = DistantLandShare::currentWorldSpace;
+    s_staging.hasWorldSpace = DistantLandShare::hasCurrentWorldSpace;
+
     // Morrowind camera matrices — already captured CPU-side by SetTransform handler
     // (no device->GetTransform needed, works with state forwarding suppression)
 
@@ -199,6 +330,22 @@ DLContext DistantLand::captureStage0Context() {
     }
     s_staging.waterLevel = mwBridge->CellHasWater() ? mwBridge->WaterLevel() : -1e9f;
 
+    // Snapshot environment state for N-1 rendering (avoids mwBridge race conditions)
+    s_staging.cellHasWater = mwBridge->CellHasWater();
+    s_staging.cellHasWeather = mwBridge->CellHasWeather();
+    s_staging.isExterior = mwBridge->IsExterior();
+    s_staging.isUnderwater = mwBridge->IsUnderwater(s_staging.eyePos.z);
+    s_staging.isMenu = mwBridge->IsMenu();
+
+    // Log captured state at capture time
+    if (LOG::catEnabled(LOG::Cat_DistantLand)) {
+        int frameNum = getFrameNumber();
+        LOG::logline("[FSTATE][CAPTURE] frame=%d staging: menu=%d cache=%d water=%d weather=%d ext=%d under=%d envFlags=0x%02X waterLvl=%.1f eyeZ=%.1f",
+            frameNum, s_staging.isMenu, s_staging.isRenderCached,
+            s_staging.cellHasWater, s_staging.cellHasWeather, s_staging.isExterior, s_staging.isUnderwater,
+            s_staging.postEnvFlags, s_staging.waterLevel, s_staging.eyePos.z);
+    }
+
     // Snapshot all per-frame state into context (foundation for threading)
     DLContext ctx = captureContext();
 
@@ -213,6 +360,7 @@ DLContext DistantLand::captureStage0Context() {
 // Called in render phase after recording is complete.
 void DistantLand::renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuffer* fb) {
     MGE_ZoneScopedN("DL_RenderStage0GPU");
+    logFrameStateDiff("S0GPU", ctx);
 
     // N-1 camera debug: Check if first recorded call's worldViewTransform matches ctx->mwView
     if (LOG::catEnabled(LOG::Cat_DistantLand)) {
@@ -240,27 +388,47 @@ void DistantLand::renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuff
     IDirect3DStateBlock9* stateSaved;
     UINT passes;
 
-    // N-1 fix: Use current frame's menu state, not buffered context's stale state
-    if (!s_staging.isRenderCached) {
-        if (isDistantCell()) {
+    // Snapshot render decision at S0GPU entry - use this for ALL stages in this frame
+    // This prevents mid-frame inconsistency when s_staging.isRenderCached changes during capture
+    s_frameRenderCached = s_staging.isRenderCached;
+
+    // Menu caching uses CURRENT frame's state - must respond immediately to menu exit
+    // WorldSpace uses N-1 buffer's snapshot (ctx) - thread-safe vs selectDistantCell race
+    LOG_CAT(LOG::Cat_SyncThread, "[S0GPU] s_frameRenderCached=%d ctx->hasWorldSpace=%d", s_frameRenderCached ? 1 : 0, ctx->hasWorldSpace ? 1 : 0);
+    if (!s_frameRenderCached) {
+        if (ctx->hasWorldSpace) {
             // Save state block manually since we can change FVF/decl
+            LOG_CAT(LOG::Cat_SyncThread, "[S0GPU] CreateStateBlock");
             {
                 MGE_ZoneScopedN("DL_CreateStateBlock");
                 device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
             }
+            LOG_CAT(LOG::Cat_SyncThread, "[S0GPU] BeginPass SETUP");
             effect->BeginPass(PASS_SETUP);
             effect->EndPass();
 
             // Shadow map early render
+            // Use s_staging.isMenu (current) not ctx->isMenu (N-1) for menu skip decision
+            // This ensures shadows render on menu exit frame (responsive UI)
+            LOG_CAT(LOG::Cat_SyncThread, "[S0GPU] Shadow check flags=%d weather=%d menu=%d (staging=%d)",
+                (Configuration.MGEFlags & USE_SHADOWS) ? 1 : 0,
+                ctx->cellHasWeather ? 1 : 0,
+                ctx->isMenu ? 1 : 0,
+                s_staging.isMenu ? 1 : 0);
             if (Configuration.MGEFlags & USE_SHADOWS) {
-                if (mwBridge->CellHasWeather() && !mwBridge->IsMenu()) {
+                if (ctx->cellHasWeather && !s_staging.isMenu) {
                     MGE_ZoneScopedN("DL_ShadowMap");
+                    LOG_CAT(LOG::Cat_SyncThread, "[S0GPU] Shadow transitionTo");
                     FixedFunctionShader::transitionTo(PhaseTransition::ShadowEntry);
+                    LOG_CAT(LOG::Cat_SyncThread, "[S0GPU] Shadow effectBegin");
                     effectShadow->Begin(&passes, D3DXFX_DONOTSAVESTATE);
+                    LOG_CAT(LOG::Cat_SyncThread, "[S0GPU] Shadow renderShadowMap");
                     renderShadowMap(ctx);
+                    LOG_CAT(LOG::Cat_SyncThread, "[S0GPU] Shadow effectEnd");
                     g_passBreaks.mge_shadowRT += 2;
                     effectShadow->End();
                     FixedFunctionShader::transitionTo(PhaseTransition::ShadowExit);
+                    LOG_CAT(LOG::Cat_SyncThread, "[S0GPU] Shadow DONE");
 
                     // Write shadow viewproj back to s_staging for ffeshader/mged3d8device reads
                     memcpy(s_staging.smViewproj, ctx->smViewproj, sizeof(s_staging.smViewproj));
@@ -273,24 +441,29 @@ void DistantLand::renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuff
             editProjectionZ(&distProj, kDistantNearPlane - 1e-2, Configuration.DL.DrawDist * kCellSize);
             effect->SetMatrix(ehProj, &distProj);
 
+            LOG_CAT(LOG::Cat_SyncThread, "[S0GPU] effect->Begin");
             effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
 
-            if (!mwBridge->IsUnderwater(ctx->eyePos.z)) {
+            LOG_CAT(LOG::Cat_SyncThread, "[S0GPU] underwater=%d exterior=%d", ctx->isUnderwater ? 1 : 0, ctx->isExterior ? 1 : 0);
+            if (!ctx->isUnderwater) {
                 // Draw distant landscape
-                if (mwBridge->IsExterior()) {
+                if (ctx->isExterior) {
                     MGE_ZoneScopedN("DL_Land");
+                    LOG_CAT(LOG::Cat_SyncThread, "[S0GPU] renderDistantLand START");
                     effect->BeginPass(PASS_RENDERLAND);
                     renderDistantLand(ctx, effect, &ctx->mwView, &distProj);
                     effect->EndPass();
+                    LOG_CAT(LOG::Cat_SyncThread, "[S0GPU] renderDistantLand DONE");
                 }
 
                 // Draw distant statics, with alpha dissolve as they pass the near view boundary
                 if (Configuration.MGEFlags & USE_DISTANT_STATICS) {
                     MGE_ZoneScopedN("DL_Statics");
-                    DWORD p = mwBridge->CellHasWeather() ? PASS_RENDERSTATICSEXTERIOR : PASS_RENDERSTATICSINTERIOR;
+                    DWORD p = ctx->cellHasWeather ? PASS_RENDERSTATICSEXTERIOR : PASS_RENDERSTATICSINTERIOR;
                     effect->BeginPass(p);
                     vsr.beginAlphaToCoverage(device);
 
+                    LOG_CAT(LOG::Cat_SyncThread, "[S0GPU] cullDistantStatics START");
                     cullDistantStatics(ctx, &ctx->mwView, &distProj);
                     renderDistantStatics(ctx);
 
@@ -304,7 +477,7 @@ void DistantLand::renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuff
 
             // Sky scattering and sky objects (should be drawn late as possible)
             // In HLSL mode, sky is always deferred here and rendered via shader
-            if (mwBridge->CellHasWeather()) {
+            if (ctx->cellHasWeather) {
                 MGE_ZoneScopedN("DL_Sky");
                 FixedFunctionShader::transitionTo(PhaseTransition::SkyEntry);
                 const auto& sky = fb ? fb->recordSky : recordSky;
@@ -316,8 +489,8 @@ void DistantLand::renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuff
                 FixedFunctionShader::transitionTo(PhaseTransition::SkyExit);
             }
 
-            // Update reflection
-            if (mwBridge->CellHasWater()) {
+            // Update reflection (use ctx flag for N-1 thread safety)
+            if (ctx->cellHasWater) {
                 MGE_ZoneScopedN("DL_WaterRefl");
                 FixedFunctionShader::transitionTo(PhaseTransition::WaterReflEntry);
                 const auto* sky = fb ? &fb->recordSky : nullptr;
@@ -342,6 +515,7 @@ void DistantLand::renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuff
             // Save distant land only frame to texture
             if (~Configuration.MGEFlags & NO_MW_MGE_BLEND) {
                 IDirect3DTexture9* blendTex = PostShaders::borrowBuffer(1);
+                LOG_CAT(LOG::Cat_SyncThread, "[S0GPU] texDistantBlend captured: tex=%p fb=%p", (void*)blendTex, (void*)fb);
                 if (fb) {
                     fb->texDistantBlend = blendTex;
                 } else {
@@ -359,8 +533,8 @@ void DistantLand::renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuff
         } else {
             // Non-distant cell path (DL off or interior without distant statics)
 
-            // Sky rendering - still needed even without DL
-            if (mwBridge->CellHasWeather()) {
+            // Sky rendering - still needed even without DL (use ctx flag for N-1 thread safety)
+            if (ctx->cellHasWeather) {
                 // Save state block for sky rendering
                 device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
                 effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
@@ -380,8 +554,8 @@ void DistantLand::renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuff
 
             // Clear water reflection to avoid seeing previous cell environment reflected
             // Must be done every frame to react to lighting changes
-            // Skip for cells without water to avoid unnecessary GPU work
-            if (mwBridge->CellHasWater()) {
+            // Skip for cells without water to avoid unnecessary GPU work (use ctx flag for N-1 thread safety)
+            if (ctx->cellHasWater) {
                 clearReflection(ctx);
             }
 
@@ -429,17 +603,17 @@ void DistantLand::renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer*
 
     ///LOG::logline("Stage 1 prims: %d", recordMW.size());
 
-    // N-1 fix: Use current frame's menu state, not buffered context's stale state
-    if (!s_staging.isRenderCached) {
+    // Use frame-consistent render decision (snapshotted at S0GPU entry)
+    if (!s_frameRenderCached) {
         // Save state block manually since we can change FVF/decl
         device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
 
         // TODO: Locate this properly
-        if (isDistantCell()) {
+        if (ctx->hasWorldSpace) {
             cullGrass(ctx, &ctx->mwView, &ctx->mwProj);
         }
 
-        if (isDistantCell()) {
+        if (ctx->hasWorldSpace) {
             // Render over Morrowind domain
             effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
 
@@ -453,7 +627,8 @@ void DistantLand::renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer*
             }
 
             // Overlay shadow onto Morrowind objects (skip if HLSL shadows are handling it)
-            if ((Configuration.MGEFlags & USE_SHADOWS) && mwBridge->CellHasWeather() && !isHLSLActive()) {
+            // Use ctx flag for N-1 thread safety
+            if ((Configuration.MGEFlags & USE_SHADOWS) && ctx->cellHasWeather && !isHLSLActive()) {
                 effect->BeginPass(ctx->isPPLActive ? PASS_RENDERSHADOWFFE : PASS_RENDERSHADOW);
                 renderShadow(ctx);
                 effect->EndPass();
@@ -539,7 +714,7 @@ void DistantLand::renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer*
             }*/
 
             // Continue depth with distant land (skip for interiors - no distant geometry)
-            if (isDistantCell()) {
+            if (ctx->hasWorldSpace) {
                 effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
                 if (ImGuiManager::GetEnableDepthPass()) {
                     renderDepthDistantLand(ctx);
@@ -609,14 +784,15 @@ void DistantLand::renderStage2(DLContext* ctx, FixedFunctionShader::FrameBuffer*
         return;
     }
 
-    // N-1 fix: Use current frame's menu state, not buffered context's stale state
-    if (!s_staging.isRenderCached) {
+    // Use frame-consistent render decision (snapshotted at S0GPU entry)
+    if (!s_frameRenderCached) {
         // Save state block manually since we can change FVF/decl
         device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
 
-        if (isDistantCell()) {
+        if (ctx->hasWorldSpace) {
             // Shadowing onto recorded renders (skip if HLSL shadows are handling it)
-            if ((Configuration.MGEFlags & USE_SHADOWS) && mwBridge->CellHasWeather() && !isHLSLActive()) {
+            // Use ctx flag for N-1 thread safety
+            if ((Configuration.MGEFlags & USE_SHADOWS) && ctx->cellHasWeather && !isHLSLActive()) {
                 effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
                 effect->BeginPass(ctx->isPPLActive ? PASS_RENDERSHADOWFFE : PASS_RENDERSHADOW);
                 renderShadow(ctx);
@@ -665,19 +841,21 @@ void DistantLand::renderStage2(DLContext* ctx, FixedFunctionShader::FrameBuffer*
 // renderStageBlend - Blend between MGE distant land and Morrowind, rendering caustics first so it blends out
 void DistantLand::renderStageBlend(DLContext* ctx, FixedFunctionShader::FrameBuffer* fb) {
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_StageBlend, 0);
+    logFrameStateDiff("BLEND", ctx);
     FixedFunctionShader::transitionTo(PhaseTransition::StageBlendEntry);
     auto mwBridge = MWBridge::get();
     IDirect3DStateBlock9* stateSaved;
     UINT passes;
 
-    // N-1 fix: Use current frame's menu state, not buffered context's stale state
-    if (s_staging.isRenderCached) {
+    // Use frame-consistent render decision (snapshotted at S0GPU entry)
+    if (s_frameRenderCached) {
         return;
     }
 
     // Early out: skip state block overhead when no blend work will be done
-    bool hasCaustics = mwBridge->IsExterior() && Configuration.DL.WaterCaustics > 0;
-    bool hasBlend = isDistantCell() && (~Configuration.MGEFlags & NO_MW_MGE_BLEND);
+    // Use ctx flag for N-1 thread safety
+    bool hasCaustics = ctx->isExterior && Configuration.DL.WaterCaustics > 0;
+    bool hasBlend = ctx->hasWorldSpace && (~Configuration.MGEFlags & NO_MW_MGE_BLEND);
     if (!hasCaustics && !hasBlend) {
         return;
     }
@@ -686,11 +864,11 @@ void DistantLand::renderStageBlend(DLContext* ctx, FixedFunctionShader::FrameBuf
     device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
     effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
 
-    // Render caustics
+    // Render caustics (use ctx->waterLevel for N-1 thread safety)
     if (hasCaustics) {
         D3DXMATRIX m;
         IDirect3DTexture9* tex = PostShaders::borrowBuffer(0);
-        D3DXMatrixTranslation(&m, ctx->eyePos.x, ctx->eyePos.y, mwBridge->WaterLevel());
+        D3DXMatrixTranslation(&m, ctx->eyePos.x, ctx->eyePos.y, ctx->waterLevel);
 
         effect->SetTexture(ehTex0, tex);
         effect->SetTexture(ehTex1, texWater);
@@ -707,13 +885,19 @@ void DistantLand::renderStageBlend(DLContext* ctx, FixedFunctionShader::FrameBuf
     // Blend MW/MGE
     if (hasBlend) {
         IDirect3DTexture9* blendTex = fb ? fb->texDistantBlend : texDistantBlend;
-        effect->SetTexture(ehTex0, blendTex);
-        effect->SetTexture(ehTex3, texDepthFrame);
-        effect->CommitChanges();
+        // Skip blend if texture is NULL (buffer was captured during menu mode when DL was skipped)
+        if (!blendTex) {
+            LOG_CAT(LOG::Cat_SyncThread, "[BLEND] SKIP: blendTex is NULL (fb=%p)", (void*)fb);
+        } else {
+            LOG_CAT(LOG::Cat_SyncThread, "[BLEND] using blendTex=%p fb=%p", (void*)blendTex, (void*)fb);
+            effect->SetTexture(ehTex0, blendTex);
+            effect->SetTexture(ehTex3, texDepthFrame);
+            effect->CommitChanges();
 
-        effect->BeginPass(PASS_BLENDMGE);
-        PostShaders::applyBlend();
-        effect->EndPass();
+            effect->BeginPass(PASS_BLENDMGE);
+            PostShaders::applyBlend();
+            effect->EndPass();
+        }
     }
 
     effect->End();
@@ -726,6 +910,7 @@ void DistantLand::renderStageBlend(DLContext* ctx, FixedFunctionShader::FrameBuf
 // renderStageWater - Render replacement water plane
 void DistantLand::renderStageWater(DLContext* ctx) {
     MGE_ZoneScopedN("Water_Stage_DL");
+    logFrameStateDiff("WATER", ctx);
     auto mwBridge = MWBridge::get();
     IDirect3DStateBlock9* stateSaved;
     UINT passes;
@@ -742,14 +927,15 @@ void DistantLand::renderStageWater(DLContext* ctx) {
         }
     }
 
-    if (mwBridge->CellHasWater()) {
+    // Use ctx flags for N-1 thread safety (avoid mwBridge race conditions)
+    if (ctx->cellHasWater) {
         // Save state block manually since we can change FVF/decl
         device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
         effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
 
-        // Draw water plane
-        bool u = mwBridge->IsUnderwater(ctx->eyePos.z);
-        bool i = !mwBridge->IsExterior();
+        // Draw water plane (use ctx flags, not live mwBridge state)
+        bool u = ctx->isUnderwater;
+        bool i = !ctx->isExterior;
 
         if (u || i) {
             // Set up clip plane at fog end for certain environments to save fillrate
@@ -801,9 +987,9 @@ void DistantLand::setupCommonEffect(DLContext* ctx, const D3DXMATRIX* view, cons
         effect->SetFloatArray(ehSunAmb, a, 3);
     }
 
-    // Sky/fog
+    // Sky/fog (use ctx flags for N-1 thread safety)
     bool isExpFog = (Configuration.MGEFlags & EXP_FOG) != 0;
-    const RGBVECTOR* skyCol = mwBridge->CellHasWeather() ? mwBridge->getCurrentWeatherSkyCol() : &ctx->horizonCol;
+    const RGBVECTOR* skyCol = ctx->cellHasWeather ? mwBridge->getCurrentWeatherSkyCol() : &ctx->horizonCol;
     effect->SetFloat(ehFogStart, isExpFog ? ctx->fogExpStart : ctx->fogStart);
     effect->SetFloat(ehFogRange, isExpFog ? ctx->fogExpDivisor : ctx->fogEnd);
     effect->SetFloat(ehFogNearStart, ctx->fogNearStart);
@@ -837,8 +1023,9 @@ void DistantLand::setupCommonEffect(DLContext* ctx, const D3DXMATRIX* view, cons
     }
 
     // Wind, requires smoothing as it is very noisy
+    // Use s_staging.isMenu (current) for responsive menu exit
     static float smoothWind[2];
-    if (!mwBridge->IsMenu()) {
+    if (!s_staging.isMenu) {
         const float f = 0.02;
         const float* wind = mwBridge->GetWindVector();
         smoothWind[0] += f * (ctx->windScaling * wind[0] - smoothWind[0]);
@@ -1049,8 +1236,9 @@ void DistantLand::adjustFog() {
 void DistantLand::postProcess(DLContext* ctx) {
     MGE_ZoneScopedN("postProcess");
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_PostProcess, -1);
-    // N-1 fix: Use current frame's menu state, not buffered context's stale state
-    if (!s_staging.isRenderCached) {
+    logFrameStateDiff("POST", ctx);
+    // Use frame-consistent render decision (snapshotted at S0GPU entry)
+    if (!s_frameRenderCached) {
         auto mwBridge = MWBridge::get();
 
         // Save state block
@@ -1058,33 +1246,13 @@ void DistantLand::postProcess(DLContext* ctx) {
         device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
 
         if (Configuration.MGEFlags & USE_HW_SHADER) {
-            // Set flags to reflect cell environment
-            int envFlags = 0;
-
-            if (!mwBridge->CellHasWeather()) {
-                envFlags |= 1;
-            }
-            if (mwBridge->IsExterior()) {
-                envFlags |= 2;
-            }
-            if (mwBridge->IntLikeExterior()) {
-                envFlags |= 4;
-            }
-            if (mwBridge->IsUnderwater(ctx->eyePos.z)) {
-                envFlags |= 8;
-            } else {
-                envFlags |= 16;
-            }
-            if (ctx->sunVis >= 0.001) {
-                envFlags |= 32;
-            } else {
-                envFlags |= 64;
-            }
+            // Use captured envFlags from ctx for N-1 thread safety
+            // ctx->postEnvFlags already has weather/exterior/underwater state from capture time
 
             // Run all shaders (with callback to set changed vars)
             s_postShaderCtx = ctx;
             logWaterDiagnostics("POST-LIVE", ctx, nullptr);
-            PostShaders::shaderTime(&updatePostShader, envFlags, mwBridge->frameTime());
+            PostShaders::shaderTime(&updatePostShader, ctx->postEnvFlags, mwBridge->frameTime());
             s_postShaderCtx = nullptr;
         }
 
@@ -1126,7 +1294,9 @@ void DistantLand::postProcess(DLContext* ctx) {
 void DistantLand::postProcess(DLContext* ctx, const PostProcessData& ppd) {
     MGE_ZoneScopedN("postProcess");
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_PostProcess, -1);
-    if (!s_staging.isRenderCached) {
+    logFrameStateDiff("POST2", ctx);
+    // Use frame-consistent render decision (snapshotted at S0GPU entry)
+    if (!s_frameRenderCached) {
         // Save state block
         IDirect3DStateBlock9* stateSaved;
         device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
@@ -1222,19 +1392,19 @@ void DistantLand::updatePostShader(MGEShader* shader) {
     shader->SetFloat(EV_fognearstart, ctx->fogNearStart);
     shader->SetFloat(EV_fognearrange, ctx->fogNearEnd);
 
-    // Other — use captured PostProcessData when available, else fall back to MWBridge
+    // Other — use captured PostProcessData when available, else use ctx flags for N-1 safety
     if (s_postProcessData) {
         shader->SetFloat(EV_time, s_postProcessData->simulationTime);
         shader->SetFloat(EV_waterlevel, s_postProcessData->waterLevel);
         shader->SetBool(EV_isinterior, s_postProcessData->isInterior);
         shader->SetBool(EV_isunderwater, s_postProcessData->isUnderwater);
     } else {
+        // Use ctx flags for N-1 thread safety (only simulationTime needs live access)
         auto mwBridge = MWBridge::get();
-        float water = mwBridge->CellHasWater() ? mwBridge->WaterLevel() : -1e9f;
         shader->SetFloat(EV_time, mwBridge->simulationTime());
-        shader->SetFloat(EV_waterlevel, water);
-        shader->SetBool(EV_isinterior, !mwBridge->CellHasWeather());
-        shader->SetBool(EV_isunderwater, mwBridge->IsUnderwater(ctx->eyePos.z));
+        shader->SetFloat(EV_waterlevel, ctx->waterLevel);
+        shader->SetBool(EV_isinterior, !ctx->cellHasWeather);
+        shader->SetBool(EV_isunderwater, ctx->isUnderwater);
     }
 }
 

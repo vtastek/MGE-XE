@@ -23,6 +23,7 @@ namespace LOG {
         Cat_HLSLReplay  = 1u << 4,  // CACHE HIT, Scene N draw, Bins, Lights, bindShaderTextures, SLOW REPLAY
         Cat_Mode3       = 1u << 5,  // forced LightMode3 packing/diag
         Cat_DistantLand = 1u << 6,  // [WVT] [WATER] [NVR] [N1-STORE] [PPDCAP] particles draw
+        Cat_SyncThread  = 1u << 7,  // [CPT] [SN1] [SYNC] [S0E] [S0GPU] sync mode threading
     };
     extern unsigned g_categoryMask;
     inline bool catEnabled(unsigned cat) { return (g_categoryMask & cat) != 0; }

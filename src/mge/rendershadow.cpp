@@ -21,15 +21,18 @@ static const float shadowFarRadius = 4000.0;
 // Applies filtering to soften shadow edges
 // This *must* restore render state on return
 void DistantLand::renderShadowMap(DLContext* ctx) {
+    LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] renderShadowMap ENTER");
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_ShadowMap, 0);
     IDirect3DSurface9* target, *targetSoft;
     texShadow->GetSurfaceLevel(0, &target);
     texSoftShadow->GetSurfaceLevel(0, &targetSoft);
+    LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] GetSurfaceLevel done");
 
     // Switch to render target
     RenderTargetSwitcher rtsw(targetSoft, surfShadowZ);
     D3DVIEWPORT9 vp;
     device->GetViewport(&vp);
+    LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] RT switch done");
 
     // Unbind shadow samplers
     effect->SetTexture(ehTex0, 0);
@@ -44,6 +47,7 @@ void DistantLand::renderShadowMap(DLContext* ctx) {
     device->SetStreamSource(0, vbFullFrame, 0, 12);
     device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
     effectShadow->EndPass();
+    LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] clear pass done");
 
     // Calculate transform to map view frustum into world space
     D3DXMATRIX inverseCameraProj, cameraViewProj;
@@ -51,10 +55,14 @@ void DistantLand::renderShadowMap(DLContext* ctx) {
     D3DXMatrixInverse(&inverseCameraProj, NULL, &cameraViewProj);
 
     // Render near layer (changes viewport)
+    LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] layer0 start");
     renderShadowLayer(ctx, 0, shadowNearRadius, &inverseCameraProj);
+    LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] layer0 done");
 
     // Render far layer (changes viewport)
+    LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] layer1 start");
     renderShadowLayer(ctx, 1, shadowFarRadius, &inverseCameraProj);
+    LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] layer1 done");
 
     // Reset viewport
     device->SetViewport(&vp);
@@ -98,10 +106,10 @@ void DistantLand::renderShadowLayerGeneric(DLContext* ctx, MWBridge* mwBridge, i
     device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 12);
     effectShadow->EndPass();
 
-    // Render land and statics
+    // Render land and statics (use ctx flag for N-1 thread safety)
     effectShadow->BeginPass(PASS_RENDERSHADOWMAP);
 
-    if (mwBridge->IsExterior()) {
+    if (ctx->isExterior) {
         renderDistantLand(ctx, effectShadow, view, proj);
     }
 
@@ -113,6 +121,7 @@ void DistantLand::renderShadowLayerGeneric(DLContext* ctx, MWBridge* mwBridge, i
 
 // renderShadowLayer - Calculates projection for, and renders, one shadow layer
 void DistantLand::renderShadowLayer(DLContext* ctx, int layer, float radius, const D3DXMATRIX* inverseCameraProj) {
+    LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] renderShadowLayer %d ENTER", layer);
     auto mwBridge = MWBridge::get();
     D3DXVECTOR3 lookAt, lookAtEye, shadowCameraPos, up(0, 0, 1);
     D3DXMATRIX* view = &ctx->smView[layer], *proj = &ctx->smProj[layer], *viewproj = &ctx->smViewproj[layer];
@@ -154,24 +163,39 @@ void DistantLand::renderShadowLayer(DLContext* ctx, int layer, float radius, con
     viewproj->_42 += quantizer * floor(dv.y / quantizer);
     viewproj->_43 += dv.z;
 
+    LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] layer %d matrix done", layer);
     effect->SetMatrixArray(ehShadowViewproj, viewproj, 1);
     effectShadow->CommitChanges();
 
     // Cull
     ViewFrustum range_frustum(viewproj);
 
+    // Use snapshotted worldSpace from ctx (thread-safe vs global race with selectDistantCell)
+    auto worldSpace = static_cast<const DistantLandShare::WorldSpace*>(ctx->worldSpace);
+
+    LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] layer %d sharedMem=%d worldSpace=%p", layer, Configuration.UseSharedMemory ? 1 : 0, (void*)worldSpace);
     if (Configuration.UseSharedMemory) {
+        LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] layer %d IPC RemoveAll", layer);
         visExtraShared.RemoveAll();
         // because shadow meshes don't need to be sorted, we can read and write in parallel
+        LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] layer %d IPC getVisibleMeshesCoarse", layer);
         ipcClient.getVisibleMeshesCoarse(visExtraSharedId, range_frustum, VIS_STATIC);
+        LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] layer %d IPC done, rendering", layer);
 
         renderShadowLayerGeneric(ctx, mwBridge, layer, inverseCameraProj, view, proj, visExtraShared);
+        LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] layer %d render done", layer);
     } else {
+        // Skip if worldSpace not loaded (e.g., during cell transition)
+        if (!worldSpace) {
+            LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] layer %d SKIP: ctx->worldSpace is NULL", layer);
+            return;
+        }
+
         VisibleSet<StlVector> visible_set((StlVector()));
 
-        DistantLandShare::currentWorldSpace->NearStatics->GetVisibleMeshesCoarse(range_frustum, visible_set);
-        DistantLandShare::currentWorldSpace->FarStatics->GetVisibleMeshesCoarse(range_frustum, visible_set);
-        DistantLandShare::currentWorldSpace->VeryFarStatics->GetVisibleMeshesCoarse(range_frustum, visible_set);
+        worldSpace->NearStatics->GetVisibleMeshesCoarse(range_frustum, visible_set);
+        worldSpace->FarStatics->GetVisibleMeshesCoarse(range_frustum, visible_set);
+        worldSpace->VeryFarStatics->GetVisibleMeshesCoarse(range_frustum, visible_set);
 
         renderShadowLayerGeneric(ctx, mwBridge, layer, inverseCameraProj, view, proj, visible_set);
     }

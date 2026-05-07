@@ -18,9 +18,9 @@ void DistantLand::renderWaterReflection(DLContext* ctx, const D3DXMATRIX* view, 
     RenderTargetSwitcher rtsw(texReflection, surfReflectionZ);
     device->Clear(0, NULL, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, ctx->horizonCol, 1.0, 0);
 
-    // Calculate reflected view matrix, mirror plane at water mesh level
+    // Calculate reflected view matrix, mirror plane at water mesh level (use ctx->waterLevel for N-1 safety)
     D3DXMATRIX reflView;
-    D3DXPLANE plane(0, 0, 1.0f, -(mwBridge->WaterLevel() - 1.0f));
+    D3DXPLANE plane(0, 0, 1.0f, -(ctx->waterLevel - 1.0f));
     D3DXMatrixReflect(&reflView, &plane);
     D3DXMatrixMultiply(&reflView, &reflView, view);
     effect->SetMatrix(ehView, &reflView);
@@ -33,8 +33,8 @@ void DistantLand::renderWaterReflection(DLContext* ctx, const D3DXMATRIX* view, 
     // Clipping setup
     D3DXMATRIX clipMat;
 
-    // Clip geometry on opposite side of water plane
-    plane *= mwBridge->IsUnderwater(ctx->eyePos.z) ? -1.0f : 1.0f;
+    // Clip geometry on opposite side of water plane (use ctx flags for N-1 thread safety)
+    plane *= ctx->isUnderwater ? -1.0f : 1.0f;
 
     // If using dynamic ripples, the water level can be lowered by up to 0.5 * waveheight
     // so move clip plane downwards at the cost of some reflection errors
@@ -67,8 +67,8 @@ void DistantLand::renderWaterReflection(DLContext* ctx, const D3DXMATRIX* view, 
     device->SetClipPlane(0, plane);
     device->SetRenderState(D3DRS_CLIPPLANEENABLE, 1);
 
-    // Rendering
-    if (mwBridge->IsExterior() && (Configuration.MGEFlags & REFLECTIVE_WATER)) {
+    // Rendering (use ctx flags for N-1 thread safety)
+    if (ctx->isExterior && (Configuration.MGEFlags & REFLECTIVE_WATER)) {
         // Draw land reflection, with opposite culling
         effect->BeginPass(PASS_RENDERLANDREFL);
         device->SetRenderState(D3DRS_CULLMODE, D3DCULL_CCW);
@@ -78,7 +78,7 @@ void DistantLand::renderWaterReflection(DLContext* ctx, const D3DXMATRIX* view, 
 
     if (isDistantCell() && (Configuration.MGEFlags & REFLECT_NEAR)) {
         // Draw statics reflection, with opposite culling and no dissolve
-        DWORD p = (mwBridge->CellHasWeather() && !mwBridge->IsUnderwater(ctx->eyePos.z)) ? PASS_RENDERSTATICSEXTERIOR : PASS_RENDERSTATICSINTERIOR;
+        DWORD p = (ctx->cellHasWeather && !ctx->isUnderwater) ? PASS_RENDERSTATICSEXTERIOR : PASS_RENDERSTATICSINTERIOR;
         effect->SetFloat(ehNearViewRange, 0);
         effect->BeginPass(p);
         device->SetRenderState(D3DRS_CULLMODE, D3DCULL_CCW);
@@ -88,7 +88,7 @@ void DistantLand::renderWaterReflection(DLContext* ctx, const D3DXMATRIX* view, 
     }
 
     const auto& activeSky = sky ? *sky : recordSky;
-    if ((Configuration.MGEFlags & REFLECT_SKY) && !activeSky.empty() && !mwBridge->IsUnderwater(ctx->eyePos.z)) {
+    if ((Configuration.MGEFlags & REFLECT_SKY) && !activeSky.empty() && !ctx->isUnderwater) {
         // Draw sky reflection, with opposite culling
         renderReflectedSky(ctx, activeSky);
     }
@@ -222,11 +222,17 @@ void DistantLand::renderReflectedStatics(DLContext* ctx, const D3DXMATRIX* view,
         ipcClient.waitForCompletion();
         visExtraShared.Render(device, effect, effect, &ehTex0, nullptr, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT);
     } else {
+        // Use snapshotted worldSpace from ctx (thread-safe vs global race with selectDistantCell)
+        auto worldSpace = static_cast<const DistantLandShare::WorldSpace*>(ctx->worldSpace);
+        if (!worldSpace) {
+            return;  // No worldSpace during cell transition
+        }
+
         VisibleSet<StlVector> visReflected((StlVector()));
 
-        DistantLandShare::currentWorldSpace->NearStatics->GetVisibleMeshes(range_frustum, viewsphere, visReflected);
-        DistantLandShare::currentWorldSpace->FarStatics->GetVisibleMeshes(range_frustum, viewsphere, visReflected);
-        DistantLandShare::currentWorldSpace->VeryFarStatics->GetVisibleMeshes(range_frustum, viewsphere, visReflected);
+        worldSpace->NearStatics->GetVisibleMeshes(range_frustum, viewsphere, visReflected);
+        worldSpace->FarStatics->GetVisibleMeshes(range_frustum, viewsphere, visReflected);
+        worldSpace->VeryFarStatics->GetVisibleMeshes(range_frustum, viewsphere, visReflected);
         visReflected.SortByState();
 
         device->SetVertexDeclaration(StaticDecl);
@@ -240,7 +246,8 @@ void DistantLand::clearReflection(DLContext* ctx) {
     DWORD baseColour;
 
     texReflection->GetSurfaceLevel(0, &target);
-    if (mwBridge->CellHasWeather() || mwBridge->IsUnderwater(ctx->eyePos.z)) {
+    // Use ctx flags for N-1 thread safety
+    if (ctx->cellHasWeather || ctx->isUnderwater) {
         // Use fog colour as reflection
         baseColour = (DWORD)ctx->horizonCol;
     } else {
@@ -453,7 +460,8 @@ void DistantLand::renderWaterPlane(DLContext* ctx) {
     D3DXMATRIX m;
     IDirect3DTexture9* texRefract = PostShaders::borrowBuffer(0);
 
-    D3DXMatrixTranslation(&m, ctx->eyePos.x, ctx->eyePos.y, MWBridge::get()->WaterLevel());
+    // Use ctx->waterLevel for N-1 thread safety
+    D3DXMatrixTranslation(&m, ctx->eyePos.x, ctx->eyePos.y, ctx->waterLevel);
     effect->SetMatrix(ehWorld, &m);
     effect->SetTexture(ehTex0, texReflection);
     effect->SetTexture(ehTex1, texWater);

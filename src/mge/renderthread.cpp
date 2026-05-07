@@ -67,6 +67,7 @@ void RenderThread::stop() {
 }
 
 void RenderThread::workerLoop() {
+    threadId = std::this_thread::get_id();  // Store thread ID for identification
     LOG::logline("-- RenderThread worker started");
 
     while (true) {
@@ -96,6 +97,13 @@ void RenderThread::workerLoop() {
             case WorkType::RenderStage0:
                 executeRenderStage0();
                 break;
+            case WorkType::RenderStage0Early:
+                LOG::logline("[RT] S0E_START");
+                g_renderThreadOwnsDevice.store(true, std::memory_order_release);
+                executeRenderStage0Early(work.useN1Buffer);
+                g_renderThreadOwnsDevice.store(false, std::memory_order_release);
+                LOG::logline("[RT] S0E_DONE");
+                break;
             case WorkType::RenderStage1:
                 executeRenderStage1(work.ctx);
                 break;
@@ -113,6 +121,11 @@ void RenderThread::workerLoop() {
                 if (ImGuiManager::GetStressAsyncDelay()) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 }
+                break;
+            case WorkType::RenderRemaining:
+                g_renderThreadOwnsDevice.store(true, std::memory_order_release);
+                executeRenderRemaining(work.useN1Buffer);
+                g_renderThreadOwnsDevice.store(false, std::memory_order_release);
                 break;
             case WorkType::Shutdown:
             case WorkType::None:
@@ -189,4 +202,14 @@ void RenderThread::executeFullFrame(int /*bufferIndex*/, bool useN1Buffer) {
     if (fullFrameLogCount <= 20) {
         LOG::logline("[RT] executeFullFrame: completed");
     }
+}
+
+void RenderThread::executeRenderStage0Early(bool useN1Buffer) {
+    MGE_ZoneScopedN("RT_Stage0Early");
+    FixedFunctionShader::renderStage0Early(useN1Buffer);
+}
+
+void RenderThread::executeRenderRemaining(bool useN1Buffer) {
+    MGE_ZoneScopedN("RT_RenderRemaining");
+    FixedFunctionShader::renderRemainingStages(useN1Buffer);
 }

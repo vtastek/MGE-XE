@@ -148,6 +148,7 @@ DLContext DistantLand::s_staging = {
     {}, {},                                              // eyeVec, eyePos
     0,                                                   // postEnvFlags
     -1e9f,                                               // waterLevel
+    nullptr, false,                                      // worldSpace, hasWorldSpace
     {}, {},                                              // sunVec, sunPos
     0,                                                   // sunVis
     {}, {}, {},                                          // sunCol, sunAmb, ambCol
@@ -162,7 +163,8 @@ DLContext DistantLand::s_staging = {
     0, 0,                                                // windScaling, niceWeather
     0, 0,                                                // lightSunMult, lightAmbMult
     {}, {}, {},                                          // smView[2], smProj[2], smViewproj[2]
-    false, false                                         // isRenderCached, isPPLActive
+    false, false,                                        // isRenderCached, isPPLActive
+    false, false, false, false, false                    // cellHasWater, cellHasWeather, isExterior, isUnderwater, isMenu
 };
 
 D3DXHANDLE DistantLand::ehRcpRes;

@@ -424,7 +424,7 @@ FixedFunctionShader::ShaderKey FixedFunctionShader::computeShaderKeyWithSuffixes
 // HLSL Pipeline Implementation
 void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, int recordMWIdx) {
     // Skip if we're in replay mode to avoid recursion
-    if (isReplaying) {
+    if (isReplaying.load(std::memory_order_acquire)) {
         // During replay mode, perform actual rendering with this specific call
         renderMorrowindHLSL_Internal(rs, frs, lightrs);
         return;
@@ -433,7 +433,7 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
     // Start recording at first HLSL call if not already recording (unless under manual control or disabled)
     // Recording happens for ALL modes (standard, PPL, HLSL) - renderStageBlend is designed to run
     // before replay, compositing distant land based on depth before the scene is drawn.
-    if (!isRecording && !isReplaying && !manualRecordingControl && recordingEnabled && !recordingCompletedThisFrame && ImGuiManager::GetEnableRecording()) {
+    if (!isRecording.load(std::memory_order_acquire) && !isReplaying.load(std::memory_order_acquire) && !manualRecordingControl && recordingEnabled && !recordingCompletedThisFrame && ImGuiManager::GetEnableRecording()) {
         startRecording();
     }
 
@@ -446,12 +446,12 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
     }
     if (currentRecordingScene > 0 && scene12RecLogCount < 3) {
         LOG_CAT(LOG::Cat_HLSLReplay, "Scene %d draw: isRecording=%d, enableRec=%d",
-            currentRecordingScene, isRecording, ImGuiManager::GetEnableRecording());
+            currentRecordingScene, isRecording.load(std::memory_order_relaxed), ImGuiManager::GetEnableRecording());
         scene12RecLogCount++;
     }
 
     // If recording is active, record the call for batched replay
-    if (isRecording && ImGuiManager::GetEnableRecording()) {
+    if (isRecording.load(std::memory_order_acquire) && ImGuiManager::GetEnableRecording()) {
         // Create a copy of rs and add CURRENT shadow world-view-projection matrices for this draw call
         // During recording, use current matrices; during replay, these will be the "recorded" matrices
         RenderedState rsWithShadows = *rs;
@@ -548,7 +548,7 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
 
     // Get ShaderKey with texture suffix detection
     ShaderKey sk;
-    if (isReplaying) {
+    if (isReplaying.load(std::memory_order_acquire)) {
         // During replay, use the recorded ShaderKey with original suffix flags
         // Select buffer based on mode: N-1 uses prepBuffer, N-2 uses renderBuffer
         auto& fb = usingN1Buffer ? getPrepBuffer() : getRenderingBuffer();
@@ -817,7 +817,7 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     // During replay, device may have UI view — use recorded game view instead
     // Select buffer based on mode: N-1 uses prepBuffer, N-2 uses renderBuffer
     D3DXMATRIX currentView;
-    if (isReplaying) {
+    if (isReplaying.load(std::memory_order_acquire)) {
         auto& fb = usingN1Buffer ? getPrepBuffer() : getRenderingBuffer();
         currentView = fb.currentView;
     } else {
@@ -985,7 +985,7 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     // During replay, use ALL recorded matrices to avoid stale matrix issues
     // During normal rendering, get them from the device
     // Select buffer based on mode: N-1 uses prepBuffer, N-2 uses renderBuffer
-    if (isReplaying) {
+    if (isReplaying.load(std::memory_order_acquire)) {
         auto& fb = usingN1Buffer ? getPrepBuffer() : getRenderingBuffer();
         projMatrix = fb.currentProj;
         viewMatrix = fb.currentView;
@@ -998,7 +998,7 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
 
     // During replay, use recorded combined matrices; during normal rendering, calculate them
     D3DXMATRIX worldViewProj, worldView;
-    if (isReplaying) {
+    if (isReplaying.load(std::memory_order_acquire)) {
         // Use precomputed worldViewTransforms from recording time - this has the CORRECT view matrix
         // that was active when MW issued this draw call. Recomputing with frameBuffer view would
         // use the wrong view if buffer indices rotated.
@@ -1076,7 +1076,7 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
 
         if (hlslShader.regShadowWorldViewProj.reg != REG_INVALID) {
             D3DXMATRIX shadowWVP[2];
-            if (isReplaying && s_activeShadowVP) {
+            if (isReplaying.load(std::memory_order_acquire) && s_activeShadowVP) {
                 shadowWVP[0] = rs->worldTransforms[0] * s_activeShadowVP[0];
                 shadowWVP[1] = rs->worldTransforms[0] * s_activeShadowVP[1];
             } else {
@@ -1144,7 +1144,7 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             }
 
             if (hlslShader.hShadowWorldViewProj) {
-                if (isReplaying && s_activeShadowVP) {
+                if (isReplaying.load(std::memory_order_acquire) && s_activeShadowVP) {
                     D3DXMATRIX currentShadowWVP[2];
                     currentShadowWVP[0] = rs->worldTransforms[0] * s_activeShadowVP[0];
                     currentShadowWVP[1] = rs->worldTransforms[0] * s_activeShadowVP[1];
@@ -1754,7 +1754,7 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         device->SetPixelShader(NULL);
 
         // During replay, texture slots are managed by bindShaderTextures
-        if (!isReplaying) {
+        if (!isReplaying.load(std::memory_order_acquire)) {
             FixedFunctionShader::setCachedTexture(device, 2, nullptr);
             FixedFunctionShader::setCachedTexture(device, 3, nullptr);
             FixedFunctionShader::setCachedTexture(device, 4, nullptr);
@@ -1810,7 +1810,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
         }
     }
 
-    isReplaying = true;
+    isReplaying.store(true, std::memory_order_release);
 
     // Save render states before replay to restore after (replay skips per-call restore)
     DWORD savedAlphaBlend = 0, savedAlphaTest = 0, savedZEnable = 0, savedZWrite = 0, savedZFunc = 0;
@@ -3642,5 +3642,5 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
         device->SetRenderState(D3DRS_EMISSIVEMATERIALSOURCE, savedEmissiveMat);
     }
 
-    isReplaying = false;
+    isReplaying.store(false, std::memory_order_release);
 }
