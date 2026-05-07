@@ -111,6 +111,7 @@ struct ConfigurationStruct {
     int OcclusionHysteresisFrames;  // consecutive OCCLUDED frames before a static actually culls
     float OcclusionSphereInflate;   // per-instance sphere/OBB radius scale for verdict stability
     bool LogDistantPipeline;        // gate per-frame diagnostic loglines + phase-timer reports + Numpad-5 mask dump
+    bool UseSceneGraphSnapshot;     // enable MGE-side per-frame scene-graph walk (drives the texture-light variant of FFE)
 
     struct {
         float zoom, zoomRate, zoomRateTarget;

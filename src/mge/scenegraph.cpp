@@ -15,6 +15,7 @@
 
 #include <cmath>
 
+#include "configuration.h"
 #include "datahandler_view.h"
 #include "scenegraph.h"
 
@@ -199,6 +200,20 @@ namespace MGE::SceneGraph {
 
     void onFrameReady() {
         if (!g_dataHandler) return;
+
+        // Default-off: ensure the walk has zero overhead on installs that
+        // haven't opted in. When the flag is off, output caches are kept
+        // empty so consumers (FFE texture-light variant) never activate.
+        if (!Configuration.UseSceneGraphSnapshot) {
+            if (!g_pinned.empty() || !g_nodes.empty() || !g_lights.empty() || !g_pointLights.empty()) {
+                g_pinned.clear();
+                g_nodes.clear();
+                g_lights.clear();
+                g_pointLights.clear();
+                ++g_frameRevision;
+            }
+            return;
+        }
 
         if (needsRebuild()) {
             rebuild();

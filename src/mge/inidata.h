@@ -146,6 +146,7 @@ const iniSetting iniSettings[] = {
     {&Configuration.OcclusionHysteresisFrames, t_int32, 1, siniMisc, "Occlusion Hysteresis Frames", "8", NULL, MINMAX, 1, 30},
     {&Configuration.OcclusionSphereInflate, t_float, 1, siniMisc, "Occlusion Sphere Inflate", "1.15", NULL, MINMAX, 1.0, 3.0},
     {&Configuration.LogDistantPipeline, t_bool, 1, siniMisc, "Log Distant Pipeline", False, &dictBool, DICTONLY, 0, 0},
+    {&Configuration.UseSceneGraphSnapshot, t_bool, 1, siniMisc, "Use Scene Graph Snapshot", False, &dictBool, DICTONLY, 0, 0},
 
     // Distant Land flags
     {&Configuration.MGEFlags, t_bit, USE_DISTANT_LAND_BIT, siniDL, "Distant Land", True, &dictBool, DICTONLY, 0, 0},
