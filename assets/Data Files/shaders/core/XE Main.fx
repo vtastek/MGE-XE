@@ -52,6 +52,38 @@ float4 MGEBlendPS(DeferredOut IN) : COLOR0 {
 }
 
 //------------------------------------------------------------
+// Water reflection occlusion mask
+
+struct ReflectionMaskOut {
+    float4 pos : POSITION;
+    float4 tex : TEXCOORD0;
+    float3 eye : TEXCOORD1;
+};
+
+ReflectionMaskOut ReflectionMaskVS(float4 pos : POSITION) {
+    ReflectionMaskOut OUT;
+    float2 ndc = pos.xy;
+
+    OUT.pos = float4(ndc, 0, 1);
+    OUT.tex = float4(0.5 + float2(0.5, -0.5) * ndc, 0, 0);
+
+    OUT.eye = float3(view[0][2], view[1][2], view[2][2]);
+    OUT.eye += (ndc.x / proj[0][0]) * float3(view[0][0], view[1][0], view[2][0]);
+    OUT.eye += (ndc.y / proj[1][1]) * float3(view[0][1], view[1][1], view[2][1]);
+    return OUT;
+}
+
+float4 ReflectionMaskPS(ReflectionMaskOut IN) : COLOR0 {
+    float sceneDepth = tex2Dlod(sampDepthPoint, IN.tex).r;
+    float waterDepth = (reflectionWaterLevel - eyePos.z) / IN.eye.z;
+
+    clip(nearViewRange + 64.0 - sceneDepth);
+    clip(waterDepth);
+    clip(waterDepth - sceneDepth);
+    return 0;
+}
+
+//------------------------------------------------------------
 // Dynamic waves simulation
 
 struct WaveVertOut
@@ -267,6 +299,52 @@ Technique T0 {
         PixelShader = compile ps_3_0 LandscapePS();
     }
     //------------------------------------------------------------
+    // Used to render the landscape reflection without pancaked depth
+    Pass P3ro {
+        ZEnable = true;
+        ZWriteEnable = true;
+        ZFunc = LessEqual;
+        CullMode = CCW;
+
+        AlphaBlendEnable = false;
+        AlphaTestEnable = false;
+
+        VertexShader = compile vs_3_0 LandscapeReflOldVS();
+        PixelShader = compile ps_3_0 LandscapePS();
+    }
+    //------------------------------------------------------------
+    // Used for rendering reflected statics in exteriors, with depth pancaked to water
+    Pass P4extr {
+        ZEnable = true;
+        ZWriteEnable = true;
+        ZFunc = LessEqual;
+        CullMode = CW;
+
+        AlphaBlendEnable = false;
+        AlphaTestEnable = true;
+        AlphaFunc = GreaterEqual;
+        AlphaRef = 133;
+
+        VertexShader = compile vs_3_0 StaticExteriorReflVS();
+        PixelShader = compile ps_3_0 StaticPS();
+    }
+    //------------------------------------------------------------
+    // Used for rendering reflected statics in interiors, with depth pancaked to water
+    Pass P4intr {
+        ZEnable = true;
+        ZWriteEnable = true;
+        ZFunc = LessEqual;
+        CullMode = CW;
+
+        AlphaBlendEnable = false;
+        AlphaTestEnable = true;
+        AlphaFunc = GreaterEqual;
+        AlphaRef = 133;
+
+        VertexShader = compile vs_3_0 StaticInteriorReflVS();
+        PixelShader = compile ps_3_0 StaticPS();
+    }
+    //------------------------------------------------------------
     // Used for rendering distant statics in exteriors
     Pass P4ext {
         ZEnable = true;
@@ -443,6 +521,20 @@ Technique T0 {
 
         VertexShader = compile vs_3_0 NullVS();
         PixelShader = compile ps_3_0 NullPS();
+    }
+    //------------------------------------------------------------
+    // Used to prefill reflection Z where main-view early-Z hides water
+    Pass P13 {
+        ZEnable = true;
+        ZWriteEnable = true;
+        ZFunc = Always;
+        CullMode = none;
+        AlphaBlendEnable = false;
+        AlphaTestEnable = false;
+        ColorWriteEnable = 0;
+
+        VertexShader = compile vs_3_0 ReflectionMaskVS();
+        PixelShader = compile ps_3_0 ReflectionMaskPS();
     }
     //------------------------------------------------------------
 }

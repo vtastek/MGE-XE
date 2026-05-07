@@ -168,6 +168,7 @@ bool ImGuiManager::stateSuppression = false;
 bool ImGuiManager::syncGpuThread = true;
 bool ImGuiManager::asyncGpuThread = false;
 bool ImGuiManager::enableEarlyZ = true;
+bool ImGuiManager::pancakedReflections = true;
 int ImGuiManager::cmdBufferCmdCount = 0;
 int ImGuiManager::cmdBufferSizeKB = 0;
 int ImGuiManager::cmdStagePreScene = 0;
@@ -763,6 +764,15 @@ void ImGuiManager::RenderDebugInterface() {
         ImGui::SetItemTooltip("Submit GPU work to render thread at Present(). Auto-enables suppression. Wait at UI BeginScene.");
         ImGui::Checkbox("Early-Z Depth Pass", &enableEarlyZ);
         ImGui::SetItemTooltip("Render MW depth before Stage0GPU for early-Z rejection of distant land.");
+        ImGui::Checkbox("Pancaked Reflections", &pancakedReflections);
+        ImGui::SetItemTooltip("Project reflected land/statics depth onto the water plane for reflection early-Z. Disable for old reflections.");
+        if (ImGui::Button("Old Reflections")) {
+            pancakedReflections = false;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("New Reflections")) {
+            pancakedReflections = true;
+        }
         if (cmdBufferRecording || cmdBufferReplay) {
             ImGui::Text("  Commands: %d  Size: %d KB", cmdBufferCmdCount, cmdBufferSizeKB);
             ImGui::Text("  Pre:%d S0:%d Inter:%d S1/2:%d UI:%d",

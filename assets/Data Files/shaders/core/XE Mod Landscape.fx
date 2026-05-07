@@ -15,6 +15,14 @@ TransformedVert transformLandVert(float4 pos) {
     return v;
 }
 
+TransformedVert transformLandVertReflection(float4 pos) {
+    TransformedVert v;
+
+    v.viewpos = mul(mul(pos, world), reflectionView);
+    v.pos = pancakeReflectionClip(mul(v.viewpos, reflectionProj));
+    return v;
+}
+
 //------------------------------------------------------------
 // Distant land height bias to prevent low lod meshes from clipping
 
@@ -65,6 +73,24 @@ LandVertOut LandscapeReflVS(float4 pos : POSITION, float2 texcoord : TEXCOORD0) 
     pos.z += -16 * saturate(1 - pos.z/16);
 
     // Transforms
+    TransformedVert v = transformLandVertReflection(pos);
+    OUT.pos = v.pos;
+    OUT.texcoord = texcoord;
+    return OUT;
+}
+
+LandVertOut LandscapeReflOldVS(float4 pos : POSITION, float2 texcoord : TEXCOORD0) {
+    LandVertOut OUT;
+
+    float3 eyevec = mul(pos, world).xyz - eyePos.xyz;
+    float dist = length(eyevec);
+    if(isAboveSeaLevel(eyePos))
+        OUT.fog = fogColour(eyevec / dist, dist);
+    else
+        OUT.fog = fogMWColour(dist);
+
+    pos.z += -16 * saturate(1 - pos.z/16);
+
     TransformedVert v = transformLandVert(pos);
     OUT.pos = v.pos;
     OUT.texcoord = texcoord;

@@ -11,6 +11,8 @@
 shared float2 rcpRes;
 shared float shadowRcpRes;
 shared matrix world, view, proj;
+shared matrix reflectionView, reflectionProj;
+shared float reflectionWaterLevel;
 shared matrix vertexBlendPalette[4];
 shared matrix prevVertexBlendPalette[4];  // Previous frame's worldview for velocity
 shared matrix shadowViewProj[2];
@@ -120,6 +122,23 @@ struct TransformedVert {
     float4 viewpos;
     float4 normal;
 };
+
+float4 pancakeReflectionClip(float4 reflClip) {
+    float2 ndc = reflClip.xy / reflClip.w;
+
+    float3 ray = float3(view[0][2], view[1][2], view[2][2]);
+    ray += (ndc.x / proj[0][0]) * float3(view[0][0], view[1][0], view[2][0]);
+    ray += (ndc.y / proj[1][1]) * float3(view[0][1], view[1][1], view[2][1]);
+
+    float waterDepth = (reflectionWaterLevel - eyePos.z) / ray.z;
+    float4 waterView = float4(ndc.x * waterDepth / proj[0][0],
+                              ndc.y * waterDepth / proj[1][1],
+                              waterDepth, 1);
+    float4 waterClip = mul(waterView, proj);
+
+    reflClip.z = (waterClip.z / waterClip.w) * reflClip.w;
+    return reflClip;
+}
 
 //------------------------------------------------------------
 // Suppress warning X3205: conversion from larger type to smaller, possible loss of data

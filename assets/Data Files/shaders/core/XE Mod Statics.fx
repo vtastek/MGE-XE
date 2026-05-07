@@ -22,6 +22,16 @@ TransformedVert transformStaticVert(StatVertIn IN) {
     return v;
 }
 
+TransformedVert transformStaticVertReflection(StatVertIn IN) {
+    TransformedVert v;
+
+    v.worldpos = mul(IN.pos, world);
+    v.viewpos = mul(v.worldpos, reflectionView);
+    v.pos = pancakeReflectionClip(mul(v.viewpos, reflectionProj));
+
+    return v;
+}
+
 float4 lightStaticVert(StatVertIn IN) {
     // Decompress normal
     float4 normal = float4(normalize(2 * IN.normal.xyz - 1), 0);
@@ -89,6 +99,41 @@ StatVertOut StaticInteriorVS (StatVertIn IN) {
 #endif
 
     // Fogging (interior)
+    float dist = length(v.viewpos.xyz);
+    OUT.fog = fogMWColour(dist);
+
+    OUT.texcoords_range = float3(texcoordsModifier(IN), dist);
+    return OUT;
+}
+
+StatVertOut StaticExteriorReflVS(StatVertIn IN) {
+    StatVertOut OUT;
+    TransformedVert v = transformStaticVertReflection(IN);
+    OUT.pos = v.pos;
+#ifdef USE_HLSL_PIPELINE
+    OUT.color = lightStaticVertHLSL(IN, OUT.normalEmissive);
+#else
+    OUT.color = lightStaticVert(IN);
+#endif
+
+    float3 eyevec = v.worldpos.xyz - eyePos.xyz;
+    float dist = length(eyevec);
+    OUT.fog = fogColour(eyevec / dist, dist);
+
+    OUT.texcoords_range = float3(texcoordsModifier(IN), dist);
+    return OUT;
+}
+
+StatVertOut StaticInteriorReflVS(StatVertIn IN) {
+    StatVertOut OUT;
+    TransformedVert v = transformStaticVertReflection(IN);
+    OUT.pos = v.pos;
+#ifdef USE_HLSL_PIPELINE
+    OUT.color = lightStaticVertHLSL(IN, OUT.normalEmissive);
+#else
+    OUT.color = lightStaticVert(IN);
+#endif
+
     float dist = length(v.viewpos.xyz);
     OUT.fog = fogMWColour(dist);
 

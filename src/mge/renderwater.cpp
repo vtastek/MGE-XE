@@ -17,18 +17,41 @@ void DistantLand::renderWaterReflection(DLContext* ctx, const D3DXMATRIX* view, 
     // Switch to render target
     RenderTargetSwitcher rtsw(texReflection, surfReflectionZ);
     device->Clear(0, NULL, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, ctx->horizonCol, 1.0, 0);
+    const bool usePancakedReflections = ImGuiManager::GetPancakedReflections();
+    effect->SetFloat(ehReflectionWaterLevel, ctx->waterLevel);
+
+    // Use the early-Z depth texture to prefill reflection Z where main-view
+    // geometry is in front of the water plane. Reflected draws then reject
+    // those pixels before running their expensive pixel shaders.
+    if (usePancakedReflections && !ctx->isUnderwater && ImGuiManager::GetEnableEarlyZ()) {
+        effect->SetTexture(ehTex3, texDepthFrame);
+        effect->CommitChanges();
+        effect->BeginPass(PASS_REFLECTIONMASK);
+        device->SetVertexDeclaration(WaterDecl);
+        device->SetStreamSource(0, vbFullFrame, 0, 12);
+        device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+        effect->EndPass();
+        device->SetRenderState(D3DRS_COLORWRITEENABLE,
+            D3DCOLORWRITEENABLE_RED | D3DCOLORWRITEENABLE_GREEN |
+            D3DCOLORWRITEENABLE_BLUE | D3DCOLORWRITEENABLE_ALPHA);
+    }
 
     // Calculate reflected view matrix, mirror plane at water mesh level (use ctx->waterLevel for N-1 safety)
     D3DXMATRIX reflView;
     D3DXPLANE plane(0, 0, 1.0f, -(ctx->waterLevel - 1.0f));
     D3DXMatrixReflect(&reflView, &plane);
     D3DXMatrixMultiply(&reflView, &reflView, view);
-    effect->SetMatrix(ehView, &reflView);
 
     // Calculate new projection
     D3DXMATRIX reflProj = *proj;
     editProjectionZ(&reflProj, 4.0, Configuration.DL.DrawDist * kCellSize);
-    effect->SetMatrix(ehProj, &reflProj);
+    if (usePancakedReflections) {
+        effect->SetMatrix(ehReflectionView, &reflView);
+        effect->SetMatrix(ehReflectionProj, &reflProj);
+    } else {
+        effect->SetMatrix(ehView, &reflView);
+        effect->SetMatrix(ehProj, &reflProj);
+    }
 
     // Clipping setup
     D3DXMATRIX clipMat;
@@ -70,7 +93,7 @@ void DistantLand::renderWaterReflection(DLContext* ctx, const D3DXMATRIX* view, 
     // Rendering (use ctx flags for N-1 thread safety)
     if (ctx->isExterior && (Configuration.MGEFlags & REFLECTIVE_WATER)) {
         // Draw land reflection, with opposite culling
-        effect->BeginPass(PASS_RENDERLANDREFL);
+        effect->BeginPass(usePancakedReflections ? PASS_RENDERLANDREFL : PASS_RENDERLANDREFLOLD);
         device->SetRenderState(D3DRS_CULLMODE, D3DCULL_CCW);
         renderDistantLand(ctx, effect, &reflView, &reflProj);
         effect->EndPass();
@@ -78,7 +101,12 @@ void DistantLand::renderWaterReflection(DLContext* ctx, const D3DXMATRIX* view, 
 
     if (isDistantCell() && (Configuration.MGEFlags & REFLECT_NEAR)) {
         // Draw statics reflection, with opposite culling and no dissolve
-        DWORD p = (ctx->cellHasWeather && !ctx->isUnderwater) ? PASS_RENDERSTATICSEXTERIOR : PASS_RENDERSTATICSINTERIOR;
+        DWORD p;
+        if (ctx->cellHasWeather && !ctx->isUnderwater) {
+            p = usePancakedReflections ? PASS_RENDERSTATICSEXTERIORREFL : PASS_RENDERSTATICSEXTERIOR;
+        } else {
+            p = usePancakedReflections ? PASS_RENDERSTATICSINTERIORREFL : PASS_RENDERSTATICSINTERIOR;
+        }
         effect->SetFloat(ehNearViewRange, 0);
         effect->BeginPass(p);
         device->SetRenderState(D3DRS_CULLMODE, D3DCULL_CCW);
@@ -90,6 +118,8 @@ void DistantLand::renderWaterReflection(DLContext* ctx, const D3DXMATRIX* view, 
     const auto& activeSky = sky ? *sky : recordSky;
     if ((Configuration.MGEFlags & REFLECT_SKY) && !activeSky.empty() && !ctx->isUnderwater) {
         // Draw sky reflection, with opposite culling
+        effect->SetMatrix(ehView, &reflView);
+        effect->SetMatrix(ehProj, &reflProj);
         renderReflectedSky(ctx, activeSky);
     }
 
