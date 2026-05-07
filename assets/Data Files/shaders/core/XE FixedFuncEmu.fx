@@ -83,14 +83,10 @@ static const int LGs = max(1, ceil(FFE_LIGHTS_ACTIVE / 4.0));
 // upstream.
 //
 // Wire format per light (3 texels, R32G32B32A32F):
-//   texel 0: (posX, posY, posZ, ambient)  — view-space pos + per-light ambient
-//   texel 1: (diffR, diffG, diffB, _)     — engine-derived diffuse (× dimmer)
+//   texel 0: (posX, posY, posZ, _)        — view-space position (.w reserved)
+//   texel 1: (diffR, diffG, diffB, _)     — raw NI diffuse × dimmer
 //   texel 2: (k0, k1, k2, radius)         — falloff const/lin/quad + radius
 //
-// Texel-0.w carries the engine-derived per-light ambient term so the
-// textured path matches the constant-array path's
-// (lambert + ambient) * att behaviour for MCP magic / spell-effect
-// lights (where bufferAmbient is non-zero).
 // Texel-2.w carries Bethesda's modder-set radius (NI::Light::specular.r).
 // The shader uses it as the inner edge of a smoothstep window that
 // drives attenuation to exactly 0 at 2×radius, masking the seam from
@@ -143,7 +139,6 @@ float3 evaluatePointLightsTextured(float3 viewPos, float3 normal) {
         float4 pos     = tex2Dlod(LightDataSampler, float4(u0, 0.5, 0, 0));
         float4 color   = tex2Dlod(LightDataSampler, float4(u1, 0.5, 0, 0));
         float4 falloff = tex2Dlod(LightDataSampler, float4(u2, 0.5, 0, 0));
-        float ambient  = pos.w;
         float radius   = falloff.w;
 
         float3 toLight = pos.xyz - viewPos;
@@ -173,10 +168,11 @@ float3 evaluatePointLightsTextured(float3 viewPos, float3 normal) {
         // so skip forming the explicit L vector — saves a vec3 divide.
         float lambert = saturate(dot(normal, toLight) * invDist);
 
-        // (lambert + ambient) * att * color — mirrors calcLighting4's
-        // (lambert + lightAmbient[group]) * att for parity with the
-        // constant-array path on MCP magic / spell-effect lights.
-        acc += (lambert + ambient) * att * color.rgb;
+        // Standard 1/(k0 + k2·d²) attenuation × Lambert × diffuse.
+        // No per-light ambient term: NI fields are raw (no engine
+        // markers to interpret), so the constant-array path's
+        // bufferAmbient correction does not apply here.
+        acc += lambert * att * color.rgb;
     }
     return acc;
 }

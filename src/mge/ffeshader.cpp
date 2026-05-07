@@ -509,18 +509,13 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
                     D3DXVec3TransformCoord(&viewPos, &s_lightWorldPos[i], &rs->viewTransform);
 
                     const unsigned int t = i * kTexelsPerLight * 4;
-                    // Texel 0: view-space position + per-light ambient (.w).
-                    // The .w slot carries the engine-derived per-light ambient
-                    // term — the shader's textured lighting equation uses
-                    // (lambert + ambient) * att * diffuse to match the
-                    // constant-array path's behaviour for MCP magic / spell
-                    // lights (where bufferAmbient was non-zero).
+                    // Texel 0: view-space position. The .w slot is reserved
+                    // (memset-zeroed above); shader does not read it.
                     dst[t + 0] = viewPos.x;
                     dst[t + 1] = viewPos.y;
                     dst[t + 2] = viewPos.z;
-                    dst[t + 3] = pl.ambient;
-                    // Texel 1: diffuse (already pre-multiplied by dimmer +
-                    // engine branching in SceneGraph::extractPointLight).
+                    // Texel 1: diffuse (raw NI::Light::diffuse * dimmer,
+                    // packed by SceneGraph::extractPointLight).
                     dst[t + 4] = pl.diffuse[0];
                     dst[t + 5] = pl.diffuse[1];
                     dst[t + 6] = pl.diffuse[2];

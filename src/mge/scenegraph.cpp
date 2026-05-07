@@ -13,11 +13,10 @@
 #include "NIPointer.h"
 #include "NIRTTIDefines.h"
 
-#include <cmath>
-
 #include "configuration.h"
 #include "datahandler_view.h"
 #include "scenegraph.h"
+#include "support/log.h"
 
 namespace MGE::SceneGraph {
 
@@ -38,10 +37,17 @@ namespace MGE::SceneGraph {
         // Lua scripts detach the underlying engine objects mid-frame.
         std::vector<NI::Pointer<NI::AVObject>> g_pinned;
 
-        // Mirrors the engine's per-light falloff branching from master's
-        // ffeshader.cpp constant-array path. NI::PointLight gives us the
-        // raw attenuation values; the engine interprets them as four
-        // distinct light kinds based on which fields are non-zero.
+        // Ships raw NI::PointLight fields. NO engine-state branching —
+        // the magic patterns master's constant-array path decodes
+        // (`{0, 0.1, 0}` projectile, `{0, k1, 0}` spell, `{0, 0, k2}`
+        // MCP magic) are markers Morrowind sets on D3DLIGHT9 state via
+        // SetLight, not on the raw NI fields. Pattern-matching on raw
+        // NI values misclassifies static lanterns on installs whose
+        // Morrowind.ini favours linear-dominant falloff (a common
+        // configuration). msoc-plugin's deleted producer + 7d49548's
+        // texture-light shader both shipped raw fields and applied
+        // the standard 1/(k0 + k1·d + k2·d²) formula directly; that's
+        // what we mirror here.
         PointLight extractPointLight(const NI::PointLight* pl) {
             PointLight out{};
 
@@ -49,53 +55,14 @@ namespace MGE::SceneGraph {
             out.worldPos[1] = pl->worldTransform.translation.y;
             out.worldPos[2] = pl->worldTransform.translation.z;
 
-            const float k0     = pl->constantAttenuation;
-            const float k1     = pl->linearAttenuation;
-            const float k2     = pl->quadraticAttenuation;
             const float dimmer = pl->dimmer;
-
             out.diffuse[0] = pl->diffuse.r * dimmer;
             out.diffuse[1] = pl->diffuse.g * dimmer;
             out.diffuse[2] = pl->diffuse.b * dimmer;
-            out.ambient    = 0.0f;
-            out.falloff[0] = k0;
-            out.falloff[1] = k1;
-            out.falloff[2] = k2;
 
-            if (k0 > 0.0f) {
-                // Standard point light source — pass-through.
-            } else if (k2 > 0.0f) {
-                // Morrowind-Code-Patch magic light (only quadratic set).
-                // Engine path uses the carryover bufferFalloffConstant from
-                // the previous standard light; we use the same default it
-                // initialises to (0.33).
-                constexpr float kMcpDefaultK0 = 0.33f;
-                out.diffuse[0] *= kMcpDefaultK0;
-                out.diffuse[1] *= kMcpDefaultK0;
-                out.diffuse[2] *= kMcpDefaultK0;
-                out.ambient    = 1.0f + 1e-4f / std::sqrt(k2);
-                out.falloff[0] = kMcpDefaultK0;
-                out.falloff[1] = 0.0f;
-                out.falloff[2] = kMcpDefaultK0 * k2;
-            } else if (k1 == 0.10000001f) {
-                // Projectile light — engine sets exactly { 0, 3*(1/30), 0 }.
-                // Replacement falloff is significantly brighter to look cool.
-                out.falloff[0] = 0.0f;
-                out.falloff[1] = 0.0f;
-                out.falloff[2] = 5e-5f;
-            } else if (k1 > 0.0f) {
-                // Light-magic spell effect: { 0, 3 / (22 * magnitude), 0 }.
-                // Approximated as half-lambert weight + quadratic falloff.
-                const float brightness = 0.25f + 1e-4f / k1;
-                out.diffuse[0]  = brightness;
-                out.diffuse[1]  = brightness;
-                out.diffuse[2]  = brightness;
-                out.ambient     = 1.0f;
-                out.falloff[0]  = 0.0f;
-                out.falloff[1]  = 0.0f;
-                out.falloff[2]  = 0.5555f * k1 * k1;
-                out.worldPos[2] += 25.0f;  // lift out of ground embedment
-            }
+            out.falloff[0] = pl->constantAttenuation;
+            out.falloff[1] = pl->linearAttenuation;
+            out.falloff[2] = pl->quadraticAttenuation;
 
             // Bethesda overloads NI::Light::specular.r as the modder-set
             // fade radius (verified by NIPointLight.h:28 comment).
@@ -191,7 +158,11 @@ namespace MGE::SceneGraph {
     }
 
     void setDataHandler(void* dh) {
+        const bool firstStamp = (g_dataHandler == nullptr) && (dh != nullptr);
         g_dataHandler = dh;
+        if (firstStamp) {
+            LOG::logline("-- [SCENEGRAPH] DataHandler stamped: %p", dh);
+        }
     }
 
     void* getDataHandler() {
@@ -217,6 +188,14 @@ namespace MGE::SceneGraph {
 
         if (needsRebuild()) {
             rebuild();
+
+            static uint64_t s_lastLoggedRev = (uint64_t)-1;
+            if (g_frameRevision != s_lastLoggedRev && (g_frameRevision % 30) == 0) {
+                LOG::logline("-- [SCENEGRAPH] rev=%llu nodes=%zu lights=%zu pointLights=%zu",
+                    (unsigned long long)g_frameRevision,
+                    g_nodes.size(), g_lights.size(), g_pointLights.size());
+                s_lastLoggedRev = g_frameRevision;
+            }
         } else {
             ++g_framesSinceLastWalk;
         }
