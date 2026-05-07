@@ -65,7 +65,7 @@
       <WarningLevel>Level3</WarningLevel>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <Optimization>Disabled</Optimization>
-      <AdditionalIncludeDirectories>./src</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>./src;..\MWSE\MWSE\SharedSE;..\MWSE\MWSE\deps\span-lite</AdditionalIncludeDirectories>
       <EnableEnhancedInstructionSet>StreamingSIMDExtensions2</EnableEnhancedInstructionSet>
       <FloatingPointModel>Fast</FloatingPointModel>
       <EnforceTypeConversionRules>true</EnforceTypeConversionRules>
@@ -90,7 +90,7 @@
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <EnableEnhancedInstructionSet>StreamingSIMDExtensions2</EnableEnhancedInstructionSet>
       <FloatingPointModel>Fast</FloatingPointModel>
-      <AdditionalIncludeDirectories>./src</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>./src;..\MWSE\MWSE\SharedSE;..\MWSE\MWSE\deps\span-lite</AdditionalIncludeDirectories>
       <EnforceTypeConversionRules>true</EnforceTypeConversionRules>
       <RuntimeTypeInfo>false</RuntimeTypeInfo>
       <LanguageStandard>stdcpp17</LanguageStandard>
@@ -193,6 +193,8 @@
     <ClInclude Include="src\mge\ffeshader.h" />
     <ClInclude Include="src\mge\inidata.h" />
     <ClInclude Include="src\mge\memorypool.h" />
+    <ClInclude Include="src\mge\NIConfig.h" />
+    <ClInclude Include="src\mge\NIRTTIDefines.h" />
     <ClInclude Include="src\mge\mged3d8device.h" />
     <ClInclude Include="src\mge\mgedinput.h" />
     <ClInclude Include="src\mge\mgedirect3d8.h" />
