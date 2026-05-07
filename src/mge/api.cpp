@@ -6,6 +6,7 @@
 #include "mmefunctiondefs.h"
 #include "mgeversion.h"
 #include "postshaders.h"
+#include "scenegraph.h"
 #include "userhud.h"
 #include "mwbridge.h"
 #include "support/log.h"
@@ -851,5 +852,25 @@ namespace api {
     void MGEAPIv3::nearRenderDistanceSet(float distance) {
         distance = std::max(2500.0f, std::min(7168.0f, distance));
         MWBridge::get()->SetViewDistance(distance);
+    }
+
+    //-------------------------------------------------------------------------
+    // MGEAPIv4 — scene-graph bridge.
+    //
+    // Backed by the SceneGraph module. MWSE drives the lifecycle:
+    //   1. setDataHandler() once after TES3::DataHandler is constructed.
+    //   2. onSceneGraphReady() per frame at a known-safe site.
+    // All actual walk/throttle/storage logic lives in scenegraph.cpp.
+
+    void MGEAPIv4::setDataHandler(void* dataHandler) {
+        MGE::SceneGraph::setDataHandler(dataHandler);
+    }
+
+    void* MGEAPIv4::getDataHandler() const {
+        return MGE::SceneGraph::getDataHandler();
+    }
+
+    void MGEAPIv4::onSceneGraphReady() {
+        MGE::SceneGraph::onFrameReady();
     }
 }

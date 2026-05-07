@@ -3,7 +3,7 @@
 #include <stddef.h>
 
 namespace api {
-	static const int supported_api_version = 3;
+	static const int supported_api_version = 4;
 
 	struct MGEAPI {
 		virtual int getAPIVersion() const = 0;
@@ -225,7 +225,18 @@ namespace api {
 		virtual bool shaderSetVectorArray(ShaderHandle handle, const char* variableName, const float* values, size_t* count);
     };
 
-    typedef MGEAPIv3 MGEAPI_ExportVersion;
+    struct MGEAPIv4 : public MGEAPIv3 {
+        // Scene-graph bridge. MWSE stamps DataHandler in once it is constructed
+        // (TES3::DataHandler::get()) and calls onSceneGraphReady() each frame
+        // at a known-safe site (after WorldController::updateEnvironmentLightingWeather).
+        // MGE consumes the pointer through SharedSE NI types and walks the
+        // scene roots itself, throttling internally.
+        virtual void  setDataHandler(void* dataHandler);
+        virtual void* getDataHandler() const;
+        virtual void  onSceneGraphReady();
+    };
+
+    typedef MGEAPIv4 MGEAPI_ExportVersion;
 
 	inline MGEAPIv1* api = nullptr;
 	inline const MacroFunctions* macros = nullptr;

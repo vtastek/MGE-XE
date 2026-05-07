@@ -140,6 +140,7 @@
     <ClCompile Include="src\mge\renderexterior.cpp" />
     <ClCompile Include="src\mge\rendergrass.cpp" />
     <ClCompile Include="src\mge\rendershadow.cpp" />
+    <ClCompile Include="src\mge\scenegraph.cpp" />
     <ClCompile Include="src\mge\renderwater.cpp" />
     <ClCompile Include="src\mge\specificrender.cpp" />
     <ClCompile Include="src\mge\statusoverlay.cpp" />
@@ -207,6 +208,8 @@
     <ClInclude Include="src\mge\phasetimers.h" />
     <ClInclude Include="src\mge\postshaders.h" />
     <ClInclude Include="src\mge\quadtree.h" />
+    <ClInclude Include="src\mge\scenegraph.h" />
+    <ClInclude Include="src\mge\datahandler_view.h" />
     <ClInclude Include="src\mge\specificrender.h" />
     <ClInclude Include="src\mge\statusoverlay.h" />
     <ClInclude Include="src\mge\terrain_horizon_occluder.h" />
