@@ -444,6 +444,19 @@ void DistantLand::renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuff
             LOG_CAT(LOG::Cat_SyncThread, "[S0GPU] effect->Begin");
             effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
 
+            // Draw sky before distant geometry so MSAA edge resolves on thin
+            // objects blend against sky instead of the raw clear colour.
+            if (ctx->cellHasWeather) {
+                MGE_ZoneScopedN("DL_Sky");
+                FixedFunctionShader::transitionTo(PhaseTransition::SkyEntry);
+                const auto& sky = fb ? fb->recordSky : recordSky;
+                if (!sky.empty()) {
+                    bool useAtmScatter = (Configuration.MGEFlags & USE_ATM_SCATTER) && !ImGuiManager::GetSuppressSky();
+                    renderSky(sky, useAtmScatter);
+                }
+                FixedFunctionShader::transitionTo(PhaseTransition::SkyExit);
+            }
+
             LOG_CAT(LOG::Cat_SyncThread, "[S0GPU] underwater=%d exterior=%d", ctx->isUnderwater ? 1 : 0, ctx->isExterior ? 1 : 0);
             if (!ctx->isUnderwater) {
                 // Draw distant landscape
@@ -473,20 +486,6 @@ void DistantLand::renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuff
                 else {
                     visDistant.RemoveAll();
                 }
-            }
-
-            // Sky scattering and sky objects (should be drawn late as possible)
-            // In HLSL mode, sky is always deferred here and rendered via shader
-            if (ctx->cellHasWeather) {
-                MGE_ZoneScopedN("DL_Sky");
-                FixedFunctionShader::transitionTo(PhaseTransition::SkyEntry);
-                const auto& sky = fb ? fb->recordSky : recordSky;
-                if (!sky.empty()) {
-                    // Always use shader path - renderSky handles ATM_SCATTER on/off
-                    bool useAtmScatter = (Configuration.MGEFlags & USE_ATM_SCATTER) && !ImGuiManager::GetSuppressSky();
-                    renderSky(sky, useAtmScatter);
-                }
-                FixedFunctionShader::transitionTo(PhaseTransition::SkyExit);
             }
 
             // Update reflection (use ctx flag for N-1 thread safety)
@@ -804,36 +803,33 @@ void DistantLand::renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer*
         }
 
         // Single RT switch for all depth rendering (renderDepth + StretchRect + renderDepthDistantLand + MSAA resolve)
-        // When early-Z is enabled and sync mode active, renderEarlyZDepth already handled MW depth + velocity
-        bool earlyZActive = ImGuiManager::GetSyncGpuThread() && ImGuiManager::GetEnableEarlyZ();
+        // Early-Z fills the backbuffer depth before Stage0GPU, but SSAO/blend still need a
+        // complete depth texture with a matching private depth-stencil. Rebuild that here.
         {
             MGE_ZoneScopedN("DL_DepthSection");
             RenderTargetSwitcher rtsw(surfDepthFrameMSAA, surfDepthDepth);
             g_passBreaks.mge_depthRT += 2; // Single RenderTargetSwitcher in+out for entire depth section
 
-            // Skip MW depth if early-Z already did it
-            if (!earlyZActive) {
-                // Set RT1 for velocity buffer (MRT with depth)
-                // Skip on first frame after menu exit to preserve motion blur from before menu
-                if (velocityBufferEnabled && surfVelocityMSAA && !s_skipVelocityBufferThisFrame) {
-                    device->SetRenderTarget(1, surfVelocityMSAA);
-                }
+            // Set RT1 for velocity buffer (MRT with depth)
+            // Skip on first frame after menu exit to preserve motion blur from before menu
+            if (velocityBufferEnabled && surfVelocityMSAA && !s_skipVelocityBufferThisFrame) {
+                device->SetRenderTarget(1, surfVelocityMSAA);
+            }
 
-                // Depth texture from recorded renders
-                // HLSL path: only render Scene 0 depth (Scene 2 hands handled by renderStage2)
-                int sceneFilter = (isHLSLActive()) ? 0 : -1;
-                FixedFunctionShader::transitionTo(PhaseTransition::DepthEntry);
-                effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
-                if (ImGuiManager::GetEnableDepthPass()) {
-                    renderDepth(ctx, activeRecordMW, sceneFilter, fb);
-                }
-                effectDepth->End();
-                FixedFunctionShader::transitionTo(PhaseTransition::DepthExit);
+            // Depth texture from recorded renders
+            // HLSL path: only render Scene 0 depth (Scene 2 hands handled by renderStage2)
+            int sceneFilter = (isHLSLActive()) ? 0 : -1;
+            FixedFunctionShader::transitionTo(PhaseTransition::DepthEntry);
+            effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
+            if (ImGuiManager::GetEnableDepthPass()) {
+                renderDepth(ctx, activeRecordMW, sceneFilter, fb);
+            }
+            effectDepth->End();
+            FixedFunctionShader::transitionTo(PhaseTransition::DepthExit);
 
-                // Clear RT1 after depth pass (distant land doesn't need velocity)
-                if (velocityBufferEnabled && surfVelocityMSAA && !s_skipVelocityBufferThisFrame) {
-                    device->SetRenderTarget(1, nullptr);
-                }
+            // Clear RT1 after depth pass (distant land doesn't need velocity)
+            if (velocityBufferEnabled && surfVelocityMSAA && !s_skipVelocityBufferThisFrame) {
+                device->SetRenderTarget(1, nullptr);
             }
 
             // Copy recordMW to Hi-Z for culling (before distant land adds to depth)
@@ -865,8 +861,6 @@ void DistantLand::renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer*
             }
 
             // Phase A: Resolve MSAA depth frame to non-MSAA texture for post-processing
-            // When early-Z is active, MW depth was already resolved, but distant land depth
-            // was just added, so we still need to re-resolve the combined depth
             if (Configuration.AALevel > 0) {
                 MGE_ZoneScopedN("DL_DepthMSAAResolve");
                 IDirect3DSurface9* texDepthFrameSurface;
@@ -876,8 +870,8 @@ void DistantLand::renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer*
                 g_passBreaks.raw_stretchRect++;
                 texDepthFrameSurface->Release();
 
-                // Resolve MSAA velocity buffer (only needed when early-Z didn't do it)
-                if (!earlyZActive && velocityBufferEnabled && texVelocity && surfVelocityMSAA) {
+                // Resolve MSAA velocity buffer
+                if (velocityBufferEnabled && texVelocity && surfVelocityMSAA) {
                     IDirect3DSurface9* texVelocitySurface;
                     texVelocity->GetSurfaceLevel(0, &texVelocitySurface);
                     device->StretchRect(surfVelocityMSAA, NULL, texVelocitySurface, NULL, D3DTEXF_NONE);

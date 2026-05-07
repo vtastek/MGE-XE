@@ -301,7 +301,7 @@ Technique T0 {
     //------------------------------------------------------------
     // Used for rendering sky scattering and sky reflection
     Pass P5 {
-        ZEnable = true;
+        ZEnable = false;
         ZWriteEnable = false;
         CullMode = CW;
 
@@ -318,7 +318,7 @@ Technique T0 {
     //------------------------------------------------------------
     // Used for rendering clouds
     Pass P5clouds {
-        ZEnable = true;
+        ZEnable = false;
         ZWriteEnable = false;
         CullMode = CW;
 
