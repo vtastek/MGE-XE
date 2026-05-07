@@ -1135,7 +1135,7 @@ void DistantLand::saveHiZSnapshot() {
 
 bool DistantLand::cullAgainstHiZ(const D3DXVECTOR3& bboxMin, const D3DXVECTOR3& bboxMax, const D3DXMATRIX& worldViewProj, bool debugLog) {
 
-    // TEMPORARY: Disable Hi-Z culling while debugging pyramid data issue
+    // OBSOLETE: GPU-based Hi-Z culling - replaced by CPU-side Hi-Z in prep thread
     return false;
 
     // Use previous frame's Hi-Z for async culling (no GPU stall waiting for current frame)

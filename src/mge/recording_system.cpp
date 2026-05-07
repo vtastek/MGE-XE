@@ -1761,7 +1761,17 @@ void FixedFunctionShader::renderFullFrameAsync(bool useN1Buffer) {
         fb.state = BufferState::ReadyToRender;
     }
 
+    // Early-Z Depth Pass: Fill backbuffer depth + depth texture + velocity
+    // Must run BEFORE Stage0GPU so DL benefits from early-Z rejection
+    {
+        MGE_ZoneScopedN("Early-Z Depth");
+        LOG_CAT(LOG::Cat_Recording, ">> renderFullFrameAsync Early-Z Depth start");
+        DistantLand::renderEarlyZDepth(renderCtx, &fb);
+        LOG_CAT(LOG::Cat_Recording, ">> renderFullFrameAsync Early-Z Depth done");
+    }
+
     // Stage 0 GPU: shadow map, distant land, sky, water reflection
+    // Now benefits from early-Z rejection (backbuffer depth populated)
     {
         MGE_ZoneScopedN("Stage0 GPU");
         LOG_CAT(LOG::Cat_Recording, ">> renderFullFrameAsync Stage0GPU start");
@@ -2057,7 +2067,15 @@ void FixedFunctionShader::renderRemainingStages(bool useN1Buffer) {
 
         fb.stateContract.applyTo((IDirect3DDevice9*)device);
 
-        // Stage 0 GPU
+        // Early-Z Depth Pass: Fill backbuffer depth before Stage0GPU
+        {
+            MGE_ZoneScopedN("Early-Z Depth");
+            LOG_CAT(LOG::Cat_Recording, ">> renderRemainingStages Early-Z Depth start");
+            DistantLand::renderEarlyZDepth(renderCtx, &fb);
+            LOG_CAT(LOG::Cat_Recording, ">> renderRemainingStages Early-Z Depth done");
+        }
+
+        // Stage 0 GPU (benefits from early-Z rejection)
         {
             MGE_ZoneScopedN("Stage0 GPU Fallback");
             DistantLand::renderStage0GPU(renderCtx, &fb);

@@ -242,6 +242,7 @@ public:
     static DLContext captureStage0Context();
     static void renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuffer* fb = nullptr);
     static DLContext renderStage0();
+    static void renderEarlyZDepth(DLContext* ctx, FixedFunctionShader::FrameBuffer* fb = nullptr);
     static void renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer* fb = nullptr);
     static void renderStage2(DLContext* ctx, FixedFunctionShader::FrameBuffer* fb = nullptr);
     static void renderStageBlend(DLContext* ctx, FixedFunctionShader::FrameBuffer* fb = nullptr);

@@ -306,6 +306,7 @@ public:
     static bool GetStateSuppressionEnabled() { return stateSuppression || syncGpuThread || asyncGpuThread; }
     static bool GetSyncGpuThread() { return syncGpuThread; }
     static bool GetAsyncGpuThread() { return asyncGpuThread; }
+    static bool GetEnableEarlyZ() { return enableEarlyZ; }
     static void UpdateCmdBufferStats(int cmdCount, int sizeKB);
     static void UpdateCmdBufferPerStageStats(int preScene, int scene0, int interScene, int scene1Plus, int ui);
 
@@ -478,6 +479,7 @@ private:
     static bool stateSuppression;         // Enable MW state suppression for async (Phase B) - default false
     static bool syncGpuThread;            // Enable sync GPU thread (Phase B2) - default false
     static bool asyncGpuThread;           // Enable async GPU thread (Phase C) - default false
+    static bool enableEarlyZ;             // Enable early-Z depth pass before Stage0GPU - default true
     static int cmdBufferCmdCount;         // Last frame's command count
     static int cmdBufferSizeKB;           // Last frame's buffer size in KB
     static int cmdStagePreScene;          // Per-stage command counts
