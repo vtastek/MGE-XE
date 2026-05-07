@@ -34,6 +34,7 @@
   <ImportGroup Label="ExtensionSettings">
   </ImportGroup>
   <ImportGroup Label="Shared">
+    <Import Project="..\MWSE\MWSE\SharedSE\SharedSE.vcxitems" Label="Shared" />
   </ImportGroup>
   <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
@@ -65,7 +66,7 @@
       <WarningLevel>Level3</WarningLevel>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <Optimization>Disabled</Optimization>
-      <AdditionalIncludeDirectories>./src;..\MWSE\MWSE\SharedSE;..\MWSE\MWSE\deps\span-lite</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>./src;./src/mge;..\MWSE\MWSE\SharedSE;..\MWSE\MWSE\deps\span-lite</AdditionalIncludeDirectories>
       <EnableEnhancedInstructionSet>StreamingSIMDExtensions2</EnableEnhancedInstructionSet>
       <FloatingPointModel>Fast</FloatingPointModel>
       <EnforceTypeConversionRules>true</EnforceTypeConversionRules>
@@ -90,7 +91,7 @@
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <EnableEnhancedInstructionSet>StreamingSIMDExtensions2</EnableEnhancedInstructionSet>
       <FloatingPointModel>Fast</FloatingPointModel>
-      <AdditionalIncludeDirectories>./src;..\MWSE\MWSE\SharedSE;..\MWSE\MWSE\deps\span-lite</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>./src;./src/mge;..\MWSE\MWSE\SharedSE;..\MWSE\MWSE\deps\span-lite</AdditionalIncludeDirectories>
       <EnforceTypeConversionRules>true</EnforceTypeConversionRules>
       <RuntimeTypeInfo>false</RuntimeTypeInfo>
       <LanguageStandard>stdcpp17</LanguageStandard>
@@ -210,6 +211,7 @@
     <ClInclude Include="src\mge\quadtree.h" />
     <ClInclude Include="src\mge\scenegraph.h" />
     <ClInclude Include="src\mge\datahandler_view.h" />
+    <ClInclude Include="src\mge\mge_se_prelude.h" />
     <ClInclude Include="src\mge\specificrender.h" />
     <ClInclude Include="src\mge\statusoverlay.h" />
     <ClInclude Include="src\mge\terrain_horizon_occluder.h" />
@@ -244,4 +246,14 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
+  <!-- Force-include MGE's SharedSE prelude on every .cpp pulled in by the
+       SharedSE shared-project import (provides SE_IS_MGE / MWSE_NO_CUSTOM_ALLOC
+       and the headers MWSE/CSSE would normally provide via their PCH). Scoped
+       via ClCompile Update so MGE-XE's own TUs are not affected — they include
+       d3dx9 SDK headers that conflict with the prelude's near/far undef. -->
+  <ItemGroup>
+    <ClCompile Update="..\MWSE\MWSE\SharedSE\*.cpp">
+      <ForcedIncludeFiles>$(ProjectDir)src\mge\mge_se_prelude.h</ForcedIncludeFiles>
+    </ClCompile>
+  </ItemGroup>
 </Project>
