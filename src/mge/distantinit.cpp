@@ -9,9 +9,6 @@
 #include "morrowindbsa.h"
 #include "msocclient.h"
 #include "mwbridge.h"
-// Lifecycle entry points for the static-instancing TU.
-// MOREFPS-INSTANCING: drop this include + the initVB/shutdownVB calls below to remove instancing.
-#include "staticinstancing.h"
 #include "mgeversion.h"
 #include "statusoverlay.h"
 #include "ipc/dlshare.h"
@@ -1389,15 +1386,6 @@ bool DistantLand::initGrass() {
         return false;
     }
 
-    // Dynamic VB for distant-statics instancing, owned by the
-    // StaticInstancing namespace. Vertex layout is the same as
-    // vbGrassInstances (4x3 transposed transform per instance,
-    // consumed via GrassDecl).
-    // MOREFPS-INSTANCING: drop this initVB call to remove instancing.
-    if (!StaticInstancing::initVB(device)) {
-        return false;
-    }
-
     return true;
 }
 
@@ -1495,9 +1483,6 @@ void DistantLand::release() {
     ibWater = nullptr;
     vbGrassInstances->Release();
     vbGrassInstances = nullptr;
-    // Static instance VB lifecycle owned by the StaticInstancing namespace.
-    // MOREFPS-INSTANCING: drop this shutdownVB call to remove instancing.
-    StaticInstancing::shutdownVB();
     vbFullFrame->Release();
     vbFullFrame = nullptr;
     vbClipCube->Release();

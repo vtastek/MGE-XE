@@ -107,7 +107,6 @@ struct ConfigurationStruct {
     float UIScale;
     int WindowAlignX, WindowAlignY;
     bool UseSharedMemory;
-    bool UseStaticInstancing;  // gate distant-static instanced draws
     bool UseOcclusionCulling;  // reuse msoc.dll's CPU occlusion mask for distant statics
     int OcclusionHysteresisFrames;  // consecutive OCCLUDED frames before a static actually culls
     float OcclusionSphereInflate;   // per-instance sphere/OBB radius scale for verdict stability

@@ -444,39 +444,4 @@ Technique T0 {
         VertexShader = compile vs_3_0 NullVS();
         PixelShader = compile ps_3_0 NullPS();
     }
-    //------------------------------------------------------------
-    // Instanced distant statics (exterior).
-    // Matches P4ext render state; only the vertex shader differs.
-    Pass P4extInst {
-        ZEnable = true;
-        ZWriteEnable = true;
-        ZFunc = LessEqual;
-        CullMode = CW;
-
-        AlphaBlendEnable = false;
-        AlphaTestEnable = true;
-        AlphaFunc = GreaterEqual;
-        AlphaRef = 133;
-
-        VertexShader = compile vs_3_0 StaticExteriorInstVS();
-        PixelShader = compile ps_3_0 StaticPS();
-    }
-    //------------------------------------------------------------
-    // Instanced distant statics (interior / underwater).
-    // Matches P4int render state; only the vertex shader differs.
-    Pass P4intInst {
-        ZEnable = true;
-        ZWriteEnable = true;
-        ZFunc = LessEqual;
-        CullMode = CW;
-
-        AlphaBlendEnable = false;
-        AlphaTestEnable = true;
-        AlphaFunc = GreaterEqual;
-        AlphaRef = 133;
-
-        VertexShader = compile vs_3_0 StaticInteriorInstVS();
-        PixelShader = compile ps_3_0 StaticPS();
-    }
-    //------------------------------------------------------------
 }

@@ -6,8 +6,6 @@
 #include "mwbridge.h"
 #include "phasetimers.h"
 #include "proxydx/d3d8header.h"
-// MOREFPS-INSTANCING: drop this include + the StaticInstancing::buildVB dispatch in cullDistantStatics to remove instancing.
-#include "staticinstancing.h"
 #include "support/log.h"
 #include "terrain_horizon_occluder.h"
 
@@ -594,16 +592,6 @@ void DistantLand::cullDistantStatics(const D3DXMATRIX* view, const D3DXMATRIX* p
     } else {
         applyMSOCToDistantStatics(visDistant);
     }
-
-    // Build the per-frame instance VB when instancing is enabled.
-    // MOREFPS-INSTANCING: drop this whole block to remove instancing.
-    if (Configuration.UseStaticInstancing) {
-        if (Configuration.UseSharedMemory) {
-            StaticInstancing::buildVB(visDistantShared);
-        } else {
-            StaticInstancing::buildVB(visDistant);
-        }
-    }
 }
 
 void DistantLand::renderDistantStatics() {
@@ -631,15 +619,8 @@ void DistantLand::renderDistantStatics() {
     device->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
 }
 
-// Distant-statics instancing implementations live in
-// staticinstancing.cpp (namespace StaticInstancing). Only
-// applyMSOCToDistantStatics (below) lives here — it's path-agnostic
-// and consumed by both the instanced and non-instanced render paths.
-
 // MSOC verdict pass — populates `msocOccluded` with a per-instance
-// cull mask. Both the instanced and non-instanced render paths consume
-// this mask, so culling behaves the same regardless of which rendering
-// pipeline is active.
+// cull mask consumed by both the color and depth render paths.
 //
 // Walks the visible set, runs the batched sphere query, optionally
 // escalates large statics to the OBB test, then applies far-distance
@@ -857,6 +838,3 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
 
 template void DistantLand::applyMSOCToDistantStatics(VisibleSet<StlVector>& staticSet);
 template void DistantLand::applyMSOCToDistantStatics(VisibleSet<IpcClientVector>& staticSet);
-
-// (Instanced render path moved to StaticInstancing::renderColor /
-// renderDepth in staticinstancing.cpp.)

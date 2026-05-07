@@ -142,7 +142,6 @@
     <ClCompile Include="src\mge\rendershadow.cpp" />
     <ClCompile Include="src\mge\renderwater.cpp" />
     <ClCompile Include="src\mge\specificrender.cpp" />
-    <ClCompile Include="src\mge\staticinstancing.cpp" />
     <ClCompile Include="src\mge\statusoverlay.cpp" />
     <ClCompile Include="src\mge\terrain_horizon_occluder.cpp" />
     <ClCompile Include="src\mge\userhud.cpp" />
@@ -207,7 +206,6 @@
     <ClInclude Include="src\mge\postshaders.h" />
     <ClInclude Include="src\mge\quadtree.h" />
     <ClInclude Include="src\mge\specificrender.h" />
-    <ClInclude Include="src\mge\staticinstancing.h" />
     <ClInclude Include="src\mge\statusoverlay.h" />
     <ClInclude Include="src\mge\terrain_horizon_occluder.h" />
     <ClInclude Include="src\mge\userhud.h" />

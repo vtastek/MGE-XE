@@ -18,11 +18,7 @@ enum RenderPassID {
     PASS_DEBUGSHADOW,
     PASS_PLAYERWAVE,
     PASS_WAVESTEP,
-    PASS_WORKAROUND,
-    // Instanced distant-static color passes. Appended so existing pass
-    // indices remain stable.
-    PASS_RENDERSTATICSEXTERIOR_INST,
-    PASS_RENDERSTATICSINTERIOR_INST
+    PASS_WORKAROUND
 };
 
 enum RenderShadowMapID {
@@ -37,10 +33,7 @@ enum RenderDepthID {
     PASS_RENDERMWDEPTH,
     PASS_RENDERLANDDEPTH,
     PASS_RENDERSTATICSDEPTH,
-    PASS_RENDERGRASSDEPTHINST,
-    // Instanced distant-static depth pass. Appended so existing pass
-    // indices remain stable.
-    PASS_RENDERSTATICSDEPTH_INST
+    PASS_RENDERGRASSDEPTHINST
 };
 
 static const int SIZEOFSTATICVERT = 20;

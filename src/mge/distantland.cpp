@@ -6,8 +6,6 @@
 #include "distantshader.h"
 #include "postshaders.h"
 #include "mwbridge.h"
-// MOREFPS-INSTANCING: opt-in path — drop the include + StaticInstancing dispatch below to remove instancing entirely.
-#include "staticinstancing.h"
 
 
 
@@ -78,29 +76,15 @@ void DistantLand::renderStage0() {
                     contributeDistantLandOccluders();
                 }
 
-                // Draw distant statics, with alpha dissolve as they pass the near view boundary
+                // Draw distant statics, with alpha dissolve as they pass the near view boundary.
+                // applyMSOCToDistantStatics (inside cullDistantStatics) populates msocOccluded.
                 if (Configuration.MGEFlags & USE_DISTANT_STATICS) {
-                    // Dispatch between per-object and instanced paths.
-                    // applyMSOCToDistantStatics (inside cullDistantStatics) populates
-                    // msocOccluded for both paths; the instanced path additionally builds
-                    // batchedStatics inside StaticInstancing::buildVB.
-                    // MOREFPS-INSTANCING: collapse this branch to the non-instanced arm to remove instancing.
-                    const bool useInstancing = Configuration.UseStaticInstancing;
-                    DWORD p;
-                    if (useInstancing) {
-                        p = mwBridge->CellHasWeather() ? PASS_RENDERSTATICSEXTERIOR_INST : PASS_RENDERSTATICSINTERIOR_INST;
-                    } else {
-                        p = mwBridge->CellHasWeather() ? PASS_RENDERSTATICSEXTERIOR : PASS_RENDERSTATICSINTERIOR;
-                    }
+                    DWORD p = mwBridge->CellHasWeather() ? PASS_RENDERSTATICSEXTERIOR : PASS_RENDERSTATICSINTERIOR;
                     effect->BeginPass(p);
                     vsr.beginAlphaToCoverage(device);
 
                     cullDistantStatics(&mwView, &distProj);
-                    if (useInstancing) {
-                        StaticInstancing::renderColor();
-                    } else {
-                        renderDistantStatics();
-                    }
+                    renderDistantStatics();
 
                     vsr.endAlphaToCoverage(device);
                     effect->EndPass();

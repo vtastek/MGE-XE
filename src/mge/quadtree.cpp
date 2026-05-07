@@ -73,12 +73,9 @@ QuadTreeMesh::QuadTreeMesh(const QuadTreeMesh& rh) {
 bool QuadTreeMesh::CompareByState(const RenderMesh& lh, const RenderMesh& rh) {
     // Sort key is a tuple: (tex, vBuffer, hasAlpha, animateUV).
     //
-    // The wide key lets the per-frame grouping in StaticInstancing::buildVB
-    // form maximally-sized batches — groups break when any of these four
-    // fields differ. The non-instanced VisibleSet::Render path also benefits:
-    // hasAlpha / animateUV cluster consecutively, so the per-draw
-    // SetRenderState(ALPHATESTENABLE) and SetBool(animateUV) calls trigger
-    // less often.
+    // The wide key clusters hasAlpha / animateUV consecutively, so the
+    // per-draw SetRenderState(ALPHATESTENABLE) and SetBool(animateUV)
+    // calls trigger less often inside VisibleSet::Render.
     if (lh.tex != rh.tex) {
         return lh.tex < rh.tex;
     }

@@ -238,8 +238,6 @@ public:
     static void shutdownHorizonWorkspace();
     static void cullDistantStatics(const D3DXMATRIX* view, const D3DXMATRIX* proj);
     static void renderDistantStatics();
-    // Distant-statics instancing lives in namespace StaticInstancing
-    // (staticinstancing.h) — buildVB / renderColor / renderDepth.
 
     // MSOC occlusion verdict pass — walks the visible set, runs the
     // batched sphere query, applies far/handoff gates and temporal
