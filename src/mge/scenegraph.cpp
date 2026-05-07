@@ -8,9 +8,7 @@
 #include "NIAVObject.h"
 #include "NINode.h"
 #include "NILight.h"
-#include "NIDirectionalLight.h"
 #include "NIPointLight.h"
-#include "NIPointer.h"
 #include "NIRTTIDefines.h"
 
 #include "configuration.h"
@@ -25,17 +23,13 @@ namespace MGE::SceneGraph {
         void*    g_dataHandler   = nullptr;
         uint64_t g_frameRevision = 0;
 
-        // Output caches. Public accessors return const refs to these.
-        // Pointers stay valid until the next rebuild because g_pinned
-        // holds NI::Pointer<> refs for the same objects.
-        std::vector<NI::Light*>                g_lights;
-        std::vector<NI::AVObject*>             g_nodes;
-        std::vector<PointLight>                g_pointLights;
-
-        // Lifetime anchor — refcount-holds every NI::AVObject we exposed
-        // so consumers can dereference safely between rebuilds even if
-        // Lua scripts detach the underlying engine objects mid-frame.
-        std::vector<NI::Pointer<NI::AVObject>> g_pinned;
+        // Output cache — POD only. No NI pointers held past walk return:
+        // every dereference of a visited NI::PointLight happens inside walk()
+        // and produces scalar field copies in `extractPointLight`. PODs don't
+        // dangle, so no NI::Pointer<> pinning is needed and no g_pinned
+        // anchor vector. Future consumers that need typed NI access (e.g.
+        // shadow map per-light list) add their own typed pinned vector then.
+        std::vector<PointLight> g_pointLights;
 
         // Ships raw NI::PointLight fields. NO engine-state branching —
         // the magic patterns master's constant-array path decodes
@@ -83,22 +77,21 @@ namespace MGE::SceneGraph {
             if (!av) return;
             if (av->getAppCulled()) return;
 
-            g_pinned.emplace_back(av);
-            g_nodes.push_back(av);
-
-            if (av->isInstanceOfType(NI::RTTIStaticPtr::NiLight)) {
-                auto* light = static_cast<NI::Light*>(av);
-                g_lights.push_back(light);
-
-                if (av->isInstanceOfType(NI::RTTIStaticPtr::NiPointLight)) {
-                    g_pointLights.push_back(
-                        extractPointLight(static_cast<const NI::PointLight*>(av)));
-                }
+            if (av->isInstanceOfType(NI::RTTIStaticPtr::NiPointLight)) {
+                g_pointLights.push_back(
+                    extractPointLight(static_cast<const NI::PointLight*>(av)));
             }
 
             if (av->isInstanceOfType(NI::RTTIStaticPtr::NiNode)) {
                 auto node = static_cast<NI::Node*>(av);
-                const auto count = node->children.getFilledCount();
+                // Iterate [0, endIndex), null-skip in walk(). NITArray is
+                // sparse — filledCount counts non-null entries, but they
+                // may sit at non-contiguous slots up to endIndex. Using
+                // filledCount as the loop bound silently drops any light
+                // whose slot index is >= filledCount (visible as missing
+                // lights / dark patches in dense interiors). msoc's walk
+                // used endIndex; mirror that here.
+                const auto count = node->children.getEndIndex();
                 for (size_t i = 0; i < count; ++i) {
                     walk(node->children.at(i));
                 }
@@ -117,8 +110,8 @@ namespace MGE::SceneGraph {
 
             auto wor  = MGE::DataHandlerView::worldObjectRoot(g_dataHandler);
             auto pick = MGE::DataHandlerView::worldPickObjectRoot(g_dataHandler);
-            const int worCnt  = wor  ? static_cast<int>(wor->children.getFilledCount())  : 0;
-            const int pickCnt = pick ? static_cast<int>(pick->children.getFilledCount()) : 0;
+            const int worCnt  = wor  ? static_cast<int>(wor->children.getEndIndex())  : 0;
+            const int pickCnt = pick ? static_cast<int>(pick->children.getEndIndex()) : 0;
             if (worCnt != g_lastWorldObjChildCnt || pickCnt != g_lastPickObjChildCnt) {
                 return true;
             }
@@ -127,19 +120,15 @@ namespace MGE::SceneGraph {
         }
 
         void rebuild() {
-            // Releasing g_pinned drops the refcount on the previous frame's
-            // NI::AVObjects. Clearing g_nodes/g_lights afterwards is just
-            // bookkeeping (the raw pointers were aliases).
-            g_pinned.clear();
-            g_nodes.clear();
-            g_lights.clear();
             g_pointLights.clear();
 
             walk(MGE::DataHandlerView::worldObjectRoot(g_dataHandler));
             walk(MGE::DataHandlerView::worldPickObjectRoot(g_dataHandler));
-
             // sgSunlight is a sibling root of the two NiNodes — the global
-            // directional light. Treat as a synthetic single-node subtree.
+            // directional light. NiDirectionalLight is not a NiPointLight,
+            // so the walk's RTTI test naturally skips it for g_pointLights.
+            // Visited only so future per-subtype POD vectors (e.g.
+            // g_directionalLights) get populated by the same pass.
             if (auto sun = MGE::DataHandlerView::sgSunlight(g_dataHandler)) {
                 walk(reinterpret_cast<NI::AVObject*>(sun));
             }
@@ -149,8 +138,8 @@ namespace MGE::SceneGraph {
             g_lastSeenCurrentCell = MGE::DataHandlerView::currentCell(g_dataHandler);
             auto wor  = MGE::DataHandlerView::worldObjectRoot(g_dataHandler);
             auto pick = MGE::DataHandlerView::worldPickObjectRoot(g_dataHandler);
-            g_lastWorldObjChildCnt = wor  ? static_cast<int>(wor->children.getFilledCount())  : 0;
-            g_lastPickObjChildCnt  = pick ? static_cast<int>(pick->children.getFilledCount()) : 0;
+            g_lastWorldObjChildCnt = wor  ? static_cast<int>(wor->children.getEndIndex())  : 0;
+            g_lastPickObjChildCnt  = pick ? static_cast<int>(pick->children.getEndIndex()) : 0;
 
             g_framesSinceLastWalk = 0;
             ++g_frameRevision;
@@ -173,13 +162,10 @@ namespace MGE::SceneGraph {
         if (!g_dataHandler) return;
 
         // Default-off: ensure the walk has zero overhead on installs that
-        // haven't opted in. When the flag is off, output caches are kept
+        // haven't opted in. When the flag is off, the output cache is kept
         // empty so consumers (FFE texture-light variant) never activate.
         if (!Configuration.UseSceneGraphSnapshot) {
-            if (!g_pinned.empty() || !g_nodes.empty() || !g_lights.empty() || !g_pointLights.empty()) {
-                g_pinned.clear();
-                g_nodes.clear();
-                g_lights.clear();
+            if (!g_pointLights.empty()) {
                 g_pointLights.clear();
                 ++g_frameRevision;
             }
@@ -191,9 +177,9 @@ namespace MGE::SceneGraph {
 
             static uint64_t s_lastLoggedRev = (uint64_t)-1;
             if (g_frameRevision != s_lastLoggedRev && (g_frameRevision % 30) == 0) {
-                LOG::logline("-- [SCENEGRAPH] rev=%llu nodes=%zu lights=%zu pointLights=%zu",
+                LOG::logline("-- [SCENEGRAPH] rev=%llu pointLights=%zu",
                     (unsigned long long)g_frameRevision,
-                    g_nodes.size(), g_lights.size(), g_pointLights.size());
+                    g_pointLights.size());
                 s_lastLoggedRev = g_frameRevision;
             }
         } else {
@@ -201,9 +187,7 @@ namespace MGE::SceneGraph {
         }
     }
 
-    const std::vector<NI::Light*>&    lights()         { return g_lights; }
-    const std::vector<NI::AVObject*>& nodes()          { return g_nodes; }
-    const std::vector<PointLight>&    pointLights()    { return g_pointLights; }
-    uint64_t                          frameRevision()  { return g_frameRevision; }
+    const std::vector<PointLight>& pointLights()    { return g_pointLights; }
+    uint64_t                       frameRevision()  { return g_frameRevision; }
 
 }

@@ -70,7 +70,7 @@ class FixedFunctionShader {
         DWORD heavyLighting : 1;
         // When 1, generate the USE_TEXTURE_LIGHTS variant — shader reads
         // point lights from a 1D dynamic texture (3 texels per light)
-        // populated from MGE::SceneGraph::lights() with a runtime loop
+        // populated from MGE::SceneGraph::pointLights() with a runtime loop
         // count. Overrides the heavyLighting 4/8 choice.
         DWORD useTextureLightVariant : 1;
         DWORD vertexMaterial : 2;
