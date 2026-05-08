@@ -21,6 +21,7 @@ ShadowVertOut ShadowVS(StatVertIn IN) {
     ShadowVertOut OUT;
 	
 	float4 pos = IN.pos;
+    float4 worldpos = mul(pos, world);
 	// Apply wind animation to match HLSL pipeline exactly
 	#ifdef HAS_GRASS
 			// Use grass displacement for grass geometry
@@ -28,7 +29,7 @@ ShadowVertOut ShadowVS(StatVertIn IN) {
 			pos.xy += (1 - IN.color.z) * displacement.xy;
 	#else
 			// Apply wind animation to alpha-tested geometry (trees, bushes, etc.)
-			if (hasAlpha) {
+			if (hasAlpha && length(worldpos.xy - eyePos.xy) < 16384.0) {
 				float3 displacement = grassDisplacement(IN.pos.xyz, IN.pos.z, 1.0);
 				pos.xyz += displacement;
 			}

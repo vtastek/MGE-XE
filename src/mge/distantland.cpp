@@ -27,6 +27,21 @@ PassBreakCounters g_passBreaks;
 // File-scope ctx pointer for updatePostShader callback (set/cleared in postProcess)
 static DLContext* s_postShaderCtx = nullptr;
 
+namespace {
+    DWORD encodeFloatRenderState(float value) {
+        DWORD bits = 0;
+        memcpy(&bits, &value, sizeof(bits));
+        return bits;
+    }
+}
+
+void DistantLand::setDistantLandDepthBias(bool enable, float depthBias, float slopeBias) {
+    const float activeDepthBias = enable ? depthBias : 0.0f;
+    const float activeSlopeBias = enable ? slopeBias : 0.0f;
+    device->SetRenderState(D3DRS_DEPTHBIAS, encodeFloatRenderState(activeDepthBias));
+    device->SetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, encodeFloatRenderState(activeSlopeBias));
+}
+
 // ============================================================================
 // Frame State Logging - Auto-diff system to track state changes across frames
 // ============================================================================
@@ -336,6 +351,22 @@ DLContext DistantLand::captureStage0Context() {
     s_staging.isExterior = mwBridge->IsExterior();
     s_staging.isUnderwater = mwBridge->IsUnderwater(s_staging.eyePos.z);
     s_staging.isMenu = mwBridge->IsMenu();
+    s_staging.simulationTime = mwBridge->simulationTime();
+
+    // Snapshot smoothed wind once per captured frame. HLSL replay may draw this
+    // frame later; updating wind per replay draw makes alpha-tested animation
+    // diverge from distant statics and depth.
+    {
+        static float smoothWind[2];
+        if (!s_staging.isMenu) {
+            const float f = 0.02f;
+            const float* wind = mwBridge->GetWindVector();
+            smoothWind[0] += f * (s_staging.windScaling * wind[0] - smoothWind[0]);
+            smoothWind[1] += f * (s_staging.windScaling * wind[1] - smoothWind[1]);
+        }
+        s_staging.windVec[0] = smoothWind[0];
+        s_staging.windVec[1] = smoothWind[1];
+    }
 
     // Log captured state at capture time
     if (LOG::catEnabled(LOG::Cat_DistantLand)) {
@@ -1236,20 +1267,13 @@ void DistantLand::setupCommonEffect(DLContext* ctx, const D3DXMATRIX* view, cons
         effect->SetFloatArray(ehSkyScatterFar, ctx->atmSkylightScatter, 4);
     }
 
-    // Wind, requires smoothing as it is very noisy
-    // Use s_staging.isMenu (current) for responsive menu exit
-    static float smoothWind[2];
-    if (!s_staging.isMenu) {
-        const float f = 0.02;
-        const float* wind = mwBridge->GetWindVector();
-        smoothWind[0] += f * (ctx->windScaling * wind[0] - smoothWind[0]);
-        smoothWind[1] += f * (ctx->windScaling * wind[1] - smoothWind[1]);
-        effect->SetFloatArray(ehWindVec, smoothWind, 2);
-    }
+    // Wind was smoothed and captured with the frame context so buffered DL,
+    // depth, and HLSL replay all animate from the same state.
+    effect->SetFloatArray(ehWindVec, ctx->windVec, 2);
 
     // Other
     effect->SetFloatArray(ehFootPos, (float*)mwBridge->PlayerPositionPointer(), 3);
-    effect->SetFloat(ehTime, mwBridge->simulationTime());
+    effect->SetFloat(ehTime, ctx->simulationTime);
 }
 
 // setScattering - Set scattering coefficients for atmospheric scattering shader

@@ -79,7 +79,8 @@ public:
                 const D3DXHANDLE* animate_uv_handle,
                 const D3DXHANDLE* world_matrix_handle,
                 unsigned int vertex_size,
-                bool parallelRead = false) {
+                bool parallelRead = false,
+                bool setAlphaTestWithHandle = false) {
         IDirect3DTexture9* last_texture = nullptr;
         IDirect3DVertexBuffer9* last_buffer = nullptr;
         bool last_animateUV = false;
@@ -104,6 +105,9 @@ public:
                 if (has_alpha_handle) {
                     // Depth-only rendering, control if texture alpha channel reads are required in shader
                     effectPool->SetBool(*has_alpha_handle, mesh.hasAlpha);
+                    if (setAlphaTestWithHandle) {
+                        device->SetRenderState(D3DRS_ALPHATESTENABLE, mesh.hasAlpha);
+                    }
                 }
                 else {
                     // World rendering, alpha test state is compatible with transparency supersampling, while clip() isn't

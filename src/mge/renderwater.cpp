@@ -257,7 +257,9 @@ void DistantLand::renderReflectedStatics(DLContext* ctx, const D3DXMATRIX* view,
         device->SetVertexDeclaration(StaticDecl);
 
         ipcClient.waitForCompletion();
-        visExtraShared.Render(device, effect, effect, &ehTex0, nullptr, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT);
+        setDistantLandDepthBias(true, 3.0e-6f, 3.0e-6f);
+        visExtraShared.Render(device, effect, effect, &ehTex0, &ehHasAlpha, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT, false, true);
+        setDistantLandDepthBias(false);
     } else {
         // Use snapshotted worldSpace from ctx (thread-safe vs global race with selectDistantCell)
         auto worldSpace = static_cast<const DistantLandShare::WorldSpace*>(ctx->worldSpace);
@@ -273,7 +275,9 @@ void DistantLand::renderReflectedStatics(DLContext* ctx, const D3DXMATRIX* view,
         visReflected.SortByState();
 
         device->SetVertexDeclaration(StaticDecl);
-        visReflected.Render(device, effect, effect, &ehTex0, nullptr, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT);
+        setDistantLandDepthBias(true, 3.0e-6f, 3.0e-6f);
+        visReflected.Render(device, effect, effect, &ehTex0, &ehHasAlpha, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT, false, true);
+        setDistantLandDepthBias(false);
     }
 }
 
@@ -513,5 +517,7 @@ void DistantLand::renderWaterPlane(DLContext* ctx) {
     device->SetVertexDeclaration(WaterDecl);
     device->SetStreamSource(0, vbWater, 0, 12);
     device->SetIndices(ibWater);
+    setDistantLandDepthBias(true, 4.0e-6f, 4.0e-6f);
     device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, numWaterVerts, 0, numWaterTris);
+    setDistantLandDepthBias(false);
 }

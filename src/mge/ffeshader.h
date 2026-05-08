@@ -64,6 +64,10 @@ struct DLContext {
     bool isExterior;
     bool isUnderwater;
     bool isMenu;
+
+    // Captured animation state for buffered N-1/N-2 rendering.
+    float windVec[2];
+    float simulationTime;
 };
 
 // Captured MWBridge state for postProcess — allows render thread execution without MWBridge access
@@ -1054,6 +1058,11 @@ public:
 
         // Scene number this call was recorded in (0=world, 1=particles, 2=hands)
         int sceneNum = 0;
+
+        // Frame animation state captured with the draw call. Replayed frames can be
+        // N-1/N-2, so shader animation must not sample live Morrowind time/wind.
+        float simulationTime = 0.0f;
+        float windVec[2] = {0.0f, 0.0f};
 
         // Expected device state for debug mode (state leak detection)
         ExpectedDeviceState expectedState;

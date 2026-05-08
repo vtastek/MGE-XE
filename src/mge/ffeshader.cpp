@@ -3444,6 +3444,9 @@ FixedFunctionShader::HLSLRecordedCall::HLSLRecordedCall(const RenderedState* rs_
     : rs(*rs_), frs(*frs_), lightrs(lightrs_), sk(sk_), hasBoundingBox(false), recordMWIndex(recordMWIdx), bin(RenderBin::Opaque), prepared(false), dirtyFlags(DIRTY_ALL) {
     // Capture complete device state snapshot for async replay (no assumptions about prior state)
     deviceState = g_deviceState;
+    simulationTime = DistantLand::s_staging.simulationTime;
+    windVec[0] = DistantLand::s_staging.windVec[0];
+    windVec[1] = DistantLand::s_staging.windVec[1];
 
     // Capture sampler states for stages 0-1 (Morrowind-bound textures)
     // from proxy shadow state instead of per-draw GetSamplerState() calls.
@@ -3537,4 +3540,3 @@ FixedFunctionShader::HLSLRecordedCall::HLSLRecordedCall(const RenderedState* rs_
 }
 
 // computeBoundingBox moved to hiz_culling.cpp
-

@@ -19,6 +19,7 @@ float nearFogRange : register(c50);
 float2 windVec : register(c51);
 float time : register(c52);
 bool hasAlpha : register(c53);  // For detecting alpha-tested geometry
+static const float windAnimationMaxDistance = 16384.0;
 
 #ifdef HAS_GRASS
 // Additional grass-specific parameters
@@ -319,9 +320,12 @@ VS_OUTPUT vs_main(VS_INPUT input) {
 	#else
         // Apply simple wind animation to alpha-tested geometry (trees, bushes, etc.)
         if (hasAlpha && vertexBlendState.x < 0.5) {
-            float3 displacement = grassDisplacement(input.pos.xyz, input.pos.z, 1.0);
-            input.pos.xyz += displacement;
-            worldpos.xyz += displacement;
+            float4 baseViewpos = mul(input.pos, worldview);
+            if (length(baseViewpos.xyz) < windAnimationMaxDistance) {
+                float3 displacement = grassDisplacement(input.pos.xyz, input.pos.z, 1.0);
+                input.pos.xyz += displacement;
+                worldpos.xyz += displacement;
+            }
         }
 	#endif
 

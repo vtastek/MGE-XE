@@ -233,7 +233,7 @@ float4 WaterPS(in WaterVertOut IN): COLOR0
     float3 reflected = getProjectedReflection(reflectedPos);
 
     // Fade reflection into an inscatter dominated horizon
-    reflected = lerp(fog.rgb, reflected, fog.a);
+    reflected = lerp(reflected * 0.96, reflected, fog.a);
 
     // Smooth out high frequencies at a distance
     float3 adjustnormal = lerp(float3(0, 0, 0.1), normal, pow(saturate(1.05 * fog.a), 2));

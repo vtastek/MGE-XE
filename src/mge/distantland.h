@@ -256,6 +256,7 @@ public:
     static void renderGrassAfterBackfill(DLContext* ctx);
 
     static void setupCommonEffect(DLContext* ctx, const D3DXMATRIX* view, const D3DXMATRIX* proj);
+    static void setDistantLandDepthBias(bool enable, float depthBias = 2.0e-6f, float slopeBias = 2.0e-6f);
 
     static void renderDistantLand(DLContext* ctx, ID3DXEffect* e, const D3DXMATRIX* view, const D3DXMATRIX* proj);
     static void renderDistantLandZ();

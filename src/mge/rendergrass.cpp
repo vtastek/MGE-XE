@@ -128,7 +128,9 @@ void DistantLand::renderGrassInst(DLContext* ctx) {
     effect->SetTexture(ehTex3, texSoftShadow);
     device->SetVertexDeclaration(GrassDecl);
 
+    setDistantLandDepthBias(true);
     renderGrassCommon(effect);
+    setDistantLandDepthBias(false);
 }
 
 // renderGrassInstZ - Z only pass
@@ -142,7 +144,9 @@ void DistantLand::renderGrassInstZ() {
     effect->SetFloat(ehAlphaRef, 128.0f / 255.0f);
     device->SetVertexDeclaration(GrassDecl);
 
+    setDistantLandDepthBias(true);
     renderGrassCommon(effectDepth);
+    setDistantLandDepthBias(false);
 }
 
 void DistantLand::renderGrassCommon(ID3DXEffect* e) {

@@ -1454,18 +1454,13 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             cmdBuf->recordSetVSConstantF(hlslShader.regHasAlphaVS.reg, v, 1);
         }
         if (hlslShader.regWindVec.reg != REG_INVALID) {
-            static float smoothWind[2] = {0, 0};
-            if (!MWBridge::get()->IsMenu()) {
-                const float f = 0.02f;
-                const float* wind = MWBridge::get()->GetWindVector();
-                smoothWind[0] += f * (1.0f * wind[0] - smoothWind[0]);
-                smoothWind[1] += f * (1.0f * wind[1] - smoothWind[1]);
-            }
-            float v[4] = { smoothWind[0], smoothWind[1], 0, 0 };
+            const float* wind = replayCall ? replayCall->windVec : DistantLand::s_staging.windVec;
+            float v[4] = { wind[0], wind[1], 0, 0 };
             cmdBuf->recordSetVSConstantF(hlslShader.regWindVec.reg, v, 1);
         }
         if (hlslShader.regTime.reg != REG_INVALID) {
-            float v[4] = { MWBridge::get()->simulationTime(), 0, 0, 0 };
+            float time = replayCall ? replayCall->simulationTime : DistantLand::s_staging.simulationTime;
+            float v[4] = { time, 0, 0, 0 };
             cmdBuf->recordSetVSConstantF(hlslShader.regTime.reg, v, 1);
         }
 
@@ -1637,17 +1632,14 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         if (hHasAlphaVS) hlslShader.vsConstantTable->SetBool(device, hHasAlphaVS, rs->alphaTest);
         D3DXHANDLE hWindVec = hlslShader.vsConstantTable->GetConstantByName(NULL, "windVec");
         if (hWindVec) {
-            static float smoothWind[2] = {0, 0};
-            if (!MWBridge::get()->IsMenu()) {
-                const float f = 0.02f;
-                const float* wind = MWBridge::get()->GetWindVector();
-                smoothWind[0] += f * (1.0f * wind[0] - smoothWind[0]);
-                smoothWind[1] += f * (1.0f * wind[1] - smoothWind[1]);
-            }
-            hlslShader.vsConstantTable->SetFloatArray(device, hWindVec, smoothWind, 2);
+            const float* wind = replayCall ? replayCall->windVec : DistantLand::s_staging.windVec;
+            hlslShader.vsConstantTable->SetFloatArray(device, hWindVec, wind, 2);
         }
         D3DXHANDLE hTime = hlslShader.vsConstantTable->GetConstantByName(NULL, "time");
-        if (hTime) hlslShader.vsConstantTable->SetFloat(device, hTime, MWBridge::get()->simulationTime());
+        if (hTime) {
+            float time = replayCall ? replayCall->simulationTime : DistantLand::s_staging.simulationTime;
+            hlslShader.vsConstantTable->SetFloat(device, hTime, time);
+        }
         D3DXHANDLE hHasVCol = hlslShader.psConstantTable->GetConstantByName(NULL, "hasVCol");
         if (hHasVCol) hlslShader.psConstantTable->SetBool(device, hHasVCol, (rs->fvf & D3DFVF_DIFFUSE) != 0);
         D3DXHANDLE hMaterialAlpha = hlslShader.psConstantTable->GetConstantByName(NULL, "materialAlpha");

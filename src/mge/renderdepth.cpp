@@ -179,11 +179,13 @@ void DistantLand::renderDepthDistantLand(DLContext* ctx) {
             // Distant statics
             effectDepth->BeginPass(PASS_RENDERSTATICSDEPTH);
             device->SetVertexDeclaration(StaticDecl);
+            setDistantLandDepthBias(true, 3.0e-6f, 3.0e-6f);
             if (Configuration.UseSharedMemory) {
                 visDistantShared.Render(device, effectDepth, effect, &ehTex0, &ehHasAlpha, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT);
             } else {
                 visDistant.Render(device, effectDepth, effect, &ehTex0, &ehHasAlpha, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT);
             }
+            setDistantLandDepthBias(false);
             effectDepth->EndPass();
         }
 
@@ -1365,5 +1367,3 @@ float DistantLand::computeLightRadius(float constant, float linear, float quadra
     // Use 400 units as safe maximum (350 + margin for Hi-Z culling tolerance)
     return 400.0f;
 }
-
-

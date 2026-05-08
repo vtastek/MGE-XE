@@ -128,7 +128,7 @@ void DistantLand::renderDistantLand(DLContext* ctx, ID3DXEffect* e, const D3DXMA
     }
 
     device->SetVertexDeclaration(LandDecl);
-    
+
     if (Configuration.UseSharedMemory) {
         visLandShared.Render(device, SIZEOFLANDVERT, true);
     } else {
@@ -268,11 +268,13 @@ void DistantLand::renderDistantStatics(DLContext* ctx) {
 
     device->SetVertexDeclaration(StaticDecl);
 
+    setDistantLandDepthBias(true, 3.0e-6f, 3.0e-6f);
     if (Configuration.UseSharedMemory) {
-        visDistantShared.Render(device, effect, effect, &ehTex0, nullptr, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT);
+        visDistantShared.Render(device, effect, effect, &ehTex0, &ehHasAlpha, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT, false, true);
     } else {
-        visDistant.Render(device, effect, effect, &ehTex0, nullptr, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT);
+        visDistant.Render(device, effect, effect, &ehTex0, &ehHasAlpha, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT, false, true);
     }
+    setDistantLandDepthBias(false);
 
     device->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
 }

@@ -7,16 +7,32 @@
 //------------------------------------------------------------
 // Common functions
 
+static const float windAnimationMaxDistance = 16384.0;
+
+float4 animateStaticPos(StatVertIn IN) {
+    float4 pos = IN.pos;
+    float4 worldpos = mul(pos, world);
+
+    // Match the HLSL fixed-function path for rigid alpha-tested geometry.
+    if (hasAlpha && length(worldpos.xy - eyePos.xy) < windAnimationMaxDistance) {
+        float3 displacement = grassDisplacement(IN.pos.xyz, IN.pos.z, 1.0);
+        pos.xyz += displacement;
+    }
+
+    return pos;
+}
+
 TransformedVert transformStaticVert(StatVertIn IN) {
     // Transforms with implicit depth bias
     TransformedVert v;
+    float4 pos = animateStaticPos(IN);
 
-    v.worldpos = mul(IN.pos, world);
+    v.worldpos = mul(pos, world);
     v.viewpos = mul(v.worldpos, view);
     v.pos = mul(v.viewpos, proj);
 
     // Cull vertices closer than nearViewRange threshold (preserves early-Z, no clip/discard)
-    if (nearViewRange - 1800 > length(v.viewpos))
+    if (nearViewRange - 1500 > length(v.viewpos))
         v.pos = float4(0, 0, -10000, 0);
 
     return v;
@@ -24,8 +40,9 @@ TransformedVert transformStaticVert(StatVertIn IN) {
 
 TransformedVert transformStaticVertReflection(StatVertIn IN) {
     TransformedVert v;
+    float4 pos = animateStaticPos(IN);
 
-    v.worldpos = mul(IN.pos, world);
+    v.worldpos = mul(pos, world);
     v.viewpos = mul(v.worldpos, reflectionView);
     v.pos = pancakeReflectionClip(mul(v.viewpos, reflectionProj));
 
