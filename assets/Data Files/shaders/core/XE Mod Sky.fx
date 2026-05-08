@@ -72,8 +72,8 @@ float4 SkyPS(SkyVertOut IN, float2 vpos : VPOS) : COLOR0 {
             float3 ambientLin = toLinearSrgb(saturate(sunAmb));
             float3 waterDepthLin = toLinearSrgb(saturate(waterDepthCol));
             float below = saturate(-dir.z);
-            float3 lowerSky = lerp(fogFarLin, ambientLin, smoothstep(0.0, 0.35, below));
-            lowerSky = lerp(lowerSky, waterDepthLin, smoothstep(0.35, 1.0, below));
+            float3 lowerSky = lerp(fogFarLin, ambientLin * 0.18, smoothstep(0.0, 0.35, below));
+            lowerSky = lerp(lowerSky, waterDepthLin * 0.18, smoothstep(0.35, 1.0, below));
             c.rgb = lowerSky;
         }
         c.rgb += ditherSky[vpos.x % 4][vpos.y % 4];
