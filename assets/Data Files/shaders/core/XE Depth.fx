@@ -239,8 +239,13 @@ Technique T0 {
         ZWriteEnable = true;
         CullMode = none;
 
+        AlphaBlendEnable = false;
+        AlphaTestEnable = true;
+        AlphaFunc = GreaterEqual;
+        AlphaRef = 128;
+
         VertexShader = compile vs_3_0 DepthGrassInstVS();
-        PixelShader = compile ps_3_0 DepthNearPS();
+        PixelShader = compile ps_3_0 DepthGrassInstPS();
     }
    //------------------------------------------------------------
    // Used for rendering displaced near-patch terrain depth

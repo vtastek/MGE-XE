@@ -190,7 +190,9 @@ void DistantLand::renderDepthDistantLand(DLContext* ctx) {
         if (Configuration.MGEFlags & USE_GRASS) {
             // Grass
             effectDepth->BeginPass(PASS_RENDERGRASSDEPTHINST);
+            vsr.beginAlphaToCoverage(device);
             renderGrassInstZ();
+            vsr.endAlphaToCoverage(device);
             effectDepth->EndPass();
         }
     }
@@ -1363,6 +1365,5 @@ float DistantLand::computeLightRadius(float constant, float linear, float quadra
     // Use 400 units as safe maximum (350 + margin for Hi-Z culling tolerance)
     return 400.0f;
 }
-
 
 

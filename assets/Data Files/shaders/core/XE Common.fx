@@ -267,6 +267,9 @@ float3 fogApply(float3 c, float4 f) {
 
 #ifdef USE_HLSL_PIPELINE
 shared float intensityScalar;
+shared float a2cMipScale;
+shared float a2cTexSize;
+shared float a2cSharpness;
 #define PI 3.14159
 
 float3 toLinearSrgb(float3 c) {

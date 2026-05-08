@@ -140,6 +140,9 @@ public:
     static float GetAttenuationCutoffDist();
     static float GetParallaxScale();
     static float GetParallaxBias();
+    static float GetA2CMipScale();
+    static float GetA2CTexSize();
+    static float GetA2CSharpness();
     static bool GetShowPCFInterface();
     static void TogglePCFInterface();
 
@@ -349,6 +352,11 @@ private:
     // Parallax mapping parameters (debug tunable)
     static float parallaxScale;           // default 0.026
     static float parallaxBias;            // default 0.3
+
+    // Alpha-to-coverage grass parameters (debug tunable)
+    static float a2cMipScale;             // Mip level alpha boost multiplier (default 0.25)
+    static float a2cTexSize;              // Texture size for mip calculation (default 1024)
+    static float a2cSharpness;            // fwidth sharpening multiplier (default 0.5)
 
     // Debug interface controls
     static int bboxVisualizationMode;  // 0=off, 1=objects, 2=lights

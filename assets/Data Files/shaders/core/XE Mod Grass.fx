@@ -6,6 +6,30 @@
 //------------------------------------------------------------
 // Common functions
 
+// Calculate mip level from texture coordinates (in texel space)
+float CalcMipLevel(float2 texcoordTexels) {
+    float2 dx = ddx(texcoordTexels);
+    float2 dy = ddy(texcoordTexels);
+    float delta = max(dot(dx, dx), dot(dy, dy));
+    return max(0, 0.5 * log2(delta));
+}
+
+float grassCoverageAlpha(float alpha, float2 texcoords, float viewDepth) {
+#ifdef USE_HLSL_PIPELINE
+    float mipLevel = CalcMipLevel(texcoords * a2cTexSize);
+    alpha *= 1.0 + mipLevel * a2cMipScale;
+    float alphaRef = 64.0/255.0;
+    float derivative = fwidth(alpha);
+    float distanceFade = pow(saturate(viewDepth / 8192.0), 2.0);
+    float distanceSharpness = lerp(a2cSharpness, 0.1, distanceFade);
+    return saturate((alpha - alphaRef) / max(derivative, 0.0001) * distanceSharpness + 0.5);
+#else
+    float distanceFade = pow(saturate(viewDepth / 8192.0), 2.0);
+    float falloffRate = lerp(4.0, 1.0, distanceFade);
+    return calc_coverage(alpha, 128.0/255.0, falloffRate);
+#endif
+}
+
 TransformedVert transformGrassVert(StatVertInstIn IN) {
     TransformedVert v;
 
@@ -36,6 +60,7 @@ struct GrassVertOut {
 #ifdef USE_HLSL_PIPELINE
     float4 normalFacing : TEXCOORD3;  // .xyz = world normal, .w = facing sign for two-sided
 #endif
+    float4 worldDepth : TEXCOORD4;    // .xyz = world position, .w = view depth
 };
 
 GrassVertOut GrassInstVS(StatVertInstIn IN) {
@@ -44,14 +69,15 @@ GrassVertOut GrassInstVS(StatVertInstIn IN) {
     float3 eyevec = v.worldpos.xyz - eyePos.xyz;
 
     OUT.pos = v.pos;
+    OUT.worldDepth = float4(v.worldpos.xyz, v.pos.w);
     OUT.fog = fogMWColour(length(eyevec));
 
-    // Two-sided facing sign for grass (flip normal based on view direction)
-    float facingSign = -sign(dot(eyevec, v.normal.xyz));
+    // Two-sided facing sign for grass. Keep it binary so lighting never crosses through zero.
+    float facingSign = dot(eyevec, v.normal.xyz) < 0 ? 1.0 : -1.0;
 
 #ifdef USE_HLSL_PIPELINE
-    // Pass normal and facing sign to PS for per-pixel lighting
-    OUT.normalFacing = float4(v.normal.xyz, facingSign);
+    // Pass normal to PS; facing is recomputed per-pixel from world position.
+    OUT.normalFacing = float4(v.normal.xyz, 1.0);
     // color.rgb unused in HLSL PS (lighting computed there), but set for shadow estimate
     float lambert = dot(v.normal.xyz, -sunVec) * facingSign;
     if(lambert < 0) lambert *= -0.3;
@@ -91,22 +117,33 @@ float4 GrassPS(GrassVertOut IN): COLOR0 {
 #ifdef USE_HLSL_PIPELINE
     // Per-pixel lighting in linear space matching FFE/landscape.
     float3 normal = normalize(IN.normalFacing.xyz);
-    float facingSign = IN.normalFacing.w;
+    float3 eyevec = IN.worldDepth.xyz - eyePos.xyz;
+    float facingSign = dot(eyevec, normal) < 0 ? 1.0 : -1.0;
 
     // Two-sided lambert with backscatter
-    float lambert = dot(normal, -sunVec) * facingSign;
-    if(lambert < 0) lambert *= -0.3;
+    float lambert = max(0, dot(normal, -sunVec));
 
+	float3 vt = -sunVec  + normal * 0.5;
+	float vd = pow(saturate(dot(normalize(eyevec), vt)), 2.0) * 0.5;
+	float vl = 1.0 * (vd + toLinearSrgb(sunAmb)/PI);
+
+
+	//lambert = dot(normal, -sunVec);
+    //if(lambert < 0.0) lambert *= -0.5 * PI;
+	
+	//lambert = dot(normal, -normalize(sunVec));
+	float shadows = 1 - saturate(v * shadecolor * 50.);   
     float3 albedoLin = toLinearSrgb(result.rgb);
     float3 sunColLin = toLinearSrgb(sunCol);
-    float3 sunAmbLin = toLinearSrgb(sunAmb) / PI;
+    float3 sunAmbLin = toLinearSrgb(sunAmb);
 
-    float3 lit = albedoLin * (sunColLin * lambert + sunAmbLin);
+    float3 lit = albedoLin * (sunColLin * lambert  +  sunColLin  * vl * shadows + sunAmbLin);
+	
     lit *= intensityScalar;
 
     // Apply shadow darkening (towards blue like legacy)
-    lit *= 1 - v * shadecolor;
-
+    
+	//result.rgb = lambert;
     result.rgb = fogApplyLinearAgX(lit, toLinearSrgb(fogColFar), IN.fog.a);
 #else
     result.rgb *= IN.color.rgb;
@@ -118,8 +155,8 @@ float4 GrassPS(GrassVertOut IN): COLOR0 {
     result.rgb = fogApply(result.rgb, IN.fog);
 #endif
 
-    // Alpha to coverage conversion
-    result.a = calc_coverage(result.a, 128.0/255.0, 4.0);
+    // Alpha to coverage with mipmap compensation and fwidth sharpening
+    result.a = grassCoverageAlpha(result.a, IN.texcoords, IN.worldDepth.w);
 
     return result;
 }
@@ -140,6 +177,28 @@ DepthVertOut DepthGrassInstVS(StatVertInstIn IN) {
     // Grass is static (sway is cosmetic), no velocity
     OUT.curClip = OUT.pos;
     OUT.prevClip = OUT.pos;
+
+    return OUT;
+}
+
+struct GrassDepthVelocityOut {
+    float4 depth : COLOR0;
+    float4 velocity : COLOR1;
+};
+
+GrassDepthVelocityOut DepthGrassInstPS(DepthVertOut IN) {
+    GrassDepthVelocityOut OUT;
+
+    clip(nearViewRange + 64.0 - IN.depth);
+
+    float alpha = tex2D(sampBaseTex, IN.texcoords).a;
+    if(alpha < 64.0/255.0)
+        discard;
+
+    float coverage = grassCoverageAlpha(alpha, IN.texcoords, IN.depth);
+
+    OUT.depth = float4(IN.depth, IN.depth, IN.depth, coverage);
+    OUT.velocity = float4(0, 0, 0, 1);
 
     return OUT;
 }
