@@ -16,14 +16,16 @@ void DistantLand::renderWaterReflection(DLContext* ctx, const D3DXMATRIX* view, 
 
     // Switch to render target
     RenderTargetSwitcher rtsw(texReflection, surfReflectionZ);
-    device->Clear(0, NULL, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, ctx->horizonCol, 1.0, 0);
+    device->Clear(0, NULL, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, ctx->horizonCol, 1.0, 0);
     const bool usePancakedReflections = ImGuiManager::GetPancakedReflections();
     effect->SetFloat(ehReflectionWaterLevel, ctx->waterLevel);
 
-    // Use the early-Z depth texture to prefill reflection Z where main-view
-    // geometry is in front of the water plane. Reflected draws then reject
-    // those pixels before running their expensive pixel shaders.
+    // Use the early-Z depth texture to mark reflection pixels where main-view
+    // geometry is in front of the water plane. Reflected draws keep real Z for
+    // stable ordering and use this stencil mask for early rejection.
     if (usePancakedReflections && !ctx->isUnderwater && ImGuiManager::GetEnableEarlyZ()) {
+        effect->SetMatrix(ehView, view);
+        effect->SetMatrix(ehProj, proj);
         effect->SetTexture(ehTex3, texDepthFrame);
         effect->CommitChanges();
         effect->BeginPass(PASS_REFLECTIONMASK);
@@ -48,10 +50,9 @@ void DistantLand::renderWaterReflection(DLContext* ctx, const D3DXMATRIX* view, 
     if (usePancakedReflections) {
         effect->SetMatrix(ehReflectionView, &reflView);
         effect->SetMatrix(ehReflectionProj, &reflProj);
-    } else {
-        effect->SetMatrix(ehView, &reflView);
-        effect->SetMatrix(ehProj, &reflProj);
     }
+    effect->SetMatrix(ehView, &reflView);
+    effect->SetMatrix(ehProj, &reflProj);
 
     // Clipping setup
     D3DXMATRIX clipMat;
@@ -120,11 +121,13 @@ void DistantLand::renderWaterReflection(DLContext* ctx, const D3DXMATRIX* view, 
         // Draw sky reflection, with opposite culling
         effect->SetMatrix(ehView, &reflView);
         effect->SetMatrix(ehProj, &reflProj);
+        device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
         renderReflectedSky(ctx, activeSky);
     }
 
     // Restore view state
     device->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
+    device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
     effect->SetMatrix(ehView, view);
     effect->SetMatrix(ehProj, proj);
 }
@@ -143,6 +146,8 @@ void DistantLand::renderReflectedSky(DLContext* ctx, const std::vector<RecordedM
     // Render sky without clouds first
     effect->BeginPass(PASS_RENDERSKY);
     device->SetRenderState(D3DRS_CULLMODE, D3DCULL_CCW);
+    device->SetRenderState(D3DRS_ZENABLE, TRUE);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
 
     for (const auto& i : recordSky_const) {
         // Skip clouds
@@ -196,6 +201,8 @@ void DistantLand::renderReflectedSky(DLContext* ctx, const std::vector<RecordedM
     // Render clouds with a separate shader
     effect->BeginPass(PASS_RENDERCLOUDS);
     device->SetRenderState(D3DRS_CULLMODE, D3DCULL_CCW);
+    device->SetRenderState(D3DRS_ZENABLE, TRUE);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
 
     for (const auto& i : recordSky_const) {
         // Clouds only

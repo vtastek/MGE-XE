@@ -1245,8 +1245,9 @@ bool DistantLand::initWater() {
         return false;
     }
 
-    // Reflection Z-buffer
-    hr = device->CreateDepthStencilSurface(reflRes, reflRes, D3DFMT_D24X8, D3DMULTISAMPLE_NONE, 0, TRUE, &surfReflectionZ, NULL);
+    // Reflection depth/stencil. Stencil stores the main-view water occlusion mask
+    // so reflected geometry can keep real Z ordering while still skipping hidden pixels.
+    hr = device->CreateDepthStencilSurface(reflRes, reflRes, D3DFMT_D24S8, D3DMULTISAMPLE_NONE, 0, TRUE, &surfReflectionZ, NULL);
     if (hr != D3D_OK) {
         LOG::logline("!! Failed to create reflection Z buffer");
         return false;

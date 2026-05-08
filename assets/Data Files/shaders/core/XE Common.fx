@@ -136,7 +136,14 @@ float4 pancakeReflectionClip(float4 reflClip) {
                               waterDepth, 1);
     float4 waterClip = mul(waterView, proj);
 
-    reflClip.z = (waterClip.z / waterClip.w) * reflClip.w;
+    float reflZ = reflClip.z / reflClip.w;
+    float waterZ = waterClip.z / waterClip.w;
+
+    // Keep reflection geometry close to the water-plane depth for early-Z, but
+    // preserve enough real reflected depth to avoid coplanar fights within trees.
+    // Only adjust z; changing w/xy breaks perspective interpolation and skews geometry.
+    float pancakeZ = lerp(waterZ, reflZ, 0.0005);
+    reflClip.z = pancakeZ * reflClip.w;
     return reflClip;
 }
 

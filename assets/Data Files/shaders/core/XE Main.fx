@@ -290,12 +290,20 @@ Technique T0 {
         ZEnable = true;
         ZWriteEnable = true;
         ZFunc = LessEqual;
+        StencilEnable = true;
+        StencilFunc = NotEqual;
+        StencilRef = 1;
+        StencilMask = 255;
+        StencilWriteMask = 0;
+        StencilFail = Keep;
+        StencilZFail = Keep;
+        StencilPass = Keep;
         CullMode = CCW;
 
         AlphaBlendEnable = false;
         AlphaTestEnable = false;
 
-        VertexShader = compile vs_3_0 LandscapeReflVS();
+        VertexShader = compile vs_3_0 LandscapeReflOldVS();
         PixelShader = compile ps_3_0 LandscapePS();
     }
     //------------------------------------------------------------
@@ -318,6 +326,14 @@ Technique T0 {
         ZEnable = true;
         ZWriteEnable = true;
         ZFunc = LessEqual;
+        StencilEnable = true;
+        StencilFunc = NotEqual;
+        StencilRef = 1;
+        StencilMask = 255;
+        StencilWriteMask = 0;
+        StencilFail = Keep;
+        StencilZFail = Keep;
+        StencilPass = Keep;
         CullMode = CW;
 
         AlphaBlendEnable = false;
@@ -325,7 +341,7 @@ Technique T0 {
         AlphaFunc = GreaterEqual;
         AlphaRef = 133;
 
-        VertexShader = compile vs_3_0 StaticExteriorReflVS();
+        VertexShader = compile vs_3_0 StaticExteriorVS();
         PixelShader = compile ps_3_0 StaticPS();
     }
     //------------------------------------------------------------
@@ -334,6 +350,14 @@ Technique T0 {
         ZEnable = true;
         ZWriteEnable = true;
         ZFunc = LessEqual;
+        StencilEnable = true;
+        StencilFunc = NotEqual;
+        StencilRef = 1;
+        StencilMask = 255;
+        StencilWriteMask = 0;
+        StencilFail = Keep;
+        StencilZFail = Keep;
+        StencilPass = Keep;
         CullMode = CW;
 
         AlphaBlendEnable = false;
@@ -341,7 +365,7 @@ Technique T0 {
         AlphaFunc = GreaterEqual;
         AlphaRef = 133;
 
-        VertexShader = compile vs_3_0 StaticInteriorReflVS();
+        VertexShader = compile vs_3_0 StaticInteriorVS();
         PixelShader = compile ps_3_0 StaticPS();
     }
     //------------------------------------------------------------
@@ -525,9 +549,16 @@ Technique T0 {
     //------------------------------------------------------------
     // Used to prefill reflection Z where main-view early-Z hides water
     Pass P13 {
-        ZEnable = true;
-        ZWriteEnable = true;
-        ZFunc = Always;
+        ZEnable = false;
+        ZWriteEnable = false;
+        StencilEnable = true;
+        StencilFunc = Always;
+        StencilRef = 1;
+        StencilMask = 255;
+        StencilWriteMask = 255;
+        StencilFail = Keep;
+        StencilZFail = Keep;
+        StencilPass = Replace;
         CullMode = none;
         AlphaBlendEnable = false;
         AlphaTestEnable = false;

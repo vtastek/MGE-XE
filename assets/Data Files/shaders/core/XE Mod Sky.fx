@@ -62,8 +62,20 @@ float4 SkyPS(SkyVertOut IN, float2 vpos : VPOS) : COLOR0 {
         float3 dir = normalize(IN.skypos.xyz);
         float3 fogFarLin = toLinearSrgb(fogColFar);
         float3 skyColLin = toLinearSrgb(skyCol);
-        float t = 1 - pow(saturate(1 - 2.22 * saturate(dir.z - 0.075)), 1.15);
-        c.rgb = lerp(fogFarLin, skyColLin, t);
+        float skyT = 1 - pow(saturate(1 - 2.22 * saturate(dir.z - 0.075)), 1.15);
+        c.rgb = lerp(fogFarLin, skyColLin, skyT);
+
+        if (dir.z < 0) {
+            float sunlightFactor = 1 - pow(1 - sunVis, 2);
+            float3 sunColAdjusted = sunCol * sunlightFactor;
+            float3 waterDepthCol = sunColAdjusted * float3(0.03, 0.04, 0.05) + (2 * skyCol + fogColFar) * float3(0.075, 0.08, 0.085);
+            float3 ambientLin = toLinearSrgb(saturate(sunAmb));
+            float3 waterDepthLin = toLinearSrgb(saturate(waterDepthCol));
+            float below = saturate(-dir.z);
+            float3 lowerSky = lerp(fogFarLin, ambientLin, smoothstep(0.0, 0.35, below));
+            lowerSky = lerp(lowerSky, waterDepthLin, smoothstep(0.35, 1.0, below));
+            c.rgb = lowerSky;
+        }
         c.rgb += ditherSky[vpos.x % 4][vpos.y % 4];
     }
     c.rgb = ToneMap_AgX_Linear(c.rgb / PI);  // pre-exposed: cancel internal exposure bias

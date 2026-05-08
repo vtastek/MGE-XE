@@ -81,6 +81,23 @@ float3 getProjectedReflection(float4 tex)
 
 #endif
 
+float reflectionOcclusionAt(float4 tex)
+{
+    float2 uv = tex.xy / tex.w;
+    float2 ndc = float2(2 * (uv.x - 0.5 * (1 + rcpRes.x)),
+                        -2 * (uv.y - 0.5 * (1 + rcpRes.y)));
+
+    float3 ray = float3(view[0][2], view[1][2], view[2][2]);
+    ray += (ndc.x / proj[0][0]) * float3(view[0][0], view[1][0], view[2][0]);
+    ray += (ndc.y / proj[1][1]) * float3(view[0][1], view[1][1], view[2][1]);
+
+    float waterDepth = (waterLevel - eyePos.z) / ray.z;
+    float sceneDepth = tex2Dproj(sampDepth, tex).r;
+    float validScene = step(sceneDepth, nearViewRange + 64.0) * step(0.0, waterDepth);
+
+    return validScene * smoothstep(-128.0, 384.0, waterDepth - sceneDepth);
+}
+
 //------------------------------------------------------------
 // Water shader
 
@@ -206,7 +223,9 @@ float4 WaterPS(in WaterVertOut IN): COLOR0
 #else
     float4 screenpos = IN.screenposclamp;
 #endif
-    float3 reflected = getProjectedReflection(screenpos - float4(2.1 * reffactor.x, -abs(reffactor.y), 0, 0));
+    float4 reflectedPos = screenpos - float4(2.1 * reffactor.x, -abs(reffactor.y), 0, 0);
+    reflectedPos.xy = lerp(reflectedPos.xy, screenpos.xy, reflectionOcclusionAt(reflectedPos));
+    float3 reflected = getProjectedReflection(reflectedPos);
 
     // Fade reflection into an inscatter dominated horizon
     reflected = lerp(fog.rgb, reflected, fog.a);
@@ -258,7 +277,9 @@ float4 UnderwaterPS(in WaterVertOut IN): COLOR0
     refracted = lerp(fogColFar, refracted, exp(-dist / 500));
 
     // Sample reflection texture
-    float3 reflected = getProjectedReflection(IN.screenpos - float4(2.1 * reffactor.x, -abs(reffactor.y), 0, 0));
+    float4 reflectedPos = IN.screenpos - float4(2.1 * reffactor.x, -abs(reffactor.y), 0, 0);
+    reflectedPos.xy = lerp(reflectedPos.xy, IN.screenpos.xy, reflectionOcclusionAt(reflectedPos));
+    float3 reflected = getProjectedReflection(reflectedPos);
 
     // Fresnel equation, including total internal reflection
     float fresnel = pow(saturate(1.12 - 0.65 * dot(-EyeVec, normal)), 8);
