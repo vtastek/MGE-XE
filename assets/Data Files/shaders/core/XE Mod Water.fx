@@ -82,21 +82,12 @@ float3 getProjectedReflection(float4 tex)
 
 #endif
 
-float reflectionOcclusionAt(float4 tex)
+float reflectionOcclusionAt(float4 tex, float actualWaterDepth)
 {
-    float2 uv = tex.xy / tex.w;
-    float2 ndc = float2(2 * (uv.x - 0.5 * (1 + rcpRes.x)),
-                        -2 * (uv.y - 0.5 * (1 + rcpRes.y)));
-
-    float3 ray = float3(view[0][2], view[1][2], view[2][2]);
-    ray += (ndc.x / proj[0][0]) * float3(view[0][0], view[1][0], view[2][0]);
-    ray += (ndc.y / proj[1][1]) * float3(view[0][1], view[1][1], view[2][1]);
-
-    float waterDepth = (waterLevel - eyePos.z) / ray.z;
     float sceneDepth = tex2Dproj(sampDepth, tex).r;
-    float validScene = step(sceneDepth, nearViewRange + 64.0) * step(0.0, waterDepth);
+    float validScene = step(sceneDepth, nearViewRange + 64.0);
 
-    return validScene * smoothstep(-128.0, 384.0, waterDepth - sceneDepth);
+    return validScene * smoothstep(-128.0, 384.0, actualWaterDepth - sceneDepth);
 }
 
 //------------------------------------------------------------
@@ -155,15 +146,14 @@ WaterVertOut WaterVS (in float4 pos : POSITION)
     float dist = length(eyePos.xyz - OUT.pos.xyz);
 
     float addheight = waveHeight * (lerp(height, height2, saturate(dist/8000)) - 0.5) * saturate(1 - dist/6400) * saturate(dist/200);
-    OUT.pos.z += addheight;
-
+    OUT.pos.z += addheight - waveHeight * 0.2;
     // Calculate screen position for refraction
     OUT.position = mul(OUT.pos, view);
     OUT.position = mul(OUT.position, proj);
     OUT.screenpos = float4(0.5 * (1 + rcpRes) * OUT.position.w + float2(0.5, -0.5) * OUT.position.xy, OUT.position.zw);
 
     // Clamp reflection point to be above surface
-    float4 clampedPos = OUT.pos - float4(0, 0, abs(addheight), 0);
+    float4 clampedPos = OUT.pos - float4(0, 0, 0 * abs(addheight), 0);
     clampedPos = mul(clampedPos, view);
     clampedPos = mul(clampedPos, proj);
     OUT.screenposclamp = float4(0.5 * (1 + rcpRes) * clampedPos.w + float2(0.5, -0.5) * clampedPos.xy, clampedPos.zw);
@@ -229,12 +219,12 @@ float4 WaterPS(in WaterVertOut IN): COLOR0
     float4 screenpos = IN.screenposclamp;
 #endif
     float4 reflectedPos = screenpos - float4(2.1 * reffactor.x, -abs(reffactor.y), 0, 0);
-    reflectedPos.xy = lerp(reflectedPos.xy, screenpos.xy, reflectionOcclusionAt(reflectedPos));
+    reflectedPos.xy = lerp(reflectedPos.xy, screenpos.xy, reflectionOcclusionAt(reflectedPos, IN.screenpos.w));
     float3 reflected = getProjectedReflection(reflectedPos);
 
     // Fade reflection into an inscatter dominated horizon
     reflected = lerp(reflected * 0.96, reflected, fog.a);
-
+	//return float4(reflected, 1.0);
     // Smooth out high frequencies at a distance
     float3 adjustnormal = lerp(float3(0, 0, 0.1), normal, pow(saturate(1.05 * fog.a), 2));
     adjustnormal = lerp(adjustnormal, float3(0, 0, 1.0), (1 + EyeVec.z) * (1 - saturate(1 / (dist / 1000 + 1))));
@@ -283,7 +273,7 @@ float4 UnderwaterPS(in WaterVertOut IN): COLOR0
 
     // Sample reflection texture
     float4 reflectedPos = IN.screenpos - float4(2.1 * reffactor.x, -abs(reffactor.y), 0, 0);
-    reflectedPos.xy = lerp(reflectedPos.xy, IN.screenpos.xy, reflectionOcclusionAt(reflectedPos));
+    reflectedPos.xy = lerp(reflectedPos.xy, IN.screenpos.xy, reflectionOcclusionAt(reflectedPos, IN.screenpos.w));
     float3 reflected = getProjectedReflection(reflectedPos);
 
     // Fresnel equation, including total internal reflection
