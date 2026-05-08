@@ -1097,6 +1097,43 @@ void DistantLand::renderStageWater(DLContext* ctx) {
     }
 }
 
+// renderDepthBackfill - Fill DL areas with dark ambient before MW render
+// Prevents bright sky clear color from bleeding through AA edges against DL
+void DistantLand::renderDepthBackfill(DLContext* ctx) {
+    // Only needed in HLSL mode
+    if (!isHLSLActive()) {
+        return;
+    }
+
+    // Skip if no DL (interior without distant statics)
+    if (!ctx->hasWorldSpace) {
+        return;
+    }
+
+    // Skip if render is cached
+    if (s_frameRenderCached) {
+        return;
+    }
+
+    IDirect3DStateBlock9* stateSaved;
+    UINT passes;
+
+    device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
+    effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
+
+    // Set depth texture for sampling
+    effect->SetTexture(ehTex3, texDepthFrame);
+    effect->CommitChanges();
+
+    effect->BeginPass(PASS_DEPTHBACKFILL);
+    PostShaders::applyBlend();
+    effect->EndPass();
+
+    effect->End();
+    stateSaved->Apply();
+    stateSaved->Release();
+}
+
 // setupCommonEffect - Set shared shader variables for this frame
 void DistantLand::setupCommonEffect(DLContext* ctx, const D3DXMATRIX* view, const D3DXMATRIX* proj) {
     auto mwBridge = MWBridge::get();

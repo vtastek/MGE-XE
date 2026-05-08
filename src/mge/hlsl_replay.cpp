@@ -1829,6 +1829,12 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
     // Reset to baseline state at start of each scene replay to prevent cross-scene leaks
     setReplayBaseline(cmdBuf, device);
 
+    // Scene 0 only: Fill DL areas with dark ambient before MW geometry
+    // Prevents bright sky clear color from bleeding through AA edges against DL
+    if (sceneCount == 0 && !cmdBuf) {
+        DistantLand::renderDepthBackfill(&fb.dlContext);
+    }
+
     // N-1: Use rendering buffer's currentView/currentProj (stamped at previous Present())
     // These matrices represent the camera position when this frame was recorded
     D3DXMATRIX currentView = fb.currentView;

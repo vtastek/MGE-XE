@@ -52,6 +52,29 @@ float4 MGEBlendPS(DeferredOut IN) : COLOR0 {
 }
 
 //------------------------------------------------------------
+// Depth backfill for HLSL clear color fix
+// Fills DL areas with dark ambient instead of bright sky clear color
+// Uses min filter to dilate coverage and catch AA edge pixels
+
+float4 DepthBackfillPS(DeferredOut IN) : COLOR0 {
+    // Sample 3x3 neighborhood and take minimum depth (dilates DL coverage)
+    float depth = tex2Dlod(sampDepthPoint, IN.tex).r;
+    depth = min(depth, tex2Dlod(sampDepthPoint, IN.tex + float4(-rcpRes.x, 0, 0, 0)).r);
+    depth = min(depth, tex2Dlod(sampDepthPoint, IN.tex + float4(rcpRes.x, 0, 0, 0)).r);
+    depth = min(depth, tex2Dlod(sampDepthPoint, IN.tex + float4(0, -rcpRes.y, 0, 0)).r);
+    depth = min(depth, tex2Dlod(sampDepthPoint, IN.tex + float4(0, rcpRes.y, 0, 0)).r);
+    depth = min(depth, tex2Dlod(sampDepthPoint, IN.tex + float4(-rcpRes.x, -rcpRes.y, 0, 0)).r);
+    depth = min(depth, tex2Dlod(sampDepthPoint, IN.tex + float4(rcpRes.x, -rcpRes.y, 0, 0)).r);
+    depth = min(depth, tex2Dlod(sampDepthPoint, IN.tex + float4(-rcpRes.x, rcpRes.y, 0, 0)).r);
+    depth = min(depth, tex2Dlod(sampDepthPoint, IN.tex + float4(rcpRes.x, rcpRes.y, 0, 0)).r);
+
+    // Discard sky pixels (no DL depth nearby) - keeps sky clear color
+    clip(nearViewRange - depth - 1.0);
+    // DL exists nearby - output dark ambient
+    return float4(sunAmb * 0.18, 1.0);
+}
+
+//------------------------------------------------------------
 // Water reflection occlusion mask
 
 struct ReflectionMaskOut {
@@ -566,6 +589,22 @@ Technique T0 {
 
         VertexShader = compile vs_3_0 ReflectionMaskVS();
         PixelShader = compile ps_3_0 ReflectionMaskPS();
+    }
+    //------------------------------------------------------------
+    // Depth backfill - fills DL areas with dark color before MW render
+    // Prevents bright sky clear color from bleeding through AA edges
+    Pass P14 {
+        ZEnable = false;
+        ZWriteEnable = false;
+        StencilEnable = false;
+        CullMode = CW;
+        FillMode = Solid;
+
+        AlphaBlendEnable = false;
+        AlphaTestEnable = false;
+
+        VertexShader = compile vs_3_0 MGEBlendVS();
+        PixelShader = compile ps_3_0 DepthBackfillPS();
     }
     //------------------------------------------------------------
 }

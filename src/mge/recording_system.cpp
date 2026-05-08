@@ -1045,6 +1045,9 @@ void FixedFunctionShader::executeGpuPhase() {
     DistantLand::renderStage1(frameCtx, &fb);
     DistantLand::renderForwardPrepassChain(frameCtx, &fb.postProcessData);
 
+    // Fill DL areas with dark ambient before MW replay (prevents sky clear color AA artifacts)
+    DistantLand::renderDepthBackfill(frameCtx);
+
     // Build HLSL replay into command buffer, then replay it
     // IMPORTANT: Only replay Scene 0 here! Scene 1/2 are recorded AFTER EndScene(0),
     // so replaying them here would use STALE data from previous frame (race condition).
@@ -1200,6 +1203,9 @@ void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool w
         // contributes to SSAO.
         DistantLand::renderForwardPrepassChain(renderCtx, &fb.postProcessData);
     }
+
+    // Fill DL areas with dark ambient before MW replay (prevents sky clear color AA artifacts)
+    DistantLand::renderDepthBackfill(renderCtx);
 
     // === REPLAY ALL SCENES ===
     isReplaying.store(true, std::memory_order_release);
