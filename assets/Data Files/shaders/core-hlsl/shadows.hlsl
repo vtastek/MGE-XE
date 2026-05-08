@@ -158,6 +158,47 @@ float shadowSampleESM(float4 shadowPos, float2 shadowUV, int cascade, float rece
     return shadow / sampleCount;
 }
 
+// Shadow texel density checkerboard visualization
+// Returns: RGB color showing cascade (hue) and texel density (checker size)
+// checkerScale: texels per checker square (8 = 8x8 texel blocks)
+float3 shadowTexelCheckerboard(float4 shadow0pos, float4 shadow1pos, float checkerScale) {
+    float3 atlasMargin = float3(1.0 - 2.0 * 4.0 * shadowRcpRes, 1.0 - 2.0 * 4.0 * shadowRcpRes, 1.0);
+
+    bool inNear = all(saturate(atlasMargin - abs(shadow0pos.xyz)));
+    bool inFar = all(saturate(atlasMargin - abs(shadow1pos.xyz)));
+
+    // Shadow map size (matches shadowSamplePCF hardcoded value)
+    float shadowMapSize = 2048.0;
+
+    float2 shadowUV0 = (0.5 + 0.5 * shadowRcpRes) + float2(0.5, -0.5) * shadow0pos.xy;
+    float2 shadowUV1 = (0.5 + 0.5 * shadowRcpRes) + float2(0.5, -0.5) * shadow1pos.xy;
+
+    // Checkerboard at scaled texel resolution (checkerScale texels per square)
+    float2 texelPos0 = shadowUV0 * shadowMapSize / checkerScale;
+    float2 texelPos1 = shadowUV1 * shadowMapSize / checkerScale;
+
+    float checker0 = fmod(floor(texelPos0.x) + floor(texelPos0.y), 2.0);
+    float checker1 = fmod(floor(texelPos1.x) + floor(texelPos1.y), 2.0);
+
+    // Cascade 0 (near): cyan/magenta
+    float3 color0A = float3(0.0, 1.0, 1.0);  // cyan
+    float3 color0B = float3(1.0, 0.0, 1.0);  // magenta
+
+    // Cascade 1 (far): yellow/blue
+    float3 color1A = float3(1.0, 1.0, 0.0);  // yellow
+    float3 color1B = float3(0.0, 0.0, 1.0);  // blue
+
+    if (inNear) {
+        return lerp(color0A, color0B, checker0);
+    }
+    else if (inFar) {
+        return lerp(color1A, color1B, checker1);
+    }
+
+    // Outside both cascades - gray
+    return float3(0.3, 0.3, 0.3);
+}
+
 // Main shadow sampling function for cascaded shadow maps
 float shadowSample(float4 shadow0pos, float4 shadow1pos, float ndotlgeo, float alphaFlag) {
     float3 atlasMargin = float3(1.0 - 2.0 * 4.0 * shadowRcpRes, 1.0 - 2.0 * 4.0 * shadowRcpRes, 1.0);

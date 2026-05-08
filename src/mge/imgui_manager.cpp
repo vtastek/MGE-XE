@@ -28,6 +28,10 @@ float ImGuiManager::pcfBias2 = 0.0038f;          // Second depth bias for lerp
 float ImGuiManager::pcfSlopeBias = 0.0047f;      // Slope-based bias to prevent acne on angled surfaces
 float ImGuiManager::pcfTerrainBias = 0.02f;      // Extra bias for terrain receivers (near cascade, all modes)
 
+// Shadow cascade radii
+float ImGuiManager::shadowNearRadius = 1000.0f;  // Near cascade radius in world units
+float ImGuiManager::shadowFarRadius = 4000.0f;   // Far cascade radius in world units
+
 float ImGuiManager::intensityScalar = 1.0f;      // HLSL-pipeline unified-look intensity multiplier
 float ImGuiManager::attenuationMultiplier = 40000.0f;   // Point light attenuation multiplier (inverse-square)
 float ImGuiManager::attenuationCutoffDist = 1000.0f;    // Point light cutoff distance
@@ -383,6 +387,13 @@ void ImGuiManager::RenderPCFFilteringInterface() {
         ImGui::SliderFloat("Terrain Bias (near)", &pcfTerrainBias, 0.0f, 0.02f, "%.4f");
 
         ImGui::Separator();
+        ImGui::Text("Cascade Radii");
+        ImGui::SliderFloat("Near Radius", &shadowNearRadius, 500.0f, 3000.0f, "%.0f");
+        ImGui::SliderFloat("Far Radius", &shadowFarRadius, 1000.0f, 8000.0f, "%.0f");
+        float ratio = shadowFarRadius / shadowNearRadius;
+        ImGui::Text("Ratio: %.2f (texel density ratio: %.1f:1)", ratio, ratio);
+
+        ImGui::Separator();
         ImGui::Text("HLSL Unified Look");
         ImGui::SliderFloat("Intensity", &intensityScalar, 0.1f, 10.0f, "%.2f");
         ImGui::SliderFloat("Atten Multiplier", &attenuationMultiplier, 1.0f, 100000.0f, "%.0f", ImGuiSliderFlags_Logarithmic);
@@ -432,6 +443,8 @@ float ImGuiManager::GetPCFBias() { return pcfBias; }
 float ImGuiManager::GetPCFBias2() { return pcfBias2; }
 float ImGuiManager::GetPCFSlopeBias() { return pcfSlopeBias; }
 float ImGuiManager::GetPCFTerrainBias() { return pcfTerrainBias; }
+float ImGuiManager::GetShadowNearRadius() { return shadowNearRadius; }
+float ImGuiManager::GetShadowFarRadius() { return shadowFarRadius; }
 float ImGuiManager::GetIntensityScalar() { return intensityScalar; }
 float ImGuiManager::GetAttenuationMultiplier() { return attenuationMultiplier; }
 float ImGuiManager::GetAttenuationCutoffDist() { return attenuationCutoffDist; }
@@ -539,9 +552,10 @@ void ImGuiManager::RenderDebugInterface() {
             "17: Height (paramH.g, blue=no paramH)",
             "18: Raw Sun Color (input)",
             "19: Raw Ambient Color (input)",
-            "20: Middle Gray (0.18 lin / 0.5 gamma)"
+            "20: Middle Gray (0.18 lin / 0.5 gamma)",
+            "21: Shadow Texel Density (checkerboard)"
         };
-        ImGui::Combo("Shader Debug View", &shaderDebugMode, debugModes, 21);
+        ImGui::Combo("Shader Debug View", &shaderDebugMode, debugModes, 22);
         ImGui::SetItemTooltip("Override shader output to visualize internal values");
 
         ImGui::Checkbox("Enable Stateless Batching (experimental)", &enableStatelessBatch);

@@ -11,8 +11,8 @@
 
 
 
-static const float shadowNearRadius = 1000.0;
-static const float shadowFarRadius = 4000.0;
+// Shadow cascade radii now controlled via ImGui (imgui_manager.cpp)
+// Default values: near=1000, far=4000
 
 
 
@@ -56,12 +56,12 @@ void DistantLand::renderShadowMap(DLContext* ctx) {
 
     // Render near layer (changes viewport)
     LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] layer0 start");
-    renderShadowLayer(ctx, 0, shadowNearRadius, &inverseCameraProj);
+    renderShadowLayer(ctx, 0, ImGuiManager::GetShadowNearRadius(), &inverseCameraProj);
     LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] layer0 done");
 
     // Render far layer (changes viewport)
     LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] layer1 start");
-    renderShadowLayer(ctx, 1, shadowFarRadius, &inverseCameraProj);
+    renderShadowLayer(ctx, 1, ImGuiManager::GetShadowFarRadius(), &inverseCameraProj);
     LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] layer1 done");
 
     // Reset viewport

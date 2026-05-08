@@ -135,6 +135,8 @@ public:
     static float GetPCFBias2();
     static float GetPCFSlopeBias();
     static float GetPCFTerrainBias();
+    static float GetShadowNearRadius();
+    static float GetShadowFarRadius();
     static float GetIntensityScalar();
     static float GetAttenuationMultiplier();
     static float GetAttenuationCutoffDist();
@@ -342,6 +344,10 @@ private:
     static float pcfBias2;             // Second depth bias for lerp
     static float pcfSlopeBias;         // Slope-based bias to prevent acne on angled surfaces
     static float pcfTerrainBias;       // Extra bias added only to terrain receivers (near cascade, all modes)
+
+    // Shadow cascade radii (debug tunable)
+    static float shadowNearRadius;     // Near cascade radius in world units (default 1000)
+    static float shadowFarRadius;      // Far cascade radius in world units (default 4000)
 
     // HLSL-pipeline unified-look intensity multiplier (mirrors Configuration.IntensityScalar).
     static float intensityScalar;
