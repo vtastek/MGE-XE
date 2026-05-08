@@ -1133,8 +1133,8 @@ void DistantLand::renderDepthBackfill(DLContext* ctx) {
     stateSaved->Apply();
     stateSaved->Release();
 
-    // Render grass after backfill in HLSL mode
-    renderGrassAfterBackfill(ctx);
+    // HLSL grass color is rendered after Scene 0 replay, just before water samples
+    // the backbuffer for refraction. Depth was already emitted in renderStage1.
 }
 
 // renderGrassAfterBackfill - Render DL grass after backfill pass (HLSL mode only)

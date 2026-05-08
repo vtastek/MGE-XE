@@ -18,6 +18,7 @@ static const float3 sunColAdjusted = sunCol * sunlightFactor;
 static const float3 depthBaseColor = sunColAdjusted * float3(0.03, 0.04, 0.05) + (2 * skyCol + fogColFar) * float3(0.075, 0.08, 0.085);
 static const float windFactor = (length(windVec) + 1.5) / 140;
 static const float waterLevel = world[3][2];
+static const float shoreDepthBias = 24.0;
 
 shared texture tex4, tex5;
 shared float3 rippleOrigin;
@@ -190,21 +191,25 @@ float4 WaterPS(in WaterVertOut IN): COLOR0
 
     // Distort refraction dependent on depth
     float4 newscrpos = IN.screenpos + float4(reffactor.yx, 0, 0);
-    float depth = max(0, tex2Dproj(sampDepth, newscrpos).r - IN.screenpos.w);
+    float sceneDepth = tex2Dproj(sampDepth, newscrpos).r;
+    float aboveWaterDepth = step(sceneDepth + shoreDepthBias, IN.screenpos.w);
+    float depth = max(shoreDepthBias, sceneDepth - IN.screenpos.w);
 
     // Refraction
     float3 refracted = depthColor;
     float shorefactor = 0;
 
     // Avoid sampling deep water
-    if(depth < 4000)
+    if(depth < 4000 && aboveWaterDepth < 0.5)
     {
         // Sample refraction texture
         newscrpos = IN.screenpos + saturate(depth / 100) * float4(reffactor.yx, 0, 0);
         refracted = tex2Dproj(sampRefract, newscrpos).rgb;
 
         // Get distorted depth
-        depth = max(0, tex2Dproj(sampDepth, newscrpos).r - IN.screenpos.w);
+        sceneDepth = tex2Dproj(sampDepth, newscrpos).r;
+        aboveWaterDepth = step(sceneDepth + shoreDepthBias, IN.screenpos.w);
+        depth = max(shoreDepthBias, sceneDepth - IN.screenpos.w);
         depth /= dot(EyeVec, float3(view[0][2], view[1][2], view[2][2]));
 
         // Small scale shoreline animation

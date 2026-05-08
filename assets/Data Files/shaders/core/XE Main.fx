@@ -58,20 +58,20 @@ float4 MGEBlendPS(DeferredOut IN) : COLOR0 {
 
 float4 DepthBackfillPS(DeferredOut IN) : COLOR0 {
     // Sample 3x3 neighborhood and take minimum depth (dilates DL coverage)
-    float depth = tex2Dlod(sampDepthPoint, IN.tex).r;
-    depth = min(depth, tex2Dlod(sampDepthPoint, IN.tex + float4(-rcpRes.x, 0, 0, 0)).r);
-    depth = min(depth, tex2Dlod(sampDepthPoint, IN.tex + float4(rcpRes.x, 0, 0, 0)).r);
-    depth = min(depth, tex2Dlod(sampDepthPoint, IN.tex + float4(0, -rcpRes.y, 0, 0)).r);
-    depth = min(depth, tex2Dlod(sampDepthPoint, IN.tex + float4(0, rcpRes.y, 0, 0)).r);
-    depth = min(depth, tex2Dlod(sampDepthPoint, IN.tex + float4(-rcpRes.x, -rcpRes.y, 0, 0)).r);
-    depth = min(depth, tex2Dlod(sampDepthPoint, IN.tex + float4(rcpRes.x, -rcpRes.y, 0, 0)).r);
-    depth = min(depth, tex2Dlod(sampDepthPoint, IN.tex + float4(-rcpRes.x, rcpRes.y, 0, 0)).r);
-    depth = min(depth, tex2Dlod(sampDepthPoint, IN.tex + float4(rcpRes.x, rcpRes.y, 0, 0)).r);
+    // float depth = tex2Dlod(sampDepthPoint, IN.tex).r;
+    // depth = min(depth, tex2Dlod(sampDepthPoint, IN.tex + float4(-rcpRes.x, 0, 0, 0)).r);
+    // depth = min(depth, tex2Dlod(sampDepthPoint, IN.tex + float4(rcpRes.x, 0, 0, 0)).r);
+    // depth = min(depth, tex2Dlod(sampDepthPoint, IN.tex + float4(0, -rcpRes.y, 0, 0)).r);
+    // depth = min(depth, tex2Dlod(sampDepthPoint, IN.tex + float4(0, rcpRes.y, 0, 0)).r);
+    // depth = min(depth, tex2Dlod(sampDepthPoint, IN.tex + float4(-rcpRes.x, -rcpRes.y, 0, 0)).r);
+    // depth = min(depth, tex2Dlod(sampDepthPoint, IN.tex + float4(rcpRes.x, -rcpRes.y, 0, 0)).r);
+    // depth = min(depth, tex2Dlod(sampDepthPoint, IN.tex + float4(-rcpRes.x, rcpRes.y, 0, 0)).r);
+    // depth = min(depth, tex2Dlod(sampDepthPoint, IN.tex + float4(rcpRes.x, rcpRes.y, 0, 0)).r);
 
-    // Discard sky pixels (no DL depth nearby) - keeps sky clear color
-    clip(nearViewRange - depth - 1.0);
+    // // Discard sky pixels (no DL depth nearby) - keeps sky clear color
+    // clip(nearViewRange - depth - 1.0);
     // DL exists nearby - output dark ambient
-    return float4(sunAmb * 0.18, 1.0);
+    return float4(sunAmb * 0.5, 1.0);
 }
 
 //------------------------------------------------------------

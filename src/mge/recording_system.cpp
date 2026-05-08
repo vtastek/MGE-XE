@@ -1068,6 +1068,7 @@ void FixedFunctionShader::executeGpuPhase() {
     // Blend distant land over near objects AFTER replay
     // (MW/MGE blend uses depth to composite distant land behind near objects)
     DistantLand::renderStageBlend(frameCtx, &fb);
+    DistantLand::renderGrassAfterBackfill(frameCtx);
 
     // Water surface AFTER replay — refraction samples backbuffer which needs scene content
     // Only render if not already drawn (prevents double-render when water rendered in DIP path)
@@ -1223,6 +1224,7 @@ void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool w
         // Blend distant land over near objects AFTER replay
         // (MW/MGE blend uses depth to composite distant land behind near objects)
         DistantLand::renderStageBlend(renderCtx, &fb);
+        DistantLand::renderGrassAfterBackfill(renderCtx);
     }
 
     // Water surface AFTER Scene 0 but BEFORE Scene 1 particles
@@ -1815,6 +1817,7 @@ void FixedFunctionShader::renderFullFrameAsync(bool useN1Buffer) {
 
         // Blend distant land over near objects
         DistantLand::renderStageBlend(renderCtx, &fb);
+        DistantLand::renderGrassAfterBackfill(renderCtx);
     }
 
     // Water surface after Scene 0, before particles
@@ -2114,6 +2117,7 @@ void FixedFunctionShader::renderRemainingStages(bool useN1Buffer) {
         replayRecordedCalls(0, nullptr);
         transitionTo(PhaseTransition::ReplayExit);
         DistantLand::renderStageBlend(renderCtx, &fb);
+        DistantLand::renderGrassAfterBackfill(renderCtx);
     }
 
     // Water surface after Scene 0, before particles
