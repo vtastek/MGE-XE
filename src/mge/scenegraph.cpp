@@ -78,8 +78,20 @@ namespace MGE::SceneGraph {
             if (av->getAppCulled()) return;
 
             if (av->isInstanceOfType(NI::RTTIStaticPtr::NiPointLight)) {
-                g_pointLights.push_back(
-                    extractPointLight(static_cast<const NI::PointLight*>(av)));
+                auto* pl = static_cast<const NI::PointLight*>(av);
+                // Skip lights with no engine-set radius. Morrowind stores the
+                // modder-set Radius in NI::Light::specular.r (Bethesda overload)
+                // and the engine's own per-object selection at 0x4D2F40
+                // (game_dynamicLightTest) culls the light when
+                //   `objectToLightDist - objectRadius > specular.r`.
+                // A `specular.r == 0` light is excluded by every object in
+                // vanilla — it never enters any effect list, never gets pushed
+                // via SetLight, never lights anything. Filtering here saves
+                // a texLightData pool slot and a per-mesh sphere-AABB test
+                // for a light that would have been dropped anyway.
+                if (pl->specular.r > 0.0f) {
+                    g_pointLights.push_back(extractPointLight(pl));
+                }
             }
 
             if (av->isInstanceOfType(NI::RTTIStaticPtr::NiNode)) {
