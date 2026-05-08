@@ -249,6 +249,7 @@ public:
     static void renderStageBlend(DLContext* ctx, FixedFunctionShader::FrameBuffer* fb = nullptr);
     static void renderStageWater(DLContext* ctx);
     static void renderDepthBackfill(DLContext* ctx);
+    static void renderGrassAfterBackfill(DLContext* ctx);
 
     static void setupCommonEffect(DLContext* ctx, const D3DXMATRIX* view, const D3DXMATRIX* proj);
 

@@ -753,8 +753,8 @@ void DistantLand::renderStage1(DLContext* ctx, FixedFunctionShader::FrameBuffer*
             // Render over Morrowind domain
             effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
 
-            // Draw grass with shadows
-            if (Configuration.MGEFlags & USE_GRASS) {
+            // Draw grass with shadows (skip in HLSL mode - rendered after backfill)
+            if ((Configuration.MGEFlags & USE_GRASS) && !isHLSLActive()) {
                 effect->BeginPass(PASS_RENDERGRASSINST);
                 vsr.beginAlphaToCoverage(device);
                 renderGrassInst(ctx);
@@ -1127,6 +1127,40 @@ void DistantLand::renderDepthBackfill(DLContext* ctx) {
 
     effect->BeginPass(PASS_DEPTHBACKFILL);
     PostShaders::applyBlend();
+    effect->EndPass();
+
+    effect->End();
+    stateSaved->Apply();
+    stateSaved->Release();
+
+    // Render grass after backfill in HLSL mode
+    renderGrassAfterBackfill(ctx);
+}
+
+// renderGrassAfterBackfill - Render DL grass after backfill pass (HLSL mode only)
+void DistantLand::renderGrassAfterBackfill(DLContext* ctx) {
+    if (!(Configuration.MGEFlags & USE_GRASS)) {
+        return;
+    }
+
+    if (!ctx->hasWorldSpace) {
+        return;
+    }
+
+    if (s_frameRenderCached) {
+        return;
+    }
+
+    IDirect3DStateBlock9* stateSaved;
+    UINT passes;
+
+    device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
+    effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
+
+    effect->BeginPass(PASS_RENDERGRASSINST);
+    vsr.beginAlphaToCoverage(device);
+    renderGrassInst(ctx);
+    vsr.endAlphaToCoverage(device);
     effect->EndPass();
 
     effect->End();

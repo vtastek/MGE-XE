@@ -1831,6 +1831,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
 
     // Scene 0 only: Fill DL areas with dark ambient before MW geometry
     // Prevents bright sky clear color from bleeding through AA edges against DL
+    // Uses depth test (GREATEREQUAL) to preserve DL grass already rendered
     if (sceneCount == 0 && !cmdBuf) {
         DistantLand::renderDepthBackfill(&fb.dlContext);
     }
