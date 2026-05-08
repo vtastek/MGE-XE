@@ -15,19 +15,21 @@ float CalcMipLevel(float2 texcoordTexels) {
 }
 
 float grassCoverageAlpha(float alpha, float2 texcoords, float viewDepth) {
+    float alphaRef = 64.0/255.0;
+    float derivative = fwidth(alpha);
+    float distanceFade = pow(saturate(viewDepth / 4000.0), 2.0);
+
 #ifdef USE_HLSL_PIPELINE
     float mipLevel = CalcMipLevel(texcoords * a2cTexSize);
     alpha *= 1.0 + mipLevel * a2cMipScale;
-    float alphaRef = 64.0/255.0;
-    float derivative = fwidth(alpha);
-    float distanceFade = pow(saturate(viewDepth / 8192.0), 2.0);
-    float distanceSharpness = lerp(a2cSharpness, 0.1, distanceFade);
-    return saturate((alpha - alphaRef) / max(derivative, 0.0001) * distanceSharpness + 0.5);
+    derivative = fwidth(alpha);
+    float distanceSharpness = lerp(a2cSharpnessClose, a2cSharpnessFar, distanceFade);
 #else
-    float distanceFade = pow(saturate(viewDepth / 8192.0), 2.0);
-    float falloffRate = lerp(4.0, 1.0, distanceFade);
-    return calc_coverage(alpha, 128.0/255.0, falloffRate);
+    float distanceSharpness = lerp(1.0, 0.25, distanceFade);
 #endif
+
+    float edgeWidth = max(derivative / max(distanceSharpness, 0.001), 1.0/255.0);
+    return saturate(0.5 + 0.5 * (alpha - alphaRef) / edgeWidth);
 }
 
 TransformedVert transformGrassVert(StatVertInstIn IN) {
@@ -119,12 +121,12 @@ float4 GrassPS(GrassVertOut IN): COLOR0 {
     float3 normal = normalize(IN.normalFacing.xyz);
     float3 eyevec = IN.worldDepth.xyz - eyePos.xyz;
     float facingSign = dot(eyevec, normal) < 0 ? 1.0 : -1.0;
-
+	float3 albedoLin = toLinearSrgb(result.rgb);
     // Two-sided lambert with backscatter
     float lambert = max(0, dot(normal, -sunVec));
 
 	float3 vt = -sunVec  + normal * 0.5;
-	float vd = pow(saturate(dot(normalize(eyevec), vt)), 2.0) * 0.5;
+	float vd = pow(saturate(dot(normalize(eyevec), vt)), 2.0) * 0.5 * albedoLin;
 	float vl = 1.0 * (vd + toLinearSrgb(sunAmb)/PI);
 
 
@@ -133,11 +135,11 @@ float4 GrassPS(GrassVertOut IN): COLOR0 {
 	
 	//lambert = dot(normal, -normalize(sunVec));
 	float shadows = 1 - saturate(v * shadecolor * 50.);   
-    float3 albedoLin = toLinearSrgb(result.rgb);
+    
     float3 sunColLin = toLinearSrgb(sunCol);
-    float3 sunAmbLin = toLinearSrgb(sunAmb);
+    float3 sunAmbLin = toLinearSrgb(sunAmb)/PI;
 
-    float3 lit = albedoLin * (sunColLin * lambert  +  sunColLin  * vl * shadows + sunAmbLin);
+    float3 lit = albedoLin * (sunColLin * lambert * shadows  +  sunColLin  * vl * shadows + sunAmbLin);
 	
     lit *= intensityScalar;
 

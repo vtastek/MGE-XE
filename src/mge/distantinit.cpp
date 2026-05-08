@@ -218,7 +218,8 @@ D3DXHANDLE DistantLand::ehDisplacementFalloff;
 D3DXHANDLE DistantLand::ehIntensityScalar;
 D3DXHANDLE DistantLand::ehA2CMipScale;
 D3DXHANDLE DistantLand::ehA2CTexSize;
-D3DXHANDLE DistantLand::ehA2CSharpness;
+D3DXHANDLE DistantLand::ehA2CSharpnessClose;
+D3DXHANDLE DistantLand::ehA2CSharpnessFar;
 D3DXHANDLE DistantLand::ehDebugMode;
 
 std::function<void(IDirect3DSurface9*)> DistantLand::captureScreenHandler = nullptr;
@@ -702,7 +703,8 @@ bool DistantLand::initShader() {
     ehIntensityScalar = effect->GetParameterByName(0, "intensityScalar");
     ehA2CMipScale = effect->GetParameterByName(0, "a2cMipScale");
     ehA2CTexSize = effect->GetParameterByName(0, "a2cTexSize");
-    ehA2CSharpness = effect->GetParameterByName(0, "a2cSharpness");
+    ehA2CSharpnessClose = effect->GetParameterByName(0, "a2cSharpnessClose");
+    ehA2CSharpnessFar = effect->GetParameterByName(0, "a2cSharpnessFar");
     ehDebugMode = effect->GetParameterByName(0, "debugMode");
 
     D3DVIEWPORT9 vp;

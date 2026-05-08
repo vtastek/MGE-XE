@@ -37,7 +37,8 @@ float ImGuiManager::parallaxBias = 0.5f;         // Parallax mapping bias
 // Alpha-to-coverage grass parameters
 float ImGuiManager::a2cMipScale = 0.25f;         // Mip level alpha boost multiplier
 float ImGuiManager::a2cTexSize = 1024.0f;        // Texture size for mip calculation
-float ImGuiManager::a2cSharpness = 0.5f;         // fwidth sharpening multiplier
+float ImGuiManager::a2cSharpnessClose = 2.0f;    // Close fwidth sharpening multiplier
+float ImGuiManager::a2cSharpnessFar = 0.1f;      // Far fwidth sharpening multiplier
 
 // Debug interface controls
 int ImGuiManager::bboxVisualizationMode = 0;
@@ -393,7 +394,8 @@ void ImGuiManager::RenderPCFFilteringInterface() {
         ImGui::Text("Grass Alpha-to-Coverage");
         ImGui::SliderFloat("A2C Mip Scale", &a2cMipScale, 0.0f, 1.0f, "%.2f");
         ImGui::SliderFloat("A2C Tex Size", &a2cTexSize, 128.0f, 2048.0f, "%.0f");
-        ImGui::SliderFloat("A2C Sharpness", &a2cSharpness, 0.1f, 2.0f, "%.2f");
+        ImGui::SliderFloat("A2C Sharpness Close", &a2cSharpnessClose, 0.1f, 2.0f, "%.2f");
+        ImGui::SliderFloat("A2C Sharpness Far", &a2cSharpnessFar, 0.1f, 2.0f, "%.2f");
 
         ImGui::Separator();
         ImGui::Checkbox("Show Demo Window", &showDemo);
@@ -437,7 +439,8 @@ float ImGuiManager::GetParallaxScale() { return parallaxScale; }
 float ImGuiManager::GetParallaxBias() { return parallaxBias; }
 float ImGuiManager::GetA2CMipScale() { return a2cMipScale; }
 float ImGuiManager::GetA2CTexSize() { return a2cTexSize; }
-float ImGuiManager::GetA2CSharpness() { return a2cSharpness; }
+float ImGuiManager::GetA2CSharpnessClose() { return a2cSharpnessClose; }
+float ImGuiManager::GetA2CSharpnessFar() { return a2cSharpnessFar; }
 bool ImGuiManager::GetShowPCFInterface() { return showPCFInterface; }
 
 void ImGuiManager::TogglePCFInterface() { 

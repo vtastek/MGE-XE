@@ -1220,7 +1220,8 @@ void DistantLand::setupCommonEffect(DLContext* ctx, const D3DXMATRIX* view, cons
     // A2C grass parameters (always set, null-safe)
     if (ehA2CMipScale) effect->SetFloat(ehA2CMipScale, ImGuiManager::GetA2CMipScale());
     if (ehA2CTexSize) effect->SetFloat(ehA2CTexSize, ImGuiManager::GetA2CTexSize());
-    if (ehA2CSharpness) effect->SetFloat(ehA2CSharpness, ImGuiManager::GetA2CSharpness());
+    if (ehA2CSharpnessClose) effect->SetFloat(ehA2CSharpnessClose, ImGuiManager::GetA2CSharpnessClose());
+    if (ehA2CSharpnessFar) effect->SetFloat(ehA2CSharpnessFar, ImGuiManager::GetA2CSharpnessFar());
     if (LOG::catEnabled(LOG::Cat_DistantLand)) {
         static int nvLogCount = 0;
         if (nvLogCount++ < 10) {

@@ -195,7 +195,8 @@ public:
     static D3DXHANDLE ehIntensityScalar;
     static D3DXHANDLE ehA2CMipScale;
     static D3DXHANDLE ehA2CTexSize;
-    static D3DXHANDLE ehA2CSharpness;
+    static D3DXHANDLE ehA2CSharpnessClose;
+    static D3DXHANDLE ehA2CSharpnessFar;
     static D3DXHANDLE ehDebugMode;
 
     static std::function<void(IDirect3DSurface9*)> captureScreenHandler;
