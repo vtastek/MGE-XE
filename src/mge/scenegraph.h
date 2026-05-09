@@ -7,10 +7,12 @@
 // per-frame mutations and post the engine's worldTransform refresh
 // pass on camera roots, pre any cull walk, pre any draw). MGE walks
 // the scene roots (worldObjectRoot + worldPickObjectRoot + sgSunlight)
-// recursively, extracts POD fields from each NiPointLight visited,
-// and exposes the resulting flat vector for consumers (FFE many-lights
-// shader today; future: water reflection, shadow maps, custom post
-// effects each add their own typed POD vector to the same walk pass).
+// recursively, classifies each visited node by RTTI, and extracts a
+// POD view per subtype. Currently exposes NiPointLight (FFE many-lights
+// consumer) and NiDirectionalLight (sun direction + colour, no consumer
+// yet — staged for the dynamic-shadows work). Future per-subtype POD
+// vectors (geometry casters, water-reflection candidates, etc.) plug in
+// at the same dispatch with no extra traversal cost.
 //
 // All public accessors return references to internal storage that
 // remains valid until the next onFrameReady() call. Consumers that
@@ -43,6 +45,23 @@ namespace MGE::SceneGraph {
         float radius;        // specular.r — Bethesda's modder-set fade radius
     };
     const std::vector<PointLight>& pointLights();
+
+    // POD view of directional lights. In vanilla MW the only entry is the
+    // sun (the sgSunlight DataHandler root is itself a NiDirectionalLight);
+    // the walk classifies by RTTI so any modder-added directional lights
+    // would surface here too. World-space direction is computed as
+    // worldTransform.rotation * NI::DirectionalLight::direction — the sun's
+    // local direction is fixed at NIF authoring time and the day/night
+    // controller drives worldTransform.rotation, so the multiply is what
+    // captures the animated sun vector. Diffuse is pre-multiplied by
+    // dimmer to match the PointLight convention; ambient is raw (the
+    // engine doesn't scale sun ambient by dimmer either).
+    struct DirectionalLight {
+        float worldDir[3];   // worldTransform.rotation * direction
+        float diffuse[3];    // dl->diffuse.rgb * dl->dimmer
+        float ambient[3];    // dl->ambient.rgb
+    };
+    const std::vector<DirectionalLight>& directionalLights();
 
     // Increments each time onFrameReady() actually rebuilds the cache
     // (skipped rebuilds do not bump it). Consumers can use this as a
