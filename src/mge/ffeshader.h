@@ -200,7 +200,7 @@ class FixedFunctionShader {
     static D3DXHANDLE ehLightDiffuse, ehLightAmbient, ehLightPosition;
     static D3DXHANDLE ehLightFalloffQuadratic, ehLightFalloffLinear, ehLightFalloffConstant;
     // Texture-light path handles
-    static D3DXHANDLE ehTexLightData, ehLightDataParams, ehLightIndices;
+    static D3DXHANDLE ehTexLightData, ehLightDataParams, ehLightIndices, ehTexLightView;
     static D3DXHANDLE ehTexgenTransform, ehBumpMatrix, ehBumpLumiScaleBias;
 
     static float sunMultiplier, ambMultiplier;

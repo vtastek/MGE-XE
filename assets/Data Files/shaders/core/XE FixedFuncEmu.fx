@@ -83,9 +83,16 @@ static const int LGs = max(1, ceil(FFE_LIGHTS_ACTIVE / 4.0));
 // upstream.
 //
 // Wire format per light (3 texels, R32G32B32A32F):
-//   texel 0: (posX, posY, posZ, _)        — view-space position (.w reserved)
+//   texel 0: (posX, posY, posZ, _)        — WORLD-space position (.w reserved)
 //   texel 1: (diffR, diffG, diffB, _)     — raw NI diffuse × dimmer
 //   texel 2: (k0, k1, k2, radius)         — falloff const/lin/quad + radius
+//
+// Texel 0 is in WORLD space — the shader transforms it to view-space
+// per pixel using the `texLightView` uniform (one mat-vec per light).
+// Storing world-space (rather than view-space) means the texture only
+// needs re-upload when the light snapshot changes; camera rotation no
+// longer triggers an upload. Trade is a small per-light per-pixel
+// matrix-vector multiply (~12 ALU ops/light) on GPU.
 //
 // Texel-2.w carries Bethesda's modder-set radius (NI::Light::specular.r).
 // The shader uses it as the inner edge of a smoothstep window that
@@ -116,6 +123,11 @@ shared float4 lightDataParams;
 // kMaxIndicesPerMesh=32 indices per mesh. lightDataParams.x is the
 // runtime-bounded loop count over these indices.
 shared float4 lightIndices[8];
+// View matrix used to transform world-space light positions (from
+// texLightData texel 0) into view-space for the lighting math. Pushed
+// per-draw from ffeshader.cpp::renderMorrowind alongside the other
+// texture-light uniforms.
+shared matrix texLightView;
 #ifdef USE_TEXTURE_LIGHTS
 
 float3 evaluatePointLightsTextured(float3 viewPos, float3 normal) {
@@ -141,7 +153,13 @@ float3 evaluatePointLightsTextured(float3 viewPos, float3 normal) {
         float4 falloff = tex2Dlod(LightDataSampler, float4(u2, 0.5, 0, 0));
         float radius   = falloff.w;
 
-        float3 toLight = pos.xyz - viewPos;
+        // Transform world-space light position into view-space using the
+        // per-draw `texLightView` matrix. This is the "world-space-in-
+        // texture" half of the camera-rotation upload optimisation — the
+        // texture stays revision-keyed; camera motion only triggers this
+        // ~12-ALU mat-vec per light per pixel.
+        float3 lightViewPos = mul(float4(pos.xyz, 1.0), texLightView).xyz;
+        float3 toLight = lightViewPos - viewPos;
         float dist2    = dot(toLight, toLight);
         // rsqrt + dist2 * invDist beats sqrt + 1/sqrt on modern HW.
         float invDist  = rsqrt(dist2);

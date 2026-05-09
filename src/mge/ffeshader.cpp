@@ -33,7 +33,7 @@ D3DXHANDLE FixedFunctionShader::ehMaterialDiffuse, FixedFunctionShader::ehMateri
 D3DXHANDLE FixedFunctionShader::ehLightSceneAmbient, FixedFunctionShader::ehLightSunDiffuse, FixedFunctionShader::ehLightDiffuse;
 D3DXHANDLE FixedFunctionShader::ehLightSunDirection, FixedFunctionShader::ehLightPosition, FixedFunctionShader::ehLightAmbient;
 D3DXHANDLE FixedFunctionShader::ehLightFalloffQuadratic, FixedFunctionShader::ehLightFalloffLinear, FixedFunctionShader::ehLightFalloffConstant;
-D3DXHANDLE FixedFunctionShader::ehTexLightData, FixedFunctionShader::ehLightDataParams, FixedFunctionShader::ehLightIndices;
+D3DXHANDLE FixedFunctionShader::ehTexLightData, FixedFunctionShader::ehLightDataParams, FixedFunctionShader::ehLightIndices, FixedFunctionShader::ehTexLightView;
 D3DXHANDLE FixedFunctionShader::ehTexgenTransform, FixedFunctionShader::ehBumpMatrix, FixedFunctionShader::ehBumpLumiScaleBias;
 
 float FixedFunctionShader::sunMultiplier, FixedFunctionShader::ambMultiplier;
@@ -89,6 +89,7 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
     ehTexLightData = effect->GetParameterByName(0, "texLightData");
     ehLightDataParams = effect->GetParameterByName(0, "lightDataParams");
     ehLightIndices = effect->GetParameterByName(0, "lightIndices");
+    ehTexLightView = effect->GetParameterByName(0, "texLightView");
     ehTexgenTransform = effect->GetParameterByName(0, "texgenTransform");
     ehBumpMatrix = effect->GetParameterByName(0, "bumpMatrix");
     ehBumpLumiScaleBias = effect->GetParameterByName(0, "bumpLumiScaleBias");
@@ -490,20 +491,18 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
         // s_msocToTex maps original snapshot index → texture row index
         // (or UINT_MAX for non-points). s_lightWorldPos caches world
         // positions used by the per-mesh selection's sphere-AABB test.
-        // s_lastUploadedView lets us detect view-matrix change (camera
-        // moved/rotated since the texture was packed).
         // s_lightAlive flags lights whose 2*radius influence sphere
-        // intersects the camera frustum (precull populated alongside
-        // the texture upload — same trigger).
+        // intersects the camera frustum (precull runs whenever the view
+        // matrix changes — independently of the texture upload, which
+        // now only fires on snapshot-revision change). s_lastPrecullView
+        // caches the view matrix the precull was last computed against.
         static unsigned int s_msocToTex[kMaxTexLights];
         static D3DXVECTOR3 s_lightWorldPos[kMaxTexLights];
         static bool        s_lightAlive[kMaxTexLights];
-        static D3DXMATRIX  s_lastUploadedView = {};
+        static D3DXMATRIX  s_lastPrecullView = {};
 
         const uint64_t currentRev = MGE::SceneGraph::frameRevision();
-        const bool viewChanged = (memcmp(&s_lastUploadedView, &rs->viewTransform,
-                                          sizeof(D3DXMATRIX)) != 0);
-        const bool needUpload = (currentRev != lastUploadedRevision) || viewChanged;
+        const bool needUpload = (currentRev != lastUploadedRevision);
 
         if (needUpload && texLightData) {
             LARGE_INTEGER tsUploadBegin;
@@ -521,15 +520,20 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
                 for (unsigned int i = 0; i < snapshotCount; ++i) {
                     const auto& pl = snapshotLights[i];
                     s_lightWorldPos[i] = D3DXVECTOR3(pl.worldPos[0], pl.worldPos[1], pl.worldPos[2]);
-                    D3DXVECTOR3 viewPos;
-                    D3DXVec3TransformCoord(&viewPos, &s_lightWorldPos[i], &rs->viewTransform);
 
                     const unsigned int t = i * kTexelsPerLight * 4;
-                    // Texel 0: view-space position. The .w slot is reserved
-                    // (memset-zeroed above); shader does not read it.
-                    dst[t + 0] = viewPos.x;
-                    dst[t + 1] = viewPos.y;
-                    dst[t + 2] = viewPos.z;
+                    // Texel 0: WORLD-space position. The shader's per-draw
+                    // `texLightView` matrix uniform transforms it to view
+                    // space inside evaluatePointLightsTextured (one mat-vec
+                    // per light per pixel). Storing world-space here means
+                    // camera rotation no longer triggers re-upload — only
+                    // a SceneGraph revision change does, and the per-frame
+                    // upload count drops from ~0.86 to whatever the actual
+                    // light-data change rate is. The .w slot is reserved
+                    // (memset-zeroed above).
+                    dst[t + 0] = pl.worldPos[0];
+                    dst[t + 1] = pl.worldPos[1];
+                    dst[t + 2] = pl.worldPos[2];
                     // Texel 1: diffuse (raw NI::Light::diffuse * dimmer,
                     // packed by SceneGraph::extractPointLight).
                     dst[t + 4] = pl.diffuse[0];
@@ -551,65 +555,15 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
                 }
                 texLightData->UnlockRect(0);
 
-                // _Claude_ Light frustum precull. Same trigger as the
-                // texture upload (view changed OR snapshot revision
-                // changed), so it pairs naturally and runs once per
-                // change rather than per draw. Marks each light "alive"
-                // if its 2*radius influence sphere intersects the
-                // camera frustum. The 2*radius matches the per-mesh
-                // sphere-AABB cull AND the shader's smoothstep zero
-                // point — three boundaries coincide, so a light killed
-                // here is one whose contribution would have been 0 for
-                // every visible pixel anyway. No new seam mechanism.
-                //
-                // Per-mesh loop below early-outs on `!s_lightAlive[i]`,
-                // so the inner sphere-AABB scan only iterates the live
-                // set. From earlier interior/exterior comparison data,
-                // halving the candidate count saved ~300 ns/draw.
-                {
-                    D3DMATRIX projTransform;
-                    device->GetTransform(D3DTS_PROJECTION, &projTransform);
-                    D3DXMATRIX viewProj;
-                    D3DXMatrixMultiply(&viewProj,
-                        (const D3DXMATRIX*)&rs->viewTransform,
-                        (const D3DXMATRIX*)&projTransform);
-                    // Gribb-Hartmann frustum-plane extraction. Normals
-                    // point INWARD; a point inside the frustum has
-                    // positive distance from every plane.
-                    D3DXPLANE planes[6] = {
-                        D3DXPLANE(viewProj._14 + viewProj._11, viewProj._24 + viewProj._21,
-                                  viewProj._34 + viewProj._31, viewProj._44 + viewProj._41), // L
-                        D3DXPLANE(viewProj._14 - viewProj._11, viewProj._24 - viewProj._21,
-                                  viewProj._34 - viewProj._31, viewProj._44 - viewProj._41), // R
-                        D3DXPLANE(viewProj._14 - viewProj._12, viewProj._24 - viewProj._22,
-                                  viewProj._34 - viewProj._32, viewProj._44 - viewProj._42), // T
-                        D3DXPLANE(viewProj._14 + viewProj._12, viewProj._24 + viewProj._22,
-                                  viewProj._34 + viewProj._32, viewProj._44 + viewProj._42), // B
-                        D3DXPLANE(viewProj._13, viewProj._23, viewProj._33, viewProj._43), // N
-                        D3DXPLANE(viewProj._14 - viewProj._13, viewProj._24 - viewProj._23,
-                                  viewProj._34 - viewProj._33, viewProj._44 - viewProj._43), // F
-                    };
-                    for (int p = 0; p < 6; ++p) D3DXPlaneNormalize(&planes[p], &planes[p]);
-
-                    unsigned int aliveCount = 0;
-                    for (unsigned int i = 0; i < snapshotCount; ++i) {
-                        const float r = snapshotLights[i].radius * 2.0f;
-                        const D3DXVECTOR3& lp = s_lightWorldPos[i];
-                        bool alive = true;
-                        for (int p = 0; p < 6; ++p) {
-                            const float d = D3DXPlaneDotCoord(&planes[p], &lp);
-                            if (d < -r) { alive = false; break; }
-                        }
-                        s_lightAlive[i] = alive;
-                        if (alive) ++aliveCount;
-                    }
-                    s_preCullAliveSum += aliveCount;
-                    s_preCullTotalSum += snapshotCount;
-                }
-
                 lastUploadedRevision = currentRev;
                 lastUploadedPointCount = snapshotCount;
-                s_lastUploadedView = rs->viewTransform;
+                // Force precull to re-run below — new light positions may
+                // not match the prior frustum-alive set even at the same
+                // view matrix. Set s_lastPrecullView to a sentinel that
+                // can't equal any valid view matrix (memset to 0 is a row
+                // of zero floats — degenerate, never produced by a real
+                // camera).
+                memset(&s_lastPrecullView, 0, sizeof(s_lastPrecullView));
             }
             LARGE_INTEGER tsUploadEnd;
             QueryPerformanceCounter(&tsUploadEnd);
@@ -620,6 +574,65 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
                     uploadTicks * 1000000000ULL / static_cast<unsigned long long>(s_qpcFreq.QuadPart);
             }
             ++s_uploads;
+        }
+
+        // Frustum precull. Decoupled from texture upload — runs whenever
+        // the camera's view matrix changes (most frames during gameplay)
+        // OR a fresh upload reset s_lastPrecullView. The precull marks
+        // each light "alive" if its 2*radius influence sphere intersects
+        // the camera frustum. The 2*radius matches the per-mesh sphere-AABB
+        // cull AND the shader's smoothstep zero point — three boundaries
+        // coincide, so a light killed here is one whose contribution would
+        // have been 0 for every visible pixel anyway. No new seam mechanism.
+        //
+        // Per-mesh loop below early-outs on `!s_lightAlive[i]`, so the
+        // inner sphere-AABB scan only iterates the live set. From earlier
+        // measurement data (aliveRatio ~38% in mixed exterior/interior),
+        // dropping ~62% of candidates here cuts per-mesh selection cost.
+        if (lastUploadedPointCount > 0) {
+            const bool precullStale = (memcmp(&s_lastPrecullView, &rs->viewTransform,
+                                              sizeof(D3DXMATRIX)) != 0);
+            if (precullStale) {
+                D3DMATRIX projTransform;
+                device->GetTransform(D3DTS_PROJECTION, &projTransform);
+                D3DXMATRIX viewProj;
+                D3DXMatrixMultiply(&viewProj,
+                    (const D3DXMATRIX*)&rs->viewTransform,
+                    (const D3DXMATRIX*)&projTransform);
+                // Gribb-Hartmann frustum-plane extraction. Normals point
+                // INWARD; a point inside the frustum has positive distance
+                // from every plane.
+                D3DXPLANE planes[6] = {
+                    D3DXPLANE(viewProj._14 + viewProj._11, viewProj._24 + viewProj._21,
+                              viewProj._34 + viewProj._31, viewProj._44 + viewProj._41), // L
+                    D3DXPLANE(viewProj._14 - viewProj._11, viewProj._24 - viewProj._21,
+                              viewProj._34 - viewProj._31, viewProj._44 - viewProj._41), // R
+                    D3DXPLANE(viewProj._14 - viewProj._12, viewProj._24 - viewProj._22,
+                              viewProj._34 - viewProj._32, viewProj._44 - viewProj._42), // T
+                    D3DXPLANE(viewProj._14 + viewProj._12, viewProj._24 + viewProj._22,
+                              viewProj._34 + viewProj._32, viewProj._44 + viewProj._42), // B
+                    D3DXPLANE(viewProj._13, viewProj._23, viewProj._33, viewProj._43), // N
+                    D3DXPLANE(viewProj._14 - viewProj._13, viewProj._24 - viewProj._23,
+                              viewProj._34 - viewProj._33, viewProj._44 - viewProj._43), // F
+                };
+                for (int p = 0; p < 6; ++p) D3DXPlaneNormalize(&planes[p], &planes[p]);
+
+                unsigned int aliveCount = 0;
+                for (unsigned int i = 0; i < lastUploadedPointCount; ++i) {
+                    const float r = snapshotLights[i].radius * 2.0f;
+                    const D3DXVECTOR3& lp = s_lightWorldPos[i];
+                    bool alive = true;
+                    for (int p = 0; p < 6; ++p) {
+                        const float d = D3DXPlaneDotCoord(&planes[p], &lp);
+                        if (d < -r) { alive = false; break; }
+                    }
+                    s_lightAlive[i] = alive;
+                    if (alive) ++aliveCount;
+                }
+                s_preCullAliveSum += aliveCount;
+                s_preCullTotalSum += lastUploadedPointCount;
+                s_lastPrecullView = rs->viewTransform;
+            }
         }
 
         if (lastUploadedPointCount > 0) {
@@ -738,6 +751,14 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
             if (ehTexLightData) effectFFE->SetTexture(ehTexLightData, texLightData);
             if (ehLightDataParams) effectFFE->SetVector(ehLightDataParams, &lightDataParams_v);
             if (ehLightIndices) effectFFE->SetVectorArray(ehLightIndices, (D3DXVECTOR4*)idxFloats, 8);
+            // texLightView: per-draw view matrix used by the texture-light
+            // shader to transform world-space light positions (from texLightData
+            // texel 0) into view-space inside evaluatePointLightsTextured. The
+            // texture stays revision-keyed (re-uploaded only when light data
+            // changes); the view matrix changes every frame on camera motion
+            // but is just a 4x4 SetMatrix push (~100 ns) instead of a full
+            // texture LockRect+memset+pack cycle.
+            if (ehTexLightView) effectFFE->SetMatrix(ehTexLightView, &rs->viewTransform);
 
             LARGE_INTEGER selEnd;
             QueryPerformanceCounter(&selEnd);
