@@ -257,6 +257,20 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
     // <50 ns/draw, look elsewhere.
     static unsigned long long s_selectionCalls = 0;
     static unsigned long long s_selectionTotalNs = 0;
+    // Texture-upload cost: how often does texLightData actually get
+    // re-uploaded (revision bumped OR view-matrix changed), and ns spent
+    // in LockRect+memset+pack+UnlockRect+frustum-precull per upload.
+    static unsigned long long s_uploads          = 0;
+    static unsigned long long s_uploadsTotalNs   = 0;
+    // Frustum-precull alive ratio: cumulative alive count / total checks
+    // across all uploads. Tells us how effective the 2*radius frustum
+    // precull is at trimming the candidate set for the per-mesh inner loop.
+    static unsigned long long s_preCullAliveSum  = 0;
+    static unsigned long long s_preCullTotalSum  = 0;
+    // Per-mesh selected-light histogram. After per-mesh sphere-AABB cull +
+    // partial_sort, how many lights actually drive the shader's per-pixel
+    // loop. Buckets: [0, 1-4, 5-8, 9-16, 17-31, 32 (capped)].
+    static unsigned long long s_selectedBuckets[6] = {0};
     static LARGE_INTEGER s_qpcFreq = {};
     if (s_qpcFreq.QuadPart == 0) QueryPerformanceFrequency(&s_qpcFreq);
 
@@ -492,6 +506,8 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
         const bool needUpload = (currentRev != lastUploadedRevision) || viewChanged;
 
         if (needUpload && texLightData) {
+            LARGE_INTEGER tsUploadBegin;
+            QueryPerformanceCounter(&tsUploadBegin);
             D3DLOCKED_RECT locked;
             if (SUCCEEDED(texLightData->LockRect(0, &locked, nullptr, D3DLOCK_DISCARD))) {
                 float* dst = (float*)locked.pBits;
@@ -575,6 +591,7 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
                     };
                     for (int p = 0; p < 6; ++p) D3DXPlaneNormalize(&planes[p], &planes[p]);
 
+                    unsigned int aliveCount = 0;
                     for (unsigned int i = 0; i < snapshotCount; ++i) {
                         const float r = snapshotLights[i].radius * 2.0f;
                         const D3DXVECTOR3& lp = s_lightWorldPos[i];
@@ -584,13 +601,25 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
                             if (d < -r) { alive = false; break; }
                         }
                         s_lightAlive[i] = alive;
+                        if (alive) ++aliveCount;
                     }
+                    s_preCullAliveSum += aliveCount;
+                    s_preCullTotalSum += snapshotCount;
                 }
 
                 lastUploadedRevision = currentRev;
                 lastUploadedPointCount = snapshotCount;
                 s_lastUploadedView = rs->viewTransform;
             }
+            LARGE_INTEGER tsUploadEnd;
+            QueryPerformanceCounter(&tsUploadEnd);
+            const unsigned long long uploadTicks =
+                static_cast<unsigned long long>(tsUploadEnd.QuadPart - tsUploadBegin.QuadPart);
+            if (s_qpcFreq.QuadPart > 0) {
+                s_uploadsTotalNs +=
+                    uploadTicks * 1000000000ULL / static_cast<unsigned long long>(s_qpcFreq.QuadPart);
+            }
+            ++s_uploads;
         }
 
         if (lastUploadedPointCount > 0) {
@@ -681,6 +710,17 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
                     });
                 candidateCount = kMaxIndicesPerMesh;
             }
+
+            // Per-mesh selected-count histogram. Read this with the
+            // [LIGHTS-INSTR] periodic dump to see whether meshes are
+            // hitting the 32-light cap (last bucket) or sitting in the
+            // single-digits zone (most are).
+            if (candidateCount == 0)                       ++s_selectedBuckets[0];
+            else if (candidateCount <= 4)                  ++s_selectedBuckets[1];
+            else if (candidateCount <= 8)                  ++s_selectedBuckets[2];
+            else if (candidateCount <= 16)                 ++s_selectedBuckets[3];
+            else if (candidateCount < kMaxIndicesPerMesh)  ++s_selectedBuckets[4];
+            else                                           ++s_selectedBuckets[5];
 
             // _Claude_ Pack indices into 8 float4s (32 slots = kMaxIndicesPerMesh).
             float idxFloats[8 * 4] = { 0 };
@@ -835,6 +875,46 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
                 "-- [SELECTION-TIMING] calls=%llu totalNs=%llu avgNs=%.0f",
                 s_selectionCalls, s_selectionTotalNs,
                 s_selectionCalls ? (double)s_selectionTotalNs / s_selectionCalls : 0.0);
+            // Texture-upload cost (LockRect + memset + pack + frustum precull).
+            // uploads/calls ratio = how often we actually touch the texture
+            // (lower with the SceneGraph change-detect; vanishes for static scenes).
+            const double uploadAvg = s_uploads ? (double)s_uploadsTotalNs / s_uploads : 0.0;
+            const double uploadFrac = s_callCount ? 100.0 * (double)s_uploads / s_callCount : 0.0;
+            LOG::logline(
+                "-- [UPLOAD-TIMING] uploads=%llu (%.2f%% of draws) totalNs=%llu avgNs=%.0f",
+                s_uploads, uploadFrac, s_uploadsTotalNs, uploadAvg);
+            // Frustum precull alive ratio. High = many lights survived the
+            // 2*radius frustum check (poor cull, big candidate set per mesh).
+            // Low = camera barely sees any lights (dense interior with most
+            // lights behind walls / off-camera).
+            const double aliveRatio = s_preCullTotalSum
+                ? 100.0 * (double)s_preCullAliveSum / s_preCullTotalSum : 0.0;
+            LOG::logline(
+                "-- [PRECULL] aliveRatio=%.0f%% (%llu alive / %llu total across uploads)",
+                aliveRatio, s_preCullAliveSum, s_preCullTotalSum);
+            // Per-mesh selected-count histogram. If the rightmost bucket
+            // (capped at 32) is > 0, kMaxIndicesPerMesh is binding for
+            // some meshes — bumping it would let more lights through.
+            // If most draws sit in [0, 1-4, 5-8], the cap is fine.
+            LOG::logline(
+                "-- [SELECTED-DIST] [0|1-4|5-8|9-16|17-31|=32]=%llu|%llu|%llu|%llu|%llu|%llu",
+                s_selectedBuckets[0], s_selectedBuckets[1], s_selectedBuckets[2],
+                s_selectedBuckets[3], s_selectedBuckets[4], s_selectedBuckets[5]);
+            // Per-frame averages. SceneGraph::frameCount() ticks once per
+            // bridge call, so cumulative-counter / frameCount = per-frame.
+            // Skips emission if frame count is zero (bridge hasn't fired)
+            // or 1 (avoids meaningless single-frame divides).
+            const unsigned long long frames = MGE::SceneGraph::frameCount();
+            if (frames > 1) {
+                const double v3PerFrame  = (double)s_variantCalls[3] / frames;
+                const double v3NsFrame   = (double)s_variantTotalNs[3] / frames;
+                const double selNsFrame  = (double)s_selectionTotalNs / frames;
+                const double upNsFrame   = (double)s_uploadsTotalNs   / frames;
+                const double upPerFrame  = (double)s_uploads          / frames;
+                LOG::logline(
+                    "-- [PER-FRAME] frames=%llu v3draws=%.1f v3ns=%.0f selns=%.0f upns=%.0f uploads=%.2f",
+                    frames, v3PerFrame, v3NsFrame, selNsFrame, upNsFrame, upPerFrame);
+            }
             s_lastReportCall = s_callCount;
         }
     }

@@ -49,4 +49,10 @@ namespace MGE::SceneGraph {
     // cheap "should I re-derive my own derived state" key.
     uint64_t frameRevision();
 
+    // Cumulative count of frames walked since the bridge was stamped (one
+    // walk per onFrameReady call when the INI knob is on). Mainly for
+    // diagnostic use — divide cumulative per-call counters by this to
+    // get per-frame averages.
+    uint64_t frameCount();
+
 }
