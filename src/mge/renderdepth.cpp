@@ -734,6 +734,7 @@ void DistantLand::renderDepthRecordedDisplaced(const std::vector<RecordedMWState
 
         effect->SetMatrix(ehWorld, &call.rs.worldTransforms[0]);
         effect->SetMatrixArray(ehVertexBlendPalette, wvPalette, 4);
+        effect->SetMatrixArray(ehPrevVertexBlendPalette, wvPalette, 4);  // Terrain is static: prev = cur
         effect->SetBool(ehHasAlpha, false);
         effect->SetFloat(ehAlphaRef, -1.0f);
         effectDepth->CommitChanges();
