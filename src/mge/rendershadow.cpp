@@ -88,8 +88,26 @@ void DistantLand::renderShadowLayerGeneric(MWBridge* mwBridge, int layer, const 
     D3DVIEWPORT9 vp = { layer * res, 0, res, res, 0.0f, 1.0f };
     device->SetViewport(&vp);
 
-    // Render view frustum to stencil, which limits rendering to visible texels
-    effect->SetMatrix(ehWorld, inverseCameraProj);
+    // Render view frustum to stencil, which limits rendering to visible
+    // texels. Pre-scale the stencil cube outward in clip XY by 10% so
+    // pixels at the camera-frustum boundary always have caster data
+    // when the camera rotates a sub-stencil-pixel amount. Without this
+    // margin, screen-edge pixels (especially the bottom band per user
+    // observation) periodically fall outside the camera-frustum
+    // projection in cascade space as the camera rotates -> the stencil
+    // marks no caster contribution there -> fragment thinks it's lit
+    // when it should be shadowed -> visible flicker. Z scale stays 1
+    // to keep the depth bounds tight; only lateral margin is needed
+    // for camera-rotation jitter.
+    //
+    // Cost: ~21% more stencil pixels covered (1.1 * 1.1 - 1.0). Stencil
+    // writes are cheap (no color, no depth-write cost), and the caster
+    // pass only does extra work for pixels that would otherwise have
+    // had MISSING data — useful work, not waste.
+    D3DXMATRIX stencilMargin, expandedInverseCameraProj;
+    D3DXMatrixScaling(&stencilMargin, 1.1f, 1.1f, 1.0f);
+    D3DXMatrixMultiply(&expandedInverseCameraProj, &stencilMargin, inverseCameraProj);
+    effect->SetMatrix(ehWorld, &expandedInverseCameraProj);
     effectShadow->BeginPass(PASS_SHADOWSTENCIL);
     device->SetVertexDeclaration(WaterDecl);
     device->SetStreamSource(0, vbClipCube, 0, 12);
