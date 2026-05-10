@@ -162,8 +162,16 @@ void DistantLand::renderShadowMap() {
     device->SetStreamSource(0, vbFullFrame, 0, 12);
     device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
 
+    // V pass: bind history for cascade 1 temporal blend. Alpha=0 in
+    // cascade 0 region (shader gates by UV) so cascade 0 is unaffected.
+    // First frame after init: history is empty/zero — alpha=0.5 with
+    // history=0 gives half-strength shadow, but it's only one frame
+    // and not visible in motion. (Could pre-clear history to 1.0 to
+    // avoid the dim flash; not worth the extra init code.)
     device->SetRenderTarget(0, targetSoft);
     effect->SetTexture(ehTex3, texShadow);
+    effect->SetTexture(ehTexShadowHistory, texShadowHistory);
+    effect->SetFloat(ehShadowTemporalAlphaC1, Configuration.ShadowCascade1TemporalBlend);
     effect->SetBool(ehHasAlpha, true);      // flag as vertical filter pass
     effectShadow->CommitChanges();
 
@@ -172,6 +180,20 @@ void DistantLand::renderShadowMap() {
 
     // Restore full viewport for callers
     device->SetViewport(&vp);
+
+    // Update history texture with this frame's final atlas via GPU
+    // blit. StretchRect(src=texSoftShadow, dst=texShadowHistory) — same
+    // size, same format, no scaling. Cost is one fullscreen texture
+    // copy on the GPU (~30-50 µs), runs entirely outside the CPU
+    // dispatch window. Done after viewport restore so the StretchRect
+    // covers the full atlas.
+    if (Configuration.ShadowCascade1TemporalBlend > 0.0f && texShadowHistory) {
+        IDirect3DSurface9* histSurf = nullptr;
+        if (SUCCEEDED(texShadowHistory->GetSurfaceLevel(0, &histSurf))) {
+            device->StretchRect(targetSoft, nullptr, histSurf, nullptr, D3DTEXF_NONE);
+            histSurf->Release();
+        }
+    }
 
     // Clean up surface pointers
     target->Release();
