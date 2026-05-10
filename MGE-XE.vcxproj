@@ -255,5 +255,25 @@
     <ClCompile Update="..\MWSE\MWSE\SharedSE\*.cpp">
       <ForcedIncludeFiles>$(ProjectDir)src\mge\mge_se_prelude.h</ForcedIncludeFiles>
     </ClCompile>
+    <!-- Exclude SharedSE TUs MGE-XE doesn't reach via its include chain.
+         NIDX8Renderer.h's NI::DX8AdapterDesc has size_validation static_assert
+         expecting D3DADAPTER_IDENTIFIER8 == 1068 bytes, but proxydx's shim
+         comes out to 1072 (LARGE_INTEGER forces 8-byte trailing padding).
+         The real legacy d3d8.h (no longer shipped by Windows SDK) used two
+         DWORDs for DriverVersion, avoiding the padding. The two .cpps that
+         include NIDX8Renderer.h are the only entry points — neither is
+         reachable from scenegraph.cpp/datahandler_view.h, so excluding them
+         from the MGE build avoids the layout mismatch entirely.
+         CodePatchUtil.cpp similarly only matters for MWSE's runtime code-
+         patch system, which MGE doesn't participate in. -->
+    <ClCompile Update="..\MWSE\MWSE\SharedSE\NIDX8Renderer.cpp">
+      <ExcludedFromBuild>true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Update="..\MWSE\MWSE\SharedSE\NIRenderedTexture.cpp">
+      <ExcludedFromBuild>true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Update="..\MWSE\MWSE\SharedSE\CodePatchUtil.cpp">
+      <ExcludedFromBuild>true</ExcludedFromBuild>
+    </ClCompile>
   </ItemGroup>
 </Project>

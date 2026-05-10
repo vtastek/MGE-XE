@@ -10,19 +10,56 @@
 // the narrow set of TUs that touch SharedSE — keeping the rest of MGE-XE's
 // build untouched.
 
+// Windows + D3D includes go BEFORE the near/far #undef. Both windows.h
+// and d3d9.h's DEFINE_GUID expansions reference the legacy 16-bit
+// memory-model macros (NEAR/FAR — and lowercase aliases on some SDK
+// versions) during macro expansion of EXTERN_C const GUID FAR name.
+// Undefining them up here, before the SDK chain gets to expand those
+// DEFINE_GUID lines, leaves trailing identifiers without their FAR
+// qualifier and breaks parsing of every IID definition in d3d9.h.
+//
+// proxydx/d3d9header.h hits the same constraint — it includes d3d9.h
+// THEN undefs. We mirror that order. SharedSE's NICamera.h has fields
+// literally named `near` / `far` (the only reason we undef at all),
+// so the undefs MUST happen between the SDK chain and SharedSE.
+//
+// proxydx/d3d8header.h is included rather than <d3d8.h> because
+// modern Windows SDKs (10.0.22621+ verified) no longer ship d3d8.h.
+// Proxydx provides the d3d8 type shims (D3DCAPS8, D3DADAPTER_-
+// IDENTIFIER8, D3DPRESENT_PARAMETERS8, IDirect3DDevice8 typedef etc.)
+// that SharedSE/NIDX8Renderer.h depends on. Their layouts match the
+// real d3d8 SDK (verified: sizeof(DX8DeviceDesc) == 0xF4 holds with
+// proxydx's D3DCAPS8). It also transitively pulls d3d9.h via
+// proxydx/d3d9header.h.
 #include <windows.h>
-// Windows.h defines `near` and `far` as macros (legacy 16-bit memory model);
-// SharedSE NICamera.h has fields named `near` / `far` on NI::Frustum.
+#include "proxydx/d3d8header.h"
 #undef near
 #undef far
 
+// SharedSE/NIDX8Renderer.h declares fields like
+//   D3DPRESENT_PARAMETERS d3dPresentParameters;
+// expecting the legacy d3d8 layout (52 bytes / 0x34). Modern d3d9.h's
+// D3DPRESENT_PARAMETERS is 56 bytes (has the extra MultiSampleQuality
+// field d3d9 added). Without correction the offset of every subsequent
+// field shifts by 4 and the engine-truth size_validation static_assert
+// at the end of DX8Renderer fails. proxydx provides the correctly-sized
+// D3DPRESENT_PARAMETERS8 alias; mapping the d3d9 name to it, scoped to
+// SharedSE TUs only (this prelude is force-included only on those),
+// keeps the layout matching the engine without touching MGE's own
+// d3d9-aware code.
+#define D3DPRESENT_PARAMETERS    D3DPRESENT_PARAMETERS8
+
+#include <cassert>
 #include <filesystem>
 #include <iomanip>
 #include <iterator>
+#include <map>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #define span_CONFIG_SELECT_SPAN span_SPAN_NONSTD
