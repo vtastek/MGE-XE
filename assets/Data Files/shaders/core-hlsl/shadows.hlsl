@@ -201,19 +201,21 @@ float3 shadowTexelCheckerboard(float4 shadow0pos, float4 shadow1pos, float check
 
 // Main shadow sampling function for cascaded shadow maps
 float shadowSample(float4 shadow0pos, float4 shadow1pos, float ndotlgeo, float alphaFlag) {
-    float3 atlasMargin = float3(1.0 - 2.0 * 4.0 * shadowRcpRes, 1.0 - 2.0 * 4.0 * shadowRcpRes, 1.0);
-
-    bool inNear = all(saturate(atlasMargin - abs(shadow0pos.xyz)));
-    bool inFar = all(saturate(atlasMargin - abs(shadow1pos.xyz)));
+    float3 receiverLimit = float3(1.0 + 2.0 * 16.0 * shadowRcpRes, 1.0 + 2.0 * 16.0 * shadowRcpRes, 1.0);
+    bool inNear = all(saturate(receiverLimit - abs(shadow0pos.xyz)));
+    bool inFar = all(saturate(receiverLimit - abs(shadow1pos.xyz)));
+    float2 uvMargin = 4.0 * shadowRcpRes;
 
     float2 shadowUV0 = (0.5 + 0.5 * shadowRcpRes) + float2(0.5, -0.5) * shadow0pos.xy;
     float2 shadowUV1 = (0.5 + 0.5 * shadowRcpRes) + float2(0.5, -0.5) * shadow1pos.xy;
+    shadowUV0 = clamp(shadowUV0, uvMargin, 1.0 - uvMargin);
+    shadowUV1 = clamp(shadowUV1, uvMargin, 1.0 - uvMargin);
 
-    // Use optimized PCF for opaque geometry, original PCF for alpha
-    float shadow0 = inNear ? (alphaFlag > 0.5 ? shadowSampleESM(shadow0pos, shadowUV0, 0, shadow0pos.z, ndotlgeo) : shadowSamplePCF(shadow0pos, shadowUV0, 0, shadow0pos.z, ndotlgeo)) : 1.0;
-    float shadow1 = inFar ? shadowSampleESM(shadow1pos, shadowUV1, 1, shadow1pos.z, ndotlgeo) : 1.0;
+    float shadow0 = alphaFlag > 0.5
+        ? shadowSampleESM(shadow0pos, shadowUV0, 0, shadow0pos.z, ndotlgeo)
+        : shadowSamplePCF(shadow0pos, shadowUV0, 0, shadow0pos.z, ndotlgeo);
+    float shadow1 = shadowSampleESM(shadow1pos, shadowUV1, 1, shadow1pos.z, ndotlgeo);
 
-    // Ensure we have valid shadow data before blending
     if (inNear) {
         return shadow0;
     }
@@ -221,7 +223,6 @@ float shadowSample(float4 shadow0pos, float4 shadow1pos, float ndotlgeo, float a
         return shadow1;
     }
 
-    // Outside both cascades - no shadow
     return 1.0;
 }
 

@@ -396,7 +396,7 @@ void ImGuiManager::RenderPCFFilteringInterface() {
         float nearClip = 1.0f;
         float split1 = splitLambda * (nearClip * std::pow(shadowDistance / nearClip, 0.5f)) +
                        (1.0f - splitLambda) * (nearClip + (shadowDistance - nearClip) * 0.5f);
-        ImGui::Text("Cascade 0: 1 - %.0f, Cascade 1: %.0f - %.0f", split1, split1, shadowDistance);
+        ImGui::Text("Cascade 0: near - %.0f, Cascade 1: %.0f - %.0f", split1, split1, shadowDistance);
 
         ImGui::Separator();
         ImGui::Text("HLSL Unified Look");

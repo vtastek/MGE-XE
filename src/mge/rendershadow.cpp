@@ -92,7 +92,7 @@ static LightSpaceBounds computeLightSpaceBounds(
 // Compute split distances using practical split scheme (blend of log and linear)
 static void computeCascadeSplits(float nearClip, float farClip, float lambda, float splits[3])
 {
-    splits[0] = nearClip;
+    splits[0] = 0.0f;
 
     for (int i = 1; i < 3; i++) {
         float p = (float)i / 2.0f;
@@ -143,7 +143,7 @@ void DistantLand::renderShadowMap(DLContext* ctx) {
     D3DXMatrixInverse(&inverseCameraProj, NULL, &cameraViewProj);
 
     // Compute cascade split points using practical split scheme
-    float nearClip = 1.0f;  // Camera near plane
+    float nearClip = 1.0f;  // Positive reference distance for logarithmic splitting.
     float shadowDistance = ImGuiManager::GetShadowDistance();
     float splitLambda = ImGuiManager::GetSplitLambda();
     float splits[3];

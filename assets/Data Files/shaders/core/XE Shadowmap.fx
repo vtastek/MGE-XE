@@ -48,6 +48,15 @@ ShadowVertOut ShadowVS(StatVertIn IN) {
     return OUT;
 }
 
+ShadowVertOut ShadowStencilVS(StatVertIn IN) {
+    ShadowVertOut OUT = ShadowVS(IN);
+
+    const float stencilGuardTexels = 16.0;
+    OUT.pos.xy *= 1.0 + 2.0 * stencilGuardTexels * shadowRcpRes;
+
+    return OUT;
+}
+
 ShadowVertOut ShadowClearVS(float4 pos : POSITION) {
     ShadowVertOut OUT;
 
@@ -140,14 +149,14 @@ technique T0 {
         ColorWriteEnable = 0;
         CullMode = none;
 
-        StencilEnable = true;
+        StencilEnable = false;
         StencilFunc = always;
         StencilPass = replace;
         StencilFail = keep;
         StencilRef = 1;
         StencilMask = 0xffffffff;
 
-        VertexShader = compile vs_3_0 ShadowVS();
+        VertexShader = compile vs_3_0 ShadowStencilVS();
         PixelShader = compile ps_3_0 ShadowStencilPS();
     }
     //------------------------------------------------------------
@@ -162,7 +171,7 @@ technique T0 {
         CullMode = CCW;   // Counter-clockwise culling for legacy effects
 #endif
 
-        StencilEnable = true;
+        StencilEnable = false;
         StencilFunc = notequal;
         StencilPass = keep;
         StencilFail = keep;
