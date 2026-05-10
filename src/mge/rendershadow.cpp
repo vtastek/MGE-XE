@@ -3,6 +3,7 @@
 #include "distantshader.h"
 #include "configuration.h"
 #include "mwbridge.h"
+#include "phasetimers.h"
 #include "proxydx/d3d8header.h"
 #include "support/log.h"
 
@@ -20,6 +21,7 @@ static const float shadowFarRadius = 4000.0;
 // Applies filtering to soften shadow edges
 // This *must* restore render state on return
 void DistantLand::renderShadowMap() {
+    MGE_SCOPED_TIMER("renderShadowMap");
     IDirect3DSurface9* target, *targetSoft;
     texShadow->GetSurfaceLevel(0, &target);
     texSoftShadow->GetSurfaceLevel(0, &targetSoft);
@@ -129,6 +131,11 @@ void DistantLand::renderShadowLayerGeneric(MWBridge* mwBridge, int layer, const 
 
 // renderShadowLayer - Calculates projection for, and renders, one shadow layer
 void DistantLand::renderShadowLayer(int layer, float radius, const D3DXMATRIX* inverseCameraProj) {
+    // Per-cascade total: matrix construction + visibility query +
+    // stencil pass + caster render. In IPC mode the cull cost overlaps
+    // with rendering via parallelRead, so splitting cull from render
+    // wouldn't be meaningful — one timer per cascade is the right grain.
+    MGE_SCOPED_TIMER(layer == 0 ? "renderShadowLayer:c0" : "renderShadowLayer:c1");
     auto mwBridge = MWBridge::get();
     D3DXVECTOR3 lookAt, lookAtEye, shadowCameraPos, up(0, 0, 1);
     D3DXMATRIX* view = &smView[layer], *proj = &smProj[layer], *viewproj = &smViewproj[layer];
