@@ -81,7 +81,12 @@ float shadowDeltaZ(float4 shadow0pos, float4 shadow1pos) {
         // fires for the small percentage of fragments in the band.
         float2      c0Out      = abs(shadow0pos.xy) / atlasMargin.xy;
         float       c0OutMax   = max(c0Out.x, c0Out.y);
-        const float blendStart = 0.9;
+        // Widened to 20% of cascade-0 inner area (was 0.9 / 10%) after
+        // empirical test: the narrower band still left jagged edge
+        // shadows in dense Vivec-style cells where camera-rotation
+        // texel jitter spans >10%. Widening costs slightly more samples
+        // in the blend region (still <1.5% of all pixels).
+        const float blendStart = 0.8;
 
         [branch] if(c0OutMax > blendStart && inC1) {
             float2 c1UV = (0.5 + 0.5*shadowRcpRes) + float2(0.5, -0.5) * shadow1pos.xy;
