@@ -971,9 +971,22 @@ private:
     static std::vector<std::thread> o3RecompileWorkers;
     static std::atomic<bool> o3RecompileStarted;  // Ensures we only start once
 
+    // Split-queue promotion: workers compile blobs (CPU only), render thread
+    // drains and creates device shaders + swaps cache entries.
+    struct O3PromoteRequest {
+        ShaderKey key;
+        ID3DBlob* vsBlob;
+        ID3DBlob* psBlob;
+    };
+    static std::queue<O3PromoteRequest> o3PromoteQueue;
+    static std::mutex o3PromoteMutex;
+
     static void queueAllO3Recompiles();
     static void startO3RecompileThread();
     static void stopO3RecompileThread();
+    // Render-thread drain: creates device shaders for ready blobs and swaps
+    // them into the cache. Call once per frame from swapBuffers().
+    static void drainO3Promotions(int budget = 1);
 
     // Vertex shader caching (vertex shaders don't use texture suffix defines)
     struct VertexShaderKey {
@@ -996,6 +1009,13 @@ private:
     static std::unordered_map<VertexShaderKey, IDirect3DVertexShader9*, VertexShaderKey::hasher> vertexShaderCache;
 
     static HLSLShader generateMWShaderHLSL(const ShaderKey& sk, uint8_t optLevel = 1);
+    // Phase 1 — pure CPU, thread-safe. Returns false on compile failure.
+    static bool compileShaderBlobsHLSL(const ShaderKey& sk, uint8_t optLevel,
+                                       ID3DBlob** outVsBlob, ID3DBlob** outPsBlob);
+    // Phase 2 — render thread only (calls device->CreateVertexShader/CreatePixelShader).
+    // On failure, returned HLSLShader has null vertexShader/pixelShader.
+    static HLSLShader createShaderFromBlobs(const ShaderKey& sk, ID3DBlob* vsBlob,
+                                            ID3DBlob* psBlob, uint8_t optLevel);
     static HLSLShader createPurpleErrorShader();
     static void captureAndDumpTexture(IDirect3DTexture9* texture);
 

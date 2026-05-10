@@ -489,6 +489,10 @@ std::atomic<bool> FixedFunctionShader::o3RecompileActive{false};
 std::vector<std::thread> FixedFunctionShader::o3RecompileWorkers;
 std::atomic<bool> FixedFunctionShader::o3RecompileStarted{false};
 
+// Split-queue promotion: workers push compiled blobs here, render thread drains.
+std::queue<FixedFunctionShader::O3PromoteRequest> FixedFunctionShader::o3PromoteQueue;
+std::mutex FixedFunctionShader::o3PromoteMutex;
+
 // Precache progress counters for loading bar
 std::atomic<int> FixedFunctionShader::precacheCompleted{0};
 std::atomic<int> FixedFunctionShader::precacheTotal{0};
@@ -1745,7 +1749,9 @@ void FixedFunctionShader::startO3RecompileThread() {
 
     o3RecompileActive = true;
 
-    constexpr int numWorkers = 2;
+    // Single worker: only does CPU compile, pushes blobs to promote queue.
+    // Render thread drains via drainO3Promotions() in swapBuffers().
+    constexpr int numWorkers = 1;
     static std::atomic<int> totalCompiled{0};
     totalCompiled = 0;
 
@@ -1757,7 +1763,6 @@ void FixedFunctionShader::startO3RecompileThread() {
             ShaderKey key;
             bool hasWork = false;
 
-            // Pop from queue
             {
                 std::lock_guard<std::mutex> lock(o3QueueMutex);
                 if (!o3RecompileQueue.empty()) {
@@ -1768,29 +1773,26 @@ void FixedFunctionShader::startO3RecompileThread() {
             }
 
             if (!hasWork) {
-                break;  // Queue empty, done
+                break;
             }
 
-            // Compile at O3 (this is the slow part)
-            HLSLShader newShader;
+            ID3DBlob* vsBlob = nullptr;
+            ID3DBlob* psBlob = nullptr;
+            bool ok;
             {
                 MGE_ZoneScopedN("FFE_HLSL_O3_Compile");
-                newShader = generateMWShaderHLSL(key, 3);
+                ok = compileShaderBlobsHLSL(key, 3, &vsBlob, &psBlob);
+            }
+            if (!ok) {
+                // Compile failed — leave existing O1 entry alone, skip.
+                continue;
             }
 
-            // Replace O1 entry in cache (release old shaders first)
-            AcquireSRWLockExclusive(&hlslCacheLock);
-            auto it = cacheHLSLShaders.find(key);
-            if (it != cacheHLSLShaders.end()) {
-                // Release old O1 shaders
-                if (it->second.vertexShader) it->second.vertexShader->Release();
-                if (it->second.pixelShader) it->second.pixelShader->Release();
-                if (it->second.vsConstantTable) it->second.vsConstantTable->Release();
-                if (it->second.psConstantTable) it->second.psConstantTable->Release();
-                // Replace with new O3 shader
-                it->second = newShader;
+            // Hand off to render thread for device shader creation + cache swap.
+            {
+                std::lock_guard<std::mutex> lock(o3PromoteMutex);
+                o3PromoteQueue.push({key, vsBlob, psBlob});
             }
-            ReleaseSRWLockExclusive(&hlslCacheLock);
 
             compiled++;
         }
@@ -1798,24 +1800,88 @@ void FixedFunctionShader::startO3RecompileThread() {
         totalCompiled += compiled;
     };
 
-    LOG::logline("-- O3 recompile: starting %d workers", numWorkers);
+    LOG::logline("-- O3 recompile: starting %d worker", numWorkers);
     for (int i = 0; i < numWorkers; i++) {
         o3RecompileWorkers.emplace_back(workerFunc);
     }
 
-    // Detach a monitor thread to log completion and invalidate LRU
+    // Monitor thread: just logs when CPU compile is fully drained. Note that
+    // the promote queue may still have unprocessed entries — render thread
+    // continues draining at 1/frame until empty.
     std::thread([numWorkers]() {
         for (auto& w : o3RecompileWorkers) {
             if (w.joinable()) w.join();
         }
         o3RecompileWorkers.clear();
 
-        // Invalidate LRU so next draw picks up O3 shaders
-        hlslShaderLRU.last_sk = ShaderKey();
-
-        LOG::logline("-- O3 recompile finished: %d shaders upgraded", totalCompiled.load());
+        LOG::logline("-- O3 recompile (CPU phase) finished: %d shaders compiled, awaiting promotion", totalCompiled.load());
         o3RecompileActive = false;
     }).detach();
+}
+
+// Render-thread drain. Pops up to `budget` blobs, creates device shaders, swaps
+// them into the cache, releases old COM pointers OUTSIDE the cache lock.
+void FixedFunctionShader::drainO3Promotions(int budget) {
+    if (!device) return;
+
+    for (int i = 0; i < budget; i++) {
+        O3PromoteRequest req;
+        {
+            std::lock_guard<std::mutex> lock(o3PromoteMutex);
+            if (o3PromoteQueue.empty()) return;
+            req = o3PromoteQueue.front();
+            o3PromoteQueue.pop();
+        }
+
+        MGE_ZoneScopedN("FFE_HLSL_O3_Promote");
+
+        HLSLShader newShader = createShaderFromBlobs(req.key, req.vsBlob, req.psBlob, 3);
+        req.vsBlob->Release();
+        req.psBlob->Release();
+
+        if (!newShader.vertexShader || !newShader.pixelShader) {
+            // Create failed — drop any partial pieces, leave existing O1 alone.
+            if (newShader.vertexShader) newShader.vertexShader->Release();
+            if (newShader.pixelShader) newShader.pixelShader->Release();
+            if (newShader.vsConstantTable) newShader.vsConstantTable->Release();
+            if (newShader.psConstantTable) newShader.psConstantTable->Release();
+            continue;
+        }
+
+        // Swap into cache. Capture old COM pointers for release outside the lock.
+        IDirect3DVertexShader9* oldVS = nullptr;
+        IDirect3DPixelShader9*  oldPS = nullptr;
+        ID3DXConstantTable*     oldVSCT = nullptr;
+        ID3DXConstantTable*     oldPSCT = nullptr;
+        bool swapped = false;
+
+        AcquireSRWLockExclusive(&hlslCacheLock);
+        auto it = cacheHLSLShaders.find(req.key);
+        if (it != cacheHLSLShaders.end() && it->second.optimizationLevel < 3) {
+            oldVS   = it->second.vertexShader;
+            oldPS   = it->second.pixelShader;
+            oldVSCT = it->second.vsConstantTable;
+            oldPSCT = it->second.psConstantTable;
+            it->second = newShader;
+            // Invalidate LRU under the lock so no draw can read stale pointers.
+            hlslShaderLRU.last_sk = ShaderKey();
+            swapped = true;
+        }
+        ReleaseSRWLockExclusive(&hlslCacheLock);
+
+        if (swapped) {
+            if (oldVS)   oldVS->Release();
+            if (oldPS)   oldPS->Release();
+            if (oldVSCT) oldVSCT->Release();
+            if (oldPSCT) oldPSCT->Release();
+        } else {
+            // Cache entry already O3+ or missing — drop newly-created shader.
+            if (newShader.vertexShader)    newShader.vertexShader->Release();
+            if (newShader.pixelShader)     newShader.pixelShader->Release();
+            if (newShader.vsConstantTable) newShader.vsConstantTable->Release();
+            if (newShader.psConstantTable) newShader.psConstantTable->Release();
+        }
+    }
 }
 
 void FixedFunctionShader::stopO3RecompileThread() {
@@ -1826,10 +1892,23 @@ void FixedFunctionShader::stopO3RecompileThread() {
     }
     o3RecompileWorkers.clear();
 
-    // Clear any remaining queue
-    std::lock_guard<std::mutex> lock(o3QueueMutex);
-    while (!o3RecompileQueue.empty()) {
-        o3RecompileQueue.pop();
+    // Clear pending compile keys
+    {
+        std::lock_guard<std::mutex> lock(o3QueueMutex);
+        while (!o3RecompileQueue.empty()) {
+            o3RecompileQueue.pop();
+        }
+    }
+
+    // Drain promote queue, releasing any blobs that were never promoted.
+    {
+        std::lock_guard<std::mutex> lock(o3PromoteMutex);
+        while (!o3PromoteQueue.empty()) {
+            auto& req = o3PromoteQueue.front();
+            if (req.vsBlob) req.vsBlob->Release();
+            if (req.psBlob) req.psBlob->Release();
+            o3PromoteQueue.pop();
+        }
     }
 }
 
@@ -1891,22 +1970,27 @@ static FixedFunctionShader::ConstReg resolveConstReg(ID3DXConstantTable* table, 
     return cr;
 }
 
-FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const ShaderKey& sk, uint8_t optLevel) {
-    HLSLShader hlslShader = {};
-    
+// Phase 1: pure-CPU compile. Loads source, builds defines, calls D3DCompile for
+// VS+PS. Thread-safe — no device calls. Caller owns returned blobs (via
+// outVsBlob/outPsBlob) and must Release() them.
+bool FixedFunctionShader::compileShaderBlobsHLSL(const ShaderKey& sk, uint8_t optLevel,
+                                                 ID3DBlob** outVsBlob, ID3DBlob** outPsBlob) {
+    *outVsBlob = nullptr;
+    *outPsBlob = nullptr;
+
     // Shader entry points
     const char* vertexShaderName = "vs_main";
     const char* pixelShaderName = "ps_main";
-    
+
     // Load separate vertex and pixel shader files
     DWORD vsFileSize = 0, psFileSize = 0;
     char* vertexShaderSource = HLSLShaderManager::loadHLSLShaderFile("Data Files\\shaders\\core-hlsl\\XE FixedFuncEmu_VS.hlsl", &vsFileSize);
     char* pixelShaderSource = HLSLShaderManager::loadHLSLShaderFile("Data Files\\shaders\\core-hlsl\\XE FixedFuncEmu_PS.hlsl", &psFileSize);
-    
+
     if (!vertexShaderSource || !pixelShaderSource) {
         if (vertexShaderSource) delete[] vertexShaderSource;
         if (pixelShaderSource) delete[] pixelShaderSource;
-        return hlslShaderDefaultPurple;
+        return false;
     }
 
     // Build shader defines based on ShaderKey
@@ -1925,30 +2009,24 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
 
     if (sk.hasParamH) {
         defines[defineCount++] = {"HAS_PARAMH", "1"};
-        // LOG::logline("HLSL: Compiling with HAS_PARAMH define");
     }
     if (sk.disableParallax) {
         defines[defineCount++] = {"SKIP_PARALLAX", "1"};
     }
     if (sk.hasParamX) {
         defines[defineCount++] = {"HAS_PARAMX", "1"};
-        // LOG::logline("HLSL: Compiling with HAS_PARAMX define");
     }
     if (sk.hasGrass) {
         defines[defineCount++] = {"HAS_GRASS", "1"};
-        // LOG::logline("HLSL: Compiling with HAS_GRASS define");
     }
     if (sk.hasShadows) {
         defines[defineCount++] = {"HAS_SHADOWS", "1"};
-        // LOG::logline("HLSL: Compiling with HAS_SHADOWS define");
     }
     if (sk.hasDetail) {
         defines[defineCount++] = {"HAS_DETAIL", "1"};
-        // LOG::logline("HLSL: Compiling with HAS_DETAIL define");
     }
     if (!sk.useLighting) {
         defines[defineCount++] = {"NOLIT", "1"};
-        // LOG::logline("HLSL: Compiling with NOLIT define (unlit shader)");
     }
     if (sk.useInstancing) {
         defines[defineCount++] = {"USE_INSTANCING", "1"};
@@ -1966,18 +2044,13 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         defines[defineCount++] = {"HAS_DISPLACEMENT", "1"};
     }
     defines[defineCount] = {nullptr, nullptr}; // Null terminator
-    
-    // LOG::logline("HLSL: Compiling shader with %d defines", defineCount);
-    
+
     // Compile vertex shader
-    // TODO: Optimize - vertex shaders don't use texture suffix defines (HAS_PARAMH, HAS_PARAMX)
-    // Many vertex shaders could be cached and reused across pixel shader variants
     ID3DBlob* vsBlob = nullptr;
     ID3DBlob* vsErrors = nullptr;
 
     // Use IEEE_STRICTNESS for consistent Z precision across shader permutations (stateless batch vs regular)
     DWORD vsCompileFlags = D3DCOMPILE_PREFER_FLOW_CONTROL | D3DCOMPILE_IEEE_STRICTNESS;
-    // Use optimization level based on optLevel parameter (1=O1, 2=O2, 3=O3)
     if (optLevel == 1) {
         vsCompileFlags |= D3DCOMPILE_OPTIMIZATION_LEVEL1;
     } else if (optLevel == 2) {
@@ -1985,13 +2058,13 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     } else {
         vsCompileFlags |= D3DCOMPILE_OPTIMIZATION_LEVEL3;
     }
-    
+
     HRESULT hr = D3DCompile(
         vertexShaderSource,
         vsFileSize,
         "XE FixedFuncEmu_VS.hlsl",
-        defines, // Pass suffix texture defines
-        HLSLShaderManager::getIncludeHandler(), // Include handler for #include support
+        defines,
+        HLSLShaderManager::getIncludeHandler(),
         vertexShaderName,
         "vs_3_0",
         vsCompileFlags,
@@ -1999,7 +2072,7 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         &vsBlob,
         &vsErrors
     );
-    
+
     if (FAILED(hr)) {
         if (vsErrors) {
             LOG::write("!! HLSL Vertex Shader compile errors:\n");
@@ -2007,33 +2080,84 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
             LOG::write("\n");
             vsErrors->Release();
         }
-        LOG::logline("!! HLSL Vertex Shader compilation failed, using default");
+        LOG::logline("!! HLSL Vertex Shader compilation failed");
         delete[] vertexShaderSource;
         delete[] pixelShaderSource;
-        return hlslShaderDefaultPurple;
+        return false;
     }
-    
-    // Create vertex shader
-    hr = device->CreateVertexShader(
+    if (vsErrors) vsErrors->Release();
+
+    // Compile pixel shader
+    ID3DBlob* psBlob = nullptr;
+    ID3DBlob* psErrors = nullptr;
+
+    // Match D3DX9 effect compilation - no IEEE_STRICTNESS for invariance with depth pass
+    DWORD psCompileFlags = D3DCOMPILE_PREFER_FLOW_CONTROL;
+    if (optLevel == 1) {
+        psCompileFlags |= D3DCOMPILE_OPTIMIZATION_LEVEL1;
+    } else if (optLevel == 2) {
+        psCompileFlags |= D3DCOMPILE_OPTIMIZATION_LEVEL2;
+    } else {
+        psCompileFlags |= D3DCOMPILE_OPTIMIZATION_LEVEL3;
+    }
+
+    hr = D3DCompile(
+        pixelShaderSource,
+        psFileSize,
+        "XE FixedFuncEmu_PS.hlsl",
+        defines,
+        HLSLShaderManager::getIncludeHandler(),
+        pixelShaderName,
+        "ps_3_0",
+        psCompileFlags,
+        0,
+        &psBlob,
+        &psErrors
+    );
+
+    delete[] vertexShaderSource;
+    delete[] pixelShaderSource;
+
+    if (FAILED(hr)) {
+        if (psErrors) {
+            LOG::write("!! HLSL Pixel Shader compile errors:\n");
+            LOG::write(reinterpret_cast<const char*>(psErrors->GetBufferPointer()));
+            LOG::write("\n");
+            psErrors->Release();
+        }
+        LOG::logline("!! HLSL Pixel Shader compilation failed");
+        vsBlob->Release();
+        return false;
+    }
+    if (psErrors) psErrors->Release();
+
+    *outVsBlob = vsBlob;
+    *outPsBlob = psBlob;
+    return true;
+}
+
+// Phase 2: render-thread only. Creates device shaders from compiled blobs and
+// resolves constant tables / register handles. On failure, returned struct's
+// vertexShader/pixelShader will be null. Does NOT release input blobs.
+FixedFunctionShader::HLSLShader FixedFunctionShader::createShaderFromBlobs(
+    const ShaderKey& sk, ID3DBlob* vsBlob, ID3DBlob* psBlob, uint8_t optLevel) {
+    HLSLShader hlslShader = {};
+
+    HRESULT hr = device->CreateVertexShader(
         reinterpret_cast<DWORD*>(vsBlob->GetBufferPointer()),
         &hlslShader.vertexShader
     );
-    
     if (FAILED(hr)) {
         LOG::logline("!! Failed to create HLSL vertex shader");
-        vsBlob->Release();
-        delete[] vertexShaderSource;
-        delete[] pixelShaderSource;
-        return hlslShaderDefaultPurple;
+        return hlslShader;
     }
-    
+
     // Get constant table for vertex shader
     hr = D3DXGetShaderConstantTable(
         reinterpret_cast<DWORD*>(vsBlob->GetBufferPointer()),
         &hlslShader.vsConstantTable
     );
 
-    // Cache vertex shader constant handles to avoid per-draw string lookups
     if (hlslShader.vsConstantTable) {
         hlslShader.hWorldViewProj = hlslShader.vsConstantTable->GetConstantByName(NULL, "worldViewProj");
         hlslShader.hView = hlslShader.vsConstantTable->GetConstantByName(NULL, "view");
@@ -2052,7 +2176,6 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         hlslShader.hVertexBlendState = hlslShader.vsConstantTable->GetConstantByName(NULL, "vertexBlendState");
         hlslShader.hShadowWorldViewProj = hlslShader.vsConstantTable->GetConstantByName(NULL, "shadowWorldViewProj");
 
-        // Resolve VS register offsets for command buffer path
         hlslShader.regWorldViewProj = resolveConstReg(hlslShader.vsConstantTable, hlslShader.hWorldViewProj);
         hlslShader.regView = resolveConstReg(hlslShader.vsConstantTable, hlslShader.hView);
         hlslShader.regProj = resolveConstReg(hlslShader.vsConstantTable, hlslShader.hProj);
@@ -2063,74 +2186,18 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         hlslShader.regShadowWorldViewProj = resolveConstReg(hlslShader.vsConstantTable, hlslShader.hShadowWorldViewProj);
     }
 
-    // Log VS blob size before releasing
-    // LOG::logline("-- HLSL VS blob size: %u bytes", vsBlob->GetBufferSize());
-
-    vsBlob->Release();
-    
-    // Compile pixel shader using pixel shader source
-    ID3DBlob* psBlob = nullptr;
-    ID3DBlob* psErrors = nullptr;
-
-    // Match D3DX9 effect compilation - no IEEE_STRICTNESS for invariance with depth pass
-    DWORD psCompileFlags = D3DCOMPILE_PREFER_FLOW_CONTROL;
-    // Use optimization level based on optLevel parameter (1=O1, 2=O2, 3=O3)
-    if (optLevel == 1) {
-        psCompileFlags |= D3DCOMPILE_OPTIMIZATION_LEVEL1;
-    } else if (optLevel == 2) {
-        psCompileFlags |= D3DCOMPILE_OPTIMIZATION_LEVEL2;
-    } else {
-        psCompileFlags |= D3DCOMPILE_OPTIMIZATION_LEVEL3;
-    }
-    
-    hr = D3DCompile(
-        pixelShaderSource,
-        psFileSize,
-        "XE FixedFuncEmu_PS.hlsl",
-        defines, // Pass same suffix texture defines
-        HLSLShaderManager::getIncludeHandler(), // Include handler for #include support
-        pixelShaderName,
-        "ps_3_0",
-        psCompileFlags,
-        0,
-        &psBlob,
-        &psErrors
-    );
-    
-    if (FAILED(hr)) {
-        if (psErrors) {
-            LOG::write("!! HLSL Pixel Shader compile errors:\n");
-            LOG::write(reinterpret_cast<const char*>(psErrors->GetBufferPointer()));
-            LOG::write("\n");
-            psErrors->Release();
-        }
-        LOG::logline("!! HLSL Pixel Shader compilation failed, using default");
-        // Clean up vertex shader
-        if (hlslShader.vertexShader) hlslShader.vertexShader->Release();
-        if (hlslShader.vsConstantTable) hlslShader.vsConstantTable->Release();
-        delete[] vertexShaderSource;
-        delete[] pixelShaderSource;
-        return hlslShaderDefaultPurple;
-    }
-    
-    // Create pixel shader
     hr = device->CreatePixelShader(
         reinterpret_cast<DWORD*>(psBlob->GetBufferPointer()),
         &hlslShader.pixelShader
     );
-    
+
     if (FAILED(hr)) {
         LOG::logline("!! Failed to create HLSL pixel shader");
-        psBlob->Release();
-        // Clean up vertex shader
-        if (hlslShader.vertexShader) hlslShader.vertexShader->Release();
-        if (hlslShader.vsConstantTable) hlslShader.vsConstantTable->Release();
-        delete[] vertexShaderSource;
-        delete[] pixelShaderSource;
-        return hlslShaderDefaultPurple;
+        if (hlslShader.vertexShader) { hlslShader.vertexShader->Release(); hlslShader.vertexShader = nullptr; }
+        if (hlslShader.vsConstantTable) { hlslShader.vsConstantTable->Release(); hlslShader.vsConstantTable = nullptr; }
+        return hlslShader;
     }
-    
-    // Get constant table for pixel shader
+
     hr = D3DXGetShaderConstantTable(
         reinterpret_cast<DWORD*>(psBlob->GetBufferPointer()),
         &hlslShader.psConstantTable
@@ -2139,19 +2206,16 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
     if (FAILED(hr) || !hlslShader.psConstantTable) {
         LOG::logline("HLSL: Failed to extract pixel shader constant table, hr=%x", hr);
     } else {
-        // Cache pixel shader constant handles to avoid per-draw string lookups
         hlslShader.hMaterialDiffuse = hlslShader.psConstantTable->GetConstantByName(NULL, "materialDiffuse");
         hlslShader.hMaterialAmbient = hlslShader.psConstantTable->GetConstantByName(NULL, "materialAmbient");
         hlslShader.hMaterialEmissive = hlslShader.psConstantTable->GetConstantByName(NULL, "materialEmissive");
 
-        // Cache additional lighting and shader constant handles
         hlslShader.hLightSunDirection = hlslShader.psConstantTable->GetConstantByName(NULL, "lightSunDirection");
         hlslShader.hLightSunDiffuse = hlslShader.psConstantTable->GetConstantByName(NULL, "lightSunDiffuse");
         hlslShader.hLightSceneAmbient = hlslShader.psConstantTable->GetConstantByName(NULL, "lightSceneAmbient");
         hlslShader.hShadowRcpRes = hlslShader.psConstantTable->GetConstantByName(NULL, "shadowRcpRes");
         hlslShader.hPCFFilterSize = hlslShader.psConstantTable->GetConstantByName(NULL, "PCF_filterSize");
 
-        // Cache point light constant handles (only present for lightMode 1-2)
         hlslShader.hLightDiffuse = hlslShader.psConstantTable->GetConstantByName(NULL, "lightDiffuse");
         hlslShader.hLightPosition = hlslShader.psConstantTable->GetConstantByName(NULL, "lightPosition");
         hlslShader.hLightAmbient = hlslShader.psConstantTable->GetConstantByName(NULL, "lightAmbient");
@@ -2159,7 +2223,6 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         hlslShader.hLightFalloffQuadratic = hlslShader.psConstantTable->GetConstantByName(NULL, "lightFalloffQuadratic");
         hlslShader.hLightFalloffConstant = hlslShader.psConstantTable->GetConstantByName(NULL, "lightFalloffConstant");
 
-        // Resolve PS register offsets for command buffer path
         hlslShader.regMaterialDiffuse = resolveConstReg(hlslShader.psConstantTable, hlslShader.hMaterialDiffuse);
         hlslShader.regMaterialAmbient = resolveConstReg(hlslShader.psConstantTable, hlslShader.hMaterialAmbient);
         hlslShader.regMaterialEmissive = resolveConstReg(hlslShader.psConstantTable, hlslShader.hMaterialEmissive);
@@ -2175,29 +2238,37 @@ FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const 
         hlslShader.regLightFalloffQuadratic = resolveConstReg(hlslShader.psConstantTable, hlslShader.hLightFalloffQuadratic);
         hlslShader.regLightFalloffConstant = resolveConstReg(hlslShader.psConstantTable, hlslShader.hLightFalloffConstant);
 
-        // Dynamic constants resolved on first use in renderMorrowindHLSL_Internal
         hlslShader.dynamicConstsResolved = false;
     }
 
-    // Log compilation details for debugging (before releasing blobs)
-    // LOG::logline("-- HLSL shader compiled successfully: VS=%s PS=%s", vertexShaderName, pixelShaderName);
-    // LOG::logline("-- HLSL PS blob size: %u bytes", psBlob->GetBufferSize());
-    
-    psBlob->Release();
-    
-    // Clean up shader sources
-    delete[] vertexShaderSource;
-    delete[] pixelShaderSource;
-
-    // Record optimization level used for this shader
     hlslShader.optimizationLevel = optLevel;
-
     return hlslShader;
+}
+
+// Wrapper: full compile + create. Used by precache + synchronous O1 path.
+FixedFunctionShader::HLSLShader FixedFunctionShader::generateMWShaderHLSL(const ShaderKey& sk, uint8_t optLevel) {
+    ID3DBlob* vsBlob = nullptr;
+    ID3DBlob* psBlob = nullptr;
+    if (!compileShaderBlobsHLSL(sk, optLevel, &vsBlob, &psBlob)) {
+        return hlslShaderDefaultPurple;
+    }
+    HLSLShader shader = createShaderFromBlobs(sk, vsBlob, psBlob, optLevel);
+    vsBlob->Release();
+    psBlob->Release();
+    if (!shader.vertexShader || !shader.pixelShader) {
+        return hlslShaderDefaultPurple;
+    }
+    return shader;
 }
 
 // Triple buffer rotation at Present()
 // Rotation: Recording(N) -> Prep(N-1) -> Render(N-2) -> Recording(cleared)
 void FixedFunctionShader::swapBuffers() {
+    // Promote one O3-compiled shader per frame on the render thread. Keeps
+    // CreateVertexShader/CreatePixelShader off the worker so it never contends
+    // with rendering on the D3D9 device lock.
+    drainO3Promotions(1);
+
     // Snapshot final light state into recording buffer BEFORE swap.
     // After swap, this buffer becomes the prep buffer — prepareRecordedCalls() reads it
     // off the worker thread. Per-frame snapshot avoids main-thread/worker-thread races
