@@ -8,11 +8,99 @@
 #include "support/log.h"
 
 #include <cmath>
+#include <algorithm>
 
+// Frustum-fitted Cascaded Shadow Maps (Lengyel-style)
+// Each cascade tightly fits a slice of the view frustum projected into light space
 
+// Compute 8 corners of a frustum slice between splitNear and splitFar (world distances)
+// Uses linear interpolation in world space since NDC z is non-linear for perspective
+static void computeFrustumSliceCorners(
+    const D3DXMATRIX* invViewProj,
+    float splitNear, float splitFar,
+    D3DXVECTOR3 corners[8])
+{
+    // First get the full frustum corners at NDC z=0 (near) and z=1 (far)
+    const float ndcX[4] = {-1, 1, 1, -1};
+    const float ndcY[4] = {-1, -1, 1, 1};
 
-// Shadow cascade radii now controlled via ImGui (imgui_manager.cpp)
-// Default values: near=1000, far=4000
+    D3DXVECTOR3 nearCorners[4], farCorners[4];
+
+    for (int i = 0; i < 4; i++) {
+        D3DXVECTOR4 nearNDC(ndcX[i], ndcY[i], 0.0f, 1.0f);
+        D3DXVECTOR4 farNDC(ndcX[i], ndcY[i], 1.0f, 1.0f);
+        D3DXVECTOR4 worldNear, worldFar;
+
+        D3DXVec4Transform(&worldNear, &nearNDC, invViewProj);
+        D3DXVec4Transform(&worldFar, &farNDC, invViewProj);
+
+        worldNear /= worldNear.w;
+        worldFar /= worldFar.w;
+
+        nearCorners[i] = D3DXVECTOR3(worldNear.x, worldNear.y, worldNear.z);
+        farCorners[i] = D3DXVECTOR3(worldFar.x, worldFar.y, worldFar.z);
+    }
+
+    // Compute actual frustum depth from corners (camera's real far plane)
+    D3DXVECTOR3 nearCenter = (nearCorners[0] + nearCorners[1] + nearCorners[2] + nearCorners[3]) * 0.25f;
+    D3DXVECTOR3 farCenter = (farCorners[0] + farCorners[1] + farCorners[2] + farCorners[3]) * 0.25f;
+    float frustumDepth = D3DXVec3Length(&(farCenter - nearCenter));
+
+    // Lerp factors for the slice (relative to actual camera frustum)
+    float nearLerp = splitNear / frustumDepth;
+    float farLerp = splitFar / frustumDepth;
+
+    // Clamp to valid range (in case shadowDistance > camera far)
+    nearLerp = std::min(nearLerp, 1.0f);
+    farLerp = std::min(farLerp, 1.0f);
+
+    // Interpolate to get slice corners
+    for (int i = 0; i < 4; i++) {
+        D3DXVECTOR3 dir = farCorners[i] - nearCorners[i];
+        corners[i] = nearCorners[i] + dir * nearLerp;
+        corners[i + 4] = nearCorners[i] + dir * farLerp;
+    }
+}
+
+// Compute light-space AABB for frustum slice corners
+struct LightSpaceBounds {
+    float minX, maxX, minY, maxY, minZ, maxZ;
+};
+
+static LightSpaceBounds computeLightSpaceBounds(
+    const D3DXVECTOR3 corners[8],
+    const D3DXMATRIX* lightView)
+{
+    LightSpaceBounds bounds = { FLT_MAX, -FLT_MAX, FLT_MAX, -FLT_MAX, FLT_MAX, -FLT_MAX };
+
+    for (int i = 0; i < 8; i++) {
+        D3DXVECTOR4 corner(corners[i].x, corners[i].y, corners[i].z, 1.0f);
+        D3DXVECTOR4 lightSpace;
+        D3DXVec4Transform(&lightSpace, &corner, lightView);
+
+        bounds.minX = std::min(bounds.minX, lightSpace.x);
+        bounds.maxX = std::max(bounds.maxX, lightSpace.x);
+        bounds.minY = std::min(bounds.minY, lightSpace.y);
+        bounds.maxY = std::max(bounds.maxY, lightSpace.y);
+        bounds.minZ = std::min(bounds.minZ, lightSpace.z);
+        bounds.maxZ = std::max(bounds.maxZ, lightSpace.z);
+    }
+
+    return bounds;
+}
+
+// Compute split distances using practical split scheme (blend of log and linear)
+static void computeCascadeSplits(float nearClip, float farClip, float lambda, float splits[3])
+{
+    splits[0] = nearClip;
+
+    for (int i = 1; i < 3; i++) {
+        float p = (float)i / 2.0f;
+        float logSplit = nearClip * std::pow(farClip / nearClip, p);
+        float linearSplit = nearClip + (farClip - nearClip) * p;
+        splits[i] = lambda * logSplit + (1.0f - lambda) * linearSplit;
+    }
+}
 
 
 
@@ -54,14 +142,21 @@ void DistantLand::renderShadowMap(DLContext* ctx) {
     D3DXMatrixMultiply(&cameraViewProj, &ctx->mwView, &ctx->mwProj);
     D3DXMatrixInverse(&inverseCameraProj, NULL, &cameraViewProj);
 
+    // Compute cascade split points using practical split scheme
+    float nearClip = 1.0f;  // Camera near plane
+    float shadowDistance = ImGuiManager::GetShadowDistance();
+    float splitLambda = ImGuiManager::GetSplitLambda();
+    float splits[3];
+    computeCascadeSplits(nearClip, shadowDistance, splitLambda, splits);
+
     // Render near layer (changes viewport)
     LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] layer0 start");
-    renderShadowLayer(ctx, 0, ImGuiManager::GetShadowNearRadius(), &inverseCameraProj);
+    renderShadowLayer(ctx, 0, splits[0], splits[1], &inverseCameraProj);
     LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] layer0 done");
 
     // Render far layer (changes viewport)
     LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] layer1 start");
-    renderShadowLayer(ctx, 1, ImGuiManager::GetShadowFarRadius(), &inverseCameraProj);
+    renderShadowLayer(ctx, 1, splits[1], splits[2], &inverseCameraProj);
     LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] layer1 done");
 
     // Reset viewport
@@ -119,49 +214,59 @@ void DistantLand::renderShadowLayerGeneric(DLContext* ctx, MWBridge* mwBridge, i
     effectShadow->EndPass();
 }
 
-// renderShadowLayer - Calculates projection for, and renders, one shadow layer
-void DistantLand::renderShadowLayer(DLContext* ctx, int layer, float radius, const D3DXMATRIX* inverseCameraProj) {
-    LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] renderShadowLayer %d ENTER", layer);
+// renderShadowLayer - Calculates frustum-fitted projection for one shadow cascade
+void DistantLand::renderShadowLayer(DLContext* ctx, int layer, float splitNear, float splitFar, const D3DXMATRIX* inverseCameraProj) {
+    LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] renderShadowLayer %d ENTER (split %.1f-%.1f)", layer, splitNear, splitFar);
     auto mwBridge = MWBridge::get();
-    D3DXVECTOR3 lookAt, lookAtEye, shadowCameraPos, up(0, 0, 1);
+    D3DXVECTOR3 up(0, 0, 1);
     D3DXMATRIX* view = &ctx->smView[layer], *proj = &ctx->smProj[layer], *viewproj = &ctx->smViewproj[layer];
 
     // Select light vector, sunPos during daytime, sunVec during night
     D3DXVECTOR4 lightVec = (ctx->sunPos.z > 0) ? -ctx->sunPos : ctx->sunVec;
+    D3DXVECTOR3 lightDir(lightVec.x, lightVec.y, lightVec.z);
+    D3DXVec3Normalize(&lightDir, &lightDir);
 
-    // Centre of projection is one radius ahead of the player
-    // Not as far in z direction as player is likely looking at the ground plane rather than below
-    // This will be split into a non-texel-quantized but temporally stable view position part,
-    // and a texel-quantized view rotation part with small magnitude
-    lookAt.x = ctx->eyePos.x + radius * ctx->eyeVec.x;
-    lookAt.y = ctx->eyePos.y + radius * ctx->eyeVec.y;
-    lookAt.z = ctx->eyePos.z + 0.5f * radius * ctx->eyeVec.z;
+    // Compute frustum slice corners for this cascade
+    D3DXVECTOR3 frustumCorners[8];
+    computeFrustumSliceCorners(inverseCameraProj, splitNear, splitFar, frustumCorners);
 
-    // Quantize eye position to partially reduce texture swimming during camera movement
-    lookAtEye.x = float(16.0 * std::floor(0.0625 * ctx->eyePos.x));
-    lookAtEye.y = float(16.0 * std::floor(0.0625 * ctx->eyePos.y));
-    lookAtEye.z = float(16.0 * std::floor(0.0625 * ctx->eyePos.z));
+    // Compute frustum slice center for light view matrix positioning
+    D3DXVECTOR3 frustumCenter(0, 0, 0);
+    for (int i = 0; i < 8; i++) {
+        frustumCenter += frustumCorners[i];
+    }
+    frustumCenter *= 0.125f;
 
-    // Create shadow frustum centred on lookAtEye, looking along lightVec
+    // Build light view matrix looking along light direction from above the frustum
     const float zrange = kCellSize;
-    shadowCameraPos.x = lookAtEye.x - zrange * lightVec.x;
-    shadowCameraPos.y = lookAtEye.y - zrange * lightVec.y;
-    shadowCameraPos.z = lookAtEye.z - zrange * lightVec.z;
+    D3DXVECTOR3 shadowCameraPos = frustumCenter - lightDir * zrange;
 
-    D3DXMatrixLookAtRH(view, &shadowCameraPos, &lookAtEye, &up);
-    D3DXMatrixOrthoRH(proj, 2 * radius, (1 + std::fabs(lightVec.z)) * radius, 0, 2.0 * zrange);
+    // Quantize camera position to reduce temporal jitter during movement
+    shadowCameraPos.x = float(16.0 * std::floor(0.0625 * shadowCameraPos.x));
+    shadowCameraPos.y = float(16.0 * std::floor(0.0625 * shadowCameraPos.y));
+    shadowCameraPos.z = float(16.0 * std::floor(0.0625 * shadowCameraPos.z));
+
+    D3DXVECTOR3 lookAtPoint = shadowCameraPos + lightDir;
+    D3DXMatrixLookAtRH(view, &shadowCameraPos, &lookAtPoint, &up);
+
+    // Transform frustum corners to light space and compute AABB
+    LightSpaceBounds bounds = computeLightSpaceBounds(frustumCorners, view);
+
+    // Extend Z range to include potential casters above the frustum
+    bounds.minZ -= zrange;
+
+    // Create ortho projection fitting the light-space AABB
+    D3DXMatrixOrthoOffCenterRH(proj, bounds.minX, bounds.maxX, bounds.minY, bounds.maxY,
+                               -bounds.maxZ, -bounds.minZ);
+
     *viewproj = (*view) * (*proj);
 
-    // Transform remainder into shadow clip space and quantize
-    // Prevents all shimmer during camera rotation
-    D3DXVECTOR3 dv, deltaLookAt = lookAtEye - lookAt;
-    D3DXVec3TransformNormal(&dv, &deltaLookAt, viewproj);
-
-    // Quantize clip space range [-1, +1] over ShadowResolution texels
+    // Texel snapping: quantize viewproj translation to shadow map texel grid
+    // This prevents shimmer during camera rotation while keeping ortho size stable
+    // Clip space range [-1, +1] maps to ShadowResolution texels
     const float quantizer = 2.0f / Configuration.DL.ShadowResolution;
-    viewproj->_41 += quantizer * floor(dv.x / quantizer);
-    viewproj->_42 += quantizer * floor(dv.y / quantizer);
-    viewproj->_43 += dv.z;
+    viewproj->_41 = quantizer * std::floor(viewproj->_41 / quantizer);
+    viewproj->_42 = quantizer * std::floor(viewproj->_42 / quantizer);
 
     LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] layer %d matrix done", layer);
     effect->SetMatrixArray(ehShadowViewproj, viewproj, 1);

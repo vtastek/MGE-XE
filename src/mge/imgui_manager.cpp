@@ -6,6 +6,7 @@
 #include "distantland.h"
 #include "patch_displacement.h"
 #include <cstdio>
+#include <cmath>
 
 bool ImGuiManager::initialized = false;
 bool ImGuiManager::showDemo = false;
@@ -29,8 +30,8 @@ float ImGuiManager::pcfSlopeBias = 0.0047f;      // Slope-based bias to prevent 
 float ImGuiManager::pcfTerrainBias = 0.02f;      // Extra bias for terrain receivers (near cascade, all modes)
 
 // Shadow cascade radii
-float ImGuiManager::shadowNearRadius = 1000.0f;  // Near cascade radius in world units
-float ImGuiManager::shadowFarRadius = 4000.0f;   // Far cascade radius in world units
+float ImGuiManager::splitLambda = 0.25f;         // Blend factor: 0=linear, 1=logarithmic
+float ImGuiManager::shadowDistance = 6000.0f;    // Maximum shadow distance in world units
 
 float ImGuiManager::intensityScalar = 1.0f;      // HLSL-pipeline unified-look intensity multiplier
 float ImGuiManager::attenuationMultiplier = 40000.0f;   // Point light attenuation multiplier (inverse-square)
@@ -387,11 +388,15 @@ void ImGuiManager::RenderPCFFilteringInterface() {
         ImGui::SliderFloat("Terrain Bias (near)", &pcfTerrainBias, 0.0f, 0.02f, "%.4f");
 
         ImGui::Separator();
-        ImGui::Text("Cascade Radii");
-        ImGui::SliderFloat("Near Radius", &shadowNearRadius, 500.0f, 3000.0f, "%.0f");
-        ImGui::SliderFloat("Far Radius", &shadowFarRadius, 1000.0f, 8000.0f, "%.0f");
-        float ratio = shadowFarRadius / shadowNearRadius;
-        ImGui::Text("Ratio: %.2f (texel density ratio: %.1f:1)", ratio, ratio);
+        ImGui::Text("Frustum-Fitted Cascades");
+        ImGui::SliderFloat("Split Lambda", &splitLambda, 0.0f, 1.0f, "%.2f");
+        ImGui::SetItemTooltip("0 = linear splits, 1 = logarithmic splits, 0.5 = practical blend");
+        ImGui::SliderFloat("Shadow Distance", &shadowDistance, 1000.0f, 8000.0f, "%.0f");
+        // Show computed split point for reference
+        float nearClip = 1.0f;
+        float split1 = splitLambda * (nearClip * std::pow(shadowDistance / nearClip, 0.5f)) +
+                       (1.0f - splitLambda) * (nearClip + (shadowDistance - nearClip) * 0.5f);
+        ImGui::Text("Cascade 0: 1 - %.0f, Cascade 1: %.0f - %.0f", split1, split1, shadowDistance);
 
         ImGui::Separator();
         ImGui::Text("HLSL Unified Look");
@@ -443,8 +448,8 @@ float ImGuiManager::GetPCFBias() { return pcfBias; }
 float ImGuiManager::GetPCFBias2() { return pcfBias2; }
 float ImGuiManager::GetPCFSlopeBias() { return pcfSlopeBias; }
 float ImGuiManager::GetPCFTerrainBias() { return pcfTerrainBias; }
-float ImGuiManager::GetShadowNearRadius() { return shadowNearRadius; }
-float ImGuiManager::GetShadowFarRadius() { return shadowFarRadius; }
+float ImGuiManager::GetSplitLambda() { return splitLambda; }
+float ImGuiManager::GetShadowDistance() { return shadowDistance; }
 float ImGuiManager::GetIntensityScalar() { return intensityScalar; }
 float ImGuiManager::GetAttenuationMultiplier() { return attenuationMultiplier; }
 float ImGuiManager::GetAttenuationCutoffDist() { return attenuationCutoffDist; }

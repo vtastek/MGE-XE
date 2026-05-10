@@ -301,7 +301,7 @@ public:
     static void renderShadowMap(DLContext* ctx);
     template<class T>
     static void renderShadowLayerGeneric(DLContext* ctx, MWBridge* mwBridge, int layer, const D3DXMATRIX* inverseCameraProj, D3DXMATRIX* view, D3DXMATRIX* proj, VisibleSet<T>& visible_set);
-    static void renderShadowLayer(DLContext* ctx, int layer, float radius, const D3DXMATRIX* inverseCameraProj);
+    static void renderShadowLayer(DLContext* ctx, int layer, float splitNear, float splitFar, const D3DXMATRIX* inverseCameraProj);
     static void renderShadow(DLContext* ctx);
     static void renderShadowDebug(DLContext* ctx);
 
