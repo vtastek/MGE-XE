@@ -95,19 +95,6 @@ float4 ShadowSoftenPS(ShadowPostOut IN) : COLOR0 {
     }
 
     d = d / 3.0;
-
-    // Cascade 1 temporal blend (V pass only). Cascade 0 occupies UV
-    // [0, shadowCascadeSize] = [0, 0.5]; cascade 1 occupies the right
-    // half. shadowTemporalAlphaC1 weights last-frame's final atlas
-    // (texShadowHistory) into cascade 1 only — cascade 0 always uses
-    // freshly-rendered data. Always-sample + lerp avoids per-pixel
-    // branching; alpha=0 in cascade 0 makes it a no-op there.
-    if (hasAlpha) {
-        float alpha = (IN.texcoords.x >= shadowCascadeSize) ? shadowTemporalAlphaC1 : 0.0;
-        float dHist = tex2Dlod(sampShadowHistory, t).r;
-        d = lerp(d, dHist, alpha);
-    }
-
     return d.xxxx;
 }
 

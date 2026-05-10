@@ -148,7 +148,6 @@ const iniSetting iniSettings[] = {
     {&Configuration.LogDistantPipeline, t_bool, 1, siniMisc, "Log Distant Pipeline", False, &dictBool, DICTONLY, 0, 0},
     {&Configuration.UseSceneGraphSnapshot, t_bool, 1, siniMisc, "Use Scene Graph Snapshot", False, &dictBool, DICTONLY, 0, 0},
     {&Configuration.UseAsyncSceneGraphWalk, t_bool, 1, siniMisc, "Use Async Scene Graph Walk", False, &dictBool, DICTONLY, 0, 0},
-    {&Configuration.ShadowCascade1TemporalBlend, t_float, 1, siniMisc, "Shadow Cascade 1 Temporal Blend", "0.5", NULL, MINMAX, 0.0, 0.95},
 
     // Distant Land flags
     {&Configuration.MGEFlags, t_bit, USE_DISTANT_LAND_BIT, siniDL, "Distant Land", True, &dictBool, DICTONLY, 0, 0},

@@ -137,12 +137,6 @@ public:
     static IDirect3DVertexBuffer9* vbWaveSim;
 
     static IDirect3DTexture9* texShadow, *texSoftShadow;
-    // Cascade 1 temporal-blend history: copy of the previous frame's
-    // texSoftShadow, sampled by the soften V-pass shader and blended
-    // into cascade 1's region only (cascade 0 region is unaffected).
-    // Smooths the every-other-frame cascade 1 jump introduced by the
-    // adaptive shadow scheduler. Allocated/released alongside texShadow.
-    static IDirect3DTexture9* texShadowHistory;
     static IDirect3DSurface9* surfShadowZ;
     static IDirect3DVertexBuffer9* vbFullFrame, *vbClipCube;
 
@@ -164,10 +158,6 @@ public:
     static D3DXHANDLE ehRcpRes, ehShadowRcpRes;
     static D3DXHANDLE ehWorld, ehView, ehProj;
     static D3DXHANDLE ehShadowViewproj;
-    // Cascade 1 temporal-blend uniforms (XE Common.fx). texShadowHistory
-    // holds last frame's final atlas; shadowTemporalAlphaC1 is the
-    // history-weight blended into cascade 1 region during soften V pass.
-    static D3DXHANDLE ehTexShadowHistory, ehShadowTemporalAlphaC1;
     static D3DXHANDLE ehVertexBlendState, ehVertexBlendPalette;
     static D3DXHANDLE ehAlphaRef, ehMaterialAlpha;
     static D3DXHANDLE ehHasAlpha, ehHasBones, ehHasVCol;

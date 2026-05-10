@@ -88,7 +88,6 @@ IDirect3DVertexBuffer9* DistantLand::vbWaveSim;
 
 IDirect3DTexture9* DistantLand::texShadow;
 IDirect3DTexture9* DistantLand::texSoftShadow;
-IDirect3DTexture9* DistantLand::texShadowHistory;
 IDirect3DSurface9* DistantLand::surfShadowZ;
 IDirect3DVertexBuffer9* DistantLand::vbFullFrame;
 IDirect3DVertexBuffer9* DistantLand::vbClipCube;
@@ -117,8 +116,6 @@ D3DXHANDLE DistantLand::ehWorld;
 D3DXHANDLE DistantLand::ehView;
 D3DXHANDLE DistantLand::ehProj;
 D3DXHANDLE DistantLand::ehShadowViewproj;
-D3DXHANDLE DistantLand::ehTexShadowHistory;
-D3DXHANDLE DistantLand::ehShadowTemporalAlphaC1;
 D3DXHANDLE DistantLand::ehVertexBlendState;
 D3DXHANDLE DistantLand::ehVertexBlendPalette;
 D3DXHANDLE DistantLand::ehAlphaRef;
@@ -585,8 +582,6 @@ bool DistantLand::initShader() {
     ehView = effect->GetParameterByName(0, "view");
     ehProj = effect->GetParameterByName(0, "proj");
     ehShadowViewproj = effect->GetParameterByName(0, "shadowViewProj");
-    ehTexShadowHistory = effect->GetParameterByName(0, "texShadowHistory");
-    ehShadowTemporalAlphaC1 = effect->GetParameterByName(0, "shadowTemporalAlphaC1");
     ehVertexBlendState = effect->GetParameterByName(0, "vertexBlendState");
     ehVertexBlendPalette = effect->GetParameterByName(0, "vertexBlendPalette");
     ehAlphaRef = effect->GetParameterByName(0, "alphaRef");
@@ -865,16 +860,6 @@ bool DistantLand::initShadow() {
     hr = device->CreateTexture(cascades * shadowSize, shadowSize, 1, D3DUSAGE_RENDERTARGET, shadowFormat, D3DPOOL_DEFAULT, &texSoftShadow, NULL);
     if (hr != D3D_OK) {
         LOG::logline("!! Failed to create shadow render target");
-        return false;
-    }
-    // History texture for cascade-1 temporal blend (XE Shadowmap.fx
-    // soften V-pass samples it via sampShadowHistory). Same format and
-    // size as texSoftShadow so we can StretchRect-blit between them.
-    // RENDERTARGET usage is required because StretchRect's source
-    // surface must be a render target on most drivers.
-    hr = device->CreateTexture(cascades * shadowSize, shadowSize, 1, D3DUSAGE_RENDERTARGET, shadowFormat, D3DPOOL_DEFAULT, &texShadowHistory, NULL);
-    if (hr != D3D_OK) {
-        LOG::logline("!! Failed to create shadow history render target");
         return false;
     }
     hr = device->CreateDepthStencilSurface(cascades * shadowSize, shadowSize, shadowZFormat, D3DMULTISAMPLE_NONE, 0, TRUE, &surfShadowZ, NULL);
@@ -1483,10 +1468,6 @@ void DistantLand::release() {
     texShadow = nullptr;
     texSoftShadow->Release();
     texSoftShadow = nullptr;
-    if (texShadowHistory) {
-        texShadowHistory->Release();
-        texShadowHistory = nullptr;
-    }
     surfShadowZ->Release();
     surfShadowZ = nullptr;
 

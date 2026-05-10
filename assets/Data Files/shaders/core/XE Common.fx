@@ -43,13 +43,6 @@ sampler sampWater3d = sampler_state { texture = <tex1>; minfilter = linear; magf
 sampler sampDepth = sampler_state { texture = <tex3>; minfilter = linear; magfilter = linear; mipfilter = none; addressu = clamp; addressv = clamp; };
 sampler sampDepthPoint = sampler_state { texture = <tex3>; minfilter = point; magfilter = point; mipfilter = none; addressu = clamp; addressv = clamp; };
 
-// Cascade 1 temporal-blend history. Sampled by the soften V pass to
-// blend last frame's atlas value into cascade 1 region only. Bound by
-// MGE C++ side per renderShadowMap call.
-shared texture texShadowHistory;
-shared float shadowTemporalAlphaC1;
-sampler sampShadowHistory = sampler_state { texture = <texShadowHistory>; minfilter = linear; magfilter = linear; mipfilter = none; addressu = clamp; addressv = clamp; };
-
 
 //------------------------------------------------------------
 // Distant land statics / grass
