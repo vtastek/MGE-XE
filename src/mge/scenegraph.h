@@ -63,6 +63,36 @@ namespace MGE::SceneGraph {
     };
     const std::vector<DirectionalLight>& directionalLights();
 
+    // Snapshot lock helpers — required when the async walk is active
+    // (Use Async Scene Graph Walk INI flag). The worker thread swaps
+    // the public vectors atomically under this lock; consumers that
+    // want race-free access to pointLights() / directionalLights() must
+    // hold the lock for the duration of their reads.
+    //
+    // In synchronous mode (default), the lock is a no-op — the walk
+    // and consumer reads are on the same thread by construction. The
+    // helpers can be called unconditionally; correctness is unchanged.
+    //
+    // RAII pattern recommended:
+    //   {
+    //       MGE::SceneGraph::SnapshotReadLock lk;
+    //       const auto& lights = MGE::SceneGraph::pointLights();
+    //       // ... use lights ...
+    //   }   // lock released
+    //
+    // Worker swap is microseconds; consumer reads typically <1 ms. Lock
+    // contention is near-zero in practice.
+    void lockSnapshot();
+    void unlockSnapshot();
+
+    class SnapshotReadLock {
+    public:
+        SnapshotReadLock()  { lockSnapshot();   }
+        ~SnapshotReadLock() { unlockSnapshot(); }
+        SnapshotReadLock(const SnapshotReadLock&) = delete;
+        SnapshotReadLock& operator=(const SnapshotReadLock&) = delete;
+    };
+
     // Increments each time onFrameReady() actually rebuilds the cache
     // (skipped rebuilds do not bump it). Consumers can use this as a
     // cheap "should I re-derive my own derived state" key.
