@@ -51,17 +51,52 @@ TransformedVert transformShadowVert(MorrowindVertIn IN) {
 // 2 layer cascade ortho ESM lookup
 
 float shadowDeltaZ(float4 shadow0pos, float4 shadow1pos) {
+    // Default: no caster blocks this fragment.
     float dz = 1e-6;
 
-    [branch] if(all(saturate(atlasMargin - abs(shadow0pos.xyz)))) {
-        // Layer 0, inner
-        float2 shadowUV = (0.5 + 0.5*shadowRcpRes) + float2(0.5, -0.5) * shadow0pos.xy;
-        dz = tex2Dlod(sampDepth, mapShadowToAtlas(shadowUV, 0)).r / ESM_scale - shadow0pos.z;
+    // Cascade-membership tests are computed up front because we need
+    // both in the cascade-0 blend zone below.
+    bool inC0 = all(saturate(atlasMargin - abs(shadow0pos.xyz)));
+    bool inC1 = all(saturate(atlasMargin - abs(shadow1pos.xyz)));
+
+    [branch] if(inC0) {
+        // Cascade 0 is always sampled when in range.
+        float2 c0UV = (0.5 + 0.5*shadowRcpRes) + float2(0.5, -0.5) * shadow0pos.xy;
+        float  dz0  = tex2Dlod(sampDepth, mapShadowToAtlas(c0UV, 0)).r / ESM_scale - shadow0pos.z;
+
+        // Cascade-boundary blend (edge-flicker fix). The original code
+        // used a strict cascade-0/1 if/else with no transition, so a
+        // fragment oscillating at the boundary jumped between two ESM
+        // samples whose stored depths differed (different texel
+        // densities — cascade 0 = 1000u/N, cascade 1 = 4000u/N — so the
+        // same world point reads different blurred values from each).
+        // Result: visible flicker ~50-100 pixels in from the screen edge
+        // (the typical screen-projection of the cascade-0 footprint).
+        //
+        // Fix: in the outer 10% of cascade 0's safe area, sample both
+        // cascades and lerp by smoothstep distance-to-boundary. At the
+        // boundary itself the fragment is sampling cascade 1 only,
+        // matching what fragments fully outside cascade 0 use — so the
+        // transition is C0 continuous. The extra cascade-1 fetch only
+        // fires for the small percentage of fragments in the band.
+        float2      c0Out      = abs(shadow0pos.xy) / atlasMargin.xy;
+        float       c0OutMax   = max(c0Out.x, c0Out.y);
+        const float blendStart = 0.9;
+
+        [branch] if(c0OutMax > blendStart && inC1) {
+            float2 c1UV = (0.5 + 0.5*shadowRcpRes) + float2(0.5, -0.5) * shadow1pos.xy;
+            float  dz1  = tex2Dlod(sampDepth, mapShadowToAtlas(c1UV, 1)).r / ESM_scale - shadow1pos.z;
+            float  t    = smoothstep(blendStart, 1.0, c0OutMax);
+            dz = lerp(dz0, dz1, t);
+        }
+        else {
+            dz = dz0;
+        }
     }
-    else if(all(saturate(atlasMargin - abs(shadow1pos.xyz)))) {
-        // Layer 1
-        float2 shadowUV = (0.5 + 0.5*shadowRcpRes) + float2(0.5, -0.5) * shadow1pos.xy;
-        dz = tex2Dlod(sampDepth, mapShadowToAtlas(shadowUV, 1)).r / ESM_scale - shadow1pos.z;
+    else if(inC1) {
+        // Fragment is fully outside cascade 0 — cascade 1 only.
+        float2 c1UV = (0.5 + 0.5*shadowRcpRes) + float2(0.5, -0.5) * shadow1pos.xy;
+        dz = tex2Dlod(sampDepth, mapShadowToAtlas(c1UV, 1)).r / ESM_scale - shadow1pos.z;
     }
 
     return dz;
