@@ -16,26 +16,17 @@ static const float shadowFarRadius = 4000.0;
 
 
 
-// renderShadowMap
-// Renders multiple shadow map layers to channels in one texture
-// Applies filtering to soften shadow edges
-// This *must* restore render state on return
-void DistantLand::renderShadowMap() {
-    MGE_SCOPED_TIMER("renderShadowMap");
-    IDirect3DSurface9* target, *targetSoft;
-    texShadow->GetSurfaceLevel(0, &target);
-    texSoftShadow->GetSurfaceLevel(0, &targetSoft);
+// clearShadowCascade — clears one cascade's region of the shadow atlas.
+// device->Clear is viewport-bounded when no rect array is provided, and
+// the fullscreen quad in PASS_CLEARSHADOWMAP is also viewport-clipped,
+// so this leaves the OTHER cascade's region untouched. The adaptive
+// scheduler in renderShadowMap relies on this for the cascade-1-skip
+// case (cascade 1's region must persist across the skip frame).
+void DistantLand::clearShadowCascade(int layer) {
+    const DWORD res = Configuration.DL.ShadowResolution;
+    D3DVIEWPORT9 vp = { (DWORD)(layer * (int)res), 0, res, res, 0.0f, 1.0f };
+    device->SetViewport(&vp);
 
-    // Switch to render target
-    RenderTargetSwitcher rtsw(targetSoft, surfShadowZ);
-    D3DVIEWPORT9 vp;
-    device->GetViewport(&vp);
-
-    // Unbind shadow samplers
-    effect->SetTexture(ehTex0, 0);
-    effect->SetTexture(ehTex2, 0);
-
-    // Clear floating point buffer to far depth
     device->Clear(0, 0, D3DCLEAR_ZBUFFER|D3DCLEAR_STENCIL, 0, 1.0, 0);
     effectShadow->BeginPass(PASS_CLEARSHADOWMAP);
     effect->SetBool(ehHasAlpha, false);
@@ -44,22 +35,123 @@ void DistantLand::renderShadowMap() {
     device->SetStreamSource(0, vbFullFrame, 0, 12);
     device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
     effectShadow->EndPass();
+}
+
+// renderShadowMap
+// Renders cascaded shadow map atlas with adaptive scheduling:
+//   - Still frame (camera + sun + cell unchanged) → skip everything;
+//     last frame's atlas is byte-identical valid.
+//   - Moving frame, cascade 1 skip parity → render only cascade 0;
+//     cascade 1's region of the atlas (and its smViewproj matrix)
+//     persist from the previous render.
+//   - Moving frame, cascade 1 update parity → render both cascades.
+//   - First frame / cell change → force-render both cascades.
+//
+// Soften pass is viewport-clipped to match the cascades that were
+// re-rendered, so the cascade 1 region (when skipped) doesn't get
+// re-blurred on top of last frame's already-blurred result.
+//
+// This *must* restore render state on return.
+void DistantLand::renderShadowMap() {
+    MGE_SCOPED_TIMER("renderShadowMap");
+
+    // ---- adaptive scheduler state ----
+    static D3DXMATRIX  s_lastView = {};
+    static D3DXVECTOR4 s_lastSunVec = {};
+    static D3DXVECTOR4 s_lastSunPos = {};
+    static const void* s_lastWorld = nullptr;
+    static bool        s_haveValidAtlas = false;
+    static unsigned    s_movingFrameCounter = 0;
+
+    // Skip-rate diagnostics — gated by Configuration.LogDistantPipeline,
+    // dumped every 1800 frames (~30s at 60fps). Tells us how often each
+    // skip path activates so we can tune the adaptive thresholds.
+    static unsigned s_diagFull = 0;       // full-skip frame count
+    static unsigned s_diagC1Skip = 0;     // cascade-1-skip frame count
+    static unsigned s_diagFull2 = 0;      // both-cascade render count
+    static unsigned s_diagTotal = 0;
+
+    const void* curWorld = (const void*)DistantLandShare::currentWorldSpace;
+    const bool cellChanged = (s_lastWorld != curWorld);
+    const bool viewChanged = memcmp(&s_lastView, &mwView, sizeof(D3DXMATRIX)) != 0;
+    const bool sunChanged  = memcmp(&s_lastSunVec, &sunVec, sizeof(D3DXVECTOR4)) != 0
+                          || memcmp(&s_lastSunPos, &sunPos, sizeof(D3DXVECTOR4)) != 0;
+    const bool stillFrame = s_haveValidAtlas && !cellChanged && !viewChanged && !sunChanged;
+
+    ++s_diagTotal;
+    if (stillFrame) {
+        ++s_diagFull;
+        if (Configuration.LogDistantPipeline && (s_diagTotal % 1800 == 0)) {
+            LOG::logline("-- [SHADOW-ADAPT] frames=%u full_skip=%u(%.0f%%) c1_skip=%u(%.0f%%) full_render=%u(%.0f%%)",
+                s_diagTotal,
+                s_diagFull,   100.0 * s_diagFull   / s_diagTotal,
+                s_diagC1Skip, 100.0 * s_diagC1Skip / s_diagTotal,
+                s_diagFull2,  100.0 * s_diagFull2  / s_diagTotal);
+        }
+        return;
+    }
+
+    // Cache state for next frame's still detection.
+    s_lastView = mwView;
+    s_lastSunVec = sunVec;
+    s_lastSunPos = sunPos;
+    s_lastWorld  = curWorld;
+
+    // Decide cascade 1: render every other moving frame, but force-render
+    // when the cell changed or there's no valid prior atlas.
+    const bool forceFullUpdate = cellChanged || !s_haveValidAtlas;
+    const bool renderCascade1  = forceFullUpdate || ((++s_movingFrameCounter & 1u) == 1u);
+
+    if (renderCascade1) ++s_diagFull2; else ++s_diagC1Skip;
+
+    IDirect3DSurface9* target, *targetSoft;
+    texShadow->GetSurfaceLevel(0, &target);
+    texSoftShadow->GetSurfaceLevel(0, &targetSoft);
+
+    // Switch to render target (caster pass writes to texSoftShadow)
+    RenderTargetSwitcher rtsw(targetSoft, surfShadowZ);
+    D3DVIEWPORT9 vp;
+    device->GetViewport(&vp);
+
+    // Unbind shadow samplers
+    effect->SetTexture(ehTex0, 0);
+    effect->SetTexture(ehTex2, 0);
+
+    // Per-cascade clear (viewport-bounded). On cascade-1-skip frames we
+    // clear only cascade 0's region; cascade 1's region keeps last
+    // frame's content.
+    clearShadowCascade(0);
+    if (renderCascade1) {
+        clearShadowCascade(1);
+    }
 
     // Calculate transform to map view frustum into world space
     D3DXMATRIX inverseCameraProj, cameraViewProj;
     D3DXMatrixMultiply(&cameraViewProj, &mwView, &mwProj);
     D3DXMatrixInverse(&inverseCameraProj, NULL, &cameraViewProj);
 
-    // Render near layer (changes viewport)
+    // Render near layer (always; cheaper of the two)
     renderShadowLayer(0, shadowNearRadius, &inverseCameraProj);
 
-    // Render far layer (changes viewport)
-    renderShadowLayer(1, shadowFarRadius, &inverseCameraProj);
+    // Render far layer conditionally. When skipped, smViewproj[1] keeps
+    // last frame's value — receiver pass sees a matrix that matches the
+    // atlas content we left in cascade 1's region.
+    if (renderCascade1) {
+        renderShadowLayer(1, shadowFarRadius, &inverseCameraProj);
+    }
 
-    // Reset viewport
-    device->SetViewport(&vp);
+    // Soften shadow map. Viewport restricts the soften writes so when
+    // cascade 1 is skipped, its already-blurred region from last frame
+    // is preserved (re-blurring an already-blurred result would compound
+    // the gaussian and make far shadows progressively mushier each skip).
+    if (renderCascade1) {
+        device->SetViewport(&vp);  // full atlas
+    } else {
+        const DWORD res = Configuration.DL.ShadowResolution;
+        D3DVIEWPORT9 vp0 = { 0, 0, res, res, 0.0f, 1.0f };
+        device->SetViewport(&vp0);  // cascade 0 only
+    }
 
-    // Soften shadow map
     device->SetRenderTarget(0, target);
     effectShadow->BeginPass(PASS_SOFTENSHADOWMAP);
     effect->SetTexture(ehTex3, texSoftShadow);
@@ -78,9 +170,22 @@ void DistantLand::renderShadowMap() {
     device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
     effectShadow->EndPass();
 
+    // Restore full viewport for callers
+    device->SetViewport(&vp);
+
     // Clean up surface pointers
     target->Release();
     targetSoft->Release();
+
+    s_haveValidAtlas = true;
+
+    if (Configuration.LogDistantPipeline && (s_diagTotal % 1800 == 0)) {
+        LOG::logline("-- [SHADOW-ADAPT] frames=%u full_skip=%u(%.0f%%) c1_skip=%u(%.0f%%) full_render=%u(%.0f%%)",
+            s_diagTotal,
+            s_diagFull,   100.0 * s_diagFull   / s_diagTotal,
+            s_diagC1Skip, 100.0 * s_diagC1Skip / s_diagTotal,
+            s_diagFull2,  100.0 * s_diagFull2  / s_diagTotal);
+    }
 }
 
 template<class T>

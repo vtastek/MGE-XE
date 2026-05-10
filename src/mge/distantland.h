@@ -273,6 +273,12 @@ public:
     static void renderDepthRecorded();
 
     static void renderShadowMap();
+    // Clears one cascade's region of the shadow atlas (depth + stencil
+    // + the float-encoded "far depth" sentinel). Viewport-clipped so it
+    // touches only [layer*res, 0, res, res] of the atlas — the other
+    // cascade's region is preserved. Used by the adaptive shadow
+    // scheduler to refresh only the cascade(s) being re-rendered.
+    static void clearShadowCascade(int layer);
     template<class T>
     static void renderShadowLayerGeneric(MWBridge* mwBridge, int layer, const D3DXMATRIX* inverseCameraProj, D3DXMATRIX* view, D3DXMATRIX* proj, VisibleSet<T>& visible_set);
     static void renderShadowLayer(int layer, float radius, const D3DXMATRIX* inverseCameraProj);
