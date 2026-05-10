@@ -209,11 +209,24 @@ void DistantLand::renderDepthAdditional(DLContext* ctx, const std::vector<Record
     RenderTargetSwitcher rtsw(targetOverride ? targetOverride : surfDepthFrameMSAA,
         depthStencilOverride ? depthStencilOverride : surfDepthDepth);
 
-    // Set RT1 for velocity buffer (MRT with depth) - only if not using custom target
+    // Set RT1 for velocity buffer (MRT with depth)
     // Skip on first frame after menu exit to preserve motion blur from before menu
-    bool useVelocityMRT = velocityBufferEnabled && surfVelocityMSAA && !targetOverride && !shouldSkipVelocityBuffer();
+    // When targetOverride is set (non-MSAA hands path), use non-MSAA velocity surface to match
+    // MRT requires all render targets have same sample count
+    bool useVelocityMRT = velocityBufferEnabled && texVelocity && !shouldSkipVelocityBuffer();
+    IDirect3DSurface9* velocitySurf = nullptr;
     if (useVelocityMRT) {
-        device->SetRenderTarget(1, surfVelocityMSAA);
+        if (targetOverride && texVelocity) {
+            // Non-MSAA path: get surface from texture directly
+            texVelocity->GetSurfaceLevel(0, &velocitySurf);
+        } else if (surfVelocityMSAA) {
+            // MSAA path: use MSAA surface
+            velocitySurf = surfVelocityMSAA;
+            velocitySurf->AddRef();  // Match the GetSurfaceLevel ref count
+        }
+        if (velocitySurf) {
+            device->SetRenderTarget(1, velocitySurf);
+        }
     }
 
     if (clearZ) {
@@ -241,8 +254,9 @@ void DistantLand::renderDepthAdditional(DLContext* ctx, const std::vector<Record
     effectDepth->EndPass();
 
     // Clear RT1 after rendering
-    if (useVelocityMRT) {
+    if (velocitySurf) {
         device->SetRenderTarget(1, nullptr);
+        velocitySurf->Release();
     }
 
     // Reset projection matrix
@@ -491,8 +505,13 @@ void DistantLand::renderDepthRecorded(const std::vector<RecordedMWState>& recMW,
         effect->SetInt(ehVertexBlendState, i.vertexBlendState);
 
         // Recalculate skinned transforms with game view matrix (not device view, which may be UI)
+        // Scene 2 (hands): use worldViewTransforms directly - camera-attached, no view recalc
         D3DXMATRIX currentWorldViewForCache = i.worldViewTransforms[0];
-        if (i.vertexBlendState > 0 && gameView) {
+        if (i.vertexBlendState > 0 && i.sceneNum >= 2) {
+            // Scene 2: use recorded worldViewTransforms directly (camera-relative)
+            effect->SetMatrixArray(ehVertexBlendPalette, i.worldViewTransforms, 4);
+            currentWorldViewForCache = i.worldViewTransforms[0];
+        } else if (i.vertexBlendState > 0 && gameView) {
             D3DXMATRIX currentWorldViewTransforms[4];
             for (int j = 0; j < 4; j++) {
                 currentWorldViewTransforms[j] = i.worldTransforms[j] * (*gameView);
@@ -553,8 +572,17 @@ void DistantLand::renderDepthRecorded(const std::vector<RecordedMWState>& recMW,
 
                     if (bestIdx != -1) {
                         // Found previous frame's matrices for this instance
-                        for (int j = 0; j < 4; j++) {
-                            D3DXMatrixMultiply(&prevWorldView[j], &it->second[bestIdx].data.worldTransforms[j], gameView);
+                        // Scene 2 (hands): use cached worldViewTransforms directly - they already
+                        // include the view from recording time, no need to multiply by current view.
+                        // This makes hands camera-relative: only actual animation causes blur.
+                        if (i.sceneNum >= 2) {
+                            for (int j = 0; j < 4; j++) {
+                                prevWorldView[j] = it->second[bestIdx].data.worldTransforms[j];
+                            }
+                        } else {
+                            for (int j = 0; j < 4; j++) {
+                                D3DXMatrixMultiply(&prevWorldView[j], &it->second[bestIdx].data.worldTransforms[j], gameView);
+                            }
                         }
                         foundPrev = true;
                         // Remove used instance so 2 pauldrons don't claim the same previous matrix
@@ -563,9 +591,16 @@ void DistantLand::renderDepthRecorded(const std::vector<RecordedMWState>& recMW,
                 }
 
                 // Store for next frame
+                // Scene 2: store worldViewTransforms (camera-relative); others: store worldTransforms
                 SkinnedMatrixData sdata;
-                for (int j = 0; j < 4; j++) {
-                    sdata.worldTransforms[j] = i.worldTransforms[j];
+                if (i.sceneNum >= 2) {
+                    for (int j = 0; j < 4; j++) {
+                        sdata.worldTransforms[j] = i.worldViewTransforms[j];
+                    }
+                } else {
+                    for (int j = 0; j < 4; j++) {
+                        sdata.worldTransforms[j] = i.worldTransforms[j];
+                    }
                 }
                 s_curSkinnedCache[skey].push_back({ sdata, currentPos });
 
@@ -601,7 +636,12 @@ void DistantLand::renderDepthRecorded(const std::vector<RecordedMWState>& recMW,
                     }
 
                     if (bestIdx != -1) {
-                        D3DXMatrixMultiply(&prevWorldView[0], &it->second[bestIdx].matrix, gameView);
+                        // Scene 2: use cached worldViewTransforms directly (camera-relative)
+                        if (i.sceneNum >= 2) {
+                            prevWorldView[0] = it->second[bestIdx].matrix;
+                        } else {
+                            D3DXMatrixMultiply(&prevWorldView[0], &it->second[bestIdx].matrix, gameView);
+                        }
                         foundPrev = true;
                         // Remove used instance so identical meshes don't claim same previous matrix
                         it->second.erase(it->second.begin() + bestIdx);
@@ -609,7 +649,12 @@ void DistantLand::renderDepthRecorded(const std::vector<RecordedMWState>& recMW,
                 }
 
                 // Store for next frame
-                s_curWorldCache[vkey].push_back({ i.worldTransforms[0], currentPos });
+                // Scene 2: store worldViewTransforms (camera-relative); others: store worldTransforms
+                if (i.sceneNum >= 2) {
+                    s_curWorldCache[vkey].push_back({ i.worldViewTransforms[0], currentPos });
+                } else {
+                    s_curWorldCache[vkey].push_back({ i.worldTransforms[0], currentPos });
+                }
             }
 
             // If no valid previous found, use current (no velocity)
