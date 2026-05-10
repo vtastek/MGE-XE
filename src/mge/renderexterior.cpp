@@ -742,14 +742,20 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
         case MSOCClient::ResultNotReady:   ++diagNotReady;   break;
         }
 
-        // Hysteresis state lookup.
-        const std::uint64_t hKey = hashStaticKey(
-            m.sphere.center.x, m.sphere.center.y, m.sphere.center.z);
-        auto& hState = g_msocHysteresis[hKey];
-        hState.lastSeenFrame = g_msocHysteresisFrame;
-
+        // Fast path: only OCCLUDED entries need hysteresis state. Most
+        // entries (typically ~70-80%) hit Visible / ViewCulled / NotReady
+        // and can exit here without touching the hash map. The previous
+        // implementation did the hash op for every entry regardless,
+        // which dominated the verdict-pass cost in dense exterior scenes
+        // (~5000 entries × ~150ns per hash op).
+        //
+        // Stale-entry handling: when a mesh that was previously OCCLUDED
+        // is now non-occluded, we leave its hState in the map untouched.
+        // The age-prune below evicts entries whose lastSeenFrame is more
+        // than kHysteresisAgeOutFrames behind. The next time the mesh
+        // hits OCCLUDED again, the gap-detection further down restarts
+        // its consecutive counter — see comment there.
         if (verdict != MSOCClient::ResultOccluded) {
-            hState.consecutiveOccluded = 0;
             // msocOccluded[idx] stays 0 (render).
             ++idx;
             continue;
@@ -764,7 +770,9 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
 
         if (distSq > farMSOCLimitSq) {
             ++diagFarSpared;
-            // Far gate spares — render.
+            // Far gate spares — render. Skip hysteresis lookup too: a
+            // far-spared OCCLUDED is functionally the same as visible
+            // for our purposes.
         }
         else {
             const float thresh = nearViewRange + m.sphere.radius + kHandoffMargin;
@@ -772,14 +780,32 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
                 ++diagHandoffSpared;
                 // Handoff gate spares — render.
             }
-            else if (hState.consecutiveOccluded < hysteresisFrames) {
-                ++hState.consecutiveOccluded;
-                ++diagHysteresisSpared;
-                // Hysteresis still in warmup — render.
-            }
             else {
-                // Sustained OCCLUDED past all gates — actually cull.
-                msocOccluded[idx] = 1;
+                // Hysteresis lookup happens ONLY here, after both fast
+                // gates passed. Detect "gap since last OCCLUDED" — if
+                // the mesh wasn't OCCLUDED last frame, restart the
+                // consecutive counter to preserve the original
+                // "consecutiveOccluded counts truly consecutive frames"
+                // semantic. Without this, a mesh oscillating in/out of
+                // occlusion could carry stale count across visible
+                // frames and trigger a cull earlier than it should.
+                const std::uint64_t hKey = hashStaticKey(
+                    m.sphere.center.x, m.sphere.center.y, m.sphere.center.z);
+                auto& hState = g_msocHysteresis[hKey];
+                if (g_msocHysteresisFrame - hState.lastSeenFrame > 1) {
+                    hState.consecutiveOccluded = 0;
+                }
+                hState.lastSeenFrame = g_msocHysteresisFrame;
+
+                if (hState.consecutiveOccluded < hysteresisFrames) {
+                    ++hState.consecutiveOccluded;
+                    ++diagHysteresisSpared;
+                    // Hysteresis still in warmup — render.
+                }
+                else {
+                    // Sustained OCCLUDED past all gates — actually cull.
+                    msocOccluded[idx] = 1;
+                }
             }
         }
         ++idx;
