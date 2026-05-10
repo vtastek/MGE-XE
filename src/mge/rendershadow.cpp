@@ -90,16 +90,17 @@ static LightSpaceBounds computeLightSpaceBounds(
 }
 
 // Compute split distances using practical split scheme (blend of log and linear)
-static void computeCascadeSplits(float nearClip, float farClip, float lambda, float splits[3])
+static void computeCascadeSplits(float nearClip, float farClip, float lambda, float splits[kShadowCascadeCount + 1])
 {
     splits[0] = 0.0f;
 
-    for (int i = 1; i < 3; i++) {
-        float p = (float)i / 2.0f;
+    for (int i = 1; i < kShadowCascadeCount; i++) {
+        float p = (float)i / (float)kShadowCascadeCount;
         float logSplit = nearClip * std::pow(farClip / nearClip, p);
         float linearSplit = nearClip + (farClip - nearClip) * p;
         splits[i] = lambda * logSplit + (1.0f - lambda) * linearSplit;
     }
+    splits[kShadowCascadeCount] = farClip;
 }
 
 
@@ -108,7 +109,7 @@ static void computeCascadeSplits(float nearClip, float farClip, float lambda, fl
 // Renders multiple shadow map layers to channels in one texture
 // Applies filtering to soften shadow edges
 // This *must* restore render state on return
-void DistantLand::renderShadowMap(DLContext* ctx) {
+void DistantLand::renderShadowMap(DLContext* ctx, FixedFunctionShader::FrameBuffer* fb) {
     LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] renderShadowMap ENTER");
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_ShadowMap, 0);
     IDirect3DSurface9* target, *targetSoft;
@@ -146,18 +147,14 @@ void DistantLand::renderShadowMap(DLContext* ctx) {
     float nearClip = 1.0f;  // Positive reference distance for logarithmic splitting.
     float shadowDistance = ImGuiManager::GetShadowDistance();
     float splitLambda = ImGuiManager::GetSplitLambda();
-    float splits[3];
+    float splits[kShadowCascadeCount + 1];
     computeCascadeSplits(nearClip, shadowDistance, splitLambda, splits);
 
-    // Render near layer (changes viewport)
-    LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] layer0 start");
-    renderShadowLayer(ctx, 0, splits[0], splits[1], &inverseCameraProj);
-    LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] layer0 done");
-
-    // Render far layer (changes viewport)
-    LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] layer1 start");
-    renderShadowLayer(ctx, 1, splits[1], splits[2], &inverseCameraProj);
-    LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] layer1 done");
+    for (int layer = 0; layer < kShadowCascadeCount; ++layer) {
+        LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] layer%d start", layer);
+        renderShadowLayer(ctx, fb, layer, splits[layer], splits[layer + 1], &inverseCameraProj);
+        LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] layer%d done", layer);
+    }
 
     // Reset viewport
     device->SetViewport(&vp);
@@ -184,6 +181,61 @@ void DistantLand::renderShadowMap(DLContext* ctx) {
     // Clean up surface pointers
     target->Release();
     targetSoft->Release();
+}
+
+void DistantLand::renderShadowRecorded(const std::vector<RecordedMWState>& recMW, int layer, const D3DXMATRIX* viewproj) {
+    if (layer > 1 || recMW.empty()) {
+        return;
+    }
+
+    effectShadow->BeginPass(PASS_RENDERSHADOWMAP_MW);
+
+    for (const auto& i : recMW) {
+        if (i.sceneNum != 0) {
+            continue;
+        }
+        if (i.blendEnable && i.destBlend == D3DBLEND_ONE) {
+            continue;
+        }
+
+        bool alphaDependent = i.alphaTest || i.blendEnable;
+        effect->SetFloat(ehMaterialAlpha, alphaDependent ? i.diffuseMaterial.a : 1.0f);
+        if (alphaDependent && i.texture) {
+            effect->SetTexture(ehTex0, i.texture);
+            effect->SetBool(ehHasAlpha, true);
+            effect->SetFloat(ehAlphaRef, i.alphaTest ? (i.alphaRef / 255.0f) : 180.0f / 255.0f);
+        } else {
+            effect->SetTexture(ehTex0, 0);
+            effect->SetBool(ehHasAlpha, false);
+            effect->SetFloat(ehAlphaRef, -1.0f);
+        }
+
+        D3DXMATRIX shadowPalette[4];
+        if (i.vertexBlendState != 0) {
+            for (int j = 0; j < 4; ++j) {
+                shadowPalette[j] = i.worldTransforms[j] * (*viewproj);
+            }
+        } else {
+            shadowPalette[0] = i.worldTransforms[0] * (*viewproj);
+            for (int j = 1; j < 4; ++j) {
+                shadowPalette[j] = shadowPalette[0];
+            }
+        }
+
+        effect->SetBool(ehHasBones, i.vertexBlendState != 0);
+        effect->SetInt(ehVertexBlendState, i.vertexBlendState);
+        effect->SetMatrixArray(ehVertexBlendPalette, shadowPalette, 4);
+        effectShadow->CommitChanges();
+
+        DWORD cull = (i.cullMode != D3DCULL_NONE) ? i.cullMode : (DWORD)D3DCULL_CW;
+        device->SetRenderState(D3DRS_CULLMODE, cull);
+        device->SetStreamSource(0, i.vb, i.vbOffset, i.vbStride);
+        device->SetIndices(i.ib);
+        device->SetFVF(i.fvf);
+        device->DrawIndexedPrimitive(i.primType, i.baseIndex, i.minIndex, i.vertCount, i.startIndex, i.primCount);
+    }
+
+    effectShadow->EndPass();
 }
 
 template<class T>
@@ -215,7 +267,7 @@ void DistantLand::renderShadowLayerGeneric(DLContext* ctx, MWBridge* mwBridge, i
 }
 
 // renderShadowLayer - Calculates frustum-fitted projection for one shadow cascade
-void DistantLand::renderShadowLayer(DLContext* ctx, int layer, float splitNear, float splitFar, const D3DXMATRIX* inverseCameraProj) {
+void DistantLand::renderShadowLayer(DLContext* ctx, FixedFunctionShader::FrameBuffer* fb, int layer, float splitNear, float splitFar, const D3DXMATRIX* inverseCameraProj) {
     LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] renderShadowLayer %d ENTER (split %.1f-%.1f)", layer, splitNear, splitFar);
     auto mwBridge = MWBridge::get();
     D3DXVECTOR3 up(0, 0, 1);
@@ -288,6 +340,7 @@ void DistantLand::renderShadowLayer(DLContext* ctx, int layer, float splitNear, 
         LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] layer %d IPC done, rendering", layer);
 
         renderShadowLayerGeneric(ctx, mwBridge, layer, inverseCameraProj, view, proj, visExtraShared);
+        renderShadowRecorded(fb ? fb->recordMW : recordMW, layer, viewproj);
         LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] layer %d render done", layer);
     } else {
         // Skip if worldSpace not loaded (e.g., during cell transition)
@@ -303,6 +356,7 @@ void DistantLand::renderShadowLayer(DLContext* ctx, int layer, float splitNear, 
         worldSpace->VeryFarStatics->GetVisibleMeshesCoarse(range_frustum, visible_set);
 
         renderShadowLayerGeneric(ctx, mwBridge, layer, inverseCameraProj, view, proj, visible_set);
+        renderShadowRecorded(fb ? fb->recordMW : recordMW, layer, viewproj);
     }
 }
 
@@ -310,11 +364,12 @@ void DistantLand::renderShadowLayer(DLContext* ctx, int layer, float splitNear, 
 void DistantLand::renderShadow(DLContext* ctx) {
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_ShadowOverlay, 0, (int)recordMW.size());
     // Supply view space -> shadow clip space matrix
-    D3DXMATRIX inverseView, viewToShadow[2];
+    D3DXMATRIX inverseView, viewToShadow[kShadowCascadeCount];
     D3DXMatrixInverse(&inverseView, NULL, &ctx->mwView);
-    viewToShadow[0] = inverseView * ctx->smViewproj[0];
-    viewToShadow[1] = inverseView * ctx->smViewproj[1];
-    effect->SetMatrixArray(ehShadowViewproj, viewToShadow, 2);
+    for (int i = 0; i < kShadowCascadeCount; ++i) {
+        viewToShadow[i] = inverseView * ctx->smViewproj[i];
+    }
+    effect->SetMatrixArray(ehShadowViewproj, viewToShadow, kShadowCascadeCount);
 
     // Bind filtered ESM
     effect->SetTexture(ehTex3, texSoftShadow);
@@ -370,20 +425,20 @@ void DistantLand::renderShadowDebug(DLContext* ctx) {
     UINT passes;
 
     // Create shadow clip space -> camera clip space matrices
-    D3DXMATRIX inverseShadowViewProj, cameraViewProj, shadowToCameraProj[2];
+    D3DXMATRIX inverseShadowViewProj, cameraViewProj, shadowToCameraProj[kShadowCascadeCount];
 
     D3DXMatrixMultiply(&cameraViewProj, &ctx->mwView, &ctx->mwProj);
-    D3DXMatrixInverse(&inverseShadowViewProj, NULL, &ctx->smViewproj[0]);
-    D3DXMatrixMultiply(&shadowToCameraProj[0], &inverseShadowViewProj, &cameraViewProj);
-    D3DXMatrixInverse(&inverseShadowViewProj, NULL, &ctx->smViewproj[1]);
-    D3DXMatrixMultiply(&shadowToCameraProj[1], &inverseShadowViewProj, &cameraViewProj);
+    for (int i = 0; i < kShadowCascadeCount; ++i) {
+        D3DXMatrixInverse(&inverseShadowViewProj, NULL, &ctx->smViewproj[i]);
+        D3DXMatrixMultiply(&shadowToCameraProj[i], &inverseShadowViewProj, &cameraViewProj);
+    }
 
     // Display shadow layers in top right corner
     effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
     effect->BeginPass(PASS_DEBUGSHADOW);
     device->SetRenderState(D3DRS_CULLMODE, D3DCULL_CW);
     effect->SetTexture(ehTex3, texSoftShadow);
-    effect->SetMatrixArray(ehVertexBlendPalette, shadowToCameraProj, 2);
+    effect->SetMatrixArray(ehVertexBlendPalette, shadowToCameraProj, kShadowCascadeCount);
     effect->CommitChanges();
     device->SetVertexDeclaration(WaterDecl);
     device->SetStreamSource(0, vbFullFrame, 0, 12);

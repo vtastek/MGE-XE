@@ -392,11 +392,14 @@ void ImGuiManager::RenderPCFFilteringInterface() {
         ImGui::SliderFloat("Split Lambda", &splitLambda, 0.0f, 1.0f, "%.2f");
         ImGui::SetItemTooltip("0 = linear splits, 1 = logarithmic splits, 0.5 = practical blend");
         ImGui::SliderFloat("Shadow Distance", &shadowDistance, 1000.0f, 8000.0f, "%.0f");
-        // Show computed split point for reference
+        // Show computed split points for reference
         float nearClip = 1.0f;
-        float split1 = splitLambda * (nearClip * std::pow(shadowDistance / nearClip, 0.5f)) +
-                       (1.0f - splitLambda) * (nearClip + (shadowDistance - nearClip) * 0.5f);
-        ImGui::Text("Cascade 0: near - %.0f, Cascade 1: %.0f - %.0f", split1, split1, shadowDistance);
+        float split1 = splitLambda * (nearClip * std::pow(shadowDistance / nearClip, 1.0f / 3.0f)) +
+                       (1.0f - splitLambda) * (nearClip + (shadowDistance - nearClip) * (1.0f / 3.0f));
+        float split2 = splitLambda * (nearClip * std::pow(shadowDistance / nearClip, 2.0f / 3.0f)) +
+                       (1.0f - splitLambda) * (nearClip + (shadowDistance - nearClip) * (2.0f / 3.0f));
+        ImGui::Text("Cascade 0: 0-%.0f, Cascade 1: %.0f-%.0f, Cascade 2: %.0f-%.0f",
+            split1, split1, split2, split2, shadowDistance);
 
         ImGui::Separator();
         ImGui::Text("HLSL Unified Look");

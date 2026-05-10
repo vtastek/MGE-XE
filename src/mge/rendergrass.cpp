@@ -124,7 +124,7 @@ void DistantLand::renderGrassInst(DLContext* ctx) {
     }
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_Grass, 0, (int)batchedGrass.size());
 
-    effect->SetMatrixArray(ehShadowViewproj, ctx->smViewproj, 2);
+    effect->SetMatrixArray(ehShadowViewproj, ctx->smViewproj, kShadowCascadeCount);
     effect->SetTexture(ehTex3, texSoftShadow);
     device->SetVertexDeclaration(GrassDecl);
 

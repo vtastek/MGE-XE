@@ -454,7 +454,7 @@ void DistantLand::renderStage0GPU(DLContext* ctx, FixedFunctionShader::FrameBuff
                     LOG_CAT(LOG::Cat_SyncThread, "[S0GPU] Shadow effectBegin");
                     effectShadow->Begin(&passes, D3DXFX_DONOTSAVESTATE);
                     LOG_CAT(LOG::Cat_SyncThread, "[S0GPU] Shadow renderShadowMap");
-                    renderShadowMap(ctx);
+                    renderShadowMap(ctx, fb);
                     LOG_CAT(LOG::Cat_SyncThread, "[S0GPU] Shadow effectEnd");
                     g_passBreaks.mge_shadowRT += 2;
                     effectShadow->End();

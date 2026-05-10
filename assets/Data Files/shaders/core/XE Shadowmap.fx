@@ -11,6 +11,8 @@
 //------------------------------------------------------------
 // Shadow caster rendering
 
+static const float shadowMWDepthBias = 2.0e-4;
+
 struct ShadowVertOut {
     float4 pos : POSITION;
     float2 texcoords : TEXCOORD0;
@@ -48,6 +50,29 @@ ShadowVertOut ShadowVS(StatVertIn IN) {
     return OUT;
 }
 
+ShadowVertOut ShadowMWVS(MorrowindVertIn IN) {
+    ShadowVertOut OUT;
+
+    float4 pos = IN.pos;
+    if(vertexBlendState < 0.5) {
+#ifdef HAS_GRASS
+        float3 displacement = grassDisplacement(IN.pos.xyz, IN.pos.z, 2.5);
+        pos.xy += (1 - IN.color.z) * displacement.xy;
+#else
+        if (hasAlpha) {
+            float3 displacement = grassDisplacement(IN.pos.xyz, IN.pos.z, 1.0);
+            pos.xyz += displacement;
+        }
+#endif
+    }
+
+    OUT.pos = hasBones ? skin(pos, IN.blendweights) : mul(pos, vertexBlendPalette[0]);
+    OUT.pos.z = max(0, OUT.pos.z);
+    OUT.depth = OUT.pos.z / OUT.pos.w;
+    OUT.texcoords = IN.texcoords;
+    return OUT;
+}
+
 ShadowVertOut ShadowStencilVS(StatVertIn IN) {
     ShadowVertOut OUT = ShadowVS(IN);
 
@@ -74,6 +99,15 @@ float4 ShadowPS(ShadowVertOut IN) : COLOR0 {
     }
 
     return ESM_scale * IN.depth;
+}
+
+float4 ShadowMWPS(ShadowVertOut IN) : COLOR0 {
+    if(hasAlpha) {
+        float a = materialAlpha * tex2D(sampBaseTex, IN.texcoords).a;
+        clip(a - (alphaRef >= 0 ? alphaRef : 180.0/255.0));
+    }
+
+    return ESM_scale * saturate(IN.depth + shadowMWDepthBias);
 }
 
 float4 ShadowStencilPS(ShadowVertOut IN) : COLOR0 {
@@ -191,6 +225,29 @@ technique T0 {
 
         VertexShader = compile vs_3_0 ShadowSoftenVS();
         PixelShader = compile ps_3_0 ShadowSoftenPS();
+    }
+    //------------------------------------------------------------
+    // Used to render recorded Morrowind scene geometry into the shadow map
+    Pass P4 {
+        ZEnable = true;
+        ZWriteEnable = true;
+        ColorWriteEnable = red|green|blue|alpha;
+        CullMode = CCW;
+
+        StencilEnable = false;
+        StencilFunc = notequal;
+        StencilPass = keep;
+        StencilFail = keep;
+        StencilRef = 0;
+        StencilMask = 0xffffffff;
+
+        AlphaBlendEnable = false;
+        AlphaTestEnable = false;
+        FogEnable = false;
+        Lighting = false;
+
+        VertexShader = compile vs_3_0 ShadowMWVS();
+        PixelShader = compile ps_3_0 ShadowMWPS();
     }
     //------------------------------------------------------------
 }

@@ -66,7 +66,7 @@ TransformedVert transformShadowVert(MorrowindVertIn IN) {
 //------------------------------------------------------------
 // 2 layer cascade ortho ESM lookup
 
-float shadowDeltaZ(float4 shadow0pos, float4 shadow1pos) {
+float shadowDeltaZ(float4 shadow0pos, float4 shadow1pos, float4 shadow2pos) {
     float dz = 1e-6;
     float2 uvMargin = 4 * shadowRcpRes;
     float3 receiverLimit = float3(1 + 2 * 16 * shadowRcpRes, 1 + 2 * 16 * shadowRcpRes, atlasMargin.z);
@@ -82,6 +82,12 @@ float shadowDeltaZ(float4 shadow0pos, float4 shadow1pos) {
         float2 shadowUV = (0.5 + 0.5*shadowRcpRes) + float2(0.5, -0.5) * shadow1pos.xy;
         shadowUV = clamp(shadowUV, uvMargin, 1 - uvMargin);
         dz = tex2Dlod(sampDepth, mapShadowToAtlas(shadowUV, 1)).r / ESM_scale - shadow1pos.z;
+    }
+    else if(all(saturate(receiverLimit - abs(shadow2pos.xyz)))) {
+        // Layer 2
+        float2 shadowUV = (0.5 + 0.5*shadowRcpRes) + float2(0.5, -0.5) * shadow2pos.xy;
+        shadowUV = clamp(shadowUV, uvMargin, 1 - uvMargin);
+        dz = tex2Dlod(sampDepth, mapShadowToAtlas(shadowUV, 2)).r / ESM_scale - shadow2pos.z;
     }
 
     return dz;
@@ -102,6 +108,7 @@ struct RenderShadowVertOut {
 
     float4 shadow0pos: TEXCOORD1;
     float4 shadow1pos: TEXCOORD2;
+    float4 shadow2pos: TEXCOORD3;
 };
 
 RenderShadowVertOut RenderShadowsBaseVS(MorrowindVertIn IN) {
@@ -126,8 +133,10 @@ RenderShadowVertOut RenderShadowsBaseVS(MorrowindVertIn IN) {
     // Find position in light space, output light depth
     OUT.shadow0pos = mul(v.viewpos, shadowViewProj[0]);
     OUT.shadow1pos = mul(v.viewpos, shadowViewProj[1]);
+    OUT.shadow2pos = mul(v.viewpos, shadowViewProj[2]);
     OUT.shadow0pos.z = OUT.shadow0pos.z / OUT.shadow0pos.w;
     OUT.shadow1pos.z = OUT.shadow1pos.z / OUT.shadow1pos.w;
+    OUT.shadow2pos.z = OUT.shadow2pos.z / OUT.shadow2pos.w;
 
     OUT.texcoords = IN.texcoords;
     return OUT;
@@ -158,7 +167,7 @@ float4 RenderShadowsPS(RenderShadowVertOut IN): COLOR0 {
     }
 
     // Soft shadowing
-    float dz = shadowDeltaZ(IN.shadow0pos, IN.shadow1pos);
+    float dz = shadowDeltaZ(IN.shadow0pos, IN.shadow1pos, IN.shadow2pos);
     clip(-dz);
     float v = shadowESM(dz) * IN.light * alpha;
     

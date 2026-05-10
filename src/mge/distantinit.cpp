@@ -162,7 +162,7 @@ DLContext DistantLand::s_staging = {
     0,                                                   // nearViewRange
     0, 0,                                                // windScaling, niceWeather
     0, 0,                                                // lightSunMult, lightAmbMult
-    {}, {}, {},                                          // smView[2], smProj[2], smViewproj[2]
+    {}, {}, {},                                          // smView, smProj, smViewproj
     false, false,                                        // isRenderCached, isPPLActive
     false, false, false, false, false                    // cellHasWater, cellHasWeather, isExterior, isUnderwater, isMenu
 };
@@ -1418,7 +1418,7 @@ bool DistantLand::initShadow() {
     // Use 32-bit float for HLSL path (higher precision), 16-bit for legacy effects pipeline
     const D3DFORMAT shadowFormat = Configuration.UseHLSLPipeline ? D3DFMT_R32F : D3DFMT_R16F;
     const D3DFORMAT shadowZFormat = D3DFMT_D24S8;
-    const UINT shadowSize = Configuration.DL.ShadowResolution, cascades = 2;
+    const UINT shadowSize = Configuration.DL.ShadowResolution, cascades = kShadowCascadeCount;
     HRESULT hr;
 
     // The shadow texture holds a horizontal-packed shadow atlas

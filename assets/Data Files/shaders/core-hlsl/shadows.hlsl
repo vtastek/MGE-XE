@@ -27,6 +27,8 @@ float PCF_penumbraScale : register(c14);
 float PCF_minPenumbra : register(c15);
 float PCF_maxPenumbra : register(c16);
 float PCF_slopeBias : register(c17);
+matrix shadowViewProjPS[3] : register(c31);
+float4 shadowCascadeDepths : register(c43); // x/y = natural split depths, z = far distance
 // Terrain receiver hint + extra near-cascade bias.
 //   .x = isTerrain (0 or 1, set per-draw / per-merged-batch on C++ side)
 //   .y = terrain bias amount (global, from imgui PCF window)
@@ -37,7 +39,7 @@ float PCF_slopeBias : register(c17);
 float4 terrainShadowParams : register(c25);
 
 // Shadow constants
-static const int shadowCascades = 2;
+static const int shadowCascades = 3;
 static const float shadowCascadeSize = 1.0 / shadowCascades;
 static const float ESM_scale = 32768.0;
 
@@ -106,13 +108,11 @@ float shadowSamplePCF(float4 shadowPos, float2 shadowUV, int cascade, float rece
 
     // Static depth biasing to make up for incorrect fractional sampling on the shadow map grid
     float fractionalSamplingError = 2.0 * dot(float2(1.0f, 1.0f) * texelSize, abs(receiverPlaneDepthBias));
-    float biasedDepth = receiverDepth - min(fractionalSamplingError, 0.01f);
+    float compareDepth = receiverDepth - min(fractionalSamplingError, 0.01f);
 
     float finalBias = lerp(PCF_bias, PCF_bias2, step(0.7, ndotlgeo)) + dynamicSlopeBias;
     finalBias += terrainShadowParams.x * terrainShadowParams.y;
-    biasedDepth -= finalBias;
-
-
+    compareDepth -= finalBias;
 
     // PCF filtering pass with blue noise sampling - invert values so shadows=1, lit=0
     float shadow = 1.0;
@@ -127,7 +127,7 @@ float shadowSamplePCF(float4 shadowPos, float2 shadowUV, int cascade, float rece
         // Use tex2D with hardware bilinear filtering
         float sampledDepth = tex2D(sampShadow, mapShadowToAtlas(shadowUV + offset, cascade).xy).r / (ESM_scale);
         // Invert: shadow=1.0, lit=0.0 (so shadows dominate when averaged)
-        float sampleShadow = ((sampledDepth) >= receiverDepth - biasedDepth * 0.0032) ? 0.0 : 1.0;
+        float sampleShadow = sampledDepth >= compareDepth ? 0.0 : 1.0;
         shadow += sampleShadow;
         sampleCount += 1.0;
     }
@@ -161,66 +161,105 @@ float shadowSampleESM(float4 shadowPos, float2 shadowUV, int cascade, float rece
 // Shadow texel density checkerboard visualization
 // Returns: RGB color showing cascade (hue) and texel density (checker size)
 // checkerScale: texels per checker square (8 = 8x8 texel blocks)
-float3 shadowTexelCheckerboard(float4 shadow0pos, float4 shadow1pos, float checkerScale) {
-    float3 atlasMargin = float3(1.0 - 2.0 * 4.0 * shadowRcpRes, 1.0 - 2.0 * 4.0 * shadowRcpRes, 1.0);
+float4 shadowPosFromView(float3 viewPos, int cascade) {
+    float4 shadowPos = mul(float4(viewPos, 1.0), shadowViewProjPS[cascade]);
+    shadowPos.z = shadowPos.z / shadowPos.w;
+    return shadowPos;
+}
 
-    bool inNear = all(saturate(atlasMargin - abs(shadow0pos.xyz)));
-    bool inFar = all(saturate(atlasMargin - abs(shadow1pos.xyz)));
+float2 shadowSplitDepths() {
+    float nearSplit = max(shadowCascadeDepths.x, 0.0);
+    float midSplit = shadowCascadeDepths.y > nearSplit
+        ? shadowCascadeDepths.y
+        : max(nearSplit + 1.0, shadowCascadeDepths.z * 0.5);
+    return float2(nearSplit, midSplit);
+}
+
+float3 shadowTexelCheckerboard(float3 viewPos, float checkerScale) {
+    float4 shadow0pos = shadowPosFromView(viewPos, 0);
+    float4 shadow1pos = shadowPosFromView(viewPos, 1);
+    float4 shadow2pos = shadowPosFromView(viewPos, 2);
 
     // Shadow map size (matches shadowSamplePCF hardcoded value)
     float shadowMapSize = 2048.0;
 
     float2 shadowUV0 = (0.5 + 0.5 * shadowRcpRes) + float2(0.5, -0.5) * shadow0pos.xy;
     float2 shadowUV1 = (0.5 + 0.5 * shadowRcpRes) + float2(0.5, -0.5) * shadow1pos.xy;
+    float2 shadowUV2 = (0.5 + 0.5 * shadowRcpRes) + float2(0.5, -0.5) * shadow2pos.xy;
 
     // Checkerboard at scaled texel resolution (checkerScale texels per square)
     float2 texelPos0 = shadowUV0 * shadowMapSize / checkerScale;
     float2 texelPos1 = shadowUV1 * shadowMapSize / checkerScale;
+    float2 texelPos2 = shadowUV2 * shadowMapSize / checkerScale;
 
     float checker0 = fmod(floor(texelPos0.x) + floor(texelPos0.y), 2.0);
     float checker1 = fmod(floor(texelPos1.x) + floor(texelPos1.y), 2.0);
+    float checker2 = fmod(floor(texelPos2.x) + floor(texelPos2.y), 2.0);
+    float viewDepth = length(viewPos);
+    float2 splitDepths = shadowSplitDepths();
 
     // Cascade 0 (near): cyan/magenta
     float3 color0A = float3(0.0, 1.0, 1.0);  // cyan
     float3 color0B = float3(1.0, 0.0, 1.0);  // magenta
 
-    // Cascade 1 (far): yellow/blue
-    float3 color1A = float3(1.0, 1.0, 0.0);  // yellow
-    float3 color1B = float3(0.0, 0.0, 1.0);  // blue
+    // Cascade 1 (near): green/red
+    float3 color1A = float3(0.0, 1.0, 0.0);  // green
+    float3 color1B = float3(1.0, 0.0, 0.0);  // red
 
-    if (inNear) {
+    // Cascade 2 (far): yellow/blue
+    float3 color2A = float3(1.0, 1.0, 0.0);  // yellow
+    float3 color2B = float3(0.0, 0.0, 1.0);  // blue
+
+    if (viewDepth <= splitDepths.x) {
         return lerp(color0A, color0B, checker0);
     }
-    else if (inFar) {
+    else if (viewDepth <= splitDepths.y) {
         return lerp(color1A, color1B, checker1);
     }
-
-    // Outside both cascades - gray
-    return float3(0.3, 0.3, 0.3);
+    return lerp(color2A, color2B, checker2);
 }
 
 // Main shadow sampling function for cascaded shadow maps
-float shadowSample(float4 shadow0pos, float4 shadow1pos, float ndotlgeo, float alphaFlag) {
+float shadowSample(float3 viewPos, float ndotlgeo, float alphaFlag) {
     float3 receiverLimit = float3(1.0 + 2.0 * 16.0 * shadowRcpRes, 1.0 + 2.0 * 16.0 * shadowRcpRes, 1.0);
+    float4 shadow0pos = shadowPosFromView(viewPos, 0);
+    float4 shadow1pos = shadowPosFromView(viewPos, 1);
+    float4 shadow2pos = shadowPosFromView(viewPos, 2);
     bool inNear = all(saturate(receiverLimit - abs(shadow0pos.xyz)));
-    bool inFar = all(saturate(receiverLimit - abs(shadow1pos.xyz)));
+    bool inMid = all(saturate(receiverLimit - abs(shadow1pos.xyz)));
+    bool inFar = all(saturate(receiverLimit - abs(shadow2pos.xyz)));
     float2 uvMargin = 4.0 * shadowRcpRes;
 
     float2 shadowUV0 = (0.5 + 0.5 * shadowRcpRes) + float2(0.5, -0.5) * shadow0pos.xy;
     float2 shadowUV1 = (0.5 + 0.5 * shadowRcpRes) + float2(0.5, -0.5) * shadow1pos.xy;
+    float2 shadowUV2 = (0.5 + 0.5 * shadowRcpRes) + float2(0.5, -0.5) * shadow2pos.xy;
     shadowUV0 = clamp(shadowUV0, uvMargin, 1.0 - uvMargin);
     shadowUV1 = clamp(shadowUV1, uvMargin, 1.0 - uvMargin);
+    shadowUV2 = clamp(shadowUV2, uvMargin, 1.0 - uvMargin);
 
     float shadow0 = alphaFlag > 0.5
         ? shadowSampleESM(shadow0pos, shadowUV0, 0, shadow0pos.z, ndotlgeo)
         : shadowSamplePCF(shadow0pos, shadowUV0, 0, shadow0pos.z, ndotlgeo);
     float shadow1 = shadowSampleESM(shadow1pos, shadowUV1, 1, shadow1pos.z, ndotlgeo);
+    float shadow2 = shadowSampleESM(shadow2pos, shadowUV2, 2, shadow2pos.z, ndotlgeo);
 
-    if (inNear) {
-        return shadow0;
+    float viewDepth = length(viewPos);
+    float2 splitDepths = shadowSplitDepths();
+
+    if (viewDepth <= splitDepths.x) {
+        if (inNear) return shadow0;
+        if (inMid) return shadow1;
+        if (inFar) return shadow2;
     }
-    else if (inFar) {
-        return shadow1;
+    else if (viewDepth <= splitDepths.y) {
+        if (inMid) return shadow1;
+        if (inFar) return shadow2;
+        if (inNear) return shadow0;
+    }
+    else {
+        if (inFar) return shadow2;
+        if (inMid) return shadow1;
+        if (inNear) return shadow0;
     }
 
     return 1.0;

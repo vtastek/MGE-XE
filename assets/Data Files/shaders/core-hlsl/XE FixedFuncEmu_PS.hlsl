@@ -207,7 +207,7 @@ float4 ps_main(VS_OUTPUT input, float2 pixelPos : VPOS) : COLOR{
 		ndotlgeo = dot(normalVS, -normalize(lightSunDirection));
 		//deb = ndotlgeo;
 		
-		shadows = shadowSample(input.shadow0pos, input.shadow1pos, ndotlgeo, hasAlpha ? 1.0 : 0.0);
+		shadows = shadowSample(input.viewPos, ndotlgeo, hasAlpha ? 1.0 : 0.0);
 		deb = shadows; // returns 0 black
 		#endif
 	#endif
@@ -691,7 +691,7 @@ float4 ps_main(VS_OUTPUT input, float2 pixelPos : VPOS) : COLOR{
 			// Shadow texel density checkerboard (cascade + texel grid)
 			// Scale: 8 = each checker square is 8x8 shadow texels
 			#ifdef HAS_SHADOWS
-			debugColor = shadowTexelCheckerboard(input.shadow0pos, input.shadow1pos, 8.0);
+			debugColor = shadowTexelCheckerboard(input.viewPos, 8.0);
 			#else
 			debugColor = float3(0.1, 0.1, 0.1); // Dark gray = no shadows
 			#endif

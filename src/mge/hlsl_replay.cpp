@@ -25,6 +25,7 @@
 #include "patch_displacement.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <climits>
 #include <unordered_map>
@@ -35,6 +36,21 @@
 // During replay, points to fb.shadowViewproj (recording-time matrices).
 // Outside replay, nullptr - callers fall back to s_staging.smViewproj.
 static const D3DXMATRIX* s_activeShadowVP = nullptr;
+
+static void computeShadowCascadeDepths(float outDepths[4]) {
+    const float nearClip = 1.0f;
+    const float shadowDistance = ImGuiManager::GetShadowDistance();
+    const float splitLambda = ImGuiManager::GetSplitLambda();
+
+    for (int i = 1; i < kShadowCascadeCount; ++i) {
+        float p = (float)i / (float)kShadowCascadeCount;
+        float logSplit = nearClip * std::pow(shadowDistance / nearClip, p);
+        float linearSplit = nearClip + (shadowDistance - nearClip) * p;
+        outDepths[i - 1] = splitLambda * logSplit + (1.0f - splitLambda) * linearSplit;
+    }
+    outDepths[2] = shadowDistance;
+    outDepths[3] = 0.0f;
+}
 
 // Slow frame detection: prepareMs stored by prepareRecordedCalls, read by replayRecordedCalls
 extern float lastPrepareMs;
@@ -457,8 +473,9 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
         RenderedState rsWithShadows = *rs;
 
         // Use current shadow matrices for this specific draw call during recording
-        rsWithShadows.shadowWorldViewProj[0] = rs->worldTransforms[0] * DistantLand::s_staging.smViewproj[0];
-        rsWithShadows.shadowWorldViewProj[1] = rs->worldTransforms[0] * DistantLand::s_staging.smViewproj[1];
+        for (int i = 0; i < kShadowCascadeCount; ++i) {
+            rsWithShadows.shadowWorldViewProj[i] = rs->worldTransforms[0] * DistantLand::s_staging.smViewproj[i];
+        }
 
         // Defer shader key computation to prepare phase (avoid texture hash lookups during recording)
         ShaderKey sk;
@@ -505,8 +522,9 @@ void FixedFunctionShader::renderMorrowindHLSL(const RenderedState* rs, const Fra
     // Compute shadow world-view-projection matrices for this draw call
     // (rs from mged3d8device has zeros - compute from current shadow map VP)
     RenderedState rsWithShadows = *rs;
-    rsWithShadows.shadowWorldViewProj[0] = rs->worldTransforms[0] * DistantLand::s_staging.smViewproj[0];
-    rsWithShadows.shadowWorldViewProj[1] = rs->worldTransforms[0] * DistantLand::s_staging.smViewproj[1];
+    for (int i = 0; i < kShadowCascadeCount; ++i) {
+            rsWithShadows.shadowWorldViewProj[i] = rs->worldTransforms[0] * DistantLand::s_staging.smViewproj[i];
+        }
 
     renderMorrowindHLSL_Internal(&rsWithShadows, frs, lightrs);
 }
@@ -837,19 +855,21 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
     // Set shadow matrices if shadows are enabled
     if (sk.hasShadows) {
         // Compute shadow transform matrices using cached inverse view
-        static D3DXMATRIX cachedViewToShadowLocal[2];
-        static bool shadowTransformValid = false;
-
-        if (!shadowTransformValid || !shadowMatricesValid) {
-            const auto* svp = s_activeShadowVP ? s_activeShadowVP : DistantLand::s_staging.smViewproj;
-            cachedViewToShadowLocal[0] = cachedInverseView * svp[0];
-            cachedViewToShadowLocal[1] = cachedInverseView * svp[1];
-            shadowTransformValid = shadowMatricesValid;
+        D3DXMATRIX cachedViewToShadowLocal[kShadowCascadeCount];
+        const auto* svp = s_activeShadowVP ? s_activeShadowVP : DistantLand::s_staging.smViewproj;
+        for (int i = 0; i < kShadowCascadeCount; ++i) {
+            cachedViewToShadowLocal[i] = cachedInverseView * svp[i];
         }
 
-        // Shadow matrices at c60-c67 (explicit register to avoid collision)
+        // VS keeps the first two legacy interpolators; PS gets all cascades from view-space position.
         setConstantF(cmdBuf, device, true, 60, (float*)&cachedViewToShadowLocal[0], 4); // c60-c63
         setConstantF(cmdBuf, device, true, 64, (float*)&cachedViewToShadowLocal[1], 4); // c64-c67
+        for (int i = 0; i < kShadowCascadeCount; ++i) {
+            setMatrixConstantF(cmdBuf, device, false, 31 + i * 4, cachedViewToShadowLocal[i]);
+        }
+        float shadowCascadeDepths[4];
+        computeShadowCascadeDepths(shadowCascadeDepths);
+        setConstantF(cmdBuf, device, false, 43, shadowCascadeDepths, 1);
 
         // Set shadow resolution parameter
         float shadowRcpData[4] = { 1.0f / Configuration.DL.ShadowResolution, 0, 0, 0 };
@@ -1156,6 +1176,19 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         } catch (...) {
             LOG::logline("!! HLSL Vertex shader constant table access failed - shader may have been edited");
         }
+    }
+
+    if (sk.hasShadows) {
+        D3DXMATRIX viewInverse;
+        D3DXMatrixInverse(&viewInverse, nullptr, &viewMatrix);
+        const auto* svp = s_activeShadowVP ? s_activeShadowVP : DistantLand::s_staging.smViewproj;
+        for (int i = 0; i < kShadowCascadeCount; ++i) {
+            D3DXMATRIX viewToShadow = viewInverse * svp[i];
+            setMatrixConstantF(cmdBuf, device, false, 31 + i * 4, viewToShadow);
+        }
+        float shadowCascadeDepths[4];
+        computeShadowCascadeDepths(shadowCascadeDepths);
+        setConstantF(cmdBuf, device, false, 43, shadowCascadeDepths, 1);
     }
 
     // Compute lighting data (shared between cmdBuf and device paths)
@@ -2733,7 +2766,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
 
             D3DXMATRIX viewT, projT;
             D3DXVECTOR3 sunDirView;
-            D3DXMATRIX shadowViewToClip[2];
+            D3DXMATRIX shadowViewToClip[kShadowCascadeCount];
             RGBVECTOR sunDiffuse;
             RGBVECTOR sceneAmbient;
 
@@ -2757,8 +2790,9 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                 // Pre-calculate shadow view-to-clip matrices
                 D3DXMATRIX viewInverse;
                 D3DXMatrixInverse(&viewInverse, nullptr, &fb.currentView);
-                shadowViewToClip[0] = viewInverse * fb.shadowViewproj[0];
-                shadowViewToClip[1] = viewInverse * fb.shadowViewproj[1];
+                for (int i = 0; i < kShadowCascadeCount; ++i) {
+                    shadowViewToClip[i] = viewInverse * fb.shadowViewproj[i];
+                }
             }
 
             // Local shader cache to avoid SRW locks in loop
@@ -2965,6 +2999,14 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                         // Set shadow matrices using hoisted view-to-shadow transforms
                         if (hlslShader.hShadowWorldViewProj) {
                             hlslShader.vsConstantTable->SetMatrixArray(device, hlslShader.hShadowWorldViewProj, shadowViewToClip, 2);
+                        }
+                        for (int i = 0; i < kShadowCascadeCount; ++i) {
+                            setMatrixConstantF(nullptr, device, false, 31 + i * 4, shadowViewToClip[i]);
+                        }
+                        {
+                            float shadowCascadeDepths[4];
+                            computeShadowCascadeDepths(shadowCascadeDepths);
+                            device->SetPixelShaderConstantF(43, shadowCascadeDepths, 1);
                         }
 
                         // Shadow PS constants - use resolved registers to avoid conflicts.
@@ -3312,8 +3354,9 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                             rsDisp.primCount = sp->primCount;
                             D3DXMatrixMultiply(&rsDisp.worldViewTransforms[0],
                                                &rsDisp.worldTransforms[0], &fb.currentView);
-                            rsDisp.shadowWorldViewProj[0] = rsDisp.worldTransforms[0] * DistantLand::s_staging.smViewproj[0];
-                            rsDisp.shadowWorldViewProj[1] = rsDisp.worldTransforms[0] * DistantLand::s_staging.smViewproj[1];
+                            for (int i = 0; i < kShadowCascadeCount; ++i) {
+                            rsDisp.shadowWorldViewProj[i] = rsDisp.worldTransforms[0] * DistantLand::s_staging.smViewproj[i];
+                        }
                             renderMorrowindHLSL_Internal(&rsDisp, &tintedFrs, call.lightrs.get(),
                                                          DIRTY_ALL, (int)i, cmdBuf, &call.deviceState, &call);
                             renderedDisplaced = true;

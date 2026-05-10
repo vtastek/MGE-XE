@@ -15,7 +15,7 @@ shared matrix reflectionView, reflectionProj;
 shared float reflectionWaterLevel;
 shared matrix vertexBlendPalette[4];
 shared matrix prevVertexBlendPalette[4];  // Previous frame's worldview for velocity
-shared matrix shadowViewProj[2];
+shared matrix shadowViewProj[3];
 shared bool hasAlpha, hasBones, hasVCol;
 shared float alphaRef, materialAlpha;
 shared int vertexBlendState;

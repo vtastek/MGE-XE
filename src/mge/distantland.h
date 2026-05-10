@@ -298,10 +298,11 @@ public:
     // Texture-based lighting system
     static float computeLightRadius(float constant, float linear, float quadratic);
 
-    static void renderShadowMap(DLContext* ctx);
+    static void renderShadowMap(DLContext* ctx, FixedFunctionShader::FrameBuffer* fb = nullptr);
     template<class T>
     static void renderShadowLayerGeneric(DLContext* ctx, MWBridge* mwBridge, int layer, const D3DXMATRIX* inverseCameraProj, D3DXMATRIX* view, D3DXMATRIX* proj, VisibleSet<T>& visible_set);
-    static void renderShadowLayer(DLContext* ctx, int layer, float splitNear, float splitFar, const D3DXMATRIX* inverseCameraProj);
+    static void renderShadowLayer(DLContext* ctx, FixedFunctionShader::FrameBuffer* fb, int layer, float splitNear, float splitFar, const D3DXMATRIX* inverseCameraProj);
+    static void renderShadowRecorded(const std::vector<RecordedMWState>& recMW, int layer, const D3DXMATRIX* viewproj);
     static void renderShadow(DLContext* ctx);
     static void renderShadowDebug(DLContext* ctx);
 

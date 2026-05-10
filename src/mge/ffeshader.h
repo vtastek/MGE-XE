@@ -52,7 +52,7 @@ struct DLContext {
     float lightSunMult, lightAmbMult;
 
     // Shadow (written by renderShadowMap in Stage0, read by Stage1/2)
-    D3DXMATRIX smView[2], smProj[2], smViewproj[2];
+    D3DXMATRIX smView[kShadowCascadeCount], smProj[kShadowCascadeCount], smViewproj[kShadowCascadeCount];
 
     // Flags
     bool isRenderCached;
@@ -1216,11 +1216,11 @@ public:
         D3DXMATRIX view, proj;           // Scene 0 (world)
         D3DXMATRIX viewScene1, projScene1;  // Scene 1 (particles) - may differ if camera moves during Scene 0
         D3DXMATRIX viewScene2, projScene2;  // Scene 2 (hands) - different view matrix
-        D3DXMATRIX shadowViewproj[2];
+        D3DXMATRIX shadowViewproj[kShadowCascadeCount];
 
         // Matrices stamped at Present() for render pass (fresh camera)
         D3DXMATRIX currentView, currentProj;
-        D3DXMATRIX currentShadowViewproj[2];
+        D3DXMATRIX currentShadowViewproj[kShadowCascadeCount];
 
         // Per-buffer occluder set (no cross-buffer sharing)
         std::unordered_set<MeshKey, MeshKeyHash> rasterizedOccluderMeshes;

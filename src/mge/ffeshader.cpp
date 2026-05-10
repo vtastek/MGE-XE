@@ -2284,10 +2284,8 @@ void FixedFunctionShader::swapBuffers() {
         memset(&oldBuf.proj, 0xFF, sizeof(D3DXMATRIX));
         memset(&oldBuf.currentView, 0xFF, sizeof(D3DXMATRIX));
         memset(&oldBuf.currentProj, 0xFF, sizeof(D3DXMATRIX));
-        memset(&oldBuf.shadowViewproj[0], 0xFF, sizeof(D3DXMATRIX));
-        memset(&oldBuf.shadowViewproj[1], 0xFF, sizeof(D3DXMATRIX));
-        memset(&oldBuf.currentShadowViewproj[0], 0xFF, sizeof(D3DXMATRIX));
-        memset(&oldBuf.currentShadowViewproj[1], 0xFF, sizeof(D3DXMATRIX));
+        memset(oldBuf.shadowViewproj, 0xFF, sizeof(oldBuf.shadowViewproj));
+        memset(oldBuf.currentShadowViewproj, 0xFF, sizeof(oldBuf.currentShadowViewproj));
         oldBuf.frameNumber = -9999;  // Obvious sentinel value
     }
 

@@ -59,10 +59,11 @@ struct GrassVertOut {
 
     float4 shadow0pos : TEXCOORD1;
     float4 shadow1pos : TEXCOORD2;
+    float4 shadow2pos : TEXCOORD3;
 #ifdef USE_HLSL_PIPELINE
-    float4 normalFacing : TEXCOORD3;  // .xyz = world normal, .w = facing sign for two-sided
+    float4 normalFacing : TEXCOORD4;  // .xyz = world normal, .w = facing sign for two-sided
 #endif
-    float4 worldDepth : TEXCOORD4;    // .xyz = world position, .w = view depth
+    float4 worldDepth : TEXCOORD5;    // .xyz = world position, .w = view depth
 };
 
 GrassVertOut GrassInstVS(StatVertInstIn IN) {
@@ -97,8 +98,10 @@ GrassVertOut GrassInstVS(StatVertInstIn IN) {
     // Find position in light space, output light depth
     OUT.shadow0pos = mul(v.worldpos, shadowViewProj[0]);
     OUT.shadow1pos = mul(v.worldpos, shadowViewProj[1]);
+    OUT.shadow2pos = mul(v.worldpos, shadowViewProj[2]);
     OUT.shadow0pos.z = OUT.shadow0pos.z / OUT.shadow0pos.w;
     OUT.shadow1pos.z = OUT.shadow1pos.z / OUT.shadow1pos.w;
+    OUT.shadow2pos.z = OUT.shadow2pos.z / OUT.shadow2pos.w;
 
     OUT.texcoords = IN.texcoords;
     return OUT;
@@ -112,7 +115,7 @@ float4 GrassPS(GrassVertOut IN): COLOR0 {
         discard;
 
     // Soft shadowing
-    float dz = shadowDeltaZ(IN.shadow0pos, IN.shadow1pos);
+    float dz = shadowDeltaZ(IN.shadow0pos, IN.shadow1pos, IN.shadow2pos);
     float v = shadowESM(dz);
     v *= IN.color.a;
 

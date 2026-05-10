@@ -9,7 +9,7 @@
 // Engine parameters
 
 // Number of cascades that are rendered (this is hardcoded)
-static const int shadowCascades = 2;
+static const int shadowCascades = 3;
 
 // Shadow atlas texture scaling factor
 static const float shadowCascadeSize = 1. / shadowCascades;

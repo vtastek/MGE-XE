@@ -425,8 +425,7 @@ void FixedFunctionShader::startRecording() {
         device->GetTransform(D3DTS_VIEW, &fb.view);
         device->GetTransform(D3DTS_PROJECTION, &fb.proj);
     }
-    fb.shadowViewproj[0] = DistantLand::s_staging.smViewproj[0];
-    fb.shadowViewproj[1] = DistantLand::s_staging.smViewproj[1];
+    memcpy(fb.shadowViewproj, DistantLand::s_staging.smViewproj, sizeof(fb.shadowViewproj));
     fb.state = BufferState::Recording;
     fb.valid = true;
 
@@ -1037,8 +1036,7 @@ void FixedFunctionShader::executeGpuPhase() {
     // shadow matrices and wrote them back to s_staging. The stale previous-frame values
     // captured at startRecording() would cause shadow shaking on camera movement.
     {
-        fb.shadowViewproj[0] = DistantLand::s_staging.smViewproj[0];
-        fb.shadowViewproj[1] = DistantLand::s_staging.smViewproj[1];
+        memcpy(fb.shadowViewproj, DistantLand::s_staging.smViewproj, sizeof(fb.shadowViewproj));
     }
 
     // Stage 1: grass, shadow overlay, depth
@@ -1182,8 +1180,7 @@ void FixedFunctionShader::finalizeAndRenderAllScenes(DLContext* frameCtx, bool w
     // shadow matrices and wrote them back to s_staging. The stale previous-frame values
     // captured at startRecording() would cause shadow shaking on camera movement.
     {
-        fb.shadowViewproj[0] = DistantLand::s_staging.smViewproj[0];
-        fb.shadowViewproj[1] = DistantLand::s_staging.smViewproj[1];
+        memcpy(fb.shadowViewproj, DistantLand::s_staging.smViewproj, sizeof(fb.shadowViewproj));
     }
 
     // === DEPTH PASSES ===
@@ -1786,8 +1783,7 @@ void FixedFunctionShader::renderFullFrameAsync(bool useN1Buffer) {
     }
 
     // Update shadow VP from freshly computed matrices
-    fb.shadowViewproj[0] = DistantLand::s_staging.smViewproj[0];
-    fb.shadowViewproj[1] = DistantLand::s_staging.smViewproj[1];
+    memcpy(fb.shadowViewproj, DistantLand::s_staging.smViewproj, sizeof(fb.shadowViewproj));
 
     // Depth passes: Scene 0 (world) and Scene 2 (hands)
     {
@@ -2012,8 +2008,7 @@ void FixedFunctionShader::renderStage0Early(bool useN1Buffer) {
     LOG_CAT(LOG::Cat_SyncThread, "[S0E] F=%d POST_GPU", frame);
 
     // Update shadow VP from freshly computed matrices
-    fb.shadowViewproj[0] = DistantLand::s_staging.smViewproj[0];
-    fb.shadowViewproj[1] = DistantLand::s_staging.smViewproj[1];
+    memcpy(fb.shadowViewproj, DistantLand::s_staging.smViewproj, sizeof(fb.shadowViewproj));
 
     stage0EarlyCompleted = true;
     LOG_CAT(LOG::Cat_SyncThread, "[S0E] F=%d DONE", frame);
@@ -2087,8 +2082,7 @@ void FixedFunctionShader::renderRemainingStages(bool useN1Buffer) {
             DistantLand::renderStage0GPU(renderCtx, &fb);
         }
 
-        fb.shadowViewproj[0] = DistantLand::s_staging.smViewproj[0];
-        fb.shadowViewproj[1] = DistantLand::s_staging.smViewproj[1];
+        memcpy(fb.shadowViewproj, DistantLand::s_staging.smViewproj, sizeof(fb.shadowViewproj));
     }
 
     // Prepare all scenes if not already done by CPU prep
