@@ -135,8 +135,14 @@ public:
     static float GetPCFBias2();
     static float GetPCFSlopeBias();
     static float GetPCFTerrainBias();
+    static float GetClosePCFFilterSize();
+    static float GetClosePCFBias();
+    static float GetClosePCFBias2();
+    static float GetClosePCFSlopeBias();
+    static float GetClosePCFTerrainBias();
     static float GetSplitLambda();
     static float GetShadowDistance();
+    static float GetCloseCascadeDistance();
     static float GetIntensityScalar();
     static float GetAttenuationMultiplier();
     static float GetAttenuationCutoffDist();
@@ -187,6 +193,12 @@ public:
 
     // Forward SSAO visualization interface
     static void RenderSSAOInterface();
+
+    // Shadow map visualization interface
+    static void RenderShadowInterface();
+
+    // Velocity buffer visualization interface
+    static void RenderVelocityInterface();
 
     // Hi-Z occluder selection parameters
     static int GetOccluderMaxCount() { return occluderMaxCount; }
@@ -332,6 +344,7 @@ private:
     static bool showDebugInterface;
     static bool showHiZInterface;
     static bool showSSAOInterface;
+    static bool showShadowInterface;
     static bool showVelocityInterface;
     static HWND windowHandle;
 
@@ -344,10 +357,16 @@ private:
     static float pcfBias2;             // Second depth bias for lerp
     static float pcfSlopeBias;         // Slope-based bias to prevent acne on angled surfaces
     static float pcfTerrainBias;       // Extra bias added only to terrain receivers (near cascade, all modes)
+    static float closePCFFilterSize;   // Close cascade filter size in texels
+    static float closePCFBias;
+    static float closePCFBias2;
+    static float closePCFSlopeBias;
+    static float closePCFTerrainBias;
 
     // Shadow cascade parameters (frustum-fitted CSM)
-    static float splitLambda;          // Blend factor: 0=linear splits, 1=logarithmic splits (default 0.5)
+    static float splitLambda;          // Blend factor: 0=linear splits, 1=logarithmic splits (default 0.75)
     static float shadowDistance;       // Maximum shadow distance in world units (default 4000)
+    static float closeCascadeDistance; // Exclusive close cascade distance for high-quality dynamic shadows
 
     // HLSL-pipeline unified-look intensity multiplier (mirrors Configuration.IntensityScalar).
     static float intensityScalar;

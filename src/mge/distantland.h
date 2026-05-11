@@ -151,7 +151,7 @@ public:
     static IDirect3DSurface9* surfRain, *surfRipples, *surfRippleBuffer;
     static IDirect3DVertexBuffer9* vbWaveSim;
 
-    static IDirect3DTexture9* texShadow, *texSoftShadow;
+    static IDirect3DTexture9* texShadow, *texSoftShadow, *texShadowBlur;
     static IDirect3DTexture9* texBlueNoise;  // 34x1 R16G16F blue noise for shadow PCF
     static IDirect3DSurface9* surfShadowZ;
     static IDirect3DVertexBuffer9* vbFullFrame, *vbClipCube;

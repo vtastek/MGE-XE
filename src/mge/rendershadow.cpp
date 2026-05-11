@@ -89,18 +89,22 @@ static LightSpaceBounds computeLightSpaceBounds(
     return bounds;
 }
 
-// Compute split distances using practical split scheme (blend of log and linear)
+// Compute split distances using the old two-cascade practical split, with an
+// exclusive close cascade inserted in front for high-quality nearby dynamics.
 static void computeCascadeSplits(float nearClip, float farClip, float lambda, float splits[kShadowCascadeCount + 1])
 {
-    splits[0] = 0.0f;
+    const float oldNearFarSplitP = 0.5f;
+    const float oldLogSplit = nearClip * std::pow(farClip / nearClip, oldNearFarSplitP);
+    const float oldLinearSplit = nearClip + (farClip - nearClip) * oldNearFarSplitP;
+    const float oldNearFarSplit = lambda * oldLogSplit + (1.0f - lambda) * oldLinearSplit;
+    const float closeSplit = std::min(
+        ImGuiManager::GetCloseCascadeDistance(),
+        std::max(nearClip, oldNearFarSplit - 1.0f));
 
-    for (int i = 1; i < kShadowCascadeCount; i++) {
-        float p = (float)i / (float)kShadowCascadeCount;
-        float logSplit = nearClip * std::pow(farClip / nearClip, p);
-        float linearSplit = nearClip + (farClip - nearClip) * p;
-        splits[i] = lambda * logSplit + (1.0f - lambda) * linearSplit;
-    }
-    splits[kShadowCascadeCount] = farClip;
+    splits[0] = 0.0f;
+    splits[1] = closeSplit;
+    splits[2] = oldNearFarSplit;
+    splits[3] = farClip;
 }
 
 
@@ -112,13 +116,14 @@ static void computeCascadeSplits(float nearClip, float farClip, float lambda, fl
 void DistantLand::renderShadowMap(DLContext* ctx, FixedFunctionShader::FrameBuffer* fb) {
     LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] renderShadowMap ENTER");
     ImGuiManager::LogFrameEvent(FrameEvent::MGE_ShadowMap, 0);
-    IDirect3DSurface9* target, *targetSoft;
+    IDirect3DSurface9* target, *targetSoft, *targetBlur;
     texShadow->GetSurfaceLevel(0, &target);
     texSoftShadow->GetSurfaceLevel(0, &targetSoft);
+    texShadowBlur->GetSurfaceLevel(0, &targetBlur);
     LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] GetSurfaceLevel done");
 
     // Switch to render target
-    RenderTargetSwitcher rtsw(targetSoft, surfShadowZ);
+    RenderTargetSwitcher rtsw(target, surfShadowZ);
     D3DVIEWPORT9 vp;
     device->GetViewport(&vp);
     LOG_CAT(LOG::Cat_SyncThread, "[SHADOW] RT switch done");
@@ -160,9 +165,9 @@ void DistantLand::renderShadowMap(DLContext* ctx, FixedFunctionShader::FrameBuff
     device->SetViewport(&vp);
 
     // Soften shadow map
-    device->SetRenderTarget(0, target);
+    device->SetRenderTarget(0, targetBlur);
     effectShadow->BeginPass(PASS_SOFTENSHADOWMAP);
-    effect->SetTexture(ehTex3, texSoftShadow);
+    effect->SetTexture(ehTex3, texShadow);
     effect->SetBool(ehHasAlpha, false);     // flag as horizontal filter pass
     effectShadow->CommitChanges();
 
@@ -171,7 +176,7 @@ void DistantLand::renderShadowMap(DLContext* ctx, FixedFunctionShader::FrameBuff
     device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
 
     device->SetRenderTarget(0, targetSoft);
-    effect->SetTexture(ehTex3, texShadow);
+    effect->SetTexture(ehTex3, texShadowBlur);
     effect->SetBool(ehHasAlpha, true);      // flag as vertical filter pass
     effectShadow->CommitChanges();
 
@@ -181,6 +186,7 @@ void DistantLand::renderShadowMap(DLContext* ctx, FixedFunctionShader::FrameBuff
     // Clean up surface pointers
     target->Release();
     targetSoft->Release();
+    targetBlur->Release();
 }
 
 void DistantLand::renderShadowRecorded(const std::vector<RecordedMWState>& recMW, int layer, const D3DXMATRIX* viewproj) {

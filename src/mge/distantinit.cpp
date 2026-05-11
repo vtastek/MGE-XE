@@ -138,6 +138,7 @@ IDirect3DVertexBuffer9* DistantLand::vbWaveSim;
 
 IDirect3DTexture9* DistantLand::texShadow;
 IDirect3DTexture9* DistantLand::texSoftShadow;
+IDirect3DTexture9* DistantLand::texShadowBlur;
 IDirect3DTexture9* DistantLand::texBlueNoise;
 IDirect3DSurface9* DistantLand::surfShadowZ;
 IDirect3DVertexBuffer9* DistantLand::vbFullFrame;
@@ -1432,6 +1433,11 @@ bool DistantLand::initShadow() {
         LOG::logline("!! Failed to create shadow render target");
         return false;
     }
+    hr = device->CreateTexture(cascades * shadowSize, shadowSize, 1, D3DUSAGE_RENDERTARGET, shadowFormat, D3DPOOL_DEFAULT, &texShadowBlur, NULL);
+    if (hr != D3D_OK) {
+        LOG::logline("!! Failed to create shadow blur render target");
+        return false;
+    }
     hr = device->CreateDepthStencilSurface(cascades * shadowSize, shadowSize, shadowZFormat, D3DMULTISAMPLE_NONE, 0, TRUE, &surfShadowZ, NULL);
     if (hr != D3D_OK) {
         LOG::logline("!! Failed to create shadow Z buffer");
@@ -2070,6 +2076,10 @@ void DistantLand::release() {
     texShadow = nullptr;
     texSoftShadow->Release();
     texSoftShadow = nullptr;
+    if (texShadowBlur) {
+        texShadowBlur->Release();
+        texShadowBlur = nullptr;
+    }
     if (texBlueNoise) {
         texBlueNoise->Release();
         texBlueNoise = nullptr;

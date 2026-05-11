@@ -5,6 +5,7 @@
 #include "mwbridge.h"
 #include "distantland.h"
 #include "patch_displacement.h"
+#include <algorithm>
 #include <cstdio>
 #include <cmath>
 
@@ -14,6 +15,7 @@ bool ImGuiManager::showPCFInterface = false;
 bool ImGuiManager::showDebugInterface = false;
 bool ImGuiManager::showHiZInterface = false;
 bool ImGuiManager::showSSAOInterface = false;
+bool ImGuiManager::showShadowInterface = false;
 bool ImGuiManager::showVelocityInterface = false;
 HWND ImGuiManager::windowHandle = nullptr;
 
@@ -24,14 +26,20 @@ float ImGuiManager::pcfFilterSize = 5.5f;        // Base filter size in texels
 float ImGuiManager::pcfPenumbraScale = 1.44f;    // Scale factor for distance-based penumbra
 float ImGuiManager::pcfMinPenumbra = 1.5f;       // Minimum penumbra size
 float ImGuiManager::pcfMaxPenumbra = 3.4f;       // Maximum penumbra size
-float ImGuiManager::pcfBias = 0.0031f;           // Depth bias to prevent acne
-float ImGuiManager::pcfBias2 = 0.0038f;          // Second depth bias for lerp
-float ImGuiManager::pcfSlopeBias = 0.0047f;      // Slope-based bias to prevent acne on angled surfaces
-float ImGuiManager::pcfTerrainBias = 0.02f;      // Extra bias for terrain receivers (near cascade, all modes)
+float ImGuiManager::pcfBias = 0.0f;              // Depth bias to prevent acne
+float ImGuiManager::pcfBias2 = 0.0015f;          // Second depth bias for lerp
+float ImGuiManager::pcfSlopeBias = 0.0f;         // Slope-based bias to prevent acne on angled surfaces
+float ImGuiManager::pcfTerrainBias = 0.0015f;    // Extra bias for terrain receivers (near cascade, all modes)
+float ImGuiManager::closePCFFilterSize = 24.0f;  // Close cascade filter size in texels
+float ImGuiManager::closePCFBias = 0.0f;
+float ImGuiManager::closePCFBias2 = 0.0f;
+float ImGuiManager::closePCFSlopeBias = 0.0f;
+float ImGuiManager::closePCFTerrainBias = 0.002f;
 
 // Shadow cascade radii
-float ImGuiManager::splitLambda = 0.25f;         // Blend factor: 0=linear, 1=logarithmic
+float ImGuiManager::splitLambda = 0.75f;         // Blend factor: 0=linear, 1=logarithmic
 float ImGuiManager::shadowDistance = 6000.0f;    // Maximum shadow distance in world units
+float ImGuiManager::closeCascadeDistance = 100.0f; // Exclusive close cascade for high-quality dynamic shadows
 
 float ImGuiManager::intensityScalar = 1.0f;      // HLSL-pipeline unified-look intensity multiplier
 float ImGuiManager::attenuationMultiplier = 40000.0f;   // Point light attenuation multiplier (inverse-square)
@@ -221,6 +229,11 @@ bool ImGuiManager::Initialize(HWND hwnd, IDirect3DDevice9* device) {
     pcfBias2 = Configuration.PCF.Bias2;
     pcfSlopeBias = Configuration.PCF.SlopeBias;
     pcfTerrainBias = Configuration.PCF.TerrainBias;
+    closePCFFilterSize = Configuration.PCF.CloseFilterSize;
+    closePCFBias = Configuration.PCF.CloseBias;
+    closePCFBias2 = Configuration.PCF.CloseBias2;
+    closePCFSlopeBias = Configuration.PCF.CloseSlopeBias;
+    closePCFTerrainBias = Configuration.PCF.CloseTerrainBias;
     intensityScalar = Configuration.IntensityScalar;
 
 
@@ -234,7 +247,7 @@ bool ImGuiManager::Initialize(HWND hwnd, IDirect3DDevice9* device) {
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
     
     // Enable ImGui to draw its own cursor when interface is showing
-    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showVelocityInterface || showFrameEventLog;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showShadowInterface || showVelocityInterface || showFrameEventLog;
 
     // Setup Dear ImGui style
     ImGui::StyleColorsDark();
@@ -326,6 +339,16 @@ void ImGuiManager::Render() {
         RenderSSAOInterface();
     }
 
+    // Show shadow map visualization interface
+    if (showShadowInterface) {
+        RenderShadowInterface();
+    }
+
+    // Show velocity buffer visualization interface
+    if (showVelocityInterface) {
+        RenderVelocityInterface();
+    }
+
     // Show frame event log
     if (showFrameEventLog) {
         RenderFrameEventLog();
@@ -388,18 +411,27 @@ void ImGuiManager::RenderPCFFilteringInterface() {
         ImGui::SliderFloat("Terrain Bias (near)", &pcfTerrainBias, 0.0f, 0.02f, "%.4f");
 
         ImGui::Separator();
+        ImGui::Text("Close Cascade");
+        ImGui::SliderFloat("Close Filter Size", &closePCFFilterSize, 0.1f, 32.0f, "%.2f");
+        ImGui::SliderFloat("Close Depth Bias", &closePCFBias, 0.0f, 0.01f, "%.5f");
+        ImGui::SliderFloat("Close Depth Bias 2", &closePCFBias2, 0.0f, 0.01f, "%.5f");
+        ImGui::SliderFloat("Close Slope Bias", &closePCFSlopeBias, 0.0f, 0.01f, "%.5f");
+        ImGui::SliderFloat("Close Terrain Bias", &closePCFTerrainBias, 0.0f, 0.02f, "%.5f");
+
+        ImGui::Separator();
         ImGui::Text("Frustum-Fitted Cascades");
         ImGui::SliderFloat("Split Lambda", &splitLambda, 0.0f, 1.0f, "%.2f");
         ImGui::SetItemTooltip("0 = linear splits, 1 = logarithmic splits, 0.5 = practical blend");
         ImGui::SliderFloat("Shadow Distance", &shadowDistance, 1000.0f, 8000.0f, "%.0f");
-        // Show computed split points for reference
+        ImGui::SliderFloat("Close Cascade Distance", &closeCascadeDistance, 64.0f, 2000.0f, "%.0f");
+        ImGui::SetItemTooltip("Exclusive close cascade range for high-quality nearby dynamic shadows.");
+        // Show computed split points for reference. Cascades 1/2 keep the old two-cascade split.
         float nearClip = 1.0f;
-        float split1 = splitLambda * (nearClip * std::pow(shadowDistance / nearClip, 1.0f / 3.0f)) +
-                       (1.0f - splitLambda) * (nearClip + (shadowDistance - nearClip) * (1.0f / 3.0f));
-        float split2 = splitLambda * (nearClip * std::pow(shadowDistance / nearClip, 2.0f / 3.0f)) +
-                       (1.0f - splitLambda) * (nearClip + (shadowDistance - nearClip) * (2.0f / 3.0f));
+        float oldSplit = splitLambda * (nearClip * std::pow(shadowDistance / nearClip, 0.5f)) +
+                         (1.0f - splitLambda) * (nearClip + (shadowDistance - nearClip) * 0.5f);
+        float closeSplit = std::min(closeCascadeDistance, std::max(nearClip, oldSplit - 1.0f));
         ImGui::Text("Cascade 0: 0-%.0f, Cascade 1: %.0f-%.0f, Cascade 2: %.0f-%.0f",
-            split1, split1, split2, split2, shadowDistance);
+            closeSplit, closeSplit, oldSplit, oldSplit, shadowDistance);
 
         ImGui::Separator();
         ImGui::Text("HLSL Unified Look");
@@ -433,13 +465,18 @@ void ImGuiManager::RenderPCFFilteringInterface() {
         Configuration.PCF.Bias2 = pcfBias2;
         Configuration.PCF.SlopeBias = pcfSlopeBias;
         Configuration.PCF.TerrainBias = pcfTerrainBias;
+        Configuration.PCF.CloseFilterSize = closePCFFilterSize;
+        Configuration.PCF.CloseBias = closePCFBias;
+        Configuration.PCF.CloseBias2 = closePCFBias2;
+        Configuration.PCF.CloseSlopeBias = closePCFSlopeBias;
+        Configuration.PCF.CloseTerrainBias = closePCFTerrainBias;
         Configuration.IntensityScalar = intensityScalar;
         Configuration.SaveSettings();
     }
 
     // Update mouse cursor visibility based on interface state
     ImGuiIO& io = ImGui::GetIO();
-    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showVelocityInterface || showFrameEventLog;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showShadowInterface || showVelocityInterface || showFrameEventLog;
 }
 
 // Getter functions for shader constants
@@ -451,8 +488,14 @@ float ImGuiManager::GetPCFBias() { return pcfBias; }
 float ImGuiManager::GetPCFBias2() { return pcfBias2; }
 float ImGuiManager::GetPCFSlopeBias() { return pcfSlopeBias; }
 float ImGuiManager::GetPCFTerrainBias() { return pcfTerrainBias; }
+float ImGuiManager::GetClosePCFFilterSize() { return closePCFFilterSize; }
+float ImGuiManager::GetClosePCFBias() { return closePCFBias; }
+float ImGuiManager::GetClosePCFBias2() { return closePCFBias2; }
+float ImGuiManager::GetClosePCFSlopeBias() { return closePCFSlopeBias; }
+float ImGuiManager::GetClosePCFTerrainBias() { return closePCFTerrainBias; }
 float ImGuiManager::GetSplitLambda() { return splitLambda; }
 float ImGuiManager::GetShadowDistance() { return shadowDistance; }
+float ImGuiManager::GetCloseCascadeDistance() { return closeCascadeDistance; }
 float ImGuiManager::GetIntensityScalar() { return intensityScalar; }
 float ImGuiManager::GetAttenuationMultiplier() { return attenuationMultiplier; }
 float ImGuiManager::GetAttenuationCutoffDist() { return attenuationCutoffDist; }
@@ -470,7 +513,7 @@ void ImGuiManager::TogglePCFInterface() {
     
     // Update mouse cursor visibility
     ImGuiIO& io = ImGui::GetIO();
-    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showVelocityInterface || showFrameEventLog;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showShadowInterface || showVelocityInterface || showFrameEventLog;
     
     // Save PCF settings when interface is being closed
     if (wasShowing && !showPCFInterface) {
@@ -482,6 +525,11 @@ void ImGuiManager::TogglePCFInterface() {
         Configuration.PCF.Bias2 = pcfBias2;
         Configuration.PCF.SlopeBias = pcfSlopeBias;
         Configuration.PCF.TerrainBias = pcfTerrainBias;
+        Configuration.PCF.CloseFilterSize = closePCFFilterSize;
+        Configuration.PCF.CloseBias = closePCFBias;
+        Configuration.PCF.CloseBias2 = closePCFBias2;
+        Configuration.PCF.CloseSlopeBias = closePCFSlopeBias;
+        Configuration.PCF.CloseTerrainBias = closePCFTerrainBias;
         Configuration.IntensityScalar = intensityScalar;
         Configuration.SaveSettings();
     }
@@ -677,6 +725,11 @@ void ImGuiManager::RenderDebugInterface() {
         ImGui::Text("  Status: %s", DistantLand::forwardSSAOActive ? "Active" : "Inactive");
         ImGui::Checkbox("Show SSAO Viewer", &showSSAOInterface);
         ImGui::SetItemTooltip("Preview the raw or blurred SSAO texture generated before Scene 0 replay.");
+
+        ImGui::Separator();
+        ImGui::Text("Shadow Map");
+        ImGui::Checkbox("Show Shadow Map Viewer", &showShadowInterface);
+        ImGui::SetItemTooltip("Preview the full horizontal cascade atlas.");
 
         ImGui::Separator();
         ImGui::Text("Velocity Buffer");
@@ -875,7 +928,7 @@ void ImGuiManager::RenderDebugInterface() {
 
     // Update mouse cursor visibility based on interface state
     ImGuiIO& io = ImGui::GetIO();
-    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showVelocityInterface || showFrameEventLog;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showShadowInterface || showVelocityInterface || showFrameEventLog;
 }
 
 void ImGuiManager::ToggleDebugInterface() {
@@ -883,7 +936,7 @@ void ImGuiManager::ToggleDebugInterface() {
 
     // Update mouse cursor visibility
     ImGuiIO& io = ImGui::GetIO();
-    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showVelocityInterface || showFrameEventLog;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showShadowInterface || showVelocityInterface || showFrameEventLog;
 }
 
 // Debug control getters (Recording/Replay/Immediate/Depth always enabled)
@@ -1321,7 +1374,7 @@ void ImGuiManager::ToggleFrameEventLog() {
     showFrameEventLog = !showFrameEventLog;
 
     ImGuiIO& io = ImGui::GetIO();
-    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showVelocityInterface || showFrameEventLog;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showShadowInterface || showVelocityInterface || showFrameEventLog;
 }
 
 void ImGuiManager::RenderFrameEventLog() {
@@ -1781,7 +1834,7 @@ void ImGuiManager::RenderHiZInterface() {
 
     // Update mouse cursor visibility based on interface state
     ImGuiIO& io = ImGui::GetIO();
-    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showVelocityInterface || showFrameEventLog;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showShadowInterface || showVelocityInterface || showFrameEventLog;
 }
 
 void ImGuiManager::ToggleHiZInterface() {
@@ -1789,7 +1842,7 @@ void ImGuiManager::ToggleHiZInterface() {
 
     // Update mouse cursor visibility
     ImGuiIO& io = ImGui::GetIO();
-    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showVelocityInterface || showFrameEventLog;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showShadowInterface || showVelocityInterface || showFrameEventLog;
 }
 
 bool ImGuiManager::GetShowHiZInterface() {
@@ -1846,49 +1899,104 @@ void ImGuiManager::RenderSSAOInterface() {
         }
     }
     ImGui::End();
+}
 
-    // Velocity Buffer Viewer Window
-    if (showVelocityInterface) {
-        ImGui::SetNextWindowSize(ImVec2(400, 450), ImGuiCond_FirstUseEver);
-        ImGui::Begin("Velocity Buffer", &showVelocityInterface);
+void ImGuiManager::RenderShadowInterface() {
+    ImGui::SetNextWindowPos(ImVec2(980, 10), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(900, 380), ImGuiCond_FirstUseEver);
 
-        static float velocityZoom = 1.0f;
-        static float velocityScale = 10.0f;
+    if (ImGui::Begin("Shadow Map Atlas", &showShadowInterface)) {
+        static int shadowAtlasMode = 0;
+        static float shadowZoom = 1.0f;
 
-        ImGui::Checkbox("Enable Velocity Buffer", &DistantLand::velocityBufferEnabled);
-        ImGui::SliderFloat("Zoom", &velocityZoom, 0.25f, 2.0f, "%.2fx");
-        ImGui::SliderFloat("Display Scale", &velocityScale, 1.0f, 50.0f, "%.1f");
-        ImGui::SetItemTooltip("Amplify velocity visualization (actual values are typically small).");
+        const char* atlasModes[] = {
+            "Raw depth atlas (HLSL input)",
+            "Filtered atlas (legacy/grass)",
+            "Horizontal blur scratch"
+        };
+        ImGui::Combo("Atlas", &shadowAtlasMode, atlasModes, 3);
+
+        ImGui::SliderFloat("Zoom", &shadowZoom, 0.10f, 4.0f, "%.2fx");
+        ImGui::Text("%s", atlasModes[shadowAtlasMode]);
         ImGui::Separator();
 
-        IDirect3DTexture9* texture = DistantLand::texVelocity;
-        if (texture && DistantLand::velocityBufferEnabled) {
+        IDirect3DTexture9* texture = shadowAtlasMode == 0 ? DistantLand::texShadow :
+            (shadowAtlasMode == 1 ? DistantLand::texSoftShadow : DistantLand::texShadowBlur);
+
+        if (texture) {
             D3DSURFACE_DESC desc = {};
             if (SUCCEEDED(texture->GetLevelDesc(0, &desc))) {
-                ImGui::Text("Resolution: %ux%u (G16R16F)", desc.Width, desc.Height);
-                ImGui::Text("Red = X velocity, Green = Y velocity");
-                ImGui::BeginChild("VelocityTexture", ImVec2(0.0f, 0.0f), true, ImGuiWindowFlags_HorizontalScrollbar);
-                ImVec2 contentSize = ImGui::GetContentRegionAvail();
-                float fitScale = 1.0f;
-                if (desc.Width > 0 && desc.Height > 0) {
-                    fitScale = std::min(contentSize.x / (float)desc.Width, contentSize.y / (float)desc.Height);
+                ImGui::Text("Resolution: %ux%u", desc.Width, desc.Height);
+                ImGui::BeginChild("ShadowMapAtlasTexture", ImVec2(0.0f, 0.0f), true, ImGuiWindowFlags_HorizontalScrollbar);
+
+                ImVec2 avail = ImGui::GetContentRegionAvail();
+                float fitScaleX = desc.Width > 0 ? avail.x / (float)desc.Width : 1.0f;
+                float fitScaleY = desc.Height > 0 ? avail.y / (float)desc.Height : 1.0f;
+                float fitScale = fitScaleX < fitScaleY ? fitScaleX : fitScaleY;
+                if (fitScale > 1.0f) {
+                    fitScale = 1.0f;
                 }
                 if (fitScale <= 0.0f) {
                     fitScale = 1.0f;
                 }
-                float displayScale = fitScale * velocityZoom;
+
+                float displayScale = fitScale * shadowZoom;
                 ImGui::Image((void*)texture, ImVec2(desc.Width * displayScale, desc.Height * displayScale));
                 ImGui::EndChild();
             } else {
-                ImGui::Text("Unable to query velocity texture description.");
+                ImGui::Text("Unable to query shadow texture description.");
             }
         } else {
-            ImGui::Text("No velocity texture available.");
-            ImGui::Text("Enable velocity buffer and HLSL mode to generate.");
+            ImGui::Text("No shadow map texture available yet.");
+            ImGui::Text("Enable distant land shadows and render a frame.");
         }
-        ImGui::End();
     }
+    ImGui::End();
 
     ImGuiIO& io = ImGui::GetIO();
-    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showVelocityInterface || showFrameEventLog;
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showShadowInterface || showVelocityInterface || showFrameEventLog;
+}
+
+void ImGuiManager::RenderVelocityInterface() {
+    ImGui::SetNextWindowSize(ImVec2(400, 450), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Velocity Buffer", &showVelocityInterface);
+
+    static float velocityZoom = 1.0f;
+    static float velocityScale = 10.0f;
+
+    ImGui::Checkbox("Enable Velocity Buffer", &DistantLand::velocityBufferEnabled);
+    ImGui::SliderFloat("Zoom", &velocityZoom, 0.25f, 2.0f, "%.2fx");
+    ImGui::SliderFloat("Display Scale", &velocityScale, 1.0f, 50.0f, "%.1f");
+    ImGui::SetItemTooltip("Amplify velocity visualization (actual values are typically small).");
+    ImGui::Separator();
+
+    IDirect3DTexture9* texture = DistantLand::texVelocity;
+    if (texture && DistantLand::velocityBufferEnabled) {
+        D3DSURFACE_DESC desc = {};
+        if (SUCCEEDED(texture->GetLevelDesc(0, &desc))) {
+            ImGui::Text("Resolution: %ux%u (G16R16F)", desc.Width, desc.Height);
+            ImGui::Text("Red = X velocity, Green = Y velocity");
+            ImGui::BeginChild("VelocityTexture", ImVec2(0.0f, 0.0f), true, ImGuiWindowFlags_HorizontalScrollbar);
+            ImVec2 contentSize = ImGui::GetContentRegionAvail();
+            float fitScale = 1.0f;
+            if (desc.Width > 0 && desc.Height > 0) {
+                fitScale = std::min(contentSize.x / (float)desc.Width, contentSize.y / (float)desc.Height);
+            }
+            if (fitScale <= 0.0f) {
+                fitScale = 1.0f;
+            }
+            float displayScale = fitScale * velocityZoom;
+            ImGui::Image((void*)texture, ImVec2(desc.Width * displayScale, desc.Height * displayScale));
+            ImGui::EndChild();
+        } else {
+            ImGui::Text("Unable to query velocity texture description.");
+        }
+    } else {
+        ImGui::Text("No velocity texture available.");
+        ImGui::Text("Enable velocity buffer and HLSL mode to generate.");
+    }
+    ImGui::End();
+
+    ImGuiIO& io = ImGui::GetIO();
+    io.MouseDrawCursor = showDebugInterface || showPCFInterface || showHiZInterface || showSSAOInterface || showShadowInterface || showVelocityInterface || showFrameEventLog;
 }

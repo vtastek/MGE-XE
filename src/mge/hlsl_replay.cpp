@@ -41,13 +41,16 @@ static void computeShadowCascadeDepths(float outDepths[4]) {
     const float nearClip = 1.0f;
     const float shadowDistance = ImGuiManager::GetShadowDistance();
     const float splitLambda = ImGuiManager::GetSplitLambda();
+    const float oldNearFarSplitP = 0.5f;
+    const float logSplit = nearClip * std::pow(shadowDistance / nearClip, oldNearFarSplitP);
+    const float linearSplit = nearClip + (shadowDistance - nearClip) * oldNearFarSplitP;
+    const float oldNearFarSplit = splitLambda * logSplit + (1.0f - splitLambda) * linearSplit;
+    const float closeSplit = std::min(
+        ImGuiManager::GetCloseCascadeDistance(),
+        std::max(nearClip, oldNearFarSplit - 1.0f));
 
-    for (int i = 1; i < kShadowCascadeCount; ++i) {
-        float p = (float)i / (float)kShadowCascadeCount;
-        float logSplit = nearClip * std::pow(shadowDistance / nearClip, p);
-        float linearSplit = nearClip + (shadowDistance - nearClip) * p;
-        outDepths[i - 1] = splitLambda * logSplit + (1.0f - splitLambda) * linearSplit;
-    }
+    outDepths[0] = closeSplit;
+    outDepths[1] = oldNearFarSplit;
     outDepths[2] = shadowDistance;
     outDepths[3] = 0.0f;
 }
@@ -135,6 +138,30 @@ static void setConstantF(D3DCommandBuffer* cmdBuf, IDirect3DDevice9* device, boo
         if (isVS) device->SetVertexShaderConstantF(reg, data, count);
         else device->SetPixelShaderConstantF(reg, data, count);
     }
+}
+
+static void setCloseCascadeShadowParams(D3DCommandBuffer* cmdBuf, IDirect3DDevice9* device) {
+    float closeBiasParams[4] = {
+        ImGuiManager::GetClosePCFBias(),
+        ImGuiManager::GetClosePCFBias2(),
+        ImGuiManager::GetClosePCFSlopeBias(),
+        ImGuiManager::GetClosePCFTerrainBias()
+    };
+    float closeFilterParams[4] = {
+        ImGuiManager::GetClosePCFFilterSize(),
+        0.0f,
+        0.0f,
+        0.0f
+    };
+
+    setConstantF(cmdBuf, device, false, 44, closeBiasParams, 1);
+    setConstantF(cmdBuf, device, false, 45, closeFilterParams, 1);
+}
+
+static void setTerrainShadowParams(D3DCommandBuffer* cmdBuf, IDirect3DDevice9* device, FixedFunctionShader::ConstReg reg, float isTerrain) {
+    float terrainParams[4] = { isTerrain, ImGuiManager::GetPCFTerrainBias(), 0.0f, 0.0f };
+    UINT targetReg = reg.reg != FixedFunctionShader::REG_INVALID ? reg.reg : 25;
+    setConstantF(cmdBuf, device, false, targetReg, terrainParams, 1);
 }
 
 // Apply complete device state from snapshot to command buffer or device directly.
@@ -346,9 +373,10 @@ void FixedFunctionShader::bindShaderTextures(const ShaderKey& sk, const Rendered
         }
     }
 
-    // Slot 4: Shadow map
+    // Slot 4: raw shadow map for HLSL depth compares.
+    // Legacy effects sample texSoftShadow after the blur pass; HLSL does its own PCF/ESM compares.
     if (sk.hasShadows) {
-        setCachedTexture(device, 4, DistantLand::texSoftShadow);
+        setCachedTexture(device, 4, DistantLand::texShadow);
         // Slot 7: Blue noise texture for shadow PCF
         if (DistantLand::texBlueNoise) {
             setCachedTexture(device, 7, DistantLand::texBlueNoise);
@@ -870,6 +898,7 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         float shadowCascadeDepths[4];
         computeShadowCascadeDepths(shadowCascadeDepths);
         setConstantF(cmdBuf, device, false, 43, shadowCascadeDepths, 1);
+        setCloseCascadeShadowParams(cmdBuf, device);
 
         // Set shadow resolution parameter
         float shadowRcpData[4] = { 1.0f / Configuration.DL.ShadowResolution, 0, 0, 0 };
@@ -1189,6 +1218,7 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         float shadowCascadeDepths[4];
         computeShadowCascadeDepths(shadowCascadeDepths);
         setConstantF(cmdBuf, device, false, 43, shadowCascadeDepths, 1);
+        setCloseCascadeShadowParams(cmdBuf, device);
     }
 
     // Compute lighting data (shared between cmdBuf and device paths)
@@ -1440,11 +1470,11 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             float v[4] = { ImGuiManager::GetPCFSlopeBias(), 0, 0, 0 };
             cmdBuf->recordSetPSConstantF(hlslShader.regPCFSlopeBias.reg, v, 1);
         }
-        // Terrain shadow params (only set if shader has shadows enabled).
-        if (hlslShader.regTerrainShadowParams.reg != REG_INVALID) {
+        // Terrain shadow params. terrainShadowParams is pinned to PS c25, so use
+        // that as a fallback for paths whose dynamic register cache is still cold.
+        if (sk.hasShadows) {
             float isTerrain = (replayCall && replayCall->bin == RenderBin::Terrain) ? 1.0f : 0.0f;
-            float v[4] = { isTerrain, ImGuiManager::GetPCFTerrainBias(), 0, 0 };
-            cmdBuf->recordSetPSConstantF(hlslShader.regTerrainShadowParams.reg, v, 1);
+            setTerrainShadowParams(cmdBuf, device, hlslShader.regTerrainShadowParams, isTerrain);
         }
         if (hlslShader.regDebugMode.reg != REG_INVALID) {
             float v[4] = { (float)ImGuiManager::GetShaderDebugMode(), 0, 0, 0 };
@@ -1613,11 +1643,11 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         if (hPCFBias2) hlslShader.psConstantTable->SetFloat(device, hPCFBias2, ImGuiManager::GetPCFBias2());
         D3DXHANDLE hPCFSlopeBias = hlslShader.psConstantTable->GetConstantByName(NULL, "PCF_slopeBias");
         if (hPCFSlopeBias) hlslShader.psConstantTable->SetFloat(device, hPCFSlopeBias, ImGuiManager::GetPCFSlopeBias());
-        // Terrain shadow params (only set if shader has shadows enabled).
-        if (hlslShader.regTerrainShadowParams.reg != REG_INVALID) {
+        // Terrain shadow params. terrainShadowParams is pinned to PS c25, so use
+        // that as a fallback for paths whose dynamic register cache is still cold.
+        if (sk.hasShadows) {
             float isTerrain = (replayCall && replayCall->bin == RenderBin::Terrain) ? 1.0f : 0.0f;
-            float v[4] = { isTerrain, ImGuiManager::GetPCFTerrainBias(), 0, 0 };
-            device->SetPixelShaderConstantF(hlslShader.regTerrainShadowParams.reg, v, 1);
+            setTerrainShadowParams(nullptr, device, hlslShader.regTerrainShadowParams, isTerrain);
         }
         D3DXHANDLE hDebugMode = hlslShader.psConstantTable->GetConstantByName(NULL, "debugMode");
         if (hDebugMode) hlslShader.psConstantTable->SetInt(device, hDebugMode, ImGuiManager::GetShaderDebugMode());
@@ -3007,6 +3037,7 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                             float shadowCascadeDepths[4];
                             computeShadowCascadeDepths(shadowCascadeDepths);
                             device->SetPixelShaderConstantF(43, shadowCascadeDepths, 1);
+                            setCloseCascadeShadowParams(nullptr, device);
                         }
 
                         // Shadow PS constants - use resolved registers to avoid conflicts.
@@ -3026,12 +3057,11 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                             setIfValid(hlslShader.regPCFMaxPenumbra, 16, ImGuiManager::GetPCFMaxPenumbra());
                             setIfValid(hlslShader.regPCFSlopeBias, 17, ImGuiManager::GetPCFSlopeBias());
 
-                            // Terrain shadow params
-                            if (hlslShader.regTerrainShadowParams.reg != REG_INVALID) {
-                                float isTerrain = (mb.key.bin == (uint8_t)RenderBin::Terrain) ? 1.0f : 0.0f;
-                                float terrainConsts[4] = { isTerrain, ImGuiManager::GetPCFTerrainBias(), 0, 0 };
-                                device->SetPixelShaderConstantF(hlslShader.regTerrainShadowParams.reg, terrainConsts, 1);
-                            }
+                            // Terrain shadow params. terrainShadowParams is pinned
+                            // to PS c25; merged batches may not have resolved the
+                            // dynamic register cache before reaching this path.
+                            float isTerrain = (mb.key.bin == (uint8_t)RenderBin::Terrain) ? 1.0f : 0.0f;
+                            setTerrainShadowParams(nullptr, device, hlslShader.regTerrainShadowParams, isTerrain);
                         }
                     }
 

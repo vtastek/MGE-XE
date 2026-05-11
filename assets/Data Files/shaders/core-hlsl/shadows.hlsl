@@ -28,7 +28,9 @@ float PCF_minPenumbra : register(c15);
 float PCF_maxPenumbra : register(c16);
 float PCF_slopeBias : register(c17);
 matrix shadowViewProjPS[3] : register(c31);
-float4 shadowCascadeDepths : register(c43); // x/y = natural split depths, z = far distance
+float4 shadowCascadeDepths : register(c43); // x = exclusive close split, y = old near/far split, z = far distance
+float4 closePCFBiasParams : register(c44); // x = bias, y = bias2, z = slope bias, w = terrain bias
+float4 closePCFFilterParams : register(c45); // x = filter size
 // Terrain receiver hint + extra near-cascade bias.
 //   .x = isTerrain (0 or 1, set per-draw / per-merged-batch on C++ side)
 //   .y = terrain bias amount (global, from imgui PCF window)
@@ -66,34 +68,13 @@ float2 sampleBlueNoise9(int i) {
     return tex2Dlod(sampBlueNoise, float4((25 + i + 0.5) / 34.0, 0.5, 0, 0)).xy;
 }
 
-// PCF shadow filtering with distance-based penumbra
-float shadowSamplePCF(float4 shadowPos, float2 shadowUV, int cascade, float receiverDepth, float ndotlgeo) {
-    // Blocker search pass using blue noise - find average blocker depth
-    float blockerSum = 0.0;
-    float blockerCount = 0.0;
-
-    // Use 9-sample blue noise pattern for blocker search
-    for (int i = 0; i < 9; i++) {
-        float2 offset = sampleBlueNoise9(i) * shadowRcpRes; // Blue noise within single texel radius
-        // Use tex2D with hardware bilinear filtering instead of tex2Dlod
-        float sampledDepth = tex2D(sampShadow, mapShadowToAtlas(shadowUV + offset, cascade).xy).r / (ESM_scale);
-
-        if (sampledDepth < receiverDepth - PCF_bias) {
-            blockerSum += sampledDepth;
-            blockerCount += 1.0;
-        }
-    }
-
-    float avgBlockerDepth = blockerSum / blockerCount;
-    float penumbraSize = (receiverDepth - avgBlockerDepth) * 100.0; // Scale factor for visibility
-    penumbraSize = penumbraSize * PCF_penumbraScale;
-    penumbraSize = clamp(penumbraSize, PCF_minPenumbra, PCF_maxPenumbra);
-
+// Fixed-radius PCF shadow filtering for the exclusive close cascade.
+float shadowSamplePCF(float4 shadowPos, float2 shadowUV, int cascade, float receiverDepth, float ndotlgeo, float4 biasParams, float filterSize) {
     // Calculate slope bias based on surface angle to light
     // ndotlgeo ranges from 0 (perpendicular) to 1 (parallel)
     // For steep angles (low ndotlgeo), we need more bias
     float slopeFactor = saturate(ndotlgeo * 5); // 0 for parallel surfaces, 1 for perpendicular
-    float dynamicSlopeBias = PCF_slopeBias * slopeFactor;
+    float dynamicSlopeBias = biasParams.z * slopeFactor;
 
     // Calculate partial derivatives for receiver plane depth bias
     float2 shadowMapSize = float2(2048, 2048); // Adjust based on your shadow map size
@@ -110,14 +91,14 @@ float shadowSamplePCF(float4 shadowPos, float2 shadowUV, int cascade, float rece
     float fractionalSamplingError = 2.0 * dot(float2(1.0f, 1.0f) * texelSize, abs(receiverPlaneDepthBias));
     float compareDepth = receiverDepth - min(fractionalSamplingError, 0.01f);
 
-    float finalBias = lerp(PCF_bias, PCF_bias2, step(0.7, ndotlgeo)) + dynamicSlopeBias;
-    finalBias += terrainShadowParams.x * terrainShadowParams.y;
+    float finalBias = lerp(biasParams.x, biasParams.y, step(0.7, ndotlgeo)) + dynamicSlopeBias;
+    finalBias += terrainShadowParams.x * biasParams.w;
     compareDepth -= finalBias;
 
     // PCF filtering pass with blue noise sampling - invert values so shadows=1, lit=0
     float shadow = 1.0;
     float sampleCount = 0.0;
-    float filterRadius = (shadowRcpRes + shadowRcpRes / 2) * penumbraSize * max(0.25, PCF_filterSize * 0.1);
+    float filterRadius = (shadowRcpRes + shadowRcpRes / 2) * max(0.25, filterSize * 0.1);
 
     // Use 25-sample blue noise pattern for main PCF filtering
     for (int i = 0; i < 25; i++) {
@@ -138,11 +119,14 @@ float shadowSamplePCF(float4 shadowPos, float2 shadowUV, int cascade, float rece
 
 // Simple ESM shadow sampling with blur for far cascade
 float shadowSampleESM(float4 shadowPos, float2 shadowUV, int cascade, float receiverDepth, float ndotlgeo) {
+    float4 biasParams = cascade == 0 ? closePCFBiasParams : float4(PCF_bias, PCF_bias2, PCF_slopeBias, terrainShadowParams.y);
+
     // Calculate slope bias based on surface angle to light
     float slopeFactor = 1.0 - pow(ndotlgeo, 11); // 0 for parallel surfaces, 1 for perpendicular
-    float dynamicSlopeBias = PCF_slopeBias * slopeFactor;
+    float dynamicSlopeBias = biasParams.z * slopeFactor;
 
-    float biasLerp = lerp(PCF_bias, PCF_bias2, step(0.4, ndotlgeo)) + dynamicSlopeBias;
+    float biasLerp = lerp(biasParams.x, biasParams.y, step(0.4, ndotlgeo)) + dynamicSlopeBias;
+    biasLerp += terrainShadowParams.x * (cascade == 2 ? 0.0 : biasParams.w);
     float shadow = 0.0;
     float sampleCount = 0.0;
 
@@ -168,11 +152,11 @@ float4 shadowPosFromView(float3 viewPos, int cascade) {
 }
 
 float2 shadowSplitDepths() {
-    float nearSplit = max(shadowCascadeDepths.x, 0.0);
-    float midSplit = shadowCascadeDepths.y > nearSplit
+    float closeSplit = max(shadowCascadeDepths.x, 0.0);
+    float oldNearFarSplit = shadowCascadeDepths.y > closeSplit
         ? shadowCascadeDepths.y
-        : max(nearSplit + 1.0, shadowCascadeDepths.z * 0.5);
-    return float2(nearSplit, midSplit);
+        : max(closeSplit + 1.0, shadowCascadeDepths.z * 0.5);
+    return float2(closeSplit, oldNearFarSplit);
 }
 
 float3 shadowTexelCheckerboard(float3 viewPos, float checkerScale) {
@@ -195,14 +179,14 @@ float3 shadowTexelCheckerboard(float3 viewPos, float checkerScale) {
     float checker0 = fmod(floor(texelPos0.x) + floor(texelPos0.y), 2.0);
     float checker1 = fmod(floor(texelPos1.x) + floor(texelPos1.y), 2.0);
     float checker2 = fmod(floor(texelPos2.x) + floor(texelPos2.y), 2.0);
-    float viewDepth = length(viewPos);
+    float viewDepth = max(viewPos.z, 0.0);
     float2 splitDepths = shadowSplitDepths();
 
-    // Cascade 0 (near): cyan/magenta
+    // Cascade 0 (close): cyan/magenta
     float3 color0A = float3(0.0, 1.0, 1.0);  // cyan
     float3 color0B = float3(1.0, 0.0, 1.0);  // magenta
 
-    // Cascade 1 (near): green/red
+    // Cascade 1 (old near): green/red
     float3 color1A = float3(0.0, 1.0, 0.0);  // green
     float3 color1B = float3(1.0, 0.0, 0.0);  // red
 
@@ -239,11 +223,11 @@ float shadowSample(float3 viewPos, float ndotlgeo, float alphaFlag) {
 
     float shadow0 = alphaFlag > 0.5
         ? shadowSampleESM(shadow0pos, shadowUV0, 0, shadow0pos.z, ndotlgeo)
-        : shadowSamplePCF(shadow0pos, shadowUV0, 0, shadow0pos.z, ndotlgeo);
+        : shadowSamplePCF(shadow0pos, shadowUV0, 0, shadow0pos.z, ndotlgeo, closePCFBiasParams, closePCFFilterParams.x);
     float shadow1 = shadowSampleESM(shadow1pos, shadowUV1, 1, shadow1pos.z, ndotlgeo);
     float shadow2 = shadowSampleESM(shadow2pos, shadowUV2, 2, shadow2pos.z, ndotlgeo);
 
-    float viewDepth = length(viewPos);
+    float viewDepth = max(viewPos.z, 0.0);
     float2 splitDepths = shadowSplitDepths();
 
     if (viewDepth <= splitDepths.x) {

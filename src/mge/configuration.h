@@ -151,6 +151,11 @@ struct ConfigurationStruct {
         float Bias2;
         float SlopeBias;
         float TerrainBias;  // Extra bias added only to terrain receivers in near cascade
+        float CloseFilterSize;
+        float CloseBias;
+        float CloseBias2;
+        float CloseSlopeBias;
+        float CloseTerrainBias;  // Extra bias added only to terrain receivers in the close cascade
     } PCF;
 
     // Linear-light intensity multiplier shared by HLSL FFE and DL HLSL-pipeline
