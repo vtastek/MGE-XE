@@ -275,10 +275,16 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
     static LARGE_INTEGER s_qpcFreq = {};
     if (s_qpcFreq.QuadPart == 0) QueryPerformanceFrequency(&s_qpcFreq);
 
-    LARGE_INTEGER tsBegin;
-    QueryPerformanceCounter(&tsBegin);
+    // Cache the LogDistantPipeline flag once per draw. All per-draw
+    // instrumentation (QPC pairs, counter buckets, peak-tracking, periodic
+    // dumps) gates on this. Off = ~100 us/frame saved in dense PPL scenes
+    // (mostly from skipped QPC pairs; ~30 ns each × ~4 sites × ~900 draws).
+    const bool logPerf = Configuration.LogDistantPipeline;
 
-    {
+    LARGE_INTEGER tsBegin{};
+    if (logPerf) QueryPerformanceCounter(&tsBegin);
+
+    if (logPerf) {
         const size_t activeSize = lightrs->active.size();
         ++s_callCount;
         if (activeSize <= 4) ++s_engineBuckets[0];
@@ -312,18 +318,21 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
         std::min<unsigned int>(static_cast<unsigned int>(snapshotLights.size()), kMaxTexLights);
     const bool useTextureLights = (snapshotCount > 0) && (texLightData != nullptr);
 
-    // Instrument: snapshot size distribution.
-    if (snapshotCount == 0)         ++s_msocBuckets[0];
-    else if (snapshotCount <= 8)    ++s_msocBuckets[1];
-    else if (snapshotCount <= 16)   ++s_msocBuckets[2];
-    else if (snapshotCount <= 32)   ++s_msocBuckets[3];
-    else if (snapshotCount <= 48)   ++s_msocBuckets[4];
-    else if (snapshotCount <= 64)   ++s_msocBuckets[5];
-    else if (snapshotCount <= 128)  ++s_msocBuckets[6];
-    else                            ++s_msocBuckets[7];
-    if (snapshotCount > s_peakMsoc) {
-        s_peakMsoc = snapshotCount;
-        LOG::logline("-- [LIGHTS-INSTR] new peak snapshotCount = %zu", (size_t)snapshotCount);
+    // Instrument: snapshot size distribution. Gated by logPerf so the bucket
+    // increments + peak-tracking + log all skip when LogDistantPipeline is off.
+    if (logPerf) {
+        if (snapshotCount == 0)         ++s_msocBuckets[0];
+        else if (snapshotCount <= 8)    ++s_msocBuckets[1];
+        else if (snapshotCount <= 16)   ++s_msocBuckets[2];
+        else if (snapshotCount <= 32)   ++s_msocBuckets[3];
+        else if (snapshotCount <= 48)   ++s_msocBuckets[4];
+        else if (snapshotCount <= 64)   ++s_msocBuckets[5];
+        else if (snapshotCount <= 128)  ++s_msocBuckets[6];
+        else                            ++s_msocBuckets[7];
+        if (snapshotCount > s_peakMsoc) {
+            s_peakMsoc = snapshotCount;
+            LOG::logline("-- [LIGHTS-INSTR] new peak snapshotCount = %zu", (size_t)snapshotCount);
+        }
     }
 
     // _Claude_ Per-mesh light selection — hoisted above ShaderKey so
@@ -361,8 +370,8 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
         const bool needUpload = (currentRev != lastUploadedRevision);
 
         if (needUpload && texLightData) {
-            LARGE_INTEGER tsUploadBegin;
-            QueryPerformanceCounter(&tsUploadBegin);
+            LARGE_INTEGER tsUploadBegin{};
+            if (logPerf) QueryPerformanceCounter(&tsUploadBegin);
             D3DLOCKED_RECT locked;
             if (SUCCEEDED(texLightData->LockRect(0, &locked, nullptr, D3DLOCK_DISCARD))) {
                 float* dst = (float*)locked.pBits;
@@ -392,15 +401,17 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
                 lastUploadedPointCount = snapshotCount;
                 memset(&s_lastPrecullView, 0, sizeof(s_lastPrecullView));
             }
-            LARGE_INTEGER tsUploadEnd;
-            QueryPerformanceCounter(&tsUploadEnd);
-            const unsigned long long uploadTicks =
-                static_cast<unsigned long long>(tsUploadEnd.QuadPart - tsUploadBegin.QuadPart);
-            if (s_qpcFreq.QuadPart > 0) {
-                s_uploadsTotalNs +=
-                    uploadTicks * 1000000000ULL / static_cast<unsigned long long>(s_qpcFreq.QuadPart);
+            if (logPerf) {
+                LARGE_INTEGER tsUploadEnd;
+                QueryPerformanceCounter(&tsUploadEnd);
+                const unsigned long long uploadTicks =
+                    static_cast<unsigned long long>(tsUploadEnd.QuadPart - tsUploadBegin.QuadPart);
+                if (s_qpcFreq.QuadPart > 0) {
+                    s_uploadsTotalNs +=
+                        uploadTicks * 1000000000ULL / static_cast<unsigned long long>(s_qpcFreq.QuadPart);
+                }
+                ++s_uploads;
             }
-            ++s_uploads;
         }
 
         // Frustum precull. Decoupled from texture upload — runs whenever
@@ -444,15 +455,17 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
                     s_lightAlive[i] = alive;
                     if (alive) ++aliveCount;
                 }
-                s_preCullAliveSum += aliveCount;
-                s_preCullTotalSum += lastUploadedPointCount;
+                if (logPerf) {
+                    s_preCullAliveSum += aliveCount;
+                    s_preCullTotalSum += lastUploadedPointCount;
+                }
                 s_lastPrecullView = rs->viewTransform;
             }
         }
 
         if (lastUploadedPointCount > 0) {
-            LARGE_INTEGER selBegin;
-            QueryPerformanceCounter(&selBegin);
+            LARGE_INTEGER selBegin{};
+            if (logPerf) QueryPerformanceCounter(&selBegin);
 
             D3DXVECTOR3 bMin, bMax;
             if (!computeBoundingBox(rs, bMin, bMax)) {
@@ -496,26 +509,30 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
                 candidateCount = kMaxIndicesPerMesh;
             }
 
-            if (candidateCount == 0)                       ++s_selectedBuckets[0];
-            else if (candidateCount <= 4)                  ++s_selectedBuckets[1];
-            else if (candidateCount <= 8)                  ++s_selectedBuckets[2];
-            else if (candidateCount <= 16)                 ++s_selectedBuckets[3];
-            else if (candidateCount < kMaxIndicesPerMesh)  ++s_selectedBuckets[4];
-            else                                           ++s_selectedBuckets[5];
+            if (logPerf) {
+                if (candidateCount == 0)                       ++s_selectedBuckets[0];
+                else if (candidateCount <= 4)                  ++s_selectedBuckets[1];
+                else if (candidateCount <= 8)                  ++s_selectedBuckets[2];
+                else if (candidateCount <= 16)                 ++s_selectedBuckets[3];
+                else if (candidateCount < kMaxIndicesPerMesh)  ++s_selectedBuckets[4];
+                else                                           ++s_selectedBuckets[5];
+            }
 
             for (unsigned int j = 0; j < candidateCount; ++j) {
                 idxFloats[j] = (float)candidates[j].texIdx;
             }
 
-            LARGE_INTEGER selEnd;
-            QueryPerformanceCounter(&selEnd);
-            const unsigned long long selDeltaTicks =
-                (unsigned long long)(selEnd.QuadPart - selBegin.QuadPart);
-            if (s_qpcFreq.QuadPart > 0) {
-                s_selectionTotalNs +=
-                    selDeltaTicks * 1000000000ULL / (unsigned long long)s_qpcFreq.QuadPart;
+            if (logPerf) {
+                LARGE_INTEGER selEnd;
+                QueryPerformanceCounter(&selEnd);
+                const unsigned long long selDeltaTicks =
+                    (unsigned long long)(selEnd.QuadPart - selBegin.QuadPart);
+                if (s_qpcFreq.QuadPart > 0) {
+                    s_selectionTotalNs +=
+                        selDeltaTicks * 1000000000ULL / (unsigned long long)s_qpcFreq.QuadPart;
+                }
+                ++s_selectionCalls;
             }
-            ++s_selectionCalls;
         }
     }
 
@@ -767,8 +784,10 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
     // Instrument: end QPC, attribute the elapsed time to the variant bucket
     // selected for this draw, and emit a periodic histogram + per-variant
     // averages. variantIdx mirrors the precache labelling: 0=no point lights,
-    // 1=4 lights, 2=8 lights, 3=64 (msoc-emit).
-    {
+    // 1=4 lights, 2=8 lights, 3=64 (msoc-emit). Entire block gated by
+    // logPerf — when off, the per-draw QPC + accumulators + log all skip,
+    // which is the bulk of the per-frame instrumentation overhead.
+    if (logPerf) {
         LARGE_INTEGER tsEnd;
         QueryPerformanceCounter(&tsEnd);
         const unsigned long long deltaTicks =

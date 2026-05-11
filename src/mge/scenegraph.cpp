@@ -297,7 +297,7 @@ namespace MGE::SceneGraph {
                 g_walksTotalNs += deltaNs;
                 ++g_walksWithChange; // async always bumps revision
 
-                if (g_walks - g_lastReportWalks >= 1800) {
+                if (Configuration.LogDistantPipeline && g_walks - g_lastReportWalks >= 1800) {
                     const double avgNs      = (double)g_walksTotalNs / (double)g_walks;
                     const double changeRate = 100.0 * (double)g_walksWithChange / (double)g_walks;
                     LOG::logline("-- [SCENEGRAPH async] walks=%llu totalNs=%llu (avg=%.0fns) changes=%llu (%.0f%%) lights=%zu sun=%zu",
@@ -396,7 +396,7 @@ namespace MGE::SceneGraph {
         g_walksTotalNs += deltaNs;
         if (g_frameRevision != prevRev) ++g_walksWithChange;
 
-        if (g_walks - g_lastReportWalks >= 1800) {
+        if (Configuration.LogDistantPipeline && g_walks - g_lastReportWalks >= 1800) {
             const double avgNs      = (double)g_walksTotalNs / (double)g_walks;
             const double changeRate = 100.0 * (double)g_walksWithChange / (double)g_walks;
             LOG::logline("-- [SCENEGRAPH sync] walks=%llu totalNs=%llu (avg=%.0fns) changes=%llu (%.0f%%) lights=%zu sun=%zu",
