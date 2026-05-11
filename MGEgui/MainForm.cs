@@ -143,6 +143,7 @@ namespace MGEgui {
             { "DLWtrWave", new string [] { "udDLWtrWave", "lDLWtrWave" } },
             { "DLSunShadows", new string[] { "cbDLSunShadows" } },
             { "PerPixelLighting", new string[] { "cbPerPixelLighting" } },
+            { "UseMSOC", new string[] { "cbUseMSOC" } },
             { "LightSettings", new string[] { "bMWLightSettings" } },
 
             /* In-game */
@@ -409,6 +410,11 @@ namespace MGEgui {
         private static INIFile.INIVariableDef iniShadowDetail = new INIFile.INIVariableDef("SunShadowDetail", siniDL, "Sun Shadow Map Resolution", INIFile.INIVariableType.UInt32, "2048", 1024, 2048);
         private static INIFile.INIVariableDef iniPixelLighting = new INIFile.INIVariableDef("PPLighting", siniDL, "Per Pixel Shader", INIFile.INIBoolType.OnOff, "Off");
         private static INIFile.INIVariableDef iniPixelLightingFlags = new INIFile.INIVariableDef("PPLightingFlags", siniDL, "Per Pixel Shader Flags", INIFile.INIVariableType.Dictionary, "Always", pplFlagsDict);
+        // Mirror of Configuration::UseOcclusionCulling. INI key lives in
+        // [Misc] (matches the C++ side at inidata.h) but the UI control is
+        // grouped under the XE feature box on the Distant Land tab for
+        // discoverability.
+        private static INIFile.INIVariableDef iniUseMSOC = new INIFile.INIVariableDef("UseMSOC", siniMisc, "Use Occlusion Culling", INIFile.INIBoolType.Text, "False");
 #endregion
 
         private static INIFile.INIVariableDef[] iniSettings = {
@@ -435,7 +441,8 @@ namespace MGEgui {
             iniInterBeg, iniInterEnd, iniSkyRefl, iniDynRipples,
             iniReflBlur, iniExpFog, iniDLExpMul,
             iniScattering, iniWaveHght, iniCaustics,
-            iniShadows, iniShadowDetail, iniPixelLighting, iniPixelLightingFlags
+            iniShadows, iniShadowDetail, iniPixelLighting, iniPixelLightingFlags,
+            iniUseMSOC
         };
 
         private void LoadGraphicsSettings() {
@@ -548,6 +555,7 @@ namespace MGEgui {
             cmbDLShadowDetail.SelectedIndex = (iniFile.getKeyValue("SunShadowDetail") == 2048) ? 1 : 0;
             cbPerPixelLighting.Checked = (iniFile.getKeyValue("PPLighting") == 1);
             cmbPerPixelLightFlags.SelectedIndex = (int)iniFile.getKeyValue("PPLightingFlags");
+            cbUseMSOC.Checked = (iniFile.getKeyValue("UseMSOC") == 1);
             loading = false;
         }
 
@@ -632,6 +640,7 @@ namespace MGEgui {
             iniFile.setKey("SunShadowDetail", cmbDLShadowDetail.SelectedIndex == 1 ? 2048 : 1024);
             iniFile.setKey("PPLighting", cbPerPixelLighting.Checked);
             iniFile.setKey("PPLightingFlags", cmbPerPixelLightFlags.SelectedIndex);
+            iniFile.setKey("UseMSOC", cbUseMSOC.Checked);
             iniFile.save();
             try {
                 RegistryKey key = Registry.LocalMachine.OpenSubKey(Statics.reg_mw, true);
@@ -1753,6 +1762,16 @@ namespace MGEgui {
                     return;
                 }
             }
+        }
+
+        private void gbXEFeatures_Enter(object sender, EventArgs e)
+        {
+
+        }
+
+        private void cmbDLShadowDetail_SelectedIndexChanged(object sender, EventArgs e)
+        {
+
         }
     }
 

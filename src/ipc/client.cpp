@@ -261,6 +261,24 @@ namespace IPC {
 		return beginRpc(Command::GetVisibleMeshes);
 	}
 
+	bool Client::getVisibleMeshesAllRanges(VecId visibleSet, std::uint8_t rangeCount,
+		const ViewFrustum (&frustums)[3], const D3DXVECTOR4 (&spheres)[3],
+		const DWORD (&setFlags)[3], VisibleSetSort sort)
+	{
+		WAIT_FOR_PREVIOUS_COMMAND;
+
+		auto& params = m_ipcParameters->params.meshAllRangesParams;
+		params.visibleSet = visibleSet;
+		params.sort = sort;
+		params.rangeCount = rangeCount;
+		for (std::uint8_t i = 0; i < 3; ++i) {
+			params.viewFrustum[i] = frustums[i];
+			params.viewSphere[i] = spheres[i];
+			params.setFlags[i] = setFlags[i];
+		}
+		return beginRpc(Command::GetVisibleMeshesAllRanges);
+	}
+
 	bool Client::sortVisibleSet(VecId visibleSet, VisibleSetSort sort) {
 		WAIT_FOR_PREVIOUS_COMMAND;
 

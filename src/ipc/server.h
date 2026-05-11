@@ -45,6 +45,7 @@ namespace IPC {
 		void setWorldSpace();
 		void getVisibleMeshesCoarse();
 		void getVisibleMeshes();
+		void getVisibleMeshesAllRanges();
 		void sortVisibleSet();
 
 	public:

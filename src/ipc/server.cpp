@@ -97,6 +97,9 @@ namespace IPC {
 			case Command::GetVisibleMeshes:
 				getVisibleMeshes();
 				break;
+			case Command::GetVisibleMeshesAllRanges:
+				getVisibleMeshesAllRanges();
+				break;
 			case Command::SortVisibleSet:
 				sortVisibleSet();
 				break;
@@ -203,6 +206,25 @@ namespace IPC {
 		auto& params = m_ipcParameters->params.meshParams;
 		auto& vec = getVec<RenderMesh>(params.visibleSet);
 		DistantLandShare::getVisibleMeshes(vec, params.viewFrustum, params.viewSphere, params.sort, params.setFlags);
+	}
+
+	// Batched all-ranges variant. Runs each of the rangeCount range queries
+	// (Near/Far/VeryFar) into the same vec, then applies the requested sort
+	// once over the merged set. Saves 3 client-server round trips vs the
+	// per-range RPC sequence.
+	void Server::getVisibleMeshesAllRanges() {
+		auto& params = m_ipcParameters->params.meshAllRangesParams;
+		auto& vec = getVec<RenderMesh>(params.visibleSet);
+		// Sort runs once at the end across the merged set — pass None to
+		// the per-range fetches so they don't sort intermediate state.
+		for (std::uint8_t i = 0; i < params.rangeCount; ++i) {
+			DistantLandShare::getVisibleMeshes(
+				vec, params.viewFrustum[i], params.viewSphere[i],
+				VisibleSetSort::None, params.setFlags[i]);
+		}
+		if (params.sort != VisibleSetSort::None) {
+			DistantLandShare::sortVisibleSet(vec, params.sort);
+		}
 	}
 
 	void Server::sortVisibleSet() {

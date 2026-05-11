@@ -236,7 +236,19 @@ public:
     // renderexterior.cpp). Called from release() so the malloc'd buffers
     // don't leak across renderer init/release cycles.
     static void shutdownHorizonWorkspace();
-    static void cullDistantStatics(const D3DXMATRIX* view, const D3DXMATRIX* proj);
+    // Two-phase culling so the IPC server's quadtree work overlaps with
+    // the rest of the frame instead of blocking the main thread.
+    //
+    //   _kickoff issues the batched 3-range visibility RPC (or the
+    //   equivalent synchronous quadtree query in the non-IPC path) and
+    //   returns immediately. Must be called once mwView is finalized.
+    //
+    //   _finish blocks until the visible set is populated and then runs
+    //   applyMSOCToDistantStatics over it. Must be called before any
+    //   consumer of the visible set (renderDepth:statics,
+    //   renderDistantStatics, water-reflection statics).
+    static void cullDistantStatics_kickoff(const D3DXMATRIX* view, const D3DXMATRIX* proj);
+    static void cullDistantStatics_finish();
     static void renderDistantStatics();
 
     // MSOC occlusion verdict pass — walks the visible set, runs the

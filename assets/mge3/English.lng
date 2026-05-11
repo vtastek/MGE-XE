@@ -121,6 +121,7 @@ cbIdle = "CPU idle"
 cbImportIni = "Import Morrowind.ini"
 cbMenuCaching = "Pause world rendering in menus"
 cbPerPixelLighting = "Per-pixel ligh&ting shader"
+cbUseMSOC = "Use &MSOC occlusion culling"
 cbReduceTextureMemUse = "Reduce texture memory use"
 cbScreenshots = "Allow screenshots"
 cbShowFPS = "Show FPS"
@@ -311,6 +312,7 @@ DLWtrCaust = "This sets the intensity of underwater caustic lighting in percent.
 DLWtrWave = "This sets the height of water waves in Morrowind units.\nA graphics card with vertex texture fetch support is required for this feature.\nSuggested value for wave height is 30-50."
 PerPixelLighting = "Replaces Morrowind's rendering with a shader-based system that delivers better quality dynamic lighting.\n\n* Uses per-pixel instead of per-vertex lighting, improving lighting on large polygons.\n* Combines light from multiple light sources correctly.\n* Renders higher dynamic range lighting from sunlight.\n* Generally expensive to render, reducing FPS by 10-20%."
 LightSettings = "Requires per-pixel lighting to be enabled. Adjusts the brightness of sunlight and ambient light in exteriors, allowing brighter than normal lighting."
+UseMSOC = "Enables communication with the MSOC plugin (msoc.dll, shipped via MWSE).\nWhen on, MGE-XE queries the plugin's occlusion mask to cull distant statics that are hidden behind near-scene geometry.\nNo effect if the plugin isn't installed or doesn't export the occlusion-query API."
 
 ; In-game tab
 DisableMGE = "Disables all MGE rendering and features except for resolution settings.\nNote that this doesn't disable MWSE, so you don't need to run its external version."

@@ -121,6 +121,12 @@ namespace IPC {
         GetVisibleMeshesCoarse,
         GetVisibleMeshes,
         SortVisibleSet,
+        // Batched variant of GetVisibleMeshes: runs all 3 distant-statics
+        // range queries (Near/Far/VeryFar) plus the sort in one RPC,
+        // collapsing 4 sequential client-server round trips into 1. Used
+        // by DistantLand::cullDistantStatics_kickoff to let the server-
+        // side quadtree work overlap with shadow / curtain rendering.
+        GetVisibleMeshesAllRanges,
     };
 
     struct AllocVecParameters {
@@ -180,6 +186,18 @@ namespace IPC {
         IN D3DXVECTOR4 viewSphere;
     };
 
+    // Batched 3-range variant. rangeCount selects how many entries of the
+    // arrays are live (1..3). Total size ≈ 3 × (96 + 16 + 4) + small =
+    // ~360 bytes, well under the union budget.
+    struct GetMeshesAllRangesParameters {
+        IN VecId visibleSet;
+        IN VisibleSetSort sort;
+        IN std::uint8_t rangeCount;
+        IN ViewFrustum viewFrustum[3];
+        IN D3DXVECTOR4 viewSphere[3];
+        IN DWORD setFlags[3];
+    };
+
 	struct Parameters {
         Command command;
         union {
@@ -190,6 +208,7 @@ namespace IPC {
             InitLandscapeParameters initLandscapeParams;
             SetWorldSpaceParameters worldSpaceParams;
             GetMeshesParameters meshParams;
+            GetMeshesAllRangesParameters meshAllRangesParams;
         } params;
 	};
 }

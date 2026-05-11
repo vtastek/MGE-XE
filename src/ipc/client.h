@@ -213,6 +213,18 @@ namespace IPC {
 		bool getVisibleMeshes(VecId visibleSet, const ViewFrustum& viewFrustum, const D3DXVECTOR4& viewSphere, DWORD setFlags, VisibleSetSort sort = VisibleSetSort::None);
 
 		/**
+		* @brief Batched 3-range variant of getVisibleMeshes. Runs all
+		*        active range queries plus the sort in a single RPC so
+		*        the server-side work can overlap with main-thread work
+		*        between kick-off and the matching waitForCompletion.
+		* @param rangeCount Number of active entries in the arrays (1..3).
+		*                   Entries with setFlags=0 are skipped server-side.
+		*/
+		bool getVisibleMeshesAllRanges(VecId visibleSet, std::uint8_t rangeCount,
+			const ViewFrustum (&frustums)[3], const D3DXVECTOR4 (&spheres)[3],
+			const DWORD (&setFlags)[3], VisibleSetSort sort);
+
+		/**
 		* @brief Asynchronously sort an already-populated visible set.
 		* @param visibleSet ID of a filled shared vector of RenderMesh objects.
 		* @param sort The type of sort desired.

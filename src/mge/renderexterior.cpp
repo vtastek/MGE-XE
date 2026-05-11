@@ -488,8 +488,18 @@ void DistantLand::renderDistantLandZ() {
     }
 }
 
-void DistantLand::cullDistantStatics(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
-    MGE_SCOPED_TIMER("cullDistantStatics");
+// Cross-phase scratch for the non-IPC diagnostic counters. Populated by
+// _kickoff (which performs the synchronous quadtree queries when the
+// IPC path is disabled) and consumed by _finish's log block.
+namespace {
+    unsigned g_cullDiagNearCount    = 0;
+    unsigned g_cullDiagFarCount     = 0;
+    unsigned g_cullDiagVeryFarCount = 0;
+}
+
+void DistantLand::cullDistantStatics_kickoff(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
+    MGE_SCOPED_TIMER("cullDistantStatics:kickoff");
+
     D3DXMATRIX ds_proj = *proj, ds_viewproj;
     D3DXVECTOR4 viewsphere(eyePos.x, eyePos.y, eyePos.z, 0);
     float zn = nearViewRange - 768.0f, zf = zn;
@@ -501,75 +511,104 @@ void DistantLand::cullDistantStatics(const D3DXMATRIX* view, const D3DXMATRIX* p
         visDistant.RemoveAll();
     }
 
-    // Per-bucket diagnostics: counts only available in the
-    // non-IPC path (GetVisibleMeshes is synchronous). In IPC mode
-    // getVisibleMeshes is async and the totals only materialize after
-    // waitForCompletion below — we then log the total without a
-    // bucket breakdown. Snapshotted via size deltas across the three
-    // range fetches.
+    g_cullDiagNearCount = g_cullDiagFarCount = g_cullDiagVeryFarCount = 0;
+
     const bool useIpc = Configuration.UseSharedMemory;
-    unsigned diagNearCount = 0, diagFarCount = 0, diagVeryFarCount = 0;
-    unsigned prevSize = 0;
 
-    zf = std::min(Configuration.DL.NearStaticEnd * kCellSize, cullDist);
-    if (zn < zf) {
-        editProjectionZ(&ds_proj, zn, zf);
-        ds_viewproj = (*view) * ds_proj;
-        ViewFrustum range_frustum(&ds_viewproj);
-        viewsphere.w = zf;
-        if (useIpc) {
-            ipcClient.getVisibleMeshes(visDistantSharedId, range_frustum, viewsphere, VIS_NEAR);
-        } else {
-            DistantLandShare::currentWorldSpace->NearStatics->GetVisibleMeshes(range_frustum, viewsphere, visDistant);
-            diagNearCount = (unsigned)visDistant.Size() - prevSize;
-            prevSize = (unsigned)visDistant.Size();
-        }
-    }
-
-    zf = std::min(Configuration.DL.FarStaticEnd * kCellSize, cullDist);
-    if (zn < zf) {
-        editProjectionZ(&ds_proj, zn, zf);
-        ds_viewproj = (*view) * ds_proj;
-        ViewFrustum range_frustum(&ds_viewproj);
-        viewsphere.w = zf;
-        if (useIpc) {
-            ipcClient.getVisibleMeshes(visDistantSharedId, range_frustum, viewsphere, VIS_FAR);
-        } else {
-            DistantLandShare::currentWorldSpace->FarStatics->GetVisibleMeshes(range_frustum, viewsphere, visDistant);
-            diagFarCount = (unsigned)visDistant.Size() - prevSize;
-            prevSize = (unsigned)visDistant.Size();
-        }
-    }
-
-    zf = std::min(Configuration.DL.VeryFarStaticEnd * kCellSize, cullDist);
-    if (zn < zf) {
-        editProjectionZ(&ds_proj, zn, zf);
-        ds_viewproj = (*view) * ds_proj;
-        ViewFrustum range_frustum(&ds_viewproj);
-        viewsphere.w = zf;
-        if (useIpc) {
-            ipcClient.getVisibleMeshes(visDistantSharedId, range_frustum, viewsphere, VIS_VERY_FAR);
-        } else {
-            DistantLandShare::currentWorldSpace->VeryFarStatics->GetVisibleMeshes(range_frustum, viewsphere, visDistant);
-            diagVeryFarCount = (unsigned)visDistant.Size() - prevSize;
-            prevSize = (unsigned)visDistant.Size();
+    // Pack the per-range parameters once; we use them either to populate
+    // the batched RPC (IPC path) or to drive the local quadtree queries
+    // sequentially (non-IPC path).
+    struct Range {
+        DWORD flag;
+        ViewFrustum frustum;
+        D3DXVECTOR4 sphere;
+        bool active;
+    };
+    Range ranges[3] = {
+        { VIS_NEAR,     ViewFrustum(&ds_viewproj), viewsphere, false },
+        { VIS_FAR,      ViewFrustum(&ds_viewproj), viewsphere, false },
+        { VIS_VERY_FAR, ViewFrustum(&ds_viewproj), viewsphere, false },
+    };
+    const float rangeEnds[3] = {
+        Configuration.DL.NearStaticEnd     * kCellSize,
+        Configuration.DL.FarStaticEnd      * kCellSize,
+        Configuration.DL.VeryFarStaticEnd  * kCellSize,
+    };
+    for (int i = 0; i < 3; ++i) {
+        zf = std::min(rangeEnds[i], cullDist);
+        if (zn < zf) {
+            editProjectionZ(&ds_proj, zn, zf);
+            ds_viewproj = (*view) * ds_proj;
+            ranges[i].frustum = ViewFrustum(&ds_viewproj);
+            ranges[i].sphere.w = zf;
+            ranges[i].active = true;
         }
     }
 
     if (useIpc) {
-        ipcClient.sortVisibleSet(visDistantSharedId, VisibleSetSort::ByState);
-        ipcClient.waitForCompletion();
+        // One batched RPC for all 3 fetches + sort. The server-side work
+        // (~265 us median) runs in parallel with renderShadowMap /
+        // renderDistantLand / contributeDistantLandOccluders, which add
+        // up to >1.5 ms of main-thread work — so cullDistantStatics_finish
+        // typically sees the server already done.
+        DWORD setFlags[3] = {
+            ranges[0].active ? ranges[0].flag : 0,
+            ranges[1].active ? ranges[1].flag : 0,
+            ranges[2].active ? ranges[2].flag : 0,
+        };
+        ViewFrustum frustums[3] = {
+            ranges[0].frustum, ranges[1].frustum, ranges[2].frustum,
+        };
+        D3DXVECTOR4 spheres[3] = {
+            ranges[0].sphere,  ranges[1].sphere,  ranges[2].sphere,
+        };
+        ipcClient.getVisibleMeshesAllRanges(
+            visDistantSharedId, 3, frustums, spheres, setFlags,
+            VisibleSetSort::ByState);
     } else {
+        // Non-IPC path: synchronous quadtree work happens on the main
+        // thread here. No pipelining benefit, but the bucket counters are
+        // available right away.
+        unsigned prevSize = 0;
+        if (ranges[0].active) {
+            DistantLandShare::currentWorldSpace->NearStatics->GetVisibleMeshes(
+                ranges[0].frustum, ranges[0].sphere, visDistant);
+            g_cullDiagNearCount = (unsigned)visDistant.Size() - prevSize;
+            prevSize = (unsigned)visDistant.Size();
+        }
+        if (ranges[1].active) {
+            DistantLandShare::currentWorldSpace->FarStatics->GetVisibleMeshes(
+                ranges[1].frustum, ranges[1].sphere, visDistant);
+            g_cullDiagFarCount = (unsigned)visDistant.Size() - prevSize;
+            prevSize = (unsigned)visDistant.Size();
+        }
+        if (ranges[2].active) {
+            DistantLandShare::currentWorldSpace->VeryFarStatics->GetVisibleMeshes(
+                ranges[2].frustum, ranges[2].sphere, visDistant);
+            g_cullDiagVeryFarCount = (unsigned)visDistant.Size() - prevSize;
+        }
         visDistant.SortByState();
+    }
+}
+
+void DistantLand::cullDistantStatics_finish() {
+    MGE_SCOPED_TIMER("cullDistantStatics:finish");
+
+    if (Configuration.UseSharedMemory) {
+        {
+            MGE_SCOPED_TIMER("cullDistantStatics:finishWait");
+            ipcClient.waitForCompletion();
+        }
     }
 
     // Per-frame cull summary + phase-timer flush. Gated by the
     // LogDistantPipeline config flag — off by default. IPC path logs
-    // total only (async fetches mean per-bucket isn't meaningful at
-    // delivery time); non-IPC logs the breakdown.
+    // total only (bucket split is now collapsed inside the batched RPC);
+    // non-IPC logs the breakdown captured during _kickoff.
     if (Configuration.LogDistantPipeline) {
         static int diagFrameCounter = 0;
         if ((diagFrameCounter++ % 60) == 0) {
+            const bool useIpc = Configuration.UseSharedMemory;
             const unsigned total = useIpc
                 ? (unsigned)visDistantShared.Size()
                 : (unsigned)visDistant.Size();
@@ -577,7 +616,10 @@ void DistantLand::cullDistantStatics(const D3DXMATRIX* view, const D3DXMATRIX* p
                 LOG::logline("-- DL statics: total=%u (IPC; bucket split not available)", total);
             } else {
                 LOG::logline("-- DL statics: total=%u  near=%u  far=%u  veryFar=%u",
-                             total, diagNearCount, diagFarCount, diagVeryFarCount);
+                             total,
+                             g_cullDiagNearCount,
+                             g_cullDiagFarCount,
+                             g_cullDiagVeryFarCount);
             }
             MGEPhaseTimers::report();
         }

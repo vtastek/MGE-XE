@@ -52,6 +52,21 @@ void DistantLand::renderStage0() {
             effect->BeginPass(PASS_SETUP);
             effect->EndPass();
 
+            // Distant projection matrix — pulled forward so the IPC
+            // server can start the distant-statics quadtree fetch
+            // immediately, in parallel with renderShadowMap /
+            // renderDistantLand / contributeDistantLandOccluders. The
+            // matched cullDistantStatics_finish() call below picks up
+            // the result.
+            D3DXMATRIX distProj = mwProj;
+            editProjectionZ(&distProj, kDistantNearPlane - 1e-2, Configuration.DL.DrawDist * kCellSize);
+
+            const bool kickedOffDistantStatics =
+                (Configuration.MGEFlags & USE_DISTANT_STATICS) != 0;
+            if (kickedOffDistantStatics) {
+                cullDistantStatics_kickoff(&mwView, &distProj);
+            }
+
             // Shadow map early render
             if (Configuration.MGEFlags & USE_SHADOWS) {
                 if (mwBridge->CellHasWeather() && !mwBridge->IsMenu()) {
@@ -61,10 +76,8 @@ void DistantLand::renderStage0() {
                 }
             }
 
-            // Distant everything; bias the projection matrix such that
-            // distant land gets drawn behind anything Morrowind would draw
-            D3DXMATRIX distProj = mwProj;
-            editProjectionZ(&distProj, kDistantNearPlane - 1e-2, Configuration.DL.DrawDist * kCellSize);
+            // Distant everything; the projection bias above keeps distant
+            // land drawn behind anything Morrowind would draw.
             effect->SetMatrix(ehProj, &distProj);
 
             effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
@@ -86,13 +99,14 @@ void DistantLand::renderStage0() {
                 }
 
                 // Draw distant statics, with alpha dissolve as they pass the near view boundary.
-                // applyMSOCToDistantStatics (inside cullDistantStatics) populates msocOccluded.
-                if (Configuration.MGEFlags & USE_DISTANT_STATICS) {
+                // _finish blocks until the kickoff RPC completes, then
+                // runs applyMSOCToDistantStatics to populate msocOccluded.
+                if (kickedOffDistantStatics) {
                     DWORD p = mwBridge->CellHasWeather() ? PASS_RENDERSTATICSEXTERIOR : PASS_RENDERSTATICSINTERIOR;
                     effect->BeginPass(p);
                     vsr.beginAlphaToCoverage(device);
 
-                    cullDistantStatics(&mwView, &distProj);
+                    cullDistantStatics_finish();
                     renderDistantStatics();
 
                     vsr.endAlphaToCoverage(device);
