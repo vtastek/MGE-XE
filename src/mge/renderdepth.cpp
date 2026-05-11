@@ -33,14 +33,18 @@ void DistantLand::renderDepth() {
     effectDepth->EndPass();
 
     // Recorded draw calls
-    effectDepth->BeginPass(PASS_RENDERMWDEPTH);
-    renderDepthRecorded();
-    effectDepth->EndPass();
+    {
+        MGE_SCOPED_TIMER("renderDepth:recorded");
+        effectDepth->BeginPass(PASS_RENDERMWDEPTH);
+        renderDepthRecorded();
+        effectDepth->EndPass();
+    }
 
     if (isDistantCell()) {
         if (!mwBridge->IsUnderwater(eyePos.z)) {
             // Distant land
             if (mwBridge->IsExterior()) {
+                MGE_SCOPED_TIMER("renderDepth:land");
                 effectDepth->BeginPass(PASS_RENDERLANDDEPTH);
                 renderDistantLandZ();
                 effectDepth->EndPass();
@@ -50,19 +54,23 @@ void DistantLand::renderDepth() {
             // color path) has already populated msocOccluded; the depth
             // pass consumes the same skip mask so depth and color agree
             // on which instances are present.
-            effectDepth->BeginPass(PASS_RENDERSTATICSDEPTH);
-            device->SetVertexDeclaration(StaticDecl);
-            const std::uint8_t* skipMask = msocOccluded.empty() ? nullptr : msocOccluded.data();
-            if (Configuration.UseSharedMemory) {
-                visDistantShared.Render(device, effectDepth, effect, &ehTex0, &ehHasAlpha, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT, false, skipMask);
-            } else {
-                visDistant.Render(device, effectDepth, effect, &ehTex0, &ehHasAlpha, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT, false, skipMask);
+            {
+                MGE_SCOPED_TIMER("renderDepth:statics");
+                effectDepth->BeginPass(PASS_RENDERSTATICSDEPTH);
+                device->SetVertexDeclaration(StaticDecl);
+                const std::uint8_t* skipMask = msocOccluded.empty() ? nullptr : msocOccluded.data();
+                if (Configuration.UseSharedMemory) {
+                    visDistantShared.Render(device, effectDepth, effect, &ehTex0, &ehHasAlpha, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT, false, skipMask);
+                } else {
+                    visDistant.Render(device, effectDepth, effect, &ehTex0, &ehHasAlpha, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT, false, skipMask);
+                }
+                effectDepth->EndPass();
             }
-            effectDepth->EndPass();
         }
 
         if (Configuration.MGEFlags & USE_GRASS) {
             // Grass
+            MGE_SCOPED_TIMER("renderDepth:grass");
             effectDepth->BeginPass(PASS_RENDERGRASSDEPTHINST);
             renderGrassInstZ();
             effectDepth->EndPass();
