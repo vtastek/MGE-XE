@@ -30,6 +30,7 @@ float ImGuiManager::pcfBias = 0.0f;              // Depth bias to prevent acne
 float ImGuiManager::pcfBias2 = 0.0015f;          // Second depth bias for lerp
 float ImGuiManager::pcfSlopeBias = 0.0f;         // Slope-based bias to prevent acne on angled surfaces
 float ImGuiManager::pcfTerrainBias = 0.0015f;    // Extra bias for terrain receivers (near cascade, all modes)
+float ImGuiManager::farPCFTerrainBias = 0.0015f; // Far cascade terrain caster bias
 float ImGuiManager::closePCFFilterSize = 24.0f;  // Close cascade filter size in texels
 float ImGuiManager::closePCFBias = 0.0f;
 float ImGuiManager::closePCFBias2 = 0.0f;
@@ -229,6 +230,7 @@ bool ImGuiManager::Initialize(HWND hwnd, IDirect3DDevice9* device) {
     pcfBias2 = Configuration.PCF.Bias2;
     pcfSlopeBias = Configuration.PCF.SlopeBias;
     pcfTerrainBias = Configuration.PCF.TerrainBias;
+    farPCFTerrainBias = Configuration.PCF.FarTerrainBias;
     closePCFFilterSize = Configuration.PCF.CloseFilterSize;
     closePCFBias = Configuration.PCF.CloseBias;
     closePCFBias2 = Configuration.PCF.CloseBias2;
@@ -408,7 +410,8 @@ void ImGuiManager::RenderPCFFilteringInterface() {
         ImGui::SliderFloat("Depth Bias", &pcfBias, 0.0f, 0.01f, "%.4f");
         ImGui::SliderFloat("Depth Bias 2", &pcfBias2, 0.0f, 0.01f, "%.4f");
         ImGui::SliderFloat("Slope Bias", &pcfSlopeBias, 0.0f, 0.01f, "%.4f");
-        ImGui::SliderFloat("Terrain Bias (near)", &pcfTerrainBias, 0.0f, 0.02f, "%.4f");
+        ImGui::SliderFloat("Terrain Caster Bias (near)", &pcfTerrainBias, 0.0f, 0.02f, "%.4f");
+        ImGui::SliderFloat("Terrain Caster Bias (far)", &farPCFTerrainBias, 0.0f, 0.02f, "%.4f");
 
         ImGui::Separator();
         ImGui::Text("Close Cascade");
@@ -416,7 +419,7 @@ void ImGuiManager::RenderPCFFilteringInterface() {
         ImGui::SliderFloat("Close Depth Bias", &closePCFBias, 0.0f, 0.01f, "%.5f");
         ImGui::SliderFloat("Close Depth Bias 2", &closePCFBias2, 0.0f, 0.01f, "%.5f");
         ImGui::SliderFloat("Close Slope Bias", &closePCFSlopeBias, 0.0f, 0.01f, "%.5f");
-        ImGui::SliderFloat("Close Terrain Bias", &closePCFTerrainBias, 0.0f, 0.02f, "%.5f");
+        ImGui::SliderFloat("Close Terrain Caster Bias", &closePCFTerrainBias, 0.0f, 0.02f, "%.5f");
 
         ImGui::Separator();
         ImGui::Text("Frustum-Fitted Cascades");
@@ -465,6 +468,7 @@ void ImGuiManager::RenderPCFFilteringInterface() {
         Configuration.PCF.Bias2 = pcfBias2;
         Configuration.PCF.SlopeBias = pcfSlopeBias;
         Configuration.PCF.TerrainBias = pcfTerrainBias;
+        Configuration.PCF.FarTerrainBias = farPCFTerrainBias;
         Configuration.PCF.CloseFilterSize = closePCFFilterSize;
         Configuration.PCF.CloseBias = closePCFBias;
         Configuration.PCF.CloseBias2 = closePCFBias2;
@@ -488,6 +492,7 @@ float ImGuiManager::GetPCFBias() { return pcfBias; }
 float ImGuiManager::GetPCFBias2() { return pcfBias2; }
 float ImGuiManager::GetPCFSlopeBias() { return pcfSlopeBias; }
 float ImGuiManager::GetPCFTerrainBias() { return pcfTerrainBias; }
+float ImGuiManager::GetFarPCFTerrainBias() { return farPCFTerrainBias; }
 float ImGuiManager::GetClosePCFFilterSize() { return closePCFFilterSize; }
 float ImGuiManager::GetClosePCFBias() { return closePCFBias; }
 float ImGuiManager::GetClosePCFBias2() { return closePCFBias2; }
@@ -525,6 +530,7 @@ void ImGuiManager::TogglePCFInterface() {
         Configuration.PCF.Bias2 = pcfBias2;
         Configuration.PCF.SlopeBias = pcfSlopeBias;
         Configuration.PCF.TerrainBias = pcfTerrainBias;
+        Configuration.PCF.FarTerrainBias = farPCFTerrainBias;
         Configuration.PCF.CloseFilterSize = closePCFFilterSize;
         Configuration.PCF.CloseBias = closePCFBias;
         Configuration.PCF.CloseBias2 = closePCFBias2;

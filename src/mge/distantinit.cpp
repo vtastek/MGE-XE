@@ -177,6 +177,7 @@ D3DXHANDLE DistantLand::ehReflectionView;
 D3DXHANDLE DistantLand::ehReflectionProj;
 D3DXHANDLE DistantLand::ehReflectionWaterLevel;
 D3DXHANDLE DistantLand::ehShadowViewproj;
+D3DXHANDLE DistantLand::ehShadowCasterDepthBias;
 D3DXHANDLE DistantLand::ehVertexBlendState;
 D3DXHANDLE DistantLand::ehVertexBlendPalette;
 D3DXHANDLE DistantLand::ehPrevVertexBlendPalette;
@@ -716,6 +717,10 @@ bool DistantLand::initShader() {
 
     if (!createCoreEffectWithMods("XE Shadowmap.fx", device, features, effectPool, &effectShadow, false)) {
         return false;
+    }
+    ehShadowCasterDepthBias = effectShadow->GetParameterByName(0, "shadowCasterDepthBias");
+    if (ehShadowCasterDepthBias) {
+        effectShadow->SetFloat(ehShadowCasterDepthBias, 0.0f);
     }
     if (!createCoreEffectWithMods("XE Depth.fx", device, features, effectPool, &effectDepth, false)) {
         return false;

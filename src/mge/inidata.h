@@ -295,6 +295,7 @@ const iniSetting iniSettings[] = {
     {&Configuration.PCF.Bias2, t_float, 1, siniRendState, "PCF Depth Bias 2", "0.0015", NULL, MINMAX, 0.0, 0.01},
     {&Configuration.PCF.SlopeBias, t_float, 1, siniRendState, "PCF Slope Bias", "0.0", NULL, MINMAX, 0.0, 0.01},
     {&Configuration.PCF.TerrainBias, t_float, 1, siniRendState, "PCF Terrain Bias", "0.0015", NULL, MINMAX, 0.0, 0.02},
+    {&Configuration.PCF.FarTerrainBias, t_float, 1, siniRendState, "PCF Far Terrain Bias", "0.0015", NULL, MINMAX, 0.0, 0.02},
     {&Configuration.PCF.CloseFilterSize, t_float, 1, siniRendState, "PCF Close Filter Size", "24.0", NULL, MINMAX, 0.1, 32.0},
     {&Configuration.PCF.CloseBias, t_float, 1, siniRendState, "PCF Close Depth Bias", "0.0", NULL, MINMAX, 0.0, 0.01},
     {&Configuration.PCF.CloseBias2, t_float, 1, siniRendState, "PCF Close Depth Bias 2", "0.0", NULL, MINMAX, 0.0, 0.01},

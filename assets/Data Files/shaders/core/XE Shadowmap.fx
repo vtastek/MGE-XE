@@ -12,6 +12,7 @@
 // Shadow caster rendering
 
 static const float shadowMWDepthBias = 2.0e-4;
+float shadowCasterDepthBias = 0.0;
 
 struct ShadowVertOut {
     float4 pos : POSITION;
@@ -98,7 +99,7 @@ float4 ShadowPS(ShadowVertOut IN) : COLOR0 {
         clip(a - 180.0/255.0);
     }
 
-    return ESM_scale * IN.depth;
+    return ESM_scale * saturate(IN.depth + shadowCasterDepthBias);
 }
 
 float4 ShadowMWPS(ShadowVertOut IN) : COLOR0 {

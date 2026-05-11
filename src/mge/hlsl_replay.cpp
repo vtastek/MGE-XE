@@ -145,7 +145,7 @@ static void setCloseCascadeShadowParams(D3DCommandBuffer* cmdBuf, IDirect3DDevic
         ImGuiManager::GetClosePCFBias(),
         ImGuiManager::GetClosePCFBias2(),
         ImGuiManager::GetClosePCFSlopeBias(),
-        ImGuiManager::GetClosePCFTerrainBias()
+        0.0f
     };
     float closeFilterParams[4] = {
         ImGuiManager::GetClosePCFFilterSize(),
@@ -156,12 +156,6 @@ static void setCloseCascadeShadowParams(D3DCommandBuffer* cmdBuf, IDirect3DDevic
 
     setConstantF(cmdBuf, device, false, 44, closeBiasParams, 1);
     setConstantF(cmdBuf, device, false, 45, closeFilterParams, 1);
-}
-
-static void setTerrainShadowParams(D3DCommandBuffer* cmdBuf, IDirect3DDevice9* device, FixedFunctionShader::ConstReg reg, float isTerrain) {
-    float terrainParams[4] = { isTerrain, ImGuiManager::GetPCFTerrainBias(), 0.0f, 0.0f };
-    UINT targetReg = reg.reg != FixedFunctionShader::REG_INVALID ? reg.reg : 25;
-    setConstantF(cmdBuf, device, false, targetReg, terrainParams, 1);
 }
 
 // Apply complete device state from snapshot to command buffer or device directly.
@@ -1338,7 +1332,6 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
             resolveAndCache(hlslShader.psConstantTable, "PCF_bias", hlslShader.regPCFBias);
             resolveAndCache(hlslShader.psConstantTable, "PCF_bias2", hlslShader.regPCFBias2);
             resolveAndCache(hlslShader.psConstantTable, "PCF_slopeBias", hlslShader.regPCFSlopeBias);
-            resolveAndCache(hlslShader.psConstantTable, "terrainShadowParams", hlslShader.regTerrainShadowParams);
             resolveAndCache(hlslShader.vsConstantTable, "windVec", hlslShader.regWindVec);
             resolveAndCache(hlslShader.vsConstantTable, "time", hlslShader.regTime);
             resolveAndCache(hlslShader.psConstantTable, "normres", hlslShader.regNormres);
@@ -1469,12 +1462,6 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         if (hlslShader.regPCFSlopeBias.reg != REG_INVALID) {
             float v[4] = { ImGuiManager::GetPCFSlopeBias(), 0, 0, 0 };
             cmdBuf->recordSetPSConstantF(hlslShader.regPCFSlopeBias.reg, v, 1);
-        }
-        // Terrain shadow params. terrainShadowParams is pinned to PS c25, so use
-        // that as a fallback for paths whose dynamic register cache is still cold.
-        if (sk.hasShadows) {
-            float isTerrain = (replayCall && replayCall->bin == RenderBin::Terrain) ? 1.0f : 0.0f;
-            setTerrainShadowParams(cmdBuf, device, hlslShader.regTerrainShadowParams, isTerrain);
         }
         if (hlslShader.regDebugMode.reg != REG_INVALID) {
             float v[4] = { (float)ImGuiManager::GetShaderDebugMode(), 0, 0, 0 };
@@ -1643,12 +1630,6 @@ void FixedFunctionShader::renderMorrowindHLSL_Internal(const RenderedState* rs, 
         if (hPCFBias2) hlslShader.psConstantTable->SetFloat(device, hPCFBias2, ImGuiManager::GetPCFBias2());
         D3DXHANDLE hPCFSlopeBias = hlslShader.psConstantTable->GetConstantByName(NULL, "PCF_slopeBias");
         if (hPCFSlopeBias) hlslShader.psConstantTable->SetFloat(device, hPCFSlopeBias, ImGuiManager::GetPCFSlopeBias());
-        // Terrain shadow params. terrainShadowParams is pinned to PS c25, so use
-        // that as a fallback for paths whose dynamic register cache is still cold.
-        if (sk.hasShadows) {
-            float isTerrain = (replayCall && replayCall->bin == RenderBin::Terrain) ? 1.0f : 0.0f;
-            setTerrainShadowParams(nullptr, device, hlslShader.regTerrainShadowParams, isTerrain);
-        }
         D3DXHANDLE hDebugMode = hlslShader.psConstantTable->GetConstantByName(NULL, "debugMode");
         if (hDebugMode) hlslShader.psConstantTable->SetInt(device, hDebugMode, ImGuiManager::GetShaderDebugMode());
         D3DXHANDLE hHeightBlendParams = hlslShader.psConstantTable->GetConstantByName(NULL, "heightBlendParams");
@@ -3057,11 +3038,6 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
                             setIfValid(hlslShader.regPCFMaxPenumbra, 16, ImGuiManager::GetPCFMaxPenumbra());
                             setIfValid(hlslShader.regPCFSlopeBias, 17, ImGuiManager::GetPCFSlopeBias());
 
-                            // Terrain shadow params. terrainShadowParams is pinned
-                            // to PS c25; merged batches may not have resolved the
-                            // dynamic register cache before reaching this path.
-                            float isTerrain = (mb.key.bin == (uint8_t)RenderBin::Terrain) ? 1.0f : 0.0f;
-                            setTerrainShadowParams(nullptr, device, hlslShader.regTerrainShadowParams, isTerrain);
                         }
                     }
 

@@ -135,6 +135,9 @@ void DistantLand::renderShadowMap(DLContext* ctx, FixedFunctionShader::FrameBuff
     // Clear floating point buffer to far depth
     device->Clear(0, 0, D3DCLEAR_ZBUFFER|D3DCLEAR_STENCIL, 0, 1.0, 0);
     effectShadow->BeginPass(PASS_CLEARSHADOWMAP);
+    if (ehShadowCasterDepthBias) {
+        effectShadow->SetFloat(ehShadowCasterDepthBias, 0.0f);
+    }
     effect->SetBool(ehHasAlpha, false);
     effectShadow->CommitChanges();
     device->SetVertexDeclaration(WaterDecl);
@@ -263,7 +266,16 @@ void DistantLand::renderShadowLayerGeneric(DLContext* ctx, MWBridge* mwBridge, i
     effectShadow->BeginPass(PASS_RENDERSHADOWMAP);
 
     if (ctx->isExterior) {
+        const float terrainCasterBias = layer == 0 ? ImGuiManager::GetClosePCFTerrainBias() :
+            (layer == 1 ? ImGuiManager::GetPCFTerrainBias() : ImGuiManager::GetFarPCFTerrainBias());
+        if (ehShadowCasterDepthBias) {
+            effectShadow->SetFloat(ehShadowCasterDepthBias, terrainCasterBias);
+        }
         renderDistantLand(ctx, effectShadow, view, proj);
+        if (ehShadowCasterDepthBias) {
+            effectShadow->SetFloat(ehShadowCasterDepthBias, 0.0f);
+            effectShadow->CommitChanges();
+        }
     }
 
     device->SetVertexDeclaration(StaticDecl);

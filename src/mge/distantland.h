@@ -173,7 +173,7 @@ public:
     static D3DXHANDLE ehRcpRes, ehShadowRcpRes;
     static D3DXHANDLE ehWorld, ehView, ehProj;
     static D3DXHANDLE ehReflectionView, ehReflectionProj, ehReflectionWaterLevel;
-    static D3DXHANDLE ehShadowViewproj;
+    static D3DXHANDLE ehShadowViewproj, ehShadowCasterDepthBias;
     static D3DXHANDLE ehVertexBlendState, ehVertexBlendPalette, ehPrevVertexBlendPalette;
     static D3DXHANDLE ehAlphaRef, ehMaterialAlpha;
     static D3DXHANDLE ehHasAlpha, ehHasBones, ehHasVCol;

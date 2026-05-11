@@ -29,16 +29,8 @@ float PCF_maxPenumbra : register(c16);
 float PCF_slopeBias : register(c17);
 matrix shadowViewProjPS[3] : register(c31);
 float4 shadowCascadeDepths : register(c43); // x = exclusive close split, y = old near/far split, z = far distance
-float4 closePCFBiasParams : register(c44); // x = bias, y = bias2, z = slope bias, w = terrain bias
+float4 closePCFBiasParams : register(c44); // x = bias, y = bias2, z = slope bias, w = unused
 float4 closePCFFilterParams : register(c45); // x = filter size
-// Terrain receiver hint + extra near-cascade bias.
-//   .x = isTerrain (0 or 1, set per-draw / per-merged-batch on C++ side)
-//   .y = terrain bias amount (global, from imgui PCF window)
-// Terrain self-occludes more visibly than other geometry in the near cascade
-// across all rendering modes; this lets us bump bias for terrain receivers
-// without inflating the global PCF_bias and softening contact shadows on
-// non-terrain meshes.
-float4 terrainShadowParams : register(c25);
 
 // Shadow constants
 static const int shadowCascades = 3;
@@ -92,7 +84,6 @@ float shadowSamplePCF(float4 shadowPos, float2 shadowUV, int cascade, float rece
     float compareDepth = receiverDepth - min(fractionalSamplingError, 0.01f);
 
     float finalBias = lerp(biasParams.x, biasParams.y, step(0.7, ndotlgeo)) + dynamicSlopeBias;
-    finalBias += terrainShadowParams.x * biasParams.w;
     compareDepth -= finalBias;
 
     // PCF filtering pass with blue noise sampling - invert values so shadows=1, lit=0
@@ -119,14 +110,13 @@ float shadowSamplePCF(float4 shadowPos, float2 shadowUV, int cascade, float rece
 
 // Simple ESM shadow sampling with blur for far cascade
 float shadowSampleESM(float4 shadowPos, float2 shadowUV, int cascade, float receiverDepth, float ndotlgeo) {
-    float4 biasParams = cascade == 0 ? closePCFBiasParams : float4(PCF_bias, PCF_bias2, PCF_slopeBias, terrainShadowParams.y);
+    float4 biasParams = cascade == 0 ? closePCFBiasParams : float4(PCF_bias, PCF_bias2, PCF_slopeBias, 0.0);
 
     // Calculate slope bias based on surface angle to light
     float slopeFactor = 1.0 - pow(ndotlgeo, 11); // 0 for parallel surfaces, 1 for perpendicular
     float dynamicSlopeBias = biasParams.z * slopeFactor;
 
     float biasLerp = lerp(biasParams.x, biasParams.y, step(0.4, ndotlgeo)) + dynamicSlopeBias;
-    biasLerp += terrainShadowParams.x * (cascade == 2 ? 0.0 : biasParams.w);
     float shadow = 0.0;
     float sampleCount = 0.0;
 
