@@ -225,18 +225,14 @@ namespace api {
 		virtual bool shaderSetVectorArray(ShaderHandle handle, const char* variableName, const float* values, size_t* count);
     };
 
-    struct MGEAPIv4 : public MGEAPIv3 {
-        // Scene-graph bridge. MWSE stamps DataHandler in once it is constructed
-        // (TES3::DataHandler::get()) and calls onSceneGraphReady() each frame
-        // at a known-safe site (after WorldController::updateEnvironmentLightingWeather).
-        // MGE consumes the pointer through SharedSE NI types and walks the
-        // scene roots itself, throttling internally.
-        virtual void  setDataHandler(void* dataHandler);
-        virtual void* getDataHandler() const;
-        virtual void  onSceneGraphReady();
-    };
+    // MGEAPIv4 (scene-graph bridge) used to live here. MWSE dropped its
+    // side of the ABI on the sharedse-ni-unification branch (commit
+    // d2a92c596d). MGE now self-sources the DataHandler pointer from the
+    // engine global at 0x7C67E0 inside MGE::SceneGraph::getDataHandler(),
+    // and drives the per-frame walk from DistantLand::renderStage0, so
+    // the v4 surface is dead. Removed to keep MGE close to upstream.
 
-    typedef MGEAPIv4 MGEAPI_ExportVersion;
+    typedef MGEAPIv3 MGEAPI_ExportVersion;
 
 	inline MGEAPIv1* api = nullptr;
 	inline const MacroFunctions* macros = nullptr;

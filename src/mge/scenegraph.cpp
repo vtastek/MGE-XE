@@ -325,20 +325,29 @@ namespace MGE::SceneGraph {
         }
     }
 
-    void setDataHandler(void* dh) {
-        const bool firstStamp = (g_dataHandler == nullptr) && (dh != nullptr);
-        g_dataHandler = dh;
-        if (firstStamp) {
-            LOG::logline("-- [SCENEGRAPH] DataHandler stamped: %p", dh);
-        }
-    }
-
     void* getDataHandler() {
+        // Self-source from the engine global at 0x7C67E0 (the same address
+        // TES3::DataHandler::get() reads on the MWSE side). Lazy: returns
+        // null on early frames before the engine has constructed the
+        // singleton; subsequent calls retry until the read returns
+        // non-null, at which point we cache and log once.
+        //
+        // Previously this pointer was pushed in by MWSE through
+        // MGEAPIv4::setDataHandler. MWSE dropped that ABI on the
+        // sharedse-ni-unification branch (commit d2a92c596d), so we
+        // resolve it ourselves to remove the cross-DLL handoff.
+        if (!g_dataHandler) {
+            void* dh = *reinterpret_cast<void**>(0x7C67E0);
+            if (dh) {
+                g_dataHandler = dh;
+                LOG::logline("-- [SCENEGRAPH] DataHandler resolved from engine global 0x7C67E0: %p", dh);
+            }
+        }
         return g_dataHandler;
     }
 
     void onFrameReady() {
-        if (!g_dataHandler) return;
+        if (!getDataHandler()) return;
 
         if (!Configuration.UseSceneGraphSnapshot) {
             // Disabled: drop any lingering data so flipping the flag off

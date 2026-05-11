@@ -854,23 +854,8 @@ namespace api {
         MWBridge::get()->SetViewDistance(distance);
     }
 
-    //-------------------------------------------------------------------------
-    // MGEAPIv4 — scene-graph bridge.
-    //
-    // Backed by the SceneGraph module. MWSE drives the lifecycle:
-    //   1. setDataHandler() once after TES3::DataHandler is constructed.
-    //   2. onSceneGraphReady() per frame at a known-safe site.
-    // All actual walk/throttle/storage logic lives in scenegraph.cpp.
-
-    void MGEAPIv4::setDataHandler(void* dataHandler) {
-        MGE::SceneGraph::setDataHandler(dataHandler);
-    }
-
-    void* MGEAPIv4::getDataHandler() const {
-        return MGE::SceneGraph::getDataHandler();
-    }
-
-    void MGEAPIv4::onSceneGraphReady() {
-        MGE::SceneGraph::onFrameReady();
-    }
+    // MGEAPIv4 (scene-graph bridge) implementations used to live here.
+    // Dropped along with the v4 surface — see api.h for the rationale.
+    // MGE::SceneGraph drives itself now: getDataHandler() self-sources the
+    // engine global, onFrameReady() is called from DistantLand::renderStage0.
 }

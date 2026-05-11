@@ -6,6 +6,7 @@
 #include "distantshader.h"
 #include "postshaders.h"
 #include "mwbridge.h"
+#include "scenegraph.h"
 
 
 
@@ -17,6 +18,14 @@ void DistantLand::renderStage0() {
     auto mwBridge = MWBridge::get();
     IDirect3DStateBlock9* stateSaved;
     UINT passes;
+
+    // Drive the scene-graph snapshot once per frame. renderStage0 is gated
+    // by mged3d8device's stage0Complete flag, so this fires exactly once
+    // per frame regardless of how many scenes/Clicks the engine submits
+    // afterwards. Self-sources DataHandler on first call; no-op until the
+    // engine has constructed the singleton. Replaces the previous MWSE-
+    // driven MGEAPIv4::onSceneGraphReady() trigger (dropped on this branch).
+    MGE::SceneGraph::onFrameReady();
 
     // Update current cell and select distant static set
     selectDistantCell();

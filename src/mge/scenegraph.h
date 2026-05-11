@@ -1,31 +1,45 @@
 #pragma once
 
-// Per-frame scene-graph snapshot owned MGE-side. MWSE pushes the
-// TES3::DataHandler pointer once on first onSceneGraphReady, then
-// signals the start of each frame's safe-to-walk window (a wrap of
-// TES3Game::renderNextFrame's call site at 0x41BE56 — post all
-// per-frame mutations and post the engine's worldTransform refresh
-// pass on camera roots, pre any cull walk, pre any draw). MGE walks
-// the scene roots (worldObjectRoot + worldPickObjectRoot + sgSunlight)
-// recursively, classifies each visited node by RTTI, and extracts a
-// POD view per subtype. Currently exposes NiPointLight (FFE many-lights
-// consumer) and NiDirectionalLight (sun direction + colour, no consumer
-// yet — staged for the dynamic-shadows work). Future per-subtype POD
-// vectors (geometry casters, water-reflection candidates, etc.) plug in
-// at the same dispatch with no extra traversal cost.
+// Per-frame scene-graph snapshot owned MGE-side. The DataHandler pointer
+// is self-sourced from Morrowind's engine global at 0x7C67E0 (matching
+// what TES3::DataHandler::get() reads on the MWSE side) on first call
+// to getDataHandler(); a per-frame trigger from DistantLand::renderStage0
+// drives onFrameReady() exactly once per frame (renderStage0 is
+// stage0Complete-gated by mged3d8device, so it never fires twice in the
+// same frame). MGE walks the scene roots (worldObjectRoot +
+// worldPickObjectRoot + sgSunlight) recursively, classifies each visited
+// node by RTTI, and extracts a POD view per subtype. Currently exposes
+// NiPointLight (FFE many-lights consumer) and NiDirectionalLight (sun
+// direction + colour, no consumer yet — staged for the dynamic-shadows
+// work). Future per-subtype POD vectors (geometry casters, water-
+// reflection candidates, etc.) plug in at the same dispatch with no
+// extra traversal cost.
 //
 // All public accessors return references to internal storage that
 // remains valid until the next onFrameReady() call. Consumers that
 // want to outlive a frame must copy.
+//
+// Previously the bridge was driven from MWSE via MGEAPIv4::setDataHandler
+// + MGEAPIv4::onSceneGraphReady. MWSE removed its side of that ABI on the
+// sharedse-ni-unification branch (commit d2a92c596d on MWSE); MGE no
+// longer expects MWSE to push either signal — both are self-sourced.
 
 #include <cstdint>
 #include <vector>
 
 namespace MGE::SceneGraph {
 
-    // Bridge wiring — called from MGEAPIv4 impl.
-    void  setDataHandler(void* dataHandler);
+    // Returns the engine's TES3::DataHandler pointer (typed as void* —
+    // MGE consumes it via offset-based access in datahandler_view.h, not
+    // by including the TES3 type). Self-sources from the engine global
+    // at 0x7C67E0 on first call once DataHandler is constructed; returns
+    // nullptr before that point.
     void* getDataHandler();
+
+    // Trigger called from DistantLand::renderStage0 once per frame. Walks
+    // the scene graph (synchronously or via the async worker depending on
+    // Configuration.UseAsyncSceneGraphWalk) and refreshes the snapshot.
+    // No-op if DataHandler hasn't been constructed yet.
     void  onFrameReady();
 
     // POD view of point lights, suitable for consumers that do not

@@ -6,10 +6,10 @@
 // returned typed (MGE has SharedSE); TES3-typed pointers are returned as
 // void* opaque — useful for identity comparison without dragging in TES3.
 //
-// The DataHandler pointer itself comes from MWSE through the MGEAPIv4
-// bridge (MGEAPIv4::setDataHandler). All accessors below assume the
-// caller has a non-null dh; callers that don't are responsible for the
-// null check.
+// The DataHandler pointer itself is self-sourced from the engine global
+// at 0x7C67E0 via MGE::SceneGraph::getDataHandler(). All accessors below
+// assume the caller has a non-null dh; callers that don't are
+// responsible for the null check.
 //
 // Adding a new field is one constant + one inline. Fields the consumer
 // doesn't read remain inert at zero cost.
