@@ -68,6 +68,16 @@
 #define SE_IS_MGE 1
 #define MWSE_NO_CUSTOM_ALLOC 1
 
+// Target-application gate consumed by SharedSE/NIDefines.h (and any other
+// SharedSE header that selects between Morrowind- and CS-specific subheaders
+// via SE_TARGETS_MW vs SE_TARGETS_CS). MGE-XE attaches to morrowind.exe, so we
+// pick the MW variant. Previously the per-project NIConfig.h / NIRTTIDefines.h
+// / NIVirtualTableDefines.h files inside MWSE/ and CSSE/ supplied this
+// implicitly; the unification pass deleted those and replaced them with
+// SE_TARGETS_*-gated includes inside SharedSE/NIDefines.h, so every consumer
+// must declare its target up front or hit the static_assert there.
+#define SE_TARGETS_MW TRUE
+
 // Engine allocator entry points on Morrowind.exe. MGE-XE shares this process,
 // so the addresses are valid; in practice MGE never invokes these (it is a
 // read-only consumer), but a few SharedSE call sites reference se::memory::_new
