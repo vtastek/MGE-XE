@@ -1773,6 +1773,16 @@ namespace MGEgui {
         {
 
         }
+
+        private void gbDLDrawDist_Enter(object sender, EventArgs e)
+        {
+
+        }
+
+        private void lScreenshotStatus_Click(object sender, EventArgs e)
+        {
+
+        }
     }
 
 }
