@@ -2253,6 +2253,16 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
         device->SetPixelShaderConstantF(50, lightParams, 1);
     }
 
+    // Push HLSL FFE near-fog params (VS c49=nearFogStart, c50=nearFogRange)
+    // before either merged batches or the normal replay loop draw.
+    {
+        float fogParams[8] = {
+            DistantLand::s_staging.fogNearStart, 0, 0, 0,
+            DistantLand::s_staging.fogNearEnd,   0, 0, 0,
+        };
+        device->SetVertexShaderConstantF(49, fogParams, 2);
+    }
+
     // Inline Hi-Z culling using current matrices (same as bbox visualization)
     const size_t numCalls = recCalls.size();
 
@@ -3117,18 +3127,6 @@ void FixedFunctionShader::replayRecordedCalls(int sceneCount, D3DCommandBuffer* 
         D3DXVec4Transform(&eyeW, &origin, &invView);
         float falloff[4] = { 2560.0f, 1280.0f, eyeW.x, eyeW.y };
         device->SetVertexShaderConstantF(73, falloff, 1);
-    }
-
-    // Push HLSL FFE near-fog params (c49=nearFogStart, c50=nearFogRange) per
-    // replay so XE FixedFuncEmu_VS::fogMWScalar reaches 0 at MW view distance
-    // — same point DL begins blending. Without this push the registers stay
-    // stale and input.fog falls apart, mismatching the DL horizon.
-    {
-        float fogParams[8] = {
-            DistantLand::s_staging.fogNearStart, 0, 0, 0,
-            DistantLand::s_staging.fogNearEnd,   0, 0, 0,
-        };
-        device->SetVertexShaderConstantF(49, fogParams, 2);
     }
 
     FixedFunctionShader::logCellCrossFrame(sceneCount == 0 ? "REPLAY0-BEGIN" : "REPLAY-BEGIN", fb);
