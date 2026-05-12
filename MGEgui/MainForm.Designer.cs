@@ -1240,7 +1240,7 @@ namespace MGEgui {
             // cbUseSharedMemory
             // 
             this.cbUseSharedMemory.AutoSize = true;
-            this.cbUseSharedMemory.Location = new System.Drawing.Point(20, 154);
+            this.cbUseSharedMemory.Location = new System.Drawing.Point(18, 154);
             this.cbUseSharedMemory.Name = "cbUseSharedMemory";
             this.cbUseSharedMemory.Size = new System.Drawing.Size(197, 29);
             this.cbUseSharedMemory.TabIndex = 25;
@@ -1728,7 +1728,7 @@ namespace MGEgui {
             "4x",
             "8x",
             "16x"});
-            this.cmbAntiAlias.Location = new System.Drawing.Point(4, 17);
+            this.cmbAntiAlias.Location = new System.Drawing.Point(4, 15);
             this.cmbAntiAlias.Margin = new System.Windows.Forms.Padding(4);
             this.cmbAntiAlias.Name = "cmbAntiAlias";
             this.cmbAntiAlias.Size = new System.Drawing.Size(94, 33);
@@ -1758,7 +1758,7 @@ namespace MGEgui {
             "x2",
             "x3",
             "x4"});
-            this.cmbVWait.Location = new System.Drawing.Point(691, 17);
+            this.cmbVWait.Location = new System.Drawing.Point(691, 15);
             this.cmbVWait.Margin = new System.Windows.Forms.Padding(4);
             this.cmbVWait.Name = "cmbVWait";
             this.cmbVWait.Size = new System.Drawing.Size(118, 33);
@@ -1775,7 +1775,7 @@ namespace MGEgui {
             "4x",
             "8x",
             "16x"});
-            this.cmbAnisoLevel.Location = new System.Drawing.Point(313, 17);
+            this.cmbAnisoLevel.Location = new System.Drawing.Point(313, 15);
             this.cmbAnisoLevel.Margin = new System.Windows.Forms.Padding(4);
             this.cmbAnisoLevel.Name = "cmbAnisoLevel";
             this.cmbAnisoLevel.Size = new System.Drawing.Size(94, 33);
