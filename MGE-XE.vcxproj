@@ -9,6 +9,10 @@
       <Configuration>Release</Configuration>
       <Platform>Win32</Platform>
     </ProjectConfiguration>
+    <ProjectConfiguration Include="Release-Tracy|Win32">
+      <Configuration>Release-Tracy</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>15.0</VCProjectVersion>
@@ -30,16 +34,25 @@
     <PlatformToolset>v143</PlatformToolset>
     <WholeProgramOptimization>true</WholeProgramOptimization>
   </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release-Tracy|Win32'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+  </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings">
   </ImportGroup>
   <ImportGroup Label="Shared">
-    <Import Project="..\MWSE\MWSE\SharedSE\SharedSE.vcxitems" Label="Shared" />
+    <Import Project="..\..\MWSE\SharedSE\SharedSE.vcxitems" Label="Shared" />
   </ImportGroup>
   <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
   <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release-Tracy|Win32'">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
@@ -59,6 +72,14 @@
     <IntDir>$(SolutionDir)bin\MSVC-$(Configuration)\d3d8\</IntDir>
     <IncludePath>$(VC_IncludePath);$(WindowsSDK_IncludePath);;C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\include</IncludePath>
   </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release-Tracy|Win32'">
+    <LinkIncremental>false</LinkIncremental>
+    <LibraryPath>$(VC_LibraryPath_x86);$(WindowsSDK_LibraryPath_x86);$(NETFXKitsDir)Lib\um\x86;C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\Lib\x86;</LibraryPath>
+    <TargetName>d3d8_tracy</TargetName>
+    <OutDir>$(SolutionDir)bin\MSVC-Release\</OutDir>
+    <IntDir>$(SolutionDir)bin\MSVC-Release-Tracy\d3d8\</IntDir>
+    <IncludePath>$(VC_IncludePath);$(WindowsSDK_IncludePath);;C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\include</IncludePath>
+  </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
       <PreprocessorDefinitions>WIN32;NOMINMAX;_DEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
@@ -66,7 +87,7 @@
       <WarningLevel>Level3</WarningLevel>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <Optimization>Disabled</Optimization>
-      <AdditionalIncludeDirectories>./src;./src/mge;..\MWSE\MWSE\SharedSE;..\MWSE\MWSE\deps\span-lite</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>./src;./src/mge;./3rdparty/tracy/public;..\..\MWSE\SharedSE;..\..\MWSE\deps\span-lite</AdditionalIncludeDirectories>
       <EnableEnhancedInstructionSet>StreamingSIMDExtensions2</EnableEnhancedInstructionSet>
       <FloatingPointModel>Fast</FloatingPointModel>
       <EnforceTypeConversionRules>true</EnforceTypeConversionRules>
@@ -91,7 +112,7 @@
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <EnableEnhancedInstructionSet>StreamingSIMDExtensions2</EnableEnhancedInstructionSet>
       <FloatingPointModel>Fast</FloatingPointModel>
-      <AdditionalIncludeDirectories>./src;./src/mge;..\MWSE\MWSE\SharedSE;..\MWSE\MWSE\deps\span-lite</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>./src;./src/mge;./3rdparty/tracy/public;..\..\MWSE\SharedSE;..\..\MWSE\deps\span-lite</AdditionalIncludeDirectories>
       <EnforceTypeConversionRules>true</EnforceTypeConversionRules>
       <RuntimeTypeInfo>false</RuntimeTypeInfo>
       <LanguageStandard>stdcpp17</LanguageStandard>
@@ -107,6 +128,33 @@
       <AdditionalDependencies>kernel32.lib;user32.lib;gdi32.lib;d3d9.lib;d3dx9.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ModuleDefinitionFile>src\exports.def</ModuleDefinitionFile>
       <TreatLinkerWarningAsErrors>true</TreatLinkerWarningAsErrors>
+      <SubSystem>Windows</SubSystem>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release-Tracy|Win32'">
+    <ClCompile>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <WarningLevel>Level3</WarningLevel>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <Optimization>MaxSpeed</Optimization>
+      <EnableEnhancedInstructionSet>StreamingSIMDExtensions2</EnableEnhancedInstructionSet>
+      <FloatingPointModel>Fast</FloatingPointModel>
+      <AdditionalIncludeDirectories>./src;./src/mge;./3rdparty/tracy/public;..\..\MWSE\SharedSE;..\..\MWSE\deps\span-lite</AdditionalIncludeDirectories>
+      <EnforceTypeConversionRules>true</EnforceTypeConversionRules>
+      <RuntimeTypeInfo>false</RuntimeTypeInfo>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <PreprocessorDefinitions>WIN32;NOMINMAX;NDEBUG;_WINDOWS;TRACY_ENABLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <LanguageStandard_C>stdc17</LanguageStandard_C>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+    </ClCompile>
+    <Link>
+      <TargetMachine>MachineX86</TargetMachine>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <AdditionalDependencies>kernel32.lib;user32.lib;gdi32.lib;d3d9.lib;d3dx9.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <ModuleDefinitionFile>src\exports.def</ModuleDefinitionFile>
+      <TreatLinkerWarningAsErrors>false</TreatLinkerWarningAsErrors>
       <SubSystem>Windows</SubSystem>
     </Link>
   </ItemDefinitionGroup>
@@ -169,6 +217,7 @@
     <ClCompile Include="src\support\log.cpp" />
     <ClCompile Include="src\support\pngsave.cpp" />
     <ClCompile Include="src\support\timing.cpp" />
+    <ClCompile Include="3rdparty\tracy\public\TracyClient.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\exports.def" />
@@ -252,7 +301,7 @@
        via ClCompile Update so MGE-XE's own TUs are not affected — they include
        d3dx9 SDK headers that conflict with the prelude's near/far undef. -->
   <ItemGroup>
-    <ClCompile Update="..\MWSE\MWSE\SharedSE\*.cpp">
+    <ClCompile Update="..\..\MWSE\SharedSE\*.cpp">
       <ForcedIncludeFiles>$(ProjectDir)src\mge\mge_se_prelude.h</ForcedIncludeFiles>
     </ClCompile>
     <!-- Exclude SharedSE TUs MGE-XE doesn't reach via its include chain.
@@ -266,13 +315,13 @@
          from the MGE build avoids the layout mismatch entirely.
          CodePatchUtil.cpp similarly only matters for MWSE's runtime code-
          patch system, which MGE doesn't participate in. -->
-    <ClCompile Update="..\MWSE\MWSE\SharedSE\NIDX8Renderer.cpp">
+    <ClCompile Update="..\..\MWSE\SharedSE\NIDX8Renderer.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
-    <ClCompile Update="..\MWSE\MWSE\SharedSE\NIRenderedTexture.cpp">
+    <ClCompile Update="..\..\MWSE\SharedSE\NIRenderedTexture.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
-    <ClCompile Update="..\MWSE\MWSE\SharedSE\CodePatchUtil.cpp">
+    <ClCompile Update="..\..\MWSE\SharedSE\CodePatchUtil.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
   </ItemGroup>

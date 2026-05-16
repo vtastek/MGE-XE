@@ -7,14 +7,39 @@
 #include "postshaders.h"
 #include "mwbridge.h"
 #include "scenegraph.h"
+#include "mge_tracy.h"
 
 
 
 using std::string;
 using std::unordered_map;
 
+#ifdef TRACY_ENABLE
+static constexpr tracy::SourceLocationData s_mwSkyLoc   { "MW sky",       "BeginScene",  __FILE__, 0, 0 };
+static constexpr tracy::SourceLocationData s_mwDrawsLoc { "MW draw loop", "renderStage0", __FILE__, 0, 0 };
+static tracy::ScopedZone* s_mwSkyZone   = nullptr;
+static tracy::ScopedZone* s_mwDrawsZone = nullptr;
+#endif
+
+void DistantLand::beginSkyZone() {
+#ifdef TRACY_ENABLE
+    if (g_tracyActive) s_mwSkyZone = new tracy::ScopedZone(&s_mwSkyLoc, 0, true);
+#endif
+}
+
+void DistantLand::beginDrawsZone() {
+#ifdef TRACY_ENABLE
+    if (g_tracyActive) s_mwDrawsZone = new tracy::ScopedZone(&s_mwDrawsLoc, 0, true);
+#endif
+}
+
 // renderStage0 - Render distant land at beginning of scene 0, after sky
 void DistantLand::renderStage0() {
+#ifdef TRACY_ENABLE
+    delete s_mwSkyZone;
+    s_mwSkyZone = nullptr;
+#endif
+    MGE_ZoneScopedN("Stage0");
     auto mwBridge = MWBridge::get();
     IDirect3DStateBlock9* stateSaved;
     UINT passes;
@@ -174,6 +199,12 @@ void DistantLand::renderStage0() {
 
 // renderStage1 - Render grass and shadows over near features, and write depth texture for scene 0
 void DistantLand::renderStage1() {
+#ifdef TRACY_ENABLE
+    delete s_mwDrawsZone;
+    s_mwDrawsZone = nullptr;
+#endif
+    MGE_ZoneScopedN("Stage1");
+    MGE_TracyPlot("MW draw calls", (int64_t)recordMW.size());
     auto mwBridge = MWBridge::get();
     IDirect3DStateBlock9* stateSaved;
     UINT passes;
@@ -227,6 +258,7 @@ void DistantLand::renderStage1() {
 
 // renderStage2 - Render shadows and depth texture for scenes 1+ (post-stencil redraw/alpha/1st person)
 void DistantLand::renderStage2() {
+    MGE_ZoneScopedN("Stage2");
     auto mwBridge = MWBridge::get();
     IDirect3DStateBlock9* stateSaved;
     UINT passes;

@@ -6,6 +6,7 @@
 #include "phasetimers.h"
 #include "proxydx/d3d8header.h"
 #include "support/log.h"
+#include "mge_tracy.h"
 
 #include <cmath>
 
@@ -53,6 +54,7 @@ void DistantLand::clearShadowCascade(int layer) {
 //
 // This *must* restore render state on return.
 void DistantLand::renderShadowMap() {
+    MGE_ZoneScopedN("renderShadowMap");
     MGE_SCOPED_TIMER("renderShadowMap");
 
     // ---- adaptive scheduler state ----
@@ -307,6 +309,7 @@ void DistantLand::renderShadowLayer(int layer, float radius, const D3DXMATRIX* i
 
 // renderShadow - Renders shadows (using blending) over Morrowind shadow receivers
 void DistantLand::renderShadow() {
+    MGE_ZoneScopedN("renderShadow");
     // Supply view space -> shadow clip space matrix
     D3DXMATRIX inverseView, viewToShadow[2];
     D3DXMatrixInverse(&inverseView, NULL, &mwView);

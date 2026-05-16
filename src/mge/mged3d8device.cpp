@@ -4,6 +4,7 @@
 #include "proxydx/d3d8surface.h"
 
 #include <algorithm>
+#include <tlhelp32.h>
 #include "mgeversion.h"
 #include "configuration.h"
 #include "distantland.h"
@@ -11,10 +12,41 @@
 #include "statusoverlay.h"
 #include "userhud.h"
 #include "videobackground.h"
+#include "mge_tracy.h"
+
+bool g_tracyActive = false;
+
+static bool isTracyProfilerRunning() {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+    PROCESSENTRY32 pe;
+    pe.dwSize = sizeof(pe);
+    bool found = false;
+    if (Process32First(snap, &pe)) {
+        do {
+            if (_strnicmp(pe.szExeFile, "tracy", 5) == 0) {
+                found = true;
+                break;
+            }
+        } while (Process32Next(snap, &pe));
+    }
+    CloseHandle(snap);
+    return found;
+}
 
 static int sceneCount;
 static bool rendertargetNormal, isHUDready;
 static bool isMainView, isStencilScene, isAmbientWhite;
+
+#ifdef TRACY_ENABLE
+static constexpr tracy::SourceLocationData s_sceneZoneLocs[] = {
+    { "scene0", "BeginScene", __FILE__, 0, 0 },
+    { "scene1", "BeginScene", __FILE__, 0, 0 },
+    { "scene2+", "BeginScene", __FILE__, 0, 0 },
+    { "UI",     "BeginScene", __FILE__, 0, 0 },
+};
+static tracy::ScopedZone* s_currentSceneZone = nullptr;
+#endif
 static DWORD stencilRef;
 static bool stage0Complete, isFrameComplete, isHUDComplete;
 static bool isWaterMaterial, waterDrawn, distantWater;
@@ -79,6 +111,10 @@ MGEProxyDevice::MGEProxyDevice(IDirect3DDevice9* real, ProxyD3D* d3d) : ProxyDev
 
     lightrs.lights.clear();
     lightrs.active.clear();
+
+    // Detect Tracy profiler for conditional zone activation
+    g_tracyActive = isTracyProfilerRunning();
+    LOG::logline("Tracy: profiler %s, zones %s", g_tracyActive ? "detected" : "not detected", g_tracyActive ? "enabled" : "disabled");
 
     // Store active device in distant land, occurs on startup and after fullscreen alt-tab
     DistantLand::device = realDevice;
@@ -198,7 +234,9 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
     isFrameComplete = false;
     isHUDComplete = false;
 
-    return ProxyDevice::Present(a, b, c, d);
+    HRESULT hr = ProxyDevice::Present(a, b, c, d);
+    MGE_FrameMark;
+    return hr;
 }
 
 // SetRenderTarget
@@ -244,6 +282,15 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
             // isMainView is not always valid at EndScene if Morrowind draws sunglare
             ++sceneCount;
 
+#ifdef TRACY_ENABLE
+            if (g_tracyActive) {
+                int idx = sceneCount <= 1 ? sceneCount : 2;
+                s_currentSceneZone = new tracy::ScopedZone(&s_sceneZoneLocs[idx], 0, true);
+            }
+#endif
+            if (sceneCount == 0)
+                DistantLand::beginSkyZone();
+
             // Set any custom FOV and check distant water state
             if (sceneCount == 0) {
                 if (Configuration.ScreenFOV > 0) {
@@ -252,6 +299,10 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                 distantWater = (Configuration.MGEFlags & USE_DISTANT_LAND) || (Configuration.MGEFlags & USE_DISTANT_WATER);
             }
         } else {
+#ifdef TRACY_ENABLE
+            if (g_tracyActive)
+                s_currentSceneZone = new tracy::ScopedZone(&s_sceneZoneLocs[3], 0, true);
+#endif
             // UI scene, apply post-process if there was anything drawn before it
             // Race menu will render an extra scene past this point
             if (DistantLand::ready && sceneCount > 0 && !isFrameComplete) {
@@ -315,6 +366,11 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
 
         isHUDComplete = true;
     }
+
+#ifdef TRACY_ENABLE
+    delete s_currentSceneZone;
+    s_currentSceneZone = nullptr;
+#endif
 
     return ProxyDevice::EndScene();
 }
@@ -454,6 +510,7 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
             // At this point, only the sky is rendered in exteriors, or nothing in interiors
             DistantLand::renderStage0();
             stage0Complete = true;
+            DistantLand::beginDrawsZone();
         }
 
         if (isWaterMaterial) {

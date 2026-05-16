@@ -23,6 +23,7 @@
 #include "datahandler_view.h"
 #include "scenegraph.h"
 #include "support/log.h"
+#include "mge_tracy.h"
 
 namespace MGE::SceneGraph {
 
@@ -347,6 +348,7 @@ namespace MGE::SceneGraph {
     }
 
     void onFrameReady() {
+        MGE_ZoneScopedN("SceneGraph::onFrameReady");
         if (!getDataHandler()) return;
 
         if (!Configuration.UseSceneGraphSnapshot) {

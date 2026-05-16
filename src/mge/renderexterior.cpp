@@ -8,6 +8,7 @@
 #include "proxydx/d3d8header.h"
 #include "support/log.h"
 #include "terrain_horizon_occluder.h"
+#include "mge_tracy.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -68,6 +69,7 @@ bool                    g_horizonInitialized = false;
 
 // renderSky - Render atmosphere scattering sky layer and other recorded draw calls on top
 void DistantLand::renderSky() {
+    MGE_ZoneScopedN("renderSky");
     // Recorded renders
     const auto& recordSky_const = recordSky;
     const int standardCloudVerts = 65, standardCloudTris = 112;
@@ -142,6 +144,7 @@ void DistantLand::renderSky() {
 }
 
 void DistantLand::renderDistantLand(ID3DXEffect* e, const D3DXMATRIX* view, const D3DXMATRIX* proj) {
+    MGE_ZoneScopedN("renderDistantLand");
     MGE_SCOPED_TIMER("renderDistantLand");
     D3DXMATRIX world, viewproj = (*view) * (*proj);
     D3DXVECTOR4 viewsphere(eyePos.x, eyePos.y, eyePos.z, Configuration.DL.DrawDist * kCellSize);
@@ -221,6 +224,7 @@ void DistantLand::renderDistantLand(ID3DXEffect* e, const D3DXMATRIX* view, cons
 // then call the reference's simplify + emit, fix up the vertex layout for
 // MOC's consumption, and submit via mwse_addPreTransformedOccluder.
 void DistantLand::contributeDistantLandOccluders() {
+    MGE_ZoneScopedN("contributeOccluders");
     MGE_SCOPED_TIMER("contributeDistantLandOccluders");
 
     static int diagGuardFrame = 0;
@@ -498,6 +502,7 @@ namespace {
 }
 
 void DistantLand::cullDistantStatics_kickoff(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
+    MGE_ZoneScopedN("cullDistantStatics_kickoff");
     MGE_SCOPED_TIMER("cullDistantStatics:kickoff");
 
     D3DXMATRIX ds_proj = *proj, ds_viewproj;
@@ -592,6 +597,7 @@ void DistantLand::cullDistantStatics_kickoff(const D3DXMATRIX* view, const D3DXM
 }
 
 void DistantLand::cullDistantStatics_finish() {
+    MGE_ZoneScopedN("cullDistantStatics_finish");
     MGE_SCOPED_TIMER("cullDistantStatics:finish");
 
     if (Configuration.UseSharedMemory) {
@@ -637,6 +643,7 @@ void DistantLand::cullDistantStatics_finish() {
 }
 
 void DistantLand::renderDistantStatics() {
+    MGE_ZoneScopedN("renderDistantStatics");
     MGE_SCOPED_TIMER("renderDistantStatics");
     if (!MWBridge::get()->IsExterior()) {
         // Set clipping to stop large architectural meshes (that don't match exactly)

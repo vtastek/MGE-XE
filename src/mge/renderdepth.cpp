@@ -6,10 +6,12 @@
 #include "phasetimers.h"
 #include "proxydx/d3d8header.h"
 #include "support/log.h"
+#include "mge_tracy.h"
 
 
 
 void DistantLand::renderDepth() {
+    MGE_ZoneScopedN("renderDepth");
     MGE_SCOPED_TIMER("renderDepth");
     auto mwBridge = MWBridge::get();
 
@@ -82,6 +84,7 @@ void DistantLand::renderDepth() {
 }
 
 void DistantLand::renderDepthAdditional() {
+    MGE_ZoneScopedN("renderDepthAdditional");
     // Switch to render target
     RenderTargetSwitcher rtsw(texDepthFrame, surfDepthDepth);
 
@@ -103,6 +106,7 @@ void DistantLand::renderDepthAdditional() {
 }
 
 void DistantLand::renderDepthRecorded() {
+    MGE_ZoneScopedN("renderDepthRecorded");
     // Use an alpha threshold for solidity that isn't precisely equal to a commonly used value (such as 0.5).
     // Vertex interpolators can be slightly inaccurate and cause a value that should be constant across a triangle
     // to have interpolated fragment values that vary either side of the threshold and cause noise.

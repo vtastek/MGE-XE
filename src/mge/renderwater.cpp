@@ -5,10 +5,12 @@
 #include "doublesurface.h"
 #include "mwbridge.h"
 #include "postshaders.h"
+#include "mge_tracy.h"
 
 
 
 void DistantLand::renderWaterReflection(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
+    MGE_ZoneScopedN("renderWaterReflection");
     auto mwBridge = MWBridge::get();
 
     // Switch to render target
@@ -252,6 +254,7 @@ void DistantLand::clearReflection() {
 }
 
 void DistantLand::simulateDynamicWaves() {
+    MGE_ZoneScopedN("simulateDynamicWaves");
     auto mwBridge = MWBridge::get();
 
     static bool resetRippleSurface = true;

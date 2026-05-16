@@ -214,7 +214,9 @@ public:
     static bool inspectIndexedPrimitive(int sceneCount, const RenderedState* rs, const FragmentState* frs, LightState* lightrs);
 
     static void renderSky();
+    static void beginSkyZone();
     static void renderStage0();
+    static void beginDrawsZone();
     static void renderStage1();
     static void renderStage2();
     static void renderStageBlend();
