@@ -190,6 +190,7 @@
     <ClCompile Include="src\mge\rendergrass.cpp" />
     <ClCompile Include="src\mge\rendershadow.cpp" />
     <ClCompile Include="src\mge\scenegraph.cpp" />
+    <ClCompile Include="src\mge\scenegraph_geometry_cache.cpp" />
     <ClCompile Include="src\mge\renderwater.cpp" />
     <ClCompile Include="src\mge\specificrender.cpp" />
     <ClCompile Include="src\mge\statusoverlay.cpp" />
@@ -259,6 +260,7 @@
     <ClInclude Include="src\mge\postshaders.h" />
     <ClInclude Include="src\mge\quadtree.h" />
     <ClInclude Include="src\mge\scenegraph.h" />
+    <ClInclude Include="src\mge\scenegraph_geometry_cache.h" />
     <ClInclude Include="src\mge\datahandler_view.h" />
     <ClInclude Include="src\mge\mge_se_prelude.h" />
     <ClInclude Include="src\mge\specificrender.h" />

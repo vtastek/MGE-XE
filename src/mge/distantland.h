@@ -286,8 +286,11 @@ public:
     static void renderDepth();
     static void renderDepthAdditional();
     static void renderDepthRecorded();
+    static void renderDepthFromCache(const D3DXMATRIX* gameView);
+    static void updateVisibleSet(void* const* shapes, int count);
 
     static void renderShadowMap();
+    static void renderShadowFromCache(int layer, const D3DXMATRIX* viewproj);
     // Clears one cascade's region of the shadow atlas (depth + stencil
     // + the float-encoded "far depth" sentinel). Viewport-clipped so it
     // touches only [layer*res, 0, res, res] of the atlas — the other

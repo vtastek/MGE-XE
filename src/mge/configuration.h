@@ -138,6 +138,7 @@ struct ConfigurationStruct {
         BYTE WaterWaveHeight;
         BYTE WaterCaustics;
         DWORD ShadowResolution;
+        float ShadowNearStaticRadius;   // include static objects within this distance in near cascade (0 = off)
         float Wind[10];
         float FogD[10];
         float FgOD[10];

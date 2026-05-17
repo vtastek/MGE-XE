@@ -17,6 +17,10 @@
 // used to live in MWSE.dll before the extraction).
 class MSOCClient {
 public:
+    // Callback type for MSOC-culled visible geometry.
+    // Called by msoc.dll with (shapes[], boundsXYZR[], count) after verdict classification.
+    using FnVisibleGeomCallback = void(__cdecl*)(void* const*, const float*, int);
+
     // One-time probe. Safe to call repeatedly; subsequent calls no-op.
     // Logs a single descriptive line to mgeXE.log either way.
     static void init();
@@ -129,4 +133,11 @@ public:
     static bool addPreTransformedOccluder(
         const float* verts, int vtxCount, int stride, int offY, int offW,
         const unsigned int* tris, int triCount);
+
+    // Register/unregister a callback that receives the MSOC-culled visible
+    // geometry set each frame (before Morrowind's drainPendingDisplays).
+    // Callback signature: void __cdecl cb(void* const* shapes, const float* boundsXYZR, int count)
+    // Returns false if the plugin is absent or doesn't export the symbol.
+    static bool registerVisibleGeomCallback(FnVisibleGeomCallback cb);
+    static bool unregisterVisibleGeomCallback(FnVisibleGeomCallback cb);
 };

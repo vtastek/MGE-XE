@@ -7,6 +7,7 @@
 #include "postshaders.h"
 #include "mwbridge.h"
 #include "scenegraph.h"
+#include "scenegraph_geometry_cache.h"
 #include "mge_tracy.h"
 #include "statusoverlay.h"
 
@@ -54,6 +55,8 @@ void DistantLand::renderStage0() {
     // engine has constructed the singleton. Replaces the previous MWSE-
     // driven MGEAPIv4::onSceneGraphReady() trigger (dropped on this branch).
     MGE::SceneGraph::onFrameReady();
+    // Build geometry cache for depth/shadow from cache rendering.
+    MGE::GeometryCache::onFrameReady(MGE::SceneGraph::getDataHandler());
 
     // Update current cell and select distant static set
     selectDistantCell();

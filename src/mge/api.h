@@ -27,6 +27,7 @@ namespace api {
 		unsigned char WaterWaveHeight;
 		unsigned char WaterCaustics;
 		unsigned int ShadowResolution;
+		float ShadowNearStaticRadius;
 		float Wind[10];
 		float FogDist[10];
 		float FogOffset[10];

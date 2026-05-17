@@ -6,6 +6,8 @@
 #include "XE Common.fx"
 #include "XE Mod Shadow Data.fx"
 
+static const float shadowMWDepthBias = 2.0e-4;
+
 
 
 //------------------------------------------------------------
@@ -33,6 +35,19 @@ ShadowVertOut ShadowVS(StatVertIn IN) {
     return OUT;
 }
 
+// Vertex shader for rendering Morrowind scene geometry as shadow casters.
+// Uses vertexBlendPalette[0] as the combined model-to-shadow-clip matrix.
+// vertexBlendState=1 for CPU-skinned objects (world-space VBs, no wind).
+// vertexBlendState=0 for static objects (model-space VBs, world*shadowVP in palette[0]).
+ShadowVertOut ShadowMWVS(MorrowindVertIn IN) {
+    ShadowVertOut OUT;
+    OUT.pos = mul(IN.pos, vertexBlendPalette[0]);
+    OUT.pos.z = max(0, OUT.pos.z);
+    OUT.depth = OUT.pos.z / OUT.pos.w;
+    OUT.texcoords = IN.texcoords;
+    return OUT;
+}
+
 ShadowVertOut ShadowClearVS(float4 pos : POSITION) {
     ShadowVertOut OUT;
 
@@ -40,6 +55,14 @@ ShadowVertOut ShadowClearVS(float4 pos : POSITION) {
     OUT.depth = 1.0f;
     OUT.texcoords = 0.0f;
     return OUT;
+}
+
+float4 ShadowMWPS(ShadowVertOut IN) : COLOR0 {
+    if(hasAlpha) {
+        float a = materialAlpha * tex2D(sampBaseTex, IN.texcoords).a;
+        clip(a - (alphaRef >= 0 ? alphaRef : 180.0/255.0));
+    }
+    return ESM_scale * saturate(IN.depth + shadowMWDepthBias);
 }
 
 float4 ShadowPS(ShadowVertOut IN) : COLOR0 {
@@ -163,6 +186,24 @@ technique T0 {
 
         VertexShader = compile vs_3_0 ShadowSoftenVS();
         PixelShader = compile ps_3_0 ShadowSoftenPS();
+    }
+    //------------------------------------------------------------
+    // Used to render Morrowind world geometry as shadow casters
+    Pass P4 {
+        ZEnable = true;
+        ZWriteEnable = true;
+        ColorWriteEnable = red|green|blue|alpha;
+        CullMode = CW;
+
+        StencilEnable = false;
+
+        AlphaBlendEnable = false;
+        AlphaTestEnable = false;
+        FogEnable = false;
+        Lighting = false;
+
+        VertexShader = compile vs_3_0 ShadowMWVS();
+        PixelShader = compile ps_3_0 ShadowMWPS();
     }
     //------------------------------------------------------------
 }

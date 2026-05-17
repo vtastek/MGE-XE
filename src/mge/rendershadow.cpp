@@ -5,6 +5,7 @@
 #include "mwbridge.h"
 #include "phasetimers.h"
 #include "proxydx/d3d8header.h"
+#include "scenegraph_geometry_cache.h"
 #include "support/log.h"
 #include "mge_tracy.h"
 
@@ -190,6 +191,64 @@ void DistantLand::renderShadowMap() {
     }
 }
 
+void DistantLand::renderShadowFromCache(int layer, const D3DXMATRIX* viewproj) {
+    if (layer != 0) return;  // near cascade only — before zone to avoid ghost entry
+    MGE_ZoneScopedN("renderShadowFromCache");
+
+    static constexpr float kShadowMinSize = 50.0f;
+
+    ViewFrustum frustum(viewproj);
+
+    effectShadow->BeginPass(PASS_RENDERSHADOWMAP_MW);
+    effect->SetFloat(ehMaterialAlpha, 1.0f);
+    effect->SetBool(ehHasBones, false);
+
+    for (const auto& kv : MGE::GeometryCache::cache()) {
+        const auto& e = kv.second;
+        if (!e.vb || !e.ib) continue;
+        if (e.blendEnable) continue;
+
+        if (!e.isSkinned && e.dynamicHint == 0) {
+            if (e.boundsRadius < kShadowMinSize) continue;
+        }
+
+        BoundingSphere bs;
+        bs.center = D3DXVECTOR3(e.worldTransformD3D[12], e.worldTransformD3D[13], e.worldTransformD3D[14]);
+        bs.radius = e.boundsRadius;
+        if (frustum.ContainsSphere(bs) == ViewFrustum::OUTSIDE) continue;
+
+        D3DXMATRIX shadowPalette[4];
+        if (e.isSkinned) {
+            shadowPalette[0] = *viewproj;
+            effect->SetInt(ehVertexBlendState, 1);
+        } else {
+            D3DXMatrixMultiply(&shadowPalette[0], reinterpret_cast<const D3DXMATRIX*>(e.worldTransformD3D), viewproj);
+            effect->SetInt(ehVertexBlendState, 0);
+        }
+        shadowPalette[1] = shadowPalette[2] = shadowPalette[3] = shadowPalette[0];
+        effect->SetMatrixArray(ehVertexBlendPalette, shadowPalette, 4);
+
+        if (e.alphaTest && e.d3dTexture) {
+            effect->SetTexture(ehTex0, e.d3dTexture);
+            effect->SetBool(ehHasAlpha, true);
+            effect->SetFloat(ehAlphaRef, e.alphaRef);
+        } else {
+            effect->SetTexture(ehTex0, nullptr);
+            effect->SetBool(ehHasAlpha, false);
+            effect->SetFloat(ehAlphaRef, -1.0f);
+        }
+
+        effectShadow->CommitChanges();
+        device->SetRenderState(D3DRS_CULLMODE, D3DCULL_CW);
+        device->SetStreamSource(0, e.vb, 0, MGE::GeometryCache::kVBStride);
+        device->SetIndices(e.ib);
+        device->SetFVF(MGE::GeometryCache::kVBFVF);
+        device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, e.vertexCount, 0, e.triangleCount);
+    }
+
+    effectShadow->EndPass();
+}
+
 template<class T>
 void DistantLand::renderShadowLayerGeneric(MWBridge* mwBridge, int layer, const D3DXMATRIX* inverseCameraProj, D3DXMATRIX* view, D3DXMATRIX* proj, VisibleSet<T>& visible_set) {
     // Clip to atlas region with viewport
@@ -243,6 +302,8 @@ void DistantLand::renderShadowLayer(int layer, float radius, const D3DXMATRIX* i
     // with rendering via parallelRead, so splitting cull from render
     // wouldn't be meaningful — one timer per cascade is the right grain.
     MGE_SCOPED_TIMER(layer == 0 ? "renderShadowLayer:c0" : "renderShadowLayer:c1");
+    ZoneNamedN(___tracy_zone_slc0, "renderShadowLayer:c0", g_tracyActive && layer == 0);
+    ZoneNamedN(___tracy_zone_slc1, "renderShadowLayer:c1", g_tracyActive && layer != 0);
     auto mwBridge = MWBridge::get();
     D3DXVECTOR3 lookAt, lookAtEye, shadowCameraPos, up(0, 0, 1);
     D3DXMATRIX* view = &smView[layer], *proj = &smProj[layer], *viewproj = &smViewproj[layer];
@@ -305,11 +366,14 @@ void DistantLand::renderShadowLayer(int layer, float radius, const D3DXMATRIX* i
 
         renderShadowLayerGeneric(mwBridge, layer, inverseCameraProj, view, proj, visible_set);
     }
+
+    // Render Morrowind world geometry as shadow casters from the geometry cache.
+    renderShadowFromCache(layer, viewproj);
 }
 
 // renderShadow - Renders shadows (using blending) over Morrowind shadow receivers
 void DistantLand::renderShadow() {
-    MGE_ZoneScopedN("renderShadow");
+    MGE_ZoneScopedN("applyShadows");
     // Supply view space -> shadow clip space matrix
     D3DXMATRIX inverseView, viewToShadow[2];
     D3DXMatrixInverse(&inverseView, NULL, &mwView);

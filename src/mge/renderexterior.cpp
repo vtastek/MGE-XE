@@ -138,7 +138,6 @@ void DistantLand::renderSky() {
 }
 
 void DistantLand::renderDistantLand(ID3DXEffect* e, const D3DXMATRIX* view, const D3DXMATRIX* proj) {
-    MGE_ZoneScopedN("renderDistantLand");
     MGE_SCOPED_TIMER("renderDistantLand");
     D3DXMATRIX world, viewproj = (*view) * (*proj);
     D3DXVECTOR4 viewsphere(eyePos.x, eyePos.y, eyePos.z, Configuration.DL.DrawDist * kCellSize);

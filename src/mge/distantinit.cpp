@@ -10,6 +10,7 @@
 #include "msocclient.h"
 #include "mwbridge.h"
 #include "mgeversion.h"
+#include "scenegraph_geometry_cache.h"
 #include "statusoverlay.h"
 #include "ipc/dlshare.h"
 #include <algorithm>
@@ -269,6 +270,12 @@ const D3DVERTEXELEMENT9 GrassElem[] = {
 
 
 
+// Called from msoc.dll when MSOC finishes verdict classification, before any display() calls.
+// Stores the MSOC-culled visible set for use in renderDepthFromCache this frame.
+static void __cdecl onVisibleGeom(void* const* shapes, const float* /*boundsXYZR*/, int count) {
+    DistantLand::updateVisibleSet(shapes, count);
+}
+
 bool DistantLand::init() {
     if (ready) {
         return true;
@@ -279,6 +286,7 @@ bool DistantLand::init() {
 
     LOG::logline(">> Starting Distant Land init");
     vsr.init(device);
+    MGE::GeometryCache::init(device);
     BSA::init();
 
     if (Configuration.UseSharedMemory && !initIpc()) {
@@ -326,6 +334,7 @@ bool DistantLand::init() {
     // the rest of distant-land is wired up so the resulting log banner
     // lands next to other distant-land init lines in mgeXE.log.
     MSOCClient::init();
+    MSOCClient::registerVisibleGeomCallback(onVisibleGeom);
 
     MWBridge::get()->patchResolveDuringInit(&resolveDynamicVisGroups);
 

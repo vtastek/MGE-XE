@@ -25,6 +25,8 @@ using FnAddOccluder         = int  (__cdecl*)(
 using FnAddPreTransformedOccluder = int  (__cdecl*)(
     const float* verts, int vtxCount, int stride, int offY, int offW,
     const unsigned int* tris, int triCount);
+using FnRegisterVisGeom   = void (__cdecl*)(void(__cdecl*)(void* const*, const float*, int));
+using FnUnregisterVisGeom = void (__cdecl*)(void(__cdecl*)(void* const*, const float*, int));
 
 HMODULE       g_module            = nullptr;
 FnIsMaskReady g_isMaskReady       = nullptr;
@@ -37,6 +39,8 @@ FnGetSnapshotAgeMs    g_getAgeMs         = nullptr;  // optional
 FnGetMaskResolution   g_getMaskRes       = nullptr;  // optional
 FnAddOccluder         g_addOccluder      = nullptr;  // optional
 FnAddPreTransformedOccluder g_addPreTransformedOccluder = nullptr;  // optional
+FnRegisterVisGeom     g_registerVisGeom   = nullptr;  // optional
+FnUnregisterVisGeom   g_unregisterVisGeom = nullptr;  // optional
 bool          g_probed             = false;
 
 // Frozen ABI codes from the plugin. Match PatchOcclusionCulling.h.
@@ -93,6 +97,10 @@ void MSOCClient::init() {
         GetProcAddress(g_module, "mwse_addOccluder"));
     g_addPreTransformedOccluder = reinterpret_cast<FnAddPreTransformedOccluder>(
         GetProcAddress(g_module, "mwse_addPreTransformedOccluder"));
+    g_registerVisGeom = reinterpret_cast<FnRegisterVisGeom>(
+        GetProcAddress(g_module, "mwse_registerVisibleGeomCallback"));
+    g_unregisterVisGeom = reinterpret_cast<FnUnregisterVisGeom>(
+        GetProcAddress(g_module, "mwse_unregisterVisibleGeomCallback"));
 
     if (!g_isMaskReady || !g_testSphere) {
         LOG::logline("-- MSOC: msoc.dll loaded but required exports missing; disabling");
@@ -108,6 +116,8 @@ void MSOCClient::init() {
         g_getMaskRes = nullptr;
         g_addOccluder = nullptr;
         g_addPreTransformedOccluder = nullptr;
+        g_registerVisGeom = nullptr;
+        g_unregisterVisGeom = nullptr;
         return;
     }
 
@@ -265,4 +275,16 @@ bool MSOCClient::addPreTransformedOccluder(
     return g_addPreTransformedOccluder(
         verts, vtxCount, stride, offY, offW,
         tris, triCount) != 0;
+}
+
+bool MSOCClient::registerVisibleGeomCallback(FnVisibleGeomCallback cb) {
+    if (!g_registerVisGeom || !cb) return false;
+    g_registerVisGeom(cb);
+    return true;
+}
+
+bool MSOCClient::unregisterVisibleGeomCallback(FnVisibleGeomCallback cb) {
+    if (!g_unregisterVisGeom || !cb) return false;
+    g_unregisterVisGeom(cb);
+    return true;
 }

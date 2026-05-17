@@ -5,8 +5,26 @@
 #include "mwbridge.h"
 #include "phasetimers.h"
 #include "proxydx/d3d8header.h"
+#include "scenegraph_geometry_cache.h"
 #include "support/log.h"
 #include "mge_tracy.h"
+
+#include <unordered_set>
+
+// MSOC-culled visible set received from the VisibleGeomCallback.
+// s_visibleKeys: current frame (being built by callback).
+// s_prevVisibleKeys: previous frame (ready at renderDepth time).
+// Both keyed on NiTriBasedGeometry* cast to uint32_t — matches GeometryCache keys.
+static std::unordered_set<uint32_t> s_visibleKeys;
+static std::unordered_set<uint32_t> s_prevVisibleKeys;
+
+void DistantLand::updateVisibleSet(void* const* shapes, int count) {
+    s_prevVisibleKeys = std::move(s_visibleKeys);
+    s_visibleKeys.clear();
+    s_visibleKeys.reserve(count);
+    for (int i = 0; i < count; ++i)
+        s_visibleKeys.insert(reinterpret_cast<uint32_t>(shapes[i]));
+}
 
 
 
@@ -34,11 +52,11 @@ void DistantLand::renderDepth() {
     device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
     effectDepth->EndPass();
 
-    // Recorded draw calls
+    // World geometry from scenegraph cache
     {
-        MGE_SCOPED_TIMER("renderDepth:recorded");
+        MGE_SCOPED_TIMER("renderDepth:cache");
         effectDepth->BeginPass(PASS_RENDERMWDEPTH);
-        renderDepthRecorded();
+        renderDepthFromCache(&mwView);
         effectDepth->EndPass();
     }
 
@@ -145,4 +163,73 @@ void DistantLand::renderDepthRecorded() {
         device->SetFVF(i.fvf);
         device->DrawIndexedPrimitive(i.primType, i.baseIndex, i.minIndex, i.vertCount, i.startIndex, i.primCount);
     }
+}
+
+void DistantLand::renderDepthFromCache(const D3DXMATRIX* gameView) {
+    MGE_ZoneScopedN("renderDepthFromCache");
+
+    // Non-skinned VBs are model-space; per-draw palette[0] = worldTransform * gameView.
+    // Skinned VBs are CPU-skinned to world-space; palette[0] = gameView.
+    // vertexBlendState=1 for skinned suppresses grassDisplacement() in the depth VS.
+    const float solidThreshold = 0.499f;
+
+    effect->SetBool(ehHasVCol, false);
+    effect->SetFloat(ehMaterialAlpha, 1.0f);
+    effect->SetBool(ehHasBones, false);
+    effect->SetInt(ehVertexBlendState, 0);
+
+    const auto& cacheMap = MGE::GeometryCache::cache();
+    const bool useVisibleSet = !s_prevVisibleKeys.empty();
+
+    auto drawEntry = [&](const MGE::GeometryCache::CachedGeometry& e) {
+        if (!e.vb || !e.ib) return;
+
+        D3DXMATRIX wvMat;
+        if (e.isSkinned) {
+            wvMat = *gameView;
+            effect->SetInt(ehVertexBlendState, 1);
+        } else {
+            D3DXMatrixMultiply(&wvMat, reinterpret_cast<const D3DXMATRIX*>(e.worldTransformD3D), gameView);
+            effect->SetInt(ehVertexBlendState, 0);
+        }
+        D3DXMATRIX wvPalette[4] = { wvMat, wvMat, wvMat, wvMat };
+        effect->SetMatrixArray(ehVertexBlendPalette, wvPalette, 4);
+
+        bool alphaDependent = e.alphaTest || e.blendEnable;
+        if (alphaDependent && e.d3dTexture) {
+            effect->SetTexture(ehTex0, e.d3dTexture);
+            effect->SetBool(ehHasAlpha, true);
+            effect->SetFloat(ehAlphaRef, e.alphaTest ? e.alphaRef : solidThreshold);
+        } else {
+            effect->SetTexture(ehTex0, nullptr);
+            effect->SetBool(ehHasAlpha, false);
+            effect->SetFloat(ehAlphaRef, -1.0f);
+        }
+
+        effectDepth->CommitChanges();
+
+        device->SetRenderState(D3DRS_CULLMODE, e.blendEnable ? D3DCULL_NONE : D3DCULL_CW);
+        device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+        device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+
+        device->SetStreamSource(0, e.vb, 0, MGE::GeometryCache::kVBStride);
+        device->SetIndices(e.ib);
+        device->SetFVF(MGE::GeometryCache::kVBFVF);
+        device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, e.vertexCount, 0, e.triangleCount);
+    };
+
+    if (useVisibleSet) {
+        // Iterate only the MSOC-culled visible set (~510 entries vs ~12000 full cache).
+        for (uint32_t key : s_prevVisibleKeys) {
+            auto it = cacheMap.find(key);
+            if (it != cacheMap.end()) drawEntry(it->second);
+        }
+    } else {
+        // Fallback: MSOC absent or first frame — render entire geometry cache.
+        for (const auto& kv : cacheMap) drawEntry(kv.second);
+    }
+
+    effect->SetTexture(ehTex0, nullptr);
+    effect->SetBool(ehHasAlpha, false);
+    effect->SetFloat(ehAlphaRef, -1.0f);
 }
