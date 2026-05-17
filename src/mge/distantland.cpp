@@ -8,11 +8,14 @@
 #include "mwbridge.h"
 #include "scenegraph.h"
 #include "mge_tracy.h"
+#include "statusoverlay.h"
 
 
 
 using std::string;
 using std::unordered_map;
+
+static bool g_contributeOccluders = false;
 
 #ifdef TRACY_ENABLE
 static constexpr tracy::SourceLocationData s_mwSkyLoc   { "MW sky",       "BeginScene",  __FILE__, 0, 0 };
@@ -114,13 +117,22 @@ void DistantLand::renderStage0() {
                     renderDistantLand(effect, &mwView, &distProj);
                     effect->EndPass();
 
+                    // Numpad0: toggle horizon-curtain contribution at runtime.
+                    if (GetAsyncKeyState(VK_NUMPAD3) & 0x0001) {
+                        g_contributeOccluders = !g_contributeOccluders;
+                        char msg[64];
+                        std::snprintf(msg, sizeof(msg), "MSOC contributions: %s",
+                                      g_contributeOccluders ? "ON" : "OFF");
+                        StatusOverlay::setStatus(msg);
+                    }
                     // Feed the horizon-curtain occluder into MSOC's mask
                     // for the next frame. Placed here (not inside
                     // renderDistantLand) because renderDistantLand also
                     // fires for water reflection and shadow passes; the
                     // contribution always uses mwView, so running it once
                     // per frame is enough.
-                    contributeDistantLandOccluders();
+                    if (g_contributeOccluders)
+                        contributeDistantLandOccluders();
                 }
 
                 // Draw distant statics, with alpha dissolve as they pass the near view boundary.

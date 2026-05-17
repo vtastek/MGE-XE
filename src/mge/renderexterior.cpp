@@ -7,6 +7,7 @@
 #include "phasetimers.h"
 #include "proxydx/d3d8header.h"
 #include "support/log.h"
+#include "statusoverlay.h"
 #include "terrain_horizon_occluder.h"
 #include "mge_tracy.h"
 
@@ -14,56 +15,17 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
-#include <unordered_map>
 #include <vector>
 
-// MSOC temporal hysteresis.
-// MSOC verdicts can be unstable for small / distant statics whose
-// projected rect is a few pixels wide — a 1-2 px camera jitter flips
-// the verdict frame-to-frame, producing visible flicker.
-//
-// Fix: track per-static "consecutive OCCLUDED" counter. Only cull once
-// the static has been reported OCCLUDED for the user-configured number
-// of frames in a row (mge.ini [Misc] "Occlusion Hysteresis Frames",
-// default 8). A single VISIBLE verdict resets the counter, so brief
-// cull spikes don't translate into visible flicker.
-//
-// Key = packed hash of sphere center XYZ. Statics don't move, so the
-// position is stable across frames and across the IPC boundary (sphere
-// data comes from the wire format, identical on both sides). Collisions
-// would mean two statics at the exact same XYZ share a counter — rare
-// in practice; worst outcome is "they cull together," still safer than
-// flicker.
 namespace {
-struct MsocHysteresisState {
-    std::uint8_t  consecutiveOccluded;
-    std::uint32_t lastSeenFrame;
-};
-std::unordered_map<std::uint64_t, MsocHysteresisState> g_msocHysteresis;
-std::uint32_t g_msocHysteresisFrame = 0;
-constexpr std::uint32_t kHysteresisAgeOutFrames = 60;
-
-inline std::uint64_t hashStaticKey(float x, float y, float z) {
-    std::uint32_t ix, iy, iz;
-    std::memcpy(&ix, &x, 4);
-    std::memcpy(&iy, &y, 4);
-    std::memcpy(&iz, &z, 4);
-    // splitmix-style mixing. Three primes are odd / coprime; XOR
-    // combine spreads bits across the 64-bit hash so close-XYZ
-    // statics don't collapse into the same bucket.
-    std::uint64_t h = (std::uint64_t)ix * 0x9E3779B97F4A7C15ull;
-    h ^= (std::uint64_t)iy * 0xBF58476D1CE4E5B9ull;
-    h ^= (std::uint64_t)iz * 0x94D049BB133111EBull;
-    return h;
-}
-
-// Horizon-curtain workspace. Lives at file scope so
-// DistantLand::shutdownHorizonWorkspace can free it on release. Lazily
-// initialized on first call to contributeDistantLandOccluders.
+// Horizon-curtain workspace — kept for shutdownHorizonWorkspace; no longer populated.
 thc_horizon_t           g_horizon{};
 thc_simplify_workspace_t g_horizonWs{};
 bool                    g_horizonInitialized = false;
 } // namespace
+
+// Numpad8/Numpad2: raise/lower MSOC low-static cutoff height (steps of 256 units).
+static float g_msocCutoffHeight = 2500.0f;
 
 
 
@@ -680,234 +642,200 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
     MGE_SCOPED_TIMER("applyMSOCToDistantStatics");
 
     msocOccluded.clear();
-    if (staticSet.Empty()) {
+    if (staticSet.Empty())
         return;
-    }
 
-    // Skip MSOC entirely in interior cells. The horizon curtain
-    // produces nothing useful indoors (no terrain horizon), and the
-    // ~228 us/frame the verdict pass costs is pure waste. The
-    // distant-statics rendering path is still active in interiors
-    // (via NoInteriorDL=False) but we don't bother culling it.
-    if (!MWBridge::get()->IsExterior()) {
+    if (!MWBridge::get()->IsExterior())
         return;
-    }
 
     const bool cullByOcclusion =
         Configuration.UseOcclusionCulling
         && MSOCClient::isAvailable()
         && MSOCClient::isMaskReady();
-    if (!cullByOcclusion) {
-        return;   // empty mask = nothing culled
-    }
+    if (!cullByOcclusion)
+        return;
 
     const unsigned setSize = (unsigned)staticSet.Size();
     msocOccluded.resize(setSize, 0);
 
-    // Constants — same values as the original implementation in
-    // buildStaticInstanceVB; kept here as the single source of truth.
-    //
-    // OBB escalation disabled (threshold bumped to "never"). The OBB
-    // test was added to resolve giants whose loose bounding sphere
-    // couldn't return OCCLUDED, but for tall-thin statics like the
-    // Telvanni mushroom towers, the OBB box may exclude the spire (or
-    // have tight Z), so the OBB triangles project entirely within the
-    // curtain region while the real geometry extends above the
-    // silhouette. Result: tower wrongly reports OCCLUDED while the
-    // sphere correctly reports VISIBLE. Sphere-only is more
-    // conservative and under-culls in the right direction; the cull
-    // rate hit is small now that the horizon curtain gives the sphere
-    // test enough mask coverage to resolve real occlusion.
-    constexpr float kOBBRadiusThreshold = std::numeric_limits<float>::max();
-    constexpr float kHandoffMargin      = 512.0f;
-    // User-tunable knobs (mge.ini, [Misc]):
-    //   "Occlusion Sphere Inflate"   — radius multiplier for verdict stability
-    //   "Occlusion Hysteresis Frames" — consecutive OCCLUDED frames before cull
-    const float kSphereInflate          = Configuration.OcclusionSphereInflate;
-    const std::uint8_t hysteresisFrames =
-        (std::uint8_t)Configuration.OcclusionHysteresisFrames;
-    const float farMSOCLimit   = Configuration.DL.FarStaticEnd * kCellSize;
-    const float farMSOCLimitSq = farMSOCLimit * farMSOCLimit;
+    // Numpad8/2: adjust cutoff height live.
+    if (GetAsyncKeyState(VK_NUMPAD8) & 0x0001) {
+        g_msocCutoffHeight += 256.0f;
+        char msg[64];
+        std::snprintf(msg, sizeof(msg), "MSOC cutoff: %.0f units", g_msocCutoffHeight);
+        StatusOverlay::setStatus(msg);
+    }
+    if (GetAsyncKeyState(VK_NUMPAD2) & 0x0001) {
+        g_msocCutoffHeight = std::max(0.0f, g_msocCutoffHeight - 256.0f);
+        char msg[64];
+        std::snprintf(msg, sizeof(msg), "MSOC cutoff: %.0f units", g_msocCutoffHeight);
+        StatusOverlay::setStatus(msg);
+    }
 
-    // Bump per-frame counter once per MSOC pass for hysteresis aging.
-    ++g_msocHysteresisFrame;
+    // Statics whose bounding sphere top sits at or below waterLevel + kTallness are
+    // bucketed into flat per-cell-group OBBs and tested as a batch (~33 calls).
+    // Statics above the cutoff (hillside objects, towers) go through the original
+    // per-static sphere batch — they are never grouped and never falsely culled.
+    const float kTallness  = g_msocCutoffHeight;
+    const float waterLevel = MWBridge::get()->WaterLevel();
+    const float cutoffZ    = waterLevel + kTallness;
 
-    // Batched sphere test — pack all spheres into one buffer, issue
-    // a single DLL call instead of N. Saves the per-sphere
-    // boundary-crossing overhead.
-    static std::vector<float> sphereScratch;
-    static std::vector<MSOCClient::TestResult> verdictScratch;
-    sphereScratch.clear();
-    verdictScratch.clear();
-    sphereScratch.reserve(setSize * 4);
-    verdictScratch.resize(setSize, MSOCClient::ResultVisible);
+    // Distance thresholds for group-size LOD (squared, avoids sqrt per static).
+    // Near  (<4 cells): 1x1-cell OBBs.
+    // Mid   (<8 cells): 2x2-cell OBBs.
+    // Far   (8+ cells): 3x3-cell OBBs.
+    const float kNearDistSq = (4.0f * kCellSize) * (4.0f * kCellSize);
+    const float kMidDistSq  = (8.0f * kCellSize) * (8.0f * kCellSize);
+
+    // Flat group list — typically ≤ 64 entries, linear search is cache-friendly
+    // and cheaper than unordered_map for this count.
+    struct GroupEntry {
+        std::uint64_t key;
+        float minX, maxX, minY, maxY;
+        MSOCClient::TestResult verdict;
+    };
+    static std::vector<GroupEntry>              groups;
+    // Per-static group index; 0xFFFF = high static (handled by sphere batch).
+    static std::vector<std::uint16_t>           staticGroupIdx;
+    // Sphere batch for "high" statics.
+    static std::vector<float>                   sphereBatch;
+    static std::vector<MSOCClient::TestResult>  sphereResults;
+
+    groups.clear();
+    groups.reserve(64);
+    sphereBatch.clear();
+    staticGroupIdx.assign(setSize, 0xFFFF);
+
+    // Pass 1: partition statics. Low → cell group (linear search).  High → sphere batch.
     {
-        MGE_SCOPED_TIMER("applyMSOCToDistantStatics:sphereBatch");
+        MGE_SCOPED_TIMER("applyMSOCToDistantStatics:partition");
         staticSet.Reset();
+        unsigned idx = 0;
         while (!staticSet.AtEnd()) {
             const auto& m = staticSet.Next();
-            sphereScratch.push_back(m.sphere.center.x);
-            sphereScratch.push_back(m.sphere.center.y);
-            sphereScratch.push_back(m.sphere.center.z);
-            sphereScratch.push_back(m.sphere.radius * kSphereInflate);
-        }
-        MSOCClient::classifySphereBatch(
-            sphereScratch.data(), (int)setSize, verdictScratch.data());
-    }
+            const float sx = m.sphere.center.x, sy = m.sphere.center.y;
+            const float sz = m.sphere.center.z, sr = m.sphere.radius;
 
-    int diagTested = 0, diagVisible = 0, diagOccluded = 0;
-    int diagViewCulled = 0, diagNotReady = 0;
-    int diagOBBCalls = 0, diagOBBOccluded = 0;
-    int diagHandoffSpared = 0, diagFarSpared = 0, diagHysteresisSpared = 0;
+            if (sz + sr <= cutoffZ) {
+                // Low static: find or create grid-aligned cell group.
+                const float dx  = sx - eyePos.x;
+                const float dy  = sy - eyePos.y;
+                const float dSq = dx * dx + dy * dy;
+                const int gCells = (dSq < kNearDistSq) ? 1 : (dSq < kMidDistSq) ? 2 : 3;
+                const float gSize = gCells * kCellSize;
+                const int gx = (int)floorf(sx / gSize);
+                const int gy = (int)floorf(sy / gSize);
+                const std::uint64_t key =
+                    ((std::uint64_t)(std::uint32_t)gx << 32) | (std::uint32_t)gy;
 
-    staticSet.Reset();
-    unsigned idx = 0;
-    while (!staticSet.AtEnd()) {
-        const auto& m = staticSet.Next();
-        ++diagTested;
-
-        MSOCClient::TestResult verdict = verdictScratch[idx];
-
-        // OBB escalation for giants (radius > kOBBRadiusThreshold).
-        if (m.sphere.radius > kOBBRadiusThreshold
-            && verdict == MSOCClient::ResultVisible)
-        {
-            ++diagOBBCalls;
-            const auto obbVerdict = MSOCClient::classifyOBB(
-                m.box.center.x, m.box.center.y, m.box.center.z,
-                m.box.vx.x * kSphereInflate, m.box.vx.y * kSphereInflate, m.box.vx.z * kSphereInflate,
-                m.box.vy.x * kSphereInflate, m.box.vy.y * kSphereInflate, m.box.vy.z * kSphereInflate,
-                m.box.vz.x * kSphereInflate, m.box.vz.y * kSphereInflate, m.box.vz.z * kSphereInflate);
-            if (obbVerdict != MSOCClient::ResultNotReady) {
-                verdict = obbVerdict;
-                if (verdict == MSOCClient::ResultOccluded) ++diagOBBOccluded;
-            }
-        }
-
-        switch (verdict) {
-        case MSOCClient::ResultVisible:    ++diagVisible;    break;
-        case MSOCClient::ResultOccluded:   ++diagOccluded;   break;
-        case MSOCClient::ResultViewCulled: ++diagViewCulled; break;
-        case MSOCClient::ResultNotReady:   ++diagNotReady;   break;
-        }
-
-        // Fast path: only OCCLUDED entries need hysteresis state. Most
-        // entries (typically ~70-80%) hit Visible / ViewCulled / NotReady
-        // and can exit here without touching the hash map. The previous
-        // implementation did the hash op for every entry regardless,
-        // which dominated the verdict-pass cost in dense exterior scenes
-        // (~5000 entries × ~150ns per hash op).
-        //
-        // Stale-entry handling: when a mesh that was previously OCCLUDED
-        // is now non-occluded, we leave its hState in the map untouched.
-        // The age-prune below evicts entries whose lastSeenFrame is more
-        // than kHysteresisAgeOutFrames behind. The next time the mesh
-        // hits OCCLUDED again, the gap-detection further down restarts
-        // its consecutive counter — see comment there.
-        if (verdict != MSOCClient::ResultOccluded) {
-            // msocOccluded[idx] stays 0 (render).
-            ++idx;
-            continue;
-        }
-
-        // verdict == OCCLUDED. Apply gates + hysteresis to decide
-        // whether to actually cull.
-        const float dx = m.sphere.center.x - eyePos.x;
-        const float dy = m.sphere.center.y - eyePos.y;
-        const float dz = m.sphere.center.z - eyePos.z;
-        const float distSq = dx * dx + dy * dy + dz * dz;
-
-        if (distSq > farMSOCLimitSq) {
-            ++diagFarSpared;
-            // Far gate spares — render. Skip hysteresis lookup too: a
-            // far-spared OCCLUDED is functionally the same as visible
-            // for our purposes.
-        }
-        else {
-            const float thresh = nearViewRange + m.sphere.radius + kHandoffMargin;
-            if (distSq < thresh * thresh) {
-                ++diagHandoffSpared;
-                // Handoff gate spares — render.
-            }
-            else {
-                // Hysteresis lookup happens ONLY here, after both fast
-                // gates passed. Detect "gap since last OCCLUDED" — if
-                // the mesh wasn't OCCLUDED last frame, restart the
-                // consecutive counter to preserve the original
-                // "consecutiveOccluded counts truly consecutive frames"
-                // semantic. Without this, a mesh oscillating in/out of
-                // occlusion could carry stale count across visible
-                // frames and trigger a cull earlier than it should.
-                const std::uint64_t hKey = hashStaticKey(
-                    m.sphere.center.x, m.sphere.center.y, m.sphere.center.z);
-                auto& hState = g_msocHysteresis[hKey];
-                if (g_msocHysteresisFrame - hState.lastSeenFrame > 1) {
-                    hState.consecutiveOccluded = 0;
+                // Linear scan — groups count is tiny (~33), fits in a cache line or two.
+                std::uint16_t gIdx = (std::uint16_t)groups.size();
+                for (std::uint16_t i = 0; i < (std::uint16_t)groups.size(); ++i) {
+                    if (groups[i].key == key) { gIdx = i; break; }
                 }
-                hState.lastSeenFrame = g_msocHysteresisFrame;
-
-                if (hState.consecutiveOccluded < hysteresisFrames) {
-                    ++hState.consecutiveOccluded;
-                    ++diagHysteresisSpared;
-                    // Hysteresis still in warmup — render.
+                if (gIdx == (std::uint16_t)groups.size()) {
+                    const float x0 = (float)gx * gSize;
+                    const float y0 = (float)gy * gSize;
+                    groups.push_back({key, x0, x0 + gSize, y0, y0 + gSize,
+                                      MSOCClient::ResultVisible});
                 }
-                else {
-                    // Sustained OCCLUDED past all gates — actually cull.
-                    msocOccluded[idx] = 1;
-                }
-            }
-        }
-        ++idx;
-    }
-
-    // Hysteresis age-prune. Drop entries not touched in the last
-    // kHysteresisAgeOutFrames frames. Run once per 60 frames so per-
-    // frame cost stays trivial.
-    if ((g_msocHysteresisFrame % 60) == 0) {
-        for (auto it = g_msocHysteresis.begin(); it != g_msocHysteresis.end();) {
-            if (g_msocHysteresisFrame - it->second.lastSeenFrame > kHysteresisAgeOutFrames) {
-                it = g_msocHysteresis.erase(it);
+                staticGroupIdx[idx] = gIdx;
             } else {
-                ++it;
+                // High static: per-static sphere test.
+                sphereBatch.push_back(sx);
+                sphereBatch.push_back(sy);
+                sphereBatch.push_back(sz);
+                sphereBatch.push_back(sr);
+            }
+            ++idx;
+        }
+    }
+
+    // Pass 2a: OBB test for each low group (flat slab at [waterLevel, cutoffZ]).
+    {
+        MGE_SCOPED_TIMER("applyMSOCToDistantStatics:obbTests");
+        const float slabCZ = (waterLevel + cutoffZ) * 0.5f;
+        const float slabHZ = kTallness * 0.5f;
+        for (auto& g : groups) {
+            const float cx = (g.minX + g.maxX) * 0.5f;
+            const float cy = (g.minY + g.maxY) * 0.5f;
+            const float hx = (g.maxX - g.minX) * 0.5f;
+            const float hy = (g.maxY - g.minY) * 0.5f;
+            g.verdict = MSOCClient::classifyOBB(
+                cx, cy, slabCZ,
+                hx,  0,      0,
+                 0, hy,      0,
+                 0,  0, slabHZ);
+        }
+    }
+
+    // Pass 2b: sphere batch for high statics.
+    // Results land directly in msocOccluded via staticGroupIdx == 0xFFFF slots.
+    int diagHighCulled = 0;
+    if (!sphereBatch.empty()) {
+        MGE_SCOPED_TIMER("applyMSOCToDistantStatics:sphereBatch");
+        const int nSpheres = (int)(sphereBatch.size() / 4);
+        sphereResults.assign(nSpheres, MSOCClient::ResultVisible);
+        MSOCClient::classifySphereBatch(sphereBatch.data(), nSpheres, sphereResults.data());
+        // Map results back: high statics appear in staticGroupIdx order (0xFFFF slots).
+        int si = 0;
+        for (unsigned idx = 0; idx < setSize; ++idx) {
+            if (staticGroupIdx[idx] == 0xFFFF) {
+                if (sphereResults[si] == MSOCClient::ResultOccluded) {
+                    msocOccluded[idx] = 1;
+                    ++diagHighCulled;
+                }
+                ++si;
             }
         }
     }
 
-    // Numpad-5 mask dump (debug feature, gated by LogDistantPipeline).
-    // Latched once-per-frame and only services on a frame where the
-    // mask is ready, so a tap that lands during a non-cull frame still
-    // dumps on the next eligible one.
+    // Pass 3: propagate group verdicts — direct array lookup, no recomputation.
+    int diagLowCulled = 0;
+    {
+        for (unsigned idx = 0; idx < setSize; ++idx) {
+            const std::uint16_t gIdx = staticGroupIdx[idx];
+            if (gIdx != 0xFFFF && groups[gIdx].verdict == MSOCClient::ResultOccluded) {
+                msocOccluded[idx] = 1;
+                ++diagLowCulled;
+            }
+        }
+    }
+
     if (Configuration.LogDistantPipeline) {
         static bool dumpPending = false;
         static int  dumpIndex   = 0;
-        if (GetAsyncKeyState(VK_NUMPAD5) & 0x0001) {
+        if (GetAsyncKeyState(VK_NUMPAD5) & 0x0001)
             dumpPending = true;
-        }
         if (dumpPending) {
             char exePath[MAX_PATH] = {};
             GetModuleFileNameA(NULL, exePath, MAX_PATH);
-            if (char* lastSlash = strrchr(exePath, '\\')) {
+            if (char* lastSlash = strrchr(exePath, '\\'))
                 *lastSlash = '\0';
-            }
             char fullPath[MAX_PATH];
-            std::snprintf(fullPath, sizeof(fullPath), "%s\\msoc_mask_%03d.pfm",
-                          exePath, dumpIndex++);
+            std::snprintf(fullPath, sizeof(fullPath), "%s\\msoc_mask_%03d.pfm", exePath, dumpIndex++);
             const bool ok = MSOCClient::dumpMask(fullPath);
-            LOG::logline("-- MSOC: Numpad5 mask dump %s %s",
-                         ok ? "->" : "FAILED for", fullPath);
+            LOG::logline("-- MSOC: Numpad5 mask dump %s %s", ok ? "->" : "FAILED for", fullPath);
             dumpPending = false;
         }
-    }
 
-    static int diagFrameCounter = 0;
-    if (Configuration.LogDistantPipeline && (diagFrameCounter++ % 60) == 0) {
-        const int rateNum = diagTested > 0 ? (diagOccluded * 100) / diagTested : 0;
-        LOG::logline(
-            "-- MSOC cull: tested=%d  occluded=%d (%d%%)  visible=%d  viewCulled=%d  notReady=%d  obb=%d/%d  handoffSpared=%d  farSpared=%d  hystSpared=%d  hystSize=%u",
-            diagTested, diagOccluded, rateNum,
-            diagVisible, diagViewCulled, diagNotReady,
-            diagOBBOccluded, diagOBBCalls, diagHandoffSpared, diagFarSpared,
-            diagHysteresisSpared, (unsigned)g_msocHysteresis.size());
+        static int diagFrameCounter = 0;
+        if ((diagFrameCounter++ % 60) == 0) {
+            int diagGroupsOccluded = 0;
+            for (const auto& g : groups)
+                if (g.verdict == MSOCClient::ResultOccluded) ++diagGroupsOccluded;
+            const int diagTotalCulled = diagLowCulled + diagHighCulled;
+            const unsigned nHigh = (unsigned)(sphereBatch.size() / 4);
+            LOG::logline(
+                "-- MSOC cull: statics=%u  low=%u(groups=%u occ=%d culled=%d)"
+                "  high=%u(culled=%d)  total=%d(%d%%)",
+                setSize,
+                setSize - nHigh, (unsigned)groups.size(),
+                diagGroupsOccluded, diagLowCulled,
+                nHigh, diagHighCulled,
+                diagTotalCulled,
+                setSize > 0 ? (diagTotalCulled * 100) / setSize : 0);
+        }
     }
 }
 
