@@ -170,6 +170,7 @@ void DistantLand::renderStage0() {
             }
 
             effect->End();
+            renderMSOCBasinBoundsDebug(&mwView, &distProj);
 
             // Reset matrices
             effect->SetMatrix(ehView, &mwView);

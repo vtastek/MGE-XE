@@ -252,6 +252,7 @@ public:
     static void cullDistantStatics_kickoff(const D3DXMATRIX* view, const D3DXMATRIX* proj);
     static void cullDistantStatics_finish();
     static void renderDistantStatics();
+    static void renderMSOCBasinBoundsDebug(const D3DXMATRIX* view, const D3DXMATRIX* proj);
 
     // MSOC occlusion verdict pass — walks the visible set, runs the
     // batched sphere query, applies far/handoff gates and temporal

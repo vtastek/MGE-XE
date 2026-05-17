@@ -27,6 +27,38 @@ bool                    g_horizonInitialized = false;
 // Numpad8/Numpad2: raise/lower MSOC low-static cutoff height (steps of 256 units).
 static float g_msocCutoffHeight = 2500.0f;
 
+namespace {
+struct MSOCBasinDebugBox {
+    float minX, maxX, minY, maxY, minZ, maxZ;
+    MSOCClient::TestResult verdict;
+};
+
+static bool g_drawMSOCBasinBounds = false;
+static std::vector<MSOCBasinDebugBox> g_msocBasinDebugBoxes;
+
+struct MSOCLineVertex {
+    float x, y, z;
+    DWORD color;
+};
+
+constexpr DWORD fvfMSOCLine = D3DFVF_XYZ | D3DFVF_DIFFUSE;
+
+DWORD colorForMSOCVerdict(MSOCClient::TestResult verdict) {
+    switch (verdict) {
+    case MSOCClient::ResultOccluded:   return D3DCOLOR_XRGB(255, 64, 64);
+    case MSOCClient::ResultViewCulled: return D3DCOLOR_XRGB(64, 128, 255);
+    case MSOCClient::ResultNotReady:   return D3DCOLOR_XRGB(255, 224, 64);
+    default:                           return D3DCOLOR_XRGB(64, 255, 96);
+    }
+}
+
+float distanceSqToAABB2D(float px, float py, float minX, float maxX, float minY, float maxY) {
+    const float dx = (px < minX) ? (minX - px) : (px > maxX) ? (px - maxX) : 0.0f;
+    const float dy = (py < minY) ? (minY - py) : (py > maxY) ? (py - maxY) : 0.0f;
+    return dx * dx + dy * dy;
+}
+} // namespace
+
 
 
 // renderSky - Render atmosphere scattering sky layer and other recorded draw calls on top
@@ -630,6 +662,79 @@ void DistantLand::renderDistantStatics() {
     device->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
 }
 
+void DistantLand::renderMSOCBasinBoundsDebug(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
+    if (GetAsyncKeyState(VK_NUMPAD9) & 0x0001) {
+        g_drawMSOCBasinBounds = !g_drawMSOCBasinBounds;
+        char msg[64];
+        std::snprintf(msg, sizeof(msg), "MSOC basin boxes: %s",
+                      g_drawMSOCBasinBounds ? "ON" : "OFF");
+        StatusOverlay::setStatus(msg);
+    }
+
+    if (!g_drawMSOCBasinBounds || g_msocBasinDebugBoxes.empty() || !view || !proj)
+        return;
+
+    IDirect3DStateBlock9* stateSaved = nullptr;
+    if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &stateSaved)) || !stateSaved)
+        return;
+
+    static std::vector<MSOCLineVertex> lineVerts;
+    lineVerts.clear();
+    lineVerts.reserve(g_msocBasinDebugBoxes.size() * 24);
+
+    auto pushLine = [](float ax, float ay, float az,
+                       float bx, float by, float bz,
+                       DWORD color) {
+        lineVerts.push_back({ax, ay, az, color});
+        lineVerts.push_back({bx, by, bz, color});
+    };
+
+    for (const auto& b : g_msocBasinDebugBoxes) {
+        const DWORD color = colorForMSOCVerdict(b.verdict);
+
+        pushLine(b.minX, b.minY, b.minZ, b.maxX, b.minY, b.minZ, color);
+        pushLine(b.maxX, b.minY, b.minZ, b.maxX, b.maxY, b.minZ, color);
+        pushLine(b.maxX, b.maxY, b.minZ, b.minX, b.maxY, b.minZ, color);
+        pushLine(b.minX, b.maxY, b.minZ, b.minX, b.minY, b.minZ, color);
+
+        pushLine(b.minX, b.minY, b.maxZ, b.maxX, b.minY, b.maxZ, color);
+        pushLine(b.maxX, b.minY, b.maxZ, b.maxX, b.maxY, b.maxZ, color);
+        pushLine(b.maxX, b.maxY, b.maxZ, b.minX, b.maxY, b.maxZ, color);
+        pushLine(b.minX, b.maxY, b.maxZ, b.minX, b.minY, b.maxZ, color);
+
+        pushLine(b.minX, b.minY, b.minZ, b.minX, b.minY, b.maxZ, color);
+        pushLine(b.maxX, b.minY, b.minZ, b.maxX, b.minY, b.maxZ, color);
+        pushLine(b.maxX, b.maxY, b.minZ, b.maxX, b.maxY, b.maxZ, color);
+        pushLine(b.minX, b.maxY, b.minZ, b.minX, b.maxY, b.maxZ, color);
+    }
+
+    D3DXMATRIX identity;
+    D3DXMatrixIdentity(&identity);
+
+    device->SetVertexDeclaration(nullptr);
+    device->SetVertexShader(nullptr);
+    device->SetPixelShader(nullptr);
+    device->SetFVF(fvfMSOCLine);
+    device->SetTransform(D3DTS_WORLD, &identity);
+    device->SetTransform(D3DTS_VIEW, view);
+    device->SetTransform(D3DTS_PROJECTION, proj);
+    device->SetTexture(0, nullptr);
+    device->SetRenderState(D3DRS_LIGHTING, FALSE);
+    device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+    device->SetRenderState(D3DRS_ZENABLE, FALSE);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+    device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    device->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
+
+    device->DrawPrimitiveUP(D3DPT_LINELIST, (UINT)(lineVerts.size() / 2),
+                            lineVerts.data(), sizeof(MSOCLineVertex));
+
+    stateSaved->Apply();
+    stateSaved->Release();
+}
+
 // MSOC verdict pass — populates `msocOccluded` with a per-instance
 // cull mask consumed by both the color and depth render paths.
 //
@@ -642,6 +747,7 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
     MGE_SCOPED_TIMER("applyMSOCToDistantStatics");
 
     msocOccluded.clear();
+    g_msocBasinDebugBoxes.clear();
     if (staticSet.Empty())
         return;
 
@@ -686,18 +792,20 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
     // Far   (8+ cells): 3x3-cell OBBs.
     const float kNearDistSq = (4.0f * kCellSize) * (4.0f * kCellSize);
     const float kMidDistSq  = (8.0f * kCellSize) * (8.0f * kCellSize);
+    const float groupCullStartDist = nearViewRange + kCellSize;
+    const float groupCullStartDistSq = groupCullStartDist * groupCullStartDist;
 
     // Flat group list — typically ≤ 64 entries, linear search is cache-friendly
     // and cheaper than unordered_map for this count.
     struct GroupEntry {
-        std::uint64_t key;
+        int gx, gy, gCells;
         float minX, maxX, minY, maxY;
         MSOCClient::TestResult verdict;
     };
     static std::vector<GroupEntry>              groups;
-    // Per-static group index; 0xFFFF = high static (handled by sphere batch).
+    // Per-static group index; 0xFFFF = handled by sphere batch.
     static std::vector<std::uint16_t>           staticGroupIdx;
-    // Sphere batch for "high" statics.
+    // Sphere batch for high statics and near low statics.
     static std::vector<float>                   sphereBatch;
     static std::vector<MSOCClient::TestResult>  sphereResults;
 
@@ -717,7 +825,8 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
             const float sz = m.sphere.center.z, sr = m.sphere.radius;
 
             if (sz + sr <= cutoffZ) {
-                // Low static: find or create grid-aligned cell group.
+                // Low static: use grouped OBBs only after the near handoff band.
+                // Close low statics use the original per-static sphere path.
                 const float dx  = sx - eyePos.x;
                 const float dy  = sy - eyePos.y;
                 const float dSq = dx * dx + dy * dy;
@@ -725,18 +834,29 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
                 const float gSize = gCells * kCellSize;
                 const int gx = (int)floorf(sx / gSize);
                 const int gy = (int)floorf(sy / gSize);
-                const std::uint64_t key =
-                    ((std::uint64_t)(std::uint32_t)gx << 32) | (std::uint32_t)gy;
+                const float x0 = (float)gx * gSize;
+                const float y0 = (float)gy * gSize;
+                const float minDistSq = distanceSqToAABB2D(
+                    eyePos.x, eyePos.y, x0, x0 + gSize, y0, y0 + gSize);
+                if (minDistSq <= groupCullStartDistSq) {
+                    sphereBatch.push_back(sx);
+                    sphereBatch.push_back(sy);
+                    sphereBatch.push_back(sz);
+                    sphereBatch.push_back(sr);
+                    ++idx;
+                    continue;
+                }
 
                 // Linear scan — groups count is tiny (~33), fits in a cache line or two.
                 std::uint16_t gIdx = (std::uint16_t)groups.size();
                 for (std::uint16_t i = 0; i < (std::uint16_t)groups.size(); ++i) {
-                    if (groups[i].key == key) { gIdx = i; break; }
+                    if (groups[i].gx == gx && groups[i].gy == gy && groups[i].gCells == gCells) {
+                        gIdx = i;
+                        break;
+                    }
                 }
                 if (gIdx == (std::uint16_t)groups.size()) {
-                    const float x0 = (float)gx * gSize;
-                    const float y0 = (float)gy * gSize;
-                    groups.push_back({key, x0, x0 + gSize, y0, y0 + gSize,
+                    groups.push_back({gx, gy, gCells, x0, x0 + gSize, y0, y0 + gSize,
                                       MSOCClient::ResultVisible});
                 }
                 staticGroupIdx[idx] = gIdx;
@@ -751,7 +871,7 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
         }
     }
 
-    // Pass 2a: OBB test for each low group (flat slab at [waterLevel, cutoffZ]).
+    // Pass 2a: raster test each low group against its projected bbox footprint.
     {
         MGE_SCOPED_TIMER("applyMSOCToDistantStatics:obbTests");
         const float slabCZ = (waterLevel + cutoffZ) * 0.5f;
@@ -766,24 +886,29 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
                 hx,  0,      0,
                  0, hy,      0,
                  0,  0, slabHZ);
+            if (g_drawMSOCBasinBounds) {
+                g_msocBasinDebugBoxes.push_back({
+                    g.minX, g.maxX, g.minY, g.maxY, waterLevel, cutoffZ, g.verdict
+                });
+            }
         }
     }
 
-    // Pass 2b: sphere batch for high statics.
+    // Pass 2b: sphere batch for high statics and near low statics.
     // Results land directly in msocOccluded via staticGroupIdx == 0xFFFF slots.
-    int diagHighCulled = 0;
+    int diagSphereCulled = 0;
     if (!sphereBatch.empty()) {
         MGE_SCOPED_TIMER("applyMSOCToDistantStatics:sphereBatch");
         const int nSpheres = (int)(sphereBatch.size() / 4);
         sphereResults.assign(nSpheres, MSOCClient::ResultVisible);
         MSOCClient::classifySphereBatch(sphereBatch.data(), nSpheres, sphereResults.data());
-        // Map results back: high statics appear in staticGroupIdx order (0xFFFF slots).
+        // Map results back: sphere-tested statics appear in staticGroupIdx order (0xFFFF slots).
         int si = 0;
         for (unsigned idx = 0; idx < setSize; ++idx) {
             if (staticGroupIdx[idx] == 0xFFFF) {
                 if (sphereResults[si] == MSOCClient::ResultOccluded) {
                     msocOccluded[idx] = 1;
-                    ++diagHighCulled;
+                    ++diagSphereCulled;
                 }
                 ++si;
             }
@@ -824,15 +949,15 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
             int diagGroupsOccluded = 0;
             for (const auto& g : groups)
                 if (g.verdict == MSOCClient::ResultOccluded) ++diagGroupsOccluded;
-            const int diagTotalCulled = diagLowCulled + diagHighCulled;
-            const unsigned nHigh = (unsigned)(sphereBatch.size() / 4);
+            const int diagTotalCulled = diagLowCulled + diagSphereCulled;
+            const unsigned nSphere = (unsigned)(sphereBatch.size() / 4);
             LOG::logline(
                 "-- MSOC cull: statics=%u  low=%u(groups=%u occ=%d culled=%d)"
-                "  high=%u(culled=%d)  total=%d(%d%%)",
+                "  sphere=%u(culled=%d)  total=%d(%d%%)",
                 setSize,
-                setSize - nHigh, (unsigned)groups.size(),
+                setSize - nSphere, (unsigned)groups.size(),
                 diagGroupsOccluded, diagLowCulled,
-                nHigh, diagHighCulled,
+                nSphere, diagSphereCulled,
                 diagTotalCulled,
                 setSize > 0 ? (diagTotalCulled * 100) / setSize : 0);
         }
