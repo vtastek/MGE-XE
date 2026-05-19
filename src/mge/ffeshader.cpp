@@ -313,7 +313,20 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
     // Directional sun handling stays via the engine loop below — the sun
     // is set up via MGEProxyDevice::SetLight intercept and threaded
     // through lightrs->active. Only point-light fill is replaced.
-    const auto& snapshotLights = MGE::SceneGraph::pointLights();
+    // The async-walk worker can publish-swap MGE::SceneGraph::g_pointLights
+    // out from under us at any moment (scenegraph.cpp:267-268). Without the
+    // SnapshotReadLock that scenegraph.h:83 explicitly requires, iterating a
+    // raw reference is a use-after-swap that crashes when snapshotCount peaks
+    // (observed at snapshotCount=256 / kMaxTexLights). Copy the vector under
+    // the lock, then iterate the local copy without holding the lock for the
+    // rest of the upload + precull + selection block (which includes blocking
+    // D3D calls like LockRect).
+    std::vector<MGE::SceneGraph::PointLight> snapshotLightsCopy;
+    {
+        MGE::SceneGraph::SnapshotReadLock lk;
+        snapshotLightsCopy = MGE::SceneGraph::pointLights();
+    }
+    const auto& snapshotLights = snapshotLightsCopy;
     const unsigned int snapshotCount =
         std::min<unsigned int>(static_cast<unsigned int>(snapshotLights.size()), kMaxTexLights);
     const bool useTextureLights = (snapshotCount > 0) && (texLightData != nullptr);
