@@ -596,7 +596,13 @@ void DistantLand::cullDistantStatics_finish() {
     if (Configuration.UseSharedMemory) {
         {
             MGE_SCOPED_TIMER("cullDistantStatics:finishWait");
-            ipcClient.waitForCompletion();
+            // Guarded wait: an interleaved RPC between kickoff and here
+            // (e.g. cullGrass's getVisibleMeshesCoarse, which awaits its
+            // own result) may already have drained the AllRanges
+            // completion. In that case the statics data is ready and no
+            // RPC is pending — an unconditional waitForCompletion would
+            // block on an event nobody signals and time out at 60s.
+            ipcClient.tryWaitForCompletion();
         }
     }
 

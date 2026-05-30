@@ -55,8 +55,6 @@ void DistantLand::renderStage0() {
     // engine has constructed the singleton. Replaces the previous MWSE-
     // driven MGEAPIv4::onSceneGraphReady() trigger (dropped on this branch).
     MGE::SceneGraph::onFrameReady();
-    // Build geometry cache for depth/shadow from cache rendering.
-    MGE::GeometryCache::onFrameReady(MGE::SceneGraph::getDataHandler());
 
     // Update current cell and select distant static set
     selectDistantCell();
@@ -98,7 +96,21 @@ void DistantLand::renderStage0() {
                 cullDistantStatics_kickoff(&mwView, &distProj);
             }
 
-            // Shadow map early render
+            // Cull grass early so renderGrassInstZ in the depth pre-pass has data.
+            if ((Configuration.MGEFlags & USE_GRASS) && mwBridge->IsExterior()) {
+                cullGrass(&mwView, &mwProj);
+            }
+
+            // Full depth pre-pass: near scene (CPU/GPU overlap with GeomCache
+            // walk) then distant land, statics, grass. Depth buffer is complete
+            // before any color pass runs, enabling early-z across DL, reflections,
+            // and the Morrowind scene.
+            effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
+            renderDepth();
+            effectDepth->End();
+
+            // Shadow map runs after the depth pre-pass so renderShadowFromCache
+            // sees the freshly updated geometry cache from renderDepth's overlap.
             if (Configuration.MGEFlags & USE_SHADOWS) {
                 if (mwBridge->CellHasWeather() && !mwBridge->IsMenu()) {
                     effectShadow->Begin(&passes, D3DXFX_DONOTSAVESTATE);
@@ -138,17 +150,13 @@ void DistantLand::renderStage0() {
                         contributeDistantLandOccluders();
                 }
 
-                // Draw distant statics, with alpha dissolve as they pass the near view boundary.
-                // _finish blocks until the kickoff RPC completes, then
-                // runs applyMSOCToDistantStatics to populate msocOccluded.
+                // Draw distant statics. cullDistantStatics_finish was called
+                // inside renderDepth (depth pre-pass) so msocOccluded is ready.
                 if (kickedOffDistantStatics) {
                     DWORD p = mwBridge->CellHasWeather() ? PASS_RENDERSTATICSEXTERIOR : PASS_RENDERSTATICSINTERIOR;
                     effect->BeginPass(p);
                     vsr.beginAlphaToCoverage(device);
-
-                    cullDistantStatics_finish();
                     renderDistantStatics();
-
                     vsr.endAlphaToCoverage(device);
                     effect->EndPass();
                 }
@@ -231,11 +239,6 @@ void DistantLand::renderStage1() {
         // Save state block manually since we can change FVF/decl
         device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
 
-        // TODO: Locate this properly
-        if (isDistantCell()) {
-            cullGrass(&mwView, &mwProj);
-        }
-
         if (isDistantCell()) {
             // Render over Morrowind domain
             effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
@@ -258,11 +261,6 @@ void DistantLand::renderStage1() {
 
             effect->End();
         }
-
-        // Depth texture from recorded renders and distant land
-        effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
-        renderDepth();
-        effectDepth->End();
 
         // Restore render state
         stateSaved->Apply();

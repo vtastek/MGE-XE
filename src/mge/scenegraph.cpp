@@ -256,6 +256,7 @@ namespace MGE::SceneGraph {
         // FFE consumer's per-frame re-upload is cheaper than the copy).
         //
         void rebuildAsync() {
+            MGE_ZoneScopedN("SceneGraph::rebuildAsync");
             g_pointLightsW.clear();
             g_directionalLightsW.clear();
 

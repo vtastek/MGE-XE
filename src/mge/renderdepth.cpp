@@ -5,6 +5,7 @@
 #include "mwbridge.h"
 #include "phasetimers.h"
 #include "proxydx/d3d8header.h"
+#include "scenegraph.h"
 #include "scenegraph_geometry_cache.h"
 #include "support/log.h"
 #include "mge_tracy.h"
@@ -52,13 +53,15 @@ void DistantLand::renderDepth() {
     device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
     effectDepth->EndPass();
 
-    // World geometry from scenegraph cache
+    // Near-scene geometry from scenegraph cache. Kick GPU first, then
+    // update the cache on CPU while the GPU renders — CPU/GPU overlap.
     {
         MGE_SCOPED_TIMER("renderDepth:cache");
         effectDepth->BeginPass(PASS_RENDERMWDEPTH);
         renderDepthFromCache(&mwView);
         effectDepth->EndPass();
     }
+    MGE::GeometryCache::onFrameReady(MGE::SceneGraph::getDataHandler());
 
     if (isDistantCell()) {
         if (!mwBridge->IsUnderwater(eyePos.z)) {
@@ -70,10 +73,13 @@ void DistantLand::renderDepth() {
                 effectDepth->EndPass();
             }
 
-            // Distant statics. cullDistantStatics (run earlier from the
-            // color path) has already populated msocOccluded; the depth
-            // pass consumes the same skip mask so depth and color agree
-            // on which instances are present.
+            // Finish the async statics cull here so depth and color both
+            // consume the same msocOccluded mask. Moved from Stage0's
+            // color pass so it overlaps with land depth on the GPU.
+            if (Configuration.MGEFlags & USE_DISTANT_STATICS) {
+                cullDistantStatics_finish();
+            }
+
             {
                 MGE_SCOPED_TIMER("renderDepth:statics");
                 effectDepth->BeginPass(PASS_RENDERSTATICSDEPTH);

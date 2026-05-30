@@ -54,7 +54,6 @@ namespace IPC {
 		bool m_isRpcPending;
 
 		bool beginRpc(Command command);
-		WakeReason tryWaitForCompletion(DWORD ms = MaxWait);
 
 	public:
 		Client();
@@ -233,5 +232,15 @@ namespace IPC {
 		bool sortVisibleSet(VecId visibleSet, VisibleSetSort sort);
 
 		WakeReason waitForCompletion(DWORD ms = MaxWait);
+
+		/**
+		* @brief Wait for the current RPC to complete, but only if one is
+		*        actually pending. Returns Complete immediately when no RPC
+		*        is outstanding. Use this (rather than waitForCompletion) when
+		*        an earlier interleaved RPC may already have drained the
+		*        completion you were waiting for — otherwise waitForCompletion
+		*        blocks on an event nobody will signal and times out at MaxWait.
+		*/
+		WakeReason tryWaitForCompletion(DWORD ms = MaxWait);
 	};
 }
