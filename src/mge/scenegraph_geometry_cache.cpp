@@ -32,8 +32,9 @@ namespace MGE::GeometryCache {
         std::unordered_map<IDirect3DTexture9*, const char*> g_textureNameMap;
 
         void releaseEntry(CachedGeometry& e) {
-            if (e.vb) { e.vb->Release(); e.vb = nullptr; }
-            if (e.ib) { e.ib->Release(); e.ib = nullptr; }
+            if (e.vb[0]) { e.vb[0]->Release(); e.vb[0] = nullptr; }
+            if (e.vb[1]) { e.vb[1]->Release(); e.vb[1] = nullptr; }
+            if (e.ib)    { e.ib->Release();    e.ib    = nullptr; }
         }
 
         IDirect3DTexture9* getDX9Texture(NI::Texture* tex) {
@@ -108,16 +109,17 @@ namespace MGE::GeometryCache {
 
         void uploadEntry(CachedGeometry& e, NI::TriBasedGeometry* geom,
                          NI::TriBasedGeometryData* data) {
-            if (e.vb) { e.vb->Release(); e.vb = nullptr; }
-            if (e.ib) { e.ib->Release(); e.ib = nullptr; }
-
             const auto vertexCount = static_cast<uint32_t>(data->getActiveVertexCount());
             const auto triCount    = static_cast<uint32_t>(data->getActiveTriangleCount());
 
             const auto* mv = data->vertex;          // model-space, always present
             const bool  sk = (geom->skinInstance.get() != nullptr);
 
-            if (!vertexCount || !triCount || !mv) return;
+            // Invalid geometry — drop any stale buffers so the entry is skipped.
+            if (!vertexCount || !triCount || !mv) {
+                releaseEntry(e);
+                return;
+            }
 
             // Validate skin data before allocating VB (avoids allocate-then-release).
             NI::SkinInstance* si = nullptr;
@@ -125,78 +127,108 @@ namespace MGE::GeometryCache {
             if (sk) {
                 si = geom->skinInstance.get();
                 sd = si ? si->skinData.get() : nullptr;
-                if (!sd || !si->bones) return;
+                if (!sd || !si->bones) {
+                    releaseEntry(e);
+                    return;
+                }
             }
 
-            // VB: world-space pos + zero normal + white color + UV (set 0)
+            // On a size change, drop both slots + IB so they repopulate at the
+            // new size; the unused slot rebuilds lazily next time it's written.
+            const bool sizeChanged = (e.vertexCount != vertexCount) || (e.triangleCount != triCount);
+            if (sizeChanged) {
+                if (e.vb[0]) { e.vb[0]->Release(); e.vb[0] = nullptr; }
+                if (e.vb[1]) { e.vb[1]->Release(); e.vb[1] = nullptr; }
+                if (e.ib)    { e.ib->Release();    e.ib    = nullptr; }
+            }
+
+            // Write the slot NOT being read by the in-flight depth pass (which
+            // reads vb[writeSlot] from last frame); flip writeSlot at the end so
+            // the shadow pass reads the fresh slot. Avoids per-frame VB churn
+            // while keeping the depth/shadow CPU-GPU overlap hazard-free.
+            const uint8_t slot = 1u - e.writeSlot;
+
+            // VB: world-space pos + zero normal + white color + UV (set 0).
             // Matches MorrowindVertIn so the depth/shadow VS declaration is satisfied.
-            HRESULT hr = g_device->CreateVertexBuffer(
-                vertexCount * sizeof(DepthVertex),
-                D3DUSAGE_WRITEONLY,
-                MGE::GeometryCache::kVBFVF,
-                D3DPOOL_MANAGED, &e.vb, nullptr);
-            if (FAILED(hr)) return;
-
-            void* vbData = nullptr;
-            e.vb->Lock(0, 0, &vbData, 0);
-            auto* verts = static_cast<DepthVertex*>(vbData);
-            const auto* uvs = data->textureCoords;  // NI::Point2*, nullptr if no UVs
-
-            if (sk) {
-                // CPU skinning: accumulate weighted bone contributions into world-space.
-                for (uint32_t i = 0; i < vertexCount; ++i) {
-                    verts[i].x = verts[i].y = verts[i].z = 0.0f;
-                    verts[i].nx = 0.0f; verts[i].ny = 0.0f; verts[i].nz = 0.0f;
-                    verts[i].color = 0xFFFFFFFF;
-                    verts[i].u = uvs ? uvs[i].x : 0.0f;
-                    verts[i].v = uvs ? uvs[i].y : 0.0f;
-                }
-                const uint32_t numBones = sd->numBones;
-                for (uint32_t b = 0; b < numBones; ++b) {
-                    auto* boneNode = si->bones[b];
-                    if (!boneNode) continue;
-                    const auto& bdata = sd->boneData[b];
-                    if (!bdata.weights) continue;
-                    const NI::Transform& offset = bdata.transform;
-                    const NI::Transform& bworld = boneNode->worldTransform;
-                    for (uint32_t k = 0; k < bdata.weightCount; ++k) {
-                        const uint32_t vi = bdata.weights[k].index;
-                        if (vi >= vertexCount) continue;
-                        const float w = bdata.weights[k].weight;
-                        const NI::Point3 v_bone  = offset * NI::Point3{mv[vi].x, mv[vi].y, mv[vi].z};
-                        const NI::Point3 v_world = bworld * v_bone;
-                        verts[vi].x += w * v_world.x;
-                        verts[vi].y += w * v_world.y;
-                        verts[vi].z += w * v_world.z;
-                    }
-                }
-            } else {
-                // Non-skinned: store model-space positions.
-                // worldTransformD3D is set per-frame and applied per-draw.
-                for (uint32_t i = 0; i < vertexCount; ++i) {
-                    verts[i].x = mv[i].x; verts[i].y = mv[i].y; verts[i].z = mv[i].z;
-                    verts[i].nx = 0.0f; verts[i].ny = 0.0f; verts[i].nz = 0.0f;
-                    verts[i].color = 0xFFFFFFFF;
-                    verts[i].u = uvs ? uvs[i].x : 0.0f;
-                    verts[i].v = uvs ? uvs[i].y : 0.0f;
-                }
+            if (!e.vb[slot]) {
+                HRESULT hr = g_device->CreateVertexBuffer(
+                    vertexCount * sizeof(DepthVertex),
+                    D3DUSAGE_WRITEONLY,
+                    MGE::GeometryCache::kVBFVF,
+                    D3DPOOL_MANAGED, &e.vb[slot], nullptr);
+                if (FAILED(hr)) { e.vb[slot] = nullptr; return; }
             }
-            e.vb->Unlock();
 
-            // IB: triangle indices (uint16, 6 bytes per triangle)
-            const auto* triList = data->getTriList();
-            if (triList) {
-                hr = g_device->CreateIndexBuffer(
+            // IB: triangle indices (uint16, 6 bytes per triangle), shared across
+            // slots. Topology is constant for skinned meshes, so the IB is written
+            // only when it is (re)created; non-skinned re-uploads (revision bump)
+            // rewrite it too.
+            const bool createdIB = (e.ib == nullptr);
+            if (createdIB) {
+                g_device->CreateIndexBuffer(
                     triCount * 6, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16,
                     D3DPOOL_MANAGED, &e.ib, nullptr);
-                if (SUCCEEDED(hr)) {
+            }
+
+            void* vbData = nullptr;
+            if (SUCCEEDED(e.vb[slot]->Lock(0, 0, &vbData, 0))) {
+                auto* verts = static_cast<DepthVertex*>(vbData);
+                const auto* uvs = data->textureCoords;  // NI::Point2*, nullptr if no UVs
+
+                if (sk) {
+                    // CPU skinning: accumulate weighted bone contributions into world-space.
+                    for (uint32_t i = 0; i < vertexCount; ++i) {
+                        verts[i].x = verts[i].y = verts[i].z = 0.0f;
+                        verts[i].nx = 0.0f; verts[i].ny = 0.0f; verts[i].nz = 0.0f;
+                        verts[i].color = 0xFFFFFFFF;
+                        verts[i].u = uvs ? uvs[i].x : 0.0f;
+                        verts[i].v = uvs ? uvs[i].y : 0.0f;
+                    }
+                    const uint32_t numBones = sd->numBones;
+                    for (uint32_t b = 0; b < numBones; ++b) {
+                        auto* boneNode = si->bones[b];
+                        if (!boneNode) continue;
+                        const auto& bdata = sd->boneData[b];
+                        if (!bdata.weights) continue;
+                        const NI::Transform& offset = bdata.transform;
+                        const NI::Transform& bworld = boneNode->worldTransform;
+                        for (uint32_t k = 0; k < bdata.weightCount; ++k) {
+                            const uint32_t vi = bdata.weights[k].index;
+                            if (vi >= vertexCount) continue;
+                            const float w = bdata.weights[k].weight;
+                            const NI::Point3 v_bone  = offset * NI::Point3{mv[vi].x, mv[vi].y, mv[vi].z};
+                            const NI::Point3 v_world = bworld * v_bone;
+                            verts[vi].x += w * v_world.x;
+                            verts[vi].y += w * v_world.y;
+                            verts[vi].z += w * v_world.z;
+                        }
+                    }
+                } else {
+                    // Non-skinned: store model-space positions.
+                    // worldTransformD3D is set per-frame and applied per-draw.
+                    for (uint32_t i = 0; i < vertexCount; ++i) {
+                        verts[i].x = mv[i].x; verts[i].y = mv[i].y; verts[i].z = mv[i].z;
+                        verts[i].nx = 0.0f; verts[i].ny = 0.0f; verts[i].nz = 0.0f;
+                        verts[i].color = 0xFFFFFFFF;
+                        verts[i].u = uvs ? uvs[i].x : 0.0f;
+                        verts[i].v = uvs ? uvs[i].y : 0.0f;
+                    }
+                }
+                e.vb[slot]->Unlock();
+            }
+
+            if (e.ib && (createdIB || !sk)) {
+                const auto* triList = data->getTriList();
+                if (triList) {
                     void* ibData = nullptr;
-                    e.ib->Lock(0, 0, &ibData, 0);
-                    memcpy(ibData, triList, triCount * 6);
-                    e.ib->Unlock();
+                    if (SUCCEEDED(e.ib->Lock(0, 0, &ibData, 0))) {
+                        memcpy(ibData, triList, triCount * 6);
+                        e.ib->Unlock();
+                    }
                 }
             }
 
+            e.writeSlot     = slot;   // flip: shadow pass now reads the fresh slot
             e.vertexCount   = vertexCount;
             e.triangleCount = triCount;
             e.revisionID    = data->revisionID;
@@ -233,7 +265,7 @@ namespace MGE::GeometryCache {
             auto it = g_cache.find(key);
             if (it == g_cache.end()) {
                 auto& e = g_cache[key];
-                e.vb = nullptr; e.ib = nullptr;
+                e.vb[0] = e.vb[1] = nullptr; e.ib = nullptr; e.writeSlot = 0;
                 uploadEntry(e, geom, data);
                 extractMaterial(e, geom);
                 buildD3DTransform(e.worldTransformD3D, geom);

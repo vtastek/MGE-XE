@@ -76,10 +76,13 @@ void DistantLand::renderStage0() {
         ///LOG::logline("Sky prims: %d", recordSky.size());
 
         if (isDistantCell()) {
-            // Save state block manually since we can change FVF/decl
-            device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
-            effect->BeginPass(PASS_SETUP);
-            effect->EndPass();
+            {
+                MGE_ZoneScopedN("Stage0:setup");
+                // Save state block manually since we can change FVF/decl
+                device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
+                effect->BeginPass(PASS_SETUP);
+                effect->EndPass();
+            }
 
             // Distant projection matrix — pulled forward so the IPC
             // server can start the distant-statics quadtree fetch

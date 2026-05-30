@@ -18,8 +18,16 @@ namespace MGE::GeometryCache {
     // Entries are created on first visit and evicted when the object is no longer
     // in the scene (skipped by a complete onFrameReady walk).
     struct CachedGeometry {
-        IDirect3DVertexBuffer9* vb;     // D3DFVF_XYZ, world-space positions
-        IDirect3DIndexBuffer9*  ib;     // D3DFMT_INDEX16 triangle list
+        // Double-buffered VB. onFrameReady writes the slot NOT being read by
+        // the in-flight depth pre-pass (vb[writeSlot] from last frame), then
+        // flips writeSlot so the shadow pass reads the fresh slot. This keeps
+        // the depth/shadow CPU-GPU overlap without reallocating per frame.
+        // Static (non-skinned) entries are written rarely and typically use a
+        // single slot. Use readVB() to fetch the slot a consumer should draw.
+        IDirect3DVertexBuffer9* vb[2];  // D3DFVF_XYZ, world-space positions
+        uint8_t  writeSlot;             // slot holding the most recently written VB
+        IDirect3DIndexBuffer9*  ib;     // D3DFMT_INDEX16 triangle list (slot-shared)
+        IDirect3DVertexBuffer9* readVB() const { return vb[writeSlot]; }
         uint32_t vertexCount;
         uint32_t triangleCount;
         float    boundsCenter[3];       // model-space bound center (for culling)

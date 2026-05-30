@@ -67,6 +67,7 @@ void DistantLand::renderDepth() {
         if (!mwBridge->IsUnderwater(eyePos.z)) {
             // Distant land
             if (mwBridge->IsExterior()) {
+                MGE_ZoneScopedN("renderDepth:land");
                 MGE_SCOPED_TIMER("renderDepth:land");
                 effectDepth->BeginPass(PASS_RENDERLANDDEPTH);
                 renderDistantLandZ();
@@ -81,6 +82,7 @@ void DistantLand::renderDepth() {
             }
 
             {
+                MGE_ZoneScopedN("renderDepth:statics");
                 MGE_SCOPED_TIMER("renderDepth:statics");
                 effectDepth->BeginPass(PASS_RENDERSTATICSDEPTH);
                 device->SetVertexDeclaration(StaticDecl);
@@ -96,6 +98,7 @@ void DistantLand::renderDepth() {
 
         if (Configuration.MGEFlags & USE_GRASS) {
             // Grass
+            MGE_ZoneScopedN("renderDepth:grass");
             MGE_SCOPED_TIMER("renderDepth:grass");
             effectDepth->BeginPass(PASS_RENDERGRASSDEPTHINST);
             renderGrassInstZ();
@@ -188,7 +191,11 @@ void DistantLand::renderDepthFromCache(const D3DXMATRIX* gameView) {
     const bool useVisibleSet = !s_prevVisibleKeys.empty();
 
     auto drawEntry = [&](const MGE::GeometryCache::CachedGeometry& e) {
-        if (!e.vb || !e.ib) return;
+        // Depth runs before onFrameReady's rebuild, so readVB() returns last
+        // frame's slot — the buffer the GPU can render while the CPU rewrites
+        // the other slot for this frame's shadow pass.
+        IDirect3DVertexBuffer9* vb = e.readVB();
+        if (!vb || !e.ib) return;
 
         D3DXMATRIX wvMat;
         if (e.isSkinned) {
@@ -218,7 +225,7 @@ void DistantLand::renderDepthFromCache(const D3DXMATRIX* gameView) {
         device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
         device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
 
-        device->SetStreamSource(0, e.vb, 0, MGE::GeometryCache::kVBStride);
+        device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kVBStride);
         device->SetIndices(e.ib);
         device->SetFVF(MGE::GeometryCache::kVBFVF);
         device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, e.vertexCount, 0, e.triangleCount);

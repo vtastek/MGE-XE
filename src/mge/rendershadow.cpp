@@ -205,7 +205,10 @@ void DistantLand::renderShadowFromCache(int layer, const D3DXMATRIX* viewproj) {
 
     for (const auto& kv : MGE::GeometryCache::cache()) {
         const auto& e = kv.second;
-        if (!e.vb || !e.ib) continue;
+        // Shadow runs after onFrameReady's rebuild, so readVB() returns this
+        // frame's freshly written slot.
+        IDirect3DVertexBuffer9* vb = e.readVB();
+        if (!vb || !e.ib) continue;
         if (e.blendEnable) continue;
 
         if (!e.isSkinned && e.dynamicHint == 0) {
@@ -240,7 +243,7 @@ void DistantLand::renderShadowFromCache(int layer, const D3DXMATRIX* viewproj) {
 
         effectShadow->CommitChanges();
         device->SetRenderState(D3DRS_CULLMODE, D3DCULL_CW);
-        device->SetStreamSource(0, e.vb, 0, MGE::GeometryCache::kVBStride);
+        device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kVBStride);
         device->SetIndices(e.ib);
         device->SetFVF(MGE::GeometryCache::kVBFVF);
         device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, e.vertexCount, 0, e.triangleCount);

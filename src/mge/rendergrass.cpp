@@ -4,6 +4,7 @@
 #include "configuration.h"
 #include "mged3d8device.h"
 #include "phasetimers.h"
+#include "mge_tracy.h"
 #include "support/log.h"
 
 #include <algorithm>
@@ -11,6 +12,7 @@
 
 
 void DistantLand::cullGrass(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
+    MGE_ZoneScopedN("cullGrass");
     MGE_SCOPED_TIMER("cullGrass");
     D3DXMATRIX ds_proj = *proj, ds_viewproj;
     float zn = 4.0f, zf = nearViewRange;
