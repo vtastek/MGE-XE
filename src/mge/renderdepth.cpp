@@ -70,6 +70,17 @@ void DistantLand::renderDepth() {
         renderDepthFromCache(&mwView);   // owns its non-skinned + skinned passes
     }
 
+    // Channel-free gate: when frameSetupEarly dispatched the statics verdict to
+    // the cull worker, the worker holds the single-channel ipcClient until it
+    // has drained the statics RPC. Block here — after the cache-only depth pass
+    // above (which touches no ipcClient and overlaps the drain), and before any
+    // main-thread ipcClient touch downstream (distant statics consume / grass /
+    // shadow / land / water RPCs) — so none of them race the worker's drain.
+    // No-op when the worker path is inactive. Now that the kickoff fires before
+    // the GeometryCache walk, the drain typically completes during sky + walk
+    // and this reads ~0.
+    waitCullChannelFree();
+
     if (isDistantCell()) {
         if (!mwBridge->IsUnderwater(eyePos.z)) {
             // Distant land

@@ -74,20 +74,35 @@ void DistantLand::frameSetupEarly() {
     // that won't be used is wasted.) The renderStage0/renderDepth fallbacks cover
     // these cases (earlyWalkedCache / s_earlyKickedStatics stay false).
     if (isDistantCell() && !mwBridge->IsMenu()) {
-        // Build the geometry cache (walk + VB uploads) now so the ~2ms main-thread
-        // work happens before the sky pass; renderDepth skips its own call when
-        // earlyWalkedCache is set. Cache CONSUME (renderDepthFromCache) stays in
-        // renderDepth where the render target/effect are bound. Independent of
-        // USE_DISTANT_STATICS — this is the depth/shadow cache.
-        MGE::GeometryCache::onFrameReady(MGE::SceneGraph::getDataHandler());
-        earlyWalkedCache = true;
-
+        // Kick the distant-statics cull FIRST — before the GeometryCache walk —
+        // so the cull worker's IPC drain (the server-side quadtree cull, ~2.7ms
+        // in heavy scenes) overlaps BOTH the ~1.46ms cache walk below (main
+        // thread, no ipcClient) AND the engine's ~2ms sky pass. Previously the
+        // kickoff ran after the walk, so the drain only overlapped sky and its
+        // tail stalled the main thread at the renderStage0 channel-free gate.
+        // The kickoff needs just the camera (selectDistantCell + setView, done
+        // above), not the geometry cache — they share no state.
         if (Configuration.MGEFlags & USE_DISTANT_STATICS) {
             D3DXMATRIX distProj = mwProj;
             editProjectionZ(&distProj, kDistantNearPlane - 1e-2, Configuration.DL.DrawDist * kCellSize);
             cullDistantStatics_kickoff(&mwView, &distProj);
             s_earlyKickedStatics = true;
+
+            // Read the live cutoff input now (main thread) so g_msocCutoffHeight
+            // is final before the worker reads it; then dispatch the verdict
+            // pass to the cull worker. cullDistantStatics_finish joins it.
+            updateMSOCCutoffInput();
+            signalCullFinish();
         }
+
+        // Build the geometry cache (walk + VB uploads). The ~1.46ms main-thread
+        // walk now overlaps both the sky pass and the worker drain kicked above;
+        // renderDepth skips its own call when earlyWalkedCache is set. Cache
+        // CONSUME (renderDepthFromCache) stays in renderDepth where the render
+        // target/effect are bound. Touches no ipcClient, so it can run while the
+        // worker drains the statics RPC on the single channel.
+        MGE::GeometryCache::onFrameReady(MGE::SceneGraph::getDataHandler());
+        earlyWalkedCache = true;
     }
 }
 
@@ -113,6 +128,12 @@ void DistantLand::renderStage0() {
     auto mwBridge = MWBridge::get();
     IDirect3DStateBlock9* stateSaved;
     UINT passes;
+
+    // (Channel-free gate moved into renderDepth, right after renderDepthFromCache:
+    // that cache-only depth work touches no ipcClient and can overlap the worker's
+    // statics-RPC drain, so we let it run before blocking on the channel. Nothing
+    // in renderStage0 before renderDepth touches ipcClient on the worker path —
+    // selectDistantCell and the fallback kickoff are both skipped there.)
 
     // (Scene-graph lights snapshot — MGE::SceneGraph::onFrameReady() — moved to
     // frameSetupEarly() at BeginScene(0) so the async worker overlaps the sky

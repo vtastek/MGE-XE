@@ -12,9 +12,12 @@
 #include "mge_tracy.h"
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -57,7 +60,51 @@ float distanceSqToAABB2D(float px, float py, float minX, float maxX, float minY,
     const float dy = (py < minY) ? (minY - py) : (py > maxY) ? (py - maxY) : 0.0f;
     return dx * dx + dy * dy;
 }
+
+// ---------------------------------------------------------------------------
+// Dedicated MSOC cull worker.
+//
+// applyMSOCToDistantStatics is pure compute over an already-ready IPC result
+// (visDistantShared). Tracy showed it sitting at ~892us on the main critical
+// path inside renderDepth, after the engine's 1.46ms sky pass — yet its input
+// (the statics visible set) was ready during the sky window (finish:wait was
+// only 33us). Running the verdict on a dedicated worker lets it overlap the
+// sky pass; cullDistantStatics_finish then collapses to a ~0 join.
+//
+// Synchronization mirrors scenegraph.cpp's worker idiom: one mutex + condvar
+// + bool flags. Two sync points:
+//   - channelDrained: the worker has finished its tryWaitForCompletion drain
+//     of the statics RPC, so the single-channel ipcClient is free for the
+//     main thread's land/grass/shadow/water RPCs. renderStage0 waits on this
+//     at entry before any main-thread ipcClient touch.
+//   - maskDone: the verdict core has finished writing msocOccluded.
+//     cullDistantStatics_finish waits on this in place of wait+applyMSOC.
+std::thread             g_cullThread;
+std::mutex              g_cullMtx;
+std::condition_variable g_cullCv;
+bool g_cullPending        = false; // a finish job has been signalled
+bool g_cullChannelDrained = false; // statics RPC drained off ipcClient
+bool g_cullMaskDone       = false; // verdict core finished; msocOccluded stable
+bool g_cullStop           = false; // shutdown request
+bool g_cullStarted        = false; // lazy-init flag
+
+// Per-frame summary stashed by the verdict core (worker) and read by the
+// main-thread debug tail's 60-frame log block. Stable once maskDone joins.
+struct MSOCCullDiag {
+    bool     valid = false;
+    unsigned setSize = 0;
+    unsigned nSphere = 0;
+    unsigned groupCount = 0;
+    int      groupsOccluded = 0;
+    int      lowCulled = 0;
+    int      sphereCulled = 0;
+};
+MSOCCullDiag g_msocCullDiag;
 } // namespace
+
+// True when this frame's verdict pass was dispatched to the worker (set by
+// signalCullFinish, consumed by the wait/finish helpers). Main-thread only.
+static bool s_cullOnWorker = false;
 
 
 
@@ -494,9 +541,183 @@ namespace {
     unsigned g_cullDiagVeryFarCount = 0;
 }
 
+namespace {
+// Worker entry. Parks on the condvar until signalCullFinish wakes it, then:
+//   1. drains the statics RPC off the single IPC channel (frees the channel
+//      for the main thread's other RPCs) and signals channelDrained,
+//   2. runs the pure verdict core over the freshly-drained set and signals
+//      maskDone.
+void cullWorkerLoop() {
+#ifdef TRACY_ENABLE
+    tracy::SetThreadName("MGE MSOC cull");
+#endif
+    while (true) {
+        {
+            std::unique_lock<std::mutex> lk(g_cullMtx);
+            g_cullCv.wait(lk, []{ return g_cullStop || g_cullPending; });
+            if (g_cullStop) return;
+            g_cullPending = false;
+        }
+
+        // Drain the statics RPC. Guarded (tryWaitForCompletion): an
+        // interleaved drain — there shouldn't be one before renderStage0's
+        // channel-free gate, but stay defensive — may already have completed
+        // it, in which case there's no pending RPC to wait on.
+        {
+            MGE_ZoneScopedN("cullWorker:drain");
+            DistantLand::ipcClient.tryWaitForCompletion();
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_cullMtx);
+            g_cullChannelDrained = true;
+        }
+        g_cullCv.notify_all();
+
+        // Pure verdict core. Writes msocOccluded (+ g_msocBasinDebugBoxes /
+        // g_msocCullDiag); reads visDistantShared, eyePos, g_msocCutoffHeight,
+        // WaterLevel(). All inputs are frame-stable by signal time.
+        {
+            MGE_ZoneScopedN("cullWorker:verdict");
+            DistantLand::applyMSOCToDistantStatics(DistantLand::visDistantShared);
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_cullMtx);
+            g_cullMaskDone = true;
+        }
+        g_cullCv.notify_all();
+    }
+}
+
+void ensureCullWorker() {
+    if (!g_cullStarted) {
+        g_cullStarted = true;
+        g_cullThread = std::thread(cullWorkerLoop);
+        LOG::logline("-- [MSOC cull] worker spawned");
+    }
+}
+
+// Block until the worker has finished the verdict core (msocOccluded stable).
+void waitCullMaskReady() {
+    MGE_ZoneScopedN("finish:joinMask");
+    std::unique_lock<std::mutex> lk(g_cullMtx);
+    g_cullCv.wait(lk, []{ return g_cullMaskDone; });
+}
+
+// Main-thread debug tail for the MSOC verdict: Numpad5 mask dump + the
+// per-60-frame cull summary. Touches input / MSOCClient::dumpMask / LOG, so
+// it stays off the worker; reads g_msocCullDiag, stable after the join.
+void runMSOCDebugTail() {
+    if (!Configuration.LogDistantPipeline)
+        return;
+
+    static bool dumpPending = false;
+    static int  dumpIndex   = 0;
+    if (GetAsyncKeyState(VK_NUMPAD5) & 0x0001)
+        dumpPending = true;
+    if (dumpPending) {
+        char exePath[MAX_PATH] = {};
+        GetModuleFileNameA(NULL, exePath, MAX_PATH);
+        if (char* lastSlash = strrchr(exePath, '\\'))
+            *lastSlash = '\0';
+        char fullPath[MAX_PATH];
+        std::snprintf(fullPath, sizeof(fullPath), "%s\\msoc_mask_%03d.pfm", exePath, dumpIndex++);
+        const bool ok = MSOCClient::dumpMask(fullPath);
+        LOG::logline("-- MSOC: Numpad5 mask dump %s %s", ok ? "->" : "FAILED for", fullPath);
+        dumpPending = false;
+    }
+
+    static int diagFrameCounter = 0;
+    if (g_msocCullDiag.valid && (diagFrameCounter++ % 60) == 0) {
+        const MSOCCullDiag& d = g_msocCullDiag;
+        const int totalCulled = d.lowCulled + d.sphereCulled;
+        LOG::logline(
+            "-- MSOC cull: statics=%u  low=%u(groups=%u occ=%d culled=%d)"
+            "  sphere=%u(culled=%d)  total=%d(%d%%)",
+            d.setSize,
+            d.setSize - d.nSphere, d.groupCount,
+            d.groupsOccluded, d.lowCulled,
+            d.nSphere, d.sphereCulled,
+            totalCulled,
+            d.setSize > 0 ? (totalCulled * 100) / d.setSize : 0);
+    }
+}
+} // namespace
+
+// Numpad8/2: raise/lower the MSOC low-static cutoff height (256-unit steps).
+// Read on the main thread so g_msocCutoffHeight is final before the verdict
+// core (worker or inline) reads it.
+void DistantLand::updateMSOCCutoffInput() {
+    if (GetAsyncKeyState(VK_NUMPAD8) & 0x0001) {
+        g_msocCutoffHeight += 256.0f;
+        char msg[64];
+        std::snprintf(msg, sizeof(msg), "MSOC cutoff: %.0f units", g_msocCutoffHeight);
+        StatusOverlay::setStatus(msg);
+    }
+    if (GetAsyncKeyState(VK_NUMPAD2) & 0x0001) {
+        g_msocCutoffHeight = std::max(0.0f, g_msocCutoffHeight - 256.0f);
+        char msg[64];
+        std::snprintf(msg, sizeof(msg), "MSOC cutoff: %.0f units", g_msocCutoffHeight);
+        StatusOverlay::setStatus(msg);
+    }
+}
+
+// Dispatch the verdict pass to the cull worker. Called from frameSetupEarly
+// right after cullDistantStatics_kickoff issues the statics RPC.
+void DistantLand::signalCullFinish() {
+    ensureCullWorker();
+    {
+        std::lock_guard<std::mutex> lk(g_cullMtx);
+        g_cullChannelDrained = false;
+        g_cullMaskDone       = false;
+        g_cullPending        = true;
+    }
+    s_cullOnWorker = true;
+    g_cullCv.notify_one();
+}
+
+// Block at renderStage0 entry until the worker has drained the statics RPC,
+// so no main-thread ipcClient call (land/grass/shadow/water) races the drain
+// on the single-channel client. No-op when the worker path is inactive.
+void DistantLand::waitCullChannelFree() {
+    if (!s_cullOnWorker)
+        return;
+    MGE_ZoneScopedN("waitCullChannelFree");
+    std::unique_lock<std::mutex> lk(g_cullMtx);
+    g_cullCv.wait(lk, []{ return g_cullChannelDrained; });
+}
+
+// Tear the worker thread down on renderer release. Mirrors the SceneGraph
+// worker shutdown; resets state so a later init re-spawns cleanly.
+void DistantLand::joinCullWorker() {
+    if (!g_cullStarted)
+        return;
+    {
+        std::lock_guard<std::mutex> lk(g_cullMtx);
+        g_cullStop = true;
+    }
+    g_cullCv.notify_all();
+    if (g_cullThread.joinable())
+        g_cullThread.join();
+    g_cullStarted        = false;
+    g_cullStop           = false;
+    g_cullPending        = false;
+    g_cullChannelDrained = false;
+    g_cullMaskDone       = false;
+    s_cullOnWorker       = false;
+}
+
 void DistantLand::cullDistantStatics_kickoff(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
     MGE_ZoneScopedN("cullDistantStatics_kickoff");
     MGE_SCOPED_TIMER("cullDistantStatics:kickoff");
+
+    // Default this frame to the inline path. signalCullFinish (worker path)
+    // flips it back to true right after this kickoff. Resetting here — rather
+    // than at the end of _finish — keeps the flag fresh even on frames where
+    // _finish is skipped (e.g. underwater: the statics depth/color passes and
+    // their join don't run, but the worker was still dispatched). The kickoff
+    // always runs before the renderDepth channel-free gate and before _finish,
+    // so both read a current-frame value.
+    s_cullOnWorker = false;
 
     D3DXMATRIX ds_proj = *proj, ds_viewproj;
     D3DXVECTOR4 viewsphere(eyePos.x, eyePos.y, eyePos.z, 0);
@@ -593,24 +814,56 @@ void DistantLand::cullDistantStatics_finish() {
     MGE_ZoneScopedN("cullDistantStatics_finish");
     MGE_SCOPED_TIMER("cullDistantStatics:finish");
 
-    if (Configuration.UseSharedMemory) {
+    if (s_cullOnWorker) {
+        // Verdict pass was dispatched to the cull worker at frameSetupEarly;
+        // it drained the statics RPC and ran the verdict core during the sky
+        // window. Here we only join — collapses to ~0 on the critical path.
+        // (The Numpad cutoff was read on main in frameSetupEarly.)
+        waitCullMaskReady();
+    } else {
+        // Inline path: non-IPC (synchronous quadtree cull already populated
+        // visDistant in _kickoff), or the IPC fallback kickoff (menus /
+        // not-ready early frames) where frameSetupEarly didn't dispatch.
+        updateMSOCCutoffInput();
+
+        if (Configuration.UseSharedMemory) {
+            {
+                MGE_ZoneScopedN("finish:wait");
+                MGE_SCOPED_TIMER("cullDistantStatics:finishWait");
+                // Guarded wait: an interleaved RPC between kickoff and here
+                // (e.g. cullGrass's getVisibleMeshesCoarse, which awaits its
+                // own result) may already have drained the AllRanges
+                // completion. In that case the statics data is ready and no
+                // RPC is pending — an unconditional waitForCompletion would
+                // block on an event nobody signals and time out at 60s.
+                ipcClient.tryWaitForCompletion();
+            }
+        }
+
+        // MSOC verdict pass runs unconditionally so both instanced AND
+        // non-instanced render paths consume the same cull mask. Must run
+        // after the sort so msocOccluded[idx] aligns with each render
+        // path's visible-set iteration order.
         {
-            MGE_ZoneScopedN("finish:wait");
-            MGE_SCOPED_TIMER("cullDistantStatics:finishWait");
-            // Guarded wait: an interleaved RPC between kickoff and here
-            // (e.g. cullGrass's getVisibleMeshesCoarse, which awaits its
-            // own result) may already have drained the AllRanges
-            // completion. In that case the statics data is ready and no
-            // RPC is pending — an unconditional waitForCompletion would
-            // block on an event nobody signals and time out at 60s.
-            ipcClient.tryWaitForCompletion();
+            MGE_ZoneScopedN("finish:applyMSOC");
+            if (Configuration.UseSharedMemory) {
+                applyMSOCToDistantStatics(visDistantShared);
+            } else {
+                applyMSOCToDistantStatics(visDistant);
+            }
         }
     }
+
+    // Main-thread debug tail: Numpad5 mask dump + the per-60-frame MSOC cull
+    // summary. Reads results stable after the join / inline run; touches
+    // input / MSOCClient::dumpMask / LOG, so it stays on the main thread.
+    runMSOCDebugTail();
 
     // Per-frame cull summary + phase-timer flush. Gated by the
     // LogDistantPipeline config flag — off by default. IPC path logs
     // total only (bucket split is now collapsed inside the batched RPC);
-    // non-IPC logs the breakdown captured during _kickoff.
+    // non-IPC logs the breakdown captured during _kickoff. Flushed after the
+    // verdict so this frame's applyMSOCToDistantStatics timing is included.
     if (Configuration.LogDistantPipeline) {
         static int diagFrameCounter = 0;
         if ((diagFrameCounter++ % 60) == 0) {
@@ -630,19 +883,8 @@ void DistantLand::cullDistantStatics_finish() {
             MGEPhaseTimers::report();
         }
     }
-
-    // MSOC verdict pass runs unconditionally so both instanced AND
-    // non-instanced render paths consume the same cull mask. Must run
-    // after the sort so msocOccluded[idx] aligns with each render
-    // path's visible-set iteration order.
-    {
-        MGE_ZoneScopedN("finish:applyMSOC");
-        if (Configuration.UseSharedMemory) {
-            applyMSOCToDistantStatics(visDistantShared);
-        } else {
-            applyMSOCToDistantStatics(visDistant);
-        }
-    }
+    // (s_cullOnWorker is reset per-frame at the top of cullDistantStatics_kickoff,
+    // which always runs before this finish; no reset needed here.)
 }
 
 void DistantLand::renderDistantStatics() {
@@ -757,6 +999,7 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
 
     msocOccluded.clear();
     g_msocBasinDebugBoxes.clear();
+    g_msocCullDiag.valid = false;
     if (staticSet.Empty())
         return;
 
@@ -773,19 +1016,11 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
     const unsigned setSize = (unsigned)staticSet.Size();
     msocOccluded.resize(setSize, 0);
 
-    // Numpad8/2: adjust cutoff height live.
-    if (GetAsyncKeyState(VK_NUMPAD8) & 0x0001) {
-        g_msocCutoffHeight += 256.0f;
-        char msg[64];
-        std::snprintf(msg, sizeof(msg), "MSOC cutoff: %.0f units", g_msocCutoffHeight);
-        StatusOverlay::setStatus(msg);
-    }
-    if (GetAsyncKeyState(VK_NUMPAD2) & 0x0001) {
-        g_msocCutoffHeight = std::max(0.0f, g_msocCutoffHeight - 256.0f);
-        char msg[64];
-        std::snprintf(msg, sizeof(msg), "MSOC cutoff: %.0f units", g_msocCutoffHeight);
-        StatusOverlay::setStatus(msg);
-    }
+    // Numpad8/2 live cutoff adjust is read on the main thread before this
+    // pure core runs (updateMSOCCutoffInput, from frameSetupEarly on the
+    // worker path or cullDistantStatics_finish on the inline path), so
+    // g_msocCutoffHeight is final here. GetAsyncKeyState / StatusOverlay
+    // must not be touched off the main thread, hence the split.
 
     // Statics whose bounding sphere top sits at or below waterLevel + kTallness are
     // bucketed into flat per-cell-group OBBs and tested as a batch (~33 calls).
@@ -956,40 +1191,22 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
         }
     }
 
+    // Stash the per-frame summary for the main-thread debug tail. The
+    // Numpad5 mask dump and the 60-frame "MSOC cull" log line touch input /
+    // MSOCClient::dumpMask / LOG and run in cullDistantStatics_finish (main),
+    // reading these stable values after the worker join. Only computed when
+    // LogDistantPipeline is on — the group-occluded scan is otherwise wasted.
     if (Configuration.LogDistantPipeline) {
-        static bool dumpPending = false;
-        static int  dumpIndex   = 0;
-        if (GetAsyncKeyState(VK_NUMPAD5) & 0x0001)
-            dumpPending = true;
-        if (dumpPending) {
-            char exePath[MAX_PATH] = {};
-            GetModuleFileNameA(NULL, exePath, MAX_PATH);
-            if (char* lastSlash = strrchr(exePath, '\\'))
-                *lastSlash = '\0';
-            char fullPath[MAX_PATH];
-            std::snprintf(fullPath, sizeof(fullPath), "%s\\msoc_mask_%03d.pfm", exePath, dumpIndex++);
-            const bool ok = MSOCClient::dumpMask(fullPath);
-            LOG::logline("-- MSOC: Numpad5 mask dump %s %s", ok ? "->" : "FAILED for", fullPath);
-            dumpPending = false;
-        }
-
-        static int diagFrameCounter = 0;
-        if ((diagFrameCounter++ % 60) == 0) {
-            int diagGroupsOccluded = 0;
-            for (const auto& g : groups)
-                if (g.verdict == MSOCClient::ResultOccluded) ++diagGroupsOccluded;
-            const int diagTotalCulled = diagLowCulled + diagSphereCulled;
-            const unsigned nSphere = (unsigned)(sphereBatch.size() / 4);
-            LOG::logline(
-                "-- MSOC cull: statics=%u  low=%u(groups=%u occ=%d culled=%d)"
-                "  sphere=%u(culled=%d)  total=%d(%d%%)",
-                setSize,
-                setSize - nSphere, (unsigned)groups.size(),
-                diagGroupsOccluded, diagLowCulled,
-                nSphere, diagSphereCulled,
-                diagTotalCulled,
-                setSize > 0 ? (diagTotalCulled * 100) / setSize : 0);
-        }
+        int diagGroupsOccluded = 0;
+        for (const auto& g : groups)
+            if (g.verdict == MSOCClient::ResultOccluded) ++diagGroupsOccluded;
+        g_msocCullDiag.valid          = true;
+        g_msocCullDiag.setSize        = setSize;
+        g_msocCullDiag.nSphere        = (unsigned)(sphereBatch.size() / 4);
+        g_msocCullDiag.groupCount     = (unsigned)groups.size();
+        g_msocCullDiag.groupsOccluded = diagGroupsOccluded;
+        g_msocCullDiag.lowCulled      = diagLowCulled;
+        g_msocCullDiag.sphereCulled   = diagSphereCulled;
     }
 }
 

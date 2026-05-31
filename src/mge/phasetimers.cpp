@@ -2,6 +2,7 @@
 #include "support/log.h"
 
 #include <algorithm>
+#include <mutex>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -20,13 +21,21 @@ struct Bucket {
 
 static std::unordered_map<const char*, Bucket> g_buckets;
 
+// Guards g_buckets. Needed because timed scopes (MGE_SCOPED_TIMER) now run
+// on the dedicated MSOC cull worker as well as the main thread — concurrent
+// add() into the unsynchronized map would be a data race. Contention is
+// negligible (a handful of microsecond inserts per frame).
+static std::mutex g_mtx;
+
 void add(const char* name, std::uint64_t us) {
+    std::lock_guard<std::mutex> lk(g_mtx);
     auto& b = g_buckets[name];
     b.totalUs += us;
     ++b.calls;
 }
 
 void report() {
+    std::lock_guard<std::mutex> lk(g_mtx);
     if (g_buckets.empty()) {
         return;
     }

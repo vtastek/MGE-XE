@@ -260,6 +260,28 @@ public:
     //   renderDistantStatics, water-reflection statics).
     static void cullDistantStatics_kickoff(const D3DXMATRIX* view, const D3DXMATRIX* proj);
     static void cullDistantStatics_finish();
+
+    // --- Dedicated MSOC cull worker -------------------------------------
+    // The distant-statics verdict pass (drain the statics RPC + the
+    // partition/OBB/sphere/propagate core in applyMSOCToDistantStatics) is
+    // pure compute that depends only on an already-ready IPC result. On the
+    // IPC + early-kickoff path it is dispatched to a dedicated worker by
+    // frameSetupEarly so it overlaps the engine's sky pass instead of
+    // stalling cullDistantStatics_finish on the main critical path.
+    //
+    //   updateMSOCCutoffInput  — read the Numpad8/2 live cutoff (main thread)
+    //                            so g_msocCutoffHeight is final before the
+    //                            worker reads it.
+    //   signalCullFinish       — dispatch the verdict pass to the worker.
+    //   waitCullChannelFree    — block until the worker has drained the
+    //                            statics RPC off the single IPC channel;
+    //                            called at renderStage0 entry so no main-
+    //                            thread ipcClient call races the drain.
+    //   joinCullWorker         — tear the worker thread down (release()).
+    static void updateMSOCCutoffInput();
+    static void signalCullFinish();
+    static void waitCullChannelFree();
+    static void joinCullWorker();
     static void renderDistantStatics();
     static void renderMSOCBasinBoundsDebug(const D3DXMATRIX* view, const D3DXMATRIX* proj);
 

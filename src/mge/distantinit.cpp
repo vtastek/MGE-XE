@@ -1439,6 +1439,11 @@ void DistantLand::release() {
     landMeshes.clear();
     shutdownHorizonWorkspace();
 
+    // Tear down the dedicated MSOC cull worker so the thread doesn't outlive
+    // the renderer across init/release cycles (mirrors the SceneGraph worker
+    // shutdown). Safe to call when the worker was never spawned.
+    joinCullWorker();
+
     if (texWorldColour) {
         texWorldColour->Release();
         texWorldColour = nullptr;
