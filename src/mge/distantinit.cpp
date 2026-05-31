@@ -50,6 +50,7 @@ bool DistantLand::isDistantLandLoaded = false;
 VisibleSet<StlVector> DistantLand::visLand;
 VisibleSet<StlVector> DistantLand::visDistant;
 VisibleSet<StlVector> DistantLand::visGrass;
+VisibleSet<StlVector> DistantLand::visDistantSurvivors;
 
 VisibleSet<IpcClientVector> DistantLand::visLandShared;
 VisibleSet<IpcClientVector> DistantLand::visDistantShared;

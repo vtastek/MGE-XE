@@ -4,6 +4,52 @@
 
 #include <cassert>
 
+namespace {
+    // --- getVisibleMeshesAllRanges profiling instrumentation ---
+    // Breaks the AllRanges drain into per-range quadtree walks vs the final
+    // merged sort, so we know which half of the ~3.5ms client-side wait to
+    // attack. Rolling average logged to mgeHost64.log every kInterval calls
+    // to avoid per-frame log spam.
+    inline double msBetween(const LARGE_INTEGER& a, const LARGE_INTEGER& b) {
+        static const double msPerTick = [] {
+            LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+            return 1000.0 / static_cast<double>(f.QuadPart);
+        }();
+        return static_cast<double>(b.QuadPart - a.QuadPart) * msPerTick;
+    }
+
+    struct AllRangesStats {
+        static constexpr int kInterval = 256;
+        int samples = 0;
+        double sumRange[3] = {0, 0, 0};
+        double sumSort = 0;
+        double sumTotal = 0;
+        double maxTotal = 0;
+        unsigned long long sumMeshes = 0;
+
+        void record(const double range[3], double sortMs, double totalMs, unsigned meshes) {
+            for (int i = 0; i < 3; ++i) sumRange[i] += range[i];
+            sumSort += sortMs;
+            sumTotal += totalMs;
+            sumMeshes += meshes;
+            if (totalMs > maxTotal) maxTotal = totalMs;
+            if (++samples >= kInterval) {
+                const double n = static_cast<double>(samples);
+                LOG::logline("AllRanges avg/%d: r0=%.3f r1=%.3f r2=%.3f walk=%.3f sort=%.3f total=%.3f ms | maxTotal=%.3f | avgMeshes=%llu",
+                    samples, sumRange[0] / n, sumRange[1] / n, sumRange[2] / n,
+                    (sumRange[0] + sumRange[1] + sumRange[2]) / n, sumSort / n, sumTotal / n,
+                    maxTotal, sumMeshes / static_cast<unsigned long long>(samples));
+                LOG::flush();
+                samples = 0;
+                sumRange[0] = sumRange[1] = sumRange[2] = 0;
+                sumSort = sumTotal = maxTotal = 0;
+                sumMeshes = 0;
+            }
+        }
+    };
+    AllRangesStats g_allRangesStats;
+}
+
 namespace IPC {
 	Server::Server(HANDLE sharedMem, HANDLE clientProcess, HANDLE rpcStartEvent, HANDLE rpcCompleteEvent) :
 		m_sharedMem(sharedMem),
@@ -217,14 +263,26 @@ namespace IPC {
 		auto& vec = getVec<RenderMesh>(params.visibleSet);
 		// Sort runs once at the end across the merged set — pass None to
 		// the per-range fetches so they don't sort intermediate state.
+		LARGE_INTEGER t0, t;
+		double rangeMs[3] = {0, 0, 0};
+		QueryPerformanceCounter(&t0);
+		LARGE_INTEGER prev = t0;
 		for (std::uint8_t i = 0; i < params.rangeCount; ++i) {
 			DistantLandShare::getVisibleMeshes(
 				vec, params.viewFrustum[i], params.viewSphere[i],
 				VisibleSetSort::None, params.setFlags[i]);
+			QueryPerformanceCounter(&t);
+			if (i < 3) rangeMs[i] = msBetween(prev, t);
+			prev = t;  // prev now marks the end of the walks
 		}
+		const double walkMs = msBetween(t0, prev);
+		double sortMs = 0;
 		if (params.sort != VisibleSetSort::None) {
 			DistantLandShare::sortVisibleSet(vec, params.sort);
+			QueryPerformanceCounter(&t);
+			sortMs = msBetween(prev, t);
 		}
+		g_allRangesStats.record(rangeMs, sortMs, walkMs + sortMs, vec.size());
 	}
 
 	void Server::sortVisibleSet() {

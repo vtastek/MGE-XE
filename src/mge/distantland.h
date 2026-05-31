@@ -88,6 +88,15 @@ public:
     static VisibleSet<StlVector> visDistant;
     static VisibleSet<StlVector> visGrass;
 
+    // Cull-then-sort survivor set for distant statics. The server no longer
+    // sorts the full visible set; instead applyMSOCToDistantStatics compacts
+    // the MSOC survivors (msocOccluded[idx]==0) into a contiguous owned buffer
+    // (g_survivorStorage in renderexterior.cpp) and sorts only those (~500 vs
+    // ~13k). Both the depth and color static passes iterate this set. Kept
+    // separate from visDistant (the non-IPC raw cull output) to avoid
+    // overloading its meaning.
+    static VisibleSet<StlVector> visDistantSurvivors;
+
     static VisibleSet<IpcClientVector> visLandShared;
     static VisibleSet<IpcClientVector> visDistantShared;
     static VisibleSet<IpcClientVector> visGrassShared;

@@ -30,6 +30,14 @@ bool                    g_horizonInitialized = false;
 // Numpad8/Numpad2: raise/lower MSOC low-static cutoff height (steps of 256 units).
 static float g_msocCutoffHeight = 2500.0f;
 
+// Cull-then-sort survivor storage. applyMSOCToDistantStatics copies the
+// surviving RenderMesh values (msocOccluded[idx]==0) into this contiguous,
+// reused buffer; DistantLand::visDistantSurvivors holds const RenderMesh*
+// into it. Stable storage is mandatory — the IPC visible set is a windowed
+// view that remaps as it's iterated, so survivor pointers can't reference it.
+// Reused across frames to avoid per-frame allocation; ~500 * 156B ~= 78KB.
+static std::vector<RenderMesh> g_survivorStorage;
+
 namespace {
 struct MSOCBasinDebugBox {
     float minX, maxX, minY, maxY, minZ, maxZ;
@@ -781,9 +789,12 @@ void DistantLand::cullDistantStatics_kickoff(const D3DXMATRIX* view, const D3DXM
         D3DXVECTOR4 spheres[3] = {
             ranges[0].sphere,  ranges[1].sphere,  ranges[2].sphere,
         };
+        // Cull-then-sort: the server no longer sorts the full ~13k visible
+        // set (~1.35ms of drain wasted on meshes MSOC then occludes ~95% of).
+        // applyMSOCToDistantStatics sorts only the ~500 survivors client-side.
         ipcClient.getVisibleMeshesAllRanges(
             visDistantSharedId, 3, frustums, spheres, setFlags,
-            VisibleSetSort::ByState);
+            VisibleSetSort::None);
     } else {
         // Non-IPC path: synchronous quadtree work happens on the main
         // thread here. No pipelining benefit, but the bucket counters are
@@ -806,7 +817,8 @@ void DistantLand::cullDistantStatics_kickoff(const D3DXMATRIX* view, const D3DXM
                 ranges[2].frustum, ranges[2].sphere, visDistant);
             g_cullDiagVeryFarCount = (unsigned)visDistant.Size() - prevSize;
         }
-        visDistant.SortByState();
+        // No SortByState here: applyMSOCToDistantStatics compacts and sorts
+        // the survivor set (visDistantSurvivors) for this path too.
     }
 }
 
@@ -901,14 +913,10 @@ void DistantLand::renderDistantStatics() {
 
     device->SetVertexDeclaration(StaticDecl);
 
-    // Pass the prebuilt MSOC cull mask through the render helper's
-    // optional skipMask parameter. Empty mask = no culling.
-    const std::uint8_t* skipMask = msocOccluded.empty() ? nullptr : msocOccluded.data();
-    if (Configuration.UseSharedMemory) {
-        visDistantShared.Render(device, effect, effect, &ehTex0, nullptr, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT, false, skipMask);
-    } else {
-        visDistant.Render(device, effect, effect, &ehTex0, nullptr, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT, false, skipMask);
-    }
+    // Cull-then-sort: iterate the compacted, state-sorted survivor set built
+    // by applyMSOCToDistantStatics (IPC and non-IPC paths alike). The old
+    // skipMask plumbing is gone — occluded instances are already absent.
+    visDistantSurvivors.Render(device, effect, effect, &ehTex0, nullptr, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT, false);
 
     device->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
 }
@@ -1000,18 +1008,49 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
     msocOccluded.clear();
     g_msocBasinDebugBoxes.clear();
     g_msocCullDiag.valid = false;
-    if (staticSet.Empty())
-        return;
 
-    if (!MWBridge::get()->IsExterior())
-        return;
+    // Cull-then-sort tail. Compact the MSOC survivors (msocOccluded[idx]==0,
+    // or every mesh when the mask is empty) into stable storage and sort only
+    // those (~500 ptrs, contiguous deref → fast). Both the depth and color
+    // static passes iterate the result (visDistantSurvivors). Defined as a
+    // lambda so the no-cull early-out and the normal exit share one impl.
+    // Survivor *values* are copied because the IPC visible set is a windowed
+    // view that remaps as it advances — pointers into it would dangle.
+    auto gatherSurvivors = [&staticSet]() {
+        MGE_SCOPED_TIMER("applyMSOCToDistantStatics:gatherSort");
+        const bool haveMask = !msocOccluded.empty();
+        g_survivorStorage.clear();
+        g_survivorStorage.reserve(staticSet.Size());
+        staticSet.Reset();
+        unsigned i = 0;
+        while (!staticSet.AtEnd()) {
+            const RenderMesh& m = staticSet.Next();
+            if (!haveMask || msocOccluded[i] == 0)
+                g_survivorStorage.push_back(m);
+            ++i;
+        }
+        // Build the pointer set into now-stable storage. Storage was reserved
+        // up-front (no reallocation), and the pointers are built in a second
+        // pass regardless, so none can dangle.
+        visDistantSurvivors.RemoveAll();
+        visDistantSurvivors.visible_set.reserve((std::uint32_t)g_survivorStorage.size());
+        for (const RenderMesh& mesh : g_survivorStorage)
+            visDistantSurvivors.PushBack(mesh);
+        visDistantSurvivors.SortByState();
+    };
 
+    // Compute the occlusion mask only when culling is active in an exterior
+    // with a ready mask and a non-empty set; otherwise every mesh survives.
     const bool cullByOcclusion =
-        Configuration.UseOcclusionCulling
+        !staticSet.Empty()
+        && Configuration.UseOcclusionCulling
         && MSOCClient::isAvailable()
-        && MSOCClient::isMaskReady();
-    if (!cullByOcclusion)
+        && MSOCClient::isMaskReady()
+        && MWBridge::get()->IsExterior();
+    if (!cullByOcclusion) {
+        gatherSurvivors();
         return;
+    }
 
     const unsigned setSize = (unsigned)staticSet.Size();
     msocOccluded.resize(setSize, 0);
@@ -1208,6 +1247,9 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
         g_msocCullDiag.lowCulled      = diagLowCulled;
         g_msocCullDiag.sphereCulled   = diagSphereCulled;
     }
+
+    // Compact + sort the ~500 survivors now that msocOccluded is final.
+    gatherSurvivors();
 }
 
 template void DistantLand::applyMSOCToDistantStatics(VisibleSet<StlVector>& staticSet);

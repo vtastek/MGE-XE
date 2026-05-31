@@ -104,12 +104,9 @@ void DistantLand::renderDepth() {
                 MGE_SCOPED_TIMER("renderDepth:statics");
                 effectDepth->BeginPass(PASS_RENDERSTATICSDEPTH);
                 device->SetVertexDeclaration(StaticDecl);
-                const std::uint8_t* skipMask = msocOccluded.empty() ? nullptr : msocOccluded.data();
-                if (Configuration.UseSharedMemory) {
-                    visDistantShared.Render(device, effectDepth, effect, &ehTex0, &ehHasAlpha, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT, false, skipMask);
-                } else {
-                    visDistant.Render(device, effectDepth, effect, &ehTex0, &ehHasAlpha, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT, false, skipMask);
-                }
+                // Cull-then-sort: iterate the compacted survivor set (occluded
+                // instances already removed by applyMSOCToDistantStatics).
+                visDistantSurvivors.Render(device, effectDepth, effect, &ehTex0, &ehHasAlpha, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT, false);
                 effectDepth->EndPass();
             }
         }
