@@ -210,8 +210,15 @@ namespace MGEgui {
             // morrowind.ini uses system codepage
             var mwini = new INIFile(Statics.fn_mwini, mwSettings, System.Text.Encoding.Default);
 
-            // Clamp to FPS control maximum
-            udFPSLimit.Value = Math.Min(new Decimal(mwini.getKeyValue("FPSLimit")), udFPSLimit.Maximum);
+            // One-time migration: the limiter moved to MGE.ini "FPS Limit"
+            // (loaded in LoadGraphicsSettings, which runs first). If MGE.ini had
+            // no value yet (control == 0 = off) but the user still has a real
+            // engine "Max FPS" cap, seed the control with it. After the next save
+            // SaveMWINI forces Max FPS to the sentinel, so this won't re-trigger.
+            int oldMaxFps = (int)mwini.getKeyValue("FPSLimit");
+            if (udFPSLimit.Value == 0 && oldMaxFps > 0 && oldMaxFps < 1000) {
+                udFPSLimit.Value = Math.Min(new Decimal(oldMaxFps), udFPSLimit.Maximum);
+            }
 
             cbScreenshots.Checked = (mwini.getKeyValue("SSEnable") == 1);
             cbThreadLoad.Checked = (mwini.getKeyValue("NoThread") != 1);
@@ -347,6 +354,10 @@ namespace MGEgui {
         private static INIFile.INIVariableDef iniVWait = new INIFile.INIVariableDef("VWait", siniGlobGraph, "VWait", INIFile.INIVariableType.Dictionary, "Immediate", vWaitDict);
         private static INIFile.INIVariableDef iniRefresh = new INIFile.INIVariableDef("Refresh", siniGlobGraph, "Refresh Rate", INIFile.INIVariableType.Byte, "Default", refreshDict, 0, 240);
         private static INIFile.INIVariableDef iniBorderless = new INIFile.INIVariableDef("Borderless", siniGlobGraph, "Borderless Window", INIFile.INIBoolType.Text, "True");
+        // MGE-owned frame limiter target (fps); 0 = off. The runtime paces to this
+        // (MGE.ini "FPS Limit"); the engine's own Max FPS limiter is neutralized by
+        // forcing Morrowind.ini "Max FPS" high in SaveMWINI.
+        private static INIFile.INIVariableDef iniFPSLimit = new INIFile.INIVariableDef("FPSLimit", siniGlobGraph, "FPS Limit", INIFile.INIVariableType.Int32, "0", 0, 1000);
         private static INIFile.INIVariableDef iniAnisoLvl = new INIFile.INIVariableDef("AnisoLvl", siniRendState, "Anisotropic Filtering Level", INIFile.INIVariableType.Dictionary, "8x", anisoLevelDict);
         private static INIFile.INIVariableDef iniFogMode = new INIFile.INIVariableDef("FogMode", siniRendState, "Fog Mode", INIFile.INIVariableType.Dictionary, "Range vertex", fogModeDict);
         private static INIFile.INIVariableDef iniTransparencyAA = new INIFile.INIVariableDef("TrAA", siniRendState, "Transparency Antialiasing", INIFile.INIBoolType.OnOff, "On");
@@ -422,7 +433,7 @@ namespace MGEgui {
             // Main
             iniVersion, iniTipSpeed, iniLanguage, iniAutoLang,
             // Graphics
-            iniAntiAlias, iniAnisoLvl, iniTransparencyAA, iniVWait, iniRefresh, iniBorderless,
+            iniAntiAlias, iniAnisoLvl, iniTransparencyAA, iniVWait, iniRefresh, iniBorderless, iniFPSLimit,
             iniFOVAuto, iniFOV, iniUIScale, iniWindowAlignX, iniWindowAlignY,
             iniFogMode, iniHWShader, iniHDRTime, iniFPSCount, iniReduceTexMemUse,
             iniSSFormat, iniSSSuffix, iniSSName, iniSSDir, iniUseSharedMemory,
@@ -482,6 +493,10 @@ namespace MGEgui {
             // Graphics
             cmbAntiAlias.SelectedIndex = (int)iniFile.getKeyValue("AntiAlias");
             cmbVWait.SelectedIndex = (int)iniFile.getKeyValue("VWait");
+            // MGE-owned frame limiter (MGE.ini "FPS Limit"). Clamp to the control's
+            // range so an out-of-range ini value can't throw on assignment.
+            udFPSLimit.Value = Math.Max(udFPSLimit.Minimum,
+                Math.Min(new Decimal(iniFile.getKeyValue("FPSLimit")), udFPSLimit.Maximum));
             tbRefreshRate.Text = iniFile.getKeyValue("Refresh").ToString();
             if (tbRefreshRate.Text == "0") {
                 tbRefreshRate.Text = "Default";
@@ -569,6 +584,7 @@ namespace MGEgui {
             // Graphics
             iniFile.setKey("AntiAlias", cmbAntiAlias.SelectedIndex);
             iniFile.setKey("VWait", cmbVWait.SelectedIndex);
+            iniFile.setKey("FPSLimit", (int)udFPSLimit.Value);
             iniFile.setKey("Refresh", tbRefreshRate.Text);
             iniFile.setKey("Borderless", cbBorderless.Checked);
             iniFile.setKey("AnisoLvl", cmbAnisoLevel.SelectedIndex);
@@ -842,7 +858,10 @@ namespace MGEgui {
             // morrowind.ini uses system codepage
             var mwini = new INIFile(Statics.fn_mwini, mwSettings, System.Text.Encoding.Default, true);
 
-            mwini.setKey("FPSLimit", (int)udFPSLimit.Value);
+            // Neutralize the engine's own (buggy) Max-FPS limiter so it never
+            // stacks with MGE's pacer: force it high. The real limit lives in
+            // MGE.ini "FPS Limit" (written in SaveGraphicsSettings).
+            mwini.setKey("FPSLimit", 1000);
             mwini.setKey("SSEnable", cbScreenshots.Checked);
             mwini.setKey("NoThread", !cbThreadLoad.Checked);
             mwini.setKey("YesToAll", cbYesToAll.Checked);

@@ -4,6 +4,7 @@
 #include "proxydx/d3d8surface.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <tlhelp32.h>
 #include "mgeversion.h"
 #include "configuration.h"
@@ -13,8 +14,65 @@
 #include "userhud.h"
 #include "videobackground.h"
 #include "mge_tracy.h"
+#include "support/timing.h"
+#include "support/log.h"
 
 bool g_tracyActive = false;
+
+// timeBeginPeriod for Sleep granularity in the frame limiter.
+#pragma comment(lib, "winmm.lib")
+
+// MGE-owned frame limiter. Replaces Morrowind's built-in Max-FPS pacer (which
+// anchors to a pre-sleep timestamp, so it releases ~twice per intended period
+// with an alternating short/long beat). This paces in Present() with a QPC
+// accumulator: the next-present deadline advances by exactly one period
+// (deadline += period) rather than re-anchoring to "now", which is what kills
+// the beat. Hybrid wait — Sleep() to ~1ms short, then spin to the mark — for
+// accuracy without burning a core. Target comes from Configuration.FPSLimit
+// (MGE.ini "FPS Limit"); 0 = off. The engine's own limiter is neutralized by
+// MGEgui forcing Morrowind.ini "Max FPS" high so it never triggers.
+static void framePaceLimit() {
+    const int target = Configuration.FPSLimit;
+
+    static LARGE_INTEGER freq = {};
+    static double nextTick = 0.0;     // QPC ticks: deadline for the current present
+    static bool periodSet = false;
+
+    if (target <= 0) { nextTick = 0.0; return; }   // off; reset so re-enabling resyncs
+
+    if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
+    if (!periodSet) { timeBeginPeriod(1); periodSet = true; }
+
+    const double period = double(freq.QuadPart) / double(target);
+
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if (nextTick == 0.0) {            // first paced frame: seed the deadline
+        nextTick = double(now.QuadPart) + period;
+        return;
+    }
+
+    for (;;) {
+        QueryPerformanceCounter(&now);
+        const double remain = nextTick - double(now.QuadPart);
+        if (remain <= 0.0) break;
+        const double remMs = remain * 1000.0 / double(freq.QuadPart);
+        if (remMs > 2.0) {
+            Sleep((DWORD)(remMs - 1.0));   // coarse sleep to ~1ms short
+        } else {
+            YieldProcessor();              // fine spin to the exact mark
+        }
+    }
+
+    nextTick += period;                    // accumulator anchor (kills the beat)
+
+    // Catch-up clamp: after a hitch/load-screen/alt-tab we may be many periods
+    // behind. Resync instead of sprinting through catch-up frames.
+    QueryPerformanceCounter(&now);
+    if (double(now.QuadPart) - nextTick > period) {
+        nextTick = double(now.QuadPart) + period;
+    }
+}
 
 static bool isTracyProfilerRunning() {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -46,6 +104,108 @@ static constexpr tracy::SourceLocationData s_sceneZoneLocs[] = {
     { "UI",     "BeginScene", __FILE__, 0, 0 },
 };
 static tracy::ScopedZone* s_currentSceneZone = nullptr;
+
+// ---------------------------------------------------------------------------
+// GPU frame timer (diagnostic). The vendored Tracy has no D3D9 backend, so
+// instead of a full GPU zone context this measures total GPU time per frame
+// with D3D9 timestamp queries and emits it as the Tracy plot "GPU frame (ms)".
+// Purpose: decide whether the frame is GPU-bound — if GPU ms ~= frame ms, the
+// frame is GPU-bound. Read-back is deferred across a small ring so the CPU never
+// blocks on GetData. The span for frame F is bracketed beginFrame() (at the
+// first scene's BeginScene — start of frame F's GPU work) .. endFrame() (at
+// Present F). This measures GPU BUSY time: inter-frame idle (the frame
+// limiter's pace wait + present/back-buffer wait) falls between Present F's
+// tsEnd and frame F+1's tsStart, OUTSIDE the span — so the plot stays honest
+// when the limiter is active.
+namespace {
+struct GpuFrameTimer {
+    static constexpr int N = 4;
+    struct Slot {
+        IDirect3DQuery9* tsStart  = nullptr;
+        IDirect3DQuery9* tsEnd    = nullptr;
+        IDirect3DQuery9* disjoint = nullptr;
+        IDirect3DQuery9* freq     = nullptr;
+        bool inFlight = false;
+    };
+    Slot slots[N];
+    int  cur = -1;
+    bool initialized = false;
+    bool disabled = false;
+    bool spanOpen = false;   // beginFrame opened a span this frame (endFrame closes it)
+
+    void releaseAll() {
+        for (auto& s : slots) {
+            if (s.tsStart)  { s.tsStart->Release();  s.tsStart  = nullptr; }
+            if (s.tsEnd)    { s.tsEnd->Release();    s.tsEnd    = nullptr; }
+            if (s.disjoint) { s.disjoint->Release(); s.disjoint = nullptr; }
+            if (s.freq)     { s.freq->Release();     s.freq     = nullptr; }
+            s.inFlight = false;
+        }
+        initialized = false;
+        spanOpen = false;
+        cur = -1;
+    }
+
+    bool ensureInit(IDirect3DDevice9* dev) {
+        if (initialized) return true;
+        if (disabled || !dev) return false;
+        for (auto& s : slots) {
+            if (FAILED(dev->CreateQuery(D3DQUERYTYPE_TIMESTAMP,         &s.tsStart))  ||
+                FAILED(dev->CreateQuery(D3DQUERYTYPE_TIMESTAMP,         &s.tsEnd))    ||
+                FAILED(dev->CreateQuery(D3DQUERYTYPE_TIMESTAMPDISJOINT, &s.disjoint)) ||
+                FAILED(dev->CreateQuery(D3DQUERYTYPE_TIMESTAMPFREQ,     &s.freq))) {
+                disabled = true;     // GPU lacks timestamp queries — give up silently
+                releaseAll();
+                return false;
+            }
+        }
+        initialized = true;
+        return true;
+    }
+
+    // Close the current frame's span (before the real Present). No-op unless
+    // beginFrame opened a span this frame (e.g. a present with no main scene).
+    void endFrame() {
+        if (!initialized || !spanOpen) return;
+        Slot& s = slots[cur];
+        s.tsEnd->Issue(D3DISSUE_END);
+        s.freq->Issue(D3DISSUE_END);
+        s.disjoint->Issue(D3DISSUE_END);
+        s.inFlight = true;
+        spanOpen = false;
+    }
+
+    // Non-blocking read-back of any completed slots → emit the plot.
+    void readCompleted() {
+        if (!initialized) return;
+        for (auto& s : slots) {
+            if (!s.inFlight) continue;
+            BOOL   dis = FALSE;
+            UINT64 f = 0, t0 = 0, t1 = 0;
+            if (s.disjoint->GetData(&dis, sizeof(dis), 0) != S_OK) continue;
+            if (s.freq->GetData(&f, sizeof(f), 0)         != S_OK) continue;
+            if (s.tsStart->GetData(&t0, sizeof(t0), 0)    != S_OK) continue;
+            if (s.tsEnd->GetData(&t1, sizeof(t1), 0)      != S_OK) continue;
+            s.inFlight = false;
+            if (!dis && f != 0 && t1 >= t0) {
+                MGE_TracyPlot("GPU frame (ms)", double(t1 - t0) / double(f) * 1000.0);
+            }
+        }
+    }
+
+    // Open this frame's span at the start of GPU work (first scene's BeginScene).
+    void beginFrame() {
+        if (!initialized || spanOpen) return;
+        cur = (cur + 1) % N;
+        Slot& s = slots[cur];
+        s.inFlight = false;                  // drop any unread slot we're reusing
+        s.disjoint->Issue(D3DISSUE_BEGIN);
+        s.tsStart->Issue(D3DISSUE_END);
+        spanOpen = true;
+    }
+};
+GpuFrameTimer g_gpuTimer;
+} // namespace
 #endif
 static DWORD stencilRef;
 static bool stage0Complete, isFrameComplete, isHUDComplete;
@@ -234,7 +394,64 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
     isFrameComplete = false;
     isHUDComplete = false;
 
-    HRESULT hr = ProxyDevice::Present(a, b, c, d);
+#ifdef TRACY_ENABLE
+    if (g_tracyActive) {
+        // CPU frame period (Present -> Present) — shows the limiter beat directly.
+        static LARGE_INTEGER s_periodFreq = {};
+        static LARGE_INTEGER s_periodLast = {};
+        if (s_periodFreq.QuadPart == 0) QueryPerformanceFrequency(&s_periodFreq);
+        LARGE_INTEGER nowQpc; QueryPerformanceCounter(&nowQpc);
+        if (s_periodLast.QuadPart != 0) {
+            MGE_TracyPlot("CPU frame (ms)",
+                1000.0 * double(nowQpc.QuadPart - s_periodLast.QuadPart) / double(s_periodFreq.QuadPart));
+        }
+        s_periodLast = nowQpc;
+
+        // Engine frame-limiter probe: timer reads/frame (spin = thousands, sleep
+        // = a handful) plus which engine call site does them (logged every 60
+        // frames so we can localize the limiter loop for the fix).
+        unsigned timerCalls = TimerProbe::takeFrameCallCount();
+        MGE_TracyPlot("engine time() reads", (double)timerCalls);
+        static int s_probeFrame = 0;
+        if ((s_probeFrame++ % 60) == 0) {
+            TimerProbe::CallerStat callers[8];
+            int nc = TimerProbe::takeCallerStats(callers, 8);
+            char buf[256];
+            int off = _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                                  "[timerprobe] reads(last frame)=%u  callers(60f):", timerCalls);
+            for (int i = 0; i < nc && off > 0 && off < (int)sizeof(buf) - 24; ++i) {
+                int w = _snprintf_s(buf + off, sizeof(buf) - off, _TRUNCATE,
+                                    " %p=%u", callers[i].addr, callers[i].count);
+                if (w <= 0) break;
+                off += w;
+            }
+            LOG::logline("%s", buf);
+        }
+
+        g_gpuTimer.ensureInit(realDevice);
+        g_gpuTimer.endFrame();       // close frame F's GPU span (before pace + present)
+        g_gpuTimer.readCompleted();  // emit any finished frame's GPU ms
+        // beginFrame() is issued at the first scene's BeginScene, not here, so
+        // the limiter's inter-frame idle stays outside the measured span.
+    }
+#endif
+
+    // MGE frame limiter: pace to the target before presenting. Off when
+    // Configuration.FPSLimit == 0.
+    {
+        MGE_ZoneScopedN("framePace");
+        framePaceLimit();
+    }
+
+    HRESULT hr;
+    {
+        MGE_ZoneScopedN("engPresent");
+        hr = ProxyDevice::Present(a, b, c, d);
+    }
+
+#ifdef TRACY_ENABLE
+    if (g_tracyActive) g_gpuTimer.beginFrame();  // open frame F+1's GPU span
+#endif
     MGE_FrameMark;
     return hr;
 }
@@ -257,7 +474,11 @@ HRESULT _stdcall MGEProxyDevice::SetRenderTarget(IDirect3DSurface8* a, IDirect3D
 HRESULT _stdcall MGEProxyDevice::BeginScene() {
     auto mwBridge = MWBridge::get();
 
-    HRESULT hr = ProxyDevice::BeginScene();
+    HRESULT hr;
+    {
+        MGE_ZoneScopedN("engBeginScene");
+        hr = ProxyDevice::BeginScene();
+    }
     if (hr != D3D_OK) {
         return hr;
     }
@@ -288,8 +509,15 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                 s_currentSceneZone = new tracy::ScopedZone(&s_sceneZoneLocs[idx], 0, true);
             }
 #endif
-            if (sceneCount == 0)
+            if (sceneCount == 0) {
                 DistantLand::beginSkyZone();
+#ifdef TRACY_ENABLE
+                // Open the GPU-busy-time span at the start of the frame's GPU
+                // work (paired with endFrame() at Present). ensureInit ran in a
+                // prior Present, so this is live from frame 1.
+                if (g_tracyActive) g_gpuTimer.beginFrame();
+#endif
+            }
 
             // Set any custom FOV and check distant water state
             if (sceneCount == 0) {
@@ -388,6 +616,13 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
 // Skybox mesh doesn't extend over whole background; cleared background colour is visible at horizon
 HRESULT _stdcall MGEProxyDevice::Clear(DWORD a, const D3DRECT* b, DWORD c, D3DCOLOR d, float e, DWORD f) {
     DistantLand::setHorizonColour(d);
+    // Zone the clear during the scene-0 sky window — a Clear is a classic
+    // point at which the CPU blocks on GPU backpressure, and that wait would
+    // otherwise hide inside the "MW sky" zone.
+    if (isMainView && sceneCount == 0 && !stage0Complete) {
+        MGE_ZoneScopedN("MWsky:Clear");
+        return ProxyDevice::Clear(a, b, c, d, e, f);
+    }
     return ProxyDevice::Clear(a, b, c, d, e, f);
 }
 
@@ -539,6 +774,13 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
         }
     }
 
+    // Zone the engine's scene-0 sky draws (everything before the first world
+    // draw triggers renderStage0). Localizes whether the long "MW sky" window
+    // is spent in these draws vs. before the first draw (BeginScene/Clear).
+    if (isMainView && sceneCount == 0 && !stage0Complete) {
+        MGE_ZoneScopedN("MWsky:DIP");
+        return ProxyDevice::DrawIndexedPrimitive(a, b, c, d, e);
+    }
     return ProxyDevice::DrawIndexedPrimitive(a, b, c, d, e);
 }
 
@@ -547,6 +789,9 @@ ULONG _stdcall MGEProxyDevice::Release() {
     ULONG r = ProxyDevice::Release();
 
     if (r == 0) {
+#ifdef TRACY_ENABLE
+        g_gpuTimer.releaseAll();
+#endif
         DistantLand::release();
         MGEhud::release();
         StatusOverlay::release();

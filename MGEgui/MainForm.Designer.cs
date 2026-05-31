@@ -1331,12 +1331,12 @@ namespace MGEgui {
             this.udFPSLimit.Location = new System.Drawing.Point(686, 75);
             this.udFPSLimit.Margin = new System.Windows.Forms.Padding(4);
             this.udFPSLimit.Maximum = new decimal(new int[] {
-            240,
+            999,
             0,
             0,
             0});
             this.udFPSLimit.Minimum = new decimal(new int[] {
-            15,
+            0,
             0,
             0,
             0});

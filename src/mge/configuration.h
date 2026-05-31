@@ -87,6 +87,10 @@ struct ConfigurationStruct {
     BYTE ZBufFormat;
     BYTE VWait;
     BYTE RefreshRate;
+    // MGE-owned frame limiter target (fps). 0 = off (uncapped). Read from
+    // MGE.ini; the engine's own "Max FPS" limiter is neutralized by MGEgui
+    // forcing Morrowind.ini Max FPS high, so this is the sole pacer.
+    int FPSLimit;
     bool Borderless;
     BYTE AnisoLevel;
     BYTE ScaleFilter;

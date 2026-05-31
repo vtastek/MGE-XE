@@ -170,6 +170,7 @@ const iniSetting iniSettings[] = {
     {&Configuration.ZBufFormat, t_uint8, 1, siniGlobGraph, "Z-Buffer Format", "D24S8", &dictZBuf, DICTONLY|DONT_SAVE, 0, 0},
     {&Configuration.VWait, t_uint8, 1, siniGlobGraph, "VWait", "Immediate", &dictVWait, DICTONLY|DONT_SAVE, 0, 0},
     {&Configuration.RefreshRate, t_uint8, 1, siniGlobGraph, "Refresh Rate", "Default", &dictRefrRate, MINMAX|DONT_SAVE, 0, 240},
+    {&Configuration.FPSLimit, t_int32, 1, siniGlobGraph, "FPS Limit", "0", NULL, MINMAX|DONT_SAVE, 0, 1000},
     {&Configuration.Borderless, t_bool, 1, siniGlobGraph, "Borderless Window", "True", &dictBool, DICTONLY|DONT_SAVE, 0, 0},
     {&Configuration.AnisoLevel, t_uint8, 1, siniRendState, "Anisotropic Filtering Level", "Off", &dictAnisoLvl, DICTONLY|DONT_SAVE, 0, 0},
     {&Configuration.ScreenFOV, t_float, 1, siniRendState, "Horizontal Screen FOV", "75", NULL, MINMAX, 5, 150},
