@@ -27,6 +27,7 @@ using std::vector;
 bool DistantLand::ready = false;
 bool DistantLand::isRenderCached = false;
 bool DistantLand::isPPLActive = false;
+bool DistantLand::earlyWalkedCache = false;
 int DistantLand::numWaterVerts, DistantLand::numWaterTris;
 
 IDirect3DDevice9* DistantLand::device;

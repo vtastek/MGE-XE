@@ -595,6 +595,7 @@ void DistantLand::cullDistantStatics_finish() {
 
     if (Configuration.UseSharedMemory) {
         {
+            MGE_ZoneScopedN("finish:wait");
             MGE_SCOPED_TIMER("cullDistantStatics:finishWait");
             // Guarded wait: an interleaved RPC between kickoff and here
             // (e.g. cullGrass's getVisibleMeshesCoarse, which awaits its
@@ -634,10 +635,13 @@ void DistantLand::cullDistantStatics_finish() {
     // non-instanced render paths consume the same cull mask. Must run
     // after the sort so msocOccluded[idx] aligns with each render
     // path's visible-set iteration order.
-    if (Configuration.UseSharedMemory) {
-        applyMSOCToDistantStatics(visDistantShared);
-    } else {
-        applyMSOCToDistantStatics(visDistant);
+    {
+        MGE_ZoneScopedN("finish:applyMSOC");
+        if (Configuration.UseSharedMemory) {
+            applyMSOCToDistantStatics(visDistantShared);
+        } else {
+            applyMSOCToDistantStatics(visDistant);
+        }
     }
 }
 
@@ -791,25 +795,48 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
     const float waterLevel = MWBridge::get()->WaterLevel();
     const float cutoffZ    = waterLevel + kTallness;
 
-    // Distance thresholds for group-size LOD (squared, avoids sqrt per static).
-    // Near  (<4 cells): 1x1-cell OBBs.
-    // Mid   (<8 cells): 2x2-cell OBBs.
-    // Far   (8+ cells): 3x3-cell OBBs.
-    const float kNearDistSq = (4.0f * kCellSize) * (4.0f * kCellSize);
-    const float kMidDistSq  = (8.0f * kCellSize) * (8.0f * kCellSize);
-    const float groupCullStartDist = nearViewRange + kCellSize;
+    // ---------------------------------------------------------------------
+    // Fixed grid grouping.
+    //
+    // DL is entirely static: a static's group cell is a pure function of its
+    // fixed world position — floor(center / gSize) with a single FIXED cell
+    // size (no per-frame distance-LOD). The grid is an implicit, constant
+    // structure; it never changes frame to frame, so there is nothing to
+    // rebuild. Per frame we only bucket the *visible* low statics into their
+    // (fixed) cells via an O(1) camera-relative dense-grid lookup, replacing
+    // the old O(visible × groups) linear scan. Group bounds derive directly
+    // from the cell coords; the camera-dependent OBB verdicts are computed in
+    // Pass 2a.
+    //
+    // Fixed group cell size, in Morrowind cells. Tunable: larger = fewer/safer
+    // OBB tests (less popping, less culling); smaller = tighter culling.
+    constexpr int kMSOCGroupCells = 2;
+    const int   gCells = kMSOCGroupCells;
+    const float gSize  = gCells * kCellSize;
+
+    // Close low statics stay on the per-static sphere path (grouping is too
+    // coarse near the camera); only statics beyond this band are grouped.
+    const float groupCullStartDist   = nearViewRange + kCellSize;
     const float groupCullStartDistSq = groupCullStartDist * groupCullStartDist;
 
-    // Flat group list — typically ≤ 64 entries, linear search is cache-friendly
-    // and cheaper than unordered_map for this count.
+    // Camera-relative dense grid: maps a group cell to a group-list slot in
+    // O(1) with no hashing. Origin is the eye's group cell; radius spans the
+    // draw distance plus a margin. Stored value is groupIdx+1 (0 = empty).
+    const int eyeGx = (int)floorf(eyePos.x / gSize);
+    const int eyeGy = (int)floorf(eyePos.y / gSize);
+    const int gridRadius = (int)ceilf((float)Configuration.DL.DrawDist / (float)gCells) + 2;
+    const int gridDim    = 2 * gridRadius + 1;
+
     struct GroupEntry {
-        int gx, gy, gCells;
+        int gx, gy;
         float minX, maxX, minY, maxY;
         MSOCClient::TestResult verdict;
     };
     static std::vector<GroupEntry>              groups;
     // Per-static group index; 0xFFFF = handled by sphere batch.
     static std::vector<std::uint16_t>           staticGroupIdx;
+    // Camera-relative cell → groupIdx+1 (0 = empty), cleared each frame.
+    static std::vector<std::uint16_t>           gridCellToGroup;
     // Sphere batch for high statics and near low statics.
     static std::vector<float>                   sphereBatch;
     static std::vector<MSOCClient::TestResult>  sphereResults;
@@ -818,8 +845,9 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
     groups.reserve(64);
     sphereBatch.clear();
     staticGroupIdx.assign(setSize, 0xFFFF);
+    gridCellToGroup.assign((size_t)gridDim * gridDim, 0);
 
-    // Pass 1: partition statics. Low → cell group (linear search).  High → sphere batch.
+    // Pass 1: partition statics. Low → fixed cell group (O(1)).  High → sphere batch.
     {
         MGE_SCOPED_TIMER("applyMSOCToDistantStatics:partition");
         staticSet.Reset();
@@ -830,20 +858,19 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
             const float sz = m.sphere.center.z, sr = m.sphere.radius;
 
             if (sz + sr <= cutoffZ) {
-                // Low static: use grouped OBBs only after the near handoff band.
-                // Close low statics use the original per-static sphere path.
-                const float dx  = sx - eyePos.x;
-                const float dy  = sy - eyePos.y;
-                const float dSq = dx * dx + dy * dy;
-                const int gCells = (dSq < kNearDistSq) ? 1 : (dSq < kMidDistSq) ? 2 : 3;
-                const float gSize = gCells * kCellSize;
+                // Low static. Its grid cell is a pure function of fixed position.
                 const int gx = (int)floorf(sx / gSize);
                 const int gy = (int)floorf(sy / gSize);
                 const float x0 = (float)gx * gSize;
                 const float y0 = (float)gy * gSize;
+
+                // Near handoff / out-of-grid → per-static sphere path.
                 const float minDistSq = distanceSqToAABB2D(
                     eyePos.x, eyePos.y, x0, x0 + gSize, y0, y0 + gSize);
-                if (minDistSq <= groupCullStartDistSq) {
+                const int lx = gx - eyeGx + gridRadius;
+                const int ly = gy - eyeGy + gridRadius;
+                if (minDistSq <= groupCullStartDistSq ||
+                    lx < 0 || lx >= gridDim || ly < 0 || ly >= gridDim) {
                     sphereBatch.push_back(sx);
                     sphereBatch.push_back(sy);
                     sphereBatch.push_back(sz);
@@ -852,19 +879,16 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
                     continue;
                 }
 
-                // Linear scan — groups count is tiny (~33), fits in a cache line or two.
-                std::uint16_t gIdx = (std::uint16_t)groups.size();
-                for (std::uint16_t i = 0; i < (std::uint16_t)groups.size(); ++i) {
-                    if (groups[i].gx == gx && groups[i].gy == gy && groups[i].gCells == gCells) {
-                        gIdx = i;
-                        break;
-                    }
-                }
-                if (gIdx == (std::uint16_t)groups.size()) {
-                    groups.push_back({gx, gy, gCells, x0, x0 + gSize, y0, y0 + gSize,
+                // O(1) cell → group lookup (no linear scan).
+                const size_t cell = (size_t)ly * gridDim + lx;
+                std::uint16_t slot = gridCellToGroup[cell];
+                if (slot == 0) {
+                    slot = (std::uint16_t)(groups.size() + 1);
+                    groups.push_back({gx, gy, x0, x0 + gSize, y0, y0 + gSize,
                                       MSOCClient::ResultVisible});
+                    gridCellToGroup[cell] = slot;
                 }
-                staticGroupIdx[idx] = gIdx;
+                staticGroupIdx[idx] = (std::uint16_t)(slot - 1);
             } else {
                 // High static: per-static sphere test.
                 sphereBatch.push_back(sx);

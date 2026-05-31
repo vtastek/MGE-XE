@@ -297,6 +297,15 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                     mwBridge->SetFOV(Configuration.ScreenFOV);
                 }
                 distantWater = (Configuration.MGEFlags & USE_DISTANT_LAND) || (Configuration.MGEFlags & USE_DISTANT_WATER);
+
+                // Kick off the distant-statics cull now — the camera is already
+                // this-frame-valid (after the FOV override above), so its ~4ms
+                // server-side compute overlaps the engine's sky pass instead of
+                // stalling cullDistantStatics_finish later. renderStage0 detects
+                // this and skips the redundant setup + kickoff.
+                if (DistantLand::ready) {
+                    DistantLand::frameSetupEarly();
+                }
             }
         } else {
 #ifdef TRACY_ENABLE

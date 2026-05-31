@@ -25,6 +25,72 @@ static tracy::ScopedZone* s_mwSkyZone   = nullptr;
 static tracy::ScopedZone* s_mwDrawsZone = nullptr;
 #endif
 
+// Set by frameSetupEarly() when the per-frame statics-cull setup ran at
+// BeginScene(scene 0); read by renderStage0 to skip the redundant work.
+static bool s_frameSetupEarly   = false;  // selectDistantCell + camera/fog setup done early
+static bool s_earlyKickedStatics = false; // cullDistantStatics_kickoff already issued early
+
+// Run at BeginScene(scene 0), before the engine renders sky. The camera is
+// already this-frame-valid here (verified: BeginScene-vs-Stage0 view/proj
+// delta = 0), so we can run the distant-statics cull prerequisites and kick
+// the cull off now — its ~4ms server-side compute then overlaps the ~1.5ms
+// sky window plus the GeometryCache walk, instead of stalling cullDistantStatics_finish.
+void DistantLand::frameSetupEarly() {
+    s_frameSetupEarly = false;
+    s_earlyKickedStatics = false;
+    earlyWalkedCache = false;
+
+    // Drive the scene-graph lights snapshot here (moved from renderStage0, which
+    // runs *after* the engine's ~1.6ms sky pass). On the async path onFrameReady
+    // only signals the worker, so rebuildAsync now runs concurrent with sky
+    // instead of starting after it. Fires on every path (incl. non-IPC), so it
+    // sits before the shared-memory gate below. Pose-safe: the scene graph is
+    // fully posed for the frame at BeginScene(0) — same transforms renderStage0
+    // would see (verified camera delta = 0).
+    MGE::SceneGraph::onFrameReady();
+
+    // Only the IPC (shared-memory) path benefits from the early statics/geometry
+    // work: there the cull is async and overlaps. The non-IPC path does
+    // synchronous quadtree work in the kickoff, which has no overlap to gain —
+    // leave selectDistantCell + the GeometryCache walk in renderStage0/renderDepth.
+    if (!ready || !device || !Configuration.UseSharedMemory) return;
+
+    auto mwBridge = MWBridge::get();
+
+    // selectDistantCell issues the blocking setWorldSpace RPC + cell-change
+    // scan; running it here overlaps it with sky too. setView/adjustFog are
+    // pure computation into members (no device/effect side-effects — those live
+    // in setupCommonEffect/updateLighting, which stay in renderStage0).
+    selectDistantCell();
+    device->GetTransform(D3DTS_VIEW, &mwView);
+    device->GetTransform(D3DTS_PROJECTION, &mwProj);
+    setView(&mwView);
+    adjustFog();
+    s_frameSetupEarly = true;
+
+    // Skip in menus: renderStage0 may take the render-cached path there and
+    // never run renderDepth / cullDistantStatics_finish. (An undrained RPC is
+    // still safe — the next frame's WAIT_FOR_PREVIOUS drains it — but doing work
+    // that won't be used is wasted.) The renderStage0/renderDepth fallbacks cover
+    // these cases (earlyWalkedCache / s_earlyKickedStatics stay false).
+    if (isDistantCell() && !mwBridge->IsMenu()) {
+        // Build the geometry cache (walk + VB uploads) now so the ~2ms main-thread
+        // work happens before the sky pass; renderDepth skips its own call when
+        // earlyWalkedCache is set. Cache CONSUME (renderDepthFromCache) stays in
+        // renderDepth where the render target/effect are bound. Independent of
+        // USE_DISTANT_STATICS — this is the depth/shadow cache.
+        MGE::GeometryCache::onFrameReady(MGE::SceneGraph::getDataHandler());
+        earlyWalkedCache = true;
+
+        if (Configuration.MGEFlags & USE_DISTANT_STATICS) {
+            D3DXMATRIX distProj = mwProj;
+            editProjectionZ(&distProj, kDistantNearPlane - 1e-2, Configuration.DL.DrawDist * kCellSize);
+            cullDistantStatics_kickoff(&mwView, &distProj);
+            s_earlyKickedStatics = true;
+        }
+    }
+}
+
 void DistantLand::beginSkyZone() {
 #ifdef TRACY_ENABLE
     if (g_tracyActive) s_mwSkyZone = new tracy::ScopedZone(&s_mwSkyLoc, 0, true);
@@ -48,22 +114,25 @@ void DistantLand::renderStage0() {
     IDirect3DStateBlock9* stateSaved;
     UINT passes;
 
-    // Drive the scene-graph snapshot once per frame. renderStage0 is gated
-    // by mged3d8device's stage0Complete flag, so this fires exactly once
-    // per frame regardless of how many scenes/Clicks the engine submits
-    // afterwards. Self-sources DataHandler on first call; no-op until the
-    // engine has constructed the singleton. Replaces the previous MWSE-
-    // driven MGEAPIv4::onSceneGraphReady() trigger (dropped on this branch).
-    MGE::SceneGraph::onFrameReady();
+    // (Scene-graph lights snapshot — MGE::SceneGraph::onFrameReady() — moved to
+    // frameSetupEarly() at BeginScene(0) so the async worker overlaps the sky
+    // pass. frameSetupEarly runs once per frame before renderStage0, so the
+    // once-per-frame guarantee is preserved.)
 
-    // Update current cell and select distant static set
-    selectDistantCell();
+    // Update current cell and select distant static set. Skipped if
+    // frameSetupEarly() already ran it this frame at BeginScene — re-running
+    // would re-issue the blocking setWorldSpace RPC for nothing.
+    if (!s_frameSetupEarly) {
+        selectDistantCell();
+    }
 
     // Get Morrowind camera matrices
     device->GetTransform(D3DTS_VIEW, &mwView);
     device->GetTransform(D3DTS_PROJECTION, &mwProj);
 
-    // Set variables derived from current game state and camera configuration
+    // Set variables derived from current game state and camera configuration.
+    // setView/adjustFog re-run harmlessly even when frameSetupEarly already did
+    // (pure idempotent computation; camera/state are unchanged within the frame).
     setView(&mwView);
     adjustFog();
     setupCommonEffect(&mwView, &mwProj);
@@ -95,7 +164,10 @@ void DistantLand::renderStage0() {
 
             const bool kickedOffDistantStatics =
                 (Configuration.MGEFlags & USE_DISTANT_STATICS) != 0;
-            if (kickedOffDistantStatics) {
+            // Fallback kickoff: only if frameSetupEarly() didn't already issue it
+            // at BeginScene (non-IPC path, menus, or not-ready early frames).
+            // When it did, the cull has been overlapping the sky window already.
+            if (kickedOffDistantStatics && !s_earlyKickedStatics) {
                 cullDistantStatics_kickoff(&mwView, &distProj);
             }
 

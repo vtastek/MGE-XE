@@ -58,7 +58,13 @@ void DistantLand::renderDepth() {
     // lags a frame behind the shadow pass and SSAO detaches from moving NPCs.
     // Cheap now that VS palette skinning replaced per-frame CPU skinning, and
     // the VBs are static so there's no depth/shadow aliasing to overlap around.
-    MGE::GeometryCache::onFrameReady(MGE::SceneGraph::getDataHandler());
+    //
+    // Skipped when frameSetupEarly() already walked it at BeginScene(0) (IPC
+    // path) so the ~2ms walk overlaps the sky pass. This call is the fallback
+    // for the non-IPC / menu / not-ready paths where earlyWalkedCache is false.
+    if (!earlyWalkedCache) {
+        MGE::GeometryCache::onFrameReady(MGE::SceneGraph::getDataHandler());
+    }
     {
         MGE_SCOPED_TIMER("renderDepth:cache");
         renderDepthFromCache(&mwView);   // owns its non-skinned + skinned passes

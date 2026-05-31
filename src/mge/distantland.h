@@ -62,6 +62,9 @@ public:
     static bool ready;
     static bool isRenderCached;
     static bool isPPLActive;
+    // Set by frameSetupEarly() when the GeometryCache walk ran at BeginScene(0);
+    // read by renderDepth (different TU) to skip its own redundant walk.
+    static bool earlyWalkedCache;
     static int numWaterVerts, numWaterTris;
 
     static IDirect3DDevice9* device;
@@ -216,6 +219,11 @@ public:
 
     static void renderSky();
     static void beginSkyZone();
+    // Called from BeginScene(scene 0): runs the statics-cull prerequisites
+    // (selectDistantCell + camera/fog setup) and kicks off the distant-statics
+    // cull early, so its ~4ms server-side work overlaps the engine's sky pass.
+    // renderStage0 detects the early run and skips the redundant work.
+    static void frameSetupEarly();
     static void renderStage0();
     static void beginDrawsZone();
     static void renderStage1();
