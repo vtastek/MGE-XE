@@ -119,6 +119,7 @@ D3DXHANDLE DistantLand::ehProj;
 D3DXHANDLE DistantLand::ehShadowViewproj;
 D3DXHANDLE DistantLand::ehVertexBlendState;
 D3DXHANDLE DistantLand::ehVertexBlendPalette;
+D3DXHANDLE DistantLand::ehBoneMatrices;
 D3DXHANDLE DistantLand::ehAlphaRef;
 D3DXHANDLE DistantLand::ehMaterialAlpha;
 D3DXHANDLE DistantLand::ehHasAlpha;
@@ -593,6 +594,7 @@ bool DistantLand::initShader() {
     ehShadowViewproj = effect->GetParameterByName(0, "shadowViewProj");
     ehVertexBlendState = effect->GetParameterByName(0, "vertexBlendState");
     ehVertexBlendPalette = effect->GetParameterByName(0, "vertexBlendPalette");
+    ehBoneMatrices = effect->GetParameterByName(0, "boneMatrices");
     ehAlphaRef = effect->GetParameterByName(0, "alphaRef");
     ehMaterialAlpha = effect->GetParameterByName(0, "materialAlpha");
     ehHasAlpha = effect->GetParameterByName(0, "hasAlpha");

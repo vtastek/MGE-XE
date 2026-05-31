@@ -53,15 +53,16 @@ void DistantLand::renderDepth() {
     device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
     effectDepth->EndPass();
 
-    // Near-scene geometry from scenegraph cache. Kick GPU first, then
-    // update the cache on CPU while the GPU renders — CPU/GPU overlap.
+    // Rebuild the geometry cache (walk + per-frame bone palettes) BEFORE the
+    // depth draw so depth uses this frame's skinned poses — otherwise depth
+    // lags a frame behind the shadow pass and SSAO detaches from moving NPCs.
+    // Cheap now that VS palette skinning replaced per-frame CPU skinning, and
+    // the VBs are static so there's no depth/shadow aliasing to overlap around.
+    MGE::GeometryCache::onFrameReady(MGE::SceneGraph::getDataHandler());
     {
         MGE_SCOPED_TIMER("renderDepth:cache");
-        effectDepth->BeginPass(PASS_RENDERMWDEPTH);
-        renderDepthFromCache(&mwView);
-        effectDepth->EndPass();
+        renderDepthFromCache(&mwView);   // owns its non-skinned + skinned passes
     }
-    MGE::GeometryCache::onFrameReady(MGE::SceneGraph::getDataHandler());
 
     if (isDistantCell()) {
         if (!mwBridge->IsUnderwater(eyePos.z)) {
@@ -177,37 +178,11 @@ void DistantLand::renderDepthRecorded() {
 void DistantLand::renderDepthFromCache(const D3DXMATRIX* gameView) {
     MGE_ZoneScopedN("renderDepthFromCache");
 
-    // Non-skinned VBs are model-space; per-draw palette[0] = worldTransform * gameView.
-    // Skinned VBs are CPU-skinned to world-space; palette[0] = gameView.
-    // vertexBlendState=1 for skinned suppresses grassDisplacement() in the depth VS.
     const float solidThreshold = 0.499f;
-
-    effect->SetBool(ehHasVCol, false);
-    effect->SetFloat(ehMaterialAlpha, 1.0f);
-    effect->SetBool(ehHasBones, false);
-    effect->SetInt(ehVertexBlendState, 0);
-
     const auto& cacheMap = MGE::GeometryCache::cache();
     const bool useVisibleSet = !s_prevVisibleKeys.empty();
 
-    auto drawEntry = [&](const MGE::GeometryCache::CachedGeometry& e) {
-        // Depth runs before onFrameReady's rebuild, so readVB() returns last
-        // frame's slot — the buffer the GPU can render while the CPU rewrites
-        // the other slot for this frame's shadow pass.
-        IDirect3DVertexBuffer9* vb = e.readVB();
-        if (!vb || !e.ib) return;
-
-        D3DXMATRIX wvMat;
-        if (e.isSkinned) {
-            wvMat = *gameView;
-            effect->SetInt(ehVertexBlendState, 1);
-        } else {
-            D3DXMatrixMultiply(&wvMat, reinterpret_cast<const D3DXMATRIX*>(e.worldTransformD3D), gameView);
-            effect->SetInt(ehVertexBlendState, 0);
-        }
-        D3DXMATRIX wvPalette[4] = { wvMat, wvMat, wvMat, wvMat };
-        effect->SetMatrixArray(ehVertexBlendPalette, wvPalette, 4);
-
+    auto bindMaterial = [&](const MGE::GeometryCache::CachedGeometry& e) {
         bool alphaDependent = e.alphaTest || e.blendEnable;
         if (alphaDependent && e.d3dTexture) {
             effect->SetTexture(ehTex0, e.d3dTexture);
@@ -218,29 +193,68 @@ void DistantLand::renderDepthFromCache(const D3DXMATRIX* gameView) {
             effect->SetBool(ehHasAlpha, false);
             effect->SetFloat(ehAlphaRef, -1.0f);
         }
-
-        effectDepth->CommitChanges();
-
         device->SetRenderState(D3DRS_CULLMODE, e.blendEnable ? D3DCULL_NONE : D3DCULL_CW);
         device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
         device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+    };
 
+    auto forEach = [&](auto&& fn) {
+        if (useVisibleSet) {
+            for (uint32_t key : s_prevVisibleKeys) {
+                auto it = cacheMap.find(key);
+                if (it != cacheMap.end()) fn(it->second);
+            }
+        } else {
+            for (const auto& kv : cacheMap) fn(kv.second);
+        }
+    };
+
+    // ---- Non-skinned: model-space VB, per-draw palette[0] = worldTransform*view ----
+    effect->SetBool(ehHasVCol, false);
+    effect->SetFloat(ehMaterialAlpha, 1.0f);
+    effect->SetBool(ehHasBones, false);
+    effect->SetInt(ehVertexBlendState, 0);
+
+    effectDepth->BeginPass(PASS_RENDERMWDEPTH);
+    forEach([&](const MGE::GeometryCache::CachedGeometry& e) {
+        if (e.isSkinned) return;
+        IDirect3DVertexBuffer9* vb = e.readVB();
+        if (!vb || !e.ib) return;
+
+        D3DXMATRIX wvMat;
+        D3DXMatrixMultiply(&wvMat, reinterpret_cast<const D3DXMATRIX*>(e.worldTransformD3D), gameView);
+        D3DXMATRIX wvPalette[4] = { wvMat, wvMat, wvMat, wvMat };
+        effect->SetMatrixArray(ehVertexBlendPalette, wvPalette, 4);
+
+        bindMaterial(e);
+        effectDepth->CommitChanges();
         device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kVBStride);
         device->SetIndices(e.ib);
         device->SetFVF(MGE::GeometryCache::kVBFVF);
         device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, e.vertexCount, 0, e.triangleCount);
-    };
+    });
+    effectDepth->EndPass();
 
-    if (useVisibleSet) {
-        // Iterate only the MSOC-culled visible set (~510 entries vs ~12000 full cache).
-        for (uint32_t key : s_prevVisibleKeys) {
-            auto it = cacheMap.find(key);
-            if (it != cacheMap.end()) drawEntry(it->second);
-        }
-    } else {
-        // Fallback: MSOC absent or first frame — render entire geometry cache.
-        for (const auto& kv : cacheMap) drawEntry(kv.second);
-    }
+    // ---- Skinned: static bind-pose VB + per-frame bone palette (VS skinning) ----
+    // skinIndexed -> view -> proj; view must be the game view, proj is the depth proj.
+    effect->SetMatrix(ehView, gameView);
+
+    effectDepth->BeginPass(PASS_RENDERMWDEPTH_SKINNED);
+    device->SetVertexDeclaration(MGE::GeometryCache::skinnedDecl());
+    forEach([&](const MGE::GeometryCache::CachedGeometry& e) {
+        if (!e.isSkinned || e.skinnedUnsupported) return;
+        IDirect3DVertexBuffer9* vb = e.readVB();
+        if (!vb || !e.ib || e.numBones == 0) return;
+
+        effect->SetMatrixArray(ehBoneMatrices,
+            reinterpret_cast<const D3DXMATRIX*>(e.bonePalette.data()), e.numBones);
+        bindMaterial(e);
+        effectDepth->CommitChanges();
+        device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kSkinnedVBStride);
+        device->SetIndices(e.ib);
+        device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, e.vertexCount, 0, e.triangleCount);
+    });
+    effectDepth->EndPass();
 
     effect->SetTexture(ehTex0, nullptr);
     effect->SetBool(ehHasAlpha, false);

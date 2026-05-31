@@ -13,6 +13,12 @@ shared float shadowRcpRes;
 shared matrix world, view, proj;
 shared matrix vertexBlendPalette[4];
 shared matrix shadowViewProj[2];
+
+// Indexed bone palette for cache VS skinning (model->world per bone).
+// MAX_BONES is bounded by VS constant registers; the cache guards/reports
+// any skinned shape exceeding it rather than silently falling back.
+#define MAX_BONES 32
+shared matrix boneMatrices[MAX_BONES];
 shared bool hasAlpha, hasBones, hasVCol;
 shared float alphaRef, materialAlpha;
 shared int vertexBlendState;
@@ -99,6 +105,15 @@ struct MorrowindVertIn {
     float4 normal : NORMAL;
     float4 blendweights : BLENDWEIGHT;
     float4 color : COLOR0;
+    float2 texcoords : TEXCOORD0;
+};
+
+// Cache skinned vertex: bind-pose position + up to 4 weighted bone influences
+// indexing boneMatrices. Indices arrive as UBYTE4 (float [0,255]); cast to int.
+struct SkinnedVertIn {
+    float4 pos : POSITION;
+    float4 blendweights : BLENDWEIGHT;
+    float4 blendindices : BLENDINDICES;
     float2 texcoords : TEXCOORD0;
 };
 
@@ -262,6 +277,17 @@ float4 skin(float4 pos, float4 blend) {
         viewpos += mul(pos, vertexBlendPalette[3]) * blend[3];
 
     return viewpos;
+}
+
+// Indexed palette skinning for cache-sourced skinned geometry. Each
+// boneMatrices[i] is the bone's model->world transform; returns world-space
+// position. The caller applies view/proj (depth) or shadowViewProj (shadow).
+float4 skinIndexed(float4 pos, float4 weights, float4 indices) {
+    float4 p  = mul(pos, boneMatrices[int(indices.x)]) * weights.x;
+    p        += mul(pos, boneMatrices[int(indices.y)]) * weights.y;
+    p        += mul(pos, boneMatrices[int(indices.z)]) * weights.z;
+    p        += mul(pos, boneMatrices[int(indices.w)]) * weights.w;
+    return p;
 }
 
 //------------------------------------------------------------

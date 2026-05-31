@@ -198,39 +198,9 @@ void DistantLand::renderShadowFromCache(int layer, const D3DXMATRIX* viewproj) {
     static constexpr float kShadowMinSize = 50.0f;
 
     ViewFrustum frustum(viewproj);
+    const auto& cacheMap = MGE::GeometryCache::cache();
 
-    effectShadow->BeginPass(PASS_RENDERSHADOWMAP_MW);
-    effect->SetFloat(ehMaterialAlpha, 1.0f);
-    effect->SetBool(ehHasBones, false);
-
-    for (const auto& kv : MGE::GeometryCache::cache()) {
-        const auto& e = kv.second;
-        // Shadow runs after onFrameReady's rebuild, so readVB() returns this
-        // frame's freshly written slot.
-        IDirect3DVertexBuffer9* vb = e.readVB();
-        if (!vb || !e.ib) continue;
-        if (e.blendEnable) continue;
-
-        if (!e.isSkinned && e.dynamicHint == 0) {
-            if (e.boundsRadius < kShadowMinSize) continue;
-        }
-
-        BoundingSphere bs;
-        bs.center = D3DXVECTOR3(e.worldTransformD3D[12], e.worldTransformD3D[13], e.worldTransformD3D[14]);
-        bs.radius = e.boundsRadius;
-        if (frustum.ContainsSphere(bs) == ViewFrustum::OUTSIDE) continue;
-
-        D3DXMATRIX shadowPalette[4];
-        if (e.isSkinned) {
-            shadowPalette[0] = *viewproj;
-            effect->SetInt(ehVertexBlendState, 1);
-        } else {
-            D3DXMatrixMultiply(&shadowPalette[0], reinterpret_cast<const D3DXMATRIX*>(e.worldTransformD3D), viewproj);
-            effect->SetInt(ehVertexBlendState, 0);
-        }
-        shadowPalette[1] = shadowPalette[2] = shadowPalette[3] = shadowPalette[0];
-        effect->SetMatrixArray(ehVertexBlendPalette, shadowPalette, 4);
-
+    auto bindAlpha = [&](const MGE::GeometryCache::CachedGeometry& e) {
         if (e.alphaTest && e.d3dTexture) {
             effect->SetTexture(ehTex0, e.d3dTexture);
             effect->SetBool(ehHasAlpha, true);
@@ -240,7 +210,35 @@ void DistantLand::renderShadowFromCache(int layer, const D3DXMATRIX* viewproj) {
             effect->SetBool(ehHasAlpha, false);
             effect->SetFloat(ehAlphaRef, -1.0f);
         }
+    };
+    auto culled = [&](const MGE::GeometryCache::CachedGeometry& e) -> bool {
+        BoundingSphere bs;
+        bs.center = D3DXVECTOR3(e.worldTransformD3D[12], e.worldTransformD3D[13], e.worldTransformD3D[14]);
+        bs.radius = e.boundsRadius;
+        return frustum.ContainsSphere(bs) == ViewFrustum::OUTSIDE;
+    };
 
+    effect->SetFloat(ehMaterialAlpha, 1.0f);
+    effect->SetBool(ehHasBones, false);
+
+    // ---- Non-skinned casters: model-space VB, palette[0] = worldTransform*shadowVP ----
+    effectShadow->BeginPass(PASS_RENDERSHADOWMAP_MW);
+    for (const auto& kv : cacheMap) {
+        const auto& e = kv.second;
+        if (e.isSkinned) continue;
+        IDirect3DVertexBuffer9* vb = e.readVB();
+        if (!vb || !e.ib) continue;
+        if (e.blendEnable) continue;
+        if (e.dynamicHint == 0 && e.boundsRadius < kShadowMinSize) continue;
+        if (culled(e)) continue;
+
+        D3DXMATRIX shadowPalette[4];
+        D3DXMatrixMultiply(&shadowPalette[0], reinterpret_cast<const D3DXMATRIX*>(e.worldTransformD3D), viewproj);
+        shadowPalette[1] = shadowPalette[2] = shadowPalette[3] = shadowPalette[0];
+        effect->SetInt(ehVertexBlendState, 0);
+        effect->SetMatrixArray(ehVertexBlendPalette, shadowPalette, 4);
+
+        bindAlpha(e);
         effectShadow->CommitChanges();
         device->SetRenderState(D3DRS_CULLMODE, D3DCULL_CW);
         device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kVBStride);
@@ -248,7 +246,29 @@ void DistantLand::renderShadowFromCache(int layer, const D3DXMATRIX* viewproj) {
         device->SetFVF(MGE::GeometryCache::kVBFVF);
         device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, e.vertexCount, 0, e.triangleCount);
     }
+    effectShadow->EndPass();
 
+    // ---- Skinned casters: static bind-pose VB + per-frame bone palette (VS skinning).
+    // The skinned VS uses shadowViewProj[0], already set to this cascade's viewproj. ----
+    effectShadow->BeginPass(PASS_RENDERSHADOWMAP_MW_SKINNED);
+    device->SetVertexDeclaration(MGE::GeometryCache::skinnedDecl());
+    for (const auto& kv : cacheMap) {
+        const auto& e = kv.second;
+        if (!e.isSkinned || e.skinnedUnsupported) continue;
+        IDirect3DVertexBuffer9* vb = e.readVB();
+        if (!vb || !e.ib || e.numBones == 0) continue;
+        if (e.blendEnable) continue;
+        if (culled(e)) continue;   // skinned are dynamic — no size cull
+
+        effect->SetMatrixArray(ehBoneMatrices,
+            reinterpret_cast<const D3DXMATRIX*>(e.bonePalette.data()), e.numBones);
+        bindAlpha(e);
+        effectShadow->CommitChanges();
+        device->SetRenderState(D3DRS_CULLMODE, D3DCULL_CW);
+        device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kSkinnedVBStride);
+        device->SetIndices(e.ib);
+        device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, e.vertexCount, 0, e.triangleCount);
+    }
     effectShadow->EndPass();
 }
 

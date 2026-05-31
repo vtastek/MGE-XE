@@ -2,29 +2,28 @@
 
 #include <cstdint>
 #include <unordered_map>
+#include <vector>
 
 struct IDirect3DDevice9;
 struct IDirect3DVertexBuffer9;
 struct IDirect3DIndexBuffer9;
 struct IDirect3DTexture9;
+struct IDirect3DVertexDeclaration9;
 
 namespace MGE::GeometryCache {
 
     // Per-geometry entry keyed on NiTriShape* (cast to uint32_t on x86).
-    // Non-skinned objects: VB holds model-space positions; worldTransformD3D updated
-    //   each frame; per-draw world*view palette applied in the depth/shadow renderers.
-    // Skinned objects: CPU-skinned to world-space each frame via NiSkinInstance bone
-    //   matrices; depth/shadow uses palette[0]=gameView (no world transform needed).
+    // Non-skinned objects: VB holds model-space positions (kVBFVF); worldTransformD3D
+    //   updated each frame; per-draw world*view palette applied in the renderers.
+    // Skinned objects: STATIC bind-pose VB with per-vertex weights + bone indices
+    //   (kSkinnedDecl); the bone matrices update per frame into bonePalette and the
+    //   vertex shader skins (no per-frame CPU skinning, no per-frame VB rewrite).
     // Entries are created on first visit and evicted when the object is no longer
     // in the scene (skipped by a complete onFrameReady walk).
     struct CachedGeometry {
-        // Double-buffered VB. onFrameReady writes the slot NOT being read by
-        // the in-flight depth pre-pass (vb[writeSlot] from last frame), then
-        // flips writeSlot so the shadow pass reads the fresh slot. This keeps
-        // the depth/shadow CPU-GPU overlap without reallocating per frame.
-        // Static (non-skinned) entries are written rarely and typically use a
-        // single slot. Use readVB() to fetch the slot a consumer should draw.
-        IDirect3DVertexBuffer9* vb[2];  // D3DFVF_XYZ, world-space positions
+        // Double-buffered VB (kept for non-skinned model-space VBs; skinned VBs are
+        // static so they only use slot 0). Use readVB() to fetch the draw slot.
+        IDirect3DVertexBuffer9* vb[2];
         uint8_t  writeSlot;             // slot holding the most recently written VB
         IDirect3DIndexBuffer9*  ib;     // D3DFMT_INDEX16 triangle list (slot-shared)
         IDirect3DVertexBuffer9* readVB() const { return vb[writeSlot]; }
@@ -34,6 +33,12 @@ namespace MGE::GeometryCache {
         float    boundsRadius;          // model-space bound radius
         uint16_t revisionID;            // GeometryData::revisionID at last upload
         bool     isSkinned;
+        // Skinned: per-frame bone palette (model->world, 16 floats per bone) and
+        // bone count. skinnedUnsupported set when numBones exceeds the shader palette
+        // (kMaxBones) — such entries are skipped (reported), no CPU fallback.
+        std::vector<float> bonePalette;
+        uint32_t numBones;
+        bool     skinnedUnsupported;
         uint8_t  dynamicHint;           // counts down from N when transform moves; 0 = static
         // Material (pointers into NI memory — valid for the session)
         IDirect3DTexture9* d3dTexture;  // null if no base texture
@@ -65,6 +70,15 @@ namespace MGE::GeometryCache {
     // Layout: float3 pos, float3 normal(zeros), DWORD color(0xFFFFFFFF), float2 uv
     static constexpr unsigned int kVBStride = 36;
     static constexpr unsigned int kVBFVF    = 0x152; // XYZ|NORMAL|DIFFUSE|TEX1
+
+    // Skinned vertex layout (SkinnedVertIn in the shaders): float3 pos,
+    // float4 blendweights, UBYTE4 blendindices, float2 uv. Drawn with skinnedDecl().
+    // kMaxBones must match MAX_BONES in "XE Common.fx".
+    static constexpr unsigned int kSkinnedVBStride = 40;
+    static constexpr unsigned int kMaxBones        = 32;
+
+    // Vertex declaration for skinned VBs (created in init). Null until init runs.
+    IDirect3DVertexDeclaration9* skinnedDecl();
 
     // Reverse map: IDirect3DTexture9* → SourceTexture::fileName.
     // Rebuilt each frame from surviving cache entries. Returns null if not found.

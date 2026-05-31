@@ -50,6 +50,22 @@ DepthVertOut DepthMWVS(MorrowindVertIn IN) {
     return OUT;
 }
 
+// VS skinning variant for cache-sourced skinned geometry: bind-pose verts
+// skinned via the indexed bone palette, then view+proj.
+DepthVertOut DepthMWSkinnedVS(SkinnedVertIn IN) {
+    DepthVertOut OUT;
+
+    float4 worldpos = skinIndexed(IN.pos, IN.blendweights, IN.blendindices);
+    float4 viewpos = mul(worldpos, view);
+
+    OUT.alpha = 1.0;
+    OUT.pos = mul(viewpos, proj);
+    OUT.depth = OUT.pos.w;
+    OUT.texcoords = IN.texcoords;
+
+    return OUT;
+}
+
 float4 DepthNearPS(DepthVertOut IN) : COLOR0 {
     clip(nearViewRange + 64.0 - IN.depth);
 
@@ -130,6 +146,25 @@ Technique T0 {
         CullMode = none;
 
         VertexShader = compile vs_3_0 DepthGrassInstVS();
+        PixelShader = compile ps_3_0 DepthNearPS();
+    }
+   //------------------------------------------------------------
+   // Used for rendering cache-sourced skinned MW geometry depth (VS skinning)
+    Pass D1s {
+        ZEnable = true;
+        ZWriteEnable = true;
+        ZFunc = LessEqual;
+        CullMode = CW;
+        ClipPlaneEnable = 0;
+        FillMode = Solid;
+
+        AlphaBlendEnable = false;
+        AlphaTestEnable = false;
+        StencilEnable = false;
+        FogEnable = false;
+        Lighting = false;
+
+        VertexShader = compile vs_3_0 DepthMWSkinnedVS();
         PixelShader = compile ps_3_0 DepthNearPS();
     }
    //------------------------------------------------------------

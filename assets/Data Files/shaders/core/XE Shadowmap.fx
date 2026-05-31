@@ -48,6 +48,19 @@ ShadowVertOut ShadowMWVS(MorrowindVertIn IN) {
     return OUT;
 }
 
+// VS skinning variant for cache-sourced skinned shadow casters: bind-pose
+// verts skinned via the indexed bone palette, then shadow view-projection.
+ShadowVertOut ShadowMWSkinnedVS(SkinnedVertIn IN) {
+    ShadowVertOut OUT;
+
+    float4 worldpos = skinIndexed(IN.pos, IN.blendweights, IN.blendindices);
+    OUT.pos = mul(worldpos, shadowViewProj[0]);
+    OUT.pos.z = max(0, OUT.pos.z);
+    OUT.depth = OUT.pos.z / OUT.pos.w;
+    OUT.texcoords = IN.texcoords;
+    return OUT;
+}
+
 ShadowVertOut ShadowClearVS(float4 pos : POSITION) {
     ShadowVertOut OUT;
 
@@ -203,6 +216,24 @@ technique T0 {
         Lighting = false;
 
         VertexShader = compile vs_3_0 ShadowMWVS();
+        PixelShader = compile ps_3_0 ShadowMWPS();
+    }
+    //------------------------------------------------------------
+    // Used for cache-sourced skinned MW shadow casters (VS skinning)
+    Pass P4s {
+        ZEnable = true;
+        ZWriteEnable = true;
+        ColorWriteEnable = red|green|blue|alpha;
+        CullMode = CW;
+
+        StencilEnable = false;
+
+        AlphaBlendEnable = false;
+        AlphaTestEnable = false;
+        FogEnable = false;
+        Lighting = false;
+
+        VertexShader = compile vs_3_0 ShadowMWSkinnedVS();
         PixelShader = compile ps_3_0 ShadowMWPS();
     }
     //------------------------------------------------------------

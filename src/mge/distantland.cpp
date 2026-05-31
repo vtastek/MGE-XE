@@ -199,6 +199,24 @@ void DistantLand::renderStage0() {
             stateSaved->Apply();
             stateSaved->Release();
         } else {
+            // Interior / non-distant cell: no distant land, but the scene-graph
+            // cache still must be rebuilt (evicting stale exterior geometry) and
+            // the depth texture cleared + repopulated — otherwise SSAO/DOF read
+            // the last exterior frame. renderDepth() self-gates its distant
+            // land/statics/grass parts off when !isDistantCell(), leaving the
+            // depth clear + MW cache depth + the onFrameReady walk. State-blocked
+            // because effectDepth uses D3DXFX_DONOTSAVESTATE.
+            device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
+            effect->BeginPass(PASS_SETUP);
+            effect->EndPass();
+
+            effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
+            renderDepth();
+            effectDepth->End();
+
+            stateSaved->Apply();
+            stateSaved->Release();
+
             // Clear water reflection to avoid seeing previous cell environment reflected
             // Must be done every frame to react to lighting changes
             clearReflection();
