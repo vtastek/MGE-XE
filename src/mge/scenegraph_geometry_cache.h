@@ -81,7 +81,9 @@ namespace MGE::GeometryCache {
     IDirect3DVertexDeclaration9* skinnedDecl();
 
     // Reverse map: IDirect3DTexture9* → SourceTexture::fileName.
-    // Rebuilt each frame from surviving cache entries. Returns null if not found.
+    // DORMANT — the reverse map is currently unpopulated (the per-frame rebuild was
+    // removed as unused; see scenegraph_geometry_cache.cpp). Always returns null until
+    // a consumer repopulates it incrementally from extractMaterial.
     const char* resolveTextureName(IDirect3DTexture9* tex);
 
 }

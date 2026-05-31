@@ -34,14 +34,20 @@ void DistantLand::cullGrass(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
 
     if (Configuration.UseSharedMemory) {
         visGrassShared.RemoveAll();
-        ipcClient.getVisibleMeshesCoarse(visGrassSharedId, range_frustum, VIS_GRASS, VisibleSetSort::ByState);
-        ipcClient.waitForCompletion();
-        buildGrassInstanceVB(visGrassShared);
+        { MGE_ZoneScopedN("cullGrass:kickoff");
+          ipcClient.getVisibleMeshesCoarse(visGrassSharedId, range_frustum, VIS_GRASS, VisibleSetSort::ByState); }
+        { MGE_ZoneScopedN("cullGrass:ipcWait");
+          ipcClient.waitForCompletion(); }
+        { MGE_ZoneScopedN("cullGrass:buildVB");
+          buildGrassInstanceVB(visGrassShared); }
     } else {
         visGrass.RemoveAll();
-        DistantLandShare::currentWorldSpace->GrassStatics->GetVisibleMeshesCoarse(range_frustum, visGrass);
-        visGrass.SortByState();
-        buildGrassInstanceVB(visGrass);
+        { MGE_ZoneScopedN("cullGrass:quadtree");
+          DistantLandShare::currentWorldSpace->GrassStatics->GetVisibleMeshesCoarse(range_frustum, visGrass); }
+        { MGE_ZoneScopedN("cullGrass:sort");
+          visGrass.SortByState(); }
+        { MGE_ZoneScopedN("cullGrass:buildVB");
+          buildGrassInstanceVB(visGrass); }
     }
 
     // Grass visible-set size diagnostic, gated by LogDistantPipeline.

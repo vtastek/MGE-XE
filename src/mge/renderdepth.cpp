@@ -98,6 +98,17 @@ void DistantLand::renderDepth() {
         }
 
         if (Configuration.MGEFlags & USE_GRASS) {
+            // Cull grass here (moved out of Stage0): culling before the depth
+            // pre-pass drained the distant-statics RPC on the one-at-a-time IPC
+            // channel right after its Stage0 kickoff, before the GeometryCache
+            // walk above could overlap that ~2.3ms server-cull. Culling here —
+            // after the walk and cullDistantStatics_finish — lets the statics cull
+            // overlap the walk, and grass's own RPC is cheap with the channel now
+            // free. Grass still renders in this depth pre-pass, so early-Z holds.
+            if (mwBridge->IsExterior()) {
+                cullGrass(&mwView, &mwProj);
+            }
+
             // Grass
             MGE_ZoneScopedN("renderDepth:grass");
             MGE_SCOPED_TIMER("renderDepth:grass");

@@ -99,10 +99,11 @@ void DistantLand::renderStage0() {
                 cullDistantStatics_kickoff(&mwView, &distProj);
             }
 
-            // Cull grass early so renderGrassInstZ in the depth pre-pass has data.
-            if ((Configuration.MGEFlags & USE_GRASS) && mwBridge->IsExterior()) {
-                cullGrass(&mwView, &mwProj);
-            }
+            // (Grass culling moved into renderDepth, just before the grass depth
+            // pass — see renderdepth.cpp. Culling it here, right after the statics
+            // kickoff, drained the distant-statics RPC on the one-at-a-time IPC
+            // channel before the GeometryCache walk could overlap that ~2.3ms
+            // server-cull.)
 
             // Full depth pre-pass: near scene (CPU/GPU overlap with GeomCache
             // walk) then distant land, statics, grass. Depth buffer is complete

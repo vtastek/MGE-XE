@@ -32,6 +32,11 @@ namespace MGE::GeometryCache {
         uint64_t          g_uploadedInterval   = 0; // cumulative over log interval
 
         std::unordered_map<uint32_t, CachedGeometry>      g_cache;
+        // Reverse map GPU texture -> SourceTexture::fileName, for resolveTextureName().
+        // DORMANT: nothing populates this currently. The per-frame rebuild (walking
+        // NI property state per node) cost ~1.5ms and had no consumer, so it was
+        // removed. When a feature needs GPU-texture -> source-path resolution, populate
+        // incrementally from extractMaterial (create/material-change only), not per frame.
         std::unordered_map<IDirect3DTexture9*, const char*> g_textureNameMap;
 
         void releaseEntry(CachedGeometry& e) {
@@ -46,28 +51,6 @@ namespace MGE::GeometryCache {
                 static_cast<void*>(tex->rendererData));
             if (!srd->d3dTexture) return nullptr;
             return static_cast<ProxyTexture*>(srd->d3dTexture)->realTexture;
-        }
-
-        void registerTexture(NI::Texture* tex) {
-            if (!tex || !tex->isInstanceOfType(NI::RTTIStaticPtr::NiSourceTexture)) return;
-            auto* st = static_cast<NI::SourceTexture*>(tex);
-            if (!st->fileName) return;
-            auto* dx9 = getDX9Texture(tex);
-            if (dx9) g_textureNameMap[dx9] = st->fileName;
-        }
-
-        void registerAllMaps(NI::Geometry* geom) {
-            auto* ps = reinterpret_cast<NI::PropertyState*>(geom->propertyState);
-            if (!ps || !ps->texture) return;
-            auto* tp = ps->texture;
-            // Slot 0: base texture (all geometry)
-            const auto* bm = tp->getBaseMap();
-            if (bm && bm->texture) registerTexture(bm->texture.get());
-            // Slot 6: terrain decal (blend overlay from adjacent patch)
-            if (tp->maps.getEndIndex() > 6u) {
-                const auto* dm = tp->maps.at(6);
-                if (dm && dm->texture) registerTexture(dm->texture.get());
-            }
         }
 
         void extractMaterial(CachedGeometry& e, NI::Geometry* geom) {
@@ -348,8 +331,6 @@ namespace MGE::GeometryCache {
             auto* data = geom->getModelData().get();
             if (!data) return;
 
-            registerAllMaps(geom);
-
             const uint32_t key = reinterpret_cast<uint32_t>(geom);
 
             // Skin state: a valid SkinInstance with SkinData + bone array.
@@ -470,18 +451,29 @@ namespace MGE::GeometryCache {
         ++g_frame;
         g_uploadedThisFrame = 0;
 
-        g_textureNameMap.clear();
-        walk(MGE::DataHandlerView::worldObjectRoot(dataHandler));
-        walk(MGE::DataHandlerView::worldPickObjectRoot(dataHandler));
-        walk(MGE::DataHandlerView::worldLandscapeRoot(dataHandler));
+        {
+            MGE_ZoneScopedN("GeomCache:walkObjects");
+            walk(MGE::DataHandlerView::worldObjectRoot(dataHandler));
+        }
+        {
+            MGE_ZoneScopedN("GeomCache:walkPickObjects");
+            walk(MGE::DataHandlerView::worldPickObjectRoot(dataHandler));
+        }
+        {
+            MGE_ZoneScopedN("GeomCache:walkLandscape");
+            walk(MGE::DataHandlerView::worldLandscapeRoot(dataHandler));
+        }
 
         // Evict entries not seen this frame
-        for (auto it = g_cache.begin(); it != g_cache.end(); ) {
-            if (it->second.lastFrame != g_frame) {
-                releaseEntry(it->second);
-                it = g_cache.erase(it);
-            } else {
-                ++it;
+        {
+            MGE_ZoneScopedN("GeomCache:evict");
+            for (auto it = g_cache.begin(); it != g_cache.end(); ) {
+                if (it->second.lastFrame != g_frame) {
+                    releaseEntry(it->second);
+                    it = g_cache.erase(it);
+                } else {
+                    ++it;
+                }
             }
         }
 
