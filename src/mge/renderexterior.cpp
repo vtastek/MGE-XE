@@ -30,13 +30,15 @@ bool                    g_horizonInitialized = false;
 // Numpad8/Numpad2: raise/lower MSOC low-static cutoff height (steps of 256 units).
 static float g_msocCutoffHeight = 2500.0f;
 
-// Cull-then-sort survivor storage. applyMSOCToDistantStatics copies the
-// surviving RenderMesh values (msocOccluded[idx]==0) into this contiguous,
-// reused buffer; DistantLand::visDistantSurvivors holds const RenderMesh*
-// into it. Stable storage is mandatory — the IPC visible set is a windowed
-// view that remaps as it's iterated, so survivor pointers can't reference it.
-// Reused across frames to avoid per-frame allocation; ~500 * 156B ~= 78KB.
-static std::vector<RenderMesh> g_survivorStorage;
+// Contiguous, reused snapshot of the distant-statics visible set.
+// applyMSOCToDistantStatics materializes the windowed IPC view into this
+// buffer ONCE per frame; every subsequent pass (partition + survivor gather)
+// reads it instead of re-traversing the remapping window — a single windowed
+// walk, the rest cache-friendly sequential access. DistantLand::
+// visDistantSurvivors holds const RenderMesh* into this stable storage, so the
+// survivor set is just a pointer subset (no second value copy). Reused across
+// frames; ~12k * 156B ~= 1.9MB, trivial for the process heap.
+static std::vector<RenderMesh> g_meshValues;
 
 namespace {
 struct MSOCBasinDebugBox {
@@ -1009,40 +1011,38 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
     g_msocBasinDebugBoxes.clear();
     g_msocCullDiag.valid = false;
 
-    // Cull-then-sort tail. Compact the MSOC survivors (msocOccluded[idx]==0,
-    // or every mesh when the mask is empty) into stable storage and sort only
-    // those (~500 ptrs, contiguous deref → fast). Both the depth and color
-    // static passes iterate the result (visDistantSurvivors). Defined as a
+    // Materialize the windowed IPC view into contiguous storage ONCE. This is
+    // the only traversal of the remapping window; the partition pass and the
+    // survivor gather below both read g_meshValues sequentially (cache-friendly,
+    // no window remap). Survivor pointers reference this stable buffer.
+    g_meshValues.clear();
+    g_meshValues.reserve(staticSet.Size());
+    staticSet.Reset();
+    while (!staticSet.AtEnd())
+        g_meshValues.push_back(staticSet.Next());
+    const unsigned setSize = (unsigned)g_meshValues.size();
+
+    // Cull-then-sort tail. Build visDistantSurvivors as the pointer subset of
+    // g_meshValues that survived (msocOccluded[idx]==0, or every mesh when the
+    // mask is empty), then sort only those (~500 ptrs, contiguous deref → fast).
+    // Both the depth and color static passes iterate the result. Defined as a
     // lambda so the no-cull early-out and the normal exit share one impl.
-    // Survivor *values* are copied because the IPC visible set is a windowed
-    // view that remaps as it advances — pointers into it would dangle.
-    auto gatherSurvivors = [&staticSet]() {
+    auto gatherSurvivors = []() {
         MGE_SCOPED_TIMER("applyMSOCToDistantStatics:gatherSort");
         const bool haveMask = !msocOccluded.empty();
-        g_survivorStorage.clear();
-        g_survivorStorage.reserve(staticSet.Size());
-        staticSet.Reset();
-        unsigned i = 0;
-        while (!staticSet.AtEnd()) {
-            const RenderMesh& m = staticSet.Next();
-            if (!haveMask || msocOccluded[i] == 0)
-                g_survivorStorage.push_back(m);
-            ++i;
-        }
-        // Build the pointer set into now-stable storage. Storage was reserved
-        // up-front (no reallocation), and the pointers are built in a second
-        // pass regardless, so none can dangle.
         visDistantSurvivors.RemoveAll();
-        visDistantSurvivors.visible_set.reserve((std::uint32_t)g_survivorStorage.size());
-        for (const RenderMesh& mesh : g_survivorStorage)
-            visDistantSurvivors.PushBack(mesh);
+        visDistantSurvivors.visible_set.reserve((std::uint32_t)g_meshValues.size());
+        for (size_t i = 0; i < g_meshValues.size(); ++i) {
+            if (!haveMask || msocOccluded[i] == 0)
+                visDistantSurvivors.PushBack(g_meshValues[i]);
+        }
         visDistantSurvivors.SortByState();
     };
 
     // Compute the occlusion mask only when culling is active in an exterior
     // with a ready mask and a non-empty set; otherwise every mesh survives.
     const bool cullByOcclusion =
-        !staticSet.Empty()
+        setSize != 0
         && Configuration.UseOcclusionCulling
         && MSOCClient::isAvailable()
         && MSOCClient::isMaskReady()
@@ -1052,7 +1052,6 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
         return;
     }
 
-    const unsigned setSize = (unsigned)staticSet.Size();
     msocOccluded.resize(setSize, 0);
 
     // Numpad8/2 live cutoff adjust is read on the main thread before this
@@ -1122,12 +1121,11 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
     gridCellToGroup.assign((size_t)gridDim * gridDim, 0);
 
     // Pass 1: partition statics. Low → fixed cell group (O(1)).  High → sphere batch.
+    // Iterates the contiguous g_meshValues snapshot (not the windowed view).
     {
         MGE_SCOPED_TIMER("applyMSOCToDistantStatics:partition");
-        staticSet.Reset();
-        unsigned idx = 0;
-        while (!staticSet.AtEnd()) {
-            const auto& m = staticSet.Next();
+        for (unsigned idx = 0; idx < setSize; ++idx) {
+            const RenderMesh& m = g_meshValues[idx];
             const float sx = m.sphere.center.x, sy = m.sphere.center.y;
             const float sz = m.sphere.center.z, sr = m.sphere.radius;
 
@@ -1149,7 +1147,6 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
                     sphereBatch.push_back(sy);
                     sphereBatch.push_back(sz);
                     sphereBatch.push_back(sr);
-                    ++idx;
                     continue;
                 }
 
@@ -1170,7 +1167,6 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
                 sphereBatch.push_back(sz);
                 sphereBatch.push_back(sr);
             }
-            ++idx;
         }
     }
 
