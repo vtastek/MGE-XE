@@ -7,6 +7,9 @@
 #include "postshaders.h"
 #include "mge_tracy.h"
 
+#include <cstdint>
+#include <vector>
+
 
 
 void DistantLand::renderWaterReflection(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
@@ -217,8 +220,71 @@ void DistantLand::renderReflectedStatics(const D3DXMATRIX* view, const D3DXMATRI
 
         device->SetVertexDeclaration(StaticDecl);
 
+        // [MEASURE] Instrument the reflection-cull stall: this kickoff-then-wait
+        // issues the RPC and immediately blocks on the server cull, so the wait
+        // is the candidate to relocate/overlap. Plot it (us) + the survivor count
+        // so we can decide tier-1 (split kickoff/wait across the color block) vs
+        // drop-it, on data rather than guess.
+#ifdef TRACY_ENABLE
+        if (g_tracyActive) {
+            static LARGE_INTEGER s_freq = {};
+            if (s_freq.QuadPart == 0) QueryPerformanceFrequency(&s_freq);
+            LARGE_INTEGER t0, t1;
+            QueryPerformanceCounter(&t0);
+            {
+                MGE_ZoneScopedN("reflStatics:wait");
+                ipcClient.waitForCompletion();
+            }
+            QueryPerformanceCounter(&t1);
+            MGE_TracyPlot("reflStatics:wait(us)",
+                1e6 * double(t1.QuadPart - t0.QuadPart) / double(s_freq.QuadPart));
+            MGE_TracyPlot("reflStatics:count", double(visExtraShared.Size()));
+        } else {
+            ipcClient.waitForCompletion();
+        }
+#else
         ipcClient.waitForCompletion();
-        visExtraShared.Render(device, effect, effect, &ehTex0, nullptr, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT);
+#endif
+
+        // Phase B: cull reflection statics whose reflection can't land on any
+        // visible water tile. Each static is rendered (reflView/reflProj) into
+        // texReflection, which the water samples at the SAME screen coords — so a
+        // static contributes iff its reflection-projected screen rect overlaps a
+        // surviving water tile's main-view screen rect (NDC). Both projections
+        // share the x/y scale, so the NDC spaces align. Builds a skipMask in
+        // Render iteration order (restart()/next()); Render restarts internally.
+        const auto& waterRects = DistantLand::reflectionWaterRects;
+        std::vector<std::uint8_t> skip;
+        unsigned culled = 0;
+        if (!waterRects.empty()) {
+            MGE_ZoneScopedN("reflStatics:cull");
+            const std::uint32_t n = visExtraShared.Size();
+            skip.assign(n, 0);
+            visExtraShared.Reset();
+            for (std::uint32_t i = 0; i < n && !visExtraShared.AtEnd(); ++i) {
+                const RenderMesh& m = visExtraShared.Next();
+                const D3DXVECTOR3& c = m.sphere.center;
+                const float rad = m.sphere.radius;
+                const float cx = c.x*ds_viewproj._11 + c.y*ds_viewproj._21 + c.z*ds_viewproj._31 + ds_viewproj._41;
+                const float cy = c.x*ds_viewproj._12 + c.y*ds_viewproj._22 + c.z*ds_viewproj._32 + ds_viewproj._42;
+                const float cw = c.x*ds_viewproj._14 + c.y*ds_viewproj._24 + c.z*ds_viewproj._34 + ds_viewproj._44;
+                if (cw < 1e-3f) continue;   // behind near plane → conservatively keep
+                const float inv = 1.0f / cw;
+                const float nx = cx * inv, ny = cy * inv;
+                const float rx = rad * ds_proj._11 * inv;   // sphere radius in NDC
+                const float ry = rad * ds_proj._22 * inv;
+                bool keep = false;
+                for (const D3DXVECTOR4& wr : waterRects) {
+                    if (nx + rx >= wr.x && nx - rx <= wr.z &&
+                        ny + ry >= wr.y && ny - ry <= wr.w) { keep = true; break; }
+                }
+                if (!keep) { skip[i] = 1; ++culled; }
+            }
+        }
+        MGE_TracyPlot("reflStatics:culled", double(culled));
+
+        visExtraShared.Render(device, effect, effect, &ehTex0, nullptr, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT,
+                              false, skip.empty() ? nullptr : skip.data());
     } else {
         VisibleSet<StlVector> visReflected((StlVector()));
 

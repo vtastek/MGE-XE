@@ -29,6 +29,7 @@ bool DistantLand::isRenderCached = false;
 bool DistantLand::isPPLActive = false;
 bool DistantLand::earlyWalkedCache = false;
 bool DistantLand::renderThreadJobKicked = false;
+std::vector<D3DXVECTOR4> DistantLand::reflectionWaterRects;
 int DistantLand::numWaterVerts, DistantLand::numWaterTris;
 
 IDirect3DDevice9* DistantLand::device;

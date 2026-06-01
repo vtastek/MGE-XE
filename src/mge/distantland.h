@@ -298,6 +298,7 @@ public:
     static void joinCullWorker();
     static void renderDistantStatics();
     static void renderMSOCBasinBoundsDebug(const D3DXMATRIX* view, const D3DXMATRIX* proj);
+    static void renderWaterProxyBoundsDebug(const D3DXMATRIX* view, const D3DXMATRIX* proj);
 
     // MSOC occlusion verdict pass — walks the visible set, runs the
     // batched sphere query, applies far/handoff gates and temporal
@@ -325,6 +326,16 @@ public:
     static void renderReflectedSky();
     static void renderReflectedStatics(const D3DXMATRIX* view, const D3DXMATRIX* proj);
     static void clearReflection();
+    // Water-reflection occlusion gate: true if any water surface is actually
+    // visible in the main view (terrain height + MSOC), so the ~1ms reflection
+    // pass can be skipped when water is fully occluded / out of frame. See
+    // tasks/todo.md Phase A. Side effect: fills reflectionWaterRects with the
+    // surviving water tiles' main-view NDC screen rects, consumed by
+    // renderReflectedStatics to cull reflection statics (Phase B).
+    static bool isReflectionWaterVisible();
+    // Surviving water tile screen rects (main-view NDC AABBs: x=minX, y=minY,
+    // z=maxX, w=maxY). Where visible water samples texReflection on screen.
+    static std::vector<D3DXVECTOR4> reflectionWaterRects;
     static void simulateDynamicWaves();
     static void renderWaterPlane();
 

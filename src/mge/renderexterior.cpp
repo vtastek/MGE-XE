@@ -18,6 +18,7 @@
 #include <limits>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -48,6 +49,14 @@ struct MSOCBasinDebugBox {
 
 static bool g_drawMSOCBasinBounds = false;
 static std::vector<MSOCBasinDebugBox> g_msocBasinDebugBoxes;
+
+// Water-reflection proxy visualizer (Numpad5). isReflectionWaterVisible() fills
+// these — one box per tested water cell slab, coloured by MSOC verdict (green
+// visible / red occluded / blue view-culled). Lets us see why the gate decides
+// water is/isn't visible. (Numpad5 also drives the mask dump in runMSOCDebugTail,
+// but only when LogDistantPipeline is on; with it off, this is the sole reader.)
+static bool g_drawWaterProxyBounds = false;
+static std::vector<MSOCBasinDebugBox> g_waterProxyDebugBoxes;
 
 struct MSOCLineVertex {
     float x, y, z;
@@ -996,6 +1005,83 @@ void DistantLand::renderMSOCBasinBoundsDebug(const D3DXMATRIX* view, const D3DXM
     stateSaved->Release();
 }
 
+// Water-reflection proxy visualizer (Numpad5). Draws the per-cell water slabs
+// tested by isReflectionWaterVisible(), coloured by MSOC verdict (green visible,
+// red occluded, blue view-culled), depth-disabled so occluded slabs are still
+// inspectable behind buildings. Mirrors renderMSOCBasinBoundsDebug.
+void DistantLand::renderWaterProxyBoundsDebug(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
+    if (GetAsyncKeyState(VK_NUMPAD5) & 0x0001) {
+        g_drawWaterProxyBounds = !g_drawWaterProxyBounds;
+        char msg[64];
+        std::snprintf(msg, sizeof(msg), "Water proxy boxes: %s",
+                      g_drawWaterProxyBounds ? "ON" : "OFF");
+        StatusOverlay::setStatus(msg);
+    }
+
+    if (!g_drawWaterProxyBounds || g_waterProxyDebugBoxes.empty() || !view || !proj)
+        return;
+
+    IDirect3DStateBlock9* stateSaved = nullptr;
+    if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &stateSaved)) || !stateSaved)
+        return;
+
+    static std::vector<MSOCLineVertex> lineVerts;
+    lineVerts.clear();
+    lineVerts.reserve(g_waterProxyDebugBoxes.size() * 24);
+
+    auto pushLine = [](float ax, float ay, float az,
+                       float bx, float by, float bz,
+                       DWORD color) {
+        lineVerts.push_back({ax, ay, az, color});
+        lineVerts.push_back({bx, by, bz, color});
+    };
+
+    for (const auto& b : g_waterProxyDebugBoxes) {
+        const DWORD color = colorForMSOCVerdict(b.verdict);
+
+        pushLine(b.minX, b.minY, b.minZ, b.maxX, b.minY, b.minZ, color);
+        pushLine(b.maxX, b.minY, b.minZ, b.maxX, b.maxY, b.minZ, color);
+        pushLine(b.maxX, b.maxY, b.minZ, b.minX, b.maxY, b.minZ, color);
+        pushLine(b.minX, b.maxY, b.minZ, b.minX, b.minY, b.minZ, color);
+
+        pushLine(b.minX, b.minY, b.maxZ, b.maxX, b.minY, b.maxZ, color);
+        pushLine(b.maxX, b.minY, b.maxZ, b.maxX, b.maxY, b.maxZ, color);
+        pushLine(b.maxX, b.maxY, b.maxZ, b.minX, b.maxY, b.maxZ, color);
+        pushLine(b.minX, b.maxY, b.maxZ, b.minX, b.minY, b.maxZ, color);
+
+        pushLine(b.minX, b.minY, b.minZ, b.minX, b.minY, b.maxZ, color);
+        pushLine(b.maxX, b.minY, b.minZ, b.maxX, b.minY, b.maxZ, color);
+        pushLine(b.maxX, b.maxY, b.minZ, b.maxX, b.maxY, b.maxZ, color);
+        pushLine(b.minX, b.maxY, b.minZ, b.minX, b.maxY, b.maxZ, color);
+    }
+
+    D3DXMATRIX identity;
+    D3DXMatrixIdentity(&identity);
+
+    device->SetVertexDeclaration(nullptr);
+    device->SetVertexShader(nullptr);
+    device->SetPixelShader(nullptr);
+    device->SetFVF(fvfMSOCLine);
+    device->SetTransform(D3DTS_WORLD, &identity);
+    device->SetTransform(D3DTS_VIEW, view);
+    device->SetTransform(D3DTS_PROJECTION, proj);
+    device->SetTexture(0, nullptr);
+    device->SetRenderState(D3DRS_LIGHTING, FALSE);
+    device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+    device->SetRenderState(D3DRS_ZENABLE, FALSE);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+    device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    device->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
+
+    device->DrawPrimitiveUP(D3DPT_LINELIST, (UINT)(lineVerts.size() / 2),
+                            lineVerts.data(), sizeof(MSOCLineVertex));
+
+    stateSaved->Apply();
+    stateSaved->Release();
+}
+
 // MSOC verdict pass — populates `msocOccluded` with a per-instance
 // cull mask consumed by both the color and depth render paths.
 //
@@ -1250,3 +1336,241 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
 
 template void DistantLand::applyMSOCToDistantStatics(VisibleSet<StlVector>& staticSet);
 template void DistantLand::applyMSOCToDistantStatics(VisibleSet<IpcClientVector>& staticSet);
+
+// ---- Terrain min-height maps for the water-reflection gate ----
+//
+// Per-cell (8192) and fine (kWaterFineGrid) minimum terrain height, world-space,
+// built once from the captured distant-land mesh. The land world transform is
+// identity (distantinit.cpp), so LandMeshCache::positions are already world-space
+// — bin each vertex by floor(xy / grid) and keep the min Z.
+//
+// Terrain — not MSOC — is the decider for the reflection gate. Occlusion alone
+// can't tell "visible water" from "visible land sitting at ~water level" (a
+// street that doesn't rise above the slab is unoccluded → false-VISIBLE, the bug
+// that defeated the MSOC version). Terrain height is unambiguous: a tile has
+// water only where terrain dips below WaterLevel.
+static constexpr float kWaterFineGrid = 512.0f;
+static std::unordered_map<uint64_t, float> g_cellMinH;   // key: 8192-cell -> min Z
+static std::unordered_map<uint64_t, float> g_fineMinH;   // key: fine-cell -> min Z
+static size_t g_terrainMinHSrcSize = (size_t)-1;         // landMeshes.size() built from
+
+static inline uint64_t waterGridKey(int gx, int gy) {
+    return ((uint64_t)(uint32_t)gx << 32) | (uint32_t)gy;
+}
+
+static void buildTerrainMinHeight(
+    const std::unordered_map<IDirect3DVertexBuffer9*, DistantLand::LandMeshCache>& landMeshes) {
+    g_cellMinH.clear();
+    g_fineMinH.clear();
+    for (const auto& kv : landMeshes) {
+        for (const D3DXVECTOR3& p : kv.second.positions) {
+            auto upd = [](std::unordered_map<uint64_t, float>& m, uint64_t k, float z) {
+                auto it = m.find(k);
+                if (it == m.end()) m.emplace(k, z);
+                else if (z < it->second) it->second = z;
+            };
+            upd(g_cellMinH, waterGridKey((int)floorf(p.x / DistantLand::kCellSize),
+                                         (int)floorf(p.y / DistantLand::kCellSize)), p.z);
+            upd(g_fineMinH, waterGridKey((int)floorf(p.x / kWaterFineGrid),
+                                         (int)floorf(p.y / kWaterFineGrid)), p.z);
+        }
+    }
+    g_terrainMinHSrcSize = landMeshes.size();
+    LOG::logline("-- [water-gate] terrain min-height built: %zu cells, %zu fine tiles",
+                 g_cellMinH.size(), g_fineMinH.size());
+}
+
+// Water-reflection gate (Phase A). renderStage0 called renderWaterReflection
+// whenever the cell *contains* water (CellHasWater) — even facing into city
+// streets with the river off-frame. That pass measured ~1ms (0.64ms of it the
+// reflected-statics IPC wait, 3651 statics) for a reflection nothing samples.
+// This returns true only if some water surface is actually in view, letting the
+// caller clearReflection() + skip otherwise.
+//
+// Two-stage decider: terrain height first, MSOC occlusion second.
+//   1. Terrain (cheap, reliable): for each water tile (cell-sized far, subdivided
+//      near the player) frustum-cull the thin water box, then ask the min-height
+//      maps whether terrain in that footprint dips below WaterLevel. Street/ground
+//      at ~water level → terrain >= water → dry, dropped; riverbed → water present.
+//      A tile with no height samples is very distant unsampled terrain → dropped.
+//   2. MSOC (only on the surviving water tiles): box-test the slab against the
+//      occlusion mask and cull water that's present + in frustum but hidden behind
+//      buildings/terrain. Cheap because it runs on the few real-water tiles, not
+//      every cell. When MSOC is unavailable the survivor is kept (can't prove it
+//      hidden), so the gate still works on terrain alone.
+//
+// Returns true (reflect, unchanged behavior) only when there's no terrain data at
+// all (e.g. a worldspace without distant land).
+bool DistantLand::isReflectionWaterVisible() {
+    MGE_ZoneScopedN("isReflectionWaterVisible");
+
+    const bool debug = g_drawWaterProxyBounds;
+    if (debug) g_waterProxyDebugBoxes.clear();
+
+    // Build/refresh the terrain maps if the captured land set changed (init or
+    // release). Built once per session in practice.
+    if (g_terrainMinHSrcSize != landMeshes.size()) {
+        buildTerrainMinHeight(landMeshes);
+    }
+    if (g_cellMinH.empty()) {
+        return true;   // no terrain data → gate inert, reflect as before
+    }
+
+    const bool msocUsable = MSOCClient::isAvailable() && MSOCClient::isMaskReady();
+
+    // Current main-view frustum out to the water-visible range (fogEnd).
+    D3DXMATRIX waterProj = mwProj;
+    editProjectionZ(&waterProj, 4.0f, Configuration.DL.DrawDist * kCellSize);
+    D3DXMATRIX viewProj = mwView * waterProj;
+    ViewFrustum frustum(&viewProj);
+
+    const float waterZ = MWBridge::get()->WaterLevel();
+    const float R = fogEnd;                 // world units; water visible to fog
+    const float half = 0.5f * kCellSize;    // cell half-extent (4096)
+    const float slabHZ = 4.0f;              // thin water box half-height
+
+    bool anyVisible = false;
+    reflectionWaterRects.clear();
+
+    // Project a water tile footprint (at waterZ) to a main-view NDC AABB. Corners
+    // behind the near plane are clamped to the plane (cw=eps) so a straddling near
+    // tile yields a bounded — if loose — screen rect rather than garbage. Returns
+    // false if the tile projects fully off-screen.
+    auto tileScreenRect = [&](float tcx, float tcy, float thalf, D3DXVECTOR4& out) -> bool {
+        const float cxs[4] = { tcx - thalf, tcx + thalf, tcx - thalf, tcx + thalf };
+        const float cys[4] = { tcy - thalf, tcy - thalf, tcy + thalf, tcy + thalf };
+        float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
+        for (int i = 0; i < 4; ++i) {
+            const float wx = cxs[i], wy = cys[i], wz = waterZ;
+            float cx = wx * viewProj._11 + wy * viewProj._21 + wz * viewProj._31 + viewProj._41;
+            float cy = wx * viewProj._12 + wy * viewProj._22 + wz * viewProj._32 + viewProj._42;
+            float cw = wx * viewProj._14 + wy * viewProj._24 + wz * viewProj._34 + viewProj._44;
+            if (cw < 1e-3f) cw = 1e-3f;     // clamp behind-plane corners
+            const float inv = 1.0f / cw;
+            float nx = cx * inv, ny = cy * inv;
+            nx = std::max(-1.5f, std::min(1.5f, nx));
+            ny = std::max(-1.5f, std::min(1.5f, ny));
+            minX = std::min(minX, nx); maxX = std::max(maxX, nx);
+            minY = std::min(minY, ny); maxY = std::max(maxY, ny);
+        }
+        // Clamp to screen; reject if no on-screen overlap.
+        minX = std::max(-1.0f, minX); minY = std::max(-1.0f, minY);
+        maxX = std::min( 1.0f, maxX); maxY = std::min( 1.0f, maxY);
+        if (minX > maxX || minY > maxY) return false;
+        out = D3DXVECTOR4(minX, minY, maxX, maxY);
+        return true;
+    };
+
+    // Water-presence verdict: 1 = water (terrain below WaterLevel), 0 = dry
+    // (terrain at/above water), 2 = no data (conservatively treated as water).
+    auto cellWater = [&](int cx, int cy) -> int {
+        auto it = g_cellMinH.find(waterGridKey(cx, cy));
+        if (it == g_cellMinH.end()) return 2;
+        return (it->second < waterZ) ? 1 : 0;
+    };
+    auto footprintWater = [&](float minX, float maxX, float minY, float maxY) -> int {
+        const int fx0 = (int)floorf(minX / kWaterFineGrid);
+        const int fx1 = (int)floorf(maxX / kWaterFineGrid);
+        const int fy0 = (int)floorf(minY / kWaterFineGrid);
+        const int fy1 = (int)floorf(maxY / kWaterFineGrid);
+        bool any = false;
+        for (int fy = fy0; fy <= fy1; ++fy) {
+            for (int fx = fx0; fx <= fx1; ++fx) {
+                auto it = g_fineMinH.find(waterGridKey(fx, fy));
+                if (it == g_fineMinH.end()) continue;
+                any = true;
+                if (it->second < waterZ) return 1;   // a wet sub-tile here
+            }
+        }
+        return any ? 0 : 2;
+    };
+
+    // Test one water tile: frustum-cull the thin box, terrain water-presence,
+    // then MSOC occlusion on the survivor. A surviving (visible water) tile
+    // contributes its screen rect to reflectionWaterRects for the Phase-B static
+    // cull. No early-out — the full survivor set is the cull input. Visualizer:
+    //   green  = water present and not occluded → reflects
+    //   red    = water present but MSOC-occluded → culled
+    //   yellow = dry land at/above water level → no water
+    //   (no-data tiles are very distant; dropped and not drawn)
+    auto testTile = [&](float tcx, float tcy, float thalf) {
+        BoundingBox wbox(
+            D3DXVECTOR3(tcx - thalf, tcy - thalf, waterZ - slabHZ),
+            D3DXVECTOR3(tcx + thalf, tcy + thalf, waterZ + slabHZ));
+        if (frustum.ContainsBox(wbox) == ViewFrustum::OUTSIDE) return;
+
+        const int w = (thalf >= half - 1.0f)
+            ? cellWater((int)floorf(tcx / kCellSize), (int)floorf(tcy / kCellSize))
+            : footprintWater(tcx - thalf, tcx + thalf, tcy - thalf, tcy + thalf);
+
+        // No height data → very distant unsampled terrain; drop entirely.
+        if (w == 2) return;
+
+        bool vis;
+        MSOCClient::TestResult dbg;
+        if (w == 0) {
+            // Dry land at/above water level — no water surface here.
+            vis = false;
+            dbg = MSOCClient::ResultNotReady;     // yellow
+        } else {
+            // Water present — cull if occlusion proves it hidden. MSOC unavailable
+            // → keep it (can't prove occluded), gate falls back to terrain only.
+            MSOCClient::TestResult r = msocUsable
+                ? MSOCClient::classifyOBB(tcx, tcy, waterZ,
+                                          thalf, 0, 0,  0, thalf, 0,  0, 0, slabHZ)
+                : MSOCClient::ResultVisible;
+            vis = (r != MSOCClient::ResultOccluded);
+            dbg = vis ? MSOCClient::ResultVisible : MSOCClient::ResultOccluded; // green/red
+            if (vis) {
+                anyVisible = true;
+                D3DXVECTOR4 rect;
+                if (tileScreenRect(tcx, tcy, thalf, rect))
+                    reflectionWaterRects.push_back(rect);
+            }
+        }
+
+        if (debug) {
+            g_waterProxyDebugBoxes.push_back({
+                tcx - thalf, tcx + thalf, tcy - thalf, tcy + thalf,
+                waterZ - 128.0f, waterZ + 128.0f, dbg
+            });
+        }
+    };
+
+    const int cx0 = (int)floorf((eyePos.x - R) / kCellSize);
+    const int cx1 = (int)floorf((eyePos.x + R) / kCellSize);
+    const int cy0 = (int)floorf((eyePos.y - R) / kCellSize);
+    const int cy1 = (int)floorf((eyePos.y + R) / kCellSize);
+    const int eyeCellX = (int)floorf(eyePos.x / kCellSize);
+    const int eyeCellY = (int)floorf(eyePos.y / kCellSize);
+
+    for (int cy = cy0; cy <= cy1; ++cy) {
+        for (int cx = cx0; cx <= cx1; ++cx) {
+            const float ccx = (cx + 0.5f) * kCellSize;
+            const float ccy = (cy + 0.5f) * kCellSize;
+
+            // Range gate on cell centre (loop bounds are a square; trim to R).
+            const float dx = ccx - eyePos.x, dy = ccy - eyePos.y;
+            if (dx * dx + dy * dy > (R + half) * (R + half)) continue;
+
+            // Close cells (the 3x3 block around the player) split into a 9x9 fine
+            // sub-tile grid so sub-cell water (a canal beside a street) resolves
+            // separately and near tiles below the view get frustum-culled.
+            const bool close = (abs(cx - eyeCellX) <= 1) && (abs(cy - eyeCellY) <= 1);
+
+            if (close) {
+                const float subHalf = half / 9.0f;     // ~455
+                const float step    = 2.0f * subHalf;  // kCellSize / 9
+                for (int sy = -4; sy <= 4; ++sy) {
+                    for (int sx = -4; sx <= 4; ++sx) {
+                        testTile(ccx + sx * step, ccy + sy * step, subHalf);
+                    }
+                }
+            } else {
+                testTile(ccx, ccy, half);
+            }
+        }
+    }
+
+    return anyVisible;
+}

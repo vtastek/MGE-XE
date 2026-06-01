@@ -292,9 +292,18 @@ void DistantLand::renderStage0() {
                 renderSky();
             }
 
-            // Update reflection
+            // Update reflection. CellHasWater() is cell-level ("this cell has
+            // water"), so a city cell with a river ran the full ~1ms reflection
+            // every frame even facing into the streets. Gate on whether water is
+            // actually visible (frustum + MSOC); when it isn't, clearReflection()
+            // keeps a valid flat-fog target for the distant-water sampler and the
+            // transition frame without paying the reflection pass.
             if (mwBridge->CellHasWater()) {
-                renderWaterReflection(&mwView, &distProj);
+                if (isReflectionWaterVisible()) {
+                    renderWaterReflection(&mwView, &distProj);
+                } else {
+                    clearReflection();
+                }
             }
 
             // Update water simulation
@@ -304,6 +313,7 @@ void DistantLand::renderStage0() {
 
             effect->End();
             renderMSOCBasinBoundsDebug(&mwView, &distProj);
+            renderWaterProxyBoundsDebug(&mwView, &distProj);
 
             // Reset matrices
             effect->SetMatrix(ehView, &mwView);
