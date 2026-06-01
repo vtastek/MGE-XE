@@ -8,6 +8,7 @@
 #include "mwbridge.h"
 #include "scenegraph.h"
 #include "scenegraph_geometry_cache.h"
+#include "renderthread.h"
 #include "mge_tracy.h"
 #include "statusoverlay.h"
 
@@ -39,6 +40,7 @@ void DistantLand::frameSetupEarly() {
     s_frameSetupEarly = false;
     s_earlyKickedStatics = false;
     earlyWalkedCache = false;
+    renderThreadJobKicked = false;
 
     // Drive the scene-graph lights snapshot here (moved from renderStage0, which
     // runs *after* the engine's ~1.6ms sky pass). On the async path onFrameReady
@@ -103,6 +105,20 @@ void DistantLand::frameSetupEarly() {
         // worker drains the statics RPC on the single channel.
         MGE::GeometryCache::onFrameReady(MGE::SceneGraph::getDataHandler());
         earlyWalkedCache = true;
+
+        // Kick the render-thread depth-cache job now — after the geometry-cache
+        // walk (so the cache + VBs it consumes are stable) and before the engine's
+        // sky pass — so the worker's ~1ms submission CPU overlaps the engine's
+        // non-device sky-prep CPU. Fenced at the top of renderStage0
+        // (RenderThread::wait) before any main-thread device/effect work; renderDepth
+        // then skips its own Clear/clear-depth/cache and renders land/statics/grass
+        // onto the worker's depth buffer. Snapshot the visible-key set here (main
+        // thread) so the worker never races updateVisibleSet.
+        if (Configuration.UseRenderThread) {
+            snapshotVisibleKeysForThread();
+            MGE::RenderThread::kick(&DistantLand::renderThreadDepthCacheJob);
+            renderThreadJobKicked = true;
+        }
     }
 }
 
@@ -128,6 +144,15 @@ void DistantLand::renderStage0() {
     auto mwBridge = MWBridge::get();
     IDirect3DStateBlock9* stateSaved;
     UINT passes;
+
+    // Render-thread fence. Join the worker BEFORE any main-thread device or
+    // ID3DXEffect work below (setupCommonEffect, the depth/shadow/distant passes
+    // all share the single effect/effectDepth objects, which are not safe to use
+    // concurrently with the worker). Kicked at BeginScene(0)/frameSetupEarly, the
+    // job has had the whole sky window to finish, so this typically reads ~0.
+    if (renderThreadJobKicked) {
+        MGE::RenderThread::wait();
+    }
 
     // (Channel-free gate moved into renderDepth, right after renderDepthFromCache:
     // that cache-only depth work touches no ipcClient and can overlap the worker's

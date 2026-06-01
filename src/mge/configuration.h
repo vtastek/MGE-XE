@@ -117,6 +117,7 @@ struct ConfigurationStruct {
     bool LogDistantPipeline;        // gate per-frame diagnostic loglines + phase-timer reports + Numpad-5 mask dump
     bool UseSceneGraphSnapshot;     // enable MGE-side per-frame scene-graph walk (drives the texture-light variant of FFE)
     bool UseAsyncSceneGraphWalk;    // sub-flag: run the scene-graph walk on a worker thread; main signals at onFrameReady and returns immediately. Snapshot is one frame stale. Default off; on hides the ~350µs walk from the main-thread frame budget.
+    bool UseRenderThread;           // enable the MGE render thread: submit GPU work on a second core during the engine's CPU-only frame-start/sky windows. Also forces D3DCREATE_MULTITHREADED and arms the device-submission lock. Default off.
 
     struct {
         float zoom, zoomRate, zoomRateTarget;

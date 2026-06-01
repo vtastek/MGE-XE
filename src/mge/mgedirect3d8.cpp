@@ -2,6 +2,7 @@
 #include "mgedirect3d8.h"
 #include "mged3d8device.h"
 #include "configuration.h"
+#include "proxydx/devicelock.h"
 #include "support/log.h"
 
 #include <algorithm>
@@ -84,6 +85,19 @@ HRESULT _stdcall MGEProxyD3D::CreateDevice(UINT a, D3DDEVTYPE b, HWND c, DWORD d
     pp.AutoDepthStencilFormat = e->AutoDepthStencilFormat;
     pp.FullScreen_RefreshRateInHz = e->FullScreen_RefreshRateInHz;
     pp.PresentationInterval = e->FullScreen_PresentationInterval;
+
+    // MGE render thread: when enabled, the runtime must be multithreaded (a
+    // second core submits GPU work concurrently with the engine) and the
+    // device-submission lock must be armed so the proxy forwarders serialize
+    // against the worker. Off => single-threaded baseline, lock disabled, the
+    // forwarders pay nothing.
+    g_deviceLockEnabled = Configuration.UseRenderThread;
+    if (Configuration.UseRenderThread) {
+        d |= D3DCREATE_MULTITHREADED;
+        LOG::logline("-- [RENDERTHREAD] device created with D3DCREATE_MULTITHREADED (flags=0x%08X)", d);
+    } else {
+        LOG::logline("-- device created SINGLE-THREADED (flags=0x%08X)", d);
+    }
 
     // Create device in the same manner as the proxy
     IDirect3DDevice9* realDevice = NULL;

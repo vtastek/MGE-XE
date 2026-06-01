@@ -28,6 +28,7 @@ bool DistantLand::ready = false;
 bool DistantLand::isRenderCached = false;
 bool DistantLand::isPPLActive = false;
 bool DistantLand::earlyWalkedCache = false;
+bool DistantLand::renderThreadJobKicked = false;
 int DistantLand::numWaterVerts, DistantLand::numWaterTris;
 
 IDirect3DDevice9* DistantLand::device;

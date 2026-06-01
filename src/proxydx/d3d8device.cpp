@@ -3,6 +3,13 @@
 #include "d3d8device.h"
 #include "d3d8surface.h"
 #include "d3d8texture.h"
+#include "devicelock.h"
+
+// Device-submission lock shared with the MGE render thread (see devicelock.h).
+// Disabled until a device is created with Configuration.UseRenderThread on, so
+// the single-threaded path takes the lock's cheap disabled branch only.
+std::mutex g_deviceMtx;
+bool       g_deviceLockEnabled = false;
 
 
 
@@ -66,6 +73,7 @@ BOOL _stdcall ProxyDevice::ShowCursor(BOOL a) {
 }
 
 HRESULT _stdcall ProxyDevice::Present(const RECT* a, const RECT* b, HWND c, const RGNDATA* d) {
+    MGE_DEVLOCK();
     return realDevice->Present(a, b, c, d);
 }
 
@@ -206,6 +214,7 @@ HRESULT _stdcall ProxyDevice::UpdateTexture(IDirect3DBaseTexture8* a, IDirect3DB
 }
 
 HRESULT _stdcall ProxyDevice::SetRenderTarget(IDirect3DSurface8* a, IDirect3DSurface8* b) {
+    MGE_DEVLOCK();
     IDirect3DSurface9* a_real = NULL;
     IDirect3DSurface9* b_real = NULL;
     if (a != NULL) {
@@ -265,20 +274,24 @@ HRESULT _stdcall ProxyDevice::GetDepthStencilSurface(IDirect3DSurface8** a) {
 //-----------------------------------------------------------------------------
 
 HRESULT _stdcall ProxyDevice::BeginScene() {
+    MGE_DEVLOCK();
     return realDevice->BeginScene();
 }
 
 HRESULT _stdcall ProxyDevice::EndScene() {
+    MGE_DEVLOCK();
     return realDevice->EndScene();
 }
 
 HRESULT _stdcall ProxyDevice::Clear(DWORD a, const D3DRECT* b, DWORD c, D3DCOLOR d, float e, DWORD f) {
+    MGE_DEVLOCK();
     return realDevice->Clear(a, b, c, d, e, f);
 }
 
 //-----------------------------------------------------------------------------
 
 HRESULT _stdcall ProxyDevice::SetTransform(D3DTRANSFORMSTATETYPE a, const D3DMATRIX* b) {
+    MGE_DEVLOCK();
     return realDevice->SetTransform(a, b);
 }
 HRESULT _stdcall ProxyDevice::GetTransform(D3DTRANSFORMSTATETYPE a, D3DMATRIX* b) {
@@ -288,6 +301,7 @@ HRESULT _stdcall ProxyDevice::MultiplyTransform(D3DTRANSFORMSTATETYPE a, const D
     return realDevice->MultiplyTransform(a, b);
 }
 HRESULT _stdcall ProxyDevice::SetViewport(const D3DVIEWPORT8* a) {
+    MGE_DEVLOCK();
     return realDevice->SetViewport(a);
 }
 HRESULT _stdcall ProxyDevice::GetViewport(D3DVIEWPORT8* a) {
@@ -297,18 +311,21 @@ HRESULT _stdcall ProxyDevice::GetViewport(D3DVIEWPORT8* a) {
 //-----------------------------------------------------------------------------
 
 HRESULT _stdcall ProxyDevice::SetMaterial(const D3DMATERIAL8* a) {
+    MGE_DEVLOCK();
     return realDevice->SetMaterial(a);
 }
 HRESULT _stdcall ProxyDevice::GetMaterial(D3DMATERIAL8* a) {
     return realDevice->GetMaterial(a);
 }
 HRESULT _stdcall ProxyDevice::SetLight(DWORD a, const D3DLIGHT8* b) {
+    MGE_DEVLOCK();
     return realDevice->SetLight(a, b);
 }
 HRESULT _stdcall ProxyDevice::GetLight(DWORD a, D3DLIGHT8* b) {
     return realDevice->GetLight(a, b);
 }
 HRESULT _stdcall ProxyDevice::LightEnable(DWORD a, BOOL b) {
+    MGE_DEVLOCK();
     return realDevice->LightEnable(a, b);
 }
 HRESULT _stdcall ProxyDevice::GetLightEnable(DWORD a, BOOL* b) {
@@ -318,6 +335,7 @@ HRESULT _stdcall ProxyDevice::GetLightEnable(DWORD a, BOOL* b) {
 //-----------------------------------------------------------------------------
 
 HRESULT _stdcall ProxyDevice::SetClipPlane(DWORD a, const float* b) {
+    MGE_DEVLOCK();
     return realDevice->SetClipPlane(a, b);
 }
 HRESULT _stdcall ProxyDevice::GetClipPlane(DWORD a, float* b) {
@@ -327,6 +345,7 @@ HRESULT _stdcall ProxyDevice::GetClipPlane(DWORD a, float* b) {
 //-----------------------------------------------------------------------------
 
 HRESULT _stdcall ProxyDevice::SetRenderState(D3DRENDERSTATETYPE a, DWORD b) {
+    MGE_DEVLOCK();
     return realDevice->SetRenderState(a, b);
 }
 
@@ -337,6 +356,7 @@ HRESULT _stdcall ProxyDevice::GetRenderState(D3DRENDERSTATETYPE a, DWORD* b) {
 //-----------------------------------------------------------------------------
 
 HRESULT _stdcall ProxyDevice::SetTexture(DWORD a, IDirect3DBaseTexture8* b) {
+    MGE_DEVLOCK();
     IDirect3DTexture9* currentTexture = (b != NULL) ? static_cast<ProxyTexture*>(b)->realTexture : NULL;
     return realDevice->SetTexture(a, currentTexture);
 }
@@ -445,18 +465,22 @@ HRESULT _stdcall ProxyDevice::GetCurrentTexturePalette(UINT* a) {
 //-----------------------------------------------------------------------------
 
 HRESULT _stdcall ProxyDevice::DrawPrimitive(D3DPRIMITIVETYPE a, UINT b, UINT c) {
+    MGE_DEVLOCK();
     return realDevice->DrawPrimitive(a, b, c);
 }
 
 HRESULT _stdcall ProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b, UINT c, UINT d, UINT e) {
+    MGE_DEVLOCK();
     return realDevice->DrawIndexedPrimitive(a, (INT)baseVertexIndex, b, c, d, e);
 }
 
 HRESULT _stdcall ProxyDevice::DrawPrimitiveUP(D3DPRIMITIVETYPE a, UINT b, const void* c, UINT d) {
+    MGE_DEVLOCK();
     return realDevice->DrawPrimitiveUP(a, b, c, d);
 }
 
 HRESULT _stdcall ProxyDevice::DrawIndexedPrimitiveUP(D3DPRIMITIVETYPE a, UINT b, UINT c, UINT d, const void* e, D3DFORMAT f, const void* g, UINT h) {
+    MGE_DEVLOCK();
     return realDevice->DrawIndexedPrimitiveUP(a, b, c, d, e, f, g, h);
 }
 
@@ -467,12 +491,14 @@ HRESULT _stdcall ProxyDevice::ProcessVertices(UINT a, UINT b, UINT c, IDirect3DV
 //-----------------------------------------------------------------------------
 
 HRESULT _stdcall ProxyDevice::SetVertexShader(DWORD a) {
+    MGE_DEVLOCK();
     return realDevice->SetFVF(a);
 }
 
 //-----------------------------------------------------------------------------
 
 HRESULT _stdcall ProxyDevice::SetStreamSource(UINT a, IDirect3DVertexBuffer8* b, UINT c) {
+    MGE_DEVLOCK();
     return realDevice->SetStreamSource(a, (IDirect3DVertexBuffer9*)b, 0, c);
 }
 
@@ -482,6 +508,7 @@ HRESULT _stdcall ProxyDevice::GetStreamSource(UINT a, IDirect3DVertexBuffer8** b
 }
 
 HRESULT _stdcall ProxyDevice::SetIndices(IDirect3DIndexBuffer8* a, UINT b) {
+    MGE_DEVLOCK();
     baseVertexIndex = b;
     return realDevice->SetIndices((IDirect3DIndexBuffer9*)a);
 }

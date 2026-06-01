@@ -189,6 +189,7 @@
     <ClCompile Include="src\mge\renderexterior.cpp" />
     <ClCompile Include="src\mge\rendergrass.cpp" />
     <ClCompile Include="src\mge\rendershadow.cpp" />
+    <ClCompile Include="src\mge\renderthread.cpp" />
     <ClCompile Include="src\mge\scenegraph.cpp" />
     <ClCompile Include="src\mge\scenegraph_geometry_cache.cpp" />
     <ClCompile Include="src\mge\renderwater.cpp" />
@@ -259,6 +260,7 @@
     <ClInclude Include="src\mge\phasetimers.h" />
     <ClInclude Include="src\mge\postshaders.h" />
     <ClInclude Include="src\mge\quadtree.h" />
+    <ClInclude Include="src\mge\renderthread.h" />
     <ClInclude Include="src\mge\scenegraph.h" />
     <ClInclude Include="src\mge\scenegraph_geometry_cache.h" />
     <ClInclude Include="src\mge\datahandler_view.h" />
@@ -282,6 +284,7 @@
     <ClInclude Include="src\mwse\mwseinstruction.h" />
     <ClInclude Include="src\mwse\VMTYPES.h" />
     <ClInclude Include="src\proxydx\d3d8device.h" />
+    <ClInclude Include="src\proxydx\devicelock.h" />
     <ClInclude Include="src\proxydx\d3d8header.h" />
     <ClInclude Include="src\proxydx\d3d8interface.h" />
     <ClInclude Include="src\proxydx\d3d8surface.h" />

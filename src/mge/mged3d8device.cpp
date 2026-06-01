@@ -2,12 +2,14 @@
 #include "mged3d8device.h"
 #include "proxydx/d3d8texture.h"
 #include "proxydx/d3d8surface.h"
+#include "proxydx/devicelock.h"
 
 #include <algorithm>
 #include <cstdio>
 #include <tlhelp32.h>
 #include "mgeversion.h"
 #include "configuration.h"
+#include "renderthread.h"
 #include "distantland.h"
 #include "mwbridge.h"
 #include "statusoverlay.h"
@@ -123,26 +125,34 @@ struct GpuFrameTimer {
     struct Slot {
         IDirect3DQuery9* tsStart  = nullptr;
         IDirect3DQuery9* tsEnd    = nullptr;
+        IDirect3DQuery9* tsSky0   = nullptr;  // MW sky window start (within frame disjoint)
+        IDirect3DQuery9* tsSky1   = nullptr;  // MW sky window end (= renderStage0)
         IDirect3DQuery9* disjoint = nullptr;
         IDirect3DQuery9* freq     = nullptr;
         bool inFlight = false;
+        bool skyValid = false;   // both sky timestamps issued this frame → emit "GPU sky (ms)"
     };
     Slot slots[N];
     int  cur = -1;
     bool initialized = false;
     bool disabled = false;
     bool spanOpen = false;   // beginFrame opened a span this frame (endFrame closes it)
+    bool skyOpen  = false;   // markSkyStart issued tsSky0, awaiting markSkyEnd
 
     void releaseAll() {
         for (auto& s : slots) {
             if (s.tsStart)  { s.tsStart->Release();  s.tsStart  = nullptr; }
             if (s.tsEnd)    { s.tsEnd->Release();    s.tsEnd    = nullptr; }
+            if (s.tsSky0)   { s.tsSky0->Release();   s.tsSky0   = nullptr; }
+            if (s.tsSky1)   { s.tsSky1->Release();   s.tsSky1   = nullptr; }
             if (s.disjoint) { s.disjoint->Release(); s.disjoint = nullptr; }
             if (s.freq)     { s.freq->Release();     s.freq     = nullptr; }
             s.inFlight = false;
+            s.skyValid = false;
         }
         initialized = false;
         spanOpen = false;
+        skyOpen  = false;
         cur = -1;
     }
 
@@ -152,6 +162,8 @@ struct GpuFrameTimer {
         for (auto& s : slots) {
             if (FAILED(dev->CreateQuery(D3DQUERYTYPE_TIMESTAMP,         &s.tsStart))  ||
                 FAILED(dev->CreateQuery(D3DQUERYTYPE_TIMESTAMP,         &s.tsEnd))    ||
+                FAILED(dev->CreateQuery(D3DQUERYTYPE_TIMESTAMP,         &s.tsSky0))   ||
+                FAILED(dev->CreateQuery(D3DQUERYTYPE_TIMESTAMP,         &s.tsSky1))   ||
                 FAILED(dev->CreateQuery(D3DQUERYTYPE_TIMESTAMPDISJOINT, &s.disjoint)) ||
                 FAILED(dev->CreateQuery(D3DQUERYTYPE_TIMESTAMPFREQ,     &s.freq))) {
                 disabled = true;     // GPU lacks timestamp queries — give up silently
@@ -161,6 +173,23 @@ struct GpuFrameTimer {
         }
         initialized = true;
         return true;
+    }
+
+    // Mark the GPU-side start of the MW sky window (called right after the sky
+    // Tracy zone opens). Records a timestamp inside the live frame disjoint block.
+    void markSkyStart() {
+        if (!initialized || !spanOpen || skyOpen) return;
+        slots[cur].tsSky0->Issue(D3DISSUE_END);
+        skyOpen = true;
+    }
+
+    // Mark the GPU-side end of the MW sky window (= first world draw / renderStage0).
+    // Idempotent: only the first call per frame records the end.
+    void markSkyEnd() {
+        if (!initialized || !skyOpen) return;
+        slots[cur].tsSky1->Issue(D3DISSUE_END);
+        slots[cur].skyValid = true;
+        skyOpen = false;
     }
 
     // Close the current frame's span (before the real Present). No-op unless
@@ -189,7 +218,16 @@ struct GpuFrameTimer {
             s.inFlight = false;
             if (!dis && f != 0 && t1 >= t0) {
                 MGE_TracyPlot("GPU frame (ms)", double(t1 - t0) / double(f) * 1000.0);
+                if (s.skyValid) {
+                    UINT64 sk0 = 0, sk1 = 0;
+                    if (s.tsSky0->GetData(&sk0, sizeof(sk0), 0) == S_OK &&
+                        s.tsSky1->GetData(&sk1, sizeof(sk1), 0) == S_OK &&
+                        sk1 >= sk0) {
+                        MGE_TracyPlot("GPU sky (ms)", double(sk1 - sk0) / double(f) * 1000.0);
+                    }
+                }
             }
+            s.skyValid = false;
         }
     }
 
@@ -199,6 +237,8 @@ struct GpuFrameTimer {
         cur = (cur + 1) % N;
         Slot& s = slots[cur];
         s.inFlight = false;                  // drop any unread slot we're reusing
+        s.skyValid = false;
+        skyOpen = false;
         s.disjoint->Issue(D3DISSUE_BEGIN);
         s.tsStart->Issue(D3DISSUE_END);
         spanOpen = true;
@@ -510,7 +550,6 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
             }
 #endif
             if (sceneCount == 0) {
-                DistantLand::beginSkyZone();
 #ifdef TRACY_ENABLE
                 // Open the GPU-busy-time span at the start of the frame's GPU
                 // work (paired with endFrame() at Present). ensureInit ran in a
@@ -534,6 +573,15 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                 if (DistantLand::ready) {
                     DistantLand::frameSetupEarly();
                 }
+
+                // Open the MW sky zone *after* frameSetupEarly so it brackets only
+                // the engine's true sky pass — not our main-thread geometry-cache
+                // walk / cull kickoff, which frameSetupEarly parks here to overlap
+                // the cull worker. Closed at the top of renderStage0().
+                DistantLand::beginSkyZone();
+#ifdef TRACY_ENABLE
+                if (g_tracyActive) g_gpuTimer.markSkyStart();
+#endif
             }
         } else {
 #ifdef TRACY_ENABLE
@@ -571,6 +619,9 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
         if (sceneCount == 0) {
             // Edge case, render distant land even if Morrowind has culled everything
             if (!stage0Complete) {
+#ifdef TRACY_ENABLE
+                if (g_tracyActive) g_gpuTimer.markSkyEnd();
+#endif
                 DistantLand::renderStage0();
                 stage0Complete = true;
             }
@@ -722,6 +773,11 @@ HRESULT _stdcall MGEProxyDevice::SetRenderState(D3DRENDERSTATETYPE a, DWORD b) {
 // SetTextureStageState
 // Override some sampler options
 HRESULT _stdcall MGEProxyDevice::SetTextureStageState(DWORD a, D3DTEXTURESTAGESTATETYPE b, DWORD c) {
+    // Whole-method lock: this override submits directly via realDevice->
+    // SetSamplerState in two branches (bypassing the locked ProxyDevice base),
+    // so the bare-forward lock in the base would miss those. Base
+    // SetTextureStageState is intentionally left unlocked to avoid a re-lock.
+    MGE_DEVLOCK();
     captureFragmentRenderState(a, b, c);
 
     // Sampler overrides to ensure trilinear/anisotropic filtering works
@@ -752,6 +808,9 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
 
         if (!stage0Complete && !isAmbientWhite) {
             // At this point, only the sky is rendered in exteriors, or nothing in interiors
+#ifdef TRACY_ENABLE
+            if (g_tracyActive) g_gpuTimer.markSkyEnd();
+#endif
             DistantLand::renderStage0();
             stage0Complete = true;
             DistantLand::beginDrawsZone();
@@ -786,6 +845,14 @@ HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b
 
 // Release - Free all resources when refcount hits 0
 ULONG _stdcall MGEProxyDevice::Release() {
+    // Join the render thread BEFORE ProxyDevice::Release frees the real device
+    // (it releases realDevice at refcount 0). refcount==1 here means this call
+    // drops it to 0. The worker may still be mid-pass touching the device /
+    // depth RT, so drain + join it while everything is still alive.
+    if (refcount == 1) {
+        MGE::RenderThread::stop();
+    }
+
     ULONG r = ProxyDevice::Release();
 
     if (r == 0) {

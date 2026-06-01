@@ -65,6 +65,11 @@ public:
     // Set by frameSetupEarly() when the GeometryCache walk ran at BeginScene(0);
     // read by renderDepth (different TU) to skip its own redundant walk.
     static bool earlyWalkedCache;
+    // Set by frameSetupEarly() when it kicked the render-thread depth-cache job
+    // this frame; read by renderStage0() to fence (RenderThread::wait) before any
+    // main-thread device/effect work, and by renderDepth() to skip the Clear /
+    // float-depth clear / cache pass the worker already wrote into texDepthFrame.
+    static bool renderThreadJobKicked;
     static int numWaterVerts, numWaterTris;
 
     static IDirect3DDevice9* device;
@@ -326,7 +331,21 @@ public:
     static void renderDepth();
     static void renderDepthAdditional();
     static void renderDepthRecorded();
-    static void renderDepthFromCache(const D3DXMATRIX* gameView);
+    // visibleOverride: when non-null, iterate this key list instead of the live
+    // s_prevVisibleKeys set. Used by the render-thread job, which reads a
+    // main-thread snapshot (snapshotVisibleKeysForThread) so it never touches the
+    // set concurrently with updateVisibleSet.
+    static void renderDepthFromCache(const D3DXMATRIX* gameView,
+                                     const std::vector<uint32_t>* visibleOverride = nullptr);
+    // Copy s_prevVisibleKeys into the render-thread snapshot. Main-thread only,
+    // called at kick (frameSetupEarly) before the job can read it.
+    static void snapshotVisibleKeysForThread();
+    // Render-thread depth-cache job: under the device lock, save full device
+    // state (engine is mid-sky), bind texDepthFrame/surfDepthDepth, Clear +
+    // float-depth clear pass + renderDepthFromCache (its own effectDepth
+    // bracket), restore RT + device state. Produces the same depth content
+    // renderDepth's serial cache path would, just during the sky window.
+    static void renderThreadDepthCacheJob();
     static void updateVisibleSet(void* const* shapes, int count);
 
     static void renderShadowMap();

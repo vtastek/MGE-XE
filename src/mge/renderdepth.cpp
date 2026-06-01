@@ -5,19 +5,29 @@
 #include "mwbridge.h"
 #include "phasetimers.h"
 #include "proxydx/d3d8header.h"
+#include "proxydx/devicelock.h"
 #include "scenegraph.h"
 #include "scenegraph_geometry_cache.h"
 #include "support/log.h"
 #include "mge_tracy.h"
 
 #include <unordered_set>
+#include <vector>
 
 // MSOC-culled visible set received from the VisibleGeomCallback.
 // s_visibleKeys: current frame (being built by callback).
 // s_prevVisibleKeys: previous frame (ready at renderDepth time).
 // Both keyed on NiTriBasedGeometry* cast to uint32_t — matches GeometryCache keys.
+// updateVisibleSet (the only writer) runs on the MAIN thread — msoc.dll fires the
+// callback from inside the engine's drainPendingDisplays — so a main-thread
+// snapshot at kick cannot race it.
 static std::unordered_set<uint32_t> s_visibleKeys;
 static std::unordered_set<uint32_t> s_prevVisibleKeys;
+
+// Render-thread snapshot of s_prevVisibleKeys, populated on the main thread at
+// kick (snapshotVisibleKeysForThread) and read by the worker job. Decouples the
+// job from any later main-thread mutation of the set.
+static std::vector<uint32_t> s_threadVisibleKeys;
 
 void DistantLand::updateVisibleSet(void* const* shapes, int count) {
     s_prevVisibleKeys = std::move(s_visibleKeys);
@@ -36,38 +46,53 @@ void DistantLand::renderDepth() {
 
     // Switch to render target
     RenderTargetSwitcher rtsw(texDepthFrame, surfDepthDepth);
-    device->Clear(0, 0, D3DCLEAR_ZBUFFER, 0, 1.0, 0);
+
+    // When the render thread produced the cleared depth + MW cache depth during
+    // the sky window, it already wrote them into texDepthFrame/surfDepthDepth
+    // (fenced in renderStage0 before this runs). Skip the Clear, the float-depth
+    // clear pass, and the cache pass here; land/statics/grass below render on top
+    // of the worker's buffer, byte-identical to the serial path.
+    const bool depthCacheOnThread = renderThreadJobKicked;
+
+    if (!depthCacheOnThread) {
+        device->Clear(0, 0, D3DCLEAR_ZBUFFER, 0, 1.0, 0);
+    }
 
     // Unbind depth sampler
     effect->SetTexture(ehTex3, NULL);
 
-    // Projection should cover whole scene
+    // Projection should cover whole scene (also used by the land/statics depth
+    // passes below, so set it on both paths)
     D3DXMATRIX distProj = mwProj;
     editProjectionZ(&distProj, 4.0f, Configuration.DL.DrawDist * kCellSize);
     effect->SetMatrix(ehProj, &distProj);
 
-    // Clear floating point buffer to far depth
-    effectDepth->BeginPass(PASS_CLEARDEPTH);
-    device->SetVertexDeclaration(WaterDecl);
-    device->SetStreamSource(0, vbFullFrame, 0, 12);
-    device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
-    effectDepth->EndPass();
+    if (!depthCacheOnThread) {
+        // Clear floating point buffer to far depth
+        effectDepth->BeginPass(PASS_CLEARDEPTH);
+        device->SetVertexDeclaration(WaterDecl);
+        device->SetStreamSource(0, vbFullFrame, 0, 12);
+        device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+        effectDepth->EndPass();
 
-    // Rebuild the geometry cache (walk + per-frame bone palettes) BEFORE the
-    // depth draw so depth uses this frame's skinned poses — otherwise depth
-    // lags a frame behind the shadow pass and SSAO detaches from moving NPCs.
-    // Cheap now that VS palette skinning replaced per-frame CPU skinning, and
-    // the VBs are static so there's no depth/shadow aliasing to overlap around.
-    //
-    // Skipped when frameSetupEarly() already walked it at BeginScene(0) (IPC
-    // path) so the ~2ms walk overlaps the sky pass. This call is the fallback
-    // for the non-IPC / menu / not-ready paths where earlyWalkedCache is false.
-    if (!earlyWalkedCache) {
-        MGE::GeometryCache::onFrameReady(MGE::SceneGraph::getDataHandler());
-    }
-    {
-        MGE_SCOPED_TIMER("renderDepth:cache");
-        renderDepthFromCache(&mwView);   // owns its non-skinned + skinned passes
+        // Rebuild the geometry cache (walk + per-frame bone palettes) BEFORE the
+        // depth draw so depth uses this frame's skinned poses — otherwise depth
+        // lags a frame behind the shadow pass and SSAO detaches from moving NPCs.
+        // Cheap now that VS palette skinning replaced per-frame CPU skinning, and
+        // the VBs are static so there's no depth/shadow aliasing to overlap around.
+        //
+        // Skipped when frameSetupEarly() already walked it at BeginScene(0) (IPC
+        // path) so the ~2ms walk overlaps the sky pass. This call is the fallback
+        // for the non-IPC / menu / not-ready paths where earlyWalkedCache is false.
+        // (depthCacheOnThread implies earlyWalkedCache, so this whole block is
+        // skipped on the threaded path — the worker did the cache pass.)
+        if (!earlyWalkedCache) {
+            MGE::GeometryCache::onFrameReady(MGE::SceneGraph::getDataHandler());
+        }
+        {
+            MGE_SCOPED_TIMER("renderDepth:cache");
+            renderDepthFromCache(&mwView);   // owns its non-skinned + skinned passes
+        }
     }
 
     // Channel-free gate: when frameSetupEarly dispatched the statics verdict to
@@ -200,12 +225,14 @@ void DistantLand::renderDepthRecorded() {
     }
 }
 
-void DistantLand::renderDepthFromCache(const D3DXMATRIX* gameView) {
+void DistantLand::renderDepthFromCache(const D3DXMATRIX* gameView,
+                                       const std::vector<uint32_t>* visibleOverride) {
     MGE_ZoneScopedN("renderDepthFromCache");
 
     const float solidThreshold = 0.499f;
     const auto& cacheMap = MGE::GeometryCache::cache();
-    const bool useVisibleSet = !s_prevVisibleKeys.empty();
+    const bool useVisibleSet = visibleOverride ? !visibleOverride->empty()
+                                               : !s_prevVisibleKeys.empty();
 
     auto bindMaterial = [&](const MGE::GeometryCache::CachedGeometry& e) {
         bool alphaDependent = e.alphaTest || e.blendEnable;
@@ -225,9 +252,16 @@ void DistantLand::renderDepthFromCache(const D3DXMATRIX* gameView) {
 
     auto forEach = [&](auto&& fn) {
         if (useVisibleSet) {
-            for (uint32_t key : s_prevVisibleKeys) {
-                auto it = cacheMap.find(key);
-                if (it != cacheMap.end()) fn(it->second);
+            if (visibleOverride) {
+                for (uint32_t key : *visibleOverride) {
+                    auto it = cacheMap.find(key);
+                    if (it != cacheMap.end()) fn(it->second);
+                }
+            } else {
+                for (uint32_t key : s_prevVisibleKeys) {
+                    auto it = cacheMap.find(key);
+                    if (it != cacheMap.end()) fn(it->second);
+                }
             }
         } else {
             for (const auto& kv : cacheMap) fn(kv.second);
@@ -284,4 +318,76 @@ void DistantLand::renderDepthFromCache(const D3DXMATRIX* gameView) {
     effect->SetTexture(ehTex0, nullptr);
     effect->SetBool(ehHasAlpha, false);
     effect->SetFloat(ehAlphaRef, -1.0f);
+}
+
+// snapshotVisibleKeysForThread - copy the live visible-key set into the
+// render-thread snapshot. MAIN THREAD ONLY (updateVisibleSet, the only writer of
+// s_prevVisibleKeys, also runs on the main thread), called at kick before the
+// worker reads it.
+void DistantLand::snapshotVisibleKeysForThread() {
+    s_threadVisibleKeys.assign(s_prevVisibleKeys.begin(), s_prevVisibleKeys.end());
+}
+
+// renderThreadDepthCacheJob - Phase 1 render-thread payload.
+//
+// Runs on the MGE render thread, kicked from frameSetupEarly() during the
+// engine's sky window, fenced at the top of renderStage0() before any main-thread
+// device/effect work. Holds the device-submission lock for its entire body so it
+// is atomic against the engine's proxy forwarders. Produces exactly what the
+// serial renderDepth cache path produces — cleared depth + the MW geometry-cache
+// depth — into texDepthFrame/surfDepthDepth, just earlier (overlapping sky).
+//
+// Reads only frame-stable, kick-time-fixed data: mwView/mwProj (set by
+// frameSetupEarly before the kick, not rewritten until renderStage0 after the
+// fence), the GeometryCache (built by the walk before the kick), and the
+// s_threadVisibleKeys snapshot. Uses its OWN effectDepth Begin/End bracket — the
+// fence guarantees the main thread is not inside an effect bracket concurrently.
+void DistantLand::renderThreadDepthCacheJob() {
+    MGE_ZoneScopedN("RenderThread:job");
+    MGE_DEVLOCK();   // hold the device lock for the whole pass
+
+    if (!device) {
+        return;
+    }
+
+    // Save the full device state the engine left mid-sky; restore it before
+    // releasing the lock so the engine resumes intact. The render target is not
+    // captured by state blocks — RenderTargetSwitcher restores it separately.
+    IDirect3DStateBlock9* sb = nullptr;
+    if (device->CreateStateBlock(D3DSBT_ALL, &sb) != D3D_OK) {
+        sb = nullptr;
+    }
+
+    UINT passes;
+    {
+        RenderTargetSwitcher rtsw(texDepthFrame, surfDepthDepth);
+        device->Clear(0, 0, D3DCLEAR_ZBUFFER, 0, 1.0f, 0);
+
+        // Unbind depth sampler
+        effect->SetTexture(ehTex3, NULL);
+
+        // Projection should cover whole scene
+        D3DXMATRIX distProj = mwProj;
+        editProjectionZ(&distProj, 4.0f, Configuration.DL.DrawDist * kCellSize);
+        effect->SetMatrix(ehProj, &distProj);
+
+        // Own effect bracket — main is not in one yet (fenced before renderStage0).
+        effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
+
+        // Clear floating point buffer to far depth
+        effectDepth->BeginPass(PASS_CLEARDEPTH);
+        device->SetVertexDeclaration(WaterDecl);
+        device->SetStreamSource(0, vbFullFrame, 0, 12);
+        device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+        effectDepth->EndPass();
+
+        renderDepthFromCache(&mwView, &s_threadVisibleKeys);
+
+        effectDepth->End();
+    }
+
+    if (sb) {
+        sb->Apply();
+        sb->Release();
+    }
 }
