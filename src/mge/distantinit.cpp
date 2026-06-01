@@ -30,6 +30,13 @@ bool DistantLand::isPPLActive = false;
 bool DistantLand::earlyWalkedCache = false;
 bool DistantLand::renderThreadJobKicked = false;
 std::vector<D3DXVECTOR4> DistantLand::reflectionWaterRects;
+bool DistantLand::reflGateWanted = false;
+bool DistantLand::reflStaticsWanted = false;
+bool DistantLand::reflVisible = false;
+D3DXMATRIX  DistantLand::reflCullViewProj;
+D3DXMATRIX  DistantLand::reflCullProj;
+D3DXVECTOR4 DistantLand::reflCullViewSphere;
+VisibleSet<StlVector> DistantLand::reflectionSurvivors;
 int DistantLand::numWaterVerts, DistantLand::numWaterTris;
 
 IDirect3DDevice9* DistantLand::device;

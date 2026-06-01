@@ -41,6 +41,12 @@ static float g_msocCutoffHeight = 2500.0f;
 // frames; ~12k * 156B ~= 1.9MB, trivial for the process heap.
 static std::vector<RenderMesh> g_meshValues;
 
+// Same idea for the reflection-statics set: the cull worker materializes
+// visExtraShared into this stable buffer ONCE (before releasing the IPC channel),
+// and reflectionSurvivors holds pointers into it so the main-thread draw never
+// traverses the live IPC window concurrently with the worker / main RPCs.
+static std::vector<RenderMesh> g_reflMeshValues;
+
 namespace {
 struct MSOCBasinDebugBox {
     float minX, maxX, minY, maxY, minZ, maxZ;
@@ -586,6 +592,12 @@ void cullWorkerLoop() {
             MGE_ZoneScopedN("cullWorker:drain");
             DistantLand::ipcClient.tryWaitForCompletion();
         }
+
+        // Reflection statics RPC, issued while the worker still owns the channel
+        // (before channelDrained releases it to the main thread). Its server cull
+        // overlaps the sky window instead of stalling the reflection draw later.
+        DistantLand::workerReflectionRPC();
+
         {
             std::lock_guard<std::mutex> lk(g_cullMtx);
             g_cullChannelDrained = true;
@@ -599,6 +611,12 @@ void cullWorkerLoop() {
             MGE_ZoneScopedN("cullWorker:verdict");
             DistantLand::applyMSOCToDistantStatics(DistantLand::visDistantShared);
         }
+
+        // Reflection gate + skipMask: pure CPU over the freshly-drained reflection
+        // set and the frame-stable terrain/MSOC inputs. Produces reflVisible +
+        // reflSkipMask, joined by main at the maskDone fence.
+        DistantLand::workerReflectionGateAndMask();
+
         {
             std::lock_guard<std::mutex> lk(g_cullMtx);
             g_cullMaskDone = true;
@@ -1573,4 +1591,119 @@ bool DistantLand::isReflectionWaterVisible() {
     }
 
     return anyVisible;
+}
+
+// Materialize visExtraShared (windowed IPC view) into stable contiguous storage
+// ONE time. Must run while the channel is owned by this caller (no concurrent
+// IPC traffic). Mirrors the distant-statics materialize in applyMSOCToDistantStatics.
+void DistantLand::materializeReflectionMeshes() {
+    g_reflMeshValues.clear();
+    g_reflMeshValues.reserve(visExtraShared.Size());
+    visExtraShared.Reset();
+    while (!visExtraShared.AtEnd())
+        g_reflMeshValues.push_back(visExtraShared.Next());
+}
+
+// Cull the materialized reflection meshes into reflectionSurvivors: keep a static
+// only if its reflection (projected via the reflection view*proj) lands on a
+// surviving water tile's screen rect. Pure CPU over the stable copy + rects — no
+// IPC window access, so it's safe on the worker after channelDrained.
+void DistantLand::cullReflectionSurvivors(const D3DXMATRIX& viewProj, const D3DXMATRIX& proj) {
+    reflectionSurvivors.RemoveAll();
+    reflectionSurvivors.visible_set.reserve((std::uint32_t)g_reflMeshValues.size());
+
+    const auto& waterRects = reflectionWaterRects;
+    const bool noRects = waterRects.empty();
+    for (const RenderMesh& m : g_reflMeshValues) {
+        bool keep = true;
+        if (!noRects) {
+            const D3DXVECTOR3& c = m.sphere.center;
+            const float rad = m.sphere.radius;
+            const float cx = c.x*viewProj._11 + c.y*viewProj._21 + c.z*viewProj._31 + viewProj._41;
+            const float cy = c.x*viewProj._12 + c.y*viewProj._22 + c.z*viewProj._32 + viewProj._42;
+            const float cw = c.x*viewProj._14 + c.y*viewProj._24 + c.z*viewProj._34 + viewProj._44;
+            if (cw < 1e-3f) {
+                keep = true;   // behind near plane → conservatively keep
+            } else {
+                const float inv = 1.0f / cw;
+                const float nx = cx * inv, ny = cy * inv;
+                const float rx = rad * proj._11 * inv;   // sphere radius in NDC
+                const float ry = rad * proj._22 * inv;
+                keep = false;
+                for (const D3DXVECTOR4& wr : waterRects) {
+                    if (nx + rx >= wr.x && nx - rx <= wr.z &&
+                        ny + ry >= wr.y && ny - ry <= wr.w) { keep = true; break; }
+                }
+            }
+        }
+        if (keep) reflectionSurvivors.PushBack(m);
+    }
+    reflectionSurvivors.SortByState();
+    MGE_TracyPlot("reflStatics:count", double(g_reflMeshValues.size()));
+    MGE_TracyPlot("reflStatics:culled", double(g_reflMeshValues.size() - reflectionSurvivors.Size()));
+}
+
+// Main (frameSetupEarly): decide whether the cull worker should handle the
+// reflection this frame, and stash the reflection cull frustum/projection. Only
+// called when the worker was dispatched (USE_DISTANT_STATICS path), so
+// reflGateWanted=true implies the worker will run.
+void DistantLand::prepareReflectionCullForWorker() {
+    reflGateWanted = false;
+    reflStaticsWanted = false;
+
+    auto mwBridge = MWBridge::get();
+    if (!isDistantCell() || !mwBridge->CellHasWater()) return;
+    reflGateWanted = true;   // worker runs the reflect-vs-clear gate
+
+    // Reflection statics RPC only when near-static reflections are enabled.
+    if (!(Configuration.MGEFlags & REFLECT_NEAR)) return;
+
+    const float zn = 4.0f;
+    const float zf = std::min(fogEnd, Configuration.DL.NearStaticEnd * kCellSize);
+    if (zf <= zn) return;
+
+    // Mirror the view across the water plane (matches renderWaterReflection).
+    D3DXMATRIX reflView;
+    D3DXPLANE plane(0, 0, 1.0f, -(mwBridge->WaterLevel() - 1.0f));
+    D3DXMatrixReflect(&reflView, &plane);
+    D3DXMatrixMultiply(&reflView, &reflView, &mwView);
+
+    D3DXMATRIX ds_proj = mwProj;
+    editProjectionZ(&ds_proj, zn, zf);
+
+    reflCullProj       = ds_proj;
+    reflCullViewProj   = reflView * ds_proj;
+    reflCullViewSphere = D3DXVECTOR4(eyePos.x, eyePos.y, eyePos.z, zf);
+    reflStaticsWanted  = true;
+}
+
+// Worker step (before channelDrained): issue the reflection statics RPC and wait,
+// while the worker still owns the single IPC channel. The server cull overlaps
+// the sky window; channelDrained is signalled after this so the main thread's
+// later RPCs stay correctly sequenced behind it.
+void DistantLand::workerReflectionRPC() {
+    if (!reflStaticsWanted) return;
+    MGE_ZoneScopedN("cullWorker:reflRPC");
+    visExtraShared.RemoveAll();
+    ViewFrustum rf(&reflCullViewProj);
+    ipcClient.getVisibleMeshes(visExtraSharedId, rf, reflCullViewSphere, VIS_STATIC, VisibleSetSort::ByState);
+    ipcClient.waitForCompletion();
+    // Copy out of the IPC window now, while the channel is still owned (before
+    // channelDrained). main never touches the live window for reflections.
+    materializeReflectionMeshes();
+}
+
+// Worker step (after the statics verdict, before maskDone): run the water-visible
+// gate and build the reflection skipMask. Both are pure CPU over frame-stable
+// inputs (terrain maps, MSOC mask, stashed reflection matrices).
+void DistantLand::workerReflectionGateAndMask() {
+    if (!reflGateWanted) return;
+    {
+        MGE_ZoneScopedN("cullWorker:reflGate");
+        reflVisible = isReflectionWaterVisible();   // fills reflectionWaterRects
+    }
+    if (reflStaticsWanted) {
+        MGE_ZoneScopedN("cullWorker:reflMask");
+        cullReflectionSurvivors(reflCullViewProj, reflCullProj);
+    }
 }

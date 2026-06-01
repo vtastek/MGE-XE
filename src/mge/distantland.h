@@ -336,6 +336,33 @@ public:
     // Surviving water tile screen rects (main-view NDC AABBs: x=minX, y=minY,
     // z=maxX, w=maxY). Where visible water samples texReflection on screen.
     static std::vector<D3DXVECTOR4> reflectionWaterRects;
+
+    // --- Reflection-statics cull dispatched to the MSOC cull worker ---
+    // The gate (isReflectionWaterVisible), the reflection IPC query and the
+    // per-static skipMask are all pure-CPU/IPC and frame-stable, so they run on
+    // the cull worker during the sky window, leaving only the reflection draw on
+    // the main thread. See tasks/todo.md.
+    static bool reflGateWanted;     // worker runs the water-visible gate this frame
+    static bool reflStaticsWanted;  // worker issues the reflection RPC + culls
+    static bool reflVisible;        // gate result: any water visible (worker-written)
+    static D3DXMATRIX  reflCullViewProj;   // reflection view*proj (RPC frustum + cull projection)
+    static D3DXMATRIX  reflCullProj;       // reflection proj (NDC radius scale)
+    static D3DXVECTOR4 reflCullViewSphere; // reflection cull sphere (eye + range)
+    // Compacted reflection-static survivors: pointers into a stable copy of the
+    // IPC visible set, so the MAIN thread draws without traversing the live IPC
+    // window (which the worker + main RPCs would race). Mirrors visDistantSurvivors.
+    static VisibleSet<StlVector> reflectionSurvivors;
+    // Main (frameSetupEarly): stash the reflection cull inputs for the worker.
+    static void prepareReflectionCullForWorker();
+    // Worker: issue the reflection RPC + materialize the result (before
+    // channelDrained), then after the verdict run the gate + cull to survivors.
+    static void workerReflectionRPC();
+    static void workerReflectionGateAndMask();
+    // Materialize visExtraShared into stable storage (one IPC-window traversal).
+    static void materializeReflectionMeshes();
+    // Cull the materialized reflection meshes into reflectionSurvivors using
+    // reflectionWaterRects. Shared by the worker and the non-worker fallback.
+    static void cullReflectionSurvivors(const D3DXMATRIX& viewProj, const D3DXMATRIX& proj);
     static void simulateDynamicWaves();
     static void renderWaterPlane();
 

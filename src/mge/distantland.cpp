@@ -41,6 +41,10 @@ void DistantLand::frameSetupEarly() {
     s_earlyKickedStatics = false;
     earlyWalkedCache = false;
     renderThreadJobKicked = false;
+    // Reset reflection-worker flags: only set true when the cull worker is
+    // dispatched below, so a non-worker frame can't read stale worker results.
+    reflGateWanted = false;
+    reflStaticsWanted = false;
 
     // Drive the scene-graph lights snapshot here (moved from renderStage0, which
     // runs *after* the engine's ~1.6ms sky pass). On the async path onFrameReady
@@ -94,6 +98,12 @@ void DistantLand::frameSetupEarly() {
             // is final before the worker reads it; then dispatch the verdict
             // pass to the cull worker. cullDistantStatics_finish joins it.
             updateMSOCCutoffInput();
+
+            // Stash the reflection cull inputs for the worker BEFORE signalling it
+            // (the worker reads reflStaticsWanted/reflCull* once woken). The worker
+            // then issues the reflection RPC + gate + skipMask during sky.
+            prepareReflectionCullForWorker();
+
             signalCullFinish();
         }
 
@@ -299,7 +309,11 @@ void DistantLand::renderStage0() {
             // keeps a valid flat-fog target for the distant-water sampler and the
             // transition frame without paying the reflection pass.
             if (mwBridge->CellHasWater()) {
-                if (isReflectionWaterVisible()) {
+                // Gate result comes from the cull worker when it ran the gate this
+                // frame (reflGateWanted); otherwise compute it inline on main.
+                const bool waterVisible = reflGateWanted ? reflVisible
+                                                         : isReflectionWaterVisible();
+                if (waterVisible) {
                     renderWaterReflection(&mwView, &distProj);
                 } else {
                     clearReflection();
