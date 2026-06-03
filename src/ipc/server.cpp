@@ -282,6 +282,19 @@ namespace IPC {
 			QueryPerformanceCounter(&t);
 			sortMs = msBetween(prev, t);
 		}
+
+		// Optional piggybacked reflection-statics query into a separate vec.
+		// Its server-cull overlaps the client's kickoff→drain head-start window
+		// (GeomCache walk + sky), so the reflection set is ready by the time the
+		// worker drains this single RPC. reflFlags==0 ⇒ no reflection this RPC.
+		if (params.reflFlags != 0) {
+			auto& rvec = getVec<RenderMesh>(params.reflSet);
+			DistantLandShare::getVisibleMeshes(
+				rvec, params.reflFrustum, params.reflSphere,
+				VisibleSetSort::None, params.reflFlags);
+			DistantLandShare::sortVisibleSet(rvec, params.reflSort);
+		}
+
 		g_allRangesStats.record(rangeMs, sortMs, walkMs + sortMs, vec.size());
 	}
 

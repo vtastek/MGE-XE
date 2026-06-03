@@ -1,6 +1,7 @@
 
 #include "userhud.h"
 #include "morrowindbsa.h"
+#include "drawstats.h"
 #include "proxydx/d3d8header.h"
 #include "support/log.h"
 
@@ -61,6 +62,7 @@ bool MGEhud::init(IDirect3DDevice9* d) {
 }
 
 void MGEhud::draw() {
+    DrawStats::ScopedStage _ds(DrawStats::UI);
     IDirect3DStateBlock9* stateSaved;
     device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
 
@@ -113,6 +115,7 @@ void MGEhud::draw() {
             effect->SetTexture(ehTex, e->texture);
             effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
             effect->BeginPass(0);
+            DrawStats::count(2);
             device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 4 * i.second, 2);
             effect->EndPass();
             effect->End();

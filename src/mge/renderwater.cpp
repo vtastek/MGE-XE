@@ -1,6 +1,7 @@
 
 #include "distantland.h"
 #include "distantshader.h"
+#include "drawstats.h"
 #include "configuration.h"
 #include "doublesurface.h"
 #include "mwbridge.h"
@@ -14,6 +15,7 @@
 
 void DistantLand::renderWaterReflection(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
     MGE_ZoneScopedN("renderWaterReflection");
+    DrawStats::ScopedStage _ds(DrawStats::Reflection);
     auto mwBridge = MWBridge::get();
 
     // Switch to render target
@@ -62,6 +64,7 @@ void DistantLand::renderWaterReflection(const D3DXMATRIX* view, const D3DXMATRIX
         effect->BeginPass(PASS_WORKAROUND);
         device->SetVertexDeclaration(WaterDecl);
         device->SetStreamSource(0, vbFullFrame, 0, 12);
+        DrawStats::count(2);
         device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
         effect->EndPass();
     }
@@ -160,6 +163,7 @@ void DistantLand::renderReflectedSky() {
         device->SetStreamSource(0, i.vb, i.vbOffset, i.vbStride);
         device->SetIndices(i.ib);
         device->SetFVF(i.fvf);
+        DrawStats::count(i.primCount);
         device->DrawIndexedPrimitive(i.primType, i.baseIndex, i.minIndex, i.vertCount, i.startIndex, i.primCount);
     }
     effect->EndPass();
@@ -190,6 +194,7 @@ void DistantLand::renderReflectedSky() {
         device->SetStreamSource(0, i.vb, i.vbOffset, i.vbStride);
         device->SetIndices(i.ib);
         device->SetFVF(i.fvf);
+        DrawStats::count(i.primCount);
         device->DrawIndexedPrimitive(i.primType, i.baseIndex, i.minIndex, i.vertCount, i.startIndex, i.primCount);
     }
     effect->EndPass();
@@ -277,6 +282,7 @@ void DistantLand::clearReflection() {
 
 void DistantLand::simulateDynamicWaves() {
     MGE_ZoneScopedN("simulateDynamicWaves");
+    DrawStats::ScopedStage _ds(DrawStats::Water);
     auto mwBridge = MWBridge::get();
 
     static bool resetRippleSurface = true;
@@ -365,6 +371,7 @@ void DistantLand::simulateDynamicWaves() {
             effect->SetTexture(ehTex4, doublebuffer.sourceTexture());
             effect->CommitChanges();
 
+            DrawStats::count(1);
             device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 1);
             doublebuffer.cycle();
         }
@@ -437,6 +444,7 @@ void DistantLand::simulateDynamicWaves() {
             effect->SetFloatArray(ehRippleOrigin, rippleOrigin, 2);
             effect->CommitChanges();
 
+            DrawStats::count(1);
             device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 1);
             doublebuffer.cycle();
         }
@@ -450,6 +458,7 @@ void DistantLand::simulateDynamicWaves() {
         effect->SetTexture(ehTex4, doublebuffer.sourceTexture());
         effect->CommitChanges();
 
+        DrawStats::count(1);
         device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 1);
         doublebuffer.cycle();
     }
@@ -470,6 +479,7 @@ void DistantLand::simulateDynamicWaves() {
 }
 
 void DistantLand::renderWaterPlane() {
+    DrawStats::ScopedStage _ds(DrawStats::Water);
     D3DXMATRIX m;
     IDirect3DTexture9* texRefract = PostShaders::borrowBuffer(0);
 
@@ -488,5 +498,6 @@ void DistantLand::renderWaterPlane() {
     device->SetVertexDeclaration(WaterDecl);
     device->SetStreamSource(0, vbWater, 0, 12);
     device->SetIndices(ibWater);
+    DrawStats::count(numWaterTris);
     device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, numWaterVerts, 0, numWaterTris);
 }

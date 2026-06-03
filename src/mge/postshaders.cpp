@@ -2,6 +2,7 @@
 #include "proxydx/d3d8header.h"
 #include "support/log.h"
 #include "configuration.h"
+#include "drawstats.h"
 #include "mwbridge.h"
 #include "postshaders.h"
 
@@ -599,6 +600,7 @@ void PostShaders::evalAdaptHDR(IDirect3DSurface9* source, int environmentFlags, 
 
 // shaderTime - Applies all post processing shaders for the current frame
 void PostShaders::shaderTime(MGEShaderUpdateFunc updateVarsFunc, int environmentFlags, float frameTime) {
+    DrawStats::ScopedStage _ds(DrawStats::Post);
 
     if (isLoading.load()) {
         return; // Skip rendering this frame if still loading
@@ -665,6 +667,7 @@ void PostShaders::shaderTime(MGEShaderUpdateFunc updateVarsFunc, int environment
             s->SetTexture(EV_lastpass, doublebuffer.sourceTexture());
 
             effect->BeginPass(p);
+            DrawStats::count(2);
             device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
             effect->EndPass();
 
@@ -702,10 +705,12 @@ IDirect3DTexture9* PostShaders::borrowBuffer(int n) {
 
 // applyBlend - Utility function for distant land to render a full-screen shader
 void PostShaders::applyBlend() {
+    DrawStats::ScopedStage _ds(DrawStats::Post);
     // Render with vertex shader by using a different FVF for the same buffer
     device->SetFVF(fvfBlend);
     device->SetStreamSource(0, vbPost, 0, 32);
     device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    DrawStats::count(2);
     device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
 }
 

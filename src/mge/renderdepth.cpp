@@ -1,6 +1,7 @@
 
 #include "configuration.h"
 #include "distantland.h"
+#include "drawstats.h"
 #include "distantshader.h"
 #include "mwbridge.h"
 #include "phasetimers.h"
@@ -42,6 +43,7 @@ void DistantLand::updateVisibleSet(void* const* shapes, int count) {
 void DistantLand::renderDepth() {
     MGE_ZoneScopedN("renderDepth");
     MGE_SCOPED_TIMER("renderDepth");
+    DrawStats::ScopedStage _ds(DrawStats::Depth);
     auto mwBridge = MWBridge::get();
 
     // Switch to render target
@@ -72,6 +74,7 @@ void DistantLand::renderDepth() {
         effectDepth->BeginPass(PASS_CLEARDEPTH);
         device->SetVertexDeclaration(WaterDecl);
         device->SetStreamSource(0, vbFullFrame, 0, 12);
+        DrawStats::count(2);
         device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
         effectDepth->EndPass();
 
@@ -163,6 +166,7 @@ void DistantLand::renderDepth() {
 
 void DistantLand::renderDepthAdditional() {
     MGE_ZoneScopedN("renderDepthAdditional");
+    DrawStats::ScopedStage _ds(DrawStats::Depth);
     // Switch to render target
     RenderTargetSwitcher rtsw(texDepthFrame, surfDepthDepth);
 
@@ -221,6 +225,7 @@ void DistantLand::renderDepthRecorded() {
         device->SetStreamSource(0, i.vb, i.vbOffset, i.vbStride);
         device->SetIndices(i.ib);
         device->SetFVF(i.fvf);
+        DrawStats::count(i.primCount);
         device->DrawIndexedPrimitive(i.primType, i.baseIndex, i.minIndex, i.vertCount, i.startIndex, i.primCount);
     }
 }
@@ -290,6 +295,7 @@ void DistantLand::renderDepthFromCache(const D3DXMATRIX* gameView,
         device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kVBStride);
         device->SetIndices(e.ib);
         device->SetFVF(MGE::GeometryCache::kVBFVF);
+        DrawStats::count(e.triangleCount);
         device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, e.vertexCount, 0, e.triangleCount);
     });
     effectDepth->EndPass();
@@ -311,6 +317,7 @@ void DistantLand::renderDepthFromCache(const D3DXMATRIX* gameView,
         effectDepth->CommitChanges();
         device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kSkinnedVBStride);
         device->SetIndices(e.ib);
+        DrawStats::count(e.triangleCount);
         device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, e.vertexCount, 0, e.triangleCount);
     });
     effectDepth->EndPass();
@@ -345,6 +352,7 @@ void DistantLand::snapshotVisibleKeysForThread() {
 void DistantLand::renderThreadDepthCacheJob() {
     MGE_ZoneScopedN("RenderThread:job");
     MGE_DEVLOCK();   // hold the device lock for the whole pass
+    DrawStats::ScopedStage _ds(DrawStats::Depth);  // render-thread stage (thread_local)
 
     if (!device) {
         return;
@@ -378,6 +386,7 @@ void DistantLand::renderThreadDepthCacheJob() {
         effectDepth->BeginPass(PASS_CLEARDEPTH);
         device->SetVertexDeclaration(WaterDecl);
         device->SetStreamSource(0, vbFullFrame, 0, 12);
+        DrawStats::count(2);
         device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
         effectDepth->EndPass();
 

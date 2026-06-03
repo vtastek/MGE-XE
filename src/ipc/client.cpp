@@ -263,7 +263,10 @@ namespace IPC {
 
 	bool Client::getVisibleMeshesAllRanges(VecId visibleSet, std::uint8_t rangeCount,
 		const ViewFrustum (&frustums)[3], const D3DXVECTOR4 (&spheres)[3],
-		const DWORD (&setFlags)[3], VisibleSetSort sort)
+		const DWORD (&setFlags)[3], VisibleSetSort sort,
+		VecId reflSet, DWORD reflFlags,
+		const ViewFrustum* reflFrustum, const D3DXVECTOR4* reflSphere,
+		VisibleSetSort reflSort)
 	{
 		WAIT_FOR_PREVIOUS_COMMAND;
 
@@ -275,6 +278,14 @@ namespace IPC {
 			params.viewFrustum[i] = frustums[i];
 			params.viewSphere[i] = spheres[i];
 			params.setFlags[i] = setFlags[i];
+		}
+		// Optional piggybacked reflection query. reflFlags=0 ⇒ skipped server-side.
+		params.reflSet = reflSet;
+		params.reflFlags = reflFlags;
+		params.reflSort = reflSort;
+		if (reflFlags != 0) {
+			params.reflFrustum = *reflFrustum;
+			params.reflSphere = *reflSphere;
 		}
 		return beginRpc(Command::GetVisibleMeshesAllRanges);
 	}

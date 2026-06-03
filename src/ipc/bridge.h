@@ -189,6 +189,14 @@ namespace IPC {
     // Batched 3-range variant. rangeCount selects how many entries of the
     // arrays are live (1..3). Total size ≈ 3 × (96 + 16 + 4) + small =
     // ~360 bytes, well under the union budget.
+    //
+    // Optionally piggybacks a 4th, independent reflection-statics query into
+    // the same RPC (reflFlags != 0). The reflection set writes a SEPARATE
+    // output vec (reflSet) with its own frustum/sphere/sort, so the reflection
+    // server-cull overlaps the kickoff→drain head-start window instead of
+    // being a sequential worker RPC. reflFlags == 0 ⇒ no reflection query.
+    // Adds ~124 B (VecId + ViewFrustum + D3DXVECTOR4 + DWORD + sort) → ~484 B,
+    // still well under the union budget.
     struct GetMeshesAllRangesParameters {
         IN VecId visibleSet;
         IN VisibleSetSort sort;
@@ -196,6 +204,12 @@ namespace IPC {
         IN ViewFrustum viewFrustum[3];
         IN D3DXVECTOR4 viewSphere[3];
         IN DWORD setFlags[3];
+
+        IN VecId reflSet;
+        IN DWORD reflFlags;          // 0 ⇒ no reflection query this RPC
+        IN ViewFrustum reflFrustum;
+        IN D3DXVECTOR4 reflSphere;
+        IN VisibleSetSort reflSort;
     };
 
 	struct Parameters {

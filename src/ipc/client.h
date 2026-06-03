@@ -218,10 +218,18 @@ namespace IPC {
 		*        between kick-off and the matching waitForCompletion.
 		* @param rangeCount Number of active entries in the arrays (1..3).
 		*                   Entries with setFlags=0 are skipped server-side.
+		* @param reflSet Output vec for an optional piggybacked reflection-statics
+		*                query, run independently of the 3 statics ranges into its
+		*                own vec. reflFlags=0 (the default) disables it, leaving
+		*                existing callers unchanged.
 		*/
 		bool getVisibleMeshesAllRanges(VecId visibleSet, std::uint8_t rangeCount,
 			const ViewFrustum (&frustums)[3], const D3DXVECTOR4 (&spheres)[3],
-			const DWORD (&setFlags)[3], VisibleSetSort sort);
+			const DWORD (&setFlags)[3], VisibleSetSort sort,
+			VecId reflSet = InvalidVector, DWORD reflFlags = 0,
+			const ViewFrustum* reflFrustum = nullptr,
+			const D3DXVECTOR4* reflSphere = nullptr,
+			VisibleSetSort reflSort = VisibleSetSort::None);
 
 		/**
 		* @brief Asynchronously sort an already-populated visible set.

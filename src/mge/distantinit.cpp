@@ -32,6 +32,7 @@ bool DistantLand::renderThreadJobKicked = false;
 std::vector<D3DXVECTOR4> DistantLand::reflectionWaterRects;
 bool DistantLand::reflGateWanted = false;
 bool DistantLand::reflStaticsWanted = false;
+bool DistantLand::boxOccluderDebug = false;
 bool DistantLand::reflVisible = false;
 D3DXMATRIX  DistantLand::reflCullViewProj;
 D3DXMATRIX  DistantLand::reflCullProj;

@@ -1,6 +1,7 @@
 
 #include "distantland.h"
 #include "distantshader.h"
+#include "drawstats.h"
 #include "configuration.h"
 #include "msocclient.h"
 #include "mwbridge.h"
@@ -12,11 +13,14 @@
 #include "mge_tracy.h"
 
 #include <algorithm>
+#include <climits>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <queue>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -47,6 +51,58 @@ static std::vector<RenderMesh> g_meshValues;
 // traverses the live IPC window concurrently with the worker / main RPCs.
 static std::vector<RenderMesh> g_reflMeshValues;
 
+// Basin (watershed) pre-cull state. g_basinOccluded mirrors msocOccluded:
+// per-static, 1 = terrain-occluded by the watershed spill-height surface,
+// indexed in lockstep with g_meshValues. Filled by applyBasinCullToDistant-
+// Statics; consumed for the Phase-1 comparison diag and (when g_basinCullActive)
+// the front filter in the MSOC partition.
+static std::vector<std::uint8_t> g_basinOccluded;
+// Phase 1 (default): compute the basin verdict + comparison diag but do not
+// cull with it (proves conservativeness before any geometry is dropped).
+static bool g_basinEnabled    = true;
+// Basin front filter: drop basin-hidden statics before MSOC's grouping/sphere
+// passes and the depth replay. DISABLED — the watershed only reached ~1% beyond
+// MSOC (basinFront ~69 of ~6600 survivors), not worth the pass. The terrain-box
+// occluders (contributeTerrainBoxOccluders) now carry the terrain-occlusion role
+// through MSOC instead. Kept as a flag so the cull site reads the same way.
+static bool g_basinCullActive = false;
+// Basin debug visualization (watershed surface + culled-static boxes), Numpad6.
+// Separate on/off from culling because the extra draws add real draw calls.
+static bool g_drawBasinDebug = false;
+// Lock the eye fed into the basin flood + verdict (Numpad0) so a free camera can
+// fly into a basin to inspect it without the watershed recomputing/shifting.
+static bool        g_basinLockEye   = false;
+static D3DXVECTOR4 g_basinLockedEye = {0, 0, 0, 0};
+
+// Basin watershed surface: per-basinGrid-cell minimax spill height required to
+// reach the cell from the camera cell. Stored as a DENSE camera-relative grid
+// (not a hash map) — at fine resolutions the domain is ~10^5 cells, and an
+// unordered_map rebuild + per-static hash lookups cost >100ms. The dense array
+// is indexed by (cellX - originX, cellY - originY); the verdict bounds-checks
+// and reads it in O(1). Cached; rebuilt only when the camera cell changes, the
+// grid resolution changes, or the barrier map is rebuilt. Declared here (ahead of
+// renderBasinDebug) so the visualizer can read it.
+static std::vector<float> g_basinReqArr;   // dense req grid, g_basinReqDim^2
+static int    g_basinReqOriginX = 0;       // world cell of g_basinReqArr[0]
+static int    g_basinReqOriginY = 0;
+static int    g_basinReqDim     = 0;
+static int    g_basinCamCellX  = INT_MIN;
+static int    g_basinCamCellY  = INT_MIN;
+static float  g_basinReqGrid   = 0.0f;
+static size_t g_basinReqSrcSize = (size_t)-1;
+static bool   g_basinReqValid  = false;
+
+// Tunable basin barrier grid (world units). The watershed flood + the per-cell
+// "full-cell wall" test run at this resolution, decoupled from kCellSize. Finer
+// = the wall condition is achievable for real ridges (more conservative culling)
+// at higher flood cost + more frequent recompute. Numpad / halves, Numpad *
+// doubles, clamped to [kBasinGridMin, kBasinGridMax]. The conservativeness proof
+// holds at any resolution: a cell whose entire terrain min is above the sight-
+// line is a real wall; a sub-cell gap lowers that min and opens free passage.
+static constexpr float kBasinGridMin = 512.0f;
+static constexpr float kBasinGridMax = 8192.0f;
+static float g_basinGrid = 1024.0f;
+
 namespace {
 struct MSOCBasinDebugBox {
     float minX, maxX, minY, maxY, minZ, maxZ;
@@ -70,6 +126,33 @@ struct MSOCLineVertex {
 };
 
 constexpr DWORD fvfMSOCLine = D3DFVF_XYZ | D3DFVF_DIFFUSE;
+
+// Curtain debug overlay (Numpad3 cycle, 3rd state "ON + curtain debug").
+// contributeDistantLandOccluders stashes the pre-fixup curtain triangles here
+// (NDC x, NDC y, view-depth w) when capture is on; renderCurtainDebug draws them
+// as a screen-space overlay coloured by depth (near=red -> far=blue), then clears
+// the buffer. An empty buffer draws nothing, so the OFF and plain-ON cycle states
+// naturally show no overlay without any extra flag plumbing.
+struct CurtainDbgVert { float ndcX, ndcY, depthW; };
+static std::vector<CurtainDbgVert> g_curtainDbg;
+
+// Terrain box occluders (Numpad3 cycle, "boxes" states). Instead of the screen-
+// space horizon curtain, we voxelize the coarse terrain into per-cell boxes whose
+// TOP = the cell's minimum height (so each box is buried inside the real terrain
+// and never occludes a static sitting on the surface above it) and feed them to
+// MSOC as world-space occluders. Real 3D geometry → no per-vertex silhouette
+// aliasing, no single-wall pancake; the existing sphere/OBB tests cull against them
+// unchanged. Box footprint reuses the basin grid (g_basinMinH), extent is a radius
+// in game cells around the camera.
+static float g_boxRadiusCells = 4.0f;   // voxelization radius, in game cells
+struct BoxDbgAABB { float x0, y0, x1, y1, zTop, zBot; };
+static std::vector<BoxDbgAABB> g_boxDbg;
+
+// Pre-transformed (pixel-space) coloured vertex for the curtain overlay. The
+// curtain is a screen-space construct, so XYZRHW is the honest representation —
+// it lands exactly where the wall sits on this frame's image.
+struct CurtainScreenVertex { float x, y, z, rhw; DWORD color; };
+constexpr DWORD fvfCurtainScreen = D3DFVF_XYZRHW | D3DFVF_DIFFUSE;
 
 DWORD colorForMSOCVerdict(MSOCClient::TestResult verdict) {
     switch (verdict) {
@@ -97,24 +180,37 @@ float distanceSqToAABB2D(float px, float py, float minX, float maxX, float minY,
 // sky pass; cullDistantStatics_finish then collapses to a ~0 join.
 //
 // Synchronization mirrors scenegraph.cpp's worker idiom: one mutex + condvar
-// + bool flags. Two sync points:
+// + bool flags. Three sync points (the old single maskDone fence is split so
+// the early statics verdict isn't coupled to the late reflection cull):
 //   - channelDrained: the worker has finished its tryWaitForCompletion drain
-//     of the statics RPC, so the single-channel ipcClient is free for the
-//     main thread's land/grass/shadow/water RPCs. renderStage0 waits on this
-//     at entry before any main-thread ipcClient touch.
-//   - maskDone: the verdict core has finished writing msocOccluded.
-//     cullDistantStatics_finish waits on this in place of wait+applyMSOC.
+//     of the (now reflection-folded) statics RPC, so the single-channel
+//     ipcClient is free for the main thread's land/grass/shadow/water RPCs.
+//     renderStage0 waits on this at entry before any main-thread ipcClient touch.
+//   - staticsDone: the verdict core has finished writing msocOccluded.
+//     cullDistantStatics_finish waits on this in place of wait+applyMSOC. Signalled
+//     right after the verdict, BEFORE the reflection gate/cull, so the statics
+//     consumer (renderDepth) no longer waits on the reflection work.
+//   - reflDone: the reflection gate + survivor cull have finished. Joined just
+//     before renderWaterReflection (~10 passes later), where reflVisible /
+//     reflectionSurvivors are consumed.
 std::thread             g_cullThread;
 std::mutex              g_cullMtx;
 std::condition_variable g_cullCv;
 bool g_cullPending        = false; // a finish job has been signalled
 bool g_cullChannelDrained = false; // statics RPC drained off ipcClient
-bool g_cullMaskDone       = false; // verdict core finished; msocOccluded stable
+bool g_cullStaticsDone    = false; // verdict core finished; msocOccluded stable
+bool g_cullReflDone       = false; // reflection gate + survivor cull finished
 bool g_cullStop           = false; // shutdown request
 bool g_cullStarted        = false; // lazy-init flag
 
+// View-projection (screen space, mwView*mwProj) captured on the main thread at
+// signalCullFinish — frame-stable by then (GetTransform ran in frameSetupEarly).
+// Read by the worker's terrain-box occluder pass so it never touches the live
+// mwView/mwProj globals off the main thread.
+static D3DXMATRIX g_boxWorkerViewProj;
+
 // Per-frame summary stashed by the verdict core (worker) and read by the
-// main-thread debug tail's 60-frame log block. Stable once maskDone joins.
+// main-thread debug tail's 60-frame log block. Stable once staticsDone joins.
 struct MSOCCullDiag {
     bool     valid = false;
     unsigned setSize = 0;
@@ -123,6 +219,19 @@ struct MSOCCullDiag {
     int      groupsOccluded = 0;
     int      lowCulled = 0;
     int      sphereCulled = 0;
+    int      basinFrontCulled = 0; // statics removed by the Phase-2 basin filter
+                                   // (not counted in low/sphere — they continue
+                                   // before both passes)
+    // Basin pre-cull comparison vs MSOC (Phase 1 diagnostic).
+    float    basinGrid         = 0; // barrier grid resolution (world units)
+    unsigned basinReqCells     = 0; // cells in the watershed surface
+    int      basinCull         = 0; // statics the basin verdict would cull
+    int      basinCull_MSOCkeep = 0; // basin beyond MSOC (headroom OR false-cull
+                                     // — the cell-min flood is conservative, so
+                                     // these should be truly hidden; verify by
+                                     // looking for pop-in with Phase 2 active)
+    int      basinCull_MSOCcull = 0; // agreement (basin + MSOC both cull)
+    int      basinKeep_MSOCcull = 0; // MSOC headroom the basin can't reach
 };
 MSOCCullDiag g_msocCullDiag;
 } // namespace
@@ -136,6 +245,7 @@ static bool s_cullOnWorker = false;
 // renderSky - Render atmosphere scattering sky layer and other recorded draw calls on top
 void DistantLand::renderSky() {
     MGE_ZoneScopedN("renderSky");
+    DrawStats::ScopedStage _ds(DrawStats::Sky);
     // Recorded renders
     const auto& recordSky_const = recordSky;
     const int standardCloudVerts = 65, standardCloudTris = 112;
@@ -180,6 +290,7 @@ void DistantLand::renderSky() {
         device->SetStreamSource(0, i.vb, i.vbOffset, i.vbStride);
         device->SetIndices(i.ib);
         device->SetFVF(i.fvf);
+        DrawStats::count(i.primCount);
         device->DrawIndexedPrimitive(i.primType, i.baseIndex, i.minIndex, i.vertCount, i.startIndex, i.primCount);
     }
     effect->EndPass();
@@ -204,6 +315,7 @@ void DistantLand::renderSky() {
         device->SetStreamSource(0, i.vb, i.vbOffset, i.vbStride);
         device->SetIndices(i.ib);
         device->SetFVF(i.fvf);
+        DrawStats::count(i.primCount);
         device->DrawIndexedPrimitive(i.primType, i.baseIndex, i.minIndex, i.vertCount, i.startIndex, i.primCount);
     }
     effect->EndPass();
@@ -211,6 +323,7 @@ void DistantLand::renderSky() {
 
 void DistantLand::renderDistantLand(ID3DXEffect* e, const D3DXMATRIX* view, const D3DXMATRIX* proj) {
     MGE_SCOPED_TIMER("renderDistantLand");
+    DrawStats::ScopedStage _ds(DrawStats::Land);
     D3DXMATRIX world, viewproj = (*view) * (*proj);
     D3DXVECTOR4 viewsphere(eyePos.x, eyePos.y, eyePos.z, Configuration.DL.DrawDist * kCellSize);
 
@@ -288,9 +401,13 @@ void DistantLand::renderDistantLand(ID3DXEffect* e, const D3DXMATRIX* view, cons
 // projection and feeding `thc_horizon_test_and_update` once per triangle,
 // then call the reference's simplify + emit, fix up the vertex layout for
 // MOC's consumption, and submit via mwse_addPreTransformedOccluder.
-void DistantLand::contributeDistantLandOccluders() {
+void DistantLand::contributeDistantLandOccluders(bool captureDebug) {
     MGE_ZoneScopedN("contributeOccluders");
     MGE_SCOPED_TIMER("contributeDistantLandOccluders");
+
+    // Reset the debug-overlay capture every call; renderCurtainDebug consumes and
+    // clears it, but clear here too so a frame that bails early leaves no stale wall.
+    g_curtainDbg.clear();
 
     static int diagGuardFrame = 0;
     // Diagnostic loglines fire every 60th call AND only when the user
@@ -497,6 +614,18 @@ void DistantLand::contributeDistantLandOccluders() {
     //   stored_w = depth_w
     // (z slot ignored by MOC with the default stride=16, offW=12 layout.)
     const int vtxCount = triCount * 3;
+
+    // Stash the pre-fixup curtain (NDC x, NDC y, view-depth in z) for the in-world
+    // overlay before we overwrite the layout for MOC. Captured only when the
+    // Numpad3 cycle is in its debug state, so the cost is zero in normal use.
+    if (captureDebug) {
+        g_curtainDbg.reserve(vtxCount);
+        for (int i = 0; i < vtxCount; ++i) {
+            const thc_curtain_vertex_t& v = curtainVerts[i];
+            g_curtainDbg.push_back({ v.x, v.y, v.z });
+        }
+    }
+
     for (int i = 0; i < vtxCount; ++i) {
         thc_curtain_vertex_t& v = curtainVerts[i];
         const float d = v.z;
@@ -568,10 +697,13 @@ namespace {
 
 namespace {
 // Worker entry. Parks on the condvar until signalCullFinish wakes it, then:
-//   1. drains the statics RPC off the single IPC channel (frees the channel
-//      for the main thread's other RPCs) and signals channelDrained,
+//   1. drains the (reflection-folded) statics RPC off the single IPC channel
+//      and — while still owning the channel — materializes the reflection set,
+//      then signals channelDrained (frees the channel for the main thread),
 //   2. runs the pure verdict core over the freshly-drained set and signals
-//      maskDone.
+//      staticsDone (early fence; statics consumer no longer waits on reflection),
+//   3. runs the reflection gate + survivor cull and signals reflDone (late fence,
+//      joined just before renderWaterReflection).
 void cullWorkerLoop() {
 #ifdef TRACY_ENABLE
     tracy::SetThreadName("MGE MSOC cull");
@@ -584,19 +716,23 @@ void cullWorkerLoop() {
             g_cullPending = false;
         }
 
-        // Drain the statics RPC. Guarded (tryWaitForCompletion): an
-        // interleaved drain — there shouldn't be one before renderStage0's
-        // channel-free gate, but stay defensive — may already have completed
-        // it, in which case there's no pending RPC to wait on.
+        // Drain the statics RPC — which now also carries the folded reflection
+        // query (visExtraShared), so one drain covers both. Guarded
+        // (tryWaitForCompletion): an interleaved drain — there shouldn't be one
+        // before renderStage0's channel-free gate, but stay defensive — may
+        // already have completed it, in which case there's no pending RPC.
         {
             MGE_ZoneScopedN("cullWorker:drain");
             DistantLand::ipcClient.tryWaitForCompletion();
         }
 
-        // Reflection statics RPC, issued while the worker still owns the channel
-        // (before channelDrained releases it to the main thread). Its server cull
-        // overlaps the sky window instead of stalling the reflection draw later.
-        DistantLand::workerReflectionRPC();
+        // Materialize the reflection set out of its IPC window NOW, while the
+        // worker still owns the channel (before channelDrained releases it to the
+        // main thread). Preserves the flicker fix's "materialize before release"
+        // invariant; main never touches the live reflection window.
+        if (DistantLand::reflStaticsWanted) {
+            DistantLand::materializeReflectionMeshes();
+        }
 
         {
             std::lock_guard<std::mutex> lk(g_cullMtx);
@@ -612,14 +748,38 @@ void cullWorkerLoop() {
             DistantLand::applyMSOCToDistantStatics(DistantLand::visDistantShared);
         }
 
-        // Reflection gate + skipMask: pure CPU over the freshly-drained reflection
-        // set and the frame-stable terrain/MSOC inputs. Produces reflVisible +
-        // reflSkipMask, joined by main at the maskDone fence.
-        DistantLand::workerReflectionGateAndMask();
-
+        // Early fence: statics verdict done. Signalled BEFORE the reflection
+        // gate/cull AND before the terrain-box pass so cullDistantStatics_finish
+        // (renderDepth, ~10 passes before the reflection draw) joins on the verdict
+        // alone — it must not wait on the box occluders (those feed the mask two
+        // frames out; there is no in-frame consumer of them on the main thread).
         {
             std::lock_guard<std::mutex> lk(g_cullMtx);
-            g_cullMaskDone = true;
+            g_cullStaticsDone = true;
+        }
+        g_cullCv.notify_all();
+
+        // Contribute the terrain-box occluders to MSOC (next mask build, N+2
+        // latency). Off the main thread AND past the staticsDone fence, so its
+        // ~0.4ms lands in the reflection window's slack (finish:joinReflMask is
+        // ~0) instead of on the verdict-join critical path. Uses the frame-stable
+        // view-proj captured at signalCullFinish.
+        {
+            MGE_ZoneScopedN("cullWorker:terrainBoxes");
+            DistantLand::contributeTerrainBoxOccluders(
+                g_boxWorkerViewProj, DistantLand::boxOccluderDebug);
+        }
+
+        // Reflection gate + survivor cull: pure CPU over the materialized
+        // reflection set and the frame-stable terrain/MSOC inputs. Produces
+        // reflVisible + reflectionSurvivors, joined by main at the reflDone fence
+        // just before renderWaterReflection.
+        DistantLand::workerReflectionGateAndMask();
+
+        // Late fence: reflection cull done.
+        {
+            std::lock_guard<std::mutex> lk(g_cullMtx);
+            g_cullReflDone = true;
         }
         g_cullCv.notify_all();
     }
@@ -634,16 +794,65 @@ void ensureCullWorker() {
 }
 
 // Block until the worker has finished the verdict core (msocOccluded stable).
-void waitCullMaskReady() {
+void waitCullStaticsReady() {
     MGE_ZoneScopedN("finish:joinMask");
     std::unique_lock<std::mutex> lk(g_cullMtx);
-    g_cullCv.wait(lk, []{ return g_cullMaskDone; });
+    g_cullCv.wait(lk, []{ return g_cullStaticsDone; });
 }
 
-// Main-thread debug tail for the MSOC verdict: Numpad5 mask dump + the
-// per-60-frame cull summary. Touches input / MSOCClient::dumpMask / LOG, so
-// it stays off the worker; reads g_msocCullDiag, stable after the join.
+// Main-thread debug tail for the MSOC verdict: the per-60-frame cull summary.
+// Touches LOG, so it stays off the worker; reads g_msocCullDiag, stable after
+// the join. (The Numpad5 mask dump moved to DistantLand::debugDumpMSOCMask,
+// called after contributeDistantLandOccluders so the dump captures this frame's
+// horizon curtain instead of the pre-curtain mask.)
 void runMSOCDebugTail() {
+    if (!Configuration.LogDistantPipeline)
+        return;
+
+    static int diagFrameCounter = 0;
+    if (g_msocCullDiag.valid && (diagFrameCounter++ % 60) == 0) {
+        const MSOCCullDiag& d = g_msocCullDiag;
+        // total = everything removed from the render/depth set: group + sphere
+        // culls PLUS the basin front-culls (which skip both passes). survivors =
+        // setSize - total is what actually enters depth replay + render.
+        const int totalCulled = d.lowCulled + d.sphereCulled + d.basinFrontCulled;
+        const int survivors   = (int)d.setSize - totalCulled;
+        LOG::logline(
+            "-- MSOC cull: statics=%u  low=%u(groups=%u occ=%d culled=%d)"
+            "  sphere=%u(culled=%d)  basinFront=%d  total=%d(%d%%)  survivors=%d",
+            d.setSize,
+            d.setSize - d.nSphere, d.groupCount,
+            d.groupsOccluded, d.lowCulled,
+            d.nSphere, d.sphereCulled,
+            d.basinFrontCulled,
+            totalCulled,
+            d.setSize > 0 ? (totalCulled * 100) / d.setSize : 0,
+            survivors);
+        // Basin runs last on MSOC's survivors, so basinCull is the REAL number of
+        // statics MSOC would have drawn that the basin removes — its headroom over
+        // MSOC. Reported as a fraction of the pre-basin survivors (what MSOC kept).
+        const int msocCulled = d.basinKeep_MSOCcull;          // group + sphere culls
+        const int msocKept   = (int)d.setSize - msocCulled;   // survivors before basin
+        LOG::logline(
+            "-- MSOC basin: grid=%.0f  reqCells=%u  beyondMSOC=%d (%d%% of %d MSOC-survivors, "
+            "verify no pop)  MSOCculled=%d  [%s]",
+            d.basinGrid,
+            d.basinReqCells,
+            d.basinCull,
+            msocKept > 0 ? (d.basinCull * 100) / msocKept : 0,
+            msocKept,
+            msocCulled,
+            g_basinLockEye ? "eye:LOCK" : "eye:live");
+    }
+}
+} // namespace
+
+// Numpad5: dump the MSOC occlusion mask to a .pfm depth image. Called from
+// renderStage0 AFTER contributeDistantLandOccluders so the dump contains this
+// frame's freshly-submitted horizon curtain — the pre-curtain dump (where this
+// used to live, in cullDistantStatics_finish) could only ever show the previous
+// frame's stale curtain. Gated on LogDistantPipeline like the rest of the diag.
+void DistantLand::debugDumpMSOCMask() {
     if (!Configuration.LogDistantPipeline)
         return;
 
@@ -662,23 +871,7 @@ void runMSOCDebugTail() {
         LOG::logline("-- MSOC: Numpad5 mask dump %s %s", ok ? "->" : "FAILED for", fullPath);
         dumpPending = false;
     }
-
-    static int diagFrameCounter = 0;
-    if (g_msocCullDiag.valid && (diagFrameCounter++ % 60) == 0) {
-        const MSOCCullDiag& d = g_msocCullDiag;
-        const int totalCulled = d.lowCulled + d.sphereCulled;
-        LOG::logline(
-            "-- MSOC cull: statics=%u  low=%u(groups=%u occ=%d culled=%d)"
-            "  sphere=%u(culled=%d)  total=%d(%d%%)",
-            d.setSize,
-            d.setSize - d.nSphere, d.groupCount,
-            d.groupsOccluded, d.lowCulled,
-            d.nSphere, d.sphereCulled,
-            totalCulled,
-            d.setSize > 0 ? (totalCulled * 100) / d.setSize : 0);
-    }
 }
-} // namespace
 
 // Numpad8/2: raise/lower the MSOC low-static cutoff height (256-unit steps).
 // Read on the main thread so g_msocCutoffHeight is final before the verdict
@@ -696,16 +889,56 @@ void DistantLand::updateMSOCCutoffInput() {
         std::snprintf(msg, sizeof(msg), "MSOC cutoff: %.0f units", g_msocCutoffHeight);
         StatusOverlay::setStatus(msg);
     }
+    // Numpad6: toggle the basin debug visualization (watershed surface + culled
+    // boxes). Culling itself is always active; this only adds debug draws.
+    if (GetAsyncKeyState(VK_NUMPAD6) & 0x0001) {
+        g_drawBasinDebug = !g_drawBasinDebug;
+        char msg[64];
+        std::snprintf(msg, sizeof(msg), "Basin debug draw: %s",
+                      g_drawBasinDebug ? "ON" : "OFF");
+        StatusOverlay::setStatus(msg);
+    }
+    // Numpad0: lock/unlock the eye fed into the basin (flood source + verdict
+    // height). Locked → fly a free camera into a basin without it recomputing.
+    if (GetAsyncKeyState(VK_NUMPAD0) & 0x0001) {
+        g_basinLockEye = !g_basinLockEye;
+        if (g_basinLockEye) g_basinLockedEye = eyePos;
+        char msg[80];
+        std::snprintf(msg, sizeof(msg), "Basin eye: %s",
+                      g_basinLockEye ? "LOCKED (free-cam to inspect)" : "live");
+        StatusOverlay::setStatus(msg);
+    }
+    // Numpad / and *: halve / double the basin barrier grid (finer / coarser).
+    // Finer = more (conservative) culling at higher flood cost. The worker
+    // rebuilds the barrier map + re-floods on the next pass (grid-change cache
+    // miss). Clamped to [kBasinGridMin, kBasinGridMax].
+    if (GetAsyncKeyState(VK_DIVIDE) & 0x0001) {
+        g_basinGrid = std::max(kBasinGridMin, g_basinGrid * 0.5f);
+        char msg[64];
+        std::snprintf(msg, sizeof(msg), "Basin grid: %.0f (finer)", g_basinGrid);
+        StatusOverlay::setStatus(msg);
+    }
+    if (GetAsyncKeyState(VK_MULTIPLY) & 0x0001) {
+        g_basinGrid = std::min(kBasinGridMax, g_basinGrid * 2.0f);
+        char msg[64];
+        std::snprintf(msg, sizeof(msg), "Basin grid: %.0f (coarser)", g_basinGrid);
+        StatusOverlay::setStatus(msg);
+    }
 }
 
 // Dispatch the verdict pass to the cull worker. Called from frameSetupEarly
 // right after cullDistantStatics_kickoff issues the statics RPC.
 void DistantLand::signalCullFinish() {
     ensureCullWorker();
+    // Snapshot the screen view-proj for the worker's terrain-box occluder pass.
+    // mwView/mwProj were finalized in frameSetupEarly (GetTransform) just above
+    // this call, so this is frame-stable; the worker never reads the live globals.
+    g_boxWorkerViewProj = mwView * mwProj;
     {
         std::lock_guard<std::mutex> lk(g_cullMtx);
         g_cullChannelDrained = false;
-        g_cullMaskDone       = false;
+        g_cullStaticsDone    = false;
+        g_cullReflDone       = false;
         g_cullPending        = true;
     }
     s_cullOnWorker = true;
@@ -721,6 +954,18 @@ void DistantLand::waitCullChannelFree() {
     MGE_ZoneScopedN("waitCullChannelFree");
     std::unique_lock<std::mutex> lk(g_cullMtx);
     g_cullCv.wait(lk, []{ return g_cullChannelDrained; });
+}
+
+// Block until the worker has finished the reflection gate + survivor cull
+// (reflVisible / reflectionSurvivors stable). Joined just before
+// renderWaterReflection, ~10 passes after the early staticsDone fence — so in
+// steady state this collapses to ~0. No-op when the worker path is inactive.
+void DistantLand::waitCullReflReady() {
+    if (!s_cullOnWorker)
+        return;
+    MGE_ZoneScopedN("finish:joinReflMask");
+    std::unique_lock<std::mutex> lk(g_cullMtx);
+    g_cullCv.wait(lk, []{ return g_cullReflDone; });
 }
 
 // Tear the worker thread down on renderer release. Mirrors the SceneGraph
@@ -739,7 +984,8 @@ void DistantLand::joinCullWorker() {
     g_cullStop           = false;
     g_cullPending        = false;
     g_cullChannelDrained = false;
-    g_cullMaskDone       = false;
+    g_cullStaticsDone    = false;
+    g_cullReflDone       = false;
     s_cullOnWorker       = false;
 }
 
@@ -821,9 +1067,25 @@ void DistantLand::cullDistantStatics_kickoff(const D3DXMATRIX* view, const D3DXM
         // Cull-then-sort: the server no longer sorts the full ~13k visible
         // set (~1.35ms of drain wasted on meshes MSOC then occludes ~95% of).
         // applyMSOCToDistantStatics sorts only the ~500 survivors client-side.
-        ipcClient.getVisibleMeshesAllRanges(
-            visDistantSharedId, 3, frustums, spheres, setFlags,
-            VisibleSetSort::None);
+        //
+        // Fold the reflection-statics query (prepared in
+        // prepareReflectionCullForWorker just above) into this same RPC as a 4th,
+        // independent query writing visExtraShared. Its server-cull overlaps the
+        // kickoff→drain head-start window; the worker then drains both statics and
+        // reflection in one drain. reflStaticsWanted=false (no near-static
+        // reflections, or inline-fallback kickoff) ⇒ reflFlags=0, no fold.
+        if (reflStaticsWanted) {
+            ViewFrustum reflFrustum(&reflCullViewProj);
+            ipcClient.getVisibleMeshesAllRanges(
+                visDistantSharedId, 3, frustums, spheres, setFlags,
+                VisibleSetSort::None,
+                visExtraSharedId, VIS_STATIC, &reflFrustum, &reflCullViewSphere,
+                VisibleSetSort::ByState);
+        } else {
+            ipcClient.getVisibleMeshesAllRanges(
+                visDistantSharedId, 3, frustums, spheres, setFlags,
+                VisibleSetSort::None);
+        }
     } else {
         // Non-IPC path: synchronous quadtree work happens on the main
         // thread here. No pipelining benefit, but the bucket counters are
@@ -859,8 +1121,10 @@ void DistantLand::cullDistantStatics_finish() {
         // Verdict pass was dispatched to the cull worker at frameSetupEarly;
         // it drained the statics RPC and ran the verdict core during the sky
         // window. Here we only join — collapses to ~0 on the critical path.
-        // (The Numpad cutoff was read on main in frameSetupEarly.)
-        waitCullMaskReady();
+        // (The Numpad cutoff was read on main in frameSetupEarly.) This is the
+        // early staticsDone fence — it no longer waits on the reflection cull
+        // (that joins later at waitCullReflReady before renderWaterReflection).
+        waitCullStaticsReady();
     } else {
         // Inline path: non-IPC (synchronous quadtree cull already populated
         // visDistant in _kickoff), or the IPC fallback kickoff (menus /
@@ -893,6 +1157,10 @@ void DistantLand::cullDistantStatics_finish() {
                 applyMSOCToDistantStatics(visDistant);
             }
         }
+
+        // Inline path runs entirely on the main thread; the worker path
+        // contributes the terrain boxes on the cull thread instead.
+        contributeTerrainBoxOccluders(mwView * mwProj, boxOccluderDebug);
     }
 
     // Main-thread debug tail: Numpad5 mask dump + the per-60-frame MSOC cull
@@ -931,6 +1199,7 @@ void DistantLand::cullDistantStatics_finish() {
 void DistantLand::renderDistantStatics() {
     MGE_ZoneScopedN("renderDistantStatics");
     MGE_SCOPED_TIMER("renderDistantStatics");
+    DrawStats::ScopedStage _ds(DrawStats::Statics);
     if (!MWBridge::get()->IsExterior()) {
         // Set clipping to stop large architectural meshes (that don't match exactly)
         // from visible overdrawing and causing z-buffer occlusion
@@ -951,6 +1220,7 @@ void DistantLand::renderDistantStatics() {
 }
 
 void DistantLand::renderMSOCBasinBoundsDebug(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
+    DrawStats::ScopedStage _ds(DrawStats::Debug);
     if (GetAsyncKeyState(VK_NUMPAD9) & 0x0001) {
         g_drawMSOCBasinBounds = !g_drawMSOCBasinBounds;
         char msg[64];
@@ -1016,6 +1286,7 @@ void DistantLand::renderMSOCBasinBoundsDebug(const D3DXMATRIX* view, const D3DXM
     device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
     device->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
 
+    DrawStats::count((unsigned)(lineVerts.size() / 2));
     device->DrawPrimitiveUP(D3DPT_LINELIST, (UINT)(lineVerts.size() / 2),
                             lineVerts.data(), sizeof(MSOCLineVertex));
 
@@ -1023,11 +1294,271 @@ void DistantLand::renderMSOCBasinBoundsDebug(const D3DXMATRIX* view, const D3DXM
     stateSaved->Release();
 }
 
+// Basin watershed visualizer (Numpad6). Drawn over the live camera view:
+//   - cull-eligible watershed cells (req > eyeZ) as translucent quads at z=req,
+//     coloured yellow→red by how far the spill height rises above the (possibly
+//     locked) basin eye — the regions where statics CAN be basin-culled;
+//   - a red wireframe box around every basin-occluded static — what IS culled.
+// The gap between the two is statics sitting in cull-eligible cells whose own top
+// still pokes above req (or that the grid is too coarse to resolve). Z-test off so
+// basins hidden behind walls stay visible. Numpad0 locks the basin eye so a free
+// camera can roam without the field shifting. Mirrors renderMSOCBasinBoundsDebug.
+void DistantLand::renderBasinDebug(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
+    DrawStats::ScopedStage _ds(DrawStats::Debug);
+    if (!g_drawBasinDebug || !view || !proj) return;
+    if (!g_basinReqValid || g_basinReqDim == 0) return;
+
+    IDirect3DStateBlock9* stateSaved = nullptr;
+    if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &stateSaved)) || !stateSaved)
+        return;
+
+    const float eyeZ = (g_basinLockEye ? g_basinLockedEye : eyePos).z;
+    const float grid = g_basinReqGrid;
+    const int   dim  = g_basinReqDim;
+    const int   oX   = g_basinReqOriginX;
+    const int   oY   = g_basinReqOriginY;
+
+    // --- Surface: translucent quad per cull-eligible (req > eyeZ) cell ---
+    static std::vector<MSOCLineVertex> triVerts;
+    triVerts.clear();
+    auto pushTri = [](float ax, float ay, float az, float bx, float by, float bz,
+                      float cx, float cy, float cz, DWORD col) {
+        triVerts.push_back({ax, ay, az, col});
+        triVerts.push_back({bx, by, bz, col});
+        triVerts.push_back({cx, cy, cz, col});
+    };
+    for (int ly = 0; ly < dim; ++ly) {
+        for (int lx = 0; lx < dim; ++lx) {
+            const float req = g_basinReqArr[(size_t)ly * dim + lx];
+            if (!std::isfinite(req) || req <= eyeZ) continue;  // only basins above the eye
+            const float s = std::min(1.0f, (req - eyeZ) / 4096.0f);
+            const DWORD col = D3DCOLOR_ARGB(110, 255, (int)(255 * (1.0f - s)), 0);
+            const float x0 = (float)(oX + lx) * grid, x1 = x0 + grid;
+            const float y0 = (float)(oY + ly) * grid, y1 = y0 + grid;
+            pushTri(x0, y0, req, x1, y0, req, x1, y1, req, col);
+            pushTri(x0, y0, req, x1, y1, req, x0, y1, req, col);
+        }
+    }
+
+    // --- Culled-static boxes (red wireframe) ---
+    static std::vector<MSOCLineVertex> lineVerts;
+    lineVerts.clear();
+    auto pushLine = [](float ax, float ay, float az, float bx, float by, float bz, DWORD c) {
+        lineVerts.push_back({ax, ay, az, c});
+        lineVerts.push_back({bx, by, bz, c});
+    };
+    const DWORD boxCol = D3DCOLOR_XRGB(255, 48, 48);
+    const size_t nBoxes = std::min(g_basinOccluded.size(), g_meshValues.size());
+    for (size_t i = 0; i < nBoxes; ++i) {
+        if (!g_basinOccluded[i]) continue;
+        const D3DXVECTOR3& c = g_meshValues[i].sphere.center;
+        const float r = g_meshValues[i].sphere.radius;
+        const float x0 = c.x - r, x1 = c.x + r, y0 = c.y - r, y1 = c.y + r, z0 = c.z - r, z1 = c.z + r;
+        pushLine(x0, y0, z0, x1, y0, z0, boxCol); pushLine(x1, y0, z0, x1, y1, z0, boxCol);
+        pushLine(x1, y1, z0, x0, y1, z0, boxCol); pushLine(x0, y1, z0, x0, y0, z0, boxCol);
+        pushLine(x0, y0, z1, x1, y0, z1, boxCol); pushLine(x1, y0, z1, x1, y1, z1, boxCol);
+        pushLine(x1, y1, z1, x0, y1, z1, boxCol); pushLine(x0, y1, z1, x0, y0, z1, boxCol);
+        pushLine(x0, y0, z0, x0, y0, z1, boxCol); pushLine(x1, y0, z0, x1, y0, z1, boxCol);
+        pushLine(x1, y1, z0, x1, y1, z1, boxCol); pushLine(x0, y1, z0, x0, y1, z1, boxCol);
+    }
+
+    D3DXMATRIX identity;
+    D3DXMatrixIdentity(&identity);
+    device->SetVertexDeclaration(nullptr);
+    device->SetVertexShader(nullptr);
+    device->SetPixelShader(nullptr);
+    device->SetFVF(fvfMSOCLine);
+    device->SetTransform(D3DTS_WORLD, &identity);
+    device->SetTransform(D3DTS_VIEW, view);
+    device->SetTransform(D3DTS_PROJECTION, proj);
+    device->SetTexture(0, nullptr);
+    device->SetRenderState(D3DRS_LIGHTING, FALSE);
+    device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+    device->SetRenderState(D3DRS_ZENABLE, FALSE);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+    device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    device->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
+
+    if (!triVerts.empty()) {
+        device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+        device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+        device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+        DrawStats::count((unsigned)(triVerts.size() / 3));
+        device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, (UINT)(triVerts.size() / 3),
+                                triVerts.data(), sizeof(MSOCLineVertex));
+    }
+    if (!lineVerts.empty()) {
+        device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+        DrawStats::count((unsigned)(lineVerts.size() / 2));
+        device->DrawPrimitiveUP(D3DPT_LINELIST, (UINT)(lineVerts.size() / 2),
+                                lineVerts.data(), sizeof(MSOCLineVertex));
+    }
+
+    stateSaved->Apply();
+    stateSaved->Release();
+}
+
+// Curtain overlay (Numpad3 cycle, "ON + curtain debug"). Draws the horizon-curtain
+// triangles that were submitted to MSOC this frame as a translucent screen-space
+// fill, coloured by the wall's view depth — near walls red, far walls blue — so you
+// can see which hills produced a curtain and how far back each wall hangs. The
+// curtain is a screen-space construct built from this frame's view, so an XYZRHW
+// overlay lands exactly on the hills it represents. Consumes and clears g_curtainDbg,
+// so the OFF / plain-ON cycle states (which never fill it) draw nothing.
+void DistantLand::renderCurtainDebug() {
+    if (g_curtainDbg.empty() || !device) {
+        g_curtainDbg.clear();
+        return;
+    }
+
+    DrawStats::ScopedStage _ds(DrawStats::Debug);
+
+    // XYZRHW is post-viewport, so map NDC -> pixels with the live viewport.
+    D3DVIEWPORT9 vp;
+    if (FAILED(device->GetViewport(&vp))) { g_curtainDbg.clear(); return; }
+
+    // Depth normaliser: far reference = the distant-land draw distance.
+    const float farRef = std::max(1.0f, (float)(Configuration.DL.DrawDist * kCellSize));
+
+    static std::vector<CurtainScreenVertex> sv;
+    sv.clear();
+    sv.reserve(g_curtainDbg.size());
+    for (const CurtainDbgVert& c : g_curtainDbg) {
+        const float px = (c.ndcX * 0.5f + 0.5f) * (float)vp.Width;       // NDC x -> pixel
+        const float py = (1.0f - (c.ndcY * 0.5f + 0.5f)) * (float)vp.Height; // NDC y up -> pixel y down
+
+        float t = c.depthW / farRef;                 // 0 near .. 1 far
+        if (t < 0.0f) t = 0.0f; else if (t > 1.0f) t = 1.0f;
+        const DWORD r = (DWORD)(255.0f * (1.0f - t));
+        const DWORD b = (DWORD)(255.0f * t);
+        const DWORD color = (0x80u << 24) | (r << 16) | (0x20u << 8) | b;   // ARGB, 50% alpha
+
+        sv.push_back({ px, py, 0.5f, 1.0f, color });
+    }
+
+    IDirect3DStateBlock9* stateSaved = nullptr;
+    if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &stateSaved)) || !stateSaved) {
+        g_curtainDbg.clear();
+        return;
+    }
+
+    device->SetVertexDeclaration(nullptr);
+    device->SetVertexShader(nullptr);
+    device->SetPixelShader(nullptr);
+    device->SetFVF(fvfCurtainScreen);
+    device->SetTexture(0, nullptr);
+    device->SetRenderState(D3DRS_LIGHTING, FALSE);
+    device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+    device->SetRenderState(D3DRS_ZENABLE, FALSE);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+    device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+    device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+    device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+    device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    device->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
+
+    DrawStats::count((unsigned)(sv.size() / 3));
+    device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, (UINT)(sv.size() / 3),
+                            sv.data(), sizeof(CurtainScreenVertex));
+
+    stateSaved->Apply();
+    stateSaved->Release();
+    g_curtainDbg.clear();
+}
+
+// Terrain box occluder overlay (Numpad3 cycle, "boxes + debug"). Draws the top lip
+// of each voxel box submitted to MSOC this frame as a world-space wireframe, colour-
+// coded by the box's distance from the eye (near=red -> far=blue), so you can see the
+// voxelized terrain the occlusion is actually built from. Consumes/clears g_boxDbg.
+void DistantLand::renderBoxOccluderDebug(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
+    if (g_boxDbg.empty() || !view || !proj || !device) {
+        g_boxDbg.clear();
+        return;
+    }
+
+    DrawStats::ScopedStage _ds(DrawStats::Debug);
+
+    const float farRef = std::max(1.0f, (float)(Configuration.DL.DrawDist * kCellSize));
+
+    static std::vector<MSOCLineVertex> lineVerts;
+    lineVerts.clear();
+    lineVerts.reserve(g_boxDbg.size() * 24);
+
+    auto pushLine = [&](float ax, float ay, float az, float bx, float by, float bz, DWORD color) {
+        lineVerts.push_back({ ax, ay, az, color });
+        lineVerts.push_back({ bx, by, bz, color });
+    };
+
+    for (const BoxDbgAABB& b : g_boxDbg) {
+        const float cx = 0.5f * (b.x0 + b.x1), cy = 0.5f * (b.y0 + b.y1);
+        const float ddx = cx - eyePos.x, ddy = cy - eyePos.y;
+        float t = sqrtf(ddx * ddx + ddy * ddy) / farRef;
+        if (t < 0.0f) t = 0.0f; else if (t > 1.0f) t = 1.0f;
+        const DWORD r  = (DWORD)(255.0f * (1.0f - t));
+        const DWORD bl = (DWORD)(255.0f * t);
+        const DWORD color = 0xFF000000u | (r << 16) | (0x20u << 8) | bl;
+
+        const float zt = b.zTop;
+        const float zd = b.zBot;   // full box extent (down to the occluder floor)
+        // top rectangle
+        pushLine(b.x0, b.y0, zt, b.x1, b.y0, zt, color);
+        pushLine(b.x1, b.y0, zt, b.x1, b.y1, zt, color);
+        pushLine(b.x1, b.y1, zt, b.x0, b.y1, zt, color);
+        pushLine(b.x0, b.y1, zt, b.x0, b.y0, zt, color);
+        // bottom rectangle
+        pushLine(b.x0, b.y0, zd, b.x1, b.y0, zd, color);
+        pushLine(b.x1, b.y0, zd, b.x1, b.y1, zd, color);
+        pushLine(b.x1, b.y1, zd, b.x0, b.y1, zd, color);
+        pushLine(b.x0, b.y1, zd, b.x0, b.y0, zd, color);
+        // corner drops
+        pushLine(b.x0, b.y0, zt, b.x0, b.y0, zd, color);
+        pushLine(b.x1, b.y0, zt, b.x1, b.y0, zd, color);
+        pushLine(b.x1, b.y1, zt, b.x1, b.y1, zd, color);
+        pushLine(b.x0, b.y1, zt, b.x0, b.y1, zd, color);
+    }
+
+    IDirect3DStateBlock9* stateSaved = nullptr;
+    if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &stateSaved)) || !stateSaved) {
+        g_boxDbg.clear();
+        return;
+    }
+
+    D3DXMATRIX identity;
+    D3DXMatrixIdentity(&identity);
+    device->SetVertexDeclaration(nullptr);
+    device->SetVertexShader(nullptr);
+    device->SetPixelShader(nullptr);
+    device->SetFVF(fvfMSOCLine);
+    device->SetTransform(D3DTS_WORLD, &identity);
+    device->SetTransform(D3DTS_VIEW, view);
+    device->SetTransform(D3DTS_PROJECTION, proj);
+    device->SetTexture(0, nullptr);
+    device->SetRenderState(D3DRS_LIGHTING, FALSE);
+    device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+    device->SetRenderState(D3DRS_ZENABLE, FALSE);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+    device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    device->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
+
+    DrawStats::count((unsigned)(lineVerts.size() / 2));
+    device->DrawPrimitiveUP(D3DPT_LINELIST, (UINT)(lineVerts.size() / 2),
+                            lineVerts.data(), sizeof(MSOCLineVertex));
+
+    stateSaved->Apply();
+    stateSaved->Release();
+    g_boxDbg.clear();
+}
+
 // Water-reflection proxy visualizer (Numpad5). Draws the per-cell water slabs
 // tested by isReflectionWaterVisible(), coloured by MSOC verdict (green visible,
 // red occluded, blue view-culled), depth-disabled so occluded slabs are still
 // inspectable behind buildings. Mirrors renderMSOCBasinBoundsDebug.
 void DistantLand::renderWaterProxyBoundsDebug(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
+    DrawStats::ScopedStage _ds(DrawStats::Debug);
     if (GetAsyncKeyState(VK_NUMPAD5) & 0x0001) {
         g_drawWaterProxyBounds = !g_drawWaterProxyBounds;
         char msg[64];
@@ -1093,6 +1624,7 @@ void DistantLand::renderWaterProxyBoundsDebug(const D3DXMATRIX* view, const D3DX
     device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
     device->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
 
+    DrawStats::count((unsigned)(lineVerts.size() / 2));
     device->DrawPrimitiveUP(D3DPT_LINELIST, (UINT)(lineVerts.size() / 2),
                             lineVerts.data(), sizeof(MSOCLineVertex));
 
@@ -1125,6 +1657,15 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
     while (!staticSet.AtEnd())
         g_meshValues.push_back(staticSet.Next());
     const unsigned setSize = (unsigned)g_meshValues.size();
+
+    // Basin (watershed) pre-cull — DISABLED (g_basinCullActive=false). The
+    // terrain-box occluders now carry the terrain-occlusion role through MSOC.
+    // Only flood the spill-height surface when the basin cull (Pass 3) or its
+    // debug viz is actually on; otherwise the Dijkstra is wasted work. The box
+    // pass owns g_basinMinH independently, so skipping this doesn't starve it.
+    if (g_basinCullActive || g_drawBasinDebug)
+        buildBasinRequiredHeight();
+    g_basinOccluded.assign(setSize, 0);
 
     // Cull-then-sort tail. Build visDistantSurvivors as the pointer subset of
     // g_meshValues that survived (msocOccluded[idx]==0, or every mesh when the
@@ -1214,18 +1755,49 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
     static std::vector<std::uint16_t>           staticGroupIdx;
     // Camera-relative cell → groupIdx+1 (0 = empty), cleared each frame.
     static std::vector<std::uint16_t>           gridCellToGroup;
-    // Sphere batch for high statics and near low statics.
+    // Sphere batch for high statics, near low statics, AND the members of
+    // VISIBLE groups (two-level hierarchy: the group OBB is only a cheap reject;
+    // anything its slab can't prove occluded falls through to a precise per-static
+    // sphere test, so the survivor set is the sphere-precise set regardless of the
+    // cutoff). sphereIdx maps each 4-float sphere back to its static index, so the
+    // result mapping is order-independent (no fragile 0xFFFF-in-iteration scan).
     static std::vector<float>                   sphereBatch;
+    static std::vector<unsigned>                sphereIdx;
     static std::vector<MSOCClient::TestResult>  sphereResults;
 
     groups.clear();
     groups.reserve(64);
     sphereBatch.clear();
+    sphereIdx.clear();
     staticGroupIdx.assign(setSize, 0xFFFF);
     gridCellToGroup.assign((size_t)gridDim * gridDim, 0);
 
-    // Pass 1: partition statics. Low → fixed cell group (O(1)).  High → sphere batch.
-    // Iterates the contiguous g_meshValues snapshot (not the windowed view).
+    // Basin verdict (used as the MIDDLE pipeline stage in Pass 2b). Conservative
+    // test req > max(eyeZ, top), with top = the OBB z-max (tight) not the loose
+    // sphere top, and eyeZ possibly locked (Numpad0) for inspection.
+    const bool  basinReady = g_basinEnabled && g_basinReqValid && g_basinReqDim > 0;
+    const float basinEyeZ  = (g_basinLockEye ? g_basinLockedEye : eyePos).z;
+    const float bGrid = g_basinReqGrid;
+    const int   bDim  = g_basinReqDim, bOX = g_basinReqOriginX, bOY = g_basinReqOriginY;
+    auto basinHidden = [&](unsigned idx) -> bool {
+        if (!basinReady) return false;
+        const RenderMesh& m = g_meshValues[idx];
+        const int lx = (int)floorf(m.sphere.center.x / bGrid) - bOX;
+        const int ly = (int)floorf(m.sphere.center.y / bGrid) - bOY;
+        if (lx < 0 || lx >= bDim || ly < 0 || ly >= bDim) return false;
+        const float req = g_basinReqArr[(size_t)ly * bDim + lx];
+        if (!std::isfinite(req)) return false;
+        const D3DXVECTOR3& bc = m.box.center;
+        const float top = bc.z + fabsf(m.box.vx.z) + fabsf(m.box.vy.z) + fabsf(m.box.vz.z);
+        return req > std::max(basinEyeZ, top);
+    };
+
+    // Pass 1: partition statics into group cells. Low in-grid → fixed cell group
+    // (O(1)). High / near-handoff / out-of-grid stay 0xFFFF (sphere candidates).
+    // No sphere batch is built here — that happens in Pass 2b AFTER the group
+    // cheap-reject and the basin filter, so neither cheap-rejected nor basin-
+    // hidden statics ever enter the (expensive) sphere batch.
+    int diagBasinFrontCulled = 0;
     {
         MGE_SCOPED_TIMER("applyMSOCToDistantStatics:partition");
         for (unsigned idx = 0; idx < setSize; ++idx) {
@@ -1240,17 +1812,13 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
                 const float x0 = (float)gx * gSize;
                 const float y0 = (float)gy * gSize;
 
-                // Near handoff / out-of-grid → per-static sphere path.
+                // Near handoff / out-of-grid → stays a sphere candidate (0xFFFF).
                 const float minDistSq = distanceSqToAABB2D(
                     eyePos.x, eyePos.y, x0, x0 + gSize, y0, y0 + gSize);
                 const int lx = gx - eyeGx + gridRadius;
                 const int ly = gy - eyeGy + gridRadius;
                 if (minDistSq <= groupCullStartDistSq ||
                     lx < 0 || lx >= gridDim || ly < 0 || ly >= gridDim) {
-                    sphereBatch.push_back(sx);
-                    sphereBatch.push_back(sy);
-                    sphereBatch.push_back(sz);
-                    sphereBatch.push_back(sr);
                     continue;
                 }
 
@@ -1264,13 +1832,8 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
                     gridCellToGroup[cell] = slot;
                 }
                 staticGroupIdx[idx] = (std::uint16_t)(slot - 1);
-            } else {
-                // High static: per-static sphere test.
-                sphereBatch.push_back(sx);
-                sphereBatch.push_back(sy);
-                sphereBatch.push_back(sz);
-                sphereBatch.push_back(sr);
             }
+            // else: high static → sphere candidate (staticGroupIdx stays 0xFFFF).
         }
     }
 
@@ -1297,35 +1860,61 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
         }
     }
 
-    // Pass 2b: sphere batch for high statics and near low statics.
-    // Results land directly in msocOccluded via staticGroupIdx == 0xFFFF slots.
+    // Pass 2b: group cheap-reject → sphere batch. Occluded group ⇒ slab fully
+    // hidden ⇒ cull every member (free). Otherwise (visible-group member or
+    // 0xFFFF high/near) ⇒ append to the precise sphere batch. Basin runs LAST
+    // (Pass 3), so it isn't involved here.
+    int diagLowCulled = 0;
+    {
+        MGE_SCOPED_TIMER("applyMSOCToDistantStatics:groupResolve");
+        for (unsigned idx = 0; idx < setSize; ++idx) {
+            const std::uint16_t gIdx = staticGroupIdx[idx];
+            if (gIdx < groups.size() &&
+                groups[gIdx].verdict == MSOCClient::ResultOccluded) {
+                msocOccluded[idx] = 1;          // group cheap-reject
+                ++diagLowCulled;
+                continue;
+            }
+            const RenderMesh& m = g_meshValues[idx];
+            sphereBatch.push_back(m.sphere.center.x);
+            sphereBatch.push_back(m.sphere.center.y);
+            sphereBatch.push_back(m.sphere.center.z);
+            sphereBatch.push_back(m.sphere.radius);
+            sphereIdx.push_back(idx);
+        }
+    }
+
+    // Pass 2c: classify the sphere batch (group-cull + basin survivors) and map
+    // each result back via sphereIdx (order-independent — robust to the partition
+    // and Pass-2b gaps where statics were group- or basin-culled).
     int diagSphereCulled = 0;
     if (!sphereBatch.empty()) {
         MGE_SCOPED_TIMER("applyMSOCToDistantStatics:sphereBatch");
         const int nSpheres = (int)(sphereBatch.size() / 4);
         sphereResults.assign(nSpheres, MSOCClient::ResultVisible);
         MSOCClient::classifySphereBatch(sphereBatch.data(), nSpheres, sphereResults.data());
-        // Map results back: sphere-tested statics appear in staticGroupIdx order (0xFFFF slots).
-        int si = 0;
-        for (unsigned idx = 0; idx < setSize; ++idx) {
-            if (staticGroupIdx[idx] == 0xFFFF) {
-                if (sphereResults[si] == MSOCClient::ResultOccluded) {
-                    msocOccluded[idx] = 1;
-                    ++diagSphereCulled;
-                }
-                ++si;
+        for (int si = 0; si < nSpheres; ++si) {
+            if (sphereResults[si] == MSOCClient::ResultOccluded) {
+                msocOccluded[sphereIdx[si]] = 1;
+                ++diagSphereCulled;
             }
         }
     }
 
-    // Pass 3: propagate group verdicts — direct array lookup, no recomputation.
-    int diagLowCulled = 0;
-    {
+    // Pass 3: BASIN LAST — run only on statics MSOC KEPT (msocOccluded==0). Every
+    // basin cull here is a static the group + sphere tests would have DRAWN, so
+    // diagBasinFrontCulled is the genuine "culls beyond MSOC" headroom — no
+    // circular self-comparison. It removes them from the survivor set (fewer draw
+    // calls, the main-thread saving); it no longer offloads sphere tests. The
+    // box-top conservative test (req > max(eyeZ, OBB-top)) is unchanged.
+    if (g_basinCullActive && basinReady) {
+        MGE_SCOPED_TIMER("applyMSOCToDistantStatics:basin");
         for (unsigned idx = 0; idx < setSize; ++idx) {
-            const std::uint16_t gIdx = staticGroupIdx[idx];
-            if (gIdx != 0xFFFF && groups[gIdx].verdict == MSOCClient::ResultOccluded) {
-                msocOccluded[idx] = 1;
-                ++diagLowCulled;
+            if (msocOccluded[idx]) continue;        // already culled by group/sphere
+            if (basinHidden(idx)) {
+                g_basinOccluded[idx] = 1;
+                msocOccluded[idx]    = 1;
+                ++diagBasinFrontCulled;
             }
         }
     }
@@ -1346,6 +1935,17 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
         g_msocCullDiag.groupsOccluded = diagGroupsOccluded;
         g_msocCullDiag.lowCulled      = diagLowCulled;
         g_msocCullDiag.sphereCulled   = diagSphereCulled;
+        g_msocCullDiag.basinFrontCulled = diagBasinFrontCulled;
+
+        // Basin runs LAST on MSOC survivors, so every basin cull is a static MSOC
+        // KEPT → all of it is real "beyond-MSOC" headroom, none "agree". No
+        // circular scan needed; the counts are exact by construction.
+        g_msocCullDiag.basinGrid          = g_basinReqGrid;
+        g_msocCullDiag.basinReqCells      = (unsigned)((size_t)g_basinReqDim * g_basinReqDim);
+        g_msocCullDiag.basinCull          = diagBasinFrontCulled;
+        g_msocCullDiag.basinCull_MSOCkeep = diagBasinFrontCulled;          // = beyond MSOC
+        g_msocCullDiag.basinCull_MSOCcull = 0;
+        g_msocCullDiag.basinKeep_MSOCcull = diagLowCulled + diagSphereCulled; // MSOC's own
     }
 
     // Compact + sort the ~500 survivors now that msocOccluded is final.
@@ -1372,6 +1972,13 @@ static std::unordered_map<uint64_t, float> g_cellMinH;   // key: 8192-cell -> mi
 static std::unordered_map<uint64_t, float> g_fineMinH;   // key: fine-cell -> min Z
 static size_t g_terrainMinHSrcSize = (size_t)-1;         // landMeshes.size() built from
 
+// Per-g_basinGrid terrain minimum (the watershed barrier map). Rebuilt when the
+// grid resolution changes or landMeshes changes; far cheaper than re-flooding,
+// so it's kept separate from the per-camera-cell flood cache below.
+static std::unordered_map<uint64_t, float> g_basinMinH;  // key: basinGrid-cell -> min Z
+static float  g_basinMinHGrid    = 0.0f;                 // grid the map was built at
+static size_t g_basinMinHSrcSize = (size_t)-1;           // landMeshes.size() built from
+
 static inline uint64_t waterGridKey(int gx, int gy) {
     return ((uint64_t)(uint32_t)gx << 32) | (uint32_t)gy;
 }
@@ -1396,6 +2003,355 @@ static void buildTerrainMinHeight(
     g_terrainMinHSrcSize = landMeshes.size();
     LOG::logline("-- [water-gate] terrain min-height built: %zu cells, %zu fine tiles",
                  g_cellMinH.size(), g_fineMinH.size());
+}
+
+// Build the basin barrier map (terrain MIN per g_basinGrid cell) at the given
+// resolution. Rebuilt only on grid-change or landMeshes-change (key press / land
+// reload), so the per-frame flood never re-bins vertices.
+static void buildBasinMinHeight(
+    const std::unordered_map<IDirect3DVertexBuffer9*, DistantLand::LandMeshCache>& landMeshes,
+    float grid) {
+    g_basinMinH.clear();
+    for (const auto& kv : landMeshes) {
+        for (const D3DXVECTOR3& p : kv.second.positions) {
+            const uint64_t k = waterGridKey((int)floorf(p.x / grid), (int)floorf(p.y / grid));
+            auto it = g_basinMinH.find(k);
+            if (it == g_basinMinH.end()) g_basinMinH.emplace(k, p.z);
+            else if (p.z < it->second)   it->second = p.z;
+        }
+    }
+    g_basinMinHGrid    = grid;
+    g_basinMinHSrcSize = landMeshes.size();
+    LOG::logline("-- [basin] barrier map built: grid=%.0f, %zu cells", grid, g_basinMinH.size());
+}
+
+// Terrain box occluders — voxelize the terrain min-height grid into boxes (top =
+// cell min height, so each box is buried inside the real terrain and never occludes
+// a static on the surface) and submit them to MSOC. Two reductions keep the batch
+// inside the occluder budget while preserving a fine grid:
+//   1. FRUSTUM CULL — only cells inside the lateral view frustum are considered, so
+//      the full radius disk collapses to the visible wedge.
+//   2. GREEDY MERGE — adjacent in-frustum cells in the same height bucket are merged
+//      into larger rectangles (one box each), so flat terrain costs a handful of
+//      boxes instead of thousands. Merged box top = MIN over its cells (conservative).
+// Owns the min-height map (builds g_basinMinH itself, cached on grid/landMeshes —
+// no dependency on the basin flood, which is now disabled). Submitted via
+// addPreTransformedOccluder (the path that lands in the queryable mask). The
+// caller passes a frame-stable view-proj so this can run on the cull worker.
+// captureDebug stashes the merged AABBs for the in-world overlay.
+void DistantLand::contributeTerrainBoxOccluders(const D3DXMATRIX& viewProj, bool captureDebug) {
+    MGE_ZoneScopedN("contributeTerrainBoxes");
+    MGE_SCOPED_TIMER("contributeTerrainBoxOccluders");
+
+    g_boxDbg.clear();
+
+    if (!Configuration.UseOcclusionCulling || !MSOCClient::isAvailable())
+        return;
+    if (!MWBridge::get()->IsExterior())
+        return;
+
+    // Ensure the min-height barrier map is current (cheap; rebuilt only on grid /
+    // landMeshes change). The boxes are this map voxelized.
+    const float grid = g_basinGrid;
+    if (g_basinMinHGrid != grid || g_basinMinHSrcSize != landMeshes.size())
+        buildBasinMinHeight(landMeshes, grid);
+    if (g_basinMinH.empty())
+        return;
+
+    const int   camGX  = (int)floorf(eyePos.x / grid);
+    const int   camGY  = (int)floorf(eyePos.y / grid);
+    const int   radius = std::max(1, (int)ceilf(g_boxRadiusCells * kCellSize / grid));
+    const int   W = 2 * radius + 1, H = 2 * radius + 1;
+    const int   baseGX = camGX - radius, baseGY = camGY - radius;
+
+    constexpr float kBoxDrop = 16384.0f;   // pillar depth (always inside heightfield)
+    constexpr float kEmpty   = -1e30f;     // "no terrain / frustum-culled" sentinel
+
+    // Box floor. A fixed drop from the top is NOT enough: for a tall ridge,
+    // zTop - kBoxDrop can sit ABOVE water level, so a static at water level behind
+    // the ridge pokes out below the box and the sphere/group OBB occlusion test
+    // (which needs the whole bounds covered) fails to cull it. So the floor also
+    // reaches at least kBoxFloorBias below the water level — covering anything
+    // sitting at or near water level — whichever is deeper. Extending the box
+    // DOWN is always conservative: below the cell min it's still inside the
+    // heightfield, so it can only occlude things genuinely behind terrain.
+    const float waterLevel    = (float)MWBridge::get()->WaterLevel();
+    constexpr float kBoxFloorBias = 8192.0f;
+    auto boxFloor = [&](float zTop) {
+        return std::min(zTop - kBoxDrop, waterLevel - kBoxFloorBias);
+    };
+
+    // Lateral frustum planes (left/right/bottom/top) from the passed view-proj
+    // (screen-space mwView*mwProj). We skip the near/far planes: MOC has no far
+    // plane (depth = 1/w), so distant boxes beyond the far plane must still be
+    // kept — only off-screen-sideways cells are culled.
+    const D3DXMATRIX& M = viewProj;
+    const float planes[4][4] = {
+        { M._14 + M._11, M._24 + M._21, M._34 + M._31, M._44 + M._41 },  // left
+        { M._14 - M._11, M._24 - M._21, M._34 - M._31, M._44 - M._41 },  // right
+        { M._14 + M._12, M._24 + M._22, M._34 + M._32, M._44 + M._42 },  // bottom
+        { M._14 - M._12, M._24 - M._22, M._34 - M._32, M._44 - M._42 },  // top
+    };
+    auto boxOutside = [&](float x0, float y0, float x1, float y1, float zb, float zt) {
+        for (const auto& p : planes) {
+            const float px = p[0] > 0 ? x1 : x0;
+            const float py = p[1] > 0 ? y1 : y0;
+            const float pz = p[2] > 0 ? zt : zb;
+            if (p[0] * px + p[1] * py + p[2] * pz + p[3] < 0.0f) return true;  // fully outside
+        }
+        return false;
+    };
+
+    // Dense local height grid over the radius window; kEmpty where there is no terrain
+    // or the cell box is outside the frustum.
+    static std::vector<float> cellH;
+    cellH.assign((size_t)W * H, kEmpty);
+    for (int ly = 0; ly < H; ++ly) {
+        for (int lx = 0; lx < W; ++lx) {
+            const int gx = baseGX + lx, gy = baseGY + ly;
+            auto it = g_basinMinH.find(waterGridKey(gx, gy));
+            if (it == g_basinMinH.end()) continue;
+            const float zt = it->second;
+            const float x0 = gx * grid, x1 = x0 + grid, y0 = gy * grid, y1 = y0 + grid;
+            if (boxOutside(x0, y0, x1, y1, boxFloor(zt), zt)) continue;
+            cellH[(size_t)ly * W + lx] = zt;
+        }
+    }
+
+    // Clip-space projection + near-plane clip emit (the proven curtain path).
+    // emitBox below projects with `viewProj` (the parameter) directly.
+    constexpr float kWNear = 1.0f;
+    static const int kBoxTris[36] = {
+        4,5,6, 4,6,7,  0,2,1, 0,3,2,  0,1,5, 0,5,4,
+        1,2,6, 1,6,5,  2,3,7, 2,7,6,  3,0,4, 3,4,7,
+    };
+    static std::vector<float>        verts;
+    static std::vector<unsigned int> tris;
+    verts.clear();
+    tris.clear();
+
+    struct ClipV { float x, y, w; };
+    auto appendVert = [&](const ClipV& v) {
+        const unsigned int idx = (unsigned int)(verts.size() / 4);
+        verts.push_back(v.x); verts.push_back(v.y); verts.push_back(0.0f); verts.push_back(v.w);
+        tris.push_back(idx);
+    };
+    auto emitTri = [&](const ClipV& a, const ClipV& b, const ClipV& c) {
+        const ClipV in[3] = { a, b, c };
+        ClipV poly[4];
+        int n = 0;
+        for (int i = 0; i < 3; ++i) {
+            const ClipV& cur = in[i];
+            const ClipV& nxt = in[(i + 1) % 3];
+            const bool curIn = cur.w >= kWNear, nxtIn = nxt.w >= kWNear;
+            if (curIn) poly[n++] = cur;
+            if (curIn != nxtIn) {
+                const float t = (kWNear - cur.w) / (nxt.w - cur.w);
+                poly[n++] = { cur.x + t * (nxt.x - cur.x), cur.y + t * (nxt.y - cur.y), kWNear };
+            }
+        }
+        for (int i = 1; i + 1 < n; ++i) {
+            appendVert(poly[0]); appendVert(poly[i]); appendVert(poly[i + 1]);
+        }
+    };
+    auto emitBox = [&](float x0, float y0, float x1, float y1, float zTop) {
+        const float zBot = boxFloor(zTop);
+        const float corners[8][3] = {
+            {x0,y0,zBot},{x1,y0,zBot},{x1,y1,zBot},{x0,y1,zBot},
+            {x0,y0,zTop},{x1,y0,zTop},{x1,y1,zTop},{x0,y1,zTop},
+        };
+        ClipV cc[8];
+        for (int k = 0; k < 8; ++k) {
+            const float wx = corners[k][0], wy = corners[k][1], wz = corners[k][2];
+            cc[k].x = wx * viewProj._11 + wy * viewProj._21 + wz * viewProj._31 + viewProj._41;
+            cc[k].y = wx * viewProj._12 + wy * viewProj._22 + wz * viewProj._32 + viewProj._42;
+            cc[k].w = wx * viewProj._14 + wy * viewProj._24 + wz * viewProj._34 + viewProj._44;
+        }
+        for (int t = 0; t < 36; t += 3)
+            emitTri(cc[kBoxTris[t]], cc[kBoxTris[t + 1]], cc[kBoxTris[t + 2]]);
+    };
+
+    // Greedy merge: group adjacent cells in the same height bucket into rectangles.
+    constexpr float kBucket = 1024.0f;   // merge tolerance (coarser = fewer boxes)
+    static std::vector<char> visited;
+    visited.assign((size_t)W * H, 0);
+
+    int boxes = 0;
+    for (int ly = 0; ly < H; ++ly) {
+        for (int lx = 0; lx < W; ++lx) {
+            const size_t idx = (size_t)ly * W + lx;
+            if (visited[idx] || cellH[idx] <= kEmpty + 1.0f) continue;
+            const int bk = (int)floorf(cellH[idx] / kBucket);
+
+            // grow the run rightward, then the block downward, within the same bucket
+            int w = 1;
+            while (lx + w < W) {
+                const size_t i = (size_t)ly * W + lx + w;
+                if (visited[i] || cellH[i] <= kEmpty + 1.0f || (int)floorf(cellH[i] / kBucket) != bk) break;
+                ++w;
+            }
+            int h = 1;
+            bool grow = true;
+            while (ly + h < H && grow) {
+                for (int i = 0; i < w; ++i) {
+                    const size_t j = (size_t)(ly + h) * W + lx + i;
+                    if (visited[j] || cellH[j] <= kEmpty + 1.0f || (int)floorf(cellH[j] / kBucket) != bk) { grow = false; break; }
+                }
+                if (grow) ++h;
+            }
+
+            // mark visited, take MIN top over the rectangle (conservative)
+            float minTop = cellH[idx];
+            for (int yy = 0; yy < h; ++yy)
+                for (int xx = 0; xx < w; ++xx) {
+                    const size_t j = (size_t)(ly + yy) * W + lx + xx;
+                    if (cellH[j] < minTop) minTop = cellH[j];
+                    visited[j] = 1;
+                }
+
+            const float x0 = (baseGX + lx) * grid, x1 = (baseGX + lx + w) * grid;
+            const float y0 = (baseGY + ly) * grid, y1 = (baseGY + ly + h) * grid;
+            emitBox(x0, y0, x1, y1, minTop);
+            ++boxes;
+            if (captureDebug) g_boxDbg.push_back({ x0, y0, x1, y1, minTop, boxFloor(minTop) });
+        }
+    }
+
+    if (verts.empty())
+        return;
+
+    const int vtxCount = (int)(verts.size() / 4);
+    const int triCount = (int)(tris.size() / 3);
+    const bool ok = MSOCClient::addPreTransformedOccluder(
+        verts.data(), vtxCount, /*stride*/ 16, /*offY*/ 4, /*offW*/ 12,
+        tris.data(), triCount);
+
+    static int diagFrame = 0;
+    if (Configuration.LogDistantPipeline && (diagFrame++ % 60) == 0) {
+        LOG::logline("-- MSOC occluder: terrain boxes %s — grid=%.0f radius=%d merged=%d tris=%d",
+                     ok ? "submitted" : "REJECTED", grid, radius, boxes, triCount);
+    }
+}
+
+// ---- Basin (watershed) occlusion pre-cull ----
+//
+// requiredHeight(cell) = min over all paths from the camera cell of
+//                        ( max barrier height along the path )
+// = the lowest full-cell wall separating the camera's basin from `cell`. A
+// minimax flood (Dijkstra with `max` as the path operator) over the coarse map.
+//
+// Barrier height per cell = the cell's terrain MINIMUM, NOT its max/ridge.
+// Conservativeness: req(C) > max(eyeZ, top) must imply the static is truly
+// hidden, never visible. With cell-MIN, req(C) > S means every path E->C
+// crosses a cell whose *entire* terrain (even its lowest point) sits above S —
+// a solid full-cell wall taller than both the eye and the static top, that the
+// flood proves you cannot route around. A straight eye->top sightline stays
+// within (-inf, max(eyeZ,top)], so such a wall always blocks it ⇒ occluded.
+// (Cell-MAX would be non-conservative: a sightline can thread a low saddle of
+// a basin-grid-wide cell, so a peak there doesn't prove occlusion — that over-
+// culled visible statics. The trade is weaker culling at coarser resolution,
+// which is why the barrier grid (g_basinGrid) is tunable: finer makes the full-
+// cell-wall condition achievable for real ridges. It never hides a visible
+// static at any resolution.)
+//
+// Cells with no terrain data use barrier = -inf (free passage → lower required
+// height → conservative, never over-culls). Cached on the camera cell + grid;
+// runs on the cull worker, overlapping the main thread.
+void DistantLand::buildBasinRequiredHeight() {
+    MGE_ZoneScopedN("buildBasinRequiredHeight");
+
+    const float grid = g_basinGrid;
+
+    // Ensure the barrier map is current for this resolution + land set.
+    if (g_basinMinHGrid != grid || g_basinMinHSrcSize != landMeshes.size()) {
+        buildBasinMinHeight(landMeshes, grid);
+    }
+    if (g_basinMinH.empty()) {
+        g_basinReqValid = false;
+        return;
+    }
+
+    // Eye fed into the basin: live, or a frozen snapshot while locked (Numpad0)
+    // so a free camera can inspect basins without the watershed shifting.
+    const D3DXVECTOR4 be = g_basinLockEye ? g_basinLockedEye : eyePos;
+    const int camX = (int)floorf(be.x / grid);
+    const int camY = (int)floorf(be.y / grid);
+
+    // Cache: recompute only on camera-cell change, grid change, or map rebuild.
+    if (g_basinReqValid && camX == g_basinCamCellX && camY == g_basinCamCellY &&
+        g_basinReqGrid == grid && g_basinReqSrcSize == g_basinMinHSrcSize) {
+        return;
+    }
+
+    // Domain: cells within DrawDist of the camera (+margin). DrawDist is in
+    // Morrowind cells (== kCellSize), converted to basin-grid cells.
+    const int radius   = (int)ceilf(Configuration.DL.DrawDist * kCellSize / grid) + 2;
+    const int dim      = 2 * radius + 1;
+    const int originX  = camX - radius;
+    const int originY  = camY - radius;
+
+    constexpr float kInf = std::numeric_limits<float>::infinity();
+    static std::vector<float>   barrierArr;   // dense terrain-min over the domain
+    static std::vector<uint8_t> closed;
+    g_basinReqArr.assign((size_t)dim * dim, kInf);
+    barrierArr.assign((size_t)dim * dim, -kInf);
+    closed.assign((size_t)dim * dim, 0);
+    std::vector<float>& reqArr = g_basinReqArr;
+
+    // Scatter the sparse barrier map into the dense domain array ONCE (iterate
+    // the map, not 8 hash lookups per cell). Cells outside the domain are skipped;
+    // unsampled cells stay -inf (free passage). This is the only g_basinMinH walk.
+    for (const auto& kv : g_basinMinH) {
+        const int gx = (int)(int32_t)(kv.first >> 32);
+        const int gy = (int)(int32_t)(kv.first & 0xffffffffu);
+        const int lx = gx - originX;
+        const int ly = gy - originY;
+        if (lx < 0 || lx >= dim || ly < 0 || ly >= dim) continue;
+        barrierArr[(size_t)ly * dim + lx] = kv.second;
+    }
+
+    struct Node { float req; int idx; };
+    struct Cmp  { bool operator()(const Node& a, const Node& b) const { return a.req > b.req; } };
+    std::priority_queue<Node, std::vector<Node>, Cmp> pq;
+
+    const int srcIdx = radius * dim + radius;
+    reqArr[srcIdx] = barrierArr[srcIdx];
+    pq.push({reqArr[srcIdx], srcIdx});
+
+    while (!pq.empty()) {
+        const Node n = pq.top();
+        pq.pop();
+        if (closed[n.idx]) continue;     // stale heap entry
+        closed[n.idx] = 1;
+        const int lx = n.idx % dim;
+        const int ly = n.idx / dim;
+        // 8-connectivity, dense neighbour indices (barrier read = array, no hash).
+        for (int dy = -1; dy <= 1; ++dy) {
+            const int nly = ly + dy;
+            if (nly < 0 || nly >= dim) continue;
+            for (int dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dy == 0) continue;
+                const int nlx = lx + dx;
+                if (nlx < 0 || nlx >= dim) continue;
+                const int ni = nly * dim + nlx;
+                if (closed[ni]) continue;
+                const float cand = std::max(n.req, barrierArr[ni]);
+                if (cand < reqArr[ni]) {
+                    reqArr[ni] = cand;
+                    pq.push({cand, ni});
+                }
+            }
+        }
+    }
+
+    g_basinReqOriginX = originX;
+    g_basinReqOriginY = originY;
+    g_basinReqDim     = dim;
+    g_basinCamCellX   = camX;
+    g_basinCamCellY   = camY;
+    g_basinReqGrid    = grid;
+    g_basinReqSrcSize = g_basinMinHSrcSize;
+    g_basinReqValid   = true;
 }
 
 // Water-reflection gate (Phase A). renderStage0 called renderWaterReflection
@@ -1675,25 +2631,14 @@ void DistantLand::prepareReflectionCullForWorker() {
     reflCullViewProj   = reflView * ds_proj;
     reflCullViewSphere = D3DXVECTOR4(eyePos.x, eyePos.y, eyePos.z, zf);
     reflStaticsWanted  = true;
-}
 
-// Worker step (before channelDrained): issue the reflection statics RPC and wait,
-// while the worker still owns the single IPC channel. The server cull overlaps
-// the sky window; channelDrained is signalled after this so the main thread's
-// later RPCs stay correctly sequenced behind it.
-void DistantLand::workerReflectionRPC() {
-    if (!reflStaticsWanted) return;
-    MGE_ZoneScopedN("cullWorker:reflRPC");
+    // The reflection query is folded into the batched statics RPC issued by
+    // cullDistantStatics_kickoff (called right after this), so clear the output
+    // vec here before the RPC writes it (client convention: RemoveAll pre-RPC).
     visExtraShared.RemoveAll();
-    ViewFrustum rf(&reflCullViewProj);
-    ipcClient.getVisibleMeshes(visExtraSharedId, rf, reflCullViewSphere, VIS_STATIC, VisibleSetSort::ByState);
-    ipcClient.waitForCompletion();
-    // Copy out of the IPC window now, while the channel is still owned (before
-    // channelDrained). main never touches the live window for reflections.
-    materializeReflectionMeshes();
 }
 
-// Worker step (after the statics verdict, before maskDone): run the water-visible
+// Worker step (after the statics verdict, before reflDone): run the water-visible
 // gate and build the reflection skipMask. Both are pure CPU over frame-stable
 // inputs (terrain maps, MSOC mask, stashed reflection matrices).
 void DistantLand::workerReflectionGateAndMask() {

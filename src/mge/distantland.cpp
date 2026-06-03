@@ -17,8 +17,6 @@
 using std::string;
 using std::unordered_map;
 
-static bool g_contributeOccluders = false;
-
 #ifdef TRACY_ENABLE
 static constexpr tracy::SourceLocationData s_mwSkyLoc   { "MW sky",       "BeginScene",  __FILE__, 0, 0 };
 static constexpr tracy::SourceLocationData s_mwDrawsLoc { "MW draw loop", "renderStage0", __FILE__, 0, 0 };
@@ -89,6 +87,13 @@ void DistantLand::frameSetupEarly() {
         // The kickoff needs just the camera (selectDistantCell + setView, done
         // above), not the geometry cache — they share no state.
         if (Configuration.MGEFlags & USE_DISTANT_STATICS) {
+            // Stash the reflection cull inputs FIRST — before the kickoff — so the
+            // batched statics RPC can fold in the reflection query (4th query →
+            // visExtraShared). Its server-cull then overlaps the kickoff→drain
+            // head-start window (GeomCache walk + sky) instead of being a separate
+            // sequential worker RPC sitting in front of the statics verdict.
+            prepareReflectionCullForWorker();
+
             D3DXMATRIX distProj = mwProj;
             editProjectionZ(&distProj, kDistantNearPlane - 1e-2, Configuration.DL.DrawDist * kCellSize);
             cullDistantStatics_kickoff(&mwView, &distProj);
@@ -98,11 +103,6 @@ void DistantLand::frameSetupEarly() {
             // is final before the worker reads it; then dispatch the verdict
             // pass to the cull worker. cullDistantStatics_finish joins it.
             updateMSOCCutoffInput();
-
-            // Stash the reflection cull inputs for the worker BEFORE signalling it
-            // (the worker reads reflStaticsWanted/reflCull* once woken). The worker
-            // then issues the reflection RPC + gate + skipMask during sky.
-            prepareReflectionCullForWorker();
 
             signalCullFinish();
         }
@@ -264,22 +264,17 @@ void DistantLand::renderStage0() {
                     renderDistantLand(effect, &mwView, &distProj);
                     effect->EndPass();
 
-                    // Numpad0: toggle horizon-curtain contribution at runtime.
+                    // The terrain-box occluders are now contributed to MSOC on the
+                    // cull worker every frame (see cullWorkerLoop). Numpad3 only
+                    // toggles the in-world debug overlay of those boxes.
                     if (GetAsyncKeyState(VK_NUMPAD3) & 0x0001) {
-                        g_contributeOccluders = !g_contributeOccluders;
-                        char msg[64];
-                        std::snprintf(msg, sizeof(msg), "MSOC contributions: %s",
-                                      g_contributeOccluders ? "ON" : "OFF");
-                        StatusOverlay::setStatus(msg);
+                        boxOccluderDebug = !boxOccluderDebug;
+                        StatusOverlay::setStatus(boxOccluderDebug
+                            ? "Terrain box overlay: ON" : "Terrain box overlay: OFF");
                     }
-                    // Feed the horizon-curtain occluder into MSOC's mask
-                    // for the next frame. Placed here (not inside
-                    // renderDistantLand) because renderDistantLand also
-                    // fires for water reflection and shadow passes; the
-                    // contribution always uses mwView, so running it once
-                    // per frame is enough.
-                    if (g_contributeOccluders)
-                        contributeDistantLandOccluders();
+
+                    // Numpad5 mask dump — reflects the worker's box submission.
+                    debugDumpMSOCMask();
                 }
 
                 // Draw distant statics. cullDistantStatics_finish was called
@@ -309,6 +304,14 @@ void DistantLand::renderStage0() {
             // keeps a valid flat-fog target for the distant-water sampler and the
             // transition frame without paying the reflection pass.
             if (mwBridge->CellHasWater()) {
+                // Join the worker's late reflection fence before reading its
+                // results. The reflection gate/cull was split off the early
+                // staticsDone fence so renderDepth's statics join didn't wait on
+                // it; consume it here, ~10 passes later, where it's typically
+                // already done (~0 join). Only on the worker path (reflGateWanted).
+                if (reflGateWanted) {
+                    waitCullReflReady();
+                }
                 // Gate result comes from the cull worker when it ran the gate this
                 // frame (reflGateWanted); otherwise compute it inline on main.
                 const bool waterVisible = reflGateWanted ? reflVisible
@@ -327,6 +330,9 @@ void DistantLand::renderStage0() {
 
             effect->End();
             renderMSOCBasinBoundsDebug(&mwView, &distProj);
+            renderBasinDebug(&mwView, &distProj);
+            renderCurtainDebug();
+            renderBoxOccluderDebug(&mwView, &distProj);
             renderWaterProxyBoundsDebug(&mwView, &distProj);
 
             // Reset matrices

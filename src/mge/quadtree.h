@@ -2,6 +2,7 @@
 
 #include "dlmath.h"
 #include "memorypool.h"
+#include "drawstats.h"
 #include "ipc/bridge.h"
 
 #include <algorithm>
@@ -64,6 +65,7 @@ public:
                 last_buffer = mesh.vBuffer;
             }
 
+            DrawStats::count(mesh.faces);
             device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, mesh.verts, 0, mesh.faces);
         }
 
@@ -142,6 +144,7 @@ public:
             effectPool->SetMatrix(*world_matrix_handle, &mesh.transform);
 
             effect->CommitChanges();
+            DrawStats::count(mesh.faces);
             device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, mesh.verts, 0, mesh.faces);
             ++idx;
         }

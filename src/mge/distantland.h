@@ -255,7 +255,14 @@ public:
     // mask is empty and giants at the skyline never cull. Called from
     // renderStage0 after visLand is materialized; submissions land in
     // the next frame's mask (one-frame latency by design).
-    static void contributeDistantLandOccluders();
+    static void contributeDistantLandOccluders(bool captureDebug = false);
+    // Voxelize the min-height terrain into merged boxes and feed them to MSOC as
+    // real 3D occluders. Runs on the cull worker every frame (off the main thread)
+    // using a frame-stable view-proj. captureDebug stashes the AABBs for the
+    // Numpad3 in-world overlay.
+    static void contributeTerrainBoxOccluders(const D3DXMATRIX& viewProj, bool captureDebug = false);
+    // Numpad3: draw the terrain-box occluder overlay (capture is otherwise off).
+    static bool boxOccluderDebug;
 
     // Free the horizon-curtain workspace (the lazily-allocated state in
     // renderexterior.cpp). Called from release() so the malloc'd buffers
@@ -295,9 +302,17 @@ public:
     static void updateMSOCCutoffInput();
     static void signalCullFinish();
     static void waitCullChannelFree();
+    //   waitCullReflReady      — block until the worker has finished the
+    //                            reflection gate + survivor cull (late fence,
+    //                            joined just before renderWaterReflection).
+    static void waitCullReflReady();
     static void joinCullWorker();
     static void renderDistantStatics();
     static void renderMSOCBasinBoundsDebug(const D3DXMATRIX* view, const D3DXMATRIX* proj);
+    static void debugDumpMSOCMask();   // Numpad5 mask dump, post-curtain
+    static void renderCurtainDebug();  // Numpad3 cycle: in-world curtain overlay
+    static void renderBoxOccluderDebug(const D3DXMATRIX* view, const D3DXMATRIX* proj);
+    static void renderBasinDebug(const D3DXMATRIX* view, const D3DXMATRIX* proj);
     static void renderWaterProxyBoundsDebug(const D3DXMATRIX* view, const D3DXMATRIX* proj);
 
     // MSOC occlusion verdict pass — walks the visible set, runs the
@@ -314,6 +329,21 @@ public:
     // applyMSOCToDistantStatics. 1 = cull this instance, 0 = render.
     // Empty when MSOC is unavailable / occlusion disabled.
     static std::vector<std::uint8_t> msocOccluded;
+
+    // --- Basin (watershed) occlusion pre-cull for distant statics ---
+    // View-direction-independent terrain pre-cull run ahead of MSOC on the
+    // cull worker. buildBasinRequiredHeight floods a minimax (watershed)
+    // spill-height surface out from the camera's coarse cell — the lowest
+    // full-cell wall (per-cell terrain MIN, so it's a provable barrier) that
+    // must be cleared to reach each cell. The MSOC pass's middle stage then marks
+    // any static whose OBB top sits below that wall (dense O(1) per static).
+    // The provably conservative test is req > max(eyeZ, top): a low camera
+    // collapses to the static top (aggressive discard), an elevated camera
+    // tightens (ridge must clear the eye), so a visible static is never hidden.
+    // See tasks/todo.md (basin pre-cull). The per-static verdict runs inside the
+    // MSOC pass (group cheap-reject → basin → sphere), so only the flood builder
+    // is exposed here.
+    static void buildBasinRequiredHeight();
     static void cullGrass(const D3DXMATRIX* view, const D3DXMATRIX* proj);
     template<class T>
     static void buildGrassInstanceVB(VisibleSet<T>& grassSet);
@@ -353,10 +383,10 @@ public:
     // window (which the worker + main RPCs would race). Mirrors visDistantSurvivors.
     static VisibleSet<StlVector> reflectionSurvivors;
     // Main (frameSetupEarly): stash the reflection cull inputs for the worker.
+    // The reflection RPC is folded into the batched statics RPC (kickoff), so
+    // there is no separate worker RPC step — the worker materializes the folded
+    // result after the single drain, then runs the gate + cull to survivors.
     static void prepareReflectionCullForWorker();
-    // Worker: issue the reflection RPC + materialize the result (before
-    // channelDrained), then after the verdict run the gate + cull to survivors.
-    static void workerReflectionRPC();
     static void workerReflectionGateAndMask();
     // Materialize visExtraShared into stable storage (one IPC-window traversal).
     static void materializeReflectionMeshes();

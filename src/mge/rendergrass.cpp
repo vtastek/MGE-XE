@@ -1,5 +1,6 @@
 
 #include "distantland.h"
+#include "drawstats.h"
 #include "distantshader.h"
 #include "configuration.h"
 #include "mged3d8device.h"
@@ -165,6 +166,7 @@ void DistantLand::renderGrassInstZ() {
 }
 
 void DistantLand::renderGrassCommon(ID3DXEffect* e) {
+    DrawStats::ScopedStage _ds(DrawStats::Grass);
     int nz = 0;
     for (const auto& grass : batchedGrass) {
         effect->SetTexture(ehTex0, grass.first->tex);
@@ -175,6 +177,7 @@ void DistantLand::renderGrassCommon(ID3DXEffect* e) {
         device->SetStreamSource(0, grass.first->vBuffer, 0, SIZEOFSTATICVERT);
         device->SetStreamSourceFreq(1, D3DSTREAMSOURCE_INSTANCEDATA | 1);
         device->SetStreamSource(1, vbGrassInstances, GrassInstStride * nz, GrassInstStride);
+        DrawStats::count(grass.first->faces);
         device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, grass.first->verts, 0, grass.first->faces);
 
         nz += grass.second;

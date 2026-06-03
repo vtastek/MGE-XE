@@ -1,6 +1,7 @@
 
 #include "distantland.h"
 #include "distantshader.h"
+#include "drawstats.h"
 #include "configuration.h"
 #include "mwbridge.h"
 #include "phasetimers.h"
@@ -35,6 +36,7 @@ void DistantLand::clearShadowCascade(int layer) {
     effectShadow->CommitChanges();
     device->SetVertexDeclaration(WaterDecl);
     device->SetStreamSource(0, vbFullFrame, 0, 12);
+    DrawStats::count(2);
     device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
     effectShadow->EndPass();
 }
@@ -57,6 +59,7 @@ void DistantLand::clearShadowCascade(int layer) {
 void DistantLand::renderShadowMap() {
     MGE_ZoneScopedN("renderShadowMap");
     MGE_SCOPED_TIMER("renderShadowMap");
+    DrawStats::ScopedStage _ds(DrawStats::Shadow);
 
     // ---- adaptive scheduler state ----
     static D3DXMATRIX  s_lastView = {};
@@ -163,6 +166,7 @@ void DistantLand::renderShadowMap() {
 
     device->SetVertexDeclaration(WaterDecl);
     device->SetStreamSource(0, vbFullFrame, 0, 12);
+    DrawStats::count(2);
     device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
 
     device->SetRenderTarget(0, targetSoft);
@@ -170,6 +174,7 @@ void DistantLand::renderShadowMap() {
     effect->SetBool(ehHasAlpha, true);      // flag as vertical filter pass
     effectShadow->CommitChanges();
 
+    DrawStats::count(2);
     device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
     effectShadow->EndPass();
 
@@ -244,6 +249,7 @@ void DistantLand::renderShadowFromCache(int layer, const D3DXMATRIX* viewproj) {
         device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kVBStride);
         device->SetIndices(e.ib);
         device->SetFVF(MGE::GeometryCache::kVBFVF);
+        DrawStats::count(e.triangleCount);
         device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, e.vertexCount, 0, e.triangleCount);
     }
     effectShadow->EndPass();
@@ -267,6 +273,7 @@ void DistantLand::renderShadowFromCache(int layer, const D3DXMATRIX* viewproj) {
         device->SetRenderState(D3DRS_CULLMODE, D3DCULL_CW);
         device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kSkinnedVBStride);
         device->SetIndices(e.ib);
+        DrawStats::count(e.triangleCount);
         device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, e.vertexCount, 0, e.triangleCount);
     }
     effectShadow->EndPass();
@@ -302,6 +309,7 @@ void DistantLand::renderShadowLayerGeneric(MWBridge* mwBridge, int layer, const 
     effectShadow->BeginPass(PASS_SHADOWSTENCIL);
     device->SetVertexDeclaration(WaterDecl);
     device->SetStreamSource(0, vbClipCube, 0, 12);
+    DrawStats::count(12);
     device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 12);
     effectShadow->EndPass();
 
@@ -397,6 +405,7 @@ void DistantLand::renderShadowLayer(int layer, float radius, const D3DXMATRIX* i
 // renderShadow - Renders shadows (using blending) over Morrowind shadow receivers
 void DistantLand::renderShadow() {
     MGE_ZoneScopedN("applyShadows");
+    DrawStats::ScopedStage _ds(DrawStats::Shadow);
     // Supply view space -> shadow clip space matrix
     D3DXMATRIX inverseView, viewToShadow[2];
     D3DXMatrixInverse(&inverseView, NULL, &mwView);
@@ -449,12 +458,14 @@ void DistantLand::renderShadow() {
         device->SetStreamSource(0, i.vb, i.vbOffset, i.vbStride);
         device->SetIndices(i.ib);
         device->SetFVF(i.fvf);
+        DrawStats::count(i.primCount);
         device->DrawIndexedPrimitive(i.primType, i.baseIndex, i.minIndex, i.vertCount, i.startIndex, i.primCount);
     }
 }
 
 // renderShadowDebug - display shadow layers
 void DistantLand::renderShadowDebug() {
+    DrawStats::ScopedStage _ds(DrawStats::Debug);
     UINT passes;
 
     // Create shadow clip space -> camera clip space matrices
@@ -475,6 +486,7 @@ void DistantLand::renderShadowDebug() {
     effect->CommitChanges();
     device->SetVertexDeclaration(WaterDecl);
     device->SetStreamSource(0, vbFullFrame, 0, 12);
+    DrawStats::count(2);
     device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
     effect->EndPass();
     effect->End();

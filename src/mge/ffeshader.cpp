@@ -1,6 +1,7 @@
 
 #include "ffeshader.h"
 #include "configuration.h"
+#include "drawstats.h"
 #include "scenegraph.h"
 #include "support/log.h"
 
@@ -774,6 +775,7 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
     UINT passes;
     effectFFE->Begin(&passes, D3DXFX_DONOTSAVESTATE);
     effectFFE->BeginPass(0);
+    DrawStats::count(rs->primCount);
     device->DrawIndexedPrimitive(rs->primType, rs->baseIndex, rs->minIndex, rs->vertCount, rs->startIndex, rs->primCount);
     effectFFE->EndPass();
     effectFFE->End();

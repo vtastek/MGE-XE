@@ -4,6 +4,7 @@
 #include "d3d8surface.h"
 #include "d3d8texture.h"
 #include "devicelock.h"
+#include "drawstats.h"
 
 // Device-submission lock shared with the MGE render thread (see devicelock.h).
 // Disabled until a device is created with Configuration.UseRenderThread on, so
@@ -466,21 +467,25 @@ HRESULT _stdcall ProxyDevice::GetCurrentTexturePalette(UINT* a) {
 
 HRESULT _stdcall ProxyDevice::DrawPrimitive(D3DPRIMITIVETYPE a, UINT b, UINT c) {
     MGE_DEVLOCK();
+    DrawStats::count(c);
     return realDevice->DrawPrimitive(a, b, c);
 }
 
 HRESULT _stdcall ProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b, UINT c, UINT d, UINT e) {
     MGE_DEVLOCK();
+    DrawStats::count(e);
     return realDevice->DrawIndexedPrimitive(a, (INT)baseVertexIndex, b, c, d, e);
 }
 
 HRESULT _stdcall ProxyDevice::DrawPrimitiveUP(D3DPRIMITIVETYPE a, UINT b, const void* c, UINT d) {
     MGE_DEVLOCK();
+    DrawStats::count(b);
     return realDevice->DrawPrimitiveUP(a, b, c, d);
 }
 
 HRESULT _stdcall ProxyDevice::DrawIndexedPrimitiveUP(D3DPRIMITIVETYPE a, UINT b, UINT c, UINT d, const void* e, D3DFORMAT f, const void* g, UINT h) {
     MGE_DEVLOCK();
+    DrawStats::count(c);
     return realDevice->DrawIndexedPrimitiveUP(a, b, c, d, e, f, g, h);
 }
 

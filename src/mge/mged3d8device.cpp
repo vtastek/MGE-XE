@@ -16,10 +16,52 @@
 #include "userhud.h"
 #include "videobackground.h"
 #include "mge_tracy.h"
+#include "drawstats.h"
 #include "support/timing.h"
 #include "support/log.h"
 
 bool g_tracyActive = false;
+
+// Per-stage draw-call breakdown. Emits a Tracy plot per stage every frame and a
+// 60-frame summary line to mgexe.log (gated on LogDistantPipeline) so the totals
+// can be eyeballed against the single draw-call number DXVK reports. Counters are
+// reset here for the next frame. Called from Present, after all draws complete.
+void DrawStats::logFrame() {
+    using namespace DrawStats;
+
+    std::uint32_t totalCalls = 0, totalPrims = 0;
+    for (int i = 0; i < COUNT; ++i) { totalCalls += g_calls[i]; totalPrims += g_prims[i]; }
+
+#ifdef TRACY_ENABLE
+    if (g_tracyActive) {
+        char plot[32];
+        for (int i = 0; i < COUNT; ++i) {
+            _snprintf_s(plot, sizeof(plot), _TRUNCATE, "draws:%s", name((Stage)i));
+            TracyPlot(plot, (int64_t)g_calls[i]);
+        }
+        TracyPlot("draws:TOTAL", (int64_t)totalCalls);
+    }
+#endif
+
+    static int s_frame = 0;
+    if (Configuration.LogDistantPipeline && (s_frame++ % 60) == 0) {
+        // scene = scene0+1+2+UI, pre = depth+shadow+refl, DL = land+statics+grass+water+sky
+        const std::uint32_t scene = g_calls[Scene0] + g_calls[Scene1] + g_calls[Scene2] + g_calls[UI];
+        const std::uint32_t pre   = g_calls[Depth] + g_calls[Shadow] + g_calls[Reflection];
+        const std::uint32_t dl    = g_calls[Land] + g_calls[Statics] + g_calls[Grass] + g_calls[Water] + g_calls[Sky];
+        LOG::logline(
+            "-- draws: TOTAL=%u  scene=%u(s0=%u s1=%u s2=%u ui=%u)  "
+            "pre=%u(depth=%u shadow=%u refl=%u)  "
+            "DL=%u(land=%u statics=%u grass=%u water=%u sky=%u)  post=%u dbg=%u other=%u",
+            totalCalls,
+            scene, g_calls[Scene0], g_calls[Scene1], g_calls[Scene2], g_calls[UI],
+            pre, g_calls[Depth], g_calls[Shadow], g_calls[Reflection],
+            dl, g_calls[Land], g_calls[Statics], g_calls[Grass], g_calls[Water], g_calls[Sky],
+            g_calls[Post], g_calls[Debug], g_calls[Other]);
+    }
+
+    reset();
+}
 
 // timeBeginPeriod for Sleep granularity in the frame limiter.
 #pragma comment(lib, "winmm.lib")
@@ -492,6 +534,7 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
 #ifdef TRACY_ENABLE
     if (g_tracyActive) g_gpuTimer.beginFrame();  // open frame F+1's GPU span
 #endif
+    DrawStats::logFrame();
     MGE_FrameMark;
     return hr;
 }
@@ -543,6 +586,11 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
             // isMainView is not always valid at EndScene if Morrowind draws sunglare
             ++sceneCount;
 
+            // Tag the current draw-stats bucket for this Morrowind scene. The
+            // distant-land passes triggered mid-scene0 push their own ScopedStage
+            // and restore back to this on exit.
+            DrawStats::g_stage = (DrawStats::Stage)(DrawStats::Scene0 + (sceneCount <= 2 ? sceneCount : 2));
+
 #ifdef TRACY_ENABLE
             if (g_tracyActive) {
                 int idx = sceneCount <= 1 ? sceneCount : 2;
@@ -584,6 +632,7 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
 #endif
             }
         } else {
+            DrawStats::g_stage = DrawStats::UI;
 #ifdef TRACY_ENABLE
             if (g_tracyActive)
                 s_currentSceneZone = new tracy::ScopedZone(&s_sceneZoneLocs[3], 0, true);
