@@ -414,7 +414,13 @@ namespace MGE::SceneGraph {
     uint64_t                              frameRevision()      { return g_frameRevision; }
     uint64_t                              frameCount()         { return g_walks; }
 
-    void lockSnapshot()   { g_snapshotMtx.lock(); }
-    void unlockSnapshot() { g_snapshotMtx.unlock(); }
+    // No-op in sync mode, as the header contract promises: only the
+    // async worker swaps the public vectors under g_snapshotMtx, so without it
+    // there is no concurrent writer to guard against and the per-draw consumer
+    // (FFE many-lights) skips the uncontended lock entirely. UseAsyncSceneGraphWalk
+    // is set once at config load (gates worker spawn, line 376) and never toggled
+    // at runtime, so lock/unlock observe the same value and stay paired.
+    void lockSnapshot()   { if (Configuration.UseAsyncSceneGraphWalk) g_snapshotMtx.lock();   }
+    void unlockSnapshot() { if (Configuration.UseAsyncSceneGraphWalk) g_snapshotMtx.unlock(); }
 
 }

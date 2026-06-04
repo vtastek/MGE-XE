@@ -19,6 +19,15 @@ static void setDPIScalingAware();
 static const char* welcomeMessage = XE_VERSION_STRING;
 static bool isMW;
 
+// Request the high-performance GPU on hybrid (Optimus / PowerXpress) systems.
+// Morrowind.exe doesn't trigger the auto-switch, so the driver scans our wrapper
+// DLL's exports for these symbols at device creation time. (Same mechanism dxvk,
+// ReShade, and ENB rely on. dllexport coexists with the /DEF export list.)
+extern "C" {
+    __declspec(dllexport) DWORD NvOptimusEnablement = 0x00000001;
+    __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+}
+
 
 
 extern "C" BOOL _stdcall DllMain(HANDLE hModule, DWORD reason, void* unused) {

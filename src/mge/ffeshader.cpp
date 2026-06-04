@@ -98,7 +98,7 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
     effectDefaultPurple = effect;
     sunMultiplier = ambMultiplier = 1.0;
 
-    // _Claude_ Phase 2: allocate the dynamic light texture for the
+    // Phase 2: allocate the dynamic light texture for the
     // USE_TEXTURE_LIGHTS shader path. Width = kTexelsPerLight * kMaxTexLights
     // = 192 texels at default; height = 1; R32G32B32A32F so each texel
     // holds 4 floats. D3DUSAGE_DYNAMIC + D3DPOOL_DEFAULT = update via
@@ -124,7 +124,7 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
     }
     lastUploadedRevision = (unsigned int)-1;
     lastUploadedPointCount = 0;
-    // _Claude_ Bbox cache is keyed by D3D resource pointers; pointers
+    // Bbox cache is keyed by D3D resource pointers; pointers
     // become invalid after device reset, so wipe.
     bboxCache.clear();
 
@@ -157,7 +157,7 @@ void FixedFunctionShader::precacheAsync() {
             skCommon.vertexColour = vertexCol;
             skCommon.vertexMaterial = vertexCol + 1;
 
-            // _Claude_ Light bucket sweep: 0 = 4 lights (heavyLighting=0),
+            // Light bucket sweep: 0 = 4 lights (heavyLighting=0),
             // 1 = 8 lights (heavyLighting=1), 2 = 64 lights (useTextureLightVariant=1).
             // The 64-light variant only fires when msoc emits lights, but we
             // pre-compile it so the first dense-interior frame doesn't stutter.
@@ -251,7 +251,7 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
     static unsigned long long s_msocBuckets[8] = {0};
     static unsigned long long s_variantCalls[4] = {0};
     static unsigned long long s_variantTotalNs[4] = {0};
-    // _Claude_ Per-mesh selection cost. Wraps the bbox-compute +
+    // Per-mesh selection cost. Wraps the bbox-compute +
     // sphere-AABB loop + partial_sort + constant-push block. Use to
     // judge whether MeshKey-based selection caching (#1) or
     // light frustum-precull (#2) is worth implementing — if avgNs is
@@ -314,10 +314,25 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
     // Directional sun handling stays via the engine loop below — the sun
     // is set up via MGEProxyDevice::SetLight intercept and threaded
     // through lightrs->active. Only point-light fill is replaced.
+    // The async scene-graph walk worker (scenegraph.cpp rebuildAsync)
+    // swaps g_pointLights under SnapshotReadLock; a swap landing mid-read frees
+    // the buffer this reference indexes (the c0000005 in renderMorrowind+0x42e:
+    // stale base + clamped count walked off the reallocated array). Hold the
+    // lock across the count sample AND every snapshotLights read so the buffer
+    // can't move and the loop bound can't outlive it. useTextureLights /
+    // candidateCount / idxFloats are declared above the block so they survive
+    // to the shader-param pushes below; the lock releases at the block's close,
+    // before the caller (inspectIndexedPrimitive) issues DrawIndexedPrimitive.
+    // In synchronous mode the lock is a documented no-op.
+    bool useTextureLights = false;
+    unsigned int candidateCount = 0;
+    float idxFloats[8 * 4] = { 0 };
+    {
+    MGE::SceneGraph::SnapshotReadLock snapshotLock;
     const auto& snapshotLights = MGE::SceneGraph::pointLights();
     const unsigned int snapshotCount =
         std::min<unsigned int>(static_cast<unsigned int>(snapshotLights.size()), kMaxTexLights);
-    const bool useTextureLights = (snapshotCount > 0) && (texLightData != nullptr);
+    useTextureLights = (snapshotCount > 0) && (texLightData != nullptr);
 
     // Instrument: snapshot size distribution. Gated by logPerf so the bucket
     // increments + peak-tracking + log all skip when LogDistantPipeline is off.
@@ -336,7 +351,7 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
         }
     }
 
-    // _Claude_ Per-mesh light selection — hoisted above ShaderKey so
+    // Per-mesh light selection — hoisted above ShaderKey so
     // we know candidateCount before picking the variant. Draws that
     // pick zero snapshot lights ("fast-path") demote from v3 (64-light
     // texture path) to v1/v2 (engine 8-light shader, all-zero point
@@ -349,9 +364,6 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
     // per-mesh sphere-AABB cull. Texture-light param pushes (texture,
     // params, indices, view matrix) need effectFFE so they live below,
     // gated on actuallyUseTextureLights.
-    unsigned int candidateCount = 0;
-    float idxFloats[8 * 4] = { 0 };
-
     if (useTextureLights) {
         // Per-draw selection scratch (no allocation in the hot path).
         // s_msocToTex maps original snapshot index → texture row index
@@ -536,6 +548,7 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
             }
         }
     }
+    }   // release SnapshotReadLock — all snapshotLights reads complete
 
     // Fast-path gate: snapshot is active AND this mesh is in range of
     // at least one snapshot light. False here means use the engine 8-light
@@ -584,7 +597,7 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
     float bufferPosition[3 * MaxLights];
     float bufferFalloffQuadratic[MaxLights], bufferFalloffLinear[MaxLights], bufferFalloffConstant[MaxLights];
 
-    // _Claude_ The 8-slot constant arrays below are read only by the
+    // The 8-slot constant arrays below are read only by the
     // engine-emulating shader paths (4-light / 8-light). When the
     // texture-light variant (useTextureLights) is active, the compiled
     // shader doesn't reference them, and the matching SetFloatArray
@@ -620,7 +633,7 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
         }
 
         if (light->type == D3DLIGHT_POINT) {
-            // _Claude_ Phase 2 wire-in: skip engine-emit point lights when
+            // Phase 2 wire-in: skip engine-emit point lights when
             // msoc is feeding us the snapshot. Directional handling below
             // still runs (sun must come from the engine — it's set up via
             // MGEProxyDevice::SetLight intercept).
@@ -681,7 +694,7 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
         }
     }
 
-    // _Claude_ Texture-light parameter pushes. The cull and selection
+    // Texture-light parameter pushes. The cull and selection
     // already ran above (hoisted block) so candidateCount and idxFloats
     // are populated. Gated on actuallyUseTextureLights so demoted draws
     // (candidateCount == 0) skip the 4 pushes AND get the v1/v2 shader
@@ -721,7 +734,7 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
     // before the per-light loop in the pixel shader). Always push.
     effectFFE->SetFloatArray(ehLightSceneAmbient, ambient, 3);
     effectFFE->SetFloatArray(ehLightSunDiffuse, sunDiffuse, 3);
-    // _Claude_ Engine 8-light constant arrays. Only read by the
+    // Engine 8-light constant arrays. Only read by the
     // engine-emulating shader paths (calcLighting4 / calcLighting8).
     // The texture-light variant ignores them — skipping these 6 D3DX9
     // parameter pushes saves ~600 ns/draw on the v3 path. The
@@ -1018,7 +1031,7 @@ ID3DXEffect* FixedFunctionShader::generateMWShader(const ShaderKey& sk) {
     genVertexColour = buf.str();
 
     // Lighting
-    // _Claude_ msoc-emit path: USE_TEXTURE_LIGHTS macro switches the
+    // msoc-emit path: USE_TEXTURE_LIGHTS macro switches the
     // shader to read lights from a 1D texture (3 texels per light) with
     // a runtime loop count. Non-msoc draws still pick the 4/8 buckets
     // via heavyLighting below. The FFE_LIGHTS_ACTIVE value is moot when
@@ -1175,7 +1188,7 @@ ID3DXEffect* FixedFunctionShader::generateMWShader(const ShaderKey& sk) {
     genFog = buf.str();
 
     // Compile HLSL through insertions into a template file
-    // _Claude_ Phase 2: USE_TEXTURE_LIGHTS macro present (with value "1")
+    // Phase 2: USE_TEXTURE_LIGHTS macro present (with value "1")
     // only for the msoc-emit variant. For all other variants we omit it
     // so the shader's #ifdef branch falls through to the constant-array
     // path. Using #ifdef rather than #if 0/1 because that's the convention
@@ -1265,7 +1278,7 @@ void FixedFunctionShader::release() {
     bboxCache.clear();
 }
 
-// _Claude_ Vertex-buffer-derived per-mesh world-space AABB. Ported from
+// Vertex-buffer-derived per-mesh world-space AABB. Ported from
 // vtastek's hiz_culling.cpp::computeBoundingBox with simplifications
 // (no debug-key gating, no recording-thread coordination — we run on
 // the render thread). Cache hit: 8-corner transform by worldTransforms[0]
