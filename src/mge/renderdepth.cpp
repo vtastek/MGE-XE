@@ -250,7 +250,12 @@ void DistantLand::renderDepthFromCache(const D3DXMATRIX* gameView,
             effect->SetBool(ehHasAlpha, false);
             effect->SetFloat(ehAlphaRef, -1.0f);
         }
-        device->SetRenderState(D3DRS_CULLMODE, e.blendEnable ? D3DCULL_NONE : D3DCULL_CW);
+        // Mirrored (negative-determinant) parts flip clip-space winding, so cull the
+        // opposite face — else depth records the inner surface and SSAO shows
+        // "inside-out" left limbs. Matches the engine's per-draw mirror swap.
+        const DWORD cull = e.blendEnable ? D3DCULL_NONE
+                                         : (e.mirrored ? D3DCULL_CCW : D3DCULL_CW);
+        device->SetRenderState(D3DRS_CULLMODE, cull);
         device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
         device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
     };

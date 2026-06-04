@@ -30,6 +30,12 @@ namespace MGE::GeometryCache {
         uint64_t          g_frame          = 0;
         uint32_t          g_uploadedThisFrame  = 0;
         uint64_t          g_uploadedInterval   = 0; // cumulative over log interval
+        // Phase 0 diagnostic: null-bone influence accounting (the suspected NPC
+        // "explosion" source — a null SkinInstance::bones[b] currently falls back
+        // to identity, parking influenced verts at the model/cell origin).
+        uint32_t          g_nullBoneHitsInterval  = 0; // total null bones seen / interval
+        uint32_t          g_nullBonePartsInterval = 0; // distinct parts with >=1 null bone
+        const char*       g_nullBoneSampleTex     = nullptr; // a sample part's texture
 
         std::unordered_map<uint32_t, CachedGeometry>      g_cache;
         // Reverse map GPU texture -> SourceTexture::fileName, for resolveTextureName().
@@ -294,15 +300,29 @@ namespace MGE::GeometryCache {
         // Per-frame: fill bonePalette with each bone's model->world matrix
         // (D3D row-vector form, pos*M = world). Cheap: numBones matrices, no
         // per-vertex work. Assumes numBones <= kMaxBones (guarded at VB build).
-        void buildBonePalette(CachedGeometry& e, NI::SkinInstance* si, NI::SkinData* sd) {
+        void buildD3DTransform(float out[16], const NI::TriBasedGeometry* geom);
+
+        void buildBonePalette(CachedGeometry& e, const NI::TriBasedGeometry* geom,
+                              NI::SkinInstance* si, NI::SkinData* sd) {
             const uint32_t numBones = sd->numBones;
             e.bonePalette.resize(numBones * 16);
+            bool partHadNullBone = false;
             for (uint32_t b = 0; b < numBones; ++b) {
                 float* m = &e.bonePalette[b * 16];
                 NI::AVObject* boneNode = si->bones[b];
                 if (!boneNode) {
-                    for (int i = 0; i < 16; ++i) m[i] = 0.0f;
-                    m[0] = m[5] = m[10] = m[15] = 1.0f;
+                    // Phase 0: a null bone influence. Fall back to the geometry's own
+                    // world transform (keeps influenced verts attached to the object)
+                    // instead of identity, which parked them at the model/cell origin
+                    // and stretched origin->NPC triangles into the depth buffer. The
+                    // diagnostic counters stay on permanently to catch any recurrence.
+                    ++g_nullBoneHitsInterval;
+                    if (!partHadNullBone) {
+                        partHadNullBone = true;
+                        ++g_nullBonePartsInterval;
+                        if (e.textureName) g_nullBoneSampleTex = e.textureName;
+                    }
+                    buildD3DTransform(m, geom);
                     continue;
                 }
                 // Compose: apply bone offset, then bone world (matches CPU-skin math).
@@ -327,6 +347,28 @@ namespace MGE::GeometryCache {
             buildD3DFromTransform(out, geom->worldTransform);
         }
 
+        // Sign of the upper-left 3x3 determinant of a row-major affine matrix.
+        // Negative => the transform mirrors (reflects) the mesh, flipping clip-space
+        // triangle winding. Left-side body parts / armor reuse the right mesh via a
+        // negative-scale node, so they hit this. The depth/shadow cache must cull the
+        // OPPOSITE face for these, else it records the inner surface (SSAO shows
+        // "inside-out" left limbs). Sign is layout-invariant (det A == det Aᵀ).
+        bool isMirroredMatrix(const float m[16]) {
+            const float det = m[0] * (m[5] * m[10] - m[6] * m[9])
+                            - m[1] * (m[4] * m[10] - m[6] * m[8])
+                            + m[2] * (m[4] * m[9]  - m[5] * m[8]);
+            return det < 0.0f;
+        }
+
+        // Pick the transform that maps this part's mesh into world space: the bone
+        // palette root for skinned parts (the limb's bones share the reflection sign),
+        // the geometry's world transform otherwise.
+        bool computeMirrored(const CachedGeometry& e) {
+            const float* m = (e.isSkinned && e.numBones > 0 && !e.skinnedUnsupported)
+                             ? e.bonePalette.data() : e.worldTransformD3D;
+            return isMirroredMatrix(m);
+        }
+
         void visitGeometry(NI::TriBasedGeometry* geom, bool inCharacter) {
             auto* data = geom->getModelData().get();
             if (!data) return;
@@ -345,7 +387,7 @@ namespace MGE::GeometryCache {
                 e.numBones = 0; e.skinnedUnsupported = false;
                 if (sk) {
                     buildSkinnedVB(e, geom, data, si, sd);          // static
-                    if (!e.skinnedUnsupported) buildBonePalette(e, si, sd);
+                    if (!e.skinnedUnsupported) buildBonePalette(e, geom, si, sd);
                 } else {
                     uploadEntry(e, geom, data);
                 }
@@ -353,6 +395,7 @@ namespace MGE::GeometryCache {
                 buildD3DTransform(e.worldTransformD3D, geom);       // bounds center
                 e.dynamicHint = (sk || inCharacter) ? 4 : 0;
                 e.lastFrame = g_frame;
+                e.mirrored = computeMirrored(e);                    // winding flip for depth/shadow
             } else {
                 auto& e = it->second;
                 e.lastFrame = g_frame;
@@ -362,7 +405,7 @@ namespace MGE::GeometryCache {
                         buildSkinnedVB(e, geom, data, si, sd);
                         extractMaterial(e, geom);
                     }
-                    if (!e.skinnedUnsupported) buildBonePalette(e, si, sd);  // per frame
+                    if (!e.skinnedUnsupported) buildBonePalette(e, geom, si, sd);  // per frame
                     buildD3DTransform(e.worldTransformD3D, geom);            // bounds center
                     e.dynamicHint = 4;
                 } else {
@@ -385,6 +428,7 @@ namespace MGE::GeometryCache {
                         memcpy(e.worldTransformD3D, newTransform, sizeof(newTransform));
                     }
                 }
+                e.mirrored = computeMirrored(e);                    // winding flip for depth/shadow
             }
         }
 
@@ -483,15 +527,23 @@ namespace MGE::GeometryCache {
             static uint64_t s_lastLog = 0;
             if (g_frame - s_lastLog >= 1800) {
                 uint32_t skinnedCount = 0, namedTexCount = 0, nullTexCount = 0, nullNameCount = 0;
+                uint32_t mirroredCount = 0;
                 for (const auto& kv : g_cache) {
                     if (kv.second.isSkinned) ++skinnedCount;
+                    if (kv.second.mirrored) ++mirroredCount;
                     if (kv.second.d3dTexture && kv.second.textureName) ++namedTexCount;
                     else if (!kv.second.d3dTexture) ++nullTexCount;
                     else ++nullNameCount;
                 }
                 LOG::logline("-- [GEOM CACHE] frame=%llu cached=%zu skinned=%u named=%u nulltex=%u nullname=%u mapSize=%zu uploads/interval=%llu",
                     g_frame, g_cache.size(), skinnedCount, namedTexCount, nullTexCount, nullNameCount, g_textureNameMap.size(), g_uploadedInterval);
+                LOG::logline("-- [GEOM CACHE] nullbone hits/interval=%u parts/interval=%u sampleTex=%s mirrored=%u",
+                    g_nullBoneHitsInterval, g_nullBonePartsInterval,
+                    g_nullBoneSampleTex ? g_nullBoneSampleTex : "(none)", mirroredCount);
                 g_uploadedInterval = 0;
+                g_nullBoneHitsInterval = 0;
+                g_nullBonePartsInterval = 0;
+                g_nullBoneSampleTex = nullptr;
                 s_lastLog = g_frame;
             }
         }

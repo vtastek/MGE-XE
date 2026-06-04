@@ -40,6 +40,10 @@ namespace MGE::GeometryCache {
         uint32_t numBones;
         bool     skinnedUnsupported;
         uint8_t  dynamicHint;           // counts down from N when transform moves; 0 = static
+        // True when the part's world/bone transform has negative determinant (a
+        // mirrored left-side part). Clip-space winding is flipped, so the cache
+        // depth/shadow draws must cull the opposite face for these.
+        bool     mirrored;
         // Material (pointers into NI memory — valid for the session)
         IDirect3DTexture9* d3dTexture;  // null if no base texture
         const char*        textureName; // SourceTexture::fileName, null if none
