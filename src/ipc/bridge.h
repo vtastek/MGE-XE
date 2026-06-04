@@ -210,6 +210,13 @@ namespace IPC {
         IN ViewFrustum reflFrustum;
         IN D3DXVECTOR4 reflSphere;
         IN VisibleSetSort reflSort;
+
+        // Host-side occlusion cull. occlusionMask is a Vec holding the
+        // [OcclusionMask::Header][raw MOC ZTile buffer] blob shipped from
+        // msoc.dll; the server reconstructs the mask and TestRect-culls each
+        // frustum survivor before PushBack, so only visible statics cross the
+        // wire. InvalidVector ⇒ no host cull (behaves exactly as before).
+        IN VecId occlusionMask;
     };
 
 	struct Parameters {

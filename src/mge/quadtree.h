@@ -39,6 +39,18 @@ struct QuadTreeMesh: public RenderMesh {
     static bool CompareByTexture(const RenderMesh& lh, const RenderMesh& rh);
 };
 
+// Optional occlusion hook threaded into the quadtree walk. MOC-free (a plain
+// function pointer) so quadtree.h stays free of any MOC / host dependency: the
+// 64-bit host registers a callback that TestRect's the mesh against the shipped
+// mask, letting the walk skip occluded statics BEFORE PushBack — so only visible
+// survivors cross the IPC boundary. nullptr ⇒ no occlusion filtering (the MGE
+// in-process / non-IPC path, unchanged).
+struct OcclusionFilter {
+    // Returns true if the mesh is occluded and should NOT be added to the set.
+    bool (*cull)(void* ctx, const QuadTreeMesh& mesh);
+    void* ctx;
+};
+
 //-----------------------------------------------------------------------------
 template<class T>
 class VisibleSet {
@@ -229,7 +241,7 @@ struct QuadTreeNode {
     ~QuadTreeNode();
 
     template<class T>
-    void GetVisibleMeshes(const ViewFrustum& frustum, const D3DXVECTOR4& viewsphere, VisibleSet<T>& visible_set, bool inside = false) {
+    void GetVisibleMeshes(const ViewFrustum& frustum, const D3DXVECTOR4& viewsphere, VisibleSet<T>& visible_set, bool inside = false, const OcclusionFilter* occ = nullptr) {
         // Check if this node is fully outside the frustum.
         // If inside = true then that means it has already been determined that this entire branch is visible
         if (inside == false) {
@@ -245,16 +257,16 @@ struct QuadTreeNode {
 
         // If this node has children, check them
         if (children[0]) {
-            children[0]->GetVisibleMeshes(frustum, viewsphere, visible_set, inside);
+            children[0]->GetVisibleMeshes(frustum, viewsphere, visible_set, inside, occ);
         }
         if (children[1]) {
-            children[1]->GetVisibleMeshes(frustum, viewsphere, visible_set, inside);
+            children[1]->GetVisibleMeshes(frustum, viewsphere, visible_set, inside, occ);
         }
         if (children[2]) {
-            children[2]->GetVisibleMeshes(frustum, viewsphere, visible_set, inside);
+            children[2]->GetVisibleMeshes(frustum, viewsphere, visible_set, inside, occ);
         }
         if (children[3]) {
-            children[3]->GetVisibleMeshes(frustum, viewsphere, visible_set, inside);
+            children[3]->GetVisibleMeshes(frustum, viewsphere, visible_set, inside, occ);
         }
         if (meshes.empty()) {
             return;
@@ -288,6 +300,11 @@ struct QuadTreeNode {
             float view_limit = viewsphere.w + mesh->sphere.radius;
 
             if (range_squared <= view_limit * view_limit) {
+                // Occlusion filter (host-side cull): skip statics the mask proves
+                // hidden BEFORE they enter the set, so only survivors cross IPC.
+                if (occ && occ->cull(occ->ctx, *mesh)) {
+                    continue;
+                }
                 visible_set.PushBack(*mesh);
             }
         }
@@ -371,8 +388,8 @@ public:
     bool Optimize();
     void Clear();
     template<class T>
-    void GetVisibleMeshes(const ViewFrustum& frustum, const D3DXVECTOR4& viewsphere, VisibleSet<T>& visible_set) {
-        m_root_node->GetVisibleMeshes(frustum, viewsphere, visible_set);
+    void GetVisibleMeshes(const ViewFrustum& frustum, const D3DXVECTOR4& viewsphere, VisibleSet<T>& visible_set, const OcclusionFilter* occ = nullptr) {
+        m_root_node->GetVisibleMeshes(frustum, viewsphere, visible_set, false, occ);
     }
     template<class T>
     void GetVisibleMeshesCoarse(const ViewFrustum& frustum, VisibleSet<T>& visible_set) {

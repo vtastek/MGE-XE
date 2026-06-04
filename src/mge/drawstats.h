@@ -42,6 +42,20 @@ namespace DrawStats {
         return n[s];
     }
 
+    // Persistent "draws:<stage>" plot-name literals. Tracy stores the plot-name
+    // POINTER (never copies it), so the name must outlive the capture — a stack
+    // buffer would leave Tracy reading freed memory and render the plot label as
+    // mojibake. These literals have static lifetime, so the labels stay valid.
+    inline const char* plotName(Stage s) {
+        static const char* const n[COUNT] = {
+            "draws:scene0", "draws:scene1", "draws:scene2", "draws:ui",
+            "draws:depth", "draws:shadow", "draws:refl",
+            "draws:land", "draws:statics", "draws:grass", "draws:water", "draws:sky",
+            "draws:post", "draws:dbg", "draws:other"
+        };
+        return n[s];
+    }
+
     inline thread_local Stage g_stage = Other;
     inline std::uint32_t g_calls[COUNT] = {};
     inline std::uint32_t g_prims[COUNT] = {};

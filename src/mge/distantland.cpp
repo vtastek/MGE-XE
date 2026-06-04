@@ -331,7 +331,10 @@ void DistantLand::renderStage0() {
             effect->End();
             renderMSOCBasinBoundsDebug(&mwView, &distProj);
             renderBasinDebug(&mwView, &distProj);
-            renderCurtainDebug();
+            // Curtain occluder superseded by box occluders (contributeTerrainBox-
+            // Occluders); the curtain path is no longer fed, so this overlay always
+            // no-ops. Disabled here but kept defined/parked alongside the basin code.
+            // renderCurtainDebug();
             renderBoxOccluderDebug(&mwView, &distProj);
             renderWaterProxyBoundsDebug(&mwView, &distProj);
 

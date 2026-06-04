@@ -34,10 +34,8 @@ void DrawStats::logFrame() {
 
 #ifdef TRACY_ENABLE
     if (g_tracyActive) {
-        char plot[32];
         for (int i = 0; i < COUNT; ++i) {
-            _snprintf_s(plot, sizeof(plot), _TRUNCATE, "draws:%s", name((Stage)i));
-            TracyPlot(plot, (int64_t)g_calls[i]);
+            TracyPlot(plotName((Stage)i), (int64_t)g_calls[i]);
         }
         TracyPlot("draws:TOTAL", (int64_t)totalCalls);
     }

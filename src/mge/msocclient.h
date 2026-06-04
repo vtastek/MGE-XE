@@ -134,6 +134,16 @@ public:
         const float* verts, int vtxCount, int stride, int offY, int offW,
         const unsigned int* tris, int triCount);
 
+    // True if the plugin exports mwse_copyOcclusionMask (host-side cull). When
+    // false, host occlusion cull must stay disabled (the mask can't be shipped).
+    static bool hasMaskExport();
+
+    // Copy the snapshot mask blob ([OcclusionMask::Header][raw ZTile buffer])
+    // for shipping to the 64-bit host. Two-call: dst==nullptr returns the
+    // required byte count; otherwise returns bytes written (0 if unavailable or
+    // dstBytes too small). See OcclusionMask::Header / msoc.dll's MaskBlobHeader.
+    static int copyMaskBlob(void* dst, int dstBytes);
+
     // Register/unregister a callback that receives the MSOC-culled visible
     // geometry set each frame (before Morrowind's drainPendingDisplays).
     // Callback signature: void __cdecl cb(void* const* shapes, const float* boundsXYZR, int count)

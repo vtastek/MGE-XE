@@ -132,6 +132,13 @@ namespace IPC {
 		std::optional<T> pop_back();
 
 		bool reserve(std::uint32_t count);
+
+		// Bulk overwrite the vector with `bytes` raw bytes from `src`, as a flat
+		// memcpy into window 0. Requires sizeof(T)==1 and bytes <= the window
+		// size (caller sizes the vec so the blob is single-window). Avoids
+		// per-byte push_back for large blobs (e.g. the occlusion-mask transfer).
+		// Sets size() == bytes. Returns false if it would span windows.
+		bool assign_bytes(const void* src, std::uint32_t bytes);
 	};
 }
 

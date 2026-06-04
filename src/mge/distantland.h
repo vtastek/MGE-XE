@@ -6,6 +6,7 @@
 #include "specificrender.h"
 #include "ipc/client.h"
 #include "ipc/dlshare.h"
+#include "ipc/occlusionmask.h"
 
 #include <cstdint>
 #include <string>
@@ -107,12 +108,16 @@ public:
     static VisibleSet<IpcClientVector> visGrassShared;
     static VisibleSet<IpcClientVector> visExtraShared;
     static IPC::VecView<IPC::DynVisFlag> dynVisFlagsShared;
+    // Single-window chunk vec carrying the occlusion-mask blob shipped to the
+    // host each frame (host-side cull). Empty/InvalidVector when disabled.
+    static IPC::VecView<OcclusionMask::MaskChunk> maskBlobShared;
 
     static IPC::VecId visLandSharedId;
     static IPC::VecId visDistantSharedId;
     static IPC::VecId visGrassSharedId;
     static IPC::VecId visExtraSharedId;
     static IPC::VecId dynVisFlagsSharedId;
+    static IPC::VecId maskBlobSharedId;
 
     static std::vector<RecordedState> recordMW;
     static std::vector<RecordedState> recordSky;

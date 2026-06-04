@@ -71,14 +71,14 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
-    <IncludePath>$(SolutionDir)src;C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\include;$(IncludePath)</IncludePath>
+    <IncludePath>$(SolutionDir)src;$(SolutionDir)3rdparty\msoc;C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\include;$(IncludePath)</IncludePath>
     <LibraryPath>C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\Lib\x64;$(LibraryPath)</LibraryPath>
     <OutDir>$(SolutionDir)bin\MSVC-$(Configuration)\</OutDir>
     <IntDir>$(SolutionDir)bin\MSVC-$(Configuration)\mgeHost64\</IntDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <LibraryPath>C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\Lib\x64;$(LibraryPath)</LibraryPath>
-    <IncludePath>$(SolutionDir)src;C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\include;$(IncludePath)</IncludePath>
+    <IncludePath>$(SolutionDir)src;$(SolutionDir)3rdparty\msoc;C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\include;$(IncludePath)</IncludePath>
     <OutDir>$(SolutionDir)bin\MSVC-$(Configuration)\</OutDir>
     <IntDir>$(SolutionDir)bin\MSVC-$(Configuration)\mgeHost64\</IntDir>
   </PropertyGroup>
@@ -157,6 +157,17 @@
     <ClCompile Include="..\src\mge\quadtree.cpp" />
     <ClCompile Include="..\src\support\log.cpp" />
     <ClCompile Include="main.cpp" />
+    <!-- Vendored Intel MOC for host-side occlusion testing. Per-ISA .cpp files
+         get elevated /arch flags; the dispatcher (MaskedOcclusionCulling.cpp)
+         picks the supported tier at runtime, matching msoc.dll's choice on the
+         same CPU. -->
+    <ClCompile Include="..\3rdparty\msoc\MaskedOcclusionCulling.cpp" />
+    <ClCompile Include="..\3rdparty\msoc\MaskedOcclusionCullingAVX2.cpp">
+      <AdditionalOptions>/arch:AVX2 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <ClCompile Include="..\3rdparty\msoc\MaskedOcclusionCullingAVX512.cpp">
+      <AdditionalOptions>/arch:AVX512 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\src\ipc\bridge.h" />
@@ -174,6 +185,9 @@
     <ClInclude Include="..\src\mge\quadtree.h" />
     <ClInclude Include="..\src\support\log.h" />
     <ClInclude Include="..\src\support\winheader.h" />
+    <ClInclude Include="..\src\ipc\occlusionmask.h" />
+    <ClInclude Include="..\src\ipc\occlusiontest.h" />
+    <ClInclude Include="..\3rdparty\msoc\MaskedOcclusionCulling.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

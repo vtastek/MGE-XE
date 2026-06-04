@@ -67,12 +67,14 @@ VisibleSet<IpcClientVector> DistantLand::visDistantShared;
 VisibleSet<IpcClientVector> DistantLand::visGrassShared;
 VisibleSet<IpcClientVector> DistantLand::visExtraShared;
 IPC::VecView<IPC::DynVisFlag> DistantLand::dynVisFlagsShared;
+IPC::VecView<OcclusionMask::MaskChunk> DistantLand::maskBlobShared;
 
 IPC::VecId DistantLand::visLandSharedId = IPC::InvalidVector;
 IPC::VecId DistantLand::visDistantSharedId = IPC::InvalidVector;
 IPC::VecId DistantLand::visGrassSharedId = IPC::InvalidVector;
 IPC::VecId DistantLand::visExtraSharedId = IPC::InvalidVector;
 IPC::VecId DistantLand::dynVisFlagsSharedId = IPC::InvalidVector;
+IPC::VecId DistantLand::maskBlobSharedId = IPC::InvalidVector;
 
 vector<DistantLand::RecordedState> DistantLand::recordMW;
 vector<DistantLand::RecordedState> DistantLand::recordSky;
@@ -412,6 +414,21 @@ bool DistantLand::initIpc() {
     auto& dynVisVec = maybeDynVisVec.value();
     dynVisFlagsSharedId = dynVisVec.id();
     dynVisFlagsShared = dynVisVec;
+
+    // Occlusion-mask transfer vec (host-side cull). One resident window of
+    // kBlobChunks × 64KB chunks — large enough for the biggest blob (AVX512
+    // ZTile buffer ~96KB + header) while keeping the Vec reservation tiny (the
+    // element is a 64KB chunk, not a byte, so maxSize*windowBytes stays small;
+    // see occlusionmask.h). Allocated unconditionally; written only when
+    // host-cull is enabled + supported.
+    auto maybeMaskVec = ipcClient.allocVecBlocking<OcclusionMask::MaskChunk>(
+        OcclusionMask::kBlobChunks, OcclusionMask::kBlobChunks, OcclusionMask::kBlobChunks);
+    if (!maybeMaskVec.has_value()) {
+        return false;
+    }
+    auto& maskVec = maybeMaskVec.value();
+    maskBlobSharedId = maskVec.id();
+    maskBlobShared = maskVec;
 
     return true;
 }

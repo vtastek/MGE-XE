@@ -112,6 +112,7 @@ struct ConfigurationStruct {
     int WindowAlignX, WindowAlignY;
     bool UseSharedMemory;
     bool UseOcclusionCulling;  // reuse msoc.dll's CPU occlusion mask for distant statics
+    bool UseHostOcclusionCull; // ship the mask to the 64-bit host so it occlusion-culls distant statics in the quadtree walk (only survivors cross IPC). Default off.
     int OcclusionHysteresisFrames;  // consecutive OCCLUDED frames before a static actually culls
     float OcclusionSphereInflate;   // per-instance sphere/OBB radius scale for verdict stability
     bool LogDistantPipeline;        // gate per-frame diagnostic loglines + phase-timer reports + Numpad-5 mask dump

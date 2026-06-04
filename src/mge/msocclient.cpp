@@ -27,6 +27,7 @@ using FnAddPreTransformedOccluder = int  (__cdecl*)(
     const unsigned int* tris, int triCount);
 using FnRegisterVisGeom   = void (__cdecl*)(void(__cdecl*)(void* const*, const float*, int));
 using FnUnregisterVisGeom = void (__cdecl*)(void(__cdecl*)(void* const*, const float*, int));
+using FnCopyMask          = int  (__cdecl*)(void* dst, int dstBytes);
 
 HMODULE       g_module            = nullptr;
 FnIsMaskReady g_isMaskReady       = nullptr;
@@ -41,6 +42,7 @@ FnAddOccluder         g_addOccluder      = nullptr;  // optional
 FnAddPreTransformedOccluder g_addPreTransformedOccluder = nullptr;  // optional
 FnRegisterVisGeom     g_registerVisGeom   = nullptr;  // optional
 FnUnregisterVisGeom   g_unregisterVisGeom = nullptr;  // optional
+FnCopyMask            g_copyMask          = nullptr;  // optional; host-cull only
 bool          g_probed             = false;
 
 // Frozen ABI codes from the plugin. Match PatchOcclusionCulling.h.
@@ -101,6 +103,8 @@ void MSOCClient::init() {
         GetProcAddress(g_module, "mwse_registerVisibleGeomCallback"));
     g_unregisterVisGeom = reinterpret_cast<FnUnregisterVisGeom>(
         GetProcAddress(g_module, "mwse_unregisterVisibleGeomCallback"));
+    g_copyMask = reinterpret_cast<FnCopyMask>(
+        GetProcAddress(g_module, "mwse_copyOcclusionMask"));
 
     if (!g_isMaskReady || !g_testSphere) {
         LOG::logline("-- MSOC: msoc.dll loaded but required exports missing; disabling");
@@ -118,6 +122,7 @@ void MSOCClient::init() {
         g_addPreTransformedOccluder = nullptr;
         g_registerVisGeom = nullptr;
         g_unregisterVisGeom = nullptr;
+        g_copyMask = nullptr;
         return;
     }
 
@@ -287,4 +292,13 @@ bool MSOCClient::unregisterVisibleGeomCallback(FnVisibleGeomCallback cb) {
     if (!g_unregisterVisGeom || !cb) return false;
     g_unregisterVisGeom(cb);
     return true;
+}
+
+bool MSOCClient::hasMaskExport() {
+    return g_copyMask != nullptr;
+}
+
+int MSOCClient::copyMaskBlob(void* dst, int dstBytes) {
+    if (!g_copyMask) return 0;
+    return g_copyMask(dst, dstBytes);
 }

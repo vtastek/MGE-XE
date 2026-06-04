@@ -143,6 +143,7 @@ const iniSetting iniSettings[] = {
     {&Configuration.OnlyProxyD3D8To9, t_bool, 1, siniMisc, "Only Proxy D3D8To9", False, &dictBool, DICTONLY|DONT_SAVE, 0, 0},
     {&Configuration.UseSharedMemory, t_bool, 1, siniMisc, "Use Shared Memory", False, &dictBool, DICTONLY, 0, 0},
     {&Configuration.UseOcclusionCulling, t_bool, 1, siniMisc, "Use Occlusion Culling", False, &dictBool, DICTONLY, 0, 0},
+    {&Configuration.UseHostOcclusionCull, t_bool, 1, siniMisc, "Use Host Occlusion Cull", False, &dictBool, DICTONLY, 0, 0},
     {&Configuration.OcclusionHysteresisFrames, t_int32, 1, siniMisc, "Occlusion Hysteresis Frames", "8", NULL, MINMAX, 1, 30},
     {&Configuration.OcclusionSphereInflate, t_float, 1, siniMisc, "Occlusion Sphere Inflate", "1.15", NULL, MINMAX, 1.0, 3.0},
     {&Configuration.LogDistantPipeline, t_bool, 1, siniMisc, "Log Distant Pipeline", False, &dictBool, DICTONLY, 0, 0},

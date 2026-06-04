@@ -57,6 +57,12 @@ static std::vector<RenderMesh> g_reflMeshValues;
 // Statics; consumed for the Phase-1 comparison diag and (when g_basinCullActive)
 // the front filter in the MSOC partition.
 static std::vector<std::uint8_t> g_basinOccluded;
+// True on frames where MGE shipped a ready mask to the host, so the host ran the
+// occlusion cull during its quadtree walk and visDistantShared already holds only
+// survivors. When set, applyMSOCToDistantStatics skips its own (now redundant)
+// group+sphere cull and just materializes + sorts. Reset each frame in the
+// kickoff. Same-build deploy guarantees the host loads any mask MGE ships ready.
+static bool g_hostCullActiveThisFrame = false;
 // Phase 1 (default): compute the basin verdict + comparison diag but do not
 // cull with it (proves conservativeness before any geometry is dropped).
 static bool g_basinEnabled    = true;
@@ -1001,6 +1007,7 @@ void DistantLand::cullDistantStatics_kickoff(const D3DXMATRIX* view, const D3DXM
     // always runs before the renderDepth channel-free gate and before _finish,
     // so both read a current-frame value.
     s_cullOnWorker = false;
+    g_hostCullActiveThisFrame = false;   // set true below iff a ready mask ships
 
     D3DXMATRIX ds_proj = *proj, ds_viewproj;
     D3DXVECTOR4 viewsphere(eyePos.x, eyePos.y, eyePos.z, 0);
@@ -1074,17 +1081,42 @@ void DistantLand::cullDistantStatics_kickoff(const D3DXMATRIX* view, const D3DXM
         // kickoff→drain head-start window; the worker then drains both statics and
         // reflection in one drain. reflStaticsWanted=false (no near-static
         // reflections, or inline-fallback kickoff) ⇒ reflFlags=0, no fold.
+        // Host-side occlusion cull: ship msoc.dll's snapshot mask into the
+        // single-window blob vec so the server TestRect-culls each frustum
+        // survivor before PushBack — only visible survivors cross the wire.
+        // Gated (default off) + needs the plugin's copy export + a ready mask.
+        // occlMaskId stays InvalidVector otherwise, and the server behaves
+        // exactly as before. When a ready mask ships, g_hostCullActiveThisFrame
+        // tells applyMSOCToDistantStatics to skip its now-redundant cull.
+        IPC::VecId occlMaskId = IPC::InvalidVector;
+        if (Configuration.UseHostOcclusionCull && MSOCClient::hasMaskExport() &&
+            MSOCClient::isMaskReady() && maskBlobSharedId != IPC::InvalidVector) {
+            static std::vector<char> maskScratch;
+            const int need = MSOCClient::copyMaskBlob(nullptr, 0);
+            if (need > 0) {
+                if ((int)maskScratch.size() < need) maskScratch.resize(need);
+                const int wrote = MSOCClient::copyMaskBlob(maskScratch.data(), (int)maskScratch.size());
+                if (wrote > 0 &&
+                    maskBlobShared.assign_bytes(maskScratch.data(), (std::uint32_t)wrote)) {
+                    occlMaskId = maskBlobSharedId;
+                    g_hostCullActiveThisFrame = true;
+                }
+            }
+        }
+
         if (reflStaticsWanted) {
             ViewFrustum reflFrustum(&reflCullViewProj);
             ipcClient.getVisibleMeshesAllRanges(
                 visDistantSharedId, 3, frustums, spheres, setFlags,
                 VisibleSetSort::None,
                 visExtraSharedId, VIS_STATIC, &reflFrustum, &reflCullViewSphere,
-                VisibleSetSort::ByState);
+                VisibleSetSort::ByState, occlMaskId);
         } else {
             ipcClient.getVisibleMeshesAllRanges(
                 visDistantSharedId, 3, frustums, spheres, setFlags,
-                VisibleSetSort::None);
+                VisibleSetSort::None,
+                IPC::InvalidVector, 0, nullptr, nullptr,
+                VisibleSetSort::None, occlMaskId);
         }
     } else {
         // Non-IPC path: synchronous quadtree work happens on the main
@@ -1686,8 +1718,12 @@ void DistantLand::applyMSOCToDistantStatics(VisibleSet<T>& staticSet) {
 
     // Compute the occlusion mask only when culling is active in an exterior
     // with a ready mask and a non-empty set; otherwise every mesh survives.
+    // When the host already culled this frame (g_hostCullActiveThisFrame),
+    // staticSet is the survivor set — skip the now-redundant group+sphere cull
+    // and just materialize + sort. This is where the verdict cost collapses.
     const bool cullByOcclusion =
         setSize != 0
+        && !g_hostCullActiveThisFrame
         && Configuration.UseOcclusionCulling
         && MSOCClient::isAvailable()
         && MSOCClient::isMaskReady()

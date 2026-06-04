@@ -8,6 +8,7 @@
 #include "support/log.h"
 
 #include <cassert>
+#include <cstring>
 
 namespace IPC {
 	template<typename T>
@@ -384,6 +385,25 @@ namespace IPC {
 				return false;
 		}
 
+		return true;
+	}
+
+	template<typename T>
+	bool VecView<T>::assign_bytes(const void* src, std::uint32_t bytes) {
+		// Flat bulk write of a raw blob into window 0. Works for any element type
+		// (the blob memcpy's across whole elements); the vec must be sized so the
+		// blob fits one window. size() is set to the element count covering bytes.
+		const std::uint32_t windowBytes = m_windowSize * static_cast<std::uint32_t>(sizeof(T));
+		if (bytes > windowBytes)
+			return false;                 // would span windows; unsupported
+		// Map+commit window 0 for writing (isAppend=true), then flat-copy.
+		if (!slide_window(0, true))
+			return false;
+		std::memcpy(m_buffer, src, bytes);
+		m_index = 0;
+		m_subIndex = 0;
+		m_shared->size = (bytes + static_cast<std::uint32_t>(sizeof(T)) - 1)
+		               / static_cast<std::uint32_t>(sizeof(T));
 		return true;
 	}
 }
