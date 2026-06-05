@@ -444,4 +444,37 @@ Technique T0 {
         VertexShader = compile vs_3_0 NullVS();
         PixelShader = compile ps_3_0 NullPS();
     }
+    //------------------------------------------------------------
+    // Cache near terrain (reflections) — real MW terrain mesh, two-texture splat
+    Pass P13 {
+        ZEnable = true;
+        ZWriteEnable = true;
+        ZFunc = LessEqual;
+        StencilEnable = false;
+        CullMode = CCW;            // reflection winding (inverted)
+
+        AlphaBlendEnable = false;
+        AlphaTestEnable = false;
+
+        VertexShader = compile vs_3_0 CacheTerrainVS();
+        PixelShader = compile ps_3_0 CacheTerrainPS();
+    }
+    //------------------------------------------------------------
+    // Cache-skinned shadow receiver (reflections) — same states as P2ffe, but
+    // 32-bone skinIndexed VS so skinned NPCs receive sun shadows in the reflection.
+    Pass P14 {
+        ZEnable = true;
+        ZWriteEnable = false;
+        ZFunc = LessEqual;
+        StencilEnable = false;
+        CullMode = CW;
+
+        AlphaBlendEnable = true;
+        SrcBlend = Zero;
+        DestBlend = InvSrcColor;
+        AlphaTestEnable = false;
+
+        VertexShader = compile vs_3_0 RenderShadowsFFESkinnedVS();
+        PixelShader = compile ps_3_0 RenderShadowsPS();
+    }
 }

@@ -28,6 +28,10 @@ namespace MGE::GeometryCache {
         IDirect3DDevice9* g_device          = nullptr;
         IDirect3DVertexDeclaration9* g_skinnedDecl = nullptr;
         uint64_t          g_frame          = 0;
+        // Set while walking the landscape (terrain) root so visitGeometry can tag
+        // entries (CachedGeometry::isLandscape). Terrain is excluded from the
+        // cache color pass — it stays on the distant-land path.
+        bool              g_walkingLandscape = false;
         uint32_t          g_uploadedThisFrame  = 0;
         uint64_t          g_uploadedInterval   = 0; // cumulative over log interval
         // Phase 0 diagnostic: null-bone influence accounting (the suspected NPC
@@ -61,13 +65,34 @@ namespace MGE::GeometryCache {
 
         void extractMaterial(CachedGeometry& e, NI::Geometry* geom) {
             e.d3dTexture  = nullptr;
+            e.d3dOverlay  = nullptr;
             e.textureName = nullptr;
             e.alphaRef    = 0.0f;
             e.alphaTest   = false;
             e.blendEnable = false;
+            // Default material: white diffuse/ambient, no emissive (texture-only
+            // opaque). Overwritten below when the shape carries a MaterialProperty.
+            e.matDiffuse[0]  = e.matDiffuse[1]  = e.matDiffuse[2]  = e.matDiffuse[3]  = 1.0f;
+            e.matAmbient[0]  = e.matAmbient[1]  = e.matAmbient[2]  = e.matAmbient[3]  = 1.0f;
+            e.matEmissive[0] = e.matEmissive[1] = e.matEmissive[2] = e.matEmissive[3] = 0.0f;
+            e.vColSource = 0;   // SOURCE_IGNORE until a VertexColorProperty says otherwise
 
             auto* ps = reinterpret_cast<NI::PropertyState*>(geom->propertyState);
             if (!ps) return;
+
+            if (ps->vertexColor) {
+                e.vColSource = static_cast<uint8_t>(ps->vertexColor->source);  // 0 ignore, 1 emissive, 2 amb+diff
+            }
+
+            if (ps->material) {
+                const auto* mp = ps->material;
+                e.matDiffuse[0]  = mp->diffuse.r;  e.matDiffuse[1]  = mp->diffuse.g;
+                e.matDiffuse[2]  = mp->diffuse.b;  e.matDiffuse[3]  = mp->alpha;
+                e.matAmbient[0]  = mp->ambient.r;  e.matAmbient[1]  = mp->ambient.g;
+                e.matAmbient[2]  = mp->ambient.b;  e.matAmbient[3]  = 1.0f;
+                e.matEmissive[0] = mp->emissive.r; e.matEmissive[1] = mp->emissive.g;
+                e.matEmissive[2] = mp->emissive.b; e.matEmissive[3] = 0.0f;
+            }
 
             if (ps->alpha) {
                 const auto* ap = ps->alpha;
@@ -86,6 +111,17 @@ namespace MGE::GeometryCache {
                         e.d3dTexture  = getDX9Texture(tex);
                     }
                 }
+                // Terrain decal overlay: maps[6] = DECAL_1 (the second land texture
+                // for splat blending). Present on multi-texture terrain patches.
+                if (ps->texture->maps.getEndIndex() > 6u) {
+                    const auto* decalMap = ps->texture->maps.at(6);
+                    if (decalMap && decalMap->texture) {
+                        auto* dtex = decalMap->texture.get();
+                        if (dtex->isInstanceOfType(NI::RTTIStaticPtr::NiSourceTexture)) {
+                            e.d3dOverlay = getDX9Texture(dtex);
+                        }
+                    }
+                }
             }
         }
 
@@ -93,21 +129,22 @@ namespace MGE::GeometryCache {
         // D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_TEX1, stride 36.
         struct DepthVertex {
             float x, y, z;    // POSITION  (12)
-            float nx, ny, nz; // NORMAL    (12, zeros — depth/shadow don't use normals)
+            float nx, ny, nz; // NORMAL    (12, model-space; depth/shadow ignore, color pass lights)
             DWORD color;       // DIFFUSE   ( 4, 0xFFFFFFFF — hasVCol=false, unused)
             float u, v;        // TEXCOORD0 ( 8, from UV set 0)
         };
         static_assert(sizeof(DepthVertex) == 36, "DepthVertex size mismatch");
 
         // Skinned vertex layout matching SkinnedVertIn (VS palette skinning input).
-        // Drawn with g_skinnedDecl; stride 40.
+        // Drawn with g_skinnedDecl; stride 52.
         struct SkinnedVertex {
             float x, y, z;          // POSITION     (12) bind-pose
+            float nx, ny, nz;       // NORMAL       (12) bind-pose model-space
             float w0, w1, w2, w3;   // BLENDWEIGHT  (16) top-4 influences, normalized
             DWORD indices;          // BLENDINDICES ( 4) UBYTE4 bone palette indices
             float u, v;             // TEXCOORD0    ( 8)
         };
-        static_assert(sizeof(SkinnedVertex) == 40, "SkinnedVertex size mismatch");
+        static_assert(sizeof(SkinnedVertex) == 52, "SkinnedVertex size mismatch");
 
         void uploadEntry(CachedGeometry& e, NI::TriBasedGeometry* geom,
                          NI::TriBasedGeometryData* data) {
@@ -151,10 +188,16 @@ namespace MGE::GeometryCache {
             if (SUCCEEDED(e.vb[slot]->Lock(0, 0, &vbData, 0))) {
                 auto* verts = static_cast<DepthVertex*>(vbData);
                 const auto* uvs = data->textureCoords;  // NI::Point2*, nullptr if no UVs
+                const auto* nrm = data->normal;         // NI::Point3*, nullptr if no normals
+                const auto* vcol = data->color;         // NI::PackedColor*(b,g,r,a)=D3DCOLOR, null if none
                 for (uint32_t i = 0; i < vertexCount; ++i) {
                     verts[i].x = mv[i].x; verts[i].y = mv[i].y; verts[i].z = mv[i].z;
-                    verts[i].nx = 0.0f; verts[i].ny = 0.0f; verts[i].nz = 0.0f;
-                    verts[i].color = 0xFFFFFFFF;
+                    // Model-space normals; lit by renderMorrowind in the cache color pass
+                    // (Phase 0.5). Depth/shadow ignore them. Up if the mesh has none.
+                    if (nrm) { verts[i].nx = nrm[i].x; verts[i].ny = nrm[i].y; verts[i].nz = nrm[i].z; }
+                    else     { verts[i].nx = 0.0f; verts[i].ny = 0.0f; verts[i].nz = 1.0f; }
+                    // PackedColor byte order (b,g,r,a) is exactly D3DCOLOR, copy straight.
+                    verts[i].color = vcol ? *reinterpret_cast<const DWORD*>(&vcol[i]) : 0xFFFFFFFF;
                     verts[i].u = uvs ? uvs[i].x : 0.0f;
                     verts[i].v = uvs ? uvs[i].y : 0.0f;
                 }
@@ -181,6 +224,7 @@ namespace MGE::GeometryCache {
             e.isSkinned          = false;
             e.numBones           = 0;
             e.skinnedUnsupported = false;
+            e.hasVertexColor     = (data->color != nullptr);
 
             const auto& b = data->bounds;
             e.boundsCenter[0] = b.center.x;
@@ -214,6 +258,7 @@ namespace MGE::GeometryCache {
             e.revisionID         = data->revisionID;
             e.isSkinned          = true;
             e.numBones           = numBones;
+            e.hasVertexColor     = false;   // skinned VB layout has no colour slot (0.5-C)
 
             if (numBones > MGE::GeometryCache::kMaxBones) {
                 // Too many bones for the VS palette — skip this caster, report once.
@@ -250,6 +295,7 @@ namespace MGE::GeometryCache {
             if (SUCCEEDED(e.vb[0]->Lock(0, 0, &vbData, 0))) {
                 auto* verts = static_cast<SkinnedVertex*>(vbData);
                 const auto* uvs = data->textureCoords;
+                const auto* nrm = data->normal;         // bind-pose model-space normals
                 for (uint32_t i = 0; i < vertexCount; ++i) {
                     auto& infs = perVert[i];
                     std::sort(infs.begin(), infs.end(),
@@ -263,6 +309,10 @@ namespace MGE::GeometryCache {
                     else             { w[0] = 1.0f; }
 
                     verts[i].x = mv[i].x; verts[i].y = mv[i].y; verts[i].z = mv[i].z;
+                    // Bind-pose normals; the VS skins them by the bone palette (same as
+                    // position) for the cache color pass. Up if the mesh has none.
+                    if (nrm) { verts[i].nx = nrm[i].x; verts[i].ny = nrm[i].y; verts[i].nz = nrm[i].z; }
+                    else     { verts[i].nx = 0.0f; verts[i].ny = 0.0f; verts[i].nz = 1.0f; }
                     verts[i].w0 = w[0]; verts[i].w1 = w[1]; verts[i].w2 = w[2]; verts[i].w3 = w[3];
                     verts[i].indices = static_cast<DWORD>(idx[0])
                                      | (static_cast<DWORD>(idx[1]) << 8)
@@ -395,10 +445,12 @@ namespace MGE::GeometryCache {
                 buildD3DTransform(e.worldTransformD3D, geom);       // bounds center
                 e.dynamicHint = (sk || inCharacter) ? 4 : 0;
                 e.lastFrame = g_frame;
+                e.isLandscape = g_walkingLandscape;
                 e.mirrored = computeMirrored(e);                    // winding flip for depth/shadow
             } else {
                 auto& e = it->second;
                 e.lastFrame = g_frame;
+                e.isLandscape = g_walkingLandscape;
                 if (sk) {
                     // Static skinned VB: rebuild only on revision / skin-state change.
                     if (data->revisionID != e.revisionID || !e.isSkinned) {
@@ -470,13 +522,14 @@ namespace MGE::GeometryCache {
     void init(IDirect3DDevice9* device) {
         g_device = device;
 
-        // Vertex declaration for skinned VBs (SkinnedVertex, stride 40).
+        // Vertex declaration for skinned VBs (SkinnedVertex, stride 52).
         if (!g_skinnedDecl && g_device) {
             static const D3DVERTEXELEMENT9 elems[] = {
                 {0, 0,  D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION,     0},
-                {0, 12, D3DDECLTYPE_FLOAT4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_BLENDWEIGHT,  0},
-                {0, 28, D3DDECLTYPE_UBYTE4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_BLENDINDICES, 0},
-                {0, 32, D3DDECLTYPE_FLOAT2, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD,     0},
+                {0, 12, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_NORMAL,       0},
+                {0, 24, D3DDECLTYPE_FLOAT4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_BLENDWEIGHT,  0},
+                {0, 40, D3DDECLTYPE_UBYTE4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_BLENDINDICES, 0},
+                {0, 44, D3DDECLTYPE_FLOAT2, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD,     0},
                 D3DDECL_END()
             };
             g_device->CreateVertexDeclaration(elems, &g_skinnedDecl);
@@ -505,7 +558,9 @@ namespace MGE::GeometryCache {
         }
         {
             MGE_ZoneScopedN("GeomCache:walkLandscape");
+            g_walkingLandscape = true;
             walk(MGE::DataHandlerView::worldLandscapeRoot(dataHandler));
+            g_walkingLandscape = false;
         }
 
         // Evict entries not seen this frame
@@ -528,18 +583,38 @@ namespace MGE::GeometryCache {
             if (g_frame - s_lastLog >= 1800) {
                 uint32_t skinnedCount = 0, namedTexCount = 0, nullTexCount = 0, nullNameCount = 0;
                 uint32_t mirroredCount = 0;
+                // Terrain (isLandscape) characterization: how the splat passes land
+                // in the cache. landOpaque = base layers (no blend), landAlphaTest,
+                // landBlend = alpha-splat layers (separate trishapes if >0 here).
+                // landVCol = carry vertex colours. Samples a few texture names.
+                uint32_t landCount = 0, landOpaque = 0, landAlphaTest = 0, landBlend = 0, landVCol = 0;
+                const char* landTexA = nullptr; const char* landTexB = nullptr;
                 for (const auto& kv : g_cache) {
                     if (kv.second.isSkinned) ++skinnedCount;
                     if (kv.second.mirrored) ++mirroredCount;
                     if (kv.second.d3dTexture && kv.second.textureName) ++namedTexCount;
                     else if (!kv.second.d3dTexture) ++nullTexCount;
                     else ++nullNameCount;
+                    if (kv.second.isLandscape) {
+                        ++landCount;
+                        if (kv.second.blendEnable) ++landBlend;
+                        else if (kv.second.alphaTest) ++landAlphaTest;
+                        else ++landOpaque;
+                        if (kv.second.hasVertexColor) ++landVCol;
+                        if (kv.second.textureName) {
+                            if (!landTexA) landTexA = kv.second.textureName;
+                            else if (!landTexB && kv.second.textureName != landTexA) landTexB = kv.second.textureName;
+                        }
+                    }
                 }
                 LOG::logline("-- [GEOM CACHE] frame=%llu cached=%zu skinned=%u named=%u nulltex=%u nullname=%u mapSize=%zu uploads/interval=%llu",
                     g_frame, g_cache.size(), skinnedCount, namedTexCount, nullTexCount, nullNameCount, g_textureNameMap.size(), g_uploadedInterval);
                 LOG::logline("-- [GEOM CACHE] nullbone hits/interval=%u parts/interval=%u sampleTex=%s mirrored=%u",
                     g_nullBoneHitsInterval, g_nullBonePartsInterval,
                     g_nullBoneSampleTex ? g_nullBoneSampleTex : "(none)", mirroredCount);
+                LOG::logline("-- [GEOM CACHE] landscape=%u opaque=%u alphatest=%u blend=%u vcol=%u texA=%s texB=%s",
+                    landCount, landOpaque, landAlphaTest, landBlend, landVCol,
+                    landTexA ? landTexA : "(none)", landTexB ? landTexB : "(none)");
                 g_uploadedInterval = 0;
                 g_nullBoneHitsInterval = 0;
                 g_nullBonePartsInterval = 0;

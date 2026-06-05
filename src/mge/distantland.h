@@ -193,6 +193,9 @@ public:
     static D3DXHANDLE ehFogStart, ehFogRange;
     static D3DXHANDLE ehFogNearStart, ehFogNearRange;
     static D3DXHANDLE ehNearViewRange;
+    static D3DXHANDLE ehStaticNearCull;
+    static D3DXHANDLE ehShadowReflMult;
+    static D3DXHANDLE ehLandNearCull;
     static D3DXHANDLE ehWindVec;
     static D3DXHANDLE ehNiceWeather;
     static D3DXHANDLE ehTime;
@@ -360,6 +363,20 @@ public:
     static void renderWaterReflection(const D3DXMATRIX* view, const D3DXMATRIX* proj);
     static void renderReflectedSky();
     static void renderReflectedStatics(const D3DXMATRIX* view, const D3DXMATRIX* proj);
+    // Phase 0.5: inject the GeometryCache dynamic set (NPCs + dynamic statics)
+    // into the water reflection with full color via FixedFunctionShader::
+    // renderMorrowind, driven from the cache walk (not engine draws). Additive —
+    // no engine suppression. Non-skinned opaque parts only in 0.5-B.
+    static void renderReflectionsFromCache(const D3DXMATRIX* view, const D3DXMATRIX* proj, float nearDist);
+    // Phase 0.5: apply sun shadows to the cache reflection objects by re-drawing
+    // them with the shadow-receiver shader. The sun shadow map is world-space, so
+    // reflected geometry samples it correctly via shadowViewProj = inverse(reflView)
+    // * smViewproj. Non-skinned only for now (skinned receiver needs skinIndexed).
+    static void renderReflectionShadowsFromCache(const D3DXMATRIX* view, const D3DXMATRIX* proj, float nearDist);
+    // Phase 0.5: draw the real near terrain from the cache into the reflection
+    // (two-texture AlphaGrid splat), replacing the coarse distant-land LOD inside
+    // nearDist. The DL land pass is near-clipped (landNearCull) to hand off.
+    static void renderReflectionTerrainFromCache(const D3DXMATRIX* view, const D3DXMATRIX* proj, float nearDist);
     static void clearReflection();
     // Water-reflection occlusion gate: true if any water surface is actually
     // visible in the main view (terrain height + MSOC), so the ~1ms reflection

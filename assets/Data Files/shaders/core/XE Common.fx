@@ -30,6 +30,21 @@ shared float4 skyScatterColFar;
 shared float fogStart, fogRange;
 shared float nearFogStart, nearFogRange;
 shared float nearViewRange;
+// Per-object near cull for distant statics: when > 0, a static whose object origin
+// is closer than this to the camera is culled whole (the MGE cache owns the near
+// field and draws it lit). 0 = off (default; normal full-range statics). Set only
+// for the cache-driven reflection handover so the main view is unaffected.
+shared float staticNearCull;
+// Per-object shadow-receiver intensity scale (1 = normal). The cache reflection
+// pass fades it toward 0 at the cache->distant-land handover using the SAME
+// per-object Euclidean distance as the point-light fade, so shadows and lights
+// fade together and land exactly on the geometry handover. Set every receiver
+// draw (1 in the main view), so it never leaks.
+shared float shadowReflMult;
+// Per-pixel near cull for distant-land terrain (handover to the MGE cache near
+// terrain in reflections). When > 0, land fragments closer than this are clipped
+// so the cache draws the near field at full resolution. 0 = off (main view).
+shared float landNearCull;
 shared float3 sunPos;
 shared float sunVis;
 shared float2 windVec;
@@ -112,6 +127,7 @@ struct MorrowindVertIn {
 // indexing boneMatrices. Indices arrive as UBYTE4 (float [0,255]); cast to int.
 struct SkinnedVertIn {
     float4 pos : POSITION;
+    float3 nrm : NORMAL;
     float4 blendweights : BLENDWEIGHT;
     float4 blendindices : BLENDINDICES;
     float2 texcoords : TEXCOORD0;

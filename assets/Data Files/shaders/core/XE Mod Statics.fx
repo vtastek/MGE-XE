@@ -14,6 +14,14 @@ TransformedVert transformStaticVert(StatVertIn IN) {
     v.worldpos = mul(IN.pos, world);
     v.viewpos = mul(v.worldpos, view);
     v.pos = mul(v.viewpos, proj);
+
+    // Per-object near cull (handover to the MGE cache near field). world._41_42_43
+    // is this object's origin, so the test is uniform across the object — the whole
+    // static is culled or kept, never sliced mid-geometry. Inert when staticNearCull
+    // is 0 (origin distance is never negative).
+    if (distance(world._41_42_43, eyePos) < staticNearCull) {
+        v.pos = float4(2, 2, 2, 1);   // outside clip space -> whole object discarded
+    }
     return v;
 }
 

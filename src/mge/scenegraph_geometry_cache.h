@@ -44,12 +44,36 @@ namespace MGE::GeometryCache {
         // mirrored left-side part). Clip-space winding is flipped, so the cache
         // depth/shadow draws must cull the opposite face for these.
         bool     mirrored;
+        // True for entries walked from the world landscape (terrain) root. The
+        // cache-driven color pass excludes these — terrain needs vertex colours +
+        // texture splatting we don't synthesize yet (Phase 2); it stays on the
+        // distant-land reflection path. Depth/shadow ignore this flag.
+        bool     isLandscape;
         // Material (pointers into NI memory — valid for the session)
         IDirect3DTexture9* d3dTexture;  // null if no base texture
+        // Terrain decal overlay (TexturingProperty maps[6] = DECAL_1): the second
+        // land texture, blended over the base by the AlphaGrid in vertex-colour
+        // alpha. Null for non-terrain / single-texture tiles. Drives the cache
+        // terrain reflection's two-texture splat.
+        IDirect3DTexture9* d3dOverlay;
         const char*        textureName; // SourceTexture::fileName, null if none
         float alphaRef;
         bool  alphaTest;
         bool  blendEnable;
+        // Material colours (RGBA) captured from the NI MaterialProperty on the
+        // create/material-change path, for the cache-driven color pass
+        // (Phase 0.5). Default to white diffuse/ambient, zero emissive when the
+        // shape has no material. Depth/shadow ignore these.
+        float matDiffuse[4];
+        float matAmbient[4];
+        float matEmissive[4];
+        // Vertex colour usage. hasVertexColor: the mesh carries per-vertex colours
+        // (filled into the non-skinned VB's DIFFUSE slot). vColSource: NI
+        // VertexColorProperty::source — 0 ignore (vcol unused, constant material),
+        // 1 emissive, 2 ambient+diffuse. The color pass uses vcol only when both say
+        // so, else real material colours win (don't white-wash them).
+        bool    hasVertexColor;
+        uint8_t vColSource;
         // Lifecycle
         uint64_t lastFrame;             // frame counter from most recent visit
         // D3D row-major world transform for non-skinned objects (model-space VBs).
@@ -71,14 +95,14 @@ namespace MGE::GeometryCache {
 
     // Vertex buffer format used by each CachedGeometry::vb.
     // D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_TEX1
-    // Layout: float3 pos, float3 normal(zeros), DWORD color(0xFFFFFFFF), float2 uv
+    // Layout: float3 pos, float3 normal, DWORD color(0xFFFFFFFF), float2 uv
     static constexpr unsigned int kVBStride = 36;
     static constexpr unsigned int kVBFVF    = 0x152; // XYZ|NORMAL|DIFFUSE|TEX1
 
     // Skinned vertex layout (SkinnedVertIn in the shaders): float3 pos,
-    // float4 blendweights, UBYTE4 blendindices, float2 uv. Drawn with skinnedDecl().
-    // kMaxBones must match MAX_BONES in "XE Common.fx".
-    static constexpr unsigned int kSkinnedVBStride = 40;
+    // float3 normal, float4 blendweights, UBYTE4 blendindices, float2 uv. Drawn with
+    // skinnedDecl(). kMaxBones must match MAX_BONES in "XE Common.fx".
+    static constexpr unsigned int kSkinnedVBStride = 52;
     static constexpr unsigned int kMaxBones        = 32;
 
     // Vertex declaration for skinned VBs (created in init). Null until init runs.

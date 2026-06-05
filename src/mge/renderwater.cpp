@@ -4,14 +4,54 @@
 #include "drawstats.h"
 #include "configuration.h"
 #include "doublesurface.h"
+#include "ffeshader.h"
 #include "mwbridge.h"
 #include "postshaders.h"
+#include "scenegraph_geometry_cache.h"
 #include "mge_tracy.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
 
+
+// Tweakable: the cache-driven reflection covers near objects within this fraction
+// of Morrowind's view distance (nearViewRange). Beyond it, distant-land statics
+// take over (dissolved in via ehNearViewRange). 1.0 = full MW view distance; lower
+// (down to ~0.5) shrinks the lit near-field. TODO: promote to a config/Numpad knob.
+static float s_reflectionCacheNearFactor = 1.0f;
+
+// Per-object cache->distant-land handover fade: 1 up close, ramps to 0 over the
+// last quarter before nearDist (the handover), using the object's Euclidean origin
+// distance — the SAME metric the geometry cull uses. Statics only; dynamics (NPCs)
+// keep full intensity. Shared by the point-light fade and the shadow fade so they
+// ramp identically and both land exactly on the geometry handover.
+static float cacheHandoverFade(const D3DXVECTOR3& center, const D3DXVECTOR3& eye,
+                               unsigned dynamicHint, float nearDist) {
+    if (dynamicHint != 0 || nearDist <= 0.0f) return 1.0f;
+    const D3DXVECTOR3 d = center - eye;
+    const float t = (nearDist - D3DXVec3Length(&d)) / (0.25f * nearDist);
+    return t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+}
+
+// World-space bounding sphere for a cache entry. The cache stores the geometry's
+// bound in MODEL space (boundsCenter/boundsRadius); the cull frustum is in world
+// space. Using the object ORIGIN (worldTransformD3D translation) as the sphere
+// center is wrong whenever the geometry is offset from its node origin — most
+// dramatically for terrain patches, whose origin is the cell corner ~4096u from
+// the real patch center, causing false culls when the camera is close/over the
+// cell. Transform the model center by the world matrix and scale the radius by the
+// largest axis scale so the sphere actually encloses the drawn geometry.
+static void cacheWorldBounds(const MGE::GeometryCache::CachedGeometry& e, D3DXVECTOR3& outCenter, float& outRadius) {
+    const D3DXMATRIX& w = *reinterpret_cast<const D3DXMATRIX*>(e.worldTransformD3D);
+    const D3DXVECTOR3 modelC(e.boundsCenter[0], e.boundsCenter[1], e.boundsCenter[2]);
+    D3DXVec3TransformCoord(&outCenter, &modelC, &w);
+    const float sx = D3DXVec3Length(reinterpret_cast<const D3DXVECTOR3*>(&w._11));
+    const float sy = D3DXVec3Length(reinterpret_cast<const D3DXVECTOR3*>(&w._21));
+    const float sz = D3DXVec3Length(reinterpret_cast<const D3DXVECTOR3*>(&w._31));
+    outRadius = e.boundsRadius * std::max(sx, std::max(sy, sz));
+}
 
 void DistantLand::renderWaterReflection(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
     MGE_ZoneScopedN("renderWaterReflection");
@@ -72,25 +112,68 @@ void DistantLand::renderWaterReflection(const D3DXMATRIX* view, const D3DXMATRIX
     device->SetClipPlane(0, plane);
     device->SetRenderState(D3DRS_CLIPPLANEENABLE, 1);
 
+    // Near-field distance the cache owns in the reflection (Morrowind's view
+    // distance by default). Statics, terrain, shadows and lights all hand off to
+    // distant land at this distance.
+    const float cacheNearDist = Configuration.UseSceneGraphSnapshot
+                                ? nearViewRange * s_reflectionCacheNearFactor : 0.0f;
+
     // Rendering
     if (mwBridge->IsExterior() && (Configuration.MGEFlags & REFLECTIVE_WATER)) {
-        // Draw land reflection, with opposite culling
+        // Draw land reflection, with opposite culling. Near-clip the LOD land so the
+        // cache draws the real near terrain at full resolution; DL owns beyond.
+        effect->SetFloat(ehLandNearCull, cacheNearDist);
         effect->BeginPass(PASS_RENDERLANDREFL);
         device->SetRenderState(D3DRS_CULLMODE, D3DCULL_CCW);
         renderDistantLand(effect, &reflView, &reflProj);
         effect->EndPass();
+        effect->SetFloat(ehLandNearCull, 0);   // off for the main-view land later this frame
+
+        // Real near terrain from the cache (two-texture AlphaGrid splat).
+        renderReflectionTerrainFromCache(&reflView, &reflProj, cacheNearDist);
     }
 
     if (isDistantCell() && (Configuration.MGEFlags & REFLECT_NEAR)) {
-        // Draw statics reflection, with opposite culling and no dissolve
+        // Draw statics reflection, with opposite culling and no dissolve.
+        // Per-object handover: distant statics whose object origin is within
+        // cacheNearDist are culled whole (staticNearCull) — the cache draws those,
+        // lit. DL owns everything beyond. Complementary to the cache's near-distance
+        // test (same metric, same threshold) => no duplicates, no z-fight, no slice.
         DWORD p = (mwBridge->CellHasWeather() && !mwBridge->IsUnderwater(eyePos.z)) ? PASS_RENDERSTATICSEXTERIOR : PASS_RENDERSTATICSINTERIOR;
         effect->SetFloat(ehNearViewRange, 0);
+        effect->SetFloat(ehStaticNearCull, cacheNearDist);
         effect->BeginPass(p);
         device->SetRenderState(D3DRS_CULLMODE, D3DCULL_CCW);
         renderReflectedStatics(&reflView, &reflProj);
         effect->EndPass();
+        effect->SetFloat(ehStaticNearCull, 0);   // off for the main-view statics later this frame
         effect->SetFloat(ehNearViewRange, nearViewRange);
     }
+
+    // Phase 0.5-B/C: inject the GeometryCache near-field set (NPCs + dynamic +
+    // static objects within cacheNearDist, excluding terrain) into the reflection
+    // with full FFE color, driven from the cache walk. Additive — runs inside the
+    // clip-plane setup, after distant statics. renderMorrowind manages its own
+    // effectFFE bracket (the distant-land effect is mid-Begin but not in a pass
+    // here). No-op when the snapshot cache is empty/disabled.
+    renderReflectionsFromCache(&reflView, &reflProj, cacheNearDist);
+
+    // Apply sun shadows to the cache reflection objects + terrain (world-space
+    // shadow map, reflected lookup). Runs after the cache color so it darkens the
+    // drawn pixels; distance-faded by the receiver's built-in fog attenuation.
+    //
+    // The receiver gates/scales by surface lit-ness dot(normal, -sunVecView). The
+    // cache geometry is rasterized in REFLECTED-view space (normals * reflView), so
+    // sunVecView must be the sun in reflected-view space too — otherwise the dot is
+    // inconsistent and flat up-facing surfaces (terrain) fail the lit-ness clip and
+    // receive no shadow. setupCommonEffect set the main-view sun; swap to the
+    // reflected sun for this pass, then restore for the rest of the frame.
+    D3DXVECTOR3 sunVecViewRefl, sunVecViewMain;
+    D3DXVec3TransformNormal(&sunVecViewRefl, reinterpret_cast<const D3DXVECTOR3*>(&sunVec), &reflView);
+    D3DXVec3TransformNormal(&sunVecViewMain, reinterpret_cast<const D3DXVECTOR3*>(&sunVec), view);
+    effect->SetFloatArray(ehSunVecView, sunVecViewRefl, 3);
+    renderReflectionShadowsFromCache(&reflView, &reflProj, cacheNearDist);
+    effect->SetFloatArray(ehSunVecView, sunVecViewMain, 3);   // restore for later passes
 
     if ((Configuration.MGEFlags & REFLECT_SKY) && !recordSky.empty() && !mwBridge->IsUnderwater(eyePos.z)) {
         // Draw sky reflection, with opposite culling
@@ -257,6 +340,380 @@ void DistantLand::renderReflectedStatics(const D3DXMATRIX* view, const D3DXMATRI
         device->SetVertexDeclaration(StaticDecl);
         visReflected.Render(device, effect, effect, &ehTex0, nullptr, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT);
     }
+}
+
+// buildCacheReflectionState - synthesize the RenderedState / FragmentState /
+// LightState that FixedFunctionShader::renderMorrowind expects, from a cache
+// entry's captured material + the frame-global sun/ambient. Mirrors the
+// "standard diffuse texturing" precached variant (single-stage MODULATE,
+// uvSet 0, constant material, no vcol/texgen/bump) so the draw hits a
+// precompiled shader. Point lights are added inside renderMorrowind from
+// MGE::SceneGraph::pointLights() — not synthesized here.
+static void buildCacheReflectionState(const MGE::GeometryCache::CachedGeometry& e,
+                                      const D3DXMATRIX& view,
+                                      const D3DXVECTOR4& sunVec, const RGBVECTOR& sunCol,
+                                      const RGBVECTOR& sunAmb, const RGBVECTOR& ambCol,
+                                      RenderedState& rs, FragmentState& frs,
+                                      LightState& lightrs) {
+    // ---- RenderedState ----
+    memset(&rs, 0, sizeof(rs));
+    // Use vertex colours only when the mesh has them AND its VertexColorProperty
+    // says to (else real material colours would be white-washed). vColSource: 1
+    // emissive, 2 ambient+diffuse. fvf drives ShaderKey only (the draw uses the
+    // device-bound cache FVF); DIFFUSE present -> vertexColour=1.
+    const bool useVCol = e.hasVertexColor && e.vColSource != 0;
+    rs.fvf            = D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_TEX1 | (useVCol ? D3DFVF_DIFFUSE : 0);
+    rs.zWrite         = true;
+    rs.cullMode       = D3DCULL_CCW;
+    rs.useLighting    = true;
+    rs.useFog         = true;            // fogMode=1, shared fog constants from the main effect
+    rs.blendEnable    = false;
+    // vColSource 2 (ambient+diffuse) -> vcol drives diffuse (vertexMaterial 2);
+    // 1 (emissive) -> vcol drives emissive (vertexMaterial 3); else constant material.
+    rs.matSrcDiffuse  = (useVCol && e.vColSource == 2) ? D3DMCS_COLOR1 : D3DMCS_MATERIAL;
+    rs.matSrcEmissive = (useVCol && e.vColSource == 1) ? D3DMCS_COLOR1 : D3DMCS_MATERIAL;
+    rs.vertexBlendState = 0;             // non-skinned (0.5-B)
+
+    rs.diffuseMaterial.r = e.matDiffuse[0]; rs.diffuseMaterial.g = e.matDiffuse[1];
+    rs.diffuseMaterial.b = e.matDiffuse[2]; rs.diffuseMaterial.a = e.matDiffuse[3];
+
+    rs.viewTransform = view;
+    rs.worldTransforms[0] = *reinterpret_cast<const D3DXMATRIX*>(e.worldTransformD3D);
+    D3DXMatrixMultiply(&rs.worldViewTransforms[0],
+        reinterpret_cast<const D3DXMATRIX*>(e.worldTransformD3D), &view);
+
+    rs.primType = D3DPT_TRIANGLELIST;
+    rs.baseIndex = 0; rs.minIndex = 0;
+    rs.vertCount = e.vertexCount; rs.startIndex = 0; rs.primCount = e.triangleCount;
+
+    // ---- FragmentState ----
+    memset(&frs, 0, sizeof(frs));
+    // Single-stage MODULATE(texture, diffuse); stage 1 DISABLE bounds activeStages.
+    FragmentState::Stage& s0 = frs.stage[0];
+    s0.colorOp   = D3DTOP_MODULATE; s0.colorArg1 = D3DTA_TEXTURE; s0.colorArg2 = D3DTA_DIFFUSE;
+    s0.alphaOp   = D3DTOP_MODULATE; s0.alphaArg1 = D3DTA_TEXTURE; s0.alphaArg2 = D3DTA_DIFFUSE;
+    s0.colorArg0 = D3DTA_CURRENT;   s0.alphaArg0 = D3DTA_CURRENT; s0.resultArg = D3DTA_CURRENT;
+    s0.texcoordIndex = 0;
+    frs.stage[1].colorOp = D3DTOP_DISABLE;   // memset 0 == colorOp 0 != DISABLE; set explicitly
+
+    frs.material.diffuse.r  = e.matDiffuse[0];  frs.material.diffuse.g  = e.matDiffuse[1];
+    frs.material.diffuse.b  = e.matDiffuse[2];  frs.material.diffuse.a  = e.matDiffuse[3];
+    frs.material.ambient.r  = e.matAmbient[0];  frs.material.ambient.g  = e.matAmbient[1];
+    frs.material.ambient.b  = e.matAmbient[2];  frs.material.ambient.a  = e.matAmbient[3];
+    frs.material.emissive.r = e.matEmissive[0]; frs.material.emissive.g = e.matEmissive[1];
+    frs.material.emissive.b = e.matEmissive[2]; frs.material.emissive.a = e.matEmissive[3];
+
+    // ---- LightState: one directional sun; point lights added in renderMorrowind ----
+    lightrs.lights.clear();
+    lightrs.active.clear();
+    lightrs.lightsTransformed.clear();
+    lightrs.globalAmbient.r = ambCol.r;
+    lightrs.globalAmbient.g = ambCol.g;
+    lightrs.globalAmbient.b = ambCol.b;
+    lightrs.globalAmbient.a = 1.0f;
+
+    LightState::Light& sun = lightrs.lights[0];
+    sun.type = D3DLIGHT_DIRECTIONAL;
+    sun.diffuse.r = sunCol.r; sun.diffuse.g = sunCol.g; sun.diffuse.b = sunCol.b; sun.diffuse.a = 1.0f;
+    sun.position = D3DVECTOR{ sunVec.x, sunVec.y, sunVec.z };
+    sun.ambient  = D3DVECTOR{ sunAmb.r, sunAmb.g, sunAmb.b };
+    lightrs.active.push_back(0);
+}
+
+void DistantLand::renderReflectionsFromCache(const D3DXMATRIX* view, const D3DXMATRIX* proj, float nearDist) {
+    MGE_ZoneScopedN("renderReflectionsFromCache");
+
+    const auto& cacheMap = MGE::GeometryCache::cache();
+    if (cacheMap.empty()) return;
+
+    // Reflection frustum cull (reflected camera sees a different set than the
+    // main MSOC visible set, so iterate the whole cache and cull here).
+    D3DXMATRIX viewproj;
+    D3DXMatrixMultiply(&viewproj, view, proj);
+    ViewFrustum frustum(&viewproj);
+
+    // Cache covers near objects within nearDist of the camera (Morrowind's view
+    // distance by default); distant-land statics dissolve in beyond it. nearDist<=0
+    // means "no near limit" (cull by frustum only). Compare on center distance.
+    const D3DXVECTOR3 eye(eyePos.x, eyePos.y, eyePos.z);
+    const bool haveNearLimit = nearDist > 0.0f;
+
+    // renderMorrowind reads a few live device states; satisfy them once up front.
+    // - D3DRS_AMBIENT must not be 0xffffffff (full-bright special case).
+    // - D3DTS_PROJECTION feeds the point-light frustum precull.
+    device->SetRenderState(D3DRS_AMBIENT, 0);
+    device->SetTransform(D3DTS_PROJECTION, proj);
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+    device->SetRenderState(D3DRS_ZENABLE, TRUE);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+
+    RenderedState rs;
+    FragmentState frs;
+    static LightState lightrs;   // holds maps; reused to avoid per-draw realloc
+
+    for (const auto& kv : cacheMap) {
+        const auto& e = kv.second;
+        if (e.blendEnable) continue;         // alpha-blended: engine path
+        if (!e.d3dTexture) continue;         // untextured: different shader key
+        if (e.isLandscape) continue;         // terrain: cache-terrain / distant-land path
+        if (e.isSkinned && (e.skinnedUnsupported || e.numBones == 0)) continue;  // unskinnable
+
+        const D3DXVECTOR3 center(e.worldTransformD3D[12], e.worldTransformD3D[13], e.worldTransformD3D[14]);
+
+        // Near-field ownership (handover): static objects within nearDist are owned
+        // by the cache (drawn lit here); the distant-land statics pass culls those
+        // same objects (staticNearCull = nearDist) and owns everything beyond. Same
+        // metric (object-origin distance) + threshold on both sides => exact
+        // partition: no duplicates, no z-fight, no slice. Dynamic objects (NPCs)
+        // aren't distant statics, so they reflect out to the full MW view distance
+        // regardless of the (possibly smaller) static handover factor.
+        if (haveNearLimit) {
+            const float limit = (e.dynamicHint == 0) ? nearDist : nearViewRange;
+            const D3DXVECTOR3 d = center - eye;
+            if (D3DXVec3Length(&d) > limit) continue;
+        }
+
+        IDirect3DVertexBuffer9* vb = e.readVB();
+        if (!vb || !e.ib) continue;
+
+        // Frustum cull. Non-skinned: true world-space bound (not the object origin)
+        // so geometry offset from its node origin isn't falsely rejected at screen
+        // edges. Skinned: bind-pose radius at the node origin — the bind-pose center
+        // doesn't map through the node transform to the animated pose, so use the
+        // origin (matches the proven depth/shadow skinned cull).
+        BoundingSphere bs;
+        if (e.isSkinned) { bs.center = center; bs.radius = e.boundsRadius; }
+        else             { cacheWorldBounds(e, bs.center, bs.radius); }
+        if (frustum.ContainsSphere(bs) == ViewFrustum::OUTSIDE) continue;
+
+        buildCacheReflectionState(e, *view, sunVec, sunCol, sunAmb, ambCol, rs, frs, lightrs);
+
+        // Alpha test (cutout foliage/armor): the FFE shader outputs texture.a *
+        // material.a; the FF alpha test then discards. renderMorrowind doesn't set
+        // these states, so drive them per part. alphaRef is stored normalized.
+        if (e.alphaTest) {
+            device->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
+            device->SetRenderState(D3DRS_ALPHAREF, (DWORD)(e.alphaRef * 255.0f));
+            device->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATEREQUAL);
+        } else {
+            device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+        }
+
+        // Point-light fade toward the static handover (matches the shadow fade).
+        const float plMult = cacheHandoverFade(center, eye, e.dynamicHint, nearDist);
+
+        // Reflection base winding is inverted (CCW); a mirrored part flips again.
+        device->SetRenderState(D3DRS_CULLMODE, e.mirrored ? D3DCULL_CW : D3DCULL_CCW);
+        device->SetTexture(0, e.d3dTexture);
+        device->SetIndices(e.ib);
+
+        if (e.isSkinned) {
+            // VS palette skinning: bind-pose VB + per-frame bone palette (model->world);
+            // renderMorrowind selects the skinIndexed path and applies reflView.
+            device->SetVertexDeclaration(MGE::GeometryCache::skinnedDecl());
+            device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kSkinnedVBStride);
+            const D3DXMATRIX* pal = reinterpret_cast<const D3DXMATRIX*>(e.bonePalette.data());
+            FixedFunctionShader::renderMorrowind(&rs, &frs, &lightrs, plMult, pal, (int)e.numBones, view);
+        } else {
+            device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kVBStride);
+            device->SetFVF(MGE::GeometryCache::kVBFVF);
+            FixedFunctionShader::renderMorrowind(&rs, &frs, &lightrs, plMult);
+        }
+    }
+}
+
+void DistantLand::renderReflectionShadowsFromCache(const D3DXMATRIX* view, const D3DXMATRIX* proj, float nearDist) {
+    MGE_ZoneScopedN("renderReflectionShadowsFromCache");
+
+    const auto& cacheMap = MGE::GeometryCache::cache();
+    if (cacheMap.empty()) return;
+
+    // Sun shadow map is world-space. The cache objects are rasterized in reflected
+    // view space, so map reflected-view -> world (inverse reflView) -> shadow clip.
+    D3DXMATRIX invView, viewToShadow[2];
+    D3DXMatrixInverse(&invView, nullptr, view);
+    viewToShadow[0] = invView * smViewproj[0];
+    viewToShadow[1] = invView * smViewproj[1];
+    effect->SetMatrixArray(ehShadowViewproj, viewToShadow, 2);
+    effect->SetTexture(ehTex3, texSoftShadow);
+
+    D3DXMATRIX viewproj;
+    D3DXMatrixMultiply(&viewproj, view, proj);
+    ViewFrustum frustum(&viewproj);
+    const D3DXVECTOR3 eye(eyePos.x, eyePos.y, eyePos.z);
+
+    effect->SetBool(ehHasBones, false);
+    effect->SetInt(ehVertexBlendState, 0);
+    effect->SetFloat(ehMaterialAlpha, 1.0f);
+    // Receiver alpha = materialAlpha (1), NOT vertex colour. Critical for terrain:
+    // its vcol.a is the AlphaGrid splat factor, which must not modulate shadow
+    // strength (would erase shadows wherever the base texture shows through).
+    effect->SetBool(ehHasVCol, false);
+
+    // P2ffe — shadows over FFE output (our cache color was drawn via the FFE path).
+    // Same object set/cull as the color pass so the receiver lands on the drawn
+    // pixels (ZFunc LessEqual against the reflection depth the color pass wrote).
+    effect->BeginPass(PASS_RENDERSHADOWFFE);
+    for (const auto& kv : cacheMap) {
+        const auto& e = kv.second;
+        if (e.isSkinned) continue;          // skinned receiver = skinIndexed (0.5-C)
+        if (e.blendEnable) continue;
+        // Terrain IS included here: the cache near terrain receives sun shadows the
+        // same way the cache objects do (additive receiver over the FFE/terrain color
+        // that already wrote depth). The distant-land LOD beyond the handover has no
+        // shadows, so the fade ramps cache-terrain shadows to 0 at the boundary.
+        IDirect3DVertexBuffer9* vb = e.readVB();
+        if (!vb || !e.ib) continue;
+
+        // True world-space bound for the frustum cull (origin is wrong for offset
+        // geometry / terrain patches — see cacheWorldBounds).
+        BoundingSphere bs;
+        cacheWorldBounds(e, bs.center, bs.radius);
+        if (frustum.ContainsSphere(bs) == ViewFrustum::OUTSIDE) continue;
+
+        // Handover metric: statics match the distant-land staticNearCull (object
+        // origin) for an exact partition; terrain uses its world-space patch center
+        // (origin = cell corner) and counts a straddling patch as in-range.
+        const D3DXVECTOR3 origin(e.worldTransformD3D[12], e.worldTransformD3D[13], e.worldTransformD3D[14]);
+        const D3DXVECTOR3 metric = e.isLandscape ? bs.center : origin;
+        if (nearDist > 0.0f) {
+            const float limit = (e.dynamicHint == 0) ? nearDist : nearViewRange;
+            const float reach = e.isLandscape ? bs.radius : 0.0f;
+            const D3DXVECTOR3 d = metric - eye;
+            if (D3DXVec3Length(&d) - reach > limit) continue;
+        }
+
+        D3DXMATRIX wv;
+        D3DXMatrixMultiply(&wv, reinterpret_cast<const D3DXMATRIX*>(e.worldTransformD3D), view);
+        D3DXMATRIX pal[4] = { wv, wv, wv, wv };
+        effect->SetMatrixArray(ehVertexBlendPalette, pal, 4);
+
+        // Handover fade, identical to the point-light fade so shadows + lights ramp
+        // together and land exactly on the geometry handover.
+        effect->SetFloat(ehShadowReflMult, cacheHandoverFade(metric, eye, e.dynamicHint, nearDist));
+
+        // Alpha-tested receivers need the base texture for the cutout clip.
+        if (e.alphaTest && e.d3dTexture) {
+            effect->SetTexture(ehTex0, e.d3dTexture);
+            effect->SetBool(ehHasAlpha, true);
+            effect->SetFloat(ehAlphaRef, e.alphaRef);
+        } else {
+            effect->SetTexture(ehTex0, nullptr);
+            effect->SetBool(ehHasAlpha, false);
+            effect->SetFloat(ehAlphaRef, -1.0f);
+        }
+        effect->CommitChanges();
+
+        device->SetRenderState(D3DRS_CULLMODE, e.mirrored ? D3DCULL_CW : D3DCULL_CCW);
+        device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kVBStride);
+        device->SetIndices(e.ib);
+        device->SetFVF(MGE::GeometryCache::kVBFVF);
+        DrawStats::count(e.triangleCount);
+        device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, e.vertexCount, 0, e.triangleCount);
+    }
+    effect->EndPass();
+
+    // Cache-skinned receivers (NPCs). Same world-space shadow lookup, but the
+    // receiver depth is rebuilt in the VS via 32-bone skinIndexed -> mul(view),
+    // bit-identical to the cache color pass (cacheSkinnedVertex), so it lands on the
+    // drawn pixels without acne. Separate pass = dedicated skinned VS + skinnedDecl
+    // stream + bone palette. view (reflView) and hasVCol=false are already bound.
+    effect->BeginPass(PASS_RENDERSHADOWFFE_SKINNED);
+    for (const auto& kv : cacheMap) {
+        const auto& e = kv.second;
+        if (!e.isSkinned) continue;
+        if (e.skinnedUnsupported || e.numBones == 0) continue;
+        if (e.blendEnable) continue;
+        IDirect3DVertexBuffer9* vb = e.readVB();
+        if (!vb || !e.ib) continue;
+
+        // Skinned cull: bind-pose radius at the node origin (matches the color pass;
+        // the bind-pose center doesn't map through the node transform to the pose).
+        BoundingSphere bs;
+        bs.center = D3DXVECTOR3(e.worldTransformD3D[12], e.worldTransformD3D[13], e.worldTransformD3D[14]);
+        bs.radius = e.boundsRadius;
+        if (frustum.ContainsSphere(bs) == ViewFrustum::OUTSIDE) continue;
+
+        // Handover fade (NPCs are dynamic => full strength, but compute generally).
+        effect->SetFloat(ehShadowReflMult, cacheHandoverFade(bs.center, eye, e.dynamicHint, nearDist));
+
+        // Bone palette (model->world); view (reflView) already bound on the effect.
+        const D3DXMATRIX* pal = reinterpret_cast<const D3DXMATRIX*>(e.bonePalette.data());
+        effect->SetMatrixArray(ehBoneMatrices, pal, (int)e.numBones);
+
+        if (e.alphaTest && e.d3dTexture) {
+            effect->SetTexture(ehTex0, e.d3dTexture);
+            effect->SetBool(ehHasAlpha, true);
+            effect->SetFloat(ehAlphaRef, e.alphaRef);
+        } else {
+            effect->SetTexture(ehTex0, nullptr);
+            effect->SetBool(ehHasAlpha, false);
+            effect->SetFloat(ehAlphaRef, -1.0f);
+        }
+        effect->CommitChanges();
+
+        device->SetRenderState(D3DRS_CULLMODE, e.mirrored ? D3DCULL_CW : D3DCULL_CCW);
+        device->SetVertexDeclaration(MGE::GeometryCache::skinnedDecl());
+        device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kSkinnedVBStride);
+        device->SetIndices(e.ib);
+        DrawStats::count(e.triangleCount);
+        device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, e.vertexCount, 0, e.triangleCount);
+    }
+    effect->EndPass();
+
+    effect->SetFloat(ehShadowReflMult, 1.0f);   // restore full strength for later passes
+}
+
+void DistantLand::renderReflectionTerrainFromCache(const D3DXMATRIX* view, const D3DXMATRIX* proj, float nearDist) {
+    MGE_ZoneScopedN("renderReflectionTerrainFromCache");
+    if (nearDist <= 0.0f) return;
+
+    const auto& cacheMap = MGE::GeometryCache::cache();
+    if (cacheMap.empty()) return;
+
+    D3DXMATRIX viewproj;
+    D3DXMatrixMultiply(&viewproj, view, proj);
+    ViewFrustum frustum(&viewproj);
+    const D3DXVECTOR3 eye(eyePos.x, eyePos.y, eyePos.z);
+
+    effect->BeginPass(PASS_RENDERCACHETERRAIN);
+    for (const auto& kv : cacheMap) {
+        const auto& e = kv.second;
+        if (!e.isLandscape || e.isSkinned) continue;
+        if (!e.d3dTexture) continue;          // need at least a base texture
+        IDirect3DVertexBuffer9* vb = e.readVB();
+        if (!vb || !e.ib) continue;
+
+        // Terrain patches are large; cull by the true world-space bound sphere
+        // (the patch origin is the cell corner, ~4096u from the real center — using
+        // it falsely culls the patch the camera is standing on). Skip patches whose
+        // bound is wholly beyond the handover (the DL LOD owns those).
+        BoundingSphere bs;
+        cacheWorldBounds(e, bs.center, bs.radius);
+        if (frustum.ContainsSphere(bs) == ViewFrustum::OUTSIDE) continue;
+        const D3DXVECTOR3 d = bs.center - eye;
+        if (D3DXVec3Length(&d) - bs.radius > nearDist) continue;
+
+        effect->SetMatrix(ehWorld, reinterpret_cast<const D3DXMATRIX*>(e.worldTransformD3D));
+        effect->SetTexture(ehTex0, e.d3dTexture);
+        // No overlay -> bind base to tex2 so lerp(base, base, a) == base.
+        effect->SetTexture(ehTex2, e.d3dOverlay ? e.d3dOverlay : e.d3dTexture);
+        // Position is computed from vertexBlendPalette[0] (= world*view), the exact
+        // same premultiplied matrix the shadow receiver uses, so the LessEqual shadow
+        // pass lands on the same depth (no acne). Matches the object color/shadow path.
+        D3DXMATRIX wv;
+        D3DXMatrixMultiply(&wv, reinterpret_cast<const D3DXMATRIX*>(e.worldTransformD3D), view);
+        effect->SetMatrixArray(ehVertexBlendPalette, &wv, 1);
+        effect->CommitChanges();
+
+        device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kVBStride);
+        device->SetIndices(e.ib);
+        device->SetFVF(MGE::GeometryCache::kVBFVF);
+        DrawStats::count(e.triangleCount);
+        device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, e.vertexCount, 0, e.triangleCount);
+    }
+    effect->EndPass();
 }
 
 void DistantLand::clearReflection() {

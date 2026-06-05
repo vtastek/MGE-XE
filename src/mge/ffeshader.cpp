@@ -28,6 +28,7 @@ std::unordered_map<FixedFunctionShader::MeshKey, FixedFunctionShader::ObjectSpac
                    FixedFunctionShader::MeshKeyHash> FixedFunctionShader::bboxCache;
 
 D3DXHANDLE FixedFunctionShader::ehWorld, FixedFunctionShader::ehWorldView;
+D3DXHANDLE FixedFunctionShader::ehView, FixedFunctionShader::ehBoneMatrices;
 D3DXHANDLE FixedFunctionShader::ehVertexBlendState, FixedFunctionShader::ehVertexBlendPalette;
 D3DXHANDLE FixedFunctionShader::ehTex0, FixedFunctionShader::ehTex1, FixedFunctionShader::ehTex2, FixedFunctionShader::ehTex3, FixedFunctionShader::ehTex4, FixedFunctionShader::ehTex5;
 D3DXHANDLE FixedFunctionShader::ehMaterialDiffuse, FixedFunctionShader::ehMaterialAmbient, FixedFunctionShader::ehMaterialEmissive;
@@ -36,6 +37,7 @@ D3DXHANDLE FixedFunctionShader::ehLightSunDirection, FixedFunctionShader::ehLigh
 D3DXHANDLE FixedFunctionShader::ehLightFalloffQuadratic, FixedFunctionShader::ehLightFalloffLinear, FixedFunctionShader::ehLightFalloffConstant;
 D3DXHANDLE FixedFunctionShader::ehTexLightData, FixedFunctionShader::ehLightDataParams, FixedFunctionShader::ehLightIndices, FixedFunctionShader::ehTexLightView;
 D3DXHANDLE FixedFunctionShader::ehTexgenTransform, FixedFunctionShader::ehBumpMatrix, FixedFunctionShader::ehBumpLumiScaleBias;
+D3DXHANDLE FixedFunctionShader::ehPointLightMult;
 
 float FixedFunctionShader::sunMultiplier, FixedFunctionShader::ambMultiplier;
 
@@ -65,6 +67,8 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
 
     // Use it to bind shared parameters too
     ehWorld = effect->GetParameterByName(0, "world");
+    ehView = effect->GetParameterByName(0, "view");
+    ehBoneMatrices = effect->GetParameterByName(0, "boneMatrices");
     ehVertexBlendState = effect->GetParameterByName(0, "vertexBlendState");
     ehVertexBlendPalette = effect->GetParameterByName(0, "vertexBlendPalette");
     ehTex0 = effect->GetParameterByName(0, "tex0");
@@ -91,6 +95,7 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
     ehLightDataParams = effect->GetParameterByName(0, "lightDataParams");
     ehLightIndices = effect->GetParameterByName(0, "lightIndices");
     ehTexLightView = effect->GetParameterByName(0, "texLightView");
+    ehPointLightMult = effect->GetParameterByName(0, "pointLightMult");
     ehTexgenTransform = effect->GetParameterByName(0, "texgenTransform");
     ehBumpMatrix = effect->GetParameterByName(0, "bumpMatrix");
     ehBumpLumiScaleBias = effect->GetParameterByName(0, "bumpLumiScaleBias");
@@ -233,7 +238,8 @@ void FixedFunctionShader::updateLighting(float sunMult, float ambMult) {
     ambMultiplier = ambMult;
 }
 
-void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const FragmentState* frs, LightState* lightrs) {
+void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, float pointLightMult,
+                                          const D3DXMATRIX* cacheBonePalette, int cacheNumBones, const D3DXMATRIX* cacheView) {
     ID3DXEffect* effectFFE;
 
     // Instrument: per-draw stats — engine lightrs.active.size(), msoc snapshot
@@ -559,6 +565,11 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
 
     // Check if state matches last used effect
     ShaderKey sk(rs, frs, lightrs);
+    if (cacheBonePalette) {
+        // Cache 32-bone indexed skinning (mutually exclusive with the reactive
+        // 4-matrix path, which the cache feed never uses — rs->vertexBlendState 0).
+        sk.usesCacheSkin = 1;
+    }
     if (actuallyUseTextureLights) {
         // Select the 64-light shader variant; per-pixel attenuation
         // will dim out lights that don't affect a given fragment.
@@ -580,6 +591,11 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
         shaderLRU.effect = effectFFE;
         shaderLRU.last_sk = sk;
     }
+
+    // Per-draw point-light scale (1 in the reactive path; faded by the cache
+    // reflection pass at the distant-land handover). Always pushed so it never
+    // leaks a faded value into the next draw.
+    if (ehPointLightMult) effectFFE->SetFloat(ehPointLightMult, pointLightMult);
 
     // Set up material
     effectFFE->SetVector(ehMaterialDiffuse, (D3DXVECTOR4*)&frs->material.diffuse);
@@ -778,7 +794,12 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
 
     // Set common state and render
     effectFFE->SetInt(ehVertexBlendState, rs->vertexBlendState);
-    if (rs->vertexBlendState) {
+    if (sk.usesCacheSkin) {
+        // boneMatrices (model->world) + view; the VS skins via skinIndexed then
+        // applies view. No rigid world/worldview needed.
+        effectFFE->SetMatrixArray(ehBoneMatrices, cacheBonePalette, cacheNumBones);
+        if (cacheView) effectFFE->SetMatrix(ehView, cacheView);
+    } else if (rs->vertexBlendState) {
         effectFFE->SetMatrixArray(ehVertexBlendPalette, rs->worldViewTransforms, 4);
     } else {
         effectFFE->SetMatrix(ehWorld, &rs->worldTransforms[0]);
@@ -938,6 +959,9 @@ ID3DXEffect* FixedFunctionShader::generateMWShader(const ShaderKey& sk) {
     if (sk.usesSkinning) {
         buf << "float4 blendweights : BLENDWEIGHT; ";
     }
+    if (sk.usesCacheSkin) {
+        buf << "float4 blendweights : BLENDWEIGHT; float4 blendindices : BLENDINDICES; ";
+    }
     if (sk.vertexColour) {
         buf << "float4 col : COLOR; ";
     }
@@ -971,6 +995,8 @@ ID3DXEffect* FixedFunctionShader::generateMWShader(const ShaderKey& sk) {
 
     if (sk.usesSkinning) {
         buf << "viewpos = skinnedVertex(IN.pos, IN.blendweights); normal = skinnedNormal(IN.nrm, IN.blendweights);";
+    } else if (sk.usesCacheSkin) {
+        buf << "viewpos = cacheSkinnedVertex(IN.pos, IN.blendweights, IN.blendindices); normal = cacheSkinnedNormal(IN.nrm, IN.blendweights, IN.blendindices);";
     } else {
         buf << "viewpos = rigidVertex(IN.pos); normal = rigidNormal(IN.nrm);";
     }

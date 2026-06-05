@@ -47,6 +47,21 @@ TransformedVert transformShadowVert(MorrowindVertIn IN) {
     return v;
 }
 
+// Cache 32-bone indexed-skinning receiver transform. MUST be bit-identical to the
+// cache color pass (cacheSkinnedVertex in XE FixedFuncEmu.fx): skin over the
+// model->world bone palette, THEN one mul by view. Premultiplying view into the
+// palette would reorder the float ops and reintroduce receiver acne against the
+// depth the color pass wrote. view is reflView during the reflection.
+TransformedVert transformShadowVertSkinned(SkinnedVertIn IN) {
+    TransformedVert v;
+    float4 worldpos = skinIndexed(IN.pos, IN.blendweights, IN.blendindices);
+    v.viewpos = mul(worldpos, view);
+    float4 worldnrm = skinIndexed(float4(IN.nrm, 0), IN.blendweights, IN.blendindices);
+    v.normal = mul(float4(worldnrm.xyz, 0), view);
+    v.pos = mul(v.viewpos, proj);
+    return v;
+}
+
 //------------------------------------------------------------
 // 2 layer cascade ortho ESM lookup
 
@@ -124,14 +139,16 @@ struct RenderShadowVertOut {
     float4 shadow1pos: TEXCOORD2;
 };
 
-RenderShadowVertOut RenderShadowsBaseVS(MorrowindVertIn IN) {
+// Shared receiver body. Takes a transformed vert + the vertex-colour source +
+// texcoords so the rigid and cache-skinned VS variants differ only in how they
+// build the TransformedVert.
+RenderShadowVertOut shadowReceiverBody(TransformedVert v, float4 vcolor, float2 texcoords) {
     RenderShadowVertOut OUT;
-    TransformedVert v = transformShadowVert(IN);
 
     OUT.pos = v.pos;
 
     // Fragment colour routing
-    OUT.alpha = vertexMaterial(IN.color).a;
+    OUT.alpha = vertexMaterial(vcolor).a;
 
     // Non-standard shadow luminance, to create sufficient contrast when ambient is high
     OUT.light = shadowSunEstimate(saturate(dot(v.normal.xyz, -sunVecView)));
@@ -143,14 +160,28 @@ RenderShadowVertOut RenderShadowsBaseVS(MorrowindVertIn IN) {
     else
         OUT.light *= saturate(4 * fogatt);
 
+    // Per-object reflection handover fade (computed CPU-side from the same
+    // Euclidean distance as the point-light fade). 1 in the main view.
+    OUT.light *= shadowReflMult;
+
     // Find position in light space, output light depth
     OUT.shadow0pos = mul(v.viewpos, shadowViewProj[0]);
     OUT.shadow1pos = mul(v.viewpos, shadowViewProj[1]);
     OUT.shadow0pos.z = OUT.shadow0pos.z / OUT.shadow0pos.w;
     OUT.shadow1pos.z = OUT.shadow1pos.z / OUT.shadow1pos.w;
 
-    OUT.texcoords = IN.texcoords;
+    OUT.texcoords = texcoords;
     return OUT;
+}
+
+RenderShadowVertOut RenderShadowsBaseVS(MorrowindVertIn IN) {
+    return shadowReceiverBody(transformShadowVert(IN), IN.color, IN.texcoords);
+}
+
+// Cache-skinned receiver. hasVCol is forced false for this pass (receiver alpha =
+// materialAlpha), so the vcolour source is unused; pass white.
+RenderShadowVertOut RenderShadowsFFESkinnedVS(SkinnedVertIn IN) {
+    return shadowReceiverBody(transformShadowVertSkinned(IN), float4(1, 1, 1, 1), IN.texcoords);
 }
 
 RenderShadowVertOut RenderShadowsVS(MorrowindVertIn IN) {

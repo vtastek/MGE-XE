@@ -11,6 +11,11 @@ shared float4 materialDiffuse, materialAmbient, materialEmissive;
 shared float3 lightSceneAmbient, lightSunDiffuse, lightDiffuse[8];
 shared float4 lightAmbient[2];
 shared float3 lightSunDirection;
+// Per-draw point-light intensity scale. 1 = normal. The cache reflection pass
+// fades it toward 0 as a static approaches the cache->distant-land handover, so
+// point lights don't pop against the sun-only far field. renderMorrowind sets it
+// every draw (1 in the main reactive path), so it never leaks between draws.
+shared float pointLightMult;
 shared float4 lightPosition[6];
 shared float4 lightFalloffQuadratic[2], lightFalloffLinear[2];
 shared float4 lightFalloffConstant[2];
@@ -61,6 +66,17 @@ float3 rigidNormal(float3 normal) { return mul(float4(normal, 0), worldview).xyz
 
 float4 skinnedVertex(float4 pos, float4 weights) { return skin(pos, weights); }
 float3 skinnedNormal(float3 normal, float4 weights) { return skin(float4(normal, 0), weights).xyz; }
+
+// Cache (32-bone indexed) skinning, used by the cache-driven color pass. boneMatrices
+// are model->world (the rigid path bakes world*view into 'worldview', which has no
+// per-bone equivalent here), so skin to world then apply the view matrix.
+float4 cacheSkinnedVertex(float4 pos, float4 weights, float4 indices) {
+    return mul(skinIndexed(pos, weights, indices), view);
+}
+float3 cacheSkinnedNormal(float3 normal, float4 weights, float4 indices) {
+    float3 worldn = skinIndexed(float4(normal, 0), weights, indices).xyz;
+    return mul(float4(worldn, 0), view).xyz;
+}
 
 // Texgens with view space inputs, normals must be normalized due to non-uniform scaling matrices
 float3 texgenNormal(float3 normal) { return normalize(normal); }
@@ -325,7 +341,7 @@ float4 PerPixelPS(FFEPixel IN) : COLOR0 {
     // texture (3 texels per light); shader iterates lightDataParams.x
     // lights (runtime count, no compile-time array). See
     // evaluatePointLightsTextured below.
-    d += evaluatePointLightsTextured(IN.viewpos, normal);
+    d += pointLightMult * evaluatePointLightsTextured(IN.viewpos, normal);
 #else
     // Reconstruct per-light L vectors from view-space position. Was per-vertex
     // via interpolators; moved here to lift the interpolator-budget cap on light count.
@@ -335,7 +351,7 @@ float4 PerPixelPS(FFEPixel IN) : COLOR0 {
         lightvec[3*i + 1] = lightPosition[i + 2] - IN.viewpos.y;
         lightvec[3*i + 2] = lightPosition[i + 4] - IN.viewpos.z;
     }
-    d += calcPointLighting(FFE_LIGHTS_ACTIVE, lightvec, normal);
+    d += pointLightMult * calcPointLighting(FFE_LIGHTS_ACTIVE, lightvec, normal);
 #endif
 
     // Material

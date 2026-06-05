@@ -66,6 +66,10 @@ class FixedFunctionShader {
     struct ShaderKey {
         DWORD uvSets : 4;
         DWORD usesSkinning : 1;
+        // Cache-driven 32-bone indexed skinning (boneMatrices + skinIndexed), as
+        // opposed to the reactive 4-matrix vertexBlendPalette path (usesSkinning).
+        // Mutually exclusive with usesSkinning; set only by the cache reflection feed.
+        DWORD usesCacheSkin : 1;
         DWORD vertexColour : 1;
         DWORD heavyLighting : 1;
         // When 1, generate the USE_TEXTURE_LIGHTS variant — shader reads
@@ -193,6 +197,7 @@ class FixedFunctionShader {
         D3DXVECTOR3& outMin, D3DXVECTOR3& outMax);
 
     static D3DXHANDLE ehWorld, ehWorldView;
+    static D3DXHANDLE ehView, ehBoneMatrices;   // cache 32-bone indexed skinning
     static D3DXHANDLE ehVertexBlendState, ehVertexBlendPalette;
     static D3DXHANDLE ehTex0, ehTex1, ehTex2, ehTex3, ehTex4, ehTex5;
     static D3DXHANDLE ehMaterialDiffuse, ehMaterialAmbient, ehMaterialEmissive;
@@ -202,6 +207,7 @@ class FixedFunctionShader {
     // Texture-light path handles
     static D3DXHANDLE ehTexLightData, ehLightDataParams, ehLightIndices, ehTexLightView;
     static D3DXHANDLE ehTexgenTransform, ehBumpMatrix, ehBumpLumiScaleBias;
+    static D3DXHANDLE ehPointLightMult;
 
     static float sunMultiplier, ambMultiplier;
 
@@ -211,6 +217,12 @@ public:
     static bool init(IDirect3DDevice* d, ID3DXEffectPool* pool);
     static void precacheAsync();
     static void updateLighting(float sunMult, float ambMult);
-    static void renderMorrowind(const RenderedState* rs, const FragmentState* frs, LightState* lightrs);
+    // pointLightMult scales the point-light contribution (1 = normal). The cache
+    // reflection pass fades it toward 0 at the cache->distant-land handover.
+    // cacheBonePalette/cacheNumBones/cacheView drive the cache 32-bone indexed
+    // skinning path (used by the cache reflection feed). When cacheBonePalette is
+    // null, the rigid/reactive-skinning path is unchanged.
+    static void renderMorrowind(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, float pointLightMult = 1.0f,
+                                const D3DXMATRIX* cacheBonePalette = nullptr, int cacheNumBones = 0, const D3DXMATRIX* cacheView = nullptr);
     static void release();
 };

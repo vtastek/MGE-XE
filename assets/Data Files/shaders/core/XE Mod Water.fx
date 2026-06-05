@@ -156,6 +156,11 @@ WaterVertOut WaterVS (in float4 pos : POSITION)
 
 float4 WaterPS(in WaterVertOut IN): COLOR0
 {
+    // TEMP (cache-reflection inspection): output the raw reflection texture with
+    // no normal distortion / fresnel / fog so the reflected geometry can be read
+    // directly. Remove to restore normal water shading.
+    return float4(getProjectedReflection(IN.screenpos), 1);
+
     // Calculate eye vector
     float3 EyeVec = IN.pos.xyz - eyePos.xyz;
     float dist = length(EyeVec);

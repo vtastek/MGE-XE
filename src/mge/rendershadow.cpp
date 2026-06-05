@@ -416,6 +416,10 @@ void DistantLand::renderShadow() {
     // Bind filtered ESM
     effect->SetTexture(ehTex3, texSoftShadow);
 
+    // Full-strength receiver in the main view (the cache reflection pass fades this
+    // per object; the receiver multiplies OUT.light by it, so it must be 1 here).
+    effect->SetFloat(ehShadowReflMult, 1.0f);
+
     // Use an alpha threshold for solidity that isn't precisely equal to a commonly used value (such as 0.5).
     // Vertex interpolators can be slightly inaccurate and cause a value that should be constant across a triangle
     // to have interpolated fragment values that vary either side of the threshold and cause noise.
