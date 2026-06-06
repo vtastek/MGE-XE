@@ -41,6 +41,22 @@ D3DXHANDLE FixedFunctionShader::ehPointLightMult;
 
 float FixedFunctionShader::sunMultiplier, FixedFunctionShader::ambMultiplier;
 
+// Texture-light selection instrumentation accumulators. Moved out of
+// renderMorrowind's local statics so the extracted selectTextureLights() (shared
+// with the cache terrain pass) can increment them while renderMorrowind's periodic
+// [SELECTION-TIMING]/[UPLOAD-TIMING]/[PRECULL]/[SELECTED-DIST] log still reads
+// them. Cumulative (never reset — reported as totals / frameCount).
+namespace {
+    unsigned long long s_selectionCalls   = 0;
+    unsigned long long s_selectionTotalNs = 0;
+    unsigned long long s_uploads          = 0;
+    unsigned long long s_uploadsTotalNs   = 0;
+    unsigned long long s_preCullAliveSum  = 0;
+    unsigned long long s_preCullTotalSum  = 0;
+    unsigned long long s_selectedBuckets[6] = {0};
+    LARGE_INTEGER      s_qpcFreq = {};
+}
+
 static string buildArgString(DWORD arg, const string& mask, const string& sampler);
 
 
@@ -238,8 +254,197 @@ void FixedFunctionShader::updateLighting(float sunMult, float ambMult) {
     ambMultiplier = ambMult;
 }
 
+// selectTextureLights — revision-keyed texLightData upload + view-keyed frustum
+// precull + per-mesh sphere-AABB nearest-kMaxIndicesPerMesh selection. Extracted
+// from renderMorrowind so the cache terrain pass (renderCachedTerrain) selects
+// lights with byte-identical logic — parity with the reactive path (the A/B
+// light-seam fix). The caller must hold MGE::SceneGraph::SnapshotReadLock and pass
+// the locked snapshot + its kMaxTexLights-clamped count, the draw's view matrix,
+// and the draw's world-space AABB. device's D3DTS_PROJECTION must be the matching
+// projection (drives the precull frustum). Fills idxFloats (>= kMaxIndicesPerMesh)
+// and returns the selected light count (0 if no snapshot / no texture / none in range).
+int FixedFunctionShader::selectTextureLights(
+        const std::vector<MGE::SceneGraph::PointLight>& snapshotLights,
+        unsigned int snapshotCount, const D3DXMATRIX& view,
+        const D3DXVECTOR3& bMin, const D3DXVECTOR3& bMax,
+        float* idxFloats, bool logPerf) {
+    if (snapshotCount == 0 || !texLightData) return 0;
+    if (s_qpcFreq.QuadPart == 0) QueryPerformanceFrequency(&s_qpcFreq);
+
+    // Per-draw selection scratch (persistent statics; no hot-path allocation).
+    // s_lightWorldPos caches world positions for the sphere-AABB test; s_lightAlive
+    // flags lights whose 2*radius sphere intersects the camera frustum (precull
+    // recomputed only when the view matrix changes); s_lastPrecullView caches that
+    // view. s_msocToTex maps snapshot index → texture row (identity here).
+    static unsigned int s_msocToTex[kMaxTexLights];
+    static D3DXVECTOR3 s_lightWorldPos[kMaxTexLights];
+    static bool        s_lightAlive[kMaxTexLights];
+    static D3DXMATRIX  s_lastPrecullView = {};
+
+    const uint64_t currentRev = MGE::SceneGraph::frameRevision();
+    const bool needUpload = (currentRev != lastUploadedRevision);
+
+    if (needUpload && texLightData) {
+        LARGE_INTEGER tsUploadBegin{};
+        if (logPerf) QueryPerformanceCounter(&tsUploadBegin);
+        D3DLOCKED_RECT locked;
+        if (SUCCEEDED(texLightData->LockRect(0, &locked, nullptr, D3DLOCK_DISCARD))) {
+            float* dst = (float*)locked.pBits;
+            memset(dst, 0, kTexelsPerLight * kMaxTexLights * 4 * sizeof(float));
+
+            for (unsigned int i = 0; i < snapshotCount; ++i) {
+                const auto& pl = snapshotLights[i];
+                s_lightWorldPos[i] = D3DXVECTOR3(pl.worldPos[0], pl.worldPos[1], pl.worldPos[2]);
+
+                const unsigned int t = i * kTexelsPerLight * 4;
+                dst[t + 0] = pl.worldPos[0];
+                dst[t + 1] = pl.worldPos[1];
+                dst[t + 2] = pl.worldPos[2];
+                dst[t + 4] = pl.diffuse[0];
+                dst[t + 5] = pl.diffuse[1];
+                dst[t + 6] = pl.diffuse[2];
+                dst[t + 8]  = pl.falloff[0];
+                dst[t + 9]  = pl.falloff[1];
+                dst[t + 10] = pl.falloff[2];
+                dst[t + 11] = pl.radius;
+
+                s_msocToTex[i] = i;
+            }
+            texLightData->UnlockRect(0);
+
+            lastUploadedRevision = currentRev;
+            lastUploadedPointCount = snapshotCount;
+            memset(&s_lastPrecullView, 0, sizeof(s_lastPrecullView));
+        }
+        if (logPerf) {
+            LARGE_INTEGER tsUploadEnd;
+            QueryPerformanceCounter(&tsUploadEnd);
+            const unsigned long long uploadTicks =
+                static_cast<unsigned long long>(tsUploadEnd.QuadPart - tsUploadBegin.QuadPart);
+            if (s_qpcFreq.QuadPart > 0) {
+                s_uploadsTotalNs +=
+                    uploadTicks * 1000000000ULL / static_cast<unsigned long long>(s_qpcFreq.QuadPart);
+            }
+            ++s_uploads;
+        }
+    }
+
+    // Frustum precull. Recomputed whenever the view matrix changes OR a fresh upload
+    // reset s_lastPrecullView. Marks each light "alive" if its 2*radius influence
+    // sphere intersects the camera frustum.
+    if (lastUploadedPointCount > 0) {
+        const bool precullStale = (memcmp(&s_lastPrecullView, &view, sizeof(D3DXMATRIX)) != 0);
+        if (precullStale) {
+            D3DMATRIX projTransform;
+            device->GetTransform(D3DTS_PROJECTION, &projTransform);
+            D3DXMATRIX viewProj;
+            D3DXMatrixMultiply(&viewProj, &view, (const D3DXMATRIX*)&projTransform);
+            D3DXPLANE planes[6] = {
+                D3DXPLANE(viewProj._14 + viewProj._11, viewProj._24 + viewProj._21,
+                          viewProj._34 + viewProj._31, viewProj._44 + viewProj._41),
+                D3DXPLANE(viewProj._14 - viewProj._11, viewProj._24 - viewProj._21,
+                          viewProj._34 - viewProj._31, viewProj._44 - viewProj._41),
+                D3DXPLANE(viewProj._14 - viewProj._12, viewProj._24 - viewProj._22,
+                          viewProj._34 - viewProj._32, viewProj._44 - viewProj._42),
+                D3DXPLANE(viewProj._14 + viewProj._12, viewProj._24 + viewProj._22,
+                          viewProj._34 + viewProj._32, viewProj._44 + viewProj._42),
+                D3DXPLANE(viewProj._13, viewProj._23, viewProj._33, viewProj._43),
+                D3DXPLANE(viewProj._14 - viewProj._13, viewProj._24 - viewProj._23,
+                          viewProj._34 - viewProj._33, viewProj._44 - viewProj._43),
+            };
+            for (int p = 0; p < 6; ++p) D3DXPlaneNormalize(&planes[p], &planes[p]);
+
+            unsigned int aliveCount = 0;
+            for (unsigned int i = 0; i < lastUploadedPointCount; ++i) {
+                const float r = snapshotLights[i].radius * 2.0f;
+                const D3DXVECTOR3& lp = s_lightWorldPos[i];
+                bool alive = true;
+                for (int p = 0; p < 6; ++p) {
+                    const float d = D3DXPlaneDotCoord(&planes[p], &lp);
+                    if (d < -r) { alive = false; break; }
+                }
+                s_lightAlive[i] = alive;
+                if (alive) ++aliveCount;
+            }
+            if (logPerf) {
+                s_preCullAliveSum += aliveCount;
+                s_preCullTotalSum += lastUploadedPointCount;
+            }
+            s_lastPrecullView = view;
+        }
+    }
+
+    unsigned int candidateCount = 0;
+    if (lastUploadedPointCount > 0) {
+        LARGE_INTEGER selBegin{};
+        if (logPerf) QueryPerformanceCounter(&selBegin);
+
+        struct Cand { unsigned int texIdx; float dist2OverR2; };
+        Cand candidates[kMaxTexLights];
+
+        for (unsigned int i = 0; i < snapshotCount; ++i) {
+            if (!s_lightAlive[i]) continue;
+            const auto& pl = snapshotLights[i];
+            if (pl.radius <= 0.0f) continue;
+            const float effR  = pl.radius * 2.0f;
+            const float effR2 = effR * effR;
+
+            const D3DXVECTOR3& lp = s_lightWorldPos[i];
+            const float cx = std::max(bMin.x, std::min(bMax.x, lp.x));
+            const float cy = std::max(bMin.y, std::min(bMax.y, lp.y));
+            const float cz = std::max(bMin.z, std::min(bMax.z, lp.z));
+            const float dx = lp.x - cx, dy = lp.y - cy, dz = lp.z - cz;
+            const float dist2 = dx*dx + dy*dy + dz*dz;
+
+            if (dist2 < effR2) {
+                candidates[candidateCount].texIdx = i;
+                const float r2 = pl.radius * pl.radius;
+                candidates[candidateCount].dist2OverR2 = dist2 / r2;
+                ++candidateCount;
+            }
+        }
+
+        if (candidateCount > kMaxIndicesPerMesh) {
+            std::partial_sort(
+                candidates, candidates + kMaxIndicesPerMesh,
+                candidates + candidateCount,
+                [](const Cand& a, const Cand& b) {
+                    return a.dist2OverR2 < b.dist2OverR2;
+                });
+            candidateCount = kMaxIndicesPerMesh;
+        }
+
+        if (logPerf) {
+            if (candidateCount == 0)                       ++s_selectedBuckets[0];
+            else if (candidateCount <= 4)                  ++s_selectedBuckets[1];
+            else if (candidateCount <= 8)                  ++s_selectedBuckets[2];
+            else if (candidateCount <= 16)                 ++s_selectedBuckets[3];
+            else if (candidateCount < kMaxIndicesPerMesh)  ++s_selectedBuckets[4];
+            else                                           ++s_selectedBuckets[5];
+        }
+
+        for (unsigned int j = 0; j < candidateCount; ++j) {
+            idxFloats[j] = (float)candidates[j].texIdx;
+        }
+
+        if (logPerf) {
+            LARGE_INTEGER selEnd;
+            QueryPerformanceCounter(&selEnd);
+            const unsigned long long selDeltaTicks =
+                (unsigned long long)(selEnd.QuadPart - selBegin.QuadPart);
+            if (s_qpcFreq.QuadPart > 0) {
+                s_selectionTotalNs +=
+                    selDeltaTicks * 1000000000ULL / (unsigned long long)s_qpcFreq.QuadPart;
+            }
+            ++s_selectionCalls;
+        }
+    }
+    return (int)candidateCount;
+}
+
 void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, float pointLightMult,
-                                          const D3DXMATRIX* cacheBonePalette, int cacheNumBones, const D3DXMATRIX* cacheView) {
+                                          const D3DXMATRIX* cacheBonePalette, int cacheNumBones, const D3DXMATRIX* cacheView,
+                                          const D3DXVECTOR3* cacheWorldBoundsMin, const D3DXVECTOR3* cacheWorldBoundsMax) {
     ID3DXEffect* effectFFE;
 
     // Instrument: per-draw stats — engine lightrs.active.size(), msoc snapshot
@@ -257,29 +462,11 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
     static unsigned long long s_msocBuckets[8] = {0};
     static unsigned long long s_variantCalls[4] = {0};
     static unsigned long long s_variantTotalNs[4] = {0};
-    // Per-mesh selection cost. Wraps the bbox-compute +
-    // sphere-AABB loop + partial_sort + constant-push block. Use to
-    // judge whether MeshKey-based selection caching (#1) or
-    // light frustum-precull (#2) is worth implementing — if avgNs is
-    // a few hundred per draw, selection is the bottleneck; if it's
-    // <50 ns/draw, look elsewhere.
-    static unsigned long long s_selectionCalls = 0;
-    static unsigned long long s_selectionTotalNs = 0;
-    // Texture-upload cost: how often does texLightData actually get
-    // re-uploaded (revision bumped OR view-matrix changed), and ns spent
-    // in LockRect+memset+pack+UnlockRect+frustum-precull per upload.
-    static unsigned long long s_uploads          = 0;
-    static unsigned long long s_uploadsTotalNs   = 0;
-    // Frustum-precull alive ratio: cumulative alive count / total checks
-    // across all uploads. Tells us how effective the 2*radius frustum
-    // precull is at trimming the candidate set for the per-mesh inner loop.
-    static unsigned long long s_preCullAliveSum  = 0;
-    static unsigned long long s_preCullTotalSum  = 0;
-    // Per-mesh selected-light histogram. After per-mesh sphere-AABB cull +
-    // partial_sort, how many lights actually drive the shader's per-pixel
-    // loop. Buckets: [0, 1-4, 5-8, 9-16, 17-31, 32 (capped)].
-    static unsigned long long s_selectedBuckets[6] = {0};
-    static LARGE_INTEGER s_qpcFreq = {};
+    // Per-mesh selection / upload / precull / selected-dist accumulators moved to
+    // file scope (s_selectionCalls, s_selectionTotalNs, s_uploads, s_uploadsTotalNs,
+    // s_preCullAliveSum, s_preCullTotalSum, s_selectedBuckets, s_qpcFreq) so the
+    // extracted selectTextureLights() — shared with the cache terrain pass — feeds
+    // the same periodic histograms this function logs below.
     if (s_qpcFreq.QuadPart == 0) QueryPerformanceFrequency(&s_qpcFreq);
 
     // Cache the LogDistantPipeline flag once per draw. All per-draw
@@ -357,202 +544,25 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
         }
     }
 
-    // Per-mesh light selection — hoisted above ShaderKey so
-    // we know candidateCount before picking the variant. Draws that
-    // pick zero snapshot lights ("fast-path") demote from v3 (64-light
-    // texture path) to v1/v2 (engine 8-light shader, all-zero point
-    // buffers). Per LIGHTS-INSTR + SELECTED-DIST: ~41% of v3 calls
-    // select 0 lights — that's the activation rate. Saves the v3
-    // shader's per-pixel point loop + 4 effect param pushes for those
-    // draws.
-    //
-    // The block below contains the full upload + frustum precull +
-    // per-mesh sphere-AABB cull. Texture-light param pushes (texture,
-    // params, indices, view matrix) need effectFFE so they live below,
-    // gated on actuallyUseTextureLights.
+    // Per-mesh light selection — hoisted above ShaderKey so we know candidateCount
+    // before picking the variant. The revision-keyed texLightData upload + view-keyed
+    // frustum precull + per-mesh sphere-AABB cull are extracted into
+    // selectTextureLights() so the cache terrain pass (renderCachedTerrain) selects
+    // lights with BYTE-IDENTICAL logic — that's what keeps cache color in lockstep
+    // with the reactive path (the A/B light-seam fix). Bounds: cache draws pass an
+    // explicit world AABB (their VBs are D3DUSAGE_WRITEONLY, so computeBoundingBox
+    // can't read them and would fall back to the object origin — the object seam);
+    // reactive draws use computeBoundingBox, falling back to origin on lock failure.
     if (useTextureLights) {
-        // Per-draw selection scratch (no allocation in the hot path).
-        // s_msocToTex maps original snapshot index → texture row index
-        // (or UINT_MAX for non-points). s_lightWorldPos caches world
-        // positions used by the per-mesh selection's sphere-AABB test.
-        // s_lightAlive flags lights whose 2*radius influence sphere
-        // intersects the camera frustum (precull runs whenever the view
-        // matrix changes — independently of the texture upload, which
-        // now only fires on snapshot-revision change). s_lastPrecullView
-        // caches the view matrix the precull was last computed against.
-        static unsigned int s_msocToTex[kMaxTexLights];
-        static D3DXVECTOR3 s_lightWorldPos[kMaxTexLights];
-        static bool        s_lightAlive[kMaxTexLights];
-        static D3DXMATRIX  s_lastPrecullView = {};
-
-        const uint64_t currentRev = MGE::SceneGraph::frameRevision();
-        const bool needUpload = (currentRev != lastUploadedRevision);
-
-        if (needUpload && texLightData) {
-            LARGE_INTEGER tsUploadBegin{};
-            if (logPerf) QueryPerformanceCounter(&tsUploadBegin);
-            D3DLOCKED_RECT locked;
-            if (SUCCEEDED(texLightData->LockRect(0, &locked, nullptr, D3DLOCK_DISCARD))) {
-                float* dst = (float*)locked.pBits;
-                memset(dst, 0, kTexelsPerLight * kMaxTexLights * 4 * sizeof(float));
-
-                for (unsigned int i = 0; i < snapshotCount; ++i) {
-                    const auto& pl = snapshotLights[i];
-                    s_lightWorldPos[i] = D3DXVECTOR3(pl.worldPos[0], pl.worldPos[1], pl.worldPos[2]);
-
-                    const unsigned int t = i * kTexelsPerLight * 4;
-                    dst[t + 0] = pl.worldPos[0];
-                    dst[t + 1] = pl.worldPos[1];
-                    dst[t + 2] = pl.worldPos[2];
-                    dst[t + 4] = pl.diffuse[0];
-                    dst[t + 5] = pl.diffuse[1];
-                    dst[t + 6] = pl.diffuse[2];
-                    dst[t + 8]  = pl.falloff[0];
-                    dst[t + 9]  = pl.falloff[1];
-                    dst[t + 10] = pl.falloff[2];
-                    dst[t + 11] = pl.radius;
-
-                    s_msocToTex[i] = i;
-                }
-                texLightData->UnlockRect(0);
-
-                lastUploadedRevision = currentRev;
-                lastUploadedPointCount = snapshotCount;
-                memset(&s_lastPrecullView, 0, sizeof(s_lastPrecullView));
-            }
-            if (logPerf) {
-                LARGE_INTEGER tsUploadEnd;
-                QueryPerformanceCounter(&tsUploadEnd);
-                const unsigned long long uploadTicks =
-                    static_cast<unsigned long long>(tsUploadEnd.QuadPart - tsUploadBegin.QuadPart);
-                if (s_qpcFreq.QuadPart > 0) {
-                    s_uploadsTotalNs +=
-                        uploadTicks * 1000000000ULL / static_cast<unsigned long long>(s_qpcFreq.QuadPart);
-                }
-                ++s_uploads;
-            }
+        D3DXVECTOR3 bMin, bMax;
+        if (cacheWorldBoundsMin) {
+            bMin = *cacheWorldBoundsMin; bMax = *cacheWorldBoundsMax;
+        } else if (!computeBoundingBox(rs, bMin, bMax)) {
+            const D3DXMATRIX& wt = rs->worldTransforms[0];
+            bMin = bMax = D3DXVECTOR3(wt._41, wt._42, wt._43);
         }
-
-        // Frustum precull. Decoupled from texture upload — runs whenever
-        // the camera's view matrix changes OR a fresh upload reset
-        // s_lastPrecullView. Marks each light "alive" if its 2*radius
-        // influence sphere intersects the camera frustum.
-        if (lastUploadedPointCount > 0) {
-            const bool precullStale = (memcmp(&s_lastPrecullView, &rs->viewTransform,
-                                              sizeof(D3DXMATRIX)) != 0);
-            if (precullStale) {
-                D3DMATRIX projTransform;
-                device->GetTransform(D3DTS_PROJECTION, &projTransform);
-                D3DXMATRIX viewProj;
-                D3DXMatrixMultiply(&viewProj,
-                    (const D3DXMATRIX*)&rs->viewTransform,
-                    (const D3DXMATRIX*)&projTransform);
-                D3DXPLANE planes[6] = {
-                    D3DXPLANE(viewProj._14 + viewProj._11, viewProj._24 + viewProj._21,
-                              viewProj._34 + viewProj._31, viewProj._44 + viewProj._41),
-                    D3DXPLANE(viewProj._14 - viewProj._11, viewProj._24 - viewProj._21,
-                              viewProj._34 - viewProj._31, viewProj._44 - viewProj._41),
-                    D3DXPLANE(viewProj._14 - viewProj._12, viewProj._24 - viewProj._22,
-                              viewProj._34 - viewProj._32, viewProj._44 - viewProj._42),
-                    D3DXPLANE(viewProj._14 + viewProj._12, viewProj._24 + viewProj._22,
-                              viewProj._34 + viewProj._32, viewProj._44 + viewProj._42),
-                    D3DXPLANE(viewProj._13, viewProj._23, viewProj._33, viewProj._43),
-                    D3DXPLANE(viewProj._14 - viewProj._13, viewProj._24 - viewProj._23,
-                              viewProj._34 - viewProj._33, viewProj._44 - viewProj._43),
-                };
-                for (int p = 0; p < 6; ++p) D3DXPlaneNormalize(&planes[p], &planes[p]);
-
-                unsigned int aliveCount = 0;
-                for (unsigned int i = 0; i < lastUploadedPointCount; ++i) {
-                    const float r = snapshotLights[i].radius * 2.0f;
-                    const D3DXVECTOR3& lp = s_lightWorldPos[i];
-                    bool alive = true;
-                    for (int p = 0; p < 6; ++p) {
-                        const float d = D3DXPlaneDotCoord(&planes[p], &lp);
-                        if (d < -r) { alive = false; break; }
-                    }
-                    s_lightAlive[i] = alive;
-                    if (alive) ++aliveCount;
-                }
-                if (logPerf) {
-                    s_preCullAliveSum += aliveCount;
-                    s_preCullTotalSum += lastUploadedPointCount;
-                }
-                s_lastPrecullView = rs->viewTransform;
-            }
-        }
-
-        if (lastUploadedPointCount > 0) {
-            LARGE_INTEGER selBegin{};
-            if (logPerf) QueryPerformanceCounter(&selBegin);
-
-            D3DXVECTOR3 bMin, bMax;
-            if (!computeBoundingBox(rs, bMin, bMax)) {
-                const D3DXMATRIX& wt = rs->worldTransforms[0];
-                bMin = bMax = D3DXVECTOR3(wt._41, wt._42, wt._43);
-            }
-
-            struct Cand { unsigned int texIdx; float dist2OverR2; };
-            Cand candidates[kMaxTexLights];
-            candidateCount = 0;
-
-            for (unsigned int i = 0; i < snapshotCount; ++i) {
-                if (!s_lightAlive[i]) continue;
-                const auto& pl = snapshotLights[i];
-                if (pl.radius <= 0.0f) continue;
-                const float effR  = pl.radius * 2.0f;
-                const float effR2 = effR * effR;
-
-                const D3DXVECTOR3& lp = s_lightWorldPos[i];
-                const float cx = std::max(bMin.x, std::min(bMax.x, lp.x));
-                const float cy = std::max(bMin.y, std::min(bMax.y, lp.y));
-                const float cz = std::max(bMin.z, std::min(bMax.z, lp.z));
-                const float dx = lp.x - cx, dy = lp.y - cy, dz = lp.z - cz;
-                const float dist2 = dx*dx + dy*dy + dz*dz;
-
-                if (dist2 < effR2) {
-                    candidates[candidateCount].texIdx = i;
-                    const float r2 = pl.radius * pl.radius;
-                    candidates[candidateCount].dist2OverR2 = dist2 / r2;
-                    ++candidateCount;
-                }
-            }
-
-            if (candidateCount > kMaxIndicesPerMesh) {
-                std::partial_sort(
-                    candidates, candidates + kMaxIndicesPerMesh,
-                    candidates + candidateCount,
-                    [](const Cand& a, const Cand& b) {
-                        return a.dist2OverR2 < b.dist2OverR2;
-                    });
-                candidateCount = kMaxIndicesPerMesh;
-            }
-
-            if (logPerf) {
-                if (candidateCount == 0)                       ++s_selectedBuckets[0];
-                else if (candidateCount <= 4)                  ++s_selectedBuckets[1];
-                else if (candidateCount <= 8)                  ++s_selectedBuckets[2];
-                else if (candidateCount <= 16)                 ++s_selectedBuckets[3];
-                else if (candidateCount < kMaxIndicesPerMesh)  ++s_selectedBuckets[4];
-                else                                           ++s_selectedBuckets[5];
-            }
-
-            for (unsigned int j = 0; j < candidateCount; ++j) {
-                idxFloats[j] = (float)candidates[j].texIdx;
-            }
-
-            if (logPerf) {
-                LARGE_INTEGER selEnd;
-                QueryPerformanceCounter(&selEnd);
-                const unsigned long long selDeltaTicks =
-                    (unsigned long long)(selEnd.QuadPart - selBegin.QuadPart);
-                if (s_qpcFreq.QuadPart > 0) {
-                    s_selectionTotalNs +=
-                        selDeltaTicks * 1000000000ULL / (unsigned long long)s_qpcFreq.QuadPart;
-                }
-                ++s_selectionCalls;
-            }
-        }
+        candidateCount = selectTextureLights(snapshotLights, snapshotCount,
+                                             rs->viewTransform, bMin, bMax, idxFloats, logPerf);
     }
     }   // release SnapshotReadLock — all snapshotLights reads complete
 

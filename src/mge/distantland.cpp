@@ -312,6 +312,11 @@ void DistantLand::renderStage0() {
             // for the sky + reflection passes that follow.
             if (cacheOpaqueMode) {
                 renderCachedOpaque(&mwView, &mwProj);
+                // M2.1: own the terrain too (objects + terrain = all opaque). The
+                // engine's near-terrain base + splat passes are suppressed in
+                // inspectIndexedPrimitive in CACHE mode, so this is the only near
+                // terrain; DL LOD sits behind via the distant projection.
+                renderCachedTerrain(&mwView, &mwProj);
                 effect->SetMatrix(ehProj, &distProj);
             }
 
@@ -478,9 +483,17 @@ void DistantLand::renderStage1() {
 
             // Overlay shadow onto Morrowind objects
             if ((Configuration.MGEFlags & USE_SHADOWS) && mwBridge->CellHasWeather()) {
+                // CACHE mode: the cache owns scene-0 textured-opaque color/depth at the
+                // snapshot pose, so renderShadow() skips that set (skipCacheCovered) and
+                // renderShadowReceiverFromCache re-applies the receiver at the SAME pose
+                // — otherwise the live recordMW receiver mismatches the async-stale cache
+                // depth and flickers on animated geometry (banners).
                 effect->BeginPass(isPPLActive ? PASS_RENDERSHADOWFFE : PASS_RENDERSHADOW);
-                renderShadow();
+                renderShadow(cacheOpaqueMode);
                 effect->EndPass();
+                if (cacheOpaqueMode) {
+                    renderShadowReceiverFromCache(&mwView, &mwProj);
+                }
             }
 
             effect->End();
@@ -1266,7 +1279,13 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
         // engine's reactive draw of those covered parts here (skip the per-draw
         // renderMorrowind + the engine forward). Non-covered parts fall through to
         // the normal reactive path so the A/B compares only the covered subset.
-        if (cacheOpaqueMode && isCoveredOpaque(rs, frs)) {
+        //
+        // M2.1: also suppress the engine's terrain splat overlay passes (isLandSplat
+        // = the alpha-blend 2nd+ passes). The opaque base terrain pass is already
+        // covered by isCoveredOpaque; together they remove ALL engine near terrain so
+        // renderCachedTerrain isn't double-drawn over it. (recordMW capture above is
+        // untouched — depth replay still sees the engine terrain.)
+        if (cacheOpaqueMode && (isCoveredOpaque(rs, frs) || isLandSplat)) {
             return false;
         }
         // Render Morrowind with replacement shaders

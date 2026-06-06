@@ -1,6 +1,7 @@
 #pragma once
 
 #include "proxydx/d3d8header.h"
+#include "scenegraph.h"   // MGE::SceneGraph::PointLight for selectTextureLights
 
 #include <unordered_map>
 #include <vector>
@@ -222,7 +223,25 @@ public:
     // cacheBonePalette/cacheNumBones/cacheView drive the cache 32-bone indexed
     // skinning path (used by the cache reflection feed). When cacheBonePalette is
     // null, the rigid/reactive-skinning path is unchanged.
+    // cacheWorldBoundsMin/Max override the per-mesh light-selection bounds for cache
+    // draws (their VBs are D3DUSAGE_WRITEONLY, so computeBoundingBox can't read them
+    // and would fall back to the object origin — the A/B light seam). Pass the cache
+    // entry's true world AABB; null = reactive path (computeBoundingBox).
     static void renderMorrowind(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, float pointLightMult = 1.0f,
-                                const D3DXMATRIX* cacheBonePalette = nullptr, int cacheNumBones = 0, const D3DXMATRIX* cacheView = nullptr);
+                                const D3DXMATRIX* cacheBonePalette = nullptr, int cacheNumBones = 0, const D3DXMATRIX* cacheView = nullptr,
+                                const D3DXVECTOR3* cacheWorldBoundsMin = nullptr, const D3DXVECTOR3* cacheWorldBoundsMax = nullptr);
+    // Shared texture-light selection (revision-keyed upload + view-keyed frustum
+    // precull + per-mesh sphere-AABB nearest-kMaxIndicesPerMesh). Used by
+    // renderMorrowind (objects) and the cache terrain pass so both pick lights with
+    // byte-identical logic. Caller holds MGE::SceneGraph::SnapshotReadLock; device's
+    // D3DTS_PROJECTION must match `view`. Returns the selected count; fills idxFloats
+    // (>= kMaxIndicesPerMesh floats, packed as the lightIndices c-register layout).
+    static int selectTextureLights(const std::vector<MGE::SceneGraph::PointLight>& snapshotLights,
+                                   unsigned int snapshotCount, const D3DXMATRIX& view,
+                                   const D3DXVECTOR3& bMin, const D3DXVECTOR3& bMax,
+                                   float* idxFloats, bool logPerf);
+    static IDirect3DTexture9* textureLightData() { return texLightData; }
+    static unsigned int maxTexLights()      { return kMaxTexLights; }
+    static float        texLightTexelSize() { return 1.0f / (float)(kTexelsPerLight * kMaxTexLights); }
     static void release();
 };

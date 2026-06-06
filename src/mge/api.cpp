@@ -7,6 +7,7 @@
 #include "mgeversion.h"
 #include "postshaders.h"
 #include "scenegraph.h"
+#include "scenegraph_geometry_cache.h"
 #include "userhud.h"
 #include "mwbridge.h"
 #include "support/log.h"
@@ -854,8 +855,29 @@ namespace api {
         MWBridge::get()->SetViewDistance(distance);
     }
 
-    // MGEAPIv4 (scene-graph bridge) implementations used to live here.
-    // Dropped along with the v4 surface — see api.h for the rationale.
-    // MGE::SceneGraph drives itself now: getDataHandler() self-sources the
-    // engine global, onFrameReady() is called from DistantLand::renderStage0.
+    //-------------------------------------------------------------------------
+    // MGEAPIv4 — scene-graph bridge, revived as ABI-continuity stubs (M2.2).
+    // MGE self-sources the DataHandler (engine global 0x7C67E0) and self-drives
+    // onFrameReady() from DistantLand::renderStage0, so setDataHandler /
+    // onSceneGraphReady are no-ops; getDataHandler forwards the self-sourced ptr.
+
+    void MGEAPIv4::setDataHandler(void* /*dataHandler*/) {
+        // No-op: MGE self-sources from the engine global. Slot kept for ABI layout.
+    }
+
+    void* MGEAPIv4::getDataHandler() const {
+        return MGE::SceneGraph::getDataHandler();
+    }
+
+    void MGEAPIv4::onSceneGraphReady() {
+        // No-op: DistantLand::renderStage0 drives MGE::SceneGraph::onFrameReady().
+    }
+
+    //-------------------------------------------------------------------------
+    // MGEAPIv5 — renderer-takeover flag (M2.2). True when MGE owns the opaque
+    // world this frame, so MWSE can no-op the engine's scene0 opaque render.
+
+    bool MGEAPIv5::isOpaqueWorldCacheOwned() const {
+        return DistantLand::cacheOpaqueMode && !MGE::GeometryCache::cache().empty();
+    }
 }

@@ -100,9 +100,11 @@ namespace MGE::GeometryCache {
     static constexpr unsigned int kVBFVF    = 0x152; // XYZ|NORMAL|DIFFUSE|TEX1
 
     // Skinned vertex layout (SkinnedVertIn in the shaders): float3 pos,
-    // float3 normal, float4 blendweights, UBYTE4 blendindices, float2 uv. Drawn with
-    // skinnedDecl(). kMaxBones must match MAX_BONES in "XE Common.fx".
-    static constexpr unsigned int kSkinnedVBStride = 52;
+    // float3 normal, float4 blendweights, UBYTE4 blendindices, float2 uv, DWORD color.
+    // Drawn with skinnedDecl(). kMaxBones must match MAX_BONES in "XE Common.fx".
+    // Phase 2: color appended at offset 52 (depth/shadow skinned VS ignore it; the
+    // FFE cache-skin color path reads it when the part uses vertex colour).
+    static constexpr unsigned int kSkinnedVBStride = 56;
     static constexpr unsigned int kMaxBones        = 32;
 
     // Vertex declaration for skinned VBs (created in init). Null until init runs.

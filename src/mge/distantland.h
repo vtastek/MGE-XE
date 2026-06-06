@@ -205,6 +205,9 @@ public:
     static D3DXHANDLE ehShadowReflMult;
     static D3DXHANDLE ehLandNearCull;
     static D3DXHANDLE ehReflWaterClip;
+    // Texture-light path handles on the distant-land effect (cache terrain point
+    // lights). Bound per-patch from selectTextureLights output in renderCachedTerrain.
+    static D3DXHANDLE ehLightData, ehLightDataParams, ehLightIndices, ehTexLightView;
     static D3DXHANDLE ehWindVec;
     static D3DXHANDLE ehNiceWeather;
     static D3DXHANDLE ehTime;
@@ -393,6 +396,13 @@ public:
     // (two-texture AlphaGrid splat), replacing the coarse distant-land LOD inside
     // nearDist. The DL land pass is near-clipped (landNearCull) to hand off.
     static void renderReflectionTerrainFromCache(const D3DXMATRIX* view, const D3DXMATRIX* proj, float nearDist);
+    // Phase 1 Milestone 2.1: main-view sibling of renderReflectionTerrainFromCache.
+    // Draws the real near terrain (the engine's submitted landscape, two-texture
+    // AlphaGrid splat) from the cache into the MAIN view, so MGE owns ALL opaque
+    // (objects + terrain) in CACHE mode. No near-dist handover (the cache IS the
+    // engine's near terrain; DL LOD owns beyond via the distant projection), no
+    // water clip, main-view CW winding. Run from renderStage0 after renderCachedOpaque.
+    static void renderCachedTerrain(const D3DXMATRIX* view, const D3DXMATRIX* proj);
     static void clearReflection();
     // Water-reflection occlusion gate: true if any water surface is actually
     // visible in the main view (terrain height + MSOC), so the ~1ms reflection
@@ -471,7 +481,16 @@ public:
     template<class T>
     static void renderShadowLayerGeneric(MWBridge* mwBridge, int layer, const D3DXMATRIX* inverseCameraProj, D3DXMATRIX* view, D3DXMATRIX* proj, VisibleSet<T>& visible_set);
     static void renderShadowLayer(int layer, float radius, const D3DXMATRIX* inverseCameraProj);
-    static void renderShadow();
+    // skipCacheCovered: in CACHE mode (scene 0), skip the recordMW entries the cache
+    // owns (textured opaque) — their shadow receiver comes from the cache instead
+    // (renderShadowReceiverFromCache), at the snapshot pose, so the async-stale
+    // snapshot doesn't flicker against a live-pose receiver on animated geometry.
+    static void renderShadow(bool skipCacheCovered = false);
+    // Main-view cache shadow receiver (CACHE mode): re-draws the cache opaque set
+    // (objects + terrain + skinned) as shadow receivers at the snapshot pose, so the
+    // receiver depth matches the cache color/depth. Main-view sibling of
+    // renderReflectionShadowsFromCache (full strength, no handover fade).
+    static void renderShadowReceiverFromCache(const D3DXMATRIX* view, const D3DXMATRIX* proj);
     static void renderShadowDebug();
 
     static void postProcess();

@@ -20,7 +20,8 @@ enum RenderPassID {
     PASS_WAVESTEP,
     PASS_WORKAROUND,
     PASS_RENDERCACHETERRAIN,  // appended pass P13; cache near terrain in reflections
-    PASS_RENDERSHADOWFFE_SKINNED   // appended pass P14; cache-skinned shadow receiver (reflections)
+    PASS_RENDERSHADOWFFE_SKINNED,  // appended pass P14; cache-skinned shadow receiver (reflections)
+    PASS_RENDERCACHETERRAINLIT   // appended pass P15; cache near terrain with point lights (main view)
 };
 
 enum RenderShadowMapID {

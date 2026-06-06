@@ -477,4 +477,22 @@ Technique T0 {
         VertexShader = compile vs_3_0 RenderShadowsFFESkinnedVS();
         PixelShader = compile ps_3_0 RenderShadowsPS();
     }
+    //------------------------------------------------------------
+    // Cache near terrain WITH dynamic point lights (main view) — same states as P13
+    // (cache terrain) but the lit VS/PS evaluate texture-backed point lights so cache
+    // terrain matches the reactive PPL terrain. Main-view winding (CW); the caller
+    // (renderCachedTerrain) overrides cull per-draw as needed.
+    Pass P15 {
+        ZEnable = true;
+        ZWriteEnable = true;
+        ZFunc = LessEqual;
+        StencilEnable = false;
+        CullMode = CW;
+
+        AlphaBlendEnable = false;
+        AlphaTestEnable = false;
+
+        VertexShader = compile vs_3_0 CacheTerrainLitVS();
+        PixelShader = compile ps_3_0 CacheTerrainLitPS();
+    }
 }

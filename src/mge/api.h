@@ -3,7 +3,7 @@
 #include <stddef.h>
 
 namespace api {
-	static const int supported_api_version = 4;
+	static const int supported_api_version = 5;
 
 	struct MGEAPI {
 		virtual int getAPIVersion() const = 0;
@@ -226,14 +226,35 @@ namespace api {
 		virtual bool shaderSetVectorArray(ShaderHandle handle, const char* variableName, const float* values, size_t* count);
     };
 
-    // MGEAPIv4 (scene-graph bridge) used to live here. MWSE dropped its
-    // side of the ABI on the sharedse-ni-unification branch (commit
-    // d2a92c596d). MGE now self-sources the DataHandler pointer from the
-    // engine global at 0x7C67E0 inside MGE::SceneGraph::getDataHandler(),
-    // and drives the per-frame walk from DistantLand::renderStage0, so
-    // the v4 surface is dead. Removed to keep MGE close to upstream.
+    // MGEAPIv4 — scene-graph bridge (Phase 1 M2.2, revived).
+    //
+    // The v4 surface was dropped (commit 5941da3) once MWSE stopped pushing the
+    // DataHandler pointer (sharedse-ni-unification d2a92c596d): MGE now self-sources
+    // the engine global at 0x7C67E0 in MGE::SceneGraph::getDataHandler() and drives
+    // the per-frame walk from DistantLand::renderStage0. The Phase 1 renderer
+    // takeover needs an MGE->MWSE flag (v5) to no-op the engine's opaque scene, so
+    // the export ABI is revived. v4 is restored AS STUBS purely for vtable/ABI
+    // continuity (so v5 sits at the documented slot offsets): setDataHandler /
+    // onSceneGraphReady are no-ops (MGE self-sources + self-drives), getDataHandler
+    // forwards to the self-sourced pointer.
+    struct MGEAPIv4 : public MGEAPIv3 {
+        virtual void  setDataHandler(void* dataHandler);
+        virtual void* getDataHandler() const;
+        virtual void  onSceneGraphReady();
+    };
 
-    typedef MGEAPIv3 MGEAPI_ExportVersion;
+    // MGEAPIv5 — renderer-takeover flag (Phase 1 M2.2).
+    //
+    // A single wholesale signal MWSE reads to no-op the engine's scene0 opaque-world
+    // render (objects + terrain) when MGE owns it this frame. True iff CACHE mode is
+    // active AND the geometry cache is populated for the current frame; false
+    // otherwise (the engine then renders opaque as normal). Alpha, water, the
+    // first-person arm and UI stay engine-driven regardless.
+    struct MGEAPIv5 : public MGEAPIv4 {
+        virtual bool isOpaqueWorldCacheOwned() const;
+    };
+
+    typedef MGEAPIv5 MGEAPI_ExportVersion;
 
 	inline MGEAPIv1* api = nullptr;
 	inline const MacroFunctions* macros = nullptr;

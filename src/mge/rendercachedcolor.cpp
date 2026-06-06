@@ -368,15 +368,23 @@ void DistantLand::renderCachedOpaque(const D3DXMATRIX* view, const D3DXMATRIX* p
         IDirect3DVertexBuffer9* vb = e.readVB();
         if (!vb || !e.ib) return;
 
+        // World-space bound: skinned = bone-palette-derived posed bound; non-skinned
+        // = true world bound (not the object origin). Used for the fallback frustum
+        // cull AND the texture-light selection AABB below (renderMorrowind can't read
+        // our WRITEONLY VB via computeBoundingBox, so we hand it these bounds — the
+        // object light-seam fix, keeping cache light selection identical to reactive).
+        BoundingSphere bs;
+        if (e.isSkinned) { cacheSkinnedWorldBounds(e, bs.center, bs.radius); }
+        else             { cacheWorldBounds(e, bs.center, bs.radius); }
+
         // Only the full-cache fallback frustum-culls (the visible set is already
-        // the main-camera cull). Skinned: bone-palette-derived posed bound;
-        // non-skinned: true world-space bound (not the object origin).
+        // the main-camera cull).
         if (!useVisibleSet) {
-            BoundingSphere bs;
-            if (e.isSkinned) { cacheSkinnedWorldBounds(e, bs.center, bs.radius); }
-            else             { cacheWorldBounds(e, bs.center, bs.radius); }
             if (frustum.ContainsSphere(bs) == ViewFrustum::OUTSIDE) { if (logPerf) ++s_skFrustum; return; }
         }
+
+        const D3DXVECTOR3 lbMin(bs.center.x - bs.radius, bs.center.y - bs.radius, bs.center.z - bs.radius);
+        const D3DXVECTOR3 lbMax(bs.center.x + bs.radius, bs.center.y + bs.radius, bs.center.z + bs.radius);
 
         buildCacheMainState(e, *view, sunVec, sunCol, sunAmb, ambCol, rs, frs, lightrs);
 
@@ -404,11 +412,11 @@ void DistantLand::renderCachedOpaque(const D3DXMATRIX* view, const D3DXMATRIX* p
             device->SetVertexDeclaration(MGE::GeometryCache::skinnedDecl());
             device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kSkinnedVBStride);
             const D3DXMATRIX* pal = reinterpret_cast<const D3DXMATRIX*>(e.bonePalette.data());
-            FixedFunctionShader::renderMorrowind(&rs, &frs, &lightrs, 1.0f, pal, (int)e.numBones, view);
+            FixedFunctionShader::renderMorrowind(&rs, &frs, &lightrs, 1.0f, pal, (int)e.numBones, view, &lbMin, &lbMax);
         } else {
             device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kVBStride);
             device->SetFVF(MGE::GeometryCache::kVBFVF);
-            FixedFunctionShader::renderMorrowind(&rs, &frs, &lightrs);
+            FixedFunctionShader::renderMorrowind(&rs, &frs, &lightrs, 1.0f, nullptr, 0, nullptr, &lbMin, &lbMax);
         }
         if (logPerf) ++s_drawn;
     };
@@ -616,6 +624,215 @@ void DistantLand::renderReflectionTerrainFromCache(const D3DXMATRIX* view, const
         device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kVBStride);
         device->SetIndices(e.ib);
         device->SetFVF(MGE::GeometryCache::kVBFVF);
+        DrawStats::count(e.triangleCount);
+        device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, e.vertexCount, 0, e.triangleCount);
+    }
+    effect->EndPass();
+}
+
+// renderCachedTerrain - main-view sibling of renderReflectionTerrainFromCache.
+// Draws the real near terrain (the engine's submitted landscape patches, two-texture
+// AlphaGrid splat) from the cache into the MAIN view so MGE owns ALL opaque
+// (objects + terrain) in CACHE mode. Lit with sun + vcol AND dynamic point lights
+// via the SHARED FixedFunctionShader::selectTextureLights (per-patch, byte-identical
+// to the object path), so cache terrain matches the reactive PPL terrain lighting
+// (the A/B light-seam fix). Uses PASS_RENDERCACHETERRAINLIT (CacheTerrainLitVS/PS);
+// the reflection keeps PASS_RENDERCACHETERRAIN untouched. Differences from the
+// reflection version: no near-dist handover (cache landscape IS the engine's near
+// terrain; DL LOD owns beyond via the distant projection), main-view CW winding, no
+// water clip.
+void DistantLand::renderCachedTerrain(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
+    MGE_ZoneScopedN("renderCachedTerrain");
+
+    const auto& cacheMap = MGE::GeometryCache::cache();
+    if (cacheMap.empty()) return;
+
+    // Main-view projection for the shared `proj` pool param; caller restores distProj.
+    effect->SetMatrix(ehProj, proj);
+    // D3DTS_PROJECTION drives selectTextureLights' frustum precull (renderCachedOpaque
+    // already set it to mwProj, but be self-contained for the object-less case).
+    device->SetTransform(D3DTS_PROJECTION, proj);
+
+    D3DXMATRIX viewproj;
+    D3DXMatrixMultiply(&viewproj, view, proj);
+    ViewFrustum frustum(&viewproj);
+
+    // Texture-light setup: bind the shared light-data texture once; per patch we run
+    // the same selection the object path uses and push lightIndices/lightDataParams/
+    // texLightView. texLightView = view (world->view) so the shader transforms the
+    // texture's world-space light positions into the terrain's view space.
+    const bool logPerf = Configuration.LogDistantPipeline;
+    const float texelSize = FixedFunctionShader::texLightTexelSize();
+    effect->SetTexture(ehLightData, FixedFunctionShader::textureLightData());
+    effect->SetMatrix(ehTexLightView, view);
+    float idxFloats[8 * 4] = { 0 };
+
+    // Hold the snapshot lock across the patch loop: selectTextureLights reads the
+    // point-light snapshot (and, on a revision bump, uploads texLightData) under it.
+    MGE::SceneGraph::SnapshotReadLock snapshotLock;
+    const auto& snapshotLights = MGE::SceneGraph::pointLights();
+    const unsigned int snapshotCount =
+        std::min<unsigned int>((unsigned int)snapshotLights.size(), FixedFunctionShader::maxTexLights());
+
+    effect->BeginPass(PASS_RENDERCACHETERRAINLIT);
+    for (const auto& kv : cacheMap) {
+        const auto& e = kv.second;
+        if (!e.isLandscape || e.isSkinned) continue;
+        if (!e.d3dTexture) continue;          // need at least a base texture
+        IDirect3DVertexBuffer9* vb = e.readVB();
+        if (!vb || !e.ib) continue;
+
+        // Cull by the true world-space bound sphere (the patch origin is the cell
+        // corner, ~4096u from the real center — using it falsely culls the patch the
+        // camera stands on). No near-dist limit: all cache landscape is near terrain.
+        BoundingSphere bs;
+        cacheWorldBounds(e, bs.center, bs.radius);
+        if (frustum.ContainsSphere(bs) == ViewFrustum::OUTSIDE) continue;
+
+        // Per-patch point-light selection (sphere-AABB nearest-32), byte-identical to
+        // the object path. AABB from the patch's world bound sphere.
+        const D3DXVECTOR3 lbMin(bs.center.x - bs.radius, bs.center.y - bs.radius, bs.center.z - bs.radius);
+        const D3DXVECTOR3 lbMax(bs.center.x + bs.radius, bs.center.y + bs.radius, bs.center.z + bs.radius);
+        const int lightCount = FixedFunctionShader::selectTextureLights(
+            snapshotLights, snapshotCount, *view, lbMin, lbMax, idxFloats, logPerf);
+        const D3DXVECTOR4 lightDataParams_v((float)lightCount, texelSize, 0.0f, 0.0f);
+        effect->SetVector(ehLightDataParams, &lightDataParams_v);
+        if (lightCount > 0) effect->SetVectorArray(ehLightIndices, (D3DXVECTOR4*)idxFloats, 8);
+
+        effect->SetMatrix(ehWorld, reinterpret_cast<const D3DXMATRIX*>(e.worldTransformD3D));
+        effect->SetTexture(ehTex0, e.d3dTexture);
+        // No overlay -> bind base to tex2 so lerp(base, base, a) == base.
+        effect->SetTexture(ehTex2, e.d3dOverlay ? e.d3dOverlay : e.d3dTexture);
+        // Position via vertexBlendPalette[0] (= world*view), the same premultiplied
+        // matrix the reflection/shadow paths use (bit-identical depth, no acne).
+        D3DXMATRIX wv;
+        D3DXMatrixMultiply(&wv, reinterpret_cast<const D3DXMATRIX*>(e.worldTransformD3D), view);
+        effect->SetMatrixArray(ehVertexBlendPalette, &wv, 1);
+        effect->CommitChanges();
+
+        // Main-view winding: CW (the pass declares reflection CCW). Set after
+        // CommitChanges, matching the shadow path's per-part cull override.
+        device->SetRenderState(D3DRS_CULLMODE, D3DCULL_CW);
+        device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kVBStride);
+        device->SetIndices(e.ib);
+        device->SetFVF(MGE::GeometryCache::kVBFVF);
+        DrawStats::count(e.triangleCount);
+        device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, e.vertexCount, 0, e.triangleCount);
+    }
+    effect->EndPass();
+}
+
+// renderShadowReceiverFromCache - main-view sibling of renderReflectionShadowsFromCache.
+// Re-draws the cache opaque set (textured objects + terrain + skinned NPCs) as sun-
+// shadow receivers AT THE SNAPSHOT POSE, so the receiver depth is bit-consistent with
+// the cache color/depth that renderCachedOpaque/renderCachedTerrain wrote. The default
+// receiver (renderShadow over recordMW) replays the engine's LIVE pose; with the async
+// scene-graph walk the snapshot is one frame stale, so a live-pose receiver mismatches
+// the cache depth and flickers on animated geometry (waving banners). renderShadow()
+// skips the cache-covered set (skipCacheCovered) and this owns it instead. Full strength
+// (no distant-land handover fade — the whole near scene is cache-owned in the main view).
+// The main-view sun (ehSunVecView) is already bound by setupCommonEffect (no reflected
+// swap), and the shadow lookup is view->world->shadow exactly as renderShadow() builds it.
+void DistantLand::renderShadowReceiverFromCache(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
+    MGE_ZoneScopedN("renderShadowReceiverFromCache");
+
+    const auto& cacheMap = MGE::GeometryCache::cache();
+    if (cacheMap.empty()) return;
+
+    // View space -> world (inverse view) -> shadow clip, same mapping renderShadow uses.
+    D3DXMATRIX invView, viewToShadow[2];
+    D3DXMatrixInverse(&invView, nullptr, view);
+    viewToShadow[0] = invView * smViewproj[0];
+    viewToShadow[1] = invView * smViewproj[1];
+    effect->SetMatrixArray(ehShadowViewproj, viewToShadow, 2);
+    effect->SetTexture(ehTex3, texSoftShadow);
+
+    D3DXMATRIX viewproj;
+    D3DXMatrixMultiply(&viewproj, view, proj);
+    ViewFrustum frustum(&viewproj);
+
+    effect->SetBool(ehHasBones, false);
+    effect->SetInt(ehVertexBlendState, 0);
+    effect->SetFloat(ehMaterialAlpha, 1.0f);
+    // Receiver alpha = materialAlpha (1), not vertex colour (terrain vcol.a is the
+    // AlphaGrid splat factor and must not modulate shadow strength).
+    effect->SetBool(ehHasVCol, false);
+    effect->SetFloat(ehShadowReflMult, 1.0f);   // full strength in the main view
+
+    // Non-skinned receivers (objects + terrain). Same covered set the cache color owns
+    // (textured, non-blend); untextured/alpha opaque stay on the recordMW receiver.
+    effect->BeginPass(PASS_RENDERSHADOWFFE);
+    for (const auto& kv : cacheMap) {
+        const auto& e = kv.second;
+        if (e.isSkinned) continue;          // skinned receiver = skinIndexed pass below
+        if (e.blendEnable) continue;
+        if (!e.d3dTexture) continue;        // untextured opaque is engine-drawn (recordMW receiver)
+        IDirect3DVertexBuffer9* vb = e.readVB();
+        if (!vb || !e.ib) continue;
+
+        BoundingSphere bs;
+        cacheWorldBounds(e, bs.center, bs.radius);
+        if (frustum.ContainsSphere(bs) == ViewFrustum::OUTSIDE) continue;
+
+        D3DXMATRIX wv;
+        D3DXMatrixMultiply(&wv, reinterpret_cast<const D3DXMATRIX*>(e.worldTransformD3D), view);
+        D3DXMATRIX pal[4] = { wv, wv, wv, wv };
+        effect->SetMatrixArray(ehVertexBlendPalette, pal, 4);
+
+        if (e.alphaTest && e.d3dTexture) {
+            effect->SetTexture(ehTex0, e.d3dTexture);
+            effect->SetBool(ehHasAlpha, true);
+            effect->SetFloat(ehAlphaRef, e.alphaRef);
+        } else {
+            effect->SetTexture(ehTex0, nullptr);
+            effect->SetBool(ehHasAlpha, false);
+            effect->SetFloat(ehAlphaRef, -1.0f);
+        }
+        effect->CommitChanges();
+
+        // Main-view winding matches the cache color pass (CW normal, CCW mirrored).
+        device->SetRenderState(D3DRS_CULLMODE, e.mirrored ? D3DCULL_CCW : D3DCULL_CW);
+        device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kVBStride);
+        device->SetIndices(e.ib);
+        device->SetFVF(MGE::GeometryCache::kVBFVF);
+        DrawStats::count(e.triangleCount);
+        device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, e.vertexCount, 0, e.triangleCount);
+    }
+    effect->EndPass();
+
+    // Cache-skinned receivers (NPCs). Receiver depth rebuilt in the VS via 32-bone
+    // skinIndexed -> mul(view), bit-identical to the cache skinned color pass.
+    effect->BeginPass(PASS_RENDERSHADOWFFE_SKINNED);
+    for (const auto& kv : cacheMap) {
+        const auto& e = kv.second;
+        if (!e.isSkinned) continue;
+        if (e.skinnedUnsupported || e.numBones == 0) continue;
+        if (e.blendEnable) continue;
+        IDirect3DVertexBuffer9* vb = e.readVB();
+        if (!vb || !e.ib) continue;
+
+        BoundingSphere bs;
+        cacheSkinnedWorldBounds(e, bs.center, bs.radius);
+        if (frustum.ContainsSphere(bs) == ViewFrustum::OUTSIDE) continue;
+
+        const D3DXMATRIX* pal = reinterpret_cast<const D3DXMATRIX*>(e.bonePalette.data());
+        effect->SetMatrixArray(ehBoneMatrices, pal, (int)e.numBones);
+
+        if (e.alphaTest && e.d3dTexture) {
+            effect->SetTexture(ehTex0, e.d3dTexture);
+            effect->SetBool(ehHasAlpha, true);
+            effect->SetFloat(ehAlphaRef, e.alphaRef);
+        } else {
+            effect->SetTexture(ehTex0, nullptr);
+            effect->SetBool(ehHasAlpha, false);
+            effect->SetFloat(ehAlphaRef, -1.0f);
+        }
+        effect->CommitChanges();
+
+        device->SetRenderState(D3DRS_CULLMODE, e.mirrored ? D3DCULL_CCW : D3DCULL_CW);
+        device->SetVertexDeclaration(MGE::GeometryCache::skinnedDecl());
+        device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kSkinnedVBStride);
+        device->SetIndices(e.ib);
         DrawStats::count(e.triangleCount);
         device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, e.vertexCount, 0, e.triangleCount);
     }

@@ -136,15 +136,16 @@ namespace MGE::GeometryCache {
         static_assert(sizeof(DepthVertex) == 36, "DepthVertex size mismatch");
 
         // Skinned vertex layout matching SkinnedVertIn (VS palette skinning input).
-        // Drawn with g_skinnedDecl; stride 52.
+        // Drawn with g_skinnedDecl; stride 56.
         struct SkinnedVertex {
             float x, y, z;          // POSITION     (12) bind-pose
             float nx, ny, nz;       // NORMAL       (12) bind-pose model-space
             float w0, w1, w2, w3;   // BLENDWEIGHT  (16) top-4 influences, normalized
             DWORD indices;          // BLENDINDICES ( 4) UBYTE4 bone palette indices
             float u, v;             // TEXCOORD0    ( 8)
+            DWORD color;            // COLOR        ( 4) Phase 2: per-vertex colour
         };
-        static_assert(sizeof(SkinnedVertex) == 52, "SkinnedVertex size mismatch");
+        static_assert(sizeof(SkinnedVertex) == 56, "SkinnedVertex size mismatch");
 
         void uploadEntry(CachedGeometry& e, NI::TriBasedGeometry* geom,
                          NI::TriBasedGeometryData* data) {
@@ -258,7 +259,7 @@ namespace MGE::GeometryCache {
             e.revisionID         = data->revisionID;
             e.isSkinned          = true;
             e.numBones           = numBones;
-            e.hasVertexColor     = false;   // skinned VB layout has no colour slot (0.5-C)
+            e.hasVertexColor     = (data->color != nullptr);   // Phase 2: skinned VB now carries colour
 
             if (numBones > MGE::GeometryCache::kMaxBones) {
                 // Too many bones for the VS palette — skip this caster, report once.
@@ -296,6 +297,7 @@ namespace MGE::GeometryCache {
                 auto* verts = static_cast<SkinnedVertex*>(vbData);
                 const auto* uvs = data->textureCoords;
                 const auto* nrm = data->normal;         // bind-pose model-space normals
+                const auto* vcol = data->color;         // NI::PackedColor*(b,g,r,a)=D3DCOLOR, null if none
                 for (uint32_t i = 0; i < vertexCount; ++i) {
                     auto& infs = perVert[i];
                     std::sort(infs.begin(), infs.end(),
@@ -320,6 +322,8 @@ namespace MGE::GeometryCache {
                                      | (static_cast<DWORD>(idx[3]) << 24);
                     verts[i].u = uvs ? uvs[i].x : 0.0f;
                     verts[i].v = uvs ? uvs[i].y : 0.0f;
+                    // PackedColor byte order (b,g,r,a) is exactly D3DCOLOR, copy straight.
+                    verts[i].color = vcol ? *reinterpret_cast<const DWORD*>(&vcol[i]) : 0xFFFFFFFF;
                 }
                 e.vb[0]->Unlock();
             }
@@ -522,14 +526,18 @@ namespace MGE::GeometryCache {
     void init(IDirect3DDevice9* device) {
         g_device = device;
 
-        // Vertex declaration for skinned VBs (SkinnedVertex, stride 52).
+        // Vertex declaration for skinned VBs (SkinnedVertex, stride 56). The COLOR
+        // element (offset 52) is read only by the FFE cache-skin color path when the
+        // part uses vertex colour; the depth/shadow skinned VS don't declare it and
+        // D3D9 ignores unread elements, so those passes are unaffected.
         if (!g_skinnedDecl && g_device) {
             static const D3DVERTEXELEMENT9 elems[] = {
-                {0, 0,  D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION,     0},
-                {0, 12, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_NORMAL,       0},
-                {0, 24, D3DDECLTYPE_FLOAT4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_BLENDWEIGHT,  0},
-                {0, 40, D3DDECLTYPE_UBYTE4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_BLENDINDICES, 0},
-                {0, 44, D3DDECLTYPE_FLOAT2, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD,     0},
+                {0, 0,  D3DDECLTYPE_FLOAT3,   D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION,     0},
+                {0, 12, D3DDECLTYPE_FLOAT3,   D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_NORMAL,       0},
+                {0, 24, D3DDECLTYPE_FLOAT4,   D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_BLENDWEIGHT,  0},
+                {0, 40, D3DDECLTYPE_UBYTE4,   D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_BLENDINDICES, 0},
+                {0, 44, D3DDECLTYPE_FLOAT2,   D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD,     0},
+                {0, 52, D3DDECLTYPE_D3DCOLOR, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_COLOR,        0},
                 D3DDECL_END()
             };
             g_device->CreateVertexDeclaration(elems, &g_skinnedDecl);

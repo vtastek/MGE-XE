@@ -169,6 +169,7 @@ D3DXHANDLE DistantLand::ehStaticNearCull;
 D3DXHANDLE DistantLand::ehShadowReflMult;
 D3DXHANDLE DistantLand::ehLandNearCull;
 D3DXHANDLE DistantLand::ehReflWaterClip;
+D3DXHANDLE DistantLand::ehLightData, DistantLand::ehLightDataParams, DistantLand::ehLightIndices, DistantLand::ehTexLightView;
 D3DXHANDLE DistantLand::ehWindVec;
 D3DXHANDLE DistantLand::ehNiceWeather;
 D3DXHANDLE DistantLand::ehTime;
@@ -658,6 +659,10 @@ bool DistantLand::initShader() {
     ehShadowReflMult = effect->GetParameterByName(0, "shadowReflMult");
     ehLandNearCull = effect->GetParameterByName(0, "landNearCull");
     ehReflWaterClip = effect->GetParameterByName(0, "reflWaterClipPlane");
+    ehLightData = effect->GetParameterByName(0, "texLightData");
+    ehLightDataParams = effect->GetParameterByName(0, "lightDataParams");
+    ehLightIndices = effect->GetParameterByName(0, "lightIndices");
+    ehTexLightView = effect->GetParameterByName(0, "texLightView");
     ehWindVec = effect->GetParameterByName(0, "windVec");
     ehNiceWeather = effect->GetParameterByName(0, "niceWeather");
     ehTime = effect->GetParameterByName(0, "time");
