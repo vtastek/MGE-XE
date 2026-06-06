@@ -197,6 +197,16 @@ void DistantLand::renderStage0() {
     isRenderCached &= (Configuration.MGEFlags & USE_MENU_CACHING) && mwBridge->IsMenu();
     isPPLActive = (Configuration.MGEFlags & USE_FFESHADER) && !(Configuration.PerPixelLightFlags == 1 && !mwBridge->IntCurCellAddr());
 
+    // Phase 1 Milestone 1 A/B toggle. Read NUMPAD7 once per frame here (before the
+    // engine's near-scene inspectIndexedPrimitive calls) so the mode is stable for
+    // the whole frame. CACHE mode draws the simple-opaque subset from the cache in
+    // renderStage0 and suppresses the engine's covered opaque draws.
+    if (GetAsyncKeyState(VK_NUMPAD7) & 0x0001) {
+        cacheOpaqueMode = !cacheOpaqueMode;
+        StatusOverlay::setStatus(cacheOpaqueMode
+            ? "Opaque source: CACHE (MGE-driven)" : "Opaque source: ENGINE (reactive)");
+    }
+
     if (!isRenderCached) {
         ///LOG::logline("Sky prims: %d", recordSky.size());
 
@@ -292,6 +302,19 @@ void DistantLand::renderStage0() {
                 }
             }
 
+            // Phase 1 Milestone 1: in CACHE mode, draw the simple-opaque subset of
+            // the near scene authoritatively from the GeometryCache walk (same
+            // immutable snapshot feeding depth/shadow), replacing the engine's
+            // reactive per-draw opaque (suppressed in inspectIndexedPrimitive). The
+            // real backbuffer + main depthstencil are bound here and the engine's
+            // near scene hasn't run yet, so both paths hit the same RT/camera. Uses
+            // the true near projection; restore the distant projection afterwards
+            // for the sky + reflection passes that follow.
+            if (cacheOpaqueMode) {
+                renderCachedOpaque(&mwView, &mwProj);
+                effect->SetMatrix(ehProj, &distProj);
+            }
+
             // Sky scattering and sky objects (should be drawn late as possible)
             if ((Configuration.MGEFlags & USE_ATM_SCATTER) && mwBridge->CellHasWeather()) {
                 renderSky();
@@ -368,6 +391,18 @@ void DistantLand::renderStage0() {
 
             stateSaved->Apply();
             stateSaved->Release();
+
+            // Phase 1 Milestone 1 (interior): CACHE-mode opaque from the cache walk.
+            // Bracket with a state block (the depth pass restored engine state) so
+            // the render states we touch don't leak into the reflection/wave passes.
+            if (cacheOpaqueMode) {
+                device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
+                effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
+                renderCachedOpaque(&mwView, &mwProj);
+                effect->End();
+                stateSaved->Apply();
+                stateSaved->Release();
+            }
 
             // Water reflection. Exteriors update it inside the distant-cell branch
             // above; interiors have no distant land, so render the GeometryCache
@@ -1166,6 +1201,27 @@ void DistantLand::setSunLight(const D3DLIGHT8* s) {
     sunAmb = s->Ambient;
 }
 
+// isCoveredOpaque - Phase 1 Milestone 1 predicate for the engine draws that
+// renderCachedOpaque takes over: any opaque (zWrite, non-blend) draw that samples a
+// base texture. CACHE mode owns ALL such geometry (drawn base-texture-only from the
+// cache), so the engine draw is suppressed here.
+//
+// Earlier this was narrower (single-stage, UV0 only), leaving multi-stage parts to
+// the engine. But renderCachedOpaque draws every non-blend textured cache part
+// base-only regardless of the original stage count, so a multi-stage part got drawn
+// TWICE (cache base-only + engine full). For statics both land at the same depth
+// (harmless), but ANIMATED parts differ by a sub-frame between the cache snapshot
+// transform and the engine's live transform — the two draws z-fight. Suppressing
+// the whole opaque-textured set makes every covered part single-draw (cache only),
+// killing the z-fight. The tradeoff is that multi-texture detail (dark/detail/glow)
+// renders base-only in CACHE mode — the documented Phase-2 coverage gap, now uniform
+// instead of double-drawn. Untextured / alpha-blended / terrain-splat stay engine.
+static bool isCoveredOpaque(const RenderedState* rs, const FragmentState* frs) {
+    if (!rs->zWrite || rs->blendEnable) return false;   // opaque only
+    const auto& s0 = frs->stage[0];
+    return s0.colorArg1 == D3DTA_TEXTURE || s0.colorArg2 == D3DTA_TEXTURE;  // has a base texture
+}
+
 // inspectIndexedPrimitive
 // Filters and records DIP calls for later use; returning false should cause the draw call to be skipped
 // Can also replace selected fixed function calls with an augmented shader
@@ -1205,6 +1261,14 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
             return false;
         }
     } else if (isPPLActive) {
+        // Phase 1 Milestone 1 CACHE mode: the simple-opaque subset is drawn
+        // authoritatively by renderCachedOpaque in renderStage0. Suppress the
+        // engine's reactive draw of those covered parts here (skip the per-draw
+        // renderMorrowind + the engine forward). Non-covered parts fall through to
+        // the normal reactive path so the A/B compares only the covered subset.
+        if (cacheOpaqueMode && isCoveredOpaque(rs, frs)) {
+            return false;
+        }
         // Render Morrowind with replacement shaders
         FixedFunctionShader::renderMorrowind(rs, frs, lightrs);
         return false;

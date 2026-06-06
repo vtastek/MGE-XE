@@ -38,6 +38,10 @@ void DistantLand::updateVisibleSet(void* const* shapes, int count) {
         s_visibleKeys.insert(reinterpret_cast<uint32_t>(shapes[i]));
 }
 
+const std::unordered_set<uint32_t>& DistantLand::visibleCacheKeys() {
+    return s_prevVisibleKeys;
+}
+
 
 
 void DistantLand::renderDepth() {

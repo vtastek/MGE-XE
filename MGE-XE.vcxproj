@@ -193,6 +193,7 @@
     <ClCompile Include="src\mge\scenegraph.cpp" />
     <ClCompile Include="src\mge\scenegraph_geometry_cache.cpp" />
     <ClCompile Include="src\mge\renderwater.cpp" />
+    <ClCompile Include="src\mge\rendercachedcolor.cpp" />
     <ClCompile Include="src\mge\specificrender.cpp" />
     <ClCompile Include="src\mge\statusoverlay.cpp" />
     <ClCompile Include="src\mge\terrain_horizon_occluder.cpp" />

@@ -27,6 +27,7 @@ using std::vector;
 bool DistantLand::ready = false;
 bool DistantLand::isRenderCached = false;
 bool DistantLand::isPPLActive = false;
+bool DistantLand::cacheOpaqueMode = false;
 bool DistantLand::earlyWalkedCache = false;
 bool DistantLand::renderThreadJobKicked = false;
 std::vector<D3DXVECTOR4> DistantLand::reflectionWaterRects;

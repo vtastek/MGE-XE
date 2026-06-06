@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <functional>
 #include <memory>
 
@@ -63,6 +64,13 @@ public:
     static bool ready;
     static bool isRenderCached;
     static bool isPPLActive;
+    // Phase 1 Milestone 1 A/B toggle (NUMPAD7). false = ENGINE (untouched
+    // reactive path). true = CACHE (renderCachedOpaque draws the simple-opaque
+    // subset authoritatively from the GeometryCache walk in renderStage0, and
+    // inspectIndexedPrimitive suppresses the engine's covered opaque draws).
+    // Read once per frame at renderStage0 entry so inspectIndexedPrimitive sees
+    // a stable value for the whole frame.
+    static bool cacheOpaqueMode;
     // Set by frameSetupEarly() when the GeometryCache walk ran at BeginScene(0);
     // read by renderDepth (different TU) to skip its own redundant walk.
     static bool earlyWalkedCache;
@@ -369,6 +377,13 @@ public:
     // renderMorrowind, driven from the cache walk (not engine draws). Additive —
     // no engine suppression. Non-skinned opaque parts only in 0.5-B.
     static void renderReflectionsFromCache(const D3DXMATRIX* view, const D3DXMATRIX* proj, float nearDist);
+    // Phase 1 Milestone 1: draw the simple-opaque subset of the GeometryCache
+    // (NPCs + dynamic + near statics, excluding terrain) into the MAIN view with
+    // full FFE color, driven authoritatively from the cache walk instead of the
+    // engine's reactive per-draw path. Sibling of renderReflectionsFromCache with
+    // the main view/proj, documented CW base winding, no water clip plane, and its
+    // own z (ZWRITE on, ZFUNC LESSEQUAL). Run from renderStage0 in CACHE mode.
+    static void renderCachedOpaque(const D3DXMATRIX* view, const D3DXMATRIX* proj);
     // Phase 0.5: apply sun shadows to the cache reflection objects by re-drawing
     // them with the shadow-receiver shader. The sun shadow map is world-space, so
     // reflected geometry samples it correctly via shadowViewProj = inverse(reflView)
@@ -438,6 +453,12 @@ public:
     // renderDepth's serial cache path would, just during the sky window.
     static void renderThreadDepthCacheJob();
     static void updateVisibleSet(void* const* shapes, int count);
+    // The main-view MSOC visible set (s_prevVisibleKeys), keyed on
+    // NiTriBasedGeometry* == GeometryCache keys. Exposed so the cache-driven
+    // opaque color pass can iterate exactly the engine-submitted on-screen set
+    // (the same set the depth pass uses) instead of an independent frustum cull,
+    // which kept color in lockstep with depth and the reactive engine path.
+    static const std::unordered_set<uint32_t>& visibleCacheKeys();
 
     static void renderShadowMap();
     static void renderShadowFromCache(int layer, const D3DXMATRIX* viewproj);
