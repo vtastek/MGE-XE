@@ -369,9 +369,25 @@ void DistantLand::renderStage0() {
             stateSaved->Apply();
             stateSaved->Release();
 
-            // Clear water reflection to avoid seeing previous cell environment reflected
-            // Must be done every frame to react to lighting changes
-            clearReflection();
+            // Water reflection. Exteriors update it inside the distant-cell branch
+            // above; interiors have no distant land, so render the GeometryCache
+            // near-field (NPCs + objects) reflection here when the cell has water
+            // and the user enabled interior reflections ("Water Reflects Interiors").
+            // renderWaterReflection self-gates its exterior-only parts (LOD land,
+            // distant statics, sky), so this draws just the cache color + shadow
+            // reflection. Otherwise clear, so the distant-water sampler reads a valid
+            // flat-fog target and we don't reflect the previous cell. Cleared every
+            // frame regardless to react to lighting changes.
+            if ((Configuration.MGEFlags & REFLECT_INTERIOR) && mwBridge->CellHasWater()) {
+                device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
+                effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
+                renderWaterReflection(&mwView, &mwProj);
+                effect->End();
+                stateSaved->Apply();
+                stateSaved->Release();
+            } else {
+                clearReflection();
+            }
 
             // Update water simulation
             if (Configuration.MGEFlags & DYNAMIC_RIPPLES) {

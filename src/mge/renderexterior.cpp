@@ -2414,6 +2414,18 @@ void DistantLand::buildBasinRequiredHeight() {
 bool DistantLand::isReflectionWaterVisible() {
     MGE_ZoneScopedN("isReflectionWaterVisible");
 
+    // The terrain-height gate is an exterior-only optimization: the min-height
+    // maps describe the exterior worldspace, and landMeshes persists across cell
+    // changes (built at init, cleared at release). In an interior those maps are
+    // stale relative to the interior's own water, so the gate would test interior
+    // water tiles against unrelated exterior terrain and wrongly cull. Key on
+    // IsExterior (not isDistantCell): interiors that ship generated distant land
+    // are still distant cells, but their water must not be gated by exterior
+    // terrain. Reflect unconditionally in any interior.
+    if (!MWBridge::get()->IsExterior()) {
+        return true;
+    }
+
     const bool debug = g_drawWaterProxyBounds;
     if (debug) g_waterProxyDebugBoxes.clear();
 
