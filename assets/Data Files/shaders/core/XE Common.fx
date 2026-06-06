@@ -45,6 +45,13 @@ shared float shadowReflMult;
 // terrain in reflections). When > 0, land fragments closer than this are clipped
 // so the cache draws the near field at full resolution. 0 = off (main view).
 shared float landNearCull;
+// Per-pixel below-water clip for the cache reflection passes, expressed as a plane
+// in REFLECTED-view space: cache pixel shaders discard fragments where
+// dot(float4(viewpos, 1), reflWaterClipPlane) < 0. The device clip plane is lowered
+// by 0.5*waveHeight for dynamic ripples, which lets a band of below-water geometry
+// bleed into the now-detailed cache reflection; this clips it at the TRUE water
+// level per-fragment instead. Default (0,0,0,1) = pass-all (main view / no clip).
+shared float4 reflWaterClipPlane;
 shared float3 sunPos;
 shared float sunVis;
 shared float2 windVec;

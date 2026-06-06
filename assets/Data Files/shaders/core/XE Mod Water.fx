@@ -18,6 +18,7 @@ static const float3 sunColAdjusted = sunCol * sunlightFactor;
 static const float3 depthBaseColor = sunColAdjusted * float3(0.03, 0.04, 0.05) + (2 * skyCol + fogColFar) * float3(0.075, 0.08, 0.085);
 static const float windFactor = (length(windVec) + 1.5) / 140;
 static const float waterLevel = world[3][2];
+static const float shoreDepthBias = 24.0;
 
 shared texture tex4, tex5;
 shared float3 rippleOrigin;
@@ -81,6 +82,14 @@ float3 getProjectedReflection(float4 tex)
 
 #endif
 
+float reflectionOcclusionAt(float4 tex, float actualWaterDepth)
+{
+    float sceneDepth = tex2Dproj(sampDepth, tex).r;
+    float validScene = step(sceneDepth, nearViewRange + 64.0);
+
+    return validScene * smoothstep(-128.0, 384.0, actualWaterDepth - sceneDepth);
+}
+
 //------------------------------------------------------------
 // Water shader
 
@@ -138,17 +147,21 @@ WaterVertOut WaterVS (in float4 pos : POSITION)
 
     float addheight = waveHeight * (lerp(height, height2, saturate(dist/8000)) - 0.5) * saturate(1 - dist/6400) * saturate(dist/200);
     OUT.pos.z += addheight;
-
     // Calculate screen position for refraction
     OUT.position = mul(OUT.pos, view);
     OUT.position = mul(OUT.position, proj);
     OUT.screenpos = float4(0.5 * (1 + rcpRes) * OUT.position.w + float2(0.5, -0.5) * OUT.position.xy, OUT.position.zw);
 
-    // Clamp reflection point to be above surface
-    float4 clampedPos = OUT.pos - float4(0, 0, abs(addheight), 0);
-    clampedPos = mul(clampedPos, view);
-    clampedPos = mul(clampedPos, proj);
-    OUT.screenposclamp = float4(0.5 * (1 + rcpRes) * clampedPos.w + float2(0.5, -0.5) * clampedPos.xy, clampedPos.zw);
+    // Reflection sample point: reconstruct the FLAT water plane by removing the wave
+    // displacement (signed), so planar reflection depends only on the surface normal
+    // (ripple distortion via reffactor), not on vertex height. A planar mirror RT has
+    // no height information, so coupling them just makes displaced water near shore
+    // sample above the flat waterline and read sky. Height drives the silhouette
+    // (OUT.position) alone.
+    float4 flatPos = OUT.pos - float4(0, 0, addheight, 0);
+    flatPos = mul(flatPos, view);
+    flatPos = mul(flatPos, proj);
+    OUT.screenposclamp = float4(0.5 * (1 + rcpRes) * flatPos.w + float2(0.5, -0.5) * flatPos.xy, flatPos.zw);
 
     return OUT;
 }
@@ -156,11 +169,6 @@ WaterVertOut WaterVS (in float4 pos : POSITION)
 
 float4 WaterPS(in WaterVertOut IN): COLOR0
 {
-    // TEMP (cache-reflection inspection): output the raw reflection texture with
-    // no normal distortion / fresnel / fog so the reflected geometry can be read
-    // directly. Remove to restore normal water shading.
-    return float4(getProjectedReflection(IN.screenpos), 1);
-
     // Calculate eye vector
     float3 EyeVec = IN.pos.xyz - eyePos.xyz;
     float dist = length(EyeVec);
@@ -178,28 +186,33 @@ float4 WaterPS(in WaterVertOut IN): COLOR0
 
     // Distort refraction dependent on depth
     float4 newscrpos = IN.screenpos + float4(reffactor.yx, 0, 0);
-    float depth = max(0, tex2Dproj(sampDepth, newscrpos).r - IN.screenpos.w);
+    float sceneDepth = tex2Dproj(sampDepth, newscrpos).r;
+    float aboveWaterDepth = step(sceneDepth + shoreDepthBias, IN.screenpos.w);
+    float depth = max(shoreDepthBias, sceneDepth - IN.screenpos.w);
 
     // Refraction
     float3 refracted = depthColor;
     float shorefactor = 0;
 
     // Avoid sampling deep water
-    if(depth < 4000)
+    if(depth < 4000 && aboveWaterDepth < 0.5)
     {
         // Sample refraction texture
         newscrpos = IN.screenpos + saturate(depth / 100) * float4(reffactor.yx, 0, 0);
         refracted = tex2Dproj(sampRefract, newscrpos).rgb;
 
         // Get distorted depth
-        depth = max(0, tex2Dproj(sampDepth, newscrpos).r - IN.screenpos.w);
+        sceneDepth = tex2Dproj(sampDepth, newscrpos).r;
+        aboveWaterDepth = step(sceneDepth + shoreDepthBias, IN.screenpos.w);
+        depth = max(shoreDepthBias, sceneDepth - IN.screenpos.w);
         depth /= dot(EyeVec, float3(view[0][2], view[1][2], view[2][2]));
 
         // Small scale shoreline animation
         depth += 300 * (0.95 - normal.z);
 
-        float depthscale = saturate(exp(-depth / 800));
-        shorefactor = pow(depthscale, 90);
+        float depthscale = saturate(exp(-depth / 500) * 1.0);
+        shorefactor = pow(depthscale, 25);
+		
 
         // Make transition between actual refraction image and depth color depending on water depth
         refracted = lerp(depthColor, refracted, 0.8 * depthscale + 0.2 * shorefactor);
@@ -211,10 +224,12 @@ float4 WaterPS(in WaterVertOut IN): COLOR0
 #else
     float4 screenpos = IN.screenposclamp;
 #endif
-    float3 reflected = getProjectedReflection(screenpos - float4(2.1 * reffactor.x, -abs(reffactor.y), 0, 0));
+    float4 reflectedPos = screenpos - float4(2.1 * reffactor.x, -abs(reffactor.y), 0, 0);
+    reflectedPos.xy = lerp(reflectedPos.xy, screenpos.xy, reflectionOcclusionAt(reflectedPos, IN.screenpos.w));
+    float3 reflected = getProjectedReflection(reflectedPos);
 
     // Fade reflection into an inscatter dominated horizon
-    reflected = lerp(fog.rgb, reflected, fog.a);
+    reflected = lerp(reflected * 0.96, reflected, fog.a);
 
     // Smooth out high frequencies at a distance
     float3 adjustnormal = lerp(float3(0, 0, 0.1), normal, pow(saturate(1.05 * fog.a), 2));
@@ -224,6 +239,8 @@ float4 WaterPS(in WaterVertOut IN): COLOR0
     float fresnel = dot(-EyeVec, adjustnormal);
     fresnel = 0.02 + pow(saturate(0.9988 - 0.28 * fresnel), 16);
     float3 result = lerp(refracted, reflected, fresnel);
+	
+
 
     // Specular lighting
     // This should use Blinn-Phong, but it doesn't work so well for area lights like the sun
@@ -232,6 +249,17 @@ float4 WaterPS(in WaterVertOut IN): COLOR0
     vdotr = saturate(1.0025 * vdotr);
     float3 spec = sunColAdjusted * (pow(vdotr, 170) + 0.07 * pow(vdotr, 4));
     result += spec * fog.a;
+	
+	// Water cut feature, vtastek
+	float wdist = dist/lerp(1200, 0, saturate((eyePos.z - waterLevel)/7.0));
+	float wcut = smoothstep(0.09,0.1, wdist);
+	float wcutdark = smoothstep(0.0889, 0.101, wdist);
+	wcutdark = wcutdark *  (1 - wcutdark);
+	wcutdark = saturate(wcutdark*3);
+	
+	// Include water cut feature
+	result = lerp(refracted, result, wcut);
+	result = lerp(result, result * 0.1, wcutdark);
 
     // Smooth transition at shore line
     result = lerp(result, refracted, shorefactor * fog.a);
@@ -263,7 +291,9 @@ float4 UnderwaterPS(in WaterVertOut IN): COLOR0
     refracted = lerp(fogColFar, refracted, exp(-dist / 500));
 
     // Sample reflection texture
-    float3 reflected = getProjectedReflection(IN.screenpos - float4(2.1 * reffactor.x, -abs(reffactor.y), 0, 0));
+    float4 reflectedPos = IN.screenpos - float4(2.1 * reffactor.x, -abs(reffactor.y), 0, 0);
+    reflectedPos.xy = lerp(reflectedPos.xy, IN.screenpos.xy, reflectionOcclusionAt(reflectedPos, IN.screenpos.w));
+    float3 reflected = getProjectedReflection(reflectedPos);
 
     // Fresnel equation, including total internal reflection
     float fresnel = pow(saturate(1.12 - 0.65 * dot(-EyeVec, normal)), 8);

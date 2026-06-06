@@ -134,6 +134,7 @@ struct CacheTerrainVertOut {
     centroid float4 fog : TEXCOORD1;
     float4 color : COLOR0;      // .a = AlphaGrid splat factor
     float3 normal : TEXCOORD2;  // world-space, for sun N.L
+    float3 viewpos : TEXCOORD3; // reflected-view space, for the below-water clip
 };
 
 CacheTerrainVertOut CacheTerrainVS(float4 pos : POSITION, float3 normal : NORMAL,
@@ -156,10 +157,15 @@ CacheTerrainVertOut CacheTerrainVS(float4 pos : POSITION, float3 normal : NORMAL
     OUT.texcoord = texcoord;
     OUT.color = color;
     OUT.normal = mul(float4(normal, 0), world).xyz;
+    OUT.viewpos = mul(pos, vertexBlendPalette[0]).xyz;   // = world*reflView, for the clip
     return OUT;
 }
 
 float4 CacheTerrainPS(CacheTerrainVertOut IN) : COLOR0 {
+    // Below-water clip (true water level) so near terrain doesn't bleed past the
+    // lowered device clip plane into the reflection. Pass-all in the main view.
+    clip(dot(float4(IN.viewpos, 1), reflWaterClipPlane));
+
     float3 normal = normalize(IN.normal);
     float3 base    = tex2D(sampBaseTex, IN.texcoord).rgb;
     float3 overlay = tex2D(sampTerrainOverlay, IN.texcoord).rgb;

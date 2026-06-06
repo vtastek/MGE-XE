@@ -632,6 +632,11 @@ void DistantLand::setupCommonEffect(const D3DXMATRIX* view, const D3DXMATRIX* pr
     // Other
     effect->SetFloatArray(ehFootPos, (float*)mwBridge->PlayerPositionPointer(), 3);
     effect->SetFloat(ehTime, mwBridge->simulationTime());
+
+    // Cache reflection below-water clip plane: pass-all by default (no clip). The
+    // water reflection pass overrides this around the cache passes and restores it.
+    const D3DXVECTOR4 reflClipPassAll(0, 0, 0, 1);
+    effect->SetVector(ehReflWaterClip, &reflClipPassAll);
 }
 
 // setScattering - Set scattering coefficients for atmospheric scattering shader

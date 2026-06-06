@@ -329,6 +329,10 @@ FFEPixel PerPixelVS(FFEVertIn IN) {
 
 // Per-pixel lighting augmented with semi-HDR tonemap instead of light clamping
 float4 PerPixelPS(FFEPixel IN) : COLOR0 {
+    // Below-water clip for the cache reflection passes (true water level). Pass-all
+    // (0,0,0,1) in the main reactive scene, so this is a no-op there.
+    clip(dot(float4(IN.viewpos, 1), reflWaterClipPlane));
+
     float3 normal = normalize(IN.nrm_fog.xyz);
     float fog = IN.nrm_fog.w;
 

@@ -196,6 +196,7 @@ public:
     static D3DXHANDLE ehStaticNearCull;
     static D3DXHANDLE ehShadowReflMult;
     static D3DXHANDLE ehLandNearCull;
+    static D3DXHANDLE ehReflWaterClip;
     static D3DXHANDLE ehWindVec;
     static D3DXHANDLE ehNiceWeather;
     static D3DXHANDLE ehTime;

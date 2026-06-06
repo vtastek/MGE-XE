@@ -22,6 +22,27 @@
 // (down to ~0.5) shrinks the lit near-field. TODO: promote to a config/Numpad knob.
 static float s_reflectionCacheNearFactor = 1.0f;
 
+// Downward bias (world units) for the cache reflection below-water clip. The clip at
+// the exact waterline cuts a thin gap at terrain/water intersections (background
+// shows through) and slices straddling characters open at the surface (hollow
+// interior visible). Lowering the clip a few units keeps a sliver of near-waterline
+// geometry: it fills the terrain gap and sinks the character cut below the surface,
+// where the water shading (fresnel/refraction/fog) masks it. Larger = less
+// aggressive (more below-water reflection); 0 = clip exactly at the true level.
+// TODO: promote to a config/Numpad knob.
+static float s_reflWaterClipBias = 3.0f;
+
+// Water-surface snap offsets (world units) applied to the rendered water mesh height,
+// chosen by the engine underwater state. A single fixed height can't satisfy both
+// sides: above water the wave crests poke up and intersect the near-surface camera,
+// and a low surface renders below the camera once submerged. So push the mesh DOWN
+// when above water (crests stay below the eye) and keep it at/above the level when
+// underwater (surface stays overhead). The snap happens exactly at the IsUnderwater
+// threshold, where the camera is at the surface and the jump is hidden. Fine-tune to
+// the wave height. TODO: promote to config/Numpad knobs.
+static float s_waterMeshSnapAbove      = -5.0f;   // above water: push down
+static float s_waterMeshSnapUnderwater =  5.0f;   // underwater: at WaterLevel (default)
+
 // Per-object cache->distant-land handover fade: 1 up close, ramps to 0 over the
 // last quarter before nearDist (the handover), using the object's Euclidean origin
 // distance — the SAME metric the geometry cull uses. Statics only; dynamics (NPCs)
@@ -51,6 +72,44 @@ static void cacheWorldBounds(const MGE::GeometryCache::CachedGeometry& e, D3DXVE
     const float sy = D3DXVec3Length(reinterpret_cast<const D3DXVECTOR3*>(&w._21));
     const float sz = D3DXVec3Length(reinterpret_cast<const D3DXVECTOR3*>(&w._31));
     outRadius = e.boundsRadius * std::max(sx, std::max(sy, sz));
+}
+
+// World-space bounding sphere for a SKINNED cache entry, derived from the per-frame
+// bone palette. The skinned VB is bind-pose; the posed geometry is placed entirely
+// by the bones, so the geom's node origin (worldTransformD3D) is NOT where the posed
+// part is. Using the origin as the cull center with the small bind-pose radius
+// falsely culls close skinned parts whose skeleton root sits away from the part
+// (e.g. a character's own torso at 1-2m: it reflects fine at 5-7m, then vanishes as
+// the reflected frustum tightens around the misplaced origin sphere). Transform the
+// bind-pose bounds center by each bone (model->world) and bound the resulting point
+// set: every posed vertex is a weighted (convex) combination of bone-transformed
+// bind positions, so a sphere over those centers plus the scaled bind radius
+// conservatively encloses the posed part.
+static void cacheSkinnedWorldBounds(const MGE::GeometryCache::CachedGeometry& e,
+                                    D3DXVECTOR3& outCenter, float& outRadius) {
+    const int n = (int)e.numBones;
+    const D3DXMATRIX* pal = reinterpret_cast<const D3DXMATRIX*>(e.bonePalette.data());
+    const D3DXVECTOR3 modelC(e.boundsCenter[0], e.boundsCenter[1], e.boundsCenter[2]);
+
+    D3DXVECTOR3 pts[MGE::GeometryCache::kMaxBones];
+    D3DXVECTOR3 c(0, 0, 0);
+    float maxScale = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        D3DXVec3TransformCoord(&pts[i], &modelC, &pal[i]);
+        c += pts[i];
+        const float sx = D3DXVec3Length(reinterpret_cast<const D3DXVECTOR3*>(&pal[i]._11));
+        const float sy = D3DXVec3Length(reinterpret_cast<const D3DXVECTOR3*>(&pal[i]._21));
+        const float sz = D3DXVec3Length(reinterpret_cast<const D3DXVECTOR3*>(&pal[i]._31));
+        maxScale = std::max(maxScale, std::max(sx, std::max(sy, sz)));
+    }
+    c /= (float)n;
+    float r = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        const D3DXVECTOR3 d = pts[i] - c;
+        r = std::max(r, D3DXVec3Length(&d));
+    }
+    outCenter = c;
+    outRadius = r + e.boundsRadius * maxScale;
 }
 
 void DistantLand::renderWaterReflection(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
@@ -111,6 +170,27 @@ void DistantLand::renderWaterReflection(const D3DXMATRIX* view, const D3DXMATRIX
 
     device->SetClipPlane(0, plane);
     device->SetRenderState(D3DRS_CLIPPLANEENABLE, 1);
+
+    // Per-pixel below-water clip plane for the cache reflection passes, at the TRUE
+    // water level. The device clip plane above is lowered by 0.5*waveHeight for
+    // dynamic ripples, which lets a band of below-water geometry bleed into the now
+    // detailed cache reflection. Same world plane, transformed only into reflected-
+    // view space (the first half of the device-plane transform above, minus the
+    // projection step) so the cache pixel shaders clip per-fragment against viewpos.
+    {
+        D3DXPLANE wpln(0, 0, 1.0f, -(mwBridge->WaterLevel() - 1.0f));
+        wpln *= mwBridge->IsUnderwater(eyePos.z) ? -1.0f : 1.0f;
+        // Lower the clip by s_reflWaterClipBias on the kept side (extends the kept
+        // half-space). Increasing d keeps geometry farther past the boundary; the
+        // sign-flip above already orients the normal toward the kept side, so this
+        // works for both the above-water and underwater reflection cases.
+        wpln.d += s_reflWaterClipBias;
+        D3DXMATRIX itRefl;
+        D3DXMatrixInverse(&itRefl, 0, &reflView);
+        D3DXMatrixTranspose(&itRefl, &itRefl);
+        D3DXPlaneTransform(&wpln, &wpln, &itRefl);
+        effect->SetVector(ehReflWaterClip, reinterpret_cast<const D3DXVECTOR4*>(&wpln));
+    }
 
     // Near-field distance the cache owns in the reflection (Morrowind's view
     // distance by default). Statics, terrain, shadows and lights all hand off to
@@ -174,6 +254,11 @@ void DistantLand::renderWaterReflection(const D3DXMATRIX* view, const D3DXMATRIX
     effect->SetFloatArray(ehSunVecView, sunVecViewRefl, 3);
     renderReflectionShadowsFromCache(&reflView, &reflProj, cacheNearDist);
     effect->SetFloatArray(ehSunVecView, sunVecViewMain, 3);   // restore for later passes
+
+    // Restore pass-all so the cache color shader (shared with the main reactive
+    // scene) and any later passes don't clip against the water plane.
+    const D3DXVECTOR4 reflClipPassAll(0, 0, 0, 1);
+    effect->SetVector(ehReflWaterClip, &reflClipPassAll);
 
     if ((Configuration.MGEFlags & REFLECT_SKY) && !recordSky.empty() && !mwBridge->IsUnderwater(eyePos.z)) {
         // Draw sky reflection, with opposite culling
@@ -479,11 +564,11 @@ void DistantLand::renderReflectionsFromCache(const D3DXMATRIX* view, const D3DXM
 
         // Frustum cull. Non-skinned: true world-space bound (not the object origin)
         // so geometry offset from its node origin isn't falsely rejected at screen
-        // edges. Skinned: bind-pose radius at the node origin — the bind-pose center
-        // doesn't map through the node transform to the animated pose, so use the
-        // origin (matches the proven depth/shadow skinned cull).
+        // edges. Skinned: bone-palette-derived bound at the actual posed location
+        // (the bind-pose VB is placed by bones, so the node origin is wrong — see
+        // cacheSkinnedWorldBounds; fixes close skinned parts vanishing).
         BoundingSphere bs;
-        if (e.isSkinned) { bs.center = center; bs.radius = e.boundsRadius; }
+        if (e.isSkinned) { cacheSkinnedWorldBounds(e, bs.center, bs.radius); }
         else             { cacheWorldBounds(e, bs.center, bs.radius); }
         if (frustum.ContainsSphere(bs) == ViewFrustum::OUTSIDE) continue;
 
@@ -628,11 +713,10 @@ void DistantLand::renderReflectionShadowsFromCache(const D3DXMATRIX* view, const
         IDirect3DVertexBuffer9* vb = e.readVB();
         if (!vb || !e.ib) continue;
 
-        // Skinned cull: bind-pose radius at the node origin (matches the color pass;
-        // the bind-pose center doesn't map through the node transform to the pose).
+        // Skinned cull: bone-palette-derived bound at the actual posed location
+        // (matches the color pass; the node origin is wrong for bind-pose skinned VBs).
         BoundingSphere bs;
-        bs.center = D3DXVECTOR3(e.worldTransformD3D[12], e.worldTransformD3D[13], e.worldTransformD3D[14]);
-        bs.radius = e.boundsRadius;
+        cacheSkinnedWorldBounds(e, bs.center, bs.radius);
         if (frustum.ContainsSphere(bs) == ViewFrustum::OUTSIDE) continue;
 
         // Handover fade (NPCs are dynamic => full strength, but compute generally).
@@ -940,7 +1024,13 @@ void DistantLand::renderWaterPlane() {
     D3DXMATRIX m;
     IDirect3DTexture9* texRefract = PostShaders::borrowBuffer(0);
 
-    D3DXMatrixTranslation(&m, eyePos.x, eyePos.y, MWBridge::get()->WaterLevel());
+    // Snap the surface height by underwater state so it never intersects the camera
+    // at the transition (see s_waterMeshSnap*). The snap lands at the IsUnderwater
+    // threshold where the camera is at the surface, hiding the jump.
+    const bool underwater = MWBridge::get()->IsUnderwater(eyePos.z);
+    const float waterZ = MWBridge::get()->WaterLevel()
+                       + (underwater ? s_waterMeshSnapUnderwater : s_waterMeshSnapAbove);
+    D3DXMatrixTranslation(&m, eyePos.x, eyePos.y, waterZ);
     effect->SetMatrix(ehWorld, &m);
     effect->SetTexture(ehTex0, texReflection);
     effect->SetTexture(ehTex1, texWater);

@@ -137,6 +137,7 @@ struct RenderShadowVertOut {
 
     float4 shadow0pos: TEXCOORD1;
     float4 shadow1pos: TEXCOORD2;
+    float3 viewpos: TEXCOORD3;       // for the cache reflection below-water clip
 };
 
 // Shared receiver body. Takes a transformed vert + the vertex-colour source +
@@ -170,6 +171,7 @@ RenderShadowVertOut shadowReceiverBody(TransformedVert v, float4 vcolor, float2 
     OUT.shadow0pos.z = OUT.shadow0pos.z / OUT.shadow0pos.w;
     OUT.shadow1pos.z = OUT.shadow1pos.z / OUT.shadow1pos.w;
 
+    OUT.viewpos = v.viewpos.xyz;
     OUT.texcoords = texcoords;
     return OUT;
 }
@@ -198,6 +200,10 @@ RenderShadowVertOut RenderShadowsFFEVS(MorrowindVertIn IN) {
 }
 
 float4 RenderShadowsPS(RenderShadowVertOut IN): COLOR0 {
+    // Below-water clip for the cache reflection passes (true water level). Pass-all
+    // (0,0,0,1) in the main view, so this is a no-op there.
+    clip(dot(float4(IN.viewpos, 1), reflWaterClipPlane));
+
     // Early reject unlit areas
     clip(IN.light - 2.0/255.0);
 
