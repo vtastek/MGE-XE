@@ -63,7 +63,10 @@ float3 cacheTerrainPointLights(float3 viewPos, float3 normal) {
         float dist2    = dot(toLight, toLight);
         float invDist  = rsqrt(dist2);
         float dist     = dist2 * invDist;
-        float att = 1.0 / max(falloff.z * dist2 + falloff.x, 1e-4);
+        // Full attenuation incl. linear k1 (falloff.y) — Morrowind candle/torch
+        // lights are pure-linear (k0=k2=0); dropping k1 blows them to white. Matches
+        // evaluatePointLightsTextured in "XE FixedFuncEmu.fx".
+        float att = 1.0 / max(falloff.z * dist2 + falloff.y * dist + falloff.x, 1e-4);
         att *= 1.0 - smoothstep(radius, 2.0 * radius, dist);
         float lambert = saturate(dot(normal, toLight) * invDist);
         acc += lambert * att * lcolor.rgb;

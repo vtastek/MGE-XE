@@ -181,11 +181,12 @@ float3 evaluatePointLightsTextured(float3 viewPos, float3 normal) {
         float invDist  = rsqrt(dist2);
         float dist     = dist2 * invDist;
 
-        // Match FFE's attenuation formula (quadratic + constant; linear
-        // ignored as in calcLighting4 above). max() guards against the
-        // singular case where both k0 and dist² are 0 (script-spawned
-        // lights with degenerate falloff would otherwise inf the result).
-        float att = 1.0 / max(falloff.z * dist2 + falloff.x, 1e-4);
+        // Full attenuation 1/(k0 + k1*d + k2*d2). The linear term k1 (falloff.y)
+        // is essential: Morrowind candle/torch lights are pure-linear (k0=k2=0),
+        // so dropping k1 collapses the denominator to the 1e-4 guard and blows the
+        // light to white inside its radius. `dist` is already computed above.
+        // max() guards the singular d->0 flame-center texel (not a fallback path).
+        float att = 1.0 / max(falloff.z * dist2 + falloff.y * dist + falloff.x, 1e-4);
 
         // Soft-cutoff window. The engine's 1/(C + L*d + Q*d²) never
         // reaches 0; without bounding it, the per-mesh CPU cull (which
