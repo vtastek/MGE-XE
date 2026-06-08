@@ -12,6 +12,7 @@
 #include "XE Mod Shadow.fx"
 #include "XE Mod Statics.fx"
 #include "XE Mod Landscape.fx"
+#include "XE Mod Landscape Lit.fx"   // main-view lit cache terrain; NOT in XE Depth.fx (s7 sampler + globals corrupt depth)
 #include "XE Mod Grass.fx"
 #include "XE Mod Sky.fx"
 #include "XE Mod Water.fx"
