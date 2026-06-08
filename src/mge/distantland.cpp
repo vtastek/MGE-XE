@@ -397,13 +397,19 @@ void DistantLand::renderStage0() {
             stateSaved->Apply();
             stateSaved->Release();
 
-            // Phase 1 Milestone 1 (interior): CACHE-mode opaque from the cache walk.
-            // Bracket with a state block (the depth pass restored engine state) so
-            // the render states we touch don't leak into the reflection/wave passes.
+            // Phase 1 Milestone 1 (non-distant cell): CACHE-mode opaque from the cache
+            // walk. The cache is the engine's NEAR scene (engine view distance), so it
+            // runs independent of distant land — interiors AND DL-off exteriors. Bracket
+            // with a state block (the depth pass restored engine state) so the render
+            // states we touch don't leak into the reflection/wave passes.
             if (cacheOpaqueMode) {
                 device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
                 effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
                 renderCachedOpaque(&mwView, &mwProj);
+                // Terrain too, so cache owns ALL opaque here as well (DL-off exteriors;
+                // a no-op in interiors — no isLandscape entries). Engine near terrain is
+                // suppressed in inspectIndexedPrimitive whenever CACHE mode is on.
+                renderCachedTerrain(&mwView, &mwProj);
                 effect->End();
                 stateSaved->Apply();
                 stateSaved->Release();
@@ -1273,24 +1279,39 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
         if ((Configuration.MGEFlags & USE_DISTANT_LAND) && (Configuration.MGEFlags & USE_ATM_SCATTER)) {
             return false;
         }
-    } else if (isPPLActive) {
-        // Phase 1 Milestone 1 CACHE mode: the simple-opaque subset is drawn
-        // authoritatively by renderCachedOpaque in renderStage0. Suppress the
-        // engine's reactive draw of those covered parts here (skip the per-draw
-        // renderMorrowind + the engine forward). Non-covered parts fall through to
-        // the normal reactive path so the A/B compares only the covered subset.
+    } else {
+        // CACHE mode: the simple-opaque subset (objects + terrain) is drawn
+        // authoritatively by renderCachedOpaque/renderCachedTerrain in renderStage0.
+        // Suppress the engine's reactive draw of those covered parts whenever CACHE
+        // mode is on — INDEPENDENT of the PPL lighting mode. The cache draw isn't
+        // PPL-gated, so suppressing only under isPPLActive let the engine redraw the
+        // same surface in fixed-function mode and the two z-fought (the cache snapshot
+        // pose vs the engine live pose differ by a sub-frame on animated parts).
+        // isLandSplat covers the terrain splat overlay passes so renderCachedTerrain
+        // isn't double-drawn. (recordMW capture above is untouched — depth replay
+        // still sees the engine geometry.)
         //
-        // M2.1: also suppress the engine's terrain splat overlay passes (isLandSplat
-        // = the alpha-blend 2nd+ passes). The opaque base terrain pass is already
-        // covered by isCoveredOpaque; together they remove ALL engine near terrain so
-        // renderCachedTerrain isn't double-drawn over it. (recordMW capture above is
-        // untouched — depth replay still sees the engine terrain.)
-        if (cacheOpaqueMode && (isCoveredOpaque(rs, frs) || isLandSplat)) {
+        // Gated on cacheOpaqueMode ONLY (not isDistantCell): renderStage0 draws the
+        // cache opaque+terrain in BOTH the distant-cell and the non-distant branches,
+        // so the cache owns this geometry regardless of distant land. Gating on
+        // isDistantCell here would un-suppress the engine in the non-distant branch
+        // where the cache still draws -> double draw / z-fight.
+        //
+        // sceneCount == 0 is REQUIRED: the cache records/replays scene 0 (the opaque
+        // world) only. Later scenes — the first-person arm, alpha-sorted, UI — stay on
+        // the engine path (plan scope). isCoveredOpaque matches textured opaque in any
+        // scene, so without this gate the 1st-person arm gets suppressed but never
+        // cache-drawn -> hands vanish. (isLandSplat already self-gates to scene 0.)
+        if (cacheOpaqueMode && sceneCount == 0 && (isCoveredOpaque(rs, frs) || isLandSplat)) {
             return false;
         }
-        // Render Morrowind with replacement shaders
-        FixedFunctionShader::renderMorrowind(rs, frs, lightrs);
-        return false;
+        // PPL reactive colour path: render non-covered opaque (and, in plain PPL mode,
+        // all opaque) with the replacement FFE shader. Only when the PPL renderer is
+        // active; in fixed-function mode the engine draws its own colour.
+        if (isPPLActive) {
+            FixedFunctionShader::renderMorrowind(rs, frs, lightrs);
+            return false;
+        }
     }
 
     return true;
