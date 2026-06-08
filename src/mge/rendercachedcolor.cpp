@@ -242,6 +242,13 @@ void DistantLand::renderReflectionsFromCache(const D3DXMATRIX* view, const D3DXM
         else             { cacheWorldBounds(e, bs.center, bs.radius); }
         if (frustum.ContainsSphere(bs) == ViewFrustum::OUTSIDE) continue;
 
+        // World-space AABB for texture-light selection. The cache VB is WRITEONLY so
+        // renderMorrowind's computeBoundingBox can't read it and would fall back to the
+        // object origin (selecting lights as if the whole part were a point at its
+        // node origin -> wrong lights). Hand it the real bound, same as renderCachedOpaque.
+        const D3DXVECTOR3 lbMin(bs.center.x - bs.radius, bs.center.y - bs.radius, bs.center.z - bs.radius);
+        const D3DXVECTOR3 lbMax(bs.center.x + bs.radius, bs.center.y + bs.radius, bs.center.z + bs.radius);
+
         buildCacheReflectionState(e, *view, sunVec, sunCol, sunAmb, ambCol, rs, frs, lightrs);
 
         // Alpha test (cutout foliage/armor): the FFE shader outputs texture.a *
@@ -269,11 +276,11 @@ void DistantLand::renderReflectionsFromCache(const D3DXMATRIX* view, const D3DXM
             device->SetVertexDeclaration(MGE::GeometryCache::skinnedDecl());
             device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kSkinnedVBStride);
             const D3DXMATRIX* pal = reinterpret_cast<const D3DXMATRIX*>(e.bonePalette.data());
-            FixedFunctionShader::renderMorrowind(&rs, &frs, &lightrs, plMult, pal, (int)e.numBones, view);
+            FixedFunctionShader::renderMorrowind(&rs, &frs, &lightrs, plMult, pal, (int)e.numBones, view, &lbMin, &lbMax);
         } else {
             device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kVBStride);
             device->SetFVF(MGE::GeometryCache::kVBFVF);
-            FixedFunctionShader::renderMorrowind(&rs, &frs, &lightrs, plMult);
+            FixedFunctionShader::renderMorrowind(&rs, &frs, &lightrs, plMult, nullptr, 0, nullptr, &lbMin, &lbMax);
         }
     }
 }
