@@ -496,4 +496,21 @@ Technique T0 {
         VertexShader = compile vs_3_0 CacheTerrainLitVS();
         PixelShader = compile ps_3_0 CacheTerrainLitPS();
     }
+    //------------------------------------------------------------
+    // Cache near terrain WITH dynamic point lights (reflections) — same states as P13
+    // (reflection winding CCW, ZWrite on) but the lit VS/PS so reflected terrain gets
+    // the same point lights as reflected objects, plus the below-water clip.
+    Pass P16 {
+        ZEnable = true;
+        ZWriteEnable = true;
+        ZFunc = LessEqual;
+        StencilEnable = false;
+        CullMode = CCW;            // reflection winding (inverted)
+
+        AlphaBlendEnable = false;
+        AlphaTestEnable = false;
+
+        VertexShader = compile vs_3_0 CacheTerrainLitVS();
+        PixelShader = compile ps_3_0 CacheTerrainReflLitPS();
+    }
 }

@@ -120,3 +120,16 @@ float4 CacheTerrainLitPS(CacheTerrainLitVertOut IN) : COLOR0 {
     result = fogApply(result, IN.fog);
     return float4(result, 1);
 }
+
+//------------------------------------------------------------
+// Reflection variant: the main-view lit shading (sun + vcol + dynamic point lights)
+// PLUS the reflection's below-water clip, so reflected near terrain gets the same
+// point lights as reflected objects (the reflection terrain previously used the
+// non-lit CacheTerrainPS, leaving it unlit by candles/torches). reflWaterClipPlane
+// comes from "XE Mod Landscape.fx" (included before this file by XE Main.fx); it is
+// the true water level in the reflection (pass-all in the main view). CacheTerrainLitVS
+// already outputs viewpos (= world*reflView) for the clip dot product.
+float4 CacheTerrainReflLitPS(CacheTerrainLitVertOut IN) : COLOR0 {
+    clip(dot(float4(IN.viewpos, 1), reflWaterClipPlane));
+    return CacheTerrainLitPS(IN);
+}

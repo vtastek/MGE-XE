@@ -598,7 +598,24 @@ void DistantLand::renderReflectionTerrainFromCache(const D3DXMATRIX* view, const
     ViewFrustum frustum(&viewproj);
     const D3DXVECTOR3 eye(eyePos.x, eyePos.y, eyePos.z);
 
-    effect->BeginPass(PASS_RENDERCACHETERRAIN);
+    // Texture-light setup, mirroring renderCachedTerrain so reflected terrain gets the
+    // same dynamic point lights as reflected objects (previously it used the non-lit
+    // CacheTerrainPS and stayed sun+vcol only). texLightView = view (= reflView) so the
+    // shader transforms world-space light positions into the reflected-view space its
+    // pixels live in. D3DTS_PROJECTION drives selectTextureLights' frustum precull.
+    const bool logPerf = Configuration.LogDistantPipeline;
+    const float texelSize = FixedFunctionShader::texLightTexelSize();
+    effect->SetTexture(ehLightData, FixedFunctionShader::textureLightData());
+    effect->SetMatrix(ehTexLightView, view);
+    device->SetTransform(D3DTS_PROJECTION, proj);
+    float idxFloats[8 * 4] = { 0 };
+
+    MGE::SceneGraph::SnapshotReadLock snapshotLock;
+    const auto& snapshotLights = MGE::SceneGraph::pointLights();
+    const unsigned int snapshotCount =
+        std::min<unsigned int>((unsigned int)snapshotLights.size(), FixedFunctionShader::maxTexLights());
+
+    effect->BeginPass(PASS_RENDERCACHETERRAINREFLLIT);
     for (const auto& kv : cacheMap) {
         const auto& e = kv.second;
         if (!e.isLandscape || e.isSkinned) continue;
@@ -615,6 +632,16 @@ void DistantLand::renderReflectionTerrainFromCache(const D3DXMATRIX* view, const
         if (frustum.ContainsSphere(bs) == ViewFrustum::OUTSIDE) continue;
         const D3DXVECTOR3 d = bs.center - eye;
         if (D3DXVec3Length(&d) - bs.radius > nearDist) continue;
+
+        // Per-patch point-light selection (sphere-AABB nearest-32), byte-identical to
+        // the object/main-terrain path. AABB from the patch's world bound sphere.
+        const D3DXVECTOR3 lbMin(bs.center.x - bs.radius, bs.center.y - bs.radius, bs.center.z - bs.radius);
+        const D3DXVECTOR3 lbMax(bs.center.x + bs.radius, bs.center.y + bs.radius, bs.center.z + bs.radius);
+        const int lightCount = FixedFunctionShader::selectTextureLights(
+            snapshotLights, snapshotCount, *view, lbMin, lbMax, idxFloats, logPerf);
+        const D3DXVECTOR4 lightDataParams_v((float)lightCount, texelSize, 0.0f, 0.0f);
+        effect->SetVector(ehLightDataParams, &lightDataParams_v);
+        if (lightCount > 0) effect->SetVectorArray(ehLightIndices, (D3DXVECTOR4*)idxFloats, 8);
 
         effect->SetMatrix(ehWorld, reinterpret_cast<const D3DXMATRIX*>(e.worldTransformD3D));
         effect->SetTexture(ehTex0, e.d3dTexture);
