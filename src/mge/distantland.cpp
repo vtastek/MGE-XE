@@ -144,6 +144,20 @@ void DistantLand::beginDrawsZone() {
 #endif
 }
 
+// Handover band clip plane. Builds a view-space-z slab in CLIP space (vs_3_0 user
+// clip planes are evaluated in clip space) so it must be constructed from the SAME
+// projection the bracketed geometry is drawn with. The slab is independent of view
+// orientation — it depends only on the projection's _33/_43 (the view-z -> clip-z/w
+// mapping). keepNear=true keeps view-z > d (cull-near: bound LOD to the band START);
+// keepNear=false keeps view-z < d (cull-far: bound near content to the band END).
+// Mirrors the proven forms at renderexterior.cpp (interior statics) and the water
+// fillrate clip. Caller enables D3DRS_CLIPPLANEENABLE and disables it afterwards.
+static D3DXPLANE makeBandClipPlane(const D3DXMATRIX& proj, float d, bool keepNear) {
+    const float a = proj._33 * d + proj._43;
+    return keepNear ? D3DXPLANE(0, 0, d, -a)    // keep view-z > d
+                    : D3DXPLANE(0, 0, -d, a);   // keep view-z < d
+}
+
 // renderStage0 - Render distant land at beginning of scene 0, after sky
 void DistantLand::renderStage0() {
 #ifdef TRACY_ENABLE
@@ -271,7 +285,17 @@ void DistantLand::renderStage0() {
                 // Draw distant landscape
                 if (mwBridge->IsExterior()) {
                     effect->BeginPass(PASS_RENDERLAND);
+                    // Handover band near-cut: bound LOD land to the band START so it
+                    // doesn't draw into the near field the cache/engine owns. Plane built
+                    // from distProj (the projection the land is drawn with). Set after
+                    // BeginPass (shader bound) to avoid the FF->shader SetClipPlane bug.
+                    {
+                        D3DXPLANE p = makeBandClipPlane(distProj, nearViewRange - 1152.0f, true);
+                        device->SetClipPlane(0, p);
+                        device->SetRenderState(D3DRS_CLIPPLANEENABLE, 1);
+                    }
                     renderDistantLand(effect, &mwView, &distProj);
+                    device->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
                     effect->EndPass();
 
                     // The terrain-box occluders are now contributed to MSOC on the
@@ -292,14 +316,48 @@ void DistantLand::renderStage0() {
                 if (kickedOffDistantStatics) {
                     DWORD p = mwBridge->CellHasWeather() ? PASS_RENDERSTATICSEXTERIOR : PASS_RENDERSTATICSINTERIOR;
                     effect->BeginPass(p);
+                    // Handover band near-cut: bound LOD statics to the band START so big
+                    // architectural meshes don't overshoot into the near field (slices
+                    // the whole object at the slab — no per-origin test that gaps on
+                    // objects spanning the band). distProj-built; exteriors + interiors.
+                    {
+                        D3DXPLANE pl = makeBandClipPlane(distProj, nearViewRange - 768.0f, true);
+                        device->SetClipPlane(0, pl);
+                        device->SetRenderState(D3DRS_CLIPPLANEENABLE, 1);
+                    }
                     vsr.beginAlphaToCoverage(device);
                     renderDistantStatics();
                     vsr.endAlphaToCoverage(device);
+                    device->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
                     effect->EndPass();
                 }
                 else {
                     visDistant.RemoveAll();
                 }
+            }
+
+            // Sky scattering and sky objects. Drawn AFTER distant land/statics (so the
+            // horizon haze still blends over them) but BEFORE the cache near pass and
+            // the distant-only blend capture below — so that capture is genuinely
+            // distant-only (no near scene). The cache near is opaque and z-occludes the
+            // sky where present, so moving sky ahead of it leaves the image unchanged.
+            // (Was drawn after cache near; "as late as possible" is satisfied relative
+            // to the distant passes, which is what the horizon blend needs.)
+            if ((Configuration.MGEFlags & USE_ATM_SCATTER) && mwBridge->CellHasWeather()) {
+                renderSky();
+            }
+
+            // Capture the distant-only frame (distant land + statics + sky, NO near
+            // scene) for the MW/MGE handover blend. renderStage1 PASS_BLENDMGE feathers
+            // this over the near scene across [nearViewRange-512, nearViewRange]. In
+            // ENGINE mode the engine draws the near scene later; in CACHE mode the cache
+            // near is drawn just below — either way the near scene is NOT in this frame,
+            // which is what makes the feather work. (Was captured at the END of stage0,
+            // which in CACHE mode wrongly included the cache near and killed the blend.
+            // Reflection/waves below render to their own RTs, not the backbuffer, so the
+            // backbuffer distant content is final at this point.)
+            if (~Configuration.MGEFlags & NO_MW_MGE_BLEND) {
+                texDistantBlend = PostShaders::borrowBuffer(1);
             }
 
             // Phase 1 Milestone 1: in CACHE mode, draw the simple-opaque subset of
@@ -309,20 +367,28 @@ void DistantLand::renderStage0() {
             // real backbuffer + main depthstencil are bound here and the engine's
             // near scene hasn't run yet, so both paths hit the same RT/camera. Uses
             // the true near projection; restore the distant projection afterwards
-            // for the sky + reflection passes that follow.
+            // for the reflection passes that follow.
             if (cacheOpaqueMode) {
                 renderCachedOpaque(&mwView, &mwProj);
                 // M2.1: own the terrain too (objects + terrain = all opaque). The
                 // engine's near-terrain base + splat passes are suppressed in
                 // inspectIndexedPrimitive in CACHE mode, so this is the only near
                 // terrain; DL LOD sits behind via the distant projection.
+                //
+                // Handover band far-cut: bound the full-res cache terrain to the band
+                // END so the DL LOD owns everything beyond it (else cache terrain runs
+                // all the way to the engine view distance, overlapping the LOD). Plane
+                // built from mwProj (cache terrain's projection). renderCachedOpaque
+                // above just issued shader draws, so SetClipPlane sticks here even
+                // before renderCachedTerrain's internal BeginPass.
+                {
+                    D3DXPLANE p = makeBandClipPlane(mwProj, nearViewRange, false);
+                    device->SetClipPlane(0, p);
+                    device->SetRenderState(D3DRS_CLIPPLANEENABLE, 1);
+                }
                 renderCachedTerrain(&mwView, &mwProj);
+                device->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
                 effect->SetMatrix(ehProj, &distProj);
-            }
-
-            // Sky scattering and sky objects (should be drawn late as possible)
-            if ((Configuration.MGEFlags & USE_ATM_SCATTER) && mwBridge->CellHasWeather()) {
-                renderSky();
             }
 
             // Update reflection. CellHasWater() is cell-level ("this cell has
@@ -370,10 +436,8 @@ void DistantLand::renderStage0() {
             effect->SetMatrix(ehView, &mwView);
             effect->SetMatrix(ehProj, &mwProj);
 
-            // Save distant land only frame to texture
-            if (~Configuration.MGEFlags & NO_MW_MGE_BLEND) {
-                texDistantBlend = PostShaders::borrowBuffer(1);
-            }
+            // (Distant-only blend frame is now captured earlier — right after sky and
+            // before the cache near pass — so CACHE mode's near scene is excluded.)
 
             // Restore render state
             stateSaved->Apply();

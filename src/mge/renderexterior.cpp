@@ -1232,14 +1232,10 @@ void DistantLand::renderDistantStatics() {
     MGE_ZoneScopedN("renderDistantStatics");
     MGE_SCOPED_TIMER("renderDistantStatics");
     DrawStats::ScopedStage _ds(DrawStats::Statics);
-    if (!MWBridge::get()->IsExterior()) {
-        // Set clipping to stop large architectural meshes (that don't match exactly)
-        // from visible overdrawing and causing z-buffer occlusion
-        float clipAt = nearViewRange - 768.0f;
-        D3DXPLANE clipPlane(0, 0, clipAt, -(mwProj._33 * clipAt + mwProj._43));
-        device->SetClipPlane(0, clipPlane);
-        device->SetRenderState(D3DRS_CLIPPLANEENABLE, 1);
-    }
+    // Handover band near-cut clip plane is set by the caller (renderStage0), bracketed
+    // with the distant projection these statics are drawn with so the view-z slab cuts
+    // at the intended band start. (Was an interior-only mwProj clip here — moved out so
+    // the plane matches distProj and covers exteriors too.)
 
     device->SetVertexDeclaration(StaticDecl);
 
@@ -1247,8 +1243,6 @@ void DistantLand::renderDistantStatics() {
     // by applyMSOCToDistantStatics (IPC and non-IPC paths alike). The old
     // skipMask plumbing is gone — occluded instances are already absent.
     visDistantSurvivors.Render(device, effect, effect, &ehTex0, nullptr, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT, false);
-
-    device->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
 }
 
 void DistantLand::renderMSOCBasinBoundsDebug(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
