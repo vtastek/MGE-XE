@@ -26,7 +26,24 @@ namespace DrawStats {
 
     enum Stage : int {
         Scene0, Scene1, Scene2, UI,        // Morrowind scenes (set in BeginScene)
-        Depth, Shadow, Reflection,          // pre-passes
+        // Depth pre-pass, split by content source. Depth = misc (cleardepth /
+        // renderDepthRecorded); DepthCache = renderDepthFromCache (cache geometry,
+        // frustum-only post-Phase-1); DepthLand/Statics/Grass = the distant-land
+        // depth replays. So DepthCache is the apples-to-apples vs scene0.
+        Depth, DepthCache, DepthLand, DepthStatics, DepthGrass,
+        // Shadow caster pass, split by source. Shadow = misc (per-cascade stencil cube
+        // + soften passes; distant-land caster still lands in Land — shares
+        // renderDistantLand's tag); ShadowCache = renderShadowFromCache (cache casters,
+        // near cascade 0 only); ShadowDL = distant-statics casters (both cascades).
+        Shadow, ShadowCache, ShadowDL,
+        // Reflection, split by source. Reflection = misc (reflected sky; reflected
+        // LOD land still lands in Land — it shares renderDistantLand's tag);
+        // ReflStatics = reflected distant statics (the "DL culled" set, near band
+        // shader-clipped but still issued); ReflCacheColor / ReflCacheShadow /
+        // ReflCacheTerrain = the three cache-injection passes (lit color, the shadow
+        // re-draw, and near terrain) — split out so the color/shadow ~2x doubling and
+        // terrain weight are visible separately.
+        Reflection, ReflStatics, ReflCacheColor, ReflCacheShadow, ReflCacheTerrain,
         Land, Statics, Grass, Water, Sky,   // distant-land content
         Post, Debug, Other,
         COUNT
@@ -35,7 +52,9 @@ namespace DrawStats {
     inline const char* name(Stage s) {
         static const char* const n[COUNT] = {
             "scene0", "scene1", "scene2", "ui",
-            "depth", "shadow", "refl",
+            "depth", "d.cache", "d.land", "d.stat", "d.grass",
+            "shadow", "s.cache", "s.dl",
+            "refl", "r.stat", "r.c.color", "r.c.shadow", "r.c.terr",
             "land", "statics", "grass", "water", "sky",
             "post", "dbg", "other"
         };
@@ -49,7 +68,9 @@ namespace DrawStats {
     inline const char* plotName(Stage s) {
         static const char* const n[COUNT] = {
             "draws:scene0", "draws:scene1", "draws:scene2", "draws:ui",
-            "draws:depth", "draws:shadow", "draws:refl",
+            "draws:depth", "draws:d.cache", "draws:d.land", "draws:d.statics", "draws:d.grass",
+            "draws:shadow", "draws:s.cache", "draws:s.dl",
+            "draws:refl", "draws:r.statics", "draws:r.c.color", "draws:r.c.shadow", "draws:r.c.terr",
             "draws:land", "draws:statics", "draws:grass", "draws:water", "draws:sky",
             "draws:post", "draws:dbg", "draws:other"
         };

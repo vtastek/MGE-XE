@@ -9,9 +9,10 @@
 // The synthetic-state builders (buildCacheReflectionState / buildCacheMainState)
 // turn a cache entry's captured material + the frame-global sun/ambient into the
 // RenderedState / FragmentState / LightState that FixedFunctionShader::
-// renderMorrowind expects, and the bounds helpers (cacheWorldBounds /
-// cacheSkinnedWorldBounds) provide world-space cull spheres. Kept together here so
-// renderwater.cpp stays water-only and renderStage0 stays orchestration-only.
+// renderMorrowind expects. World-space cull spheres come from cachebounds.h
+// (cacheWorldBounds / cacheSkinnedWorldBounds), shared with the early visible-set
+// build. Kept together here so renderwater.cpp stays water-only and renderStage0
+// stays orchestration-only.
 
 #include "distantland.h"
 #include "distantshader.h"
@@ -19,6 +20,7 @@
 #include "configuration.h"
 #include "ffeshader.h"
 #include "scenegraph_geometry_cache.h"
+#include "cachebounds.h"
 #include "support/log.h"
 #include "mge_tracy.h"
 
@@ -41,61 +43,9 @@ static float cacheHandoverFade(const D3DXVECTOR3& center, const D3DXVECTOR3& eye
     return t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
 }
 
-// World-space bounding sphere for a cache entry. The cache stores the geometry's
-// bound in MODEL space (boundsCenter/boundsRadius); the cull frustum is in world
-// space. Using the object ORIGIN (worldTransformD3D translation) as the sphere
-// center is wrong whenever the geometry is offset from its node origin — most
-// dramatically for terrain patches, whose origin is the cell corner ~4096u from
-// the real patch center, causing false culls when the camera is close/over the
-// cell. Transform the model center by the world matrix and scale the radius by the
-// largest axis scale so the sphere actually encloses the drawn geometry.
-static void cacheWorldBounds(const MGE::GeometryCache::CachedGeometry& e, D3DXVECTOR3& outCenter, float& outRadius) {
-    const D3DXMATRIX& w = *reinterpret_cast<const D3DXMATRIX*>(e.worldTransformD3D);
-    const D3DXVECTOR3 modelC(e.boundsCenter[0], e.boundsCenter[1], e.boundsCenter[2]);
-    D3DXVec3TransformCoord(&outCenter, &modelC, &w);
-    const float sx = D3DXVec3Length(reinterpret_cast<const D3DXVECTOR3*>(&w._11));
-    const float sy = D3DXVec3Length(reinterpret_cast<const D3DXVECTOR3*>(&w._21));
-    const float sz = D3DXVec3Length(reinterpret_cast<const D3DXVECTOR3*>(&w._31));
-    outRadius = e.boundsRadius * std::max(sx, std::max(sy, sz));
-}
-
-// World-space bounding sphere for a SKINNED cache entry, derived from the per-frame
-// bone palette. The skinned VB is bind-pose; the posed geometry is placed entirely
-// by the bones, so the geom's node origin (worldTransformD3D) is NOT where the posed
-// part is. Using the origin as the cull center with the small bind-pose radius
-// falsely culls close skinned parts whose skeleton root sits away from the part
-// (e.g. a character's own torso at 1-2m: it reflects fine at 5-7m, then vanishes as
-// the reflected frustum tightens around the misplaced origin sphere). Transform the
-// bind-pose bounds center by each bone (model->world) and bound the resulting point
-// set: every posed vertex is a weighted (convex) combination of bone-transformed
-// bind positions, so a sphere over those centers plus the scaled bind radius
-// conservatively encloses the posed part.
-static void cacheSkinnedWorldBounds(const MGE::GeometryCache::CachedGeometry& e,
-                                    D3DXVECTOR3& outCenter, float& outRadius) {
-    const int n = (int)e.numBones;
-    const D3DXMATRIX* pal = reinterpret_cast<const D3DXMATRIX*>(e.bonePalette.data());
-    const D3DXVECTOR3 modelC(e.boundsCenter[0], e.boundsCenter[1], e.boundsCenter[2]);
-
-    D3DXVECTOR3 pts[MGE::GeometryCache::kMaxBones];
-    D3DXVECTOR3 c(0, 0, 0);
-    float maxScale = 0.0f;
-    for (int i = 0; i < n; ++i) {
-        D3DXVec3TransformCoord(&pts[i], &modelC, &pal[i]);
-        c += pts[i];
-        const float sx = D3DXVec3Length(reinterpret_cast<const D3DXVECTOR3*>(&pal[i]._11));
-        const float sy = D3DXVec3Length(reinterpret_cast<const D3DXVECTOR3*>(&pal[i]._21));
-        const float sz = D3DXVec3Length(reinterpret_cast<const D3DXVECTOR3*>(&pal[i]._31));
-        maxScale = std::max(maxScale, std::max(sx, std::max(sy, sz)));
-    }
-    c /= (float)n;
-    float r = 0.0f;
-    for (int i = 0; i < n; ++i) {
-        const D3DXVECTOR3 d = pts[i] - c;
-        r = std::max(r, D3DXVec3Length(&d));
-    }
-    outCenter = c;
-    outRadius = r + e.boundsRadius * maxScale;
-}
+// cacheWorldBounds / cacheSkinnedWorldBounds now live in cachebounds.h so the
+// early deterministic visible-set build (renderdepth.cpp) and the cache color
+// passes here share one definition of the cull sphere.
 
 // buildCacheReflectionState - synthesize the RenderedState / FragmentState /
 // LightState that FixedFunctionShader::renderMorrowind expects, from a cache
@@ -177,6 +127,7 @@ static void buildCacheReflectionState(const MGE::GeometryCache::CachedGeometry& 
 
 void DistantLand::renderReflectionsFromCache(const D3DXMATRIX* view, const D3DXMATRIX* proj, float nearDist) {
     MGE_ZoneScopedN("renderReflectionsFromCache");
+    DrawStats::ScopedStage _ds(DrawStats::ReflCacheColor);   // cache objects (lit color) injected into the reflection
 
     const auto& cacheMap = MGE::GeometryCache::cache();
     if (cacheMap.empty()) return;
@@ -206,6 +157,15 @@ void DistantLand::renderReflectionsFromCache(const D3DXMATRIX* view, const D3DXM
     RenderedState rs;
     FragmentState frs;
     static LightState lightrs;   // holds maps; reused to avoid per-draw realloc
+
+    // Diagnostics (gated on LogDistantPipeline): bucket the lit draws so the cache's
+    // weight in the reflection is attributable vs the size-gated distant-statics LOD.
+    // Statics carry no size gate here (shadow uses boundsRadius<50, the DL LOD ~150),
+    // so the small-static buckets show exactly how many sub-LOD-size objects the cache
+    // lights that the distant-statics pass would never generate — the candidate trim.
+    const bool logPerf = Configuration.LogDistantPipeline;
+    static unsigned s_dyn = 0, s_stLt50 = 0, s_st50_150 = 0, s_stGe150 = 0;
+    static unsigned s_calls = 0;
 
     for (const auto& kv : cacheMap) {
         const auto& e = kv.second;
@@ -241,6 +201,26 @@ void DistantLand::renderReflectionsFromCache(const D3DXMATRIX* view, const D3DXM
         if (e.isSkinned) { cacheSkinnedWorldBounds(e, bs.center, bs.radius); }
         else             { cacheWorldBounds(e, bs.center, bs.radius); }
         if (frustum.ContainsSphere(bs) == ViewFrustum::OUTSIDE) continue;
+
+        // Histogram the frustum-visible set by type/size (world-space radius, matching
+        // the LOD generation metric) BEFORE the size gate below, so the buckets show
+        // the full distribution and quantify what the gate drops. dynamicHint!=0 => NPC.
+        if (logPerf) {
+            if (e.dynamicHint != 0)        ++s_dyn;
+            else if (bs.radius < 50.0f)    ++s_stLt50;
+            else if (bs.radius < 150.0f)   ++s_st50_150;
+            else                           ++s_stGe150;
+        }
+
+        // Size gate (statics only): skip sub-150-radius statics. They're below the
+        // distant-statics LOD generation threshold, so they never appear in the
+        // dl.stat pass either — drawing them lit here is pure cache overdraw with no
+        // distant counterpart, and they're too small to read in a reflection. NPCs /
+        // dynamics (dynamicHint != 0) are always drawn. Matches the LOD ~150 gate and
+        // the intent of the shadow caster gate (kShadowMinSize = 50). The shadow
+        // re-draw (renderReflectionShadowsFromCache) carries the SAME gate so every
+        // lit object is also shadowed (no lit-but-unshadowed mismatch).
+        if (e.dynamicHint == 0 && bs.radius < 150.0f) continue;
 
         // World-space AABB for texture-light selection. The cache VB is WRITEONLY so
         // renderMorrowind's computeBoundingBox can't read it and would fall back to the
@@ -282,6 +262,18 @@ void DistantLand::renderReflectionsFromCache(const D3DXMATRIX* view, const D3DXM
             device->SetFVF(MGE::GeometryCache::kVBFVF);
             FixedFunctionShader::renderMorrowind(&rs, &frs, &lightrs, plMult, nullptr, 0, nullptr, &lbMin, &lbMax);
         }
+    }
+
+    constexpr unsigned kIv = 300;
+    if (logPerf && (++s_calls % kIv == 0)) {
+        const unsigned st = s_stLt50 + s_st50_150 + s_stGe150;
+        // Per-frame averages. visible = frustum survivors (pre-gate); drawn =
+        // dynamics + statics>=150 (post-gate); dropped = sub-150 statics the gate removes.
+        LOG::logline("-- [REFL CACHE COLOR] per-frame: visible=%u static=%u{<50=%u 50-150=%u >=150=%u} dynamic=%u "
+                     "-> drawn=%u dropped<150=%u (nearDist=%.0f)",
+                     (s_dyn + st) / kIv, st / kIv, s_stLt50 / kIv, s_st50_150 / kIv, s_stGe150 / kIv, s_dyn / kIv,
+                     (s_dyn + s_stGe150) / kIv, (s_stLt50 + s_st50_150) / kIv, nearDist);
+        s_dyn = s_stLt50 = s_st50_150 = s_stGe150 = 0;
     }
 }
 
@@ -335,17 +327,16 @@ void DistantLand::renderCachedOpaque(const D3DXMATRIX* view, const D3DXMATRIX* p
     device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
     device->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
 
-    // Iterate the engine-submitted on-screen visible set (s_prevVisibleKeys) — the
-    // SAME set the depth pass walks — so cache color stays in lockstep with depth
-    // and the reactive engine. An independent per-part frustum cull (as in the
-    // reflection, which needs it for the different reflected camera) rejected close
-    // parts the engine still draws (e.g. a hand reaching toward the camera), making
-    // them vanish in CACHE mode while depth kept them. The visible set IS the main-
-    // camera cull, so no extra frustum test is needed; only the empty-set fallback
-    // (no MSOC verdict yet) frustum-culls the full cache to avoid drawing offscreen.
-    const auto& visKeys = visibleCacheKeys();
-    const bool useVisibleSet = !visKeys.empty();
-
+    // Deterministic current-frame frustum cull over the full cache. Previously this
+    // iterated the engine-submitted MSOC set (s_prevVisibleKeys) and only frustum-
+    // culled in the empty-set fallback; that set lags a frame (the plugin builds it
+    // late, during the engine's near cullShow) and empties entirely when MSOC is off,
+    // collapsing to an unculled full-cache draw. The depth pre-pass now drives off
+    // the same early frustum-visible set (buildFrustumVisibleSet); promoting the
+    // per-part frustum test to always-on keeps this color pass in lockstep with it,
+    // current-frame, and independent of MSOC. The earlier worry (a close hand getting
+    // rejected) was about the reflected camera's tighter frustum — the main-view
+    // frustum here is the camera the engine itself culls against, so close parts pass.
     D3DXMATRIX viewproj;
     D3DXMatrixMultiply(&viewproj, view, proj);
     ViewFrustum frustum(&viewproj);
@@ -384,11 +375,8 @@ void DistantLand::renderCachedOpaque(const D3DXMATRIX* view, const D3DXMATRIX* p
         if (e.isSkinned) { cacheSkinnedWorldBounds(e, bs.center, bs.radius); }
         else             { cacheWorldBounds(e, bs.center, bs.radius); }
 
-        // Only the full-cache fallback frustum-culls (the visible set is already
-        // the main-camera cull).
-        if (!useVisibleSet) {
-            if (frustum.ContainsSphere(bs) == ViewFrustum::OUTSIDE) { if (logPerf) ++s_skFrustum; return; }
-        }
+        // Deterministic current-frame frustum cull (always on).
+        if (frustum.ContainsSphere(bs) == ViewFrustum::OUTSIDE) { if (logPerf) ++s_skFrustum; return; }
 
         const D3DXVECTOR3 lbMin(bs.center.x - bs.radius, bs.center.y - bs.radius, bs.center.z - bs.radius);
         const D3DXVECTOR3 lbMax(bs.center.x + bs.radius, bs.center.y + bs.radius, bs.center.z + bs.radius);
@@ -428,25 +416,19 @@ void DistantLand::renderCachedOpaque(const D3DXMATRIX* view, const D3DXMATRIX* p
         if (logPerf) ++s_drawn;
     };
 
-    if (useVisibleSet) {
-        for (uint32_t key : visKeys) {
-            auto it = cacheMap.find(key);
-            if (it != cacheMap.end()) drawEntry(it->second);
-        }
-    } else {
-        for (const auto& kv : cacheMap) drawEntry(kv.second);
-    }
+    for (const auto& kv : cacheMap) drawEntry(kv.second);
 
     if (logPerf && (++s_calls % 300 == 0)) {
-        LOG::logline("-- [CACHE OPAQUE] drawn=%u skip{blend=%u notex=%u land=%u unskin=%u frustum=%u} visSet=%d sampleUnskinTex=%s",
+        LOG::logline("-- [CACHE OPAQUE] drawn=%u skip{blend=%u notex=%u land=%u unskin=%u frustum=%u} sampleUnskinTex=%s",
                      s_drawn, s_skBlend, s_skNoTex, s_skLand, s_skUnskin, s_skFrustum,
-                     useVisibleSet ? 1 : 0, s_lastUnskinTex ? s_lastUnskinTex : "(none)");
+                     s_lastUnskinTex ? s_lastUnskinTex : "(none)");
         s_drawn = s_skBlend = s_skNoTex = s_skLand = s_skUnskin = s_skFrustum = 0;
     }
 }
 
 void DistantLand::renderReflectionShadowsFromCache(const D3DXMATRIX* view, const D3DXMATRIX* proj, float nearDist) {
     MGE_ZoneScopedN("renderReflectionShadowsFromCache");
+    DrawStats::ScopedStage _ds(DrawStats::ReflCacheShadow);   // cache objects' shadow re-draw
 
     const auto& cacheMap = MGE::GeometryCache::cache();
     if (cacheMap.empty()) return;
@@ -493,6 +475,11 @@ void DistantLand::renderReflectionShadowsFromCache(const D3DXMATRIX* view, const
         BoundingSphere bs;
         cacheWorldBounds(e, bs.center, bs.radius);
         if (frustum.ContainsSphere(bs) == ViewFrustum::OUTSIDE) continue;
+
+        // Size gate, identical to the color pass (statics only, terrain exempt): only
+        // objects the color pass actually drew get a shadow re-draw, so there's no
+        // lit-but-unshadowed mismatch and the receiver set tracks the lit set exactly.
+        if (!e.isLandscape && e.dynamicHint == 0 && bs.radius < 150.0f) continue;
 
         // Handover metric: statics match the distant-land staticNearCull (object
         // origin) for an exact partition; terrain uses its world-space patch center
@@ -588,6 +575,7 @@ void DistantLand::renderReflectionShadowsFromCache(const D3DXMATRIX* view, const
 
 void DistantLand::renderReflectionTerrainFromCache(const D3DXMATRIX* view, const D3DXMATRIX* proj, float nearDist) {
     MGE_ZoneScopedN("renderReflectionTerrainFromCache");
+    DrawStats::ScopedStage _ds(DrawStats::ReflCacheTerrain);   // cache terrain injected into the reflection
     if (nearDist <= 0.0f) return;
 
     const auto& cacheMap = MGE::GeometryCache::cache();
@@ -602,7 +590,13 @@ void DistantLand::renderReflectionTerrainFromCache(const D3DXMATRIX* view, const
     // same dynamic point lights as reflected objects (previously it used the non-lit
     // CacheTerrainPS and stayed sun+vcol only). texLightView = view (= reflView) so the
     // shader transforms world-space light positions into the reflected-view space its
-    // pixels live in. D3DTS_PROJECTION drives selectTextureLights' frustum precull.
+    // pixels live in. selectTextureLights reads D3DTS_PROJECTION for its frustum
+    // precull — but unlike the main view, the reflection has an ACTIVE hardware clip
+    // plane (renderWaterReflection: SetClipPlane + CLIPPLANEENABLE) whose device-space
+    // interpretation depends on D3DTS_PROJECTION. Leaving reflProj set across the patch
+    // DRAWS corrupts that clip plane and clips ALL reflected terrain (the regression).
+    // So capture the clip-consistent projection here and bracket the reflProj swap
+    // tightly around selectTextureLights, restoring it before each draw.
     const bool logPerf = Configuration.LogDistantPipeline;
     const float texelSize = FixedFunctionShader::texLightTexelSize();
     effect->SetTexture(ehLightData, FixedFunctionShader::textureLightData());
@@ -610,11 +604,27 @@ void DistantLand::renderReflectionTerrainFromCache(const D3DXMATRIX* view, const
     device->SetTransform(D3DTS_PROJECTION, proj);
     float idxFloats[8 * 4] = { 0 };
 
+    // Set the shared `proj` param explicitly, exactly as the WORKING main-view lit path
+    // does (renderCachedTerrain). P13 (CacheTerrainVS) renders without this because the
+    // reflection's prior passes leave `proj` = reflProj. But the lit pass (P16) carries
+    // extra globals (lightIndices[8], texLightView, the s7 sampler) that perturb the
+    // ID3DXEffect register layout — the same class of collision that corrupted the depth
+    // effect (commit 35fcd0f). If P16 resolves the shared `proj` to a different register
+    // than the prior pass wrote, the VS multiplies by a stale projection -> degenerate
+    // clip space -> nothing rasterizes (which is exactly the P16 reflection symptom:
+    // VS-stage rejection, no fragments even with a solid-color PS). Writing `proj` here
+    // under the P16-bound layout pins reflProj into whatever register P16 actually reads.
+    effect->SetMatrix(ehProj, proj);
+
     MGE::SceneGraph::SnapshotReadLock snapshotLock;
     const auto& snapshotLights = MGE::SceneGraph::pointLights();
     const unsigned int snapshotCount =
         std::min<unsigned int>((unsigned int)snapshotLights.size(), FixedFunctionShader::maxTexLights());
 
+    // Lit reflection terrain (P16: CacheTerrainLitVS/CacheTerrainReflLitPS) so reflected
+    // near terrain receives the same dynamic point lights (candles/torches) as reflected
+    // objects, plus the below-water shader clip. P16 previously failed to rasterize; the
+    // suspected cause is the stale shared `proj` (see the explicit SetMatrix(ehProj) above).
     effect->BeginPass(PASS_RENDERCACHETERRAINREFLLIT);
     for (const auto& kv : cacheMap) {
         const auto& e = kv.second;

@@ -43,17 +43,27 @@ void DrawStats::logFrame() {
 
     static int s_frame = 0;
     if (Configuration.LogDistantPipeline && (s_frame++ % 60) == 0) {
-        // scene = scene0+1+2+UI, pre = depth+shadow+refl, DL = land+statics+grass+water+sky
+        // scene = scene0+1+2+UI, pre = depth(all)+shadow+refl(all), DL = land+statics+grass+water+sky
         const std::uint32_t scene = g_calls[Scene0] + g_calls[Scene1] + g_calls[Scene2] + g_calls[UI];
-        const std::uint32_t pre   = g_calls[Depth] + g_calls[Shadow] + g_calls[Reflection];
+        const std::uint32_t depth = g_calls[Depth] + g_calls[DepthCache] + g_calls[DepthLand]
+                                  + g_calls[DepthStatics] + g_calls[DepthGrass];
+        const std::uint32_t shadow = g_calls[Shadow] + g_calls[ShadowCache] + g_calls[ShadowDL];
+        const std::uint32_t reflCache = g_calls[ReflCacheColor] + g_calls[ReflCacheShadow] + g_calls[ReflCacheTerrain];
+        const std::uint32_t refl  = g_calls[Reflection] + g_calls[ReflStatics] + reflCache;
+        const std::uint32_t pre   = depth + shadow + refl;
         const std::uint32_t dl    = g_calls[Land] + g_calls[Statics] + g_calls[Grass] + g_calls[Water] + g_calls[Sky];
         LOG::logline(
-            "-- draws: TOTAL=%u  scene=%u(s0=%u s1=%u s2=%u ui=%u)  "
-            "pre=%u(depth=%u shadow=%u refl=%u)  "
+            "-- draws: TOTAL=%u  scene=%u(s0=%u s1=%u s2=%u ui=%u)  pre=%u "
+            "depth=%u(cache=%u land=%u stat=%u grass=%u misc=%u) "
+            "shadow=%u(cache=%u dl=%u misc=%u) "
+            "refl=%u(dl.stat=%u cache=%u[color=%u shadow=%u terr=%u] misc=%u)  "
             "DL=%u(land=%u statics=%u grass=%u water=%u sky=%u)  post=%u dbg=%u other=%u",
             totalCalls,
-            scene, g_calls[Scene0], g_calls[Scene1], g_calls[Scene2], g_calls[UI],
-            pre, g_calls[Depth], g_calls[Shadow], g_calls[Reflection],
+            scene, g_calls[Scene0], g_calls[Scene1], g_calls[Scene2], g_calls[UI], pre,
+            depth, g_calls[DepthCache], g_calls[DepthLand], g_calls[DepthStatics], g_calls[DepthGrass], g_calls[Depth],
+            shadow, g_calls[ShadowCache], g_calls[ShadowDL], g_calls[Shadow],
+            refl, g_calls[ReflStatics], reflCache,
+            g_calls[ReflCacheColor], g_calls[ReflCacheShadow], g_calls[ReflCacheTerrain], g_calls[Reflection],
             dl, g_calls[Land], g_calls[Statics], g_calls[Grass], g_calls[Water], g_calls[Sky],
             g_calls[Post], g_calls[Debug], g_calls[Other]);
     }

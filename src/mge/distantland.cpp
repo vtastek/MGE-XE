@@ -116,6 +116,17 @@ void DistantLand::frameSetupEarly() {
         MGE::GeometryCache::onFrameReady(MGE::SceneGraph::getDataHandler());
         earlyWalkedCache = true;
 
+        // Build the deterministic, current-frame frustum-visible set over the fresh
+        // cache, using the camera read above (mwView/mwProj). This is the set MGE
+        // now owns: the depth pre-pass (renderDepthFromCache) and the cache opaque
+        // color pass both consume it instead of the plugin's frame-lagged engine-MSOC
+        // verdict — so leading-edge tiles a pan reveals this frame get depth (no sky
+        // holes) and an MSOC-off frame stays frustum-culled (no 14.6ms unculled draw).
+        // Must run before snapshotVisibleKeysForThread (the render-thread job reads a
+        // snapshot of it). ~0.4ms (reflection paths prove full-cache frustum cost),
+        // overlapping the sky window. Frustum-only here; Phase 3 adds occlusion.
+        buildFrustumVisibleSet(&mwView, &mwProj);
+
         // Kick the render-thread depth-cache job now — after the geometry-cache
         // walk (so the cache + VBs it consumes are stable) and before the engine's
         // sky pass — so the worker's ~1ms submission CPU overlaps the engine's

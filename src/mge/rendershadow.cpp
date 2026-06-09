@@ -199,6 +199,7 @@ void DistantLand::renderShadowMap() {
 void DistantLand::renderShadowFromCache(int layer, const D3DXMATRIX* viewproj) {
     if (layer != 0) return;  // near cascade only — before zone to avoid ghost entry
     MGE_ZoneScopedN("renderShadowFromCache");
+    DrawStats::ScopedStage _ds(DrawStats::ShadowCache);   // cache geometry as shadow casters
 
     static constexpr float kShadowMinSize = 50.0f;
 
@@ -321,7 +322,10 @@ void DistantLand::renderShadowLayerGeneric(MWBridge* mwBridge, int layer, const 
     }
 
     device->SetVertexDeclaration(StaticDecl);
-    visible_set.Render(device, effectShadow, effect, &ehTex0, &ehHasAlpha, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT, true);
+    {
+        DrawStats::ScopedStage _ds(DrawStats::ShadowDL);   // distant-statics shadow casters
+        visible_set.Render(device, effectShadow, effect, &ehTex0, &ehHasAlpha, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT, true);
+    }
 
     effectShadow->EndPass();
 }

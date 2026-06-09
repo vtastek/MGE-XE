@@ -50,6 +50,27 @@ static float s_waterMeshSnapUnderwater =  5.0f;   // underwater: at WaterLevel (
 // renderReflectionTerrainFromCache / renderCachedOpaque) lives in
 // rendercachedcolor.cpp. renderWaterReflection below just calls those methods.
 
+// Diagnostic (gated on LogDistantPipeline): bucket the reflected distant-statics
+// survivors by object-origin distance vs cacheNearDist. The near band is collapsed
+// to nothing by the staticNearCull vertex-shader clip (XE Mod Statics.fx) so the
+// cache can draw those objects lit — but the draw call is still ISSUED here, so the
+// near count is wasted draw calls that mirror the cache's lit near-statics. The far
+// band is what actually rasterizes. Confirms the dl.stat/cache double-issue.
+static void logReflStaticNearFar(VisibleSet<StlVector>& vs, const D3DXVECTOR3& eye, float cacheNearDist) {
+    if (!Configuration.LogDistantPipeline || cacheNearDist <= 0.0f) return;
+    static unsigned s_near = 0, s_far = 0, s_calls = 0;
+    for (const RenderMesh* m : vs.visible_set) {
+        const D3DXVECTOR3 d = m->sphere.center - eye;
+        if (D3DXVec3Length(&d) < cacheNearDist) ++s_near; else ++s_far;
+    }
+    constexpr unsigned kIv = 300;
+    if ((++s_calls % kIv) == 0) {
+        LOG::logline("-- [REFL DL.STAT] per-frame: near(<%.0f, shader-clipped waste)=%u far(rasterized)=%u total=%u",
+                     cacheNearDist, s_near / kIv, s_far / kIv, (s_near + s_far) / kIv);
+        s_near = s_far = 0;
+    }
+}
+
 void DistantLand::renderWaterReflection(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
     MGE_ZoneScopedN("renderWaterReflection");
     DrawStats::ScopedStage _ds(DrawStats::Reflection);
@@ -307,6 +328,7 @@ void DistantLand::renderReflectedSky() {
 }
 
 void DistantLand::renderReflectedStatics(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
+    DrawStats::ScopedStage _ds(DrawStats::ReflStatics);   // reflected distant statics (the "DL culled" set)
     // Select appropriate static clipping distance
     D3DXMATRIX ds_proj = *proj, ds_viewproj;
     float zn = 4.0f, zf = Configuration.DL.NearStaticEnd * kCellSize;
@@ -325,12 +347,19 @@ void DistantLand::renderReflectedStatics(const D3DXMATRIX* view, const D3DXMATRI
     ViewFrustum range_frustum(&ds_viewproj);
     D3DXVECTOR4 viewsphere(eyePos.x, eyePos.y, eyePos.z, zf);
 
+    // Same near radius the cache reflection owns (renderWaterReflection), recomputed
+    // here for the diagnostic near/far split below.
+    const D3DXVECTOR3 eye(eyePos.x, eyePos.y, eyePos.z);
+    const float diagCacheNearDist = Configuration.UseSceneGraphSnapshot
+                                    ? nearViewRange * s_reflectionCacheNearFactor : 0.0f;
+
     if (Configuration.UseSharedMemory) {
         // Worker path: the cull worker already issued the reflection RPC,
         // materialized it, and culled it to reflectionSurvivors during the sky
         // window. Just draw the stable survivor set — no RPC, no wait, no IPC
         // window traversal on the main thread.
         if (reflStaticsWanted) {
+            logReflStaticNearFar(reflectionSurvivors, eye, diagCacheNearDist);
             device->SetVertexDeclaration(StaticDecl);
             reflectionSurvivors.Render(device, effect, effect, &ehTex0, nullptr, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT);
             return;
@@ -350,6 +379,7 @@ void DistantLand::renderReflectedStatics(const D3DXMATRIX* view, const D3DXMATRI
             DistantLand::cullReflectionSurvivors(ds_viewproj, ds_proj);
         }
 
+        logReflStaticNearFar(reflectionSurvivors, eye, diagCacheNearDist);
         device->SetVertexDeclaration(StaticDecl);
         reflectionSurvivors.Render(device, effect, effect, &ehTex0, nullptr, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT);
     } else {
@@ -360,6 +390,7 @@ void DistantLand::renderReflectedStatics(const D3DXMATRIX* view, const D3DXMATRI
         DistantLandShare::currentWorldSpace->VeryFarStatics->GetVisibleMeshes(range_frustum, viewsphere, visReflected);
         visReflected.SortByState();
 
+        logReflStaticNearFar(visReflected, eye, diagCacheNearDist);
         device->SetVertexDeclaration(StaticDecl);
         visReflected.Render(device, effect, effect, &ehTex0, nullptr, &ehHasVCol, &ehWorld, SIZEOFSTATICVERT);
     }

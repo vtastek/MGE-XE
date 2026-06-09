@@ -9,6 +9,7 @@
 #include "proxydx/devicelock.h"
 #include "scenegraph.h"
 #include "scenegraph_geometry_cache.h"
+#include "cachebounds.h"
 #include "support/log.h"
 #include "mge_tracy.h"
 
@@ -22,10 +23,24 @@
 // updateVisibleSet (the only writer) runs on the MAIN thread — msoc.dll fires the
 // callback from inside the engine's drainPendingDisplays — so a main-thread
 // snapshot at kick cannot race it.
+//
+// NOTE: as of the early-deterministic-cull work these no longer drive the cache
+// depth/opaque paths (those consume s_frustumVisibleKeys, built this frame). Kept
+// because the lagged engine-MSOC verdict still feeds the distant-statics path and
+// is the foundation for Phase 3 (an early MGE-driven MSOC mask over the cache).
 static std::unordered_set<uint32_t> s_visibleKeys;
 static std::unordered_set<uint32_t> s_prevVisibleKeys;
 
-// Render-thread snapshot of s_prevVisibleKeys, populated on the main thread at
+// Deterministic, current-frame frustum-culled visible set over the full cacheMap,
+// built in the early stage (frameSetupEarly, after the cache walk) by
+// buildFrustumVisibleSet. This is the set MGE owns: the cache depth pre-pass and
+// the cache opaque color pass both drive off it, so leading-edge tiles a pan
+// reveals THIS frame get depth (no sky holes) and an empty engine-MSOC set no
+// longer collapses the depth pass to an unculled full-cache draw. Frustum-only
+// (no occlusion yet — Phase 3 adds the early MGE-driven MSOC mask).
+static std::vector<uint32_t> s_frustumVisibleKeys;
+
+// Render-thread snapshot of s_frustumVisibleKeys, populated on the main thread at
 // kick (snapshotVisibleKeysForThread) and read by the worker job. Decouples the
 // job from any later main-thread mutation of the set.
 static std::vector<uint32_t> s_threadVisibleKeys;
@@ -40,6 +55,47 @@ void DistantLand::updateVisibleSet(void* const* shapes, int count) {
 
 const std::unordered_set<uint32_t>& DistantLand::visibleCacheKeys() {
     return s_prevVisibleKeys;
+}
+
+// buildFrustumVisibleSet - deterministic current-frame frustum cull over the full
+// GeometryCache, producing s_frustumVisibleKeys. Called EARLY (frameSetupEarly,
+// right after the cache walk) on the IPC path, and at the renderDepth walk site on
+// the non-IPC path, so every path gets a current-frame visible set instead of the
+// frame-lagged engine-MSOC verdict.
+//
+// Frustum is built from the game view*proj (the camera the engine itself culls
+// against). The depth pre-pass draws the result with the far-extended distant
+// projection, but that only widens the near/far Z mapping — the lateral planes are
+// identical, so the game-proj frustum is the correct (and slightly conservative on
+// far) cull for near-field cache geometry. Includes terrain (isLandscape) and
+// alpha-blended entries because the depth pass records them too; per-pass filtering
+// (skinned vs not, blend, etc.) stays at the draw site. Skinned entries with no
+// usable palette are excluded here — they're never drawn and would trip the bound
+// helper (div-by-zero / pts[] overrun); see cachebounds.h.
+void DistantLand::buildFrustumVisibleSet(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
+    MGE_ZoneScopedN("buildFrustumVisibleSet");
+    s_frustumVisibleKeys.clear();
+
+    const auto& cacheMap = MGE::GeometryCache::cache();
+    if (cacheMap.empty()) return;
+
+    D3DXMATRIX viewproj;
+    D3DXMatrixMultiply(&viewproj, view, proj);
+    ViewFrustum frustum(&viewproj);
+
+    s_frustumVisibleKeys.reserve(cacheMap.size());
+    for (const auto& kv : cacheMap) {
+        const auto& e = kv.second;
+        BoundingSphere bs;
+        if (e.isSkinned) {
+            if (e.skinnedUnsupported || e.numBones == 0) continue;
+            cacheSkinnedWorldBounds(e, bs.center, bs.radius);
+        } else {
+            cacheWorldBounds(e, bs.center, bs.radius);
+        }
+        if (frustum.ContainsSphere(bs) == ViewFrustum::OUTSIDE) continue;
+        s_frustumVisibleKeys.push_back(kv.first);
+    }
 }
 
 
@@ -95,6 +151,11 @@ void DistantLand::renderDepth() {
         // skipped on the threaded path — the worker did the cache pass.)
         if (!earlyWalkedCache) {
             MGE::GeometryCache::onFrameReady(MGE::SceneGraph::getDataHandler());
+            // Non-IPC / menu / not-ready fallback: frameSetupEarly didn't run the
+            // early walk, so it didn't build the frustum-visible set either. Build
+            // it here (after the walk, before the consume) so this path drives off
+            // the same deterministic current-frame set as the IPC/threaded paths.
+            buildFrustumVisibleSet(&mwView, &mwProj);
         }
         {
             MGE_SCOPED_TIMER("renderDepth:cache");
@@ -134,6 +195,7 @@ void DistantLand::renderDepth() {
             {
                 MGE_ZoneScopedN("renderDepth:statics");
                 MGE_SCOPED_TIMER("renderDepth:statics");
+                DrawStats::ScopedStage _ds(DrawStats::DepthStatics);
                 effectDepth->BeginPass(PASS_RENDERSTATICSDEPTH);
                 device->SetVertexDeclaration(StaticDecl);
                 // Cull-then-sort: iterate the compacted survivor set (occluded
@@ -237,11 +299,14 @@ void DistantLand::renderDepthRecorded() {
 void DistantLand::renderDepthFromCache(const D3DXMATRIX* gameView,
                                        const std::vector<uint32_t>* visibleOverride) {
     MGE_ZoneScopedN("renderDepthFromCache");
+    // Cache-geometry depth draws bucket separately from the distant-land depth
+    // replays so cache-depth (frustum-only post-Phase-1) can be compared directly
+    // against the MSOC-culled scene0. Counter is thread_local-stage safe (render
+    // thread vs main both push their own g_stage; the shared array tolerates it).
+    DrawStats::ScopedStage _dsCache(DrawStats::DepthCache);
 
     const float solidThreshold = 0.499f;
     const auto& cacheMap = MGE::GeometryCache::cache();
-    const bool useVisibleSet = visibleOverride ? !visibleOverride->empty()
-                                               : !s_prevVisibleKeys.empty();
 
     auto bindMaterial = [&](const MGE::GeometryCache::CachedGeometry& e) {
         bool alphaDependent = e.alphaTest || e.blendEnable;
@@ -264,21 +329,16 @@ void DistantLand::renderDepthFromCache(const D3DXMATRIX* gameView,
         device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
     };
 
+    // Iterate the deterministic current-frame frustum-visible set (built early by
+    // buildFrustumVisibleSet): s_frustumVisibleKeys for the serial path, or the
+    // render-thread snapshot of it (visibleOverride) for the threaded job. No
+    // full-cache fallback — an empty set means nothing is in frustum, which is the
+    // correct verdict (replaces the old s_prevVisibleKeys / unculled-cache branch).
+    const std::vector<uint32_t>& keys = visibleOverride ? *visibleOverride : s_frustumVisibleKeys;
     auto forEach = [&](auto&& fn) {
-        if (useVisibleSet) {
-            if (visibleOverride) {
-                for (uint32_t key : *visibleOverride) {
-                    auto it = cacheMap.find(key);
-                    if (it != cacheMap.end()) fn(it->second);
-                }
-            } else {
-                for (uint32_t key : s_prevVisibleKeys) {
-                    auto it = cacheMap.find(key);
-                    if (it != cacheMap.end()) fn(it->second);
-                }
-            }
-        } else {
-            for (const auto& kv : cacheMap) fn(kv.second);
+        for (uint32_t key : keys) {
+            auto it = cacheMap.find(key);
+            if (it != cacheMap.end()) fn(it->second);
         }
     };
 
@@ -336,12 +396,13 @@ void DistantLand::renderDepthFromCache(const D3DXMATRIX* gameView,
     effect->SetFloat(ehAlphaRef, -1.0f);
 }
 
-// snapshotVisibleKeysForThread - copy the live visible-key set into the
-// render-thread snapshot. MAIN THREAD ONLY (updateVisibleSet, the only writer of
-// s_prevVisibleKeys, also runs on the main thread), called at kick before the
-// worker reads it.
+// snapshotVisibleKeysForThread - copy the early frustum-visible set into the
+// render-thread snapshot. MAIN THREAD ONLY, called at kick (frameSetupEarly, right
+// after buildFrustumVisibleSet) before the worker reads it. s_frustumVisibleKeys is
+// only rewritten by the next frame's buildFrustumVisibleSet, which runs after the
+// job is fenced (renderStage0), so the snapshot also decouples the job from that.
 void DistantLand::snapshotVisibleKeysForThread() {
-    s_threadVisibleKeys.assign(s_prevVisibleKeys.begin(), s_prevVisibleKeys.end());
+    s_threadVisibleKeys.assign(s_frustumVisibleKeys.begin(), s_frustumVisibleKeys.end());
 }
 
 // renderThreadDepthCacheJob - Phase 1 render-thread payload.

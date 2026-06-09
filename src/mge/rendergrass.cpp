@@ -154,6 +154,7 @@ void DistantLand::renderGrassInst() {
 // renderGrassInstZ - Z only pass
 void DistantLand::renderGrassInstZ() {
     MGE_SCOPED_TIMER("renderGrassInstZ");
+    DrawStats::ScopedStage _ds(DrawStats::DepthGrass);   // distant-land grass depth replay
     if (!hasVisibleGrass()) {
         return;
     }

@@ -677,6 +677,7 @@ void DistantLand::shutdownHorizonWorkspace() {
 
 void DistantLand::renderDistantLandZ() {
     MGE_SCOPED_TIMER("renderDistantLandZ");
+    DrawStats::ScopedStage _ds(DrawStats::DepthLand);   // distant-land depth replay
     D3DXMATRIX world;
 
     D3DXMatrixIdentity(&world);

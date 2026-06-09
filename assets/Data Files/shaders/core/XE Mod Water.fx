@@ -3,6 +3,12 @@
 // MGE XE 0.16.0
 // Water plane rendering. Can be used as a core mod.
 
+// DEBUG (vtastek): when 1, WaterPS early-returns the raw reflection RT sampled at
+// the flat screen position — undistorted (no ripple reffactor) and without the
+// water fog/fresnel/specular mix — so the reflection contents (e.g. cache terrain)
+// can be inspected directly. Set to 0 to restore normal water shading.
+#define DEBUG_REFLECTION_RAW 0
+
 
 //------------------------------------------------------------
 // Samplers, clamping mode
@@ -224,6 +230,12 @@ float4 WaterPS(in WaterVertOut IN): COLOR0
 #else
     float4 screenpos = IN.screenposclamp;
 #endif
+
+#if DEBUG_REFLECTION_RAW
+    // Raw reflection inspection: flat-position sample, no distortion/fog/fresnel.
+    return float4(getProjectedReflection(screenpos), 1);
+#endif
+
     float4 reflectedPos = screenpos - float4(2.1 * reffactor.x, -abs(reffactor.y), 0, 0);
     reflectedPos.xy = lerp(reflectedPos.xy, screenpos.xy, reflectionOcclusionAt(reflectedPos, IN.screenpos.w));
     float3 reflected = getProjectedReflection(reflectedPos);

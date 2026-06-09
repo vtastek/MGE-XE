@@ -453,7 +453,13 @@ public:
     // set concurrently with updateVisibleSet.
     static void renderDepthFromCache(const D3DXMATRIX* gameView,
                                      const std::vector<uint32_t>* visibleOverride = nullptr);
-    // Copy s_prevVisibleKeys into the render-thread snapshot. Main-thread only,
+    // Build the deterministic current-frame frustum-visible set (s_frustumVisibleKeys)
+    // over the full GeometryCache, from the game view*proj. Called early
+    // (frameSetupEarly, after the cache walk) on the IPC path and at the renderDepth
+    // walk site on the non-IPC path. The cache depth + opaque color passes drive off
+    // this set instead of the frame-lagged engine-MSOC verdict. Frustum-only (Phase 1).
+    static void buildFrustumVisibleSet(const D3DXMATRIX* view, const D3DXMATRIX* proj);
+    // Copy s_frustumVisibleKeys into the render-thread snapshot. Main-thread only,
     // called at kick (frameSetupEarly) before the job can read it.
     static void snapshotVisibleKeysForThread();
     // Render-thread depth-cache job: under the device lock, save full device
@@ -464,10 +470,10 @@ public:
     static void renderThreadDepthCacheJob();
     static void updateVisibleSet(void* const* shapes, int count);
     // The main-view MSOC visible set (s_prevVisibleKeys), keyed on
-    // NiTriBasedGeometry* == GeometryCache keys. Exposed so the cache-driven
-    // opaque color pass can iterate exactly the engine-submitted on-screen set
-    // (the same set the depth pass uses) instead of an independent frustum cull,
-    // which kept color in lockstep with depth and the reactive engine path.
+    // NiTriBasedGeometry* == GeometryCache keys. No longer drives the cache
+    // depth/opaque paths (they consume the early frustum set, buildFrustumVisibleSet)
+    // — kept for the distant-statics path and as the foundation for Phase 3 (an
+    // early MGE-driven MSOC mask over the cache, replacing this lagged verdict).
     static const std::unordered_set<uint32_t>& visibleCacheKeys();
 
     static void renderShadowMap();
