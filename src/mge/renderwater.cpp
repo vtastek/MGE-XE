@@ -195,23 +195,25 @@ void DistantLand::renderWaterReflection(const D3DXMATRIX* view, const D3DXMATRIX
     // clip-plane setup, after distant statics. renderMorrowind manages its own
     // effectFFE bracket (the distant-land effect is mid-Begin but not in a pass
     // here). No-op when the snapshot cache is empty/disabled.
-    renderReflectionsFromCache(&reflView, &reflProj, cacheNearDist);
-
-    // Apply sun shadows to the cache reflection objects + terrain (world-space
-    // shadow map, reflected lookup). Runs after the cache color so it darkens the
-    // drawn pixels; distance-faded by the receiver's built-in fog attenuation.
     //
-    // The receiver gates/scales by surface lit-ness dot(normal, -sunVecView). The
+    // Sun shadows are folded INTO this color pass (the applyCacheShadow branch in
+    // XE FixedFuncEmu.fx): each fragment computes its receiver term inline, which
+    // replaces the standalone renderReflectionShadowsFromCache re-draw of the same
+    // geometry (~1000 draws/frame). Reflected cache TERRAIN lost its receiver
+    // re-draw with that pass (its color comes from the distant-land effect, not
+    // FFE) — accepted for now; the DL LOD beyond the handover never had shadows.
+    //
+    // The fold gates/scales by surface lit-ness dot(normal, -sunVecView). The
     // cache geometry is rasterized in REFLECTED-view space (normals * reflView), so
     // sunVecView must be the sun in reflected-view space too — otherwise the dot is
-    // inconsistent and flat up-facing surfaces (terrain) fail the lit-ness clip and
-    // receive no shadow. setupCommonEffect set the main-view sun; swap to the
-    // reflected sun for this pass, then restore for the rest of the frame.
+    // inconsistent and flat up-facing surfaces fail the lit-ness term and receive
+    // no shadow. setupCommonEffect set the main-view sun; swap to the reflected
+    // sun for this pass, then restore for the rest of the frame.
     D3DXVECTOR3 sunVecViewRefl, sunVecViewMain;
     D3DXVec3TransformNormal(&sunVecViewRefl, reinterpret_cast<const D3DXVECTOR3*>(&sunVec), &reflView);
     D3DXVec3TransformNormal(&sunVecViewMain, reinterpret_cast<const D3DXVECTOR3*>(&sunVec), view);
     effect->SetFloatArray(ehSunVecView, sunVecViewRefl, 3);
-    renderReflectionShadowsFromCache(&reflView, &reflProj, cacheNearDist);
+    renderReflectionsFromCache(&reflView, &reflProj, cacheNearDist);
     effect->SetFloatArray(ehSunVecView, sunVecViewMain, 3);   // restore for later passes
 
     // Restore pass-all so the cache color shader (shared with the main reactive

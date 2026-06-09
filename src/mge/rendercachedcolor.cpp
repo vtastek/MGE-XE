@@ -154,6 +154,23 @@ void DistantLand::renderReflectionsFromCache(const D3DXMATRIX* view, const D3DXM
     device->SetRenderState(D3DRS_ZENABLE, TRUE);
     device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
 
+    // Sun shadow fold: the FFE color shader samples the shadow atlas inline
+    // (applyCacheShadow branch in PerPixelPS), replacing the standalone
+    // renderReflectionShadowsFromCache receiver re-draw of this same object set.
+    // The sun shadow map is world-space and the cache objects rasterize in
+    // reflected view space, so bind reflected-view -> world (inverse reflView) ->
+    // shadow clip, exactly as the standalone pass built it. shadowViewProj and
+    // shadowReflMult are `shared` pool params: set on the distant-land effect,
+    // read by the FFE variants. The caller has already bound the reflected-view
+    // sunVecView (the fold's lit-ness gate needs the sun in the same space as
+    // the rasterized normals).
+    D3DXMATRIX invView, viewToShadow[2];
+    D3DXMatrixInverse(&invView, nullptr, view);
+    viewToShadow[0] = invView * smViewproj[0];
+    viewToShadow[1] = invView * smViewproj[1];
+    effect->SetMatrixArray(ehShadowViewproj, viewToShadow, 2);
+    FixedFunctionShader::setCacheShadow(texSoftShadow, true);
+
     RenderedState rs;
     FragmentState frs;
     static LightState lightrs;   // holds maps; reused to avoid per-draw realloc
@@ -245,6 +262,11 @@ void DistantLand::renderReflectionsFromCache(const D3DXMATRIX* view, const D3DXM
         // Point-light fade toward the static handover (matches the shadow fade).
         const float plMult = cacheHandoverFade(center, eye, e.dynamicHint, nearDist);
 
+        // Shadow handover fade rides the SAME per-object fade (shared
+        // shadowReflMult, read by the FFE shadow fold), so shadows and point
+        // lights ramp together and land exactly on the geometry handover.
+        effect->SetFloat(ehShadowReflMult, plMult);
+
         // Reflection base winding is inverted (CCW); a mirrored part flips again.
         device->SetRenderState(D3DRS_CULLMODE, e.mirrored ? D3DCULL_CW : D3DCULL_CCW);
         device->SetTexture(0, e.d3dTexture);
@@ -263,6 +285,11 @@ void DistantLand::renderReflectionsFromCache(const D3DXMATRIX* view, const D3DXM
             FixedFunctionShader::renderMorrowind(&rs, &frs, &lightrs, plMult, nullptr, 0, nullptr, &lbMin, &lbMax);
         }
     }
+
+    // Shadow fold off + full receiver strength for everything after this pass
+    // (the main scene shares the FFE shader; gate must never leak).
+    effect->SetFloat(ehShadowReflMult, 1.0f);
+    FixedFunctionShader::setCacheShadow(nullptr, false);
 
     constexpr unsigned kIv = 300;
     if (logPerf && (++s_calls % kIv == 0)) {
@@ -426,6 +453,11 @@ void DistantLand::renderCachedOpaque(const D3DXMATRIX* view, const D3DXMATRIX* p
     }
 }
 
+// NOTE: no longer invoked — the reflection sun shadow is folded into the FFE color
+// pass (applyCacheShadow in XE FixedFuncEmu.fx; see renderReflectionsFromCache).
+// Kept because PASS_RENDERSHADOWFFE/_SKINNED are still used by the main-view
+// receiver (renderShadowReceiverFromCache) and as the reference implementation of
+// the standalone receiver math the fold mirrors.
 void DistantLand::renderReflectionShadowsFromCache(const D3DXMATRIX* view, const D3DXMATRIX* proj, float nearDist) {
     MGE_ZoneScopedN("renderReflectionShadowsFromCache");
     DrawStats::ScopedStage _ds(DrawStats::ReflCacheShadow);   // cache objects' shadow re-draw
@@ -616,6 +648,27 @@ void DistantLand::renderReflectionTerrainFromCache(const D3DXMATRIX* view, const
     // under the P16-bound layout pins reflProj into whatever register P16 actually reads.
     effect->SetMatrix(ehProj, proj);
 
+    // Sun shadow fold inputs (CacheTerrainReflLitPS darkens shadowed fragments
+    // inline, mirroring the FFE object fold — the standalone terrain receiver
+    // re-draw went away with renderReflectionShadowsFromCache). Same P16 lesson
+    // as ehProj above: this pass now reads shadowViewProj / sunVecView /
+    // shadowReflMult / tex3, so set every one of them under the P16 layout.
+    // World-space shadow map, reflected-view pixels: reflected-view -> world
+    // (inverse reflView) -> shadow clip. The atlas rides sampDepth (tex3) here —
+    // no conflict, terrain uses tex0/tex2 only. sunVecView must be the sun in
+    // reflected-view space (the lit-ness dot uses rasterized reflView normals);
+    // the cache object pass re-binds it and renderWaterReflection restores the
+    // main-view sun afterwards.
+    D3DXMATRIX invView, viewToShadow[2];
+    D3DXMatrixInverse(&invView, nullptr, view);
+    viewToShadow[0] = invView * smViewproj[0];
+    viewToShadow[1] = invView * smViewproj[1];
+    effect->SetMatrixArray(ehShadowViewproj, viewToShadow, 2);
+    effect->SetTexture(ehTex3, texSoftShadow);
+    D3DXVECTOR3 sunVecViewRefl;
+    D3DXVec3TransformNormal(&sunVecViewRefl, reinterpret_cast<const D3DXVECTOR3*>(&sunVec), view);
+    effect->SetFloatArray(ehSunVecView, sunVecViewRefl, 3);
+
     MGE::SceneGraph::SnapshotReadLock snapshotLock;
     const auto& snapshotLights = MGE::SceneGraph::pointLights();
     const unsigned int snapshotCount =
@@ -653,6 +706,10 @@ void DistantLand::renderReflectionTerrainFromCache(const D3DXMATRIX* view, const
         effect->SetVector(ehLightDataParams, &lightDataParams_v);
         if (lightCount > 0) effect->SetVectorArray(ehLightIndices, (D3DXVECTOR4*)idxFloats, 8);
 
+        // Shadow handover fade: same per-patch metric the standalone terrain
+        // receiver used (world-space patch center; DL LOD beyond has no shadows).
+        effect->SetFloat(ehShadowReflMult, cacheHandoverFade(bs.center, eye, e.dynamicHint, nearDist));
+
         effect->SetMatrix(ehWorld, reinterpret_cast<const D3DXMATRIX*>(e.worldTransformD3D));
         effect->SetTexture(ehTex0, e.d3dTexture);
         // No overlay -> bind base to tex2 so lerp(base, base, a) == base.
@@ -672,6 +729,9 @@ void DistantLand::renderReflectionTerrainFromCache(const D3DXMATRIX* view, const
         device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, e.vertexCount, 0, e.triangleCount);
     }
     effect->EndPass();
+
+    // Full receiver strength for everything after this pass (shared param).
+    effect->SetFloat(ehShadowReflMult, 1.0f);
 }
 
 // renderCachedTerrain - main-view sibling of renderReflectionTerrainFromCache.

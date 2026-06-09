@@ -38,6 +38,7 @@ D3DXHANDLE FixedFunctionShader::ehLightFalloffQuadratic, FixedFunctionShader::eh
 D3DXHANDLE FixedFunctionShader::ehTexLightData, FixedFunctionShader::ehLightDataParams, FixedFunctionShader::ehLightIndices, FixedFunctionShader::ehTexLightView;
 D3DXHANDLE FixedFunctionShader::ehTexgenTransform, FixedFunctionShader::ehBumpMatrix, FixedFunctionShader::ehBumpLumiScaleBias;
 D3DXHANDLE FixedFunctionShader::ehPointLightMult;
+D3DXHANDLE FixedFunctionShader::ehShadowAtlas, FixedFunctionShader::ehApplyCacheShadow;
 
 float FixedFunctionShader::sunMultiplier, FixedFunctionShader::ambMultiplier;
 
@@ -115,6 +116,11 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
     ehTexgenTransform = effect->GetParameterByName(0, "texgenTransform");
     ehBumpMatrix = effect->GetParameterByName(0, "bumpMatrix");
     ehBumpLumiScaleBias = effect->GetParameterByName(0, "bumpLumiScaleBias");
+    ehShadowAtlas = effect->GetParameterByName(0, "texShadowAtlas");
+    ehApplyCacheShadow = effect->GetParameterByName(0, "applyCacheShadow");
+    // Explicit off at init so the main reactive scene never takes the shadow-fold
+    // branch until the cache reflection pass enables it (shared-pool param).
+    if (ehApplyCacheShadow) effect->SetBool(ehApplyCacheShadow, FALSE);
 
     effectDefaultPurple = effect;
     sunMultiplier = ambMultiplier = 1.0;
@@ -252,6 +258,13 @@ void FixedFunctionShader::precacheAsync() {
 void FixedFunctionShader::updateLighting(float sunMult, float ambMult) {
     sunMultiplier = sunMult;
     ambMultiplier = ambMult;
+}
+
+void FixedFunctionShader::setCacheShadow(IDirect3DTexture9* atlas, bool enable) {
+    // Set on any pooled FFE effect; `shared` params propagate to every variant.
+    if (!effectDefaultPurple) return;
+    if (ehShadowAtlas) effectDefaultPurple->SetTexture(ehShadowAtlas, atlas);
+    if (ehApplyCacheShadow) effectDefaultPurple->SetBool(ehApplyCacheShadow, enable ? TRUE : FALSE);
 }
 
 // selectTextureLights — revision-keyed texLightData upload + view-keyed frustum

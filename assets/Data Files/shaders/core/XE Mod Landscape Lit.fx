@@ -131,5 +131,41 @@ float4 CacheTerrainLitPS(CacheTerrainLitVertOut IN) : COLOR0 {
 // already outputs viewpos (= world*reflView) for the clip dot product.
 float4 CacheTerrainReflLitPS(CacheTerrainLitVertOut IN) : COLOR0 {
     clip(dot(float4(IN.viewpos, 1), reflWaterClipPlane));
-    return CacheTerrainLitPS(IN);
+    float4 c = CacheTerrainLitPS(IN);
+
+    // Sun shadow fold, mirroring the FFE object fold (applyCacheShadow in
+    // "XE FixedFuncEmu.fx") so reflected near terrain darkens like reflected
+    // objects — replaces the terrain receiver re-draw that went away with
+    // renderReflectionShadowsFromCache. This pass is reflection-only, so no
+    // gate is needed. Uses the receiver machinery from "XE Mod Shadow.fx"
+    // directly (sampDepth/tex3 holds the shadow atlas during this pass;
+    // unlike FFE there is no tex3 conflict — terrain uses tex0/tex2).
+    // shadowViewProj = reflected-view -> shadow clip and sunVecView = the
+    // reflected-view sun, bound by renderReflectionTerrainFromCache. Applied
+    // after tonemap + fog: the standalone receiver darkened the FINAL color
+    // (SrcBlend=Zero / DestBlend=InvSrcColor == c.rgb * (1 - v*shadecolor)).
+    // No vcol.a here: the splat factor must not modulate shadow strength
+    // (the standalone pass forced hasVCol=false for the same reason).
+    float4 shadow0pos = mul(float4(IN.viewpos, 1), shadowViewProj[0]);
+    float4 shadow1pos = mul(float4(IN.viewpos, 1), shadowViewProj[1]);
+    shadow0pos.z /= shadow0pos.w;
+    shadow1pos.z /= shadow1pos.w;
+
+    float lightT = shadowSunEstimate(saturate(dot(normalize(IN.viewnormal), -sunVecView)));
+    float fogatt = pow(fogMWScalar(length(IN.viewpos)), 2);
+    lightT *= isAboveSeaLevel(eyePos) ? fogatt : saturate(4 * fogatt);
+    // Per-patch cache->distant-land handover fade (DL LOD has no shadows).
+    lightT *= shadowReflMult;
+
+    // Shadowed fragments have NEGATIVE dz; shadowESM is exactly 0 for dz >= 0
+    // (the no-caster case), so no guard is needed.
+    float dz = shadowDeltaZ(shadow0pos, shadow1pos);
+    float v = shadowESM(dz) * lightT;
+
+    // Fade out shadows at map edges
+    float2 fade = saturate(25 * (1 - abs(shadow1pos.xy)));
+    v *= fade.x * fade.y;
+
+    c.rgb *= 1 - v * shadecolor;
+    return c;
 }

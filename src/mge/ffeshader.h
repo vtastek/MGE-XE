@@ -209,6 +209,8 @@ class FixedFunctionShader {
     static D3DXHANDLE ehTexLightData, ehLightDataParams, ehLightIndices, ehTexLightView;
     static D3DXHANDLE ehTexgenTransform, ehBumpMatrix, ehBumpLumiScaleBias;
     static D3DXHANDLE ehPointLightMult;
+    // Reflection-cache shadow fold (shadow atlas at s6 + applyCacheShadow gate)
+    static D3DXHANDLE ehShadowAtlas, ehApplyCacheShadow;
 
     static float sunMultiplier, ambMultiplier;
 
@@ -240,6 +242,14 @@ public:
                                    unsigned int snapshotCount, const D3DXMATRIX& view,
                                    const D3DXVECTOR3& bMin, const D3DXVECTOR3& bMax,
                                    float* idxFloats, bool logPerf);
+    // Reflection-cache shadow fold: bind the sun-shadow atlas (sampler s6) and the
+    // applyCacheShadow gate, shared-pool-propagated to every FFE variant. The cache
+    // reflection color pass enables this around its draw loop so PerPixelPS darkens
+    // shadowed fragments inline (replacing the separate receiver re-draw); disabled
+    // (default) the branch is never taken and the main scene is byte-identical.
+    // Caller binds shadowViewProj (reflected-view -> shadow clip), the reflected
+    // sunVecView and per-draw shadowReflMult on the distant-land effect (shared).
+    static void setCacheShadow(IDirect3DTexture9* atlas, bool enable);
     static IDirect3DTexture9* textureLightData() { return texLightData; }
     static unsigned int maxTexLights()      { return kMaxTexLights; }
     static float        texLightTexelSize() { return 1.0f / (float)(kTexelsPerLight * kMaxTexLights); }

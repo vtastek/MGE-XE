@@ -4,6 +4,9 @@
 // Replacement shaders for Morrowind's object rendering
 
 #include "XE Common.fx"
+// Shadow constants (shade/shadecolor/ESM_*) for the reflection-cache shadow fold
+// below. Constants only — the receiver VS/structs/samplers stay in XE Mod Shadow.fx.
+#include "XE Mod Shadow Data.fx"
 
 shared texture tex4, tex5;
 shared matrix worldview;
@@ -29,6 +32,84 @@ sampler sampFFE2 = sampler_state { texture = <tex2>; };
 sampler sampFFE3 = sampler_state { texture = <tex3>; };
 sampler sampFFE4 = sampler_state { texture = <tex4>; };
 sampler sampFFE5 = sampler_state { texture = <tex5>; };
+
+//------------------------------------------------------------
+// Reflection-cache sun shadow fold. The cache reflection color pass computes the
+// shadow receiver term inline (gated by applyCacheShadow), replacing the separate
+// darkening re-draw (PASS_RENDERSHADOWFFE) that submitted the same geometry twice.
+//
+// The shadow atlas CANNOT ride the receiver's sampDepth (tex3): FFE's sampFFE3
+// also reads tex3 for object texture stage 3. Dedicated shared texture + sampler
+// pinned at s6 instead — provably free (FFE uses s0-s5 for stages, s7 for
+// texLightData), same pattern as LightDataSampler below.
+//
+// The ESM atlas lookup is duplicated from XE Mod Shadow.fx (ffe- prefix, bound to
+// s6) rather than #including it (that would pull in sampDepth<-tex3 and the
+// receiver VS/structs). KEEP IN SYNC with shadowDeltaZ / shadowESM /
+// mapShadowToAtlas / shadowSunEstimate there.
+shared texture texShadowAtlas;
+sampler sampFFEShadow : register(s6) = sampler_state {
+    texture = <texShadowAtlas>;
+    minfilter = linear; magfilter = linear; mipfilter = none;
+    addressu = clamp; addressv = clamp;
+};
+// Default false => the main reactive scene never takes the branch and is
+// byte-identical. Set true only around the cache reflection color loop.
+shared bool applyCacheShadow;
+
+// Clip space margin of 4 texels (see XE Mod Shadow.fx atlasMargin).
+static float3 ffeAtlasMargin = float3(1 - 2*4*shadowRcpRes, 1 - 2*4*shadowRcpRes, 1);
+
+// Shadow UV to shadow atlas UV, for tex2Dlod.
+float4 ffeMapShadowToAtlas(float2 t, int layer) {
+    return float4(t.x * shadowCascadeSize + layer * shadowCascadeSize, t.y, 0, 0);
+}
+
+// Incoming vertex sunlight estimation (non-standard shadow luminance, for
+// contrast when ambient is high).
+float ffeShadowSunEstimate(float lambert) {
+    float x = lambert * dot(sunCol, float3(0.36, 0.53, 0.11));
+    x *= 0.25 + 0.75 * sunVis;
+    return x / (shade + x);
+}
+
+// 2 layer cascade ortho ESM lookup with the cascade-boundary blend band
+// (edge-flicker fix) — same structure as XE Mod Shadow.fx::shadowDeltaZ.
+float ffeShadowDeltaZ(float4 shadow0pos, float4 shadow1pos) {
+    float dz = 1e-6;
+
+    bool inC0 = all(saturate(ffeAtlasMargin - abs(shadow0pos.xyz)));
+    bool inC1 = all(saturate(ffeAtlasMargin - abs(shadow1pos.xyz)));
+
+    [branch] if(inC0) {
+        float2 c0UV = (0.5 + 0.5*shadowRcpRes) + float2(0.5, -0.5) * shadow0pos.xy;
+        float  dz0  = tex2Dlod(sampFFEShadow, ffeMapShadowToAtlas(c0UV, 0)).r / ESM_scale - shadow0pos.z;
+
+        float2      c0Out      = abs(shadow0pos.xy) / ffeAtlasMargin.xy;
+        float       c0OutMax   = max(c0Out.x, c0Out.y);
+        const float blendStart = 0.8;
+
+        [branch] if(c0OutMax > blendStart && inC1) {
+            float2 c1UV = (0.5 + 0.5*shadowRcpRes) + float2(0.5, -0.5) * shadow1pos.xy;
+            float  dz1  = tex2Dlod(sampFFEShadow, ffeMapShadowToAtlas(c1UV, 1)).r / ESM_scale - shadow1pos.z;
+            float  t    = smoothstep(blendStart, 1.0, c0OutMax);
+            dz = lerp(dz0, dz1, t);
+        }
+        else {
+            dz = dz0;
+        }
+    }
+    else if(inC1) {
+        float2 c1UV = (0.5 + 0.5*shadowRcpRes) + float2(0.5, -0.5) * shadow1pos.xy;
+        dz = tex2Dlod(sampFFEShadow, ffeMapShadowToAtlas(c1UV, 1)).r / ESM_scale - shadow1pos.z;
+    }
+
+    return dz;
+}
+
+float ffeShadowESM(float dz) {
+    return 1 - saturate(exp(ESM_c * dz + ESM_bias));
+}
 
 //------------------------------------------------------------
 
@@ -370,6 +451,39 @@ float4 PerPixelPS(FFEPixel IN) : COLOR0 {
     // Static tonemap and final fogging
     c.rgb = tonemap(c.rgb);
     /* template */ FFE_FOG_APPLICATION
+
+    // Reflection-cache sun shadow fold. Applied after tonemap + fog because the
+    // standalone receiver pass it replaces darkened the FINAL framebuffer color
+    // (SrcBlend=Zero / DestBlend=InvSrcColor == c.rgb * (1 - v*shadecolor)).
+    // No clip(): v = 0 makes the multiply a no-op on non-shadowed fragments.
+    // shadowViewProj is bound as reflected-view -> shadow clip, and sunVecView as
+    // the reflected-view sun, by the cache reflection pass before its draw loop.
+    [branch] if (applyCacheShadow) {
+        float4 shadow0pos = mul(float4(IN.viewpos, 1), shadowViewProj[0]);
+        float4 shadow1pos = mul(float4(IN.viewpos, 1), shadowViewProj[1]);
+        shadow0pos.z /= shadow0pos.w;
+        shadow1pos.z /= shadow1pos.w;
+
+        // Surface lit-ness estimate + fog attenuation (shadow darkness and
+        // distance fade), as shadowReceiverBody computes per vertex.
+        float lightT = ffeShadowSunEstimate(saturate(dot(normal, -sunVecView)));
+        float fogatt = pow(fogMWScalar(length(IN.viewpos)), 2);
+        lightT *= isAboveSeaLevel(eyePos) ? fogatt : saturate(4 * fogatt);
+        // Per-object cache->distant-land handover fade (1 in the main view).
+        lightT *= shadowReflMult;
+
+        // Shadowed fragments have NEGATIVE dz (dz = casterDepth - fragmentDepth;
+        // the standalone receiver keeps them via clip(-dz)). No guard needed:
+        // ffeShadowESM saturates to exactly 0 for dz >= 0 (the no-caster case).
+        float dz = ffeShadowDeltaZ(shadow0pos, shadow1pos);
+        float v = ffeShadowESM(dz) * lightT;
+
+        // Fade out shadows at map edges
+        float2 fade = saturate(25 * (1 - abs(shadow1pos.xy)));
+        v *= fade.x * fade.y;
+
+        c.rgb *= 1 - v * shadecolor;
+    }
 
     return c;
 }
