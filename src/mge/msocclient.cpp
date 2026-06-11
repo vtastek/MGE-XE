@@ -27,7 +27,10 @@ using FnAddPreTransformedOccluder = int  (__cdecl*)(
     const unsigned int* tris, int triCount);
 using FnRegisterVisGeom   = void (__cdecl*)(void(__cdecl*)(void* const*, const float*, int));
 using FnUnregisterVisGeom = void (__cdecl*)(void(__cdecl*)(void* const*, const float*, int));
+using FnRegisterOccGeom   = void (__cdecl*)(void(__cdecl*)(void* const*, const float*, int));
+using FnUnregisterOccGeom = void (__cdecl*)(void(__cdecl*)(void* const*, const float*, int));
 using FnCopyMask          = int  (__cdecl*)(void* dst, int dstBytes);
+using FnClassifyNow       = void (__cdecl*)(void* camera);
 
 HMODULE       g_module            = nullptr;
 FnIsMaskReady g_isMaskReady       = nullptr;
@@ -42,7 +45,10 @@ FnAddOccluder         g_addOccluder      = nullptr;  // optional
 FnAddPreTransformedOccluder g_addPreTransformedOccluder = nullptr;  // optional
 FnRegisterVisGeom     g_registerVisGeom   = nullptr;  // optional
 FnUnregisterVisGeom   g_unregisterVisGeom = nullptr;  // optional
+FnRegisterOccGeom     g_registerOccGeom   = nullptr;  // optional; occlusion refinement
+FnUnregisterOccGeom   g_unregisterOccGeom = nullptr;  // optional
 FnCopyMask            g_copyMask          = nullptr;  // optional; host-cull only
+FnClassifyNow         g_classifyNow       = nullptr;  // optional; Stage 2 early classify
 bool          g_probed             = false;
 
 // Frozen ABI codes from the plugin. Match PatchOcclusionCulling.h.
@@ -103,8 +109,14 @@ void MSOCClient::init() {
         GetProcAddress(g_module, "mwse_registerVisibleGeomCallback"));
     g_unregisterVisGeom = reinterpret_cast<FnUnregisterVisGeom>(
         GetProcAddress(g_module, "mwse_unregisterVisibleGeomCallback"));
+    g_registerOccGeom = reinterpret_cast<FnRegisterOccGeom>(
+        GetProcAddress(g_module, "mwse_registerOccludedGeomCallback"));
+    g_unregisterOccGeom = reinterpret_cast<FnUnregisterOccGeom>(
+        GetProcAddress(g_module, "mwse_unregisterOccludedGeomCallback"));
     g_copyMask = reinterpret_cast<FnCopyMask>(
         GetProcAddress(g_module, "mwse_copyOcclusionMask"));
+    g_classifyNow = reinterpret_cast<FnClassifyNow>(
+        GetProcAddress(g_module, "mwse_classifyMainSceneNow"));
 
     if (!g_isMaskReady || !g_testSphere) {
         LOG::logline("-- MSOC: msoc.dll loaded but required exports missing; disabling");
@@ -122,7 +134,10 @@ void MSOCClient::init() {
         g_addPreTransformedOccluder = nullptr;
         g_registerVisGeom = nullptr;
         g_unregisterVisGeom = nullptr;
+        g_registerOccGeom = nullptr;
+        g_unregisterOccGeom = nullptr;
         g_copyMask = nullptr;
+        g_classifyNow = nullptr;
         return;
     }
 
@@ -292,6 +307,31 @@ bool MSOCClient::unregisterVisibleGeomCallback(FnVisibleGeomCallback cb) {
     if (!g_unregisterVisGeom || !cb) return false;
     g_unregisterVisGeom(cb);
     return true;
+}
+
+bool MSOCClient::registerOccludedGeomCallback(FnVisibleGeomCallback cb) {
+    if (!g_registerOccGeom || !cb) return false;
+    g_registerOccGeom(cb);
+    return true;
+}
+
+bool MSOCClient::unregisterOccludedGeomCallback(FnVisibleGeomCallback cb) {
+    if (!g_unregisterOccGeom || !cb) return false;
+    g_unregisterOccGeom(cb);
+    return true;
+}
+
+bool MSOCClient::hasOccludedGeomCallback() {
+    return g_registerOccGeom != nullptr;
+}
+
+void MSOCClient::classifyMainSceneNow(void* camera) {
+    if (!g_classifyNow) return;
+    g_classifyNow(camera);
+}
+
+bool MSOCClient::hasEarlyClassify() {
+    return g_classifyNow != nullptr;
 }
 
 bool MSOCClient::hasMaskExport() {

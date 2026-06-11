@@ -57,7 +57,8 @@ void DrawStats::logFrame() {
             "depth=%u(cache=%u land=%u stat=%u grass=%u misc=%u) "
             "shadow=%u(cache=%u dl=%u misc=%u) "
             "refl=%u(dl.stat=%u cache=%u[color=%u shadow=%u terr=%u] misc=%u)  "
-            "DL=%u(land=%u statics=%u grass=%u water=%u sky=%u)  post=%u dbg=%u other=%u",
+            "DL=%u(land=%u statics=%u grass=%u water=%u sky=%u)  post=%u dbg=%u other=%u  "
+            "cacheOccCull=%u",
             totalCalls,
             scene, g_calls[Scene0], g_calls[Scene1], g_calls[Scene2], g_calls[UI], pre,
             depth, g_calls[DepthCache], g_calls[DepthLand], g_calls[DepthStatics], g_calls[DepthGrass], g_calls[Depth],
@@ -65,7 +66,8 @@ void DrawStats::logFrame() {
             refl, g_calls[ReflStatics], reflCache,
             g_calls[ReflCacheColor], g_calls[ReflCacheShadow], g_calls[ReflCacheTerrain], g_calls[Reflection],
             dl, g_calls[Land], g_calls[Statics], g_calls[Grass], g_calls[Water], g_calls[Sky],
-            g_calls[Post], g_calls[Debug], g_calls[Other]);
+            g_calls[Post], g_calls[Debug], g_calls[Other],
+            DistantLand::lastRefineCulled());
     }
 
     reset();

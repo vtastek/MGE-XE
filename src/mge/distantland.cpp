@@ -116,15 +116,24 @@ void DistantLand::frameSetupEarly() {
         MGE::GeometryCache::onFrameReady(MGE::SceneGraph::getDataHandler());
         earlyWalkedCache = true;
 
-        // Build the deterministic, current-frame frustum-visible set over the fresh
-        // cache, using the camera read above (mwView/mwProj). This is the set MGE
-        // now owns: the depth pre-pass (renderDepthFromCache) and the cache opaque
-        // color pass both consume it instead of the plugin's frame-lagged engine-MSOC
-        // verdict — so leading-edge tiles a pan reveals this frame get depth (no sky
-        // holes) and an MSOC-off frame stays frustum-culled (no 14.6ms unculled draw).
-        // Must run before snapshotVisibleKeysForThread (the render-thread job reads a
-        // snapshot of it). ~0.4ms (reflection paths prove full-cache frustum cost),
-        // overlapping the sky window. Frustum-only here; Phase 3 adds occlusion.
+        // Stage 2 early classify. Ask the plugin to run the engine's world-camera
+        // occlusion classify NOW (before the engine's own renderMainScene CullShow), so
+        // the visible/occluded callbacks fire with the CURRENT-frame set. The plugin's
+        // natural scene-0 CullShow then only displays the survivors. Must run before
+        // buildFrustumVisibleSet (which consumes the result) and before the render-thread
+        // kick (so the snapshot below captures the engine-set). Null camera = plugin
+        // resolves the world camera. No-op (frustum cull stands) if the plugin predates
+        // the export or self-declines (root unverified, scene disabled).
+        earlyClassifyMainScene(nullptr);
+
+        // Build the current-frame visible set over the fresh cache, using the camera
+        // read above (mwView/mwProj). This is the set MGE owns: the depth pre-pass
+        // (renderDepthFromCache) and the cache opaque color pass both consume it. When
+        // the early classify ran (engine-set mode), it is the engine's exact drawn set
+        // (occlusion-culled); otherwise it is the frustum cull (optionally MSOC-refined)
+        // — either way current-frame, so leading-edge tiles a pan reveals get depth (no
+        // sky holes). Must run before snapshotVisibleKeysForThread (the render-thread
+        // job reads a snapshot of it). ~0.4ms, overlapping the sky window.
         buildFrustumVisibleSet(&mwView, &mwProj);
 
         // Kick the render-thread depth-cache job now — after the geometry-cache
@@ -230,6 +239,13 @@ void DistantLand::renderStage0() {
         cacheOpaqueMode = !cacheOpaqueMode;
         StatusOverlay::setStatus(cacheOpaqueMode
             ? "Opaque source: CACHE (MGE-driven)" : "Opaque source: ENGINE (reactive)");
+    }
+
+    // A/B the MSOC occlusion refinement of the cache visible set (depth + opaque).
+    if (GetAsyncKeyState(VK_NUMPAD4) & 0x0001) {
+        refineCacheCullWithMSOC = !refineCacheCullWithMSOC;
+        StatusOverlay::setStatus(refineCacheCullWithMSOC
+            ? "Cache cull: FRUSTUM + MSOC occlusion" : "Cache cull: FRUSTUM only");
     }
 
     if (!isRenderCached) {

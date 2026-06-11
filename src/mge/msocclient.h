@@ -150,4 +150,30 @@ public:
     // Returns false if the plugin is absent or doesn't export the symbol.
     static bool registerVisibleGeomCallback(FnVisibleGeomCallback cb);
     static bool unregisterVisibleGeomCallback(FnVisibleGeomCallback cb);
+
+    // Complement of the visible-geom callback: receives the nodes MSOC proved
+    // OCCLUDED this frame (same signature/timing). Used to SUBTRACT the engine's
+    // positive occlusion verdict from MGE's own deterministic cache visible set
+    // (occlusion refinement). Returns false if the plugin is absent or predates the
+    // export (older msoc.dll) — refinement then stays off, frustum-only behavior.
+    static bool registerOccludedGeomCallback(FnVisibleGeomCallback cb);
+    static bool unregisterOccludedGeomCallback(FnVisibleGeomCallback cb);
+
+    // True if the loaded plugin exports the occluded-geom callback (i.e. occlusion
+    // refinement of the cache set is available). False on absent/old plugin.
+    static bool hasOccludedGeomCallback();
+
+    // Stage 2 early classify. Ask the plugin to run the main world-camera occlusion
+    // classify NOW — build the mask and fire the visible/occluded callbacks — so the
+    // current-frame verdicts are ready for MGE's depth pre-pass, while the engine's
+    // own scene-0 CullShow only displays the survivors. Call once per frame at
+    // BeginScene(0), before buildFrustumVisibleSet. Pass the world camera or nullptr
+    // (the plugin resolves it internally). No-op if the plugin is absent / predates
+    // the export, or the plugin's own guards decline (root not yet confirmed, scene
+    // disabled, menu) — in which case the in-engine classify path runs as before.
+    static void classifyMainSceneNow(void* camera);
+
+    // True if the loaded plugin exports the early-classify entrypoint (i.e. Stage 2 is
+    // available). False on absent/old plugin — the frustum cull path then stands.
+    static bool hasEarlyClassify();
 };

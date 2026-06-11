@@ -49,6 +49,11 @@ namespace MGE::GeometryCache {
         // texture splatting we don't synthesize yet (Phase 2); it stays on the
         // distant-land reflection path. Depth/shadow ignore this flag.
         bool     isLandscape;
+        // True for entries walked from worldPickObjectRoot (dropped items, projectiles
+        // etc.). That root is NOT traversed by the engine's world-camera occlusion
+        // classify, so the Stage 2 engine-set cache cull keeps these via frustum
+        // instead of dropping them for absence from the world classify.
+        bool     isPickRoot;
         // Material (pointers into NI memory — valid for the session)
         IDirect3DTexture9* d3dTexture;  // null if no base texture
         // Terrain decal overlay (TexturingProperty maps[6] = DECAL_1): the second

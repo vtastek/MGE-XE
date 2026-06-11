@@ -354,26 +354,23 @@ void DistantLand::renderCachedOpaque(const D3DXMATRIX* view, const D3DXMATRIX* p
     device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
     device->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
 
-    // Deterministic current-frame frustum cull over the full cache. Previously this
-    // iterated the engine-submitted MSOC set (s_prevVisibleKeys) and only frustum-
-    // culled in the empty-set fallback; that set lags a frame (the plugin builds it
-    // late, during the engine's near cullShow) and empties entirely when MSOC is off,
-    // collapsing to an unculled full-cache draw. The depth pre-pass now drives off
-    // the same early frustum-visible set (buildFrustumVisibleSet); promoting the
-    // per-part frustum test to always-on keeps this color pass in lockstep with it,
-    // current-frame, and independent of MSOC. The earlier worry (a close hand getting
-    // rejected) was about the reflected camera's tighter frustum — the main-view
-    // frustum here is the camera the engine itself culls against, so close parts pass.
-    D3DXMATRIX viewproj;
-    D3DXMatrixMultiply(&viewproj, view, proj);
-    ViewFrustum frustum(&viewproj);
+    // Consume the SAME deterministic set the depth pre-pass drove off this frame
+    // (frustumVisibleKeys / buildFrustumVisibleSet) rather than re-culling per part.
+    // This keeps the color pass byte-for-byte in lockstep with depth — including any
+    // MSOC occlusion refinement buildFrustumVisibleSet applied — so a refined-away
+    // static is absent from BOTH depth and color (no lit-but-no-depth or vice versa).
+    // The set is built from the game view*proj (the camera the engine culls against);
+    // the lateral planes match this pass's projection, so close parts/hands/belts that
+    // pass the engine's cull are in the set. drawEntry still applies the per-pass
+    // material filters (blend / untextured / terrain / unsupported-skin) below.
+    const std::vector<uint32_t>& visKeys = frustumVisibleKeys();
 
     // Diagnostics (gated on LogDistantPipeline): per-interval skip accounting so we
     // can see which covered-but-skipped parts the engine suppression would drop.
     // skinnedUnsupported (>kMaxBones armor like full-skeleton belts) is the prime
     // suspect for "missing on multiple NPCs"; log a sample texture name.
     const bool logPerf = Configuration.LogDistantPipeline;
-    static unsigned s_drawn = 0, s_skBlend = 0, s_skNoTex = 0, s_skLand = 0, s_skUnskin = 0, s_skFrustum = 0;
+    static unsigned s_drawn = 0, s_skBlend = 0, s_skNoTex = 0, s_skLand = 0, s_skUnskin = 0;
     static const char* s_lastUnskinTex = nullptr;
     static unsigned s_calls = 0;
 
@@ -394,17 +391,17 @@ void DistantLand::renderCachedOpaque(const D3DXMATRIX* view, const D3DXMATRIX* p
         if (!vb || !e.ib) return;
 
         // World-space bound: skinned = bone-palette-derived posed bound; non-skinned
-        // = true world bound (not the object origin). Used for the fallback frustum
-        // cull AND the texture-light selection AABB below (renderMorrowind can't read
-        // our WRITEONLY VB via computeBoundingBox, so we hand it these bounds — the
-        // object light-seam fix, keeping cache light selection identical to reactive).
+        // = true world bound (not the object origin). Used for the texture-light
+        // selection AABB below (renderMorrowind can't read our WRITEONLY VB via
+        // computeBoundingBox, so we hand it these bounds — the object light-seam fix,
+        // keeping cache light selection identical to reactive).
         BoundingSphere bs;
         if (e.isSkinned) { cacheSkinnedWorldBounds(e, bs.center, bs.radius); }
         else             { cacheWorldBounds(e, bs.center, bs.radius); }
 
-        // Deterministic current-frame frustum cull (always on).
-        if (frustum.ContainsSphere(bs) == ViewFrustum::OUTSIDE) { if (logPerf) ++s_skFrustum; return; }
-
+        // No per-part frustum test here: visKeys is already frustum-culled (and
+        // occlusion-refined) by buildFrustumVisibleSet. bs is still needed below for
+        // the texture-light selection AABB (renderMorrowind can't read our WRITEONLY VB).
         const D3DXVECTOR3 lbMin(bs.center.x - bs.radius, bs.center.y - bs.radius, bs.center.z - bs.radius);
         const D3DXVECTOR3 lbMax(bs.center.x + bs.radius, bs.center.y + bs.radius, bs.center.z + bs.radius);
 
@@ -443,13 +440,18 @@ void DistantLand::renderCachedOpaque(const D3DXMATRIX* view, const D3DXMATRIX* p
         if (logPerf) ++s_drawn;
     };
 
-    for (const auto& kv : cacheMap) drawEntry(kv.second);
+    // Iterate the shared frustum/occlusion-refined set (key -> cacheMap), the same
+    // forEach pattern renderDepthFromCache uses, so depth and color draw the same set.
+    for (uint32_t key : visKeys) {
+        auto it = cacheMap.find(key);
+        if (it != cacheMap.end()) drawEntry(it->second);
+    }
 
     if (logPerf && (++s_calls % 300 == 0)) {
-        LOG::logline("-- [CACHE OPAQUE] drawn=%u skip{blend=%u notex=%u land=%u unskin=%u frustum=%u} sampleUnskinTex=%s",
-                     s_drawn, s_skBlend, s_skNoTex, s_skLand, s_skUnskin, s_skFrustum,
+        LOG::logline("-- [CACHE OPAQUE] drawn=%u skip{blend=%u notex=%u land=%u unskin=%u} visKeys=%zu sampleUnskinTex=%s",
+                     s_drawn, s_skBlend, s_skNoTex, s_skLand, s_skUnskin, visKeys.size(),
                      s_lastUnskinTex ? s_lastUnskinTex : "(none)");
-        s_drawn = s_skBlend = s_skNoTex = s_skLand = s_skUnskin = s_skFrustum = 0;
+        s_drawn = s_skBlend = s_skNoTex = s_skLand = s_skUnskin = 0;
     }
 }
 

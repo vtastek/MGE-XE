@@ -28,6 +28,7 @@ bool DistantLand::ready = false;
 bool DistantLand::isRenderCached = false;
 bool DistantLand::isPPLActive = false;
 bool DistantLand::cacheOpaqueMode = false;
+bool DistantLand::refineCacheCullWithMSOC = true;
 bool DistantLand::earlyWalkedCache = false;
 bool DistantLand::renderThreadJobKicked = false;
 std::vector<D3DXVECTOR4> DistantLand::reflectionWaterRects;
@@ -297,6 +298,12 @@ static void __cdecl onVisibleGeom(void* const* shapes, const float* /*boundsXYZR
     DistantLand::updateVisibleSet(shapes, count);
 }
 
+// Called from msoc.dll alongside onVisibleGeom: the complement set MSOC proved
+// OCCLUDED this frame. Feeds buildFrustumVisibleSet's occlusion refinement.
+static void __cdecl onOccludedGeom(void* const* shapes, const float* /*boundsXYZR*/, int count) {
+    DistantLand::updateOccludedSet(shapes, count);
+}
+
 bool DistantLand::init() {
     if (ready) {
         return true;
@@ -356,6 +363,9 @@ bool DistantLand::init() {
     // lands next to other distant-land init lines in mgeXE.log.
     MSOCClient::init();
     MSOCClient::registerVisibleGeomCallback(onVisibleGeom);
+    // Occlusion refinement of the cache visible set (subtractive). No-op on an older
+    // plugin that lacks the export — buildFrustumVisibleSet then stays frustum-only.
+    MSOCClient::registerOccludedGeomCallback(onOccludedGeom);
 
     MWBridge::get()->patchResolveDuringInit(&resolveDynamicVisGroups);
 

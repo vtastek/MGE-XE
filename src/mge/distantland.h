@@ -71,6 +71,11 @@ public:
     // Read once per frame at renderStage0 entry so inspectIndexedPrimitive sees
     // a stable value for the whole frame.
     static bool cacheOpaqueMode;
+    // A/B toggle (NUMPAD4): when true, buildFrustumVisibleSet subtracts MSOC's
+    // positive per-frame OCCLUDED verdict (occluded-geom callback) from the cache
+    // visible set — static objects only, gated by freshness + an eye-translation
+    // guard. False = frustum-only (the post-675b0ab baseline). Default true.
+    static bool refineCacheCullWithMSOC;
     // Set by frameSetupEarly() when the GeometryCache walk ran at BeginScene(0);
     // read by renderDepth (different TU) to skip its own redundant walk.
     static bool earlyWalkedCache;
@@ -469,12 +474,31 @@ public:
     // renderDepth's serial cache path would, just during the sky window.
     static void renderThreadDepthCacheJob();
     static void updateVisibleSet(void* const* shapes, int count);
+    // Stage 2 early classify (main thread, BeginScene(0) via frameSetupEarly, before
+    // buildFrustumVisibleSet). Asks the plugin to run the world-camera occlusion
+    // classify NOW so the visible/occluded callbacks fire with the current-frame set;
+    // latches whether it ran so buildFrustumVisibleSet can drive the cache passes off
+    // the engine's exact drawn set (engine-set mode). worldCamera may be null (the
+    // plugin resolves it). No-op if the plugin lacks the export or self-declines.
+    static void earlyClassifyMainScene(void* worldCamera);
     // The main-view MSOC visible set (s_prevVisibleKeys), keyed on
     // NiTriBasedGeometry* == GeometryCache keys. No longer drives the cache
     // depth/opaque paths (they consume the early frustum set, buildFrustumVisibleSet)
     // — kept for the distant-statics path and as the foundation for Phase 3 (an
     // early MGE-driven MSOC mask over the cache, replacing this lagged verdict).
     static const std::unordered_set<uint32_t>& visibleCacheKeys();
+    // MSOC occluded-geom callback sink (complement of updateVisibleSet). Records the
+    // set of cache keys MSOC proved OCCLUDED this frame + the fact a drain ran, for
+    // buildFrustumVisibleSet to subtract. Main-thread only (fires inside the engine's
+    // drainPendingDisplays), same as updateVisibleSet.
+    static void updateOccludedSet(void* const* shapes, int count);
+    // The deterministic current-frame frustum-visible set (s_frustumVisibleKeys),
+    // built by buildFrustumVisibleSet. The cache opaque color pass consumes it so it
+    // stays in lockstep with the depth pre-pass (same set). Keys = GeometryCache keys.
+    static const std::vector<uint32_t>& frustumVisibleKeys();
+    // Diagnostic: count of cache entries the last buildFrustumVisibleSet dropped via
+    // MSOC occlusion refinement (0 when disarmed). For the LogDistantPipeline line.
+    static unsigned lastRefineCulled();
 
     static void renderShadowMap();
     static void renderShadowFromCache(int layer, const D3DXMATRIX* viewproj);

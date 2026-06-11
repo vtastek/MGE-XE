@@ -10,6 +10,7 @@
 #include "scenegraph.h"
 #include "scenegraph_geometry_cache.h"
 #include "cachebounds.h"
+#include "msocclient.h"
 #include "support/log.h"
 #include "mge_tracy.h"
 
@@ -45,16 +46,82 @@ static std::vector<uint32_t> s_frustumVisibleKeys;
 // job from any later main-thread mutation of the set.
 static std::vector<uint32_t> s_threadVisibleKeys;
 
+// Occlusion refinement of the frustum set. s_occludedKeys = the cache keys MSOC
+// proved OCCLUDED this frame (the complement of the visible callback), written on
+// the MAIN thread by updateOccludedSet from inside the engine's drainPendingDisplays
+// — same thread/timing as updateVisibleSet, so no race with buildFrustumVisibleSet.
+// s_occludedFresh is set by each callback and CONSUMED (cleared) by the next
+// buildFrustumVisibleSet, so a verdict refines at most one frame's cull and a stalled
+// drain (menus / cell load) stops refining immediately. s_prevBuildEyePos tracks the
+// per-frame eye translation — the only motion that can stale a positive occlusion
+// verdict (rotation can't; exposure-tested) — and disarms refinement on a jump
+// (teleport / fast travel) larger than kMaxRefineEyeStep.
+static std::unordered_set<uint32_t> s_occludedKeys;
+static bool         s_occludedFresh     = false;
+static D3DXVECTOR4  s_prevBuildEyePos(0.0f, 0.0f, 0.0f, 0.0f);
+static bool         s_prevBuildEyeValid = false;
+static const float  kMaxRefineEyeStep   = 256.0f;   // world units / frame
+static unsigned     s_refineCulledCount = 0;        // diag (LogDistantPipeline)
+
+// Stage 2 engine-set consumption. s_visibleCallbackFired is a tripwire flipped by
+// updateVisibleSet; earlyClassifyMainScene() resets it, calls the plugin's early
+// classify, and latches s_earlyClassifyRan = "the callback fired DURING the call" -
+// i.e. the world classify ran THIS frame, before the cull, so s_visibleKeys is the
+// engine's current-frame drawn set (no lag). buildFrustumVisibleSet reads
+// s_earlyClassifyRan to drive the cache passes off s_visibleKeys directly (absence
+// culls), then clears it. A late Mode-A callback (engine CullShow, after the cull)
+// also trips s_visibleCallbackFired, but it lands after this frame's consume and is
+// reset before the next early classify, so it never masquerades as a current set.
+static bool         s_visibleCallbackFired = false;
+static bool         s_earlyClassifyRan     = false;
+
 void DistantLand::updateVisibleSet(void* const* shapes, int count) {
     s_prevVisibleKeys = std::move(s_visibleKeys);
     s_visibleKeys.clear();
     s_visibleKeys.reserve(count);
     for (int i = 0; i < count; ++i)
         s_visibleKeys.insert(reinterpret_cast<uint32_t>(shapes[i]));
+    s_visibleCallbackFired = true;
+}
+
+// Stage 2 early classify (main thread, called from frameSetupEarly at BeginScene(0),
+// before buildFrustumVisibleSet). Ask the plugin to run the world-camera occlusion
+// classify NOW; the plugin fires the visible/occluded callbacks synchronously on this
+// thread (updateVisibleSet / updateOccludedSet) so the current-frame set is ready for
+// the cull below. Latches whether it actually classified (callback fired during the
+// call) - the plugin self-declines (root unverified, scene disabled, menu, absent
+// export) without signalling, so the tripwire is the authoritative "did it run".
+void DistantLand::earlyClassifyMainScene(void* worldCamera) {
+    s_earlyClassifyRan = false;
+    if (!Configuration.UseOcclusionCulling || !MSOCClient::hasEarlyClassify()) return;
+    s_visibleCallbackFired = false;
+    MSOCClient::classifyMainSceneNow(worldCamera);
+    s_earlyClassifyRan = s_visibleCallbackFired;
 }
 
 const std::unordered_set<uint32_t>& DistantLand::visibleCacheKeys() {
     return s_prevVisibleKeys;
+}
+
+// updateOccludedSet - sink for the MSOC occluded-geom callback. Records this frame's
+// OCCLUDED cache keys and marks the verdict fresh for the next buildFrustumVisibleSet.
+// Main thread only (fires inside the engine's drainPendingDisplays), so it never races
+// buildFrustumVisibleSet. Fired every drain (incl. zero-occluder frames, count 0) so
+// "fresh" precisely means "a drain produced a verdict this frame".
+void DistantLand::updateOccludedSet(void* const* shapes, int count) {
+    s_occludedKeys.clear();
+    s_occludedKeys.reserve(count);
+    for (int i = 0; i < count; ++i)
+        s_occludedKeys.insert(reinterpret_cast<uint32_t>(shapes[i]));
+    s_occludedFresh = true;
+}
+
+const std::vector<uint32_t>& DistantLand::frustumVisibleKeys() {
+    return s_frustumVisibleKeys;
+}
+
+unsigned DistantLand::lastRefineCulled() {
+    return s_refineCulledCount;
 }
 
 // buildFrustumVisibleSet - deterministic current-frame frustum cull over the full
@@ -77,12 +144,80 @@ void DistantLand::buildFrustumVisibleSet(const D3DXMATRIX* view, const D3DXMATRI
     s_frustumVisibleKeys.clear();
 
     const auto& cacheMap = MGE::GeometryCache::cache();
-    if (cacheMap.empty()) return;
+    if (cacheMap.empty()) {
+        s_earlyClassifyRan = false;   // consume the latch even on the empty-cache early out
+        s_occludedFresh    = false;
+        return;
+    }
 
     D3DXMATRIX viewproj;
     D3DXMatrixMultiply(&viewproj, view, proj);
     ViewFrustum frustum(&viewproj);
 
+    // Stage 2 engine-set mode: the early classify (mwse_classifyMainSceneNow) ran THIS
+    // frame, so s_visibleKeys is the engine's exact current-frame drawn opaque set
+    // (world camera). Drive the cache depth/opaque passes off it directly — absence
+    // culls, which is SAFE here because the verdict is current-frame (no lag, no
+    // leading-edge holes) — so d.cache collapses toward the engine's drawn count
+    // instead of the full frustum set. Gated on the same NUMPAD4 A/B toggle as the
+    // subtractive refinement. worldPickObjectRoot entries (isPickRoot — dropped items,
+    // projectiles) are NOT traversed by the world-camera classify, so they'd be absent
+    // from s_visibleKeys; keep them via frustum so they don't vanish. First-person
+    // (arm root) is a separate camera AND not in the GeometryCache, so nothing to do.
+    const bool engineSetMode =
+        refineCacheCullWithMSOC &&
+        Configuration.UseOcclusionCulling &&
+        s_earlyClassifyRan;
+    if (engineSetMode) {
+        s_refineCulledCount = 0;
+        s_frustumVisibleKeys.reserve(s_visibleKeys.size() + 16);
+        for (const auto& kv : cacheMap) {
+            const auto& e = kv.second;
+            // Match the frustum path's skinned-usable filter so the set means the same
+            // thing to the draw sites (no unusable-skin entries).
+            if (e.isSkinned && (e.skinnedUnsupported || e.numBones == 0)) continue;
+            if (s_visibleKeys.count(kv.first)) {
+                s_frustumVisibleKeys.push_back(kv.first);     // engine drew it this frame
+            } else if (e.isPickRoot) {
+                BoundingSphere bs;
+                if (e.isSkinned) cacheSkinnedWorldBounds(e, bs.center, bs.radius);
+                else             cacheWorldBounds(e, bs.center, bs.radius);
+                if (frustum.ContainsSphere(bs) != ViewFrustum::OUTSIDE)
+                    s_frustumVisibleKeys.push_back(kv.first);
+            } else {
+                ++s_refineCulledCount;   // engine culled it (occluded / outside engine frustum)
+            }
+        }
+        // Consume the per-frame flags and advance the eye baseline (same as the frustum
+        // path's tail) so a stalled drain can't reuse a stale set.
+        s_earlyClassifyRan  = false;
+        s_occludedFresh     = false;
+        s_prevBuildEyePos   = eyePos;
+        s_prevBuildEyeValid = true;
+        return;
+    }
+
+    // Occlusion refinement arming. SUBTRACTIVE only: a key is dropped solely because
+    // MSOC positively reported it OCCLUDED this frame — absence from any engine set
+    // never culls (that was the depth-lag hole bug). Armed when: the A/B toggle is on,
+    // occlusion culling is enabled, the plugin exports the occluded callback, a drain
+    // produced a fresh verdict (s_occludedFresh), AND the eye moved < kMaxRefineEyeStep
+    // since the last build. Rotation can't stale an occlusion verdict (occlusion is
+    // eye-position-only; exposure-tested), so only the translation guard is needed; the
+    // jump guard disarms across teleport / fast travel / cell load.
+    const float dx = eyePos.x - s_prevBuildEyePos.x;
+    const float dy = eyePos.y - s_prevBuildEyePos.y;
+    const float dz = eyePos.z - s_prevBuildEyePos.z;
+    const bool eyeStepOk = s_prevBuildEyeValid &&
+        (dx * dx + dy * dy + dz * dz) < (kMaxRefineEyeStep * kMaxRefineEyeStep);
+    const bool refineArmed =
+        refineCacheCullWithMSOC &&
+        Configuration.UseOcclusionCulling &&
+        MSOCClient::hasOccludedGeomCallback() &&
+        s_occludedFresh &&
+        eyeStepOk;
+
+    s_refineCulledCount = 0;
     s_frustumVisibleKeys.reserve(cacheMap.size());
     for (const auto& kv : cacheMap) {
         const auto& e = kv.second;
@@ -94,8 +229,26 @@ void DistantLand::buildFrustumVisibleSet(const D3DXMATRIX* view, const D3DXMATRI
             cacheWorldBounds(e, bs.center, bs.radius);
         }
         if (frustum.ContainsSphere(bs) == ViewFrustum::OUTSIDE) continue;
+
+        // Refine: drop static objects MSOC proved occluded this frame. Statics only
+        // (!isSkinned && dynamicHint == 0) — a mover/NPC can invalidate its own verdict
+        // between the drain and now. Terrain (isLandscape) is never in s_occludedKeys
+        // (the plugin's SkipTerrainOccludees bypasses TestRect), so it's implicitly safe.
+        if (refineArmed && !e.isSkinned && e.dynamicHint == 0 &&
+            s_occludedKeys.count(kv.first)) {
+            ++s_refineCulledCount;
+            continue;
+        }
+
         s_frustumVisibleKeys.push_back(kv.first);
     }
+
+    // Consume the verdict (one frame max) and advance the eye baseline. Done even when
+    // disarmed so a stalled drain can't be reused and the next frame has a fresh delta.
+    s_occludedFresh    = false;
+    s_earlyClassifyRan = false;   // frustum path: don't let a stale latch leak forward
+    s_prevBuildEyePos  = eyePos;
+    s_prevBuildEyeValid = true;
 }
 
 

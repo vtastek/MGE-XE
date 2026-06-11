@@ -32,6 +32,10 @@ namespace MGE::GeometryCache {
         // entries (CachedGeometry::isLandscape). Terrain is excluded from the
         // cache color pass — it stays on the distant-land path.
         bool              g_walkingLandscape = false;
+        // Set while walking worldPickObjectRoot so visitGeometry can tag entries
+        // (CachedGeometry::isPickRoot) — that root is outside the engine's world-camera
+        // occlusion classify; the Stage 2 engine-set cull keeps these via frustum.
+        bool              g_walkingPick = false;
         uint32_t          g_uploadedThisFrame  = 0;
         uint64_t          g_uploadedInterval   = 0; // cumulative over log interval
         // Phase 0 diagnostic: null-bone influence accounting (the suspected NPC
@@ -450,11 +454,13 @@ namespace MGE::GeometryCache {
                 e.dynamicHint = (sk || inCharacter) ? 4 : 0;
                 e.lastFrame = g_frame;
                 e.isLandscape = g_walkingLandscape;
+                e.isPickRoot = g_walkingPick;
                 e.mirrored = computeMirrored(e);                    // winding flip for depth/shadow
             } else {
                 auto& e = it->second;
                 e.lastFrame = g_frame;
                 e.isLandscape = g_walkingLandscape;
+                e.isPickRoot = g_walkingPick;
                 if (sk) {
                     // Static skinned VB: rebuild only on revision / skin-state change.
                     if (data->revisionID != e.revisionID || !e.isSkinned) {
@@ -562,7 +568,9 @@ namespace MGE::GeometryCache {
         }
         {
             MGE_ZoneScopedN("GeomCache:walkPickObjects");
+            g_walkingPick = true;
             walk(MGE::DataHandlerView::worldPickObjectRoot(dataHandler));
+            g_walkingPick = false;
         }
         {
             MGE_ZoneScopedN("GeomCache:walkLandscape");
