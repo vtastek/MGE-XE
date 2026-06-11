@@ -156,29 +156,31 @@ void DistantLand::buildFrustumVisibleSet(const D3DXMATRIX* view, const D3DXMATRI
         // whether the early classify covers terrain (worldLandscapeRoot). If visLand is
         // substantial, terrain IS in visKeys (occlusion-culled) and renderCachedTerrain
         // should consume it instead of re-frustum-culling the full 2304-tile cache.
-        unsigned visLand = 0, visObj = 0;
+        // Pick-root entries are NO LONGER frustum-rescued: the visible-geom callback
+        // reports occlusion SURVIVORS only (the exact set the engine draws), and the
+        // engine's drawn count matches objects alone — so pick entries absent from
+        // s_visibleKeys are occluded clutter the engine doesn't draw. Treat them like
+        // any other entry: keep iff the engine drew it, else occlusion-cull. (Diagnostic
+        // pickVis = visible pick still drawn; pickCulled = pick now correctly dropped.)
+        unsigned visLand = 0, visObj = 0, visPick = 0, pickCulled = 0;
         for (const auto& kv : cacheMap) {
             const auto& e = kv.second;
             if (e.isSkinned && (e.skinnedUnsupported || e.numBones == 0)) continue;
             if (s_visibleKeys.count(kv.first)) {
                 s_frustumVisibleKeys.push_back(kv.first);     // engine drew it this frame
-                if (e.isLandscape) ++visLand; else ++visObj;
-            } else if (e.isPickRoot) {
-                // worldPickObjectRoot is outside the world classify; keep via frustum.
-                BoundingSphere bs;
-                if (e.isSkinned) cacheSkinnedWorldBounds(e, bs.center, bs.radius);
-                else             cacheWorldBounds(e, bs.center, bs.radius);
-                if (frustum.ContainsSphere(bs) != ViewFrustum::OUTSIDE)
-                    s_frustumVisibleKeys.push_back(kv.first);
+                if (e.isLandscape)    ++visLand;
+                else if (e.isPickRoot) ++visPick;
+                else                   ++visObj;
             } else {
                 ++s_refineCulledCount;   // engine culled it (occluded / LOD / out of frustum)
+                if (e.isPickRoot) ++pickCulled;
             }
         }
         if (Configuration.LogDistantPipeline) {
             static unsigned s_n = 0;
             if (++s_n % 300 == 0)
-                LOG::logline("-- [VISKEYS] engine-visible: land=%u obj=%u total=%zu (refineCulled=%u)",
-                             visLand, visObj, s_frustumVisibleKeys.size(), s_refineCulledCount);
+                LOG::logline("-- [VISKEYS] MSOC: land=%u obj=%u pickVis=%u pickCulled=%u total=%zu (refineCulled=%u)",
+                             visLand, visObj, visPick, pickCulled, s_frustumVisibleKeys.size(), s_refineCulledCount);
         }
         return;
     }
@@ -197,6 +199,12 @@ void DistantLand::buildFrustumVisibleSet(const D3DXMATRIX* view, const D3DXMATRI
         }
         if (frustum.ContainsSphere(bs) == ViewFrustum::OUTSIDE) continue;
         s_frustumVisibleKeys.push_back(kv.first);
+    }
+    if (Configuration.LogDistantPipeline) {
+        static unsigned s_n = 0;
+        if (++s_n % 300 == 0)
+            LOG::logline("-- [VISKEYS] FRUSTUM-FALLBACK (no early classify): total=%zu",
+                         s_frustumVisibleKeys.size());
     }
 }
 
@@ -257,6 +265,10 @@ void DistantLand::renderDepth() {
             // early walk, so it didn't build the frustum-visible set either. Build
             // it here (after the walk, before the consume) so this path drives off
             // the same deterministic current-frame set as the IPC/threaded paths.
+            // (The early classify itself must run at BeginScene(0) in frameSetupEarly,
+            // before the engine's CullShow — running it here is too late: the engine's
+            // MSOC is already active and declines with rc=1. frameSetupEarly runs it
+            // for interiors too, so s_earlyClassifyRan may already be latched here.)
             buildFrustumVisibleSet(&mwView, &mwProj);
         }
         {

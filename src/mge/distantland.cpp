@@ -149,6 +149,17 @@ void DistantLand::frameSetupEarly() {
             MGE::RenderThread::kick(&DistantLand::renderThreadDepthCacheJob);
             renderThreadJobKicked = true;
         }
+    } else if (!mwBridge->IsMenu()) {
+        // Interior / non-distant cell: the exterior early block above is skipped (it
+        // exists for the distant-statics overlap, which interiors don't have), so its
+        // cache walk + buildFrustumVisibleSet fall through to the serial renderDepth
+        // path. But the early classify MUST run HERE, at BeginScene(0) before the
+        // engine's scene-0 CullShow — running it later in renderDepth is too late (the
+        // engine's MSOC is already active and declines with rc=1, so interiors fell to
+        // a pure-frustum visible set and drew clutter the engine occludes). This fills
+        // s_visibleKeys + latches s_earlyClassifyRan; renderDepth's buildFrustumVisibleSet
+        // then consumes it (MSOC branch) once it has walked the cache.
+        earlyClassifyMainScene(nullptr);
     }
 }
 
