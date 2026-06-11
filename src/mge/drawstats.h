@@ -31,11 +31,16 @@ namespace DrawStats {
         // frustum-only post-Phase-1); DepthLand/Statics/Grass = the distant-land
         // depth replays. So DepthCache is the apples-to-apples vs scene0.
         Depth, DepthCache, DepthLand, DepthStatics, DepthGrass,
-        // Shadow caster pass, split by source. Shadow = misc (per-cascade stencil cube
-        // + soften passes; distant-land caster still lands in Land — shares
+        // Shadow caster pass, split by source. Shadow = caster misc (per-cascade stencil
+        // cube + soften passes; distant-land caster still lands in Land — shares
         // renderDistantLand's tag); ShadowCache = renderShadowFromCache (cache casters,
         // near cascade 0 only); ShadowDL = distant-statics casters (both cascades).
-        Shadow, ShadowCache, ShadowDL,
+        // ShadowRecv = the receiver re-draw (renderShadow over recordMW: the engine's
+        // near scene shaded as shadow receivers). Split from Shadow so the receiver cost
+        // is visible separately from the caster passes and never hides inside scene0.
+        // In CACHE mode the cache-covered receiver is folded into the color passes
+        // (zero extra draws), so ShadowRecv there is only the non-cache remainder.
+        Shadow, ShadowCache, ShadowDL, ShadowRecv,
         // Reflection, split by source. Reflection = misc (reflected sky; reflected
         // LOD land still lands in Land — it shares renderDistantLand's tag);
         // ReflStatics = reflected distant statics (the "DL culled" set, near band
@@ -46,6 +51,12 @@ namespace DrawStats {
         Reflection, ReflStatics, ReflCacheColor, ReflCacheShadow, ReflCacheTerrain,
         Land, Statics, Grass, Water, Sky,   // distant-land content
         Post, Debug, Other,
+        // CACHE-mode near scene (scene 0), split from Scene0 so the cache passes don't
+        // hide inside the engine's scene count. CacheOpaque = renderCachedOpaque (objects
+        // + skinned NPCs from the visKeys set); CacheTerrain = renderCachedTerrain (near
+        // landscape patches). In ENGINE mode both are 0 (the engine draws scene 0), so
+        // the scene subtotal stays directly comparable between the two modes.
+        CacheOpaque, CacheTerrain,
         COUNT
     };
 
@@ -53,10 +64,11 @@ namespace DrawStats {
         static const char* const n[COUNT] = {
             "scene0", "scene1", "scene2", "ui",
             "depth", "d.cache", "d.land", "d.stat", "d.grass",
-            "shadow", "s.cache", "s.dl",
+            "shadow", "s.cache", "s.dl", "s.recv",
             "refl", "r.stat", "r.c.color", "r.c.shadow", "r.c.terr",
             "land", "statics", "grass", "water", "sky",
-            "post", "dbg", "other"
+            "post", "dbg", "other",
+            "c.opaque", "c.terr"
         };
         return n[s];
     }
@@ -69,10 +81,11 @@ namespace DrawStats {
         static const char* const n[COUNT] = {
             "draws:scene0", "draws:scene1", "draws:scene2", "draws:ui",
             "draws:depth", "draws:d.cache", "draws:d.land", "draws:d.statics", "draws:d.grass",
-            "draws:shadow", "draws:s.cache", "draws:s.dl",
+            "draws:shadow", "draws:s.cache", "draws:s.dl", "draws:s.recv",
             "draws:refl", "draws:r.statics", "draws:r.c.color", "draws:r.c.shadow", "draws:r.c.terr",
             "draws:land", "draws:statics", "draws:grass", "draws:water", "draws:sky",
-            "draws:post", "draws:dbg", "draws:other"
+            "draws:post", "draws:dbg", "draws:other",
+            "draws:c.opaque", "draws:c.terr"
         };
         return n[s];
     }

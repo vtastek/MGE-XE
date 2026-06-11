@@ -409,7 +409,7 @@ void DistantLand::renderShadowLayer(int layer, float radius, const D3DXMATRIX* i
 // renderShadow - Renders shadows (using blending) over Morrowind shadow receivers
 void DistantLand::renderShadow(bool skipCacheCovered) {
     MGE_ZoneScopedN("applyShadows");
-    DrawStats::ScopedStage _ds(DrawStats::Shadow);
+    DrawStats::ScopedStage _ds(DrawStats::ShadowRecv);   // receiver re-draw, split from the caster passes
     // Supply view space -> shadow clip space matrix
     D3DXMATRIX inverseView, viewToShadow[2];
     D3DXMatrixInverse(&inverseView, NULL, &mwView);
@@ -438,9 +438,9 @@ void DistantLand::renderShadow(bool skipCacheCovered) {
         }
 
         // CACHE mode (scene 0): the cache owns textured-opaque color/depth at the
-        // snapshot pose; its shadow receiver comes from the cache too
-        // (renderShadowReceiverFromCache). Receiving from this live-pose recordMW
-        // entry would mismatch the cache depth and flicker on animated geometry
+        // snapshot pose; its shadow receiver is folded into the cache color passes
+        // (renderCachedOpaque / renderCachedTerrain). Receiving from this live-pose
+        // recordMW entry would mismatch the cache depth and flicker on animated geometry
         // (the async snapshot is one frame stale). Skip exactly the cache-covered set
         // (textured, zWrite, non-blend); untextured/alpha stay on the recordMW path.
         if (skipCacheCovered && i.zWrite && !i.blendEnable && i.texture) {

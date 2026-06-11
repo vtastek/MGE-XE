@@ -106,7 +106,11 @@ CacheTerrainLitVertOut CacheTerrainLitVS(float4 pos : POSITION, float3 normal : 
     return OUT;
 }
 
-float4 CacheTerrainLitPS(CacheTerrainLitVertOut IN) : COLOR0 {
+// Fold-free lit color (albedo + sun + dynamic point lights + tonemap + fog). Both
+// the main-view (CacheTerrainLitPS) and reflection (CacheTerrainReflLitPS) shaders
+// build on this; the sun shadow fold below is layered on top so the two paths share
+// one base and one fold, differing only in the matrices/sun the CPU binds per pass.
+float4 cacheTerrainLitColor(CacheTerrainLitVertOut IN) {
     float3 normal  = normalize(IN.normal);
     float3 base    = tex2D(sampBaseTex, IN.texcoord).rgb;
     float3 overlay = tex2D(sampTerrainOverlay, IN.texcoord).rgb;
@@ -121,41 +125,29 @@ float4 CacheTerrainLitPS(CacheTerrainLitVertOut IN) : COLOR0 {
     return float4(result, 1);
 }
 
-//------------------------------------------------------------
-// Reflection variant: the main-view lit shading (sun + vcol + dynamic point lights)
-// PLUS the reflection's below-water clip, so reflected near terrain gets the same
-// point lights as reflected objects (the reflection terrain previously used the
-// non-lit CacheTerrainPS, leaving it unlit by candles/torches). reflWaterClipPlane
-// comes from "XE Mod Landscape.fx" (included before this file by XE Main.fx); it is
-// the true water level in the reflection (pass-all in the main view). CacheTerrainLitVS
-// already outputs viewpos (= world*reflView) for the clip dot product.
-float4 CacheTerrainReflLitPS(CacheTerrainLitVertOut IN) : COLOR0 {
-    clip(dot(float4(IN.viewpos, 1), reflWaterClipPlane));
-    float4 c = CacheTerrainLitPS(IN);
-
-    // Sun shadow fold, mirroring the FFE object fold (applyCacheShadow in
-    // "XE FixedFuncEmu.fx") so reflected near terrain darkens like reflected
-    // objects — replaces the terrain receiver re-draw that went away with
-    // renderReflectionShadowsFromCache. This pass is reflection-only, so no
-    // gate is needed. Uses the receiver machinery from "XE Mod Shadow.fx"
-    // directly (sampDepth/tex3 holds the shadow atlas during this pass;
-    // unlike FFE there is no tex3 conflict — terrain uses tex0/tex2).
-    // shadowViewProj = reflected-view -> shadow clip and sunVecView = the
-    // reflected-view sun, bound by renderReflectionTerrainFromCache. Applied
-    // after tonemap + fog: the standalone receiver darkened the FINAL color
-    // (SrcBlend=Zero / DestBlend=InvSrcColor == c.rgb * (1 - v*shadecolor)).
-    // No vcol.a here: the splat factor must not modulate shadow strength
-    // (the standalone pass forced hasVCol=false for the same reason).
-    float4 shadow0pos = mul(float4(IN.viewpos, 1), shadowViewProj[0]);
-    float4 shadow1pos = mul(float4(IN.viewpos, 1), shadowViewProj[1]);
+// Sun shadow fold, mirroring the FFE object fold (applyCacheShadow in
+// "XE FixedFuncEmu.fx") so near terrain darkens like the cache objects do. Replaces
+// the standalone terrain receiver re-draw (renderShadowReceiverFromCache in the main
+// view, renderReflectionShadowsFromCache in the reflection, both removed). Uses the
+// receiver machinery from "XE Mod Shadow.fx" directly (sampDepth/tex3 holds the shadow
+// atlas during these passes; unlike FFE there is no tex3 conflict, terrain uses
+// tex0/tex2 only). shadowViewProj = view -> shadow clip and sunVecView = the
+// same-space sun, bound by the CPU caller (main: renderCachedTerrain; reflection:
+// renderReflectionTerrainFromCache). Applied after tonemap + fog: the standalone
+// receiver darkened the FINAL color (SrcBlend=Zero / DestBlend=InvSrcColor ==
+// c.rgb * (1 - v*shadecolor)). No vcol.a: the splat factor must not modulate shadow
+// strength. shadowReflMult gates AND fades: 0 disables the fold entirely (shadows-off,
+// or the DL LOD handover beyond the band), 1 = full strength.
+float4 cacheTerrainSunShadow(float4 c, float3 viewpos, float3 viewnormal) {
+    float4 shadow0pos = mul(float4(viewpos, 1), shadowViewProj[0]);
+    float4 shadow1pos = mul(float4(viewpos, 1), shadowViewProj[1]);
     shadow0pos.z /= shadow0pos.w;
     shadow1pos.z /= shadow1pos.w;
 
-    float lightT = shadowSunEstimate(saturate(dot(normalize(IN.viewnormal), -sunVecView)));
-    float fogatt = pow(fogMWScalar(length(IN.viewpos)), 2);
+    float lightT = shadowSunEstimate(saturate(dot(normalize(viewnormal), -sunVecView)));
+    float fogatt = pow(fogMWScalar(length(viewpos)), 2);
     lightT *= isAboveSeaLevel(eyePos) ? fogatt : saturate(4 * fogatt);
-    // Per-patch cache->distant-land handover fade (DL LOD has no shadows).
-    lightT *= shadowReflMult;
+    lightT *= shadowReflMult;   // gate/fade (0 = no fold)
 
     // Shadowed fragments have NEGATIVE dz; shadowESM is exactly 0 for dz >= 0
     // (the no-caster case), so no guard is needed.
@@ -168,4 +160,27 @@ float4 CacheTerrainReflLitPS(CacheTerrainLitVertOut IN) : COLOR0 {
 
     c.rgb *= 1 - v * shadecolor;
     return c;
+}
+
+// Main-view cache near terrain: lit color + the sun shadow fold. The fold reads the
+// main-view shadowViewProj / sunVecView and shadowReflMult bound by renderCachedTerrain
+// (1 when shadows are enabled, 0 to disable). Replaces the separate main-view receiver
+// re-draw (renderShadowReceiverFromCache).
+float4 CacheTerrainLitPS(CacheTerrainLitVertOut IN) : COLOR0 {
+    return cacheTerrainSunShadow(cacheTerrainLitColor(IN), IN.viewpos, IN.viewnormal);
+}
+
+//------------------------------------------------------------
+// Reflection variant: the main-view lit shading (sun + vcol + dynamic point lights)
+// PLUS the reflection's below-water clip, so reflected near terrain gets the same
+// point lights as reflected objects (the reflection terrain previously used the
+// non-lit CacheTerrainPS, leaving it unlit by candles/torches). reflWaterClipPlane
+// comes from "XE Mod Landscape.fx" (included before this file by XE Main.fx); it is
+// the true water level in the reflection (pass-all in the main view). CacheTerrainLitVS
+// already outputs viewpos (= world*reflView) for the clip dot product. Same fold as
+// the main view, but renderReflectionTerrainFromCache binds the reflected-view
+// matrices and the per-patch handover fade in shadowReflMult.
+float4 CacheTerrainReflLitPS(CacheTerrainLitVertOut IN) : COLOR0 {
+    clip(dot(float4(IN.viewpos, 1), reflWaterClipPlane));
+    return cacheTerrainSunShadow(cacheTerrainLitColor(IN), IN.viewpos, IN.viewnormal);
 }

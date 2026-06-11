@@ -241,13 +241,6 @@ void DistantLand::renderStage0() {
             ? "Opaque source: CACHE (MGE-driven)" : "Opaque source: ENGINE (reactive)");
     }
 
-    // A/B the MSOC occlusion refinement of the cache visible set (depth + opaque).
-    if (GetAsyncKeyState(VK_NUMPAD4) & 0x0001) {
-        refineCacheCullWithMSOC = !refineCacheCullWithMSOC;
-        StatusOverlay::setStatus(refineCacheCullWithMSOC
-            ? "Cache cull: FRUSTUM + MSOC occlusion" : "Cache cull: FRUSTUM only");
-    }
-
     if (!isRenderCached) {
         ///LOG::logline("Sky prims: %d", recordSky.size());
 
@@ -581,16 +574,13 @@ void DistantLand::renderStage1() {
             // Overlay shadow onto Morrowind objects
             if ((Configuration.MGEFlags & USE_SHADOWS) && mwBridge->CellHasWeather()) {
                 // CACHE mode: the cache owns scene-0 textured-opaque color/depth at the
-                // snapshot pose, so renderShadow() skips that set (skipCacheCovered) and
-                // renderShadowReceiverFromCache re-applies the receiver at the SAME pose
-                // — otherwise the live recordMW receiver mismatches the async-stale cache
-                // depth and flickers on animated geometry (banners).
+                // snapshot pose. renderShadow() skips that set (skipCacheCovered); its sun
+                // shadow is folded into the cache color passes (renderCachedOpaque /
+                // renderCachedTerrain) instead of a separate receiver re-draw, so it rides
+                // the color draws at the snapshot pose and tracks the occlusion-culled set.
                 effect->BeginPass(isPPLActive ? PASS_RENDERSHADOWFFE : PASS_RENDERSHADOW);
                 renderShadow(cacheOpaqueMode);
                 effect->EndPass();
-                if (cacheOpaqueMode) {
-                    renderShadowReceiverFromCache(&mwView, &mwProj);
-                }
             }
 
             effect->End();

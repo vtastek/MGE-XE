@@ -30,7 +30,7 @@ using FnUnregisterVisGeom = void (__cdecl*)(void(__cdecl*)(void* const*, const f
 using FnRegisterOccGeom   = void (__cdecl*)(void(__cdecl*)(void* const*, const float*, int));
 using FnUnregisterOccGeom = void (__cdecl*)(void(__cdecl*)(void* const*, const float*, int));
 using FnCopyMask          = int  (__cdecl*)(void* dst, int dstBytes);
-using FnClassifyNow       = void (__cdecl*)(void* camera);
+using FnClassifyNow       = int  (__cdecl*)(void* camera);
 
 HMODULE       g_module            = nullptr;
 FnIsMaskReady g_isMaskReady       = nullptr;
@@ -325,9 +325,9 @@ bool MSOCClient::hasOccludedGeomCallback() {
     return g_registerOccGeom != nullptr;
 }
 
-void MSOCClient::classifyMainSceneNow(void* camera) {
-    if (!g_classifyNow) return;
-    g_classifyNow(camera);
+int MSOCClient::classifyMainSceneNow(void* camera) {
+    if (!g_classifyNow) return -1;
+    return g_classifyNow(camera);
 }
 
 bool MSOCClient::hasEarlyClassify() {

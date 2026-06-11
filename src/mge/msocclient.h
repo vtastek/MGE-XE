@@ -171,7 +171,9 @@ public:
     // (the plugin resolves it internally). No-op if the plugin is absent / predates
     // the export, or the plugin's own guards decline (root not yet confirmed, scene
     // disabled, menu) — in which case the in-engine classify path runs as before.
-    static void classifyMainSceneNow(void* camera);
+    // Returns the plugin's status code: 0 = classified, non-zero = the guard that
+    // declined (diagnostic), -1 = export absent. See msoc OcclusionPass.cpp for codes.
+    static int classifyMainSceneNow(void* camera);
 
     // True if the loaded plugin exports the early-classify entrypoint (i.e. Stage 2 is
     // available). False on absent/old plugin — the frustum cull path then stands.

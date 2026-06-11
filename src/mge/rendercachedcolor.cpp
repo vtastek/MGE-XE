@@ -21,6 +21,7 @@
 #include "ffeshader.h"
 #include "scenegraph_geometry_cache.h"
 #include "cachebounds.h"
+#include "mwbridge.h"
 #include "support/log.h"
 #include "mge_tracy.h"
 
@@ -323,6 +324,7 @@ static void buildCacheMainState(const MGE::GeometryCache::CachedGeometry& e,
 
 void DistantLand::renderCachedOpaque(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
     MGE_ZoneScopedN("renderCachedOpaque");
+    DrawStats::ScopedStage _ds(DrawStats::CacheOpaque);   // cache near objects (split from scene0)
 
     const auto& cacheMap = MGE::GeometryCache::cache();
     if (cacheMap.empty()) return;
@@ -353,6 +355,33 @@ void DistantLand::renderCachedOpaque(const D3DXMATRIX* view, const D3DXMATRIX* p
     device->SetRenderState(D3DRS_ZENABLE, TRUE);
     device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
     device->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+
+    // Sun shadow fold (main-view sibling of renderReflectionsFromCache): the FFE color
+    // shader samples the shadow atlas inline (applyCacheShadow branch in PerPixelPS),
+    // replacing the standalone renderShadowReceiverFromCache receiver re-draw of this
+    // same object set. Because the fold rides the color draws it tracks visKeys exactly
+    // (occlusion-culled objects are absent from both), and shadows cost zero extra draws.
+    // Main view: view -> world (inverse view) -> shadow clip; sunVecView is already the
+    // main-view sun (setupCommonEffect; renderCachedOpaque runs before any reflected
+    // swap). Gate matches the engine's own receiver pass (renderShadow in renderStage1:
+    // isDistantCell + shadows enabled + weather) so the cache scene shadows wherever the
+    // engine scene would. NOT gated on !IsMenu: menu frames keep the (stale) atlas the
+    // last non-menu frame rendered and the receiver still applies it — dropping the fold
+    // during menus would make cache shadows vanish whenever a menu is open. A non-distant
+    // cell never has a valid atlas, so isDistantCell() guards that. shadowReflMult = 1
+    // (no handover fade in the main view, all near is cache-owned).
+    auto mwBridge = MWBridge::get();
+    const bool foldShadows = (Configuration.MGEFlags & USE_SHADOWS) && isDistantCell()
+        && mwBridge->CellHasWeather();
+    if (foldShadows) {
+        D3DXMATRIX invView, viewToShadow[2];
+        D3DXMatrixInverse(&invView, nullptr, view);
+        viewToShadow[0] = invView * smViewproj[0];
+        viewToShadow[1] = invView * smViewproj[1];
+        effect->SetMatrixArray(ehShadowViewproj, viewToShadow, 2);
+        effect->SetFloat(ehShadowReflMult, 1.0f);
+        FixedFunctionShader::setCacheShadow(texSoftShadow, true);
+    }
 
     // Consume the SAME deterministic set the depth pre-pass drove off this frame
     // (frustumVisibleKeys / buildFrustumVisibleSet) rather than re-culling per part.
@@ -445,6 +474,13 @@ void DistantLand::renderCachedOpaque(const D3DXMATRIX* view, const D3DXMATRIX* p
     for (uint32_t key : visKeys) {
         auto it = cacheMap.find(key);
         if (it != cacheMap.end()) drawEntry(it->second);
+    }
+
+    // Shadow fold off + full strength for everything after this pass (the main scene
+    // shares the FFE shader; the gate must never leak past the cache opaque draws).
+    if (foldShadows) {
+        FixedFunctionShader::setCacheShadow(nullptr, false);
+        effect->SetFloat(ehShadowReflMult, 1.0f);
     }
 
     if (logPerf && (++s_calls % 300 == 0)) {
@@ -749,6 +785,7 @@ void DistantLand::renderReflectionTerrainFromCache(const D3DXMATRIX* view, const
 // water clip.
 void DistantLand::renderCachedTerrain(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
     MGE_ZoneScopedN("renderCachedTerrain");
+    DrawStats::ScopedStage _ds(DrawStats::CacheTerrain);   // cache near terrain (split from scene0)
 
     const auto& cacheMap = MGE::GeometryCache::cache();
     if (cacheMap.empty()) return;
@@ -759,9 +796,15 @@ void DistantLand::renderCachedTerrain(const D3DXMATRIX* view, const D3DXMATRIX* 
     // already set it to mwProj, but be self-contained for the object-less case).
     device->SetTransform(D3DTS_PROJECTION, proj);
 
-    D3DXMATRIX viewproj;
-    D3DXMatrixMultiply(&viewproj, view, proj);
-    ViewFrustum frustum(&viewproj);
+    // Consume the SAME engine-visible set the depth pre-pass and the opaque pass drive
+    // off (frustumVisibleKeys / buildFrustumVisibleSet). Terrain tiles ARE in that set:
+    // the engine's MSOC classify covers worldLandscapeRoot, so the set already carries
+    // the engine's occlusion-culled terrain (the [VISKEYS] land count). Iterating it here
+    // instead of re-frustum-culling the full ~2304-tile cache drops cache terrain to the
+    // engine's drawn count (no occluded tiles behind hills), and keeps depth/opaque/terrain
+    // replaying one identical set. The handover band clip plane (set by the caller) still
+    // far-cuts to nearViewRange so the DL LOD owns everything beyond.
+    const std::vector<uint32_t>& visKeys = frustumVisibleKeys();
 
     // Texture-light setup: bind the shared light-data texture once; per patch we run
     // the same selection the object path uses and push lightIndices/lightDataParams/
@@ -773,6 +816,27 @@ void DistantLand::renderCachedTerrain(const D3DXMATRIX* view, const D3DXMATRIX* 
     effect->SetMatrix(ehTexLightView, view);
     float idxFloats[8 * 4] = { 0 };
 
+    // Sun shadow fold (CacheTerrainLitPS samples inline, mirroring the FFE object fold).
+    // Main-view view -> world (inverse view) -> shadow clip; sunVecView is already the
+    // main-view sun. The fold is gated by shadowReflMult: 1 = shadowed (shadows enabled +
+    // weather + not a menu, the condition that filled texSoftShadow this frame), 0 = no
+    // fold. Replaces the standalone main-view terrain receiver (renderShadowReceiverFromCache).
+    // Gate matches the engine receiver (isDistantCell + shadows + weather); NOT gated on
+    // !IsMenu so cache terrain keeps shadows while a menu is open (the atlas stays valid,
+    // just not regenerated). isDistantCell() guards the no-atlas case.
+    auto mwBridge = MWBridge::get();
+    const bool foldShadows = (Configuration.MGEFlags & USE_SHADOWS) && isDistantCell()
+        && mwBridge->CellHasWeather();
+    if (foldShadows) {
+        D3DXMATRIX invView, viewToShadow[2];
+        D3DXMatrixInverse(&invView, nullptr, view);
+        viewToShadow[0] = invView * smViewproj[0];
+        viewToShadow[1] = invView * smViewproj[1];
+        effect->SetMatrixArray(ehShadowViewproj, viewToShadow, 2);
+        effect->SetTexture(ehTex3, texSoftShadow);
+    }
+    effect->SetFloat(ehShadowReflMult, foldShadows ? 1.0f : 0.0f);
+
     // Hold the snapshot lock across the patch loop: selectTextureLights reads the
     // point-light snapshot (and, on a revision bump, uploads texLightData) under it.
     MGE::SceneGraph::SnapshotReadLock snapshotLock;
@@ -781,19 +845,20 @@ void DistantLand::renderCachedTerrain(const D3DXMATRIX* view, const D3DXMATRIX* 
         std::min<unsigned int>((unsigned int)snapshotLights.size(), FixedFunctionShader::maxTexLights());
 
     effect->BeginPass(PASS_RENDERCACHETERRAINLIT);
-    for (const auto& kv : cacheMap) {
-        const auto& e = kv.second;
+    for (uint32_t key : visKeys) {
+        auto it = cacheMap.find(key);
+        if (it == cacheMap.end()) continue;
+        const auto& e = it->second;
         if (!e.isLandscape || e.isSkinned) continue;
         if (!e.d3dTexture) continue;          // need at least a base texture
         IDirect3DVertexBuffer9* vb = e.readVB();
         if (!vb || !e.ib) continue;
 
-        // Cull by the true world-space bound sphere (the patch origin is the cell
-        // corner, ~4096u from the real center — using it falsely culls the patch the
-        // camera stands on). No near-dist limit: all cache landscape is near terrain.
+        // World-space bound for the light-selection AABB. No frustum/occlusion cull here:
+        // visKeys is already the engine's culled drawn set. (Patch origin is the cell
+        // corner ~4096u off the real center, so use the true world bound, not the origin.)
         BoundingSphere bs;
         cacheWorldBounds(e, bs.center, bs.radius);
-        if (frustum.ContainsSphere(bs) == ViewFrustum::OUTSIDE) continue;
 
         // Per-patch point-light selection (sphere-AABB nearest-32), byte-identical to
         // the object path. AABB from the patch's world bound sphere.
@@ -826,121 +891,12 @@ void DistantLand::renderCachedTerrain(const D3DXMATRIX* view, const D3DXMATRIX* 
         device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, e.vertexCount, 0, e.triangleCount);
     }
     effect->EndPass();
+
+    // Full receiver strength for everything after this pass (shared param must not leak).
+    effect->SetFloat(ehShadowReflMult, 1.0f);
 }
 
-// renderShadowReceiverFromCache - main-view sibling of renderReflectionShadowsFromCache.
-// Re-draws the cache opaque set (textured objects + terrain + skinned NPCs) as sun-
-// shadow receivers AT THE SNAPSHOT POSE, so the receiver depth is bit-consistent with
-// the cache color/depth that renderCachedOpaque/renderCachedTerrain wrote. The default
-// receiver (renderShadow over recordMW) replays the engine's LIVE pose; with the async
-// scene-graph walk the snapshot is one frame stale, so a live-pose receiver mismatches
-// the cache depth and flickers on animated geometry (waving banners). renderShadow()
-// skips the cache-covered set (skipCacheCovered) and this owns it instead. Full strength
-// (no distant-land handover fade — the whole near scene is cache-owned in the main view).
-// The main-view sun (ehSunVecView) is already bound by setupCommonEffect (no reflected
-// swap), and the shadow lookup is view->world->shadow exactly as renderShadow() builds it.
-void DistantLand::renderShadowReceiverFromCache(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
-    MGE_ZoneScopedN("renderShadowReceiverFromCache");
-
-    const auto& cacheMap = MGE::GeometryCache::cache();
-    if (cacheMap.empty()) return;
-
-    // View space -> world (inverse view) -> shadow clip, same mapping renderShadow uses.
-    D3DXMATRIX invView, viewToShadow[2];
-    D3DXMatrixInverse(&invView, nullptr, view);
-    viewToShadow[0] = invView * smViewproj[0];
-    viewToShadow[1] = invView * smViewproj[1];
-    effect->SetMatrixArray(ehShadowViewproj, viewToShadow, 2);
-    effect->SetTexture(ehTex3, texSoftShadow);
-
-    D3DXMATRIX viewproj;
-    D3DXMatrixMultiply(&viewproj, view, proj);
-    ViewFrustum frustum(&viewproj);
-
-    effect->SetBool(ehHasBones, false);
-    effect->SetInt(ehVertexBlendState, 0);
-    effect->SetFloat(ehMaterialAlpha, 1.0f);
-    // Receiver alpha = materialAlpha (1), not vertex colour (terrain vcol.a is the
-    // AlphaGrid splat factor and must not modulate shadow strength).
-    effect->SetBool(ehHasVCol, false);
-    effect->SetFloat(ehShadowReflMult, 1.0f);   // full strength in the main view
-
-    // Non-skinned receivers (objects + terrain). Same covered set the cache color owns
-    // (textured, non-blend); untextured/alpha opaque stay on the recordMW receiver.
-    effect->BeginPass(PASS_RENDERSHADOWFFE);
-    for (const auto& kv : cacheMap) {
-        const auto& e = kv.second;
-        if (e.isSkinned) continue;          // skinned receiver = skinIndexed pass below
-        if (e.blendEnable) continue;
-        if (!e.d3dTexture) continue;        // untextured opaque is engine-drawn (recordMW receiver)
-        IDirect3DVertexBuffer9* vb = e.readVB();
-        if (!vb || !e.ib) continue;
-
-        BoundingSphere bs;
-        cacheWorldBounds(e, bs.center, bs.radius);
-        if (frustum.ContainsSphere(bs) == ViewFrustum::OUTSIDE) continue;
-
-        D3DXMATRIX wv;
-        D3DXMatrixMultiply(&wv, reinterpret_cast<const D3DXMATRIX*>(e.worldTransformD3D), view);
-        D3DXMATRIX pal[4] = { wv, wv, wv, wv };
-        effect->SetMatrixArray(ehVertexBlendPalette, pal, 4);
-
-        if (e.alphaTest && e.d3dTexture) {
-            effect->SetTexture(ehTex0, e.d3dTexture);
-            effect->SetBool(ehHasAlpha, true);
-            effect->SetFloat(ehAlphaRef, e.alphaRef);
-        } else {
-            effect->SetTexture(ehTex0, nullptr);
-            effect->SetBool(ehHasAlpha, false);
-            effect->SetFloat(ehAlphaRef, -1.0f);
-        }
-        effect->CommitChanges();
-
-        // Main-view winding matches the cache color pass (CW normal, CCW mirrored).
-        device->SetRenderState(D3DRS_CULLMODE, e.mirrored ? D3DCULL_CCW : D3DCULL_CW);
-        device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kVBStride);
-        device->SetIndices(e.ib);
-        device->SetFVF(MGE::GeometryCache::kVBFVF);
-        DrawStats::count(e.triangleCount);
-        device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, e.vertexCount, 0, e.triangleCount);
-    }
-    effect->EndPass();
-
-    // Cache-skinned receivers (NPCs). Receiver depth rebuilt in the VS via 32-bone
-    // skinIndexed -> mul(view), bit-identical to the cache skinned color pass.
-    effect->BeginPass(PASS_RENDERSHADOWFFE_SKINNED);
-    for (const auto& kv : cacheMap) {
-        const auto& e = kv.second;
-        if (!e.isSkinned) continue;
-        if (e.skinnedUnsupported || e.numBones == 0) continue;
-        if (e.blendEnable) continue;
-        IDirect3DVertexBuffer9* vb = e.readVB();
-        if (!vb || !e.ib) continue;
-
-        BoundingSphere bs;
-        cacheSkinnedWorldBounds(e, bs.center, bs.radius);
-        if (frustum.ContainsSphere(bs) == ViewFrustum::OUTSIDE) continue;
-
-        const D3DXMATRIX* pal = reinterpret_cast<const D3DXMATRIX*>(e.bonePalette.data());
-        effect->SetMatrixArray(ehBoneMatrices, pal, (int)e.numBones);
-
-        if (e.alphaTest && e.d3dTexture) {
-            effect->SetTexture(ehTex0, e.d3dTexture);
-            effect->SetBool(ehHasAlpha, true);
-            effect->SetFloat(ehAlphaRef, e.alphaRef);
-        } else {
-            effect->SetTexture(ehTex0, nullptr);
-            effect->SetBool(ehHasAlpha, false);
-            effect->SetFloat(ehAlphaRef, -1.0f);
-        }
-        effect->CommitChanges();
-
-        device->SetRenderState(D3DRS_CULLMODE, e.mirrored ? D3DCULL_CCW : D3DCULL_CW);
-        device->SetVertexDeclaration(MGE::GeometryCache::skinnedDecl());
-        device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kSkinnedVBStride);
-        device->SetIndices(e.ib);
-        DrawStats::count(e.triangleCount);
-        device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, e.vertexCount, 0, e.triangleCount);
-    }
-    effect->EndPass();
-}
+// renderShadowReceiverFromCache removed: the main-view sun shadow is now folded into
+// the cache color passes (applyCacheShadow in renderCachedOpaque's FFE draws,
+// cacheTerrainSunShadow in renderCachedTerrain), so receivers ride the color draws and
+// track the occlusion-culled visKeys exactly — no separate full-cache receiver re-draw.

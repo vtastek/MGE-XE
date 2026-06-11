@@ -71,11 +71,6 @@ public:
     // Read once per frame at renderStage0 entry so inspectIndexedPrimitive sees
     // a stable value for the whole frame.
     static bool cacheOpaqueMode;
-    // A/B toggle (NUMPAD4): when true, buildFrustumVisibleSet subtracts MSOC's
-    // positive per-frame OCCLUDED verdict (occluded-geom callback) from the cache
-    // visible set — static objects only, gated by freshness + an eye-translation
-    // guard. False = frustum-only (the post-675b0ab baseline). Default true.
-    static bool refineCacheCullWithMSOC;
     // Set by frameSetupEarly() when the GeometryCache walk ran at BeginScene(0);
     // read by renderDepth (different TU) to skip its own redundant walk.
     static bool earlyWalkedCache;
@@ -487,11 +482,6 @@ public:
     // — kept for the distant-statics path and as the foundation for Phase 3 (an
     // early MGE-driven MSOC mask over the cache, replacing this lagged verdict).
     static const std::unordered_set<uint32_t>& visibleCacheKeys();
-    // MSOC occluded-geom callback sink (complement of updateVisibleSet). Records the
-    // set of cache keys MSOC proved OCCLUDED this frame + the fact a drain ran, for
-    // buildFrustumVisibleSet to subtract. Main-thread only (fires inside the engine's
-    // drainPendingDisplays), same as updateVisibleSet.
-    static void updateOccludedSet(void* const* shapes, int count);
     // The deterministic current-frame frustum-visible set (s_frustumVisibleKeys),
     // built by buildFrustumVisibleSet. The cache opaque color pass consumes it so it
     // stays in lockstep with the depth pre-pass (same set). Keys = GeometryCache keys.
@@ -512,15 +502,11 @@ public:
     static void renderShadowLayerGeneric(MWBridge* mwBridge, int layer, const D3DXMATRIX* inverseCameraProj, D3DXMATRIX* view, D3DXMATRIX* proj, VisibleSet<T>& visible_set);
     static void renderShadowLayer(int layer, float radius, const D3DXMATRIX* inverseCameraProj);
     // skipCacheCovered: in CACHE mode (scene 0), skip the recordMW entries the cache
-    // owns (textured opaque) — their shadow receiver comes from the cache instead
-    // (renderShadowReceiverFromCache), at the snapshot pose, so the async-stale
-    // snapshot doesn't flicker against a live-pose receiver on animated geometry.
+    // owns (textured opaque) — their shadow receiver is folded into the cache color
+    // passes (applyCacheShadow in renderCachedOpaque, cacheTerrainSunShadow in
+    // renderCachedTerrain) at the snapshot pose, so the async-stale snapshot doesn't
+    // flicker against a live-pose receiver on animated geometry.
     static void renderShadow(bool skipCacheCovered = false);
-    // Main-view cache shadow receiver (CACHE mode): re-draws the cache opaque set
-    // (objects + terrain + skinned) as shadow receivers at the snapshot pose, so the
-    // receiver depth matches the cache color/depth. Main-view sibling of
-    // renderReflectionShadowsFromCache (full strength, no handover fade).
-    static void renderShadowReceiverFromCache(const D3DXMATRIX* view, const D3DXMATRIX* proj);
     static void renderShadowDebug();
 
     static void postProcess();
