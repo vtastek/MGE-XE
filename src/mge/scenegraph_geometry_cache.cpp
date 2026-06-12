@@ -4,6 +4,7 @@
 #include "NIGeometry.h"
 #include "NIGeometryData.h"
 #include "NINode.h"
+#include "NISwitchNode.h"
 #include "NIProperty.h"
 #include "NIRTTIDefines.h"
 #include "NISourceTexture.h"
@@ -70,6 +71,10 @@ namespace MGE::GeometryCache {
         void extractMaterial(CachedGeometry& e, NI::Geometry* geom) {
             e.d3dTexture  = nullptr;
             e.d3dOverlay  = nullptr;
+            e.d3dDark     = nullptr;
+            e.d3dDetail   = nullptr;
+            e.d3dGlow     = nullptr;
+            e.baseUV = e.darkUV = e.detailUV = e.glowUV = 0;
             e.textureName = nullptr;
             e.alphaRef    = 0.0f;
             e.alphaTest   = false;
@@ -113,8 +118,30 @@ namespace MGE::GeometryCache {
                         auto* st = static_cast<NI::SourceTexture*>(tex);
                         e.textureName = st->fileName;
                         e.d3dTexture  = getDX9Texture(tex);
+                        e.baseUV = baseMap->texCoordSet >= 3u ? 3u : static_cast<uint8_t>(baseMap->texCoordSet);
                     }
                 }
+                // Multi-map siblings (dark/detail/glow) on the same property — the
+                // PPL fixed-function blend the cache color pass reconstructs. Store
+                // the D3D9 texture and the UV set it samples (its true texCoordSet,
+                // clamped to 0..3). uploadEntry sizes the VB so every used set is
+                // carried (e.g. the glow-mod detail map on set 2).
+                auto captureMap = [&](NI::TexturingProperty::Map* map,
+                                      IDirect3DTexture9*& outTex, uint8_t& outUV) {
+                    if (!map || !map->texture) return;
+                    auto* mtex = map->texture.get();
+                    if (!mtex->isInstanceOfType(NI::RTTIStaticPtr::NiSourceTexture)) return;
+                    IDirect3DTexture9* d3d = getDX9Texture(mtex);
+                    if (!d3d) return;
+                    outTex = d3d;
+                    // Store the map's TRUE UV set (clamped to 3 — FFE texcoordIndex is
+                    // 2-bit / FVF carries <=4 sets). uploadEntry sizes the VB to cover it.
+                    outUV  = map->texCoordSet >= 3u ? 3u : static_cast<uint8_t>(map->texCoordSet);
+                };
+                captureMap(ps->texture->getDarkMap(),   e.d3dDark,   e.darkUV);
+                captureMap(ps->texture->getDetailMap(), e.d3dDetail, e.detailUV);
+                captureMap(ps->texture->getGlowMap(),   e.d3dGlow,   e.glowUV);
+
                 // Terrain decal overlay: maps[6] = DECAL_1 (the second land texture
                 // for splat blending). Present on multi-texture terrain patches.
                 if (ps->texture->maps.getEndIndex() > 6u) {
@@ -138,6 +165,10 @@ namespace MGE::GeometryCache {
             float u, v;        // TEXCOORD0 ( 8, from UV set 0)
         };
         static_assert(sizeof(DepthVertex) == 36, "DepthVertex size mismatch");
+        // Multi-map shapes append extra UV sets after the TEXCOORD0 of DepthVertex
+        // (stride = kVBStridePos + 8*uvSetCount). uploadEntry writes them with a
+        // generic byte-offset writer rather than a fixed struct, so 1..4 UV sets
+        // share one code path; the depth/shadow VS read only TEXCOORD0.
 
         // Skinned vertex layout matching SkinnedVertIn (VS palette skinning input).
         // Drawn with g_skinnedDecl; stride 56.
@@ -164,20 +195,43 @@ namespace MGE::GeometryCache {
                 return;
             }
 
-            // On a size change, drop both slots + IB so they repopulate at the new size.
-            const bool sizeChanged = (e.vertexCount != vertexCount) || (e.triangleCount != triCount);
+            // UV-set count: carry as many sets as the maps actually use (the glow-mod
+            // windows put base/dark on sets 0/1 and the detail map on set 2). The maps'
+            // texCoordSets were captured in extractMaterial (which runs first). Bound by
+            // the mesh's own set count and 4 (FFE texcoordIndex is 2-bit). Per-set blocks
+            // are contiguous in textureCoords — set s starts at +s*storedVerts, sized by
+            // the data's stored vertexCount. Single-UV geometry resolves to count 1.
+            // Landscape excluded: terrain splats via d3dOverlay and its passes bind the
+            // single-UV stride unconditionally.
+            const uint16_t storedVerts = data->vertexCount;
+            uint8_t maxMapUV = e.baseUV;
+            if (e.d3dDark)   maxMapUV = std::max(maxMapUV, e.darkUV);
+            if (e.d3dDetail) maxMapUV = std::max(maxMapUV, e.detailUV);
+            if (e.d3dGlow)   maxMapUV = std::max(maxMapUV, e.glowUV);
+            const uint8_t availSets = data->textureCoords
+                ? static_cast<uint8_t>(std::min<unsigned>(data->textureSets, 4u)) : 1u;
+            uint8_t uvSetCount = std::min<uint8_t>(static_cast<uint8_t>(maxMapUV + 1), availSets);
+            if (uvSetCount < 1 || g_walkingLandscape) uvSetCount = 1;
+            const unsigned int stride = MGE::GeometryCache::kVBStridePos + 8u * uvSetCount;
+            const DWORD vbFVF = MGE::GeometryCache::kVBFVFBase
+                              | (static_cast<DWORD>(uvSetCount) << D3DFVF_TEXCOUNT_SHIFT);
+
+            // On a size OR UV-layout change, drop both slots + IB so they repopulate
+            // at the new size/stride.
+            const bool sizeChanged = (e.vertexCount != vertexCount)
+                || (e.triangleCount != triCount) || (e.uvSetCount != uvSetCount);
             if (sizeChanged) {
                 releaseEntry(e);
             }
 
             const uint8_t slot = 1u - e.writeSlot;
 
-            // Model-space VB (XYZ|NORMAL|DIFFUSE|TEX1); per-draw world*view palette.
+            // Model-space VB (XYZ|NORMAL|DIFFUSE|TEXn); per-draw world*view palette.
             if (!e.vb[slot]) {
                 HRESULT hr = g_device->CreateVertexBuffer(
-                    vertexCount * sizeof(DepthVertex),
+                    vertexCount * stride,
                     D3DUSAGE_WRITEONLY,
-                    MGE::GeometryCache::kVBFVF,
+                    vbFVF,
                     D3DPOOL_MANAGED, &e.vb[slot], nullptr);
                 if (FAILED(hr)) { e.vb[slot] = nullptr; return; }
             }
@@ -191,21 +245,42 @@ namespace MGE::GeometryCache {
 
             void* vbData = nullptr;
             if (SUCCEEDED(e.vb[slot]->Lock(0, 0, &vbData, 0))) {
-                auto* verts = static_cast<DepthVertex*>(vbData);
-                const auto* uvs = data->textureCoords;  // NI::Point2*, nullptr if no UVs
+                const auto* uvs = data->textureCoords;  // NI::Point2*, set-major, nullptr if no UVs
                 const auto* nrm = data->normal;         // NI::Point3*, nullptr if no normals
                 const auto* vcol = data->color;         // NI::PackedColor*(b,g,r,a)=D3DCOLOR, null if none
+                // Generic writer: DepthVertex prefix (pos+normal+color+UV0) then 8 bytes
+                // per additional UV set. Set s for vertex i lives at uvs[s*storedVerts+i]
+                // (set-major, confirmed by the [MULTIMAP] raw dump). Walk by byte offset
+                // so 1..4 UV sets share one path.
+                auto* base = static_cast<uint8_t*>(vbData);
+                // Tight model-space AABB over the verts (for world-AABB light
+                // selection that matches the reactive computeBoundingBox).
+                float mn[3] = { mv[0].x, mv[0].y, mv[0].z };
+                float mx[3] = { mv[0].x, mv[0].y, mv[0].z };
                 for (uint32_t i = 0; i < vertexCount; ++i) {
-                    verts[i].x = mv[i].x; verts[i].y = mv[i].y; verts[i].z = mv[i].z;
+                    auto* v = reinterpret_cast<DepthVertex*>(base + i * stride);
+                    v->x = mv[i].x; v->y = mv[i].y; v->z = mv[i].z;
+                    if (mv[i].x < mn[0]) mn[0] = mv[i].x; if (mv[i].x > mx[0]) mx[0] = mv[i].x;
+                    if (mv[i].y < mn[1]) mn[1] = mv[i].y; if (mv[i].y > mx[1]) mx[1] = mv[i].y;
+                    if (mv[i].z < mn[2]) mn[2] = mv[i].z; if (mv[i].z > mx[2]) mx[2] = mv[i].z;
                     // Model-space normals; lit by renderMorrowind in the cache color pass
                     // (Phase 0.5). Depth/shadow ignore them. Up if the mesh has none.
-                    if (nrm) { verts[i].nx = nrm[i].x; verts[i].ny = nrm[i].y; verts[i].nz = nrm[i].z; }
-                    else     { verts[i].nx = 0.0f; verts[i].ny = 0.0f; verts[i].nz = 1.0f; }
+                    if (nrm) { v->nx = nrm[i].x; v->ny = nrm[i].y; v->nz = nrm[i].z; }
+                    else     { v->nx = 0.0f; v->ny = 0.0f; v->nz = 1.0f; }
                     // PackedColor byte order (b,g,r,a) is exactly D3DCOLOR, copy straight.
-                    verts[i].color = vcol ? *reinterpret_cast<const DWORD*>(&vcol[i]) : 0xFFFFFFFF;
-                    verts[i].u = uvs ? uvs[i].x : 0.0f;
-                    verts[i].v = uvs ? uvs[i].y : 0.0f;
+                    v->color = vcol ? *reinterpret_cast<const DWORD*>(&vcol[i]) : 0xFFFFFFFF;
+                    v->u = uvs ? uvs[i].x : 0.0f;          // UV set 0
+                    v->v = uvs ? uvs[i].y : 0.0f;
+                    // Extra UV sets 1..uvSetCount-1, appended after TEXCOORD0.
+                    auto* extra = reinterpret_cast<float*>(base + i * stride + 36);
+                    for (uint8_t s = 1; s < uvSetCount; ++s) {
+                        const auto& p = uvs[s * storedVerts + i];
+                        *extra++ = p.x;
+                        *extra++ = p.y;
+                    }
                 }
+                e.aabbMin[0] = mn[0]; e.aabbMin[1] = mn[1]; e.aabbMin[2] = mn[2];
+                e.aabbMax[0] = mx[0]; e.aabbMax[1] = mx[1]; e.aabbMax[2] = mx[2];
                 e.vb[slot]->Unlock();
             }
 
@@ -229,6 +304,9 @@ namespace MGE::GeometryCache {
             e.isSkinned          = false;
             e.numBones           = 0;
             e.skinnedUnsupported = false;
+            e.uvSetCount         = uvSetCount;
+            e.vbStride           = static_cast<uint16_t>(stride);
+            e.vbFVF              = vbFVF;
             e.hasVertexColor     = (data->color != nullptr);
 
             const auto& b = data->bounds;
@@ -263,6 +341,9 @@ namespace MGE::GeometryCache {
             e.revisionID         = data->revisionID;
             e.isSkinned          = true;
             e.numBones           = numBones;
+            e.uvSetCount         = 1;       // skinnedDecl carries one UV set; multi-map is non-skinned only
+            e.vbStride           = MGE::GeometryCache::kSkinnedVBStride;
+            e.vbFVF              = 0;        // skinned draws use skinnedDecl, not an FVF
             e.hasVertexColor     = (data->color != nullptr);   // Phase 2: skinned VB now carries colour
 
             if (numBones > MGE::GeometryCache::kMaxBones) {
@@ -443,13 +524,15 @@ namespace MGE::GeometryCache {
                 auto& e = g_cache[key];
                 e.vb[0] = e.vb[1] = nullptr; e.ib = nullptr; e.writeSlot = 0;
                 e.numBones = 0; e.skinnedUnsupported = false;
+                // Material first: uploadEntry reads the captured map UV sets (baseUV/
+                // darkUV/detailUV/glowUV, set here) to size the VB's UV-set count.
+                extractMaterial(e, geom);
                 if (sk) {
                     buildSkinnedVB(e, geom, data, si, sd);          // static
                     if (!e.skinnedUnsupported) buildBonePalette(e, geom, si, sd);
                 } else {
                     uploadEntry(e, geom, data);
                 }
-                extractMaterial(e, geom);
                 buildD3DTransform(e.worldTransformD3D, geom);       // bounds center
                 e.dynamicHint = (sk || inCharacter) ? 4 : 0;
                 e.lastFrame = g_frame;
@@ -464,8 +547,8 @@ namespace MGE::GeometryCache {
                 if (sk) {
                     // Static skinned VB: rebuild only on revision / skin-state change.
                     if (data->revisionID != e.revisionID || !e.isSkinned) {
-                        buildSkinnedVB(e, geom, data, si, sd);
                         extractMaterial(e, geom);
+                        buildSkinnedVB(e, geom, data, si, sd);
                     }
                     if (!e.skinnedUnsupported) buildBonePalette(e, geom, si, sd);  // per frame
                     buildD3DTransform(e.worldTransformD3D, geom);            // bounds center
@@ -473,8 +556,8 @@ namespace MGE::GeometryCache {
                 } else {
                     const bool changed = (data->revisionID != e.revisionID) || e.isSkinned;
                     if (changed) {
-                        uploadEntry(e, geom, data);
                         extractMaterial(e, geom);
+                        uploadEntry(e, geom, data);
                     }
                     if (inCharacter) {
                         buildD3DTransform(e.worldTransformD3D, geom);
@@ -494,11 +577,32 @@ namespace MGE::GeometryCache {
             }
         }
 
-        void walk(NI::AVObject* av, bool inCharacter = false) {
-            if (!av || av->getAppCulled()) return;
+        // bypassCull skips the entry's own app-cull check. Used for a NiSwitchNode's
+        // active child: switchIndex already selected it, and a menu-frame cull pass may
+        // have transiently app-culled it; the cache frustum-culls later anyway.
+        void walk(NI::AVObject* av, bool inCharacter = false, bool bypassCull = false) {
+            if (!av) return;
+            if (!bypassCull && av->getAppCulled()) return;
 
             if (av->isInstanceOfType(NI::RTTIStaticPtr::NiTriBasedGeom)) {
                 visitGeometry(static_cast<NI::TriBasedGeometry*>(av), inCharacter);
+                return;
+            }
+
+            // NiSwitchNode (e.g. "Glow in the Dark"'s NightDaySwitch): only the child
+            // at switchIndex is displayed. Walk that child EXPLICITLY rather than
+            // iterating all children and trusting per-child app-cull — in menu frames
+            // the engine's cull pass can leave the inactive (day) variant un-culled and
+            // the active (night) one culled, so the generic NiNode path below would
+            // capture the wrong variant (day window showing while a menu is open).
+            // switchIndex < 0 means no active child. Bypass the active child's own
+            // app-cull so a transient menu cull can't drop it.
+            if (av->isInstanceOfType(NI::RTTIStaticPtr::NiSwitchNode)) {
+                auto* sw = static_cast<NI::SwitchNode*>(av);
+                const int idx = sw->switchIndex;
+                if (idx >= 0 && (size_t)idx < sw->children.getEndIndex()) {
+                    walk(sw->children.at(idx).get(), inCharacter, true);
+                }
                 return;
             }
 

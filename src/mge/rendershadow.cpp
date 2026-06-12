@@ -247,9 +247,12 @@ void DistantLand::renderShadowFromCache(int layer, const D3DXMATRIX* viewproj) {
         bindAlpha(e);
         effectShadow->CommitChanges();
         device->SetRenderState(D3DRS_CULLMODE, D3DCULL_CW);
-        device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kVBStride);
+        // Per-entry stride/FVF: multi-map objects carry extra UV sets. The shadow
+        // caster VS reads only position, but the stream stride MUST match the VB layout
+        // or vertices past the first are misaligned.
+        device->SetStreamSource(0, vb, 0, e.vbStride);
         device->SetIndices(e.ib);
-        device->SetFVF(MGE::GeometryCache::kVBFVF);
+        device->SetFVF(e.vbFVF);
         DrawStats::count(e.triangleCount);
         device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, e.vertexCount, 0, e.triangleCount);
     }

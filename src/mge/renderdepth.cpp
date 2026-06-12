@@ -475,9 +475,12 @@ void DistantLand::renderDepthFromCache(const D3DXMATRIX* gameView,
 
         bindMaterial(e);
         effectDepth->CommitChanges();
-        device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kVBStride);
+        // Per-entry stride/FVF: multi-map objects carry extra UV sets. The depth VS
+        // reads only TEXCOORD0, but the stream stride MUST match the VB layout or every
+        // vertex past the first is misaligned.
+        device->SetStreamSource(0, vb, 0, e.vbStride);
         device->SetIndices(e.ib);
-        device->SetFVF(MGE::GeometryCache::kVBFVF);
+        device->SetFVF(e.vbFVF);
         DrawStats::count(e.triangleCount);
         device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, e.vertexCount, 0, e.triangleCount);
     });

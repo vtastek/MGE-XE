@@ -48,6 +48,61 @@ static float cacheHandoverFade(const D3DXVECTOR3& center, const D3DXVECTOR3& eye
 // early deterministic visible-set build (renderdepth.cpp) and the cache color
 // passes here share one definition of the cull sphere.
 
+// A present map is usable only if the cache VB actually carries the UV set it
+// samples — i.e. its texCoordSet is within the entry's uvSetCount.
+static bool cacheMapActive(IDirect3DTexture9* tex, uint8_t uv, uint8_t uvSetCount) {
+    return tex != nullptr && uv < uvSetCount;
+}
+
+// One reconstructed fixed-function texture stage.
+struct CacheStage {
+    IDirect3DTexture9* tex;
+    uint8_t uv;          // texcoordIndex (the map's texCoordSet)
+    BYTE colorOp;
+    BYTE colorArg2;      // DIFFUSE for base, CURRENT for the rest
+    BYTE alphaOp;        // MODULATE (matched) or SELECTARG2 (keep prev alpha)
+};
+
+// Build the ordered cache texture-stage list, matching MW's LIVE fixed-function
+// setup (verified against [PPLFRS] A/B). Two rules, both load-bearing:
+//   1. Per-slot ops (NOT OpenMW's table — MW is the match target):
+//        BASE   : MODULATE(tex, DIFFUSE),   alpha MODULATE
+//        DARK   : MODULATE(tex, CURRENT),   alpha MODULATE
+//        DETAIL : MODULATE2X(tex, CURRENT), alpha keep-prev
+//        GLOW   : ADD(tex, CURRENT),        alpha keep-prev
+//      "keep-prev" alpha = MW's ALPHAOP DISABLE; encoded as SELECTARG2 so ShaderKey
+//      sees neither alphaOpMatched nor alphaOpSelect1 and the JIT leaves c.a alone.
+//   2. ORDER stages by texCoordSet ascending (MW assigns D3D stage index =
+//      texCoordSet, NOT map slot). The "Glow in the Dark" night mesh re-authors
+//      base/dark/detail across scrambled UV sets, so slot order != stage order;
+//      because each stage's [0,1] saturation clamps the running result, applying
+//      MODULATE2X at the wrong point made some windows over-bright in cache.
+//      stable_sort keeps slot order on ties (two maps sharing a UV set).
+// bindCacheTextures and buildCacheReflectionState both consume this, so the sampler
+// binding and the stage ops can never drift. Returns the stage count.
+static int buildCacheStages(const MGE::GeometryCache::CachedGeometry& e, CacheStage out[8]) {
+    int n = 0;
+    if (e.d3dTexture)
+        out[n++] = { e.d3dTexture, e.baseUV,   D3DTOP_MODULATE,   D3DTA_DIFFUSE, D3DTOP_MODULATE };
+    if (cacheMapActive(e.d3dDark,   e.darkUV,   e.uvSetCount))
+        out[n++] = { e.d3dDark,     e.darkUV,   D3DTOP_MODULATE,   D3DTA_CURRENT, D3DTOP_MODULATE };
+    if (cacheMapActive(e.d3dDetail, e.detailUV, e.uvSetCount))
+        out[n++] = { e.d3dDetail,   e.detailUV, D3DTOP_MODULATE2X, D3DTA_CURRENT, D3DTOP_SELECTARG2 };
+    if (cacheMapActive(e.d3dGlow,   e.glowUV,   e.uvSetCount))
+        out[n++] = { e.d3dGlow,     e.glowUV,   D3DTOP_ADD,        D3DTA_CURRENT, D3DTOP_SELECTARG2 };
+    std::stable_sort(out, out + n, [](const CacheStage& a, const CacheStage& b) { return a.uv < b.uv; });
+    return n;
+}
+
+// Bind the entry's textures to sampler slots in stage order (renderMorrowind reads
+// device texture[i] for stage i) — same buildCacheStages order the FragmentState uses.
+static void bindCacheTextures(IDirect3DDevice9* device,
+                              const MGE::GeometryCache::CachedGeometry& e) {
+    CacheStage stages[8];
+    const int n = buildCacheStages(e, stages);
+    for (int i = 0; i < n; ++i) device->SetTexture(i, stages[i].tex);
+}
+
 // buildCacheReflectionState - synthesize the RenderedState / FragmentState /
 // LightState that FixedFunctionShader::renderMorrowind expects, from a cache
 // entry's captured material + the frame-global sun/ambient. Mirrors the
@@ -68,7 +123,13 @@ static void buildCacheReflectionState(const MGE::GeometryCache::CachedGeometry& 
     // emissive, 2 ambient+diffuse. fvf drives ShaderKey only (the draw uses the
     // device-bound cache FVF); DIFFUSE present -> vertexColour=1.
     const bool useVCol = e.hasVertexColor && e.vColSource != 0;
-    rs.fvf            = D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_TEX1 | (useVCol ? D3DFVF_DIFFUSE : 0);
+    // TEXn matching the entry's uvSetCount: lifts the ShaderKey's uvSets so the JIT
+    // declares texcoord0..n-1 and the dark/detail/glow stages can sample their own
+    // sets (e.g. detail on set 2). Single-UV entries stay TEX1. DIFFUSE drives
+    // vertexColour. (ShaderKey clamps uvSets down to the max texcoordIndex actually
+    // used, so an over-stated count costs nothing.)
+    const DWORD texFvf = static_cast<DWORD>(e.uvSetCount) << D3DFVF_TEXCOUNT_SHIFT;
+    rs.fvf            = D3DFVF_XYZ | D3DFVF_NORMAL | texFvf | (useVCol ? D3DFVF_DIFFUSE : 0);
     rs.zWrite         = true;
     rs.cullMode       = D3DCULL_CCW;
     rs.useLighting    = true;
@@ -93,14 +154,23 @@ static void buildCacheReflectionState(const MGE::GeometryCache::CachedGeometry& 
     rs.vertCount = e.vertexCount; rs.startIndex = 0; rs.primCount = e.triangleCount;
 
     // ---- FragmentState ----
+    // Reconstruct MW's live fixed-function multi-map blend so the FFE JIT replays
+    // exactly what the reactive (PPL) path does on the same NiTexturingProperty. The
+    // per-slot ops AND the stage ORDER (by texCoordSet) come from buildCacheStages,
+    // shared with bindCacheTextures so the sampler binding matches. Single-map entries
+    // collapse to one stage, identical to before. Terminated by a DISABLE stage.
     memset(&frs, 0, sizeof(frs));
-    // Single-stage MODULATE(texture, diffuse); stage 1 DISABLE bounds activeStages.
-    FragmentState::Stage& s0 = frs.stage[0];
-    s0.colorOp   = D3DTOP_MODULATE; s0.colorArg1 = D3DTA_TEXTURE; s0.colorArg2 = D3DTA_DIFFUSE;
-    s0.alphaOp   = D3DTOP_MODULATE; s0.alphaArg1 = D3DTA_TEXTURE; s0.alphaArg2 = D3DTA_DIFFUSE;
-    s0.colorArg0 = D3DTA_CURRENT;   s0.alphaArg0 = D3DTA_CURRENT; s0.resultArg = D3DTA_CURRENT;
-    s0.texcoordIndex = 0;
-    frs.stage[1].colorOp = D3DTOP_DISABLE;   // memset 0 == colorOp 0 != DISABLE; set explicitly
+    CacheStage stages[8];
+    int ns = buildCacheStages(e, stages);
+    if (ns > 7) ns = 7;   // leave room for the DISABLE terminator at stage[7]
+    for (int i = 0; i < ns; ++i) {
+        FragmentState::Stage& s = frs.stage[i];
+        s.colorOp   = stages[i].colorOp; s.colorArg1 = D3DTA_TEXTURE; s.colorArg2 = stages[i].colorArg2;
+        s.alphaOp   = stages[i].alphaOp; s.alphaArg1 = D3DTA_TEXTURE; s.alphaArg2 = stages[i].colorArg2;
+        s.colorArg0 = D3DTA_CURRENT;     s.alphaArg0 = D3DTA_CURRENT; s.resultArg = D3DTA_CURRENT;
+        s.texcoordIndex = stages[i].uv;
+    }
+    frs.stage[ns].colorOp = D3DTOP_DISABLE;   // memset 0 == colorOp 0 != DISABLE; set explicitly
 
     frs.material.diffuse.r  = e.matDiffuse[0];  frs.material.diffuse.g  = e.matDiffuse[1];
     frs.material.diffuse.b  = e.matDiffuse[2];  frs.material.diffuse.a  = e.matDiffuse[3];
@@ -241,11 +311,16 @@ void DistantLand::renderReflectionsFromCache(const D3DXMATRIX* view, const D3DXM
         if (e.dynamicHint == 0 && bs.radius < 150.0f) continue;
 
         // World-space AABB for texture-light selection. The cache VB is WRITEONLY so
-        // renderMorrowind's computeBoundingBox can't read it and would fall back to the
-        // object origin (selecting lights as if the whole part were a point at its
-        // node origin -> wrong lights). Hand it the real bound, same as renderCachedOpaque.
-        const D3DXVECTOR3 lbMin(bs.center.x - bs.radius, bs.center.y - bs.radius, bs.center.z - bs.radius);
-        const D3DXVECTOR3 lbMax(bs.center.x + bs.radius, bs.center.y + bs.radius, bs.center.z + bs.radius);
+        // renderMorrowind's computeBoundingBox can't read it. Non-skinned: the TIGHT
+        // world AABB (matches reactive computeBoundingBox -> same light set; a fat
+        // sphere-cube over-selects). Skinned: the bone-derived sphere box.
+        D3DXVECTOR3 lbMin, lbMax;
+        if (e.isSkinned) {
+            lbMin = D3DXVECTOR3(bs.center.x - bs.radius, bs.center.y - bs.radius, bs.center.z - bs.radius);
+            lbMax = D3DXVECTOR3(bs.center.x + bs.radius, bs.center.y + bs.radius, bs.center.z + bs.radius);
+        } else {
+            cacheWorldAABB(e, lbMin, lbMax);
+        }
 
         buildCacheReflectionState(e, *view, sunVec, sunCol, sunAmb, ambCol, rs, frs, lightrs);
 
@@ -270,7 +345,9 @@ void DistantLand::renderReflectionsFromCache(const D3DXMATRIX* view, const D3DXM
 
         // Reflection base winding is inverted (CCW); a mirrored part flips again.
         device->SetRenderState(D3DRS_CULLMODE, e.mirrored ? D3DCULL_CW : D3DCULL_CCW);
-        device->SetTexture(0, e.d3dTexture);
+        // Base + any dark/detail/glow maps to consecutive sampler slots (packed to
+        // match the FragmentState stages buildCacheReflectionState emitted).
+        bindCacheTextures(device, e);
         device->SetIndices(e.ib);
 
         if (e.isSkinned) {
@@ -281,8 +358,9 @@ void DistantLand::renderReflectionsFromCache(const D3DXMATRIX* view, const D3DXM
             const D3DXMATRIX* pal = reinterpret_cast<const D3DXMATRIX*>(e.bonePalette.data());
             FixedFunctionShader::renderMorrowind(&rs, &frs, &lightrs, plMult, pal, (int)e.numBones, view, &lbMin, &lbMax);
         } else {
-            device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kVBStride);
-            device->SetFVF(MGE::GeometryCache::kVBFVF);
+            // Per-entry stride/FVF: dual-UV (44 / TEX2) for multi-map shapes, else 36 / TEX1.
+            device->SetStreamSource(0, vb, 0, e.vbStride);
+            device->SetFVF(e.vbFVF);
             FixedFunctionShader::renderMorrowind(&rs, &frs, &lightrs, plMult, nullptr, 0, nullptr, &lbMin, &lbMax);
         }
     }
@@ -419,20 +497,21 @@ void DistantLand::renderCachedOpaque(const D3DXMATRIX* view, const D3DXMATRIX* p
         IDirect3DVertexBuffer9* vb = e.readVB();
         if (!vb || !e.ib) return;
 
-        // World-space bound: skinned = bone-palette-derived posed bound; non-skinned
-        // = true world bound (not the object origin). Used for the texture-light
-        // selection AABB below (renderMorrowind can't read our WRITEONLY VB via
-        // computeBoundingBox, so we hand it these bounds — the object light-seam fix,
-        // keeping cache light selection identical to reactive).
-        BoundingSphere bs;
-        if (e.isSkinned) { cacheSkinnedWorldBounds(e, bs.center, bs.radius); }
-        else             { cacheWorldBounds(e, bs.center, bs.radius); }
-
-        // No per-part frustum test here: visKeys is already frustum-culled (and
-        // occlusion-refined) by buildFrustumVisibleSet. bs is still needed below for
-        // the texture-light selection AABB (renderMorrowind can't read our WRITEONLY VB).
-        const D3DXVECTOR3 lbMin(bs.center.x - bs.radius, bs.center.y - bs.radius, bs.center.z - bs.radius);
-        const D3DXVECTOR3 lbMax(bs.center.x + bs.radius, bs.center.y + bs.radius, bs.center.z + bs.radius);
+        // Texture-light selection AABB (renderMorrowind can't read our WRITEONLY VB
+        // via computeBoundingBox, so we hand it these bounds — the object light-seam
+        // fix). Non-skinned: the TIGHT world AABB (8 model-AABB corners transformed by
+        // the world matrix), byte-matching the reactive computeBoundingBox so the cache
+        // selects the SAME lights — a fat sphere-cube over-selects nearby lights and
+        // made windows brighter in cache. Skinned: the bone-palette-derived sphere box.
+        D3DXVECTOR3 lbMin, lbMax;
+        if (e.isSkinned) {
+            BoundingSphere bs;
+            cacheSkinnedWorldBounds(e, bs.center, bs.radius);
+            lbMin = D3DXVECTOR3(bs.center.x - bs.radius, bs.center.y - bs.radius, bs.center.z - bs.radius);
+            lbMax = D3DXVECTOR3(bs.center.x + bs.radius, bs.center.y + bs.radius, bs.center.z + bs.radius);
+        } else {
+            cacheWorldAABB(e, lbMin, lbMax);
+        }
 
         buildCacheMainState(e, *view, sunVec, sunCol, sunAmb, ambCol, rs, frs, lightrs);
 
@@ -451,7 +530,9 @@ void DistantLand::renderCachedOpaque(const D3DXMATRIX* view, const D3DXMATRIX* p
         // game-view space with `mirrored ? CCW : CW`. The main opaque pass matches:
         // CW normal, CCW for mirrored (negative-determinant) left-side parts.
         device->SetRenderState(D3DRS_CULLMODE, e.mirrored ? D3DCULL_CCW : D3DCULL_CW);
-        device->SetTexture(0, e.d3dTexture);
+        // Base + any dark/detail/glow maps to consecutive sampler slots (packed to
+        // match the FragmentState stages buildCacheMainState emitted).
+        bindCacheTextures(device, e);
         device->SetIndices(e.ib);
 
         if (e.isSkinned) {
@@ -462,8 +543,9 @@ void DistantLand::renderCachedOpaque(const D3DXMATRIX* view, const D3DXMATRIX* p
             const D3DXMATRIX* pal = reinterpret_cast<const D3DXMATRIX*>(e.bonePalette.data());
             FixedFunctionShader::renderMorrowind(&rs, &frs, &lightrs, 1.0f, pal, (int)e.numBones, view, &lbMin, &lbMax);
         } else {
-            device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kVBStride);
-            device->SetFVF(MGE::GeometryCache::kVBFVF);
+            // Per-entry stride/FVF: dual-UV (44 / TEX2) for multi-map shapes, else 36 / TEX1.
+            device->SetStreamSource(0, vb, 0, e.vbStride);
+            device->SetFVF(e.vbFVF);
             FixedFunctionShader::renderMorrowind(&rs, &frs, &lightrs, 1.0f, nullptr, 0, nullptr, &lbMin, &lbMax);
         }
         if (logPerf) ++s_drawn;
@@ -585,9 +667,10 @@ void DistantLand::renderReflectionShadowsFromCache(const D3DXMATRIX* view, const
         effect->CommitChanges();
 
         device->SetRenderState(D3DRS_CULLMODE, e.mirrored ? D3DCULL_CW : D3DCULL_CCW);
-        device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kVBStride);
+        // Per-entry stride/FVF: multi-map objects carry extra UV sets.
+        device->SetStreamSource(0, vb, 0, e.vbStride);
         device->SetIndices(e.ib);
-        device->SetFVF(MGE::GeometryCache::kVBFVF);
+        device->SetFVF(e.vbFVF);
         DrawStats::count(e.triangleCount);
         device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, e.vertexCount, 0, e.triangleCount);
     }

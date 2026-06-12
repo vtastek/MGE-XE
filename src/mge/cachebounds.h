@@ -32,6 +32,33 @@ inline void cacheWorldBounds(const MGE::GeometryCache::CachedGeometry& e, D3DXVE
     outRadius = e.boundsRadius * std::max(sx, std::max(sy, sz));
 }
 
+// World-space tight AABB for a NON-SKINNED cache entry: the 8 corners of the stored
+// model-space AABB transformed by the world matrix, then bounded. This mirrors
+// FixedFunctionShader::computeBoundingBox (which walks the VB) so the cache color
+// pass selects the SAME point lights as the reactive path — the cache VB is
+// WRITEONLY, so renderMorrowind can't compute it and would otherwise get a fat
+// sphere-cube box that over-selects lights (the "windows brighter in cache" delta).
+inline void cacheWorldAABB(const MGE::GeometryCache::CachedGeometry& e,
+                           D3DXVECTOR3& outMin, D3DXVECTOR3& outMax) {
+    const D3DXMATRIX& w = *reinterpret_cast<const D3DXMATRIX*>(e.worldTransformD3D);
+    const float* mn = e.aabbMin;
+    const float* mx = e.aabbMax;
+    bool first = true;
+    for (int c = 0; c < 8; ++c) {
+        const D3DXVECTOR3 corner((c & 1) ? mx[0] : mn[0],
+                                 (c & 2) ? mx[1] : mn[1],
+                                 (c & 4) ? mx[2] : mn[2]);
+        D3DXVECTOR3 wc;
+        D3DXVec3TransformCoord(&wc, &corner, &w);
+        if (first) { outMin = outMax = wc; first = false; }
+        else {
+            outMin.x = std::min(outMin.x, wc.x); outMax.x = std::max(outMax.x, wc.x);
+            outMin.y = std::min(outMin.y, wc.y); outMax.y = std::max(outMax.y, wc.y);
+            outMin.z = std::min(outMin.z, wc.z); outMax.z = std::max(outMax.z, wc.z);
+        }
+    }
+}
+
 // World-space bounding sphere for a SKINNED cache entry, derived from the per-frame
 // bone palette. The skinned VB is bind-pose; the posed geometry is placed entirely
 // by the bones, so the geom's node origin (worldTransformD3D) is NOT where the posed

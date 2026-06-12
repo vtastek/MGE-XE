@@ -31,6 +31,13 @@ namespace MGE::GeometryCache {
         uint32_t triangleCount;
         float    boundsCenter[3];       // model-space bound center (for culling)
         float    boundsRadius;          // model-space bound radius
+        // Tight model-space AABB (min/max over the mesh verts), captured at upload.
+        // Transformed (8 corners) to a world AABB for point-light selection, matching
+        // FixedFunctionShader::computeBoundingBox on the reactive path — the cache VB
+        // is WRITEONLY so renderMorrowind can't walk it. Non-skinned only; skinned
+        // entries keep the bone-derived sphere bound for light selection.
+        float    aabbMin[3];
+        float    aabbMax[3];
         uint16_t revisionID;            // GeometryData::revisionID at last upload
         bool     isSkinned;
         // Skinned: per-frame bone palette (model->world, 16 floats per bone) and
@@ -61,6 +68,31 @@ namespace MGE::GeometryCache {
         // alpha. Null for non-terrain / single-texture tiles. Drives the cache
         // terrain reflection's two-texture splat.
         IDirect3DTexture9* d3dOverlay;
+        // Multi-map texturing (e.g. "Glow in the Dark" night windows): the base
+        // map's DARK/DETAIL/GLOW siblings on the same NiTexturingProperty. Each is
+        // null when absent; *UV is the cached UV set the map samples (clamped to
+        // {0,1} — the VB carries at most a second UV set). The cache color pass
+        // reconstructs the PPL fixed-function multi-stage blend from these
+        // (MODULATE dark / MODULATE2X detail / ADD glow), matching the FFE JIT.
+        // BUMP/GLOSS are env-map effects MW disables in fixed function — out of
+        // scope; terrain DECAL_1 stays on d3dOverlay.
+        IDirect3DTexture9* d3dDark;
+        IDirect3DTexture9* d3dDetail;
+        IDirect3DTexture9* d3dGlow;
+        // Each map's true UV set (NI texCoordSet, clamped 0..3 — the FFE shader's
+        // texcoordIndex is 2-bit and an FVF carries at most 4 sets). The cache color
+        // pass sets each stage's texcoordIndex to these so a map samples its OWN set
+        // (e.g. the "Glow in the Dark" detail map on set 2), matching PPL. Glow-mod
+        // windows carry 3 UV sets: base(0), dark(1), detail(2).
+        uint8_t baseUV, darkUV, detailUV, glowUV;
+        // Non-skinned VB UV-set count + the derived stride/FVF. uvSetCount = the
+        // highest UV set any present map uses + 1, bounded by the mesh's set count and
+        // 4 (1 = ordinary single-UV geometry, the 99% case → stride 36). Every cache
+        // draw path binds vbStride/vbFVF per entry so depth/shadow/color agree on the
+        // layout. Skinned entries keep uvSetCount=1 (skinnedDecl has one UV set).
+        uint8_t  uvSetCount;
+        uint16_t vbStride;
+        uint32_t vbFVF;
         const char*        textureName; // SourceTexture::fileName, null if none
         float alphaRef;
         bool  alphaTest;
@@ -103,6 +135,13 @@ namespace MGE::GeometryCache {
     // Layout: float3 pos, float3 normal, DWORD color(0xFFFFFFFF), float2 uv
     static constexpr unsigned int kVBStride = 36;
     static constexpr unsigned int kVBFVF    = 0x152; // XYZ|NORMAL|DIFFUSE|TEX1
+
+    // Multi-map shapes carry extra UV sets. Per-entry stride = kVBStridePos (28:
+    // pos+normal+color) + 8 bytes per UV set; FVF = kVBFVFBase | (uvSetCount <<
+    // D3DFVF_TEXCOUNT_SHIFT). Computed into CachedGeometry::vbStride/vbFVF
+    // (uvSetCount 1..4). Single-UV geometry resolves to kVBStride/kVBFVF.
+    static constexpr unsigned int kVBStridePos = 28;
+    static constexpr unsigned int kVBFVFBase   = 0x052; // XYZ|NORMAL|DIFFUSE (no TEX bits)
 
     // Skinned vertex layout (SkinnedVertIn in the shaders): float3 pos,
     // float3 normal, float4 blendweights, UBYTE4 blendindices, float2 uv, DWORD color.
