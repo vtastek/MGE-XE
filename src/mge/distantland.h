@@ -490,6 +490,14 @@ public:
     // MSOC occlusion refinement (0 when disarmed). For the LogDistantPipeline line.
     static unsigned lastRefineCulled();
 
+    // Diagnostic: the reflection-statics pipeline stage counts from the last
+    // isReflectionWaterVisible + cullReflectionSurvivors run, surfaced so the main
+    // thread (logReflStaticNearFar) can show WHERE the count diverges on a jump.
+    static void getReflPipeDiag(int& tilesTested, int& waterPresent, int& waterOccluded,
+                                int& rects, int& queried, int& survivors, bool& msocUsable);
+    static void getReflPipeFlip(int& flips, float& distMinCells, float& distMaxCells,
+                                float& elevMinDeg, float& elevMaxDeg);
+
     static void renderShadowMap();
     static void renderShadowFromCache(int layer, const D3DXMATRIX* viewproj);
     // Clears one cascade's region of the shadow atlas (depth + stencil

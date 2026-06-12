@@ -23,6 +23,7 @@
 #include <queue>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -154,6 +155,42 @@ static float g_boxRadiusCells = 4.0f;   // voxelization radius, in game cells
 struct BoxDbgAABB { float x0, y0, x1, y1, zTop, zBot; };
 static std::vector<BoxDbgAABB> g_boxDbg;
 
+// [REFL PIPE] diagnostic: reflection-statics pipeline stage counts. Filled by
+// isReflectionWaterVisible (water-tile stages) and cullReflectionSurvivors (statics
+// in/out), read on the main thread by logReflStaticNearFar to pin WHERE the count
+// diverges on a jump frame. Plain ints; the worker fills, main reads — a benign
+// diagnostic race (no tearing concern at this granularity).
+struct ReflPipeDiag {
+    int tilesTested = 0, waterPresent = 0, waterOccluded = 0, rects = 0;
+    int queried = 0, survivors = 0;
+    bool msocUsable = false;
+    // Flip diagnostics: tiles whose in-range visible-state changed since last frame
+    // (the flickering ones). farness = horizontal distance (cells); tiltedness =
+    // elevation angle of the eye->tile ray above the water plane (grazing = small).
+    int   flips = 0;
+    float flipDistMinCells = 0, flipDistMaxCells = 0;
+    float flipElevMinDeg = 0, flipElevMaxDeg = 0;
+};
+static ReflPipeDiag g_reflPipe;
+
+// True once isReflectionWaterVisible ran its tile loop this frame (i.e. it did NOT
+// early-out on interior / no-terrain-data). Lets cullReflectionSurvivors tell apart
+// "gate ran and found no in-range water → cull statics" from "gate couldn't compute
+// → keep all (legacy fallback)". Reset per frame at the top of the gate.
+static bool g_reflRectsComputed = false;
+
+// 1-frame hysteresis on per-water-tile visibility. A borderline horizon tile can flip
+// occluded↔visible every frame (snapshot wobble / a box-occluder occasionally missing
+// its drain), and because each tile's rect catches hundreds of reflection statics that
+// makes the survivor count oscillate ~149↔576. Require a tile to read visible THIS
+// frame AND the previous frame before it contributes a static-cull rect: single-frame
+// visible blips are filtered, genuine sustained water passes (1 frame late). Keyed by
+// quantized tile-centre world position (absolute, so a cell change needs no reset — the
+// set is rebuilt every frame). Only gates rect emission; the anyVisible gate (terrain/
+// sky reflection) still uses the raw per-frame verdict.
+static std::unordered_set<int64_t> g_reflWaterVisLast;
+static std::unordered_set<int64_t> g_reflWaterVisThis;
+
 // Pre-transformed (pixel-space) coloured vertex for the curtain overlay. The
 // curtain is a screen-space construct, so XYZRHW is the honest representation —
 // it lands exactly where the wall sits on this frame's image.
@@ -241,6 +278,30 @@ struct MSOCCullDiag {
 };
 MSOCCullDiag g_msocCullDiag;
 } // namespace
+
+// [REFL PIPE] accessor — defined outside the anonymous namespace so it satisfies the
+// DistantLand member declaration; reads the file-static counters filled by the
+// reflection cull (worker) for the main-thread diagnostic line.
+void DistantLand::getReflPipeDiag(int& tilesTested, int& waterPresent, int& waterOccluded,
+                                  int& rects, int& queried, int& survivors, bool& msocUsable) {
+    tilesTested   = g_reflPipe.tilesTested;
+    waterPresent  = g_reflPipe.waterPresent;
+    waterOccluded = g_reflPipe.waterOccluded;
+    rects         = g_reflPipe.rects;
+    queried       = g_reflPipe.queried;
+    survivors     = g_reflPipe.survivors;
+    msocUsable    = g_reflPipe.msocUsable;
+}
+
+// [REFL PIPE FLIP] accessor — farness/tiltedness of the tiles that flipped this frame.
+void DistantLand::getReflPipeFlip(int& flips, float& distMinCells, float& distMaxCells,
+                                  float& elevMinDeg, float& elevMaxDeg) {
+    flips        = g_reflPipe.flips;
+    distMinCells = g_reflPipe.flipDistMinCells;
+    distMaxCells = g_reflPipe.flipDistMaxCells;
+    elevMinDeg   = g_reflPipe.flipElevMinDeg;
+    elevMaxDeg   = g_reflPipe.flipElevMaxDeg;
+}
 
 // True when this frame's verdict pass was dispatched to the worker (set by
 // signalCullFinish, consumed by the wait/finish helpers). Main-thread only.
@@ -1580,13 +1641,14 @@ void DistantLand::renderBoxOccluderDebug(const D3DXMATRIX* view, const D3DXMATRI
     g_boxDbg.clear();
 }
 
-// Water-reflection proxy visualizer (Numpad5). Draws the per-cell water slabs
+// Water-reflection proxy visualizer (Numpad1). Draws the per-cell water slabs
 // tested by isReflectionWaterVisible(), coloured by MSOC verdict (green visible,
 // red occluded, blue view-culled), depth-disabled so occluded slabs are still
-// inspectable behind buildings. Mirrors renderMSOCBasinBoundsDebug.
+// inspectable behind buildings. Mirrors renderMSOCBasinBoundsDebug. Moved off
+// Numpad5 (which fires the MSOC mask dump) so the two no longer collide.
 void DistantLand::renderWaterProxyBoundsDebug(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
     DrawStats::ScopedStage _ds(DrawStats::Debug);
-    if (GetAsyncKeyState(VK_NUMPAD5) & 0x0001) {
+    if (GetAsyncKeyState(VK_NUMPAD1) & 0x0001) {
         g_drawWaterProxyBounds = !g_drawWaterProxyBounds;
         char msg[64];
         std::snprintf(msg, sizeof(msg), "Water proxy boxes: %s",
@@ -2095,21 +2157,20 @@ void DistantLand::contributeTerrainBoxOccluders(const D3DXMATRIX& viewProj, bool
     const int   W = 2 * radius + 1, H = 2 * radius + 1;
     const int   baseGX = camGX - radius, baseGY = camGY - radius;
 
-    constexpr float kBoxDrop = 16384.0f;   // pillar depth (always inside heightfield)
     constexpr float kEmpty   = -1e30f;     // "no terrain / frustum-culled" sentinel
 
-    // Box floor. A fixed drop from the top is NOT enough: for a tall ridge,
-    // zTop - kBoxDrop can sit ABOVE water level, so a static at water level behind
-    // the ridge pokes out below the box and the sphere/group OBB occlusion test
-    // (which needs the whole bounds covered) fails to cull it. So the floor also
-    // reaches at least kBoxFloorBias below the water level — covering anything
-    // sitting at or near water level — whichever is deeper. Extending the box
-    // DOWN is always conservative: below the cell min it's still inside the
-    // heightfield, so it can only occlude things genuinely behind terrain.
+    // Box floor. The box only needs to reach far enough below the terrain min to
+    // cover statics sitting at/near water level behind a ridge — the OBB occlusion
+    // test needs the whole occludee bounds covered. A flat 500 units below water
+    // does it; the old 16k pillar was wasteful depth (and fed the looking-down
+    // frustum problem). The min with zTop keeps the box non-degenerate where the
+    // terrain min itself dips below water. Still conservative: the top is the cell
+    // min, buried in the heightfield, so the box only occludes things genuinely
+    // behind terrain.
     const float waterLevel    = (float)MWBridge::get()->WaterLevel();
-    constexpr float kBoxFloorBias = 8192.0f;
+    constexpr float kBoxFloorBelowWater = 500.0f;
     auto boxFloor = [&](float zTop) {
-        return std::min(zTop - kBoxDrop, waterLevel - kBoxFloorBias);
+        return std::min(zTop - kBoxFloorBelowWater, waterLevel - kBoxFloorBelowWater);
     };
 
     // Lateral frustum planes (left/right/bottom/top) from the passed view-proj
@@ -2144,7 +2205,29 @@ void DistantLand::contributeTerrainBoxOccluders(const D3DXMATRIX& viewProj, bool
             if (it == g_basinMinH.end()) continue;
             const float zt = it->second;
             const float x0 = gx * grid, x1 = x0 + grid, y0 = gy * grid, y1 = y0 + grid;
-            if (boxOutside(x0, y0, x1, y1, boxFloor(zt), zt)) continue;
+            // Frustum-cull by the box TOP FACE only, not the buried floor. The floor
+            // drops ~16k units (boxFloor) purely to extend downward occlusion for
+            // statics behind ridges; it is always below the local terrain min, so it
+            // never forms a visible silhouette and must not vote on visibility. When
+            // the camera pitches down, the tilted screen bottom/top planes widen with
+            // depth and the deep column's far-Z corner falls INSIDE the downward cone
+            // even when the surface is laterally off-screen — that is why looking at
+            // your feet kept all 546 boxes. Testing the slab at zt culls strictly more
+            // (for any plane with a negative z-coeff the p-vertex moves up to zt,
+            // lowering the dot), and removing a box only ever drops occlusion → more
+            // draws, never a visual gap. So the cull stays conservative.
+            if (boxOutside(x0, y0, x1, y1, zt, zt)) continue;
+            // DL-only exclusion: terrain boxes are DISTANT-LAND occluders. Within the
+            // near view distance the real terrain is rasterized full-res (aggregate
+            // terrain), so a box there is redundant AND harmful — its vertical wall is
+            // a cliff vs the gradual slope, near-clips into the view, and over-occludes
+            // upslope statics (the original flicker). So skip any box whose footprint is
+            // within the near view range of the eye; boxes only exist where DL takes
+            // over. (max with one grid cell keeps the minimum near-clip guard if the
+            // view distance is ever tuned very low.)
+            const float dlNearExcl = std::max(grid, nearViewRange);
+            if (distanceSqToAABB2D(eyePos.x, eyePos.y, x0, x1, y0, y1) <= dlNearExcl * dlNearExcl)
+                continue;
             cellH[(size_t)ly * W + lx] = zt;
         }
     }
@@ -2186,6 +2269,16 @@ void DistantLand::contributeTerrainBoxOccluders(const D3DXMATRIX& viewProj, bool
         }
     };
     auto emitBox = [&](float x0, float y0, float x1, float y1, float zTop) {
+        // Inflate the footprint 1.25x about its centre to close grid-vs-terrain
+        // misalignment gaps (adjacent boxes now overlap ~0.25 cell). Conservative: the
+        // top stays at the cell minimum (buried below the surface), so a wider box still
+        // only occludes things genuinely behind terrain — it just seals the seams.
+        {
+            const float cx = 0.5f * (x0 + x1), cy = 0.5f * (y0 + y1);
+            const float ex = 0.625f * (x1 - x0), ey = 0.625f * (y1 - y0);  // 1.25x half-extent
+            x0 = cx - ex; x1 = cx + ex;
+            y0 = cy - ey; y1 = cy + ey;
+        }
         const float zBot = boxFloor(zTop);
         const float corners[8][3] = {
             {x0,y0,zBot},{x1,y0,zBot},{x1,y1,zBot},{x0,y1,zBot},
@@ -2201,6 +2294,49 @@ void DistantLand::contributeTerrainBoxOccluders(const D3DXMATRIX& viewProj, bool
         for (int t = 0; t < 36; t += 3)
             emitTri(cc[kBoxTris[t]], cc[kBoxTris[t + 1]], cc[kBoxTris[t + 2]]);
     };
+
+    // Distance-graded coarsening (1024 near -> 2048 far). Boxes near the DL
+    // boundary keep the base grid; further out we collapse each world-aligned 2x2
+    // block onto one 2x-coarser box by stamping the block's MIN top onto all four
+    // members, so the greedy merge below fuses them. The outer rings dominate the
+    // disc area, so this roughly halves the box/tri count and keeps the batch under
+    // the shared occluder-tri budget. World-aligned (gx>>1, arithmetic shift floors
+    // in C++20) so the supercell lattice is frame-stable — array-space grouping
+    // would jitter distant boxes and pop distant statics in/out of occlusion. A
+    // supercell with ANY near member is left untouched (no near coarsening). MIN
+    // top keeps it at or below every member's terrain min, so still buried.
+    {
+        const float coarsenDist   = std::max(2.5f * kCellSize, nearViewRange + 1.5f * kCellSize);
+        const float coarsenDistSq = coarsenDist * coarsenDist;
+        auto cellDistSq = [&](int lx, int ly) {
+            const int gx = baseGX + lx, gy = baseGY + ly;
+            const float x0 = gx * grid, x1 = x0 + grid, y0 = gy * grid, y1 = y0 + grid;
+            return distanceSqToAABB2D(eyePos.x, eyePos.y, x0, x1, y0, y1);
+        };
+        static std::unordered_map<uint64_t, float> superMin;     // supercell -> min top
+        static std::unordered_set<uint64_t>        superBlocked; // supercell has a near member
+        superMin.clear();
+        superBlocked.clear();
+        for (int ly = 0; ly < H; ++ly)
+            for (int lx = 0; lx < W; ++lx) {
+                const size_t idx = (size_t)ly * W + lx;
+                if (cellH[idx] <= kEmpty + 1.0f) continue;
+                const uint64_t sk = waterGridKey((baseGX + lx) >> 1, (baseGY + ly) >> 1);
+                if (cellDistSq(lx, ly) <= coarsenDistSq) { superBlocked.insert(sk); continue; }
+                auto it = superMin.find(sk);
+                if (it == superMin.end()) superMin.emplace(sk, cellH[idx]);
+                else if (cellH[idx] < it->second) it->second = cellH[idx];
+            }
+        for (int ly = 0; ly < H; ++ly)
+            for (int lx = 0; lx < W; ++lx) {
+                const size_t idx = (size_t)ly * W + lx;
+                if (cellH[idx] <= kEmpty + 1.0f) continue;
+                if (cellDistSq(lx, ly) <= coarsenDistSq) continue;
+                const uint64_t sk = waterGridKey((baseGX + lx) >> 1, (baseGY + ly) >> 1);
+                if (superBlocked.count(sk)) continue;
+                cellH[idx] = superMin[sk];
+            }
+    }
 
     // Greedy merge: group adjacent cells in the same height bucket into rectangles.
     constexpr float kBucket = 1024.0f;   // merge tolerance (coarser = fewer boxes)
@@ -2409,6 +2545,11 @@ void DistantLand::buildBasinRequiredHeight() {
 bool DistantLand::isReflectionWaterVisible() {
     MGE_ZoneScopedN("isReflectionWaterVisible");
 
+    // Cleared up front so the interior / no-terrain-data early-outs below leave it
+    // false (cullReflectionSurvivors then keeps all — the legacy fallback). Set true
+    // only after the tile loop actually runs.
+    g_reflRectsComputed = false;
+
     // The terrain-height gate is an exterior-only optimization: the min-height
     // maps describe the exterior worldspace, and landMeshes persists across cell
     // changes (built at init, cleared at release). In an interior those maps are
@@ -2442,12 +2583,32 @@ bool DistantLand::isReflectionWaterVisible() {
     ViewFrustum frustum(&viewProj);
 
     const float waterZ = MWBridge::get()->WaterLevel();
-    const float R = fogEnd;                 // world units; water visible to fog
+    const float R = fogEnd;                 // world units; water visible to fog (the GATE range)
     const float half = 0.5f * kCellSize;    // cell half-extent (4096)
     const float slabHZ = 4.0f;              // thin water box half-height
+    const float eyeAboveWater = eyePos.z - waterZ;  // for the grazing-angle static-rect cull
+    constexpr float kReflGrazeTan2 = 0.00191f;      // tan^2(2.5 deg): drop static rects below ~2.5 deg elevation
+    const float grazeFarMinSq = (2.0f * kCellSize) * (2.0f * kCellSize);  // grazing cull applies only beyond 2 cells
+
+    // Reflection STATICS only reflect out to NearStaticEnd (see renderReflectedStatics
+    // / prepareReflectionCullForWorker), but the gate tests water to fogEnd. Far horizon
+    // tiles beyond the static range still produce thin horizon rects, and the 2D rect
+    // test then spuriously keeps distant statics whose mirror projects to the horizon —
+    // a single borderline far tile flipping (occluded↔visible) swings the survivor count
+    // by hundreds. So contribute static-cull rects ONLY for tiles within the static
+    // range; far tiles still set anyVisible (terrain/sky reflection gate unchanged).
+    const float staticReflRange   = std::min(fogEnd, Configuration.DL.NearStaticEnd * kCellSize);
+    const float staticReflRangeSq = staticReflRange * staticReflRange;
 
     bool anyVisible = false;
     reflectionWaterRects.clear();
+
+    // [REFL PIPE] reset water-tile stage counters for this frame.
+    g_reflPipe.tilesTested = g_reflPipe.waterPresent = g_reflPipe.waterOccluded = 0;
+    g_reflPipe.msocUsable = msocUsable;
+
+    // Start this frame's visible-tile set (hysteresis); swapped into ...Last at the end.
+    g_reflWaterVisThis.clear();
 
     // Project a water tile footprint (at waterZ) to a main-view NDC AABB. Corners
     // behind the near plane are clamped to the plane (cw=eps) so a straddling near
@@ -2515,6 +2676,7 @@ bool DistantLand::isReflectionWaterVisible() {
             D3DXVECTOR3(tcx - thalf, tcy - thalf, waterZ - slabHZ),
             D3DXVECTOR3(tcx + thalf, tcy + thalf, waterZ + slabHZ));
         if (frustum.ContainsBox(wbox) == ViewFrustum::OUTSIDE) return;
+        ++g_reflPipe.tilesTested;   // [REFL PIPE] in-frustum water-tile candidates
 
         const int w = (thalf >= half - 1.0f)
             ? cellWater((int)floorf(tcx / kCellSize), (int)floorf(tcy / kCellSize))
@@ -2532,17 +2694,45 @@ bool DistantLand::isReflectionWaterVisible() {
         } else {
             // Water present — cull if occlusion proves it hidden. MSOC unavailable
             // → keep it (can't prove occluded), gate falls back to terrain only.
+            ++g_reflPipe.waterPresent;   // [REFL PIPE] tiles with water surface
             MSOCClient::TestResult r = msocUsable
                 ? MSOCClient::classifyOBB(tcx, tcy, waterZ,
                                           thalf, 0, 0,  0, thalf, 0,  0, 0, slabHZ)
                 : MSOCClient::ResultVisible;
             vis = (r != MSOCClient::ResultOccluded);
+            if (!vis) ++g_reflPipe.waterOccluded;   // [REFL PIPE] water MSOC-culled
             dbg = vis ? MSOCClient::ResultVisible : MSOCClient::ResultOccluded; // green/red
             if (vis) {
-                anyVisible = true;
-                D3DXVECTOR4 rect;
-                if (tileScreenRect(tcx, tcy, thalf, rect))
-                    reflectionWaterRects.push_back(rect);
+                anyVisible = true;   // gate (terrain/sky reflection) — full fogEnd range
+                // Static-cull rect only for water within the reflection-static range,
+                // not too grazing, AND only with 1-frame hysteresis (visible this and
+                // last). Grazing cull (measured: the flickering tiles sit at ~1.9 deg
+                // elevation, 3.3 cells out): such far/tilted cells are coarse tiles
+                // straddling the close-terrain ridge silhouette, so their occlusion
+                // verdict flickers and swings the survivor count by ~100 statics. We
+                // drop only their STATIC-cull contribution; the sky/horizon reflection
+                // gate (anyVisible, above) is untouched. elev < thresh <=> eyeAboveWater
+                // < dist*tan(thresh); squared to avoid the sqrt. Eye-height-relative, so
+                // far water from a hill keeps a steeper angle and is retained.
+                //   Gated on dist > 2 cells: while SWIMMING the eye sits at water level
+                // (eyeAboveWater ~ 0), so every tile reads grazing — but near water (and
+                // the subdivided 3x3 block) must still reflect. Only the far coarse tiles
+                // that actually straddle a ridge are culled.
+                const float ddx = tcx - eyePos.x, ddy = tcy - eyePos.y;
+                const float dist2 = ddx * ddx + ddy * ddy;
+                const bool tooGrazing = dist2 > grazeFarMinSq
+                    && eyeAboveWater > 0.0f
+                    && eyeAboveWater * eyeAboveWater < dist2 * kReflGrazeTan2;
+                if (dist2 <= staticReflRangeSq && !tooGrazing) {
+                    const int64_t tkey = ((int64_t)lroundf(tcx / 64.0f) << 32)
+                                       ^ (int64_t)(uint32_t)lroundf(tcy / 64.0f);
+                    g_reflWaterVisThis.insert(tkey);
+                    if (g_reflWaterVisLast.count(tkey) != 0) {   // visible last frame too
+                        D3DXVECTOR4 rect;
+                        if (tileScreenRect(tcx, tcy, thalf, rect))
+                            reflectionWaterRects.push_back(rect);
+                    }
+                }
             }
         }
 
@@ -2589,6 +2779,38 @@ bool DistantLand::isReflectionWaterVisible() {
         }
     }
 
+    g_reflPipe.rects = (int)reflectionWaterRects.size();   // [REFL PIPE] visible water rects
+    g_reflRectsComputed = true;   // tile loop ran → empty rects now means "no in-range water"
+
+    // [REFL PIPE FLIP] Diagnose the flickering tiles: any in-range tile whose visible-
+    // state changed since last frame (symmetric difference of the visible sets). Report
+    // their farness (horizontal distance, in cells) and tiltedness (elevation angle of
+    // the eye->tile ray above the water plane; grazing/tilted = small angle). Decodes
+    // the 64-unit-quantized tile centre back out of the hysteresis key.
+    {
+        int flips = 0;
+        float dMinC = 1e9f, dMaxC = -1e9f, eMin = 1e9f, eMax = -1e9f;
+        auto note = [&](int64_t tkey) {
+            const float tcx = (float)(int)(tkey >> 32) * 64.0f;
+            const float tcy = (float)(int)(int32_t)(uint32_t)tkey * 64.0f;
+            const float dx = tcx - eyePos.x, dy = tcy - eyePos.y;
+            const float dist = sqrtf(dx * dx + dy * dy);
+            const float distCells = dist / kCellSize;
+            const float elevDeg = atan2f(eyeAboveWater, std::max(1.0f, dist)) * (180.0f / 3.14159265f);
+            ++flips;
+            dMinC = std::min(dMinC, distCells); dMaxC = std::max(dMaxC, distCells);
+            eMin = std::min(eMin, elevDeg);     eMax = std::max(eMax, elevDeg);
+        };
+        for (int64_t k : g_reflWaterVisThis) if (g_reflWaterVisLast.count(k) == 0) note(k);
+        for (int64_t k : g_reflWaterVisLast) if (g_reflWaterVisThis.count(k) == 0) note(k);
+        g_reflPipe.flips            = flips;
+        g_reflPipe.flipDistMinCells = flips ? dMinC : 0.0f;
+        g_reflPipe.flipDistMaxCells = flips ? dMaxC : 0.0f;
+        g_reflPipe.flipElevMinDeg   = flips ? eMin  : 0.0f;
+        g_reflPipe.flipElevMaxDeg   = flips ? eMax  : 0.0f;
+    }
+
+    g_reflWaterVisLast.swap(g_reflWaterVisThis);   // this frame's visible tiles → last
     return anyVisible;
 }
 
@@ -2613,8 +2835,13 @@ void DistantLand::cullReflectionSurvivors(const D3DXMATRIX& viewProj, const D3DX
 
     const auto& waterRects = reflectionWaterRects;
     const bool noRects = waterRects.empty();
+    // Empty rects has two meanings: the gate RAN and found no in-range water (cull all
+    // statics — none have near water to reflect in), or the gate couldn't compute
+    // (interior / no terrain data → keep all, legacy fallback). g_reflRectsComputed
+    // distinguishes them. With rects (the common case) the per-static test below decides.
+    const bool keepWhenNoRects = !g_reflRectsComputed;
     for (const RenderMesh& m : g_reflMeshValues) {
-        bool keep = true;
+        bool keep = keepWhenNoRects;
         if (!noRects) {
             const D3DXVECTOR3& c = m.sphere.center;
             const float rad = m.sphere.radius;
@@ -2638,6 +2865,8 @@ void DistantLand::cullReflectionSurvivors(const D3DXMATRIX& viewProj, const D3DX
         if (keep) reflectionSurvivors.PushBack(m);
     }
     reflectionSurvivors.SortByState();
+    g_reflPipe.queried   = (int)g_reflMeshValues.size();       // [REFL PIPE] frustum-query input
+    g_reflPipe.survivors = (int)reflectionSurvivors.Size();    // [REFL PIPE] after water-rect cull
     MGE_TracyPlot("reflStatics:count", double(g_reflMeshValues.size()));
     MGE_TracyPlot("reflStatics:culled", double(g_reflMeshValues.size() - reflectionSurvivors.Size()));
 }

@@ -69,6 +69,34 @@ static void logReflStaticNearFar(VisibleSet<StlVector>& vs, const D3DXVECTOR3& e
                      cacheNearDist, s_near / kIv, s_far / kIv, (s_near + s_far) / kIv);
         s_near = s_far = 0;
     }
+
+    // [REFL PIPE] On a significant survivor swing, dump the full reflection pipeline so
+    // we can see WHERE it diverges: water-tile stages (tested→present→occluded→rects)
+    // feed the water-rect cull (queried→survivors). If 'rects' moves with 'surv', it's
+    // step-3 water-tile occlusion (snapshot) flipping; if 'rects' is steady but 'surv'
+    // jumps, it's the step-4 reflection cull; if 'queried' jumps, the frustum query.
+    static int s_prevSurv = -1;
+    int tiles, water, occl, rects, queried, surv; bool msoc;
+    DistantLand::getReflPipeDiag(tiles, water, occl, rects, queried, surv, msoc);
+
+    // [REFL PIPE FLIP] Farness/tiltedness of the tiles that flipped this frame — the
+    // test for "really far and really tilted". dist in cells, elev = grazing angle.
+    int flips; float fDistMin, fDistMax, fElevMin, fElevMax;
+    DistantLand::getReflPipeFlip(flips, fDistMin, fDistMax, fElevMin, fElevMax);
+
+    const int survDelta = surv > s_prevSurv ? surv - s_prevSurv : s_prevSurv - surv;
+    if (s_prevSurv >= 0 && survDelta > 40) {
+        LOG::logline("-- [REFL PIPE] JUMP surv %d->%d | waterTiles tested=%d present=%d occluded=%d rects=%d msoc=%d | statics queried=%d surv=%d | flips=%d dist=%.1f..%.1f cells elev=%.1f..%.1f deg",
+                     s_prevSurv, surv, tiles, water, occl, rects, msoc ? 1 : 0, queried, surv,
+                     flips, fDistMin, fDistMax, fElevMin, fElevMax);
+    } else if (flips > 0) {
+        // Capture flip geometry even without a big survivor swing, rate-limited.
+        static int s_flipThrottle = 0;
+        if ((s_flipThrottle++ % 30) == 0)
+            LOG::logline("-- [REFL PIPE FLIP] flips=%d dist=%.1f..%.1f cells elev=%.1f..%.1f deg | rects=%d surv=%d",
+                         flips, fDistMin, fDistMax, fElevMin, fElevMax, rects, surv);
+    }
+    s_prevSurv = surv;
 }
 
 void DistantLand::renderWaterReflection(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
