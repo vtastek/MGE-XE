@@ -1234,7 +1234,9 @@ bool DistantLand::initLandscapeClient() {
 
     auto id = IPC::InvalidVector;
     {
-        auto& maybeBuffers = ipcClient.allocVecBlocking<IPC::LandscapeBuffers>(1, 200000, mesh_count);
+        // allocVecBlocking returns the optional by value; bind via auto&& so the
+        // temporary's lifetime extends to this block (C++20 rejects auto& here).
+        auto&& maybeBuffers = ipcClient.allocVecBlocking<IPC::LandscapeBuffers>(1, 200000, mesh_count);
         if (!maybeBuffers.has_value()) {
             return false;
         }

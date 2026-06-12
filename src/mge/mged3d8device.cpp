@@ -318,6 +318,7 @@ static void initOnLoad();
 static bool detectMenu(const D3DMATRIX* m);
 static void captureRenderState(D3DRENDERSTATETYPE a, DWORD b);
 static void captureFragmentRenderState(DWORD a, D3DTEXTURESTAGESTATETYPE b, DWORD c);
+
 static void captureTransform(D3DTRANSFORMSTATETYPE a, const D3DMATRIX* b);
 static void captureLight(DWORD a, const D3DLIGHT8* b);
 static void captureMaterial(const D3DMATERIAL8* a);

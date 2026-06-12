@@ -49,21 +49,27 @@
 // d3d9-aware code.
 #define D3DPRESENT_PARAMETERS    D3DPRESENT_PARAMETERS8
 
+#include <array>
 #include <cassert>
 #include <filesystem>
+#include <functional>
 #include <iomanip>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
-#define span_CONFIG_SELECT_SPAN span_SPAN_NONSTD
-#include <nonstd/span.hpp>
+// SharedSE migrated from span-lite (nonstd::span) to C++20 std::span; MGE-XE
+// builds at /std:c++20 and pulls <span> here so any SharedSE header returning a
+// std::span has it available through the force-included prelude.
+#include <span>
 
 #define SE_IS_MGE 1
 #define MWSE_NO_CUSTOM_ALLOC 1
