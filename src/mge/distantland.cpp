@@ -53,6 +53,14 @@ void DistantLand::frameSetupEarly() {
     // would see (verified camera delta = 0).
     MGE::SceneGraph::onFrameReady();
 
+    // Bin point lights into screen tiles for the tiled FFE path (USE_TILED_LIGHTS),
+    // main view only. Runs right after the snapshot drive above and BEFORE the
+    // UseSharedMemory gate below — tiled isn't IPC-specific. No-op unless tiled
+    // lighting is active (config flag + VK_DECIMAL toggle) and the snapshot has
+    // point lights. The camera is this-frame-valid here (BeginScene scene 0), which
+    // matches the view/proj the main draws use, so the grid lines up with VPOS.
+    FixedFunctionShader::buildTileGrid();
+
     // Only the IPC (shared-memory) path benefits from the early statics/geometry
     // work: there the cull is async and overlaps. The non-IPC path does
     // synchronous quadtree work in the kickoff, which has no overlap to gain —
@@ -250,6 +258,15 @@ void DistantLand::renderStage0() {
         cacheOpaqueMode = !cacheOpaqueMode;
         StatusOverlay::setStatus(cacheOpaqueMode
             ? "Opaque source: CACHE (MGE-driven)" : "Opaque source: ENGINE (reactive)");
+    }
+
+    // VK_DECIMAL: A/B toggle tiled vs per-mesh point lighting (numpad digits are all
+    // taken — Numpad4=heatmap, Numpad7=cache, Numpad1=water proxy). Master config flag
+    // (UseTiledLights) still gates: when off, this is inert. Polled once per frame.
+    if ((GetAsyncKeyState(VK_DECIMAL) & 0x0001) && Configuration.UseTiledLights) {
+        FixedFunctionShader::tiledLightsActive = !FixedFunctionShader::tiledLightsActive;
+        StatusOverlay::setStatus(FixedFunctionShader::tiledLightsActive
+            ? "Point lights: TILED (screen grid)" : "Point lights: PER-MESH (selection)");
     }
 
     if (!isRenderCached) {
@@ -1401,7 +1418,11 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
         // all opaque) with the replacement FFE shader. Only when the PPL renderer is
         // active; in fixed-function mode the engine draws its own colour.
         if (isPPLActive) {
-            FixedFunctionShader::renderMorrowind(rs, frs, lightrs);
+            // Reactive main view → tiled point lighting (no-op fallback to per-mesh
+            // when tiled is inactive; the LightMode param is a static call-site signal).
+            FixedFunctionShader::renderMorrowind(rs, frs, lightrs, 1.0f,
+                nullptr, 0, nullptr, nullptr, nullptr,
+                FixedFunctionShader::LightMode::Tiled);
             return false;
         }
     }

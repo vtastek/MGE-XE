@@ -196,6 +196,11 @@ static void buildCacheReflectionState(const MGE::GeometryCache::CachedGeometry& 
     lightrs.active.push_back(0);
 }
 
+// Reflection point-light cap. Reflections see a mirrored, often water-distorted
+// surface, so the seam from selecting fewer lights is imperceptible — 8 instead of
+// the main view's 32 keeps the heavy per-mesh FFE variant's per-pixel loop short.
+static const unsigned int kReflMaxLights = 8;
+
 void DistantLand::renderReflectionsFromCache(const D3DXMATRIX* view, const D3DXMATRIX* proj, float nearDist) {
     MGE_ZoneScopedN("renderReflectionsFromCache");
     DrawStats::ScopedStage _ds(DrawStats::ReflCacheColor);   // cache objects (lit color) injected into the reflection
@@ -356,12 +361,17 @@ void DistantLand::renderReflectionsFromCache(const D3DXMATRIX* view, const D3DXM
             device->SetVertexDeclaration(MGE::GeometryCache::skinnedDecl());
             device->SetStreamSource(0, vb, 0, MGE::GeometryCache::kSkinnedVBStride);
             const D3DXMATRIX* pal = reinterpret_cast<const D3DXMATRIX*>(e.bonePalette.data());
-            FixedFunctionShader::renderMorrowind(&rs, &frs, &lightrs, plMult, pal, (int)e.numBones, view, &lbMin, &lbMax);
+            // Reflections cap point lights at 8 (kReflMaxLights): the mirrored
+            // surface hides the seam from the tighter selection, and the heavy
+            // per-mesh variant loops far fewer lights.
+            FixedFunctionShader::renderMorrowind(&rs, &frs, &lightrs, plMult, pal, (int)e.numBones, view, &lbMin, &lbMax,
+                                                 FixedFunctionShader::LightMode::PerMesh, kReflMaxLights);
         } else {
             // Per-entry stride/FVF: dual-UV (44 / TEX2) for multi-map shapes, else 36 / TEX1.
             device->SetStreamSource(0, vb, 0, e.vbStride);
             device->SetFVF(e.vbFVF);
-            FixedFunctionShader::renderMorrowind(&rs, &frs, &lightrs, plMult, nullptr, 0, nullptr, &lbMin, &lbMax);
+            FixedFunctionShader::renderMorrowind(&rs, &frs, &lightrs, plMult, nullptr, 0, nullptr, &lbMin, &lbMax,
+                                                 FixedFunctionShader::LightMode::PerMesh, kReflMaxLights);
         }
     }
 

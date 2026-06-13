@@ -3,6 +3,8 @@
 #include "configuration.h"
 #include "drawstats.h"
 #include "scenegraph.h"
+#include "postshaders.h"
+#include "mge_tracy.h"
 #include "support/log.h"
 
 #include <Windows.h>
@@ -11,6 +13,7 @@
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include <cmath>
 
 using std::string;
 using std::stringstream;
@@ -24,6 +27,18 @@ ID3DXEffect* FixedFunctionShader::effectDefaultPurple;
 IDirect3DTexture9* FixedFunctionShader::texLightData = nullptr;
 uint64_t FixedFunctionShader::lastUploadedRevision = (uint64_t)-1;
 unsigned int FixedFunctionShader::lastUploadedPointCount = 0;
+
+IDirect3DTexture9* FixedFunctionShader::texLightGrid = nullptr;
+IDirect3DTexture9* FixedFunctionShader::texLightIndexList = nullptr;
+unsigned int FixedFunctionShader::gridTilesX = 0;
+unsigned int FixedFunctionShader::gridTilesY = 0;
+uint64_t FixedFunctionShader::lastGridRevision = (uint64_t)-1;
+uint32_t FixedFunctionShader::lastGridViewHash = 0;
+bool FixedFunctionShader::tiledLightsActive = false;
+
+D3DXVECTOR3 FixedFunctionShader::s_lightWorldPos[FixedFunctionShader::kMaxTexLights];
+bool        FixedFunctionShader::s_lightAlive[FixedFunctionShader::kMaxTexLights];
+D3DXMATRIX  FixedFunctionShader::s_lastPrecullView = {};
 std::unordered_map<FixedFunctionShader::MeshKey, FixedFunctionShader::ObjectSpaceBBox,
                    FixedFunctionShader::MeshKeyHash> FixedFunctionShader::bboxCache;
 
@@ -36,6 +51,7 @@ D3DXHANDLE FixedFunctionShader::ehLightSceneAmbient, FixedFunctionShader::ehLigh
 D3DXHANDLE FixedFunctionShader::ehLightSunDirection, FixedFunctionShader::ehLightPosition, FixedFunctionShader::ehLightAmbient;
 D3DXHANDLE FixedFunctionShader::ehLightFalloffQuadratic, FixedFunctionShader::ehLightFalloffLinear, FixedFunctionShader::ehLightFalloffConstant;
 D3DXHANDLE FixedFunctionShader::ehTexLightData, FixedFunctionShader::ehLightDataParams, FixedFunctionShader::ehLightIndices, FixedFunctionShader::ehTexLightView;
+D3DXHANDLE FixedFunctionShader::ehTexLightGrid, FixedFunctionShader::ehTexLightIndexList, FixedFunctionShader::ehTileGridParams, FixedFunctionShader::ehTileGridParams2;
 D3DXHANDLE FixedFunctionShader::ehTexgenTransform, FixedFunctionShader::ehBumpMatrix, FixedFunctionShader::ehBumpLumiScaleBias;
 D3DXHANDLE FixedFunctionShader::ehPointLightMult;
 D3DXHANDLE FixedFunctionShader::ehDebugLightCount;
@@ -115,6 +131,10 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
     ehLightDataParams = effect->GetParameterByName(0, "lightDataParams");
     ehLightIndices = effect->GetParameterByName(0, "lightIndices");
     ehTexLightView = effect->GetParameterByName(0, "texLightView");
+    ehTexLightGrid = effect->GetParameterByName(0, "texLightGrid");
+    ehTexLightIndexList = effect->GetParameterByName(0, "texLightIndexList");
+    ehTileGridParams = effect->GetParameterByName(0, "tileGridParams");
+    ehTileGridParams2 = effect->GetParameterByName(0, "tileGridParams2");
     ehPointLightMult = effect->GetParameterByName(0, "pointLightMult");
     ehDebugLightCount = effect->GetParameterByName(0, "debugLightCount");
     ehTexgenTransform = effect->GetParameterByName(0, "texgenTransform");
@@ -155,6 +175,36 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
     }
     lastUploadedRevision = (unsigned int)-1;
     lastUploadedPointCount = 0;
+
+    // Tiled point-light grid textures (USE_TILED_LIGHTS). texLightGrid: one
+    // texel per cluster (kMaxTilesX x kMaxTilesY*kMaxSlicesZ). texLightIndexList:
+    // flat index list (kIndexTexW x kIndexTexH, 4 indices/texel). Both DYNAMIC
+    // A32B32G32R32F, updated per frame via LockRect-DISCARD by buildTileGrid.
+    if (texLightGrid)      { texLightGrid->Release();      texLightGrid = nullptr; }
+    if (texLightIndexList) { texLightIndexList->Release(); texLightIndexList = nullptr; }
+    {
+        HRESULT ghr = device->CreateTexture(kMaxTilesX, kMaxTilesY * kMaxSlicesZ, 1,
+            D3DUSAGE_DYNAMIC, D3DFMT_A32B32G32R32F, D3DPOOL_DEFAULT, &texLightGrid, nullptr);
+        HRESULT ihr = device->CreateTexture(kIndexTexW, kIndexTexH, 1,
+            D3DUSAGE_DYNAMIC, D3DFMT_A32B32G32R32F, D3DPOOL_DEFAULT, &texLightIndexList, nullptr);
+        if (ghr != D3D_OK || ihr != D3D_OK) {
+            LOG::logline("!! FFE tile-grid texture create failed: grid=0x%08x index=0x%08x",
+                         (unsigned)ghr, (unsigned)ihr);
+            if (texLightGrid)      { texLightGrid->Release();      texLightGrid = nullptr; }
+            if (texLightIndexList) { texLightIndexList->Release(); texLightIndexList = nullptr; }
+        } else {
+            LOG::logline("-- FFE tile-grid textures created: grid %ux%u, index %ux%u (cap %u/tile, %u total)",
+                         kMaxTilesX, kMaxTilesY * kMaxSlicesZ, kIndexTexW, kIndexTexH,
+                         kPerTileCap, kMaxTotalIndices);
+        }
+    }
+    lastGridRevision = (uint64_t)-1;
+    lastGridViewHash = 0;
+    gridTilesX = gridTilesY = 0;
+    // Runtime tiled toggle starts at the master config flag (VK_DECIMAL flips it).
+    tiledLightsActive = Configuration.UseTiledLights;
+    memset(&s_lastPrecullView, 0, sizeof(s_lastPrecullView));
+
     // Bbox cache is keyed by D3D resource pointers; pointers
     // become invalid after device reset, so wipe.
     bboxCache.clear();
@@ -189,12 +239,15 @@ void FixedFunctionShader::precacheAsync() {
             skCommon.vertexMaterial = vertexCol + 1;
 
             // Light bucket sweep: 0 = 4 lights (heavyLighting=0),
-            // 1 = 8 lights (heavyLighting=1), 2 = 64 lights (useTextureLightVariant=1).
-            // The 64-light variant only fires when msoc emits lights, but we
-            // pre-compile it so the first dense-interior frame doesn't stutter.
-            for (int lightBucket = 0; lightBucket <= 2; ++lightBucket) {
+            // 1 = 8 lights (heavyLighting=1), 2 = per-mesh texture lights
+            // (useTextureLightVariant=1), 3 = tiled lights (usesTiledLightVariant=1).
+            // The snapshot variants only fire when the scene-graph snapshot feeds
+            // lights, but we pre-compile them so the first dense-interior frame
+            // doesn't stutter.
+            for (int lightBucket = 0; lightBucket <= 3; ++lightBucket) {
                 skCommon.heavyLighting = (lightBucket == 1) ? 1 : 0;
                 skCommon.useTextureLightVariant = (lightBucket == 2) ? 1 : 0;
+                skCommon.usesTiledLightVariant  = (lightBucket == 3) ? 1 : 0;
 
                 for (int skinning = 0; skinning <= 1; ++skinning) {
                     skCommon.usesSkinning = skinning;
@@ -271,6 +324,114 @@ void FixedFunctionShader::setCacheShadow(IDirect3DTexture9* atlas, bool enable) 
     if (ehApplyCacheShadow) effectDefaultPurple->SetBool(ehApplyCacheShadow, enable ? TRUE : FALSE);
 }
 
+// ensureLightUpload — revision-keyed texLightData upload (pos/diffuse/falloff,
+// 3 texels per light) + s_lightWorldPos fill. Shared by selectTextureLights
+// (per-mesh) and buildTileGrid (tiled) so the snapshot is packed to the GPU
+// exactly once per revision regardless of which path runs first. No-op when the
+// snapshot revision is unchanged. Caller holds MGE::SceneGraph::SnapshotReadLock.
+void FixedFunctionShader::ensureLightUpload(
+        const std::vector<MGE::SceneGraph::PointLight>& snapshotLights,
+        unsigned int snapshotCount, bool logPerf) {
+    if (!texLightData) return;
+    if (s_qpcFreq.QuadPart == 0) QueryPerformanceFrequency(&s_qpcFreq);
+
+    const uint64_t currentRev = MGE::SceneGraph::frameRevision();
+    if (currentRev == lastUploadedRevision) return;   // already uploaded this revision
+
+    LARGE_INTEGER tsUploadBegin{};
+    if (logPerf) QueryPerformanceCounter(&tsUploadBegin);
+    D3DLOCKED_RECT locked;
+    if (SUCCEEDED(texLightData->LockRect(0, &locked, nullptr, D3DLOCK_DISCARD))) {
+        float* dst = (float*)locked.pBits;
+        memset(dst, 0, kTexelsPerLight * kMaxTexLights * 4 * sizeof(float));
+
+        for (unsigned int i = 0; i < snapshotCount; ++i) {
+            const auto& pl = snapshotLights[i];
+            s_lightWorldPos[i] = D3DXVECTOR3(pl.worldPos[0], pl.worldPos[1], pl.worldPos[2]);
+
+            const unsigned int t = i * kTexelsPerLight * 4;
+            dst[t + 0] = pl.worldPos[0];
+            dst[t + 1] = pl.worldPos[1];
+            dst[t + 2] = pl.worldPos[2];
+            dst[t + 4] = pl.diffuse[0];
+            dst[t + 5] = pl.diffuse[1];
+            dst[t + 6] = pl.diffuse[2];
+            dst[t + 8]  = pl.falloff[0];
+            dst[t + 9]  = pl.falloff[1];
+            dst[t + 10] = pl.falloff[2];
+            dst[t + 11] = pl.radius;
+        }
+        texLightData->UnlockRect(0);
+
+        lastUploadedRevision = currentRev;
+        lastUploadedPointCount = snapshotCount;
+        // Force the next precull to recompute (a fresh snapshot invalidates the
+        // cached alive set even if the view matrix is bit-identical).
+        memset(&s_lastPrecullView, 0, sizeof(s_lastPrecullView));
+    }
+    if (logPerf) {
+        LARGE_INTEGER tsUploadEnd;
+        QueryPerformanceCounter(&tsUploadEnd);
+        const unsigned long long uploadTicks =
+            static_cast<unsigned long long>(tsUploadEnd.QuadPart - tsUploadBegin.QuadPart);
+        if (s_qpcFreq.QuadPart > 0) {
+            s_uploadsTotalNs +=
+                uploadTicks * 1000000000ULL / static_cast<unsigned long long>(s_qpcFreq.QuadPart);
+        }
+        ++s_uploads;
+    }
+}
+
+// precullLights — view-keyed frustum precull. Marks s_lightAlive[i] for lights
+// whose 2*radius influence sphere intersects the camera frustum. Recomputed only
+// when the view matrix changes (or a fresh upload reset s_lastPrecullView).
+// device's D3DTS_PROJECTION must match `view`. Shared by selectTextureLights and
+// buildTileGrid.
+void FixedFunctionShader::precullLights(
+        const std::vector<MGE::SceneGraph::PointLight>& snapshotLights,
+        const D3DXMATRIX& view, bool logPerf) {
+    if (lastUploadedPointCount == 0) return;
+    const bool precullStale = (memcmp(&s_lastPrecullView, &view, sizeof(D3DXMATRIX)) != 0);
+    if (!precullStale) return;
+
+    D3DMATRIX projTransform;
+    device->GetTransform(D3DTS_PROJECTION, &projTransform);
+    D3DXMATRIX viewProj;
+    D3DXMatrixMultiply(&viewProj, &view, (const D3DXMATRIX*)&projTransform);
+    D3DXPLANE planes[6] = {
+        D3DXPLANE(viewProj._14 + viewProj._11, viewProj._24 + viewProj._21,
+                  viewProj._34 + viewProj._31, viewProj._44 + viewProj._41),
+        D3DXPLANE(viewProj._14 - viewProj._11, viewProj._24 - viewProj._21,
+                  viewProj._34 - viewProj._31, viewProj._44 - viewProj._41),
+        D3DXPLANE(viewProj._14 - viewProj._12, viewProj._24 - viewProj._22,
+                  viewProj._34 - viewProj._32, viewProj._44 - viewProj._42),
+        D3DXPLANE(viewProj._14 + viewProj._12, viewProj._24 + viewProj._22,
+                  viewProj._34 + viewProj._32, viewProj._44 + viewProj._42),
+        D3DXPLANE(viewProj._13, viewProj._23, viewProj._33, viewProj._43),
+        D3DXPLANE(viewProj._14 - viewProj._13, viewProj._24 - viewProj._23,
+                  viewProj._34 - viewProj._33, viewProj._44 - viewProj._43),
+    };
+    for (int p = 0; p < 6; ++p) D3DXPlaneNormalize(&planes[p], &planes[p]);
+
+    unsigned int aliveCount = 0;
+    for (unsigned int i = 0; i < lastUploadedPointCount; ++i) {
+        const float r = snapshotLights[i].radius * 2.0f;
+        const D3DXVECTOR3& lp = s_lightWorldPos[i];
+        bool alive = true;
+        for (int p = 0; p < 6; ++p) {
+            const float d = D3DXPlaneDotCoord(&planes[p], &lp);
+            if (d < -r) { alive = false; break; }
+        }
+        s_lightAlive[i] = alive;
+        if (alive) ++aliveCount;
+    }
+    if (logPerf) {
+        s_preCullAliveSum += aliveCount;
+        s_preCullTotalSum += lastUploadedPointCount;
+    }
+    s_lastPrecullView = view;
+}
+
 // selectTextureLights — revision-keyed texLightData upload + view-keyed frustum
 // precull + per-mesh sphere-AABB nearest-kMaxIndicesPerMesh selection. Extracted
 // from renderMorrowind so the cache terrain pass (renderCachedTerrain) selects
@@ -284,112 +445,19 @@ int FixedFunctionShader::selectTextureLights(
         const std::vector<MGE::SceneGraph::PointLight>& snapshotLights,
         unsigned int snapshotCount, const D3DXMATRIX& view,
         const D3DXVECTOR3& bMin, const D3DXVECTOR3& bMax,
-        float* idxFloats, bool logPerf) {
+        float* idxFloats, bool logPerf, unsigned int maxIndices) {
     if (snapshotCount == 0 || !texLightData) return 0;
     if (s_qpcFreq.QuadPart == 0) QueryPerformanceFrequency(&s_qpcFreq);
 
-    // Per-draw selection scratch (persistent statics; no hot-path allocation).
-    // s_lightWorldPos caches world positions for the sphere-AABB test; s_lightAlive
-    // flags lights whose 2*radius sphere intersects the camera frustum (precull
-    // recomputed only when the view matrix changes); s_lastPrecullView caches that
-    // view. s_msocToTex maps snapshot index → texture row (identity here).
-    static unsigned int s_msocToTex[kMaxTexLights];
-    static D3DXVECTOR3 s_lightWorldPos[kMaxTexLights];
-    static bool        s_lightAlive[kMaxTexLights];
-    static D3DXMATRIX  s_lastPrecullView = {};
+    // Clamp to the buffer/shader capacity (idxFloats + lightIndices[8] hold 32).
+    if (maxIndices > kMaxIndicesPerMesh) maxIndices = kMaxIndicesPerMesh;
+    if (maxIndices == 0) return 0;
 
-    const uint64_t currentRev = MGE::SceneGraph::frameRevision();
-    const bool needUpload = (currentRev != lastUploadedRevision);
-
-    if (needUpload && texLightData) {
-        LARGE_INTEGER tsUploadBegin{};
-        if (logPerf) QueryPerformanceCounter(&tsUploadBegin);
-        D3DLOCKED_RECT locked;
-        if (SUCCEEDED(texLightData->LockRect(0, &locked, nullptr, D3DLOCK_DISCARD))) {
-            float* dst = (float*)locked.pBits;
-            memset(dst, 0, kTexelsPerLight * kMaxTexLights * 4 * sizeof(float));
-
-            for (unsigned int i = 0; i < snapshotCount; ++i) {
-                const auto& pl = snapshotLights[i];
-                s_lightWorldPos[i] = D3DXVECTOR3(pl.worldPos[0], pl.worldPos[1], pl.worldPos[2]);
-
-                const unsigned int t = i * kTexelsPerLight * 4;
-                dst[t + 0] = pl.worldPos[0];
-                dst[t + 1] = pl.worldPos[1];
-                dst[t + 2] = pl.worldPos[2];
-                dst[t + 4] = pl.diffuse[0];
-                dst[t + 5] = pl.diffuse[1];
-                dst[t + 6] = pl.diffuse[2];
-                dst[t + 8]  = pl.falloff[0];
-                dst[t + 9]  = pl.falloff[1];
-                dst[t + 10] = pl.falloff[2];
-                dst[t + 11] = pl.radius;
-
-                s_msocToTex[i] = i;
-            }
-            texLightData->UnlockRect(0);
-
-            lastUploadedRevision = currentRev;
-            lastUploadedPointCount = snapshotCount;
-            memset(&s_lastPrecullView, 0, sizeof(s_lastPrecullView));
-        }
-        if (logPerf) {
-            LARGE_INTEGER tsUploadEnd;
-            QueryPerformanceCounter(&tsUploadEnd);
-            const unsigned long long uploadTicks =
-                static_cast<unsigned long long>(tsUploadEnd.QuadPart - tsUploadBegin.QuadPart);
-            if (s_qpcFreq.QuadPart > 0) {
-                s_uploadsTotalNs +=
-                    uploadTicks * 1000000000ULL / static_cast<unsigned long long>(s_qpcFreq.QuadPart);
-            }
-            ++s_uploads;
-        }
-    }
-
-    // Frustum precull. Recomputed whenever the view matrix changes OR a fresh upload
-    // reset s_lastPrecullView. Marks each light "alive" if its 2*radius influence
-    // sphere intersects the camera frustum.
-    if (lastUploadedPointCount > 0) {
-        const bool precullStale = (memcmp(&s_lastPrecullView, &view, sizeof(D3DXMATRIX)) != 0);
-        if (precullStale) {
-            D3DMATRIX projTransform;
-            device->GetTransform(D3DTS_PROJECTION, &projTransform);
-            D3DXMATRIX viewProj;
-            D3DXMatrixMultiply(&viewProj, &view, (const D3DXMATRIX*)&projTransform);
-            D3DXPLANE planes[6] = {
-                D3DXPLANE(viewProj._14 + viewProj._11, viewProj._24 + viewProj._21,
-                          viewProj._34 + viewProj._31, viewProj._44 + viewProj._41),
-                D3DXPLANE(viewProj._14 - viewProj._11, viewProj._24 - viewProj._21,
-                          viewProj._34 - viewProj._31, viewProj._44 - viewProj._41),
-                D3DXPLANE(viewProj._14 - viewProj._12, viewProj._24 - viewProj._22,
-                          viewProj._34 - viewProj._32, viewProj._44 - viewProj._42),
-                D3DXPLANE(viewProj._14 + viewProj._12, viewProj._24 + viewProj._22,
-                          viewProj._34 + viewProj._32, viewProj._44 + viewProj._42),
-                D3DXPLANE(viewProj._13, viewProj._23, viewProj._33, viewProj._43),
-                D3DXPLANE(viewProj._14 - viewProj._13, viewProj._24 - viewProj._23,
-                          viewProj._34 - viewProj._33, viewProj._44 - viewProj._43),
-            };
-            for (int p = 0; p < 6; ++p) D3DXPlaneNormalize(&planes[p], &planes[p]);
-
-            unsigned int aliveCount = 0;
-            for (unsigned int i = 0; i < lastUploadedPointCount; ++i) {
-                const float r = snapshotLights[i].radius * 2.0f;
-                const D3DXVECTOR3& lp = s_lightWorldPos[i];
-                bool alive = true;
-                for (int p = 0; p < 6; ++p) {
-                    const float d = D3DXPlaneDotCoord(&planes[p], &lp);
-                    if (d < -r) { alive = false; break; }
-                }
-                s_lightAlive[i] = alive;
-                if (alive) ++aliveCount;
-            }
-            if (logPerf) {
-                s_preCullAliveSum += aliveCount;
-                s_preCullTotalSum += lastUploadedPointCount;
-            }
-            s_lastPrecullView = view;
-        }
-    }
+    // Revision-keyed upload + view-keyed frustum precull (shared with buildTileGrid).
+    // The scratch (s_lightWorldPos / s_lightAlive / s_lastPrecullView) lives at class
+    // scope so the tiled path reuses the same alive set.
+    ensureLightUpload(snapshotLights, snapshotCount, logPerf);
+    precullLights(snapshotLights, view, logPerf);
 
     unsigned int candidateCount = 0;
     if (lastUploadedPointCount > 0) {
@@ -421,14 +489,14 @@ int FixedFunctionShader::selectTextureLights(
             }
         }
 
-        if (candidateCount > kMaxIndicesPerMesh) {
+        if (candidateCount > maxIndices) {
             std::partial_sort(
-                candidates, candidates + kMaxIndicesPerMesh,
+                candidates, candidates + maxIndices,
                 candidates + candidateCount,
                 [](const Cand& a, const Cand& b) {
                     return a.dist2OverR2 < b.dist2OverR2;
                 });
-            candidateCount = kMaxIndicesPerMesh;
+            candidateCount = maxIndices;
         }
 
         if (logPerf) {
@@ -459,9 +527,309 @@ int FixedFunctionShader::selectTextureLights(
     return (int)candidateCount;
 }
 
+// Effective tiled-lighting state: master config flag AND the runtime toggle.
+bool FixedFunctionShader::tiledLightingActive() {
+    return Configuration.UseTiledLights && tiledLightsActive;
+}
+
+namespace {
+// Screen-space NDC bounds of a view-space sphere along ONE axis, via the
+// eye->sphere tangent-line method (Mara & McGuire, "2D Polyhedral Bounds of a
+// Clipped, Perspective-Projected 3D Sphere"). Replaces the old AABB-corner test,
+// which tripped the full-screen stamp for any light within ~3.46*radius (the
+// circumscribing cube's diagonal corner crosses the near plane) — measured as
+// nearStamp=9/9 in exteriors. This gives a TIGHT rect and only falls back to the
+// full axis extent when the sphere genuinely encloses the eye on this plane.
+//
+//   a   = sphere-center component on this axis (view space; +z forward)
+//   z   = sphere-center depth (view space)
+//   r   = sphere radius
+//   foc = projection focal length for this axis (proj._11 for x, _22 for y)
+// On return true, [outMin,outMax] are NDC (-1..1). Returns false when the eye is
+// inside the sphere's projection onto this plane (caller keeps full extent). A
+// tangent point behind the near plane pushes that side to the screen edge
+// (+/-1e9, clamped to a tile by the caller) — robust near-plane handling.
+bool sphereAxisBoundsNDC(float a, float z, float r, float foc,
+                         float& outMin, float& outMax) {
+    const float d2 = a*a + z*z;
+    if (d2 <= r*r) return false;                 // eye within sphere on this plane
+    const float d  = std::sqrt(d2);
+    const float cosA = std::sqrt(d2 - r*r) / d;  // tangent length / d
+    const float sinA = r / d;
+    const float ua = a / d, uz = z / d;          // center direction (unit)
+
+    // Two tangent directions: rotate the center direction by +/- the half-angle.
+    const float t1a = ua*cosA - uz*sinA, t1z = ua*sinA + uz*cosA;
+    const float t2a = ua*cosA + uz*sinA, t2z = -ua*sinA + uz*cosA;
+
+    const float eps = 1e-4f;
+    const float n1 = (t1z > eps) ? foc * (t1a / t1z) : (t1a >= 0 ? 1e9f : -1e9f);
+    const float n2 = (t2z > eps) ? foc * (t2a / t2z) : (t2a >= 0 ? 1e9f : -1e9f);
+
+    outMin = std::min(n1, n2);
+    outMax = std::max(n1, n2);
+    return true;
+}
+} // namespace
+
+// buildTileGrid — bin the per-frame point-light snapshot into screen-space tiles
+// for the USE_TILED_LIGHTS path. Runs once per frame (main view only), hooked
+// from DistantLand::frameSetupEarly after the scene-graph snapshot. Each alive
+// light's 2*radius sphere is projected to a screen-space AABB; covered tiles
+// record the light's texLightData row index. Two-pass (count -> prefix-sum
+// offsets -> fill) into texLightGrid (offset,count per cluster) and
+// texLightIndexList (flat index list). Rebuilt only when the snapshot revision
+// or the camera (view+proj+RT size) changes — the same cadence the per-mesh
+// precull already pays. Target: sub-100us (bounded by alive-lights x tiles-covered).
+void FixedFunctionShader::buildTileGrid() {
+    if (!tiledLightingActive()) return;
+    if (!device || !texLightData || !texLightGrid || !texLightIndexList) return;
+    if (!Configuration.UseSceneGraphSnapshot) return;   // tiled rides the snapshot
+    MGE_ZoneScopedN("buildTileGrid");
+
+    const bool logPerf = Configuration.LogDistantPipeline;
+    if (s_qpcFreq.QuadPart == 0) QueryPerformanceFrequency(&s_qpcFreq);
+    LARGE_INTEGER tsBegin{};
+    if (logPerf) QueryPerformanceCounter(&tsBegin);
+
+    // Main camera view + projection (this-frame-valid at BeginScene scene 0).
+    D3DXMATRIX view, proj;
+    device->GetTransform(D3DTS_VIEW, &view);
+    device->GetTransform(D3DTS_PROJECTION, &proj);
+
+    // Scene resolution -> active tile grid (32px tiles, clamped to the max grid).
+    // Source from PostShaders' canonical scene resolution (the viewport the main
+    // PPL pass + VPOS actually use), NOT GetRenderTarget(0) here: frameSetupEarly
+    // runs before the engine binds its scene target, so RT(0) can be a stale
+    // intermediate buffer (wrong size -> the grid covers only part of the screen,
+    // the rest clamps to an empty tile row = unlit).
+    unsigned int rtW = 0, rtH = 0;
+    PostShaders::getSceneResolution(rtW, rtH);
+    if (rtW == 0 || rtH == 0) {
+        // Fallback before post-buffers exist: the currently bound RT(0).
+        IDirect3DSurface9* rt = nullptr;
+        if (SUCCEEDED(device->GetRenderTarget(0, &rt)) && rt) {
+            D3DSURFACE_DESC sd;
+            if (SUCCEEDED(rt->GetDesc(&sd))) { rtW = sd.Width; rtH = sd.Height; }
+            rt->Release();
+        }
+    }
+    if (rtW == 0 || rtH == 0) return;
+
+    unsigned int tilesX = std::min((rtW + kTileSizePx - 1) / kTileSizePx, kMaxTilesX);
+    unsigned int tilesY = std::min((rtH + kTileSizePx - 1) / kTileSizePx, kMaxTilesY);
+    gridTilesX = tilesX;
+    gridTilesY = tilesY;
+
+    // Hold the snapshot lock across upload + precull + bin (radii are read here).
+    MGE::SceneGraph::SnapshotReadLock snapshotLock;
+    const auto& snapshotLights = MGE::SceneGraph::pointLights();
+    const unsigned int snapshotCount =
+        std::min<unsigned int>(static_cast<unsigned int>(snapshotLights.size()), kMaxTexLights);
+
+    // Revision-keyed upload + view-keyed precull (shared with the per-mesh path).
+    ensureLightUpload(snapshotLights, snapshotCount, logPerf);
+    precullLights(snapshotLights, view, logPerf);
+
+    // Rebuild key: the grid is light-dependent (revision) AND view-dependent
+    // (view+proj+RT). Skip the bin/upload when neither changed.
+    const uint64_t currentRev = MGE::SceneGraph::frameRevision();
+    uint32_t viewHash = 2166136261u;
+    {
+        auto mix = [&](const void* p, size_t n) {
+            const unsigned char* b = (const unsigned char*)p;
+            for (size_t i = 0; i < n; ++i) { viewHash ^= b[i]; viewHash *= 16777619u; }
+        };
+        mix(&view, sizeof(view));
+        mix(&proj, sizeof(proj));
+        mix(&rtW, sizeof(rtW));
+        mix(&rtH, sizeof(rtH));
+    }
+    if (currentRev == lastGridRevision && viewHash == lastGridViewHash) return;
+
+    // Per-light screen-tile rect (computed once; reused by both fill passes).
+    struct TileRect { int minTx, minTy, maxTx, maxTy; unsigned int texIdx; };
+    static TileRect s_rects[kMaxTexLights];
+    unsigned int rectCount = 0;
+
+    const float fW = (float)rtW, fH = (float)rtH;
+    const int   maxTx = (int)tilesX - 1, maxTy = (int)tilesY - 1;
+
+    // Instrumentation: how many alive lights hit the near-plane full-screen stamp,
+    // and how many tiles those stamps account for (the prime build-cost suspect).
+    unsigned int nearStampLights = 0, nearStampTiles = 0;
+    const unsigned int fullScreenTiles = tilesX * tilesY;
+
+    for (unsigned int i = 0; i < snapshotCount; ++i) {
+        if (!s_lightAlive[i]) continue;
+        const float radius = snapshotLights[i].radius;
+        if (radius <= 0.0f) continue;
+        const float sphereR = 2.0f * radius;   // shader cuts attenuation to 0 here
+        const D3DXVECTOR3& c = s_lightWorldPos[i];
+
+        // Tight screen rect from the eye->sphere tangent bounds (view space).
+        // Full-screen stamp ONLY when the eye is genuinely inside the 2*radius
+        // sphere (the light then lights every screen direction — unavoidable in
+        // 2D tiling; clustered Z is the eventual fix). Otherwise per-axis tangent
+        // bounds give a tight rect, near-plane-robust (a tangent behind near
+        // pushes that side to the screen edge).
+        D3DXVECTOR3 cView;
+        D3DXVec3TransformCoord(&cView, &c, &view);
+
+        int rMinTx, rMinTy, rMaxTx, rMaxTy;
+        const bool eyeInside =
+            (cView.x*cView.x + cView.y*cView.y + cView.z*cView.z) <= sphereR*sphereR;
+        if (eyeInside) {
+            rMinTx = 0; rMinTy = 0; rMaxTx = maxTx; rMaxTy = maxTy;
+            ++nearStampLights;
+            nearStampTiles += fullScreenTiles;
+        } else {
+            // Per-axis NDC bounds (full extent if the sphere encloses the eye on
+            // that plane). x uses proj._11, y uses proj._22.
+            float xminN = -1.0f, xmaxN = 1.0f, yminN = -1.0f, ymaxN = 1.0f;
+            sphereAxisBoundsNDC(cView.x, cView.z, sphereR, proj._11, xminN, xmaxN);
+            sphereAxisBoundsNDC(cView.y, cView.z, sphereR, proj._22, yminN, ymaxN);
+
+            // NDC -> pixels. x: [-1,1] -> [0,W]; y flips ([+1]=top=0).
+            const float sMinX = (xminN * 0.5f + 0.5f) * fW;
+            const float sMaxX = (xmaxN * 0.5f + 0.5f) * fW;
+            const float sMinY = (0.5f - ymaxN * 0.5f) * fH;
+            const float sMaxY = (0.5f - yminN * 0.5f) * fH;
+
+            // Fully off-screen -> skip (no tile contributes).
+            if (sMaxX < 0 || sMinX > fW || sMaxY < 0 || sMinY > fH) continue;
+
+            rMinTx = std::max(0, std::min(maxTx, (int)(sMinX / kTileSizePx)));
+            rMaxTx = std::max(0, std::min(maxTx, (int)(sMaxX / kTileSizePx)));
+            rMinTy = std::max(0, std::min(maxTy, (int)(sMinY / kTileSizePx)));
+            rMaxTy = std::max(0, std::min(maxTy, (int)(sMaxY / kTileSizePx)));
+        }
+
+        s_rects[rectCount++] = { rMinTx, rMinTy, rMaxTx, rMaxTy, i };
+    }
+
+    // Pass A — per-tile coverage count (capped per tile).
+    const unsigned int numClusters = tilesX * tilesY;   // sliceZ=0 plane only
+    static unsigned int s_tileCount[kMaxTilesX * kMaxTilesY * kMaxSlicesZ];
+    static unsigned int s_tileOffset[kMaxTilesX * kMaxTilesY * kMaxSlicesZ];
+    static unsigned int s_tileCursor[kMaxTilesX * kMaxTilesY * kMaxSlicesZ];
+    memset(s_tileCount, 0, numClusters * sizeof(unsigned int));
+
+    for (unsigned int r = 0; r < rectCount; ++r) {
+        const TileRect& tr = s_rects[r];
+        for (int ty = tr.minTy; ty <= tr.maxTy; ++ty) {
+            unsigned int rowBase = ty * tilesX;
+            for (int tx = tr.minTx; tx <= tr.maxTx; ++tx) {
+                unsigned int cid = rowBase + tx;
+                if (s_tileCount[cid] < kPerTileCap) ++s_tileCount[cid];
+            }
+        }
+    }
+
+    // Prefix-sum -> per-tile offset into the flat index list (global clamp).
+    // wantedTotal = the pre-global-clamp demand (sum of per-tile capped counts);
+    // total = what actually fit. wantedTotal > kMaxTotalIndices means later
+    // clusters got starved (the "fill ends mid-screen" bug) — surfaced in the log.
+    unsigned int total = 0, wantedTotal = 0, peakTileCount = 0;
+    for (unsigned int cid = 0; cid < numClusters; ++cid) {
+        s_tileOffset[cid] = total;
+        unsigned int cnt = s_tileCount[cid];
+        wantedTotal += cnt;
+        if (cnt > peakTileCount) peakTileCount = cnt;
+        if (total + cnt > kMaxTotalIndices) cnt = (total < kMaxTotalIndices) ? (kMaxTotalIndices - total) : 0;
+        s_tileCount[cid] = cnt;   // final, clamped count
+        s_tileCursor[cid] = 0;
+        total += cnt;
+    }
+
+    // Pass B — fill the flat index list (light texLightData row indices).
+    static float s_idxScratch[kMaxTotalIndices];
+    for (unsigned int r = 0; r < rectCount; ++r) {
+        const TileRect& tr = s_rects[r];
+        for (int ty = tr.minTy; ty <= tr.maxTy; ++ty) {
+            unsigned int rowBase = ty * tilesX;
+            for (int tx = tr.minTx; tx <= tr.maxTx; ++tx) {
+                unsigned int cid = rowBase + tx;
+                if (s_tileCursor[cid] < s_tileCount[cid]) {
+                    s_idxScratch[s_tileOffset[cid] + s_tileCursor[cid]] = (float)tr.texIdx;
+                    ++s_tileCursor[cid];
+                }
+            }
+        }
+    }
+
+    // Upload grid texture: one texel per cluster (offset, count, 0, 0). Only the
+    // active tilesX x tilesY sub-rect; the shader clamps tile coords so unused
+    // texels are never sampled (DISCARD leaves them undefined, which is fine).
+    D3DLOCKED_RECT glr;
+    if (SUCCEEDED(texLightGrid->LockRect(0, &glr, nullptr, D3DLOCK_DISCARD))) {
+        for (unsigned int ty = 0; ty < tilesY; ++ty) {
+            float* row = (float*)((BYTE*)glr.pBits + ty * glr.Pitch);
+            unsigned int rowBase = ty * tilesX;
+            for (unsigned int tx = 0; tx < tilesX; ++tx) {
+                unsigned int cid = rowBase + tx;
+                row[tx * 4 + 0] = (float)s_tileOffset[cid];
+                row[tx * 4 + 1] = (float)s_tileCount[cid];
+                row[tx * 4 + 2] = 0.0f;
+                row[tx * 4 + 3] = 0.0f;
+            }
+        }
+        texLightGrid->UnlockRect(0);
+    }
+
+    // Upload index list: flat array packed 4 indices/texel, row-major. Only the
+    // rows containing data (ceil(total / (kIndexTexW*4))).
+    D3DLOCKED_RECT ilr;
+    if (SUCCEEDED(texLightIndexList->LockRect(0, &ilr, nullptr, D3DLOCK_DISCARD))) {
+        const unsigned int floatsPerRow = kIndexTexW * 4;
+        unsigned int usedRows = (total + floatsPerRow - 1) / floatsPerRow;
+        if (usedRows == 0) usedRows = 1;
+        if (usedRows > kIndexTexH) usedRows = kIndexTexH;
+        for (unsigned int row = 0; row < usedRows; ++row) {
+            float* dst = (float*)((BYTE*)ilr.pBits + row * ilr.Pitch);
+            const float* src = &s_idxScratch[row * floatsPerRow];
+            unsigned int copyFloats = floatsPerRow;
+            // Last partial row: clear the tail past `total` so no stale index leaks.
+            unsigned int rowStart = row * floatsPerRow;
+            unsigned int valid = (total > rowStart) ? std::min(floatsPerRow, total - rowStart) : 0;
+            memcpy(dst, src, valid * sizeof(float));
+            if (valid < copyFloats) memset(dst + valid, 0, (copyFloats - valid) * sizeof(float));
+        }
+        texLightIndexList->UnlockRect(0);
+    }
+
+    // Push the frame-constant grid params + textures on the shared pool (the
+    // tiled variant reads them; the per-mesh reflection path never overwrites
+    // tileGridParams or the grid textures, so binding once per rebuild is safe).
+    if (effectDefaultPurple) {
+        D3DXVECTOR4 p1((float)kTileSizePx, (float)tilesX, (float)tilesY, (float)kMaxSlicesZ);
+        D3DXVECTOR4 p2(1.0f / (float)kMaxTilesX, 1.0f / (float)(kMaxTilesY * kMaxSlicesZ),
+                       (float)kIndexTexW, 1.0f / (float)kIndexTexH);
+        if (ehTileGridParams)  effectDefaultPurple->SetVector(ehTileGridParams, &p1);
+        if (ehTileGridParams2) effectDefaultPurple->SetVector(ehTileGridParams2, &p2);
+        if (ehTexLightGrid)      effectDefaultPurple->SetTexture(ehTexLightGrid, texLightGrid);
+        if (ehTexLightIndexList) effectDefaultPurple->SetTexture(ehTexLightIndexList, texLightIndexList);
+    }
+
+    lastGridRevision = currentRev;
+    lastGridViewHash = viewHash;
+
+    if (logPerf) {
+        LARGE_INTEGER tsEnd;
+        QueryPerformanceCounter(&tsEnd);
+        const unsigned long long ns = (s_qpcFreq.QuadPart > 0)
+            ? (unsigned long long)(tsEnd.QuadPart - tsBegin.QuadPart) * 1000000000ULL / (unsigned long long)s_qpcFreq.QuadPart
+            : 0ULL;
+        LOG::logline("-- [TILE-GRID] rt=%ux%u %ux%u tiles, lights=%u alive-binned=%u indices=%u/%u wanted=%u peakTile=%u nearStamp=%u(%utiles) build=%lluns",
+                     rtW, rtH, tilesX, tilesY, snapshotCount, rectCount, total, kMaxTotalIndices,
+                     wantedTotal, peakTileCount, nearStampLights, nearStampTiles, ns);
+    }
+}
+
 void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, float pointLightMult,
                                           const D3DXMATRIX* cacheBonePalette, int cacheNumBones, const D3DXMATRIX* cacheView,
-                                          const D3DXVECTOR3* cacheWorldBoundsMin, const D3DXVECTOR3* cacheWorldBoundsMax) {
+                                          const D3DXVECTOR3* cacheWorldBoundsMin, const D3DXVECTOR3* cacheWorldBoundsMax,
+                                          LightMode lightMode, unsigned int maxIndices) {
     ID3DXEffect* effectFFE;
 
     // Instrument: per-draw stats — engine lightrs.active.size(), msoc snapshot
@@ -537,7 +905,19 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
     bool useTextureLights = false;
     unsigned int candidateCount = 0;
     float idxFloats[8 * 4] = { 0 };
-    {
+
+    // Tiled main-view route: the screen-tile grid was built once this frame in
+    // buildTileGrid, so skip the per-mesh selection (and the snapshot lock)
+    // entirely. useTiledLights gates the USE_TILED_LIGHTS variant — it needs an
+    // uploaded snapshot (lastUploadedPointCount) plus the grid textures. The
+    // "which view" signal is static at the call site (lightMode); reflection and
+    // first-person draws never pass Tiled, so they stay on the per-mesh path.
+    const bool tiledRoute = (lightMode == LightMode::Tiled) && tiledLightingActive();
+    bool useTiledLights = false;
+    if (tiledRoute) {
+        useTiledLights = (lastUploadedPointCount > 0) && texLightData
+                       && texLightGrid && texLightIndexList;
+    } else {
     MGE::SceneGraph::SnapshotReadLock snapshotLock;
     const auto& snapshotLights = MGE::SceneGraph::pointLights();
     const unsigned int snapshotCount =
@@ -579,7 +959,7 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
             bMin = bMax = D3DXVECTOR3(wt._41, wt._42, wt._43);
         }
         candidateCount = selectTextureLights(snapshotLights, snapshotCount,
-                                             rs->viewTransform, bMin, bMax, idxFloats, logPerf);
+                                             rs->viewTransform, bMin, bMax, idxFloats, logPerf, maxIndices);
     }
     }   // release SnapshotReadLock — all snapshotLights reads complete
 
@@ -597,9 +977,13 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
         // 4-matrix path, which the cache feed never uses — rs->vertexBlendState 0).
         sk.usesCacheSkin = 1;
     }
-    if (actuallyUseTextureLights) {
-        // Select the 64-light shader variant; per-pixel attenuation
-        // will dim out lights that don't affect a given fragment.
+    if (useTiledLights) {
+        // Tiled variant: per-pixel loop over the pixel's screen-tile light list.
+        // Mutually exclusive with useTextureLightVariant.
+        sk.usesTiledLightVariant = 1;
+    } else if (actuallyUseTextureLights) {
+        // Per-mesh texture-light variant; per-pixel attenuation dims out lights
+        // that don't affect a given fragment.
         sk.useTextureLightVariant = 1;
     }
 
@@ -624,13 +1008,15 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
     // leaks a faded value into the next draw.
     if (ehPointLightMult) effectFFE->SetFloat(ehPointLightMult, pointLightMult);
 
-    // Debug: per-object light-count heatmap. Push the selected per-mesh light count
-    // (candidateCount, 0..kMaxIndicesPerMesh) when the visualizer is on, else -1 (the
-    // shader treats <0 as "off"). Set every draw on whatever variant is bound, so both
-    // the reactive PPL and cache paths show identical density. candidateCount is 0 on
-    // the non-texture-light fallback (no snapshot point lights reach this mesh).
-    if (ehDebugLightCount)
-        effectFFE->SetFloat(ehDebugLightCount, debugLightHeatmap ? (float)candidateCount : -1.0f);
+    // Debug: light-count heatmap. >= 0 = visualizer on, < 0 = off (the shader
+    // treats < 0 as off). Per-mesh: push the selected count (candidateCount). Tiled:
+    // the per-mesh count is meaningless (the tiled path never computes it), so push
+    // 0 as the "on" flag — the shader sources the actual per-TILE loop count itself.
+    if (ehDebugLightCount) {
+        float heat = -1.0f;
+        if (debugLightHeatmap) heat = useTiledLights ? 0.0f : (float)candidateCount;
+        effectFFE->SetFloat(ehDebugLightCount, heat);
+    }
 
     // Set up material
     effectFFE->SetVector(ehMaterialDiffuse, (D3DXVECTOR4*)&frs->material.diffuse);
@@ -656,7 +1042,7 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
     // zero-init is dead work too. Keep the buffers declared so the
     // skipped SetFloatArray block is the only conditional, but skip
     // the memsets to save ~50 ns/draw on the v3 path.
-    if (!actuallyUseTextureLights) {
+    if (!actuallyUseTextureLights && !useTiledLights) {
         memset(&bufferDiffuse, 0, sizeof(bufferDiffuse));
         memset(&bufferAmbient, 0, sizeof(bufferAmbient));
         memset(&bufferPosition, 0, sizeof(bufferPosition));
@@ -684,11 +1070,11 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
         }
 
         if (light->type == D3DLIGHT_POINT) {
-            // Phase 2 wire-in: skip engine-emit point lights when
-            // msoc is feeding us the snapshot. Directional handling below
+            // Skip engine-emit point lights when a snapshot-backed path (per-mesh
+            // texture or tiled) is feeding point lights. Directional handling below
             // still runs (sun must come from the engine — it's set up via
             // MGEProxyDevice::SetLight intercept).
-            if (useTextureLights) continue;
+            if (useTextureLights || useTiledLights) continue;
 
             memcpy(&bufferDiffuse[pointLightCount], &light->diffuse, sizeof(light->diffuse));
 
@@ -764,6 +1150,20 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
         if (ehTexLightView) effectFFE->SetMatrix(ehTexLightView, &rs->viewTransform);
     }
 
+    // Tiled-light parameter pushes. The grid/index textures + tileGridParams are
+    // bound frame-constant in buildTileGrid (the per-mesh reflection path never
+    // overwrites them). Per-draw we still push the shared params the per-mesh path
+    // also writes — texLightData, the texel stride (lightDataParams.y, read by
+    // evalOnePointLight), and texLightView (= this draw's main view) — so a prior
+    // reflection per-mesh draw can't leak its reflected view / stale stride here.
+    if (useTiledLights) {
+        const float texelSize = 1.0f / (float)(kTexelsPerLight * kMaxTexLights);
+        D3DXVECTOR4 lightDataParams_v(0.0f, texelSize, 0.0f, 0.0f);  // .y = texel U stride
+        if (ehTexLightData) effectFFE->SetTexture(ehTexLightData, texLightData);
+        if (ehLightDataParams) effectFFE->SetVector(ehLightDataParams, &lightDataParams_v);
+        if (ehTexLightView) effectFFE->SetMatrix(ehTexLightView, &rs->viewTransform);
+    }
+
 
     // Apply light multipliers, for HDR light levels
     sunDiffuse *= sunMultiplier;
@@ -793,7 +1193,7 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
     // parameter handle resolution + constant-table write); the
     // compiled shader's eliminated-as-dead status doesn't make the
     // framework call free.
-    if (!actuallyUseTextureLights) {
+    if (!actuallyUseTextureLights && !useTiledLights) {
         effectFFE->SetVectorArray(ehLightDiffuse, bufferDiffuse, MaxLights);
         effectFFE->SetFloatArray(ehLightAmbient, bufferAmbient, MaxLights);
         effectFFE->SetFloatArray(ehLightPosition, bufferPosition, 3 * MaxLights);
@@ -869,7 +1269,7 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
                 : 0ULL;
         unsigned int variantIdx;
         if (sk.vertexMaterial == 0)        variantIdx = 0;
-        else if (sk.useTextureLightVariant)   variantIdx = 3;
+        else if (sk.useTextureLightVariant || sk.usesTiledLightVariant) variantIdx = 3;
         else if (sk.heavyLighting)         variantIdx = 2;
         else                               variantIdx = 1;
         ++s_variantCalls[variantIdx];
@@ -943,6 +1343,16 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
 }
 
 ID3DXEffect* FixedFunctionShader::generateMWShader(const ShaderKey& sk) {
+    // Synchronous FFE shader compile (D3DXCreateEffectFromFile below). On the
+    // render thread, a first-time variant compiles here mid-frame — the prime
+    // suspect for the ~1s hitches. Zoned for Tracy + timed so a spike attributes
+    // to "FFE compile" and the periodic count shows how many variants compile
+    // per session (the tiled variant doubled the variant space).
+    MGE_ZoneScopedN("generateMWShader");
+    if (s_qpcFreq.QuadPart == 0) QueryPerformanceFrequency(&s_qpcFreq);
+    LARGE_INTEGER tsGenBegin{};
+    QueryPerformanceCounter(&tsGenBegin);
+
     string genVBCoupling, genPSCoupling, genTransform, genTexcoords, genVertexColour, genLightCount, genMaterial, genTexturing, genFog;
     stringstream buf;
 
@@ -1101,7 +1511,7 @@ ID3DXEffect* FixedFunctionShader::generateMWShader(const ShaderKey& sk) {
     // away cleanly during compile.
     if (sk.vertexMaterial == 0) {
         genLightCount = "0";
-    } else if (sk.useTextureLightVariant) {
+    } else if (sk.useTextureLightVariant || sk.usesTiledLightVariant) {
         genLightCount = "0";
     } else {
         genLightCount = sk.heavyLighting ? "8" : "4";
@@ -1254,7 +1664,13 @@ ID3DXEffect* FixedFunctionShader::generateMWShader(const ShaderKey& sk) {
     // so the shader's #ifdef branch falls through to the constant-array
     // path. Using #ifdef rather than #if 0/1 because that's the convention
     // already used in this file (FFE_ERROR_MATERIAL, VERIFY).
-    const char* useTextureLightsValue = sk.useTextureLightVariant ? "1" : nullptr;
+    // Point-light variant macro. USE_TEXTURE_LIGHTS (per-mesh) and USE_TILED_LIGHTS
+    // (screen-tile grid) are mutually exclusive, so at most one is emitted. Emit the
+    // ACTIVE one as the single pre-terminator entry: a nullptr-name entry terminates
+    // the D3DXMACRO list, so we can't leave a dead nullptr slot before a live macro.
+    const char* lightMacroName = nullptr;
+    if (sk.useTextureLightVariant)    lightMacroName = "USE_TEXTURE_LIGHTS";
+    else if (sk.usesTiledLightVariant) lightMacroName = "USE_TILED_LIGHTS";
     const D3DXMACRO generatedCode[] = {
         "FFE_VB_COUPLING", genVBCoupling.c_str(),
         "FFE_SHADER_COUPLING", genPSCoupling.c_str(),
@@ -1265,10 +1681,9 @@ ID3DXEffect* FixedFunctionShader::generateMWShader(const ShaderKey& sk) {
         "FFE_VERTEX_MATERIAL", genMaterial.c_str(),
         "FFE_TEXTURING", genTexturing.c_str(),
         "FFE_FOG_APPLICATION", genFog.c_str(),
-        // Conditional macro — appears with value "1" iff the texture-
-        // light variant is being generated. Pre-terminator entry; the
-        // real terminator is the {0, 0} below.
-        useTextureLightsValue ? "USE_TEXTURE_LIGHTS" : nullptr, useTextureLightsValue,
+        // Conditional macro — appears with value "1" iff a snapshot light variant
+        // is being generated. Pre-terminator entry; the real terminator is {0,0}.
+        lightMacroName ? lightMacroName : nullptr, lightMacroName ? "1" : nullptr,
         0, 0
     };
 
@@ -1295,6 +1710,23 @@ ID3DXEffect* FixedFunctionShader::generateMWShader(const ShaderKey& sk) {
     }
 
     cacheEffects[sk] = effectFFE;
+
+    // Compile-cost accounting. Each call is one synchronous D3DX compile; a slow
+    // one mid-frame is felt as a hitch. Log per-compile ms + a running total so a
+    // session's compile burden (and any single outlier) is visible without Tracy.
+    {
+        LARGE_INTEGER tsGenEnd;
+        QueryPerformanceCounter(&tsGenEnd);
+        const double ms = (s_qpcFreq.QuadPart > 0)
+            ? 1000.0 * (double)(tsGenEnd.QuadPart - tsGenBegin.QuadPart) / (double)s_qpcFreq.QuadPart
+            : 0.0;
+        static unsigned long long s_genCount = 0;
+        static double s_genTotalMs = 0.0;
+        ++s_genCount;
+        s_genTotalMs += ms;
+        LOG::logline("-- [FFE-COMPILE] #%llu %.1fms (session total %.0fms) tiled=%d tex=%d",
+                     s_genCount, ms, s_genTotalMs, (int)sk.usesTiledLightVariant, (int)sk.useTextureLightVariant);
+    }
     return effectFFE;
 }
 
@@ -1334,8 +1766,18 @@ void FixedFunctionShader::release() {
         texLightData->Release();
         texLightData = nullptr;
     }
+    if (texLightGrid) {
+        texLightGrid->Release();
+        texLightGrid = nullptr;
+    }
+    if (texLightIndexList) {
+        texLightIndexList->Release();
+        texLightIndexList = nullptr;
+    }
     lastUploadedRevision = (unsigned int)-1;
     lastUploadedPointCount = 0;
+    lastGridRevision = (uint64_t)-1;
+    lastGridViewHash = 0;
     bboxCache.clear();
 }
 

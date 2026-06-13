@@ -49,6 +49,17 @@ class PostShaders {
     static std::atomic<bool> isLoading; // Add this member declaration
 
 public:
+    // Canonical scene render resolution (from the viewport at initBuffers).
+    // rcpRes = (1/W, 1/H); this returns W/H. 0 if buffers aren't initialised.
+    // The tiled-light grid (FixedFunctionShader::buildTileGrid) sizes itself to
+    // this so its screen tiles match the RT the main PPL pass + VPOS see — more
+    // reliable than GetRenderTarget(0) at frame start, which can have a stale or
+    // intermediate buffer bound before the engine sets the scene target.
+    static void getSceneResolution(unsigned int& w, unsigned int& h) {
+        w = (rcpRes[0] > 0.0f) ? (unsigned int)(1.0f / rcpRes[0] + 0.5f) : 0;
+        h = (rcpRes[1] > 0.0f) ? (unsigned int)(1.0f / rcpRes[1] + 0.5f) : 0;
+    }
+
     static bool init(IDirect3DDevice9* realDevice);
     static bool initShaderChain();
     static bool loadNewShader(const char* name);

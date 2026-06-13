@@ -226,6 +226,51 @@ shared float4 lightIndices[8];
 // texture-light uniforms.
 shared matrix texLightView;
 
+//------------------------------------------------------------
+// Tiled point-light path (USE_TILED_LIGHTS). Lights are binned into
+// screen-space tiles ONCE per frame on the CPU (FixedFunctionShader::
+// buildTileGrid); each pixel loops only over its own tile's light list,
+// and every main-view draw shares the same grid (so neighbouring opaque
+// draws are batchable — unlike the per-mesh USE_TEXTURE_LIGHTS path).
+//
+// Two textures (Doom-2016 two-texture scheme), both A32B32G32R32F:
+//   LightGridSampler  (s8): one texel per cluster. .x = flat offset into
+//                            the index list, .y = light count. .z/.w
+//                            reserved for the clustered (depth-slice) add.
+//   LightIndexSampler (s9): flat index list, 4 light-indices per texel
+//                            (each index is a row into texLightData, the
+//                            SAME wire format the per-mesh path reads).
+//
+// Cluster id = (sliceZ*tilesY + tileY)*tilesX + tileX, with numSlicesZ==1
+// now. The grid texture is addressed directly by 2D (tileX, sliceZ*tilesY
+// + tileY) coords; clustered later = set numSlicesZ>1 and add a Z term.
+//
+// KNOWN 2D-tiled weakness: a tile spanning near+far depth loops the union
+// of every light in that screen column. The deferred clustered Z-slice
+// fixes exactly this — the numSlicesZ plumbing keeps it an incremental add.
+shared texture texLightGrid;
+sampler LightGridSampler : register(s8) = sampler_state {
+    texture   = <texLightGrid>;
+    MinFilter = POINT;
+    MagFilter = POINT;
+    MipFilter = NONE;
+    AddressU  = CLAMP;
+    AddressV  = CLAMP;
+};
+shared texture texLightIndexList;
+sampler LightIndexSampler : register(s9) = sampler_state {
+    texture   = <texLightIndexList>;
+    MinFilter = POINT;
+    MagFilter = POINT;
+    MipFilter = NONE;
+    AddressU  = CLAMP;
+    AddressV  = CLAMP;
+};
+// tileGridParams  = (tileSizePx, tilesX, tilesY, numSlicesZ)
+// tileGridParams2 = (invGridTexW, invGridTexH, idxTexW, invIdxTexH)
+shared float4 tileGridParams;
+shared float4 tileGridParams2;
+
 // Debug: per-object light-count heatmap. Pushed per draw from
 // renderMorrowind = the selected per-mesh light count when the visualizer is on,
 // -1 when off. The pixel shader overrides its output with lightCountHeatmap() so
@@ -243,70 +288,128 @@ float3 lightCountHeatmap(float n) {
     return c;
 }
 
-#ifdef USE_TEXTURE_LIGHTS
+#if defined(USE_TEXTURE_LIGHTS) || defined(USE_TILED_LIGHTS)
 
+// Shade one point light, given its row index `idxF` into texLightData (3
+// texels: pos / diffuse / falloff+radius). Shared by both the per-mesh
+// (USE_TEXTURE_LIGHTS) and the tiled (USE_TILED_LIGHTS) paths so the
+// attenuation / soft-cutoff math stays identical between variants — the
+// only difference between the two is how idxF is resolved (per-mesh index
+// array vs the per-tile flat index list).
+float3 evalOnePointLight(float idxF, float3 viewPos, float3 normal) {
+    float stride = lightDataParams.y;
+
+    // Strength-reduced texel U coordinates: compute u0 once, derive
+    // u1/u2 by adding stride. Saves two multiplies per light vs.
+    // recomputing (idx*3 + offset + 0.5) * stride for each texel.
+    float u0 = (idxF * 3.0 + 0.5) * stride;
+    float u1 = u0 + stride;
+    float u2 = u0 + stride * 2.0;
+
+    float4 pos     = tex2Dlod(LightDataSampler, float4(u0, 0.5, 0, 0));
+    float4 color   = tex2Dlod(LightDataSampler, float4(u1, 0.5, 0, 0));
+    float4 falloff = tex2Dlod(LightDataSampler, float4(u2, 0.5, 0, 0));
+    float radius   = falloff.w;
+
+    // Transform world-space light position into view-space using the
+    // per-draw `texLightView` matrix. This is the "world-space-in-
+    // texture" half of the camera-rotation upload optimisation — the
+    // texture stays revision-keyed; camera motion only triggers this
+    // ~12-ALU mat-vec per light per pixel.
+    float3 lightViewPos = mul(float4(pos.xyz, 1.0), texLightView).xyz;
+    float3 toLight = lightViewPos - viewPos;
+    float dist2    = dot(toLight, toLight);
+    // rsqrt + dist2 * invDist beats sqrt + 1/sqrt on modern HW.
+    float invDist  = rsqrt(dist2);
+    float dist     = dist2 * invDist;
+
+    // Full attenuation 1/(k0 + k1*d + k2*d2). The linear term k1 (falloff.y)
+    // is essential: Morrowind candle/torch lights are pure-linear (k0=k2=0),
+    // so dropping k1 collapses the denominator to the 1e-4 guard and blows the
+    // light to white inside its radius. `dist` is already computed above.
+    // max() guards the singular d->0 flame-center texel (not a fallback path).
+    float att = 1.0 / max(falloff.z * dist2 + falloff.y * dist + falloff.x, 1e-4);
+
+    // Soft-cutoff window. The engine's 1/(C + L*d + Q*d²) never
+    // reaches 0; without bounding it, the CPU cull (which IS binary)
+    // creates visible hard seams wherever the cull boundary lands.
+    // Multiply attenuation by a smoothstep that ramps from 1 at
+    // d == radius down to 0 at d == 2*radius — same 2×radius point the
+    // CPU uses for cull (per-mesh sphere-AABB, or per-tile sphere-AABB
+    // in buildTileGrid), so the two boundaries align and the seam
+    // disappears. Pattern from OpenMW's PerObjectUniform mode.
+    att *= 1.0 - smoothstep(radius, 2.0 * radius, dist);
+
+    // Lambert (saturate(N · L) — matches FFE convention).
+    // dot(N, L) = dot(N, toLight) / dist; we already have invDist,
+    // so skip forming the explicit L vector — saves a vec3 divide.
+    float lambert = saturate(dot(normal, toLight) * invDist);
+
+    // Standard attenuation × Lambert × diffuse. No per-light ambient
+    // term: NI fields are raw (no engine markers to interpret).
+    return lambert * att * color.rgb;
+}
+#endif
+
+#ifdef USE_TEXTURE_LIGHTS
 float3 evaluatePointLightsTextured(float3 viewPos, float3 normal) {
     float3 acc = 0;
     int numLights = (int)lightDataParams.x;
-    float stride  = lightDataParams.y;
 
     for (int i = 0; i < numLights; ++i) {
         // Resolve i -> texture index via the per-mesh selection list.
         // lightIndices is a float4[8] holding 32 packed indices; lane
         // selection via i/4 row, i%4 column.
         float idxF = lightIndices[i / 4][i % 4];
+        acc += evalOnePointLight(idxF, viewPos, normal);
+    }
+    return acc;
+}
+#endif
 
-        // Strength-reduced texel U coordinates: compute u0 once, derive
-        // u1/u2 by adding stride. Saves two multiplies per light vs.
-        // recomputing (idx*3 + offset + 0.5) * stride for each texel.
-        float u0 = (idxF * 3.0 + 0.5) * stride;
-        float u1 = u0 + stride;
-        float u2 = u0 + stride * 2.0;
+#ifdef USE_TILED_LIGHTS
+// Tiled per-pixel light evaluation. The pixel's screen tile resolves to a
+// grid cell (offset,count) into the flat index list; loop only that tile's
+// lights. `outCount` returns the looped count for the Numpad4 heatmap.
+float3 evaluatePointLightsTiled(float3 viewPos, float3 normal, float2 vpos, out float outCount) {
+    float3 acc = 0;
 
-        float4 pos     = tex2Dlod(LightDataSampler, float4(u0, 0.5, 0, 0));
-        float4 color   = tex2Dlod(LightDataSampler, float4(u1, 0.5, 0, 0));
-        float4 falloff = tex2Dlod(LightDataSampler, float4(u2, 0.5, 0, 0));
-        float radius   = falloff.w;
+    float tileSizePx = tileGridParams.x;
+    float tilesX     = tileGridParams.y;
+    float tilesY     = tileGridParams.z;
+    // tileGridParams.w = numSlicesZ (==1 now; sliceZ pinned to 0).
 
-        // Transform world-space light position into view-space using the
-        // per-draw `texLightView` matrix. This is the "world-space-in-
-        // texture" half of the camera-rotation upload optimisation — the
-        // texture stays revision-keyed; camera motion only triggers this
-        // ~12-ALU mat-vec per light per pixel.
-        float3 lightViewPos = mul(float4(pos.xyz, 1.0), texLightView).xyz;
-        float3 toLight = lightViewPos - viewPos;
-        float dist2    = dot(toLight, toLight);
-        // rsqrt + dist2 * invDist beats sqrt + 1/sqrt on modern HW.
-        float invDist  = rsqrt(dist2);
-        float dist     = dist2 * invDist;
+    float2 tile = floor(vpos / tileSizePx);
+    tile.x = clamp(tile.x, 0.0, tilesX - 1.0);
+    tile.y = clamp(tile.y, 0.0, tilesY - 1.0);
 
-        // Full attenuation 1/(k0 + k1*d + k2*d2). The linear term k1 (falloff.y)
-        // is essential: Morrowind candle/torch lights are pure-linear (k0=k2=0),
-        // so dropping k1 collapses the denominator to the 1e-4 guard and blows the
-        // light to white inside its radius. `dist` is already computed above.
-        // max() guards the singular d->0 flame-center texel (not a fallback path).
-        float att = 1.0 / max(falloff.z * dist2 + falloff.y * dist + falloff.x, 1e-4);
+    float sliceZ   = 0.0;
+    float gridRow  = sliceZ * tilesY + tile.y;
+    float gridU    = (tile.x + 0.5) * tileGridParams2.x;   // invGridTexW
+    float gridV    = (gridRow + 0.5) * tileGridParams2.y;  // invGridTexH
+    float4 cell    = tex2Dlod(LightGridSampler, float4(gridU, gridV, 0, 0));
+    float offset   = cell.x;
+    float count    = cell.y;
+    outCount       = count;
 
-        // Soft-cutoff window. The engine's 1/(C + L*d + Q*d²) never
-        // reaches 0; without bounding it, the per-mesh CPU cull (which
-        // IS binary) creates visible hard seams wherever a mesh sits
-        // on the cull boundary. Multiply attenuation by a smoothstep
-        // that ramps from 1 at d == radius down to 0 at d == 2*radius —
-        // same 2×radius point the CPU uses for cull, so the two
-        // boundaries align and the seam disappears. Pattern from
-        // OpenMW's PerObjectUniform mode (lighting_util.glsl).
-        att *= 1.0 - smoothstep(radius, 2.0 * radius, dist);
+    float idxTexW    = tileGridParams2.z;
+    float invIdxTexW = 1.0 / idxTexW;
+    float invIdxTexH = tileGridParams2.w;
 
-        // Lambert (saturate(N · L) — matches FFE convention).
-        // dot(N, L) = dot(N, toLight) / dist; we already have invDist,
-        // so skip forming the explicit L vector — saves a vec3 divide.
-        float lambert = saturate(dot(normal, toLight) * invDist);
-
-        // Standard 1/(k0 + k2·d²) attenuation × Lambert × diffuse.
-        // No per-light ambient term: NI fields are raw (no engine
-        // markers to interpret), so the constant-array path's
-        // bufferAmbient correction does not apply here.
-        acc += lambert * att * color.rgb;
+    int n = (int)count;
+    for (int j = 0; j < n; ++j) {
+        // Flat index into the index list -> texel (4 indices/texel) + lane.
+        float k     = offset + (float)j;
+        float texel = floor(k * 0.25);
+        float lane  = k - texel * 4.0;
+        float ty    = floor(texel * invIdxTexW);
+        float tx    = texel - ty * idxTexW;
+        float4 four = tex2Dlod(LightIndexSampler,
+                               float4((tx + 0.5) * invIdxTexW, (ty + 0.5) * invIdxTexH, 0, 0));
+        float idxF = (lane < 0.5) ? four.x
+                   : (lane < 1.5) ? four.y
+                   : (lane < 2.5) ? four.z : four.w;
+        acc += evalOnePointLight(idxF, viewPos, normal);
     }
     return acc;
 }
@@ -427,8 +530,10 @@ FFEPixel PerPixelVS(FFEVertIn IN) {
     return OUT;
 }
 
-// Per-pixel lighting augmented with semi-HDR tonemap instead of light clamping
-float4 PerPixelPS(FFEPixel IN) : COLOR0 {
+// Per-pixel lighting augmented with semi-HDR tonemap instead of light clamping.
+// vpos : VPOS is the screen-space pixel coordinate, used by the tiled light path
+// to resolve the pixel's screen tile (same VPOS pattern as XE Mod Sky.fx).
+float4 PerPixelPS(FFEPixel IN, float2 vpos : VPOS) : COLOR0 {
     // Below-water clip for the cache reflection passes (true water level). Pass-all
     // (0,0,0,1) in the main reactive scene, so this is a no-op there.
     clip(dot(float4(IN.viewpos, 1), reflWaterClipPlane));
@@ -440,10 +545,17 @@ float4 PerPixelPS(FFEPixel IN) : COLOR0 {
     float3 d = lightSunDiffuse * saturate(dot(normal, -lightSunDirection));
     float3 a = lightSceneAmbient;
 
-#ifdef USE_TEXTURE_LIGHTS
-    // _Claude_ Phase 2 texture-light path. Lights packed into a 1D
-    // texture (3 texels per light); shader iterates lightDataParams.x
-    // lights (runtime count, no compile-time array). See
+#if defined(USE_TILED_LIGHTS)
+    // Tiled point-light path. Lights binned into screen tiles once per
+    // frame (FixedFunctionShader::buildTileGrid); this pixel loops only
+    // its own tile's list. tileLightCount is the looped count, fed to the
+    // Numpad4 heatmap below.
+    float tileLightCount = 0;
+    d += pointLightMult * evaluatePointLightsTiled(IN.viewpos, normal, vpos, tileLightCount);
+#elif defined(USE_TEXTURE_LIGHTS)
+    // Per-mesh texture-light path. Lights packed into a 1D texture (3
+    // texels per light); shader iterates lightDataParams.x lights
+    // (runtime count, no compile-time array). See
     // evaluatePointLightsTextured below.
     d += pointLightMult * evaluatePointLightsTextured(IN.viewpos, normal);
 #else
@@ -503,10 +615,19 @@ float4 PerPixelPS(FFEPixel IN) : COLOR0 {
         c.rgb *= 1 - v * shadecolor;
     }
 
-    // Debug: override with the per-object light-count heatmap (sun-only fog kept so
-    // shape reads). debugLightCount < 0 = visualizer off (the common case).
-    [branch] if (debugLightCount >= 0)
+    // Debug: override with the light-count heatmap (sun-only fog kept so shape
+    // reads). debugLightCount < 0 = visualizer off (the common case); >= 0 = on.
+    // Under tiled, the count is the in-shader per-TILE loop count (not the CPU
+    // per-mesh candidateCount, which the tiled path never computes). Tile counts
+    // run higher than per-object counts, so feed the ramp a retuned divisor (48
+    // via the 16/48 scale) vs the per-mesh /16 in lightCountHeatmap.
+    [branch] if (debugLightCount >= 0) {
+#ifdef USE_TILED_LIGHTS
+        c.rgb = lightCountHeatmap(tileLightCount * (16.0 / 48.0));
+#else
         c.rgb = lightCountHeatmap(debugLightCount);
+#endif
+    }
 
     return c;
 }
