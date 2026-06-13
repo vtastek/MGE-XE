@@ -38,7 +38,10 @@ D3DXHANDLE FixedFunctionShader::ehLightFalloffQuadratic, FixedFunctionShader::eh
 D3DXHANDLE FixedFunctionShader::ehTexLightData, FixedFunctionShader::ehLightDataParams, FixedFunctionShader::ehLightIndices, FixedFunctionShader::ehTexLightView;
 D3DXHANDLE FixedFunctionShader::ehTexgenTransform, FixedFunctionShader::ehBumpMatrix, FixedFunctionShader::ehBumpLumiScaleBias;
 D3DXHANDLE FixedFunctionShader::ehPointLightMult;
+D3DXHANDLE FixedFunctionShader::ehDebugLightCount;
 D3DXHANDLE FixedFunctionShader::ehShadowAtlas, FixedFunctionShader::ehApplyCacheShadow;
+
+bool FixedFunctionShader::debugLightHeatmap = false;
 
 float FixedFunctionShader::sunMultiplier, FixedFunctionShader::ambMultiplier;
 
@@ -113,6 +116,7 @@ bool FixedFunctionShader::init(IDirect3DDevice* d, ID3DXEffectPool* pool) {
     ehLightIndices = effect->GetParameterByName(0, "lightIndices");
     ehTexLightView = effect->GetParameterByName(0, "texLightView");
     ehPointLightMult = effect->GetParameterByName(0, "pointLightMult");
+    ehDebugLightCount = effect->GetParameterByName(0, "debugLightCount");
     ehTexgenTransform = effect->GetParameterByName(0, "texgenTransform");
     ehBumpMatrix = effect->GetParameterByName(0, "bumpMatrix");
     ehBumpLumiScaleBias = effect->GetParameterByName(0, "bumpLumiScaleBias");
@@ -619,6 +623,14 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
     // reflection pass at the distant-land handover). Always pushed so it never
     // leaks a faded value into the next draw.
     if (ehPointLightMult) effectFFE->SetFloat(ehPointLightMult, pointLightMult);
+
+    // Debug: per-object light-count heatmap. Push the selected per-mesh light count
+    // (candidateCount, 0..kMaxIndicesPerMesh) when the visualizer is on, else -1 (the
+    // shader treats <0 as "off"). Set every draw on whatever variant is bound, so both
+    // the reactive PPL and cache paths show identical density. candidateCount is 0 on
+    // the non-texture-light fallback (no snapshot point lights reach this mesh).
+    if (ehDebugLightCount)
+        effectFFE->SetFloat(ehDebugLightCount, debugLightHeatmap ? (float)candidateCount : -1.0f);
 
     // Set up material
     effectFFE->SetVector(ehMaterialDiffuse, (D3DXVECTOR4*)&frs->material.diffuse);

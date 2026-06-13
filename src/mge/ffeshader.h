@@ -209,6 +209,7 @@ class FixedFunctionShader {
     static D3DXHANDLE ehTexLightData, ehLightDataParams, ehLightIndices, ehTexLightView;
     static D3DXHANDLE ehTexgenTransform, ehBumpMatrix, ehBumpLumiScaleBias;
     static D3DXHANDLE ehPointLightMult;
+    static D3DXHANDLE ehDebugLightCount;   // per-object light-count heatmap (debug)
     // Reflection-cache shadow fold (shadow atlas at s6 + applyCacheShadow gate)
     static D3DXHANDLE ehShadowAtlas, ehApplyCacheShadow;
 
@@ -217,6 +218,12 @@ class FixedFunctionShader {
     static ID3DXEffect* generateMWShader(const ShaderKey& sk);
 
 public:
+    // Debug visualizer: when true, renderMorrowind pushes the per-mesh selected light
+    // count into the FFE shader's debugLightCount uniform, which overrides the pixel
+    // output with a 0..kMaxIndicesPerMesh heatmap. Toggled per-frame (Numpad4) in
+    // BeginScene. Shows the per-object light density both PPL and cache draws pay.
+    static bool debugLightHeatmap;
+
     static bool init(IDirect3DDevice* d, ID3DXEffectPool* pool);
     static void precacheAsync();
     static void updateLighting(float sunMult, float ambMult);

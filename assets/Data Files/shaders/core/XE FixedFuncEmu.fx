@@ -225,6 +225,24 @@ shared float4 lightIndices[8];
 // per-draw from ffeshader.cpp::renderMorrowind alongside the other
 // texture-light uniforms.
 shared matrix texLightView;
+
+// Debug: per-object light-count heatmap. Pushed per draw from
+// renderMorrowind = the selected per-mesh light count when the visualizer is on,
+// -1 when off. The pixel shader overrides its output with lightCountHeatmap() so
+// both reactive PPL and cache draws show identical density.
+shared float debugLightCount;
+float3 lightCountHeatmap(float n) {
+    // Cold(0) -> hot heatmap. Scaled to 0..16, not the 32 hard cap: real per-object
+    // selected counts top out ~8-12 even in dense interiors, so normalizing by the
+    // cap wasted two thirds of the ramp (everything blue/green). 0 = dim blue (sun
+    // only), green ~5, yellow ~8, red >=16. Tune the divisor if a denser scene clips.
+    float t = saturate(n / 16.0);
+    float3 c = lerp(float3(0.04, 0.05, 0.30), float3(0.0, 0.9, 0.1), saturate(t / 0.33));
+    c = lerp(c, float3(1.0, 0.9, 0.0), saturate((t - 0.33) / 0.33));
+    c = lerp(c, float3(1.0, 0.05, 0.0), saturate((t - 0.66) / 0.34));
+    return c;
+}
+
 #ifdef USE_TEXTURE_LIGHTS
 
 float3 evaluatePointLightsTextured(float3 viewPos, float3 normal) {
@@ -484,6 +502,11 @@ float4 PerPixelPS(FFEPixel IN) : COLOR0 {
 
         c.rgb *= 1 - v * shadecolor;
     }
+
+    // Debug: override with the per-object light-count heatmap (sun-only fog kept so
+    // shape reads). debugLightCount < 0 = visualizer off (the common case).
+    [branch] if (debugLightCount >= 0)
+        c.rgb = lightCountHeatmap(debugLightCount);
 
     return c;
 }

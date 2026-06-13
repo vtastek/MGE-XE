@@ -13,6 +13,7 @@
 #include "distantland.h"
 #include "mwbridge.h"
 #include "statusoverlay.h"
+#include "ffeshader.h"
 #include "userhud.h"
 #include "videobackground.h"
 #include "mge_tracy.h"
@@ -617,6 +618,13 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                 // prior Present, so this is live from frame 1.
                 if (g_tracyActive) g_gpuTimer.beginFrame();
 #endif
+                // Numpad4: toggle the per-object light-count heatmap (FFE/PPL + cache).
+                // Polled once per frame at frame start so it works in any scene.
+                if (GetAsyncKeyState(VK_NUMPAD4) & 0x0001) {
+                    FixedFunctionShader::debugLightHeatmap = !FixedFunctionShader::debugLightHeatmap;
+                    StatusOverlay::setStatus(FixedFunctionShader::debugLightHeatmap
+                                             ? "Light-count heatmap: ON" : "Light-count heatmap: OFF");
+                }
             }
 
             // Set any custom FOV and check distant water state
