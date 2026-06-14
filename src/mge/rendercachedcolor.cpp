@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <tuple>
 #include <vector>
 
 
@@ -260,6 +261,22 @@ void DistantLand::renderReflectionsFromCache(const D3DXMATRIX* view, const D3DXM
     static unsigned s_dyn = 0, s_stLt50 = 0, s_st50_150 = 0, s_stGe150 = 0;
     static unsigned s_calls = 0;
 
+    // Gather→sort→batched-draw. Pass 1 runs the existing filters/cull/size-gate and
+    // pushes survivors (with their already-computed bounds) into this reused vector;
+    // pass 2 sorts by a cheap effect-proxy key so consecutive draws share a ShaderKey,
+    // then draws under one held-open effect pass (beginBatch/endBatch). Reordering is
+    // visually order-independent here: only opaque + alpha-tested entries reach pass 2
+    // (blended entries are filtered out below), all z-tested and depth-writing.
+    struct ReflDraw {
+        const MGE::GeometryCache::CachedGeometry* e;
+        D3DXVECTOR3 center;
+        BoundingSphere bs;
+        D3DXVECTOR3 lbMin, lbMax;
+        bool keep;   // exterior: mirrored sphere lands on a visible water rect (else culled)
+    };
+    static std::vector<ReflDraw> survivors;
+    survivors.clear();
+
     for (const auto& kv : cacheMap) {
         const auto& e = kv.second;
         if (e.blendEnable) continue;         // alpha-blended: engine path
@@ -327,7 +344,97 @@ void DistantLand::renderReflectionsFromCache(const D3DXMATRIX* view, const D3DXM
             cacheWorldAABB(e, lbMin, lbMax);
         }
 
-        buildCacheReflectionState(e, *view, sunVec, sunCol, sunAmb, ambCol, rs, frs, lightrs);
+        survivors.push_back({ &e, center, bs, lbMin, lbMax, true });
+    }
+
+    // Water-rect cull: a cache object reflects into VISIBLE water only if its mirrored
+    // sphere (projected via the reflected viewproj — x,y NDC identical to reflCullViewProj)
+    // lands on a surviving water-tile rect (reflectionWaterRects, worker-built: terrain-wet
+    // + MSOC-visible + hysteresis). Objects whose reflection falls on no visible water are
+    // pure overdraw — culled. The cache range (nearDist ~7168) sits inside the 2-cell
+    // grazing-free zone and within staticReflRange, so neither the grazing nor range filter
+    // drops a cache tile; only MSOC + hysteresis gate. reflWaterCullActive folds in the
+    // interior / no-data / SWIMMING fallbacks (set by isReflectionWaterVisible): when the
+    // screen-space water projection is unreliable it is false → keep all (no per-tile cull),
+    // since the rects AND mask would otherwise collapse edge-on and over-cull.
+    const bool cullByWater = DistantLand::reflWaterCullActive;
+    unsigned reflStage2Drop = 0;   // rect survivors the fine silhouette mask additionally culled
+    {
+        const auto& rects = reflectionWaterRects;
+        for (ReflDraw& s : survivors) {
+            if (!cullByWater) { s.keep = true; continue; }
+            const D3DXVECTOR3& c = s.bs.center;
+            const float rad = s.bs.radius;
+            const float cx = c.x*viewproj._11 + c.y*viewproj._21 + c.z*viewproj._31 + viewproj._41;
+            const float cy = c.x*viewproj._12 + c.y*viewproj._22 + c.z*viewproj._32 + viewproj._42;
+            const float cw = c.x*viewproj._14 + c.y*viewproj._24 + c.z*viewproj._34 + viewproj._44;
+            bool keep = false;
+            if (cw < 1e-3f) {
+                keep = true;   // behind near plane → conservatively keep (matches the statics cull)
+            } else {
+                const float inv = 1.0f / cw;
+                const float nx = cx * inv, ny = cy * inv;
+                const float rx = rad * proj->_11 * inv;   // sphere radius in NDC
+                const float ry = rad * proj->_22 * inv;
+                bool rectKeep = false;
+                for (const D3DXVECTOR4& wr : rects) {   // stage 1: coarse rect
+                    if (nx + rx >= wr.x && nx - rx <= wr.z &&
+                        ny + ry >= wr.y && ny - ry <= wr.w) { rectKeep = true; break; }
+                }
+                // Stage 2: fine water-silhouette mask refines rect survivors, dropping
+                // objects flanking a thin/diagonal river (near a wet tile, off the water).
+                const bool maskKeep = rectKeep && DistantLand::reflWaterMaskTestNDC(nx, ny, rx, ry);
+                if (rectKeep && !maskKeep) ++reflStage2Drop;
+                keep = maskKeep;
+            }
+            s.keep = keep;
+        }
+    }
+
+    // Debug overlay (cycle state 5): stash each candidate as a box, GREEN = kept
+    // (drawn), RED = culled. Same keep the draw consumes, so the overlay is an exact
+    // before/after of the cull. The reflected viewproj is stashed for the frustum
+    // wireframe drawn in the main view.
+    if (debugReflFrustum) {
+        reflDbgViewProj = viewproj;
+        reflDbgValid = true;
+        reflCacheDbg.clear();
+        reflCacheDbg.reserve(survivors.size());
+        unsigned green = 0;
+        for (const ReflDraw& s : survivors) {
+            reflCacheDbg.push_back({ s.bs.center, s.bs.radius, s.keep });
+            if (s.keep) ++green;
+        }
+        LOG::logline("-- [REFL DBG] cache=%u waterRects=%u maskBits=%d kept=%u culled=%u "
+                     "stage2drop=%u (cullByWater=%d)",
+                     (unsigned)survivors.size(), (unsigned)reflectionWaterRects.size(),
+                     DistantLand::reflWaterMaskSetBits(), green,
+                     (unsigned)survivors.size() - green, reflStage2Drop, cullByWater ? 1 : 0);
+    }
+
+    // Sort by a cheap effect-proxy key so same-ShaderKey draws sit adjacent
+    // without running the per-mesh selection. The light-variant bit can still
+    // split a group in two, but the list is mostly grouped — enough to collapse
+    // the per-draw effect switches inside the batched tail. (texture, skin, FVF,
+    // mirror are the ShaderKey-relevant fields the loop drives per object.)
+    std::sort(survivors.begin(), survivors.end(),
+              [](const ReflDraw& a, const ReflDraw& b) {
+                  return std::tie(a.e->d3dTexture, a.e->isSkinned, a.e->vbFVF, a.e->mirrored)
+                       < std::tie(b.e->d3dTexture, b.e->isSkinned, b.e->vbFVF, b.e->mirrored);
+              });
+
+    FixedFunctionShader::beginBatch();
+    unsigned drawnCount = 0;
+    for (const ReflDraw& d : survivors) {
+        if (!d.keep) continue;   // culled: reflection lands on no visible water
+        ++drawnCount;
+        const auto& e = *d.e;
+        IDirect3DVertexBuffer9* vb = e.readVB();
+
+        {
+            MGE_ZoneScopedN("refl:state");
+            buildCacheReflectionState(e, *view, sunVec, sunCol, sunAmb, ambCol, rs, frs, lightrs);
+        }
 
         // Alpha test (cutout foliage/armor): the FFE shader outputs texture.a *
         // material.a; the FF alpha test then discards. renderMorrowind doesn't set
@@ -341,7 +448,7 @@ void DistantLand::renderReflectionsFromCache(const D3DXMATRIX* view, const D3DXM
         }
 
         // Point-light fade toward the static handover (matches the shadow fade).
-        const float plMult = cacheHandoverFade(center, eye, e.dynamicHint, nearDist);
+        const float plMult = cacheHandoverFade(d.center, eye, e.dynamicHint, nearDist);
 
         // Shadow handover fade rides the SAME per-object fade (shared
         // shadowReflMult, read by the FFE shadow fold), so shadows and point
@@ -351,10 +458,24 @@ void DistantLand::renderReflectionsFromCache(const D3DXMATRIX* view, const D3DXM
         // Reflection base winding is inverted (CCW); a mirrored part flips again.
         device->SetRenderState(D3DRS_CULLMODE, e.mirrored ? D3DCULL_CW : D3DCULL_CCW);
         // Base + any dark/detail/glow maps to consecutive sampler slots (packed to
-        // match the FragmentState stages buildCacheReflectionState emitted).
-        bindCacheTextures(device, e);
-        device->SetIndices(e.ib);
+        // match the FragmentState stages buildCacheReflectionState emitted). Build the
+        // stage list once: bind to the device (kept for state parity) AND capture it
+        // to hand straight to renderMorrowind, so the FFE shader's tex0..N are set
+        // without the per-stage device->GetTexture readback (a proxy round-trip).
+        IDirect3DBaseTexture9* texArr[8];
+        int texCount;
+        {
+            MGE_ZoneScopedN("refl:bind");
+            CacheStage stages[8];
+            texCount = buildCacheStages(e, stages);
+            for (int i = 0; i < texCount; ++i) {
+                device->SetTexture(i, stages[i].tex);
+                texArr[i] = stages[i].tex;
+            }
+            device->SetIndices(e.ib);
+        }
 
+        MGE_ZoneScopedN("refl:draw");
         if (e.isSkinned) {
             // VS palette skinning: bind-pose VB + per-frame bone palette (model->world);
             // renderMorrowind selects the skinIndexed path and applies reflView.
@@ -364,21 +485,30 @@ void DistantLand::renderReflectionsFromCache(const D3DXMATRIX* view, const D3DXM
             // Reflections cap point lights at 8 (kReflMaxLights): the mirrored
             // surface hides the seam from the tighter selection, and the heavy
             // per-mesh variant loops far fewer lights.
-            FixedFunctionShader::renderMorrowind(&rs, &frs, &lightrs, plMult, pal, (int)e.numBones, view, &lbMin, &lbMax,
-                                                 FixedFunctionShader::LightMode::PerMesh, kReflMaxLights);
+            FixedFunctionShader::renderMorrowind(&rs, &frs, &lightrs, plMult, pal, (int)e.numBones, view, &d.lbMin, &d.lbMax,
+                                                 FixedFunctionShader::LightMode::PerMesh, kReflMaxLights, texArr, (unsigned)texCount);
         } else {
             // Per-entry stride/FVF: dual-UV (44 / TEX2) for multi-map shapes, else 36 / TEX1.
             device->SetStreamSource(0, vb, 0, e.vbStride);
             device->SetFVF(e.vbFVF);
-            FixedFunctionShader::renderMorrowind(&rs, &frs, &lightrs, plMult, nullptr, 0, nullptr, &lbMin, &lbMax,
-                                                 FixedFunctionShader::LightMode::PerMesh, kReflMaxLights);
+            FixedFunctionShader::renderMorrowind(&rs, &frs, &lightrs, plMult, nullptr, 0, nullptr, &d.lbMin, &d.lbMax,
+                                                 FixedFunctionShader::LightMode::PerMesh, kReflMaxLights, texArr, (unsigned)texCount);
         }
     }
+    FixedFunctionShader::endBatch();
 
     // Shadow fold off + full receiver strength for everything after this pass
     // (the main scene shares the FFE shader; gate must never leak).
     effect->SetFloat(ehShadowReflMult, 1.0f);
     FixedFunctionShader::setCacheShadow(nullptr, false);
+
+    // Grouping quality: drawn ≫ effectSwitches confirms the sort collapsed the
+    // draw list into a handful of held-open passes. drawn is the post-water-cull
+    // count (<= survivors); candidates shows what the cull removed.
+    if (logPerf) {
+        LOG::logline("-- [REFL BATCH] drawn=%u candidates=%u effectSwitches=%u",
+                     drawnCount, (unsigned)survivors.size(), FixedFunctionShader::batchEffectSwitches());
+    }
 
     constexpr unsigned kIv = 300;
     if (logPerf && (++s_calls % kIv == 0)) {

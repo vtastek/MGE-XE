@@ -173,11 +173,135 @@ struct ReflPipeDiag {
 };
 static ReflPipeDiag g_reflPipe;
 
+// Runtime A/B toggle (Numpad1): enable the stage-2 fine water-silhouette mask (the
+// runtime near-grid raster + per-object mask test). OFF → skip the near-grid build and
+// the raster, leave the mask invalid so reflWaterMaskTestNDC keeps all → rect-only
+// (stage-1) cull, exactly the pre-mask behavior. Lets us bisect whether stage-2 is
+// implicated in a crash without swapping DLLs. Read on the main thread (updateMSOCCutoffInput)
+// and by the gate (worker or inline) — a benign cross-thread bool, like the other debug flags.
+static bool g_reflFineMaskEnabled = true;
+
 // True once isReflectionWaterVisible ran its tile loop this frame (i.e. it did NOT
 // early-out on interior / no-terrain-data). Lets cullReflectionSurvivors tell apart
 // "gate ran and found no in-range water → cull statics" from "gate couldn't compute
 // → keep all (legacy fallback)". Reset per frame at the top of the gate.
 static bool g_reflRectsComputed = false;
+
+// ---- Reflection water-silhouette mask (stage-2 fine cull) ----
+//
+// A tight binary screen-NDC mask of where VISIBLE water actually lands, built by
+// software-rastering the WET fine cells (g_fineMinH < waterZ) of the tiles that
+// already survived to emit a reflectionWaterRect. reflectionWaterRects is the cheap
+// COARSE stage (one loose AABB per wet tile); this mask is the FINE stage that drops
+// objects FLANKING a thin/diagonal river — near a wet tile (so they pass the rect)
+// but off the actual water silhouette. Water lies on the mirror plane, so its main-
+// cam NDC equals the reflection-cam NDC; the mask lives in the same screen space both
+// reflection culls test in. Binary (no Z): the reflection clips all geometry to one
+// side of the water plane, so nothing sits between camera and plane to depth-
+// disambiguate — a "water here" bit cannot mis-cull (a visible reflection lands on a
+// water pixel by definition). 256x128 cells packed as uint64 words (4 KB), file-scope
+// so there is no per-frame allocation; cleared each frame in the gate. kReflMaskW/H is
+// the silhouette tightness knob (bump to 512x256 if a far river reads blocky).
+static constexpr int kReflMaskW = 256;
+static constexpr int kReflMaskH = 128;
+static constexpr int kReflMaskWords = (kReflMaskW * kReflMaskH) / 64;
+static uint64_t g_reflWaterMask[kReflMaskWords];
+// false on the interior / no-terrain-data early-outs (cull then keeps all, mirroring
+// the empty-rects fallback); set true once the tile loop runs. Cleared per frame.
+static bool g_reflWaterMaskValid = false;
+
+// Map an NDC [-1,1] AABB to the inclusive mask cell range. Returns false if the AABB
+// lies fully outside the mask (off-screen); clamps a straddling AABB to the edges.
+static inline bool reflMaskCellRange(float nminx, float nminy, float nmaxx, float nmaxy,
+                                     int& ix0, int& iy0, int& ix1, int& iy1) {
+    ix0 = (int)floorf((nminx * 0.5f + 0.5f) * kReflMaskW);
+    ix1 = (int)floorf((nmaxx * 0.5f + 0.5f) * kReflMaskW);
+    iy0 = (int)floorf((nminy * 0.5f + 0.5f) * kReflMaskH);
+    iy1 = (int)floorf((nmaxy * 0.5f + 0.5f) * kReflMaskH);
+    if (ix1 < 0 || iy1 < 0 || ix0 >= kReflMaskW || iy0 >= kReflMaskH) return false;
+    if (ix0 < 0) ix0 = 0;
+    if (iy0 < 0) iy0 = 0;
+    if (ix1 >= kReflMaskW) ix1 = kReflMaskW - 1;
+    if (iy1 >= kReflMaskH) iy1 = kReflMaskH - 1;
+    return true;
+}
+
+// Set every mask bit covered by an NDC AABB. Loose (the AABB of a grazing-angle water
+// quad balloons inland) — used only as the behind-near-plane fallback in the rasterizer
+// where the proper quad fill can't run.
+static inline void reflMaskSetRange(float nminx, float nminy, float nmaxx, float nmaxy) {
+    int ix0, iy0, ix1, iy1;
+    if (!reflMaskCellRange(nminx, nminy, nmaxx, nmaxy, ix0, iy0, ix1, iy1)) return;
+    for (int y = iy0; y <= iy1; ++y) {
+        const int base = y * kReflMaskW;
+        for (int x = ix0; x <= ix1; ++x) {
+            const int bit = base + x;
+            g_reflWaterMask[bit >> 6] |= (uint64_t(1) << (bit & 63));
+        }
+    }
+}
+
+// Set one mask bit (mask-cell coords, no bounds check by caller responsibility).
+static inline void reflMaskSetCell(int cx, int cy) {
+    if (cx < 0 || cy < 0 || cx >= kReflMaskW || cy >= kReflMaskH) return;
+    const int bit = cy * kReflMaskW + cx;
+    g_reflWaterMask[bit >> 6] |= (uint64_t(1) << (bit & 63));
+}
+
+// Scanline-fill a triangle given in mask-cell float coords (edge-function rasterizer,
+// pixel-centre sampling). Tight: covers exactly the projected footprint, no AABB slop.
+static inline void reflMaskFillTri(float x0, float y0, float x1, float y1, float x2, float y2) {
+    // Reject non-finite verts (degenerate edge-on projection near the eye), then clamp
+    // the bbox in FLOAT space before the int cast — so a wildly off-screen corner can
+    // never produce an out-of-range (UB) int and an out-of-bounds mask write.
+    if (!std::isfinite(x0) || !std::isfinite(y0) || !std::isfinite(x1) ||
+        !std::isfinite(y1) || !std::isfinite(x2) || !std::isfinite(y2)) return;
+    float fminx = std::max(0.0f, std::min((float)kReflMaskW, std::min(x0, std::min(x1, x2))));
+    float fmaxx = std::max(0.0f, std::min((float)kReflMaskW, std::max(x0, std::max(x1, x2))));
+    float fminy = std::max(0.0f, std::min((float)kReflMaskH, std::min(y0, std::min(y1, y2))));
+    float fmaxy = std::max(0.0f, std::min((float)kReflMaskH, std::max(y0, std::max(y1, y2))));
+    int minx = (int)floorf(fminx);
+    int maxx = (int)ceilf (fmaxx);
+    int miny = (int)floorf(fminy);
+    int maxy = (int)ceilf (fmaxy);
+    if (maxx > kReflMaskW) maxx = kReflMaskW;
+    if (maxy > kReflMaskH) maxy = kReflMaskH;
+    if (minx >= maxx || miny >= maxy) return;
+    auto edge = [](float ax, float ay, float bx, float by, float px, float py) {
+        return (px - ax) * (by - ay) - (py - ay) * (bx - ax);
+    };
+    const float area = edge(x0, y0, x1, y1, x2, y2);
+    if (fabsf(area) < 1e-6f) return;   // degenerate
+    const float s = (area < 0.0f) ? -1.0f : 1.0f;   // normalize winding
+    for (int py = miny; py < maxy; ++py) {
+        const float sy = py + 0.5f;
+        const int base = py * kReflMaskW;
+        for (int px = minx; px < maxx; ++px) {
+            const float sx = px + 0.5f;
+            const float w0 = edge(x1, y1, x2, y2, sx, sy) * s;
+            const float w1 = edge(x2, y2, x0, y0, sx, sy) * s;
+            const float w2 = edge(x0, y0, x1, y1, sx, sy) * s;
+            if (w0 >= 0.0f && w1 >= 0.0f && w2 >= 0.0f) {
+                const int bit = base + px;
+                g_reflWaterMask[bit >> 6] |= (uint64_t(1) << (bit & 63));
+            }
+        }
+    }
+}
+
+// Fill a convex quad given as 4 mask-cell float coords in tileScreenRect corner order
+// (0=(-,-) 1=(+,-) 2=(-,+) 3=(+,+)); perimeter 0-1-3-2 → triangles (0,1,3),(0,3,2).
+// Also sets the centroid cell so a sub-cell-thin quad (whose edges miss every pixel
+// centre) still leaves a bit — no hole that would falsely cull an object over it.
+static inline void reflMaskFillQuad(const float mx[4], const float my[4]) {
+    reflMaskFillTri(mx[0], my[0], mx[1], my[1], mx[3], my[3]);
+    reflMaskFillTri(mx[0], my[0], mx[3], my[3], mx[2], my[2]);
+    const float cxf = 0.25f * (mx[0] + mx[1] + mx[2] + mx[3]);
+    const float cyf = 0.25f * (my[0] + my[1] + my[2] + my[3]);
+    // Range-compare (NaN-false) bounds the value so the int cast is always defined.
+    if (cxf >= 0.0f && cxf < (float)kReflMaskW && cyf >= 0.0f && cyf < (float)kReflMaskH)
+        reflMaskSetCell((int)cxf, (int)cyf);
+}
 
 // 1-frame hysteresis on per-water-tile visibility. A borderline horizon tile can flip
 // occluded↔visible every frame (snapshot wobble / a box-occluder occasionally missing
@@ -945,6 +1069,36 @@ void DistantLand::debugDumpMSOCMask() {
 // Read on the main thread so g_msocCutoffHeight is final before the verdict
 // core (worker or inline) reads it.
 void DistantLand::updateMSOCCutoffInput() {
+    // In-world overlays are compacted onto one cycling key (numpad +). One press
+    // advances which single overlay is active; we derive the per-overlay
+    // capture/render bools here. Read on the main thread BEFORE the cull worker
+    // dispatch so a press this frame is captured this frame (the worker fills the
+    // water-proxy / basin / box debug buffers gated on these bools).
+    if (GetAsyncKeyState(VK_ADD) & 0x0001) {
+        debugOverlayCycle = (debugOverlayCycle + 1) % 6;
+        static const char* const names[6] = {
+            "OFF", "Water proxy boxes", "Box occluders", "Basin watershed",
+            "MSOC basin boxes", "Reflection frustum + cache" };
+        char msg[80];
+        std::snprintf(msg, sizeof(msg), "Overlay [+]: %s", names[debugOverlayCycle]);
+        StatusOverlay::setStatus(msg);
+    }
+    g_drawWaterProxyBounds = (debugOverlayCycle == 1);
+    boxOccluderDebug       = (debugOverlayCycle == 2);
+    g_drawBasinDebug       = (debugOverlayCycle == 3);
+    g_drawMSOCBasinBounds  = (debugOverlayCycle == 4);
+    debugReflFrustum       = (debugOverlayCycle == 5);
+    // Cleared each frame; renderReflectionsFromCache re-validates it only if a
+    // water reflection actually runs (else the overlay draws no frustum).
+    reflDbgValid = false;
+
+    // Numpad1: A/B toggle the stage-2 reflection fine-mask (near-grid raster + mask test).
+    // OFF → rect-only reflection cull (pre-mask behavior); for bisecting crashes.
+    if (GetAsyncKeyState(VK_NUMPAD1) & 0x0001) {
+        g_reflFineMaskEnabled = !g_reflFineMaskEnabled;
+        StatusOverlay::setStatus(g_reflFineMaskEnabled
+            ? "Reflection fine mask: ON" : "Reflection fine mask: OFF (rect-only)");
+    }
     if (GetAsyncKeyState(VK_NUMPAD8) & 0x0001) {
         g_msocCutoffHeight += 256.0f;
         char msg[64];
@@ -957,15 +1111,8 @@ void DistantLand::updateMSOCCutoffInput() {
         std::snprintf(msg, sizeof(msg), "MSOC cutoff: %.0f units", g_msocCutoffHeight);
         StatusOverlay::setStatus(msg);
     }
-    // Numpad6: toggle the basin debug visualization (watershed surface + culled
-    // boxes). Culling itself is always active; this only adds debug draws.
-    if (GetAsyncKeyState(VK_NUMPAD6) & 0x0001) {
-        g_drawBasinDebug = !g_drawBasinDebug;
-        char msg[64];
-        std::snprintf(msg, sizeof(msg), "Basin debug draw: %s",
-                      g_drawBasinDebug ? "ON" : "OFF");
-        StatusOverlay::setStatus(msg);
-    }
+    // (Basin watershed overlay is now overlay-cycle state 3; g_drawBasinDebug is
+    // derived above.)
     // Numpad0: lock/unlock the eye fed into the basin (flood source + verdict
     // height). Locked → fly a free camera into a basin without it recomputing.
     if (GetAsyncKeyState(VK_NUMPAD0) & 0x0001) {
@@ -1309,14 +1456,8 @@ void DistantLand::renderDistantStatics() {
 
 void DistantLand::renderMSOCBasinBoundsDebug(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
     DrawStats::ScopedStage _ds(DrawStats::Debug);
-    if (GetAsyncKeyState(VK_NUMPAD9) & 0x0001) {
-        g_drawMSOCBasinBounds = !g_drawMSOCBasinBounds;
-        char msg[64];
-        std::snprintf(msg, sizeof(msg), "MSOC basin boxes: %s",
-                      g_drawMSOCBasinBounds ? "ON" : "OFF");
-        StatusOverlay::setStatus(msg);
-    }
-
+    // Toggle is now overlay-cycle state 4 (g_drawMSOCBasinBounds derived in
+    // updateMSOCCutoffInput).
     if (!g_drawMSOCBasinBounds || g_msocBasinDebugBoxes.empty() || !view || !proj)
         return;
 
@@ -1648,14 +1789,8 @@ void DistantLand::renderBoxOccluderDebug(const D3DXMATRIX* view, const D3DXMATRI
 // Numpad5 (which fires the MSOC mask dump) so the two no longer collide.
 void DistantLand::renderWaterProxyBoundsDebug(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
     DrawStats::ScopedStage _ds(DrawStats::Debug);
-    if (GetAsyncKeyState(VK_NUMPAD1) & 0x0001) {
-        g_drawWaterProxyBounds = !g_drawWaterProxyBounds;
-        char msg[64];
-        std::snprintf(msg, sizeof(msg), "Water proxy boxes: %s",
-                      g_drawWaterProxyBounds ? "ON" : "OFF");
-        StatusOverlay::setStatus(msg);
-    }
-
+    // Toggle is now overlay-cycle state 1 (g_drawWaterProxyBounds derived in
+    // updateMSOCCutoffInput).
     if (!g_drawWaterProxyBounds || g_waterProxyDebugBoxes.empty() || !view || !proj)
         return;
 
@@ -1716,6 +1851,146 @@ void DistantLand::renderWaterProxyBoundsDebug(const D3DXMATRIX* view, const D3DX
     DrawStats::count((unsigned)(lineVerts.size() / 2));
     device->DrawPrimitiveUP(D3DPT_LINELIST, (UINT)(lineVerts.size() / 2),
                             lineVerts.data(), sizeof(MSOCLineVertex));
+
+    stateSaved->Apply();
+    stateSaved->Release();
+}
+
+// Reflection-frustum + cache survivor overlay (overlay-cycle state 5). Drawn in
+// the MAIN camera view: wireframes the reflection cull frustum (inverse of the
+// stashed reflection view*proj — it sits BELOW the water mirror, looking up) plus
+// every GeometryCache reflection candidate as a box, RED = drawn into the
+// reflection now, GREEN = its mirrored sphere lands on a visible water rect (would
+// survive a water-rect cull — the over-draw / fix preview). Mirrors
+// renderMSOCBasinBoundsDebug's state save / LINELIST / restore; Z-test off so the
+// below-water frustum and boxes behind buildings stay visible.
+void DistantLand::renderReflectionFrustumDebug(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
+    DrawStats::ScopedStage _ds(DrawStats::Debug);
+    if (!debugReflFrustum || !reflDbgValid || !view || !proj)
+        return;
+
+    IDirect3DStateBlock9* stateSaved = nullptr;
+    if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &stateSaved)) || !stateSaved)
+        return;
+
+    static std::vector<MSOCLineVertex> lineVerts;
+    lineVerts.clear();
+    lineVerts.reserve(reflCacheDbg.size() * 24 + 24);
+
+    auto pushLine = [](float ax, float ay, float az, float bx, float by, float bz, DWORD color) {
+        lineVerts.push_back({ax, ay, az, color});
+        lineVerts.push_back({bx, by, bz, color});
+    };
+    auto pushWireBox = [&](float x0, float y0, float z0, float x1, float y1, float z1, DWORD color) {
+        pushLine(x0,y0,z0, x1,y0,z0, color); pushLine(x1,y0,z0, x1,y1,z0, color);
+        pushLine(x1,y1,z0, x0,y1,z0, color); pushLine(x0,y1,z0, x0,y0,z0, color);
+        pushLine(x0,y0,z1, x1,y0,z1, color); pushLine(x1,y0,z1, x1,y1,z1, color);
+        pushLine(x1,y1,z1, x0,y1,z1, color); pushLine(x0,y1,z1, x0,y0,z1, color);
+        pushLine(x0,y0,z0, x0,y0,z1, color); pushLine(x1,y0,z0, x1,y0,z1, color);
+        pushLine(x1,y1,z0, x1,y1,z1, color); pushLine(x0,y1,z0, x0,y1,z1, color);
+    };
+
+    // Reflection frustum: 8 world corners = inverse(reflDbgViewProj) of the D3D NDC
+    // cube (x,y in [-1,1], z in [0,1]). near face yellow, far magenta, sides cyan.
+    D3DXMATRIX invVP;
+    if (D3DXMatrixInverse(&invVP, nullptr, &reflDbgViewProj)) {
+        static const D3DXVECTOR3 ndc[8] = {
+            {-1,-1,0},{ 1,-1,0},{ 1, 1,0},{-1, 1,0},   // near 0..3
+            {-1,-1,1},{ 1,-1,1},{ 1, 1,1},{-1, 1,1}};  // far  4..7
+        D3DXVECTOR3 c[8];
+        for (int i = 0; i < 8; ++i) D3DXVec3TransformCoord(&c[i], &ndc[i], &invVP);
+        const DWORD kYellow = D3DCOLOR_XRGB(255,255,0), kMagenta = D3DCOLOR_XRGB(255,0,255), kCyan = D3DCOLOR_XRGB(0,255,255);
+        auto edge = [&](int a, int b, DWORD col){ pushLine(c[a].x,c[a].y,c[a].z, c[b].x,c[b].y,c[b].z, col); };
+        edge(0,1,kYellow); edge(1,2,kYellow); edge(2,3,kYellow); edge(3,0,kYellow);     // near quad
+        edge(4,5,kMagenta); edge(5,6,kMagenta); edge(6,7,kMagenta); edge(7,4,kMagenta); // far quad
+        edge(0,4,kCyan); edge(1,5,kCyan); edge(2,6,kCyan); edge(3,7,kCyan);             // side edges
+    }
+
+    // Cache reflection candidates: RED = drawn now, GREEN = would survive water-rect cull.
+    const DWORD kRed = D3DCOLOR_XRGB(255,64,64), kGreen = D3DCOLOR_XRGB(64,255,96);
+    for (const ReflCacheDbgBox& b : reflCacheDbg) {
+        const DWORD col = b.keep ? kGreen : kRed;
+        pushWireBox(b.center.x - b.radius, b.center.y - b.radius, b.center.z - b.radius,
+                    b.center.x + b.radius, b.center.y + b.radius, b.center.z + b.radius, col);
+    }
+
+    if (!lineVerts.empty()) {
+        D3DXMATRIX identity;
+        D3DXMatrixIdentity(&identity);
+        device->SetVertexDeclaration(nullptr);
+        device->SetVertexShader(nullptr);
+        device->SetPixelShader(nullptr);
+        device->SetFVF(fvfMSOCLine);
+        device->SetTransform(D3DTS_WORLD, &identity);
+        device->SetTransform(D3DTS_VIEW, view);
+        device->SetTransform(D3DTS_PROJECTION, proj);
+        device->SetTexture(0, nullptr);
+        device->SetRenderState(D3DRS_LIGHTING, FALSE);
+        device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+        device->SetRenderState(D3DRS_ZENABLE, FALSE);
+        device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+        device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+        device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+        device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+        device->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
+
+        DrawStats::count((unsigned)(lineVerts.size() / 2));
+        device->DrawPrimitiveUP(D3DPT_LINELIST, (UINT)(lineVerts.size() / 2),
+                                lineVerts.data(), sizeof(MSOCLineVertex));
+    }
+
+    // Stage-2 mask overlay: draw the rasterized water silhouette (g_reflWaterMask) as
+    // translucent screen-space cells, so the fine raster the cache/statics cull tests
+    // against is directly inspectable. XYZRHW (post-viewport), one quad per set bit.
+    if (g_reflWaterMaskValid) {
+        D3DVIEWPORT9 vp;
+        if (SUCCEEDED(device->GetViewport(&vp))) {
+            static std::vector<CurtainScreenVertex> mv;
+            mv.clear();
+            const float cellNdcW = 2.0f / (float)kReflMaskW;
+            const float cellNdcH = 2.0f / (float)kReflMaskH;
+            const DWORD maskColor = 0x600080FFu;   // ARGB ~38% alpha, cyan-blue water
+            for (int cy = 0; cy < kReflMaskH; ++cy) {
+                for (int cx = 0; cx < kReflMaskW; ++cx) {
+                    const int bit = cy * kReflMaskW + cx;
+                    if (!(g_reflWaterMask[bit >> 6] & (uint64_t(1) << (bit & 63)))) continue;
+                    // Cell NDC AABB → pixel quad (NDC y up → pixel y down).
+                    const float nx0 = -1.0f + cx * cellNdcW, nx1 = nx0 + cellNdcW;
+                    const float ny0 = -1.0f + cy * cellNdcH, ny1 = ny0 + cellNdcH;
+                    const float px0 = (nx0 * 0.5f + 0.5f) * (float)vp.Width;
+                    const float px1 = (nx1 * 0.5f + 0.5f) * (float)vp.Width;
+                    const float py0 = (1.0f - (ny1 * 0.5f + 0.5f)) * (float)vp.Height;
+                    const float py1 = (1.0f - (ny0 * 0.5f + 0.5f)) * (float)vp.Height;
+                    mv.push_back({ px0, py0, 0.5f, 1.0f, maskColor });
+                    mv.push_back({ px1, py0, 0.5f, 1.0f, maskColor });
+                    mv.push_back({ px1, py1, 0.5f, 1.0f, maskColor });
+                    mv.push_back({ px0, py0, 0.5f, 1.0f, maskColor });
+                    mv.push_back({ px1, py1, 0.5f, 1.0f, maskColor });
+                    mv.push_back({ px0, py1, 0.5f, 1.0f, maskColor });
+                }
+            }
+            if (!mv.empty()) {
+                device->SetVertexDeclaration(nullptr);
+                device->SetVertexShader(nullptr);
+                device->SetPixelShader(nullptr);
+                device->SetFVF(fvfCurtainScreen);
+                device->SetTexture(0, nullptr);
+                device->SetRenderState(D3DRS_LIGHTING, FALSE);
+                device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+                device->SetRenderState(D3DRS_ZENABLE, FALSE);
+                device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+                device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+                device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+                device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+                device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+                device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+                device->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
+                DrawStats::count((unsigned)(mv.size() / 3));
+                device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, (UINT)(mv.size() / 3),
+                                        mv.data(), sizeof(CurtainScreenVertex));
+            }
+        }
+    }
 
     stateSaved->Apply();
     stateSaved->Release();
@@ -2062,8 +2337,37 @@ template void DistantLand::applyMSOCToDistantStatics(VisibleSet<IpcClientVector>
 // water only where terrain dips below WaterLevel.
 static constexpr float kWaterFineGrid = 512.0f;
 static std::unordered_map<uint64_t, float> g_cellMinH;   // key: 8192-cell -> min Z
-static std::unordered_map<uint64_t, float> g_fineMinH;   // key: fine-cell -> min Z
+static std::unordered_map<uint64_t, float> g_fineMinH;   // key: 512-cell -> min Z (far mask + presence gate)
 static size_t g_terrainMinHSrcSize = (size_t)-1;         // landMeshes.size() built from
+
+// ---- Runtime near-camera terrain height grid (close reflection-mask silhouette) ----
+//
+// Vertex-binning into a fixed grid (g_fineMinH) can't beat the captured LOD mesh's own
+// vertex spacing: where the mesh is decimated coarser than the grid, cells with no
+// vertex stay empty and the mask checkerboards. The fix is to RASTERIZE the real
+// terrain triangles into a fine dense grid covering the 3x3 cells around the camera —
+// every cell a triangle covers gets the interpolated surface height, so coverage is
+// continuous (no holes) and finer than the vertex spacing. Rebuilt only when the eye
+// crosses a cell (infrequent), on the cull worker (off the main thread).
+static constexpr float kNearGrid = 128.0f;               // near silhouette resolution
+static constexpr int   kNearCellsPerWorldCell = (int)(DistantLand::kCellSize / kNearGrid); // 64
+static constexpr int   kNearW = 3 * kNearCellsPerWorldCell;   // 3x3 world cells → 192 grid cells/side
+struct NearHeightGrid {
+    int   gx0 = 0, gy0 = 0;          // grid-cell index of the region origin (floor(worldOrigin/kNearGrid))
+    int   builtCellX = INT_MIN, builtCellY = INT_MIN;  // eye cell this was built for
+    bool  valid = false;
+    std::vector<float> minZ;         // kNearW*kNearW, +inf = no terrain
+};
+static NearHeightGrid g_nearGrid;
+
+// Per distant-land tile: its source mesh + XY AABB, so the near-grid rebuild only
+// iterates triangles of tiles overlapping the 3x3 region (not the whole worldspace).
+// Built alongside g_fineMinH (same landMeshes-changed trigger).
+struct TileTriEntry {
+    const DistantLand::LandMeshCache* mesh;
+    float minx, miny, maxx, maxy;
+};
+static std::vector<TileTriEntry> g_tileTris;
 
 // Per-g_basinGrid terrain minimum (the watershed barrier map). Rebuilt when the
 // grid resolution changes or landMeshes changes; far cheaper than re-flooding,
@@ -2080,7 +2384,13 @@ static void buildTerrainMinHeight(
     const std::unordered_map<IDirect3DVertexBuffer9*, DistantLand::LandMeshCache>& landMeshes) {
     g_cellMinH.clear();
     g_fineMinH.clear();
+    g_tileTris.clear();
+    g_tileTris.reserve(landMeshes.size());
+    g_nearGrid.valid = false;   // region/source changed → force a near-grid rebuild
+    g_nearGrid.builtCellX = g_nearGrid.builtCellY = INT_MIN;
     for (const auto& kv : landMeshes) {
+        // Per-tile XY AABB for the near-grid triangle cull.
+        float tminx = 1e30f, tminy = 1e30f, tmaxx = -1e30f, tmaxy = -1e30f;
         for (const D3DXVECTOR3& p : kv.second.positions) {
             auto upd = [](std::unordered_map<uint64_t, float>& m, uint64_t k, float z) {
                 auto it = m.find(k);
@@ -2091,11 +2401,86 @@ static void buildTerrainMinHeight(
                                          (int)floorf(p.y / DistantLand::kCellSize)), p.z);
             upd(g_fineMinH, waterGridKey((int)floorf(p.x / kWaterFineGrid),
                                          (int)floorf(p.y / kWaterFineGrid)), p.z);
+            tminx = std::min(tminx, p.x); tmaxx = std::max(tmaxx, p.x);
+            tminy = std::min(tminy, p.y); tmaxy = std::max(tmaxy, p.y);
         }
+        if (!kv.second.indices.empty() && tmaxx >= tminx)
+            g_tileTris.push_back({ &kv.second, tminx, tminy, tmaxx, tmaxy });
     }
     g_terrainMinHSrcSize = landMeshes.size();
-    LOG::logline("-- [water-gate] terrain min-height built: %zu cells, %zu fine tiles",
-                 g_cellMinH.size(), g_fineMinH.size());
+    LOG::logline("-- [water-gate] terrain min-height built: %zu cells, %zu fine tiles, %zu tiled meshes",
+                 g_cellMinH.size(), g_fineMinH.size(), g_tileTris.size());
+}
+
+// Rebuild the dense near-camera terrain height grid for the 3x3 world cells around the
+// given eye cell, by rasterizing real terrain triangles (continuous coverage → no
+// vertex-spacing holes). No-op if already built for this cell. Runs on the cull worker
+// during isReflectionWaterVisible; cost is bounded to the few tiles overlapping the
+// region (per-tile AABB cull) and only paid on a cell crossing.
+static void buildNearHeightGrid(int eyeCellX, int eyeCellY) {
+    if (g_nearGrid.valid && g_nearGrid.builtCellX == eyeCellX && g_nearGrid.builtCellY == eyeCellY)
+        return;   // still current
+
+    g_nearGrid.gx0 = (eyeCellX - 1) * kNearCellsPerWorldCell;
+    g_nearGrid.gy0 = (eyeCellY - 1) * kNearCellsPerWorldCell;
+    g_nearGrid.builtCellX = eyeCellX;
+    g_nearGrid.builtCellY = eyeCellY;
+    g_nearGrid.minZ.assign((size_t)kNearW * kNearW, 1e30f);
+
+    // Region world bounds (for the per-tile AABB reject).
+    const float rx0 = g_nearGrid.gx0 * kNearGrid;
+    const float ry0 = g_nearGrid.gy0 * kNearGrid;
+    const float rx1 = rx0 + kNearW * kNearGrid;
+    const float ry1 = ry0 + kNearW * kNearGrid;
+
+    for (const TileTriEntry& t : g_tileTris) {
+        if (t.maxx < rx0 || t.minx > rx1 || t.maxy < ry0 || t.miny > ry1) continue;  // tile outside region
+        const auto& pos = t.mesh->positions;
+        const auto& idx = t.mesh->indices;
+        const std::uint32_t nv = (std::uint32_t)pos.size();
+        for (size_t i = 0; i + 3 <= idx.size(); i += 3) {
+            const std::uint32_t i0 = idx[i], i1 = idx[i + 1], i2 = idx[i + 2];
+            if (i0 >= nv || i1 >= nv || i2 >= nv) continue;   // malformed index guard
+            const D3DXVECTOR3& a = pos[i0];
+            const D3DXVECTOR3& b = pos[i1];
+            const D3DXVECTOR3& c = pos[i2];
+            // Triangle XY bbox → grid-cell range, clipped to the region.
+            float bminx = std::min(a.x, std::min(b.x, c.x));
+            float bmaxx = std::max(a.x, std::max(b.x, c.x));
+            float bminy = std::min(a.y, std::min(b.y, c.y));
+            float bmaxy = std::max(a.y, std::max(b.y, c.y));
+            int cx0 = (int)floorf(bminx / kNearGrid) - g_nearGrid.gx0;
+            int cx1 = (int)floorf(bmaxx / kNearGrid) - g_nearGrid.gx0;
+            int cy0 = (int)floorf(bminy / kNearGrid) - g_nearGrid.gy0;
+            int cy1 = (int)floorf(bmaxy / kNearGrid) - g_nearGrid.gy0;
+            if (cx1 < 0 || cy1 < 0 || cx0 >= kNearW || cy0 >= kNearW) continue;
+            if (cx0 < 0) cx0 = 0; if (cy0 < 0) cy0 = 0;
+            if (cx1 >= kNearW) cx1 = kNearW - 1; if (cy1 >= kNearW) cy1 = kNearW - 1;
+            // Barycentric setup (XY); skip degenerate triangles.
+            const float dx1 = b.x - a.x, dy1 = b.y - a.y;
+            const float dx2 = c.x - a.x, dy2 = c.y - a.y;
+            const float den = dx1 * dy2 - dx2 * dy1;
+            if (fabsf(den) < 1e-6f) continue;
+            const float invDen = 1.0f / den;
+            for (int gy = cy0; gy <= cy1; ++gy) {
+                const float wy = (g_nearGrid.gy0 + gy + 0.5f) * kNearGrid;
+                float* row = &g_nearGrid.minZ[(size_t)gy * kNearW];
+                for (int gx = cx0; gx <= cx1; ++gx) {
+                    const float wx = (g_nearGrid.gx0 + gx + 0.5f) * kNearGrid;
+                    // Point-in-triangle via barycentric; interpolate z if inside.
+                    const float px = wx - a.x, py = wy - a.y;
+                    const float w1 = (px * dy2 - dx2 * py) * invDen;
+                    const float w2 = (dx1 * py - px * dy1) * invDen;
+                    const float w0 = 1.0f - w1 - w2;
+                    if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f) continue;
+                    const float z = w0 * a.z + w1 * b.z + w2 * c.z;
+                    if (z < row[gx]) row[gx] = z;
+                }
+            }
+        }
+    }
+    g_nearGrid.valid = true;
+    LOG::logline("-- [water-gate] near height grid rebuilt for cell (%d,%d)", eyeCellX, eyeCellY);
 }
 
 // Build the basin barrier map (terrain MIN per g_basinGrid cell) at the given
@@ -2550,6 +2935,17 @@ bool DistantLand::isReflectionWaterVisible() {
     // only after the tile loop actually runs.
     g_reflRectsComputed = false;
 
+    // Water cull off by default; enabled below only when the screen-space projection is
+    // reliable (exterior, terrain data, eye well above water). Interior / no-data / swimming
+    // leave it false → both consumers keep all reflection candidates.
+    reflWaterCullActive = false;
+
+    // Stage-2 fine mask: clear bits + invalidate up front, so the same early-outs
+    // leave the mask invalid (reflWaterMaskTestNDC then keeps all). Validated at the
+    // same point as the rects, once the tile loop has run.
+    g_reflWaterMaskValid = false;
+    memset(g_reflWaterMask, 0, sizeof(g_reflWaterMask));
+
     // The terrain-height gate is an exterior-only optimization: the min-height
     // maps describe the exterior worldspace, and landMeshes persists across cell
     // changes (built at init, cleared at release). In an interior those maps are
@@ -2590,6 +2986,22 @@ bool DistantLand::isReflectionWaterVisible() {
     constexpr float kReflGrazeTan2 = 0.00191f;      // tan^2(2.5 deg): drop static rects below ~2.5 deg elevation
     const float grazeFarMinSq = (2.0f * kCellSize) * (2.0f * kCellSize);  // grazing cull applies only beyond 2 cells
 
+    // Stage-2 fine mask is only well-conditioned when the eye is clearly ABOVE the water
+    // plane. Swimming/underwater the eye sits ON the mirror plane, so water-plane cells
+    // project edge-on: cells near the eye blow up to wild NDC (rasterizer stress) and the
+    // edge-on silhouette wrongly culls peripheral objects. When that happens, OMIT the two
+    // silhouette grids (near 128u + far 512u) — skip the raster, leave the mask invalid so
+    // reflWaterMaskTestNDC keeps all — and let the coarse rect stage cull alone. The
+    // reflection system stays on; only the fine refinement is suspended near the surface.
+    constexpr float kMaskMinEyeHeight = 64.0f;      // below this above-water height → skip the fine mask
+    // Screen-space water projection is reliable only when the eye is clearly above the
+    // plane. Below it (swimming/wading) BOTH the rects and the mask collapse edge-on and
+    // over-cull — so disable the whole water cull (keep all). The fine mask additionally
+    // honors the Numpad1 A/B toggle.
+    const bool projReliable = eyeAboveWater > kMaskMinEyeHeight;
+    reflWaterCullActive = projReliable;             // gates rects AND mask in both consumers
+    const bool maskUsable = g_reflFineMaskEnabled && projReliable;
+
     // Reflection STATICS only reflect out to NearStaticEnd (see renderReflectedStatics
     // / prepareReflectionCullForWorker), but the gate tests water to fogEnd. Far horizon
     // tiles beyond the static range still produce thin horizon rects, and the 2D rect
@@ -2609,6 +3021,15 @@ bool DistantLand::isReflectionWaterVisible() {
 
     // Start this frame's visible-tile set (hysteresis); swapped into ...Last at the end.
     g_reflWaterVisThis.clear();
+
+    // Warmup: the rect-emit gate normally requires a tile visible THIS frame AND last
+    // (1-frame anti-flicker). At load / after a cell change the last-frame set is empty,
+    // so NO rects emit for one frame → every reflection object is culled (a visible flash
+    // of empty water reflection). When the last set is empty, drop the last-frame
+    // requirement so rects emit immediately. Anti-flicker is unaffected: the flickering
+    // tiles live in already-watery areas (last non-empty), so this only relaxes the very
+    // first frame entering water, never the sustained case.
+    const bool reflWarmup = g_reflWaterVisLast.empty();
 
     // Project a water tile footprint (at waterZ) to a main-view NDC AABB. Corners
     // behind the near plane are clamped to the plane (cw=eps) so a straddling near
@@ -2663,6 +3084,74 @@ bool DistantLand::isReflectionWaterVisible() {
         return any ? 0 : 2;
     };
 
+    // Stage-2 raster primitive: project one wet grid cell (centre ccx,ccy, half-extent
+    // cellHalf) onto the water plane to mask-cell coords and scanline-fill the actual
+    // quad — tight, no AABB inland spill. Water on the mirror plane ⇒ main-cam NDC ==
+    // reflection NDC. Corner order matches tileScreenRect: 0=(-,-) 1=(+,-) 2=(-,+) 3=(+,+).
+    auto fillWetCellQuad = [&](float ccx, float ccy, float cellHalf) {
+        const float cxs[4] = { ccx - cellHalf, ccx + cellHalf, ccx - cellHalf, ccx + cellHalf };
+        const float cys[4] = { ccy - cellHalf, ccy - cellHalf, ccy + cellHalf, ccy + cellHalf };
+        float mx[4], my[4];
+        for (int i = 0; i < 4; ++i) {
+            const float wx = cxs[i], wy = cys[i], wz = waterZ;
+            const float cx = wx*viewProj._11 + wy*viewProj._21 + wz*viewProj._31 + viewProj._41;
+            const float cy = wx*viewProj._12 + wy*viewProj._22 + wz*viewProj._32 + viewProj._42;
+            const float cw = wx*viewProj._14 + wy*viewProj._24 + wz*viewProj._34 + viewProj._44;
+            if (cw < 1e-3f) {
+                // Rare near-plane straddle: fall back to the loose AABB so there's no
+                // hole at the camera's feet (safe over-cover, not the common path).
+                D3DXVECTOR4 cell;
+                if (tileScreenRect(ccx, ccy, cellHalf, cell))
+                    reflMaskSetRange(cell.x, cell.y, cell.z, cell.w);
+                return;
+            }
+            const float inv = 1.0f / cw;
+            mx[i] = (cx * inv * 0.5f + 0.5f) * (float)kReflMaskW;
+            my[i] = (cy * inv * 0.5f + 0.5f) * (float)kReflMaskH;
+        }
+        reflMaskFillQuad(mx, my);
+    };
+
+    // FAR tiles: walk the 512u g_fineMinH cells in the tile footprint, fill the wet ones.
+    // Far cells are sub-pixel on screen, so the coarse grid is plenty.
+    auto rasterTileWetCells = [&](float tcx, float tcy, float thalf) {
+        const float grid = kWaterFineGrid;
+        const int fx0 = (int)floorf((tcx - thalf) / grid);
+        const int fx1 = (int)floorf((tcx + thalf) / grid);
+        const int fy0 = (int)floorf((tcy - thalf) / grid);
+        const int fy1 = (int)floorf((tcy + thalf) / grid);
+        const float cellHalf = 0.5f * grid;
+        for (int fy = fy0; fy <= fy1; ++fy)
+            for (int fx = fx0; fx <= fx1; ++fx) {
+                auto it = g_fineMinH.find(waterGridKey(fx, fy));
+                if (it == g_fineMinH.end() || it->second >= waterZ) continue;   // dry / no data
+                fillWetCellQuad((fx + 0.5f) * grid, (fy + 0.5f) * grid, cellHalf);
+            }
+    };
+
+    // CLOSE tiles: walk the dense 128u runtime near-grid (triangle-rasterized real
+    // terrain → continuous coverage, no vertex-spacing holes) over the sub-tile
+    // footprint, fill the wet cells. This is the tight near-camera silhouette.
+    auto rasterCloseTile = [&](float tcx, float tcy, float thalf) {
+        if (!g_nearGrid.valid) { rasterTileWetCells(tcx, tcy, thalf); return; }   // fallback
+        const float cellHalf = 0.5f * kNearGrid;
+        int cx0 = (int)floorf((tcx - thalf) / kNearGrid) - g_nearGrid.gx0;
+        int cx1 = (int)floorf((tcx + thalf) / kNearGrid) - g_nearGrid.gx0;
+        int cy0 = (int)floorf((tcy - thalf) / kNearGrid) - g_nearGrid.gy0;
+        int cy1 = (int)floorf((tcy + thalf) / kNearGrid) - g_nearGrid.gy0;
+        if (cx1 < 0 || cy1 < 0 || cx0 >= kNearW || cy0 >= kNearW) return;
+        if (cx0 < 0) cx0 = 0; if (cy0 < 0) cy0 = 0;
+        if (cx1 >= kNearW) cx1 = kNearW - 1; if (cy1 >= kNearW) cy1 = kNearW - 1;
+        for (int gy = cy0; gy <= cy1; ++gy) {
+            const float* row = &g_nearGrid.minZ[(size_t)gy * kNearW];
+            for (int gx = cx0; gx <= cx1; ++gx) {
+                if (row[gx] >= waterZ) continue;   // dry / no terrain (+inf)
+                fillWetCellQuad((g_nearGrid.gx0 + gx + 0.5f) * kNearGrid,
+                                (g_nearGrid.gy0 + gy + 0.5f) * kNearGrid, cellHalf);
+            }
+        }
+    };
+
     // Test one water tile: frustum-cull the thin box, terrain water-presence,
     // then MSOC occlusion on the survivor. A surviving (visible water) tile
     // contributes its screen rect to reflectionWaterRects for the Phase-B static
@@ -2671,7 +3160,7 @@ bool DistantLand::isReflectionWaterVisible() {
     //   red    = water present but MSOC-occluded → culled
     //   yellow = dry land at/above water level → no water
     //   (no-data tiles are very distant; dropped and not drawn)
-    auto testTile = [&](float tcx, float tcy, float thalf) {
+    auto testTile = [&](float tcx, float tcy, float thalf, bool closeTile) {
         BoundingBox wbox(
             D3DXVECTOR3(tcx - thalf, tcy - thalf, waterZ - slabHZ),
             D3DXVECTOR3(tcx + thalf, tcy + thalf, waterZ + slabHZ));
@@ -2727,10 +3216,20 @@ bool DistantLand::isReflectionWaterVisible() {
                     const int64_t tkey = ((int64_t)lroundf(tcx / 64.0f) << 32)
                                        ^ (int64_t)(uint32_t)lroundf(tcy / 64.0f);
                     g_reflWaterVisThis.insert(tkey);
-                    if (g_reflWaterVisLast.count(tkey) != 0) {   // visible last frame too
+                    if (reflWarmup || g_reflWaterVisLast.count(tkey) != 0) {   // visible last frame too (or warmup)
                         D3DXVECTOR4 rect;
-                        if (tileScreenRect(tcx, tcy, thalf, rect))
+                        if (tileScreenRect(tcx, tcy, thalf, rect)) {
                             reflectionWaterRects.push_back(rect);
+                            // Stage-2: raster this tile's wet cells into the fine mask
+                            // (same gate as the rect → "raster the rect-emitting tiles only").
+                            // Close tiles use the dense runtime near-grid (triangle-rastered
+                            // real terrain) for a tight, hole-free near silhouette. Omitted
+                            // while swimming (degenerate edge-on projection).
+                            if (maskUsable) {
+                                if (closeTile) rasterCloseTile(tcx, tcy, thalf);
+                                else           rasterTileWetCells(tcx, tcy, thalf);
+                            }
+                        }
                     }
                 }
             }
@@ -2751,6 +3250,12 @@ bool DistantLand::isReflectionWaterVisible() {
     const int eyeCellX = (int)floorf(eyePos.x / kCellSize);
     const int eyeCellY = (int)floorf(eyePos.y / kCellSize);
 
+    // Refresh the dense near-camera height grid (triangle-rastered real terrain) for the
+    // 3x3 cells the close-tile silhouette raster reads. No-op unless the eye crossed a cell.
+    // Skipped while swimming (mask omitted) — no point building what won't be read.
+    if (maskUsable)
+        buildNearHeightGrid(eyeCellX, eyeCellY);
+
     for (int cy = cy0; cy <= cy1; ++cy) {
         for (int cx = cx0; cx <= cx1; ++cx) {
             const float ccx = (cx + 0.5f) * kCellSize;
@@ -2770,17 +3275,20 @@ bool DistantLand::isReflectionWaterVisible() {
                 const float step    = 2.0f * subHalf;  // kCellSize / 9
                 for (int sy = -4; sy <= 4; ++sy) {
                     for (int sx = -4; sx <= 4; ++sx) {
-                        testTile(ccx + sx * step, ccy + sy * step, subHalf);
+                        testTile(ccx + sx * step, ccy + sy * step, subHalf, true);
                     }
                 }
             } else {
-                testTile(ccx, ccy, half);
+                testTile(ccx, ccy, half, false);
             }
         }
     }
 
     g_reflPipe.rects = (int)reflectionWaterRects.size();   // [REFL PIPE] visible water rects
     g_reflRectsComputed = true;   // tile loop ran → empty rects now means "no in-range water"
+    // Stage-2 mask is meaningful only when it was actually rastered (eye above water).
+    // Swimming → leave it invalid so reflWaterMaskTestNDC keeps all (rect-only cull).
+    g_reflWaterMaskValid = maskUsable;
 
     // [REFL PIPE FLIP] Diagnose the flickering tiles: any in-range tile whose visible-
     // state changed since last frame (symmetric difference of the visible sets). Report
@@ -2841,6 +3349,8 @@ void DistantLand::cullReflectionSurvivors(const D3DXMATRIX& viewProj, const D3DX
     // distinguishes them. With rects (the common case) the per-static test below decides.
     const bool keepWhenNoRects = !g_reflRectsComputed;
     for (const RenderMesh& m : g_reflMeshValues) {
+        // Water cull unreliable (interior / no data / swimming) → keep all.
+        if (!reflWaterCullActive) { reflectionSurvivors.PushBack(m); continue; }
         bool keep = keepWhenNoRects;
         if (!noRects) {
             const D3DXVECTOR3& c = m.sphere.center;
@@ -2856,10 +3366,14 @@ void DistantLand::cullReflectionSurvivors(const D3DXMATRIX& viewProj, const D3DX
                 const float rx = rad * proj._11 * inv;   // sphere radius in NDC
                 const float ry = rad * proj._22 * inv;
                 keep = false;
-                for (const D3DXVECTOR4& wr : waterRects) {
+                for (const D3DXVECTOR4& wr : waterRects) {   // stage 1: coarse rect
                     if (nx + rx >= wr.x && nx - rx <= wr.z &&
                         ny + ry >= wr.y && ny - ry <= wr.w) { keep = true; break; }
                 }
+                // Stage 2: fine water-silhouette mask refines the rect survivors,
+                // dropping objects flanking a thin/diagonal river. Only run on rect
+                // survivors; fail → cull.
+                if (keep) keep = reflWaterMaskTestNDC(nx, ny, rx, ry);
             }
         }
         if (keep) reflectionSurvivors.PushBack(m);
@@ -2869,6 +3383,38 @@ void DistantLand::cullReflectionSurvivors(const D3DXMATRIX& viewProj, const D3DX
     g_reflPipe.survivors = (int)reflectionSurvivors.Size();    // [REFL PIPE] after water-rect cull
     MGE_TracyPlot("reflStatics:count", double(g_reflMeshValues.size()));
     MGE_TracyPlot("reflStatics:culled", double(g_reflMeshValues.size() - reflectionSurvivors.Size()));
+}
+
+// Stage-2 fine cull (shared by statics + cache). Keep (true) if the footprint NDC
+// AABB overlaps any set water-silhouette bit, OR the mask is invalid (interior /
+// no-data fallback — mirrors the empty-rects keep). A fully off-screen footprint maps
+// to no cells → no water → cull. Water-on-plane means the caller's reflection-
+// projected footprint indexes the same mask the main camera built.
+bool DistantLand::reflWaterMaskTestNDC(float nx, float ny, float rx, float ry) {
+    if (!g_reflWaterMaskValid) return true;
+    int ix0, iy0, ix1, iy1;
+    if (!reflMaskCellRange(nx - rx, ny - ry, nx + rx, ny + ry, ix0, iy0, ix1, iy1))
+        return false;
+    for (int y = iy0; y <= iy1; ++y) {
+        const int base = y * kReflMaskW;
+        for (int x = ix0; x <= ix1; ++x) {
+            const int bit = base + x;
+            if (g_reflWaterMask[bit >> 6] & (uint64_t(1) << (bit & 63))) return true;
+        }
+    }
+    return false;
+}
+
+// Debug: popcount of the current silhouette mask (0 when invalid). Reported in
+// [REFL DBG] to quantify the rasterized water area.
+int DistantLand::reflWaterMaskSetBits() {
+    if (!g_reflWaterMaskValid) return 0;
+    int n = 0;
+    for (int i = 0; i < kReflMaskWords; ++i) {
+        uint64_t w = g_reflWaterMask[i];
+        while (w) { w &= (w - 1); ++n; }
+    }
+    return n;
 }
 
 // Main (frameSetupEarly): decide whether the cull worker should handle the

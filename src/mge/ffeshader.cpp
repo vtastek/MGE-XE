@@ -24,6 +24,16 @@ ID3DXEffectPool* FixedFunctionShader::constantPool;
 unordered_map<FixedFunctionShader::ShaderKey, ID3DXEffect*, FixedFunctionShader::ShaderKey::hasher> FixedFunctionShader::cacheEffects;
 FixedFunctionShader::ShaderLRU FixedFunctionShader::shaderLRU;
 ID3DXEffect* FixedFunctionShader::effectDefaultPurple;
+ID3DXEffect* FixedFunctionShader::s_batchEffect = nullptr;
+bool FixedFunctionShader::s_inBatch = false;
+unsigned int FixedFunctionShader::s_batchSwitches = 0;
+bool FixedFunctionShader::s_biSunDir = false, FixedFunctionShader::s_biSceneAmbient = false, FixedFunctionShader::s_biSunDiffuse = false;
+bool FixedFunctionShader::s_biTexLightView = false, FixedFunctionShader::s_biTexLightData = false, FixedFunctionShader::s_biDebugHeat = false, FixedFunctionShader::s_biCheckAmbient = false;
+D3DXVECTOR3 FixedFunctionShader::s_lastSunDir, FixedFunctionShader::s_lastSceneAmbient, FixedFunctionShader::s_lastSunDiffuse;
+D3DXMATRIX FixedFunctionShader::s_lastTexLightView;
+IDirect3DTexture9* FixedFunctionShader::s_lastTexLightData = nullptr;
+float FixedFunctionShader::s_lastDebugHeat = 0.0f;
+DWORD FixedFunctionShader::s_lastCheckAmbient = 0;
 IDirect3DTexture9* FixedFunctionShader::texLightData = nullptr;
 uint64_t FixedFunctionShader::lastUploadedRevision = (uint64_t)-1;
 unsigned int FixedFunctionShader::lastUploadedPointCount = 0;
@@ -322,6 +332,35 @@ void FixedFunctionShader::setCacheShadow(IDirect3DTexture9* atlas, bool enable) 
     if (!effectDefaultPurple) return;
     if (ehShadowAtlas) effectDefaultPurple->SetTexture(ehShadowAtlas, atlas);
     if (ehApplyCacheShadow) effectDefaultPurple->SetBool(ehApplyCacheShadow, enable ? TRUE : FALSE);
+}
+
+// Open a batched-submit bracket. While s_inBatch, renderMorrowind's draw tail
+// keeps one effect pass open across consecutive same-effect draws (see the tail
+// branch). s_batchEffect = nullptr means no pass is open yet; the first draw
+// opens one. Resets the effect-switch counter for this batch.
+void FixedFunctionShader::beginBatch() {
+    s_inBatch = true;
+    s_batchEffect = nullptr;
+    s_batchSwitches = 0;
+    // Invalidate the frame-invariant param cache so draw 1 of this batch always
+    // pushes (the previous batch's values, or a non-batched draw, may have left
+    // different shared-pool state).
+    s_biSunDir = s_biSceneAmbient = s_biSunDiffuse = false;
+    s_biTexLightView = s_biTexLightData = s_biDebugHeat = s_biCheckAmbient = false;
+}
+
+// Flush the batched-submit bracket. Closes any pass left open by the last draw
+// and nulls the device shaders so no FFE state leaks into the following pass.
+// Idempotent: safe to call when no pass is open or when not batching.
+void FixedFunctionShader::endBatch() {
+    if (s_batchEffect) {
+        s_batchEffect->EndPass();
+        s_batchEffect->End();
+        device->SetVertexShader(NULL);
+        device->SetPixelShader(NULL);
+        s_batchEffect = nullptr;
+    }
+    s_inBatch = false;
 }
 
 // ensureLightUpload — revision-keyed texLightData upload (pos/diffuse/falloff,
@@ -829,7 +868,8 @@ void FixedFunctionShader::buildTileGrid() {
 void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const FragmentState* frs, LightState* lightrs, float pointLightMult,
                                           const D3DXMATRIX* cacheBonePalette, int cacheNumBones, const D3DXMATRIX* cacheView,
                                           const D3DXVECTOR3* cacheWorldBoundsMin, const D3DXVECTOR3* cacheWorldBoundsMax,
-                                          LightMode lightMode, unsigned int maxIndices) {
+                                          LightMode lightMode, unsigned int maxIndices,
+                                          IDirect3DBaseTexture9* const* cacheTextures, unsigned int cacheTextureCount) {
     ID3DXEffect* effectFFE;
 
     // Instrument: per-draw stats — engine lightrs.active.size(), msoc snapshot
@@ -1015,7 +1055,12 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
     if (ehDebugLightCount) {
         float heat = -1.0f;
         if (debugLightHeatmap) heat = useTiledLights ? 0.0f : (float)candidateCount;
-        effectFFE->SetFloat(ehDebugLightCount, heat);
+        // Frame-invariant when the heatmap is off (constant -1); per-object when on
+        // (candidateCount). Batched: push only on change.
+        if (!s_inBatch || !s_biDebugHeat || heat != s_lastDebugHeat) {
+            effectFFE->SetFloat(ehDebugLightCount, heat);
+            s_lastDebugHeat = heat; s_biDebugHeat = true;
+        }
     }
 
     // Set up material
@@ -1122,7 +1167,13 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
             }
             ++pointLightCount;
         } else if (light->type == D3DLIGHT_DIRECTIONAL) {
-            effectFFE->SetFloatArray(ehLightSunDirection, (const float*)&light->viewspacePos, 3);
+            // Sun view-space direction = sun dir x view; constant across a
+            // single-view batch (reflected view is fixed). Batched: push on change.
+            const D3DXVECTOR3 sd(light->viewspacePos.x, light->viewspacePos.y, light->viewspacePos.z);
+            if (!s_inBatch || !s_biSunDir || sd != s_lastSunDir) {
+                effectFFE->SetFloatArray(ehLightSunDirection, (const float*)&light->viewspacePos, 3);
+                s_lastSunDir = sd; s_biSunDir = true;
+            }
 
             sunDiffuse = light->diffuse;
             ambient.r += light->ambient.x;
@@ -1144,10 +1195,21 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
             0.0f,                   // .z = unused (we use indices, not slices)
             0.0f);                  // .w = unused
 
-        if (ehTexLightData) effectFFE->SetTexture(ehTexLightData, texLightData);
+        // texLightData (the per-frame light texture) and texLightView (this view's
+        // transform) are frame-invariant across a single-view batch; lightDataParams
+        // (.x = candidateCount) and lightIndices (the per-mesh selection) are per
+        // object. Batched: push the two invariants only on change.
+        if (ehTexLightData && (!s_inBatch || !s_biTexLightData || texLightData != s_lastTexLightData)) {
+            effectFFE->SetTexture(ehTexLightData, texLightData);
+            s_lastTexLightData = texLightData; s_biTexLightData = true;
+        }
         if (ehLightDataParams) effectFFE->SetVector(ehLightDataParams, &lightDataParams_v);
         if (ehLightIndices) effectFFE->SetVectorArray(ehLightIndices, (D3DXVECTOR4*)idxFloats, 8);
-        if (ehTexLightView) effectFFE->SetMatrix(ehTexLightView, &rs->viewTransform);
+        if (ehTexLightView && (!s_inBatch || !s_biTexLightView
+                               || memcmp(&rs->viewTransform, &s_lastTexLightView, sizeof(D3DXMATRIX)) != 0)) {
+            effectFFE->SetMatrix(ehTexLightView, &rs->viewTransform);
+            s_lastTexLightView = rs->viewTransform; s_biTexLightView = true;
+        }
     }
 
     // Tiled-light parameter pushes. The grid/index textures + tileGridParams are
@@ -1172,8 +1234,17 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
     // Special case, check if ambient state is pure white (distant land does not record this for a reason)
     // Morrowind temporarily sets this for full-bright particle effects, but just adding it
     // to other ambient sources above would cause over-brightness
+    // D3DRS_AMBIENT is a per-draw proxy round-trip; in a batch the caller sets it
+    // once up front (reflection: AMBIENT=0), so read it on draw 1 and reuse the
+    // cached value for the rest. A full-bright value set before the batch is still
+    // honored (it's what gets cached).
     DWORD checkAmbient;
-    device->GetRenderState(D3DRS_AMBIENT, &checkAmbient);
+    if (s_inBatch && s_biCheckAmbient) {
+        checkAmbient = s_lastCheckAmbient;
+    } else {
+        device->GetRenderState(D3DRS_AMBIENT, &checkAmbient);
+        s_lastCheckAmbient = checkAmbient; s_biCheckAmbient = true;
+    }
     if (checkAmbient == 0xffffffff) {
         // Set lighting to result in full-bright equivalent after tonemapping
         ambient.r = ambient.g = ambient.b = 1.25;
@@ -1182,9 +1253,20 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
 
     // Sun + scene-ambient are read by every shader variant (texture-light
     // path uses them too — sun direction and global ambient are mixed in
-    // before the per-light loop in the pixel shader). Always push.
-    effectFFE->SetFloatArray(ehLightSceneAmbient, ambient, 3);
-    effectFFE->SetFloatArray(ehLightSunDiffuse, sunDiffuse, 3);
+    // before the per-light loop in the pixel shader). Frame-invariant across a
+    // single-view batch (sun/ambient are frame globals); batched pushes on change.
+    {
+        const D3DXVECTOR3 amb(ambient.r, ambient.g, ambient.b);
+        if (!s_inBatch || !s_biSceneAmbient || amb != s_lastSceneAmbient) {
+            effectFFE->SetFloatArray(ehLightSceneAmbient, ambient, 3);
+            s_lastSceneAmbient = amb; s_biSceneAmbient = true;
+        }
+        const D3DXVECTOR3 sdf(sunDiffuse.r, sunDiffuse.g, sunDiffuse.b);
+        if (!s_inBatch || !s_biSunDiffuse || sdf != s_lastSunDiffuse) {
+            effectFFE->SetFloatArray(ehLightSunDiffuse, sunDiffuse, 3);
+            s_lastSunDiffuse = sdf; s_biSunDiffuse = true;
+        }
+    }
     // Engine 8-light constant arrays. Only read by the
     // engine-emulating shader paths (calcLighting4 / calcLighting8).
     // The texture-light variant ignores them — skipping these 6 D3DX9
@@ -1216,14 +1298,25 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
         effectFFE->SetMatrix(ehTexgenTransform, &m);
     }
 
-    // Copy texture bindings from fixed function pipe
+    // Copy texture bindings into the effect's tex0..N params (the FFE shader samples
+    // these, not the device FF stages). Cache path: the caller passed the stage
+    // textures directly (cacheTextures) — use them and skip the per-stage
+    // device->GetTexture proxy round-trip. Reactive path (cacheTextures == null):
+    // read the device textures the engine bound, as before.
     const D3DXHANDLE ehIndex[] = { ehTex0, ehTex1, ehTex2, ehTex3, ehTex4, ehTex5 };
-    for (n = 0; n != std::min((int)sk.activeStages, 6); ++n) {
-        IDirect3DBaseTexture9* tex;
-        device->GetTexture(n, &tex);
-        effectFFE->SetTexture(ehIndex[n], tex);
-        if (tex) {
-            tex->Release();
+    const int texStages = std::min((int)sk.activeStages, 6);
+    if (cacheTextures) {
+        for (n = 0; n != texStages; ++n) {
+            effectFFE->SetTexture(ehIndex[n], (n < (int)cacheTextureCount) ? cacheTextures[n] : nullptr);
+        }
+    } else {
+        for (n = 0; n != texStages; ++n) {
+            IDirect3DBaseTexture9* tex;
+            device->GetTexture(n, &tex);
+            effectFFE->SetTexture(ehIndex[n], tex);
+            if (tex) {
+                tex->Release();
+            }
         }
     }
 
@@ -1241,16 +1334,43 @@ void FixedFunctionShader::renderMorrowind(const RenderedState* rs, const Fragmen
         effectFFE->SetMatrix(ehWorldView, &rs->worldViewTransforms[0]);
     }
 
-    UINT passes;
-    effectFFE->Begin(&passes, D3DXFX_DONOTSAVESTATE);
-    effectFFE->BeginPass(0);
-    DrawStats::count(rs->primCount);
-    device->DrawIndexedPrimitive(rs->primType, rs->baseIndex, rs->minIndex, rs->vertCount, rs->startIndex, rs->primCount);
-    effectFFE->EndPass();
-    effectFFE->End();
+    if (!s_inBatch) {
+        // Default path (main loop, first-person, non-batched cache): full effect
+        // apply + teardown around the single draw, exactly as upstream.
+        UINT passes;
+        effectFFE->Begin(&passes, D3DXFX_DONOTSAVESTATE);
+        effectFFE->BeginPass(0);
+        DrawStats::count(rs->primCount);
+        device->DrawIndexedPrimitive(rs->primType, rs->baseIndex, rs->minIndex, rs->vertCount, rs->startIndex, rs->primCount);
+        effectFFE->EndPass();
+        effectFFE->End();
 
-    device->SetVertexShader(NULL);
-    device->SetPixelShader(NULL);
+        device->SetVertexShader(NULL);
+        device->SetPixelShader(NULL);
+    } else {
+        // Batched path: hold one effect pass open across consecutive same-effect
+        // draws. On an effect switch, close the old pass and open the new one;
+        // otherwise just CommitChanges to push this draw's params into the live
+        // pass (no Begin/End teardown). The FFE technique pass sets only the
+        // vertex/pixel shader (no render states), so the caller's per-object
+        // SetRenderState(CULLMODE/ALPHATEST/...) are honored either way. endBatch
+        // flushes the final open pass and nulls the device shaders.
+        if (effectFFE != s_batchEffect) {
+            if (s_batchEffect) {
+                s_batchEffect->EndPass();
+                s_batchEffect->End();
+            }
+            UINT passes;
+            effectFFE->Begin(&passes, D3DXFX_DONOTSAVESTATE);
+            effectFFE->BeginPass(0);
+            s_batchEffect = effectFFE;
+            ++s_batchSwitches;
+        } else {
+            effectFFE->CommitChanges();
+        }
+        DrawStats::count(rs->primCount);
+        device->DrawIndexedPrimitive(rs->primType, rs->baseIndex, rs->minIndex, rs->vertCount, rs->startIndex, rs->primCount);
+    }
 
     // Instrument: end QPC, attribute the elapsed time to the variant bucket
     // selected for this draw, and emit a periodic histogram + per-variant

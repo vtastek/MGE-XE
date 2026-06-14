@@ -347,13 +347,9 @@ void DistantLand::renderStage0() {
                     effect->EndPass();
 
                     // The terrain-box occluders are now contributed to MSOC on the
-                    // cull worker every frame (see cullWorkerLoop). Numpad3 only
-                    // toggles the in-world debug overlay of those boxes.
-                    if (GetAsyncKeyState(VK_NUMPAD3) & 0x0001) {
-                        boxOccluderDebug = !boxOccluderDebug;
-                        StatusOverlay::setStatus(boxOccluderDebug
-                            ? "Terrain box overlay: ON" : "Terrain box overlay: OFF");
-                    }
+                    // cull worker every frame (see cullWorkerLoop). The in-world
+                    // overlay of those boxes is now overlay-cycle state 2
+                    // (boxOccluderDebug derived in updateMSOCCutoffInput).
 
                     // Numpad5 mask dump — reflects the worker's box submission.
                     debugDumpMSOCMask();
@@ -479,6 +475,7 @@ void DistantLand::renderStage0() {
             // renderCurtainDebug();
             renderBoxOccluderDebug(&mwView, &distProj);
             renderWaterProxyBoundsDebug(&mwView, &distProj);
+            renderReflectionFrustumDebug(&mwView, &distProj);
 
             // Reset matrices
             effect->SetMatrix(ehView, &mwView);

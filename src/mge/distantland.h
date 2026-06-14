@@ -284,6 +284,29 @@ public:
     // Numpad3: draw the terrain-box occluder overlay (capture is otherwise off).
     static bool boxOccluderDebug;
 
+    // In-world debug overlays are compacted onto ONE cycling key (numpad +,
+    // VK_ADD). debugOverlayCycle selects which single overlay is active; the
+    // per-overlay capture/render bools (boxOccluderDebug, g_drawWaterProxyBounds,
+    // g_drawBasinDebug, g_drawMSOCBasinBounds, debugReflFrustum) are DERIVED from
+    // it each frame in updateMSOCCutoffInput (early, before the cull worker reads
+    // them). 0=off 1=water-proxy 2=box-occluders 3=basin-watershed 4=msoc-basin
+    // 5=reflection-frustum+cache. Advanced by updateMSOCCutoffInput.
+    static int debugOverlayCycle;
+    // Cycle state 5: draw the reflection cull frustum + the GeometryCache
+    // reflection draw set as boxes, RED = drawn now, GREEN = its mirrored sphere
+    // lands on a visible water rect (would survive a water-rect cull — the fix
+    // preview). debugReflFrustum gates capture in renderReflectionsFromCache.
+    static bool debugReflFrustum;
+    struct ReflCacheDbgBox { D3DXVECTOR3 center; float radius; bool keep; };
+    static std::vector<ReflCacheDbgBox> reflCacheDbg;
+    // The reflection render view*proj, stashed by renderReflectionsFromCache when
+    // the overlay is active, so renderReflectionFrustumDebug (drawn in the MAIN
+    // view) can invert it to wireframe the reflection camera frustum. reflDbgValid
+    // is false when no water reflection ran this frame (overlay then draws nothing).
+    static D3DXMATRIX reflDbgViewProj;
+    static bool reflDbgValid;
+    static void renderReflectionFrustumDebug(const D3DXMATRIX* view, const D3DXMATRIX* proj);
+
     // Free the horizon-curtain workspace (the lazily-allocated state in
     // renderexterior.cpp). Called from release() so the malloc'd buffers
     // don't leak across renderer init/release cycles.
@@ -414,6 +437,12 @@ public:
     // Surviving water tile screen rects (main-view NDC AABBs: x=minX, y=minY,
     // z=maxX, w=maxY). Where visible water samples texReflection on screen.
     static std::vector<D3DXVECTOR4> reflectionWaterRects;
+    // Whether the screen-space water cull (rects + silhouette mask) is reliable this
+    // frame. FALSE → both consumers (cullReflectionSurvivors, renderReflectionsFromCache)
+    // keep ALL reflection candidates. Set false on interior / no terrain data, and while
+    // SWIMMING (eye on the water plane → water projects edge-on → rects AND mask collapse
+    // to slivers and over-cull). Written by isReflectionWaterVisible.
+    static bool reflWaterCullActive;
 
     // --- Reflection-statics cull dispatched to the MSOC cull worker ---
     // The gate (isReflectionWaterVisible), the reflection IPC query and the
@@ -441,6 +470,16 @@ public:
     // Cull the materialized reflection meshes into reflectionSurvivors using
     // reflectionWaterRects. Shared by the worker and the non-worker fallback.
     static void cullReflectionSurvivors(const D3DXMATRIX& viewProj, const D3DXMATRIX& proj);
+    // Stage-2 reflection cull: fine water-silhouette mask test. Given a footprint's
+    // main-view NDC AABB (centre nx,ny ± half-extents rx,ry), returns true (keep) if
+    // it overlaps any rasterized visible-water bit. Returns true unconditionally when
+    // the mask is invalid (interior / no terrain data — mirrors the empty-rects keep).
+    // Water lies on the mirror plane, so a reflection-projected footprint shares the
+    // main-cam NDC the mask was built in. Built by isReflectionWaterVisible, consumed
+    // by cullReflectionSurvivors (statics) and renderReflectionsFromCache (cache).
+    static bool reflWaterMaskTestNDC(float nx, float ny, float rx, float ry);
+    // Debug: number of set bits in the current water-silhouette mask (0 if invalid).
+    static int reflWaterMaskSetBits();
     static void simulateDynamicWaves();
     static void renderWaterPlane();
 

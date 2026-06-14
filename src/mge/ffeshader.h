@@ -127,6 +127,35 @@ class FixedFunctionShader {
     static ShaderLRU shaderLRU;
     static ID3DXEffect* effectDefaultPurple;
 
+    // --- Batched FFE submit (opt-in; see beginBatch/endBatch) ---
+    // When s_inBatch, renderMorrowind holds one effect pass open across
+    // consecutive same-effect draws (CommitChanges per object) instead of a
+    // full Begin/BeginPass/EndPass/End per draw. s_batchEffect is the effect
+    // whose pass is currently open (nullptr = none). s_batchSwitches counts how
+    // many times the batched tail had to close one pass and open another
+    // (effect switches) since beginBatch — a grouping-quality metric the caller
+    // logs. Non-batched callers never touch these (default path unchanged).
+    static ID3DXEffect* s_batchEffect;
+    static bool s_inBatch;
+    static unsigned int s_batchSwitches;
+
+    // Batched-mode frame-invariant param cache. The FFE light/view params below
+    // are `shared` (constant pool) so a value set on any variant propagates to
+    // all of them; within a single-view batch they never change. While s_inBatch,
+    // renderMorrowind pushes each only when its value differs from the last draw
+    // (and caches it here), so a param fires once (draw 1) and the rest skip both
+    // the Set* and the CommitChanges upload it would force. Each has a validity
+    // flag because a demoted draw (candidateCount==0) takes the engine path and
+    // never touches the texture-light params — beginBatch() clears all flags so
+    // draw 1 always re-sets. Non-batched callers ignore this (always Set).
+    static bool s_biSunDir, s_biSceneAmbient, s_biSunDiffuse;
+    static bool s_biTexLightView, s_biTexLightData, s_biDebugHeat, s_biCheckAmbient;
+    static D3DXVECTOR3 s_lastSunDir, s_lastSceneAmbient, s_lastSunDiffuse;
+    static D3DXMATRIX s_lastTexLightView;
+    static IDirect3DTexture9* s_lastTexLightData;
+    static float s_lastDebugHeat;
+    static DWORD s_lastCheckAmbient;   // GetRenderState(D3DRS_AMBIENT), read once per batch
+
     // Dynamic 1D texture holding per-frame light data for the
     // USE_TEXTURE_LIGHTS shader path. Layout: 3 texels per light
     // (pos+ambient, diffuse, falloff+radius) at R32G32B32A32F. Width =
@@ -332,7 +361,15 @@ public:
                                 const D3DXMATRIX* cacheBonePalette = nullptr, int cacheNumBones = 0, const D3DXMATRIX* cacheView = nullptr,
                                 const D3DXVECTOR3* cacheWorldBoundsMin = nullptr, const D3DXVECTOR3* cacheWorldBoundsMax = nullptr,
                                 LightMode lightMode = LightMode::PerMesh,
-                                unsigned int maxIndices = kMaxIndicesPerMesh);
+                                unsigned int maxIndices = kMaxIndicesPerMesh,
+                                // Cache path: the per-stage textures, passed directly so the
+                                // effect's tex0..N are set without reading them back from the
+                                // device (GetTexture per stage is a proxy round-trip the cache
+                                // caller can avoid — it already knows the textures). When null,
+                                // the reactive path reads device textures as before. Count is
+                                // the stage count (== ShaderKey activeStages for cache draws).
+                                IDirect3DBaseTexture9* const* cacheTextures = nullptr,
+                                unsigned int cacheTextureCount = 0);
     // Shared texture-light selection (revision-keyed upload + view-keyed frustum
     // precull + per-mesh sphere-AABB nearest-kMaxIndicesPerMesh). Used by
     // renderMorrowind (objects) and the cache terrain pass so both pick lights with
@@ -354,6 +391,17 @@ public:
     // Caller binds shadowViewProj (reflected-view -> shadow clip), the reflected
     // sunVecView and per-draw shadowReflMult on the distant-land effect (shared).
     static void setCacheShadow(IDirect3DTexture9* atlas, bool enable);
+    // Batched submit bracket. Between beginBatch()/endBatch(), renderMorrowind
+    // holds an effect pass open across consecutive same-effect draws and only
+    // CommitChanges per object, collapsing the per-draw Begin/End cost. Callers
+    // must order their draw list by effect (texture/skin/fvf/mirror) so a pass
+    // spans many objects. endBatch flushes the open pass and nulls the device
+    // shaders; it is idempotent (safe on any exit path). batchEffectSwitches()
+    // returns the effect-switch count accumulated since beginBatch (drawn ≫
+    // switches confirms grouping worked).
+    static void beginBatch();
+    static void endBatch();
+    static unsigned int batchEffectSwitches() { return s_batchSwitches; }
     static IDirect3DTexture9* textureLightData() { return texLightData; }
     static unsigned int maxTexLights()      { return kMaxTexLights; }
     static float        texLightTexelSize() { return 1.0f / (float)(kTexelsPerLight * kMaxTexLights); }
