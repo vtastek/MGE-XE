@@ -72,7 +72,10 @@ float3 getFinalWaterNormal(float2 texcoord1, float2 texcoord2, float dist, float
     // Sample the per-body flow field at this world position.
     float4 flow = tex2Dlod(sampFlow, float4((vertXY - flowMapTransform.xy) * flowMapTransform.zw, 0, 0));
     float2 flowDir = flow.rg * 2 - 1;
-    float  intensity = lerp(1.0, flow.b, flowMapWeight);          // weight 0 → sea-equivalent
+    // B is the wave-amplitude mask (decoded *3). Saturate it for normal strength so the
+    // 3x open-sea amplitude doesn't over-steepen normals: pond 0 (calm), river ~0.5,
+    // beach/sea full. weight 0 → sea-equivalent (1.0).
+    float  intensity = lerp(1.0, saturate(flow.b * 3.0), flowMapWeight);
     // Alpha is a packed routing channel: 0.5 = neutral, <0.5 = NEAR group (river/beach), >0.5 =
     // FAR group (sea). Rivers/beaches advect the CLOSE normal (detail rolls downstream/onshore);
     // sea advects the FAR normal along the blurred coastline normal (large swells refract shoreward).
@@ -187,38 +190,42 @@ WaterVertOut WaterVS (in float4 pos : POSITION)
     float2 worldXY = OUT.pos.xy;
     float  dist = length(eyePos.xyz - OUT.pos.xyz);
 
-    // Sample the per-body flow field: direction, intensity (B), near/far routing (A).
+    // Sample the per-body flow field: direction (R,G), wave-amplitude mask (B), routing (A).
     float4 flow = tex2Dlod(sampFlow, float4((worldXY - flowMapTransform.xy) * flowMapTransform.zw, 0, 0));
     float2 flowDir = flow.rg * 2 - 1;
     float  flowMag = length(flowDir);
-    flowDir = (flowMag > 1e-3) ? flowDir / flowMag : float2(1, 0);
-    float  intensity = lerp(1.0, flow.b, flowMapWeight);
-    float  farStr    = saturate((flow.a - 0.5) * 2);   // sea group → longer swell
+    // Per-body wave-amplitude mask baked into B (decoded *3): pond 0, river ~0.5x,
+    // beach/default 1x, open sea 3x. Weight 0 (flow off) → uniform 1x (master ambient).
+    float  waveMul = lerp(1.0, flow.b * 3.0, flowMapWeight);
 
-    // Crest lines run ACROSS the flow; waves are short ALONG it. The sea class widens
-    // the wavelength (long swells); rivers/beaches stay tight.
-    float2 crestDir = float2(-flowDir.y, flowDir.x);
-    float  baseLen  = waveLen * lerp(1.0, 3.0, farStr);
+    // ISOTROPIC ambient waves — master's water3d height field (two scales, distance-blended,
+    // direction-free, tiny). The base chop present everywhere; OFF reproduces it exactly.
+    // Same displacement as the standard / DYNAMIC_RIPPLES WaterVS.
+    float  ta = 0.4 * time;
+    float  height  = tex3Dlod(sampWater3d, float4(worldXY / 1104, ta, 0)).a;
+    float  height2 = tex3Dlod(sampWater3d, float4(worldXY / 3900, ta, 0)).a;
+    float  ambient = waveHeight * (lerp(height, height2, saturate(dist / 8000)) - 0.5);
 
-    // Vertical Gerstner sum: a few waves fanned slightly about flowDir → short
-    // wavelength in the travel direction, long coherent crest lines perpendicular.
-    // h depends on stable world XY + time, so crests travel with the flow through the
-    // world and stay put on the lattice.
-    float h = 0.0;
+    // DIRECTIONAL crests — Gerstner waves fanned about the flow heading, crests running
+    // ACROSS the flow (beaches roll onshore). Added only where the flow map gives a heading.
+    float2 dir0     = (flowMag > 1e-3) ? flowDir / flowMag : float2(1, 0);
+    float2 crestDir = float2(-dir0.y, dir0.x);
+    float  h_dir = 0.0;
     [unroll] for (int i = 0; i < 4; ++i)
     {
         float  fan    = (i - 1.5) * crestSpread;            // small directional spread
-        float2 dir    = normalize(flowDir + crestDir * fan);
-        float  lambda = baseLen * (1.0 + 0.35 * i);
+        float2 dir    = normalize(dir0 + crestDir * fan);
+        float  lambda = waveLen * (1.0 + 0.35 * i);
         float  k      = 6.28318530718 / lambda;
         float  w      = waveSpeed * 30.0 * sqrt(k);         // deep-water-like dispersion
-        h += sin(dot(dir, worldXY) * k - w * time) / (1.0 + 0.6 * i);
+        h_dir += sin(dot(dir, worldXY) * k - w * time) / (1.0 + 0.6 * i);
     }
+    float  dirW = saturate(flowMag * 4.0) * flowMapWeight;  // 0 open sea/pond, 1 beach/river
 
-    // Amplitude: knob * body intensity, faded near the eye and toward the fog horizon
-    // exactly like the radial DYNAMIC_RIPPLES displacement.
-    float amp = waveAmp * intensity * lerp(1.0, 0.7, farStr);
-    float addheight = amp * h * saturate(1 - dist / 6400) * saturate(dist / 200);
+    // Combine: per-body-scaled (ambient everywhere + directional crests on flowing bodies),
+    // faded near the eye and toward the fog horizon like the DYNAMIC_RIPPLES displacement.
+    float addheight = waveMul * (ambient + dirW * waveAmp * h_dir)
+                    * saturate(1 - dist / 6400) * saturate(dist / 200);
     OUT.pos.z += addheight;
 
     // Silhouette uses the displaced height.
