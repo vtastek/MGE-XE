@@ -2522,10 +2522,14 @@ static std::atomic<bool> g_flowMapDirty{false};            // worker → main up
 // Tunables (Open knobs — adjust at review).
 // (Runtime-tunable knobs g_flow* + g_flowRebake are declared above
 //  updateMSOCCutoffInput so the input handler can see them.)
-static constexpr float kFlowPondInten    = 0.2f;    // smallest isolated-body intensity
-static constexpr float kFlowLakeInten    = 0.5f;    // largest isolated-body intensity
-static constexpr int   kFlowLakeCells    = 200;     // cellCount mapping pond→lake intensity
 static constexpr int   kFlowBlurPasses   = 1;       // light box-blur passes on intensity (0 = off)
+// B channel = per-body 3D-wave amplitude mask (encoded /3, decoded *3 in WaterVS): pond
+// dead calm, river ~0.5x, beach/default 1x, open sea 3x. The pixel shader reuses B as the
+// surface normal strength (saturate(flow.b*3)) → calm bodies smoother, sea/beach choppier.
+static constexpr float kFlowWaveNone     = 0.0f;        // pond/lake → 0 waves
+static constexpr float kFlowWaveRiver    = 1.0f / 6.0f; // river → ~0.5x ("less in rivers")
+static constexpr float kFlowWaveDefault  = 1.0f / 3.0f; // beach / default / uncovered → 1x
+static constexpr float kFlowWaveSea      = 1.0f;        // open sea → 3x
 static constexpr float kFlowSeaRefract   = 1.5f;    // sea far-wave (refraction) strength near coasts
 static constexpr int64_t kFlowMaxCells   = 4 * 1024 * 1024; // sanity bound on W*H
 static constexpr float kFlowGrid         = 512.0f;  // flow-map cell size (world units)
@@ -2757,19 +2761,17 @@ void DistantLand::buildWaterFlowMap(float waterZ) {
         uint8_t cat;
 
         if (dist[i] == INT_MAX) {
-            // Not connected to the sea → isolated pond/lake; calmer, scaled by size.
+            // Not connected to the sea → isolated pond/lake: dead calm, no 3D waves.
             cat = CAT_POND;
-            const int cnt = compCount[label[i]];
-            const float t = std::min(1.0f, (float)cnt / (float)kFlowLakeCells);
-            intensity = kFlowPondInten + (kFlowLakeInten - kFlowPondInten) * t;
+            intensity = kFlowWaveNone;
         } else if (wide[i]) {
-            // Open water: wide, full amplitude, isotropic (today's look).
+            // Open water: wide → tallest isotropic swell (3x).
             cat = CAT_SEA;
-            intensity = 1.0f;
+            intensity = kFlowWaveSea;
         } else if (distWide[i] != INT_MAX && distWide[i] <= beachReach) {
-            // Narrow fringe of open water → beach.
+            // Narrow fringe of open water → beach (1x; gets the flow-steered directional crests).
             cat = CAT_BEACH;
-            intensity = g_flowBeachMul;
+            intensity = kFlowWaveDefault;
         } else {
             // Narrow, sea-connected, away from open water → river. Downstream = -grad(distToSea).
             cat = CAT_RIVER;
@@ -2778,7 +2780,7 @@ void DistantLand::buildWaterFlowMap(float waterZ) {
             const float fx = -gx, fy = -gy;
             const float len = sqrtf(fx * fx + fy * fy);
             if (len > 1e-3f) { dirX = fx / len; dirY = fy / len; directionality = 1.0f; }
-            intensity = g_flowRiverInten;
+            intensity = kFlowWaveRiver;   // ~0.5x: less than open water
         }
 
         chDirX[i] = dirX; chDirY[i] = dirY; chInten[i] = intensity; chDir[i] = directionality;
@@ -2807,7 +2809,7 @@ void DistantLand::buildWaterFlowMap(float waterZ) {
                 if (wet[ni] && dB[ni] == INT_MAX && chCat[ni] == CAT_SEA) {
                     dB[ni] = nd; q.push_back(ni);
                     chCat[ni] = CAT_BEACH;
-                    chInten[ni] = g_flowBeachMul;
+                    chInten[ni] = kFlowWaveDefault;   // beach → 1x
                     chDirX[ni] = chDirY[ni] = chDir[ni] = 0.0f;
                 }
             }
@@ -2941,7 +2943,7 @@ void DistantLand::buildWaterFlowMap(float waterZ) {
             if (len > 1e-6f) { chDirX[i] = gx / len; chDirY[i] = gy / len; }
             if (isBeach) {
                 chDir[i]   = phi[i];                               // near-flow strength ramps 0 → full
-                chInten[i] = 1.0f + (g_flowBeachMul - 1.0f) * phi[i];  // amplitude blends sea → beach
+                chInten[i] = kFlowWaveDefault;                     // beach amplitude = 1x (flat mask)
             } else {
                 // Sea: far-wave (refraction) strength fades offshore. The blurred-field gradient
                 // magnitude ~1/R near a coast and ~0 in deep sea; len*R*boost normalises that to
@@ -3021,8 +3023,13 @@ void DistantLand::buildWaterFlowMap(float waterZ) {
             }
         }
     } else {
+        // Dry / out-of-coverage cells default to 1x ambient waves (B = kFlowWaveDefault),
+        // not 0: the LOD water mesh reaches far past this wet-cell bbox and clamp-samples
+        // the border, so a 0 here left the distant water flat. Direction/routing neutral
+        // (no heading → the shader keeps those cells isotropic). Wet cells keep their bake.
+        const uint32_t dryDefault = (enc8(0.5f) << 24) | (enc8(0.5f) << 16) | (enc8(0.5f) << 8) | enc8(kFlowWaveDefault);
         for (size_t i = 0; i < N; ++i) {
-            if (!wet[i]) continue;
+            if (!wet[i]) { g_flowMapBytes[i] = dryDefault; continue; }
             const uint32_t R = enc8(chDirX[i] * 0.5f + 0.5f);
             const uint32_t G = enc8(chDirY[i] * 0.5f + 0.5f);
             const uint32_t B = enc8(chInten[i]);

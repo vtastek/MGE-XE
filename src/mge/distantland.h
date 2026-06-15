@@ -172,8 +172,9 @@ public:
         float cellSize;     // world units per grid cell at this level
         int   vertBase;     // first vertex of this level's block in vbWaterLod
         int   vertCount;    // vertices owned by this level
-        int   ibStart;      // first index of this level's triangle list in ibWaterLod
-        int   triCount;     // triangles in this level
+        int   numVariants;  // flexible-trim hole variants (1 for solid level 0, else 4)
+        int   ibStart[4];   // first index of each trim variant's triangle list
+        int   triCount[4];  // triangles in each trim variant
     };
     static IDirect3DVertexBuffer9* vbWaterLod;
     static IDirect3DIndexBuffer9* ibWaterLod;

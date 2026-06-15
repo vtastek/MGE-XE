@@ -106,7 +106,7 @@ int DistantLand::numWaterLodVerts;
 std::vector<DistantLand::WaterLodLevel> DistantLand::waterLodLevels;
 bool DistantLand::waterLodMeshOn = true;
 float DistantLand::waterWaveAmp = 32.0f;
-float DistantLand::waterWaveLen = 1200.0f;
+float DistantLand::waterWaveLen = 3000.0f;
 float DistantLand::waterWaveSpeed = 1.0f;
 float DistantLand::waterCrestSpread = 0.5f;
 
@@ -919,6 +919,17 @@ bool DistantLand::initWater() {
 // square annulus rings whose central hole is the footprint of the next-finer level.
 // Vertices are stored in LOCAL integer grid units (centred on 0); renderWaterPlane
 // supplies cell size + world snap per level, so one static VB/IB serves every frame.
+//
+// Two crack fixes vs the naive nested rings:
+//  A. Flexible interior trim. Each finer level snaps in finer steps than the coarse
+//     hole, so the hole must shift by e=(ex,ey) in {0,1} coarse cells to nest exactly.
+//     We bake 4 hole variants per ring level; the draw picks one from the eye parity.
+//  B. Stitched transition row. A level's outer edge is retriangulated at the coarser
+//     neighbour's spacing (2*cellSize) so the shared boundary carries no un-shared
+//     midpoint vertex -> no T-junction. The outer ring is hole-independent, so the
+//     stitched annulus is emitted into every trim variant (one draw per level).
+// Heights come from WaterVS (continuous in world XY), so coincident boundary verts
+// evaluate the same height -> watertight. Geometry-only; the shader is untouched.
 bool DistantLand::initWaterLodMesh() {
     const int   L  = 6;        // LOD levels
     const float c0 = 128.0f;   // finest cell size (world units) — ~4 verts across a 512u flow cell
@@ -930,74 +941,155 @@ bool DistantLand::initWaterLodMesh() {
     waterLodLevels.clear();
     waterLodLevels.reserve(L);
 
-    // Count vertices (full grid per level; hole verts unused on rings but kept for
-    // trivial indexing) and triangles (filled cells only).
+    // Full grid per level; hole/ring verts kept for trivial indexing (16-bit safe).
     numWaterLodVerts = L * verts1D * verts1D;
-    int totalTris = 0;
-    for (int k = 0; k < L; ++k) {
-        int cells = (k == 0) ? (m * m) : (m * m - half * half);  // ring removes central m/2 x m/2
-        totalTris += 2 * cells;
-    }
 
     hr = device->CreateVertexBuffer(numWaterLodVerts * 12, 0, 0, D3DPOOL_MANAGED, &vbWaterLod, 0);
     if (hr != D3D_OK) {
         LOG::logline("!! Failed to create LOD water verts");
         return false;
     }
-    hr = device->CreateIndexBuffer(totalTris * 6, 0, D3DFMT_INDEX16, D3DPOOL_MANAGED, &ibWaterLod, 0);
-    if (hr != D3D_OK) {
-        LOG::logline("!! Failed to create LOD water indices");
-        return false;
-    }
 
+    // Vertices: local integer lattice in [-half, half] on both axes, plane at z=-1.
     D3DXVECTOR3* v;
     vbWaterLod->Lock(0, 0, (void**)&v, 0);
-    USHORT* idx;
-    ibWaterLod->Lock(0, 0, (void**)&idx, 0);
-
-    const int   holeLo = half / 2;          // central hole spans cells [holeLo, holeHi)
-    const int   holeHi = half + half / 2;   // = m/4 .. 3m/4
-    int vertBase = 0, ibStart = 0;
-
     for (int k = 0; k < L; ++k) {
-        // Vertices: local integer lattice in [-half, half] on both axes, plane at z=-1.
         for (int gy = 0; gy <= m; ++gy) {
             for (int gx = 0; gx <= m; ++gx) {
                 *v++ = D3DXVECTOR3(float(gx - half), float(gy - half), -1.0f);
             }
         }
+    }
+    vbWaterLod->Unlock();
 
-        // Indices: 2 triangles per filled cell. Cells are (cx,cy) in [0, m). Levels
-        // >0 skip the central hole so the finer level fits inside without overlap.
-        int tris = 0;
-        for (int cy = 0; cy < m; ++cy) {
-            for (int cx = 0; cx < m; ++cx) {
-                if (k > 0 && cx >= holeLo && cx < holeHi && cy >= holeLo && cy < holeHi) {
-                    continue;   // hole = next-finer level's footprint
-                }
-                USHORT v00 = USHORT(vertBase + cy * verts1D + cx);
-                USHORT v10 = USHORT(v00 + 1);
-                USHORT v01 = USHORT(v00 + verts1D);
-                USHORT v11 = USHORT(v01 + 1);
-                *idx++ = v00; *idx++ = v10; *idx++ = v11;
-                *idx++ = v00; *idx++ = v11; *idx++ = v01;
-                tris += 2;
-            }
+    // Indices grow with the stitch + 4 trim variants, so build into a list then size
+    // the IB exactly. ~0.8 MB managed; built once, static thereafter.
+    std::vector<USHORT> indices;
+    indices.reserve(400000);
+
+    int vertBase = 0;
+    auto vidx = [&](int gx, int gy) -> USHORT {
+        return USHORT(vertBase + gy * verts1D + gx);
+    };
+    // Emit one triangle, forcing CCW winding in local XY. Height is added by the VS,
+    // so signed area on the z=-1 plane is constant and decides orientation; this lets
+    // the corner/edge helpers ignore reflection-induced winding flips.
+    auto addTri = [&](int ax, int ay, int bx, int by, int cx, int cy) {
+        long cross = long(bx - ax) * (cy - ay) - long(by - ay) * (cx - ax);
+        USHORT ia = vidx(ax, ay), ib = vidx(bx, by), ic = vidx(cx, cy);
+        if (cross < 0) std::swap(ib, ic);
+        indices.push_back(ia); indices.push_back(ib); indices.push_back(ic);
+    };
+    // Regular fine cell: two triangles.
+    auto addCell = [&](int cx, int cy) {
+        addTri(cx, cy, cx + 1, cy, cx + 1, cy + 1);
+        addTri(cx, cy, cx + 1, cy + 1, cx, cy + 1);
+    };
+    // Transition edge block: two outer cells collapsed so the outer boundary spans
+    // one coarse edge A-C (odd outer vertex B dropped). (ax,ay)=outer-left vertex,
+    // (tx,ty)=+1 tangent step along the edge, (nx,ny)=+1 inward normal.
+    auto addEdgeBlock = [&](int ax, int ay, int tx, int ty, int nx, int ny) {
+        int Ax = ax,                Ay = ay;
+        int Cx = ax + 2 * tx,       Cy = ay + 2 * ty;
+        int Apx = ax + nx,          Apy = ay + ny;
+        int Bpx = ax + tx + nx,     Bpy = ay + ty + ny;
+        int Cpx = ax + 2 * tx + nx, Cpy = ay + 2 * ty + ny;
+        addTri(Ax, Ay, Cx, Cy, Bpx, Bpy);
+        addTri(Ax, Ay, Bpx, Bpy, Apx, Apy);
+        addTri(Cx, Cy, Cpx, Cpy, Bpx, Bpy);
+    };
+    // Transition corner: 2x2 block whose two grid-boundary edges are coarse.
+    // (cgx,cgy)=outer corner vertex, (dx,dy)=inward signs. Six triangles tile the
+    // block; the two odd boundary midpoints are never referenced on the outer edges.
+    auto addCorner = [&](int cgx, int cgy, int dx, int dy) {
+        int Ox = cgx,          Oy = cgy;            // outer corner
+        int Bx = cgx + 2 * dx, By = cgy;            // coarse edge 1 far end
+        int Tx = cgx,          Ty = cgy + 2 * dy;   // coarse edge 2 far end
+        int Mx = cgx + dx,     My = cgy + dy;       // centre
+        int Rx = cgx + 2 * dx, Ry = cgy + dy;
+        int Sx = cgx + 2 * dx, Sy = cgy + 2 * dy;   // inner corner
+        int Ux = cgx + dx,     Uy = cgy + 2 * dy;
+        addTri(Ox, Oy, Bx, By, Mx, My);
+        addTri(Ox, Oy, Mx, My, Tx, Ty);
+        addTri(Bx, By, Rx, Ry, Mx, My);
+        addTri(Rx, Ry, Sx, Sy, Mx, My);
+        addTri(Mx, My, Sx, Sy, Ux, Uy);
+        addTri(Mx, My, Ux, Uy, Tx, Ty);
+    };
+    // Stitched outer annulus: 4 corners + 4 transition edges between them. Hole-
+    // independent, so identical in every trim variant.
+    auto addOuterStitch = [&]() {
+        addCorner(0, 0, +1, +1);
+        addCorner(m, 0, -1, +1);
+        addCorner(0, m, +1, -1);
+        addCorner(m, m, -1, -1);
+        for (int c = 2; c <= m - 4; c += 2) {
+            addEdgeBlock(c, 0, 1, 0,  0,  1);   // bottom
+            addEdgeBlock(c, m, 1, 0,  0, -1);   // top
+            addEdgeBlock(0, c, 0, 1,  1,  0);   // left
+            addEdgeBlock(m, c, 0, 1, -1,  0);   // right
         }
+    };
+
+    for (int k = 0; k < L; ++k) {
+        const bool stitch = (k < L - 1);          // every level but the outermost
+        const int  numVar = (k == 0) ? 1 : 4;     // level 0 is solid (no hole)
 
         WaterLodLevel lvl;
-        lvl.cellSize  = c0 * float(1 << k);
-        lvl.vertBase  = vertBase;
-        lvl.vertCount = verts1D * verts1D;
-        lvl.ibStart   = ibStart;
-        lvl.triCount  = tris;
-        waterLodLevels.push_back(lvl);
+        lvl.cellSize    = c0 * float(1 << k);
+        lvl.vertBase    = vertBase;
+        lvl.vertCount   = verts1D * verts1D;
+        lvl.numVariants = numVar;
+        for (int i = 0; i < 4; ++i) { lvl.ibStart[i] = 0; lvl.triCount[i] = 0; }
 
+        for (int vrt = 0; vrt < numVar; ++vrt) {
+            const int ex = vrt & 1;
+            const int ey = (vrt >> 1) & 1;
+            // Flexible-trim hole = next-finer level's footprint, shifted by parity so
+            // it nests exactly. Always inside [2, m-2), away from the stitched ring.
+            const int holeLoX = (m / 4) + ex, holeHiX = (3 * m / 4) + ex;
+            const int holeLoY = (m / 4) + ey, holeHiY = (3 * m / 4) + ey;
+
+            const size_t startIdx = indices.size();
+            lvl.ibStart[vrt] = int(startIdx);
+
+            // Interior fine cells. Skip the outer ring on stitched levels (emitted by
+            // addOuterStitch) and the central hole on ring levels.
+            for (int cy = 0; cy < m; ++cy) {
+                for (int cx = 0; cx < m; ++cx) {
+                    if (stitch) {
+                        const bool corner = (cx <= 1 || cx >= m - 2) && (cy <= 1 || cy >= m - 2);
+                        const bool bedge  = (cy == 0 || cy == m - 1) && (cx >= 2 && cx <= m - 3);
+                        const bool vedge  = (cx == 0 || cx == m - 1) && (cy >= 2 && cy <= m - 3);
+                        if (corner || bedge || vedge) continue;   // stitched ring
+                    }
+                    if (k > 0 && cx >= holeLoX && cx < holeHiX && cy >= holeLoY && cy < holeHiY) {
+                        continue;   // hole = next-finer level's footprint
+                    }
+                    addCell(cx, cy);
+                }
+            }
+
+            if (stitch) {
+                addOuterStitch();
+            }
+
+            lvl.triCount[vrt] = int((indices.size() - startIdx) / 3);
+        }
+
+        waterLodLevels.push_back(lvl);
         vertBase += verts1D * verts1D;
-        ibStart  += tris * 3;
     }
 
-    vbWaterLod->Unlock();
+    const int totalTris = int(indices.size() / 3);
+    hr = device->CreateIndexBuffer(int(indices.size()) * 2, 0, D3DFMT_INDEX16, D3DPOOL_MANAGED, &ibWaterLod, 0);
+    if (hr != D3D_OK) {
+        LOG::logline("!! Failed to create LOD water indices");
+        return false;
+    }
+    USHORT* idx;
+    ibWaterLod->Lock(0, 0, (void**)&idx, 0);
+    std::copy(indices.begin(), indices.end(), idx);
     ibWaterLod->Unlock();
 
     LOG::logline("-- Water LOD mesh: %d levels, %d verts, %d tris (finest cell %.0fu, reach %.0fu)",

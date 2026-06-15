@@ -710,9 +710,18 @@ void DistantLand::renderWaterPlane() {
             effect->SetMatrix(ehWorld, &m);
             effect->CommitChanges();
 
-            DrawStats::count(lvl.triCount);
+            // Flexible-trim variant: shift the hole by eye parity so it nests exactly
+            // over the finer level's snapped footprint (kills the coverage-gap flicker).
+            int variant = 0;
+            if (lvl.numVariants > 1) {
+                const int ex = int(((long long)floorf(eyePos.x / lvl.cellSize)) & 1);
+                const int ey = int(((long long)floorf(eyePos.y / lvl.cellSize)) & 1);
+                variant = ey * 2 + ex;
+            }
+
+            DrawStats::count(lvl.triCount[variant]);
             device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, lvl.vertBase, lvl.vertCount,
-                                         lvl.ibStart, lvl.triCount);
+                                         lvl.ibStart[variant], lvl.triCount[variant]);
         }
     } else {
         D3DXMatrixTranslation(&m, eyePos.x, eyePos.y, waterZ);
