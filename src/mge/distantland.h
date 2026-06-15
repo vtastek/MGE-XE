@@ -162,9 +162,45 @@ public:
     static IDirect3DIndexBuffer9* ibWater;
     static IDirect3DVertexBuffer9* vbGrassInstances;
 
+    // World-snapped nested-grid (geo-clipmap) water mesh. Built once when
+    // UseWaterFlowMap is on (initWaterLodMesh); drawn per-level in
+    // renderWaterPlane with a per-level snapped world matrix so vertices land on
+    // a stable world lattice every frame (kills the radial mesh's swimming).
+    // Vertices are stored in local integer grid units (cell size supplied by the
+    // per-frame world matrix); each level records its index range and cell size.
+    struct WaterLodLevel {
+        float cellSize;     // world units per grid cell at this level
+        int   vertBase;     // first vertex of this level's block in vbWaterLod
+        int   vertCount;    // vertices owned by this level
+        int   ibStart;      // first index of this level's triangle list in ibWaterLod
+        int   triCount;     // triangles in this level
+    };
+    static IDirect3DVertexBuffer9* vbWaterLod;
+    static IDirect3DIndexBuffer9* ibWaterLod;
+    static int numWaterLodVerts;
+    static std::vector<WaterLodLevel> waterLodLevels;
+    static bool waterLodMeshOn;        // runtime A/B (VK_NUMPAD0): true = clipmap, false = radial
+    static float waterWaveAmp;         // live shader uniform: Gerstner crest amplitude (world units)
+    static float waterWaveLen;         // live shader uniform: base wavelength along the flow (world units)
+    static float waterWaveSpeed;       // live shader uniform: crest travel speed scale
+    static float waterCrestSpread;     // live shader uniform: directional fan (small = longer crest lines)
+
     static IDirect3DTexture9* texRain, *texRipples, *texRippleBuffer;
     static IDirect3DSurface9* surfRain, *surfRipples, *surfRippleBuffer;
     static IDirect3DVertexBuffer9* vbWaveSim;
+
+    // Water flow map (UseWaterFlowMap): low-res baked RGBA8 covering the exterior
+    // island. R,G = downstream flow dir (encoded), B = wave intensity, A =
+    // directionality. Built once on the cull worker (buildWaterFlowMap), lazily
+    // uploaded on the main thread (updateFlowMapTexture). VK_NUMPAD9 A/B.
+    static IDirect3DTexture9* texFlow;
+    static bool waterFlowDebugOn;
+    static bool waterFlowClassify;  // CLASSIFY view: paint water flat by category (river/pond/beach/sea)
+    static bool waterFlowDirView;   // DIRECTION view: paint water by flow angle (hue wheel)
+    static float waterFlowScroll;   // live shader uniform: river directional advection rate (NUMPAD8/6/3 tuning)
+    static float waterFlowSeaSpeed; // live shader uniform: base wave animation rate scale (1 = stock)
+    static float waterFlowCycleUV;  // live shader uniform: bounded per-cycle UV displacement (Valve flow map)
+    static float waterFlowSeaRefract; // live shader uniform: sea far-wave (refraction) strength multiplier
 
     static IDirect3DTexture9* texShadow, *texSoftShadow;
     static IDirect3DSurface9* surfShadowZ;
@@ -213,6 +249,8 @@ public:
     static D3DXHANDLE ehTime;
     static D3DXHANDLE ehRippleOrigin;
     static D3DXHANDLE ehWaveHeight;
+    static D3DXHANDLE ehFlow, ehFlowTransform, ehFlowWeight, ehFlowScroll, ehFlowSeaSpeed, ehFlowCycleUV, ehFlowSeaRefract, ehFlowDebugView;
+    static D3DXHANDLE ehWaveAmp, ehWaveLen, ehWaveSpeed, ehCrestSpread;
 
     static std::function<void(IDirect3DSurface9*)> captureScreenHandler;
     static bool captureScreenWithUI;
@@ -222,6 +260,7 @@ public:
     static bool initShader();
     static bool initDepth();
     static bool initWater();
+    static bool initWaterLodMesh();
     static bool initDynamicWaves();
     static bool initLandscapeClient();
     static bool initLandscape();
@@ -434,6 +473,15 @@ public:
     // surviving water tiles' main-view NDC screen rects, consumed by
     // renderReflectedStatics to cull reflection statics (Phase B).
     static bool isReflectionWaterVisible();
+
+    // Water flow map. buildWaterFlowMap bakes the per-body flow field on the cull
+    // worker (CPU only). updateFlowMapTexture (main thread) lazily (re)creates and
+    // uploads texFlow when the worker marks it dirty; returns true if texFlow is
+    // valid to bind. getFlowMapTransform fills {origin.x, origin.y, invSizeX, invSizeY}.
+    static void buildWaterFlowMap(float waterZ);
+    static bool updateFlowMapTexture();
+    static void getFlowMapTransform(float out[4]);
+
     // Surviving water tile screen rects (main-view NDC AABBs: x=minX, y=minY,
     // z=maxX, w=maxY). Where visible water samples texReflection on screen.
     static std::vector<D3DXVECTOR4> reflectionWaterRects;

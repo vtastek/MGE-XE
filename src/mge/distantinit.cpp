@@ -100,6 +100,16 @@ IDirect3DVertexBuffer9* DistantLand::vbWater;
 IDirect3DIndexBuffer9* DistantLand::ibWater;
 IDirect3DVertexBuffer9* DistantLand::vbGrassInstances;
 
+IDirect3DVertexBuffer9* DistantLand::vbWaterLod;
+IDirect3DIndexBuffer9* DistantLand::ibWaterLod;
+int DistantLand::numWaterLodVerts;
+std::vector<DistantLand::WaterLodLevel> DistantLand::waterLodLevels;
+bool DistantLand::waterLodMeshOn = true;
+float DistantLand::waterWaveAmp = 32.0f;
+float DistantLand::waterWaveLen = 1200.0f;
+float DistantLand::waterWaveSpeed = 1.0f;
+float DistantLand::waterCrestSpread = 0.5f;
+
 IDirect3DTexture9* DistantLand::texRain;
 IDirect3DTexture9* DistantLand::texRipples;
 IDirect3DTexture9* DistantLand::texRippleBuffer;
@@ -107,6 +117,15 @@ IDirect3DSurface9* DistantLand::surfRain;
 IDirect3DSurface9* DistantLand::surfRipples;
 IDirect3DSurface9* DistantLand::surfRippleBuffer;
 IDirect3DVertexBuffer9* DistantLand::vbWaveSim;
+
+IDirect3DTexture9* DistantLand::texFlow;
+bool DistantLand::waterFlowDebugOn = true;
+bool DistantLand::waterFlowClassify = false;
+bool DistantLand::waterFlowDirView = false;
+float DistantLand::waterFlowScroll = 0.4f;
+float DistantLand::waterFlowSeaSpeed = 1.0f;
+float DistantLand::waterFlowCycleUV = 1.0f;
+float DistantLand::waterFlowSeaRefract = 1.0f;
 
 IDirect3DTexture9* DistantLand::texShadow;
 IDirect3DTexture9* DistantLand::texSoftShadow;
@@ -181,6 +200,18 @@ D3DXHANDLE DistantLand::ehNiceWeather;
 D3DXHANDLE DistantLand::ehTime;
 D3DXHANDLE DistantLand::ehRippleOrigin;
 D3DXHANDLE DistantLand::ehWaveHeight;
+D3DXHANDLE DistantLand::ehFlow;
+D3DXHANDLE DistantLand::ehFlowTransform;
+D3DXHANDLE DistantLand::ehFlowWeight;
+D3DXHANDLE DistantLand::ehFlowScroll;
+D3DXHANDLE DistantLand::ehFlowSeaSpeed;
+D3DXHANDLE DistantLand::ehFlowCycleUV;
+D3DXHANDLE DistantLand::ehFlowSeaRefract;
+D3DXHANDLE DistantLand::ehFlowDebugView;
+D3DXHANDLE DistantLand::ehWaveAmp;
+D3DXHANDLE DistantLand::ehWaveLen;
+D3DXHANDLE DistantLand::ehWaveSpeed;
+D3DXHANDLE DistantLand::ehCrestSpread;
 
 std::function<void(IDirect3DSurface9*)> DistantLand::captureScreenHandler = nullptr;
 bool DistantLand::captureScreenWithUI;
@@ -590,6 +621,8 @@ static const D3DXMACRO macroExpFog = { "USE_EXPFOG", "" };
 static const D3DXMACRO macroScattering = { "USE_SCATTERING", "" };
 static const D3DXMACRO macroFilterReflection = { "FILTER_WATER_REFLECTION", "" };
 static const D3DXMACRO macroDynamicRipples = { "DYNAMIC_RIPPLES", "" };
+static const D3DXMACRO macroWaterFlowMap = { "WATER_FLOW_MAP", "" };
+static const D3DXMACRO macroWaterLodMesh = { "WATER_LOD_MESH", "" };
 static const D3DXMACRO macroTerminator = { 0, 0 };
 
 bool DistantLand::initShader() {
@@ -615,6 +648,12 @@ bool DistantLand::initShader() {
     }
     if (Configuration.MGEFlags & DYNAMIC_RIPPLES) {
         features.push_back(macroDynamicRipples);
+    }
+    if (Configuration.UseWaterFlowMap) {
+        features.push_back(macroWaterFlowMap);
+        // 3D waves are meaningless without the flow direction, so the world-snapped
+        // LOD mesh + flow-steered crest displacement rides the same gate.
+        features.push_back(macroWaterLodMesh);
     }
     features.push_back(macroTerminator);
 
@@ -711,6 +750,23 @@ bool DistantLand::initShader() {
         ehTex5 = effect->GetParameterByName(0, "tex5");
         ehRippleOrigin = effect->GetParameterByName(0, "rippleOrigin");
         ehWaveHeight = effect->GetParameterByName(0, "waveHeight");
+    }
+
+    // Water flow map parameters
+    if (Configuration.UseWaterFlowMap) {
+        ehFlow = effect->GetParameterByName(0, "texFlow");
+        ehFlowTransform = effect->GetParameterByName(0, "flowMapTransform");
+        ehFlowWeight = effect->GetParameterByName(0, "flowMapWeight");
+        ehFlowScroll = effect->GetParameterByName(0, "flowScrollSpeed");
+        ehFlowSeaSpeed = effect->GetParameterByName(0, "flowSeaSpeed");
+        ehFlowCycleUV = effect->GetParameterByName(0, "flowCycleUV");
+        ehFlowSeaRefract = effect->GetParameterByName(0, "flowSeaRefract");
+        ehFlowDebugView = effect->GetParameterByName(0, "flowDebugView");
+        // Flow-steered crest displacement uniforms (WATER_LOD_MESH).
+        ehWaveAmp = effect->GetParameterByName(0, "waveAmp");
+        ehWaveLen = effect->GetParameterByName(0, "waveLen");
+        ehWaveSpeed = effect->GetParameterByName(0, "waveSpeed");
+        ehCrestSpread = effect->GetParameterByName(0, "crestSpread");
     }
 
     return true;
@@ -838,6 +894,13 @@ bool DistantLand::initWater() {
 
     ibWater->Unlock();
 
+    // World-snapped LOD water mesh (gated by the flow map; A/B vs radial at runtime).
+    if (Configuration.UseWaterFlowMap) {
+        if (!initWaterLodMesh()) {
+            return false;
+        }
+    }
+
     if (Configuration.MGEFlags & DYNAMIC_RIPPLES) {
         // Setup water simulation
         if (!initDynamicWaves()) {
@@ -848,6 +911,97 @@ bool DistantLand::initWater() {
         MWBridge::get()->toggleRipples(false);
     }
 
+    return true;
+}
+
+// Build the world-snapped nested-grid (geo-clipmap) water mesh. L concentric LOD
+// levels: level 0 is a solid m x m patch of the finest cells; levels 1..L-1 are
+// square annulus rings whose central hole is the footprint of the next-finer level.
+// Vertices are stored in LOCAL integer grid units (centred on 0); renderWaterPlane
+// supplies cell size + world snap per level, so one static VB/IB serves every frame.
+bool DistantLand::initWaterLodMesh() {
+    const int   L  = 6;        // LOD levels
+    const float c0 = 128.0f;   // finest cell size (world units) — ~4 verts across a 512u flow cell
+    const int   m  = 64;       // grid cells per side per level (even)
+    const int   verts1D = m + 1;
+    const int   half = m / 2;
+
+    HRESULT hr;
+    waterLodLevels.clear();
+    waterLodLevels.reserve(L);
+
+    // Count vertices (full grid per level; hole verts unused on rings but kept for
+    // trivial indexing) and triangles (filled cells only).
+    numWaterLodVerts = L * verts1D * verts1D;
+    int totalTris = 0;
+    for (int k = 0; k < L; ++k) {
+        int cells = (k == 0) ? (m * m) : (m * m - half * half);  // ring removes central m/2 x m/2
+        totalTris += 2 * cells;
+    }
+
+    hr = device->CreateVertexBuffer(numWaterLodVerts * 12, 0, 0, D3DPOOL_MANAGED, &vbWaterLod, 0);
+    if (hr != D3D_OK) {
+        LOG::logline("!! Failed to create LOD water verts");
+        return false;
+    }
+    hr = device->CreateIndexBuffer(totalTris * 6, 0, D3DFMT_INDEX16, D3DPOOL_MANAGED, &ibWaterLod, 0);
+    if (hr != D3D_OK) {
+        LOG::logline("!! Failed to create LOD water indices");
+        return false;
+    }
+
+    D3DXVECTOR3* v;
+    vbWaterLod->Lock(0, 0, (void**)&v, 0);
+    USHORT* idx;
+    ibWaterLod->Lock(0, 0, (void**)&idx, 0);
+
+    const int   holeLo = half / 2;          // central hole spans cells [holeLo, holeHi)
+    const int   holeHi = half + half / 2;   // = m/4 .. 3m/4
+    int vertBase = 0, ibStart = 0;
+
+    for (int k = 0; k < L; ++k) {
+        // Vertices: local integer lattice in [-half, half] on both axes, plane at z=-1.
+        for (int gy = 0; gy <= m; ++gy) {
+            for (int gx = 0; gx <= m; ++gx) {
+                *v++ = D3DXVECTOR3(float(gx - half), float(gy - half), -1.0f);
+            }
+        }
+
+        // Indices: 2 triangles per filled cell. Cells are (cx,cy) in [0, m). Levels
+        // >0 skip the central hole so the finer level fits inside without overlap.
+        int tris = 0;
+        for (int cy = 0; cy < m; ++cy) {
+            for (int cx = 0; cx < m; ++cx) {
+                if (k > 0 && cx >= holeLo && cx < holeHi && cy >= holeLo && cy < holeHi) {
+                    continue;   // hole = next-finer level's footprint
+                }
+                USHORT v00 = USHORT(vertBase + cy * verts1D + cx);
+                USHORT v10 = USHORT(v00 + 1);
+                USHORT v01 = USHORT(v00 + verts1D);
+                USHORT v11 = USHORT(v01 + 1);
+                *idx++ = v00; *idx++ = v10; *idx++ = v11;
+                *idx++ = v00; *idx++ = v11; *idx++ = v01;
+                tris += 2;
+            }
+        }
+
+        WaterLodLevel lvl;
+        lvl.cellSize  = c0 * float(1 << k);
+        lvl.vertBase  = vertBase;
+        lvl.vertCount = verts1D * verts1D;
+        lvl.ibStart   = ibStart;
+        lvl.triCount  = tris;
+        waterLodLevels.push_back(lvl);
+
+        vertBase += verts1D * verts1D;
+        ibStart  += tris * 3;
+    }
+
+    vbWaterLod->Unlock();
+    ibWaterLod->Unlock();
+
+    LOG::logline("-- Water LOD mesh: %d levels, %d verts, %d tris (finest cell %.0fu, reach %.0fu)",
+                 L, numWaterLodVerts, totalTris, c0, m * c0 * float(1 << (L - 1)));
     return true;
 }
 
@@ -1541,6 +1695,11 @@ void DistantLand::release() {
     surfShadowZ->Release();
     surfShadowZ = nullptr;
 
+    if (texFlow) {
+        texFlow->Release();
+        texFlow = nullptr;
+    }
+
     texWater->Release();
     texWater = nullptr;
     texReflection->Release();
@@ -1551,6 +1710,14 @@ void DistantLand::release() {
     vbWater = nullptr;
     ibWater->Release();
     ibWater = nullptr;
+    if (vbWaterLod) {
+        vbWaterLod->Release();
+        vbWaterLod = nullptr;
+    }
+    if (ibWaterLod) {
+        ibWaterLod->Release();
+        ibWaterLod = nullptr;
+    }
     vbGrassInstances->Release();
     vbGrassInstances = nullptr;
     vbFullFrame->Release();

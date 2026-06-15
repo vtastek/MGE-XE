@@ -13,6 +13,7 @@
 #include "mge_tracy.h"
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cmath>
 #include <condition_variable>
@@ -1068,6 +1069,24 @@ void DistantLand::debugDumpMSOCMask() {
 // Numpad8/2: raise/lower the MSOC low-static cutoff height (256-unit steps).
 // Read on the main thread so g_msocCutoffHeight is final before the verdict
 // core (worker or inline) reads it.
+// Flow-map re-bake signal (main → cull worker) and the runtime-tunable knobs.
+// Declared here so updateMSOCCutoffInput (NUMPAD7/6/3) can write them; consumed by
+// buildWaterFlowMap on the worker. Plain writes ordered before the g_flowRebake
+// release store, which the worker reads with acquire — benign for debug tuning.
+static std::atomic<bool> g_flowRebake{false};
+static std::atomic<int> g_flowDebugBake{0};  // 0 flow, 1 CLASSIFY colours, 2 DIRECTION (flow-angle hue)
+// Classification is GEOMETRIC (by water-body thinness), not depth-based: a river is narrow
+// water (land close on every side); the sea is wide; the beach is the narrow fringe of the
+// sea. RiverWidth = how many cells from shore still counts as "narrow"; BeachReach = how many
+// cells out from open (wide) water stays beach before becoming sea.
+static float g_flowRiverWidth   = 2.0f;    // max cells-to-nearest-land for water to be a river
+static float g_flowBeachReach   = 10.0f;   // cells from open water that remain beach (else sea)
+static float g_flowBeachExtend  = 30.0f;   // cells to grow beach OUTWARD into open sea (SEA→BEACH only)
+static float g_flowBeachMul     = 0.5f;    // beach wave intensity
+static float g_flowRiverInten   = 0.7f;    // river/inlet base wave intensity
+static float g_flowDirRadius    = 40.0f;   // box-blur radius (cells) for the macro coastline normal
+static float g_flowDirIters     = 3.0f;    // box-blur iterations (≈Gaussian) for beach direction
+
 void DistantLand::updateMSOCCutoffInput() {
     // In-world overlays are compacted onto one cycling key (numpad +). One press
     // advances which single overlay is active; we derive the per-overlay
@@ -1099,46 +1118,111 @@ void DistantLand::updateMSOCCutoffInput() {
         StatusOverlay::setStatus(g_reflFineMaskEnabled
             ? "Reflection fine mask: ON" : "Reflection fine mask: OFF (rect-only)");
     }
-    if (GetAsyncKeyState(VK_NUMPAD8) & 0x0001) {
-        g_msocCutoffHeight += 256.0f;
-        char msg[64];
-        std::snprintf(msg, sizeof(msg), "MSOC cutoff: %.0f units", g_msocCutoffHeight);
-        StatusOverlay::setStatus(msg);
+    // Numpad0: A/B toggle the world-snapped LOD water mesh (clipmap) vs the legacy
+    // camera-locked radial fan. Clipmap = vertices on a stable world lattice (no
+    // swimming) + flow-steered 3D crests; radial = the pre-LOD look for comparison.
+    if ((GetAsyncKeyState(VK_NUMPAD0) & 0x0001) && Configuration.UseWaterFlowMap) {
+        waterLodMeshOn = !waterLodMeshOn;
+        StatusOverlay::setStatus(waterLodMeshOn
+            ? "Water mesh: LOD clipmap (world-snapped, 3D crests)"
+            : "Water mesh: radial fan (legacy)");
     }
-    if (GetAsyncKeyState(VK_NUMPAD2) & 0x0001) {
-        g_msocCutoffHeight = std::max(0.0f, g_msocCutoffHeight - 256.0f);
-        char msg[64];
-        std::snprintf(msg, sizeof(msg), "MSOC cutoff: %.0f units", g_msocCutoffHeight);
-        StatusOverlay::setStatus(msg);
+    // Numpad9: cycle the water flow map mode. OFF → neutral (today's uniform water look);
+    // FLOW → per-body directional waves + storm-calm ponds; CLASSIFY → flat category colours
+    // (green=river, red=pond, yellow=beach, blue=sea); DIRECTION → flow-angle hue wheel (rivers
+    // downstream, beaches onshore). Each mode re-bakes the map into the matching encoding.
+    if ((GetAsyncKeyState(VK_NUMPAD9) & 0x0001) && Configuration.UseWaterFlowMap) {
+        static int mode = 1;   // 0 OFF, 1 FLOW (default), 2 CLASSIFY, 3 DIRECTION
+        mode = (mode + 1) % 4;
+        waterFlowDebugOn  = (mode == 1);
+        waterFlowClassify = (mode == 2);
+        waterFlowDirView  = (mode == 3);
+        g_flowDebugBake.store(mode == 2 ? 1 : (mode == 3 ? 2 : 0), std::memory_order_release);
+        g_flowRebake.store(true, std::memory_order_release);   // re-bake into the new encoding
+        static const char* const nm[4] = {
+            "Water flow: OFF (neutral)", "Water flow: FLOW",
+            "Water flow: CLASSIFY (grn river / red pond / yel beach / blu sea)",
+            "Water flow: DIRECTION (hue = flow angle; rivers downstream, beaches onshore)" };
+        StatusOverlay::setStatus(nm[mode]);
     }
-    // (Basin watershed overlay is now overlay-cycle state 3; g_drawBasinDebug is
-    // derived above.)
-    // Numpad0: lock/unlock the eye fed into the basin (flood source + verdict
-    // height). Locked → fly a free camera into a basin without it recomputing.
-    if (GetAsyncKeyState(VK_NUMPAD0) & 0x0001) {
-        g_basinLockEye = !g_basinLockEye;
-        if (g_basinLockEye) g_basinLockedEye = eyePos;
-        char msg[80];
-        std::snprintf(msg, sizeof(msg), "Basin eye: %s",
-                      g_basinLockEye ? "LOCKED (free-cam to inspect)" : "live");
-        StatusOverlay::setStatus(msg);
+    // Flow-map knob tuning. NUMPAD8 cycles which knob is selected; NUMPAD6/NUMPAD3
+    // increase/decrease it. "Scroll" is a live shader uniform (instant). The other
+    // four are baked into the flow map, so adjusting them sets g_flowRebake and the
+    // cull worker re-bakes on the next water view.
+    if (Configuration.UseWaterFlowMap) {
+        static int knob = 0;  // 0 RiverSpeed 1 SeaSpeed 2 RiverWidth 3 RiverInten 4 BeachMul 5 BeachReach 6 BeachExtend 7 DirRadius 8 DirIters 9 CycleUV 10 SeaRefract 11 WaveAmp 12 WaveLen 13 WaveSpeed 14 CrestSpread
+        static const char* const knobName[15] = {
+            "RiverSpeed", "SeaSpeed", "RiverWidth", "RiverInten", "BeachMul", "BeachReach", "BeachExtend",
+            "DirRadius", "DirIters", "CycleUV", "SeaRefract", "WaveAmp", "WaveLen", "WaveSpeed", "CrestSpread" };
+        const bool inc    = (GetAsyncKeyState(VK_NUMPAD6) & 0x0001) != 0;
+        const bool dec    = (GetAsyncKeyState(VK_NUMPAD3) & 0x0001) != 0;
+        const bool cycle  = (GetAsyncKeyState(VK_NUMPAD8) & 0x0001) != 0;
+        if (cycle) {
+            knob = (knob + 1) % 15;
+        }
+        if (inc || dec) {
+            const float s = inc ? 1.0f : -1.0f;
+            const float m = inc ? 1.5f : 1.0f / 1.5f;   // multiplicative step
+            bool rebake = true;
+            switch (knob) {
+            case 0:  // RiverSpeed: directional advection rate, live (no rebake)
+                waterFlowScroll = std::max(0.001f, std::min(1.0f, waterFlowScroll * m));
+                rebake = false;
+                break;
+            case 1:  // SeaSpeed: base wave animation rate, live (no rebake)
+                waterFlowSeaSpeed = std::max(0.05f, std::min(8.0f, waterFlowSeaSpeed * m));
+                rebake = false;
+                break;
+            case 2:  g_flowRiverWidth   = std::max(0.5f, std::min(16.0f, g_flowRiverWidth + s * 0.5f)); break;
+            case 3:  g_flowRiverInten   = std::max(0.0f, std::min(3.0f, g_flowRiverInten + s * 0.10f)); break;
+            case 4:  g_flowBeachMul     = std::max(0.0f, std::min(1.0f, g_flowBeachMul   + s * 0.10f)); break;
+            case 5:  g_flowBeachReach   = std::max(0.0f, std::min(16.0f, g_flowBeachReach + s * 0.5f)); break;
+            case 6:  g_flowBeachExtend  = std::max(0.0f, std::min(32.0f, g_flowBeachExtend + s * 0.5f)); break;
+            case 7:  g_flowDirRadius    = std::max(1.0f, std::min(64.0f, g_flowDirRadius + s * 2.0f)); break;
+            case 8:  g_flowDirIters     = std::max(1.0f, std::min(8.0f, g_flowDirIters + s * 1.0f)); break;
+            case 9:  // CycleUV: bounded per-cycle UV displacement (bigger = longer cycle, less pulsing), live
+                waterFlowCycleUV = std::max(0.02f, std::min(4.0f, waterFlowCycleUV * m));
+                rebake = false;
+                break;
+            case 10: // SeaRefract: sea far-wave (refraction) strength multiplier, live (no rebake)
+                waterFlowSeaRefract = std::max(0.0f, std::min(4.0f, waterFlowSeaRefract + s * 0.25f));
+                rebake = false;
+                break;
+            case 11: // WaveAmp: 3D crest amplitude (world units), live (no rebake)
+                waterWaveAmp = std::max(0.0f, std::min(64.0f, waterWaveAmp + s * 2.0f));
+                rebake = false;
+                break;
+            case 12: // WaveLen: base wavelength along the flow (world units), live (no rebake)
+                waterWaveLen = std::max(64.0f, std::min(4096.0f, waterWaveLen * m));
+                rebake = false;
+                break;
+            case 13: // WaveSpeed: crest travel speed scale, live (no rebake)
+                waterWaveSpeed = std::max(0.05f, std::min(8.0f, waterWaveSpeed * m));
+                rebake = false;
+                break;
+            case 14: // CrestSpread: directional fan (small = longer crest lines), live (no rebake)
+                waterCrestSpread = std::max(0.0f, std::min(1.0f, waterCrestSpread + s * 0.05f));
+                rebake = false;
+                break;
+            }
+            if (rebake) g_flowRebake.store(true, std::memory_order_release);
+        }
+        // Report the current selection/value whenever a tuning key is pressed.
+        if (cycle || inc || dec) {
+            const float val[15] = { waterFlowScroll, waterFlowSeaSpeed, g_flowRiverWidth,
+                                   g_flowRiverInten, g_flowBeachMul, g_flowBeachReach, g_flowBeachExtend,
+                                   g_flowDirRadius, g_flowDirIters, waterFlowCycleUV, waterFlowSeaRefract,
+                                   waterWaveAmp, waterWaveLen, waterWaveSpeed, waterCrestSpread };
+            char msg[96];
+            std::snprintf(msg, sizeof(msg), "Flow [8] %s = %.3f  (6 +/ 3 -)",
+                          knobName[knob], val[knob]);
+            StatusOverlay::setStatus(msg);
+        }
     }
-    // Numpad / and *: halve / double the basin barrier grid (finer / coarser).
-    // Finer = more (conservative) culling at higher flood cost. The worker
-    // rebuilds the barrier map + re-floods on the next pass (grid-change cache
-    // miss). Clamped to [kBasinGridMin, kBasinGridMax].
-    if (GetAsyncKeyState(VK_DIVIDE) & 0x0001) {
-        g_basinGrid = std::max(kBasinGridMin, g_basinGrid * 0.5f);
-        char msg[64];
-        std::snprintf(msg, sizeof(msg), "Basin grid: %.0f (finer)", g_basinGrid);
-        StatusOverlay::setStatus(msg);
-    }
-    if (GetAsyncKeyState(VK_MULTIPLY) & 0x0001) {
-        g_basinGrid = std::min(kBasinGridMax, g_basinGrid * 2.0f);
-        char msg[64];
-        std::snprintf(msg, sizeof(msg), "Basin grid: %.0f (coarser)", g_basinGrid);
-        StatusOverlay::setStatus(msg);
-    }
+    // (Retired debug hot keys: MSOC cutoff height (NUMPAD8/2), basin eye lock
+    // (NUMPAD0), basin barrier grid (NUMPAD / and *). Those values are settled;
+    // g_msocCutoffHeight / g_basinLockEye / g_basinGrid keep their defaults.
+    // NUMPAD8 is now the flow-map knob cycle above.)
 }
 
 // Dispatch the verdict pass to the cull worker. Called from frameSetupEarly
@@ -2412,6 +2496,598 @@ static void buildTerrainMinHeight(
                  g_cellMinH.size(), g_fineMinH.size(), g_tileTris.size());
 }
 
+// ---- Water flow map (per-water-body directional waves & storm-calm ponds) ----
+//
+// Baked once on the cull worker. RASTERIZES the captured terrain triangles (g_tileTris)
+// into a dense min-height grid — vertex-binning g_fineMinH leaves decimation holes that
+// checkerboard the classification (sparse "squares" in rivers, dotted/black open sea).
+// Cells with NO triangle coverage are deep OPEN SEA (water outside the terrain mesh) and
+// are treated as full-intensity sea. Then: flood-fill wet cells into bodies, run a
+// distance-to-sea BFS seeded from the open-sea cells, derive a per-cell flow field, and
+// encode RGBA8 (R,G = downstream dir, B = wave intensity, A = directionality). The water
+// shader advects the normal map downstream (rivers) and scales amplitude per body (calm
+// ponds/shallows). The texture upload happens on the main thread.
+//
+// Channel semantics (see XE Mod Water.fx getFinalWaterNormal):
+//   open sea / near-shore : dir 0, intensity 1, directionality 0  → unchanged look
+//   river/inlet (dist>fr) : dir = -grad(dist) (downstream), intensity ~0.7, dir'ity 1
+//   isolated lake/pond    : dir 0, intensity by cellCount (~0.2 pond .. 0.5 lake)
+//   beach/shore (any)     : intensity *= kFlowBeachMul where adjacent to dry land / shallow
+static std::vector<uint32_t> g_flowMapBytes;          // A8R8G8B8, W*H
+static int   g_flowMapW = 0, g_flowMapH = 0;
+static float g_flowOriginX = 0.0f, g_flowOriginY = 0.0f;   // world XY of grid corner (0,0)
+static float g_flowInvSizeX = 0.0f, g_flowInvSizeY = 0.0f; // 1/(W*grid), 1/(H*grid)
+static std::atomic<bool> g_flowMapDirty{false};            // worker → main upload signal
+
+// Tunables (Open knobs — adjust at review).
+// (Runtime-tunable knobs g_flow* + g_flowRebake are declared above
+//  updateMSOCCutoffInput so the input handler can see them.)
+static constexpr float kFlowPondInten    = 0.2f;    // smallest isolated-body intensity
+static constexpr float kFlowLakeInten    = 0.5f;    // largest isolated-body intensity
+static constexpr int   kFlowLakeCells    = 200;     // cellCount mapping pond→lake intensity
+static constexpr int   kFlowBlurPasses   = 1;       // light box-blur passes on intensity (0 = off)
+static constexpr float kFlowSeaRefract   = 1.5f;    // sea far-wave (refraction) strength near coasts
+static constexpr int64_t kFlowMaxCells   = 4 * 1024 * 1024; // sanity bound on W*H
+static constexpr float kFlowGrid         = 512.0f;  // flow-map cell size (world units)
+
+void DistantLand::buildWaterFlowMap(float waterZ) {
+    g_flowMapW = g_flowMapH = 0;
+    if (g_tileTris.empty()) {
+        return;
+    }
+
+    // 1. World bbox over the captured terrain tiles → integer flow-grid bbox.
+    float wminx = 1e30f, wminy = 1e30f, wmaxx = -1e30f, wmaxy = -1e30f;
+    for (const TileTriEntry& t : g_tileTris) {
+        wminx = std::min(wminx, t.minx); wmaxx = std::max(wmaxx, t.maxx);
+        wminy = std::min(wminy, t.miny); wmaxy = std::max(wmaxy, t.maxy);
+    }
+    const int minFx = (int)floorf(wminx / kFlowGrid);
+    const int minFy = (int)floorf(wminy / kFlowGrid);
+    const int maxFx = (int)floorf(wmaxx / kFlowGrid);
+    const int maxFy = (int)floorf(wmaxy / kFlowGrid);
+    const int W = maxFx - minFx + 1;
+    const int H = maxFy - minFy + 1;
+    if (W <= 0 || H <= 0 || (int64_t)W * H > kFlowMaxCells) {
+        LOG::logline("!! [water-flow] grid out of range (%dx%d) — flow map skipped", W, H);
+        return;
+    }
+    const size_t N = (size_t)W * H;
+
+    // 2. RASTERIZE terrain triangles into a dense min-height grid (continuous coverage,
+    //    no decimation holes). 1e30 = no triangle covers the cell = OPEN SEA.
+    std::vector<float> minH(N, 1e30f);
+    const float gx0w = minFx * kFlowGrid;
+    const float gy0w = minFy * kFlowGrid;
+    for (const TileTriEntry& t : g_tileTris) {
+        const auto& pos = t.mesh->positions;
+        const auto& idx = t.mesh->indices;
+        const std::uint32_t nv = (std::uint32_t)pos.size();
+        for (size_t i = 0; i + 3 <= idx.size(); i += 3) {
+            const std::uint32_t i0 = idx[i], i1 = idx[i + 1], i2 = idx[i + 2];
+            if (i0 >= nv || i1 >= nv || i2 >= nv) continue;
+            const D3DXVECTOR3& a = pos[i0];
+            const D3DXVECTOR3& b = pos[i1];
+            const D3DXVECTOR3& c = pos[i2];
+            float bminx = std::min(a.x, std::min(b.x, c.x));
+            float bmaxx = std::max(a.x, std::max(b.x, c.x));
+            float bminy = std::min(a.y, std::min(b.y, c.y));
+            float bmaxy = std::max(a.y, std::max(b.y, c.y));
+            int cx0 = (int)floorf(bminx / kFlowGrid) - minFx;
+            int cx1 = (int)floorf(bmaxx / kFlowGrid) - minFx;
+            int cy0 = (int)floorf(bminy / kFlowGrid) - minFy;
+            int cy1 = (int)floorf(bmaxy / kFlowGrid) - minFy;
+            if (cx1 < 0 || cy1 < 0 || cx0 >= W || cy0 >= H) continue;
+            if (cx0 < 0) cx0 = 0; if (cy0 < 0) cy0 = 0;
+            if (cx1 >= W) cx1 = W - 1; if (cy1 >= H) cy1 = H - 1;
+            const float dx1 = b.x - a.x, dy1 = b.y - a.y;
+            const float dx2 = c.x - a.x, dy2 = c.y - a.y;
+            const float den = dx1 * dy2 - dx2 * dy1;
+            if (fabsf(den) < 1e-6f) continue;
+            const float invDen = 1.0f / den;
+            for (int gy = cy0; gy <= cy1; ++gy) {
+                const float wy = gy0w + (gy + 0.5f) * kFlowGrid;
+                float* row = &minH[(size_t)gy * W];
+                for (int gx = cx0; gx <= cx1; ++gx) {
+                    const float wx = gx0w + (gx + 0.5f) * kFlowGrid;
+                    const float px = wx - a.x, py = wy - a.y;
+                    const float w1 = (px * dy2 - dx2 * py) * invDen;
+                    const float w2 = (dx1 * py - px * dy1) * invDen;
+                    const float w0 = 1.0f - w1 - w2;
+                    if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f) continue;
+                    const float z = w0 * a.z + w1 * b.z + w2 * c.z;
+                    if (z < row[gx]) row[gx] = z;
+                }
+            }
+        }
+    }
+
+    // 3. Classify. openSea = no terrain data (deep ocean) → wet + BFS seed. data &
+    //    below water → wet (coast/river/lake bed). data & above water → dry land.
+    std::vector<uint8_t> wet(N, 0), openSea(N, 0);
+    for (size_t i = 0; i < N; ++i) {
+        if (minH[i] >= 1e29f)      { wet[i] = 1; openSea[i] = 1; }   // no data → open ocean
+        else if (minH[i] < waterZ) { wet[i] = 1; }                   // submerged terrain
+    }
+
+    static const int nb[4][2] = { {1,0},{-1,0},{0,1},{0,-1} };
+
+    // 4a. Connected components (4-conn flood) over wet cells (isolated-lake sizing).
+    std::vector<int> label(N, -1);
+    std::vector<int> compCount;
+    std::vector<int> stk;
+    int numComp = 0;
+    for (size_t s = 0; s < N; ++s) {
+        if (!wet[s] || label[s] != -1) continue;
+        const int comp = numComp++;
+        int count = 0;
+        stk.clear();
+        stk.push_back((int)s);
+        label[s] = comp;
+        while (!stk.empty()) {
+            const int c = stk.back(); stk.pop_back();
+            ++count;
+            const int cx = c % W, cy = c / W;
+            for (auto& d : nb) {
+                const int nx = cx + d[0], ny = cy + d[1];
+                if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+                const int ni = ny * W + nx;
+                if (wet[ni] && label[ni] == -1) { label[ni] = comp; stk.push_back(ni); }
+            }
+        }
+        compCount.push_back(count);
+    }
+
+    // 4b. Distance-to-sea BFS seeded from OPEN-SEA cells. Rivers/inlets share the sea's
+    //     component, so seeding the whole component would zero their distance (no gradient
+    //     → no flow); seeding from open ocean gives a real distance ramp inland. Lakes
+    //     never reach an open-sea cell → stay INF (isolated). Fallback: if there's no
+    //     open sea at all, seed the largest component (keeps behavior reasonable).
+    std::vector<int> dist(N, INT_MAX);
+    std::vector<int> q;
+    q.reserve(N);
+    int seaSeed = 0;
+    for (size_t i = 0; i < N; ++i) {
+        if (openSea[i]) { dist[i] = 0; q.push_back((int)i); ++seaSeed; }
+    }
+    if (seaSeed == 0) {
+        int seaComp = -1, seaMax = -1;
+        for (int i = 0; i < numComp; ++i) {
+            if (compCount[i] > seaMax) { seaMax = compCount[i]; seaComp = i; }
+        }
+        for (size_t i = 0; i < N; ++i) {
+            if (label[i] == seaComp) { dist[i] = 0; q.push_back((int)i); ++seaSeed; }
+        }
+    }
+    for (size_t head = 0; head < q.size(); ++head) {
+        const int c = q[head];
+        const int cx = c % W, cy = c / W;
+        const int nd = dist[c] + 1;
+        for (auto& d : nb) {
+            const int nx = cx + d[0], ny = cy + d[1];
+            if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+            const int ni = ny * W + nx;
+            if (wet[ni] && dist[ni] == INT_MAX) { dist[ni] = nd; q.push_back(ni); }
+        }
+    }
+
+    // 4c. Distance-to-SHORE BFS: cells from the nearest LAND (dry) cell. This is the
+    //     thinness/width measure that drives river detection — narrow water (rivers) stays
+    //     small in every direction; open sea grows large. Depth is deliberately ignored.
+    //     Grid-edge neighbours are open ocean (the bbox has a fringe), never shore.
+    std::vector<int> distShore(N, INT_MAX);
+    q.clear();
+    for (size_t i = 0; i < N; ++i) {
+        if (!wet[i]) continue;
+        const int cx = (int)(i % W), cy = (int)(i / W);
+        bool touchesLand = false;
+        for (auto& d : nb) {
+            const int nx = cx + d[0], ny = cy + d[1];
+            if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;   // grid edge = ocean, not land
+            if (!wet[ny * W + nx]) { touchesLand = true; break; }
+        }
+        if (touchesLand) { distShore[i] = 1; q.push_back((int)i); }
+    }
+    for (size_t head = 0; head < q.size(); ++head) {
+        const int c = q[head];
+        const int cx = c % W, cy = c / W;
+        const int nd = distShore[c] + 1;
+        for (auto& d : nb) {
+            const int nx = cx + d[0], ny = cy + d[1];
+            if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+            const int ni = ny * W + nx;
+            if (wet[ni] && distShore[ni] == INT_MAX) { distShore[ni] = nd; q.push_back(ni); }
+        }
+    }
+
+    // 4d. Wide water = nearest shore farther than the river half-width (open water). Beach =
+    //     narrow water within beachReach cells of wide water (the sea's thin fringe). River =
+    //     narrow water NOT near any wide water (thin in every direction). distWide is a bounded
+    //     dilation of the wide set into the narrow shore band.
+    const float riverWidth = g_flowRiverWidth;
+    const int   beachReach = (int)(g_flowBeachReach + 0.5f);
+    std::vector<uint8_t> wide(N, 0);
+    std::vector<int> distWide(N, INT_MAX);
+    q.clear();
+    for (size_t i = 0; i < N; ++i) {
+        if (wet[i] && distShore[i] != INT_MAX && (float)distShore[i] > riverWidth) {
+            wide[i] = 1; distWide[i] = 0; q.push_back((int)i);
+        }
+    }
+    for (size_t head = 0; head < q.size(); ++head) {
+        const int c = q[head];
+        if (distWide[c] >= beachReach) continue;   // stop expanding past the beach band
+        const int cx = c % W, cy = c / W;
+        const int nd = distWide[c] + 1;
+        for (auto& d : nb) {
+            const int nx = cx + d[0], ny = cy + d[1];
+            if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+            const int ni = ny * W + nx;
+            if (wet[ni] && distWide[ni] == INT_MAX) { distWide[ni] = nd; q.push_back(ni); }
+        }
+    }
+
+    // 5. Per-cell flow field → float channels (so an optional blur is well-defined).
+    // chCat is the debug classification (CLASSIFY view): 0 none/dry, 1 sea, 2 river,
+    // 3 pond/lake, 4 beach.
+    // chDir holds the provisional NEAR-flow strength (river/beach); chFar the SEA far/refraction
+    // strength. A final pass packs both into chDir as the alpha routing channel (0.5 = neutral,
+    // <0.5 = near group, >0.5 = far group). chInten stays the wave amplitude (pond-calm).
+    std::vector<float> chDirX(N, 0.0f), chDirY(N, 0.0f), chInten(N, 0.0f), chDir(N, 0.0f), chFar(N, 0.0f);
+    std::vector<uint8_t> chCat(N, 0);
+    enum { CAT_NONE = 0, CAT_SEA = 1, CAT_RIVER = 2, CAT_POND = 3, CAT_BEACH = 4 };
+    auto distAt = [&](int x, int y) -> int {
+        if (x < 0 || y < 0 || x >= W || y >= H) return INT_MAX;
+        const int i = y * W + x;
+        return wet[i] ? dist[i] : INT_MAX;
+    };
+    // Central-difference gradient component with one-sided / INF fallback.
+    auto gradComp = [](int neg, int pos, int center) -> float {
+        const bool hn = neg != INT_MAX, hp = pos != INT_MAX;
+        if (hn && hp) return 0.5f * (float)(pos - neg);
+        if (hp)       return (float)(pos - center);
+        if (hn)       return (float)(center - neg);
+        return 0.0f;
+    };
+
+    for (size_t i = 0; i < N; ++i) {
+        if (!wet[i]) continue;   // dry → all-zero (sampled outside any body)
+        const int cx = (int)(i % W), cy = (int)(i / W);
+        float dirX = 0.0f, dirY = 0.0f, intensity = 0.0f, directionality = 0.0f;
+        uint8_t cat;
+
+        if (dist[i] == INT_MAX) {
+            // Not connected to the sea → isolated pond/lake; calmer, scaled by size.
+            cat = CAT_POND;
+            const int cnt = compCount[label[i]];
+            const float t = std::min(1.0f, (float)cnt / (float)kFlowLakeCells);
+            intensity = kFlowPondInten + (kFlowLakeInten - kFlowPondInten) * t;
+        } else if (wide[i]) {
+            // Open water: wide, full amplitude, isotropic (today's look).
+            cat = CAT_SEA;
+            intensity = 1.0f;
+        } else if (distWide[i] != INT_MAX && distWide[i] <= beachReach) {
+            // Narrow fringe of open water → beach.
+            cat = CAT_BEACH;
+            intensity = g_flowBeachMul;
+        } else {
+            // Narrow, sea-connected, away from open water → river. Downstream = -grad(distToSea).
+            cat = CAT_RIVER;
+            const float gx = gradComp(distAt(cx - 1, cy), distAt(cx + 1, cy), dist[i]);
+            const float gy = gradComp(distAt(cx, cy - 1), distAt(cx, cy + 1), dist[i]);
+            const float fx = -gx, fy = -gy;
+            const float len = sqrtf(fx * fx + fy * fy);
+            if (len > 1e-3f) { dirX = fx / len; dirY = fy / len; directionality = 1.0f; }
+            intensity = g_flowRiverInten;
+        }
+
+        chDirX[i] = dirX; chDirY[i] = dirY; chInten[i] = intensity; chDir[i] = directionality;
+        chCat[i] = cat;
+    }
+
+    // 5b. BeachExtend: grow beach seaward into open water by beachExtend cells. Expands ONLY
+    //     into SEA cells (reclassifying them to beach), so it can neither create nor shorten
+    //     rivers — it widens the coastal beach band independently of RiverWidth/BeachReach.
+    const int beachExtend = (int)(g_flowBeachExtend + 0.5f);
+    if (beachExtend > 0) {
+        std::vector<int> dB(N, INT_MAX);
+        q.clear();
+        for (size_t i = 0; i < N; ++i) {
+            if (chCat[i] == CAT_BEACH) { dB[i] = 0; q.push_back((int)i); }
+        }
+        for (size_t head = 0; head < q.size(); ++head) {
+            const int c = q[head];
+            if (dB[c] >= beachExtend) continue;   // cap distance from the original beach front
+            const int cx = c % W, cy = c / W;
+            const int nd = dB[c] + 1;
+            for (auto& d : nb) {
+                const int nx = cx + d[0], ny = cy + d[1];
+                if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+                const int ni = ny * W + nx;
+                if (wet[ni] && dB[ni] == INT_MAX && chCat[ni] == CAT_SEA) {
+                    dB[ni] = nd; q.push_back(ni);
+                    chCat[ni] = CAT_BEACH;
+                    chInten[ni] = g_flowBeachMul;
+                    chDirX[ni] = chDirY[ni] = chDir[ni] = 0.0f;
+                }
+            }
+        }
+    }
+
+    // 5c. Beach flow ramps SMOOTHLY across the band, from the open-sea front (calm, no flow) to
+    //     the land edge (full onshore flow). Per the design: the coastline's local ups/downs must
+    //     NOT bend the general direction, and there must be no sudden calm-sea→violent-beach step.
+    //     We build a normalized cross-band coordinate phi in [0,1] from two BFS distance fields over
+    //     the beach cells: dSea (cells from the seaward front) and dLand (cells from the landward
+    //     front); phi = dSea/(dSea+dLand) → 0 at the sea side, 1 at the land side. phi is blurred so
+    //     border wiggles average out, then:
+    //       direction      = normalize(grad phi)              (general onshore, not border-following)
+    //       directionality = phi                              (flow accelerates 0 → full toward land)
+    //       intensity      = lerp(1.0 [sea], beachMul, phi)   (amplitude blends, no step)
+    {
+        std::vector<int> dSea(N, INT_MAX), dLand(N, INT_MAX);
+        // seaward front: beach cells adjacent to a SEA cell
+        q.clear();
+        for (size_t i = 0; i < N; ++i) {
+            if (chCat[i] != CAT_BEACH) continue;
+            const int cx = (int)(i % W), cy = (int)(i / W);
+            for (auto& d : nb) {
+                const int nx = cx + d[0], ny = cy + d[1];
+                if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+                if (chCat[ny * W + nx] == CAT_SEA) { dSea[i] = 0; q.push_back((int)i); break; }
+            }
+        }
+        for (size_t head = 0; head < q.size(); ++head) {
+            const int c = q[head];
+            const int cx = c % W, cy = c / W;
+            const int nd = dSea[c] + 1;
+            for (auto& d : nb) {
+                const int nx = cx + d[0], ny = cy + d[1];
+                if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+                const int ni = ny * W + nx;
+                if (chCat[ni] == CAT_BEACH && dSea[ni] == INT_MAX) { dSea[ni] = nd; q.push_back(ni); }
+            }
+        }
+        // landward front: beach cells adjacent to dry land
+        q.clear();
+        for (size_t i = 0; i < N; ++i) {
+            if (chCat[i] != CAT_BEACH) continue;
+            const int cx = (int)(i % W), cy = (int)(i / W);
+            for (auto& d : nb) {
+                const int nx = cx + d[0], ny = cy + d[1];
+                if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+                if (!wet[ny * W + nx]) { dLand[i] = 0; q.push_back((int)i); break; }
+            }
+        }
+        for (size_t head = 0; head < q.size(); ++head) {
+            const int c = q[head];
+            const int cx = c % W, cy = c / W;
+            const int nd = dLand[c] + 1;
+            for (auto& d : nb) {
+                const int nx = cx + d[0], ny = cy + d[1];
+                if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+                const int ni = ny * W + nx;
+                if (chCat[ni] == CAT_BEACH && dLand[ni] == INT_MAX) { dLand[ni] = nd; q.push_back(ni); }
+            }
+        }
+        // normalized cross-band coordinate
+        std::vector<float> phi(N, 0.0f);
+        for (size_t i = 0; i < N; ++i) {
+            if (chCat[i] != CAT_BEACH) continue;
+            const float a = (dSea[i]  == INT_MAX) ? (float)beachReach : (float)dSea[i];
+            const float b = (dLand[i] == INT_MAX) ? (float)beachReach : (float)dLand[i];
+            const float s = a + b;
+            phi[i] = (s > 0.0f) ? (a / s) : 0.5f;
+        }
+        // blur phi over beach neighbours so the coastline's ups/downs don't steer the direction
+        for (int pass = 0; pass < kFlowBlurPasses + 4; ++pass) {
+            std::vector<float> tP(phi);
+            for (size_t i = 0; i < N; ++i) {
+                if (chCat[i] != CAT_BEACH) continue;
+                const int cx = (int)(i % W), cy = (int)(i / W);
+                float sP = tP[i]; int n = 1;
+                for (auto& d : nb) {
+                    const int nx = cx + d[0], ny = cy + d[1];
+                    if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+                    const int ni = ny * W + nx;
+                    if (chCat[ni] == CAT_BEACH) { sP += tP[ni]; ++n; }
+                }
+                phi[i] = sP / (float)n;
+            }
+        }
+        // DIRECTION = the MACRO coastline normal: gradient of a heavily-blurred land(1)/water(0)
+        //     field. Blurring over a wide radius collapses the whole grid into a smooth land/sea
+        //     ramp, so grad() at a beach cell is the broad orientation of that coast — south of the
+        //     island it points north (waves come from the south), the west coast points east, etc.
+        //     Fully averaged across cells: the flow map shows none of the per-cell boxy source. phi
+        //     drives only the STRENGTH ramp.
+        std::vector<float> lf(N), tmp(N);
+        for (size_t i = 0; i < N; ++i) lf[i] = wet[i] ? 0.0f : 1.0f;
+        {
+            std::vector<float> pre(std::max(W, H) + 1);
+            const int dirIters = std::max(1, (int)(g_flowDirIters + 0.5f));
+            const int R = std::max(1, (int)(g_flowDirRadius + 0.5f));
+            for (int it = 0; it < dirIters; ++it) {
+                for (int y = 0; y < H; ++y) {                       // horizontal box blur, radius R
+                    const int row = y * W;
+                    pre[0] = 0.0f;
+                    for (int x = 0; x < W; ++x) pre[x + 1] = pre[x] + lf[row + x];
+                    for (int x = 0; x < W; ++x) {
+                        const int lo = std::max(0, x - R), hi = std::min(W - 1, x + R);
+                        tmp[row + x] = (pre[hi + 1] - pre[lo]) / (float)(hi - lo + 1);
+                    }
+                }
+                for (int x = 0; x < W; ++x) {                       // vertical box blur, radius R
+                    pre[0] = 0.0f;
+                    for (int y = 0; y < H; ++y) pre[y + 1] = pre[y] + tmp[y * W + x];
+                    for (int y = 0; y < H; ++y) {
+                        const int lo = std::max(0, y - R), hi = std::min(H - 1, y + R);
+                        lf[y * W + x] = (pre[hi + 1] - pre[lo]) / (float)(hi - lo + 1);
+                    }
+                }
+            }
+        }
+        const int R = std::max(1, (int)(g_flowDirRadius + 0.5f));
+        for (size_t i = 0; i < N; ++i) {
+            const bool isBeach = (chCat[i] == CAT_BEACH);
+            const bool isSea   = (chCat[i] == CAT_SEA);
+            if (!isBeach && !isSea) continue;
+            const int cx = (int)(i % W), cy = (int)(i / W);
+            const int xl = std::max(0, cx - 1), xr = std::min(W - 1, cx + 1);
+            const int yd = std::max(0, cy - 1), yu = std::min(H - 1, cy + 1);
+            const float gx = lf[cy * W + xr] - lf[cy * W + xl];    // toward more land = onshore
+            const float gy = lf[yu * W + cx] - lf[yd * W + cx];
+            const float len = sqrtf(gx * gx + gy * gy);
+            if (len > 1e-6f) { chDirX[i] = gx / len; chDirY[i] = gy / len; }
+            if (isBeach) {
+                chDir[i]   = phi[i];                               // near-flow strength ramps 0 → full
+                chInten[i] = 1.0f + (g_flowBeachMul - 1.0f) * phi[i];  // amplitude blends sea → beach
+            } else {
+                // Sea: far-wave (refraction) strength fades offshore. The blurred-field gradient
+                // magnitude ~1/R near a coast and ~0 in deep sea; len*R*boost normalises that to
+                // a 0..1 ramp so swells refract toward shore only within the coastal band.
+                if (len > 1e-6f) chFar[i] = std::min(1.0f, len * (float)R * kFlowSeaRefract);
+            }
+        }
+    }
+
+    // 5d. Pack the alpha routing channel: 0.5 = neutral; <0.5 = NEAR group (river/beach), with
+    //     near-strength = (0.5 - a) * 2 advecting the close normal; >0.5 = FAR group (sea), with
+    //     far-strength = (a - 0.5) * 2 advecting the far normal (refraction). chDir held the
+    //     provisional near strength (river=1, beach=phi, sea/pond=0); chFar the sea far strength.
+    for (size_t i = 0; i < N; ++i) {
+        if (!wet[i]) continue;
+        if (chCat[i] == CAT_SEA) chDir[i] = 0.5f + 0.5f * std::min(1.0f, std::max(0.0f, chFar[i]));
+        else                     chDir[i] = 0.5f - 0.5f * std::min(1.0f, std::max(0.0f, chDir[i]));
+    }
+
+    // 6. Light box-blur of ALL channels (intensity + flow dir + directionality), so the
+    // piecewise-constant per-cell field doesn't show hard square edges through the water's
+    // linear texture filter. Averaged only over wet neighbours (dry stays zero). Direction
+    // is blurred un-normalized: shorter vectors near body edges → gentler advection, which
+    // is what we want at transitions. Bends average opposing vectors, but 1 pass is mild.
+    for (int pass = 0; pass < kFlowBlurPasses; ++pass) {
+        std::vector<float> tI(chInten), tX(chDirX), tY(chDirY), tD(chDir);
+        for (size_t i = 0; i < N; ++i) {
+            if (!wet[i]) continue;
+            const int cx = (int)(i % W), cy = (int)(i / W);
+            float sI = tI[i], sX = tX[i], sY = tY[i], sD = tD[i]; int n = 1;
+            for (auto& d : nb) {
+                const int nx = cx + d[0], ny = cy + d[1];
+                if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+                const int ni = ny * W + nx;
+                if (wet[ni]) { sI += tI[ni]; sX += tX[ni]; sY += tY[ni]; sD += tD[ni]; ++n; }
+            }
+            const float inv = 1.0f / (float)n;
+            chInten[i] = sI * inv; chDirX[i] = sX * inv; chDirY[i] = sY * inv; chDir[i] = sD * inv;
+        }
+    }
+
+    // 7. Encode RGBA8 (A8R8G8B8 in-memory = 0xAARRGGBB).
+    auto enc8 = [](float v01) -> uint32_t {
+        int b = (int)(v01 * 255.0f + 0.5f);
+        return (uint32_t)std::max(0, std::min(255, b));
+    };
+    g_flowMapBytes.assign(N, 0);
+    const int debugBake = g_flowDebugBake.load(std::memory_order_acquire);
+    if (debugBake == 1) {
+        // CLASSIFY view: flat category colours (sea=blue, river=green, pond=red, beach=yellow).
+        // 0xAARRGGBB; A unused here (shader keys on flowDebugView, tints by RGB).
+        static const uint32_t catCol[5] = {
+            0x00000000,  // none/dry
+            0x000000FF,  // sea   = blue
+            0x0000FF00,  // river = green
+            0x00FF0000,  // pond  = red
+            0x00FFFF00,  // beach = yellow
+        };
+        for (size_t i = 0; i < N; ++i) {
+            if (!wet[i]) continue;
+            g_flowMapBytes[i] = catCol[chCat[i]];
+        }
+    } else if (debugBake == 2) {
+        // DIRECTION view: colour by flow angle (hue wheel). Directional cells (rivers
+        // downstream, beaches onshore) get a saturated hue; non-directional water (sea/pond)
+        // is dim grey. East=red, North=green, West=cyan, South=magenta-ish.
+        for (size_t i = 0; i < N; ++i) {
+            if (!wet[i]) continue;
+            if (chDirX[i] != 0.0f || chDirY[i] != 0.0f) {   // any directional cell (river/beach/sea-refract)
+                const float h = atan2f(chDirY[i], chDirX[i]) * 0.1591549f + 0.5f;   // 1/(2pi)
+                const float r = std::min(1.0f, std::max(0.0f, fabsf(h * 6 - 3) - 1));
+                const float g = std::min(1.0f, std::max(0.0f, 2 - fabsf(h * 6 - 2)));
+                const float b = std::min(1.0f, std::max(0.0f, 2 - fabsf(h * 6 - 4)));
+                g_flowMapBytes[i] = (enc8(r) << 16) | (enc8(g) << 8) | enc8(b);
+            } else {
+                g_flowMapBytes[i] = 0x00303030;   // grey = no direction
+            }
+        }
+    } else {
+        for (size_t i = 0; i < N; ++i) {
+            if (!wet[i]) continue;
+            const uint32_t R = enc8(chDirX[i] * 0.5f + 0.5f);
+            const uint32_t G = enc8(chDirY[i] * 0.5f + 0.5f);
+            const uint32_t B = enc8(chInten[i]);
+            const uint32_t A = enc8(chDir[i]);
+            g_flowMapBytes[i] = (A << 24) | (R << 16) | (G << 8) | B;
+        }
+    }
+
+    g_flowMapW = W; g_flowMapH = H;
+    g_flowOriginX = minFx * kFlowGrid;
+    g_flowOriginY = minFy * kFlowGrid;
+    g_flowInvSizeX = 1.0f / (W * kFlowGrid);
+    g_flowInvSizeY = 1.0f / (H * kFlowGrid);
+    g_flowMapDirty.store(true, std::memory_order_release);
+
+    LOG::logline("-- [water-flow] flow map built: %dx%d cells, %d bodies, sea seed=%d cells, waterZ=%.0f",
+                 W, H, numComp, seaSeed, waterZ);
+}
+
+// Main thread: lazily (re)create texFlow and upload the worker-baked bytes when
+// dirty. Returns true if texFlow is valid to bind. Same managed Lock/Unlock upload
+// pattern as the error texture / ripple textures.
+bool DistantLand::updateFlowMapTexture() {
+    if (g_flowMapW <= 0 || g_flowMapH <= 0) {
+        return texFlow != nullptr;
+    }
+    if (g_flowMapDirty.exchange(false, std::memory_order_acquire)) {
+        // Recreate if the grid dimensions changed (e.g. land set reloaded).
+        if (texFlow) {
+            D3DSURFACE_DESC desc;
+            if (texFlow->GetLevelDesc(0, &desc) == D3D_OK &&
+                ((int)desc.Width != g_flowMapW || (int)desc.Height != g_flowMapH)) {
+                texFlow->Release();
+                texFlow = nullptr;
+            }
+        }
+        if (!texFlow) {
+            if (device->CreateTexture(g_flowMapW, g_flowMapH, 1, 0, D3DFMT_A8R8G8B8,
+                                      D3DPOOL_MANAGED, &texFlow, NULL) != D3D_OK) {
+                texFlow = nullptr;
+                LOG::logline("!! [water-flow] CreateTexture failed (%dx%d)", g_flowMapW, g_flowMapH);
+                return false;
+            }
+        }
+        D3DLOCKED_RECT lr;
+        if (texFlow->LockRect(0, &lr, NULL, 0) == D3D_OK) {
+            const uint8_t* src = (const uint8_t*)g_flowMapBytes.data();
+            uint8_t* dst = (uint8_t*)lr.pBits;
+            const int rowBytes = g_flowMapW * 4;
+            for (int y = 0; y < g_flowMapH; ++y) {
+                memcpy(dst + (size_t)y * lr.Pitch, src + (size_t)y * rowBytes, rowBytes);
+            }
+            texFlow->UnlockRect(0);
+        }
+    }
+    return texFlow != nullptr;
+}
+
+void DistantLand::getFlowMapTransform(float out[4]) {
+    out[0] = g_flowOriginX;
+    out[1] = g_flowOriginY;
+    out[2] = g_flowInvSizeX;
+    out[3] = g_flowInvSizeY;
+}
+
 // Rebuild the dense near-camera terrain height grid for the 3x3 world cells around the
 // given eye cell, by rasterizing real terrain triangles (continuous coverage → no
 // vertex-spacing holes). No-op if already built for this cell. Runs on the cull worker
@@ -2965,6 +3641,16 @@ bool DistantLand::isReflectionWaterVisible() {
     // release). Built once per session in practice.
     if (g_terrainMinHSrcSize != landMeshes.size()) {
         buildTerrainMinHeight(landMeshes);
+        // Same one-time gate (CPU only, on the cull worker). The wet/dry source is
+        // g_fineMinH, just (re)built above. waterZ captured at build time.
+        if (Configuration.UseWaterFlowMap) {
+            buildWaterFlowMap(MWBridge::get()->WaterLevel());
+        }
+    } else if (Configuration.UseWaterFlowMap &&
+               g_flowRebake.exchange(false, std::memory_order_acquire)) {
+        // Knob tuning (NUMPAD7/6/3) asked for a re-bake. Terrain triangles persist,
+        // so only the flow map is rebuilt; same CPU-only worker path.
+        buildWaterFlowMap(MWBridge::get()->WaterLevel());
     }
     if (g_cellMinH.empty()) {
         return true;   // no terrain data → gate inert, reflect as before

@@ -120,6 +120,7 @@ struct ConfigurationStruct {
     bool UseAsyncSceneGraphWalk;    // sub-flag: run the scene-graph walk on a worker thread; main signals at onFrameReady and returns immediately. Snapshot is one frame stale. Default off; on hides the ~350µs walk from the main-thread frame budget.
     bool UseRenderThread;           // enable the MGE render thread: submit GPU work on a second core during the engine's CPU-only frame-start/sky windows. Also forces D3DCREATE_MULTITHREADED and arms the device-submission lock. Default off.
     bool UseTiledLights;            // main-view point lights via per-frame screen-tile binning (USE_TILED_LIGHTS) instead of per-mesh selection. Rides the scene-graph snapshot. Runtime A/B on VK_DECIMAL. Default off.
+    bool UseWaterFlowMap;           // per-water-body directional waves & storm-calm ponds: bake a low-res flow map (distance-to-sea BFS over the wet/dry grid) and sample it in the water shader (WATER_FLOW_MAP). Runtime A/B on VK_NUMPAD9. Default off. (MGEFlags bits 0-31 are full, so this is a standalone bool like UseTiledLights.)
 
     struct {
         float zoom, zoomRate, zoomRateTarget;

@@ -33,6 +33,29 @@ shared float waveHeight;
 sampler sampRain = sampler_state { texture = <tex4>; minfilter = linear; magfilter = linear; mipfilter = linear; addressu = wrap; addressv = wrap; };
 sampler sampWave = sampler_state { texture = <tex5>; minfilter = linear; magfilter = linear; mipfilter = linear; bordercolor = 0; addressu = border; addressv = border; };
 
+#ifdef WATER_FLOW_MAP
+// Per-water-body flow field, baked CPU-side (see buildWaterFlowMap). R,G = downstream
+// flow direction (encoded *0.5+0.5), B = wave intensity, A = packed routing
+// (0.5 neutral, <0.5 near/river+beach strength, >0.5 far/sea-refraction strength).
+shared texture texFlow;
+shared float4 flowMapTransform;     // origin.xy, invSize.xy  (world XY → [0,1] map UV)
+shared float  flowMapWeight;        // debug A/B: 1 = flow map on, 0 = neutral
+sampler sampFlow = sampler_state { texture = <texFlow>; minfilter = linear; magfilter = linear; mipfilter = none; addressu = clamp; addressv = clamp; };
+shared float flowScrollSpeed;        // river directional advection rate (live NUMPAD8/6/3 tuning)
+shared float flowSeaSpeed;           // base wave animation rate scale (1 = stock; live tuning)
+shared float flowCycleUV;            // bounded per-cycle UV displacement (Valve flow map; live tuning)
+shared float flowSeaRefract;         // sea far-wave (refraction) strength multiplier (live tuning)
+shared float flowDebugView;          // CLASSIFY view: 1 = paint water flat by category colour
+#endif
+
+#ifdef WATER_LOD_MESH
+// Flow-steered anisotropic crest displacement (world-snapped LOD mesh). Live knobs.
+shared float waveAmp;       // crest amplitude (world units)
+shared float waveLen;       // base wavelength along the flow (world units)
+shared float waveSpeed;     // crest travel speed scale
+shared float crestSpread;   // directional fan: small = longer, straighter crest lines
+#endif
+
 static const float waveTexResolution = 512;
 static const float waveTexWorldSize = waveTexResolution * 2.5;
 static const float waveTexRcpRes = 1.0 / waveTexResolution;
@@ -43,14 +66,47 @@ static const float playerWaveSize = 12.0 / waveTexWorldSize; // 12 world units r
 
 float3 getFinalWaterNormal(float2 texcoord1, float2 texcoord2, float dist, float2 vertXY) : NORMAL
 {
+    float2 far_normal, close_normal;
+
+#ifdef WATER_FLOW_MAP
+    // Sample the per-body flow field at this world position.
+    float4 flow = tex2Dlod(sampFlow, float4((vertXY - flowMapTransform.xy) * flowMapTransform.zw, 0, 0));
+    float2 flowDir = flow.rg * 2 - 1;
+    float  intensity = lerp(1.0, flow.b, flowMapWeight);          // weight 0 → sea-equivalent
+    // Alpha is a packed routing channel: 0.5 = neutral, <0.5 = NEAR group (river/beach), >0.5 =
+    // FAR group (sea). Rivers/beaches advect the CLOSE normal (detail rolls downstream/onshore);
+    // sea advects the FAR normal along the blurred coastline normal (large swells refract shoreward).
+    float  nearStr = saturate((0.5 - flow.a) * 2) * flowMapWeight;
+    float  farStr  = saturate((flow.a - 0.5) * 2) * flowMapWeight * flowSeaRefract;
+
+    float t = 0.4 * flowSeaSpeed * time;   // base (sea) animation rate, separately tunable
+
+    // Valve flow-map ping-pong. A plain "texcoord -= flowDir*speed*time" advection grows the UV
+    // offset without bound; because flowDir varies in space, neighbouring pixels then diverge
+    // ever further across the noise texture → severe minification = the pixelated specular and
+    // apparent wave-size/frequency changes. Instead bound the offset to one cycle (frac phase,
+    // max displacement flowCycleUV) and crossfade two half-phase-shifted samples so the reset is
+    // never visible. Apparent scroll velocity stays = flowScrollSpeed (the RiverSpeed knob).
+    float  rate  = flowScrollSpeed / flowCycleUV;                // cycles/time → velocity = flowScrollSpeed
+    float  ph0   = frac(time * rate);
+    float  ph1   = frac(time * rate + 0.5);
+    float  blend = abs(1.0 - 2.0 * ph0);                         // triangle wave; weight→0 as a phase resets
+    float2 dispF = flowDir * farStr  * flowCycleUV;              // sea → far normal (refraction); 0 elsewhere
+    float2 dispN = flowDir * nearStr * flowCycleUV;              // river/beach → close normal; 0 elsewhere
+    far_normal   = lerp(tex3D(sampWater3d, float3(texcoord1 - dispF * ph0, t)).rg,
+                        tex3D(sampWater3d, float3(texcoord1 - dispF * ph1, t)).rg, blend);
+    close_normal = lerp(tex3D(sampWater3d, float3(texcoord2 - dispN * ph0, t)).rg,
+                        tex3D(sampWater3d, float3(texcoord2 - dispN * ph1, t)).rg, blend);
+#else
     // Calculate the W texture coordinate based on the time that has passed
     float t = 0.4 * time;
     float3 w1 = float3(texcoord1, t);
     float3 w2 = float3(texcoord2, t);
 
     // Blend together the normals from different sized areas of the same texture
-    float2 far_normal = tex3D(sampWater3d, w1).rg;
-    float2 close_normal = tex3D(sampWater3d, w2).rg;
+    far_normal = tex3D(sampWater3d, w1).rg;
+    close_normal = tex3D(sampWater3d, w2).rg;
+#endif
 
 #ifdef DYNAMIC_RIPPLES
     // Blend normals from rain and player ripples
@@ -59,6 +115,10 @@ float3 getFinalWaterNormal(float2 texcoord1, float2 texcoord2, float dist, float
 #endif
 
     float2 normal_R = 2 * lerp(close_normal, far_normal, saturate(dist / 8000)) - 1;
+#ifdef WATER_FLOW_MAP
+    // Calmer ponds/shallows (low intensity); sea (intensity 1) unchanged.
+    normal_R *= intensity;
+#endif
     return normalize(float3(normal_R, 1));
 }
 
@@ -105,12 +165,78 @@ struct WaterVertOut
     float4 pos : TEXCOORD0;
     float4 texcoords : TEXCOORD1;
     float4 screenpos : TEXCOORD2;
-#ifdef DYNAMIC_RIPPLES
+#if defined(DYNAMIC_RIPPLES) || defined(WATER_LOD_MESH)
     float4 screenposclamp : TEXCOORD3;
 #endif
 };
 
-#ifndef DYNAMIC_RIPPLES
+#if defined(WATER_LOD_MESH)
+
+WaterVertOut WaterVS (in float4 pos : POSITION)
+{
+    WaterVertOut OUT;
+
+    // World-snapped lattice: the per-level world matrix supplies cell size + snap, so
+    // mul(pos, world) lands every vertex on a stable world position (no swimming).
+    OUT.pos = mul(pos, world);
+
+    // Calculate various texture coordinates
+    OUT.texcoords.xy = OUT.pos.xy / 3900;
+    OUT.texcoords.zw = OUT.pos.xy / 527;
+
+    float2 worldXY = OUT.pos.xy;
+    float  dist = length(eyePos.xyz - OUT.pos.xyz);
+
+    // Sample the per-body flow field: direction, intensity (B), near/far routing (A).
+    float4 flow = tex2Dlod(sampFlow, float4((worldXY - flowMapTransform.xy) * flowMapTransform.zw, 0, 0));
+    float2 flowDir = flow.rg * 2 - 1;
+    float  flowMag = length(flowDir);
+    flowDir = (flowMag > 1e-3) ? flowDir / flowMag : float2(1, 0);
+    float  intensity = lerp(1.0, flow.b, flowMapWeight);
+    float  farStr    = saturate((flow.a - 0.5) * 2);   // sea group → longer swell
+
+    // Crest lines run ACROSS the flow; waves are short ALONG it. The sea class widens
+    // the wavelength (long swells); rivers/beaches stay tight.
+    float2 crestDir = float2(-flowDir.y, flowDir.x);
+    float  baseLen  = waveLen * lerp(1.0, 3.0, farStr);
+
+    // Vertical Gerstner sum: a few waves fanned slightly about flowDir → short
+    // wavelength in the travel direction, long coherent crest lines perpendicular.
+    // h depends on stable world XY + time, so crests travel with the flow through the
+    // world and stay put on the lattice.
+    float h = 0.0;
+    [unroll] for (int i = 0; i < 4; ++i)
+    {
+        float  fan    = (i - 1.5) * crestSpread;            // small directional spread
+        float2 dir    = normalize(flowDir + crestDir * fan);
+        float  lambda = baseLen * (1.0 + 0.35 * i);
+        float  k      = 6.28318530718 / lambda;
+        float  w      = waveSpeed * 30.0 * sqrt(k);         // deep-water-like dispersion
+        h += sin(dot(dir, worldXY) * k - w * time) / (1.0 + 0.6 * i);
+    }
+
+    // Amplitude: knob * body intensity, faded near the eye and toward the fog horizon
+    // exactly like the radial DYNAMIC_RIPPLES displacement.
+    float amp = waveAmp * intensity * lerp(1.0, 0.7, farStr);
+    float addheight = amp * h * saturate(1 - dist / 6400) * saturate(dist / 200);
+    OUT.pos.z += addheight;
+
+    // Silhouette uses the displaced height.
+    OUT.position = mul(OUT.pos, view);
+    OUT.position = mul(OUT.position, proj);
+    OUT.screenpos = float4(0.5 * (1 + rcpRes) * OUT.position.w + float2(0.5, -0.5) * OUT.position.xy, OUT.position.zw);
+
+    // Planar reflection samples the FLAT water plane (height removed), as in the
+    // DYNAMIC_RIPPLES path — a planar mirror RT has no height information.
+    float4 flatPos = OUT.pos - float4(0, 0, addheight, 0);
+    flatPos = mul(flatPos, view);
+    flatPos = mul(flatPos, proj);
+    OUT.screenposclamp = float4(0.5 * (1 + rcpRes) * flatPos.w + float2(0.5, -0.5) * flatPos.xy, flatPos.zw);
+
+    return OUT;
+}
+
+#elif !defined(DYNAMIC_RIPPLES)
 
 WaterVertOut WaterVS (in float4 pos : POSITION)
 {
@@ -225,10 +351,10 @@ float4 WaterPS(in WaterVertOut IN): COLOR0
     }
 
     // Sample reflection texture
-#ifndef DYNAMIC_RIPPLES
-    float4 screenpos = IN.screenpos;
-#else
+#if defined(DYNAMIC_RIPPLES) || defined(WATER_LOD_MESH)
     float4 screenpos = IN.screenposclamp;
+#else
+    float4 screenpos = IN.screenpos;
 #endif
 
 #if DEBUG_REFLECTION_RAW
@@ -277,6 +403,17 @@ float4 WaterPS(in WaterVertOut IN): COLOR0
     result = lerp(result, refracted, shorefactor * fog.a);
 
     // Note that both refraction and reflection textures have fog applied already
+
+#ifdef WATER_FLOW_MAP
+    // CLASSIFY debug view: overlay the baked category colour (green=river, red=pond,
+    // yellow=beach, blue=sea) so the flood-fill classification can be validated directly.
+    if (flowDebugView > 0.5)
+    {
+        float3 cat = tex2Dlod(sampFlow, float4((IN.pos.xy - flowMapTransform.xy) * flowMapTransform.zw, 0, 0)).rgb;
+        float m = step(0.01, dot(cat, 1));   // only tint where a category was baked
+        result = lerp(result, cat, 0.8 * m);
+    }
+#endif
 
     return float4(result, 1);
 }

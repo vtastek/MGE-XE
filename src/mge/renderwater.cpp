@@ -656,8 +656,6 @@ void DistantLand::renderWaterPlane() {
     const bool underwater = MWBridge::get()->IsUnderwater(eyePos.z);
     const float waterZ = MWBridge::get()->WaterLevel()
                        + (underwater ? s_waterMeshSnapUnderwater : s_waterMeshSnapAbove);
-    D3DXMatrixTranslation(&m, eyePos.x, eyePos.y, waterZ);
-    effect->SetMatrix(ehWorld, &m);
     effect->SetTexture(ehTex0, texReflection);
     effect->SetTexture(ehTex1, texWater);
     effect->SetTexture(ehTex2, texRefract);
@@ -666,11 +664,64 @@ void DistantLand::renderWaterPlane() {
         effect->SetTexture(ehTex4, texRain);
         effect->SetTexture(ehTex5, texRipples);
     }
-    effect->CommitChanges();
+    if (Configuration.UseWaterFlowMap && updateFlowMapTexture()) {
+        float ft[4];
+        getFlowMapTransform(ft);
+        effect->SetTexture(ehFlow, texFlow);
+        effect->SetFloatArray(ehFlowTransform, ft, 4);
+        // Debug A/B (VK_NUMPAD9): 1 = flow map active, 0 = neutral (today's look).
+        effect->SetFloat(ehFlowWeight, waterFlowDebugOn ? 1.0f : 0.0f);
+        effect->SetFloat(ehFlowScroll, waterFlowScroll);
+        effect->SetFloat(ehFlowSeaSpeed, waterFlowSeaSpeed);
+        effect->SetFloat(ehFlowCycleUV, waterFlowCycleUV);
+        effect->SetFloat(ehFlowSeaRefract, waterFlowSeaRefract);
+        effect->SetFloat(ehFlowDebugView, (waterFlowClassify || waterFlowDirView) ? 1.0f : 0.0f);
+    }
+    if (Configuration.UseWaterFlowMap) {
+        // Flow-steered crest displacement knobs (WATER_LOD_MESH). Set every frame the
+        // LOD shader is compiled — even before the flow texture is ready — so waveLen
+        // is never the 0 default (which would divide-by-zero in the displacement VS).
+        effect->SetFloat(ehWaveAmp, waterWaveAmp);
+        effect->SetFloat(ehWaveLen, waterWaveLen);
+        effect->SetFloat(ehWaveSpeed, waterWaveSpeed);
+        effect->SetFloat(ehCrestSpread, waterCrestSpread);
+    }
 
     device->SetVertexDeclaration(WaterDecl);
-    device->SetStreamSource(0, vbWater, 0, 12);
-    device->SetIndices(ibWater);
-    DrawStats::count(numWaterTris);
-    device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, numWaterVerts, 0, numWaterTris);
+
+    // World-snapped LOD path (clipmap): one snapped world matrix + draw per level so
+    // vertices land on a stable world lattice (no swimming). Else the radial mesh.
+    const bool useLod = waterLodMeshOn && Configuration.UseWaterFlowMap
+                        && vbWaterLod && !waterLodLevels.empty();
+    if (useLod) {
+        device->SetStreamSource(0, vbWaterLod, 0, 12);
+        device->SetIndices(ibWaterLod);
+        for (const WaterLodLevel& lvl : waterLodLevels) {
+            // Snap the level origin to 2*cellSize so each finer level's boundary lands
+            // on the coarser grid lines (shared world-lattice points → no seam).
+            const float snap = 2.0f * lvl.cellSize;
+            const float originX = floorf(eyePos.x / snap) * snap;
+            const float originY = floorf(eyePos.y / snap) * snap;
+            // World = scale(cellSize, cellSize, 1) * translate(origin, waterZ).
+            D3DXMatrixScaling(&m, lvl.cellSize, lvl.cellSize, 1.0f);
+            m._41 = originX;
+            m._42 = originY;
+            m._43 = waterZ;
+            effect->SetMatrix(ehWorld, &m);
+            effect->CommitChanges();
+
+            DrawStats::count(lvl.triCount);
+            device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, lvl.vertBase, lvl.vertCount,
+                                         lvl.ibStart, lvl.triCount);
+        }
+    } else {
+        D3DXMatrixTranslation(&m, eyePos.x, eyePos.y, waterZ);
+        effect->SetMatrix(ehWorld, &m);
+        effect->CommitChanges();
+
+        device->SetStreamSource(0, vbWater, 0, 12);
+        device->SetIndices(ibWater);
+        DrawStats::count(numWaterTris);
+        device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, numWaterVerts, 0, numWaterTris);
+    }
 }
