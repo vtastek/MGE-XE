@@ -17,6 +17,7 @@
 #include "XE Mod Sky.fx"
 #include "XE Mod Water.fx"
 #include "XE Mod Caustics.fx"
+#include "XE Mod Foam.fx"          // world-anchored hybrid particle foam sim; after Water (shares foamOrigin/flow uniforms)
 
 //------------------------------------------------------------
 // Morrowind/MGE blending
@@ -513,4 +514,58 @@ Technique T0 {
         VertexShader = compile vs_3_0 CacheTerrainLitVS();
         PixelShader = compile ps_3_0 CacheTerrainReflLitPS();
     }
+#ifdef WATER_FOAM
+    //------------------------------------------------------------
+    // Foam sim — Voronoi particle advection (reuses the wave-sim fullscreen quad/VS)
+    Pass P17 {
+        ZEnable = false;
+        ZWriteEnable = false;
+        StencilEnable = false;
+        CullMode = none;
+        AlphaBlendEnable = false;
+        AlphaTestEnable = false;
+
+        VertexShader = compile vs_3_0 WaveVS();
+        PixelShader = compile ps_3_0 FoamAdvectPS();
+    }
+    //------------------------------------------------------------
+    // Foam sim — velocity/density field smoothing
+    Pass P18 {
+        ZEnable = false;
+        ZWriteEnable = false;
+        StencilEnable = false;
+        CullMode = none;
+        AlphaBlendEnable = false;
+        AlphaTestEnable = false;
+
+        VertexShader = compile vs_3_0 WaveVS();
+        PixelShader = compile ps_3_0 FoamFieldPS();
+    }
+    //------------------------------------------------------------
+    // Foam sim — vorticity → foam extraction (writes texFoam)
+    Pass P19 {
+        ZEnable = false;
+        ZWriteEnable = false;
+        StencilEnable = false;
+        CullMode = none;
+        AlphaBlendEnable = false;
+        AlphaTestEnable = false;
+
+        VertexShader = compile vs_3_0 WaveVS();
+        PixelShader = compile ps_3_0 FoamExtractPS();
+    }
+    //------------------------------------------------------------
+    // Foam sim — advect the detail UV offset field through the velocity (River Editor technique)
+    Pass P20 {
+        ZEnable = false;
+        ZWriteEnable = false;
+        StencilEnable = false;
+        CullMode = none;
+        AlphaBlendEnable = false;
+        AlphaTestEnable = false;
+
+        VertexShader = compile vs_3_0 WaveVS();
+        PixelShader = compile ps_3_0 FoamUVPS();
+    }
+#endif
 }

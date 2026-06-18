@@ -46,6 +46,17 @@ shared float flowSeaSpeed;           // base wave animation rate scale (1 = stoc
 shared float flowCycleUV;            // bounded per-cycle UV displacement (Valve flow map; live tuning)
 shared float flowSeaRefract;         // sea far-wave (refraction) strength multiplier (live tuning)
 shared float flowDebugView;          // CLASSIFY view: 1 = paint water flat by category colour
+shared float flowMapWarp;            // domain-warp amount (world u) to break the 512u texel grid
+// Domain warp: jitter world XY before mapping to flow UV, so the axis-aligned 512u texel grid
+// reads as organic wiggles instead of hard squares. Self-contained 2-octave sin (the foam fbm
+// lives under WATER_FOAM and isn't always available in this block).
+float2 flowWarpUV(float2 worldXY) {
+    float2 p = worldXY * (1.0 / 512.0);   // ~one wiggle per flow cell
+    float2 j = float2(sin(p.x * 6.28 + p.y * 3.1) + 0.5 * sin(p.x * 13.1 - p.y * 7.7),
+                      sin(p.y * 6.28 - p.x * 2.7) + 0.5 * sin(p.y * 12.3 + p.x * 5.9));
+    worldXY += j * flowMapWarp;
+    return (worldXY - flowMapTransform.xy) * flowMapTransform.zw;
+}
 #endif
 
 #ifdef WATER_LOD_MESH
@@ -54,6 +65,58 @@ shared float waveAmp;       // crest amplitude (world units)
 shared float waveLen;       // base wavelength along the flow (world units)
 shared float waveSpeed;     // crest travel speed scale
 shared float crestSpread;   // directional fan: small = longer, straighter crest lines
+#endif
+
+#ifdef WATER_FOAM
+// World-anchored hybrid Voronoi particle foam (see XE Mod Foam.fx for the sim). Single
+// low-res CARRIER: the sim writes foam intensity into texFoam0 over a player-tracking
+// window whose world min-corner is foamOrigin0; the water shader samples it by world XY
+// and the procedural detail below supplies the up-close crispness. foamOrigin is the sim's
+// TRANSIENT origin (declared here, included before XE Mod Foam.fx, set for the sim passes —
+// NOT used by the consume).
+shared float2  foamOrigin;          // transient window origin used by the sim passes
+shared float   foamWeight;          // runtime A/B: 1 = foam on, 0 = off (legacy)
+shared texture texFoam0;            // the carrier buffer
+shared float2  foamOrigin0;         // carrier window world min-corner (world XY)
+static const float foamTexWorldSize0 = 512.0 * 25.0;    // carrier window (= 12800u; foamTexResolution * foamCascadeWorldRes[0])
+sampler sampFoam0 = sampler_state { texture = <texFoam0>; minfilter = linear; magfilter = linear; mipfilter = none; bordercolor = 0; addressu = border; addressv = border; };
+// Advected detail-UV offset field (River Editor; same window as texFoam0). xy = world-unit offset.
+shared texture texFoamUV;
+sampler sampFoamUVc = sampler_state { texture = <texFoamUV>; minfilter = linear; magfilter = linear; mipfilter = none; addressu = clamp; addressv = clamp; };
+
+// Two-layer foam (Phase 2). Both layers share one erosion + ridged-fbm so far and near read
+// as the same streaky material. foamDetail = (worldUnitsPerCell, advectRate, erodeThreshold, –).
+// FAR  : flow-map-driven (river/beach routing × flow-advected ridged fbm), all distance.
+// NEAR : the sim carrier (texFoam0, warped by texFoamUV) ADDS choke-point detail in its window.
+shared float4 foamDetail;
+shared float  foamFarAmount;        // far flow-map foam layer strength (0 = near-only)
+shared float  foamVortGain;         // static vorticity (curl) concentration for the far foam (VortGain)
+shared float  foamFineScale;        // multi-scale erosion: how much finer the perforating octave is (FineScale)
+shared float  foamFineAmt;          // multi-scale erosion: fine-perforation strength (FineAmt; 0 = single-scale)
+shared float  foamCoarseScale;      // multi-scale erosion: how much COARSER the clumping octave is (CoarseScale)
+shared float  foamCoarseAmt;        // multi-scale erosion: coarse-clumping strength (CoarseAmt; 0 = off)
+float foamHash(float2 p)   { p = frac(p * float2(127.1, 311.7)); p += dot(p, p + 34.23); return frac(p.x * p.y); }
+float foamVnoise(float2 p) {
+    float2 i = floor(p), f = frac(p);
+    float2 u = f * f * (3.0 - 2.0 * f);
+    float a = foamHash(i), b = foamHash(i + float2(1, 0)), c = foamHash(i + float2(0, 1)), d = foamHash(i + float2(1, 1));
+    return lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y);
+}
+float foamFbm(float2 p) { return 0.6 * foamVnoise(p) + 0.4 * foamVnoise(p * 2.13 + 19.7); }
+// Ridged 4-octave fbm: v = 1 - |2*vnoise-1| folds the rounded value noise into sharp filament
+// ridges; non-integer lacunarity (2.07) breaks axis-aligned tiling, gain 0.5. Sum of octave
+// weights ~0.94, so the result spans ~[0,0.94] (used as 0.5 + foamFbm2 in the erosion below).
+float foamFbm2(float2 p) {
+    float v = 0.0, a = 0.5, f = 1.0;
+    for (int i = 0; i < 4; ++i) {
+        float r = 1.0 - abs(2.0 * foamVnoise(p * f) - 1.0);
+        v += a * r;
+        f *= 2.07; a *= 0.5;
+    }
+    return v;
+}
+// Shared erosion sharpness (consume-side const, not knobbed — foamDetail slots stay for live tuning).
+static const float foamErodeSharp = 3.0;
 #endif
 
 static const float waveTexResolution = 512;
@@ -70,7 +133,7 @@ float3 getFinalWaterNormal(float2 texcoord1, float2 texcoord2, float dist, float
 
 #ifdef WATER_FLOW_MAP
     // Sample the per-body flow field at this world position.
-    float4 flow = tex2Dlod(sampFlow, float4((vertXY - flowMapTransform.xy) * flowMapTransform.zw, 0, 0));
+    float4 flow = tex2Dlod(sampFlow, float4(flowWarpUV(vertXY), 0, 0));
     float2 flowDir = flow.rg * 2 - 1;
     // B is the wave-amplitude mask (decoded *3). Saturate it for normal strength so the
     // 3x open-sea amplitude doesn't over-steepen normals: pond 0 (calm), river ~0.5,
@@ -112,7 +175,8 @@ float3 getFinalWaterNormal(float2 texcoord1, float2 texcoord2, float dist, float
 #endif
 
 #ifdef DYNAMIC_RIPPLES
-    // Blend normals from rain and player ripples
+    // Blend normals from rain and player ripples (static taps — the hybrid foam sim is
+    // the vehicle for flow-driven player/rain disturbance; the ripple wake stays master).
     close_normal.rg += tex2Dlod(sampRain, float4(texcoord2, 0, 0)).ba;
     close_normal.rg += tex2Dlod(sampWave, float4((vertXY - rippleOrigin) / waveTexWorldSize, 0, 0)).ba;
 #endif
@@ -411,14 +475,116 @@ float4 WaterPS(in WaterVertOut IN): COLOR0
 
     // Note that both refraction and reflection textures have fog applied already
 
+    float3 dbgShader = 0;   // debug: in-shader foam quantity captured for the SH_* overlay views
+
+#ifdef WATER_FOAM
+    // World-anchored hybrid particle foam (sim in XE Mod Foam.fx). Sample the low-res carrier
+    // by world XY over its player-tracking window; the border (0) outside the window yields no
+    // foam, and foamWeight 0 (A/B off) → legacy water untouched.
+    {
+        float2 fuv0 = (IN.pos.xy - foamOrigin0) / foamTexWorldSize0;
+        // Near-layer window edge fade: fade to 0 over the outer ~12% so the hard carrier
+        // window boundary is not visible; the far layer carries on past it seamlessly.
+        float2 ef0v = saturate(min(fuv0, 1.0 - fuv0) / 0.12);
+
+        // --- FAR: flow-map-driven, all distance (extends as far as the flow map has data) ---
+        // Routing mask uses flow.a (river/beach NEAR group), NOT flow.b — B is 1/3 in dry water
+        // and would foam open sea. Advect a ridged fbm along the flow direction, then erode to
+        // crisp streaks. No sim dependency, so this reaches the full flow-map extent.
+        float4 fl    = tex2Dlod(sampFlow, float4(flowWarpUV(IN.pos.xy), 0, 0));
+        float2 fdir  = fl.rg * 2 - 1;
+        float  rmask = saturate((0.5 - fl.a) * 2) * flowMapWeight;     // river/beach routing
+        // Static vorticity = curl of the baked flow direction (d(dirY)/dx - d(dirX)/dy). High at
+        // bends / confluences / shear lines — where real foam gathers. 4 unwarped neighbour taps
+        // (~one 512u cell apart); |curl| × VortGain concentrates the scrolling foam there. The
+        // *0.5+0.5 encoding scale folds into the gain. VortGain 0 = today's uniform-river far foam.
+        float2 ftO   = flowMapTransform.xy;
+        float2 ftS   = flowMapTransform.zw;
+        float  gR    = tex2Dlod(sampFlow, float4((IN.pos.xy + float2(512, 0) - ftO) * ftS, 0, 0)).g;
+        float  gL    = tex2Dlod(sampFlow, float4((IN.pos.xy - float2(512, 0) - ftO) * ftS, 0, 0)).g;
+        float  rU    = tex2Dlod(sampFlow, float4((IN.pos.xy + float2(0, 512) - ftO) * ftS, 0, 0)).r;
+        float  rD    = tex2Dlod(sampFlow, float4((IN.pos.xy - float2(0, 512) - ftO) * ftS, 0, 0)).r;
+        float  vort  = abs((gR - gL) - (rU - rD)) * foamVortGain;
+        float  farCover = rmask * (1.0 + vort);                        // concentrate at turbulent spots
+        // Valve flow-map ping-pong (mirrors getFinalWaterNormal L134+): bound the advection to one
+        // cycle and crossfade two half-phase samples so it never shears into vortexes. DECOUPLED from
+        // the normals' CycleUV (which the user keeps large for the normals → huge slow morph that hid
+        // FoamSpeed). Fixed modest 512-world-u cycle → short period, smooth crossfade, and FoamSpeed
+        // is now a clean, responsive scroll-speed control. World velocity = 512 * foamDetail.y.
+        float2 fP    = IN.pos.xy / foamDetail.x;
+        float  fcyc  = 512.0 / foamDetail.x;                     // fixed displacement per cycle (fbm-tile units)
+        float  frate = foamDetail.y;                             // cycles/time → world velocity = 512 * FoamSpeed
+        float  fph0  = frac(time * frate);
+        float  fph1  = frac(time * frate + 0.5);
+        float  fbl   = abs(1.0 - 2.0 * fph0);
+        float2 fdisp = fdir * fcyc;
+        float  nf    = lerp(foamFbm2(fP - fdisp * fph0), foamFbm2(fP - fdisp * fph1), fbl);
+        // Multi-scale erosion, COARSE octave: a lower-frequency advected octave clumps the coverage
+        // into patches so big uniform stretches break into foam clusters (real foam gathers, it isn't
+        // a flat sheet). foamCoarseScale = how much coarser than the base; foamCoarseAmt = clump strength.
+        float2 fPc   = fP / foamCoarseScale;                          // coarser (bigger clumps)
+        float2 fdc   = fdisp / foamCoarseScale;                       // same world scroll velocity
+        float  ncrs  = lerp(foamFbm2(fPc - fdc * fph0), foamFbm2(fPc - fdc * fph1), fbl);
+        farCover    *= lerp(1.0, saturate(0.4 + ncrs), foamCoarseAmt);  // clump into patches
+        // Multi-scale erosion, FINE octave: a finer advected octave perforates the foam edge into lacy /
+        // bubbly detail (real foam has structure at several scales). foamFineScale = how much finer than
+        // the base; foamFineAmt = how hard it carves (0 = single-scale, today's streaky look).
+        float2 fPf   = fP * foamFineScale;
+        float2 fdf   = fdisp * foamFineScale;                          // same world scroll velocity
+        float  nfine = lerp(foamFbm2(fPf - fdf * fph0), foamFbm2(fPf - fdf * fph1), fbl);
+        float  farFoam = saturate((farCover * (0.5 + nf) - foamDetail.z) * foamErodeSharp);
+        farFoam *= lerp(1.0, saturate(0.5 + nfine), foamFineAmt);      // fine perforation
+        farFoam *= foamFarAmount;
+
+        // --- NEAR: sim carrier adds dynamic, FLOWING choke-point detail within its window. It uses
+        // the SAME ping-pong advection as the far layer (so it flows/matches instead of just being
+        // stretched by the static sim warp), PLUS the sim's UV warp (off) for sim-driven structure. ---
+        float  simD   = tex2Dlod(sampFoam0, float4(fuv0, 0, 0)).r;
+        float  window = foamWeight * ef0v.x * ef0v.y;                  // carrier window fade (0 when foam A/B off)
+        float  cover  = simD * window;
+        float2 off    = tex2Dlod(sampFoamUVc, float4(fuv0, 0, 0)).xy;  // sim flow perturbation (warp)
+        float2 nP     = (IN.pos.xy + off) / foamDetail.x;
+        float  nn     = lerp(foamFbm2(nP - fdisp * fph0), foamFbm2(nP - fdisp * fph1), fbl);  // SAME ping-pong as far
+        float  nearFoam = saturate((cover * (0.5 + nn) - foamDetail.z) * foamErodeSharp);
+
+        // Mixing: the sim MODULATES the far foam up and down (more where foam piles, less where it
+        // clears) instead of a plain max(). foamDetail.w (FoamMix) scales how strongly it overrides
+        // the far baseline; faded by the window so the far layer carries on seamlessly past the carrier.
+        float  foam  = lerp(farFoam, nearFoam, saturate(foamDetail.w * window));
+
+        // Debug: capture an in-pipeline quantity for the SH_* overlay views (8..11). The foam is
+        // still composited below, so the effect stays live (only the final overlay swaps it in).
+        if (flowDebugView > 7.5)
+        {
+            if (flowDebugView < 8.5)       dbgShader = rmask.xxx;                 // 8  SH RMASK
+            else if (flowDebugView < 9.5)  dbgShader = float3(fdir * 0.5 + 0.5, 0.5); // 9  SH FDIR
+            else if (flowDebugView < 10.5) dbgShader = saturate(nf).xxx;          // 10 SH FBM
+            else                           dbgShader = saturate(farFoam).xxx;     // 11 SH FARFOAM
+        }
+
+        float  shoreMask = saturate(1.0 - depth / 800.0);   // gather toward shallows/shore
+        float3 foamCol = sunColAdjusted + 0.25;
+        result = lerp(result, foamCol, saturate(foam * (0.4 + 0.6 * shoreMask)) * fog.a);
+    }
+#endif
+
 #ifdef WATER_FLOW_MAP
-    // CLASSIFY debug view: overlay the baked category colour (green=river, red=pond,
-    // yellow=beach, blue=sea) so the flood-fill classification can be validated directly.
+    // Water-flow debug overlays (id in flowDebugView):
+    //   2..7  BAKED source views — show the re-baked texture RGB (CLASSIFY / DIRECTION / STRENGTH /
+    //         INTENSITY / DIST RAW / DIST SMOOTH). The bake encodes the value; effect is off.
+    //   8..11 SHADER views — dbgShader captured above from the live foam pipeline; foam stays on.
     if (flowDebugView > 0.5)
     {
-        float3 cat = tex2Dlod(sampFlow, float4((IN.pos.xy - flowMapTransform.xy) * flowMapTransform.zw, 0, 0)).rgb;
-        float m = step(0.01, dot(cat, 1));   // only tint where a category was baked
-        result = lerp(result, cat, 0.8 * m);
+        if (flowDebugView < 7.5)
+        {
+            float3 t = tex2Dlod(sampFlow, float4(flowWarpUV(IN.pos.xy), 0, 0)).rgb;
+            float m = step(0.01, dot(t, 1));   // only tint where a value was baked
+            result = lerp(result, t, 0.8 * m);
+        }
+        else
+        {
+            result = lerp(result, dbgShader, 0.85);
+        }
     }
 #endif
 

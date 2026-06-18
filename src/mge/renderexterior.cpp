@@ -11,6 +11,7 @@
 #include "statusoverlay.h"
 #include "terrain_horizon_occluder.h"
 #include "mge_tracy.h"
+#include "imgui.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1079,13 +1080,19 @@ static std::atomic<int> g_flowDebugBake{0};  // 0 flow, 1 CLASSIFY colours, 2 DI
 // water (land close on every side); the sea is wide; the beach is the narrow fringe of the
 // sea. RiverWidth = how many cells from shore still counts as "narrow"; BeachReach = how many
 // cells out from open (wide) water stays beach before becoming sea.
-static float g_flowRiverWidth   = 2.0f;    // max cells-to-nearest-land for water to be a river
+static float g_flowRiverWidth   = 3.5f;    // max cells-to-nearest-land for water to be a river
 static float g_flowBeachReach   = 10.0f;   // cells from open water that remain beach (else sea)
 static float g_flowBeachExtend  = 30.0f;   // cells to grow beach OUTWARD into open sea (SEA→BEACH only)
 static float g_flowBeachMul     = 0.5f;    // beach wave intensity
 static float g_flowRiverInten   = 0.7f;    // river/inlet base wave intensity
 static float g_flowDirRadius    = 40.0f;   // box-blur radius (cells) for the macro coastline normal
 static float g_flowDirIters     = 3.0f;    // box-blur iterations (≈Gaussian) for beach direction
+// River foam de-block: SAME separable box blur as the beach direction above, run on a binary
+// river mask so the 512u square category source becomes a smooth continuous strength ramp.
+static float g_flowRiverBlurRadius = 1.0f; // box-blur radius (cells) for the river foam ramp
+static float g_flowRiverBlurIters  = 1.0f; // box-blur iterations (≈Gaussian) for the river ramp
+static float g_flowRiverGain       = 4.0f; // post-blur gain: pushes narrow-river cores back to full
+static float g_flowDilate          = 3.0f; // expand baked field this many cells past the shore (FlowExpand)
 
 void DistantLand::updateMSOCCutoffInput() {
     // In-world overlays are compacted onto one cycling key (numpad +). One press
@@ -1132,37 +1139,81 @@ void DistantLand::updateMSOCCutoffInput() {
     // (green=river, red=pond, yellow=beach, blue=sea); DIRECTION → flow-angle hue wheel (rivers
     // downstream, beaches onshore). Each mode re-bakes the map into the matching encoding.
     if ((GetAsyncKeyState(VK_NUMPAD9) & 0x0001) && Configuration.UseWaterFlowMap) {
-        static int mode = 1;   // 0 OFF, 1 FLOW (default), 2 CLASSIFY, 3 DIRECTION
-        mode = (mode + 1) % 4;
-        waterFlowDebugOn  = (mode == 1);
-        waterFlowClassify = (mode == 2);
-        waterFlowDirView  = (mode == 3);
-        g_flowDebugBake.store(mode == 2 ? 1 : (mode == 3 ? 2 : 0), std::memory_order_release);
+        // Cycle of water-flow debug views. Two tiers:
+        //   BAKED source views (2..7): the flow texture is re-baked into a debug encoding, so the
+        //     flow/foam effect is OFF (the texture no longer holds real flow) — inspect the data.
+        //   SHADER views (8..11): NORMAL bake + effect ON, the shader overlays an in-pipeline value
+        //     (filtered rmask/fdir, the fbm, the eroded far foam) at its last line — foam KEPT live.
+        static const int NMODES = 12;
+        static int mode = 1;
+        mode = (mode + 1) % NMODES;
+        // per-mode: bake encoding id (0 = normal flow), effect (flow weight) on?
+        static const int  bakeId[NMODES]  = { 0, 0, 1, 2, 3, 4, 5, 6, 0, 0, 0, 0 };
+        static const bool effectOn[NMODES] = { false, true, false, false, false, false, false, false,
+                                               true, true, true, true };
+        waterFlowDebugOn  = effectOn[mode];
+        waterFlowDebugView = (mode >= 2) ? mode : 0;            // shader overlay id (0 = none)
+        g_flowDebugBake.store(bakeId[mode], std::memory_order_release);
         g_flowRebake.store(true, std::memory_order_release);   // re-bake into the new encoding
-        static const char* const nm[4] = {
-            "Water flow: OFF (neutral)", "Water flow: FLOW",
+        static const char* const nm[NMODES] = {
+            "Water flow: OFF (neutral)",
+            "Water flow: FLOW",
             "Water flow: CLASSIFY (grn river / red pond / yel beach / blu sea)",
-            "Water flow: DIRECTION (hue = flow angle; rivers downstream, beaches onshore)" };
+            "Water flow: DIRECTION (hue = flow angle)  [baked, effect off]",
+            "Water flow: STRENGTH (near river/beach routing, white=full)  [baked, effect off]",
+            "Water flow: INTENSITY (wave amplitude)  [baked, effect off]",
+            "Water flow: DIST RAW (banded dist-to-sea; jagged bands = quantized)  [baked, effect off]",
+            "Water flow: DIST SMOOTH (banded blurred dist; smooth bands = de-blocked)  [baked, effect off]",
+            "Water flow: SH RMASK (shader filtered river/beach strength)  [effect ON]",
+            "Water flow: SH FDIR (shader filtered flow direction; R=x G=y)  [effect ON]",
+            "Water flow: SH FBM (ridged foam noise)  [effect ON]",
+            "Water flow: SH FARFOAM (final eroded far foam)  [effect ON]" };
         StatusOverlay::setStatus(nm[mode]);
+    }
+    // Numpad2: A/B toggle the world-anchored particle foam (sim + render). OFF leaves
+    // the water identical to the no-foam look (the sim is also skipped, saving its cost).
+    // Foam is always on (gated only by UseWaterFlowMap). NUMPAD2 now toggles the foam
+    // debug panels (raw particle/field buffers blitted to the screen corner) instead of
+    // the old A/B foam toggle, which was a confusion point during sim bring-up.
+    if ((GetAsyncKeyState(VK_NUMPAD2) & 0x0001) && Configuration.UseWaterFlowMap) {
+        foamDebugView = !foamDebugView;
+        StatusOverlay::setStatus(foamDebugView
+            ? "Foam debug panels: ON (particles | field)"
+            : "Foam debug panels: OFF");
     }
     // Flow-map knob tuning. NUMPAD8 cycles which knob is selected; NUMPAD6/NUMPAD3
     // increase/decrease it. "Scroll" is a live shader uniform (instant). The other
     // four are baked into the flow map, so adjusting them sets g_flowRebake and the
     // cull worker re-bakes on the next water view.
     if (Configuration.UseWaterFlowMap) {
-        static int knob = 0;  // 0 RiverSpeed 1 SeaSpeed 2 RiverWidth 3 RiverInten 4 BeachMul 5 BeachReach 6 BeachExtend 7 DirRadius 8 DirIters 9 CycleUV 10 SeaRefract 11 WaveAmp 12 WaveLen 13 WaveSpeed 14 CrestSpread
-        static const char* const knobName[15] = {
+        static int knob = 0;  // 0 RiverSpeed 1 SeaSpeed 2 RiverWidth 3 RiverInten 4 BeachMul 5 BeachReach 6 BeachExtend 7 DirRadius 8 DirIters 9 CycleUV 10 SeaRefract 11 WaveAmp 12 WaveLen 13 WaveSpeed 14 CrestSpread 15 FoamForce 16 FoamDecay 17 FoamPress 18 FoamScale 19 DetTile 20 FoamSpeed 21 ErodeThr 22 FarAmt 23 RiverBlurR 24 RiverBlurIt 25 RiverGain 26 FlowWarp 27 FlowExpand 28 FoamMix 29 FoamGauss 30 FoamDens 31 FoamUVDcy 32 SimSpeed 33 VortGain 34 FineScale 35 FineAmt 36 CoarseScale 37 CoarseAmt
+        static const char* const knobName[38] = {
             "RiverSpeed", "SeaSpeed", "RiverWidth", "RiverInten", "BeachMul", "BeachReach", "BeachExtend",
-            "DirRadius", "DirIters", "CycleUV", "SeaRefract", "WaveAmp", "WaveLen", "WaveSpeed", "CrestSpread" };
+            "DirRadius", "DirIters", "CycleUV", "SeaRefract", "WaveAmp", "WaveLen", "WaveSpeed", "CrestSpread",
+            "FoamForce", "FoamDecay", "FoamPress", "FoamScale",         // carrier sim tuning
+            "DetTile", "FoamSpeed", "ErodeThr", "FarAmt",             // two-layer foam (FoamSpeed = far advect ×river flow)
+            "RiverBlurR", "RiverBlurIt", "RiverGain",                // baked river-foam box blur (mirrors DirRadius/DirIters)
+            "FlowWarp", "FlowExpand",                                // FlowWarp = shader grid-break; FlowExpand = bake shore dilation
+            "FoamMix",                                               // near/sim → far modulation (0 far only, 1 sim drives)
+            "FoamGauss", "FoamDens", "FoamUVDcy",                    // XE Mod Foam sim: blob size, particle density, UV-stretch decay
+            "SimSpeed", "VortGain",                                  // SimSpeed = sim advance; VortGain = static curl concentration (far)
+            "FineScale", "FineAmt",                                  // multi-scale foam erosion (perforating octave)
+            "CoarseScale", "CoarseAmt" };                            // multi-scale foam erosion (clumping octave)
         const bool inc    = (GetAsyncKeyState(VK_NUMPAD6) & 0x0001) != 0;
         const bool dec    = (GetAsyncKeyState(VK_NUMPAD3) & 0x0001) != 0;
         const bool cycle  = (GetAsyncKeyState(VK_NUMPAD8) & 0x0001) != 0;
+        const bool fineTgl= (GetAsyncKeyState(VK_MULTIPLY) & 0x0001) != 0;   // numpad * = fine-tune toggle
+        static bool fine = false;
+        if (fineTgl) fine = !fine;
         if (cycle) {
-            knob = (knob + 1) % 15;
+            knob = (knob + 1) % 38;
+            fine = false;                               // each new knob starts at the coarse step
         }
         if (inc || dec) {
-            const float s = inc ? 1.0f : -1.0f;
-            const float m = inc ? 1.5f : 1.0f / 1.5f;   // multiplicative step
+            const float fineK = fine ? 0.25f : 1.0f;            // additive steps → quarter in fine mode
+            const float s = (inc ? 1.0f : -1.0f) * fineK;
+            const float mB = fine ? 1.12f : 1.5f;              // gentler multiplicative step in fine mode
+            const float m = inc ? mB : 1.0f / mB;
             bool rebake = true;
             switch (knob) {
             case 0:  // RiverSpeed: directional advection rate, live (no rebake)
@@ -1204,18 +1255,113 @@ void DistantLand::updateMSOCCutoffInput() {
                 waterCrestSpread = std::max(0.0f, std::min(1.0f, waterCrestSpread + s * 0.05f));
                 rebake = false;
                 break;
+            case 15: // FoamForce: carrier river advection force, live (no rebake)
+                foamFlowForce[0] = std::max(0.0f, std::min(8.0f, foamFlowForce[0] + s * 0.25f));
+                rebake = false;
+                break;
+            case 16: // FoamDecay: carrier velocity decay toward the flow current, live
+                foamDecay[0] = std::max(0.5f, std::min(0.99f, foamDecay[0] + s * 0.01f));
+                rebake = false;
+                break;
+            case 17: // FoamPress: carrier density pile-up coefficient (narrows), live
+                foamPressure[0] = std::max(0.0f, std::min(2.0f, foamPressure[0] + s * 0.05f));
+                rebake = false;
+                break;
+            case 18: // FoamScale: carrier vorticity → foam intensity scale, live
+                foamScale[0] = std::max(0.0f, std::min(400.0f, foamScale[0] * m));
+                rebake = false;
+                break;
+            case 19: // DetTile: indirection fbm cell size (world units, smaller = crisper), live
+                foamDetailTile = std::max(16.0f, std::min(4096.0f, foamDetailTile * m));
+                rebake = false;
+                break;
+            case 20: // FoamSpeed: foam detail scroll speed as a multiplier on river flow (1 = match), live
+                foamDetailSpeed = std::max(0.0f, std::min(8.0f, foamDetailSpeed + s * 0.1f));
+                rebake = false;
+                break;
+            case 21: // ErodeThr: shared erosion cut (higher = tighter foam streaks), live
+                foamErodeThreshold = std::max(0.0f, std::min(1.0f, foamErodeThreshold + s * 0.02f));
+                rebake = false;
+                break;
+            case 22: // FarAmt: far flow-map layer strength (0 = near-only), live
+                foamFarAmount = std::max(0.0f, std::min(2.0f, foamFarAmount + s * 0.1f));
+                rebake = false;
+                break;
+            case 23: // RiverBlurR: river-foam box-blur radius (cells), mirrors DirRadius → rebake
+                g_flowRiverBlurRadius = std::max(1.0f, std::min(64.0f, g_flowRiverBlurRadius + s * 2.0f));
+                break;
+            case 24: // RiverBlurIt: river-foam box-blur iterations, mirrors DirIters → rebake
+                g_flowRiverBlurIters  = std::max(1.0f, std::min(8.0f, g_flowRiverBlurIters + s * 1.0f));
+                break;
+            case 25: // RiverGain: post-blur gain (narrow-river core strength) → rebake
+                g_flowRiverGain       = std::max(0.5f, std::min(16.0f, g_flowRiverGain + s * 0.5f));
+                break;
+            case 26: // FlowWarp: shader domain-warp amount (world u), live (no rebake)
+                waterFlowWarp = std::max(0.0f, std::min(1024.0f, waterFlowWarp + s * 64.0f));
+                rebake = false;
+                break;
+            case 27: // FlowExpand: dilate baked field past the shore (cells) → rebake
+                g_flowDilate = std::max(0.0f, std::min(16.0f, g_flowDilate + s * 1.0f));
+                break;
+            case 28: // FoamMix: near/sim → far modulation strength, live (no rebake)
+                foamMix = std::max(0.0f, std::min(1.0f, foamMix + s * 0.1f));
+                rebake = false;
+                break;
+            case 29: // FoamGauss: sim particle splat radius → foam blob size, live
+                foamGaussRadius = std::max(0.5f, std::min(8.0f, foamGaussRadius + s * 0.5f));
+                rebake = false;
+                break;
+            case 30: // FoamDens: sim particle respawn density, live
+                foamMinDensity = std::max(0.2f, std::min(3.0f, foamMinDensity + s * 0.1f));
+                rebake = false;
+                break;
+            case 31: // FoamUVDcy: sim UV-offset decay (bounds detail stretch), live
+                foamUVDecay = std::max(0.5f, std::min(0.999f, foamUVDecay + s * 0.01f));
+                rebake = false;
+                break;
+            case 32: // SimSpeed: sim particle advance rate (slow near foam to match far), live
+                foamSimSpeed = std::max(0.05f, std::min(2.0f, foamSimSpeed + s * 0.1f));
+                rebake = false;
+                break;
+            case 33: // VortGain: static vorticity (curl) concentration for the far foam, live
+                foamVortGain = std::max(0.0f, std::min(64.0f, foamVortGain + s * 1.0f));
+                rebake = false;
+                break;
+            case 34: // FineScale: multi-scale erosion perforating-octave ratio, live
+                foamFineScale = std::max(1.5f, std::min(16.0f, foamFineScale + s * 0.5f));
+                rebake = false;
+                break;
+            case 35: // FineAmt: multi-scale fine-perforation strength, live
+                foamFineAmt = std::max(0.0f, std::min(1.0f, foamFineAmt + s * 0.1f));
+                rebake = false;
+                break;
+            case 36: // CoarseScale: multi-scale erosion clumping-octave ratio, live
+                foamCoarseScale = std::max(1.5f, std::min(16.0f, foamCoarseScale + s * 0.5f));
+                rebake = false;
+                break;
+            case 37: // CoarseAmt: multi-scale coarse-clumping strength, live
+                foamCoarseAmt = std::max(0.0f, std::min(1.0f, foamCoarseAmt + s * 0.1f));
+                rebake = false;
+                break;
             }
             if (rebake) g_flowRebake.store(true, std::memory_order_release);
         }
-        // Report the current selection/value whenever a tuning key is pressed.
-        if (cycle || inc || dec) {
-            const float val[15] = { waterFlowScroll, waterFlowSeaSpeed, g_flowRiverWidth,
+        // Report the current selection/value whenever a tuning key is pressed (incl. the * fine toggle).
+        if (cycle || inc || dec || fineTgl) {
+            const float val[38] = { waterFlowScroll, waterFlowSeaSpeed, g_flowRiverWidth,
                                    g_flowRiverInten, g_flowBeachMul, g_flowBeachReach, g_flowBeachExtend,
                                    g_flowDirRadius, g_flowDirIters, waterFlowCycleUV, waterFlowSeaRefract,
-                                   waterWaveAmp, waterWaveLen, waterWaveSpeed, waterCrestSpread };
-            char msg[96];
-            std::snprintf(msg, sizeof(msg), "Flow [8] %s = %.3f  (6 +/ 3 -)",
-                          knobName[knob], val[knob]);
+                                   waterWaveAmp, waterWaveLen, waterWaveSpeed, waterCrestSpread,
+                                   foamFlowForce[0], foamDecay[0], foamPressure[0], foamScale[0],
+                                   foamDetailTile, foamDetailSpeed, foamErodeThreshold, foamFarAmount,
+                                   g_flowRiverBlurRadius, g_flowRiverBlurIters, g_flowRiverGain,
+                                   waterFlowWarp, g_flowDilate, foamMix,
+                                   foamGaussRadius, foamMinDensity, foamUVDecay, foamSimSpeed, foamVortGain,
+                                   foamFineScale, foamFineAmt,
+                                   foamCoarseScale, foamCoarseAmt };
+            char msg[112];
+            std::snprintf(msg, sizeof(msg), "Flow [8] %s = %.3f  (6 +/ 3 -)  [* %s]",
+                          knobName[knob], val[knob], fine ? "FINE" : "coarse");
             StatusOverlay::setStatus(msg);
         }
     }
@@ -1223,6 +1369,84 @@ void DistantLand::updateMSOCCutoffInput() {
     // (NUMPAD0), basin barrier grid (NUMPAD / and *). Those values are settled;
     // g_msocCutoffHeight / g_basinLockEye / g_basinGrid keep their defaults.
     // NUMPAD8 is now the flow-map knob cycle above.)
+}
+
+// ImGui Water Flow / Foam panel (F10). Defined here — not in imgui_water.cpp — so it can reach
+// every setting: DistantLand:: public statics AND the file-static g_flow* bake knobs + rebake.
+// Baked sliders re-bake once on release (IsItemDeactivatedAfterEdit), like the NUMPAD8 knobs.
+void DrawFlowFoamPanel() {
+    ImGui::SetNextWindowSize(ImVec2(370, 0), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Water Flow / Foam")) { ImGui::End(); return; }
+
+    auto baked = [](const char* label, float* v, float lo, float hi, const char* fmt) {
+        ImGui::SliderFloat(label, v, lo, hi, fmt);
+        if (ImGui::IsItemDeactivatedAfterEdit())
+            g_flowRebake.store(true, std::memory_order_release);
+    };
+
+    if (ImGui::CollapsingHeader("Classify  (rebake)", ImGuiTreeNodeFlags_DefaultOpen)) {
+        baked("RiverWidth",  &g_flowRiverWidth,  0.5f, 16.0f, "%.1f");
+        baked("RiverInten",  &g_flowRiverInten,  0.0f, 3.0f,  "%.2f");
+        baked("BeachMul",    &g_flowBeachMul,    0.0f, 1.0f,  "%.2f");
+        baked("BeachReach",  &g_flowBeachReach,  0.0f, 16.0f, "%.1f");
+        baked("BeachExtend", &g_flowBeachExtend, 0.0f, 32.0f, "%.1f");
+        baked("DirRadius",   &g_flowDirRadius,   1.0f, 64.0f, "%.0f");
+        baked("DirIters",    &g_flowDirIters,    1.0f, 8.0f,  "%.0f");
+        baked("FlowExpand",  &g_flowDilate,      0.0f, 16.0f, "%.0f");
+        baked("RiverBlurR",  &g_flowRiverBlurRadius, 1.0f, 64.0f, "%.0f");
+        baked("RiverBlurIt", &g_flowRiverBlurIters,  1.0f, 8.0f,  "%.0f");
+        baked("RiverGain",   &g_flowRiverGain,   0.5f, 16.0f, "%.2f");
+        if (ImGui::Button("Rebake now"))
+            g_flowRebake.store(true, std::memory_order_release);
+    }
+    if (ImGui::CollapsingHeader("Animation  (live)", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::SliderFloat("RiverSpeed",  &DistantLand::waterFlowScroll,    0.001f, 1.0f, "%.3f");
+        ImGui::SliderFloat("SeaSpeed",    &DistantLand::waterFlowSeaSpeed,  0.05f, 8.0f, "%.2f");
+        ImGui::SliderFloat("CycleUV",     &DistantLand::waterFlowCycleUV,   0.02f, 4.0f, "%.2f");
+        ImGui::SliderFloat("SeaRefract",  &DistantLand::waterFlowSeaRefract,0.0f, 4.0f, "%.2f");
+        ImGui::SliderFloat("WaveAmp",     &DistantLand::waterWaveAmp,       0.0f, 64.0f, "%.1f");
+        ImGui::SliderFloat("WaveLen",     &DistantLand::waterWaveLen,       64.0f, 4096.0f, "%.0f");
+        ImGui::SliderFloat("WaveSpeed",   &DistantLand::waterWaveSpeed,     0.05f, 8.0f, "%.2f");
+        ImGui::SliderFloat("CrestSpread", &DistantLand::waterCrestSpread,   0.0f, 1.0f, "%.2f");
+    }
+    if (ImGui::CollapsingHeader("Far foam  (live)", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::SliderFloat("DetTile",   &DistantLand::foamDetailTile,     16.0f, 4096.0f, "%.0f");
+        ImGui::SliderFloat("FoamSpeed", &DistantLand::foamDetailSpeed,    0.0f, 8.0f, "%.2f");
+        ImGui::SliderFloat("ErodeThr",  &DistantLand::foamErodeThreshold, 0.0f, 1.0f, "%.3f");
+        ImGui::SliderFloat("FarAmt",    &DistantLand::foamFarAmount,      0.0f, 2.0f, "%.2f");
+        ImGui::SliderFloat("FoamMix",   &DistantLand::foamMix,            0.0f, 1.0f, "%.2f");
+        ImGui::SliderFloat("VortGain",  &DistantLand::foamVortGain,       0.0f, 64.0f, "%.1f");
+        ImGui::SliderFloat("FineScale", &DistantLand::foamFineScale,      1.5f, 16.0f, "%.1f");
+        ImGui::SliderFloat("FineAmt",   &DistantLand::foamFineAmt,        0.0f, 1.0f, "%.2f");
+        ImGui::SliderFloat("CoarseScale", &DistantLand::foamCoarseScale,  1.5f, 16.0f, "%.1f");
+        ImGui::SliderFloat("CoarseAmt", &DistantLand::foamCoarseAmt,      0.0f, 1.0f, "%.2f");
+        ImGui::SliderFloat("FlowWarp",  &DistantLand::waterFlowWarp,      0.0f, 1024.0f, "%.0f");
+    }
+    if (ImGui::CollapsingHeader("Sim foam  (live)", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::SliderFloat("FoamForce", &DistantLand::foamFlowForce[0], 0.0f, 8.0f, "%.2f");
+        ImGui::SliderFloat("FoamDecay", &DistantLand::foamDecay[0],     0.5f, 0.99f, "%.2f");
+        ImGui::SliderFloat("FoamPress", &DistantLand::foamPressure[0],  0.0f, 2.0f, "%.2f");
+        ImGui::SliderFloat("FoamScale", &DistantLand::foamScale[0],     0.0f, 400.0f, "%.1f");
+        ImGui::SliderFloat("FoamGauss", &DistantLand::foamGaussRadius,  0.5f, 8.0f, "%.2f");
+        ImGui::SliderFloat("FoamDens",  &DistantLand::foamMinDensity,   0.2f, 3.0f, "%.2f");
+        ImGui::SliderFloat("FoamUVDcy", &DistantLand::foamUVDecay,      0.5f, 0.999f, "%.3f");
+        ImGui::SliderFloat("SimSpeed",  &DistantLand::foamSimSpeed,     0.05f, 2.0f, "%.2f");
+    }
+    if (ImGui::CollapsingHeader("Debug view")) {
+        static const char* const views[12] = {
+            "OFF", "FLOW", "CLASSIFY", "DIRECTION", "STRENGTH", "INTENSITY",
+            "DIST RAW", "DIST SMOOTH", "SH RMASK", "SH FDIR", "SH FBM", "SH FARFOAM" };
+        static const int  bakeId[12] = { 0,0,1,2,3,4,5,6,0,0,0,0 };
+        static const bool effOn[12]  = { false,true,false,false,false,false,false,false,true,true,true,true };
+        static int mode = 1;
+        if (ImGui::Combo("view", &mode, views, 12)) {
+            DistantLand::waterFlowDebugOn   = effOn[mode];
+            DistantLand::waterFlowDebugView = (mode >= 2) ? mode : 0;
+            g_flowDebugBake.store(bakeId[mode], std::memory_order_release);
+            g_flowRebake.store(true, std::memory_order_release);
+        }
+    }
+    ImGui::End();
 }
 
 // Dispatch the verdict pass to the cull worker. Called from frameSetupEarly
@@ -2738,6 +2962,7 @@ void DistantLand::buildWaterFlowMap(float waterZ) {
     // strength. A final pass packs both into chDir as the alpha routing channel (0.5 = neutral,
     // <0.5 = near group, >0.5 = far group). chInten stays the wave amplitude (pond-calm).
     std::vector<float> chDirX(N, 0.0f), chDirY(N, 0.0f), chInten(N, 0.0f), chDir(N, 0.0f), chFar(N, 0.0f);
+    std::vector<float> chDistSmooth(N, 0.0f);   // 5c-bis blurred distance-to-sea (DIST SMOOTH debug view)
     std::vector<uint8_t> chCat(N, 0);
     enum { CAT_NONE = 0, CAT_SEA = 1, CAT_RIVER = 2, CAT_POND = 3, CAT_BEACH = 4 };
     auto distAt = [&](int x, int y) -> int {
@@ -2953,6 +3178,87 @@ void DistantLand::buildWaterFlowMap(float waterZ) {
         }
     }
 
+    // 5c-bis. De-block the river foam the SAME way the beach band is smoothed (5c): a wide
+    //     separable box blur. Two fields get it — both knobbed by RiverBlurR / RiverBlurIt / RiverGain
+    //     (#23/24/25, rebake):
+    //       (a) DIRECTION (the square look): the river flow vector in step 5 is the central
+    //           difference of the INTEGER distance field, so its angle quantizes to a few values
+    //           per cell (the diagonal staircase) — and the far foam advects the fbm ALONG it
+    //           (fadv = fdir·time·speed), so neighbouring cells scroll the texture in different
+    //           constant directions → square seams. Beach has none of this because its normal is
+    //           grad(wide-blurred field). We do the SAME for rivers: blur the SCALAR distance field
+    //           first, then take its gradient → a continuous heading. Rewrites the source direction,
+    //           so the debug view, DIRECTION encoding and downstream foam all see de-blocked data.
+    //       (b) STRENGTH: the binary river mask blurred into a smooth ramp, so the consume's erosion
+    //           contour (ErodeThr) is a rounded curve, not the square mask edge. Replaces the hard
+    //           near-strength (=1); beach phi kept via max(); gain restores a narrow river's core.
+    //     Sea alpha is overwritten by chFar in 5d, so this shapes river/beach/pond only.
+    {
+        const int rbR  = std::max(1, (int)(g_flowRiverBlurRadius + 0.5f));
+        const int rbIt = std::max(1, (int)(g_flowRiverBlurIters + 0.5f));
+        std::vector<float> pre(std::max(W, H) + 1), tmp(N);
+        auto boxBlur = [&](std::vector<float>& f) {            // rbIt separable box passes, radius rbR
+            for (int it = 0; it < rbIt; ++it) {
+                for (int y = 0; y < H; ++y) {                  // horizontal
+                    const int row = y * W;
+                    pre[0] = 0.0f;
+                    for (int x = 0; x < W; ++x) pre[x + 1] = pre[x] + f[row + x];
+                    for (int x = 0; x < W; ++x) {
+                        const int lo = std::max(0, x - rbR), hi = std::min(W - 1, x + rbR);
+                        tmp[row + x] = (pre[hi + 1] - pre[lo]) / (float)(hi - lo + 1);
+                    }
+                }
+                for (int x = 0; x < W; ++x) {                  // vertical
+                    pre[0] = 0.0f;
+                    for (int y = 0; y < H; ++y) pre[y + 1] = pre[y] + tmp[y * W + x];
+                    for (int y = 0; y < H; ++y) {
+                        const int lo = std::max(0, y - rbR), hi = std::min(H - 1, y + rbR);
+                        f[y * W + x] = (pre[hi + 1] - pre[lo]) / (float)(hi - lo + 1);
+                    }
+                }
+            }
+        };
+
+        // (a) river direction = -grad(SMOOTH distance-to-sea): blur the SCALAR distance field
+        //     (normalized convolution over connected water), then take its gradient. The integer
+        //     distance field's raw per-cell gradient quantizes to a few angles (the diagonal
+        //     staircase); blurring the scalar first gives a continuous field → a continuous heading.
+        std::vector<float> df(N, 0.0f), dw(N, 0.0f);
+        for (size_t i = 0; i < N; ++i)
+            if (wet[i] && dist[i] != INT_MAX) { df[i] = (float)dist[i]; dw[i] = 1.0f; }
+        boxBlur(df); boxBlur(dw);
+        std::vector<float>& ds = chDistSmooth;   // retained for the DIST SMOOTH debug view
+        for (size_t i = 0; i < N; ++i) ds[i] = (dw[i] > 1e-6f) ? (df[i] / dw[i]) : 0.0f;
+        auto dsAt = [&](int x, int y, float fallback) -> float {   // one-sided fallback past the blur reach
+            const int j = y * W + x;
+            return (dw[j] > 1e-3f) ? ds[j] : fallback;
+        };
+
+        // (b) river strength: binary mask → smooth ramp
+        std::vector<float> rf(N, 0.0f);
+        for (size_t i = 0; i < N; ++i) rf[i] = (chCat[i] == CAT_RIVER) ? 1.0f : 0.0f;
+        boxBlur(rf);
+
+        const float gain = g_flowRiverGain;
+        for (size_t i = 0; i < N; ++i) {
+            if (!wet[i]) continue;
+            if (chCat[i] == CAT_RIVER) {                           // smooth heading from grad(ds)
+                const int cx = (int)(i % W), cy = (int)(i / W);
+                const int xl = std::max(0, cx - 1), xr = std::min(W - 1, cx + 1);
+                const int yd = std::max(0, cy - 1), yu = std::min(H - 1, cy + 1);
+                const float c  = ds[i];
+                const float gx = dsAt(xr, cy, c) - dsAt(xl, cy, c);
+                const float gy = dsAt(cx, yu, c) - dsAt(cx, yd, c);
+                const float fx = -gx, fy = -gy;                    // downstream = decreasing dist-to-sea
+                const float len = sqrtf(fx * fx + fy * fy);
+                if (len > 1e-4f) { chDirX[i] = fx / len; chDirY[i] = fy / len; }
+            }
+            const float beachPart   = (chCat[i] == CAT_BEACH) ? chDir[i] : 0.0f;
+            const float riverSmooth = std::min(1.0f, rf[i] * gain);   // smooth ramp, not the boxy 1
+            chDir[i] = std::max(beachPart, riverSmooth);
+        }
+    }
+
     // 5d. Pack the alpha routing channel: 0.5 = neutral; <0.5 = NEAR group (river/beach), with
     //     near-strength = (0.5 - a) * 2 advecting the close normal; >0.5 = FAR group (sea), with
     //     far-strength = (a - 0.5) * 2 advecting the far normal (refraction). chDir held the
@@ -2985,6 +3291,38 @@ void DistantLand::buildWaterFlowMap(float waterZ) {
         }
     }
 
+    // 6b. Dilate the baked field outward into the dry border (FlowExpand cells) so the water EDGE
+    //     samples valid flow on BOTH sides — no zero/gray cells to interpolate toward and no foam
+    //     cut at the 512u grid line. Nearest-wet propagation via BFS; cells past the margin keep
+    //     dryDefault. hasData marks wet + dilated cells; the encoder below uses it instead of wet.
+    std::vector<uint8_t> hasData(N, 0);
+    for (size_t i = 0; i < N; ++i) hasData[i] = wet[i] ? 1 : 0;
+    const int dilateCells = std::max(0, (int)(g_flowDilate + 0.5f));
+    if (dilateCells > 0) {
+        std::vector<int> dDil(N, INT_MAX);
+        q.clear();
+        for (size_t i = 0; i < N; ++i) if (wet[i]) { dDil[i] = 0; q.push_back((int)i); }
+        for (size_t head = 0; head < q.size(); ++head) {
+            const int c = q[head];
+            if (dDil[c] >= dilateCells) continue;       // cap expansion at the margin
+            const int cx = c % W, cy = c / W;
+            const int nd = dDil[c] + 1;
+            for (auto& d : nb) {
+                const int nx = cx + d[0], ny = cy + d[1];
+                if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+                const int ni = ny * W + nx;
+                if (!hasData[ni]) {                      // first (= nearest-wet) reach wins
+                    dDil[ni] = nd;
+                    chDirX[ni] = chDirX[c]; chDirY[ni] = chDirY[c];
+                    chInten[ni] = chInten[c]; chDir[ni] = chDir[c];
+                    chCat[ni] = chCat[c];                // carry category so debug views show the expansion
+                    hasData[ni] = 1;
+                    q.push_back(ni);
+                }
+            }
+        }
+    }
+
     // 7. Encode RGBA8 (A8R8G8B8 in-memory = 0xAARRGGBB).
     auto enc8 = [](float v01) -> uint32_t {
         int b = (int)(v01 * 255.0f + 0.5f);
@@ -3003,7 +3341,7 @@ void DistantLand::buildWaterFlowMap(float waterZ) {
             0x00FFFF00,  // beach = yellow
         };
         for (size_t i = 0; i < N; ++i) {
-            if (!wet[i]) continue;
+            if (!hasData[i]) continue;
             g_flowMapBytes[i] = catCol[chCat[i]];
         }
     } else if (debugBake == 2) {
@@ -3011,7 +3349,7 @@ void DistantLand::buildWaterFlowMap(float waterZ) {
         // downstream, beaches onshore) get a saturated hue; non-directional water (sea/pond)
         // is dim grey. East=red, North=green, West=cyan, South=magenta-ish.
         for (size_t i = 0; i < N; ++i) {
-            if (!wet[i]) continue;
+            if (!hasData[i]) continue;
             if (chDirX[i] != 0.0f || chDirY[i] != 0.0f) {   // any directional cell (river/beach/sea-refract)
                 const float h = atan2f(chDirY[i], chDirX[i]) * 0.1591549f + 0.5f;   // 1/(2pi)
                 const float r = std::min(1.0f, std::max(0.0f, fabsf(h * 6 - 3) - 1));
@@ -3022,6 +3360,31 @@ void DistantLand::buildWaterFlowMap(float waterZ) {
                 g_flowMapBytes[i] = 0x00303030;   // grey = no direction
             }
         }
+    } else if (debugBake >= 3 && debugBake <= 6) {
+        // Grayscale source views (RGB = value; the shader tints by RGB, masking near-black).
+        //   3 STRENGTH   = near river/beach routing strength = saturate((0.5 - A) * 2)
+        //   4 INTENSITY  = wave amplitude (B channel)
+        //   5 DIST RAW   = banded raw integer dist-to-sea  (jagged bands = quantized direction source)
+        //   6 DIST SMOOTH= banded blurred dist-to-sea (chDistSmooth) (smooth bands = de-blocked)
+        const float distBand = 8.0f;   // cells per contour band
+        auto gray = [&](float v) -> uint32_t {
+            const uint32_t g = enc8(std::max(0.0f, std::min(1.0f, v)));
+            return (g << 16) | (g << 8) | g;
+        };
+        for (size_t i = 0; i < N; ++i) {
+            if (!hasData[i]) continue;
+            float v = 0.0f;
+            if (debugBake == 3) {
+                v = std::max(0.0f, std::min(1.0f, (0.5f - chDir[i]) * 2.0f));
+            } else if (debugBake == 4) {
+                v = chInten[i];
+            } else {   // 5 / 6: distance bands, connected water only
+                if (dist[i] == INT_MAX) continue;
+                const float d = (debugBake == 5) ? (float)dist[i] : chDistSmooth[i];
+                v = (d - std::floor(d / distBand) * distBand) / distBand;   // sawtooth contour bands
+            }
+            g_flowMapBytes[i] = gray(v);
+        }
     } else {
         // Dry / out-of-coverage cells default to 1x ambient waves (B = kFlowWaveDefault),
         // not 0: the LOD water mesh reaches far past this wet-cell bbox and clamp-samples
@@ -3029,7 +3392,7 @@ void DistantLand::buildWaterFlowMap(float waterZ) {
         // (no heading → the shader keeps those cells isotropic). Wet cells keep their bake.
         const uint32_t dryDefault = (enc8(0.5f) << 24) | (enc8(0.5f) << 16) | (enc8(0.5f) << 8) | enc8(kFlowWaveDefault);
         for (size_t i = 0; i < N; ++i) {
-            if (!wet[i]) { g_flowMapBytes[i] = dryDefault; continue; }
+            if (!hasData[i]) { g_flowMapBytes[i] = dryDefault; continue; }   // wet + dilated border
             const uint32_t R = enc8(chDirX[i] * 0.5f + 0.5f);
             const uint32_t G = enc8(chDirY[i] * 0.5f + 0.5f);
             const uint32_t B = enc8(chInten[i]);

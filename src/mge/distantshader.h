@@ -22,7 +22,11 @@ enum RenderPassID {
     PASS_RENDERCACHETERRAIN,  // appended pass P13; cache near terrain in reflections
     PASS_RENDERSHADOWFFE_SKINNED,  // appended pass P14; cache-skinned shadow receiver (reflections)
     PASS_RENDERCACHETERRAINLIT,   // appended pass P15; cache near terrain with point lights (main view)
-    PASS_RENDERCACHETERRAINREFLLIT  // appended pass P16; cache near terrain with point lights + below-water clip (reflections)
+    PASS_RENDERCACHETERRAINREFLLIT,  // appended pass P16; cache near terrain with point lights + below-water clip (reflections)
+    PASS_FOAM_ADVECT,   // appended pass P17; foam sim Voronoi particle advection (WATER_FOAM only)
+    PASS_FOAM_FIELD,    // appended pass P18; foam sim velocity/density field smoothing
+    PASS_FOAM_EXTRACT,  // appended pass P19; foam sim vorticity → texFoam extraction
+    PASS_FOAM_UV        // appended pass P20; advect the foam-detail UV offset field through velocity
 };
 
 enum RenderShadowMapID {

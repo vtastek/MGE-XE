@@ -28,6 +28,7 @@ bool DistantLand::ready = false;
 bool DistantLand::isRenderCached = false;
 bool DistantLand::isPPLActive = false;
 bool DistantLand::cacheOpaqueMode = false;
+bool DistantLand::cacheOnlyMode = false;
 bool DistantLand::earlyWalkedCache = false;
 bool DistantLand::renderThreadJobKicked = false;
 std::vector<D3DXVECTOR4> DistantLand::reflectionWaterRects;
@@ -117,15 +118,56 @@ IDirect3DSurface9* DistantLand::surfRain;
 IDirect3DSurface9* DistantLand::surfRipples;
 IDirect3DSurface9* DistantLand::surfRippleBuffer;
 IDirect3DVertexBuffer9* DistantLand::vbWaveSim;
+IDirect3DVertexBuffer9* DistantLand::vbFoamSim;
 
 IDirect3DTexture9* DistantLand::texFlow;
 bool DistantLand::waterFlowDebugOn = true;
-bool DistantLand::waterFlowClassify = false;
-bool DistantLand::waterFlowDirView = false;
+int  DistantLand::waterFlowDebugView = 0;
 float DistantLand::waterFlowScroll = 0.4f;
 float DistantLand::waterFlowSeaSpeed = 1.0f;
-float DistantLand::waterFlowCycleUV = 1.0f;
+float DistantLand::waterFlowCycleUV = 4.0f;
 float DistantLand::waterFlowSeaRefract = 1.0f;
+float DistantLand::waterFlowWarp = 64.0f;
+
+IDirect3DTexture9* DistantLand::texFoamP_A[DistantLand::foamCascades];
+IDirect3DTexture9* DistantLand::texFoamP_B[DistantLand::foamCascades];
+IDirect3DTexture9* DistantLand::texFoamField[DistantLand::foamCascades];
+IDirect3DTexture9* DistantLand::texFoam[DistantLand::foamCascades];
+IDirect3DSurface9* DistantLand::surfFoamP_A[DistantLand::foamCascades];
+IDirect3DSurface9* DistantLand::surfFoamP_B[DistantLand::foamCascades];
+IDirect3DSurface9* DistantLand::surfFoamField[DistantLand::foamCascades];
+IDirect3DSurface9* DistantLand::surfFoam[DistantLand::foamCascades];
+IDirect3DTexture9* DistantLand::texFoamUV_A[DistantLand::foamCascades];
+IDirect3DTexture9* DistantLand::texFoamUV_B[DistantLand::foamCascades];
+IDirect3DSurface9* DistantLand::surfFoamUV_A[DistantLand::foamCascades];
+IDirect3DSurface9* DistantLand::surfFoamUV_B[DistantLand::foamCascades];
+int   DistantLand::foamLastXpos[DistantLand::foamCascades];
+int   DistantLand::foamLastYpos[DistantLand::foamCascades];
+float DistantLand::foamOriginC[DistantLand::foamCascades][2];
+bool DistantLand::foamSimReset = true;
+bool DistantLand::waterFoamOn = true;
+bool DistantLand::foamDebugView = false;
+// Single-carrier foam tuning (cascades collapsed to one). Tune live via the NUMPAD8 cycle.
+float DistantLand::foamFlowForce[foamCascades] = { 1.5f };
+float DistantLand::foamDecay[foamCascades]     = { 0.94f };
+float DistantLand::foamPressure[foamCascades]  = { 0.1f };
+float DistantLand::foamScale[foamCascades]     = { 6.7f };
+// Two-layer foam defaults: 32u fbm cells (fine streaks), FoamSpeed 1.0 (far-layer advect rate
+// = ×river flow), erode threshold 0.35 (crisp edge), far-layer strength 1.0.
+float DistantLand::foamDetailTile     = 160.0f;
+float DistantLand::foamDetailSpeed    = 0.6f;
+float DistantLand::foamErodeThreshold = 0.98f;
+float DistantLand::foamFarAmount      = 1.0f;
+float DistantLand::foamMix            = 0.5f;
+float DistantLand::foamGaussRadius    = 4.0f;
+float DistantLand::foamMinDensity     = 0.4f;
+float DistantLand::foamUVDecay        = 0.97f;
+float DistantLand::foamSimSpeed       = 1.0f;
+float DistantLand::foamVortGain        = 4.0f;
+float DistantLand::foamFineScale       = 5.0f;
+float DistantLand::foamFineAmt         = 0.6f;
+float DistantLand::foamCoarseScale     = 3.0f;
+float DistantLand::foamCoarseAmt       = 0.5f;
 
 IDirect3DTexture9* DistantLand::texShadow;
 IDirect3DTexture9* DistantLand::texSoftShadow;
@@ -208,10 +250,36 @@ D3DXHANDLE DistantLand::ehFlowSeaSpeed;
 D3DXHANDLE DistantLand::ehFlowCycleUV;
 D3DXHANDLE DistantLand::ehFlowSeaRefract;
 D3DXHANDLE DistantLand::ehFlowDebugView;
+D3DXHANDLE DistantLand::ehFlowWarp;
 D3DXHANDLE DistantLand::ehWaveAmp;
 D3DXHANDLE DistantLand::ehWaveLen;
 D3DXHANDLE DistantLand::ehWaveSpeed;
 D3DXHANDLE DistantLand::ehCrestSpread;
+D3DXHANDLE DistantLand::ehFoamParticles;
+D3DXHANDLE DistantLand::ehFoamFieldIn;
+D3DXHANDLE DistantLand::ehFoamOrigin;
+D3DXHANDLE DistantLand::ehFoamShift;
+D3DXHANDLE DistantLand::ehFoamFieldShift;
+D3DXHANDLE DistantLand::ehFoamPlayer;
+D3DXHANDLE DistantLand::ehFoamParams;
+D3DXHANDLE DistantLand::ehFoamWorldRes;
+D3DXHANDLE DistantLand::ehFoamAdvance;
+D3DXHANDLE DistantLand::ehFoam0;
+D3DXHANDLE DistantLand::ehFoamOrigin0;
+D3DXHANDLE DistantLand::ehFoamWeight;
+D3DXHANDLE DistantLand::ehFoamDetail;
+D3DXHANDLE DistantLand::ehFoamFarAmount;
+D3DXHANDLE DistantLand::ehFoamUVIn;
+D3DXHANDLE DistantLand::ehFoamUVRate;
+D3DXHANDLE DistantLand::ehFoamUVDecay;
+D3DXHANDLE DistantLand::ehFoamUVTex;
+D3DXHANDLE DistantLand::ehFoamGaussRadius;
+D3DXHANDLE DistantLand::ehFoamMinDensity;
+D3DXHANDLE DistantLand::ehFoamVortGain;
+D3DXHANDLE DistantLand::ehFoamFineScale;
+D3DXHANDLE DistantLand::ehFoamFineAmt;
+D3DXHANDLE DistantLand::ehFoamCoarseScale;
+D3DXHANDLE DistantLand::ehFoamCoarseAmt;
 
 std::function<void(IDirect3DSurface9*)> DistantLand::captureScreenHandler = nullptr;
 bool DistantLand::captureScreenWithUI;
@@ -623,6 +691,7 @@ static const D3DXMACRO macroFilterReflection = { "FILTER_WATER_REFLECTION", "" }
 static const D3DXMACRO macroDynamicRipples = { "DYNAMIC_RIPPLES", "" };
 static const D3DXMACRO macroWaterFlowMap = { "WATER_FLOW_MAP", "" };
 static const D3DXMACRO macroWaterLodMesh = { "WATER_LOD_MESH", "" };
+static const D3DXMACRO macroWaterFoam = { "WATER_FOAM", "" };
 static const D3DXMACRO macroTerminator = { 0, 0 };
 
 bool DistantLand::initShader() {
@@ -654,6 +723,11 @@ bool DistantLand::initShader() {
         // 3D waves are meaningless without the flow direction, so the world-snapped
         // LOD mesh + flow-steered crest displacement rides the same gate.
         features.push_back(macroWaterLodMesh);
+        // World-anchored hybrid particle foam: the flow map IS the foam sim's velocity
+        // field, so the foam rides the same gate. The sim only runs when DYNAMIC_RIPPLES
+        // is also active (it reuses the wave-sim fullscreen quad); the shader sample is a
+        // harmless no-op (texFoam stays cleared) otherwise.
+        features.push_back(macroWaterFoam);
     }
     features.push_back(macroTerminator);
 
@@ -762,11 +836,39 @@ bool DistantLand::initShader() {
         ehFlowCycleUV = effect->GetParameterByName(0, "flowCycleUV");
         ehFlowSeaRefract = effect->GetParameterByName(0, "flowSeaRefract");
         ehFlowDebugView = effect->GetParameterByName(0, "flowDebugView");
+        ehFlowWarp = effect->GetParameterByName(0, "flowMapWarp");
         // Flow-steered crest displacement uniforms (WATER_LOD_MESH).
         ehWaveAmp = effect->GetParameterByName(0, "waveAmp");
         ehWaveLen = effect->GetParameterByName(0, "waveLen");
         ehWaveSpeed = effect->GetParameterByName(0, "waveSpeed");
         ehCrestSpread = effect->GetParameterByName(0, "crestSpread");
+        // World-anchored particle foam sim uniforms (WATER_FOAM).
+        ehFoamParticles = effect->GetParameterByName(0, "texFoamParticles");
+        ehFoamFieldIn = effect->GetParameterByName(0, "texFoamFieldIn");
+        ehFoamOrigin = effect->GetParameterByName(0, "foamOrigin");
+        ehFoamShift = effect->GetParameterByName(0, "foamShiftPx");
+        ehFoamFieldShift = effect->GetParameterByName(0, "foamFieldShift");
+        ehFoamPlayer = effect->GetParameterByName(0, "foamPlayer");
+        ehFoamParams = effect->GetParameterByName(0, "foamParams");
+        ehFoamWorldRes = effect->GetParameterByName(0, "foamWorldRes");   // sim-side, set per cascade
+        ehFoamAdvance = effect->GetParameterByName(0, "foamAdvance");      // per-microstep texel advance (≤1)
+        // Consume side: both cascades bound at once (fine + coarse).
+        ehFoam0 = effect->GetParameterByName(0, "texFoam0");          // single carrier
+        ehFoamOrigin0 = effect->GetParameterByName(0, "foamOrigin0");
+        ehFoamWeight = effect->GetParameterByName(0, "foamWeight");
+        ehFoamDetail = effect->GetParameterByName(0, "foamDetail");
+        ehFoamFarAmount = effect->GetParameterByName(0, "foamFarAmount");
+        ehFoamUVIn = effect->GetParameterByName(0, "texFoamUVIn");    // sim ping-pong source
+        ehFoamUVRate = effect->GetParameterByName(0, "foamUVRate");
+        ehFoamUVDecay = effect->GetParameterByName(0, "foamUVDecay");
+        ehFoamUVTex = effect->GetParameterByName(0, "texFoamUV");     // consume: advected offset field
+        ehFoamGaussRadius = effect->GetParameterByName(0, "foamGaussRadius");
+        ehFoamMinDensity = effect->GetParameterByName(0, "foamMinDensity");
+        ehFoamVortGain = effect->GetParameterByName(0, "foamVortGain");
+        ehFoamFineScale = effect->GetParameterByName(0, "foamFineScale");
+        ehFoamFineAmt = effect->GetParameterByName(0, "foamFineAmt");
+        ehFoamCoarseScale = effect->GetParameterByName(0, "foamCoarseScale");
+        ehFoamCoarseAmt = effect->GetParameterByName(0, "foamCoarseAmt");
     }
 
     return true;
@@ -897,6 +999,10 @@ bool DistantLand::initWater() {
     // World-snapped LOD water mesh (gated by the flow map; A/B vs radial at runtime).
     if (Configuration.UseWaterFlowMap) {
         if (!initWaterLodMesh()) {
+            return false;
+        }
+        // World-anchored hybrid particle foam sim RTs (WATER_FOAM).
+        if (!initFoamSim()) {
             return false;
         }
     }
@@ -1152,6 +1258,63 @@ bool DistantLand::initDynamicWaves() {
     memcpy(vp, waveVertices, sizeof(waveVertices));
     vbWaveSim->Unlock();
 
+    return true;
+}
+
+// World-anchored hybrid particle foam sim resources (WATER_FOAM). Four fp16 RGBA RTs
+// at foamTexResolution: two ping-pong particle buffers, one velocity/density field
+// buffer, one foam-output buffer sampled by the water shader. The sim itself reuses
+// the wave-sim fullscreen quad (vbWaveSim) + WaveVS, so no VB is created here.
+bool DistantLand::initFoamSim() {
+    HRESULT hr;
+    const int res = foamTexResolution;
+
+    // One full set of 4 RTs per cascade (fine + coarse); the resolution is shared.
+    for (int c = 0; c < foamCascades; ++c) {
+        struct { IDirect3DTexture9** tex; IDirect3DSurface9** surf; const char* name; } targets[] = {
+            { &texFoamP_A[c],   &surfFoamP_A[c],   "foam particle A" },
+            { &texFoamP_B[c],   &surfFoamP_B[c],   "foam particle B" },
+            { &texFoamField[c], &surfFoamField[c], "foam field" },
+            { &texFoam[c],      &surfFoam[c],      "foam output" },
+            { &texFoamUV_A[c],  &surfFoamUV_A[c],  "foam UV A" },
+            { &texFoamUV_B[c],  &surfFoamUV_B[c],  "foam UV B" },
+        };
+
+        for (auto& t : targets) {
+            hr = device->CreateTexture(res, res, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, t.tex, NULL);
+            if (hr != D3D_OK) {
+                LOG::logline("!! Failed to create %s texture (cascade %d)", t.name, c);
+                return false;
+            }
+            (*t.tex)->GetSurfaceLevel(0, t.surf);
+            device->ColorFill(*t.surf, 0, 0);
+        }
+    }
+
+    // Foam's own fullscreen triangle, scaled to foamTexResolution (mirrors the wave-sim
+    // vbWaveSim triangle but at the foam RT size). The WaveVS geometry behaves in pixel
+    // space, so a 512-sized triangle covers only a cropped corner of a larger foam RT;
+    // sizing the triangle to the RT fills it exactly (see simulateFoam).
+    const float r = (float)foamTexResolution;
+    float foamVertices[] = {
+        -r/2 - 0.5f,    r/2 - 0.5f,   0, 1,   -0.5f,  0.5f,   0, 0,
+         r   - 0.5f,  2*r   - 0.5f,   0, 1,    1.0f,  2.0f,   0, 1,
+         r   - 0.5f,   -r    - 0.5f,  0, 1,    1.0f, -1.0f,   1, 1
+    };
+    hr = device->CreateVertexBuffer(3 * 32, D3DUSAGE_WRITEONLY, fvfWave, D3DPOOL_DEFAULT, &vbFoamSim, 0);
+    if (hr != D3D_OK) {
+        LOG::logline("!! Failed to create foam simulation vb");
+        return false;
+    }
+    void* fvp;
+    if (vbFoamSim->Lock(0, 0, &fvp, 0) != D3D_OK) {
+        LOG::logline("!! Failed to lock foam simulation vb");
+        return false;
+    }
+    memcpy(fvp, foamVertices, sizeof(foamVertices));
+    vbFoamSim->Unlock();
+
+    foamSimReset = true;
     return true;
 }
 
@@ -1790,6 +1953,24 @@ void DistantLand::release() {
     if (texFlow) {
         texFlow->Release();
         texFlow = nullptr;
+    }
+
+    if (texFoam[0]) {
+        for (int c = 0; c < foamCascades; ++c) {
+            surfFoamP_A[c]->Release();   surfFoamP_A[c] = nullptr;
+            texFoamP_A[c]->Release();    texFoamP_A[c] = nullptr;
+            surfFoamP_B[c]->Release();   surfFoamP_B[c] = nullptr;
+            texFoamP_B[c]->Release();    texFoamP_B[c] = nullptr;
+            surfFoamField[c]->Release(); surfFoamField[c] = nullptr;
+            texFoamField[c]->Release();  texFoamField[c] = nullptr;
+            surfFoam[c]->Release();      surfFoam[c] = nullptr;
+            texFoam[c]->Release();       texFoam[c] = nullptr;
+            surfFoamUV_A[c]->Release();  surfFoamUV_A[c] = nullptr;
+            texFoamUV_A[c]->Release();   texFoamUV_A[c] = nullptr;
+            surfFoamUV_B[c]->Release();  surfFoamUV_B[c] = nullptr;
+            texFoamUV_B[c]->Release();   texFoamUV_B[c] = nullptr;
+        }
+        if (vbFoamSim) { vbFoamSim->Release(); vbFoamSim = nullptr; }
     }
 
     texWater->Release();

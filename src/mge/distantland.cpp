@@ -255,9 +255,20 @@ void DistantLand::renderStage0() {
     // the whole frame. CACHE mode draws the simple-opaque subset from the cache in
     // renderStage0 and suppresses the engine's covered opaque draws.
     if (GetAsyncKeyState(VK_NUMPAD7) & 0x0001) {
-        cacheOpaqueMode = !cacheOpaqueMode;
-        StatusOverlay::setStatus(cacheOpaqueMode
-            ? "Opaque source: CACHE (MGE-driven)" : "Opaque source: ENGINE (reactive)");
+        // 3-state cycle: ENGINE -> CACHE -> CACHE-ONLY -> ENGINE.
+        // ENGINE     : cacheOpaqueMode=0, cacheOnlyMode=0 (untouched reactive path)
+        // CACHE      : cacheOpaqueMode=1, cacheOnlyMode=0 (cache owns opaque; rest reactive)
+        // CACHE-ONLY : cacheOpaqueMode=1, cacheOnlyMode=1 (only cache draws scene 0; rest black)
+        if (!cacheOpaqueMode) {
+            cacheOpaqueMode = true;  cacheOnlyMode = false;
+            StatusOverlay::setStatus("Opaque source: CACHE (MGE-driven)");
+        } else if (!cacheOnlyMode) {
+            cacheOnlyMode = true;
+            StatusOverlay::setStatus("Opaque source: CACHE-ONLY (cache coverage; rest suppressed)");
+        } else {
+            cacheOpaqueMode = false; cacheOnlyMode = false;
+            StatusOverlay::setStatus("Opaque source: ENGINE (reactive)");
+        }
     }
 
     // VK_DECIMAL: A/B toggle tiled vs per-mesh point lighting (numpad digits are all
@@ -464,6 +475,9 @@ void DistantLand::renderStage0() {
             // Update water simulation
             if (Configuration.MGEFlags & DYNAMIC_RIPPLES) {
                 simulateDynamicWaves();
+                if (Configuration.UseWaterFlowMap && waterFoamOn) {
+                    simulateFoam();
+                }
             }
 
             effect->End();
@@ -551,6 +565,9 @@ void DistantLand::renderStage0() {
 
                 effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
                 simulateDynamicWaves();
+                if (Configuration.UseWaterFlowMap && waterFoamOn) {
+                    simulateFoam();
+                }
                 effect->End();
 
                 // Restore render state
@@ -1046,6 +1063,33 @@ void DistantLand::postProcess() {
             PostShaders::shaderTime(&updatePostShader, envFlags, mwBridge->frameTime());
         }
 
+        // === FOAM DEBUG VIEW (temporary): blit the raw foam sim surfaces to screen
+        // corners, unmodulated and full-RGB, so the particle/field/output buffers can
+        // be inspected directly instead of through the water shader's masked .r tap
+        // (edge-fade * shoreMask * fog.a makes every diagnostic look like "white,
+        // offset"). surfFoam carries the FoamExtractPS diagnostic; surfFoamField .z is
+        // density. Gated on the foam toggle (NUMPAD2). ===
+        if (Configuration.UseWaterFlowMap && waterFoamOn && foamDebugView && surfFoam[0]) {
+            IDirect3DSurface9* backbuffer = nullptr;
+            device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backbuffer);
+            if (backbuffer) {
+                D3DSURFACE_DESC bd;
+                backbuffer->GetDesc(&bd);
+                const LONG sz = 300, pad = 8;
+                LONG y0 = (LONG)bd.Height - sz - pad;
+                // Left = carrier foam output, right = carrier field (.z = density).
+                RECT rFoam  = { pad,            y0, pad + sz,        y0 + sz };
+                RECT rField = { 2*pad + sz,     y0, 2*pad + 2*sz,    y0 + sz };
+                HRESULT h0 = device->StretchRect(surfFoam[0], 0, backbuffer, &rFoam,  D3DTEXF_POINT);
+                HRESULT h1 = surfFoamField[0] ? device->StretchRect(surfFoamField[0], 0, backbuffer, &rField, D3DTEXF_POINT) : 0;
+                if (h0 != D3D_OK || h1 != D3D_OK) {
+                    static bool logged = false;
+                    if (!logged) { LOG::logline("!! Foam debug blit StretchRect failed: 0x%x 0x%x", h0, h1); logged = true; }
+                }
+                backbuffer->Release();
+            }
+        }
+
         // Capture pre-UI screenshots here
         checkCaptureScreenshot(false);
 
@@ -1409,6 +1453,14 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
         // scene, so without this gate the 1st-person arm gets suppressed but never
         // cache-drawn -> hands vanish. (isLandSplat already self-gates to scene 0.)
         if (cacheOpaqueMode && sceneCount == 0 && (isCoveredOpaque(rs, frs) || isLandSplat)) {
+            return false;
+        }
+        // CACHE-ONLY diagnostic: suppress every remaining colour draw across ALL scenes
+        // (non-covered opaque, blended fence/lava/glow, decals, first-person hands,
+        // alpha-sorted, UI) so the frame shows ONLY what renderCachedOpaque/
+        // renderCachedTerrain produced. recordMW above is untouched (depth replay still
+        // sees the geometry).
+        if (cacheOnlyMode) {
             return false;
         }
         // PPL reactive colour path: render non-covered opaque (and, in plain PPL mode,

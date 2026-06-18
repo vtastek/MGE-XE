@@ -645,6 +645,211 @@ void DistantLand::simulateDynamicWaves() {
     effect->SetFloat(ehWaveHeight, (float)Configuration.DL.WaterWaveHeight);
 }
 
+void DistantLand::simulateFoam() {
+    MGE_ZoneScopedN("simulateFoam");
+    DrawStats::ScopedStage _ds(DrawStats::Water);
+    auto mwBridge = MWBridge::get();
+
+    // Paused in menu; needs the flow field bound (it IS the advecting velocity field).
+    if (mwBridge->IsMenu()) {
+        return;
+    }
+    if (!updateFlowMapTexture()) {
+        return;
+    }
+
+    // Substep cadence (independent of the ripple sim; capped to bound the GPU cost).
+    static float remainingFoamTime = 0;
+    static const float foamStep = 1.0f / 60.0f;
+    float frameTime = std::min(mwBridge->frameTime(), 0.5f);
+    remainingFoamTime += frameTime;
+    int numSteps = (int)(remainingFoamTime / foamStep);
+    remainingFoamTime -= numSteps * foamStep;
+    numSteps = std::max(1, std::min(numSteps, 3));
+
+    device->SetFVF(fvfWave);
+    device->SetStreamSource(0, vbFoamSim, 0, 32);   // foam's own RT-sized fullscreen triangle (shared by all cascades)
+
+    const D3DXVECTOR3* playerPos = (const D3DXVECTOR3*)mwBridge->PlayerPositionPointer();
+
+    // Shared flow uniforms the foam passes read (sampFlow at world pos) — cascade-invariant,
+    // set once. The foam tuning (foamParams) is per-cascade and set inside the loop below.
+    float ft[4];
+    getFlowMapTransform(ft);
+    effect->SetTexture(ehFlow, texFlow);
+    effect->SetFloatArray(ehFlowTransform, ft, 4);
+    effect->SetFloat(ehFlowWeight, waterFlowDebugOn ? 1.0f : 0.0f);
+    // (river-mask soften/expand is now baked into the routing alpha — see buildWaterFlowMap 5c-bis)
+    // UV-advection (River Editor): rate tied to the FoamSpeed knob; decay bounds the offset stretch.
+    effect->SetFloat(ehFoamUVRate, foamDetailSpeed);
+    effect->SetFloat(ehFoamUVDecay, foamUVDecay);
+    effect->SetFloat(ehFoamGaussRadius, foamGaussRadius);
+    effect->SetFloat(ehFoamMinDensity, foamMinDensity);
+
+    // Player in-water flag (window texel position is cascade-dependent, computed per cascade).
+    float dz = playerPos->z - mwBridge->WaterLevel();
+    bool inWater = (dz < 0 && dz > -128.0f * mwBridge->PlayerHeight());
+
+    // Save the frame RT once; the passes below retarget manually and it is restored on scope exit.
+    RenderTargetSwitcher rtsw(surfFoamP_A[0], NULL);
+
+    // Force the viewport to the foam RT size after every retarget (matches SetRenderTarget's
+    // auto-size; defends against a driver leaving it stale).
+    D3DVIEWPORT9 savedVp;
+    device->GetViewport(&savedVp);
+    const D3DVIEWPORT9 foamVp = { 0, 0, (DWORD)foamTexResolution, (DWORD)foamTexResolution, 0.0f, 1.0f };
+
+    // The reset is one shared flag across cascades — capture it, clear once after the loop,
+    // so every cascade clears on the resetting frame.
+    const bool doReset = foamSimReset;
+
+    // Single world-anchored low-res carrier (foamCascades == 1; the loop carries over from the
+    // cascade split and now runs once). The water shader's procedural detail supplies the
+    // up-close crispness, so this sim stays cheap and coarse.
+    for (int c = 0; c < foamCascades; ++c) {
+        const float worldRes = foamCascadeWorldRes[c];
+        effect->SetFloat(ehFoamWorldRes, worldRes);
+
+        // Per-cascade sim tuning (force/decay/pressure/scale).
+        float foamParams[4] = { foamFlowForce[c], foamDecay[c], foamPressure[c], foamScale[c] };
+        effect->SetFloatArray(ehFoamParams, foamParams, 4);
+
+        // Micro-substep the advection so each step moves ≤1 texel (the 8-neighbour Voronoi
+        // tracker's hard limit). advTotal is the world-relative per-substep texel advance
+        // (= 3.125/worldRes — constant world speed across cascades); split it into `micro`
+        // equal micro-steps each ≤1 texel. Coarse cascade (advTotal 0.25) → micro 1 (no cost
+        // change); fine cascade (advTotal 2.0 @ 1.5625u) → micro 2. The advect loop runs
+        // numSteps*micro iterations so the per-frame world advance is preserved.
+        const float advTotal = 3.125f * foamSimSpeed / worldRes;   // SimSpeed scales sim-foam visual speed
+        const int   micro    = std::max(1, (int)ceilf(advTotal));
+        const float advStep  = advTotal / micro;
+        effect->SetFloat(ehFoamAdvance, advStep);
+
+        // World-anchor: track the player at texel granularity so foam stays world-locked
+        // (the window scrolls, its contents do not). Mirrors the ripple sim's tracking.
+        int newXpos = (int)floor(playerPos->x / worldRes);
+        int newYpos = (int)floor(playerPos->y / worldRes);
+        int shiftX = newXpos - foamLastXpos[c];
+        int shiftY = newYpos - foamLastYpos[c];
+        foamLastXpos[c] = newXpos;
+        foamLastYpos[c] = newYpos;
+
+        // First step (or device reset): clear the buffers — the advect respawn self-seeds
+        // particles into every texel within a frame.
+        if (doReset) {
+            device->ColorFill(surfFoamP_A[c], 0, 0);
+            device->ColorFill(surfFoamP_B[c], 0, 0);
+            device->ColorFill(surfFoamField[c], 0, 0);
+            device->ColorFill(surfFoam[c], 0, 0);
+            device->ColorFill(surfFoamUV_A[c], 0, 0);
+            device->ColorFill(surfFoamUV_B[c], 0, 0);
+            shiftX = shiftY = 0;
+        }
+
+        // Shift the persistent particle buffer (A) into the scratch (B) by the integer texel
+        // offset; the advect pass then subtracts foamShiftPx from each stored position so the
+        // window-local coords survive the shift (the re-bin fixup). Clear B so streamed-in
+        // border texels are empty (they respawn).
+        int shiftXp = (shiftX > 0) ? +shiftX : 0;
+        int shiftXn = (shiftX < 0) ? -shiftX : 0;
+        int shiftYp = (shiftY > 0) ? +shiftY : 0;
+        int shiftYn = (shiftY < 0) ? -shiftY : 0;
+        RECT source, target;
+        source.left = shiftXp;   source.right  = foamTexResolution - shiftXn;
+        source.top  = shiftYp;   source.bottom = foamTexResolution - shiftYn;
+        target.left = shiftXn;   target.right  = foamTexResolution - shiftXp;
+        target.top  = shiftYn;   target.bottom = foamTexResolution - shiftYp;
+        device->ColorFill(surfFoamP_B[c], 0, 0);
+        device->StretchRect(surfFoamP_A[c], &source, surfFoamP_B[c], &target, D3DTEXF_NONE);
+
+        // Window world origin (min corner): foam particle (tx,ty) → world = origin + (tx,ty)*res.
+        const float halfWorld = 0.5f * worldRes * foamTexResolution;
+        float foamOrigin[2] = { newXpos * worldRes - halfWorld,
+                                newYpos * worldRes - halfWorld };
+        effect->SetFloatArray(ehFoamOrigin, foamOrigin, 2);   // transient per-cascade for the sim
+        foamOriginC[c][0] = foamOrigin[0];                    // saved for the consume bind
+        foamOriginC[c][1] = foamOrigin[1];
+
+        // Player injection input: window texel position + in-water flag.
+        float foamPlayer[3] = { (playerPos->x - foamOrigin[0]) / worldRes,
+                                (playerPos->y - foamOrigin[1]) / worldRes,
+                                inWater ? 1.0f : 0.0f };
+        effect->SetFloatArray(ehFoamPlayer, foamPlayer, 3);
+
+        // Full per-frame window shift (texels) for the pressure-field read. The field buffer is
+        // not re-binned, so it lags the scrolled particles by the whole frame's shift on EVERY
+        // substep (unlike foamShiftPx, which re-bins the particles once on substep 0). The advect
+        // offsets the field sample by this to kill the movement-fed brightness drift.
+        float fieldShift[2] = { (float)shiftX, (float)shiftY };
+        effect->SetFloatArray(ehFoamFieldShift, fieldShift, 2);
+
+        device->SetViewport(&foamVp);
+
+        // PASS_FOAM_ADVECT — Voronoi particle step, ping-pong B→A. Source is the realigned B.
+        SurfaceDoubleBuffer pb;
+        pb.init(texFoamP_B[c], surfFoamP_B[c], texFoamP_A[c], surfFoamP_A[c]);
+        effect->BeginPass(PASS_FOAM_ADVECT);
+        const int totalIters = numSteps * micro;
+        for (int i = 0; i < totalIters; ++i) {
+            // The re-bin shift applies once (first iteration only); later steps do not re-shift.
+            float shiftPx[2] = { (i == 0) ? (float)shiftX : 0.0f, (i == 0) ? (float)shiftY : 0.0f };
+            device->SetRenderTarget(0, pb.sinkSurface());
+            device->SetViewport(&foamVp);
+            effect->SetTexture(ehFoamParticles, pb.sourceTexture());
+            effect->SetTexture(ehFoamFieldIn, texFoamField[c]);   // previous frame's field (pressure source)
+            effect->SetFloatArray(ehFoamShift, shiftPx, 2);
+            effect->CommitChanges();
+            DrawStats::count(1);
+            device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 1);
+            pb.cycle();
+        }
+        effect->EndPass();
+        // Ensure the canonical particle buffer (A) holds the final result.
+        if (pb.sourceSurface() != surfFoamP_A[c]) {
+            device->StretchRect(pb.sourceSurface(), 0, surfFoamP_A[c], 0, D3DTEXF_NONE);
+        }
+
+        // PASS_FOAM_FIELD — smooth Voronoi velocity + density from A into the field buffer.
+        device->SetRenderTarget(0, surfFoamField[c]);
+        device->SetViewport(&foamVp);
+        effect->BeginPass(PASS_FOAM_FIELD);
+        effect->SetTexture(ehFoamParticles, texFoamP_A[c]);
+        effect->CommitChanges();
+        DrawStats::count(1);
+        device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 1);
+        effect->EndPass();
+
+        // PASS_FOAM_EXTRACT — foam = clamp(scale·|vorticity|), river-masked, into texFoam.
+        device->SetRenderTarget(0, surfFoam[c]);
+        device->SetViewport(&foamVp);
+        effect->BeginPass(PASS_FOAM_EXTRACT);
+        effect->SetTexture(ehFoamFieldIn, texFoamField[c]);
+        effect->CommitChanges();
+        DrawStats::count(1);
+        device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 1);
+        effect->EndPass();
+
+        // PASS_FOAM_UV — advect the detail UV offset field through the velocity (River Editor).
+        // Re-bin the canonical UV (A) into B by the window shift (plain scroll; the stored offsets
+        // are displacements, so their values need no fixup — only the buffer content scrolls), then
+        // advect B → A reading the current velocity field.
+        device->ColorFill(surfFoamUV_B[c], 0, 0);
+        device->StretchRect(surfFoamUV_A[c], &source, surfFoamUV_B[c], &target, D3DTEXF_NONE);
+        device->SetRenderTarget(0, surfFoamUV_A[c]);
+        device->SetViewport(&foamVp);
+        effect->BeginPass(PASS_FOAM_UV);
+        effect->SetTexture(ehFoamUVIn, texFoamUV_B[c]);
+        effect->SetTexture(ehFoamFieldIn, texFoamField[c]);
+        effect->CommitChanges();
+        DrawStats::count(1);
+        device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 1);
+        effect->EndPass();
+    }
+
+    foamSimReset = false;
+    device->SetViewport(&savedVp);   // restore the frame viewport for subsequent rendering
+}
+
 void DistantLand::renderWaterPlane() {
     DrawStats::ScopedStage _ds(DrawStats::Water);
     D3DXMATRIX m;
@@ -675,7 +880,23 @@ void DistantLand::renderWaterPlane() {
         effect->SetFloat(ehFlowSeaSpeed, waterFlowSeaSpeed);
         effect->SetFloat(ehFlowCycleUV, waterFlowCycleUV);
         effect->SetFloat(ehFlowSeaRefract, waterFlowSeaRefract);
-        effect->SetFloat(ehFlowDebugView, (waterFlowClassify || waterFlowDirView) ? 1.0f : 0.0f);
+        effect->SetFloat(ehFlowDebugView, (float)waterFlowDebugView);
+        effect->SetFloat(ehFlowWarp, waterFlowWarp);
+        // World-anchored particle foam carrier: bind the single low-res buffer + its window
+        // origin (saved by simulateFoam). foamWeight is the runtime A/B (0 → legacy water).
+        effect->SetTexture(ehFoam0, texFoam[0]);
+        effect->SetTexture(ehFoamUVTex, texFoamUV_A[0]);   // advected detail-UV offset field
+        effect->SetFloatArray(ehFoamOrigin0, foamOriginC[0], 2);
+        effect->SetFloat(ehFoamWeight, waterFoamOn ? 1.0f : 0.0f);
+        // Indirection detail (Phase 1): procedural fbm modulating the carrier (live-tuned).
+        float foamDetail[4] = { foamDetailTile, foamDetailSpeed, foamErodeThreshold, foamMix };
+        effect->SetFloatArray(ehFoamDetail, foamDetail, 4);
+        effect->SetFloat(ehFoamFarAmount, foamFarAmount);
+        effect->SetFloat(ehFoamVortGain, foamVortGain);
+        effect->SetFloat(ehFoamFineScale, foamFineScale);
+        effect->SetFloat(ehFoamFineAmt, foamFineAmt);
+        effect->SetFloat(ehFoamCoarseScale, foamCoarseScale);
+        effect->SetFloat(ehFoamCoarseAmt, foamCoarseAmt);
     }
     if (Configuration.UseWaterFlowMap) {
         // Flow-steered crest displacement knobs (WATER_LOD_MESH). Set every frame the
@@ -688,6 +909,17 @@ void DistantLand::renderWaterPlane() {
     }
 
     device->SetVertexDeclaration(WaterDecl);
+
+    // Force LINEAR min/mag on the pixel-stage samplers. The water effect's sampler_state
+    // blocks declare linear, but Begin() runs with D3DXFX_DONOTSAVESTATE and the effect's
+    // internal state-cache can desync across passes, leaving a register at the device-default
+    // POINT — which showed as pixellated flow-driven normals/foam. Set after BeginPass (done by
+    // the caller) and after the last CommitChanges so these win for the draw. All water samplers
+    // want linear; vertex-texture-fetch stages (256+) are untouched (point-only by hardware).
+    for (DWORD s = 0; s < 10; ++s) {
+        device->SetSamplerState(s, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+        device->SetSamplerState(s, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    }
 
     // World-snapped LOD path (clipmap): one snapped world matrix + draw per level so
     // vertices land on a stable world lattice (no swimming). Else the radial mesh.

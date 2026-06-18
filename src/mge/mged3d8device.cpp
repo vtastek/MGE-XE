@@ -16,6 +16,7 @@
 #include "ffeshader.h"
 #include "userhud.h"
 #include "videobackground.h"
+#include "imgui_water.h"
 #include "mge_tracy.h"
 #include "drawstats.h"
 #include "support/timing.h"
@@ -531,6 +532,10 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         // the limiter's inter-frame idle stays outside the measured span.
     }
 #endif
+
+    // Dear ImGui Water/Foam tuning panel (F10). Drawn onto the backbuffer after the scene,
+    // before pacing/present. Lazily inits on the first call.
+    ImGuiWater::onPresent(realDevice);
 
     // MGE frame limiter: pace to the target before presenting. Off when
     // Configuration.FPSLimit == 0.

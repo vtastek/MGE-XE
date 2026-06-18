@@ -54,6 +54,18 @@ public:
     static constexpr DWORD fvfWave = D3DFVF_XYZRHW | D3DFVF_TEX2;
     static constexpr int waveTexResolution = 512;
     static constexpr float waveTexWorldRes = 2.5f;
+    // World-anchored hybrid particle foam sim (WATER_FOAM). Two cascades, each a full
+    // world-anchored 1024 sim at a different world-scale: cascade 0 (fine/near) and
+    // cascade 1 (coarse/far). The water shader samples the fine cascade near the camera
+    // and blends to the coarse one at cascade 0's window edge. Resolution is shared by
+    // all cascades (the foam passes reuse one fullscreen triangle, vbFoamSim).
+    // Single low-res CARRIER buffer (the cascades collapsed to one — Phase 2 of the indirection
+    // redesign). The carrier marks WHERE foam is (vorticity); the procedural detail in the water
+    // shader supplies the up-close crispness, so the sim itself can stay cheap and coarse.
+    // foamCascades kept = 1 so the world-anchor loop/arrays carry over unchanged (one iteration).
+    static constexpr int foamCascades = 1;
+    static constexpr int foamTexResolution = 512;     // half-size sim: ~2MB/RT × 6 RTs ≈ 12MB VRAM (¼ the fill of 1024)
+    static constexpr float foamCascadeWorldRes[foamCascades] = { 25.0f };    // 512 * 25 = 12800u window (kept; texel doubled)
     static constexpr int GrassInstStride = 48;
     static constexpr int MaxGrassElements = 8192;
     static constexpr float kCellSize = 8192.0f;
@@ -71,6 +83,13 @@ public:
     // Read once per frame at renderStage0 entry so inspectIndexedPrimitive sees
     // a stable value for the whole frame.
     static bool cacheOpaqueMode;
+    // NUMPAD7 third state (CACHE-ONLY): when true, cacheOpaqueMode is also true, but
+    // inspectIndexedPrimitive additionally suppresses EVERY other colour draw across ALL
+    // scenes (reactive PPL, the fixed-function fallback, first-person hands, alpha-sorted,
+    // UI) so only what renderCachedOpaque/renderCachedTerrain produce is visible. A
+    // diagnostic to read cache coverage at a glance: anything not owned by the cache goes
+    // black. (sky stage is separate from inspectIndexedPrimitive, so it still backdrops.)
+    static bool cacheOnlyMode;
     // Set by frameSetupEarly() when the GeometryCache walk ran at BeginScene(0);
     // read by renderDepth (different TU) to skip its own redundant walk.
     static bool earlyWalkedCache;
@@ -189,6 +208,7 @@ public:
     static IDirect3DTexture9* texRain, *texRipples, *texRippleBuffer;
     static IDirect3DSurface9* surfRain, *surfRipples, *surfRippleBuffer;
     static IDirect3DVertexBuffer9* vbWaveSim;
+    static IDirect3DVertexBuffer9* vbFoamSim;   // fullscreen triangle sized to foamTexResolution
 
     // Water flow map (UseWaterFlowMap): low-res baked RGBA8 covering the exterior
     // island. R,G = downstream flow dir (encoded), B = wave intensity, A =
@@ -196,12 +216,52 @@ public:
     // uploaded on the main thread (updateFlowMapTexture). VK_NUMPAD9 A/B.
     static IDirect3DTexture9* texFlow;
     static bool waterFlowDebugOn;
-    static bool waterFlowClassify;  // CLASSIFY view: paint water flat by category (river/pond/beach/sea)
-    static bool waterFlowDirView;   // DIRECTION view: paint water by flow angle (hue wheel)
+    static int  waterFlowDebugView; // 0 none; >0 = debug overlay id passed to the shader (2..11)
     static float waterFlowScroll;   // live shader uniform: river directional advection rate (NUMPAD8/6/3 tuning)
     static float waterFlowSeaSpeed; // live shader uniform: base wave animation rate scale (1 = stock)
     static float waterFlowCycleUV;  // live shader uniform: bounded per-cycle UV displacement (Valve flow map)
     static float waterFlowSeaRefract; // live shader uniform: sea far-wave (refraction) strength multiplier
+    static float waterFlowWarp;       // live shader uniform: domain-warp amount (world u) to break the 512u flow grid
+
+    // World-anchored hybrid Voronoi particle foam (WATER_FOAM, gated by UseWaterFlowMap).
+    // texFoamP_A/B: ping-pong particle buffer (xy = window texel pos, zw = velocity).
+    // texFoamField: smoothed velocity + density field (the vorticity source).
+    // texFoam: extracted foam intensity sampled by the water shader. fp16 throughout.
+    // Per-cascade arrays (foamCascades): cascade 0 = fine/near, cascade 1 = coarse/far.
+    static IDirect3DTexture9* texFoamP_A[foamCascades], *texFoamP_B[foamCascades], *texFoamField[foamCascades], *texFoam[foamCascades];
+    static IDirect3DSurface9* surfFoamP_A[foamCascades], *surfFoamP_B[foamCascades], *surfFoamField[foamCascades], *surfFoam[foamCascades];
+    // Advected detail-UV offset field (River Editor): per-texel world-space offset transported
+    // through the velocity field so the consume's foam texture follows curved river flow. Ping-pong.
+    static IDirect3DTexture9* texFoamUV_A[foamCascades], *texFoamUV_B[foamCascades];
+    static IDirect3DSurface9* surfFoamUV_A[foamCascades], *surfFoamUV_B[foamCascades];
+    static int   foamLastXpos[foamCascades], foamLastYpos[foamCascades];   // per-cascade world-anchor window tracking (texels)
+    static float foamOriginC[foamCascades][2];   // per-cascade window world min-corner (saved for the consume bind)
+    static bool foamSimReset;          // clear/seed the particle buffers on the next sim step
+    static bool waterFoamOn;           // runtime A/B: true = foam sim + render, false = legacy water
+    static bool foamDebugView;         // NUMPAD2: blit raw foam particle/field buffers to screen corner
+    // Per-cascade live tuning (fine/near = [0], coarse/far = [1]). The two cascades have
+    // very different texel sizes, so vorticity/density respond differently to the same
+    // values — they are tuned independently to match the two foam looks.
+    static float foamFlowForce[foamCascades];   // live: river advection force (texels/substep)
+    static float foamDecay[foamCascades];       // live: velocity decay toward the flow current
+    static float foamPressure[foamCascades];    // live: density pile-up coefficient (narrows)
+    static float foamScale[foamCascades];       // live: vorticity → foam intensity scale
+    // Two-layer foam (Phase 2): erosion + ridged-fbm shared by the far (flow-map) and near
+    // (sim carrier) layers. Live-tuned via the NUMPAD8 cycle.
+    static float foamDetailTile;       // world units per fbm cell (smaller = crisper)
+    static float foamDetailSpeed;      // far-layer flow advect rate (also the sim UV-advect rate)
+    static float foamErodeThreshold;   // erosion cut: higher = tighter foam streaks [0,1]
+    static float foamFarAmount;        // far flow-map layer strength (0 = near-only)
+    static float foamMix;              // near/sim → far modulation in the carrier window (foamDetail.w); 0 = far only
+    static float foamGaussRadius;      // sim particle splat radius → foam blob size (FoamGauss)
+    static float foamMinDensity;       // sim particle respawn density (FoamDens)
+    static float foamUVDecay;          // sim UV-offset decay → bounds detail stretch (FoamUVDcy)
+    static float foamSimSpeed;         // scales sim particle advance rate → sim-foam visual speed (SimSpeed)
+    static float foamVortGain;         // static vorticity (curl) concentration for the far foam (VortGain)
+    static float foamFineScale;        // multi-scale erosion: perforating octave scale ratio (FineScale)
+    static float foamFineAmt;          // multi-scale erosion: fine-perforation strength (FineAmt)
+    static float foamCoarseScale;      // multi-scale erosion: clumping octave scale ratio (CoarseScale)
+    static float foamCoarseAmt;        // multi-scale erosion: coarse-clumping strength (CoarseAmt)
 
     static IDirect3DTexture9* texShadow, *texSoftShadow;
     static IDirect3DSurface9* surfShadowZ;
@@ -250,8 +310,16 @@ public:
     static D3DXHANDLE ehTime;
     static D3DXHANDLE ehRippleOrigin;
     static D3DXHANDLE ehWaveHeight;
-    static D3DXHANDLE ehFlow, ehFlowTransform, ehFlowWeight, ehFlowScroll, ehFlowSeaSpeed, ehFlowCycleUV, ehFlowSeaRefract, ehFlowDebugView;
+    static D3DXHANDLE ehFlow, ehFlowTransform, ehFlowWeight, ehFlowScroll, ehFlowSeaSpeed, ehFlowCycleUV, ehFlowSeaRefract, ehFlowDebugView, ehFlowWarp;
     static D3DXHANDLE ehWaveAmp, ehWaveLen, ehWaveSpeed, ehCrestSpread;
+    static D3DXHANDLE ehFoamParticles, ehFoamFieldIn, ehFoamOrigin, ehFoamShift, ehFoamFieldShift, ehFoamPlayer, ehFoamParams, ehFoamWorldRes, ehFoamAdvance;
+    static D3DXHANDLE ehFoam0, ehFoamOrigin0, ehFoamWeight, ehFoamDetail, ehFoamFarAmount;   // ehFoam0/Origin0 = the single carrier
+    static D3DXHANDLE ehFoamUVIn, ehFoamUVRate, ehFoamUVDecay;   // UV-advection sim uniforms
+    static D3DXHANDLE ehFoamGaussRadius, ehFoamMinDensity;       // sim look knobs (blob size, particle density)
+    static D3DXHANDLE ehFoamVortGain;                            // static vorticity concentration (far foam)
+    static D3DXHANDLE ehFoamFineScale, ehFoamFineAmt;            // multi-scale foam erosion
+    static D3DXHANDLE ehFoamCoarseScale, ehFoamCoarseAmt;       // multi-scale foam erosion (coarse clumping)
+    static D3DXHANDLE ehFoamUVTex;                               // consume: advected UV offset field
 
     static std::function<void(IDirect3DSurface9*)> captureScreenHandler;
     static bool captureScreenWithUI;
@@ -263,6 +331,7 @@ public:
     static bool initWater();
     static bool initWaterLodMesh();
     static bool initDynamicWaves();
+    static bool initFoamSim();
     static bool initLandscapeClient();
     static bool initLandscape();
     static bool initDistantStaticsClient();
@@ -530,6 +599,12 @@ public:
     // Debug: number of set bits in the current water-silhouette mask (0 if invalid).
     static int reflWaterMaskSetBits();
     static void simulateDynamicWaves();
+    // World-anchored hybrid particle foam sim (WATER_FOAM). Runs in the same effect
+    // Begin bracket as simulateDynamicWaves (reuses vbWaveSim + WaveVS), gated by
+    // UseWaterFlowMap && waterFoamOn. Tracks the player with a texel-aligned StretchRect
+    // shift (world-locked foam), advects Voronoi particles along the flow map, and
+    // writes foam intensity into texFoam for the water shader.
+    static void simulateFoam();
     static void renderWaterPlane();
 
     static void renderDepth();

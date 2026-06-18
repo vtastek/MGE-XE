@@ -87,7 +87,7 @@
       <WarningLevel>Level3</WarningLevel>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <Optimization>Disabled</Optimization>
-      <AdditionalIncludeDirectories>./src;./src/mge;./3rdparty/tracy/public;..\..\MWSE\SharedSE</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>./src;./src/mge;./src\imgui;./src\imgui\backends;./3rdparty/tracy/public;..\..\MWSE\SharedSE</AdditionalIncludeDirectories>
       <EnableEnhancedInstructionSet>StreamingSIMDExtensions2</EnableEnhancedInstructionSet>
       <FloatingPointModel>Fast</FloatingPointModel>
       <EnforceTypeConversionRules>true</EnforceTypeConversionRules>
@@ -112,7 +112,7 @@
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <EnableEnhancedInstructionSet>StreamingSIMDExtensions2</EnableEnhancedInstructionSet>
       <FloatingPointModel>Fast</FloatingPointModel>
-      <AdditionalIncludeDirectories>./src;./src/mge;./3rdparty/tracy/public;..\..\MWSE\SharedSE</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>./src;./src/mge;./src\imgui;./src\imgui\backends;./3rdparty/tracy/public;..\..\MWSE\SharedSE</AdditionalIncludeDirectories>
       <EnforceTypeConversionRules>true</EnforceTypeConversionRules>
       <RuntimeTypeInfo>false</RuntimeTypeInfo>
       <LanguageStandard>stdcpp20</LanguageStandard>
@@ -139,7 +139,7 @@
       <Optimization>MaxSpeed</Optimization>
       <EnableEnhancedInstructionSet>StreamingSIMDExtensions2</EnableEnhancedInstructionSet>
       <FloatingPointModel>Fast</FloatingPointModel>
-      <AdditionalIncludeDirectories>./src;./src/mge;./3rdparty/tracy/public;..\..\MWSE\SharedSE</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>./src;./src/mge;./src\imgui;./src\imgui\backends;./3rdparty/tracy/public;..\..\MWSE\SharedSE</AdditionalIncludeDirectories>
       <EnforceTypeConversionRules>true</EnforceTypeConversionRules>
       <RuntimeTypeInfo>false</RuntimeTypeInfo>
       <LanguageStandard>stdcpp20</LanguageStandard>
@@ -187,6 +187,13 @@
     <ClCompile Include="src\mge\quadtree.cpp" />
     <ClCompile Include="src\mge\renderdepth.cpp" />
     <ClCompile Include="src\mge\renderexterior.cpp" />
+    <ClCompile Include="src\mge\imgui_water.cpp" />
+    <ClCompile Include="src\imgui\imgui.cpp" />
+    <ClCompile Include="src\imgui\imgui_draw.cpp" />
+    <ClCompile Include="src\imgui\imgui_tables.cpp" />
+    <ClCompile Include="src\imgui\imgui_widgets.cpp" />
+    <ClCompile Include="src\imgui\backends\imgui_impl_dx9.cpp" />
+    <ClCompile Include="src\imgui\backends\imgui_impl_win32.cpp" />
     <ClCompile Include="src\mge\rendergrass.cpp" />
     <ClCompile Include="src\mge\rendershadow.cpp" />
     <ClCompile Include="src\mge\renderthread.cpp" />
