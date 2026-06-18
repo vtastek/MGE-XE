@@ -127,6 +127,14 @@ namespace IPC {
         // by DistantLand::cullDistantStatics_kickoff to let the server-
         // side quadtree work overlap with shadow / curtain rendering.
         GetVisibleMeshesAllRanges,
+
+        // --- Present-seam spike (out-of-process 64-bit renderer) ---
+        // RenderInit: bring up the host-side Vulkan renderer for a fixed WxH
+        // target and bind the shared framebuffer vec that carries pixels back
+        // to the 32-bit side (Milestone A, CPU staging). RenderFrame: render one
+        // frame into that vec. Both no-ops unless the spike is enabled client-side.
+        RenderInit,
+        RenderFrame,
     };
 
     struct AllocVecParameters {
@@ -219,6 +227,29 @@ namespace IPC {
         IN VecId occlusionMask;
     };
 
+    // --- Present-seam spike params ---
+    // Milestone A uses a dedicated flat shared mapping (not a windowed Vec) for the
+    // framebuffer: a W*H*4 blob must stay contiguous on both sides, and the windowed
+    // Vec's reservedBytes = maxSize*windowBytes term overflows uint32 for a ~1MB
+    // single-window allocation. The host creates the mapping and duplicates the handle
+    // back into the client process (the same cross-process handle-sharing Vec::init
+    // does), so the client maps it read-only-ish for the blit. Milestone B swaps this
+    // CPU mapping for a shared GPU texture handle in the same OUT slot.
+    struct RenderInitParameters {
+        IN std::uint32_t width;
+        IN std::uint32_t height;
+
+        OUT HANDLE32 framebufferHandle;  // file-mapping handle valid in the CLIENT process (host-created, duplicated in)
+        OUT bool ok;
+    };
+
+    struct RenderFrameParameters {
+        IN std::uint32_t frameIndex;     // for logging / future double-buffering
+
+        OUT std::uint32_t bytesWritten;
+        OUT double renderMs;             // host-side render+readback time
+    };
+
 	struct Parameters {
         Command command;
         union {
@@ -230,6 +261,8 @@ namespace IPC {
             SetWorldSpaceParameters worldSpaceParams;
             GetMeshesParameters meshParams;
             GetMeshesAllRangesParameters meshAllRangesParams;
+            RenderInitParameters renderInitParams;
+            RenderFrameParameters renderFrameParams;
         } params;
 	};
 }

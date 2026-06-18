@@ -152,6 +152,7 @@ const iniSetting iniSettings[] = {
     {&Configuration.UseRenderThread, t_bool, 1, siniMisc, "Use Render Thread", False, &dictBool, DICTONLY, 0, 0},
     {&Configuration.UseTiledLights, t_bool, 1, siniMisc, "Use Tiled Lights", False, &dictBool, DICTONLY, 0, 0},
     {&Configuration.UseWaterFlowMap, t_bool, 1, siniMisc, "Use Water Flow Map", False, &dictBool, DICTONLY, 0, 0},
+    {&Configuration.UseRenderProcess, t_bool, 1, siniMisc, "Use Render Process", False, &dictBool, DICTONLY, 0, 0},
 
     // Distant Land flags
     {&Configuration.MGEFlags, t_bit, USE_DISTANT_LAND_BIT, siniDL, "Distant Land", True, &dictBool, DICTONLY, 0, 0},

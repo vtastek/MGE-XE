@@ -2,6 +2,7 @@
 #include "ipc/server.h"
 #include "ipc/occlusiontest.h"
 #include "support/log.h"
+#include "vkrender.h"
 
 #include <cassert>
 
@@ -58,6 +59,15 @@ namespace {
     OcclusionMask::HostMask g_hostMask;
     int g_hostMaskLogFrame   = 0;
     int g_hostCulledThisRpc  = 0;
+
+    // --- Present-seam spike state ---
+    // Host-owned flat framebuffer mapping. g_spikeFbLocal is the 64-bit view the
+    // Vulkan readback writes into; the duplicated 32-bit handle is returned to the
+    // client so it can map the same blob for the composite blit.
+    HANDLE g_spikeFbMap = nullptr;
+    void* g_spikeFbLocal = nullptr;
+    std::uint32_t g_spikeWidth = 0;
+    std::uint32_t g_spikeHeight = 0;
 
     // OcclusionFilter callback: raw per-frame verdict (matches MGE's in-process
     // cull — no inflate, no hysteresis, both unwired in MGE today). ctx is the
@@ -175,6 +185,12 @@ namespace IPC {
 				break;
 			case Command::SortVisibleSet:
 				sortVisibleSet();
+				break;
+			case Command::RenderInit:
+				renderInit();
+				break;
+			case Command::RenderFrame:
+				renderFrame();
 				break;
 			default:
 				LOG::logline("Received unknown command value %u", m_ipcParameters->command);
@@ -366,5 +382,78 @@ namespace IPC {
 		auto& params = m_ipcParameters->params.meshParams;
 		auto& vec = getVec<RenderMesh>(params.visibleSet);
 		DistantLandShare::sortVisibleSet(vec, params.sort);
+	}
+
+	// --- Present-seam spike ---
+	// Bring up the Vulkan offscreen renderer, create the flat framebuffer mapping,
+	// and duplicate its handle into the client process for the composite blit.
+	void Server::renderInit() {
+		auto& params = m_ipcParameters->params.renderInitParams;
+		params.framebufferHandle = nullptr;
+		params.ok = false;
+
+		if (!VKRender::init(params.width, params.height)) {
+			LOG::logline("!! [spike] VKRender::init(%ux%u) failed", params.width, params.height);
+			return;
+		}
+
+		// Tear down any prior mapping (re-init on size change).
+		if (g_spikeFbLocal) { UnmapViewOfFile(g_spikeFbLocal); g_spikeFbLocal = nullptr; }
+		if (g_spikeFbMap)   { CloseHandle(g_spikeFbMap); g_spikeFbMap = nullptr; }
+
+		const std::uint32_t bytes = params.width * params.height * 4u;
+		g_spikeFbMap = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, bytes, NULL);
+		if (g_spikeFbMap == NULL) {
+			LOG::winerror("[spike] failed to create framebuffer mapping (%u bytes)", bytes);
+			g_spikeFbMap = nullptr;
+			return;
+		}
+		g_spikeFbLocal = MapViewOfFile(g_spikeFbMap, FILE_MAP_ALL_ACCESS, 0, 0, bytes);
+		if (g_spikeFbLocal == nullptr) {
+			LOG::winerror("[spike] failed to map framebuffer locally");
+			CloseHandle(g_spikeFbMap);
+			g_spikeFbMap = nullptr;
+			return;
+		}
+
+		// Duplicate the mapping handle into the client process (same mechanism Vec::init uses).
+		HANDLE clientHandle = INVALID_HANDLE_VALUE;
+		if (!DuplicateHandle(GetCurrentProcess(), g_spikeFbMap, m_clientProcess, &clientHandle,
+				0, FALSE, DUPLICATE_SAME_ACCESS)) {
+			LOG::winerror("[spike] failed to duplicate framebuffer handle to client");
+			UnmapViewOfFile(g_spikeFbLocal); g_spikeFbLocal = nullptr;
+			CloseHandle(g_spikeFbMap); g_spikeFbMap = nullptr;
+			return;
+		}
+
+		g_spikeWidth = params.width;
+		g_spikeHeight = params.height;
+#pragma warning(push)
+#pragma warning(disable: 4244 4302 4311)
+		params.framebufferHandle = static_cast<HANDLE32>(clientHandle);
+#pragma warning(pop)
+		params.ok = true;
+		LOG::logline(">> [spike] render init ok (%ux%u, %u bytes, client handle %p)",
+			params.width, params.height, bytes, clientHandle);
+	}
+
+	// Render one triangle frame and copy the pixels into the flat framebuffer mapping.
+	void Server::renderFrame() {
+		auto& params = m_ipcParameters->params.renderFrameParams;
+		params.bytesWritten = 0;
+		params.renderMs = 0.0;
+
+		if (g_spikeFbLocal == nullptr || !VKRender::isReady()) {
+			return;
+		}
+
+		const std::uint32_t bytes = g_spikeWidth * g_spikeHeight * 4u;
+		double renderMs = 0.0;
+		if (!VKRender::renderFrame(g_spikeFbLocal, bytes, &renderMs)) {
+			return;
+		}
+
+		params.bytesWritten = bytes;
+		params.renderMs = renderMs;
 	}
 }

@@ -47,6 +47,8 @@ namespace IPC {
 		void getVisibleMeshes();
 		void getVisibleMeshesAllRanges();
 		void sortVisibleSet();
+		void renderInit();
+		void renderFrame();
 
 	public:
 		Server(HANDLE sharedMem, HANDLE clientProcess, HANDLE rpcStartEvent, HANDLE rpcCompleteEvent);

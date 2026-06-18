@@ -17,6 +17,7 @@
 #include "userhud.h"
 #include "videobackground.h"
 #include "imgui_water.h"
+#include "renderprocess.h"
 #include "mge_tracy.h"
 #include "drawstats.h"
 #include "support/timing.h"
@@ -536,6 +537,10 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
     // Dear ImGui Water/Foam tuning panel (F10). Drawn onto the backbuffer after the scene,
     // before pacing/present. Lazily inits on the first call.
     ImGuiWater::onPresent(realDevice);
+
+    // Present-seam spike: composite the out-of-process Vulkan renderer's output as a
+    // corner quad (gated by Configuration.UseRenderProcess + F11). No-op otherwise.
+    RenderProcess::onPresent(realDevice);
 
     // MGE frame limiter: pace to the target before presenting. Off when
     // Configuration.FPSLimit == 0.

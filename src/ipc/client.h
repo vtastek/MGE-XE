@@ -240,6 +240,23 @@ namespace IPC {
 		*/
 		bool sortVisibleSet(VecId visibleSet, VisibleSetSort sort);
 
+		/**
+		* @brief Present-seam spike: initialize the host-side renderer.
+		* @param width Target width in pixels.
+		* @param height Target height in pixels.
+		* @param outFramebufferHandle Receives a file-mapping HANDLE (valid in this process) for the W*H*4 pixel blob.
+		* @return Whether the host renderer initialized successfully (blocking).
+		*/
+		bool renderInitBlocking(std::uint32_t width, std::uint32_t height, HANDLE* outFramebufferHandle);
+
+		/**
+		* @brief Present-seam spike: render one frame into the shared framebuffer vec.
+		* @param frameIndex Frame counter (for logging only).
+		* @param outRenderMs Optional out-param: host-side render+readback time in ms.
+		* @return Whether the frame was rendered and copied successfully (blocking).
+		*/
+		bool renderFrameBlocking(std::uint32_t frameIndex, double* outRenderMs = nullptr);
+
 		WakeReason waitForCompletion(DWORD ms = MaxWait);
 
 		/**

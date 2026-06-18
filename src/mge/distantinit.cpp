@@ -12,6 +12,7 @@
 #include "mgeversion.h"
 #include "scenegraph_geometry_cache.h"
 #include "statusoverlay.h"
+#include "renderprocess.h"
 #include "ipc/dlshare.h"
 #include <algorithm>
 #include <cmath>
@@ -543,6 +544,10 @@ bool DistantLand::initIpc() {
     auto& maskVec = maybeMaskVec.value();
     maskBlobSharedId = maskVec.id();
     maskBlobShared = maskVec;
+
+    // Present-seam spike: bring up the out-of-process Vulkan renderer (gated by
+    // Configuration.UseRenderProcess; no-op otherwise).
+    RenderProcess::init(&ipcClient);
 
     return true;
 }

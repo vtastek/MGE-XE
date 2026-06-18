@@ -306,6 +306,49 @@ namespace IPC {
 		return beginRpc(Command::SortVisibleSet);
 	}
 
+	bool Client::renderInitBlocking(std::uint32_t width, std::uint32_t height, HANDLE* outFramebufferHandle) {
+		WAIT_FOR_PREVIOUS_COMMAND;
+
+		auto& params = m_ipcParameters->params.renderInitParams;
+		params.width = width;
+		params.height = height;
+		params.framebufferHandle = nullptr;
+		params.ok = false;
+		if (!beginRpc(Command::RenderInit)) {
+			return false;
+		}
+
+		if (waitForCompletion() != WakeReason::Complete) {
+			return false;
+		}
+
+		if (params.ok && outFramebufferHandle) {
+			*outFramebufferHandle = static_cast<HANDLE>(params.framebufferHandle);
+		}
+		return params.ok;
+	}
+
+	bool Client::renderFrameBlocking(std::uint32_t frameIndex, double* outRenderMs) {
+		WAIT_FOR_PREVIOUS_COMMAND;
+
+		auto& params = m_ipcParameters->params.renderFrameParams;
+		params.frameIndex = frameIndex;
+		params.bytesWritten = 0;
+		params.renderMs = 0.0;
+		if (!beginRpc(Command::RenderFrame)) {
+			return false;
+		}
+
+		if (waitForCompletion() != WakeReason::Complete) {
+			return false;
+		}
+
+		if (outRenderMs) {
+			*outRenderMs = params.renderMs;
+		}
+		return params.bytesWritten > 0;
+	}
+
 	WakeReason Client::waitForCompletion(DWORD ms) {
 		auto result = WaitForMultipleObjects(2, m_waitHandles, FALSE, ms);
 		switch (result) {
