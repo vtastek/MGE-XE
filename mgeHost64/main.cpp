@@ -26,6 +26,19 @@ int main(int argc, char** argv) {
 		return ForgeRender::probe() ? 0 : 1;
 	}
 
+	// Standalone Forge render probe (Milestone D3): render the hardcoded triangle
+	// to a Forge-owned render target and verify the readback. No MW seam.
+	if (argc >= 2 && std::strcmp(argv[1], "--forge-render") == 0) {
+		return ForgeRender::renderTriangle() ? 0 : 1;
+	}
+
+	// Standalone shared-RT render probe (Milestone D4 host half): render the
+	// triangle into a cross-process SHARED D3D12 render target + export an NT
+	// handle. Proves the host side of the route-1 present seam.
+	if (argc >= 2 && std::strcmp(argv[1], "--forge-render-shared") == 0) {
+		return ForgeRender::renderTriangleShared() ? 0 : 1;
+	}
+
 	LOG::open("mgeHost64.log");
 	LOG::logline("Host process started");
 

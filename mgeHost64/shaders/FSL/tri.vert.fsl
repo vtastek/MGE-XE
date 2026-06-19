@@ -1,0 +1,36 @@
+// mgeHost64 — Milestone D2/D3 first-light triangle (vertex stage).
+//
+// Hardcoded clip-space triangle, no vertex buffer, no resources: the three
+// positions/colors are selected by SV_VertexID. This is the minimal shader that
+// proves the FSL -> DXC -> DIRECT3D12 binary toolchain and addShader/addPipeline
+// path before any real geometry or uniforms exist. Uses DefaultRootSignature
+// (the Forge stock root sig) even though it binds nothing — ROOT_SIGNATURE is
+// mandatory and DefaultRootSignature is self-contained (no SRT include needed).
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float4, Color, COLOR);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+VSOutput VS_MAIN( SV_VertexID(uint) VertexID )
+{
+    INIT_MAIN;
+    VSOutput Out;
+
+    float2 positions[3] = {
+        float2( 0.0f,  0.6f),
+        float2( 0.6f, -0.6f),
+        float2(-0.6f, -0.6f)
+    };
+    float3 colors[3] = {
+        float3(1.0f, 0.0f, 0.0f),
+        float3(0.0f, 1.0f, 0.0f),
+        float3(0.0f, 0.0f, 1.0f)
+    };
+
+    Out.Position = float4(positions[VertexID], 0.0f, 1.0f);
+    Out.Color = float4(colors[VertexID], 1.0f);
+    RETURN(Out);
+}

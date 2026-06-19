@@ -243,7 +243,11 @@ namespace IPC {
         // (zero-copy). [1] non-null double-buffers (C). Both null ⇒ Milestone A CPU readback.
         IN HANDLE32 sharedTextureHandles[2];
 
-        OUT HANDLE32 framebufferHandle;  // A path only: file-mapping handle valid in the CLIENT process (host-created, duplicated in). Null on the B path.
+        // Route 1 (Forge D3D12 host): the host's SHARED D3D12 render-target NT handle,
+        // duplicated into the CLIENT process. MW ingests it via D3D9Ex CreateTexture.
+        // (Formerly the Milestone-A file-mapping handle; the IN sharedTextureHandles[]
+        // above are now ignored — the host owns the RT. Field name kept to avoid churn.)
+        OUT HANDLE32 framebufferHandle;
         OUT bool ok;
     };
 

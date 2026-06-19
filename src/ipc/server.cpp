@@ -3,6 +3,7 @@
 #include "ipc/occlusiontest.h"
 #include "support/log.h"
 #include "vkrender.h"
+#include "forgerender.h"
 
 #include <cassert>
 
@@ -60,12 +61,9 @@ namespace {
     int g_hostMaskLogFrame   = 0;
     int g_hostCulledThisRpc  = 0;
 
-    // --- Present-seam spike state ---
-    // Host-owned flat framebuffer mapping. g_spikeFbLocal is the 64-bit view the
-    // Vulkan readback writes into; the duplicated 32-bit handle is returned to the
-    // client so it can map the same blob for the composite blit.
-    HANDLE g_spikeFbMap = nullptr;
-    void* g_spikeFbLocal = nullptr;
+    // --- Present-seam state ---
+    // Target size of the Forge-owned shared render target (set at RenderInit), used
+    // to report bytesWritten back to the client.
     std::uint32_t g_spikeWidth = 0;
     std::uint32_t g_spikeHeight = 0;
 
@@ -98,6 +96,9 @@ namespace IPC {
 	{ }
 
 	Server::~Server() {
+		// Tear down the Forge present-seam renderer if RenderInit brought it up.
+		ForgeRender::shutdown();
+
 		if (m_ipcParameters != nullptr) {
 			UnmapViewOfFile(m_ipcParameters);
 			m_ipcParameters = nullptr;
@@ -384,68 +385,40 @@ namespace IPC {
 		DistantLandShare::sortVisibleSet(vec, params.sort);
 	}
 
-	// --- Present-seam spike ---
-	// Bring up the Vulkan offscreen renderer, create the flat framebuffer mapping,
-	// and duplicate its handle into the client process for the composite blit.
+	// --- Present seam (route 1: Forge D3D12 host renderer) ---
+	// The Forge host creates a SHARED D3D12 render target + NT handle; we duplicate
+	// that handle into the client (MW) process, which ingests it via D3D9Ex
+	// CreateTexture. (The Vulkan VKRender path stays in the tree as the CPU-staging
+	// fallback but is no longer wired here — see project_d4_present_seam_wiring.)
+	// MW's old B-path sharedTextureHandles[] are ignored: the host now OWNS the RT.
 	void Server::renderInit() {
 		auto& params = m_ipcParameters->params.renderInitParams;
-		params.framebufferHandle = nullptr;
+		params.framebufferHandle = nullptr;   // reused as the shared-RT NT handle (client-process value)
 		params.ok = false;
 
-		// KMT/global D3D9Ex shared handle is a 32-bit D3DKMT value; zero-extend (NOT
-		// sign-extend) to a 64-bit HANDLE so high-bit handles import cleanly.
-#pragma warning(push)
-#pragma warning(disable: 4302 4311 4312)
-		HANDLE sharedTex0 = reinterpret_cast<HANDLE>(
-			static_cast<std::uintptr_t>(reinterpret_cast<std::uint32_t>(params.sharedTextureHandles[0])));
-		HANDLE sharedTex1 = reinterpret_cast<HANDLE>(
-			static_cast<std::uintptr_t>(reinterpret_cast<std::uint32_t>(params.sharedTextureHandles[1])));
-#pragma warning(pop)
-
-		if (!VKRender::init(params.width, params.height, sharedTex0, sharedTex1)) {
-			LOG::logline("!! [spike] VKRender::init(%ux%u, shared=%p/%p) failed",
-				params.width, params.height, sharedTex0, sharedTex1);
+		if (!ForgeRender::init(params.width, params.height)) {
+			LOG::logline("!! [seam] ForgeRender::init(%ux%u) failed", params.width, params.height);
 			return;
 		}
 
 		g_spikeWidth = params.width;
 		g_spikeHeight = params.height;
 
-		if (sharedTex0 != nullptr) {
-			// B/C path: the host renders directly into the imported shared GPU texture(s); no
-			// CPU framebuffer mapping is needed and none is returned.
-			params.ok = true;
-			LOG::logline(">> [spike] render init ok (GPU shared textures %p/%p, %ux%u, zero-copy)",
-				sharedTex0, sharedTex1, params.width, params.height);
+		HANDLE hostHandle = static_cast<HANDLE>(ForgeRender::sharedHandle());
+		if (hostHandle == nullptr) {
+			LOG::logline("!! [seam] ForgeRender produced no shared handle");
+			ForgeRender::shutdown();
 			return;
 		}
 
-		// Tear down any prior mapping (re-init on size change).
-		if (g_spikeFbLocal) { UnmapViewOfFile(g_spikeFbLocal); g_spikeFbLocal = nullptr; }
-		if (g_spikeFbMap)   { CloseHandle(g_spikeFbMap); g_spikeFbMap = nullptr; }
-
-		const std::uint32_t bytes = params.width * params.height * 4u;
-		g_spikeFbMap = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, bytes, NULL);
-		if (g_spikeFbMap == NULL) {
-			LOG::winerror("[spike] failed to create framebuffer mapping (%u bytes)", bytes);
-			g_spikeFbMap = nullptr;
-			return;
-		}
-		g_spikeFbLocal = MapViewOfFile(g_spikeFbMap, FILE_MAP_ALL_ACCESS, 0, 0, bytes);
-		if (g_spikeFbLocal == nullptr) {
-			LOG::winerror("[spike] failed to map framebuffer locally");
-			CloseHandle(g_spikeFbMap);
-			g_spikeFbMap = nullptr;
-			return;
-		}
-
-		// Duplicate the mapping handle into the client process (same mechanism Vec::init uses).
+		// Duplicate the host's NT shared-RT handle into the client (MW) process, so
+		// MW's D3D9Ex can ingest it directly as pSharedHandle (same cross-process
+		// mechanism Vec::init / the old A-path used).
 		HANDLE clientHandle = INVALID_HANDLE_VALUE;
-		if (!DuplicateHandle(GetCurrentProcess(), g_spikeFbMap, m_clientProcess, &clientHandle,
+		if (!DuplicateHandle(GetCurrentProcess(), hostHandle, m_clientProcess, &clientHandle,
 				0, FALSE, DUPLICATE_SAME_ACCESS)) {
-			LOG::winerror("[spike] failed to duplicate framebuffer handle to client");
-			UnmapViewOfFile(g_spikeFbLocal); g_spikeFbLocal = nullptr;
-			CloseHandle(g_spikeFbMap); g_spikeFbMap = nullptr;
+			LOG::winerror("[seam] failed to duplicate shared-RT handle to client");
+			ForgeRender::shutdown();
 			return;
 		}
 
@@ -454,29 +427,24 @@ namespace IPC {
 		params.framebufferHandle = static_cast<HANDLE32>(clientHandle);
 #pragma warning(pop)
 		params.ok = true;
-		LOG::logline(">> [spike] render init ok (%ux%u, %u bytes, client handle %p)",
-			params.width, params.height, bytes, clientHandle);
+		LOG::logline(">> [seam] render init ok (%ux%u, Forge shared RT, host handle %p -> client %p)",
+			params.width, params.height, hostHandle, clientHandle);
 	}
 
-	// Render one triangle frame and copy the pixels into the flat framebuffer mapping.
+	// Render one frame into the shared RT. Blocking (host fence-waits), so the reply
+	// implies the frame is GPU-complete and MW's StretchRect won't race the draw.
 	void Server::renderFrame() {
 		auto& params = m_ipcParameters->params.renderFrameParams;
 		params.bytesWritten = 0;
 		params.renderMs = 0.0;
 
-		if (!VKRender::isReady()) {
+		LARGE_INTEGER t0; QueryPerformanceCounter(&t0);
+		if (!ForgeRender::renderFrame(params.frameIndex)) {
 			return;
 		}
+		LARGE_INTEGER t1; QueryPerformanceCounter(&t1);
 
-		const std::uint32_t bytes = g_spikeWidth * g_spikeHeight * 4u;
-		double renderMs = 0.0;
-		// A path passes the CPU mapping for readback; B path (g_spikeFbLocal == null)
-		// renders straight into the imported shared texture, so pass null/0.
-		if (!VKRender::renderFrame(g_spikeFbLocal, g_spikeFbLocal ? bytes : 0, params.targetIndex, &renderMs)) {
-			return;
-		}
-
-		params.bytesWritten = bytes;
-		params.renderMs = renderMs;
+		params.bytesWritten = g_spikeWidth * g_spikeHeight * 4u;
+		params.renderMs = msBetween(t0, t1);
 	}
 }

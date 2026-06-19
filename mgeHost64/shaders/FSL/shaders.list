@@ -1,0 +1,21 @@
+// mgeHost64 FSL driver list (Milestone D2/D3 first-light triangle).
+//
+// fsl.py is fed THIS file, not the bare *.fsl bodies. The top-level
+// defaults.h include pulls in fsl_srt.h -> d3d12_srt.h, which is what defines
+// ROOT_SIGNATURE / DefaultRootSignature for every stage below. Each #vert/#frag
+// block names the output binary (loaded at runtime as RD_SHADER_BINARIES/
+// DIRECT3D12/<name>) and #includes the matching shader body. Mirrors the stock
+// 01_Transformations/Shaders/FSL/shaders.list pattern.
+
+#include "../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
+
+#rootsig default.rootsig
+#end
+
+#vert tri.vert
+#include "tri.vert.fsl"
+#end
+
+#frag tri.frag
+#include "tri.frag.fsl"
+#end

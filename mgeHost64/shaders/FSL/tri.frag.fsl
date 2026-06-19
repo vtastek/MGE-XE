@@ -1,0 +1,16 @@
+// mgeHost64 — Milestone D2/D3 first-light triangle (fragment stage).
+//
+// Passes through the interpolated vertex color. Pairs with tri.vert.fsl.
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float4, Color, COLOR);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN(VSOutput In)
+{
+    INIT_MAIN;
+    RETURN(In.Color);
+}

@@ -16,20 +16,21 @@ void* CreateD3DWrapper(UINT version) {
 
     IDirect3D9* d3d = nullptr;
 
-    // Present-seam spike (Milestone B): a D3D9Ex factory is required to create the
-    // D3D9Ex device that can produce a shared render-target HANDLE for zero-copy
-    // hand-off to the 64-bit Vulkan renderer. Gated by UseRenderProcess; the normal
-    // game keeps the plain D3D9 path untouched. If the Ex factory can't be created,
-    // the spike is disabled for this run (logged) and we proceed on plain D3D9 so the
-    // game still launches normally.
+    // Present seam: MW's MAIN device is a native D3D9Ex device (D3D9Ex is required to
+    // open the KMT-shared blit texture the seam re-shares from its dedicated D3D9On12
+    // side-device — see renderprocess.cpp). The game renders/presents on this proven
+    // native path; the 9On12 device is created separately and used ONLY for the seam,
+    // so MGE's heavy D3D9 pipeline never goes through the 9On12 translation layer
+    // (which black-screens the whole game). Gated by UseRenderProcessEx. If the Ex
+    // factory is unavailable, the seam is disabled and we proceed on plain D3D9.
     if (Configuration.UseRenderProcessEx) {
         D3DProc9Ex func9Ex = (D3DProc9Ex)GetProcAddress(d3ddll, "Direct3DCreate9Ex");
         IDirect3D9Ex* d3dEx = nullptr;
         if (func9Ex && SUCCEEDED(func9Ex(D3D_SDK_VERSION, &d3dEx)) && d3dEx) {
             d3d = d3dEx;   // IDirect3D9Ex derives from IDirect3D9
-            LOG::logline(">> [spike] Direct3DCreate9Ex OK (D3D9Ex factory active)");
+            LOG::logline(">> [seam] Direct3DCreate9Ex OK (native D3D9Ex main device)");
         } else {
-            LOG::logline("!! [spike] Direct3DCreate9Ex unavailable; disabling D3D9Ex spike path for this run");
+            LOG::logline("!! [seam] Direct3DCreate9Ex unavailable; disabling D3D9Ex seam path for this run");
             Configuration.UseRenderProcessEx = false;
         }
     }
