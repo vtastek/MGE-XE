@@ -99,9 +99,56 @@ HRESULT _stdcall MGEProxyD3D::CreateDevice(UINT a, D3DDEVTYPE b, HWND c, DWORD d
         LOG::logline("-- device created SINGLE-THREADED (flags=0x%08X)", d);
     }
 
-    // Create device in the same manner as the proxy
+    // Create device in the same manner as the proxy.
     IDirect3DDevice9* realDevice = NULL;
-    HRESULT hr = realD3D->CreateDevice(a, b, c, d, &pp, &realDevice);
+    HRESULT hr = D3DERR_INVALIDCALL;
+
+    // Present-seam spike (Milestone B): when the factory is a D3D9Ex factory
+    // (UseRenderProcess), create a D3D9Ex device via CreateDeviceEx. An Ex device is
+    // what lets us create a shared render-target texture for zero-copy hand-off to
+    // Vulkan. Ex has stricter present rules: SwapEffect must be DISCARD/FLIP (not COPY)
+    // and BackBufferCount >= 1; windowed needs a NULL fullscreen display mode. The
+    // normal game path (spike off / plain D3D9) is untouched.
+    IDirect3D9Ex* d3dEx = nullptr;
+    if (Configuration.UseRenderProcessEx &&
+        SUCCEEDED(realD3D->QueryInterface(__uuidof(IDirect3D9Ex), reinterpret_cast<void**>(&d3dEx))) && d3dEx) {
+
+        if (pp.SwapEffect == D3DSWAPEFFECT_COPY) {
+            pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+        }
+        if (pp.BackBufferCount == 0) {
+            pp.BackBufferCount = 1;
+        }
+
+        D3DDISPLAYMODEEX dm = {};
+        D3DDISPLAYMODEEX* pdm = nullptr;
+        if (!pp.Windowed) {
+            dm.Size = sizeof(D3DDISPLAYMODEEX);
+            dm.Width = pp.BackBufferWidth;
+            dm.Height = pp.BackBufferHeight;
+            dm.RefreshRate = pp.FullScreen_RefreshRateInHz;
+            dm.Format = pp.BackBufferFormat;
+            dm.ScanLineOrdering = D3DSCANLINEORDERING_PROGRESSIVE;
+            pdm = &dm;
+        }
+
+        IDirect3DDevice9Ex* exDevice = nullptr;
+        hr = d3dEx->CreateDeviceEx(a, b, c, d, &pp, pdm, &exDevice);
+        if (SUCCEEDED(hr)) {
+            realDevice = exDevice;   // IDirect3DDevice9Ex derives from IDirect3DDevice9
+            // Ex rejects D3DPOOL_MANAGED: arm the proxy + MGE MANAGED->DEFAULT translation.
+            g_spikeForceDefaultPool = true;
+            LOG::logline(">> [spike] CreateDeviceEx OK (D3D9Ex device, windowed=%d, swap=%d); MANAGED->DEFAULT pool translation armed", pp.Windowed, pp.SwapEffect);
+        } else {
+            LOG::logline("!! [spike] CreateDeviceEx failed 0x%08X; disabling D3D9Ex spike path, using plain CreateDevice", hr);
+            Configuration.UseRenderProcessEx = false;
+        }
+        d3dEx->Release();
+    }
+
+    if (!realDevice) {
+        hr = realD3D->CreateDevice(a, b, c, d, &pp, &realDevice);
+    }
 
     if (hr != D3D_OK) {
         LOG::logline("!! D3D Proxy CreateDevice failure");

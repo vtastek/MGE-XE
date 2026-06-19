@@ -392,8 +392,31 @@ namespace IPC {
 		params.framebufferHandle = nullptr;
 		params.ok = false;
 
-		if (!VKRender::init(params.width, params.height)) {
-			LOG::logline("!! [spike] VKRender::init(%ux%u) failed", params.width, params.height);
+		// KMT/global D3D9Ex shared handle is a 32-bit D3DKMT value; zero-extend (NOT
+		// sign-extend) to a 64-bit HANDLE so high-bit handles import cleanly.
+#pragma warning(push)
+#pragma warning(disable: 4302 4311 4312)
+		HANDLE sharedTex0 = reinterpret_cast<HANDLE>(
+			static_cast<std::uintptr_t>(reinterpret_cast<std::uint32_t>(params.sharedTextureHandles[0])));
+		HANDLE sharedTex1 = reinterpret_cast<HANDLE>(
+			static_cast<std::uintptr_t>(reinterpret_cast<std::uint32_t>(params.sharedTextureHandles[1])));
+#pragma warning(pop)
+
+		if (!VKRender::init(params.width, params.height, sharedTex0, sharedTex1)) {
+			LOG::logline("!! [spike] VKRender::init(%ux%u, shared=%p/%p) failed",
+				params.width, params.height, sharedTex0, sharedTex1);
+			return;
+		}
+
+		g_spikeWidth = params.width;
+		g_spikeHeight = params.height;
+
+		if (sharedTex0 != nullptr) {
+			// B/C path: the host renders directly into the imported shared GPU texture(s); no
+			// CPU framebuffer mapping is needed and none is returned.
+			params.ok = true;
+			LOG::logline(">> [spike] render init ok (GPU shared textures %p/%p, %ux%u, zero-copy)",
+				sharedTex0, sharedTex1, params.width, params.height);
 			return;
 		}
 
@@ -426,8 +449,6 @@ namespace IPC {
 			return;
 		}
 
-		g_spikeWidth = params.width;
-		g_spikeHeight = params.height;
 #pragma warning(push)
 #pragma warning(disable: 4244 4302 4311)
 		params.framebufferHandle = static_cast<HANDLE32>(clientHandle);
@@ -443,13 +464,15 @@ namespace IPC {
 		params.bytesWritten = 0;
 		params.renderMs = 0.0;
 
-		if (g_spikeFbLocal == nullptr || !VKRender::isReady()) {
+		if (!VKRender::isReady()) {
 			return;
 		}
 
 		const std::uint32_t bytes = g_spikeWidth * g_spikeHeight * 4u;
 		double renderMs = 0.0;
-		if (!VKRender::renderFrame(g_spikeFbLocal, bytes, &renderMs)) {
+		// A path passes the CPU mapping for readback; B path (g_spikeFbLocal == null)
+		// renders straight into the imported shared texture, so pass null/0.
+		if (!VKRender::renderFrame(g_spikeFbLocal, g_spikeFbLocal ? bytes : 0, params.targetIndex, &renderMs)) {
 			return;
 		}
 

@@ -1,6 +1,7 @@
 
 #include "morrowindbsa.h"
 #include "proxydx/d3d8header.h"
+#include "proxydx/devicelock.h"
 
 #include <cstdio>
 #include <cstring>
@@ -180,7 +181,7 @@ static IDirect3DTexture9* loadTextureExact(IDirect3DDevice9* dev, const char* fi
     EntryData ed = BSALoadFile(hash);
     if (ed.valid()) {
         D3DXCreateTextureFromFileInMemoryEx(dev, ed.data.get(), ed.size, D3DX_FROM_FILE, D3DX_FROM_FILE, D3DX_FROM_FILE,
-                                            0, D3DFMT_UNKNOWN, D3DPOOL_MANAGED, D3DX_DEFAULT, D3DX_DEFAULT, 0, 0, 0, &tex);
+                                            0, D3DFMT_UNKNOWN, g_spikeForceDefaultPool ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED, D3DX_DEFAULT, D3DX_DEFAULT, 0, 0, 0, &tex);
 
         // Cache even if the texture load failed
         loadedTextures[hash.LValue] = tex;

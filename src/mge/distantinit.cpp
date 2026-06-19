@@ -1,5 +1,6 @@
 
 #include "proxydx/d3d8header.h"
+#include "proxydx/devicelock.h"
 #include "support/log.h"
 #include "configuration.h"
 #include "distantland.h"
@@ -935,12 +936,12 @@ bool DistantLand::initWater() {
         LOG::logline("!! Failed to create water decl");
         return false;
     }
-    hr = device->CreateVertexBuffer(numWaterVerts * 12, 0, 0, D3DPOOL_MANAGED, &vbWater, 0);
+    hr = device->CreateVertexBuffer(numWaterVerts * 12, 0, 0, g_spikeForceDefaultPool ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED, &vbWater, 0);
     if (hr != D3D_OK) {
         LOG::logline("!! Failed to create water verts");
         return false;
     }
-    hr = device->CreateIndexBuffer(numWaterTris * 6, 0, D3DFMT_INDEX16, D3DPOOL_MANAGED, &ibWater, 0);
+    hr = device->CreateIndexBuffer(numWaterTris * 6, 0, D3DFMT_INDEX16, g_spikeForceDefaultPool ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED, &ibWater, 0);
     if (hr != D3D_OK) {
         LOG::logline("!! Failed to create water indices");
         return false;
@@ -1055,7 +1056,7 @@ bool DistantLand::initWaterLodMesh() {
     // Full grid per level; hole/ring verts kept for trivial indexing (16-bit safe).
     numWaterLodVerts = L * verts1D * verts1D;
 
-    hr = device->CreateVertexBuffer(numWaterLodVerts * 12, 0, 0, D3DPOOL_MANAGED, &vbWaterLod, 0);
+    hr = device->CreateVertexBuffer(numWaterLodVerts * 12, 0, 0, g_spikeForceDefaultPool ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED, &vbWaterLod, 0);
     if (hr != D3D_OK) {
         LOG::logline("!! Failed to create LOD water verts");
         return false;
@@ -1193,7 +1194,7 @@ bool DistantLand::initWaterLodMesh() {
     }
 
     const int totalTris = int(indices.size() / 3);
-    hr = device->CreateIndexBuffer(int(indices.size()) * 2, 0, D3DFMT_INDEX16, D3DPOOL_MANAGED, &ibWaterLod, 0);
+    hr = device->CreateIndexBuffer(int(indices.size()) * 2, 0, D3DFMT_INDEX16, g_spikeForceDefaultPool ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED, &ibWaterLod, 0);
     if (hr != D3D_OK) {
         LOG::logline("!! Failed to create LOD water indices");
         return false;
@@ -1465,7 +1466,7 @@ bool DistantLand::loadStaticMeshes(HANDLE h, T& distantStatics, U& distantSubset
 
     // Bright yellow error texture
     IDirect3DTexture9* errorTexture;
-    device->CreateTexture(1, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &errorTexture, NULL);
+    device->CreateTexture(1, 1, 1, g_spikeForceDefaultPool ? D3DUSAGE_DYNAMIC : 0, D3DFMT_A8R8G8B8, g_spikeForceDefaultPool ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED, &errorTexture, NULL);
 
     D3DLOCKED_RECT yellow;
     errorTexture->LockRect(0, &yellow, NULL, 0);

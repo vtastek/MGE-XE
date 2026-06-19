@@ -27,6 +27,13 @@
 extern std::mutex g_deviceMtx;
 extern bool       g_deviceLockEnabled;
 
+// Present-seam spike (Milestone B): set true only when MW's device was created as
+// D3D9Ex (UseRenderProcessEx). D3D9Ex rejects D3DPOOL_MANAGED, so while this is set
+// the proxy resource-creation forwarders translate MANAGED -> DEFAULT (textures also
+// gain D3DUSAGE_DYNAMIC so they stay lockable), and MGE's own MANAGED allocations do
+// the same. Off (the normal game) = every allocation stays exactly as before.
+extern bool       g_spikeForceDefaultPool;
+
 struct MgeDeviceLock {
     bool held;
     MgeDeviceLock()  : held(g_deviceLockEnabled) { if (held) g_deviceMtx.lock(); }

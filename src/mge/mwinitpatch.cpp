@@ -50,8 +50,10 @@ void MWInitPatch::patch() {
         mwBridge->disableIntroMovies();
     }
 
-    if (Configuration.UseDefaultTexturePool) {
-        // Patch texture loading to reduce process memory footprint
+    if (Configuration.UseDefaultTexturePool || Configuration.UseRenderProcessEx) {
+        // Patch texture loading to reduce process memory footprint. Also force-on for the
+        // D3D9Ex spike path: Ex rejects D3DPOOL_MANAGED, and this routes Morrowind's static
+        // textures through a SYSTEMMEM staging texture into a DEFAULT-pool texture.
         mwBridge->patchLoadTexture2D();
     }
 

@@ -1,5 +1,6 @@
 
 #include "proxydx/d3d8header.h"
+#include "proxydx/devicelock.h"
 #include "support/log.h"
 #include "configuration.h"
 #include "drawstats.h"
@@ -460,7 +461,7 @@ bool PostShaders::initBuffers() {
     doublebuffer.init(texDoubleBuffer, surfaceDoubleBuffer);
 
     // Skip vertex shader with post-transform vertex buffer
-    hr = device->CreateVertexBuffer(4 * 32, 0, 0, D3DPOOL_MANAGED, &vbPost, 0);
+    hr = device->CreateVertexBuffer(4 * 32, 0, 0, g_spikeForceDefaultPool ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED, &vbPost, 0);
     if (hr != D3D_OK) {
         LOG::logline("!! Failed to create post-process verts");
         return false;

@@ -244,18 +244,22 @@ namespace IPC {
 		* @brief Present-seam spike: initialize the host-side renderer.
 		* @param width Target width in pixels.
 		* @param height Target height in pixels.
-		* @param outFramebufferHandle Receives a file-mapping HANDLE (valid in this process) for the W*H*4 pixel blob.
+		* @param sharedTexture0 D3D9Ex shared RT handle for zero-copy (Milestone B); null ⇒ CPU readback (A).
+		* @param sharedTexture1 Second shared RT handle to double-buffer (Milestone C); null ⇒ single-buffered.
+		* @param outFramebufferHandle A path only: receives a file-mapping HANDLE for the W*H*4 pixel blob (null on B).
 		* @return Whether the host renderer initialized successfully (blocking).
 		*/
-		bool renderInitBlocking(std::uint32_t width, std::uint32_t height, HANDLE* outFramebufferHandle);
+		bool renderInitBlocking(std::uint32_t width, std::uint32_t height,
+			HANDLE sharedTexture0, HANDLE sharedTexture1, HANDLE* outFramebufferHandle);
 
 		/**
-		* @brief Present-seam spike: render one frame into the shared framebuffer vec.
+		* @brief Present-seam spike: render one frame into shared buffer targetIndex.
 		* @param frameIndex Frame counter (for logging only).
-		* @param outRenderMs Optional out-param: host-side render+readback time in ms.
-		* @return Whether the frame was rendered and copied successfully (blocking).
+		* @param targetIndex Which shared buffer to render into (0/1 for double-buffering).
+		* @param outRenderMs Optional out-param: host-side render time in ms.
+		* @return Whether the frame was rendered successfully (blocking).
 		*/
-		bool renderFrameBlocking(std::uint32_t frameIndex, double* outRenderMs = nullptr);
+		bool renderFrameBlocking(std::uint32_t frameIndex, std::uint32_t targetIndex, double* outRenderMs = nullptr);
 
 		WakeReason waitForCompletion(DWORD ms = MaxWait);
 

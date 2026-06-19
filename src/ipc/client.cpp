@@ -306,12 +306,18 @@ namespace IPC {
 		return beginRpc(Command::SortVisibleSet);
 	}
 
-	bool Client::renderInitBlocking(std::uint32_t width, std::uint32_t height, HANDLE* outFramebufferHandle) {
+	bool Client::renderInitBlocking(std::uint32_t width, std::uint32_t height,
+		HANDLE sharedTexture0, HANDLE sharedTexture1, HANDLE* outFramebufferHandle) {
 		WAIT_FOR_PREVIOUS_COMMAND;
 
 		auto& params = m_ipcParameters->params.renderInitParams;
 		params.width = width;
 		params.height = height;
+#pragma warning(push)
+#pragma warning(disable: 4244 4302 4311)
+		params.sharedTextureHandles[0] = static_cast<HANDLE32>(sharedTexture0);
+		params.sharedTextureHandles[1] = static_cast<HANDLE32>(sharedTexture1);
+#pragma warning(pop)
 		params.framebufferHandle = nullptr;
 		params.ok = false;
 		if (!beginRpc(Command::RenderInit)) {
@@ -328,11 +334,12 @@ namespace IPC {
 		return params.ok;
 	}
 
-	bool Client::renderFrameBlocking(std::uint32_t frameIndex, double* outRenderMs) {
+	bool Client::renderFrameBlocking(std::uint32_t frameIndex, std::uint32_t targetIndex, double* outRenderMs) {
 		WAIT_FOR_PREVIOUS_COMMAND;
 
 		auto& params = m_ipcParameters->params.renderFrameParams;
 		params.frameIndex = frameIndex;
+		params.targetIndex = targetIndex;
 		params.bytesWritten = 0;
 		params.renderMs = 0.0;
 		if (!beginRpc(Command::RenderFrame)) {

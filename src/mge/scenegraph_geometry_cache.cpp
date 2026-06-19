@@ -17,6 +17,7 @@
 #include "datahandler_view.h"
 #include "mge_tracy.h"
 #include "proxydx/d3d8texture.h"
+#include "proxydx/devicelock.h"
 #include "scenegraph_geometry_cache.h"
 #include "support/log.h"
 
@@ -232,7 +233,7 @@ namespace MGE::GeometryCache {
                     vertexCount * stride,
                     D3DUSAGE_WRITEONLY,
                     vbFVF,
-                    D3DPOOL_MANAGED, &e.vb[slot], nullptr);
+                    g_spikeForceDefaultPool ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED, &e.vb[slot], nullptr);
                 if (FAILED(hr)) { e.vb[slot] = nullptr; return; }
             }
 
@@ -240,7 +241,7 @@ namespace MGE::GeometryCache {
             if (createdIB) {
                 g_device->CreateIndexBuffer(
                     triCount * 6, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16,
-                    D3DPOOL_MANAGED, &e.ib, nullptr);
+                    g_spikeForceDefaultPool ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED, &e.ib, nullptr);
             }
 
             void* vbData = nullptr;
@@ -374,7 +375,7 @@ namespace MGE::GeometryCache {
 
             HRESULT hr = g_device->CreateVertexBuffer(
                 vertexCount * MGE::GeometryCache::kSkinnedVBStride, D3DUSAGE_WRITEONLY,
-                0, D3DPOOL_MANAGED, &e.vb[0], nullptr);
+                0, g_spikeForceDefaultPool ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED, &e.vb[0], nullptr);
             if (FAILED(hr)) { e.vb[0] = nullptr; return; }
 
             void* vbData = nullptr;
@@ -415,7 +416,7 @@ namespace MGE::GeometryCache {
 
             hr = g_device->CreateIndexBuffer(
                 triCount * 6, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16,
-                D3DPOOL_MANAGED, &e.ib, nullptr);
+                g_spikeForceDefaultPool ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED, &e.ib, nullptr);
             if (SUCCEEDED(hr)) {
                 const auto* triList = data->getTriList();
                 if (triList) {

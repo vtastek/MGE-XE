@@ -238,13 +238,18 @@ namespace IPC {
     struct RenderInitParameters {
         IN std::uint32_t width;
         IN std::uint32_t height;
+        // Milestone B/C: D3D9Ex shared render-target HANDLE(s) (KMT/global) the client created.
+        // [0] non-null ⇒ the host imports them as Vulkan external memory and renders directly
+        // (zero-copy). [1] non-null double-buffers (C). Both null ⇒ Milestone A CPU readback.
+        IN HANDLE32 sharedTextureHandles[2];
 
-        OUT HANDLE32 framebufferHandle;  // file-mapping handle valid in the CLIENT process (host-created, duplicated in)
+        OUT HANDLE32 framebufferHandle;  // A path only: file-mapping handle valid in the CLIENT process (host-created, duplicated in). Null on the B path.
         OUT bool ok;
     };
 
     struct RenderFrameParameters {
-        IN std::uint32_t frameIndex;     // for logging / future double-buffering
+        IN std::uint32_t frameIndex;     // for logging
+        IN std::uint32_t targetIndex;    // which shared buffer to render into (double-buffer, C)
 
         OUT std::uint32_t bytesWritten;
         OUT double renderMs;             // host-side render+readback time

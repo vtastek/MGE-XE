@@ -121,7 +121,8 @@ struct ConfigurationStruct {
     bool UseRenderThread;           // enable the MGE render thread: submit GPU work on a second core during the engine's CPU-only frame-start/sky windows. Also forces D3DCREATE_MULTITHREADED and arms the device-submission lock. Default off.
     bool UseTiledLights;            // main-view point lights via per-frame screen-tile binning (USE_TILED_LIGHTS) instead of per-mesh selection. Rides the scene-graph snapshot. Runtime A/B on VK_DECIMAL. Default off.
     bool UseWaterFlowMap;           // per-water-body directional waves & storm-calm ponds: bake a low-res flow map (distance-to-sea BFS over the wet/dry grid) and sample it in the water shader (WATER_FLOW_MAP). Runtime A/B on VK_NUMPAD9. Default off. (MGEFlags bits 0-31 are full, so this is a standalone bool like UseTiledLights.)
-    bool UseRenderProcess;          // present-seam spike: bring up the out-of-process 64-bit Vulkan renderer (mgeHost64) and composite its output into MW's window. Gates RenderInit + framebuffer-vec setup; per-frame blit additionally toggled by a debug key (F11). Default off; off = game byte-for-byte unchanged.
+    bool UseRenderProcess;          // present-seam spike: bring up the out-of-process 64-bit Vulkan renderer (mgeHost64) and composite its output into MW's window. Gates RenderInit + framebuffer-vec setup; per-frame blit additionally toggled by a debug key (F11). Default off; off = game byte-for-byte unchanged. (Milestone A — CPU readback — works on the plain D3D9 device.)
+    bool UseRenderProcessEx;        // present-seam spike Milestone B: upgrade MW's device to D3D9Ex (for a shared render-target HANDLE → zero-copy Vulkan). SEPARATE from UseRenderProcess so the working A path stays on plain D3D9. NOTE: under DXVK, Ex windowed flip-present + MGE borderless = VK_ERROR_SURFACE_LOST_KHR (white screen) — under investigation. Default off.
 
     struct {
         float zoom, zoomRate, zoomRateTarget;

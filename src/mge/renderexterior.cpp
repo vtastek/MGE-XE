@@ -7,6 +7,7 @@
 #include "mwbridge.h"
 #include "phasetimers.h"
 #include "proxydx/d3d8header.h"
+#include "proxydx/devicelock.h"
 #include "support/log.h"
 #include "statusoverlay.h"
 #include "terrain_horizon_occluder.h"
@@ -3430,8 +3431,8 @@ bool DistantLand::updateFlowMapTexture() {
             }
         }
         if (!texFlow) {
-            if (device->CreateTexture(g_flowMapW, g_flowMapH, 1, 0, D3DFMT_A8R8G8B8,
-                                      D3DPOOL_MANAGED, &texFlow, NULL) != D3D_OK) {
+            if (device->CreateTexture(g_flowMapW, g_flowMapH, 1, g_spikeForceDefaultPool ? D3DUSAGE_DYNAMIC : 0, D3DFMT_A8R8G8B8,
+                                      g_spikeForceDefaultPool ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED, &texFlow, NULL) != D3D_OK) {
                 texFlow = nullptr;
                 LOG::logline("!! [water-flow] CreateTexture failed (%dx%d)", g_flowMapW, g_flowMapH);
                 return false;

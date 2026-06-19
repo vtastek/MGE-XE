@@ -2,6 +2,7 @@
 #include "vkshaders.h"
 #include "support/log.h"
 
+#define VK_USE_PLATFORM_WIN32_KHR
 #include <vulkan/vulkan.h>
 
 #include <cstring>
@@ -14,8 +15,13 @@
 // pipeline (process + IPC + Vulkan + composite + present) first.
 
 namespace {
+    constexpr std::uint32_t kMaxBuffers = 2;   // double-buffer the shared image (Milestone C)
+
     struct VK {
         bool ready = false;
+        bool useShared = false;          // B path: render into imported D3D9Ex texture(s)
+        std::uint32_t bufCount = 1;      // 1 = A (single offscreen), 2 = B (double-buffered shared)
+        void* sharedHandles[kMaxBuffers] = { nullptr, nullptr };
         std::uint32_t width = 0, height = 0;
 
         VkInstance instance = VK_NULL_HANDLE;
@@ -24,12 +30,12 @@ namespace {
         std::uint32_t gfxFamily = 0;
         VkQueue queue = VK_NULL_HANDLE;
 
-        VkImage colorImage = VK_NULL_HANDLE;
-        VkDeviceMemory colorMem = VK_NULL_HANDLE;
-        VkImageView colorView = VK_NULL_HANDLE;
+        VkImage colorImage[kMaxBuffers] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+        VkDeviceMemory colorMem[kMaxBuffers] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+        VkImageView colorView[kMaxBuffers] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+        VkFramebuffer framebuffer[kMaxBuffers] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
 
         VkRenderPass renderPass = VK_NULL_HANDLE;
-        VkFramebuffer framebuffer = VK_NULL_HANDLE;
         VkPipelineLayout pipeLayout = VK_NULL_HANDLE;
         VkPipeline pipeline = VK_NULL_HANDLE;
 
@@ -136,9 +142,17 @@ namespace {
         qci.queueCount = 1;
         qci.pQueuePriorities = &prio;
 
+        // External-memory import (B path) needs the Win32 external-memory device extension.
+        // VK_KHR_external_memory itself is core in 1.1.
+        const char* devExts[] = { "VK_KHR_external_memory_win32" };
+
         VkDeviceCreateInfo dci{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
         dci.queueCreateInfoCount = 1;
         dci.pQueueCreateInfos = &qci;
+        if (g.useShared) {
+            dci.enabledExtensionCount = 1;
+            dci.ppEnabledExtensionNames = devExts;
+        }
         if (vkCreateDevice(g.phys, &dci, nullptr, &g.device) != VK_SUCCESS) {
             LOG::logline("!! [vk] vkCreateDevice failed");
             return false;
@@ -147,7 +161,90 @@ namespace {
         return true;
     }
 
+    // B path: create a VkImage backed by the imported D3D9Ex shared texture memory for buffer i.
+    bool createImportedImage(std::uint32_t i) {
+        const VkFormat fmt = VK_FORMAT_B8G8R8A8_UNORM;   // matches D3DFMT_A8R8G8B8 byte order
+
+        VkExternalMemoryImageCreateInfo extImg{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
+        extImg.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT;
+
+        VkImageCreateInfo ici{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+        ici.pNext = &extImg;
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.format = fmt;
+        ici.extent = { g.width, g.height, 1 };
+        ici.mipLevels = 1;
+        ici.arrayLayers = 1;
+        ici.samples = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (vkCreateImage(g.device, &ici, nullptr, &g.colorImage[i]) != VK_SUCCESS) {
+            LOG::logline("!! [vk] vkCreateImage (imported %u) failed", i);
+            return false;
+        }
+
+        VkMemoryRequirements mr;
+        vkGetImageMemoryRequirements(g.device, g.colorImage[i], &mr);
+
+        // Constrain the memory type to what's valid for this handle.
+        std::uint32_t allowedBits = mr.memoryTypeBits;
+        auto pfnGetProps = (PFN_vkGetMemoryWin32HandlePropertiesKHR)
+            vkGetDeviceProcAddr(g.device, "vkGetMemoryWin32HandlePropertiesKHR");
+        if (pfnGetProps) {
+            VkMemoryWin32HandlePropertiesKHR hp{ VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR };
+            if (pfnGetProps(g.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT,
+                            g.sharedHandles[i], &hp) == VK_SUCCESS && hp.memoryTypeBits != 0) {
+                allowedBits &= hp.memoryTypeBits;
+            }
+        }
+        std::uint32_t memType = 0;
+        if (!findMemoryType(allowedBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, memType) &&
+            !findMemoryType(allowedBits, 0, memType)) {
+            LOG::logline("!! [vk] no memory type for imported handle (bits=0x%x)", allowedBits);
+            return false;
+        }
+
+        VkMemoryDedicatedAllocateInfo dedicated{ VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
+        dedicated.image = g.colorImage[i];
+        VkImportMemoryWin32HandleInfoKHR imp{ VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR };
+        imp.pNext = &dedicated;
+        imp.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT;
+        imp.handle = g.sharedHandles[i];
+        VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        mai.pNext = &imp;
+        mai.allocationSize = mr.size;
+        mai.memoryTypeIndex = memType;
+        if (vkAllocateMemory(g.device, &mai, nullptr, &g.colorMem[i]) != VK_SUCCESS) {
+            LOG::logline("!! [vk] vkAllocateMemory (import KMT handle %p) failed", g.sharedHandles[i]);
+            return false;
+        }
+        if (vkBindImageMemory(g.device, g.colorImage[i], g.colorMem[i], 0) != VK_SUCCESS) {
+            LOG::logline("!! [vk] vkBindImageMemory (imported %u) failed", i);
+            return false;
+        }
+
+        VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+        vci.image = g.colorImage[i];
+        vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vci.format = fmt;
+        vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        if (vkCreateImageView(g.device, &vci, nullptr, &g.colorView[i]) != VK_SUCCESS) {
+            LOG::logline("!! [vk] vkCreateImageView (imported %u) failed", i);
+            return false;
+        }
+        LOG::logline(">> [vk] imported D3D9Ex shared texture %u (KMT %p) as VkImage", i, g.sharedHandles[i]);
+        return true;
+    }
+
     bool createImageTargets() {
+        if (g.useShared) {
+            for (std::uint32_t i = 0; i < g.bufCount; ++i) {
+                if (!createImportedImage(i)) return false;
+            }
+            return true;
+        }
+
         const VkFormat fmt = VK_FORMAT_B8G8R8A8_UNORM;   // matches D3DFMT_X8R8G8B8 byte order
 
         VkImageCreateInfo ici{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
@@ -160,13 +257,13 @@ namespace {
         ici.tiling = VK_IMAGE_TILING_OPTIMAL;
         ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        if (vkCreateImage(g.device, &ici, nullptr, &g.colorImage) != VK_SUCCESS) {
+        if (vkCreateImage(g.device, &ici, nullptr, &g.colorImage[0]) != VK_SUCCESS) {
             LOG::logline("!! [vk] vkCreateImage failed");
             return false;
         }
 
         VkMemoryRequirements mr;
-        vkGetImageMemoryRequirements(g.device, g.colorImage, &mr);
+        vkGetImageMemoryRequirements(g.device, g.colorImage[0], &mr);
         std::uint32_t memType = 0;
         if (!findMemoryType(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, memType)) {
             LOG::logline("!! [vk] no device-local memory type for color image");
@@ -175,18 +272,18 @@ namespace {
         VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
         mai.allocationSize = mr.size;
         mai.memoryTypeIndex = memType;
-        if (vkAllocateMemory(g.device, &mai, nullptr, &g.colorMem) != VK_SUCCESS) {
+        if (vkAllocateMemory(g.device, &mai, nullptr, &g.colorMem[0]) != VK_SUCCESS) {
             LOG::logline("!! [vk] vkAllocateMemory (color) failed");
             return false;
         }
-        vkBindImageMemory(g.device, g.colorImage, g.colorMem, 0);
+        vkBindImageMemory(g.device, g.colorImage[0], g.colorMem[0], 0);
 
         VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-        vci.image = g.colorImage;
+        vci.image = g.colorImage[0];
         vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
         vci.format = fmt;
         vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        if (vkCreateImageView(g.device, &vci, nullptr, &g.colorView) != VK_SUCCESS) {
+        if (vkCreateImageView(g.device, &vci, nullptr, &g.colorView[0]) != VK_SUCCESS) {
             LOG::logline("!! [vk] vkCreateImageView failed");
             return false;
         }
@@ -235,7 +332,10 @@ namespace {
         color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
         color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
         color.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        color.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;  // ready for copy-to-buffer
+        // B path: leave the shared image in GENERAL for the external (D3D9/DXVK) consumer.
+        // A path: TRANSFER_SRC for the copy-to-buffer readback.
+        color.finalLayout = g.useShared ? VK_IMAGE_LAYOUT_GENERAL
+                                        : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 
         VkAttachmentReference colorRef{ 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
         VkSubpassDescription sub{};
@@ -243,15 +343,20 @@ namespace {
         sub.colorAttachmentCount = 1;
         sub.pColorAttachments = &colorRef;
 
-        // Guarantee the copy (TRANSFER) sees the color writes and the layout
-        // transition to TRANSFER_SRC happens-before the copy reads.
+        // Make the color writes (and the finalLayout transition) visible to the
+        // consumer: TRANSFER (the copy) for A, the external consumer for B.
         VkSubpassDependency dep{};
         dep.srcSubpass = 0;
         dep.dstSubpass = VK_SUBPASS_EXTERNAL;
         dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-        dep.dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        dep.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        if (g.useShared) {
+            dep.dstStageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+            dep.dstAccessMask = 0;
+        } else {
+            dep.dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            dep.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        }
 
         VkRenderPassCreateInfo rpci{ VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
         rpci.attachmentCount = 1;
@@ -265,16 +370,18 @@ namespace {
             return false;
         }
 
-        VkFramebufferCreateInfo fci{ VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
-        fci.renderPass = g.renderPass;
-        fci.attachmentCount = 1;
-        fci.pAttachments = &g.colorView;
-        fci.width = g.width;
-        fci.height = g.height;
-        fci.layers = 1;
-        if (vkCreateFramebuffer(g.device, &fci, nullptr, &g.framebuffer) != VK_SUCCESS) {
-            LOG::logline("!! [vk] vkCreateFramebuffer failed");
-            return false;
+        for (std::uint32_t i = 0; i < g.bufCount; ++i) {
+            VkFramebufferCreateInfo fci{ VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
+            fci.renderPass = g.renderPass;
+            fci.attachmentCount = 1;
+            fci.pAttachments = &g.colorView[i];
+            fci.width = g.width;
+            fci.height = g.height;
+            fci.layers = 1;
+            if (vkCreateFramebuffer(g.device, &fci, nullptr, &g.framebuffer[i]) != VK_SUCCESS) {
+                LOG::logline("!! [vk] vkCreateFramebuffer %u failed", i);
+                return false;
+            }
         }
 
         VkShaderModule vs = makeShader(kTriVertSpv, sizeof(kTriVertSpv));
@@ -380,8 +487,9 @@ namespace {
 namespace VKRender {
     bool isReady() { return g.ready; }
 
-    bool init(std::uint32_t width, std::uint32_t height) {
-        if (g.ready && g.width == width && g.height == height) {
+    bool init(std::uint32_t width, std::uint32_t height, void* sharedHandle0, void* sharedHandle1) {
+        if (g.ready && g.width == width && g.height == height &&
+            g.sharedHandles[0] == sharedHandle0 && g.sharedHandles[1] == sharedHandle1) {
             return true;
         }
         if (g.ready) {
@@ -389,6 +497,10 @@ namespace VKRender {
         }
         g.width = width;
         g.height = height;
+        g.sharedHandles[0] = sharedHandle0;
+        g.sharedHandles[1] = sharedHandle1;
+        g.useShared = (sharedHandle0 != nullptr);
+        g.bufCount = (sharedHandle0 != nullptr && sharedHandle1 != nullptr) ? 2 : 1;
 
         if (!createInstanceAndDevice()) { shutdown(); return false; }
         if (!createImageTargets())      { shutdown(); return false; }
@@ -396,17 +508,20 @@ namespace VKRender {
         if (!createCommandsAndFence())  { shutdown(); return false; }
 
         g.ready = true;
-        LOG::logline(">> [vk] renderer ready (%ux%u, B8G8R8A8, offscreen+readback)", width, height);
+        LOG::logline(">> [vk] renderer ready (%ux%u, B8G8R8A8, %s, %u buffer(s))", width, height,
+                     g.useShared ? "imported shared texture / zero-copy" : "offscreen+readback",
+                     g.bufCount);
         return true;
     }
 
-    bool renderFrame(void* outPixels, std::uint32_t outBytes, double* cpuMs) {
+    bool renderFrame(void* outPixels, std::uint32_t outBytes, std::uint32_t targetIndex, double* cpuMs) {
         if (!g.ready) return false;
-        if (outBytes < g.readbackBytes) {
+        if (!g.useShared && outBytes < g.readbackBytes) {
             LOG::logline("!! [vk] renderFrame outBytes %u < needed %llu", outBytes,
                          (unsigned long long)g.readbackBytes);
             return false;
         }
+        if (targetIndex >= g.bufCount) targetIndex = 0;
 
         LARGE_INTEGER t0; QueryPerformanceCounter(&t0);
 
@@ -419,7 +534,7 @@ namespace VKRender {
         clear.color = { { 0.08f, 0.08f, 0.12f, 1.0f } };  // dark slate so the triangle reads clearly
         VkRenderPassBeginInfo rp{ VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
         rp.renderPass = g.renderPass;
-        rp.framebuffer = g.framebuffer;
+        rp.framebuffer = g.framebuffer[targetIndex];
         rp.renderArea = { {0, 0}, { g.width, g.height } };
         rp.clearValueCount = 1;
         rp.pClearValues = &clear;
@@ -428,16 +543,19 @@ namespace VKRender {
         vkCmdDraw(g.cmd, 3, 1, 0, 0);
         vkCmdEndRenderPass(g.cmd);
 
-        // Image is now TRANSFER_SRC_OPTIMAL (render-pass finalLayout). Copy to buffer.
-        VkBufferImageCopy region{};
-        region.bufferOffset = 0;
-        region.bufferRowLength = 0;     // tightly packed
-        region.bufferImageHeight = 0;
-        region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-        region.imageOffset = { 0, 0, 0 };
-        region.imageExtent = { g.width, g.height, 1 };
-        vkCmdCopyImageToBuffer(g.cmd, g.colorImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                               g.readback, 1, &region);
+        // A path: image is TRANSFER_SRC_OPTIMAL; copy it to the host-visible buffer.
+        // B path: image is GENERAL in the shared D3D9Ex texture — nothing to copy.
+        if (!g.useShared) {
+            VkBufferImageCopy region{};
+            region.bufferOffset = 0;
+            region.bufferRowLength = 0;     // tightly packed
+            region.bufferImageHeight = 0;
+            region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            region.imageOffset = { 0, 0, 0 };
+            region.imageExtent = { g.width, g.height, 1 };
+            vkCmdCopyImageToBuffer(g.cmd, g.colorImage[targetIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   g.readback, 1, &region);
+        }
 
         vkEndCommandBuffer(g.cmd);
 
@@ -454,7 +572,9 @@ namespace VKRender {
             return false;
         }
 
-        std::memcpy(outPixels, g.readbackMapped, g.readbackBytes);
+        if (!g.useShared) {
+            std::memcpy(outPixels, g.readbackMapped, g.readbackBytes);
+        }
 
         LARGE_INTEGER t1; QueryPerformanceCounter(&t1);
         if (cpuMs) *cpuMs = double(t1.QuadPart - t0.QuadPart) * msPerTick();
@@ -468,14 +588,16 @@ namespace VKRender {
             if (g.cmdPool)      vkDestroyCommandPool(g.device, g.cmdPool, nullptr);
             if (g.pipeline)     vkDestroyPipeline(g.device, g.pipeline, nullptr);
             if (g.pipeLayout)   vkDestroyPipelineLayout(g.device, g.pipeLayout, nullptr);
-            if (g.framebuffer)  vkDestroyFramebuffer(g.device, g.framebuffer, nullptr);
             if (g.renderPass)   vkDestroyRenderPass(g.device, g.renderPass, nullptr);
             if (g.readbackMapped) vkUnmapMemory(g.device, g.readbackMem);
             if (g.readback)     vkDestroyBuffer(g.device, g.readback, nullptr);
             if (g.readbackMem)  vkFreeMemory(g.device, g.readbackMem, nullptr);
-            if (g.colorView)    vkDestroyImageView(g.device, g.colorView, nullptr);
-            if (g.colorImage)   vkDestroyImage(g.device, g.colorImage, nullptr);
-            if (g.colorMem)     vkFreeMemory(g.device, g.colorMem, nullptr);
+            for (std::uint32_t i = 0; i < kMaxBuffers; ++i) {
+                if (g.framebuffer[i]) vkDestroyFramebuffer(g.device, g.framebuffer[i], nullptr);
+                if (g.colorView[i])   vkDestroyImageView(g.device, g.colorView[i], nullptr);
+                if (g.colorImage[i])  vkDestroyImage(g.device, g.colorImage[i], nullptr);
+                if (g.colorMem[i])    vkFreeMemory(g.device, g.colorMem[i], nullptr);
+            }
             vkDestroyDevice(g.device, nullptr);
         }
         if (g.instance) vkDestroyInstance(g.instance, nullptr);

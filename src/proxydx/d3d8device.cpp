@@ -11,6 +11,7 @@
 // the single-threaded path takes the lock's cheap disabled branch only.
 std::mutex g_deviceMtx;
 bool       g_deviceLockEnabled = false;
+bool       g_spikeForceDefaultPool = false;
 
 
 
@@ -132,6 +133,13 @@ void _stdcall ProxyDevice::GetGammaRamp(D3DGAMMARAMP* a) {
 }
 
 HRESULT _stdcall ProxyDevice::CreateTexture(UINT a, UINT b, UINT c, DWORD d, D3DFORMAT e, D3DPOOL f, IDirect3DTexture8** g) {
+    // Spike (D3D9Ex): MANAGED is invalid on Ex. Move to DEFAULT and add DYNAMIC so the
+    // engine's LockRect uploads still work (managed textures are lockable; default ones
+    // are only lockable when dynamic). Render targets / depth aren't created here.
+    if (g_spikeForceDefaultPool && f == D3DPOOL_MANAGED) {
+        f = D3DPOOL_DEFAULT;
+        d |= D3DUSAGE_DYNAMIC;
+    }
     IDirect3DTexture9* g_real = NULL;
     HRESULT hr = realDevice->CreateTexture(a, b, c, d, e, f, &g_real, NULL);
     if (hr != D3D_OK || g_real == NULL) {
@@ -143,10 +151,18 @@ HRESULT _stdcall ProxyDevice::CreateTexture(UINT a, UINT b, UINT c, DWORD d, D3D
 }
 
 HRESULT _stdcall ProxyDevice::CreateVertexBuffer(UINT a, DWORD b, DWORD c, D3DPOOL d, IDirect3DVertexBuffer8** e) {
+    // Spike (D3D9Ex): MANAGED -> DEFAULT. Default-pool vertex buffers are lockable, so
+    // no usage change is needed for the engine's buffer fills.
+    if (g_spikeForceDefaultPool && d == D3DPOOL_MANAGED) {
+        d = D3DPOOL_DEFAULT;
+    }
     return realDevice->CreateVertexBuffer(a, b, c, d, (IDirect3DVertexBuffer9**)e, NULL);
 }
 
 HRESULT _stdcall ProxyDevice::CreateIndexBuffer(UINT a, DWORD b, D3DFORMAT c, D3DPOOL d, IDirect3DIndexBuffer8** e) {
+    if (g_spikeForceDefaultPool && d == D3DPOOL_MANAGED) {
+        d = D3DPOOL_DEFAULT;
+    }
     return realDevice->CreateIndexBuffer(a, b, c, d, (IDirect3DIndexBuffer9**)e, NULL);
 }
 
