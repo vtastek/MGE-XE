@@ -4,3 +4,6 @@
 [submodule "3rdparty/tracy"]
 	path = 3rdparty/tracy
 	url = https://github.com/wolfpld/tracy.git
+[submodule "3rdparty/The-Forge"]
+	path = 3rdparty/The-Forge
+	url = https://github.com/ConfettiFX/The-Forge.git
