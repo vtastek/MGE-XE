@@ -657,7 +657,12 @@ namespace {
         dDesc.mSampleCount = SAMPLE_COUNT_1;
         dDesc.mFormat = TinyImageFormat_D32_SFLOAT;
         dDesc.mStartState = RESOURCE_STATE_DEPTH_WRITE;
-        dDesc.mClearValue.depth = 1.0f;
+        // REVERSE-Z: clear to 0.0 (the far plane). With a float32 depth buffer, reverse-Z
+        // gives near-uniform precision across the whole range — the fix for "different-but-
+        // close object" z-fighting (standard-Z + D32 starves precision near the far plane,
+        // exactly where MW's huge far/near ratio bites). Paired with CMP_GEQUAL below and a
+        // viewProj that maps near->1 / far->0 (renderScene applies it). near is now 1.0.
+        dDesc.mClearValue.depth = 0.0f;
         dDesc.mClearValue.stencil = 0;
         dDesc.pName = "sceneDepth";
         addRenderTarget(R, &dDesc, &g_live.pDepth);
@@ -704,7 +709,7 @@ namespace {
         DepthStateDesc depthDesc = {};
         depthDesc.mDepthTest = true;
         depthDesc.mDepthWrite = true;
-        depthDesc.mDepthFunc = CMP_LEQUAL;
+        depthDesc.mDepthFunc = CMP_GEQUAL;   // REVERSE-Z: near=1, far=0 → keep the larger (closer) z
 
         RasterizerStateDesc rasterDesc = {};
         // Backface culling — the proven D3D9 cache color pass culls (drawEntry: mirrored ?
@@ -1089,10 +1094,23 @@ namespace ForgeRender {
         const uint32_t count = (n < haveBytes) ? n : haveBytes;
         const IPC::DrawItemWire* items = (const IPC::DrawItemWire*)drawBlob;
 
+        // REVERSE-Z: post-multiply the received row-major viewProj by Z_rev (maps clip z'
+        // = w - z, i.e. near->1 / far->0). On a row-major matrix that ONLY touches column 2:
+        // m[i*4+2] := m[i*4+3] - m[i*4+2]. The shader reads the cbuffer column-major (== the
+        // transpose) so mul(viewProj, worldPos) applies viewProj*Z_rev in row-vector terms,
+        // i.e. Z_rev acts on the post-projection clip coords — exactly reverse-Z. No shader
+        // change. Pairs with depth clear 0.0 + CMP_GEQUAL above.
+        float rzViewProj[16];
+        std::memcpy(rzViewProj, viewProj, 16 * sizeof(float));
+        rzViewProj[2]  = rzViewProj[3]  - rzViewProj[2];
+        rzViewProj[6]  = rzViewProj[7]  - rzViewProj[6];
+        rzViewProj[10] = rzViewProj[11] - rzViewProj[10];
+        rzViewProj[14] = rzViewProj[15] - rzViewProj[14];
+
         // viewProj → the persistent-mapped frame cbuffer. world[i] → window (i/kBatchSize)
         // at local slot (i%kBatchSize): byte offset (i/kBatchSize)*kBatchBytes + (i%kBatchSize)*64.
         // Index i aligns with the draw loop below (batch+local select the same matrix).
-        std::memcpy(g_live.pFrameCbv->pCpuMappedAddress, viewProj, 16 * sizeof(float));
+        std::memcpy(g_live.pFrameCbv->pCpuMappedAddress, rzViewProj, 16 * sizeof(float));
         for (uint32_t i = 0; i < count; ++i) {
             const uint32_t batch = i / kBatchSize;
             const uint32_t local = i % kBatchSize;
