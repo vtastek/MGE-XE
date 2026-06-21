@@ -320,8 +320,11 @@ namespace MGE::GeometryCache {
             e.boundsRadius    = b.radius;
 
             // M1: ship model-space pos+normal+indices to the Forge host (non-skinned
-            // opaques; terrain excluded for now). Re-uploads only on revision change.
-            if (!g_walkingLandscape && RenderProcess::wantsGeometryCapture()) {
+            // opaques AND near terrain — worldLandscapeRoot patches carry model-space
+            // vertex/normal/triList just like objects, and buildD3DTransform already set
+            // worldTransformD3D for them above). Flat-shaded for now (texturing is the
+            // next milestone, shared by objects+terrain). Re-uploads only on revision change.
+            if (RenderProcess::wantsGeometryCapture()) {
                 static std::vector<IPC::GeomVertexWire> scratch;  // single-threaded cache walk
                 scratch.resize(vertexCount);
                 const auto* nrm = data->normal;

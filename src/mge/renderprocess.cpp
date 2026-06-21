@@ -612,12 +612,15 @@ namespace {
             //     is THE de-dup. (Do NOT also filter isPickRoot — legit movers like dropped
             //     items/projectiles LIVE in the pick root and ARE textured; the proven path
             //     keeps them, dropping them blanked all movers.)
-            //   - blendEnable: alpha-blended parts stay on the engine/alpha path (not M1).
-            //   - isLandscape: terrain isn't in M1 (no splat/vcol yet).
+            //   - blendEnable: alpha-blended OBJECTS stay on the engine/alpha path. But
+            //     terrain is the exception — the D9 oracle (renderCachedTerrain) draws ALL
+            //     isLandscape regardless of blendEnable (alpha-splat trishapes included),
+            //     and at flat-shaded fidelity blend-vs-opaque is invisible. So only filter
+            //     blendEnable for non-landscape.
             //   - unsupported/zero-bone skin: no VS palette.
+            // Terrain now draws (near worldLandscapeRoot patches; flat-shaded geometry).
             if (!e.d3dTexture) continue;
-            if (e.blendEnable) continue;
-            if (e.isLandscape) continue;
+            if (!e.isLandscape && e.blendEnable) continue;
             if (e.isSkinned && (e.skinnedUnsupported || e.numBones == 0)) continue;
 
             item.slot = ks->second;
