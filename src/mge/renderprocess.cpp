@@ -24,6 +24,7 @@ namespace {
     IPC::Client* g_client = nullptr;
     bool   g_initOk  = false;
     bool   g_enabled = false;          // F11 live toggle for the per-frame composite
+    bool   g_debugScatter = false;     // F12 diagnostic: per-object world offset to expose duplicate draws
     unsigned g_frame = 0;
 
     // --- M1b: opaque-geometry capture + upload -----------------------------------
@@ -517,14 +518,15 @@ namespace {
         if (!g_geomVec || g_pendingBlob.empty() || g_pendingParts == 0) {
             return;
         }
-        // CRITICAL: never issue the upload RPC while another RPC is in flight. Our
-        // beginRpc would drain (steal) that RPC's completion, leaving its real awaiter
-        // to read a clobbered shared Parameters union — which manifests as a stale
-        // VecId/pointer freed later (heap double-free). Geometry is static; deferring a
-        // frame is free.
-        if (g_client->isRpcPending()) {
-            return;
-        }
+        // Geometry now ships on the client's DEDICATED geometry IPC channel
+        // (geomUploadBlocking → its own Parameters + events), so it no longer contends
+        // with the one-at-a-time cull/scene RPCs on the main channel. That contention used
+        // to starve this flush at present time and leave exteriors black (the draw list
+        // referenced slots whose geometry never shipped). The old isRpcPending() bail —
+        // and its clobber hazard — is gone because there is no shared Parameters union to
+        // interleave. The host services the geometry channel on its single thread (WFMO),
+        // so this upload just waits its turn behind any in-flight cull instead of being
+        // skipped, and can never race renderScene.
         const std::uint8_t* const data = g_pendingBlob.data();
         const std::uint32_t total = static_cast<std::uint32_t>(g_pendingBlob.size());
 
@@ -575,7 +577,15 @@ namespace {
         if (!g_drawVec) {
             return 0;
         }
-        const auto& keys = DistantLand::frustumVisibleKeys();
+        // Source = the engine's MSOC drawn set (visibleCacheKeys / s_prevVisibleKeys), NOT
+        // the frustum set. The frustum-fallback set iterates the WHOLE cache and keeps every
+        // cached LOD level of an object — so an object whose original AND lod meshes are both
+        // cached gets drawn TWICE (coincident). Statics resolve to one (invisible), but movers
+        // sit near the camera where multiple LOD levels coexist → Z-FIGHTING. The MSOC set is
+        // exactly what the engine DREW: one LOD per object, occlusion-correct — the same source
+        // the reflection cache path uses for dynamic things (no double there). It's the prior
+        // frame's set (1-frame lag) but the world transform is read fresh from the cache below.
+        const auto& keys = DistantLand::visibleCacheKeys();
         const auto& cacheMap = MGE::GeometryCache::cache();
 
         g_drawScratch.clear();
@@ -592,8 +602,41 @@ namespace {
             if (ce == cacheMap.end()) {
                 continue;   // evicted since the visible-set build
             }
+            const auto& e = ce->second;
+            // Mirror the PROVEN D3D9 cache color pass's per-entry filters EXACTLY (drawEntry
+            // in rendercachedcolor.cpp) so the Forge draw list draws the same set:
+            //   - !d3dTexture: drops UNTEXTURED entries — the worldPickObjectRoot collision
+            //     proxies that mirror each visual object. Drawing those gave a second
+            //     near-coincident copy; statics overlapped exactly (invisible) but MOVING
+            //     objects' visual vs proxy transforms diverged a frame → Z-FIGHTING. This
+            //     is THE de-dup. (Do NOT also filter isPickRoot — legit movers like dropped
+            //     items/projectiles LIVE in the pick root and ARE textured; the proven path
+            //     keeps them, dropping them blanked all movers.)
+            //   - blendEnable: alpha-blended parts stay on the engine/alpha path (not M1).
+            //   - isLandscape: terrain isn't in M1 (no splat/vcol yet).
+            //   - unsupported/zero-bone skin: no VS palette.
+            if (!e.d3dTexture) continue;
+            if (e.blendEnable) continue;
+            if (e.isLandscape) continue;
+            if (e.isSkinned && (e.skinnedUnsupported || e.numBones == 0)) continue;
+
             item.slot = ks->second;
-            memcpy(item.world, ce->second.worldTransformD3D, 16 * sizeof(float));
+            memcpy(item.world, e.worldTransformD3D, 16 * sizeof(float));
+            // F12 diagnostic: displace each object by a deterministic per-slot vector. The
+            // world matrix is row-major D3DX (translation in m[12..14]); a fixed offset per
+            // slot means duplicates of one object (same or different slot) appear as two
+            // separated copies. Hash the slot to a pseudo-random ±range.
+            if (g_debugScatter) {
+                const std::uint32_t s = ks->second;
+                std::uint32_t h = s * 2654435761u;        // Knuth multiplicative hash
+                auto axis = [&](std::uint32_t shift) {
+                    std::uint32_t v = (h >> shift) & 0x3FF;   // 10 bits
+                    return (static_cast<float>(v) / 1023.0f - 0.5f) * 100.0f;  // ±50 units
+                };
+                item.world[12] += axis(0);
+                item.world[13] += axis(10);
+                item.world[14] += axis(20);
+            }
             const std::size_t at = g_drawScratch.size();
             g_drawScratch.resize(at + sizeof(item));
             memcpy(g_drawScratch.data() + at, &item, sizeof(item));
@@ -631,6 +674,13 @@ namespace RenderProcess {
         if (GetAsyncKeyState(VK_F11) & 0x0001) {
             g_enabled = !g_enabled;
             LOG::logline(">> [seam] composite %s", g_enabled ? "ON" : "OFF");
+        }
+        // F12 diagnostic: scatter each object by a fixed per-slot offset so any object that
+        // is drawn more than once appears as TWO separated copies of the same mesh (a single
+        // draw just looks displaced). Reveals duplicate draws regardless of source.
+        if (GetAsyncKeyState(VK_F12) & 0x0001) {
+            g_debugScatter = !g_debugScatter;
+            LOG::logline(">> [seam] debug scatter %s", g_debugScatter ? "ON" : "OFF");
         }
         if (!g_enabled) {
             return;

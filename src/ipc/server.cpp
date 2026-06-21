@@ -88,11 +88,16 @@ namespace {
 }
 
 namespace IPC {
-	Server::Server(HANDLE sharedMem, HANDLE clientProcess, HANDLE rpcStartEvent, HANDLE rpcCompleteEvent) :
+	Server::Server(HANDLE sharedMem, HANDLE clientProcess, HANDLE rpcStartEvent, HANDLE rpcCompleteEvent,
+		HANDLE geomSharedMem, HANDLE geomRpcStartEvent, HANDLE geomRpcCompleteEvent) :
 		m_sharedMem(sharedMem),
 		m_clientProcess(clientProcess),
 		m_rpcStartEvent(rpcStartEvent),
 		m_rpcCompleteEvent(rpcCompleteEvent),
+		m_geomSharedMem(geomSharedMem),
+		m_geomRpcStartEvent(geomRpcStartEvent),
+		m_geomRpcCompleteEvent(geomRpcCompleteEvent),
+		m_geomParameters(nullptr),
 		m_ipcParameters(nullptr),
 		m_freeVecs()
 	{ }
@@ -105,11 +110,18 @@ namespace IPC {
 			UnmapViewOfFile(m_ipcParameters);
 			m_ipcParameters = nullptr;
 		}
+		if (m_geomParameters != nullptr) {
+			UnmapViewOfFile(m_geomParameters);
+			m_geomParameters = nullptr;
+		}
 
 		CleanupHandle(m_sharedMem);
 		CleanupHandle(m_clientProcess);
 		CleanupHandle(m_rpcStartEvent);
 		CleanupHandle(m_rpcCompleteEvent);
+		CleanupHandle(m_geomSharedMem);
+		CleanupHandle(m_geomRpcStartEvent);
+		CleanupHandle(m_geomRpcCompleteEvent);
 	}
 
 	bool Server::complete() {
@@ -133,16 +145,40 @@ namespace IPC {
 			return false;
 		}
 
+		// Map the dedicated geometry channel's Parameters, if the host was launched with one.
+		if (m_geomSharedMem != nullptr) {
+			if (m_geomParameters != nullptr) {
+				UnmapViewOfFile(m_geomParameters);
+				m_geomParameters = nullptr;
+			}
+			m_geomParameters = static_cast<Parameters*>(MapViewOfFile(m_geomSharedMem, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Parameters)));
+			if (m_geomParameters == nullptr) {
+				LOG::winerror("Failed to map geometry IPC parameters shared memory");
+				return false;
+			}
+		}
+
 		return true;
 	}
 
 	bool Server::listen() {
-		while (true) {
-			// signal the completion of whatever we were doing before (also signals that we've finished initializing on the first iteration)
-			SetEvent(m_rpcCompleteEvent);
+		// Init done — tell the client BOTH channels are ready to accept commands. (The
+		// original single-channel loop signalled completion at the top of each iteration;
+		// with two channels we signal per-RPC below and seed the init-complete here.)
+		SetEvent(m_rpcCompleteEvent);
+		if (m_geomRpcCompleteEvent != nullptr) {
+			SetEvent(m_geomRpcCompleteEvent);
+		}
 
-			// 0 = client process, 1 = RPC start event
-			auto waitResult = WaitForMultipleObjects(2, m_waitHandles, FALSE, INFINITE);
+		// 0 = client process, 1 = main RPC start, 2 = geometry RPC start (if present).
+		// Single thread services both — so geometry upload (addResource into g_meshes)
+		// can never race renderScene's draw, and the geometry channel just waits its turn
+		// behind an in-flight cull/scene RPC instead of starving the present-time flush.
+		HANDLE waits[3] = { m_clientProcess, m_rpcStartEvent, m_geomRpcStartEvent };
+		const DWORD waitCount = (m_geomRpcStartEvent != nullptr) ? 3 : 2;
+
+		while (true) {
+			auto waitResult = WaitForMultipleObjects(waitCount, waits, FALSE, INFINITE);
 			if (waitResult == WAIT_FAILED) {
 				LOG::winerror("Failed to wait for RPC event");
 				return false;
@@ -153,6 +189,18 @@ namespace IPC {
 				return true;
 			}
 
+			if (waitResult == WAIT_OBJECT_0 + 2) {
+				// Geometry channel — only GeomUpload is expected here.
+				if (m_geomParameters->command == Command::GeomUpload) {
+					geomUpload();
+				} else if (m_geomParameters->command != Command::None) {
+					LOG::logline("Geometry channel received unexpected command %u", m_geomParameters->command);
+				}
+				SetEvent(m_geomRpcCompleteEvent);
+				continue;
+			}
+
+			// Main channel (WAIT_OBJECT_0 + 1).
 			switch (m_ipcParameters->command) {
 			case Command::None:
 				break;
@@ -196,12 +244,19 @@ namespace IPC {
 				renderFrame();
 				break;
 			case Command::GeomUpload:
-				geomUpload();
+				// Geometry now rides its own channel; a GeomUpload on the main channel is
+				// unexpected (would read the wrong Parameters). Single-channel fallback only.
+				if (m_geomParameters == nullptr) {
+					geomUpload();
+				} else {
+					LOG::logline("Main channel received GeomUpload but a geometry channel exists");
+				}
 				break;
 			default:
 				LOG::logline("Received unknown command value %u", m_ipcParameters->command);
 				break;
 			}
+			SetEvent(m_rpcCompleteEvent);
 		}
 	}
 
@@ -483,7 +538,10 @@ namespace IPC {
 	// VB/IB per part and stores it slot-indexed. The blob is single-window, so
 	// &vec[0] is a contiguous pointer to the whole batch (as for the occlusion mask).
 	void Server::geomUpload() {
-		auto& params = m_ipcParameters->params.geomUploadParams;
+		// Read from the geometry channel's Parameters when present (its own shared region);
+		// fall back to the main channel only in the single-channel launch.
+		Parameters* pp = (m_geomParameters != nullptr) ? m_geomParameters : m_ipcParameters;
+		auto& params = pp->params.geomUploadParams;
 		params.partsUploaded = 0;
 		if (params.blob == InvalidVector || params.partCount == 0) {
 			return;

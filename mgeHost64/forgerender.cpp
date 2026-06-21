@@ -30,11 +30,18 @@
 #include "Graphics/Interfaces/IGraphics.h"
 #include "Resources/ResourceLoader/Interfaces/IResourceLoader.h"
 #include "Utilities/Interfaces/ILog.h"
+#if defined(ENABLE_GRAPHICS_VALIDATION)
+// ID3D12InfoQueue (break-on-severity control). d3d12.h is already pulled in by
+// IGraphics.h for the D3D12 backend; this only adds the debug-layer interface.
+// Include BEFORE IMemory.h (which overrides new/delete/malloc) to avoid the
+// allocator macros mangling the system header.
+#include <d3d12sdklayers.h>
+#endif
 // IMemory.h overrides new/delete/malloc — Forge convention: include it LAST.
 #include "Utilities/Interfaces/IMemory.h"
 // M1c opaque-scene SRT. defaults.h provides the C++ definitions of the FSL macros
 // (STRUCT/DATA/BEGIN_SRT/DECL_CBUFFER/SRT_SET_DESC/SRT_RES_IDX); the .srt.h then
-// declares SRT_SrtData + the gScene descriptor index. Per the Forge
+// declares SRT_SrtData + the gFrameData/gWorlds descriptor indices. Per the Forge
 // convention (06_MaterialPlayground) these come AFTER IMemory.h.
 #include "Graphics/FSL/defaults.h"
 #include "shaders/FSL/opaque.srt.h"
@@ -50,6 +57,39 @@ namespace {
 
     inline uint32_t roundUp(uint32_t v, uint32_t a) { return a ? ((v + a - 1) / a) * a : v; }
     inline uint64_t roundUp64(uint64_t v, uint32_t a) { return a ? ((v + a - 1) / a) * a : v; }
+
+    // Negative determinant of the world matrix's upper-left 3x3 ⇒ the transform flips
+    // triangle winding (a mirrored part). Such draws need the opposite front-face pipeline
+    // or they cull the wrong face and render inside-out. Row-major D3DXMATRIX (item.world).
+    // Mirrors the cache's isMirroredMatrix so host + D3D9 agree on the sign.
+    inline bool worldMirrored(const float m[16]) {
+        const float det = m[0] * (m[5] * m[10] - m[6] * m[9])
+                        - m[1] * (m[4] * m[10] - m[6] * m[8])
+                        + m[2] * (m[4] * m[9]  - m[5] * m[8]);
+        return det < 0.0f;
+    }
+
+    // If the D3D12 device has been removed, log WHY (the DXGI_ERROR reason code) and
+    // return true. Available WITHOUT the debug layer — GetDeviceRemovedReason is always
+    // present. With ENABLE_GRAPHICS_VALIDATION on, the preceding InfoQueue messages name
+    // the exact offending call. Call after batches of GPU work (upload, draw submit) so a
+    // removal is pinned to the operation that caused it instead of surfacing as silent black.
+    bool g_deviceRemovedLogged = false;   // latch: log the removal once, not every frame
+    bool logDeviceRemoved(Renderer* R, const char* where) {
+        if (!R || !R->mDx.pDevice) {
+            return false;
+        }
+        HRESULT reason = R->mDx.pDevice->GetDeviceRemovedReason();
+        if (reason != S_OK) {
+            if (!g_deviceRemovedLogged) {
+                std::printf("[forge] !! DEVICE REMOVED at %s — reason 0x%08lX\n", where, (unsigned long)reason);
+                LOGF(eERROR, "[forge] !! DEVICE REMOVED at %s — reason 0x%08lX", where, (unsigned long)reason);
+                g_deviceRemovedLogged = true;
+            }
+            return true;
+        }
+        return false;
+    }
 
     // Shared bring-up: mem → filesystem → resource dirs → log → GPU config →
     // Renderer → graphics queue → resource loader. On success *ppRenderer and
@@ -92,6 +132,13 @@ namespace {
         std::printf("[forge] initLog...\n");
         initLog(kAppName, DEFAULT_LOG_LEVEL);
 
+        // FORGE_DEBUG turns on The Forge's internal ASSERTs, which on Windows pop a MODAL
+        // MessageBox ("Display more asserts? Yes/No") that FREEZES this headless host mid-frame
+        // and blocks the game. Disable interactive mode so a failed assert returns silently
+        // instead of blocking — the D3D12 validation layer (InfoQueue -> LOGF) and the
+        // GetDeviceRemovedReason logging still record the actual fault to mgeHost64.log.
+        _EnableInteractiveMode(false);
+
         Renderer*    pRenderer = nullptr;
         RendererDesc settings = {};
         std::printf("[forge] initGPUConfiguration...\n");
@@ -111,6 +158,29 @@ namespace {
         const char* gpuName = pRenderer->pGpu ? pRenderer->pGpu->mGpuVendorPreset.mGpuName : "(unknown)";
         std::printf("[forge] initRenderer OK — GPU: %s\n", gpuName);
         LOGF(eINFO, "[forge] initRenderer OK — GPU: %s", gpuName);
+
+#if defined(ENABLE_GRAPHICS_VALIDATION)
+        // The D3D12 debug/validation layer is compiled in. Forge registers an InfoQueue
+        // message callback (DebugMessageCallback -> LOGF) so validation errors land in
+        // mgeHost64.log, but it ALSO sets break-on-CORRUPTION/ERROR. In this headless host
+        // (no debugger attached) a break raises EXCEPTION_BREAKPOINT and kills the process
+        // BEFORE we can read the message. Disable the breaks so validation messages are
+        // LOGGED but never abort — exactly what we want for diagnosing the exterior fault.
+        {
+            ID3D12InfoQueue* pInfoQueue = nullptr;
+            if (SUCCEEDED(pRenderer->mDx.pDevice->QueryInterface(IID_PPV_ARGS(&pInfoQueue)))) {
+                pInfoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, FALSE);
+                pInfoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, FALSE);
+                pInfoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, FALSE);
+                pInfoQueue->Release();
+                std::printf("[forge] D3D12 validation layer ON (breaks disabled; errors -> mgeHost64.log)\n");
+                LOGF(eINFO, "[forge] D3D12 validation layer ON (breaks disabled)");
+            } else {
+                std::printf("[forge] validation compiled in but InfoQueue unavailable (debug layer not installed?)\n");
+                LOGF(eWARNING, "[forge] validation compiled in but InfoQueue unavailable");
+            }
+        }
+#endif
 
         Queue*    pQueue = nullptr;
         QueueDesc queueDesc = {};
@@ -304,6 +374,49 @@ namespace ForgeRender {
         forgeTearDown(pRenderer, pQueue);
         std::printf("[forge] probe complete — full bring-up + teardown OK\n");
         return true;
+    }
+
+    // Standalone exercise of the M1c opaque scene path (init → uploadGeometry →
+    // renderScene) with a dummy triangle mesh, so the host-side printf/asserts are
+    // visible in a terminal. Isolates a buildOpaquePath/draw crash from the IPC seam.
+    bool sceneProbe() {
+        std::setvbuf(stdout, nullptr, _IONBF, 0);
+        std::printf("[forge] scene-probe: init...\n");
+        if (!init(640, 360)) {
+            std::printf("[forge] scene-probe: init FAILED\n");
+            return false;
+        }
+
+        // Pack one triangle mesh into a GeomUpload blob: GeomPartWire + 3 verts + 3 idx.
+        IPC::GeomVertexWire verts[3] = {
+            { 0.0f,   0.0f, 0.0f,  0,0,1 },
+            { 100.0f, 0.0f, 0.0f,  0,0,1 },
+            { 0.0f, 100.0f, 0.0f,  0,0,1 },
+        };
+        uint16_t idx[3] = { 0, 1, 2 };
+        uint8_t blob[sizeof(IPC::GeomPartWire) + sizeof(verts) + sizeof(idx)];
+        IPC::GeomPartWire hdr = {};
+        hdr.slot = 0; hdr.revisionID = 0; hdr.vertexCount = 3; hdr.indexCount = 3;
+        std::memcpy(blob, &hdr, sizeof(hdr));
+        std::memcpy(blob + sizeof(hdr), verts, sizeof(verts));
+        std::memcpy(blob + sizeof(hdr) + sizeof(verts), idx, sizeof(idx));
+        std::printf("[forge] scene-probe: uploadGeometry...\n");
+        unsigned built = uploadGeometry(blob, (unsigned)sizeof(blob), 1);
+        std::printf("[forge] scene-probe: built %u/1\n", built);
+
+        // Identity viewProj + identity world, one draw item at slot 0.
+        float vp[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+        IPC::DrawItemWire item = {};
+        item.slot = 0;
+        float ident[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+        std::memcpy(item.world, ident, sizeof(ident));
+        std::printf("[forge] scene-probe: renderScene...\n");
+        bool ok = renderScene(vp, &item, 1, (unsigned)sizeof(item));
+        std::printf("[forge] scene-probe: renderScene returned %d\n", (int)ok);
+
+        shutdown();
+        std::printf("[forge] scene-probe complete — %s\n", ok ? "OK" : "FAILED");
+        return ok;
     }
 
     bool renderTriangle() {
@@ -503,27 +616,33 @@ namespace {
         // --- M1c opaque scene path (GPU-driven: one PerFrame set, structured buffer) ---
         RenderTarget*  pDepth = nullptr;          // depth buffer for the scene
         Shader*        pOpaqueShader = nullptr;
-        Pipeline*      pOpaquePipeline = nullptr;
-        DescriptorSet* pPerFrameSet = nullptr;    // gScene cbuffer (viewProj + worlds[])
-        Buffer*        pSceneCbv = nullptr;       // gScene cbuffer (viewProj + worlds[]), persistent-mapped
-        Buffer*        pInstanceBuf = nullptr;    // [0..maxDraws-1] uint, instance-rate VB (DrawIndex)
+        Pipeline*      pOpaquePipeline = nullptr;        // FRONT_FACE_CCW (non-mirrored)
+        Pipeline*      pOpaquePipelineMirror = nullptr;  // FRONT_FACE_CW (negative-determinant world)
+        DescriptorSet* pPerFrameSet = nullptr;    // gFrameData cbuffer (viewProj), 1 instance
+        DescriptorSet* pPerBatchSet = nullptr;    // gBatch cbuffer window, kMaxBatches instances
+        Buffer*        pFrameCbv = nullptr;        // gFrameData cbuffer (viewProj), persistent-mapped
+        Buffer*        pWorldsBuf[16] = {};        // gBatch windows: one 64KB cbuffer PER batch, persistent-mapped
+        Buffer*        pInstanceBuf = nullptr;     // [0..kBatchSize-1] uint, instance-rate VB (DrawIndex), reused per batch
         uint32_t       maxDraws = 0;
     };
     LiveRenderer g_live;
 
-    // Per-draw transform: one PerFrame cbuffer (gScene) = viewProj + a worlds[] array of
-    // all visible world matrices, bound once, indexed per-draw by an instance-rate vertex
-    // attribute (identity instance buffer + firstInstance). No per-draw descriptor sets.
-    // Capped at 1023 by the D3D12 64KB cbuffer limit (1 + 1023 = 1024 * 64B). Must match
-    // OPAQUE_MAX_DRAWS in opaque.srt.h. (A StructuredBuffer would lift the cap but
-    // CPU_TO_GPU SRV reads came back garbage — revisit with GPU debugging if needed.)
-    constexpr uint32_t kMaxDraws   = 1023;
-    constexpr uint32_t kWorldsOff  = 64;            // worlds[] start (after viewProj float4x4)
-    constexpr uint32_t kSceneBytes = 64 + 64 * kMaxDraws;   // = 65536
+    // Per-draw transform: the PROVEN column-major cbuffer convention, BATCHED to beat the
+    // 64KB cbuffer cap. CRITICAL: a UNIFORM_BUFFER resource > 64KB makes Forge build an
+    // oversized full CBV (> D3D12's 65536 max) which REMOVES THE DEVICE — so each batch is
+    // its OWN exactly-64KB cbuffer (a valid full CBV, no sub-ranges). kMaxBatches separate
+    // 64KB buffers hold kBatchSize matrices each; a PerBatch descriptor set instance b binds
+    // buffer b. Draws issue in batches of kBatchSize, the per-instance DrawIndex selecting
+    // within the bound window. (This is why every "descriptor count" scaling attempt failed:
+    // the backing buffer crossed 64KB, not the descriptor count.)
+    constexpr uint32_t kBatchSize  = 1024;                 // matrices per 64KB cbuffer (must match OPAQUE_BATCH)
+    constexpr uint32_t kBatchBytes = kBatchSize * 64;      // 65536 = exactly the D3D12 CBV max
+    constexpr uint32_t kMaxBatches = 8;                    // 8 * 1024 = 8192 draws/frame
+    constexpr uint32_t kMaxDraws   = kBatchSize * kMaxBatches;
 
     // Build the M1c opaque scene path: depth target, opaque shader + pipeline (pos+normal
     // per-vertex + per-instance DrawIndex layout, depth test/write), the viewProj CBV +
-    // gScene cbuffer = viewProj + worlds[] (one PerFrame descriptor set), and the identity
+    // gFrameData cbuffer (viewProj) + gWorlds structured buffer (one PerFrame set), and the identity
     // instance buffer. The opaque shaders share the global default.rootsig (regenerated from the
     // SRT in opaque.srt.h). On any failure tears down what it made and returns false
     // (the triangle path stays usable).
@@ -588,7 +707,15 @@ namespace {
         depthDesc.mDepthFunc = CMP_LEQUAL;
 
         RasterizerStateDesc rasterDesc = {};
-        rasterDesc.mCullMode = CULL_MODE_NONE;   // M1c: no winding assumptions yet
+        // Backface culling — the proven D3D9 cache color pass culls (drawEntry: mirrored ?
+        // D3DCULL_CCW : D3DCULL_CW). CULL_MODE_NONE drew BOTH faces of every thin/double-
+        // sided mesh → two near-coincident surfaces → z-fighting on movers (thin geometry),
+        // statics (thick) unaffected. Same VB/IB + viewProj as the proven path; the scene
+        // already renders correctly oriented, so front faces are CCW → keep CCW, cull back.
+        // (Mirrored / negative-determinant parts will show inside-out until a per-draw mirror
+        // pipeline is added — a minority; the global winding is validated by this build.)
+        rasterDesc.mCullMode = CULL_MODE_BACK;
+        rasterDesc.mFrontFace = FRONT_FACE_CCW;
 
         PipelineDesc pd = {};
         pd.mType = PIPELINE_TYPE_GRAPHICS;
@@ -609,51 +736,105 @@ namespace {
             return false;
         }
 
-        // gScene: the single 64KB PerFrame cbuffer (viewProj + worlds[kMaxDraws]),
-        // persistent-mapped. One CBV, bound once.
+        // Mirror variant: same pipeline with the OPPOSITE front face (CW). Negative-
+        // determinant (mirrored) world transforms flip triangle winding, so their front
+        // faces become CW; without this they'd cull the wrong face and render INSIDE-OUT
+        // (matches the proven D3D9 drawEntry's `mirrored ? D3DCULL_CCW : D3DCULL_CW`). The
+        // draw loop picks per draw by det(world) sign — no IPC wire change needed.
+        RasterizerStateDesc rasterMirror = rasterDesc;
+        rasterMirror.mFrontFace = FRONT_FACE_CW;
+        g.pRasterizerState = &rasterMirror;
+        addPipeline(R, &pd, &g_live.pOpaquePipelineMirror);
+        g.pRasterizerState = &rasterDesc;   // restore for any later use of pd
+        if (!g_live.pOpaquePipelineMirror) {
+            std::printf("[forge] addPipeline(opaque mirror) FAILED\n");
+            return false;
+        }
+
+        // gFrameData: small viewProj cbuffer, persistent-mapped (256 = min CBV size).
         BufferLoadDesc fb = {};
         fb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         fb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
         fb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-        fb.mDesc.mSize = kSceneBytes;   // 65536 (D3D12 cbuffer max)
+        fb.mDesc.mSize = 256;
+        fb.mDesc.pName = "frameCbv";
         fb.pData = nullptr;
-        fb.ppBuffer = &g_live.pSceneCbv;
+        fb.ppBuffer = &g_live.pFrameCbv;
         addResource(&fb, nullptr);
 
-        // Identity instance-index buffer [0,1,2,...,maxDraws-1] (uint). Per draw i,
-        // firstInstance=i makes the instance-rate DrawIndex attribute read value i.
-        uint32_t* idx = (uint32_t*)tf_malloc((size_t)kMaxDraws * sizeof(uint32_t));
-        for (uint32_t i = 0; i < kMaxDraws; ++i) {
+        // World buffers: ONE exactly-64KB cbuffer per batch (a valid full CBV — a single
+        // >64KB uniform buffer removes the device). Each holds kBatchSize float4x4.
+        for (uint32_t b = 0; b < kMaxBatches; ++b) {
+            BufferLoadDesc wb = {};
+            wb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            wb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            wb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            wb.mDesc.mSize = kBatchBytes;
+            wb.mDesc.pName = "worldBatchCbv";
+            wb.pData = nullptr;
+            wb.ppBuffer = &g_live.pWorldsBuf[b];
+            addResource(&wb, nullptr);
+            if (b == 0) {
+                // Probe the BufferDesc fields that decide CBV-vs-SRV + element layout — the
+                // fields that distinguish this 64KB UNIFORM_BUFFER (CBV) workaround from the
+                // structured-buffer (SRV) path that would lift the per-batch cap entirely.
+                std::printf("[forge] worldBuf[0] desc: mDescriptors=0x%X mSize=%llu mMemoryUsage=%d mStructStride=%u mElementCount=%u\n",
+                            (unsigned)wb.mDesc.mDescriptors, (unsigned long long)wb.mDesc.mSize,
+                            (int)wb.mDesc.mMemoryUsage, (unsigned)wb.mDesc.mStructStride,
+                            (unsigned)wb.mDesc.mElementCount);
+                LOGF(eINFO, "[forge] worldBuf[0] desc: mDescriptors=0x%X mSize=%llu mMemoryUsage=%d mStructStride=%u mElementCount=%u",
+                     (unsigned)wb.mDesc.mDescriptors, (unsigned long long)wb.mDesc.mSize,
+                     (int)wb.mDesc.mMemoryUsage, (unsigned)wb.mDesc.mStructStride,
+                     (unsigned)wb.mDesc.mElementCount);
+            }
+        }
+
+        // Identity instance-index buffer [0..kBatchSize-1] (uint), reused for every batch.
+        // Per draw with local index l, firstInstance=l makes the DrawIndex attribute read l.
+        uint32_t* idx = (uint32_t*)tf_malloc((size_t)kBatchSize * sizeof(uint32_t));
+        for (uint32_t i = 0; i < kBatchSize; ++i) {
             idx[i] = i;
         }
         BufferLoadDesc ib = {};
         ib.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
         ib.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
-        ib.mDesc.mSize = (uint64_t)kMaxDraws * sizeof(uint32_t);
+        ib.mDesc.mSize = (uint64_t)kBatchSize * sizeof(uint32_t);
         ib.mDesc.mStartState = RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+        ib.mDesc.pName = "instanceIdxVB";
         ib.pData = idx;
         ib.ppBuffer = &g_live.pInstanceBuf;
         addResource(&ib, nullptr);
         waitForAllResourceLoads();
         tf_free(idx);
-        if (!g_live.pSceneCbv || !g_live.pInstanceBuf) {
+        if (!g_live.pFrameCbv || !g_live.pWorldsBuf[0] || !g_live.pInstanceBuf) {
             return false;
         }
         g_live.maxDraws = kMaxDraws;
 
-        // ONE PerFrame descriptor set (maxSets=1) binding the gScene cbuffer.
+        // PerFrame set (1 instance): gFrameData viewProj.
         DescriptorSetDesc pfDesc = SRT_SET_DESC(SrtData, PerFrame, 1, 0);
         addDescriptorSet(R, &pfDesc, &g_live.pPerFrameSet);
-        if (!g_live.pPerFrameSet) {
+        // PerBatch set (kMaxBatches instances): gBatch = window b of the world buffer.
+        DescriptorSetDesc pbDesc = SRT_SET_DESC(SrtData, PerBatch, kMaxBatches, 0);
+        addDescriptorSet(R, &pbDesc, &g_live.pPerBatchSet);
+        if (!g_live.pPerFrameSet || !g_live.pPerBatchSet) {
             return false;
         }
-        DescriptorData p = {};
-        p.mIndex = SRT_RES_IDX(SrtData, PerFrame, gScene);
-        p.ppBuffers = &g_live.pSceneCbv;
-        updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &p);
+        {
+            DescriptorData p = {};
+            p.mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
+            p.ppBuffers = &g_live.pFrameCbv;
+            updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &p);
+        }
+        for (uint32_t b = 0; b < kMaxBatches; ++b) {
+            DescriptorData p = {};
+            p.mIndex = SRT_RES_IDX(SrtData, PerBatch, gBatch);
+            p.ppBuffers = &g_live.pWorldsBuf[b];   // full 64KB buffer = the CBV (no sub-range)
+            updateDescriptorSet(R, b, g_live.pPerBatchSet, 1, &p);
+        }
 
-        std::printf("[forge] opaque scene path ready (depth %ux%u, maxDraws=%u, cbuffer-array)\n",
-                    width, height, kMaxDraws);
+        std::printf("[forge] opaque scene path ready (depth %ux%u, maxDraws=%u, batched %ux%u)\n",
+                    width, height, kMaxDraws, kMaxBatches, kBatchSize);
         return true;
     }
 
@@ -883,6 +1064,13 @@ namespace ForgeRender {
         }
         Renderer* R = g_live.pRenderer;
 
+        // If the device was already removed on a PRIOR frame (e.g. during a dense exterior),
+        // every subsequent frame stays black no matter the scene — this names that state
+        // instead of silently rendering nothing (explains "back to interior, still black").
+        if (logDeviceRemoved(R, "renderScene/entry")) {
+            return false;
+        }
+
         // Lazy one-time opaque-path build (depth RT + pipeline + descriptor sets),
         // deferred out of init so geometry upload runs first on a clean resource loader.
         if (!g_live.pOpaquePipeline) {
@@ -901,12 +1089,15 @@ namespace ForgeRender {
         const uint32_t count = (n < haveBytes) ? n : haveBytes;
         const IPC::DrawItemWire* items = (const IPC::DrawItemWire*)drawBlob;
 
-        // Fill the gScene cbuffer: viewProj at offset 0, worlds[i] at kWorldsOff + i*64.
-        // worlds[i] aligns with draw-loop index i (firstInstance=i selects it).
-        uint8_t* scene = (uint8_t*)g_live.pSceneCbv->pCpuMappedAddress;
-        std::memcpy(scene, viewProj, 16 * sizeof(float));
+        // viewProj → the persistent-mapped frame cbuffer. world[i] → window (i/kBatchSize)
+        // at local slot (i%kBatchSize): byte offset (i/kBatchSize)*kBatchBytes + (i%kBatchSize)*64.
+        // Index i aligns with the draw loop below (batch+local select the same matrix).
+        std::memcpy(g_live.pFrameCbv->pCpuMappedAddress, viewProj, 16 * sizeof(float));
         for (uint32_t i = 0; i < count; ++i) {
-            std::memcpy(scene + kWorldsOff + (size_t)i * 64, items[i].world, 64);
+            const uint32_t batch = i / kBatchSize;
+            const uint32_t local = i % kBatchSize;
+            uint8_t* dst = (uint8_t*)g_live.pWorldsBuf[batch]->pCpuMappedAddress;
+            std::memcpy(dst + (size_t)local * 64, items[i].world, 64);
         }
 
         resetCmdPool(R, g_live.pCmdPool);
@@ -929,14 +1120,38 @@ namespace ForgeRender {
         cmdBindRenderTargets(g_live.pCmd, &bind);
         cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
         cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+        // Bind a pipeline FIRST — in Forge D3D12 cmdBindPipeline establishes the root
+        // signature, which the descriptor-set binds below require. (Binding PerFrame before
+        // any pipeline hung the GPU: root args never set.) Start on the non-mirror pipeline;
+        // the loop switches to the mirror variant per draw as needed.
         cmdBindPipeline(g_live.pCmd, g_live.pOpaquePipeline);
         cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
 
         uint32_t drawn = 0;
+        uint32_t boundBatch = UINT32_MAX;
+        int      boundMirror = 0;   // matches the initial cmdBindPipeline above (0 = CCW)
         for (uint32_t i = 0; i < count; ++i) {
             const uint32_t slot = items[i].slot;
             if (slot >= g_meshHigh || !g_meshes[slot].valid) {
                 continue;   // mesh not uploaded yet (or evicted)
+            }
+            // Select the winding pipeline by the world transform's determinant sign. Both
+            // pipelines share the root signature, so the PerFrame/PerBatch descriptor sets
+            // stay bound across a pipeline switch. Bind only on change (mostly non-mirror).
+            const int mirror = worldMirrored(items[i].world) ? 1 : 0;
+            if (mirror != boundMirror) {
+                cmdBindPipeline(g_live.pCmd, mirror ? g_live.pOpaquePipelineMirror
+                                                    : g_live.pOpaquePipeline);
+                boundMirror = mirror;
+                boundBatch = UINT32_MAX;   // re-bind PerBatch after a PSO change (defensive)
+            }
+            // Rebind the batch window when crossing a 1024-draw boundary. items are in
+            // order, so this fires at most kMaxBatches times.
+            const uint32_t batch = i / kBatchSize;
+            const uint32_t local = i % kBatchSize;
+            if (batch != boundBatch) {
+                cmdBindDescriptorSet(g_live.pCmd, batch, g_live.pPerBatchSet);
+                boundBatch = batch;
             }
             HostMesh& m = g_meshes[slot];
             // Bind mesh VB (binding 0) + the shared instance-index VB (binding 1).
@@ -944,8 +1159,9 @@ namespace ForgeRender {
             uint32_t strides[2] = { (uint32_t)sizeof(IPC::GeomVertexWire), (uint32_t)sizeof(uint32_t) };
             cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
             cmdBindIndexBuffer(g_live.pCmd, m.ib, INDEX_TYPE_UINT16, 0);
-            // firstInstance = i → DrawIndex attribute reads instanceBuf[i] = i → worlds[i].
-            cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, 0, 1, 0, i);
+            // firstInstance = local → DrawIndex attribute reads instanceBuf[local] = local
+            // → gBatch.worlds[local] of the bound window.
+            cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, 0, 1, 0, local);
             ++drawn;
         }
 
@@ -966,6 +1182,8 @@ namespace ForgeRender {
         submitDesc.mSubmitDone = true;
         queueSubmit(g_live.pQueue, &submitDesc);
         waitForFences(R, 1, &g_live.pFence);
+        // A dense exterior frame is the suspected trigger; pin a removal to the draw submit.
+        logDeviceRemoved(R, "renderScene/submit");
 
         g_live.firstFrame = false;
         g_lastDrawn = drawn;
@@ -1017,6 +1235,7 @@ namespace ForgeRender {
             vbDesc.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
             vbDesc.mDesc.mSize         = vbBytes;
             vbDesc.mDesc.mStartState   = RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+            vbDesc.mDesc.pName         = "geomVB";
             vbDesc.pData               = verts;
             vbDesc.ppBuffer            = &m.vb;
             addResource(&vbDesc, nullptr);
@@ -1026,6 +1245,7 @@ namespace ForgeRender {
             ibDesc.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
             ibDesc.mDesc.mSize         = ibBytes;
             ibDesc.mDesc.mStartState   = RESOURCE_STATE_INDEX_BUFFER;
+            ibDesc.mDesc.pName         = "geomIB";
             ibDesc.pData               = indices;
             ibDesc.ppBuffer            = &m.ib;
             addResource(&ibDesc, nullptr);
@@ -1040,6 +1260,9 @@ namespace ForgeRender {
         }
 
         waitForAllResourceLoads();
+        // Exterior uploads ship ~1000+ parts in one batch; this is where a prior in-game
+        // test went DEVICE_REMOVED. Pin a removal to the upload (vs the later draw).
+        logDeviceRemoved(g_live.pRenderer, "uploadGeometry/waitForAllResourceLoads");
         LOGF(eINFO, "[forge] uploadGeometry: built %u/%u parts (%u bytes), meshHigh=%u",
              built, partCount, byteCount, g_meshHigh);
         std::printf("[forge] uploadGeometry: built %u/%u parts (%u bytes), meshHigh=%u\n",
@@ -1057,9 +1280,14 @@ namespace ForgeRender {
         freeMeshStore();   // release VB/IB before the resource loader goes down
         // M1c opaque path teardown.
         if (g_live.pPerFrameSet)    { removeDescriptorSet(R, g_live.pPerFrameSet); }
-        if (g_live.pSceneCbv)       { removeResource(g_live.pSceneCbv); }
+        if (g_live.pPerBatchSet)    { removeDescriptorSet(R, g_live.pPerBatchSet); }
+        if (g_live.pFrameCbv)       { removeResource(g_live.pFrameCbv); }
+        for (uint32_t b = 0; b < kMaxBatches; ++b) {
+            if (g_live.pWorldsBuf[b]) { removeResource(g_live.pWorldsBuf[b]); }
+        }
         if (g_live.pInstanceBuf)    { removeResource(g_live.pInstanceBuf); }
         if (g_live.pOpaquePipeline) { removePipeline(R, g_live.pOpaquePipeline); }
+        if (g_live.pOpaquePipelineMirror) { removePipeline(R, g_live.pOpaquePipelineMirror); }
         if (g_live.pOpaqueShader)   { removeShader(R, g_live.pOpaqueShader); }
         if (g_live.pDepth)          { removeRenderTarget(R, g_live.pDepth); }
         if (g_live.pFence)    { exitFence(R, g_live.pFence); }

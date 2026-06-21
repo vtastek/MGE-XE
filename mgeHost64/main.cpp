@@ -42,6 +42,12 @@ int main(int argc, char** argv) {
 		return ForgeRender::renderTriangleShared() ? 0 : 1;
 	}
 
+	// Standalone M1c opaque scene-path probe: init + uploadGeometry + renderScene with a
+	// dummy mesh, so a buildOpaquePath/draw crash is visible on stdout (no MW/IPC).
+	if (argc >= 2 && std::strcmp(argv[1], "--forge-scene") == 0) {
+		return ForgeRender::sceneProbe() ? 0 : 1;
+	}
+
 	LOG::open("mgeHost64.log");
 	LOG::logline("Host process started");
 
@@ -49,10 +55,21 @@ int main(int argc, char** argv) {
 	HANDLE clientProcess = INVALID_HANDLE_VALUE;
 	HANDLE rpcStartEvent = INVALID_HANDLE_VALUE;
 	HANDLE rpcCompleteEvent = INVALID_HANDLE_VALUE;
-	if (std::sscanf(GetCommandLineA(), "%p %p %p %p", &sharedMem, &clientProcess, &rpcStartEvent, &rpcCompleteEvent) != 4) {
-		LOG::logline("Expected handles not found on command line");
+	// Dedicated geometry channel handles (second shared-mem + start/complete events). The
+	// client always passes all 7 now; the 4-handle form is kept for forward/back-compat.
+	HANDLE geomSharedMem = nullptr;
+	HANDLE geomRpcStartEvent = nullptr;
+	HANDLE geomRpcCompleteEvent = nullptr;
+	const int parsed = std::sscanf(GetCommandLineA(), "%p %p %p %p %p %p %p",
+		&sharedMem, &clientProcess, &rpcStartEvent, &rpcCompleteEvent,
+		&geomSharedMem, &geomRpcStartEvent, &geomRpcCompleteEvent);
+	if (parsed != 7 && parsed != 4) {
+		LOG::logline("Expected handles not found on command line (parsed %d)", parsed);
 		LOG::flush();
 		return 1;
+	}
+	if (parsed == 4) {
+		geomSharedMem = geomRpcStartEvent = geomRpcCompleteEvent = nullptr;
 	}
 
 #ifdef _DEBUG
@@ -68,7 +85,8 @@ int main(int argc, char** argv) {
 		return 4;
 	}
 
-	IPC::Server server(sharedMem, clientProcess, rpcStartEvent, rpcCompleteEvent);
+	IPC::Server server(sharedMem, clientProcess, rpcStartEvent, rpcCompleteEvent,
+		geomSharedMem, geomRpcStartEvent, geomRpcCompleteEvent);
 	if (!server.init()) {
 		LOG::logline("!! Server initialization failed");
 		LOG::flush();

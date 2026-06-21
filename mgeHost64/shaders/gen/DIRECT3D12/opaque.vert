@@ -962,15 +962,21 @@ SamplerState gSamplerAnisotropic : register( s10 , space100 ) ;
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.vert.fsl"
 #line 7 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.vert.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-#line 17 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-STRUCT(SceneData)
+#line 19 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+STRUCT(FrameData)
 {
     float4x4 viewProj;
-    float4x4 worlds[ 1023 ];
-#line 21
+#line 22
 };
 
-        CBUFFER(SceneData) gScene : register( b0 , space1 ) ;
+STRUCT(BatchData)
+{
+    float4x4 worlds[ 1024 ];
+#line 27
+};
+
+        CBUFFER(FrameData) gFrameData : register( b0 , space1 ) ;
+        CBUFFER(BatchData) gBatch : register( b0 , space2 ) ;
 #line 8 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.vert.fsl"
 
 STRUCT(VSInput)
@@ -994,11 +1000,12 @@ VSOutput VS_MAIN( VSInput In )
     //INIT_MAIN;
     VSOutput Out;
 
-    float4x4 world = gScene.worlds[In.DrawIndex];
+
+    float4x4 world = gBatch.worlds[In.DrawIndex];
 
 
     float4 worldPos = mul(world, float4(In.Position, 1.0f));
-    Out.Position = mul(gScene.viewProj, worldPos);
+    Out.Position = mul(gFrameData.viewProj, worldPos);
     Out.Normal = mul((float3x3)world, In.Normal);
     return (Out);
 }

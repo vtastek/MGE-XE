@@ -53,7 +53,24 @@ namespace IPC {
 		Parameters* m_ipcParameters;
 		bool m_isRpcPending;
 
+		// Dedicated GEOMETRY channel: a SECOND shared-mem Parameters + start/complete
+		// events to the SAME host process. Bulk geometry uploads run here so they never
+		// contend with the one-at-a-time cull/scene RPCs on the main channel — that
+		// contention starved the upload flush at present time and left exteriors black
+		// (draw list referenced slots whose geometry never shipped). One user only (the
+		// present-thread flush), so no cross-thread races on this channel; the host
+		// services both channels on a single thread (WFMO), so uploadGeometry never races
+		// renderScene. Separate Parameters union ⇒ no interleaved-completion clobber.
+		HANDLE m_geomSharedMem;
+		HANDLE m_geomRpcStartEvent;
+		HANDLE m_geomRpcCompleteEvent;
+		HANDLE m_geomWaitHandles[2];   // {m_process, m_geomRpcCompleteEvent}
+		Parameters* m_geomParameters;
+		bool m_geomRpcPending;
+
 		bool beginRpc(Command command);
+		bool beginGeomRpc(Command command);
+		WakeReason waitGeomCompletion(DWORD ms = MaxWait);
 
 	public:
 		Client();

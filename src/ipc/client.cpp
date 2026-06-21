@@ -21,8 +21,16 @@ namespace IPC {
 		m_rpcStartEvent(INVALID_HANDLE_VALUE),
 		m_rpcCompleteEvent(INVALID_HANDLE_VALUE),
 		m_ipcParameters(nullptr),
-		m_isRpcPending(false)
-	{}
+		m_isRpcPending(false),
+		m_geomSharedMem(INVALID_HANDLE_VALUE),
+		m_geomRpcStartEvent(INVALID_HANDLE_VALUE),
+		m_geomRpcCompleteEvent(INVALID_HANDLE_VALUE),
+		m_geomParameters(nullptr),
+		m_geomRpcPending(false)
+	{
+		m_geomWaitHandles[0] = INVALID_HANDLE_VALUE;
+		m_geomWaitHandles[1] = INVALID_HANDLE_VALUE;
+	}
 
 	Client::~Client() {
 		if (m_process != INVALID_HANDLE_VALUE) {
@@ -39,6 +47,14 @@ namespace IPC {
 		CleanupHandle(m_sharedMem);
 		CleanupHandle(m_rpcStartEvent);
 		CleanupHandle(m_rpcCompleteEvent);
+
+		if (m_geomParameters != nullptr) {
+			UnmapViewOfFile(m_geomParameters);
+			m_geomParameters = nullptr;
+		}
+		CleanupHandle(m_geomSharedMem);
+		CleanupHandle(m_geomRpcStartEvent);
+		CleanupHandle(m_geomRpcCompleteEvent);
 	}
 
 	bool Client::isServerActive() {
@@ -108,7 +124,31 @@ namespace IPC {
 			goto failedOnCreateCompleteEvent;
 		}
 
-		std::sprintf(strHandles, "%p %p %p %p", m_sharedMem, thisProcess, m_rpcStartEvent, m_rpcCompleteEvent);
+		// --- Dedicated geometry channel: second Parameters region + start/complete events ---
+		m_geomSharedMem = CreateFileMappingA(INVALID_HANDLE_VALUE, &attrsAllowInherit, PAGE_READWRITE, 0, sizeof(Parameters), NULL);
+		if (m_geomSharedMem == NULL) {
+			LOG::winerror("Failed to create geometry shared memory region");
+			goto failedOnGeomMapping;
+		}
+		m_geomParameters = static_cast<Parameters*>(MapViewOfFile(m_geomSharedMem, FILE_MAP_ALL_ACCESS, 0, 0, 0));
+		if (m_geomParameters == nullptr) {
+			LOG::winerror("Failed to map geometry shared memory region");
+			goto failedOnGeomMap;
+		}
+		ZeroMemory(m_geomParameters, sizeof(Parameters));
+		m_geomRpcStartEvent = CreateEventA(&attrsAllowInherit, FALSE, FALSE, NULL);
+		if (m_geomRpcStartEvent == NULL) {
+			LOG::winerror("Failed to create geometry RPC start event");
+			goto failedOnGeomStartEvent;
+		}
+		m_geomRpcCompleteEvent = CreateEventA(&attrsAllowInherit, FALSE, FALSE, NULL);
+		if (m_geomRpcCompleteEvent == NULL) {
+			LOG::winerror("Failed to create geometry RPC complete event");
+			goto failedOnGeomCompleteEvent;
+		}
+
+		std::sprintf(strHandles, "%p %p %p %p %p %p %p", m_sharedMem, thisProcess, m_rpcStartEvent, m_rpcCompleteEvent,
+			m_geomSharedMem, m_geomRpcStartEvent, m_geomRpcCompleteEvent);
 		if (!CreateProcessA(executable, strHandles, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &startupInfo, &processInfo)) {
 			LOG::winerror("Failed to start 64-bit host process %s", executable);
 			goto failedOnCreateProcess;
@@ -117,6 +157,8 @@ namespace IPC {
 		m_process = processInfo.hProcess;
 		// don't care about thread handle
 		CloseHandle(processInfo.hThread);
+		m_geomWaitHandles[0] = m_process;
+		m_geomWaitHandles[1] = m_geomRpcCompleteEvent;
 
 		LOG::logline("64-bit host process started (PID %u)", processInfo.dwProcessId);
 
@@ -128,6 +170,16 @@ namespace IPC {
 		LOG::logline("Failed waiting for 64-bit host process to initialize");
 
 	failedOnCreateProcess:
+		CleanupHandle(m_geomRpcCompleteEvent);
+	failedOnGeomCompleteEvent:
+		CleanupHandle(m_geomRpcStartEvent);
+	failedOnGeomStartEvent:
+		UnmapViewOfFile(m_geomParameters);
+		m_geomParameters = nullptr;
+	failedOnGeomMap:
+		CloseHandle(m_geomSharedMem);
+		m_geomSharedMem = INVALID_HANDLE_VALUE;
+	failedOnGeomMapping:
 		CleanupHandle(m_rpcCompleteEvent);
 	failedOnCreateCompleteEvent:
 		CleanupHandle(m_rpcStartEvent);
@@ -388,18 +440,25 @@ namespace IPC {
 	}
 
 	bool Client::geomUploadBlocking(VecId blob, std::uint32_t partCount, std::uint32_t byteCount, std::uint32_t* outUploaded) {
-		WAIT_FOR_PREVIOUS_COMMAND;
+		// Geometry rides its OWN channel — wait only for the previous GEOM RPC, never the
+		// main cull/scene channel. This is the whole point: bulk uploads no longer contend
+		// with the one-at-a-time cull RPCs (which starved this at present time → exterior
+		// black). The host services this channel on the same single thread via WFMO, so it
+		// can never race renderScene.
+		if (m_geomRpcPending && waitGeomCompletion() != WakeReason::Complete) {
+			return false;
+		}
 
-		auto& params = m_ipcParameters->params.geomUploadParams;
+		auto& params = m_geomParameters->params.geomUploadParams;
 		params.blob = blob;
 		params.partCount = partCount;
 		params.byteCount = byteCount;
 		params.partsUploaded = 0;
-		if (!beginRpc(Command::GeomUpload)) {
+		if (!beginGeomRpc(Command::GeomUpload)) {
 			return false;
 		}
 
-		if (waitForCompletion() != WakeReason::Complete) {
+		if (waitGeomCompletion() != WakeReason::Complete) {
 			return false;
 		}
 
@@ -437,5 +496,42 @@ namespace IPC {
 		}
 
 		return WakeReason::Complete;
+	}
+
+	bool Client::beginGeomRpc(Command command) {
+		if (m_geomRpcPending) {
+			LOG::logline("Attempted geometry RPC while another geometry RPC was still in progress");
+			return false;
+		}
+		ResetEvent(m_geomRpcCompleteEvent);
+		m_geomParameters->command = command;
+		if (!SetEvent(m_geomRpcStartEvent)) {
+			LOG::winerror("Failed to set geometry RPC start event");
+			return false;
+		}
+		m_geomRpcPending = true;
+		return true;
+	}
+
+	WakeReason Client::waitGeomCompletion(DWORD ms) {
+		auto result = WaitForMultipleObjects(2, m_geomWaitHandles, FALSE, ms);
+		switch (result) {
+		case WAIT_FAILED:
+			LOG::winerror("IPC client wait for geometry RPC completion failed");
+			return WakeReason::Error;
+		case WAIT_TIMEOUT:
+			return WakeReason::Timeout;
+		default:
+			auto handleIndex = result - WAIT_OBJECT_0;
+			switch (handleIndex) {
+			case 0:   // m_process signalled — host gone
+				return WakeReason::ServerLost;
+			case 1:   // geometry RPC complete
+				m_geomRpcPending = false;
+				return WakeReason::Complete;
+			default:
+				return WakeReason::Error;
+			}
+		}
 	}
 }

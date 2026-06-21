@@ -30,6 +30,14 @@ namespace IPC {
 			HANDLE m_waitHandles[2];
 		};
 		HANDLE m_rpcCompleteEvent;
+		// Dedicated geometry channel (second Parameters + start/complete events). Serviced
+		// on this SAME thread via WFMO so geometry upload never races renderScene, while the
+		// client can issue uploads without contending with the main cull/scene channel.
+		// Null when the host is launched single-channel (e.g. the standalone --forge probes).
+		HANDLE m_geomSharedMem;
+		HANDLE m_geomRpcStartEvent;
+		HANDLE m_geomRpcCompleteEvent;
+		Parameters* m_geomParameters;
 		std::vector<Vec<char>*> m_vecs;
 		std::queue<VecId> m_freeVecs;
 		Parameters* m_ipcParameters;
@@ -52,7 +60,8 @@ namespace IPC {
 		void geomUpload();
 
 	public:
-		Server(HANDLE sharedMem, HANDLE clientProcess, HANDLE rpcStartEvent, HANDLE rpcCompleteEvent);
+		Server(HANDLE sharedMem, HANDLE clientProcess, HANDLE rpcStartEvent, HANDLE rpcCompleteEvent,
+			HANDLE geomSharedMem = nullptr, HANDLE geomRpcStartEvent = nullptr, HANDLE geomRpcCompleteEvent = nullptr);
 		~Server();
 		Server(const Server&) = delete;
 		Server& operator=(const Server&) = delete;

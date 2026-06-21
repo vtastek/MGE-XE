@@ -25,11 +25,12 @@ VSOutput VS_MAIN( VSInput In )
     INIT_MAIN;
     VSOutput Out;
 
-    float4x4 world = gScene.worlds[In.DrawIndex];
+    // DrawIndex is the LOCAL index within the bound batch window (0..1023).
+    float4x4 world = gBatch.worlds[In.DrawIndex];
     // Cbuffer matrices are column-major (DXC default), so mul(M, v) with the D3DX bytes
-    // uploaded as-is == D3DX v*M (proven by the working per-draw-cbuffer M1c-256).
+    // uploaded as-is == D3DX v*M. viewProj likewise.
     float4 worldPos = mul(world, float4(In.Position, 1.0f));
-    Out.Position = mul(gScene.viewProj, worldPos);
+    Out.Position = mul(gFrameData.viewProj, worldPos);
     Out.Normal = mul((float3x3)world, In.Normal);
     RETURN(Out);
 }

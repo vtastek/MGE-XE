@@ -78,6 +78,10 @@ namespace ForgeRender {
     // Parts actually drawn (slot valid) in the last renderScene — for diagnostics.
     unsigned lastDrawn();
 
+    // Standalone scene-path exercise (init → uploadGeometry → renderScene with a dummy
+    // mesh) so host-side printf/asserts are visible in a terminal. Run via --forge-scene.
+    bool sceneProbe();
+
     // Tear down the persistent renderer (shared RT, pipeline, Forge stack).
     void shutdown();
 }
