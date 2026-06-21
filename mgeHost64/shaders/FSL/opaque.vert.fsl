@@ -1,0 +1,33 @@
+// mgeHost64 — M1c opaque scene (vertex stage).
+//
+// Model-space pos+normal in (matches IPC::GeomVertexWire / the cache VB layout). Per
+// draw: world from gObject (PerDraw), camera from gFrameData (PerFrame). Emits clip
+// position + world-space normal for flat N.L shading in the fragment stage.
+
+#include "opaque.srt.h"
+
+STRUCT(VSInput)
+{
+    DATA(float3, Position, POSITION);
+    DATA(float3, Normal,   NORMAL);
+};
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float3, Normal,   NORMAL);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+VSOutput VS_MAIN( VSInput In )
+{
+    INIT_MAIN;
+    VSOutput Out;
+
+    // mul(M, v) with row-major-uploaded matrices == D3DX v*M (see opaque.srt.h).
+    float4 worldPos = mul(gObject.world, float4(In.Position, 1.0f));
+    Out.Position = mul(gFrameData.viewProj, worldPos);
+    // Upper-left 3x3 for the normal (uniform-scale assumption; fine for M1c flat shade).
+    Out.Normal = mul((float3x3)gObject.world, In.Normal);
+    RETURN(Out);
+}

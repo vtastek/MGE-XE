@@ -135,6 +135,11 @@ namespace IPC {
         // frame into that vec. Both no-ops unless the spike is enabled client-side.
         RenderInit,
         RenderFrame,
+
+        // M1b: upload a batch of static opaque meshes (model-space pos+normal+indices,
+        // slot-indexed) into the Forge host's mesh store. The blob vec holds
+        // [GeomPartWire+verts+indices]*partCount (see ipc/geomwire.h).
+        GeomUpload,
     };
 
     struct AllocVecParameters {
@@ -255,8 +260,28 @@ namespace IPC {
         IN std::uint32_t frameIndex;     // for logging
         IN std::uint32_t targetIndex;    // which shared buffer to render into (double-buffer, C)
 
+        // M1c scene path: when drawList != InvalidVector the host renders the cached
+        // opaque scene (camera below + DrawItemWire[] in the drawList vec) instead of
+        // the triangle. viewProj is D3DXMATRIX bytes (row-major) — uploaded straight to
+        // the host's gFrameData cbuffer (no transpose, see opaque.srt.h).
+        IN float viewProj[16];
+        IN VecId drawList;               // chunked byte vec of DrawItemWire[]; Invalid ⇒ triangle
+        IN std::uint32_t drawCount;
+        IN std::uint32_t drawBytes;
+
         OUT std::uint32_t bytesWritten;
         OUT double renderMs;             // host-side render+readback time
+    };
+
+    // M1b geometry upload. blob = a byte VecId holding partCount packed parts
+    // (GeomPartWire+verts+indices each, ipc/geomwire.h). The host builds a D3D12
+    // VB/IB per part and stores it in its slot-indexed mesh array.
+    struct GeomUploadParameters {
+        IN VecId blob;
+        IN std::uint32_t partCount;
+        IN std::uint32_t byteCount;
+
+        OUT std::uint32_t partsUploaded;
     };
 
 	struct Parameters {
@@ -272,6 +297,7 @@ namespace IPC {
             GetMeshesAllRangesParameters meshAllRangesParams;
             RenderInitParameters renderInitParams;
             RenderFrameParameters renderFrameParams;
+            GeomUploadParameters geomUploadParams;
         } params;
 	};
 }

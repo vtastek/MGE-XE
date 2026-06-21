@@ -1,0 +1,24 @@
+// mgeHost64 — M1c opaque scene (fragment stage).
+//
+// Flat N.L shading from a fixed overhead-ish light + ambient, so geometry reads as
+// recognizable solid shapes (no textures/real lighting yet — that's M2/M3). The point
+// of M1c is to prove camera + geometry + depth, so the look just needs to show form.
+
+#include "opaque.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float3, Normal,   NORMAL);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    float3 N = normalize(In.Normal);
+    float3 L = normalize(float3(0.3f, 0.8f, 0.5f));
+    float  ndl = max(dot(N, L), 0.0f);
+    float  shade = 0.25f + 0.75f * ndl;   // ambient + diffuse
+    RETURN(float4(shade, shade, shade, 1.0f));
+}

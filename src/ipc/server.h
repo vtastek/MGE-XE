@@ -49,6 +49,7 @@ namespace IPC {
 		void sortVisibleSet();
 		void renderInit();
 		void renderFrame();
+		void geomUpload();
 
 	public:
 		Server(HANDLE sharedMem, HANDLE clientProcess, HANDLE rpcStartEvent, HANDLE rpcCompleteEvent);

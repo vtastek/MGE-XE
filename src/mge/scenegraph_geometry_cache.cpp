@@ -19,9 +19,12 @@
 #include "proxydx/d3d8texture.h"
 #include "proxydx/devicelock.h"
 #include "scenegraph_geometry_cache.h"
+#include "renderprocess.h"
+#include "ipc/geomwire.h"
 #include "support/log.h"
 
 #include <algorithm>
+#include <vector>
 
 namespace MGE::GeometryCache {
 
@@ -184,7 +187,7 @@ namespace MGE::GeometryCache {
         static_assert(sizeof(SkinnedVertex) == 56, "SkinnedVertex size mismatch");
 
         void uploadEntry(CachedGeometry& e, NI::TriBasedGeometry* geom,
-                         NI::TriBasedGeometryData* data) {
+                         NI::TriBasedGeometryData* data, uint32_t key) {
             const auto vertexCount = static_cast<uint32_t>(data->getActiveVertexCount());
             const auto triCount    = static_cast<uint32_t>(data->getActiveTriangleCount());
 
@@ -315,6 +318,28 @@ namespace MGE::GeometryCache {
             e.boundsCenter[1] = b.center.y;
             e.boundsCenter[2] = b.center.z;
             e.boundsRadius    = b.radius;
+
+            // M1: ship model-space pos+normal+indices to the Forge host (non-skinned
+            // opaques; terrain excluded for now). Re-uploads only on revision change.
+            if (!g_walkingLandscape && RenderProcess::wantsGeometryCapture()) {
+                static std::vector<IPC::GeomVertexWire> scratch;  // single-threaded cache walk
+                scratch.resize(vertexCount);
+                const auto* nrm = data->normal;
+                for (uint32_t i = 0; i < vertexCount; ++i) {
+                    auto& w = scratch[i];
+                    w.px = mv[i].x; w.py = mv[i].y; w.pz = mv[i].z;
+                    if (nrm) { w.nx = nrm[i].x; w.ny = nrm[i].y; w.nz = nrm[i].z; }
+                    else     { w.nx = 0.0f;    w.ny = 0.0f;    w.nz = 1.0f; }
+                }
+                const auto* triList = data->getTriList();
+                if (triList) {
+                    // NI::Triangle is 3 packed uint16 indices (== the IB byte layout
+                    // used above via memcpy(.., triCount*6)).
+                    RenderProcess::captureGeometry(key, data->revisionID,
+                        scratch.data(), vertexCount,
+                        reinterpret_cast<const uint16_t*>(triList), triCount * 3u);
+                }
+            }
 
             ++g_uploadedThisFrame;
         }
@@ -532,7 +557,7 @@ namespace MGE::GeometryCache {
                     buildSkinnedVB(e, geom, data, si, sd);          // static
                     if (!e.skinnedUnsupported) buildBonePalette(e, geom, si, sd);
                 } else {
-                    uploadEntry(e, geom, data);
+                    uploadEntry(e, geom, data, key);
                 }
                 buildD3DTransform(e.worldTransformD3D, geom);       // bounds center
                 e.dynamicHint = (sk || inCharacter) ? 4 : 0;
@@ -558,7 +583,7 @@ namespace MGE::GeometryCache {
                     const bool changed = (data->revisionID != e.revisionID) || e.isSkinned;
                     if (changed) {
                         extractMaterial(e, geom);
-                        uploadEntry(e, geom, data);
+                        uploadEntry(e, geom, data, key);
                     }
                     if (inCharacter) {
                         buildD3DTransform(e.worldTransformD3D, geom);

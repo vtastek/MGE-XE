@@ -47,10 +47,36 @@ namespace ForgeRender {
     // successful init(). The IPC server DuplicateHandles this into MW's process.
     void* sharedHandle();
 
+    // True if the M1c opaque scene path (depth RT + opaque pipeline + descriptor sets)
+    // built successfully in init(). False ⇒ renderScene returns false and the seam
+    // falls back to the triangle. The server logs this so the buffered host stdout
+    // isn't needed to know whether the scene path is live.
+    bool sceneReady();
+
+    // M1b: build a D3D12 VB/IB per part from a packed upload blob (model-space
+    // pos+normal+indices, slot-indexed; see ipc/geomwire.h) and store each in the
+    // host's slot-indexed mesh array. blobBytes points at the contiguous batch;
+    // byteCount is its length; partCount is the number of parts to parse. Returns
+    // the number of parts successfully built. Safe to call before/independently of
+    // renderFrame (M1c will draw these). No-op if Forge isn't live.
+    unsigned uploadGeometry(const void* blobBytes, unsigned byteCount, unsigned partCount);
+
     // Render one frame (clear + triangle) into the shared RT and leave it in a
     // state MW's D3D9Ex StretchRect can read (COMMON). Blocking: waits on the GPU
     // fence before returning, so the RPC reply implies the frame is ready.
     bool renderFrame(unsigned frameIndex);
+
+    // M1c: render the cached opaque scene into the shared RT (depth-tested), then
+    // leave it COMMON for MW's StretchRect. viewProj is 16 floats (D3DXMATRIX bytes,
+    // row-major). drawBlob is an array of IPC::DrawItemWire (slot + world[16]);
+    // drawCount entries, drawBytes total. Parts whose slot has no uploaded mesh are
+    // skipped. Returns false if the opaque path isn't built (caller can fall back to
+    // renderFrame's triangle). Blocking (fence-waits like renderFrame).
+    bool renderScene(const float* viewProj, const void* drawBlob,
+                     unsigned drawCount, unsigned drawBytes);
+
+    // Parts actually drawn (slot valid) in the last renderScene — for diagnostics.
+    unsigned lastDrawn();
 
     // Tear down the persistent renderer (shared RT, pipeline, Forge stack).
     void shutdown();

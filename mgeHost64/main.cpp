@@ -18,7 +18,10 @@ extern "C" {
 	__declspec(dllexport) extern const char* D3D12SDKPath = u8"";
 }
 
+
+
 int main(int argc, char** argv) {
+
 	// Standalone Forge bring-up probe (Milestone D1): run `mgeHost64.exe --forge-probe`
 	// to validate the vendored Forge (D3D12) build initialises a device, with no
 	// IPC handles / Morrowind needed.

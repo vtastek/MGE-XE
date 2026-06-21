@@ -19,3 +19,11 @@
 #frag tri.frag
 #include "tri.frag.fsl"
 #end
+
+#vert opaque.vert
+#include "opaque.vert.fsl"
+#end
+
+#frag opaque.frag
+#include "opaque.frag.fsl"
+#end

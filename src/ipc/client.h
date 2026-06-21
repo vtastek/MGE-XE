@@ -261,6 +261,35 @@ namespace IPC {
 		*/
 		bool renderFrameBlocking(std::uint32_t frameIndex, std::uint32_t targetIndex, double* outRenderMs = nullptr);
 
+		/**
+		* @brief M1c: render the cached opaque scene into the shared RT.
+		* @param frameIndex Frame counter (logging).
+		* @param viewProj 16 floats (D3DXMATRIX bytes, row-major) — the camera view*proj.
+		* @param drawList Byte VecId of DrawItemWire[] (slot + world[16]); InvalidVector ⇒ triangle.
+		* @param drawCount Number of draw items.
+		* @param drawBytes Total bytes used in drawList.
+		* @param outRenderMs Optional out: host render time (ms).
+		* @return Whether the frame rendered (blocking).
+		*/
+		bool renderSceneBlocking(std::uint32_t frameIndex, const float* viewProj,
+			VecId drawList, std::uint32_t drawCount, std::uint32_t drawBytes, double* outRenderMs = nullptr);
+
+		/**
+		* @brief M1b: upload a batch of static opaque meshes to the Forge host.
+		* @param blob A byte VecId filled with partCount packed parts (GeomPartWire+verts+indices).
+		* @param partCount Number of parts packed in the blob.
+		* @param byteCount Total bytes used in the blob.
+		* @param outUploaded Optional out: parts the host actually built.
+		* @return True if the host built every part (blocking).
+		*/
+		bool geomUploadBlocking(VecId blob, std::uint32_t partCount, std::uint32_t byteCount, std::uint32_t* outUploaded = nullptr);
+
+		// True if an RPC has been issued and not yet awaited. Use this to avoid
+		// issuing a blocking RPC that would drain (steal) a pending async RPC's
+		// completion — e.g. the geometry flush defers a frame rather than clobber
+		// the shared Parameters union mid-pairing.
+		bool isRpcPending() const { return m_isRpcPending; }
+
 		WakeReason waitForCompletion(DWORD ms = MaxWait);
 
 		/**

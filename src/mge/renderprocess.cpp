@@ -1,279 +1,631 @@
 #include "renderprocess.h"
 #include "configuration.h"
 #include "ipc/client.h"
+#include "ipc/geomwire.h"
 #include "support/log.h"
+#include "dxvk_interop.h"
+#include "distantland.h"
+#include "scenegraph_geometry_cache.h"
 
 #include <windows.h>
-#include <d3d12.h>
-#include <d3d9on12.h>
+#include <cstdint>
+#include <cstring>
+#include <optional>
+#include <unordered_map>
+#include <vector>
 
 namespace {
-    // Fixed offscreen target size for the seam. Matches the host's Forge render
-    // target. Small corner quad; non-destructive to the real frame.
-    constexpr UINT kW = 640;
-    constexpr UINT kH = 360;
-
-    typedef HRESULT (_stdcall* D3DProc9On12Ex)(UINT, D3D9ON12_ARGS*, UINT, IDirect3D9Ex**);
+    // Seam target size. Set at bring-up to the live backbuffer resolution (the host's
+    // Forge render target is created at the same size via RenderInit), so the composite
+    // is a 1:1 full-screen blit. Falls back to 640x360 if the backbuffer can't be queried.
+    UINT g_w = 640;
+    UINT g_h = 360;
 
     IPC::Client* g_client = nullptr;
-    bool   g_pendingInit = false;      // do the RPC + resource setup on the first onPresent (needs the device)
     bool   g_initOk  = false;
     bool   g_enabled = false;          // F11 live toggle for the per-frame composite
     unsigned g_frame = 0;
 
-    // --- Decoupled D3D9On12 seam ---
-    // The GAME renders/presents on MW's native D3D9Ex MAIN device (unchanged, proven).
-    // The seam uses a SEPARATE, dedicated D3D9On12 side-device so MGE's heavy D3D9
-    // pipeline never goes through the 9On12 translation layer (which black-screens the
-    // whole game). The side-device:
-    //   - is D3D12-backed, so it can OpenSharedHandle the Forge host's shared D3D12 RT,
-    //   - owns a D3D9 RT texture created as a D3D9<->D3D9 KMT SHARED texture,
-    //   - each frame copies the host RT into that texture (Unwrap -> D3D12 copy -> Return).
-    // The MAIN device opens the same KMT-shared texture and StretchRects it (D3D9<->D3D9
-    // KMT sharing is a supported path — both ends are D3D9 on the same adapter).
+    // --- M1b: opaque-geometry capture + upload -----------------------------------
+    // The cache hands us model-space parts (pos+normal+indices). We assign each a
+    // dense host slot, accumulate them into a pending byte blob, and flush them to
+    // the Forge host in window-sized whole-part chunks at present time (a safe point
+    // with no other RPC in flight). Slots are stable per cache key; re-upload only on
+    // revision change. The host stores meshes slot-indexed for M1c's per-frame draw.
+    // Chunked shared vec (see ipc/geomwire.h): an 8MB window as 8x1MB chunks, so the
+    // Vec reservation (maxSize*windowBytes) stays small. Chunk cap = the full window.
+    constexpr std::uint32_t kGeomChunkCap = IPC::kGeomWindowBytes;  // <= window (assign_bytes)
 
-    IDirect3DDevice9Ex*   g_mainDevice = nullptr;   // borrowed (not owned): MW's main device, for the blit
+    std::optional<IPC::VecView<IPC::GeomChunk>> g_geomVec;          // persistent geometry upload vec
+    std::optional<IPC::VecView<IPC::GeomChunk>> g_drawVec;          // persistent per-frame draw-list vec
+    std::vector<std::uint8_t>                 g_pendingBlob;        // packed parts awaiting flush
+    std::uint32_t                             g_pendingParts = 0;
+    std::unordered_map<std::uint32_t, std::uint32_t> g_keySlot;    // cache key -> host slot
+    std::unordered_map<std::uint32_t, std::uint16_t> g_uploadedRev;// cache key -> last sent revision
+    std::uint32_t                             g_nextSlot = 0;
+    std::vector<std::uint8_t>                 g_drawScratch;        // packed DrawItemWire[] this frame
 
-    IDirect3D9Ex*         g_seamFactory = nullptr;  // 9On12 factory (owned)
-    IDirect3DDevice9Ex*   g_seamDevice  = nullptr;  // 9On12 side-device (owned)
-    IDirect3DDevice9On12* g_dev9on12    = nullptr;  // QI of g_seamDevice
-    ID3D12Device*         g_d3d12dev    = nullptr;  // side-device's underlying D3D12 device
-    ID3D12Resource*       g_hostRT12    = nullptr;  // host's shared RT, opened in this process
+    // Per-frame draw list rides a 4-chunk (4MB) vec: ~61K DrawItemWire, well over the
+    // host's kMaxDraws cap. Geometry vec stays 8 chunks (8MB).
+    constexpr unsigned kDrawChunks = 4;
 
-    IDirect3DTexture9*    g_seamTex = nullptr;      // on g_seamDevice; KMT-shared; copy destination
-    HANDLE                g_kmtHandle = nullptr;    // D3D9<->D3D9 KMT shared handle for g_seamTex
-    IDirect3DTexture9*    g_mainTex = nullptr;      // on g_mainDevice; opened from g_kmtHandle; blit source
+    void initSceneVecs();   // defined below; called from lazyInit
+    void flushGeometry();
 
-    // Side-device's D3D12 copy infrastructure (we own these).
-    ID3D12CommandQueue*        g_copyQueue = nullptr;
-    ID3D12CommandAllocator*    g_copyAlloc = nullptr;
-    ID3D12GraphicsCommandList* g_copyList  = nullptr;
-    ID3D12Fence*               g_copyFence = nullptr;
-    UINT64                     g_fenceVal  = 0;
-    HANDLE                     g_fenceEvent = nullptr;
+    // --- DXVK Vulkan-interop seam ---
+    // MW's MAIN device is DXVK (Vulkan-backed). DXVK exposes ID3D9VkInteropDevice, which
+    // hands us its own VkInstance/VkPhysicalDevice/VkDevice/VkQueue. We:
+    //   - import the Forge host's shared D3D12 render target (an NT handle) as external
+    //     memory bound to a VkImage on DXVK's device, and
+    //   - create a DXVK-owned D3D9 render-target texture (via ID3D9VkInteropDevice::
+    //     CreateImage, with TRANSFER_DST usage) whose VkImage we copy INTO each frame
+    //     with a raw vkCmdCopyImage on DXVK's queue.
+    // The MAIN device then StretchRects that D3D9 texture to its backbuffer (unchanged).
+    // One Vulkan device throughout: no native d3d9, no D3D9On12, no cross-backend share.
+    // The D3D12->Vulkan import handle type (D3D12_RESOURCE / D3D11_TEXTURE) is chosen at
+    // bring-up by querying the physical device, so the same binary adapts per vendor.
 
-    // Rolling round-trip stats, logged every 60 presented frames.
-    double g_sumRoundtripMs = 0.0;
-    double g_sumHostMs = 0.0;
-    int    g_statSamples = 0;
+    ID3D9VkInteropDevice* g_vki = nullptr;       // QI of MW's DXVK device (owned ref)
 
-    inline double msPerTick() {
-        static const double v = [] {
-            LARGE_INTEGER f; QueryPerformanceCounter(&f);
-            return 1000.0 / double(f.QuadPart);
-        }();
-        return v;
-    }
+    VkInstance       g_inst   = VK_NULL_HANDLE;  // DXVK's handles (borrowed; do not destroy)
+    VkPhysicalDevice g_phys   = VK_NULL_HANDLE;
+    VkDevice         g_dev    = VK_NULL_HANDLE;
+    VkQueue          g_queue  = VK_NULL_HANDLE;
+    uint32_t         g_qFamily = 0;
 
-    void releaseAll() {
-        if (g_mainTex)    { g_mainTex->Release();    g_mainTex = nullptr; }
-        if (g_seamTex)    { g_seamTex->Release();    g_seamTex = nullptr; }
-        g_kmtHandle = nullptr;   // owned by the textures
-        if (g_copyList)   { g_copyList->Release();   g_copyList = nullptr; }
-        if (g_copyAlloc)  { g_copyAlloc->Release();  g_copyAlloc = nullptr; }
-        if (g_copyFence)  { g_copyFence->Release();  g_copyFence = nullptr; }
-        if (g_copyQueue)  { g_copyQueue->Release();  g_copyQueue = nullptr; }
-        if (g_fenceEvent) { CloseHandle(g_fenceEvent); g_fenceEvent = nullptr; }
-        if (g_hostRT12)   { g_hostRT12->Release();   g_hostRT12 = nullptr; }
-        if (g_d3d12dev)   { g_d3d12dev->Release();   g_d3d12dev = nullptr; }
-        if (g_dev9on12)   { g_dev9on12->Release();   g_dev9on12 = nullptr; }
-        if (g_seamDevice) { g_seamDevice->Release(); g_seamDevice = nullptr; }
-        if (g_seamFactory){ g_seamFactory->Release();g_seamFactory = nullptr; }
-        g_mainDevice = nullptr;  // borrowed
-    }
+    HANDLE           g_hostHandle = nullptr;     // Forge RT shared NT handle (we own it)
+    VkExternalMemoryHandleTypeFlagBits g_htype = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
+    VkImage          g_importImg = VK_NULL_HANDLE;  // imported host RT (owned)
+    VkDeviceMemory   g_importMem = VK_NULL_HANDLE;  // imported external memory (owned)
 
-    HWND deviceWindow(IDirect3DDevice9* device) {
-        IDirect3DSwapChain9* sc = nullptr;
-        if (SUCCEEDED(device->GetSwapChain(0, &sc)) && sc) {
-            D3DPRESENT_PARAMETERS pp = {};
-            HWND hwnd = (SUCCEEDED(sc->GetPresentParameters(&pp))) ? pp.hDeviceWindow : nullptr;
-            sc->Release();
-            if (hwnd) return hwnd;
+    IDirect3DTexture9* g_mainTex = nullptr;      // DXVK D3D9 RT texture; copy dst + blit src
+    VkImage            g_dstImg = VK_NULL_HANDLE;   // its backing VkImage (borrowed)
+    VkImageLayout      g_dstLayout = VK_IMAGE_LAYOUT_GENERAL;  // DXVK's resting layout for g_mainTex
+
+    VkCommandPool   g_cmdPool = VK_NULL_HANDLE;  // owned
+    VkCommandBuffer g_cmd     = VK_NULL_HANDLE;
+    VkFence         g_fence   = VK_NULL_HANDLE;  // owned
+
+    HMODULE g_vulkanDll = nullptr;
+
+    // Dynamically-resolved Vulkan entry points (DXVK's loader, via vulkan-1.dll).
+    struct VkApi {
+        PFN_vkGetInstanceProcAddr GetInstanceProcAddr;
+        PFN_vkGetDeviceProcAddr   GetDeviceProcAddr;
+        PFN_vkGetPhysicalDeviceImageFormatProperties2 GetPhysicalDeviceImageFormatProperties2;
+        PFN_vkGetPhysicalDeviceMemoryProperties       GetPhysicalDeviceMemoryProperties;
+        PFN_vkCreateImage                CreateImage;
+        PFN_vkDestroyImage               DestroyImage;
+        PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements;
+        PFN_vkAllocateMemory             AllocateMemory;
+        PFN_vkFreeMemory                 FreeMemory;
+        PFN_vkBindImageMemory            BindImageMemory;
+        PFN_vkGetMemoryWin32HandlePropertiesKHR GetMemoryWin32HandlePropertiesKHR;
+        PFN_vkCreateCommandPool          CreateCommandPool;
+        PFN_vkDestroyCommandPool         DestroyCommandPool;
+        PFN_vkAllocateCommandBuffers     AllocateCommandBuffers;
+        PFN_vkBeginCommandBuffer         BeginCommandBuffer;
+        PFN_vkEndCommandBuffer           EndCommandBuffer;
+        PFN_vkResetCommandBuffer         ResetCommandBuffer;
+        PFN_vkCmdPipelineBarrier         CmdPipelineBarrier;
+        PFN_vkCmdCopyImage               CmdCopyImage;
+        PFN_vkQueueSubmit                QueueSubmit;
+        PFN_vkCreateFence                CreateFence;
+        PFN_vkDestroyFence               DestroyFence;
+        PFN_vkWaitForFences              WaitForFences;
+        PFN_vkResetFences                ResetFences;
+    } vk = {};
+
+    bool loadVulkan() {
+        if (!g_vulkanDll) {
+            g_vulkanDll = LoadLibraryA("vulkan-1.dll");
         }
-        return GetForegroundWindow();
-    }
-
-    // Create the dedicated D3D9On12 side-device (no rendering, never presented).
-    bool createSeamDevice(HWND hwnd) {
-        HMODULE d3d9 = GetModuleHandleA("d3d9.dll");
-        D3DProc9On12Ex create9On12 = d3d9 ? (D3DProc9On12Ex)GetProcAddress(d3d9, "Direct3DCreate9On12Ex") : nullptr;
-        if (!create9On12) {
-            LOG::logline("!! [seam] Direct3DCreate9On12Ex not exported (DXVK or old runtime?) — seam disabled");
+        if (!g_vulkanDll) {
+            LOG::logline("!! [seam] LoadLibrary(vulkan-1.dll) failed — seam disabled");
             return false;
         }
-        D3D9ON12_ARGS args = {};
-        args.Enable9On12 = TRUE;
-        args.pD3D12Device = nullptr;   // 9On12 makes its own internal D3D12 device on the default adapter
-        args.NumQueues = 0;
-        if (FAILED(create9On12(D3D_SDK_VERSION, &args, 1, &g_seamFactory)) || !g_seamFactory) {
-            LOG::logline("!! [seam] Direct3DCreate9On12Ex failed — seam disabled");
+        vk.GetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)GetProcAddress(g_vulkanDll, "vkGetInstanceProcAddr");
+        if (!vk.GetInstanceProcAddr) {
+            LOG::logline("!! [seam] vkGetInstanceProcAddr missing — seam disabled");
+            return false;
+        }
+        vk.GetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)vk.GetInstanceProcAddr(g_inst, "vkGetDeviceProcAddr");
+
+        bool ok = vk.GetDeviceProcAddr != nullptr;
+        #define INST(name) do { vk.name = (PFN_vk##name)vk.GetInstanceProcAddr(g_inst, "vk" #name); ok = ok && vk.name; } while (0)
+        #define DEV(name)  do { vk.name = (PFN_vk##name)vk.GetDeviceProcAddr(g_dev, "vk" #name);   ok = ok && vk.name; } while (0)
+        INST(GetPhysicalDeviceImageFormatProperties2);
+        INST(GetPhysicalDeviceMemoryProperties);
+        DEV(CreateImage);
+        DEV(DestroyImage);
+        DEV(GetImageMemoryRequirements);
+        DEV(AllocateMemory);
+        DEV(FreeMemory);
+        DEV(BindImageMemory);
+        DEV(GetMemoryWin32HandlePropertiesKHR);
+        DEV(CreateCommandPool);
+        DEV(DestroyCommandPool);
+        DEV(AllocateCommandBuffers);
+        DEV(BeginCommandBuffer);
+        DEV(EndCommandBuffer);
+        DEV(ResetCommandBuffer);
+        DEV(CmdPipelineBarrier);
+        DEV(CmdCopyImage);
+        DEV(QueueSubmit);
+        DEV(CreateFence);
+        DEV(DestroyFence);
+        DEV(WaitForFences);
+        DEV(ResetFences);
+        #undef INST
+        #undef DEV
+        if (!ok) {
+            LOG::logline("!! [seam] failed to resolve required Vulkan entry points — seam disabled");
+        }
+        return ok;
+    }
+
+    uint32_t pickMemoryType(uint32_t typeBits, VkMemoryPropertyFlags want) {
+        VkPhysicalDeviceMemoryProperties mp = {};
+        vk.GetPhysicalDeviceMemoryProperties(g_phys, &mp);
+        for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
+            if ((typeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want) {
+                return i;
+            }
+        }
+        return UINT32_MAX;
+    }
+
+    // Is a given external handle type importable for our RT format on this physical device?
+    bool handleTypeImportable(VkExternalMemoryHandleTypeFlagBits htype) {
+        VkPhysicalDeviceExternalImageFormatInfo ext = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO };
+        ext.handleType = htype;
+        VkPhysicalDeviceImageFormatInfo2 fi = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2 };
+        fi.pNext  = &ext;
+        fi.format = VK_FORMAT_B8G8R8A8_UNORM;
+        fi.type   = VK_IMAGE_TYPE_2D;
+        fi.tiling = VK_IMAGE_TILING_OPTIMAL;
+        fi.usage  = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        VkExternalImageFormatProperties efp = { VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES };
+        VkImageFormatProperties2 ifp = { VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2 };
+        ifp.pNext = &efp;
+        if (vk.GetPhysicalDeviceImageFormatProperties2(g_phys, &fi, &ifp) != VK_SUCCESS) {
+            return false;
+        }
+        return (efp.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) != 0;
+    }
+
+    // Import the host's shared NT handle as a VkImage on DXVK's device.
+    bool importHostImage() {
+        VkExternalMemoryImageCreateInfo extImg = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
+        extImg.handleTypes = g_htype;
+        VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+        ici.pNext         = &extImg;
+        ici.imageType     = VK_IMAGE_TYPE_2D;
+        ici.format        = VK_FORMAT_B8G8R8A8_UNORM;
+        ici.extent        = { g_w, g_h, 1 };
+        ici.mipLevels     = 1;
+        ici.arrayLayers   = 1;
+        ici.samples       = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling        = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage         = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        ici.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
+        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (vk.CreateImage(g_dev, &ici, nullptr, &g_importImg) != VK_SUCCESS) {
+            LOG::logline("!! [seam] vkCreateImage (imported host RT) failed");
             return false;
         }
 
-        D3DPRESENT_PARAMETERS pp = {};
-        pp.Windowed = TRUE;
-        pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
-        pp.BackBufferWidth = 1;
-        pp.BackBufferHeight = 1;
-        pp.BackBufferFormat = D3DFMT_X8R8G8B8;
-        pp.BackBufferCount = 1;
-        pp.hDeviceWindow = hwnd;
-        pp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
-        HRESULT hr = g_seamFactory->CreateDeviceEx(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, hwnd,
-            D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_FPU_PRESERVE | D3DCREATE_MULTITHREADED,
-            &pp, nullptr, &g_seamDevice);
-        if (FAILED(hr) || !g_seamDevice) {
-            LOG::logline("!! [seam] 9On12 CreateDeviceEx failed 0x%08X — seam disabled", hr);
+        VkMemoryRequirements mr = {};
+        vk.GetImageMemoryRequirements(g_dev, g_importImg, &mr);
+
+        VkMemoryWin32HandlePropertiesKHR whp = { VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR };
+        uint32_t handleTypeBits = mr.memoryTypeBits;
+        if (vk.GetMemoryWin32HandlePropertiesKHR(g_dev, g_htype, g_hostHandle, &whp) == VK_SUCCESS) {
+            handleTypeBits &= whp.memoryTypeBits;
+        }
+        uint32_t typeIdx = pickMemoryType(handleTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (typeIdx == UINT32_MAX) {
+            typeIdx = pickMemoryType(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        }
+        if (typeIdx == UINT32_MAX) {
+            LOG::logline("!! [seam] no device-local memory type for imported handle");
+            return false;
+        }
+
+        VkMemoryDedicatedAllocateInfo ded = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
+        ded.image = g_importImg;
+        VkImportMemoryWin32HandleInfoKHR imp = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR };
+        imp.pNext      = &ded;
+        imp.handleType = g_htype;
+        imp.handle     = g_hostHandle;
+        VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        mai.pNext           = &imp;
+        mai.allocationSize  = mr.size;
+        mai.memoryTypeIndex = typeIdx;
+        VkResult r = vk.AllocateMemory(g_dev, &mai, nullptr, &g_importMem);
+        if (r != VK_SUCCESS) {
+            LOG::logline("!! [seam] *** vkAllocateMemory (import) FAILED VkResult=%d *** (handle type %d not importable on this GPU)", (int)r, (int)g_htype);
+            return false;
+        }
+        if (vk.BindImageMemory(g_dev, g_importImg, g_importMem, 0) != VK_SUCCESS) {
+            LOG::logline("!! [seam] vkBindImageMemory (imported host RT) failed");
             return false;
         }
         return true;
     }
 
-    bool createCopyInfra() {
-        D3D12_COMMAND_QUEUE_DESC qd = {};
-        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-        if (FAILED(g_d3d12dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), (void**)&g_copyQueue))) return false;
-        if (FAILED(g_d3d12dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                __uuidof(ID3D12CommandAllocator), (void**)&g_copyAlloc))) return false;
-        if (FAILED(g_d3d12dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_copyAlloc,
-                nullptr, __uuidof(ID3D12GraphicsCommandList), (void**)&g_copyList))) return false;
-        g_copyList->Close();
-        if (FAILED(g_d3d12dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), (void**)&g_copyFence))) return false;
-        g_fenceEvent = CreateEventA(nullptr, FALSE, FALSE, nullptr);
-        return g_fenceEvent != nullptr;
+    // Create the DXVK D3D9 RT texture (copy destination + StretchRect source) and capture
+    // its backing VkImage + resting layout. Priming with ColorFill forces DXVK to settle
+    // the image into a defined, content-preserving layout (so our copy isn't discarded).
+    bool createDstTexture() {
+        D3D9VkExtImageDesc d = {};
+        d.Type               = D3DRTYPE_TEXTURE;
+        d.Width              = g_w;
+        d.Height             = g_h;
+        d.Depth              = 1;
+        d.MipLevels          = 1;
+        d.Usage              = D3DUSAGE_RENDERTARGET;
+        d.Format             = D3DFMT_A8R8G8B8;
+        d.Pool               = D3DPOOL_DEFAULT;
+        d.MultiSample        = D3DMULTISAMPLE_NONE;
+        d.MultiSampleQuality = 0;
+        d.Discard            = false;
+        d.IsAttachmentOnly   = false;
+        d.IsLockable         = false;
+        d.ImageUsage         = VK_IMAGE_USAGE_TRANSFER_DST_BIT;   // we vkCmdCopyImage INTO it
+
+        IDirect3DResource9* res = nullptr;
+        if (FAILED(g_vki->CreateImage(&d, &res)) || !res) {
+            LOG::logline("!! [seam] ID3D9VkInteropDevice::CreateImage (dst RT) failed");
+            return false;
+        }
+        HRESULT hr = res->QueryInterface(__uuidof(IDirect3DTexture9), (void**)&g_mainTex);
+        res->Release();
+        if (FAILED(hr) || !g_mainTex) {
+            LOG::logline("!! [seam] dst resource is not a Texture9");
+            return false;
+        }
+
+        // Prime the layout: ColorFill the surface so DXVK transitions+tracks a real layout.
+        IDirect3DSurface9* surf = nullptr;
+        if (SUCCEEDED(g_mainTex->GetSurfaceLevel(0, &surf)) && surf) {
+            // g_vki's device is MW's device; reach it through the surface's device.
+            IDirect3DDevice9* dev = nullptr;
+            if (SUCCEEDED(surf->GetDevice(&dev)) && dev) {
+                dev->ColorFill(surf, nullptr, D3DCOLOR_ARGB(255, 0, 0, 0));
+                dev->Release();
+            }
+            surf->Release();
+        }
+        g_vki->FlushRenderingCommands();
+
+        ID3D9VkInteropTexture* vkt = nullptr;
+        if (FAILED(g_mainTex->QueryInterface(__uuidof(ID3D9VkInteropTexture), (void**)&vkt)) || !vkt) {
+            LOG::logline("!! [seam] dst texture has no ID3D9VkInteropTexture");
+            return false;
+        }
+        VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        hr = vkt->GetVulkanImageInfo(&g_dstImg, &layout, nullptr);
+        vkt->Release();
+        if (FAILED(hr) || g_dstImg == VK_NULL_HANDLE) {
+            LOG::logline("!! [seam] GetVulkanImageInfo (dst) failed");
+            return false;
+        }
+        // Restore target must preserve contents; never transition back to UNDEFINED.
+        g_dstLayout = (layout == VK_IMAGE_LAYOUT_UNDEFINED) ? VK_IMAGE_LAYOUT_GENERAL : layout;
+        LOG::logline(">> [seam] dst DXVK texture VkImage=%p resting layout=%d", (void*)g_dstImg, (int)g_dstLayout);
+        return true;
     }
 
-    // First-present setup: stand up the 9On12 side-device, run RenderInit, open the
-    // host RT, build the KMT-shared blit texture (opened on both devices) + copy infra.
-    void lazyInit(IDirect3DDevice9* device) {
-        if (FAILED(device->QueryInterface(__uuidof(IDirect3DDevice9Ex), (void**)&g_mainDevice)) || !g_mainDevice) {
-            LOG::logline("!! [seam] main device is not D3D9Ex; cannot open KMT shared texture — seam disabled");
-            return;
+    bool createCopyInfra() {
+        VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+        pci.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        pci.queueFamilyIndex = g_qFamily;
+        if (vk.CreateCommandPool(g_dev, &pci, nullptr, &g_cmdPool) != VK_SUCCESS) {
+            return false;
         }
-        g_mainDevice->Release();   // borrowed: QI AddRef'd; we don't own the main device
+        VkCommandBufferAllocateInfo cbi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+        cbi.commandPool        = g_cmdPool;
+        cbi.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbi.commandBufferCount = 1;
+        if (vk.AllocateCommandBuffers(g_dev, &cbi, &g_cmd) != VK_SUCCESS) {
+            return false;
+        }
+        VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        return vk.CreateFence(g_dev, &fci, nullptr, &g_fence) == VK_SUCCESS;
+    }
 
-        HWND hwnd = deviceWindow(device);
-        if (!createSeamDevice(hwnd)) {
+    void releaseAll() {
+        if (g_dev) {
+            if (g_fence)     { vk.DestroyFence(g_dev, g_fence, nullptr); g_fence = VK_NULL_HANDLE; }
+            if (g_cmdPool)   { vk.DestroyCommandPool(g_dev, g_cmdPool, nullptr); g_cmdPool = VK_NULL_HANDLE; g_cmd = VK_NULL_HANDLE; }
+            if (g_importImg) { vk.DestroyImage(g_dev, g_importImg, nullptr); g_importImg = VK_NULL_HANDLE; }
+            if (g_importMem) { vk.FreeMemory(g_dev, g_importMem, nullptr); g_importMem = VK_NULL_HANDLE; }
+        }
+        if (g_mainTex)     { g_mainTex->Release(); g_mainTex = nullptr; }
+        g_dstImg = VK_NULL_HANDLE;
+        if (g_hostHandle)  { CloseHandle(g_hostHandle); g_hostHandle = nullptr; }
+        if (g_vki)         { g_vki->Release(); g_vki = nullptr; }
+        g_inst = VK_NULL_HANDLE; g_phys = VK_NULL_HANDLE; g_dev = VK_NULL_HANDLE; g_queue = VK_NULL_HANDLE;
+    }
+
+    // Seam bring-up (called from RenderProcess::init, under the loading bar / live by menu).
+    void lazyInit(IDirect3DDevice9* device) {
+        if (FAILED(device->QueryInterface(__uuidof(ID3D9VkInteropDevice), (void**)&g_vki)) || !g_vki) {
+            LOG::logline("!! [seam] main device is not DXVK (no ID3D9VkInteropDevice) — seam disabled");
+            return;
+        }
+        g_vki->GetVulkanHandles(&g_inst, &g_phys, &g_dev);
+        uint32_t queueIndex = 0;
+        g_vki->GetSubmissionQueue(&g_queue, &queueIndex, &g_qFamily);
+        if (!g_inst || !g_phys || !g_dev || !g_queue) {
+            LOG::logline("!! [seam] DXVK returned null Vulkan handles — seam disabled");
             releaseAll();
             return;
         }
-        if (FAILED(g_seamDevice->QueryInterface(__uuidof(IDirect3DDevice9On12), (void**)&g_dev9on12)) || !g_dev9on12) {
-            LOG::logline("!! [seam] seam device is not D3D9On12 — seam disabled");
+        if (!loadVulkan()) {
             releaseAll();
             return;
         }
-        if (FAILED(g_dev9on12->GetD3D12Device(__uuidof(ID3D12Device), (void**)&g_d3d12dev)) || !g_d3d12dev) {
-            LOG::logline("!! [seam] GetD3D12Device failed — seam disabled");
-            releaseAll();
-            return;
+
+        // Size the seam to the live backbuffer so the composite is a 1:1 full-screen blit.
+        {
+            IDirect3DSurface9* bb = nullptr;
+            if (SUCCEEDED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) && bb) {
+                D3DSURFACE_DESC sd = {};
+                if (SUCCEEDED(bb->GetDesc(&sd)) && sd.Width && sd.Height) {
+                    g_w = sd.Width;
+                    g_h = sd.Height;
+                }
+                bb->Release();
+            }
+            LOG::logline(">> [seam] backbuffer %ux%u — shared RT sized to match", g_w, g_h);
         }
 
         // Host brings up Forge + creates the shared RT; returns the NT handle already
         // duplicated into THIS process.
         HANDLE hostHandle = nullptr;
-        if (!g_client->renderInitBlocking(kW, kH, nullptr, nullptr, &hostHandle) || hostHandle == nullptr) {
+        if (!g_client->renderInitBlocking(g_w, g_h, nullptr, nullptr, &hostHandle) || hostHandle == nullptr) {
             LOG::logline("!! [seam] renderInit RPC failed or no shared handle; seam disabled");
             releaseAll();
             return;
         }
+        g_hostHandle = hostHandle;
         LOG::logline(">> [seam] host shared-RT NT handle (this process) = %p", hostHandle);
 
-        HRESULT hr = g_d3d12dev->OpenSharedHandle(hostHandle, __uuidof(ID3D12Resource), (void**)&g_hostRT12);
-        if (FAILED(hr) || !g_hostRT12) {
-            LOG::logline("!! [seam] *** OpenSharedHandle FAILED 0x%08X *** (side D3D12 could not open the host's RT)", hr);
+        // Cross-vendor: pick the first external handle type the GPU can import.
+        const VkExternalMemoryHandleTypeFlagBits candidates[] = {
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT,
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT,
+        };
+        bool picked = false;
+        for (VkExternalMemoryHandleTypeFlagBits c : candidates) {
+            if (handleTypeImportable(c)) { g_htype = c; picked = true; break; }
+        }
+        if (!picked) {
+            LOG::logline("!! [seam] GPU reports no importable D3D12/D3D11 external image type — seam disabled");
             releaseAll();
             return;
         }
-        LOG::logline(">> [seam] *** OpenSharedHandle OK *** (host D3D12 RT opened on the 9On12 side-device)");
+        LOG::logline(">> [seam] importing host RT as external handle type %d", (int)g_htype);
 
-        // KMT-shared D3D9 RT texture on the side-device. pSharedHandle OUT yields the
-        // KMT handle (D3DFMT_A8R8G8B8 == DXGI B8G8R8A8_UNORM, the host RT format).
-        hr = g_seamDevice->CreateTexture(kW, kH, 1, D3DUSAGE_RENDERTARGET,
-                                         D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &g_seamTex, &g_kmtHandle);
-        if (FAILED(hr) || !g_seamTex || !g_kmtHandle) {
-            LOG::logline("!! [seam] side CreateTexture (KMT shared) failed 0x%08X — seam disabled", hr);
+        if (!importHostImage()) {
             releaseAll();
             return;
         }
-
-        // Open the SAME KMT-shared texture on the MAIN device for the StretchRect.
-        hr = g_mainDevice->CreateTexture(kW, kH, 1, D3DUSAGE_RENDERTARGET,
-                                         D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &g_mainTex, &g_kmtHandle);
-        if (FAILED(hr) || !g_mainTex) {
-            LOG::logline("!! [seam] main CreateTexture (open KMT shared) failed 0x%08X — seam disabled", hr);
+        if (!createDstTexture()) {
             releaseAll();
             return;
         }
-
         if (!createCopyInfra()) {
-            LOG::logline("!! [seam] failed to create side D3D12 copy infrastructure — seam disabled");
+            LOG::logline("!! [seam] failed to create Vulkan copy infrastructure — seam disabled");
             releaseAll();
             return;
         }
 
         g_initOk = true;
-        LOG::logline(">> [seam] decoupled D3D9On12 seam ready (%ux%u). F11 toggles the composite.", kW, kH);
+        LOG::logline(">> [seam] DXVK Vulkan-interop seam ready (%ux%u). F11 toggles the composite.", g_w, g_h);
+
+        // M1b/M1c: bring up the geometry upload + per-frame draw-list channels.
+        initSceneVecs();
     }
 
-    // Copy host RT -> g_seamTex's D3D12 backing on the side-device, then CPU-wait the
-    // copy so the MAIN device's StretchRect reads finished pixels (cross-device).
-    bool copyHostRtToSeamTex() {
-        ID3D12Resource* dst12 = nullptr;
-        if (FAILED(g_dev9on12->UnwrapUnderlyingResource(g_seamTex, g_copyQueue,
-                __uuidof(ID3D12Resource), (void**)&dst12)) || !dst12) {
-            return false;
+    // Copy the imported host RT -> the DXVK D3D9 texture's VkImage, on DXVK's own queue.
+    // Blocking: CPU-waits the copy so the subsequent StretchRect reads finished pixels.
+    bool copyHostRtToDst() {
+        // Flush any DXVK rendering that touches the dst image before we use its queue.
+        g_vki->FlushRenderingCommands();
+
+        vk.ResetCommandBuffer(g_cmd, 0);
+        VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vk.BeginCommandBuffer(g_cmd, &bi);
+
+        const VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+        // dst: DXVK resting layout -> TRANSFER_DST
+        VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+        toDst.srcAccessMask       = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        toDst.dstAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toDst.oldLayout           = g_dstLayout;
+        toDst.newLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toDst.image               = g_dstImg;
+        toDst.subresourceRange    = range;
+        vk.CmdPipelineBarrier(g_cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              0, 0, nullptr, 0, nullptr, 1, &toDst);
+
+        VkImageCopy region = {};
+        region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        region.extent         = { g_w, g_h, 1 };
+        vk.CmdCopyImage(g_cmd, g_importImg, VK_IMAGE_LAYOUT_GENERAL,
+                        g_dstImg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+        // dst: TRANSFER_DST -> DXVK resting layout (so DXVK's tracking stays valid)
+        VkImageMemoryBarrier toRest = toDst;
+        toRest.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toRest.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        toRest.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toRest.newLayout     = g_dstLayout;
+        vk.CmdPipelineBarrier(g_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                              0, 0, nullptr, 0, nullptr, 1, &toRest);
+
+        vk.EndCommandBuffer(g_cmd);
+
+        VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        si.commandBufferCount = 1;
+        si.pCommandBuffers    = &g_cmd;
+
+        g_vki->LockSubmissionQueue();
+        VkResult r = vk.QueueSubmit(g_queue, 1, &si, g_fence);
+        if (r == VK_SUCCESS) {
+            vk.WaitForFences(g_dev, 1, &g_fence, VK_TRUE, UINT64_MAX);
+            vk.ResetFences(g_dev, 1, &g_fence);
+        }
+        g_vki->ReleaseSubmissionQueue();
+        return r == VK_SUCCESS;
+    }
+
+    // Allocate the persistent shared vecs: geometry upload (8 chunks) + per-frame draw
+    // list (4 chunks). Both chunk-element typed to dodge the Vec uint32 reservation trap.
+    void initSceneVecs() {
+        auto gv = g_client->allocVecBlocking<IPC::GeomChunk>(
+            IPC::kGeomChunks, IPC::kGeomChunks, IPC::kGeomChunks);
+        if (!gv) {
+            LOG::logline("!! [seam] geometry upload vec alloc failed — capture disabled");
+            return;
+        }
+        g_geomVec.emplace(std::move(*gv));
+
+        auto dv = g_client->allocVecBlocking<IPC::GeomChunk>(kDrawChunks, kDrawChunks, kDrawChunks);
+        if (!dv) {
+            LOG::logline("!! [seam] draw-list vec alloc failed — scene path disabled (triangle only)");
+        } else {
+            g_drawVec.emplace(std::move(*dv));
+        }
+        LOG::logline(">> [seam] scene vecs ready (geom %u chunks, draw %u chunks)",
+                     IPC::kGeomChunks, kDrawChunks);
+    }
+
+    // Drain g_pendingBlob to the host in window-sized whole-part chunks. Parts are
+    // self-describing (GeomPartWire carries vert/index counts), so we walk part
+    // boundaries to never split a part across a chunk. Blocking RPCs — called at
+    // present time. Static cost: each part ships once per (key,revision).
+    void flushGeometry() {
+        if (!g_geomVec || g_pendingBlob.empty() || g_pendingParts == 0) {
+            return;
+        }
+        // CRITICAL: never issue the upload RPC while another RPC is in flight. Our
+        // beginRpc would drain (steal) that RPC's completion, leaving its real awaiter
+        // to read a clobbered shared Parameters union — which manifests as a stale
+        // VecId/pointer freed later (heap double-free). Geometry is static; deferring a
+        // frame is free.
+        if (g_client->isRpcPending()) {
+            return;
+        }
+        const std::uint8_t* const data = g_pendingBlob.data();
+        const std::uint32_t total = static_cast<std::uint32_t>(g_pendingBlob.size());
+
+        std::uint32_t off = 0;
+        while (off < total) {
+            std::uint32_t chunkBytes = 0;
+            std::uint32_t chunkParts = 0;
+            std::uint32_t cursor = off;
+            while (cursor < total) {
+                IPC::GeomPartWire hdr;
+                memcpy(&hdr, data + cursor, sizeof(hdr));
+                const std::uint32_t partSize = static_cast<std::uint32_t>(
+                    sizeof(IPC::GeomPartWire)
+                    + (std::uint64_t)hdr.vertexCount * sizeof(IPC::GeomVertexWire)
+                    + (std::uint64_t)hdr.indexCount * sizeof(std::uint16_t));
+                if (chunkBytes != 0 && chunkBytes + partSize > kGeomChunkCap) {
+                    break;  // close this chunk on a part boundary
+                }
+                chunkBytes += partSize;
+                ++chunkParts;
+                cursor += partSize;
+            }
+            if (chunkParts == 0) {
+                break;  // single part exceeds the cap (shouldn't happen) — bail
+            }
+
+            if (!g_geomVec->assign_bytes(data + off, chunkBytes)) {
+                LOG::logline("!! [seam] geometry chunk assign_bytes failed (%u bytes)", chunkBytes);
+                break;
+            }
+            std::uint32_t uploaded = 0;
+            if (!g_client->geomUploadBlocking(g_geomVec->id(), chunkParts, chunkBytes, &uploaded)) {
+                LOG::logline("!! [seam] geomUpload RPC built %u/%u parts", uploaded, chunkParts);
+            }
+            off = cursor;
         }
 
-        // Both resources are COMMON at hand-off; D3D12 implicit promotion covers the copy.
-        g_copyAlloc->Reset();
-        g_copyList->Reset(g_copyAlloc, nullptr);
-        g_copyList->CopyResource(dst12, g_hostRT12);
-        g_copyList->Close();
+        g_pendingBlob.clear();
+        g_pendingParts = 0;
+    }
 
-        ID3D12CommandList* lists[] = { g_copyList };
-        g_copyQueue->ExecuteCommandLists(1, lists);
-        const UINT64 signalVal = ++g_fenceVal;
-        g_copyQueue->Signal(g_copyFence, signalVal);
-
-        ID3D12Fence* fences[] = { g_copyFence };
-        UINT64       vals[]   = { signalVal };
-        HRESULT hr = g_dev9on12->ReturnUnderlyingResource(g_seamTex, 1, vals, fences);
-        dst12->Release();
-        if (FAILED(hr)) {
-            return false;
+    // Gather this frame's visible opaque parts into g_drawScratch as DrawItemWire[]:
+    // each is the part's host slot + its current world transform. Source is the cache's
+    // current-frame frustum-visible key set (built in renderStage0); only keys we've
+    // assigned a host slot (uploaded, non-skinned, non-landscape) are included. Returns
+    // the packed item count (0 if nothing to draw / scene path unavailable).
+    std::uint32_t buildDrawList() {
+        if (!g_drawVec) {
+            return 0;
         }
+        const auto& keys = DistantLand::frustumVisibleKeys();
+        const auto& cacheMap = MGE::GeometryCache::cache();
 
-        // CPU-wait the copy: the main device is a separate timeline, so ensure the
-        // shared surface is fully written before it reads (single-buffer, blocking).
-        if (g_copyFence->GetCompletedValue() < signalVal) {
-            g_copyFence->SetEventOnCompletion(signalVal, g_fenceEvent);
-            WaitForSingleObject(g_fenceEvent, INFINITE);
+        g_drawScratch.clear();
+        g_drawScratch.reserve(keys.size() * sizeof(IPC::DrawItemWire));
+
+        IPC::DrawItemWire item;
+        std::uint32_t count = 0;
+        for (std::uint32_t key : keys) {
+            auto ks = g_keySlot.find(key);
+            if (ks == g_keySlot.end()) {
+                continue;   // not an uploaded opaque part (skinned/landscape/not yet sent)
+            }
+            auto ce = cacheMap.find(key);
+            if (ce == cacheMap.end()) {
+                continue;   // evicted since the visible-set build
+            }
+            item.slot = ks->second;
+            memcpy(item.world, ce->second.worldTransformD3D, 16 * sizeof(float));
+            const std::size_t at = g_drawScratch.size();
+            g_drawScratch.resize(at + sizeof(item));
+            memcpy(g_drawScratch.data() + at, &item, sizeof(item));
+            ++count;
         }
-        return true;
+        return count;
     }
 }
 
 namespace RenderProcess {
-    void init(IPC::Client* client) {
+    void init(IPC::Client* client, IDirect3DDevice9* device) {
         if (!Configuration.UseRenderProcess) {
             return;
         }
         g_client = client;
-        g_pendingInit = true;   // finish setup on the first onPresent, when the device is available
+        if (!device) {
+            LOG::logline("!! [seam] no device at init; seam disabled");
+            return;
+        }
+        // Bring up the seam NOW, under the "...MGE XE..." loading bar (this runs inside
+        // DistantLand::init()), so the shared texture is live by the main menu.
+        lazyInit(device);
     }
 
     void onPresent(IDirect3DDevice9* device) {
-        if (!device || (!g_pendingInit && !g_initOk)) {
+        if (!device || !g_initOk) {
             return;
         }
 
-        if (g_pendingInit) {
-            g_pendingInit = false;
-            lazyInit(device);
-        }
-        if (!g_initOk) {
-            return;
-        }
+        // Ship any geometry the cache captured this frame (independent of the F11
+        // composite toggle, so the host's mesh store is ready when we turn it on).
+        flushGeometry();
 
         // Live toggle (debug key). Edge-triggered.
         if (GetAsyncKeyState(VK_F11) & 0x0001) {
@@ -284,21 +636,46 @@ namespace RenderProcess {
             return;
         }
 
-        LARGE_INTEGER t0; QueryPerformanceCounter(&t0);
-
         const unsigned frame = g_frame++;
 
-        // Drive the host renderer: render this frame into the shared RT. Blocking —
-        // the host fence-waits before replying, so the draw is GPU-complete and the
-        // resource is quiescent before our copy.
+        // Drive the host renderer into the shared RT. Blocking — the host fence-waits
+        // before replying, so the draw is GPU-complete and the resource is quiescent
+        // before our copy. M1c: build this frame's visible draw list (camera + slots +
+        // world transforms) and render the cached opaque SCENE; fall back to the
+        // triangle if the scene path or draw data isn't available.
         double hostMs = 0.0;
-        if (!g_client->renderFrameBlocking(frame, 0, &hostMs)) {
+        bool ok = false;
+        const std::uint32_t drawCount = buildDrawList();
+        if (g_drawVec && drawCount > 0
+            && g_drawVec->assign_bytes(g_drawScratch.data(), (std::uint32_t)g_drawScratch.size())) {
+            D3DXMATRIX viewProj;
+            D3DXMatrixMultiply(&viewProj, &DistantLand::mwView, &DistantLand::mwProj);
+            // One-shot dump of the real matrix values to verify they're sane (not the
+            // convention) — viewProj + the first visible part's world transform.
+            static bool s_dumped = false;
+            if (!s_dumped) {
+                s_dumped = true;
+                const float* vp = (const float*)&viewProj;
+                LOG::logline(">> [scene] viewProj: [%.2f %.2f %.2f %.2f][%.2f %.2f %.2f %.2f][%.2f %.2f %.2f %.2f][%.2f %.2f %.2f %.2f]",
+                    vp[0],vp[1],vp[2],vp[3], vp[4],vp[5],vp[6],vp[7], vp[8],vp[9],vp[10],vp[11], vp[12],vp[13],vp[14],vp[15]);
+                const IPC::DrawItemWire* it0 = (const IPC::DrawItemWire*)g_drawScratch.data();
+                const float* w = it0->world;
+                LOG::logline(">> [scene] item0 slot=%u world: [%.2f %.2f %.2f %.2f][%.2f %.2f %.2f %.2f][%.2f %.2f %.2f %.2f][%.2f %.2f %.2f %.2f]",
+                    it0->slot, w[0],w[1],w[2],w[3], w[4],w[5],w[6],w[7], w[8],w[9],w[10],w[11], w[12],w[13],w[14],w[15]);
+                LOG::flush();
+            }
+            ok = g_client->renderSceneBlocking(frame, (const float*)&viewProj,
+                     g_drawVec->id(), drawCount, (std::uint32_t)g_drawScratch.size(), &hostMs);
+        } else {
+            ok = g_client->renderFrameBlocking(frame, 0, &hostMs);
+        }
+        if (!ok) {
             return;
         }
 
-        if (!copyHostRtToSeamTex()) {
+        if (!copyHostRtToDst()) {
             static bool logged = false;
-            if (!logged) { LOG::logline("!! [seam] copyHostRtToSeamTex failed"); logged = true; }
+            if (!logged) { LOG::logline("!! [seam] copyHostRtToDst failed"); logged = true; }
             return;
         }
 
@@ -307,11 +684,10 @@ namespace RenderProcess {
             return;
         }
 
-        // Composite as a 1:1 corner quad (top-left), non-destructive to the frame.
+        // Composite full-screen (1:1 — the shared RT matches the backbuffer size).
         IDirect3DSurface9* backbuffer = nullptr;
         if (SUCCEEDED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backbuffer)) && backbuffer) {
-            RECT dstRect = { 20, 20, 20 + (LONG)kW, 20 + (LONG)kH };
-            HRESULT hr = device->StretchRect(src, nullptr, backbuffer, &dstRect, D3DTEXF_NONE);
+            HRESULT hr = device->StretchRect(src, nullptr, backbuffer, nullptr, D3DTEXF_NONE);
             if (FAILED(hr)) {
                 static bool logged = false;
                 if (!logged) { LOG::logline("!! [seam] StretchRect failed 0x%x", hr); logged = true; }
@@ -319,20 +695,65 @@ namespace RenderProcess {
             backbuffer->Release();
         }
         src->Release();
+    }
 
-        LARGE_INTEGER t1; QueryPerformanceCounter(&t1);
-        g_sumRoundtripMs += double(t1.QuadPart - t0.QuadPart) * msPerTick();
-        g_sumHostMs += hostMs;
-        if (++g_statSamples >= 60) {
-            LOG::logline("-- [seam] avg/60: client roundtrip=%.3f ms (host render=%.3f ms)",
-                g_sumRoundtripMs / g_statSamples, g_sumHostMs / g_statSamples);
-            g_sumRoundtripMs = g_sumHostMs = 0.0;
-            g_statSamples = 0;
+    bool wantsGeometryCapture() {
+        return g_initOk && g_geomVec.has_value();
+    }
+
+    void captureGeometry(std::uint32_t key, std::uint16_t revision,
+                         const IPC::GeomVertexWire* verts, std::uint32_t vertexCount,
+                         const std::uint16_t* indices, std::uint32_t indexCount) {
+        if (!wantsGeometryCapture() || !verts || !indices || !vertexCount || !indexCount) {
+            return;
         }
+        // Skip if this exact (key,revision) was already shipped.
+        auto rev = g_uploadedRev.find(key);
+        if (rev != g_uploadedRev.end() && rev->second == revision) {
+            return;
+        }
+        // Stable host slot per cache key (reused on revision change so the host frees
+        // and rebuilds in place).
+        std::uint32_t slot;
+        auto ks = g_keySlot.find(key);
+        if (ks != g_keySlot.end()) {
+            slot = ks->second;
+        } else {
+            slot = g_nextSlot++;
+            g_keySlot.emplace(key, slot);
+        }
+
+        IPC::GeomPartWire hdr = {};
+        hdr.slot        = slot;
+        hdr.revisionID  = revision;
+        hdr.vertexCount = vertexCount;
+        hdr.indexCount  = indexCount;
+
+        const std::size_t vbBytes = (std::size_t)vertexCount * sizeof(IPC::GeomVertexWire);
+        const std::size_t ibBytes = (std::size_t)indexCount * sizeof(std::uint16_t);
+        const std::size_t at = g_pendingBlob.size();
+        g_pendingBlob.resize(at + sizeof(hdr) + vbBytes + ibBytes);
+        std::uint8_t* dst = g_pendingBlob.data() + at;
+        memcpy(dst, &hdr, sizeof(hdr));            dst += sizeof(hdr);
+        memcpy(dst, verts, vbBytes);               dst += vbBytes;
+        memcpy(dst, indices, ibBytes);
+
+        ++g_pendingParts;
+        g_uploadedRev[key] = revision;
     }
 
     void shutdown() {
         releaseAll();
+        g_geomVec.reset();
+        g_drawVec.reset();
+        g_pendingBlob.clear();
+        g_pendingBlob.shrink_to_fit();
+        g_drawScratch.clear();
+        g_drawScratch.shrink_to_fit();
+        g_pendingParts = 0;
+        g_keySlot.clear();
+        g_uploadedRev.clear();
+        g_nextSlot = 0;
         g_initOk = false;
         g_enabled = false;
     }

@@ -17,9 +17,11 @@
 // the host only through the plain decls in forgerender.h.
 
 #include "forgerender.h"
+#include "ipc/geomwire.h"
 
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 
 #include "OS/Interfaces/IOperatingSystem.h"
 #include "Utilities/Interfaces/IFileSystem.h"
@@ -30,6 +32,12 @@
 #include "Utilities/Interfaces/ILog.h"
 // IMemory.h overrides new/delete/malloc — Forge convention: include it LAST.
 #include "Utilities/Interfaces/IMemory.h"
+// M1c opaque-scene SRT. defaults.h provides the C++ definitions of the FSL macros
+// (STRUCT/DATA/BEGIN_SRT/DECL_CBUFFER/SRT_SET_DESC/SRT_RES_IDX); the .srt.h then
+// declares SRT_SrtData + the gFrameData/gObject descriptor indices. Per the Forge
+// convention (06_MaterialPlayground) these come AFTER IMemory.h.
+#include "Graphics/FSL/defaults.h"
+#include "shaders/FSL/opaque.srt.h"
 
 // App-layer callback normally provided by WindowsBase.cpp (which we exclude — it
 // drags in the window system). The backend calls this on device-lost. Headless:
@@ -491,8 +499,210 @@ namespace {
         HANDLE          ntHandle = nullptr;     // host-process NT shared handle
         uint32_t        width = 0, height = 0;
         bool            firstFrame = true;
+
+        // --- M1c opaque scene path ---
+        RenderTarget*  pDepth = nullptr;          // depth buffer for the scene
+        Shader*        pOpaqueShader = nullptr;
+        Pipeline*      pOpaquePipeline = nullptr;
+        DescriptorSet* pPerFrameSet = nullptr;    // gFrameData (viewProj)
+        DescriptorSet* pPerDrawSet = nullptr;     // gObject (world), one instance per draw
+        Buffer*        pFrameCbv = nullptr;       // viewProj, persistent-mapped
+        Buffer*        pObjectCbv = nullptr;      // maxDraws * kObjStride, persistent-mapped
+        uint32_t       maxDraws = 0;
     };
     LiveRenderer g_live;
+
+    // CBV instances must be 256-byte aligned; pad the 64-byte world matrix up.
+    // kMaxDraws temporarily small while bisecting the uploadGeometry crash (large
+    // PerDraw descriptor sets suspected). Raise once the per-draw path is proven.
+    constexpr uint32_t kObjStride = 256;
+    constexpr uint32_t kMaxDraws  = 256;
+
+    // Build the M1c opaque scene path: depth target, opaque shader + pipeline (pos+normal
+    // vertex layout, depth test/write), and the PerFrame (viewProj) + PerDraw (world)
+    // descriptor sets backed by persistent-mapped CBVs. The opaque shaders share the
+    // global default.rootsig (regenerated from the SRT in opaque.srt.h). On any failure
+    // tears down what it made and returns false (the triangle path stays usable).
+    bool buildOpaquePath(Renderer* R, uint32_t width, uint32_t height) {
+        // Depth target (reverse-Z not needed for M1c; standard LEQUAL + clear to 1.0).
+        RenderTargetDesc dDesc = {};
+        dDesc.mWidth = width;
+        dDesc.mHeight = height;
+        dDesc.mDepth = 1;
+        dDesc.mArraySize = 1;
+        dDesc.mMipLevels = 1;
+        dDesc.mSampleCount = SAMPLE_COUNT_1;
+        dDesc.mFormat = TinyImageFormat_D32_SFLOAT;
+        dDesc.mStartState = RESOURCE_STATE_DEPTH_WRITE;
+        dDesc.mClearValue.depth = 1.0f;
+        dDesc.mClearValue.stencil = 0;
+        dDesc.pName = "sceneDepth";
+        addRenderTarget(R, &dDesc, &g_live.pDepth);
+        if (!g_live.pDepth) {
+            return false;
+        }
+
+        // Opaque shaders (share the global root signature already loaded for the triangle).
+        ShaderLoadDesc sDesc = {};
+        sDesc.mVert.pFileName = "opaque.vert";
+        sDesc.mFrag.pFileName = "opaque.frag";
+        addShader(R, &sDesc, &g_live.pOpaqueShader);
+        if (!g_live.pOpaqueShader) {
+            std::printf("[forge] addShader(opaque) FAILED\n");
+            return false;
+        }
+
+        // Vertex layout matches IPC::GeomVertexWire: pos float3 @0, normal float3 @12, stride 24.
+        VertexLayout vl = {};
+        vl.mBindingCount = 1;
+        vl.mBindings[0].mStride = sizeof(IPC::GeomVertexWire);
+        vl.mAttribCount = 2;
+        vl.mAttribs[0].mSemantic = SEMANTIC_POSITION;
+        vl.mAttribs[0].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
+        vl.mAttribs[0].mBinding = 0;
+        vl.mAttribs[0].mLocation = 0;
+        vl.mAttribs[0].mOffset = 0;
+        vl.mAttribs[1].mSemantic = SEMANTIC_NORMAL;
+        vl.mAttribs[1].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
+        vl.mAttribs[1].mBinding = 0;
+        vl.mAttribs[1].mLocation = 1;
+        vl.mAttribs[1].mOffset = 12;
+
+        DepthStateDesc depthDesc = {};
+        depthDesc.mDepthTest = true;
+        depthDesc.mDepthWrite = true;
+        depthDesc.mDepthFunc = CMP_LEQUAL;
+
+        RasterizerStateDesc rasterDesc = {};
+        rasterDesc.mCullMode = CULL_MODE_NONE;   // M1c: no winding assumptions yet
+
+        PipelineDesc pd = {};
+        pd.mType = PIPELINE_TYPE_GRAPHICS;
+        GraphicsPipelineDesc& g = pd.mGraphicsDesc;
+        g.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+        g.mRenderTargetCount = 1;
+        g.pColorFormats = &g_live.pRT->mFormat;
+        g.mSampleCount = SAMPLE_COUNT_1;
+        g.mSampleQuality = 0;
+        g.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+        g.pDepthState = &depthDesc;
+        g.pVertexLayout = &vl;
+        g.pRasterizerState = &rasterDesc;
+        g.pShaderProgram = g_live.pOpaqueShader;
+        addPipeline(R, &pd, &g_live.pOpaquePipeline);
+        if (!g_live.pOpaquePipeline) {
+            std::printf("[forge] addPipeline(opaque) FAILED\n");
+            return false;
+        }
+
+        // PerFrame viewProj CBV (one), persistent-mapped.
+        BufferLoadDesc fb = {};
+        fb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        fb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+        fb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+        fb.mDesc.mSize = kObjStride;   // 256, holds one float4x4
+        fb.pData = nullptr;
+        fb.ppBuffer = &g_live.pFrameCbv;
+        addResource(&fb, nullptr);
+
+        // PerDraw world CBV array (kMaxDraws slices of kObjStride), persistent-mapped.
+        BufferLoadDesc ob = {};
+        ob.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        ob.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+        ob.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+        ob.mDesc.mSize = (uint64_t)kObjStride * kMaxDraws;
+        ob.pData = nullptr;
+        ob.ppBuffer = &g_live.pObjectCbv;
+        addResource(&ob, nullptr);
+        waitForAllResourceLoads();
+        if (!g_live.pFrameCbv || !g_live.pObjectCbv) {
+            return false;
+        }
+        g_live.maxDraws = kMaxDraws;
+
+        // Descriptor sets from the SRT (PerFrame: 1 instance; PerDraw: kMaxDraws).
+        DescriptorSetDesc pfDesc = SRT_SET_DESC(SrtData, PerFrame, 1, 0);
+        addDescriptorSet(R, &pfDesc, &g_live.pPerFrameSet);
+        DescriptorSetDesc pdDesc = SRT_SET_DESC(SrtData, PerDraw, kMaxDraws, 0);
+        addDescriptorSet(R, &pdDesc, &g_live.pPerDrawSet);
+        if (!g_live.pPerFrameSet || !g_live.pPerDrawSet) {
+            return false;
+        }
+
+        // Bind the frame CBV to PerFrame instance 0.
+        {
+            DescriptorData p = {};
+            p.mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
+            p.ppBuffers = &g_live.pFrameCbv;
+            updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &p);
+        }
+        // Bind each PerDraw instance i to object-buffer slice [i*kObjStride, +kObjStride).
+        for (uint32_t i = 0; i < kMaxDraws; ++i) {
+            DescriptorDataRange range = {};
+            range.mOffset = i * kObjStride;
+            range.mSize = kObjStride;
+            DescriptorData p = {};
+            p.mIndex = SRT_RES_IDX(SrtData, PerDraw, gObject);
+            p.ppBuffers = &g_live.pObjectCbv;
+            p.pRanges = &range;
+            updateDescriptorSet(R, i, g_live.pPerDrawSet, 1, &p);
+        }
+
+        std::printf("[forge] opaque scene path ready (depth %ux%u, maxDraws=%u)\n", width, height, kMaxDraws);
+        return true;
+    }
+
+    // --- M1b: slot-indexed static opaque mesh store ------------------------------
+    // The client assigns each cached NiTriShape* a dense slot; we keep meshes in a
+    // flat array indexed by that slot (no hashing). Grown on demand; freed on
+    // shutdown. M1c iterates a per-frame visible list of slots to draw these.
+    struct HostMesh {
+        Buffer*  vb;
+        Buffer*  ib;
+        uint32_t vertexCount;
+        uint32_t indexCount;
+        bool     valid;
+    };
+    HostMesh* g_meshes   = nullptr;
+    uint32_t  g_meshCap  = 0;   // allocated slot count
+    uint32_t  g_meshHigh = 0;   // highest slot+1 ever populated
+    unsigned  g_lastDrawn = 0;  // parts actually drawn in the last renderScene
+
+    bool ensureMeshSlot(uint32_t slot) {
+        if (slot < g_meshCap) {
+            return true;
+        }
+        uint32_t newCap = g_meshCap ? g_meshCap * 2 : 1024;
+        while (newCap <= slot) {
+            newCap *= 2;
+        }
+        HostMesh* n = (HostMesh*)tf_calloc(newCap, sizeof(HostMesh));
+        if (!n) {
+            return false;
+        }
+        if (g_meshes) {
+            std::memcpy(n, g_meshes, (size_t)g_meshCap * sizeof(HostMesh));
+            tf_free(g_meshes);
+        }
+        g_meshes  = n;
+        g_meshCap = newCap;
+        return true;
+    }
+
+    void freeMeshStore() {
+        if (g_meshes) {
+            for (uint32_t i = 0; i < g_meshHigh; ++i) {
+                if (g_meshes[i].valid) {
+                    if (g_meshes[i].vb) { removeResource(g_meshes[i].vb); }
+                    if (g_meshes[i].ib) { removeResource(g_meshes[i].ib); }
+                }
+            }
+            tf_free(g_meshes);
+        }
+        g_meshes   = nullptr;
+        g_meshCap  = 0;
+        g_meshHigh = 0;
+    }
 }
 
 namespace ForgeRender {
@@ -565,6 +775,11 @@ namespace ForgeRender {
         rtDesc.mSampleCount = SAMPLE_COUNT_1;
         rtDesc.mFormat = TinyImageFormat_B8G8R8A8_UNORM;
         rtDesc.mStartState = RESOURCE_STATE_RENDER_TARGET;
+        // M1c debug: teal clear so F11 distinguishes "composite shows the RT but
+        // geometry is off-screen" (teal screen) from "composite/RT broken" (black).
+        rtDesc.mClearValue.r = 0.0f;
+        rtDesc.mClearValue.g = 0.30f;
+        rtDesc.mClearValue.b = 0.35f;
         rtDesc.mClearValue.a = 1.0f;
         rtDesc.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
         rtDesc.pNativeHandle = (void*)g_live.pSharedRes;
@@ -586,6 +801,12 @@ namespace ForgeRender {
         initCmd(R, &cmdDesc, &g_live.pCmd);
         initFence(R, &g_live.pFence);
 
+        // M1c opaque scene path (depth RT + opaque pipeline + scene CBVs) is built
+        // LAZILY on the first renderScene — NOT here. Building it during init (before
+        // any geometry upload) was corrupting the resource loader and hanging/crashing
+        // the first uploadGeometry. Deferring it lets geometry upload run on a clean
+        // loader, and isolates any opaque-path issue to the F11 scene path.
+
         g_live.width = width;
         g_live.height = height;
         g_live.firstFrame = true;
@@ -595,6 +816,10 @@ namespace ForgeRender {
 
     void* sharedHandle() {
         return (void*)g_live.ntHandle;
+    }
+
+    bool sceneReady() {
+        return g_live.pOpaquePipeline != nullptr;
     }
 
     bool renderFrame(unsigned frameIndex) {
@@ -648,12 +873,190 @@ namespace ForgeRender {
         return true;
     }
 
+    bool renderScene(const float* viewProj, const void* drawBlob,
+                     unsigned drawCount, unsigned drawBytes) {
+        if (!g_live.pRenderer) {
+            return false;
+        }
+        Renderer* R = g_live.pRenderer;
+
+        // Lazy one-time opaque-path build (depth RT + pipeline + descriptor sets),
+        // deferred out of init so geometry upload runs first on a clean resource loader.
+        if (!g_live.pOpaquePipeline) {
+            std::printf("[forge] renderScene: lazy buildOpaquePath...\n");
+            if (!buildOpaquePath(R, g_live.width, g_live.height)) {
+                std::printf("[forge] lazy buildOpaquePath FAILED — scene path disabled\n");
+                return false;   // caller falls back to triangle
+            }
+        }
+        if (!g_live.pDepth) {
+            return false;
+        }
+
+        const uint32_t n = (drawCount < g_live.maxDraws) ? drawCount : g_live.maxDraws;
+        const uint32_t haveBytes = drawBytes / (uint32_t)sizeof(IPC::DrawItemWire);
+        const uint32_t count = (n < haveBytes) ? n : haveBytes;
+        const IPC::DrawItemWire* items = (const IPC::DrawItemWire*)drawBlob;
+
+        // Upload camera + per-draw world matrices into the persistent-mapped CBVs.
+        std::memcpy(g_live.pFrameCbv->pCpuMappedAddress, viewProj, 16 * sizeof(float));
+        uint8_t* objBase = (uint8_t*)g_live.pObjectCbv->pCpuMappedAddress;
+        for (uint32_t i = 0; i < count; ++i) {
+            std::memcpy(objBase + (size_t)i * kObjStride, items[i].world, 16 * sizeof(float));
+        }
+
+        resetCmdPool(R, g_live.pCmdPool);
+        beginCmd(g_live.pCmd);
+
+        // Shared RT: COMMON (steady state) -> RENDER_TARGET. First frame it was created
+        // RENDER_TARGET; depth created DEPTH_WRITE and stays there.
+        if (!g_live.firstFrame) {
+            RenderTargetBarrier toRT = {};
+            toRT.pRenderTarget = g_live.pRT;
+            toRT.mCurrentState = RESOURCE_STATE_COMMON;
+            toRT.mNewState = RESOURCE_STATE_RENDER_TARGET;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &toRT);
+        }
+
+        BindRenderTargetsDesc bind = {};
+        bind.mRenderTargetCount = 1;
+        bind.mRenderTargets[0] = { g_live.pRT, LOAD_ACTION_CLEAR };
+        bind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_CLEAR };
+        cmdBindRenderTargets(g_live.pCmd, &bind);
+        cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+        cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+        cmdBindPipeline(g_live.pCmd, g_live.pOpaquePipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+
+        uint32_t drawn = 0;
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint32_t slot = items[i].slot;
+            if (slot >= g_meshHigh || !g_meshes[slot].valid) {
+                continue;   // mesh not uploaded yet (or evicted)
+            }
+            HostMesh& m = g_meshes[slot];
+            cmdBindDescriptorSet(g_live.pCmd, i, g_live.pPerDrawSet);
+            uint32_t stride = (uint32_t)sizeof(IPC::GeomVertexWire);
+            cmdBindVertexBuffer(g_live.pCmd, 1, &m.vb, &stride, nullptr);
+            cmdBindIndexBuffer(g_live.pCmd, m.ib, INDEX_TYPE_UINT16, 0);
+            cmdDrawIndexed(g_live.pCmd, m.indexCount, 0, 0);
+            ++drawn;
+        }
+
+        cmdBindRenderTargets(g_live.pCmd, nullptr);
+
+        // Hand the shared RT back to COMMON for MW's D3D9Ex StretchRect.
+        RenderTargetBarrier toCommon = {};
+        toCommon.pRenderTarget = g_live.pRT;
+        toCommon.mCurrentState = RESOURCE_STATE_RENDER_TARGET;
+        toCommon.mNewState = RESOURCE_STATE_COMMON;
+        cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &toCommon);
+        endCmd(g_live.pCmd);
+
+        QueueSubmitDesc submitDesc = {};
+        submitDesc.mCmdCount = 1;
+        submitDesc.ppCmds = &g_live.pCmd;
+        submitDesc.pSignalFence = g_live.pFence;
+        submitDesc.mSubmitDone = true;
+        queueSubmit(g_live.pQueue, &submitDesc);
+        waitForFences(R, 1, &g_live.pFence);
+
+        g_live.firstFrame = false;
+        g_lastDrawn = drawn;
+        return true;
+    }
+
+    unsigned lastDrawn() { return g_lastDrawn; }
+
+    unsigned uploadGeometry(const void* blobBytes, unsigned byteCount, unsigned partCount) {
+        if (!g_live.pRenderer || !blobBytes || !byteCount || !partCount) {
+            return 0;
+        }
+        const uint8_t* p   = (const uint8_t*)blobBytes;
+        const uint8_t* end = p + byteCount;
+        unsigned built = 0;
+
+        for (unsigned i = 0; i < partCount; ++i) {
+            if (p + sizeof(IPC::GeomPartWire) > end) {
+                break;
+            }
+            IPC::GeomPartWire hdr;
+            std::memcpy(&hdr, p, sizeof(hdr));
+            p += sizeof(hdr);
+
+            const uint64_t vbBytes = (uint64_t)hdr.vertexCount * sizeof(IPC::GeomVertexWire);
+            const uint64_t ibBytes = (uint64_t)hdr.indexCount * sizeof(uint16_t);
+            if (p + vbBytes + ibBytes > end) {
+                break;  // malformed / truncated blob
+            }
+            const void* verts   = p; p += vbBytes;
+            const void* indices = p; p += ibBytes;
+            if (!hdr.vertexCount || !hdr.indexCount) {
+                continue;
+            }
+            if (!ensureMeshSlot(hdr.slot)) {
+                continue;
+            }
+
+            HostMesh& m = g_meshes[hdr.slot];
+            if (m.valid) {  // re-upload on revision change: drop the old buffers
+                if (m.vb) { removeResource(m.vb); }
+                if (m.ib) { removeResource(m.ib); }
+                m.vb = m.ib = nullptr;
+                m.valid = false;
+            }
+
+            BufferLoadDesc vbDesc = {};
+            vbDesc.mDesc.mDescriptors  = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+            vbDesc.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+            vbDesc.mDesc.mSize         = vbBytes;
+            vbDesc.mDesc.mStartState   = RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+            vbDesc.pData               = verts;
+            vbDesc.ppBuffer            = &m.vb;
+            addResource(&vbDesc, nullptr);
+
+            BufferLoadDesc ibDesc = {};
+            ibDesc.mDesc.mDescriptors  = DESCRIPTOR_TYPE_INDEX_BUFFER;
+            ibDesc.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+            ibDesc.mDesc.mSize         = ibBytes;
+            ibDesc.mDesc.mStartState   = RESOURCE_STATE_INDEX_BUFFER;
+            ibDesc.pData               = indices;
+            ibDesc.ppBuffer            = &m.ib;
+            addResource(&ibDesc, nullptr);
+
+            m.vertexCount = hdr.vertexCount;
+            m.indexCount  = hdr.indexCount;
+            m.valid       = true;
+            if (hdr.slot + 1 > g_meshHigh) {
+                g_meshHigh = hdr.slot + 1;
+            }
+            ++built;
+        }
+
+        waitForAllResourceLoads();
+        LOGF(eINFO, "[forge] uploadGeometry: built %u/%u parts (%u bytes), meshHigh=%u",
+             built, partCount, byteCount, g_meshHigh);
+        std::printf("[forge] uploadGeometry: built %u/%u parts (%u bytes), meshHigh=%u\n",
+                    built, partCount, byteCount, g_meshHigh);
+        return built;
+    }
+
     void shutdown() {
         Renderer* R = g_live.pRenderer;
         if (!R) {
+            freeMeshStore();
             g_live = LiveRenderer{};
             return;
         }
+        freeMeshStore();   // release VB/IB before the resource loader goes down
+        // M1c opaque path teardown.
+        if (g_live.pPerFrameSet)    { removeDescriptorSet(R, g_live.pPerFrameSet); }
+        if (g_live.pPerDrawSet)     { removeDescriptorSet(R, g_live.pPerDrawSet); }
+        if (g_live.pFrameCbv)       { removeResource(g_live.pFrameCbv); }
+        if (g_live.pObjectCbv)      { removeResource(g_live.pObjectCbv); }
+        if (g_live.pOpaquePipeline) { removePipeline(R, g_live.pOpaquePipeline); }
+        if (g_live.pOpaqueShader)   { removeShader(R, g_live.pOpaqueShader); }
+        if (g_live.pDepth)          { removeRenderTarget(R, g_live.pDepth); }
         if (g_live.pFence)    { exitFence(R, g_live.pFence); }
         if (g_live.pCmd)      { exitCmd(R, g_live.pCmd); }
         if (g_live.pCmdPool)  { exitCmdPool(R, g_live.pCmdPool); }

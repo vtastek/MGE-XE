@@ -3,6 +3,7 @@
 
 #include <cassert>
 #include <cstdio>
+#include <cstring>
 
 // ideally this would go in beginRpc, but we can't put it there because we
 // need to check that the previous command has finished before we start
@@ -340,6 +341,9 @@ namespace IPC {
 		auto& params = m_ipcParameters->params.renderFrameParams;
 		params.frameIndex = frameIndex;
 		params.targetIndex = targetIndex;
+		params.drawList = InvalidVector;   // triangle path (no scene data)
+		params.drawCount = 0;
+		params.drawBytes = 0;
 		params.bytesWritten = 0;
 		params.renderMs = 0.0;
 		if (!beginRpc(Command::RenderFrame)) {
@@ -354,6 +358,55 @@ namespace IPC {
 			*outRenderMs = params.renderMs;
 		}
 		return params.bytesWritten > 0;
+	}
+
+	bool Client::renderSceneBlocking(std::uint32_t frameIndex, const float* viewProj,
+		VecId drawList, std::uint32_t drawCount, std::uint32_t drawBytes, double* outRenderMs) {
+		WAIT_FOR_PREVIOUS_COMMAND;
+
+		auto& params = m_ipcParameters->params.renderFrameParams;
+		params.frameIndex = frameIndex;
+		params.targetIndex = 0;
+		std::memcpy(params.viewProj, viewProj, 16 * sizeof(float));
+		params.drawList = drawList;
+		params.drawCount = drawCount;
+		params.drawBytes = drawBytes;
+		params.bytesWritten = 0;
+		params.renderMs = 0.0;
+		if (!beginRpc(Command::RenderFrame)) {
+			return false;
+		}
+
+		if (waitForCompletion() != WakeReason::Complete) {
+			return false;
+		}
+
+		if (outRenderMs) {
+			*outRenderMs = params.renderMs;
+		}
+		return params.bytesWritten > 0;
+	}
+
+	bool Client::geomUploadBlocking(VecId blob, std::uint32_t partCount, std::uint32_t byteCount, std::uint32_t* outUploaded) {
+		WAIT_FOR_PREVIOUS_COMMAND;
+
+		auto& params = m_ipcParameters->params.geomUploadParams;
+		params.blob = blob;
+		params.partCount = partCount;
+		params.byteCount = byteCount;
+		params.partsUploaded = 0;
+		if (!beginRpc(Command::GeomUpload)) {
+			return false;
+		}
+
+		if (waitForCompletion() != WakeReason::Complete) {
+			return false;
+		}
+
+		if (outUploaded) {
+			*outUploaded = params.partsUploaded;
+		}
+		return params.partsUploaded == partCount;
 	}
 
 	WakeReason Client::waitForCompletion(DWORD ms) {

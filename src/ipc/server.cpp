@@ -1,11 +1,13 @@
 #include "ipc/dlshare.h"
 #include "ipc/server.h"
 #include "ipc/occlusiontest.h"
+#include "ipc/geomwire.h"
 #include "support/log.h"
 #include "vkrender.h"
 #include "forgerender.h"
 
 #include <cassert>
+#include <cstring>
 
 namespace {
     // --- getVisibleMeshesAllRanges profiling instrumentation ---
@@ -192,6 +194,9 @@ namespace IPC {
 				break;
 			case Command::RenderFrame:
 				renderFrame();
+				break;
+			case Command::GeomUpload:
+				geomUpload();
 				break;
 			default:
 				LOG::logline("Received unknown command value %u", m_ipcParameters->command);
@@ -427,8 +432,9 @@ namespace IPC {
 		params.framebufferHandle = static_cast<HANDLE32>(clientHandle);
 #pragma warning(pop)
 		params.ok = true;
-		LOG::logline(">> [seam] render init ok (%ux%u, Forge shared RT, host handle %p -> client %p)",
-			params.width, params.height, hostHandle, clientHandle);
+		LOG::logline(">> [seam] render init ok (%ux%u, Forge shared RT, host handle %p -> client %p) sceneReady=%d",
+			params.width, params.height, hostHandle, clientHandle, (int)ForgeRender::sceneReady());
+		LOG::flush();
 	}
 
 	// Render one frame into the shared RT. Blocking (host fence-waits), so the reply
@@ -439,12 +445,76 @@ namespace IPC {
 		params.renderMs = 0.0;
 
 		LARGE_INTEGER t0; QueryPerformanceCounter(&t0);
-		if (!ForgeRender::renderFrame(params.frameIndex)) {
+		bool ok;
+		if (params.drawList != InvalidVector) {
+			// M1c scene path: DrawItemWire[] in the drawList vec + inline camera.
+			auto& vec = getVec<IPC::GeomChunk>(params.drawList);
+			const std::uint32_t availBytes = vec.size() * static_cast<std::uint32_t>(sizeof(IPC::GeomChunk));
+			std::uint32_t bytes = params.drawBytes;
+			if (bytes == 0 || bytes > availBytes) {
+				bytes = availBytes;
+			}
+			static unsigned s_sceneLog = 0;
+			const bool logScene = (s_sceneLog++ % 60) == 0;
+			if (logScene) {
+				LOG::logline(">> [scene] renderScene ENTER frame=%u drawCount=%u bytes=%u",
+					params.frameIndex, params.drawCount, bytes);
+				LOG::flush();
+			}
+			ok = ForgeRender::renderScene(params.viewProj, vec.size() ? &vec[0] : nullptr,
+				params.drawCount, bytes);
+			if (logScene) {
+				LOG::logline(">> [scene] renderScene DONE ok=%d drawn=%u", (int)ok, ForgeRender::lastDrawn());
+				LOG::flush();
+			}
+		} else {
+			ok = ForgeRender::renderFrame(params.frameIndex);
+		}
+		if (!ok) {
 			return;
 		}
 		LARGE_INTEGER t1; QueryPerformanceCounter(&t1);
 
 		params.bytesWritten = g_spikeWidth * g_spikeHeight * 4u;
 		params.renderMs = msBetween(t0, t1);
+	}
+
+	// M1b: hand the packed geometry blob to the Forge host, which builds a D3D12
+	// VB/IB per part and stores it slot-indexed. The blob is single-window, so
+	// &vec[0] is a contiguous pointer to the whole batch (as for the occlusion mask).
+	void Server::geomUpload() {
+		auto& params = m_ipcParameters->params.geomUploadParams;
+		params.partsUploaded = 0;
+		if (params.blob == InvalidVector || params.partCount == 0) {
+			return;
+		}
+		auto& vec = getVec<IPC::GeomChunk>(params.blob);
+		if (vec.size() == 0) {
+			return;
+		}
+		const std::uint32_t availBytes = vec.size() * static_cast<std::uint32_t>(sizeof(IPC::GeomChunk));
+		std::uint32_t bytes = params.byteCount;
+		if (bytes == 0 || bytes > availBytes) {
+			bytes = availBytes;
+		}
+		const void* p = &vec[0];
+		IPC::GeomPartWire h0 = {};
+		if (bytes >= sizeof(h0)) {
+			std::memcpy(&h0, p, sizeof(h0));
+		}
+		// Log BEFORE the call (flushed): if the matching "built" line below never
+		// appears, uploadGeometry crashed/hung on this input.
+		const bool logThis = (params.partCount > 1 || params.partsUploaded != params.partCount);
+		if (logThis) {
+			LOG::logline(">> [geom] geomUpload ENTER: partCount=%u size=%u availBytes=%u byteCount=%u bytes=%u p0{slot=%u rev=%u v=%u i=%u}",
+				params.partCount, vec.size(), availBytes, params.byteCount, bytes,
+				h0.slot, h0.revisionID, h0.vertexCount, h0.indexCount);
+			LOG::flush();
+		}
+		params.partsUploaded = ForgeRender::uploadGeometry(p, bytes, params.partCount);
+		if (params.partCount > 1 || params.partsUploaded != params.partCount) {
+			LOG::logline(">> [geom] geomUpload DONE: built %u/%u", params.partsUploaded, params.partCount);
+			LOG::flush();
+		}
 	}
 }
