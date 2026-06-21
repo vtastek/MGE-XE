@@ -962,21 +962,15 @@ SamplerState gSamplerAnisotropic : register( s10 , space100 ) ;
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 #line 7 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-#line 13 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-STRUCT(FrameData)
+#line 17 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+STRUCT(SceneData)
 {
     float4x4 viewProj;
-#line 16
-};
-
-STRUCT(Object)
-{
-    float4x4 world;
+    float4x4 worlds[ 1023 ];
 #line 21
 };
 
-        CBUFFER(FrameData) gFrameData : register( b0 , space1 ) ;
-        CBUFFER(Object) gObject : register( b0 , space3 ) ;
+        CBUFFER(SceneData) gScene : register( b0 , space1 ) ;
 #line 8 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 
 STRUCT(VSOutput)

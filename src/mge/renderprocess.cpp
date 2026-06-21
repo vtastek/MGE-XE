@@ -650,20 +650,6 @@ namespace RenderProcess {
             && g_drawVec->assign_bytes(g_drawScratch.data(), (std::uint32_t)g_drawScratch.size())) {
             D3DXMATRIX viewProj;
             D3DXMatrixMultiply(&viewProj, &DistantLand::mwView, &DistantLand::mwProj);
-            // One-shot dump of the real matrix values to verify they're sane (not the
-            // convention) — viewProj + the first visible part's world transform.
-            static bool s_dumped = false;
-            if (!s_dumped) {
-                s_dumped = true;
-                const float* vp = (const float*)&viewProj;
-                LOG::logline(">> [scene] viewProj: [%.2f %.2f %.2f %.2f][%.2f %.2f %.2f %.2f][%.2f %.2f %.2f %.2f][%.2f %.2f %.2f %.2f]",
-                    vp[0],vp[1],vp[2],vp[3], vp[4],vp[5],vp[6],vp[7], vp[8],vp[9],vp[10],vp[11], vp[12],vp[13],vp[14],vp[15]);
-                const IPC::DrawItemWire* it0 = (const IPC::DrawItemWire*)g_drawScratch.data();
-                const float* w = it0->world;
-                LOG::logline(">> [scene] item0 slot=%u world: [%.2f %.2f %.2f %.2f][%.2f %.2f %.2f %.2f][%.2f %.2f %.2f %.2f][%.2f %.2f %.2f %.2f]",
-                    it0->slot, w[0],w[1],w[2],w[3], w[4],w[5],w[6],w[7], w[8],w[9],w[10],w[11], w[12],w[13],w[14],w[15]);
-                LOG::flush();
-            }
             ok = g_client->renderSceneBlocking(frame, (const float*)&viewProj,
                      g_drawVec->id(), drawCount, (std::uint32_t)g_drawScratch.size(), &hostMs);
         } else {
