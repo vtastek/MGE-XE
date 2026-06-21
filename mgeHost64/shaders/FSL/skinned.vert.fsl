@@ -1,0 +1,62 @@
+// mgeHost64 — M-Skinning skinned scene (vertex stage, GPU palette skinning).
+//
+// Reuses the opaque SRT (gFrameData viewProj + gBatch.worlds[] read as a 64KB BONE window)
+// and the shared default.rootsig — NO new SRT, NO second root signature. There is no
+// per-draw world matrix: the bone palette is already model->world. The per-INSTANCE Base
+// attribute is this part's palette offset within the bound window (host sets it via
+// firstInstance + the identity instance buffer, exactly like the static DrawIndex).
+//
+//   worldPos = Σ_j Weight[j] * mul(gBatch.worlds[Base + BoneIdx[j]], pos)
+//   clip     = mul(gFrameData.viewProj, worldPos)              // reverse-Z viewProj (host-applied)
+//   worldNrm = Σ_j Weight[j] * mul((float3x3)gBatch.worlds[Base + BoneIdx[j]], normal)
+//
+// Emits clip pos + world normal for the shared opaque.frag flat N.L shading.
+
+#include "opaque.srt.h"
+
+STRUCT(VSInput)
+{
+    DATA(float3, Position, POSITION);
+    DATA(float3, Normal,   NORMAL);
+    DATA(float4, Weights,  TEXCOORD0);
+    DATA(uint4,  BoneIdx,  TEXCOORD1);   // R8G8B8A8_UINT: .x=idx0 .y=idx1 .z=idx2 .w=idx3
+    DATA(uint,   Base,     TEXCOORD2);   // per-instance: palette offset in the bound window
+};
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float3, Normal,   NORMAL);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+VSOutput VS_MAIN( VSInput In )
+{
+    INIT_MAIN;
+    VSOutput Out;
+
+    float4 pos = float4(In.Position, 1.0f);
+
+    // Top-4 influences (manually unrolled — FSL-safe). Cbuffer matrices are column-major
+    // (DXC default), so mul(M, v) with the D3DX bytes uploaded as-is == D3DX v*M (same
+    // convention as opaque.vert). BoneIdx components map idx0..idx3 to the UBYTE4 byte
+    // order (R=low byte), pairing with Weights.x..w.
+    float4x4 b0 = gBatch.worlds[In.Base + In.BoneIdx.x];
+    float4x4 b1 = gBatch.worlds[In.Base + In.BoneIdx.y];
+    float4x4 b2 = gBatch.worlds[In.Base + In.BoneIdx.z];
+    float4x4 b3 = gBatch.worlds[In.Base + In.BoneIdx.w];
+
+    float4 worldPos = In.Weights.x * mul(b0, pos)
+                    + In.Weights.y * mul(b1, pos)
+                    + In.Weights.z * mul(b2, pos)
+                    + In.Weights.w * mul(b3, pos);
+
+    float3 worldNrm = In.Weights.x * mul((float3x3)b0, In.Normal)
+                    + In.Weights.y * mul((float3x3)b1, In.Normal)
+                    + In.Weights.z * mul((float3x3)b2, In.Normal)
+                    + In.Weights.w * mul((float3x3)b3, In.Normal);
+
+    Out.Position = mul(gFrameData.viewProj, worldPos);
+    Out.Normal = worldNrm;
+    RETURN(Out);
+}

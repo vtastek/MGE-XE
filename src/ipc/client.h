@@ -289,7 +289,9 @@ namespace IPC {
 		* @return Whether the frame rendered (blocking).
 		*/
 		bool renderSceneBlocking(std::uint32_t frameIndex, const float* viewProj,
-			VecId drawList, std::uint32_t drawCount, std::uint32_t drawBytes, double* outRenderMs = nullptr);
+			VecId drawList, std::uint32_t drawCount, std::uint32_t drawBytes,
+			VecId skinnedList, std::uint32_t skinnedCount, std::uint32_t skinnedBytes,
+			double* outRenderMs = nullptr);
 
 		/**
 		* @brief M1b: upload a batch of static opaque meshes to the Forge host.

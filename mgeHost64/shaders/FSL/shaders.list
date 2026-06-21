@@ -27,3 +27,7 @@
 #frag opaque.frag
 #include "opaque.frag.fsl"
 #end
+
+#vert skinned.vert
+#include "skinned.vert.fsl"
+#end

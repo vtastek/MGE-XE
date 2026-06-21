@@ -72,11 +72,18 @@ namespace ForgeRender {
     // drawCount entries, drawBytes total. Parts whose slot has no uploaded mesh are
     // skipped. Returns false if the opaque path isn't built (caller can fall back to
     // renderFrame's triangle). Blocking (fence-waits like renderFrame).
+    // M-Skinning: skinnedBlob is a sequence of [SkinnedDrawWire][palette]* (geomwire.h);
+    // skinnedCount items, skinnedBytes total. The host GPU palette-skins each (no per-draw
+    // world matrix — the palette is world-space). drawBlob/skinnedBlob may each be null.
     bool renderScene(const float* viewProj, const void* drawBlob,
-                     unsigned drawCount, unsigned drawBytes);
+                     unsigned drawCount, unsigned drawBytes,
+                     const void* skinnedBlob, unsigned skinnedCount, unsigned skinnedBytes);
 
     // Parts actually drawn (slot valid) in the last renderScene — for diagnostics.
     unsigned lastDrawn();
+
+    // Skinned parts actually drawn in the last renderScene — for diagnostics.
+    unsigned lastSkinnedDrawn();
 
     // Standalone scene-path exercise (init → uploadGeometry → renderScene with a dummy
     // mesh) so host-side printf/asserts are visible in a terminal. Run via --forge-scene.

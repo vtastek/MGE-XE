@@ -39,12 +39,14 @@ namespace {
 
     std::optional<IPC::VecView<IPC::GeomChunk>> g_geomVec;          // persistent geometry upload vec
     std::optional<IPC::VecView<IPC::GeomChunk>> g_drawVec;          // persistent per-frame draw-list vec
+    std::optional<IPC::VecView<IPC::GeomChunk>> g_skinnedVec;       // persistent per-frame skinned draw-list vec
     std::vector<std::uint8_t>                 g_pendingBlob;        // packed parts awaiting flush
     std::uint32_t                             g_pendingParts = 0;
     std::unordered_map<std::uint32_t, std::uint32_t> g_keySlot;    // cache key -> host slot
     std::unordered_map<std::uint32_t, std::uint16_t> g_uploadedRev;// cache key -> last sent revision
     std::uint32_t                             g_nextSlot = 0;
     std::vector<std::uint8_t>                 g_drawScratch;        // packed DrawItemWire[] this frame
+    std::vector<std::uint8_t>                 g_skinnedScratch;     // packed [SkinnedDrawWire][palette]* this frame
 
     // Per-frame draw list rides a 4-chunk (4MB) vec: ~61K DrawItemWire, well over the
     // host's kMaxDraws cap. Geometry vec stays 8 chunks (8MB).
@@ -506,8 +508,18 @@ namespace {
         } else {
             g_drawVec.emplace(std::move(*dv));
         }
-        LOG::logline(">> [seam] scene vecs ready (geom %u chunks, draw %u chunks)",
-                     IPC::kGeomChunks, kDrawChunks);
+
+        // Skinned draw list rides its own 4-chunk vec. The blob is [SkinnedDrawWire]
+        // [palette]* — bounded at the host's 256-part cap (256 * (12 + 32*64) ≈ 527KB),
+        // well under 4MB.
+        auto sv = g_client->allocVecBlocking<IPC::GeomChunk>(kDrawChunks, kDrawChunks, kDrawChunks);
+        if (!sv) {
+            LOG::logline("!! [seam] skinned draw-list vec alloc failed — skinned path disabled");
+        } else {
+            g_skinnedVec.emplace(std::move(*sv));
+        }
+        LOG::logline(">> [seam] scene vecs ready (geom %u chunks, draw %u chunks, skinned %u chunks)",
+                     IPC::kGeomChunks, kDrawChunks, kDrawChunks);
     }
 
     // Drain g_pendingBlob to the host in window-sized whole-part chunks. Parts are
@@ -538,9 +550,11 @@ namespace {
             while (cursor < total) {
                 IPC::GeomPartWire hdr;
                 memcpy(&hdr, data + cursor, sizeof(hdr));
+                const std::size_t vStride = (hdr.flags & IPC::kGeomFlagSkinned)
+                    ? sizeof(IPC::SkinnedVertexWire) : sizeof(IPC::GeomVertexWire);
                 const std::uint32_t partSize = static_cast<std::uint32_t>(
                     sizeof(IPC::GeomPartWire)
-                    + (std::uint64_t)hdr.vertexCount * sizeof(IPC::GeomVertexWire)
+                    + (std::uint64_t)hdr.vertexCount * vStride
                     + (std::uint64_t)hdr.indexCount * sizeof(std::uint16_t));
                 if (chunkBytes != 0 && chunkBytes + partSize > kGeomChunkCap) {
                     break;  // close this chunk on a part boundary
@@ -617,11 +631,15 @@ namespace {
             //     isLandscape regardless of blendEnable (alpha-splat trishapes included),
             //     and at flat-shaded fidelity blend-vs-opaque is invisible. So only filter
             //     blendEnable for non-landscape.
-            //   - unsupported/zero-bone skin: no VS palette.
+            //   - skinned: ALL skinned parts go through buildSkinnedDrawList (their own
+            //     stride-44 VB + GPU palette pipeline). They now share g_keySlot with the
+            //     static path (so they HAVE a slot here), so this static loop MUST exclude
+            //     every skinned entry — drawing a stride-44 skinned VB through the stride-24
+            //     static pipeline would garble it.
             // Terrain now draws (near worldLandscapeRoot patches; flat-shaded geometry).
             if (!e.d3dTexture) continue;
             if (!e.isLandscape && e.blendEnable) continue;
-            if (e.isSkinned && (e.skinnedUnsupported || e.numBones == 0)) continue;
+            if (e.isSkinned) continue;
 
             item.slot = ks->second;
             memcpy(item.world, e.worldTransformD3D, 16 * sizeof(float));
@@ -643,6 +661,57 @@ namespace {
             const std::size_t at = g_drawScratch.size();
             g_drawScratch.resize(at + sizeof(item));
             memcpy(g_drawScratch.data() + at, &item, sizeof(item));
+            ++count;
+        }
+        return count;
+    }
+
+    // M-Skinning: gather this frame's visible SKINNED parts into g_skinnedScratch as a
+    // sequence of [SkinnedDrawWire][palette]. Same visible-set source as buildDrawList
+    // (DistantLand::visibleCacheKeys); skinned keys are EXCLUDED from buildDrawList's static
+    // loop (it requires the per-draw world matrix; skinned has none), so the two lists are
+    // disjoint over the same set. There is no per-draw world transform — the bone palette
+    // (read fresh from the cache entry each frame, that IS the animation) is world-space.
+    // Returns the packed item count (0 if nothing skinned / skinned path unavailable).
+    std::uint32_t buildSkinnedDrawList() {
+        if (!g_skinnedVec) {
+            return 0;
+        }
+        const auto& keys = DistantLand::visibleCacheKeys();
+        const auto& cacheMap = MGE::GeometryCache::cache();
+
+        g_skinnedScratch.clear();
+        std::uint32_t count = 0;
+        for (std::uint32_t key : keys) {
+            auto ks = g_keySlot.find(key);
+            if (ks == g_keySlot.end()) {
+                continue;   // not an uploaded part (or not yet shipped)
+            }
+            auto ce = cacheMap.find(key);
+            if (ce == cacheMap.end()) {
+                continue;   // evicted since the visible-set build
+            }
+            const auto& e = ce->second;
+            // Only GPU-skinnable parts: a built skinned VB, bones within the palette cap,
+            // and a current bone palette of the expected size.
+            if (!e.isSkinned || e.skinnedUnsupported || e.numBones == 0) {
+                continue;
+            }
+            if (e.bonePalette.size() < (std::size_t)e.numBones * 16) {
+                continue;   // palette not yet built this frame
+            }
+
+            IPC::SkinnedDrawWire item;
+            item.slot     = ks->second;
+            item.numBones = e.numBones;
+            item.mirror   = e.mirrored ? 1u : 0u;
+
+            const std::size_t paletteBytes = (std::size_t)e.numBones * 64;  // numBones * 16 floats
+            const std::size_t at = g_skinnedScratch.size();
+            g_skinnedScratch.resize(at + sizeof(item) + paletteBytes);
+            std::uint8_t* dst = g_skinnedScratch.data() + at;
+            memcpy(dst, &item, sizeof(item));                  dst += sizeof(item);
+            memcpy(dst, e.bonePalette.data(), paletteBytes);
             ++count;
         }
         return count;
@@ -699,12 +768,27 @@ namespace RenderProcess {
         double hostMs = 0.0;
         bool ok = false;
         const std::uint32_t drawCount = buildDrawList();
-        if (g_drawVec && drawCount > 0
-            && g_drawVec->assign_bytes(g_drawScratch.data(), (std::uint32_t)g_drawScratch.size())) {
+        const std::uint32_t skinnedCount = buildSkinnedDrawList();
+
+        const bool haveDraw = g_drawVec && drawCount > 0
+            && g_drawVec->assign_bytes(g_drawScratch.data(), (std::uint32_t)g_drawScratch.size());
+
+        IPC::VecId   skinnedId = IPC::InvalidVector;
+        std::uint32_t skinnedBytes = 0;
+        if (g_skinnedVec && skinnedCount > 0
+            && g_skinnedVec->assign_bytes(g_skinnedScratch.data(), (std::uint32_t)g_skinnedScratch.size())) {
+            skinnedId    = g_skinnedVec->id();
+            skinnedBytes = (std::uint32_t)g_skinnedScratch.size();
+        }
+
+        if (haveDraw || skinnedId != IPC::InvalidVector) {
             D3DXMATRIX viewProj;
             D3DXMatrixMultiply(&viewProj, &DistantLand::mwView, &DistantLand::mwProj);
             ok = g_client->renderSceneBlocking(frame, (const float*)&viewProj,
-                     g_drawVec->id(), drawCount, (std::uint32_t)g_drawScratch.size(), &hostMs);
+                     haveDraw ? g_drawVec->id() : IPC::InvalidVector,
+                     haveDraw ? drawCount : 0,
+                     haveDraw ? (std::uint32_t)g_drawScratch.size() : 0,
+                     skinnedId, skinnedCount, skinnedBytes, &hostMs);
         } else {
             ok = g_client->renderFrameBlocking(frame, 0, &hostMs);
         }
@@ -781,14 +865,60 @@ namespace RenderProcess {
         g_uploadedRev[key] = revision;
     }
 
+    void captureSkinnedGeometry(std::uint32_t key, std::uint16_t revision,
+                                const IPC::SkinnedVertexWire* verts, std::uint32_t vertexCount,
+                                const std::uint16_t* indices, std::uint32_t indexCount,
+                                std::uint32_t numBones) {
+        if (!wantsGeometryCapture() || !verts || !indices || !vertexCount || !indexCount || numBones == 0) {
+            return;
+        }
+        // Skip if this exact (key,revision) was already shipped (shared with captureGeometry).
+        auto rev = g_uploadedRev.find(key);
+        if (rev != g_uploadedRev.end() && rev->second == revision) {
+            return;
+        }
+        // Stable host slot per cache key (shared slot map / nextSlot with the static path).
+        std::uint32_t slot;
+        auto ks = g_keySlot.find(key);
+        if (ks != g_keySlot.end()) {
+            slot = ks->second;
+        } else {
+            slot = g_nextSlot++;
+            g_keySlot.emplace(key, slot);
+        }
+
+        IPC::GeomPartWire hdr = {};
+        hdr.slot        = slot;
+        hdr.revisionID  = revision;
+        hdr.flags       = IPC::kGeomFlagSkinned;
+        hdr.vertexCount = vertexCount;
+        hdr.indexCount  = indexCount;
+        hdr.numBones    = static_cast<std::uint16_t>(numBones);
+
+        const std::size_t vbBytes = (std::size_t)vertexCount * sizeof(IPC::SkinnedVertexWire);
+        const std::size_t ibBytes = (std::size_t)indexCount * sizeof(std::uint16_t);
+        const std::size_t at = g_pendingBlob.size();
+        g_pendingBlob.resize(at + sizeof(hdr) + vbBytes + ibBytes);
+        std::uint8_t* dst = g_pendingBlob.data() + at;
+        memcpy(dst, &hdr, sizeof(hdr));            dst += sizeof(hdr);
+        memcpy(dst, verts, vbBytes);               dst += vbBytes;
+        memcpy(dst, indices, ibBytes);
+
+        ++g_pendingParts;
+        g_uploadedRev[key] = revision;
+    }
+
     void shutdown() {
         releaseAll();
         g_geomVec.reset();
         g_drawVec.reset();
+        g_skinnedVec.reset();
         g_pendingBlob.clear();
         g_pendingBlob.shrink_to_fit();
         g_drawScratch.clear();
         g_drawScratch.shrink_to_fit();
+        g_skinnedScratch.clear();
+        g_skinnedScratch.shrink_to_fit();
         g_pendingParts = 0;
         g_keySlot.clear();
         g_uploadedRev.clear();

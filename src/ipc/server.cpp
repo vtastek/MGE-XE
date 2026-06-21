@@ -501,25 +501,43 @@ namespace IPC {
 
 		LARGE_INTEGER t0; QueryPerformanceCounter(&t0);
 		bool ok;
-		if (params.drawList != InvalidVector) {
-			// M1c scene path: DrawItemWire[] in the drawList vec + inline camera.
-			auto& vec = getVec<IPC::GeomChunk>(params.drawList);
-			const std::uint32_t availBytes = vec.size() * static_cast<std::uint32_t>(sizeof(IPC::GeomChunk));
-			std::uint32_t bytes = params.drawBytes;
-			if (bytes == 0 || bytes > availBytes) {
-				bytes = availBytes;
+		if (params.drawList != InvalidVector || params.skinnedList != InvalidVector) {
+			// M1c/M-Skinning scene path: static DrawItemWire[] (drawList) and/or skinned
+			// [SkinnedDrawWire][palette]* (skinnedList) + inline camera. Either may be Invalid.
+			const void* drawPtr = nullptr;
+			std::uint32_t bytes = 0;
+			if (params.drawList != InvalidVector) {
+				auto& vec = getVec<IPC::GeomChunk>(params.drawList);
+				const std::uint32_t availBytes = vec.size() * static_cast<std::uint32_t>(sizeof(IPC::GeomChunk));
+				bytes = params.drawBytes;
+				if (bytes == 0 || bytes > availBytes) {
+					bytes = availBytes;
+				}
+				drawPtr = vec.size() ? &vec[0] : nullptr;
+			}
+			const void* skinnedPtr = nullptr;
+			std::uint32_t skinnedBytes = 0;
+			if (params.skinnedList != InvalidVector) {
+				auto& svec = getVec<IPC::GeomChunk>(params.skinnedList);
+				const std::uint32_t savail = svec.size() * static_cast<std::uint32_t>(sizeof(IPC::GeomChunk));
+				skinnedBytes = params.skinnedBytes;
+				if (skinnedBytes == 0 || skinnedBytes > savail) {
+					skinnedBytes = savail;
+				}
+				skinnedPtr = svec.size() ? &svec[0] : nullptr;
 			}
 			static unsigned s_sceneLog = 0;
 			const bool logScene = (s_sceneLog++ % 60) == 0;
 			if (logScene) {
-				LOG::logline(">> [scene] renderScene ENTER frame=%u drawCount=%u bytes=%u",
-					params.frameIndex, params.drawCount, bytes);
+				LOG::logline(">> [scene] renderScene ENTER frame=%u drawCount=%u bytes=%u skinnedCount=%u skinnedBytes=%u",
+					params.frameIndex, params.drawCount, bytes, params.skinnedCount, skinnedBytes);
 				LOG::flush();
 			}
-			ok = ForgeRender::renderScene(params.viewProj, vec.size() ? &vec[0] : nullptr,
-				params.drawCount, bytes);
+			ok = ForgeRender::renderScene(params.viewProj, drawPtr, params.drawCount, bytes,
+				skinnedPtr, params.skinnedCount, skinnedBytes);
 			if (logScene) {
-				LOG::logline(">> [scene] renderScene DONE ok=%d drawn=%u", (int)ok, ForgeRender::lastDrawn());
+				LOG::logline(">> [scene] renderScene DONE ok=%d drawn=%u skinned=%u",
+					(int)ok, ForgeRender::lastDrawn(), ForgeRender::lastSkinnedDrawn());
 				LOG::flush();
 			}
 		} else {

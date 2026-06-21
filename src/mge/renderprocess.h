@@ -39,4 +39,14 @@ namespace RenderProcess {
     void captureGeometry(std::uint32_t key, std::uint16_t revision,
                          const IPC::GeomVertexWire* verts, std::uint32_t vertexCount,
                          const std::uint16_t* indices, std::uint32_t indexCount);
+
+    // M-Skinning: capture a skinned part's bind-pose VB (model-space pos/normal +
+    // per-vertex weights + packed bone indices). Like captureGeometry it assigns/reuses a
+    // dense host slot (shared g_keySlot) and packs the part into the geometry blob with the
+    // SKINNED flag + numBones; re-uploads only on revision change. The per-frame bone
+    // palette is shipped separately (built in onPresent from the cache entry).
+    void captureSkinnedGeometry(std::uint32_t key, std::uint16_t revision,
+                                const IPC::SkinnedVertexWire* verts, std::uint32_t vertexCount,
+                                const std::uint16_t* indices, std::uint32_t indexCount,
+                                std::uint32_t numBones);
 }

@@ -396,6 +396,9 @@ namespace IPC {
 		params.drawList = InvalidVector;   // triangle path (no scene data)
 		params.drawCount = 0;
 		params.drawBytes = 0;
+		params.skinnedList = InvalidVector;
+		params.skinnedCount = 0;
+		params.skinnedBytes = 0;
 		params.bytesWritten = 0;
 		params.renderMs = 0.0;
 		if (!beginRpc(Command::RenderFrame)) {
@@ -413,7 +416,9 @@ namespace IPC {
 	}
 
 	bool Client::renderSceneBlocking(std::uint32_t frameIndex, const float* viewProj,
-		VecId drawList, std::uint32_t drawCount, std::uint32_t drawBytes, double* outRenderMs) {
+		VecId drawList, std::uint32_t drawCount, std::uint32_t drawBytes,
+		VecId skinnedList, std::uint32_t skinnedCount, std::uint32_t skinnedBytes,
+		double* outRenderMs) {
 		WAIT_FOR_PREVIOUS_COMMAND;
 
 		auto& params = m_ipcParameters->params.renderFrameParams;
@@ -423,6 +428,9 @@ namespace IPC {
 		params.drawList = drawList;
 		params.drawCount = drawCount;
 		params.drawBytes = drawBytes;
+		params.skinnedList = skinnedList;
+		params.skinnedCount = skinnedCount;
+		params.skinnedBytes = skinnedBytes;
 		params.bytesWritten = 0;
 		params.renderMs = 0.0;
 		if (!beginRpc(Command::RenderFrame)) {

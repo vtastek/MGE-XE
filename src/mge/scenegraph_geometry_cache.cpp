@@ -361,6 +361,7 @@ namespace MGE::GeometryCache {
             const auto* mv = data->vertex;
             if (!vertexCount || !triCount || !mv) { releaseEntry(e); return; }
 
+            const uint32_t key      = reinterpret_cast<uint32_t>(geom);
             const uint32_t numBones = sd->numBones;
 
             releaseEntry(e);
@@ -406,6 +407,14 @@ namespace MGE::GeometryCache {
                 0, g_spikeForceDefaultPool ? D3DPOOL_DEFAULT : D3DPOOL_MANAGED, &e.vb[0], nullptr);
             if (FAILED(hr)) { e.vb[0] = nullptr; return; }
 
+            // M-Skinning: also capture a model-space SkinnedVertexWire stream for the
+            // Forge host (GPU palette skinning). Filled from the same inverted influences
+            // we write into the D3D9 VB below; shipped once per (key,revision), re-uploaded
+            // on revision change. Flat fidelity (no UV/colour) — texturing is the next milestone.
+            const bool wantCapture = RenderProcess::wantsGeometryCapture();
+            static std::vector<IPC::SkinnedVertexWire> skScratch;  // single-threaded cache walk
+            if (wantCapture) skScratch.resize(vertexCount);
+
             void* vbData = nullptr;
             if (SUCCEEDED(e.vb[0]->Lock(0, 0, &vbData, 0))) {
                 auto* verts = static_cast<SkinnedVertex*>(vbData);
@@ -438,6 +447,15 @@ namespace MGE::GeometryCache {
                     verts[i].v = uvs ? uvs[i].y : 0.0f;
                     // PackedColor byte order (b,g,r,a) is exactly D3DCOLOR, copy straight.
                     verts[i].color = vcol ? *reinterpret_cast<const DWORD*>(&vcol[i]) : 0xFFFFFFFF;
+                    // Mirror the same pos/normal/weights/indices into the host wire stream.
+                    if (wantCapture) {
+                        auto& sw = skScratch[i];
+                        sw.px = verts[i].x;  sw.py = verts[i].y;  sw.pz = verts[i].z;
+                        sw.nx = verts[i].nx; sw.ny = verts[i].ny; sw.nz = verts[i].nz;
+                        sw.w0 = verts[i].w0; sw.w1 = verts[i].w1;
+                        sw.w2 = verts[i].w2; sw.w3 = verts[i].w3;
+                        sw.indices = verts[i].indices;
+                    }
                 }
                 e.vb[0]->Unlock();
             }
@@ -461,6 +479,17 @@ namespace MGE::GeometryCache {
             e.boundsCenter[1] = b.center.y;
             e.boundsCenter[2] = b.center.z;
             e.boundsRadius    = b.radius;
+
+            // Ship the captured skinned VB to the Forge host (one part, SKINNED flag +
+            // numBones). The per-frame bone palette ships separately from buildDrawList.
+            if (wantCapture) {
+                const auto* triList = data->getTriList();
+                if (triList) {
+                    RenderProcess::captureSkinnedGeometry(key, data->revisionID,
+                        skScratch.data(), vertexCount,
+                        reinterpret_cast<const uint16_t*>(triList), triCount * 3u, numBones);
+                }
+            }
 
             ++g_uploadedThisFrame;
         }

@@ -269,6 +269,13 @@ namespace IPC {
         IN std::uint32_t drawCount;
         IN std::uint32_t drawBytes;
 
+        // M-Skinning: parallel per-frame skinned draw list. skinnedList is a chunked byte
+        // vec of [SkinnedDrawWire][palette]* (geomwire.h); Invalid ⇒ no skinned draws. The
+        // scene path runs when EITHER drawList OR skinnedList is valid.
+        IN VecId skinnedList;
+        IN std::uint32_t skinnedCount;
+        IN std::uint32_t skinnedBytes;
+
         OUT std::uint32_t bytesWritten;
         OUT double renderMs;             // host-side render+readback time
     };

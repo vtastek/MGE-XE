@@ -404,15 +404,44 @@ namespace ForgeRender {
         unsigned built = uploadGeometry(blob, (unsigned)sizeof(blob), 1);
         std::printf("[forge] scene-probe: built %u/1\n", built);
 
-        // Identity viewProj + identity world, one draw item at slot 0.
+        // Pack a dummy SKINNED part into a second blob (slot 1): 3 verts fully weighted to
+        // bone 0, 1 bone. Exercises the skinned VB upload + skinned pipeline + draw.
+        IPC::SkinnedVertexWire skVerts[3] = {
+            {   0.0f,   0.0f, 0.0f,  0,0,1,  1,0,0,0,  0 },
+            { 100.0f,   0.0f, 0.0f,  0,0,1,  1,0,0,0,  0 },
+            {   0.0f, 100.0f, 0.0f,  0,0,1,  1,0,0,0,  0 },
+        };
+        uint16_t skIdx[3] = { 0, 1, 2 };
+        uint8_t skBlob[sizeof(IPC::GeomPartWire) + sizeof(skVerts) + sizeof(skIdx)];
+        IPC::GeomPartWire skHdr = {};
+        skHdr.slot = 1; skHdr.revisionID = 0; skHdr.flags = IPC::kGeomFlagSkinned;
+        skHdr.vertexCount = 3; skHdr.indexCount = 3; skHdr.numBones = 1;
+        std::memcpy(skBlob, &skHdr, sizeof(skHdr));
+        std::memcpy(skBlob + sizeof(skHdr), skVerts, sizeof(skVerts));
+        std::memcpy(skBlob + sizeof(skHdr) + sizeof(skVerts), skIdx, sizeof(skIdx));
+        std::printf("[forge] scene-probe: uploadGeometry (skinned)...\n");
+        unsigned skBuilt = uploadGeometry(skBlob, (unsigned)sizeof(skBlob), 1);
+        std::printf("[forge] scene-probe: skinned built %u/1\n", skBuilt);
+
+        // Identity viewProj + identity world, one static draw item at slot 0.
         float vp[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
         IPC::DrawItemWire item = {};
         item.slot = 0;
         float ident[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
         std::memcpy(item.world, ident, sizeof(ident));
+
+        // Skinned draw blob: [SkinnedDrawWire][1 identity bone matrix].
+        IPC::SkinnedDrawWire skItem = {};
+        skItem.slot = 1; skItem.numBones = 1; skItem.mirror = 0;
+        uint8_t skDraw[sizeof(IPC::SkinnedDrawWire) + 64];
+        std::memcpy(skDraw, &skItem, sizeof(skItem));
+        std::memcpy(skDraw + sizeof(skItem), ident, sizeof(ident));   // 16 floats = 64 bytes
+
         std::printf("[forge] scene-probe: renderScene...\n");
-        bool ok = renderScene(vp, &item, 1, (unsigned)sizeof(item));
-        std::printf("[forge] scene-probe: renderScene returned %d\n", (int)ok);
+        bool ok = renderScene(vp, &item, 1, (unsigned)sizeof(item),
+                              skDraw, 1, (unsigned)sizeof(skDraw));
+        std::printf("[forge] scene-probe: renderScene returned %d (skinnedDrawn=%u)\n",
+                    (int)ok, lastSkinnedDrawn());
 
         shutdown();
         std::printf("[forge] scene-probe complete — %s\n", ok ? "OK" : "FAILED");
@@ -622,8 +651,18 @@ namespace {
         DescriptorSet* pPerBatchSet = nullptr;    // gBatch cbuffer window, kMaxBatches instances
         Buffer*        pFrameCbv = nullptr;        // gFrameData cbuffer (viewProj), persistent-mapped
         Buffer*        pWorldsBuf[16] = {};        // gBatch windows: one 64KB cbuffer PER batch, persistent-mapped
-        Buffer*        pInstanceBuf = nullptr;     // [0..kBatchSize-1] uint, instance-rate VB (DrawIndex), reused per batch
+        Buffer*        pInstanceBuf = nullptr;     // [0..kBatchSize-1] uint, instance-rate VB (DrawIndex/Base), reused per batch
         uint32_t       maxDraws = 0;
+
+        // --- M-Skinning: GPU palette skinning path -----------------------------------
+        // Reuses the SAME SrtData/default.rootsig as the static path: gBatch.worlds[1024]
+        // is read as a 64KB BONE window (32 parts * 32 bones). Only a new skinned vertex
+        // shader + layout + a parallel set of bone cbuffers + a skinned PerBatch set.
+        Shader*        pSkinnedShader = nullptr;
+        Pipeline*      pSkinnedPipeline = nullptr;       // FRONT_FACE_CCW (non-mirrored)
+        Pipeline*      pSkinnedPipelineMirror = nullptr; // FRONT_FACE_CW (mirrored, neg-determinant bones)
+        Buffer*        pBonesBuf[16] = {};               // bone windows: one 64KB cbuffer per window, persistent-mapped
+        DescriptorSet* pPerBatchSetSkin = nullptr;       // gBatch bound to pBonesBuf[], kMaxBatches instances
     };
     LiveRenderer g_live;
 
@@ -639,6 +678,14 @@ namespace {
     constexpr uint32_t kBatchBytes = kBatchSize * 64;      // 65536 = exactly the D3D12 CBV max
     constexpr uint32_t kMaxBatches = 8;                    // 8 * 1024 = 8192 draws/frame
     constexpr uint32_t kMaxDraws   = kBatchSize * kMaxBatches;
+
+    // M-Skinning palette packing: a FIXED 32-matrix stride per skinned part (kMaxBonesPerPart,
+    // matches the cache's kMaxBones). One 64KB bone window (float4x4[1024]) holds 1024/32 = 32
+    // parts; reusing the kMaxBatches windows → 256 skinned parts/frame. base = (p%32)*32 ∈
+    // {0,32,...,992} < 1024, so the identity instance buffer gives instanceBuf[base]==base.
+    constexpr uint32_t kMaxBonesPerPart = 32;
+    constexpr uint32_t kSkinnedPerWindow = kBatchSize / kMaxBonesPerPart;   // 32
+    constexpr uint32_t kMaxSkinned = kSkinnedPerWindow * kMaxBatches;       // 256
 
     // Build the M1c opaque scene path: depth target, opaque shader + pipeline (pos+normal
     // per-vertex + per-instance DrawIndex layout, depth test/write), the viewProj CBV +
@@ -838,8 +885,127 @@ namespace {
             updateDescriptorSet(R, b, g_live.pPerBatchSet, 1, &p);
         }
 
-        std::printf("[forge] opaque scene path ready (depth %ux%u, maxDraws=%u, batched %ux%u)\n",
-                    width, height, kMaxDraws, kMaxBatches, kBatchSize);
+        // --- M-Skinning: skinned shader + pipelines + bone cbuffers + descriptor set ---
+        // Shares the global default.rootsig (same SrtData) and opaque.frag; only the vertex
+        // shader + layout differ. gBatch is bound to the bone windows (pBonesBuf) via a
+        // separate PerBatch descriptor set (pPerBatchSetSkin).
+        {
+            ShaderLoadDesc skDesc = {};
+            skDesc.mVert.pFileName = "skinned.vert";
+            skDesc.mFrag.pFileName = "opaque.frag";   // reuse flat N.L shading
+            addShader(R, &skDesc, &g_live.pSkinnedShader);
+            if (!g_live.pSkinnedShader) {
+                std::printf("[forge] addShader(skinned) FAILED\n");
+                return false;
+            }
+
+            // Skinned vertex layout: binding 0 = mesh (IPC::SkinnedVertexWire, stride 44:
+            // pos@0, normal@12, weights@24 float4, indices@40 UBYTE4→R8G8B8A8_UINT);
+            // binding 1 = per-INSTANCE Base (uint, the palette offset in the bound window),
+            // fed by the shared identity instance buffer + firstInstance.
+            VertexLayout svl = {};
+            svl.mBindingCount = 2;
+            svl.mBindings[0].mStride = sizeof(IPC::SkinnedVertexWire);
+            svl.mBindings[0].mRate = VERTEX_BINDING_RATE_VERTEX;
+            svl.mBindings[1].mStride = sizeof(uint32_t);
+            svl.mBindings[1].mRate = VERTEX_BINDING_RATE_INSTANCE;
+            svl.mAttribCount = 5;
+            svl.mAttribs[0].mSemantic = SEMANTIC_POSITION;
+            svl.mAttribs[0].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
+            svl.mAttribs[0].mBinding = 0;
+            svl.mAttribs[0].mLocation = 0;
+            svl.mAttribs[0].mOffset = 0;
+            svl.mAttribs[1].mSemantic = SEMANTIC_NORMAL;
+            svl.mAttribs[1].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
+            svl.mAttribs[1].mBinding = 0;
+            svl.mAttribs[1].mLocation = 1;
+            svl.mAttribs[1].mOffset = 12;
+            svl.mAttribs[2].mSemantic = SEMANTIC_TEXCOORD0;       // Weights (float4)
+            svl.mAttribs[2].mFormat = TinyImageFormat_R32G32B32A32_SFLOAT;
+            svl.mAttribs[2].mBinding = 0;
+            svl.mAttribs[2].mLocation = 2;
+            svl.mAttribs[2].mOffset = 24;
+            svl.mAttribs[3].mSemantic = SEMANTIC_TEXCOORD1;       // BoneIdx (UBYTE4 → uint4)
+            svl.mAttribs[3].mFormat = TinyImageFormat_R8G8B8A8_UINT;
+            svl.mAttribs[3].mBinding = 0;
+            svl.mAttribs[3].mLocation = 3;
+            svl.mAttribs[3].mOffset = 40;
+            svl.mAttribs[4].mSemantic = SEMANTIC_TEXCOORD2;       // Base (per-instance uint)
+            svl.mAttribs[4].mFormat = TinyImageFormat_R32_UINT;
+            svl.mAttribs[4].mBinding = 1;
+            svl.mAttribs[4].mLocation = 4;
+            svl.mAttribs[4].mOffset = 0;
+
+            DepthStateDesc skDepth = {};
+            skDepth.mDepthTest = true;
+            skDepth.mDepthWrite = true;
+            skDepth.mDepthFunc = CMP_GEQUAL;   // REVERSE-Z (same as static)
+
+            RasterizerStateDesc skRaster = {};
+            skRaster.mCullMode = CULL_MODE_BACK;
+            skRaster.mFrontFace = FRONT_FACE_CCW;
+
+            PipelineDesc skPd = {};
+            skPd.mType = PIPELINE_TYPE_GRAPHICS;
+            GraphicsPipelineDesc& sg = skPd.mGraphicsDesc;
+            sg.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+            sg.mRenderTargetCount = 1;
+            sg.pColorFormats = &g_live.pRT->mFormat;
+            sg.mSampleCount = SAMPLE_COUNT_1;
+            sg.mSampleQuality = 0;
+            sg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+            sg.pDepthState = &skDepth;
+            sg.pVertexLayout = &svl;
+            sg.pRasterizerState = &skRaster;
+            sg.pShaderProgram = g_live.pSkinnedShader;
+            addPipeline(R, &skPd, &g_live.pSkinnedPipeline);
+            if (!g_live.pSkinnedPipeline) {
+                std::printf("[forge] addPipeline(skinned) FAILED\n");
+                return false;
+            }
+            // Mirror variant (CW) for negative-determinant (mirrored left-side) parts.
+            RasterizerStateDesc skRasterMirror = skRaster;
+            skRasterMirror.mFrontFace = FRONT_FACE_CW;
+            sg.pRasterizerState = &skRasterMirror;
+            addPipeline(R, &skPd, &g_live.pSkinnedPipelineMirror);
+            if (!g_live.pSkinnedPipelineMirror) {
+                std::printf("[forge] addPipeline(skinned mirror) FAILED\n");
+                return false;
+            }
+
+            // Bone windows: ONE exactly-64KB cbuffer per window (same CBV rule as worlds).
+            for (uint32_t b = 0; b < kMaxBatches; ++b) {
+                BufferLoadDesc bb = {};
+                bb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                bb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+                bb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                bb.mDesc.mSize = kBatchBytes;
+                bb.mDesc.pName = "boneWindowCbv";
+                bb.pData = nullptr;
+                bb.ppBuffer = &g_live.pBonesBuf[b];
+                addResource(&bb, nullptr);
+            }
+            waitForAllResourceLoads();
+            if (!g_live.pBonesBuf[0]) {
+                return false;
+            }
+
+            // Skinned PerBatch set: instance b binds bone window b (pBonesBuf[b]) as gBatch.
+            DescriptorSetDesc sbDesc = SRT_SET_DESC(SrtData, PerBatch, kMaxBatches, 0);
+            addDescriptorSet(R, &sbDesc, &g_live.pPerBatchSetSkin);
+            if (!g_live.pPerBatchSetSkin) {
+                return false;
+            }
+            for (uint32_t b = 0; b < kMaxBatches; ++b) {
+                DescriptorData p = {};
+                p.mIndex = SRT_RES_IDX(SrtData, PerBatch, gBatch);
+                p.ppBuffers = &g_live.pBonesBuf[b];
+                updateDescriptorSet(R, b, g_live.pPerBatchSetSkin, 1, &p);
+            }
+        }
+
+        std::printf("[forge] opaque scene path ready (depth %ux%u, maxDraws=%u, batched %ux%u, maxSkinned=%u)\n",
+                    width, height, kMaxDraws, kMaxBatches, kBatchSize, kMaxSkinned);
         return true;
     }
 
@@ -853,11 +1019,13 @@ namespace {
         uint32_t vertexCount;
         uint32_t indexCount;
         bool     valid;
+        bool     skinned;       // M-Skinning: VB is SkinnedVertexWire (stride 44)
     };
     HostMesh* g_meshes   = nullptr;
     uint32_t  g_meshCap  = 0;   // allocated slot count
     uint32_t  g_meshHigh = 0;   // highest slot+1 ever populated
-    unsigned  g_lastDrawn = 0;  // parts actually drawn in the last renderScene
+    unsigned  g_lastDrawn = 0;  // static parts actually drawn in the last renderScene
+    unsigned  g_lastSkinnedDrawn = 0;  // skinned parts actually drawn in the last renderScene
 
     bool ensureMeshSlot(uint32_t slot) {
         if (slot < g_meshCap) {
@@ -1063,7 +1231,8 @@ namespace ForgeRender {
     }
 
     bool renderScene(const float* viewProj, const void* drawBlob,
-                     unsigned drawCount, unsigned drawBytes) {
+                     unsigned drawCount, unsigned drawBytes,
+                     const void* skinnedBlob, unsigned skinnedCount, unsigned skinnedBytes) {
         if (!g_live.pRenderer) {
             return false;
         }
@@ -1183,6 +1352,85 @@ namespace ForgeRender {
             ++drawn;
         }
 
+        // --- M-Skinning: skinned draw loop (GPU palette skinning) --------------------
+        // The blob is [SkinnedDrawWire][palette]* (palette = numBones * 64 bytes, each a
+        // model->world matrix). Each drawn part p packs its palette into bone window p/32
+        // at base = (p%32)*32, then draws with firstInstance=base so the per-instance Base
+        // attribute selects gBatch.worlds[base + BoneIdx]. Capped at kMaxSkinned (256).
+        uint32_t skinnedDrawn = 0;
+        if (skinnedBlob && skinnedCount && skinnedBytes &&
+            g_live.pSkinnedPipeline && g_live.pSkinnedPipelineMirror) {
+            // Bind the skinned pipeline FIRST (establishes the shared root signature), then
+            // (re)bind PerFrame. Both opaque + skinned pipelines share default.rootsig, so
+            // the descriptor sets persist across the switch.
+            cmdBindPipeline(g_live.pCmd, g_live.pSkinnedPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+
+            const uint8_t* sp  = (const uint8_t*)skinnedBlob;
+            const uint8_t* sEnd = sp + skinnedBytes;
+            uint32_t boundWindow = UINT32_MAX;
+            int      boundSkinMirror = 0;   // matches the initial pSkinnedPipeline (0 = CCW)
+            bool     dropLogged = false;
+            for (uint32_t k = 0; k < skinnedCount; ++k) {
+                if (sp + sizeof(IPC::SkinnedDrawWire) > sEnd) {
+                    break;
+                }
+                IPC::SkinnedDrawWire item;
+                std::memcpy(&item, sp, sizeof(item));
+                const uint8_t* palette = sp + sizeof(item);
+                const uint32_t bones = (item.numBones < kMaxBonesPerPart)
+                                     ? item.numBones : kMaxBonesPerPart;
+                const uint64_t paletteBytes = (uint64_t)item.numBones * 64;
+                if (palette + paletteBytes > sEnd) {
+                    break;   // truncated palette
+                }
+                sp = palette + paletteBytes;   // advance regardless of whether we draw
+
+                if (skinnedDrawn >= kMaxSkinned) {
+                    if (!dropLogged) {
+                        LOGF(eWARNING, "[forge] skinned over cap %u — dropping extra parts (count=%u)",
+                             kMaxSkinned, skinnedCount);
+                        std::printf("[forge] skinned over cap %u — dropping extra parts (count=%u)\n",
+                                    kMaxSkinned, skinnedCount);
+                        dropLogged = true;
+                    }
+                    continue;
+                }
+                const uint32_t slot = item.slot;
+                if (slot >= g_meshHigh || !g_meshes[slot].valid || !g_meshes[slot].skinned) {
+                    continue;   // mesh not uploaded yet / not a skinned mesh
+                }
+
+                const uint32_t window = skinnedDrawn / kSkinnedPerWindow;
+                const uint32_t base   = (skinnedDrawn % kSkinnedPerWindow) * kMaxBonesPerPart;
+                // Copy this part's palette into bone window `window` at matrix offset base.
+                uint8_t* dst = (uint8_t*)g_live.pBonesBuf[window]->pCpuMappedAddress;
+                std::memcpy(dst + (size_t)base * 64, palette, (size_t)bones * 64);
+
+                // Mirror pipeline by the wire flag (negative-determinant left-side parts).
+                const int mirror = item.mirror ? 1 : 0;
+                if (mirror != boundSkinMirror) {
+                    cmdBindPipeline(g_live.pCmd, mirror ? g_live.pSkinnedPipelineMirror
+                                                        : g_live.pSkinnedPipeline);
+                    boundSkinMirror = mirror;
+                    boundWindow = UINT32_MAX;   // rebind PerBatch after a PSO change (defensive)
+                }
+                if (window != boundWindow) {
+                    cmdBindDescriptorSet(g_live.pCmd, window, g_live.pPerBatchSetSkin);
+                    boundWindow = window;
+                }
+
+                HostMesh& sm = g_meshes[slot];
+                Buffer*  vbs[2]     = { sm.vb, g_live.pInstanceBuf };
+                uint32_t strides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)sizeof(uint32_t) };
+                cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                cmdBindIndexBuffer(g_live.pCmd, sm.ib, INDEX_TYPE_UINT16, 0);
+                // firstInstance = base → Base attribute reads instanceBuf[base] = base.
+                cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, base);
+                ++skinnedDrawn;
+            }
+        }
+
         cmdBindRenderTargets(g_live.pCmd, nullptr);
 
         // Hand the shared RT back to COMMON for MW's D3D9Ex StretchRect.
@@ -1205,10 +1453,12 @@ namespace ForgeRender {
 
         g_live.firstFrame = false;
         g_lastDrawn = drawn;
+        g_lastSkinnedDrawn = skinnedDrawn;
         return true;
     }
 
     unsigned lastDrawn() { return g_lastDrawn; }
+    unsigned lastSkinnedDrawn() { return g_lastSkinnedDrawn; }
 
     unsigned uploadGeometry(const void* blobBytes, unsigned byteCount, unsigned partCount) {
         if (!g_live.pRenderer || !blobBytes || !byteCount || !partCount) {
@@ -1226,7 +1476,10 @@ namespace ForgeRender {
             std::memcpy(&hdr, p, sizeof(hdr));
             p += sizeof(hdr);
 
-            const uint64_t vbBytes = (uint64_t)hdr.vertexCount * sizeof(IPC::GeomVertexWire);
+            const bool isSkinned = (hdr.flags & IPC::kGeomFlagSkinned) != 0;
+            const uint64_t vStride = isSkinned ? sizeof(IPC::SkinnedVertexWire)
+                                               : sizeof(IPC::GeomVertexWire);
+            const uint64_t vbBytes = (uint64_t)hdr.vertexCount * vStride;
             const uint64_t ibBytes = (uint64_t)hdr.indexCount * sizeof(uint16_t);
             if (p + vbBytes + ibBytes > end) {
                 break;  // malformed / truncated blob
@@ -1247,6 +1500,7 @@ namespace ForgeRender {
                 m.vb = m.ib = nullptr;
                 m.valid = false;
             }
+            m.skinned = isSkinned;
 
             BufferLoadDesc vbDesc = {};
             vbDesc.mDesc.mDescriptors  = DESCRIPTOR_TYPE_VERTEX_BUFFER;
@@ -1307,6 +1561,14 @@ namespace ForgeRender {
         if (g_live.pOpaquePipeline) { removePipeline(R, g_live.pOpaquePipeline); }
         if (g_live.pOpaquePipelineMirror) { removePipeline(R, g_live.pOpaquePipelineMirror); }
         if (g_live.pOpaqueShader)   { removeShader(R, g_live.pOpaqueShader); }
+        // M-Skinning teardown.
+        if (g_live.pPerBatchSetSkin) { removeDescriptorSet(R, g_live.pPerBatchSetSkin); }
+        for (uint32_t b = 0; b < kMaxBatches; ++b) {
+            if (g_live.pBonesBuf[b]) { removeResource(g_live.pBonesBuf[b]); }
+        }
+        if (g_live.pSkinnedPipeline)       { removePipeline(R, g_live.pSkinnedPipeline); }
+        if (g_live.pSkinnedPipelineMirror) { removePipeline(R, g_live.pSkinnedPipelineMirror); }
+        if (g_live.pSkinnedShader)         { removeShader(R, g_live.pSkinnedShader); }
         if (g_live.pDepth)          { removeRenderTarget(R, g_live.pDepth); }
         if (g_live.pFence)    { exitFence(R, g_live.pFence); }
         if (g_live.pCmd)      { exitCmd(R, g_live.pCmd); }
