@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <unordered_map>
 #include <memory>
 
@@ -208,6 +209,84 @@ IDirect3DTexture9* loadTexture(IDirect3DDevice9* dev, const char* filename) {
     // Load file with original extension
     std::snprintf(pathbuf, sizeof(pathbuf), "textures\\%s", filename);
     return loadTextureExact(dev, pathbuf);
+}
+
+// readWholeFileMalloc - Read an open file fully into a malloc'd buffer (caller frees).
+static bool readWholeFileMalloc(HANDLE h, void** outData, unsigned* outSize) {
+    DWORD sz = GetFileSize(h, nullptr);
+    if (sz == INVALID_FILE_SIZE || sz == 0) {
+        return false;
+    }
+    void* buf = std::malloc(sz);
+    if (!buf) {
+        return false;
+    }
+    DWORD bytesRead = 0;
+    SetFilePointer(h, 0, nullptr, FILE_BEGIN);
+    if (!ReadFile(h, buf, sz, &bytesRead, nullptr) || bytesRead != sz) {
+        std::free(buf);
+        return false;
+    }
+    *outData = buf;
+    *outSize = sz;
+    return true;
+}
+
+// loadFileBytesExact - Resolve a path to raw bytes via the same source priority as
+// loadTextureExact (distantland\statics -> loose Data Files -> BSA). No D3D9 texture.
+static bool loadFileBytesExact(const char* filename, void** outData, unsigned* outSize) {
+    char pathbuf[MAX_PATH];
+
+    // Distant land folder
+    std::snprintf(pathbuf, sizeof(pathbuf), "Data Files\\distantland\\statics\\%s", filename);
+    HANDLE h = CreateFile(pathbuf, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, 0, 0);
+    if (h != INVALID_HANDLE_VALUE) {
+        bool ok = readWholeFileMalloc(h, outData, outSize);
+        CloseHandle(h);
+        if (ok) { return true; }
+    }
+
+    // Loose Data Files folder
+    std::snprintf(pathbuf, sizeof(pathbuf), "Data Files\\%s", filename);
+    h = CreateFile(pathbuf, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, 0, 0);
+    if (h != INVALID_HANDLE_VALUE) {
+        bool ok = readWholeFileMalloc(h, outData, outSize);
+        CloseHandle(h);
+        if (ok) { return true; }
+    }
+
+    // BSAs
+    BSAHash3 hash = hashString(filename);
+    EntryData ed = BSALoadFile(hash);
+    if (ed.valid()) {
+        void* buf = std::malloc(ed.size);
+        if (!buf) { return false; }
+        std::memcpy(buf, ed.data.get(), ed.size);
+        *outData = buf;
+        *outSize = ed.size;
+        return true;
+    }
+
+    return false;
+}
+
+// loadFileBytes - Public raw-bytes loader, mirrors loadTexture's prefix + .dds substitution.
+bool loadFileBytes(const char* filename, void** outData, unsigned* outSize) {
+    char pathbuf[MAX_PATH];
+
+    // Prefer the .dds extension first (matches loadTexture).
+    std::snprintf(pathbuf, sizeof(pathbuf), "textures\\%s", filename);
+    size_t len = strlen(pathbuf);
+    if (len >= 3) {
+        std::strcpy(pathbuf + len - 3, "dds");
+        if (loadFileBytesExact(pathbuf, outData, outSize)) {
+            return true;
+        }
+    }
+
+    // Original extension
+    std::snprintf(pathbuf, sizeof(pathbuf), "textures\\%s", filename);
+    return loadFileBytesExact(pathbuf, outData, outSize);
 }
 
 // clearTextureCache - Clear texture cache.

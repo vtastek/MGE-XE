@@ -267,7 +267,7 @@ namespace IPC {
 		* @return Whether the host renderer initialized successfully (blocking).
 		*/
 		bool renderInitBlocking(std::uint32_t width, std::uint32_t height, std::uint32_t sampleCount,
-			HANDLE sharedTexture0, HANDLE sharedTexture1, HANDLE* outFramebufferHandle);
+			std::uint32_t anisoLevel, HANDLE sharedTexture0, HANDLE sharedTexture1, HANDLE* outFramebufferHandle);
 
 		/**
 		* @brief Present-seam spike: render one frame into shared buffer targetIndex.
@@ -302,6 +302,7 @@ namespace IPC {
 		* @return True if the host built every part (blocking).
 		*/
 		bool geomUploadBlocking(VecId blob, std::uint32_t partCount, std::uint32_t byteCount, std::uint32_t* outUploaded = nullptr);
+		bool texUploadBlocking(VecId blob, std::uint32_t texCount, std::uint32_t byteCount, std::uint32_t* outUploaded = nullptr);
 
 		// True if an RPC has been issued and not yet awaited. Use this to avoid
 		// issuing a blocking RPC that would drain (steal) a pending async RPC's

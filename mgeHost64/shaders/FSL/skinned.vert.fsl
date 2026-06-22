@@ -25,8 +25,10 @@ STRUCT(VSInput)
 
 STRUCT(VSOutput)
 {
-    DATA(float4, Position, SV_Position);
-    DATA(float3, Normal,   NORMAL);
+    DATA(float4,      Position, SV_Position);
+    DATA(float3,      Normal,   NORMAL);
+    DATA(float2,      Uv,       TEXCOORD0);   // Phase 1: 0 (skinned UV lands in Phase 3); shared opaque.frag
+    DATA(FLAT(uint),  TexIndex, TEXCOORD1);   // Phase 2: 0 (skinned textures Phase 3) → default white
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -58,5 +60,7 @@ VSOutput VS_MAIN( VSInput In )
 
     Out.Position = mul(gFrameData.viewProj, worldPos);
     Out.Normal = worldNrm;
+    Out.Uv = float2(0.0f, 0.0f);
+    Out.TexIndex = 0u;
     RETURN(Out);
 }

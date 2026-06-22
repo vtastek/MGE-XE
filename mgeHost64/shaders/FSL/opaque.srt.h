@@ -15,6 +15,7 @@
 #pragma once
 
 #define OPAQUE_BATCH 1024   // matrices per 64KB cbuffer window; must match host kBatchSize
+#define MAX_TEXTURES 1024   // bindless gTextures[] array size; MUST match IPC::kMaxTextures (geomwire.h)
 
 STRUCT(FrameData)
 {
@@ -30,6 +31,20 @@ BEGIN_SRT_NO_AB(SrtData)
     BEGIN_SRT_SET(PerFrame)
         DECL_CBUFFER(PerFrame, CBUFFER(FrameData), gFrameData)
     END_SRT_SET(PerFrame)
+    // Bindless base-map textures only — NO dynamic sampler here. The frag samples with the FSL
+    // built-in STATIC sampler gSamplerAnisotropic (anisotropic 8x, WRAP, baked into the root sig).
+    //
+    // Why no dynamic sampler: FSL assigns each resource's reflected mOffset from a SINGLE running
+    // per-set counter, but textures (SRV heap) and samplers (sampler heap) live in SEPARATE D3D12
+    // descriptor tables. With a 1024-entry array declared first, gTextures gets mOffset 0 (correct,
+    // register t0) but a sampler declared after it gets mOffset 1024 — the host's bind then lands at
+    // sampler-table slot 1024 while the shader reads s0 (slot 0 = null sampler => POINT filter +
+    // non-REPEAT address => tiled UVs sample black). The two can't BOTH sit at offset 0 in one set,
+    // so the sampler is hoisted to a static sampler instead. (The mirror of the original
+    // sampler-before-array bug; see [[project_forge_bindless_textures]].)
+    BEGIN_SRT_SET(Persistent)
+        DECL_ARRAY_TEXTURES(Persistent, Tex2D(float4), gTextures, MAX_TEXTURES)
+    END_SRT_SET(Persistent)
     BEGIN_SRT_SET(PerBatch)
         DECL_CBUFFER(PerBatch, CBUFFER(BatchData), gBatch)
     END_SRT_SET(PerBatch)

@@ -44,7 +44,9 @@ namespace ForgeRender {
     // sampleCount is the requested MSAA level (1 = none). When >1 the scene renders
     // into an internal MSAA color+depth and resolves into the shared (single-sample)
     // RT before handoff; if the device can't support the count the host logs and uses 1.
-    bool init(unsigned width, unsigned height, unsigned sampleCount);
+    // anisoLevel is MGE's Configuration.AnisoLevel (0 = off/linear, else max anisotropy);
+    // it parameterises the texture sampler built in the Phase 2 texturing path.
+    bool init(unsigned width, unsigned height, unsigned sampleCount, unsigned anisoLevel);
 
     // The exported NT shared-RT handle — valid in the HOST process. Null until a
     // successful init(). The IPC server DuplicateHandles this into MW's process.
@@ -63,6 +65,12 @@ namespace ForgeRender {
     // the number of parts successfully built. Safe to call before/independently of
     // renderFrame (M1c will draw these). No-op if Forge isn't live.
     unsigned uploadGeometry(const void* blobBytes, unsigned byteCount, unsigned partCount);
+
+    // Phase 2 bindless texturing: parse [TexUploadWire][dds bytes]* and decode each DDS into
+    // gTextures[slot] (BCn/uncompressed + mip chain), rebinding that bindless descriptor.
+    // count entries, byteCount total. Returns the number built. No-op until the opaque path
+    // (PerFrame set) exists. The sampler is built from the AF level passed to init().
+    unsigned uploadTextures(const void* blob, unsigned byteCount, unsigned count);
 
     // Render one frame (clear + triangle) into the shared RT and leave it in a
     // state MW's D3D9Ex StretchRect can read (COMMON). Blocking: waits on the GPU
@@ -91,6 +99,10 @@ namespace ForgeRender {
     // Standalone scene-path exercise (init → uploadGeometry → renderScene with a dummy
     // mesh) so host-side printf/asserts are visible in a terminal. Run via --forge-scene.
     bool sceneProbe();
+
+    // Debug: read back the live shared RT centre pixel and printf it (BGRA). Used by the
+    // --forge-scene probe to ground-truth the fragment output offline.
+    void debugReadbackCenterPixel();
 
     // Tear down the persistent renderer (shared RT, pipeline, Forge stack).
     void shutdown();

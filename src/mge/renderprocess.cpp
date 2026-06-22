@@ -6,11 +6,15 @@
 #include "dxvk_interop.h"
 #include "distantland.h"
 #include "scenegraph_geometry_cache.h"
+#include "morrowindbsa.h"
 
 #include <windows.h>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
+#include <cctype>
 #include <optional>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -43,10 +47,25 @@ namespace {
     std::vector<std::uint8_t>                 g_pendingBlob;        // packed parts awaiting flush
     std::uint32_t                             g_pendingParts = 0;
     std::unordered_map<std::uint32_t, std::uint32_t> g_keySlot;    // cache key -> host slot
-    std::unordered_map<std::uint32_t, std::uint16_t> g_uploadedRev;// cache key -> last sent revision
+    // Last-shipped identity per cache key. Dedup is on (modelId, vc, rev), NOT rev alone:
+    // the key is a recycled NiTriShape*, so a new object can inherit a freed key+slot; the
+    // GeometryData ptr (modelId) + vertexCount disambiguate it (see captureGeometry).
+    struct UploadSig { std::uint32_t id; std::uint32_t vc; std::uint16_t rev; };
+    std::unordered_map<std::uint32_t, UploadSig> g_uploadedRev;    // cache key -> last sent identity
     std::uint32_t                             g_nextSlot = 0;
     std::vector<std::uint8_t>                 g_drawScratch;        // packed DrawItemWire[] this frame
     std::vector<std::uint8_t>                 g_skinnedScratch;     // packed [SkinnedDrawWire][palette]* this frame
+
+    // --- Phase 2 bindless texture residency (client) ---
+    // Each unique texture (by normalized name) gets a dense bindless slot; its raw DDS bytes
+    // are loaded once via BSA::loadFileBytes and shipped to the host (which decodes into
+    // gTextures[slot]). Misses/oversize map to slot 0 (host default white) and are cached so
+    // we don't retry. Rides the geometry channel's chunked vec (g_texVec).
+    std::optional<IPC::VecView<IPC::GeomChunk>> g_texVec;           // persistent texture upload vec
+    std::unordered_map<std::string, std::uint32_t> g_texSlot;       // normalized name -> bindless slot
+    std::uint32_t                             g_nextTexSlot = 1;    // 0 = host default white
+    std::vector<std::uint8_t>                 g_texPendingBlob;     // [TexUploadWire][dds]* awaiting flush
+    std::uint32_t                             g_texPendingCount = 0;
 
     // Per-frame draw list rides a 4-chunk (4MB) vec: ~61K DrawItemWire, well over the
     // host's kMaxDraws cap. Geometry vec stays 8 chunks (8MB).
@@ -54,6 +73,8 @@ namespace {
 
     void initSceneVecs();   // defined below; called from lazyInit
     void flushGeometry();
+    void flushTextures();
+    std::uint32_t resolveTextureSlot(const char* textureName);
 
     // --- DXVK Vulkan-interop seam ---
     // MW's MAIN device is DXVK (Vulkan-backed). DXVK exposes ID3D9VkInteropDevice, which
@@ -390,7 +411,9 @@ namespace {
         HANDLE hostHandle = nullptr;
         // MSAA: Configuration.AALevel is the D3DMULTISAMPLE value (0/2/4/8); map 0 -> 1 sample.
         const std::uint32_t sampleCount = Configuration.AALevel > 0 ? (std::uint32_t)Configuration.AALevel : 1u;
-        if (!g_client->renderInitBlocking(g_w, g_h, sampleCount, nullptr, nullptr, &hostHandle) || hostHandle == nullptr) {
+        // AF: Configuration.AnisoLevel (0 = off, else max anisotropy) — host sampler (Phase 2).
+        const std::uint32_t anisoLevel = (std::uint32_t)Configuration.AnisoLevel;
+        if (!g_client->renderInitBlocking(g_w, g_h, sampleCount, anisoLevel, nullptr, nullptr, &hostHandle) || hostHandle == nullptr) {
             LOG::logline("!! [seam] renderInit RPC failed or no shared handle; seam disabled");
             releaseAll();
             return;
@@ -520,8 +543,124 @@ namespace {
         } else {
             g_skinnedVec.emplace(std::move(*sv));
         }
-        LOG::logline(">> [seam] scene vecs ready (geom %u chunks, draw %u chunks, skinned %u chunks)",
-                     IPC::kGeomChunks, kDrawChunks, kDrawChunks);
+
+        // Texture upload vec: kTexChunks (32MB window) — larger than geometry because a single DDS
+        // must fit one window (oversize textures are dropped to white in resolveTextureSlot).
+        auto tv = g_client->allocVecBlocking<IPC::GeomChunk>(
+            IPC::kTexChunks, IPC::kTexChunks, IPC::kTexChunks);
+        if (!tv) {
+            LOG::logline("!! [seam] texture upload vec alloc failed — textures disabled (white)");
+        } else {
+            g_texVec.emplace(std::move(*tv));
+        }
+        LOG::logline(">> [seam] scene vecs ready (geom %u, draw %u, skinned %u, tex %u chunks)",
+                     IPC::kGeomChunks, kDrawChunks, kDrawChunks, IPC::kTexChunks);
+    }
+
+    // Normalize an NI SourceTexture::fileName to the bare name BSA::loadFileBytes expects
+    // (it re-adds "textures\"). Lower-cased (BSA hashing + case-insensitive loose lookup),
+    // backslash-separated, with any leading "data files\" then "textures\" stripped.
+    static std::string normalizeTextureName(const char* fileName) {
+        if (!fileName) {
+            return std::string();
+        }
+        std::string s(fileName);
+        for (auto& c : s) {
+            c = (char)std::tolower((unsigned char)c);
+            if (c == '/') { c = '\\'; }
+        }
+        if (s.size() >= 11 && s.compare(0, 11, "data files\\") == 0) { s.erase(0, 11); }
+        if (s.size() >= 9  && s.compare(0, 9,  "textures\\")  == 0) { s.erase(0, 9); }
+        return s;
+    }
+
+    // Map a texture name to its bindless slot, loading + queueing its DDS on first sight.
+    // Misses / oversize / residency-full → slot 0 (host default white), cached so we don't retry.
+    std::uint32_t resolveTextureSlot(const char* textureName) {
+        if (!textureName || !*textureName || !g_texVec) {
+            return 0;
+        }
+        std::string name = normalizeTextureName(textureName);
+        if (name.empty()) {
+            return 0;
+        }
+        auto it = g_texSlot.find(name);
+        if (it != g_texSlot.end()) {
+            return it->second;   // already resolved (slot or cached-miss 0)
+        }
+        if (g_nextTexSlot >= IPC::kMaxTextures) {
+            static bool logged = false;
+            if (!logged) { LOG::logline("!! [tex] residency full (%u slots) — extra textures = white", IPC::kMaxTextures); logged = true; }
+            g_texSlot.emplace(name, 0);
+            return 0;
+        }
+
+        void* data = nullptr;
+        unsigned size = 0;
+        if (!BSA::loadFileBytes(name.c_str(), &data, &size) || !data || size == 0) {
+            static int misses = 0;
+            if (misses < 20) { LOG::logline("!! [tex] not found: %s (white)", name.c_str()); ++misses; }
+            if (data) { std::free(data); }
+            g_texSlot.emplace(name, 0);
+            return 0;
+        }
+
+        const std::size_t windowBytes = (std::size_t)IPC::kTexWindowBytes;
+        if (sizeof(IPC::TexUploadWire) + size > windowBytes) {
+            LOG::logline("!! [tex] %s too large (%u bytes) for %zu window — white", name.c_str(), size, windowBytes);
+            std::free(data);
+            g_texSlot.emplace(name, 0);
+            return 0;
+        }
+
+        const std::uint32_t slot = g_nextTexSlot++;
+        g_texSlot.emplace(name, slot);
+        IPC::TexUploadWire hdr{ slot, size };
+        const std::size_t at = g_texPendingBlob.size();
+        g_texPendingBlob.resize(at + sizeof(hdr) + size);
+        std::memcpy(g_texPendingBlob.data() + at, &hdr, sizeof(hdr));
+        std::memcpy(g_texPendingBlob.data() + at + sizeof(hdr), data, size);
+        std::free(data);
+        ++g_texPendingCount;
+        return slot;
+    }
+
+    // Ship queued texture uploads to the host in window-sized batches on whole-entry
+    // boundaries (each entry is guaranteed <= window by resolveTextureSlot). Blocking RPCs.
+    void flushTextures() {
+        if (!g_texVec || g_texPendingBlob.empty() || g_texPendingCount == 0) {
+            return;
+        }
+        const std::size_t windowBytes = (std::size_t)IPC::kTexWindowBytes;
+        const std::uint8_t* base = g_texPendingBlob.data();
+        const std::size_t total = g_texPendingBlob.size();
+        std::size_t off = 0;
+        while (off < total) {
+            std::size_t batchEnd = off;
+            std::uint32_t batchCount = 0;
+            while (batchEnd < total) {
+                IPC::TexUploadWire h;
+                std::memcpy(&h, base + batchEnd, sizeof(h));
+                const std::size_t entryBytes = sizeof(h) + h.byteLen;
+                if ((batchEnd - off) + entryBytes > windowBytes) { break; }   // window full
+                batchEnd += entryBytes;
+                ++batchCount;
+            }
+            if (batchCount == 0) { break; }   // safety (each entry <= window)
+            const std::uint32_t bytes = (std::uint32_t)(batchEnd - off);
+            std::uint32_t uploaded = 0;
+            if (g_texVec->assign_bytes(base + off, bytes)) {
+                g_client->texUploadBlocking(g_texVec->id(), batchCount, bytes, &uploaded);
+            }
+            if (uploaded == 0xFFFFFFFFu) {
+                // Host opaque path not built yet (first scene frame) — keep the whole queue and
+                // retry next frame (slots are already assigned; draws show white until then).
+                return;
+            }
+            off = batchEnd;
+        }
+        g_texPendingBlob.clear();
+        g_texPendingCount = 0;
     }
 
     // Drain g_pendingBlob to the host in window-sized whole-part chunks. Parts are
@@ -644,6 +783,7 @@ namespace {
             if (e.isSkinned) continue;
 
             item.slot = ks->second;
+            item.texIndex = resolveTextureSlot(e.textureName);   // bindless base map (0 = white)
             memcpy(item.world, e.worldTransformD3D, 16 * sizeof(float));
             // F12 diagnostic: displace each object by a deterministic per-slot vector. The
             // world matrix is row-major D3DX (translation in m[12..14]); a fixed offset per
@@ -772,6 +912,10 @@ namespace RenderProcess {
         const std::uint32_t drawCount = buildDrawList();
         const std::uint32_t skinnedCount = buildSkinnedDrawList();
 
+        // Ship any textures newly referenced this frame BEFORE the scene draw that uses them
+        // (buildDrawList queued their DDS via resolveTextureSlot). Lazy: only first-seen textures.
+        flushTextures();
+
         const bool haveDraw = g_drawVec && drawCount > 0
             && g_drawVec->assign_bytes(g_drawScratch.data(), (std::uint32_t)g_drawScratch.size());
 
@@ -830,18 +974,21 @@ namespace RenderProcess {
         return g_initOk && g_geomVec.has_value();
     }
 
-    void captureGeometry(std::uint32_t key, std::uint16_t revision,
+    void captureGeometry(std::uint32_t key, std::uint16_t revision, std::uint32_t modelId,
                          const IPC::GeomVertexWire* verts, std::uint32_t vertexCount,
                          const std::uint16_t* indices, std::uint32_t indexCount) {
         if (!wantsGeometryCapture() || !verts || !indices || !vertexCount || !indexCount) {
             return;
         }
-        // Skip if this exact (key,revision) was already shipped.
+        // Skip only if the SAME object (modelId), same shape (vertexCount) and same revision
+        // was already shipped. Keying on revision alone aliased recycled NiTriShape* keys (a
+        // freed object's key+slot inherited by a new mesh with a colliding revisionID).
         auto rev = g_uploadedRev.find(key);
-        if (rev != g_uploadedRev.end() && rev->second == revision) {
+        if (rev != g_uploadedRev.end() && rev->second.id == modelId &&
+            rev->second.vc == vertexCount && rev->second.rev == revision) {
             return;
         }
-        // Stable host slot per cache key (reused on revision change so the host frees
+        // Stable host slot per cache key (reused on re-upload so the host frees
         // and rebuilds in place).
         std::uint32_t slot;
         auto ks = g_keySlot.find(key);
@@ -868,19 +1015,21 @@ namespace RenderProcess {
         memcpy(dst, indices, ibBytes);
 
         ++g_pendingParts;
-        g_uploadedRev[key] = revision;
+        g_uploadedRev[key] = { modelId, vertexCount, revision };
     }
 
-    void captureSkinnedGeometry(std::uint32_t key, std::uint16_t revision,
+    void captureSkinnedGeometry(std::uint32_t key, std::uint16_t revision, std::uint32_t modelId,
                                 const IPC::SkinnedVertexWire* verts, std::uint32_t vertexCount,
                                 const std::uint16_t* indices, std::uint32_t indexCount,
                                 std::uint32_t numBones) {
         if (!wantsGeometryCapture() || !verts || !indices || !vertexCount || !indexCount || numBones == 0) {
             return;
         }
-        // Skip if this exact (key,revision) was already shipped (shared with captureGeometry).
+        // Skip only if the same object+shape+revision was already shipped (shared map with
+        // captureGeometry); identity (modelId,vc) guards against recycled NiTriShape* keys.
         auto rev = g_uploadedRev.find(key);
-        if (rev != g_uploadedRev.end() && rev->second == revision) {
+        if (rev != g_uploadedRev.end() && rev->second.id == modelId &&
+            rev->second.vc == vertexCount && rev->second.rev == revision) {
             return;
         }
         // Stable host slot per cache key (shared slot map / nextSlot with the static path).
@@ -911,7 +1060,7 @@ namespace RenderProcess {
         memcpy(dst, indices, ibBytes);
 
         ++g_pendingParts;
-        g_uploadedRev[key] = revision;
+        g_uploadedRev[key] = { modelId, vertexCount, revision };
     }
 
     void shutdown() {
@@ -919,16 +1068,22 @@ namespace RenderProcess {
         g_geomVec.reset();
         g_drawVec.reset();
         g_skinnedVec.reset();
+        g_texVec.reset();
         g_pendingBlob.clear();
         g_pendingBlob.shrink_to_fit();
         g_drawScratch.clear();
         g_drawScratch.shrink_to_fit();
         g_skinnedScratch.clear();
         g_skinnedScratch.shrink_to_fit();
+        g_texPendingBlob.clear();
+        g_texPendingBlob.shrink_to_fit();
         g_pendingParts = 0;
+        g_texPendingCount = 0;
         g_keySlot.clear();
         g_uploadedRev.clear();
+        g_texSlot.clear();
         g_nextSlot = 0;
+        g_nextTexSlot = 1;
         g_initOk = false;
         g_enabled = false;
     }

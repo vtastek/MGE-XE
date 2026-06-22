@@ -1,15 +1,18 @@
-// mgeHost64 — M1c opaque scene (fragment stage).
+// mgeHost64 — opaque scene (fragment stage).
 //
-// Flat N.L shading from a fixed overhead-ish light + ambient, so geometry reads as
-// recognizable solid shapes (no textures/real lighting yet — that's M2/M3). The point
-// of M1c is to prove camera + geometry + depth, so the look just needs to show form.
+// Phase 2 texturing: sample the bindless base-map (this draw's flat per-vertex TexIndex selects
+// gTextures[TexIndex]; slot 0 = 1x1 white for unloaded parts) and modulate by the same flat N·L
+// shade used since M1c, so geometry still reads as solid form. Real lighting and multi-map
+// (dark/detail/glow) are later milestones.
 
 #include "opaque.srt.h"
 
 STRUCT(VSOutput)
 {
-    DATA(float4, Position, SV_Position);
-    DATA(float3, Normal,   NORMAL);
+    DATA(float4,      Position, SV_Position);
+    DATA(float3,      Normal,   NORMAL);
+    DATA(float2,      Uv,       TEXCOORD0);
+    DATA(FLAT(uint),  TexIndex, TEXCOORD1);
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -20,5 +23,12 @@ float4 PS_MAIN( VSOutput In )
     float3 L = normalize(float3(0.3f, 0.8f, 0.5f));
     float  ndl = max(dot(N, L), 0.0f);
     float  shade = 0.25f + 0.75f * ndl;   // ambient + diffuse
-    RETURN(float4(shade, shade, shade, 1.0f));
+    // gSamplerAnisotropic: FSL built-in STATIC sampler (anisotropic 8x, WRAP), baked into
+    // DefaultRootSignature. We deliberately do NOT use a dynamic sampler: one sharing the Persistent
+    // set with the 1024-entry bindless array gets pushed to mOffset=1024 by FSL's single per-set
+    // descriptor counter, so the host's bind lands at sampler-table slot 1024 while the shader reads
+    // s0 (= null sampler => POINT filter + non-REPEAT address => tiled UVs sample black). A static
+    // sampler sidesteps that entirely. See opaque.srt.h.
+    float4 albedo = SampleTex2D(gTextures[In.TexIndex], gSamplerAnisotropic, In.Uv);
+    RETURN(float4(albedo.rgb * shade, 1.0f));
 }

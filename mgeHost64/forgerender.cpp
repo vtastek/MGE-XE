@@ -382,16 +382,17 @@ namespace ForgeRender {
     bool sceneProbe() {
         std::setvbuf(stdout, nullptr, _IONBF, 0);
         std::printf("[forge] scene-probe: init...\n");
-        if (!init(640, 360, 4)) {   // exercise the MSAA path (resolve into the shared RT); falls back to 1x if unsupported
+        if (!init(640, 360, 4, 16)) {   // exercise the MSAA path (resolve into the shared RT); falls back to 1x if unsupported
             std::printf("[forge] scene-probe: init FAILED\n");
             return false;
         }
 
-        // Pack one triangle mesh into a GeomUpload blob: GeomPartWire + 3 verts + 3 idx.
+        // Fullscreen triangle in NDC (viewProj + world identity) so it actually covers the RT
+        // centre — the old 0..100 triangle landed off-screen, so the probe never visually tested.
         IPC::GeomVertexWire verts[3] = {
-            { 0.0f,   0.0f, 0.0f,  0,0,1 },
-            { 100.0f, 0.0f, 0.0f,  0,0,1 },
-            { 0.0f, 100.0f, 0.0f,  0,0,1 },
+            { -1.0f, -1.0f, 0.5f,  0,0,1,  0,0 },
+            {  3.0f, -1.0f, 0.5f,  0,0,1,  2,0 },
+            { -1.0f,  3.0f, 0.5f,  0,0,1,  0,2 },
         };
         uint16_t idx[3] = { 0, 1, 2 };
         uint8_t blob[sizeof(IPC::GeomPartWire) + sizeof(verts) + sizeof(idx)];
@@ -437,11 +438,49 @@ namespace ForgeRender {
         std::memcpy(skDraw, &skItem, sizeof(skItem));
         std::memcpy(skDraw + sizeof(skItem), ident, sizeof(ident));   // 16 floats = 64 bytes
 
-        std::printf("[forge] scene-probe: renderScene...\n");
+        // First render builds the lazy opaque path (incl. the bindless PerFrame set) so the
+        // texture upload below has somewhere to land. texIndex 0 here = default white.
+        std::printf("[forge] scene-probe: renderScene #1 (builds path)...\n");
         bool ok = renderScene(vp, &item, 1, (unsigned)sizeof(item),
                               skDraw, 1, (unsigned)sizeof(skDraw));
+
+        // SLOT-0 regression guard: sample gTextures[0] (default white) THROUGH the shader. Skinned
+        // parts (TexIndex 0) and oversize-texture fallbacks all use slot 0, so it MUST sample white
+        // (160,160,160), not black — a 1x1 default white regressed this (see buildOpaquePath).
+        item.texIndex = 0;
+        renderScene(vp, &item, 1, (unsigned)sizeof(item), skDraw, 1, (unsigned)sizeof(skDraw));
+        std::printf("[forge] scene-probe: SLOT-0 (default white) sample -> expect 160,160,160\n");
+        debugReadbackCenterPixel();
+
+        // Synthetic 4x4 all-white DXT1 DDS → texture slot 1. Exercises parseDds (BC1) + the
+        // create-empty + mip-upload + bindless-descriptor path offline.
+        uint8_t dds[128 + 8] = {};
+        dds[0] = 'D'; dds[1] = 'D'; dds[2] = 'S'; dds[3] = ' ';
+        *(uint32_t*)(dds + 4)  = 124;          // dwSize
+        *(uint32_t*)(dds + 12) = 4;            // dwHeight
+        *(uint32_t*)(dds + 16) = 4;            // dwWidth
+        *(uint32_t*)(dds + 28) = 1;            // dwMipMapCount
+        *(uint32_t*)(dds + 76) = 32;           // ddspf dwSize
+        *(uint32_t*)(dds + 80) = 0x4;          // DDPF_FOURCC
+        *(uint32_t*)(dds + 84) = 0x31545844u;  // 'DXT1'
+        dds[128] = 0xFF; dds[129] = 0xFF; dds[130] = 0xFF; dds[131] = 0xFF;  // c0=c1=white, idx 0
+        uint8_t texBlob[sizeof(IPC::TexUploadWire) + sizeof(dds)];
+        IPC::TexUploadWire th{ 1, (uint32_t)sizeof(dds) };
+        std::memcpy(texBlob, &th, sizeof(th));
+        std::memcpy(texBlob + sizeof(th), dds, sizeof(dds));
+        std::printf("[forge] scene-probe: uploadTextures...\n");
+        unsigned texBuilt = uploadTextures(texBlob, (unsigned)sizeof(texBlob), 1);
+        std::printf("[forge] scene-probe: textures built %u/1\n", texBuilt);
+
+        // Second render samples the uploaded texture (slot 1).
+        item.texIndex = 1;
+        std::printf("[forge] scene-probe: renderScene #2 (samples slot 1)...\n");
+        ok = renderScene(vp, &item, 1, (unsigned)sizeof(item),
+                         skDraw, 1, (unsigned)sizeof(skDraw));
         std::printf("[forge] scene-probe: renderScene returned %d (skinnedDrawn=%u)\n",
                     (int)ok, lastSkinnedDrawn());
+
+        debugReadbackCenterPixel();   // ground-truth the frag output (defined after g_live)
 
         shutdown();
         std::printf("[forge] scene-probe complete — %s\n", ok ? "OK" : "FAILED");
@@ -647,6 +686,7 @@ namespace {
         // shared single-sample pRT before the D3D9 handoff (the shared RT can't be MSAA).
         uint32_t        sampleCount = 1;
         RenderTarget*   pMSAAColor = nullptr;     // internal MSAA color (null when sampleCount==1)
+        uint32_t        anisoLevel = 0;           // texture sampler max anisotropy (0 = linear); Phase 2
 
         // --- M1c opaque scene path (GPU-driven: one PerFrame set, structured buffer) ---
         RenderTarget*  pDepth = nullptr;          // depth buffer for the scene
@@ -657,8 +697,19 @@ namespace {
         DescriptorSet* pPerBatchSet = nullptr;    // gBatch cbuffer window, kMaxBatches instances
         Buffer*        pFrameCbv = nullptr;        // gFrameData cbuffer (viewProj), persistent-mapped
         Buffer*        pWorldsBuf[16] = {};        // gBatch windows: one 64KB cbuffer PER batch, persistent-mapped
-        Buffer*        pInstanceBuf = nullptr;     // [0..kBatchSize-1] uint, instance-rate VB (DrawIndex/Base), reused per batch
+        // Per-batch instance-rate VB of uint2 { .x = identity DrawIndex/Base, .y = per-draw
+        // texIndex }. CPU-mapped so the static loop writes texIndex per frame; .x stays identity
+        // (filled once) so skinned still reads Base from .x via firstInstance.
+        Buffer*        pInstanceBuf[16] = {};
         uint32_t       maxDraws = 0;
+
+        // --- Phase 2 bindless texturing -------------------------------------------------
+        // No dynamic sampler: the frag uses the FSL static sampler gSamplerAnisotropic (see
+        // opaque.srt.h for why a dynamic sampler can't share the array's set).
+        Texture*       pDefaultWhite = nullptr;    // gTextures[0] / fill for unloaded slots
+        Texture*       pTextures[MAX_TEXTURES] = {}; // bindless base maps; unloaded == pDefaultWhite
+        uint32_t       texHigh = 0;                // highest assigned slot + 1 (for teardown)
+        DescriptorSet* pPersistentSet = nullptr;   // bindless gTextures[] (bound once per frame)
 
         // --- M-Skinning: GPU palette skinning path -----------------------------------
         // Reuses the SAME SrtData/default.rootsig as the static path: gBatch.worlds[1024]
@@ -692,6 +743,21 @@ namespace {
     constexpr uint32_t kMaxBonesPerPart = 32;
     constexpr uint32_t kSkinnedPerWindow = kBatchSize / kMaxBonesPerPart;   // 32
     constexpr uint32_t kMaxSkinned = kSkinnedPerWindow * kMaxBatches;       // 256
+
+    // Bindless base-map texture array size (must match MAX_TEXTURES in opaque.srt.h).
+    constexpr uint32_t kMaxTextures = MAX_TEXTURES;
+
+    // Submit + wait the resource loader's UPLOAD ENGINE. beginUpdateResource/endUpdateResource
+    // record texture copies on the upload engine (pUploadEngines), which waitForAllResourceLoads
+    // (async loader) does NOT flush — without this the copies never execute and textures stay
+    // black. flushResourceUpdates does streamerFlush + returns the copy fence to wait on.
+    void flushTextureUploads(Renderer* R) {
+        FlushResourceUpdateDesc fd = {};
+        flushResourceUpdates(&fd);
+        if (fd.pOutFence) {
+            waitForFences(R, 1, &fd.pOutFence);
+        }
+    }
 
     // Build the M1c opaque scene path: depth target, opaque shader + pipeline (pos+normal
     // per-vertex + per-instance DrawIndex layout, depth test/write), the viewProj CBV +
@@ -760,15 +826,16 @@ namespace {
         }
 
         // Vertex layout: binding 0 = mesh (IPC::GeomVertexWire, per-vertex: pos@0,
-        // normal@12, stride 24); binding 1 = per-INSTANCE DrawIndex (uint, stride 4),
-        // fed by the identity instance buffer + firstInstance to index gWorlds.
+        // normal@12, UV@24, stride 32); binding 1 = per-INSTANCE DrawIndex (uint, stride 4),
+        // fed by the identity instance buffer + firstInstance to index gWorlds. UV takes
+        // TEXCOORD0, so DrawIndex moved to TEXCOORD1 (matches opaque.vert).
         VertexLayout vl = {};
         vl.mBindingCount = 2;
         vl.mBindings[0].mStride = sizeof(IPC::GeomVertexWire);
         vl.mBindings[0].mRate = VERTEX_BINDING_RATE_VERTEX;
-        vl.mBindings[1].mStride = sizeof(uint32_t);
+        vl.mBindings[1].mStride = 2 * sizeof(uint32_t);      // instance uint2 {DrawIndex, TexIndex}
         vl.mBindings[1].mRate = VERTEX_BINDING_RATE_INSTANCE;
-        vl.mAttribCount = 3;
+        vl.mAttribCount = 5;
         vl.mAttribs[0].mSemantic = SEMANTIC_POSITION;
         vl.mAttribs[0].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
         vl.mAttribs[0].mBinding = 0;
@@ -779,11 +846,21 @@ namespace {
         vl.mAttribs[1].mBinding = 0;
         vl.mAttribs[1].mLocation = 1;
         vl.mAttribs[1].mOffset = 12;
-        vl.mAttribs[2].mSemantic = SEMANTIC_TEXCOORD0;
-        vl.mAttribs[2].mFormat = TinyImageFormat_R32_UINT;
-        vl.mAttribs[2].mBinding = 1;
+        vl.mAttribs[2].mSemantic = SEMANTIC_TEXCOORD0;       // UV (per-vertex)
+        vl.mAttribs[2].mFormat = TinyImageFormat_R32G32_SFLOAT;
+        vl.mAttribs[2].mBinding = 0;
         vl.mAttribs[2].mLocation = 2;
-        vl.mAttribs[2].mOffset = 0;
+        vl.mAttribs[2].mOffset = 24;
+        vl.mAttribs[3].mSemantic = SEMANTIC_TEXCOORD1;       // DrawIndex (per-instance .x)
+        vl.mAttribs[3].mFormat = TinyImageFormat_R32_UINT;
+        vl.mAttribs[3].mBinding = 1;
+        vl.mAttribs[3].mLocation = 3;
+        vl.mAttribs[3].mOffset = 0;
+        vl.mAttribs[4].mSemantic = SEMANTIC_TEXCOORD2;       // TexIndex (per-instance .y)
+        vl.mAttribs[4].mFormat = TinyImageFormat_R32_UINT;
+        vl.mAttribs[4].mBinding = 1;
+        vl.mAttribs[4].mLocation = 4;
+        vl.mAttribs[4].mOffset = sizeof(uint32_t);
 
         DepthStateDesc depthDesc = {};
         depthDesc.mDepthTest = true;
@@ -873,25 +950,30 @@ namespace {
             }
         }
 
-        // Identity instance-index buffer [0..kBatchSize-1] (uint), reused for every batch.
-        // Per draw with local index l, firstInstance=l makes the DrawIndex attribute read l.
-        uint32_t* idx = (uint32_t*)tf_malloc((size_t)kBatchSize * sizeof(uint32_t));
-        for (uint32_t i = 0; i < kBatchSize; ++i) {
-            idx[i] = i;
+        // Per-batch instance buffers of uint2 { .x = identity index, .y = per-draw texIndex }.
+        // CPU-mapped: the static loop writes .y each frame; .x is initialised to the identity
+        // here and never clobbered, so a draw with firstInstance=l reads DrawIndex/Base = l.
+        for (uint32_t b = 0; b < kMaxBatches; ++b) {
+            BufferLoadDesc ib = {};
+            ib.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+            ib.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            ib.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            ib.mDesc.mSize = (uint64_t)kBatchSize * 2 * sizeof(uint32_t);
+            ib.mDesc.pName = "instanceVB";
+            ib.pData = nullptr;
+            ib.ppBuffer = &g_live.pInstanceBuf[b];
+            addResource(&ib, nullptr);
         }
-        BufferLoadDesc ib = {};
-        ib.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
-        ib.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
-        ib.mDesc.mSize = (uint64_t)kBatchSize * sizeof(uint32_t);
-        ib.mDesc.mStartState = RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
-        ib.mDesc.pName = "instanceIdxVB";
-        ib.pData = idx;
-        ib.ppBuffer = &g_live.pInstanceBuf;
-        addResource(&ib, nullptr);
         waitForAllResourceLoads();
-        tf_free(idx);
-        if (!g_live.pFrameCbv || !g_live.pWorldsBuf[0] || !g_live.pInstanceBuf) {
+        if (!g_live.pFrameCbv || !g_live.pWorldsBuf[0] || !g_live.pInstanceBuf[0]) {
             return false;
+        }
+        for (uint32_t b = 0; b < kMaxBatches; ++b) {
+            uint32_t* inst = (uint32_t*)g_live.pInstanceBuf[b]->pCpuMappedAddress;
+            for (uint32_t i = 0; i < kBatchSize; ++i) {
+                inst[i * 2 + 0] = i;   // .x identity (DrawIndex / Base)
+                inst[i * 2 + 1] = 0;   // .y texIndex (overwritten per frame by static draws)
+            }
         }
         g_live.maxDraws = kMaxDraws;
 
@@ -901,7 +983,10 @@ namespace {
         // PerBatch set (kMaxBatches instances): gBatch = window b of the world buffer.
         DescriptorSetDesc pbDesc = SRT_SET_DESC(SrtData, PerBatch, kMaxBatches, 0);
         addDescriptorSet(R, &pbDesc, &g_live.pPerBatchSet);
-        if (!g_live.pPerFrameSet || !g_live.pPerBatchSet) {
+        // Persistent set (1 instance): bindless gTextures[] (sampler is static, in the root sig).
+        DescriptorSetDesc psDesc = SRT_SET_DESC(SrtData, Persistent, 1, 0);
+        addDescriptorSet(R, &psDesc, &g_live.pPersistentSet);
+        if (!g_live.pPerFrameSet || !g_live.pPerBatchSet || !g_live.pPersistentSet) {
             return false;
         }
         {
@@ -910,6 +995,66 @@ namespace {
             p.ppBuffers = &g_live.pFrameCbv;
             updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &p);
         }
+
+        // --- Phase 2: bindless texture array (default white), bound once. ---
+        // No dynamic sampler: the frag samples with the FSL static sampler gSamplerAnisotropic
+        // (anisotropic 8x, WRAP, baked into the root sig). A dynamic sampler sharing the Persistent
+        // set with the 1024-entry array gets reflected mOffset=1024 (FSL single per-set counter),
+        // so its bind lands at sampler-table slot 1024 while the shader reads s0 (null sampler =>
+        // point filter + tiled-black). See opaque.srt.h / opaque.frag.fsl.
+        {
+            // 4x4 white default for gTextures[0] and every not-yet-uploaded slot. MUST be >= 4x4:
+            // a 1x1 texture sampled through the bindless array with the static ANISOTROPIC sampler
+            // returns BLACK on this stack (verified via the --forge-scene slot-0 probe — 1x1 gave
+            // CENTRE 0,0,0, 4x4 gave 160). So skinned parts (TexIndex 0) and oversize-texture
+            // fallbacks (resolveTextureSlot -> 0) rendered black until this was bumped to 4x4.
+            TextureDesc wd = {};
+            wd.mWidth = 4; wd.mHeight = 4; wd.mDepth = 1;
+            wd.mArraySize = 1; wd.mMipLevels = 1;
+            wd.mSampleCount = SAMPLE_COUNT_1;
+            wd.mFormat = TinyImageFormat_R8G8B8A8_UNORM;
+            wd.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+            wd.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+            wd.pName = "defaultWhite";
+            TextureLoadDesc wld = {};
+            wld.ppTexture = &g_live.pDefaultWhite;
+            wld.pDesc = &wd;
+            addResource(&wld, nullptr);
+            waitForAllResourceLoads();
+            if (!g_live.pDefaultWhite) {
+                std::printf("[forge] default texture creation FAILED\n");
+                return false;
+            }
+            {
+                TextureUpdateDesc wu = {};
+                wu.pTexture = g_live.pDefaultWhite;
+                wu.mBaseMipLevel = 0; wu.mMipLevels = 1;
+                wu.mBaseArrayLayer = 0; wu.mLayerCount = 1;
+                wu.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;   // created in & returned to this state
+                beginUpdateResource(&wu);
+                TextureSubresourceUpdate s = wu.getSubresourceUpdateDesc(0, 0);
+                for (uint32_t row = 0; row < s.mRowCount; ++row) {
+                    uint32_t* dst = (uint32_t*)(s.pMappedData + (size_t)row * s.mDstRowStride);
+                    for (uint32_t px = 0; px < 4; ++px) { dst[px] = 0xFFFFFFFFu; }
+                }
+                endUpdateResource(&wu);
+                flushTextureUploads(R);   // submit the upload-engine copy (else texture stays black)
+            }
+
+            for (uint32_t i = 0; i < kMaxTextures; ++i) {
+                g_live.pTextures[i] = g_live.pDefaultWhite;
+            }
+            g_live.texHigh = 0;
+
+            // Bind the whole bindless array (every slot = default white for now). Individual
+            // slots are re-bound as textures upload (uploadTextures, via mArrayOffset).
+            DescriptorData td = {};
+            td.mIndex = SRT_RES_IDX(SrtData, Persistent, gTextures);
+            td.mCount = kMaxTextures;
+            td.ppTextures = g_live.pTextures;
+            updateDescriptorSet(R, 0, g_live.pPersistentSet, 1, &td);
+        }
+
         for (uint32_t b = 0; b < kMaxBatches; ++b) {
             DescriptorData p = {};
             p.mIndex = SRT_RES_IDX(SrtData, PerBatch, gBatch);
@@ -939,7 +1084,7 @@ namespace {
             svl.mBindingCount = 2;
             svl.mBindings[0].mStride = sizeof(IPC::SkinnedVertexWire);
             svl.mBindings[0].mRate = VERTEX_BINDING_RATE_VERTEX;
-            svl.mBindings[1].mStride = sizeof(uint32_t);
+            svl.mBindings[1].mStride = 2 * sizeof(uint32_t);   // shared instance uint2; Base = .x @ off 0
             svl.mBindings[1].mRate = VERTEX_BINDING_RATE_INSTANCE;
             svl.mAttribCount = 5;
             svl.mAttribs[0].mSemantic = SEMANTIC_POSITION;
@@ -1097,12 +1242,12 @@ namespace {
 }
 
 namespace ForgeRender {
-    bool init(unsigned width, unsigned height, unsigned sampleCount) {
+    bool init(unsigned width, unsigned height, unsigned sampleCount, unsigned anisoLevel) {
         std::setvbuf(stdout, nullptr, _IONBF, 0);
         if (g_live.pRenderer) {
             shutdown();
         }
-        std::printf("[forge] live init %ux%u (%ux MSAA requested)...\n", width, height, sampleCount);
+        std::printf("[forge] live init %ux%u (%ux MSAA requested, AF %u)...\n", width, height, sampleCount, anisoLevel);
 
         if (!forgeBringUp(&g_live.pRenderer, &g_live.pQueue)) {
             return false;
@@ -1126,7 +1271,8 @@ namespace ForgeRender {
             }
         }
         g_live.sampleCount = reqSamples;
-        std::printf("[forge] MSAA sample count = %u\n", g_live.sampleCount);
+        g_live.anisoLevel  = anisoLevel;   // consumed by the Phase 2 texture sampler
+        std::printf("[forge] MSAA sample count = %u, AF = %u\n", g_live.sampleCount, g_live.anisoLevel);
 
         g_live.pShader = loadTriangleShader(R);
         if (!g_live.pShader) {
@@ -1336,6 +1482,11 @@ namespace ForgeRender {
             const uint32_t local = i % kBatchSize;
             uint8_t* dst = (uint8_t*)g_live.pWorldsBuf[batch]->pCpuMappedAddress;
             std::memcpy(dst + (size_t)local * 64, items[i].world, 64);
+            // Per-draw texIndex into the instance buffer's .y (clamped to the array). .x stays
+            // the identity DrawIndex set at creation. Unloaded/unknown slots fall back to 0 (white).
+            uint32_t* inst = (uint32_t*)g_live.pInstanceBuf[batch]->pCpuMappedAddress;
+            const uint32_t tex = items[i].texIndex < kMaxTextures ? items[i].texIndex : 0u;
+            inst[local * 2 + 1] = tex;
         }
 
         resetCmdPool(R, g_live.pCmdPool);
@@ -1368,6 +1519,7 @@ namespace ForgeRender {
         // the loop switches to the mirror variant per draw as needed.
         cmdBindPipeline(g_live.pCmd, g_live.pOpaquePipeline);
         cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);   // bindless gTextures (static sampler)
 
         uint32_t drawn = 0;
         uint32_t boundBatch = UINT32_MAX;
@@ -1397,8 +1549,8 @@ namespace ForgeRender {
             }
             HostMesh& m = g_meshes[slot];
             // Bind mesh VB (binding 0) + the shared instance-index VB (binding 1).
-            Buffer*  vbs[2]     = { m.vb, g_live.pInstanceBuf };
-            uint32_t strides[2] = { (uint32_t)sizeof(IPC::GeomVertexWire), (uint32_t)sizeof(uint32_t) };
+            Buffer*  vbs[2]     = { m.vb, g_live.pInstanceBuf[batch] };
+            uint32_t strides[2] = { (uint32_t)sizeof(IPC::GeomVertexWire), (uint32_t)(2 * sizeof(uint32_t)) };
             cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
             cmdBindIndexBuffer(g_live.pCmd, m.ib, INDEX_TYPE_UINT16, 0);
             // firstInstance = local → DrawIndex attribute reads instanceBuf[local] = local
@@ -1420,6 +1572,7 @@ namespace ForgeRender {
             // the descriptor sets persist across the switch.
             cmdBindPipeline(g_live.pCmd, g_live.pSkinnedPipeline);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
 
             const uint8_t* sp  = (const uint8_t*)skinnedBlob;
             const uint8_t* sEnd = sp + skinnedBytes;
@@ -1476,8 +1629,9 @@ namespace ForgeRender {
                 }
 
                 HostMesh& sm = g_meshes[slot];
-                Buffer*  vbs[2]     = { sm.vb, g_live.pInstanceBuf };
-                uint32_t strides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)sizeof(uint32_t) };
+                // base ∈ {0,32,...,992} < kBatchSize, so pInstanceBuf[0] (identity .x) covers it.
+                Buffer*  vbs[2]     = { sm.vb, g_live.pInstanceBuf[0] };
+                uint32_t strides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)(2 * sizeof(uint32_t)) };
                 cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
                 cmdBindIndexBuffer(g_live.pCmd, sm.ib, INDEX_TYPE_UINT16, 0);
                 // firstInstance = base → Base attribute reads instanceBuf[base] = base.
@@ -1553,6 +1707,232 @@ namespace ForgeRender {
 
     unsigned lastDrawn() { return g_lastDrawn; }
     unsigned lastSkinnedDrawn() { return g_lastSkinnedDrawn; }
+
+    void debugReadbackCenterPixel() {
+        if (!g_live.pRenderer || !g_live.pRT) {
+            return;
+        }
+        Renderer* R = g_live.pRenderer;
+
+        // Direct texture readback: copy the default-white texture (4x4 RGBA, uploaded via
+        // TextureUpdateDesc) straight to a buffer — proves whether the UPLOAD worked, bypassing
+        // the shader/descriptor binding entirely. White => upload ok (bug is binding); black =>
+        // upload broken.
+        if (g_live.pDefaultWhite) {
+            const uint32_t rowA = (R->pGpu->mUploadBufferTextureRowAlignment > 1u) ? R->pGpu->mUploadBufferTextureRowAlignment : 1u;
+            const uint32_t texA = (R->pGpu->mUploadBufferTextureAlignment > 1u) ? R->pGpu->mUploadBufferTextureAlignment : 1u;
+            const uint32_t rp = roundUp(4u * 4u, rowA);   // default white is 4x4 RGBA8
+            BufferLoadDesc tb = {};
+            tb.mDesc.mSize = roundUp64((uint64_t)rp * 4u, texA);
+            tb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
+            tb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            tb.mDesc.mStartState = RESOURCE_STATE_COPY_DEST;
+            tb.mDesc.mQueueType = QUEUE_TYPE_TRANSFER;
+            Buffer* pTexRb = nullptr; tb.ppBuffer = &pTexRb;
+            addResource(&tb, nullptr); waitForAllResourceLoads();
+            resetCmdPool(R, g_live.pCmdPool);
+            beginCmd(g_live.pCmd);
+            TextureBarrier tbar = { g_live.pDefaultWhite, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_COPY_SOURCE };
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tbar, 0, nullptr);
+            endCmd(g_live.pCmd);
+            QueueSubmitDesc s2 = {}; s2.mCmdCount = 1; s2.ppCmds = &g_live.pCmd; s2.pSignalFence = g_live.pFence; s2.mSubmitDone = true;
+            queueSubmit(g_live.pQueue, &s2); waitForFences(R, 1, &g_live.pFence);
+            TextureCopyDesc tc = {}; tc.pTexture = g_live.pDefaultWhite; tc.pBuffer = pTexRb;
+            tc.mTextureState = RESOURCE_STATE_COPY_SOURCE; tc.mQueueType = QUEUE_TYPE_GRAPHICS;
+            SyncToken tk = {}; copyResource(&tc, &tk); waitForToken(&tk);
+            const uint8_t* tp = (const uint8_t*)pTexRb->pCpuMappedAddress;
+            if (tp) { std::printf("[forge] scene-probe: defaultWhite texel (RGBA) = %u,%u,%u,%u\n", tp[0], tp[1], tp[2], tp[3]); }
+            removeResource(pTexRb);
+        }
+
+        const uint32_t W = g_live.width, H = g_live.height;
+        const uint32_t rowAlign = (R->pGpu->mUploadBufferTextureRowAlignment > 1u) ? R->pGpu->mUploadBufferTextureRowAlignment : 1u;
+        const uint32_t texAlign = (R->pGpu->mUploadBufferTextureAlignment > 1u) ? R->pGpu->mUploadBufferTextureAlignment : 1u;
+        const uint32_t rowPitch = roundUp(W * 4u, rowAlign);
+        const uint64_t bufSize  = roundUp64((uint64_t)rowPitch * H, texAlign);
+        BufferLoadDesc bd = {};
+        bd.mDesc.mSize = bufSize;
+        bd.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
+        bd.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+        bd.mDesc.mStartState = RESOURCE_STATE_COPY_DEST;
+        bd.mDesc.mQueueType = QUEUE_TYPE_TRANSFER;
+        Buffer* pReadback = nullptr;
+        bd.ppBuffer = &pReadback;
+        addResource(&bd, nullptr);
+        waitForAllResourceLoads();
+        resetCmdPool(R, g_live.pCmdPool);
+        beginCmd(g_live.pCmd);
+        RenderTargetBarrier b = {};
+        b.pRenderTarget = g_live.pRT; b.mCurrentState = RESOURCE_STATE_COMMON; b.mNewState = RESOURCE_STATE_COPY_SOURCE;
+        cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &b);
+        endCmd(g_live.pCmd);
+        QueueSubmitDesc sd = {}; sd.mCmdCount = 1; sd.ppCmds = &g_live.pCmd; sd.pSignalFence = g_live.pFence; sd.mSubmitDone = true;
+        queueSubmit(g_live.pQueue, &sd);
+        waitForFences(R, 1, &g_live.pFence);
+        TextureCopyDesc cd = {};
+        cd.pTexture = g_live.pRT->pTexture; cd.pBuffer = pReadback;
+        cd.mTextureState = RESOURCE_STATE_COPY_SOURCE; cd.mQueueType = QUEUE_TYPE_GRAPHICS;
+        SyncToken ct = {};
+        copyResource(&cd, &ct);
+        waitForToken(&ct);
+        const uint8_t* px = (const uint8_t*)pReadback->pCpuMappedAddress;
+        if (px) {
+            const uint8_t* c = &px[(uint64_t)(H / 2) * rowPitch + (uint64_t)(W / 2) * 4u];
+            std::printf("[forge] scene-probe: CENTRE pixel (BGRA) = %u,%u,%u,%u\n", c[0], c[1], c[2], c[3]);
+        } else {
+            std::printf("[forge] scene-probe: readback not mapped\n");
+        }
+        removeResource(pReadback);
+    }
+
+    // --- Phase 2: DDS parse + bindless texture upload ---------------------------------
+    static uint32_t ddsRd32(const uint8_t* p) {
+        return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    }
+    struct DdsInfo {
+        TinyImageFormat fmt = TinyImageFormat_UNDEFINED;
+        uint32_t width = 0, height = 0, mipLevels = 0, dataOffset = 0;
+        bool ok = false;
+    };
+    // Parse the formats MW ships: DXT1/3/5 (BCn), uncompressed 32-bit (treated BGRA), and DX10
+    // BC1/2/3 / BGRA / RGBA. Anything else → ok=false (slot stays default white).
+    static DdsInfo parseDds(const uint8_t* d, uint32_t size) {
+        DdsInfo r;
+        if (size < 128 || ddsRd32(d) != 0x20534444u) { return r; }   // 'DDS '
+        const uint32_t height  = ddsRd32(d + 12);
+        const uint32_t width   = ddsRd32(d + 16);
+        uint32_t       mips    = ddsRd32(d + 28);
+        const uint32_t pfFlags = ddsRd32(d + 80);
+        const uint32_t fourCC  = ddsRd32(d + 84);
+        if (mips == 0) { mips = 1; }
+        uint32_t dataOffset = 128;
+        TinyImageFormat fmt = TinyImageFormat_UNDEFINED;
+        const uint32_t DDPF_FOURCC = 0x4;
+        if (pfFlags & DDPF_FOURCC) {
+            switch (fourCC) {
+                case 0x31545844u: fmt = TinyImageFormat_DXBC1_RGBA_UNORM; break;   // 'DXT1'
+                case 0x33545844u: fmt = TinyImageFormat_DXBC2_UNORM;      break;   // 'DXT3'
+                case 0x35545844u: fmt = TinyImageFormat_DXBC3_UNORM;      break;   // 'DXT5'
+                case 0x30315844u: {                                               // 'DX10'
+                    if (size < 148) { return r; }
+                    const uint32_t dxgi = ddsRd32(d + 128);
+                    dataOffset = 148;
+                    switch (dxgi) {
+                        case 71: case 72: fmt = TinyImageFormat_DXBC1_RGBA_UNORM; break;  // BC1(_SRGB)
+                        case 74: case 75: fmt = TinyImageFormat_DXBC2_UNORM;      break;  // BC2
+                        case 77: case 78: fmt = TinyImageFormat_DXBC3_UNORM;      break;  // BC3
+                        case 87: case 91: fmt = TinyImageFormat_B8G8R8A8_UNORM;   break;  // BGRA8
+                        case 28: case 29: fmt = TinyImageFormat_R8G8B8A8_UNORM;   break;  // RGBA8
+                        default: break;
+                    }
+                } break;
+                default: break;
+            }
+        } else {
+            const uint32_t bits = ddsRd32(d + 88);   // dwRGBBitCount
+            if (bits == 32) { fmt = TinyImageFormat_B8G8R8A8_UNORM; }   // MW A8R8G8B8
+        }
+        if (fmt == TinyImageFormat_UNDEFINED || width == 0 || height == 0) { return r; }
+        r.fmt = fmt; r.width = width; r.height = height; r.mipLevels = mips;
+        r.dataOffset = dataOffset; r.ok = true;
+        return r;
+    }
+
+    // Parse [TexUploadWire][dds bytes]* and decode each into gTextures[slot]. slot 0 is reserved
+    // (default white). Returns the number of textures successfully built. No-op if Forge/the
+    // opaque path isn't live yet (textures arrive after the first scene builds the PerFrame set).
+    unsigned uploadTextures(const void* blob, unsigned byteCount, unsigned count) {
+        // The PerFrame set (which owns the bindless array) is built lazily on the first
+        // renderScene. Until then, signal "not ready" (0xFFFFFFFF) so the client keeps the
+        // batch and retries next frame, rather than silently dropping textures.
+        if (g_live.pRenderer && !g_live.pPersistentSet) {
+            return 0xFFFFFFFFu;
+        }
+        if (!g_live.pRenderer || !blob || !byteCount || !count) {
+            return 0;
+        }
+        Renderer* R = g_live.pRenderer;
+        const uint8_t* p   = (const uint8_t*)blob;
+        const uint8_t* end = p + byteCount;
+        unsigned built = 0;
+
+        for (unsigned i = 0; i < count; ++i) {
+            if (p + sizeof(IPC::TexUploadWire) > end) { break; }
+            IPC::TexUploadWire hdr;
+            std::memcpy(&hdr, p, sizeof(hdr));
+            const uint8_t* dds    = p + sizeof(hdr);
+            const uint8_t* ddsEnd = dds + hdr.byteLen;
+            if (ddsEnd > end) { break; }
+            p = ddsEnd;   // advance regardless of whether this one decodes
+
+            if (hdr.slot == 0 || hdr.slot >= kMaxTextures) { continue; }   // 0 reserved; OOB dropped
+            DdsInfo info = parseDds(dds, hdr.byteLen);
+            if (!info.ok) {
+                LOGF(eWARNING, "[forge] tex slot %u: unsupported DDS format (slot stays white)", hdr.slot);
+                continue;
+            }
+
+            Texture* tex = nullptr;
+            TextureDesc td = {};
+            td.mWidth = info.width; td.mHeight = info.height; td.mDepth = 1;
+            td.mArraySize = 1; td.mMipLevels = info.mipLevels;
+            td.mSampleCount = SAMPLE_COUNT_1;
+            td.mFormat = info.fmt;
+            td.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+            td.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+            td.pName = "mwTexture";
+            TextureLoadDesc tld = {};
+            tld.ppTexture = &tex;
+            tld.pDesc = &td;
+            addResource(&tld, nullptr);
+            waitForAllResourceLoads();
+            if (!tex) { continue; }
+
+            // Upload the tightly-packed DDS mip chain into the (row-aligned) GPU texture.
+            const uint8_t* src = dds + info.dataOffset;
+            TextureUpdateDesc upd = {};
+            upd.pTexture = tex;
+            upd.mBaseMipLevel = 0; upd.mMipLevels = info.mipLevels;
+            upd.mBaseArrayLayer = 0; upd.mLayerCount = 1;
+            upd.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;   // created in & returned to this state
+            beginUpdateResource(&upd);
+            for (uint32_t m = 0; m < info.mipLevels; ++m) {
+                TextureSubresourceUpdate s = upd.getSubresourceUpdateDesc(m, 0);
+                const uint32_t mipBytes = s.mRowCount * s.mSrcRowStride;
+                if (src + mipBytes > ddsEnd) { break; }   // truncated; stop copying mips
+                for (uint32_t row = 0; row < s.mRowCount; ++row) {
+                    std::memcpy(s.pMappedData + (size_t)row * s.mDstRowStride,
+                                src + (size_t)row * s.mSrcRowStride, s.mSrcRowStride);
+                }
+                src += mipBytes;
+            }
+            endUpdateResource(&upd);
+            // NOTE: the upload-engine copy is submitted ONCE for the whole batch after the loop
+            // (flushTextureUploads below) — not per texture. A per-texture GPU fence stalled the
+            // whole batch N times (the "slow" with hundreds of new textures on area load).
+
+            // Replace any prior texture in this slot (revision re-upload), store, rebind the
+            // single bindless descriptor. The rebind only copies CPU descriptor handles; the GPU
+            // doesn't read them until renderScene (its own fence). Safe between frames.
+            if (g_live.pTextures[hdr.slot] != g_live.pDefaultWhite) {
+                removeResource(g_live.pTextures[hdr.slot]);
+            }
+            g_live.pTextures[hdr.slot] = tex;
+            if (hdr.slot + 1 > g_live.texHigh) { g_live.texHigh = hdr.slot + 1; }
+
+            DescriptorData dd = {};   // rebind just this slot in the bindless array
+            dd.mIndex = SRT_RES_IDX(SrtData, Persistent, gTextures);
+            dd.mArrayOffset = hdr.slot;
+            dd.mCount = 1;
+            dd.ppTextures = &g_live.pTextures[hdr.slot];
+            updateDescriptorSet(R, 0, g_live.pPersistentSet, 1, &dd);
+            ++built;
+        }
+        // One upload-engine flush for the whole batch (else textures stay black). Replaces the
+        // former per-texture fence — the batch is window-bounded so this is a single short wait.
+        if (built) { flushTextureUploads(R); }
+        return built;
+    }
 
     unsigned uploadGeometry(const void* blobBytes, unsigned byteCount, unsigned partCount) {
         if (!g_live.pRenderer || !blobBytes || !byteCount || !partCount) {
@@ -1647,11 +2027,21 @@ namespace ForgeRender {
         // M1c opaque path teardown.
         if (g_live.pPerFrameSet)    { removeDescriptorSet(R, g_live.pPerFrameSet); }
         if (g_live.pPerBatchSet)    { removeDescriptorSet(R, g_live.pPerBatchSet); }
+        if (g_live.pPersistentSet)  { removeDescriptorSet(R, g_live.pPersistentSet); }
         if (g_live.pFrameCbv)       { removeResource(g_live.pFrameCbv); }
         for (uint32_t b = 0; b < kMaxBatches; ++b) {
             if (g_live.pWorldsBuf[b]) { removeResource(g_live.pWorldsBuf[b]); }
         }
-        if (g_live.pInstanceBuf)    { removeResource(g_live.pInstanceBuf); }
+        for (uint32_t b = 0; b < kMaxBatches; ++b) {
+            if (g_live.pInstanceBuf[b]) { removeResource(g_live.pInstanceBuf[b]); }
+        }
+        // Phase 2 texture teardown: distinct uploaded textures, then the shared default.
+        for (uint32_t i = 0; i < g_live.texHigh; ++i) {
+            if (g_live.pTextures[i] && g_live.pTextures[i] != g_live.pDefaultWhite) {
+                removeResource(g_live.pTextures[i]);
+            }
+        }
+        if (g_live.pDefaultWhite)   { removeResource(g_live.pDefaultWhite); }
         if (g_live.pOpaquePipeline) { removePipeline(R, g_live.pOpaquePipeline); }
         if (g_live.pOpaquePipelineMirror) { removePipeline(R, g_live.pOpaquePipelineMirror); }
         if (g_live.pOpaqueShader)   { removeShader(R, g_live.pOpaqueShader); }

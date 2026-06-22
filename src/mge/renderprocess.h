@@ -33,19 +33,27 @@ namespace RenderProcess {
     // Called from the cache upload path (scenegraph_geometry_cache.cpp) for each
     // non-skinned opaque part when its model-space geometry is (re)built. Assigns the
     // part a dense host slot (keyed on the cache key), packs pos+normal+indices into a
-    // pending blob, and ships it to the host on the next onPresent flush. Re-uploads
-    // only when revision changes. verts/indices are model-space; world transform +
-    // camera arrive per-frame in M1c.
-    void captureGeometry(std::uint32_t key, std::uint16_t revision,
+    // pending blob, and ships it to the host on the next onPresent flush. verts/indices
+    // are model-space; world transform + camera arrive per-frame in M1c.
+    //
+    // `modelId` = the part's NI GeometryData pointer (object identity). The dedup is on
+    // (modelId, vertexCount, revision), NOT revision alone: the cache key is an NiTriShape*
+    // that Morrowind RECYCLES across cell transitions, so a new object can reuse a freed
+    // object's key+slot. Static meshes share revisionID (often 0), so revision-only dedup
+    // skipped the re-upload and the slot kept the previous mesh ("barrel for head"). The
+    // GeometryData ptr differs on reuse → forces the re-upload. Morphed parts keep their
+    // data ptr but bump revisionID, so they still refresh.
+    void captureGeometry(std::uint32_t key, std::uint16_t revision, std::uint32_t modelId,
                          const IPC::GeomVertexWire* verts, std::uint32_t vertexCount,
                          const std::uint16_t* indices, std::uint32_t indexCount);
 
     // M-Skinning: capture a skinned part's bind-pose VB (model-space pos/normal +
     // per-vertex weights + packed bone indices). Like captureGeometry it assigns/reuses a
     // dense host slot (shared g_keySlot) and packs the part into the geometry blob with the
-    // SKINNED flag + numBones; re-uploads only on revision change. The per-frame bone
-    // palette is shipped separately (built in onPresent from the cache entry).
-    void captureSkinnedGeometry(std::uint32_t key, std::uint16_t revision,
+    // SKINNED flag + numBones; dedup on (modelId, vertexCount, revision) — see captureGeometry
+    // for why identity (not revision alone) is required. The per-frame bone palette is
+    // shipped separately (built in onPresent from the cache entry).
+    void captureSkinnedGeometry(std::uint32_t key, std::uint16_t revision, std::uint32_t modelId,
                                 const IPC::SkinnedVertexWire* verts, std::uint32_t vertexCount,
                                 const std::uint16_t* indices, std::uint32_t indexCount,
                                 std::uint32_t numBones);

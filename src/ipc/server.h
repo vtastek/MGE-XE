@@ -58,6 +58,7 @@ namespace IPC {
 		void renderInit();
 		void renderFrame();
 		void geomUpload();
+		void texUpload();
 
 	public:
 		Server(HANDLE sharedMem, HANDLE clientProcess, HANDLE rpcStartEvent, HANDLE rpcCompleteEvent,

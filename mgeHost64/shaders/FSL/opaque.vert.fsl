@@ -10,13 +10,17 @@ STRUCT(VSInput)
 {
     DATA(float3, Position,  POSITION);
     DATA(float3, Normal,    NORMAL);
-    DATA(uint,   DrawIndex, TEXCOORD0);   // per-instance: index into gWorlds
+    DATA(float2, Uv,        TEXCOORD0);    // per-vertex: base-map UV
+    DATA(uint,   DrawIndex, TEXCOORD1);    // per-instance: index into gWorlds (instance buf .x)
+    DATA(uint,   TexIndex,  TEXCOORD2);    // per-instance: bindless gTextures slot (instance buf .y)
 };
 
 STRUCT(VSOutput)
 {
-    DATA(float4, Position, SV_Position);
-    DATA(float3, Normal,   NORMAL);
+    DATA(float4,      Position, SV_Position);
+    DATA(float3,      Normal,   NORMAL);
+    DATA(float2,      Uv,       TEXCOORD0);
+    DATA(FLAT(uint),  TexIndex, TEXCOORD1);
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -32,5 +36,7 @@ VSOutput VS_MAIN( VSInput In )
     float4 worldPos = mul(world, float4(In.Position, 1.0f));
     Out.Position = mul(gFrameData.viewProj, worldPos);
     Out.Normal = mul((float3x3)world, In.Normal);
+    Out.Uv = In.Uv;
+    Out.TexIndex = In.TexIndex;
     RETURN(Out);
 }

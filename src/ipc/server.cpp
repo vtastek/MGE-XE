@@ -190,9 +190,11 @@ namespace IPC {
 			}
 
 			if (waitResult == WAIT_OBJECT_0 + 2) {
-				// Geometry channel — only GeomUpload is expected here.
+				// Geometry channel — GeomUpload + TexUpload (both bulk, off the cull channel).
 				if (m_geomParameters->command == Command::GeomUpload) {
 					geomUpload();
+				} else if (m_geomParameters->command == Command::TexUpload) {
+					texUpload();
 				} else if (m_geomParameters->command != Command::None) {
 					LOG::logline("Geometry channel received unexpected command %u", m_geomParameters->command);
 				}
@@ -456,8 +458,8 @@ namespace IPC {
 		params.framebufferHandle = nullptr;   // reused as the shared-RT NT handle (client-process value)
 		params.ok = false;
 
-		if (!ForgeRender::init(params.width, params.height, params.sampleCount)) {
-			LOG::logline("!! [seam] ForgeRender::init(%ux%u, %ux MSAA) failed", params.width, params.height, params.sampleCount);
+		if (!ForgeRender::init(params.width, params.height, params.sampleCount, params.anisoLevel)) {
+			LOG::logline("!! [seam] ForgeRender::init(%ux%u, %ux MSAA, AF %u) failed", params.width, params.height, params.sampleCount, params.anisoLevel);
 			return;
 		}
 
@@ -592,5 +594,27 @@ namespace IPC {
 			LOG::logline(">> [geom] geomUpload DONE: built %u/%u", params.partsUploaded, params.partCount);
 			LOG::flush();
 		}
+	}
+
+	void Server::texUpload() {
+		Parameters* pp = (m_geomParameters != nullptr) ? m_geomParameters : m_ipcParameters;
+		auto& params = pp->params.texUploadParams;
+		params.texturesUploaded = 0;
+		if (params.blob == InvalidVector || params.texCount == 0) {
+			return;
+		}
+		auto& vec = getVec<IPC::GeomChunk>(params.blob);
+		if (vec.size() == 0) {
+			return;
+		}
+		const std::uint32_t availBytes = vec.size() * static_cast<std::uint32_t>(sizeof(IPC::GeomChunk));
+		std::uint32_t bytes = params.byteCount;
+		if (bytes == 0 || bytes > availBytes) {
+			bytes = availBytes;
+		}
+		params.texturesUploaded = ForgeRender::uploadTextures(&vec[0], bytes, params.texCount);
+		LOG::logline(">> [tex] texUpload DONE: built %u/%u (%u bytes)",
+			params.texturesUploaded, params.texCount, bytes);
+		LOG::flush();
 	}
 }

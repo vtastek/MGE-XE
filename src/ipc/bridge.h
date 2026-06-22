@@ -140,6 +140,11 @@ namespace IPC {
         // slot-indexed) into the Forge host's mesh store. The blob vec holds
         // [GeomPartWire+verts+indices]*partCount (see ipc/geomwire.h).
         GeomUpload,
+
+        // Phase 2 bindless texturing: upload a batch of base-map textures. The blob vec holds
+        // [TexUploadWire][dds bytes]*texCount (see ipc/geomwire.h); the host decodes each DDS
+        // into gTextures[slot]. Rides the same dedicated geometry channel as GeomUpload.
+        TexUpload,
     };
 
     struct AllocVecParameters {
@@ -249,6 +254,9 @@ namespace IPC {
         // and resolves down into the shared RT before the D3D9 handoff. If the device doesn't
         // support the requested count the host logs and drops to 1.
         IN std::uint32_t sampleCount;
+        // Anisotropic filtering: MGE's Configuration.AnisoLevel (0 = off/linear, else the max
+        // anisotropy 2..16). The host builds its texture sampler from this (Phase 2 texturing).
+        IN std::uint32_t anisoLevel;
         // Milestone B/C: D3D9Ex shared render-target HANDLE(s) (KMT/global) the client created.
         // [0] non-null ⇒ the host imports them as Vulkan external memory and renders directly
         // (zero-copy). [1] non-null double-buffers (C). Both null ⇒ Milestone A CPU readback.
@@ -297,6 +305,15 @@ namespace IPC {
         OUT std::uint32_t partsUploaded;
     };
 
+    // Phase 2 texturing: blob vec of [TexUploadWire][dds bytes]*texCount (ipc/geomwire.h).
+    struct TexUploadParameters {
+        IN VecId blob;
+        IN std::uint32_t texCount;
+        IN std::uint32_t byteCount;
+
+        OUT std::uint32_t texturesUploaded;
+    };
+
 	struct Parameters {
         Command command;
         union {
@@ -311,6 +328,7 @@ namespace IPC {
             RenderInitParameters renderInitParams;
             RenderFrameParameters renderFrameParams;
             GeomUploadParameters geomUploadParams;
+            TexUploadParameters texUploadParams;
         } params;
 	};
 }

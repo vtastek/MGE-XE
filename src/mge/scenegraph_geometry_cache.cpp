@@ -328,17 +328,24 @@ namespace MGE::GeometryCache {
                 static std::vector<IPC::GeomVertexWire> scratch;  // single-threaded cache walk
                 scratch.resize(vertexCount);
                 const auto* nrm = data->normal;
+                // Base-map UV: set e.baseUV (set-major, uvs[set*storedVerts + i]). Most static
+                // meshes use set 0; honour the captured base map's true set for correctness.
+                const auto* capUvs = data->textureCoords;
+                const uint32_t uvBase = (uint32_t)e.baseUV * storedVerts;
                 for (uint32_t i = 0; i < vertexCount; ++i) {
                     auto& w = scratch[i];
                     w.px = mv[i].x; w.py = mv[i].y; w.pz = mv[i].z;
                     if (nrm) { w.nx = nrm[i].x; w.ny = nrm[i].y; w.nz = nrm[i].z; }
                     else     { w.nx = 0.0f;    w.ny = 0.0f;    w.nz = 1.0f; }
+                    if (capUvs) { w.u = capUvs[uvBase + i].x; w.v = capUvs[uvBase + i].y; }
+                    else        { w.u = 0.0f;                 w.v = 0.0f; }
                 }
                 const auto* triList = data->getTriList();
                 if (triList) {
                     // NI::Triangle is 3 packed uint16 indices (== the IB byte layout
                     // used above via memcpy(.., triCount*6)).
                     RenderProcess::captureGeometry(key, data->revisionID,
+                        reinterpret_cast<uint32_t>(data),   // object identity (recycled-key guard)
                         scratch.data(), vertexCount,
                         reinterpret_cast<const uint16_t*>(triList), triCount * 3u);
                 }
@@ -486,6 +493,7 @@ namespace MGE::GeometryCache {
                 const auto* triList = data->getTriList();
                 if (triList) {
                     RenderProcess::captureSkinnedGeometry(key, data->revisionID,
+                        reinterpret_cast<uint32_t>(data),   // object identity (recycled-key guard)
                         skScratch.data(), vertexCount,
                         reinterpret_cast<const uint16_t*>(triList), triCount * 3u, numBones);
                 }

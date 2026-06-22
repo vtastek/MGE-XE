@@ -360,13 +360,14 @@ namespace IPC {
 	}
 
 	bool Client::renderInitBlocking(std::uint32_t width, std::uint32_t height, std::uint32_t sampleCount,
-		HANDLE sharedTexture0, HANDLE sharedTexture1, HANDLE* outFramebufferHandle) {
+		std::uint32_t anisoLevel, HANDLE sharedTexture0, HANDLE sharedTexture1, HANDLE* outFramebufferHandle) {
 		WAIT_FOR_PREVIOUS_COMMAND;
 
 		auto& params = m_ipcParameters->params.renderInitParams;
 		params.width = width;
 		params.height = height;
 		params.sampleCount = sampleCount;
+		params.anisoLevel = anisoLevel;
 #pragma warning(push)
 #pragma warning(disable: 4244 4302 4311)
 		params.sharedTextureHandles[0] = static_cast<HANDLE32>(sharedTexture0);
@@ -475,6 +476,32 @@ namespace IPC {
 			*outUploaded = params.partsUploaded;
 		}
 		return params.partsUploaded == partCount;
+	}
+
+	bool Client::texUploadBlocking(VecId blob, std::uint32_t texCount, std::uint32_t byteCount, std::uint32_t* outUploaded) {
+		// Textures ride the SAME dedicated geometry channel as geomUpload (bulk, off the cull
+		// channel). Wait only for the previous geom-channel RPC.
+		if (m_geomRpcPending && waitGeomCompletion() != WakeReason::Complete) {
+			return false;
+		}
+
+		auto& params = m_geomParameters->params.texUploadParams;
+		params.blob = blob;
+		params.texCount = texCount;
+		params.byteCount = byteCount;
+		params.texturesUploaded = 0;
+		if (!beginGeomRpc(Command::TexUpload)) {
+			return false;
+		}
+
+		if (waitGeomCompletion() != WakeReason::Complete) {
+			return false;
+		}
+
+		if (outUploaded) {
+			*outUploaded = params.texturesUploaded;
+		}
+		return params.texturesUploaded == texCount;
 	}
 
 	WakeReason Client::waitForCompletion(DWORD ms) {
