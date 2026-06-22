@@ -783,17 +783,21 @@ namespace RenderProcess {
             skinnedBytes = (std::uint32_t)g_skinnedScratch.size();
         }
 
-        if (haveDraw || skinnedId != IPC::InvalidVector) {
-            D3DXMATRIX viewProj;
-            D3DXMatrixMultiply(&viewProj, &DistantLand::mwView, &DistantLand::mwProj);
-            ok = g_client->renderSceneBlocking(frame, (const float*)&viewProj,
-                     haveDraw ? g_drawVec->id() : IPC::InvalidVector,
-                     haveDraw ? drawCount : 0,
-                     haveDraw ? (std::uint32_t)g_drawScratch.size() : 0,
-                     skinnedId, skinnedCount, skinnedBytes, &hostMs);
-        } else {
-            ok = g_client->renderFrameBlocking(frame, 0, &hostMs);
+        // Only drive + composite the host when there's actual scene data this frame. With no
+        // draw list (loading doors, menus, empty cells) we must NOT fall back to the bring-up
+        // triangle and composite it — that flashes the debug triangle over MW's loading/menu
+        // frame. Skip the seam entirely and let MW present its own (fixed-function) frame.
+        if (!haveDraw && skinnedId == IPC::InvalidVector) {
+            return;
         }
+
+        D3DXMATRIX viewProj;
+        D3DXMatrixMultiply(&viewProj, &DistantLand::mwView, &DistantLand::mwProj);
+        ok = g_client->renderSceneBlocking(frame, (const float*)&viewProj,
+                 haveDraw ? g_drawVec->id() : IPC::InvalidVector,
+                 haveDraw ? drawCount : 0,
+                 haveDraw ? (std::uint32_t)g_drawScratch.size() : 0,
+                 skinnedId, skinnedCount, skinnedBytes, &hostMs);
         if (!ok) {
             return;
         }
