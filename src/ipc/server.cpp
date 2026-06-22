@@ -456,8 +456,8 @@ namespace IPC {
 		params.framebufferHandle = nullptr;   // reused as the shared-RT NT handle (client-process value)
 		params.ok = false;
 
-		if (!ForgeRender::init(params.width, params.height)) {
-			LOG::logline("!! [seam] ForgeRender::init(%ux%u) failed", params.width, params.height);
+		if (!ForgeRender::init(params.width, params.height, params.sampleCount)) {
+			LOG::logline("!! [seam] ForgeRender::init(%ux%u, %ux MSAA) failed", params.width, params.height, params.sampleCount);
 			return;
 		}
 

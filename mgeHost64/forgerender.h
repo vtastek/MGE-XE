@@ -41,7 +41,10 @@ namespace ForgeRender {
     // Bring up Forge and create a SHARED D3D12 render target (width x height,
     // B8G8R8A8) with an exported NT handle. Returns true on success. Idempotent
     // re-init tears down a prior instance first.
-    bool init(unsigned width, unsigned height);
+    // sampleCount is the requested MSAA level (1 = none). When >1 the scene renders
+    // into an internal MSAA color+depth and resolves into the shared (single-sample)
+    // RT before handoff; if the device can't support the count the host logs and uses 1.
+    bool init(unsigned width, unsigned height, unsigned sampleCount);
 
     // The exported NT shared-RT handle — valid in the HOST process. Null until a
     // successful init(). The IPC server DuplicateHandles this into MW's process.

@@ -359,13 +359,14 @@ namespace IPC {
 		return beginRpc(Command::SortVisibleSet);
 	}
 
-	bool Client::renderInitBlocking(std::uint32_t width, std::uint32_t height,
+	bool Client::renderInitBlocking(std::uint32_t width, std::uint32_t height, std::uint32_t sampleCount,
 		HANDLE sharedTexture0, HANDLE sharedTexture1, HANDLE* outFramebufferHandle) {
 		WAIT_FOR_PREVIOUS_COMMAND;
 
 		auto& params = m_ipcParameters->params.renderInitParams;
 		params.width = width;
 		params.height = height;
+		params.sampleCount = sampleCount;
 #pragma warning(push)
 #pragma warning(disable: 4244 4302 4311)
 		params.sharedTextureHandles[0] = static_cast<HANDLE32>(sharedTexture0);

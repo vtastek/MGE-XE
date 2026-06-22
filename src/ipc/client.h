@@ -266,7 +266,7 @@ namespace IPC {
 		* @param outFramebufferHandle A path only: receives a file-mapping HANDLE for the W*H*4 pixel blob (null on B).
 		* @return Whether the host renderer initialized successfully (blocking).
 		*/
-		bool renderInitBlocking(std::uint32_t width, std::uint32_t height,
+		bool renderInitBlocking(std::uint32_t width, std::uint32_t height, std::uint32_t sampleCount,
 			HANDLE sharedTexture0, HANDLE sharedTexture1, HANDLE* outFramebufferHandle);
 
 		/**

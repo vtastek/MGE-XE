@@ -382,7 +382,7 @@ namespace ForgeRender {
     bool sceneProbe() {
         std::setvbuf(stdout, nullptr, _IONBF, 0);
         std::printf("[forge] scene-probe: init...\n");
-        if (!init(640, 360)) {
+        if (!init(640, 360, 4)) {   // exercise the MSAA path (resolve into the shared RT); falls back to 1x if unsupported
             std::printf("[forge] scene-probe: init FAILED\n");
             return false;
         }
@@ -642,6 +642,12 @@ namespace {
         uint32_t        width = 0, height = 0;
         bool            firstFrame = true;
 
+        // MSAA: requested sample count (1 = off, validated against the device in init).
+        // >1 ⇒ the scene renders into pMSAAColor (+ MSAA pDepth) and resolves into the
+        // shared single-sample pRT before the D3D9 handoff (the shared RT can't be MSAA).
+        uint32_t        sampleCount = 1;
+        RenderTarget*   pMSAAColor = nullptr;     // internal MSAA color (null when sampleCount==1)
+
         // --- M1c opaque scene path (GPU-driven: one PerFrame set, structured buffer) ---
         RenderTarget*  pDepth = nullptr;          // depth buffer for the scene
         Shader*        pOpaqueShader = nullptr;
@@ -701,7 +707,7 @@ namespace {
         dDesc.mDepth = 1;
         dDesc.mArraySize = 1;
         dDesc.mMipLevels = 1;
-        dDesc.mSampleCount = SAMPLE_COUNT_1;
+        dDesc.mSampleCount = (SampleCount)g_live.sampleCount;   // MSAA depth must match the color RT
         dDesc.mFormat = TinyImageFormat_D32_SFLOAT;
         dDesc.mStartState = RESOURCE_STATE_DEPTH_WRITE;
         // REVERSE-Z: clear to 0.0 (the far plane). With a float32 depth buffer, reverse-Z
@@ -715,6 +721,32 @@ namespace {
         addRenderTarget(R, &dDesc, &g_live.pDepth);
         if (!g_live.pDepth) {
             return false;
+        }
+
+        // MSAA: internal multisampled color target. The scene renders here; it's resolved
+        // into the shared single-sample pRT in renderScene. Only when sampleCount > 1 — at 1x
+        // the scene renders straight into pRT exactly as before (pMSAAColor stays null).
+        if (g_live.sampleCount > 1) {
+            RenderTargetDesc cDesc = {};
+            cDesc.mWidth = width;
+            cDesc.mHeight = height;
+            cDesc.mDepth = 1;
+            cDesc.mArraySize = 1;
+            cDesc.mMipLevels = 1;
+            cDesc.mSampleCount = (SampleCount)g_live.sampleCount;
+            cDesc.mFormat = TinyImageFormat_B8G8R8A8_UNORM;   // same as pRT → resolve is format-compatible
+            cDesc.mStartState = RESOURCE_STATE_RENDER_TARGET;
+            cDesc.mClearValue.r = 0.0f;
+            cDesc.mClearValue.g = 0.0f;
+            cDesc.mClearValue.b = 0.0f;
+            cDesc.mClearValue.a = 1.0f;
+            cDesc.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+            cDesc.pName = "sceneMSAAColor";
+            addRenderTarget(R, &cDesc, &g_live.pMSAAColor);
+            if (!g_live.pMSAAColor) {
+                std::printf("[forge] addRenderTarget(MSAA color %ux) FAILED\n", g_live.sampleCount);
+                return false;
+            }
         }
 
         // Opaque shaders (share the global root signature already loaded for the triangle).
@@ -774,8 +806,8 @@ namespace {
         GraphicsPipelineDesc& g = pd.mGraphicsDesc;
         g.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
         g.mRenderTargetCount = 1;
-        g.pColorFormats = &g_live.pRT->mFormat;
-        g.mSampleCount = SAMPLE_COUNT_1;
+        g.pColorFormats = &g_live.pRT->mFormat;   // B8G8R8A8 — same for pRT and the MSAA color
+        g.mSampleCount = (SampleCount)g_live.sampleCount;
         g.mSampleQuality = 0;
         g.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
         g.pDepthState = &depthDesc;
@@ -951,7 +983,7 @@ namespace {
             sg.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
             sg.mRenderTargetCount = 1;
             sg.pColorFormats = &g_live.pRT->mFormat;
-            sg.mSampleCount = SAMPLE_COUNT_1;
+            sg.mSampleCount = (SampleCount)g_live.sampleCount;
             sg.mSampleQuality = 0;
             sg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
             sg.pDepthState = &skDepth;
@@ -1065,17 +1097,36 @@ namespace {
 }
 
 namespace ForgeRender {
-    bool init(unsigned width, unsigned height) {
+    bool init(unsigned width, unsigned height, unsigned sampleCount) {
         std::setvbuf(stdout, nullptr, _IONBF, 0);
         if (g_live.pRenderer) {
             shutdown();
         }
-        std::printf("[forge] live init %ux%u...\n", width, height);
+        std::printf("[forge] live init %ux%u (%ux MSAA requested)...\n", width, height, sampleCount);
 
         if (!forgeBringUp(&g_live.pRenderer, &g_live.pQueue)) {
             return false;
         }
         Renderer* R = g_live.pRenderer;
+
+        // MSAA: validate the requested count against the device for the shared RT format.
+        // Unsupported ⇒ log loudly and fall back to single-sample (the agreed policy — no
+        // silent substitution of a different count). Counts are 1/2/4/8 (D3DMULTISAMPLE).
+        uint32_t reqSamples = sampleCount < 1 ? 1u : sampleCount;
+        if (reqSamples > 1) {
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS msq = {};
+            msq.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            msq.SampleCount = reqSamples;
+            HRESULT qr = R->mDx.pDevice->CheckFeatureSupport(
+                D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &msq, sizeof(msq));
+            if (FAILED(qr) || msq.NumQualityLevels == 0) {
+                std::printf("[forge] MSAA %ux unsupported for B8G8R8A8_UNORM — rendering single-sample\n", reqSamples);
+                LOGF(eWARNING, "[forge] MSAA %ux unsupported for B8G8R8A8_UNORM — rendering single-sample", reqSamples);
+                reqSamples = 1;
+            }
+        }
+        g_live.sampleCount = reqSamples;
+        std::printf("[forge] MSAA sample count = %u\n", g_live.sampleCount);
 
         g_live.pShader = loadTriangleShader(R);
         if (!g_live.pShader) {
@@ -1290,9 +1341,13 @@ namespace ForgeRender {
         resetCmdPool(R, g_live.pCmdPool);
         beginCmd(g_live.pCmd);
 
-        // Shared RT: COMMON (steady state) -> RENDER_TARGET. First frame it was created
-        // RENDER_TARGET; depth created DEPTH_WRITE and stays there.
-        if (!g_live.firstFrame) {
+        // Color target: the MSAA color when antialiasing is on (resolved into pRT at the end),
+        // else the shared pRT directly. The MSAA target is left in RENDER_TARGET between frames
+        // (transitioned back after the resolve), so it needs no begin barrier — only the direct
+        // pRT path transitions COMMON (steady state) -> RENDER_TARGET (first frame it was
+        // created RENDER_TARGET). Depth was created DEPTH_WRITE and stays there.
+        RenderTarget* colorTarget = (g_live.sampleCount > 1) ? g_live.pMSAAColor : g_live.pRT;
+        if (g_live.sampleCount == 1 && !g_live.firstFrame) {
             RenderTargetBarrier toRT = {};
             toRT.pRenderTarget = g_live.pRT;
             toRT.mCurrentState = RESOURCE_STATE_COMMON;
@@ -1302,7 +1357,7 @@ namespace ForgeRender {
 
         BindRenderTargetsDesc bind = {};
         bind.mRenderTargetCount = 1;
-        bind.mRenderTargets[0] = { g_live.pRT, LOAD_ACTION_CLEAR };
+        bind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_CLEAR };
         bind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_CLEAR };
         cmdBindRenderTargets(g_live.pCmd, &bind);
         cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
@@ -1433,12 +1488,51 @@ namespace ForgeRender {
 
         cmdBindRenderTargets(g_live.pCmd, nullptr);
 
-        // Hand the shared RT back to COMMON for MW's D3D9Ex StretchRect.
-        RenderTargetBarrier toCommon = {};
-        toCommon.pRenderTarget = g_live.pRT;
-        toCommon.mCurrentState = RESOURCE_STATE_RENDER_TARGET;
-        toCommon.mNewState = RESOURCE_STATE_COMMON;
-        cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &toCommon);
+        if (g_live.sampleCount > 1) {
+            // MSAA: resolve the multisampled color into the shared single-sample RT, then leave
+            // the shared RT in COMMON for MW's D3D9Ex StretchRect. Forge has no RESOLVE resource
+            // states, so this is driven natively (the shared RT is already managed natively).
+            ID3D12GraphicsCommandList* cl = g_live.pCmd->mDx.pCmdList;
+            ID3D12Resource* msaaRes = g_live.pMSAAColor->pTexture->mDx.pResource;
+            ID3D12Resource* dstRes  = g_live.pSharedRes;
+
+            D3D12_RESOURCE_BARRIER pre[2] = {};
+            pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            pre[0].Transition.pResource = msaaRes;
+            pre[0].Transition.Subresource = 0;
+            pre[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            pre[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+            pre[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            pre[1].Transition.pResource = dstRes;
+            pre[1].Transition.Subresource = 0;
+            // First frame the shared RT was created RENDER_TARGET; steady state is COMMON.
+            pre[1].Transition.StateBefore = g_live.firstFrame ? D3D12_RESOURCE_STATE_RENDER_TARGET
+                                                              : D3D12_RESOURCE_STATE_COMMON;
+            pre[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_RESOLVE_DEST;
+            cl->ResourceBarrier(2, pre);
+
+            cl->ResolveSubresource(dstRes, 0, msaaRes, 0, DXGI_FORMAT_B8G8R8A8_UNORM);
+
+            D3D12_RESOURCE_BARRIER post[2] = {};
+            post[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            post[0].Transition.pResource = dstRes;
+            post[0].Transition.Subresource = 0;
+            post[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RESOLVE_DEST;
+            post[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;   // hand off to D3D9Ex
+            post[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            post[1].Transition.pResource = msaaRes;
+            post[1].Transition.Subresource = 0;
+            post[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+            post[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;   // ready for next frame
+            cl->ResourceBarrier(2, post);
+        } else {
+            // No MSAA: hand the shared RT (rendered into directly) back to COMMON for StretchRect.
+            RenderTargetBarrier toCommon = {};
+            toCommon.pRenderTarget = g_live.pRT;
+            toCommon.mCurrentState = RESOURCE_STATE_RENDER_TARGET;
+            toCommon.mNewState = RESOURCE_STATE_COMMON;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &toCommon);
+        }
         endCmd(g_live.pCmd);
 
         QueueSubmitDesc submitDesc = {};
@@ -1569,6 +1663,7 @@ namespace ForgeRender {
         if (g_live.pSkinnedPipeline)       { removePipeline(R, g_live.pSkinnedPipeline); }
         if (g_live.pSkinnedPipelineMirror) { removePipeline(R, g_live.pSkinnedPipelineMirror); }
         if (g_live.pSkinnedShader)         { removeShader(R, g_live.pSkinnedShader); }
+        if (g_live.pMSAAColor)      { removeRenderTarget(R, g_live.pMSAAColor); }
         if (g_live.pDepth)          { removeRenderTarget(R, g_live.pDepth); }
         if (g_live.pFence)    { exitFence(R, g_live.pFence); }
         if (g_live.pCmd)      { exitCmd(R, g_live.pCmd); }

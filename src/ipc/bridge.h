@@ -243,6 +243,12 @@ namespace IPC {
     struct RenderInitParameters {
         IN std::uint32_t width;
         IN std::uint32_t height;
+        // MSAA: MGE's Configuration.AALevel (the D3DMULTISAMPLE value 0/2/4/8) mapped to a
+        // GPU sample count (>=1). 1 ⇒ no antialiasing (host renders straight into the shared
+        // single-sample RT, as before). >1 ⇒ host renders into an internal MSAA color+depth
+        // and resolves down into the shared RT before the D3D9 handoff. If the device doesn't
+        // support the requested count the host logs and drops to 1.
+        IN std::uint32_t sampleCount;
         // Milestone B/C: D3D9Ex shared render-target HANDLE(s) (KMT/global) the client created.
         // [0] non-null ⇒ the host imports them as Vulkan external memory and renders directly
         // (zero-copy). [1] non-null double-buffers (C). Both null ⇒ Milestone A CPU readback.

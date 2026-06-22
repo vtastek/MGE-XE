@@ -388,7 +388,9 @@ namespace {
         // Host brings up Forge + creates the shared RT; returns the NT handle already
         // duplicated into THIS process.
         HANDLE hostHandle = nullptr;
-        if (!g_client->renderInitBlocking(g_w, g_h, nullptr, nullptr, &hostHandle) || hostHandle == nullptr) {
+        // MSAA: Configuration.AALevel is the D3DMULTISAMPLE value (0/2/4/8); map 0 -> 1 sample.
+        const std::uint32_t sampleCount = Configuration.AALevel > 0 ? (std::uint32_t)Configuration.AALevel : 1u;
+        if (!g_client->renderInitBlocking(g_w, g_h, sampleCount, nullptr, nullptr, &hostHandle) || hostHandle == nullptr) {
             LOG::logline("!! [seam] renderInit RPC failed or no shared handle; seam disabled");
             releaseAll();
             return;
