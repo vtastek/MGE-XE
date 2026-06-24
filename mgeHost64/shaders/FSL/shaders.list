@@ -31,3 +31,11 @@
 #vert skinned.vert
 #include "skinned.vert.fsl"
 #end
+
+#vert multimap.vert
+#include "multimap.vert.fsl"
+#end
+
+#frag multimap.frag
+#include "multimap.frag.fsl"
+#end

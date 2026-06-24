@@ -427,6 +427,25 @@ namespace ForgeRender {
         unsigned skBuilt = uploadGeometry(skBlob, (unsigned)sizeof(skBlob), 1);
         std::printf("[forge] scene-probe: skinned built %u/1\n", skBuilt);
 
+        // Tier 4: a dummy MULTI-MAP part (slot 2): a fullscreen triangle with 4 UV sets (set 1
+        // = set 0 here). Exercises the wide VB upload + multimap pipeline + draw.
+        IPC::GeomVertexWireMM mmVerts[3] = {
+            { -1.0f, -1.0f, 0.5f,  0,0,1,  0xFFFFFFFFu, { {0,0},{0,0},{0,0},{0,0} } },
+            {  3.0f, -1.0f, 0.5f,  0,0,1,  0xFFFFFFFFu, { {2,0},{2,0},{0,0},{0,0} } },
+            { -1.0f,  3.0f, 0.5f,  0,0,1,  0xFFFFFFFFu, { {0,2},{0,2},{0,0},{0,0} } },
+        };
+        uint16_t mmIdx[3] = { 0, 1, 2 };
+        uint8_t mmBlob[sizeof(IPC::GeomPartWire) + sizeof(mmVerts) + sizeof(mmIdx)];
+        IPC::GeomPartWire mmHdr = {};
+        mmHdr.slot = 2; mmHdr.revisionID = 0; mmHdr.flags = IPC::kGeomFlagMultiMap;
+        mmHdr.vertexCount = 3; mmHdr.indexCount = 3;
+        std::memcpy(mmBlob, &mmHdr, sizeof(mmHdr));
+        std::memcpy(mmBlob + sizeof(mmHdr), mmVerts, sizeof(mmVerts));
+        std::memcpy(mmBlob + sizeof(mmHdr) + sizeof(mmVerts), mmIdx, sizeof(mmIdx));
+        std::printf("[forge] scene-probe: uploadGeometry (multi-map)...\n");
+        unsigned mmBuilt = uploadGeometry(mmBlob, (unsigned)sizeof(mmBlob), 1);
+        std::printf("[forge] scene-probe: multi-map built %u/1\n", mmBuilt);
+
         // Identity viewProj + identity world, one static draw item at slot 0.
         float vp[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
         // Tier 1 lighting (6×float4): sun OFF, ambient 0.5, no fog — so the SLOT-0 white-texture
@@ -462,13 +481,14 @@ namespace ForgeRender {
         std::printf("[forge] scene-probe: renderScene #1 (builds path)...\n");
         bool ok = renderScene(vp, lt, &item, 1, (unsigned)sizeof(item),
                               skDraw, 1, (unsigned)sizeof(skDraw),
+                              nullptr, 0, 0,    // no multi-map this pass
                               nullptr, 0, 0);   // no point lights (CENTRE stays ~129)
 
         // SLOT-0 regression guard: sample gTextures[0] (default white) THROUGH the shader. Skinned
         // parts (TexIndex 0) and oversize-texture fallbacks all use slot 0, so it MUST sample white
         // (160,160,160), not black — a 1x1 default white regressed this (see buildOpaquePath).
         item.texIndex = 0;
-        renderScene(vp, lt, &item, 1, (unsigned)sizeof(item), skDraw, 1, (unsigned)sizeof(skDraw), nullptr, 0, 0);
+        renderScene(vp, lt, &item, 1, (unsigned)sizeof(item), skDraw, 1, (unsigned)sizeof(skDraw), nullptr, 0, 0, nullptr, 0, 0);
         std::printf("[forge] scene-probe: SLOT-0 (default white) sample -> expect ~129 (white x 0.5 ambient, tonemapped), NOT 0\n");
         debugReadbackCenterPixel();
 
@@ -497,11 +517,37 @@ namespace ForgeRender {
         std::printf("[forge] scene-probe: renderScene #2 (samples slot 1)...\n");
         ok = renderScene(vp, lt, &item, 1, (unsigned)sizeof(item),
                          skDraw, 1, (unsigned)sizeof(skDraw),
+                         nullptr, 0, 0,
                          nullptr, 0, 0);
         std::printf("[forge] scene-probe: renderScene returned %d (skinnedDrawn=%u)\n",
                     (int)ok, lastSkinnedDrawn());
 
         debugReadbackCenterPixel();   // ground-truth the frag output (defined after g_live)
+
+        // Third render: MULTI-MAP ONLY (slot 2) — 2 stages over the now-resident white texture
+        // (slot 1): BASE on UV set 0 + GLOW ADD on UV set 1. base = white*lit (lit = white*(0.5
+        // ambient) = 0.5); glow ADD white → 1.5 → tonemap ≈ 0.97 → CENTRE ≈ 248. Proves the MM
+        // pipeline builds + draws (multiMapDrawn=1) with no device removal.
+        {
+            IPC::MultiMapDrawWire mm = {};
+            mm.slot = 2;
+            std::memcpy(mm.world, ident, sizeof(ident));
+            mm.matDiffuse[0] = mm.matDiffuse[1] = mm.matDiffuse[2] = 1.0f;
+            mm.matAmbient[0] = mm.matAmbient[1] = mm.matAmbient[2] = 1.0f;
+            mm.vColSource = 0;
+            mm.alphaRef = 0.0f;
+            mm.stageCount = 2;
+            mm.stages[0] = IPC::packMMStage(1, 0, IPC::kMMOpBase);   // base, white slot 1, UV 0
+            mm.stages[1] = IPC::packMMStage(1, 1, IPC::kMMOpAdd);    // glow ADD, white slot 1, UV 1
+            std::printf("[forge] scene-probe: renderScene #3 (multi-map only)...\n");
+            ok = renderScene(vp, lt, nullptr, 0, 0,
+                             nullptr, 0, 0,
+                             &mm, 1, (unsigned)sizeof(mm),
+                             nullptr, 0, 0);
+            std::printf("[forge] scene-probe: multi-map renderScene returned %d (multiMapDrawn=%u) -> expect CENTRE ~248\n",
+                        (int)ok, lastMultiMapDrawn());
+            debugReadbackCenterPixel();
+        }
 
         shutdown();
         std::printf("[forge] scene-probe complete — %s\n", ok ? "OK" : "FAILED");
@@ -751,6 +797,19 @@ namespace {
         // which the static loop fills with its own texIndices). Written per frame in the skinned loop.
         Buffer*        pInstanceBufSkin = nullptr;
 
+        // --- Tier 4: multi-map (dark/detail/glow) path -------------------------------
+        // Wide vertex (GeomVertexWireMM, 4 UV sets) + its own pipeline. Shares the SAME
+        // SrtData/default.rootsig + opaque frag-side lighting (duplicated in multimap.frag).
+        // gBatch is bound to ONE 64KB world window (kMaxMultiMap=256 <= 1024 matrices).
+        Shader*        pMultiMapShader = nullptr;
+        Pipeline*      pMultiMapPipeline = nullptr;        // FRONT_FACE_CCW (non-mirrored)
+        Pipeline*      pMultiMapPipelineMirror = nullptr;  // FRONT_FACE_CW (mirrored world)
+        Buffer*        pMMWorldsBuf = nullptr;             // gBatch: one 64KB world window, persistent-mapped
+        DescriptorSet* pPerBatchSetMM = nullptr;           // gBatch bound to pMMWorldsBuf, 1 instance
+        // Per-draw instance VB (kMMInstU32 uint32 slots): { Meta, stages[4], matDiff3, matAmb3, matEmis3 },
+        // one entry per drawn part (indexed by multiMapDrawn via firstInstance). CPU-mapped, per frame.
+        Buffer*        pInstanceBufMM = nullptr;
+
         // --- Buffer consolidation: one shared mega VB + IB for STATIC non-skinned parts ----
         // Kills the per-draw VB/IB binds (the DX9-shaped bottleneck): bind these ONCE, draw each
         // part with firstVertex(BaseVertexLocation)/firstIndex offsets into them. Free-list
@@ -839,6 +898,14 @@ namespace {
     constexpr uint32_t kMaxBonesPerPart = 32;
     constexpr uint32_t kSkinnedPerWindow = kBatchSize / kMaxBonesPerPart;   // 32
     constexpr uint32_t kMaxSkinned = kSkinnedPerWindow * kMaxBatches;       // 256
+
+    // Tier 4 multi-map: ONE 64KB world window holds kBatchSize(1024) matrices; cap at 256
+    // parts/frame (< 1024 → a single window, no batching). Per-instance VB stride (uint32 slots):
+    //   [0] Meta (DrawIndex|stageCount|vColSource|alphaRef)   [1..4] stages[4]
+    //   [5..7] matDiffuse.rgb   [8..10] matAmbient.rgb   [11..13] matEmissive.rgb
+    // 14 * 4 = 56 bytes. Rare geometry → a flat 256-cap (log-drop, no fallback) is ample.
+    constexpr uint32_t kMaxMultiMap = 256;
+    constexpr uint32_t kMMInstU32   = 14;
 
     // Tier 3a point lights: per-frame cbuffer of MAX_POINT_LIGHTS lights (3 float4 each) +
     // a float4 header (count). MUST match IPC::kMaxPointLights / MAX_POINT_LIGHTS (opaque.srt.h).
@@ -1389,8 +1456,145 @@ namespace {
             }
         }
 
-        std::printf("[forge] opaque scene path ready (depth %ux%u, maxDraws=%u, batched %ux%u, maxSkinned=%u)\n",
-                    width, height, kMaxDraws, kMaxBatches, kBatchSize, kMaxSkinned);
+        // --- Tier 4: multi-map shader + pipelines + world window + instance VB + descriptor set ---
+        // Wide vertex (4 UV sets) + per-draw stage list. Shares default.rootsig + SrtData; gBatch
+        // is bound to ONE 64KB world window (pMMWorldsBuf), drawn with firstInstance = the part's
+        // world index. Mirrors the static/skinned block structure.
+        {
+            ShaderLoadDesc mmDesc = {};
+            mmDesc.mVert.pFileName = "multimap.vert";
+            mmDesc.mFrag.pFileName = "multimap.frag";
+            addShader(R, &mmDesc, &g_live.pMultiMapShader);
+            if (!g_live.pMultiMapShader) {
+                std::printf("[forge] addShader(multimap) FAILED\n");
+                return false;
+            }
+
+            // Multi-map vertex layout: binding 0 = mesh (IPC::GeomVertexWireMM, stride 60:
+            // pos@0, normal@12, color@24, uv0@28, uv1@36, uv2@44, uv3@52); binding 1 = per-INSTANCE
+            // { Meta @0, Stages uint4 @4, matDiffuse @20, matAmbient @32, matEmissive @44 } (stride 56).
+            VertexLayout mvl = {};
+            mvl.mBindingCount = 2;
+            mvl.mBindings[0].mStride = sizeof(IPC::GeomVertexWireMM);
+            mvl.mBindings[0].mRate = VERTEX_BINDING_RATE_VERTEX;
+            mvl.mBindings[1].mStride = kMMInstU32 * sizeof(uint32_t);
+            mvl.mBindings[1].mRate = VERTEX_BINDING_RATE_INSTANCE;
+            mvl.mAttribCount = 12;
+            mvl.mAttribs[0].mSemantic = SEMANTIC_POSITION;
+            mvl.mAttribs[0].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
+            mvl.mAttribs[0].mBinding = 0; mvl.mAttribs[0].mLocation = 0; mvl.mAttribs[0].mOffset = 0;
+            mvl.mAttribs[1].mSemantic = SEMANTIC_NORMAL;
+            mvl.mAttribs[1].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
+            mvl.mAttribs[1].mBinding = 0; mvl.mAttribs[1].mLocation = 1; mvl.mAttribs[1].mOffset = 12;
+            mvl.mAttribs[2].mSemantic = SEMANTIC_COLOR;
+            mvl.mAttribs[2].mFormat = TinyImageFormat_B8G8R8A8_UNORM;   // D3DCOLOR byte order
+            mvl.mAttribs[2].mBinding = 0; mvl.mAttribs[2].mLocation = 2; mvl.mAttribs[2].mOffset = 24;
+            mvl.mAttribs[3].mSemantic = SEMANTIC_TEXCOORD0;
+            mvl.mAttribs[3].mFormat = TinyImageFormat_R32G32_SFLOAT;
+            mvl.mAttribs[3].mBinding = 0; mvl.mAttribs[3].mLocation = 3; mvl.mAttribs[3].mOffset = 28;
+            mvl.mAttribs[4].mSemantic = SEMANTIC_TEXCOORD1;
+            mvl.mAttribs[4].mFormat = TinyImageFormat_R32G32_SFLOAT;
+            mvl.mAttribs[4].mBinding = 0; mvl.mAttribs[4].mLocation = 4; mvl.mAttribs[4].mOffset = 36;
+            mvl.mAttribs[5].mSemantic = SEMANTIC_TEXCOORD2;
+            mvl.mAttribs[5].mFormat = TinyImageFormat_R32G32_SFLOAT;
+            mvl.mAttribs[5].mBinding = 0; mvl.mAttribs[5].mLocation = 5; mvl.mAttribs[5].mOffset = 44;
+            mvl.mAttribs[6].mSemantic = SEMANTIC_TEXCOORD3;
+            mvl.mAttribs[6].mFormat = TinyImageFormat_R32G32_SFLOAT;
+            mvl.mAttribs[6].mBinding = 0; mvl.mAttribs[6].mLocation = 6; mvl.mAttribs[6].mOffset = 52;
+            mvl.mAttribs[7].mSemantic = SEMANTIC_TEXCOORD4;       // Meta (per-instance uint)
+            mvl.mAttribs[7].mFormat = TinyImageFormat_R32_UINT;
+            mvl.mAttribs[7].mBinding = 1; mvl.mAttribs[7].mLocation = 7; mvl.mAttribs[7].mOffset = 0;
+            mvl.mAttribs[8].mSemantic = SEMANTIC_TEXCOORD5;       // Stages (per-instance uint4)
+            mvl.mAttribs[8].mFormat = TinyImageFormat_R32G32B32A32_UINT;
+            mvl.mAttribs[8].mBinding = 1; mvl.mAttribs[8].mLocation = 8; mvl.mAttribs[8].mOffset = sizeof(uint32_t);
+            mvl.mAttribs[9].mSemantic = SEMANTIC_TEXCOORD6;       // MatDiffuse (per-instance)
+            mvl.mAttribs[9].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
+            mvl.mAttribs[9].mBinding = 1; mvl.mAttribs[9].mLocation = 9; mvl.mAttribs[9].mOffset = 5 * sizeof(uint32_t);
+            mvl.mAttribs[10].mSemantic = SEMANTIC_TEXCOORD7;      // MatAmbient (per-instance)
+            mvl.mAttribs[10].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
+            mvl.mAttribs[10].mBinding = 1; mvl.mAttribs[10].mLocation = 10; mvl.mAttribs[10].mOffset = 8 * sizeof(uint32_t);
+            mvl.mAttribs[11].mSemantic = SEMANTIC_TEXCOORD8;      // MatEmissive (per-instance)
+            mvl.mAttribs[11].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
+            mvl.mAttribs[11].mBinding = 1; mvl.mAttribs[11].mLocation = 11; mvl.mAttribs[11].mOffset = 11 * sizeof(uint32_t);
+
+            DepthStateDesc mmDepth = {};
+            mmDepth.mDepthTest = true;
+            mmDepth.mDepthWrite = true;
+            mmDepth.mDepthFunc = CMP_GEQUAL;   // REVERSE-Z (same as static)
+
+            RasterizerStateDesc mmRaster = {};
+            mmRaster.mCullMode = CULL_MODE_BACK;
+            mmRaster.mFrontFace = FRONT_FACE_CCW;
+
+            PipelineDesc mmPd = {};
+            mmPd.mType = PIPELINE_TYPE_GRAPHICS;
+            GraphicsPipelineDesc& mg = mmPd.mGraphicsDesc;
+            mg.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+            mg.mRenderTargetCount = 1;
+            mg.pColorFormats = &g_live.pRT->mFormat;
+            mg.mSampleCount = (SampleCount)g_live.sampleCount;
+            mg.mSampleQuality = 0;
+            mg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+            mg.pDepthState = &mmDepth;
+            mg.pVertexLayout = &mvl;
+            mg.pRasterizerState = &mmRaster;
+            mg.pShaderProgram = g_live.pMultiMapShader;
+            addPipeline(R, &mmPd, &g_live.pMultiMapPipeline);
+            if (!g_live.pMultiMapPipeline) {
+                std::printf("[forge] addPipeline(multimap) FAILED\n");
+                return false;
+            }
+            RasterizerStateDesc mmRasterMirror = mmRaster;
+            mmRasterMirror.mFrontFace = FRONT_FACE_CW;
+            mg.pRasterizerState = &mmRasterMirror;
+            addPipeline(R, &mmPd, &g_live.pMultiMapPipelineMirror);
+            if (!g_live.pMultiMapPipelineMirror) {
+                std::printf("[forge] addPipeline(multimap mirror) FAILED\n");
+                return false;
+            }
+
+            // One 64KB world window (a valid full CBV; kMaxMultiMap=256 <= 1024 matrices).
+            BufferLoadDesc mwb = {};
+            mwb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            mwb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            mwb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            mwb.mDesc.mSize = kBatchBytes;
+            mwb.mDesc.pName = "mmWorldsCbv";
+            mwb.pData = nullptr;
+            mwb.ppBuffer = &g_live.pMMWorldsBuf;
+            addResource(&mwb, nullptr);
+
+            // Per-draw instance VB: kMaxMultiMap entries of kMMInstU32 uint32 (indexed by
+            // multiMapDrawn via firstInstance). CPU-mapped, written per frame in the MM loop.
+            BufferLoadDesc mib = {};
+            mib.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+            mib.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            mib.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            mib.mDesc.mSize = (uint64_t)kMaxMultiMap * kMMInstU32 * sizeof(uint32_t);
+            mib.mDesc.pName = "instanceVBMM";
+            mib.pData = nullptr;
+            mib.ppBuffer = &g_live.pInstanceBufMM;
+            addResource(&mib, nullptr);
+
+            waitForAllResourceLoads();
+            if (!g_live.pMMWorldsBuf || !g_live.pInstanceBufMM) {
+                return false;
+            }
+
+            // Multi-map PerBatch set (1 instance): gBatch = the single world window.
+            DescriptorSetDesc mbDesc = SRT_SET_DESC(SrtData, PerBatch, 1, 0);
+            addDescriptorSet(R, &mbDesc, &g_live.pPerBatchSetMM);
+            if (!g_live.pPerBatchSetMM) {
+                return false;
+            }
+            DescriptorData mp = {};
+            mp.mIndex = SRT_RES_IDX(SrtData, PerBatch, gBatch);
+            mp.ppBuffers = &g_live.pMMWorldsBuf;
+            updateDescriptorSet(R, 0, g_live.pPerBatchSetMM, 1, &mp);
+        }
+
+        std::printf("[forge] opaque scene path ready (depth %ux%u, maxDraws=%u, batched %ux%u, maxSkinned=%u, maxMultiMap=%u)\n",
+                    width, height, kMaxDraws, kMaxBatches, kBatchSize, kMaxSkinned, kMaxMultiMap);
         return true;
     }
 
@@ -1413,10 +1617,11 @@ namespace {
         uint32_t vertexCount;
         uint32_t indexCount;
         bool     valid;
-        bool     skinned;       // M-Skinning: VB is SkinnedVertexWire (stride 44)
+        bool     skinned;       // M-Skinning: VB is SkinnedVertexWire (stride 56)
+        bool     multimap;      // Tier 4: VB is GeomVertexWireMM (stride 60); own per-mesh VB
         // Buffer consolidation: static non-skinned parts live in the shared mega arena (no
-        // per-mesh VB/IB) and draw with byte offsets. Skinned + dynamic-morph parts are NOT
-        // in the arena (vb/ib above). Exactly one of: inArena | skinned | dynamic.
+        // per-mesh VB/IB) and draw with byte offsets. Skinned + multimap + dynamic-morph parts
+        // are NOT in the arena (vb/ib above). Exactly one of: inArena | skinned | multimap | dynamic.
         bool     inArena;
         uint64_t vbOff;         // byte offset into pArenaVB (valid when inArena)
         uint64_t ibOff;         // byte offset into pArenaIB (valid when inArena)
@@ -1454,6 +1659,7 @@ namespace {
     constexpr uint16_t kDynPromoteStreak = 2;
     unsigned  g_lastDrawn = 0;  // static parts actually drawn in the last renderScene
     unsigned  g_lastSkinnedDrawn = 0;  // skinned parts actually drawn in the last renderScene
+    unsigned  g_lastMultiMapDrawn = 0; // multi-map parts actually drawn in the last renderScene
     unsigned  g_lastLightCount = 0;    // point lights uploaded in the last renderScene
 
     bool ensureMeshSlot(uint32_t slot) {
@@ -1706,6 +1912,7 @@ namespace ForgeRender {
     bool renderScene(const float* viewProj, const float* lighting, const void* drawBlob,
                      unsigned drawCount, unsigned drawBytes,
                      const void* skinnedBlob, unsigned skinnedCount, unsigned skinnedBytes,
+                     const void* multiMapBlob, unsigned multiMapCount, unsigned multiMapBytes,
                      const void* lightBlob, unsigned lightCount, unsigned lightBytes) {
         if (!g_live.pRenderer) {
             return false;
@@ -2069,6 +2276,82 @@ namespace ForgeRender {
             }
         }
 
+        // --- Tier 4: multi-map draw loop (dark/detail/glow) --------------------------
+        // MultiMapDrawWire[]: each part writes its world into pMMWorldsBuf[idx] and its per-draw
+        // stage/material into pInstanceBufMM[idx], then draws with firstInstance=idx so the
+        // per-instance Meta.DrawIndex selects gBatch.worlds[idx]. Capped at kMaxMultiMap (256).
+        uint32_t multiMapDrawn = 0;
+        if (multiMapBlob && multiMapCount && multiMapBytes &&
+            g_live.pMultiMapPipeline && g_live.pMultiMapPipelineMirror) {
+            cmdBindPipeline(g_live.pCmd, g_live.pMultiMapPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetMM);   // single world window
+
+            const uint32_t haveMM = multiMapBytes / (uint32_t)sizeof(IPC::MultiMapDrawWire);
+            const uint32_t nMM = (multiMapCount < haveMM) ? multiMapCount : haveMM;
+            const IPC::MultiMapDrawWire* mmItems = (const IPC::MultiMapDrawWire*)multiMapBlob;
+            int  boundMMMirror = 0;
+            bool mmDropLogged = false;
+            for (uint32_t k = 0; k < nMM; ++k) {
+                if (multiMapDrawn >= kMaxMultiMap) {
+                    if (!mmDropLogged) {
+                        LOGF(eWARNING, "[forge] multi-map over cap %u — dropping extra parts (count=%u)",
+                             kMaxMultiMap, multiMapCount);
+                        std::printf("[forge] multi-map over cap %u — dropping extra parts (count=%u)\n",
+                                    kMaxMultiMap, multiMapCount);
+                        mmDropLogged = true;
+                    }
+                    break;   // no fallback (PD1)
+                }
+                const IPC::MultiMapDrawWire& it = mmItems[k];
+                const uint32_t slot = it.slot;
+                if (slot >= g_meshHigh || !g_meshes[slot].valid || !g_meshes[slot].multimap) {
+                    continue;   // mesh not uploaded yet / not a multi-map mesh
+                }
+                const uint32_t idx = multiMapDrawn;
+
+                // world → the single 64KB window at matrix slot idx.
+                uint8_t* dst = (uint8_t*)g_live.pMMWorldsBuf->pCpuMappedAddress;
+                std::memcpy(dst + (size_t)idx * 64, it.world, 64);
+
+                // Instance entry idx: Meta(DrawIndex|stageCount|vColSource|alphaRef) + stages + material.
+                uint32_t* inst = (uint32_t*)g_live.pInstanceBufMM->pCpuMappedAddress;
+                uint32_t* e = inst + (size_t)idx * kMMInstU32;
+                const uint32_t sc  = (it.stageCount > 4u) ? 4u : it.stageCount;
+                float ar = it.alphaRef < 0.0f ? 0.0f : (it.alphaRef > 1.0f ? 1.0f : it.alphaRef);
+                const uint32_t aref = (uint32_t)(ar * 255.0f + 0.5f) & 0xFFu;
+                const uint32_t vcs  = it.vColSource & 0x3u;
+                e[0] = (idx & 0xFFu) | (sc << 8u) | (vcs << 11u) | (aref << 16u);   // Meta
+                e[1] = it.stages[0]; e[2] = it.stages[1]; e[3] = it.stages[2]; e[4] = it.stages[3];
+                float* fe = (float*)e;
+                fe[5]  = it.matDiffuse[0];  fe[6]  = it.matDiffuse[1];  fe[7]  = it.matDiffuse[2];
+                fe[8]  = it.matAmbient[0];  fe[9]  = it.matAmbient[1];  fe[10] = it.matAmbient[2];
+                fe[11] = it.matEmissive[0]; fe[12] = it.matEmissive[1]; fe[13] = it.matEmissive[2];
+
+                // Mirror pipeline by world determinant (negative = mirrored left-side part).
+                const int mirror = worldMirrored(it.world) ? 1 : 0;
+                if (mirror != boundMMMirror) {
+                    cmdBindPipeline(g_live.pCmd, mirror ? g_live.pMultiMapPipelineMirror
+                                                        : g_live.pMultiMapPipeline);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetMM);
+                    boundMMMirror = mirror;
+                }
+
+                HostMesh& mm = g_meshes[slot];
+                Buffer*  vbs[2]     = { mm.vb, g_live.pInstanceBufMM };
+                uint32_t strides[2] = { (uint32_t)sizeof(IPC::GeomVertexWireMM), (uint32_t)(kMMInstU32 * sizeof(uint32_t)) };
+                cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                cmdBindIndexBuffer(g_live.pCmd, mm.ib, INDEX_TYPE_UINT16, 0);
+                cmdDrawIndexedInstanced(g_live.pCmd, mm.indexCount, 0, 1, 0, idx);   // firstInstance=idx
+                ++multiMapDrawn;
+            }
+        }
+
         cmdBindRenderTargets(g_live.pCmd, nullptr);
 
         if (g_live.sampleCount > 1) {
@@ -2134,15 +2417,16 @@ namespace ForgeRender {
         g_live.firstFrame = false;
         g_lastDrawn = drawn;
         g_lastSkinnedDrawn = skinnedDrawn;
+        g_lastMultiMapDrawn = multiMapDrawn;
 
         // Host-side heartbeat to mgeHost64.log (LOG::logline; LOGF goes to uncaptured stdout).
         // dynamic = meshes in the upload-heap ring (must stay tiny — hundreds = over-promotion);
         // meshHigh = total slots ever populated (monotonic leak check). Lets us correlate the
         // client's [hb] frame cost with what the Forge renderer is actually drawing.
         if ((g_renderFrame % 300u) == 0u) {
-            LOG::logline(">> [forge-hb] frame=%u drawn=%u skinned=%u dynamic=%u meshHigh=%u "
+            LOG::logline(">> [forge-hb] frame=%u drawn=%u skinned=%u multimap=%u dynamic=%u meshHigh=%u "
                          "| record=%.2fms gpu=%.2fms (avg/frame over 300)",
-                         g_renderFrame, drawn, skinnedDrawn, g_dynamicCount, g_meshHigh,
+                         g_renderFrame, drawn, skinnedDrawn, multiMapDrawn, g_dynamicCount, g_meshHigh,
                          g_recAccum / 300.0, g_gpuAccum / 300.0);
             g_recAccum = 0.0;
             g_gpuAccum = 0.0;
@@ -2152,6 +2436,7 @@ namespace ForgeRender {
 
     unsigned lastDrawn() { return g_lastDrawn; }
     unsigned lastSkinnedDrawn() { return g_lastSkinnedDrawn; }
+    unsigned lastMultiMapDrawn() { return g_lastMultiMapDrawn; }
 
     void debugReadbackCenterPixel() {
         if (!g_live.pRenderer || !g_live.pRT) {
@@ -2431,9 +2716,11 @@ namespace ForgeRender {
             std::memcpy(&hdr, p, sizeof(hdr));
             p += sizeof(hdr);
 
-            const bool isSkinned = (hdr.flags & IPC::kGeomFlagSkinned) != 0;
-            const uint64_t vStride = isSkinned ? sizeof(IPC::SkinnedVertexWire)
-                                               : sizeof(IPC::GeomVertexWire);
+            const bool isSkinned  = (hdr.flags & IPC::kGeomFlagSkinned) != 0;
+            const bool isMultiMap = (hdr.flags & IPC::kGeomFlagMultiMap) != 0;
+            const uint64_t vStride = isSkinned  ? sizeof(IPC::SkinnedVertexWire)
+                                   : isMultiMap ? sizeof(IPC::GeomVertexWireMM)
+                                                : sizeof(IPC::GeomVertexWire);
             const uint64_t vbBytes = (uint64_t)hdr.vertexCount * vStride;
             const uint64_t ibBytes = (uint64_t)hdr.indexCount * sizeof(uint16_t);
             if (p + vbBytes + ibBytes > end) {
@@ -2456,7 +2743,8 @@ namespace ForgeRender {
             // recycled slots) reset the streak and stay GPU_ONLY: an upload-heap VB has
             // high-latency uncached GPU vertex fetch, so mass-promoting churn tanks render.
             const bool sameShape = m.valid && m.vertexCount == hdr.vertexCount
-                                && m.indexCount == hdr.indexCount && m.skinned == isSkinned;
+                                && m.indexCount == hdr.indexCount && m.skinned == isSkinned
+                                && m.multimap == isMultiMap;
             const bool consecutive = m.valid && (g_renderFrame == m.lastUploadFrame + 1);
 
             if (m.valid && !sameShape) {
@@ -2532,11 +2820,12 @@ namespace ForgeRender {
                 m.valid = false;
             }
 
-            // --- static build: NON-SKINNED -> shared mega arena (bind-once, offset draws);
-            //     SKINNED -> per-mesh GPU_ONLY (few draws, not worth consolidating) ---
-            m.skinned = isSkinned;
+            // --- static build: PLAIN STATIC -> shared mega arena (bind-once, offset draws);
+            //     SKINNED / MULTI-MAP -> per-mesh GPU_ONLY (wide/odd stride, own VB) ---
+            m.skinned  = isSkinned;
+            m.multimap = isMultiMap;
 
-            if (!isSkinned) {
+            if (!isSkinned && !isMultiMap) {
                 // Sub-allocate the mega VB + IB; write the sub-ranges via BufferUpdateDesc.
                 uint64_t vbo = g_arenaVB.alloc(vbBytes);
                 uint64_t ibo = g_arenaIB.alloc(ibBytes);
@@ -2677,6 +2966,13 @@ namespace ForgeRender {
         if (g_live.pSkinnedPipeline)       { removePipeline(R, g_live.pSkinnedPipeline); }
         if (g_live.pSkinnedPipelineMirror) { removePipeline(R, g_live.pSkinnedPipelineMirror); }
         if (g_live.pSkinnedShader)         { removeShader(R, g_live.pSkinnedShader); }
+        // Tier 4 multi-map teardown.
+        if (g_live.pPerBatchSetMM)          { removeDescriptorSet(R, g_live.pPerBatchSetMM); }
+        if (g_live.pMMWorldsBuf)            { removeResource(g_live.pMMWorldsBuf); }
+        if (g_live.pInstanceBufMM)          { removeResource(g_live.pInstanceBufMM); }
+        if (g_live.pMultiMapPipeline)       { removePipeline(R, g_live.pMultiMapPipeline); }
+        if (g_live.pMultiMapPipelineMirror) { removePipeline(R, g_live.pMultiMapPipelineMirror); }
+        if (g_live.pMultiMapShader)         { removeShader(R, g_live.pMultiMapShader); }
         if (g_live.pMSAAColor)      { removeRenderTarget(R, g_live.pMSAAColor); }
         if (g_live.pDepth)          { removeRenderTarget(R, g_live.pDepth); }
         if (g_live.pFence)    { exitFence(R, g_live.pFence); }

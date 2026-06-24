@@ -94,6 +94,12 @@ namespace MGE::GeometryCache {
         uint16_t vbStride;
         uint32_t vbFVF;
         const char*        textureName; // SourceTexture::fileName, null if none
+        // Multi-map sibling source filenames (SourceTexture::fileName), for resolving the
+        // dark/detail/glow maps to Forge bindless slots. Null when the map is absent. The
+        // D3D9 cache color pass uses the d3d* textures above; the Forge path needs the names.
+        const char*        darkTextureName;
+        const char*        detailTextureName;
+        const char*        glowTextureName;
         float alphaRef;
         bool  alphaTest;
         bool  blendEnable;

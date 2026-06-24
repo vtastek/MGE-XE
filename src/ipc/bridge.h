@@ -294,6 +294,14 @@ namespace IPC {
         IN std::uint32_t skinnedCount;
         IN std::uint32_t skinnedBytes;
 
+        // Tier 4 multi-map: parallel per-frame draw list of MultiMapDrawWire[] (geomwire.h) —
+        // static opaque parts carrying dark/detail/glow sibling maps, drawn through the host's
+        // wide multimap pipeline. Invalid ⇒ no multi-map draws. The scene path runs when ANY of
+        // drawList / skinnedList / multiMapList is valid.
+        IN VecId multiMapList;
+        IN std::uint32_t multiMapCount;
+        IN std::uint32_t multiMapBytes;
+
         // Tier 3a point lights: a chunked byte vec of PointLightWire[] (geomwire.h),
         // world-space, uploaded into the host's light cbuffer for the per-pixel FFE
         // evalOnePointLight loop. Invalid / count 0 ⇒ no point lights this frame.

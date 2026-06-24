@@ -1,0 +1,77 @@
+// mgeHost64 — Tier 4 multi-map scene (vertex stage).
+//
+// A STATIC opaque part carrying dark/detail/glow sibling maps (e.g. "Glow in the Dark"
+// night windows). Wide vertex: pos+normal+color + 4 UV sets (binding 0). Per-INSTANCE
+// (binding 1): a Meta word (DrawIndex + stageCount + vColSource + alphaRef), the 4 packed
+// stage words, and the Tier 2b material. Reuses the opaque SRT (gFrameData + gBatch.worlds
+// as ONE 256-matrix window) + the shared default.rootsig. Same matrix/reverse-Z convention
+// as opaque.vert. Emits clip pos + world normal/pos + 4 UVs + per-draw stage/material for
+// the multimap.frag fixed-function stage blend.
+
+#include "opaque.srt.h"
+
+STRUCT(VSInput)
+{
+    DATA(float3, Position,   POSITION);
+    DATA(float3, Normal,     NORMAL);
+    DATA(float4, Color,      COLOR);       // per-vertex DiffAmb colour (white when unused)
+    DATA(float2, Uv0,        TEXCOORD0);   // per-vertex UV set 0
+    DATA(float2, Uv1,        TEXCOORD1);   // per-vertex UV set 1
+    DATA(float2, Uv2,        TEXCOORD2);   // per-vertex UV set 2
+    DATA(float2, Uv3,        TEXCOORD3);   // per-vertex UV set 3
+    DATA(uint,   Meta,       TEXCOORD4);   // per-instance: DrawIndex(0-7)|stageCount(8-10)|vColSource(11-12)|alphaRef*255(16-23)
+    DATA(uint4,  Stages,     TEXCOORD5);   // per-instance: 4 packed stage words (texIndex(16)|uvSet(16-17)|op(18-19))
+    DATA(float3, MatDiffuse, TEXCOORD6);   // per-instance: material diffuse rgb
+    DATA(float3, MatAmbient, TEXCOORD7);   // per-instance: material ambient rgb
+    DATA(float3, MatEmissive,TEXCOORD8);   // per-instance: material emissive rgb
+};
+
+STRUCT(VSOutput)
+{
+    DATA(float4,      Position, SV_Position);
+    DATA(float3,      Normal,   NORMAL);
+    DATA(float2,      Uv0,      TEXCOORD0);
+    DATA(float2,      Uv1,      TEXCOORD1);
+    DATA(float2,      Uv2,      TEXCOORD2);
+    DATA(float2,      Uv3,      TEXCOORD3);
+    DATA(float,       Fog,      TEXCOORD4);   // MW fog scalar (1 = clear)
+    DATA(float4,      Color,    COLOR);       // per-vertex DiffAmb colour
+    DATA(FLAT(float3),MatDiffuse, TEXCOORD5); // Tier 2b material (per draw)
+    DATA(FLAT(float3),MatAmbient, TEXCOORD6);
+    DATA(FLAT(float3),MatEmissive,TEXCOORD7);
+    DATA(float3,      WorldPos,   TEXCOORD8); // Tier 3a: world position for point-light eval
+    DATA(FLAT(uint4), Stages,     TEXCOORD9); // 4 packed stage words
+    DATA(FLAT(uint),  Packed,     TEXCOORD10);// stageCount(0-2)|vColSource(3-4)|alphaRef*255(8-15)  (== Meta>>8)
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+VSOutput VS_MAIN( VSInput In )
+{
+    INIT_MAIN;
+    VSOutput Out;
+
+    uint drawIndex = In.Meta & 0xFFu;
+    // Cbuffer matrices are column-major (DXC default), so mul(M, v) with the D3DX bytes
+    // uploaded as-is == D3DX v*M. The worlds buffer is ONE 256-matrix window for multimap.
+    float4x4 world = gBatch.worlds[drawIndex];
+    float4 worldPos = mul(world, float4(In.Position, 1.0f));
+    Out.Position = mul(gFrameData.viewProj, worldPos);
+    Out.Normal = mul((float3x3)world, In.Normal);
+    Out.WorldPos = worldPos.xyz;
+    Out.Uv0 = In.Uv0;
+    Out.Uv1 = In.Uv1;
+    Out.Uv2 = In.Uv2;
+    Out.Uv3 = In.Uv3;
+    Out.Color = In.Color;
+    Out.MatDiffuse  = In.MatDiffuse;
+    Out.MatAmbient  = In.MatAmbient;
+    Out.MatEmissive = In.MatEmissive;
+    Out.Stages = In.Stages;
+    // Packed = Meta>>8 = stageCount(0-2)|vColSource(3-4)|alphaRef*255(8-15).
+    Out.Packed = In.Meta >> 8u;
+    // MW near fog (per-vertex, matches opaque.vert).
+    float dist = length(worldPos.xyz - gFrameData.eyePos.xyz);
+    Out.Fog = saturate((gFrameData.fogParams.y - dist)
+                       / (gFrameData.fogParams.y - gFrameData.fogParams.x));
+    RETURN(Out);
+}

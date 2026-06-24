@@ -1,0 +1,110 @@
+// mgeHost64 — Tier 4 multi-map scene (fragment stage).
+//
+// Computes the SAME lit term as opaque.frag (Tier 2b vColSource material routing + Tier 3a
+// point lights), then runs a fixed-function stage loop replicating rendercachedcolor.cpp's
+// reconstruction of MW's PPL multi-texture blend (ordered by texCoordSet on the client):
+//   BASE  : c = tex.rgb * lit;  baseA = tex.a   (arg2 = DIFFUSE even when not stage 0)
+//   MOD   : c *= tex.rgb        MOD2X : c *= tex.rgb*2        ADD : c += tex.rgb
+// alpha test runs on the BASE stage. The lit + point-light block below is DUPLICATED from
+// opaque.frag — keep the two in LOCKSTEP so Tier 1/2b/3a stay identical across both paths.
+
+#include "opaque.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4,      Position, SV_Position);
+    DATA(float3,      Normal,   NORMAL);
+    DATA(float2,      Uv0,      TEXCOORD0);
+    DATA(float2,      Uv1,      TEXCOORD1);
+    DATA(float2,      Uv2,      TEXCOORD2);
+    DATA(float2,      Uv3,      TEXCOORD3);
+    DATA(float,       Fog,      TEXCOORD4);
+    DATA(float4,      Color,    COLOR);
+    DATA(FLAT(float3),MatDiffuse, TEXCOORD5);
+    DATA(FLAT(float3),MatAmbient, TEXCOORD6);
+    DATA(FLAT(float3),MatEmissive,TEXCOORD7);
+    DATA(float3,      WorldPos,   TEXCOORD8);
+    DATA(FLAT(uint4), Stages,     TEXCOORD9);
+    DATA(FLAT(uint),  Packed,     TEXCOORD10);
+};
+
+// Static semi-HDR tonemap — ported verbatim from XE FixedFuncEmu.fx::tonemap (== opaque.frag).
+float3 tonemap(float3 c)
+{
+    c = clamp(c, 0.0f, 2.2f);
+    c = (((0.0548303f * c - 0.189786f) * c - 0.154732f) * c + 1.12969f) * c;
+    return c;
+}
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    float3 N = normalize(In.Normal);
+    // --- BEGIN lit block (DUPLICATED from opaque.frag — keep in lockstep) ---
+    float  ndl = saturate(dot(N, -gFrameData.sunDir.xyz));
+    float3 d = gFrameData.sunCol.rgb * ndl;
+    float3 a = gFrameData.ambCol.rgb;
+    {
+        uint nLights = (uint)gLights.lightParams.x;
+        for (uint i = 0; i < nLights; ++i)
+        {
+            float4 posR    = gLights.lights[i * 3u + 0u];
+            float3 lightCol= gLights.lights[i * 3u + 1u].rgb;
+            float3 fo      = gLights.lights[i * 3u + 2u].xyz;
+            float  radius  = posR.w;
+
+            float3 toLight = posR.xyz - In.WorldPos;
+            float  dist2   = dot(toLight, toLight);
+            float  invDist = rsqrt(max(dist2, 1e-8f));
+            float  dist    = dist2 * invDist;
+
+            float  att = 1.0f / max(fo.z * dist2 + fo.y * dist + fo.x, 1e-4f);
+            att *= 1.0f - smoothstep(radius, 2.0f * radius, dist);
+
+            float  lambert = saturate(dot(N, toLight) * invDist);
+            d += lambert * att * lightCol;
+        }
+    }
+    uint vColSource = (In.Packed >> 3u) & 0x3u;
+    float3 lit;
+    if (vColSource == 2u) {
+        lit = In.Color.rgb * (d + a) + In.MatEmissive;
+    } else if (vColSource == 1u) {
+        lit = In.MatDiffuse * d + In.MatAmbient * a + In.Color.rgb;
+    } else {
+        lit = In.MatDiffuse * d + In.MatAmbient * a + In.MatEmissive;
+    }
+    // --- END lit block ---
+
+    // Fixed-function stage loop. CURRENT defaults to the lit material (DIFFUSE). BASE replaces
+    // c with tex*lit and records the base alpha; MOD/MOD2X/ADD fold the sibling maps over it.
+    uint  stageCount = In.Packed & 0x7u;
+    float alphaRef   = float((In.Packed >> 8u) & 0xFFu) * (1.0f / 255.0f);
+    float3 c = lit;
+    float  baseA = 1.0f;
+    for (uint s = 0u; s < 4u; ++s)
+    {
+        if (s >= stageCount) { break; }
+        // Manual selects avoid dynamic indexing of the uint4 / float2 interpolators.
+        uint sw = (s == 0u) ? In.Stages.x : (s == 1u) ? In.Stages.y
+                : (s == 2u) ? In.Stages.z : In.Stages.w;
+        uint tex   = sw & 0xFFFFu;
+        uint uvSet = (sw >> 16u) & 0x3u;
+        uint op    = (sw >> 18u) & 0x3u;
+        float2 uv = (uvSet == 0u) ? In.Uv0 : (uvSet == 1u) ? In.Uv1
+                  : (uvSet == 2u) ? In.Uv2 : In.Uv3;
+        float4 t = SampleTex2D(gTextures[tex], gSamplerAnisotropic, uv);
+        if (op == 0u)      { c = t.rgb * lit; baseA = t.a; }   // BASE (MOD x DIFFUSE)
+        else if (op == 1u) { c *= t.rgb; }                     // MOD
+        else if (op == 2u) { c *= t.rgb * 2.0f; }              // MOD2X
+        else               { c += t.rgb; }                     // ADD
+    }
+
+    // Alpha test on the BASE stage (other stages keep-prev alpha; irrelevant to coverage).
+    if (baseA < alphaRef) { discard; }
+
+    c = tonemap(c);
+    c = lerp(gFrameData.fogColNear.rgb, c, In.Fog);
+    RETURN(float4(c, 1.0f));
+}

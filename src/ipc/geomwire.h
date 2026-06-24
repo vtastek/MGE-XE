@@ -44,8 +44,21 @@ namespace IPC {
         float u, v;                  // base-map UV (set 0); skinned meshes are single-UV
     };
 
+    // Tier 4 multi-map: a STATIC opaque part carrying dark/detail/glow sibling maps on the
+    // same NiTexturingProperty (e.g. "Glow in the Dark" night windows). It needs up to 4 UV
+    // sets, so it rides a SEPARATE wide vertex format + its own host pipeline (single-UV
+    // geometry — the 99% case — stays lean at 36 B GeomVertexWire). pos+normal+color +
+    // 4 UV sets (absent sets duplicate set 0). 60 bytes. Sampled set-major from the cache VB.
+    struct GeomVertexWireMM {
+        float px, py, pz;            // 0
+        float nx, ny, nz;            // 12
+        std::uint32_t color;         // 24  packed D3DCOLOR (B,G,R,A); white when vColSource != DiffAmb
+        float uv[4][2];              // 28..59  UV sets 0..3 (dup of set 0 for absent sets)
+    };
+
     // GeomPartWire::flags bits.
-    constexpr std::uint16_t kGeomFlagSkinned = 0x1;   // part vertices are SkinnedVertexWire (stride 44)
+    constexpr std::uint16_t kGeomFlagSkinned  = 0x1;   // part vertices are SkinnedVertexWire (stride 56)
+    constexpr std::uint16_t kGeomFlagMultiMap = 0x2;   // part vertices are GeomVertexWireMM (stride 60)
 
     // Per-part header preceding the part's vertex+index data in the batch blob. When
     // (flags & kGeomFlagSkinned), the part's vertices are SkinnedVertexWire (stride 44)
@@ -111,6 +124,37 @@ namespace IPC {
         std::uint32_t texIndex;      // bindless gTextures[] slot for the base map (0 = default white)
         float         alphaRef;      // alpha-test reference 0..1 (0 = no alpha test; frag discards a < ref)
     };
+
+    // Tier 4 multi-map per-frame draw item: a STATIC opaque part with up to 4 ORDERED texture
+    // stages (built CLIENT-side by replicating rendercachedcolor.cpp::buildCacheStages — present
+    // maps pushed with their op + UV set, stable-sorted by texCoordSet ascending). The host runs
+    // a fixed-function stage loop replicating the cache color pass:
+    //   BASE  : c = tex.rgb * lit;  baseA = tex.a   (arg2 = DIFFUSE even when not stage 0)
+    //   MOD   : c *= tex.rgb        MOD2X : c *= tex.rgb*2        ADD : c += tex.rgb
+    // alphaRef applies to the BASE stage only (other stages' alpha is keep-prev / irrelevant to
+    // opaque coverage). Material + vColSource feed the SAME Tier 2b/3a lit term as opaque.frag.
+    struct MultiMapDrawWire {
+        std::uint32_t slot;
+        float         world[16];
+        float         matDiffuse[3];
+        float         matAmbient[3];
+        float         matEmissive[3];
+        std::uint32_t vColSource;    // 0 none (const material), 1 emissive, 2 diffamb
+        float         alphaRef;      // base-stage alpha test 0..1 (0 = no test)
+        std::uint32_t stageCount;    // 1..4 (ordered by texCoordSet)
+        // Per stage: texIndex (low 16) | uvSet (bits 16-17) | op (bits 18-19).
+        // op: 0 BASE (MOD x DIFFUSE), 1 MOD, 2 MOD2X, 3 ADD.
+        std::uint32_t stages[4];
+    };
+
+    // Per-stage word packers (client builds, host/shader unpack).
+    constexpr std::uint32_t kMMOpBase  = 0u;
+    constexpr std::uint32_t kMMOpMod   = 1u;
+    constexpr std::uint32_t kMMOpMod2X = 2u;
+    constexpr std::uint32_t kMMOpAdd   = 3u;
+    inline std::uint32_t packMMStage(std::uint32_t texIndex, std::uint32_t uvSet, std::uint32_t op) {
+        return (texIndex & 0xFFFFu) | ((uvSet & 0x3u) << 16) | ((op & 0x3u) << 18);
+    }
 
     // Tier 3a point light (per-frame, world-space). One entry == three float4, so the host
     // memcpy's the received light array straight into its light cbuffer with no repacking.

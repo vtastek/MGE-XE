@@ -67,4 +67,13 @@ namespace RenderProcess {
                                 const IPC::SkinnedVertexWire* verts, std::uint32_t vertexCount,
                                 const std::uint16_t* indices, std::uint32_t indexCount,
                                 std::uint32_t numBones);
+
+    // Tier 4 multi-map: capture a STATIC opaque part carrying dark/detail/glow sibling maps,
+    // with up to 4 per-vertex UV sets (GeomVertexWireMM). Like captureGeometry it assigns/reuses
+    // a dense host slot (shared g_keySlot) and packs the part into the geometry blob with the
+    // MULTIMAP flag; dedup on (modelId, vertexCount, revision). The per-frame ordered stage list
+    // (texture slots + ops + UV sets) is built separately in buildMultiMapDrawList (onPresent).
+    void captureMultiMapGeometry(std::uint32_t key, std::uint16_t revision, std::uint32_t modelId,
+                                 const IPC::GeomVertexWireMM* verts, std::uint32_t vertexCount,
+                                 const std::uint16_t* indices, std::uint32_t indexCount);
 }

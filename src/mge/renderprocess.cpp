@@ -67,6 +67,7 @@ namespace {
     std::optional<IPC::VecView<IPC::GeomChunk>> g_geomVec;          // persistent geometry upload vec
     std::optional<IPC::VecView<IPC::GeomChunk>> g_drawVec;          // persistent per-frame draw-list vec
     std::optional<IPC::VecView<IPC::GeomChunk>> g_skinnedVec;       // persistent per-frame skinned draw-list vec
+    std::optional<IPC::VecView<IPC::GeomChunk>> g_multiMapVec;      // persistent per-frame multi-map draw-list vec (Tier 4)
     std::optional<IPC::VecView<IPC::GeomChunk>> g_lightVec;         // persistent per-frame point-light vec (Tier 3a)
     std::vector<std::uint8_t>                 g_pendingBlob;        // packed parts awaiting flush
     std::uint32_t                             g_pendingParts = 0;
@@ -79,6 +80,7 @@ namespace {
     std::uint32_t                             g_nextSlot = 0;
     std::vector<std::uint8_t>                 g_drawScratch;        // packed DrawItemWire[] this frame
     std::vector<std::uint8_t>                 g_skinnedScratch;     // packed [SkinnedDrawWire][palette]* this frame
+    std::vector<std::uint8_t>                 g_multiMapScratch;    // packed MultiMapDrawWire[] this frame (Tier 4)
     std::vector<std::uint8_t>                 g_lightScratch;       // packed PointLightWire[] this frame
 
     // --- Phase 2 bindless texture residency (client) ---
@@ -569,6 +571,15 @@ namespace {
             g_skinnedVec.emplace(std::move(*sv));
         }
 
+        // Multi-map draw list (Tier 4) rides its own 1-chunk vec. MultiMapDrawWire[] bounded at
+        // the host's 256-part cap (256 * 132B ≈ 34KB), well under 1MB.
+        auto mm = g_client->allocVecBlocking<IPC::GeomChunk>(1, 1, 1);
+        if (!mm) {
+            LOG::logline("!! [seam] multi-map draw-list vec alloc failed — multi-map path disabled");
+        } else {
+            g_multiMapVec.emplace(std::move(*mm));
+        }
+
         // Point-light list (Tier 3a) rides its own 1-chunk vec — kMaxPointLights * 48B ≈ 6KB,
         // far under 1MB. PointLightWire[] world-space, rebuilt each frame from the SceneGraph snapshot.
         auto lv = g_client->allocVecBlocking<IPC::GeomChunk>(1, 1, 1);
@@ -587,7 +598,7 @@ namespace {
         } else {
             g_texVec.emplace(std::move(*tv));
         }
-        LOG::logline(">> [seam] scene vecs ready (geom %u, draw %u, skinned %u, light 1, tex %u chunks)",
+        LOG::logline(">> [seam] scene vecs ready (geom %u, draw %u, skinned %u, multimap 1, light 1, tex %u chunks)",
                      IPC::kGeomChunks, kDrawChunks, kDrawChunks, IPC::kTexChunks);
     }
 
@@ -728,7 +739,9 @@ namespace {
                 IPC::GeomPartWire hdr;
                 memcpy(&hdr, data + cursor, sizeof(hdr));
                 const std::size_t vStride = (hdr.flags & IPC::kGeomFlagSkinned)
-                    ? sizeof(IPC::SkinnedVertexWire) : sizeof(IPC::GeomVertexWire);
+                    ? sizeof(IPC::SkinnedVertexWire)
+                    : (hdr.flags & IPC::kGeomFlagMultiMap)
+                        ? sizeof(IPC::GeomVertexWireMM) : sizeof(IPC::GeomVertexWire);
                 const std::uint32_t partSize = static_cast<std::uint32_t>(
                     sizeof(IPC::GeomPartWire)
                     + (std::uint64_t)hdr.vertexCount * vStride
@@ -821,6 +834,13 @@ namespace {
             if (!e.d3dTexture) continue;
             if (!e.isLandscape && e.blendEnable) continue;
             if (e.isSkinned) continue;
+            //   - multi-map: parts with dark/detail/glow siblings go through
+            //     buildMultiMapDrawList (their own stride-60 wide VB + multimap pipeline).
+            //     They share g_keySlot with the static path (so they HAVE a slot here), so this
+            //     static loop MUST exclude them — drawing a stride-60 wide VB through the
+            //     stride-36 static pipeline would garble it. Matches the capture-side condition
+            //     (non-landscape; landscape is forced single-UV / single-map).
+            if (!e.isLandscape && (e.d3dDark || e.d3dDetail || e.d3dGlow)) continue;
 
             item.slot = ks->second;
             item.texIndex = resolveTextureSlot(e.textureName);   // bindless base map (0 = white)
@@ -906,6 +926,78 @@ namespace {
             std::uint8_t* dst = g_skinnedScratch.data() + at;
             memcpy(dst, &item, sizeof(item));                  dst += sizeof(item);
             memcpy(dst, e.bonePalette.data(), paletteBytes);
+            ++count;
+        }
+        return count;
+    }
+
+    // Tier 4 multi-map: gather this frame's visible STATIC multi-map parts (dark/detail/glow
+    // siblings) into g_multiMapScratch as MultiMapDrawWire[]. Same visible-set source as
+    // buildDrawList; multi-map keys are EXCLUDED from buildDrawList's static loop (they need the
+    // wide stride-60 VB + multimap pipeline), so the two lists are disjoint over the same set.
+    // The ORDERED stage list is built here on the CLIENT, replicating rendercachedcolor.cpp::
+    // buildCacheStages EXACTLY (present maps pushed with their op + UV set, stable-sorted by
+    // texCoordSet ascending — MW assigns the D3D stage index = texCoordSet, not the map slot).
+    // Returns the packed item count (0 if nothing multi-map / path unavailable).
+    std::uint32_t buildMultiMapDrawList() {
+        if (!g_multiMapVec) {
+            return 0;
+        }
+        const auto& keys = DistantLand::visibleCacheKeys();
+        const auto& cacheMap = MGE::GeometryCache::cache();
+
+        g_multiMapScratch.clear();
+        std::uint32_t count = 0;
+        for (std::uint32_t key : keys) {
+            auto ks = g_keySlot.find(key);
+            if (ks == g_keySlot.end()) {
+                continue;   // not an uploaded part (or not yet shipped)
+            }
+            auto ce = cacheMap.find(key);
+            if (ce == cacheMap.end()) {
+                continue;   // evicted since the visible-set build
+            }
+            const auto& e = ce->second;
+            // Must match the capture-side isMultiMap condition + the static loop's filters:
+            // non-landscape, textured, opaque, non-skinned, with a dark/detail/glow sibling.
+            if (e.isLandscape || e.isSkinned || !e.d3dTexture) continue;
+            if (e.blendEnable) continue;
+            if (!(e.d3dDark || e.d3dDetail || e.d3dGlow)) continue;
+
+            // Build the ordered stage list, replicating buildCacheStages. A present map is usable
+            // only if the wide VB carries the UV set it samples (uv < uvSetCount) — cacheMapActive.
+            // Base is pushed unconditionally (e.d3dTexture); the others gated by cacheMapActive.
+            struct Stage { const char* name; std::uint8_t uv; std::uint32_t op; };
+            Stage st[4];
+            int ns = 0;
+            st[ns++] = { e.textureName, e.baseUV, IPC::kMMOpBase };
+            if (e.d3dDark   && e.darkUV   < e.uvSetCount) st[ns++] = { e.darkTextureName,   e.darkUV,   IPC::kMMOpMod };
+            if (e.d3dDetail && e.detailUV < e.uvSetCount) st[ns++] = { e.detailTextureName, e.detailUV, IPC::kMMOpMod2X };
+            if (e.d3dGlow   && e.glowUV   < e.uvSetCount) st[ns++] = { e.glowTextureName,   e.glowUV,   IPC::kMMOpAdd };
+            // Stable insertion sort by UV ascending (<=4 stages; keeps slot order on ties).
+            for (int a = 1; a < ns; ++a) {
+                Stage tmp = st[a];
+                int b = a - 1;
+                while (b >= 0 && st[b].uv > tmp.uv) { st[b + 1] = st[b]; --b; }
+                st[b + 1] = tmp;
+            }
+
+            IPC::MultiMapDrawWire item = {};
+            item.slot = ks->second;
+            memcpy(item.world, e.worldTransformD3D, 16 * sizeof(float));
+            item.matDiffuse[0]  = e.matDiffuse[0];  item.matDiffuse[1]  = e.matDiffuse[1];  item.matDiffuse[2]  = e.matDiffuse[2];
+            item.matAmbient[0]  = e.matAmbient[0];  item.matAmbient[1]  = e.matAmbient[1];  item.matAmbient[2]  = e.matAmbient[2];
+            item.matEmissive[0] = e.matEmissive[0]; item.matEmissive[1] = e.matEmissive[1]; item.matEmissive[2] = e.matEmissive[2];
+            item.vColSource = (e.hasVertexColor && e.vColSource != 0) ? e.vColSource : 0u;
+            item.alphaRef   = e.alphaTest ? e.alphaRef : 0.0f;   // base-stage alpha test
+            item.stageCount = (std::uint32_t)ns;
+            for (int s = 0; s < ns; ++s) {
+                const std::uint32_t tex = resolveTextureSlot(st[s].name);   // bindless slot (0 = white)
+                item.stages[s] = IPC::packMMStage(tex, st[s].uv, st[s].op);
+            }
+            const std::size_t at = g_multiMapScratch.size();
+            g_multiMapScratch.resize(at + sizeof(item));
+            memcpy(g_multiMapScratch.data() + at, &item, sizeof(item));
             ++count;
         }
         return count;
@@ -1020,6 +1112,7 @@ namespace RenderProcess {
         bool ok = false;
         const std::uint32_t drawCount = buildDrawList();
         const std::uint32_t skinnedCount = buildSkinnedDrawList();
+        const std::uint32_t multiMapCount = buildMultiMapDrawList();
         const std::uint32_t lightCount = buildLightList();
         const double tBuild = nowMs();
 
@@ -1041,6 +1134,14 @@ namespace RenderProcess {
             skinnedBytes = (std::uint32_t)g_skinnedScratch.size();
         }
 
+        IPC::VecId   multiMapId = IPC::InvalidVector;
+        std::uint32_t multiMapBytes = 0;
+        if (g_multiMapVec && multiMapCount > 0
+            && g_multiMapVec->assign_bytes(g_multiMapScratch.data(), (std::uint32_t)g_multiMapScratch.size())) {
+            multiMapId    = g_multiMapVec->id();
+            multiMapBytes = (std::uint32_t)g_multiMapScratch.size();
+        }
+
         IPC::VecId   lightId = IPC::InvalidVector;
         std::uint32_t lightBytes = 0;
         if (g_lightVec && lightCount > 0
@@ -1054,7 +1155,7 @@ namespace RenderProcess {
         // draw list (loading doors, menus, empty cells) we must NOT fall back to the bring-up
         // triangle and composite it — that flashes the debug triangle over MW's loading/menu
         // frame. Skip the seam entirely and let MW present its own (fixed-function) frame.
-        if (!haveDraw && skinnedId == IPC::InvalidVector) {
+        if (!haveDraw && skinnedId == IPC::InvalidVector && multiMapId == IPC::InvalidVector) {
             return;
         }
 
@@ -1087,6 +1188,7 @@ namespace RenderProcess {
                  haveDraw ? drawCount : 0,
                  haveDraw ? (std::uint32_t)g_drawScratch.size() : 0,
                  skinnedId, skinnedCount, skinnedBytes,
+                 multiMapId, (multiMapId != IPC::InvalidVector) ? multiMapCount : 0, multiMapBytes,
                  lightId, (lightId != IPC::InvalidVector) ? lightCount : 0, lightBytes, &hostMs);
         const double tRender = nowMs();
         if (!ok) {
@@ -1185,11 +1287,11 @@ namespace RenderProcess {
         if (feed >= kSpikeMs) {
             LOG::logline("!! [spike] frame %u feed=%.2fms (geomflush=%.2f build=%.2f texflush=%.2f "
                          "assign=%.2f render=%.2f[host=%.2f] copy=%.2f blit=%.2f) "
-                         "draws=%u skin=%u light=%u geom+=%u/%uKB tex+=%u/%uKB dt=%.2fms",
+                         "draws=%u skin=%u mm=%u light=%u geom+=%u/%uKB tex+=%u/%uKB dt=%.2fms",
                          frame, feed,
                          tGeomFlush - tStart, tBuild - tGeomFlush, tTexFlush - tBuild,
                          tAssign - tTexFlush, tRender - tAssign, hostMs, tCopy - tRender, tEnd - tCopy,
-                         drawCount, skinnedCount, lightCount,
+                         drawCount, skinnedCount, multiMapCount, lightCount,
                          geomParts, (unsigned)(geomBytes >> 10), texCount, (unsigned)(texBytes >> 10),
                          dtPresent);
         }
@@ -1295,11 +1397,55 @@ namespace RenderProcess {
         g_uploadedRev[key] = { modelId, vertexCount, revision };
     }
 
+    void captureMultiMapGeometry(std::uint32_t key, std::uint16_t revision, std::uint32_t modelId,
+                                 const IPC::GeomVertexWireMM* verts, std::uint32_t vertexCount,
+                                 const std::uint16_t* indices, std::uint32_t indexCount) {
+        if (!wantsGeometryCapture() || !verts || !indices || !vertexCount || !indexCount) {
+            return;
+        }
+        // Dedup on (modelId, vertexCount, revision) — shared map with captureGeometry; identity
+        // guards against recycled NiTriShape* keys (see captureGeometry).
+        auto rev = g_uploadedRev.find(key);
+        if (rev != g_uploadedRev.end() && rev->second.id == modelId &&
+            rev->second.vc == vertexCount && rev->second.rev == revision) {
+            return;
+        }
+        // Stable host slot per cache key (shared slot map / nextSlot with the static path).
+        std::uint32_t slot;
+        auto ks = g_keySlot.find(key);
+        if (ks != g_keySlot.end()) {
+            slot = ks->second;
+        } else {
+            slot = g_nextSlot++;
+            g_keySlot.emplace(key, slot);
+        }
+
+        IPC::GeomPartWire hdr = {};
+        hdr.slot        = slot;
+        hdr.revisionID  = revision;
+        hdr.flags       = IPC::kGeomFlagMultiMap;
+        hdr.vertexCount = vertexCount;
+        hdr.indexCount  = indexCount;
+
+        const std::size_t vbBytes = (std::size_t)vertexCount * sizeof(IPC::GeomVertexWireMM);
+        const std::size_t ibBytes = (std::size_t)indexCount * sizeof(std::uint16_t);
+        const std::size_t at = g_pendingBlob.size();
+        g_pendingBlob.resize(at + sizeof(hdr) + vbBytes + ibBytes);
+        std::uint8_t* dst = g_pendingBlob.data() + at;
+        memcpy(dst, &hdr, sizeof(hdr));            dst += sizeof(hdr);
+        memcpy(dst, verts, vbBytes);               dst += vbBytes;
+        memcpy(dst, indices, ibBytes);
+
+        ++g_pendingParts;
+        g_uploadedRev[key] = { modelId, vertexCount, revision };
+    }
+
     void shutdown() {
         releaseAll();
         g_geomVec.reset();
         g_drawVec.reset();
         g_skinnedVec.reset();
+        g_multiMapVec.reset();
         g_lightVec.reset();
         g_texVec.reset();
         g_pendingBlob.clear();
@@ -1308,6 +1454,8 @@ namespace RenderProcess {
         g_drawScratch.shrink_to_fit();
         g_skinnedScratch.clear();
         g_skinnedScratch.shrink_to_fit();
+        g_multiMapScratch.clear();
+        g_multiMapScratch.shrink_to_fit();
         g_lightScratch.clear();
         g_lightScratch.shrink_to_fit();
         g_texPendingBlob.clear();

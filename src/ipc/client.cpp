@@ -401,6 +401,9 @@ namespace IPC {
 		params.skinnedList = InvalidVector;
 		params.skinnedCount = 0;
 		params.skinnedBytes = 0;
+		params.multiMapList = InvalidVector;
+		params.multiMapCount = 0;
+		params.multiMapBytes = 0;
 		params.bytesWritten = 0;
 		params.renderMs = 0.0;
 		if (!beginRpc(Command::RenderFrame)) {
@@ -421,6 +424,7 @@ namespace IPC {
 		const float* lighting,
 		VecId drawList, std::uint32_t drawCount, std::uint32_t drawBytes,
 		VecId skinnedList, std::uint32_t skinnedCount, std::uint32_t skinnedBytes,
+		VecId multiMapList, std::uint32_t multiMapCount, std::uint32_t multiMapBytes,
 		VecId lightList, std::uint32_t lightCount, std::uint32_t lightBytes,
 		double* outRenderMs) {
 		WAIT_FOR_PREVIOUS_COMMAND;
@@ -436,6 +440,9 @@ namespace IPC {
 		params.skinnedList = skinnedList;
 		params.skinnedCount = skinnedCount;
 		params.skinnedBytes = skinnedBytes;
+		params.multiMapList = multiMapList;
+		params.multiMapCount = multiMapCount;
+		params.multiMapBytes = multiMapBytes;
 		params.lightList = lightList;
 		params.lightCount = lightCount;
 		params.lightBytes = lightBytes;

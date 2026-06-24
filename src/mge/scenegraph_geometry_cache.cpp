@@ -80,6 +80,7 @@ namespace MGE::GeometryCache {
             e.d3dGlow     = nullptr;
             e.baseUV = e.darkUV = e.detailUV = e.glowUV = 0;
             e.textureName = nullptr;
+            e.darkTextureName = e.detailTextureName = e.glowTextureName = nullptr;
             e.alphaRef    = 0.0f;
             e.alphaTest   = false;
             e.blendEnable = false;
@@ -131,20 +132,24 @@ namespace MGE::GeometryCache {
                 // clamped to 0..3). uploadEntry sizes the VB so every used set is
                 // carried (e.g. the glow-mod detail map on set 2).
                 auto captureMap = [&](NI::TexturingProperty::Map* map,
-                                      IDirect3DTexture9*& outTex, uint8_t& outUV) {
+                                      IDirect3DTexture9*& outTex, uint8_t& outUV,
+                                      const char*& outName) {
                     if (!map || !map->texture) return;
                     auto* mtex = map->texture.get();
                     if (!mtex->isInstanceOfType(NI::RTTIStaticPtr::NiSourceTexture)) return;
                     IDirect3DTexture9* d3d = getDX9Texture(mtex);
                     if (!d3d) return;
                     outTex = d3d;
+                    // The map's texture is a confirmed NiSourceTexture — also record its
+                    // source filename so the Forge path can resolve it to a bindless slot.
+                    outName = static_cast<NI::SourceTexture*>(mtex)->fileName;
                     // Store the map's TRUE UV set (clamped to 3 — FFE texcoordIndex is
                     // 2-bit / FVF carries <=4 sets). uploadEntry sizes the VB to cover it.
                     outUV  = map->texCoordSet >= 3u ? 3u : static_cast<uint8_t>(map->texCoordSet);
                 };
-                captureMap(ps->texture->getDarkMap(),   e.d3dDark,   e.darkUV);
-                captureMap(ps->texture->getDetailMap(), e.d3dDetail, e.detailUV);
-                captureMap(ps->texture->getGlowMap(),   e.d3dGlow,   e.glowUV);
+                captureMap(ps->texture->getDarkMap(),   e.d3dDark,   e.darkUV,   e.darkTextureName);
+                captureMap(ps->texture->getDetailMap(), e.d3dDetail, e.detailUV, e.detailTextureName);
+                captureMap(ps->texture->getGlowMap(),   e.d3dGlow,   e.glowUV,   e.glowTextureName);
 
                 // Terrain decal overlay: maps[6] = DECAL_1 (the second land texture
                 // for splat blending). Present on multi-texture terrain patches.
@@ -325,36 +330,72 @@ namespace MGE::GeometryCache {
             // worldTransformD3D for them above). Flat-shaded for now (texturing is the
             // next milestone, shared by objects+terrain). Re-uploads only on revision change.
             if (RenderProcess::wantsGeometryCapture()) {
-                static std::vector<IPC::GeomVertexWire> scratch;  // single-threaded cache walk
-                scratch.resize(vertexCount);
                 const auto* nrm = data->normal;
-                // Base-map UV: set e.baseUV (set-major, uvs[set*storedVerts + i]). Most static
-                // meshes use set 0; honour the captured base map's true set for correctness.
                 const auto* capUvs = data->textureCoords;
-                const uint32_t uvBase = (uint32_t)e.baseUV * storedVerts;
                 // Tier 2a lighting: ship the real per-vertex colour ONLY when the mesh uses
                 // VertexColorProperty source 2 (ambient+diffuse / DiffAmb) — the case where MW
                 // actually folds vcol into lighting. Otherwise ship white (0xFFFFFFFF) so the
                 // host's universal col*(d+a) path reduces to the white-material (d+a) case.
                 // (Emissive routing / non-white material constants are Tier 2b.)
                 const auto* vcol = (e.hasVertexColor && e.vColSource == 2) ? data->color : nullptr;
-                for (uint32_t i = 0; i < vertexCount; ++i) {
-                    auto& w = scratch[i];
-                    w.px = mv[i].x; w.py = mv[i].y; w.pz = mv[i].z;
-                    if (nrm) { w.nx = nrm[i].x; w.ny = nrm[i].y; w.nz = nrm[i].z; }
-                    else     { w.nx = 0.0f;    w.ny = 0.0f;    w.nz = 1.0f; }
-                    if (capUvs) { w.u = capUvs[uvBase + i].x; w.v = capUvs[uvBase + i].y; }
-                    else        { w.u = 0.0f;                 w.v = 0.0f; }
-                    w.color = vcol ? *reinterpret_cast<const DWORD*>(&vcol[i]) : 0xFFFFFFFFu;
-                }
                 const auto* triList = data->getTriList();
-                if (triList) {
-                    // NI::Triangle is 3 packed uint16 indices (== the IB byte layout
-                    // used above via memcpy(.., triCount*6)).
-                    RenderProcess::captureGeometry(key, data->revisionID,
+
+                // Tier 4 multi-map: a part with dark/detail/glow siblings rides the SEPARATE
+                // wide vertex format (GeomVertexWireMM, 4 UV sets) + its own host pipeline.
+                // Single-map parts (the 99% case) keep the lean GeomVertexWire path. Landscape
+                // is excluded (uvSetCount forced to 1 above; terrain splats via d3dOverlay).
+                const bool isMultiMap = !g_walkingLandscape
+                    && (e.d3dDark || e.d3dDetail || e.d3dGlow);
+
+                if (isMultiMap && triList) {
+                    static std::vector<IPC::GeomVertexWireMM> mmScratch;  // single-threaded cache walk
+                    mmScratch.resize(vertexCount);
+                    for (uint32_t i = 0; i < vertexCount; ++i) {
+                        auto& w = mmScratch[i];
+                        w.px = mv[i].x; w.py = mv[i].y; w.pz = mv[i].z;
+                        if (nrm) { w.nx = nrm[i].x; w.ny = nrm[i].y; w.nz = nrm[i].z; }
+                        else     { w.nx = 0.0f;    w.ny = 0.0f;    w.nz = 1.0f; }
+                        w.color = vcol ? *reinterpret_cast<const DWORD*>(&vcol[i]) : 0xFFFFFFFFu;
+                        // UV sets 0..3, read set-major (uvs[set*storedVerts + i]). Sets the VB
+                        // doesn't carry (>= uvSetCount) duplicate set 0 — those stages are
+                        // dropped client-side (cacheMapActive: uv < uvSetCount) so never read.
+                        for (uint8_t s = 0; s < 4; ++s) {
+                            const uint8_t src = (capUvs && s < uvSetCount) ? s : 0u;
+                            if (capUvs) {
+                                const auto& p = capUvs[(uint32_t)src * storedVerts + i];
+                                w.uv[s][0] = p.x; w.uv[s][1] = p.y;
+                            } else {
+                                w.uv[s][0] = 0.0f; w.uv[s][1] = 0.0f;
+                            }
+                        }
+                    }
+                    RenderProcess::captureMultiMapGeometry(key, data->revisionID,
                         reinterpret_cast<uint32_t>(data),   // object identity (recycled-key guard)
-                        scratch.data(), vertexCount,
+                        mmScratch.data(), vertexCount,
                         reinterpret_cast<const uint16_t*>(triList), triCount * 3u);
+                } else {
+                    static std::vector<IPC::GeomVertexWire> scratch;  // single-threaded cache walk
+                    scratch.resize(vertexCount);
+                    // Base-map UV: set e.baseUV (set-major, uvs[set*storedVerts + i]). Most static
+                    // meshes use set 0; honour the captured base map's true set for correctness.
+                    const uint32_t uvBase = (uint32_t)e.baseUV * storedVerts;
+                    for (uint32_t i = 0; i < vertexCount; ++i) {
+                        auto& w = scratch[i];
+                        w.px = mv[i].x; w.py = mv[i].y; w.pz = mv[i].z;
+                        if (nrm) { w.nx = nrm[i].x; w.ny = nrm[i].y; w.nz = nrm[i].z; }
+                        else     { w.nx = 0.0f;    w.ny = 0.0f;    w.nz = 1.0f; }
+                        if (capUvs) { w.u = capUvs[uvBase + i].x; w.v = capUvs[uvBase + i].y; }
+                        else        { w.u = 0.0f;                 w.v = 0.0f; }
+                        w.color = vcol ? *reinterpret_cast<const DWORD*>(&vcol[i]) : 0xFFFFFFFFu;
+                    }
+                    if (triList) {
+                        // NI::Triangle is 3 packed uint16 indices (== the IB byte layout
+                        // used above via memcpy(.., triCount*6)).
+                        RenderProcess::captureGeometry(key, data->revisionID,
+                            reinterpret_cast<uint32_t>(data),   // object identity (recycled-key guard)
+                            scratch.data(), vertexCount,
+                            reinterpret_cast<const uint16_t*>(triList), triCount * 3u);
+                    }
                 }
             }
 

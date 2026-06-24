@@ -292,6 +292,7 @@ namespace IPC {
 			const float* lighting,
 			VecId drawList, std::uint32_t drawCount, std::uint32_t drawBytes,
 			VecId skinnedList, std::uint32_t skinnedCount, std::uint32_t skinnedBytes,
+			VecId multiMapList, std::uint32_t multiMapCount, std::uint32_t multiMapBytes,
 			VecId lightList, std::uint32_t lightCount, std::uint32_t lightBytes,
 			double* outRenderMs = nullptr);
 
