@@ -1,10 +1,11 @@
 // mgeHost64 — opaque scene (fragment stage).
 //
-// Tier 1 lighting: real MW sun (directional N·L) + scene ambient + static tonemap + near fog,
-// fed per-frame via gFrameData (sunDir/sunCol/ambCol/fogColNear/fogParams). Matches FFE's
-// PerPixelPS for the vertexMaterialNone case (no vertex color yet — the base texture stands in
-// for material diffuse/ambient). Vertex color + material, point lights, and multi-map are the
-// following tiers. The base map is the bindless gTextures[TexIndex] (slot 0 = white).
+// Lighting fidelity: real MW sun (directional N·L) + scene ambient + static tonemap + near fog,
+// fed per-frame via gFrameData (sunDir/sunCol/ambCol/fogColNear/fogParams). Tier 2b adds the FFE
+// vertexMaterial routing (per-draw material constants matDiffuse/matAmbient/matEmissive + the
+// vColSource diffamb/emissive/none selection), replicating XE FixedFuncEmu.fx PerPixelPS for the
+// same opaque set the cache color path draws. Point lights and multi-map are the following tiers.
+// The base map is the bindless gTextures[TexIndex] (slot 0 = white), MODULATE'd over the material.
 
 #include "opaque.srt.h"
 
@@ -17,6 +18,10 @@ STRUCT(VSOutput)
     DATA(float,       Fog,      TEXCOORD2);
     DATA(float4,      Color,    COLOR);       // per-vertex DiffAmb colour
     DATA(float,       AlphaRef, TEXCOORD3);   // alpha-test ref 0..1 (0 = no test)
+    DATA(FLAT(float3),MatDiffuse, TEXCOORD4); // Tier 2b material constants (per draw)
+    DATA(FLAT(float3),MatAmbient, TEXCOORD5);
+    DATA(FLAT(float3),MatEmissive,TEXCOORD6);
+    DATA(FLAT(uint),  VColSource, TEXCOORD7); // 0 none, 1 emissive, 2 diffamb
 };
 
 // Static semi-HDR tonemap — ported verbatim from XE FixedFuncEmu.fx::tonemap.
@@ -35,10 +40,27 @@ float4 PS_MAIN( VSOutput In )
     float3 N = normalize(In.Normal);
     // MW lighting: sun diffuse (to-sun = -sunDir) + scene ambient. FFE convention.
     float  ndl = saturate(dot(N, -gFrameData.sunDir.xyz));
-    // FFE vertexMaterialDiffAmb: diffuse = vColor * (sun_d + ambient). vColor is white when
-    // the mesh isn't DiffAmb (capture-side decision), so this reduces to the white-material
-    // (d+a) case there. Material constants / emissive routing are Tier 2b.
-    float3 lit = In.Color.rgb * (gFrameData.sunCol.rgb * ndl + gFrameData.ambCol.rgb);
+    // FFE PerPixelPS lighting terms: d = sun diffuse (point lights added in Tier 3), a = scene
+    // ambient. (matches lightSunDiffuse*N.L + lightSceneAmbient.)
+    float3 d = gFrameData.sunCol.rgb * ndl;
+    float3 a = gFrameData.ambCol.rgb;
+
+    // Tier 2b material routing — replicates XE FixedFuncEmu.fx vertexMaterial* EXACTLY (the
+    // PROVEN cache color path's selection via matSrcDiffuse/matSrcEmissive):
+    //   vColSource 2 (DiffAmb):   col.rgb * (d + a) + matEmissive
+    //   vColSource 1 (Emissive):  matDiffuse * d + matAmbient * a + col.rgb
+    //   vColSource 0 (None):      matDiffuse * d + matAmbient * a + matEmissive
+    // The client forces vColSource 0 unless the mesh has colours AND its VertexColorProperty
+    // says to use them (else real material colours get white-washed), so the col-using
+    // branches only run on genuine DiffAmb/Emissive meshes.
+    float3 lit;
+    if (In.VColSource == 2u) {
+        lit = In.Color.rgb * (d + a) + In.MatEmissive;
+    } else if (In.VColSource == 1u) {
+        lit = In.MatDiffuse * d + In.MatAmbient * a + In.Color.rgb;
+    } else {
+        lit = In.MatDiffuse * d + In.MatAmbient * a + In.MatEmissive;
+    }
 
     // gSamplerAnisotropic: FSL built-in STATIC sampler (anisotropic 8x, WRAP), baked into
     // DefaultRootSignature. We deliberately do NOT use a dynamic sampler: one sharing the Persistent

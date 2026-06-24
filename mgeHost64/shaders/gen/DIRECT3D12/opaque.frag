@@ -960,7 +960,7 @@ SamplerState gSamplerAnisotropic : register( s10 , space100 ) ;
 #line 11 "FSL/shaders.list"
 #line 28 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
-#line 9 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 10 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(FrameData)
@@ -988,7 +988,7 @@ STRUCT(BatchData)
 #line 54 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 1024 ] : register( t0 , space0 ) ;
         CBUFFER(BatchData) gBatch : register( b0 , space2 ) ;
-#line 10 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 11 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 
 STRUCT(VSOutput)
 {
@@ -999,7 +999,11 @@ STRUCT(VSOutput)
     DATA(float, Fog, TEXCOORD2);
     DATA(float4, Color, COLOR);
     DATA(float, AlphaRef, TEXCOORD3);
-#line 20
+    DATA(FLAT(float3),MatDiffuse, TEXCOORD4);
+    DATA(FLAT(float3),MatAmbient, TEXCOORD5);
+    DATA(FLAT(float3),MatEmissive,TEXCOORD6);
+    DATA(FLAT(uint), VColSource, TEXCOORD7);
+#line 25
 };
 
 
@@ -1020,8 +1024,25 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     float ndl = saturate(dot(N, -gFrameData.sunDir.xyz));
 
 
+    float3 d = gFrameData.sunCol.rgb * ndl;
+    float3 a = gFrameData.ambCol.rgb;
 
-    float3 lit = In.Color.rgb * (gFrameData.sunCol.rgb * ndl + gFrameData.ambCol.rgb);
+
+
+
+
+
+
+
+
+    float3 lit;
+    if (In.VColSource == 2u) {
+        lit = In.Color.rgb * (d + a) + In.MatEmissive;
+    } else if (In.VColSource == 1u) {
+        lit = In.MatDiffuse * d + In.MatAmbient * a + In.Color.rgb;
+    } else {
+        lit = In.MatDiffuse * d + In.MatAmbient * a + In.MatEmissive;
+    }
 
 
 

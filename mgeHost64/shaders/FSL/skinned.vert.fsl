@@ -34,6 +34,10 @@ STRUCT(VSOutput)
     DATA(float,       Fog,      TEXCOORD2);   // MW fog scalar (shared opaque.frag, matches opaque.vert)
     DATA(float4,      Color,    COLOR);       // Tier 2a: white (skinned VB has no vcol) → (d+a) fidelity
     DATA(float,       AlphaRef, TEXCOORD3);   // alpha-test ref 0..1 (shared opaque.frag; 0 = no test)
+    DATA(FLAT(float3),MatDiffuse, TEXCOORD4); // Tier 2b: shared frag struct. Skinned has no captured
+    DATA(FLAT(float3),MatAmbient, TEXCOORD5); // material yet → defaults below reduce the frag's
+    DATA(FLAT(float3),MatEmissive,TEXCOORD6); // vColSource==2 branch to white*(d+a) = current fidelity.
+    DATA(FLAT(uint),  VColSource, TEXCOORD7);
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -70,6 +74,13 @@ VSOutput VS_MAIN( VSInput In )
     Out.TexIndex = In.TexAlpha & 0xFFFFu;
     Out.AlphaRef = float((In.TexAlpha >> 16u) & 0xFFu) * (1.0f / 255.0f);
     Out.Color = float4(1.0f, 1.0f, 1.0f, 1.0f);
+    // Tier 2b defaults: white vcol drives diffuse+ambient (vColSource 2), zero emissive →
+    // frag computes white*(d+a) = current skinned fidelity. Per-part skinned material is a
+    // later milestone (needs the skinned instance VB / wire extended like the static path).
+    Out.MatDiffuse  = float3(1.0f, 1.0f, 1.0f);
+    Out.MatAmbient  = float3(1.0f, 1.0f, 1.0f);
+    Out.MatEmissive = float3(0.0f, 0.0f, 0.0f);
+    Out.VColSource  = 2u;
     // MW near fog, same per-vertex form as opaque.vert (palette is already world-space).
     float dist = length(worldPos.xyz - gFrameData.eyePos.xyz);
     Out.Fog = saturate((gFrameData.fogParams.y - dist)

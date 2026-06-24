@@ -65,12 +65,19 @@ namespace IPC {
     // model->world transform (D3DXMATRIX bytes, row-major — uploaded straight into the
     // host's gObject cbuffer; see opaque.srt.h for the no-transpose convention). The
     // per-frame draw list is an array of these in a chunked byte vec, with the camera
-    // view*proj carried inline in the RenderFrame RPC params. 68 bytes.
+    // view*proj carried inline in the RenderFrame RPC params. 108 bytes.
     struct DrawItemWire {
         std::uint32_t slot;
         float         world[16];
         std::uint32_t texIndex;   // bindless gTextures[] slot for the base map (0 = default white)
         float         alphaRef;   // alpha-test reference 0..1 (0 = no alpha test; frag discards a < ref)
+        // Tier 2b material (FFE PerPixelPS vertexMaterial routing). RGB only — the opaque
+        // output alpha is forced to 1 (coverage mask) and alpha test uses texture alpha vs
+        // alphaRef, so material alpha is unused. Mirrors CachedGeometry.matDiffuse/Ambient/Emissive.
+        float         matDiffuse[3];
+        float         matAmbient[3];
+        float         matEmissive[3];
+        std::uint32_t vColSource;  // 0 none (const material), 1 emissive (vcol->emissive), 2 diffamb (vcol->d+a)
     };
 
     // Texture-residency upload (Phase 2 bindless texturing). The client resolves each unique

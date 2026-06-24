@@ -813,6 +813,15 @@ namespace {
             item.slot = ks->second;
             item.texIndex = resolveTextureSlot(e.textureName);   // bindless base map (0 = white)
             item.alphaRef = e.alphaTest ? e.alphaRef : 0.0f;     // alpha-test cutout (0 = no test)
+            // Tier 2b material: ship the captured MaterialProperty colours + the vertex-colour
+            // routing, replicating buildCacheReflectionState/buildCacheMainState EXACTLY. useVCol
+            // = mesh has colours AND its VertexColorProperty says to use them (else real material
+            // colours get white-washed); when off we send vColSource 0 so the frag uses the
+            // constant material (vertexMaterialNone), ignoring the VB's colour slot.
+            item.matDiffuse[0]  = e.matDiffuse[0];  item.matDiffuse[1]  = e.matDiffuse[1];  item.matDiffuse[2]  = e.matDiffuse[2];
+            item.matAmbient[0]  = e.matAmbient[0];  item.matAmbient[1]  = e.matAmbient[1];  item.matAmbient[2]  = e.matAmbient[2];
+            item.matEmissive[0] = e.matEmissive[0]; item.matEmissive[1] = e.matEmissive[1]; item.matEmissive[2] = e.matEmissive[2];
+            item.vColSource = (e.hasVertexColor && e.vColSource != 0) ? e.vColSource : 0u;
             memcpy(item.world, e.worldTransformD3D, 16 * sizeof(float));
             // F12 diagnostic: displace each object by a deterministic per-slot vector. The
             // world matrix is row-major D3DX (translation in m[12..14]); a fixed offset per

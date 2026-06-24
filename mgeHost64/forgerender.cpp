@@ -441,6 +441,12 @@ namespace ForgeRender {
         };
         IPC::DrawItemWire item = {};
         item.slot = 0;
+        // Tier 2b: white diffuse/ambient, no emissive, vColSource 0 (const material) — the
+        // "no material" default. Keeps the SLOT-0 guard at ~129 (white * 0.5 ambient, tonemapped);
+        // a zero material would make vertexMaterialNone render black.
+        item.matDiffuse[0] = item.matDiffuse[1] = item.matDiffuse[2] = 1.0f;
+        item.matAmbient[0] = item.matAmbient[1] = item.matAmbient[2] = 1.0f;
+        item.vColSource = 0;
         float ident[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
         std::memcpy(item.world, ident, sizeof(ident));
 
@@ -831,16 +837,23 @@ namespace {
     // Bindless base-map texture array size (must match MAX_TEXTURES in opaque.srt.h).
     constexpr uint32_t kMaxTextures = MAX_TEXTURES;
 
+    // Static per-instance VB stride (uint32 slots). Tier 2b grew it past the old uint2:
+    //   [0] DrawIndex (identity, set once)   [1] TexAlpha (tex|alphaRef|vColSource, per-frame)
+    //   [2..4] matDiffuse.rgb (float)        [5..7] matAmbient.rgb (float)   [8..10] matEmissive.rgb (float)
+    // 11 * 4 = 44 bytes. The material rides the instance VB (not a new cbuffer/descriptor set)
+    // to avoid the FSL descriptor-offset gotcha that hoisted the sampler — see opaque.srt.h.
+    constexpr uint32_t kStaticInstU32 = 11;
+
     // Pack the per-draw instance .y: texIndex in the low 16 bits (slots < kMaxTextures=1024,
-    // so ≤10 bits), the alpha-test reference quantised to a byte in bits 16-23. The vert
-    // shaders unpack: TexIndex = packed & 0xFFFF, AlphaRef = ((packed>>16)&0xFF)/255. Keeps
-    // the instance buffer a uint2 (no layout/stride churn). alphaRef 0 → frag's strict a<ref
-    // never discards (opaque-safe). See opaque.vert/skinned.vert/opaque.frag.
-    inline uint32_t packTexAlpha(uint32_t texIndex, float alphaRef) {
+    // so ≤10 bits), the alpha-test reference quantised to a byte in bits 16-23, and the
+    // vertex-colour routing (0/1/2) in bits 24-25. The vert shaders unpack: TexIndex = packed
+    // & 0xFFFF, AlphaRef = ((packed>>16)&0xFF)/255, VColSource = (packed>>24)&0x3. alphaRef 0 →
+    // frag's strict a<ref never discards (opaque-safe). See opaque.vert/skinned.vert/opaque.frag.
+    inline uint32_t packTexAlpha(uint32_t texIndex, float alphaRef, uint32_t vColSource = 0u) {
         const uint32_t tex = texIndex < kMaxTextures ? texIndex : 0u;
         float r = alphaRef < 0.0f ? 0.0f : (alphaRef > 1.0f ? 1.0f : alphaRef);
         const uint32_t aref = (uint32_t)(r * 255.0f + 0.5f) & 0xFFu;
-        return tex | (aref << 16);
+        return tex | (aref << 16) | ((vColSource & 0x3u) << 24);
     }
 
     // Submit + wait the resource loader's UPLOAD ENGINE. beginUpdateResource/endUpdateResource
@@ -929,9 +942,9 @@ namespace {
         vl.mBindingCount = 2;
         vl.mBindings[0].mStride = sizeof(IPC::GeomVertexWire);
         vl.mBindings[0].mRate = VERTEX_BINDING_RATE_VERTEX;
-        vl.mBindings[1].mStride = 2 * sizeof(uint32_t);      // instance uint2 {DrawIndex, TexIndex}
+        vl.mBindings[1].mStride = kStaticInstU32 * sizeof(uint32_t);   // {DrawIndex, TexAlpha, matDiff3, matAmb3, matEmis3}
         vl.mBindings[1].mRate = VERTEX_BINDING_RATE_INSTANCE;
-        vl.mAttribCount = 6;
+        vl.mAttribCount = 9;
         vl.mAttribs[0].mSemantic = SEMANTIC_POSITION;
         vl.mAttribs[0].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
         vl.mAttribs[0].mBinding = 0;
@@ -957,11 +970,26 @@ namespace {
         vl.mAttribs[4].mBinding = 1;
         vl.mAttribs[4].mLocation = 4;
         vl.mAttribs[4].mOffset = 0;
-        vl.mAttribs[5].mSemantic = SEMANTIC_TEXCOORD2;       // TexIndex (per-instance .y)
+        vl.mAttribs[5].mSemantic = SEMANTIC_TEXCOORD2;       // TexAlpha (per-instance .y: tex|alphaRef|vColSource)
         vl.mAttribs[5].mFormat = TinyImageFormat_R32_UINT;
         vl.mAttribs[5].mBinding = 1;
         vl.mAttribs[5].mLocation = 5;
         vl.mAttribs[5].mOffset = sizeof(uint32_t);
+        vl.mAttribs[6].mSemantic = SEMANTIC_TEXCOORD3;       // matDiffuse.rgb (per-instance)
+        vl.mAttribs[6].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
+        vl.mAttribs[6].mBinding = 1;
+        vl.mAttribs[6].mLocation = 6;
+        vl.mAttribs[6].mOffset = 2 * sizeof(uint32_t);
+        vl.mAttribs[7].mSemantic = SEMANTIC_TEXCOORD4;       // matAmbient.rgb (per-instance)
+        vl.mAttribs[7].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
+        vl.mAttribs[7].mBinding = 1;
+        vl.mAttribs[7].mLocation = 7;
+        vl.mAttribs[7].mOffset = 5 * sizeof(uint32_t);
+        vl.mAttribs[8].mSemantic = SEMANTIC_TEXCOORD5;       // matEmissive.rgb (per-instance)
+        vl.mAttribs[8].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
+        vl.mAttribs[8].mBinding = 1;
+        vl.mAttribs[8].mLocation = 8;
+        vl.mAttribs[8].mOffset = 8 * sizeof(uint32_t);
 
         DepthStateDesc depthDesc = {};
         depthDesc.mDepthTest = true;
@@ -1051,15 +1079,16 @@ namespace {
             }
         }
 
-        // Per-batch instance buffers of uint2 { .x = identity index, .y = per-draw texIndex }.
-        // CPU-mapped: the static loop writes .y each frame; .x is initialised to the identity
-        // here and never clobbered, so a draw with firstInstance=l reads DrawIndex/Base = l.
+        // Per-batch instance buffers (kStaticInstU32 uint32 slots/entry): { [0] identity DrawIndex,
+        // [1] per-draw TexAlpha, [2..10] per-draw material rgb }. CPU-mapped: the static loop writes
+        // slots [1..10] each frame; [0] is initialised to the identity here and never clobbered, so a
+        // draw with firstInstance=l reads DrawIndex = l.
         for (uint32_t b = 0; b < kMaxBatches; ++b) {
             BufferLoadDesc ib = {};
             ib.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
             ib.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
             ib.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-            ib.mDesc.mSize = (uint64_t)kBatchSize * 2 * sizeof(uint32_t);
+            ib.mDesc.mSize = (uint64_t)kBatchSize * kStaticInstU32 * sizeof(uint32_t);
             ib.mDesc.pName = "instanceVB";
             ib.pData = nullptr;
             ib.ppBuffer = &g_live.pInstanceBuf[b];
@@ -1089,8 +1118,9 @@ namespace {
         for (uint32_t b = 0; b < kMaxBatches; ++b) {
             uint32_t* inst = (uint32_t*)g_live.pInstanceBuf[b]->pCpuMappedAddress;
             for (uint32_t i = 0; i < kBatchSize; ++i) {
-                inst[i * 2 + 0] = i;   // .x identity (DrawIndex / Base)
-                inst[i * 2 + 1] = 0;   // .y texIndex (overwritten per frame by static draws)
+                inst[i * kStaticInstU32 + 0] = i;   // [0] identity (DrawIndex)
+                for (uint32_t k = 1; k < kStaticInstU32; ++k)
+                    inst[i * kStaticInstU32 + k] = 0;   // [1] TexAlpha + [2..10] material (per-frame)
             }
         }
         g_live.maxDraws = kMaxDraws;
@@ -1724,10 +1754,21 @@ namespace ForgeRender {
             const uint32_t local = i % kBatchSize;
             uint8_t* dst = (uint8_t*)g_live.pWorldsBuf[batch]->pCpuMappedAddress;
             std::memcpy(dst + (size_t)local * 64, items[i].world, 64);
-            // Per-draw texIndex + alpha-test ref packed into the instance buffer's .y. .x stays
-            // the identity DrawIndex set at creation. Unloaded/unknown slots fall back to 0 (white).
+            // Per-draw texIndex + alpha-test ref + vColSource packed into instance slot [1]; [0]
+            // stays the identity DrawIndex set at creation. Tier 2b material rgb in slots [2..10]
+            // (float). Unloaded/unknown slots fall back to 0 (white texture).
             uint32_t* inst = (uint32_t*)g_live.pInstanceBuf[batch]->pCpuMappedAddress;
-            inst[local * 2 + 1] = packTexAlpha(items[i].texIndex, items[i].alphaRef);
+            inst[local * kStaticInstU32 + 1] = packTexAlpha(items[i].texIndex, items[i].alphaRef, items[i].vColSource);
+            float* finst = (float*)inst;
+            finst[local * kStaticInstU32 + 2] = items[i].matDiffuse[0];
+            finst[local * kStaticInstU32 + 3] = items[i].matDiffuse[1];
+            finst[local * kStaticInstU32 + 4] = items[i].matDiffuse[2];
+            finst[local * kStaticInstU32 + 5] = items[i].matAmbient[0];
+            finst[local * kStaticInstU32 + 6] = items[i].matAmbient[1];
+            finst[local * kStaticInstU32 + 7] = items[i].matAmbient[2];
+            finst[local * kStaticInstU32 + 8] = items[i].matEmissive[0];
+            finst[local * kStaticInstU32 + 9] = items[i].matEmissive[1];
+            finst[local * kStaticInstU32 + 10] = items[i].matEmissive[2];
         }
 
         resetCmdPool(R, g_live.pCmdPool);
@@ -1773,7 +1814,7 @@ namespace ForgeRender {
         // The 1-4 dynamic-morph parts (own VB/IB, not in the arena) can't ride the shared-VB
         // indirect call, so they stay inline cmdDrawIndexedInstanced after the groups.
         const uint32_t vStride = (uint32_t)sizeof(IPC::GeomVertexWire);
-        const uint32_t iStride = (uint32_t)(2 * sizeof(uint32_t));
+        const uint32_t iStride = (uint32_t)(kStaticInstU32 * sizeof(uint32_t));
 
         // Classify the draw list once: arena parts → tmp records (for arg-buffer fill),
         // dynamic-morph parts → a small inline list. (worldMirrored + the slot lookup are
