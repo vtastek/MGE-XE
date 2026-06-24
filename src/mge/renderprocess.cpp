@@ -855,6 +855,15 @@ namespace {
             item.matEmissive[0] = e.matEmissive[0]; item.matEmissive[1] = e.matEmissive[1]; item.matEmissive[2] = e.matEmissive[2];
             item.vColSource = (e.hasVertexColor && e.vColSource != 0) ? e.vColSource : 0u;
             memcpy(item.world, e.worldTransformD3D, 16 * sizeof(float));
+            // CAMERA-RELATIVE rendering: subtract the camera world position from the world
+            // translation so vertices reach the shader near the origin. At MW's exterior
+            // coordinates (|eye| ~150k) absolute world positions quantise to ~0.01-0.1 units
+            // in float32, and the combined viewProj's per-vertex cancellation then produces
+            // orientation-dependent stretching. Shifting world + viewProj + lights + eyePos by
+            // -eye keeps all vertex math small/precise. (viewProj is built translation-free below.)
+            item.world[12] -= DistantLand::eyePos.x;
+            item.world[13] -= DistantLand::eyePos.y;
+            item.world[14] -= DistantLand::eyePos.z;
             // F12 diagnostic: displace each object by a deterministic per-slot vector. The
             // world matrix is row-major D3DX (translation in m[12..14]); a fixed offset per
             // slot means duplicates of one object (same or different slot) appear as two
@@ -926,6 +935,17 @@ namespace {
             std::uint8_t* dst = g_skinnedScratch.data() + at;
             memcpy(dst, &item, sizeof(item));                  dst += sizeof(item);
             memcpy(dst, e.bonePalette.data(), paletteBytes);
+            // CAMERA-RELATIVE: the bone palette is world-space; shift each bone matrix's
+            // translation by -eye so the skinned vertices land near the origin, consistent
+            // with the translation-free viewProj + shifted lights (see buildDrawList).
+            {
+                float* pal = reinterpret_cast<float*>(dst);
+                for (std::uint32_t b = 0; b < e.numBones; ++b) {
+                    pal[b * 16 + 12] -= DistantLand::eyePos.x;
+                    pal[b * 16 + 13] -= DistantLand::eyePos.y;
+                    pal[b * 16 + 14] -= DistantLand::eyePos.z;
+                }
+            }
             ++count;
         }
         return count;
@@ -985,6 +1005,10 @@ namespace {
             IPC::MultiMapDrawWire item = {};
             item.slot = ks->second;
             memcpy(item.world, e.worldTransformD3D, 16 * sizeof(float));
+            // CAMERA-RELATIVE: shift translation by -eye (see buildDrawList).
+            item.world[12] -= DistantLand::eyePos.x;
+            item.world[13] -= DistantLand::eyePos.y;
+            item.world[14] -= DistantLand::eyePos.z;
             item.matDiffuse[0]  = e.matDiffuse[0];  item.matDiffuse[1]  = e.matDiffuse[1];  item.matDiffuse[2]  = e.matDiffuse[2];
             item.matAmbient[0]  = e.matAmbient[0];  item.matAmbient[1]  = e.matAmbient[1];  item.matAmbient[2]  = e.matAmbient[2];
             item.matEmissive[0] = e.matEmissive[0]; item.matEmissive[1] = e.matEmissive[1]; item.matEmissive[2] = e.matEmissive[2];
@@ -1033,9 +1057,11 @@ namespace {
                 break;
             }
             IPC::PointLightWire w;
-            w.posRadius[0] = pl.worldPos[0];
-            w.posRadius[1] = pl.worldPos[1];
-            w.posRadius[2] = pl.worldPos[2];
+            // CAMERA-RELATIVE: light positions are compared against the (now camera-relative)
+            // WorldPos in the frag, so shift them by -eye too (see buildDrawList).
+            w.posRadius[0] = pl.worldPos[0] - DistantLand::eyePos.x;
+            w.posRadius[1] = pl.worldPos[1] - DistantLand::eyePos.y;
+            w.posRadius[2] = pl.worldPos[2] - DistantLand::eyePos.z;
             w.posRadius[3] = pl.radius;
             w.color[0] = pl.diffuse[0] * pointLightMult;
             w.color[1] = pl.diffuse[1] * pointLightMult;
@@ -1159,8 +1185,14 @@ namespace RenderProcess {
             return;
         }
 
+        // CAMERA-RELATIVE viewProj: zero the view matrix's translation row so the camera sits at
+        // the origin (the world translations above are pre-shifted by -eye, so this cancels exactly:
+        // eyePos == inverse(mwView)·origin, hence mwView's translation row == -eye·R). This keeps the
+        // whole vertex pipeline near the origin and eliminates the float32 large-world stretching.
+        D3DXMATRIX viewRel = DistantLand::mwView;
+        viewRel._41 = viewRel._42 = viewRel._43 = 0.0f;
         D3DXMATRIX viewProj;
-        D3DXMatrixMultiply(&viewProj, &DistantLand::mwView, &DistantLand::mwProj);
+        D3DXMatrixMultiply(&viewProj, &viewRel, &DistantLand::mwProj);
 
         // Tier 1 lighting (6 × float4): MW sun/ambient/fog for this frame, uploaded into the
         // host gFrameData after viewProj. sunVec is the world-space sun TRAVEL direction (the
@@ -1180,7 +1212,9 @@ namespace RenderProcess {
             ambColEff.r,               ambColEff.g,               ambColEff.b,               0.0f,
             DistantLand::nearFogCol.r, DistantLand::nearFogCol.g, DistantLand::nearFogCol.b, 0.0f,
             DistantLand::fogNearStart, DistantLand::fogNearEnd,   0.0f,                      0.0f,
-            DistantLand::eyePos.x,     DistantLand::eyePos.y,     DistantLand::eyePos.z,     0.0f,
+            // CAMERA-RELATIVE: WorldPos reaches the shader already relative to the eye, so the
+            // eyePos used for the per-vertex fog distance |worldPos - eyePos| is the origin (0).
+            0.0f,                      0.0f,                      0.0f,                      0.0f,
         };
 
         ok = g_client->renderSceneBlocking(frame, (const float*)&viewProj, lighting,
@@ -1244,6 +1278,23 @@ namespace RenderProcess {
             device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
             device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
             device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+            // CRITICAL: disable texture-coordinate transformation. MW leaves a VIEW-DEPENDENT
+            // texture matrix active for environment/sphere-map reflections; without this the FF
+            // pipeline would transform our blit UVs by that matrix, shearing the composited image
+            // as the camera rotates (host output g_mainTex is correct; only the sampled blit skews).
+            device->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+            device->SetTextureStageState(1, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+            // CRITICAL: MW leaves environment/sphere-map TEXGEN active (D3DTSS_TEXCOORDINDEX carries
+            // a TCI_CAMERASPACE* flag). With texgen the FF pipeline SYNTHESISES texcoords from
+            // camera-space position/normal and IGNORES the vertex UVs — disabling the texture matrix
+            // alone isn't enough (the generated coords are the zoom/skew gradient we saw). Force the
+            // stage to read vertex texcoord set 0 with no texgen.
+            device->SetTextureStageState(0, D3DTSS_TEXCOORDINDEX, 0);
+            // Belt-and-suspenders: also neutralise the texture matrix itself. Identity == passthrough.
+            {
+                D3DMATRIX ident = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+                device->SetTransform(D3DTS_TEXTURE0, &ident);
+            }
             device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
             device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
             device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
