@@ -875,6 +875,7 @@ namespace {
             item.slot     = ks->second;
             item.numBones = e.numBones;
             item.mirror   = e.mirrored ? 1u : 0u;
+            item.texIndex = resolveTextureSlot(e.textureName);   // bindless base map (0 = white)
 
             const std::size_t paletteBytes = (std::size_t)e.numBones * 64;  // numBones * 16 floats
             const std::size_t at = g_skinnedScratch.size();

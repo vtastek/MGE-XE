@@ -424,7 +424,8 @@ namespace MGE::GeometryCache {
             // M-Skinning: also capture a model-space SkinnedVertexWire stream for the
             // Forge host (GPU palette skinning). Filled from the same inverted influences
             // we write into the D3D9 VB below; shipped once per (key,revision), re-uploaded
-            // on revision change. Flat fidelity (no UV/colour) — texturing is the next milestone.
+            // on revision change. Carries base-map UV (skinned texturing); per-vertex colour
+            // (DiffAmb) is still omitted — a later fidelity tier.
             const bool wantCapture = RenderProcess::wantsGeometryCapture();
             static std::vector<IPC::SkinnedVertexWire> skScratch;  // single-threaded cache walk
             if (wantCapture) skScratch.resize(vertexCount);
@@ -469,6 +470,7 @@ namespace MGE::GeometryCache {
                         sw.w0 = verts[i].w0; sw.w1 = verts[i].w1;
                         sw.w2 = verts[i].w2; sw.w3 = verts[i].w3;
                         sw.indices = verts[i].indices;
+                        sw.u = verts[i].u;   sw.v = verts[i].v;   // base-map UV for the host
                     }
                 }
                 e.vb[0]->Unlock();

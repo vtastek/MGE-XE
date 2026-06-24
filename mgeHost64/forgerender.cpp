@@ -411,9 +411,9 @@ namespace ForgeRender {
         // Pack a dummy SKINNED part into a second blob (slot 1): 3 verts fully weighted to
         // bone 0, 1 bone. Exercises the skinned VB upload + skinned pipeline + draw.
         IPC::SkinnedVertexWire skVerts[3] = {
-            {   0.0f,   0.0f, 0.0f,  0,0,1,  1,0,0,0,  0 },
-            { 100.0f,   0.0f, 0.0f,  0,0,1,  1,0,0,0,  0 },
-            {   0.0f, 100.0f, 0.0f,  0,0,1,  1,0,0,0,  0 },
+            {   0.0f,   0.0f, 0.0f,  0,0,1,  1,0,0,0,  0,  0.0f,0.0f },
+            { 100.0f,   0.0f, 0.0f,  0,0,1,  1,0,0,0,  0,  1.0f,0.0f },
+            {   0.0f, 100.0f, 0.0f,  0,0,1,  1,0,0,0,  0,  0.0f,1.0f },
         };
         uint16_t skIdx[3] = { 0, 1, 2 };
         uint8_t skBlob[sizeof(IPC::GeomPartWire) + sizeof(skVerts) + sizeof(skIdx)];
@@ -733,6 +733,11 @@ namespace {
         Pipeline*      pSkinnedPipelineMirror = nullptr; // FRONT_FACE_CW (mirrored, neg-determinant bones)
         Buffer*        pBonesBuf[16] = {};               // bone windows: one 64KB cbuffer per window, persistent-mapped
         DescriptorSet* pPerBatchSetSkin = nullptr;       // gBatch bound to pBonesBuf[], kMaxBatches instances
+        // Skinned instance-rate VB of uint2 { .x = Base (bone offset in window), .y = texIndex }.
+        // Indexed by the global skinnedDrawn (0..kMaxSkinned-1) via firstInstance, so each drawn
+        // part gets a UNIQUE entry — no per-part overwrite hazard (can't reuse pInstanceBuf[0],
+        // which the static loop fills with its own texIndices). Written per frame in the skinned loop.
+        Buffer*        pInstanceBufSkin = nullptr;
 
         // --- Buffer consolidation: one shared mega VB + IB for STATIC non-skinned parts ----
         // Kills the per-draw VB/IB binds (the DX9-shaped bottleneck): bind these ONCE, draw each
@@ -1177,17 +1182,17 @@ namespace {
                 return false;
             }
 
-            // Skinned vertex layout: binding 0 = mesh (IPC::SkinnedVertexWire, stride 44:
-            // pos@0, normal@12, weights@24 float4, indices@40 UBYTE4→R8G8B8A8_UINT);
-            // binding 1 = per-INSTANCE Base (uint, the palette offset in the bound window),
-            // fed by the shared identity instance buffer + firstInstance.
+            // Skinned vertex layout: binding 0 = mesh (IPC::SkinnedVertexWire, stride 52:
+            // pos@0, normal@12, weights@24 float4, indices@40 UBYTE4→R8G8B8A8_UINT, uv@44);
+            // binding 1 = per-INSTANCE uint2 { Base @0 (palette offset in the bound window),
+            // texIndex @4 }, fed by pInstanceBufSkin + firstInstance=skinnedDrawn.
             VertexLayout svl = {};
             svl.mBindingCount = 2;
             svl.mBindings[0].mStride = sizeof(IPC::SkinnedVertexWire);
             svl.mBindings[0].mRate = VERTEX_BINDING_RATE_VERTEX;
-            svl.mBindings[1].mStride = 2 * sizeof(uint32_t);   // shared instance uint2; Base = .x @ off 0
+            svl.mBindings[1].mStride = 2 * sizeof(uint32_t);   // instance uint2; Base @0, texIndex @4
             svl.mBindings[1].mRate = VERTEX_BINDING_RATE_INSTANCE;
-            svl.mAttribCount = 5;
+            svl.mAttribCount = 7;
             svl.mAttribs[0].mSemantic = SEMANTIC_POSITION;
             svl.mAttribs[0].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
             svl.mAttribs[0].mBinding = 0;
@@ -1213,6 +1218,16 @@ namespace {
             svl.mAttribs[4].mBinding = 1;
             svl.mAttribs[4].mLocation = 4;
             svl.mAttribs[4].mOffset = 0;
+            svl.mAttribs[5].mSemantic = SEMANTIC_TEXCOORD3;       // Uv (per-vertex, base map)
+            svl.mAttribs[5].mFormat = TinyImageFormat_R32G32_SFLOAT;
+            svl.mAttribs[5].mBinding = 0;
+            svl.mAttribs[5].mLocation = 5;
+            svl.mAttribs[5].mOffset = 44;
+            svl.mAttribs[6].mSemantic = SEMANTIC_TEXCOORD4;       // TexIndex (per-instance uint)
+            svl.mAttribs[6].mFormat = TinyImageFormat_R32_UINT;
+            svl.mAttribs[6].mBinding = 1;
+            svl.mAttribs[6].mLocation = 6;
+            svl.mAttribs[6].mOffset = 4;
 
             DepthStateDesc skDepth = {};
             skDepth.mDepthTest = true;
@@ -1263,8 +1278,24 @@ namespace {
                 bb.ppBuffer = &g_live.pBonesBuf[b];
                 addResource(&bb, nullptr);
             }
+            // Skinned instance buffer: kMaxSkinned uint2 { Base, texIndex }, one entry per
+            // drawn part (indexed by skinnedDrawn via firstInstance). CPU-mapped, written per
+            // frame in the skinned loop. Dedicated (not pInstanceBuf[0]) so the static loop's
+            // per-frame texIndices can't clobber it.
+            {
+                BufferLoadDesc sib = {};
+                sib.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+                sib.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+                sib.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                sib.mDesc.mSize = (uint64_t)kMaxSkinned * 2 * sizeof(uint32_t);
+                sib.mDesc.pName = "instanceVBSkin";
+                sib.pData = nullptr;
+                sib.ppBuffer = &g_live.pInstanceBufSkin;
+                addResource(&sib, nullptr);
+            }
+
             waitForAllResourceLoads();
-            if (!g_live.pBonesBuf[0]) {
+            if (!g_live.pBonesBuf[0] || !g_live.pInstanceBufSkin) {
                 return false;
             }
 
@@ -1897,6 +1928,12 @@ namespace ForgeRender {
                 uint8_t* dst = (uint8_t*)g_live.pBonesBuf[window]->pCpuMappedAddress;
                 std::memcpy(dst + (size_t)base * 64, palette, (size_t)bones * 64);
 
+                // Instance entry skinnedDrawn = { Base = base, texIndex }. firstInstance below
+                // selects it; Base resolves gBatch.worlds[Base + BoneIdx], texIndex the base map.
+                uint32_t* sinst = (uint32_t*)g_live.pInstanceBufSkin->pCpuMappedAddress;
+                sinst[skinnedDrawn * 2 + 0] = base;
+                sinst[skinnedDrawn * 2 + 1] = item.texIndex;
+
                 // Mirror pipeline by the wire flag (negative-determinant left-side parts).
                 const int mirror = item.mirror ? 1 : 0;
                 if (mirror != boundSkinMirror) {
@@ -1911,13 +1948,13 @@ namespace ForgeRender {
                 }
 
                 HostMesh& sm = g_meshes[slot];
-                // base ∈ {0,32,...,992} < kBatchSize, so pInstanceBuf[0] (identity .x) covers it.
-                Buffer*  vbs[2]     = { sm.vb, g_live.pInstanceBuf[0] };
+                // Dedicated skinned instance buffer, indexed by skinnedDrawn (firstInstance below).
+                Buffer*  vbs[2]     = { sm.vb, g_live.pInstanceBufSkin };
                 uint32_t strides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)(2 * sizeof(uint32_t)) };
                 cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
                 cmdBindIndexBuffer(g_live.pCmd, sm.ib, INDEX_TYPE_UINT16, 0);
-                // firstInstance = base → Base attribute reads instanceBuf[base] = base.
-                cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, base);
+                // firstInstance = skinnedDrawn → reads {Base, texIndex} for this part.
+                cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, skinnedDrawn);
                 ++skinnedDrawn;
             }
         }
@@ -2524,6 +2561,7 @@ namespace ForgeRender {
         for (uint32_t b = 0; b < kMaxBatches; ++b) {
             if (g_live.pBonesBuf[b]) { removeResource(g_live.pBonesBuf[b]); }
         }
+        if (g_live.pInstanceBufSkin) { removeResource(g_live.pInstanceBufSkin); }
         if (g_live.pSkinnedPipeline)       { removePipeline(R, g_live.pSkinnedPipeline); }
         if (g_live.pSkinnedPipelineMirror) { removePipeline(R, g_live.pSkinnedPipelineMirror); }
         if (g_live.pSkinnedShader)         { removeShader(R, g_live.pSkinnedShader); }

@@ -32,15 +32,16 @@ namespace IPC {
     };
 
     // M-Skinning: bind-pose skinned vertex — position + normal + top-4 bone influences
-    // (weights + packed UBYTE4 palette indices). Same flat fidelity as GeomVertexWire
-    // (UV/colour omitted). The GPU palette-skins this with the per-frame bone window.
-    // `indices` packs idx0 in the low byte, matching D3D9 SkinnedVertex.indices so the
-    // FSL R8G8B8A8_UINT unpacks in the same order. 44 bytes.
+    // (weights + packed UBYTE4 palette indices) + base-map UV. The GPU palette-skins this
+    // with the per-frame bone window. `indices` packs idx0 in the low byte, matching D3D9
+    // SkinnedVertex.indices so the FSL R8G8B8A8_UINT unpacks in the same order. 52 bytes.
+    // (UV added for skinned texturing; colour still omitted — DiffAmb vcol is a later tier.)
     struct SkinnedVertexWire {
         float px, py, pz;
         float nx, ny, nz;
         float w0, w1, w2, w3;
         std::uint32_t indices;       // packed UBYTE4 bone palette indices (idx0 = low byte)
+        float u, v;                  // base-map UV (set 0); skinned meshes are single-UV
     };
 
     // GeomPartWire::flags bits.
@@ -94,11 +95,12 @@ namespace IPC {
     // negative-scale bone → inside-out without the mirror pipeline). There is NO per-draw
     // world matrix — the bone palette is already world-space. A SkinnedDrawWire is
     // followed INLINE by numBones * 64 palette bytes (each bone a model->world D3DXMATRIX,
-    // row-major). A skinned-draw blob = repeated [SkinnedDrawWire][palette]. 12 bytes + palette.
+    // row-major). A skinned-draw blob = repeated [SkinnedDrawWire][palette]. 16 bytes + palette.
     struct SkinnedDrawWire {
         std::uint32_t slot;
         std::uint32_t numBones;
         std::uint32_t mirror;        // 1 = mirrored (negative-determinant); pick CW pipeline
+        std::uint32_t texIndex;      // bindless gTextures[] slot for the base map (0 = default white)
     };
 
 #pragma pack(pop)
