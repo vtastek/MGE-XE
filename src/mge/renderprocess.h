@@ -30,6 +30,13 @@ namespace RenderProcess {
     // seam is live and wants static opaque geometry. Avoids any cost when off.
     bool wantsGeometryCapture();
 
+    // True when the Forge seam is live AND compositing (F11 on): the host renders the opaque
+    // world and the full-screen composite overwrites MW's frame at present. While true, the
+    // engine's own scene-0 covered-opaque draw is redundant (overwritten) — DistantLand
+    // suppresses it so we don't pay for double rendering. MWSE does NOT consume the API v5
+    // no-op signal, so this in-MGE suppression is the lever. Off = engine draws scene 0 normally.
+    bool ownsOpaqueWorld();
+
     // Called from the cache upload path (scenegraph_geometry_cache.cpp) for each
     // non-skinned opaque part when its model-space geometry is (re)built. Assigns the
     // part a dense host slot (keyed on the cache key), packs pos+normal+indices into a

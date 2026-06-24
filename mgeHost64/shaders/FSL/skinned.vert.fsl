@@ -29,6 +29,8 @@ STRUCT(VSOutput)
     DATA(float3,      Normal,   NORMAL);
     DATA(float2,      Uv,       TEXCOORD0);   // Phase 1: 0 (skinned UV lands in Phase 3); shared opaque.frag
     DATA(FLAT(uint),  TexIndex, TEXCOORD1);   // Phase 2: 0 (skinned textures Phase 3) → default white
+    DATA(float,       Fog,      TEXCOORD2);   // MW fog scalar (shared opaque.frag, matches opaque.vert)
+    DATA(float4,      Color,    COLOR);       // Tier 2a: white (skinned VB has no vcol) → (d+a) fidelity
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -62,5 +64,10 @@ VSOutput VS_MAIN( VSInput In )
     Out.Normal = worldNrm;
     Out.Uv = float2(0.0f, 0.0f);
     Out.TexIndex = 0u;
+    Out.Color = float4(1.0f, 1.0f, 1.0f, 1.0f);
+    // MW near fog, same per-vertex form as opaque.vert (palette is already world-space).
+    float dist = length(worldPos.xyz - gFrameData.eyePos.xyz);
+    Out.Fog = saturate((gFrameData.fogParams.y - dist)
+                       / (gFrameData.fogParams.y - gFrameData.fogParams.x));
     RETURN(Out);
 }

@@ -1,9 +1,10 @@
 // mgeHost64 — opaque scene (fragment stage).
 //
-// Phase 2 texturing: sample the bindless base-map (this draw's flat per-vertex TexIndex selects
-// gTextures[TexIndex]; slot 0 = 1x1 white for unloaded parts) and modulate by the same flat N·L
-// shade used since M1c, so geometry still reads as solid form. Real lighting and multi-map
-// (dark/detail/glow) are later milestones.
+// Tier 1 lighting: real MW sun (directional N·L) + scene ambient + static tonemap + near fog,
+// fed per-frame via gFrameData (sunDir/sunCol/ambCol/fogColNear/fogParams). Matches FFE's
+// PerPixelPS for the vertexMaterialNone case (no vertex color yet — the base texture stands in
+// for material diffuse/ambient). Vertex color + material, point lights, and multi-map are the
+// following tiers. The base map is the bindless gTextures[TexIndex] (slot 0 = white).
 
 #include "opaque.srt.h"
 
@@ -13,16 +14,31 @@ STRUCT(VSOutput)
     DATA(float3,      Normal,   NORMAL);
     DATA(float2,      Uv,       TEXCOORD0);
     DATA(FLAT(uint),  TexIndex, TEXCOORD1);
+    DATA(float,       Fog,      TEXCOORD2);
+    DATA(float4,      Color,    COLOR);       // per-vertex DiffAmb colour
 };
+
+// Static semi-HDR tonemap — ported verbatim from XE FixedFuncEmu.fx::tonemap.
+// Maps 0->0, 1.0->0.84, up to 2.2->1.0 (lets sun+ambient overshoot 1 without clipping flat).
+float3 tonemap(float3 c)
+{
+    c = clamp(c, 0.0f, 2.2f);
+    c = (((0.0548303f * c - 0.189786f) * c - 0.154732f) * c + 1.12969f) * c;
+    return c;
+}
 
 ROOT_SIGNATURE(DefaultRootSignature)
 float4 PS_MAIN( VSOutput In )
 {
     INIT_MAIN;
     float3 N = normalize(In.Normal);
-    float3 L = normalize(float3(0.3f, 0.8f, 0.5f));
-    float  ndl = max(dot(N, L), 0.0f);
-    float  shade = 0.25f + 0.75f * ndl;   // ambient + diffuse
+    // MW lighting: sun diffuse (to-sun = -sunDir) + scene ambient. FFE convention.
+    float  ndl = saturate(dot(N, -gFrameData.sunDir.xyz));
+    // FFE vertexMaterialDiffAmb: diffuse = vColor * (sun_d + ambient). vColor is white when
+    // the mesh isn't DiffAmb (capture-side decision), so this reduces to the white-material
+    // (d+a) case there. Material constants / emissive routing are Tier 2b.
+    float3 lit = In.Color.rgb * (gFrameData.sunCol.rgb * ndl + gFrameData.ambCol.rgb);
+
     // gSamplerAnisotropic: FSL built-in STATIC sampler (anisotropic 8x, WRAP), baked into
     // DefaultRootSignature. We deliberately do NOT use a dynamic sampler: one sharing the Persistent
     // set with the 1024-entry bindless array gets pushed to mOffset=1024 by FSL's single per-set
@@ -30,5 +46,10 @@ float4 PS_MAIN( VSOutput In )
     // s0 (= null sampler => POINT filter + non-REPEAT address => tiled UVs sample black). A static
     // sampler sidesteps that entirely. See opaque.srt.h.
     float4 albedo = SampleTex2D(gTextures[In.TexIndex], gSamplerAnisotropic, In.Uv);
-    RETURN(float4(albedo.rgb * shade, 1.0f));
+
+    float3 c = albedo.rgb * lit;
+    c = tonemap(c);
+    // Near fog: lerp toward fogColNear as Fog -> 0 (matches FFE's lerp(fogColNear, c, fog)).
+    c = lerp(gFrameData.fogColNear.rgb, c, In.Fog);
+    RETURN(float4(c, 1.0f));
 }

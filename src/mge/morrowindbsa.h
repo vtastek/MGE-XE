@@ -17,5 +17,8 @@ namespace BSA {
     // On success *outData is a malloc'd buffer the caller frees with std::free, *outSize its
     // length. Returns false if not found. Used by the Forge texture-residency path: ship the
     // raw DDS to the host process, which decodes it (mips + BC intact) — no GPU readback.
-    bool loadFileBytes(const char* filename, void** outData, unsigned* outSize);
+    // skipDistantStatics: when true, do NOT prefer the distantland\statics LOD folder (its
+    // downscaled copies blur near geometry); resolve loose Data Files -> BSA like the engine's
+    // near renderer. The Forge near-texturing path passes true.
+    bool loadFileBytes(const char* filename, void** outData, unsigned* outSize, bool skipDistantStatics = false);
 }

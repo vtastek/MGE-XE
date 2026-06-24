@@ -17,12 +17,18 @@ namespace IPC {
 
 #pragma pack(push, 4)
 
-    // Model-space vertex: position + normal + base-map UV (set e.baseUV). 32 bytes.
-    // (Texturing Phase 1 added u,v; multi-map extra UV sets are a later milestone.)
+    // Model-space vertex: position + normal + base-map UV (set e.baseUV) + per-vertex
+    // colour. 36 bytes. (Texturing Phase 1 added u,v; Tier 2a lighting added color.)
+    // `color` is a packed D3DCOLOR (B,G,R,A byte order, == NI::PackedColor) read by the
+    // host as B8G8R8A8_UNORM. The client writes the real vertex colour ONLY when the mesh
+    // uses VertexColorProperty source 2 (ambient+diffuse / DiffAmb); otherwise it writes
+    // 0xFFFFFFFF (white), which makes the shader's col*(d+a) reduce to the white-material
+    // (d+a) case — so the host always runs the DiffAmb path with no per-draw routing flag.
     struct GeomVertexWire {
         float px, py, pz;
         float nx, ny, nz;
         float u, v;
+        std::uint32_t color;         // packed D3DCOLOR (B,G,R,A); white when vColSource != DiffAmb
     };
 
     // M-Skinning: bind-pose skinned vertex — position + normal + top-4 bone influences
@@ -42,7 +48,7 @@ namespace IPC {
 
     // Per-part header preceding the part's vertex+index data in the batch blob. When
     // (flags & kGeomFlagSkinned), the part's vertices are SkinnedVertexWire (stride 44)
-    // and numBones is the part's bone count; otherwise GeomVertexWire (stride 24). The
+    // and numBones is the part's bone count; otherwise GeomVertexWire (stride 36). The
     // index-buffer layout is unchanged either way.
     struct GeomPartWire {
         std::uint32_t slot;          // dense host array index assigned by the client

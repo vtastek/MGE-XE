@@ -234,16 +234,24 @@ static bool readWholeFileMalloc(HANDLE h, void** outData, unsigned* outSize) {
 
 // loadFileBytesExact - Resolve a path to raw bytes via the same source priority as
 // loadTextureExact (distantland\statics -> loose Data Files -> BSA). No D3D9 texture.
-static bool loadFileBytesExact(const char* filename, void** outData, unsigned* outSize) {
+// skipDistantStatics: the distantland\statics folder holds MGE-generated DOWNSCALED LOD
+// copies for distant statics. The Forge NEAR-geometry path must NOT pick those up (it would
+// sample a low-res LOD for near objects — visible blur); pass true to match the engine's near
+// renderer (loose Data Files -> BSA only). Distant-land callers leave it false.
+static bool loadFileBytesExact(const char* filename, void** outData, unsigned* outSize,
+                               bool skipDistantStatics = false) {
     char pathbuf[MAX_PATH];
+    HANDLE h = INVALID_HANDLE_VALUE;
 
-    // Distant land folder
-    std::snprintf(pathbuf, sizeof(pathbuf), "Data Files\\distantland\\statics\\%s", filename);
-    HANDLE h = CreateFile(pathbuf, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, 0, 0);
-    if (h != INVALID_HANDLE_VALUE) {
-        bool ok = readWholeFileMalloc(h, outData, outSize);
-        CloseHandle(h);
-        if (ok) { return true; }
+    // Distant land folder (downscaled LOD copies — skipped for the near path)
+    if (!skipDistantStatics) {
+        std::snprintf(pathbuf, sizeof(pathbuf), "Data Files\\distantland\\statics\\%s", filename);
+        h = CreateFile(pathbuf, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, 0, 0);
+        if (h != INVALID_HANDLE_VALUE) {
+            bool ok = readWholeFileMalloc(h, outData, outSize);
+            CloseHandle(h);
+            if (ok) { return true; }
+        }
     }
 
     // Loose Data Files folder
@@ -271,7 +279,10 @@ static bool loadFileBytesExact(const char* filename, void** outData, unsigned* o
 }
 
 // loadFileBytes - Public raw-bytes loader, mirrors loadTexture's prefix + .dds substitution.
-bool loadFileBytes(const char* filename, void** outData, unsigned* outSize) {
+// skipDistantStatics: pass true for near-geometry texturing (the Forge host) so the
+// distantland\statics downscaled-LOD copies are NOT preferred over the full-res loose/BSA
+// source — see loadFileBytesExact.
+bool loadFileBytes(const char* filename, void** outData, unsigned* outSize, bool skipDistantStatics) {
     char pathbuf[MAX_PATH];
 
     // Prefer the .dds extension first (matches loadTexture).
@@ -279,14 +290,14 @@ bool loadFileBytes(const char* filename, void** outData, unsigned* outSize) {
     size_t len = strlen(pathbuf);
     if (len >= 3) {
         std::strcpy(pathbuf + len - 3, "dds");
-        if (loadFileBytesExact(pathbuf, outData, outSize)) {
+        if (loadFileBytesExact(pathbuf, outData, outSize, skipDistantStatics)) {
             return true;
         }
     }
 
     // Original extension
     std::snprintf(pathbuf, sizeof(pathbuf), "textures\\%s", filename);
-    return loadFileBytesExact(pathbuf, outData, outSize);
+    return loadFileBytesExact(pathbuf, outData, outSize, skipDistantStatics);
 }
 
 // clearTextureCache - Clear texture cache.

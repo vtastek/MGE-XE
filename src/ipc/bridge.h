@@ -279,6 +279,10 @@ namespace IPC {
         // the triangle. viewProj is D3DXMATRIX bytes (row-major) — uploaded straight to
         // the host's gFrameData cbuffer (no transpose, see opaque.srt.h).
         IN float viewProj[16];
+        // Tier 1 lighting: 6 × float4 = 24 floats (sunDir, sunCol, ambCol, fogColNear,
+        // fogParams[x=fogNearStart,y=fogNearEnd], eyePos), uploaded into gFrameData after
+        // viewProj. From DistantLand each frame (see RenderProcess::onPresent).
+        IN float lighting[24];
         IN VecId drawList;               // chunked byte vec of DrawItemWire[]; Invalid ⇒ triangle
         IN std::uint32_t drawCount;
         IN std::uint32_t drawBytes;

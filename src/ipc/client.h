@@ -289,6 +289,7 @@ namespace IPC {
 		* @return Whether the frame rendered (blocking).
 		*/
 		bool renderSceneBlocking(std::uint32_t frameIndex, const float* viewProj,
+			const float* lighting,
 			VecId drawList, std::uint32_t drawCount, std::uint32_t drawBytes,
 			VecId skinnedList, std::uint32_t skinnedCount, std::uint32_t skinnedBytes,
 			double* outRenderMs = nullptr);

@@ -535,7 +535,7 @@ namespace IPC {
 					params.frameIndex, params.drawCount, bytes, params.skinnedCount, skinnedBytes);
 				LOG::flush();
 			}
-			ok = ForgeRender::renderScene(params.viewProj, drawPtr, params.drawCount, bytes,
+			ok = ForgeRender::renderScene(params.viewProj, params.lighting, drawPtr, params.drawCount, bytes,
 				skinnedPtr, params.skinnedCount, skinnedBytes);
 			if (logScene) {
 				LOG::logline(">> [scene] renderScene DONE ok=%d drawn=%u skinned=%u",
@@ -581,8 +581,11 @@ namespace IPC {
 			std::memcpy(&h0, p, sizeof(h0));
 		}
 		// Log BEFORE the call (flushed): if the matching "built" line below never
-		// appears, uploadGeometry crashed/hung on this input.
-		const bool logThis = (params.partCount > 1 || params.partsUploaded != params.partCount);
+		// appears, uploadGeometry crashed/hung on this input. Only for multi-part batches
+		// (cell-load bursts — the risky path). A single-part upload every frame is the
+		// steady animated-mesh re-upload; logging it spammed the host log (partsUploaded
+		// is 0 pre-call, so the old `!= partCount` test was always true for partCount=1).
+		const bool logThis = (params.partCount > 1);
 		if (logThis) {
 			LOG::logline(">> [geom] geomUpload ENTER: partCount=%u size=%u availBytes=%u byteCount=%u bytes=%u p0{slot=%u rev=%u v=%u i=%u}",
 				params.partCount, vec.size(), availBytes, params.byteCount, bytes,

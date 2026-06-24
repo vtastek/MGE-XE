@@ -20,6 +20,15 @@
 STRUCT(FrameData)
 {
     DATA(float4x4, viewProj, None);
+    // Tier 1 lighting (per-frame, from DistantLand). All float4 for clean 16-byte cbuffer
+    // packing; shaders read .xyz. sunDir = WORLD-space sun TRAVEL direction (normalized) —
+    // to-sun is -sunDir, matching FFE's saturate(dot(N, -lightSunDirection)).
+    DATA(float4, sunDir,     None);   // xyz = world sun travel dir
+    DATA(float4, sunCol,     None);   // xyz = sun diffuse color
+    DATA(float4, ambCol,     None);   // xyz = scene ambient color
+    DATA(float4, fogColNear, None);   // xyz = near fog color (lerp target)
+    DATA(float4, fogParams,  None);   // x = fogNearStart, y = fogNearEnd
+    DATA(float4, eyePos,     None);   // xyz = world camera position (fog distance)
 };
 
 STRUCT(BatchData)

@@ -11,6 +11,7 @@ STRUCT(VSInput)
     DATA(float3, Position,  POSITION);
     DATA(float3, Normal,    NORMAL);
     DATA(float2, Uv,        TEXCOORD0);    // per-vertex: base-map UV
+    DATA(float4, Color,     COLOR);        // per-vertex: DiffAmb colour (white when unused)
     DATA(uint,   DrawIndex, TEXCOORD1);    // per-instance: index into gWorlds (instance buf .x)
     DATA(uint,   TexIndex,  TEXCOORD2);    // per-instance: bindless gTextures slot (instance buf .y)
 };
@@ -21,6 +22,8 @@ STRUCT(VSOutput)
     DATA(float3,      Normal,   NORMAL);
     DATA(float2,      Uv,       TEXCOORD0);
     DATA(FLAT(uint),  TexIndex, TEXCOORD1);
+    DATA(float,       Fog,      TEXCOORD2);   // MW fog scalar (1 = clear, 0 = full fogColNear)
+    DATA(float4,      Color,    COLOR);       // per-vertex DiffAmb colour (shared opaque.frag)
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -38,5 +41,11 @@ VSOutput VS_MAIN( VSInput In )
     Out.Normal = mul((float3x3)world, In.Normal);
     Out.Uv = In.Uv;
     Out.TexIndex = In.TexIndex;
+    Out.Color = In.Color;
+    // MW near fog (per-vertex, as FFE): dist is camera distance = |worldPos - eye| (the view
+    // transform is rigid, so this equals length(viewpos)). fog = saturate((end-dist)/(end-start)).
+    float dist = length(worldPos.xyz - gFrameData.eyePos.xyz);
+    Out.Fog = saturate((gFrameData.fogParams.y - dist)
+                       / (gFrameData.fogParams.y - gFrameData.fogParams.x));
     RETURN(Out);
 }

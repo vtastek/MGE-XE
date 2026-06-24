@@ -18,10 +18,13 @@
 
 #include "forgerender.h"
 #include "ipc/geomwire.h"
+#include "support/log.h"   // LOG::logline -> mgeHost64.log (LOGF goes to uncaptured stdout)
 
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <chrono>
+#include <vector>
 
 #include "OS/Interfaces/IOperatingSystem.h"
 #include "Utilities/Interfaces/IFileSystem.h"
@@ -390,9 +393,9 @@ namespace ForgeRender {
         // Fullscreen triangle in NDC (viewProj + world identity) so it actually covers the RT
         // centre — the old 0..100 triangle landed off-screen, so the probe never visually tested.
         IPC::GeomVertexWire verts[3] = {
-            { -1.0f, -1.0f, 0.5f,  0,0,1,  0,0 },
-            {  3.0f, -1.0f, 0.5f,  0,0,1,  2,0 },
-            { -1.0f,  3.0f, 0.5f,  0,0,1,  0,2 },
+            { -1.0f, -1.0f, 0.5f,  0,0,1,  0,0,  0xFFFFFFFFu },
+            {  3.0f, -1.0f, 0.5f,  0,0,1,  2,0,  0xFFFFFFFFu },
+            { -1.0f,  3.0f, 0.5f,  0,0,1,  0,2,  0xFFFFFFFFu },
         };
         uint16_t idx[3] = { 0, 1, 2 };
         uint8_t blob[sizeof(IPC::GeomPartWire) + sizeof(verts) + sizeof(idx)];
@@ -426,6 +429,16 @@ namespace ForgeRender {
 
         // Identity viewProj + identity world, one static draw item at slot 0.
         float vp[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+        // Tier 1 lighting (6×float4): sun OFF, ambient 0.5, no fog — so the SLOT-0 white-texture
+        // guard below stays a clean normal-independent value (white × 0.5, tonemapped ≈ 129).
+        float lt[24] = {
+            0,0,-1,0,           // sunDir (unused, sunCol=0)
+            0,0,0,0,            // sunCol = 0
+            0.5f,0.5f,0.5f,0,   // ambCol
+            0,0,0,0,            // fogColNear
+            0, 1e9f, 0,0,       // fogParams: start=0, end=1e9 -> fog ≈ 1 (clear)
+            0,0,0,0             // eyePos
+        };
         IPC::DrawItemWire item = {};
         item.slot = 0;
         float ident[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
@@ -441,15 +454,15 @@ namespace ForgeRender {
         // First render builds the lazy opaque path (incl. the bindless PerFrame set) so the
         // texture upload below has somewhere to land. texIndex 0 here = default white.
         std::printf("[forge] scene-probe: renderScene #1 (builds path)...\n");
-        bool ok = renderScene(vp, &item, 1, (unsigned)sizeof(item),
+        bool ok = renderScene(vp, lt, &item, 1, (unsigned)sizeof(item),
                               skDraw, 1, (unsigned)sizeof(skDraw));
 
         // SLOT-0 regression guard: sample gTextures[0] (default white) THROUGH the shader. Skinned
         // parts (TexIndex 0) and oversize-texture fallbacks all use slot 0, so it MUST sample white
         // (160,160,160), not black — a 1x1 default white regressed this (see buildOpaquePath).
         item.texIndex = 0;
-        renderScene(vp, &item, 1, (unsigned)sizeof(item), skDraw, 1, (unsigned)sizeof(skDraw));
-        std::printf("[forge] scene-probe: SLOT-0 (default white) sample -> expect 160,160,160\n");
+        renderScene(vp, lt, &item, 1, (unsigned)sizeof(item), skDraw, 1, (unsigned)sizeof(skDraw));
+        std::printf("[forge] scene-probe: SLOT-0 (default white) sample -> expect ~129 (white x 0.5 ambient, tonemapped), NOT 0\n");
         debugReadbackCenterPixel();
 
         // Synthetic 4x4 all-white DXT1 DDS → texture slot 1. Exercises parseDds (BC1) + the
@@ -475,7 +488,7 @@ namespace ForgeRender {
         // Second render samples the uploaded texture (slot 1).
         item.texIndex = 1;
         std::printf("[forge] scene-probe: renderScene #2 (samples slot 1)...\n");
-        ok = renderScene(vp, &item, 1, (unsigned)sizeof(item),
+        ok = renderScene(vp, lt, &item, 1, (unsigned)sizeof(item),
                          skDraw, 1, (unsigned)sizeof(skDraw));
         std::printf("[forge] scene-probe: renderScene returned %d (skinnedDrawn=%u)\n",
                     (int)ok, lastSkinnedDrawn());
@@ -720,8 +733,74 @@ namespace {
         Pipeline*      pSkinnedPipelineMirror = nullptr; // FRONT_FACE_CW (mirrored, neg-determinant bones)
         Buffer*        pBonesBuf[16] = {};               // bone windows: one 64KB cbuffer per window, persistent-mapped
         DescriptorSet* pPerBatchSetSkin = nullptr;       // gBatch bound to pBonesBuf[], kMaxBatches instances
+
+        // --- Buffer consolidation: one shared mega VB + IB for STATIC non-skinned parts ----
+        // Kills the per-draw VB/IB binds (the DX9-shaped bottleneck): bind these ONCE, draw each
+        // part with firstVertex(BaseVertexLocation)/firstIndex offsets into them. Free-list
+        // suballocated so streaming geometry can add/free regions as the player moves.
+        Buffer*        pArenaVB = nullptr;   // GPU_ONLY, GeomVertexWire (stride 32)
+        Buffer*        pArenaIB = nullptr;   // GPU_ONLY, UINT16 indices
+
+        // GPU-driven draws: per-frame indirect-argument buffer (one IndirectDrawIndexArguments
+        // per static arena part). The ~2667 cmdDrawIndexedInstanced API calls collapse into a
+        // handful of cmdExecuteIndirect (one per (mirror,batch) group) — kills the per-draw-CALL
+        // CPU record cost. CPU_TO_GPU upload heap = GENERIC_READ (includes INDIRECT_ARGUMENT),
+        // so no per-frame barrier; single-buffered (host render is lockstep, waitForFences gates).
+        Buffer*        pIndirectArgs = nullptr;
     };
     LiveRenderer g_live;
+
+    // Mega-arena sizes. Holds the resident static-opaque working set (engine ~100m + MGE LOD
+    // ~16 cells). Generous; arena-full logs + skips (no fallback). True eviction across a
+    // 40000-cell world needs a client free-slot signal (follow-up); the free-list already
+    // reclaims on re-upload/shape-change.
+    constexpr uint64_t kArenaVBBytes = 256ull << 20;   // 256 MB
+    constexpr uint64_t kArenaIBBytes = 64ull << 20;    // 64 MB
+
+    // First-fit free-list suballocator over a fixed byte arena (the mega VB or IB). VB allocs
+    // are vertexCount*32, IB allocs indexCount*2 — both inherently aligned — so region offsets
+    // stay aligned without explicit padding. free() coalesces adjacent regions.
+    struct FreeList {
+        struct Region { uint64_t off; uint64_t len; };
+        std::vector<Region> regions;     // sorted ascending by off; non-adjacent (coalesced)
+        uint64_t total = 0;
+
+        void init(uint64_t size) { regions.assign(1, {0, size}); total = size; }
+
+        // Returns byte offset, or UINT64_MAX if no region fits.
+        uint64_t alloc(uint64_t len) {
+            if (len == 0) return UINT64_MAX;
+            for (size_t i = 0; i < regions.size(); ++i) {
+                if (regions[i].len >= len) {
+                    uint64_t off = regions[i].off;
+                    if (regions[i].len == len) { regions.erase(regions.begin() + i); }
+                    else { regions[i].off += len; regions[i].len -= len; }
+                    return off;
+                }
+            }
+            return UINT64_MAX;
+        }
+
+        void release(uint64_t off, uint64_t len) {   // NOT 'free' — that's a Forge IMemory macro
+            if (len == 0) return;
+            // insert sorted, then coalesce with neighbours
+            size_t i = 0;
+            while (i < regions.size() && regions[i].off < off) ++i;
+            regions.insert(regions.begin() + i, {off, len});
+            // coalesce with next
+            if (i + 1 < regions.size() && regions[i].off + regions[i].len == regions[i + 1].off) {
+                regions[i].len += regions[i + 1].len;
+                regions.erase(regions.begin() + i + 1);
+            }
+            // coalesce with prev
+            if (i > 0 && regions[i - 1].off + regions[i - 1].len == regions[i].off) {
+                regions[i - 1].len += regions[i].len;
+                regions.erase(regions.begin() + i);
+            }
+        }
+    };
+    FreeList g_arenaVB;   // suballocates pArenaVB (bytes)
+    FreeList g_arenaIB;   // suballocates pArenaIB (bytes)
 
     // Per-draw transform: the PROVEN column-major cbuffer convention, BATCHED to beat the
     // 64KB cbuffer cap. CRITICAL: a UNIFORM_BUFFER resource > 64KB makes Forge build an
@@ -826,16 +905,16 @@ namespace {
         }
 
         // Vertex layout: binding 0 = mesh (IPC::GeomVertexWire, per-vertex: pos@0,
-        // normal@12, UV@24, stride 32); binding 1 = per-INSTANCE DrawIndex (uint, stride 4),
-        // fed by the identity instance buffer + firstInstance to index gWorlds. UV takes
-        // TEXCOORD0, so DrawIndex moved to TEXCOORD1 (matches opaque.vert).
+        // normal@12, UV@24, color@32, stride 36); binding 1 = per-INSTANCE DrawIndex (uint,
+        // stride 4), fed by the identity instance buffer + firstInstance to index gWorlds.
+        // UV takes TEXCOORD0, so DrawIndex moved to TEXCOORD1 (matches opaque.vert).
         VertexLayout vl = {};
         vl.mBindingCount = 2;
         vl.mBindings[0].mStride = sizeof(IPC::GeomVertexWire);
         vl.mBindings[0].mRate = VERTEX_BINDING_RATE_VERTEX;
         vl.mBindings[1].mStride = 2 * sizeof(uint32_t);      // instance uint2 {DrawIndex, TexIndex}
         vl.mBindings[1].mRate = VERTEX_BINDING_RATE_INSTANCE;
-        vl.mAttribCount = 5;
+        vl.mAttribCount = 6;
         vl.mAttribs[0].mSemantic = SEMANTIC_POSITION;
         vl.mAttribs[0].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
         vl.mAttribs[0].mBinding = 0;
@@ -851,16 +930,21 @@ namespace {
         vl.mAttribs[2].mBinding = 0;
         vl.mAttribs[2].mLocation = 2;
         vl.mAttribs[2].mOffset = 24;
-        vl.mAttribs[3].mSemantic = SEMANTIC_TEXCOORD1;       // DrawIndex (per-instance .x)
-        vl.mAttribs[3].mFormat = TinyImageFormat_R32_UINT;
-        vl.mAttribs[3].mBinding = 1;
+        vl.mAttribs[3].mSemantic = SEMANTIC_COLOR;           // per-vertex colour (DiffAmb)
+        vl.mAttribs[3].mFormat = TinyImageFormat_B8G8R8A8_UNORM;   // D3DCOLOR byte order (B,G,R,A)
+        vl.mAttribs[3].mBinding = 0;
         vl.mAttribs[3].mLocation = 3;
-        vl.mAttribs[3].mOffset = 0;
-        vl.mAttribs[4].mSemantic = SEMANTIC_TEXCOORD2;       // TexIndex (per-instance .y)
+        vl.mAttribs[3].mOffset = 32;
+        vl.mAttribs[4].mSemantic = SEMANTIC_TEXCOORD1;       // DrawIndex (per-instance .x)
         vl.mAttribs[4].mFormat = TinyImageFormat_R32_UINT;
         vl.mAttribs[4].mBinding = 1;
         vl.mAttribs[4].mLocation = 4;
-        vl.mAttribs[4].mOffset = sizeof(uint32_t);
+        vl.mAttribs[4].mOffset = 0;
+        vl.mAttribs[5].mSemantic = SEMANTIC_TEXCOORD2;       // TexIndex (per-instance .y)
+        vl.mAttribs[5].mFormat = TinyImageFormat_R32_UINT;
+        vl.mAttribs[5].mBinding = 1;
+        vl.mAttribs[5].mLocation = 5;
+        vl.mAttribs[5].mOffset = sizeof(uint32_t);
 
         DepthStateDesc depthDesc = {};
         depthDesc.mDepthTest = true;
@@ -964,8 +1048,25 @@ namespace {
             ib.ppBuffer = &g_live.pInstanceBuf[b];
             addResource(&ib, nullptr);
         }
+
+        // Per-frame indirect-args buffer (GPU-driven draws). One IndirectDrawIndexArguments
+        // (20 B) per arena part, up to kMaxDraws. CPU_TO_GPU persistent-mapped: written each
+        // frame, read by cmdExecuteIndirect (GENERIC_READ covers INDIRECT_ARGUMENT — no barrier).
+        {
+            BufferLoadDesc ad = {};
+            ad.mDesc.mDescriptors = DESCRIPTOR_TYPE_INDIRECT_BUFFER;
+            ad.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            ad.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            ad.mDesc.mSize = (uint64_t)kMaxDraws * sizeof(IndirectDrawIndexArguments);
+            ad.mDesc.pName = "indirectArgs";
+            ad.pData = nullptr;
+            ad.ppBuffer = &g_live.pIndirectArgs;
+            addResource(&ad, nullptr);
+        }
+
         waitForAllResourceLoads();
-        if (!g_live.pFrameCbv || !g_live.pWorldsBuf[0] || !g_live.pInstanceBuf[0]) {
+        if (!g_live.pFrameCbv || !g_live.pWorldsBuf[0] || !g_live.pInstanceBuf[0]
+            || !g_live.pIndirectArgs) {
             return false;
         }
         for (uint32_t b = 0; b < kMaxBatches; ++b) {
@@ -1190,17 +1291,60 @@ namespace {
     // The client assigns each cached NiTriShape* a dense slot; we keep meshes in a
     // flat array indexed by that slot (no hashing). Grown on demand; freed on
     // shutdown. M1c iterates a per-frame visible list of slots to draw these.
+    // Dynamic-geometry ring depth. Animated (morph) meshes re-upload their VB/IB every
+    // frame. Instead of recreating the GPU_ONLY buffer + fencing each time (~6ms), a slot
+    // that re-uploads at the same shape is promoted to a ring of persistently-mapped
+    // CPU_TO_GPU buffers we just memcpy into (no recreate, no fence). The ring lets a write
+    // land on a buffer the GPU isn't reading — explicit double-buffering, the modern
+    // replacement for D9's MANAGED/vb[2] driver magic. 2 is enough while renderScene is
+    // GPU-blocking (each frame completes before the next upload); bump if render goes async.
+    constexpr uint32_t kGeomRing = 2;
+
     struct HostMesh {
-        Buffer*  vb;
+        Buffer*  vb;            // per-mesh VB: skinned + dynamic-morph only (null when inArena)
         Buffer*  ib;
         uint32_t vertexCount;
         uint32_t indexCount;
         bool     valid;
         bool     skinned;       // M-Skinning: VB is SkinnedVertexWire (stride 44)
+        // Buffer consolidation: static non-skinned parts live in the shared mega arena (no
+        // per-mesh VB/IB) and draw with byte offsets. Skinned + dynamic-morph parts are NOT
+        // in the arena (vb/ib above). Exactly one of: inArena | skinned | dynamic.
+        bool     inArena;
+        uint64_t vbOff;         // byte offset into pArenaVB (valid when inArena)
+        uint64_t ibOff;         // byte offset into pArenaIB (valid when inArena)
+        // --- dynamic (re-uploaded / animated) path ---
+        bool     dynamic;       // in the persistent upload-heap ring (true morph only)
+        uint8_t  ring;          // next ring index to write
+        Buffer*  dynVb[kGeomRing];
+        Buffer*  dynIb[kGeomRing];
+        // Frequency gate: promote to the upload-heap ring ONLY for a mesh that re-uploads on
+        // CONSECUTIVE frames (a real per-vertex morph). Cell-transition churn (recycled slots)
+        // re-uploads a slot once, not frame-after-frame, so it must NOT promote — an upload-heap
+        // VB has high-latency uncached GPU vertex fetch, and mass-promoting churn tanks render.
+        uint32_t lastUploadFrame;
+        uint16_t uploadStreak;  // consecutive-frame re-uploads at the same shape
     };
     HostMesh* g_meshes   = nullptr;
     uint32_t  g_meshCap  = 0;   // allocated slot count
     uint32_t  g_meshHigh = 0;   // highest slot+1 ever populated
+    uint32_t  g_renderFrame = 0;   // monotonic, ++ per renderScene; drives the dynamic-promote streak
+    uint32_t  g_dynamicCount = 0;  // meshes currently in the upload-heap ring (should stay tiny)
+    // Split the host render cost into CPU command-recording (the per-draw bind+draw loop) vs
+    // GPU execution (submit→fence). If record >> gpu, the renderer is CPU-bound on per-draw
+    // binds (D3D9-style) and the DX12 win needs buffer consolidation / batched draws.
+    double    g_recAccum = 0.0;     // summed cmd-record ms over the heartbeat window
+    double    g_gpuAccum = 0.0;     // summed submit→fence ms over the heartbeat window
+
+    inline double hostNowMs() {
+        return std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    // Consecutive same-shape re-uploads before a slot migrates to the upload-heap ring.
+    // 2 = promote on the 3rd consecutive frame (a couple of static recreates at morph onset,
+    // then fence-free). Cell churn never reaches it (one-off re-uploads).
+    constexpr uint16_t kDynPromoteStreak = 2;
     unsigned  g_lastDrawn = 0;  // static parts actually drawn in the last renderScene
     unsigned  g_lastSkinnedDrawn = 0;  // skinned parts actually drawn in the last renderScene
 
@@ -1225,12 +1369,36 @@ namespace {
         return true;
     }
 
+    // Release every buffer a slot owns. Static slots own vb/ib directly; dynamic slots own
+    // the ring (dynVb/dynIb[]) and vb/ib merely alias the current ring entry, so the ring is
+    // the authority — null vb/ib first to avoid a double-free of an aliased pointer.
+    void releaseMeshBuffers(HostMesh& m) {
+        if (m.inArena) {
+            // Arena parts own no D3D12 resources — just free the suballocations.
+            g_arenaVB.release(m.vbOff, (uint64_t)m.vertexCount * sizeof(IPC::GeomVertexWire));
+            g_arenaIB.release(m.ibOff, (uint64_t)m.indexCount * sizeof(uint16_t));
+            m.inArena = false;
+            m.vbOff = m.ibOff = 0;
+        } else if (m.dynamic) {
+            for (uint32_t r = 0; r < kGeomRing; ++r) {
+                if (m.dynVb[r]) { removeResource(m.dynVb[r]); m.dynVb[r] = nullptr; }
+                if (m.dynIb[r]) { removeResource(m.dynIb[r]); m.dynIb[r] = nullptr; }
+            }
+            m.vb = m.ib = nullptr;   // were aliases into the ring
+            if (g_dynamicCount) { --g_dynamicCount; }
+        } else {
+            if (m.vb) { removeResource(m.vb); m.vb = nullptr; }
+            if (m.ib) { removeResource(m.ib); m.ib = nullptr; }
+        }
+        m.dynamic = false;
+        m.ring = 0;
+    }
+
     void freeMeshStore() {
         if (g_meshes) {
             for (uint32_t i = 0; i < g_meshHigh; ++i) {
                 if (g_meshes[i].valid) {
-                    if (g_meshes[i].vb) { removeResource(g_meshes[i].vb); }
-                    if (g_meshes[i].ib) { removeResource(g_meshes[i].ib); }
+                    releaseMeshBuffers(g_meshes[i]);
                 }
             }
             tf_free(g_meshes);
@@ -1427,7 +1595,7 @@ namespace ForgeRender {
         return true;
     }
 
-    bool renderScene(const float* viewProj, const void* drawBlob,
+    bool renderScene(const float* viewProj, const float* lighting, const void* drawBlob,
                      unsigned drawCount, unsigned drawBytes,
                      const void* skinnedBlob, unsigned skinnedCount, unsigned skinnedBytes) {
         if (!g_live.pRenderer) {
@@ -1454,6 +1622,7 @@ namespace ForgeRender {
         if (!g_live.pDepth) {
             return false;
         }
+        ++g_renderFrame;   // drives the dynamic-promote consecutive-frame streak in uploadGeometry
 
         const uint32_t n = (drawCount < g_live.maxDraws) ? drawCount : g_live.maxDraws;
         const uint32_t haveBytes = drawBytes / (uint32_t)sizeof(IPC::DrawItemWire);
@@ -1473,10 +1642,40 @@ namespace ForgeRender {
         rzViewProj[10] = rzViewProj[11] - rzViewProj[10];
         rzViewProj[14] = rzViewProj[15] - rzViewProj[14];
 
+        // HALF-PIXEL ALIGN: MW's own layers (sky/water/distant land/UI) are drawn by DXVK as
+        // D3D9, which applies the D3D9 half-pixel rasterization offset. Our Forge layer is D3D12
+        // (pixel centre at +0.5, no offset), so it lands ~½px off in BOTH axes from every
+        // MW-native layer → a ~1px whole-image shift in the composite. Re-introduce the D3D9
+        // offset on the Forge projection so the layers register. Shift screen-space by half a
+        // pixel: NDC dx = -1/width, dy = +1/height (y is flipped screen↔NDC). On the row-major
+        // viewProj clip.x = col0 (idx 0,4,8,12), clip.y = col1 (1,5,9,13), clip.w = col3
+        // (3,7,11,15); add d*col3 to the matching col so the shift scales with w (post-divide
+        // constant). kHalfPixelSign flips the whole correction in one place for F5/F6 A/B.
+        {
+            const float kHalfPixelSign = -1.0f;  // -1 pushes Forge toward bottom-right (cancels the D3D9/D3D12 top-left mismatch)
+            const float dx = kHalfPixelSign * (-1.0f / (float)g_live.width);
+            const float dy = kHalfPixelSign * ( 1.0f / (float)g_live.height);
+            rzViewProj[0]  += dx * rzViewProj[3];
+            rzViewProj[4]  += dx * rzViewProj[7];
+            rzViewProj[8]  += dx * rzViewProj[11];
+            rzViewProj[12] += dx * rzViewProj[15];
+            rzViewProj[1]  += dy * rzViewProj[3];
+            rzViewProj[5]  += dy * rzViewProj[7];
+            rzViewProj[9]  += dy * rzViewProj[11];
+            rzViewProj[13] += dy * rzViewProj[15];
+        }
+
         // viewProj → the persistent-mapped frame cbuffer. world[i] → window (i/kBatchSize)
         // at local slot (i%kBatchSize): byte offset (i/kBatchSize)*kBatchBytes + (i%kBatchSize)*64.
         // Index i aligns with the draw loop below (batch+local select the same matrix).
         std::memcpy(g_live.pFrameCbv->pCpuMappedAddress, rzViewProj, 16 * sizeof(float));
+        // Tier 1 lighting block (6 × float4 = 24 floats) right after viewProj. gFrameData layout:
+        // viewProj(64B) | sunDir | sunCol | ambCol | fogColNear | fogParams | eyePos. The pFrameCbv
+        // is 256B (min CBV), so 64 + 96 = 160B fits. Null lighting leaves the prior values.
+        if (lighting) {
+            std::memcpy((uint8_t*)g_live.pFrameCbv->pCpuMappedAddress + 16 * sizeof(float),
+                        lighting, 24 * sizeof(float));
+        }
         for (uint32_t i = 0; i < count; ++i) {
             const uint32_t batch = i / kBatchSize;
             const uint32_t local = i % kBatchSize;
@@ -1491,6 +1690,7 @@ namespace ForgeRender {
 
         resetCmdPool(R, g_live.pCmdPool);
         beginCmd(g_live.pCmd);
+        const double tRec0 = hostNowMs();   // start of CPU command recording
 
         // Color target: the MSAA color when antialiasing is on (resolved into pRT at the end),
         // else the shared pRT directly. The MSAA target is left in RENDER_TARGET between frames
@@ -1521,42 +1721,124 @@ namespace ForgeRender {
         cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
         cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);   // bindless gTextures (static sampler)
 
-        uint32_t drawn = 0;
-        uint32_t boundBatch = UINT32_MAX;
-        int      boundMirror = 0;   // matches the initial cmdBindPipeline above (0 = CCW)
+        // GPU-driven static draws (ExecuteIndirect). Consolidation already put every static
+        // non-skinned part in the shared mega VB/IB; now we also collapse the ~2667 per-part
+        // cmdDrawIndexedInstanced API CALLS (the residual CPU record cost) into a handful of
+        // cmdExecuteIndirect — one per (mirror, batch) group. ExecuteIndirect can't switch PSO
+        // or rebind descriptors/buffers mid-execution, so a single call spans exactly one group
+        // (same opaque/mirror PSO + PerBatch[batch] + arena VB + pInstanceBuf[batch] + arena IB);
+        // each part is just a 20-byte IndirectDrawIndexArguments record in pIndirectArgs.
+        // The 1-4 dynamic-morph parts (own VB/IB, not in the arena) can't ride the shared-VB
+        // indirect call, so they stay inline cmdDrawIndexedInstanced after the groups.
+        const uint32_t vStride = (uint32_t)sizeof(IPC::GeomVertexWire);
+        const uint32_t iStride = (uint32_t)(2 * sizeof(uint32_t));
+
+        // Classify the draw list once: arena parts → tmp records (for arg-buffer fill),
+        // dynamic-morph parts → a small inline list. (worldMirrored + the slot lookup are
+        // computed here once instead of twice.)
+        struct ArenaTmp { uint32_t indexCount, firstIndex, firstVertex, local; uint8_t mirror, batch; };
+        static std::vector<ArenaTmp> s_arena;     // reused across frames (render is single-threaded)
+        static std::vector<uint32_t> s_dynamic;   // draw indices i of dynamic-morph parts
+        s_arena.clear();
+        s_dynamic.clear();
+        if (s_arena.capacity() < count) s_arena.reserve(count);
         for (uint32_t i = 0; i < count; ++i) {
             const uint32_t slot = items[i].slot;
             if (slot >= g_meshHigh || !g_meshes[slot].valid) {
                 continue;   // mesh not uploaded yet (or evicted)
             }
-            // Select the winding pipeline by the world transform's determinant sign. Both
-            // pipelines share the root signature, so the PerFrame/PerBatch descriptor sets
-            // stay bound across a pipeline switch. Bind only on change (mostly non-mirror).
+            const HostMesh& m = g_meshes[slot];
+            if (m.inArena) {
+                ArenaTmp t;
+                t.indexCount  = m.indexCount;
+                t.firstIndex  = (uint32_t)(m.ibOff / sizeof(uint16_t));
+                t.firstVertex = (uint32_t)(m.vbOff / sizeof(IPC::GeomVertexWire));
+                t.local       = i % kBatchSize;
+                t.mirror      = worldMirrored(items[i].world) ? 1 : 0;
+                t.batch       = (uint8_t)(i / kBatchSize);
+                s_arena.push_back(t);
+            } else {
+                s_dynamic.push_back(i);   // own VB/IB → inline draw below
+            }
+        }
+        const uint32_t drawn = (uint32_t)(s_arena.size() + s_dynamic.size());
+
+        // Count then prefix-sum the (mirror, batch) groups (mirror outer → ≤2 PSO binds).
+        uint32_t groupCount[2][kMaxBatches] = {};
+        for (const ArenaTmp& t : s_arena) { ++groupCount[t.mirror][t.batch]; }
+        uint32_t groupOff[2][kMaxBatches] = {};
+        uint32_t running = 0;
+        for (uint32_t mir = 0; mir < 2; ++mir) {
+            for (uint32_t b = 0; b < kMaxBatches; ++b) {
+                groupOff[mir][b] = running;
+                running += groupCount[mir][b];
+            }
+        }
+        // Fill the indirect-args buffer in group order. firstInstance=local → the per-instance
+        // Base attr reads pInstanceBuf[batch][local].x = local → gBatch.worlds[local] (+ texIndex).
+        IndirectDrawIndexArguments* args =
+            (IndirectDrawIndexArguments*)g_live.pIndirectArgs->pCpuMappedAddress;
+        uint32_t cursor[2][kMaxBatches];
+        std::memcpy(cursor, groupOff, sizeof(cursor));
+        for (const ArenaTmp& t : s_arena) {
+            IndirectDrawIndexArguments& a = args[cursor[t.mirror][t.batch]++];
+            a.mIndexCount    = t.indexCount;
+            a.mInstanceCount = 1;
+            a.mStartIndex    = t.firstIndex;
+            a.mVertexOffset  = t.firstVertex;   // BaseVertexLocation (shifts 0-based indices)
+            a.mStartInstance = t.local;
+        }
+
+        // Emit: one cmdExecuteIndirect per non-empty group. The arena VB/IB + instance buffer
+        // are bound once per group; PerFrame/Persistent persist across the (same-root-sig) PSO
+        // switch but are rebound on switch defensively (matches the skinned path).
+        int boundMirror = 0;   // matches the initial cmdBindPipeline(pOpaquePipeline) above
+        for (uint32_t mir = 0; mir < 2; ++mir) {
+            bool anyInMirror = false;
+            for (uint32_t b = 0; b < kMaxBatches; ++b) { if (groupCount[mir][b]) { anyInMirror = true; break; } }
+            if (!anyInMirror) continue;
+            if ((int)mir != boundMirror) {
+                cmdBindPipeline(g_live.pCmd, mir ? g_live.pOpaquePipelineMirror
+                                                 : g_live.pOpaquePipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                boundMirror = (int)mir;
+            }
+            for (uint32_t b = 0; b < kMaxBatches; ++b) {
+                const uint32_t c = groupCount[mir][b];
+                if (!c) continue;
+                cmdBindDescriptorSet(g_live.pCmd, b, g_live.pPerBatchSet);
+                Buffer*  vbs[2]     = { g_live.pArenaVB, g_live.pInstanceBuf[b] };
+                uint32_t strides[2] = { vStride, iStride };
+                cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                cmdBindIndexBuffer(g_live.pCmd, g_live.pArenaIB, INDEX_TYPE_UINT16, 0);
+                cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, c, g_live.pIndirectArgs,
+                                   (uint64_t)groupOff[mir][b] * sizeof(IndirectDrawIndexArguments),
+                                   nullptr, 0);
+            }
+        }
+
+        // Dynamic-morph parts (own CPU_TO_GPU VB/IB): inline draws after the indirect groups.
+        // Only ~1-4 per frame, so per-draw binds here are negligible.
+        for (uint32_t i : s_dynamic) {
+            const uint32_t slot  = items[i].slot;
+            const uint32_t batch = i / kBatchSize;
+            const uint32_t local = i % kBatchSize;
             const int mirror = worldMirrored(items[i].world) ? 1 : 0;
             if (mirror != boundMirror) {
                 cmdBindPipeline(g_live.pCmd, mirror ? g_live.pOpaquePipelineMirror
                                                     : g_live.pOpaquePipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
                 boundMirror = mirror;
-                boundBatch = UINT32_MAX;   // re-bind PerBatch after a PSO change (defensive)
             }
-            // Rebind the batch window when crossing a 1024-draw boundary. items are in
-            // order, so this fires at most kMaxBatches times.
-            const uint32_t batch = i / kBatchSize;
-            const uint32_t local = i % kBatchSize;
-            if (batch != boundBatch) {
-                cmdBindDescriptorSet(g_live.pCmd, batch, g_live.pPerBatchSet);
-                boundBatch = batch;
-            }
+            cmdBindDescriptorSet(g_live.pCmd, batch, g_live.pPerBatchSet);
             HostMesh& m = g_meshes[slot];
-            // Bind mesh VB (binding 0) + the shared instance-index VB (binding 1).
             Buffer*  vbs[2]     = { m.vb, g_live.pInstanceBuf[batch] };
-            uint32_t strides[2] = { (uint32_t)sizeof(IPC::GeomVertexWire), (uint32_t)(2 * sizeof(uint32_t)) };
+            uint32_t strides[2] = { vStride, iStride };
             cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
             cmdBindIndexBuffer(g_live.pCmd, m.ib, INDEX_TYPE_UINT16, 0);
-            // firstInstance = local → DrawIndex attribute reads instanceBuf[local] = local
-            // → gBatch.worlds[local] of the bound window.
             cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, 0, 1, 0, local);
-            ++drawn;
         }
 
         // --- M-Skinning: skinned draw loop (GPU palette skinning) --------------------
@@ -1688,6 +1970,7 @@ namespace ForgeRender {
             cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &toCommon);
         }
         endCmd(g_live.pCmd);
+        const double tRec1 = hostNowMs();   // end of CPU recording (record = tRec1 - tRec0)
 
         QueueSubmitDesc submitDesc = {};
         submitDesc.mCmdCount = 1;
@@ -1696,12 +1979,27 @@ namespace ForgeRender {
         submitDesc.mSubmitDone = true;
         queueSubmit(g_live.pQueue, &submitDesc);
         waitForFences(R, 1, &g_live.pFence);
+        g_recAccum += (tRec1 - tRec0);            // CPU per-draw bind+draw recording
+        g_gpuAccum += (hostNowMs() - tRec1);      // GPU execute (submit→fence)
         // A dense exterior frame is the suspected trigger; pin a removal to the draw submit.
         logDeviceRemoved(R, "renderScene/submit");
 
         g_live.firstFrame = false;
         g_lastDrawn = drawn;
         g_lastSkinnedDrawn = skinnedDrawn;
+
+        // Host-side heartbeat to mgeHost64.log (LOG::logline; LOGF goes to uncaptured stdout).
+        // dynamic = meshes in the upload-heap ring (must stay tiny — hundreds = over-promotion);
+        // meshHigh = total slots ever populated (monotonic leak check). Lets us correlate the
+        // client's [hb] frame cost with what the Forge renderer is actually drawing.
+        if ((g_renderFrame % 300u) == 0u) {
+            LOG::logline(">> [forge-hb] frame=%u drawn=%u skinned=%u dynamic=%u meshHigh=%u "
+                         "| record=%.2fms gpu=%.2fms (avg/frame over 300)",
+                         g_renderFrame, drawn, skinnedDrawn, g_dynamicCount, g_meshHigh,
+                         g_recAccum / 300.0, g_gpuAccum / 300.0);
+            g_recAccum = 0.0;
+            g_gpuAccum = 0.0;
+        }
         return true;
     }
 
@@ -1934,13 +2232,49 @@ namespace ForgeRender {
         return built;
     }
 
+    // Create the shared mega VB/IB on first use. Must NOT live in buildOpaquePath: geometry
+    // uploads run BEFORE the lazy buildOpaquePath (first renderScene), so the arena has to exist
+    // at upload time. Idempotent.
+    bool ensureArena() {
+        if (g_live.pArenaVB && g_live.pArenaIB) { return true; }
+        if (!g_live.pRenderer) { return false; }
+        BufferLoadDesc av = {};
+        av.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+        av.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+        av.mDesc.mSize        = kArenaVBBytes;
+        av.mDesc.mStartState  = RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+        av.mDesc.pName        = "arenaVB";
+        av.pData              = nullptr;
+        av.ppBuffer           = &g_live.pArenaVB;
+        addResource(&av, nullptr);
+
+        BufferLoadDesc ai = {};
+        ai.mDesc.mDescriptors = DESCRIPTOR_TYPE_INDEX_BUFFER;
+        ai.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+        ai.mDesc.mSize        = kArenaIBBytes;
+        ai.mDesc.mStartState  = RESOURCE_STATE_INDEX_BUFFER;
+        ai.mDesc.pName        = "arenaIB";
+        ai.pData              = nullptr;
+        ai.ppBuffer           = &g_live.pArenaIB;
+        addResource(&ai, nullptr);
+
+        waitForAllResourceLoads();
+        if (!g_live.pArenaVB || !g_live.pArenaIB) { return false; }
+        g_arenaVB.init(kArenaVBBytes);
+        g_arenaIB.init(kArenaIBBytes);
+        return true;
+    }
+
     unsigned uploadGeometry(const void* blobBytes, unsigned byteCount, unsigned partCount) {
         if (!g_live.pRenderer || !blobBytes || !byteCount || !partCount) {
             return 0;
         }
+        if (!ensureArena()) { return 0; }
         const uint8_t* p   = (const uint8_t*)blobBytes;
         const uint8_t* end = p + byteCount;
         unsigned built = 0;
+        bool anyStatic = false;   // any per-mesh addResource (skinned) -> waitForAllResourceLoads
+        bool anyArena  = false;   // any arena begin/endUpdateResource -> flushResourceUpdates
 
         for (unsigned i = 0; i < partCount; ++i) {
             if (p + sizeof(IPC::GeomPartWire) > end) {
@@ -1968,51 +2302,186 @@ namespace ForgeRender {
             }
 
             HostMesh& m = g_meshes[hdr.slot];
-            if (m.valid) {  // re-upload on revision change: drop the old buffers
-                if (m.vb) { removeResource(m.vb); }
-                if (m.ib) { removeResource(m.ib); }
-                m.vb = m.ib = nullptr;
+
+            // A re-upload at the SAME shape (vertex/index count + skinned flag) MIGHT be an
+            // animated morph. But only a CONSECUTIVE-frame streak proves it — promote those to
+            // the upload-heap ring (fence-free memcpy). Non-consecutive re-uploads (cell churn /
+            // recycled slots) reset the streak and stay GPU_ONLY: an upload-heap VB has
+            // high-latency uncached GPU vertex fetch, so mass-promoting churn tanks render.
+            const bool sameShape = m.valid && m.vertexCount == hdr.vertexCount
+                                && m.indexCount == hdr.indexCount && m.skinned == isSkinned;
+            const bool consecutive = m.valid && (g_renderFrame == m.lastUploadFrame + 1);
+
+            if (m.valid && !sameShape) {
+                releaseMeshBuffers(m);
+                m.valid = false;
+                m.uploadStreak = 0;
+            }
+
+            if (sameShape) {
+                m.uploadStreak    = consecutive ? (uint16_t)(m.uploadStreak + 1) : 0;
+                m.lastUploadFrame = g_renderFrame;
+
+                if (m.dynamic) {
+                    // Already in the ring — just memcpy (no recreate, no fence).
+                    const uint8_t r = m.ring;
+                    std::memcpy(m.dynVb[r]->pCpuMappedAddress, verts,   (size_t)vbBytes);
+                    std::memcpy(m.dynIb[r]->pCpuMappedAddress, indices, (size_t)ibBytes);
+                    m.vb   = m.dynVb[r];
+                    m.ib   = m.dynIb[r];
+                    m.ring = (uint8_t)((r + 1) % kGeomRing);
+                    ++built;
+                    continue;
+                }
+
+                if (m.uploadStreak >= kDynPromoteStreak) {
+                    // PROMOTE: a proven per-frame morph. Free the static GPU_ONLY buffers, build
+                    // the persistent-mapped ring (one-time fence here only), then memcpy.
+                    releaseMeshBuffers(m);
+                    bool ringOk = true;
+                    for (uint32_t r = 0; r < kGeomRing; ++r) {
+                        BufferLoadDesc dv = {};
+                        dv.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+                        dv.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+                        dv.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                        dv.mDesc.mSize        = vbBytes;
+                        dv.mDesc.pName        = "geomVBdyn";
+                        dv.pData              = nullptr;
+                        dv.ppBuffer           = &m.dynVb[r];
+                        addResource(&dv, nullptr);
+
+                        BufferLoadDesc di = {};
+                        di.mDesc.mDescriptors = DESCRIPTOR_TYPE_INDEX_BUFFER;
+                        di.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+                        di.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                        di.mDesc.mSize        = ibBytes;
+                        di.mDesc.pName        = "geomIBdyn";
+                        di.pData              = nullptr;
+                        di.ppBuffer           = &m.dynIb[r];
+                        addResource(&di, nullptr);
+                    }
+                    waitForAllResourceLoads();   // one-time, on promotion only
+                    for (uint32_t r = 0; r < kGeomRing; ++r) {
+                        if (!m.dynVb[r] || !m.dynIb[r]) { ringOk = false; }
+                    }
+                    if (!ringOk) { releaseMeshBuffers(m); m.valid = false; m.uploadStreak = 0; continue; }
+                    m.dynamic = true;
+                    m.ring    = 0;
+                    ++g_dynamicCount;
+                    const uint8_t r = m.ring;
+                    std::memcpy(m.dynVb[r]->pCpuMappedAddress, verts,   (size_t)vbBytes);
+                    std::memcpy(m.dynIb[r]->pCpuMappedAddress, indices, (size_t)ibBytes);
+                    m.vb   = m.dynVb[r];
+                    m.ib   = m.dynIb[r];
+                    m.ring = (uint8_t)((r + 1) % kGeomRing);
+                    ++built;
+                    continue;
+                }
+
+                // Same shape but not yet a proven morph: rebuild as static GPU_ONLY (fast reads).
+                // A couple of recreate+fence frames at morph onset, then it promotes. (Cell churn
+                // never gets here twice — the streak resets, so it just rebuilds static once.)
+                releaseMeshBuffers(m);
                 m.valid = false;
             }
+
+            // --- static build: NON-SKINNED -> shared mega arena (bind-once, offset draws);
+            //     SKINNED -> per-mesh GPU_ONLY (few draws, not worth consolidating) ---
             m.skinned = isSkinned;
 
-            BufferLoadDesc vbDesc = {};
-            vbDesc.mDesc.mDescriptors  = DESCRIPTOR_TYPE_VERTEX_BUFFER;
-            vbDesc.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
-            vbDesc.mDesc.mSize         = vbBytes;
-            vbDesc.mDesc.mStartState   = RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
-            vbDesc.mDesc.pName         = "geomVB";
-            vbDesc.pData               = verts;
-            vbDesc.ppBuffer            = &m.vb;
-            addResource(&vbDesc, nullptr);
+            if (!isSkinned) {
+                // Sub-allocate the mega VB + IB; write the sub-ranges via BufferUpdateDesc.
+                uint64_t vbo = g_arenaVB.alloc(vbBytes);
+                uint64_t ibo = g_arenaIB.alloc(ibBytes);
+                if (vbo == UINT64_MAX || ibo == UINT64_MAX) {
+                    if (vbo != UINT64_MAX) { g_arenaVB.release(vbo, vbBytes); }
+                    if (ibo != UINT64_MAX) { g_arenaIB.release(ibo, ibBytes); }
+                    static bool warned = false;
+                    if (!warned) {
+                        LOG::logline("!! [forge] geometry arena FULL (need %llu VB / %llu IB) — "
+                                     "part skipped (no fallback); eviction is the follow-up",
+                                     (unsigned long long)vbBytes, (unsigned long long)ibBytes);
+                        warned = true;
+                    }
+                    continue;   // part won't draw this slot — logged, no fallback (PD1)
+                }
+                BufferUpdateDesc uv = {};
+                uv.pBuffer    = g_live.pArenaVB;
+                uv.mDstOffset = vbo;
+                uv.mSize      = vbBytes;
+                beginUpdateResource(&uv);
+                std::memcpy(uv.pMappedData, verts, (size_t)vbBytes);
+                endUpdateResource(&uv);
 
-            BufferLoadDesc ibDesc = {};
-            ibDesc.mDesc.mDescriptors  = DESCRIPTOR_TYPE_INDEX_BUFFER;
-            ibDesc.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
-            ibDesc.mDesc.mSize         = ibBytes;
-            ibDesc.mDesc.mStartState   = RESOURCE_STATE_INDEX_BUFFER;
-            ibDesc.mDesc.pName         = "geomIB";
-            ibDesc.pData               = indices;
-            ibDesc.ppBuffer            = &m.ib;
-            addResource(&ibDesc, nullptr);
+                BufferUpdateDesc ui = {};
+                ui.pBuffer    = g_live.pArenaIB;
+                ui.mDstOffset = ibo;
+                ui.mSize      = ibBytes;
+                beginUpdateResource(&ui);
+                std::memcpy(ui.pMappedData, indices, (size_t)ibBytes);
+                endUpdateResource(&ui);
 
-            m.vertexCount = hdr.vertexCount;
-            m.indexCount  = hdr.indexCount;
-            m.valid       = true;
+                m.inArena = true;
+                m.vbOff   = vbo;
+                m.ibOff   = ibo;
+                m.vb = m.ib = nullptr;
+                anyArena = true;
+            } else {
+                m.inArena = false;
+                BufferLoadDesc vbDesc = {};
+                vbDesc.mDesc.mDescriptors  = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+                vbDesc.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+                vbDesc.mDesc.mSize         = vbBytes;
+                vbDesc.mDesc.mStartState   = RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+                vbDesc.mDesc.pName         = "geomVBskin";
+                vbDesc.pData               = verts;
+                vbDesc.ppBuffer            = &m.vb;
+                addResource(&vbDesc, nullptr);
+
+                BufferLoadDesc ibDesc = {};
+                ibDesc.mDesc.mDescriptors  = DESCRIPTOR_TYPE_INDEX_BUFFER;
+                ibDesc.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+                ibDesc.mDesc.mSize         = ibBytes;
+                ibDesc.mDesc.mStartState   = RESOURCE_STATE_INDEX_BUFFER;
+                ibDesc.mDesc.pName         = "geomIBskin";
+                ibDesc.pData               = indices;
+                ibDesc.ppBuffer            = &m.ib;
+                addResource(&ibDesc, nullptr);
+                anyStatic = true;
+            }
+
+            m.vertexCount    = hdr.vertexCount;
+            m.indexCount     = hdr.indexCount;
+            m.valid          = true;
+            m.dynamic        = false;
+            m.lastUploadFrame = g_renderFrame;   // seed the consecutive-frame streak detector
             if (hdr.slot + 1 > g_meshHigh) {
                 g_meshHigh = hdr.slot + 1;
             }
             ++built;
         }
 
-        waitForAllResourceLoads();
-        // Exterior uploads ship ~1000+ parts in one batch; this is where a prior in-game
-        // test went DEVICE_REMOVED. Pin a removal to the upload (vs the later draw).
-        logDeviceRemoved(g_live.pRenderer, "uploadGeometry/waitForAllResourceLoads");
-        LOGF(eINFO, "[forge] uploadGeometry: built %u/%u parts (%u bytes), meshHigh=%u",
-             built, partCount, byteCount, g_meshHigh);
-        std::printf("[forge] uploadGeometry: built %u/%u parts (%u bytes), meshHigh=%u\n",
-                    built, partCount, byteCount, g_meshHigh);
+        // Only fence/log when a static GPU_ONLY build happened. The steady-state dynamic path
+        // (animated meshes) is pure memcpy into persistent buffers — no loader work to wait on,
+        // and logging it every frame is the very per-frame cost we're removing.
+        if (anyStatic) {
+            waitForAllResourceLoads();   // flush per-mesh (skinned) addResource loads
+        }
+        if (anyArena) {
+            // begin/endUpdateResource records on the loader's UPDATE stream, which
+            // waitForAllResourceLoads does NOT flush — must flushResourceUpdates + fence (same
+            // gotcha as texture uploads), else arena geometry stays zero.
+            flushTextureUploads(g_live.pRenderer);
+        }
+        if (anyStatic || anyArena) {
+            // Exterior uploads ship ~1000+ parts in one batch; this is where a prior in-game
+            // test went DEVICE_REMOVED. Pin a removal to the upload (vs the later draw).
+            logDeviceRemoved(g_live.pRenderer, "uploadGeometry/flush");
+            LOGF(eINFO, "[forge] uploadGeometry: built %u/%u parts (%u bytes), meshHigh=%u",
+                 built, partCount, byteCount, g_meshHigh);
+            std::printf("[forge] uploadGeometry: built %u/%u parts (%u bytes), meshHigh=%u\n",
+                        built, partCount, byteCount, g_meshHigh);
+        }
         return built;
     }
 
@@ -2029,6 +2498,11 @@ namespace ForgeRender {
         if (g_live.pPerBatchSet)    { removeDescriptorSet(R, g_live.pPerBatchSet); }
         if (g_live.pPersistentSet)  { removeDescriptorSet(R, g_live.pPersistentSet); }
         if (g_live.pFrameCbv)       { removeResource(g_live.pFrameCbv); }
+        if (g_live.pArenaVB)        { removeResource(g_live.pArenaVB); }
+        if (g_live.pArenaIB)        { removeResource(g_live.pArenaIB); }
+        if (g_live.pIndirectArgs)   { removeResource(g_live.pIndirectArgs); }
+        g_arenaVB = FreeList{};
+        g_arenaIB = FreeList{};
         for (uint32_t b = 0; b < kMaxBatches; ++b) {
             if (g_live.pWorldsBuf[b]) { removeResource(g_live.pWorldsBuf[b]); }
         }

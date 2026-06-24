@@ -8,6 +8,7 @@
 #include "mwbridge.h"
 #include "scenegraph.h"
 #include "scenegraph_geometry_cache.h"
+#include "renderprocess.h"
 #include "renderthread.h"
 #include "mge_tracy.h"
 #include "statusoverlay.h"
@@ -1452,7 +1453,13 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
         // the engine path (plan scope). isCoveredOpaque matches textured opaque in any
         // scene, so without this gate the 1st-person arm gets suppressed but never
         // cache-drawn -> hands vanish. (isLandSplat already self-gates to scene 0.)
-        if (cacheOpaqueMode && sceneCount == 0 && (isCoveredOpaque(rs, frs) || isLandSplat)) {
+        // Also suppress when the Forge seam owns the opaque world (F11 composite live): the
+        // host's full-screen composite overwrites MW's frame, so the engine's scene-0 draw is
+        // redundant double work. Removing it lets us measure the Forge path's true cost without
+        // the engine's scene 0 confounding the numbers. Same gate as cacheOpaqueMode (scene 0,
+        // covered-opaque or land splat); depth capture above is untouched.
+        if ((cacheOpaqueMode || RenderProcess::ownsOpaqueWorld()) && sceneCount == 0
+            && (isCoveredOpaque(rs, frs) || isLandSplat)) {
             return false;
         }
         // CACHE-ONLY diagnostic: suppress every remaining colour draw across ALL scenes

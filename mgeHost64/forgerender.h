@@ -86,7 +86,10 @@ namespace ForgeRender {
     // M-Skinning: skinnedBlob is a sequence of [SkinnedDrawWire][palette]* (geomwire.h);
     // skinnedCount items, skinnedBytes total. The host GPU palette-skins each (no per-draw
     // world matrix — the palette is world-space). drawBlob/skinnedBlob may each be null.
-    bool renderScene(const float* viewProj, const void* drawBlob,
+    // lighting = 24 floats (6 × float4): sunDir, sunCol, ambCol, fogColNear, fogParams
+    // (x=fogNearStart, y=fogNearEnd), eyePos — uploaded into gFrameData after viewProj.
+    // May be null (then lighting stays whatever the cbuffer last held).
+    bool renderScene(const float* viewProj, const float* lighting, const void* drawBlob,
                      unsigned drawCount, unsigned drawBytes,
                      const void* skinnedBlob, unsigned skinnedCount, unsigned skinnedBytes);
 

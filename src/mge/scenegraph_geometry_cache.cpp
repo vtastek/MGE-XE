@@ -332,6 +332,12 @@ namespace MGE::GeometryCache {
                 // meshes use set 0; honour the captured base map's true set for correctness.
                 const auto* capUvs = data->textureCoords;
                 const uint32_t uvBase = (uint32_t)e.baseUV * storedVerts;
+                // Tier 2a lighting: ship the real per-vertex colour ONLY when the mesh uses
+                // VertexColorProperty source 2 (ambient+diffuse / DiffAmb) — the case where MW
+                // actually folds vcol into lighting. Otherwise ship white (0xFFFFFFFF) so the
+                // host's universal col*(d+a) path reduces to the white-material (d+a) case.
+                // (Emissive routing / non-white material constants are Tier 2b.)
+                const auto* vcol = (e.hasVertexColor && e.vColSource == 2) ? data->color : nullptr;
                 for (uint32_t i = 0; i < vertexCount; ++i) {
                     auto& w = scratch[i];
                     w.px = mv[i].x; w.py = mv[i].y; w.pz = mv[i].z;
@@ -339,6 +345,7 @@ namespace MGE::GeometryCache {
                     else     { w.nx = 0.0f;    w.ny = 0.0f;    w.nz = 1.0f; }
                     if (capUvs) { w.u = capUvs[uvBase + i].x; w.v = capUvs[uvBase + i].y; }
                     else        { w.u = 0.0f;                 w.v = 0.0f; }
+                    w.color = vcol ? *reinterpret_cast<const DWORD*>(&vcol[i]) : 0xFFFFFFFFu;
                 }
                 const auto* triList = data->getTriList();
                 if (triList) {

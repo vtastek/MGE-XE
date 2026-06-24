@@ -418,6 +418,7 @@ namespace IPC {
 	}
 
 	bool Client::renderSceneBlocking(std::uint32_t frameIndex, const float* viewProj,
+		const float* lighting,
 		VecId drawList, std::uint32_t drawCount, std::uint32_t drawBytes,
 		VecId skinnedList, std::uint32_t skinnedCount, std::uint32_t skinnedBytes,
 		double* outRenderMs) {
@@ -427,6 +428,7 @@ namespace IPC {
 		params.frameIndex = frameIndex;
 		params.targetIndex = 0;
 		std::memcpy(params.viewProj, viewProj, 16 * sizeof(float));
+		std::memcpy(params.lighting, lighting, 24 * sizeof(float));
 		params.drawList = drawList;
 		params.drawCount = drawCount;
 		params.drawBytes = drawBytes;

@@ -27,9 +27,31 @@ namespace {
 
     IPC::Client* g_client = nullptr;
     bool   g_initOk  = false;
-    bool   g_enabled = false;          // F11 live toggle for the per-frame composite
+    bool   g_enabled = true;           // composite ON by default; F11 toggles it OFF/ON
     bool   g_debugScatter = false;     // F12 diagnostic: per-object world offset to expose duplicate draws
     unsigned g_frame = 0;
+
+    // --- Feeding-side spike logging --------------------------------------------------
+    // Periodic FPS dips are suspected to come from the client feed (geometry/texture
+    // uploads + the blocking host RPC), not the host GPU. Time each phase of onPresent
+    // with QPC and, when the whole feed exceeds kSpikeMs, emit ONE breakdown line to
+    // mgeXE.log so the periodic culprit (almost certainly texture streaming) is visible.
+    constexpr double kSpikeMs = 5.0;   // ~ one 165Hz frame budget; tune as needed
+    double g_lastPresentMs = 0.0;      // for the inter-present delta (dip magnitude)
+
+    // Baseline heartbeat: the spike log only fires on >=kSpikeMs frames, so it's BLIND to the
+    // normal per-frame cost ("always slow" lives in the baseline, not the spikes). Accumulate
+    // every composited frame and log avg/max over a window so the true standing-still cost and
+    // its breakdown are visible without spamming.
+    constexpr unsigned kHeartbeatFrames = 300;
+    struct Accum { double feed, render, host, copy, dt; double maxFeed, maxDt; unsigned n; };
+    Accum g_hb = {};
+
+    inline double nowMs() {
+        static LARGE_INTEGER freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
+        LARGE_INTEGER c; QueryPerformanceCounter(&c);
+        return 1000.0 * (double)c.QuadPart / (double)freq.QuadPart;
+    }
 
     // --- M1b: opaque-geometry capture + upload -----------------------------------
     // The cache hands us model-space parts (pos+normal+indices). We assign each a
@@ -597,7 +619,9 @@ namespace {
 
         void* data = nullptr;
         unsigned size = 0;
-        if (!BSA::loadFileBytes(name.c_str(), &data, &size) || !data || size == 0) {
+        // skipDistantStatics=true: the Forge near path must NOT pick the distantland\statics
+        // downscaled-LOD copies (they blur near geometry) — resolve loose Data Files -> BSA.
+        if (!BSA::loadFileBytes(name.c_str(), &data, &size, true) || !data || size == 0) {
             static int misses = 0;
             if (misses < 20) { LOG::logline("!! [tex] not found: %s (white)", name.c_str()); ++misses; }
             if (data) { std::free(data); }
@@ -712,6 +736,10 @@ namespace {
                 LOG::logline("!! [seam] geometry chunk assign_bytes failed (%u bytes)", chunkBytes);
                 break;
             }
+            // Blocking upload. With the dynamic-VB ring the host side is now a cheap memcpy
+            // (animated re-uploads) or a one-time static build, so blocking no longer carries
+            // the old recreate+fence cost — and it keeps the present pipeline simple (async
+            // kickoff was reverted: it cost the framerate cap without helping the steady state).
             std::uint32_t uploaded = 0;
             if (!g_client->geomUploadBlocking(g_geomVec->id(), chunkParts, chunkBytes, &uploaded)) {
                 LOG::logline("!! [seam] geomUpload RPC built %u/%u parts", uploaded, chunkParts);
@@ -880,9 +908,16 @@ namespace RenderProcess {
             return;
         }
 
+        const double tStart = nowMs();
+        const double dtPresent = (g_lastPresentMs > 0.0) ? (tStart - g_lastPresentMs) : 0.0;
+        g_lastPresentMs = tStart;
+
         // Ship any geometry the cache captured this frame (independent of the F11
         // composite toggle, so the host's mesh store is ready when we turn it on).
+        const std::uint32_t geomParts = g_pendingParts;            // snapshot (flush clears it)
+        const std::size_t   geomBytes = g_pendingBlob.size();
         flushGeometry();
+        const double tGeomFlush = nowMs();
 
         // Live toggle (debug key). Edge-triggered.
         if (GetAsyncKeyState(VK_F11) & 0x0001) {
@@ -911,10 +946,14 @@ namespace RenderProcess {
         bool ok = false;
         const std::uint32_t drawCount = buildDrawList();
         const std::uint32_t skinnedCount = buildSkinnedDrawList();
+        const double tBuild = nowMs();
 
         // Ship any textures newly referenced this frame BEFORE the scene draw that uses them
         // (buildDrawList queued their DDS via resolveTextureSlot). Lazy: only first-seen textures.
+        const std::uint32_t texCount = g_texPendingCount;          // snapshot (flush clears it)
+        const std::size_t   texBytes = g_texPendingBlob.size();
         flushTextures();
+        const double tTexFlush = nowMs();
 
         const bool haveDraw = g_drawVec && drawCount > 0
             && g_drawVec->assign_bytes(g_drawScratch.data(), (std::uint32_t)g_drawScratch.size());
@@ -926,6 +965,7 @@ namespace RenderProcess {
             skinnedId    = g_skinnedVec->id();
             skinnedBytes = (std::uint32_t)g_skinnedScratch.size();
         }
+        const double tAssign = nowMs();
 
         // Only drive + composite the host when there's actual scene data this frame. With no
         // draw list (loading doors, menus, empty cells) we must NOT fall back to the bring-up
@@ -937,11 +977,34 @@ namespace RenderProcess {
 
         D3DXMATRIX viewProj;
         D3DXMatrixMultiply(&viewProj, &DistantLand::mwView, &DistantLand::mwProj);
-        ok = g_client->renderSceneBlocking(frame, (const float*)&viewProj,
+
+        // Tier 1 lighting (6 × float4): MW sun/ambient/fog for this frame, uploaded into the
+        // host gFrameData after viewProj. sunVec is the world-space sun TRAVEL direction (the
+        // shader does dot(N, -sunDir)); fogParams = (fogNearStart, fogNearEnd); dist for fog is
+        // |worldPos - eyePos| in-shader.
+        //
+        // Sun/ambient use the CANONICAL MGE PPL/DL formula (distantland.cpp:780-792, :1141):
+        //   sun     = lightSunMult * sunCol
+        //   ambient = lightAmbMult * (sunAmb + ambCol)   // ambCol alone == globalAmbient, often
+        //                                                 // ~0 in exteriors; the ambient fill is
+        //                                                 // mostly the sun light's sunAmb term.
+        const RGBVECTOR sunColEff = DistantLand::lightSunMult * DistantLand::sunCol;
+        const RGBVECTOR ambColEff = DistantLand::lightAmbMult * (DistantLand::sunAmb + DistantLand::ambCol);
+        const float lighting[24] = {
+            DistantLand::sunVec.x,     DistantLand::sunVec.y,     DistantLand::sunVec.z,     0.0f,
+            sunColEff.r,               sunColEff.g,               sunColEff.b,               0.0f,
+            ambColEff.r,               ambColEff.g,               ambColEff.b,               0.0f,
+            DistantLand::nearFogCol.r, DistantLand::nearFogCol.g, DistantLand::nearFogCol.b, 0.0f,
+            DistantLand::fogNearStart, DistantLand::fogNearEnd,   0.0f,                      0.0f,
+            DistantLand::eyePos.x,     DistantLand::eyePos.y,     DistantLand::eyePos.z,     0.0f,
+        };
+
+        ok = g_client->renderSceneBlocking(frame, (const float*)&viewProj, lighting,
                  haveDraw ? g_drawVec->id() : IPC::InvalidVector,
                  haveDraw ? drawCount : 0,
                  haveDraw ? (std::uint32_t)g_drawScratch.size() : 0,
                  skinnedId, skinnedCount, skinnedBytes, &hostMs);
+        const double tRender = nowMs();
         if (!ok) {
             return;
         }
@@ -951,6 +1014,7 @@ namespace RenderProcess {
             if (!logged) { LOG::logline("!! [seam] copyHostRtToDst failed"); logged = true; }
             return;
         }
+        const double tCopy = nowMs();
 
         IDirect3DSurface9* src = nullptr;
         if (FAILED(g_mainTex->GetSurfaceLevel(0, &src)) || !src) {
@@ -968,10 +1032,50 @@ namespace RenderProcess {
             backbuffer->Release();
         }
         src->Release();
+        const double tEnd = nowMs();
+
+        // Spike log: one breakdown line when the client feed blew the budget. render =
+        // the blocking host RPC (host's own GPU time = host[]); render - host = IPC/wait
+        // stall. texflush is the prime suspect for the *periodic* dips (textures stream in
+        // as you cross into new cells). dt = inter-present delta (the visible dip).
+        const double feed = tEnd - tStart;
+
+        // Baseline heartbeat over every composited frame (sees the <kSpikeMs majority).
+        g_hb.feed += feed; g_hb.render += (tRender - tAssign); g_hb.host += hostMs;
+        g_hb.copy += (tCopy - tRender); g_hb.dt += dtPresent;
+        if (feed > g_hb.maxFeed) g_hb.maxFeed = feed;
+        if (dtPresent > g_hb.maxDt) g_hb.maxDt = dtPresent;
+        if (++g_hb.n >= kHeartbeatFrames) {
+            LOG::logline(">> [hb] %u frames avg: feed=%.2f render=%.2f[host=%.2f] copy=%.2f dt=%.2f | "
+                         "max feed=%.2f dt=%.2f (~%.0f fps)",
+                         g_hb.n, g_hb.feed / g_hb.n, g_hb.render / g_hb.n, g_hb.host / g_hb.n,
+                         g_hb.copy / g_hb.n, g_hb.dt / g_hb.n, g_hb.maxFeed, g_hb.maxDt,
+                         g_hb.dt > 0.0 ? 1000.0 * g_hb.n / g_hb.dt : 0.0);
+            g_hb = Accum{};
+        }
+
+        if (feed >= kSpikeMs) {
+            LOG::logline("!! [spike] frame %u feed=%.2fms (geomflush=%.2f build=%.2f texflush=%.2f "
+                         "assign=%.2f render=%.2f[host=%.2f] copy=%.2f blit=%.2f) "
+                         "draws=%u skin=%u geom+=%u/%uKB tex+=%u/%uKB dt=%.2fms",
+                         frame, feed,
+                         tGeomFlush - tStart, tBuild - tGeomFlush, tTexFlush - tBuild,
+                         tAssign - tTexFlush, tRender - tAssign, hostMs, tCopy - tRender, tEnd - tCopy,
+                         drawCount, skinnedCount,
+                         geomParts, (unsigned)(geomBytes >> 10), texCount, (unsigned)(texBytes >> 10),
+                         dtPresent);
+        }
     }
 
     bool wantsGeometryCapture() {
         return g_initOk && g_geomVec.has_value();
+    }
+
+    bool ownsOpaqueWorld() {
+        // Forge composites a full-screen blit over MW's frame when enabled; the engine's
+        // scene-0 opaque draw underneath is then pure wasted cost. Gate on the live composite
+        // toggle so F11-off restores normal engine rendering (clean A/B of the double cost).
+        return g_initOk && g_enabled;
     }
 
     void captureGeometry(std::uint32_t key, std::uint16_t revision, std::uint32_t modelId,
