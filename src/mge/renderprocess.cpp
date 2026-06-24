@@ -906,7 +906,7 @@ namespace RenderProcess {
         lazyInit(device);
     }
 
-    void onPresent(IDirect3DDevice9* device) {
+    void onStage0Composite(IDirect3DDevice9* device) {
         if (!device || !g_initOk) {
             return;
         }
@@ -1019,22 +1019,66 @@ namespace RenderProcess {
         }
         const double tCopy = nowMs();
 
-        IDirect3DSurface9* src = nullptr;
-        if (FAILED(g_mainTex->GetSurfaceLevel(0, &src)) || !src) {
-            return;
-        }
+        // Composite the Forge layer (g_mainTex) OVER MW's frame as a full-screen textured quad
+        // with PREMULTIPLIED alpha blend. The Forge RT clears to alpha=0 and geometry writes
+        // alpha=1, so alpha is a coverage mask: sky/distant land (already on the backbuffer from
+        // renderStage0) show through alpha=0 regions and alpha-test holes. Premultiplied
+        // (SRCBLEND=ONE, DESTBLEND=INVSRCALPHA) — NOT SRCALPHA — because MSAA resolve leaves
+        // edge pixels premultiplied (rgb already scaled by partial coverage); SRCALPHA would
+        // darken edges. State-blocked so nothing leaks into MW's scene 1 (every DistantLand
+        // stage does this). -0.5 px offset + POINT filter = the 1:1 texel mapping StretchRect
+        // gave (the geometry half-pixel was already corrected host-side).
+        {
+            IDirect3DStateBlock9* sb = nullptr;
+            device->CreateStateBlock(D3DSBT_ALL, &sb);
 
-        // Composite full-screen (1:1 — the shared RT matches the backbuffer size).
-        IDirect3DSurface9* backbuffer = nullptr;
-        if (SUCCEEDED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backbuffer)) && backbuffer) {
-            HRESULT hr = device->StretchRect(src, nullptr, backbuffer, nullptr, D3DTEXF_NONE);
-            if (FAILED(hr)) {
-                static bool logged = false;
-                if (!logged) { LOG::logline("!! [seam] StretchRect failed 0x%x", hr); logged = true; }
+            IDirect3DSurface9* backbuffer = nullptr;
+            if (SUCCEEDED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backbuffer)) && backbuffer) {
+                device->SetRenderTarget(0, backbuffer);
+                backbuffer->Release();
             }
-            backbuffer->Release();
+
+            device->SetPixelShader(nullptr);
+            device->SetVertexShader(nullptr);
+            device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+            device->SetTexture(0, g_mainTex);
+
+            device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+            device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
+            device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+            device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+            device->SetRenderState(D3DRS_ZENABLE, FALSE);
+            device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+            device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+            device->SetRenderState(D3DRS_LIGHTING, FALSE);
+            device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+            device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+            device->SetRenderState(D3DRS_COLORWRITEENABLE, 0x0F);
+
+            device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+            device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+            device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+            device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+            device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+            device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+            device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+            device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+            device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+            device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+
+            const float fw = (float)g_w, fh = (float)g_h;
+            struct CV { float x, y, z, rhw, u, v; };
+            const CV quad[4] = {
+                { -0.5f,      -0.5f,      0.0f, 1.0f, 0.0f, 0.0f },
+                { fw - 0.5f,  -0.5f,      0.0f, 1.0f, 1.0f, 0.0f },
+                { -0.5f,      fh - 0.5f,  0.0f, 1.0f, 0.0f, 1.0f },
+                { fw - 0.5f,  fh - 0.5f,  0.0f, 1.0f, 1.0f, 1.0f },
+            };
+            device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(CV));
+
+            device->SetTexture(0, nullptr);
+            if (sb) { sb->Apply(); sb->Release(); }
         }
-        src->Release();
         const double tEnd = nowMs();
 
         // Spike log: one breakdown line when the client feed blew the budget. render =

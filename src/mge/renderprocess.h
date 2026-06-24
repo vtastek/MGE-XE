@@ -20,8 +20,11 @@ namespace RenderProcess {
     // instead of stalling the first menu frame. Needs the live device for the bring-up.
     void init(IPC::Client* client, IDirect3DDevice9* device);
 
-    // Called from the present hook (mged3d8device.cpp), right after ImGuiWater::onPresent.
-    void onPresent(IDirect3DDevice9* device);
+    // Drive the host + composite the Forge layer into MW's frame. Called from EndScene at the
+    // end of scene 0 (after renderStageBlend, before scene 1) so Forge's opaque world lands
+    // BEHIND s1's sorted-alpha + first-person and post-process works on the whole composite.
+    // (Was onPresent — moved earlier so the opaque layer composites in scene order.)
+    void onStage0Composite(IDirect3DDevice9* device);
 
     void shutdown();
 

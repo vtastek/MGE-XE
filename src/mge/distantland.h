@@ -616,6 +616,12 @@ public:
     // set concurrently with updateVisibleSet.
     static void renderDepthFromCache(const D3DXMATRIX* gameView,
                                      const std::vector<uint32_t>* visibleOverride = nullptr);
+    // Forge composite: re-draw the cache set DEPTH-ONLY into MW's MAIN depthstencil in the
+    // GAME projection (not the extended depth proj), colour-masked, so s1 sorted-alpha and
+    // first-person occlude against the Forge-rendered opaques. Called from EndScene(s0) when
+    // the Forge seam owns the opaque world. Relies on the main backbuffer/depthstencil being
+    // bound (it is, between EndScene s0 and BeginScene s1).
+    static void renderCacheDepthToMainZ();
     // Build the deterministic current-frame frustum-visible set (s_frustumVisibleKeys)
     // over the full GeometryCache, from the game view*proj. Called early
     // (frameSetupEarly, after the cache walk) on the IPC path and at the renderDepth

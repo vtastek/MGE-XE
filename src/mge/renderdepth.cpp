@@ -513,6 +513,41 @@ void DistantLand::renderDepthFromCache(const D3DXMATRIX* gameView,
     effect->SetFloat(ehAlphaRef, -1.0f);
 }
 
+// renderCacheDepthToMainZ - Forge composite depth seam. In Forge mode the engine's scene-0
+// opaque draw is suppressed (inspectIndexedPrimitive), so MW's MAIN depthstencil holds only
+// sky + distant land — the near-opaque depth is missing, and s1's sorted-alpha / first-person
+// would draw over the Forge walls. Re-draw the SAME cache set Forge renders, DEPTH-ONLY, into
+// the main depthstencil using the GAME projection (mwProj — NOT the extended depth proj the
+// depth-texture pre-pass uses) so the values match the engine's own s1 depth test. Colour is
+// masked off (Forge owns colour via the composite). Reuses renderDepthFromCache's complete
+// objects+terrain+skinned iteration and the lean depth effect (no shading). Mirrors the
+// interior depth pattern (state block + effectDepth DONOTSAVESTATE). Relies on the main
+// backbuffer/depthstencil being the bound RT (true between EndScene s0 and BeginScene s1).
+void DistantLand::renderCacheDepthToMainZ() {
+    MGE_ZoneScopedN("renderCacheDepthToMainZ");
+    UINT passes = 0;
+    IDirect3DStateBlock9* sb = nullptr;
+    device->CreateStateBlock(D3DSBT_ALL, &sb);
+
+    device->SetRenderState(D3DRS_COLORWRITEENABLE, 0);   // depth only — Forge provides colour
+    device->SetRenderState(D3DRS_ZENABLE, TRUE);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+    device->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+
+    // GAME projection (not the editProjectionZ-extended distProj) so the hardware Z matches
+    // what the engine's s1 pass tests against. renderDepthFromCache reads ehProj for the
+    // final projection (ehVertexBlendPalette / ehView carry only world*view).
+    effect->SetMatrix(ehView, &mwView);
+    effect->SetMatrix(ehProj, &mwProj);
+    effect->SetTexture(ehTex3, NULL);
+
+    effectDepth->Begin(&passes, D3DXFX_DONOTSAVESTATE);
+    renderDepthFromCache(&mwView);
+    effectDepth->End();
+
+    if (sb) { sb->Apply(); sb->Release(); }
+}
+
 // snapshotVisibleKeysForThread - copy the early frustum-visible set into the
 // render-thread snapshot. MAIN THREAD ONLY, called at kick (frameSetupEarly, right
 // after buildFrustumVisibleSet) before the worker reads it. s_frustumVisibleKeys is

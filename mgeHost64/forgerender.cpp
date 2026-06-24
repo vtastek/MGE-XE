@@ -901,7 +901,7 @@ namespace {
             cDesc.mClearValue.r = 0.0f;
             cDesc.mClearValue.g = 0.0f;
             cDesc.mClearValue.b = 0.0f;
-            cDesc.mClearValue.a = 1.0f;
+            cDesc.mClearValue.a = 0.0f;   // transparent bg: resolves into pRT's coverage-mask alpha
             cDesc.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
             cDesc.pName = "sceneMSAAColor";
             addRenderTarget(R, &cDesc, &g_live.pMSAAColor);
@@ -1513,7 +1513,7 @@ namespace ForgeRender {
 
         D3D12_CLEAR_VALUE clearVal = {};
         clearVal.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        clearVal.Color[3] = 1.0f;
+        clearVal.Color[3] = 0.0f;   // transparent bg: alpha = coverage mask for the alpha-blend composite
 
         std::printf("[forge] live CreateCommittedResource (SHARED)...\n");
         HRESULT hr = pDevice->CreateCommittedResource(
@@ -1545,7 +1545,7 @@ namespace ForgeRender {
         rtDesc.mClearValue.r = 0.0f;
         rtDesc.mClearValue.g = 0.0f;
         rtDesc.mClearValue.b = 0.0f;
-        rtDesc.mClearValue.a = 1.0f;
+        rtDesc.mClearValue.a = 0.0f;   // transparent bg: alpha = coverage mask for the composite
         rtDesc.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
         rtDesc.pNativeHandle = (void*)g_live.pSharedRes;
         rtDesc.pName = "liveSharedRT";

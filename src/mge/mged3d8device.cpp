@@ -538,9 +538,9 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
     // before pacing/present. Lazily inits on the first call.
     ImGuiWater::onPresent(realDevice);
 
-    // Present-seam spike: composite the out-of-process Vulkan renderer's output as a
-    // corner quad (gated by Configuration.UseRenderProcess + F11). No-op otherwise.
-    RenderProcess::onPresent(realDevice);
+    // Present-seam: the Forge composite now runs at the end of scene 0 (EndScene), not here —
+    // so Forge's opaque world lands behind scene 1's sorted-alpha + first-person. See
+    // RenderProcess::onStage0Composite.
 
     // MGE frame limiter: pace to the target before presenting. Off when
     // Configuration.FPSLimit == 0.
@@ -711,6 +711,19 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
 
             // Blend close objects over distant land
             DistantLand::renderStageBlend();
+
+            // Forge present-seam composite (end of scene 0, before scene 1). Two parts, both
+            // gated on the live seam owning the opaque world:
+            //   1. renderCacheDepthToMainZ — write the cache opaque/terrain depth into the main
+            //      depthstencil (game projection) so scene 1's sorted-alpha + first-person
+            //      occlude correctly against the Forge-rendered opaques.
+            //   2. onStage0Composite — drive the host + alpha-blend the Forge colour over the
+            //      sky/distant-land already on the backbuffer (self-gates on F11; also flushes
+            //      geometry independent of the toggle).
+            if (RenderProcess::ownsOpaqueWorld()) {
+                DistantLand::renderCacheDepthToMainZ();
+            }
+            RenderProcess::onStage0Composite(realDevice);
         } else if (!isFrameComplete) {
             // Everything else except UI
             DistantLand::renderStage2();
