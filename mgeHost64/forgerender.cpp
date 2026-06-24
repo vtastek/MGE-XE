@@ -461,13 +461,14 @@ namespace ForgeRender {
         // texture upload below has somewhere to land. texIndex 0 here = default white.
         std::printf("[forge] scene-probe: renderScene #1 (builds path)...\n");
         bool ok = renderScene(vp, lt, &item, 1, (unsigned)sizeof(item),
-                              skDraw, 1, (unsigned)sizeof(skDraw));
+                              skDraw, 1, (unsigned)sizeof(skDraw),
+                              nullptr, 0, 0);   // no point lights (CENTRE stays ~129)
 
         // SLOT-0 regression guard: sample gTextures[0] (default white) THROUGH the shader. Skinned
         // parts (TexIndex 0) and oversize-texture fallbacks all use slot 0, so it MUST sample white
         // (160,160,160), not black — a 1x1 default white regressed this (see buildOpaquePath).
         item.texIndex = 0;
-        renderScene(vp, lt, &item, 1, (unsigned)sizeof(item), skDraw, 1, (unsigned)sizeof(skDraw));
+        renderScene(vp, lt, &item, 1, (unsigned)sizeof(item), skDraw, 1, (unsigned)sizeof(skDraw), nullptr, 0, 0);
         std::printf("[forge] scene-probe: SLOT-0 (default white) sample -> expect ~129 (white x 0.5 ambient, tonemapped), NOT 0\n");
         debugReadbackCenterPixel();
 
@@ -495,7 +496,8 @@ namespace ForgeRender {
         item.texIndex = 1;
         std::printf("[forge] scene-probe: renderScene #2 (samples slot 1)...\n");
         ok = renderScene(vp, lt, &item, 1, (unsigned)sizeof(item),
-                         skDraw, 1, (unsigned)sizeof(skDraw));
+                         skDraw, 1, (unsigned)sizeof(skDraw),
+                         nullptr, 0, 0);
         std::printf("[forge] scene-probe: renderScene returned %d (skinnedDrawn=%u)\n",
                     (int)ok, lastSkinnedDrawn());
 
@@ -715,6 +717,10 @@ namespace {
         DescriptorSet* pPerFrameSet = nullptr;    // gFrameData cbuffer (viewProj), 1 instance
         DescriptorSet* pPerBatchSet = nullptr;    // gBatch cbuffer window, kMaxBatches instances
         Buffer*        pFrameCbv = nullptr;        // gFrameData cbuffer (viewProj), persistent-mapped
+        // Tier 3a point lights: per-frame light cbuffer + its own descriptor set (read by the
+        // shared opaque.frag for both the static and skinned paths).
+        Buffer*        pLightCbv = nullptr;        // gLights cbuffer, persistent-mapped
+        DescriptorSet* pPerLightsSet = nullptr;    // gLights, 1 instance
         Buffer*        pWorldsBuf[16] = {};        // gBatch windows: one 64KB cbuffer PER batch, persistent-mapped
         // Per-batch instance-rate VB of uint2 { .x = identity DrawIndex/Base, .y = per-draw
         // texIndex }. CPU-mapped so the static loop writes texIndex per frame; .x stays identity
@@ -833,6 +839,12 @@ namespace {
     constexpr uint32_t kMaxBonesPerPart = 32;
     constexpr uint32_t kSkinnedPerWindow = kBatchSize / kMaxBonesPerPart;   // 32
     constexpr uint32_t kMaxSkinned = kSkinnedPerWindow * kMaxBatches;       // 256
+
+    // Tier 3a point lights: per-frame cbuffer of MAX_POINT_LIGHTS lights (3 float4 each) +
+    // a float4 header (count). MUST match IPC::kMaxPointLights / MAX_POINT_LIGHTS (opaque.srt.h).
+    // 16 + 128*3*16 = 6160 B, rounded up to a 256-byte CBV multiple.
+    constexpr uint32_t kMaxPointLights = 128;
+    constexpr uint32_t kLightCbvBytes  = ((16 + kMaxPointLights * 3 * 16) + 255) & ~255u;  // 6400
 
     // Bindless base-map texture array size (must match MAX_TEXTURES in opaque.srt.h).
     constexpr uint32_t kMaxTextures = MAX_TEXTURES;
@@ -1052,6 +1064,17 @@ namespace {
         fb.ppBuffer = &g_live.pFrameCbv;
         addResource(&fb, nullptr);
 
+        // Tier 3a: gLights cbuffer, persistent-mapped (kLightCbvBytes ~6.4KB < 64KB CBV max).
+        BufferLoadDesc lb = {};
+        lb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        lb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+        lb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+        lb.mDesc.mSize = kLightCbvBytes;
+        lb.mDesc.pName = "lightCbv";
+        lb.pData = nullptr;
+        lb.ppBuffer = &g_live.pLightCbv;
+        addResource(&lb, nullptr);
+
         // World buffers: ONE exactly-64KB cbuffer per batch (a valid full CBV — a single
         // >64KB uniform buffer removes the device). Each holds kBatchSize float4x4.
         for (uint32_t b = 0; b < kMaxBatches; ++b) {
@@ -1111,10 +1134,12 @@ namespace {
         }
 
         waitForAllResourceLoads();
-        if (!g_live.pFrameCbv || !g_live.pWorldsBuf[0] || !g_live.pInstanceBuf[0]
+        if (!g_live.pFrameCbv || !g_live.pLightCbv || !g_live.pWorldsBuf[0] || !g_live.pInstanceBuf[0]
             || !g_live.pIndirectArgs) {
             return false;
         }
+        // Zero the light cbuffer so a frame with no lightBlob (lightParams.x = 0) does nothing.
+        std::memset(g_live.pLightCbv->pCpuMappedAddress, 0, kLightCbvBytes);
         for (uint32_t b = 0; b < kMaxBatches; ++b) {
             uint32_t* inst = (uint32_t*)g_live.pInstanceBuf[b]->pCpuMappedAddress;
             for (uint32_t i = 0; i < kBatchSize; ++i) {
@@ -1128,13 +1153,16 @@ namespace {
         // PerFrame set (1 instance): gFrameData viewProj.
         DescriptorSetDesc pfDesc = SRT_SET_DESC(SrtData, PerFrame, 1, 0);
         addDescriptorSet(R, &pfDesc, &g_live.pPerFrameSet);
+        // Point-light set (1 instance): gLights cbuffer (Tier 3a) — rides the PerDraw frequency.
+        DescriptorSetDesc plDesc = SRT_SET_DESC(SrtData, PerDraw, 1, 0);
+        addDescriptorSet(R, &plDesc, &g_live.pPerLightsSet);
         // PerBatch set (kMaxBatches instances): gBatch = window b of the world buffer.
         DescriptorSetDesc pbDesc = SRT_SET_DESC(SrtData, PerBatch, kMaxBatches, 0);
         addDescriptorSet(R, &pbDesc, &g_live.pPerBatchSet);
         // Persistent set (1 instance): bindless gTextures[] (sampler is static, in the root sig).
         DescriptorSetDesc psDesc = SRT_SET_DESC(SrtData, Persistent, 1, 0);
         addDescriptorSet(R, &psDesc, &g_live.pPersistentSet);
-        if (!g_live.pPerFrameSet || !g_live.pPerBatchSet || !g_live.pPersistentSet) {
+        if (!g_live.pPerFrameSet || !g_live.pPerLightsSet || !g_live.pPerBatchSet || !g_live.pPersistentSet) {
             return false;
         }
         {
@@ -1142,6 +1170,12 @@ namespace {
             p.mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
             p.ppBuffers = &g_live.pFrameCbv;
             updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &p);
+        }
+        {
+            DescriptorData p = {};
+            p.mIndex = SRT_RES_IDX(SrtData, PerDraw, gLights);
+            p.ppBuffers = &g_live.pLightCbv;
+            updateDescriptorSet(R, 0, g_live.pPerLightsSet, 1, &p);
         }
 
         // --- Phase 2: bindless texture array (default white), bound once. ---
@@ -1420,6 +1454,7 @@ namespace {
     constexpr uint16_t kDynPromoteStreak = 2;
     unsigned  g_lastDrawn = 0;  // static parts actually drawn in the last renderScene
     unsigned  g_lastSkinnedDrawn = 0;  // skinned parts actually drawn in the last renderScene
+    unsigned  g_lastLightCount = 0;    // point lights uploaded in the last renderScene
 
     bool ensureMeshSlot(uint32_t slot) {
         if (slot < g_meshCap) {
@@ -1670,7 +1705,8 @@ namespace ForgeRender {
 
     bool renderScene(const float* viewProj, const float* lighting, const void* drawBlob,
                      unsigned drawCount, unsigned drawBytes,
-                     const void* skinnedBlob, unsigned skinnedCount, unsigned skinnedBytes) {
+                     const void* skinnedBlob, unsigned skinnedCount, unsigned skinnedBytes,
+                     const void* lightBlob, unsigned lightCount, unsigned lightBytes) {
         if (!g_live.pRenderer) {
             return false;
         }
@@ -1749,6 +1785,24 @@ namespace ForgeRender {
             std::memcpy((uint8_t*)g_live.pFrameCbv->pCpuMappedAddress + 16 * sizeof(float),
                         lighting, 24 * sizeof(float));
         }
+
+        // Tier 3a: upload this frame's point lights into gLights. Each PointLightWire is exactly
+        // 3 float4 (== one cbuffer light entry), so the blob copies straight in after the float4
+        // lightParams header. lightParams.x = the active count the frag loops. Clamp to the cap +
+        // to what actually arrived. Count 0 leaves the loop a no-op (header still written = 0).
+        {
+            uint32_t nL = lightCount;
+            if (nL > kMaxPointLights) { nL = kMaxPointLights; }
+            const uint32_t haveLights = lightBytes / (uint32_t)sizeof(IPC::PointLightWire);
+            if (nL > haveLights) { nL = haveLights; }
+            uint8_t* lc = (uint8_t*)g_live.pLightCbv->pCpuMappedAddress;
+            ((float*)lc)[0] = (float)nL;   // lightParams.x = count (.yzw already 0)
+            ((float*)lc)[1] = 0.0f; ((float*)lc)[2] = 0.0f; ((float*)lc)[3] = 0.0f;
+            if (nL && lightBlob) {
+                std::memcpy(lc + 16, lightBlob, (size_t)nL * sizeof(IPC::PointLightWire));
+            }
+            g_lastLightCount = nL;
+        }
         for (uint32_t i = 0; i < count; ++i) {
             const uint32_t batch = i / kBatchSize;
             const uint32_t local = i % kBatchSize;
@@ -1802,6 +1856,7 @@ namespace ForgeRender {
         // the loop switches to the mirror variant per draw as needed.
         cmdBindPipeline(g_live.pCmd, g_live.pOpaquePipeline);
         cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);    // Tier 3a point lights
         cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);   // bindless gTextures (static sampler)
 
         // GPU-driven static draws (ExecuteIndirect). Consolidation already put every static
@@ -1884,6 +1939,7 @@ namespace ForgeRender {
                 cmdBindPipeline(g_live.pCmd, mir ? g_live.pOpaquePipelineMirror
                                                  : g_live.pOpaquePipeline);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
                 boundMirror = (int)mir;
             }
@@ -1912,6 +1968,7 @@ namespace ForgeRender {
                 cmdBindPipeline(g_live.pCmd, mirror ? g_live.pOpaquePipelineMirror
                                                     : g_live.pOpaquePipeline);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
                 boundMirror = mirror;
             }
@@ -1937,6 +1994,7 @@ namespace ForgeRender {
             // the descriptor sets persist across the switch.
             cmdBindPipeline(g_live.pCmd, g_live.pSkinnedPipeline);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
 
             const uint8_t* sp  = (const uint8_t*)skinnedBlob;
@@ -2584,9 +2642,11 @@ namespace ForgeRender {
         freeMeshStore();   // release VB/IB before the resource loader goes down
         // M1c opaque path teardown.
         if (g_live.pPerFrameSet)    { removeDescriptorSet(R, g_live.pPerFrameSet); }
+        if (g_live.pPerLightsSet)   { removeDescriptorSet(R, g_live.pPerLightsSet); }
         if (g_live.pPerBatchSet)    { removeDescriptorSet(R, g_live.pPerBatchSet); }
         if (g_live.pPersistentSet)  { removeDescriptorSet(R, g_live.pPersistentSet); }
         if (g_live.pFrameCbv)       { removeResource(g_live.pFrameCbv); }
+        if (g_live.pLightCbv)       { removeResource(g_live.pLightCbv); }
         if (g_live.pArenaVB)        { removeResource(g_live.pArenaVB); }
         if (g_live.pArenaIB)        { removeResource(g_live.pArenaIB); }
         if (g_live.pIndirectArgs)   { removeResource(g_live.pIndirectArgs); }

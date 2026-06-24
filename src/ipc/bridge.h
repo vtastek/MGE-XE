@@ -294,6 +294,13 @@ namespace IPC {
         IN std::uint32_t skinnedCount;
         IN std::uint32_t skinnedBytes;
 
+        // Tier 3a point lights: a chunked byte vec of PointLightWire[] (geomwire.h),
+        // world-space, uploaded into the host's light cbuffer for the per-pixel FFE
+        // evalOnePointLight loop. Invalid / count 0 ⇒ no point lights this frame.
+        IN VecId lightList;
+        IN std::uint32_t lightCount;
+        IN std::uint32_t lightBytes;
+
         OUT std::uint32_t bytesWritten;
         OUT double renderMs;             // host-side render+readback time
     };

@@ -32,6 +32,7 @@ STRUCT(VSOutput)
     DATA(FLAT(float3),MatAmbient, TEXCOORD5);
     DATA(FLAT(float3),MatEmissive,TEXCOORD6);
     DATA(FLAT(uint),  VColSource, TEXCOORD7); // 0 none, 1 emissive, 2 diffamb
+    DATA(float3,      WorldPos,   TEXCOORD8); // Tier 3a: world position for point-light eval
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -47,6 +48,7 @@ VSOutput VS_MAIN( VSInput In )
     float4 worldPos = mul(world, float4(In.Position, 1.0f));
     Out.Position = mul(gFrameData.viewProj, worldPos);
     Out.Normal = mul((float3x3)world, In.Normal);
+    Out.WorldPos = worldPos.xyz;   // Tier 3a: point lights evaluate in world space
     Out.Uv = In.Uv;
     // Unpack the per-instance texIndex (low 16) + alpha-test ref (bits 16-23, /255) + vColSource (bits 24-25).
     Out.TexIndex = In.TexAlpha & 0xFFFFu;

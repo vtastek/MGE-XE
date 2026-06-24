@@ -16,6 +16,7 @@
 
 #define OPAQUE_BATCH 1024   // matrices per 64KB cbuffer window; must match host kBatchSize
 #define MAX_TEXTURES 1024   // bindless gTextures[] array size; MUST match IPC::kMaxTextures (geomwire.h)
+#define MAX_POINT_LIGHTS 128 // per-frame point-light cap; MUST match IPC::kMaxPointLights (geomwire.h)
 
 STRUCT(FrameData)
 {
@@ -36,10 +37,30 @@ STRUCT(BatchData)
     DATA(float4x4, worlds[OPAQUE_BATCH], None);
 };
 
+// Tier 3a point lights (per-frame). One light = 3 float4 packed exactly like
+// IPC::PointLightWire so the host memcpy's the wire array straight in:
+//   lights[i*3+0] = float4(worldPos.xyz, radius)
+//   lights[i*3+1] = float4(diffuse.rgb,  unused)   // dimmer- & pointLightMult-scaled
+//   lights[i*3+2] = float4(k0, k1, k2,   unused)   // 1/(k0+k1·d+k2·d²) attenuation
+// lightParams.x = active light count (host writes the actual uploaded count).
+// 16 + 128*3*16 = 6160 B < the 64KB cbuffer limit.
+STRUCT(LightData)
+{
+    DATA(float4, lightParams, None);                 // x = count
+    DATA(float4, lights[MAX_POINT_LIGHTS * 3], None);
+};
+
 BEGIN_SRT_NO_AB(SrtData)
     BEGIN_SRT_SET(PerFrame)
         DECL_CBUFFER(PerFrame, CBUFFER(FrameData), gFrameData)
     END_SRT_SET(PerFrame)
+    // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
+    // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has
+    // no register space). Its own set ⇒ b0 in spaceSET_PerDraw, no collision with PerFrame's
+    // b0. Read by opaque.frag for both the static and skinned paths.
+    BEGIN_SRT_SET(PerDraw)
+        DECL_CBUFFER(PerDraw, CBUFFER(LightData), gLights)
+    END_SRT_SET(PerDraw)
     // Bindless base-map textures only — NO dynamic sampler here. The frag samples with the FSL
     // built-in STATIC sampler gSamplerAnisotropic (anisotropic 8x, WRAP, baked into the root sig).
     //

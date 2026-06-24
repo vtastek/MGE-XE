@@ -962,7 +962,7 @@ SamplerState gSamplerAnisotropic : register( s10 , space100 ) ;
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 #line 10 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-#line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(FrameData)
 {
     float4x4 viewProj;
@@ -975,17 +975,36 @@ STRUCT(FrameData)
     float4 fogColNear;
     float4 fogParams;
     float4 eyePos;
-#line 32
+#line 33
 };
 
 STRUCT(BatchData)
 {
     float4x4 worlds[ 1024 ];
-#line 37
+#line 38
+};
+
+
+
+
+
+
+
+
+STRUCT(LightData)
+{
+    float4 lightParams;
+    float4 lights[ 128  * 3];
+#line 51
 };
 
         CBUFFER(FrameData) gFrameData : register( b0 , space1 ) ;
-#line 54 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+
+
+
+
+        CBUFFER(LightData) gLights : register( b0 , space3 ) ;
+#line 75 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 1024 ] : register( t0 , space0 ) ;
         CBUFFER(BatchData) gBatch : register( b0 , space2 ) ;
 #line 11 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
@@ -1003,7 +1022,8 @@ STRUCT(VSOutput)
     DATA(FLAT(float3),MatAmbient, TEXCOORD5);
     DATA(FLAT(float3),MatEmissive,TEXCOORD6);
     DATA(FLAT(uint), VColSource, TEXCOORD7);
-#line 25
+    DATA(float3, WorldPos, TEXCOORD8);
+#line 26
 };
 
 
@@ -1026,6 +1046,37 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
     float3 d = gFrameData.sunCol.rgb * ndl;
     float3 a = gFrameData.ambCol.rgb;
+
+
+
+
+
+
+    {
+        uint nLights = (uint)gLights.lightParams.x;
+        for (uint i = 0; i < nLights; ++i)
+        {
+            float4 posR = gLights.lights[i * 3u + 0u];
+            float3 lightCol= gLights.lights[i * 3u + 1u].rgb;
+            float3 fo = gLights.lights[i * 3u + 2u].xyz;
+            float radius = posR.w;
+
+            float3 toLight = posR.xyz - In.WorldPos;
+            float dist2 = dot(toLight, toLight);
+            float invDist = rsqrt(max(dist2, 1e-8f));
+            float dist = dist2 * invDist;
+
+
+
+            float att = 1.0f / max(fo.z * dist2 + fo.y * dist + fo.x, 1e-4f);
+
+
+            att *= 1.0f - smoothstep(radius, 2.0f * radius, dist);
+
+            float lambert = saturate(dot(N, toLight) * invDist);
+            d += lambert * att * lightCol;
+        }
+    }
 
 
 

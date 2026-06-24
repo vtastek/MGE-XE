@@ -22,6 +22,7 @@ STRUCT(VSOutput)
     DATA(FLAT(float3),MatAmbient, TEXCOORD5);
     DATA(FLAT(float3),MatEmissive,TEXCOORD6);
     DATA(FLAT(uint),  VColSource, TEXCOORD7); // 0 none, 1 emissive, 2 diffamb
+    DATA(float3,      WorldPos,   TEXCOORD8); // Tier 3a: world position for point-light eval
 };
 
 // Static semi-HDR tonemap — ported verbatim from XE FixedFuncEmu.fx::tonemap.
@@ -40,10 +41,41 @@ float4 PS_MAIN( VSOutput In )
     float3 N = normalize(In.Normal);
     // MW lighting: sun diffuse (to-sun = -sunDir) + scene ambient. FFE convention.
     float  ndl = saturate(dot(N, -gFrameData.sunDir.xyz));
-    // FFE PerPixelPS lighting terms: d = sun diffuse (point lights added in Tier 3), a = scene
-    // ambient. (matches lightSunDiffuse*N.L + lightSceneAmbient.)
+    // FFE PerPixelPS lighting terms: d = sun diffuse + point lights, a = scene ambient.
+    // (matches lightSunDiffuse*N.L + Σ pointlights + lightSceneAmbient.)
     float3 d = gFrameData.sunCol.rgb * ndl;
     float3 a = gFrameData.ambCol.rgb;
+
+    // Tier 3a point lights — replicates XE FixedFuncEmu.fx evalOnePointLight EXACTLY, in WORLD
+    // space (Forge normals + positions are world-space, like the Tier 1 sun). pointLightMult is
+    // already baked into each light's colour client-side (the main cache path uses 1.0). The
+    // lights cbuffer packs 3 float4 per light: [i*3+0]=(pos.xyz, radius), [i*3+1]=(col.rgb,_),
+    // [i*3+2]=(k0,k1,k2,_). lightParams.x is the active count (host-written).
+    {
+        uint nLights = (uint)gLights.lightParams.x;
+        for (uint i = 0; i < nLights; ++i)
+        {
+            float4 posR    = gLights.lights[i * 3u + 0u];
+            float3 lightCol= gLights.lights[i * 3u + 1u].rgb;
+            float3 fo      = gLights.lights[i * 3u + 2u].xyz;   // x=k0 const, y=k1 linear, z=k2 quad
+            float  radius  = posR.w;
+
+            float3 toLight = posR.xyz - In.WorldPos;
+            float  dist2   = dot(toLight, toLight);
+            float  invDist = rsqrt(max(dist2, 1e-8f));
+            float  dist    = dist2 * invDist;
+
+            // Full 1/(k0 + k1·d + k2·d²) attenuation. The linear k1 term is essential —
+            // MW candle/torch lights are pure-linear (k0=k2=0). max() guards d->0.
+            float  att = 1.0f / max(fo.z * dist2 + fo.y * dist + fo.x, 1e-4f);
+            // Soft cutoff: ramp 1->0 over [radius, 2·radius] so the future CPU cull boundary
+            // has no hard seam (matches evalOnePointLight / OpenMW PerObjectUniform).
+            att *= 1.0f - smoothstep(radius, 2.0f * radius, dist);
+
+            float  lambert = saturate(dot(N, toLight) * invDist);
+            d += lambert * att * lightCol;
+        }
+    }
 
     // Tier 2b material routing — replicates XE FixedFuncEmu.fx vertexMaterial* EXACTLY (the
     // PROVEN cache color path's selection via matSrcDiffuse/matSrcEmissive):

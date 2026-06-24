@@ -6,6 +6,7 @@
 #include "dxvk_interop.h"
 #include "distantland.h"
 #include "scenegraph_geometry_cache.h"
+#include "scenegraph.h"
 #include "morrowindbsa.h"
 
 #include <windows.h>
@@ -66,6 +67,7 @@ namespace {
     std::optional<IPC::VecView<IPC::GeomChunk>> g_geomVec;          // persistent geometry upload vec
     std::optional<IPC::VecView<IPC::GeomChunk>> g_drawVec;          // persistent per-frame draw-list vec
     std::optional<IPC::VecView<IPC::GeomChunk>> g_skinnedVec;       // persistent per-frame skinned draw-list vec
+    std::optional<IPC::VecView<IPC::GeomChunk>> g_lightVec;         // persistent per-frame point-light vec (Tier 3a)
     std::vector<std::uint8_t>                 g_pendingBlob;        // packed parts awaiting flush
     std::uint32_t                             g_pendingParts = 0;
     std::unordered_map<std::uint32_t, std::uint32_t> g_keySlot;    // cache key -> host slot
@@ -77,6 +79,7 @@ namespace {
     std::uint32_t                             g_nextSlot = 0;
     std::vector<std::uint8_t>                 g_drawScratch;        // packed DrawItemWire[] this frame
     std::vector<std::uint8_t>                 g_skinnedScratch;     // packed [SkinnedDrawWire][palette]* this frame
+    std::vector<std::uint8_t>                 g_lightScratch;       // packed PointLightWire[] this frame
 
     // --- Phase 2 bindless texture residency (client) ---
     // Each unique texture (by normalized name) gets a dense bindless slot; its raw DDS bytes
@@ -566,6 +569,15 @@ namespace {
             g_skinnedVec.emplace(std::move(*sv));
         }
 
+        // Point-light list (Tier 3a) rides its own 1-chunk vec — kMaxPointLights * 48B ≈ 6KB,
+        // far under 1MB. PointLightWire[] world-space, rebuilt each frame from the SceneGraph snapshot.
+        auto lv = g_client->allocVecBlocking<IPC::GeomChunk>(1, 1, 1);
+        if (!lv) {
+            LOG::logline("!! [seam] light vec alloc failed — point lights disabled");
+        } else {
+            g_lightVec.emplace(std::move(*lv));
+        }
+
         // Texture upload vec: kTexChunks (32MB window) — larger than geometry because a single DDS
         // must fit one window (oversize textures are dropped to white in resolveTextureSlot).
         auto tv = g_client->allocVecBlocking<IPC::GeomChunk>(
@@ -575,7 +587,7 @@ namespace {
         } else {
             g_texVec.emplace(std::move(*tv));
         }
-        LOG::logline(">> [seam] scene vecs ready (geom %u, draw %u, skinned %u, tex %u chunks)",
+        LOG::logline(">> [seam] scene vecs ready (geom %u, draw %u, skinned %u, light 1, tex %u chunks)",
                      IPC::kGeomChunks, kDrawChunks, kDrawChunks, IPC::kTexChunks);
     }
 
@@ -898,6 +910,56 @@ namespace {
         }
         return count;
     }
+
+    // Tier 3a: gather this frame's point lights into g_lightScratch as PointLightWire[]. Source is
+    // the MGE scene-graph snapshot (MGE::SceneGraph::pointLights()) — the same NI::PointLight POD
+    // the FFE many-lights path consumes — read under the SnapshotReadLock (the async walk swaps the
+    // vector atomically). World-space, no culling (Tier 3a is correctness-first; the frag loops the
+    // whole set). Diffuse is already dimmer-scaled; pointLightMult is baked here (1.0 on the main
+    // cache path → identity). Clamped to kMaxPointLights (logged once if exceeded). Returns the count.
+    std::uint32_t buildLightList() {
+        if (!g_lightVec) {
+            return 0;
+        }
+        // The main cache color path (rendercachedcolor.cpp) renders the SAME opaque set Forge does
+        // and passes pointLightMult = 1.0f, so bake 1.0 (kept explicit for future per-frame scaling).
+        constexpr float pointLightMult = 1.0f;
+
+        MGE::SceneGraph::SnapshotReadLock lk;
+        const auto& lights = MGE::SceneGraph::pointLights();
+
+        g_lightScratch.clear();
+        std::uint32_t count = 0;
+        for (const auto& pl : lights) {
+            if (count >= IPC::kMaxPointLights) {
+                static bool logged = false;
+                if (!logged) {
+                    LOG::logline("!! [light] %zu point lights this frame > cap %u — extra dropped (Tier 3b clustering lifts this)",
+                                 lights.size(), IPC::kMaxPointLights);
+                    logged = true;
+                }
+                break;
+            }
+            IPC::PointLightWire w;
+            w.posRadius[0] = pl.worldPos[0];
+            w.posRadius[1] = pl.worldPos[1];
+            w.posRadius[2] = pl.worldPos[2];
+            w.posRadius[3] = pl.radius;
+            w.color[0] = pl.diffuse[0] * pointLightMult;
+            w.color[1] = pl.diffuse[1] * pointLightMult;
+            w.color[2] = pl.diffuse[2] * pointLightMult;
+            w.color[3] = 0.0f;
+            w.falloff[0] = pl.falloff[0];
+            w.falloff[1] = pl.falloff[1];
+            w.falloff[2] = pl.falloff[2];
+            w.falloff[3] = 0.0f;
+            const std::size_t at = g_lightScratch.size();
+            g_lightScratch.resize(at + sizeof(w));
+            memcpy(g_lightScratch.data() + at, &w, sizeof(w));
+            ++count;
+        }
+        return count;
+    }
 }
 
 namespace RenderProcess {
@@ -958,6 +1020,7 @@ namespace RenderProcess {
         bool ok = false;
         const std::uint32_t drawCount = buildDrawList();
         const std::uint32_t skinnedCount = buildSkinnedDrawList();
+        const std::uint32_t lightCount = buildLightList();
         const double tBuild = nowMs();
 
         // Ship any textures newly referenced this frame BEFORE the scene draw that uses them
@@ -976,6 +1039,14 @@ namespace RenderProcess {
             && g_skinnedVec->assign_bytes(g_skinnedScratch.data(), (std::uint32_t)g_skinnedScratch.size())) {
             skinnedId    = g_skinnedVec->id();
             skinnedBytes = (std::uint32_t)g_skinnedScratch.size();
+        }
+
+        IPC::VecId   lightId = IPC::InvalidVector;
+        std::uint32_t lightBytes = 0;
+        if (g_lightVec && lightCount > 0
+            && g_lightVec->assign_bytes(g_lightScratch.data(), (std::uint32_t)g_lightScratch.size())) {
+            lightId    = g_lightVec->id();
+            lightBytes = (std::uint32_t)g_lightScratch.size();
         }
         const double tAssign = nowMs();
 
@@ -1015,7 +1086,8 @@ namespace RenderProcess {
                  haveDraw ? g_drawVec->id() : IPC::InvalidVector,
                  haveDraw ? drawCount : 0,
                  haveDraw ? (std::uint32_t)g_drawScratch.size() : 0,
-                 skinnedId, skinnedCount, skinnedBytes, &hostMs);
+                 skinnedId, skinnedCount, skinnedBytes,
+                 lightId, (lightId != IPC::InvalidVector) ? lightCount : 0, lightBytes, &hostMs);
         const double tRender = nowMs();
         if (!ok) {
             return;
@@ -1113,11 +1185,11 @@ namespace RenderProcess {
         if (feed >= kSpikeMs) {
             LOG::logline("!! [spike] frame %u feed=%.2fms (geomflush=%.2f build=%.2f texflush=%.2f "
                          "assign=%.2f render=%.2f[host=%.2f] copy=%.2f blit=%.2f) "
-                         "draws=%u skin=%u geom+=%u/%uKB tex+=%u/%uKB dt=%.2fms",
+                         "draws=%u skin=%u light=%u geom+=%u/%uKB tex+=%u/%uKB dt=%.2fms",
                          frame, feed,
                          tGeomFlush - tStart, tBuild - tGeomFlush, tTexFlush - tBuild,
                          tAssign - tTexFlush, tRender - tAssign, hostMs, tCopy - tRender, tEnd - tCopy,
-                         drawCount, skinnedCount,
+                         drawCount, skinnedCount, lightCount,
                          geomParts, (unsigned)(geomBytes >> 10), texCount, (unsigned)(texBytes >> 10),
                          dtPresent);
         }
@@ -1228,6 +1300,7 @@ namespace RenderProcess {
         g_geomVec.reset();
         g_drawVec.reset();
         g_skinnedVec.reset();
+        g_lightVec.reset();
         g_texVec.reset();
         g_pendingBlob.clear();
         g_pendingBlob.shrink_to_fit();
@@ -1235,6 +1308,8 @@ namespace RenderProcess {
         g_drawScratch.shrink_to_fit();
         g_skinnedScratch.clear();
         g_skinnedScratch.shrink_to_fit();
+        g_lightScratch.clear();
+        g_lightScratch.shrink_to_fit();
         g_texPendingBlob.clear();
         g_texPendingBlob.shrink_to_fit();
         g_pendingParts = 0;

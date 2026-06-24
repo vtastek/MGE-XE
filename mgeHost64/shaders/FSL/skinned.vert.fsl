@@ -38,6 +38,7 @@ STRUCT(VSOutput)
     DATA(FLAT(float3),MatAmbient, TEXCOORD5); // material yet → defaults below reduce the frag's
     DATA(FLAT(float3),MatEmissive,TEXCOORD6); // vColSource==2 branch to white*(d+a) = current fidelity.
     DATA(FLAT(uint),  VColSource, TEXCOORD7);
+    DATA(float3,      WorldPos,   TEXCOORD8); // Tier 3a: world position for point-light eval
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -69,6 +70,7 @@ VSOutput VS_MAIN( VSInput In )
 
     Out.Position = mul(gFrameData.viewProj, worldPos);
     Out.Normal = worldNrm;
+    Out.WorldPos = worldPos.xyz;   // Tier 3a: point lights evaluate in world space
     Out.Uv = In.Uv;
     // Unpack the per-instance texIndex (low 16) + alpha-test ref (bits 16-23, /255).
     Out.TexIndex = In.TexAlpha & 0xFFFFu;

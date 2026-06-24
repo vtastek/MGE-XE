@@ -112,6 +112,24 @@ namespace IPC {
         float         alphaRef;      // alpha-test reference 0..1 (0 = no alpha test; frag discards a < ref)
     };
 
+    // Tier 3a point light (per-frame, world-space). One entry == three float4, so the host
+    // memcpy's the received light array straight into its light cbuffer with no repacking.
+    // Mirrors MGE::SceneGraph::PointLight (diffuse pre-multiplied by dimmer; falloff = the
+    // raw 1/(k0+k1·d+k2·d²) coefficients; radius = the engine's specular.r fade). The frag
+    // replicates XE FixedFuncEmu.fx evalOnePointLight EXACTLY (full k0/k1/k2 attenuation +
+    // smoothstep(radius, 2·radius) soft cutoff) in WORLD space. pointLightMult is baked into
+    // color client-side (the main cache path uses 1.0, so this is identity today).
+    struct PointLightWire {
+        float posRadius[4];   // xyz = world position, w = soft-cutoff radius (specular.r)
+        float color[4];       // xyz = diffuse rgb (dimmer- and pointLightMult-scaled); w unused
+        float falloff[4];     // x = k0 const, y = k1 linear, z = k2 quad; w unused
+    };
+
+    // Per-frame point-light cap. The frag loops a bounded working set (Tier 3a is the
+    // correctness-first, no-cull step); Tier 3b clustered culling lifts this. MUST match the
+    // host MAX_POINT_LIGHTS (opaque.srt.h) and kMaxPointLights (forgerender.cpp).
+    constexpr std::uint32_t kMaxPointLights = 128;
+
 #pragma pack(pop)
 
     // Transport chunk for the shared upload vector. The IPC Vec reserves

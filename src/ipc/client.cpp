@@ -421,6 +421,7 @@ namespace IPC {
 		const float* lighting,
 		VecId drawList, std::uint32_t drawCount, std::uint32_t drawBytes,
 		VecId skinnedList, std::uint32_t skinnedCount, std::uint32_t skinnedBytes,
+		VecId lightList, std::uint32_t lightCount, std::uint32_t lightBytes,
 		double* outRenderMs) {
 		WAIT_FOR_PREVIOUS_COMMAND;
 
@@ -435,6 +436,9 @@ namespace IPC {
 		params.skinnedList = skinnedList;
 		params.skinnedCount = skinnedCount;
 		params.skinnedBytes = skinnedBytes;
+		params.lightList = lightList;
+		params.lightCount = lightCount;
+		params.lightBytes = lightBytes;
 		params.bytesWritten = 0;
 		params.renderMs = 0.0;
 		if (!beginRpc(Command::RenderFrame)) {

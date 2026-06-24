@@ -89,9 +89,13 @@ namespace ForgeRender {
     // lighting = 24 floats (6 × float4): sunDir, sunCol, ambCol, fogColNear, fogParams
     // (x=fogNearStart, y=fogNearEnd), eyePos — uploaded into gFrameData after viewProj.
     // May be null (then lighting stays whatever the cbuffer last held).
+    // Tier 3a: lightBlob is an array of IPC::PointLightWire (world-space point lights);
+    // lightCount items, lightBytes total. Uploaded into the host light cbuffer for the
+    // per-pixel FFE evalOnePointLight loop. May be null / 0 (no point lights this frame).
     bool renderScene(const float* viewProj, const float* lighting, const void* drawBlob,
                      unsigned drawCount, unsigned drawBytes,
-                     const void* skinnedBlob, unsigned skinnedCount, unsigned skinnedBytes);
+                     const void* skinnedBlob, unsigned skinnedCount, unsigned skinnedBytes,
+                     const void* lightBlob, unsigned lightCount, unsigned lightBytes);
 
     // Parts actually drawn (slot valid) in the last renderScene — for diagnostics.
     unsigned lastDrawn();

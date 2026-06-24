@@ -528,15 +528,27 @@ namespace IPC {
 				}
 				skinnedPtr = svec.size() ? &svec[0] : nullptr;
 			}
+			const void* lightPtr = nullptr;
+			std::uint32_t lightBytes = 0;
+			if (params.lightList != InvalidVector) {
+				auto& lvec = getVec<IPC::GeomChunk>(params.lightList);
+				const std::uint32_t lavail = lvec.size() * static_cast<std::uint32_t>(sizeof(IPC::GeomChunk));
+				lightBytes = params.lightBytes;
+				if (lightBytes == 0 || lightBytes > lavail) {
+					lightBytes = lavail;
+				}
+				lightPtr = lvec.size() ? &lvec[0] : nullptr;
+			}
 			static unsigned s_sceneLog = 0;
 			const bool logScene = (s_sceneLog++ % 60) == 0;
 			if (logScene) {
-				LOG::logline(">> [scene] renderScene ENTER frame=%u drawCount=%u bytes=%u skinnedCount=%u skinnedBytes=%u",
-					params.frameIndex, params.drawCount, bytes, params.skinnedCount, skinnedBytes);
+				LOG::logline(">> [scene] renderScene ENTER frame=%u drawCount=%u bytes=%u skinnedCount=%u skinnedBytes=%u lightCount=%u",
+					params.frameIndex, params.drawCount, bytes, params.skinnedCount, skinnedBytes, params.lightCount);
 				LOG::flush();
 			}
 			ok = ForgeRender::renderScene(params.viewProj, params.lighting, drawPtr, params.drawCount, bytes,
-				skinnedPtr, params.skinnedCount, skinnedBytes);
+				skinnedPtr, params.skinnedCount, skinnedBytes,
+				lightPtr, params.lightCount, lightBytes);
 			if (logScene) {
 				LOG::logline(">> [scene] renderScene DONE ok=%d drawn=%u skinned=%u",
 					(int)ok, ForgeRender::lastDrawn(), ForgeRender::lastSkinnedDrawn());
