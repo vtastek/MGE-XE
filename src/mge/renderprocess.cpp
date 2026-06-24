@@ -812,6 +812,7 @@ namespace {
 
             item.slot = ks->second;
             item.texIndex = resolveTextureSlot(e.textureName);   // bindless base map (0 = white)
+            item.alphaRef = e.alphaTest ? e.alphaRef : 0.0f;     // alpha-test cutout (0 = no test)
             memcpy(item.world, e.worldTransformD3D, 16 * sizeof(float));
             // F12 diagnostic: displace each object by a deterministic per-slot vector. The
             // world matrix is row-major D3DX (translation in m[12..14]); a fixed offset per
@@ -876,6 +877,7 @@ namespace {
             item.numBones = e.numBones;
             item.mirror   = e.mirrored ? 1u : 0u;
             item.texIndex = resolveTextureSlot(e.textureName);   // bindless base map (0 = white)
+            item.alphaRef = e.alphaTest ? e.alphaRef : 0.0f;     // alpha-test cutout (0 = no test)
 
             const std::size_t paletteBytes = (std::size_t)e.numBones * 64;  // numBones * 16 floats
             const std::size_t at = g_skinnedScratch.size();

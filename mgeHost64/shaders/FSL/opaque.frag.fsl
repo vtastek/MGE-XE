@@ -16,6 +16,7 @@ STRUCT(VSOutput)
     DATA(FLAT(uint),  TexIndex, TEXCOORD1);
     DATA(float,       Fog,      TEXCOORD2);
     DATA(float4,      Color,    COLOR);       // per-vertex DiffAmb colour
+    DATA(float,       AlphaRef, TEXCOORD3);   // alpha-test ref 0..1 (0 = no test)
 };
 
 // Static semi-HDR tonemap — ported verbatim from XE FixedFuncEmu.fx::tonemap.
@@ -46,6 +47,11 @@ float4 PS_MAIN( VSOutput In )
     // s0 (= null sampler => POINT filter + non-REPEAT address => tiled UVs sample black). A static
     // sampler sidesteps that entirely. See opaque.srt.h.
     float4 albedo = SampleTex2D(gTextures[In.TexIndex], gSamplerAnisotropic, In.Uv);
+
+    // Alpha test (cutout foliage/grates/fences). MW drives this per-part via D3DRS_ALPHAREF
+    // with GREATER; we approximate with GREATEREQUAL (keep a >= ref). Strict '<' means a ref of
+    // 0 (non-alpha-test geometry) never discards — opaque base maps with stray low alpha are safe.
+    if (albedo.a < In.AlphaRef) { discard; }
 
     float3 c = albedo.rgb * lit;
     c = tonemap(c);

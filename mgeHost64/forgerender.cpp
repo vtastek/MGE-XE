@@ -831,6 +831,18 @@ namespace {
     // Bindless base-map texture array size (must match MAX_TEXTURES in opaque.srt.h).
     constexpr uint32_t kMaxTextures = MAX_TEXTURES;
 
+    // Pack the per-draw instance .y: texIndex in the low 16 bits (slots < kMaxTextures=1024,
+    // so ≤10 bits), the alpha-test reference quantised to a byte in bits 16-23. The vert
+    // shaders unpack: TexIndex = packed & 0xFFFF, AlphaRef = ((packed>>16)&0xFF)/255. Keeps
+    // the instance buffer a uint2 (no layout/stride churn). alphaRef 0 → frag's strict a<ref
+    // never discards (opaque-safe). See opaque.vert/skinned.vert/opaque.frag.
+    inline uint32_t packTexAlpha(uint32_t texIndex, float alphaRef) {
+        const uint32_t tex = texIndex < kMaxTextures ? texIndex : 0u;
+        float r = alphaRef < 0.0f ? 0.0f : (alphaRef > 1.0f ? 1.0f : alphaRef);
+        const uint32_t aref = (uint32_t)(r * 255.0f + 0.5f) & 0xFFu;
+        return tex | (aref << 16);
+    }
+
     // Submit + wait the resource loader's UPLOAD ENGINE. beginUpdateResource/endUpdateResource
     // record texture copies on the upload engine (pUploadEngines), which waitForAllResourceLoads
     // (async loader) does NOT flush — without this the copies never execute and textures stay
@@ -1712,11 +1724,10 @@ namespace ForgeRender {
             const uint32_t local = i % kBatchSize;
             uint8_t* dst = (uint8_t*)g_live.pWorldsBuf[batch]->pCpuMappedAddress;
             std::memcpy(dst + (size_t)local * 64, items[i].world, 64);
-            // Per-draw texIndex into the instance buffer's .y (clamped to the array). .x stays
+            // Per-draw texIndex + alpha-test ref packed into the instance buffer's .y. .x stays
             // the identity DrawIndex set at creation. Unloaded/unknown slots fall back to 0 (white).
             uint32_t* inst = (uint32_t*)g_live.pInstanceBuf[batch]->pCpuMappedAddress;
-            const uint32_t tex = items[i].texIndex < kMaxTextures ? items[i].texIndex : 0u;
-            inst[local * 2 + 1] = tex;
+            inst[local * 2 + 1] = packTexAlpha(items[i].texIndex, items[i].alphaRef);
         }
 
         resetCmdPool(R, g_live.pCmdPool);
@@ -1928,11 +1939,11 @@ namespace ForgeRender {
                 uint8_t* dst = (uint8_t*)g_live.pBonesBuf[window]->pCpuMappedAddress;
                 std::memcpy(dst + (size_t)base * 64, palette, (size_t)bones * 64);
 
-                // Instance entry skinnedDrawn = { Base = base, texIndex }. firstInstance below
-                // selects it; Base resolves gBatch.worlds[Base + BoneIdx], texIndex the base map.
+                // Instance entry skinnedDrawn = { Base = base, packed texIndex+alphaRef }.
+                // firstInstance below selects it; Base resolves gBatch.worlds[Base + BoneIdx].
                 uint32_t* sinst = (uint32_t*)g_live.pInstanceBufSkin->pCpuMappedAddress;
                 sinst[skinnedDrawn * 2 + 0] = base;
-                sinst[skinnedDrawn * 2 + 1] = item.texIndex;
+                sinst[skinnedDrawn * 2 + 1] = packTexAlpha(item.texIndex, item.alphaRef);
 
                 // Mirror pipeline by the wire flag (negative-determinant left-side parts).
                 const int mirror = item.mirror ? 1 : 0;

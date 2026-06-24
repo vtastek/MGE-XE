@@ -998,7 +998,8 @@ STRUCT(VSOutput)
     DATA(FLAT(uint), TexIndex, TEXCOORD1);
     DATA(float, Fog, TEXCOORD2);
     DATA(float4, Color, COLOR);
-#line 19
+    DATA(float, AlphaRef, TEXCOORD3);
+#line 20
 };
 
 
@@ -1029,6 +1030,11 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
     float4 albedo = SampleTex2D(gTextures[In.TexIndex], gSamplerAnisotropic, In.Uv);
+
+
+
+
+    if (albedo.a < In.AlphaRef) { discard; }
 
     float3 c = albedo.rgb * lit;
     c = tonemap(c);

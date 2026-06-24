@@ -22,7 +22,7 @@ STRUCT(VSInput)
     DATA(uint4,  BoneIdx,  TEXCOORD1);   // R8G8B8A8_UINT: .x=idx0 .y=idx1 .z=idx2 .w=idx3
     DATA(uint,   Base,     TEXCOORD2);   // per-instance: palette offset in the bound window
     DATA(float2, Uv,       TEXCOORD3);   // per-vertex base-map UV
-    DATA(uint,   TexIdx,   TEXCOORD4);   // per-instance: bindless gTextures[] base-map slot
+    DATA(uint,   TexAlpha, TEXCOORD4);   // per-instance packed: texIndex (low 16) | alphaRef*255 (bits 16-23)
 };
 
 STRUCT(VSOutput)
@@ -33,6 +33,7 @@ STRUCT(VSOutput)
     DATA(FLAT(uint),  TexIndex, TEXCOORD1);   // bindless base-map slot (0 = default white)
     DATA(float,       Fog,      TEXCOORD2);   // MW fog scalar (shared opaque.frag, matches opaque.vert)
     DATA(float4,      Color,    COLOR);       // Tier 2a: white (skinned VB has no vcol) → (d+a) fidelity
+    DATA(float,       AlphaRef, TEXCOORD3);   // alpha-test ref 0..1 (shared opaque.frag; 0 = no test)
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -65,7 +66,9 @@ VSOutput VS_MAIN( VSInput In )
     Out.Position = mul(gFrameData.viewProj, worldPos);
     Out.Normal = worldNrm;
     Out.Uv = In.Uv;
-    Out.TexIndex = In.TexIdx;
+    // Unpack the per-instance texIndex (low 16) + alpha-test ref (bits 16-23, /255).
+    Out.TexIndex = In.TexAlpha & 0xFFFFu;
+    Out.AlphaRef = float((In.TexAlpha >> 16u) & 0xFFu) * (1.0f / 255.0f);
     Out.Color = float4(1.0f, 1.0f, 1.0f, 1.0f);
     // MW near fog, same per-vertex form as opaque.vert (palette is already world-space).
     float dist = length(worldPos.xyz - gFrameData.eyePos.xyz);

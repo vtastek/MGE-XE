@@ -70,6 +70,7 @@ namespace IPC {
         std::uint32_t slot;
         float         world[16];
         std::uint32_t texIndex;   // bindless gTextures[] slot for the base map (0 = default white)
+        float         alphaRef;   // alpha-test reference 0..1 (0 = no alpha test; frag discards a < ref)
     };
 
     // Texture-residency upload (Phase 2 bindless texturing). The client resolves each unique
@@ -101,6 +102,7 @@ namespace IPC {
         std::uint32_t numBones;
         std::uint32_t mirror;        // 1 = mirrored (negative-determinant); pick CW pipeline
         std::uint32_t texIndex;      // bindless gTextures[] slot for the base map (0 = default white)
+        float         alphaRef;      // alpha-test reference 0..1 (0 = no alpha test; frag discards a < ref)
     };
 
 #pragma pack(pop)

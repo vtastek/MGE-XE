@@ -13,7 +13,7 @@ STRUCT(VSInput)
     DATA(float2, Uv,        TEXCOORD0);    // per-vertex: base-map UV
     DATA(float4, Color,     COLOR);        // per-vertex: DiffAmb colour (white when unused)
     DATA(uint,   DrawIndex, TEXCOORD1);    // per-instance: index into gWorlds (instance buf .x)
-    DATA(uint,   TexIndex,  TEXCOORD2);    // per-instance: bindless gTextures slot (instance buf .y)
+    DATA(uint,   TexAlpha,  TEXCOORD2);    // per-instance packed: texIndex (low 16) | alphaRef*255 (bits 16-23)
 };
 
 STRUCT(VSOutput)
@@ -24,6 +24,7 @@ STRUCT(VSOutput)
     DATA(FLAT(uint),  TexIndex, TEXCOORD1);
     DATA(float,       Fog,      TEXCOORD2);   // MW fog scalar (1 = clear, 0 = full fogColNear)
     DATA(float4,      Color,    COLOR);       // per-vertex DiffAmb colour (shared opaque.frag)
+    DATA(float,       AlphaRef, TEXCOORD3);   // alpha-test ref 0..1 (shared opaque.frag; 0 = no test)
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -40,7 +41,9 @@ VSOutput VS_MAIN( VSInput In )
     Out.Position = mul(gFrameData.viewProj, worldPos);
     Out.Normal = mul((float3x3)world, In.Normal);
     Out.Uv = In.Uv;
-    Out.TexIndex = In.TexIndex;
+    // Unpack the per-instance texIndex (low 16) + alpha-test ref (bits 16-23, /255).
+    Out.TexIndex = In.TexAlpha & 0xFFFFu;
+    Out.AlphaRef = float((In.TexAlpha >> 16u) & 0xFFu) * (1.0f / 255.0f);
     Out.Color = In.Color;
     // MW near fog (per-vertex, as FFE): dist is camera distance = |worldPos - eye| (the view
     // transform is rigid, so this equals length(viewpos)). fog = saturate((end-dist)/(end-start)).
