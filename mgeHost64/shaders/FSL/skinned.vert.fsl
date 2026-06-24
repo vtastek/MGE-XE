@@ -39,6 +39,7 @@ STRUCT(VSOutput)
     DATA(FLAT(float3),MatEmissive,TEXCOORD6); // vColSource==2 branch to white*(d+a) = current fidelity.
     DATA(FLAT(uint),  VColSource, TEXCOORD7);
     DATA(float3,      WorldPos,   TEXCOORD8); // Tier 3a: world position for point-light eval
+    DATA(FLAT(uint),  OverlayIndex,TEXCOORD9);// MUST match opaque.frag input sig; skinned = 0 (never terrain)
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -83,6 +84,7 @@ VSOutput VS_MAIN( VSInput In )
     Out.MatAmbient  = float3(1.0f, 1.0f, 1.0f);
     Out.MatEmissive = float3(0.0f, 0.0f, 0.0f);
     Out.VColSource  = 2u;
+    Out.OverlayIndex = 0u;   // skinned parts are never terrain — gates opaque.frag's decal splat off
     // MW near fog, same per-vertex form as opaque.vert (palette is already world-space).
     float dist = length(worldPos.xyz - gFrameData.eyePos.xyz);
     Out.Fog = saturate((gFrameData.fogParams.y - dist)

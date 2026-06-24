@@ -844,6 +844,11 @@ namespace {
 
             item.slot = ks->second;
             item.texIndex = resolveTextureSlot(e.textureName);   // bindless base map (0 = white)
+            // Terrain DECAL_1 overlay (second land texture). resolveTextureSlot ships its DDS
+            // bytes the same way as the base map. Non-landscape / single-texture draws get 0,
+            // which gates the frag's splat off → byte-for-byte unchanged.
+            item.overlayTexIndex = (e.isLandscape && e.d3dOverlay && e.overlayTextureName)
+                ? resolveTextureSlot(e.overlayTextureName) : 0u;
             item.alphaRef = e.alphaTest ? e.alphaRef : 0.0f;     // alpha-test cutout (0 = no test)
             // Tier 2b material: ship the captured MaterialProperty colours + the vertex-colour
             // routing, replicating buildCacheReflectionState/buildCacheMainState EXACTLY. useVCol

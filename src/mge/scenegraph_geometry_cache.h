@@ -68,6 +68,10 @@ namespace MGE::GeometryCache {
         // alpha. Null for non-terrain / single-texture tiles. Drives the cache
         // terrain reflection's two-texture splat.
         IDirect3DTexture9* d3dOverlay;
+        // DECAL_1 overlay source filename (SourceTexture::fileName), for resolving the
+        // overlay to a Forge bindless slot. Null when no overlay. The D3D9 cache terrain
+        // pass uses d3dOverlay above; the Forge path needs the name to upload/resolve.
+        const char*        overlayTextureName;
         // Multi-map texturing (e.g. "Glow in the Dark" night windows): the base
         // map's DARK/DETAIL/GLOW siblings on the same NiTexturingProperty. Each is
         // null when absent; *UV is the cached UV set the map samples (clamped to

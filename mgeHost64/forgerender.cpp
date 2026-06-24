@@ -919,9 +919,10 @@ namespace {
     // Static per-instance VB stride (uint32 slots). Tier 2b grew it past the old uint2:
     //   [0] DrawIndex (identity, set once)   [1] TexAlpha (tex|alphaRef|vColSource, per-frame)
     //   [2..4] matDiffuse.rgb (float)        [5..7] matAmbient.rgb (float)   [8..10] matEmissive.rgb (float)
-    // 11 * 4 = 44 bytes. The material rides the instance VB (not a new cbuffer/descriptor set)
-    // to avoid the FSL descriptor-offset gotcha that hoisted the sampler — see opaque.srt.h.
-    constexpr uint32_t kStaticInstU32 = 11;
+    //   [11] OverlayIndex (terrain DECAL_1 bindless slot, 0 = no decal; per-frame)
+    // 12 * 4 = 48 bytes. The material + overlay ride the instance VB (not a new cbuffer/descriptor
+    // set) to avoid the FSL descriptor-offset gotcha that hoisted the sampler — see opaque.srt.h.
+    constexpr uint32_t kStaticInstU32 = 12;
 
     // Pack the per-draw instance .y: texIndex in the low 16 bits (slots < kMaxTextures=1024,
     // so ≤10 bits), the alpha-test reference quantised to a byte in bits 16-23, and the
@@ -1023,7 +1024,7 @@ namespace {
         vl.mBindings[0].mRate = VERTEX_BINDING_RATE_VERTEX;
         vl.mBindings[1].mStride = kStaticInstU32 * sizeof(uint32_t);   // {DrawIndex, TexAlpha, matDiff3, matAmb3, matEmis3}
         vl.mBindings[1].mRate = VERTEX_BINDING_RATE_INSTANCE;
-        vl.mAttribCount = 9;
+        vl.mAttribCount = 10;
         vl.mAttribs[0].mSemantic = SEMANTIC_POSITION;
         vl.mAttribs[0].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
         vl.mAttribs[0].mBinding = 0;
@@ -1069,6 +1070,11 @@ namespace {
         vl.mAttribs[8].mBinding = 1;
         vl.mAttribs[8].mLocation = 8;
         vl.mAttribs[8].mOffset = 8 * sizeof(uint32_t);
+        vl.mAttribs[9].mSemantic = SEMANTIC_TEXCOORD6;       // OverlayIndex (per-instance: terrain DECAL_1 slot)
+        vl.mAttribs[9].mFormat = TinyImageFormat_R32_UINT;
+        vl.mAttribs[9].mBinding = 1;
+        vl.mAttribs[9].mLocation = 9;
+        vl.mAttribs[9].mOffset = 11 * sizeof(uint32_t);
 
         DepthStateDesc depthDesc = {};
         depthDesc.mDepthTest = true;
@@ -2030,6 +2036,8 @@ namespace ForgeRender {
             finst[local * kStaticInstU32 + 8] = items[i].matEmissive[0];
             finst[local * kStaticInstU32 + 9] = items[i].matEmissive[1];
             finst[local * kStaticInstU32 + 10] = items[i].matEmissive[2];
+            // Terrain DECAL_1 overlay slot (0 = no decal → frag splat gated off, non-terrain unchanged).
+            inst[local * kStaticInstU32 + 11] = items[i].overlayTexIndex;
         }
 
         resetCmdPool(R, g_live.pCmdPool);

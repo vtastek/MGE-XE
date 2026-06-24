@@ -17,6 +17,7 @@ STRUCT(VSInput)
     DATA(float3, MatDiffuse, TEXCOORD3);    // per-instance: material diffuse rgb
     DATA(float3, MatAmbient, TEXCOORD4);    // per-instance: material ambient rgb
     DATA(float3, MatEmissive,TEXCOORD5);    // per-instance: material emissive rgb
+    DATA(uint,   OverlayIndex,TEXCOORD6);   // per-instance: terrain DECAL_1 bindless slot (0 = none)
 };
 
 STRUCT(VSOutput)
@@ -33,6 +34,7 @@ STRUCT(VSOutput)
     DATA(FLAT(float3),MatEmissive,TEXCOORD6);
     DATA(FLAT(uint),  VColSource, TEXCOORD7); // 0 none, 1 emissive, 2 diffamb
     DATA(float3,      WorldPos,   TEXCOORD8); // Tier 3a: world position for point-light eval
+    DATA(FLAT(uint),  OverlayIndex,TEXCOORD9);// terrain DECAL_1 bindless slot (0 = no decal)
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -58,6 +60,7 @@ VSOutput VS_MAIN( VSInput In )
     Out.MatDiffuse  = In.MatDiffuse;
     Out.MatAmbient  = In.MatAmbient;
     Out.MatEmissive = In.MatEmissive;
+    Out.OverlayIndex = In.OverlayIndex;   // terrain DECAL_1 slot (0 = no decal)
     // MW near fog (per-vertex, as FFE): dist is camera distance = |worldPos - eye| (the view
     // transform is rigid, so this equals length(viewpos)). fog = saturate((end-dist)/(end-start)).
     float dist = length(worldPos.xyz - gFrameData.eyePos.xyz);

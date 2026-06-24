@@ -1023,7 +1023,8 @@ STRUCT(VSOutput)
     DATA(FLAT(float3),MatEmissive,TEXCOORD6);
     DATA(FLAT(uint), VColSource, TEXCOORD7);
     DATA(float3, WorldPos, TEXCOORD8);
-#line 26
+    DATA(FLAT(uint), OverlayIndex,TEXCOORD9);
+#line 27
 };
 
 
@@ -1102,6 +1103,16 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
     float4 albedo = SampleTex2D(gTextures[In.TexIndex], gSamplerAnisotropic, In.Uv);
+
+
+
+
+
+
+    if (In.OverlayIndex != 0u) {
+        float3 ov = SampleTex2D(gTextures[In.OverlayIndex], gSamplerAnisotropic, In.Uv).rgb;
+        albedo.rgb = lerp(albedo.rgb, ov, In.Color.a);
+    }
 
 
 

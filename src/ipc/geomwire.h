@@ -91,6 +91,10 @@ namespace IPC {
         float         matAmbient[3];
         float         matEmissive[3];
         std::uint32_t vColSource;  // 0 none (const material), 1 emissive (vcol->emissive), 2 diffamb (vcol->d+a)
+        // Terrain DECAL_1 overlay: bindless gTextures[] slot for the second land texture,
+        // blended over the base by vcol ALPHA (the AlphaGrid). 0 = no decal / non-terrain
+        // (the frag's splat is gated off when this is 0, so every other draw is unchanged).
+        std::uint32_t overlayTexIndex;
     };
 
     // Texture-residency upload (Phase 2 bindless texturing). The client resolves each unique

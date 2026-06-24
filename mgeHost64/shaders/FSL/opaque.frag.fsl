@@ -23,6 +23,7 @@ STRUCT(VSOutput)
     DATA(FLAT(float3),MatEmissive,TEXCOORD6);
     DATA(FLAT(uint),  VColSource, TEXCOORD7); // 0 none, 1 emissive, 2 diffamb
     DATA(float3,      WorldPos,   TEXCOORD8); // Tier 3a: world position for point-light eval
+    DATA(FLAT(uint),  OverlayIndex,TEXCOORD9);// terrain DECAL_1 bindless slot (0 = no decal)
 };
 
 // Static semi-HDR tonemap — ported verbatim from XE FixedFuncEmu.fx::tonemap.
@@ -101,6 +102,16 @@ float4 PS_MAIN( VSOutput In )
     // s0 (= null sampler => POINT filter + non-REPEAT address => tiled UVs sample black). A static
     // sampler sidesteps that entirely. See opaque.srt.h.
     float4 albedo = SampleTex2D(gTextures[In.TexIndex], gSamplerAnisotropic, In.Uv);
+
+    // Terrain DECAL_1 splat — replicates cacheTerrainLitColor (XE Mod Landscape Lit.fx):
+    //   albedo = lerp(base, overlay, vcol.a)   (overlay shares uv0; vcol ALPHA = AlphaGrid).
+    // Gated on OverlayIndex != 0 so every non-terrain / single-texture draw is byte-for-byte
+    // unchanged. Lands BEFORE the alpha test and c = albedo.rgb * lit, so terrain computes
+    // lerp(base,overlay,vcol.a) * vcol.rgb*(d+a) — matching the D3D9 oracle.
+    if (In.OverlayIndex != 0u) {
+        float3 ov = SampleTex2D(gTextures[In.OverlayIndex], gSamplerAnisotropic, In.Uv).rgb;
+        albedo.rgb = lerp(albedo.rgb, ov, In.Color.a);
+    }
 
     // Alpha test (cutout foliage/grates/fences). MW drives this per-part via D3DRS_ALPHAREF
     // with GREATER; we approximate with GREATEREQUAL (keep a >= ref). Strict '<' means a ref of

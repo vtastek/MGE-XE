@@ -80,6 +80,7 @@ namespace MGE::GeometryCache {
             e.d3dGlow     = nullptr;
             e.baseUV = e.darkUV = e.detailUV = e.glowUV = 0;
             e.textureName = nullptr;
+            e.overlayTextureName = nullptr;
             e.darkTextureName = e.detailTextureName = e.glowTextureName = nullptr;
             e.alphaRef    = 0.0f;
             e.alphaTest   = false;
@@ -159,6 +160,9 @@ namespace MGE::GeometryCache {
                         auto* dtex = decalMap->texture.get();
                         if (dtex->isInstanceOfType(NI::RTTIStaticPtr::NiSourceTexture)) {
                             e.d3dOverlay = getDX9Texture(dtex);
+                            // Record the overlay source filename so the Forge path can
+                            // resolve it to a bindless slot (same cast captureMap uses).
+                            e.overlayTextureName = static_cast<NI::SourceTexture*>(dtex)->fileName;
                         }
                     }
                 }
