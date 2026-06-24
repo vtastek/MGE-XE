@@ -614,8 +614,12 @@ void DistantLand::renderStage1() {
                 effect->EndPass();
             }
 
-            // Overlay shadow onto Morrowind objects
-            if ((Configuration.MGEFlags & USE_SHADOWS) && mwBridge->CellHasWeather()) {
+            // Overlay shadow onto Morrowind objects. Skipped when the Forge seam owns the
+            // opaque world: the receiver re-draws recordMW geometry to darken the backbuffer,
+            // but the Forge composite (end of scene 0) overwrites exactly those covered pixels
+            // — pure waste. Shadows return host-side once Forge owns more of the pipeline.
+            if ((Configuration.MGEFlags & USE_SHADOWS) && mwBridge->CellHasWeather()
+                && !RenderProcess::ownsOpaqueWorld()) {
                 // CACHE mode: the cache owns scene-0 textured-opaque color/depth at the
                 // snapshot pose. renderShadow() skips that set (skipCacheCovered); its sun
                 // shadow is folded into the cache color passes (renderCachedOpaque /
@@ -651,7 +655,11 @@ void DistantLand::renderStage2() {
         return;
     }
 
-    if (!isRenderCached) {
+    // Skip in Forge mode too: this entire block is the recorded-render shadow receiver +
+    // recorded depth replay (renderDepthAdditional), both superseded — depth now comes from
+    // the cache (renderCacheDepthToMainZ + the depth-texture cache pass) and shadows are
+    // deferred host-side. recordMW capture / recordSky / the clear below are untouched.
+    if (!isRenderCached && !RenderProcess::ownsOpaqueWorld()) {
         // Save state block manually since we can change FVF/decl
         device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
 
