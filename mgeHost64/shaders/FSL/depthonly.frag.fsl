@@ -1,0 +1,46 @@
+// mgeHost64 — Z-prepass fragment stage (depth-only, alpha-tested).
+//
+// Phase 1 depth-takeover (tasks/forge-depth-ssao.md): the near opaque set is rendered DEPTH
+// ONLY first, so depth is complete before any shading (GTAO + early-Z colour follow). This PS
+// writes NO colour — its pipeline binds mRenderTargetCount=0 — it exists ONLY to run the SAME
+// alpha test the colour pass does (opaque.frag:119), so cutout foliage/grates write depth at
+// exactly the pixels they'd shade. That parity is what lets the colour pass use CMP_EQUAL.
+//
+// Shared by the opaque AND skinned prepass pipelines: opaque.vert and skinned.vert emit an
+// IDENTICAL VSOutput, so this one frag links against both (same discipline as opaque.frag —
+// see [[project_forge_shared_frag_vsoutput]]). Declares the full shared struct to guarantee a
+// matched signature; reads only Uv / TexIndex / AlphaRef.
+//
+// Convention (void PS_MAIN + clip + RETURN(), 0 render targets) is The Forge's own depth-pass
+// pattern (Examples_3/.../VisibilityBufferMeshDepthPassAlpha.frag.fsl).
+
+#include "opaque.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4,      Position, SV_Position);
+    DATA(float3,      Normal,   NORMAL);
+    DATA(float2,      Uv,       TEXCOORD0);
+    DATA(FLAT(uint),  TexIndex, TEXCOORD1);
+    DATA(float,       Fog,      TEXCOORD2);
+    DATA(float4,      Color,    COLOR);
+    DATA(float,       AlphaRef, TEXCOORD3);
+    DATA(FLAT(float3),MatDiffuse, TEXCOORD4);
+    DATA(FLAT(float3),MatAmbient, TEXCOORD5);
+    DATA(FLAT(float3),MatEmissive,TEXCOORD6);
+    DATA(FLAT(uint),  VColSource, TEXCOORD7);
+    DATA(float3,      WorldPos,   TEXCOORD8);
+    DATA(FLAT(uint),  OverlayIndex,TEXCOORD9);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+void PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    // Same test as opaque.frag: discard where albedo.a < AlphaRef (ref 0 = never discards, so
+    // pure-opaque draws keep every pixel). Strict '<' must MATCH the colour pass exactly or
+    // cutout edges fail the EQUAL test in the colour pass.
+    float a = SampleTex2D(gTextures[In.TexIndex], gSamplerAnisotropic, In.Uv).a;
+    clip(a < In.AlphaRef ? -1.0f : 1.0f);
+    RETURN();
+}

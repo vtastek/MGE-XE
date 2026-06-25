@@ -1,0 +1,56 @@
+// mgeHost64 — Z-prepass fragment stage for the MULTI-MAP path (depth-only, alpha-tested).
+//
+// Phase 1 Tier 1b: multi-map parts join the depth prepass so full-scene depth is complete
+// before shading. multimap.vert emits a DIFFERENT VSOutput than opaque/skinned (4 UV sets +
+// packed stages), so it needs its own depth-only frag — this one — declaring multimap.vert's
+// full output struct (must stay matched, like multimap.frag).
+//
+// Replicates multimap.frag's coverage EXACTLY: the alpha test runs on the BASE stage (op==0),
+// sampling that stage's texture+UV alpha and discarding when baseA < alphaRef. Writes NO colour
+// (pipeline binds mRenderTargetCount=0). Same void PS + clip + RETURN() depth-pass convention.
+
+#include "opaque.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4,      Position, SV_Position);
+    DATA(float3,      Normal,   NORMAL);
+    DATA(float2,      Uv0,      TEXCOORD0);
+    DATA(float2,      Uv1,      TEXCOORD1);
+    DATA(float2,      Uv2,      TEXCOORD2);
+    DATA(float2,      Uv3,      TEXCOORD3);
+    DATA(float,       Fog,      TEXCOORD4);
+    DATA(float4,      Color,    COLOR);
+    DATA(FLAT(float3),MatDiffuse, TEXCOORD5);
+    DATA(FLAT(float3),MatAmbient, TEXCOORD6);
+    DATA(FLAT(float3),MatEmissive,TEXCOORD7);
+    DATA(float3,      WorldPos,   TEXCOORD8);
+    DATA(FLAT(uint4), Stages,     TEXCOORD9);
+    DATA(FLAT(uint),  Packed,     TEXCOORD10);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+void PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    uint  stageCount = In.Packed & 0x7u;
+    float alphaRef   = float((In.Packed >> 8u) & 0xFFu) * (1.0f / 255.0f);
+    float baseA = 1.0f;
+    // Find the BASE stage (op==0) and read its alpha — same as multimap.frag's baseA path.
+    for (uint s = 0u; s < 4u; ++s)
+    {
+        if (s >= stageCount) { break; }
+        uint sw = (s == 0u) ? In.Stages.x : (s == 1u) ? In.Stages.y
+                : (s == 2u) ? In.Stages.z : In.Stages.w;
+        uint op = (sw >> 18u) & 0x3u;
+        if (op == 0u) {
+            uint   tex   = sw & 0xFFFFu;
+            uint   uvSet = (sw >> 16u) & 0x3u;
+            float2 uv = (uvSet == 0u) ? In.Uv0 : (uvSet == 1u) ? In.Uv1
+                      : (uvSet == 2u) ? In.Uv2 : In.Uv3;
+            baseA = SampleTex2D(gTextures[tex], gSamplerAnisotropic, uv).a;
+        }
+    }
+    clip(baseA < alphaRef ? -1.0f : 1.0f);
+    RETURN();
+}

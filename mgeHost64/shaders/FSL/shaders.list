@@ -28,6 +28,14 @@
 #include "opaque.frag.fsl"
 #end
 
+#frag depthonly.frag
+#include "depthonly.frag.fsl"
+#end
+
+#frag depthonly_mm.frag
+#include "depthonly_mm.frag.fsl"
+#end
+
 #vert skinned.vert
 #include "skinned.vert.fsl"
 #end

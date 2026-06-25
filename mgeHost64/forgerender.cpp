@@ -760,6 +760,12 @@ namespace {
         Shader*        pOpaqueShader = nullptr;
         Pipeline*      pOpaquePipeline = nullptr;        // FRONT_FACE_CCW (non-mirrored)
         Pipeline*      pOpaquePipelineMirror = nullptr;  // FRONT_FACE_CW (negative-determinant world)
+        // Phase 1 depth-takeover (tasks/forge-depth-ssao.md): Z-prepass. Same opaque.vert + the
+        // depth-only alpha frag (depthonly.frag), GEQUAL + depthWrite, NO colour target. Run
+        // first so depth is complete before the colour pass (which switches to EQUAL + no-write).
+        Shader*        pDepthOnlyShader = nullptr;
+        Pipeline*      pOpaquePrepassPipeline = nullptr;        // FRONT_FACE_CCW, depth-only
+        Pipeline*      pOpaquePrepassPipelineMirror = nullptr;  // FRONT_FACE_CW, depth-only
         DescriptorSet* pPerFrameSet = nullptr;    // gFrameData cbuffer (viewProj), 1 instance
         DescriptorSet* pPerBatchSet = nullptr;    // gBatch cbuffer window, kMaxBatches instances
         Buffer*        pFrameCbv = nullptr;        // gFrameData cbuffer (viewProj), persistent-mapped
@@ -789,6 +795,10 @@ namespace {
         Shader*        pSkinnedShader = nullptr;
         Pipeline*      pSkinnedPipeline = nullptr;       // FRONT_FACE_CCW (non-mirrored)
         Pipeline*      pSkinnedPipelineMirror = nullptr; // FRONT_FACE_CW (mirrored, neg-determinant bones)
+        // Tier 1b Z-prepass: skinned.vert + the shared depthonly.frag (skinned VSOutput == opaque's),
+        // GEQUAL + depthWrite, 0 RTs. Skinned COLOUR pipelines flip to CMP_EQUAL + no-write.
+        Pipeline*      pSkinnedPrepassPipeline = nullptr;
+        Pipeline*      pSkinnedPrepassPipelineMirror = nullptr;
         Buffer*        pBonesBuf[16] = {};               // bone windows: one 64KB cbuffer per window, persistent-mapped
         DescriptorSet* pPerBatchSetSkin = nullptr;       // gBatch bound to pBonesBuf[], kMaxBatches instances
         // Skinned instance-rate VB of uint2 { .x = Base (bone offset in window), .y = texIndex }.
@@ -804,6 +814,11 @@ namespace {
         Shader*        pMultiMapShader = nullptr;
         Pipeline*      pMultiMapPipeline = nullptr;        // FRONT_FACE_CCW (non-mirrored)
         Pipeline*      pMultiMapPipelineMirror = nullptr;  // FRONT_FACE_CW (mirrored world)
+        // Tier 1b Z-prepass: multimap.vert + depthonly_mm.frag (own VSOutput, base-stage alpha
+        // test), GEQUAL + depthWrite, 0 RTs. Multi-map COLOUR pipelines flip to CMP_EQUAL + no-write.
+        Shader*        pMultiMapDepthShader = nullptr;
+        Pipeline*      pMultiMapPrepassPipeline = nullptr;
+        Pipeline*      pMultiMapPrepassPipelineMirror = nullptr;
         Buffer*        pMMWorldsBuf = nullptr;             // gBatch: one 64KB world window, persistent-mapped
         DescriptorSet* pPerBatchSetMM = nullptr;           // gBatch bound to pMMWorldsBuf, 1 instance
         // Per-draw instance VB (kMMInstU32 uint32 slots): { Meta, stages[4], matDiff3, matAmb3, matEmis3 },
@@ -1076,10 +1091,15 @@ namespace {
         vl.mAttribs[9].mLocation = 9;
         vl.mAttribs[9].mOffset = 11 * sizeof(uint32_t);
 
+        // COLOUR-pass depth (Phase 1 early-Z): the Z-prepass already wrote every opaque pixel's
+        // depth, so the colour pass only MATCHES it — CMP_EQUAL + depthWrite OFF = true early-Z,
+        // zero shaded overdraw. Correct only because prepass and colour share opaque.vert, so
+        // SV_Position is bit-identical (same matrices + reverse-Z post-mul). See the prepass
+        // pipeline below (GEQUAL + write) and tasks/forge-depth-ssao.md.
         DepthStateDesc depthDesc = {};
         depthDesc.mDepthTest = true;
-        depthDesc.mDepthWrite = true;
-        depthDesc.mDepthFunc = CMP_GEQUAL;   // REVERSE-Z: near=1, far=0 → keep the larger (closer) z
+        depthDesc.mDepthWrite = false;
+        depthDesc.mDepthFunc = CMP_EQUAL;
 
         RasterizerStateDesc rasterDesc = {};
         // Backface culling — the proven D3D9 cache color pass culls (drawEntry: mirrored ?
@@ -1124,6 +1144,51 @@ namespace {
         if (!g_live.pOpaquePipelineMirror) {
             std::printf("[forge] addPipeline(opaque mirror) FAILED\n");
             return false;
+        }
+
+        // --- Phase 1 Z-prepass pipelines (opaque.vert + depthonly.frag) -----------------
+        // Depth-only: GEQUAL + depthWrite ON, NO colour target (mRenderTargetCount = 0, the
+        // Forge depth-pass convention). Reuses the SAME vertex layout (vl) + rasterizer states
+        // as the colour pipelines, so SV_Position is bit-identical → the colour pass's CMP_EQUAL
+        // matches. Runs first in renderScene to complete opaque depth before any shading.
+        {
+            ShaderLoadDesc dpDesc = {};
+            dpDesc.mVert.pFileName = "opaque.vert";
+            dpDesc.mFrag.pFileName = "depthonly.frag";
+            addShader(R, &dpDesc, &g_live.pDepthOnlyShader);
+            if (!g_live.pDepthOnlyShader) {
+                std::printf("[forge] addShader(depthonly) FAILED\n");
+                return false;
+            }
+            DepthStateDesc preDepth = {};
+            preDepth.mDepthTest = true;
+            preDepth.mDepthWrite = true;
+            preDepth.mDepthFunc = CMP_GEQUAL;   // REVERSE-Z write — fills depth for the colour EQUAL test
+
+            PipelineDesc ppd = {};
+            ppd.mType = PIPELINE_TYPE_GRAPHICS;
+            GraphicsPipelineDesc& pg = ppd.mGraphicsDesc;
+            pg.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+            pg.mRenderTargetCount = 0;          // depth-only — no colour attachment
+            pg.pColorFormats = nullptr;
+            pg.mSampleCount = (SampleCount)g_live.sampleCount;
+            pg.mSampleQuality = 0;
+            pg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+            pg.pDepthState = &preDepth;
+            pg.pVertexLayout = &vl;
+            pg.pRasterizerState = &rasterDesc;   // CCW (non-mirrored)
+            pg.pShaderProgram = g_live.pDepthOnlyShader;
+            addPipeline(R, &ppd, &g_live.pOpaquePrepassPipeline);
+            if (!g_live.pOpaquePrepassPipeline) {
+                std::printf("[forge] addPipeline(opaque prepass) FAILED\n");
+                return false;
+            }
+            pg.pRasterizerState = &rasterMirror;   // CW (negative-determinant world)
+            addPipeline(R, &ppd, &g_live.pOpaquePrepassPipelineMirror);
+            if (!g_live.pOpaquePrepassPipelineMirror) {
+                std::printf("[forge] addPipeline(opaque prepass mirror) FAILED\n");
+                return false;
+            }
         }
 
         // gFrameData: small viewProj cbuffer, persistent-mapped (256 = min CBV size).
@@ -1381,7 +1446,7 @@ namespace {
             DepthStateDesc skDepth = {};
             skDepth.mDepthTest = true;
             skDepth.mDepthWrite = true;
-            skDepth.mDepthFunc = CMP_GEQUAL;   // REVERSE-Z (same as static)
+            skDepth.mDepthFunc = CMP_GEQUAL;   // REVERSE-Z (combined depth+colour; skinned not in prepass)
 
             RasterizerStateDesc skRaster = {};
             skRaster.mCullMode = CULL_MODE_BACK;
@@ -1413,6 +1478,41 @@ namespace {
             if (!g_live.pSkinnedPipelineMirror) {
                 std::printf("[forge] addPipeline(skinned mirror) FAILED\n");
                 return false;
+            }
+
+            // Tier 1b skinned Z-prepass pipelines: skinned.vert + the shared depthonly.frag
+            // (skinned VSOutput == opaque's, so it links), GEQUAL + depthWrite, 0 RTs. Same svl
+            // so SV_Position matches the colour pass's EQUAL test.
+            {
+                DepthStateDesc skPreDepth = {};
+                skPreDepth.mDepthTest = true;
+                skPreDepth.mDepthWrite = true;
+                skPreDepth.mDepthFunc = CMP_GEQUAL;
+
+                PipelineDesc skpPd = {};
+                skpPd.mType = PIPELINE_TYPE_GRAPHICS;
+                GraphicsPipelineDesc& spg = skpPd.mGraphicsDesc;
+                spg.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+                spg.mRenderTargetCount = 0;
+                spg.pColorFormats = nullptr;
+                spg.mSampleCount = (SampleCount)g_live.sampleCount;
+                spg.mSampleQuality = 0;
+                spg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+                spg.pDepthState = &skPreDepth;
+                spg.pVertexLayout = &svl;
+                spg.pRasterizerState = &skRaster;            // CCW
+                spg.pShaderProgram = g_live.pDepthOnlyShader;
+                addPipeline(R, &skpPd, &g_live.pSkinnedPrepassPipeline);
+                if (!g_live.pSkinnedPrepassPipeline) {
+                    std::printf("[forge] addPipeline(skinned prepass) FAILED\n");
+                    return false;
+                }
+                spg.pRasterizerState = &skRasterMirror;       // CW
+                addPipeline(R, &skpPd, &g_live.pSkinnedPrepassPipelineMirror);
+                if (!g_live.pSkinnedPrepassPipelineMirror) {
+                    std::printf("[forge] addPipeline(skinned prepass mirror) FAILED\n");
+                    return false;
+                }
             }
 
             // Bone windows: ONE exactly-64KB cbuffer per window (same CBV rule as worlds).
@@ -1526,7 +1626,7 @@ namespace {
             DepthStateDesc mmDepth = {};
             mmDepth.mDepthTest = true;
             mmDepth.mDepthWrite = true;
-            mmDepth.mDepthFunc = CMP_GEQUAL;   // REVERSE-Z (same as static)
+            mmDepth.mDepthFunc = CMP_GEQUAL;   // REVERSE-Z (combined depth+colour; multimap not in prepass)
 
             RasterizerStateDesc mmRaster = {};
             mmRaster.mCullMode = CULL_MODE_BACK;
@@ -1557,6 +1657,49 @@ namespace {
             if (!g_live.pMultiMapPipelineMirror) {
                 std::printf("[forge] addPipeline(multimap mirror) FAILED\n");
                 return false;
+            }
+
+            // Tier 1b multi-map Z-prepass: multimap.vert + depthonly_mm.frag (own VSOutput,
+            // base-stage alpha test), GEQUAL + depthWrite, 0 RTs. Same mvl → SV_Position matches
+            // the colour pass's EQUAL test.
+            {
+                ShaderLoadDesc mmdDesc = {};
+                mmdDesc.mVert.pFileName = "multimap.vert";
+                mmdDesc.mFrag.pFileName = "depthonly_mm.frag";
+                addShader(R, &mmdDesc, &g_live.pMultiMapDepthShader);
+                if (!g_live.pMultiMapDepthShader) {
+                    std::printf("[forge] addShader(depthonly_mm) FAILED\n");
+                    return false;
+                }
+                DepthStateDesc mmPreDepth = {};
+                mmPreDepth.mDepthTest = true;
+                mmPreDepth.mDepthWrite = true;
+                mmPreDepth.mDepthFunc = CMP_GEQUAL;
+
+                PipelineDesc mmpPd = {};
+                mmpPd.mType = PIPELINE_TYPE_GRAPHICS;
+                GraphicsPipelineDesc& mpg = mmpPd.mGraphicsDesc;
+                mpg.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+                mpg.mRenderTargetCount = 0;
+                mpg.pColorFormats = nullptr;
+                mpg.mSampleCount = (SampleCount)g_live.sampleCount;
+                mpg.mSampleQuality = 0;
+                mpg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+                mpg.pDepthState = &mmPreDepth;
+                mpg.pVertexLayout = &mvl;
+                mpg.pRasterizerState = &mmRaster;            // CCW
+                mpg.pShaderProgram = g_live.pMultiMapDepthShader;
+                addPipeline(R, &mmpPd, &g_live.pMultiMapPrepassPipeline);
+                if (!g_live.pMultiMapPrepassPipeline) {
+                    std::printf("[forge] addPipeline(multimap prepass) FAILED\n");
+                    return false;
+                }
+                mpg.pRasterizerState = &mmRasterMirror;       // CW
+                addPipeline(R, &mmpPd, &g_live.pMultiMapPrepassPipelineMirror);
+                if (!g_live.pMultiMapPrepassPipelineMirror) {
+                    std::printf("[forge] addPipeline(multimap prepass mirror) FAILED\n");
+                    return false;
+                }
             }
 
             // One 64KB world window (a valid full CBV; kMaxMultiMap=256 <= 1024 matrices).
@@ -2058,21 +2201,10 @@ namespace ForgeRender {
             cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &toRT);
         }
 
-        BindRenderTargetsDesc bind = {};
-        bind.mRenderTargetCount = 1;
-        bind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_CLEAR };
-        bind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_CLEAR };
-        cmdBindRenderTargets(g_live.pCmd, &bind);
-        cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
-        cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
-        // Bind a pipeline FIRST — in Forge D3D12 cmdBindPipeline establishes the root
-        // signature, which the descriptor-set binds below require. (Binding PerFrame before
-        // any pipeline hung the GPU: root args never set.) Start on the non-mirror pipeline;
-        // the loop switches to the mirror variant per draw as needed.
-        cmdBindPipeline(g_live.pCmd, g_live.pOpaquePipeline);
-        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
-        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);    // Tier 3a point lights
-        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);   // bindless gTextures (static sampler)
+        // Phase 1 depth-takeover: classify + fill the indirect args FIRST, with NO render target
+        // bound yet. BOTH the Z-prepass and the colour pass replay the same arena groups, so the
+        // classification is computed once here; each pass binds its own targets/pipeline below
+        // (prepass depth-only first, then colour). (tasks/forge-depth-ssao.md)
 
         // GPU-driven static draws (ExecuteIndirect). Consolidation already put every static
         // non-skinned part in the shared mega VB/IB; now we also collapse the ~2667 per-part
@@ -2142,6 +2274,87 @@ namespace ForgeRender {
             a.mStartInstance = t.local;
         }
 
+        // ===================== Z-PREPASS (depth-only, opaque set) =====================
+        // Replay the SAME arena groups + dynamic-morph parts through the depth-only pipeline
+        // (opaque.vert + depthonly.frag, GEQUAL + depthWrite, NO colour target), so opaque depth
+        // is complete before the colour pass. The colour pass then LOADs this depth and tests
+        // CMP_EQUAL (true early-Z). No depth barrier: depth stays DEPTH_WRITE (skinned/multimap
+        // still write it in the colour pass) and is read as a DSV, not an SRV — coherent across
+        // the two passes. (Skinned/multimap are NOT in the prepass yet — Tier 1b; they keep
+        // their combined depth+colour draw, which still renders correctly.)
+        {
+            BindRenderTargetsDesc pbind = {};
+            pbind.mRenderTargetCount = 0;
+            pbind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_CLEAR };
+            cmdBindRenderTargets(g_live.pCmd, &pbind);
+            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+            cmdBindPipeline(g_live.pCmd, g_live.pOpaquePrepassPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);     // gFrameData viewProj
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);   // bindless gTextures (alpha test)
+
+            int preMirror = 0;
+            for (uint32_t mir = 0; mir < 2; ++mir) {
+                bool anyInMirror = false;
+                for (uint32_t b = 0; b < kMaxBatches; ++b) { if (groupCount[mir][b]) { anyInMirror = true; break; } }
+                if (!anyInMirror) continue;
+                if ((int)mir != preMirror) {
+                    cmdBindPipeline(g_live.pCmd, mir ? g_live.pOpaquePrepassPipelineMirror
+                                                     : g_live.pOpaquePrepassPipeline);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                    preMirror = (int)mir;
+                }
+                for (uint32_t b = 0; b < kMaxBatches; ++b) {
+                    const uint32_t c = groupCount[mir][b];
+                    if (!c) continue;
+                    cmdBindDescriptorSet(g_live.pCmd, b, g_live.pPerBatchSet);
+                    Buffer*  vbs[2]     = { g_live.pArenaVB, g_live.pInstanceBuf[b] };
+                    uint32_t strides[2] = { vStride, iStride };
+                    cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                    cmdBindIndexBuffer(g_live.pCmd, g_live.pArenaIB, INDEX_TYPE_UINT16, 0);
+                    cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, c, g_live.pIndirectArgs,
+                                       (uint64_t)groupOff[mir][b] * sizeof(IndirectDrawIndexArguments),
+                                       nullptr, 0);
+                }
+            }
+            for (uint32_t i : s_dynamic) {
+                const uint32_t slot  = items[i].slot;
+                const uint32_t batch = i / kBatchSize;
+                const uint32_t local = i % kBatchSize;
+                const int mirror = worldMirrored(items[i].world) ? 1 : 0;
+                if (mirror != preMirror) {
+                    cmdBindPipeline(g_live.pCmd, mirror ? g_live.pOpaquePrepassPipelineMirror
+                                                        : g_live.pOpaquePrepassPipeline);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                    preMirror = mirror;
+                }
+                cmdBindDescriptorSet(g_live.pCmd, batch, g_live.pPerBatchSet);
+                HostMesh& m = g_meshes[slot];
+                Buffer*  vbs[2]     = { m.vb, g_live.pInstanceBuf[batch] };
+                uint32_t strides[2] = { vStride, iStride };
+                cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                cmdBindIndexBuffer(g_live.pCmd, m.ib, INDEX_TYPE_UINT16, 0);
+                cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, 0, 1, 0, local);
+            }
+        }
+
+        // ===================== COLOUR PASS (early-Z: CMP_EQUAL, no depth write) =====================
+        BindRenderTargetsDesc bind = {};
+        bind.mRenderTargetCount = 1;
+        bind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_CLEAR };
+        bind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_LOAD };   // LOAD the prepass depth (no clear)
+        cmdBindRenderTargets(g_live.pCmd, &bind);
+        cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+        cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+        // Bind a pipeline FIRST — cmdBindPipeline establishes the root signature the descriptor
+        // binds need. Start on the non-mirror colour pipeline; the loop switches per draw.
+        cmdBindPipeline(g_live.pCmd, g_live.pOpaquePipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);    // Tier 3a point lights
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);   // bindless gTextures (static sampler)
+
         // Emit: one cmdExecuteIndirect per non-empty group. The arena VB/IB + instance buffer
         // are bound once per group; PerFrame/Persistent persist across the (same-root-sig) PSO
         // switch but are rebound on switch defensively (matches the skinned path).
@@ -2204,9 +2417,6 @@ namespace ForgeRender {
         uint32_t skinnedDrawn = 0;
         if (skinnedBlob && skinnedCount && skinnedBytes &&
             g_live.pSkinnedPipeline && g_live.pSkinnedPipelineMirror) {
-            // Bind the skinned pipeline FIRST (establishes the shared root signature), then
-            // (re)bind PerFrame. Both opaque + skinned pipelines share default.rootsig, so
-            // the descriptor sets persist across the switch.
             cmdBindPipeline(g_live.pCmd, g_live.pSkinnedPipeline);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
@@ -2215,7 +2425,7 @@ namespace ForgeRender {
             const uint8_t* sp  = (const uint8_t*)skinnedBlob;
             const uint8_t* sEnd = sp + skinnedBytes;
             uint32_t boundWindow = UINT32_MAX;
-            int      boundSkinMirror = 0;   // matches the initial pSkinnedPipeline (0 = CCW)
+            int      boundSkinMirror = 0;
             bool     dropLogged = false;
             for (uint32_t k = 0; k < skinnedCount; ++k) {
                 if (sp + sizeof(IPC::SkinnedDrawWire) > sEnd) {
@@ -2249,23 +2459,19 @@ namespace ForgeRender {
 
                 const uint32_t window = skinnedDrawn / kSkinnedPerWindow;
                 const uint32_t base   = (skinnedDrawn % kSkinnedPerWindow) * kMaxBonesPerPart;
-                // Copy this part's palette into bone window `window` at matrix offset base.
                 uint8_t* dst = (uint8_t*)g_live.pBonesBuf[window]->pCpuMappedAddress;
                 std::memcpy(dst + (size_t)base * 64, palette, (size_t)bones * 64);
 
-                // Instance entry skinnedDrawn = { Base = base, packed texIndex+alphaRef }.
-                // firstInstance below selects it; Base resolves gBatch.worlds[Base + BoneIdx].
                 uint32_t* sinst = (uint32_t*)g_live.pInstanceBufSkin->pCpuMappedAddress;
                 sinst[skinnedDrawn * 2 + 0] = base;
                 sinst[skinnedDrawn * 2 + 1] = packTexAlpha(item.texIndex, item.alphaRef);
 
-                // Mirror pipeline by the wire flag (negative-determinant left-side parts).
                 const int mirror = item.mirror ? 1 : 0;
                 if (mirror != boundSkinMirror) {
                     cmdBindPipeline(g_live.pCmd, mirror ? g_live.pSkinnedPipelineMirror
                                                         : g_live.pSkinnedPipeline);
                     boundSkinMirror = mirror;
-                    boundWindow = UINT32_MAX;   // rebind PerBatch after a PSO change (defensive)
+                    boundWindow = UINT32_MAX;
                 }
                 if (window != boundWindow) {
                     cmdBindDescriptorSet(g_live.pCmd, window, g_live.pPerBatchSetSkin);
@@ -2273,12 +2479,10 @@ namespace ForgeRender {
                 }
 
                 HostMesh& sm = g_meshes[slot];
-                // Dedicated skinned instance buffer, indexed by skinnedDrawn (firstInstance below).
                 Buffer*  vbs[2]     = { sm.vb, g_live.pInstanceBufSkin };
                 uint32_t strides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)(2 * sizeof(uint32_t)) };
                 cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
                 cmdBindIndexBuffer(g_live.pCmd, sm.ib, INDEX_TYPE_UINT16, 0);
-                // firstInstance = skinnedDrawn → reads {Base, texIndex} for this part.
                 cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, skinnedDrawn);
                 ++skinnedDrawn;
             }
@@ -2320,11 +2524,9 @@ namespace ForgeRender {
                 }
                 const uint32_t idx = multiMapDrawn;
 
-                // world → the single 64KB window at matrix slot idx.
                 uint8_t* dst = (uint8_t*)g_live.pMMWorldsBuf->pCpuMappedAddress;
                 std::memcpy(dst + (size_t)idx * 64, it.world, 64);
 
-                // Instance entry idx: Meta(DrawIndex|stageCount|vColSource|alphaRef) + stages + material.
                 uint32_t* inst = (uint32_t*)g_live.pInstanceBufMM->pCpuMappedAddress;
                 uint32_t* e = inst + (size_t)idx * kMMInstU32;
                 const uint32_t sc  = (it.stageCount > 4u) ? 4u : it.stageCount;
@@ -2338,7 +2540,6 @@ namespace ForgeRender {
                 fe[8]  = it.matAmbient[0];  fe[9]  = it.matAmbient[1];  fe[10] = it.matAmbient[2];
                 fe[11] = it.matEmissive[0]; fe[12] = it.matEmissive[1]; fe[13] = it.matEmissive[2];
 
-                // Mirror pipeline by world determinant (negative = mirrored left-side part).
                 const int mirror = worldMirrored(it.world) ? 1 : 0;
                 if (mirror != boundMMMirror) {
                     cmdBindPipeline(g_live.pCmd, mirror ? g_live.pMultiMapPipelineMirror
@@ -2964,6 +3165,9 @@ namespace ForgeRender {
         if (g_live.pDefaultWhite)   { removeResource(g_live.pDefaultWhite); }
         if (g_live.pOpaquePipeline) { removePipeline(R, g_live.pOpaquePipeline); }
         if (g_live.pOpaquePipelineMirror) { removePipeline(R, g_live.pOpaquePipelineMirror); }
+        if (g_live.pOpaquePrepassPipeline)       { removePipeline(R, g_live.pOpaquePrepassPipeline); }
+        if (g_live.pOpaquePrepassPipelineMirror) { removePipeline(R, g_live.pOpaquePrepassPipelineMirror); }
+        if (g_live.pDepthOnlyShader) { removeShader(R, g_live.pDepthOnlyShader); }
         if (g_live.pOpaqueShader)   { removeShader(R, g_live.pOpaqueShader); }
         // M-Skinning teardown.
         if (g_live.pPerBatchSetSkin) { removeDescriptorSet(R, g_live.pPerBatchSetSkin); }
@@ -2973,6 +3177,8 @@ namespace ForgeRender {
         if (g_live.pInstanceBufSkin) { removeResource(g_live.pInstanceBufSkin); }
         if (g_live.pSkinnedPipeline)       { removePipeline(R, g_live.pSkinnedPipeline); }
         if (g_live.pSkinnedPipelineMirror) { removePipeline(R, g_live.pSkinnedPipelineMirror); }
+        if (g_live.pSkinnedPrepassPipeline)       { removePipeline(R, g_live.pSkinnedPrepassPipeline); }
+        if (g_live.pSkinnedPrepassPipelineMirror) { removePipeline(R, g_live.pSkinnedPrepassPipelineMirror); }
         if (g_live.pSkinnedShader)         { removeShader(R, g_live.pSkinnedShader); }
         // Tier 4 multi-map teardown.
         if (g_live.pPerBatchSetMM)          { removeDescriptorSet(R, g_live.pPerBatchSetMM); }
@@ -2980,6 +3186,9 @@ namespace ForgeRender {
         if (g_live.pInstanceBufMM)          { removeResource(g_live.pInstanceBufMM); }
         if (g_live.pMultiMapPipeline)       { removePipeline(R, g_live.pMultiMapPipeline); }
         if (g_live.pMultiMapPipelineMirror) { removePipeline(R, g_live.pMultiMapPipelineMirror); }
+        if (g_live.pMultiMapPrepassPipeline)       { removePipeline(R, g_live.pMultiMapPrepassPipeline); }
+        if (g_live.pMultiMapPrepassPipelineMirror) { removePipeline(R, g_live.pMultiMapPrepassPipelineMirror); }
+        if (g_live.pMultiMapDepthShader)    { removeShader(R, g_live.pMultiMapDepthShader); }
         if (g_live.pMultiMapShader)         { removeShader(R, g_live.pMultiMapShader); }
         if (g_live.pMSAAColor)      { removeRenderTarget(R, g_live.pMSAAColor); }
         if (g_live.pDepth)          { removeRenderTarget(R, g_live.pDepth); }
