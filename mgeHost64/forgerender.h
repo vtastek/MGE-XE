@@ -101,6 +101,10 @@ namespace ForgeRender {
                      const void* multiMapBlob, unsigned multiMapCount, unsigned multiMapBytes,
                      const void* lightBlob, unsigned lightCount, unsigned lightBytes);
 
+    // F12 debug view: 0 = normal, 1 = depth (world-distance grayscale), 2 = scatter (client-side).
+    // Stored in a host global and written into FrameData.debugParams.x each renderScene.
+    void setDebugMode(unsigned m);
+
     // Parts actually drawn (slot valid) in the last renderScene — for diagnostics.
     unsigned lastDrawn();
 

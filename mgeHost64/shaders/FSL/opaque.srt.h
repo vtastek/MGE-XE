@@ -30,6 +30,9 @@ STRUCT(FrameData)
     DATA(float4, fogColNear, None);   // xyz = near fog color (lerp target)
     DATA(float4, fogParams,  None);   // x = fogNearStart, y = fogNearEnd
     DATA(float4, eyePos,     None);   // xyz = world camera position (fog distance)
+    // F12 debug view (offset 160B, float index 40). x: 0=normal, 1=depth world-distance grayscale.
+    // Appended after eyePos so every existing field keeps its offset; 176B total < 256B CBV min.
+    DATA(float4, debugParams, None);  // x = debug mode
 };
 
 STRUCT(BatchData)

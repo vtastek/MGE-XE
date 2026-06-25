@@ -294,6 +294,7 @@ namespace IPC {
 			VecId skinnedList, std::uint32_t skinnedCount, std::uint32_t skinnedBytes,
 			VecId multiMapList, std::uint32_t multiMapCount, std::uint32_t multiMapBytes,
 			VecId lightList, std::uint32_t lightCount, std::uint32_t lightBytes,
+			std::uint32_t debugMode = 0,
 			double* outRenderMs = nullptr);
 
 		/**

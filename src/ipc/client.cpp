@@ -426,6 +426,7 @@ namespace IPC {
 		VecId skinnedList, std::uint32_t skinnedCount, std::uint32_t skinnedBytes,
 		VecId multiMapList, std::uint32_t multiMapCount, std::uint32_t multiMapBytes,
 		VecId lightList, std::uint32_t lightCount, std::uint32_t lightBytes,
+		std::uint32_t debugMode,
 		double* outRenderMs) {
 		WAIT_FOR_PREVIOUS_COMMAND;
 
@@ -446,6 +447,7 @@ namespace IPC {
 		params.lightList = lightList;
 		params.lightCount = lightCount;
 		params.lightBytes = lightBytes;
+		params.debugMode = debugMode;
 		params.bytesWritten = 0;
 		params.renderMs = 0.0;
 		if (!beginRpc(Command::RenderFrame)) {

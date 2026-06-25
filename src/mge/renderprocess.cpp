@@ -29,7 +29,7 @@ namespace {
     IPC::Client* g_client = nullptr;
     bool   g_initOk  = false;
     bool   g_enabled = true;           // composite ON by default; F11 toggles it OFF/ON
-    bool   g_debugScatter = false;     // F12 diagnostic: per-object world offset to expose duplicate draws
+    int    g_debugMode = 0;            // F12 diagnostic cycle: 0=normal, 1=depth (world-distance), 2=scatter
     unsigned g_frame = 0;
 
     // --- Feeding-side spike logging --------------------------------------------------
@@ -873,7 +873,7 @@ namespace {
             // world matrix is row-major D3DX (translation in m[12..14]); a fixed offset per
             // slot means duplicates of one object (same or different slot) appear as two
             // separated copies. Hash the slot to a pseudo-random ±range.
-            if (g_debugScatter) {
+            if (g_debugMode == 2) {
                 const std::uint32_t s = ks->second;
                 std::uint32_t h = s * 2654435761u;        // Knuth multiplicative hash
                 auto axis = [&](std::uint32_t shift) {
@@ -1125,8 +1125,9 @@ namespace RenderProcess {
         // is drawn more than once appears as TWO separated copies of the same mesh (a single
         // draw just looks displaced). Reveals duplicate draws regardless of source.
         if (GetAsyncKeyState(VK_F12) & 0x0001) {
-            g_debugScatter = !g_debugScatter;
-            LOG::logline(">> [seam] debug scatter %s", g_debugScatter ? "ON" : "OFF");
+            g_debugMode = (g_debugMode + 1) % 3;
+            const char* name = (g_debugMode == 1) ? "DEPTH" : (g_debugMode == 2) ? "SCATTER" : "NORMAL";
+            LOG::logline(">> [seam] debug mode %d (%s)", g_debugMode, name);
         }
         if (!g_enabled) {
             return;
@@ -1228,7 +1229,8 @@ namespace RenderProcess {
                  haveDraw ? (std::uint32_t)g_drawScratch.size() : 0,
                  skinnedId, skinnedCount, skinnedBytes,
                  multiMapId, (multiMapId != IPC::InvalidVector) ? multiMapCount : 0, multiMapBytes,
-                 lightId, (lightId != IPC::InvalidVector) ? lightCount : 0, lightBytes, &hostMs);
+                 lightId, (lightId != IPC::InvalidVector) ? lightCount : 0, lightBytes,
+                 (std::uint32_t)g_debugMode, &hostMs);
         const double tRender = nowMs();
         if (!ok) {
             return;

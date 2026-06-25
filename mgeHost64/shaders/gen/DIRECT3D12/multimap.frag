@@ -975,13 +975,16 @@ STRUCT(FrameData)
     float4 fogColNear;
     float4 fogParams;
     float4 eyePos;
-#line 33
+
+
+    float4 debugParams;
+#line 36
 };
 
 STRUCT(BatchData)
 {
     float4x4 worlds[ 1024 ];
-#line 38
+#line 41
 };
 
 
@@ -995,7 +998,7 @@ STRUCT(LightData)
 {
     float4 lightParams;
     float4 lights[ 128  * 3];
-#line 51
+#line 54
 };
 
         CBUFFER(FrameData) gFrameData : register( b0 , space1 ) ;
@@ -1004,7 +1007,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLights : register( b0 , space3 ) ;
-#line 75 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 78 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 1024 ] : register( t0 , space0 ) ;
         CBUFFER(BatchData) gBatch : register( b0 , space2 ) ;
 #line 12 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap.frag.fsl"
@@ -1106,6 +1109,12 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
     c = tonemap(c);
     c = lerp(gFrameData.fogColNear.rgb, c, In.Fog);
+
+    if (gFrameData.debugParams.x > 0.5f) {
+        float dist = length(In.WorldPos - gFrameData.eyePos.xyz);
+        float g = saturate(dist * (1.0f / 8192.0f));
+        return (float4(g, g, g, 1.0f));
+    }
     return (float4(c, 1.0f));
 }
 #line 49 "FSL/shaders.list"

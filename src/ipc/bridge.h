@@ -309,6 +309,10 @@ namespace IPC {
         IN std::uint32_t lightCount;
         IN std::uint32_t lightBytes;
 
+        // F12 debug view: 0 = normal, 1 = depth (world-distance grayscale), 2 = scatter.
+        // Appended after the light-list fields so existing field offsets are unchanged.
+        IN std::uint32_t debugMode;
+
         OUT std::uint32_t bytesWritten;
         OUT double renderMs;             // host-side render+readback time
     };

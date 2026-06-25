@@ -796,7 +796,9 @@ namespace {
         Pipeline*      pSkinnedPipeline = nullptr;       // FRONT_FACE_CCW (non-mirrored)
         Pipeline*      pSkinnedPipelineMirror = nullptr; // FRONT_FACE_CW (mirrored, neg-determinant bones)
         // Tier 1b Z-prepass: skinned.vert + the shared depthonly.frag (skinned VSOutput == opaque's),
-        // GEQUAL + depthWrite, 0 RTs. Skinned COLOUR pipelines flip to CMP_EQUAL + no-write.
+        // GEQUAL + depthWrite, 0 RTs. Skinned COLOUR pipelines flip to CMP_EQUAL + no-write. The
+        // depth shader MUST pair skinned.vert (not opaque.vert) with the skinned layout.
+        Shader*        pSkinnedDepthShader = nullptr;
         Pipeline*      pSkinnedPrepassPipeline = nullptr;
         Pipeline*      pSkinnedPrepassPipelineMirror = nullptr;
         Buffer*        pBonesBuf[16] = {};               // bone windows: one 64KB cbuffer per window, persistent-mapped
@@ -1443,10 +1445,11 @@ namespace {
             svl.mAttribs[6].mLocation = 6;
             svl.mAttribs[6].mOffset = 4;
 
+            // BISECT (Tier 1b skinned-only): skinned in the Z-prepass → colour matches with EQUAL.
             DepthStateDesc skDepth = {};
             skDepth.mDepthTest = true;
-            skDepth.mDepthWrite = true;
-            skDepth.mDepthFunc = CMP_GEQUAL;   // REVERSE-Z (combined depth+colour; skinned not in prepass)
+            skDepth.mDepthWrite = false;
+            skDepth.mDepthFunc = CMP_EQUAL;
 
             RasterizerStateDesc skRaster = {};
             skRaster.mCullMode = CULL_MODE_BACK;
@@ -1482,8 +1485,19 @@ namespace {
 
             // Tier 1b skinned Z-prepass pipelines: skinned.vert + the shared depthonly.frag
             // (skinned VSOutput == opaque's, so it links), GEQUAL + depthWrite, 0 RTs. Same svl
-            // so SV_Position matches the colour pass's EQUAL test.
+            // so SV_Position matches the colour pass's EQUAL test. CRITICAL: this MUST use a
+            // skinned.vert shader, NOT pDepthOnlyShader (opaque.vert) — pairing opaque.vert with
+            // the skinned layout reads bone-indices/weights as UV/drawindex → garbage TexIndex →
+            // gTextures[garbage] OOB bindless access → GPU hang. (That was the Tier 1b hang.)
             {
+                ShaderLoadDesc skDpDesc = {};
+                skDpDesc.mVert.pFileName = "skinned.vert";
+                skDpDesc.mFrag.pFileName = "depthonly.frag";
+                addShader(R, &skDpDesc, &g_live.pSkinnedDepthShader);
+                if (!g_live.pSkinnedDepthShader) {
+                    std::printf("[forge] addShader(skinned depth) FAILED\n");
+                    return false;
+                }
                 DepthStateDesc skPreDepth = {};
                 skPreDepth.mDepthTest = true;
                 skPreDepth.mDepthWrite = true;
@@ -1501,7 +1515,7 @@ namespace {
                 spg.pDepthState = &skPreDepth;
                 spg.pVertexLayout = &svl;
                 spg.pRasterizerState = &skRaster;            // CCW
-                spg.pShaderProgram = g_live.pDepthOnlyShader;
+                spg.pShaderProgram = g_live.pSkinnedDepthShader;
                 addPipeline(R, &skpPd, &g_live.pSkinnedPrepassPipeline);
                 if (!g_live.pSkinnedPrepassPipeline) {
                     std::printf("[forge] addPipeline(skinned prepass) FAILED\n");
@@ -1810,6 +1824,7 @@ namespace {
     unsigned  g_lastSkinnedDrawn = 0;  // skinned parts actually drawn in the last renderScene
     unsigned  g_lastMultiMapDrawn = 0; // multi-map parts actually drawn in the last renderScene
     unsigned  g_lastLightCount = 0;    // point lights uploaded in the last renderScene
+    uint32_t  g_debugMode = 0;         // F12 debug view: 0=normal, 1=depth, 2=scatter (written to FrameData.debugParams.x)
 
     bool ensureMeshSlot(uint32_t slot) {
         if (slot < g_meshCap) {
@@ -2141,6 +2156,9 @@ namespace ForgeRender {
             std::memcpy((uint8_t*)g_live.pFrameCbv->pCpuMappedAddress + 16 * sizeof(float),
                         lighting, 24 * sizeof(float));
         }
+        // F12 debug view: debugParams.x at float index 40 (160B = viewProj 16f + 6×float4 24f).
+        // 0=normal (frag is byte-for-byte unchanged), 1=depth world-distance grayscale.
+        ((float*)g_live.pFrameCbv->pCpuMappedAddress)[40] = (float)g_debugMode;
 
         // Tier 3a: upload this frame's point lights into gLights. Each PointLightWire is exactly
         // 3 float4 (== one cbuffer light entry), so the blob copies straight in after the float4
@@ -2337,6 +2355,61 @@ namespace ForgeRender {
                 cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
                 cmdBindIndexBuffer(g_live.pCmd, m.ib, INDEX_TYPE_UINT16, 0);
                 cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, 0, 1, 0, local);
+            }
+
+            // --- BISECT: skinned Z-prepass (depth-only). Fill bone+instance buffers and draw
+            // depth-only; the skinned COLOUR loop below re-walks the blob and re-fills the SAME
+            // buffers (identical data → same SV_Position) then draws EQUAL. Double-fill is a
+            // deliberate simplification for the bisect (records come back once this is proven).
+            if (skinnedBlob && skinnedCount && skinnedBytes &&
+                g_live.pSkinnedPrepassPipeline && g_live.pSkinnedPrepassPipelineMirror) {
+                cmdBindPipeline(g_live.pCmd, g_live.pSkinnedPrepassPipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                const uint8_t* sp  = (const uint8_t*)skinnedBlob;
+                const uint8_t* sEnd = sp + skinnedBytes;
+                uint32_t boundWindow = UINT32_MAX;
+                int      boundSkinMirror = 0;
+                uint32_t preDrawn = 0;
+                for (uint32_t k = 0; k < skinnedCount; ++k) {
+                    if (sp + sizeof(IPC::SkinnedDrawWire) > sEnd) { break; }
+                    IPC::SkinnedDrawWire item;
+                    std::memcpy(&item, sp, sizeof(item));
+                    const uint8_t* palette = sp + sizeof(item);
+                    const uint32_t bones = (item.numBones < kMaxBonesPerPart) ? item.numBones : kMaxBonesPerPart;
+                    const uint64_t paletteBytes = (uint64_t)item.numBones * 64;
+                    if (palette + paletteBytes > sEnd) { break; }
+                    sp = palette + paletteBytes;
+                    if (preDrawn >= kMaxSkinned) { continue; }
+                    const uint32_t slot = item.slot;
+                    if (slot >= g_meshHigh || !g_meshes[slot].valid || !g_meshes[slot].skinned) { continue; }
+                    const uint32_t window = preDrawn / kSkinnedPerWindow;
+                    const uint32_t base   = (preDrawn % kSkinnedPerWindow) * kMaxBonesPerPart;
+                    uint8_t* dst = (uint8_t*)g_live.pBonesBuf[window]->pCpuMappedAddress;
+                    std::memcpy(dst + (size_t)base * 64, palette, (size_t)bones * 64);
+                    uint32_t* sinst = (uint32_t*)g_live.pInstanceBufSkin->pCpuMappedAddress;
+                    sinst[preDrawn * 2 + 0] = base;
+                    sinst[preDrawn * 2 + 1] = packTexAlpha(item.texIndex, item.alphaRef);
+                    const int mirror = item.mirror ? 1 : 0;
+                    if (mirror != boundSkinMirror) {
+                        cmdBindPipeline(g_live.pCmd, mirror ? g_live.pSkinnedPrepassPipelineMirror : g_live.pSkinnedPrepassPipeline);
+                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                        boundSkinMirror = mirror;
+                        boundWindow = UINT32_MAX;
+                    }
+                    if (window != boundWindow) {
+                        cmdBindDescriptorSet(g_live.pCmd, window, g_live.pPerBatchSetSkin);
+                        boundWindow = window;
+                    }
+                    HostMesh& sm = g_meshes[slot];
+                    Buffer*  pvbs[2]     = { sm.vb, g_live.pInstanceBufSkin };
+                    uint32_t pstrides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)(2 * sizeof(uint32_t)) };
+                    cmdBindVertexBuffer(g_live.pCmd, 2, pvbs, pstrides, nullptr);
+                    cmdBindIndexBuffer(g_live.pCmd, sm.ib, INDEX_TYPE_UINT16, 0);
+                    cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, preDrawn);
+                    ++preDrawn;
+                }
             }
         }
 
@@ -2642,6 +2715,8 @@ namespace ForgeRender {
         }
         return true;
     }
+
+    void setDebugMode(unsigned m) { g_debugMode = m; }
 
     unsigned lastDrawn() { return g_lastDrawn; }
     unsigned lastSkinnedDrawn() { return g_lastSkinnedDrawn; }
@@ -3179,6 +3254,7 @@ namespace ForgeRender {
         if (g_live.pSkinnedPipelineMirror) { removePipeline(R, g_live.pSkinnedPipelineMirror); }
         if (g_live.pSkinnedPrepassPipeline)       { removePipeline(R, g_live.pSkinnedPrepassPipeline); }
         if (g_live.pSkinnedPrepassPipelineMirror) { removePipeline(R, g_live.pSkinnedPrepassPipelineMirror); }
+        if (g_live.pSkinnedDepthShader)    { removeShader(R, g_live.pSkinnedDepthShader); }
         if (g_live.pSkinnedShader)         { removeShader(R, g_live.pSkinnedShader); }
         // Tier 4 multi-map teardown.
         if (g_live.pPerBatchSetMM)          { removeDescriptorSet(R, g_live.pPerBatchSetMM); }
