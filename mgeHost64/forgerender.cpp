@@ -1639,8 +1639,8 @@ namespace {
 
             DepthStateDesc mmDepth = {};
             mmDepth.mDepthTest = true;
-            mmDepth.mDepthWrite = true;
-            mmDepth.mDepthFunc = CMP_GEQUAL;   // REVERSE-Z (combined depth+colour; multimap not in prepass)
+            mmDepth.mDepthWrite = false;       // Tier 1b: multimap now in the Z-prepass → early-Z
+            mmDepth.mDepthFunc = CMP_EQUAL;     // prepass wrote this pixel's depth; colour matches it
 
             RasterizerStateDesc mmRaster = {};
             mmRaster.mCullMode = CULL_MODE_BACK;
@@ -2409,6 +2409,65 @@ namespace ForgeRender {
                     cmdBindIndexBuffer(g_live.pCmd, sm.ib, INDEX_TYPE_UINT16, 0);
                     cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, preDrawn);
                     ++preDrawn;
+                }
+            }
+
+            // --- BISECT: multi-map Z-prepass (depth-only). Same double-fill pattern as skinned:
+            // fill pMMWorldsBuf + pInstanceBufMM and draw depth-only with depthonly_mm.frag (base-
+            // stage alpha test). The multi-map COLOUR loop below re-walks the blob and re-fills the
+            // SAME buffers with identical data → bit-identical SV_Position → colour matches EQUAL.
+            // depthonly_mm.frag needs gTextures (Persistent) only; NO gLights (no shading).
+            if (multiMapBlob && multiMapCount && multiMapBytes &&
+                g_live.pMultiMapPrepassPipeline && g_live.pMultiMapPrepassPipelineMirror) {
+                cmdBindPipeline(g_live.pCmd, g_live.pMultiMapPrepassPipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetMM);   // single world window
+                const uint32_t haveMM = multiMapBytes / (uint32_t)sizeof(IPC::MultiMapDrawWire);
+                const uint32_t nMM = (multiMapCount < haveMM) ? multiMapCount : haveMM;
+                const IPC::MultiMapDrawWire* mmItems = (const IPC::MultiMapDrawWire*)multiMapBlob;
+                int      boundMMMirror = 0;
+                uint32_t preDrawnMM = 0;
+                for (uint32_t k = 0; k < nMM; ++k) {
+                    if (preDrawnMM >= kMaxMultiMap) { break; }   // no fallback (PD1); matches colour cap
+                    const IPC::MultiMapDrawWire& it = mmItems[k];
+                    const uint32_t slot = it.slot;
+                    if (slot >= g_meshHigh || !g_meshes[slot].valid || !g_meshes[slot].multimap) { continue; }
+                    const uint32_t idx = preDrawnMM;
+
+                    uint8_t* dst = (uint8_t*)g_live.pMMWorldsBuf->pCpuMappedAddress;
+                    std::memcpy(dst + (size_t)idx * 64, it.world, 64);
+
+                    uint32_t* inst = (uint32_t*)g_live.pInstanceBufMM->pCpuMappedAddress;
+                    uint32_t* e = inst + (size_t)idx * kMMInstU32;
+                    const uint32_t sc  = (it.stageCount > 4u) ? 4u : it.stageCount;
+                    float ar = it.alphaRef < 0.0f ? 0.0f : (it.alphaRef > 1.0f ? 1.0f : it.alphaRef);
+                    const uint32_t aref = (uint32_t)(ar * 255.0f + 0.5f) & 0xFFu;
+                    const uint32_t vcs  = it.vColSource & 0x3u;
+                    e[0] = (idx & 0xFFu) | (sc << 8u) | (vcs << 11u) | (aref << 16u);   // Meta
+                    e[1] = it.stages[0]; e[2] = it.stages[1]; e[3] = it.stages[2]; e[4] = it.stages[3];
+                    float* fe = (float*)e;
+                    fe[5]  = it.matDiffuse[0];  fe[6]  = it.matDiffuse[1];  fe[7]  = it.matDiffuse[2];
+                    fe[8]  = it.matAmbient[0];  fe[9]  = it.matAmbient[1];  fe[10] = it.matAmbient[2];
+                    fe[11] = it.matEmissive[0]; fe[12] = it.matEmissive[1]; fe[13] = it.matEmissive[2];
+
+                    const int mirror = worldMirrored(it.world) ? 1 : 0;
+                    if (mirror != boundMMMirror) {
+                        cmdBindPipeline(g_live.pCmd, mirror ? g_live.pMultiMapPrepassPipelineMirror
+                                                            : g_live.pMultiMapPrepassPipeline);
+                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetMM);
+                        boundMMMirror = mirror;
+                    }
+
+                    HostMesh& mm = g_meshes[slot];
+                    Buffer*  vbs[2]     = { mm.vb, g_live.pInstanceBufMM };
+                    uint32_t strides[2] = { (uint32_t)sizeof(IPC::GeomVertexWireMM), (uint32_t)(kMMInstU32 * sizeof(uint32_t)) };
+                    cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                    cmdBindIndexBuffer(g_live.pCmd, mm.ib, INDEX_TYPE_UINT16, 0);
+                    cmdDrawIndexedInstanced(g_live.pCmd, mm.indexCount, 0, 1, 0, idx);   // firstInstance=idx
+                    ++preDrawnMM;
                 }
             }
         }
