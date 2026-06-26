@@ -1,0 +1,27 @@
+// mgeHost64 — Tier 2: depth resolve/linearize compute stage.
+//
+// Reads sample 0 of the scene depth (MSAA-robust: Texture2DMS.Load(coord,0) when SAMPLE_COUNT>1,
+// plain Load otherwise) and writes it into a single-sample R32F UAV. Downstream (GTAO) then reads
+// ONE AA-agnostic depth resource instead of touching the multisampled DSV. The value passed
+// through is the raw reverse-Z DEVICE depth; GTAO reconstructs world position from it via
+// gAOParams.invViewProj (exact, full R32F precision, no projection-constant fork here).
+//
+// Two compiled variants (linearizedepth_sc1 / _sc4) selected host-side by g_live.sampleCount —
+// the ONLY place the MS/non-MS split lives. 8x8 thread groups. No bounds check (OOB UAV writes drop).
+
+#include "linearizedepth.srt.h"
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    int2 coord = int2(DispatchThreadID.xy);
+#if SAMPLE_COUNT > 1
+    float d = LoadTex2DMS(gSceneDepth, NO_SAMPLER, coord, 0).r;
+#else
+    float d = LoadTex2D(gSceneDepth, NO_SAMPLER, coord, 0).r;
+#endif
+    Write2D(gLinearDepthOut, coord, d);
+    RETURN();
+}

@@ -56,6 +56,12 @@ STRUCT(LightData)
 BEGIN_SRT_NO_AB(SrtData)
     BEGIN_SRT_SET(PerFrame)
         DECL_CBUFFER(PerFrame, CBUFFER(FrameData), gFrameData)
+        // Tier 2 AO buffer (rgb = view-space bent normal, a = visibility). Read ONLY by the F12
+        // debug branches (debugParams.x == 3 AO / == 4 bent normal); normal shading never touches
+        // it, so modes 0/1 stay byte-for-byte unchanged. A CBV + SRV coexist in one set fine — the
+        // compute SRTs already pair SRV+UAV in a single set (LinDepth/AO PerBatch). Tier 3 will read
+        // this unconditionally to modulate ambient.
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gAO)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has

@@ -118,9 +118,21 @@ namespace ForgeRender {
     // mesh) so host-side printf/asserts are visible in a terminal. Run via --forge-scene.
     bool sceneProbe();
 
+    // Arm PIX programmatic GPU capture — MUST be called before sceneProbe()/init() so
+    // WinPixGpuCapturer.dll hooks d3d12 device creation. sceneProbe wraps one renderScene.
+    bool enablePixCapture();
+
+    // Arm RenderDoc in-application capture — MUST be called before sceneProbe()/init() so
+    // renderdoc.dll hooks d3d12 device creation. sceneProbe wraps one renderScene in
+    // StartFrameCapture/EndFrameCapture (no Present needed). Best launched via the RenderDoc UI.
+    bool enableRdocCapture();
+
     // Debug: read back the live shared RT centre pixel and printf it (BGRA). Used by the
     // --forge-scene probe to ground-truth the fragment output offline.
     void debugReadbackCenterPixel();
+
+    // Tier 2 diag: read back pAO (RGBA16F) and printf 3 texels — GTAO write vs graphics read.
+    void debugReadbackAO();
 
     // Tear down the persistent renderer (shared RT, pipeline, Forge stack).
     void shutdown();

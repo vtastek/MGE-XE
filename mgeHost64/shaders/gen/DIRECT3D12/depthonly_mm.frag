@@ -958,7 +958,7 @@ SamplerState gSamplerAnisotropic : register( s10 , space100 ) ;
 #line 167 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 36 "FSL/shaders.list"
+#line 42 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/depthonly_mm.frag.fsl"
 #line 12 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/depthonly_mm.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1001,15 +1001,21 @@ STRUCT(LightData)
 #line 54
 };
 
-        CBUFFER(FrameData) gFrameData : register( b0 , space1 ) ;
+        CBUFFER(FrameData) gFrameData :  register(b0,space1);
 
 
 
 
-        CBUFFER(LightData) gLights : register( b0 , space3 ) ;
-#line 78 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-        Tex2D(float4) gTextures[ 1024 ] : register( t0 , space0 ) ;
-        CBUFFER(BatchData) gBatch : register( b0 , space2 ) ;
+
+        Tex2D(float4) gAO :  register(t1,space1);
+
+
+
+
+        CBUFFER(LightData) gLights :  register(b0,space3);
+#line 84 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+        Tex2D(float4) gTextures[ 1024 ] :  register(t0,space0);
+        CBUFFER(BatchData) gBatch :  register(b0,space2);
 #line 13 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/depthonly_mm.frag.fsl"
 
 STRUCT(VSOutput)
@@ -1056,4 +1062,4 @@ void PS_MAIN( VSOutput In )
     clip(baseA < alphaRef ? -1.0f : 1.0f);
     return;
 }
-#line 37 "FSL/shaders.list"
+#line 43 "FSL/shaders.list"

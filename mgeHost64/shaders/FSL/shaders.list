@@ -12,6 +12,12 @@
 #rootsig default.rootsig
 #end
 
+// Tier 2 depth-takeover: the host's FIRST compute root signature. fsl.py unions every shader
+// that declares ROOT_SIGNATURE(ComputeRootSignature) (linearizedepth + gtao below) into this one
+// compute.rootsig — see [[project_forge_fsl_shader_compile]] / 09_LightShadowPlayground.
+#rootsig compute.rootsig
+#end
+
 #vert tri.vert
 #include "tri.vert.fsl"
 #end
@@ -46,4 +52,21 @@
 
 #frag multimap.frag
 #include "multimap.frag.fsl"
+#end
+
+// --- Tier 2 depth-takeover compute passes (ComputeRootSignature) ---
+// Linearize/resolve: two SAMPLE_COUNT variants; host picks by g_live.sampleCount at pipeline build.
+#comp linearizedepth_sc1.comp
+#define SAMPLE_COUNT 1
+#include "linearizedepth.comp.fsl"
+#end
+
+#comp linearizedepth_sc4.comp
+#define SAMPLE_COUNT 4
+#include "linearizedepth.comp.fsl"
+#end
+
+// GTAO: single variant — reads the already-resolved single-sample depth, never the MSAA DSV.
+#comp gtao.comp
+#include "gtao.comp.fsl"
 #end

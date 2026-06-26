@@ -958,7 +958,7 @@ SamplerState gSamplerAnisotropic : register( s10 , space100 ) ;
 #line 167 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 28 "FSL/shaders.list"
+#line 34 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 #line 10 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1001,15 +1001,21 @@ STRUCT(LightData)
 #line 54
 };
 
-        CBUFFER(FrameData) gFrameData : register( b0 , space1 ) ;
+        CBUFFER(FrameData) gFrameData :  register(b0,space1);
 
 
 
 
-        CBUFFER(LightData) gLights : register( b0 , space3 ) ;
-#line 78 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-        Tex2D(float4) gTextures[ 1024 ] : register( t0 , space0 ) ;
-        CBUFFER(BatchData) gBatch : register( b0 , space2 ) ;
+
+        Tex2D(float4) gAO :  register(t1,space1);
+
+
+
+
+        CBUFFER(LightData) gLights :  register(b0,space3);
+#line 84 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+        Tex2D(float4) gTextures[ 1024 ] :  register(t0,space0);
+        CBUFFER(BatchData) gBatch :  register(b0,space2);
 #line 11 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 
 STRUCT(VSOutput)
@@ -1127,11 +1133,20 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
     c = lerp(gFrameData.fogColNear.rgb, c, In.Fog);
 
-    if (gFrameData.debugParams.x > 0.5f) {
+
+
+    uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
+    if (dbg == 3u || dbg == 4u) {
+        float2 aoUv = In.Position.xy * gFrameData.debugParams.yz;
+        float4 ao = SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
+        if (dbg == 4u) { RETURN(float4(ao.rgb * 0.5f + 0.5f, 1.0f)); }
+        float v = ao.a; RETURN(float4(v, v, v, 1.0f));
+    }
+    if (dbg >= 1u) {
         float dist = length(In.WorldPos - gFrameData.eyePos.xyz);
         float g = saturate(dist * (1.0f / 8192.0f));
         return (float4(g, g, g, 1.0f));
     }
     return (float4(c, 1.0f));
 }
-#line 29 "FSL/shaders.list"
+#line 35 "FSL/shaders.list"

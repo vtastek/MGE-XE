@@ -29,7 +29,7 @@ namespace {
     IPC::Client* g_client = nullptr;
     bool   g_initOk  = false;
     bool   g_enabled = true;           // composite ON by default; F11 toggles it OFF/ON
-    int    g_debugMode = 0;            // F12 diagnostic cycle: 0=normal, 1=depth (world-distance), 2=scatter
+    int    g_debugMode = 0;            // F12 diagnostic cycle: 0=normal, 1=depth (world-distance), 2=scatter, 3=AO, 4=bent normal
     unsigned g_frame = 0;
 
     // --- Feeding-side spike logging --------------------------------------------------
@@ -1125,8 +1125,10 @@ namespace RenderProcess {
         // is drawn more than once appears as TWO separated copies of the same mesh (a single
         // draw just looks displaced). Reveals duplicate draws regardless of source.
         if (GetAsyncKeyState(VK_F12) & 0x0001) {
-            g_debugMode = (g_debugMode + 1) % 3;
-            const char* name = (g_debugMode == 1) ? "DEPTH" : (g_debugMode == 2) ? "SCATTER" : "NORMAL";
+            // Tier 2 GTAO added modes 3 (AO buffer) + 4 (bent normal); cycle is now %5.
+            g_debugMode = (g_debugMode + 1) % 5;
+            const char* name = (g_debugMode == 1) ? "DEPTH" : (g_debugMode == 2) ? "SCATTER"
+                             : (g_debugMode == 3) ? "AO" : (g_debugMode == 4) ? "BENT NORMAL" : "NORMAL";
             LOG::logline(">> [seam] debug mode %d (%s)", g_debugMode, name);
         }
         if (!g_enabled) {

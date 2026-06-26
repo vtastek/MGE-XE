@@ -45,6 +45,15 @@ int main(int argc, char** argv) {
 	// Standalone M1c opaque scene-path probe: init + uploadGeometry + renderScene with a
 	// dummy mesh, so a buildOpaquePath/draw crash is visible on stdout (no MW/IPC).
 	if (argc >= 2 && std::strcmp(argv[1], "--forge-scene") == 0) {
+		// `--forge-scene pix` arms a PIX programmatic GPU capture around one renderScene
+		// (the headless probe never Presents, so PIX's hotkey capture can't trigger).
+		if (argc >= 3 && std::strcmp(argv[2], "pix") == 0) {
+			ForgeRender::enablePixCapture();   // loads WinPixGpuCapturer.dll BEFORE device init
+		}
+		// `--forge-scene rdoc` arms a RenderDoc capture instead (better descriptor-table inspection).
+		if (argc >= 3 && std::strcmp(argv[2], "rdoc") == 0) {
+			ForgeRender::enableRdocCapture();  // loads renderdoc.dll BEFORE device init
+		}
 		return ForgeRender::sceneProbe() ? 0 : 1;
 	}
 

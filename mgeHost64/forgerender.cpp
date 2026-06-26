@@ -48,6 +48,11 @@
 // convention (06_MaterialPlayground) these come AFTER IMemory.h.
 #include "Graphics/FSL/defaults.h"
 #include "shaders/FSL/opaque.srt.h"
+// Tier 2 depth-takeover compute SRTs (linearize/resolve + GTAO). Each declares its own
+// SRT_<name> + descriptor indices; the AOParams cbuffer struct comes from gtao.srt.h. They share
+// the merged ComputeRootSignature (compute.rootsig). See [[project_forge_depth_prepass]].
+#include "shaders/FSL/linearizedepth.srt.h"
+#include "shaders/FSL/gtao.srt.h"
 
 // App-layer callback normally provided by WindowsBase.cpp (which we exclude — it
 // drags in the window system). The backend calls this on device-lost. Headless:
@@ -70,6 +75,36 @@ namespace {
                         - m[1] * (m[4] * m[10] - m[6] * m[8])
                         + m[2] * (m[4] * m[9]  - m[5] * m[8]);
         return det < 0.0f;
+    }
+
+    // Full 4x4 inverse (cofactor / adjugate). Tier 2 GTAO reconstructs world position from device
+    // depth via the inverse of the reverse-Z world->clip matrix; the host has no D3DX, so invert
+    // here. Layout-agnostic (operates on the raw 16 floats); the caller feeds rzViewProj bytes and
+    // uploads the result as-is — the shader's mul(M,v) reproduces the row-vector transform either
+    // way. Returns false (and leaves out untouched) for a singular matrix.
+    bool invert4x4(const float m[16], float out[16]) {
+        float inv[16];
+        inv[0]  =  m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
+        inv[4]  = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
+        inv[8]  =  m[4]*m[9]*m[15]  - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
+        inv[12] = -m[4]*m[9]*m[14]  + m[4]*m[10]*m[13] + m[8]*m[5]*m[14] - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
+        inv[1]  = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15] - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
+        inv[5]  =  m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15] + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
+        inv[9]  = -m[0]*m[9]*m[15]  + m[0]*m[11]*m[13] + m[8]*m[1]*m[15] - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
+        inv[13] =  m[0]*m[9]*m[14]  - m[0]*m[10]*m[13] - m[8]*m[1]*m[14] + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
+        inv[2]  =  m[1]*m[6]*m[15]  - m[1]*m[7]*m[14]  - m[5]*m[2]*m[15] + m[5]*m[3]*m[14] + m[13]*m[2]*m[7]  - m[13]*m[3]*m[6];
+        inv[6]  = -m[0]*m[6]*m[15]  + m[0]*m[7]*m[14]  + m[4]*m[2]*m[15] - m[4]*m[3]*m[14] - m[12]*m[2]*m[7]  + m[12]*m[3]*m[6];
+        inv[10] =  m[0]*m[5]*m[15]  - m[0]*m[7]*m[13]  - m[4]*m[1]*m[15] + m[4]*m[3]*m[13] + m[12]*m[1]*m[7]  - m[12]*m[3]*m[5];
+        inv[14] = -m[0]*m[5]*m[14]  + m[0]*m[6]*m[13]  + m[4]*m[1]*m[14] - m[4]*m[2]*m[13] - m[12]*m[1]*m[6]  + m[12]*m[2]*m[5];
+        inv[3]  = -m[1]*m[6]*m[11]  + m[1]*m[7]*m[10]  + m[5]*m[2]*m[11] - m[5]*m[3]*m[10] - m[9]*m[2]*m[7]   + m[9]*m[3]*m[6];
+        inv[7]  =  m[0]*m[6]*m[11]  - m[0]*m[7]*m[10]  - m[4]*m[2]*m[11] + m[4]*m[3]*m[10] + m[8]*m[2]*m[7]   - m[8]*m[3]*m[6];
+        inv[11] = -m[0]*m[5]*m[11]  + m[0]*m[7]*m[9]   + m[4]*m[1]*m[11] - m[4]*m[3]*m[9]  - m[8]*m[1]*m[7]   + m[8]*m[3]*m[5];
+        inv[15] =  m[0]*m[5]*m[10]  - m[0]*m[6]*m[9]   - m[4]*m[1]*m[10] + m[4]*m[2]*m[9]  + m[8]*m[1]*m[6]   - m[8]*m[2]*m[5];
+        float det = m[0]*inv[0] + m[1]*inv[4] + m[2]*inv[8] + m[3]*inv[12];
+        if (det > -1e-12f && det < 1e-12f) { return false; }
+        det = 1.0f / det;
+        for (int i = 0; i < 16; ++i) { out[i] = inv[i] * det; }
+        return true;
     }
 
     // If the D3D12 device has been removed, log WHY (the DXGI_ERROR reason code) and
@@ -223,9 +258,12 @@ namespace {
     // Load the global graphics root signature (from the compiled default.rootsig)
     // and the triangle shaders. Returns the shader, or null on failure.
     Shader* loadTriangleShader(Renderer* pRenderer) {
-        std::printf("[forge] initRootSignature (default.rootsig)...\n");
+        std::printf("[forge] initRootSignature (default.rootsig + compute.rootsig)...\n");
         RootSignatureDesc rsDesc = {};
         rsDesc.pGraphicsFileName = "default.rootsig";
+        // Tier 2: the host's first COMPUTE root signature (linearize + GTAO). One global compute
+        // rootsig serves every PIPELINE_TYPE_COMPUTE shader (fsl.py merged both compute SRTs into it).
+        rsDesc.pComputeFileName = "compute.rootsig";
         initRootSignature(pRenderer, &rsDesc);
 
         std::printf("[forge] addShader (tri.vert/tri.frag)...\n");
@@ -362,7 +400,121 @@ namespace {
     }
 }
 
+namespace {
+    // --- PIX programmatic GPU capture (the headless probe never Presents, so PIX's hotkey
+    // capture can't trigger). enablePixCapture() loads WinPixGpuCapturer.dll BEFORE the device
+    // is created (it hooks d3d12 on load); sceneProbe then wraps one renderScene in begin/end. ---
+    // Modern WinPixGpuCapturer exports (dumpbin-verified): BeginProgrammaticGpuCapture(params),
+    // EndProgrammaticGpuCapture(). params = &{ PWSTR fileName } (PIXCaptureParameters::GpuCaptureParameters).
+    typedef long (__stdcall *PFN_PIXBeginGpu)(const void*);
+    typedef long (__stdcall *PFN_PIXEndGpu)(void);
+    static PFN_PIXBeginGpu g_pixBegin = nullptr;
+    static PFN_PIXEndGpu   g_pixEnd   = nullptr;
+
+    static HMODULE findWinPixGpuCapturer() {
+        HMODULE m = LoadLibraryW(L"WinPixGpuCapturer.dll");   // next to exe / on PATH first
+        if (m) { return m; }
+        // Scan the PIX install dir for the newest version: C:\Program Files\Microsoft PIX\<ver>\.
+        WIN32_FIND_DATAW fd = {};
+        wchar_t best[MAX_PATH] = {};
+        HANDLE h = FindFirstFileW(L"C:\\Program Files\\Microsoft PIX\\*", &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && fd.cFileName[0] != L'.') {
+                    // Lexicographically-latest version dir wins (PIX names are date/semver-ish).
+                    if (wcscmp(fd.cFileName, best) > 0) { wcscpy_s(best, fd.cFileName); }
+                }
+            } while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+        if (best[0]) {
+            wchar_t path[MAX_PATH];
+            swprintf_s(path, L"C:\\Program Files\\Microsoft PIX\\%s\\WinPixGpuCapturer.dll", best);
+            m = LoadLibraryW(path);
+        }
+        return m;
+    }
+
+    // --- RenderDoc in-application capture (alternative to PIX; the user found PIX's descriptor
+    // tables un-inspectable). Same shape: load renderdoc.dll BEFORE device creation so its hooks
+    // install, fetch the API table via RENDERDOC_GetAPI, then StartFrameCapture/EndFrameCapture
+    // wrap one renderScene. RenderDoc's Pipeline State → CS → UAVs resolves root-param → heap →
+    // resource (the view PIX denied us) so we can finally see whether gtao's space-3 u0 points at
+    // pAO. We declare the API table prefix by hand (renderdoc_app.h not vendored): the layout is
+    // append-only and STABLE up to EndFrameCapture across every version ≥ 1.1.2, so requesting
+    // eRENDERDOC_API_Version_1_1_2 (10102) and using only the prefix fields is safe. CC = __cdecl. --
+    typedef void* RDOC_DevicePtr;
+    typedef void* RDOC_WindowHandle;
+    typedef int      (__cdecl *PFN_RDOC_GetAPI)(uint32_t version, void** outAPIPointers);
+    typedef void     (__cdecl *PFN_RDOC_SetCaptureFilePathTemplate)(const char* pathtemplate);
+    typedef void     (__cdecl *PFN_RDOC_StartFrameCapture)(RDOC_DevicePtr, RDOC_WindowHandle);
+    typedef uint32_t (__cdecl *PFN_RDOC_EndFrameCapture)(RDOC_DevicePtr, RDOC_WindowHandle);
+
+    // Function-pointer table in renderdoc_app.h order; void* for fields we don't call so the
+    // offsets to SetCaptureFilePathTemplate / StartFrameCapture / EndFrameCapture stay exact.
+    struct RDOC_API_Table {
+        void* GetAPIVersion;
+        void* SetCaptureOptionU32;
+        void* SetCaptureOptionF32;
+        void* GetCaptureOptionU32;
+        void* GetCaptureOptionF32;
+        void* SetFocusToggleKeys;
+        void* SetCaptureKeys;
+        void* GetOverlayBits;
+        void* MaskOverlayBits;
+        void* RemoveHooks;
+        void* UnloadCrashHandler;
+        PFN_RDOC_SetCaptureFilePathTemplate SetCaptureFilePathTemplate;
+        void* GetCaptureFilePathTemplate;
+        void* GetNumCaptures;
+        void* GetCapture;
+        void* TriggerCapture;
+        void* IsTargetControlConnected;
+        void* LaunchReplayUI;
+        void* SetActiveWindow;
+        PFN_RDOC_StartFrameCapture StartFrameCapture;
+        void* IsFrameCapturing;
+        PFN_RDOC_EndFrameCapture EndFrameCapture;
+    };
+    static RDOC_API_Table* g_rdoc = nullptr;
+
+    static HMODULE findRenderDoc() {
+        HMODULE m = GetModuleHandleW(L"renderdoc.dll");        // already injected by the RenderDoc UI?
+        if (m) { return m; }
+        m = LoadLibraryW(L"renderdoc.dll");                    // next to exe / on PATH
+        if (m) { return m; }
+        return LoadLibraryW(L"C:\\Program Files\\RenderDoc\\renderdoc.dll");
+    }
+}
+
 namespace ForgeRender {
+    // Public: call ONCE before sceneProbe()/init() so the capturer hooks d3d12 device creation.
+    bool enablePixCapture() {
+        HMODULE m = findWinPixGpuCapturer();
+        if (!m) { std::printf("[forge] PIX: WinPixGpuCapturer.dll NOT found (install PIX or copy the dll next to the exe)\n"); return false; }
+        g_pixBegin = (PFN_PIXBeginGpu)GetProcAddress(m, "BeginProgrammaticGpuCapture");
+        g_pixEnd   = (PFN_PIXEndGpu)GetProcAddress(m, "EndProgrammaticGpuCapture");
+        std::printf("[forge] PIX capturer loaded (begin=%p end=%p)\n", (void*)g_pixBegin, (void*)g_pixEnd);
+        return g_pixBegin && g_pixEnd;
+    }
+
+    // Public: call ONCE before sceneProbe()/init() so renderdoc.dll hooks d3d12 device creation.
+    bool enableRdocCapture() {
+        HMODULE m = findRenderDoc();
+        if (!m) { std::printf("[forge] RDOC: renderdoc.dll NOT found (launch via RenderDoc UI or install it)\n"); return false; }
+        PFN_RDOC_GetAPI getApi = (PFN_RDOC_GetAPI)GetProcAddress(m, "RENDERDOC_GetAPI");
+        if (!getApi) { std::printf("[forge] RDOC: RENDERDOC_GetAPI export missing\n"); return false; }
+        const uint32_t eRENDERDOC_API_Version_1_1_2 = 10102;
+        int ok = getApi(eRENDERDOC_API_Version_1_1_2, (void**)&g_rdoc);
+        std::printf("[forge] RDOC: GetAPI -> %d (table=%p)\n", ok, (void*)g_rdoc);
+        if (!ok || !g_rdoc) { g_rdoc = nullptr; return false; }
+        // Frame number gets appended; the .rdc lands next to the game so the user can open it.
+        g_rdoc->SetCaptureFilePathTemplate("C:\\mgem\\morrowind64\\forge_gtao");
+        std::printf("[forge] RDOC capture armed (start=%p end=%p)\n",
+                    (void*)g_rdoc->StartFrameCapture, (void*)g_rdoc->EndFrameCapture);
+        return true;
+    }
+
     bool probe() {
         // Unbuffered: a Forge ASSERT/abort would otherwise swallow piped stdout.
         std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -540,14 +692,34 @@ namespace ForgeRender {
             mm.stages[0] = IPC::packMMStage(1, 0, IPC::kMMOpBase);   // base, white slot 1, UV 0
             mm.stages[1] = IPC::packMMStage(1, 1, IPC::kMMOpAdd);    // glow ADD, white slot 1, UV 1
             std::printf("[forge] scene-probe: renderScene #3 (multi-map only)...\n");
+            // PIX: capture THIS renderScene (linearize + GTAO dispatches + colour pass) if armed.
+            if (g_pixBegin) {
+                struct GpuCapParams { const wchar_t* fileName; } params = { L"C:\\mgem\\morrowind64\\forge_gtao.wpix" };
+                long hr = g_pixBegin(&params);
+                std::printf("[forge] PIX: BeginProgrammaticGpuCapture -> hr=0x%08lX\n", hr);
+            }
+            if (g_rdoc) {
+                g_rdoc->StartFrameCapture(nullptr, nullptr);   // NULL device = capture all the host's queues
+                std::printf("[forge] RDOC: StartFrameCapture\n");
+            }
             ok = renderScene(vp, lt, nullptr, 0, 0,
                              nullptr, 0, 0,
                              &mm, 1, (unsigned)sizeof(mm),
                              nullptr, 0, 0);
+            if (g_rdoc) {
+                uint32_t cap = g_rdoc->EndFrameCapture(nullptr, nullptr);
+                std::printf("[forge] RDOC: EndFrameCapture -> %u (capture: C:\\mgem\\morrowind64\\forge_gtao_frameNNN.rdc)\n", cap);
+            }
+            if (g_pixEnd) {
+                long hr = g_pixEnd();
+                std::printf("[forge] PIX: EndProgrammaticGpuCapture -> hr=0x%08lX (capture: C:\\mgem\\morrowind64\\forge_gtao.wpix)\n", hr);
+            }
             std::printf("[forge] scene-probe: multi-map renderScene returned %d (multiMapDrawn=%u) -> expect CENTRE ~248\n",
                         (int)ok, lastMultiMapDrawn());
             debugReadbackCenterPixel();
         }
+
+        debugReadbackAO();   // Tier 2 diag: ground-truth pAO contents (GTAO write vs graphics read)
 
         shutdown();
         std::printf("[forge] scene-probe complete — %s\n", ok ? "OK" : "FAILED");
@@ -766,6 +938,22 @@ namespace {
         Shader*        pDepthOnlyShader = nullptr;
         Pipeline*      pOpaquePrepassPipeline = nullptr;        // FRONT_FACE_CCW, depth-only
         Pipeline*      pOpaquePrepassPipelineMirror = nullptr;  // FRONT_FACE_CW, depth-only
+
+        // --- Tier 2 depth-takeover: depth-as-SRV + GTAO compute (AO buffer in isolation) ---
+        // First compute pipelines / UAVs / depth->SRV barrier in the host. Two passes:
+        //   (1) linearize: resolve sample 0 of pDepth (MSAA-robust) into single-sample pLinearDepth.
+        //   (2) gtao:      horizon-search AO from pLinearDepth -> pAO (rgb bent normal, a visibility).
+        // Sequenced between the Z-prepass and the colour pass in renderScene. Tier 2 feeds ONLY the
+        // F12 debug views (modes 3/4); Tier 3 will read pAO in the colour frags.
+        Texture*       pLinearDepth = nullptr;    // single-sample R32F resolved DEVICE depth (SRV+UAV)
+        Texture*       pAO = nullptr;             // RGBA16F AO (rgb = bent normal, a = visibility) (SRV+UAV)
+        Shader*        pLinearizeShader = nullptr;
+        Pipeline*      pLinearizePipeline = nullptr;
+        Shader*        pGtaoShader = nullptr;
+        Pipeline*      pGtaoPipeline = nullptr;
+        Buffer*        pAOParamsCbv = nullptr;    // gAOParams (invViewProj/screen/knobs/eye), persistent-mapped
+        DescriptorSet* pLinearizeSet = nullptr;   // LinDepthSrtData PerBatch: gSceneDepth + gLinearDepthOut
+        DescriptorSet* pGtaoBatchSet = nullptr;   // AOSrtData PerBatch:  gLinearDepthIn + gAOOut
         DescriptorSet* pPerFrameSet = nullptr;    // gFrameData cbuffer (viewProj), 1 instance
         DescriptorSet* pPerBatchSet = nullptr;    // gBatch cbuffer window, kMaxBatches instances
         Buffer*        pFrameCbv = nullptr;        // gFrameData cbuffer (viewProj), persistent-mapped
@@ -989,6 +1177,11 @@ namespace {
         // viewProj that maps near->1 / far->0 (renderScene applies it). near is now 1.0.
         dDesc.mClearValue.depth = 0.0f;
         dDesc.mClearValue.stencil = 0;
+        // Tier 2: depth must be sampleable by the linearize compute. Add SRV capability (keeps the
+        // DEPTH_WRITE start state; renderScene barriers DEPTH_WRITE→SHADER_RESOURCE before the
+        // compute reads it, then back to DEPTH_WRITE for the colour EQUAL load). MSAA-safe: the
+        // SRV is a Texture2DMS view the linearize shader Loads sample 0 of.
+        dDesc.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
         dDesc.pName = "sceneDepth";
         addRenderTarget(R, &dDesc, &g_live.pDepth);
         if (!g_live.pDepth) {
@@ -1019,6 +1212,65 @@ namespace {
                 std::printf("[forge] addRenderTarget(MSAA color %ux) FAILED\n", g_live.sampleCount);
                 return false;
             }
+        }
+
+        // --- Tier 2: single-sample linear depth + AO targets (SRV+UAV). Created here so the
+        // graphics PerFrame set (below) can bind pAO as its gAO SRV. Both start UNORDERED_ACCESS
+        // (the compute writes them first each frame); renderScene barriers them to SHADER_RESOURCE
+        // after the dispatch so the colour pass / F12 debug can sample. ---
+        {
+            TextureDesc ld = {};
+            ld.mWidth = width; ld.mHeight = height; ld.mDepth = 1;
+            ld.mArraySize = 1; ld.mMipLevels = 1;
+            ld.mSampleCount = SAMPLE_COUNT_1;                       // ALWAYS single-sample (the resolve target)
+            ld.mFormat = TinyImageFormat_R32_SFLOAT;
+            ld.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
+            ld.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+            ld.pName = "linearDepth";
+            TextureLoadDesc lld = {};
+            lld.ppTexture = &g_live.pLinearDepth;
+            lld.pDesc = &ld;
+            addResource(&lld, nullptr);
+
+            TextureDesc ad = {};
+            ad.mWidth = width; ad.mHeight = height; ad.mDepth = 1;
+            ad.mArraySize = 1; ad.mMipLevels = 1;
+            ad.mSampleCount = SAMPLE_COUNT_1;
+            ad.mFormat = TinyImageFormat_R16G16B16A16_SFLOAT;       // rgb bent normal, a visibility (option A)
+            ad.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;
+            ad.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+            ad.pName = "aoBuffer";
+            TextureLoadDesc ald = {};
+            ald.ppTexture = &g_live.pAO;
+            ald.pDesc = &ad;
+            addResource(&ald, nullptr);
+
+            // gAOParams cbuffer (invViewProj + screen + knobs + eye), uploaded per frame.
+            // UNIFORM_BUFFER (CBV), NOT DESCRIPTOR_TYPE_BUFFER: a structured-SRV view over a
+            // CPU_TO_GPU (UPLOAD-heap) resource is illegal in D3D12 and silently removes the device
+            // (the fault only surfaces lazily at the next PSO create — see Tier 2 bisect).
+            BufferLoadDesc cb = {};
+            cb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            cb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            cb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            cb.mDesc.mSize = 256;                                   // >= sizeof(AOParams) (112B), CBV-aligned
+            cb.mDesc.pName = "aoParamsCbv";
+            cb.pData = nullptr;
+            cb.ppBuffer = &g_live.pAOParamsCbv;
+            addResource(&cb, nullptr);
+
+            waitForAllResourceLoads();
+            if (!g_live.pLinearDepth || !g_live.pAO || !g_live.pAOParamsCbv) {
+                std::printf("[forge] Tier 2 AO resource alloc FAILED\n");
+                return false;
+            }
+            // Diagnostic: does the GPU support typed UAV store for the AO format? R32_SFLOAT (lin depth)
+            // is base-guaranteed; R16G16B16A16_SFLOAT needs the additional-format cap. 0x8 = READ_WRITE,
+            // 0x4 = WRITE. If the AO format lacks WRITE/READ_WRITE, gtao's Write2D silently no-ops.
+            std::printf("[forge] FORMAT CAPS: R32_SFLOAT=0x%X  R16G16B16A16_SFLOAT=0x%X  R32G32B32A32_SFLOAT=0x%X\n",
+                        (unsigned)R->pGpu->mFormatCaps[TinyImageFormat_R32_SFLOAT],
+                        (unsigned)R->pGpu->mFormatCaps[TinyImageFormat_R16G16B16A16_SFLOAT],
+                        (unsigned)R->pGpu->mFormatCaps[TinyImageFormat_R32G32B32A32_SFLOAT]);
         }
 
         // Opaque shaders (share the global root signature already loaded for the triangle).
@@ -1306,10 +1558,16 @@ namespace {
             return false;
         }
         {
-            DescriptorData p = {};
-            p.mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
-            p.ppBuffers = &g_live.pFrameCbv;
-            updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &p);
+            // PerFrame set: gFrameData CBV + gAO SRV (F12 debug only). pAO is created above, so the
+            // descriptor is valid here; its per-frame UAV<->SHADER_RESOURCE state ping-pong (renderScene)
+            // leaves it SHADER_RESOURCE before the colour pass samples it.
+            DescriptorData p[2] = {};
+            p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
+            p[0].ppBuffers = &g_live.pFrameCbv;
+            p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
+            p[1].mCount = 1;   // single-texture SRV needs explicit count (else binds nothing)
+            p[1].ppTextures = &g_live.pAO;
+            updateDescriptorSet(R, 0, g_live.pPerFrameSet, 2, p);
         }
         {
             DescriptorData p = {};
@@ -1756,6 +2014,81 @@ namespace {
             updateDescriptorSet(R, 0, g_live.pPerBatchSetMM, 1, &mp);
         }
 
+        // --- Tier 2: compute pipelines (linearize + GTAO) + their descriptor sets. First
+        // PIPELINE_TYPE_COMPUTE in the host; both use the global compute root signature. ---
+        {
+            // Linearize: pick the MSAA / non-MSAA variant by the live sample count. Only sc1/sc4
+            // are compiled (the user runs 4x, probe-verified); any sampleCount>1 maps to sc4.
+            const char* linName = (g_live.sampleCount > 1) ? "linearizedepth_sc4.comp"
+                                                           : "linearizedepth_sc1.comp";
+            ShaderLoadDesc lsd = {};
+            lsd.mComp.pFileName = linName;
+            addShader(R, &lsd, &g_live.pLinearizeShader);
+            ShaderLoadDesc gsd = {};
+            gsd.mComp.pFileName = "gtao.comp";
+            addShader(R, &gsd, &g_live.pGtaoShader);
+            if (!g_live.pLinearizeShader || !g_live.pGtaoShader) {
+                std::printf("[forge] addShader(compute %s/gtao.comp) FAILED\n", linName);
+                return false;
+            }
+
+            PipelineDesc lpd = {};
+            lpd.mType = PIPELINE_TYPE_COMPUTE;
+            lpd.mComputeDesc.pShaderProgram = g_live.pLinearizeShader;
+            addPipeline(R, &lpd, &g_live.pLinearizePipeline);
+            PipelineDesc gpd = {};
+            gpd.mType = PIPELINE_TYPE_COMPUTE;
+            gpd.mComputeDesc.pShaderProgram = g_live.pGtaoShader;
+            addPipeline(R, &gpd, &g_live.pGtaoPipeline);
+            if (!g_live.pLinearizePipeline || !g_live.pGtaoPipeline) {
+                std::printf("[forge] addPipeline(compute linearize/gtao) FAILED\n");
+                return false;
+            }
+
+            // Linearize PerBatch set: gSceneDepth (pDepth SRV) + gLinearDepthOut (pLinearDepth UAV).
+            DescriptorSetDesc lset = SRT_SET_DESC(LinDepthSrtData, PerBatch, 1, 0);
+            addDescriptorSet(R, &lset, &g_live.pLinearizeSet);
+            // GTAO PerFrame set: gAOParams cbuffer. PerBatch set: gLinearDepthIn SRV + gAOOut UAV.
+            DescriptorSetDesc gbset = SRT_SET_DESC(AOSrtData, PerDraw, 1, 0);
+            addDescriptorSet(R, &gbset, &g_live.pGtaoBatchSet);
+            if (!g_live.pLinearizeSet || !g_live.pGtaoBatchSet) {
+                std::printf("[forge] addDescriptorSet(compute) FAILED\n");
+                return false;
+            }
+            {
+                // mCount=1 is REQUIRED for single-texture binds (SRV and UAV) — without it the
+                // descriptor count is 0 and the slot binds NOTHING (UAV writes/SRV reads vanish).
+                // Buffers/CBVs default to 1, which is why the opaque path's bindless array (mCount set)
+                // and CBVs worked but these first single textures did not.
+                DescriptorData d[2] = {};
+                d[0].mIndex = SRT_RES_IDX(LinDepthSrtData, PerBatch, gSceneDepth);
+                d[0].mCount = 1;
+                d[0].ppTextures = &g_live.pDepth->pTexture;   // depth target's underlying texture (SRV)
+                d[1].mIndex = SRT_RES_IDX(LinDepthSrtData, PerBatch, gLinearDepthOut);
+                d[1].mCount = 1;
+                d[1].ppTextures = &g_live.pLinearDepth;
+                updateDescriptorSet(R, 0, g_live.pLinearizeSet, 2, d);
+            }
+            {
+                // PerDraw set (root 0, distinct from linearize's PerBatch root 1): CBV + SRV + UAV.
+                DescriptorData d[3] = {};
+                d[0].mIndex = SRT_RES_IDX(AOSrtData, PerDraw, gAOParams);
+                d[0].ppBuffers = &g_live.pAOParamsCbv;
+                d[1].mIndex = SRT_RES_IDX(AOSrtData, PerDraw, gLinearDepthIn);
+                d[1].mCount = 1;
+                d[1].ppTextures = &g_live.pLinearDepth;
+                d[2].mIndex = SRT_RES_IDX(AOSrtData, PerDraw, gAOOut);
+                d[2].mCount = 1;
+                d[2].ppTextures = &g_live.pAO;
+                updateDescriptorSet(R, 0, g_live.pGtaoBatchSet, 3, d);
+            }
+            std::printf("[forge] SET HANDLES: linBatch root=%u handle=%llu stride=%u | gtaoBatch root=%u handle=%llu stride=%u\n",
+                        (unsigned)g_live.pLinearizeSet->mDx.mCbvSrvUavRootIndex, (unsigned long long)g_live.pLinearizeSet->mDx.mCbvSrvUavHandle, (unsigned)g_live.pLinearizeSet->mDx.mCbvSrvUavStride,
+                        (unsigned)g_live.pGtaoBatchSet->mDx.mCbvSrvUavRootIndex, (unsigned long long)g_live.pGtaoBatchSet->mDx.mCbvSrvUavHandle, (unsigned)g_live.pGtaoBatchSet->mDx.mCbvSrvUavStride);
+            std::printf("[forge] Tier 2 compute ready (linearize=%s, gtao.comp; pLinearDepth R32F, pAO RGBA16F)\n",
+                        linName);
+        }
+
         std::printf("[forge] opaque scene path ready (depth %ux%u, maxDraws=%u, batched %ux%u, maxSkinned=%u, maxMultiMap=%u)\n",
                     width, height, kMaxDraws, kMaxBatches, kBatchSize, kMaxSkinned, kMaxMultiMap);
         return true;
@@ -2157,8 +2490,14 @@ namespace ForgeRender {
                         lighting, 24 * sizeof(float));
         }
         // F12 debug view: debugParams.x at float index 40 (160B = viewProj 16f + 6×float4 24f).
-        // 0=normal (frag is byte-for-byte unchanged), 1=depth world-distance grayscale.
-        ((float*)g_live.pFrameCbv->pCpuMappedAddress)[40] = (float)g_debugMode;
+        // 0=normal (frag is byte-for-byte unchanged), 1=depth world-distance grayscale,
+        // 3=AO, 4=bent normal (both sample gAO at SV_Position * debugParams.yz = invScreen).
+        {
+            float* dp = (float*)g_live.pFrameCbv->pCpuMappedAddress;
+            dp[40] = (float)g_debugMode;
+            dp[41] = 1.0f / (float)g_live.width;    // invScreen.x (F12 AO/bent-normal gAO sample)
+            dp[42] = 1.0f / (float)g_live.height;   // invScreen.y
+        }
 
         // Tier 3a: upload this frame's point lights into gLights. Each PointLightWire is exactly
         // 3 float4 (== one cbuffer light entry), so the blob copies straight in after the float4
@@ -2469,6 +2808,115 @@ namespace ForgeRender {
                     cmdDrawIndexedInstanced(g_live.pCmd, mm.indexCount, 0, 1, 0, idx);   // firstInstance=idx
                     ++preDrawnMM;
                 }
+            }
+        }
+
+        // ===================== TIER 2: LINEARIZE + GTAO COMPUTE =====================
+        // First compute work in the host. Sits between the depth-complete prepass and the colour
+        // pass: resolve pDepth (sample 0, MSAA-robust) -> single-sample pLinearDepth, then GTAO
+        // -> pAO (bent normal + visibility). Tier 2 feeds ONLY the F12 debug views; the colour
+        // pass reads pAO unconditionally is Tier 3. pLinearDepth/pAO live in UNORDERED_ACCESS at
+        // frame start (created state on frame 0; returned to SHADER_RESOURCE at the end of each
+        // frame, so they're flipped back to UAV here on every frame after the first).
+        // Tier 2 master toggle: runs the linearize + GTAO dispatches and the pDepth
+        // DEPTH_WRITE<->SHADER_RESOURCE ping-pong each frame. With it off, behaviour is pure Tier 1
+        // (pDepth stays DEPTH_WRITE; pLinearDepth/pAO stay in their created UAV state, untouched).
+        static const bool g_aoComputeEnable = true;
+        static bool s_aoDispatchLogged = false;
+        if (!s_aoDispatchLogged) {
+            std::printf("[forge] AO dispatch GATE: enable=%d linPipe=%p gtaoPipe=%p linSet=%p gBatchSet=%p pAO=%p pLinDepth=%p firstFrame=%d\n",
+                        (int)g_aoComputeEnable, (void*)g_live.pLinearizePipeline, (void*)g_live.pGtaoPipeline,
+                        (void*)g_live.pLinearizeSet, (void*)g_live.pGtaoBatchSet,
+                        (void*)g_live.pAO, (void*)g_live.pLinearDepth, (int)g_live.firstFrame);
+            s_aoDispatchLogged = true;
+        }
+        if (g_aoComputeEnable && g_live.pLinearizePipeline && g_live.pGtaoPipeline) {
+            // Build gAOParams: invViewProj (from the SAME rzViewProj geometry used, incl. the
+            // half-pixel offset) + screen + knobs + eye. Seeds follow scene-walk (WORLD-unit knobs;
+            // may need MW-scale tuning — change here). eye is read back from the frame cbuffer
+            // (floats 36..38 = gFrameData.eyePos), which holds the latest value across null-lighting frames.
+            float invVP[16];
+            if (!invert4x4(rzViewProj, invVP)) {
+                for (int i = 0; i < 16; ++i) { invVP[i] = (i % 5 == 0) ? 1.0f : 0.0f; }  // identity guard
+            }
+            const float kAORadius    = 12.0f;   // world-unit search extent (scene-walk seed)
+            const float kAOFalloff   = 50.0f;   // world-unit distance falloff (scene-walk seed)
+            const float kAOIntensity = 1.8f;    // occlusion scale (scene-walk forwardAO factor)
+            const float kAOThickness = 0.25f;   // reserved (thin-feature heuristic; unused in T2)
+            const float* fcbv = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
+            float* ap = (float*)g_live.pAOParamsCbv->pCpuMappedAddress;
+            std::memcpy(ap, invVP, 16 * sizeof(float));
+            ap[16] = (float)g_live.width;  ap[17] = (float)g_live.height;
+            ap[18] = 1.0f / (float)g_live.width; ap[19] = 1.0f / (float)g_live.height;
+            ap[20] = kAORadius; ap[21] = kAOFalloff; ap[22] = kAOIntensity; ap[23] = kAOThickness;
+            ap[24] = fcbv[36]; ap[25] = fcbv[37]; ap[26] = fcbv[38]; ap[27] = 0.0f;
+
+            const uint32_t gx = (g_live.width + 7u) / 8u;
+            const uint32_t gy = (g_live.height + 7u) / 8u;
+
+            // End the prepass render pass, then pDepth DEPTH_WRITE -> SHADER_RESOURCE (first depth
+            // -> SRV transition in the host) and flip pLinearDepth back to UAV (skip on frame 0).
+            cmdBindRenderTargets(g_live.pCmd, nullptr);
+            {
+                RenderTargetBarrier rtb = {};
+                rtb.pRenderTarget = g_live.pDepth;
+                rtb.mCurrentState = RESOURCE_STATE_DEPTH_WRITE;
+                rtb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                TextureBarrier tb[1] = {};
+                uint32_t nt = 0;
+                if (!g_live.firstFrame) {
+                    tb[nt].pTexture = g_live.pLinearDepth;
+                    tb[nt].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                    tb[nt].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    ++nt;
+                }
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, nt, tb, 1, &rtb);
+            }
+
+            // (1) Linearize/resolve dispatch.
+            cmdBeginDebugMarker(g_live.pCmd, 0.2f, 0.6f, 1.0f, "LINEARIZE (writes pLinearDepth)");
+            cmdBindPipeline(g_live.pCmd, g_live.pLinearizePipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pLinearizeSet);
+            cmdDispatch(g_live.pCmd, gx, gy, 1);
+            cmdEndDebugMarker(g_live.pCmd);
+
+            // pLinearDepth UAV -> SRV (GTAO reads it); pAO SRV -> UAV (skip on frame 0).
+            {
+                TextureBarrier tb[2] = {};
+                uint32_t nt = 0;
+                tb[nt].pTexture = g_live.pLinearDepth;
+                tb[nt].mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                tb[nt].mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                ++nt;
+                if (!g_live.firstFrame) {
+                    tb[nt].pTexture = g_live.pAO;
+                    tb[nt].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                    tb[nt].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    ++nt;
+                }
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, nt, tb, 0, nullptr);
+            }
+
+            // (2) GTAO dispatch (single PerDraw set holds cbuffer + depth SRV + AO UAV).
+            cmdBeginDebugMarker(g_live.pCmd, 1.0f, 0.3f, 0.2f, "GTAO (pLinearDepth -> pAO: bent normal + visibility)");
+            cmdBindPipeline(g_live.pCmd, g_live.pGtaoPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pGtaoBatchSet);
+            cmdDispatch(g_live.pCmd, gx, gy, 1);
+            cmdEndDebugMarker(g_live.pCmd);
+            static bool s_gtaoDispatched = false;
+            if (!s_gtaoDispatched) { std::printf("[forge] GTAO dispatch ISSUED gx=%u gy=%u (w=%u h=%u)\n", gx, gy, g_live.width, g_live.height); s_gtaoDispatched = true; }
+
+            // pAO UAV -> SRV (colour/F12 debug read it); pDepth SRV -> DEPTH_WRITE (colour LOADs it).
+            {
+                RenderTargetBarrier rtb = {};
+                rtb.pRenderTarget = g_live.pDepth;
+                rtb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                rtb.mNewState = RESOURCE_STATE_DEPTH_WRITE;
+                TextureBarrier tb = {};
+                tb.pTexture = g_live.pAO;
+                tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                tb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 1, &rtb);
             }
         }
 
@@ -2856,6 +3304,104 @@ namespace ForgeRender {
             std::printf("[forge] scene-probe: readback not mapped\n");
         }
         removeResource(pReadback);
+    }
+
+    // Tier 2 diag: read pAO (R16G16B16A16_SFLOAT) back to CPU and log 3 texels across the row.
+    // With the gtao gradient diag active, pAO should hold R=uv.x (≈.25/.5/.75 L/C/R), G=uv.y(.5),
+    // B=1, A=uv.x. All-zero ⇒ GTAO write/dispatch broken; gradient ⇒ the graphics gAO READ is broken.
+    void debugReadbackAO() {
+        if (!g_live.pRenderer || !g_live.pAO) { std::printf("[forge] AO readback: no pAO\n"); return; }
+        Renderer* R = g_live.pRenderer;
+        // --- pLinearDepth readback (R32F, 4bpp) — does the LINEARIZE compute UAV write land? ---
+        if (g_live.pLinearDepth) {
+            const uint32_t W2 = g_live.width, H2 = g_live.height, bpp2 = 4;
+            const uint32_t ra = (R->pGpu->mUploadBufferTextureRowAlignment > 1u) ? R->pGpu->mUploadBufferTextureRowAlignment : 1u;
+            const uint32_t ta = (R->pGpu->mUploadBufferTextureAlignment > 1u) ? R->pGpu->mUploadBufferTextureAlignment : 1u;
+            const uint32_t rp2 = roundUp(W2 * bpp2, ra);
+            BufferLoadDesc bd2 = {};
+            bd2.mDesc.mSize = roundUp64((uint64_t)rp2 * H2, ta);
+            bd2.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
+            bd2.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            bd2.mDesc.mStartState = RESOURCE_STATE_COPY_DEST;
+            bd2.mDesc.mQueueType = QUEUE_TYPE_TRANSFER;
+            Buffer* pRb2 = nullptr; bd2.ppBuffer = &pRb2;
+            addResource(&bd2, nullptr); waitForAllResourceLoads();
+            resetCmdPool(R, g_live.pCmdPool);
+            beginCmd(g_live.pCmd);
+            TextureBarrier tb2 = { g_live.pLinearDepth, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_COPY_SOURCE };
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb2, 0, nullptr);
+            endCmd(g_live.pCmd);
+            QueueSubmitDesc s2 = {}; s2.mCmdCount = 1; s2.ppCmds = &g_live.pCmd; s2.pSignalFence = g_live.pFence; s2.mSubmitDone = true;
+            queueSubmit(g_live.pQueue, &s2); waitForFences(R, 1, &g_live.pFence);
+            TextureCopyDesc c2 = {}; c2.pTexture = g_live.pLinearDepth; c2.pBuffer = pRb2;
+            c2.mTextureState = RESOURCE_STATE_COPY_SOURCE; c2.mQueueType = QUEUE_TYPE_GRAPHICS;
+            SyncToken t2 = {}; copyResource(&c2, &t2); waitForToken(&t2);
+            const uint8_t* b2 = (const uint8_t*)pRb2->pCpuMappedAddress;
+            if (b2) {
+                const float* cf = (const float*)(b2 + (uint64_t)(H2/2)*rp2 + (uint64_t)(W2/2)*bpp2);
+                const float* lf = (const float*)(b2 + (uint64_t)(H2/2)*rp2 + (uint64_t)(W2/4)*bpp2);
+                std::printf("[forge] LinDepth readback left=%.4f centre=%.4f\n", *lf, *cf);
+            }
+            removeResource(pRb2);
+        }
+        const uint32_t W = g_live.width, H = g_live.height;
+        const uint32_t bpp = 8;   // R16G16B16A16_SFLOAT
+        const uint32_t rowAlign = (R->pGpu->mUploadBufferTextureRowAlignment > 1u) ? R->pGpu->mUploadBufferTextureRowAlignment : 1u;
+        const uint32_t texAlign = (R->pGpu->mUploadBufferTextureAlignment > 1u) ? R->pGpu->mUploadBufferTextureAlignment : 1u;
+        const uint32_t rowPitch = roundUp(W * bpp, rowAlign);
+        const uint64_t bufSize  = roundUp64((uint64_t)rowPitch * H, texAlign);
+        BufferLoadDesc bd = {};
+        bd.mDesc.mSize = bufSize;
+        bd.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
+        bd.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+        bd.mDesc.mStartState = RESOURCE_STATE_COPY_DEST;
+        bd.mDesc.mQueueType = QUEUE_TYPE_TRANSFER;
+        Buffer* pRb = nullptr; bd.ppBuffer = &pRb;
+        addResource(&bd, nullptr); waitForAllResourceLoads();
+        resetCmdPool(R, g_live.pCmdPool);
+        beginCmd(g_live.pCmd);
+        // pAO ends each renderScene in SHADER_RESOURCE (post-GTAO barrier) → COPY_SOURCE.
+        TextureBarrier tb = { g_live.pAO, RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_COPY_SOURCE };
+        cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+        endCmd(g_live.pCmd);
+        QueueSubmitDesc sd = {}; sd.mCmdCount = 1; sd.ppCmds = &g_live.pCmd; sd.pSignalFence = g_live.pFence; sd.mSubmitDone = true;
+        queueSubmit(g_live.pQueue, &sd); waitForFences(R, 1, &g_live.pFence);
+        TextureCopyDesc cd = {};
+        cd.pTexture = g_live.pAO; cd.pBuffer = pRb;
+        cd.mTextureState = RESOURCE_STATE_COPY_SOURCE; cd.mQueueType = QUEUE_TYPE_GRAPHICS;
+        SyncToken ct = {}; copyResource(&cd, &ct); waitForToken(&ct);
+        const uint8_t* base = (const uint8_t*)pRb->pCpuMappedAddress;
+        if (base) {
+            auto half2f = [](uint16_t h) -> float {
+                uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+                uint32_t exp  = (h >> 10) & 0x1Fu;
+                uint32_t man  = h & 0x3FFu;
+                uint32_t f;
+                if (exp == 0u) {
+                    if (man == 0u) { f = sign; }
+                    else { int e = 127 - 15 + 1; while (!(man & 0x400u)) { man <<= 1; --e; } man &= 0x3FFu; f = sign | ((uint32_t)e << 23) | (man << 13); }
+                } else if (exp == 31u) { f = sign | 0x7F800000u | (man << 13); }
+                else { f = sign | ((exp - 15u + 127u) << 23) | (man << 13); }
+                float r; std::memcpy(&r, &f, 4); return r;
+            };
+            auto logpx = [&](uint32_t x, uint32_t y, const char* name) {
+                const uint16_t* p = (const uint16_t*)(base + (uint64_t)y * rowPitch + (uint64_t)x * bpp);
+                std::printf("[forge] AO readback %-6s (%u,%u) = R%.3f G%.3f B%.3f A%.3f\n",
+                            name, x, y, half2f(p[0]), half2f(p[1]), half2f(p[2]), half2f(p[3]));
+            };
+            logpx(W / 4u, H / 2u, "left");
+            logpx(W / 2u, H / 2u, "centre");
+            logpx(3u * W / 4u, H / 2u, "right");
+            // Offset-independent: scan the WHOLE copied buffer for any non-zero byte (decouples
+            // "pAO truly zero" from "my pixel-offset math is wrong").
+            uint64_t nz = 0, firstNz = 0; bool found = false;
+            for (uint64_t i = 0; i < bufSize; ++i) { if (base[i] != 0) { ++nz; if (!found) { firstNz = i; found = true; } } }
+            std::printf("[forge] AO buffer scan: %llu non-zero bytes / %llu (firstNz=%llu)\n",
+                        (unsigned long long)nz, (unsigned long long)bufSize, (unsigned long long)firstNz);
+        } else {
+            std::printf("[forge] AO readback not mapped\n");
+        }
+        removeResource(pRb);
     }
 
     // --- Phase 2: DDS parse + bindless texture upload ---------------------------------
@@ -3325,6 +3871,16 @@ namespace ForgeRender {
         if (g_live.pMultiMapPrepassPipelineMirror) { removePipeline(R, g_live.pMultiMapPrepassPipelineMirror); }
         if (g_live.pMultiMapDepthShader)    { removeShader(R, g_live.pMultiMapDepthShader); }
         if (g_live.pMultiMapShader)         { removeShader(R, g_live.pMultiMapShader); }
+        // Tier 2 compute (linearize + GTAO).
+        if (g_live.pGtaoBatchSet)   { removeDescriptorSet(R, g_live.pGtaoBatchSet); }
+        if (g_live.pLinearizeSet)   { removeDescriptorSet(R, g_live.pLinearizeSet); }
+        if (g_live.pGtaoPipeline)   { removePipeline(R, g_live.pGtaoPipeline); }
+        if (g_live.pLinearizePipeline) { removePipeline(R, g_live.pLinearizePipeline); }
+        if (g_live.pGtaoShader)     { removeShader(R, g_live.pGtaoShader); }
+        if (g_live.pLinearizeShader){ removeShader(R, g_live.pLinearizeShader); }
+        if (g_live.pAOParamsCbv)    { removeResource(g_live.pAOParamsCbv); }
+        if (g_live.pAO)             { removeResource(g_live.pAO); }
+        if (g_live.pLinearDepth)    { removeResource(g_live.pLinearDepth); }
         if (g_live.pMSAAColor)      { removeRenderTarget(R, g_live.pMSAAColor); }
         if (g_live.pDepth)          { removeRenderTarget(R, g_live.pDepth); }
         if (g_live.pFence)    { exitFence(R, g_live.pFence); }

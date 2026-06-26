@@ -958,7 +958,7 @@ SamplerState gSamplerAnisotropic : register( s10 , space100 ) ;
 #line 167 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 16 "FSL/shaders.list"
+#line 22 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/tri.vert.fsl"
 
 
@@ -997,4 +997,4 @@ VSOutput VS_MAIN( uint VertexID : SV_VERTEXID )
     Out.Color = float4(colors[VertexID], 1.0f);
     return (Out);
 }
-#line 17 "FSL/shaders.list"
+#line 23 "FSL/shaders.list"

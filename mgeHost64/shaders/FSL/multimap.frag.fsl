@@ -106,8 +106,15 @@ float4 PS_MAIN( VSOutput In )
 
     c = tonemap(c);
     c = lerp(gFrameData.fogColNear.rgb, c, In.Fog);
-    // F12 depth view: visualize world distance (reverse-Z NDC is too crushed to read).
-    if (gFrameData.debugParams.x > 0.5f) {
+    // F12 debug views (see opaque.frag — kept in lockstep). gAO sampled at SV_Position.xy * invScreen.
+    uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
+    if (dbg == 3u || dbg == 4u) {
+        float2 aoUv = In.Position.xy * gFrameData.debugParams.yz;
+        float4 ao = SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
+        if (dbg == 4u) { RETURN(float4(ao.rgb * 0.5f + 0.5f, 1.0f)); }       // mode 4: bent normal
+        float v = ao.a; RETURN(float4(v, v, v, 1.0f));                       // mode 3: AO/visibility
+    }
+    if (dbg >= 1u) {   // mode 1/2: world-distance grayscale (reverse-Z NDC is too crushed to read)
         float dist = length(In.WorldPos - gFrameData.eyePos.xyz);
         float g = saturate(dist * (1.0f / 8192.0f));  // near=black, far=white; range tunable
         RETURN(float4(g, g, g, 1.0f));
