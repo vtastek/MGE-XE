@@ -1130,10 +1130,13 @@ namespace RenderProcess {
         // is drawn more than once appears as TWO separated copies of the same mesh (a single
         // draw just looks displaced). Reveals duplicate draws regardless of source.
         if (GetAsyncKeyState(VK_F12) & 0x0001) {
-            // Tier 2 GTAO added modes 3 (AO buffer) + 4 (bent normal); cycle is now %5.
-            g_debugMode = (g_debugMode + 1) % 5;
+            // Tier 2 GTAO added 3 (AO) + 4 (bent normal); dev panel added 5 (albedo) 6 (lit)
+            // 7 (ambient) shading-isolation views — cycle is now %8.
+            g_debugMode = (g_debugMode + 1) % 8;
             const char* name = (g_debugMode == 1) ? "DEPTH" : (g_debugMode == 2) ? "SCATTER"
-                             : (g_debugMode == 3) ? "AO" : (g_debugMode == 4) ? "BENT NORMAL" : "NORMAL";
+                             : (g_debugMode == 3) ? "AO" : (g_debugMode == 4) ? "BENT NORMAL"
+                             : (g_debugMode == 5) ? "ALBEDO" : (g_debugMode == 6) ? "LIT"
+                             : (g_debugMode == 7) ? "AMBIENT" : "NORMAL";
             LOG::logline(">> [seam] debug mode %d (%s)", g_debugMode, name);
         }
         // F9 toggles the in-host dev overlay (edge-triggered).

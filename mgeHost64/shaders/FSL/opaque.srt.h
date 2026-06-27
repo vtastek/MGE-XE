@@ -32,7 +32,11 @@ STRUCT(FrameData)
     DATA(float4, eyePos,     None);   // xyz = world camera position (fog distance)
     // F12 debug view (offset 160B, float index 40). x: 0=normal, 1=depth world-distance grayscale.
     // Appended after eyePos so every existing field keeps its offset; 176B total < 256B CBV min.
-    DATA(float4, debugParams, None);  // x = debug mode
+    DATA(float4, debugParams, None);  // x = debug mode, yz = invScreen, w = toggle bits (1 AO, 2 bent-N, 4 amb=white)
+    // Dev panel intensity modifiers (offset 176B, float index 44). All default 1.0 (no-op). They
+    // scale per-component output of the Forge passes only, so surfaces Forge does NOT draw stay put
+    // — cranking one isolates what's still on MW's own path. 192B total < 256B CBV min.
+    DATA(float4, dbgScales,   None);  // x = ambient, y = diffuse, z = albedo, w = overall
 };
 
 STRUCT(BatchData)

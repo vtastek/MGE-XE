@@ -58,6 +58,7 @@
 // the merged ComputeRootSignature (compute.rootsig). See [[project_forge_depth_prepass]].
 #include "shaders/FSL/linearizedepth.srt.h"
 #include "shaders/FSL/gtao.srt.h"
+#include "shaders/FSL/aoblur.srt.h"
 
 // App-layer callback normally provided by WindowsBase.cpp (which we exclude — it
 // drags in the window system). The backend calls this on device-lost. Headless:
@@ -968,13 +969,17 @@ namespace {
         // F12 debug views (modes 3/4); Tier 3 will read pAO in the colour frags.
         Texture*       pLinearDepth = nullptr;    // single-sample R32F resolved DEVICE depth (SRV+UAV)
         Texture*       pAO = nullptr;             // RGBA16F AO (rgb = bent normal, a = visibility) (SRV+UAV)
+        Texture*       pAOBlur = nullptr;         // RGBA16F bilateral-blurred AO (the frags' gAO) (SRV+UAV)
         Shader*        pLinearizeShader = nullptr;
         Pipeline*      pLinearizePipeline = nullptr;
         Shader*        pGtaoShader = nullptr;
         Pipeline*      pGtaoPipeline = nullptr;
+        Shader*        pAOBlurShader = nullptr;
+        Pipeline*      pAOBlurPipeline = nullptr;
         Buffer*        pAOParamsCbv = nullptr;    // gAOParams (invViewProj/screen/knobs/eye), persistent-mapped
         DescriptorSet* pLinearizeSet = nullptr;   // LinDepthSrtData PerBatch: gSceneDepth + gLinearDepthOut
         DescriptorSet* pGtaoBatchSet = nullptr;   // AOSrtData PerBatch:  gLinearDepthIn + gAOOut
+        DescriptorSet* pAOBlurSet = nullptr;      // AOBlurSrtData PerFrame: gBlurParams + gAOSrc + gBlurDepthIn + gAODst
         DescriptorSet* pPerFrameSet = nullptr;    // gFrameData cbuffer (viewProj), 1 instance
         DescriptorSet* pPerBatchSet = nullptr;    // gBatch cbuffer window, kMaxBatches instances
         Buffer*        pFrameCbv = nullptr;        // gFrameData cbuffer (viewProj), persistent-mapped
@@ -1266,6 +1271,15 @@ namespace {
             ald.pDesc = &ad;
             addResource(&ald, nullptr);
 
+            // pAOBlur: bilateral-blur destination, identical format/desc to pAO. The colour frags
+            // sample THIS (not raw pAO) as gAO; pAO/pLinearDepth feed the blur as SRVs.
+            TextureDesc abd = ad;             // same RGBA16F, SRV+UAV, starts UNORDERED_ACCESS
+            abd.pName = "aoBlurBuffer";
+            TextureLoadDesc abld = {};
+            abld.ppTexture = &g_live.pAOBlur;
+            abld.pDesc = &abd;
+            addResource(&abld, nullptr);
+
             // gAOParams cbuffer (invViewProj + screen + knobs + eye), uploaded per frame.
             // UNIFORM_BUFFER (CBV), NOT DESCRIPTOR_TYPE_BUFFER: a structured-SRV view over a
             // CPU_TO_GPU (UPLOAD-heap) resource is illegal in D3D12 and silently removes the device
@@ -1281,7 +1295,7 @@ namespace {
             addResource(&cb, nullptr);
 
             waitForAllResourceLoads();
-            if (!g_live.pLinearDepth || !g_live.pAO || !g_live.pAOParamsCbv) {
+            if (!g_live.pLinearDepth || !g_live.pAO || !g_live.pAOBlur || !g_live.pAOParamsCbv) {
                 std::printf("[forge] Tier 2 AO resource alloc FAILED\n");
                 return false;
             }
@@ -1579,15 +1593,16 @@ namespace {
             return false;
         }
         {
-            // PerFrame set: gFrameData CBV + gAO SRV (F12 debug only). pAO is created above, so the
-            // descriptor is valid here; its per-frame UAV<->SHADER_RESOURCE state ping-pong (renderScene)
-            // leaves it SHADER_RESOURCE before the colour pass samples it.
+            // PerFrame set: gFrameData CBV + gAO SRV. The frags read the BILATERAL-BLURRED AO
+            // (pAOBlur), not raw pAO; pAOBlur's per-frame UAV<->SHADER_RESOURCE ping-pong (renderScene)
+            // leaves it SHADER_RESOURCE before the colour pass samples it. (Raw pAO still feeds the
+            // blur as an SRV, and the DebugTextures/readback paths still inspect pAO directly.)
             DescriptorData p[2] = {};
             p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
             p[0].ppBuffers = &g_live.pFrameCbv;
             p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
             p[1].mCount = 1;   // single-texture SRV needs explicit count (else binds nothing)
-            p[1].ppTextures = &g_live.pAO;
+            p[1].ppTextures = &g_live.pAOBlur;
             updateDescriptorSet(R, 0, g_live.pPerFrameSet, 2, p);
         }
         {
@@ -2048,8 +2063,11 @@ namespace {
             ShaderLoadDesc gsd = {};
             gsd.mComp.pFileName = "gtao.comp";
             addShader(R, &gsd, &g_live.pGtaoShader);
-            if (!g_live.pLinearizeShader || !g_live.pGtaoShader) {
-                std::printf("[forge] addShader(compute %s/gtao.comp) FAILED\n", linName);
+            ShaderLoadDesc absd = {};
+            absd.mComp.pFileName = "aoblur.comp";
+            addShader(R, &absd, &g_live.pAOBlurShader);
+            if (!g_live.pLinearizeShader || !g_live.pGtaoShader || !g_live.pAOBlurShader) {
+                std::printf("[forge] addShader(compute %s/gtao.comp/aoblur.comp) FAILED\n", linName);
                 return false;
             }
 
@@ -2061,8 +2079,12 @@ namespace {
             gpd.mType = PIPELINE_TYPE_COMPUTE;
             gpd.mComputeDesc.pShaderProgram = g_live.pGtaoShader;
             addPipeline(R, &gpd, &g_live.pGtaoPipeline);
-            if (!g_live.pLinearizePipeline || !g_live.pGtaoPipeline) {
-                std::printf("[forge] addPipeline(compute linearize/gtao) FAILED\n");
+            PipelineDesc abpd = {};
+            abpd.mType = PIPELINE_TYPE_COMPUTE;
+            abpd.mComputeDesc.pShaderProgram = g_live.pAOBlurShader;
+            addPipeline(R, &abpd, &g_live.pAOBlurPipeline);
+            if (!g_live.pLinearizePipeline || !g_live.pGtaoPipeline || !g_live.pAOBlurPipeline) {
+                std::printf("[forge] addPipeline(compute linearize/gtao/aoblur) FAILED\n");
                 return false;
             }
 
@@ -2072,7 +2094,10 @@ namespace {
             // GTAO PerFrame set: gAOParams cbuffer. PerBatch set: gLinearDepthIn SRV + gAOOut UAV.
             DescriptorSetDesc gbset = SRT_SET_DESC(AOSrtData, PerDraw, 1, 0);
             addDescriptorSet(R, &gbset, &g_live.pGtaoBatchSet);
-            if (!g_live.pLinearizeSet || !g_live.pGtaoBatchSet) {
+            // AO blur PerFrame set (root index distinct from PerBatch/PerDraw — no rebind collision).
+            DescriptorSetDesc abset = SRT_SET_DESC(AOBlurSrtData, PerFrame, 1, 0);
+            addDescriptorSet(R, &abset, &g_live.pAOBlurSet);
+            if (!g_live.pLinearizeSet || !g_live.pGtaoBatchSet || !g_live.pAOBlurSet) {
                 std::printf("[forge] addDescriptorSet(compute) FAILED\n");
                 return false;
             }
@@ -2102,6 +2127,22 @@ namespace {
                 d[2].mCount = 1;
                 d[2].ppTextures = &g_live.pAO;
                 updateDescriptorSet(R, 0, g_live.pGtaoBatchSet, 3, d);
+            }
+            {
+                // AO blur PerFrame set: CBV (shared pAOParamsCbv) + 2 SRV (pAO, pLinearDepth) + UAV (pAOBlur).
+                DescriptorData d[4] = {};
+                d[0].mIndex = SRT_RES_IDX(AOBlurSrtData, PerFrame, gBlurParams);
+                d[0].ppBuffers = &g_live.pAOParamsCbv;
+                d[1].mIndex = SRT_RES_IDX(AOBlurSrtData, PerFrame, gAOSrc);
+                d[1].mCount = 1;
+                d[1].ppTextures = &g_live.pAO;
+                d[2].mIndex = SRT_RES_IDX(AOBlurSrtData, PerFrame, gBlurDepthIn);
+                d[2].mCount = 1;
+                d[2].ppTextures = &g_live.pLinearDepth;
+                d[3].mIndex = SRT_RES_IDX(AOBlurSrtData, PerFrame, gAODst);
+                d[3].mCount = 1;
+                d[3].ppTextures = &g_live.pAOBlur;
+                updateDescriptorSet(R, 0, g_live.pAOBlurSet, 4, d);
             }
             std::printf("[forge] SET HANDLES: linBatch root=%u handle=%llu stride=%u | gtaoBatch root=%u handle=%llu stride=%u\n",
                         (unsigned)g_live.pLinearizeSet->mDx.mCbvSrvUavRootIndex, (unsigned long long)g_live.pLinearizeSet->mDx.mCbvSrvUavHandle, (unsigned)g_live.pLinearizeSet->mDx.mCbvSrvUavStride,
@@ -2194,14 +2235,30 @@ namespace {
     // ---- AO knobs (Stage 3): promoted from the hardcoded constants so sliders drive them live.
     // ap[20..23] read these each frame, so a slider move takes effect next frame. aoThickness is
     // the GTAO horizon self-occlusion bias (Stage 4) — was reserved/unused before.
-    float g_aoRadius    = 12.0f;   // world-unit search extent (scene-walk seed)
-    float g_aoFalloff   = 50.0f;   // world-unit distance falloff (scene-walk seed)
-    float g_aoIntensity = 1.8f;    // occlusion scale (scene-walk forwardAO factor)
-    float g_aoThickness = 0.10f;   // horizon self-occlusion bias (kills flat-ground matcap gradient)
+    float g_aoRadius    = 1.5f;    // world-unit search extent (in-game keeper)
+    float g_aoFalloff   = 20.0f;   // world-unit distance falloff (in-game keeper)
+    float g_aoIntensity = 4.0f;    // occlusion scale (in-game keeper; darker than before)
+    float g_aoThickness = 0.4f;    // horizon self-occlusion bias (in-game keeper; kills flat-ground matcap)
+    float g_aoBlurPx    = 2.0f;    // bilateral blur spatial sigma in pixels (0 = passthrough)
+    float g_aoBlurDepth = 5.0f;    // bilateral blur range sigma in WORLD units (rejects across silhouettes)
+
+    // AO contribution toggles → FrameData.debugParams.w bitmask (bit0 AO, bit1 bent normal, bit2 ambient=white).
+    bool  g_aoEnable         = true;    // AO visibility modulates ambient (matches current behaviour)
+    bool  g_bentNormalEnable = false;   // use the AO bent normal as the lighting normal (A/B; off = geometric N)
+    bool  g_ambientWhite     = false;   // debug: force ambient term to 1.0 so AO darkening is visible (pair w/ Diffuse=0)
+
+    // Dev panel intensity modifiers → FrameData.dbgScales (float index 44..47). All 1.0 = no-op.
+    // Scale Forge per-component output only; surfaces Forge doesn't draw are unaffected, so cranking
+    // one is a quick way to spot what's still going through MW's own path.
+    float g_ambScale     = 1.0f;   // ambient term
+    float g_litScale     = 1.0f;   // diffuse (sun + point) term
+    float g_albedoScale  = 1.0f;   // albedo (texture) term
+    float g_overallScale = 1.0f;   // final output
 
     // F12 debug-view names; index = debugParams.x. The dropdown writes g_debugMode directly so the
     // overlay selector and the F12 key cycle stay unified.
-    const char* const kDebugModeNames[] = { "0 normal", "1 depth", "2 scatter", "3 AO", "4 bent-normal" };
+    const char* const kDebugModeNames[] = { "0 normal", "1 depth", "2 scatter", "3 AO", "4 bent-normal",
+                                            "5 albedo", "6 lit", "7 ambient" };
 
     // Build the dev overlay once. The headless host has no Load/Unload reload split, so font-system
     // + UI-system init AND their pipeline load happen together here, right after pRT exists.
@@ -2280,10 +2337,32 @@ namespace {
         uiAddComponentWidget(g_uiPanel, "AO radius (world)", &sR, WIDGET_TYPE_SLIDER_FLOAT);
         SliderFloatWidget sF = {}; sF.pData = &g_aoFalloff;   sF.mMin = 1.0f;  sF.mMax = 200.0f; sF.mStep = 1.0f;
         uiAddComponentWidget(g_uiPanel, "AO falloff (world)", &sF, WIDGET_TYPE_SLIDER_FLOAT);
-        SliderFloatWidget sI = {}; sI.pData = &g_aoIntensity; sI.mMin = 0.0f;  sI.mMax = 3.0f;   sI.mStep = 0.02f;
+        SliderFloatWidget sI = {}; sI.pData = &g_aoIntensity; sI.mMin = 0.0f;  sI.mMax = 8.0f;   sI.mStep = 0.05f;
         uiAddComponentWidget(g_uiPanel, "AO intensity", &sI, WIDGET_TYPE_SLIDER_FLOAT);
         SliderFloatWidget sT = {}; sT.pData = &g_aoThickness; sT.mMin = 0.0f;  sT.mMax = 0.5f;   sT.mStep = 0.005f;
         uiAddComponentWidget(g_uiPanel, "AO horizon bias", &sT, WIDGET_TYPE_SLIDER_FLOAT);
+        SliderFloatWidget sBl = {}; sBl.pData = &g_aoBlurPx;    sBl.mMin = 0.0f; sBl.mMax = 4.0f;   sBl.mStep = 0.1f;
+        uiAddComponentWidget(g_uiPanel, "AO blur spatial (px)", &sBl, WIDGET_TYPE_SLIDER_FLOAT);
+        SliderFloatWidget sBd = {}; sBd.pData = &g_aoBlurDepth; sBd.mMin = 1.0f; sBd.mMax = 256.0f; sBd.mStep = 1.0f;
+        uiAddComponentWidget(g_uiPanel, "AO blur range (world)", &sBd, WIDGET_TYPE_SLIDER_FLOAT);
+
+        // AO contribution toggles.
+        CheckboxWidget cAO = {}; cAO.pData = &g_aoEnable;
+        uiAddComponentWidget(g_uiPanel, "AO enable", &cAO, WIDGET_TYPE_CHECKBOX);
+        CheckboxWidget cBN = {}; cBN.pData = &g_bentNormalEnable;
+        uiAddComponentWidget(g_uiPanel, "Bent normal enable", &cBN, WIDGET_TYPE_CHECKBOX);
+        CheckboxWidget cAW = {}; cAW.pData = &g_ambientWhite;
+        uiAddComponentWidget(g_uiPanel, "Ambient = white (debug)", &cAW, WIDGET_TYPE_CHECKBOX);
+
+        // Intensity modifiers (dbgScales) — crank one to see which surfaces respond (= Forge-drawn).
+        SliderFloatWidget sAmb = {}; sAmb.pData = &g_ambScale;     sAmb.mMin = 0.0f; sAmb.mMax = 4.0f; sAmb.mStep = 0.02f;
+        uiAddComponentWidget(g_uiPanel, "Ambient intensity", &sAmb, WIDGET_TYPE_SLIDER_FLOAT);
+        SliderFloatWidget sLit = {}; sLit.pData = &g_litScale;     sLit.mMin = 0.0f; sLit.mMax = 4.0f; sLit.mStep = 0.02f;
+        uiAddComponentWidget(g_uiPanel, "Diffuse intensity", &sLit, WIDGET_TYPE_SLIDER_FLOAT);
+        SliderFloatWidget sAlb = {}; sAlb.pData = &g_albedoScale;  sAlb.mMin = 0.0f; sAlb.mMax = 4.0f; sAlb.mStep = 0.02f;
+        uiAddComponentWidget(g_uiPanel, "Albedo intensity", &sAlb, WIDGET_TYPE_SLIDER_FLOAT);
+        SliderFloatWidget sOvr = {}; sOvr.pData = &g_overallScale; sOvr.mMin = 0.0f; sOvr.mMax = 4.0f; sOvr.mStep = 0.02f;
+        uiAddComponentWidget(g_uiPanel, "Overall intensity", &sOvr, WIDGET_TYPE_SLIDER_FLOAT);
 
         g_uiInited = true;
         LOG::logline(">> [devui] ready (%ux%u fmt=%u)", width, height, colorFmt); LOG::flush();
@@ -2690,6 +2769,10 @@ namespace ForgeRender {
             dp[40] = (float)g_debugMode;
             dp[41] = 1.0f / (float)g_live.width;    // invScreen.x (F12 AO/bent-normal gAO sample)
             dp[42] = 1.0f / (float)g_live.height;   // invScreen.y
+            dp[43] = (float)((g_aoEnable ? 1u : 0u) | (g_bentNormalEnable ? 2u : 0u)
+                           | (g_ambientWhite ? 4u : 0u)); // AO toggles
+            // dbgScales (float index 44..47): dev panel intensity modifiers.
+            dp[44] = g_ambScale; dp[45] = g_litScale; dp[46] = g_albedoScale; dp[47] = g_overallScale;
         }
 
         // Tier 3a: upload this frame's point lights into gLights. Each PointLightWire is exactly
@@ -3040,6 +3123,7 @@ namespace ForgeRender {
             ap[18] = 1.0f / (float)g_live.width; ap[19] = 1.0f / (float)g_live.height;
             ap[20] = g_aoRadius; ap[21] = g_aoFalloff; ap[22] = g_aoIntensity; ap[23] = g_aoThickness;
             ap[24] = fcbv[36]; ap[25] = fcbv[37]; ap[26] = fcbv[38]; ap[27] = 0.0f;
+            ap[28] = g_aoBlurPx; ap[29] = g_aoBlurDepth; ap[30] = 0.0f; ap[31] = 0.0f;  // gBlurParams.blurParams
 
             const uint32_t gx = (g_live.width + 7u) / 8u;
             const uint32_t gy = (g_live.height + 7u) / 8u;
@@ -3096,17 +3180,43 @@ namespace ForgeRender {
             static bool s_gtaoDispatched = false;
             if (!s_gtaoDispatched) { std::printf("[forge] GTAO dispatch ISSUED gx=%u gy=%u (w=%u h=%u)\n", gx, gy, g_live.width, g_live.height); s_gtaoDispatched = true; }
 
-            // pAO UAV -> SRV (colour/F12 debug read it); pDepth SRV -> DEPTH_WRITE (colour LOADs it).
+            // pAO UAV -> SRV (blur + F12 debug read it); pAOBlur SRV -> UAV (blur writes it, skip f0);
+            // pDepth SRV -> DEPTH_WRITE (colour LOADs it). pLinearDepth STAYS SRV — the blur reads it.
             {
                 RenderTargetBarrier rtb = {};
                 rtb.pRenderTarget = g_live.pDepth;
                 rtb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
                 rtb.mNewState = RESOURCE_STATE_DEPTH_WRITE;
+                TextureBarrier tb[2] = {};
+                uint32_t nt = 0;
+                tb[nt].pTexture = g_live.pAO;
+                tb[nt].mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                tb[nt].mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                ++nt;
+                if (!g_live.firstFrame) {
+                    tb[nt].pTexture = g_live.pAOBlur;
+                    tb[nt].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                    tb[nt].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                    ++nt;
+                }
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, nt, tb, 1, &rtb);
+            }
+
+            // (3) Bilateral AO blur: pAO + pLinearDepth (both SRV) -> pAOBlur (UAV). PerFrame set
+            // (root distinct from gtao/linearize). Depth-aware, so it denoises without silhouette
+            // bleed. The colour frags sample pAOBlur as gAO.
+            {
+                cmdBeginDebugMarker(g_live.pCmd, 0.6f, 1.0f, 0.4f, "AO BILATERAL BLUR (pAO -> pAOBlur)");
+                cmdBindPipeline(g_live.pCmd, g_live.pAOBlurPipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pAOBlurSet);
+                cmdDispatch(g_live.pCmd, gx, gy, 1);
+                cmdEndDebugMarker(g_live.pCmd);
+                // pAOBlur UAV -> SRV for the colour pass.
                 TextureBarrier tb = {};
-                tb.pTexture = g_live.pAO;
+                tb.pTexture = g_live.pAOBlur;
                 tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
                 tb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
-                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 1, &rtb);
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
             }
         }
 
@@ -3453,6 +3563,8 @@ namespace ForgeRender {
         removeShader(R, g_live.pGtaoShader);           g_live.pGtaoShader = nullptr;
         removePipeline(R, g_live.pLinearizePipeline);  g_live.pLinearizePipeline = nullptr;
         removeShader(R, g_live.pLinearizeShader);      g_live.pLinearizeShader = nullptr;
+        removePipeline(R, g_live.pAOBlurPipeline);     g_live.pAOBlurPipeline = nullptr;
+        removeShader(R, g_live.pAOBlurShader);         g_live.pAOBlurShader = nullptr;
 
         const char* linName = (g_live.sampleCount > 1) ? "linearizedepth_sc4.comp"
                                                        : "linearizedepth_sc1.comp";
@@ -3462,7 +3574,10 @@ namespace ForgeRender {
         ShaderLoadDesc gsd = {};
         gsd.mComp.pFileName = "gtao.comp";
         addShader(R, &gsd, &g_live.pGtaoShader);
-        if (!g_live.pLinearizeShader || !g_live.pGtaoShader) {
+        ShaderLoadDesc absd = {};
+        absd.mComp.pFileName = "aoblur.comp";
+        addShader(R, &absd, &g_live.pAOBlurShader);
+        if (!g_live.pLinearizeShader || !g_live.pGtaoShader || !g_live.pAOBlurShader) {
             LOG::logline("!! [forge] hot-reload addShader FAILED (dxil missing on disk?)"); LOG::flush();
             return;
         }
@@ -3474,7 +3589,11 @@ namespace ForgeRender {
         gpd.mType = PIPELINE_TYPE_COMPUTE;
         gpd.mComputeDesc.pShaderProgram = g_live.pGtaoShader;
         addPipeline(R, &gpd, &g_live.pGtaoPipeline);
-        LOG::logline(">> [forge] compute shaders hot-reloaded (gtao.comp + %s)", linName); LOG::flush();
+        PipelineDesc abpd = {};
+        abpd.mType = PIPELINE_TYPE_COMPUTE;
+        abpd.mComputeDesc.pShaderProgram = g_live.pAOBlurShader;
+        addPipeline(R, &abpd, &g_live.pAOBlurPipeline);
+        LOG::logline(">> [forge] compute shaders hot-reloaded (gtao.comp + aoblur.comp + %s)", linName); LOG::flush();
     }
 
     // Auto hot-reload: poll the gtao dxil's mtime (CWD = morrowind64, same dir the loader reads from)
@@ -4150,14 +4269,18 @@ namespace ForgeRender {
         if (g_live.pMultiMapPrepassPipelineMirror) { removePipeline(R, g_live.pMultiMapPrepassPipelineMirror); }
         if (g_live.pMultiMapDepthShader)    { removeShader(R, g_live.pMultiMapDepthShader); }
         if (g_live.pMultiMapShader)         { removeShader(R, g_live.pMultiMapShader); }
-        // Tier 2 compute (linearize + GTAO).
+        // Tier 2 compute (linearize + GTAO + AO bilateral blur).
+        if (g_live.pAOBlurSet)      { removeDescriptorSet(R, g_live.pAOBlurSet); }
         if (g_live.pGtaoBatchSet)   { removeDescriptorSet(R, g_live.pGtaoBatchSet); }
         if (g_live.pLinearizeSet)   { removeDescriptorSet(R, g_live.pLinearizeSet); }
+        if (g_live.pAOBlurPipeline) { removePipeline(R, g_live.pAOBlurPipeline); }
         if (g_live.pGtaoPipeline)   { removePipeline(R, g_live.pGtaoPipeline); }
         if (g_live.pLinearizePipeline) { removePipeline(R, g_live.pLinearizePipeline); }
+        if (g_live.pAOBlurShader)   { removeShader(R, g_live.pAOBlurShader); }
         if (g_live.pGtaoShader)     { removeShader(R, g_live.pGtaoShader); }
         if (g_live.pLinearizeShader){ removeShader(R, g_live.pLinearizeShader); }
         if (g_live.pAOParamsCbv)    { removeResource(g_live.pAOParamsCbv); }
+        if (g_live.pAOBlur)         { removeResource(g_live.pAOBlur); }
         if (g_live.pAO)             { removeResource(g_live.pAO); }
         if (g_live.pLinearDepth)    { removeResource(g_live.pLinearDepth); }
         if (g_live.pMSAAColor)      { removeRenderTarget(R, g_live.pMSAAColor); }

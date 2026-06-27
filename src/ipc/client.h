@@ -56,6 +56,10 @@ namespace IPC {
 		// Dev FSL hot-reload watcher: a Windows-python child (watch_shaders.py) launched alongside
 		// the host in a dev tree, killed with it. INVALID when not spawned (shipped tree / no python).
 		HANDLE m_watcherProcess;
+		// Job object owning the watcher, with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: when THIS process
+		// (Morrowind) dies — even on a hard exit where ~Client never runs — the OS closes the job
+		// handle and kills the watcher. Belt-and-suspenders with stopWatcher's explicit Terminate.
+		HANDLE m_watcherJob;
 
 		// Dedicated GEOMETRY channel: a SECOND shared-mem Parameters + start/complete
 		// events to the SAME host process. Bulk geometry uploads run here so they never

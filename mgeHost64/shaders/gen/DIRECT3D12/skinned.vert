@@ -978,13 +978,17 @@ STRUCT(FrameData)
 
 
     float4 debugParams;
-#line 36
+
+
+
+    float4 dbgScales;
+#line 40
 };
 
 STRUCT(BatchData)
 {
     float4x4 worlds[ 1024 ];
-#line 41
+#line 45
 };
 
 
@@ -998,7 +1002,7 @@ STRUCT(LightData)
 {
     float4 lightParams;
     float4 lights[ 128  * 3];
-#line 54
+#line 58
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1013,7 +1017,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 84 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 88 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 1024 ] :  register(t0,space0);
         CBUFFER(BatchData) gBatch :  register(b0,space2);
 #line 16 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skinned.vert.fsl"
