@@ -40,12 +40,28 @@ float4 PS_MAIN( VSOutput In )
 {
     INIT_MAIN;
     float3 N = normalize(In.Normal);
+
+    // Sample the AO buffer once (rgb = world-space bent normal, a = visibility), shared by the
+    // ambient term, the bent-normal swap, and the F12 views. gAO is the BILATERAL-BLURRED AO
+    // (pAOBlur, denoised in a compute pass), so a single tap is all that's needed here.
+    // debugParams.yz = invScreen; .w = toggle bitmask (bit0 AO->ambient, bit1 bent normal).
+    uint   aoFlags  = (uint)(gFrameData.debugParams.w + 0.5f);
+    float2 aoUv     = In.Position.xy * gFrameData.debugParams.yz;
+    float4 aoSample = SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
+    if ((aoFlags & 2u) != 0u) { N = normalize(aoSample.rgb); }   // "Bent normal enable" tick: bend the lighting normal
+
     // MW lighting: sun diffuse (to-sun = -sunDir) + scene ambient. FFE convention.
     float  ndl = saturate(dot(N, -gFrameData.sunDir.xyz));
     // FFE PerPixelPS lighting terms: d = sun diffuse + point lights, a = scene ambient.
     // (matches lightSunDiffuse*N.L + Σ pointlights + lightSceneAmbient.)
     float3 d = gFrameData.sunCol.rgb * ndl;
-    float3 a = gFrameData.ambCol.rgb;
+    // "Ambient = white (debug)" tick (bit2): force ambient to 1.0 so AO darkening is visible.
+    float3 a = ((aoFlags & 4u) != 0u) ? float3(1.0f, 1.0f, 1.0f) : gFrameData.ambCol.rgb;
+
+    // Tier 3: GTAO modulates AMBIENT only (scene-walk oracle — sun/point diffuse untouched).
+    // Gated by the "AO enable" tick (debugParams.w bit0). Sky/no-geom AO = 1 (no-op).
+    if ((aoFlags & 1u) != 0u) { a *= aoSample.a; }
+    a *= gFrameData.dbgScales.x;   // dev panel: ambient intensity modifier
 
     // Tier 3a point lights — replicates XE FixedFuncEmu.fx evalOnePointLight EXACTLY, in WORLD
     // space (Forge normals + positions are world-space, like the Tier 1 sun). pointLightMult is
@@ -77,6 +93,7 @@ float4 PS_MAIN( VSOutput In )
             d += lambert * att * lightCol;
         }
     }
+    d *= gFrameData.dbgScales.y;   // dev panel: diffuse (sun + point) intensity modifier
 
     // Tier 2b material routing — replicates XE FixedFuncEmu.fx vertexMaterial* EXACTLY (the
     // PROVEN cache color path's selection via matSrcDiffuse/matSrcEmissive):
@@ -118,21 +135,31 @@ float4 PS_MAIN( VSOutput In )
     // 0 (non-alpha-test geometry) never discards — opaque base maps with stray low alpha are safe.
     if (albedo.a < In.AlphaRef) { discard; }
 
+    albedo.rgb *= gFrameData.dbgScales.z;   // dev panel: albedo (texture) intensity modifier
+
     float3 c = albedo.rgb * lit;
+    c *= gFrameData.dbgScales.w;   // dev panel: overall output intensity modifier
     c = tonemap(c);
     // Near fog: lerp toward fogColNear as Fog -> 0 (matches FFE's lerp(fogColNear, c, fog)).
     c = lerp(gFrameData.fogColNear.rgb, c, In.Fog);
-    // F12 debug views. gAO is sampled at SV_Position.xy * invScreen (debugParams.yz). Tier 2's
-    // success criterion = mode 3/4 "look right in isolation"; modes 0 (normal) and 1/2 (depth) never
-    // touch gAO so they're byte-for-byte unchanged.
+    // F12 debug views. gAO is sampled at SV_Position.xy * invScreen (debugParams.yz). The isolation
+    // views (5 albedo / 6 lit / 7 ambient) output one shading component so surfaces Forge does NOT
+    // draw stay unchanged — a quick way to spot what's still going through MW's own path.
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
     if (dbg == 3u || dbg == 4u) {
-        float2 aoUv = In.Position.xy * gFrameData.debugParams.yz;
-        float4 ao = SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
-        if (dbg == 4u) { RETURN(float4(ao.rgb, 1.0f)); }                    // mode 4: bent normal (raw float3, no remap)
-        float v = ao.a; RETURN(float4(v, v, v, 1.0f));                       // mode 3: AO/visibility
+        if (dbg == 4u) { RETURN(float4(aoSample.rgb, 1.0f)); }              // mode 4: bent normal (raw float3, no remap)
+        float v = aoSample.a; RETURN(float4(v, v, v, 1.0f));                 // mode 3: AO/visibility
     }
-    if (dbg >= 1u) {   // mode 1/2: world-distance grayscale (reverse-Z NDC is too crushed to read)
+    if (dbg == 5u) { RETURN(float4(albedo.rgb, 1.0f)); }                     // mode 5: albedo only (texture, no lighting)
+    if (dbg == 6u) { RETURN(float4(lit, 1.0f)); }                            // mode 6: lit only (lighting, no texture)
+    if (dbg == 7u) {                                                        // mode 7: ambient-only lighting (diffuse removed)
+        float3 al;
+        if (In.VColSource == 2u)      { al = In.Color.rgb * a + In.MatEmissive; }
+        else if (In.VColSource == 1u) { al = In.MatAmbient * a + In.Color.rgb; }
+        else                          { al = In.MatAmbient * a + In.MatEmissive; }
+        RETURN(float4(al, 1.0f));
+    }
+    if (dbg == 1u || dbg == 2u) {   // world-distance grayscale (reverse-Z NDC is too crushed to read)
         float dist = length(In.WorldPos - gFrameData.eyePos.xyz);
         float g = saturate(dist * (1.0f / 8192.0f));  // near=black, far=white; range tunable
         RETURN(float4(g, g, g, 1.0f));

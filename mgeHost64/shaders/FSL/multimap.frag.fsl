@@ -41,10 +41,23 @@ float4 PS_MAIN( VSOutput In )
 {
     INIT_MAIN;
     float3 N = normalize(In.Normal);
+
+    // Sample the AO buffer once (rgb = bent normal, a = visibility). gAO is the bilateral-blurred
+    // pAOBlur, so a single tap suffices. debugParams.w = toggle bitmask (bit0 AO->ambient, bit1
+    // bent normal). Kept in lockstep with opaque.frag.
+    uint   aoFlags  = (uint)(gFrameData.debugParams.w + 0.5f);
+    float2 aoUv     = In.Position.xy * gFrameData.debugParams.yz;
+    float4 aoSample = SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
+    if ((aoFlags & 2u) != 0u) { N = normalize(aoSample.rgb); }   // "Bent normal enable" tick
+
     // --- BEGIN lit block (DUPLICATED from opaque.frag — keep in lockstep) ---
     float  ndl = saturate(dot(N, -gFrameData.sunDir.xyz));
     float3 d = gFrameData.sunCol.rgb * ndl;
-    float3 a = gFrameData.ambCol.rgb;
+    // "Ambient = white (debug)" tick (bit2): force ambient to 1.0 so AO darkening is visible.
+    float3 a = ((aoFlags & 4u) != 0u) ? float3(1.0f, 1.0f, 1.0f) : gFrameData.ambCol.rgb;
+    // Tier 3: GTAO modulates AMBIENT only — gated by the "AO enable" tick (debugParams.w bit0).
+    if ((aoFlags & 1u) != 0u) { a *= aoSample.a; }
+    a *= gFrameData.dbgScales.x;   // dev panel: ambient intensity modifier (lockstep w/ opaque.frag)
     {
         uint nLights = (uint)gLights.lightParams.x;
         for (uint i = 0; i < nLights; ++i)
@@ -66,6 +79,7 @@ float4 PS_MAIN( VSOutput In )
             d += lambert * att * lightCol;
         }
     }
+    d *= gFrameData.dbgScales.y;   // dev panel: diffuse (sun + point) intensity modifier
     uint vColSource = (In.Packed >> 3u) & 0x3u;
     float3 lit;
     if (vColSource == 2u) {
@@ -81,7 +95,9 @@ float4 PS_MAIN( VSOutput In )
     // c with tex*lit and records the base alpha; MOD/MOD2X/ADD fold the sibling maps over it.
     uint  stageCount = In.Packed & 0x7u;
     float alphaRef   = float((In.Packed >> 8u) & 0xFFu) * (1.0f / 255.0f);
-    float3 c = lit;
+    float albScale   = gFrameData.dbgScales.z;   // dev panel: albedo (texture) intensity modifier (BASE stage)
+    float3 c   = lit;
+    float3 alb = float3(1.0f, 1.0f, 1.0f);        // texture-only product (debug mode 5 albedo view)
     float  baseA = 1.0f;
     for (uint s = 0u; s < 4u; ++s)
     {
@@ -95,26 +111,34 @@ float4 PS_MAIN( VSOutput In )
         float2 uv = (uvSet == 0u) ? In.Uv0 : (uvSet == 1u) ? In.Uv1
                   : (uvSet == 2u) ? In.Uv2 : In.Uv3;
         float4 t = SampleTex2D(gTextures[tex], gSamplerAnisotropic, uv);
-        if (op == 0u)      { c = t.rgb * lit; baseA = t.a; }   // BASE (MOD x DIFFUSE)
-        else if (op == 1u) { c *= t.rgb; }                     // MOD
-        else if (op == 2u) { c *= t.rgb * 2.0f; }              // MOD2X
-        else               { c += t.rgb; }                     // ADD
+        if (op == 0u)      { float3 b = t.rgb * albScale; c = b * lit; baseA = t.a; alb = b; } // BASE (MOD x DIFFUSE)
+        else if (op == 1u) { c *= t.rgb;        alb *= t.rgb; }          // MOD
+        else if (op == 2u) { c *= t.rgb * 2.0f; alb *= t.rgb * 2.0f; }   // MOD2X
+        else               { c += t.rgb;        alb += t.rgb; }          // ADD
     }
 
     // Alpha test on the BASE stage (other stages keep-prev alpha; irrelevant to coverage).
     if (baseA < alphaRef) { discard; }
 
+    c *= gFrameData.dbgScales.w;   // dev panel: overall output intensity modifier
     c = tonemap(c);
     c = lerp(gFrameData.fogColNear.rgb, c, In.Fog);
     // F12 debug views (see opaque.frag — kept in lockstep). gAO sampled at SV_Position.xy * invScreen.
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
     if (dbg == 3u || dbg == 4u) {
-        float2 aoUv = In.Position.xy * gFrameData.debugParams.yz;
-        float4 ao = SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
-        if (dbg == 4u) { RETURN(float4(ao.rgb, 1.0f)); }                    // mode 4: bent normal (raw float3, no remap)
-        float v = ao.a; RETURN(float4(v, v, v, 1.0f));                       // mode 3: AO/visibility
+        if (dbg == 4u) { RETURN(float4(aoSample.rgb, 1.0f)); }              // mode 4: bent normal (raw float3, no remap)
+        float v = aoSample.a; RETURN(float4(v, v, v, 1.0f));                 // mode 3: AO/visibility
     }
-    if (dbg >= 1u) {   // mode 1/2: world-distance grayscale (reverse-Z NDC is too crushed to read)
+    if (dbg == 5u) { RETURN(float4(alb, 1.0f)); }                            // mode 5: albedo only (texture product)
+    if (dbg == 6u) { RETURN(float4(lit, 1.0f)); }                           // mode 6: lit only (lighting, no texture)
+    if (dbg == 7u) {                                                        // mode 7: ambient-only lighting (diffuse removed)
+        float3 al;
+        if (vColSource == 2u)      { al = In.Color.rgb * a + In.MatEmissive; }
+        else if (vColSource == 1u) { al = In.MatAmbient * a + In.Color.rgb; }
+        else                       { al = In.MatAmbient * a + In.MatEmissive; }
+        RETURN(float4(al, 1.0f));
+    }
+    if (dbg == 1u || dbg == 2u) {   // world-distance grayscale (reverse-Z NDC is too crushed to read)
         float dist = length(In.WorldPos - gFrameData.eyePos.xyz);
         float g = saturate(dist * (1.0f / 8192.0f));  // near=black, far=white; range tunable
         RETURN(float4(g, g, g, 1.0f));

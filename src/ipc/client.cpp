@@ -23,6 +23,7 @@ namespace IPC {
 		m_ipcParameters(nullptr),
 		m_isRpcPending(false),
 		m_watcherProcess(INVALID_HANDLE_VALUE),
+		m_watcherJob(NULL),
 		m_geomSharedMem(INVALID_HANDLE_VALUE),
 		m_geomRpcStartEvent(INVALID_HANDLE_VALUE),
 		m_geomRpcCompleteEvent(INVALID_HANDLE_VALUE),
@@ -84,16 +85,28 @@ namespace IPC {
 			GetFileAttributesA(kScript) == INVALID_FILE_ATTRIBUTES) {
 			return;   // not a dev tree — no watcher
 		}
+		// Job object so the watcher dies with us even on a hard exit (~Client may not run): the OS
+		// kills every process in the job when the last handle to it closes, i.e. when WE terminate.
+		m_watcherJob = CreateJobObjectA(NULL, NULL);
+		if (m_watcherJob) {
+			JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {};
+			jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+			SetInformationJobObject(m_watcherJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
+		}
 		char cmd[768];
 		std::sprintf(cmd, "\"%s\" \"%s\"", kPython, kScript);
 		STARTUPINFOA si = {}; si.cb = sizeof(si);
 		PROCESS_INFORMATION pi = {};
-		if (CreateProcessA(kPython, cmd, NULL, NULL, FALSE, CREATE_NEW_CONSOLE, NULL, NULL, &si, &pi)) {
+		// Suspended so we can assign it to the job BEFORE it runs (no window of an unparented child).
+		if (CreateProcessA(kPython, cmd, NULL, NULL, FALSE, CREATE_NEW_CONSOLE | CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
+			if (m_watcherJob) { AssignProcessToJobObject(m_watcherJob, pi.hProcess); }
+			ResumeThread(pi.hThread);
 			m_watcherProcess = pi.hProcess;
 			CloseHandle(pi.hThread);
 			LOG::logline("FSL hot-reload watcher started (PID %u)", pi.dwProcessId);
 		} else {
 			LOG::winerror("Failed to start FSL hot-reload watcher");
+			if (m_watcherJob) { CloseHandle(m_watcherJob); m_watcherJob = NULL; }
 		}
 	}
 
@@ -102,6 +115,10 @@ namespace IPC {
 			TerminateProcess(m_watcherProcess, 0);
 			CloseHandle(m_watcherProcess);
 			m_watcherProcess = INVALID_HANDLE_VALUE;
+		}
+		if (m_watcherJob) {
+			CloseHandle(m_watcherJob);   // KILL_ON_JOB_CLOSE finishes off the watcher if Terminate missed it
+			m_watcherJob = NULL;
 		}
 	}
 

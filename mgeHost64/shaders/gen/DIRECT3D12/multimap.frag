@@ -978,13 +978,17 @@ STRUCT(FrameData)
 
 
     float4 debugParams;
-#line 36
+
+
+
+    float4 dbgScales;
+#line 40
 };
 
 STRUCT(BatchData)
 {
     float4x4 worlds[ 1024 ];
-#line 41
+#line 45
 };
 
 
@@ -998,7 +1002,7 @@ STRUCT(LightData)
 {
     float4 lightParams;
     float4 lights[ 128  * 3];
-#line 54
+#line 58
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1013,7 +1017,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 84 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 88 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 1024 ] :  register(t0,space0);
         CBUFFER(BatchData) gBatch :  register(b0,space2);
 #line 12 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap.frag.fsl"
@@ -1051,9 +1055,22 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     //INIT_MAIN;
     float3 N = normalize(In.Normal);
 
+
+
+
+    uint aoFlags = (uint)(gFrameData.debugParams.w + 0.5f);
+    float2 aoUv = In.Position.xy * gFrameData.debugParams.yz;
+    float4 aoSample = SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
+    if ((aoFlags & 2u) != 0u) { N = normalize(aoSample.rgb); }
+
+
     float ndl = saturate(dot(N, -gFrameData.sunDir.xyz));
     float3 d = gFrameData.sunCol.rgb * ndl;
-    float3 a = gFrameData.ambCol.rgb;
+
+    float3 a = ((aoFlags & 4u) != 0u) ? float3(1.0f, 1.0f, 1.0f) : gFrameData.ambCol.rgb;
+
+    if ((aoFlags & 1u) != 0u) { a *= aoSample.a; }
+    a *= gFrameData.dbgScales.x;
     {
         uint nLights = (uint)gLights.lightParams.x;
         for (uint i = 0; i < nLights; ++i)
@@ -1075,6 +1092,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
             d += lambert * att * lightCol;
         }
     }
+    d *= gFrameData.dbgScales.y;
     uint vColSource = (In.Packed >> 3u) & 0x3u;
     float3 lit;
     if (vColSource == 2u) {
@@ -1090,7 +1108,9 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
     uint stageCount = In.Packed & 0x7u;
     float alphaRef = float((In.Packed >> 8u) & 0xFFu) * (1.0f / 255.0f);
+    float albScale = gFrameData.dbgScales.z;
     float3 c = lit;
+    float3 alb = float3(1.0f, 1.0f, 1.0f);
     float baseA = 1.0f;
     for (uint s = 0u; s < 4u; ++s)
     {
@@ -1104,26 +1124,34 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
         float2 uv = (uvSet == 0u) ? In.Uv0 : (uvSet == 1u) ? In.Uv1
                   : (uvSet == 2u) ? In.Uv2 : In.Uv3;
         float4 t = SampleTex2D(gTextures[tex], gSamplerAnisotropic, uv);
-        if (op == 0u) { c = t.rgb * lit; baseA = t.a; }
-        else if (op == 1u) { c *= t.rgb; }
-        else if (op == 2u) { c *= t.rgb * 2.0f; }
-        else { c += t.rgb; }
+        if (op == 0u) { float3 b = t.rgb * albScale; c = b * lit; baseA = t.a; alb = b; }
+        else if (op == 1u) { c *= t.rgb; alb *= t.rgb; }
+        else if (op == 2u) { c *= t.rgb * 2.0f; alb *= t.rgb * 2.0f; }
+        else { c += t.rgb; alb += t.rgb; }
     }
 
 
     if (baseA < alphaRef) { discard; }
 
+    c *= gFrameData.dbgScales.w;
     c = tonemap(c);
     c = lerp(gFrameData.fogColNear.rgb, c, In.Fog);
 
     uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
     if (dbg == 3u || dbg == 4u) {
-        float2 aoUv = In.Position.xy * gFrameData.debugParams.yz;
-        float4 ao = SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
-        if (dbg == 4u) { RETURN(float4(ao.rgb, 1.0f)); }
-        float v = ao.a; RETURN(float4(v, v, v, 1.0f));
+        if (dbg == 4u) { RETURN(float4(aoSample.rgb, 1.0f)); }
+        float v = aoSample.a; RETURN(float4(v, v, v, 1.0f));
     }
-    if (dbg >= 1u) {
+    if (dbg == 5u) { RETURN(float4(alb, 1.0f)); }
+    if (dbg == 6u) { RETURN(float4(lit, 1.0f)); }
+    if (dbg == 7u) {
+        float3 al;
+        if (vColSource == 2u) { al = In.Color.rgb * a + In.MatEmissive; }
+        else if (vColSource == 1u) { al = In.MatAmbient * a + In.Color.rgb; }
+        else { al = In.MatAmbient * a + In.MatEmissive; }
+        return (float4(al, 1.0f));
+    }
+    if (dbg == 1u || dbg == 2u) {
         float dist = length(In.WorldPos - gFrameData.eyePos.xyz);
         float g = saturate(dist * (1.0f / 8192.0f));
         return (float4(g, g, g, 1.0f));

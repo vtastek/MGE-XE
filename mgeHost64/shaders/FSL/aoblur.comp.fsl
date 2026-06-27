@@ -1,0 +1,77 @@
+// mgeHost64 — Tier 2 AO bilateral blur (compute).
+//
+// Depth-aware NxN blur of the raw GTAO buffer: a spatial Gaussian (sigma in px) times a range
+// weight on world-position difference (sigma in world units, reconstructed per tap from device
+// depth + invViewProj). Smooths the AO visibility AND the bent normal together, but the range
+// weight collapses across depth discontinuities so it does NOT bleed across silhouettes (the halo
+// a naive box blur produces). Spatial sigma <= 0 => straight passthrough copy. Output gAODst
+// (pAOBlur) is what the colour frags sample as gAO.
+
+#include "aoblur.srt.h"
+
+#define BLUR_RADIUS 3   // 7x7 tap budget; effective extent is set by the spatial sigma (px)
+
+float3 reconstructWorldB(float2 uv, float deviceZ)
+{
+    float ndcX = uv.x * 2.0f - 1.0f;
+    float ndcY = 1.0f - uv.y * 2.0f;
+    float4 p = mul(gBlurParams.invViewProj, float4(ndcX, ndcY, deviceZ, 1.0f));
+    return p.xyz / p.w;
+}
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    int2   px        = int2(DispatchThreadID.xy);
+    float2 screen    = gBlurParams.screenParams.xy;
+    float2 invScreen = gBlurParams.screenParams.zw;
+    if (px.x >= (int)screen.x || px.y >= (int)screen.y)
+    {
+        RETURN();
+    }
+
+    float4 centerAO = LoadTex2D(gAOSrc, NO_SAMPLER, px, 0);
+    float  centerZ  = LoadTex2D(gBlurDepthIn, NO_SAMPLER, px, 0).r;
+
+    float sigmaPx = gBlurParams.blurParams.x;
+    // Passthrough where the blur is off or there is no geometry (sky / cleared reverse-Z far = 0).
+    if (sigmaPx <= 0.0f || centerZ <= 0.0f)
+    {
+        Write2D(gAODst, px, centerAO);
+        RETURN();
+    }
+
+    float2 uv      = (float2(px) + 0.5f) * invScreen;
+    float3 centerW = reconstructWorldB(uv, centerZ);
+    float  sigmaW  = max(gBlurParams.blurParams.y, 1e-3f);
+    float  invSp   = 1.0f / (2.0f * sigmaPx * sigmaPx);   // spatial (px^2) falloff
+    float  invSr   = 1.0f / (2.0f * sigmaW * sigmaW);     // range (world^2) falloff
+
+    float4 sum  = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float  wsum = 0.0f;
+
+    UNROLL for (int j = -BLUR_RADIUS; j <= BLUR_RADIUS; ++j)
+    UNROLL for (int i = -BLUR_RADIUS; i <= BLUR_RADIUS; ++i)
+    {
+        int2  sp = clamp(px + int2(i, j), int2(0, 0), int2((int)screen.x - 1, (int)screen.y - 1));
+        float z  = LoadTex2D(gBlurDepthIn, NO_SAMPLER, sp, 0).r;
+        if (z > 0.0f)   // skip sky taps (no geometry — would reconstruct garbage)
+        {
+            float4 ao  = LoadTex2D(gAOSrc, NO_SAMPLER, sp, 0);
+            float2 suv = (float2(sp) + 0.5f) * invScreen;
+            float3 w   = reconstructWorldB(suv, z);
+            float  ds2 = float(i * i + j * j);     // spatial distance^2 (px)
+            float3 dw  = w - centerW;
+            float  dr2 = dot(dw, dw);              // range distance^2 (world units)
+            float  wgt = exp(-ds2 * invSp - dr2 * invSr);
+            sum  += ao * wgt;
+            wsum += wgt;
+        }
+    }
+
+    float4 outAO = (wsum > 0.0f) ? (sum / wsum) : centerAO;
+    Write2D(gAODst, px, outAO);
+    RETURN();
+}

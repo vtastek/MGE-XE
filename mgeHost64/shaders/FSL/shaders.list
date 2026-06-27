@@ -70,3 +70,8 @@
 #comp gtao.comp
 #include "gtao.comp.fsl"
 #end
+
+// AO bilateral blur: third compute pass — denoises pAO -> pAOBlur (depth-aware, no silhouette bleed).
+#comp aoblur.comp
+#include "aoblur.comp.fsl"
+#end

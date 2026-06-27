@@ -960,7 +960,7 @@ SamplerState gSamplerAnisotropic : register( s10 , space100 ) ;
 #line 11 "FSL/shaders.list"
 #line 71 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gtao.comp.fsl"
-#line 16 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gtao.comp.fsl"
+#line 18 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gtao.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gtao.srt.h"
 #line 17 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gtao.srt.h"
 STRUCT(AOParams)
@@ -984,7 +984,7 @@ STRUCT(AOParams)
         CBUFFER(AOParams) gAOParams :  register(b0,space3);
         Tex2D(float) gLinearDepthIn :  register(t1,space3);
         WTex2D(float4) gAOOut :  register(u2,space3);
-#line 17 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gtao.comp.fsl"
+#line 19 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gtao.comp.fsl"
 
 
 
@@ -1084,6 +1084,8 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     float rnd = ignoise(float2(px));
     float occ = 0.0f;
     float3 bentN = float3(0.0f, 0.0f, 0.0f);
+
+
 
 
 
