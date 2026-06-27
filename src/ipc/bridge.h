@@ -270,6 +270,17 @@ namespace IPC {
         OUT bool ok;
     };
 
+    // Dev overlay input snapshot forwarded client -> host each frame (Stage 2). Mouse is in host
+    // render-target pixels (client already did ScreenToClient). buttons: bit0=L,bit1=R,bit2=M.
+    struct DevInput {
+        std::int32_t  x = 0;
+        std::int32_t  y = 0;
+        std::uint32_t buttons = 0;
+        float         wheel = 0.0f;
+        std::uint32_t uiVisible = 0;
+        std::uint32_t reloadShaders = 0;   // one-shot (F8 edge): host rebuilds compute pipelines from disk
+    };
+
     struct RenderFrameParameters {
         IN std::uint32_t frameIndex;     // for logging
         IN std::uint32_t targetIndex;    // which shared buffer to render into (double-buffer, C)
@@ -312,6 +323,17 @@ namespace IPC {
         // F12 debug view: 0 = normal, 1 = depth (world-distance grayscale), 2 = scatter.
         // Appended after the light-list fields so existing field offsets are unchanged.
         IN std::uint32_t debugMode;
+
+        // Dev overlay input bridge (Stage 2): the headless host has no window/InputSystem, so the
+        // client polls the mouse (client-space pixels) + a visibility toggle and forwards it here
+        // each frame. The host pushes these into Forge UI via uiSetExternalInput. devMouseButtons
+        // is a bitmask: bit0=L, bit1=R, bit2=M. devUiVisible nonzero shows/activates the panel.
+        IN std::int32_t  devMouseX;
+        IN std::int32_t  devMouseY;
+        IN std::uint32_t devMouseButtons;
+        IN float         devMouseWheel;
+        IN std::uint32_t devUiVisible;
+        IN std::uint32_t devReloadShaders;   // one-shot (F8 edge): host rebuilds compute pipelines from disk
 
         OUT std::uint32_t bytesWritten;
         OUT double renderMs;             // host-side render+readback time

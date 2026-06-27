@@ -33,6 +33,11 @@
 #include "Graphics/Interfaces/IGraphics.h"
 #include "Resources/ResourceLoader/Interfaces/IResourceLoader.h"
 #include "Utilities/Interfaces/ILog.h"
+// Dev overlay (Stage 1): Forge's own IUI/IFont rendered into pRT each frame. The headless host
+// has no window/InputSystem, so input is bridged from the MW client over IPC and injected via the
+// vendored UI.cpp shim (uiSetExternalInput) — see [[project_forge_dev_overlay]].
+#include "Application/Interfaces/IUI.h"
+#include "Application/Interfaces/IFont.h"
 #if defined(ENABLE_GRAPHICS_VALIDATION)
 // ID3D12InfoQueue (break-on-severity control). d3d12.h is already pulled in by
 // IGraphics.h for the D3D12 backend; this only adds the debug-layer interface.
@@ -59,6 +64,20 @@
 // no swapchain to rebuild, so record nothing. The header's extern "C" block
 // gives this C linkage to match the (compiled-as-C) Direct3D12.c reference.
 void requestReset(const ResetDesc* pResetDesc) { (void)pResetDesc; }
+
+// Dev overlay (Stage 1/2). The platform*UserInterface / platform*FontSystem functions live in The
+// Forge's UI.cpp / FontSystem.cpp with no public header — normally the app framework
+// (WindowsBase::initBaseSubsystems) calls platformInit*/platformUpdate*/platformExit* around the
+// app's init/exit. The headless host excludes that framework, so it MUST drive them itself.
+// platformInitFontSystem in particular sizes the font atlas (from DPI) and creates the FONS
+// context; skipping it leaves the atlas 0x0 and initFontSystem crashes. uiSetExternalInput is the
+// vendored UI.cpp input-bridge setter (FORGE_HOST_EXTERNAL_INPUT) the host pushes mouse state into.
+extern bool platformInitFontSystem();
+extern bool platformInitUserInterface();
+extern void platformUpdateUserInterface(float deltaTime);
+extern void platformExitFontSystem();
+extern void platformExitUserInterface();
+extern "C" void uiSetExternalInput(float x, float y, float wheel, bool l, bool r, bool m, bool enabled);
 
 namespace {
     const char* kAppName = "mgeHost64";
@@ -166,6 +185,8 @@ namespace {
         fsSetPathForResourceDir(pSystemFileIO, RD_OTHER_FILES, "");
         fsSetPathForResourceDir(pSystemFileIO, RD_SHADER_BINARIES, "");
         fsSetPathForResourceDir(pSystemFileIO, RD_PIPELINE_CACHE, "");
+        // Dev overlay font lives in morrowind64/fonts/ (deployed beside the exe).
+        fsSetPathForResourceDir(pSystemFileIO, RD_FONTS, "fonts");
 
         std::printf("[forge] initLog...\n");
         initLog(kAppName, DEFAULT_LOG_LEVEL);
@@ -2159,6 +2180,170 @@ namespace {
     unsigned  g_lastLightCount = 0;    // point lights uploaded in the last renderScene
     uint32_t  g_debugMode = 0;         // F12 debug view: 0=normal, 1=depth, 2=scatter (written to FrameData.debugParams.x)
 
+    // ---- Dev overlay (Forge IUI) state ----
+    bool          g_uiInited  = false;
+    bool          g_uiVisible = true;          // F9 (client-forwarded) toggles; default on
+    uint32_t      g_uiFontId  = 0;
+    UIComponent*  g_uiPanel   = nullptr;
+    double        g_uiLastMs  = 0.0;           // for the per-frame ImGui delta-time
+    // Forwarded mouse from the MW client (set in renderScene, pushed to UI.cpp::uiSetExternalInput).
+    float         g_inMouseX = 0.0f, g_inMouseY = 0.0f, g_inWheel = 0.0f;
+    bool          g_inLBtn = false, g_inRBtn = false, g_inMBtn = false;
+    int32_t       g_uiDropdownMode = 0;        // DebugTexturesWidget/Dropdown mirror of g_debugMode
+
+    // ---- AO knobs (Stage 3): promoted from the hardcoded constants so sliders drive them live.
+    // ap[20..23] read these each frame, so a slider move takes effect next frame. aoThickness is
+    // the GTAO horizon self-occlusion bias (Stage 4) — was reserved/unused before.
+    float g_aoRadius    = 12.0f;   // world-unit search extent (scene-walk seed)
+    float g_aoFalloff   = 50.0f;   // world-unit distance falloff (scene-walk seed)
+    float g_aoIntensity = 1.8f;    // occlusion scale (scene-walk forwardAO factor)
+    float g_aoThickness = 0.10f;   // horizon self-occlusion bias (kills flat-ground matcap gradient)
+
+    // F12 debug-view names; index = debugParams.x. The dropdown writes g_debugMode directly so the
+    // overlay selector and the F12 key cycle stay unified.
+    const char* const kDebugModeNames[] = { "0 normal", "1 depth", "2 scatter", "3 AO", "4 bent-normal" };
+
+    // Build the dev overlay once. The headless host has no Load/Unload reload split, so font-system
+    // + UI-system init AND their pipeline load happen together here, right after pRT exists.
+    void initDevUI(Renderer* R, uint32_t width, uint32_t height, uint32_t colorFmt) {
+        if (g_uiInited) {
+            return;
+        }
+
+        LOG::logline(">> [devui] initDevUI begin (%ux%u fmt=%u)", width, height, colorFmt); LOG::flush();
+
+        // Framework-level init the headless host must drive itself (normally WindowsBase does it):
+        // platformInitFontSystem sizes the atlas from DPI + builds the FONS context; without it the
+        // atlas is 0x0 and initFontSystem crashes. Must precede fntDefineFonts (which needs FONS).
+        if (!platformInitFontSystem()) {
+            LOG::logline("!! [devui] platformInitFontSystem FAILED"); LOG::flush();
+            return;
+        }
+        if (!platformInitUserInterface()) {
+            LOG::logline("!! [devui] platformInitUserInterface FAILED"); LOG::flush();
+            return;
+        }
+        LOG::logline(">> [devui] platformInit{Font,UI} ok"); LOG::flush();
+
+        FontDesc font = {};
+        font.pFontName = "MGEDev";
+        font.pFontPath = "ComicRelief.ttf";   // RD_FONTS = morrowind64/fonts/
+        fntDefineFonts(&font, 1, &g_uiFontId);
+        LOG::logline(">> [devui] fntDefineFonts ok (id=%u)", g_uiFontId); LOG::flush();
+
+        FontSystemDesc fontDesc = {};
+        fontDesc.pRenderer = R;
+        if (!initFontSystem(&fontDesc)) {
+            LOG::logline("!! [devui] initFontSystem FAILED (font missing?)"); LOG::flush();
+            return;
+        }
+        LOG::logline(">> [devui] initFontSystem ok"); LOG::flush();
+
+        UserInterfaceDesc uiDesc = {};
+        uiDesc.pRenderer = R;
+        uiDesc.mEnableRemoteUI = false;   // headless: no remote-UI socket
+        initUserInterface(&uiDesc);
+        LOG::logline(">> [devui] initUserInterface ok"); LOG::flush();
+
+        FontSystemLoadDesc fontLoad = {};
+        fontLoad.mLoadType = RELOAD_TYPE_ALL;
+        fontLoad.mColorFormat = colorFmt;
+        fontLoad.mWidth = width;
+        fontLoad.mHeight = height;
+        loadFontSystem(&fontLoad);
+        LOG::logline(">> [devui] loadFontSystem ok"); LOG::flush();
+
+        UserInterfaceLoadDesc uiLoad = {};
+        uiLoad.mLoadType = RELOAD_TYPE_ALL;
+        uiLoad.mColorFormat = colorFmt;
+        uiLoad.mWidth = width;
+        uiLoad.mHeight = height;
+        loadUserInterface(&uiLoad);
+        LOG::logline(">> [devui] loadUserInterface ok"); LOG::flush();
+
+        UIComponentDesc cd = {};
+        cd.mStartPosition = vec2(16.0f, 16.0f);
+        cd.mStartSize = vec2(360.0f, 420.0f);
+        cd.mFontID = g_uiFontId;
+        uiAddComponent("MGE Dev", &cd, &g_uiPanel);
+
+        LabelWidget lbl = {};
+        uiAddComponentWidget(g_uiPanel, "Forge dev overlay (F9 toggles)", &lbl, WIDGET_TYPE_LABEL);
+
+        DropdownWidget dd = {};
+        dd.pData = &g_debugMode;
+        dd.pNames = kDebugModeNames;
+        dd.mCount = (uint32_t)(sizeof(kDebugModeNames) / sizeof(kDebugModeNames[0]));
+        uiAddComponentWidget(g_uiPanel, "Fullscreen buffer", &dd, WIDGET_TYPE_DROPDOWN);
+
+        SliderFloatWidget sR = {}; sR.pData = &g_aoRadius;    sR.mMin = 1.0f;  sR.mMax = 64.0f;  sR.mStep = 0.5f;
+        uiAddComponentWidget(g_uiPanel, "AO radius (world)", &sR, WIDGET_TYPE_SLIDER_FLOAT);
+        SliderFloatWidget sF = {}; sF.pData = &g_aoFalloff;   sF.mMin = 1.0f;  sF.mMax = 200.0f; sF.mStep = 1.0f;
+        uiAddComponentWidget(g_uiPanel, "AO falloff (world)", &sF, WIDGET_TYPE_SLIDER_FLOAT);
+        SliderFloatWidget sI = {}; sI.pData = &g_aoIntensity; sI.mMin = 0.0f;  sI.mMax = 3.0f;   sI.mStep = 0.02f;
+        uiAddComponentWidget(g_uiPanel, "AO intensity", &sI, WIDGET_TYPE_SLIDER_FLOAT);
+        SliderFloatWidget sT = {}; sT.pData = &g_aoThickness; sT.mMin = 0.0f;  sT.mMax = 0.5f;   sT.mStep = 0.005f;
+        uiAddComponentWidget(g_uiPanel, "AO horizon bias", &sT, WIDGET_TYPE_SLIDER_FLOAT);
+
+        g_uiInited = true;
+        LOG::logline(">> [devui] ready (%ux%u fmt=%u)", width, height, colorFmt); LOG::flush();
+    }
+
+    // Per-frame: push forwarded input, build the ImGui frame, and draw it into pRT. Called from
+    // renderScene with pRT in RENDER_TARGET state (caller restores COMMON for the DXVK handoff).
+    void drawDevUI() {
+        if (!g_uiInited) {
+            return;
+        }
+
+        // Attach the buffer-viewer once the AO targets exist (they're built lazily on first
+        // renderScene, after initDevUI). The widget clones a pointer to this persistent array.
+        static const Texture* s_debugTex[2] = {};
+        static bool s_texWidgetAdded = false;
+        if (!s_texWidgetAdded && g_live.pAO && g_live.pLinearDepth) {
+            s_debugTex[0] = g_live.pAO;
+            s_debugTex[1] = g_live.pLinearDepth;
+            DebugTexturesWidget dbg = {};
+            dbg.pTextures = s_debugTex;
+            dbg.mTexturesCount = 2;
+            dbg.mTextureDisplaySize = float2(320.0f, 180.0f);
+            uiAddComponentWidget(g_uiPanel, "AO  |  LinearDepth", &dbg, WIDGET_TYPE_DEBUG_TEXTURES);
+            s_texWidgetAdded = true;
+        }
+
+        uiSetExternalInput(g_inMouseX, g_inMouseY, g_inWheel, g_inLBtn, g_inRBtn, g_inMBtn, g_uiVisible);
+        uiSetComponentActive(g_uiPanel, g_uiVisible);
+
+        const double now = hostNowMs();
+        const float  dt  = (g_uiLastMs > 0.0) ? (float)((now - g_uiLastMs) / 1000.0) : 0.016f;
+        g_uiLastMs = now;
+        platformUpdateUserInterface(dt);
+
+        BindRenderTargetsDesc bind = {};
+        bind.mRenderTargetCount = 1;
+        bind.mRenderTargets[0] = { g_live.pRT, LOAD_ACTION_LOAD };
+        cmdBindRenderTargets(g_live.pCmd, &bind);
+        cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+        cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+        cmdDrawUserInterface(g_live.pCmd);
+        cmdBindRenderTargets(g_live.pCmd, nullptr);
+    }
+
+    void exitDevUI() {
+        if (!g_uiInited) {
+            return;
+        }
+        unloadFontSystem(RELOAD_TYPE_ALL);
+        unloadUserInterface(RELOAD_TYPE_ALL);
+        exitFontSystem();
+        exitUserInterface();
+        // Mirror WindowsBase::exitBaseSubsystems order (UI before fonts) for the framework-level teardown.
+        platformExitUserInterface();
+        platformExitFontSystem();
+        g_uiInited = false;
+        g_uiPanel  = nullptr;
+    }
+
     bool ensureMeshSlot(uint32_t slot) {
         if (slot < g_meshCap) {
             return true;
@@ -2343,6 +2528,11 @@ namespace ForgeRender {
         g_live.width = width;
         g_live.height = height;
         g_live.firstFrame = true;
+
+        // Dev overlay: Forge IUI rendered into pRT each frame. UI is single-sample and matches
+        // pRT's B8G8R8A8 (no MSAA UI pipeline). Failure here is non-fatal — the scene still renders.
+        initDevUI(R, width, height, (uint32_t)g_live.pRT->mFormat);
+
         std::printf("[forge] live init OK\n");
         return true;
     }
@@ -2406,6 +2596,8 @@ namespace ForgeRender {
         return true;
     }
 
+    void checkShaderHotReload();   // defined below; polls the gtao dxil mtime for auto hot-reload
+
     bool renderScene(const float* viewProj, const float* lighting, const void* drawBlob,
                      unsigned drawCount, unsigned drawBytes,
                      const void* skinnedBlob, unsigned skinnedCount, unsigned skinnedBytes,
@@ -2415,6 +2607,7 @@ namespace ForgeRender {
             return false;
         }
         Renderer* R = g_live.pRenderer;
+        checkShaderHotReload();   // auto-reload compute pipelines if a recompiled dxil landed on disk
 
         // If the device was already removed on a PRIOR frame (e.g. during a dense exterior),
         // every subsequent frame stays black no matter the scene — this names that state
@@ -2839,16 +3032,13 @@ namespace ForgeRender {
             if (!invert4x4(rzViewProj, invVP)) {
                 for (int i = 0; i < 16; ++i) { invVP[i] = (i % 5 == 0) ? 1.0f : 0.0f; }  // identity guard
             }
-            const float kAORadius    = 12.0f;   // world-unit search extent (scene-walk seed)
-            const float kAOFalloff   = 50.0f;   // world-unit distance falloff (scene-walk seed)
-            const float kAOIntensity = 1.8f;    // occlusion scale (scene-walk forwardAO factor)
-            const float kAOThickness = 0.25f;   // reserved (thin-feature heuristic; unused in T2)
+            // AO knobs are now dev-overlay sliders (g_ao*); the per-frame upload reads them live.
             const float* fcbv = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
             float* ap = (float*)g_live.pAOParamsCbv->pCpuMappedAddress;
             std::memcpy(ap, invVP, 16 * sizeof(float));
             ap[16] = (float)g_live.width;  ap[17] = (float)g_live.height;
             ap[18] = 1.0f / (float)g_live.width; ap[19] = 1.0f / (float)g_live.height;
-            ap[20] = kAORadius; ap[21] = kAOFalloff; ap[22] = kAOIntensity; ap[23] = kAOThickness;
+            ap[20] = g_aoRadius; ap[21] = g_aoFalloff; ap[22] = g_aoIntensity; ap[23] = g_aoThickness;
             ap[24] = fcbv[36]; ap[25] = fcbv[37]; ap[26] = fcbv[38]; ap[27] = 0.0f;
 
             const uint32_t gx = (g_live.width + 7u) / 8u;
@@ -3168,20 +3358,33 @@ namespace ForgeRender {
 
             cl->ResolveSubresource(dstRes, 0, msaaRes, 0, DXGI_FORMAT_B8G8R8A8_UNORM);
 
+            // Resolve dst back to RENDER_TARGET (not COMMON yet) so the dev overlay can draw into
+            // it; the final COMMON transition for the D3D9Ex handoff happens after drawDevUI().
             D3D12_RESOURCE_BARRIER post[2] = {};
             post[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             post[0].Transition.pResource = dstRes;
             post[0].Transition.Subresource = 0;
             post[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RESOLVE_DEST;
-            post[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;   // hand off to D3D9Ex
+            post[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
             post[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             post[1].Transition.pResource = msaaRes;
             post[1].Transition.Subresource = 0;
             post[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
             post[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;   // ready for next frame
             cl->ResourceBarrier(2, post);
+
+            // Dev overlay into the resolved pRT (RENDER_TARGET), then hand off to COMMON natively.
+            drawDevUI();
+            D3D12_RESOURCE_BARRIER toCommon = {};
+            toCommon.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            toCommon.Transition.pResource = dstRes;
+            toCommon.Transition.Subresource = 0;
+            toCommon.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            toCommon.Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;   // hand off to D3D9Ex
+            cl->ResourceBarrier(1, &toCommon);
         } else {
-            // No MSAA: hand the shared RT (rendered into directly) back to COMMON for StretchRect.
+            // No MSAA: dev overlay into pRT (still RENDER_TARGET), then hand back to COMMON for StretchRect.
+            drawDevUI();
             RenderTargetBarrier toCommon = {};
             toCommon.pRenderTarget = g_live.pRT;
             toCommon.mCurrentState = RESOURCE_STATE_RENDER_TARGET;
@@ -3224,6 +3427,81 @@ namespace ForgeRender {
     }
 
     void setDebugMode(unsigned m) { g_debugMode = m; }
+
+    void setDevInput(int x, int y, unsigned buttons, float wheel, unsigned uiVisible) {
+        g_inMouseX = (float)x;
+        g_inMouseY = (float)y;
+        g_inLBtn   = (buttons & 0x1u) != 0;
+        g_inRBtn   = (buttons & 0x2u) != 0;
+        g_inMBtn   = (buttons & 0x4u) != 0;
+        g_inWheel  = wheel;
+        g_uiVisible = (uiVisible != 0);
+    }
+
+    // Dev hot-reload (F8): rebuild the compute pipelines (gtao + linearize) from the dxil currently
+    // on disk — no game restart. The descriptor sets stay valid (bound to the root signature, which
+    // is unchanged), so only shader+pipeline are swapped. Recompile externally with fsl.py + redeploy
+    // the *_0.dxil first, then trigger this. Queue is idled so no in-flight dispatch uses the old PSO.
+    void reloadComputeShaders() {
+        Renderer* R = g_live.pRenderer;
+        if (!R || !g_live.pGtaoShader) {
+            return;
+        }
+        waitQueueIdle(g_live.pQueue);
+
+        removePipeline(R, g_live.pGtaoPipeline);       g_live.pGtaoPipeline = nullptr;
+        removeShader(R, g_live.pGtaoShader);           g_live.pGtaoShader = nullptr;
+        removePipeline(R, g_live.pLinearizePipeline);  g_live.pLinearizePipeline = nullptr;
+        removeShader(R, g_live.pLinearizeShader);      g_live.pLinearizeShader = nullptr;
+
+        const char* linName = (g_live.sampleCount > 1) ? "linearizedepth_sc4.comp"
+                                                       : "linearizedepth_sc1.comp";
+        ShaderLoadDesc lsd = {};
+        lsd.mComp.pFileName = linName;
+        addShader(R, &lsd, &g_live.pLinearizeShader);
+        ShaderLoadDesc gsd = {};
+        gsd.mComp.pFileName = "gtao.comp";
+        addShader(R, &gsd, &g_live.pGtaoShader);
+        if (!g_live.pLinearizeShader || !g_live.pGtaoShader) {
+            LOG::logline("!! [forge] hot-reload addShader FAILED (dxil missing on disk?)"); LOG::flush();
+            return;
+        }
+        PipelineDesc lpd = {};
+        lpd.mType = PIPELINE_TYPE_COMPUTE;
+        lpd.mComputeDesc.pShaderProgram = g_live.pLinearizeShader;
+        addPipeline(R, &lpd, &g_live.pLinearizePipeline);
+        PipelineDesc gpd = {};
+        gpd.mType = PIPELINE_TYPE_COMPUTE;
+        gpd.mComputeDesc.pShaderProgram = g_live.pGtaoShader;
+        addPipeline(R, &gpd, &g_live.pGtaoPipeline);
+        LOG::logline(">> [forge] compute shaders hot-reloaded (gtao.comp + %s)", linName); LOG::flush();
+    }
+
+    // Auto hot-reload: poll the gtao dxil's mtime (CWD = morrowind64, same dir the loader reads from)
+    // every ~20 frames; when it changes, an external fsl.py watcher has landed a recompile, so rebuild
+    // the compute pipelines. Edit .fsl -> save -> live, no key press. (F8 stays as a manual trigger.)
+    void checkShaderHotReload() {
+        static unsigned long long s_lastWrite = 0;
+        static unsigned s_tick = 0;
+        if ((s_tick++ % 20) != 0) {
+            return;
+        }
+        WIN32_FILE_ATTRIBUTE_DATA fad = {};
+        if (!GetFileAttributesExA("DIRECT3D12\\gtao.comp_0.dxil", GetFileExInfoStandard, &fad)) {
+            return;
+        }
+        unsigned long long w = ((unsigned long long)fad.ftLastWriteTime.dwHighDateTime << 32) |
+                               fad.ftLastWriteTime.dwLowDateTime;
+        if (s_lastWrite == 0) {
+            s_lastWrite = w;   // baseline: don't reload the first time we see the file
+            return;
+        }
+        if (w != s_lastWrite) {
+            s_lastWrite = w;
+            LOG::logline(">> [forge] gtao dxil changed on disk — auto hot-reload"); LOG::flush();
+            reloadComputeShaders();
+        }
+    }
 
     unsigned lastDrawn() { return g_lastDrawn; }
     unsigned lastSkinnedDrawn() { return g_lastSkinnedDrawn; }
@@ -3818,6 +4096,7 @@ namespace ForgeRender {
             return;
         }
         freeMeshStore();   // release VB/IB before the resource loader goes down
+        exitDevUI();       // Forge IUI/IFont teardown while the renderer is still alive
         // M1c opaque path teardown.
         if (g_live.pPerFrameSet)    { removeDescriptorSet(R, g_live.pPerFrameSet); }
         if (g_live.pPerLightsSet)   { removeDescriptorSet(R, g_live.pPerLightsSet); }

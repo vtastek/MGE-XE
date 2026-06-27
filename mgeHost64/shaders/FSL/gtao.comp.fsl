@@ -3,11 +3,13 @@
 // Reads the single-sample reverse-Z DEVICE depth (gLinearDepthIn from the linearize pass),
 // reconstructs WORLD positions per tap via gAOParams.invViewProj (only the combined viewProj is
 // available host-side — no separate view/proj — so the whole search runs in world space keyed off
-// gAOParams.eyePos), reconstructs the surface normal from min-difference depth neighbours, runs a
-// Jimenez-style GTAO horizon integral, and writes float4(bentNormalWS, visibility) to gAOOut.
+// gAOParams.eyePos), reconstructs the surface normal from min-difference depth neighbours, and runs
+// an HBAO-style elevation search (occlusion = how high a neighbour rises above the tangent plane,
+// N-relative so it is VIEW-INDEPENDENT — no matcap, no grazing blackening; V is only used to orient
+// the bent normal). Writes float4(bentNormalWS, visibility) to gAOOut.
 //
 //   a (visibility)  : 1 = fully open (white), 0 = fully occluded (cavity). Tier 3 will do ambient *= a.
-//   rgb (bent normal): world-space mean unoccluded direction (debug mode 4 shows it *0.5+0.5).
+//   rgb (bent normal): world-space mean unoccluded direction (debug mode 4 outputs it RAW, no remap).
 //
 // Tier 2 is AO-in-isolation: nothing here feeds the colour pass except the F12 debug views. Seeds
 // follow scene-walk (radius/falloff/intensity in gAOParams); they are WORLD-unit knobs and may need
@@ -17,7 +19,7 @@
 
 #define GTAO_PI       3.14159265359f
 #define GTAO_HALF_PI  1.57079632679f
-#define NUM_SLICES    2
+#define NUM_SLICES    3
 #define NUM_STEPS     8
 
 float3 reconstructWorld(float2 uv, float deviceZ)
@@ -50,27 +52,33 @@ NUM_THREADS(8, 8, 1)
 void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
 {
     INIT_MAIN;
+	float vis = 0.0f;
+	float3 bn = 0.0f;
+	float3 deb = 0.0f;
     int2   px        = int2(DispatchThreadID.xy);
     float2 screen    = gAOParams.screenParams.xy;
     float2 invScreen = gAOParams.screenParams.zw;
     float2 uv        = (float2(px) + 0.5f) * invScreen;
 
     float deviceZ = loadDeviceZ(px);
+	
+	
     // Reverse-Z far/cleared = 0.0 (sky / no geometry) → fully unoccluded.
     if (deviceZ <= 0.0f)
     {
         Write2D(gAOOut, px, float4(0.0f, 0.0f, 1.0f, 1.0f));
         RETURN();
     }
-
     float3 P = reconstructWorld(uv, deviceZ);
     float3 V = normalize(gAOParams.eyePos.xyz - P);
+
 
     // Screen-axis world deltas (also map screen directions → world tangent for the slices).
     float3 Pr = reconstructWorld(uv + float2(invScreen.x, 0.0f), loadDeviceZ(px + int2(1, 0)));
     float3 Pl = reconstructWorld(uv - float2(invScreen.x, 0.0f), loadDeviceZ(px - int2(1, 0)));
     float3 Pu = reconstructWorld(uv + float2(0.0f, invScreen.y), loadDeviceZ(px + int2(0, 1)));
     float3 Pd = reconstructWorld(uv - float2(0.0f, invScreen.y), loadDeviceZ(px - int2(0, 1)));
+	
 
     // Min-difference neighbours (smaller world gap = same surface; rejects silhouette bleed).
     float3 dxr = Pr - P, dxl = P - Pl;
@@ -79,18 +87,41 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     float3 ddyv = (dot(dyr, dyr) < dot(dyl, dyl)) ? dyr : dyl;
     float3 N = normalize(cross(ddxv, ddyv));
     if (dot(N, V) < 0.0f) { N = -N; }   // orient toward the camera
+	
+
+
 
     // Adaptive screen radius: keep the world search extent ~constant regardless of distance.
-    float wpp = max(min(length(dxr), length(dxl)), 1e-4f);   // world units per pixel (approx)
+    float wpp = max(min(length(dxr), length(dxl)), 1e-4f);
+	// world units per pixel (approx)
     float radiusWorld = gAOParams.aoParams.x;
     float searchPixels = clamp(radiusWorld / wpp, 2.0f, 96.0f);
-    float stepPx = searchPixels / float(NUM_STEPS);
+
+    // Force >=1px per step: sub-pixel steps make every sample land on ~the same texel, so ds is a
+    // tiny depth-quantized world delta and dot(ds,N)/|ds| explodes into noise (worst where wpp is
+    // large — distant / low-radius pixels, amplified by reverse-Z quantization). 1px steps give each
+    // sample a real, distinct world delta. The effective search may exceed radius where wpp is big;
+    // that trade buys clean AO.
+    float stepPx = max(searchPixels / float(NUM_STEPS), 1.0f);
+
+
     float falloff = max(gAOParams.aoParams.y, 1e-3f);
+	
+    // N-relative thickness bias: a sample only occludes if it rises more than this above the
+    // surface tangent plane (sin of elevation). This is VIEW-INDEPENDENT, unlike a horizon-cosine
+    // bias — a flat plane has elevation 0 everywhere, so it never self-occludes at any camera angle.
+    float horizonBias = gAOParams.aoParams.w;
 
     float  rnd   = ignoise(float2(px));
-    float  ao    = 0.0f;
+    float  occ   = 0.0f;                       // accumulated OCCLUSION (0 = open, 1 = blocked)
     float3 bentN = float3(0.0f, 0.0f, 0.0f);
 
+    // HBAO-style horizon search: occlusion is the ELEVATION a neighbour rises above this surface's
+    // tangent plane (sin of the horizon angle), measured purely N-relative. The view vector V never
+    // enters the occlusion term, so flat surfaces give 0 at EVERY camera angle — no matcap, no
+    // grazing-angle blackening. (V is only used to orient the bent normal / N.) NOTE: hP/hM take the
+    // elevation as-is per step (no running max) — maxing let one tall/noisy sample latch the whole
+    // sweep's horizon, which showed up as artifacts; per-step assignment is cleaner here.
     UNROLL
     for (int s = 0; s < NUM_SLICES; ++s)
     {
@@ -98,15 +129,8 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         float2 dir = float2(cos(phi), sin(phi));            // screen-space (pixels)
         float3 sliceDirW = normalize(ddxv * dir.x + ddyv * dir.y);
 
-        // Slice plane spanned by V and sliceDirW; project the normal into it.
-        float3 planeN = normalize(cross(sliceDirW, V));
-        float3 Np = N - planeN * dot(N, planeN);
-        float  nLen = length(Np);
-        if (nLen < 1e-4f) { continue; }
-        float3 Npn = Np / nLen;
-        float  n = atan2(dot(Npn, sliceDirW), dot(Npn, V));  // projected-normal angle from V
-
-        float2 cosH = float2(-1.0f, -1.0f);   // x = +dir horizon cos, y = -dir horizon cos
+        float hP = 0.0f;   // +dir elevation above tangent plane (sin), >= 0
+        float hM = 0.0f;   // -dir elevation
 
         for (int t = 1; t <= NUM_STEPS; ++t)
         {
@@ -116,44 +140,49 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
             float dzp = loadDeviceZ(scp);
             if (dzp > 0.0f)
             {
-                float3 S = reconstructWorld((float2(scp) + 0.5f) * invScreen, dzp);
-                float3 ds = S - P;
+                float3 ds = reconstructWorld((float2(scp) + 0.5f) * invScreen, dzp) - P;
                 float  dl = length(ds);
-                float  c  = dot(ds / max(dl, 1e-6f), V);
-                c = lerp(-1.0f, c, saturate(1.0f - dl / falloff));   // distance falloff
-                cosH.x = max(cosH.x, c);
+                // sin(elevation above tangent) minus the height bias; clamp negatives (at/below
+                // the surface) to 0, then fade with distance so far geometry stops occluding.
+                float  e = max(dot(ds, N) / max(dl, 1e-6f) - horizonBias, 0.0f);
+                e *= saturate(1.0f - dl / falloff);
+                hP = e;
             }
             // -dir
             int2  scm = px - int2(dir * off + 0.5f);
             float dzm = loadDeviceZ(scm);
             if (dzm > 0.0f)
             {
-                float3 S = reconstructWorld((float2(scm) + 0.5f) * invScreen, dzm);
-                float3 ds = S - P;
+                float3 ds = reconstructWorld((float2(scm) + 0.5f) * invScreen, dzm) - P;
                 float  dl = length(ds);
-                float  c  = dot(ds / max(dl, 1e-6f), V);
-                c = lerp(-1.0f, c, saturate(1.0f - dl / falloff));
-                cosH.y = max(cosH.y, c);
+                float  e = max(dot(ds, N) / max(dl, 1e-6f) - horizonBias, 0.0f);
+                e *= saturate(1.0f - dl / falloff);
+                hM = e;
             }
         }
 
-        // Clamp horizons into the visible hemisphere around the projected normal.
-        float th1 = n + max(-acos(clamp(cosH.y, -1.0f, 1.0f)) - n, -GTAO_HALF_PI);   // -dir (<=0)
-        float th2 = n + min( acos(clamp(cosH.x, -1.0f, 1.0f)) - n,  GTAO_HALF_PI);   // +dir (>=0)
-        ao += nLen * (gtaoInner(th1, n) + gtaoInner(th2, n));
-
-        float  bentAngle = 0.5f * (th1 + th2);
-        bentN += (V * cos(bentAngle) + sliceDirW * sin(bentAngle)) * nLen;
+        // Slice occlusion = mean of the two horizon sines. Bent normal tilts toward the more-open
+        // side (lower horizon) along the slice tangent, lifted by overall openness.
+        occ += 0.5f * (hP + hM);
+        float openP = 1.0f - hP;
+        float openM = 1.0f - hM;
+        bentN += N * (openP + openM) + sliceDirW * (openP - openM);
     }
 
-    ao = saturate(ao / float(NUM_SLICES));
-    // intensity scales OCCLUSION (scene-walk feel: forwardAO = 1 - intensity*occlusion).
-    float occ = (1.0f - ao) * gAOParams.aoParams.z;
-    float vis = saturate(1.0f - occ);
-
-    float3 bn = bentN + N * 1e-3f;   // guard fully-degenerate accumulation
+    occ = saturate(occ / float(NUM_SLICES));
+    // Resolve fade: where the world radius is finer than a pixel (radiusWorld < wpp), the search
+    // CAN'T represent it — the pixel/step floors over-reach and sample geometry tens of units away,
+    // producing flickery false occlusion (worst in the distance / at grazing, where wpp is large).
+    // Fade AO to zero there: a sub-pixel radius should yield NO AO, not noise. Full once the radius
+    // spans >~2 px. This is what makes a small radius (e.g. 1) usable — tight AO up close, clean
+    // (empty) where it can't be resolved — and never touches well-resolved large-radius pixels.
+    occ *= saturate(radiusWorld / wpp - 1.0f);
+    occ *= gAOParams.aoParams.z;                                     // intensity scales occlusion
+    vis = saturate(1.0f - occ);
+ 
+    bn = bentN + N * 1e-3f;   // guard fully-degenerate accumulation
     bn = normalize(bn);
-
+	
     Write2D(gAOOut, px, float4(bn, vis));
     RETURN();
 }

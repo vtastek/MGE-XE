@@ -32,6 +32,11 @@ namespace {
     int    g_debugMode = 0;            // F12 diagnostic cycle: 0=normal, 1=depth (world-distance), 2=scatter, 3=AO, 4=bent normal
     unsigned g_frame = 0;
 
+    // Dev overlay (Stage 2): F9 toggles the in-host Forge panel; mouse is polled each frame and
+    // forwarded over the renderScene RPC. The host injects it into Forge UI (uiSetExternalInput).
+    bool   g_devUiVisible = false;     // F9; default off so it never blocks normal play
+    HWND   g_devHwnd = nullptr;        // MW focus window (cached from device creation params)
+
     // --- Feeding-side spike logging --------------------------------------------------
     // Periodic FPS dips are suspected to come from the client feed (geometry/texture
     // uploads + the blocking host RPC), not the host GPU. Time each phase of onPresent
@@ -1131,6 +1136,11 @@ namespace RenderProcess {
                              : (g_debugMode == 3) ? "AO" : (g_debugMode == 4) ? "BENT NORMAL" : "NORMAL";
             LOG::logline(">> [seam] debug mode %d (%s)", g_debugMode, name);
         }
+        // F9 toggles the in-host dev overlay (edge-triggered).
+        if (GetAsyncKeyState(VK_F9) & 0x0001) {
+            g_devUiVisible = !g_devUiVisible;
+            LOG::logline(">> [seam] dev overlay %s", g_devUiVisible ? "ON" : "OFF");
+        }
         if (!g_enabled) {
             return;
         }
@@ -1225,6 +1235,34 @@ namespace RenderProcess {
             0.0f,                      0.0f,                      0.0f,                      0.0f,
         };
 
+        // Dev overlay input (Stage 2): poll the mouse in MW client-space pixels (1:1 with the host
+        // render target) + L/R/M buttons, and forward with the F9 visibility flag. Only meaningful
+        // when the panel is up; otherwise uiVisible=0 leaves the host overlay hidden/inert.
+        IPC::DevInput devInput;
+        devInput.uiVisible = g_devUiVisible ? 1u : 0u;
+        // F8 (edge): one-shot host compute-shader hot-reload — rebuild gtao/linearize from the dxil
+        // on disk (recompile + redeploy first). Independent of panel visibility.
+        if (GetAsyncKeyState(VK_F8) & 0x0001) {
+            devInput.reloadShaders = 1u;
+            LOG::logline(">> [seam] compute shader hot-reload requested (F8)");
+        }
+        if (g_devUiVisible) {
+            if (!g_devHwnd) {
+                D3DDEVICE_CREATION_PARAMETERS cp = {};
+                if (SUCCEEDED(device->GetCreationParameters(&cp))) {
+                    g_devHwnd = cp.hFocusWindow;
+                }
+            }
+            POINT p;
+            if (GetCursorPos(&p) && g_devHwnd && ScreenToClient(g_devHwnd, &p)) {
+                devInput.x = p.x;
+                devInput.y = p.y;
+            }
+            if (GetAsyncKeyState(VK_LBUTTON) & 0x8000) devInput.buttons |= 0x1u;
+            if (GetAsyncKeyState(VK_RBUTTON) & 0x8000) devInput.buttons |= 0x2u;
+            if (GetAsyncKeyState(VK_MBUTTON) & 0x8000) devInput.buttons |= 0x4u;
+        }
+
         ok = g_client->renderSceneBlocking(frame, (const float*)&viewProj, lighting,
                  haveDraw ? g_drawVec->id() : IPC::InvalidVector,
                  haveDraw ? drawCount : 0,
@@ -1232,7 +1270,7 @@ namespace RenderProcess {
                  skinnedId, skinnedCount, skinnedBytes,
                  multiMapId, (multiMapId != IPC::InvalidVector) ? multiMapCount : 0, multiMapBytes,
                  lightId, (lightId != IPC::InvalidVector) ? lightCount : 0, lightBytes,
-                 (std::uint32_t)g_debugMode, &hostMs);
+                 (std::uint32_t)g_debugMode, &devInput, &hostMs);
         const double tRender = nowMs();
         if (!ok) {
             return;

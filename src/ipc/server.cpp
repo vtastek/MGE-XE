@@ -559,6 +559,11 @@ namespace IPC {
 				LOG::flush();
 			}
 			ForgeRender::setDebugMode(params.debugMode);
+			ForgeRender::setDevInput(params.devMouseX, params.devMouseY, params.devMouseButtons,
+				params.devMouseWheel, params.devUiVisible);
+			if (params.devReloadShaders) {
+				ForgeRender::reloadComputeShaders();
+			}
 			ok = ForgeRender::renderScene(params.viewProj, params.lighting, drawPtr, params.drawCount, bytes,
 				skinnedPtr, params.skinnedCount, skinnedBytes,
 				multiMapPtr, params.multiMapCount, multiMapBytes,

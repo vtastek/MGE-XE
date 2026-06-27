@@ -1139,7 +1139,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     if (dbg == 3u || dbg == 4u) {
         float2 aoUv = In.Position.xy * gFrameData.debugParams.yz;
         float4 ao = SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
-        if (dbg == 4u) { RETURN(float4(ao.rgb * 0.5f + 0.5f, 1.0f)); }
+        if (dbg == 4u) { RETURN(float4(ao.rgb, 1.0f)); }
         float v = ao.a; RETURN(float4(v, v, v, 1.0f));
     }
     if (dbg >= 1u) {

@@ -923,211 +923,107 @@ inline int2 GetDimensions(TextureCube t, SamplerState smp) { return GetDimension
 
 #endif // _D3D_H
 
-#line 1 "FSL/shaders.list"
-#line 10 "FSL/shaders.list"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
-#line 25 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fsl_srt.h"
-#line 40 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fsl_srt.h"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/d3d12_srt.h"
-#line 41 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fsl_srt.h"
-#line 26 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
-#line 143 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
+#line 1 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/UIShaders.list"
+#line 1 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/../../../../Graphics/FSL/defaults.h"
+#line 25 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/../../../../Graphics/FSL/defaults.h"
+#line 1 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/fsl_srt.h"
+#line 40 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/fsl_srt.h"
+#line 1 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/d3d12_srt.h"
+#line 41 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/fsl_srt.h"
+#line 26 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/../../../../Graphics/FSL/defaults.h"
+#line 143 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/../../../../Graphics/FSL/defaults.h"
 
 SamplerState gSamplerPointClamp : register( s0 , space100 ) ;
-#line 146 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
+#line 146 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/../../../../Graphics/FSL/defaults.h"
 SamplerState gSamplerPointWrap : register( s1 , space100 ) ;
-#line 148 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
+#line 148 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/../../../../Graphics/FSL/defaults.h"
 SamplerState gSamplerBilinearClamp : register( s2 , space100 ) ;
-#line 150 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
+#line 150 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/../../../../Graphics/FSL/defaults.h"
 SamplerState gSamplerBilinearWrap : register( s3 , space100 ) ;
-#line 152 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
+#line 152 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/../../../../Graphics/FSL/defaults.h"
 SamplerState gSamplerTrilinearClamp : register( s4 , space100 ) ;
-#line 154 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
+#line 154 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/../../../../Graphics/FSL/defaults.h"
 SamplerState gSamplerTrilinearWrap : register( s5 , space100 ) ;
-#line 156 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
+#line 156 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/../../../../Graphics/FSL/defaults.h"
 SamplerState gSamplerPointMirror : register( s6 , space100 ) ;
-#line 158 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
+#line 158 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/../../../../Graphics/FSL/defaults.h"
 SamplerState gSamplerPointBorder : register( s7 , space100 ) ;
-#line 160 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
+#line 160 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/../../../../Graphics/FSL/defaults.h"
 SamplerState gSamplerTrilinearMirror : register( s8 , space100 ) ;
-#line 162 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
+#line 162 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/../../../../Graphics/FSL/defaults.h"
 SamplerState gSamplerTrilinearBorder : register( s9 , space100 ) ;
-#line 164 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
+#line 164 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/../../../../Graphics/FSL/defaults.h"
 SamplerState gSamplerAnisotropic : register( s10 , space100 ) ;
-#line 167 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
+#line 167 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/../../../../Graphics/FSL/defaults.h"
 
-#line 11 "FSL/shaders.list"
-#line 54 "FSL/shaders.list"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap.frag.fsl"
-#line 11 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap.frag.fsl"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-#line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-STRUCT(FrameData)
+#line 2 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/UIShaders.list"
+#line 3 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/UIShaders.list"
+#line 1 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Tools/ForgeShadingLanguage/includes/fsl_ext.h"
+#line 26 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Tools/ForgeShadingLanguage/includes/fsl_ext.h"
+#line 1 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Tools/ForgeShadingLanguage/includes/d3d12_ext.h"
+#line 27 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Tools/ForgeShadingLanguage/includes/fsl_ext.h"
+#line 4 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/UIShaders.list"
+#line 8 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/UIShaders.list"
+#line 1 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Tools/ForgeShadingLanguage/includes/fsl_ext.h"
+#line 9 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/UIShaders.list"
+#line 13 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/UIShaders.list"
+#line 1 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Tools/ForgeShadingLanguage/includes/fsl_ext.h"
+#line 14 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/UIShaders.list"
+#line 18 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/UIShaders.list"
+#line 1 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Tools/ForgeShadingLanguage/includes/fsl_ext.h"
+#line 19 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/UIShaders.list"
+#line 23 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/UIShaders.list"
+#line 1 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Tools/ForgeShadingLanguage/includes/fsl_ext.h"
+#line 24 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/UIShaders.list"
+#line 26 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/UIShaders.list"
+#line 1 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/ImGui.frag.fsl"
+#line 25 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/ImGui.frag.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/ImGuiResources.h"
+#line 32 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/ImGuiResources.h"
+STRUCT(UniformBlock)
 {
-    float4x4 viewProj;
-
-
-
-    float4 sunDir;
-    float4 sunCol;
-    float4 ambCol;
-    float4 fogColNear;
-    float4 fogParams;
-    float4 eyePos;
-
-
-    float4 debugParams;
-#line 36
+	float4x4 ProjectionMatrix;
+#line 35
 };
+#line 37 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/ImGuiResources.h"
+#line 1 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/ImGui.srt.h"
+#line 29 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/ImGui.srt.h"
+		CBUFFER(UniformBlock) gUniformBlock :  register(b0,space2);
 
-STRUCT(BatchData)
+
+
+		Tex2DMS(float4, 16 ) gTexture :  register(t1,space2);
+
+#line 38 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/ImGuiResources.h"
+#line 26 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/ImGui.frag.fsl"
+
+STRUCT(PS_INPUT)
 {
-    float4x4 worlds[ 1024 ];
-#line 41
+	DATA(float4, pos, SV_Position);
+	DATA(float4, col, COLOR0);
+	DATA(float2, uv, TEXCOORD0);
+#line 32
 };
-
-
-
-
-
-
-
-
-STRUCT(LightData)
-{
-    float4 lightParams;
-    float4 lights[ 128  * 3];
-#line 54
-};
-
-        CBUFFER(FrameData) gFrameData :  register(b0,space1);
-
-
-
-
-
-        Tex2D(float4) gAO :  register(t1,space1);
-
-
-
-
-        CBUFFER(LightData) gLights :  register(b0,space3);
-#line 84 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-        Tex2D(float4) gTextures[ 1024 ] :  register(t0,space0);
-        CBUFFER(BatchData) gBatch :  register(b0,space2);
-#line 12 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap.frag.fsl"
-
-STRUCT(VSOutput)
-{
-    DATA(float4, Position, SV_Position);
-    DATA(float3, Normal, NORMAL);
-    DATA(float2, Uv0, TEXCOORD0);
-    DATA(float2, Uv1, TEXCOORD1);
-    DATA(float2, Uv2, TEXCOORD2);
-    DATA(float2, Uv3, TEXCOORD3);
-    DATA(float, Fog, TEXCOORD4);
-    DATA(float4, Color, COLOR);
-    DATA(FLAT(float3),MatDiffuse, TEXCOORD5);
-    DATA(FLAT(float3),MatAmbient, TEXCOORD6);
-    DATA(FLAT(float3),MatEmissive,TEXCOORD7);
-    DATA(float3, WorldPos, TEXCOORD8);
-    DATA(FLAT(uint4), Stages, TEXCOORD9);
-    DATA(FLAT(uint), Packed, TEXCOORD10);
-#line 29
-};
-
-
-float3 tonemap(float3 c)
-{
-    c = clamp(c, 0.0f, 2.2f);
-    c = (((0.0548303f * c - 0.189786f) * c - 0.154732f) * c + 1.12969f) * c;
-    return c;
-}
 
 [RootSignature( "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)" )]
-float4 PS_MAIN( VSOutput In ): SV_TARGET
+float4 PS_MAIN( PS_INPUT In ): SV_TARGET
 {
-    //INIT_MAIN;
-    float3 N = normalize(In.Normal);
-
-    float ndl = saturate(dot(N, -gFrameData.sunDir.xyz));
-    float3 d = gFrameData.sunCol.rgb * ndl;
-    float3 a = gFrameData.ambCol.rgb;
-    {
-        uint nLights = (uint)gLights.lightParams.x;
-        for (uint i = 0; i < nLights; ++i)
-        {
-            float4 posR = gLights.lights[i * 3u + 0u];
-            float3 lightCol= gLights.lights[i * 3u + 1u].rgb;
-            float3 fo = gLights.lights[i * 3u + 2u].xyz;
-            float radius = posR.w;
-
-            float3 toLight = posR.xyz - In.WorldPos;
-            float dist2 = dot(toLight, toLight);
-            float invDist = rsqrt(max(dist2, 1e-8f));
-            float dist = dist2 * invDist;
-
-            float att = 1.0f / max(fo.z * dist2 + fo.y * dist + fo.x, 1e-4f);
-            att *= 1.0f - smoothstep(radius, 2.0f * radius, dist);
-
-            float lambert = saturate(dot(N, toLight) * invDist);
-            d += lambert * att * lightCol;
-        }
-    }
-    uint vColSource = (In.Packed >> 3u) & 0x3u;
-    float3 lit;
-    if (vColSource == 2u) {
-        lit = In.Color.rgb * (d + a) + In.MatEmissive;
-    } else if (vColSource == 1u) {
-        lit = In.MatDiffuse * d + In.MatAmbient * a + In.Color.rgb;
-    } else {
-        lit = In.MatDiffuse * d + In.MatAmbient * a + In.MatEmissive;
-    }
+	//INIT_MAIN;
+	float4 Out = f4(0);
 
 
 
+	GetDimensionsMS(gTexture, texSize);
+	uint2 coord = uint2(float2(texSize) * In.uv);
+	for (int s = 0; s <  16 ; ++s)
+	{
+		Out += LoadTex2DMS(gTexture, gSamplerBilinearClamp, coord, s);
+	}
+	Out = In.col * (Out /  16 );
 
-    uint stageCount = In.Packed & 0x7u;
-    float alphaRef = float((In.Packed >> 8u) & 0xFFu) * (1.0f / 255.0f);
-    float3 c = lit;
-    float baseA = 1.0f;
-    for (uint s = 0u; s < 4u; ++s)
-    {
-        if (s >= stageCount) { break; }
-
-        uint sw = (s == 0u) ? In.Stages.x : (s == 1u) ? In.Stages.y
-                : (s == 2u) ? In.Stages.z : In.Stages.w;
-        uint tex = sw & 0xFFFFu;
-        uint uvSet = (sw >> 16u) & 0x3u;
-        uint op = (sw >> 18u) & 0x3u;
-        float2 uv = (uvSet == 0u) ? In.Uv0 : (uvSet == 1u) ? In.Uv1
-                  : (uvSet == 2u) ? In.Uv2 : In.Uv3;
-        float4 t = SampleTex2D(gTextures[tex], gSamplerAnisotropic, uv);
-        if (op == 0u) { c = t.rgb * lit; baseA = t.a; }
-        else if (op == 1u) { c *= t.rgb; }
-        else if (op == 2u) { c *= t.rgb * 2.0f; }
-        else { c += t.rgb; }
-    }
-
-
-    if (baseA < alphaRef) { discard; }
-
-    c = tonemap(c);
-    c = lerp(gFrameData.fogColNear.rgb, c, In.Fog);
-
-    uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
-    if (dbg == 3u || dbg == 4u) {
-        float2 aoUv = In.Position.xy * gFrameData.debugParams.yz;
-        float4 ao = SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
-        if (dbg == 4u) { RETURN(float4(ao.rgb, 1.0f)); }
-        float v = ao.a; RETURN(float4(v, v, v, 1.0f));
-    }
-    if (dbg >= 1u) {
-        float dist = length(In.WorldPos - gFrameData.eyePos.xyz);
-        float g = saturate(dist * (1.0f / 8192.0f));
-        return (float4(g, g, g, 1.0f));
-    }
-    return (float4(c, 1.0f));
+	return (Out);
 }
-#line 55 "FSL/shaders.list"
+#line 27 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/UIShaders.list"
+#line 29 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/UIShaders.list"
+#line 1 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Tools/ForgeShadingLanguage/includes/fsl_ext.h"
+#line 30 "C:/projects/mgexe/MGE-XE/3rdparty/The-Forge/Common_3/Application/UI/Shaders/FSL/UIShaders.list"
