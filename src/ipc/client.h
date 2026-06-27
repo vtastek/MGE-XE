@@ -53,6 +53,10 @@ namespace IPC {
 		Parameters* m_ipcParameters;
 		bool m_isRpcPending;
 
+		// Dev FSL hot-reload watcher: a Windows-python child (watch_shaders.py) launched alongside
+		// the host in a dev tree, killed with it. INVALID when not spawned (shipped tree / no python).
+		HANDLE m_watcherProcess;
+
 		// Dedicated GEOMETRY channel: a SECOND shared-mem Parameters + start/complete
 		// events to the SAME host process. Bulk geometry uploads run here so they never
 		// contend with the one-at-a-time cull/scene RPCs on the main channel — that
@@ -71,6 +75,8 @@ namespace IPC {
 		bool beginRpc(Command command);
 		bool beginGeomRpc(Command command);
 		WakeReason waitGeomCompletion(DWORD ms = MaxWait);
+		void startWatcher();   // dev FSL hot-reload watcher; no-op outside a dev tree
+		void stopWatcher();
 
 	public:
 		Client();
@@ -295,6 +301,7 @@ namespace IPC {
 			VecId multiMapList, std::uint32_t multiMapCount, std::uint32_t multiMapBytes,
 			VecId lightList, std::uint32_t lightCount, std::uint32_t lightBytes,
 			std::uint32_t debugMode = 0,
+			const DevInput* devInput = nullptr,
 			double* outRenderMs = nullptr);
 
 		/**

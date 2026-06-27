@@ -507,6 +507,101 @@
       <TreatWarningAsError>false</TreatWarningAsError>
       <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
+    <!-- Dev overlay (Forge IUI/IFont). UI.cpp carries the FORGE_HOST_EXTERNAL_INPUT shim so the
+         headless host injects forwarded mouse instead of reading gainput (no window). The shim also
+         keeps WindowsInput.cpp/gainput out of the link. -->
+    <ClCompile Include="..\3rdparty\The-Forge\Common_3\Application\UI\UI.cpp">
+      <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
+      <ExceptionHandling>false</ExceptionHandling>
+      <RuntimeTypeInfo>false</RuntimeTypeInfo>
+      <SDLCheck>false</SDLCheck>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <PreprocessorDefinitions>FORGE_HOST_EXTERNAL_INPUT;_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="..\3rdparty\The-Forge\Common_3\Application\Fonts\FontSystem.cpp">
+      <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
+      <ExceptionHandling>false</ExceptionHandling>
+      <RuntimeTypeInfo>false</RuntimeTypeInfo>
+      <SDLCheck>false</SDLCheck>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="..\3rdparty\The-Forge\Common_3\Application\Fonts\stbtt.cpp">
+      <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
+      <ExceptionHandling>false</ExceptionHandling>
+      <RuntimeTypeInfo>false</RuntimeTypeInfo>
+      <SDLCheck>false</SDLCheck>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="..\3rdparty\The-Forge\Common_3\Application\ThirdParty\OpenSource\imgui\imgui.cpp">
+      <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
+      <ExceptionHandling>false</ExceptionHandling>
+      <RuntimeTypeInfo>false</RuntimeTypeInfo>
+      <SDLCheck>false</SDLCheck>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="..\3rdparty\The-Forge\Common_3\Application\ThirdParty\OpenSource\imgui\imgui_demo.cpp">
+      <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
+      <ExceptionHandling>false</ExceptionHandling>
+      <RuntimeTypeInfo>false</RuntimeTypeInfo>
+      <SDLCheck>false</SDLCheck>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="..\3rdparty\The-Forge\Common_3\Application\ThirdParty\OpenSource\imgui\imgui_draw.cpp">
+      <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
+      <ExceptionHandling>false</ExceptionHandling>
+      <RuntimeTypeInfo>false</RuntimeTypeInfo>
+      <SDLCheck>false</SDLCheck>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="..\3rdparty\The-Forge\Common_3\Application\ThirdParty\OpenSource\imgui\imgui_tables.cpp">
+      <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
+      <ExceptionHandling>false</ExceptionHandling>
+      <RuntimeTypeInfo>false</RuntimeTypeInfo>
+      <SDLCheck>false</SDLCheck>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="..\3rdparty\The-Forge\Common_3\Application\ThirdParty\OpenSource\imgui\imgui_widgets.cpp">
+      <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
+      <ExceptionHandling>false</ExceptionHandling>
+      <RuntimeTypeInfo>false</RuntimeTypeInfo>
+      <SDLCheck>false</SDLCheck>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <!-- CameraMatrix (used by FontSystem world-space text). Input-clean TU. -->
+    <ClCompile Include="..\3rdparty\The-Forge\Common_3\Application\CameraController.cpp">
+      <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
+      <ExceptionHandling>false</ExceptionHandling>
+      <RuntimeTypeInfo>false</RuntimeTypeInfo>
+      <SDLCheck>false</SDLCheck>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <!-- Headless-host stubs for the OS/profiler symbols UI.cpp references but the host doesn't link. -->
+    <ClCompile Include="forge_host_stubs.cpp">
+      <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
+      <ExceptionHandling>false</ExceptionHandling>
+      <RuntimeTypeInfo>false</RuntimeTypeInfo>
+      <SDLCheck>false</SDLCheck>
+      <WarningLevel>TurnOffAllWarnings</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;D3D12_AGILITY_SDK=1;D3D12_AGILITY_SDK_VERSION=715;_CRT_SECURE_NO_WARNINGS;_CRT_NONSTDC_NO_DEPRECATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="forgerender.h" />

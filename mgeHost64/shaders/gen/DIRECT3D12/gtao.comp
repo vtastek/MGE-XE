@@ -1021,6 +1021,9 @@ NUM_THREADS(8, 8, 1)
 void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 {
     INIT_MAIN;
+	float vis = 0.0f;
+	float3 bn = 0.0f;
+	float3 deb = 0.0f;
     int2 px = int2(DispatchThreadID.xy);
     float2 screen = gAOParams.screenParams.xy;
     float2 invScreen = gAOParams.screenParams.zw;
@@ -1028,20 +1031,23 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
     float deviceZ = loadDeviceZ(px);
 
+
+
     if (deviceZ <= 0.0f)
     {
         Write2D(gAOOut, px, float4(0.0f, 0.0f, 1.0f, 1.0f));
         return;
     }
-
     float3 P = reconstructWorld(uv, deviceZ);
     float3 V = normalize(gAOParams.eyePos.xyz - P);
+
 
 
     float3 Pr = reconstructWorld(uv + float2(invScreen.x, 0.0f), loadDeviceZ(px + int2(1, 0)));
     float3 Pl = reconstructWorld(uv - float2(invScreen.x, 0.0f), loadDeviceZ(px - int2(1, 0)));
     float3 Pu = reconstructWorld(uv + float2(0.0f, invScreen.y), loadDeviceZ(px + int2(0, 1)));
     float3 Pd = reconstructWorld(uv - float2(0.0f, invScreen.y), loadDeviceZ(px - int2(0, 1)));
+
 
 
     float3 dxr = Pr - P, dxl = P - Pl;
@@ -1052,32 +1058,46 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     if (dot(N, V) < 0.0f) { N = -N; }
 
 
+
+
+
     float wpp = max(min(length(dxr), length(dxl)), 1e-4f);
+
     float radiusWorld = gAOParams.aoParams.x;
     float searchPixels = clamp(radiusWorld / wpp, 2.0f, 96.0f);
-    float stepPx = searchPixels / float( 8 );
+
+
+
+
+
+
+    float stepPx = max(searchPixels / float( 8 ), 1.0f);
+
+
     float falloff = max(gAOParams.aoParams.y, 1e-3f);
 
+
+
+
+    float horizonBias = gAOParams.aoParams.w;
+
     float rnd = ignoise(float2(px));
-    float ao = 0.0f;
+    float occ = 0.0f;
     float3 bentN = float3(0.0f, 0.0f, 0.0f);
 
+
+
+
+
     UNROLL
-    for (int s = 0; s <  2 ; ++s)
+    for (int s = 0; s <  3 ; ++s)
     {
-        float phi = (float(s) + rnd) * ( 3.14159265359f  / float( 2 ));
+        float phi = (float(s) + rnd) * ( 3.14159265359f  / float( 3 ));
         float2 dir = float2(cos(phi), sin(phi));
         float3 sliceDirW = normalize(ddxv * dir.x + ddyv * dir.y);
 
-
-        float3 planeN = normalize(cross(sliceDirW, V));
-        float3 Np = N - planeN * dot(N, planeN);
-        float nLen = length(Np);
-        if (nLen < 1e-4f) { continue; }
-        float3 Npn = Np / nLen;
-        float n = atan2(dot(Npn, sliceDirW), dot(Npn, V));
-
-        float2 cosH = float2(-1.0f, -1.0f);
+        float hP = 0.0f;
+        float hM = 0.0f;
 
         for (int t = 1; t <=  8 ; ++t)
         {
@@ -1087,42 +1107,47 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
             float dzp = loadDeviceZ(scp);
             if (dzp > 0.0f)
             {
-                float3 S = reconstructWorld((float2(scp) + 0.5f) * invScreen, dzp);
-                float3 ds = S - P;
+                float3 ds = reconstructWorld((float2(scp) + 0.5f) * invScreen, dzp) - P;
                 float dl = length(ds);
-                float c = dot(ds / max(dl, 1e-6f), V);
-                c = lerp(-1.0f, c, saturate(1.0f - dl / falloff));
-                cosH.x = max(cosH.x, c);
+
+
+                float e = max(dot(ds, N) / max(dl, 1e-6f) - horizonBias, 0.0f);
+                e *= saturate(1.0f - dl / falloff);
+                hP = e;
             }
 
             int2 scm = px - int2(dir * off + 0.5f);
             float dzm = loadDeviceZ(scm);
             if (dzm > 0.0f)
             {
-                float3 S = reconstructWorld((float2(scm) + 0.5f) * invScreen, dzm);
-                float3 ds = S - P;
+                float3 ds = reconstructWorld((float2(scm) + 0.5f) * invScreen, dzm) - P;
                 float dl = length(ds);
-                float c = dot(ds / max(dl, 1e-6f), V);
-                c = lerp(-1.0f, c, saturate(1.0f - dl / falloff));
-                cosH.y = max(cosH.y, c);
+                float e = max(dot(ds, N) / max(dl, 1e-6f) - horizonBias, 0.0f);
+                e *= saturate(1.0f - dl / falloff);
+                hM = e;
             }
         }
 
 
-        float th1 = n + max(-acos(clamp(cosH.y, -1.0f, 1.0f)) - n, - 1.57079632679f );
-        float th2 = n + min( acos(clamp(cosH.x, -1.0f, 1.0f)) - n,  1.57079632679f );
-        ao += nLen * (gtaoInner(th1, n) + gtaoInner(th2, n));
 
-        float bentAngle = 0.5f * (th1 + th2);
-        bentN += (V * cos(bentAngle) + sliceDirW * sin(bentAngle)) * nLen;
+        occ += 0.5f * (hP + hM);
+        float openP = 1.0f - hP;
+        float openM = 1.0f - hM;
+        bentN += N * (openP + openM) + sliceDirW * (openP - openM);
     }
 
-    ao = saturate(ao / float( 2 ));
+    occ = saturate(occ / float( 3 ));
 
-    float occ = (1.0f - ao) * gAOParams.aoParams.z;
-    float vis = saturate(1.0f - occ);
 
-    float3 bn = bentN + N * 1e-3f;
+
+
+
+
+    occ *= saturate(radiusWorld / wpp - 1.0f);
+    occ *= gAOParams.aoParams.z;
+    vis = saturate(1.0f - occ);
+
+    bn = bentN + N * 1e-3f;
     bn = normalize(bn);
 
     Write2D(gAOOut, px, float4(bn, vis));

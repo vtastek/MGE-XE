@@ -22,6 +22,7 @@ namespace IPC {
 		m_rpcCompleteEvent(INVALID_HANDLE_VALUE),
 		m_ipcParameters(nullptr),
 		m_isRpcPending(false),
+		m_watcherProcess(INVALID_HANDLE_VALUE),
 		m_geomSharedMem(INVALID_HANDLE_VALUE),
 		m_geomRpcStartEvent(INVALID_HANDLE_VALUE),
 		m_geomRpcCompleteEvent(INVALID_HANDLE_VALUE),
@@ -33,6 +34,7 @@ namespace IPC {
 	}
 
 	Client::~Client() {
+		stopWatcher();
 		if (m_process != INVALID_HANDLE_VALUE) {
 			TerminateProcess(m_process, 0);
 			CloseHandle(m_process);
@@ -72,6 +74,37 @@ namespace IPC {
 		return false;
 	}
 
+	void Client::startWatcher() {
+		// Dev-only FSL hot-reload watcher: recompiles + deploys shaders on save so the host's
+		// dxil-mtime auto-reload makes edit->live automatic. Gated on the dev paths existing, so it
+		// is a silent no-op in a shipped tree. Own console window so its compile/deploy log is visible.
+		static const char* kPython = "C:\\Users\\devbox\\AppData\\Local\\Programs\\Python\\Python311\\python.exe";
+		static const char* kScript = "C:\\projects\\mgexe\\MGE-XE\\mgeHost64\\shaders\\watch_shaders.py";
+		if (GetFileAttributesA(kPython) == INVALID_FILE_ATTRIBUTES ||
+			GetFileAttributesA(kScript) == INVALID_FILE_ATTRIBUTES) {
+			return;   // not a dev tree — no watcher
+		}
+		char cmd[768];
+		std::sprintf(cmd, "\"%s\" \"%s\"", kPython, kScript);
+		STARTUPINFOA si = {}; si.cb = sizeof(si);
+		PROCESS_INFORMATION pi = {};
+		if (CreateProcessA(kPython, cmd, NULL, NULL, FALSE, CREATE_NEW_CONSOLE, NULL, NULL, &si, &pi)) {
+			m_watcherProcess = pi.hProcess;
+			CloseHandle(pi.hThread);
+			LOG::logline("FSL hot-reload watcher started (PID %u)", pi.dwProcessId);
+		} else {
+			LOG::winerror("Failed to start FSL hot-reload watcher");
+		}
+	}
+
+	void Client::stopWatcher() {
+		if (m_watcherProcess != INVALID_HANDLE_VALUE) {
+			TerminateProcess(m_watcherProcess, 0);
+			CloseHandle(m_watcherProcess);
+			m_watcherProcess = INVALID_HANDLE_VALUE;
+		}
+	}
+
 	bool Client::startServer(const char* executable) {
 		STARTUPINFO startupInfo = {};
 		PROCESS_INFORMATION processInfo = {};
@@ -81,6 +114,7 @@ namespace IPC {
 			TerminateProcess(m_process, 0);
 			CloseHandle(m_process);
 			m_process = INVALID_HANDLE_VALUE;
+			stopWatcher();   // kill the old watcher too; startWatcher() re-spawns below
 		}
 
 		CleanupHandle(m_sharedMem);
@@ -161,6 +195,8 @@ namespace IPC {
 		m_geomWaitHandles[1] = m_geomRpcCompleteEvent;
 
 		LOG::logline("64-bit host process started (PID %u)", processInfo.dwProcessId);
+
+		startWatcher();   // dev: FSL hot-reload watcher rides the host's lifecycle (no-op in shipped tree)
 
 		// wait for the server to finish bootstrapping
 		if (waitForCompletion() == WakeReason::Complete) {
@@ -427,6 +463,7 @@ namespace IPC {
 		VecId multiMapList, std::uint32_t multiMapCount, std::uint32_t multiMapBytes,
 		VecId lightList, std::uint32_t lightCount, std::uint32_t lightBytes,
 		std::uint32_t debugMode,
+		const DevInput* devInput,
 		double* outRenderMs) {
 		WAIT_FOR_PREVIOUS_COMMAND;
 
@@ -448,6 +485,13 @@ namespace IPC {
 		params.lightCount = lightCount;
 		params.lightBytes = lightBytes;
 		params.debugMode = debugMode;
+		const DevInput di = devInput ? *devInput : DevInput{};
+		params.devMouseX = di.x;
+		params.devMouseY = di.y;
+		params.devMouseButtons = di.buttons;
+		params.devMouseWheel = di.wheel;
+		params.devUiVisible = di.uiVisible;
+		params.devReloadShaders = di.reloadShaders;
 		params.bytesWritten = 0;
 		params.renderMs = 0.0;
 		if (!beginRpc(Command::RenderFrame)) {
