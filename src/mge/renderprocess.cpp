@@ -1447,6 +1447,14 @@ namespace RenderProcess {
         return g_initOk && g_enabled;
     }
 
+    bool ownsDistantLand() {
+        // The host draws exterior distant land + statics into the Forge frame; the composite
+        // lays it over MW. So MW's own main-view DL color draw is redundant when the seam is
+        // compositing. Same gate as ownsOpaqueWorld (F11 = g_enabled) for a clean A/B; the
+        // caller adds the exterior check (Forge DL is exterior-only). See header.
+        return g_initOk && g_enabled;
+    }
+
     void captureGeometry(std::uint32_t key, std::uint16_t revision, std::uint32_t modelId,
                          const IPC::GeomVertexWire* verts, std::uint32_t vertexCount,
                          const std::uint16_t* indices, std::uint32_t indexCount) {

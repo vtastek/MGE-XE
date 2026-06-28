@@ -40,6 +40,15 @@ namespace RenderProcess {
     // no-op signal, so this in-MGE suppression is the lever. Off = engine draws scene 0 normally.
     bool ownsOpaqueWorld();
 
+    // True when the Forge seam is live AND compositing (F11 on): the host draws the exterior
+    // distant land + distant statics into the same Forge frame, which the full-screen composite
+    // lays over MW. While true, MW's own main-view DL color (renderDistantLand / renderDistantStatics
+    // in renderStage0) is redundant — the composite overwrites exactly those pixels — so DistantLand
+    // skips those COLOR draws. The depth pre-pass and the statics cull are kept (MW effects still
+    // sample the distant depth). Exterior-only at the call site (Forge DL is exterior-only). Off =
+    // MW draws its own DL normally, giving a clean F11 A/B and a safe fallback if Forge DL has a gap.
+    bool ownsDistantLand();
+
     // Called from the cache upload path (scenegraph_geometry_cache.cpp) for each
     // non-skinned opaque part when its model-space geometry is (re)built. Assigns the
     // part a dense host slot (keyed on the cache key), packs pos+normal+indices into a
