@@ -958,9 +958,9 @@ SamplerState gSamplerAnisotropic : register( s10 , space100 ) ;
 #line 167 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 46 "FSL/shaders.list"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skinned.vert.fsl"
-#line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skinned.vert.fsl"
+#line 72 "FSL/shaders.list"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
+#line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(FrameData)
@@ -1036,36 +1036,33 @@ STRUCT(LightData)
 
         Tex2DArray(float4) gStaticsArrays[ 128 ] :  register(t896,space0);
         CBUFFER(BatchData) gBatch :  register(b0,space2);
-#line 16 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skinned.vert.fsl"
+#line 16 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
 
 STRUCT(VSInput)
 {
-    DATA(float3, Position, POSITION);
-    DATA(float3, Normal, NORMAL);
-    DATA(float4, Weights, TEXCOORD0);
-    DATA(uint4, BoneIdx, TEXCOORD1);
-    DATA(uint, Base, TEXCOORD2);
-    DATA(float2, Uv, TEXCOORD3);
-    DATA(uint, TexAlpha, TEXCOORD4);
-#line 26
+    DATA(float4, Position, POSITION);
+    DATA(float4, Normal, NORMAL);
+    DATA(float4, Color, COLOR);
+    DATA(float2, Uv, TEXCOORD0);
+
+    DATA(float4, W0, TEXCOORD1);
+    DATA(float4, W1, TEXCOORD2);
+    DATA(float4, W2, TEXCOORD3);
+    DATA(float4, W3, TEXCOORD4);
+    DATA(float4, InstParams, TEXCOORD5);
+#line 29
 };
 
 STRUCT(VSOutput)
 {
     DATA(float4, Position, SV_Position);
-    DATA(float3, Normal, NORMAL);
     DATA(float2, Uv, TEXCOORD0);
-    DATA(FLAT(uint), TexIndex, TEXCOORD1);
-    DATA(float, Fog, TEXCOORD2);
     DATA(float4, Color, COLOR);
-    DATA(float, AlphaRef, TEXCOORD3);
-    DATA(FLAT(float3),MatDiffuse, TEXCOORD4);
-    DATA(FLAT(float3),MatAmbient, TEXCOORD5);
-    DATA(FLAT(float3),MatEmissive,TEXCOORD6);
-    DATA(FLAT(uint), VColSource, TEXCOORD7);
-    DATA(float3, WorldPos, TEXCOORD8);
-    DATA(FLAT(uint), OverlayIndex,TEXCOORD9);
-#line 43
+    DATA(float, Fog, TEXCOORD1);
+    DATA(FLAT(uint), TexIndex, TEXCOORD2);
+    DATA(FLAT(uint), Flags, TEXCOORD3);
+    DATA(float3, WorldPos, TEXCOORD4);
+#line 40
 };
 
 [RootSignature( "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)" )]
@@ -1074,47 +1071,35 @@ VSOutput VS_MAIN( VSInput In )
     //INIT_MAIN;
     VSOutput Out;
 
-    float4 pos = float4(In.Position, 1.0f);
 
 
+    float4 worldPos = In.Position.x * In.W0 + In.Position.y * In.W1
+                    + In.Position.z * In.W2 + In.Position.w * In.W3;
+    Out.WorldPos = worldPos.xyz;
 
 
-
-    float4x4 b0 = gBatch.worlds[In.Base + In.BoneIdx.x];
-    float4x4 b1 = gBatch.worlds[In.Base + In.BoneIdx.y];
-    float4x4 b2 = gBatch.worlds[In.Base + In.BoneIdx.z];
-    float4x4 b3 = gBatch.worlds[In.Base + In.BoneIdx.w];
-
-    float4 worldPos = In.Weights.x * mul(b0, pos)
-                    + In.Weights.y * mul(b1, pos)
-                    + In.Weights.z * mul(b2, pos)
-                    + In.Weights.w * mul(b3, pos);
-
-    float3 worldNrm = In.Weights.x * mul((float3x3)b0, In.Normal)
-                    + In.Weights.y * mul((float3x3)b1, In.Normal)
-                    + In.Weights.z * mul((float3x3)b2, In.Normal)
-                    + In.Weights.w * mul((float3x3)b3, In.Normal);
 
     Out.Position = mul(gFrameData.viewProj, worldPos);
-    Out.Normal = worldNrm;
-    Out.WorldPos = worldPos.xyz;
+
+
+
+
+    float3 n = normalize(2.0f * In.Normal.xyz - 1.0f);
+    float3 nWorld = n.x * In.W0.xyz + n.y * In.W1.xyz + n.z * In.W2.xyz;
+    float emissive = In.Normal.w;
+    float3 light = gFrameData.sunCol.rgb * saturate(dot(nWorld, -gFrameData.sunDir.xyz))
+                 + gFrameData.lodSunAmb.rgb + emissive;
+    Out.Color = float4(In.Color.rgb * light, In.Color.a);
+
     Out.Uv = In.Uv;
-
-    Out.TexIndex = In.TexAlpha & 0xFFFFu;
-    Out.AlphaRef = float((In.TexAlpha >> 16u) & 0xFFu) * (1.0f / 255.0f);
-    Out.Color = float4(1.0f, 1.0f, 1.0f, 1.0f);
+    Out.TexIndex = (uint)(In.InstParams.x + 0.5f);
+    Out.Flags = (uint)(In.InstParams.y + 0.5f);
 
 
-
-    Out.MatDiffuse = float3(1.0f, 1.0f, 1.0f);
-    Out.MatAmbient = float3(1.0f, 1.0f, 1.0f);
-    Out.MatEmissive = float3(0.0f, 0.0f, 0.0f);
-    Out.VColSource = 2u;
-    Out.OverlayIndex = 0u;
 
     float dist = length(worldPos.xyz - gFrameData.eyePos.xyz);
     Out.Fog = saturate((gFrameData.fogParams.y - dist)
                        / (gFrameData.fogParams.y - gFrameData.fogParams.x));
     return (Out);
 }
-#line 47 "FSL/shaders.list"
+#line 73 "FSL/shaders.list"

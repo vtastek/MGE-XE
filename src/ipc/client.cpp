@@ -488,7 +488,7 @@ namespace IPC {
 		params.frameIndex = frameIndex;
 		params.targetIndex = 0;
 		std::memcpy(params.viewProj, viewProj, 16 * sizeof(float));
-		std::memcpy(params.lighting, lighting, 24 * sizeof(float));
+		std::memcpy(params.lighting, lighting, 28 * sizeof(float));
 		params.drawList = drawList;
 		params.drawCount = drawCount;
 		params.drawBytes = drawBytes;

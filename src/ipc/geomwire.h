@@ -109,11 +109,20 @@ namespace IPC {
 
     // Bindless texture-array capacity (client residency cap == host gTextures[] size; the host
     // mirrors this as MAX_TEXTURES in opaque.srt.h / kMaxTextures in forgerender.cpp).
-    // MUST stay in lock-step with host MAX_TEXTURES. Capped at 1024: Forge's addDescriptorSet
-    // crashes building a bindless descriptor table >1024 entries on this stack (2048 faults in
-    // consume_descriptor_handles; 1024 verified OK). Beyond 1024 unique textures in a session
-    // fall back to white — a real limit pending LRU eviction or SM6.6 ResourceDescriptorHeap.
-    constexpr std::uint32_t kMaxTextures = 1024;
+    // MUST stay in lock-step with host MAX_TEXTURES. The Persistent descriptor TABLE (gTextures +
+    // gStaticsArrays) crashes Forge's addDescriptorSet >1024 entries on this stack (2048 faults in
+    // consume_descriptor_handles; 1024 verified OK). gTextures(896) + gStaticsArrays(128) = 1024,
+    // exactly the proven-OK boundary. Distant STATICS no longer live in gTextures — they moved to
+    // gStaticsArrays (descriptor-array of Texture2DArrays, bucketed by format/size; see
+    // forgerender.cpp). Only the 3 distant-land ATLAS slots remain host-reserved in gTextures.
+    constexpr std::uint32_t kMaxTextures = 896;
+
+    // Host-owned distant LAND atlas reserves the TOP kDlReserve slots of the shared bindless
+    // gTextures[] array (base/normal/detail — 3 slots; the rest is headroom). Distant statics left
+    // gTextures for gStaticsArrays, so this shrank 320 -> 8. The client caps its own bottom-up
+    // residency below it: client slots [1, kMaxTextures-kDlReserve); land atlas [kMaxTextures-3,
+    // kMaxTextures). Client over-cap falls back to white (client-side LRU recycles its range).
+    constexpr std::uint32_t kDlReserve = 8;
 
     // M-Skinning per-frame draw item: which uploaded skinned mesh (slot) to draw, the
     // part's bone count, and its mirror flag (left-side parts reuse the right mesh via a

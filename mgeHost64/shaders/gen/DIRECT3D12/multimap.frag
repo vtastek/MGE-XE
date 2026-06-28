@@ -962,7 +962,7 @@ SamplerState gSamplerAnisotropic : register( s10 , space100 ) ;
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap.frag.fsl"
 #line 11 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-#line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(FrameData)
 {
     float4x4 viewProj;
@@ -982,13 +982,25 @@ STRUCT(FrameData)
 
 
     float4 dbgScales;
-#line 40
+
+
+
+
+    float4 lodParams;
+
+    float4 lodSunAmb;
+
+
+
+
+    float4 lodEye;
+#line 58
 };
 
 STRUCT(BatchData)
 {
     float4x4 worlds[ 1024 ];
-#line 45
+#line 63
 };
 
 
@@ -1002,7 +1014,7 @@ STRUCT(LightData)
 {
     float4 lightParams;
     float4 lights[ 128  * 3];
-#line 58
+#line 76
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1017,8 +1029,12 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 88 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-        Tex2D(float4) gTextures[ 1024 ] :  register(t0,space0);
+#line 106 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+        Tex2D(float4) gTextures[ 896 ] :  register(t0,space0);
+
+
+
+        Tex2DArray(float4) gStaticsArrays[ 128 ] :  register(t896,space0);
         CBUFFER(BatchData) gBatch :  register(b0,space2);
 #line 12 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap.frag.fsl"
 

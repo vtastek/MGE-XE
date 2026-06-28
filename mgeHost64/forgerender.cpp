@@ -18,6 +18,7 @@
 
 #include "forgerender.h"
 #include "ipc/geomwire.h"
+#include "mge/configuration.h"   // Configuration.DL.* for the host-owned live distant-land cull
 #include "support/log.h"   // LOG::logline -> mgeHost64.log (LOGF goes to uncaptured stdout)
 
 #include <cstdio>
@@ -25,6 +26,10 @@
 #include <cstring>
 #include <chrono>
 #include <vector>
+#include <string>
+#include <cmath>
+#include <unordered_map>
+#include <algorithm>
 
 #include "OS/Interfaces/IOperatingSystem.h"
 #include "Utilities/Interfaces/IFileSystem.h"
@@ -624,13 +629,14 @@ namespace ForgeRender {
         float vp[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
         // Tier 1 lighting (6×float4): sun OFF, ambient 0.5, no fog — so the SLOT-0 white-texture
         // guard below stays a clean normal-independent value (white × 0.5, tonemapped ≈ 129).
-        float lt[24] = {
+        float lt[28] = {
             0,0,-1,0,           // sunDir (unused, sunCol=0)
             0,0,0,0,            // sunCol = 0
             0.5f,0.5f,0.5f,0,   // ambCol
             0,0,0,0,            // fogColNear
             0, 1e9f, 0,0,       // fogParams: start=0, end=1e9 -> fog ≈ 1 (clear)
-            0,0,0,0             // eyePos
+            0,0,0,0,            // eyePos
+            0,0,0,0             // realEye.xyz + isExterior (0 -> no host-owned DL in the scene-probe)
         };
         IPC::DrawItemWire item = {};
         item.slot = 0;
@@ -1000,7 +1006,9 @@ namespace {
         Texture*       pDefaultWhite = nullptr;    // gTextures[0] / fill for unloaded slots
         Texture*       pTextures[MAX_TEXTURES] = {}; // bindless base maps; unloaded == pDefaultWhite
         uint32_t       texHigh = 0;                // highest assigned slot + 1 (for teardown)
-        DescriptorSet* pPersistentSet = nullptr;   // bindless gTextures[] (bound once per frame)
+        DescriptorSet* pPersistentSet = nullptr;   // bindless gTextures[] + gStaticsArrays (bound once per frame)
+        Texture*       pStaticsWhiteArray = nullptr; // 4x4x2 white Tex2DArray; fills every gStaticsArrays slot until the
+                                                     // distant-statics buckets build (and stays in the unused tail).
 
         // --- M-Skinning: GPU palette skinning path -----------------------------------
         // Reuses the SAME SrtData/default.rootsig as the static path: gBatch.worlds[1024]
@@ -1669,6 +1677,50 @@ namespace {
             td.mCount = kMaxTextures;
             td.ppTextures = g_live.pTextures;
             updateDescriptorSet(R, 0, g_live.pPersistentSet, 1, &td);
+
+            // gStaticsArrays (distant-statics buckets) shares the Persistent table. Initialize EVERY
+            // element to a 4x4x2 white Texture2DArray so the table holds no uninitialized descriptors
+            // before the buckets build (first exterior). buildStaticsTextureArrays re-binds the real
+            // buckets; the unused tail keeps pointing here. mArraySize=2 forces a 2DArray SRV (a
+            // 1-slice texture reflects as a plain Tex2D, the wrong descriptor dimension for the array).
+            {
+                TextureDesc sw = {};
+                sw.mWidth = 4; sw.mHeight = 4; sw.mDepth = 1;
+                sw.mArraySize = 2; sw.mMipLevels = 1;
+                sw.mSampleCount = SAMPLE_COUNT_1;
+                sw.mFormat = TinyImageFormat_R8G8B8A8_UNORM;
+                sw.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+                sw.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+                sw.pName = "staticsWhiteArray";
+                TextureLoadDesc swl = {};
+                swl.ppTexture = &g_live.pStaticsWhiteArray;
+                swl.pDesc = &sw;
+                addResource(&swl, nullptr);
+                waitForAllResourceLoads();
+                if (!g_live.pStaticsWhiteArray) { std::printf("[forge] statics white array creation FAILED\n"); return false; }
+                for (uint32_t layer = 0; layer < 2; ++layer) {
+                    TextureUpdateDesc wu = {};
+                    wu.pTexture = g_live.pStaticsWhiteArray;
+                    wu.mBaseMipLevel = 0; wu.mMipLevels = 1;
+                    wu.mBaseArrayLayer = layer; wu.mLayerCount = 1;
+                    wu.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                    beginUpdateResource(&wu);
+                    TextureSubresourceUpdate s = wu.getSubresourceUpdateDesc(0, layer);
+                    for (uint32_t row = 0; row < s.mRowCount; ++row) {
+                        uint32_t* dst = (uint32_t*)(s.pMappedData + (size_t)row * s.mDstRowStride);
+                        for (uint32_t px = 0; px < 4; ++px) { dst[px] = 0xFFFFFFFFu; }
+                    }
+                    endUpdateResource(&wu);
+                }
+                flushTextureUploads(R);
+
+                std::vector<Texture*> whites(MAX_STATICS_BUCKETS, g_live.pStaticsWhiteArray);
+                DescriptorData sd = {};
+                sd.mIndex = SRT_RES_IDX(SrtData, Persistent, gStaticsArrays);
+                sd.mCount = MAX_STATICS_BUCKETS;
+                sd.ppTextures = whites.data();
+                updateDescriptorSet(R, 0, g_live.pPersistentSet, 1, &sd);
+            }
         }
 
         for (uint32_t b = 0; b < kMaxBatches; ++b) {
@@ -2677,6 +2729,15 @@ namespace ForgeRender {
 
     void checkShaderHotReload();   // defined below; polls the gtao dxil mtime for auto hot-reload
 
+    // Phase 1a/1b LIVE distant land — defined below (with the DL globals), forward-declared so
+    // renderScene (earlier in the file) can drive them. dlSetFrameEye/dlLogHeartbeat wrap the DL
+    // global state renderScene touches so those globals can stay next to their definitions.
+    void dlSetFrameEye(float x, float y, float z, bool exterior);
+    void dlLiveCullAndBuild(Renderer* R, const float* rzViewProj);
+    void dlLiveRecord();
+    void dlLogHeartbeat();
+    void dlLogGpuSlow(double gpuMs, double recMs, unsigned drawn);   // per-frame GPU spike (reads DL counts)
+
     bool renderScene(const float* viewProj, const float* lighting, const void* drawBlob,
                      unsigned drawCount, unsigned drawBytes,
                      const void* skinnedBlob, unsigned skinnedCount, unsigned skinnedBytes,
@@ -2760,6 +2821,10 @@ namespace ForgeRender {
         if (lighting) {
             std::memcpy((uint8_t*)g_live.pFrameCbv->pCpuMappedAddress + 16 * sizeof(float),
                         lighting, 24 * sizeof(float));
+            // Phase 1a/1b: lighting[24..27] = realEye.xyz + isExterior (appended by the client; the
+            // scene-probe passes 0s). The near scene is camera-relative (eyePos=0); resident DL is in
+            // ABSOLUTE coords, so the live DL cull/build shifts it by -realEye. lodEye -> gFrameData[56..59].
+            dlSetFrameEye(lighting[24], lighting[25], lighting[26], lighting[27] != 0.0f);
         }
         // F12 debug view: debugParams.x at float index 40 (160B = viewProj 16f + 6×float4 24f).
         // 0=normal (frag is byte-for-byte unchanged), 1=depth world-distance grayscale,
@@ -2815,6 +2880,13 @@ namespace ForgeRender {
             // Terrain DECAL_1 overlay slot (0 = no decal → frag splat gated off, non-terrain unchanged).
             inst[local * kStaticInstU32 + 11] = items[i].overlayTexIndex;
         }
+
+        // Phase 1a/1b LIVE distant land: lazy resident load + per-frame frustum/tier cull + ring fill
+        // + lazy texture load. MUST run here — BEFORE beginCmd — because it can create GPU resources
+        // and load textures (addResource/updateDescriptorSet), which can't happen mid-command-buffer.
+        // The recorded draws (dlLiveRecord) go in after the near colour pass. rzViewProj is the
+        // relative, reverse-Z, extended-far matrix already in gFrameData.
+        dlLiveCullAndBuild(R, rzViewProj);
 
         resetCmdPool(R, g_live.pCmdPool);
         beginCmd(g_live.pCmd);
@@ -3441,6 +3513,11 @@ namespace ForgeRender {
             }
         }
 
+        // Phase 1a/1b LIVE distant land: draw land + statics into the SAME colorTarget + pDepth as the
+        // near scene (still bound here), depth-write reverse-Z GEQUAL so DL is occluded behind the near
+        // scene and fills the horizon. Cull/ring-fill already ran before recording (dlLiveCullAndBuild).
+        dlLiveRecord();
+
         cmdBindRenderTargets(g_live.pCmd, nullptr);
 
         if (g_live.sampleCount > 1) {
@@ -3511,8 +3588,14 @@ namespace ForgeRender {
         submitDesc.mSubmitDone = true;
         queueSubmit(g_live.pQueue, &submitDesc);
         waitForFences(R, 1, &g_live.pFence);
+        const double gpuMs = hostNowMs() - tRec1;
         g_recAccum += (tRec1 - tRec0);            // CPU per-draw bind+draw recording
-        g_gpuAccum += (hostNowMs() - tRec1);      // GPU execute (submit→fence)
+        g_gpuAccum += gpuMs;                       // GPU execute (submit→fence)
+        // Per-frame slow-GPU self-report (the 300-frame average can't surface a fresh dense-area
+        // stall at 0.2 fps). Pairs with [dl-slow] (CPU cull) to localize a hitch to CPU vs GPU.
+        if (gpuMs > 30.0) {
+            dlLogGpuSlow(gpuMs, tRec1 - tRec0, drawn);
+        }
         // A dense exterior frame is the suspected trigger; pin a removal to the draw submit.
         logDeviceRemoved(R, "renderScene/submit");
 
@@ -3530,6 +3613,7 @@ namespace ForgeRender {
                          "| record=%.2fms gpu=%.2fms (avg/frame over 300)",
                          g_renderFrame, drawn, skinnedDrawn, multiMapDrawn, g_dynamicCount, g_meshHigh,
                          g_recAccum / 300.0, g_gpuAccum / 300.0);
+            dlLogHeartbeat();
             g_recAccum = 0.0;
             g_gpuAccum = 0.0;
         }
@@ -3950,6 +4034,1385 @@ namespace ForgeRender {
         return built;
     }
 
+    // ===================== Phase 1a: host-owned distant land =============================
+    // The distant land is loaded + culled + drawn entirely host-side (the DL files are static
+    // per worldspace and the host's cwd is morrowind64), so it renders WITHOUT Morrowind — see
+    // [[project_forge_dl_host_owned]] / tasks/forge-phase1.md. Resident LandElem VBs (16 B:
+    // float3 pos + SHORT2N uv) + the 3 atlas textures (base/normal/detail) feed a 16 B land
+    // pipeline that reuses the opaque SrtData/default.rootsig + the bindless gTextures array.
+    // The --forge-dl probe renders it from a synthetic camera to ground-truth the loader/pipeline
+    // /atlas in isolation; the same loader+pipeline+draw wire into renderScene for the live path.
+
+    constexpr uint32_t kMaxLandMeshes  = 16384;
+    // DL LAND atlas lives in the TOP 3 slots of gTextures[] (the client caps its own bottom-up
+    // residency below kDlReserve; see IPC::kDlReserve) so host-owned land never stomps the client's
+    // near-scene textures. Distant STATICS no longer use gTextures — they live in gStaticsArrays
+    // (the bucketed Texture2DArray residency, below).
+    constexpr uint32_t kLandBaseSlot   = MAX_TEXTURES - 1;   // 895
+    constexpr uint32_t kLandNormalSlot = MAX_TEXTURES - 2;   // 894
+    constexpr uint32_t kLandDetailSlot = MAX_TEXTURES - 3;   // 893
+
+    struct LandMeshGPU {
+        Buffer*  vb;
+        Buffer*  ib;
+        uint32_t indexCount;
+        bool     large;             // 32-bit indices
+        float    cx, cy, cz, r;     // bounding sphere (world)
+    };
+    LandMeshGPU g_landMeshes[kMaxLandMeshes];
+    uint32_t    g_landMeshCount = 0;
+    Shader*     g_pLandShader   = nullptr;
+    Pipeline*   g_pLandPipeline = nullptr;
+    bool        g_landLoaded    = false;
+
+    // --- Phase 1b distant STATICS (host-owned, GPU-driven: instancing + bindless + execute-indirect) ---
+    // The unique mesh LIBRARY (static_meshes) is packed ONCE into a mega VB (StaticElem, 20 B) + a
+    // mega 16-bit IB; each subset records its (vbBase, ibBase, indexCount) into those. Placements
+    // (usage.data worldspace 0 = exterior) expand to per-(instance×subset) entries grouped by subset
+    // into one instance VB (binding 1: world matrix rows + bindless texSlot/flags). One indirect-arg
+    // record per subset (with StartInstanceLocation = its instance run) drives a single
+    // cmdExecuteIndirect. See [[project_forge_dl_statics_format]].
+    constexpr uint32_t kStaticsBuckets    = MAX_STATICS_BUCKETS;  // gStaticsArrays element count (128)
+    constexpr uint32_t kStaticsTexCap     = 512;   // cap the long side: extract that mip + chain (raw copy)
+    constexpr uint32_t kStaticsInstStride = 80;    // 4 world rows (64 B) + params float4 (16 B)
+    constexpr float    kStaticsScopeR     = 6144.0f; // probe: draw instances within this radius of the densest cell
+
+    struct StaticsSubsetGPU {
+        uint32_t vbBase;       // first vertex in the mega-VB (BaseVertexLocation)
+        uint32_t ibBase;       // first index  in the mega-IB (StartIndexLocation)
+        uint32_t indexCount;   // faces*3
+        uint32_t texSlot;      // bindless gTextures slot (0 until its texture is loaded in scope)
+        uint32_t flags;        // bit1 = hasAlpha cutout
+    };
+    struct StaticsDefCPU { uint32_t firstSubset, numSubsets; float radius; uint8_t type; }; // mirrors DistantStatic
+
+    Buffer*   g_pStaticsVB       = nullptr;   // mega per-vertex (GPU_ONLY, stride 20)
+    Buffer*   g_pStaticsIB       = nullptr;   // mega 16-bit index (GPU_ONLY)
+    Buffer*   g_pStaticsInst     = nullptr;   // per-instance stream for the current scope (GPU_ONLY)
+    Buffer*   g_pStaticsArgs     = nullptr;   // IndirectDrawIndexArguments[] for the current scope
+    Shader*   g_pStaticsShader   = nullptr;
+    Pipeline* g_pStaticsPipeline = nullptr;
+    std::vector<StaticsSubsetGPU> g_staticsSubsets;
+    std::vector<StaticsDefCPU>    g_staticsDefs;
+    std::vector<std::string>      g_staticsSubsetTex;   // per-subset basename (lowercased)
+    // DL statics texture residency = gStaticsArrays: a descriptor-array of Texture2DArrays, one
+    // element per (format, capped-size) BUCKET. Every statics texture is uploaded ONCE at load into
+    // its bucket as an array slice (raw mip-extract: the largest mip with long side <= kStaticsTexCap,
+    // plus the chain below it — no decode/resize/encode). All resident => no eviction, no white,
+    // no per-frame streaming. subset.texSlot = (bucket<<16)|layer. Bucket 0 is reserved = white.
+    struct StaticsTexBucket {
+        TinyImageFormat fmt = TinyImageFormat_UNDEFINED;
+        uint32_t w = 0, h = 0, mips = 0;   // uniform across the bucket's slices
+        Texture* tex = nullptr;            // the Texture2DArray (mArraySize = count)
+        uint32_t count = 0;                // assigned layers
+    };
+    std::vector<StaticsTexBucket>             g_staticsBuckets;     // [0] = white; reals from [1]
+    bool                                      g_staticsTexReady = false;
+    std::vector<uint8_t>          g_usageData;          // resident usage.data
+    uint64_t  g_ws0Off    = 0;                          // byte offset of the first exterior instance record
+    uint32_t  g_ws0Count  = 0;                          // exterior instance count
+    uint32_t  g_staticsDrawCount = 0;                   // EI arg count (subsets with scoped instances)
+    uint32_t  g_staticsInstTotal = 0;                   // total scoped draw-instances
+    bool      g_staticsLoaded    = false;
+
+    // --- Phase 1a/1b LIVE distant land (host-owned cull, persistent rings) -------------------
+    // The probe loads/draws DL in isolation; the LIVE path wires the same loaders + pipelines into
+    // renderScene (after the near colour pass, shared depth). It must NOT addResource per frame (the
+    // probe's buildStaticsScope pattern would stutter), so the per-frame instance + indirect-arg
+    // streams ride PERSISTENT CPU_TO_GPU rings (created once). A uniform grid over the resident
+    // exterior placements makes the per-frame frustum cull cheap. lodEye shifts DL into the
+    // camera-relative space the near scene uses. See tasks/forge-phase1.md.
+    enum { DL_STATIC_AUTO = 0, DL_STATIC_NEAR, DL_STATIC_FAR, DL_STATIC_VERY_FAR,
+           DL_STATIC_GRASS, DL_STATIC_TREE, DL_STATIC_BUILDING };   // mirrors dlformat.h StaticType
+    constexpr uint32_t kLiveMaxInst    = 65536;        // per-frame draw-instance cap (ring size)
+    constexpr uint32_t kLiveMaxSubsets = 16384;        // per-frame indirect-arg cap (ring size)
+    constexpr float    kLiveGridCell   = 8192.0f;      // uniform-grid cell (one MW cell) for the cull
+    Buffer*   g_pStaticsInstRing = nullptr;            // CPU_TO_GPU per-frame instance stream (80 B/inst)
+    Buffer*   g_pStaticsArgsRing = nullptr;            // CPU_TO_GPU per-frame IndirectDrawIndexArguments[]
+    struct LiveGridCell {
+        std::vector<uint32_t> inst;                    // instance indices into g_usageData ws0 records
+        float minx, miny, minz, maxx, maxy, maxz;      // AABB of member placements (padded for cull)
+    };
+    std::vector<LiveGridCell> g_liveGrid;
+    bool      g_dlExterior   = false;                  // per-frame: client's isExterior gate
+    bool      g_dlLiveInit   = false;                  // resident load + grid + rings done
+    bool      g_staticsLiveOk = false;                 // statics library + rings ready
+    float     g_dlEye[3]     = { 0, 0, 0 };            // realEye this frame (DL shift origin)
+    // (Statics textures are all resident from load via gStaticsArrays — no per-frame load budget.)
+    std::vector<uint32_t> g_liveLandVisible;           // land mesh indices surviving the frustum cull
+    uint32_t  g_liveLastInst = 0, g_liveLastSubsets = 0, g_liveLastLand = 0;  // per-frame draw counts (log)
+
+    // Read an entire file into `out`. Uses std::vector (Forge's IMemory bans raw malloc).
+    bool dlReadWholeFile(const char* path, std::vector<uint8_t>& out) {
+        out.clear();
+        std::FILE* f = std::fopen(path, "rb");
+        if (!f) { return false; }
+        std::fseek(f, 0, SEEK_END);
+        long sz = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
+        if (sz <= 0) { std::fclose(f); return false; }
+        out.resize((size_t)sz);
+        size_t rd = std::fread(out.data(), 1, (size_t)sz, f);
+        std::fclose(f);
+        if (rd != (size_t)sz) { out.clear(); return false; }
+        return true;
+    }
+
+    // Decode a DDS file from disk into bindless gTextures[slot] (reuses parseDds + the
+    // uploadTextures create/upload/rebind path). Returns true on success.
+    bool dlLoadAtlas(Renderer* R, const char* path, uint32_t slot) {
+        std::vector<uint8_t> dds;
+        if (!dlReadWholeFile(path, dds)) { std::printf("[forge][dl] atlas missing: %s\n", path); return false; }
+        DdsInfo info = parseDds(dds.data(), (unsigned)dds.size());
+        if (!info.ok) { std::printf("[forge][dl] atlas unsupported DDS: %s\n", path); return false; }
+
+        Texture* tex = nullptr;
+        TextureDesc td = {};
+        td.mWidth = info.width; td.mHeight = info.height; td.mDepth = 1;
+        td.mArraySize = 1; td.mMipLevels = info.mipLevels;
+        td.mSampleCount = SAMPLE_COUNT_1;
+        td.mFormat = info.fmt;
+        td.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+        td.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+        td.pName = "dlAtlas";
+        TextureLoadDesc tld = {};
+        tld.ppTexture = &tex;
+        tld.pDesc = &td;
+        addResource(&tld, nullptr);
+        waitForAllResourceLoads();
+        if (!tex) { return false; }
+
+        const uint8_t* src    = dds.data() + info.dataOffset;
+        const uint8_t* ddsEnd = dds.data() + dds.size();
+        TextureUpdateDesc upd = {};
+        upd.pTexture = tex;
+        upd.mBaseMipLevel = 0; upd.mMipLevels = info.mipLevels;
+        upd.mBaseArrayLayer = 0; upd.mLayerCount = 1;
+        upd.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+        beginUpdateResource(&upd);
+        for (uint32_t m = 0; m < info.mipLevels; ++m) {
+            TextureSubresourceUpdate s = upd.getSubresourceUpdateDesc(m, 0);
+            const uint32_t mipBytes = s.mRowCount * s.mSrcRowStride;
+            if (src + mipBytes > ddsEnd) { break; }
+            for (uint32_t row = 0; row < s.mRowCount; ++row) {
+                std::memcpy(s.pMappedData + (size_t)row * s.mDstRowStride,
+                            src + (size_t)row * s.mSrcRowStride, s.mSrcRowStride);
+            }
+            src += mipBytes;
+        }
+        endUpdateResource(&upd);
+        flushTextureUploads(R);
+
+        if (g_live.pTextures[slot] != g_live.pDefaultWhite) { removeResource(g_live.pTextures[slot]); }
+        g_live.pTextures[slot] = tex;
+        if (slot + 1 > g_live.texHigh) { g_live.texHigh = slot + 1; }
+        DescriptorData dd = {};
+        dd.mIndex = SRT_RES_IDX(SrtData, Persistent, gTextures);
+        dd.mArrayOffset = slot;
+        dd.mCount = 1;
+        dd.ppTextures = &g_live.pTextures[slot];
+        updateDescriptorSet(R, 0, g_live.pPersistentSet, 1, &dd);
+        std::printf("[forge][dl] atlas slot %u <- %s (%ux%u, %u mips)\n",
+                    slot, path, info.width, info.height, info.mipLevels);
+        return true;
+    }
+
+    // Build the land pipeline: distantland.vert/.frag, 16 B vertex layout (pos + SHORT2N uv),
+    // depth-write + reverse-Z GEQUAL (land owns its depth — no prepass, terrain is fully opaque),
+    // drawn after the near colour pass. Reuses default.rootsig + the opaque descriptor sets.
+    bool buildLandPath(Renderer* R) {
+        if (g_pLandPipeline) { return true; }
+        ShaderLoadDesc sd = {};
+        sd.mVert.pFileName = "distantland.vert";
+        sd.mFrag.pFileName = "distantland.frag";
+        addShader(R, &sd, &g_pLandShader);
+        if (!g_pLandShader) { std::printf("[forge][dl] addShader(distantland) FAILED\n"); return false; }
+
+        VertexLayout vl = {};
+        vl.mBindingCount = 1;
+        vl.mBindings[0].mStride = 16;               // LandElem: float3 pos + SHORT2N uv
+        vl.mBindings[0].mRate = VERTEX_BINDING_RATE_VERTEX;
+        vl.mAttribCount = 2;
+        vl.mAttribs[0].mSemantic = SEMANTIC_POSITION;
+        vl.mAttribs[0].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
+        vl.mAttribs[0].mBinding = 0;
+        vl.mAttribs[0].mLocation = 0;
+        vl.mAttribs[0].mOffset = 0;
+        vl.mAttribs[1].mSemantic = SEMANTIC_TEXCOORD0;
+        vl.mAttribs[1].mFormat = TinyImageFormat_R16G16_SNORM;   // SHORT2N -> [-1,1], as the D3D9 decl
+        vl.mAttribs[1].mBinding = 0;
+        vl.mAttribs[1].mLocation = 1;
+        vl.mAttribs[1].mOffset = 12;
+
+        DepthStateDesc ds = {};
+        ds.mDepthTest = true;
+        ds.mDepthWrite = true;
+        ds.mDepthFunc = CMP_GEQUAL;                 // reverse-Z (near->1, far->0); pDepth clears to 0
+
+        RasterizerStateDesc rs = {};
+        rs.mCullMode = CULL_MODE_NONE;              // terrain heightfield: don't risk culling LOD faces
+        rs.mFrontFace = FRONT_FACE_CCW;
+
+        PipelineDesc pd = {};
+        pd.mType = PIPELINE_TYPE_GRAPHICS;
+        GraphicsPipelineDesc& g = pd.mGraphicsDesc;
+        g.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+        g.mRenderTargetCount = 1;
+        g.pColorFormats = &g_live.pRT->mFormat;
+        g.mSampleCount = (SampleCount)g_live.sampleCount;
+        g.mSampleQuality = 0;
+        g.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+        g.pDepthState = &ds;
+        g.pVertexLayout = &vl;
+        g.pRasterizerState = &rs;
+        g.pShaderProgram = g_pLandShader;
+        addPipeline(R, &pd, &g_pLandPipeline);
+        if (!g_pLandPipeline) { std::printf("[forge][dl] addPipeline(distantland) FAILED\n"); return false; }
+        std::printf("[forge][dl] land pipeline built\n");
+        return true;
+    }
+
+    // Load the 3 atlas textures + parse the distantland\world container into resident Forge
+    // VB/IB + bounding spheres. Idempotent. Requires buildOpaquePath (pPersistentSet) already built.
+    bool loadDistantLand(Renderer* R) {
+        if (g_landLoaded) { return true; }
+        bool a0 = dlLoadAtlas(R, "Data Files\\distantland\\world.dds",          kLandBaseSlot);
+        bool a1 = dlLoadAtlas(R, "Data Files\\distantland\\world_n.dds",        kLandNormalSlot);
+        bool a2 = dlLoadAtlas(R, "Data Files\\textures\\MGE\\world_detail.dds", kLandDetailSlot);
+        if (!a0 || !a1 || !a2) { std::printf("[forge][dl] atlas incomplete (a0=%d a1=%d a2=%d)\n", a0, a1, a2); return false; }
+
+        std::vector<uint8_t> file;
+        if (!dlReadWholeFile("Data Files\\distantland\\world", file) || file.size() < 4) {
+            std::printf("[forge][dl] world container missing/empty\n");
+            return false;
+        }
+        const uint8_t* p   = file.data();
+        const uint8_t* end = file.data() + file.size();
+        uint32_t meshCount = 0;
+        std::memcpy(&meshCount, p, 4); p += 4;
+        std::printf("[forge][dl] world container: %u meshes (%zu bytes)\n", meshCount, file.size());
+
+        uint32_t built = 0;
+        for (uint32_t i = 0; i < meshCount && g_landMeshCount < kMaxLandMeshes; ++i) {
+            // Per-mesh header: radius(4) + center(12) + boxMin(12) + boxMax(12) = 40, then verts(4)+faces(4).
+            if (p + 48 > end) { break; }
+            float radius; float center[3];
+            std::memcpy(&radius, p, 4);
+            std::memcpy(center, p + 4, 12);
+            p += 40;                                 // skip boxMin/boxMax (sphere suffices for the cull)
+            uint32_t verts = 0, faces = 0;
+            std::memcpy(&verts, p, 4); std::memcpy(&faces, p + 4, 4); p += 8;
+
+            bool large = (verts > 0xFFFFu || faces > 0xFFFFu);
+            size_t vbBytes = (size_t)verts * 16;
+            size_t ibBytes = (size_t)faces * (large ? 12 : 6);
+            if (p + vbBytes + ibBytes > end) { std::printf("[forge][dl] mesh %u truncated\n", i); break; }
+            const uint8_t* vbSrc = p;
+            const uint8_t* ibSrc = p + vbBytes;
+            p += vbBytes + ibBytes;
+            if (!verts || !faces) { continue; }
+
+            LandMeshGPU& m = g_landMeshes[g_landMeshCount];
+            m.vb = nullptr; m.ib = nullptr;
+            BufferLoadDesc vbd = {};
+            vbd.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+            vbd.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+            vbd.mDesc.mSize = vbBytes;
+            vbd.pData = vbSrc;
+            vbd.ppBuffer = &m.vb;
+            addResource(&vbd, nullptr);
+            BufferLoadDesc ibd = {};
+            ibd.mDesc.mDescriptors = DESCRIPTOR_TYPE_INDEX_BUFFER;
+            ibd.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+            ibd.mDesc.mSize = ibBytes;
+            ibd.pData = ibSrc;
+            ibd.ppBuffer = &m.ib;
+            addResource(&ibd, nullptr);
+            waitForAllResourceLoads();
+            if (!m.vb || !m.ib) { std::printf("[forge][dl] mesh %u buffer alloc FAILED\n", i); continue; }
+
+            m.indexCount = faces * 3;
+            m.large = large;
+            m.cx = center[0]; m.cy = center[1]; m.cz = center[2]; m.r = radius;
+            ++g_landMeshCount;
+            ++built;
+        }
+        std::printf("[forge][dl] resident land meshes: %u\n", g_landMeshCount);
+        g_landLoaded = (built > 0);
+        return g_landLoaded;
+    }
+
+    void dlMul(const float a[16], const float b[16], float out[16]);   // defined with the camera helpers below
+
+    // Build the statics pipeline: statics.vert/.frag, two vertex bindings (0 = StaticElem 20 B,
+    // per-vertex; 1 = per-INSTANCE world matrix rows + params, 80 B), depth-write + reverse-Z
+    // GEQUAL (shares pDepth with land/near). Reuses default.rootsig + the opaque descriptor sets.
+    bool buildStaticsPath(Renderer* R) {
+        if (g_pStaticsPipeline) { return true; }
+        ShaderLoadDesc sd = {};
+        sd.mVert.pFileName = "statics.vert";
+        sd.mFrag.pFileName = "statics.frag";
+        addShader(R, &sd, &g_pStaticsShader);
+        if (!g_pStaticsShader) { std::printf("[forge][dl] addShader(statics) FAILED\n"); return false; }
+
+        VertexLayout vl = {};
+        vl.mBindingCount = 2;
+        vl.mBindings[0].mStride = 20;                       // StaticElem: FLOAT16_4 pos, UBYTE4N nrm, D3DCOLOR, FLOAT16_2 uv
+        vl.mBindings[0].mRate   = VERTEX_BINDING_RATE_VERTEX;
+        vl.mBindings[1].mStride = kStaticsInstStride;       // per-instance: 4 world rows + params
+        vl.mBindings[1].mRate   = VERTEX_BINDING_RATE_INSTANCE;
+        vl.mAttribCount = 9;
+        // binding 0 (per-vertex)
+        vl.mAttribs[0].mSemantic = SEMANTIC_POSITION;
+        vl.mAttribs[0].mFormat   = TinyImageFormat_R16G16B16A16_SFLOAT;  // FLOAT16_4
+        vl.mAttribs[0].mBinding  = 0; vl.mAttribs[0].mLocation = 0; vl.mAttribs[0].mOffset = 0;
+        vl.mAttribs[1].mSemantic = SEMANTIC_NORMAL;
+        vl.mAttribs[1].mFormat   = TinyImageFormat_R8G8B8A8_UNORM;       // UBYTE4N (xyz=normal, w=emissive)
+        vl.mAttribs[1].mBinding  = 0; vl.mAttribs[1].mLocation = 1; vl.mAttribs[1].mOffset = 8;
+        vl.mAttribs[2].mSemantic = SEMANTIC_COLOR;
+        vl.mAttribs[2].mFormat   = TinyImageFormat_B8G8R8A8_UNORM;       // D3DCOLOR byte order
+        vl.mAttribs[2].mBinding  = 0; vl.mAttribs[2].mLocation = 2; vl.mAttribs[2].mOffset = 12;
+        vl.mAttribs[3].mSemantic = SEMANTIC_TEXCOORD0;
+        vl.mAttribs[3].mFormat   = TinyImageFormat_R16G16_SFLOAT;        // FLOAT16_2
+        vl.mAttribs[3].mBinding  = 0; vl.mAttribs[3].mLocation = 3; vl.mAttribs[3].mOffset = 16;
+        // binding 1 (per-instance): 4 world rows (TEXCOORD1..4) + params (TEXCOORD5)
+        for (uint32_t k = 0; k < 5; ++k) {
+            vl.mAttribs[4 + k].mSemantic = (ShaderSemantic)(SEMANTIC_TEXCOORD1 + k);
+            vl.mAttribs[4 + k].mFormat   = TinyImageFormat_R32G32B32A32_SFLOAT;
+            vl.mAttribs[4 + k].mBinding  = 1;
+            vl.mAttribs[4 + k].mLocation = 4 + k;
+            vl.mAttribs[4 + k].mOffset   = k * 16;
+        }
+
+        DepthStateDesc ds = {};
+        ds.mDepthTest = true; ds.mDepthWrite = true; ds.mDepthFunc = CMP_GEQUAL;
+        RasterizerStateDesc rs = {};
+        // Single-sided, front = CCW: under MW's live view+proj the facing is INVERTED from the
+        // --forge-dl probe's synthetic LH camera (the probe's FRONT_FACE_CW showed BACK faces =
+        // "inside out"; CULL_NONE confirmed the geometry is otherwise correct). CCW is the live
+        // front, so back-cull saves the back-face fill. (MGE itself draws distant statics single-
+        // sided; its foliage LODs are crossed quads, so single-sided is correct for this geometry.)
+        rs.mCullMode = CULL_MODE_BACK; rs.mFrontFace = FRONT_FACE_CCW;
+
+        PipelineDesc pd = {};
+        pd.mType = PIPELINE_TYPE_GRAPHICS;
+        GraphicsPipelineDesc& g = pd.mGraphicsDesc;
+        g.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+        g.mRenderTargetCount = 1;
+        g.pColorFormats = &g_live.pRT->mFormat;
+        g.mSampleCount = (SampleCount)g_live.sampleCount;
+        g.mSampleQuality = 0;
+        g.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+        g.pDepthState = &ds;
+        g.pVertexLayout = &vl;
+        g.pRasterizerState = &rs;
+        g.pShaderProgram = g_pStaticsShader;
+        addPipeline(R, &pd, &g_pStaticsPipeline);
+        if (!g_pStaticsPipeline) { std::printf("[forge][dl] addPipeline(statics) FAILED\n"); return false; }
+        std::printf("[forge][dl] statics pipeline built\n");
+        return true;
+    }
+
+    // Parse static_meshes into the mega VB/IB + per-subset records, and load usage.data resident.
+    // The unique geometry is uploaded ONCE; textures + instances are bound later per scope. Idempotent.
+    bool loadDistantStatics(Renderer* R) {
+        if (g_staticsLoaded) { return true; }
+
+        // usage.data: DWORD DistantStaticCount, DWORD dynamicVisGroupCount, [visgroups 130 B each],
+        // then per-worldspace { DWORD count; (ws>0) char[64] name; records[count*34] }. ws0 = exterior.
+        if (!dlReadWholeFile("Data Files\\distantland\\statics\\usage.data", g_usageData) || g_usageData.size() < 8) {
+            std::printf("[forge][dl] usage.data missing\n"); return false;
+        }
+        uint32_t distantStaticCount = 0, visGroupCount = 0;
+        std::memcpy(&distantStaticCount, &g_usageData[0], 4);
+        std::memcpy(&visGroupCount,      &g_usageData[4], 4);
+        uint64_t uoff = 8 + (uint64_t)visGroupCount * 130;
+        if (uoff + 4 > g_usageData.size()) { std::printf("[forge][dl] usage.data truncated header\n"); return false; }
+        std::memcpy(&g_ws0Count, &g_usageData[uoff], 4); uoff += 4;
+        g_ws0Off = uoff;                                  // ws0 has no name; records follow immediately
+        if (g_ws0Off + (uint64_t)g_ws0Count * 34 > g_usageData.size()) {
+            std::printf("[forge][dl] usage.data ws0 overrun (%u instances)\n", g_ws0Count); return false;
+        }
+
+        // static_meshes: per DistantStatic { DWORD numSubsets; float r; float3 c; byte type; per subset
+        //   { float r; float3 c; float3 amin; float3 amax; int verts; int faces; vbytes[verts*20];
+        //     idx[faces*3]u16; bool[2]{hasAlpha,uvCtrl}; u16 pathsize; char name[pathsize] } }.
+        std::vector<uint8_t> file;
+        if (!dlReadWholeFile("Data Files\\distantland\\statics\\static_meshes", file) || file.size() < 4) {
+            std::printf("[forge][dl] static_meshes missing\n"); return false;
+        }
+        const uint8_t* p   = file.data();
+        const uint8_t* end = file.data() + file.size();
+
+        std::vector<uint8_t> megaVB, megaIB;             // packed library geometry
+        megaVB.reserve(160u << 20); megaIB.reserve(64u << 20);
+        g_staticsSubsets.clear(); g_staticsDefs.clear(); g_staticsSubsetTex.clear();
+        g_staticsDefs.reserve(distantStaticCount);
+
+        for (uint32_t s = 0; s < distantStaticCount; ++s) {
+            if (p + 21 > end) { break; }
+            uint32_t numSubsets = 0; std::memcpy(&numSubsets, p, 4);
+            float    sradius = 0.0f; std::memcpy(&sradius, p + 4, 4);   // model bounding radius
+            uint8_t  stype   = *(p + 4 + 4 + 12);                       // StaticType (dlformat.h)
+            p += 4 + 4 + 12 + 1;                          // numSubsets + radius + center + type
+            StaticsDefCPU def; def.firstSubset = (uint32_t)g_staticsSubsets.size(); def.numSubsets = numSubsets;
+            def.radius = sradius; def.type = stype;
+            for (uint32_t ss = 0; ss < numSubsets; ++ss) {
+                if (p + 44 > end) { p = end; break; }
+                p += 4 + 12 + 12 + 12;                    // subset sphere + aabbMin + aabbMax
+                int verts = 0, faces = 0;
+                std::memcpy(&verts, p, 4); std::memcpy(&faces, p + 4, 4); p += 8;
+                size_t vbBytes = (size_t)verts * 20;
+                size_t ibBytes = (size_t)faces * 6;       // 16-bit indices, faces*3
+                if (verts < 0 || faces < 0 || p + vbBytes + ibBytes + 4 > end) { p = end; break; }
+                const uint8_t* vbSrc = p;       p += vbBytes;
+                const uint8_t* ibSrc = p;       p += ibBytes;
+                uint8_t hasAlpha = *p; p += 2;            // bool[2] {hasAlpha, hasUVController}
+                uint16_t pathsize = 0; std::memcpy(&pathsize, p, 2); p += 2;
+                if (p + pathsize > end) { p = end; break; }
+                // texname -> path RELATIVE to statics\textures\, lowercased, .dds. The LOD library
+                // MIRRORS the source texture subfolders (tr\, hr\, sum\, glow\, ... for TR/mod packs):
+                // 226 of 1557 DDS live in subfolders, so basename-only lookup loses the folder and
+                // ~250 statics go white. Keep the subpath: strip trailing NUL/space, normalize slashes
+                // + lowercase, drop a leading "data files\" then "textures\" prefix, force .dds (the
+                // library is all .dds; static_meshes stores the original, often .tga, source name).
+                std::string name;
+                {
+                    const char* np = (const char*)p; uint16_t n = pathsize;
+                    while (n > 0 && (np[n-1] == 0 || np[n-1] == ' ')) { --n; }
+                    std::string full;
+                    for (int i = 0; i < (int)n; ++i) {
+                        char c = np[i];
+                        if (c == '/') { c = '\\'; }
+                        if (c >= 'A' && c <= 'Z') { c = (char)(c - 'A' + 'a'); }
+                        full.push_back(c);
+                    }
+                    if (full.rfind("data files\\", 0) == 0) { full.erase(0, 11); }
+                    if (full.rfind("textures\\", 0) == 0)    { full.erase(0, 9); }
+                    size_t dot = full.find_last_of('.');
+                    if (dot != std::string::npos) { full.erase(dot); }
+                    name = full + ".dds";
+                }
+                p += pathsize;
+
+                StaticsSubsetGPU sub = {};
+                sub.vbBase     = (uint32_t)(megaVB.size() / 20);
+                sub.ibBase     = (uint32_t)(megaIB.size() / 2);
+                sub.indexCount = (uint32_t)faces * 3;
+                sub.texSlot    = 0;                       // assigned lazily when first drawn in scope
+                sub.flags      = hasAlpha ? 0x2u : 0u;
+                if (verts > 0 && faces > 0) {
+                    megaVB.insert(megaVB.end(), vbSrc, vbSrc + vbBytes);
+                    megaIB.insert(megaIB.end(), ibSrc, ibSrc + ibBytes);
+                }
+                g_staticsSubsets.push_back(sub);
+                g_staticsSubsetTex.push_back(name);
+            }
+            g_staticsDefs.push_back(def);
+        }
+        std::printf("[forge][dl] statics library: %zu statics, %zu subsets, megaVB %.1fMB megaIB %.1fMB\n",
+                    g_staticsDefs.size(), g_staticsSubsets.size(), megaVB.size()/1e6, megaIB.size()/1e6);
+        if (megaVB.empty() || megaIB.empty()) { return false; }
+
+        BufferLoadDesc vbd = {};
+        vbd.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+        vbd.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+        vbd.mDesc.mSize = megaVB.size();
+        vbd.mDesc.pName = "staticsVB";
+        vbd.pData = megaVB.data();
+        vbd.ppBuffer = &g_pStaticsVB;
+        addResource(&vbd, nullptr);
+        BufferLoadDesc ibd = {};
+        ibd.mDesc.mDescriptors = DESCRIPTOR_TYPE_INDEX_BUFFER;
+        ibd.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+        ibd.mDesc.mSize = megaIB.size();
+        ibd.mDesc.pName = "staticsIB";
+        ibd.pData = megaIB.data();
+        ibd.ppBuffer = &g_pStaticsIB;
+        addResource(&ibd, nullptr);
+        waitForAllResourceLoads();
+        if (!g_pStaticsVB || !g_pStaticsIB) { std::printf("[forge][dl] statics mega buffer alloc FAILED\n"); return false; }
+
+        g_staticsLoaded = true;
+        return true;
+    }
+
+    // Tightly-packed (DDS on-disk) byte size of one mip surface at (w,h) for the given format. BCn
+    // is block-packed (min 1 block); uncompressed is 32-bit. Matches util_get_surface_info's tight
+    // mSrcRowStride*mRowCount, so it correctly advances over skipped top mips.
+    static uint32_t ddsTightMipBytes(TinyImageFormat fmt, uint32_t w, uint32_t h) {
+        uint32_t bw, bh;
+        switch (fmt) {
+            case TinyImageFormat_DXBC1_RGBA_UNORM:
+                bw = (w + 3) / 4; bh = (h + 3) / 4; if (!bw) bw = 1; if (!bh) bh = 1;
+                return bw * bh * 8;
+            case TinyImageFormat_DXBC2_UNORM:
+            case TinyImageFormat_DXBC3_UNORM:
+                bw = (w + 3) / 4; bh = (h + 3) / 4; if (!bw) bw = 1; if (!bh) bh = 1;
+                return bw * bh * 16;
+            default:   // BGRA8 / RGBA8 (uncompressed 32-bit)
+                return w * h * 4;
+        }
+    }
+
+    // Build the distant-statics texture residency (gStaticsArrays): one Texture2DArray per
+    // (format, capped-size) bucket, every unique statics texture uploaded ONCE as a slice via raw
+    // mip-extract (the largest mip with long side <= kStaticsTexCap + the chain below it — no
+    // decode/resize/encode). Each subset's texSlot resolves to (bucket<<16)|layer. All resident:
+    // no eviction, no per-frame streaming, no white-on-traverse (the old LRU thrashed at high
+    // DrawDist because a single view's working set exceeds the shared descriptor table). Idempotent.
+    // Requires loadDistantStatics + the Persistent set (g_live.pStaticsWhiteArray). Runs ONCE at the
+    // first-exterior init (a one-time multi-hundred-ms hitch — reading ~1.5k DDS + GPU uploads).
+    bool buildStaticsTextureArrays(Renderer* R) {
+        if (g_staticsTexReady) { return true; }
+        if (!g_staticsLoaded || !g_live.pPersistentSet || !g_live.pStaticsWhiteArray) { return false; }
+        const std::string texDir = "Data Files\\distantland\\statics\\textures\\";
+
+        struct UTexPlan { TinyImageFormat fmt; uint32_t cw, ch, capStep, availMips, bucket, layer; };
+        std::unordered_map<std::string, UTexPlan> plan;        // unique name -> plan (zero = white/bucket 0)
+        std::unordered_map<uint64_t, uint32_t>    keyToBucket; // (fmt,cw,ch) -> bucket index
+        auto bucketKey = [](TinyImageFormat f, uint32_t w, uint32_t h) -> uint64_t {
+            return ((uint64_t)(uint32_t)f << 40) | ((uint64_t)(w & 0xFFFFF) << 20) | (uint64_t)(h & 0xFFFFF);
+        };
+
+        g_staticsBuckets.clear();
+        g_staticsBuckets.push_back(StaticsTexBucket{ TinyImageFormat_R8G8B8A8_UNORM, 4, 4, 1,
+                                                     g_live.pStaticsWhiteArray, 2 });   // [0] = white
+        std::vector<std::vector<std::string>> bucketMembers; bucketMembers.emplace_back();
+
+        // Pass 1: header scan -> bucket plan (dedup by name).
+        uint32_t missing = 0, overflow = 0;
+        for (const std::string& nm : g_staticsSubsetTex) {
+            if (nm.empty() || plan.find(nm) != plan.end()) { continue; }
+            std::vector<uint8_t> hdr;
+            DdsInfo info = dlReadWholeFile((texDir + nm).c_str(), hdr)
+                         ? parseDds(hdr.data(), (uint32_t)hdr.size()) : DdsInfo{};
+            if (!info.ok) { plan[nm] = UTexPlan{}; ++missing; continue; }   // -> white (bucket 0)
+            uint32_t k = 0, w = info.width, h = info.height;
+            while ((w > kStaticsTexCap || h > kStaticsTexCap) && (k + 1) < info.mipLevels) {
+                w = (w > 1) ? w >> 1 : 1; h = (h > 1) ? h >> 1 : 1; ++k;    // clamp to leave >=1 mip
+            }
+            UTexPlan up; up.fmt = info.fmt; up.cw = w; up.ch = h; up.capStep = k;
+            up.availMips = info.mipLevels - k;
+            const uint64_t key = bucketKey(info.fmt, w, h);
+            auto bit = keyToBucket.find(key);
+            if (bit == keyToBucket.end()) {
+                if (g_staticsBuckets.size() >= kStaticsBuckets) { plan[nm] = UTexPlan{}; ++overflow; continue; }
+                const uint32_t b = (uint32_t)g_staticsBuckets.size();
+                keyToBucket[key] = b;
+                StaticsTexBucket nb; nb.fmt = info.fmt; nb.w = w; nb.h = h; nb.mips = up.availMips;
+                g_staticsBuckets.push_back(nb);
+                bucketMembers.emplace_back();
+                bit = keyToBucket.find(key);
+            }
+            up.bucket = bit->second;
+            StaticsTexBucket& b = g_staticsBuckets[up.bucket];
+            if (up.availMips < b.mips) { b.mips = up.availMips; }   // uniform chain = min over members
+            up.layer = b.count++;
+            bucketMembers[up.bucket].push_back(nm);
+            plan[nm] = up;
+        }
+
+        // Pass 2: create + bind one Texture2DArray per real bucket.
+        for (uint32_t b = 1; b < g_staticsBuckets.size(); ++b) {
+            StaticsTexBucket& bk = g_staticsBuckets[b];
+            TextureDesc td = {};
+            td.mWidth = bk.w; td.mHeight = bk.h; td.mDepth = 1;
+            td.mArraySize = bk.count; td.mMipLevels = bk.mips;
+            td.mSampleCount = SAMPLE_COUNT_1;
+            td.mFormat = bk.fmt;
+            td.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+            td.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+            td.pName = "staticsBucket";
+            TextureLoadDesc tld = {}; tld.ppTexture = &bk.tex; tld.pDesc = &td;
+            addResource(&tld, nullptr);
+        }
+        waitForAllResourceLoads();
+        {
+            std::vector<Texture*> texs(g_staticsBuckets.size());
+            for (uint32_t b = 0; b < g_staticsBuckets.size(); ++b) {
+                texs[b] = g_staticsBuckets[b].tex ? g_staticsBuckets[b].tex : g_live.pStaticsWhiteArray;
+            }
+            DescriptorData sd = {};
+            sd.mIndex = SRT_RES_IDX(SrtData, Persistent, gStaticsArrays);
+            sd.mArrayOffset = 0; sd.mCount = (uint32_t)g_staticsBuckets.size();
+            sd.ppTextures = texs.data();
+            updateDescriptorSet(R, 0, g_live.pPersistentSet, 1, &sd);
+        }
+
+        // Pass 3: upload each unique texture's capped mip range into its slice.
+        uint32_t uploaded = 0;
+        for (uint32_t b = 1; b < g_staticsBuckets.size(); ++b) {
+            StaticsTexBucket& bk = g_staticsBuckets[b];
+            if (!bk.tex) { continue; }
+            for (uint32_t layer = 0; layer < (uint32_t)bucketMembers[b].size(); ++layer) {
+                const std::string& nm = bucketMembers[b][layer];
+                std::vector<uint8_t> dds;
+                if (!dlReadWholeFile((texDir + nm).c_str(), dds)) { continue; }
+                DdsInfo info = parseDds(dds.data(), (uint32_t)dds.size());
+                if (!info.ok) { continue; }
+                const UTexPlan& up = plan[nm];
+                const uint8_t* src    = dds.data() + info.dataOffset;
+                const uint8_t* ddsEnd = dds.data() + dds.size();
+                uint32_t sw = info.width, sh = info.height;                 // advance over skipped top mips
+                for (uint32_t i = 0; i < up.capStep; ++i) {
+                    src += ddsTightMipBytes(info.fmt, sw, sh);
+                    sw = (sw > 1) ? sw >> 1 : 1; sh = (sh > 1) ? sh >> 1 : 1;
+                }
+                TextureUpdateDesc upd = {};
+                upd.pTexture = bk.tex;
+                upd.mBaseMipLevel = 0; upd.mMipLevels = bk.mips;
+                upd.mBaseArrayLayer = layer; upd.mLayerCount = 1;
+                upd.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                beginUpdateResource(&upd);
+                for (uint32_t m = 0; m < bk.mips; ++m) {
+                    TextureSubresourceUpdate s = upd.getSubresourceUpdateDesc(m, layer);
+                    const uint32_t mipBytes = s.mRowCount * s.mSrcRowStride;
+                    if (src + mipBytes > ddsEnd) { break; }
+                    for (uint32_t row = 0; row < s.mRowCount; ++row) {
+                        std::memcpy(s.pMappedData + (size_t)row * s.mDstRowStride,
+                                    src + (size_t)row * s.mSrcRowStride, s.mSrcRowStride);
+                    }
+                    src += mipBytes;
+                }
+                endUpdateResource(&upd);
+                ++uploaded;
+            }
+            flushTextureUploads(R);   // submit per bucket (bounds the staging ring)
+        }
+
+        // Resolve every subset's texSlot once (missing/overflow -> bucket 0 = white).
+        for (uint32_t sid = 0; sid < g_staticsSubsets.size(); ++sid) {
+            auto it = plan.find(g_staticsSubsetTex[sid]);
+            g_staticsSubsets[sid].texSlot = (it != plan.end())
+                                          ? ((it->second.bucket << 16) | (it->second.layer & 0xFFFF)) : 0u;
+        }
+
+        uint64_t vram = 0;
+        for (uint32_t b = 1; b < g_staticsBuckets.size(); ++b) {
+            const StaticsTexBucket& bk = g_staticsBuckets[b];
+            uint32_t mw = bk.w, mh = bk.h;
+            for (uint32_t m = 0; m < bk.mips; ++m) {
+                vram += (uint64_t)ddsTightMipBytes(bk.fmt, mw, mh) * bk.count;
+                mw = (mw > 1) ? mw >> 1 : 1; mh = (mh > 1) ? mh >> 1 : 1;
+            }
+        }
+        std::printf("[forge][dl] statics textures: %zu buckets, %u uploaded, %u missing, %u overflow, ~%lluMB resident\n",
+                    g_staticsBuckets.size() - 1, uploaded, missing, overflow, (unsigned long long)(vram >> 20));
+        g_staticsTexReady = true;
+        return true;
+    }
+
+    // Build the per-scope instance + indirect-arg buffers: collect exterior placements within
+    // kStaticsScopeR of camera target T, expand to (instance×subset) grouped by subset, load each
+    // referenced texture (bindless), and emit one IndirectDrawIndexArguments per non-empty subset.
+    bool buildStaticsScope(Renderer* R, const float T[3]) {
+        if (!g_staticsLoaded) { return false; }
+        const float r2 = kStaticsScopeR * kStaticsScopeR;
+
+        // Per-subset accumulator of instance rows (80 B each: 16 floats world + 4 floats params).
+        std::vector<std::vector<float>> bySubset(g_staticsSubsets.size());
+        uint32_t scoped = 0;
+        const uint8_t* rec = &g_usageData[g_ws0Off];
+        for (uint32_t i = 0; i < g_ws0Count; ++i, rec += 34) {
+            uint32_t staticRef; std::memcpy(&staticRef, rec, 4);
+            float pos[3], yaw, pitch, roll, scale;
+            std::memcpy(pos, rec + 6, 12);
+            std::memcpy(&yaw, rec + 18, 4); std::memcpy(&pitch, rec + 22, 4);
+            std::memcpy(&roll, rec + 26, 4); std::memcpy(&scale, rec + 30, 4);
+            float dx = pos[0] - T[0], dy = pos[1] - T[1];
+            if (dx*dx + dy*dy > r2) { continue; }
+            if (staticRef >= g_staticsDefs.size()) { continue; }
+            ++scoped;
+
+            // transform = Scale * RotZ(-roll) * RotY(-pitch) * RotX(-yaw) * Translate(pos)  (D3DX row-vec).
+            float cz=std::cos(-roll),  sz=std::sin(-roll);
+            float cy=std::cos(-pitch), sy=std::sin(-pitch);
+            float cx=std::cos(-yaw),   sx=std::sin(-yaw);
+            float S[16]  = { scale,0,0,0, 0,scale,0,0, 0,0,scale,0, 0,0,0,1 };
+            float Rz[16] = { cz,sz,0,0, -sz,cz,0,0, 0,0,1,0, 0,0,0,1 };
+            float Ry[16] = { cy,0,-sy,0, 0,1,0,0, sy,0,cy,0, 0,0,0,1 };
+            float Rx[16] = { 1,0,0,0, 0,cx,sx,0, 0,-sx,cx,0, 0,0,0,1 };
+            float Tm[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, pos[0],pos[1],pos[2],1 };
+            float m0[16], m1[16], m2[16], W[16];
+            dlMul(S,  Rz, m0);
+            dlMul(m0, Ry, m1);
+            dlMul(m1, Rx, m2);
+            dlMul(m2, Tm, W);                             // world (row-major D3DX)
+
+            const StaticsDefCPU& def = g_staticsDefs[staticRef];
+            for (uint32_t k = 0; k < def.numSubsets; ++k) {
+                uint32_t sid = def.firstSubset + k;
+                // texSlot was resolved once in buildStaticsTextureArrays ((bucket<<16)|layer).
+                std::vector<float>& dst = bySubset[sid];
+                dst.insert(dst.end(), W, W + 16);
+                dst.push_back((float)g_staticsSubsets[sid].texSlot);
+                dst.push_back((float)g_staticsSubsets[sid].flags);
+                dst.push_back(0.0f); dst.push_back(0.0f);
+            }
+        }
+
+        // Flatten grouped instances + build one indirect-arg record per non-empty subset.
+        std::vector<float> instAll;
+        std::vector<IndirectDrawIndexArguments> args;
+        uint32_t instBase = 0;
+        for (uint32_t sid = 0; sid < g_staticsSubsets.size(); ++sid) {
+            const std::vector<float>& v = bySubset[sid];
+            if (v.empty()) { continue; }
+            uint32_t instCount = (uint32_t)(v.size() / 20);   // 20 floats per instance (80 B)
+            instAll.insert(instAll.end(), v.begin(), v.end());
+            IndirectDrawIndexArguments a = {};
+            a.mIndexCount    = g_staticsSubsets[sid].indexCount;
+            a.mInstanceCount = instCount;
+            a.mStartIndex    = g_staticsSubsets[sid].ibBase;
+            a.mVertexOffset  = g_staticsSubsets[sid].vbBase;
+            a.mStartInstance = instBase;
+            args.push_back(a);
+            instBase += instCount;
+        }
+        g_staticsInstTotal = instBase;
+        g_staticsDrawCount = (uint32_t)args.size();
+        std::printf("[forge][dl] statics scope T(%.0f,%.0f,%.0f) r%.0f: %u placements -> %u draw-instances, %u subsets, %zu tex-buckets\n",
+                    T[0], T[1], T[2], kStaticsScopeR, scoped, g_staticsInstTotal, g_staticsDrawCount,
+                    g_staticsBuckets.empty() ? (size_t)0 : g_staticsBuckets.size() - 1);
+        if (g_staticsDrawCount == 0) { return false; }
+
+        BufferLoadDesc ibl = {};
+        ibl.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+        ibl.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+        ibl.mDesc.mSize = instAll.size() * sizeof(float);
+        ibl.mDesc.pName = "staticsInst";
+        ibl.pData = instAll.data();
+        ibl.ppBuffer = &g_pStaticsInst;
+        addResource(&ibl, nullptr);
+        BufferLoadDesc adl = {};
+        adl.mDesc.mDescriptors = DESCRIPTOR_TYPE_INDIRECT_BUFFER;
+        adl.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+        adl.mDesc.mSize = args.size() * sizeof(IndirectDrawIndexArguments);
+        adl.mDesc.pName = "staticsArgs";
+        adl.pData = args.data();
+        adl.ppBuffer = &g_pStaticsArgs;
+        addResource(&adl, nullptr);
+        waitForAllResourceLoads();
+        if (!g_pStaticsInst || !g_pStaticsArgs) { std::printf("[forge][dl] statics scope buffer FAILED\n"); return false; }
+        return true;
+    }
+
+    // Pick the densest 8192-grid cell among exterior placements as the probe camera target
+    // (deterministic, dense scene). out[2] = the cell's mean z.
+    void pickStaticsTarget(float out[3]) {
+        const float G = 8192.0f;
+        std::vector<uint64_t> keys; std::vector<uint32_t> cnt;
+        std::vector<double> zsum;
+        const uint8_t* rec = &g_usageData[g_ws0Off];
+        for (uint32_t i = 0; i < g_ws0Count; ++i, rec += 34) {
+            float pos[3]; std::memcpy(pos, rec + 6, 12);
+            int32_t ix = (int32_t)std::floor(pos[0] / G);
+            int32_t iy = (int32_t)std::floor(pos[1] / G);
+            uint64_t key = ((uint64_t)(uint32_t)ix << 32) | (uint32_t)iy;
+            // linear probe into the small histogram (few thousand cells)
+            uint32_t j = 0; for (; j < keys.size(); ++j) { if (keys[j] == key) { break; } }
+            if (j == keys.size()) { keys.push_back(key); cnt.push_back(0); zsum.push_back(0.0); }
+            cnt[j] += 1; zsum[j] += pos[2];
+        }
+        uint32_t best = 0;
+        for (uint32_t j = 1; j < cnt.size(); ++j) { if (cnt[j] > cnt[best]) { best = j; } }
+        int32_t ix = (int32_t)(keys[best] >> 32), iy = (int32_t)(uint32_t)keys[best];
+        out[0] = (ix + 0.5f) * G;
+        out[1] = (iy + 0.5f) * G;
+        out[2] = (float)(zsum[best] / (cnt[best] ? cnt[best] : 1));
+        std::printf("[forge][dl] densest cell (%d,%d) %u placements -> target (%.0f,%.0f,%.0f)\n",
+                    ix, iy, cnt[best], out[0], out[1], out[2]);
+    }
+
+    // --- tiny row-major (D3D LH, v*M) matrix helpers for the probe's synthetic camera ---
+    void dlNorm3(float v[3]) {
+        float l = std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+        if (l > 1e-8f) { v[0] /= l; v[1] /= l; v[2] /= l; }
+    }
+    void dlCross(const float a[3], const float b[3], float out[3]) {
+        out[0] = a[1]*b[2] - a[2]*b[1];
+        out[1] = a[2]*b[0] - a[0]*b[2];
+        out[2] = a[0]*b[1] - a[1]*b[0];
+    }
+    float dlDot3(const float a[3], const float b[3]) { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]; }
+    void dlLookAtLH(const float eye[3], const float at[3], const float up[3], float m[16]) {
+        float z[3] = { at[0]-eye[0], at[1]-eye[1], at[2]-eye[2] }; dlNorm3(z);
+        float x[3]; dlCross(up, z, x); dlNorm3(x);
+        float y[3]; dlCross(z, x, y);
+        m[0]=x[0]; m[1]=y[0]; m[2]=z[0]; m[3]=0;
+        m[4]=x[1]; m[5]=y[1]; m[6]=z[1]; m[7]=0;
+        m[8]=x[2]; m[9]=y[2]; m[10]=z[2]; m[11]=0;
+        m[12]=-dlDot3(x,eye); m[13]=-dlDot3(y,eye); m[14]=-dlDot3(z,eye); m[15]=1;
+    }
+    void dlPerspLH(float yScale, float aspect, float zn, float zf, float m[16]) {
+        for (int i = 0; i < 16; ++i) { m[i] = 0; }
+        m[0] = yScale / aspect;
+        m[5] = yScale;
+        m[10] = zf / (zf - zn);
+        m[11] = 1.0f;
+        m[14] = -zn * zf / (zf - zn);
+    }
+    void dlMul(const float a[16], const float b[16], float out[16]) {
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 4; ++j)
+                out[i*4+j] = a[i*4+0]*b[0*4+j] + a[i*4+1]*b[1*4+j]
+                           + a[i*4+2]*b[2*4+j] + a[i*4+3]*b[3*4+j];
+    }
+
+    // Standalone --forge-dl probe: bring Forge up, build the opaque path's descriptor sets + the
+    // land pipeline, load distant land from disk, render it from a synthetic camera over the
+    // terrain bounds into the owned RT, read back, and report coverage. No MW / IPC — proves the
+    // host-owned DL loader + pipeline + atlas in isolation ("DL renders without Morrowind").
+    bool renderDLProbe(bool withStatics) {
+        std::setvbuf(stdout, nullptr, _IONBF, 0);
+        std::printf("[forge][dl] --forge-%s probe (cwd must be morrowind64)\n", withStatics ? "statics" : "dl");
+        const unsigned W = 1280, H = 720;
+        if (!init(W, H, 1, 8)) { std::printf("[forge][dl] init FAILED\n"); return false; }
+        Renderer* R = g_live.pRenderer;
+        if (!buildOpaquePath(R, g_live.width, g_live.height)) {
+            std::printf("[forge][dl] buildOpaquePath FAILED\n"); shutdown(); return false;
+        }
+        if (!buildLandPath(R))     { shutdown(); return false; }
+        if (!loadDistantLand(R))   { shutdown(); return false; }
+        if (g_landMeshCount == 0)  { std::printf("[forge][dl] no land meshes\n"); shutdown(); return false; }
+
+        // Phase 1b: load the statics library + build the scoped instance/indirect buffers around the
+        // densest exterior cell (the probe camera then frames that cluster).
+        float staticsT[3] = { 0, 0, 0 };
+        if (withStatics) {
+            if (!buildStaticsPath(R))         { shutdown(); return false; }
+            if (!loadDistantStatics(R))       { shutdown(); return false; }
+            if (!buildStaticsTextureArrays(R)){ shutdown(); return false; }
+            pickStaticsTarget(staticsT);
+            if (!buildStaticsScope(R, staticsT)) { shutdown(); return false; }
+        }
+
+        // Terrain bounds from the loaded sphere centres.
+        float mnX=3.4e38f,mnY=3.4e38f,mnZ=3.4e38f,mxX=-3.4e38f,mxY=-3.4e38f,mxZ=-3.4e38f;
+        for (uint32_t i=0;i<g_landMeshCount;++i){
+            const LandMeshGPU& m=g_landMeshes[i];
+            mnX = (m.cx-m.r<mnX)?m.cx-m.r:mnX; mxX=(m.cx+m.r>mxX)?m.cx+m.r:mxX;
+            mnY = (m.cy-m.r<mnY)?m.cy-m.r:mnY; mxY=(m.cy+m.r>mxY)?m.cy+m.r:mxY;
+            mnZ = (m.cz-m.r<mnZ)?m.cz-m.r:mnZ; mxZ=(m.cz+m.r>mxZ)?m.cz+m.r:mxZ;
+        }
+        float cx=0.5f*(mnX+mxX), cy=0.5f*(mnY+mxY), cz=0.5f*(mnZ+mxZ);
+        float extX=mxX-mnX, extY=mxY-mnY, ext=(extX>extY)?extX:extY;
+        std::printf("[forge][dl] bounds c(%.0f,%.0f,%.0f) ext %.0f z[%.0f,%.0f]\n", cx,cy,cz,ext,mnZ,mxZ);
+
+        // Synthetic camera. Land-only: high above the terrain top near the centre, looking across it.
+        // Statics: a ground-level oblique view of the dense cluster so the instanced statics fill the
+        // frame (land still draws behind, sharing depth). MW is Z-up.
+        float eye[3], at[3];
+        if (withStatics) {
+            eye[0] = staticsT[0] - 0.9f*kStaticsScopeR;
+            eye[1] = staticsT[1] - 0.3f*kStaticsScopeR;
+            eye[2] = staticsT[2] + 0.55f*kStaticsScopeR;
+            at[0]  = staticsT[0]; at[1] = staticsT[1]; at[2] = staticsT[2] + 600.0f;
+        } else {
+            eye[0] = cx - 0.35f*ext; eye[1] = cy; eye[2] = mxZ + 0.10f*ext + 4000.0f;
+            at[0]  = cx + 0.25f*ext; at[1] = cy; at[2] = cz;
+        }
+        float up[3]  = { 0.0f, 0.0f, 1.0f };
+        float zn=8.0f, zf=2.0f*ext + 40000.0f;
+        const float yScale = 1.732051f;        // 1/tan(30deg) → 60° vertical FOV
+        float view[16], proj[16], vp[16];
+        dlLookAtLH(eye, at, up, view);
+        dlPerspLH(yScale, (float)W/(float)H, zn, zf, proj);
+        dlMul(view, proj, vp);
+        // reverse-Z munge (matches renderScene): col2 := col3 - col2 on the row-major matrix.
+        vp[2]=vp[3]-vp[2]; vp[6]=vp[7]-vp[6]; vp[10]=vp[11]-vp[10]; vp[14]=vp[15]-vp[14];
+
+        // Fill gFrameData directly (opaque.srt.h FrameData layout, float indices).
+        float* fd = (float*)g_live.pFrameCbv->pCpuMappedAddress;
+        std::memcpy(fd, vp, 16*sizeof(float));
+        float sun[3] = { 0.4f, 0.2f, -0.9f }; dlNorm3(sun);          // world sun TRAVEL dir (to-sun = -sun)
+        fd[16]=sun[0]; fd[17]=sun[1]; fd[18]=sun[2]; fd[19]=0;       // sunDir
+        fd[20]=1.0f;   fd[21]=0.96f;  fd[22]=0.86f; fd[23]=0;        // sunCol
+        fd[24]=0.34f;  fd[25]=0.38f;  fd[26]=0.46f; fd[27]=0;        // ambCol
+        fd[28]=0.60f;  fd[29]=0.66f;  fd[30]=0.78f; fd[31]=0;        // fogColNear
+        fd[32]=0.30f*zf; fd[33]=0.95f*zf; fd[34]=0; fd[35]=0;        // fogParams (start, end)
+        fd[36]=eye[0]; fd[37]=eye[1]; fd[38]=eye[2]; fd[39]=0;       // eyePos
+        fd[40]=0; fd[41]=1.0f/(float)W; fd[42]=1.0f/(float)H; fd[43]=0; // debugParams
+        fd[44]=1; fd[45]=1; fd[46]=1; fd[47]=1;                      // dbgScales
+        fd[48]=(float)kLandBaseSlot; fd[49]=(float)kLandNormalSlot;  // lodParams.xy
+        fd[50]=(float)kLandDetailSlot; fd[51]=7168.0f;               // lodParams.zw (detail slot, nearViewRange)
+        fd[52]=0.34f; fd[53]=0.38f; fd[54]=0.46f; fd[55]=0;          // lodSunAmb (= ambCol for 1a)
+        fd[56]=0; fd[57]=0; fd[58]=0; fd[59]=0;                      // lodEye = 0 (probe camera is absolute)
+
+        // Readback buffer (mirror drawTriangleAndVerify).
+        const uint32_t rowAlign = (R->pGpu->mUploadBufferTextureRowAlignment > 1u) ? R->pGpu->mUploadBufferTextureRowAlignment : 1u;
+        const uint32_t texAlign = (R->pGpu->mUploadBufferTextureAlignment > 1u) ? R->pGpu->mUploadBufferTextureAlignment : 1u;
+        const uint32_t rowPitch = roundUp(W*4u, rowAlign);
+        const uint64_t bufSize  = roundUp64((uint64_t)rowPitch*H, texAlign);
+        BufferLoadDesc rbd = {};
+        rbd.mDesc.mSize = bufSize;
+        rbd.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
+        rbd.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+        rbd.mDesc.mStartState = RESOURCE_STATE_COPY_DEST;
+        rbd.mDesc.mQueueType = QUEUE_TYPE_TRANSFER;
+        Buffer* pReadback = nullptr;
+        rbd.ppBuffer = &pReadback;
+        addResource(&rbd, nullptr);
+        waitForAllResourceLoads();
+
+        resetCmdPool(R, g_live.pCmdPool);
+        beginCmd(g_live.pCmd);
+        BindRenderTargetsDesc bind = {};
+        bind.mRenderTargetCount = 1;
+        bind.mRenderTargets[0] = { g_live.pRT, LOAD_ACTION_CLEAR };
+        bind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_CLEAR };
+        cmdBindRenderTargets(g_live.pCmd, &bind);
+        cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)W, (float)H, 0.0f, 1.0f);
+        cmdSetScissor(g_live.pCmd, 0, 0, W, H);
+        cmdBindPipeline(g_live.pCmd, g_pLandPipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSet);
+        uint64_t drawnTris = 0;
+        for (uint32_t i=0;i<g_landMeshCount;++i){
+            LandMeshGPU& m = g_landMeshes[i];
+            Buffer*  vbs[1]     = { m.vb };
+            uint32_t strides[1] = { 16 };
+            cmdBindVertexBuffer(g_live.pCmd, 1, vbs, strides, nullptr);
+            cmdBindIndexBuffer(g_live.pCmd, m.ib, m.large ? INDEX_TYPE_UINT32 : INDEX_TYPE_UINT16, 0);
+            cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, 0, 1, 0, 0);
+            drawnTris += m.indexCount / 3;
+        }
+
+        // Statics: one cmdExecuteIndirect over the mega VB/IB + per-instance stream. The arg buffer
+        // holds one IndirectDrawIndexArguments per scoped subset (StartInstanceLocation selects its
+        // instance run); StartIndexLocation/BaseVertexLocation select its slice of the mega buffers.
+        if (withStatics && g_staticsDrawCount > 0) {
+            cmdBindPipeline(g_live.pCmd, g_pStaticsPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSet);
+            Buffer*  svbs[2]     = { g_pStaticsVB, g_pStaticsInst };
+            uint32_t sstrides[2] = { 20, kStaticsInstStride };
+            cmdBindVertexBuffer(g_live.pCmd, 2, svbs, sstrides, nullptr);
+            cmdBindIndexBuffer(g_live.pCmd, g_pStaticsIB, INDEX_TYPE_UINT16, 0);
+            cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_staticsDrawCount, g_pStaticsArgs, 0, nullptr, 0);
+        }
+
+        cmdBindRenderTargets(g_live.pCmd, nullptr);
+        RenderTargetBarrier rtb = {};
+        rtb.pRenderTarget = g_live.pRT;
+        rtb.mCurrentState = RESOURCE_STATE_RENDER_TARGET;
+        rtb.mNewState = RESOURCE_STATE_COPY_SOURCE;
+        cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rtb);
+        endCmd(g_live.pCmd);
+
+        QueueSubmitDesc submit = {};
+        submit.mCmdCount = 1;
+        submit.ppCmds = &g_live.pCmd;
+        submit.pSignalFence = g_live.pFence;
+        submit.mSubmitDone = true;
+        queueSubmit(g_live.pQueue, &submit);
+        waitForFences(R, 1, &g_live.pFence);
+
+        TextureCopyDesc copyDesc = {};
+        copyDesc.pTexture = g_live.pRT->pTexture;
+        copyDesc.pBuffer = pReadback;
+        copyDesc.mTextureState = RESOURCE_STATE_COPY_SOURCE;
+        copyDesc.mQueueType = QUEUE_TYPE_GRAPHICS;
+        SyncToken tok = {};
+        copyResource(&copyDesc, &tok);
+        waitForToken(&tok);
+
+        bool ok = false;
+        const uint8_t* px = (const uint8_t*)pReadback->pCpuMappedAddress;
+        if (px) {
+            uint64_t nonClear = 0;
+            for (uint32_t y=0;y<H;y+=16) {
+                for (uint32_t x=0;x<W;x+=16) {
+                    const uint8_t* s=&px[(uint64_t)y*rowPitch + (uint64_t)x*4];
+                    if (s[0]|s[1]|s[2]) { ++nonClear; }
+                }
+            }
+            const uint8_t* c=&px[(uint64_t)(H/2)*rowPitch + (uint64_t)(W/2)*4];
+            std::printf("[forge][dl] drew %u land meshes / %llu tris + %u static draw-instances (%u subsets); centre=%u,%u,%u,%u; non-clear samples=%llu\n",
+                        g_landMeshCount, (unsigned long long)drawnTris, g_staticsInstTotal, g_staticsDrawCount,
+                        c[0],c[1],c[2],c[3], (unsigned long long)nonClear);
+            ok = nonClear > 0;
+            std::printf("[forge][dl] rendered: %s\n", ok ? "YES" : "NO");
+            // Dump the RT to an uncompressed TGA (forge_dl.tga in cwd) so the terrain look can be
+            // eyeballed: atlas UV fidelity, lighting, fog. TGA stores BGR == our BGRA source order.
+            const char* tgaName = withStatics ? "forge_statics.tga" : "forge_dl.tga";
+            std::FILE* tf = std::fopen(tgaName, "wb");
+            if (tf) {
+                uint8_t hdr[18] = {0};
+                hdr[2]  = 2;                                   // uncompressed true-color
+                hdr[12] = (uint8_t)(W & 0xFF); hdr[13] = (uint8_t)(W >> 8);
+                hdr[14] = (uint8_t)(H & 0xFF); hdr[15] = (uint8_t)(H >> 8);
+                hdr[16] = 24;                                  // bpp
+                hdr[17] = 0x20;                                // top-left origin
+                std::fwrite(hdr, 1, 18, tf);
+                std::vector<uint8_t> rowBuf((size_t)W * 3);
+                for (uint32_t y = 0; y < H; ++y) {
+                    const uint8_t* row = &px[(uint64_t)y * rowPitch];
+                    for (uint32_t x = 0; x < W; ++x) {
+                        rowBuf[x*3+0] = row[x*4+0];            // B
+                        rowBuf[x*3+1] = row[x*4+1];            // G
+                        rowBuf[x*3+2] = row[x*4+2];            // R
+                    }
+                    std::fwrite(rowBuf.data(), 1, rowBuf.size(), tf);
+                }
+                std::fclose(tf);
+                std::printf("[forge][dl] wrote %s (%ux%u)\n", tgaName, W, H);
+            }
+        } else {
+            std::printf("[forge][dl] readback not mapped\n");
+        }
+        removeResource(pReadback);
+        shutdown();
+        return ok;
+    }
+
+    bool renderDistantLandProbe()    { return renderDLProbe(false); }
+    bool renderDistantStaticsProbe() { return renderDLProbe(true);  }
+
+    // ===================== Phase 1a/1b LIVE distant land (wired into renderScene) =============
+
+    // Latch this frame's realEye + exterior gate (called from renderScene's lighting block, which
+    // sits earlier in the file than the DL globals).
+    void dlSetFrameEye(float x, float y, float z, bool exterior) {
+        g_dlEye[0] = x; g_dlEye[1] = y; g_dlEye[2] = z;
+        g_dlExterior = exterior;
+    }
+
+    // Per-frame GPU-spike log (from renderScene), reads the DL draw counts living below it.
+    void dlLogGpuSlow(double gpuMs, double recMs, unsigned drawn) {
+        LOG::logline(">> [gpu-slow] gpu=%.1fms record=%.1fms drawn=%u dl-land=%u dl-inst=%u dl-subsets=%u",
+                     gpuMs, recMs, drawn, g_liveLastLand, g_liveLastInst, g_liveLastSubsets);
+    }
+
+    // Per-300-frame DL heartbeat (from renderScene's heartbeat block).
+    void dlLogHeartbeat() {
+        if (!g_dlLiveInit) { return; }
+        LOG::logline(">> [forge-hb][dl] exterior=%d land=%u/%u static-instances=%u subsets=%u tex-buckets=%zu",
+                     (int)g_dlExterior, g_liveLastLand, g_landMeshCount, g_liveLastInst,
+                     g_liveLastSubsets, g_staticsBuckets.empty() ? 0 : g_staticsBuckets.size() - 1);
+    }
+
+    // Build a uniform grid (cell = one MW cell) over the resident exterior placements: gridCell ->
+    // [instance indices into g_usageData ws0]. One-time; the per-frame cull then visits only the
+    // grid cells whose AABB intersects the frustum. Each cell's AABB bounds the member placement
+    // POSITIONS (padded for per-static extent in the coarse reject; the per-instance test is exact).
+    void buildStaticsGrid() {
+        g_liveGrid.clear();
+        if (!g_staticsLoaded || g_ws0Count == 0) { return; }
+        std::unordered_map<uint64_t, uint32_t> cellMap;
+        cellMap.reserve(4096);
+        const uint8_t* rec = &g_usageData[g_ws0Off];
+        for (uint32_t i = 0; i < g_ws0Count; ++i, rec += 34) {
+            float pos[3]; std::memcpy(pos, rec + 6, 12);
+            int32_t ix = (int32_t)std::floor(pos[0] / kLiveGridCell);
+            int32_t iy = (int32_t)std::floor(pos[1] / kLiveGridCell);
+            uint64_t key = ((uint64_t)(uint32_t)ix << 32) | (uint32_t)iy;
+            auto it = cellMap.find(key);
+            uint32_t ci;
+            if (it == cellMap.end()) {
+                ci = (uint32_t)g_liveGrid.size();
+                cellMap.emplace(key, ci);
+                LiveGridCell c;
+                c.minx = c.miny = c.minz =  3.4e38f;
+                c.maxx = c.maxy = c.maxz = -3.4e38f;
+                g_liveGrid.push_back(std::move(c));
+            } else {
+                ci = it->second;
+            }
+            LiveGridCell& c = g_liveGrid[ci];
+            c.inst.push_back(i);
+            c.minx = std::min(c.minx, pos[0]); c.maxx = std::max(c.maxx, pos[0]);
+            c.miny = std::min(c.miny, pos[1]); c.maxy = std::max(c.maxy, pos[1]);
+            c.minz = std::min(c.minz, pos[2]); c.maxz = std::max(c.maxz, pos[2]);
+        }
+        std::printf("[forge][dl] live grid: %zu cells over %u placements\n", g_liveGrid.size(), g_ws0Count);
+    }
+
+    // Create the persistent per-frame instance + indirect-arg rings (CPU_TO_GPU, mapped). Replaces
+    // the probe's per-scope addResource/removeResource (too slow per frame). Idempotent.
+    bool dlCreateLiveRings(Renderer* R) {
+        if (g_pStaticsInstRing && g_pStaticsArgsRing) { return true; }
+        BufferLoadDesc ir = {};
+        ir.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+        ir.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+        ir.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+        ir.mDesc.mSize = (uint64_t)kLiveMaxInst * kStaticsInstStride;
+        ir.mDesc.pName = "staticsInstRing";
+        ir.pData = nullptr;
+        ir.ppBuffer = &g_pStaticsInstRing;
+        addResource(&ir, nullptr);
+        BufferLoadDesc ar = {};
+        ar.mDesc.mDescriptors = DESCRIPTOR_TYPE_INDIRECT_BUFFER;
+        ar.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+        ar.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+        ar.mDesc.mSize = (uint64_t)kLiveMaxSubsets * sizeof(IndirectDrawIndexArguments);
+        ar.mDesc.pName = "staticsArgsRing";
+        ar.pData = nullptr;
+        ar.ppBuffer = &g_pStaticsArgsRing;
+        addResource(&ar, nullptr);
+        waitForAllResourceLoads();
+        return g_pStaticsInstRing && g_pStaticsArgsRing;
+    }
+
+    // Extract the 6 frustum planes (normalized) from a ROW-MAJOR viewProj used as clip = v*M (the
+    // same convention the host uploads, including the reverse-Z munge). Gribb-Hartmann; planeN =
+    // (a,b,c,d) with inside == a*x+b*y+c*z+d >= 0. m[i*4+j] = M[row i][col j]; colK = rows' Kth col.
+    void dlExtractFrustum(const float* m, float planes[6][4]) {
+        // colX=...j0, colY=...j1, colZ=...j2, colW=...j3 across rows i=0..3.
+        auto setp = [&](int idx, float a, float b, float c, float d) {
+            float inv = 1.0f / std::sqrt(a*a + b*b + c*c + 1e-20f);
+            planes[idx][0] = a*inv; planes[idx][1] = b*inv; planes[idx][2] = c*inv; planes[idx][3] = d*inv;
+        };
+        // left = colW + colX
+        setp(0, m[3]+m[0], m[7]+m[4], m[11]+m[8],  m[15]+m[12]);
+        // right = colW - colX
+        setp(1, m[3]-m[0], m[7]-m[4], m[11]-m[8],  m[15]-m[12]);
+        // bottom = colW + colY
+        setp(2, m[3]+m[1], m[7]+m[5], m[11]+m[9],  m[15]+m[13]);
+        // top = colW - colY
+        setp(3, m[3]-m[1], m[7]-m[5], m[11]-m[9],  m[15]-m[13]);
+        // near = colZ (DX z in [0,w]; reverse-Z swaps which physical plane this is — volume identical)
+        setp(4, m[2],      m[6],      m[10],       m[14]);
+        // far = colW - colZ
+        setp(5, m[3]-m[2], m[7]-m[6], m[11]-m[10], m[15]-m[14]);
+    }
+
+    // Sphere (relative-space center + radius) vs frustum. true = at least partly inside.
+    bool dlSphereInFrustum(const float planes[6][4], float cx, float cy, float cz, float r) {
+        for (int i = 0; i < 6; ++i) {
+            float d = planes[i][0]*cx + planes[i][1]*cy + planes[i][2]*cz + planes[i][3];
+            if (d < -r) { return false; }
+        }
+        return true;
+    }
+
+    // Per-frame cull + ring fill (runs BEFORE command recording — it lazily creates GPU resources +
+    // loads newly-visible textures, which must not happen mid-command-buffer). Fills g_liveLandVisible
+    // + the instance/args rings, and writes the DL fields of gFrameData (lodParams/lodSunAmb/lodEye).
+    // rzViewProj = the relative, reverse-Z, extended-far viewProj already in gFrameData.
+    void dlLiveCullAndBuild(Renderer* R, const float* rzViewProj) {
+        g_liveLandVisible.clear();
+        g_liveLastInst = g_liveLastSubsets = g_liveLastLand = 0;
+        if (!g_dlExterior) { return; }
+        const double tCull0 = hostNowMs();   // CPU cull+build cost (NOT in the host record/gpu metrics)
+
+        // Lazy one-time resident load (first exterior frame): land + statics library + grid + rings.
+        if (!g_dlLiveInit) {
+            if (!buildLandPath(R) || !loadDistantLand(R)) {
+                std::printf("[forge][dl] live land load FAILED — DL disabled\n");
+                g_dlExterior = false; return;
+            }
+            g_staticsLiveOk = buildStaticsPath(R) && loadDistantStatics(R)
+                            && buildStaticsTextureArrays(R) && dlCreateLiveRings(R);
+            if (g_staticsLiveOk) { buildStaticsGrid(); }
+            else { std::printf("[forge][dl] live statics unavailable — land only\n"); }
+            g_dlLiveInit = true;
+            std::printf("[forge][dl] live init done (land meshes=%u, statics=%d)\n",
+                        g_landMeshCount, (int)g_staticsLiveOk);
+        }
+
+        // DL frame constants into gFrameData (mirrors the probe's fd[48..59] block).
+        float* fd = (float*)g_live.pFrameCbv->pCpuMappedAddress;
+        fd[48] = (float)kLandBaseSlot; fd[49] = (float)kLandNormalSlot;
+        fd[50] = (float)kLandDetailSlot; fd[51] = 7168.0f;     // lodParams.zw (detail slot, nearViewRange)
+        fd[52] = fd[24]; fd[53] = fd[25]; fd[54] = fd[26]; fd[55] = 0.0f;  // lodSunAmb = ambCol
+        fd[56] = g_dlEye[0]; fd[57] = g_dlEye[1]; fd[58] = g_dlEye[2]; fd[59] = 0.0f;  // lodEye
+
+        float planes[6][4];
+        dlExtractFrustum(rzViewProj, planes);
+        const float eye[3] = { g_dlEye[0], g_dlEye[1], g_dlEye[2] };
+
+        // Land: frustum-cull the resident sphere set in relative space.
+        for (uint32_t i = 0; i < g_landMeshCount; ++i) {
+            const LandMeshGPU& m = g_landMeshes[i];
+            if (dlSphereInFrustum(planes, m.cx - eye[0], m.cy - eye[1], m.cz - eye[2], m.r)) {
+                g_liveLandVisible.push_back(i);
+            }
+        }
+        g_liveLastLand = (uint32_t)g_liveLandVisible.size();
+
+        if (!g_staticsLiveOk) { return; }
+
+        // Statics: per-cell coarse reject, then per-instance tier/distance/MinSize + frustum cull.
+        // Survivors expand to (instance x subset), grouped by subset into the instance ring.
+        static std::vector<std::vector<float>> s_bySubset;   // reused; capacity retained across frames
+        static std::vector<uint32_t> s_touched;              // subset ids that got instances this frame
+        if (s_bySubset.size() != g_staticsSubsets.size()) { s_bySubset.assign(g_staticsSubsets.size(), {}); }
+        s_touched.clear();
+
+        const float nearEnd = Configuration.DL.NearStaticEnd     * 8192.0f;   // cell -> world distance
+        const float farEnd  = Configuration.DL.FarStaticEnd      * 8192.0f;
+        const float vfarEnd = Configuration.DL.VeryFarStaticEnd  * 8192.0f;
+        const float farMin  = Configuration.DL.FarStaticMinSize;
+        const float vfarMin = Configuration.DL.VeryFarStaticMinSize;
+        // Near cutoff: the Forge NEAR path (cache opaque) already draws statics within the near
+        // scene, so a DL static drawn there is a DUPLICATE → z-fight ("double rendering, near and DL").
+        // Skip DL statics closer than the handover (MGE clips its distant statics at nearViewRange-768).
+        // lodParams.w (fd[51]) = nearViewRange; per-origin cut (a large mesh straddling the band can
+        // still gap — acceptable for the additive phase; MGE uses a slab clip plane there).
+        const float nearCut  = fd[51] - 768.0f;
+        const float nearCut2 = nearCut * nearCut;
+
+        uint32_t cellsHit = 0, examined = 0;             // slow-frame diagnostics
+        for (const LiveGridCell& c : g_liveGrid) {
+            // Cell sphere (relative): center of the padded AABB, radius = half-diagonal + extent pad.
+            float pad = kLiveGridCell;   // generous static-extent margin (per-instance test is exact)
+            float ccx = 0.5f*(c.minx+c.maxx) - eye[0];
+            float ccy = 0.5f*(c.miny+c.maxy) - eye[1];
+            float ccz = 0.5f*(c.minz+c.maxz) - eye[2];
+            float hx = 0.5f*(c.maxx-c.minx)+pad, hy = 0.5f*(c.maxy-c.miny)+pad, hz = 0.5f*(c.maxz-c.minz)+pad;
+            float cr = std::sqrt(hx*hx + hy*hy + hz*hz);
+            if (!dlSphereInFrustum(planes, ccx, ccy, ccz, cr)) { continue; }
+            ++cellsHit;
+
+            for (uint32_t ii : c.inst) {
+                ++examined;
+                const uint8_t* rec = &g_usageData[g_ws0Off + (uint64_t)ii * 34];
+                uint32_t staticRef; std::memcpy(&staticRef, rec, 4);
+                if (staticRef >= g_staticsDefs.size()) { continue; }
+                float pos[3], yaw, pitch, roll, scale;
+                std::memcpy(pos, rec + 6, 12);
+                std::memcpy(&yaw, rec + 18, 4); std::memcpy(&pitch, rec + 22, 4);
+                std::memcpy(&roll, rec + 26, 4); std::memcpy(&scale, rec + 30, 4);
+
+                const StaticsDefCPU& def = g_staticsDefs[staticRef];
+                // Tier/size rule (dlshare.h:184). Buildings ×2 for tier selection only.
+                float effR  = def.radius * scale;
+                float tierR = (def.type == DL_STATIC_BUILDING) ? effR * 2.0f : effR;
+                int tier;
+                switch (def.type) {
+                    case DL_STATIC_GRASS:    continue;             // grass not in this path
+                    case DL_STATIC_NEAR:     tier = 0; break;
+                    case DL_STATIC_FAR:      tier = 1; break;
+                    case DL_STATIC_VERY_FAR: tier = 2; break;
+                    default:  // AUTO/TREE/BUILDING
+                        tier = (tierR <= farMin) ? 0 : (tierR <= vfarMin ? 1 : 2);
+                        break;
+                }
+                float rangeEnd = (tier == 0) ? nearEnd : (tier == 1) ? farEnd : vfarEnd;
+                float dx = pos[0] - eye[0], dy = pos[1] - eye[1];
+                float d2 = dx*dx + dy*dy;
+                if (d2 < nearCut2 || d2 > rangeEnd*rangeEnd) { continue; }   // near-owned or beyond tier
+
+                // Frustum-cull the instance sphere (relative space).
+                if (!dlSphereInFrustum(planes, pos[0]-eye[0], pos[1]-eye[1], pos[2]-eye[2], effR)) { continue; }
+
+                // World matrix (buildStaticsScope math), translation pre-shifted by -eye.
+                float cz=std::cos(-roll),  sz=std::sin(-roll);
+                float cyf=std::cos(-pitch),syf=std::sin(-pitch);
+                float cxf=std::cos(-yaw),  sxf=std::sin(-yaw);
+                float S[16]  = { scale,0,0,0, 0,scale,0,0, 0,0,scale,0, 0,0,0,1 };
+                float Rz[16] = { cz,sz,0,0, -sz,cz,0,0, 0,0,1,0, 0,0,0,1 };
+                float Ry[16] = { cyf,0,-syf,0, 0,1,0,0, syf,0,cyf,0, 0,0,0,1 };
+                float Rx[16] = { 1,0,0,0, 0,cxf,sxf,0, 0,-sxf,cxf,0, 0,0,0,1 };
+                float Tm[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, pos[0],pos[1],pos[2],1 };
+                float m0[16], m1[16], m2[16], W[16];
+                dlMul(S,  Rz, m0);
+                dlMul(m0, Ry, m1);
+                dlMul(m1, Rx, m2);
+                dlMul(m2, Tm, W);
+                W[12] -= eye[0]; W[13] -= eye[1]; W[14] -= eye[2];   // camera-relative shift
+
+                for (uint32_t k = 0; k < def.numSubsets; ++k) {
+                    uint32_t sid = def.firstSubset + k;
+                    // texSlot = (bucket<<16)|layer, resolved once in buildStaticsTextureArrays; all
+                    // statics textures are resident in gStaticsArrays (no per-frame re-resolve/stream).
+                    uint32_t ts = g_staticsSubsets[sid].texSlot;   // <= 127<<16 -> exact as float
+                    std::vector<float>& dst = s_bySubset[sid];
+                    if (dst.empty()) { s_touched.push_back(sid); }
+                    dst.insert(dst.end(), W, W + 16);
+                    dst.push_back((float)ts);
+                    dst.push_back((float)g_staticsSubsets[sid].flags);
+                    dst.push_back(0.0f); dst.push_back(0.0f);
+                }
+            }
+        }
+
+        // Flatten the touched subsets into the persistent rings (one indirect-arg per subset).
+        float* instMap = (float*)g_pStaticsInstRing->pCpuMappedAddress;
+        IndirectDrawIndexArguments* argMap = (IndirectDrawIndexArguments*)g_pStaticsArgsRing->pCpuMappedAddress;
+        uint32_t instBase = 0, drawCount = 0;
+        bool overflow = false;
+        for (uint32_t sid : s_touched) {
+            std::vector<float>& v = s_bySubset[sid];
+            uint32_t instCount = (uint32_t)(v.size() / 20);   // 20 floats (80 B) per instance
+            if (instBase + instCount > kLiveMaxInst || drawCount >= kLiveMaxSubsets) {
+                overflow = true; v.clear(); continue;
+            }
+            std::memcpy(instMap + (size_t)instBase * 20, v.data(), v.size() * sizeof(float));
+            IndirectDrawIndexArguments a = {};
+            a.mIndexCount    = g_staticsSubsets[sid].indexCount;
+            a.mInstanceCount = instCount;
+            a.mStartIndex    = g_staticsSubsets[sid].ibBase;
+            a.mVertexOffset  = g_staticsSubsets[sid].vbBase;
+            a.mStartInstance = instBase;
+            argMap[drawCount++] = a;
+            instBase += instCount;
+            v.clear();   // reset for next frame (capacity retained)
+        }
+        g_liveLastInst = instBase;
+        g_liveLastSubsets = drawCount;
+        if (overflow) {
+            static bool warned = false;
+            if (!warned) { std::printf("[forge][dl] live ring overflow (inst cap %u / subset cap %u) — clamped\n",
+                                       kLiveMaxInst, kLiveMaxSubsets); warned = true; }
+        }
+
+        // Slow-frame self-report: this CPU cull+build runs in the blocking RPC but OUTSIDE the host's
+        // record/gpu metrics, so a stall here is invisible to the 300-frame heartbeat (which never
+        // updates at 0.2 fps). Log EVERY frame the cull alone exceeds ~20 ms, with the breakdown
+        // (cells/instances examined, survivors). Statics textures are all resident (no per-frame loads).
+        const double cullMs = hostNowMs() - tCull0;
+        if (cullMs > 20.0) {
+            LOG::logline(">> [dl-slow] cull=%.1fms cellsHit=%u examined=%u land=%u inst=%u subsets=%u buckets=%zu",
+                         cullMs, cellsHit, examined, g_liveLastLand, g_liveLastInst, g_liveLastSubsets,
+                         g_staticsBuckets.empty() ? 0 : g_staticsBuckets.size() - 1);
+        }
+    }
+
+    // Record the live DL draws into g_live.pCmd. Runs AFTER the near colour pass with colorTarget +
+    // pDepth still bound: land + statics depth-write with reverse-Z GEQUAL, so the near scene (larger
+    // reverse-Z) correctly occludes DL behind it, and DL fills the empty sky/horizon. (No GTAO on DL:
+    // GTAO already ran on the near-only depth before this.)
+    void dlLiveRecord() {
+        if (!g_dlExterior || !g_dlLiveInit || !g_landLoaded) { return; }
+        cmdBeginDebugMarker(g_live.pCmd, 0.3f, 0.8f, 0.5f, "DISTANT LAND (live)");
+
+        cmdBindPipeline(g_live.pCmd, g_pLandPipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSet);
+        for (uint32_t idx : g_liveLandVisible) {
+            LandMeshGPU& m = g_landMeshes[idx];
+            Buffer*  vbs[1]     = { m.vb };
+            uint32_t strides[1] = { 16 };
+            cmdBindVertexBuffer(g_live.pCmd, 1, vbs, strides, nullptr);
+            cmdBindIndexBuffer(g_live.pCmd, m.ib, m.large ? INDEX_TYPE_UINT32 : INDEX_TYPE_UINT16, 0);
+            cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, 0, 1, 0, 0);
+        }
+
+        if (g_staticsLiveOk && g_liveLastSubsets > 0) {
+            cmdBindPipeline(g_live.pCmd, g_pStaticsPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSet);
+            Buffer*  svbs[2]     = { g_pStaticsVB, g_pStaticsInstRing };
+            uint32_t sstrides[2] = { 20, kStaticsInstStride };
+            cmdBindVertexBuffer(g_live.pCmd, 2, svbs, sstrides, nullptr);
+            cmdBindIndexBuffer(g_live.pCmd, g_pStaticsIB, INDEX_TYPE_UINT16, 0);
+            cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_liveLastSubsets,
+                               g_pStaticsArgsRing, 0, nullptr, 0);
+        }
+        cmdEndDebugMarker(g_live.pCmd);
+    }
+
     // Create the shared mega VB/IB on first use. Must NOT live in buildOpaquePath: geometry
     // uploads run BEFORE the lazy buildOpaquePath (first renderScene), so the arena has to exist
     // at upload time. Idempotent.
@@ -4269,6 +5732,38 @@ namespace ForgeRender {
         if (g_live.pMultiMapPrepassPipelineMirror) { removePipeline(R, g_live.pMultiMapPrepassPipelineMirror); }
         if (g_live.pMultiMapDepthShader)    { removeShader(R, g_live.pMultiMapDepthShader); }
         if (g_live.pMultiMapShader)         { removeShader(R, g_live.pMultiMapShader); }
+        // Phase 1a distant-land teardown (atlas textures freed by the bindless loop below).
+        for (uint32_t i = 0; i < g_landMeshCount; ++i) {
+            if (g_landMeshes[i].vb) { removeResource(g_landMeshes[i].vb); g_landMeshes[i].vb = nullptr; }
+            if (g_landMeshes[i].ib) { removeResource(g_landMeshes[i].ib); g_landMeshes[i].ib = nullptr; }
+        }
+        g_landMeshCount = 0;
+        g_landLoaded = false;
+        if (g_pLandPipeline) { removePipeline(R, g_pLandPipeline); g_pLandPipeline = nullptr; }
+        if (g_pLandShader)   { removeShader(R, g_pLandShader);     g_pLandShader = nullptr; }
+        // Phase 1b distant-statics teardown (per-subset textures freed by the bindless loop below).
+        if (g_pStaticsArgs)     { removeResource(g_pStaticsArgs);     g_pStaticsArgs = nullptr; }
+        if (g_pStaticsInst)     { removeResource(g_pStaticsInst);     g_pStaticsInst = nullptr; }
+        if (g_pStaticsVB)       { removeResource(g_pStaticsVB);       g_pStaticsVB = nullptr; }
+        if (g_pStaticsIB)       { removeResource(g_pStaticsIB);       g_pStaticsIB = nullptr; }
+        if (g_pStaticsPipeline) { removePipeline(R, g_pStaticsPipeline); g_pStaticsPipeline = nullptr; }
+        if (g_pStaticsShader)   { removeShader(R, g_pStaticsShader);   g_pStaticsShader = nullptr; }
+        g_staticsSubsets.clear(); g_staticsDefs.clear(); g_staticsSubsetTex.clear();
+        // Bucketed statics texture arrays (gStaticsArrays). Bucket 0 aliases the white array — free
+        // it once, separately, below; don't double-free here.
+        for (size_t b = 1; b < g_staticsBuckets.size(); ++b) {
+            if (g_staticsBuckets[b].tex) { removeResource(g_staticsBuckets[b].tex); }
+        }
+        g_staticsBuckets.clear(); g_staticsTexReady = false;
+        if (g_live.pStaticsWhiteArray) { removeResource(g_live.pStaticsWhiteArray); g_live.pStaticsWhiteArray = nullptr; }
+        g_usageData.clear();
+        g_staticsDrawCount = 0; g_staticsInstTotal = 0; g_staticsLoaded = false;
+        // Phase 1a/1b LIVE distant-land teardown (persistent rings + grid + flags).
+        if (g_pStaticsArgsRing) { removeResource(g_pStaticsArgsRing); g_pStaticsArgsRing = nullptr; }
+        if (g_pStaticsInstRing) { removeResource(g_pStaticsInstRing); g_pStaticsInstRing = nullptr; }
+        g_liveGrid.clear(); g_liveLandVisible.clear();
+        g_dlLiveInit = false; g_staticsLiveOk = false; g_dlExterior = false;
+        g_liveLastInst = g_liveLastSubsets = g_liveLastLand = 0;
         // Tier 2 compute (linearize + GTAO + AO bilateral blur).
         if (g_live.pAOBlurSet)      { removeDescriptorSet(R, g_live.pAOBlurSet); }
         if (g_live.pGtaoBatchSet)   { removeDescriptorSet(R, g_live.pGtaoBatchSet); }

@@ -142,6 +142,19 @@ namespace ForgeRender {
     // Tier 2 diag: read back pAO (RGBA16F) and printf 3 texels — GTAO write vs graphics read.
     void debugReadbackAO();
 
+    // Phase 1a standalone probe (--forge-dl): bring Forge up, build the land pipeline, load the
+    // host-owned distant land (Data Files\distantland\world + atlas) from the cwd, render it from a
+    // synthetic camera into the owned RT and read back. No MW / IPC — proves the DL loader +
+    // pipeline + atlas in isolation. Returns true if any land covered the frame. Run from morrowind64.
+    bool renderDistantLandProbe();
+
+    // Phase 1b standalone probe (--forge-statics): like renderDistantLandProbe, but also loads the
+    // host-owned distant STATICS (static_meshes library + usage.data placements), builds the mega
+    // VB/IB + per-instance stream + indirect-args for the densest exterior cell, and draws them with
+    // a single cmdExecuteIndirect (instancing + bindless per-subset textures + execute-indirect) over
+    // the distant land. Dumps forge_statics.tga. Proves the GPU-driven statics path in isolation.
+    bool renderDistantStaticsProbe();
+
     // Tear down the persistent renderer (shared RT, pipeline, Forge stack).
     void shutdown();
 }

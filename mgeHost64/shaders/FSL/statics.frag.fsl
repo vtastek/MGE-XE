@@ -1,0 +1,51 @@
+// mgeHost64 — Phase 1b distant STATICS (fragment stage, host-owned, GPU-driven).
+//
+// Faithful port of XE Mod Statics.fx::StaticPS: the per-subset texture is resolved host-side into
+// gStaticsArrays[bucket] layer `layer` (TexIndex = (bucket<<16)|layer) — a descriptor-array of
+// Texture2DArrays bucketed by (format, capped-size) so ALL distant-statics textures stay resident
+// without overrunning the 1024 descriptor table (see opaque.srt.h / forgerender.cpp). Modulated by
+// the per-vertex lit colour, then placeholder linear fog. Cutout statics (Flags bit1 = hasAlpha)
+// alpha-test at MGE's 133/255 reference — the single-sample probe clips rather than the MSAA
+// alpha-to-coverage StaticPS uses (calc_coverage); real A2C is a live-path (MSAA) refinement.
+
+#include "opaque.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4,      Position, SV_Position);
+    DATA(float2,      Uv,       TEXCOORD0);
+    DATA(float4,      Color,    COLOR);
+    DATA(float,       Fog,      TEXCOORD1);
+    DATA(FLAT(uint),  TexIndex, TEXCOORD2);
+    DATA(FLAT(uint),  Flags,    TEXCOORD3);
+    DATA(float3,      WorldPos, TEXCOORD4);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    // TexIndex packs the bucket (which Texture2DArray) and the layer (slice within it). The bucket
+    // is FLAT/coherent per draw (one EI subset = one texture), so this index is uniform — no divergence.
+    uint bucket = In.TexIndex >> 16;
+    uint layer  = In.TexIndex & 0xFFFFu;
+    float4 tex = SampleTex2DArray(gStaticsArrays[bucket], gSamplerAnisotropic, float3(In.Uv, (float)layer));
+
+    // Cutout alpha test (XE Mod Statics.fx ref 133/255). Only hasAlpha subsets test; opaque ones
+    // never discard (stray low alpha is safe).
+    if ((In.Flags & 0x2u) != 0u) {
+        if (tex.a < (133.0f / 255.0f)) { discard; }
+    }
+
+    float3 result = tex.rgb * In.Color.rgb;
+    result = lerp(gFrameData.fogColNear.rgb, result, In.Fog);
+
+    // F12 distance grayscale parity (debugParams.x 1/2) with distantland.frag + opaque.frag.
+    uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
+    if (dbg == 1u || dbg == 2u) {
+        float dist = length(In.WorldPos - gFrameData.eyePos.xyz);
+        float g = saturate(dist * (1.0f / 8192.0f));
+        RETURN(float4(g, g, g, 1.0f));
+    }
+    RETURN(float4(result, 1.0f));
+}

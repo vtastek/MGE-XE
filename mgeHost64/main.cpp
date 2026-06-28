@@ -42,6 +42,18 @@ int main(int argc, char** argv) {
 		return ForgeRender::renderTriangleShared() ? 0 : 1;
 	}
 
+	// Standalone Phase 1a distant-land probe: load + render host-owned DL from a synthetic
+	// camera (no MW/IPC). MUST run with cwd = morrowind64 so the DL files resolve.
+	if (argc >= 2 && std::strcmp(argv[1], "--forge-dl") == 0) {
+		return ForgeRender::renderDistantLandProbe() ? 0 : 1;
+	}
+
+	// Standalone Phase 1b distant-statics probe: load + GPU-driven-render host-owned distant statics
+	// (instancing + bindless + execute-indirect) over the land. MUST run with cwd = morrowind64.
+	if (argc >= 2 && std::strcmp(argv[1], "--forge-statics") == 0) {
+		return ForgeRender::renderDistantStaticsProbe() ? 0 : 1;
+	}
+
 	// Standalone M1c opaque scene-path probe: init + uploadGeometry + renderScene with a
 	// dummy mesh, so a buildOpaquePath/draw crash is visible on stdout (no MW/IPC).
 	if (argc >= 2 && std::strcmp(argv[1], "--forge-scene") == 0) {
