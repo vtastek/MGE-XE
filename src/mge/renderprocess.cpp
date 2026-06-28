@@ -5,6 +5,7 @@
 #include "support/log.h"
 #include "dxvk_interop.h"
 #include "distantland.h"
+#include "mwbridge.h"
 #include "scenegraph_geometry_cache.h"
 #include "scenegraph.h"
 #include "morrowindbsa.h"
@@ -98,6 +99,12 @@ namespace {
     std::uint32_t                             g_nextTexSlot = 1;    // 0 = host default white
     std::vector<std::uint8_t>                 g_texPendingBlob;     // [TexUploadWire][dds]* awaiting flush
     std::uint32_t                             g_texPendingCount = 0;
+    // LRU eviction over the client's bindless range [1, kMaxTextures-kDlReserve). Residency is
+    // cumulative all session (no per-cell reset), so without eviction a long traversal exhausts the
+    // slots and every NEW near texture goes white ("near white far from spawn"). Recycle the
+    // least-recently-used slot instead. g_frame is the LRU clock.
+    std::vector<std::string>                  g_slotName;           // slot -> name (for eviction; size kMaxTextures)
+    std::vector<std::uint32_t>                g_slotLastUsed;       // slot -> last g_frame it was referenced
 
     // Per-frame draw list rides a 4-chunk (4MB) vec: ~61K DrawItemWire, well over the
     // host's kMaxDraws cap. Geometry vec stays 8 chunks (8MB).
@@ -634,15 +641,15 @@ namespace {
         if (name.empty()) {
             return 0;
         }
+        const std::uint32_t cap = IPC::kMaxTextures - IPC::kDlReserve;   // client range [1, cap)
+        if (g_slotName.size() != IPC::kMaxTextures) {
+            g_slotName.assign(IPC::kMaxTextures, std::string());
+            g_slotLastUsed.assign(IPC::kMaxTextures, 0u);
+        }
         auto it = g_texSlot.find(name);
         if (it != g_texSlot.end()) {
+            if (it->second != 0) { g_slotLastUsed[it->second] = g_frame; }   // refresh LRU age
             return it->second;   // already resolved (slot or cached-miss 0)
-        }
-        if (g_nextTexSlot >= IPC::kMaxTextures) {
-            static bool logged = false;
-            if (!logged) { LOG::logline("!! [tex] residency full (%u slots) — extra textures = white", IPC::kMaxTextures); logged = true; }
-            g_texSlot.emplace(name, 0);
-            return 0;
         }
 
         void* data = nullptr;
@@ -665,8 +672,25 @@ namespace {
             return 0;
         }
 
-        const std::uint32_t slot = g_nextTexSlot++;
-        g_texSlot.emplace(name, slot);
+        // Assign a slot: grow while the range has room, else recycle the least-recently-used slot.
+        std::uint32_t slot;
+        if (g_nextTexSlot < cap) {
+            slot = g_nextTexSlot++;
+        } else {
+            std::uint32_t lru = 1, best = 0xFFFFFFFFu;
+            for (std::uint32_t s = 1; s < cap; ++s) {
+                if (g_slotLastUsed[s] < best) { best = g_slotLastUsed[s]; lru = s; }
+            }
+            if (best == g_frame) {
+                static bool warned = false;   // working set > capacity this frame: unavoidable thrash
+                if (!warned) { LOG::logline("!! [tex] working set exceeds %u client slots — thrashing (white)", cap); warned = true; }
+            }
+            g_texSlot.erase(g_slotName[lru]);   // evict the recycled name
+            slot = lru;
+        }
+        g_texSlot[name] = slot;
+        g_slotName[slot] = name;
+        g_slotLastUsed[slot] = g_frame;
         IPC::TexUploadWire hdr{ slot, size };
         const std::size_t at = g_texPendingBlob.size();
         g_texPendingBlob.resize(at + sizeof(hdr) + size);
@@ -1212,8 +1236,19 @@ namespace RenderProcess {
         // whole vertex pipeline near the origin and eliminates the float32 large-world stretching.
         D3DXMATRIX viewRel = DistantLand::mwView;
         viewRel._41 = viewRel._42 = viewRel._43 = 0.0f;
+
+        // UNIFIED FAR PROJECTION (Phase 1a/1b): push the far plane out to the distant-land draw
+        // distance so near opaque + host-owned DL share ONE reverse-Z depth mapping (statics get
+        // occluded behind distant terrain in the shared depth). Near geometry is unaffected — only
+        // the far plane moves; reverse-Z keeps near precision. mwProj is the NEAR projection; recover
+        // its near plane (zn = -_43/_33 for a standard D3D perspective) and re-edit only z.
+        D3DXMATRIX farProj = DistantLand::mwProj;
+        const float zn = (farProj._33 != 0.0f) ? (-farProj._43 / farProj._33) : 4.0f;
+        DistantLand::editProjectionZ(&farProj, zn, Configuration.DL.DrawDist * DistantLand::kCellSize);
         D3DXMATRIX viewProj;
-        D3DXMatrixMultiply(&viewProj, &viewRel, &DistantLand::mwProj);
+        D3DXMatrixMultiply(&viewProj, &viewRel, &farProj);
+
+        const bool isExterior = MWBridge::get()->IsExterior();
 
         // Tier 1 lighting (6 × float4): MW sun/ambient/fog for this frame, uploaded into the
         // host gFrameData after viewProj. sunVec is the world-space sun TRAVEL direction (the
@@ -1227,7 +1262,7 @@ namespace RenderProcess {
         //                                                 // mostly the sun light's sunAmb term.
         const RGBVECTOR sunColEff = DistantLand::lightSunMult * DistantLand::sunCol;
         const RGBVECTOR ambColEff = DistantLand::lightAmbMult * (DistantLand::sunAmb + DistantLand::ambCol);
-        const float lighting[24] = {
+        const float lighting[28] = {
             DistantLand::sunVec.x,     DistantLand::sunVec.y,     DistantLand::sunVec.z,     0.0f,
             sunColEff.r,               sunColEff.g,               sunColEff.b,               0.0f,
             ambColEff.r,               ambColEff.g,               ambColEff.b,               0.0f,
@@ -1236,6 +1271,9 @@ namespace RenderProcess {
             // CAMERA-RELATIVE: WorldPos reaches the shader already relative to the eye, so the
             // eyePos used for the per-vertex fog distance |worldPos - eyePos| is the origin (0).
             0.0f,                      0.0f,                      0.0f,                      0.0f,
+            // Phase 1a/1b: the REAL absolute camera eye (host shifts resident DL by -realEye to
+            // match the camera-relative near scene) + isExterior gate (1 = feed host-owned DL).
+            DistantLand::eyePos.x,     DistantLand::eyePos.y,     DistantLand::eyePos.z,     isExterior ? 1.0f : 0.0f,
         };
 
         // Dev overlay input (Stage 2): poll the mouse in MW client-space pixels (1:1 with the host
@@ -1566,6 +1604,8 @@ namespace RenderProcess {
         g_keySlot.clear();
         g_uploadedRev.clear();
         g_texSlot.clear();
+        g_slotName.clear();
+        g_slotLastUsed.clear();
         g_nextSlot = 0;
         g_nextTexSlot = 1;
         g_initOk = false;

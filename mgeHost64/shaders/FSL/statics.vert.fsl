@@ -1,0 +1,78 @@
+// mgeHost64 — Phase 1b distant STATICS (vertex stage, host-owned, GPU-driven).
+//
+// Distant statics are loaded host-side (Data Files\distantland\statics\static_meshes = the unique
+// mesh LIBRARY, usage.data = the placements) and drawn with instancing + bindless textures +
+// execute-indirect — see tasks/forge-phase1.md and [[project_forge_dl_statics_format]]. Binding 0
+// is the MGE StaticElem vertex (20 B: FLOAT16_4 pos, UBYTE4N normal{.w=emissive}, D3DCOLOR vcol,
+// FLOAT16_2 uv). Binding 1 is the PER-INSTANCE stream: the object's world matrix (4 rows) + params
+// (bindless texSlot, flags); cmdExecuteIndirect's StartInstanceLocation offsets into it per subset.
+//
+// Faithful port of XE Mod Statics.fx::StaticExteriorVS (transformStaticVert + lightStaticVert):
+// per-VERTEX sun N.L + distant ambient + emissive, modulating the vertex colour. world = D3DX
+// row-major, so worldPos = pos*M is the explicit row combination (convention-proof; the cbuffer
+// viewProj keeps the column-major mul like opaque/distantland). Placeholder linear fog (1c = scatter).
+
+#include "opaque.srt.h"
+
+STRUCT(VSInput)
+{
+    DATA(float4, Position, POSITION);    // FLOAT16_4 model pos (w = 1)
+    DATA(float4, Normal,   NORMAL);      // UBYTE4N: xyz encoded normal, w = emissive
+    DATA(float4, Color,    COLOR);       // D3DCOLOR per-vertex colour (B8G8R8A8 -> rgba)
+    DATA(float2, Uv,       TEXCOORD0);   // FLOAT16_2 base-map UV
+    // Per-instance (binding 1): the object's world matrix as 4 rows + packed params.
+    DATA(float4, W0, TEXCOORD1);
+    DATA(float4, W1, TEXCOORD2);
+    DATA(float4, W2, TEXCOORD3);
+    DATA(float4, W3, TEXCOORD4);
+    DATA(float4, InstParams, TEXCOORD5); // x = packed texSlot (bucket<<16|layer), y = flags (bit1 = hasAlpha cutout)
+};
+
+STRUCT(VSOutput)
+{
+    DATA(float4,      Position, SV_Position);
+    DATA(float2,      Uv,       TEXCOORD0);
+    DATA(float4,      Color,    COLOR);     // per-vertex lit colour
+    DATA(float,       Fog,      TEXCOORD1);
+    DATA(FLAT(uint),  TexIndex, TEXCOORD2);
+    DATA(FLAT(uint),  Flags,    TEXCOORD3);
+    DATA(float3,      WorldPos, TEXCOORD4); // F12 distance grayscale parity
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+VSOutput VS_MAIN( VSInput In )
+{
+    INIT_MAIN;
+    VSOutput Out;
+
+    // worldPos = pos * M with M stored as 4 ROWS (W0..W3) in the instance stream — the explicit
+    // row combination is identical to D3DX's row-vector pos*M regardless of HLSL matrix packing.
+    float4 worldPos = In.Position.x * In.W0 + In.Position.y * In.W1
+                    + In.Position.z * In.W2 + In.Position.w * In.W3;
+    Out.WorldPos = worldPos.xyz;
+
+    // Cbuffer viewProj is column-major (DXC default): mul(viewProj, worldPos) == worldPos*viewProj
+    // (D3DX), the SAME reverse-Z mapping the near opaque + distant-land passes use (one depth).
+    Out.Position = mul(gFrameData.viewProj, worldPos);
+
+    // Lighting (XE Mod Statics.fx::lightStaticVert): decompress + world-transform the normal as a
+    // direction (no post-normalise, matching MGE — distant statics use uniform scale), then
+    // sun N.L + distant ambient + emissive, modulating the per-vertex colour.
+    float3 n      = normalize(2.0f * In.Normal.xyz - 1.0f);
+    float3 nWorld = n.x * In.W0.xyz + n.y * In.W1.xyz + n.z * In.W2.xyz;
+    float  emissive = In.Normal.w;
+    float3 light = gFrameData.sunCol.rgb * saturate(dot(nWorld, -gFrameData.sunDir.xyz))
+                 + gFrameData.lodSunAmb.rgb + emissive;
+    Out.Color = float4(In.Color.rgb * light, In.Color.a);
+
+    Out.Uv       = In.Uv;   // animateUV (hasUVController) scroll needs a time uniform — deferred.
+    Out.TexIndex = (uint)(In.InstParams.x + 0.5f);
+    Out.Flags    = (uint)(In.InstParams.y + 0.5f);
+
+    // Placeholder distant fog (1c = atmospheric scatter), same linear ramp as distantland.vert so
+    // statics + land read as one far mass.
+    float dist = length(worldPos.xyz - gFrameData.eyePos.xyz);
+    Out.Fog = saturate((gFrameData.fogParams.y - dist)
+                       / (gFrameData.fogParams.y - gFrameData.fogParams.x));
+    RETURN(Out);
+}

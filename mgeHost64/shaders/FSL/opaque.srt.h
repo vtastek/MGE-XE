@@ -15,7 +15,13 @@
 #pragma once
 
 #define OPAQUE_BATCH 1024   // matrices per 64KB cbuffer window; must match host kBatchSize
-#define MAX_TEXTURES 1024   // bindless gTextures[] array size; MUST match IPC::kMaxTextures (geomwire.h)
+#define MAX_TEXTURES 896    // bindless gTextures[] array size; MUST match IPC::kMaxTextures (geomwire.h)
+// Distant-statics texture residency: a descriptor-array of Texture2DArrays, one element per
+// (format, capped-size) bucket. Each element is ONE descriptor (format/size are runtime resource
+// props; HLSL sees only Texture2DArray<float4>), so this holds arrays of DIFFERENT formats+sizes
+// indexed bindlessly — no switch, no per-texture descriptor. MAX_TEXTURES + MAX_STATICS_BUCKETS =
+// 1024, the proven-OK Persistent-table size (see geomwire.h). statics texSlot = (bucket<<16)|layer.
+#define MAX_STATICS_BUCKETS 128
 #define MAX_POINT_LIGHTS 128 // per-frame point-light cap; MUST match IPC::kMaxPointLights (geomwire.h)
 
 STRUCT(FrameData)
@@ -37,6 +43,18 @@ STRUCT(FrameData)
     // scale per-component output of the Forge passes only, so surfaces Forge does NOT draw stay put
     // — cranking one isolates what's still on MW's own path. 192B total < 256B CBV min.
     DATA(float4, dbgScales,   None);  // x = ambient, y = diffuse, z = albedo, w = overall
+    // Phase 1a distant-land LOD (host-owned DL). Appended so every field above keeps its offset.
+    // distantland.vert/.frag read these; opaque/skinned/multimap never touch them (harmless when 0).
+    // lodParams: x = base-atlas bindless slot, y = normal-atlas slot, z = detail-atlas slot,
+    //            w = nearViewRange (for the landBias z-sink). 208B.
+    DATA(float4, lodParams,   None);
+    // lodSunAmb: xyz = distant-land sun ambient (XE Mod Landscape.fx sunAmb). 224B < 256B CBV min.
+    DATA(float4, lodSunAmb,   None);
+    // Phase 1a/1b LIVE: the REAL camera eye (absolute world). The live frame is camera-relative
+    // (near worlds pre-shifted by -eye, eyePos = 0), but resident DL geometry is in ABSOLUTE world
+    // coords — distantland.vert subtracts lodEye to match; statics are host-shifted so statics.vert
+    // never reads it. Near/opaque/skinned/multimap paths leave it 0 and never touch it. 240B < 256B.
+    DATA(float4, lodEye,      None);
 };
 
 STRUCT(BatchData)
@@ -87,6 +105,10 @@ BEGIN_SRT_NO_AB(SrtData)
     // sampler-before-array bug; see [[project_forge_bindless_textures]].)
     BEGIN_SRT_SET(Persistent)
         DECL_ARRAY_TEXTURES(Persistent, Tex2D(float4), gTextures, MAX_TEXTURES)
+        // Distant-statics: array of Texture2DArrays (bucketed by format/size). Declared AFTER
+        // gTextures so it stacks at SRV offset MAX_TEXTURES (FSL single per-set counter); the host
+        // binds it via SRT_RES_IDX(...,gStaticsArrays). statics.frag samples gStaticsArrays[bucket].
+        DECL_ARRAY_TEXTURES(Persistent, Tex2DArray(float4), gStaticsArrays, MAX_STATICS_BUCKETS)
     END_SRT_SET(Persistent)
     BEGIN_SRT_SET(PerBatch)
         DECL_CBUFFER(PerBatch, CBUFFER(BatchData), gBatch)

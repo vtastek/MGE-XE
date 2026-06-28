@@ -1,0 +1,60 @@
+// mgeHost64 — Phase 1a distant-land LOD (vertex stage, host-owned DL).
+//
+// The distant land is loaded host-side (Data Files\distantland\world + world.dds/_n + the MGE
+// detail map) and rendered independently of Morrowind's scene — see tasks/forge-phase1.md. Each
+// resident mesh is the MGE LandElem VB (16 B: float3 POSITION + SHORT2N TEXCOORD0, the global
+// atlas UV; world = IDENTITY). Camera/sun/fog/atlas-slots come from the shared gFrameData
+// (extended with lodParams/lodSunAmb). Reuses opaque.srt.h + DefaultRootSignature + the bindless
+// gTextures array (the 3 atlas textures occupy three bindless slots) — no gBatch/gLights/gAO.
+//
+// Faithful port of XE Mod Landscape.fx::LandscapeVS: landBias z-sink to hide the low-LOD mesh at
+// the near handover, atlas-direct UV passthrough, per-vertex fog distance. (Distant atmospheric
+// scatter fog is Phase 1c; 1a uses a placeholder linear fog so the band reads as a single mass.)
+
+#include "opaque.srt.h"
+
+STRUCT(VSInput)
+{
+    DATA(float3, Position, POSITION);
+    DATA(float2, Uv,       TEXCOORD0);   // SHORT2N atlas UV (R16G16_SNORM in the layout -> [-1,1])
+};
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float2, Uv,       TEXCOORD0);
+    DATA(float3, WorldPos, TEXCOORD1);   // for F12 distance grayscale parity with opaque.frag
+    DATA(float,  Fog,      TEXCOORD2);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+VSOutput VS_MAIN( VSInput In )
+{
+    INIT_MAIN;
+    VSOutput Out;
+
+    // world = identity for distant land (renderexterior.cpp:533). Resident land verts are ABSOLUTE
+    // world coords; the live frame is camera-relative (near worlds pre-shifted by -eye, eyePos = 0),
+    // so shift land by -lodEye to share the relative space. lodEye is 0 in the --forge-dl probe
+    // (synthetic absolute camera), so this is a no-op there. Camera distance from the UN-biased
+    // position, exactly as LandscapeVS computes it before the z-sink.
+    float3 worldPos = In.Position - gFrameData.lodEye.xyz;
+    float  dist = length(worldPos - gFrameData.eyePos.xyz);
+
+    // landBias (XE Mod Landscape.fx:21): -30 - 2*max(0, (nearViewRange-1152) - dist). Sinks the
+    // coarse far mesh below the near handover so it never pokes through the near scene.
+    float  maxDist = gFrameData.lodParams.w - 1152.0f;   // lodParams.w = nearViewRange
+    worldPos.z += -30.0f + -2.0f * max(0.0f, maxDist - dist);
+
+    // Cbuffer matrices are column-major (DXC default): mul(viewProj, worldPos) with the D3DX bytes
+    // uploaded as-is == D3DX v*M. Same reverse-Z viewProj the near opaque pass uses (one depth).
+    Out.Position = mul(gFrameData.viewProj, float4(worldPos, 1.0f));
+    Out.WorldPos = worldPos;
+    Out.Uv = In.Uv;
+
+    // Placeholder distant fog (Phase 1c replaces with fogColourScatter). Linear ramp toward
+    // fogColNear by camera distance; keeps the far mass from reading as a hard cutoff.
+    Out.Fog = saturate((gFrameData.fogParams.y - dist)
+                       / (gFrameData.fogParams.y - gFrameData.fogParams.x));
+    RETURN(Out);
+}

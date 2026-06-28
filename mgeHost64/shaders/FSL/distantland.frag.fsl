@@ -1,0 +1,54 @@
+// mgeHost64 — Phase 1a distant-land LOD (fragment stage, host-owned DL).
+//
+// Faithful port of XE Mod Landscape.fx::LandscapePS. Samples the three resident atlas textures by
+// bindless slot (gFrameData.lodParams.xyz = base/normal/detail slots): base colour, world normal
+// map (2n-1), and the tiled MGE detail map at uv*333 and uv*90. Lighting = sun N.L (to-sun =
+// -sunDir) + distant-land ambient (lodSunAmb), then the two-scale detail modulation, then fog.
+//
+// NOT tonemapped: LandscapePS returns lit*detail directly (unlike opaque.frag, which inlines the
+// FFE tonemap because its FFE source did). Matching MGE's DL look means no inline tonemap here.
+
+#include "opaque.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float2, Uv,       TEXCOORD0);
+    DATA(float3, WorldPos, TEXCOORD1);
+    DATA(float,  Fog,      TEXCOORD2);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    uint baseIdx   = (uint)(gFrameData.lodParams.x + 0.5f);
+    uint normalIdx = (uint)(gFrameData.lodParams.y + 0.5f);
+    uint detailIdx = (uint)(gFrameData.lodParams.z + 0.5f);
+
+    // Expand + normalize the world normal map (XE Mod Landscape.fx:83).
+    float3 normal = normalize(2.0f * SampleTex2D(gTextures[normalIdx], gSamplerAnisotropic, In.Uv).rgb - 1.0f);
+
+    // World base colour.
+    float3 result = SampleTex2D(gTextures[baseIdx], gSamplerAnisotropic, In.Uv).rgb;
+
+    // Two-scale tiled detail (XE Mod Landscape.fx:89-90).
+    float detail = SampleTex2D(gTextures[detailIdx], gSamplerAnisotropic, In.Uv * 333.0f).g + 0.5f;
+    detail *= 0.5f * SampleTex2D(gTextures[detailIdx], gSamplerAnisotropic, In.Uv * 90.0f).g + 0.75f;
+
+    // Sun diffuse (to-sun = -sunDir) + distant-land ambient. Matches LandscapePS:93.
+    result *= gFrameData.sunCol.rgb * saturate(dot(-gFrameData.sunDir.xyz, normal)) + gFrameData.lodSunAmb.rgb;
+    result *= detail;
+
+    // Placeholder distant fog (Phase 1c = atmospheric scatter). lerp toward fogColNear by Fog.
+    result = lerp(gFrameData.fogColNear.rgb, result, In.Fog);
+
+    // F12 distance grayscale parity (debugParams.x 1/2): far reads bright, matching opaque.frag.
+    uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
+    if (dbg == 1u || dbg == 2u) {
+        float dist = length(In.WorldPos - gFrameData.eyePos.xyz);
+        float g = saturate(dist * (1.0f / 8192.0f));
+        RETURN(float4(g, g, g, 1.0f));
+    }
+    RETURN(float4(result, 1.0f));
+}
