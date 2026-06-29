@@ -2,7 +2,9 @@
 
 #include "proxydx/d3d8header.h"
 
-
+// Forward declaration so accessors can hand back typed scene-graph nodes without
+// pulling the MWSE SharedSE NI headers into every consumer of mwbridge.h.
+namespace NI { struct Node; }
 
 //-----------------------------------------------------------------------------
 
@@ -104,6 +106,13 @@ public:
     void toggleRipples(BOOL enabled);
     void markWaterNode(float k);
     void markMoonNodes(float k);
+    // Returns the two moon root scene-graph nodes (Masser, Secunda), either null when
+    // unavailable. Reuses the markMoonNodes offset chain (eMaster -> weather controller
+    // -> masser/secunda -> moon root). Each root parents the moon's Shadow Node cutout
+    // and Moon Node disc billboards; the engine's per-node appCulled flag encodes "is
+    // this moon up". Used by the water reflection to draw moons independently of the
+    // main-camera frustum (recordSky only captures moons the main view actually drew).
+    void getMoonRootNodes(NI::Node** masser, NI::Node** secunda);
     void disableScreenshotFunc();
     void disableSunglare();
     void disableIntroMovies();

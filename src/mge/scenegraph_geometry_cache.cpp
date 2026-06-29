@@ -24,6 +24,7 @@
 #include "support/log.h"
 
 #include <algorithm>
+#include <cstring>
 #include <vector>
 
 namespace MGE::GeometryCache {
@@ -41,6 +42,18 @@ namespace MGE::GeometryCache {
         // (CachedGeometry::isPickRoot) — that root is outside the engine's world-camera
         // occlusion classify; the Stage 2 engine-set cull keeps these via frustum.
         bool              g_walkingPick = false;
+        // Set while walking skyRoot (SK1 sky takeover) so visitGeometry tags entries
+        // (CachedGeometry::isSky) and forces a per-frame re-upload — the dome's vertex-colour
+        // gradient changes every frame (sun angle / weather) without bumping revisionID.
+        bool              g_walkingSky = false;
+        // SK2: monotonic counter assigned to each isSky entry's skyOrder during the skyRoot
+        // walk (reset to 0 at the start of each sky walk). Encodes back-to-front subtree order
+        // so the Forge sky pass can sort its alpha-blended draws (dome → stars → sun → moons).
+        uint16_t          g_skyVisitCounter = 0;
+
+        // NiAlphaProperty blend-function index (Gamebryo order) -> D3DBLEND. Defined with the
+        // moon support below; forward-declared so extractMaterial can translate sky blend modes.
+        D3DBLEND niBlendToD3D(unsigned int ni);
         uint32_t          g_uploadedThisFrame  = 0;
         uint64_t          g_uploadedInterval   = 0; // cumulative over log interval
         // Phase 0 diagnostic: null-bone influence accounting (the suspected NPC
@@ -85,6 +98,11 @@ namespace MGE::GeometryCache {
             e.alphaRef    = 0.0f;
             e.alphaTest   = false;
             e.blendEnable = false;
+            // SK1 sky: default to the standard transparency blend; overwritten below from the
+            // NiAlphaProperty flags when present. Only consumed for isSky entries (the Forge
+            // sky pass); opaque/alpha-test draws ignore these.
+            e.srcBlend    = static_cast<unsigned char>(D3DBLEND_SRCALPHA);
+            e.destBlend   = static_cast<unsigned char>(D3DBLEND_INVSRCALPHA);
             // Default material: white diffuse/ambient, no emissive (texture-only
             // opaque). Overwritten below when the shape carries a MaterialProperty.
             e.matDiffuse[0]  = e.matDiffuse[1]  = e.matDiffuse[2]  = e.matDiffuse[3]  = 1.0f;
@@ -114,6 +132,11 @@ namespace MGE::GeometryCache {
                 e.alphaTest   = (ap->flags & NI::AlphaProperty::TEST_ENABLE_MASK) != 0;
                 e.blendEnable = (ap->flags & NI::AlphaProperty::ALPHA_MASK) != 0;
                 e.alphaRef    = ap->alphaTestRef / 255.0f;
+                // Sky blend factors (same translation the moon path uses).
+                e.srcBlend  = static_cast<unsigned char>(niBlendToD3D(
+                    (ap->flags & NI::AlphaProperty::SRC_BLEND_MASK)  >> NI::AlphaProperty::SRC_BLEND_POS));
+                e.destBlend = static_cast<unsigned char>(niBlendToD3D(
+                    (ap->flags & NI::AlphaProperty::DEST_BLEND_MASK) >> NI::AlphaProperty::DEST_BLEND_POS));
             }
 
             if (ps->texture) {
@@ -394,11 +417,14 @@ namespace MGE::GeometryCache {
                     }
                     if (triList) {
                         // NI::Triangle is 3 packed uint16 indices (== the IB byte layout
-                        // used above via memcpy(.., triCount*6)).
+                        // used above via memcpy(.., triCount*6)). SK1 sky: force a re-upload every
+                        // frame (g_walkingSky) so the dome's per-frame vertex-colour gradient
+                        // bypasses the (modelId,vc,rev) dedup, which would otherwise skip it.
                         RenderProcess::captureGeometry(key, data->revisionID,
                             reinterpret_cast<uint32_t>(data),   // object identity (recycled-key guard)
                             scratch.data(), vertexCount,
-                            reinterpret_cast<const uint16_t*>(triList), triCount * 3u);
+                            reinterpret_cast<const uint16_t*>(triList), triCount * 3u,
+                            g_walkingSky);
                     }
                 }
             }
@@ -658,12 +684,16 @@ namespace MGE::GeometryCache {
                 e.lastFrame = g_frame;
                 e.isLandscape = g_walkingLandscape;
                 e.isPickRoot = g_walkingPick;
+                e.isSky = g_walkingSky;
+                if (g_walkingSky) e.skyOrder = g_skyVisitCounter++;  // SK2 back-to-front key
                 e.mirrored = computeMirrored(e);                    // winding flip for depth/shadow
             } else {
                 auto& e = it->second;
                 e.lastFrame = g_frame;
                 e.isLandscape = g_walkingLandscape;
                 e.isPickRoot = g_walkingPick;
+                e.isSky = g_walkingSky;
+                if (g_walkingSky) e.skyOrder = g_skyVisitCounter++;  // SK2 back-to-front key
                 if (sk) {
                     // Static skinned VB: rebuild only on revision / skin-state change.
                     if (data->revisionID != e.revisionID || !e.isSkinned) {
@@ -674,7 +704,9 @@ namespace MGE::GeometryCache {
                     buildD3DTransform(e.worldTransformD3D, geom);            // bounds center
                     e.dynamicHint = 4;
                 } else {
-                    const bool changed = (data->revisionID != e.revisionID) || e.isSkinned;
+                    // SK1 sky: force re-extract + re-upload every frame (the dome's vertex
+                    // colours change without a revisionID bump) — see g_walkingSky.
+                    const bool changed = (data->revisionID != e.revisionID) || e.isSkinned || g_walkingSky;
                     if (changed) {
                         extractMaterial(e, geom);
                         uploadEntry(e, geom, data, key);
@@ -751,6 +783,165 @@ namespace MGE::GeometryCache {
             }
         }
 
+    // ---- Reflection moon support (scene-graph-sourced) -----------------------------
+    // The engine records a moon in recordSky only when it draws it for the MAIN camera,
+    // so a moon up but outside the main frustum (looking away/down) never reaches the
+    // water reflection that way. These helpers materialize the moon billboards straight
+    // from the live scene graph, gated by the engine's own appCulled, so the reflection
+    // can draw them frustum-independently.
+
+    // Per-moon-shape D3D9 geometry keyed on NiGeometry*. Created once; vertex data is
+    // refreshed each call (4 verts — negligible) so phase/fade/orientation updates track.
+    // D3DPOOL_MANAGED so the buffers survive device reset without an explicit release.
+    struct MoonGeom {
+        IDirect3DVertexBuffer9* vb;
+        IDirect3DIndexBuffer9*  ib;
+        uint32_t vertCount, triCount;
+    };
+    std::unordered_map<uint32_t, MoonGeom> g_moonGeom;
+
+    // NiAlphaProperty blend-function index (Gamebryo order) -> D3DBLEND.
+    D3DBLEND niBlendToD3D(unsigned int ni) {
+        switch (ni) {
+            case 0:  return D3DBLEND_ONE;
+            case 1:  return D3DBLEND_ZERO;
+            case 2:  return D3DBLEND_SRCCOLOR;
+            case 3:  return D3DBLEND_INVSRCCOLOR;
+            case 4:  return D3DBLEND_DESTCOLOR;
+            case 5:  return D3DBLEND_INVDESTCOLOR;
+            case 6:  return D3DBLEND_SRCALPHA;
+            case 7:  return D3DBLEND_INVSRCALPHA;
+            case 8:  return D3DBLEND_DESTALPHA;
+            case 9:  return D3DBLEND_INVDESTALPHA;
+            case 10: return D3DBLEND_SRCALPHASAT;
+            default: return D3DBLEND_ONE;
+        }
+    }
+
+    // (Re)create + refresh the DepthVertex-layout VB/IB for one moon shape. Returns
+    // false (shape skipped) on degenerate geometry or allocation failure.
+    bool materializeMoonShape(NI::TriBasedGeometry* geom, MGE::GeometryCache::MoonShapeDraw& out) {
+        auto* data = static_cast<NI::TriBasedGeometryData*>(geom->getModelData().get());
+        if (!data) return false;
+        const uint32_t vc  = static_cast<uint32_t>(data->getActiveVertexCount());
+        const uint32_t tc  = static_cast<uint32_t>(data->getActiveTriangleCount());
+        const auto*    mv  = data->vertex;
+        const auto*    tri = data->getTriList();
+        if (!vc || !tc || !mv || !tri) return false;
+
+        const uint32_t key = reinterpret_cast<uint32_t>(geom);
+        auto& g = g_moonGeom[key];
+
+        if (!g.vb || g.vertCount != vc) {
+            if (g.vb) { g.vb->Release(); g.vb = nullptr; }
+            if (FAILED(g_device->CreateVertexBuffer(vc * MGE::GeometryCache::kVBStride, 0,
+                    MGE::GeometryCache::kVBFVF, D3DPOOL_MANAGED, &g.vb, nullptr)))
+                return false;
+        }
+        if (!g.ib || g.triCount != tc) {
+            if (g.ib) { g.ib->Release(); g.ib = nullptr; }
+            if (FAILED(g_device->CreateIndexBuffer(tc * 6, 0, D3DFMT_INDEX16,
+                    D3DPOOL_MANAGED, &g.ib, nullptr)))
+                return false;
+        }
+        g.vertCount = vc;
+        g.triCount  = tc;
+
+        const auto* nrm = data->normal;
+        const auto* col = data->color;
+        const auto* uv  = data->textureCoords;   // set 0 (moons are single-UV)
+        void* vbData = nullptr;
+        if (FAILED(g.vb->Lock(0, 0, &vbData, 0))) return false;
+        auto* dst = static_cast<DepthVertex*>(vbData);
+        for (uint32_t i = 0; i < vc; ++i) {
+            dst[i].x = mv[i].x; dst[i].y = mv[i].y; dst[i].z = mv[i].z;
+            if (nrm) { dst[i].nx = nrm[i].x; dst[i].ny = nrm[i].y; dst[i].nz = nrm[i].z; }
+            else     { dst[i].nx = 0.0f;     dst[i].ny = 0.0f;     dst[i].nz = 1.0f; }
+            dst[i].color = col ? *reinterpret_cast<const DWORD*>(&col[i]) : 0xFFFFFFFFu;
+            if (uv) { dst[i].u = uv[i].x; dst[i].v = uv[i].y; }
+            else    { dst[i].u = 0.0f;    dst[i].v = 0.0f; }
+        }
+        g.vb->Unlock();
+
+        void* ibData = nullptr;
+        if (SUCCEEDED(g.ib->Lock(0, 0, &ibData, 0))) {
+            memcpy(ibData, tri, tc * 6);
+            g.ib->Unlock();
+        }
+
+        out.vb        = g.vb;
+        out.ib        = g.ib;
+        out.vertCount = vc;
+        out.triCount  = tc;
+        buildD3DTransform(out.worldTransform, geom);
+        return true;
+    }
+
+    // Recursively collect up to 2 drawable moon shapes under av, respecting per-node
+    // appCulled (a full moon has no dark-side cutout, so its Shadow Node is culled).
+    void collectMoonShapes(NI::AVObject* av, MGE::GeometryCache::MoonShapeDraw* out, int& count) {
+        if (!av || count >= 2) return;
+        if (av->getAppCulled()) return;
+
+        if (av->isInstanceOfType(NI::RTTIStaticPtr::NiTriBasedGeom)) {
+            auto* geom = static_cast<NI::TriBasedGeometry*>(av);
+            MGE::GeometryCache::MoonShapeDraw d = {};
+            if (!materializeMoonShape(geom, d)) return;
+
+            d.texture   = nullptr;
+            d.srcBlend  = D3DBLEND_SRCALPHA;
+            d.destBlend = D3DBLEND_INVSRCALPHA;
+            auto* ps = reinterpret_cast<NI::PropertyState*>(geom->propertyState);
+            if (ps) {
+                if (ps->texture) {
+                    auto* baseMap = ps->texture->getBaseMap();
+                    if (baseMap && baseMap->texture) {
+                        auto* tex = baseMap->texture.get();
+                        if (tex->isInstanceOfType(NI::RTTIStaticPtr::NiSourceTexture))
+                            d.texture = getDX9Texture(tex);
+                    }
+                }
+                if (ps->alpha) {
+                    const unsigned short f = ps->alpha->flags;
+                    d.srcBlend  = static_cast<unsigned char>(niBlendToD3D(
+                        (f & NI::AlphaProperty::SRC_BLEND_MASK)  >> NI::AlphaProperty::SRC_BLEND_POS));
+                    d.destBlend = static_cast<unsigned char>(niBlendToD3D(
+                        (f & NI::AlphaProperty::DEST_BLEND_MASK) >> NI::AlphaProperty::DEST_BLEND_POS));
+                }
+            }
+            if (!d.texture) return;   // no base map -> nothing to draw
+            // The dark-side cutout lives under the moon root's 'Shadow Node'; the lit disc
+            // under 'Moon Node'. Discriminate by that parent name — robust, since the disc
+            // can share the cutout's alpha-blend mode (blend alone is ambiguous).
+            d.isMoonShadow = false;
+            if (av->parentNode) {
+                const char* pn = av->parentNode->getName();
+                if (pn && std::strcmp(pn, "Shadow Node") == 0) d.isMoonShadow = true;
+            }
+            out[count++] = d;
+            return;
+        }
+
+        if (av->isInstanceOfType(NI::RTTIStaticPtr::NiNode)) {
+            auto* node = static_cast<NI::Node*>(av);
+            const auto n = node->children.getEndIndex();
+            for (size_t i = 0; i < n && count < 2; ++i)
+                collectMoonShapes(node->children.at(i).get(), out, count);
+        }
+    }
+
+    int buildMoonDrawListImpl(NI::Node* root, MGE::GeometryCache::MoonShapeDraw out[2]) {
+        if (!g_device || !root) return 0;
+        if (root->getAppCulled()) return 0;   // moon is down / hidden by phase
+        int count = 0;
+        collectMoonShapes(root, out, count);
+        // Draw the dark-side cutout before the disc.
+        if (count == 2 && !out[0].isMoonShadow && out[1].isMoonShadow) {
+            MGE::GeometryCache::MoonShapeDraw t = out[0]; out[0] = out[1]; out[1] = t;
+        }
+        return count;
+    }
+
     }
 
     void init(IDirect3DDevice9* device) {
@@ -778,6 +969,70 @@ namespace MGE::GeometryCache {
         return g_skinnedDecl;
     }
 
+    // ---- SK0: sky-takeover diagnostic (scene-graph inspect, NO capture) ----------
+    // The sky is a proper NiNode subtree "skyRoot" — a sibling of worldRoot under the
+    // World Scene Graph Root (the node that parents the cell roots + the camera root).
+    // Reach it by climbing worldObjectRoot to the topmost ancestor and finding the
+    // "skyRoot" child by name. SK0 only LOGS the subtree (name / cull / verts / blend /
+    // alpha-test / texture) so we can confirm what the real walk would capture before
+    // any host draw. No g_cache writes, no side effects. Gated + throttled by the caller.
+    static NI::Node* findSkyRoot(void* dataHandler) {
+        NI::AVObject* n = MGE::DataHandlerView::worldObjectRoot(dataHandler);
+        if (!n) return nullptr;
+        while (n->parentNode) n = n->parentNode;          // climb to World Scene Graph Root
+        if (!n->isInstanceOfType(NI::RTTIStaticPtr::NiNode)) return nullptr;
+        auto* root = static_cast<NI::Node*>(n);
+        const auto count = root->children.getEndIndex();
+        for (size_t i = 0; i < count; ++i) {
+            NI::AVObject* c = root->children.at(i).get();
+            if (!c) continue;
+            const char* nm = c->getName();
+            if (nm && std::strcmp(nm, "skyRoot") == 0
+                   && c->isInstanceOfType(NI::RTTIStaticPtr::NiNode)) {
+                return static_cast<NI::Node*>(c);
+            }
+        }
+        return nullptr;
+    }
+
+    static void dumpSkyNode(NI::AVObject* av, int depth) {
+        if (!av) return;
+        const char* nm     = av->getName();
+        const bool  culled = av->getAppCulled();
+        if (av->isInstanceOfType(NI::RTTIStaticPtr::NiTriBasedGeom)) {
+            auto* geom = static_cast<NI::TriBasedGeometry*>(av);
+            auto* data = geom->getModelData().get();
+            const uint32_t vc = data ? static_cast<uint32_t>(data->getActiveVertexCount()) : 0u;
+            bool blend = false, atest = false; const char* texName = nullptr;
+            auto* ps = reinterpret_cast<NI::PropertyState*>(geom->propertyState);
+            if (ps) {
+                if (ps->alpha) {
+                    blend = (ps->alpha->flags & NI::AlphaProperty::ALPHA_MASK) != 0;
+                    atest = (ps->alpha->flags & NI::AlphaProperty::TEST_ENABLE_MASK) != 0;
+                }
+                if (ps->texture) {
+                    auto* baseMap = ps->texture->getBaseMap();
+                    if (baseMap && baseMap->texture) {
+                        auto* tex = baseMap->texture.get();
+                        if (tex->isInstanceOfType(NI::RTTIStaticPtr::NiSourceTexture))
+                            texName = static_cast<NI::SourceTexture*>(tex)->fileName;
+                    }
+                }
+            }
+            LOG::logline("[SKY] %*sGEOM '%s' culled=%d verts=%u blend=%d atest=%d tex=%s",
+                depth * 2, "", nm ? nm : "(null)", culled ? 1 : 0, vc,
+                blend ? 1 : 0, atest ? 1 : 0, texName ? texName : "(none)");
+            return;
+        }
+        LOG::logline("[SKY] %*sNODE '%s' culled=%d", depth * 2, "", nm ? nm : "(null)", culled ? 1 : 0);
+        if (av->isInstanceOfType(NI::RTTIStaticPtr::NiNode)) {
+            auto* node = static_cast<NI::Node*>(av);
+            const auto count = node->children.getEndIndex();
+            for (size_t i = 0; i < count; ++i)
+                dumpSkyNode(node->children.at(i).get(), depth + 1);
+        }
+    }
+
     void onFrameReady(void* dataHandler) {
         if (!g_device || !dataHandler) return;
         if (!Configuration.UseSceneGraphSnapshot) return;
@@ -801,6 +1056,32 @@ namespace MGE::GeometryCache {
             g_walkingLandscape = true;
             walk(MGE::DataHandlerView::worldLandscapeRoot(dataHandler));
             g_walkingLandscape = false;
+        }
+        // SK1 sky takeover: walk skyRoot only when the Forge sky pass is live (F7 toggle ON +
+        // seam compositing). walk()'s getAppCulled() early-return gives free day/night/phase/
+        // weather selection; captured shapes ride the same capture/IPC seam as opaques but are
+        // tagged isSky → the Forge host's dedicated alpha-blend sky pass draws them.
+        if (RenderProcess::wantsSkyCapture()) {
+            MGE_ZoneScopedN("GeomCache:walkSky");
+            g_walkingSky = true;
+            g_skyVisitCounter = 0;   // SK2: restart back-to-front ordering each sky walk
+            walk(findSkyRoot(dataHandler));
+            g_walkingSky = false;
+        }
+
+        // SK0 (sky takeover, diagnostic): periodically dump the skyRoot subtree so we can
+        // confirm the shapes/materials the real walk will capture. No capture, no draw.
+        if (Configuration.LogDistantPipeline) {
+            static uint64_t s_lastSkyLog = 0;
+            if (g_frame - s_lastSkyLog >= 300) {
+                s_lastSkyLog = g_frame;
+                if (NI::Node* skyRoot = findSkyRoot(dataHandler)) {
+                    LOG::logline("== [SKY DUMP] frame %llu ==", (unsigned long long)g_frame);
+                    dumpSkyNode(skyRoot, 0);
+                } else {
+                    LOG::logline("== [SKY DUMP] skyRoot NOT found (frame %llu) ==", (unsigned long long)g_frame);
+                }
+            }
         }
 
         // Evict entries not seen this frame
@@ -866,6 +1147,10 @@ namespace MGE::GeometryCache {
 
     const std::unordered_map<uint32_t, CachedGeometry>& cache() {
         return g_cache;
+    }
+
+    int buildMoonDrawList(void* moonRoot, MoonShapeDraw out[2]) {
+        return buildMoonDrawListImpl(static_cast<NI::Node*>(moonRoot), out);
     }
 
     const char* resolveTextureName(IDirect3DTexture9* tex) {

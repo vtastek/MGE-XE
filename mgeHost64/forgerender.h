@@ -95,11 +95,15 @@ namespace ForgeRender {
     // Tier 3a: lightBlob is an array of IPC::PointLightWire (world-space point lights);
     // lightCount items, lightBytes total. Uploaded into the host light cbuffer for the
     // per-pixel FFE evalOnePointLight loop. May be null / 0 (no point lights this frame).
+    // SK1: skyBlob is an array of IPC::SkyDrawWire (alpha-blended sky shapes, SK1 = the gradient
+    // dome); skyCount items, skyBytes total. Drawn FIRST in the colour pass with depth off + alpha
+    // blend so it sits behind the opaque world. May be null / 0 (Forge sky toggle off → MW sky).
     bool renderScene(const float* viewProj, const float* lighting, const void* drawBlob,
                      unsigned drawCount, unsigned drawBytes,
                      const void* skinnedBlob, unsigned skinnedCount, unsigned skinnedBytes,
                      const void* multiMapBlob, unsigned multiMapCount, unsigned multiMapBytes,
-                     const void* lightBlob, unsigned lightCount, unsigned lightBytes);
+                     const void* lightBlob, unsigned lightCount, unsigned lightBytes,
+                     const void* skyBlob = nullptr, unsigned skyCount = 0, unsigned skyBytes = 0);
 
     // F12 debug view: 0 = normal, 1 = depth (world-distance grayscale), 2 = scatter (client-side).
     // Stored in a host global and written into FrameData.debugParams.x each renderScene.

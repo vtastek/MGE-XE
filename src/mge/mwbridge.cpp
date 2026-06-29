@@ -1046,6 +1046,37 @@ void MWBridge::markMoonNodes(float k) {
 
 //-----------------------------------------------------------------------------
 
+// getMoonRootNodes
+// Returns the Masser/Secunda moon root scene-graph nodes (either null when the
+// weather controller isn't live yet). Same offset chain as markMoonNodes.
+void MWBridge::getMoonRootNodes(NI::Node** masser, NI::Node** secunda) {
+    if (masser)  *masser  = nullptr;
+    if (secunda) *secunda = nullptr;
+
+    DWORD addr = read_dword(eMaster);
+    if (!addr) return;
+    addr = read_dword(addr + 0x58);   // weather controller
+    if (!addr) return;
+
+    // moonObj+0x10 is the 'Moon Shadow' NiTriShape — a leaf TWO levels below the moon
+    // root. Climb two NiAVObject::parentNode links (+0x18): Moon Shadow -> 'Shadow Node'
+    // -> moon root ('Textures\tx_masser' / '...tx_secunda'), which parents BOTH the
+    // 'Shadow Node' (dark-side cutout) and the 'Moon Node' (lit disc) billboards.
+    auto moonRoot = [this](DWORD moonObj) -> NI::Node* {
+        if (!moonObj) return nullptr;
+        DWORD geom = read_dword(moonObj + 0x10);   // 'Moon Shadow' geom
+        if (!geom) return nullptr;
+        DWORD shadowNode = read_dword(geom + 0x18);   // parentNode
+        if (!shadowNode) return nullptr;
+        return reinterpret_cast<NI::Node*>(read_dword(shadowNode + 0x18));   // moon root
+    };
+
+    if (masser)  *masser  = moonRoot(read_dword(addr + 0x48));
+    if (secunda) *secunda = moonRoot(read_dword(addr + 0x44));
+}
+
+//-----------------------------------------------------------------------------
+
 // disableScreenshotFunc
 // Stops Morrowind from taking its own screenshots, or displaying an error message, when PrtScr is pressed
 void MWBridge::disableScreenshotFunc() {

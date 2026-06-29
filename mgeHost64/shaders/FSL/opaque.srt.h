@@ -55,6 +55,11 @@ STRUCT(FrameData)
     // coords — distantland.vert subtracts lodEye to match; statics are host-shifted so statics.vert
     // never reads it. Near/opaque/skinned/multimap paths leave it 0 and never touch it. 240B < 256B.
     DATA(float4, lodEye,      None);
+    // SK2 dev "ownership tell": tint the Forge sky toward magenta so it's unmistakable that the
+    // Forge host (not MW) is drawing the sky — the takeover is otherwise byte-identical. Only
+    // sky.frag reads these; every other pass ignores them (0 = no tint = clean A/B). 256B == min CBV.
+    //   x = tint amount 0..1, y = host time (seconds, for the pulse), z = pulse flag (0/1), w unused.
+    DATA(float4, skyParams,   None);
 };
 
 STRUCT(BatchData)

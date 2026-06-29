@@ -61,6 +61,21 @@ namespace MGE::GeometryCache {
         // classify, so the Stage 2 engine-set cache cull keeps these via frustum
         // instead of dropping them for absence from the world classify.
         bool     isPickRoot;
+        // SK1 sky takeover: true for entries walked from skyRoot (atmosphere dome, stars,
+        // sun, moons, clouds). Sky is alpha-blended and drawn by the Forge host's dedicated
+        // sky pass (depth off, behind the opaque world) — it's EXCLUDED from every opaque
+        // draw list and re-uploaded every frame (the dome's vertex-colour gradient changes
+        // with sun angle / weather without a revisionID bump). srcBlend/destBlend are the
+        // NiAlphaProperty blend factors (D3DBLEND_*), translated in extractMaterial.
+        bool     isSky;
+        unsigned char srcBlend;   // D3DBLEND_* (sky source blend factor)
+        unsigned char destBlend;  // D3DBLEND_* (sky dest blend factor)
+        // SK2: subtree visit order within the skyRoot walk (0 = first child visited).
+        // walk() descends skyRoot children in deterministic array order each frame, so this
+        // == MW's back-to-front sky draw order (atmosphere dome → stars → sun → moons). The
+        // Forge sky pass sorts its draw list by this so multiple alpha-blended shapes layer
+        // correctly. Only meaningful for isSky entries; stale (but harmless) otherwise.
+        uint16_t skyOrder;
         // Material (pointers into NI memory — valid for the session)
         IDirect3DTexture9* d3dTexture;  // null if no base texture
         // Terrain decal overlay (TexturingProperty maps[6] = DECAL_1): the second
@@ -163,6 +178,31 @@ namespace MGE::GeometryCache {
 
     // Vertex declaration for skinned VBs (created in init). Null until init runs.
     IDirect3DVertexDeclaration9* skinnedDecl();
+
+    // ---- Reflection moon support -------------------------------------------------
+    // One drawable billboard shape of a moon (its Shadow Node cutout or Moon Node disc),
+    // materialized from the live scene graph so the water reflection can draw moons that
+    // are up but outside the main-camera frustum (recordSky only captures what the main
+    // view drew). VB/IB are in kVBFVF/kVBStride layout (matches the sky StatVertIn).
+    struct MoonShapeDraw {
+        IDirect3DVertexBuffer9* vb;       // kVBFVF, kVBStride
+        IDirect3DIndexBuffer9*  ib;       // D3DFMT_INDEX16 triangle list
+        IDirect3DTexture9*      texture;  // base map (null draws skipped by caller)
+        unsigned int vertCount;
+        unsigned int triCount;
+        unsigned char srcBlend;           // D3DBLEND_* (translated from NiAlphaProperty)
+        unsigned char destBlend;          // D3DBLEND_*
+        bool  isMoonShadow;               // dark-side cutout (destBlend == INVSRCALPHA)
+        float worldTransform[16];         // D3D row-major model->world
+    };
+
+    // Materialize the drawable shapes (Shadow Node + Moon Node, up to 2) of the moon
+    // rooted at moonRoot (a NI::Node*, passed as void* to keep NI deps out of headers).
+    // Returns 0 when the moon's root node is app-culled (down/hidden by phase — the
+    // engine's own "is this moon up" oracle) or has no drawable shape; else the shape
+    // count, shadow-cutout first. The VB/IB are owned by an internal per-NiGeometry
+    // cache (created once, vertex data refreshed each call).
+    int buildMoonDrawList(void* moonRoot, MoonShapeDraw out[2]);
 
     // Reverse map: IDirect3DTexture9* → SourceTexture::fileName.
     // DORMANT — the reverse map is currently unpopulated (the per-frame rebuild was

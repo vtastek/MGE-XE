@@ -54,6 +54,17 @@
 #include "multimap.frag.fsl"
 #end
 
+// SK1 sky takeover: alpha-blended sky shapes (SK1 = the gradient dome). Reuses opaque.srt.h /
+// DefaultRootSignature + the opaque GeomVertexWire layout; the host's FIRST blend pipeline
+// (SRCALPHA/INVSRCALPHA, depth off). sky.frag outputs real RGBA for the premultiplied composite.
+#vert sky.vert
+#include "sky.vert.fsl"
+#end
+
+#frag sky.frag
+#include "sky.frag.fsl"
+#end
+
 // Phase 1a: host-owned distant-land LOD. Own 16B vertex layout (pos + SHORT2N atlas UV),
 // reuses opaque.srt.h / DefaultRootSignature + the bindless gTextures atlas. One colour
 // pipeline (depth-write, reverse-Z GEQUAL), no prepass (terrain is fully opaque).
