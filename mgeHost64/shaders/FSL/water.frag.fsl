@@ -1,0 +1,173 @@
+// mgeHost64 — Forge water takeover (fragment stage, WT1).
+//
+// CORE port of XE Mod Water.fx WaterPS / UnderwaterPS (the non-flow, non-foam path): animated
+// normal from the 3D water_NRM volume, refraction (a host copy of the pre-water Forge colour
+// target, depth-gated), Fresnel, sun specular, fog + depth shoreline. Reflection is a WT1 STAND-IN
+// (flat horizon tint); WT2 fills gReflectColor with a real mirror-view pass. Output alpha = 1 so the
+// present-seam premultiplied composite shows the water (it's opaque coverage, unlike the sky).
+//
+// Differences from the D3D9 WaterPS (deliberate, WT1):
+//   - Fog uses the FORGE FRAME's near fog (gFrameData.fogColNear/fogParams), matching opaque/DL/sky,
+//     NOT MGE's atmospheric fogColourScatter. The refraction sample is already Forge-fogged.
+//   - Scene depth = pLinearDepth (RAW reverse-Z DEVICE depth); world distance is reconstructed via
+//     gBatch.worlds[7] = invViewProj (camera-relative, same as GTAO's reconstructWorld).
+//   - Flow map, Gerstner crests, foam, dynamic ripples are follow-ups (not ported).
+// Params ride gBatch.worlds[6] (host writes 4 contiguous float4 groups; transpose to read them):
+//   g0 = (waterLevelRel, windFactor, shoreDepthBias, time)
+//   g1 = (depthBaseColor.rgb, underwater)
+//   g2 = (camFwd.xyz, nearViewRange)
+//   g3 = (reflectStandInAmt, _, _, _)
+
+#include "opaque.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float3, WorldPos, TEXCOORD0);     // camera-relative world position (eyePos == 0)
+};
+
+// Reconstruct camera-relative world position from a screen UV + reverse-Z device depth, exactly as
+// gtao.comp's reconstructWorld (invViewProj of the SAME camera-relative rzViewProj).
+float3 reconstructWorld(float4x4 invVP, float2 uv, float deviceZ)
+{
+    float ndcX = uv.x * 2.0f - 1.0f;
+    float ndcY = 1.0f - uv.y * 2.0f;
+    float4 p = mul(invVP, float4(ndcX, ndcY, deviceZ, 1.0f));
+    return p.xyz / p.w;
+}
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+
+    // --- params (see header) ---
+    float4x4 P    = transpose(gBatch.worlds[6]);   // host wrote 4 float4 groups row-major
+    float4x4 invVP = gBatch.worlds[7];             // used directly with mul() (GTAO convention)
+    float  waterLevelRel = P[0].x;
+    float  windFactor    = P[0].y;
+    float  shoreDepthBias= P[0].z;
+    float  time          = P[0].w;
+    float3 depthBaseColor= P[1].xyz;
+    bool   underwater    = P[1].w > 0.5f;
+    float3 camFwd        = P[2].xyz;
+    uint   waterDbg      = (uint)(P[3].x + 0.5f);   // 0 normal, 1 reflection-only, 2 refraction-only
+
+    float2 invScreen = gFrameData.debugParams.yz;
+    float3 fogCol    = gFrameData.fogColNear.rgb;
+
+    // Eye vector (camera-relative: eye at origin).
+    float3 EyeVec = In.WorldPos;
+    float  dist   = length(EyeVec);
+    EyeVec = (dist > 1e-4f) ? EyeVec / dist : float3(0, 0, 1);
+
+    // Forge-frame near fog scalar (1 = clear, 0 = full fogColNear), matching opaque.frag.
+    float fog = saturate((gFrameData.fogParams.y - dist)
+                       / (gFrameData.fogParams.y - gFrameData.fogParams.x));
+
+    // Absolute world XY for WORLD-ANCHORED normal sampling (the frame is camera-relative; lodEye is
+    // the real absolute eye). Without this the normals swim with the camera.
+    float2 worldXY = In.WorldPos.xy + gFrameData.lodEye.xy;
+
+    // --- underwater: simple tinted, distance-faded fog (UnderwaterPS core) ---
+    if (underwater) {
+        float uw = saturate(exp(-dist / 4096.0f));
+        float3 col = lerp(fogCol, depthBaseColor, uw);
+        RETURN(float4(col, 1.0f));
+    }
+
+    // --- animated water normal (getFinalWaterNormal, #else no-flow branch) ---
+    float t = 0.4f * time;
+    float2 tc1 = worldXY / 3900.0f;   // far  scale
+    float2 tc2 = worldXY / 527.0f;    // close scale
+    float2 far_n   = SampleLvlTex3D(gWaterNormalVol, gSamplerBilinearWrap, float3(tc1, t), 0.0f).rg;
+    float2 close_n = SampleLvlTex3D(gWaterNormalVol, gSamplerBilinearWrap, float3(tc2, t), 0.0f).rg;
+    float2 normal_R = 2.0f * lerp(close_n, far_n, saturate(dist / 8000.0f)) - 1.0f;
+    float3 normal = normalize(float3(normal_R, 1.0f));
+
+    // --- fogged deep-water base colour ---
+    float3 depthColor = lerp(fogCol, depthBaseColor, fog);
+
+    // Reflection/refraction pixel distortion (wind strength increases it).
+    float2 reffactor = (windFactor * dist + 0.1f) * normal.xy;
+    float2 baseUV = In.Position.xy * invScreen;          // this fragment's own screen UV
+
+    // --- refraction (depth-gated, distorted) ---
+    float2 distUV   = baseUV + reffactor.yx * invScreen;
+    float  sceneDevZ= SampleLvlTex2D(gSceneLinDepth, gSamplerPointClamp, distUV, 0.0f).r;
+    float3 sceneW   = reconstructWorld(invVP, distUV, sceneDevZ);
+    float  sceneDist= length(sceneW);
+    float  aboveWater = step(sceneDist + shoreDepthBias, dist);   // 1 = scene in FRONT of water
+    float  depth      = max(shoreDepthBias, sceneDist - dist);
+
+    float3 refracted = depthColor;
+    float  shorefactor = 0.0f;
+    if (depth < 4000.0f && aboveWater < 0.5f) {
+        float2 ruv = baseUV + saturate(depth / 100.0f) * reffactor.yx * invScreen;
+        refracted  = SampleLvlTex2D(gRefractColor, gSamplerBilinearClamp, ruv, 0.0f).rgb;
+
+        // re-fetch depth at the distorted tap; convert slant → perpendicular via camFwd.
+        sceneDevZ  = SampleLvlTex2D(gSceneLinDepth, gSamplerPointClamp, ruv, 0.0f).r;
+        sceneW     = reconstructWorld(invVP, ruv, sceneDevZ);
+        sceneDist  = length(sceneW);
+        depth      = max(shoreDepthBias, sceneDist - dist);
+        float denom = max(abs(dot(EyeVec, camFwd)), 0.25f);
+        depth     /= denom;
+        depth     += 300.0f * (0.95f - normal.z);   // small-scale shoreline animation
+
+        float depthscale = saturate(exp(-depth / 500.0f));
+        shorefactor = pow(depthscale, 25.0f);
+        refracted = lerp(depthColor, refracted, 0.8f * depthscale + 0.2f * shorefactor);
+    }
+
+    // --- reflection (WT2 Stage 1: real mirror-view RT, sky-only for now) ---
+    // gReflectColor is the mirrored scene in MAIN-screen space (mirror world geom + normal camera),
+    // so sample it at THIS fragment's screen UV, distorted by the surface normal (MGE's 2.1x/abs
+    // pattern). The RT is premultiplied (rgb·a) over a transparent clear, so composite it over the
+    // fog colour by (1 - a) → un-drawn areas (below the reflected horizon, pre-DL) read fog, not black.
+    float2 reflUV = baseUV + float2(-2.1f * reffactor.x, abs(reffactor.y)) * invScreen;
+    float4 reflSample = SampleLvlTex2D(gReflectColor, gSamplerBilinearClamp, reflUV, 0.0f);
+    float3 reflected = reflSample.rgb + fogCol * (1.0f - reflSample.a);
+	float3 deb = reflected;
+    reflected = lerp(reflected * 0.96f, reflected, fog);
+	
+    // Dev-panel water debug views (g_waterDebugMode → P[3].x). Output an isolated term so the
+    // reflection / refraction RT contents are directly visible. Mode 1 shows the RAW reflection
+    // sample (rgb·a premultiplied): a black surface = the reflection RT is empty; coverage shows the
+    // mirrored scene. Mode 2 shows the refraction term. 0 = normal water (no branch taken).
+    if (waterDbg == 1u) { RETURN(float4(reflSample.rgb, 1.0f)); }
+    if (waterDbg == 2u) { RETURN(float4(refracted, 1.0f)); }
+
+    // --- Fresnel ---
+    float3 adjustnormal = lerp(float3(0, 0, 0.1f), normal, pow(saturate(1.05f * fog), 2.0f));
+    adjustnormal = lerp(adjustnormal, float3(0, 0, 1.0f),
+                        (1.0f + EyeVec.z) * (1.0f - saturate(1.0f / (dist / 1000.0f + 1.0f))));
+    float fresnel = dot(-EyeVec, adjustnormal);
+    fresnel = 0.02f + pow(saturate(0.9988f - 0.28f * fresnel), 16.0f);
+    float3 result = lerp(refracted, reflected, fresnel);
+	
+
+    // --- sun specular (widened Phong lobe, area-light approximation) ---
+    float3 sunPos = -gFrameData.sunDir.xyz;   // gFrameData.sunDir = travel dir; to-sun = -dir
+    float  vdotr = dot(-EyeVec, reflect(-sunPos, normal));
+    vdotr = saturate(1.0025f * vdotr);
+    float3 spec = gFrameData.sunCol.rgb * (pow(vdotr, 170.0f) + 0.07f * pow(vdotr, 4.0f));
+    result += spec * fog;
+
+    // --- water cut feature (vtastek) ---
+    float wdist = dist / lerp(1200.0f, 0.0f, saturate((-waterLevelRel) / 7.0f));
+    float wcut = smoothstep(0.09f, 0.1f, wdist);
+    float wcutdark = smoothstep(0.0889f, 0.101f, wdist);
+    wcutdark = wcutdark * (1.0f - wcutdark);
+    wcutdark = saturate(wcutdark * 3.0f);
+    result = lerp(refracted, result, wcut);
+    result = lerp(result, result * 0.1f, wcutdark);
+	
+
+    // shore-line smoothing
+    result = lerp(result, refracted, shorefactor * fog);
+	
+	result = result;
+
+    RETURN(float4(result, 1.0f));
+}

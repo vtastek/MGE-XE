@@ -307,6 +307,7 @@ namespace IPC {
 			VecId skyList, std::uint32_t skyCount, std::uint32_t skyBytes,
 			std::uint32_t debugMode = 0,
 			const DevInput* devInput = nullptr,
+			const float* waterParams = nullptr, std::uint32_t waterEnabled = 0,
 			double* outRenderMs = nullptr);
 
 		/**

@@ -482,6 +482,7 @@ namespace IPC {
 		VecId skyList, std::uint32_t skyCount, std::uint32_t skyBytes,
 		std::uint32_t debugMode,
 		const DevInput* devInput,
+		const float* waterParams, std::uint32_t waterEnabled,
 		double* outRenderMs) {
 		WAIT_FOR_PREVIOUS_COMMAND;
 
@@ -506,6 +507,10 @@ namespace IPC {
 		params.skyCount = skyCount;
 		params.skyBytes = skyBytes;
 		params.debugMode = debugMode;
+		// WT1 Forge water: 12 per-frame surface params + the F7 enable gate (no geometry).
+		if (waterParams) { std::memcpy(params.waterParams, waterParams, 12 * sizeof(float)); }
+		else { std::memset(params.waterParams, 0, 12 * sizeof(float)); }
+		params.waterEnabled = waterEnabled;
 		const DevInput di = devInput ? *devInput : DevInput{};
 		params.devMouseX = di.x;
 		params.devMouseY = di.y;

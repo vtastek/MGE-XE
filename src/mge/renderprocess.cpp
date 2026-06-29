@@ -32,7 +32,8 @@ namespace {
     IPC::Client* g_client = nullptr;
     bool   g_initOk  = false;
     bool   g_enabled = true;           // composite ON by default; F11 toggles it OFF/ON
-    bool   g_skyEnabled = false;       // SK1 Forge sky pass OFF by default; F7 toggles it ON/OFF (clean A/B vs MW sky)
+    bool   g_skyEnabled = true;        // Sky takeover is DONE → Forge sky is now ALWAYS ON (no longer toggled).
+    bool   g_waterEnabled = false;     // WT1 Forge water pass OFF by default; F7 toggles it ON/OFF (clean A/B vs MW water)
     int    g_debugMode = 0;            // F12 diagnostic cycle: 0=normal, 1=depth (world-distance), 2=scatter, 3=AO, 4=bent normal
     unsigned g_frame = 0;
 
@@ -1213,6 +1214,9 @@ namespace {
                 item.world[4] =  sy*Ux; item.world[5] =  sy*Uy; item.world[6]  =  sy*Uz;   // +Y -> up
                 item.world[8] = -sz*Fx; item.world[9] = -sz*Fy; item.world[10] = -sz*Fz;   // +Z -> toward camera
             }
+            // WT2: tell the Forge reflection pass which shape is the sun, so it can re-face the disc
+            // for the mirrored view (the world above faces the MAIN camera → squashed once mirrored).
+            item.isSunDisc = isSunDisc ? 1u : 0u;
             // CAMERA-RELATIVE: the sky is camera-attached; shift by -eye to match the host's
             // translation-free viewProj (see buildDrawList) and keep vertex math near the origin.
             item.world[12] -= DistantLand::eyePos.x;
@@ -1283,12 +1287,12 @@ namespace RenderProcess {
             g_devUiVisible = !g_devUiVisible;
             LOG::logline(">> [seam] dev overlay %s", g_devUiVisible ? "ON" : "OFF");
         }
-        // F7 toggles the SK1 Forge sky pass (edge-triggered). OFF (default) → MW's own sky is
-        // untouched. ON → the cache walks skyRoot and the host draws the gradient dome behind the
-        // opaque world (clean A/B vs vanilla MW sky).
+        // F7 toggles the Forge WATER takeover (edge-triggered). The sky takeover is finished, so the
+        // sky pass is always on now and F7 was freed — it now drives water (WT1). OFF (default) → MW's
+        // own water draws (clean A/B). ON → the host draws its geo-clipmap water surface.
         if (GetAsyncKeyState(VK_F7) & 0x0001) {
-            g_skyEnabled = !g_skyEnabled;
-            LOG::logline(">> [seam] Forge sky (SK1) %s", g_skyEnabled ? "ON" : "OFF");
+            g_waterEnabled = !g_waterEnabled;
+            LOG::logline(">> [seam] Forge water (WT1) %s", g_waterEnabled ? "ON" : "OFF");
         }
         if (!g_enabled) {
             return;
@@ -1436,6 +1440,33 @@ namespace RenderProcess {
             if (GetAsyncKeyState(VK_MBUTTON) & 0x8000) devInput.buttons |= 0x4u;
         }
 
+        // WT1 Forge water: per-frame surface params (no geometry — the host generates the
+        // geo-clipmap mesh). waterOn (F7) gates the host water pass. depthBaseColor mirrors XE Mod
+        // Water.fx:24 using available DistantLand colours as the skyCol/fogColFar proxies; windFactor
+        // is a calm constant (windVec isn't exposed to MGE — tune later). camFwd = mwView's 3rd column
+        // (world-space view forward) for the slant→perpendicular shoreline depth correction.
+        float waterParams[12] = {};
+        const std::uint32_t waterOn = wantsWaterCapture() ? 1u : 0u;
+        if (waterOn) {
+            MWBridge* mw = MWBridge::get();
+            const float sunlightFactor = 1.0f - (1.0f - DistantLand::sunVis) * (1.0f - DistantLand::sunVis);
+            const RGBVECTOR sunAdj = sunlightFactor * DistantLand::sunCol;
+            const RGBVECTOR skyC = DistantLand::horizonCol;     // skyCol proxy
+            const RGBVECTOR fogF = DistantLand::nearFogCol;     // fogColFar proxy
+            waterParams[0]  = mw->WaterLevel();
+            waterParams[1]  = 0.013f;                            // windFactor (calm; tune later)
+            waterParams[2]  = 24.0f;                             // shoreDepthBias (XE Mod Water.fx:27)
+            waterParams[3]  = sunAdj.r * 0.03f + (2.0f * skyC.r + fogF.r) * 0.075f;
+            waterParams[4]  = sunAdj.g * 0.04f + (2.0f * skyC.g + fogF.g) * 0.080f;
+            waterParams[5]  = sunAdj.b * 0.05f + (2.0f * skyC.b + fogF.b) * 0.085f;
+            waterParams[6]  = DistantLand::nearViewRange;
+            waterParams[7]  = mw->IsUnderwater(DistantLand::eyePos.z) ? 1.0f : 0.0f;
+            waterParams[8]  = DistantLand::mwView._13;
+            waterParams[9]  = DistantLand::mwView._23;
+            waterParams[10] = DistantLand::mwView._33;
+            waterParams[11] = 0.0f;
+        }
+
         ok = g_client->renderSceneBlocking(frame, (const float*)&viewProj, lighting,
                  haveDraw ? g_drawVec->id() : IPC::InvalidVector,
                  haveDraw ? drawCount : 0,
@@ -1444,7 +1475,7 @@ namespace RenderProcess {
                  multiMapId, (multiMapId != IPC::InvalidVector) ? multiMapCount : 0, multiMapBytes,
                  lightId, (lightId != IPC::InvalidVector) ? lightCount : 0, lightBytes,
                  skyId, (skyId != IPC::InvalidVector) ? skyCount : 0, skyBytes,
-                 (std::uint32_t)g_debugMode, &devInput, &hostMs);
+                 (std::uint32_t)g_debugMode, &devInput, waterParams, waterOn, &hostMs);
         const double tRender = nowMs();
         if (!ok) {
             return;
@@ -1574,9 +1605,16 @@ namespace RenderProcess {
     }
 
     bool wantsSkyCapture() {
-        // Walk skyRoot only when the seam is live, geometry capture is up, the composite is ON
-        // (F11), and the SK1 sky pass is toggled ON (F7). Off by default → MW's own sky shows.
+        // Sky takeover is DONE: walk skyRoot whenever the seam is live, geometry capture is up, and
+        // the composite is ON (F11). g_skyEnabled is now permanently true (F7 freed for water).
         return g_initOk && g_geomVec.has_value() && g_enabled && g_skyEnabled;
+    }
+
+    bool wantsWaterCapture() {
+        // WT1 Forge water: true when the seam is live, the composite is ON (F11), and the Forge water
+        // pass is toggled ON (F7). No geometry capture (the host generates the mesh); this gate drives
+        // the per-frame water-params crossing and (WT3) the MGE water-pass suppression.
+        return g_initOk && g_enabled && g_waterEnabled;
     }
 
     bool ownsOpaqueWorld() {

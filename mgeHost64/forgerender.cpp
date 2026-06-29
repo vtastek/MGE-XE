@@ -102,6 +102,19 @@ namespace {
         return det < 0.0f;
     }
 
+    // Row-major 4x4 multiply C = A·B (out[i*4+j] = sum_k A[i*4+k]·B[k*4+j]). Same row-major /
+    // row-vector convention as the rest of the host (a point transforms p' = p·M). WT2 builds the
+    // reflection matrix as Mirror·viewProj (mirror world geometry about the water plane, then the
+    // normal camera). out may alias neither A nor B.
+    void mul4x4(const float a[16], const float b[16], float out[16]) {
+        for (int i = 0; i < 4; ++i) {
+            for (int j = 0; j < 4; ++j) {
+                out[i*4+j] = a[i*4+0]*b[0*4+j] + a[i*4+1]*b[1*4+j]
+                           + a[i*4+2]*b[2*4+j] + a[i*4+3]*b[3*4+j];
+            }
+        }
+    }
+
     // Full 4x4 inverse (cofactor / adjugate). Tier 2 GTAO reconstructs world position from device
     // depth via the inverse of the reverse-Z world->clip matrix; the host has no D3DX, so invert
     // here. Layout-agnostic (operates on the raw 16 floats); the caller feeds rzViewProj bytes and
@@ -1061,6 +1074,38 @@ namespace {
         DescriptorSet* pPerBatchSetSky = nullptr;          // gBatch bound to pSkyWorldsBuf, 1 instance
         Buffer*        pSkyInstanceBuf = nullptr;          // per-draw instance VB (kStaticInstU32 slots), CPU-mapped
 
+        // --- WT1: Forge water takeover (host-generated geo-clipmap surface) -----------
+        // Reuses the SAME SrtData/default.rootsig: the per-LOD-level worlds + packed params + invVP
+        // ride gBatch.worlds (pWaterWorldsBuf, one window) exactly like the sky path; the 4 water SRVs
+        // (gWaterNormalVol/gRefractColor/gSceneLinDepth/gReflectColor) append to the PerFrame set and
+        // are bound once into pPerFrameSet. Drawn AFTER the distant land (depth-write reverse-Z GEQUAL,
+        // cull NONE) into the same colour+depth, then the present-seam composites the whole frame.
+        Shader*        pWaterShader = nullptr;
+        Pipeline*      pWaterPipeline = nullptr;           // depth GEQUAL + write, cull NONE, no blend
+        Buffer*        pWaterWorldsBuf = nullptr;          // gBatch: worlds[0..5]=LOD levels, [6]=params, [7]=invVP
+        DescriptorSet* pPerBatchSetWater = nullptr;        // gBatch bound to pWaterWorldsBuf, 1 instance
+        Buffer*        pWaterInstanceBuf = nullptr;        // per-draw instance VB: DrawIndex=level (kMaxWaterLevels)
+        Buffer*        pWaterVB = nullptr;                 // GPU_ONLY clipmap verts (float3, stride 12)
+        Buffer*        pWaterIB = nullptr;                 // GPU_ONLY clipmap indices (uint16)
+        Texture*       pRefractColor = nullptr;            // screen copy of the pre-water colour (refraction src)
+        Texture*       pWaterNormalVol = nullptr;          // water_NRM.dds 3D animated-normal volume
+        bool           waterReady = false;                 // all water resources built (gates the pass)
+
+        // --- WT2: real Forge reflection RT (replaces WT1's flat stand-in) ----------------
+        // A fixed 1024² RT (matches MGE's texReflection budget; sampled with normalized UV so the
+        // resolution is decoupled from the screen). Rendered by mirroring world geometry about the
+        // water plane (mirrorVP = Mirror·viewProj) and drawing into it with the NORMAL camera, so it
+        // lands in main-screen space → the water frag samples it at its own screen UV. Stage 1 draws
+        // SKY ONLY (own decoupled buffers; validates the mirror matrix without the DL cull machinery).
+        RenderTarget*  pReflectColor = nullptr;            // 1024² B8G8R8A8, alpha = coverage
+        RenderTarget*  pReflectDepth = nullptr;            // 1024² D32 reverse-Z (mirror pass depth)
+        Buffer*        pReflectFrameCbv = nullptr;         // gFrameData for the mirror view (own viewProj)
+        DescriptorSet* pPerFrameSetReflect = nullptr;      // PerFrame set bound to pReflectFrameCbv (+ gAO + water SRVs)
+        Buffer*        pReflectSkyWorldsBuf = nullptr;     // reflect sky gBatch window (own; filled in the reflect pass)
+        DescriptorSet* pPerBatchSetReflectSky = nullptr;   // gBatch bound to pReflectSkyWorldsBuf
+        Buffer*        pReflectSkyInstanceBuf = nullptr;   // reflect sky per-draw instance VB
+        bool           reflectReady = false;               // all reflection resources built (gates the pass)
+
         // --- Buffer consolidation: one shared mega VB + IB for STATIC non-skinned parts ----
         // Kills the per-draw VB/IB binds (the DX9-shaped bottleneck): bind these ONCE, draw each
         // part with firstVertex(BaseVertexLocation)/firstIndex offsets into them. Free-list
@@ -1162,6 +1207,28 @@ namespace {
     // the full sky subtree is ~15 shapes (SK2). One 64KB world window (< 1024 matrices) holds them.
     constexpr uint32_t kMaxSkyDraws = 64;
 
+    // WT1 Forge water: the geo-clipmap (port of MGE initWaterLodMesh, distantinit.cpp:1047) — 6 LOD
+    // levels, finest cell 128u, 64 cells/side, T-junction stitch + 4 trim variants/level. The host
+    // generates verts/indices once and draws one cmdDrawIndexedInstanced per level (DrawIndex=level
+    // selects gBatch.worlds[level]). worlds[0..5] = the 6 levels, [6] = packed params, [7] = invVP.
+    constexpr uint32_t kMaxWaterLevels = 6;
+    constexpr uint32_t kWaterLevels    = 6;
+    // WT2 reflection RT side (matches MGE texReflection's 1024² budget; sampled with normalized UV).
+    constexpr uint32_t kReflectSize = 1024;
+    constexpr float    kWaterCell0     = 128.0f;
+    constexpr int      kWaterGrid      = 64;     // cells per side per level (even)
+    // One per-level draw record: which IB sub-range each of the 4 trim variants occupies.
+    struct WaterLodLevelHost {
+        float    cellSize;
+        uint32_t vertBase;        // first vertex of this level in pWaterVB
+        uint32_t vertCount;       // verts in this level
+        uint32_t ibStart[4];      // index of first index for variant v
+        uint32_t triCount[4];     // triangles for variant v
+        uint32_t numVariants;     // 1 (level 0) or 4
+    };
+    WaterLodLevelHost g_waterLevels[kWaterLevels] = {};
+    uint32_t          g_waterVertTotal = 0;
+
     // Tier 3a point lights: per-frame cbuffer of MAX_POINT_LIGHTS lights (3 float4 each) +
     // a float4 header (count). MUST match IPC::kMaxPointLights / MAX_POINT_LIGHTS (opaque.srt.h).
     // 16 + 128*3*16 = 6160 B, rounded up to a 256-byte CBV multiple.
@@ -1211,6 +1278,296 @@ namespace {
         if (fd.pOutFence) {
             waitForFences(R, 1, &fd.pOutFence);
         }
+    }
+
+    // Little-endian 32-bit read (DDS header fields). Defined here (ahead of the water loader AND
+    // parseDds, both of which use it).
+    static uint32_t ddsRd32(const uint8_t* p) {
+        return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    }
+
+    // WT1: build the geo-clipmap water VB/IB (CPU port of MGE DistantLand::initWaterLodMesh,
+    // distantinit.cpp:1047). Local integer lattice [-half,half] on z=0 (height added in the VS later);
+    // 6 LOD levels, each with a stitched outer annulus (T-junction fix to the coarser ring) and (for
+    // levels 1..5) 4 trim variants whose central hole shifts by eye parity to nest the finer level.
+    // Fills g_waterLevels + the two GPU_ONLY buffers via BufferLoadDesc pData. Idempotent.
+    bool buildWaterMesh(Renderer* R) {
+        if (g_live.pWaterVB && g_live.pWaterIB) { return true; }
+        const int   m       = kWaterGrid;
+        const int   verts1D = m + 1;
+        const int   half    = m / 2;
+        const float c0      = kWaterCell0;
+        const int   L       = (int)kWaterLevels;
+
+        g_waterVertTotal = (uint32_t)(L * verts1D * verts1D);
+        std::vector<float> verts;                  // float3 per vertex
+        verts.reserve((size_t)g_waterVertTotal * 3);
+        for (int k = 0; k < L; ++k) {
+            for (int gy = 0; gy <= m; ++gy) {
+                for (int gx = 0; gx <= m; ++gx) {
+                    verts.push_back((float)(gx - half));
+                    verts.push_back((float)(gy - half));
+                    verts.push_back(0.0f);         // z = 0 (height in the VS, follow-up)
+                }
+            }
+        }
+
+        std::vector<uint16_t> indices;
+        indices.reserve(400000);
+        int vertBase = 0;
+        auto vidx = [&](int gx, int gy) -> uint16_t { return (uint16_t)(vertBase + gy * verts1D + gx); };
+        // Emit one triangle forcing CCW winding on the z=0 plane (signed area decides orientation).
+        auto addTri = [&](int ax, int ay, int bx, int by, int cx, int cy) {
+            long cross = (long)(bx - ax) * (cy - ay) - (long)(by - ay) * (cx - ax);
+            uint16_t ia = vidx(ax, ay), ib = vidx(bx, by), ic = vidx(cx, cy);
+            if (cross < 0) { uint16_t t = ib; ib = ic; ic = t; }
+            indices.push_back(ia); indices.push_back(ib); indices.push_back(ic);
+        };
+        auto addCell = [&](int cx, int cy) {
+            addTri(cx, cy, cx + 1, cy, cx + 1, cy + 1);
+            addTri(cx, cy, cx + 1, cy + 1, cx, cy + 1);
+        };
+        auto addEdgeBlock = [&](int ax, int ay, int tx, int ty, int nx, int ny) {
+            int Ax = ax,                Ay = ay;
+            int Cx = ax + 2 * tx,       Cy = ay + 2 * ty;
+            int Apx = ax + nx,          Apy = ay + ny;
+            int Bpx = ax + tx + nx,     Bpy = ay + ty + ny;
+            int Cpx = ax + 2 * tx + nx, Cpy = ay + 2 * ty + ny;
+            addTri(Ax, Ay, Cx, Cy, Bpx, Bpy);
+            addTri(Ax, Ay, Bpx, Bpy, Apx, Apy);
+            addTri(Cx, Cy, Cpx, Cpy, Bpx, Bpy);
+        };
+        auto addCorner = [&](int cgx, int cgy, int dx, int dy) {
+            int Ox = cgx,          Oy = cgy;
+            int Bx = cgx + 2 * dx, By = cgy;
+            int Tx = cgx,          Ty = cgy + 2 * dy;
+            int Mx = cgx + dx,     My = cgy + dy;
+            int Rx = cgx + 2 * dx, Ry = cgy + dy;
+            int Sx = cgx + 2 * dx, Sy = cgy + 2 * dy;
+            int Ux = cgx + dx,     Uy = cgy + 2 * dy;
+            addTri(Ox, Oy, Bx, By, Mx, My);
+            addTri(Ox, Oy, Mx, My, Tx, Ty);
+            addTri(Bx, By, Rx, Ry, Mx, My);
+            addTri(Rx, Ry, Sx, Sy, Mx, My);
+            addTri(Mx, My, Sx, Sy, Ux, Uy);
+            addTri(Mx, My, Ux, Uy, Tx, Ty);
+        };
+        auto addOuterStitch = [&]() {
+            addCorner(0, 0, +1, +1);
+            addCorner(m, 0, -1, +1);
+            addCorner(0, m, +1, -1);
+            addCorner(m, m, -1, -1);
+            for (int c = 2; c <= m - 4; c += 2) {
+                addEdgeBlock(c, 0, 1, 0,  0,  1);
+                addEdgeBlock(c, m, 1, 0,  0, -1);
+                addEdgeBlock(0, c, 0, 1,  1,  0);
+                addEdgeBlock(m, c, 0, 1, -1,  0);
+            }
+        };
+
+        for (int k = 0; k < L; ++k) {
+            const bool stitch = (k < L - 1);
+            const int  numVar = (k == 0) ? 1 : 4;
+            WaterLodLevelHost& lvl = g_waterLevels[k];
+            lvl.cellSize    = c0 * (float)(1 << k);
+            lvl.vertBase    = (uint32_t)vertBase;
+            lvl.vertCount   = (uint32_t)(verts1D * verts1D);
+            lvl.numVariants = (uint32_t)numVar;
+            for (int i = 0; i < 4; ++i) { lvl.ibStart[i] = 0; lvl.triCount[i] = 0; }
+            for (int vrt = 0; vrt < numVar; ++vrt) {
+                const int ex = vrt & 1;
+                const int ey = (vrt >> 1) & 1;
+                const int holeLoX = (m / 4) + ex, holeHiX = (3 * m / 4) + ex;
+                const int holeLoY = (m / 4) + ey, holeHiY = (3 * m / 4) + ey;
+                const size_t startIdx = indices.size();
+                lvl.ibStart[vrt] = (uint32_t)startIdx;
+                for (int cy = 0; cy < m; ++cy) {
+                    for (int cx = 0; cx < m; ++cx) {
+                        if (stitch) {
+                            const bool corner = (cx <= 1 || cx >= m - 2) && (cy <= 1 || cy >= m - 2);
+                            const bool bedge  = (cy == 0 || cy == m - 1) && (cx >= 2 && cx <= m - 3);
+                            const bool vedge  = (cx == 0 || cx == m - 1) && (cy >= 2 && cy <= m - 3);
+                            if (corner || bedge || vedge) continue;
+                        }
+                        if (k > 0 && cx >= holeLoX && cx < holeHiX && cy >= holeLoY && cy < holeHiY) continue;
+                        addCell(cx, cy);
+                    }
+                }
+                if (stitch) { addOuterStitch(); }
+                lvl.triCount[vrt] = (uint32_t)((indices.size() - startIdx) / 3);
+            }
+            vertBase += verts1D * verts1D;
+        }
+
+        BufferLoadDesc wv = {};
+        wv.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+        wv.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+        wv.mDesc.mSize        = (uint64_t)verts.size() * sizeof(float);
+        wv.mDesc.mStartState  = RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+        wv.mDesc.pName        = "waterVB";
+        wv.pData              = verts.data();
+        wv.ppBuffer           = &g_live.pWaterVB;
+        addResource(&wv, nullptr);
+
+        BufferLoadDesc wi = {};
+        wi.mDesc.mDescriptors = DESCRIPTOR_TYPE_INDEX_BUFFER;
+        wi.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+        wi.mDesc.mSize        = (uint64_t)indices.size() * sizeof(uint16_t);
+        wi.mDesc.mStartState  = RESOURCE_STATE_INDEX_BUFFER;
+        wi.mDesc.pName        = "waterIB";
+        wi.pData              = indices.data();
+        wi.ppBuffer           = &g_live.pWaterIB;
+        addResource(&wi, nullptr);
+
+        waitForAllResourceLoads();
+        if (!g_live.pWaterVB || !g_live.pWaterIB) { return false; }
+        std::printf("[forge][water] clipmap mesh: %d levels, %u verts, %zu tris\n",
+                    L, g_waterVertTotal, indices.size() / 3);
+        return true;
+    }
+
+    // WT1: load water_NRM.dds as a 3D animated-normal volume. The host runs from the morrowind64 cwd,
+    // so it reads the file directly. water_NRM is uncompressed 32-bit BGRA (DDS depth at offset 24).
+    // The host's parseDds (uploadTextures) is 2D-only, so this is a dedicated 3D path: parse the
+    // header inline, create a Texture3D, then slice/row-copy each mip (mDstSliceStride per Z slice).
+    bool loadWaterNormalVolume(Renderer* R) {
+        if (g_live.pWaterNormalVol) { return true; }
+        const char* path = "Data Files\\textures\\MGE\\water_NRM.dds";
+        FILE* f = std::fopen(path, "rb");
+        if (!f) { std::printf("[forge][water] water_NRM.dds not found (%s)\n", path); return false; }
+        std::fseek(f, 0, SEEK_END);
+        long sz = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
+        if (sz < 128) { std::fclose(f); return false; }
+        std::vector<uint8_t> bytes((size_t)sz);
+        size_t rd = std::fread(bytes.data(), 1, (size_t)sz, f);
+        std::fclose(f);
+        if (rd != (size_t)sz) { return false; }
+        const uint8_t* d = bytes.data();
+        if (ddsRd32(d) != 0x20534444u) { std::printf("[forge][water] bad DDS magic\n"); return false; }
+        const uint32_t height = ddsRd32(d + 12);
+        const uint32_t width  = ddsRd32(d + 16);
+        uint32_t       depth  = ddsRd32(d + 24);
+        uint32_t       mips   = ddsRd32(d + 28);
+        const uint32_t pfFlags= ddsRd32(d + 80);
+        const uint32_t bits   = ddsRd32(d + 88);
+        if (mips == 0) { mips = 1; }
+        if (depth == 0) { depth = 1; }
+        // water_NRM is an uncompressed 32-bit volume (no FourCC). Treat as BGRA8 (MW A8R8G8B8).
+        if ((pfFlags & 0x4) != 0 || bits != 32) {
+            std::printf("[forge][water] water_NRM.dds not 32-bit uncompressed (pfFlags=%u bits=%u) — unsupported\n",
+                        pfFlags, bits);
+            return false;
+        }
+        const uint32_t dataOffset = 128;
+
+        TextureDesc td = {};
+        td.mWidth = width; td.mHeight = height; td.mDepth = depth;
+        td.mArraySize = 1; td.mMipLevels = mips;
+        td.mSampleCount = SAMPLE_COUNT_1;
+        td.mFormat = TinyImageFormat_B8G8R8A8_UNORM;
+        td.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+        td.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+        td.pName = "waterNormalVol";
+        TextureLoadDesc tld = {};
+        tld.ppTexture = &g_live.pWaterNormalVol;
+        tld.pDesc = &td;
+        addResource(&tld, nullptr);
+        waitForAllResourceLoads();
+        if (!g_live.pWaterNormalVol) { std::printf("[forge][water] addResource(volume) FAILED\n"); return false; }
+
+        const uint8_t* src    = d + dataOffset;
+        const uint8_t* srcEnd = d + sz;
+        TextureUpdateDesc upd = {};
+        upd.pTexture = g_live.pWaterNormalVol;
+        upd.mBaseMipLevel = 0; upd.mMipLevels = mips;
+        upd.mBaseArrayLayer = 0; upd.mLayerCount = 1;
+        upd.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+        beginUpdateResource(&upd);
+        for (uint32_t mip = 0; mip < mips; ++mip) {
+            TextureSubresourceUpdate s = upd.getSubresourceUpdateDesc(mip, 0);
+            const uint32_t sliceBytes = s.mRowCount * s.mSrcRowStride;
+            // Slice count for this mip = max(1, depth >> mip).
+            uint32_t mipDepth = depth >> mip; if (mipDepth == 0) mipDepth = 1;
+            for (uint32_t z = 0; z < mipDepth; ++z) {
+                if (src + sliceBytes > srcEnd) { mip = mips; break; }   // truncated → stop
+                uint8_t* dstSlice = s.pMappedData + (size_t)z * s.mDstSliceStride;
+                for (uint32_t row = 0; row < s.mRowCount; ++row) {
+                    std::memcpy(dstSlice + (size_t)row * s.mDstRowStride,
+                                src + (size_t)row * s.mSrcRowStride, s.mSrcRowStride);
+                }
+                src += sliceBytes;
+            }
+        }
+        endUpdateResource(&upd);
+        std::printf("[forge][water] volume %ux%ux%u, %u mips (BGRA8) loaded\n", width, height, depth, mips);
+        return true;
+    }
+
+    // WT1/WT2: (re)build the water shader + graphics pipeline ONLY (not the resources/buffers/sets,
+    // which persist across a shader edit). Called from buildOpaquePath at startup AND from the
+    // hot-reload path so water.vert/.frag edits go live without a full relaunch. Idempotent: tears
+    // down the existing shader/pipeline first. Position-only layout (pos float3 + per-instance
+    // DrawIndex), depth GEQUAL+write (reverse-Z), cull NONE, no blend.
+    bool buildWaterPipeline(Renderer* R) {
+        waitQueueIdle(g_live.pQueue);
+        if (g_live.pWaterPipeline) { removePipeline(R, g_live.pWaterPipeline); g_live.pWaterPipeline = nullptr; }
+        if (g_live.pWaterShader)   { removeShader(R, g_live.pWaterShader);     g_live.pWaterShader = nullptr; }
+
+        ShaderLoadDesc wsDesc = {};
+        wsDesc.mVert.pFileName = "water.vert";
+        wsDesc.mFrag.pFileName = "water.frag";
+        addShader(R, &wsDesc, &g_live.pWaterShader);
+        if (!g_live.pWaterShader) {
+            LOG::logline("!! [forge][water] addShader(water) FAILED (dxil missing?)"); LOG::flush();
+            return false;
+        }
+
+        VertexLayout wvl = {};
+        wvl.mBindingCount = 2;
+        wvl.mBindings[0].mStride = 12;
+        wvl.mBindings[1].mStride = sizeof(uint32_t);
+        wvl.mBindings[1].mRate   = VERTEX_BINDING_RATE_INSTANCE;
+        wvl.mAttribCount = 2;
+        wvl.mAttribs[0].mSemantic = SEMANTIC_POSITION;
+        wvl.mAttribs[0].mFormat   = TinyImageFormat_R32G32B32_SFLOAT;
+        wvl.mAttribs[0].mBinding  = 0;
+        wvl.mAttribs[0].mLocation = 0;
+        wvl.mAttribs[0].mOffset   = 0;
+        wvl.mAttribs[1].mSemantic = SEMANTIC_TEXCOORD1;       // DrawIndex (matches water.vert)
+        wvl.mAttribs[1].mFormat   = TinyImageFormat_R32_UINT;
+        wvl.mAttribs[1].mBinding  = 1;
+        wvl.mAttribs[1].mLocation = 1;
+        wvl.mAttribs[1].mOffset   = 0;
+
+        DepthStateDesc wDepth = {};
+        wDepth.mDepthTest = true;
+        wDepth.mDepthWrite = true;
+        wDepth.mDepthFunc = CMP_GEQUAL;        // reverse-Z: water writes + occludes
+
+        RasterizerStateDesc wRaster = {};
+        wRaster.mCullMode = CULL_MODE_NONE;    // matches MGE water (P6/P7, double-sided plane)
+        wRaster.mFrontFace = FRONT_FACE_CCW;
+
+        PipelineDesc wPd = {};
+        wPd.mType = PIPELINE_TYPE_GRAPHICS;
+        GraphicsPipelineDesc& wg = wPd.mGraphicsDesc;
+        wg.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+        wg.mRenderTargetCount = 1;
+        wg.pColorFormats = &g_live.pRT->mFormat;
+        wg.mSampleCount = (SampleCount)g_live.sampleCount;
+        wg.mSampleQuality = 0;
+        wg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+        wg.pDepthState = &wDepth;
+        wg.pVertexLayout = &wvl;
+        wg.pRasterizerState = &wRaster;
+        wg.pShaderProgram = g_live.pWaterShader;
+        addPipeline(R, &wPd, &g_live.pWaterPipeline);
+        if (!g_live.pWaterPipeline) {
+            LOG::logline("!! [forge][water] addPipeline(water) FAILED"); LOG::flush();
+            return false;
+        }
+        return true;
     }
 
     // Build the M1c opaque scene path: depth target, opaque shader + pipeline (pos+normal
@@ -2242,6 +2599,227 @@ namespace {
             updateDescriptorSet(R, 0, g_live.pPerBatchSetSky, 1, &skp);
         }
 
+        // --- WT1: Forge water (host-generated geo-clipmap surface) ------------------------------
+        // Own position-only vertex layout (float3 + per-instance DrawIndex=level). Reuses the shared
+        // SrtData/default.rootsig: worlds+params ride gBatch (pWaterWorldsBuf, one window, like sky),
+        // and the 4 water SRVs append to the PerFrame set (bound below). Depth GEQUAL + write
+        // (reverse-Z, water occludes / is occluded), cull NONE (MGE P6/P7), no blend, frag alpha=1.
+        {
+            // Build the clipmap mesh + load the animated-normal volume. If either fails, leave water
+            // unbuilt (waterReady stays false) — the rest of the path is unaffected (clean A/B).
+            const bool meshOk = buildWaterMesh(R);
+            const bool volOk  = loadWaterNormalVolume(R);
+
+            // Water shader + graphics pipeline (extracted so the hot-reload path can rebuild them
+            // when water.vert/.frag change on disk — graphics shaders aren't reloaded by the
+            // compute-only checkShaderHotReload otherwise).
+            if (!buildWaterPipeline(R)) {
+                return false;
+            }
+
+            // pRefractColor: screen-sized copy target of the pre-water colour (refraction source).
+            // SRV only (the copy is a CopyResource/ResolveSubresource, not a render target).
+            {
+                TextureDesc rd = {};
+                rd.mWidth = width; rd.mHeight = height; rd.mDepth = 1;
+                rd.mArraySize = 1; rd.mMipLevels = 1;
+                rd.mSampleCount = SAMPLE_COUNT_1;
+                rd.mFormat = TinyImageFormat_B8G8R8A8_UNORM;       // matches the shared RT
+                rd.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+                rd.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+                rd.pName = "refractColor";
+                TextureLoadDesc rld = {};
+                rld.ppTexture = &g_live.pRefractColor;
+                rld.pDesc = &rd;
+                addResource(&rld, nullptr);
+            }
+
+            // gBatch window for water (worlds[0..5]=levels, [6]=params, [7]=invVP) + per-draw instance
+            // VB (DrawIndex per level). Same layout as the sky window.
+            BufferLoadDesc wwb = {};
+            wwb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            wwb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            wwb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            wwb.mDesc.mSize = kBatchBytes;
+            wwb.mDesc.pName = "waterWorldsCbv";
+            wwb.pData = nullptr;
+            wwb.ppBuffer = &g_live.pWaterWorldsBuf;
+            addResource(&wwb, nullptr);
+
+            BufferLoadDesc wib = {};
+            wib.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+            wib.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            wib.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            wib.mDesc.mSize = (uint64_t)kMaxWaterLevels * sizeof(uint32_t);
+            wib.mDesc.pName = "instanceVBWater";
+            wib.pData = nullptr;
+            wib.ppBuffer = &g_live.pWaterInstanceBuf;
+            addResource(&wib, nullptr);
+
+            waitForAllResourceLoads();
+            if (!g_live.pRefractColor || !g_live.pWaterWorldsBuf || !g_live.pWaterInstanceBuf) {
+                std::printf("[forge] water resource alloc FAILED\n");
+                return false;
+            }
+            // Fill the per-draw instance VB once: DrawIndex[level] = level (selects gBatch.worlds[level]).
+            {
+                uint32_t* wi = (uint32_t*)g_live.pWaterInstanceBuf->pCpuMappedAddress;
+                for (uint32_t i = 0; i < kMaxWaterLevels; ++i) { wi[i] = i; }
+            }
+
+            DescriptorSetDesc wbDesc = SRT_SET_DESC(SrtData, PerBatch, 1, 0);
+            addDescriptorSet(R, &wbDesc, &g_live.pPerBatchSetWater);
+            if (!g_live.pPerBatchSetWater) { return false; }
+            DescriptorData wbp = {};
+            wbp.mIndex = SRT_RES_IDX(SrtData, PerBatch, gBatch);
+            wbp.ppBuffers = &g_live.pWaterWorldsBuf;
+            updateDescriptorSet(R, 0, g_live.pPerBatchSetWater, 1, &wbp);
+
+            // waterReady gates the per-frame pass: needs the mesh, pipeline, worlds window AND the
+            // animated-normal volume (the frag samples a Tex3D — binding a 2D fallback to a 3D slot is
+            // an illegal type mismatch, so the volume is mandatory; it's a shipped MGE asset).
+            g_live.waterReady = meshOk && volOk && g_live.pWaterNormalVol && g_live.pWaterPipeline
+                              && g_live.pWaterWorldsBuf && g_live.pWaterVB && g_live.pWaterIB;
+
+            // Bind the 4 water SRVs into the (already-created) PerFrame set — only when fully ready, so
+            // the Tex3D slot never gets a null/2D binding. These are STABLE views; the refraction/scene-
+            // depth CONTENTS change per frame (the descriptors don't). gSceneLinDepth = pLinearDepth (RAW
+            // reverse-Z device depth, Tier 2 AO block above). gReflectColor is the WT1 stand-in — bind
+            // pRefractColor as a valid placeholder (the frag ignores it in WT1; WT2 rebinds the mirror RT).
+            if (g_live.waterReady) {
+                DescriptorData wp[4] = {};
+                wp[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gWaterNormalVol);
+                wp[0].mCount = 1; wp[0].ppTextures = &g_live.pWaterNormalVol;
+                wp[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gRefractColor);
+                wp[1].mCount = 1; wp[1].ppTextures = &g_live.pRefractColor;
+                wp[2].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSceneLinDepth);
+                wp[2].mCount = 1; wp[2].ppTextures = &g_live.pLinearDepth;
+                wp[3].mIndex = SRT_RES_IDX(SrtData, PerFrame, gReflectColor);
+                wp[3].mCount = 1; wp[3].ppTextures = &g_live.pRefractColor;   // WT1 stand-in
+                updateDescriptorSet(R, 0, g_live.pPerFrameSet, 4, wp);
+            }
+            std::printf("[forge][water] build: mesh=%d vol=%d ready=%d\n",
+                        (int)meshOk, (int)volOk, (int)g_live.waterReady);
+        }
+
+        // --- WT2: reflection RT (1024²) + mirror-view frame cbuffer/set + reflect sky buffers ------
+        // Stage 1 renders SKY ONLY into pReflectColor with the mirror matrix; the water frag samples
+        // it (gReflectColor re-bound to pReflectColor below, replacing the WT1 stand-in). Reuses the
+        // sky pipeline (cull NONE → winding-agnostic, so the mirror's handedness flip is a no-op here).
+        {
+            // 1024² colour RT (alpha = coverage, cleared transparent) + matching D32 reverse-Z depth.
+            RenderTargetDesc rcd = {};
+            rcd.mWidth = kReflectSize; rcd.mHeight = kReflectSize; rcd.mDepth = 1;
+            rcd.mArraySize = 1; rcd.mMipLevels = 1; rcd.mSampleCount = SAMPLE_COUNT_1;
+            rcd.mFormat = TinyImageFormat_B8G8R8A8_UNORM;
+            rcd.mStartState = RESOURCE_STATE_SHADER_RESOURCE;   // resting; pass flips to RENDER_TARGET
+            rcd.mClearValue.r = 0.0f;
+            rcd.mClearValue.g = 0.0f;
+            rcd.mClearValue.b = 0.0f;
+            rcd.mClearValue.a = 0.0f;   // transparent: alpha = coverage (premultiplied, composited over fog)
+            rcd.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+            rcd.pName = "reflectColor";
+            addRenderTarget(R, &rcd, &g_live.pReflectColor);
+
+            RenderTargetDesc rdd = {};
+            rdd.mWidth = kReflectSize; rdd.mHeight = kReflectSize; rdd.mDepth = 1;
+            rdd.mArraySize = 1; rdd.mMipLevels = 1; rdd.mSampleCount = SAMPLE_COUNT_1;
+            rdd.mFormat = TinyImageFormat_D32_SFLOAT;
+            rdd.mStartState = RESOURCE_STATE_DEPTH_WRITE;
+            rdd.mClearValue.depth = 0.0f;   // reverse-Z clear
+            rdd.mClearValue.stencil = 0;
+            rdd.pName = "reflectDepth";
+            addRenderTarget(R, &rdd, &g_live.pReflectDepth);
+
+            // Mirror-view frame cbuffer (own viewProj; same 256B layout as gFrameData).
+            BufferLoadDesc rfb = {};
+            rfb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            rfb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            rfb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            rfb.mDesc.mSize = 256;
+            rfb.mDesc.pName = "reflectFrameCbv";
+            rfb.pData = nullptr;
+            rfb.ppBuffer = &g_live.pReflectFrameCbv;
+            addResource(&rfb, nullptr);
+
+            // Reflect sky gBatch window + instance VB (own copies; the reflect pass fills + draws them
+            // BEFORE the main sky pass, so they must be decoupled from pSkyWorldsBuf/pSkyInstanceBuf).
+            BufferLoadDesc rsw = {};
+            rsw.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            rsw.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            rsw.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            rsw.mDesc.mSize = kBatchBytes;
+            rsw.mDesc.pName = "reflectSkyWorldsCbv";
+            rsw.pData = nullptr;
+            rsw.ppBuffer = &g_live.pReflectSkyWorldsBuf;
+            addResource(&rsw, nullptr);
+
+            BufferLoadDesc rsi = {};
+            rsi.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+            rsi.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            rsi.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            rsi.mDesc.mSize = (uint64_t)kMaxSkyDraws * kStaticInstU32 * sizeof(uint32_t);
+            rsi.mDesc.pName = "instanceVBReflectSky";
+            rsi.pData = nullptr;
+            rsi.ppBuffer = &g_live.pReflectSkyInstanceBuf;
+            addResource(&rsi, nullptr);
+
+            waitForAllResourceLoads();
+            if (!g_live.pReflectColor || !g_live.pReflectDepth || !g_live.pReflectFrameCbv
+                || !g_live.pReflectSkyWorldsBuf || !g_live.pReflectSkyInstanceBuf) {
+                std::printf("[forge] reflection resource alloc FAILED\n");
+                return false;
+            }
+
+            // pPerFrameSetReflect: a SECOND PerFrame set bound to pReflectFrameCbv (so the reflection
+            // pass uses the mirror viewProj while the main pass keeps rzViewProj — two matrices in one
+            // command buffer need two cbuffers). gAO + the 4 water SRVs are bound to the same textures
+            // as the main set (the sky frag ignores them; the set layout just needs them valid).
+            DescriptorSetDesc rpfDesc = SRT_SET_DESC(SrtData, PerFrame, 1, 0);
+            addDescriptorSet(R, &rpfDesc, &g_live.pPerFrameSetReflect);
+            DescriptorSetDesc rsbDesc = SRT_SET_DESC(SrtData, PerBatch, 1, 0);
+            addDescriptorSet(R, &rsbDesc, &g_live.pPerBatchSetReflectSky);
+            if (!g_live.pPerFrameSetReflect || !g_live.pPerBatchSetReflectSky) { return false; }
+            {
+                Texture* vol = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
+                DescriptorData p[6] = {};
+                p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
+                p[0].ppBuffers = &g_live.pReflectFrameCbv;
+                p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
+                p[1].mCount = 1; p[1].ppTextures = &g_live.pAOBlur;
+                p[2].mIndex = SRT_RES_IDX(SrtData, PerFrame, gWaterNormalVol);
+                p[2].mCount = 1; p[2].ppTextures = &vol;
+                p[3].mIndex = SRT_RES_IDX(SrtData, PerFrame, gRefractColor);
+                p[3].mCount = 1; p[3].ppTextures = &g_live.pRefractColor;
+                p[4].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSceneLinDepth);
+                p[4].mCount = 1; p[4].ppTextures = &g_live.pLinearDepth;
+                p[5].mIndex = SRT_RES_IDX(SrtData, PerFrame, gReflectColor);
+                p[5].mCount = 1; p[5].ppTextures = &g_live.pRefractColor;   // reflect set never reads this
+                updateDescriptorSet(R, 0, g_live.pPerFrameSetReflect, 6, p);
+            }
+            {
+                DescriptorData rbp = {};
+                rbp.mIndex = SRT_RES_IDX(SrtData, PerBatch, gBatch);
+                rbp.ppBuffers = &g_live.pReflectSkyWorldsBuf;
+                updateDescriptorSet(R, 0, g_live.pPerBatchSetReflectSky, 1, &rbp);
+            }
+
+            g_live.reflectReady = g_live.waterReady && g_live.pReflectColor && g_live.pReflectDepth
+                                && g_live.pReflectFrameCbv && g_live.pPerFrameSetReflect
+                                && g_live.pPerBatchSetReflectSky;
+
+            // Re-point gReflectColor (in the MAIN PerFrame set) at the real reflection RT, replacing
+            // WT1's pRefractColor stand-in. Only when ready, so the water frag samples a valid RT.
+            if (g_live.reflectReady && g_live.waterReady) {
+                Texture* reflTex = g_live.pReflectColor->pTexture;
+                DescriptorData rp = {};
+                rp.mIndex = SRT_RES_IDX(SrtData, PerFrame, gReflectColor);
+                rp.mCount = 1; rp.ppTextures = &reflTex;
+                updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &rp);
+            }
+            std::printf("[forge][reflect] build ready=%d (%u²)\n", (int)g_live.reflectReady, kReflectSize);
+        }
+
         // --- Tier 2: compute pipelines (linearize + GTAO) + their descriptor sets. First
         // PIPELINE_TYPE_COMPUTE in the host; both use the global compute root signature. ---
         {
@@ -2455,6 +3033,14 @@ namespace {
     float g_skyDebugTint = 0.0f;   // 0 = identical to MW (clean A/B); 1 = full magenta
     bool  g_skyTintPulse = false;  // animate the tint so it's obviously Forge-owned
 
+    // WT2 water debug: output one isolated water term instead of the composited surface, so the
+    // reflection / refraction contents are directly inspectable. Driven by two panel CHECKBOXES
+    // (the proven widget type — AO toggles use them; the dropdown's pData write is unreliable here).
+    // Combined into a mode (1 = reflection RT only / raw gReflectColor, 2 = refraction only) routed
+    // into the water params (worlds[6] group 3); water.frag branches on it. Both off = normal water.
+    bool g_waterReflOnly = false;
+    bool g_waterRefrOnly = false;
+
     // F12 debug-view names; index = debugParams.x. The dropdown writes g_debugMode directly so the
     // overlay selector and the F12 key cycle stay unified.
     const char* const kDebugModeNames[] = { "0 normal", "1 depth", "2 scatter", "3 AO", "4 bent-normal",
@@ -2573,6 +3159,15 @@ namespace {
         uiAddComponentWidget(g_uiPanel, "Sky tint (Forge tell)", &sSky, WIDGET_TYPE_SLIDER_FLOAT);
         CheckboxWidget cSkyP = {}; cSkyP.pData = &g_skyTintPulse;
         uiAddComponentWidget(g_uiPanel, "Sky tint pulse", &cSkyP, WIDGET_TYPE_CHECKBOX);
+
+        // WT2 water debug: isolate the reflection / refraction inputs so they can be inspected
+        // directly (the composited surface can hide a black/empty reflection RT). 0 = normal water.
+        LabelWidget watLbl = {};
+        uiAddComponentWidget(g_uiPanel, "-- Water takeover (F7) --", &watLbl, WIDGET_TYPE_LABEL);
+        CheckboxWidget cWRefl = {}; cWRefl.pData = &g_waterReflOnly;
+        uiAddComponentWidget(g_uiPanel, "Water: reflection only", &cWRefl, WIDGET_TYPE_CHECKBOX);
+        CheckboxWidget cWRefr = {}; cWRefr.pData = &g_waterRefrOnly;
+        uiAddComponentWidget(g_uiPanel, "Water: refraction only", &cWRefr, WIDGET_TYPE_CHECKBOX);
 
         g_uiInited = true;
         LOG::logline(">> [devui] ready (%ux%u fmt=%u)", width, height, colorFmt); LOG::flush();
@@ -2901,7 +3496,8 @@ namespace ForgeRender {
                      const void* skinnedBlob, unsigned skinnedCount, unsigned skinnedBytes,
                      const void* multiMapBlob, unsigned multiMapCount, unsigned multiMapBytes,
                      const void* lightBlob, unsigned lightCount, unsigned lightBytes,
-                     const void* skyBlob, unsigned skyCount, unsigned skyBytes) {
+                     const void* skyBlob, unsigned skyCount, unsigned skyBytes,
+                     const float* waterParams, unsigned waterEnabled) {
         if (!g_live.pRenderer) {
             return false;
         }
@@ -3457,6 +4053,154 @@ namespace ForgeRender {
             }
         }
 
+        // ===================== WT2: REFLECTION PASS (sky-only, Stage 1) =====================
+        // Render the mirrored scene into pReflectColor (1024²) BEFORE the main colour pass, so the
+        // water frag can sample it. Stage 1 = SKY ONLY: mirror world geometry about the water plane
+        // (mirrorVP = Mirror·viewProj) and draw the sky with the NORMAL camera → it lands in main-
+        // screen space. Own frame cbuffer (mirror matrix) + own sky buffers (filled here, decoupled
+        // from the main sky pass). Gated by reflectReady (build) + waterEnabled (F7) + a sky list.
+        {
+            static uint32_t s_reflGateLog = 0;
+            if ((s_reflGateLog++ % 120) == 0) {
+                LOG::logline(">> [forge][reflect] GATE ready=%d waterEn=%u params=%d skyBlob=%d skyCount=%u skyBytes=%u",
+                             (int)g_live.reflectReady, waterEnabled, (int)(waterParams != nullptr),
+                             (int)(skyBlob != nullptr), skyCount, skyBytes);
+                LOG::flush();
+            }
+        }
+        if (g_live.reflectReady && waterEnabled && waterParams && skyBlob && skyCount && skyBytes) {
+            const float* fcbvR = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
+            const float eyeAbsZ = fcbvR[58];                       // lodEye.z (absolute camera)
+            const float waterLevelAbs = waterParams[0];
+            const float dRel = (waterLevelAbs - 1.0f) - eyeAbsZ;   // water plane, camera-relative (logged)
+
+            // STAGE 1 (sky): mirror about the CAMERA's horizontal plane (z = 0 camera-relative), NOT
+            // the water plane. The sky is an infinite, camera-attached dome; reflecting a FINITE dome
+            // about the water plane (~|dRel| below) displaces it ~2·|dRel| below the camera → when the
+            // dome radius is smaller than that the camera leaves the dome and it only fills the lower
+            // screen ("ends at 5m then black", horizon mismatched), and billboards (the sun disc) are
+            // viewed obliquely (squashed). Mirroring about z = 0 keeps the dome centered on the camera
+            // (fills the screen at any height) and flips its pitch = the reflected sky directions.
+            // (Stage 2 static distant land will mirror about the water plane dRel — different plane.)
+            float M[16] = { 1,0,0,0,  0,1,0,0,  0,0,-1,0,  0,0,0,1 };
+            float mirrorVP[16];
+            mul4x4(M, viewProj, mirrorVP);   // mirror world geom, then the ORIGINAL (pre-reverse-Z) camera
+            // Same reverse-Z + half-pixel edits the main path applies to viewProj (so the reflection
+            // RT is in main-screen space → the water frag samples it at its own screen UV).
+            mirrorVP[2]  = mirrorVP[3]  - mirrorVP[2];
+            mirrorVP[6]  = mirrorVP[7]  - mirrorVP[6];
+            mirrorVP[10] = mirrorVP[11] - mirrorVP[10];
+            mirrorVP[14] = mirrorVP[15] - mirrorVP[14];
+            {
+                const float dx = -1.0f * (-1.0f / (float)g_live.width);
+                const float dy = -1.0f * ( 1.0f / (float)g_live.height);
+                mirrorVP[0]  += dx * mirrorVP[3];  mirrorVP[4]  += dx * mirrorVP[7];
+                mirrorVP[8]  += dx * mirrorVP[11]; mirrorVP[12] += dx * mirrorVP[15];
+                mirrorVP[1]  += dy * mirrorVP[3];  mirrorVP[5]  += dy * mirrorVP[7];
+                mirrorVP[9]  += dy * mirrorVP[11]; mirrorVP[13] += dy * mirrorVP[15];
+            }
+            // Reflect frame cbuffer = a copy of the main frame data (identical lighting/fog/skyParams)
+            // with ONLY the viewProj replaced by the mirror matrix.
+            std::memcpy(g_live.pReflectFrameCbv->pCpuMappedAddress, fcbvR, 256);
+            std::memcpy(g_live.pReflectFrameCbv->pCpuMappedAddress, mirrorVP, 64);
+
+            // pReflectColor SHADER_RESOURCE -> RENDER_TARGET (pReflectDepth stays DEPTH_WRITE).
+            {
+                RenderTargetBarrier rb = {};
+                rb.pRenderTarget = g_live.pReflectColor;
+                rb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                rb.mNewState = RESOURCE_STATE_RENDER_TARGET;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rb);
+            }
+            BindRenderTargetsDesc rbind = {};
+            rbind.mRenderTargetCount = 1;
+            rbind.mRenderTargets[0] = { g_live.pReflectColor, LOAD_ACTION_CLEAR };
+            rbind.mDepthStencil = { g_live.pReflectDepth, LOAD_ACTION_CLEAR };
+            cmdBindRenderTargets(g_live.pCmd, &rbind);
+            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)kReflectSize, (float)kReflectSize, 0.0f, 1.0f);
+            cmdSetScissor(g_live.pCmd, 0, 0, kReflectSize, kReflectSize);
+
+            // Sky draw (mirror): fill the reflect sky buffers + replay the shapes. Cull NONE in the
+            // sky PSO makes the mirror's winding flip irrelevant. Same per-shape data as the main sky
+            // pass (only the bound frame cbuffer differs).
+            const uint32_t haveSkyR = skyBytes / (uint32_t)sizeof(IPC::SkyDrawWire);
+            uint32_t nSkyR = (skyCount < haveSkyR) ? skyCount : haveSkyR;
+            if (nSkyR > kMaxSkyDraws) { nSkyR = kMaxSkyDraws; }
+            const IPC::SkyDrawWire* skyItemsR = (const IPC::SkyDrawWire*)skyBlob;
+            cmdBindPipeline(g_live.pCmd, g_live.pSkyPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflect);   // MIRROR matrix
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetReflectSky);
+            Pipeline* curReflSky = g_live.pSkyPipeline;
+            uint32_t reflSkyDrawn = 0;
+            for (uint32_t k = 0; k < nSkyR; ++k) {
+                const IPC::SkyDrawWire& it = skyItemsR[k];
+                const uint32_t slot = it.slot;
+                if (slot >= g_meshHigh || !g_meshes[slot].valid) continue;
+                HostMesh& m = g_meshes[slot];
+                if (m.skinned || m.multimap) continue;
+                const uint32_t idx = reflSkyDrawn;
+                Pipeline* want = g_live.pSkyPipeline;
+                if (it.srcBlend == kD3DBLEND_SRCALPHA && it.destBlend == kD3DBLEND_ONE) {
+                    want = g_live.pSkyPipelineAdd;
+                }
+                if (want != curReflSky) { cmdBindPipeline(g_live.pCmd, want); curReflSky = want; }
+
+                uint8_t* dst = (uint8_t*)g_live.pReflectSkyWorldsBuf->pCpuMappedAddress;
+                std::memcpy(dst + (size_t)idx * 64, it.world, 64);
+                // WT2 sun-disc fix: the client faces the sun to the MAIN camera, so after the mirror
+                // (M = flip world-z) it faces the REFLECTED camera while we view from the main camera
+                // → foreshortened/squashed. Pre-flip the z-component of its 3 basis rows here; M then
+                // un-flips the rotation (→ faces the view = round) but still mirrors the translation
+                // (→ correct reflected position). Only the flagged sun shape (moons look fine as-is).
+                if (it.isSunDisc) {
+                    float* w = (float*)(dst + (size_t)idx * 64);
+                    w[2]  = -w[2];    // +X basis z
+                    w[6]  = -w[6];    // +Y basis z
+                    w[10] = -w[10];   // +Z basis z
+                }
+                uint32_t* inst = (uint32_t*)g_live.pReflectSkyInstanceBuf->pCpuMappedAddress;
+                inst[idx * kStaticInstU32 + 0] = idx;
+                inst[idx * kStaticInstU32 + 1] = packTexAlpha(it.texIndex, it.alphaRef, it.vColSource);
+                float* finst = (float*)inst;
+                finst[idx * kStaticInstU32 + 2] = it.matColor[0];
+                finst[idx * kStaticInstU32 + 3] = it.matColor[1];
+                finst[idx * kStaticInstU32 + 4] = it.matColor[2];
+                finst[idx * kStaticInstU32 + 11] = it.matAlpha;
+
+                Buffer*  meshVb     = m.inArena ? g_live.pArenaVB : m.vb;
+                Buffer*  meshIb     = m.inArena ? g_live.pArenaIB : m.ib;
+                uint32_t firstVertex = m.inArena ? (uint32_t)(m.vbOff / sizeof(IPC::GeomVertexWire)) : 0u;
+                uint32_t firstIndex  = m.inArena ? (uint32_t)(m.ibOff / sizeof(uint16_t)) : 0u;
+                if (!meshVb || !meshIb) continue;
+                Buffer*  vbs[2]     = { meshVb, g_live.pReflectSkyInstanceBuf };
+                uint32_t strides[2] = { vStride, iStride };
+                cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                cmdBindIndexBuffer(g_live.pCmd, meshIb, INDEX_TYPE_UINT16, 0);
+                cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, firstIndex, 1, firstVertex, idx);
+                ++reflSkyDrawn;
+            }
+
+            static uint32_t s_reflDrawLog = 0;
+            if ((s_reflDrawLog++ % 120) == 0) {
+                LOG::logline(">> [forge][reflect] PASS RAN: nSky=%u drawn=%u waterLvl=%.1f eyeZ=%.1f dRel=%.1f mVP[0,5,10]=%.3f,%.3f,%.4f",
+                             nSkyR, reflSkyDrawn, waterLevelAbs, eyeAbsZ, dRel,
+                             mirrorVP[0], mirrorVP[5], mirrorVP[10]);
+                LOG::flush();
+            }
+
+            // End the reflect pass; pReflectColor RENDER_TARGET -> SHADER_RESOURCE (water samples it).
+            cmdBindRenderTargets(g_live.pCmd, nullptr);
+            {
+                RenderTargetBarrier rb = {};
+                rb.pRenderTarget = g_live.pReflectColor;
+                rb.mCurrentState = RESOURCE_STATE_RENDER_TARGET;
+                rb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rb);
+            }
+        }
+
         // ===================== COLOUR PASS (early-Z: CMP_EQUAL, no depth write) =====================
         BindRenderTargetsDesc bind = {};
         bind.mRenderTargetCount = 1;
@@ -3773,6 +4517,146 @@ namespace ForgeRender {
         // scene and fills the horizon. Cull/ring-fill already ran before recording (dlLiveCullAndBuild).
         dlLiveRecord();
 
+        // ===================== WT1: FORGE WATER SURFACE =====================
+        // Drawn LAST (after near scene + DL) so the whole opaque frame is its refraction/scene-depth
+        // source. Sequence: end the colour pass → copy colorTarget into pRefractColor (refraction src)
+        // → re-bind the colour pass (LOAD/LOAD) → upload the per-LOD-level worlds + packed params +
+        // invVP → draw one indexed-instanced call per clipmap level (DrawIndex=level). Depth GEQUAL +
+        // write so water occludes / is occluded correctly. Gated by waterReady (build) + waterEnabled (F7).
+        if (g_live.waterReady && waterEnabled) {
+            // (1) End the colour pass; copy colorTarget → pRefractColor. CopyResource for 1x; for MSAA
+            // the colour is multisampled → ResolveSubresource into the single-sample refraction copy.
+            cmdBindRenderTargets(g_live.pCmd, nullptr);
+            ID3D12GraphicsCommandList* cl = g_live.pCmd->mDx.pCmdList;
+            ID3D12Resource* colRes  = colorTarget->pTexture->mDx.pResource;
+            ID3D12Resource* refrRes = g_live.pRefractColor->mDx.pResource;
+            const bool msaa = (g_live.sampleCount > 1);
+            {
+                D3D12_RESOURCE_BARRIER pre[2] = {};
+                pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                pre[0].Transition.pResource = colRes;
+                pre[0].Transition.Subresource = 0;
+                pre[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                pre[0].Transition.StateAfter  = msaa ? D3D12_RESOURCE_STATE_RESOLVE_SOURCE
+                                                     : D3D12_RESOURCE_STATE_COPY_SOURCE;
+                pre[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                pre[1].Transition.pResource = refrRes;
+                pre[1].Transition.Subresource = 0;
+                pre[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                                              | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                pre[1].Transition.StateAfter  = msaa ? D3D12_RESOURCE_STATE_RESOLVE_DEST
+                                                     : D3D12_RESOURCE_STATE_COPY_DEST;
+                cl->ResourceBarrier(2, pre);
+            }
+            if (msaa) { cl->ResolveSubresource(refrRes, 0, colRes, 0, DXGI_FORMAT_B8G8R8A8_UNORM); }
+            else      { cl->CopyResource(refrRes, colRes); }
+            {
+                D3D12_RESOURCE_BARRIER post[2] = {};
+                post[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                post[0].Transition.pResource = colRes;
+                post[0].Transition.Subresource = 0;
+                post[0].Transition.StateBefore = msaa ? D3D12_RESOURCE_STATE_RESOLVE_SOURCE
+                                                      : D3D12_RESOURCE_STATE_COPY_SOURCE;
+                post[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                post[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                post[1].Transition.pResource = refrRes;
+                post[1].Transition.Subresource = 0;
+                post[1].Transition.StateBefore = msaa ? D3D12_RESOURCE_STATE_RESOLVE_DEST
+                                                      : D3D12_RESOURCE_STATE_COPY_DEST;
+                post[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                                               | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                cl->ResourceBarrier(2, post);
+            }
+
+            // (2) Build worlds[0..5] (camera-relative, eye-snapped per level), worlds[6]=packed params,
+            // worlds[7]=invVP. The absolute eye for snapping = gFrameData.lodEye (fcbv float 56..58),
+            // valid across null-lighting frames (same source the AO block uses for the eye).
+            const float* fcbv = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
+            const float eyeAbsX = fcbv[56], eyeAbsY = fcbv[57], eyeAbsZ = fcbv[58];
+            const float waterLevelAbs = waterParams ? waterParams[0] : 0.0f;
+            const bool  underwater    = waterParams && waterParams[7] > 0.5f;
+            const float waterZ = waterLevelAbs + (underwater ? 5.0f : -5.0f);
+
+            uint8_t* wbuf = (uint8_t*)g_live.pWaterWorldsBuf->pCpuMappedAddress;
+            for (uint32_t k = 0; k < kWaterLevels; ++k) {
+                const float cell = g_waterLevels[k].cellSize;
+                const float snap = 2.0f * cell;
+                const float originX = std::floor(eyeAbsX / snap) * snap;
+                const float originY = std::floor(eyeAbsY / snap) * snap;
+                // Camera-relative, D3DX row-major: scale(cell,cell,1) · translate(origin-eye, waterZ-eye.z).
+                float m[16] = { cell, 0, 0, 0,  0, cell, 0, 0,  0, 0, 1, 0,
+                                originX - eyeAbsX, originY - eyeAbsY, waterZ - eyeAbsZ, 1 };
+                std::memcpy(wbuf + (size_t)k * 64, m, 64);
+            }
+            // worlds[6] = packed params (4 float4 groups, row-major; the frag transposes to read).
+            {
+                float p[16] = {};
+                p[0] = waterLevelAbs - eyeAbsZ;                 // waterLevelRel (water-cut feature)
+                p[1] = waterParams ? waterParams[1] : 0.013f;  // windFactor
+                p[2] = waterParams ? waterParams[2] : 24.0f;   // shoreDepthBias
+                // Animation time for the normal volume's W axis. MUST be wrapped on the HOST (double)
+                // before the float cast: hostNowMs() is steady_clock-since-BOOT, so seconds is ~1e5-1e6
+                // → float32 ULP ~0.02-0.13s quantizes t into coarse steps ("low frame rate" normals).
+                // The frag does t = 0.4*time and the volume W is REPEAT, so wrapping at period 2.5 keeps
+                // t in [0,1) at full precision AND wraps seamlessly (0.4*2.5 = exactly one W cycle).
+                p[3] = (float)std::fmod(hostNowMs() * 0.001, 2.5);
+                p[4] = waterParams ? waterParams[3] : 0.0f;    // depthBaseColor.r
+                p[5] = waterParams ? waterParams[4] : 0.0f;    // .g
+                p[6] = waterParams ? waterParams[5] : 0.0f;    // .b
+                p[7] = underwater ? 1.0f : 0.0f;
+                p[8]  = waterParams ? waterParams[8]  : 0.0f;  // camFwd.x
+                p[9]  = waterParams ? waterParams[9]  : 0.0f;  // camFwd.y
+                p[10] = waterParams ? waterParams[10] : 1.0f;  // camFwd.z
+                p[11] = waterParams ? waterParams[6] : 0.0f;   // nearViewRange
+                p[12] = g_waterReflOnly ? 1.0f : (g_waterRefrOnly ? 2.0f : 0.0f);  // water debug view
+                std::memcpy(wbuf + 6 * 64, p, 64);
+            }
+            // worlds[7] = invViewProj of the SAME rzViewProj (incl. half-pixel) the GTAO block inverts;
+            // uploaded RAW (the frag does mul(invVP, ndc), identical convention to gtao.comp).
+            {
+                float invVP[16];
+                if (!invert4x4(rzViewProj, invVP)) {
+                    for (int i = 0; i < 16; ++i) { invVP[i] = (i % 5 == 0) ? 1.0f : 0.0f; }
+                }
+                std::memcpy(wbuf + 7 * 64, invVP, 64);
+            }
+
+            // (3) Re-bind the colour pass (LOAD colour, LOAD depth — pDepth is still DEPTH_WRITE) and
+            // draw each clipmap level. Trim variant = eye parity (port of renderwater.cpp:947).
+            BindRenderTargetsDesc wbind = {};
+            wbind.mRenderTargetCount = 1;
+            wbind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };
+            wbind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_LOAD };
+            cmdBindRenderTargets(g_live.pCmd, &wbind);
+            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+            cmdBindPipeline(g_live.pCmd, g_live.pWaterPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);    // gFrameData + gAO + 4 water SRVs
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetWater);
+            Buffer*  wvbs[2]     = { g_live.pWaterVB, g_live.pWaterInstanceBuf };
+            uint32_t wstrides[2] = { 12, (uint32_t)sizeof(uint32_t) };
+            cmdBindVertexBuffer(g_live.pCmd, 2, wvbs, wstrides, nullptr);
+            cmdBindIndexBuffer(g_live.pCmd, g_live.pWaterIB, INDEX_TYPE_UINT16, 0);
+            for (uint32_t k = 0; k < kWaterLevels; ++k) {
+                const WaterLodLevelHost& lvl = g_waterLevels[k];
+                uint32_t variant = 0;
+                if (lvl.numVariants > 1) {
+                    const int ex = (int)(((long long)std::floor(eyeAbsX / lvl.cellSize)) & 1);
+                    const int ey = (int)(((long long)std::floor(eyeAbsY / lvl.cellSize)) & 1);
+                    variant = (uint32_t)(ey * 2 + ex);
+                }
+                if (!lvl.triCount[variant]) continue;
+                // firstInstance = k → the instance VB's DrawIndex[k] = k → gBatch.worlds[k].
+                // BaseVertexLocation = 0: the indices ALREADY include each level's vertBase (the vidx
+                // lambda bakes it in, like MGE's DrawIndexedPrimitive with BaseVertexIndex=0). Passing
+                // vertBase here too DOUBLE-offset levels 1..5 → only level 0 drew (~1 cell of coverage).
+                cmdDrawIndexedInstanced(g_live.pCmd, lvl.triCount[variant] * 3,
+                                        lvl.ibStart[variant], 1, 0, k);
+            }
+        }
+
         cmdBindRenderTargets(g_live.pCmd, nullptr);
 
         if (g_live.sampleCount > 1) {
@@ -3934,6 +4818,16 @@ namespace ForgeRender {
         abpd.mComputeDesc.pShaderProgram = g_live.pAOBlurShader;
         addPipeline(R, &abpd, &g_live.pAOBlurPipeline);
         LOG::logline(">> [forge] compute shaders hot-reloaded (gtao.comp + aoblur.comp + %s)", linName); LOG::flush();
+
+        // GRAPHICS hot-reload: also rebuild the water pipeline so water.vert/.frag edits go live on
+        // the same trigger (the fsl.py watcher recompiles ALL dxil and bumps gtao's mtime LAST, so
+        // water's fresh dxil is already on disk here). The persistent water resources/buffers/sets
+        // are untouched — only the shader + PSO are swapped. Skipped cleanly if water isn't built.
+        if (g_live.pWaterPipeline || g_live.pWaterShader) {
+            if (buildWaterPipeline(R)) {
+                LOG::logline(">> [forge][water] water graphics pipeline hot-reloaded (water.vert + water.frag)"); LOG::flush();
+            }
+        }
     }
 
     // Auto hot-reload: poll the gtao dxil's mtime (CWD = morrowind64, same dir the loader reads from)
@@ -4141,10 +5035,8 @@ namespace ForgeRender {
         removeResource(pRb);
     }
 
-    // --- Phase 2: DDS parse + bindless texture upload ---------------------------------
-    static uint32_t ddsRd32(const uint8_t* p) {
-        return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-    }
+    // --- Phase 2: DDS parse + bindless texture upload --------------------------------- (ddsRd32
+    // is defined above, ahead of the WT1 water volume loader which also needs it.)
     struct DdsInfo {
         TinyImageFormat fmt = TinyImageFormat_UNDEFINED;
         uint32_t width = 0, height = 0, mipLevels = 0, dataOffset = 0;
@@ -5995,6 +6887,24 @@ namespace ForgeRender {
         if (g_live.pSkyPipeline)            { removePipeline(R, g_live.pSkyPipeline); }
         if (g_live.pSkyPipelineAdd)         { removePipeline(R, g_live.pSkyPipelineAdd); }
         if (g_live.pSkyShader)              { removeShader(R, g_live.pSkyShader); }
+        // WT1 water teardown.
+        if (g_live.pPerBatchSetWater)       { removeDescriptorSet(R, g_live.pPerBatchSetWater); }
+        if (g_live.pWaterWorldsBuf)         { removeResource(g_live.pWaterWorldsBuf); }
+        if (g_live.pWaterInstanceBuf)       { removeResource(g_live.pWaterInstanceBuf); }
+        if (g_live.pWaterVB)                { removeResource(g_live.pWaterVB); }
+        if (g_live.pWaterIB)                { removeResource(g_live.pWaterIB); }
+        if (g_live.pRefractColor)           { removeResource(g_live.pRefractColor); }
+        if (g_live.pWaterNormalVol)         { removeResource(g_live.pWaterNormalVol); }
+        if (g_live.pWaterPipeline)          { removePipeline(R, g_live.pWaterPipeline); }
+        if (g_live.pWaterShader)            { removeShader(R, g_live.pWaterShader); }
+        // WT2 reflection teardown.
+        if (g_live.pPerFrameSetReflect)     { removeDescriptorSet(R, g_live.pPerFrameSetReflect); }
+        if (g_live.pPerBatchSetReflectSky)  { removeDescriptorSet(R, g_live.pPerBatchSetReflectSky); }
+        if (g_live.pReflectFrameCbv)        { removeResource(g_live.pReflectFrameCbv); }
+        if (g_live.pReflectSkyWorldsBuf)    { removeResource(g_live.pReflectSkyWorldsBuf); }
+        if (g_live.pReflectSkyInstanceBuf)  { removeResource(g_live.pReflectSkyInstanceBuf); }
+        if (g_live.pReflectColor)           { removeRenderTarget(R, g_live.pReflectColor); }
+        if (g_live.pReflectDepth)           { removeRenderTarget(R, g_live.pReflectDepth); }
         // Phase 1a distant-land teardown (atlas textures freed by the bindless loop below).
         for (uint32_t i = 0; i < g_landMeshCount; ++i) {
             if (g_landMeshes[i].vb) { removeResource(g_landMeshes[i].vb); g_landMeshes[i].vb = nullptr; }

@@ -89,6 +89,18 @@ BEGIN_SRT_NO_AB(SrtData)
         // compute SRTs already pair SRV+UAV in a single set (LinDepth/AO PerBatch). Tier 3 will read
         // this unconditionally to modulate ambient.
         DECL_TEXTURE(PerFrame, Tex2D(float4), gAO)
+        // Forge water takeover (WT1). Appended AFTER gAO so gFrameData(CBV)/gAO(t0) keep their
+        // offsets — opaque/skinned/multimap/sky frags never sample these (harmless null tail). Bound
+        // once into pPerFrameSet (stable descriptors; the refraction/reflect CONTENTS change per
+        // frame, the views don't). Only water.frag reads them.
+        //   gWaterNormalVol = water_NRM.dds as a 3D animated-normal volume (rg = normal, a = height).
+        //   gRefractColor   = host copy of the pre-water colour target (refraction source).
+        //   gSceneLinDepth  = pLinearDepth (RAW reverse-Z DEVICE depth; near=1 far=0) for shoreline.
+        //   gReflectColor   = reflection RT (WT1 = stand-in / unused; WT2 fills it with the mirror pass).
+        DECL_TEXTURE(PerFrame, Tex3D(float4), gWaterNormalVol)
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gRefractColor)
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gSceneLinDepth)
+        DECL_TEXTURE(PerFrame, Tex2D(float4), gReflectColor)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has

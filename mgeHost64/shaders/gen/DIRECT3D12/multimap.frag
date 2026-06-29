@@ -1033,8 +1033,20 @@ STRUCT(LightData)
 
 
 
+
+
+
+
+        Tex3D(float4) gWaterNormalVol :  register(t2,space1);
+        Tex2D(float4) gRefractColor :  register(t3,space1);
+        Tex2D(float4) gSceneLinDepth :  register(t4,space1);
+        Tex2D(float4) gReflectColor :  register(t5,space1);
+
+
+
+
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 111 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 123 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 896 ] :  register(t0,space0);
 
 
