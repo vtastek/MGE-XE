@@ -747,6 +747,14 @@ void DistantLand::renderStageWater() {
         return;
     }
 
+    // WT3: Forge owns the water → skip MGE's replacement water plane entirely (analogous to the SK3
+    // sky gate). Both call sites still suppress MW's own raw water grid (the d3d8device water-material
+    // path returns D3D_OK after this no-op), so with Forge water ON exactly ONE surface draws: Forge's.
+    // OFF → MGE water draws unchanged (clean F7 A/B). Gated on wantsWaterCapture (F11 composite + F7).
+    if (RenderProcess::wantsWaterCapture()) {
+        return;
+    }
+
     if (mwBridge->CellHasWater()) {
         // Save state block manually since we can change FVF/decl
         device->CreateStateBlock(D3DSBT_ALL, &stateSaved);

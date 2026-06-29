@@ -208,6 +208,11 @@ namespace IPC {
         float         matColor[3]; // material diffuse rgb
         float         matAlpha;    // material alpha (weather/night fade; 1 = opaque)
         std::uint32_t vColSource;  // 0 none (const material), 1 emissive, 2 diffamb
+        // WT2 reflection: this shape is the SUN DISC (client re-billboards it to face the MAIN
+        // camera, buildSkyDrawList). The Forge reflection pass needs to flip its basis-z before the
+        // mirror so it stays round in the mirrored view (the moons arrive camera-faced too but look
+        // fine, so only the sun is flagged). 0 for every other sky shape. Appended (offset-stable).
+        std::uint32_t isSunDisc;
     };
 
     // Per-frame sky draw cap. SK1 draws only the dome; the full sky subtree is ~15 shapes (SK2).

@@ -103,7 +103,10 @@ namespace ForgeRender {
                      const void* skinnedBlob, unsigned skinnedCount, unsigned skinnedBytes,
                      const void* multiMapBlob, unsigned multiMapCount, unsigned multiMapBytes,
                      const void* lightBlob, unsigned lightCount, unsigned lightBytes,
-                     const void* skyBlob = nullptr, unsigned skyCount = 0, unsigned skyBytes = 0);
+                     const void* skyBlob = nullptr, unsigned skyCount = 0, unsigned skyBytes = 0,
+                     // WT1: per-frame water params (12 floats; see bridge.h RenderFrameParameters)
+                     // + the F7 water-enable gate. Null/0 ⇒ no Forge water pass this frame.
+                     const float* waterParams = nullptr, unsigned waterEnabled = 0);
 
     // F12 debug view: 0 = normal, 1 = depth (world-distance grayscale), 2 = scatter (client-side).
     // Stored in a host global and written into FrameData.debugParams.x each renderScene.

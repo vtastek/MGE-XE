@@ -579,7 +579,8 @@ namespace IPC {
 				skinnedPtr, params.skinnedCount, skinnedBytes,
 				multiMapPtr, params.multiMapCount, multiMapBytes,
 				lightPtr, params.lightCount, lightBytes,
-				skyPtr, params.skyCount, skyBytes);
+				skyPtr, params.skyCount, skyBytes,
+				params.waterParams, params.waterEnabled);
 			if (logScene) {
 				LOG::logline(">> [scene] renderScene DONE ok=%d drawn=%u skinned=%u",
 					(int)ok, ForgeRender::lastDrawn(), ForgeRender::lastSkinnedDrawn());

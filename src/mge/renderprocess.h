@@ -39,6 +39,12 @@ namespace RenderProcess {
     // walk only runs when the host will actually draw it.
     bool wantsSkyCapture();
 
+    // WT1 Forge water takeover: true when the seam is live AND compositing (F11) AND the Forge water
+    // pass is toggled ON (F7). No geometry capture (the host generates the geo-clipmap mesh); this
+    // gates the per-frame water-params crossing and, later (WT3), suppression of MGE's own water +
+    // reflection passes. Default OFF → MGE water draws (clean A/B).
+    bool wantsWaterCapture();
+
     // True when the Forge seam is live AND compositing (F11 on): the host renders the opaque
     // world and the full-screen composite overwrites MW's frame at present. While true, the
     // engine's own scene-0 covered-opaque draw is redundant (overwritten) — DistantLand

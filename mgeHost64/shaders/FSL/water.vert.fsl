@@ -1,0 +1,39 @@
+// mgeHost64 — Forge water takeover (vertex stage, WT1).
+//
+// Host-generated geo-clipmap water. Position-only model verts (a local integer lattice on z=0,
+// stride 12 — like MGE's WaterDecl) + a per-INSTANCE DrawIndex that selects this LOD level's
+// world matrix from gBatch.worlds (camera-relative, eye-snapped; the host fills worlds[0..5] with
+// the 6 clipmap levels, like the sky path's gBatch window). Camera from gFrameData.viewProj
+// (reverse-Z + half-pixel already baked by the host). Height = 0 in WT1 (Gerstner crest
+// displacement is a follow-up). Shares opaque.srt.h / DefaultRootSignature + the column-major /
+// reverse-Z matrix convention as opaque.vert (mul(M, v) == D3DX row-vector v*M).
+//
+// gBatch.worlds reserved tail (host-written each frame): [6] = WaterData params, [7] = invViewProj.
+// The frag reads them; the VS only needs the per-level world (worlds[DrawIndex]).
+
+#include "opaque.srt.h"
+
+STRUCT(VSInput)
+{
+    DATA(float3, Position,  POSITION);     // model-space lattice vertex (z = 0)
+    DATA(uint,   DrawIndex, TEXCOORD1);    // per-instance: clipmap level 0..5 → gBatch.worlds[level]
+};
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float3, WorldPos, TEXCOORD0);     // camera-relative world position (eyePos == 0 this frame)
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+VSOutput VS_MAIN( VSInput In )
+{
+    INIT_MAIN;
+    VSOutput Out;
+
+    float4x4 world = gBatch.worlds[In.DrawIndex];   // per-LOD-level world (scale·snap·translate)
+    float4 worldPos = mul(world, float4(In.Position, 1.0f));
+    Out.WorldPos = worldPos.xyz;
+    Out.Position = mul(gFrameData.viewProj, worldPos);
+    RETURN(Out);
+}

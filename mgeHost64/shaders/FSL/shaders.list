@@ -87,6 +87,17 @@
 #include "statics.frag.fsl"
 #end
 
+// Forge water takeover (WT1): host-generated geo-clipmap water. Position-only verts + per-instance
+// clipmap level; reuses opaque.srt.h / DefaultRootSignature (worlds+params ride gBatch, 4 water SRVs
+// appended to the PerFrame set). Depth-write reverse-Z GEQUAL, cull NONE, frag outputs alpha=1.
+#vert water.vert
+#include "water.vert.fsl"
+#end
+
+#frag water.frag
+#include "water.frag.fsl"
+#end
+
 // --- Tier 2 depth-takeover compute passes (ComputeRootSignature) ---
 // Linearize/resolve: two SAMPLE_COUNT variants; host picks by g_live.sampleCount at pipeline build.
 #comp linearizedepth_sc1.comp

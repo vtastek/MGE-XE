@@ -336,6 +336,16 @@ namespace IPC {
         // Appended after the light-list fields so existing field offsets are unchanged.
         IN std::uint32_t debugMode;
 
+        // Forge water takeover (WT1): per-frame water surface params (NO geometry — the host
+        // generates the geo-clipmap mesh itself). waterEnabled (F7) gates the host water pass.
+        //   [0] waterLevel (absolute world Z)      [6] nearViewRange
+        //   [1] windFactor                         [7] underwater (0/1)
+        //   [2] shoreDepthBias                     [8..10] camFwd.xyz (world view forward)
+        //   [3..5] depthBaseColor.rgb              [11] reserved
+        // Appended after debugMode so every existing field offset is unchanged.
+        IN float waterParams[12];
+        IN std::uint32_t waterEnabled;
+
         // Dev overlay input bridge (Stage 2): the headless host has no window/InputSystem, so the
         // client polls the mouse (client-space pixels) + a visibility toggle and forwards it here
         // each frame. The host pushes these into Forge UI via uiSetExternalInput. devMouseButtons
