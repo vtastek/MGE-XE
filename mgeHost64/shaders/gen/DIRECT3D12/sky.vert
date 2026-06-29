@@ -958,9 +958,9 @@ SamplerState gSamplerAnisotropic : register( s10 , space100 ) ;
 #line 167 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 30 "FSL/shaders.list"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.vert.fsl"
-#line 7 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.vert.fsl"
+#line 61 "FSL/shaders.list"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sky.vert.fsl"
+#line 16 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sky.vert.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(FrameData)
@@ -1041,38 +1041,29 @@ STRUCT(LightData)
 
         Tex2DArray(float4) gStaticsArrays[ 128 ] :  register(t896,space0);
         CBUFFER(BatchData) gBatch :  register(b0,space2);
-#line 8 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.vert.fsl"
+#line 17 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sky.vert.fsl"
 
 STRUCT(VSInput)
 {
     DATA(float3, Position, POSITION);
-    DATA(float3, Normal, NORMAL);
     DATA(float2, Uv, TEXCOORD0);
     DATA(float4, Color, COLOR);
     DATA(uint, DrawIndex, TEXCOORD1);
     DATA(uint, TexAlpha, TEXCOORD2);
     DATA(float3, MatDiffuse, TEXCOORD3);
-    DATA(float3, MatAmbient, TEXCOORD4);
-    DATA(float3, MatEmissive,TEXCOORD5);
-    DATA(uint, OverlayIndex,TEXCOORD6);
-#line 21
+    DATA(uint, MatAlphaBits,TEXCOORD6);
+#line 27
 };
 
 STRUCT(VSOutput)
 {
     DATA(float4, Position, SV_Position);
-    DATA(float3, Normal, NORMAL);
     DATA(float2, Uv, TEXCOORD0);
-    DATA(FLAT(uint), TexIndex, TEXCOORD1);
-    DATA(float, Fog, TEXCOORD2);
     DATA(float4, Color, COLOR);
-    DATA(float, AlphaRef, TEXCOORD3);
-    DATA(FLAT(float3),MatDiffuse, TEXCOORD4);
-    DATA(FLAT(float3),MatAmbient, TEXCOORD5);
-    DATA(FLAT(float3),MatEmissive,TEXCOORD6);
-    DATA(FLAT(uint), VColSource, TEXCOORD7);
-    DATA(float3, WorldPos, TEXCOORD8);
-    DATA(FLAT(uint), OverlayIndex,TEXCOORD9);
+    DATA(FLAT(uint), TexIndex, TEXCOORD1);
+    DATA(FLAT(float3),MatDiffuse, TEXCOORD2);
+    DATA(FLAT(uint), VColSource, TEXCOORD3);
+    DATA(FLAT(float), MatAlpha, TEXCOORD4);
 #line 38
 };
 
@@ -1082,29 +1073,15 @@ VSOutput VS_MAIN( VSInput In )
     //INIT_MAIN;
     VSOutput Out;
 
-
     float4x4 world = gBatch.worlds[In.DrawIndex];
-
-
     float4 worldPos = mul(world, float4(In.Position, 1.0f));
     Out.Position = mul(gFrameData.viewProj, worldPos);
-    Out.Normal = mul((float3x3)world, In.Normal);
-    Out.WorldPos = worldPos.xyz;
     Out.Uv = In.Uv;
-
-    Out.TexIndex = In.TexAlpha & 0xFFFFu;
-    Out.AlphaRef = float((In.TexAlpha >> 16u) & 0xFFu) * (1.0f / 255.0f);
-    Out.VColSource = (In.TexAlpha >> 24u) & 0x3u;
     Out.Color = In.Color;
+    Out.TexIndex = In.TexAlpha & 0xFFFFu;
+    Out.VColSource = (In.TexAlpha >> 24u) & 0x3u;
     Out.MatDiffuse = In.MatDiffuse;
-    Out.MatAmbient = In.MatAmbient;
-    Out.MatEmissive = In.MatEmissive;
-    Out.OverlayIndex = In.OverlayIndex;
-
-
-    float dist = length(worldPos.xyz - gFrameData.eyePos.xyz);
-    Out.Fog = saturate((gFrameData.fogParams.y - dist)
-                       / (gFrameData.fogParams.y - gFrameData.fogParams.x));
+    Out.MatAlpha = asfloat(In.MatAlphaBits);
     return (Out);
 }
-#line 31 "FSL/shaders.list"
+#line 62 "FSL/shaders.list"

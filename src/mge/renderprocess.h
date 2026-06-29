@@ -33,6 +33,12 @@ namespace RenderProcess {
     // seam is live and wants static opaque geometry. Avoids any cost when off.
     bool wantsGeometryCapture();
 
+    // SK1 sky takeover: true when the Forge seam is live AND compositing AND the Forge sky pass
+    // is toggled ON (F7). Gates the cache's skyRoot walk + the per-frame sky draw list. Default
+    // OFF → MW's own sky is untouched (clean A/B). Independent of wantsGeometryCapture so the sky
+    // walk only runs when the host will actually draw it.
+    bool wantsSkyCapture();
+
     // True when the Forge seam is live AND compositing (F11 on): the host renders the opaque
     // world and the full-screen composite overwrites MW's frame at present. While true, the
     // engine's own scene-0 covered-opaque draw is redundant (overwritten) — DistantLand
@@ -62,9 +68,13 @@ namespace RenderProcess {
     // skipped the re-upload and the slot kept the previous mesh ("barrel for head"). The
     // GeometryData ptr differs on reuse → forces the re-upload. Morphed parts keep their
     // data ptr but bump revisionID, so they still refresh.
+    // `forceReupload` (SK1 sky) bypasses the (modelId, vertexCount, revision) dedup so a part whose
+    // vertex data changes WITHOUT a revisionID bump (the sky dome's per-frame gradient) re-ships
+    // every frame. Default false keeps every existing caller's dedup behaviour.
     void captureGeometry(std::uint32_t key, std::uint16_t revision, std::uint32_t modelId,
                          const IPC::GeomVertexWire* verts, std::uint32_t vertexCount,
-                         const std::uint16_t* indices, std::uint32_t indexCount);
+                         const std::uint16_t* indices, std::uint32_t indexCount,
+                         bool forceReupload = false);
 
     // M-Skinning: capture a skinned part's bind-pose VB (model-space pos/normal +
     // per-vertex weights + packed bone indices). Like captureGeometry it assigns/reuses a

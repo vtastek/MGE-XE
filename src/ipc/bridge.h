@@ -324,6 +324,14 @@ namespace IPC {
         IN std::uint32_t lightCount;
         IN std::uint32_t lightBytes;
 
+        // SK1 sky takeover: per-frame sky draw list of SkyDrawWire[] (geomwire.h) — alpha-blended
+        // sky shapes (SK1 = the gradient atmosphere dome), drawn FIRST in the host colour pass with
+        // depth off so they sit behind the opaque world. Invalid / count 0 ⇒ no Forge sky this frame
+        // (Forge sky toggle off → MW's own sky shows). Grouped with the other per-frame lists.
+        IN VecId skyList;
+        IN std::uint32_t skyCount;
+        IN std::uint32_t skyBytes;
+
         // F12 debug view: 0 = normal, 1 = depth (world-distance grayscale), 2 = scatter.
         // Appended after the light-list fields so existing field offsets are unchanged.
         IN std::uint32_t debugMode;

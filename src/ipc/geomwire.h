@@ -187,6 +187,33 @@ namespace IPC {
     // host MAX_POINT_LIGHTS (opaque.srt.h) and kMaxPointLights (forgerender.cpp).
     constexpr std::uint32_t kMaxPointLights = 128;
 
+    // SK1 sky takeover: per-frame sky draw item — an alpha-blended sky shape (SK1 = the gradient
+    // atmosphere dome). Like DrawItemWire it references an uploaded mesh slot + its camera-relative
+    // world (D3DXMATRIX bytes, row-major). texIndex 0 = vertex-colour-only (the dome); SK2 textured
+    // shapes carry a real bindless slot. srcBlend/destBlend are D3DBLEND_* (translated from
+    // NiAlphaProperty); SK1 draws SRCALPHA/INVSRCALPHA, so the host ignores them for now and SK2
+    // buckets draws by blend-pair. Drawn FIRST in the host colour pass (depth off) so it sits behind
+    // the opaque world. 108 bytes.
+    struct SkyDrawWire {
+        std::uint32_t slot;
+        float         world[16];
+        std::uint32_t texIndex;    // bindless gTextures[] slot (0 = vertex-colour-only dome)
+        std::uint32_t srcBlend;    // D3DBLEND_* source factor (SK2: bucket draws by blend-pair)
+        std::uint32_t destBlend;   // D3DBLEND_* dest factor
+        float         alphaRef;    // alpha-test ref 0..1 (0 = no test)
+        // SK2 FFP modulation: the captured MaterialProperty diffuse rgb + per-element alpha
+        // fade (= matDiffuse[3]: star night-fade, cloud cross-fade). vColSource routes the
+        // frag between vertex colour (dome/stars) and the constant material (moon disc/shadow),
+        // mirroring opaque.frag. The frag does c = tex * base; c.a *= matAlpha.
+        float         matColor[3]; // material diffuse rgb
+        float         matAlpha;    // material alpha (weather/night fade; 1 = opaque)
+        std::uint32_t vColSource;  // 0 none (const material), 1 emissive, 2 diffamb
+    };
+
+    // Per-frame sky draw cap. SK1 draws only the dome; the full sky subtree is ~15 shapes (SK2).
+    // MUST match the host kMaxSkyDraws (forgerender.cpp).
+    constexpr std::uint32_t kMaxSkyDraws = 64;
+
 #pragma pack(pop)
 
     // Transport chunk for the shared upload vector. The IPC Vec reserves

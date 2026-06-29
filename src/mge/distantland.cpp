@@ -399,7 +399,8 @@ void DistantLand::renderStage0() {
             // sky where present, so moving sky ahead of it leaves the image unchanged.
             // (Was drawn after cache near; "as late as possible" is satisfied relative
             // to the distant passes, which is what the horizon blend needs.)
-            if ((Configuration.MGEFlags & USE_ATM_SCATTER) && mwBridge->CellHasWeather()) {
+            if ((Configuration.MGEFlags & USE_ATM_SCATTER) && mwBridge->CellHasWeather()
+                && !RenderProcess::wantsSkyCapture()) {       // SK3: Forge owns the sky → don't draw MGE's
                 renderSky();
             }
 

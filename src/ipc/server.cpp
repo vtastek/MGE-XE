@@ -504,7 +504,7 @@ namespace IPC {
 		LARGE_INTEGER t0; QueryPerformanceCounter(&t0);
 		bool ok;
 		if (params.drawList != InvalidVector || params.skinnedList != InvalidVector
-			|| params.multiMapList != InvalidVector) {
+			|| params.multiMapList != InvalidVector || params.skyList != InvalidVector) {
 			// M1c/M-Skinning scene path: static DrawItemWire[] (drawList) and/or skinned
 			// [SkinnedDrawWire][palette]* (skinnedList) + inline camera. Either may be Invalid.
 			const void* drawPtr = nullptr;
@@ -551,6 +551,17 @@ namespace IPC {
 				}
 				lightPtr = lvec.size() ? &lvec[0] : nullptr;
 			}
+			const void* skyPtr = nullptr;
+			std::uint32_t skyBytes = 0;
+			if (params.skyList != InvalidVector) {
+				auto& kvec = getVec<IPC::GeomChunk>(params.skyList);
+				const std::uint32_t kavail = kvec.size() * static_cast<std::uint32_t>(sizeof(IPC::GeomChunk));
+				skyBytes = params.skyBytes;
+				if (skyBytes == 0 || skyBytes > kavail) {
+					skyBytes = kavail;
+				}
+				skyPtr = kvec.size() ? &kvec[0] : nullptr;
+			}
 			static unsigned s_sceneLog = 0;
 			const bool logScene = (s_sceneLog++ % 60) == 0;
 			if (logScene) {
@@ -567,7 +578,8 @@ namespace IPC {
 			ok = ForgeRender::renderScene(params.viewProj, params.lighting, drawPtr, params.drawCount, bytes,
 				skinnedPtr, params.skinnedCount, skinnedBytes,
 				multiMapPtr, params.multiMapCount, multiMapBytes,
-				lightPtr, params.lightCount, lightBytes);
+				lightPtr, params.lightCount, lightBytes,
+				skyPtr, params.skyCount, skyBytes);
 			if (logScene) {
 				LOG::logline(">> [scene] renderScene DONE ok=%d drawn=%u skinned=%u",
 					(int)ok, ForgeRender::lastDrawn(), ForgeRender::lastSkinnedDrawn());

@@ -11,6 +11,8 @@
 #include "morrowindbsa.h"
 
 #include <windows.h>
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -30,6 +32,7 @@ namespace {
     IPC::Client* g_client = nullptr;
     bool   g_initOk  = false;
     bool   g_enabled = true;           // composite ON by default; F11 toggles it OFF/ON
+    bool   g_skyEnabled = false;       // SK1 Forge sky pass OFF by default; F7 toggles it ON/OFF (clean A/B vs MW sky)
     int    g_debugMode = 0;            // F12 diagnostic cycle: 0=normal, 1=depth (world-distance), 2=scatter, 3=AO, 4=bent normal
     unsigned g_frame = 0;
 
@@ -75,6 +78,7 @@ namespace {
     std::optional<IPC::VecView<IPC::GeomChunk>> g_skinnedVec;       // persistent per-frame skinned draw-list vec
     std::optional<IPC::VecView<IPC::GeomChunk>> g_multiMapVec;      // persistent per-frame multi-map draw-list vec (Tier 4)
     std::optional<IPC::VecView<IPC::GeomChunk>> g_lightVec;         // persistent per-frame point-light vec (Tier 3a)
+    std::optional<IPC::VecView<IPC::GeomChunk>> g_skyVec;           // persistent per-frame sky draw-list vec (SK1)
     std::vector<std::uint8_t>                 g_pendingBlob;        // packed parts awaiting flush
     std::uint32_t                             g_pendingParts = 0;
     std::unordered_map<std::uint32_t, std::uint32_t> g_keySlot;    // cache key -> host slot
@@ -88,6 +92,7 @@ namespace {
     std::vector<std::uint8_t>                 g_skinnedScratch;     // packed [SkinnedDrawWire][palette]* this frame
     std::vector<std::uint8_t>                 g_multiMapScratch;    // packed MultiMapDrawWire[] this frame (Tier 4)
     std::vector<std::uint8_t>                 g_lightScratch;       // packed PointLightWire[] this frame
+    std::vector<std::uint8_t>                 g_skyScratch;         // packed SkyDrawWire[] this frame (SK1)
 
     // --- Phase 2 bindless texture residency (client) ---
     // Each unique texture (by normalized name) gets a dense bindless slot; its raw DDS bytes
@@ -601,6 +606,15 @@ namespace {
             g_lightVec.emplace(std::move(*lv));
         }
 
+        // Sky draw list (SK1) rides its own 1-chunk vec — kMaxSkyDraws * 88B ≈ 5.6KB, far under 1MB.
+        // SkyDrawWire[] alpha-blended sky shapes, rebuilt each frame from the cache's isSky entries.
+        auto kv = g_client->allocVecBlocking<IPC::GeomChunk>(1, 1, 1);
+        if (!kv) {
+            LOG::logline("!! [seam] sky draw-list vec alloc failed — Forge sky (SK1) disabled");
+        } else {
+            g_skyVec.emplace(std::move(*kv));
+        }
+
         // Texture upload vec: kTexChunks (32MB window) — larger than geometry because a single DDS
         // must fit one window (oversize textures are dropped to white in resolveTextureSlot).
         auto tv = g_client->allocVecBlocking<IPC::GeomChunk>(
@@ -860,6 +874,7 @@ namespace {
             //     every skinned entry — drawing a stride-44 skinned VB through the stride-24
             //     static pipeline would garble it.
             // Terrain now draws (near worldLandscapeRoot patches; flat-shaded geometry).
+            if (e.isSky) continue;   // sky rides the Forge alpha-blend sky pass (buildSkyDrawList)
             if (!e.d3dTexture) continue;
             if (!e.isLandscape && e.blendEnable) continue;
             if (e.isSkinned) continue;
@@ -949,6 +964,7 @@ namespace {
             const auto& e = ce->second;
             // Only GPU-skinnable parts: a built skinned VB, bones within the palette cap,
             // and a current bone palette of the expected size.
+            if (e.isSky) continue;   // sky rides the Forge alpha-blend sky pass (buildSkyDrawList)
             if (!e.isSkinned || e.skinnedUnsupported || e.numBones == 0) {
                 continue;
             }
@@ -1014,6 +1030,7 @@ namespace {
             const auto& e = ce->second;
             // Must match the capture-side isMultiMap condition + the static loop's filters:
             // non-landscape, textured, opaque, non-skinned, with a dark/detail/glow sibling.
+            if (e.isSky) continue;   // sky rides the Forge alpha-blend sky pass (buildSkyDrawList)
             if (e.isLandscape || e.isSkinned || !e.d3dTexture) continue;
             if (e.blendEnable) continue;
             if (!(e.d3dDark || e.d3dDetail || e.d3dGlow)) continue;
@@ -1112,6 +1129,104 @@ namespace {
         }
         return count;
     }
+
+    // SK1 sky takeover: gather this frame's sky parts into g_skyScratch as SkyDrawWire[]. Source is
+    // the WHOLE geometry cache (sky shapes are NOT in DistantLand::visibleCacheKeys — that's the MSOC
+    // world-object drawn set), filtered to isSky entries that have a host slot. SK1 emits ONLY the
+    // dome: the untextured vertex-colour shape (isSky && !d3dTexture); SK2 adds the textured shapes
+    // (sun/moons/clouds/stars). Camera-relative shift matches the host's translation-free viewProj
+    // (the sky is camera-attached). Only runs when the Forge sky pass is toggled on (F7), so the
+    // full-cache scan is paid only during the A/B. Returns the packed item count.
+    std::uint32_t buildSkyDrawList() {
+        if (!g_skyVec || !g_skyEnabled) {
+            return 0;
+        }
+        const auto& cacheMap = MGE::GeometryCache::cache();
+
+        g_skyScratch.clear();
+        // SK2: gather every isSky entry that has a host slot (dome + textured sun/moons/stars),
+        // then sort by skyOrder (MW's back-to-front subtree order) so the alpha-blended shapes
+        // layer correctly — the cache is an unordered_map, so we can't rely on iteration order.
+        struct SkyCand { std::uint16_t order; const MGE::GeometryCache::CachedGeometry* e; std::uint32_t slot; };
+        static std::vector<SkyCand> cands;   // single-threaded; reused frame-to-frame
+        cands.clear();
+        for (const auto& kv : cacheMap) {
+            const auto& e = kv.second;
+            if (!e.isSky) continue;
+            auto ks = g_keySlot.find(kv.first);
+            if (ks == g_keySlot.end()) {
+                continue;   // not yet uploaded to the host
+            }
+            cands.push_back({ e.skyOrder, &e, ks->second });
+        }
+        std::sort(cands.begin(), cands.end(),
+                  [](const SkyCand& a, const SkyCand& b) { return a.order < b.order; });
+
+        IPC::SkyDrawWire item;
+        std::uint32_t count = 0;
+        for (const auto& c : cands) {
+            const auto& e = *c.e;
+            item.slot      = c.slot;
+            // Dome stays 0 (vertex-colour only → host default white); textured shapes resolve
+            // their DDS to a bindless slot via the existing residency path.
+            item.texIndex  = e.d3dTexture ? resolveTextureSlot(e.textureName) : 0u;
+            item.srcBlend  = e.srcBlend;
+            item.destBlend = e.destBlend;
+            item.alphaRef  = e.alphaTest ? e.alphaRef : 0.0f;
+            // SK2 FFP modulation: material diffuse rgb + per-element alpha fade + vcol routing,
+            // exactly as buildDrawList ships for opaques.
+            item.matColor[0] = e.matDiffuse[0];
+            item.matColor[1] = e.matDiffuse[1];
+            item.matColor[2] = e.matDiffuse[2];
+            item.matAlpha    = e.matDiffuse[3];
+            item.vColSource  = (e.hasVertexColor && e.vColSource != 0) ? e.vColSource : 0u;
+            memcpy(item.world, e.worldTransformD3D, 16 * sizeof(float));
+            // SK2 billboard fix (SUN ONLY): the sun disc hangs under a NiBillboardNode that MW
+            // re-faces to the camera each frame via rotateToCamera — but that runs AFTER our
+            // onFrameReady scene walk, so e.worldTransformD3D still holds the billboard's BASE
+            // celestial-sphere (tangent) orientation. Replayed verbatim the quad is a flat plate
+            // tangent to the sky sphere: round looking straight at it (zenith), squashed at grazing
+            // angles (near the horizon). The two-part MOONS are also 4-vert/2-tri textured quads but
+            // arrive ALREADY camera-faced in their captured transform (re-billboarding them broke
+            // their facing in-game), so leave those alone — gate on the sun's base-texture name
+            // ("tx_sun_05" — the moons are tx_masser/tx_secunda/tx_mooncircle, no "sun"). Rebuild a
+            // camera-facing basis: preserve position (translation) + per-axis size; orient model
+            // +X -> camera right, +Y -> camera up (spherical / full-facing → always round = vanilla).
+            bool isSunDisc = false;
+            if (e.d3dTexture && e.textureName && e.vertexCount == 4 && e.triangleCount == 2) {
+                // case-insensitive substring "sun" (|32 lowercases ASCII letters; loop guard keeps
+                // the p[1]/p[2] look-ahead inside the null-terminated string).
+                for (const char* p = e.textureName; p[0] && p[1] && p[2]; ++p) {
+                    if ((p[0] | 32) == 's' && (p[1] | 32) == 'u' && (p[2] | 32) == 'n') { isSunDisc = true; break; }
+                }
+            }
+            if (isSunDisc) {
+                const D3DXMATRIX& V = DistantLand::mwView;  // row-vector view: columns = world camera axes
+                const float* m = item.world;
+                const float sx = sqrtf(m[0]*m[0] + m[1]*m[1] + m[2]*m[2]);     // model +X length (width)
+                const float sy = sqrtf(m[4]*m[4] + m[5]*m[5] + m[6]*m[6]);     // model +Y length (height)
+                const float sz = sqrtf(m[8]*m[8] + m[9]*m[9] + m[10]*m[10]);   // model +Z length (normal)
+                const float Rx = V._11, Ry = V._21, Rz = V._31;   // camera right  (world)
+                const float Ux = V._12, Uy = V._22, Uz = V._32;   // camera up     (world)
+                const float Fx = V._13, Fy = V._23, Fz = V._33;   // camera forward(world, into scene)
+                item.world[0] =  sx*Rx; item.world[1] =  sx*Ry; item.world[2]  =  sx*Rz;   // +X -> right
+                item.world[4] =  sy*Ux; item.world[5] =  sy*Uy; item.world[6]  =  sy*Uz;   // +Y -> up
+                item.world[8] = -sz*Fx; item.world[9] = -sz*Fy; item.world[10] = -sz*Fz;   // +Z -> toward camera
+            }
+            // CAMERA-RELATIVE: the sky is camera-attached; shift by -eye to match the host's
+            // translation-free viewProj (see buildDrawList) and keep vertex math near the origin.
+            item.world[12] -= DistantLand::eyePos.x;
+            item.world[13] -= DistantLand::eyePos.y;
+            item.world[14] -= DistantLand::eyePos.z;
+            const std::size_t at = g_skyScratch.size();
+            g_skyScratch.resize(at + sizeof(item));
+            memcpy(g_skyScratch.data() + at, &item, sizeof(item));
+            if (++count >= IPC::kMaxSkyDraws) {
+                break;
+            }
+        }
+        return count;
+    }
 }
 
 namespace RenderProcess {
@@ -1168,6 +1283,13 @@ namespace RenderProcess {
             g_devUiVisible = !g_devUiVisible;
             LOG::logline(">> [seam] dev overlay %s", g_devUiVisible ? "ON" : "OFF");
         }
+        // F7 toggles the SK1 Forge sky pass (edge-triggered). OFF (default) → MW's own sky is
+        // untouched. ON → the cache walks skyRoot and the host draws the gradient dome behind the
+        // opaque world (clean A/B vs vanilla MW sky).
+        if (GetAsyncKeyState(VK_F7) & 0x0001) {
+            g_skyEnabled = !g_skyEnabled;
+            LOG::logline(">> [seam] Forge sky (SK1) %s", g_skyEnabled ? "ON" : "OFF");
+        }
         if (!g_enabled) {
             return;
         }
@@ -1185,6 +1307,7 @@ namespace RenderProcess {
         const std::uint32_t skinnedCount = buildSkinnedDrawList();
         const std::uint32_t multiMapCount = buildMultiMapDrawList();
         const std::uint32_t lightCount = buildLightList();
+        const std::uint32_t skyCount = buildSkyDrawList();
         const double tBuild = nowMs();
 
         // Ship any textures newly referenced this frame BEFORE the scene draw that uses them
@@ -1220,13 +1343,22 @@ namespace RenderProcess {
             lightId    = g_lightVec->id();
             lightBytes = (std::uint32_t)g_lightScratch.size();
         }
+
+        IPC::VecId   skyId = IPC::InvalidVector;
+        std::uint32_t skyBytes = 0;
+        if (g_skyVec && skyCount > 0
+            && g_skyVec->assign_bytes(g_skyScratch.data(), (std::uint32_t)g_skyScratch.size())) {
+            skyId    = g_skyVec->id();
+            skyBytes = (std::uint32_t)g_skyScratch.size();
+        }
         const double tAssign = nowMs();
 
         // Only drive + composite the host when there's actual scene data this frame. With no
         // draw list (loading doors, menus, empty cells) we must NOT fall back to the bring-up
         // triangle and composite it — that flashes the debug triangle over MW's loading/menu
         // frame. Skip the seam entirely and let MW present its own (fixed-function) frame.
-        if (!haveDraw && skinnedId == IPC::InvalidVector && multiMapId == IPC::InvalidVector) {
+        if (!haveDraw && skinnedId == IPC::InvalidVector && multiMapId == IPC::InvalidVector
+            && skyId == IPC::InvalidVector) {
             return;
         }
 
@@ -1311,6 +1443,7 @@ namespace RenderProcess {
                  skinnedId, skinnedCount, skinnedBytes,
                  multiMapId, (multiMapId != IPC::InvalidVector) ? multiMapCount : 0, multiMapBytes,
                  lightId, (lightId != IPC::InvalidVector) ? lightCount : 0, lightBytes,
+                 skyId, (skyId != IPC::InvalidVector) ? skyCount : 0, skyBytes,
                  (std::uint32_t)g_debugMode, &devInput, &hostMs);
         const double tRender = nowMs();
         if (!ok) {
@@ -1440,6 +1573,12 @@ namespace RenderProcess {
         return g_initOk && g_geomVec.has_value();
     }
 
+    bool wantsSkyCapture() {
+        // Walk skyRoot only when the seam is live, geometry capture is up, the composite is ON
+        // (F11), and the SK1 sky pass is toggled ON (F7). Off by default → MW's own sky shows.
+        return g_initOk && g_geomVec.has_value() && g_enabled && g_skyEnabled;
+    }
+
     bool ownsOpaqueWorld() {
         // Forge composites a full-screen blit over MW's frame when enabled; the engine's
         // scene-0 opaque draw underneath is then pure wasted cost. Gate on the live composite
@@ -1457,15 +1596,18 @@ namespace RenderProcess {
 
     void captureGeometry(std::uint32_t key, std::uint16_t revision, std::uint32_t modelId,
                          const IPC::GeomVertexWire* verts, std::uint32_t vertexCount,
-                         const std::uint16_t* indices, std::uint32_t indexCount) {
+                         const std::uint16_t* indices, std::uint32_t indexCount,
+                         bool forceReupload) {
         if (!wantsGeometryCapture() || !verts || !indices || !vertexCount || !indexCount) {
             return;
         }
         // Skip only if the SAME object (modelId), same shape (vertexCount) and same revision
         // was already shipped. Keying on revision alone aliased recycled NiTriShape* keys (a
         // freed object's key+slot inherited by a new mesh with a colliding revisionID).
+        // forceReupload (SK1 sky dome) bypasses this — its vertex colours change every frame
+        // without a revisionID bump, so the dedup would otherwise freeze the gradient.
         auto rev = g_uploadedRev.find(key);
-        if (rev != g_uploadedRev.end() && rev->second.id == modelId &&
+        if (!forceReupload && rev != g_uploadedRev.end() && rev->second.id == modelId &&
             rev->second.vc == vertexCount && rev->second.rev == revision) {
             return;
         }
@@ -1594,6 +1736,7 @@ namespace RenderProcess {
         g_skinnedVec.reset();
         g_multiMapVec.reset();
         g_lightVec.reset();
+        g_skyVec.reset();
         g_texVec.reset();
         g_pendingBlob.clear();
         g_pendingBlob.shrink_to_fit();
@@ -1605,6 +1748,8 @@ namespace RenderProcess {
         g_multiMapScratch.shrink_to_fit();
         g_lightScratch.clear();
         g_lightScratch.shrink_to_fit();
+        g_skyScratch.clear();
+        g_skyScratch.shrink_to_fit();
         g_texPendingBlob.clear();
         g_texPendingBlob.shrink_to_fit();
         g_pendingParts = 0;

@@ -1049,6 +1049,18 @@ namespace {
         // one entry per drawn part (indexed by multiMapDrawn via firstInstance). CPU-mapped, per frame.
         Buffer*        pInstanceBufMM = nullptr;
 
+        // --- SK1: sky pass (alpha-blended, depth off) --------------------------------
+        // The host's FIRST blend pipeline. Reuses the SAME GeomVertexWire layout (vl) + SrtData/
+        // default.rootsig + bindless gTextures as the static opaque path; sky.vert reads gBatch.worlds
+        // (one window, like multimap) and sky.frag outputs real RGBA (no forced alpha=1) so the
+        // present-seam premultiplied composite lays the dome over MW. Drawn FIRST in the colour pass.
+        Shader*        pSkyShader = nullptr;
+        Pipeline*      pSkyPipeline = nullptr;             // SRCALPHA/INVSRCALPHA, depth test+write OFF
+        Pipeline*      pSkyPipelineAdd = nullptr;          // SK2: SRCALPHA/ONE additive variant (glare/cloud groundwork)
+        Buffer*        pSkyWorldsBuf = nullptr;            // gBatch: one 64KB world window, persistent-mapped
+        DescriptorSet* pPerBatchSetSky = nullptr;          // gBatch bound to pSkyWorldsBuf, 1 instance
+        Buffer*        pSkyInstanceBuf = nullptr;          // per-draw instance VB (kStaticInstU32 slots), CPU-mapped
+
         // --- Buffer consolidation: one shared mega VB + IB for STATIC non-skinned parts ----
         // Kills the per-draw VB/IB binds (the DX9-shaped bottleneck): bind these ONCE, draw each
         // part with firstVertex(BaseVertexLocation)/firstIndex offsets into them. Free-list
@@ -1146,6 +1158,10 @@ namespace {
     constexpr uint32_t kMaxMultiMap = 256;
     constexpr uint32_t kMMInstU32   = 14;
 
+    // SK1 sky: per-frame sky draw cap (must match IPC::kMaxSkyDraws). SK1 draws only the dome;
+    // the full sky subtree is ~15 shapes (SK2). One 64KB world window (< 1024 matrices) holds them.
+    constexpr uint32_t kMaxSkyDraws = 64;
+
     // Tier 3a point lights: per-frame cbuffer of MAX_POINT_LIGHTS lights (3 float4 each) +
     // a float4 header (count). MUST match IPC::kMaxPointLights / MAX_POINT_LIGHTS (opaque.srt.h).
     // 16 + 128*3*16 = 6160 B, rounded up to a 256-byte CBV multiple.
@@ -1174,6 +1190,16 @@ namespace {
         const uint32_t aref = (uint32_t)(r * 255.0f + 0.5f) & 0xFFu;
         return tex | (aref << 16) | ((vColSource & 0x3u) << 24);
     }
+
+    // SK2: D3DBLEND_* (the SkyDrawWire blend factors, captured from NiAlphaProperty) — the host
+    // keeps D3D headers out, so these are the literal d3d9.h enum values. Used to classify a
+    // captured (src,dst) pair against the prebuilt sky PSO set.
+    enum {
+        kD3DBLEND_ZERO        = 1,
+        kD3DBLEND_ONE         = 2,
+        kD3DBLEND_SRCALPHA    = 5,
+        kD3DBLEND_INVSRCALPHA = 6,
+    };
 
     // Submit + wait the resource loader's UPLOAD ENGINE. beginUpdateResource/endUpdateResource
     // record texture copies on the upload engine (pUploadEngines), which waitForAllResourceLoads
@@ -2102,6 +2128,120 @@ namespace {
             updateDescriptorSet(R, 0, g_live.pPerBatchSetMM, 1, &mp);
         }
 
+        // --- SK1: sky shader + pipeline (FIRST blend PSO, depth off) + world window + instance VB ---
+        // Reuses the opaque GeomVertexWire layout (vl) + SrtData/default.rootsig + bindless gTextures;
+        // sky.vert reads gBatch.worlds as ONE 64KB window (pSkyWorldsBuf, like multimap), drawn with
+        // firstInstance = the part's world index. The dome is alpha-blended into the transparent-
+        // cleared colour target → premultiplied; the present-seam composites it over MW. Depth test+
+        // write OFF (pure background): drawn first, the opaque world (replace blend) overwrites it
+        // where geometry exists. Built unconditionally (unused/zero-cost when the SK1 toggle is off).
+        {
+            ShaderLoadDesc skDesc = {};
+            skDesc.mVert.pFileName = "sky.vert";
+            skDesc.mFrag.pFileName = "sky.frag";
+            addShader(R, &skDesc, &g_live.pSkyShader);
+            if (!g_live.pSkyShader) {
+                std::printf("[forge] addShader(sky) FAILED\n");
+                return false;
+            }
+
+            DepthStateDesc skyDepth = {};
+            skyDepth.mDepthTest = false;
+            skyDepth.mDepthWrite = false;
+
+            // Standard transparency blend (the host's first). Colour target is cleared to (0,0,0,0)
+            // so result.rgb = src.rgb*a (premultiplied); alpha channel ONE/INVSRCALPHA accumulates
+            // coverage → result.a = a. Exactly what the present-seam ONE/INVSRCALPHA composite wants.
+            BlendStateDesc skyBlend = {};
+            skyBlend.mSrcFactors[0]      = BC_SRC_ALPHA;
+            skyBlend.mDstFactors[0]      = BC_ONE_MINUS_SRC_ALPHA;
+            skyBlend.mSrcAlphaFactors[0] = BC_ONE;
+            skyBlend.mDstAlphaFactors[0] = BC_ONE_MINUS_SRC_ALPHA;
+            skyBlend.mBlendModes[0]      = BM_ADD;
+            skyBlend.mBlendAlphaModes[0] = BM_ADD;
+            skyBlend.mColorWriteMasks[0] = COLOR_MASK_ALL;
+            skyBlend.mRenderTargetMask   = BLEND_STATE_TARGET_0;
+            skyBlend.mIndependentBlend   = false;
+
+            // Cull NONE: the dome is a single-sided shell viewed from inside; MW draws it without a
+            // depth-tested winding dependency. NONE keeps SK1 winding-agnostic (draw order owns it).
+            RasterizerStateDesc skyRaster = {};
+            skyRaster.mCullMode = CULL_MODE_NONE;
+            skyRaster.mFrontFace = FRONT_FACE_CCW;
+
+            PipelineDesc skPd = {};
+            skPd.mType = PIPELINE_TYPE_GRAPHICS;
+            GraphicsPipelineDesc& sg = skPd.mGraphicsDesc;
+            sg.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+            sg.mRenderTargetCount = 1;
+            sg.pColorFormats = &g_live.pRT->mFormat;
+            sg.mSampleCount = (SampleCount)g_live.sampleCount;
+            sg.mSampleQuality = 0;
+            sg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+            sg.pDepthState = &skyDepth;
+            sg.pBlendState = &skyBlend;
+            sg.pVertexLayout = &vl;                 // reuse the opaque GeomVertexWire layout
+            sg.pRasterizerState = &skyRaster;
+            sg.pShaderProgram = g_live.pSkyShader;
+            addPipeline(R, &skPd, &g_live.pSkyPipeline);
+            if (!g_live.pSkyPipeline) {
+                std::printf("[forge] addPipeline(sky) FAILED\n");
+                return false;
+            }
+
+            // SK2: a second, ADDITIVE sky PSO (SRCALPHA/ONE) — groundwork for the deferred sun
+            // glare + cloud layers. Identical to the alpha-over PSO except dst colour = ONE
+            // (and dst alpha = ONE so coverage accumulates). skyPipelineFor() picks per draw by
+            // the captured (src,dst) blend pair; the SK2 elements (sun/moons/stars) are all
+            // alpha-over and use pSkyPipeline. Built unconditionally (zero cost when unused).
+            BlendStateDesc skyBlendAdd = skyBlend;
+            skyBlendAdd.mDstFactors[0]      = BC_ONE;
+            skyBlendAdd.mDstAlphaFactors[0] = BC_ONE;
+            sg.pBlendState = &skyBlendAdd;
+            addPipeline(R, &skPd, &g_live.pSkyPipelineAdd);
+            if (!g_live.pSkyPipelineAdd) {
+                std::printf("[forge] addPipeline(sky additive) FAILED\n");
+                return false;
+            }
+
+            // One 64KB world window + a per-draw instance VB (kStaticInstU32 slots, like opaque).
+            BufferLoadDesc swb = {};
+            swb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            swb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            swb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            swb.mDesc.mSize = kBatchBytes;
+            swb.mDesc.pName = "skyWorldsCbv";
+            swb.pData = nullptr;
+            swb.ppBuffer = &g_live.pSkyWorldsBuf;
+            addResource(&swb, nullptr);
+
+            BufferLoadDesc sib = {};
+            sib.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+            sib.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            sib.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            sib.mDesc.mSize = (uint64_t)kMaxSkyDraws * kStaticInstU32 * sizeof(uint32_t);
+            sib.mDesc.pName = "instanceVBSky";
+            sib.pData = nullptr;
+            sib.ppBuffer = &g_live.pSkyInstanceBuf;
+            addResource(&sib, nullptr);
+
+            waitForAllResourceLoads();
+            if (!g_live.pSkyWorldsBuf || !g_live.pSkyInstanceBuf) {
+                return false;
+            }
+
+            // Sky PerBatch set (1 instance): gBatch = the single sky world window.
+            DescriptorSetDesc skbDesc = SRT_SET_DESC(SrtData, PerBatch, 1, 0);
+            addDescriptorSet(R, &skbDesc, &g_live.pPerBatchSetSky);
+            if (!g_live.pPerBatchSetSky) {
+                return false;
+            }
+            DescriptorData skp = {};
+            skp.mIndex = SRT_RES_IDX(SrtData, PerBatch, gBatch);
+            skp.ppBuffers = &g_live.pSkyWorldsBuf;
+            updateDescriptorSet(R, 0, g_live.pPerBatchSetSky, 1, &skp);
+        }
+
         // --- Tier 2: compute pipelines (linearize + GTAO) + their descriptor sets. First
         // PIPELINE_TYPE_COMPUTE in the host; both use the global compute root signature. ---
         {
@@ -2270,6 +2410,7 @@ namespace {
     unsigned  g_lastDrawn = 0;  // static parts actually drawn in the last renderScene
     unsigned  g_lastSkinnedDrawn = 0;  // skinned parts actually drawn in the last renderScene
     unsigned  g_lastMultiMapDrawn = 0; // multi-map parts actually drawn in the last renderScene
+    unsigned  g_lastSkyDrawn = 0;      // SK1 sky parts actually drawn in the last renderScene
     unsigned  g_lastLightCount = 0;    // point lights uploaded in the last renderScene
     uint32_t  g_debugMode = 0;         // F12 debug view: 0=normal, 1=depth, 2=scatter (written to FrameData.debugParams.x)
 
@@ -2306,6 +2447,13 @@ namespace {
     float g_litScale     = 1.0f;   // diffuse (sun + point) term
     float g_albedoScale  = 1.0f;   // albedo (texture) term
     float g_overallScale = 1.0f;   // final output
+
+    // SK2 "ownership tell": the Forge sky takeover is byte-identical to MW's own sky, so there's
+    // no way to tell it's live. These tint the Forge sky toward magenta (gFrameData.skyParams,
+    // read only by sky.frag) — crank the slider and the sky goes magenta IFF Forge is drawing it
+    // (F7 on). Pulse animates it (MW's sky never pulses) for an unmistakable confirmation. 0 = off.
+    float g_skyDebugTint = 0.0f;   // 0 = identical to MW (clean A/B); 1 = full magenta
+    bool  g_skyTintPulse = false;  // animate the tint so it's obviously Forge-owned
 
     // F12 debug-view names; index = debugParams.x. The dropdown writes g_debugMode directly so the
     // overlay selector and the F12 key cycle stay unified.
@@ -2415,6 +2563,16 @@ namespace {
         uiAddComponentWidget(g_uiPanel, "Albedo intensity", &sAlb, WIDGET_TYPE_SLIDER_FLOAT);
         SliderFloatWidget sOvr = {}; sOvr.pData = &g_overallScale; sOvr.mMin = 0.0f; sOvr.mMax = 4.0f; sOvr.mStep = 0.02f;
         uiAddComponentWidget(g_uiPanel, "Overall intensity", &sOvr, WIDGET_TYPE_SLIDER_FLOAT);
+
+        // SK2 sky-takeover "ownership tell". The Forge sky is byte-identical to MW's, so crank this
+        // (F7 on) to tint the Forge sky magenta — it only moves if Forge is drawing the sky. Pulse
+        // animates it for an unmistakable confirmation. Leave at 0 for a clean vanilla-vs-Forge A/B.
+        LabelWidget skyLbl = {};
+        uiAddComponentWidget(g_uiPanel, "-- Sky takeover (F7) --", &skyLbl, WIDGET_TYPE_LABEL);
+        SliderFloatWidget sSky = {}; sSky.pData = &g_skyDebugTint; sSky.mMin = 0.0f; sSky.mMax = 1.0f; sSky.mStep = 0.02f;
+        uiAddComponentWidget(g_uiPanel, "Sky tint (Forge tell)", &sSky, WIDGET_TYPE_SLIDER_FLOAT);
+        CheckboxWidget cSkyP = {}; cSkyP.pData = &g_skyTintPulse;
+        uiAddComponentWidget(g_uiPanel, "Sky tint pulse", &cSkyP, WIDGET_TYPE_CHECKBOX);
 
         g_uiInited = true;
         LOG::logline(">> [devui] ready (%ux%u fmt=%u)", width, height, colorFmt); LOG::flush();
@@ -2742,7 +2900,8 @@ namespace ForgeRender {
                      unsigned drawCount, unsigned drawBytes,
                      const void* skinnedBlob, unsigned skinnedCount, unsigned skinnedBytes,
                      const void* multiMapBlob, unsigned multiMapCount, unsigned multiMapBytes,
-                     const void* lightBlob, unsigned lightCount, unsigned lightBytes) {
+                     const void* lightBlob, unsigned lightCount, unsigned lightBytes,
+                     const void* skyBlob, unsigned skyCount, unsigned skyBytes) {
         if (!g_live.pRenderer) {
             return false;
         }
@@ -2838,6 +2997,12 @@ namespace ForgeRender {
                            | (g_ambientWhite ? 4u : 0u)); // AO toggles
             // dbgScales (float index 44..47): dev panel intensity modifiers.
             dp[44] = g_ambScale; dp[45] = g_litScale; dp[46] = g_albedoScale; dp[47] = g_overallScale;
+            // skyParams (float index 60..63): SK2 "ownership tell" — sky.frag tints the Forge sky
+            // toward magenta by dp[60], optionally pulsing (dp[62]) over host time dp[61]. 0 = no-op.
+            dp[60] = g_skyDebugTint;
+            dp[61] = (float)(hostNowMs() * 0.001);
+            dp[62] = g_skyTintPulse ? 1.0f : 0.0f;
+            dp[63] = 0.0f;
         }
 
         // Tier 3a: upload this frame's point lights into gLights. Each PointLightWire is exactly
@@ -3300,6 +3465,96 @@ namespace ForgeRender {
         cmdBindRenderTargets(g_live.pCmd, &bind);
         cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
         cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+
+        // --- SK1: sky pass (FIRST in the colour pass, depth off, alpha blend) ----------------
+        // Draw the sky shapes (SK1 = the gradient dome) BEFORE the opaque world so the opaque
+        // replace-blend draws overwrite them where geometry exists → sky ends up behind. The colour
+        // target was just cleared to (0,0,0,0); SRCALPHA/INVSRCALPHA gives premultiplied output for
+        // the present-seam composite. Each item writes its world into pSkyWorldsBuf[idx] + its
+        // DrawIndex/TexAlpha into pSkyInstanceBuf[idx], drawn with firstInstance=idx. Sky meshes are
+        // captured as ordinary GeomVertexWire statics, so they live in the arena (or the dynamic ring
+        // after the per-frame re-upload promotes them) — handle both. Capped at kMaxSkyDraws.
+        uint32_t skyDrawn = 0;
+        if (skyBlob && skyCount && skyBytes && g_live.pSkyPipeline && g_live.pSkyWorldsBuf) {
+            const uint32_t haveSky = skyBytes / (uint32_t)sizeof(IPC::SkyDrawWire);
+            uint32_t nSky = (skyCount < haveSky) ? skyCount : haveSky;
+            if (nSky > kMaxSkyDraws) { nSky = kMaxSkyDraws; }
+            const IPC::SkyDrawWire* skyItems = (const IPC::SkyDrawWire*)skyBlob;
+
+            // Bind a sky pipeline FIRST (establishes the shared default.rootsig the descriptor
+            // binds need); the loop switches between the alpha-over / additive PSOs per draw.
+            cmdBindPipeline(g_live.pCmd, g_live.pSkyPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetSky);
+            Pipeline* curSkyPipe = g_live.pSkyPipeline;
+
+            for (uint32_t k = 0; k < nSky; ++k) {
+                const IPC::SkyDrawWire& it = skyItems[k];
+                const uint32_t slot = it.slot;
+                if (slot >= g_meshHigh || !g_meshes[slot].valid) {
+                    continue;   // mesh not uploaded yet
+                }
+                HostMesh& m = g_meshes[slot];
+                if (m.skinned || m.multimap) {
+                    continue;   // sky uses the lean GeomVertexWire layout only
+                }
+                const uint32_t idx = skyDrawn;
+
+                // SK2: pick the blend PSO from the captured (src,dst) pair. SK2 elements
+                // (sun/moons/stars) are all standard alpha-over → pSkyPipeline; SRCALPHA/ONE →
+                // the additive variant (deferred glare/clouds). Unhandled pairs fall back to
+                // alpha-over and log once (surfaces e.g. an unexpected moon-shadow blend). The
+                // skyOrder sort groups like blends, so rebinds are rare.
+                Pipeline* want = g_live.pSkyPipeline;
+                if (it.srcBlend == kD3DBLEND_SRCALPHA && it.destBlend == kD3DBLEND_ONE) {
+                    want = g_live.pSkyPipelineAdd;
+                } else if (!(it.srcBlend == kD3DBLEND_SRCALPHA && it.destBlend == kD3DBLEND_INVSRCALPHA)) {
+                    static bool warnedSkyBlend = false;
+                    if (!warnedSkyBlend) {
+                        std::printf("[forge][sky] unhandled blend pair src=%u dst=%u -> alpha-over fallback\n",
+                                    it.srcBlend, it.destBlend);
+                        warnedSkyBlend = true;
+                    }
+                }
+                if (want != curSkyPipe) {
+                    cmdBindPipeline(g_live.pCmd, want);
+                    curSkyPipe = want;
+                }
+
+                uint8_t* dst = (uint8_t*)g_live.pSkyWorldsBuf->pCpuMappedAddress;
+                std::memcpy(dst + (size_t)idx * 64, it.world, 64);
+
+                uint32_t* inst = (uint32_t*)g_live.pSkyInstanceBuf->pCpuMappedAddress;
+                inst[idx * kStaticInstU32 + 0] = idx;   // DrawIndex → gBatch.worlds[idx]
+                inst[idx * kStaticInstU32 + 1] = packTexAlpha(it.texIndex, it.alphaRef, it.vColSource);
+                // SK2 FFP modulation: material diffuse rgb in slots [2..4] (TEXCOORD3) and the
+                // per-element alpha fade bit-cast into the spare overlay slot [11] (TEXCOORD6) —
+                // reuses the opaque vl unchanged. sky.frag does c = tex * base; c.a *= matAlpha.
+                float* finst = (float*)inst;
+                finst[idx * kStaticInstU32 + 2] = it.matColor[0];
+                finst[idx * kStaticInstU32 + 3] = it.matColor[1];
+                finst[idx * kStaticInstU32 + 4] = it.matColor[2];
+                finst[idx * kStaticInstU32 + 11] = it.matAlpha;
+
+                // Arena (bind-once + offsets) vs dynamic-ring (own VB/IB) source.
+                Buffer*  meshVb     = m.inArena ? g_live.pArenaVB : m.vb;
+                Buffer*  meshIb     = m.inArena ? g_live.pArenaIB : m.ib;
+                uint32_t firstVertex = m.inArena ? (uint32_t)(m.vbOff / sizeof(IPC::GeomVertexWire)) : 0u;
+                uint32_t firstIndex  = m.inArena ? (uint32_t)(m.ibOff / sizeof(uint16_t)) : 0u;
+                if (!meshVb || !meshIb) {
+                    continue;
+                }
+                Buffer*  vbs[2]     = { meshVb, g_live.pSkyInstanceBuf };
+                uint32_t strides[2] = { vStride, iStride };
+                cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                cmdBindIndexBuffer(g_live.pCmd, meshIb, INDEX_TYPE_UINT16, 0);
+                cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, firstIndex, 1, firstVertex, idx);
+                ++skyDrawn;
+            }
+        }
+
         // Bind a pipeline FIRST — cmdBindPipeline establishes the root signature the descriptor
         // binds need. Start on the non-mirror colour pipeline; the loop switches per draw.
         cmdBindPipeline(g_live.pCmd, g_live.pOpaquePipeline);
@@ -3603,15 +3858,16 @@ namespace ForgeRender {
         g_lastDrawn = drawn;
         g_lastSkinnedDrawn = skinnedDrawn;
         g_lastMultiMapDrawn = multiMapDrawn;
+        g_lastSkyDrawn = skyDrawn;
 
         // Host-side heartbeat to mgeHost64.log (LOG::logline; LOGF goes to uncaptured stdout).
         // dynamic = meshes in the upload-heap ring (must stay tiny — hundreds = over-promotion);
         // meshHigh = total slots ever populated (monotonic leak check). Lets us correlate the
         // client's [hb] frame cost with what the Forge renderer is actually drawing.
         if ((g_renderFrame % 300u) == 0u) {
-            LOG::logline(">> [forge-hb] frame=%u drawn=%u skinned=%u multimap=%u dynamic=%u meshHigh=%u "
+            LOG::logline(">> [forge-hb] frame=%u drawn=%u skinned=%u multimap=%u sky=%u dynamic=%u meshHigh=%u "
                          "| record=%.2fms gpu=%.2fms (avg/frame over 300)",
-                         g_renderFrame, drawn, skinnedDrawn, multiMapDrawn, g_dynamicCount, g_meshHigh,
+                         g_renderFrame, drawn, skinnedDrawn, multiMapDrawn, skyDrawn, g_dynamicCount, g_meshHigh,
                          g_recAccum / 300.0, g_gpuAccum / 300.0);
             dlLogHeartbeat();
             g_recAccum = 0.0;
@@ -5732,6 +5988,13 @@ namespace ForgeRender {
         if (g_live.pMultiMapPrepassPipelineMirror) { removePipeline(R, g_live.pMultiMapPrepassPipelineMirror); }
         if (g_live.pMultiMapDepthShader)    { removeShader(R, g_live.pMultiMapDepthShader); }
         if (g_live.pMultiMapShader)         { removeShader(R, g_live.pMultiMapShader); }
+        // SK1 sky teardown.
+        if (g_live.pPerBatchSetSky)         { removeDescriptorSet(R, g_live.pPerBatchSetSky); }
+        if (g_live.pSkyWorldsBuf)           { removeResource(g_live.pSkyWorldsBuf); }
+        if (g_live.pSkyInstanceBuf)         { removeResource(g_live.pSkyInstanceBuf); }
+        if (g_live.pSkyPipeline)            { removePipeline(R, g_live.pSkyPipeline); }
+        if (g_live.pSkyPipelineAdd)         { removePipeline(R, g_live.pSkyPipelineAdd); }
+        if (g_live.pSkyShader)              { removeShader(R, g_live.pSkyShader); }
         // Phase 1a distant-land teardown (atlas textures freed by the bindless loop below).
         for (uint32_t i = 0; i < g_landMeshCount; ++i) {
             if (g_landMeshes[i].vb) { removeResource(g_landMeshes[i].vb); g_landMeshes[i].vb = nullptr; }

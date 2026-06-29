@@ -958,7 +958,7 @@ SamplerState gSamplerAnisotropic : register( s10 , space100 ) ;
 #line 167 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 65 "FSL/shaders.list"
+#line 76 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/distantland.frag.fsl"
 #line 11 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/distantland.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -994,13 +994,18 @@ STRUCT(FrameData)
 
 
     float4 lodEye;
-#line 58
+
+
+
+
+    float4 skyParams;
+#line 63
 };
 
 STRUCT(BatchData)
 {
     float4x4 worlds[ 1024 ];
-#line 63
+#line 68
 };
 
 
@@ -1014,7 +1019,7 @@ STRUCT(LightData)
 {
     float4 lightParams;
     float4 lights[ 128  * 3];
-#line 76
+#line 81
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1029,7 +1034,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 106 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 111 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 896 ] :  register(t0,space0);
 
 
@@ -1081,4 +1086,4 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     }
     return (float4(result, 1.0f));
 }
-#line 66 "FSL/shaders.list"
+#line 77 "FSL/shaders.list"

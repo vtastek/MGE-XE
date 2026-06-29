@@ -1,0 +1,45 @@
+// mgeHost64 — sky takeover (fragment stage).
+//
+// The sky is emissive: output the base map sampled at the vertex UV, modulated by either the
+// per-vertex colour (the dome's baked atmosphere gradient, the stars' per-vertex mask) or the
+// per-draw material colour (the moon disc/shadow paints with the moon / sky colour). The
+// vColSource byte picks which, mirroring opaque.frag's proven routing. matAlpha then applies the
+// per-element fade (star night-fade, cloud cross-fade later); 1.0 is a no-op, so the SK1 dome is
+// unchanged (vColSource ≠ 0, matAlpha 1).
+//
+// CRITICAL: output REAL RGBA (do NOT force alpha=1 like opaque.frag). The host's sky pipeline
+// blends SRCALPHA/INVSRCALPHA into a transparent-cleared colour target → premultiplied
+// (rgb·a, a); the present-seam ONE/INVSRCALPHA composite then lays it over MW correctly.
+
+#include "opaque.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4,      Position, SV_Position);
+    DATA(float2,      Uv,       TEXCOORD0);
+    DATA(float4,      Color,    COLOR);
+    DATA(FLAT(uint),  TexIndex, TEXCOORD1);
+    DATA(FLAT(float3),MatDiffuse, TEXCOORD2);
+    DATA(FLAT(uint),  VColSource, TEXCOORD3);
+    DATA(FLAT(float), MatAlpha,   TEXCOORD4);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    float4 tex = SampleTex2D(gTextures[In.TexIndex], gSamplerAnisotropic, In.Uv);
+    // vColSource != 0 → a VertexColorProperty drives this shape (dome gradient, star mask):
+    // modulate by the per-vertex colour. Else use the constant material colour (moon disc/shadow).
+    float4 base = (In.VColSource != 0u) ? In.Color : float4(In.MatDiffuse, 1.0f);
+    float4 c = tex * base;
+    c.a *= In.MatAlpha;   // per-element weather/night fade (1 = no-op; dome unaffected)
+    // SK2 dev "ownership tell": tint toward magenta by gFrameData.skyParams.x (dev-panel slider).
+    // Only the Forge sky pass runs this shader, so a non-zero tint visibly proves Forge owns the
+    // sky (MW's identical sky never moves). Optional pulse (.z) animates it over host time (.y).
+    // amount 0 → lerp is a no-op → byte-identical to the untinted takeover (clean A/B).
+    float amt = gFrameData.skyParams.x;
+    if (gFrameData.skyParams.z > 0.5f) { amt *= 0.5f + 0.5f * sin(gFrameData.skyParams.y * 3.0f); }
+    c.rgb = lerp(c.rgb, float3(1.0f, 0.0f, 1.0f), amt);
+    RETURN(c);
+}
