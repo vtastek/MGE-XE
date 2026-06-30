@@ -4,6 +4,7 @@
 #include "drawstats.h"
 #include "distantshader.h"
 #include "mwbridge.h"
+#include "renderprocess.h"
 #include "phasetimers.h"
 #include "proxydx/d3d8header.h"
 #include "proxydx/devicelock.h"
@@ -226,7 +227,17 @@ void DistantLand::renderDepth() {
     // of the worker's buffer, byte-identical to the serial path.
     const bool depthCacheOnThread = renderThreadJobKicked;
 
-    if (!depthCacheOnThread) {
+    // Forge owns the composited frame AND the water (F11 + Forge water always-on): nothing samples
+    // texDepthFrame this frame — post-process (SSAO/DOF), the MW↔MGE blend, caustics, and MGE water
+    // are all suppressed. So skip PRODUCING the depth texture: the float-depth clear + the cache /
+    // land / statics (renderdepth.cpp:310) / grass DEPTH draws. The cache WALK, the frustum-visible
+    // set, the IPC channel drain (waitCullChannelFree), and the statics + grass CULLS still run —
+    // Forge's draw lists + MGE grass color depend on them, and the statics RPC MUST be drained to
+    // keep the one-at-a-time IPC channel paired. F7-off (MGE water A/B) restores the full depth pass.
+    const bool forgeOwnsDepth =
+        RenderProcess::ownsOpaqueWorld() && RenderProcess::wantsWaterCapture();
+
+    if (!depthCacheOnThread && !forgeOwnsDepth) {
         device->Clear(0, 0, D3DCLEAR_ZBUFFER, 0, 1.0, 0);
     }
 
@@ -240,13 +251,15 @@ void DistantLand::renderDepth() {
     effect->SetMatrix(ehProj, &distProj);
 
     if (!depthCacheOnThread) {
-        // Clear floating point buffer to far depth
-        effectDepth->BeginPass(PASS_CLEARDEPTH);
-        device->SetVertexDeclaration(WaterDecl);
-        device->SetStreamSource(0, vbFullFrame, 0, 12);
-        DrawStats::count(2);
-        device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
-        effectDepth->EndPass();
+        // Clear floating point buffer to far depth (skipped when Forge owns depth — no consumer).
+        if (!forgeOwnsDepth) {
+            effectDepth->BeginPass(PASS_CLEARDEPTH);
+            device->SetVertexDeclaration(WaterDecl);
+            device->SetStreamSource(0, vbFullFrame, 0, 12);
+            DrawStats::count(2);
+            device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
+            effectDepth->EndPass();
+        }
 
         // Rebuild the geometry cache (walk + per-frame bone palettes) BEFORE the
         // depth draw so depth uses this frame's skinned poses — otherwise depth
@@ -271,7 +284,9 @@ void DistantLand::renderDepth() {
             // for interiors too, so s_earlyClassifyRan may already be latched here.)
             buildFrustumVisibleSet(&mwView, &mwProj);
         }
-        {
+        // Cache near-depth draw (skipped when Forge owns depth — no consumer). The WALK above still
+        // ran (feeds Forge's draw lists); only the texDepthFrame draw is elided.
+        if (!forgeOwnsDepth) {
             MGE_SCOPED_TIMER("renderDepth:cache");
             renderDepthFromCache(&mwView);   // owns its non-skinned + skinned passes
         }
@@ -290,8 +305,8 @@ void DistantLand::renderDepth() {
 
     if (isDistantCell()) {
         if (!mwBridge->IsUnderwater(eyePos.z)) {
-            // Distant land
-            if (mwBridge->IsExterior()) {
+            // Distant land depth (skipped when Forge owns depth — no consumer).
+            if (mwBridge->IsExterior() && !forgeOwnsDepth) {
                 MGE_ZoneScopedN("renderDepth:land");
                 MGE_SCOPED_TIMER("renderDepth:land");
                 effectDepth->BeginPass(PASS_RENDERLANDDEPTH);
@@ -302,11 +317,13 @@ void DistantLand::renderDepth() {
             // Finish the async statics cull here so depth and color both
             // consume the same msocOccluded mask. Moved from Stage0's
             // color pass so it overlaps with land depth on the GPU.
+            // SURVIVES forgeOwnsDepth: the statics RPC must be drained to keep the IPC channel paired.
             if (Configuration.MGEFlags & USE_DISTANT_STATICS) {
                 cullDistantStatics_finish();
             }
 
-            {
+            // Distant statics depth (renderdepth.cpp:310 — skipped when Forge owns depth, no consumer).
+            if (!forgeOwnsDepth) {
                 MGE_ZoneScopedN("renderDepth:statics");
                 MGE_SCOPED_TIMER("renderDepth:statics");
                 DrawStats::ScopedStage _ds(DrawStats::DepthStatics);
@@ -327,16 +344,20 @@ void DistantLand::renderDepth() {
             // after the walk and cullDistantStatics_finish — lets the statics cull
             // overlap the walk, and grass's own RPC is cheap with the channel now
             // free. Grass still renders in this depth pre-pass, so early-Z holds.
+            // SURVIVES forgeOwnsDepth: MGE grass COLOR still draws (Forge has no grass) and needs this.
             if (mwBridge->IsExterior()) {
                 cullGrass(&mwView, &mwProj);
             }
 
-            // Grass
-            MGE_ZoneScopedN("renderDepth:grass");
-            MGE_SCOPED_TIMER("renderDepth:grass");
-            effectDepth->BeginPass(PASS_RENDERGRASSDEPTHINST);
-            renderGrassInstZ();
-            effectDepth->EndPass();
+            // Grass depth (skipped when Forge owns depth — no consumer; the grass COLOR pass in
+            // renderStage1 uses the backbuffer depth, not texDepthFrame).
+            if (!forgeOwnsDepth) {
+                MGE_ZoneScopedN("renderDepth:grass");
+                MGE_SCOPED_TIMER("renderDepth:grass");
+                effectDepth->BeginPass(PASS_RENDERGRASSDEPTHINST);
+                renderGrassInstZ();
+                effectDepth->EndPass();
+            }
         }
     }
 

@@ -5,6 +5,7 @@
 #include "configuration.h"
 #include "msocclient.h"
 #include "mwbridge.h"
+#include "renderprocess.h"
 #include "phasetimers.h"
 #include "proxydx/d3d8header.h"
 #include "proxydx/devicelock.h"
@@ -4484,6 +4485,11 @@ void DistantLand::prepareReflectionCullForWorker() {
 
     auto mwBridge = MWBridge::get();
     if (!isDistantCell() || !mwBridge->CellHasWater()) return;
+    // Forge owns the water surface (F7): MGE water is suppressed (renderStageWater early-returns),
+    // so its reflection RT has no visible consumer. Skip the ENTIRE reflection cull this frame —
+    // worker gate, the statics RPC fold, and (at the draw site) the draw — by leaving reflGateWanted
+    // false. No fence to consume, no inline cull. F7-off restores the full MGE reflection (clean A/B).
+    if (RenderProcess::wantsWaterCapture()) return;
     reflGateWanted = true;   // worker runs the reflect-vs-clear gate
 
     // Reflection statics RPC only when near-static reflections are enabled.

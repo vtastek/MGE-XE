@@ -327,7 +327,16 @@ void DistantLand::renderStage0() {
 
             // Shadow map runs after the depth pre-pass so renderShadowFromCache
             // sees the freshly updated geometry cache from renderDepth's overlap.
-            if (Configuration.MGEFlags & USE_SHADOWS) {
+            //
+            // Forge color has no shadows and its composite overwrites every MGE opaque/DL
+            // pixel, so the shadow map's only surviving consumer whose output ISN'T overwritten
+            // is the water reflection (texReflection → MGE water, visible only when F7 is off).
+            // Skip the whole shadow-map BUILD when Forge owns BOTH the opaque world (receiver
+            // already gated in renderStage1/2) AND the water (reflection suppressed below) — then
+            // nothing samples it. F7-off keeps it so MGE water still gets reflected shadows.
+            const bool forgeOwnsAllShadowConsumers =
+                RenderProcess::ownsOpaqueWorld() && RenderProcess::wantsWaterCapture();
+            if ((Configuration.MGEFlags & USE_SHADOWS) && !forgeOwnsAllShadowConsumers) {
                 if (mwBridge->CellHasWeather() && !mwBridge->IsMenu()) {
                     effectShadow->Begin(&passes, D3DXFX_DONOTSAVESTATE);
                     renderShadowMap();
@@ -341,9 +350,16 @@ void DistantLand::renderStage0() {
 
             effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
 
+            // Forge owns exterior distant-land COLOR: the host draws LOD land + statics into the
+            // Forge frame and the present composite lays it over MW, so MW's own exterior DL color
+            // here is pure overdraw the composite overwrites. Skip it when ownsDistantLand (F11) in
+            // exteriors. Interiors keep drawing (Forge DL is exterior-only). renderDepth's DL depth +
+            // statics CULL are untouched (separate pass) so SSAO/blend/grass still have their inputs.
+            const bool forgeOwnsExteriorDL =
+                RenderProcess::ownsDistantLand() && mwBridge->IsExterior();
             if (!mwBridge->IsUnderwater(eyePos.z)) {
                 // Draw distant landscape
-                if (mwBridge->IsExterior()) {
+                if (mwBridge->IsExterior() && !forgeOwnsExteriorDL) {
                     effect->BeginPass(PASS_RENDERLAND);
                     // Handover band near-cut: bound LOD land to the band START so it
                     // doesn't draw into the near field the cache/engine owns. Plane built
@@ -370,22 +386,24 @@ void DistantLand::renderStage0() {
                 // Draw distant statics. cullDistantStatics_finish was called
                 // inside renderDepth (depth pre-pass) so msocOccluded is ready.
                 if (kickedOffDistantStatics) {
-                    DWORD p = mwBridge->CellHasWeather() ? PASS_RENDERSTATICSEXTERIOR : PASS_RENDERSTATICSINTERIOR;
-                    effect->BeginPass(p);
-                    // Handover band near-cut: bound LOD statics to the band START so big
-                    // architectural meshes don't overshoot into the near field (slices
-                    // the whole object at the slab — no per-origin test that gaps on
-                    // objects spanning the band). distProj-built; exteriors + interiors.
-                    {
-                        D3DXPLANE pl = makeBandClipPlane(distProj, nearViewRange - 768.0f, true);
-                        device->SetClipPlane(0, pl);
-                        device->SetRenderState(D3DRS_CLIPPLANEENABLE, 1);
+                    if (!forgeOwnsExteriorDL) {
+                        DWORD p = mwBridge->CellHasWeather() ? PASS_RENDERSTATICSEXTERIOR : PASS_RENDERSTATICSINTERIOR;
+                        effect->BeginPass(p);
+                        // Handover band near-cut: bound LOD statics to the band START so big
+                        // architectural meshes don't overshoot into the near field (slices
+                        // the whole object at the slab — no per-origin test that gaps on
+                        // objects spanning the band). distProj-built; exteriors + interiors.
+                        {
+                            D3DXPLANE pl = makeBandClipPlane(distProj, nearViewRange - 768.0f, true);
+                            device->SetClipPlane(0, pl);
+                            device->SetRenderState(D3DRS_CLIPPLANEENABLE, 1);
+                        }
+                        vsr.beginAlphaToCoverage(device);
+                        renderDistantStatics();
+                        vsr.endAlphaToCoverage(device);
+                        device->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
+                        effect->EndPass();
                     }
-                    vsr.beginAlphaToCoverage(device);
-                    renderDistantStatics();
-                    vsr.endAlphaToCoverage(device);
-                    device->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
-                    effect->EndPass();
                 }
                 else {
                     visDistant.RemoveAll();
@@ -454,7 +472,7 @@ void DistantLand::renderStage0() {
             // actually visible (frustum + MSOC); when it isn't, clearReflection()
             // keeps a valid flat-fog target for the distant-water sampler and the
             // transition frame without paying the reflection pass.
-            if (mwBridge->CellHasWater()) {
+            if (mwBridge->CellHasWater() && !RenderProcess::wantsWaterCapture()) {
                 // Join the worker's late reflection fence before reading its
                 // results. The reflection gate/cull was split off the early
                 // staticsDone fence so renderDepth's statics join didn't wait on
@@ -472,6 +490,12 @@ void DistantLand::renderStage0() {
                 } else {
                     clearReflection();
                 }
+            } else if (mwBridge->CellHasWater()) {
+                // Forge owns the water surface (F7): MGE water is suppressed, so its reflection RT
+                // has no visible consumer. The cull was already skipped (prepareReflectionCullForWorker
+                // returned early → reflGateWanted false). Keep a valid flat-fog target for the
+                // distant-water sampler without paying the reflection cull/draw.
+                clearReflection();
             }
 
             // Update water simulation
@@ -549,7 +573,8 @@ void DistantLand::renderStage0() {
             // reflection. Otherwise clear, so the distant-water sampler reads a valid
             // flat-fog target and we don't reflect the previous cell. Cleared every
             // frame regardless to react to lighting changes.
-            if ((Configuration.MGEFlags & REFLECT_INTERIOR) && mwBridge->CellHasWater()) {
+            if ((Configuration.MGEFlags & REFLECT_INTERIOR) && mwBridge->CellHasWater()
+                && !RenderProcess::wantsWaterCapture()) {
                 device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
                 effect->Begin(&passes, D3DXFX_DONOTSAVESTATE);
                 renderWaterReflection(&mwView, &mwProj);
@@ -557,6 +582,8 @@ void DistantLand::renderStage0() {
                 stateSaved->Apply();
                 stateSaved->Release();
             } else {
+                // Forge owns interior water too (F7) → fall through to clearReflection (keeps a valid
+                // flat target for the distant-water sampler), same as the no-reflection-enabled case.
                 clearReflection();
             }
 
@@ -696,6 +723,14 @@ void DistantLand::renderStageBlend() {
     UINT passes;
 
     if (isRenderCached) {
+        return;
+    }
+
+    // Forge owns the composited frame (F11): the MW↔MGE handover feather (PASS_BLENDMGE) blends a
+    // distant-only capture into the band the Forge composite then overwrites — invisible. Caustics
+    // likewise draw on MW water that Forge owns. Both consume texDepthFrame; skipping them here is a
+    // step toward retiring the MGE depth pre-pass. F11-off restores the full blend (clean A/B).
+    if (RenderProcess::ownsOpaqueWorld()) {
         return;
     }
 
@@ -1053,7 +1088,12 @@ void DistantLand::postProcess() {
         IDirect3DStateBlock9* stateSaved;
         device->CreateStateBlock(D3DSBT_ALL, &stateSaved);
 
-        if (Configuration.MGEFlags & USE_HW_SHADER) {
+        // Forge owns the composited frame (F11): the host already shades + applies its own GTAO,
+        // and the MGE post chain's depth effects (SSAO/DOF) read texDepthFrame — the last consumer
+        // of the MGE depth pre-pass. Skip the whole HW post chain when Forge is on so depth can be
+        // retired. NOTE: this also drops any depth-free MGE post (bloom/colour/underwater); F11-off
+        // restores it (clean A/B). Screenshot + menu-cache + foam-debug below still run.
+        if ((Configuration.MGEFlags & USE_HW_SHADER) && !RenderProcess::ownsOpaqueWorld()) {
             // Set flags to reflect cell environment
             int envFlags = 0;
 
