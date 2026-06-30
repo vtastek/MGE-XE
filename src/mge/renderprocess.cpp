@@ -830,15 +830,20 @@ namespace {
         if (!g_drawVec) {
             return 0;
         }
-        // Source = the engine's MSOC drawn set (visibleCacheKeys / s_prevVisibleKeys), NOT
-        // the frustum set. The frustum-fallback set iterates the WHOLE cache and keeps every
-        // cached LOD level of an object — so an object whose original AND lod meshes are both
-        // cached gets drawn TWICE (coincident). Statics resolve to one (invisible), but movers
-        // sit near the camera where multiple LOD levels coexist → Z-FIGHTING. The MSOC set is
-        // exactly what the engine DREW: one LOD per object, occlusion-correct — the same source
-        // the reflection cache path uses for dynamic things (no double there). It's the prior
-        // frame's set (1-frame lag) but the world transform is read fresh from the cache below.
-        const auto& keys = DistantLand::visibleCacheKeys();
+        // Source = MGE's OWN current-frame frustum-visible set (frustumVisibleKeys /
+        // buildFrustumVisibleSet, built in renderStage0) — the SAME source the proven D3D9
+        // cache color path (renderCachedOpaque) consumes. This is adaptive and decouples the
+        // Forge near draw from the MWSE occlusion plugin entirely:
+        //   - plugin ON  → buildFrustumVisibleSet fills it from the engine's drawn set
+        //     (s_visibleKeys: de-duped, one LOD per object, occlusion-correct, CURRENT frame —
+        //     strictly better than the old visibleCacheKeys, which lagged a frame).
+        //   - plugin OFF → frustum-only fallback (whole-cache frustum walk). Near still renders.
+        // The old MSOC-set choice (visibleCacheKeys) went empty when the plugin was disabled,
+        // blanking ALL near opaques. The frustum-fallback's only cost is a transient double-draw
+        // of an object that has BOTH its original AND a stale LOD mesh still cached across an LOD
+        // transition (statics overlap → invisible; the rare mover case z-fights until eviction) —
+        // the exact tradeoff renderCachedOpaque already lives with.
+        const auto& keys = DistantLand::frustumVisibleKeys();
         const auto& cacheMap = MGE::GeometryCache::cache();
 
         g_drawScratch.clear();
@@ -940,7 +945,7 @@ namespace {
 
     // M-Skinning: gather this frame's visible SKINNED parts into g_skinnedScratch as a
     // sequence of [SkinnedDrawWire][palette]. Same visible-set source as buildDrawList
-    // (DistantLand::visibleCacheKeys); skinned keys are EXCLUDED from buildDrawList's static
+    // (DistantLand::frustumVisibleKeys); skinned keys are EXCLUDED from buildDrawList's static
     // loop (it requires the per-draw world matrix; skinned has none), so the two lists are
     // disjoint over the same set. There is no per-draw world transform — the bone palette
     // (read fresh from the cache entry each frame, that IS the animation) is world-space.
@@ -949,7 +954,7 @@ namespace {
         if (!g_skinnedVec) {
             return 0;
         }
-        const auto& keys = DistantLand::visibleCacheKeys();
+        const auto& keys = DistantLand::frustumVisibleKeys();
         const auto& cacheMap = MGE::GeometryCache::cache();
 
         g_skinnedScratch.clear();
@@ -1015,7 +1020,7 @@ namespace {
         if (!g_multiMapVec) {
             return 0;
         }
-        const auto& keys = DistantLand::visibleCacheKeys();
+        const auto& keys = DistantLand::frustumVisibleKeys();
         const auto& cacheMap = MGE::GeometryCache::cache();
 
         g_multiMapScratch.clear();
