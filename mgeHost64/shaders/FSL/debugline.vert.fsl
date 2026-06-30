@@ -1,0 +1,27 @@
+// mgeHost64 — debug line (vertex stage), --forge-view only.
+//
+// Transforms an EYE-RELATIVE world position by the (translation-free, reverse-Z) gFrameData.viewProj
+// — same convention as distantland/statics/sky (mul(viewProj, worldPos)). Used to draw distance
+// reference rings (e.g. the 16-cell DL draw-distance circle) so statics range can be eyeballed.
+// Shares opaque.srt.h / DefaultRootSignature; only reads gFrameData.viewProj.
+
+#include "opaque.srt.h"
+
+STRUCT(VSInput)
+{
+    DATA(float3, Position, POSITION);   // eye-relative world position
+};
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+VSOutput VS_MAIN( VSInput In )
+{
+    INIT_MAIN;
+    VSOutput Out;
+    Out.Position = mul(gFrameData.viewProj, float4(In.Position, 1.0f));
+    RETURN(Out);
+}

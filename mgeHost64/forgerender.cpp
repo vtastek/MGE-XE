@@ -3604,6 +3604,8 @@ namespace ForgeRender {
     void dlSetFrameEye(float x, float y, float z, bool exterior);
     void dlLiveCullAndBuild(Renderer* R, const float* rzViewProj);
     void dlLiveRecord();
+    bool dlCreateLiveRings(Renderer* R);   // statics instance/arg rings (forward: --forge-view eager init)
+    void buildStaticsGrid();               // live cull grid (forward: --forge-view eager init)
     void dlLogHeartbeat();
     void dlLogGpuSlow(double gpuMs, double recMs, unsigned drawn);   // per-frame GPU spike (reads DL counts)
 
@@ -5455,7 +5457,12 @@ namespace ForgeRender {
     Buffer*   g_pStaticsInst     = nullptr;   // per-instance stream for the current scope (GPU_ONLY)
     Buffer*   g_pStaticsArgs     = nullptr;   // IndirectDrawIndexArguments[] for the current scope
     Shader*   g_pStaticsShader   = nullptr;
-    Pipeline* g_pStaticsPipeline = nullptr;
+    Pipeline* g_pStaticsPipeline = nullptr;   // FRONT_FACE_CCW: MW's live in-game viewProj
+    Pipeline* g_pStaticsPipelineCW = nullptr; // FRONT_FACE_CW: synthetic dlLookAtLH camera (--forge-view)
+    // The standalone viewer's synthetic LH camera winds statics OPPOSITE to MW's live viewProj (the
+    // land hides it via CULL_NONE; statics CULL_BACK shows "inside out"). Set by worldViewer so
+    // dlLiveRecord binds the CW variant — a known camera-convention artifact, not a Forge bug.
+    bool      g_dlStaticsFrontCW = false;
     std::vector<StaticsSubsetGPU> g_staticsSubsets;
     std::vector<StaticsDefCPU>    g_staticsDefs;
     std::vector<std::string>      g_staticsSubsetTex;   // per-subset basename (lowercased)
@@ -5496,11 +5503,6 @@ namespace ForgeRender {
     uint32_t  g_staticsDrawCount = 0;                   // EI arg count (subsets with scoped instances)
     uint32_t  g_staticsInstTotal = 0;                   // total scoped draw-instances
     bool      g_staticsLoaded    = false;
-    // Viewer-only: CPU copy of the scoped instance rows (20 floats each, ABSOLUTE world matrix)
-    // kept by buildStaticsScope so the standalone viewer can re-bake them camera-relative each
-    // frame (subtract eye from the translation row) into an upload buffer — matching how the live
-    // path bakes W[12..14]-=eye. Empty on the in-game path (GPU_ONLY buffer is used there).
-    std::vector<float> g_staticsInstCPU;
 
     // --- Phase 1a/1b LIVE distant land (host-owned cull, persistent rings) -------------------
     // The probe loads/draws DL in isolation; the LIVE path wires the same loaders + pipelines into
@@ -5797,6 +5799,13 @@ namespace ForgeRender {
         g.pShaderProgram = g_pStaticsShader;
         addPipeline(R, &pd, &g_pStaticsPipeline);
         if (!g_pStaticsPipeline) { std::printf("[forge][dl] addPipeline(statics) FAILED\n"); return false; }
+
+        // CW variant for the standalone viewer's synthetic LH camera (inverts the live facing).
+        RasterizerStateDesc rsCW = rs; rsCW.mFrontFace = FRONT_FACE_CW;
+        g.pRasterizerState = &rsCW;
+        addPipeline(R, &pd, &g_pStaticsPipelineCW);
+        if (!g_pStaticsPipelineCW) { std::printf("[forge][dl] addPipeline(statics CW) FAILED\n"); return false; }
+
         std::printf("[forge][dl] statics pipeline built\n");
         return true;
     }
@@ -6165,10 +6174,6 @@ namespace ForgeRender {
                     g_staticsBuckets.empty() ? (size_t)0 : g_staticsBuckets.size() - 1);
         if (g_staticsDrawCount == 0) { return false; }
 
-        // Retain the absolute instance rows so the standalone viewer can re-bake them
-        // camera-relative per frame (the in-game path ignores this — it uses the GPU_ONLY buffer).
-        g_staticsInstCPU = instAll;
-
         BufferLoadDesc ibl = {};
         ibl.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
         ibl.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
@@ -6510,43 +6515,36 @@ namespace ForgeRender {
         if (!hwnd) { std::printf("[forge][view] CreateWindow FAILED\n"); return false; }
         ShowWindow(hwnd, SW_SHOW); s_viewerQuit = false; s_viewerSpeedMul = 1.0f;
 
-        // --- init renderer (single-sample so the pRT->backbuffer copy is 1:1) + load land + statics ---
+        // The live DL path reads Configuration.DL.* tier ranges (NearStaticEnd/FarStaticEnd/
+        // VeryFarStaticEnd). The headless host only loads settings on the IPC path, so load them
+        // here too — without it every static is range-rejected (ranges default to 0).
+        bool cfgOk = Configuration.LoadSettings();
+        std::printf("[forge][view] LoadSettings=%d  DL near/far/vfar = %.2f / %.2f / %.2f cells  drawDist=%.1f\n",
+                    (int)cfgOk, Configuration.DL.NearStaticEnd, Configuration.DL.FarStaticEnd,
+                    Configuration.DL.VeryFarStaticEnd, Configuration.DL.DrawDist);
+
+        // --- init renderer (single-sample, 8x aniso) ---
         if (!init(W, H, 1, 8)) { std::printf("[forge][view] init FAILED\n"); return false; }
         Renderer* R = g_live.pRenderer;
+
+        // Run the SAME resident load the live path's lazy init does (buildLandPath/loadDistantLand +
+        // statics library/textures/rings/grid), eagerly — so we have land bounds for the camera start
+        // — then set g_dlLiveInit so dlLiveCullAndBuild skips re-loading and just culls+records each
+        // frame across the WHOLE world (per-frame frustum + tier cull), exercising the in-game DL code.
+        // (We skip dlCreateCullResources — that's only the B2 GPU-cull validation; CPU cull is live.)
         if (!buildOpaquePath(R, g_live.width, g_live.height) || !buildLandPath(R) || !loadDistantLand(R)) {
             std::printf("[forge][view] DL load FAILED\n"); shutdown(); return false;
         }
         float staticsT[3] = { 0, 0, 0 };
-        bool haveStatics = buildStaticsPath(R) && loadDistantStatics(R) && buildStaticsTextureArrays(R);
-        if (haveStatics) { pickStaticsTarget(staticsT); haveStatics = buildStaticsScope(R, staticsT); }
-        std::printf("[forge][view] loaded: %u land meshes, statics=%d (%u draws)\n",
-                    g_landMeshCount, (int)haveStatics, g_staticsDrawCount);
-
-        // Camera-relative statics: statics.vert uses the ABSOLUTE instance matrix (no lodEye), so
-        // under the translation-free viewProj the rows must be pre-shifted by -eye each frame
-        // (exactly what the live path's dlLiveCullAndBuild bakes). Mirror the GPU_ONLY scoped buffer
-        // into a CPU_TO_GPU upload buffer we rewrite per frame from g_staticsInstCPU.
-        Buffer* pViewStaticsInst = nullptr;
-        if (haveStatics && !g_staticsInstCPU.empty()) {
-            BufferLoadDesc vb = {};
-            vb.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
-            vb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
-            vb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-            vb.mDesc.mSize = g_staticsInstCPU.size() * sizeof(float);
-            vb.mDesc.pName = "viewStaticsInst";
-            vb.pData = nullptr;
-            vb.ppBuffer = &pViewStaticsInst;
-            addResource(&vb, nullptr);
-            waitForAllResourceLoads();
-            if (!pViewStaticsInst) { std::printf("[forge][view] viewStaticsInst FAILED — statics off\n"); haveStatics = false; }
-            else {
-                // Write the FULL absolute rows once. Only the translation row (floats 12..14)
-                // changes per frame (-eye); the rotation/scale rows + params are constant, so the
-                // per-frame loop rewrites just 3 floats/instance instead of memcpying all 20.
-                std::memcpy(pViewStaticsInst->pCpuMappedAddress, g_staticsInstCPU.data(),
-                            g_staticsInstCPU.size() * sizeof(float));
-            }
-        }
+        g_staticsLiveOk = buildStaticsPath(R) && loadDistantStatics(R) && buildStaticsTextureArrays(R)
+                        && dlCreateLiveRings(R);
+        if (g_staticsLiveOk) { buildStaticsGrid(); pickStaticsTarget(staticsT); }
+        else { std::printf("[forge][view] statics unavailable — land only\n"); }
+        g_dlLiveInit = true;
+        g_dlStaticsFrontCW = true;   // synthetic LH camera → statics wind opposite to MW's live view
+        bool haveStatics = g_staticsLiveOk;
+        std::printf("[forge][view] loaded: %u land meshes, statics-live=%d\n",
+                    g_landMeshCount, (int)haveStatics);
 
         // --- swapchain on the window + present sync ---
         SwapChain* pSwap = nullptr;
@@ -6578,10 +6576,8 @@ namespace ForgeRender {
         if (haveStatics) {
             tgt[0]=staticsT[0]; tgt[1]=staticsT[1]; tgt[2]=staticsT[2];
             eye[0]=staticsT[0]-6000.0f; eye[1]=staticsT[1]; eye[2]=staticsT[2]+3000.0f;
-            const float* s0 = g_staticsInstCPU.data();
-            std::printf("[forge][view] staticsT=(%.0f,%.0f,%.0f) eyeStart=(%.0f,%.0f,%.0f) inst0Pos=(%.0f,%.0f,%.0f) nInst=%zu\n",
-                        staticsT[0],staticsT[1],staticsT[2], eye[0],eye[1],eye[2],
-                        s0[12],s0[13],s0[14], g_staticsInstCPU.size()/20);
+            std::printf("[forge][view] staticsT=(%.0f,%.0f,%.0f) eyeStart=(%.0f,%.0f,%.0f)\n",
+                        staticsT[0],staticsT[1],staticsT[2], eye[0],eye[1],eye[2]);
         }
         // Aim at the target (statics cluster, or land centre).
         float aim[3] = { tgt[0] - eye[0], tgt[1] - eye[1], tgt[2] - eye[2] };
@@ -6594,6 +6590,43 @@ namespace ForgeRender {
         const float kPi = 3.14159265f;
         LARGE_INTEGER qf, t0; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&t0);
         double fpsAccum = 0.0; int fpsFrames = 0;   // window-title FPS readout
+
+        // --- debug distance ring: a ground circle at the 16-cell DL draw distance, centred on the
+        // camera (eye-relative line strip), always-visible overlay → eyeball whether statics reach it.
+        const float    kGroundZ   = cz;                      // ring elevation (mid-land z)
+        const uint32_t kRingSegs  = 128, kRingVerts = kRingSegs + 1;   // +1 closes the loop
+        const float    kRingRadius = 16.0f * 8192.0f;        // 16 cells = DL Draw Distance
+        Shader*   pDbgShader = nullptr; Pipeline* pDbgPipe = nullptr; Buffer* pDbgVB = nullptr;
+        {
+            ShaderLoadDesc sd = {}; sd.mVert.pFileName = "debugline.vert"; sd.mFrag.pFileName = "debugline.frag";
+            addShader(R, &sd, &pDbgShader);
+            if (pDbgShader) {
+                VertexLayout vl = {};
+                vl.mBindingCount = 1; vl.mBindings[0].mStride = 12; vl.mBindings[0].mRate = VERTEX_BINDING_RATE_VERTEX;
+                vl.mAttribCount = 1;
+                vl.mAttribs[0].mSemantic = SEMANTIC_POSITION; vl.mAttribs[0].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
+                vl.mAttribs[0].mBinding = 0; vl.mAttribs[0].mLocation = 0; vl.mAttribs[0].mOffset = 0;
+                DepthStateDesc ds = {}; ds.mDepthTest = false; ds.mDepthWrite = false;   // always-on overlay
+                RasterizerStateDesc rs = {}; rs.mCullMode = CULL_MODE_NONE; rs.mFrontFace = FRONT_FACE_CCW;
+                PipelineDesc pd = {}; pd.mType = PIPELINE_TYPE_GRAPHICS;
+                GraphicsPipelineDesc& g = pd.mGraphicsDesc;
+                g.mPrimitiveTopo = PRIMITIVE_TOPO_LINE_STRIP;
+                g.mRenderTargetCount = 1; g.pColorFormats = &g_live.pRT->mFormat;
+                g.mSampleCount = (SampleCount)g_live.sampleCount; g.mSampleQuality = 0;
+                g.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+                g.pDepthState = &ds; g.pVertexLayout = &vl; g.pRasterizerState = &rs; g.pShaderProgram = pDbgShader;
+                addPipeline(R, &pd, &pDbgPipe);
+                BufferLoadDesc vb = {};
+                vb.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+                vb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+                vb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                vb.mDesc.mSize = kRingVerts * 3 * sizeof(float);
+                vb.mDesc.pName = "debugRingVB"; vb.pData = nullptr; vb.ppBuffer = &pDbgVB;
+                addResource(&vb, nullptr); waitForAllResourceLoads();
+            }
+            std::printf("[forge][view] debug 16-cell ring: shader=%d pipe=%d (radius %.0f)\n",
+                        (int)(pDbgShader!=nullptr), (int)(pDbgPipe!=nullptr), kRingRadius);
+        }
 
         // --- render loop ---
         while (!s_viewerQuit) {
@@ -6679,10 +6712,13 @@ namespace ForgeRender {
             fd[36]=0; fd[37]=0; fd[38]=0; fd[39]=0;                // eyePos = 0 (camera-relative frame)
             fd[40]=0; fd[41]=1.0f/(float)W; fd[42]=1.0f/(float)H; fd[43]=0;
             fd[44]=1; fd[45]=1; fd[46]=1; fd[47]=1;
-            fd[48]=(float)kLandBaseSlot; fd[49]=(float)kLandNormalSlot;
-            fd[50]=(float)kLandDetailSlot; fd[51]=7168.0f;
-            fd[52]=0.34f; fd[53]=0.38f; fd[54]=0.46f; fd[55]=0;
-            fd[56]=eye[0]; fd[57]=eye[1]; fd[58]=eye[2]; fd[59]=0; // lodEye = camera (land: In.Position - lodEye → camera-relative)
+            // fd[48..59] (DL slots / lodSunAmb / lodEye) are written by dlLiveCullAndBuild below.
+
+            // LIVE DL: per-frame frustum + tier cull of the WHOLE world (land + statics), filling the
+            // shared rings + gFrameData DL fields — the exact in-game path. Runs BEFORE command
+            // recording (it can lazily create resources; here it just culls since we pre-loaded).
+            dlSetFrameEye(eye[0], eye[1], eye[2], /*exterior*/true);
+            dlLiveCullAndBuild(R, vp);
 
             uint32_t idx = 0;
             acquireNextImage(R, pSwap, pImgSem, nullptr, &idx);
@@ -6702,39 +6738,26 @@ namespace ForgeRender {
             cmdBindRenderTargets(g_live.pCmd, &bind);
             cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)W, (float)H, 0.0f, 1.0f);
             cmdSetScissor(g_live.pCmd, 0, 0, W, H);
-            cmdBindPipeline(g_live.pCmd, g_pLandPipeline);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSet);
-            for (uint32_t i=0;i<g_landMeshCount;++i){ LandMeshGPU& mm=g_landMeshes[i];
-                Buffer* vbs[1]={mm.vb}; uint32_t st[1]={16};
-                cmdBindVertexBuffer(g_live.pCmd, 1, vbs, st, nullptr);
-                cmdBindIndexBuffer(g_live.pCmd, mm.ib, mm.large?INDEX_TYPE_UINT32:INDEX_TYPE_UINT16, 0);
-                cmdDrawIndexedInstanced(g_live.pCmd, mm.indexCount, 0, 1, 0, 0);
-            }
-            // Camera-relative statics: re-bake the scoped absolute rows for THIS frame by
-            // subtracting the eye from each instance's translation row (floats 12..14) — identical
-            // to the live path's W[12..14]-=eye. With the translation-free viewProj + eyePos=0 this
-            // puts statics in the same eye-relative frame as land (no far-from-origin shake).
-            // Safe to write the persistent map here: last frame's waitForFences drained the GPU.
-            if (haveStatics && pViewStaticsInst && g_staticsDrawCount > 0) {
-                const float* src = g_staticsInstCPU.data();
-                float*       dst = (float*)pViewStaticsInst->pCpuMappedAddress;
-                const size_t nInst = g_staticsInstCPU.size() / 20;
-                for (size_t i = 0; i < nInst; ++i) {
-                    const float* s = src + i*20; float* d = dst + i*20;
-                    d[12] = s[12] - eye[0]; d[13] = s[13] - eye[1]; d[14] = s[14] - eye[2];
+            // Replay the live cull result — the EXACT in-game DL record (land visible-set + statics
+            // execute-indirect over the rings). It binds its own pipelines + descriptor sets.
+            dlLiveRecord();
+
+            // Debug 16-cell ring: rebuild the eye-relative ground circle for this frame (centre = the
+            // camera's XY at kGroundZ; only the z offset changes), then draw it as a line strip.
+            if (pDbgPipe && pDbgVB) {
+                float* rv = (float*)pDbgVB->pCpuMappedAddress;
+                const float gz = kGroundZ - eye[2];   // eye-relative ground z
+                for (uint32_t i = 0; i < kRingVerts; ++i) {
+                    float a = (float)i / (float)kRingSegs * (2.0f * kPi);
+                    rv[i*3+0] = kRingRadius * std::cos(a);
+                    rv[i*3+1] = kRingRadius * std::sin(a);
+                    rv[i*3+2] = gz;
                 }
-                cmdBindPipeline(g_live.pCmd, g_pStaticsPipeline);
+                cmdBindPipeline(g_live.pCmd, pDbgPipe);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSet);
-                Buffer* svbs[2]={g_pStaticsVB, pViewStaticsInst}; uint32_t sst[2]={20, kStaticsInstStride};
-                cmdBindVertexBuffer(g_live.pCmd, 2, svbs, sst, nullptr);
-                cmdBindIndexBuffer(g_live.pCmd, g_pStaticsIB, INDEX_TYPE_UINT16, 0);
-                cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_staticsDrawCount, g_pStaticsArgs, 0, nullptr, 0);
+                Buffer* dvbs[1] = { pDbgVB }; uint32_t dst[1] = { 12 };
+                cmdBindVertexBuffer(g_live.pCmd, 1, dvbs, dst, nullptr);
+                cmdDraw(g_live.pCmd, kRingVerts, 0);
             }
             cmdBindRenderTargets(g_live.pCmd, nullptr);
             toRT.mCurrentState = RESOURCE_STATE_RENDER_TARGET; toRT.mNewState = RESOURCE_STATE_PRESENT;
@@ -6756,8 +6779,9 @@ namespace ForgeRender {
         }
 
         waitQueueIdle(g_live.pQueue);
-        if (pViewStaticsInst) { removeResource(pViewStaticsInst); }
-        g_staticsInstCPU.clear();
+        if (pDbgVB)     { removeResource(pDbgVB); }
+        if (pDbgPipe)   { removePipeline(R, pDbgPipe); }
+        if (pDbgShader) { removeShader(R, pDbgShader); }
         exitSemaphore(R, pImgSem); exitSemaphore(R, pRenderSem);
         removeSwapChain(R, pSwap);
         DestroyWindow(hwnd);
@@ -7240,7 +7264,7 @@ namespace ForgeRender {
         }
 
         if (g_drawDLStatics && g_staticsLiveOk && g_liveLastSubsets > 0) {
-            cmdBindPipeline(g_live.pCmd, g_pStaticsPipeline);
+            cmdBindPipeline(g_live.pCmd, g_dlStaticsFrontCW ? g_pStaticsPipelineCW : g_pStaticsPipeline);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);

@@ -958,7 +958,7 @@ SamplerState gSamplerAnisotropic : register( s10 , space100 ) ;
 #line 167 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 115 "FSL/shaders.list"
+#line 124 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gtao.comp.fsl"
 #line 18 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gtao.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/gtao.srt.h"
@@ -1155,4 +1155,4 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     Write2D(gAOOut, px, float4(bn, vis));
     return;
 }
-#line 116 "FSL/shaders.list"
+#line 125 "FSL/shaders.list"
