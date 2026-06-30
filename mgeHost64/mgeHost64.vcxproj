@@ -17,6 +17,15 @@
       <Configuration>Release</Configuration>
       <Platform>x64</Platform>
     </ProjectConfiguration>
+    <!-- Release-Fast: identical to Release|x64 but WITHOUT FORGE_DEBUG, so the D3D12
+         validation/debug layer is compiled OUT. The debug layer CPU-validates every
+         barrier/draw/descriptor call (~10x host CPU cost, e.g. 500 vs 5000 fps on an
+         idle scene), and it inflates every in-game host timing. Build this config to
+         measure real perf; build Release for the always-on validation safety net. -->
+    <ProjectConfiguration Include="Release-Fast|x64">
+      <Configuration>Release-Fast</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>17.0</VCProjectVersion>
@@ -56,6 +65,13 @@
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>NotSet</CharacterSet>
   </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release-Fast|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>NotSet</CharacterSet>
+  </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings">
   </ImportGroup>
@@ -73,6 +89,9 @@
   <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release-Fast|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <IncludePath>$(ProjectDir);$(SolutionDir)src;$(SolutionDir)3rdparty\msoc;$(SolutionDir)3rdparty\The-Forge\Common_3;C:\VulkanSDK\1.4.313.2\Include;$(IncludePath);C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\include</IncludePath>
@@ -81,6 +100,12 @@
     <IntDir>$(SolutionDir)bin\MSVC-$(Configuration)\mgeHost64\</IntDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <LibraryPath>C:\VulkanSDK\1.4.313.2\Lib;$(LibraryPath);C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\Lib\x64</LibraryPath>
+    <IncludePath>$(ProjectDir);$(SolutionDir)src;$(SolutionDir)3rdparty\msoc;$(SolutionDir)3rdparty\The-Forge\Common_3;C:\VulkanSDK\1.4.313.2\Include;$(IncludePath);C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\include</IncludePath>
+    <OutDir>$(SolutionDir)bin\MSVC-$(Configuration)\</OutDir>
+    <IntDir>$(SolutionDir)bin\MSVC-$(Configuration)\mgeHost64\</IntDir>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release-Fast|x64'">
     <LibraryPath>C:\VulkanSDK\1.4.313.2\Lib;$(LibraryPath);C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\Lib\x64</LibraryPath>
     <IncludePath>$(ProjectDir);$(SolutionDir)src;$(SolutionDir)3rdparty\msoc;$(SolutionDir)3rdparty\The-Forge\Common_3;C:\VulkanSDK\1.4.313.2\Include;$(IncludePath);C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\include</IncludePath>
     <OutDir>$(SolutionDir)bin\MSVC-$(Configuration)\</OutDir>
@@ -142,6 +167,31 @@
            Renderer::pDebugValidation) appear consistently across every TU. Defining
            ENABLE_GRAPHICS_VALIDATION alone leaves those structs half-configured (C2039). -->
       <PreprocessorDefinitions>_CONSOLE;MGE64_HOST;NOMINMAX;FORGE_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>d3dx9.lib;vulkan-1.lib;winmm.lib;amd_ags_x64.lib;nvapi64.lib;dxcompiler.lib;WinPixEventRuntime.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\ags\ags_lib\lib;$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\nvapi\amd64;$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\DirectXShaderCompiler\lib\x64;$(SolutionDir)3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource\winpixeventruntime\bin;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+    </Link>
+  </ItemDefinitionGroup>
+  <!-- Identical to Release|x64 EXCEPT the PreprocessorDefinitions omit FORGE_DEBUG, so The
+       Forge compiles "retail": no D3D12 validation/debug layer, no InfoQueue callback, no
+       validation-only struct members. Everything else (opt flags, LTCG, libs) matches Release
+       so the perf numbers are representative. The host's own validation block is guarded by
+       #if defined(ENABLE_GRAPHICS_VALIDATION), so it compiles out cleanly here. -->
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release-Fast|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>_CONSOLE;MGE64_HOST;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
