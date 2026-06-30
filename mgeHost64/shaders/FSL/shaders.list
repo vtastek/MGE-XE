@@ -98,6 +98,15 @@
 #include "water.frag.fsl"
 #end
 
+// Debug line (--forge-view only): solid-colour world-space line list for distance reference rings.
+#vert debugline.vert
+#include "debugline.vert.fsl"
+#end
+
+#frag debugline.frag
+#include "debugline.frag.fsl"
+#end
+
 // --- Tier 2 depth-takeover compute passes (ComputeRootSignature) ---
 // Linearize/resolve: two SAMPLE_COUNT variants; host picks by g_live.sampleCount at pipeline build.
 #comp linearizedepth_sc1.comp

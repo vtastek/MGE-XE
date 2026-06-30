@@ -1,0 +1,18 @@
+// mgeHost64 — debug line (fragment stage), --forge-view only.
+//
+// Constant bright colour, alpha = 1 (opaque overlay). The viewer renders straight to the
+// backbuffer, so the alpha convention of the present-seam composite does not apply here.
+
+#include "opaque.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    RETURN(float4(1.0f, 0.25f, 0.05f, 1.0f));   // bright orange-red
+}
