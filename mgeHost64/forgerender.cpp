@@ -6464,11 +6464,19 @@ namespace ForgeRender {
     // and iterates far faster than launching the game. Renders into the existing headless pRT (reusing
     // the probe's land+statics record), then CopyResource pRT -> swapchain backbuffer -> present.
     // tasks/forge-viewer.md. V1 = land+statics+fly-cam; sky (V2) and water (V3) layer on the loop.
-    static bool s_viewerQuit = false;
+    static bool  s_viewerQuit     = false;
+    static float s_viewerSpeedMul = 1.0f;   // mouse-wheel adjusts fly speed (×1.2 per notch)
     static LRESULT CALLBACK viewerWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         switch (msg) {
             case WM_CLOSE: case WM_DESTROY: s_viewerQuit = true; return 0;
             case WM_KEYDOWN: if (wp == VK_ESCAPE) { s_viewerQuit = true; } return 0;
+            case WM_MOUSEWHEEL: {
+                int notches = GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA;
+                s_viewerSpeedMul *= std::pow(1.2f, (float)notches);
+                if (s_viewerSpeedMul < 0.02f) s_viewerSpeedMul = 0.02f;
+                if (s_viewerSpeedMul > 50.0f) s_viewerSpeedMul = 50.0f;
+                return 0;
+            }
         }
         return DefWindowProcW(h, msg, wp, lp);
     }
@@ -6486,11 +6494,12 @@ namespace ForgeRender {
         RegisterClassExW(&wc);
         RECT wr = { 0, 0, (LONG)W, (LONG)H };
         AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
-        HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"Forge World Viewer  (WASD + arrows, Shift = fast, ESC = quit)",
+        HWND hwnd = CreateWindowExW(0, wc.lpszClassName,
+            L"Forge World Viewer  (WASD+arrows / hold RMB = mouse-look / wheel = speed / Shift = fast / ESC = quit)",
             WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, wr.right - wr.left, wr.bottom - wr.top,
             nullptr, nullptr, hInst, nullptr);
         if (!hwnd) { std::printf("[forge][view] CreateWindow FAILED\n"); return false; }
-        ShowWindow(hwnd, SW_SHOW); s_viewerQuit = false;
+        ShowWindow(hwnd, SW_SHOW); s_viewerQuit = false; s_viewerSpeedMul = 1.0f;
 
         // --- init renderer (single-sample so the pRT->backbuffer copy is 1:1) + load land + statics ---
         if (!init(W, H, 1, 8)) { std::printf("[forge][view] init FAILED\n"); return false; }
@@ -6512,7 +6521,7 @@ namespace ForgeRender {
         scd.ppPresentQueues = &g_live.pQueue; scd.mPresentQueueCount = 1;
         scd.mImageCount = 2; scd.mWidth = W; scd.mHeight = H;
         scd.mColorFormat = TinyImageFormat_B8G8R8A8_UNORM;
-        scd.mEnableVsync = true;
+        scd.mEnableVsync = false;   // uncapped → smooth fly camera (no vsync-beat judder; tearing OK for a viewer)
         addSwapChain(R, &scd, &pSwap);
         if (!pSwap) { std::printf("[forge][view] addSwapChain FAILED\n"); shutdown(); return false; }
         Semaphore* pImgSem = nullptr; Semaphore* pRenderSem = nullptr;
@@ -6537,6 +6546,7 @@ namespace ForgeRender {
         const float yScale = 1.732051f;                       // 60° vertical FOV
         const float kPi = 3.14159265f;
         LARGE_INTEGER qf, t0; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&t0);
+        double fpsAccum = 0.0; int fpsFrames = 0;   // window-title FPS readout
 
         // --- render loop ---
         while (!s_viewerQuit) {
@@ -6548,18 +6558,46 @@ namespace ForgeRender {
             LARGE_INTEGER t1; QueryPerformanceCounter(&t1);
             float dt = (float)(t1.QuadPart - t0.QuadPart) / (float)qf.QuadPart; t0 = t1;
             if (dt > 0.1f) dt = 0.1f;
+            fpsAccum += dt; ++fpsFrames;
+            if (fpsAccum >= 0.4) {
+                wchar_t title[160];
+                swprintf(title, 160, L"Forge World Viewer  —  %.0f fps  (RMB look / WASD / wheel=speed x%.2f / Shift / ESC)",
+                         (double)fpsFrames / fpsAccum, (double)s_viewerSpeedMul);
+                SetWindowTextW(hwnd, title);
+                fpsAccum = 0.0; fpsFrames = 0;
+            }
             auto down = [](int vk){ return (GetAsyncKeyState(vk) & 0x8000) != 0; };
-            float moveSpd = ext * 0.10f * dt * (down(VK_SHIFT) ? 6.0f : 1.0f);   // ~world-scaled
+            // Altitude-proportional fly speed (Google-Earth feel): fast when high over the world,
+            // slow near the ground — fixes "sluggish when very high". Wheel (speedMul) + Shift scale on top.
+            float altitude = eye[2] - mnZ; if (altitude < 800.0f) altitude = 800.0f;
+            float moveSpd = altitude * 1.6f * dt * s_viewerSpeedMul * (down(VK_SHIFT) ? 6.0f : 1.0f);
             float lookSpd = 1.4f * dt;
             if (down(VK_LEFT))  yaw   -= lookSpd;
             if (down(VK_RIGHT)) yaw   += lookSpd;
             if (down(VK_UP))    pitch += lookSpd;
             if (down(VK_DOWN))  pitch -= lookSpd;
+            // Mouse-look while the RIGHT mouse button is held: hide+recenter the cursor and turn
+            // its delta-from-centre into yaw/pitch (FPS-style). Release RMB to get the cursor back.
+            {
+                static bool s_look = false;
+                bool rmb = down(VK_RBUTTON);
+                RECT cr; GetClientRect(hwnd, &cr);
+                POINT ctr = { (cr.right - cr.left) / 2, (cr.bottom - cr.top) / 2 };
+                ClientToScreen(hwnd, &ctr);
+                if (rmb && !s_look)      { s_look = true;  ShowCursor(FALSE); SetCursorPos(ctr.x, ctr.y); }
+                else if (!rmb && s_look) { s_look = false; ShowCursor(TRUE); }
+                if (s_look) {
+                    POINT cur; GetCursorPos(&cur);
+                    yaw   += (float)(cur.x - ctr.x) * 0.0025f;
+                    pitch -= (float)(cur.y - ctr.y) * 0.0025f;
+                    SetCursorPos(ctr.x, ctr.y);
+                }
+            }
             if (pitch >  1.55f) pitch =  1.55f;
             if (pitch < -1.55f) pitch = -1.55f;
             float cp = std::cos(pitch), sp = std::sin(pitch), cyw = std::cos(yaw), syw = std::sin(yaw);
             float fwd[3] = { cp*cyw, cp*syw, sp };
-            float rgt[3] = { syw, -cyw, 0.0f };               // right = fwd × worldUp(Z), normalized in XY
+            float rgt[3] = { -syw, cyw, 0.0f };               // screen-right in the LH view (A/D strafe; was inverted)
             if (down('W')) { eye[0]+=fwd[0]*moveSpd; eye[1]+=fwd[1]*moveSpd; eye[2]+=fwd[2]*moveSpd; }
             if (down('S')) { eye[0]-=fwd[0]*moveSpd; eye[1]-=fwd[1]*moveSpd; eye[2]-=fwd[2]*moveSpd; }
             if (down('D')) { eye[0]+=rgt[0]*moveSpd; eye[1]+=rgt[1]*moveSpd; }
@@ -6568,11 +6606,17 @@ namespace ForgeRender {
             if (down(VK_CONTROL)) eye[2]-=moveSpd;
             (void)kPi;
 
-            // viewProj from the camera (reverse-Z munge matches renderScene/probe).
-            float at[3] = { eye[0]+fwd[0], eye[1]+fwd[1], eye[2]+fwd[2] };
-            float up[3] = { 0.0f, 0.0f, 1.0f };
+            // CAMERA-RELATIVE viewProj: build the view from the ORIGIN (no eye translation baked into
+            // the matrix) and shift land by -lodEye in the shader, so ALL clip-space math runs on
+            // SMALL numbers. THE fix for "shaking far from origin": with the eye in the matrix
+            // (absolute), viewProj*absolutePos is a huge-minus-huge float32 cancellation whose error
+            // couples to orientation → the world appears to rotate. Matches in-game (translation-free
+            // viewProj + lodEye = realEye + eyePos = 0).
+            float org[3] = { 0.0f, 0.0f, 0.0f };
+            float at[3]  = { fwd[0], fwd[1], fwd[2] };   // from origin toward fwd
+            float up[3]  = { 0.0f, 0.0f, 1.0f };
             float view[16], proj[16], vp[16];
-            dlLookAtLH(eye, at, up, view);
+            dlLookAtLH(org, at, up, view);
             dlPerspLH(yScale, (float)W/(float)H, zn, zf, proj);
             dlMul(view, proj, vp);
             vp[2]=vp[3]-vp[2]; vp[6]=vp[7]-vp[6]; vp[10]=vp[11]-vp[10]; vp[14]=vp[15]-vp[14];
@@ -6585,13 +6629,13 @@ namespace ForgeRender {
             fd[24]=0.34f; fd[25]=0.38f; fd[26]=0.46f; fd[27]=0;
             fd[28]=0.60f; fd[29]=0.66f; fd[30]=0.78f; fd[31]=0;
             fd[32]=0.30f*zf; fd[33]=0.95f*zf; fd[34]=0; fd[35]=0;
-            fd[36]=eye[0]; fd[37]=eye[1]; fd[38]=eye[2]; fd[39]=0;
+            fd[36]=0; fd[37]=0; fd[38]=0; fd[39]=0;                // eyePos = 0 (camera-relative frame)
             fd[40]=0; fd[41]=1.0f/(float)W; fd[42]=1.0f/(float)H; fd[43]=0;
             fd[44]=1; fd[45]=1; fd[46]=1; fd[47]=1;
             fd[48]=(float)kLandBaseSlot; fd[49]=(float)kLandNormalSlot;
             fd[50]=(float)kLandDetailSlot; fd[51]=7168.0f;
             fd[52]=0.34f; fd[53]=0.38f; fd[54]=0.46f; fd[55]=0;
-            fd[56]=0; fd[57]=0; fd[58]=0; fd[59]=0;                // lodEye = 0 (camera absolute)
+            fd[56]=eye[0]; fd[57]=eye[1]; fd[58]=eye[2]; fd[59]=0; // lodEye = camera (land: In.Position - lodEye → camera-relative)
 
             uint32_t idx = 0;
             acquireNextImage(R, pSwap, pImgSem, nullptr, &idx);
@@ -6599,9 +6643,14 @@ namespace ForgeRender {
 
             resetCmdPool(R, g_live.pCmdPool);
             beginCmd(g_live.pCmd);
+            // Render STRAIGHT into the acquired backbuffer (no pRT round-trip / copy). It comes back
+            // from acquire in PRESENT state → transition to RENDER_TARGET, draw, then back to PRESENT.
+            RenderTargetBarrier toRT = {};
+            toRT.pRenderTarget = bb; toRT.mCurrentState = RESOURCE_STATE_PRESENT; toRT.mNewState = RESOURCE_STATE_RENDER_TARGET;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &toRT);
             BindRenderTargetsDesc bind = {};
             bind.mRenderTargetCount = 1;
-            bind.mRenderTargets[0] = { g_live.pRT, LOAD_ACTION_CLEAR };
+            bind.mRenderTargets[0] = { bb, LOAD_ACTION_CLEAR };
             bind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_CLEAR };
             cmdBindRenderTargets(g_live.pCmd, &bind);
             cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)W, (float)H, 0.0f, 1.0f);
@@ -6617,7 +6666,10 @@ namespace ForgeRender {
                 cmdBindIndexBuffer(g_live.pCmd, mm.ib, mm.large?INDEX_TYPE_UINT32:INDEX_TYPE_UINT16, 0);
                 cmdDrawIndexedInstanced(g_live.pCmd, mm.indexCount, 0, 1, 0, 0);
             }
-            if (haveStatics && g_staticsDrawCount > 0) {
+            // Statics temporarily OFF: statics.vert uses the ABSOLUTE instance matrix (no lodEye), so
+            // it doesn't render correctly under the camera-relative (translation-free) viewProj. Bring
+            // them back camera-relative via the live path (dlLiveCullAndBuild bakes -eye per frame).
+            if (false && haveStatics && g_staticsDrawCount > 0) {
                 cmdBindPipeline(g_live.pCmd, g_pStaticsPipeline);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
@@ -6629,16 +6681,8 @@ namespace ForgeRender {
                 cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_staticsDrawCount, g_pStaticsArgs, 0, nullptr, 0);
             }
             cmdBindRenderTargets(g_live.pCmd, nullptr);
-
-            // Copy the rendered pRT into the acquired backbuffer, then present.
-            RenderTargetBarrier cpb[2] = {};
-            cpb[0].pRenderTarget = g_live.pRT; cpb[0].mCurrentState = RESOURCE_STATE_RENDER_TARGET; cpb[0].mNewState = RESOURCE_STATE_COPY_SOURCE;
-            cpb[1].pRenderTarget = bb;         cpb[1].mCurrentState = RESOURCE_STATE_PRESENT;       cpb[1].mNewState = RESOURCE_STATE_COPY_DEST;
-            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 2, cpb);
-            g_live.pCmd->mDx.pCmdList->CopyResource(bb->pTexture->mDx.pResource, g_live.pRT->pTexture->mDx.pResource);
-            cpb[0].mCurrentState = RESOURCE_STATE_COPY_SOURCE; cpb[0].mNewState = RESOURCE_STATE_RENDER_TARGET;
-            cpb[1].mCurrentState = RESOURCE_STATE_COPY_DEST;   cpb[1].mNewState = RESOURCE_STATE_PRESENT;
-            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 2, cpb);
+            toRT.mCurrentState = RESOURCE_STATE_RENDER_TARGET; toRT.mNewState = RESOURCE_STATE_PRESENT;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &toRT);
             endCmd(g_live.pCmd);
 
             QueueSubmitDesc sub = {};
