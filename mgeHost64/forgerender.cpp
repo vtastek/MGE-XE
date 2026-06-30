@@ -65,6 +65,10 @@
 #include "shaders/FSL/linearizedepth.srt.h"
 #include "shaders/FSL/gtao.srt.h"
 #include "shaders/FSL/aoblur.srt.h"
+// Stage B (M1) GPU statics cull SRT (CullSrtData: gCullParams + gCullInst + gCullCount). Also shares
+// the merged ComputeRootSignature. Names its element CullInstance (not GpuCullInstance) to avoid
+// redefining the host C++ struct when STRUCT(T) expands to `struct T` in this TU.
+#include "shaders/FSL/cull.srt.h"
 
 // App-layer callback normally provided by WindowsBase.cpp (which we exclude — it
 // drags in the window system). The backend calls this on device-lost. Headless:
@@ -1002,6 +1006,20 @@ namespace {
         DescriptorSet* pLinearizeSet = nullptr;   // LinDepthSrtData PerBatch: gSceneDepth + gLinearDepthOut
         DescriptorSet* pGtaoBatchSet = nullptr;   // AOSrtData PerBatch:  gLinearDepthIn + gAOOut
         DescriptorSet* pAOBlurSet = nullptr;      // AOBlurSrtData PerFrame: gBlurParams + gAOSrc + gBlurDepthIn + gAODst
+        // --- Stage B (M1) GPU statics cull (B2 = COUNT-only validation) ------------------------
+        // cull.comp tests every resident GpuCullInstance vs the per-frame CullParams (planes/eye/
+        // ranges) and atomic-adds numSubsets into pCullCountBuf[0]. The host resets it from a zero
+        // upload buffer and reads it back (raw D3D12 CopyBufferRegion — Forge exposes no buffer->
+        // buffer copy) to compare against the CPU cull's g_liveLastInst. No draws (B3 adds scatter).
+        Buffer*        pCullInstBuf = nullptr;     // GPU_ONLY structured SRV: g_cullInst (96B/inst), uploaded once
+        Buffer*        pCullCountBuf = nullptr;    // GPU_ONLY structured RW (uint[4]): [0] = survivor count
+        Buffer*        pCullCountReadback = nullptr; // GPU_TO_CPU, persistent-mapped (post-fence read)
+        Buffer*        pCullCountZero = nullptr;   // CPU_TO_GPU zeros (per-frame reset source)
+        Buffer*        pCullParamsCbv = nullptr;   // gCullParams (planes/eye/ranges/count), persistent-mapped
+        Shader*        pCullShader = nullptr;
+        Pipeline*      pCullPipeline = nullptr;
+        DescriptorSet* pCullSet = nullptr;         // CullSrtData PerBatch: gCullParams + gCullInst + gCullCount
+        uint32_t       cullInstCount = 0;          // g_ws0Count at upload (dispatch + bounds guard)
         DescriptorSet* pPerFrameSet = nullptr;    // gFrameData cbuffer (viewProj), 1 instance
         DescriptorSet* pPerBatchSet = nullptr;    // gBatch cbuffer window, kMaxBatches instances
         Buffer*        pFrameCbv = nullptr;        // gFrameData cbuffer (viewProj), persistent-mapped
@@ -3033,6 +3051,8 @@ namespace {
     // in the TU) so the Phase 0 panel readout in drawDevUI can see them.
     uint32_t  g_liveLastInst = 0, g_liveLastSubsets = 0, g_liveLastLand = 0;
     uint32_t  g_lastCullExamined = 0;   // instances the cull TESTED this frame (cull-ms normalizer)
+    uint32_t  g_lastGpuCullCount = 0;   // Stage B (B2): GPU cull survivor count (Σ numSubsets), read
+                                        // back post-fence; must equal g_liveLastInst (CPU) once correct.
 
     // Phase 0 panel toggles: turn a Forge subsystem's draw OFF to reveal MW's own version through the
     // premultiplied composite (instant visual A/B). All default ON (no behaviour change). Host-side —
@@ -3763,6 +3783,38 @@ namespace ForgeRender {
         auto gpuPhaseEnd = [&](uint32_t i) {
             if (g_live.pGpuQueryPool) { QueryDesc q = {}; q.mIndex = i; cmdEndQuery(g_live.pCmd, g_live.pGpuQueryPool, &q); }
         };
+
+        // ===================== Stage B (B2): GPU statics cull — COUNT-only validation ===========
+        // Independent compute pass at the very start of recording (no render target bound). Resets
+        // the survivor counter from a zero upload buffer, dispatches cull.comp (one thread/instance,
+        // atomic-adds numSubsets on survival), and copies the count into a readback buffer for the
+        // post-fence compare against g_liveLastInst. Raw D3D12 CopyBufferRegion (Forge has no buffer->
+        // buffer copy); Forge BufferBarriers keep the DEFAULT-heap counter's state tracked. No draws.
+        if (g_live.pCullPipeline && g_live.cullInstCount) {
+            ID3D12GraphicsCommandList* cl = g_live.pCmd->mDx.pCmdList;
+            BufferBarrier bb = {};
+            bb.pBuffer = g_live.pCullCountBuf;
+            // reset: UAV -> COPY_DEST, copy zeros in, COPY_DEST -> UAV
+            bb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS; bb.mNewState = RESOURCE_STATE_COPY_DEST;
+            cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
+            cl->CopyBufferRegion(g_live.pCullCountBuf->mDx.pResource, 0,
+                                 g_live.pCullCountZero->mDx.pResource, 0, sizeof(uint32_t));
+            bb.mCurrentState = RESOURCE_STATE_COPY_DEST; bb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+            cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
+            // dispatch the cull (one thread per resident instance)
+            cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.9f, 0.2f, "CULL (count survivors -> validate)");
+            cmdBindPipeline(g_live.pCmd, g_live.pCullPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pCullSet);
+            cmdDispatch(g_live.pCmd, (g_live.cullInstCount + 63u) / 64u, 1, 1);
+            cmdEndDebugMarker(g_live.pCmd);
+            // readback: UAV -> COPY_SOURCE, copy to readback, COPY_SOURCE -> UAV
+            bb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS; bb.mNewState = RESOURCE_STATE_COPY_SOURCE;
+            cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
+            cl->CopyBufferRegion(g_live.pCullCountReadback->mDx.pResource, 0,
+                                 g_live.pCullCountBuf->mDx.pResource, 0, sizeof(uint32_t));
+            bb.mCurrentState = RESOURCE_STATE_COPY_SOURCE; bb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+            cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
+        }
 
         // Color target: the MSAA color when antialiasing is on (resolved into pRT at the end),
         // else the shared pRT directly. The MSAA target is left in RENDER_TARGET between frames
@@ -4872,6 +4924,11 @@ namespace ForgeRender {
                 g_lastGpuPhaseMs[i] = (e > b) ? ((double)(e - b) / g_live.gpuTickFreq) * 1000.0 : 0.0;
             }
         }
+        // Stage B (B2): the GPU cull survivor count is valid now the fence signalled. Compare to the
+        // CPU cull's g_liveLastInst in the heartbeat — they MUST match once the GPU logic is correct.
+        if (g_live.pCullCountReadback && g_live.pCullCountReadback->pCpuMappedAddress) {
+            g_lastGpuCullCount = *(const uint32_t*)g_live.pCullCountReadback->pCpuMappedAddress;
+        }
         // Per-frame slow-GPU self-report (the 300-frame average can't surface a fresh dense-area
         // stall at 0.2 fps). Pairs with [dl-slow] (CPU cull) to localize a hitch to CPU vs GPU.
         if (gpuMs > 30.0) {
@@ -4903,10 +4960,11 @@ namespace ForgeRender {
             // host" the client saw is localized: setup (per-draw memcpy) + cull (DL CPU cull + lazy
             // loads) + record + gpu + post = total. cull is the prime pre-record suspect.
             LOG::logline(">> [forge-hb] host split: setup=%.2f cull=%.2f record=%.2f gpu=%.2f post=%.2f total=%.2fms"
-                         " | cull examined=%u survivors=%u (%.3f us/1k examined)",
+                         " | cull examined=%u survivors=%u (%.3f us/1k examined) | gpuCull=%u %s",
                          g_lastSetupMs, g_lastCullMs, g_lastRecMs, g_lastGpuMs, g_lastPostMs, g_lastTotalMs,
                          g_lastCullExamined, g_liveLastInst,
-                         g_lastCullExamined ? (g_lastCullMs * 1000.0 / (g_lastCullExamined / 1000.0)) : 0.0);
+                         g_lastCullExamined ? (g_lastCullMs * 1000.0 / (g_lastCullExamined / 1000.0)) : 0.0,
+                         g_lastGpuCullCount, (g_lastGpuCullCount == g_liveLastInst) ? "MATCH" : "MISMATCH");
             LOG::logline(">> [forge-hb] gpu split: prepass=%.2f gtao=%.2f reflect=%.2f color=%.2f water=%.2f resolve=%.2f ms",
                          g_lastGpuPhaseMs[kGpuPhasePrepass], g_lastGpuPhaseMs[kGpuPhaseGtao],
                          g_lastGpuPhaseMs[kGpuPhaseReflect], g_lastGpuPhaseMs[kGpuPhaseColor],
@@ -5417,16 +5475,20 @@ namespace ForgeRender {
     std::vector<uint8_t>          g_usageData;          // resident usage.data
     // Canonical per-instance cull data, precomputed ONCE at load (statics never move). Replaces the
     // per-frame trig/mat-mul (Stage A) AND the per-frame tier/effR compute — the CPU cull now just
-    // reads this. It is ALSO the exact resident struct the Stage B GPU compute cull reads (88 B,
-    // aligned). world = absolute (S·Rz·Ry·Rx·T); -eye is applied per frame. rangeEndIdx 0/1/2 =
+    // reads this. It is ALSO the exact resident struct the Stage B GPU compute cull reads (96 B,
+    // 16-aligned). world = absolute (S·Rz·Ry·Rx·T); -eye is applied per frame. rangeEndIdx 0/1/2 =
     // near/far/veryFar tier; 0xFFFFFFFF = skip (grass). Indexed by ws0 instance index.
+    // The 96 B size is deliberate: an HLSL StructuredBuffer element holding a float4x4 has 16-byte
+    // alignment, so the shader struct rounds 80 -> 96; an explicit posZ + _pad keep the C++ upload
+    // byte-identical to that stride and let the cull shader test the sphere z without decoding world.
     struct GpuCullInstance {
-        float    world[16];        // absolute world matrix
-        float    posX, posY;       // absolute xy (horizontal distance test)
-        float    effR;             // frustum sphere radius (def.radius * scale)
+        float    world[16];        // absolute world matrix (64 B)
+        float    posX, posY, posZ; // absolute position (xy = horizontal dist test, z = frustum sphere)
+        float    effR;             // frustum sphere radius (def.radius * scale)            -> 80 B
         uint32_t rangeEndIdx;      // tier: 0=nearEnd 1=farEnd 2=vfarEnd ; 0xFFFFFFFF = skip
         uint32_t firstSubset;
         uint32_t numSubsets;
+        uint32_t _pad;             // -> 96 B (matches the HLSL StructuredBuffer element stride)
     };
     std::vector<GpuCullInstance>  g_cullInst;
     uint64_t  g_ws0Off    = 0;                          // byte offset of the first exterior instance record
@@ -6453,7 +6515,7 @@ namespace ForgeRender {
                 float Tm[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, pos[0],pos[1],pos[2],1 };
                 float m0[16], m1[16], m2[16];
                 dlMul(S,  Rz, m0); dlMul(m0, Ry, m1); dlMul(m1, Rx, m2); dlMul(m2, Tm, gi.world);
-                gi.posX = pos[0]; gi.posY = pos[1];
+                gi.posX = pos[0]; gi.posY = pos[1]; gi.posZ = pos[2];
                 // tier/effR/subset range — precomputed (constant per session: type, size, DL config).
                 if (staticRef >= g_staticsDefs.size()) { gi.rangeEndIdx = 0xFFFFFFFFu; }
                 else {
@@ -6520,6 +6582,111 @@ namespace ForgeRender {
         return g_pStaticsInstRing && g_pStaticsArgsRing;
     }
 
+    // Stage B (M1) GPU statics cull resources (B2 = COUNT-only validation). One-time, AFTER
+    // buildStaticsGrid fills g_cullInst: upload the canonical instance struct as a structured SRV,
+    // create the survivor-count UAV + readback/zero staging + per-frame CullParams cbuffer, and the
+    // cull.comp pipeline/descriptor set. Idempotent; non-fatal if it fails (validation just won't run).
+    bool dlCreateCullResources(Renderer* R) {
+        if (g_live.pCullPipeline) { return true; }
+        if (g_cullInst.empty())   { return false; }
+        g_live.cullInstCount = (uint32_t)g_cullInst.size();   // == g_ws0Count
+
+        // (1) Resident instance SRV (GPU_ONLY structured buffer, uploaded once from g_cullInst).
+        //     Structured SRV over an UPLOAD heap is illegal in D3D12 (silent device-remove) → GPU_ONLY.
+        BufferLoadDesc ib = {};
+        ib.mDesc.mDescriptors  = DESCRIPTOR_TYPE_BUFFER;
+        ib.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+        ib.mDesc.mStructStride = sizeof(GpuCullInstance);     // 96
+        ib.mDesc.mElementCount = g_live.cullInstCount;
+        ib.mDesc.mSize         = (uint64_t)ib.mDesc.mStructStride * ib.mDesc.mElementCount;
+        ib.mDesc.mStartState   = RESOURCE_STATE_SHADER_RESOURCE;
+        ib.mDesc.pName         = "cullInstBuf";
+        ib.pData               = g_cullInst.data();           // staged upload at load
+        ib.ppBuffer            = &g_live.pCullInstBuf;
+        addResource(&ib, nullptr);
+
+        // (2) Survivor-count UAV (uint[4]; [0] = Σ numSubsets). DEFAULT heap (UAV can't be upload/readback).
+        BufferLoadDesc cb = {};
+        cb.mDesc.mDescriptors  = DESCRIPTOR_TYPE_RW_BUFFER;
+        cb.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+        cb.mDesc.mStructStride = sizeof(uint32_t);
+        cb.mDesc.mElementCount = 4;
+        cb.mDesc.mSize         = (uint64_t)cb.mDesc.mStructStride * cb.mDesc.mElementCount;
+        cb.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
+        cb.mDesc.pName         = "cullCountBuf";
+        cb.pData               = nullptr;
+        cb.ppBuffer            = &g_live.pCullCountBuf;
+        addResource(&cb, nullptr);
+
+        // (3) Readback (GPU_TO_CPU) + zero-reset (CPU_TO_GPU) staging, persistent-mapped. Forge has no
+        //     buffer->buffer copy, so the per-frame reset/readback uses raw D3D12 CopyBufferRegion.
+        BufferLoadDesc rb = {};
+        rb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
+        rb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+        rb.mDesc.mSize        = 16;
+        rb.mDesc.mStartState  = RESOURCE_STATE_COPY_DEST;
+        rb.mDesc.pName        = "cullCountReadback";
+        rb.ppBuffer           = &g_live.pCullCountReadback;
+        addResource(&rb, nullptr);
+        BufferLoadDesc zb = {};
+        zb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+        zb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+        zb.mDesc.mSize        = 16;
+        zb.mDesc.pName        = "cullCountZero";
+        zb.ppBuffer           = &g_live.pCullCountZero;
+        addResource(&zb, nullptr);
+
+        // (4) Per-frame CullParams cbuffer (planes/eye/ranges/count), filled in dlLiveCullAndBuild.
+        BufferLoadDesc pb = {};
+        pb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        pb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+        pb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+        pb.mDesc.mSize        = 256;                          // >= sizeof(CullParams) (144B), CBV-aligned
+        pb.mDesc.pName        = "cullParamsCbv";
+        pb.ppBuffer           = &g_live.pCullParamsCbv;
+        addResource(&pb, nullptr);
+
+        waitForAllResourceLoads();
+        if (g_live.pCullCountZero && g_live.pCullCountZero->pCpuMappedAddress) {
+            std::memset(g_live.pCullCountZero->pCpuMappedAddress, 0, 16);  // reset source (never changes)
+        }
+        if (!g_live.pCullInstBuf || !g_live.pCullCountBuf || !g_live.pCullCountReadback
+            || !g_live.pCullCountZero || !g_live.pCullParamsCbv) {
+            std::printf("[forge][cull] Stage B resource alloc FAILED\n");
+            return false;
+        }
+
+        // (5) cull.comp pipeline (merged ComputeRootSignature) + its PerBatch descriptor set.
+        ShaderLoadDesc csd = {};
+        csd.mComp.pFileName = "cull.comp";
+        addShader(R, &csd, &g_live.pCullShader);
+        if (!g_live.pCullShader) { std::printf("[forge][cull] addShader(cull.comp) FAILED\n"); return false; }
+        PipelineDesc cpd = {};
+        cpd.mType = PIPELINE_TYPE_COMPUTE;
+        cpd.mComputeDesc.pShaderProgram = g_live.pCullShader;
+        addPipeline(R, &cpd, &g_live.pCullPipeline);
+        if (!g_live.pCullPipeline) { std::printf("[forge][cull] addPipeline(cull.comp) FAILED\n"); return false; }
+
+        DescriptorSetDesc cset = SRT_SET_DESC(CullSrtData, PerBatch, 1, 0);
+        addDescriptorSet(R, &cset, &g_live.pCullSet);
+        if (!g_live.pCullSet) { std::printf("[forge][cull] addDescriptorSet FAILED\n"); return false; }
+        {
+            DescriptorData d[3] = {};
+            d[0].mIndex     = SRT_RES_IDX(CullSrtData, PerBatch, gCullParams);
+            d[0].ppBuffers  = &g_live.pCullParamsCbv;
+            d[1].mIndex     = SRT_RES_IDX(CullSrtData, PerBatch, gCullInst);
+            d[1].mCount     = 1;
+            d[1].ppBuffers  = &g_live.pCullInstBuf;
+            d[2].mIndex     = SRT_RES_IDX(CullSrtData, PerBatch, gCullCount);
+            d[2].mCount     = 1;
+            d[2].ppBuffers  = &g_live.pCullCountBuf;
+            updateDescriptorSet(R, 0, g_live.pCullSet, 3, d);
+        }
+        std::printf("[forge][cull] Stage B ready: %u instances (struct=%zuB)\n",
+                    g_live.cullInstCount, sizeof(GpuCullInstance));
+        return true;
+    }
+
     // Extract the 6 frustum planes (normalized) from a ROW-MAJOR viewProj used as clip = v*M (the
     // same convention the host uploads, including the reverse-Z munge). Gribb-Hartmann; planeN =
     // (a,b,c,d) with inside == a*x+b*y+c*z+d >= 0. m[i*4+j] = M[row i][col j]; colK = rows' Kth col.
@@ -6570,7 +6737,12 @@ namespace ForgeRender {
             }
             g_staticsLiveOk = buildStaticsPath(R) && loadDistantStatics(R)
                             && buildStaticsTextureArrays(R) && dlCreateLiveRings(R);
-            if (g_staticsLiveOk) { buildStaticsGrid(); }
+            if (g_staticsLiveOk) {
+                buildStaticsGrid();
+                // Stage B (B2): upload g_cullInst + create the GPU cull pipeline (validation only;
+                // non-fatal — the CPU cull stays authoritative until B3's draw cutover).
+                dlCreateCullResources(R);
+            }
             else { std::printf("[forge][dl] live statics unavailable — land only\n"); }
             g_dlLiveInit = true;
             std::printf("[forge][dl] live init done (land meshes=%u, statics=%d)\n",
@@ -6703,6 +6875,18 @@ namespace ForgeRender {
         g_liveLastInst = instBase;
         g_liveLastSubsets = drawCount;
         g_lastCullExamined = examined;   // instances tested this frame — normalizes cull ms across scenes
+
+        // Stage B (B2): mirror the EXACT planes/eye/ranges this CPU cull used into the GPU cull
+        // cbuffer (the validation dispatch runs during command recording, post-beginCmd). The GPU
+        // tests every instance with this identical rule → its Σ numSubsets must equal g_liveLastInst.
+        if (g_live.pCullParamsCbv && g_live.pCullParamsCbv->pCpuMappedAddress) {
+            float* cp = (float*)g_live.pCullParamsCbv->pCpuMappedAddress;
+            for (int p = 0; p < 6; ++p) { std::memcpy(cp + p * 4, planes[p], 4 * sizeof(float)); } // 0..23
+            cp[24] = eye[0]; cp[25] = eye[1]; cp[26] = eye[2]; cp[27] = 0.0f;                       // eye
+            cp[28] = nearEnd * nearEnd; cp[29] = farEnd * farEnd;                                   // ranges
+            cp[30] = vfarEnd * vfarEnd; cp[31] = nearCut2;
+            cp[32] = (float)g_live.cullInstCount; cp[33] = cp[34] = cp[35] = 0.0f;                  // misc.x = count
+        }
         if (overflow) {
             static bool warned = false;
             if (!warned) { std::printf("[forge][dl] live ring overflow (inst cap %u / subset cap %u) — clamped\n",
@@ -7134,6 +7318,16 @@ namespace ForgeRender {
         // Phase 1a/1b LIVE distant-land teardown (persistent rings + grid + flags).
         if (g_pStaticsArgsRing) { removeResource(g_pStaticsArgsRing); g_pStaticsArgsRing = nullptr; }
         if (g_pStaticsInstRing) { removeResource(g_pStaticsInstRing); g_pStaticsInstRing = nullptr; }
+        // Stage B (M1) GPU cull resources.
+        if (g_live.pCullSet)           { removeDescriptorSet(R, g_live.pCullSet);    g_live.pCullSet = nullptr; }
+        if (g_live.pCullPipeline)      { removePipeline(R, g_live.pCullPipeline);    g_live.pCullPipeline = nullptr; }
+        if (g_live.pCullShader)        { removeShader(R, g_live.pCullShader);        g_live.pCullShader = nullptr; }
+        if (g_live.pCullParamsCbv)     { removeResource(g_live.pCullParamsCbv);      g_live.pCullParamsCbv = nullptr; }
+        if (g_live.pCullCountZero)     { removeResource(g_live.pCullCountZero);      g_live.pCullCountZero = nullptr; }
+        if (g_live.pCullCountReadback) { removeResource(g_live.pCullCountReadback);  g_live.pCullCountReadback = nullptr; }
+        if (g_live.pCullCountBuf)      { removeResource(g_live.pCullCountBuf);       g_live.pCullCountBuf = nullptr; }
+        if (g_live.pCullInstBuf)       { removeResource(g_live.pCullInstBuf);        g_live.pCullInstBuf = nullptr; }
+        g_live.cullInstCount = 0;
         g_liveGrid.clear(); g_liveLandVisible.clear();
         g_dlLiveInit = false; g_staticsLiveOk = false; g_dlExterior = false;
         g_liveLastInst = g_liveLastSubsets = g_liveLastLand = 0;

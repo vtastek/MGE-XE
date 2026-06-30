@@ -119,3 +119,10 @@
 #comp aoblur.comp
 #include "aoblur.comp.fsl"
 #end
+
+// Stage B (M1) GPU statics cull — COUNT-only validation: one thread per resident instance, ports
+// dlLiveCullAndBuild's per-instance tier/distance/frustum rule, atomic-adds numSubsets. ComputeRootSig
+// (unions into compute.rootsig). No scatter/draw cutover yet (B3). See tasks/forge-gpu-occlusion.md.
+#comp cull.comp
+#include "cull.comp.fsl"
+#end

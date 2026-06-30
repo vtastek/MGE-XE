@@ -1,0 +1,55 @@
+// mgeHost64 — Stage B (M1) GPU frustum/tier cull, COUNT-only validation pass.
+//
+// Direct port of dlLiveCullAndBuild's PER-INSTANCE rule (forgerender.cpp): tier range² + near cutoff
+// + Gribb-Hartmann frustum-sphere test, in camera-relative space. The GPU tests EVERY resident
+// instance (the CPU grid's cell rejects are conservative, so the survivor set is identical); on
+// survival it atomic-adds numSubsets — matching the CPU's g_liveLastInst = Σ numSubsets over
+// survivors (13,611 in the test scene). No scatter, no draws: B2 proves the math + plumbing only.
+//
+// 64-wide groups. Out-of-range tail threads bounds-checked against misc.x (no grid coarse-reject).
+
+#include "cull.srt.h"
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(64, 1, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    // NB: every RETURN() MUST start its own line — fsl.py only rewrites RETURN()->return when the
+    // line begins (after whitespace) with RETURN (generators/d3d.py); inline `{ RETURN(); }` is
+    // left untransformed and fails DXC as `return()`.
+    uint i = DispatchThreadID.x;
+    if (i >= (uint)gCullParams.misc.x)
+        RETURN();
+
+    CullInstance inst = gCullInst[i];
+    if (inst.rangeEndIdx == 0xFFFFFFFFu)   // grass / invalid -> skip
+        RETURN();
+
+    // Tier range² (x/y/z = near/far/vfar end, squared host-side).
+    float rangeEnd2 = (inst.rangeEndIdx == 0u) ? gCullParams.ranges.x
+                    : (inst.rangeEndIdx == 1u) ? gCullParams.ranges.y
+                                               : gCullParams.ranges.z;
+
+    // Horizontal distance test: near-owned (< nearCut²) or beyond the tier range -> reject.
+    float dx = inst.posX - gCullParams.eye.x;
+    float dy = inst.posY - gCullParams.eye.y;
+    float d2 = dx * dx + dy * dy;
+    if (d2 < gCullParams.ranges.w || d2 > rangeEnd2)
+        RETURN();
+
+    // Frustum-cull the instance sphere (camera-relative center, radius effR).
+    float cz = inst.posZ - gCullParams.eye.z;
+    UNROLL
+    for (uint p = 0u; p < 6u; ++p)
+    {
+        float4 pl = gCullParams.planes[p];
+        float  dist = pl.x * dx + pl.y * dy + pl.z * cz + pl.w;
+        if (dist < -inst.effR)
+            RETURN();
+    }
+
+    uint orig;
+    AtomicAdd(gCullCount[0], inst.numSubsets, orig);
+    RETURN();
+}
