@@ -5496,6 +5496,11 @@ namespace ForgeRender {
     uint32_t  g_staticsDrawCount = 0;                   // EI arg count (subsets with scoped instances)
     uint32_t  g_staticsInstTotal = 0;                   // total scoped draw-instances
     bool      g_staticsLoaded    = false;
+    // Viewer-only: CPU copy of the scoped instance rows (20 floats each, ABSOLUTE world matrix)
+    // kept by buildStaticsScope so the standalone viewer can re-bake them camera-relative each
+    // frame (subtract eye from the translation row) into an upload buffer — matching how the live
+    // path bakes W[12..14]-=eye. Empty on the in-game path (GPU_ONLY buffer is used there).
+    std::vector<float> g_staticsInstCPU;
 
     // --- Phase 1a/1b LIVE distant land (host-owned cull, persistent rings) -------------------
     // The probe loads/draws DL in isolation; the LIVE path wires the same loaders + pipelines into
@@ -6160,6 +6165,10 @@ namespace ForgeRender {
                     g_staticsBuckets.empty() ? (size_t)0 : g_staticsBuckets.size() - 1);
         if (g_staticsDrawCount == 0) { return false; }
 
+        // Retain the absolute instance rows so the standalone viewer can re-bake them
+        // camera-relative per frame (the in-game path ignores this — it uses the GPU_ONLY buffer).
+        g_staticsInstCPU = instAll;
+
         BufferLoadDesc ibl = {};
         ibl.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
         ibl.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
@@ -6513,6 +6522,32 @@ namespace ForgeRender {
         std::printf("[forge][view] loaded: %u land meshes, statics=%d (%u draws)\n",
                     g_landMeshCount, (int)haveStatics, g_staticsDrawCount);
 
+        // Camera-relative statics: statics.vert uses the ABSOLUTE instance matrix (no lodEye), so
+        // under the translation-free viewProj the rows must be pre-shifted by -eye each frame
+        // (exactly what the live path's dlLiveCullAndBuild bakes). Mirror the GPU_ONLY scoped buffer
+        // into a CPU_TO_GPU upload buffer we rewrite per frame from g_staticsInstCPU.
+        Buffer* pViewStaticsInst = nullptr;
+        if (haveStatics && !g_staticsInstCPU.empty()) {
+            BufferLoadDesc vb = {};
+            vb.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+            vb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            vb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            vb.mDesc.mSize = g_staticsInstCPU.size() * sizeof(float);
+            vb.mDesc.pName = "viewStaticsInst";
+            vb.pData = nullptr;
+            vb.ppBuffer = &pViewStaticsInst;
+            addResource(&vb, nullptr);
+            waitForAllResourceLoads();
+            if (!pViewStaticsInst) { std::printf("[forge][view] viewStaticsInst FAILED — statics off\n"); haveStatics = false; }
+            else {
+                // Write the FULL absolute rows once. Only the translation row (floats 12..14)
+                // changes per frame (-eye); the rotation/scale rows + params are constant, so the
+                // per-frame loop rewrites just 3 floats/instance instead of memcpying all 20.
+                std::memcpy(pViewStaticsInst->pCpuMappedAddress, g_staticsInstCPU.data(),
+                            g_staticsInstCPU.size() * sizeof(float));
+            }
+        }
+
         // --- swapchain on the window + present sync ---
         SwapChain* pSwap = nullptr;
         SwapChainDesc scd = {};
@@ -6535,9 +6570,21 @@ namespace ForgeRender {
             mnZ=(m.cz-m.r<mnZ)?m.cz-m.r:mnZ; mxZ=(m.cz+m.r>mxZ)?m.cz+m.r:mxZ; }
         float cx=0.5f*(mnX+mxX), cy=0.5f*(mnY+mxY), cz=0.5f*(mnZ+mxZ);
         float ext=((mxX-mnX)>(mxY-mnY))?(mxX-mnX):(mxY-mnY);
+        float tgt[3] = { cx, cy, cz };
         float eye[3] = { cx - 0.35f*ext, cy, mxZ + 0.10f*ext + 4000.0f };
-        // Aim at the terrain centre.
-        float aim[3] = { cx - eye[0], cy - eye[1], cz - eye[2] };
+        // Start where the content is: if statics loaded, open ON the dense statics cluster
+        // (pickStaticsTarget's cell) so the camera-relative statics are dead ahead at launch,
+        // not the land centre (which can be far from the scoped statics).
+        if (haveStatics) {
+            tgt[0]=staticsT[0]; tgt[1]=staticsT[1]; tgt[2]=staticsT[2];
+            eye[0]=staticsT[0]-6000.0f; eye[1]=staticsT[1]; eye[2]=staticsT[2]+3000.0f;
+            const float* s0 = g_staticsInstCPU.data();
+            std::printf("[forge][view] staticsT=(%.0f,%.0f,%.0f) eyeStart=(%.0f,%.0f,%.0f) inst0Pos=(%.0f,%.0f,%.0f) nInst=%zu\n",
+                        staticsT[0],staticsT[1],staticsT[2], eye[0],eye[1],eye[2],
+                        s0[12],s0[13],s0[14], g_staticsInstCPU.size()/20);
+        }
+        // Aim at the target (statics cluster, or land centre).
+        float aim[3] = { tgt[0] - eye[0], tgt[1] - eye[1], tgt[2] - eye[2] };
         float aimLen = std::sqrt(aim[0]*aim[0]+aim[1]*aim[1]+aim[2]*aim[2]) + 1e-6f;
         aim[0]/=aimLen; aim[1]/=aimLen; aim[2]/=aimLen;
         float yaw = std::atan2(aim[1], aim[0]);
@@ -6666,16 +6713,25 @@ namespace ForgeRender {
                 cmdBindIndexBuffer(g_live.pCmd, mm.ib, mm.large?INDEX_TYPE_UINT32:INDEX_TYPE_UINT16, 0);
                 cmdDrawIndexedInstanced(g_live.pCmd, mm.indexCount, 0, 1, 0, 0);
             }
-            // Statics temporarily OFF: statics.vert uses the ABSOLUTE instance matrix (no lodEye), so
-            // it doesn't render correctly under the camera-relative (translation-free) viewProj. Bring
-            // them back camera-relative via the live path (dlLiveCullAndBuild bakes -eye per frame).
-            if (false && haveStatics && g_staticsDrawCount > 0) {
+            // Camera-relative statics: re-bake the scoped absolute rows for THIS frame by
+            // subtracting the eye from each instance's translation row (floats 12..14) — identical
+            // to the live path's W[12..14]-=eye. With the translation-free viewProj + eyePos=0 this
+            // puts statics in the same eye-relative frame as land (no far-from-origin shake).
+            // Safe to write the persistent map here: last frame's waitForFences drained the GPU.
+            if (haveStatics && pViewStaticsInst && g_staticsDrawCount > 0) {
+                const float* src = g_staticsInstCPU.data();
+                float*       dst = (float*)pViewStaticsInst->pCpuMappedAddress;
+                const size_t nInst = g_staticsInstCPU.size() / 20;
+                for (size_t i = 0; i < nInst; ++i) {
+                    const float* s = src + i*20; float* d = dst + i*20;
+                    d[12] = s[12] - eye[0]; d[13] = s[13] - eye[1]; d[14] = s[14] - eye[2];
+                }
                 cmdBindPipeline(g_live.pCmd, g_pStaticsPipeline);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSet);
-                Buffer* svbs[2]={g_pStaticsVB, g_pStaticsInst}; uint32_t sst[2]={20, kStaticsInstStride};
+                Buffer* svbs[2]={g_pStaticsVB, pViewStaticsInst}; uint32_t sst[2]={20, kStaticsInstStride};
                 cmdBindVertexBuffer(g_live.pCmd, 2, svbs, sst, nullptr);
                 cmdBindIndexBuffer(g_live.pCmd, g_pStaticsIB, INDEX_TYPE_UINT16, 0);
                 cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_staticsDrawCount, g_pStaticsArgs, 0, nullptr, 0);
@@ -6700,6 +6756,8 @@ namespace ForgeRender {
         }
 
         waitQueueIdle(g_live.pQueue);
+        if (pViewStaticsInst) { removeResource(pViewStaticsInst); }
+        g_staticsInstCPU.clear();
         exitSemaphore(R, pImgSem); exitSemaphore(R, pRenderSem);
         removeSwapChain(R, pSwap);
         DestroyWindow(hwnd);
