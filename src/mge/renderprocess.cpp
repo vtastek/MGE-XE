@@ -9,6 +9,7 @@
 #include "scenegraph_geometry_cache.h"
 #include "scenegraph.h"
 #include "morrowindbsa.h"
+#include "mge_tracy.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -33,7 +34,7 @@ namespace {
     bool   g_initOk  = false;
     bool   g_enabled = true;           // composite ON by default; F11 toggles it OFF/ON
     bool   g_skyEnabled = true;        // Sky takeover is DONE → Forge sky is now ALWAYS ON (no longer toggled).
-    bool   g_waterEnabled = false;     // WT1 Forge water pass OFF by default; F7 toggles it ON/OFF (clean A/B vs MW water)
+    bool   g_waterEnabled = true;      // Forge water takeover is DONE → ON by default ("always on"); F7 still toggles OFF for A/B vs MW water
     int    g_debugMode = 0;            // F12 diagnostic cycle: 0=normal, 1=depth (world-distance), 2=scatter, 3=AO, 4=bent normal
     unsigned g_frame = 0;
 
@@ -1252,6 +1253,10 @@ namespace RenderProcess {
         if (!device || !g_initOk) {
             return;
         }
+        // Whole client-side Forge driving phase: geom flush → build draw lists → tex flush → the
+        // blocking host RPC → RT copy → composite blit. Zoned so the Tracy frame has NO unaccounted
+        // gap here (the earlier "unaccounted after renderCacheDepthToMainZ" was this function).
+        MGE_ZoneScopedN("Forge onStage0Composite");
 
         const double tStart = nowMs();
         const double dtPresent = (g_lastPresentMs > 0.0) ? (tStart - g_lastPresentMs) : 0.0;
@@ -1261,7 +1266,13 @@ namespace RenderProcess {
         // composite toggle, so the host's mesh store is ready when we turn it on).
         const std::uint32_t geomParts = g_pendingParts;            // snapshot (flush clears it)
         const std::size_t   geomBytes = g_pendingBlob.size();
-        flushGeometry();
+        {
+            // The ~1ms "beginning gap" before the build-lists zone: shipping this frame's captured
+            // geometry over IPC (the cache walk's output). Cheap on steady frames (geom+=0KB), spikes
+            // on cell loads. Goes to ~0 with Phase 2 (resident GPU geometry — nothing to ship).
+            MGE_ZoneScopedN("Forge geom flush");
+            flushGeometry();
+        }
         const double tGeomFlush = nowMs();
 
         // Live toggle (debug key). Edge-triggered.
@@ -1307,18 +1318,27 @@ namespace RenderProcess {
         // triangle if the scene path or draw data isn't available.
         double hostMs = 0.0;
         bool ok = false;
-        const std::uint32_t drawCount = buildDrawList();
-        const std::uint32_t skinnedCount = buildSkinnedDrawList();
-        const std::uint32_t multiMapCount = buildMultiMapDrawList();
-        const std::uint32_t lightCount = buildLightList();
-        const std::uint32_t skyCount = buildSkyDrawList();
+        // Re-walk the geometry cache to build the host's draw lists (the MGE→Forge feeding cost —
+        // Phase 2 makes this GPU-resident so it goes to 0).
+        std::uint32_t drawCount, skinnedCount, multiMapCount, lightCount, skyCount;
+        {
+            MGE_ZoneScopedN("Forge build draw lists");
+            drawCount = buildDrawList();
+            skinnedCount = buildSkinnedDrawList();
+            multiMapCount = buildMultiMapDrawList();
+            lightCount = buildLightList();
+            skyCount = buildSkyDrawList();
+        }
         const double tBuild = nowMs();
 
         // Ship any textures newly referenced this frame BEFORE the scene draw that uses them
         // (buildDrawList queued their DDS via resolveTextureSlot). Lazy: only first-seen textures.
         const std::uint32_t texCount = g_texPendingCount;          // snapshot (flush clears it)
         const std::size_t   texBytes = g_texPendingBlob.size();
-        flushTextures();
+        {
+            MGE_ZoneScopedN("Forge tex flush");
+            flushTextures();
+        }
         const double tTexFlush = nowMs();
 
         const bool haveDraw = g_drawVec && drawCount > 0
@@ -1356,6 +1376,15 @@ namespace RenderProcess {
             skyBytes = (std::uint32_t)g_skyScratch.size();
         }
         const double tAssign = nowMs();
+
+        // The MGE→Forge FEEDING cost (the bulk of the "unaccounted" client gap): every frame MGE
+        // walks its scene-graph cache to rebuild the host's draw lists + uploads geom/tex over IPC.
+        // This is exactly the dependence to drive toward 0 — a resident flat GPU scene (Phase 2) lets
+        // the host keep geometry across frames and the GPU cull build draw lists, removing both.
+        MGE_TracyPlot("Forge prep: geomFlush ms", tGeomFlush - tStart);
+        MGE_TracyPlot("Forge prep: buildLists ms", tBuild - tGeomFlush);
+        MGE_TracyPlot("Forge prep: texFlush ms", tTexFlush - tBuild);
+        MGE_TracyPlot("Forge prep: assign ms", tAssign - tTexFlush);
 
         // Only drive + composite the host when there's actual scene data this frame. With no
         // draw list (loading doors, menus, empty cells) we must NOT fall back to the bring-up
@@ -1467,21 +1496,37 @@ namespace RenderProcess {
             waterParams[11] = 0.0f;
         }
 
-        ok = g_client->renderSceneBlocking(frame, (const float*)&viewProj, lighting,
-                 haveDraw ? g_drawVec->id() : IPC::InvalidVector,
-                 haveDraw ? drawCount : 0,
-                 haveDraw ? (std::uint32_t)g_drawScratch.size() : 0,
-                 skinnedId, skinnedCount, skinnedBytes,
-                 multiMapId, (multiMapId != IPC::InvalidVector) ? multiMapCount : 0, multiMapBytes,
-                 lightId, (lightId != IPC::InvalidVector) ? lightCount : 0, lightBytes,
-                 skyId, (skyId != IPC::InvalidVector) ? skyCount : 0, skyBytes,
-                 (std::uint32_t)g_debugMode, &devInput, waterParams, waterOn, &hostMs);
+        // Blocking RPC: the client thread STALLS here until the Forge host finishes its whole
+        // frame (record + GPU + present-seam). Serial — no overlap with MGE's frame. Zoned so the
+        // wait is accounted in Tracy (was the ~10ms "unaccounted" gap after renderCacheDepthToMainZ).
+        const double tPreForge = nowMs();
+        {
+            MGE_ZoneScopedN("Forge renderSceneBlocking (host wait)");
+            ok = g_client->renderSceneBlocking(frame, (const float*)&viewProj, lighting,
+                     haveDraw ? g_drawVec->id() : IPC::InvalidVector,
+                     haveDraw ? drawCount : 0,
+                     haveDraw ? (std::uint32_t)g_drawScratch.size() : 0,
+                     skinnedId, skinnedCount, skinnedBytes,
+                     multiMapId, (multiMapId != IPC::InvalidVector) ? multiMapCount : 0, multiMapBytes,
+                     lightId, (lightId != IPC::InvalidVector) ? lightCount : 0, lightBytes,
+                     skyId, (skyId != IPC::InvalidVector) ? skyCount : 0, skyBytes,
+                     (std::uint32_t)g_debugMode, &devInput, waterParams, waterOn, &hostMs);
+        }
         const double tRender = nowMs();
+        // Split the wait: hostMs = host self-timed cost; (client wait - hostMs) = IPC/sync/host-present
+        // overhead. If these diverge, the host frame is serializing behind its own present.
+        MGE_TracyPlot("Forge client wait ms", tRender - tPreForge);
+        MGE_TracyPlot("Forge host ms", hostMs);
         if (!ok) {
             return;
         }
 
-        if (!copyHostRtToDst()) {
+        bool copyOk;
+        {
+            MGE_ZoneScopedN("Forge RT copy");
+            copyOk = copyHostRtToDst();
+        }
+        if (!copyOk) {
             static bool logged = false;
             if (!logged) { LOG::logline("!! [seam] copyHostRtToDst failed"); logged = true; }
             return;
@@ -1498,6 +1543,7 @@ namespace RenderProcess {
         // stage does this). -0.5 px offset + POINT filter = the 1:1 texel mapping StretchRect
         // gave (the geometry half-pixel was already corrected host-side).
         {
+            MGE_ZoneScopedN("Forge composite blit");
             IDirect3DStateBlock9* sb = nullptr;
             device->CreateStateBlock(D3DSBT_ALL, &sb);
 

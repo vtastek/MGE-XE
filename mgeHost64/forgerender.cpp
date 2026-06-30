@@ -43,6 +43,7 @@
 // vendored UI.cpp shim (uiSetExternalInput) — see [[project_forge_dev_overlay]].
 #include "Application/Interfaces/IUI.h"
 #include "Application/Interfaces/IFont.h"
+#include "Utilities/ThirdParty/OpenSource/bstrlib/bstrlib.h"   // Phase 0 panel: DynamicTextWidget live stats
 #if defined(ENABLE_GRAPHICS_VALIDATION)
 // ID3D12InfoQueue (break-on-severity control). d3d12.h is already pulled in by
 // IGraphics.h for the D3D12 backend; this only adds the debug-layer interface.
@@ -956,6 +957,8 @@ namespace {
         CmdPool*        pCmdPool = nullptr;
         Cmd*            pCmd = nullptr;
         Fence*          pFence = nullptr;
+        QueryPool*      pGpuQueryPool = nullptr;   // GPU timestamp pool (per-phase 4ms breakdown)
+        double          gpuTickFreq = 0.0;         // timestamp ticks/sec (getTimestampFrequency)
         ID3D12Resource* pSharedRes = nullptr;   // owned by pRT (released on removeRenderTarget)
         HANDLE          ntHandle = nullptr;     // host-process NT shared handle
         uint32_t        width = 0, height = 0;
@@ -1194,6 +1197,10 @@ namespace {
     constexpr uint32_t kMaxBonesPerPart = 32;
     constexpr uint32_t kSkinnedPerWindow = kBatchSize / kMaxBonesPerPart;   // 32
     constexpr uint32_t kMaxSkinned = kSkinnedPerWindow * kMaxBatches;       // 256
+
+    // GPU timestamp phases (the ~4ms gpu breakdown). Index = QueryDesc index in renderScene.
+    enum { kGpuPhasePrepass = 0, kGpuPhaseGtao, kGpuPhaseReflect, kGpuPhaseColor,
+           kGpuPhaseWater, kGpuPhaseResolve, kGpuPhaseCount };
 
     // Tier 4 multi-map: ONE 64KB world window holds kBatchSize(1024) matrices; cap at 256
     // parts/frame (< 1024 → a single window, no batching). Per-instance VB stride (uint32 slots):
@@ -2921,6 +2928,21 @@ namespace {
                         linName);
         }
 
+        // GPU timestamp pool for the per-phase 4ms breakdown (kGpuPhaseCount begin/end pairs).
+        // Failure is non-fatal — the breakdown just stays 0 (don't gate the scene on profiling).
+        {
+            QueryPoolDesc qd = {};
+            qd.pName = "GpuPhaseTimestamps";
+            qd.mType = QUERY_TYPE_TIMESTAMP;
+            qd.mQueryCount = kGpuPhaseCount;
+            initQueryPool(R, &qd, &g_live.pGpuQueryPool);
+            if (g_live.pGpuQueryPool) {
+                getTimestampFrequency(g_live.pQueue, &g_live.gpuTickFreq);
+                std::printf("[forge] GPU timestamp pool ready (%u phases, freq=%.0f ticks/s)\n",
+                            (unsigned)kGpuPhaseCount, g_live.gpuTickFreq);
+            }
+        }
+
         std::printf("[forge] opaque scene path ready (depth %ux%u, maxDraws=%u, batched %ux%u, maxSkinned=%u, maxMultiMap=%u)\n",
                     width, height, kMaxDraws, kMaxBatches, kBatchSize, kMaxSkinned, kMaxMultiMap);
         return true;
@@ -2990,6 +3012,36 @@ namespace {
     unsigned  g_lastMultiMapDrawn = 0; // multi-map parts actually drawn in the last renderScene
     unsigned  g_lastSkyDrawn = 0;      // SK1 sky parts actually drawn in the last renderScene
     unsigned  g_lastLightCount = 0;    // point lights uploaded in the last renderScene
+    // Phase 0 panel readouts: extra per-frame counters + single-frame timings (the 300-frame
+    // accumulators g_recAccum/g_gpuAccum are for the heartbeat; these are this frame's values).
+    unsigned  g_lastReflSkyDrawn = 0;  // sky shapes drawn into the reflection RT (WT2)
+    unsigned  g_lastWaterLevels  = 0;  // water clipmap LOD levels drawn (WT1)
+    double    g_lastRecMs = 0.0;       // this frame's CPU command-record ms (beginCmd→endCmd)
+    double    g_lastGpuMs = 0.0;       // this frame's GPU submit→fence ms (incl. resolve)
+    // Pre-record CPU split (the ~2ms the client saw that record+gpu didn't account for): the host
+    // frame is setup + cull + record + gpu. setup = per-draw world/instance memcpy + cbuffers;
+    // cull = dlLiveCullAndBuild (CPU frustum/tier cull + ring fill + lazy resource/texture load,
+    // MUST run pre-beginCmd). post = after the fence (panel/heartbeat). total = whole renderScene.
+    double    g_lastSetupMs = 0.0;
+    double    g_lastCullMs  = 0.0;
+    double    g_lastPostMs  = 0.0;
+    double    g_lastTotalMs = 0.0;
+    // GPU-side per-phase ms (breaks down the ~4ms gpu via timestamp queries). kGpuPhase* enum
+    // is defined up near kMaxDraws (used in buildOpaquePath, earlier in the TU than this block).
+    double    g_lastGpuPhaseMs[kGpuPhaseCount] = {};
+    // Live DL cull survivors (set in dlLiveCullAndBuild). Declared here (not in the DL section lower
+    // in the TU) so the Phase 0 panel readout in drawDevUI can see them.
+    uint32_t  g_liveLastInst = 0, g_liveLastSubsets = 0, g_liveLastLand = 0;
+    uint32_t  g_lastCullExamined = 0;   // instances the cull TESTED this frame (cull-ms normalizer)
+
+    // Phase 0 panel toggles: turn a Forge subsystem's draw OFF to reveal MW's own version through the
+    // premultiplied composite (instant visual A/B). All default ON (no behaviour change). Host-side —
+    // they gate the host render blocks; MGE's counterparts are gated separately on the client (F-keys).
+    bool g_drawSky       = true;
+    bool g_drawDLLand    = true;
+    bool g_drawDLStatics = true;
+    bool g_drawWater     = true;
+    bool g_drawReflect   = true;
     uint32_t  g_debugMode = 0;         // F12 debug view: 0=normal, 1=depth, 2=scatter (written to FrameData.debugParams.x)
 
     // ---- Dev overlay (Forge IUI) state ----
@@ -3002,6 +3054,11 @@ namespace {
     float         g_inMouseX = 0.0f, g_inMouseY = 0.0f, g_inWheel = 0.0f;
     bool          g_inLBtn = false, g_inRBtn = false, g_inMBtn = false;
     int32_t       g_uiDropdownMode = 0;        // DebugTexturesWidget/Dropdown mirror of g_debugMode
+    // Phase 0 live-stats readout: a DynamicTextWidget backed by a fixed char array (Forge pattern,
+    // 01_Transformations). drawDevUI bformat()s the current per-frame counts into it each frame.
+    unsigned char g_statsBuf[1024] = {};
+    bstring       g_statsText = bfromarr(g_statsBuf);
+    float4        g_statsColor = { 0.70f, 1.0f, 0.70f, 1.0f };
 
     // ---- AO knobs (Stage 3): promoted from the hardcoded constants so sliders drive them live.
     // ap[20..23] read these each frame, so a slider move takes effect next frame. aoThickness is
@@ -3169,6 +3226,28 @@ namespace {
         CheckboxWidget cWRefr = {}; cWRefr.pData = &g_waterRefrOnly;
         uiAddComponentWidget(g_uiPanel, "Water: refraction only", &cWRefr, WIDGET_TYPE_CHECKBOX);
 
+        // -- Phase 0: per-subsystem draw toggles (off → MW's version shows through the composite) --
+        LabelWidget subLbl = {};
+        uiAddComponentWidget(g_uiPanel, "-- Forge subsystems (off = show MW) --", &subLbl, WIDGET_TYPE_LABEL);
+        CheckboxWidget cDSky = {}; cDSky.pData = &g_drawSky;
+        uiAddComponentWidget(g_uiPanel, "Draw: sky", &cDSky, WIDGET_TYPE_CHECKBOX);
+        CheckboxWidget cDLand = {}; cDLand.pData = &g_drawDLLand;
+        uiAddComponentWidget(g_uiPanel, "Draw: distant land", &cDLand, WIDGET_TYPE_CHECKBOX);
+        CheckboxWidget cDStat = {}; cDStat.pData = &g_drawDLStatics;
+        uiAddComponentWidget(g_uiPanel, "Draw: distant statics", &cDStat, WIDGET_TYPE_CHECKBOX);
+        CheckboxWidget cDWat = {}; cDWat.pData = &g_drawWater;
+        uiAddComponentWidget(g_uiPanel, "Draw: water", &cDWat, WIDGET_TYPE_CHECKBOX);
+        CheckboxWidget cDRef = {}; cDRef.pData = &g_drawReflect;
+        uiAddComponentWidget(g_uiPanel, "Draw: reflection", &cDRef, WIDGET_TYPE_CHECKBOX);
+
+        // -- Phase 0: live per-frame stats (updated each frame in drawDevUI) --
+        LabelWidget statLbl = {};
+        uiAddComponentWidget(g_uiPanel, "-- Stats (this frame) --", &statLbl, WIDGET_TYPE_LABEL);
+        DynamicTextWidget statsW = {};
+        statsW.pText = &g_statsText;
+        statsW.pColor = &g_statsColor;
+        uiAddComponentWidget(g_uiPanel, "", &statsW, WIDGET_TYPE_DYNAMIC_TEXT);
+
         g_uiInited = true;
         LOG::logline(">> [devui] ready (%ux%u fmt=%u)", width, height, colorFmt); LOG::flush();
     }
@@ -3194,6 +3273,23 @@ namespace {
             uiAddComponentWidget(g_uiPanel, "AO  |  LinearDepth", &dbg, WIDGET_TYPE_DEBUG_TEXTURES);
             s_texWidgetAdded = true;
         }
+
+        // Phase 0: refresh the live-stats text from this frame's counters (Forge bformat pattern).
+        bformat(&g_statsText,
+                "near opaque %u | skinned %u | multimap %u\n"
+                "sky %u | reflect-sky %u | lights %u\n"
+                "DL land %u | DL statics %u inst / %u subsets\n"
+                "water levels %u\n"
+                "host %.2f ms = setup %.2f + cull %.2f + rec %.2f + gpu %.2f + post %.2f\n"
+                "gpu: prepass %.2f gtao %.2f reflect %.2f color %.2f water %.2f resolve %.2f",
+                g_lastDrawn, g_lastSkinnedDrawn, g_lastMultiMapDrawn,
+                g_lastSkyDrawn, g_lastReflSkyDrawn, g_lastLightCount,
+                g_liveLastLand, g_liveLastInst, g_liveLastSubsets,
+                g_lastWaterLevels,
+                g_lastTotalMs, g_lastSetupMs, g_lastCullMs, g_lastRecMs, g_lastGpuMs, g_lastPostMs,
+                g_lastGpuPhaseMs[kGpuPhasePrepass], g_lastGpuPhaseMs[kGpuPhaseGtao],
+                g_lastGpuPhaseMs[kGpuPhaseReflect], g_lastGpuPhaseMs[kGpuPhaseColor],
+                g_lastGpuPhaseMs[kGpuPhaseWater], g_lastGpuPhaseMs[kGpuPhaseResolve]);
 
         uiSetExternalInput(g_inMouseX, g_inMouseY, g_inWheel, g_inLBtn, g_inRBtn, g_inMBtn, g_uiVisible);
         uiSetComponentActive(g_uiPanel, g_uiVisible);
@@ -3502,6 +3598,7 @@ namespace ForgeRender {
             return false;
         }
         Renderer* R = g_live.pRenderer;
+        const double tEntry = hostNowMs();   // host-frame split: start of renderScene
         checkShaderHotReload();   // auto-reload compute pipelines if a recompiled dxil landed on disk
 
         // If the device was already removed on a PRIOR frame (e.g. during a dense exterior),
@@ -3647,11 +3744,25 @@ namespace ForgeRender {
         // and load textures (addResource/updateDescriptorSet), which can't happen mid-command-buffer.
         // The recorded draws (dlLiveRecord) go in after the near colour pass. rzViewProj is the
         // relative, reverse-Z, extended-far matrix already in gFrameData.
+        const double tCull0 = hostNowMs();   // end of per-draw setup, start of the DL cull
         dlLiveCullAndBuild(R, rzViewProj);
+        const double tCull1 = hostNowMs();   // end of the DL cull (+ lazy resource/texture load)
 
         resetCmdPool(R, g_live.pCmdPool);
         beginCmd(g_live.pCmd);
         const double tRec0 = hostNowMs();   // start of CPU command recording
+        g_lastSetupMs = tCull0 - tEntry;    // hot-reload check + cbuffers + per-draw memcpy loop
+        g_lastCullMs  = tCull1 - tCull0;    // dlLiveCullAndBuild (CPU cull + ring fill + lazy loads)
+
+        // GPU per-phase timestamps: wrap each render phase with a begin/end query. cmdBeginQuery
+        // writes a GPU timestamp at phase start, cmdEndQuery at phase end; resolved before endCmd,
+        // read back after the fence (gpuMs). Empty/gated phases (reflection/water off) measure ~0.
+        auto gpuPhaseBegin = [&](uint32_t i) {
+            if (g_live.pGpuQueryPool) { QueryDesc q = {}; q.mIndex = i; cmdBeginQuery(g_live.pCmd, g_live.pGpuQueryPool, &q); }
+        };
+        auto gpuPhaseEnd = [&](uint32_t i) {
+            if (g_live.pGpuQueryPool) { QueryDesc q = {}; q.mIndex = i; cmdEndQuery(g_live.pCmd, g_live.pGpuQueryPool, &q); }
+        };
 
         // Color target: the MSAA color when antialiasing is on (resolved into pRT at the end),
         // else the shared pRT directly. The MSAA target is left in RENDER_TARGET between frames
@@ -3748,6 +3859,7 @@ namespace ForgeRender {
         // still write it in the colour pass) and is read as a DSV, not an SRV — coherent across
         // the two passes. (Skinned/multimap are NOT in the prepass yet — Tier 1b; they keep
         // their combined depth+colour draw, which still renders correctly.)
+        gpuPhaseBegin(kGpuPhasePrepass);
         {
             BindRenderTargetsDesc pbind = {};
             pbind.mRenderTargetCount = 0;
@@ -3920,6 +4032,8 @@ namespace ForgeRender {
             }
         }
 
+        gpuPhaseEnd(kGpuPhasePrepass);
+        gpuPhaseBegin(kGpuPhaseGtao);
         // ===================== TIER 2: LINEARIZE + GTAO COMPUTE =====================
         // First compute work in the host. Sits between the depth-complete prepass and the colour
         // pass: resolve pDepth (sample 0, MSAA-robust) -> single-sample pLinearDepth, then GTAO
@@ -4053,6 +4167,8 @@ namespace ForgeRender {
             }
         }
 
+        gpuPhaseEnd(kGpuPhaseGtao);
+        gpuPhaseBegin(kGpuPhaseReflect);
         // ===================== WT2: REFLECTION PASS (sky-only, Stage 1) =====================
         // Render the mirrored scene into pReflectColor (1024²) BEFORE the main colour pass, so the
         // water frag can sample it. Stage 1 = SKY ONLY: mirror world geometry about the water plane
@@ -4068,7 +4184,8 @@ namespace ForgeRender {
                 LOG::flush();
             }
         }
-        if (g_live.reflectReady && waterEnabled && waterParams && skyBlob && skyCount && skyBytes) {
+        g_lastReflSkyDrawn = 0;   // Phase 0 panel: 0 unless the reflection pass runs below
+        if (g_drawReflect && g_live.reflectReady && waterEnabled && waterParams && skyBlob && skyCount && skyBytes) {
             const float* fcbvR = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
             const float eyeAbsZ = fcbvR[58];                       // lodEye.z (absolute camera)
             const float waterLevelAbs = waterParams[0];
@@ -4181,6 +4298,7 @@ namespace ForgeRender {
                 cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, firstIndex, 1, firstVertex, idx);
                 ++reflSkyDrawn;
             }
+            g_lastReflSkyDrawn = reflSkyDrawn;   // Phase 0 panel
 
             static uint32_t s_reflDrawLog = 0;
             if ((s_reflDrawLog++ % 120) == 0) {
@@ -4201,6 +4319,8 @@ namespace ForgeRender {
             }
         }
 
+        gpuPhaseEnd(kGpuPhaseReflect);
+        gpuPhaseBegin(kGpuPhaseColor);
         // ===================== COLOUR PASS (early-Z: CMP_EQUAL, no depth write) =====================
         BindRenderTargetsDesc bind = {};
         bind.mRenderTargetCount = 1;
@@ -4219,7 +4339,7 @@ namespace ForgeRender {
         // captured as ordinary GeomVertexWire statics, so they live in the arena (or the dynamic ring
         // after the per-frame re-upload promotes them) — handle both. Capped at kMaxSkyDraws.
         uint32_t skyDrawn = 0;
-        if (skyBlob && skyCount && skyBytes && g_live.pSkyPipeline && g_live.pSkyWorldsBuf) {
+        if (g_drawSky && skyBlob && skyCount && skyBytes && g_live.pSkyPipeline && g_live.pSkyWorldsBuf) {
             const uint32_t haveSky = skyBytes / (uint32_t)sizeof(IPC::SkyDrawWire);
             uint32_t nSky = (skyCount < haveSky) ? skyCount : haveSky;
             if (nSky > kMaxSkyDraws) { nSky = kMaxSkyDraws; }
@@ -4517,13 +4637,16 @@ namespace ForgeRender {
         // scene and fills the horizon. Cull/ring-fill already ran before recording (dlLiveCullAndBuild).
         dlLiveRecord();
 
+        gpuPhaseEnd(kGpuPhaseColor);
+        gpuPhaseBegin(kGpuPhaseWater);
         // ===================== WT1: FORGE WATER SURFACE =====================
         // Drawn LAST (after near scene + DL) so the whole opaque frame is its refraction/scene-depth
         // source. Sequence: end the colour pass → copy colorTarget into pRefractColor (refraction src)
         // → re-bind the colour pass (LOAD/LOAD) → upload the per-LOD-level worlds + packed params +
         // invVP → draw one indexed-instanced call per clipmap level (DrawIndex=level). Depth GEQUAL +
         // write so water occludes / is occluded correctly. Gated by waterReady (build) + waterEnabled (F7).
-        if (g_live.waterReady && waterEnabled) {
+        g_lastWaterLevels = 0;   // Phase 0 panel: 0 unless the water pass runs below
+        if (g_live.waterReady && waterEnabled && g_drawWater) {
             // (1) End the colour pass; copy colorTarget → pRefractColor. CopyResource for 1x; for MSAA
             // the colour is multisampled → ResolveSubresource into the single-sample refraction copy.
             cmdBindRenderTargets(g_live.pCmd, nullptr);
@@ -4654,11 +4777,14 @@ namespace ForgeRender {
                 // vertBase here too DOUBLE-offset levels 1..5 → only level 0 drew (~1 cell of coverage).
                 cmdDrawIndexedInstanced(g_live.pCmd, lvl.triCount[variant] * 3,
                                         lvl.ibStart[variant], 1, 0, k);
+                ++g_lastWaterLevels;   // Phase 0 panel
             }
         }
 
         cmdBindRenderTargets(g_live.pCmd, nullptr);
 
+        gpuPhaseEnd(kGpuPhaseWater);
+        gpuPhaseBegin(kGpuPhaseResolve);
         if (g_live.sampleCount > 1) {
             // MSAA: resolve the multisampled color into the shared single-sample RT, then leave
             // the shared RT in COMMON for MW's D3D9Ex StretchRect. Forge has no RESOLVE resource
@@ -4717,6 +4843,11 @@ namespace ForgeRender {
             toCommon.mNewState = RESOURCE_STATE_COMMON;
             cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &toCommon);
         }
+        gpuPhaseEnd(kGpuPhaseResolve);
+        // Resolve all GPU phase timestamps into the readback buffer (valid after the fence below).
+        if (g_live.pGpuQueryPool) {
+            cmdResolveQuery(g_live.pCmd, g_live.pGpuQueryPool, 0, kGpuPhaseCount);
+        }
         endCmd(g_live.pCmd);
         const double tRec1 = hostNowMs();   // end of CPU recording (record = tRec1 - tRec0)
 
@@ -4730,6 +4861,17 @@ namespace ForgeRender {
         const double gpuMs = hostNowMs() - tRec1;
         g_recAccum += (tRec1 - tRec0);            // CPU per-draw bind+draw recording
         g_gpuAccum += gpuMs;                       // GPU execute (submit→fence)
+        g_lastRecMs = tRec1 - tRec0;               // Phase 0 panel: this frame's single values
+        g_lastGpuMs = gpuMs;
+        // GPU per-phase breakdown of gpuMs: read back the timestamps (valid now the fence signalled).
+        if (g_live.pGpuQueryPool && g_live.gpuTickFreq > 0.0) {
+            for (uint32_t i = 0; i < kGpuPhaseCount; ++i) {
+                QueryData qd = {};
+                getQueryData(R, g_live.pGpuQueryPool, i, &qd);
+                const uint64_t b = qd.mBeginTimestamp, e = qd.mEndTimestamp;
+                g_lastGpuPhaseMs[i] = (e > b) ? ((double)(e - b) / g_live.gpuTickFreq) * 1000.0 : 0.0;
+            }
+        }
         // Per-frame slow-GPU self-report (the 300-frame average can't surface a fresh dense-area
         // stall at 0.2 fps). Pairs with [dl-slow] (CPU cull) to localize a hitch to CPU vs GPU.
         if (gpuMs > 30.0) {
@@ -4748,11 +4890,27 @@ namespace ForgeRender {
         // dynamic = meshes in the upload-heap ring (must stay tiny — hundreds = over-promotion);
         // meshHigh = total slots ever populated (monotonic leak check). Lets us correlate the
         // client's [hb] frame cost with what the Forge renderer is actually drawing.
+        // Post-fence + whole-frame totals (host-internal; the server also wall-times renderScene for
+        // the client's hostMs — these let us see WHERE that wall goes: setup+cull+record+gpu+post).
+        g_lastPostMs  = hostNowMs() - (tRec1 + gpuMs);
+        g_lastTotalMs = hostNowMs() - tEntry;
         if ((g_renderFrame % 300u) == 0u) {
             LOG::logline(">> [forge-hb] frame=%u drawn=%u skinned=%u multimap=%u sky=%u dynamic=%u meshHigh=%u "
                          "| record=%.2fms gpu=%.2fms (avg/frame over 300)",
                          g_renderFrame, drawn, skinnedDrawn, multiMapDrawn, skyDrawn, g_dynamicCount, g_meshHigh,
                          g_recAccum / 300.0, g_gpuAccum / 300.0);
+            // Host-frame split (this frame's instantaneous values) so the ~2ms "unaccounted inside the
+            // host" the client saw is localized: setup (per-draw memcpy) + cull (DL CPU cull + lazy
+            // loads) + record + gpu + post = total. cull is the prime pre-record suspect.
+            LOG::logline(">> [forge-hb] host split: setup=%.2f cull=%.2f record=%.2f gpu=%.2f post=%.2f total=%.2fms"
+                         " | cull examined=%u survivors=%u (%.3f us/1k examined)",
+                         g_lastSetupMs, g_lastCullMs, g_lastRecMs, g_lastGpuMs, g_lastPostMs, g_lastTotalMs,
+                         g_lastCullExamined, g_liveLastInst,
+                         g_lastCullExamined ? (g_lastCullMs * 1000.0 / (g_lastCullExamined / 1000.0)) : 0.0);
+            LOG::logline(">> [forge-hb] gpu split: prepass=%.2f gtao=%.2f reflect=%.2f color=%.2f water=%.2f resolve=%.2f ms",
+                         g_lastGpuPhaseMs[kGpuPhasePrepass], g_lastGpuPhaseMs[kGpuPhaseGtao],
+                         g_lastGpuPhaseMs[kGpuPhaseReflect], g_lastGpuPhaseMs[kGpuPhaseColor],
+                         g_lastGpuPhaseMs[kGpuPhaseWater], g_lastGpuPhaseMs[kGpuPhaseResolve]);
             dlLogHeartbeat();
             g_recAccum = 0.0;
             g_gpuAccum = 0.0;
@@ -5257,6 +5415,20 @@ namespace ForgeRender {
     std::vector<StaticsTexBucket>             g_staticsBuckets;     // [0] = white; reals from [1]
     bool                                      g_staticsTexReady = false;
     std::vector<uint8_t>          g_usageData;          // resident usage.data
+    // Canonical per-instance cull data, precomputed ONCE at load (statics never move). Replaces the
+    // per-frame trig/mat-mul (Stage A) AND the per-frame tier/effR compute — the CPU cull now just
+    // reads this. It is ALSO the exact resident struct the Stage B GPU compute cull reads (88 B,
+    // aligned). world = absolute (S·Rz·Ry·Rx·T); -eye is applied per frame. rangeEndIdx 0/1/2 =
+    // near/far/veryFar tier; 0xFFFFFFFF = skip (grass). Indexed by ws0 instance index.
+    struct GpuCullInstance {
+        float    world[16];        // absolute world matrix
+        float    posX, posY;       // absolute xy (horizontal distance test)
+        float    effR;             // frustum sphere radius (def.radius * scale)
+        uint32_t rangeEndIdx;      // tier: 0=nearEnd 1=farEnd 2=vfarEnd ; 0xFFFFFFFF = skip
+        uint32_t firstSubset;
+        uint32_t numSubsets;
+    };
+    std::vector<GpuCullInstance>  g_cullInst;
     uint64_t  g_ws0Off    = 0;                          // byte offset of the first exterior instance record
     uint32_t  g_ws0Count  = 0;                          // exterior instance count
     uint32_t  g_staticsDrawCount = 0;                   // EI arg count (subsets with scoped instances)
@@ -5288,7 +5460,8 @@ namespace ForgeRender {
     float     g_dlEye[3]     = { 0, 0, 0 };            // realEye this frame (DL shift origin)
     // (Statics textures are all resident from load via gStaticsArrays — no per-frame load budget.)
     std::vector<uint32_t> g_liveLandVisible;           // land mesh indices surviving the frustum cull
-    uint32_t  g_liveLastInst = 0, g_liveLastSubsets = 0, g_liveLastLand = 0;  // per-frame draw counts (log)
+    // g_liveLastInst/Subsets/Land declared up with the other per-frame counters (Phase 0 panel needs
+    // them in drawDevUI, which is defined earlier in the TU).
 
     // Read an entire file into `out`. Uses std::vector (Forge's IMemory bans raw malloc).
     bool dlReadWholeFile(const char* path, std::vector<uint8_t>& out) {
@@ -6252,11 +6425,51 @@ namespace ForgeRender {
     void buildStaticsGrid() {
         g_liveGrid.clear();
         if (!g_staticsLoaded || g_ws0Count == 0) { return; }
+        // Precompute the canonical per-instance cull struct (same iteration as the grid). Mirrors the
+        // exact tier/effR rule the old per-frame hot loop used (dlshare.h:184) so survivors are
+        // byte-identical; only the per-frame distance + frustum tests + -eye stay in the loop.
+        g_cullInst.assign((size_t)g_ws0Count, GpuCullInstance{});
+        const float gFarMin  = Configuration.DL.FarStaticMinSize;
+        const float gVfarMin = Configuration.DL.VeryFarStaticMinSize;
         std::unordered_map<uint64_t, uint32_t> cellMap;
         cellMap.reserve(4096);
         const uint8_t* rec = &g_usageData[g_ws0Off];
         for (uint32_t i = 0; i < g_ws0Count; ++i, rec += 34) {
             float pos[3]; std::memcpy(pos, rec + 6, 12);
+            GpuCullInstance& gi = g_cullInst[i];
+            {
+                uint32_t staticRef; std::memcpy(&staticRef, rec, 4);
+                float yaw, pitch, roll, scale;
+                std::memcpy(&yaw, rec + 18, 4); std::memcpy(&pitch, rec + 22, 4);
+                std::memcpy(&roll, rec + 26, 4); std::memcpy(&scale, rec + 30, 4);
+                // Absolute world matrix (S·Rz·Ry·Rx·T) — same math as the old hot loop, minus -eye.
+                float cz=std::cos(-roll),  sz=std::sin(-roll);
+                float cyf=std::cos(-pitch),syf=std::sin(-pitch);
+                float cxf=std::cos(-yaw),  sxf=std::sin(-yaw);
+                float S[16]  = { scale,0,0,0, 0,scale,0,0, 0,0,scale,0, 0,0,0,1 };
+                float Rz[16] = { cz,sz,0,0, -sz,cz,0,0, 0,0,1,0, 0,0,0,1 };
+                float Ry[16] = { cyf,0,-syf,0, 0,1,0,0, syf,0,cyf,0, 0,0,0,1 };
+                float Rx[16] = { 1,0,0,0, 0,cxf,sxf,0, 0,-sxf,cxf,0, 0,0,0,1 };
+                float Tm[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, pos[0],pos[1],pos[2],1 };
+                float m0[16], m1[16], m2[16];
+                dlMul(S,  Rz, m0); dlMul(m0, Ry, m1); dlMul(m1, Rx, m2); dlMul(m2, Tm, gi.world);
+                gi.posX = pos[0]; gi.posY = pos[1];
+                // tier/effR/subset range — precomputed (constant per session: type, size, DL config).
+                if (staticRef >= g_staticsDefs.size()) { gi.rangeEndIdx = 0xFFFFFFFFu; }
+                else {
+                    const StaticsDefCPU& def = g_staticsDefs[staticRef];
+                    gi.effR = def.radius * scale;
+                    gi.firstSubset = def.firstSubset; gi.numSubsets = def.numSubsets;
+                    float tierR = (def.type == DL_STATIC_BUILDING) ? gi.effR * 2.0f : gi.effR;
+                    switch (def.type) {
+                        case DL_STATIC_GRASS:    gi.rangeEndIdx = 0xFFFFFFFFu; break;  // skip
+                        case DL_STATIC_NEAR:     gi.rangeEndIdx = 0; break;
+                        case DL_STATIC_FAR:      gi.rangeEndIdx = 1; break;
+                        case DL_STATIC_VERY_FAR: gi.rangeEndIdx = 2; break;
+                        default: gi.rangeEndIdx = (tierR <= gFarMin) ? 0 : (tierR <= gVfarMin ? 1 : 2); break;
+                    }
+                }
+            }
             int32_t ix = (int32_t)std::floor(pos[0] / kLiveGridCell);
             int32_t iy = (int32_t)std::floor(pos[1] / kLiveGridCell);
             uint64_t key = ((uint64_t)(uint32_t)ix << 32) | (uint32_t)iy;
@@ -6396,8 +6609,8 @@ namespace ForgeRender {
         const float nearEnd = Configuration.DL.NearStaticEnd     * 8192.0f;   // cell -> world distance
         const float farEnd  = Configuration.DL.FarStaticEnd      * 8192.0f;
         const float vfarEnd = Configuration.DL.VeryFarStaticEnd  * 8192.0f;
-        const float farMin  = Configuration.DL.FarStaticMinSize;
-        const float vfarMin = Configuration.DL.VeryFarStaticMinSize;
+        // (FarStaticMinSize/VeryFarStaticMinSize are now consumed at LOAD — tier is precomputed into
+        //  g_cullInst.rangeEndIdx, so the per-frame hot loop no longer needs the MinSize thresholds.)
         // Near cutoff: the Forge NEAR path (cache opaque) already draws statics within the near
         // scene, so a DL static drawn there is a DUPLICATE → z-fight ("double rendering, near and DL").
         // Skip DL statics closer than the handover (MGE clips its distant statics at nearViewRange-768).
@@ -6416,58 +6629,42 @@ namespace ForgeRender {
             float hx = 0.5f*(c.maxx-c.minx)+pad, hy = 0.5f*(c.maxy-c.miny)+pad, hz = 0.5f*(c.maxz-c.minz)+pad;
             float cr = std::sqrt(hx*hx + hy*hy + hz*hz);
             if (!dlSphereInFrustum(planes, ccx, ccy, ccz, cr)) { continue; }
+            // Cell-level DISTANCE reject (Stage A.5): the per-instance test rejects anything past its
+            // tier range (≤ vfarEnd, the max). If the cell's NEAREST horizontal point is already beyond
+            // vfarEnd, every instance in it is out of range → skip the whole cell. The grid's frustum
+            // test alone passes cells out to the far plane (>> vfarEnd), so ~all the 96%-rejected
+            // examined instances live in too-far cells. Nearest-point dist to the xy AABB (+pad margin).
+            {
+                float nx = eye[0] < c.minx ? c.minx : (eye[0] > c.maxx ? c.maxx : eye[0]);
+                float ny = eye[1] < c.miny ? c.miny : (eye[1] > c.maxy ? c.maxy : eye[1]);
+                float ndx = eye[0] - nx, ndy = eye[1] - ny;
+                float farLimit = vfarEnd + pad;   // pad for static extent (the per-instance test is exact)
+                if (ndx*ndx + ndy*ndy > farLimit*farLimit) { continue; }
+            }
             ++cellsHit;
 
             for (uint32_t ii : c.inst) {
                 ++examined;
-                const uint8_t* rec = &g_usageData[g_ws0Off + (uint64_t)ii * 34];
-                uint32_t staticRef; std::memcpy(&staticRef, rec, 4);
-                if (staticRef >= g_staticsDefs.size()) { continue; }
-                float pos[3], yaw, pitch, roll, scale;
-                std::memcpy(pos, rec + 6, 12);
-                std::memcpy(&yaw, rec + 18, 4); std::memcpy(&pitch, rec + 22, 4);
-                std::memcpy(&roll, rec + 26, 4); std::memcpy(&scale, rec + 30, 4);
-
-                const StaticsDefCPU& def = g_staticsDefs[staticRef];
-                // Tier/size rule (dlshare.h:184). Buildings ×2 for tier selection only.
-                float effR  = def.radius * scale;
-                float tierR = (def.type == DL_STATIC_BUILDING) ? effR * 2.0f : effR;
-                int tier;
-                switch (def.type) {
-                    case DL_STATIC_GRASS:    continue;             // grass not in this path
-                    case DL_STATIC_NEAR:     tier = 0; break;
-                    case DL_STATIC_FAR:      tier = 1; break;
-                    case DL_STATIC_VERY_FAR: tier = 2; break;
-                    default:  // AUTO/TREE/BUILDING
-                        tier = (tierR <= farMin) ? 0 : (tierR <= vfarMin ? 1 : 2);
-                        break;
-                }
-                float rangeEnd = (tier == 0) ? nearEnd : (tier == 1) ? farEnd : vfarEnd;
-                float dx = pos[0] - eye[0], dy = pos[1] - eye[1];
+                // All per-instance cull data is precomputed (g_cullInst). Only the per-frame tests
+                // (distance vs eye, frustum) + the -eye shift remain. world[12..14] == absolute pos.
+                const GpuCullInstance& gi = g_cullInst[ii];
+                if (gi.rangeEndIdx == 0xFFFFFFFFu) { continue; }   // grass / invalid → skip
+                float rangeEnd = (gi.rangeEndIdx == 0) ? nearEnd : (gi.rangeEndIdx == 1) ? farEnd : vfarEnd;
+                float dx = gi.posX - eye[0], dy = gi.posY - eye[1];
                 float d2 = dx*dx + dy*dy;
                 if (d2 < nearCut2 || d2 > rangeEnd*rangeEnd) { continue; }   // near-owned or beyond tier
 
-                // Frustum-cull the instance sphere (relative space).
-                if (!dlSphereInFrustum(planes, pos[0]-eye[0], pos[1]-eye[1], pos[2]-eye[2], effR)) { continue; }
+                // Frustum-cull the instance sphere (relative space). z = world[14] (absolute pos.z).
+                if (!dlSphereInFrustum(planes, dx, dy, gi.world[14]-eye[2], gi.effR)) { continue; }
 
-                // World matrix (buildStaticsScope math), translation pre-shifted by -eye.
-                float cz=std::cos(-roll),  sz=std::sin(-roll);
-                float cyf=std::cos(-pitch),syf=std::sin(-pitch);
-                float cxf=std::cos(-yaw),  sxf=std::sin(-yaw);
-                float S[16]  = { scale,0,0,0, 0,scale,0,0, 0,0,scale,0, 0,0,0,1 };
-                float Rz[16] = { cz,sz,0,0, -sz,cz,0,0, 0,0,1,0, 0,0,0,1 };
-                float Ry[16] = { cyf,0,-syf,0, 0,1,0,0, syf,0,cyf,0, 0,0,0,1 };
-                float Rx[16] = { 1,0,0,0, 0,cxf,sxf,0, 0,-sxf,cxf,0, 0,0,0,1 };
-                float Tm[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, pos[0],pos[1],pos[2],1 };
-                float m0[16], m1[16], m2[16], W[16];
-                dlMul(S,  Rz, m0);
-                dlMul(m0, Ry, m1);
-                dlMul(m1, Rx, m2);
-                dlMul(m2, Tm, W);
+                // World matrix: copy the precomputed absolute matrix, then the ONLY per-frame change —
+                // the camera-relative -eye shift on the translation row.
+                float W[16];
+                std::memcpy(W, gi.world, 16 * sizeof(float));
                 W[12] -= eye[0]; W[13] -= eye[1]; W[14] -= eye[2];   // camera-relative shift
 
-                for (uint32_t k = 0; k < def.numSubsets; ++k) {
-                    uint32_t sid = def.firstSubset + k;
+                for (uint32_t k = 0; k < gi.numSubsets; ++k) {
+                    uint32_t sid = gi.firstSubset + k;
                     // texSlot = (bucket<<16)|layer, resolved once in buildStaticsTextureArrays; all
                     // statics textures are resident in gStaticsArrays (no per-frame re-resolve/stream).
                     uint32_t ts = g_staticsSubsets[sid].texSlot;   // <= 127<<16 -> exact as float
@@ -6505,6 +6702,7 @@ namespace ForgeRender {
         }
         g_liveLastInst = instBase;
         g_liveLastSubsets = drawCount;
+        g_lastCullExamined = examined;   // instances tested this frame — normalizes cull ms across scenes
         if (overflow) {
             static bool warned = false;
             if (!warned) { std::printf("[forge][dl] live ring overflow (inst cap %u / subset cap %u) — clamped\n",
@@ -6531,6 +6729,7 @@ namespace ForgeRender {
         if (!g_dlExterior || !g_dlLiveInit || !g_landLoaded) { return; }
         cmdBeginDebugMarker(g_live.pCmd, 0.3f, 0.8f, 0.5f, "DISTANT LAND (live)");
 
+        if (g_drawDLLand) {   // Phase 0 panel toggle
         cmdBindPipeline(g_live.pCmd, g_pLandPipeline);
         cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
         cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
@@ -6544,8 +6743,9 @@ namespace ForgeRender {
             cmdBindIndexBuffer(g_live.pCmd, m.ib, m.large ? INDEX_TYPE_UINT32 : INDEX_TYPE_UINT16, 0);
             cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, 0, 1, 0, 0);
         }
+        }
 
-        if (g_staticsLiveOk && g_liveLastSubsets > 0) {
+        if (g_drawDLStatics && g_staticsLiveOk && g_liveLastSubsets > 0) {
             cmdBindPipeline(g_live.pCmd, g_pStaticsPipeline);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
