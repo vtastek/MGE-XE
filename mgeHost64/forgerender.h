@@ -162,6 +162,13 @@ namespace ForgeRender {
     // the distant land. Dumps forge_statics.tga. Proves the GPU-driven statics path in isolation.
     bool renderDistantStaticsProbe();
 
+    // Standalone interactive world viewer (--forge-view): a real Win32 window + Forge swapchain
+    // showing the host-owned distant land + statics that you fly around (WASD + arrows, Shift = fast,
+    // ESC = quit). No Morrowind / IPC / client — isolates Forge renderer bugs from integration bugs
+    // and iterates fast. Renders into the headless pRT (probe path) then copies pRT -> backbuffer ->
+    // present, in a message loop. tasks/forge-viewer.md.
+    bool worldViewer();
+
     // Tear down the persistent renderer (shared RT, pipeline, Forge stack).
     void shutdown();
 }

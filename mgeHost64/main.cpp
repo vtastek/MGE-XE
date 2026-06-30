@@ -54,6 +54,13 @@ int main(int argc, char** argv) {
 		return ForgeRender::renderDistantStaticsProbe() ? 0 : 1;
 	}
 
+	// Standalone interactive world viewer: a real window showing host-owned distant land + statics
+	// you fly around (WASD + arrows, ESC quit). No Morrowind/IPC — isolates Forge from integration.
+	// MUST run with cwd = morrowind64.
+	if (argc >= 2 && std::strcmp(argv[1], "--forge-view") == 0) {
+		return ForgeRender::worldViewer() ? 0 : 1;
+	}
+
 	// Standalone M1c opaque scene-path probe: init + uploadGeometry + renderScene with a
 	// dummy mesh, so a buildOpaquePath/draw crash is visible on stdout (no MW/IPC).
 	if (argc >= 2 && std::strcmp(argv[1], "--forge-scene") == 0) {

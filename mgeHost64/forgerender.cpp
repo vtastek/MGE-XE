@@ -6457,6 +6457,214 @@ namespace ForgeRender {
     bool renderDistantLandProbe()    { return renderDLProbe(false); }
     bool renderDistantStaticsProbe() { return renderDLProbe(true);  }
 
+    // ---- Standalone interactive world viewer (--forge-view) ---------------------------------------
+    // A real Win32 window + Forge swapchain showing the host-owned world (distant land + statics) that
+    // you fly around with WASD + arrow keys. NO Morrowind, NO IPC, NO client — so it isolates Forge
+    // RENDERER bugs from INTEGRATION bugs (a hang here = Forge; a hang only in-game = the seam/IPC)
+    // and iterates far faster than launching the game. Renders into the existing headless pRT (reusing
+    // the probe's land+statics record), then CopyResource pRT -> swapchain backbuffer -> present.
+    // tasks/forge-viewer.md. V1 = land+statics+fly-cam; sky (V2) and water (V3) layer on the loop.
+    static bool s_viewerQuit = false;
+    static LRESULT CALLBACK viewerWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+        switch (msg) {
+            case WM_CLOSE: case WM_DESTROY: s_viewerQuit = true; return 0;
+            case WM_KEYDOWN: if (wp == VK_ESCAPE) { s_viewerQuit = true; } return 0;
+        }
+        return DefWindowProcW(h, msg, wp, lp);
+    }
+
+    bool worldViewer() {
+        std::setvbuf(stdout, nullptr, _IONBF, 0);
+        const unsigned W = 1280, H = 720;
+        std::printf("[forge][view] world viewer (cwd must be morrowind64) — WASD+arrows fly, Shift fast, ESC quit\n");
+
+        // --- Win32 window ---
+        HINSTANCE hInst = GetModuleHandleW(nullptr);
+        WNDCLASSEXW wc = {}; wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = viewerWndProc; wc.hInstance = hInst;
+        wc.lpszClassName = L"ForgeWorldViewer"; wc.hCursor = LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW);
+        RegisterClassExW(&wc);
+        RECT wr = { 0, 0, (LONG)W, (LONG)H };
+        AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
+        HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"Forge World Viewer  (WASD + arrows, Shift = fast, ESC = quit)",
+            WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, wr.right - wr.left, wr.bottom - wr.top,
+            nullptr, nullptr, hInst, nullptr);
+        if (!hwnd) { std::printf("[forge][view] CreateWindow FAILED\n"); return false; }
+        ShowWindow(hwnd, SW_SHOW); s_viewerQuit = false;
+
+        // --- init renderer (single-sample so the pRT->backbuffer copy is 1:1) + load land + statics ---
+        if (!init(W, H, 1, 8)) { std::printf("[forge][view] init FAILED\n"); return false; }
+        Renderer* R = g_live.pRenderer;
+        if (!buildOpaquePath(R, g_live.width, g_live.height) || !buildLandPath(R) || !loadDistantLand(R)) {
+            std::printf("[forge][view] DL load FAILED\n"); shutdown(); return false;
+        }
+        float staticsT[3] = { 0, 0, 0 };
+        bool haveStatics = buildStaticsPath(R) && loadDistantStatics(R) && buildStaticsTextureArrays(R);
+        if (haveStatics) { pickStaticsTarget(staticsT); haveStatics = buildStaticsScope(R, staticsT); }
+        std::printf("[forge][view] loaded: %u land meshes, statics=%d (%u draws)\n",
+                    g_landMeshCount, (int)haveStatics, g_staticsDrawCount);
+
+        // --- swapchain on the window + present sync ---
+        SwapChain* pSwap = nullptr;
+        SwapChainDesc scd = {};
+        scd.mWindowHandle.type = WINDOW_HANDLE_TYPE_WIN32;
+        scd.mWindowHandle.window = hwnd;
+        scd.ppPresentQueues = &g_live.pQueue; scd.mPresentQueueCount = 1;
+        scd.mImageCount = 2; scd.mWidth = W; scd.mHeight = H;
+        scd.mColorFormat = TinyImageFormat_B8G8R8A8_UNORM;
+        scd.mEnableVsync = true;
+        addSwapChain(R, &scd, &pSwap);
+        if (!pSwap) { std::printf("[forge][view] addSwapChain FAILED\n"); shutdown(); return false; }
+        Semaphore* pImgSem = nullptr; Semaphore* pRenderSem = nullptr;
+        initSemaphore(R, &pImgSem); initSemaphore(R, &pRenderSem);
+
+        // --- terrain bounds → camera start (the probe's land overview), then free-fly ---
+        float mnX=3.4e38f,mnY=3.4e38f,mnZ=3.4e38f,mxX=-3.4e38f,mxY=-3.4e38f,mxZ=-3.4e38f;
+        for (uint32_t i=0;i<g_landMeshCount;++i){ const LandMeshGPU& m=g_landMeshes[i];
+            mnX=(m.cx-m.r<mnX)?m.cx-m.r:mnX; mxX=(m.cx+m.r>mxX)?m.cx+m.r:mxX;
+            mnY=(m.cy-m.r<mnY)?m.cy-m.r:mnY; mxY=(m.cy+m.r>mxY)?m.cy+m.r:mxY;
+            mnZ=(m.cz-m.r<mnZ)?m.cz-m.r:mnZ; mxZ=(m.cz+m.r>mxZ)?m.cz+m.r:mxZ; }
+        float cx=0.5f*(mnX+mxX), cy=0.5f*(mnY+mxY), cz=0.5f*(mnZ+mxZ);
+        float ext=((mxX-mnX)>(mxY-mnY))?(mxX-mnX):(mxY-mnY);
+        float eye[3] = { cx - 0.35f*ext, cy, mxZ + 0.10f*ext + 4000.0f };
+        // Aim at the terrain centre.
+        float aim[3] = { cx - eye[0], cy - eye[1], cz - eye[2] };
+        float aimLen = std::sqrt(aim[0]*aim[0]+aim[1]*aim[1]+aim[2]*aim[2]) + 1e-6f;
+        aim[0]/=aimLen; aim[1]/=aimLen; aim[2]/=aimLen;
+        float yaw = std::atan2(aim[1], aim[0]);
+        float pitch = std::asin(aim[2] < -1.0f ? -1.0f : (aim[2] > 1.0f ? 1.0f : aim[2]));
+        const float zn = 8.0f, zf = 2.0f*ext + 40000.0f;
+        const float yScale = 1.732051f;                       // 60° vertical FOV
+        const float kPi = 3.14159265f;
+        LARGE_INTEGER qf, t0; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&t0);
+
+        // --- render loop ---
+        while (!s_viewerQuit) {
+            MSG m;
+            while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageW(&m); }
+            if (s_viewerQuit) break;
+
+            // dt for frame-rate-independent movement.
+            LARGE_INTEGER t1; QueryPerformanceCounter(&t1);
+            float dt = (float)(t1.QuadPart - t0.QuadPart) / (float)qf.QuadPart; t0 = t1;
+            if (dt > 0.1f) dt = 0.1f;
+            auto down = [](int vk){ return (GetAsyncKeyState(vk) & 0x8000) != 0; };
+            float moveSpd = ext * 0.10f * dt * (down(VK_SHIFT) ? 6.0f : 1.0f);   // ~world-scaled
+            float lookSpd = 1.4f * dt;
+            if (down(VK_LEFT))  yaw   -= lookSpd;
+            if (down(VK_RIGHT)) yaw   += lookSpd;
+            if (down(VK_UP))    pitch += lookSpd;
+            if (down(VK_DOWN))  pitch -= lookSpd;
+            if (pitch >  1.55f) pitch =  1.55f;
+            if (pitch < -1.55f) pitch = -1.55f;
+            float cp = std::cos(pitch), sp = std::sin(pitch), cyw = std::cos(yaw), syw = std::sin(yaw);
+            float fwd[3] = { cp*cyw, cp*syw, sp };
+            float rgt[3] = { syw, -cyw, 0.0f };               // right = fwd × worldUp(Z), normalized in XY
+            if (down('W')) { eye[0]+=fwd[0]*moveSpd; eye[1]+=fwd[1]*moveSpd; eye[2]+=fwd[2]*moveSpd; }
+            if (down('S')) { eye[0]-=fwd[0]*moveSpd; eye[1]-=fwd[1]*moveSpd; eye[2]-=fwd[2]*moveSpd; }
+            if (down('D')) { eye[0]+=rgt[0]*moveSpd; eye[1]+=rgt[1]*moveSpd; }
+            if (down('A')) { eye[0]-=rgt[0]*moveSpd; eye[1]-=rgt[1]*moveSpd; }
+            if (down(VK_SPACE))   eye[2]+=moveSpd;
+            if (down(VK_CONTROL)) eye[2]-=moveSpd;
+            (void)kPi;
+
+            // viewProj from the camera (reverse-Z munge matches renderScene/probe).
+            float at[3] = { eye[0]+fwd[0], eye[1]+fwd[1], eye[2]+fwd[2] };
+            float up[3] = { 0.0f, 0.0f, 1.0f };
+            float view[16], proj[16], vp[16];
+            dlLookAtLH(eye, at, up, view);
+            dlPerspLH(yScale, (float)W/(float)H, zn, zf, proj);
+            dlMul(view, proj, vp);
+            vp[2]=vp[3]-vp[2]; vp[6]=vp[7]-vp[6]; vp[10]=vp[11]-vp[10]; vp[14]=vp[15]-vp[14];
+
+            float* fd = (float*)g_live.pFrameCbv->pCpuMappedAddress;
+            std::memcpy(fd, vp, 16*sizeof(float));
+            float sun[3] = { 0.4f, 0.2f, -0.9f }; dlNorm3(sun);
+            fd[16]=sun[0]; fd[17]=sun[1]; fd[18]=sun[2]; fd[19]=0;
+            fd[20]=1.0f; fd[21]=0.96f; fd[22]=0.86f; fd[23]=0;
+            fd[24]=0.34f; fd[25]=0.38f; fd[26]=0.46f; fd[27]=0;
+            fd[28]=0.60f; fd[29]=0.66f; fd[30]=0.78f; fd[31]=0;
+            fd[32]=0.30f*zf; fd[33]=0.95f*zf; fd[34]=0; fd[35]=0;
+            fd[36]=eye[0]; fd[37]=eye[1]; fd[38]=eye[2]; fd[39]=0;
+            fd[40]=0; fd[41]=1.0f/(float)W; fd[42]=1.0f/(float)H; fd[43]=0;
+            fd[44]=1; fd[45]=1; fd[46]=1; fd[47]=1;
+            fd[48]=(float)kLandBaseSlot; fd[49]=(float)kLandNormalSlot;
+            fd[50]=(float)kLandDetailSlot; fd[51]=7168.0f;
+            fd[52]=0.34f; fd[53]=0.38f; fd[54]=0.46f; fd[55]=0;
+            fd[56]=0; fd[57]=0; fd[58]=0; fd[59]=0;                // lodEye = 0 (camera absolute)
+
+            uint32_t idx = 0;
+            acquireNextImage(R, pSwap, pImgSem, nullptr, &idx);
+            RenderTarget* bb = pSwap->ppRenderTargets[idx];
+
+            resetCmdPool(R, g_live.pCmdPool);
+            beginCmd(g_live.pCmd);
+            BindRenderTargetsDesc bind = {};
+            bind.mRenderTargetCount = 1;
+            bind.mRenderTargets[0] = { g_live.pRT, LOAD_ACTION_CLEAR };
+            bind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_CLEAR };
+            cmdBindRenderTargets(g_live.pCmd, &bind);
+            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)W, (float)H, 0.0f, 1.0f);
+            cmdSetScissor(g_live.pCmd, 0, 0, W, H);
+            cmdBindPipeline(g_live.pCmd, g_pLandPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSet);
+            for (uint32_t i=0;i<g_landMeshCount;++i){ LandMeshGPU& mm=g_landMeshes[i];
+                Buffer* vbs[1]={mm.vb}; uint32_t st[1]={16};
+                cmdBindVertexBuffer(g_live.pCmd, 1, vbs, st, nullptr);
+                cmdBindIndexBuffer(g_live.pCmd, mm.ib, mm.large?INDEX_TYPE_UINT32:INDEX_TYPE_UINT16, 0);
+                cmdDrawIndexedInstanced(g_live.pCmd, mm.indexCount, 0, 1, 0, 0);
+            }
+            if (haveStatics && g_staticsDrawCount > 0) {
+                cmdBindPipeline(g_live.pCmd, g_pStaticsPipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSet);
+                Buffer* svbs[2]={g_pStaticsVB, g_pStaticsInst}; uint32_t sst[2]={20, kStaticsInstStride};
+                cmdBindVertexBuffer(g_live.pCmd, 2, svbs, sst, nullptr);
+                cmdBindIndexBuffer(g_live.pCmd, g_pStaticsIB, INDEX_TYPE_UINT16, 0);
+                cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_staticsDrawCount, g_pStaticsArgs, 0, nullptr, 0);
+            }
+            cmdBindRenderTargets(g_live.pCmd, nullptr);
+
+            // Copy the rendered pRT into the acquired backbuffer, then present.
+            RenderTargetBarrier cpb[2] = {};
+            cpb[0].pRenderTarget = g_live.pRT; cpb[0].mCurrentState = RESOURCE_STATE_RENDER_TARGET; cpb[0].mNewState = RESOURCE_STATE_COPY_SOURCE;
+            cpb[1].pRenderTarget = bb;         cpb[1].mCurrentState = RESOURCE_STATE_PRESENT;       cpb[1].mNewState = RESOURCE_STATE_COPY_DEST;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 2, cpb);
+            g_live.pCmd->mDx.pCmdList->CopyResource(bb->pTexture->mDx.pResource, g_live.pRT->pTexture->mDx.pResource);
+            cpb[0].mCurrentState = RESOURCE_STATE_COPY_SOURCE; cpb[0].mNewState = RESOURCE_STATE_RENDER_TARGET;
+            cpb[1].mCurrentState = RESOURCE_STATE_COPY_DEST;   cpb[1].mNewState = RESOURCE_STATE_PRESENT;
+            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 2, cpb);
+            endCmd(g_live.pCmd);
+
+            QueueSubmitDesc sub = {};
+            sub.mCmdCount = 1; sub.ppCmds = &g_live.pCmd;
+            sub.pSignalFence = g_live.pFence;
+            sub.mWaitSemaphoreCount = 1; sub.ppWaitSemaphores = &pImgSem;
+            sub.mSignalSemaphoreCount = 1; sub.ppSignalSemaphores = &pRenderSem;
+            queueSubmit(g_live.pQueue, &sub);
+            QueuePresentDesc pres = {};
+            pres.pSwapChain = pSwap; pres.mIndex = (uint8_t)idx;
+            pres.mWaitSemaphoreCount = 1; pres.ppWaitSemaphores = &pRenderSem;
+            pres.mSubmitDone = true;
+            queuePresent(g_live.pQueue, &pres);
+            waitForFences(R, 1, &g_live.pFence);
+        }
+
+        waitQueueIdle(g_live.pQueue);
+        exitSemaphore(R, pImgSem); exitSemaphore(R, pRenderSem);
+        removeSwapChain(R, pSwap);
+        DestroyWindow(hwnd);
+        UnregisterClassW(wc.lpszClassName, hInst);
+        shutdown();
+        std::printf("[forge][view] viewer closed\n");
+        return true;
+    }
+
     // ===================== Phase 1a/1b LIVE distant land (wired into renderScene) =============
 
     // Latch this frame's realEye + exterior gate (called from renderScene's lighting block, which
