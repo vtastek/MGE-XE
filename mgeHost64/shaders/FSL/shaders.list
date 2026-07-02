@@ -141,6 +141,18 @@
 #include "aoblur.comp.fsl"
 #end
 
+// Phase 3 prologue: Hi-Z mip-pyramid build (tail-submitted after the frame fence; occlusion M1).
+// Two variants of one body, like linearizedepth: FIRST copies pLinearDepth -> mip 0, the reduce
+// MIN-halves mip i-1 -> mip i (reverse-Z min = farthest = conservative for the later Hi-Z cull).
+#comp hizreduce_first.comp
+#define HIZ_FIRST 1
+#include "hizreduce.comp.fsl"
+#end
+
+#comp hizreduce.comp
+#include "hizreduce.comp.fsl"
+#end
+
 // Stage B (B3) GPU statics cull — count -> prefix-sum -> scatter -> execute-indirect (drives the far
 // statics draw; the CPU cull stays for parity until visually verified). All three share compute.rootsig
 // + the CullSrtData PerBatch set. cull.comp = COUNT (survivors atomic-add numSubsets for the CPU parity

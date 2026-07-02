@@ -69,6 +69,9 @@
 // the merged ComputeRootSignature. Names its element CullInstance (not GpuCullInstance) to avoid
 // redefining the host C++ struct when STRUCT(T) expands to `struct T` in this TU.
 #include "shaders/FSL/cull.srt.h"
+// Phase 3 prologue: Hi-Z pyramid build SRT (HizSrtData, Persistent frequency). Shares the merged
+// ComputeRootSignature. See [[project_forge_gpu_occlusion]] M1.
+#include "shaders/FSL/hizreduce.srt.h"
 
 // App-layer callback normally provided by WindowsBase.cpp (which we exclude — it
 // drags in the window system). The backend calls this on device-lost. Headless:
@@ -1007,6 +1010,24 @@ namespace {
         DescriptorSet* pLinearizeSet = nullptr;   // LinDepthSrtData PerBatch: gSceneDepth + gLinearDepthOut
         DescriptorSet* pGtaoBatchSet = nullptr;   // AOSrtData PerBatch:  gLinearDepthIn + gAOOut
         DescriptorSet* pAOBlurSet = nullptr;      // AOBlurSrtData PerFrame: gBlurParams + gAOSrc + gBlurDepthIn + gAODst
+        // --- Phase 3 prologue: Hi-Z pyramid from frame N's depth, built in a SECOND, independently-
+        // fenced cmd tail-submitted right after the frame fence. Same queue => GPU-ordered before
+        // frame N+1 automatically; the client signal rides the MAIN fence so it is never delayed.
+        // pHiz stays UNORDERED_ACCESS for life (per-mip UAVs, reduce reads the src mip as UAV);
+        // pLinearDepth is SHADER_RESOURCE at frame end, so the prologue reads it barrier-free.
+        // No consumer yet (occlusion M2 wires cull.comp to it) => zero behaviour change.
+        Texture*       pHiz = nullptr;             // R32F mip pyramid of pLinearDepth (min = farthest)
+        Shader*        pHizShaderFirst = nullptr;  // hizreduce_first.comp (pLinearDepth -> mip 0)
+        Shader*        pHizShader = nullptr;       // hizreduce.comp (2x2 MIN reduce, mip i-1 -> i)
+        Pipeline*      pHizPipelineFirst = nullptr;
+        Pipeline*      pHizPipeline = nullptr;
+        DescriptorSet* pHizSet = nullptr;          // HizSrtData Persistent, maxSets = hizMips (set i = mip i)
+        CmdPool*       pHizCmdPool = nullptr;      // own pool/cmd/fence — never blocks the main submit
+        Cmd*           pHizCmd = nullptr;
+        Fence*         pHizFence = nullptr;
+        QueryPool*     pHizQueryPool = nullptr;    // 1-entry timestamp (prologue GPU ms, read next frame)
+        uint32_t       hizMips = 0;                // 1 + floor(log2(max(w,h)))
+        bool           hizReady = false;           // creation failure => prologue disabled, frame unaffected
         // --- Stage B (M1) GPU statics cull (B2 = COUNT-only validation) ------------------------
         // cull.comp tests every resident GpuCullInstance vs the per-frame CullParams (planes/eye/
         // ranges) and atomic-adds numSubsets into pCullCountBuf[0]. The host resets it from a zero
@@ -3034,6 +3055,89 @@ namespace {
             }
         }
 
+        // --- Phase 3 prologue: Hi-Z pyramid resources (texture + 2 pipelines + per-mip set +
+        // own cmd/fence/query). NON-FATAL: any failure leaves hizReady=false — the prologue never
+        // submits and the frame is unaffected (mirrors the query-pool precedent above). ---
+        {
+            uint32_t mips = 1;
+            for (uint32_t d = (width > height ? width : height); d > 1u; d >>= 1) { ++mips; }
+
+            TextureDesc hd = {};
+            hd.mWidth = width; hd.mHeight = height; hd.mDepth = 1;
+            hd.mArraySize = 1; hd.mMipLevels = mips;
+            hd.mSampleCount = SAMPLE_COUNT_1;
+            hd.mFormat = TinyImageFormat_R32_SFLOAT;
+            hd.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;   // stays UAV for LIFE (see member block)
+            hd.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+            hd.pName = "hizPyramid";
+            TextureLoadDesc hld = {};
+            hld.ppTexture = &g_live.pHiz;
+            hld.pDesc = &hd;
+            addResource(&hld, nullptr);
+            waitForAllResourceLoads();
+
+            ShaderLoadDesc hfd = {};
+            hfd.mComp.pFileName = "hizreduce_first.comp";
+            addShader(R, &hfd, &g_live.pHizShaderFirst);
+            ShaderLoadDesc hrd = {};
+            hrd.mComp.pFileName = "hizreduce.comp";
+            addShader(R, &hrd, &g_live.pHizShader);
+            if (g_live.pHizShaderFirst) {
+                PipelineDesc pd = {};
+                pd.mType = PIPELINE_TYPE_COMPUTE;
+                pd.mComputeDesc.pShaderProgram = g_live.pHizShaderFirst;
+                addPipeline(R, &pd, &g_live.pHizPipelineFirst);
+            }
+            if (g_live.pHizShader) {
+                PipelineDesc pd = {};
+                pd.mType = PIPELINE_TYPE_COMPUTE;
+                pd.mComputeDesc.pShaderProgram = g_live.pHizShader;
+                addPipeline(R, &pd, &g_live.pHizPipeline);
+            }
+
+            // One set per mip: index 0 = first pass (pLinearDepth SRV -> mip 0), index i = reduce
+            // mip i-1 -> i (mUAVMipSlice picks the backend's per-mip UAV). Updated once, here.
+            if (g_live.pHiz && g_live.pHizPipelineFirst && g_live.pHizPipeline) {
+                DescriptorSetDesc hset = SRT_SET_DESC(HizSrtData, Persistent, mips, 0);
+                addDescriptorSet(R, &hset, &g_live.pHizSet);
+            }
+            if (g_live.pHizSet) {
+                for (uint32_t m = 0; m < mips; ++m) {
+                    DescriptorData d[3] = {};
+                    d[0].mIndex = SRT_RES_IDX(HizSrtData, Persistent, gHizLinDepth);
+                    d[0].mCount = 1;
+                    d[0].ppTextures = &g_live.pLinearDepth;
+                    d[1].mIndex = SRT_RES_IDX(HizSrtData, Persistent, gHizSrcMip);
+                    d[1].mCount = 1;
+                    d[1].ppTextures = &g_live.pHiz;
+                    d[1].mUAVMipSlice = (uint16_t)(m > 0 ? m - 1 : 0);
+                    d[2].mIndex = SRT_RES_IDX(HizSrtData, Persistent, gHizDstMip);
+                    d[2].mCount = 1;
+                    d[2].ppTextures = &g_live.pHiz;
+                    d[2].mUAVMipSlice = (uint16_t)m;
+                    updateDescriptorSet(R, m, g_live.pHizSet, 3, d);
+                }
+                CmdPoolDesc hp = {};
+                hp.pQueue = g_live.pQueue;
+                initCmdPool(R, &hp, &g_live.pHizCmdPool);
+                CmdDesc hc = {};
+                hc.pPool = g_live.pHizCmdPool;
+                initCmd(R, &hc, &g_live.pHizCmd);
+                initFence(R, &g_live.pHizFence);
+                QueryPoolDesc hq = {};
+                hq.pName = "HizPrologueTimestamp";
+                hq.mType = QUERY_TYPE_TIMESTAMP;
+                hq.mQueryCount = 1;
+                initQueryPool(R, &hq, &g_live.pHizQueryPool);   // null => timing stays 0, still runs
+            }
+            g_live.hizMips = mips;
+            g_live.hizReady = g_live.pHiz && g_live.pHizPipelineFirst && g_live.pHizPipeline
+                           && g_live.pHizSet && g_live.pHizCmdPool && g_live.pHizCmd && g_live.pHizFence;
+            std::printf("[forge] Hi-Z prologue %s (%ux%u, %u mips)\n",
+                        g_live.hizReady ? "ready" : "DISABLED (resource/shader/pipeline create failed)",
+                        width, height, mips);
+        }
+
         std::printf("[forge] opaque scene path ready (depth %ux%u, maxDraws=%u, batched %ux%u, maxSkinned=%u, maxMultiMap=%u)\n",
                     width, height, kMaxDraws, kMaxBatches, kBatchSize, kMaxSkinned, kMaxMultiMap);
         return true;
@@ -3120,6 +3224,11 @@ namespace {
     // GPU-side per-phase ms (breaks down the ~4ms gpu via timestamp queries). kGpuPhase* enum
     // is defined up near kMaxDraws (used in buildOpaquePath, earlier in the TU than this block).
     double    g_lastGpuPhaseMs[kGpuPhaseCount] = {};
+    // Phase 3 prologue observability: LAST prologue's GPU ms (own 1-entry query pool, read the
+    // frame after, once its fence has signalled) + how many times a prologue was still running
+    // when the next frame reached the tail (MW's inter-frame window shorter than the build).
+    double    g_lastHizGpuMs = 0.0;
+    unsigned  g_hizOverruns  = 0;
     // Live DL cull survivors (set in dlLiveCullAndBuild). Declared here (not in the DL section lower
     // in the TU) so the Phase 0 panel readout in drawDevUI can see them.
     uint32_t  g_liveLastInst = 0, g_liveLastSubsets = 0, g_liveLastLand = 0;
@@ -3138,6 +3247,9 @@ namespace {
     // for the parity check + the reflect path); this only switches which instance/arg buffers the MAIN
     // statics draw consumes. A/B toggle until visually verified, then the CPU main cull can be removed.
     bool g_gpuStaticsCull = true;
+    // Phase 3 prologue A/B: OFF = the tail submit never happens — byte-identical to the pre-P3
+    // frame (the pyramid has no consumer yet, so ON changes only where GPU idle time goes).
+    bool g_hizPrologue   = true;
     bool g_drawWater     = true;
     bool g_drawReflect   = true;
     bool g_drawReflectGeo = true;   // WV2: reflect host-owned land + statics (off = sky-only reflection)
@@ -3342,6 +3454,8 @@ namespace {
         uiAddComponentWidget(g_uiPanel, "Draw: distant statics", &cDStat, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cGpuCull = {}; cGpuCull.pData = &g_gpuStaticsCull;
         uiAddComponentWidget(g_uiPanel, "Statics: GPU cull (B3 draw)", &cGpuCull, WIDGET_TYPE_CHECKBOX);
+        CheckboxWidget cHiz = {}; cHiz.pData = &g_hizPrologue;
+        uiAddComponentWidget(g_uiPanel, "Prologue: Hi-Z pyramid (P3)", &cHiz, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cDWat = {}; cDWat.pData = &g_drawWater;
         uiAddComponentWidget(g_uiPanel, "Draw: water", &cDWat, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cDRef = {}; cDRef.pData = &g_drawReflect;
@@ -4287,7 +4401,13 @@ namespace ForgeRender {
                         (void*)g_live.pAO, (void*)g_live.pLinearDepth, (int)g_live.firstFrame);
             s_aoDispatchLogged = true;
         }
+        // Phase 3 prologue gate: TRUE only when the linearize dispatch was actually RECORDED this
+        // frame — not resource existence. If the compute dxil is missing or a hot-reload addShader
+        // failed, linearize never runs and pLinearDepth is stale (or frame-0 stuck in UAV state);
+        // the prologue must then not read it.
+        bool linearizedThisFrame = false;
         if (g_aoComputeEnable && g_live.pLinearizePipeline && g_live.pGtaoPipeline) {
+            linearizedThisFrame = true;
             // Build gAOParams: invViewProj (from the SAME rzViewProj geometry used, incl. the
             // half-pixel offset) + screen + knobs + eye. Seeds follow scene-walk (WORLD-unit knobs;
             // may need MW-scale tuning — change here). eye is read back from the frame cbuffer
@@ -5171,6 +5291,77 @@ namespace ForgeRender {
         // A dense exterior frame is the suspected trigger; pin a removal to the draw submit.
         logDeviceRemoved(R, "renderScene/submit");
 
+        // ===================== Phase 3 prologue: Hi-Z pyramid (tail submit) =====================
+        // Frame N's depth -> mip pyramid for frame N+1's occlusion cull — camera-independent, so
+        // it belongs in the host-idle window between this fence and the next kickoff. Recorded
+        // into its OWN cmd/fence and submitted WITHOUT a wait: the server signals the client off
+        // the main fence above, so the client-visible frame is not lengthened; same single queue
+        // means frame N+1's cmds are GPU-ordered after this automatically (no semaphores). CPU
+        // cost of recording lands in g_lastPostMs. Gated on the linearize dispatch having been
+        // recorded THIS frame (pLinearDepth valid + in SHADER_RESOURCE).
+        if (g_live.hizReady && g_hizPrologue && linearizedThisFrame) {
+            // Settle the PREVIOUS prologue first (no-op if never submitted). Still-incomplete
+            // here means it overran MW's whole inter-frame window — count it (expect ~never).
+            FenceStatus fs = FENCE_STATUS_NOTSUBMITTED;
+            getFenceStatus(R, g_live.pHizFence, &fs);
+            if (fs == FENCE_STATUS_INCOMPLETE) {
+                ++g_hizOverruns;
+            }
+            waitForFences(R, 1, &g_live.pHizFence);
+            // Last prologue's GPU time (its resolve is valid now the fence has signalled).
+            if (g_live.pHizQueryPool && g_live.gpuTickFreq > 0.0 && fs != FENCE_STATUS_NOTSUBMITTED) {
+                QueryData qd = {};
+                getQueryData(R, g_live.pHizQueryPool, 0, &qd);
+                if (qd.mEndTimestamp > qd.mBeginTimestamp) {
+                    g_lastHizGpuMs = ((double)(qd.mEndTimestamp - qd.mBeginTimestamp) / g_live.gpuTickFreq) * 1000.0;
+                }
+            }
+
+            resetCmdPool(R, g_live.pHizCmdPool);
+            beginCmd(g_live.pHizCmd);
+            if (g_live.pHizQueryPool) {
+                QueryDesc q = {};
+                q.mIndex = 0;
+                cmdBeginQuery(g_live.pHizCmd, g_live.pHizQueryPool, &q);
+            }
+            cmdBeginDebugMarker(g_live.pHizCmd, 0.3f, 0.8f, 0.8f, "HI-Z PROLOGUE (pLinearDepth -> pHiz pyramid)");
+            // First pass: pLinearDepth (SRV) -> mip 0. Then per mip a UAV barrier (current==new==
+            // UNORDERED_ACCESS lowers to a true D3D12 UAV barrier — same trick as the cull block's
+            // uavBarrier lambda) + the 2x2 MIN reduce. Set index m binds src mip m-1 / dst mip m.
+            cmdBindPipeline(g_live.pHizCmd, g_live.pHizPipelineFirst);
+            cmdBindDescriptorSet(g_live.pHizCmd, 0, g_live.pHizSet);
+            cmdDispatch(g_live.pHizCmd, (g_live.width + 7u) / 8u, (g_live.height + 7u) / 8u, 1);
+            cmdBindPipeline(g_live.pHizCmd, g_live.pHizPipeline);
+            uint32_t mw = g_live.width, mh = g_live.height;
+            for (uint32_t m = 1; m < g_live.hizMips; ++m) {
+                TextureBarrier tb = {};
+                tb.pTexture = g_live.pHiz;
+                tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                tb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                cmdResourceBarrier(g_live.pHizCmd, 0, nullptr, 1, &tb, 0, nullptr);
+                mw = (mw > 1u) ? (mw >> 1) : 1u;
+                mh = (mh > 1u) ? (mh >> 1) : 1u;
+                cmdBindDescriptorSet(g_live.pHizCmd, m, g_live.pHizSet);
+                cmdDispatch(g_live.pHizCmd, (mw + 7u) / 8u, (mh + 7u) / 8u, 1);
+            }
+            cmdEndDebugMarker(g_live.pHizCmd);
+            if (g_live.pHizQueryPool) {
+                QueryDesc q = {};
+                q.mIndex = 0;
+                cmdEndQuery(g_live.pHizCmd, g_live.pHizQueryPool, &q);
+                cmdResolveQuery(g_live.pHizCmd, g_live.pHizQueryPool, 0, 1);
+            }
+            endCmd(g_live.pHizCmd);
+
+            QueueSubmitDesc hizSubmit = {};
+            hizSubmit.mCmdCount = 1;
+            hizSubmit.ppCmds = &g_live.pHizCmd;
+            hizSubmit.pSignalFence = g_live.pHizFence;
+            hizSubmit.mSubmitDone = true;
+            queueSubmit(g_live.pQueue, &hizSubmit);
+            // NO fence wait — return to the client now; the GPU builds the pyramid under MW's frame.
+        }
+
         g_live.firstFrame = false;
         g_lastDrawn = drawn;
         g_lastSkinnedDrawn = skinnedDrawn;
@@ -5199,11 +5390,13 @@ namespace ForgeRender {
                          g_lastCullExamined, g_liveLastInst,
                          g_lastCullExamined ? (g_lastCullMs * 1000.0 / (g_lastCullExamined / 1000.0)) : 0.0,
                          g_lastGpuCullCount, (g_lastGpuCullCount == g_liveLastInst) ? "MATCH" : "MISMATCH");
-            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f gtao=%.2f reflect=%.2f color=%.2f water=%.2f resolve=%.2f ms",
+            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f gtao=%.2f reflect=%.2f color=%.2f water=%.2f resolve=%.2f ms"
+                         " | hiz=%.2f (prologue, overruns=%u)",
                          g_lastGpuPhaseMs[kGpuPhaseCull],
                          g_lastGpuPhaseMs[kGpuPhasePrepass], g_lastGpuPhaseMs[kGpuPhaseGtao],
                          g_lastGpuPhaseMs[kGpuPhaseReflect], g_lastGpuPhaseMs[kGpuPhaseColor],
-                         g_lastGpuPhaseMs[kGpuPhaseWater], g_lastGpuPhaseMs[kGpuPhaseResolve]);
+                         g_lastGpuPhaseMs[kGpuPhaseWater], g_lastGpuPhaseMs[kGpuPhaseResolve],
+                         g_lastHizGpuMs, g_hizOverruns);
             // Whole-frame GPU EXECUTION vs submit->fence WALL clock. If exec << wall, the frame is
             // GPU-idle/queue-bound (waiting behind the client's shared-GPU work), NOT render-bound.
             const double frameExec = g_lastGpuPhaseMs[kGpuPhaseFrame];
@@ -5275,6 +5468,41 @@ namespace ForgeRender {
         abpd.mComputeDesc.pShaderProgram = g_live.pAOBlurShader;
         addPipeline(R, &abpd, &g_live.pAOBlurPipeline);
         LOG::logline(">> [forge] compute shaders hot-reloaded (gtao.comp + aoblur.comp + %s)", linName); LOG::flush();
+
+        // Phase 3 prologue: rebuild the two hiz pipelines too (queue already idled above, so no
+        // in-flight prologue uses the old PSOs). Failure DISABLES the prologue (hizReady=false,
+        // loud) rather than dispatching a null pipeline — resources/set stay valid for a retry.
+        if (g_live.pHizShader || g_live.pHizShaderFirst) {
+            if (g_live.pHizPipeline)      { removePipeline(R, g_live.pHizPipeline);      g_live.pHizPipeline = nullptr; }
+            if (g_live.pHizShader)        { removeShader(R, g_live.pHizShader);          g_live.pHizShader = nullptr; }
+            if (g_live.pHizPipelineFirst) { removePipeline(R, g_live.pHizPipelineFirst); g_live.pHizPipelineFirst = nullptr; }
+            if (g_live.pHizShaderFirst)   { removeShader(R, g_live.pHizShaderFirst);     g_live.pHizShaderFirst = nullptr; }
+            ShaderLoadDesc hfd = {};
+            hfd.mComp.pFileName = "hizreduce_first.comp";
+            addShader(R, &hfd, &g_live.pHizShaderFirst);
+            ShaderLoadDesc hrd = {};
+            hrd.mComp.pFileName = "hizreduce.comp";
+            addShader(R, &hrd, &g_live.pHizShader);
+            if (g_live.pHizShaderFirst && g_live.pHizShader) {
+                PipelineDesc pfd = {};
+                pfd.mType = PIPELINE_TYPE_COMPUTE;
+                pfd.mComputeDesc.pShaderProgram = g_live.pHizShaderFirst;
+                addPipeline(R, &pfd, &g_live.pHizPipelineFirst);
+                PipelineDesc prd = {};
+                prd.mType = PIPELINE_TYPE_COMPUTE;
+                prd.mComputeDesc.pShaderProgram = g_live.pHizShader;
+                addPipeline(R, &prd, &g_live.pHizPipeline);
+            }
+            if (g_live.pHizPipelineFirst && g_live.pHizPipeline) {
+                // Re-arm after an earlier failed reload (set/cmd/fence are persistent).
+                g_live.hizReady = g_live.pHiz && g_live.pHizSet && g_live.pHizCmdPool
+                               && g_live.pHizCmd && g_live.pHizFence;
+                LOG::logline(">> [forge] hiz prologue shaders hot-reloaded (hizreduce_first + hizreduce)"); LOG::flush();
+            } else {
+                g_live.hizReady = false;
+                LOG::logline("!! [forge] hiz hot-reload FAILED — prologue DISABLED (dxil missing on disk?)"); LOG::flush();
+            }
+        }
 
         // GRAPHICS hot-reload: also rebuild the water pipeline so water.vert/.frag edits go live on
         // the same trigger (the fsl.py watcher recompiles ALL dxil and bumps gtao's mtime LAST, so
@@ -8734,6 +8962,12 @@ namespace ForgeRender {
             g_live = LiveRenderer{};
             return;
         }
+        // Phase 3 prologue: the LAST tail submit may still be in flight — renderScene fence-waits
+        // its OWN frame but deliberately never waits the prologue. This wait is MANDATORY (not
+        // defensive): releasing pHiz/pHizCmd under a running prologue is a device-removal.
+        if (g_live.pHizFence) {
+            waitForFences(R, 1, &g_live.pHizFence);
+        }
         freeMeshStore();   // release VB/IB before the resource loader goes down
         exitDevUI();       // Forge IUI/IFont teardown while the renderer is still alive
         // M1c opaque path teardown.
@@ -8874,6 +9108,17 @@ namespace ForgeRender {
         g_dlLiveInit = false; g_staticsLiveOk = false; g_dlExterior = false;
         g_liveLastInst = g_liveLastSubsets = g_liveLastLand = 0;
         g_liveLastSubsetsRefl = g_liveLastInstRefl = 0;
+        // Phase 3 Hi-Z prologue (fence already waited at the top of shutdown).
+        if (g_live.pHizSet)          { removeDescriptorSet(R, g_live.pHizSet); }
+        if (g_live.pHizPipeline)     { removePipeline(R, g_live.pHizPipeline); }
+        if (g_live.pHizPipelineFirst){ removePipeline(R, g_live.pHizPipelineFirst); }
+        if (g_live.pHizShader)       { removeShader(R, g_live.pHizShader); }
+        if (g_live.pHizShaderFirst)  { removeShader(R, g_live.pHizShaderFirst); }
+        if (g_live.pHizQueryPool)    { exitQueryPool(R, g_live.pHizQueryPool); }
+        if (g_live.pHizFence)        { exitFence(R, g_live.pHizFence); }
+        if (g_live.pHizCmd)          { exitCmd(R, g_live.pHizCmd); }
+        if (g_live.pHizCmdPool)      { exitCmdPool(R, g_live.pHizCmdPool); }
+        if (g_live.pHiz)             { removeResource(g_live.pHiz); }
         // Tier 2 compute (linearize + GTAO + AO bilateral blur).
         if (g_live.pAOBlurSet)      { removeDescriptorSet(R, g_live.pAOBlurSet); }
         if (g_live.pGtaoBatchSet)   { removeDescriptorSet(R, g_live.pGtaoBatchSet); }

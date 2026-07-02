@@ -1,0 +1,60 @@
+// mgeHost64 — Phase 3 prologue: Hi-Z mip-pyramid build (deferred occlusion milestone M1).
+//
+// Runs in the tail-submitted prologue cmd AFTER the frame fence, so the GPU builds frame N's
+// pyramid while MW runs its scene-1/UI/present window. No consumer yet — occlusion M2 points
+// cull.comp at it for frame N+1's two-phase Hi-Z cull.
+//
+// Two compiled variants of this one body (HIZ_FIRST, like linearizedepth's SAMPLE_COUNT):
+//   hizreduce_first — 1:1 copy pLinearDepth -> mip 0 (dispatch covers mip-0 dims).
+//   hizreduce       — 2x2 MIN-reduce mip i-1 -> mip i (dispatch covers the DST mip dims).
+//
+// MIN because the depth is reverse-Z device depth (near = 1, far = 0): a pyramid texel must hold
+// the FARTHEST depth of its footprint or the later occlusion test culls visible objects. For the
+// same reason odd source dims take EXTRA taps at +2 (each dst texel covers src 2p..2p+2, so the
+// floor-halved dst grid still covers the odd remainder row/column); a clamp-only 2x2 kernel would
+// simply drop that remainder -> non-conservative pyramid -> false occlusion. The tap coordinate
+// clamp to srcDim-1 below only collapses taps PAST the last texel (dims 1/2 tails) — coverage of
+// every real texel is what matters, duplicated taps are harmless under min.
+//
+// 8x8 groups, no dst bounds check (OOB UAV writes drop — same as linearizedepth). OOB UAV *reads*
+// return 0 = far = conservative, but the clamp means none are actually taken.
+
+#include "hizreduce.srt.h"
+
+#ifndef HIZ_FIRST
+#define HIZ_FIRST 0
+#endif
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    int2 p = int2(DispatchThreadID.xy);
+#if HIZ_FIRST
+    float d = LoadTex2D(gHizLinDepth, NO_SAMPLER, p, 0).r;
+#else
+    int2 sd = GetDimensions(gHizSrcMip, NO_SAMPLER);
+    int2 mx = sd - int2(1, 1);
+    int2 s = p * 2;
+    float d =    LoadRWTex2D(gHizSrcMip, min(s,               mx));
+    d = min(d,   LoadRWTex2D(gHizSrcMip, min(s + int2(1, 0),  mx)));
+    d = min(d,   LoadRWTex2D(gHizSrcMip, min(s + int2(0, 1),  mx)));
+    d = min(d,   LoadRWTex2D(gHizSrcMip, min(s + int2(1, 1),  mx)));
+    bool oddX = (sd.x & 1) != 0;
+    bool oddY = (sd.y & 1) != 0;
+    if (oddX) {
+        d = min(d, LoadRWTex2D(gHizSrcMip, min(s + int2(2, 0), mx)));
+        d = min(d, LoadRWTex2D(gHizSrcMip, min(s + int2(2, 1), mx)));
+    }
+    if (oddY) {
+        d = min(d, LoadRWTex2D(gHizSrcMip, min(s + int2(0, 2), mx)));
+        d = min(d, LoadRWTex2D(gHizSrcMip, min(s + int2(1, 2), mx)));
+    }
+    if (oddX && oddY) {
+        d = min(d, LoadRWTex2D(gHizSrcMip, min(s + int2(2, 2), mx)));
+    }
+#endif
+    Write2D(gHizDstMip, p, d);
+    RETURN();
+}
