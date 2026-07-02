@@ -43,6 +43,11 @@ using std::vector;
 static IDirect3DDevice9* device;
 static HANDLE staticFile;
 
+// Sky-bake only (default false = real distant-land statics gen behaviour is byte-for-byte unchanged):
+// when set, ExportShape accepts textureless / UV-less shapes (MW's vertex/material-coloured sky dome)
+// instead of dropping them. Toggled by the SetAllowTexturelessShapes export around a sky bake.
+static bool g_allowTextureless = false;
+
 // Functions from OpenEXR to convert a float to a half float
 static inline unsigned short FloatToHalfI(unsigned int i) {
     int s =  (i >> 16) & 0x00008000;
@@ -486,15 +491,17 @@ private:
         NiAlphaPropertyRef niAlphaProp = DynamicCast<NiAlphaProperty>(ResolveProperty(asAVObject, NiAlphaProperty::TYPE));
         NiMaterialPropertyRef niMatProp = DynamicCast<NiMaterialProperty>(ResolveProperty(asAVObject, NiMaterialProperty::TYPE));
 
-        // Check that an external texture exists
-        if (!niTexProp || niTexProp->GetTextureCount() == 0) {
-            // log_file << "External texture does not exist" << endl;
-            return false;
+        // Check that an external texture exists. Textureless shapes are dropped, EXCEPT during a sky
+        // bake (g_allowTextureless) where the MW atmosphere dome is deliberately texture-free.
+        NiSourceTextureRef niSrcTex;
+        bool hasTexture = false;
+        if (niTexProp && niTexProp->GetTextureCount() > 0) {
+            TexDesc texDesc = niTexProp->GetTexture(0);
+            niSrcTex = texDesc.source;
+            hasTexture = (niSrcTex && niSrcTex->IsTextureExternal());
         }
-        TexDesc texDesc = niTexProp->GetTexture(0);
-        NiSourceTextureRef niSrcTex = texDesc.source;
-        if (!niSrcTex || !niSrcTex->IsTextureExternal()) {
-            // log_file << "Texture was not external" << endl;
+        if (!hasTexture && !g_allowTextureless) {
+            // log_file << "External texture does not exist" << endl;
             return false;
         }
 
@@ -513,8 +520,10 @@ private:
             return false;
         }
 
-        // Check that there is at least one set of texture coords available
-        if (niGeomData->GetUVSetCount() == 0) {
+        // Check that there is at least one set of texture coords available. As with the texture check,
+        // the sky dome legitimately has none, so tolerate that during a sky bake (UVs default to 0).
+        bool hasUV = niGeomData->GetUVSetCount() > 0;
+        if (!hasUV && !g_allowTextureless) {
             // log_file << "There are no texture coordinates on this mesh." << endl;
             return false;
         }
@@ -579,7 +588,10 @@ private:
             normals = niGeomData->GetNormals();
         }
         vector<Color4> colors = niGeomData->GetColors();
-        vector<TexCoord> texCoords = niGeomData->GetUVSet(0);
+        vector<TexCoord> texCoords;
+        if (hasUV) {
+            texCoords = niGeomData->GetUVSet(0);
+        }
 
         // Vertices
         bool hasNormals = normals.size() > 0;
@@ -613,7 +625,12 @@ private:
                 node->vBuffer[i].Diffuse[3] = (unsigned char)(255.0f * alpha);
             }
 
-            node->vBuffer[i].texCoord = texCoords[i];
+            if (hasUV) {
+                node->vBuffer[i].texCoord = texCoords[i];
+            } else {
+                node->vBuffer[i].texCoord.u = 0.0f;
+                node->vBuffer[i].texCoord.v = 0.0f;
+            }
         }
 
         // Write index buffer
@@ -624,25 +641,28 @@ private:
             node->iBuffer[i*3+2] = tris[i].v3;
         }
 
-        // Get texture file path
-        string s = niSrcTex->GetTextureFileName();
+        // Get texture file path (textureless sky dome keeps an empty path)
+        string s;
+        if (hasTexture) {
+            s = niSrcTex->GetTextureFileName();
 
-        // Make texture path all lowercase
-        for (size_t i = 0; i < s.size(); ++i) {
-            if (s[i] >= 'A' && s[i] <= 'Z') {
-                s[i] += 32;
+            // Make texture path all lowercase
+            for (size_t i = 0; i < s.size(); ++i) {
+                if (s[i] >= 'A' && s[i] <= 'Z') {
+                    s[i] += 32;
+                }
             }
-        }
 
-        // If the path starts with "textures" or "\textures" remove it
-        size_t pos = s.find("textures");
-        if (pos == 0 || (pos == 1 && s[0] == '\\')) {
-            s = s.substr(pos + 8, string::npos);
-        }
+            // If the path starts with "textures" or "\textures" remove it
+            size_t pos = s.find("textures");
+            if (pos == 0 || (pos == 1 && s[0] == '\\')) {
+                s = s.substr(pos + 8, string::npos);
+            }
 
-        // Remove any leading backslashes that remain
-        if (s[0] == '\\') {
-            s = s.substr(1, string::npos);
+            // Remove any leading backslashes that remain
+            if (!s.empty() && s[0] == '\\') {
+                s = s.substr(1, string::npos);
+            }
         }
 
         node->tex = s;
@@ -829,4 +849,10 @@ extern "C" void __stdcall BeginStaticCreation(IDirect3DDevice9* _device, char* o
 
 extern "C" void __stdcall EndStaticCreation() {
     CloseHandle(staticFile);
+}
+
+// Sky-bake toggle: when on, ProcessNif accepts textureless / UV-less shapes (the MW atmosphere dome).
+// Default off, so ordinary distant-land statics generation is completely unaffected.
+extern "C" void __stdcall SetAllowTexturelessShapes(int on) {
+    g_allowTextureless = (on != 0);
 }

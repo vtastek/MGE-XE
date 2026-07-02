@@ -52,6 +52,11 @@ namespace IPC {
 		};
 		Parameters* m_ipcParameters;
 		bool m_isRpcPending;
+		// Async-frame window: true between renderSceneKickoff and renderSceneFinish.
+		// While open, ANY other RPC (main OR geom channel) is refused loudly — it would
+		// either steal the RenderFrame completion (main) or serialize behind the whole
+		// host frame on the single host service thread (geom). See client.cpp.
+		bool m_frameWindowOpen;
 
 		// Dev FSL hot-reload watcher: a Windows-python child (watch_shaders.py) launched alongside
 		// the host in a dev tree, killed with it. INVALID when not spawned (shipped tree / no python).
@@ -309,6 +314,36 @@ namespace IPC {
 			const DevInput* devInput = nullptr,
 			const float* waterParams = nullptr, std::uint32_t waterEnabled = 0,
 			double* outRenderMs = nullptr);
+
+		/**
+		* @brief Async-frame split: copy the frame params into shared memory and start the
+		*        host RenderFrame WITHOUT waiting. The host renders frame N while the caller
+		*        continues MW's own frame-N work. Opens the IPC-free window: until the paired
+		*        renderSceneFinish, every other RPC on either channel is refused loudly.
+		*        Same arguments as renderSceneBlocking (minus outRenderMs, which the finish
+		*        returns). All pointer args are copied before return — no lifetime coupling.
+		* @return Whether the RPC was issued (host running). On false, no window is open.
+		*/
+		bool renderSceneKickoff(std::uint32_t frameIndex, const float* viewProj,
+			const float* lighting,
+			VecId drawList, std::uint32_t drawCount, std::uint32_t drawBytes,
+			VecId skinnedList, std::uint32_t skinnedCount, std::uint32_t skinnedBytes,
+			VecId multiMapList, std::uint32_t multiMapCount, std::uint32_t multiMapBytes,
+			VecId lightList, std::uint32_t lightCount, std::uint32_t lightBytes,
+			VecId skyList, std::uint32_t skyCount, std::uint32_t skyBytes,
+			std::uint32_t debugMode = 0,
+			const DevInput* devInput = nullptr,
+			const float* waterParams = nullptr, std::uint32_t waterEnabled = 0);
+
+		/**
+		* @brief Async-frame split: wait for the RenderFrame started by renderSceneKickoff.
+		*        The host fence-waits before replying, so on return the shared RT is
+		*        GPU-complete and quiescent (safe to copy). Closes the IPC-free window
+		*        unconditionally, even on failure.
+		* @param outRenderMs Optional out: host-side render time in ms.
+		* @return Whether the frame rendered (bytesWritten > 0).
+		*/
+		bool renderSceneFinish(double* outRenderMs = nullptr);
 
 		/**
 		* @brief M1b: upload a batch of static opaque meshes to the Forge host.

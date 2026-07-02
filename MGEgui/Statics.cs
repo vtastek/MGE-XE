@@ -244,10 +244,12 @@ namespace MGEgui {
         private struct CommandArgs {
             public readonly bool styles;
             public readonly bool mutex;
+            public readonly bool bakeSky;
 
             public CommandArgs(string[] args) {
                 styles = true;
                 mutex = true;
+                bakeSky = false;
                 foreach (string s in args) {
                     switch (s) {
                         case "-nostyles":
@@ -255,6 +257,10 @@ namespace MGEgui {
                             break;
                         case "-nomutex":
                             mutex = false;
+                            break;
+                        case "-bake-sky":
+                        case "--bake-sky":
+                            bakeSky = true;
                             break;
                     }
                 }
@@ -363,6 +369,17 @@ namespace MGEgui {
                 Triggers[i] = new Trigger();
             }
             
+            // Dev-only offline sky bake (SK-1): bake MW sky meshes + clear-day textures into the
+            // host-loadable distantland\sky blob, then exit without opening the main GUI.
+            if (args.bakeSky) {
+                try {
+                    SkyBake.Run();
+                } catch (Exception ex) {
+                    MessageBox.Show(ex.ToString(), strings["Error"]);
+                }
+                return;
+            }
+
             mf = new MainForm(autoLanguage);
             Application.Run(mf);
         }

@@ -1,0 +1,92 @@
+// mgeHost64 — SK V2 viewer sky MESH (vertex stage, host-owned, --forge-view only).
+//
+// Real MW sky meshes baked offline into the StaticElem library format (Data Files\distantland\sky\
+// sky_meshes via ProcessNif) and drawn as a few fixed, camera-relative draws — the standalone
+// world viewer's sky (dome + scrolling clouds + sun billboard). See tasks/forge-viewer-sky.md and
+// [[project_forge_sky_takeover]] (the in-game SK1/SK2 path is separate; this is the viewer's own).
+//
+// Binding 0 = the MGE StaticElem vertex (20 B: FLOAT16_4 pos{w=1}, UBYTE4N normal, D3DCOLOR vcol,
+// FLOAT16_2 uv) — the SAME layout as statics.vert, so the baked dome/cloud meshes feed unchanged and
+// the sun billboard (host-generated, half-float) rides the same path. Binding 1 = PER-INSTANCE: the
+// object's world matrix (4 rows W0..W3) + four packed sky-param float4s (P0..P3). One instance per
+// draw; firstInstance selects the record (0 dome / 1 cloud / 2 sun). No lighting / no fog — emissive.
+//
+//   P0 = (mode, texSlot, cloudUVOffset, opacity)   mode: 0 dome, 1 cloud, 2 sun
+//   P1 = (tint.rgb, _)            cloud tint / sun colour
+//   P2 = (atmoTop.rgb, _)         dome zenith emission
+//   P3 = (atmoBottom.rgb, _)      dome horizon emission
+//
+// Shares opaque.srt.h / DefaultRootSignature + the same column-major / reverse-Z viewProj convention
+// as statics.vert (host post-multiplies viewProj by Z_rev before upload). World is the explicit row
+// combination pos*M (W0..W3 = D3DX rows), convention-proof like statics.vert.
+
+#include "opaque.srt.h"
+
+STRUCT(VSInput)
+{
+    DATA(float4, Position, POSITION);    // FLOAT16_4 model pos (w = 1)
+    DATA(float4, Normal,   NORMAL);      // UBYTE4N (unused by sky; part of StaticElem stride)
+    DATA(float4, Color,    COLOR);       // D3DCOLOR per-vertex colour (dome gradient: .a = horizon->zenith)
+    DATA(float2, Uv,       TEXCOORD0);   // FLOAT16_2 base-map UV (cloud / sun)
+    // Per-instance (binding 1): world matrix as 4 rows + four packed sky-param float4s.
+    DATA(float4, W0, TEXCOORD1);
+    DATA(float4, W1, TEXCOORD2);
+    DATA(float4, W2, TEXCOORD3);
+    DATA(float4, W3, TEXCOORD4);
+    DATA(float4, P0, TEXCOORD5);
+    DATA(float4, P1, TEXCOORD6);
+    DATA(float4, P2, TEXCOORD7);
+    DATA(float4, P3, TEXCOORD8);
+};
+
+STRUCT(VSOutput)
+{
+    DATA(float4,       Position, SV_Position);
+    DATA(float2,       Uv,       TEXCOORD0);
+    DATA(float4,       Color,    COLOR);
+    DATA(FLAT(uint),   Mode,     TEXCOORD1);
+    DATA(FLAT(uint),   TexIndex, TEXCOORD2);
+    DATA(FLAT(float2), CloudOp,  TEXCOORD3);  // x = cloudUVOffset, y = opacity
+    DATA(FLAT(float3), Tint,     TEXCOORD4);
+    DATA(FLAT(float3), AtmoTop,  TEXCOORD5);
+    DATA(FLAT(float3), AtmoBot,  TEXCOORD6);
+    DATA(float,        HeightT,  TEXCOORD7);   // dome vertical gradient factor (0 horizon -> 1 zenith)
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+VSOutput VS_MAIN( VSInput In )
+{
+    INIT_MAIN;
+    VSOutput Out;
+
+    uint mode = (uint)(In.P0.x + 0.5f);
+
+    // worldPos = pos * M with M stored as 4 ROWS (W0..W3) in the instance stream (convention-proof,
+    // identical to statics.vert). Sky is centered on the eye (camera-relative) at a large radius.
+    float4 worldPos = In.Position.x * In.W0 + In.Position.y * In.W1
+                    + In.Position.z * In.W2 + In.Position.w * In.W3;
+
+    if (mode == 3u) {
+        // Mode 3 = flat fullscreen sky fill (MW clears the sky to the sky colour; the real atmosphere
+        // mesh is only a horizon band and can't cover the zenith). The host supplies a clip-space
+        // fullscreen triangle in Position.xy; pass it straight through (reverse-Z far plane = 0).
+        Out.Position = float4(In.Position.x, In.Position.y, 0.0f, 1.0f);
+    } else {
+        Out.Position = mul(gFrameData.viewProj, worldPos);
+    }
+
+    // Dome band gradient (mode 0): the real sky_atmosphere mesh is a 2-ring cone band with NO usable
+    // baked colour, so drive horizon->zenith purely by MODEL-space Z, normalised over the band's own
+    // Z range host-side: P3.w = model zMin, P2.w = 1/(zMax-zMin). (Unused / harmless for other modes.)
+    Out.HeightT  = saturate((In.Position.z - In.P3.w) * In.P2.w);
+
+    Out.Uv       = In.Uv;
+    Out.Color    = In.Color;
+    Out.Mode     = mode;
+    Out.TexIndex = (uint)(In.P0.y + 0.5f);
+    Out.CloudOp  = float2(In.P0.z, In.P0.w);
+    Out.Tint     = In.P1.rgb;
+    Out.AtmoTop  = In.P2.rgb;
+    Out.AtmoBot  = In.P3.rgb;
+    RETURN(Out);
+}

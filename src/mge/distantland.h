@@ -98,6 +98,23 @@ public:
     // main-thread device/effect work, and by renderDepth() to skip the Clear /
     // float-depth clear / cache pass the worker already wrote into texDepthFrame.
     static bool renderThreadJobKicked;
+    // Async full-frame overlap (Phase 2): latched by frameSetupEarly() when THIS frame
+    // runs the early Forge kickoff at BeginScene(0) — UseAsyncHostFrame + the Forge
+    // baseline (seam compositing + Forge water), one warm-up frame after any transition.
+    // Covers exterior distant cells (2a: the distant-statics cull is gated off — the
+    // host renders those statics) AND plain interiors / non-distant cells (2b: no
+    // scene-0 RPC exists there; the interior cache walk + visible set are hoisted to
+    // frameSetupEarly). Interior DISTANT cells stay on the late kickoff — MGE still
+    // draws their distant statics, so its cull keeps the channel. While latched, the
+    // whole scene 0 is the IPC-free async window; the grass cull runs pre-kickoff
+    // instead of in renderDepth. Read by mged3d8device (fire the kickoff after
+    // frameSetupEarly), renderStage0 (skip the fallback statics kickoff) and
+    // renderDepth (skip cullDistantStatics_finish). Stable for the frame: the seam's
+    // F11/F7 toggles are polled at composite-finish time, after every consumer.
+    static bool earlyForgeKickoff;
+    // Set when frameSetupEarly already ran the grass cull (pre-kickoff, channel free);
+    // renderDepth skips its own cullGrass then (grass depth/color consume the same VB).
+    static bool earlyCulledGrass;
     static int numWaterVerts, numWaterTris;
 
     static IDirect3DDevice9* device;

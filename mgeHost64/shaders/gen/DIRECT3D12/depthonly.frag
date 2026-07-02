@@ -999,13 +999,25 @@ STRUCT(FrameData)
 
 
     float4 skyParams;
-#line 63
+
+
+
+
+
+
+    float4 gReflWaterClip;
+
+
+
+
+    float4 skyZenith;
+#line 75
 };
 
 STRUCT(BatchData)
 {
     float4x4 worlds[ 1024 ];
-#line 68
+#line 80
 };
 
 
@@ -1019,7 +1031,7 @@ STRUCT(LightData)
 {
     float4 lightParams;
     float4 lights[ 128  * 3];
-#line 81
+#line 93
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1046,7 +1058,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 123 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 135 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 896 ] :  register(t0,space0);
 
 

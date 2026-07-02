@@ -958,14 +958,17 @@ SamplerState gSamplerAnisotropic : register( s10 , space100 ) ;
 #line 167 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 136 "FSL/shaders.list"
+#line 149 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cull.comp.fsl"
-#line 11 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cull.comp.fsl"
+#line 12 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cull.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cull.srt.h"
-#line 19 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cull.srt.h"
+#line 26 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cull.srt.h"
 STRUCT(CullInstance)
 {
-    float4x4 world;
+    float4 wr0;
+    float4 wr1;
+    float4 wr2;
+    float4 wr3;
     float posX;
     float posY;
     float posZ;
@@ -974,7 +977,18 @@ STRUCT(CullInstance)
     uint firstSubset;
     uint numSubsets;
     uint pad;
-#line 30
+#line 40
+};
+
+
+STRUCT(StaticsSubset)
+{
+    uint vbBase;
+    uint ibBase;
+    uint indexCount;
+    uint texSlot;
+    uint flags;
+#line 50
 };
 
 STRUCT(CullParams)
@@ -983,13 +997,19 @@ STRUCT(CullParams)
     float4 eye;
     float4 ranges;
     float4 misc;
-#line 38
+#line 58
 };
 
         CBUFFER(CullParams) gCullParams :  register(b0,space2);
         Buffer(CullInstance) gCullInst :  register(t1,space2);
-        RWBuffer(uint) gCullCount :  register(u2,space2);
-#line 12 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cull.comp.fsl"
+        Buffer(StaticsSubset) gStaticsSubsets :  register(t2,space2);
+        RWBuffer(uint) gCullCount :  register(u3,space2);
+        RWBuffer(uint) gSubsetCount :  register(u4,space2);
+        RWBuffer(uint) gSubsetOffset :  register(u5,space2);
+        RWBuffer(uint) gSubsetCursor :  register(u6,space2);
+        RWBuffer(uint) gArgs :  register(u7,space2);
+        RWBuffer(uint) gInstOut :  register(u8,space2);
+#line 13 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cull.comp.fsl"
 
 [RootSignature( "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)" )]
 NUM_THREADS(64, 1, 1)
@@ -1032,6 +1052,12 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
     uint orig;
     AtomicAdd(gCullCount[0], inst.numSubsets, orig);
+    for (uint k = 0u; k < inst.numSubsets; ++k)
+    {
+        uint sid = inst.firstSubset + k;
+        uint prev;
+        AtomicAdd(gSubsetCount[sid], 1u, prev);
+    }
     return;
 }
-#line 137 "FSL/shaders.list"
+#line 150 "FSL/shaders.list"

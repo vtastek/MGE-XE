@@ -1,0 +1,84 @@
+// mgeHost64 — Stage B (B3) GPU statics cull, PASS 3 of 3: SCATTER.
+//
+// Re-runs cull.comp's EXACT per-instance test (same CullParams — the two agree bit-for-bit), and for
+// each surviving (instance, subset) claims a slot in the subset's run
+// (slot = AtomicAdd(gSubsetCursor[sid], 1)) and writes the per-instance vertex row at
+// gInstOut[(gSubsetOffset[sid] + slot) * 20 ..]. The row matches the statics.vert binding-1 stream
+// (kStaticsInstStride = 80B = 20 uint): 4 world ROWS (camera-relative: wr3.xyz − eye) + InstParams
+// (texSlot, flags, 0, 0). Floats stored via asuint — the raw vertex fetch reads them back as float.
+//
+// The world rows are copied straight from the resident CullInstance (row-major; the CPU path memcpy's
+// the same 16 floats then subtracts eye), so no matrix decode. Draw = cmdExecuteIndirect over gArgs.
+
+#include "cull.srt.h"
+
+#define kMaxInst 65536u
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(64, 1, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    uint i = DispatchThreadID.x;
+    if (i >= (uint)gCullParams.misc.x)
+        RETURN();
+
+    CullInstance inst = gCullInst[i];
+    if (inst.rangeEndIdx == 0xFFFFFFFFu)
+        RETURN();
+
+    float rangeEnd2 = (inst.rangeEndIdx == 0u) ? gCullParams.ranges.x
+                    : (inst.rangeEndIdx == 1u) ? gCullParams.ranges.y
+                                               : gCullParams.ranges.z;
+
+    float dx = inst.posX - gCullParams.eye.x;
+    float dy = inst.posY - gCullParams.eye.y;
+    float d2 = dx * dx + dy * dy;
+    if (d2 < gCullParams.ranges.w || d2 > rangeEnd2)
+        RETURN();
+
+    float cz = inst.posZ - gCullParams.eye.z;
+    UNROLL
+    for (uint p = 0u; p < 6u; ++p)
+    {
+        float4 pl = gCullParams.planes[p];
+        float  dist = pl.x * dx + pl.y * dy + pl.z * cz + pl.w;
+        if (dist < -inst.effR)
+            RETURN();
+    }
+
+    // Camera-relative world rows (translation shifted by -eye; the only per-frame change).
+    float4 r0 = inst.wr0;
+    float4 r1 = inst.wr1;
+    float4 r2 = inst.wr2;
+    float4 r3 = inst.wr3;
+    r3.x -= gCullParams.eye.x;
+    r3.y -= gCullParams.eye.y;
+    r3.z -= gCullParams.eye.z;
+
+    for (uint k = 0u; k < inst.numSubsets; ++k)
+    {
+        uint sid = inst.firstSubset + k;
+        uint slot;
+        AtomicAdd(gSubsetCursor[sid], 1u, slot);
+        uint row = gSubsetOffset[sid] + slot;
+        if (row >= kMaxInst)   // ring overflow guard (matches cullscan clamp)
+            continue;
+
+        StaticsSubset s = gStaticsSubsets[sid];
+        uint b = row * 20u;
+        gInstOut[b + 0u]  = asuint(r0.x); gInstOut[b + 1u]  = asuint(r0.y);
+        gInstOut[b + 2u]  = asuint(r0.z); gInstOut[b + 3u]  = asuint(r0.w);
+        gInstOut[b + 4u]  = asuint(r1.x); gInstOut[b + 5u]  = asuint(r1.y);
+        gInstOut[b + 6u]  = asuint(r1.z); gInstOut[b + 7u]  = asuint(r1.w);
+        gInstOut[b + 8u]  = asuint(r2.x); gInstOut[b + 9u]  = asuint(r2.y);
+        gInstOut[b + 10u] = asuint(r2.z); gInstOut[b + 11u] = asuint(r2.w);
+        gInstOut[b + 12u] = asuint(r3.x); gInstOut[b + 13u] = asuint(r3.y);
+        gInstOut[b + 14u] = asuint(r3.z); gInstOut[b + 15u] = asuint(r3.w);
+        gInstOut[b + 16u] = asuint((float)s.texSlot);
+        gInstOut[b + 17u] = asuint((float)s.flags);
+        gInstOut[b + 18u] = asuint(0.0f);
+        gInstOut[b + 19u] = asuint(0.0f);
+    }
+    RETURN();
+}

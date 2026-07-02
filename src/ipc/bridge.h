@@ -296,8 +296,10 @@ namespace IPC {
         // Phase 1a/1b appends a 7th float4 (realEye.xyz, isExterior) for the host-owned LIVE
         // distant-land path: realEye = DistantLand::eyePos (absolute camera, since the camera-relative
         // frame zeroes the shipped eyePos), isExterior gates DL feeding. Host reads it into
-        // FrameData.lodEye + g_dlExterior. 28 floats total.
-        IN float lighting[28];
+        // FrameData.lodEye + g_dlExterior.
+        // C2 appends an 8th float4 (skyZenith.rgb, _) — the current interpolated zenith sky colour for
+        // the host-computed dome gradient (FrameData.skyZenith). 32 floats total.
+        IN float lighting[32];
         IN VecId drawList;               // chunked byte vec of DrawItemWire[]; Invalid ⇒ triangle
         IN std::uint32_t drawCount;
         IN std::uint32_t drawBytes;

@@ -25,6 +25,9 @@ STRUCT(VSOutput)
     DATA(float2, Uv,       TEXCOORD0);
     DATA(float3, WorldPos, TEXCOORD1);   // for F12 distance grayscale parity with opaque.frag
     DATA(float,  Fog,      TEXCOORD2);
+    // Real water reflection (WV2): below-water clip. Pass-all (0,0,0,1) in every non-reflect frame
+    // cbuffer → Clip = 1 >= 0 (nothing clipped). Rasterizer system-value; no frag input, no PSO state.
+    DATA(float,  Clip,     SV_ClipDistance0);
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -42,9 +45,15 @@ VSOutput VS_MAIN( VSInput In )
     float  dist = length(worldPos - gFrameData.eyePos.xyz);
 
     // landBias (XE Mod Landscape.fx:21): -30 - 2*max(0, (nearViewRange-1152) - dist). Sinks the
-    // coarse far mesh below the near handover so it never pokes through the near scene.
-    float  maxDist = gFrameData.lodParams.w - 1152.0f;   // lodParams.w = nearViewRange
-    worldPos.z += -30.0f + -2.0f * max(0.0f, maxDist - dist);
+    // coarse far mesh below the near handover so it never pokes through the near scene (MAIN view).
+    // WV2: the REFLECTION has no near scene and draws DL near (no near-cull), so sinking would displace
+    // the reflected terrain far below its true height (huge near shore) — skip it in the reflect-geo
+    // pass. gReflWaterClip is pass-all (0,0,0,1) everywhere EXCEPT reflect-geo (nz = ±1), so .z != 0
+    // uniquely identifies the reflection.
+    if (gFrameData.gReflWaterClip.z == 0.0f) {
+        float  maxDist = gFrameData.lodParams.w - 1152.0f;   // lodParams.w = nearViewRange
+        worldPos.z += -30.0f + -2.0f * max(0.0f, maxDist - dist);
+    }
 
     // Cbuffer matrices are column-major (DXC default): mul(viewProj, worldPos) with the D3DX bytes
     // uploaded as-is == D3DX v*M. Same reverse-Z viewProj the near opaque pass uses (one depth).
@@ -56,5 +65,9 @@ VSOutput VS_MAIN( VSInput In )
     // fogColNear by camera distance; keeps the far mass from reading as a hard cutoff.
     Out.Fog = saturate((gFrameData.fogParams.y - dist)
                        / (gFrameData.fogParams.y - gFrameData.fogParams.x));
+
+    // Below-water clip (reflect-geo pass only): keep the above-water side of the water plane. The plane
+    // is camera-relative, matching worldPos (which is In.Position - lodEye). Pass-all in every other pass.
+    Out.Clip = dot(gFrameData.gReflWaterClip.xyz, worldPos) + gFrameData.gReflWaterClip.w;
     RETURN(Out);
 }

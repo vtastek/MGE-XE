@@ -42,6 +42,7 @@ namespace {
     // forwarded over the renderScene RPC. The host injects it into Forge UI (uiSetExternalInput).
     bool   g_devUiVisible = false;     // F9; default off so it never blocks normal play
     HWND   g_devHwnd = nullptr;        // MW focus window (cached from device creation params)
+    bool   g_reloadShadersPending = false; // F8 latched at composite finish, consumed by the next kickoff
 
     // --- Feeding-side spike logging --------------------------------------------------
     // Periodic FPS dips are suspected to come from the client feed (geometry/texture
@@ -55,9 +56,29 @@ namespace {
     // normal per-frame cost ("always slow" lives in the baseline, not the spikes). Accumulate
     // every composited frame and log avg/max over a window so the true standing-still cost and
     // its breakdown are visible without spamming.
+    //
+    // `overlap` = wall time between kickoff-return and finish-entry: MW frame work the host
+    // render ran UNDER (recovered time). It is NOT part of `feed` — feed stays the client's
+    // own cost (kickoff prep + residual wait + copy + blit), so feed is comparable across
+    // fused/async modes and IS the perf baseline once the wait bucket collapses.
     constexpr unsigned kHeartbeatFrames = 300;
-    struct Accum { double feed, render, host, copy, dt; double maxFeed, maxDt; unsigned n; };
+    struct Accum { double feed, geom, render, host, overlap, copy, blit, dt; double maxFeed, maxDt; unsigned n, earlyN; };
     Accum g_hb = {};
+
+    // Async-frame split: everything the finish half needs from the kickoff half. Reset at
+    // every kickoff entry; rpcPending=true only when renderSceneKickoff actually started the
+    // host (finish no-ops otherwise, so every kickoff early-out stays a whole-frame no-op).
+    struct KickState {
+        bool rpcPending;
+        bool early;     // fired from the BeginScene(0) site (DistantLand::earlyForgeKickoff latch)
+        unsigned frame;
+        std::uint32_t drawCount, skinnedCount, multiMapCount, lightCount, skyCount;
+        std::uint32_t geomParts, texCount;
+        std::size_t geomBytes, texBytes;
+        double dtPresent;
+        double tStart, tGeomFlush, tBuild, tTexFlush, tAssign, tKick;
+    };
+    KickState g_kick = {};
 
     inline double nowMs() {
         static LARGE_INTEGER freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
@@ -1186,7 +1207,14 @@ namespace {
             item.matColor[1] = e.matDiffuse[1];
             item.matColor[2] = e.matDiffuse[2];
             item.matAlpha    = e.matDiffuse[3];
-            item.vColSource  = (e.hasVertexColor && e.vColSource != 0) ? e.vColSource : 0u;
+            {
+                const std::uint32_t baseVCol = (e.hasVertexColor && e.vColSource != 0) ? e.vColSource : 0u;
+                // C3: the untextured atmosphere dome (texIndex 0, vertex-coloured) is now host-coloured
+                // with a vertical gradient. Tag it with the dedicated vColSource 3 ("host gradient dome")
+                // so sky.frag computes fogColNear->skyZenith from the vertex direction instead of using
+                // the (no-longer-re-uploaded) baked per-vertex gradient. SK2 textured shapes keep 0/1/2.
+                item.vColSource = (item.texIndex == 0u && baseVCol != 0u) ? 3u : baseVCol;
+            }
             memcpy(item.world, e.worldTransformD3D, 16 * sizeof(float));
             // SK2 billboard fix (SUN ONLY): the sun disc hangs under a NiBillboardNode that MW
             // re-faces to the camera each frame via rotateToCamera — but that runs AFTER our
@@ -1254,14 +1282,18 @@ namespace RenderProcess {
         lazyInit(device);
     }
 
-    void onStage0Composite(IDirect3DDevice9* device) {
+    void onStage0CompositeKickoff(IDirect3DDevice9* device) {
+        // Whole-frame no-op guarantee: rpcPending stays false on every early-out below, so
+        // the paired Finish returns immediately.
+        g_kick = KickState{};
         if (!device || !g_initOk) {
             return;
         }
-        // Whole client-side Forge driving phase: geom flush → build draw lists → tex flush → the
-        // blocking host RPC → RT copy → composite blit. Zoned so the Tracy frame has NO unaccounted
-        // gap here (the earlier "unaccounted after renderCacheDepthToMainZ" was this function).
-        MGE_ZoneScopedN("Forge onStage0Composite");
+        // Client-side Forge driving phase, kickoff half: geom flush → build draw lists → tex
+        // flush → start the host RenderFrame WITHOUT waiting. The host renders frame N while
+        // MW's own frame-N work continues; onStage0CompositeFinish drains the completion and
+        // composites. Zoned so the Tracy frame has NO unaccounted gap here.
+        MGE_ZoneScopedN("Forge composite kickoff");
 
         const double tStart = nowMs();
         const double dtPresent = (g_lastPresentMs > 0.0) ? (tStart - g_lastPresentMs) : 0.0;
@@ -1280,48 +1312,20 @@ namespace RenderProcess {
         }
         const double tGeomFlush = nowMs();
 
-        // Live toggle (debug key). Edge-triggered.
-        if (GetAsyncKeyState(VK_F11) & 0x0001) {
-            g_enabled = !g_enabled;
-            LOG::logline(">> [seam] composite %s", g_enabled ? "ON" : "OFF");
-        }
-        // F12 diagnostic: scatter each object by a fixed per-slot offset so any object that
-        // is drawn more than once appears as TWO separated copies of the same mesh (a single
-        // draw just looks displaced). Reveals duplicate draws regardless of source.
-        if (GetAsyncKeyState(VK_F12) & 0x0001) {
-            // Tier 2 GTAO added 3 (AO) + 4 (bent normal); dev panel added 5 (albedo) 6 (lit)
-            // 7 (ambient) shading-isolation views — cycle is now %8.
-            g_debugMode = (g_debugMode + 1) % 8;
-            const char* name = (g_debugMode == 1) ? "DEPTH" : (g_debugMode == 2) ? "SCATTER"
-                             : (g_debugMode == 3) ? "AO" : (g_debugMode == 4) ? "BENT NORMAL"
-                             : (g_debugMode == 5) ? "ALBEDO" : (g_debugMode == 6) ? "LIT"
-                             : (g_debugMode == 7) ? "AMBIENT" : "NORMAL";
-            LOG::logline(">> [seam] debug mode %d (%s)", g_debugMode, name);
-        }
-        // F9 toggles the in-host dev overlay (edge-triggered).
-        if (GetAsyncKeyState(VK_F9) & 0x0001) {
-            g_devUiVisible = !g_devUiVisible;
-            LOG::logline(">> [seam] dev overlay %s", g_devUiVisible ? "ON" : "OFF");
-        }
-        // F7 toggles the Forge WATER takeover (edge-triggered). The sky takeover is finished, so the
-        // sky pass is always on now and F7 was freed — it now drives water (WT1). OFF (default) → MW's
-        // own water draws (clean A/B). ON → the host draws its geo-clipmap water surface.
-        if (GetAsyncKeyState(VK_F7) & 0x0001) {
-            g_waterEnabled = !g_waterEnabled;
-            LOG::logline(">> [seam] Forge water (WT1) %s", g_waterEnabled ? "ON" : "OFF");
-        }
+        // (Edge-triggered dev-key polls — F11/F12/F9/F7/F8 — moved to
+        // onStage0CompositeFinish so every per-frame ownership gate, including the
+        // frameSetupEarly early-kickoff latch that runs BEFORE this function, sees
+        // one consistent value per frame. See the comment there.)
         if (!g_enabled) {
             return;
         }
 
         const unsigned frame = g_frame++;
 
-        // Drive the host renderer into the shared RT. Blocking — the host fence-waits
-        // before replying, so the draw is GPU-complete and the resource is quiescent
-        // before our copy. M1c: build this frame's visible draw list (camera + slots +
-        // world transforms) and render the cached opaque SCENE; fall back to the
-        // triangle if the scene path or draw data isn't available.
-        double hostMs = 0.0;
+        // Drive the host renderer into the shared RT. Async — the host fence-waits before
+        // signalling completion, so at renderSceneFinish the draw is GPU-complete and the
+        // resource quiescent before our copy. M1c: build this frame's visible draw list
+        // (camera + slots + world transforms) and render the cached opaque SCENE.
         bool ok = false;
         // Re-walk the geometry cache to build the host's draw lists (the MGE→Forge feeding cost —
         // Phase 2 makes this GPU-resident so it goes to 0).
@@ -1432,7 +1436,20 @@ namespace RenderProcess {
         //                                                 // mostly the sun light's sunAmb term.
         const RGBVECTOR sunColEff = DistantLand::lightSunMult * DistantLand::sunCol;
         const RGBVECTOR ambColEff = DistantLand::lightAmbMult * (DistantLand::sunAmb + DistantLand::ambCol);
-        const float lighting[28] = {
+        // Host-computed sky dome (C2): the current interpolated ZENITH sky colour MW already blended
+        // this frame from the Weather_*_Sky_*_Color ini keys (getCurrentWeatherSkyCol; MW does the
+        // time-of-day blend internally). The host colours the dome with a vertical gradient
+        // fogColNear(horizon) -> skyZenith(zenith), so we ship ONLY this colour — the dome geometry
+        // itself no longer re-uploads (see scenegraph_geometry_cache SK1). Null-guarded to black.
+        // Guard on CellHasWeather like DistantLand::update (the weather-struct pointer is only valid
+        // then); fall back to the horizon (nearFogCol) so a no-weather cell yields a flat dome. The
+        // dome only draws in weather exteriors anyway, so skyZenith is otherwise unconsumed.
+        MWBridge* mwb = MWBridge::get();
+        const RGBVECTOR* skyColPtr = mwb->CellHasWeather() ? mwb->getCurrentWeatherSkyCol() : nullptr;
+        const float skyZenithR = skyColPtr ? skyColPtr->r : DistantLand::nearFogCol.r;
+        const float skyZenithG = skyColPtr ? skyColPtr->g : DistantLand::nearFogCol.g;
+        const float skyZenithB = skyColPtr ? skyColPtr->b : DistantLand::nearFogCol.b;
+        const float lighting[32] = {
             DistantLand::sunVec.x,     DistantLand::sunVec.y,     DistantLand::sunVec.z,     0.0f,
             sunColEff.r,               sunColEff.g,               sunColEff.b,               0.0f,
             ambColEff.r,               ambColEff.g,               ambColEff.b,               0.0f,
@@ -1444,6 +1461,9 @@ namespace RenderProcess {
             // Phase 1a/1b: the REAL absolute camera eye (host shifts resident DL by -realEye to
             // match the camera-relative near scene) + isExterior gate (1 = feed host-owned DL).
             DistantLand::eyePos.x,     DistantLand::eyePos.y,     DistantLand::eyePos.z,     isExterior ? 1.0f : 0.0f,
+            // C2 skyZenith (float4 28..31): zenith sky colour for the host dome gradient. Host reads
+            // it into FrameData.skyZenith; only sky.frag (dome branch) consumes it.
+            skyZenithR,                skyZenithG,                skyZenithB,                0.0f,
         };
 
         // Dev overlay input (Stage 2): poll the mouse in MW client-space pixels (1:1 with the host
@@ -1451,11 +1471,11 @@ namespace RenderProcess {
         // when the panel is up; otherwise uiVisible=0 leaves the host overlay hidden/inert.
         IPC::DevInput devInput;
         devInput.uiVisible = g_devUiVisible ? 1u : 0u;
-        // F8 (edge): one-shot host compute-shader hot-reload — rebuild gtao/linearize from the dxil
-        // on disk (recompile + redeploy first). Independent of panel visibility.
-        if (GetAsyncKeyState(VK_F8) & 0x0001) {
+        // F8 one-shot host compute-shader hot-reload: the edge poll happens at composite
+        // finish (see there); consume the latched request into THIS frame's DevInput.
+        if (g_reloadShadersPending) {
             devInput.reloadShaders = 1u;
-            LOG::logline(">> [seam] compute shader hot-reload requested (F8)");
+            g_reloadShadersPending = false;
         }
         if (g_devUiVisible) {
             if (!g_devHwnd) {
@@ -1501,13 +1521,13 @@ namespace RenderProcess {
             waterParams[11] = 0.0f;
         }
 
-        // Blocking RPC: the client thread STALLS here until the Forge host finishes its whole
-        // frame (record + GPU + present-seam). Serial — no overlap with MGE's frame. Zoned so the
-        // wait is accounted in Tracy (was the ~10ms "unaccounted" gap after renderCacheDepthToMainZ).
-        const double tPreForge = nowMs();
+        // Async kickoff: copy the frame params into shared memory and start the host, then
+        // RETURN — the host renders while MW's frame-N work continues. All the pointer args
+        // (viewProj/lighting/devInput/waterParams) are memcpy'd into the IPC block before
+        // renderSceneKickoff returns, so these stack locals can die here.
         {
-            MGE_ZoneScopedN("Forge renderSceneBlocking (host wait)");
-            ok = g_client->renderSceneBlocking(frame, (const float*)&viewProj, lighting,
+            MGE_ZoneScopedN("Forge renderSceneKickoff");
+            ok = g_client->renderSceneKickoff(frame, (const float*)&viewProj, lighting,
                      haveDraw ? g_drawVec->id() : IPC::InvalidVector,
                      haveDraw ? drawCount : 0,
                      haveDraw ? (std::uint32_t)g_drawScratch.size() : 0,
@@ -1515,12 +1535,107 @@ namespace RenderProcess {
                      multiMapId, (multiMapId != IPC::InvalidVector) ? multiMapCount : 0, multiMapBytes,
                      lightId, (lightId != IPC::InvalidVector) ? lightCount : 0, lightBytes,
                      skyId, (skyId != IPC::InvalidVector) ? skyCount : 0, skyBytes,
-                     (std::uint32_t)g_debugMode, &devInput, waterParams, waterOn, &hostMs);
+                     (std::uint32_t)g_debugMode, &devInput, waterParams, waterOn);
+        }
+        if (!ok) {
+            return;     // rpcPending stays false → Finish no-ops
+        }
+
+        // Hand everything the finish half needs across the overlap window.
+        g_kick.rpcPending    = true;
+        g_kick.early         = DistantLand::earlyForgeKickoff;  // BeginScene(0) site vs late (EndScene)
+        g_kick.frame         = frame;
+        g_kick.drawCount     = drawCount;
+        g_kick.skinnedCount  = skinnedCount;
+        g_kick.multiMapCount = multiMapCount;
+        g_kick.lightCount    = lightCount;
+        g_kick.skyCount      = skyCount;
+        g_kick.geomParts     = geomParts;
+        g_kick.texCount      = texCount;
+        g_kick.geomBytes     = geomBytes;
+        g_kick.texBytes      = texBytes;
+        g_kick.dtPresent     = dtPresent;
+        g_kick.tStart        = tStart;
+        g_kick.tGeomFlush    = tGeomFlush;
+        g_kick.tBuild        = tBuild;
+        g_kick.tTexFlush     = tTexFlush;
+        g_kick.tAssign       = tAssign;
+        g_kick.tKick         = nowMs();
+    }
+
+    void onStage0CompositeFinish(IDirect3DDevice9* device) {
+        // Poll the seam's edge-triggered dev keys HERE, at composite finish — after every
+        // consumer of the ownership gates has run this frame. Phase 2 latches the early-
+        // kickoff decision (DistantLand::earlyForgeKickoff) at BeginScene(0), BEFORE the
+        // kickoff; polling in the kickoff flipped g_enabled/g_waterEnabled between that
+        // latch and the stage-0 suppression gates — a mid-frame mixed state that could
+        // e.g. fire the shadow/reflection RPCs inside the still-open async window. Costs
+        // one frame of latency on dev toggles; every gate now sees one value per frame.
+        if (g_initOk) {
+            // F11: live composite toggle.
+            if (GetAsyncKeyState(VK_F11) & 0x0001) {
+                g_enabled = !g_enabled;
+                LOG::logline(">> [seam] composite %s", g_enabled ? "ON" : "OFF");
+            }
+            // F12 diagnostic: scatter each object by a fixed per-slot offset so any object that
+            // is drawn more than once appears as TWO separated copies of the same mesh (a single
+            // draw just looks displaced). Reveals duplicate draws regardless of source.
+            if (GetAsyncKeyState(VK_F12) & 0x0001) {
+                // Tier 2 GTAO added 3 (AO) + 4 (bent normal); dev panel added 5 (albedo) 6 (lit)
+                // 7 (ambient) shading-isolation views — cycle is now %8.
+                g_debugMode = (g_debugMode + 1) % 8;
+                const char* name = (g_debugMode == 1) ? "DEPTH" : (g_debugMode == 2) ? "SCATTER"
+                                 : (g_debugMode == 3) ? "AO" : (g_debugMode == 4) ? "BENT NORMAL"
+                                 : (g_debugMode == 5) ? "ALBEDO" : (g_debugMode == 6) ? "LIT"
+                                 : (g_debugMode == 7) ? "AMBIENT" : "NORMAL";
+                LOG::logline(">> [seam] debug mode %d (%s)", g_debugMode, name);
+            }
+            // F9 toggles the in-host dev overlay.
+            if (GetAsyncKeyState(VK_F9) & 0x0001) {
+                g_devUiVisible = !g_devUiVisible;
+                LOG::logline(">> [seam] dev overlay %s", g_devUiVisible ? "ON" : "OFF");
+            }
+            // F7 toggles the Forge WATER takeover. The sky takeover is finished, so the sky
+            // pass is always on now and F7 was freed — it drives water (WT1). ON (default) →
+            // the host draws its geo-clipmap water surface. OFF → MW's own water (clean A/B).
+            if (GetAsyncKeyState(VK_F7) & 0x0001) {
+                g_waterEnabled = !g_waterEnabled;
+                LOG::logline(">> [seam] Forge water (WT1) %s", g_waterEnabled ? "ON" : "OFF");
+            }
+            // F8: one-shot host compute-shader hot-reload — rebuild gtao/linearize from the
+            // dxil on disk (recompile + redeploy first). Latched into the NEXT kickoff's
+            // DevInput. Independent of panel visibility.
+            if (GetAsyncKeyState(VK_F8) & 0x0001) {
+                g_reloadShadersPending = true;
+                LOG::logline(">> [seam] compute shader hot-reload requested (F8)");
+            }
+        }
+
+        if (!g_kick.rpcPending) {
+            return;
+        }
+        g_kick.rpcPending = false;
+
+        MGE_ZoneScopedN("Forge composite finish");
+
+        // overlap = the MW frame work the host render ran under. In fused mode (Finish
+        // called straight after Kickoff) this is ~0 and every bucket reduces to the old
+        // serial breakdown — the exact A/B.
+        const double tWait0 = nowMs();
+        const double overlap = tWait0 - g_kick.tKick;
+
+        double hostMs = 0.0;
+        bool ok;
+        {
+            MGE_ZoneScopedN("Forge renderSceneFinish (host wait)");
+            ok = g_client->renderSceneFinish(&hostMs);
         }
         const double tRender = nowMs();
-        // Split the wait: hostMs = host self-timed cost; (client wait - hostMs) = IPC/sync/host-present
-        // overhead. If these diverge, the host frame is serializing behind its own present.
-        MGE_TracyPlot("Forge client wait ms", tRender - tPreForge);
+        // Split the wait: hostMs = host self-timed cost; (residual wait + kickoff cost - hostMs)
+        // = IPC/sync/host-present overhead. Once the kickoff is hoisted to frame start, the
+        // residual wait collapsing toward 0 is the whole point of the async split.
+        MGE_TracyPlot("Forge client wait ms", tRender - tWait0);
+        MGE_TracyPlot("Forge overlap ms", overlap);
         MGE_TracyPlot("Forge host ms", hostMs);
         if (!ok) {
             return;
@@ -1619,36 +1734,58 @@ namespace RenderProcess {
         const double tEnd = nowMs();
 
         // Spike log: one breakdown line when the client feed blew the budget. render =
-        // the blocking host RPC (host's own GPU time = host[]); render - host = IPC/wait
-        // stall. texflush is the prime suspect for the *periodic* dips (textures stream in
-        // as you cross into new cells). dt = inter-present delta (the visible dip).
-        const double feed = tEnd - tStart;
+        // kickoff issue + residual host wait (host's own GPU time = host[]); overlap =
+        // MW frame work the host ran under (NOT client cost). texflush is the prime
+        // suspect for the *periodic* dips (textures stream in as you cross into new
+        // cells). dt = inter-present delta (the visible dip).
+        //
+        // feed EXCLUDES the overlap window — it's the client's own cost, comparable
+        // across fused/async: (kickoff prep) + (residual wait + copy + blit).
+        const double feed = (g_kick.tKick - g_kick.tStart) + (tEnd - tWait0);
+        const double renderBucket = (g_kick.tKick - g_kick.tAssign) + (tRender - tWait0);
 
         // Baseline heartbeat over every composited frame (sees the <kSpikeMs majority).
-        g_hb.feed += feed; g_hb.render += (tRender - tAssign); g_hb.host += hostMs;
-        g_hb.copy += (tCopy - tRender); g_hb.dt += dtPresent;
+        g_hb.feed += feed; g_hb.geom += (g_kick.tGeomFlush - g_kick.tStart);
+        g_hb.render += renderBucket; g_hb.host += hostMs; g_hb.overlap += overlap;
+        g_hb.copy += (tCopy - tRender); g_hb.blit += (tEnd - tCopy); g_hb.dt += g_kick.dtPresent;
         if (feed > g_hb.maxFeed) g_hb.maxFeed = feed;
-        if (dtPresent > g_hb.maxDt) g_hb.maxDt = dtPresent;
+        if (g_kick.dtPresent > g_hb.maxDt) g_hb.maxDt = g_kick.dtPresent;
+        if (g_kick.early) ++g_hb.earlyN;
         if (++g_hb.n >= kHeartbeatFrames) {
-            LOG::logline(">> [hb] %u frames avg: feed=%.2f render=%.2f[host=%.2f] copy=%.2f dt=%.2f | "
-                         "max feed=%.2f dt=%.2f (~%.0f fps)",
-                         g_hb.n, g_hb.feed / g_hb.n, g_hb.render / g_hb.n, g_hb.host / g_hb.n,
-                         g_hb.copy / g_hb.n, g_hb.dt / g_hb.n, g_hb.maxFeed, g_hb.maxDt,
+            LOG::logline(">> [hb] %u frames avg: feed=%.2f geom=%.2f render=%.2f[host=%.2f] "
+                         "overlap=%.2f copy=%.2f blit=%.2f dt=%.2f early=%u | max feed=%.2f dt=%.2f (~%.0f fps)",
+                         g_hb.n, g_hb.feed / g_hb.n, g_hb.geom / g_hb.n,
+                         g_hb.render / g_hb.n, g_hb.host / g_hb.n, g_hb.overlap / g_hb.n,
+                         g_hb.copy / g_hb.n, g_hb.blit / g_hb.n, g_hb.dt / g_hb.n, g_hb.earlyN,
+                         g_hb.maxFeed, g_hb.maxDt,
                          g_hb.dt > 0.0 ? 1000.0 * g_hb.n / g_hb.dt : 0.0);
             g_hb = Accum{};
         }
 
         if (feed >= kSpikeMs) {
             LOG::logline("!! [spike] frame %u feed=%.2fms (geomflush=%.2f build=%.2f texflush=%.2f "
-                         "assign=%.2f render=%.2f[host=%.2f] copy=%.2f blit=%.2f) "
+                         "assign=%.2f render=%.2f[host=%.2f] overlap=%.2f copy=%.2f blit=%.2f) "
                          "draws=%u skin=%u mm=%u light=%u geom+=%u/%uKB tex+=%u/%uKB dt=%.2fms",
-                         frame, feed,
-                         tGeomFlush - tStart, tBuild - tGeomFlush, tTexFlush - tBuild,
-                         tAssign - tTexFlush, tRender - tAssign, hostMs, tCopy - tRender, tEnd - tCopy,
-                         drawCount, skinnedCount, multiMapCount, lightCount,
-                         geomParts, (unsigned)(geomBytes >> 10), texCount, (unsigned)(texBytes >> 10),
-                         dtPresent);
+                         g_kick.frame, feed,
+                         g_kick.tGeomFlush - g_kick.tStart, g_kick.tBuild - g_kick.tGeomFlush,
+                         g_kick.tTexFlush - g_kick.tBuild, g_kick.tAssign - g_kick.tTexFlush,
+                         renderBucket, hostMs, overlap, tCopy - tRender, tEnd - tCopy,
+                         g_kick.drawCount, g_kick.skinnedCount, g_kick.multiMapCount, g_kick.lightCount,
+                         g_kick.geomParts, (unsigned)(g_kick.geomBytes >> 10),
+                         g_kick.texCount, (unsigned)(g_kick.texBytes >> 10),
+                         g_kick.dtPresent);
         }
+    }
+
+    void onStage0Composite(IDirect3DDevice9* device) {
+        // Fused kickoff+finish — the exact pre-split serial behaviour (A/B reference,
+        // UseAsyncHostFrame=0). overlap ≈ 0 by construction.
+        onStage0CompositeKickoff(device);
+        onStage0CompositeFinish(device);
+    }
+
+    bool kickoffPending() {
+        return g_kick.rpcPending;
     }
 
     bool wantsGeometryCapture() {

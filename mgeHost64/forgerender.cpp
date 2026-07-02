@@ -647,14 +647,15 @@ namespace ForgeRender {
         float vp[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
         // Tier 1 lighting (6×float4): sun OFF, ambient 0.5, no fog — so the SLOT-0 white-texture
         // guard below stays a clean normal-independent value (white × 0.5, tonemapped ≈ 129).
-        float lt[28] = {
+        float lt[32] = {
             0,0,-1,0,           // sunDir (unused, sunCol=0)
             0,0,0,0,            // sunCol = 0
             0.5f,0.5f,0.5f,0,   // ambCol
             0,0,0,0,            // fogColNear
             0, 1e9f, 0,0,       // fogParams: start=0, end=1e9 -> fog ≈ 1 (clear)
             0,0,0,0,            // eyePos
-            0,0,0,0             // realEye.xyz + isExterior (0 -> no host-owned DL in the scene-probe)
+            0,0,0,0,            // realEye.xyz + isExterior (0 -> no host-owned DL in the scene-probe)
+            0,0,0,0             // C2 skyZenith (unused in the probe)
         };
         IPC::DrawItemWire item = {};
         item.slot = 0;
@@ -1018,8 +1019,23 @@ namespace {
         Buffer*        pCullParamsCbv = nullptr;   // gCullParams (planes/eye/ranges/count), persistent-mapped
         Shader*        pCullShader = nullptr;
         Pipeline*      pCullPipeline = nullptr;
-        DescriptorSet* pCullSet = nullptr;         // CullSrtData PerBatch: gCullParams + gCullInst + gCullCount
+        DescriptorSet* pCullSet = nullptr;         // CullSrtData PerBatch: all 9 cull resources
         uint32_t       cullInstCount = 0;          // g_ws0Count at upload (dispatch + bounds guard)
+        // --- Stage B (B3) count->prefix-sum->scatter->execute-indirect (GPU-driven statics draw) ---
+        Buffer*        pStaticsSubsetBuf = nullptr; // GPU_ONLY structured SRV: g_staticsSubsets (20B/subset)
+        Buffer*        pSubsetCount   = nullptr;    // GPU_ONLY RW uint[subsetCount] (per-subset survivor count)
+        Buffer*        pSubsetOffset  = nullptr;    // GPU_ONLY RW uint[subsetCount] (prefix-sum start)
+        Buffer*        pSubsetCursor  = nullptr;    // GPU_ONLY RW uint[subsetCount] (scatter cursor)
+        Buffer*        pSubsetCountZero = nullptr;  // CPU_TO_GPU zeros[subsetCount] (per-frame reset source)
+        Buffer*        pGpuArgs       = nullptr;    // RW_BUFFER|INDIRECT: IndirectDrawIndexArguments[subsetCount]
+        Buffer*        pGpuInstOut    = nullptr;    // RW_BUFFER|VERTEX: survivor rows (20 uint/inst)
+        Shader*        pCullScanShader = nullptr;
+        Pipeline*      pCullScanPipeline = nullptr;
+        Shader*        pCullScatterShader = nullptr;
+        Pipeline*      pCullScatterPipeline = nullptr;
+        uint32_t       cullSubsetCount = 0;         // g_staticsSubsets.size() at upload
+        bool           gpuStaticsReady = false;     // all B3 resources + pipelines created
+        bool           gpuArgsInDrawState = false;  // pGpuArgs/pGpuInstOut currently in INDIRECT/VERTEX (else UAV)
         DescriptorSet* pPerFrameSet = nullptr;    // gFrameData cbuffer (viewProj), 1 instance
         DescriptorSet* pPerBatchSet = nullptr;    // gBatch cbuffer window, kMaxBatches instances
         Buffer*        pFrameCbv = nullptr;        // gFrameData cbuffer (viewProj), persistent-mapped
@@ -1122,6 +1138,11 @@ namespace {
         RenderTarget*  pReflectDepth = nullptr;            // 1024² D32 reverse-Z (mirror pass depth)
         Buffer*        pReflectFrameCbv = nullptr;         // gFrameData for the mirror view (own viewProj)
         DescriptorSet* pPerFrameSetReflect = nullptr;      // PerFrame set bound to pReflectFrameCbv (+ gAO + water SRVs)
+        // WV2 (real reflection): the land/statics mirror uses a DIFFERENT matrix (mirror about the WATER
+        // plane, not the camera plane) + the below-water clip plane, so it needs its OWN frame cbuffer/set
+        // (overwriting pReflectFrameCbv mid-pass would corrupt the sky draws that execute later on the GPU).
+        Buffer*        pReflectFrameCbvGeo = nullptr;       // gFrameData for the water-plane mirror + clip plane
+        DescriptorSet* pPerFrameSetReflectGeo = nullptr;    // PerFrame set bound to pReflectFrameCbvGeo
         Buffer*        pReflectSkyWorldsBuf = nullptr;     // reflect sky gBatch window (own; filled in the reflect pass)
         DescriptorSet* pPerBatchSetReflectSky = nullptr;   // gBatch bound to pReflectSkyWorldsBuf
         Buffer*        pReflectSkyInstanceBuf = nullptr;   // reflect sky per-draw instance VB
@@ -1218,7 +1239,12 @@ namespace {
 
     // GPU timestamp phases (the ~4ms gpu breakdown). Index = QueryDesc index in renderScene.
     enum { kGpuPhasePrepass = 0, kGpuPhaseGtao, kGpuPhaseReflect, kGpuPhaseColor,
-           kGpuPhaseWater, kGpuPhaseResolve, kGpuPhaseCount };
+           kGpuPhaseWater, kGpuPhaseResolve,
+           kGpuPhaseCull,    // the 3-pass GPU statics cull compute (before prepass; was unwrapped)
+           kGpuPhaseFrame,   // WHOLE command buffer GPU EXECUTION (beginCmd..resolve) — compare to the
+                             // submit->fence WALL clock (g_lastGpuMs): wall - frame = GPU idle / queue-
+                             // wait behind the client's shared-GPU work (NOT our render cost).
+           kGpuPhaseCount };
 
     // Tier 4 multi-map: ONE 64KB world window holds kBatchSize(1024) matrices; cap at 256
     // parts/frame (< 1024 → a single window, no batching). Per-instance VB stride (uint32 slots):
@@ -1896,12 +1922,13 @@ namespace {
             }
         }
 
-        // gFrameData: small viewProj cbuffer, persistent-mapped (256 = min CBV size).
+        // gFrameData: small viewProj cbuffer, persistent-mapped. 512B (was 256): WV2 appended
+        // gReflWaterClip pushed the struct to 272B, over the 256 min CBV → next 256-aligned size.
         BufferLoadDesc fb = {};
         fb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         fb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
         fb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-        fb.mDesc.mSize = 256;
+        fb.mDesc.mSize = 512;
         fb.mDesc.pName = "frameCbv";
         fb.pData = nullptr;
         fb.ppBuffer = &g_live.pFrameCbv;
@@ -1983,6 +2010,13 @@ namespace {
         }
         // Zero the light cbuffer so a frame with no lightBlob (lightParams.x = 0) does nothing.
         std::memset(g_live.pLightCbv->pCpuMappedAddress, 0, kLightCbvBytes);
+        // WV2: gReflWaterClip = pass-all (0,0,0,1) in the MAIN frame cbuffer (float index 64..67).
+        // Only pReflectFrameCbvGeo overwrites it with the real below-water plane; every other path
+        // (main/viewer/probe) leaves this identity so distantland.vert/statics.vert never clip. Set once.
+        {
+            float* dp = (float*)g_live.pFrameCbv->pCpuMappedAddress;
+            dp[64] = 0.0f; dp[65] = 0.0f; dp[66] = 0.0f; dp[67] = 1.0f;
+        }
         for (uint32_t b = 0; b < kMaxBatches; ++b) {
             uint32_t* inst = (uint32_t*)g_live.pInstanceBuf[b]->pCpuMappedAddress;
             for (uint32_t i = 0; i < kBatchSize; ++i) {
@@ -2756,16 +2790,29 @@ namespace {
             rdd.pName = "reflectDepth";
             addRenderTarget(R, &rdd, &g_live.pReflectDepth);
 
-            // Mirror-view frame cbuffer (own viewProj; same 256B layout as gFrameData).
+            // Mirror-view frame cbuffer (own viewProj; same 512B layout as gFrameData post-WV2).
             BufferLoadDesc rfb = {};
             rfb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
             rfb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
             rfb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-            rfb.mDesc.mSize = 256;
+            rfb.mDesc.mSize = 512;
             rfb.mDesc.pName = "reflectFrameCbv";
             rfb.pData = nullptr;
             rfb.ppBuffer = &g_live.pReflectFrameCbv;
             addResource(&rfb, nullptr);
+
+            // WV2 reflect-GEO frame cbuffer: the water-plane mirror matrix + the below-water clip plane
+            // (the sky cbuffer above uses the camera-plane mirror with a pass-all clip). Own buffer so
+            // both matrices coexist in one command buffer (the GPU reads each at execute time).
+            BufferLoadDesc rfg = {};
+            rfg.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            rfg.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            rfg.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            rfg.mDesc.mSize = 512;
+            rfg.mDesc.pName = "reflectFrameCbvGeo";
+            rfg.pData = nullptr;
+            rfg.ppBuffer = &g_live.pReflectFrameCbvGeo;
+            addResource(&rfg, nullptr);
 
             // Reflect sky gBatch window + instance VB (own copies; the reflect pass fills + draws them
             // BEFORE the main sky pass, so they must be decoupled from pSkyWorldsBuf/pSkyInstanceBuf).
@@ -2791,6 +2838,7 @@ namespace {
 
             waitForAllResourceLoads();
             if (!g_live.pReflectColor || !g_live.pReflectDepth || !g_live.pReflectFrameCbv
+                || !g_live.pReflectFrameCbvGeo
                 || !g_live.pReflectSkyWorldsBuf || !g_live.pReflectSkyInstanceBuf) {
                 std::printf("[forge] reflection resource alloc FAILED\n");
                 return false;
@@ -2829,8 +2877,33 @@ namespace {
                 updateDescriptorSet(R, 0, g_live.pPerBatchSetReflectSky, 1, &rbp);
             }
 
+            // WV2: pPerFrameSetReflectGeo — a THIRD PerFrame set bound to pReflectFrameCbvGeo (the
+            // water-plane mirror + clip plane). Same gAO + water SRVs as pPerFrameSetReflect (the
+            // land/statics frags ignore them; the set layout just needs valid bindings).
+            DescriptorSetDesc rpgDesc = SRT_SET_DESC(SrtData, PerFrame, 1, 0);
+            addDescriptorSet(R, &rpgDesc, &g_live.pPerFrameSetReflectGeo);
+            if (!g_live.pPerFrameSetReflectGeo) { return false; }
+            {
+                Texture* vol = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
+                DescriptorData p[6] = {};
+                p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
+                p[0].ppBuffers = &g_live.pReflectFrameCbvGeo;
+                p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
+                p[1].mCount = 1; p[1].ppTextures = &g_live.pAOBlur;
+                p[2].mIndex = SRT_RES_IDX(SrtData, PerFrame, gWaterNormalVol);
+                p[2].mCount = 1; p[2].ppTextures = &vol;
+                p[3].mIndex = SRT_RES_IDX(SrtData, PerFrame, gRefractColor);
+                p[3].mCount = 1; p[3].ppTextures = &g_live.pRefractColor;
+                p[4].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSceneLinDepth);
+                p[4].mCount = 1; p[4].ppTextures = &g_live.pLinearDepth;
+                p[5].mIndex = SRT_RES_IDX(SrtData, PerFrame, gReflectColor);
+                p[5].mCount = 1; p[5].ppTextures = &g_live.pRefractColor;   // reflect-geo set never reads this
+                updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, 6, p);
+            }
+
             g_live.reflectReady = g_live.waterReady && g_live.pReflectColor && g_live.pReflectDepth
                                 && g_live.pReflectFrameCbv && g_live.pPerFrameSetReflect
+                                && g_live.pReflectFrameCbvGeo && g_live.pPerFrameSetReflectGeo
                                 && g_live.pPerBatchSetReflectSky;
 
             // Re-point gReflectColor (in the MAIN PerFrame set) at the real reflection RT, replacing
@@ -3060,8 +3133,17 @@ namespace {
     bool g_drawSky       = true;
     bool g_drawDLLand    = true;
     bool g_drawDLStatics = true;
+    // Stage B (B3): draw the far statics from the GPU-driven cull (count->prefix-sum->scatter->
+    // execute-indirect) instead of the CPU cull's rings. The CPU cull still runs (fills g_liveLastInst
+    // for the parity check + the reflect path); this only switches which instance/arg buffers the MAIN
+    // statics draw consumes. A/B toggle until visually verified, then the CPU main cull can be removed.
+    bool g_gpuStaticsCull = true;
     bool g_drawWater     = true;
     bool g_drawReflect   = true;
+    bool g_drawReflectGeo = true;   // WV2: reflect host-owned land + statics (off = sky-only reflection)
+    bool g_reflHorizonScissor = true; // WV2 perf: scissor the reflect pass to below the water-plane horizon
+    bool g_reflGeoReady = false;    // WV2 perf: reflect-geo CPU cull ran pre-beginCmd this frame (rings
+                                    // valid) → the reflect pass records the draws; else skips (no stale draw)
     uint32_t  g_debugMode = 0;         // F12 debug view: 0=normal, 1=depth, 2=scatter (written to FrameData.debugParams.x)
 
     // ---- Dev overlay (Forge IUI) state ----
@@ -3091,7 +3173,10 @@ namespace {
     float g_aoBlurDepth = 5.0f;    // bilateral blur range sigma in WORLD units (rejects across silhouettes)
 
     // AO contribution toggles → FrameData.debugParams.w bitmask (bit0 AO, bit1 bent normal, bit2 ambient=white).
-    bool  g_aoEnable         = true;    // AO visibility modulates ambient (matches current behaviour)
+    // Baseline-thinning (2026-07-02): GTAO is off by default (g_aoGtaoDispatch below), so g_aoEnable
+    // defaults OFF too — else the colour frag would multiply ambient by a STALE pAOBlur (never written
+    // this frame) → black AO. Re-tick both in the dev panel to bring GTAO back for an A/B.
+    bool  g_aoEnable         = false;   // AO visibility modulates ambient (OFF: GTAO not running)
     bool  g_bentNormalEnable = false;   // use the AO bent normal as the lighting normal (A/B; off = geometric N)
     bool  g_ambientWhite     = false;   // debug: force ambient term to 1.0 so AO darkening is visible (pair w/ Diffuse=0)
 
@@ -3255,10 +3340,16 @@ namespace {
         uiAddComponentWidget(g_uiPanel, "Draw: distant land", &cDLand, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cDStat = {}; cDStat.pData = &g_drawDLStatics;
         uiAddComponentWidget(g_uiPanel, "Draw: distant statics", &cDStat, WIDGET_TYPE_CHECKBOX);
+        CheckboxWidget cGpuCull = {}; cGpuCull.pData = &g_gpuStaticsCull;
+        uiAddComponentWidget(g_uiPanel, "Statics: GPU cull (B3 draw)", &cGpuCull, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cDWat = {}; cDWat.pData = &g_drawWater;
         uiAddComponentWidget(g_uiPanel, "Draw: water", &cDWat, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cDRef = {}; cDRef.pData = &g_drawReflect;
         uiAddComponentWidget(g_uiPanel, "Draw: reflection", &cDRef, WIDGET_TYPE_CHECKBOX);
+        CheckboxWidget cDRefG = {}; cDRefG.pData = &g_drawReflectGeo;
+        uiAddComponentWidget(g_uiPanel, "Draw: reflect land+statics", &cDRefG, WIDGET_TYPE_CHECKBOX);
+        CheckboxWidget cRScis = {}; cRScis.pData = &g_reflHorizonScissor;
+        uiAddComponentWidget(g_uiPanel, "Reflect: horizon scissor", &cRScis, WIDGET_TYPE_CHECKBOX);
 
         // -- Phase 0: live per-frame stats (updated each frame in drawDevUI) --
         LabelWidget statLbl = {};
@@ -3603,6 +3694,14 @@ namespace ForgeRender {
     // global state renderScene touches so those globals can stay next to their definitions.
     void dlSetFrameEye(float x, float y, float z, bool exterior);
     void dlLiveCullAndBuild(Renderer* R, const float* rzViewProj);
+    void dlReflectCullAndBuild(Renderer* R, const float* mirrorViewProj);   // WV2 reflect-geo cull
+    void dlReflectRecordGeo();                                              // WV2 reflect-geo record
+    // WV2: reflect-geo CPU CULL (build mirror-about-water matrix + clip plane, write pReflectFrameCbvGeo,
+    // cull into the reflection rings). Runs PRE-beginCmd (hoisted off the record phase, like the main
+    // cull); the reflect pass then only RECORDS the draws (dlReflectRecordGeo) gated by g_reflGeoReady.
+    // fcbvR = main frame cbuffer, dRel = water plane (camera-relative), eyeAbsZ = abs camera z.
+    void dlReflectGeoCull(Renderer* R, const float* viewProj, const float* fcbvR,
+                          float dRel, float eyeAbsZ, float waterLevelAbs, bool underwater);
     void dlLiveRecord();
     bool dlCreateLiveRings(Renderer* R);   // statics instance/arg rings (forward: --forge-view eager init)
     void buildStaticsGrid();               // live cull grid (forward: --forge-view eager init)
@@ -3699,6 +3798,11 @@ namespace ForgeRender {
             // scene-probe passes 0s). The near scene is camera-relative (eyePos=0); resident DL is in
             // ABSOLUTE coords, so the live DL cull/build shifts it by -realEye. lodEye -> gFrameData[56..59].
             dlSetFrameEye(lighting[24], lighting[25], lighting[26], lighting[27] != 0.0f);
+            // C2: lighting[28..31] = skyZenith.rgb (current interpolated zenith sky colour). Host dome
+            // gradient (sky.frag) reads FrameData.skyZenith at float index 68..71 (after gReflWaterClip
+            // at 64..67). The scene-probe passes only 24 floats, so guard on the null-lighting path.
+            float* fd = (float*)g_live.pFrameCbv->pCpuMappedAddress;
+            fd[68] = lighting[28]; fd[69] = lighting[29]; fd[70] = lighting[30]; fd[71] = lighting[31];
         }
         // F12 debug view: debugParams.x at float index 40 (160B = viewProj 16f + 6×float4 24f).
         // 0=normal (frag is byte-for-byte unchanged), 1=depth world-distance grayscale,
@@ -3768,6 +3872,22 @@ namespace ForgeRender {
         // relative, reverse-Z, extended-far matrix already in gFrameData.
         const double tCull0 = hostNowMs();   // end of per-draw setup, start of the DL cull
         dlLiveCullAndBuild(R, rzViewProj);
+        // WV2 perf: hoist the reflect-geo CPU cull off the record phase — run it here (pre-beginCmd, like
+        // the main cull; counts in the `cull` metric, not `record`). Fills the reflection rings + writes
+        // pReflectFrameCbvGeo; the reflect PASS then only records the draws (gated by g_reflGeoReady).
+        // Runs AFTER dlLiveCullAndBuild so fcbvR already has this frame's DL fields (lodEye) + init done.
+        {
+            const float* fcbvR = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
+            const float  eyeAbsZ = fcbvR[58];                       // lodEye.z (absolute camera)
+            const float  waterLevelAbs = waterParams ? waterParams[0] : 0.0f;
+            const float  dRel = (waterLevelAbs - 1.0f) - eyeAbsZ;
+            const bool   underwater = waterParams && waterParams[7] > 0.5f;
+            if (g_drawReflect && g_live.reflectReady && waterEnabled && waterParams) {
+                dlReflectGeoCull(R, viewProj, fcbvR, dRel, eyeAbsZ, waterLevelAbs, underwater);
+            } else {
+                g_reflGeoReady = false;
+            }
+        }
         const double tCull1 = hostNowMs();   // end of the DL cull (+ lazy resource/texture load)
 
         resetCmdPool(R, g_live.pCmdPool);
@@ -3785,38 +3905,89 @@ namespace ForgeRender {
         auto gpuPhaseEnd = [&](uint32_t i) {
             if (g_live.pGpuQueryPool) { QueryDesc q = {}; q.mIndex = i; cmdEndQuery(g_live.pCmd, g_live.pGpuQueryPool, &q); }
         };
+        // Whole-frame GPU execution timer (beginCmd..resolve). Compared to the submit->fence wall clock
+        // it separates real GPU work from GPU idle/queue-wait (host shares the GPU with the client).
+        gpuPhaseBegin(kGpuPhaseFrame);
+        gpuPhaseBegin(kGpuPhaseCull);
 
-        // ===================== Stage B (B2): GPU statics cull — COUNT-only validation ===========
-        // Independent compute pass at the very start of recording (no render target bound). Resets
-        // the survivor counter from a zero upload buffer, dispatches cull.comp (one thread/instance,
-        // atomic-adds numSubsets on survival), and copies the count into a readback buffer for the
-        // post-fence compare against g_liveLastInst. Raw D3D12 CopyBufferRegion (Forge has no buffer->
-        // buffer copy); Forge BufferBarriers keep the DEFAULT-heap counter's state tracked. No draws.
+        // ===================== Stage B (B3): GPU statics cull — count -> prefix -> scatter ==========
+        // Independent compute passes at the very start of recording (no render target bound). The COUNT
+        // pass resets/dispatches cull.comp (one thread/instance): survivors atomic-add numSubsets into
+        // gCullCount[0] (the CPU-parity readback) AND per-subset into gSubsetCount. Then (B3, gated on
+        // g_gpuStaticsCull) a single-thread PREFIX pass turns the per-subset counts into instance offsets
+        // + one IndirectDrawIndexArguments each, and a SCATTER pass writes each survivor's camera-relative
+        // row into gInstOut. dlLiveRecord draws from gInstOut/gpuArgs via cmdExecuteIndirect.
+        // Raw D3D12 CopyBufferRegion resets the counters (Forge has no buffer->buffer copy); Forge
+        // BufferBarriers keep the DEFAULT-heap UAV states tracked.
         if (g_live.pCullPipeline && g_live.cullInstCount) {
             ID3D12GraphicsCommandList* cl = g_live.pCmd->mDx.pCmdList;
-            BufferBarrier bb = {};
-            bb.pBuffer = g_live.pCullCountBuf;
-            // reset: UAV -> COPY_DEST, copy zeros in, COPY_DEST -> UAV
-            bb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS; bb.mNewState = RESOURCE_STATE_COPY_DEST;
-            cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
+            const bool doGpuDraw = g_live.gpuStaticsReady && g_gpuStaticsCull;
+            auto bufBarrier = [&](Buffer* buf, ResourceState from, ResourceState to) {
+                BufferBarrier bb = {}; bb.pBuffer = buf; bb.mCurrentState = from; bb.mNewState = to;
+                cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
+            };
+            auto uavBarrier = [&](Buffer* buf) { bufBarrier(buf, RESOURCE_STATE_UNORDERED_ACCESS,
+                                                             RESOURCE_STATE_UNORDERED_ACCESS); };
+
+            // reset gCullCount[0] (parity counter): UAV -> COPY_DEST, copy zeros, COPY_DEST -> UAV
+            bufBarrier(g_live.pCullCountBuf, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_DEST);
             cl->CopyBufferRegion(g_live.pCullCountBuf->mDx.pResource, 0,
                                  g_live.pCullCountZero->mDx.pResource, 0, sizeof(uint32_t));
-            bb.mCurrentState = RESOURCE_STATE_COPY_DEST; bb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
-            cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
-            // dispatch the cull (one thread per resident instance)
-            cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.9f, 0.2f, "CULL (count survivors -> validate)");
+            bufBarrier(g_live.pCullCountBuf, RESOURCE_STATE_COPY_DEST, RESOURCE_STATE_UNORDERED_ACCESS);
+
+            if (doGpuDraw) {
+                // reset gSubsetCount[] to 0 from the zero staging buffer
+                bufBarrier(g_live.pSubsetCount, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_DEST);
+                cl->CopyBufferRegion(g_live.pSubsetCount->mDx.pResource, 0,
+                                     g_live.pSubsetCountZero->mDx.pResource, 0,
+                                     (uint64_t)sizeof(uint32_t) * g_live.cullSubsetCount);
+                bufBarrier(g_live.pSubsetCount, RESOURCE_STATE_COPY_DEST, RESOURCE_STATE_UNORDERED_ACCESS);
+                // args/instOut were left in INDIRECT/VERTEX by the last GPU-draw frame → back to UAV.
+                if (g_live.gpuArgsInDrawState) {
+                    bufBarrier(g_live.pGpuArgs,    RESOURCE_STATE_INDIRECT_ARGUMENT, RESOURCE_STATE_UNORDERED_ACCESS);
+                    bufBarrier(g_live.pGpuInstOut, RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, RESOURCE_STATE_UNORDERED_ACCESS);
+                    g_live.gpuArgsInDrawState = false;
+                }
+            }
+
+            // COUNT pass (also fills gSubsetCount when the B3 resources are bound).
+            cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.9f, 0.2f, "CULL count");
             cmdBindPipeline(g_live.pCmd, g_live.pCullPipeline);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pCullSet);
             cmdDispatch(g_live.pCmd, (g_live.cullInstCount + 63u) / 64u, 1, 1);
             cmdEndDebugMarker(g_live.pCmd);
-            // readback: UAV -> COPY_SOURCE, copy to readback, COPY_SOURCE -> UAV
-            bb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS; bb.mNewState = RESOURCE_STATE_COPY_SOURCE;
-            cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
+
+            if (doGpuDraw) {
+                uavBarrier(g_live.pSubsetCount);
+                // PREFIX pass (single thread): gSubsetCount -> gSubsetOffset + gpuArgs; reset gSubsetCursor.
+                cmdBeginDebugMarker(g_live.pCmd, 0.2f, 0.9f, 0.9f, "CULL prefix-sum");
+                cmdBindPipeline(g_live.pCmd, g_live.pCullScanPipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pCullSet);
+                cmdDispatch(g_live.pCmd, 1, 1, 1);
+                cmdEndDebugMarker(g_live.pCmd);
+                uavBarrier(g_live.pSubsetOffset);
+                uavBarrier(g_live.pSubsetCursor);
+                uavBarrier(g_live.pGpuArgs);
+                // SCATTER pass: survivors -> gInstOut rows.
+                cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.5f, 0.9f, "CULL scatter");
+                cmdBindPipeline(g_live.pCmd, g_live.pCullScatterPipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pCullSet);
+                cmdDispatch(g_live.pCmd, (g_live.cullInstCount + 63u) / 64u, 1, 1);
+                cmdEndDebugMarker(g_live.pCmd);
+                uavBarrier(g_live.pGpuInstOut);
+                // Hand args/instOut to the draw (INDIRECT_ARGUMENT / VERTEX). Restored next cull frame.
+                bufBarrier(g_live.pGpuArgs,    RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_INDIRECT_ARGUMENT);
+                bufBarrier(g_live.pGpuInstOut, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+                g_live.gpuArgsInDrawState = true;
+            }
+
+            // readback gCullCount[0]: UAV -> COPY_SOURCE, copy to readback, COPY_SOURCE -> UAV
+            bufBarrier(g_live.pCullCountBuf, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_SOURCE);
             cl->CopyBufferRegion(g_live.pCullCountReadback->mDx.pResource, 0,
                                  g_live.pCullCountBuf->mDx.pResource, 0, sizeof(uint32_t));
-            bb.mCurrentState = RESOURCE_STATE_COPY_SOURCE; bb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
-            cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
+            bufBarrier(g_live.pCullCountBuf, RESOURCE_STATE_COPY_SOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
         }
+        gpuPhaseEnd(kGpuPhaseCull);
 
         // Color target: the MSAA color when antialiasing is on (resolved into pRT at the end),
         // else the shared pRT directly. The MSAA target is left in RENDER_TARGET between frames
@@ -4095,10 +4266,19 @@ namespace ForgeRender {
         // pass reads pAO unconditionally is Tier 3. pLinearDepth/pAO live in UNORDERED_ACCESS at
         // frame start (created state on frame 0; returned to SHADER_RESOURCE at the end of each
         // frame, so they're flipped back to UAV here on every frame after the first).
-        // Tier 2 master toggle: runs the linearize + GTAO dispatches and the pDepth
-        // DEPTH_WRITE<->SHADER_RESOURCE ping-pong each frame. With it off, behaviour is pure Tier 1
-        // (pDepth stays DEPTH_WRITE; pLinearDepth/pAO stay in their created UAV state, untouched).
+        // Tier 2 master toggle: runs the linearize dispatch + the pDepth/pLinearDepth/pAO(/pAOBlur)
+        // state ping-pong each frame. Kept ON: the linearize output (pLinearDepth) is sampled by the
+        // ALWAYS-ON water pass (gSceneLinDepth) and the colour pass samples pAOBlur (gAO), so the
+        // resource-state transitions here are load-bearing beyond AO — fully gating this off would
+        // leave those in UNORDERED_ACCESS while sampled (the old "clean Tier-1 degradation" comment
+        // predates water-takeover + the bilateral blur). The EXPENSIVE GTAO horizon-search + blur
+        // dispatches are gated separately by g_aoGtaoDispatch below (baseline: off).
         static const bool g_aoComputeEnable = true;
+        // Baseline-thinning (2026-07-02): skip the two costly GTAO dispatches (horizon search + blur,
+        // ~0.8ms) while keeping linearize + all state barriers. pAO/pAOBlur are still transitioned
+        // (states stay valid) but not written — their stale values are inert because g_aoEnable is
+        // OFF (colour frag doesn't read AO). Re-tick in the dev panel with g_aoEnable for an A/B.
+        static bool g_aoGtaoDispatch = false;
         static bool s_aoDispatchLogged = false;
         if (!s_aoDispatchLogged) {
             std::printf("[forge] AO dispatch GATE: enable=%d linPipe=%p gtaoPipe=%p linSet=%p gBatchSet=%p pAO=%p pLinDepth=%p firstFrame=%d\n",
@@ -4172,14 +4352,17 @@ namespace ForgeRender {
                 cmdResourceBarrier(g_live.pCmd, 0, nullptr, nt, tb, 0, nullptr);
             }
 
-            // (2) GTAO dispatch (single PerDraw set holds cbuffer + depth SRV + AO UAV).
-            cmdBeginDebugMarker(g_live.pCmd, 1.0f, 0.3f, 0.2f, "GTAO (pLinearDepth -> pAO: bent normal + visibility)");
-            cmdBindPipeline(g_live.pCmd, g_live.pGtaoPipeline);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pGtaoBatchSet);
-            cmdDispatch(g_live.pCmd, gx, gy, 1);
-            cmdEndDebugMarker(g_live.pCmd);
-            static bool s_gtaoDispatched = false;
-            if (!s_gtaoDispatched) { std::printf("[forge] GTAO dispatch ISSUED gx=%u gy=%u (w=%u h=%u)\n", gx, gy, g_live.width, g_live.height); s_gtaoDispatched = true; }
+            // (2) GTAO dispatch (single PerDraw set holds cbuffer + depth SRV + AO UAV). Gated:
+            // baseline skips this (pAO left stale but state-valid; g_aoEnable off makes it inert).
+            if (g_aoGtaoDispatch) {
+                cmdBeginDebugMarker(g_live.pCmd, 1.0f, 0.3f, 0.2f, "GTAO (pLinearDepth -> pAO: bent normal + visibility)");
+                cmdBindPipeline(g_live.pCmd, g_live.pGtaoPipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pGtaoBatchSet);
+                cmdDispatch(g_live.pCmd, gx, gy, 1);
+                cmdEndDebugMarker(g_live.pCmd);
+                static bool s_gtaoDispatched = false;
+                if (!s_gtaoDispatched) { std::printf("[forge] GTAO dispatch ISSUED gx=%u gy=%u (w=%u h=%u)\n", gx, gy, g_live.width, g_live.height); s_gtaoDispatched = true; }
+            }
 
             // pAO UAV -> SRV (blur + F12 debug read it); pAOBlur SRV -> UAV (blur writes it, skip f0);
             // pDepth SRV -> DEPTH_WRITE (colour LOADs it). pLinearDepth STAYS SRV — the blur reads it.
@@ -4207,11 +4390,15 @@ namespace ForgeRender {
             // (root distinct from gtao/linearize). Depth-aware, so it denoises without silhouette
             // bleed. The colour frags sample pAOBlur as gAO.
             {
-                cmdBeginDebugMarker(g_live.pCmd, 0.6f, 1.0f, 0.4f, "AO BILATERAL BLUR (pAO -> pAOBlur)");
-                cmdBindPipeline(g_live.pCmd, g_live.pAOBlurPipeline);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pAOBlurSet);
-                cmdDispatch(g_live.pCmd, gx, gy, 1);
-                cmdEndDebugMarker(g_live.pCmd);
+                // Gated with the GTAO dispatch: baseline skips the blur (pAOBlur stays stale but is
+                // still transitioned UAV -> SRV below, so the colour pass samples it in a valid state).
+                if (g_aoGtaoDispatch) {
+                    cmdBeginDebugMarker(g_live.pCmd, 0.6f, 1.0f, 0.4f, "AO BILATERAL BLUR (pAO -> pAOBlur)");
+                    cmdBindPipeline(g_live.pCmd, g_live.pAOBlurPipeline);
+                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pAOBlurSet);
+                    cmdDispatch(g_live.pCmd, gx, gy, 1);
+                    cmdEndDebugMarker(g_live.pCmd);
+                }
                 // pAOBlur UAV -> SRV for the colour pass.
                 TextureBarrier tb = {};
                 tb.pTexture = g_live.pAOBlur;
@@ -4270,9 +4457,10 @@ namespace ForgeRender {
                 mirrorVP[1]  += dy * mirrorVP[3];  mirrorVP[5]  += dy * mirrorVP[7];
                 mirrorVP[9]  += dy * mirrorVP[11]; mirrorVP[13] += dy * mirrorVP[15];
             }
-            // Reflect frame cbuffer = a copy of the main frame data (identical lighting/fog/skyParams)
-            // with ONLY the viewProj replaced by the mirror matrix.
-            std::memcpy(g_live.pReflectFrameCbv->pCpuMappedAddress, fcbvR, 256);
+            // Reflect frame cbuffer = a copy of the main frame data (identical lighting/fog/skyParams/
+            // skyZenith, incl. gReflWaterClip = pass-all) with ONLY the viewProj replaced by the mirror
+            // matrix. 288B covers through skyZenith (float 68..71) so the reflected dome gradient matches.
+            std::memcpy(g_live.pReflectFrameCbv->pCpuMappedAddress, fcbvR, 288);
             std::memcpy(g_live.pReflectFrameCbv->pCpuMappedAddress, mirrorVP, 64);
 
             // pReflectColor SHADER_RESOURCE -> RENDER_TARGET (pReflectDepth stays DEPTH_WRITE).
@@ -4289,7 +4477,43 @@ namespace ForgeRender {
             rbind.mDepthStencil = { g_live.pReflectDepth, LOAD_ACTION_CLEAR };
             cmdBindRenderTargets(g_live.pCmd, &rbind);
             cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)kReflectSize, (float)kReflectSize, 0.0f, 1.0f);
-            cmdSetScissor(g_live.pCmd, 0, 0, kReflectSize, kReflectSize);
+
+            // Horizon scissor (parity-safe perf): the water plane can never project ABOVE its own
+            // horizon line, so the water frag never samples the reflect RT above it — scissor the WHOLE
+            // reflect pass (sky + land + statics) to below the horizon and skip that raster/pixel work
+            // (exactly what MGE's reflectionWaterRects, always below the horizon, skip). The full RT is
+            // still cleared (transparent) at bind, and the viewport is unchanged (RT pixels keep their
+            // screen-UV mapping) — only rasterization is clipped. Find the topmost water pixel by
+            // projecting far water-plane points through the MAIN rzViewProj (fcbvR — what the water frag
+            // uses for its screen UV) and taking the min screen-y. Underwater (whole screen can be water)
+            // or horizon above the screen top → full RT (keep-all, like reflWaterCullActive=false).
+            uint32_t reflScissorTop = 0;
+            if (g_reflHorizonScissor && waterParams[7] <= 0.5f) {
+                const float* MV = fcbvR;                            // row-major D3DX; wp*M (homogeneous)
+                const float waterZrel = waterLevelAbs - eyeAbsZ;    // water plane, camera-relative
+                const float R = (Configuration.DL.DrawDist > 0 ? (float)Configuration.DL.DrawDist : 40.0f)
+                              * 8192.0f * 4.0f;                     // well past the far plane → true horizon
+                float minYfrac = 1.0f;                             // 0 = screen top, 1 = bottom
+                bool anyFront = false;
+                for (int a = 0; a < 16; ++a) {
+                    const float ang = (float)a * (6.28318531f / 16.0f);
+                    const float px = R * std::cos(ang), py = R * std::sin(ang), pz = waterZrel;
+                    const float cy = px*MV[1] + py*MV[5] + pz*MV[9] + MV[13];
+                    const float cw = px*MV[3] + py*MV[7] + pz*MV[11] + MV[15];
+                    if (cw <= 1e-4f) { continue; }                 // behind camera → not on screen
+                    anyFront = true;
+                    const float yfrac = 0.5f * (1.0f - cy / cw);
+                    if (yfrac < minYfrac) { minYfrac = yfrac; }
+                }
+                if (anyFront) {
+                    float topPx = minYfrac * (float)kReflectSize - 16.0f;   // 16px pad (waves/numerical)
+                    if (topPx < 0.0f) { topPx = 0.0f; }
+                    if (topPx > (float)kReflectSize) { topPx = (float)kReflectSize; }
+                    reflScissorTop = (uint32_t)topPx;
+                }
+            }
+            const uint32_t reflScissorH = (reflScissorTop < kReflectSize) ? (kReflectSize - reflScissorTop) : 1u;
+            cmdSetScissor(g_live.pCmd, 0, reflScissorTop, kReflectSize, reflScissorH);
 
             // Sky draw (mirror): fill the reflect sky buffers + replay the shapes. Cull NONE in the
             // sky PSO makes the mirror's winding flip irrelevant. Same per-shape data as the main sky
@@ -4353,6 +4577,13 @@ namespace ForgeRender {
                 ++reflSkyDrawn;
             }
             g_lastReflSkyDrawn = reflSkyDrawn;   // Phase 0 panel
+
+            // ---- WV2 (real reflection): reflected LAND + STATICS over the reflected sky --------------
+            // The CPU cull + mirror matrix + clip plane + pReflectFrameCbvGeo write already ran PRE-beginCmd
+            // (dlReflectGeoCull, hoisted off record). Here we only RECORD the draws into the still-bound
+            // pReflectColor/Depth, AFTER the sky (depth GEQUAL+write → occludes the reflected sky). Gated by
+            // g_reflGeoReady (the cull ran + rings valid this frame).
+            if (g_reflGeoReady) { dlReflectRecordGeo(); }
 
             static uint32_t s_reflDrawLog = 0;
             if ((s_reflDrawLog++ % 120) == 0) {
@@ -4898,6 +5129,7 @@ namespace ForgeRender {
             cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &toCommon);
         }
         gpuPhaseEnd(kGpuPhaseResolve);
+        gpuPhaseEnd(kGpuPhaseFrame);   // close the whole-frame GPU-execution timer
         // Resolve all GPU phase timestamps into the readback buffer (valid after the fence below).
         if (g_live.pGpuQueryPool) {
             cmdResolveQuery(g_live.pCmd, g_live.pGpuQueryPool, 0, kGpuPhaseCount);
@@ -4967,10 +5199,17 @@ namespace ForgeRender {
                          g_lastCullExamined, g_liveLastInst,
                          g_lastCullExamined ? (g_lastCullMs * 1000.0 / (g_lastCullExamined / 1000.0)) : 0.0,
                          g_lastGpuCullCount, (g_lastGpuCullCount == g_liveLastInst) ? "MATCH" : "MISMATCH");
-            LOG::logline(">> [forge-hb] gpu split: prepass=%.2f gtao=%.2f reflect=%.2f color=%.2f water=%.2f resolve=%.2f ms",
+            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f gtao=%.2f reflect=%.2f color=%.2f water=%.2f resolve=%.2f ms",
+                         g_lastGpuPhaseMs[kGpuPhaseCull],
                          g_lastGpuPhaseMs[kGpuPhasePrepass], g_lastGpuPhaseMs[kGpuPhaseGtao],
                          g_lastGpuPhaseMs[kGpuPhaseReflect], g_lastGpuPhaseMs[kGpuPhaseColor],
                          g_lastGpuPhaseMs[kGpuPhaseWater], g_lastGpuPhaseMs[kGpuPhaseResolve]);
+            // Whole-frame GPU EXECUTION vs submit->fence WALL clock. If exec << wall, the frame is
+            // GPU-idle/queue-bound (waiting behind the client's shared-GPU work), NOT render-bound.
+            const double frameExec = g_lastGpuPhaseMs[kGpuPhaseFrame];
+            LOG::logline(">> [forge-hb] gpu frame: exec=%.2f wall=%.2f idle/queue=%.2f ms (%s)",
+                         frameExec, g_lastGpuMs, g_lastGpuMs - frameExec,
+                         (frameExec < 0.5 * g_lastGpuMs) ? "IDLE-BOUND (GPU waits, not busy)" : "gpu-work-bound");
             dlLogHeartbeat();
             g_recAccum = 0.0;
             g_gpuAccum = 0.0;
@@ -5504,6 +5743,62 @@ namespace ForgeRender {
     uint32_t  g_staticsInstTotal = 0;                   // total scoped draw-instances
     bool      g_staticsLoaded    = false;
 
+    // --- SK V2 viewer sky (--forge-view only): baked MW sky meshes + a sun billboard --------------
+    // The standalone viewer's host-side sky: sky_atmosphere.nif (dome) + sky_clouds_01.nif (clouds)
+    // baked offline into the StaticElem library (Data Files\distantland\sky\sky_meshes, index 0 dome /
+    // 1 cloud) + the clear-weather cloud/sun DDS loaded into dedicated bindless slots. Drawn as a few
+    // fixed, camera-relative draws (no usage.data / no instancing / no grid). See tasks/forge-viewer-sky.md.
+    constexpr uint32_t kSkyInstStride = 128;                 // 4 world rows (64B) + 4 sky-param float4 (64B)
+    constexpr uint32_t kSkyCloudSlot  = MAX_TEXTURES - 4;    // 892 (just below the land atlas slots)
+    constexpr uint32_t kSkySunSlot    = MAX_TEXTURES - 5;    // 891
+    struct SkySubset { uint32_t vbBase = 0, ibBase = 0, indexCount = 0; };   // into the sky mega VB/IB
+    struct SkyState {
+        Buffer*   vb        = nullptr;        // sky mega per-vertex (GPU_ONLY, stride 20 StaticElem)
+        Buffer*   ib        = nullptr;        // sky mega 16-bit index (GPU_ONLY)
+        SkySubset dome       = {};
+        SkySubset cloud      = {};
+        float     domeR      = 1.0f;          // dome model bounding radius (for the camera-relative scale)
+        float     cloudR     = 1.0f;          // cloud model bounding radius
+        float     domeZMin   = 0.0f;          // dome band model-space Z extent (for the height gradient)
+        float     domeZInv   = 0.0f;          // 1/(zMax-zMin); 0 -> flat (guards a degenerate band)
+        float     cloudZMin  = 0.0f;          // cloud model Z extent (horizon-edge alpha fade, OpenMW parity)
+        float     cloudFadeInv = 0.0f;        // fade ramp: 0 at zMin (outer ring) -> 1 partway up
+        bool      loaded     = false;
+        bool      texOk      = false;         // cloud + sun DDS loaded into gTextures slots
+        Shader*   shader     = nullptr;
+        Pipeline* pipeDome   = nullptr;       // depth off, blend OFF, cull NONE (fills the sky)
+        Pipeline* pipeCloud  = nullptr;       // depth off, SRCALPHA/INVSRCALPHA, cull NONE
+        Pipeline* pipeSun    = nullptr;       // depth off, SRCALPHA/ONE (additive), cull NONE
+        Buffer*   inst       = nullptr;       // CPU_TO_GPU per-instance: 4 records (dome/cloud/sun/fill) * 128B
+        Buffer*   sunVB      = nullptr;       // CPU_TO_GPU sun billboard StaticElem (6 verts, rebuilt/frame)
+        Buffer*   fillVB     = nullptr;       // static clip-space fullscreen triangle (3 verts, sky fill)
+        float     cloudTimer = 0.0f;          // CloudUpdater::setTextureCoord scroll phase (wraps at 4)
+        bool      ready      = false;         // shader + pipelines + buffers built
+    };
+    SkyState g_sky;
+
+    // f32 -> IEEE-754 half (round-to-nearest-even). The sun billboard is host-generated per frame in
+    // the StaticElem (FLOAT16) layout so it rides the same skymesh pipeline as the baked dome/cloud.
+    static uint16_t skyF32ToF16(float f) {
+        uint32_t x; std::memcpy(&x, &f, 4);
+        uint32_t sign = (x >> 16) & 0x8000u;
+        int32_t  exp  = (int32_t)((x >> 23) & 0xFF) - 127 + 15;
+        uint32_t mant = x & 0x7FFFFFu;
+        if (((x >> 23) & 0xFF) == 0xFF) { return (uint16_t)(sign | 0x7C00u | (mant ? 0x200u : 0)); } // inf/nan
+        if (exp >= 0x1F) { return (uint16_t)(sign | 0x7C00u); }                                       // overflow -> inf
+        if (exp <= 0) {                                                                               // subnormal/zero
+            if (exp < -10) { return (uint16_t)sign; }
+            mant |= 0x800000u;
+            uint32_t shift = (uint32_t)(14 - exp);
+            uint32_t h = mant >> shift;
+            if ((mant >> (shift - 1)) & 1u) { h += 1; }   // round
+            return (uint16_t)(sign | h);
+        }
+        uint16_t h = (uint16_t)(sign | ((uint32_t)exp << 10) | (mant >> 13));
+        if ((mant >> 12) & 1u) { h += 1; }                // round-to-nearest
+        return h;
+    }
+
     // --- Phase 1a/1b LIVE distant land (host-owned cull, persistent rings) -------------------
     // The probe loads/draws DL in isolation; the LIVE path wires the same loaders + pipelines into
     // renderScene (after the near colour pass, shared depth). It must NOT addResource per frame (the
@@ -5518,6 +5813,14 @@ namespace ForgeRender {
     constexpr float    kLiveGridCell   = 8192.0f;      // uniform-grid cell (one MW cell) for the cull
     Buffer*   g_pStaticsInstRing = nullptr;            // CPU_TO_GPU per-frame instance stream (80 B/inst)
     Buffer*   g_pStaticsArgsRing = nullptr;            // CPU_TO_GPU per-frame IndirectDrawIndexArguments[]
+    // WV2 (real reflection): a SECOND set of statics rings + land-visible list, filled by a SEPARATE
+    // cull with the mirror-about-water frustum. Decoupled from the main rings (which the reflect pass
+    // must not clobber — the main pass records them later in the same command buffer).
+    Buffer*   g_pStaticsInstRingRefl = nullptr;
+    Buffer*   g_pStaticsArgsRingRefl = nullptr;
+    std::vector<uint32_t> g_liveLandVisibleRefl;       // land mesh indices surviving the MIRROR frustum
+    uint32_t  g_liveLastSubsetsRefl = 0;               // indirect-arg count for the reflect statics draw
+    uint32_t  g_liveLastInstRefl    = 0;               // instance count (diagnostics)
     struct LiveGridCell {
         std::vector<uint32_t> inst;                    // instance indices into g_usageData ws0 records
         float minx, miny, minz, maxx, maxy, maxz;      // AABB of member placements (padded for cull)
@@ -5932,6 +6235,558 @@ namespace ForgeRender {
 
         g_staticsLoaded = true;
         return true;
+    }
+
+    // SK V2 — parse the baked viewer sky meshes (Data Files\distantland\sky\sky_meshes): the SAME
+    // per-static / per-subset StaticElem layout as static_meshes (see loadDistantStatics), but tiny —
+    // static index 0 = atmosphere dome, 1 = clouds. Keep subset[0] of each into a dedicated sky mega
+    // VB/IB (GPU_ONLY). NO usage.data / instancing / grid — the sky is a couple of fixed, camera-
+    // relative draws. Also loads the clear-weather cloud + sun DDS into dedicated bindless slots.
+    bool loadSkyMeshes(Renderer* R) {
+        if (g_sky.loaded) { return true; }
+        std::vector<uint8_t> file;
+        if (!dlReadWholeFile("Data Files\\distantland\\sky\\sky_meshes", file) || file.size() < 4) {
+            std::printf("[forge][sky] sky_meshes missing (run MGEXEgui --bake-sky)\n"); return false;
+        }
+        const uint8_t* p   = file.data();
+        const uint8_t* end = file.data() + file.size();
+
+        std::vector<uint8_t> vb, ib;
+        SkySubset subs[2] = {};
+        bool got[2] = { false, false };
+        float modelR[2] = { 1.0f, 1.0f };
+        float zmin[2] = { 0.0f, 0.0f }, zmax[2] = { 0.0f, 0.0f };   // dome band model-Z extent
+        for (uint32_t s = 0; s < 2; ++s) {
+            if (p + 21 > end) { break; }
+            uint32_t numSubsets = 0; std::memcpy(&numSubsets, p, 4);
+            float sradius = 1.0f; std::memcpy(&sradius, p + 4, 4);   // model bounding radius
+            modelR[s] = (sradius > 1e-3f) ? sradius : 1.0f;
+            p += 4 + 4 + 12 + 1;                          // numSubsets + radius + center + type
+            for (uint32_t ss = 0; ss < numSubsets; ++ss) {
+                if (p + 44 > end) { p = end; break; }
+                float subMinZ = 0.0f, subMaxZ = 0.0f;     // model-Z extent (min.z @ +24, max.z @ +36)
+                std::memcpy(&subMinZ, p + 24, 4);
+                std::memcpy(&subMaxZ, p + 36, 4);
+                p += 4 + 12 + 12 + 12;                    // subset sphere + center + aabbMin + aabbMax
+                int verts = 0, faces = 0;
+                std::memcpy(&verts, p, 4); std::memcpy(&faces, p + 4, 4); p += 8;
+                size_t vbBytes = (size_t)verts * 20, ibBytes = (size_t)faces * 6;
+                if (verts < 0 || faces < 0 || p + vbBytes + ibBytes + 4 > end) { p = end; break; }
+                const uint8_t* vbSrc = p; p += vbBytes;
+                const uint8_t* ibSrc = p; p += ibBytes;
+                p += 2;                                   // bool[2] {hasAlpha, hasUVController}
+                uint16_t pathsize = 0; std::memcpy(&pathsize, p, 2); p += 2;
+                if (p + pathsize > end) { p = end; break; }
+                p += pathsize;                            // tex name (sky uses dedicated slots; ignored)
+                if (ss == 0 && verts > 0 && faces > 0) {  // keep the first subset of this static
+                    SkySubset sub;
+                    sub.vbBase     = (uint32_t)(vb.size() / 20);
+                    sub.ibBase     = (uint32_t)(ib.size() / 2);
+                    sub.indexCount = (uint32_t)faces * 3;
+                    vb.insert(vb.end(), vbSrc, vbSrc + vbBytes);
+                    ib.insert(ib.end(), ibSrc, ibSrc + ibBytes);
+                    subs[s] = sub; got[s] = true;
+                    zmin[s] = subMinZ; zmax[s] = subMaxZ;
+                }
+            }
+        }
+        if (!got[0] || !got[1] || vb.empty() || ib.empty()) {
+            std::printf("[forge][sky] sky_meshes parse incomplete (dome=%d cloud=%d)\n", (int)got[0], (int)got[1]);
+            return false;
+        }
+        g_sky.dome = subs[0]; g_sky.cloud = subs[1];
+        g_sky.domeR = modelR[0]; g_sky.cloudR = modelR[1];
+        g_sky.domeZMin = zmin[0];
+        g_sky.domeZInv = (zmax[0] - zmin[0] > 1e-3f) ? (1.0f / (zmax[0] - zmin[0])) : 0.0f;
+        // Cloud horizon fade (OpenMW ModVertexAlphaVisitor::Clouds): outer ring (lowest Z) -> alpha 0,
+        // reaching full opacity ~40% up so only the horizon-edge ring fades (kills the hard rim seam).
+        g_sky.cloudZMin = zmin[1];
+        g_sky.cloudFadeInv = (zmax[1] - zmin[1] > 1e-3f) ? (1.0f / (0.40f * (zmax[1] - zmin[1]))) : 0.0f;
+
+        BufferLoadDesc vbd = {};
+        vbd.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+        vbd.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+        vbd.mDesc.mSize = vb.size(); vbd.mDesc.pName = "skyVB";
+        vbd.pData = vb.data(); vbd.ppBuffer = &g_sky.vb;
+        addResource(&vbd, nullptr);
+        BufferLoadDesc ibd = {};
+        ibd.mDesc.mDescriptors = DESCRIPTOR_TYPE_INDEX_BUFFER;
+        ibd.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+        ibd.mDesc.mSize = ib.size(); ibd.mDesc.pName = "skyIB";
+        ibd.pData = ib.data(); ibd.ppBuffer = &g_sky.ib;
+        addResource(&ibd, nullptr);
+        waitForAllResourceLoads();
+        if (!g_sky.vb || !g_sky.ib) { std::printf("[forge][sky] sky mega buffer alloc FAILED\n"); return false; }
+
+        // Cloud + sun DDS into dedicated bindless gTextures slots (reuses parseDds + the atlas upload/
+        // rebind path). Missing textures leave the slot at default white (same as the land atlases).
+        bool tc = dlLoadAtlas(R, "Data Files\\distantland\\sky\\textures\\tx_sky_clear.dds", kSkyCloudSlot);
+        bool ts = dlLoadAtlas(R, "Data Files\\distantland\\sky\\textures\\tx_sun_05.dds",   kSkySunSlot);
+        g_sky.texOk = tc && ts;
+
+        std::printf("[forge][sky] loaded: dome %u idx, cloud %u idx, cloudTex=%d sunTex=%d\n",
+                    g_sky.dome.indexCount, g_sky.cloud.indexCount, (int)tc, (int)ts);
+        g_sky.loaded = true;
+        return true;
+    }
+
+    // SK V2 — build the viewer-sky pipelines (skymesh.vert/.frag): StaticElem binding 0 + per-instance
+    // world rows + sky params (binding 1, 8 float4). Three blend variants share the shader: dome
+    // (blend OFF, fills the sky), cloud (SRCALPHA/INVSRCALPHA), sun (SRCALPHA/ONE additive). Depth
+    // test+write OFF, cull NONE — drawn BEFORE the world so terrain (depth-write) overdraws/occludes
+    // the sky for free. Allocates the per-instance + sun billboard CPU_TO_GPU buffers. Idempotent.
+    bool buildSkyMeshPath(Renderer* R) {
+        if (g_sky.ready) { return true; }
+        ShaderLoadDesc sd = {};
+        sd.mVert.pFileName = "skymesh.vert";
+        sd.mFrag.pFileName = "skymesh.frag";
+        addShader(R, &sd, &g_sky.shader);
+        if (!g_sky.shader) { std::printf("[forge][sky] addShader(skymesh) FAILED\n"); return false; }
+
+        VertexLayout vl = {};
+        vl.mBindingCount = 2;
+        vl.mBindings[0].mStride = 20;                     // StaticElem
+        vl.mBindings[0].mRate   = VERTEX_BINDING_RATE_VERTEX;
+        vl.mBindings[1].mStride = kSkyInstStride;         // W0..W3 + P0..P3
+        vl.mBindings[1].mRate   = VERTEX_BINDING_RATE_INSTANCE;
+        vl.mAttribCount = 12;
+        vl.mAttribs[0].mSemantic = SEMANTIC_POSITION;
+        vl.mAttribs[0].mFormat   = TinyImageFormat_R16G16B16A16_SFLOAT;
+        vl.mAttribs[0].mBinding  = 0; vl.mAttribs[0].mLocation = 0; vl.mAttribs[0].mOffset = 0;
+        vl.mAttribs[1].mSemantic = SEMANTIC_NORMAL;
+        vl.mAttribs[1].mFormat   = TinyImageFormat_R8G8B8A8_UNORM;
+        vl.mAttribs[1].mBinding  = 0; vl.mAttribs[1].mLocation = 1; vl.mAttribs[1].mOffset = 8;
+        vl.mAttribs[2].mSemantic = SEMANTIC_COLOR;
+        vl.mAttribs[2].mFormat   = TinyImageFormat_B8G8R8A8_UNORM;
+        vl.mAttribs[2].mBinding  = 0; vl.mAttribs[2].mLocation = 2; vl.mAttribs[2].mOffset = 12;
+        vl.mAttribs[3].mSemantic = SEMANTIC_TEXCOORD0;
+        vl.mAttribs[3].mFormat   = TinyImageFormat_R16G16_SFLOAT;
+        vl.mAttribs[3].mBinding  = 0; vl.mAttribs[3].mLocation = 3; vl.mAttribs[3].mOffset = 16;
+        for (uint32_t k = 0; k < 8; ++k) {               // binding 1: W0..W3 (k 0..3) + P0..P3 (k 4..7)
+            vl.mAttribs[4 + k].mSemantic = (ShaderSemantic)(SEMANTIC_TEXCOORD1 + k);
+            vl.mAttribs[4 + k].mFormat   = TinyImageFormat_R32G32B32A32_SFLOAT;
+            vl.mAttribs[4 + k].mBinding  = 1;
+            vl.mAttribs[4 + k].mLocation = 4 + k;
+            vl.mAttribs[4 + k].mOffset   = k * 16;
+        }
+
+        DepthStateDesc ds = {}; ds.mDepthTest = false; ds.mDepthWrite = false;
+        RasterizerStateDesc rs = {}; rs.mCullMode = CULL_MODE_NONE; rs.mFrontFace = FRONT_FACE_CCW;
+
+        PipelineDesc pd = {};
+        pd.mType = PIPELINE_TYPE_GRAPHICS;
+        GraphicsPipelineDesc& g = pd.mGraphicsDesc;
+        g.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+        g.mRenderTargetCount = 1;
+        g.pColorFormats = &g_live.pRT->mFormat;
+        g.mSampleCount = (SampleCount)g_live.sampleCount;
+        g.mSampleQuality = 0;
+        g.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+        g.pDepthState = &ds;
+        g.pVertexLayout = &vl;
+        g.pRasterizerState = &rs;
+        g.pShaderProgram = g_sky.shader;
+
+        // Dome: blend OFF (opaque emission fills the sky).
+        addPipeline(R, &pd, &g_sky.pipeDome);
+        // Cloud: standard transparency over the dome.
+        BlendStateDesc cb = {};
+        cb.mSrcFactors[0] = BC_SRC_ALPHA;  cb.mDstFactors[0] = BC_ONE_MINUS_SRC_ALPHA;
+        cb.mSrcAlphaFactors[0] = BC_ONE;   cb.mDstAlphaFactors[0] = BC_ONE_MINUS_SRC_ALPHA;
+        cb.mBlendModes[0] = BM_ADD;        cb.mBlendAlphaModes[0] = BM_ADD;
+        cb.mColorWriteMasks[0] = COLOR_MASK_ALL; cb.mRenderTargetMask = BLEND_STATE_TARGET_0;
+        cb.mIndependentBlend = false;
+        g.pBlendState = &cb;
+        addPipeline(R, &pd, &g_sky.pipeCloud);
+        // Sun: additive (SRCALPHA/ONE) → dst += rgb*a.
+        BlendStateDesc ab = cb;
+        ab.mDstFactors[0] = BC_ONE; ab.mDstAlphaFactors[0] = BC_ONE;
+        g.pBlendState = &ab;
+        addPipeline(R, &pd, &g_sky.pipeSun);
+        if (!g_sky.pipeDome || !g_sky.pipeCloud || !g_sky.pipeSun) {
+            std::printf("[forge][sky] addPipeline(skymesh) FAILED\n"); return false;
+        }
+
+        // Per-instance params (3 records: dome/cloud/sun) + the host-generated sun billboard VB.
+        BufferLoadDesc ib = {};
+        ib.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+        ib.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+        ib.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+        ib.mDesc.mSize = 5 * kSkyInstStride; ib.mDesc.pName = "skyInst";   // dome/cloud/sun/fill/mirror-band
+        ib.pData = nullptr; ib.ppBuffer = &g_sky.inst;
+        addResource(&ib, nullptr);
+        BufferLoadDesc sb = {};
+        sb.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+        sb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+        sb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+        sb.mDesc.mSize = 6 * 20; sb.mDesc.pName = "skySunVB";   // 6 StaticElem verts
+        sb.pData = nullptr; sb.ppBuffer = &g_sky.sunVB;
+        addResource(&sb, nullptr);
+        // Static fullscreen-fill triangle (clip-space, StaticElem stride). Position.xy = clip coords,
+        // consumed directly by skymesh.vert mode 3 (no viewProj). Built once; never rewritten.
+        BufferLoadDesc fb = {};
+        fb.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+        fb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+        fb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+        fb.mDesc.mSize = 3 * 20; fb.mDesc.pName = "skyFillVB";
+        fb.pData = nullptr; fb.ppBuffer = &g_sky.fillVB;
+        addResource(&fb, nullptr);
+        waitForAllResourceLoads();
+        if (!g_sky.inst || !g_sky.sunVB || !g_sky.fillVB) { std::printf("[forge][sky] sky inst/sun/fill VB alloc FAILED\n"); return false; }
+
+        {   // fill the fullscreen triangle once: NDC (-1,-1),(3,-1),(-1,3)
+            const float clip[3][2] = { { -1.0f, -1.0f }, { 3.0f, -1.0f }, { -1.0f, 3.0f } };
+            uint8_t* fv = (uint8_t*)g_sky.fillVB->pCpuMappedAddress;
+            for (int i = 0; i < 3; ++i) {
+                uint16_t px = skyF32ToF16(clip[i][0]), py = skyF32ToF16(clip[i][1]);
+                uint16_t p05 = skyF32ToF16(0.5f), p1 = skyF32ToF16(1.0f), p0 = skyF32ToF16(0.0f);
+                std::memcpy(fv + 0, &px, 2); std::memcpy(fv + 2, &py, 2);
+                std::memcpy(fv + 4, &p05, 2); std::memcpy(fv + 6, &p1, 2);   // pos.zw
+                fv[8]=128; fv[9]=128; fv[10]=255; fv[11]=0;                  // normal
+                fv[12]=255; fv[13]=255; fv[14]=255; fv[15]=255;             // colour
+                std::memcpy(fv + 16, &p0, 2); std::memcpy(fv + 18, &p0, 2);  // uv
+                fv += 20;
+            }
+        }
+
+        std::printf("[forge][sky] pipelines built (dome/cloud/sun/fill)\n");
+        g_sky.ready = true;
+        return true;
+    }
+
+    // SK V2/V4 — record the viewer sky (dome -> clouds -> sun) into g_live.pCmd, AFTER the RT bind +
+    // clear and BEFORE dlLiveRecord (the world). Depth test+write OFF on all three, so the world's
+    // depth-write pass overdraws/occludes the sky for free (terrain hides the sun behind a mountain).
+    // Camera-relative: world centered at the origin (eye), MW Z-up, scaled to a fraction of zfar
+    // (a sky shell projects identically at any radius — only zn<R<zf matters). Cloud V scrolls
+    // (CloudUpdater::setTextureCoord parity). horizonCol = the frame's fog colour (fd[28..30]) so the
+    // dome bottom, the fog, and the land edge agree. One hardcoded clear-day palette (host-tunable).
+    void dlDrawViewerSky(const float toSunIn[3], float zfar, float dt, const float horizonCol[3],
+                         const float ambientCol[3]) {
+        if (!g_sky.ready || !g_sky.loaded) { return; }
+
+        // --- clear-day palette (host-tunable; sourced from OpenMW's clear-weather entry) ---
+        const float kZenith[3]       = { 0.20f, 0.42f, 0.82f };   // dome zenith blue
+        const float kCloudTint[3]    = { 1.00f, 1.00f, 1.00f };   // clear clouds = white
+        const float kCloudOpacity    = 0.85f;
+        const float kSunColor[3]     = { 1.00f, 0.92f, 0.78f };
+        const float kSunOpacity      = 1.00f;
+        const float kClearCloudSpeed = 6.0f;   // OpenMW clear ~1.25; raised for a visible viewer demo
+
+        // --- cloud scroll (port of sky.cpp:560-566 CloudUpdater::setTextureCoord) ---
+        g_sky.cloudTimer += dt * kClearCloudSpeed / 400.0f;
+        if (g_sky.cloudTimer >= 4.0f) { g_sky.cloudTimer -= 4.0f; }
+
+        const float domeR   = 0.40f * zfar;
+        const float cloudR  = 0.38f * zfar;
+        const float sunDist = 0.36f * zfar;
+        const float sunSize = 0.045f * sunDist;
+
+        // --- per-instance records: 0 dome band, 1 cloud, 2 sun, 3 fill (32 floats each = kSkyInstStride) ---
+        float* inst = (float*)g_sky.inst->pCpuMappedAddress;
+        auto setWorldScale = [](float* r, float s) {
+            r[0]=s; r[1]=0; r[2]=0; r[3]=0;  r[4]=0; r[5]=s; r[6]=0; r[7]=0;
+            r[8]=0; r[9]=0; r[10]=s; r[11]=0; r[12]=0; r[13]=0; r[14]=0; r[15]=1;
+        };
+        { // dome band (record 0): gradient normalised over the band's OWN model-Z range
+            float* r = inst + 0*32;
+            const float domeScale = domeR / g_sky.domeR;
+            setWorldScale(r, domeScale);
+            // The real atmosphere band sits ENTIRELY below the model origin (z in [-800,-100]) -> below
+            // the eye -> behind terrain -> invisible. Lift it so its bottom ring sits at the eye horizon,
+            // making the fog->sky gradient a visible band ABOVE the horizon (W3.z = -zMin*scale).
+            r[14] = -g_sky.domeZMin * domeScale;
+            r[16]=0; r[17]=0; r[18]=0; r[19]=1;                                  // P0: mode0, tex-, uv-, op1
+            r[20]=0; r[21]=0; r[22]=0; r[23]=0;                                  // P1 (unused)
+            r[24]=kZenith[0]; r[25]=kZenith[1]; r[26]=kZenith[2];
+            r[27]=g_sky.domeZInv;                                                // P2.w = 1/(zMax-zMin)
+            r[28]=horizonCol[0]; r[29]=horizonCol[1]; r[30]=horizonCol[2];
+            r[31]=g_sky.domeZMin;                                                // P3.w = model zMin (gradient base)
+        }
+        { // mirror band (record 4): the SAME atmosphere band FLIPPED below the horizon → the horizon fog
+          // band is mirrored downward and gradients to the ambient colour (user art direction). Reuses
+          // mode 0 (no shader change): same dome mesh, world Z negated so the band hangs below the eye
+          // horizon (dome PSO is cull NONE → the winding flip is a no-op). HeightT still 0 at the zMin
+          // ring (kept AT the horizon) → 1 at the zMax ring (now the LOWEST): AtmoBot=fog@horizon,
+          // AtmoTop=ambient@bottom. Drawn after the flat fill so it overwrites it near the horizon.
+            float* r = inst + 4*32;
+            const float domeScale = domeR / g_sky.domeR;
+            setWorldScale(r, domeScale);
+            // Overlap the band a fraction of its own height ABOVE the horizon so its (fog) top ring
+            // covers the dome band's (fog) bottom ring — kills the 1px flat-fill (zenith blue) seam that
+            // leaked between the two coincident ring meshes exactly at the horizon. Fog-on-fog overlap,
+            // so it's invisible; it only guarantees the horizon row is fully covered. Tunable (raise if a
+            // line persists / lower if the horizon fog band looks too thick).
+            const float bandH   = (g_sky.domeZInv > 1e-8f) ? (domeScale / g_sky.domeZInv) : 0.0f;
+            const float overlap = 0.05f * bandH;
+            r[10] = -domeScale;                                  // FLIP Z (hang below the horizon)
+            r[14] =  g_sky.domeZMin * domeScale + overlap;       // zMin ring lifted just ABOVE the horizon
+            r[16]=0; r[17]=0; r[18]=0; r[19]=1;                                  // P0: mode0
+            r[20]=0; r[21]=0; r[22]=0; r[23]=0;                                  // P1 (unused)
+            r[24]=ambientCol[0]; r[25]=ambientCol[1]; r[26]=ambientCol[2];       // AtmoTop = ambient (bottom, HeightT=1)
+            r[27]=g_sky.domeZInv;                                                // P2.w = 1/(zMax-zMin)
+            r[28]=horizonCol[0]; r[29]=horizonCol[1]; r[30]=horizonCol[2];       // AtmoBot = fog (horizon, HeightT=0)
+            r[31]=g_sky.domeZMin;                                                // P3.w = model zMin
+        }
+        { // fill (record 3): flat clear-day sky colour behind everything (MW clears the sky)
+            float* r = inst + 3*32;
+            setWorldScale(r, 1.0f);                                              // world unused (clip-space passthrough)
+            r[16]=3; r[17]=0; r[18]=0; r[19]=1;                                  // P0: mode3
+            r[20]=0; r[21]=0; r[22]=0; r[23]=0;                                  // P1 (unused)
+            r[24]=kZenith[0]; r[25]=kZenith[1]; r[26]=kZenith[2]; r[27]=0;       // P2 = fill colour (AtmoTop)
+            r[28]=0;r[29]=0;r[30]=0;r[31]=0;
+        }
+        { // cloud (record 1)
+            float* r = inst + 1*32;
+            setWorldScale(r, cloudR / g_sky.cloudR);
+            r[16]=1; r[17]=(float)kSkyCloudSlot; r[18]=g_sky.cloudTimer; r[19]=kCloudOpacity; // P0
+            r[20]=kCloudTint[0]; r[21]=kCloudTint[1]; r[22]=kCloudTint[2]; r[23]=0;           // P1 tint
+            r[24]=0;r[25]=0;r[26]=0;r[27]=g_sky.cloudFadeInv;                                 // P2.w = fade 1/range
+            r[28]=0;r[29]=0;r[30]=0;r[31]=g_sky.cloudZMin;                                    // P3.w = fade zMin
+        }
+        { // sun (record 2): identity world — sunVB is already eye-relative world space
+            float* r = inst + 2*32;
+            setWorldScale(r, 1.0f);
+            r[16]=2; r[17]=(float)kSkySunSlot; r[18]=0; r[19]=kSunOpacity;       // P0
+            r[20]=kSunColor[0]; r[21]=kSunColor[1]; r[22]=kSunColor[2]; r[23]=0; // P1 sun colour
+            r[24]=0;r[25]=0;r[26]=0;r[27]=0; r[28]=0;r[29]=0;r[30]=0;r[31]=0;
+        }
+
+        // --- sun billboard: a camera-facing quad toward the sun (eye-relative), rebuilt per frame ---
+        float toSun[3] = { toSunIn[0], toSunIn[1], toSunIn[2] };
+        float tl = std::sqrt(toSun[0]*toSun[0]+toSun[1]*toSun[1]+toSun[2]*toSun[2]) + 1e-6f;
+        toSun[0]/=tl; toSun[1]/=tl; toSun[2]/=tl;
+        float up0[3] = { 0.0f, 0.0f, 1.0f };
+        if (std::fabs(toSun[2]) > 0.95f) { up0[0]=0.0f; up0[1]=1.0f; up0[2]=0.0f; }  // sun near zenith
+        float right[3] = { toSun[1]*up0[2]-toSun[2]*up0[1], toSun[2]*up0[0]-toSun[0]*up0[2], toSun[0]*up0[1]-toSun[1]*up0[0] };
+        float rl = std::sqrt(right[0]*right[0]+right[1]*right[1]+right[2]*right[2]) + 1e-6f;
+        right[0]/=rl; right[1]/=rl; right[2]/=rl;
+        float up[3] = { right[1]*toSun[2]-right[2]*toSun[1], right[2]*toSun[0]-right[0]*toSun[2], right[0]*toSun[1]-right[1]*toSun[0] };
+        float C[3] = { toSun[0]*sunDist, toSun[1]*sunDist, toSun[2]*sunDist };
+        auto corner = [&](float out[3], float sx, float sy) {
+            out[0] = C[0] + right[0]*sx*sunSize + up[0]*sy*sunSize;
+            out[1] = C[1] + right[1]*sx*sunSize + up[1]*sy*sunSize;
+            out[2] = C[2] + right[2]*sx*sunSize + up[2]*sy*sunSize;
+        };
+        float TL[3],TR[3],BR[3],BL[3];
+        corner(TL,-1.0f, 1.0f); corner(TR, 1.0f, 1.0f); corner(BR, 1.0f,-1.0f); corner(BL,-1.0f,-1.0f);
+        uint8_t* sv = (uint8_t*)g_sky.sunVB->pCpuMappedAddress;
+        auto putHalf = [](uint8_t*& c, float f){ uint16_t h = skyF32ToF16(f); std::memcpy(c, &h, 2); c += 2; };
+        auto writeVert = [&](uint8_t*& c, const float p[3], float u, float v){
+            putHalf(c,p[0]); putHalf(c,p[1]); putHalf(c,p[2]); putHalf(c,1.0f);  // pos FLOAT16_4 (w=1)
+            c[0]=128; c[1]=128; c[2]=255; c[3]=0; c+=4;                          // normal UBYTE4N (unused)
+            c[0]=255; c[1]=255; c[2]=255; c[3]=255; c+=4;                        // colour BGRA (unused for sun)
+            putHalf(c,u); putHalf(c,v);                                          // uv FLOAT16_2
+        };
+        writeVert(sv, TL, 0,0); writeVert(sv, TR, 1,0); writeVert(sv, BR, 1,1);  // tri 1
+        writeVert(sv, TL, 0,0); writeVert(sv, BR, 1,1); writeVert(sv, BL, 0,1);  // tri 2
+
+        // --- record: fill -> dome band -> clouds -> sun (share opaque.srt.h sets; PerFrame + Persistent) ---
+        Cmd* cmd = g_live.pCmd;
+        cmdBindDescriptorSet(cmd, 0, g_live.pPerFrameSet);
+        cmdBindDescriptorSet(cmd, 0, g_live.pPerLightsSet);
+        cmdBindDescriptorSet(cmd, 0, g_live.pPersistentSet);
+        cmdBindDescriptorSet(cmd, 0, g_live.pPerBatchSet);
+        uint32_t strides[2] = { 20, kSkyInstStride };
+        // 1) flat sky fill (dome PSO, opaque, fullscreen triangle) — firstInstance 3
+        cmdBindPipeline(cmd, g_sky.pipeDome);
+        Buffer* fvbs[2] = { g_sky.fillVB, g_sky.inst };
+        cmdBindVertexBuffer(cmd, 2, fvbs, strides, nullptr);
+        cmdDrawInstanced(cmd, 3, 0, 1, 3);
+        // 2) atmosphere band (same dome PSO, indexed) — firstInstance 0
+        Buffer* mvbs[2] = { g_sky.vb, g_sky.inst };
+        cmdBindVertexBuffer(cmd, 2, mvbs, strides, nullptr);
+        cmdBindIndexBuffer(cmd, g_sky.ib, INDEX_TYPE_UINT16, 0);
+        cmdDrawIndexedInstanced(cmd, g_sky.dome.indexCount,  g_sky.dome.ibBase,  1, g_sky.dome.vbBase,  0);
+        // 2b) mirror band below the horizon (fog → ambient), same dome PSO + mesh — firstInstance 4
+        cmdDrawIndexedInstanced(cmd, g_sky.dome.indexCount,  g_sky.dome.ibBase,  1, g_sky.dome.vbBase,  4);
+        // 3) clouds (vb/ib still bound) — firstInstance 1
+        cmdBindPipeline(cmd, g_sky.pipeCloud);
+        cmdDrawIndexedInstanced(cmd, g_sky.cloud.indexCount, g_sky.cloud.ibBase, 1, g_sky.cloud.vbBase, 1);
+        // 4) sun billboard — firstInstance 2
+        cmdBindPipeline(cmd, g_sky.pipeSun);
+        Buffer* svbs[2] = { g_sky.sunVB, g_sky.inst };
+        cmdBindVertexBuffer(cmd, 2, svbs, strides, nullptr);
+        cmdDrawInstanced(cmd, 6, 0, 1, 2);
+    }
+
+    // WV1 — viewer water. buildOpaquePath already built ALL water resources (mesh/volume/pipeline/
+    // refract/worlds/PerBatchWater + the 4 PerFrame water SRVs) AND pLinearDepth + the linearize
+    // compute; the live renderScene RUNS them in-game — this runs the same for the viewer. Called
+    // AFTER dlLiveRecord (so the sky+land+statics frame is the refraction/scene-depth source), it:
+    //   (1) linearize dispatch: resolve pDepth -> pLinearDepth (raw reverse-Z device depth = the
+    //       frag's gSceneLinDepth; the frag reconstructs world via worlds[7] invVP).
+    //   (2) copy colorTarget -> pRefractColor (refraction source; viewer is 1x -> CopyResource).
+    //   (3) draw each geo-clipmap level (camera-relative, eye-snapped, eye-parity trim variant),
+    //       depth GEQUAL+write vs pDepth so terrain occludes / is occluded by the water.
+    // Host-synthesizes waterParams (no client): level=0 (MW sea), deep tint, camFwd from the fly cam.
+    // gReflectColor was rebound to a flat fog-colour stand-in in worldViewer -> single-colour reflect.
+    // Leaves colorTarget+pDepth bound (LOAD) on exit, matching the live pass (caller draws the ring next).
+    void dlDrawViewerWater(RenderTarget* colorTarget, const float* rzViewProj,
+                           const float eye[3], const float camFwd[3], float zfar) {
+        if (!g_live.waterReady || !g_drawWater) { g_lastWaterLevels = 0; return; }
+        // Extend water to the horizon: uniformly scale the whole geo-clipmap so its outer ring reaches
+        // the far plane (the clipmap's natural radius = 32*outerCell ~= 131072u stops well short of the
+        // horizon for a high fly-camera, leaving a sky wedge between the water edge and the horizon
+        // line). Uniform scale keeps the x2 LOD nesting intact and is VISUALLY FREE in WT1: the water
+        // is a flat z=0 plane whose wave normals come from the water_NRM volume sampled by ABSOLUTE
+        // worldXY (water.frag), so mesh cell size doesn't affect appearance — only coverage. Viewer-only
+        // (the live water pass keeps the native cell size for near-player Gerstner-crest detail later).
+        // Far water is fog-saturated (fog=0 past fogParams.y) so the extended ring blends into the sky.
+        const float kOuterRadius = 32.0f * g_waterLevels[kWaterLevels - 1].cellSize;   // ~131072u
+        float wscale = 1.5f * zfar / kOuterRadius;                      // outer ring reaches ~1.5x far plane
+        if (wscale < 1.0f) { wscale = 1.0f; }                           // never shrink below the native mesh
+        // pLinearDepth is created UNORDERED_ACCESS and returned to SHADER_RESOURCE after each pass;
+        // the very first pass therefore skips the SRV->UAV pre-barrier (same role as g_live.firstFrame
+        // in renderScene, which the viewer never advances since it doesn't call renderScene).
+        static bool s_firstWater = true;
+
+        Cmd* cmd = g_live.pCmd;
+        const uint32_t gx = (g_live.width + 7u) / 8u;
+        const uint32_t gy = (g_live.height + 7u) / 8u;
+
+        // (1) End the colour pass, then LINEARIZE: pDepth DEPTH_WRITE->SHADER_RESOURCE + pLinearDepth
+        // back to UAV (skip on the first pass), dispatch, then pLinearDepth UAV->SHADER_RESOURCE (the
+        // water frag samples it) and pDepth SHADER_RESOURCE->DEPTH_WRITE (the water draw LOADs it).
+        cmdBindRenderTargets(cmd, nullptr);
+        {
+            RenderTargetBarrier rtb = {};
+            rtb.pRenderTarget = g_live.pDepth;
+            rtb.mCurrentState = RESOURCE_STATE_DEPTH_WRITE;
+            rtb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+            TextureBarrier tb[1] = {};
+            uint32_t nt = 0;
+            if (!s_firstWater) {
+                tb[nt].pTexture = g_live.pLinearDepth;
+                tb[nt].mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                tb[nt].mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                ++nt;
+            }
+            cmdResourceBarrier(cmd, 0, nullptr, nt, tb, 1, &rtb);
+        }
+        cmdBindPipeline(cmd, g_live.pLinearizePipeline);
+        cmdBindDescriptorSet(cmd, 0, g_live.pLinearizeSet);
+        cmdDispatch(cmd, gx, gy, 1);
+        {
+            RenderTargetBarrier rtb = {};
+            rtb.pRenderTarget = g_live.pDepth;
+            rtb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+            rtb.mNewState = RESOURCE_STATE_DEPTH_WRITE;
+            TextureBarrier tb[1] = {};
+            tb[0].pTexture = g_live.pLinearDepth;
+            tb[0].mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+            tb[0].mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+            cmdResourceBarrier(cmd, 0, nullptr, 1, tb, 1, &rtb);
+        }
+        s_firstWater = false;
+
+        // (2) Copy colorTarget -> pRefractColor (refraction source). Raw D3D12 barriers (matches the
+        // live pass); viewer is single-sample so CopyResource, not ResolveSubresource.
+        ID3D12GraphicsCommandList* cl = cmd->mDx.pCmdList;
+        ID3D12Resource* colRes  = colorTarget->pTexture->mDx.pResource;
+        ID3D12Resource* refrRes = g_live.pRefractColor->mDx.pResource;
+        {
+            D3D12_RESOURCE_BARRIER pre[2] = {};
+            pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            pre[0].Transition.pResource = colRes;
+            pre[0].Transition.Subresource = 0;
+            pre[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            pre[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            pre[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            pre[1].Transition.pResource = refrRes;
+            pre[1].Transition.Subresource = 0;
+            pre[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                                          | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            pre[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+            cl->ResourceBarrier(2, pre);
+        }
+        cl->CopyResource(refrRes, colRes);
+        {
+            D3D12_RESOURCE_BARRIER post[2] = {};
+            post[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            post[0].Transition.pResource = colRes;
+            post[0].Transition.Subresource = 0;
+            post[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            post[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            post[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            post[1].Transition.pResource = refrRes;
+            post[1].Transition.Subresource = 0;
+            post[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            post[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                                           | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            cl->ResourceBarrier(2, post);
+        }
+
+        // (3) Build worlds[0..5] (camera-relative, eye-snapped per level), worlds[6]=packed params,
+        // worlds[7]=invVP. Host-synthesized params (no client): sea level 0, a deep-water tint (not
+        // the black default), camFwd from the fly camera. underwater = eye below the sea plane.
+        const float waterLevelAbs = 0.0f;
+        const bool  underwater    = (eye[2] < waterLevelAbs);
+        const float waterZ = waterLevelAbs + (underwater ? 5.0f : -5.0f);
+        const float depthBase[3] = { 0.02f, 0.10f, 0.14f };   // deep-water tint
+
+        uint8_t* wbuf = (uint8_t*)g_live.pWaterWorldsBuf->pCpuMappedAddress;
+        for (uint32_t k = 0; k < kWaterLevels; ++k) {
+            const float cell = g_waterLevels[k].cellSize * wscale;   // horizon-extended
+            const float snap = 2.0f * cell;
+            const float originX = std::floor(eye[0] / snap) * snap;
+            const float originY = std::floor(eye[1] / snap) * snap;
+            float m[16] = { cell, 0, 0, 0,  0, cell, 0, 0,  0, 0, 1, 0,
+                            originX - eye[0], originY - eye[1], waterZ - eye[2], 1 };
+            std::memcpy(wbuf + (size_t)k * 64, m, 64);
+        }
+        {
+            float p[16] = {};
+            p[0] = waterLevelAbs - eye[2];                 // waterLevelRel (water-cut feature)
+            p[1] = 0.013f;                                 // windFactor
+            p[2] = 24.0f;                                  // shoreDepthBias
+            p[3] = (float)std::fmod(hostNowMs() * 0.001, 2.5);   // anim time (wrap host-side; see live pass)
+            p[4] = depthBase[0]; p[5] = depthBase[1]; p[6] = depthBase[2];
+            p[7] = underwater ? 1.0f : 0.0f;
+            p[8]  = camFwd[0]; p[9] = camFwd[1]; p[10] = camFwd[2];
+            p[11] = 0.0f;                                   // nearViewRange (viewer has no near scene)
+            p[12] = g_waterReflOnly ? 1.0f : (g_waterRefrOnly ? 2.0f : 0.0f);   // water debug view
+            std::memcpy(wbuf + 6 * 64, p, 64);
+        }
+        {
+            float invVP[16];
+            if (!invert4x4(rzViewProj, invVP)) {
+                for (int i = 0; i < 16; ++i) { invVP[i] = (i % 5 == 0) ? 1.0f : 0.0f; }
+            }
+            std::memcpy(wbuf + 7 * 64, invVP, 64);
+        }
+
+        // Re-bind the colour pass (LOAD colour, LOAD depth) and draw each clipmap level.
+        BindRenderTargetsDesc wbind = {};
+        wbind.mRenderTargetCount = 1;
+        wbind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };
+        wbind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_LOAD };
+        cmdBindRenderTargets(cmd, &wbind);
+        cmdSetViewport(cmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+        cmdSetScissor(cmd, 0, 0, g_live.width, g_live.height);
+        cmdBindPipeline(cmd, g_live.pWaterPipeline);
+        cmdBindDescriptorSet(cmd, 0, g_live.pPerFrameSet);
+        cmdBindDescriptorSet(cmd, 0, g_live.pPerLightsSet);
+        cmdBindDescriptorSet(cmd, 0, g_live.pPersistentSet);
+        cmdBindDescriptorSet(cmd, 0, g_live.pPerBatchSetWater);
+        Buffer*  wvbs[2]     = { g_live.pWaterVB, g_live.pWaterInstanceBuf };
+        uint32_t wstrides[2] = { 12, (uint32_t)sizeof(uint32_t) };
+        cmdBindVertexBuffer(cmd, 2, wvbs, wstrides, nullptr);
+        cmdBindIndexBuffer(cmd, g_live.pWaterIB, INDEX_TYPE_UINT16, 0);
+        g_lastWaterLevels = 0;
+        for (uint32_t k = 0; k < kWaterLevels; ++k) {
+            const WaterLodLevelHost& lvl = g_waterLevels[k];
+            uint32_t variant = 0;
+            if (lvl.numVariants > 1) {
+                const float scaledCell = lvl.cellSize * wscale;   // match the horizon-extended snap
+                const int ex = (int)(((long long)std::floor(eye[0] / scaledCell)) & 1);
+                const int ey = (int)(((long long)std::floor(eye[1] / scaledCell)) & 1);
+                variant = (uint32_t)(ey * 2 + ex);
+            }
+            if (!lvl.triCount[variant]) continue;
+            cmdDrawIndexedInstanced(cmd, lvl.triCount[variant] * 3, lvl.ibStart[variant], 1, 0, k);
+            ++g_lastWaterLevels;
+        }
     }
 
     // Tightly-packed (DDS on-disk) byte size of one mip surface at (w,h) for the given format. BCn
@@ -6480,6 +7335,9 @@ namespace ForgeRender {
     // tasks/forge-viewer.md. V1 = land+statics+fly-cam; sky (V2) and water (V3) layer on the loop.
     static bool  s_viewerQuit     = false;
     static float s_viewerSpeedMul = 1.0f;   // mouse-wheel adjusts fly speed (×1.2 per notch)
+    // WV1 — viewer-owned flat reflection stand-in (4x4 fog-colour texture bound to gReflectColor).
+    // The viewer has no mirror pass, so the water frag samples this single colour as its reflection.
+    Texture* g_viewerReflectTex = nullptr;
     static LRESULT CALLBACK viewerWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         switch (msg) {
             case WM_CLOSE: case WM_DESTROY: s_viewerQuit = true; return 0;
@@ -6546,6 +7404,64 @@ namespace ForgeRender {
         std::printf("[forge][view] loaded: %u land meshes, statics-live=%d\n",
                     g_landMeshCount, (int)haveStatics);
 
+        // SK V2 viewer sky: baked dome + clouds + sun billboard (host-side, no MW). Non-fatal —
+        // if the bake is missing (run MGEXEgui --bake-sky), the viewer runs land-only as before.
+        bool haveSky = buildSkyMeshPath(R) && loadSkyMeshes(R);
+        std::printf("[forge][view] sky=%d\n", (int)haveSky);
+
+        // WV1 viewer water. buildOpaquePath already built ALL water resources (mesh/volume/pipeline/
+        // refract/worlds + the 4 PerFrame SRVs) AND pLinearDepth + the linearize compute, and set
+        // g_live.waterReady — the viewer just RUNS them each frame (dlDrawViewerWater). The only build
+        // step the viewer needs is the flat reflection stand-in: buildOpaquePath bound gReflectColor to
+        // pReflectColor (a mirror RT the viewer never renders -> would sample black), so re-point it at
+        // a 4x4 fog-colour texture. Single-colour reflection, no mirror pass, no shader change.
+        const float kViewerFog[3]     = { 0.60f, 0.66f, 0.78f };   // horizon/fog colour (== fd[28..30])
+        const float kViewerAmbient[3] = { 0.34f, 0.38f, 0.46f };   // ambient colour   (== fd[24..26])
+        bool haveWater = false;
+        if (g_live.waterReady) {
+            TextureDesc rd = {};
+            rd.mWidth = 4; rd.mHeight = 4; rd.mDepth = 1;
+            rd.mArraySize = 1; rd.mMipLevels = 1;
+            rd.mSampleCount = SAMPLE_COUNT_1;
+            rd.mFormat = TinyImageFormat_R8G8B8A8_UNORM;
+            rd.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+            rd.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+            rd.pName = "viewerReflectStandIn";
+            TextureLoadDesc rld = {};
+            rld.ppTexture = &g_viewerReflectTex;
+            rld.pDesc = &rd;
+            addResource(&rld, nullptr);
+            waitForAllResourceLoads();
+            if (g_viewerReflectTex) {
+                // Fill 4x4 with the fog/horizon colour (RGBA8), so the water reflection agrees with the
+                // sky dome bottom + the fogged land edge. Constant in the viewer, so filled once.
+                const uint8_t r8 = (uint8_t)(kViewerFog[0] * 255.0f + 0.5f);
+                const uint8_t g8 = (uint8_t)(kViewerFog[1] * 255.0f + 0.5f);
+                const uint8_t b8 = (uint8_t)(kViewerFog[2] * 255.0f + 0.5f);
+                const uint32_t rgba = (uint32_t)r8 | ((uint32_t)g8 << 8) | ((uint32_t)b8 << 16) | 0xFF000000u;
+                TextureUpdateDesc wu = {};
+                wu.pTexture = g_viewerReflectTex;
+                wu.mBaseMipLevel = 0; wu.mMipLevels = 1;
+                wu.mBaseArrayLayer = 0; wu.mLayerCount = 1;
+                wu.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                beginUpdateResource(&wu);
+                TextureSubresourceUpdate s = wu.getSubresourceUpdateDesc(0, 0);
+                for (uint32_t row = 0; row < s.mRowCount; ++row) {
+                    uint32_t* dst = (uint32_t*)(s.pMappedData + (size_t)row * s.mDstRowStride);
+                    for (uint32_t px = 0; px < 4; ++px) { dst[px] = rgba; }
+                }
+                endUpdateResource(&wu);
+                flushTextureUploads(R);
+                // Re-point gReflectColor (main PerFrame set) at the flat stand-in.
+                DescriptorData rp = {};
+                rp.mIndex = SRT_RES_IDX(SrtData, PerFrame, gReflectColor);
+                rp.mCount = 1; rp.ppTextures = &g_viewerReflectTex;
+                updateDescriptorSet(R, 0, g_live.pPerFrameSet, 1, &rp);
+                haveWater = true;
+            }
+        }
+        std::printf("[forge][view] water=%d (clipmap %u levels)\n", (int)haveWater, (unsigned)kWaterLevels);
+
         // --- swapchain on the window + present sync ---
         SwapChain* pSwap = nullptr;
         SwapChainDesc scd = {};
@@ -6591,42 +7507,12 @@ namespace ForgeRender {
         LARGE_INTEGER qf, t0; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&t0);
         double fpsAccum = 0.0; int fpsFrames = 0;   // window-title FPS readout
 
-        // --- debug distance ring: a ground circle at the 16-cell DL draw distance, centred on the
-        // camera (eye-relative line strip), always-visible overlay → eyeball whether statics reach it.
-        const float    kGroundZ   = cz;                      // ring elevation (mid-land z)
-        const uint32_t kRingSegs  = 128, kRingVerts = kRingSegs + 1;   // +1 closes the loop
-        const float    kRingRadius = 16.0f * 8192.0f;        // 16 cells = DL Draw Distance
-        Shader*   pDbgShader = nullptr; Pipeline* pDbgPipe = nullptr; Buffer* pDbgVB = nullptr;
-        {
-            ShaderLoadDesc sd = {}; sd.mVert.pFileName = "debugline.vert"; sd.mFrag.pFileName = "debugline.frag";
-            addShader(R, &sd, &pDbgShader);
-            if (pDbgShader) {
-                VertexLayout vl = {};
-                vl.mBindingCount = 1; vl.mBindings[0].mStride = 12; vl.mBindings[0].mRate = VERTEX_BINDING_RATE_VERTEX;
-                vl.mAttribCount = 1;
-                vl.mAttribs[0].mSemantic = SEMANTIC_POSITION; vl.mAttribs[0].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
-                vl.mAttribs[0].mBinding = 0; vl.mAttribs[0].mLocation = 0; vl.mAttribs[0].mOffset = 0;
-                DepthStateDesc ds = {}; ds.mDepthTest = false; ds.mDepthWrite = false;   // always-on overlay
-                RasterizerStateDesc rs = {}; rs.mCullMode = CULL_MODE_NONE; rs.mFrontFace = FRONT_FACE_CCW;
-                PipelineDesc pd = {}; pd.mType = PIPELINE_TYPE_GRAPHICS;
-                GraphicsPipelineDesc& g = pd.mGraphicsDesc;
-                g.mPrimitiveTopo = PRIMITIVE_TOPO_LINE_STRIP;
-                g.mRenderTargetCount = 1; g.pColorFormats = &g_live.pRT->mFormat;
-                g.mSampleCount = (SampleCount)g_live.sampleCount; g.mSampleQuality = 0;
-                g.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
-                g.pDepthState = &ds; g.pVertexLayout = &vl; g.pRasterizerState = &rs; g.pShaderProgram = pDbgShader;
-                addPipeline(R, &pd, &pDbgPipe);
-                BufferLoadDesc vb = {};
-                vb.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
-                vb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
-                vb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-                vb.mDesc.mSize = kRingVerts * 3 * sizeof(float);
-                vb.mDesc.pName = "debugRingVB"; vb.pData = nullptr; vb.ppBuffer = &pDbgVB;
-                addResource(&vb, nullptr); waitForAllResourceLoads();
-            }
-            std::printf("[forge][view] debug 16-cell ring: shader=%d pipe=%d (radius %.0f)\n",
-                        (int)(pDbgShader!=nullptr), (int)(pDbgPipe!=nullptr), kRingRadius);
-        }
+        // --- distance fog (eye-relative, like distantland.vert): full clear near the eye, ramping to
+        // fogColNear by the DL draw-distance edge — gives the depth cue the overhead view lacked ("too
+        // high without fog, looks close"). The headless host normally fills fogParams from the client
+        // weather; the viewer has no client, so synthesize it from the DL Draw Distance. ---
+        const float    kFogEnd    = Configuration.DL.DrawDist * 8192.0f;   // cells -> world: fully fogged here
+        const float    kFogStart  = 0.35f * kFogEnd;                       // clear out to ~35% of draw distance
 
         // --- render loop ---
         while (!s_viewerQuit) {
@@ -6685,6 +7571,12 @@ namespace ForgeRender {
             if (down(VK_SPACE))   eye[2]+=moveSpd;
             if (down(VK_CONTROL)) eye[2]-=moveSpd;
             (void)kPi;
+            // F7 edge-toggle: water on/off A/B (matches the live F7 water toggle; here it flips the
+            // shared g_drawWater the water pass gates on). Edge-detected so one press = one flip.
+            { static bool s_f7prev = false; bool f7 = down(VK_F7);
+              if (f7 && !s_f7prev) { g_drawWater = !g_drawWater;
+                  std::printf("[forge][view] water draw %s\n", g_drawWater ? "ON" : "OFF"); }
+              s_f7prev = f7; }
 
             // CAMERA-RELATIVE viewProj: build the view from the ORIGIN (no eye translation baked into
             // the matrix) and shift land by -lodEye in the shader, so ALL clip-space math runs on
@@ -6706,9 +7598,9 @@ namespace ForgeRender {
             float sun[3] = { 0.4f, 0.2f, -0.9f }; dlNorm3(sun);
             fd[16]=sun[0]; fd[17]=sun[1]; fd[18]=sun[2]; fd[19]=0;
             fd[20]=1.0f; fd[21]=0.96f; fd[22]=0.86f; fd[23]=0;
-            fd[24]=0.34f; fd[25]=0.38f; fd[26]=0.46f; fd[27]=0;
-            fd[28]=0.60f; fd[29]=0.66f; fd[30]=0.78f; fd[31]=0;
-            fd[32]=0.30f*zf; fd[33]=0.95f*zf; fd[34]=0; fd[35]=0;
+            fd[24]=kViewerAmbient[0]; fd[25]=kViewerAmbient[1]; fd[26]=kViewerAmbient[2]; fd[27]=0;
+            fd[28]=kViewerFog[0]; fd[29]=kViewerFog[1]; fd[30]=kViewerFog[2]; fd[31]=0;
+            fd[32]=kFogStart; fd[33]=kFogEnd; fd[34]=0; fd[35]=0;  // fogParams (start, end) — tied to draw distance
             fd[36]=0; fd[37]=0; fd[38]=0; fd[39]=0;                // eyePos = 0 (camera-relative frame)
             fd[40]=0; fd[41]=1.0f/(float)W; fd[42]=1.0f/(float)H; fd[43]=0;
             fd[44]=1; fd[45]=1; fd[46]=1; fd[47]=1;
@@ -6738,27 +7630,27 @@ namespace ForgeRender {
             cmdBindRenderTargets(g_live.pCmd, &bind);
             cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)W, (float)H, 0.0f, 1.0f);
             cmdSetScissor(g_live.pCmd, 0, 0, W, H);
+
+            // SK V2/V4 viewer sky FIRST (depth off): dome -> clouds (scrolling) -> sun. Drawn before the
+            // world so dlLiveRecord's depth-write terrain overdraws/occludes it (sun hides behind hills).
+            // to-sun = -sun (sun is the travel dir); horizon = the frame's fog colour (fd[28..30]).
+            if (haveSky) {
+                float toSun[3] = { -sun[0], -sun[1], -sun[2] };
+                float horizon[3] = { fd[28], fd[29], fd[30] };
+                float ambient[3] = { fd[24], fd[25], fd[26] };   // mirror-band bottom = frame ambient
+                dlDrawViewerSky(toSun, zf, dt, horizon, ambient);
+            }
+
             // Replay the live cull result — the EXACT in-game DL record (land visible-set + statics
             // execute-indirect over the rings). It binds its own pipelines + descriptor sets.
             dlLiveRecord();
 
-            // Debug 16-cell ring: rebuild the eye-relative ground circle for this frame (centre = the
-            // camera's XY at kGroundZ; only the z offset changes), then draw it as a line strip.
-            if (pDbgPipe && pDbgVB) {
-                float* rv = (float*)pDbgVB->pCpuMappedAddress;
-                const float gz = kGroundZ - eye[2];   // eye-relative ground z
-                for (uint32_t i = 0; i < kRingVerts; ++i) {
-                    float a = (float)i / (float)kRingSegs * (2.0f * kPi);
-                    rv[i*3+0] = kRingRadius * std::cos(a);
-                    rv[i*3+1] = kRingRadius * std::sin(a);
-                    rv[i*3+2] = gz;
-                }
-                cmdBindPipeline(g_live.pCmd, pDbgPipe);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
-                Buffer* dvbs[1] = { pDbgVB }; uint32_t dst[1] = { 12 };
-                cmdBindVertexBuffer(g_live.pCmd, 1, dvbs, dst, nullptr);
-                cmdDraw(g_live.pCmd, kRingVerts, 0);
-            }
+            // WV1 water LAST (after sky+land+statics) so the whole opaque frame is its refraction +
+            // scene-depth source; depth GEQUAL+write vs pDepth makes terrain occlude / be-occluded.
+            // Runs the same linearize + water pass the live renderScene runs (F7-equivalent = g_drawWater).
+            // Leaves the backbuffer+depth bound (LOAD).
+            if (haveWater) { dlDrawViewerWater(bb, vp, eye, fwd, zf); }
+
             cmdBindRenderTargets(g_live.pCmd, nullptr);
             toRT.mCurrentState = RESOURCE_STATE_RENDER_TARGET; toRT.mNewState = RESOURCE_STATE_PRESENT;
             cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &toRT);
@@ -6779,9 +7671,20 @@ namespace ForgeRender {
         }
 
         waitQueueIdle(g_live.pQueue);
-        if (pDbgVB)     { removeResource(pDbgVB); }
-        if (pDbgPipe)   { removePipeline(R, pDbgPipe); }
-        if (pDbgShader) { removeShader(R, pDbgShader); }
+        // WV1: viewer-owned reflect stand-in (the water resources themselves are g_live-owned and
+        // torn down by shutdown() below). Removed before shutdown so the descriptor no longer dangles.
+        if (g_viewerReflectTex) { removeResource(g_viewerReflectTex); g_viewerReflectTex = nullptr; }
+        // SK V2 viewer sky teardown.
+        if (g_sky.fillVB)    { removeResource(g_sky.fillVB);    g_sky.fillVB = nullptr; }
+        if (g_sky.sunVB)     { removeResource(g_sky.sunVB);     g_sky.sunVB = nullptr; }
+        if (g_sky.inst)      { removeResource(g_sky.inst);      g_sky.inst = nullptr; }
+        if (g_sky.pipeSun)   { removePipeline(R, g_sky.pipeSun);   g_sky.pipeSun = nullptr; }
+        if (g_sky.pipeCloud) { removePipeline(R, g_sky.pipeCloud); g_sky.pipeCloud = nullptr; }
+        if (g_sky.pipeDome)  { removePipeline(R, g_sky.pipeDome);  g_sky.pipeDome = nullptr; }
+        if (g_sky.shader)    { removeShader(R, g_sky.shader);      g_sky.shader = nullptr; }
+        if (g_sky.ib)        { removeResource(g_sky.ib);        g_sky.ib = nullptr; }
+        if (g_sky.vb)        { removeResource(g_sky.vb);        g_sky.vb = nullptr; }
+        g_sky.ready = false; g_sky.loaded = false;
         exitSemaphore(R, pImgSem); exitSemaphore(R, pRenderSem);
         removeSwapChain(R, pSwap);
         DestroyWindow(hwnd);
@@ -6912,8 +7815,14 @@ namespace ForgeRender {
         ar.pData = nullptr;
         ar.ppBuffer = &g_pStaticsArgsRing;
         addResource(&ar, nullptr);
+        // WV2: duplicate rings for the reflection cull (same caps; filled by the mirror-frustum cull).
+        BufferLoadDesc irR = ir; irR.mDesc.pName = "staticsInstRingRefl"; irR.ppBuffer = &g_pStaticsInstRingRefl;
+        addResource(&irR, nullptr);
+        BufferLoadDesc arR = ar; arR.mDesc.pName = "staticsArgsRingRefl"; arR.ppBuffer = &g_pStaticsArgsRingRefl;
+        addResource(&arR, nullptr);
         waitForAllResourceLoads();
-        return g_pStaticsInstRing && g_pStaticsArgsRing;
+        return g_pStaticsInstRing && g_pStaticsArgsRing
+            && g_pStaticsInstRingRefl && g_pStaticsArgsRingRefl;
     }
 
     // Stage B (M1) GPU statics cull resources (B2 = COUNT-only validation). One-time, AFTER
@@ -6980,44 +7889,146 @@ namespace ForgeRender {
         pb.ppBuffer           = &g_live.pCullParamsCbv;
         addResource(&pb, nullptr);
 
+        // ---- Stage B (B3) count->prefix-sum->scatter resources ----
+        const uint32_t subsetCount = (uint32_t)g_staticsSubsets.size();
+        g_live.cullSubsetCount = subsetCount;
+
+        // (6) Resident subset SRV (GPU_ONLY structured, uploaded once from g_staticsSubsets; 20B/subset).
+        //     StaticsSubsetGPU {vbBase, ibBase, indexCount, texSlot, flags} == the FSL StaticsSubset.
+        BufferLoadDesc sb = {};
+        sb.mDesc.mDescriptors  = DESCRIPTOR_TYPE_BUFFER;
+        sb.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+        sb.mDesc.mStructStride = sizeof(StaticsSubsetGPU);   // 20
+        sb.mDesc.mElementCount = subsetCount;
+        sb.mDesc.mSize         = (uint64_t)sb.mDesc.mStructStride * subsetCount;
+        sb.mDesc.mStartState   = RESOURCE_STATE_SHADER_RESOURCE;
+        sb.mDesc.pName         = "staticsSubsetBuf";
+        sb.pData               = g_staticsSubsets.data();
+        sb.ppBuffer            = &g_live.pStaticsSubsetBuf;
+        addResource(&sb, nullptr);
+
+        // (7) Per-subset uint UAVs (count/offset/cursor). Structured stride-4 (the proven B2 pattern).
+        auto addSubsetUav = [&](Buffer** out, const char* name) {
+            BufferLoadDesc bd = {};
+            bd.mDesc.mDescriptors  = DESCRIPTOR_TYPE_RW_BUFFER;
+            bd.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+            bd.mDesc.mStructStride = sizeof(uint32_t);
+            bd.mDesc.mElementCount = subsetCount;
+            bd.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * subsetCount;
+            bd.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
+            bd.mDesc.pName         = name;
+            bd.ppBuffer            = out;
+            addResource(&bd, nullptr);
+        };
+        addSubsetUav(&g_live.pSubsetCount,  "subsetCount");
+        addSubsetUav(&g_live.pSubsetOffset, "subsetOffset");
+        addSubsetUav(&g_live.pSubsetCursor, "subsetCursor");
+
+        // (8) Zero-reset staging for gSubsetCount (CopyBufferRegion source; Forge has no buffer clear).
+        BufferLoadDesc szb = {};
+        szb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+        szb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+        szb.mDesc.mSize        = (uint64_t)sizeof(uint32_t) * subsetCount;
+        szb.mDesc.pName        = "subsetCountZero";
+        szb.ppBuffer           = &g_live.pSubsetCountZero;
+        addResource(&szb, nullptr);
+
+        // (9) GPU-filled indirect args (RW in the scan pass, INDIRECT_ARGUMENT for the draw).
+        //     5 uint / subset (IndirectDrawIndexArguments). Structured stride-4.
+        BufferLoadDesc ab = {};
+        ab.mDesc.mDescriptors  = (DescriptorType)(DESCRIPTOR_TYPE_RW_BUFFER | DESCRIPTOR_TYPE_INDIRECT_BUFFER);
+        ab.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+        ab.mDesc.mStructStride = sizeof(uint32_t);
+        ab.mDesc.mElementCount = subsetCount * 5u;
+        ab.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * subsetCount * 5u;
+        ab.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
+        ab.mDesc.pName         = "gpuStaticsArgs";
+        ab.ppBuffer            = &g_live.pGpuArgs;
+        addResource(&ab, nullptr);
+
+        // (10) GPU survivor instance ring (RW in the scatter pass, VERTEX buffer for the draw).
+        //      20 uint / instance (80B = kStaticsInstStride), reinterpreted as float by the vertex fetch.
+        BufferLoadDesc ob = {};
+        ob.mDesc.mDescriptors  = (DescriptorType)(DESCRIPTOR_TYPE_RW_BUFFER | DESCRIPTOR_TYPE_VERTEX_BUFFER);
+        ob.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+        ob.mDesc.mStructStride = sizeof(uint32_t);
+        ob.mDesc.mElementCount = kLiveMaxInst * 20u;
+        ob.mDesc.mSize         = (uint64_t)sizeof(uint32_t) * kLiveMaxInst * 20u;
+        ob.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
+        ob.mDesc.pName         = "gpuStaticsInstOut";
+        ob.ppBuffer            = &g_live.pGpuInstOut;
+        addResource(&ob, nullptr);
+
         waitForAllResourceLoads();
         if (g_live.pCullCountZero && g_live.pCullCountZero->pCpuMappedAddress) {
             std::memset(g_live.pCullCountZero->pCpuMappedAddress, 0, 16);  // reset source (never changes)
+        }
+        if (g_live.pSubsetCountZero && g_live.pSubsetCountZero->pCpuMappedAddress) {
+            std::memset(g_live.pSubsetCountZero->pCpuMappedAddress, 0, (size_t)sizeof(uint32_t) * subsetCount);
         }
         if (!g_live.pCullInstBuf || !g_live.pCullCountBuf || !g_live.pCullCountReadback
             || !g_live.pCullCountZero || !g_live.pCullParamsCbv) {
             std::printf("[forge][cull] Stage B resource alloc FAILED\n");
             return false;
         }
+        g_live.gpuStaticsReady = g_live.pStaticsSubsetBuf && g_live.pSubsetCount && g_live.pSubsetOffset
+                              && g_live.pSubsetCursor && g_live.pSubsetCountZero && g_live.pGpuArgs
+                              && g_live.pGpuInstOut;
+        // cull.comp unconditionally writes gSubsetCount every frame — those UAVs MUST be bound, so the
+        // whole cull is disabled if the B3 buffers failed (never run the count pass against an unbound UAV).
+        if (!g_live.gpuStaticsReady) {
+            std::printf("[forge][cull] B3 resource alloc FAILED — cull disabled\n");
+            return false;
+        }
 
-        // (5) cull.comp pipeline (merged ComputeRootSignature) + its PerBatch descriptor set.
-        ShaderLoadDesc csd = {};
-        csd.mComp.pFileName = "cull.comp";
-        addShader(R, &csd, &g_live.pCullShader);
-        if (!g_live.pCullShader) { std::printf("[forge][cull] addShader(cull.comp) FAILED\n"); return false; }
-        PipelineDesc cpd = {};
-        cpd.mType = PIPELINE_TYPE_COMPUTE;
-        cpd.mComputeDesc.pShaderProgram = g_live.pCullShader;
-        addPipeline(R, &cpd, &g_live.pCullPipeline);
-        if (!g_live.pCullPipeline) { std::printf("[forge][cull] addPipeline(cull.comp) FAILED\n"); return false; }
+        // (5) cull compute pipelines (merged ComputeRootSignature) — COUNT + PREFIX + SCATTER share the
+        //     one CullSrtData PerBatch descriptor set.
+        auto addCullPipeline = [&](const char* name, Shader** sh, Pipeline** pl) -> bool {
+            ShaderLoadDesc csd = {};
+            csd.mComp.pFileName = name;
+            addShader(R, &csd, sh);
+            if (!*sh) { std::printf("[forge][cull] addShader(%s) FAILED\n", name); return false; }
+            PipelineDesc cpd = {};
+            cpd.mType = PIPELINE_TYPE_COMPUTE;
+            cpd.mComputeDesc.pShaderProgram = *sh;
+            addPipeline(R, &cpd, pl);
+            if (!*pl) { std::printf("[forge][cull] addPipeline(%s) FAILED\n", name); return false; }
+            return true;
+        };
+        if (!addCullPipeline("cull.comp", &g_live.pCullShader, &g_live.pCullPipeline)
+         || !addCullPipeline("cullscan.comp", &g_live.pCullScanShader, &g_live.pCullScanPipeline)
+         || !addCullPipeline("cullscatter.comp", &g_live.pCullScatterShader, &g_live.pCullScatterPipeline)) {
+            return false;
+        }
 
         DescriptorSetDesc cset = SRT_SET_DESC(CullSrtData, PerBatch, 1, 0);
         addDescriptorSet(R, &cset, &g_live.pCullSet);
         if (!g_live.pCullSet) { std::printf("[forge][cull] addDescriptorSet FAILED\n"); return false; }
         {
-            DescriptorData d[3] = {};
-            d[0].mIndex     = SRT_RES_IDX(CullSrtData, PerBatch, gCullParams);
-            d[0].ppBuffers  = &g_live.pCullParamsCbv;
-            d[1].mIndex     = SRT_RES_IDX(CullSrtData, PerBatch, gCullInst);
-            d[1].mCount     = 1;
-            d[1].ppBuffers  = &g_live.pCullInstBuf;
-            d[2].mIndex     = SRT_RES_IDX(CullSrtData, PerBatch, gCullCount);
-            d[2].mCount     = 1;
-            d[2].ppBuffers  = &g_live.pCullCountBuf;
-            updateDescriptorSet(R, 0, g_live.pCullSet, 3, d);
+            DescriptorData d[9] = {};
+            uint32_t n = 0;
+            d[n].mIndex   = SRT_RES_IDX(CullSrtData, PerBatch, gCullParams);
+            d[n].ppBuffers = &g_live.pCullParamsCbv; ++n;
+            d[n].mIndex   = SRT_RES_IDX(CullSrtData, PerBatch, gCullInst);
+            d[n].mCount = 1; d[n].ppBuffers = &g_live.pCullInstBuf; ++n;
+            d[n].mIndex   = SRT_RES_IDX(CullSrtData, PerBatch, gCullCount);
+            d[n].mCount = 1; d[n].ppBuffers = &g_live.pCullCountBuf; ++n;
+            d[n].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gStaticsSubsets);
+            d[n].mCount = 1; d[n].ppBuffers = &g_live.pStaticsSubsetBuf; ++n;
+            d[n].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gSubsetCount);
+            d[n].mCount = 1; d[n].ppBuffers = &g_live.pSubsetCount; ++n;
+            d[n].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gSubsetOffset);
+            d[n].mCount = 1; d[n].ppBuffers = &g_live.pSubsetOffset; ++n;
+            d[n].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gSubsetCursor);
+            d[n].mCount = 1; d[n].ppBuffers = &g_live.pSubsetCursor; ++n;
+            d[n].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gArgs);
+            d[n].mCount = 1; d[n].ppBuffers = &g_live.pGpuArgs; ++n;
+            d[n].mIndex = SRT_RES_IDX(CullSrtData, PerBatch, gInstOut);
+            d[n].mCount = 1; d[n].ppBuffers = &g_live.pGpuInstOut; ++n;
+            updateDescriptorSet(R, 0, g_live.pCullSet, n, d);
         }
-        std::printf("[forge][cull] Stage B ready: %u instances (struct=%zuB)\n",
-                    g_live.cullInstCount, sizeof(GpuCullInstance));
+        std::printf("[forge][cull] Stage B ready: %u instances (struct=%zuB) gpuDraw=%d subsets=%u\n",
+                    g_live.cullInstCount, sizeof(GpuCullInstance), (int)g_live.gpuStaticsReady, subsetCount);
         return true;
     }
 
@@ -7053,18 +8064,40 @@ namespace ForgeRender {
         return true;
     }
 
-    // Per-frame cull + ring fill (runs BEFORE command recording — it lazily creates GPU resources +
-    // loads newly-visible textures, which must not happen mid-command-buffer). Fills g_liveLandVisible
-    // + the instance/args rings, and writes the DL fields of gFrameData (lodParams/lodSunAmb/lodEye).
-    // rzViewProj = the relative, reverse-Z, extended-far viewProj already in gFrameData.
-    void dlLiveCullAndBuild(Renderer* R, const float* rzViewProj) {
-        g_liveLandVisible.clear();
-        g_liveLastInst = g_liveLastSubsets = g_liveLastLand = 0;
+    // WV2: cull output targets. The main path passes the live globals (behaviour-identical); the
+    // reflection path passes its own rings/land-list so the two culls (main viewProj + mirror-about-water
+    // viewProj) don't clobber each other in one command buffer. `primary` gates the side-effects that
+    // belong to the main path ONLY: lazy resident load, the DL gFrameData block, the GPU-cull CullParams
+    // cbuffer, and the g_liveLast* diagnostic counters.
+    struct DlCullTargets {
+        std::vector<uint32_t>* landVisible;
+        Buffer**               instRing;   // by-ref: the primary rings are created by the lazy init
+        Buffer**               argRing;    //         INSIDE this call, so read the global at flatten time
+        uint32_t*              lastSubsets;
+        uint32_t*              lastInst;   // nullable (diagnostics)
+        bool                   primary;
+        bool                   suppressNearCut;  // WV2: reflection has NO near-scene path → draw DL
+                                                 // statics all the way to the eye (else near objects
+                                                 // vanish from the reflection — no one else covers them).
+    };
+
+    // Per-frame cull + ring fill (the PRIMARY call runs BEFORE command recording — it lazily creates GPU
+    // resources + loads newly-visible textures, which must not happen mid-command-buffer). Fills
+    // T.landVisible + T.instRing/T.argRing, and (primary only) writes the DL fields of gFrameData. viewProj
+    // = the relative, reverse-Z, extended-far matrix (main) or the mirror-about-water matrix (reflection);
+    // only the frustum planes come from it — tier/distance ranges + g_dlEye are the REAL eye either way.
+    void dlCullAndBuild(Renderer* R, const float* viewProj, const DlCullTargets& T) {
+        T.landVisible->clear();
+        *T.lastSubsets = 0;
+        if (T.lastInst) { *T.lastInst = 0; }
+        if (T.primary) { g_liveLastInst = g_liveLastSubsets = g_liveLastLand = 0; }
         if (!g_dlExterior) { return; }
         const double tCull0 = hostNowMs();   // CPU cull+build cost (NOT in the host record/gpu metrics)
 
         // Lazy one-time resident load (first exterior frame): land + statics library + grid + rings.
-        if (!g_dlLiveInit) {
+        // PRIMARY only — it does addResource/updateDescriptorSet, illegal mid-command-buffer. The reflect
+        // cull runs INSIDE the command buffer, so it relies on the primary cull having already run.
+        if (T.primary && !g_dlLiveInit) {
             if (!buildLandPath(R) || !loadDistantLand(R)) {
                 std::printf("[forge][dl] live land load FAILED — DL disabled\n");
                 g_dlExterior = false; return;
@@ -7082,28 +8115,35 @@ namespace ForgeRender {
             std::printf("[forge][dl] live init done (land meshes=%u, statics=%d)\n",
                         g_landMeshCount, (int)g_staticsLiveOk);
         }
+        if (!g_dlLiveInit) { return; }   // reflect cull before the primary init ran → nothing to do
 
-        // DL frame constants into gFrameData (mirrors the probe's fd[48..59] block).
-        float* fd = (float*)g_live.pFrameCbv->pCpuMappedAddress;
-        fd[48] = (float)kLandBaseSlot; fd[49] = (float)kLandNormalSlot;
-        fd[50] = (float)kLandDetailSlot; fd[51] = 7168.0f;     // lodParams.zw (detail slot, nearViewRange)
-        fd[52] = fd[24]; fd[53] = fd[25]; fd[54] = fd[26]; fd[55] = 0.0f;  // lodSunAmb = ambCol
-        fd[56] = g_dlEye[0]; fd[57] = g_dlEye[1]; fd[58] = g_dlEye[2]; fd[59] = 0.0f;  // lodEye
+        // DL frame constants into gFrameData (mirrors the probe's fd[48..59] block). PRIMARY only —
+        // these are camera-independent, so the reflect cull must not touch pFrameCbv (its geo cbuffer
+        // is a copy made in the reflect pass).
+        if (T.primary) {
+            float* fd = (float*)g_live.pFrameCbv->pCpuMappedAddress;
+            fd[48] = (float)kLandBaseSlot; fd[49] = (float)kLandNormalSlot;
+            fd[50] = (float)kLandDetailSlot; fd[51] = 7168.0f;     // lodParams.zw (detail slot, nearViewRange)
+            fd[52] = fd[24]; fd[53] = fd[25]; fd[54] = fd[26]; fd[55] = 0.0f;  // lodSunAmb = ambCol
+            fd[56] = g_dlEye[0]; fd[57] = g_dlEye[1]; fd[58] = g_dlEye[2]; fd[59] = 0.0f;  // lodEye
+        }
 
         float planes[6][4];
-        dlExtractFrustum(rzViewProj, planes);
+        dlExtractFrustum(viewProj, planes);
         const float eye[3] = { g_dlEye[0], g_dlEye[1], g_dlEye[2] };
 
         // Land: frustum-cull the resident sphere set in relative space.
         for (uint32_t i = 0; i < g_landMeshCount; ++i) {
             const LandMeshGPU& m = g_landMeshes[i];
             if (dlSphereInFrustum(planes, m.cx - eye[0], m.cy - eye[1], m.cz - eye[2], m.r)) {
-                g_liveLandVisible.push_back(i);
+                T.landVisible->push_back(i);
             }
         }
-        g_liveLastLand = (uint32_t)g_liveLandVisible.size();
+        if (T.primary) { g_liveLastLand = (uint32_t)T.landVisible->size(); }
 
         if (!g_staticsLiveOk) { return; }
+        // nearViewRange (fd[51]) is a constant written by the primary path; read it for the near cutoff.
+        const float* fd = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
 
         // Statics: per-cell coarse reject, then per-instance tier/distance/MinSize + frustum cull.
         // Survivors expand to (instance x subset), grouped by subset into the instance ring.
@@ -7122,10 +8162,24 @@ namespace ForgeRender {
         // Skip DL statics closer than the handover (MGE clips its distant statics at nearViewRange-768).
         // lodParams.w (fd[51]) = nearViewRange; per-origin cut (a large mesh straddling the band can
         // still gap — acceptable for the additive phase; MGE uses a slab clip plane there).
-        const float nearCut  = fd[51] - 768.0f;
+        // WV2: the REFLECTION suppresses this cut (no near-scene path reflects, so DL must cover near too).
+        const float nearCut  = T.suppressNearCut ? 0.0f : (fd[51] - 768.0f);
         const float nearCut2 = nearCut * nearCut;
 
+        // When the GPU cull drives the PRIMARY statics draw (g_gpuStaticsCull), skip this whole CPU
+        // cell-walk + ring-fill — the 3-pass compute (count->prefix->scatter) does it on the GPU. The
+        // reflect path (primary=false) + the A/B-off case still run the full CPU cull below.
+        const bool cpuStaticsCull = !(T.primary && g_gpuStaticsCull);
         uint32_t cellsHit = 0, examined = 0;             // slow-frame diagnostics
+        bool overflow = false;
+        if (!cpuStaticsCull) {
+            // GPU drives the primary statics draw; skip the CPU cell-walk + ring fill entirely.
+            *T.lastSubsets = 0;
+            if (T.lastInst) { *T.lastInst = 0; }
+            g_liveLastInst = g_lastGpuCullCount;   // panel: prev-frame GPU survivor readback (Σ numSubsets)
+            g_liveLastSubsets = 0;
+            g_lastCullExamined = 0;
+        } else {
         for (const LiveGridCell& c : g_liveGrid) {
             // Cell sphere (relative): center of the padded AABB, radius = half-diagonal + extent pad.
             float pad = kLiveGridCell;   // generous static-extent margin (per-instance test is exact)
@@ -7184,11 +8238,10 @@ namespace ForgeRender {
             }
         }
 
-        // Flatten the touched subsets into the persistent rings (one indirect-arg per subset).
-        float* instMap = (float*)g_pStaticsInstRing->pCpuMappedAddress;
-        IndirectDrawIndexArguments* argMap = (IndirectDrawIndexArguments*)g_pStaticsArgsRing->pCpuMappedAddress;
+        // Flatten the touched subsets into the caller's rings (one indirect-arg per subset).
+        float* instMap = (float*)(*T.instRing)->pCpuMappedAddress;
+        IndirectDrawIndexArguments* argMap = (IndirectDrawIndexArguments*)(*T.argRing)->pCpuMappedAddress;
         uint32_t instBase = 0, drawCount = 0;
-        bool overflow = false;
         for (uint32_t sid : s_touched) {
             std::vector<float>& v = s_bySubset[sid];
             uint32_t instCount = (uint32_t)(v.size() / 20);   // 20 floats (80 B) per instance
@@ -7206,20 +8259,27 @@ namespace ForgeRender {
             instBase += instCount;
             v.clear();   // reset for next frame (capacity retained)
         }
-        g_liveLastInst = instBase;
-        g_liveLastSubsets = drawCount;
-        g_lastCullExamined = examined;   // instances tested this frame — normalizes cull ms across scenes
+        *T.lastSubsets = drawCount;
+        if (T.lastInst) { *T.lastInst = instBase; }
+        if (T.primary) {
+            g_liveLastInst = instBase;
+            g_liveLastSubsets = drawCount;
+            g_lastCullExamined = examined;   // instances tested this frame — normalizes cull ms across scenes
+        }
+        }   // end else (cpuStaticsCull) — CPU cell-walk + ring fill
 
-        // Stage B (B2): mirror the EXACT planes/eye/ranges this CPU cull used into the GPU cull
+        // Stage B: mirror the EXACT planes/eye/ranges into the GPU cull cbuffer (the 3-pass dispatch runs
         // cbuffer (the validation dispatch runs during command recording, post-beginCmd). The GPU
         // tests every instance with this identical rule → its Σ numSubsets must equal g_liveLastInst.
-        if (g_live.pCullParamsCbv && g_live.pCullParamsCbv->pCpuMappedAddress) {
+        // PRIMARY only — the GPU-cull validation belongs to the main path (mirror planes would corrupt it).
+        if (T.primary && g_live.pCullParamsCbv && g_live.pCullParamsCbv->pCpuMappedAddress) {
             float* cp = (float*)g_live.pCullParamsCbv->pCpuMappedAddress;
             for (int p = 0; p < 6; ++p) { std::memcpy(cp + p * 4, planes[p], 4 * sizeof(float)); } // 0..23
             cp[24] = eye[0]; cp[25] = eye[1]; cp[26] = eye[2]; cp[27] = 0.0f;                       // eye
             cp[28] = nearEnd * nearEnd; cp[29] = farEnd * farEnd;                                   // ranges
             cp[30] = vfarEnd * vfarEnd; cp[31] = nearCut2;
-            cp[32] = (float)g_live.cullInstCount; cp[33] = cp[34] = cp[35] = 0.0f;                  // misc.x = count
+            cp[32] = (float)g_live.cullInstCount;                                                   // misc.x = instance count
+            cp[33] = (float)g_live.cullSubsetCount; cp[34] = cp[35] = 0.0f;                         // misc.y = subset count
         }
         if (overflow) {
             static bool warned = false;
@@ -7232,11 +8292,39 @@ namespace ForgeRender {
         // updates at 0.2 fps). Log EVERY frame the cull alone exceeds ~20 ms, with the breakdown
         // (cells/instances examined, survivors). Statics textures are all resident (no per-frame loads).
         const double cullMs = hostNowMs() - tCull0;
-        if (cullMs > 20.0) {
+        if (T.primary && cullMs > 20.0) {
             LOG::logline(">> [dl-slow] cull=%.1fms cellsHit=%u examined=%u land=%u inst=%u subsets=%u buckets=%zu",
                          cullMs, cellsHit, examined, g_liveLastLand, g_liveLastInst, g_liveLastSubsets,
                          g_staticsBuckets.empty() ? 0 : g_staticsBuckets.size() - 1);
         }
+    }
+
+    // Main-path wrapper: cull into the LIVE globals (behaviour-identical to the pre-WV2 signature).
+    void dlLiveCullAndBuild(Renderer* R, const float* rzViewProj) {
+        DlCullTargets T = {};
+        T.landVisible = &g_liveLandVisible;
+        T.instRing    = &g_pStaticsInstRing;
+        T.argRing     = &g_pStaticsArgsRing;
+        T.lastSubsets = &g_liveLastSubsets;
+        T.lastInst    = &g_liveLastInst;
+        T.primary     = true;
+        dlCullAndBuild(R, rzViewProj, T);
+    }
+
+    // WV2 reflect-path wrapper: cull into the REFLECTION rings/land-list with the mirror-about-water
+    // viewProj (frustum planes only differ — tier/distance ranges + g_dlEye are the REAL eye, so the
+    // reflection draw distance == the DL draw distance). primary=false: no lazy init / no gFrameData /
+    // no GPU-cull cbuffer write, so it is safe to run mid-command-buffer (the primary cull already ran).
+    void dlReflectCullAndBuild(Renderer* R, const float* mirrorViewProj) {
+        DlCullTargets T = {};
+        T.landVisible = &g_liveLandVisibleRefl;
+        T.instRing    = &g_pStaticsInstRingRefl;
+        T.argRing     = &g_pStaticsArgsRingRefl;
+        T.lastSubsets = &g_liveLastSubsetsRefl;
+        T.lastInst    = &g_liveLastInstRefl;
+        T.primary     = false;
+        T.suppressNearCut = true;   // draw DL statics to the eye (reflection has no near-scene path)
+        dlCullAndBuild(R, mirrorViewProj, T);
     }
 
     // Record the live DL draws into g_live.pCmd. Runs AFTER the near colour pass with colorTarget +
@@ -7263,20 +8351,123 @@ namespace ForgeRender {
         }
         }
 
-        if (g_drawDLStatics && g_staticsLiveOk && g_liveLastSubsets > 0) {
+        // B3: draw the far statics from the GPU-driven cull (count->prefix->scatter filled pGpuArgs +
+        // pGpuInstOut this frame) when g_gpuStaticsCull; else the CPU cull's rings. The CPU cull still
+        // runs either way (fills g_liveLastInst for the parity check + the reflect path).
+        const bool gpuDraw = g_gpuStaticsCull && g_live.gpuStaticsReady && g_live.gpuArgsInDrawState;
+        if (g_drawDLStatics && g_staticsLiveOk && (gpuDraw || g_liveLastSubsets > 0)) {
             cmdBindPipeline(g_live.pCmd, g_dlStaticsFrontCW ? g_pStaticsPipelineCW : g_pStaticsPipeline);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSet);
-            Buffer*  svbs[2]     = { g_pStaticsVB, g_pStaticsInstRing };
+            Buffer*  svbs[2]     = { g_pStaticsVB, gpuDraw ? g_live.pGpuInstOut : g_pStaticsInstRing };
             uint32_t sstrides[2] = { 20, kStaticsInstStride };
             cmdBindVertexBuffer(g_live.pCmd, 2, svbs, sstrides, nullptr);
             cmdBindIndexBuffer(g_live.pCmd, g_pStaticsIB, INDEX_TYPE_UINT16, 0);
-            cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_liveLastSubsets,
-                               g_pStaticsArgsRing, 0, nullptr, 0);
+            if (gpuDraw) {
+                // One indirect command per subset (zero-instance subsets = no-op draws).
+                cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_live.cullSubsetCount,
+                                   g_live.pGpuArgs, 0, nullptr, 0);
+            } else {
+                cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_liveLastSubsets,
+                                   g_pStaticsArgsRing, 0, nullptr, 0);
+            }
         }
         cmdEndDebugMarker(g_live.pCmd);
+    }
+
+    // WV2: record the reflected land + statics into pReflectColor/pReflectDepth (already bound by the
+    // reflect pass). A mirror of dlLiveRecord bound to the REFLECT targets: pPerFrameSetReflectGeo (the
+    // water-plane mirror matrix + below-water clip plane), the reflection rings, and the OPPOSITE-winding
+    // statics PSO (the mirror flips triangle winding). Land is cull NONE → winding-agnostic. Drawn AFTER
+    // the sky into the same RT (depth GEQUAL+write, so land/statics occlude each other + the sky behind).
+    void dlReflectRecordGeo() {
+        if (!g_dlExterior || !g_dlLiveInit || !g_landLoaded) { return; }
+        cmdBeginDebugMarker(g_live.pCmd, 0.3f, 0.6f, 0.9f, "DISTANT LAND (reflect)");
+
+        if (g_drawDLLand) {
+            cmdBindPipeline(g_live.pCmd, g_pLandPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflectGeo);   // MIRROR-about-water + clip
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSet);
+            for (uint32_t idx : g_liveLandVisibleRefl) {
+                LandMeshGPU& m = g_landMeshes[idx];
+                Buffer*  vbs[1]     = { m.vb };
+                uint32_t strides[1] = { 16 };
+                cmdBindVertexBuffer(g_live.pCmd, 1, vbs, strides, nullptr);
+                cmdBindIndexBuffer(g_live.pCmd, m.ib, m.large ? INDEX_TYPE_UINT32 : INDEX_TYPE_UINT16, 0);
+                cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, 0, 1, 0, 0);
+            }
+        }
+
+        if (g_drawDLStatics && g_staticsLiveOk && g_liveLastSubsetsRefl > 0) {
+            // Opposite winding to the main record (the water-plane mirror flips handedness).
+            cmdBindPipeline(g_live.pCmd, g_dlStaticsFrontCW ? g_pStaticsPipeline : g_pStaticsPipelineCW);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflectGeo);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSet);
+            Buffer*  svbs[2]     = { g_pStaticsVB, g_pStaticsInstRingRefl };
+            uint32_t sstrides[2] = { 20, kStaticsInstStride };
+            cmdBindVertexBuffer(g_live.pCmd, 2, svbs, sstrides, nullptr);
+            cmdBindIndexBuffer(g_live.pCmd, g_pStaticsIB, INDEX_TYPE_UINT16, 0);
+            cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_liveLastSubsetsRefl,
+                               g_pStaticsArgsRingRefl, 0, nullptr, 0);
+        }
+        cmdEndDebugMarker(g_live.pCmd);
+    }
+
+    // WV2: the reflect-geo CPU CULL (mirror matrix + clip plane + pReflectFrameCbvGeo write + cull into
+    // the reflection rings). Runs PRE-beginCmd — no GPU commands here, only CPU work + persistent-mapped
+    // writes — so it's off the record phase. Sets g_reflGeoReady when the rings are valid; the reflect
+    // pass records the draws (dlReflectRecordGeo) only then. Defined after the DL globals it reads.
+    void dlReflectGeoCull(Renderer* R, const float* viewProj, const float* fcbvR,
+                          float dRel, float eyeAbsZ, float waterLevelAbs, bool underwater) {
+        g_reflGeoReady = false;
+        if (!g_drawReflectGeo || !g_dlExterior || !g_dlLiveInit || !g_landLoaded) { return; }
+
+        // Mirror about the water plane: the sky's M with M[14] = 2·dRel (reflect about z = dRel, the
+        // camera-relative water level). Same reverse-Z + half-pixel edits the sky/main paths apply.
+        float MG[16] = { 1,0,0,0,  0,1,0,0,  0,0,-1,0,  0,0,2.0f*dRel,1 };
+        float mirrorGeoVP[16];
+        mul4x4(MG, viewProj, mirrorGeoVP);
+        mirrorGeoVP[2]  = mirrorGeoVP[3]  - mirrorGeoVP[2];
+        mirrorGeoVP[6]  = mirrorGeoVP[7]  - mirrorGeoVP[6];
+        mirrorGeoVP[10] = mirrorGeoVP[11] - mirrorGeoVP[10];
+        mirrorGeoVP[14] = mirrorGeoVP[15] - mirrorGeoVP[14];
+        {
+            const float dx = -1.0f * (-1.0f / (float)g_live.width);
+            const float dy = -1.0f * ( 1.0f / (float)g_live.height);
+            mirrorGeoVP[0]  += dx * mirrorGeoVP[3];  mirrorGeoVP[4]  += dx * mirrorGeoVP[7];
+            mirrorGeoVP[8]  += dx * mirrorGeoVP[11]; mirrorGeoVP[12] += dx * mirrorGeoVP[15];
+            mirrorGeoVP[1]  += dy * mirrorGeoVP[3];  mirrorGeoVP[5]  += dy * mirrorGeoVP[7];
+            mirrorGeoVP[9]  += dy * mirrorGeoVP[11]; mirrorGeoVP[13] += dy * mirrorGeoVP[15];
+        }
+
+        // Below-water clip plane (mirror of renderwater.cpp:113/127/131). World plane keeps the ABOVE-
+        // water side: (0,0,1, -(waterLevel-1)); flipped underwater; +½·wave if dynamic ripples. Then
+        // camera-relative for the shader (worldPos = pos - lodEye, plane normal only in z): d += nz·eyeZ.
+        float nz = 1.0f;
+        float dw = -(waterLevelAbs - 1.0f);
+        if (underwater) { nz = -nz; dw = -dw; }
+        if (Configuration.MGEFlags & DYNAMIC_RIPPLES) { dw += 0.5f * (float)Configuration.DL.WaterWaveHeight; }
+        const float dClip = dw + nz * eyeAbsZ;
+
+        // pReflectFrameCbvGeo = copy of the main frame data, viewProj := mirror-about-water,
+        // gReflWaterClip (float 64..67) := the camera-relative below-water plane.
+        std::memcpy(g_live.pReflectFrameCbvGeo->pCpuMappedAddress, fcbvR, 272);
+        std::memcpy(g_live.pReflectFrameCbvGeo->pCpuMappedAddress, mirrorGeoVP, 64);
+        {
+            float* gp = (float*)g_live.pReflectFrameCbvGeo->pCpuMappedAddress;
+            gp[64] = 0.0f; gp[65] = 0.0f; gp[66] = nz; gp[67] = dClip;
+        }
+
+        // Cull into the reflection rings with the mirror frustum. primary=false → no lazy loads (the
+        // main cull, which ran just before this pre-beginCmd, did the init). Rings now valid for the pass.
+        dlReflectCullAndBuild(R, mirrorGeoVP);
+        g_reflGeoReady = true;
     }
 
     // Create the shared mega VB/IB on first use. Must NOT live in buildOpaquePath: geometry
@@ -7617,8 +8808,10 @@ namespace ForgeRender {
         if (g_live.pWaterShader)            { removeShader(R, g_live.pWaterShader); }
         // WT2 reflection teardown.
         if (g_live.pPerFrameSetReflect)     { removeDescriptorSet(R, g_live.pPerFrameSetReflect); }
+        if (g_live.pPerFrameSetReflectGeo)  { removeDescriptorSet(R, g_live.pPerFrameSetReflectGeo); }
         if (g_live.pPerBatchSetReflectSky)  { removeDescriptorSet(R, g_live.pPerBatchSetReflectSky); }
         if (g_live.pReflectFrameCbv)        { removeResource(g_live.pReflectFrameCbv); }
+        if (g_live.pReflectFrameCbvGeo)     { removeResource(g_live.pReflectFrameCbvGeo); }
         if (g_live.pReflectSkyWorldsBuf)    { removeResource(g_live.pReflectSkyWorldsBuf); }
         if (g_live.pReflectSkyInstanceBuf)  { removeResource(g_live.pReflectSkyInstanceBuf); }
         if (g_live.pReflectColor)           { removeRenderTarget(R, g_live.pReflectColor); }
@@ -7652,6 +8845,8 @@ namespace ForgeRender {
         // Phase 1a/1b LIVE distant-land teardown (persistent rings + grid + flags).
         if (g_pStaticsArgsRing) { removeResource(g_pStaticsArgsRing); g_pStaticsArgsRing = nullptr; }
         if (g_pStaticsInstRing) { removeResource(g_pStaticsInstRing); g_pStaticsInstRing = nullptr; }
+        if (g_pStaticsArgsRingRefl) { removeResource(g_pStaticsArgsRingRefl); g_pStaticsArgsRingRefl = nullptr; }
+        if (g_pStaticsInstRingRefl) { removeResource(g_pStaticsInstRingRefl); g_pStaticsInstRingRefl = nullptr; }
         // Stage B (M1) GPU cull resources.
         if (g_live.pCullSet)           { removeDescriptorSet(R, g_live.pCullSet);    g_live.pCullSet = nullptr; }
         if (g_live.pCullPipeline)      { removePipeline(R, g_live.pCullPipeline);    g_live.pCullPipeline = nullptr; }
@@ -7661,10 +8856,24 @@ namespace ForgeRender {
         if (g_live.pCullCountReadback) { removeResource(g_live.pCullCountReadback);  g_live.pCullCountReadback = nullptr; }
         if (g_live.pCullCountBuf)      { removeResource(g_live.pCullCountBuf);       g_live.pCullCountBuf = nullptr; }
         if (g_live.pCullInstBuf)       { removeResource(g_live.pCullInstBuf);        g_live.pCullInstBuf = nullptr; }
-        g_live.cullInstCount = 0;
-        g_liveGrid.clear(); g_liveLandVisible.clear();
+        // Stage B (B3) GPU-draw resources + extra pipelines.
+        if (g_live.pCullScanPipeline)    { removePipeline(R, g_live.pCullScanPipeline);    g_live.pCullScanPipeline = nullptr; }
+        if (g_live.pCullScanShader)      { removeShader(R, g_live.pCullScanShader);        g_live.pCullScanShader = nullptr; }
+        if (g_live.pCullScatterPipeline) { removePipeline(R, g_live.pCullScatterPipeline); g_live.pCullScatterPipeline = nullptr; }
+        if (g_live.pCullScatterShader)   { removeShader(R, g_live.pCullScatterShader);     g_live.pCullScatterShader = nullptr; }
+        if (g_live.pStaticsSubsetBuf)  { removeResource(g_live.pStaticsSubsetBuf);  g_live.pStaticsSubsetBuf = nullptr; }
+        if (g_live.pSubsetCount)        { removeResource(g_live.pSubsetCount);       g_live.pSubsetCount = nullptr; }
+        if (g_live.pSubsetOffset)       { removeResource(g_live.pSubsetOffset);      g_live.pSubsetOffset = nullptr; }
+        if (g_live.pSubsetCursor)       { removeResource(g_live.pSubsetCursor);      g_live.pSubsetCursor = nullptr; }
+        if (g_live.pSubsetCountZero)    { removeResource(g_live.pSubsetCountZero);   g_live.pSubsetCountZero = nullptr; }
+        if (g_live.pGpuArgs)            { removeResource(g_live.pGpuArgs);           g_live.pGpuArgs = nullptr; }
+        if (g_live.pGpuInstOut)         { removeResource(g_live.pGpuInstOut);        g_live.pGpuInstOut = nullptr; }
+        g_live.cullInstCount = 0; g_live.cullSubsetCount = 0;
+        g_live.gpuStaticsReady = false; g_live.gpuArgsInDrawState = false;
+        g_liveGrid.clear(); g_liveLandVisible.clear(); g_liveLandVisibleRefl.clear();
         g_dlLiveInit = false; g_staticsLiveOk = false; g_dlExterior = false;
         g_liveLastInst = g_liveLastSubsets = g_liveLastLand = 0;
+        g_liveLastSubsetsRefl = g_liveLastInstRefl = 0;
         // Tier 2 compute (linearize + GTAO + AO bilateral blur).
         if (g_live.pAOBlurSet)      { removeDescriptorSet(R, g_live.pAOBlurSet); }
         if (g_live.pGtaoBatchSet)   { removeDescriptorSet(R, g_live.pGtaoBatchSet); }

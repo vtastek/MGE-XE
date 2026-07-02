@@ -15,6 +15,9 @@ namespace MGEgui {
         [DllImport("MGE3/MGEfuncs.dll", CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Ansi, EntryPoint = "EndStaticCreation")]
         internal static extern void EndStaticCreation();
 
+        [DllImport("MGE3/MGEfuncs.dll", CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Ansi, EntryPoint = "SetAllowTexturelessShapes")]
+        internal static extern void SetAllowTexturelessShapes(int on);
+
         [DllImport("MGE3/MGEfuncs.dll", CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Ansi, EntryPoint = "ProcessNif")]
         internal static extern float ProcessNif(
             [MarshalAs(UnmanagedType.LPArray)] byte[] data, int datasize, float simplify, float cutoff, byte static_type);

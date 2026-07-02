@@ -1,12 +1,13 @@
-// mgeHost64 — Stage B (M1) GPU frustum/tier cull, COUNT-only validation pass.
+// mgeHost64 — Stage B (B3) GPU statics cull, PASS 1 of 3: COUNT.
 //
 // Direct port of dlLiveCullAndBuild's PER-INSTANCE rule (forgerender.cpp): tier range² + near cutoff
-// + Gribb-Hartmann frustum-sphere test, in camera-relative space. The GPU tests EVERY resident
-// instance (the CPU grid's cell rejects are conservative, so the survivor set is identical); on
-// survival it atomic-adds numSubsets — matching the CPU's g_liveLastInst = Σ numSubsets over
-// survivors (13,611 in the test scene). No scatter, no draws: B2 proves the math + plumbing only.
+// + Gribb-Hartmann frustum-sphere test, in camera-relative space. Every surviving instance:
+//   - AtomicAdd(gCullCount[0], numSubsets)  — kept for the post-fence CPU-parity check (== 13,611).
+//   - AtomicAdd(gSubsetCount[firstSubset+k], 1) for each of its subsets — the per-subset survivor
+//     count the prefix-sum (cullscan) turns into per-subset instance offsets + indirect args.
 //
 // 64-wide groups. Out-of-range tail threads bounds-checked against misc.x (no grid coarse-reject).
+// cullscatter.comp re-runs this EXACT test; the two MUST agree (same CullParams, no data races).
 
 #include "cull.srt.h"
 
@@ -51,5 +52,11 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
 
     uint orig;
     AtomicAdd(gCullCount[0], inst.numSubsets, orig);
+    for (uint k = 0u; k < inst.numSubsets; ++k)
+    {
+        uint sid = inst.firstSubset + k;
+        uint prev;
+        AtomicAdd(gSubsetCount[sid], 1u, prev);
+    }
     RETURN();
 }

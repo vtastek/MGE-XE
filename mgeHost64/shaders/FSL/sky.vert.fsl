@@ -33,8 +33,9 @@ STRUCT(VSOutput)
     DATA(float4,      Color,    COLOR);
     DATA(FLAT(uint),  TexIndex, TEXCOORD1);
     DATA(FLAT(float3),MatDiffuse, TEXCOORD2);  // per-draw material rgb (FLAT = constant per draw)
-    DATA(FLAT(uint),  VColSource, TEXCOORD3);  // 0 none (const material), 1 emissive, 2 diffamb
+    DATA(FLAT(uint),  VColSource, TEXCOORD3);  // 0 none (const material), 1 emissive, 2 diffamb, 3 host-gradient dome
     DATA(FLAT(float), MatAlpha,   TEXCOORD4);  // per-element fade (1 = no-op)
+    DATA(float3,      WorldDir,  TEXCOORD5);   // camera-relative world position (C4: dome gradient direction, MW Z-up)
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -52,5 +53,9 @@ VSOutput VS_MAIN( VSInput In )
     Out.VColSource = (In.TexAlpha >> 24u) & 0x3u;  // route vertex colour vs constant material
     Out.MatDiffuse = In.MatDiffuse;
     Out.MatAlpha = asfloat(In.MatAlphaBits);       // weather/night fade (overlay slot reused)
+    // C4: the dome is camera-attached and shipped camera-relative (worldPos already -eye), so
+    // worldPos.xyz IS the direction from the eye to this vertex. Pass it raw; the frag normalizes
+    // (MW Z-up → .z is the vertical factor for the fog->zenith gradient). Inert for SK2 shapes.
+    Out.WorldDir = worldPos.xyz;
     RETURN(Out);
 }
