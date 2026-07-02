@@ -416,15 +416,17 @@ namespace MGE::GeometryCache {
                         w.color = vcol ? *reinterpret_cast<const DWORD*>(&vcol[i]) : 0xFFFFFFFFu;
                     }
                     if (triList) {
-                        // NI::Triangle is 3 packed uint16 indices (== the IB byte layout
-                        // used above via memcpy(.., triCount*6)). SK1 sky: force a re-upload every
-                        // frame (g_walkingSky) so the dome's per-frame vertex-colour gradient
-                        // bypasses the (modelId,vc,rev) dedup, which would otherwise skip it.
+                        // NI::Triangle is 3 packed uint16 indices (== the IB byte layout used above
+                        // via memcpy(.., triCount*6)). SK1 dome: NO forced re-upload anymore. The host
+                        // now colours the atmosphere dome geometrically (sky.frag vertical gradient
+                        // fog->zenith from the thin per-frame skyZenith param), so its per-frame baked
+                        // vertex-colour gradient is irrelevant — ship the mesh ONCE like any static
+                        // (modelId,vc,rev), leaving the geometry channel idle in a static scene.
                         RenderProcess::captureGeometry(key, data->revisionID,
                             reinterpret_cast<uint32_t>(data),   // object identity (recycled-key guard)
                             scratch.data(), vertexCount,
                             reinterpret_cast<const uint16_t*>(triList), triCount * 3u,
-                            g_walkingSky);
+                            false);
                     }
                 }
             }
@@ -704,13 +706,24 @@ namespace MGE::GeometryCache {
                     buildD3DTransform(e.worldTransformD3D, geom);            // bounds center
                     e.dynamicHint = 4;
                 } else {
-                    // SK1 sky: force re-extract + re-upload every frame (the dome's vertex
-                    // colours change without a revisionID bump) — see g_walkingSky.
-                    const bool changed = (data->revisionID != e.revisionID) || e.isSkinned || g_walkingSky;
-                    if (changed) {
+                    // Non-skinned upload decision:
+                    //  - Sky (dome + SK2): the host consumes only STATIC vertex data — it colours the
+                    //    dome geometrically (skyZenith gradient; baked vcol ignored) and the SK2 shapes'
+                    //    orbit + weather/night fade ride SkyDrawWire per-frame (world transform +
+                    //    matColor/matAlpha), NOT the VB. MW bumps the sky's revisionID EVERY frame
+                    //    (atmosphere gradient / star fade), but the VB never meaningfully changes, so
+                    //    re-uploading it is a pure per-frame IPC tax (~0.85ms blocking round-trip for a
+                    //    ~5KB blob). Refresh only the cheap CPU-side MATERIAL that buildSkyDrawList reads
+                    //    (e.matColor/e.matAlpha) and skip the VB re-upload — the mesh shipped once on
+                    //    first capture (new-entry branch).
+                    //  - Everything else: re-extract + re-upload on revision/skin change.
+                    if (g_walkingSky) {
+                        extractMaterial(e, geom);
+                    } else if ((data->revisionID != e.revisionID) || e.isSkinned) {
                         extractMaterial(e, geom);
                         uploadEntry(e, geom, data, key);
                     }
+                    // Transform (orbit for sky) + dynamic hint, shared by sky and opaque.
                     if (inCharacter) {
                         buildD3DTransform(e.worldTransformD3D, geom);
                         e.dynamicHint = 4;

@@ -8,7 +8,17 @@
 // ideally this would go in beginRpc, but we can't put it there because we
 // need to check that the previous command has finished before we start
 // manipulating parameters
+//
+// ASYNC-FRAME WINDOW GUARD: between renderSceneKickoff and renderSceneFinish the
+// RenderFrame RPC is deliberately left pending while the client does its own frame
+// work. Any other RPC in that window would drain (steal) the RenderFrame completion
+// and clobber the shared Parameters union mid-frame — a silent desync that surfaces
+// as a 60s IPC timeout frames later. Fail LOUD instead: refuse the RPC and log.
 #define WAIT_FOR_PREVIOUS_COMMAND { \
+	if (m_frameWindowOpen) { \
+		LOG::logline("!! IPC RPC attempted inside the async RenderFrame window (would clobber the pending frame)"); \
+		return false; \
+	} \
 	if (tryWaitForCompletion() != WakeReason::Complete) { \
 		return false; \
 	} \
@@ -22,6 +32,7 @@ namespace IPC {
 		m_rpcCompleteEvent(INVALID_HANDLE_VALUE),
 		m_ipcParameters(nullptr),
 		m_isRpcPending(false),
+		m_frameWindowOpen(false),
 		m_watcherProcess(INVALID_HANDLE_VALUE),
 		m_watcherJob(NULL),
 		m_geomSharedMem(INVALID_HANDLE_VALUE),
@@ -473,7 +484,7 @@ namespace IPC {
 		return params.bytesWritten > 0;
 	}
 
-	bool Client::renderSceneBlocking(std::uint32_t frameIndex, const float* viewProj,
+	bool Client::renderSceneKickoff(std::uint32_t frameIndex, const float* viewProj,
 		const float* lighting,
 		VecId drawList, std::uint32_t drawCount, std::uint32_t drawBytes,
 		VecId skinnedList, std::uint32_t skinnedCount, std::uint32_t skinnedBytes,
@@ -482,15 +493,14 @@ namespace IPC {
 		VecId skyList, std::uint32_t skyCount, std::uint32_t skyBytes,
 		std::uint32_t debugMode,
 		const DevInput* devInput,
-		const float* waterParams, std::uint32_t waterEnabled,
-		double* outRenderMs) {
+		const float* waterParams, std::uint32_t waterEnabled) {
 		WAIT_FOR_PREVIOUS_COMMAND;
 
 		auto& params = m_ipcParameters->params.renderFrameParams;
 		params.frameIndex = frameIndex;
 		params.targetIndex = 0;
 		std::memcpy(params.viewProj, viewProj, 16 * sizeof(float));
-		std::memcpy(params.lighting, lighting, 28 * sizeof(float));
+		std::memcpy(params.lighting, lighting, 32 * sizeof(float));
 		params.drawList = drawList;
 		params.drawCount = drawCount;
 		params.drawBytes = drawBytes;
@@ -524,14 +534,52 @@ namespace IPC {
 			return false;
 		}
 
+		// The host is now rendering frame N while we return to MW's own frame-N work.
+		// The window guard stays up until renderSceneFinish drains the completion —
+		// see WAIT_FOR_PREVIOUS_COMMAND.
+		m_frameWindowOpen = true;
+		return true;
+	}
+
+	bool Client::renderSceneFinish(double* outRenderMs) {
+		// ALWAYS drop the window guard, even on failure — a stale guard would refuse
+		// every subsequent RPC forever (fail-loud, not fail-dead).
+		m_frameWindowOpen = false;
+
 		if (waitForCompletion() != WakeReason::Complete) {
 			return false;
 		}
 
+		auto& params = m_ipcParameters->params.renderFrameParams;
 		if (outRenderMs) {
 			*outRenderMs = params.renderMs;
 		}
 		return params.bytesWritten > 0;
+	}
+
+	bool Client::renderSceneBlocking(std::uint32_t frameIndex, const float* viewProj,
+		const float* lighting,
+		VecId drawList, std::uint32_t drawCount, std::uint32_t drawBytes,
+		VecId skinnedList, std::uint32_t skinnedCount, std::uint32_t skinnedBytes,
+		VecId multiMapList, std::uint32_t multiMapCount, std::uint32_t multiMapBytes,
+		VecId lightList, std::uint32_t lightCount, std::uint32_t lightBytes,
+		VecId skyList, std::uint32_t skyCount, std::uint32_t skyBytes,
+		std::uint32_t debugMode,
+		const DevInput* devInput,
+		const float* waterParams, std::uint32_t waterEnabled,
+		double* outRenderMs) {
+		// Fused kickoff+finish — the exact pre-split serial behaviour (A/B reference).
+		if (!renderSceneKickoff(frameIndex, viewProj, lighting,
+			drawList, drawCount, drawBytes,
+			skinnedList, skinnedCount, skinnedBytes,
+			multiMapList, multiMapCount, multiMapBytes,
+			lightList, lightCount, lightBytes,
+			skyList, skyCount, skyBytes,
+			debugMode, devInput, waterParams, waterEnabled)) {
+			return false;
+		}
+
+		return renderSceneFinish(outRenderMs);
 	}
 
 	bool Client::geomUploadBlocking(VecId blob, std::uint32_t partCount, std::uint32_t byteCount, std::uint32_t* outUploaded) {
@@ -540,6 +588,14 @@ namespace IPC {
 		// with the one-at-a-time cull RPCs (which starved this at present time → exterior
 		// black). The host services this channel on the same single thread via WFMO, so it
 		// can never race renderScene.
+		//
+		// It CAN however queue behind an async RenderFrame (single host service thread) —
+		// a mid-window upload silently blocks until the whole host frame completes,
+		// defeating the overlap. The async window must be IPC-free on BOTH channels.
+		if (m_frameWindowOpen) {
+			LOG::logline("!! IPC geom upload attempted inside the async RenderFrame window (would serialize behind the host frame)");
+			return false;
+		}
 		if (m_geomRpcPending && waitGeomCompletion() != WakeReason::Complete) {
 			return false;
 		}
@@ -565,7 +621,12 @@ namespace IPC {
 
 	bool Client::texUploadBlocking(VecId blob, std::uint32_t texCount, std::uint32_t byteCount, std::uint32_t* outUploaded) {
 		// Textures ride the SAME dedicated geometry channel as geomUpload (bulk, off the cull
-		// channel). Wait only for the previous geom-channel RPC.
+		// channel). Wait only for the previous geom-channel RPC. Same async-window rule as
+		// geomUploadBlocking: IPC-free on both channels while a RenderFrame is in flight.
+		if (m_frameWindowOpen) {
+			LOG::logline("!! IPC tex upload attempted inside the async RenderFrame window (would serialize behind the host frame)");
+			return false;
+		}
 		if (m_geomRpcPending && waitGeomCompletion() != WakeReason::Complete) {
 			return false;
 		}

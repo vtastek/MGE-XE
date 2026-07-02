@@ -318,7 +318,9 @@ void DistantLand::renderDepth() {
             // consume the same msocOccluded mask. Moved from Stage0's
             // color pass so it overlaps with land depth on the GPU.
             // SURVIVES forgeOwnsDepth: the statics RPC must be drained to keep the IPC channel paired.
-            if (Configuration.MGEFlags & USE_DISTANT_STATICS) {
+            // Skipped on early-Forge-kickoff frames: the cull kickoff was gated off in
+            // frameSetupEarly (no RPC to drain), keeping the kickoff/finish pairing symmetric.
+            if ((Configuration.MGEFlags & USE_DISTANT_STATICS) && !earlyForgeKickoff) {
                 cullDistantStatics_finish();
             }
 
@@ -345,7 +347,9 @@ void DistantLand::renderDepth() {
             // overlap the walk, and grass's own RPC is cheap with the channel now
             // free. Grass still renders in this depth pre-pass, so early-Z holds.
             // SURVIVES forgeOwnsDepth: MGE grass COLOR still draws (Forge has no grass) and needs this.
-            if (mwBridge->IsExterior()) {
+            // On early-Forge-kickoff frames frameSetupEarly already culled it pre-kickoff
+            // (this point is inside the IPC-free async window); consume that result.
+            if (mwBridge->IsExterior() && !earlyCulledGrass) {
                 cullGrass(&mwView, &mwProj);
             }
 

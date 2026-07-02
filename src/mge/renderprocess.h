@@ -24,7 +24,27 @@ namespace RenderProcess {
     // end of scene 0 (after renderStageBlend, before scene 1) so Forge's opaque world lands
     // BEHIND s1's sorted-alpha + first-person and post-process works on the whole composite.
     // (Was onPresent — moved earlier so the opaque layer composites in scene order.)
+    //
+    // FUSED form (UseAsyncHostFrame=0): kickoff+finish back-to-back — the exact pre-split
+    // serial behaviour for A/B.
     void onStage0Composite(IDirect3DDevice9* device);
+
+    // Async-frame split (UseAsyncHostFrame=1). Kickoff: flush geom/tex, build the draw
+    // lists + frame params, and START the host RenderFrame without waiting — the host
+    // renders frame N while MW's own frame-N work continues. Finish: wait for the host
+    // (GPU-complete fence), copy the shared RT, composite over MW's backbuffer. The two
+    // must be called as a pair within one scene 0; between them NO IPC may run on either
+    // channel (the client refuses it loudly — see IPC::Client::renderSceneKickoff). Every
+    // kickoff early-out (seam down, F11 off, no scene data) makes the paired Finish a
+    // no-op, so the pair degrades to exactly the old whole-function early-outs.
+    void onStage0CompositeKickoff(IDirect3DDevice9* device);
+    void onStage0CompositeFinish(IDirect3DDevice9* device);
+
+    // True while a kicked-off host RenderFrame awaits its Finish (the async window is
+    // open). The EndScene call site uses this to skip its late kickoff when the Phase 2
+    // early kickoff (BeginScene(0), gated by DistantLand::earlyForgeKickoff) already
+    // fired this frame.
+    bool kickoffPending();
 
     void shutdown();
 

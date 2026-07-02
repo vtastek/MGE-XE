@@ -40,6 +40,8 @@ void DistantLand::frameSetupEarly() {
     s_earlyKickedStatics = false;
     earlyWalkedCache = false;
     renderThreadJobKicked = false;
+    earlyForgeKickoff = false;
+    earlyCulledGrass = false;
     // Reset reflection-worker flags: only set true when the cull worker is
     // dispatched below, so a non-worker frame can't read stale worker results.
     reflGateWanted = false;
@@ -86,6 +88,33 @@ void DistantLand::frameSetupEarly() {
     // still safe — the next frame's WAIT_FOR_PREVIOUS drains it — but doing work
     // that won't be used is wasted.) The renderStage0/renderDepth fallbacks cover
     // these cases (earlyWalkedCache / s_earlyKickedStatics stay false).
+    // Async full-frame overlap (Phase 2): decide whether THIS frame runs the early
+    // Forge kickoff at BeginScene(0), making the whole scene 0 the IPC-free window.
+    // Requires the Forge baseline — seam compositing (F11) + Forge water (F7) —
+    // because exactly then every MGE consumer of the statics cull, shadow, reflection
+    // and depth-production RPCs is suppressed, so the main channel can be vacated for
+    // the async RenderFrame. Cell shape (2a + 2b):
+    //   - exterior distant cell    → eligible; the statics cull is gated off below.
+    //   - plain interior / any non-distant cell → eligible; NO scene-0 RPC exists there
+    //     at all (no statics/grass/land cull; no weather → no shadow map; the interior
+    //     reflection RPC is wantsWaterCapture-suppressed). The else-branch below hoists
+    //     the cache walk + visible set so the kickoff has fresh data (2b).
+    //   - interior DISTANT cell    → NOT eligible (late kickoff): the host DL is
+    //     exterior-only, MGE still draws these statics, so its cull must keep the channel.
+    // One warm-up frame after any transition (load, interior↔exterior, toggle): the
+    // first eligible frame keeps the late kickoff so the host never renders params
+    // captured before the engine pushed this environment's sun/ambient
+    // (SetLight/SetRenderState arrive mid-scene-0 — steady-state values are smooth,
+    // transition jumps are not).
+    static bool s_forgePrevEligible = false;
+    const bool distantCellNow = isDistantCell();
+    const bool forgeEligibleNow = Configuration.UseAsyncHostFrame
+        && RenderProcess::ownsOpaqueWorld() && RenderProcess::wantsWaterCapture()
+        && !mwBridge->IsMenu()
+        && (mwBridge->IsExterior() || !distantCellNow);
+    earlyForgeKickoff = forgeEligibleNow && s_forgePrevEligible;
+    s_forgePrevEligible = forgeEligibleNow;
+
     if (isDistantCell() && !mwBridge->IsMenu()) {
         // Kick the distant-statics cull FIRST — before the GeometryCache walk —
         // so the cull worker's IPC drain (the server-side quadtree cull, ~2.7ms
@@ -95,7 +124,14 @@ void DistantLand::frameSetupEarly() {
         // tail stalled the main thread at the renderStage0 channel-free gate.
         // The kickoff needs just the camera (selectDistantCell + setView, done
         // above), not the geometry cache — they share no state.
-        if (Configuration.MGEFlags & USE_DISTANT_STATICS) {
+        //
+        // GATED OFF under the early Forge kickoff: the host renders those distant
+        // statics itself (GPU cull over the resident set) and every MGE draw that
+        // consumed this cull is suppressed in this mode, so the RPC is dead weight —
+        // and it would squat the main channel exactly where the async RenderFrame
+        // needs it. First cut of the MGE gutting, not a workaround; F11/F7-off or
+        // fused mode restores it (clean A/B).
+        if ((Configuration.MGEFlags & USE_DISTANT_STATICS) && !earlyForgeKickoff) {
             // Stash the reflection cull inputs FIRST — before the kickoff — so the
             // batched statics RPC can fold in the reflection query (4th query →
             // visExtraShared). Its server-cull then overlaps the kickoff→drain
@@ -145,6 +181,17 @@ void DistantLand::frameSetupEarly() {
         // job reads a snapshot of it). ~0.4ms, overlapping the sky window.
         buildFrustumVisibleSet(&mwView, &mwProj);
 
+        // Early Forge kickoff frames: run the grass cull NOW, before the async window
+        // opens. Grass is the one scene-0 RPC with a live consumer in Forge mode (MGE
+        // still draws grass color — the host has no grass), so it can't be gated off
+        // like the statics cull; it moves ahead of the kickoff instead. The channel is
+        // free here — the statics cull kickoff/worker above is gated off on exactly
+        // these frames. renderDepth skips its own cullGrass via earlyCulledGrass.
+        if (earlyForgeKickoff && (Configuration.MGEFlags & USE_GRASS) && mwBridge->IsExterior()) {
+            cullGrass(&mwView, &mwProj);
+            earlyCulledGrass = true;
+        }
+
         // Kick the render-thread depth-cache job now — after the geometry-cache
         // walk (so the cache + VBs it consumes are stable) and before the engine's
         // sky pass — so the worker's ~1ms submission CPU overlaps the engine's
@@ -169,6 +216,17 @@ void DistantLand::frameSetupEarly() {
         // s_visibleKeys + latches s_earlyClassifyRan; renderDepth's buildFrustumVisibleSet
         // then consumes it (MSOC branch) once it has walked the cache.
         earlyClassifyMainScene(nullptr);
+
+        // 2b: early-Forge-kickoff frames need the kickoff's inputs ready NOW — hoist the
+        // cache walk + current-frame visible set here (the exact pair renderDepth's
+        // !earlyWalkedCache fallback runs, in the same order: classify above, walk, build).
+        // renderDepth then skips its own copies. Non-latched frames keep the serial
+        // renderDepth path untouched.
+        if (earlyForgeKickoff) {
+            MGE::GeometryCache::onFrameReady(MGE::SceneGraph::getDataHandler());
+            earlyWalkedCache = true;
+            buildFrustumVisibleSet(&mwView, &mwProj);
+        }
     }
 }
 
@@ -302,8 +360,13 @@ void DistantLand::renderStage0() {
             D3DXMATRIX distProj = mwProj;
             editProjectionZ(&distProj, kDistantNearPlane - 1e-2, Configuration.DL.DrawDist * kCellSize);
 
+            // Early-Forge-kickoff frames gate the whole statics cull off (frameSetupEarly):
+            // the async RenderFrame owns the IPC channel for all of scene 0, and every MGE
+            // consumer of the cull is suppressed in that mode. kickedOffDistantStatics=false
+            // then routes the color path to visDistant.RemoveAll() below and renderDepth
+            // skips cullDistantStatics_finish — the kickoff/finish pairing stays symmetric.
             const bool kickedOffDistantStatics =
-                (Configuration.MGEFlags & USE_DISTANT_STATICS) != 0;
+                (Configuration.MGEFlags & USE_DISTANT_STATICS) != 0 && !earlyForgeKickoff;
             // Fallback kickoff: only if frameSetupEarly() didn't already issue it
             // at BeginScene (non-IPC path, menus, or not-ready early frames).
             // When it did, the cull has been overlapping the sky window already.
@@ -336,11 +399,24 @@ void DistantLand::renderStage0() {
             // nothing samples it. F7-off keeps it so MGE water still gets reflected shadows.
             const bool forgeOwnsAllShadowConsumers =
                 RenderProcess::ownsOpaqueWorld() && RenderProcess::wantsWaterCapture();
-            if ((Configuration.MGEFlags & USE_SHADOWS) && !forgeOwnsAllShadowConsumers) {
+            const bool shadowBuildEligible = (Configuration.MGEFlags & USE_SHADOWS) && !forgeOwnsAllShadowConsumers;
+            if (shadowBuildEligible) {
                 if (mwBridge->CellHasWeather() && !mwBridge->IsMenu()) {
                     effectShadow->Begin(&passes, D3DXFX_DONOTSAVESTATE);
                     renderShadowMap();
                     effectShadow->End();
+                }
+            }
+            // Baseline-thinning verify (2026-07-02): confirm the shadow-map BUILD is actually skipped
+            // when Forge owns opaque + water (the default F11-on/F7-on baseline). Throttled so it
+            // doesn't spam. If this logs eligible=1 in the baseline, water/opaque ownership isn't
+            // engaging (e.g. F7-off MGE-water A/B) — see the shadow gate above.
+            {
+                static unsigned s_shadowGateLog = 0;
+                if ((s_shadowGateLog++ % 300) == 0) {
+                    LOG::logline(">> [baseline][shadow] build eligible=%d (USE_SHADOWS=%d ownsOpaque=%d wantsWater=%d)",
+                                 (int)shadowBuildEligible, (int)((Configuration.MGEFlags & USE_SHADOWS) != 0),
+                                 (int)RenderProcess::ownsOpaqueWorld(), (int)RenderProcess::wantsWaterCapture());
                 }
             }
 
@@ -911,6 +987,15 @@ void DistantLand::adjustFog() {
         return;
     }
 
+    // Forge-owned horizon: the host renders DL.DrawDist cells of world into the composite
+    // regardless of MGE's own DL flag, so with USE_DISTANT_LAND off MW's vanilla short fog
+    // would wall off a world that IS there. Take the DL fog path (weather-scaled, cell
+    // units) whenever the seam owns the frame in a weather cell — this is the cut that
+    // lets MGE's DL machinery turn off entirely while the horizon stays at host distance.
+    // Weather-gated so interiors keep vanilla fog exactly like the DL-on non-distant case;
+    // F11-off restores vanilla fog via the else-branch's nearViewRange re-sync (clean A/B).
+    const bool forgeFog = RenderProcess::ownsDistantLand() && mwBridge->CellHasWeather();
+
     // Get fog cell ranges based on environment and weather
     if (mwBridge->IsUnderwater(eyePos.z)) {
         fogStart = Configuration.DL.BelowWaterFogStart;
@@ -942,7 +1027,7 @@ void DistantLand::adjustFog() {
         windScaling = ws;
 
         // For exp fog, adjust start distance so that starting fog approximately equals fo, to retain near visibility comparable to vanilla
-        if ((Configuration.MGEFlags & USE_DISTANT_LAND) && (Configuration.MGEFlags & EXP_FOG)) {
+        if (((Configuration.MGEFlags & USE_DISTANT_LAND) || forgeFog) && (Configuration.MGEFlags & EXP_FOG)) {
             float lg = log(1.0f - 0.25f * fo);
             float expCorrection = lg / (1 + lg);
             fogStart = ff * Configuration.DL.AboveWaterFogStart + expCorrection * fogEnd;
@@ -962,7 +1047,7 @@ void DistantLand::adjustFog() {
     fogStart *= kCellSize;
     fogEnd *= kCellSize;
 
-    if ((Configuration.MGEFlags & USE_DISTANT_LAND) && isDistantCell()) {
+    if (((Configuration.MGEFlags & USE_DISTANT_LAND) && isDistantCell()) || forgeFog) {
         // Set hardware fog for Morrowind's use
         if (Configuration.MGEFlags & EXP_FOG) {
             // Exponential fog mode

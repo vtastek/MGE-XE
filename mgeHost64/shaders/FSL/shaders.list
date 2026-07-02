@@ -65,6 +65,18 @@
 #include "sky.frag.fsl"
 #end
 
+// SK V2 viewer sky MESH (--forge-view only): baked MW sky meshes (dome + clouds) + a host-generated
+// sun billboard, all in the StaticElem 20B layout. Binding 1 = per-instance world rows + packed sky
+// params (P0..P3). Reuses opaque.srt.h / DefaultRootSignature + bindless gTextures. Three blend PSOs
+// share these shaders (dome opaque, cloud SRCALPHA, sun additive). See tasks/forge-viewer-sky.md.
+#vert skymesh.vert
+#include "skymesh.vert.fsl"
+#end
+
+#frag skymesh.frag
+#include "skymesh.frag.fsl"
+#end
+
 // Phase 1a: host-owned distant-land LOD. Own 16B vertex layout (pos + SHORT2N atlas UV),
 // reuses opaque.srt.h / DefaultRootSignature + the bindless gTextures atlas. One colour
 // pipeline (depth-write, reverse-Z GEQUAL), no prepass (terrain is fully opaque).
@@ -129,9 +141,20 @@
 #include "aoblur.comp.fsl"
 #end
 
-// Stage B (M1) GPU statics cull — COUNT-only validation: one thread per resident instance, ports
-// dlLiveCullAndBuild's per-instance tier/distance/frustum rule, atomic-adds numSubsets. ComputeRootSig
-// (unions into compute.rootsig). No scatter/draw cutover yet (B3). See tasks/forge-gpu-occlusion.md.
+// Stage B (B3) GPU statics cull — count -> prefix-sum -> scatter -> execute-indirect (drives the far
+// statics draw; the CPU cull stays for parity until visually verified). All three share compute.rootsig
+// + the CullSrtData PerBatch set. cull.comp = COUNT (survivors atomic-add numSubsets for the CPU parity
+// check AND per-subset counts). See tasks/forge-gpu-occlusion.md.
 #comp cull.comp
 #include "cull.comp.fsl"
+#end
+
+// PREFIX-SUM: single thread, per-subset survivor count -> instance offset + one IndirectDrawIndexArguments.
+#comp cullscan.comp
+#include "cullscan.comp.fsl"
+#end
+
+// SCATTER: re-test survivors, write each (instance,subset) camera-relative row into the GPU instance ring.
+#comp cullscatter.comp
+#include "cullscatter.comp.fsl"
 #end

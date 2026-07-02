@@ -1,0 +1,60 @@
+// mgeHost64 — SK V2 viewer sky MESH (fragment stage, host-owned, --forge-view only).
+//
+// Emissive sky (no lighting / no fog). Three modes selected per draw (P0.x), routed here flat:
+//   0 dome  : atmosphere emission = lerp(horizon, zenith, vertex alpha). The two colours come from
+//             the per-draw sky params (AtmoBot/AtmoTop); the dome's baked vertex alpha shapes the
+//             vertical gradient. Output opaque (the dome PSO has blend OFF — it fills the sky).
+//   1 cloud : sample the cloud texture at (uv + (0, cloudUVOffset)) — the clouds SCROLL. Modulated
+//             by the cloud tint, faded by opacity. Output RGBA (SRCALPHA/INVSRCALPHA over the dome).
+//   2 sun   : sample the sun texture at uv, tinted by the sun colour. Output RGBA (additive PSO,
+//             SRCALPHA/ONE → dst += rgb*a).
+//
+// gTextures (bindless) carries the cloud + sun DDS in dedicated slots (TexIndex). Shares opaque.srt.h
+// / DefaultRootSignature + the static anisotropic sampler.
+
+#include "opaque.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4,       Position, SV_Position);
+    DATA(float2,       Uv,       TEXCOORD0);
+    DATA(float4,       Color,    COLOR);
+    DATA(FLAT(uint),   Mode,     TEXCOORD1);
+    DATA(FLAT(uint),   TexIndex, TEXCOORD2);
+    DATA(FLAT(float2), CloudOp,  TEXCOORD3);
+    DATA(FLAT(float3), Tint,     TEXCOORD4);
+    DATA(FLAT(float3), AtmoTop,  TEXCOORD5);
+    DATA(FLAT(float3), AtmoBot,  TEXCOORD6);
+    DATA(float,        HeightT,  TEXCOORD7);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+
+    if (In.Mode == 3u) {
+        // Flat sky fill: whole-sky background = the clear-day sky colour (AtmoTop). Drawn first, opaque.
+        RETURN(float4(In.AtmoTop, 1.0f));
+    }
+
+    if (In.Mode == 0u) {
+        // Atmosphere band: vertical gradient by model-Z (horizon -> zenith). HeightT (from the VS,
+        // normalised over the band's own Z range) drives the blend; top ring == the sky fill colour.
+        float3 rgb = lerp(In.AtmoBot, In.AtmoTop, In.HeightT);
+        RETURN(float4(rgb, 1.0f));
+    }
+
+    if (In.Mode == 1u) {
+        // Scrolling clouds: scroll V by cloudUVOffset (CloudUpdater::setTextureCoord parity). HeightT
+        // (from the VS, keyed off cloud model-Z) fades the horizon-edge ring to 0 so the disc rim melts
+        // into the sky gradient instead of a hard seam (OpenMW ModVertexAlphaVisitor::Clouds parity).
+        float2 uv = In.Uv + float2(0.0f, In.CloudOp.x);
+        float4 c = SampleTex2D(gTextures[In.TexIndex], gSamplerAnisotropic, uv);
+        RETURN(float4(c.rgb * In.Tint, c.a * In.CloudOp.y * In.HeightT));
+    }
+
+    // Sun billboard (additive): rgb*a accumulates into the sky.
+    float4 s = SampleTex2D(gTextures[In.TexIndex], gSamplerAnisotropic, In.Uv);
+    RETURN(float4(s.rgb * In.Tint, s.a * In.CloudOp.y));
+}

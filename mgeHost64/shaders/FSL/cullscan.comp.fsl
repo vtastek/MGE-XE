@@ -1,0 +1,76 @@
+// mgeHost64 — Stage B (B3) GPU statics cull, PASS 2 of 3: PREFIX-SUM (parallel workgroup scan).
+//
+// Turns the per-subset survivor counts (gSubsetCount, from cull.comp) into (a) gSubsetOffset[sid] =
+// the subset's first row in the survivor instance stream (mStartInstance), (b) a reset
+// gSubsetCursor[sid] = 0 for the scatter, and (c) one IndirectDrawIndexArguments per subset. Runs as a
+// SINGLE workgroup of 256 threads (dispatch 1,1,1) doing a tiled Hillis-Steele inclusive scan with a
+// carried base in groupshared — replacing the original SINGLE-THREAD serial loop, which was a GPU
+// anti-pattern (one lane, no latency hiding: ~1 ms of the frame for ~1,300 subsets even on an empty
+// view). DispatchThreadID.x == the group-thread index (0..255) since there is exactly one group.
+//
+// ALL threads must reach every GroupMemoryBarrier uniformly — the divergent guards below wrap only the
+// memory writes, never a barrier, so no wave deadlock. kMaxInst == host kLiveMaxInst (ring capacity).
+
+#include "cull.srt.h"
+
+#define kMaxInst 65536u
+#define SCAN_GROUP 256u
+
+GroupShared(uint, g_scan[256]);
+GroupShared(uint, g_base);        // running instance base carried across tiles
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(256, 1, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    uint tid = DispatchThreadID.x;
+    uint subsetCount = (uint)gCullParams.misc.y;
+
+    if (tid == 0u)
+        g_base = 0u;
+    GroupMemoryBarrier();
+
+    uint numTiles = (subsetCount + SCAN_GROUP - 1u) / SCAN_GROUP;
+    for (uint tile = 0u; tile < numTiles; ++tile)
+    {
+        uint sid = tile * SCAN_GROUP + tid;
+        uint c = (sid < subsetCount) ? gSubsetCount[sid] : 0u;
+
+        // In-place Hillis-Steele inclusive scan over the 256 tile counts (read phase, barrier, write
+        // phase, barrier — each thread reads its neighbour into a register before any thread writes).
+        g_scan[tid] = c;
+        GroupMemoryBarrier();
+        UNROLL
+        for (uint off = 1u; off < SCAN_GROUP; off <<= 1u)
+        {
+            uint v = (tid >= off) ? g_scan[tid - off] : 0u;
+            GroupMemoryBarrier();
+            g_scan[tid] = g_scan[tid] + v;
+            GroupMemoryBarrier();
+        }
+
+        uint excl      = g_scan[tid] - c;        // exclusive prefix within the tile
+        uint tileTotal = g_scan[SCAN_GROUP - 1u]; // inclusive sum of the whole tile
+
+        if (sid < subsetCount)
+        {
+            uint off2 = g_base + excl;            // global instance offset for this subset
+            gSubsetOffset[sid] = off2;
+            gSubsetCursor[sid] = 0u;
+            StaticsSubset s = gStaticsSubsets[sid];
+            uint a = sid * 5u;
+            gArgs[a + 0u] = s.indexCount;         // IndexCountPerInstance
+            gArgs[a + 1u] = c;                    // InstanceCount
+            gArgs[a + 2u] = s.ibBase;             // StartIndexLocation
+            gArgs[a + 3u] = s.vbBase;             // BaseVertexLocation
+            gArgs[a + 4u] = off2;                 // StartInstanceLocation
+        }
+
+        GroupMemoryBarrier();
+        if (tid == 0u)
+            g_base = g_base + tileTotal;
+        GroupMemoryBarrier();
+    }
+    RETURN();
+}

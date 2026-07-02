@@ -33,6 +33,8 @@ bool DistantLand::cacheOpaqueMode = false;
 bool DistantLand::cacheOnlyMode = false;
 bool DistantLand::earlyWalkedCache = false;
 bool DistantLand::renderThreadJobKicked = false;
+bool DistantLand::earlyForgeKickoff = false;
+bool DistantLand::earlyCulledGrass = false;
 std::vector<D3DXVECTOR4> DistantLand::reflectionWaterRects;
 bool DistantLand::reflWaterCullActive = true;
 bool DistantLand::reflGateWanted = false;

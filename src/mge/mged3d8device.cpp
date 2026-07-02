@@ -651,6 +651,19 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                 // this and skips the redundant setup + kickoff.
                 if (DistantLand::ready) {
                     DistantLand::frameSetupEarly();
+
+                    // Phase 2 async overlap: start the Forge host frame NOW, so its whole
+                    // D3D12 frame (record + GPU) runs under MW's entire scene 0 (sky +
+                    // residual draws + MGE stage work). frameSetupEarly just produced
+                    // everything the kickoff feeds on (camera, cache walk, classify,
+                    // visible set) and — when the latch is up — vacated the IPC channel
+                    // (statics cull gated off, grass culled pre-kickoff). The paired
+                    // Finish stays at the EndScene(0) composite point (UI constraint).
+                    // Latch false (interiors, menus, F11/F7-off, fused mode, warm-up
+                    // frame) → the late kickoff at EndScene(0) runs instead.
+                    if (DistantLand::earlyForgeKickoff) {
+                        RenderProcess::onStage0CompositeKickoff(realDevice);
+                    }
                 }
 
                 // Open the MW sky zone *after* frameSetupEarly so it brackets only
@@ -720,10 +733,30 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
             //   2. onStage0Composite — drive the host + alpha-blend the Forge colour over the
             //      sky/distant-land already on the backbuffer (self-gates on F11; also flushes
             //      geometry independent of the toggle).
-            if (RenderProcess::ownsOpaqueWorld()) {
-                DistantLand::renderCacheDepthToMainZ();
+            //
+            // Async split (UseAsyncHostFrame): kick the host off FIRST so its D3D12 frame
+            // overlaps client work, then wait+composite. Phase 2: when the early kickoff
+            // already fired at BeginScene(0) (DistantLand::earlyForgeKickoff — the host has
+            // been rendering under ALL of scene 0), skip the late kickoff and only Finish
+            // here. Otherwise (interiors, menus, warm-up, F11/F7-off) kick late — Phase 1
+            // behaviour, window = the cache-depth replay below. The window between Kickoff
+            // and Finish must stay IPC-free on both channels — renderCacheDepthToMainZ is
+            // pure client-side D3D9 (verified: no ipcClient traffic). Fused mode keeps the
+            // exact pre-split order for a deterministic A/B.
+            if (Configuration.UseAsyncHostFrame) {
+                if (!RenderProcess::kickoffPending()) {
+                    RenderProcess::onStage0CompositeKickoff(realDevice);
+                }
+                if (RenderProcess::ownsOpaqueWorld()) {
+                    DistantLand::renderCacheDepthToMainZ();
+                }
+                RenderProcess::onStage0CompositeFinish(realDevice);
+            } else {
+                if (RenderProcess::ownsOpaqueWorld()) {
+                    DistantLand::renderCacheDepthToMainZ();
+                }
+                RenderProcess::onStage0Composite(realDevice);
             }
-            RenderProcess::onStage0Composite(realDevice);
         } else if (!isFrameComplete) {
             // Everything else except UI
             DistantLand::renderStage2();
@@ -834,7 +867,12 @@ HRESULT _stdcall MGEProxyDevice::SetRenderState(D3DRENDERSTATETYPE a, DWORD b) {
     if (a == D3DRS_FOGVERTEXMODE || a == D3DRS_FOGTABLEMODE) {
         return D3D_OK;
     }
-    if ((Configuration.MGEFlags & USE_DISTANT_LAND) && (a == D3DRS_FOGSTART || a == D3DRS_FOGEND)) {
+    // Drop MW's own fog ranges when MGE owns fog: with DL on (adjustFog sets DL-scale fog),
+    // and equally when the Forge seam owns the frame with DL OFF — adjustFog then forces the
+    // same DL-scale fog (forgeFog) so the horizon matches the host's DL.DrawDist-cell render,
+    // and MW's per-frame vanilla-range sets would fight it right back to the short fog wall.
+    if (((Configuration.MGEFlags & USE_DISTANT_LAND) || RenderProcess::ownsDistantLand())
+        && (a == D3DRS_FOGSTART || a == D3DRS_FOGEND)) {
         return D3D_OK;
     }
     if (a == D3DRS_STENCILENABLE) {

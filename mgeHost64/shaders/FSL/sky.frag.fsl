@@ -22,6 +22,7 @@ STRUCT(VSOutput)
     DATA(FLAT(float3),MatDiffuse, TEXCOORD2);
     DATA(FLAT(uint),  VColSource, TEXCOORD3);
     DATA(FLAT(float), MatAlpha,   TEXCOORD4);
+    DATA(float3,      WorldDir,  TEXCOORD5);   // C4: camera-relative world dir (dome gradient)
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -29,9 +30,21 @@ float4 PS_MAIN( VSOutput In )
 {
     INIT_MAIN;
     float4 tex = SampleTex2D(gTextures[In.TexIndex], gSamplerAnisotropic, In.Uv);
-    // vColSource != 0 → a VertexColorProperty drives this shape (dome gradient, star mask):
-    // modulate by the per-vertex colour. Else use the constant material colour (moon disc/shadow).
-    float4 base = (In.VColSource != 0u) ? In.Color : float4(In.MatDiffuse, 1.0f);
+    // Base colour routing (mirrors opaque.frag's vColSource + the C4 host-gradient dome):
+    //   3 host-gradient dome: pure vertical gradient fogColNear(horizon)->skyZenith(zenith) computed
+    //     from the vertex world DIRECTION (MW Z-up). The dome's baked per-vertex colour is now
+    //     irrelevant (no longer re-uploaded per frame) — only the mesh shape matters. alpha = 1
+    //     (the atmosphere dome is the opaque sky backdrop).
+    //   1/2 (emissive/diffamb): a VertexColorProperty drives this shape (star mask) → per-vertex colour.
+    //   0 none: the constant material colour (moon disc/shadow).
+    float4 base;
+    if (In.VColSource == 3u) {
+        float3 dir = normalize(In.WorldDir);
+        float  t   = saturate(dir.z);
+        base = float4(lerp(gFrameData.fogColNear.rgb, gFrameData.skyZenith.rgb, t), 1.0f);
+    } else {
+        base = (In.VColSource != 0u) ? In.Color : float4(In.MatDiffuse, 1.0f);
+    }
     float4 c = tex * base;
     c.a *= In.MatAlpha;   // per-element weather/night fade (1 = no-op; dome unaffected)
     // SK2 dev "ownership tell": tint toward magenta by gFrameData.skyParams.x (dev-panel slider).

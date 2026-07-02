@@ -60,6 +60,18 @@ STRUCT(FrameData)
     // sky.frag reads these; every other pass ignores them (0 = no tint = clean A/B). 256B == min CBV.
     //   x = tint amount 0..1, y = host time (seconds, for the pulse), z = pulse flag (0/1), w unused.
     DATA(float4, skyParams,   None);
+    // Real water reflection (WV2): camera-relative below-water CLIP plane (nx,ny,nz,d) for the
+    // reflect-geo pass. distantland.vert/statics.vert emit SV_ClipDistance0 = dot(plane.xyz,worldPos)+plane.w
+    // so only ABOVE-water geometry reflects (seabed clipped). Pass-all (0,0,0,1) in every non-reflect
+    // cbuffer (Clip = 1 >= 0 → nothing clipped); the real plane lives ONLY in pReflectFrameCbvGeo.
+    // 272B struct → host frame cbuffers bumped to 512B (256B min CBV, 256B-aligned). Only these two
+    // verts read it; no frag change (SV_ClipDistance is a rasterizer system-value). 272B.
+    DATA(float4, gReflWaterClip, None);
+    // C2 host-computed sky dome: the current interpolated ZENITH sky colour (client ships MW's
+    // per-frame getCurrentWeatherSkyCol via lighting[28..31]). sky.frag's dome branch builds a
+    // vertical gradient fogColNear(horizon) -> skyZenith(zenith), so the atmosphere dome no longer
+    // needs its baked per-vertex gradient re-uploaded each frame. Only sky.frag reads it. 288B < 512B.
+    DATA(float4, skyZenith, None);
 };
 
 STRUCT(BatchData)
