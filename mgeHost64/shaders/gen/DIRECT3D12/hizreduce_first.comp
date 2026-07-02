@@ -958,127 +958,26 @@ SamplerState gSamplerAnisotropic : register( s10 , space100 ) ;
 #line 167 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 171 "FSL/shaders.list"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullscatter.comp.fsl"
-#line 13 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullscatter.comp.fsl"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cull.srt.h"
-#line 26 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cull.srt.h"
-STRUCT(CullInstance)
-{
-    float4 wr0;
-    float4 wr1;
-    float4 wr2;
-    float4 wr3;
-    float posX;
-    float posY;
-    float posZ;
-    float effR;
-    uint rangeEndIdx;
-    uint firstSubset;
-    uint numSubsets;
-    uint pad;
-#line 40
-};
-
-
-STRUCT(StaticsSubset)
-{
-    uint vbBase;
-    uint ibBase;
-    uint indexCount;
-    uint texSlot;
-    uint flags;
-#line 50
-};
-
-STRUCT(CullParams)
-{
-    float4 planes[6];
-    float4 eye;
-    float4 ranges;
-    float4 misc;
-#line 58
-};
-
-        CBUFFER(CullParams) gCullParams :  register(b0,space2);
-        Buffer(CullInstance) gCullInst :  register(t1,space2);
-        Buffer(StaticsSubset) gStaticsSubsets :  register(t2,space2);
-        RWBuffer(uint) gCullCount :  register(u3,space2);
-        RWBuffer(uint) gSubsetCount :  register(u4,space2);
-        RWBuffer(uint) gSubsetOffset :  register(u5,space2);
-        RWBuffer(uint) gSubsetCursor :  register(u6,space2);
-        RWBuffer(uint) gArgs :  register(u7,space2);
-        RWBuffer(uint) gInstOut :  register(u8,space2);
-#line 14 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullscatter.comp.fsl"
-
-
-
+#line 149 "FSL/shaders.list"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/hizreduce.comp.fsl"
+#line 22 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/hizreduce.comp.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/hizreduce.srt.h"
+#line 19 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/hizreduce.srt.h"
+        Tex2D(float) gHizLinDepth :  register(t0,space0);
+        RTex2D(float) gHizSrcMip :  register(u1,space0);
+        WTex2D(float) gHizDstMip :  register(u2,space0);
+#line 23 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/hizreduce.comp.fsl"
+#line 28 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/hizreduce.comp.fsl"
 [RootSignature( "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)" )]
-NUM_THREADS(64, 1, 1)
+NUM_THREADS(8, 8, 1)
 void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 {
     INIT_MAIN;
-    uint i = DispatchThreadID.x;
-    if (i >= (uint)gCullParams.misc.x)
-        return;
+    int2 p = int2(DispatchThreadID.xy);
 
-    CullInstance inst = gCullInst[i];
-    if (inst.rangeEndIdx == 0xFFFFFFFFu)
-        return;
-
-    float rangeEnd2 = (inst.rangeEndIdx == 0u) ? gCullParams.ranges.x
-                    : (inst.rangeEndIdx == 1u) ? gCullParams.ranges.y
-                                               : gCullParams.ranges.z;
-
-    float dx = inst.posX - gCullParams.eye.x;
-    float dy = inst.posY - gCullParams.eye.y;
-    float d2 = dx * dx + dy * dy;
-    if (d2 < gCullParams.ranges.w || d2 > rangeEnd2)
-        return;
-
-    float cz = inst.posZ - gCullParams.eye.z;
-    UNROLL
-    for (uint p = 0u; p < 6u; ++p)
-    {
-        float4 pl = gCullParams.planes[p];
-        float dist = pl.x * dx + pl.y * dy + pl.z * cz + pl.w;
-        if (dist < -inst.effR)
-            return;
-    }
-
-
-    float4 r0 = inst.wr0;
-    float4 r1 = inst.wr1;
-    float4 r2 = inst.wr2;
-    float4 r3 = inst.wr3;
-    r3.x -= gCullParams.eye.x;
-    r3.y -= gCullParams.eye.y;
-    r3.z -= gCullParams.eye.z;
-
-    for (uint k = 0u; k < inst.numSubsets; ++k)
-    {
-        uint sid = inst.firstSubset + k;
-        uint slot;
-        AtomicAdd(gSubsetCursor[sid], 1u, slot);
-        uint row = gSubsetOffset[sid] + slot;
-        if (row >=  65536u )
-            continue;
-
-        StaticsSubset s = gStaticsSubsets[sid];
-        uint b = row * 20u;
-        gInstOut[b + 0u] = asuint(r0.x); gInstOut[b + 1u] = asuint(r0.y);
-        gInstOut[b + 2u] = asuint(r0.z); gInstOut[b + 3u] = asuint(r0.w);
-        gInstOut[b + 4u] = asuint(r1.x); gInstOut[b + 5u] = asuint(r1.y);
-        gInstOut[b + 6u] = asuint(r1.z); gInstOut[b + 7u] = asuint(r1.w);
-        gInstOut[b + 8u] = asuint(r2.x); gInstOut[b + 9u] = asuint(r2.y);
-        gInstOut[b + 10u] = asuint(r2.z); gInstOut[b + 11u] = asuint(r2.w);
-        gInstOut[b + 12u] = asuint(r3.x); gInstOut[b + 13u] = asuint(r3.y);
-        gInstOut[b + 14u] = asuint(r3.z); gInstOut[b + 15u] = asuint(r3.w);
-        gInstOut[b + 16u] = asuint((float)s.texSlot);
-        gInstOut[b + 17u] = asuint((float)s.flags);
-        gInstOut[b + 18u] = asuint(0.0f);
-        gInstOut[b + 19u] = asuint(0.0f);
-    }
+    float d = LoadTex2D(gHizLinDepth, NO_SAMPLER, p, 0).r;
+#line 58 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/hizreduce.comp.fsl"
+    Write2D(gHizDstMip, p, d);
     return;
 }
-#line 172 "FSL/shaders.list"
+#line 150 "FSL/shaders.list"
