@@ -115,6 +115,24 @@ void DistantLand::frameSetupEarly() {
     earlyForgeKickoff = forgeEligibleNow && s_forgePrevEligible;
     s_forgePrevEligible = forgeEligibleNow;
 
+    // W1.5 active-cell gate for the GeomCache walk: when Forge owns the opaque world,
+    // every cache consumer (near draw lists, classify-driven visible set) is bounded
+    // by MW's own view distance — subtrees beyond it can never be drawn, so the walk
+    // skips them wholesale. Radius must reach the frustum's far CORNERS: the engine
+    // culls on view-z, so a corner object sits at viewDist * sqrt(1 + tanX² + tanY²)
+    // Euclidean from the eye (tan factors from the live projection — fov is moddable).
+    // Exterior only (interiors are one root, nothing to cut) and gated by
+    // ownsOpaqueWorld so legacy consumers that reach past the view distance (MGE
+    // shadows/reflections) are never starved. 0 disables the gate (full walk).
+    float cacheGateRadius = 0.0f;
+    if (Configuration.ForgeActiveCellWalk
+            && RenderProcess::ownsOpaqueWorld() && mwBridge->IsExterior()) {
+        const float tanX = (mwProj._11 != 0.0f) ? 1.0f / mwProj._11 : 1.0f;
+        const float tanY = (mwProj._22 != 0.0f) ? 1.0f / mwProj._22 : 1.0f;
+        cacheGateRadius = mwBridge->GetViewDistance()
+                        * sqrtf(1.0f + tanX * tanX + tanY * tanY) + 1024.0f;
+    }
+
     if (isDistantCell() && !mwBridge->IsMenu()) {
         // Kick the distant-statics cull FIRST — before the GeometryCache walk —
         // so the cull worker's IPC drain (the server-side quadtree cull, ~2.7ms
@@ -158,7 +176,8 @@ void DistantLand::frameSetupEarly() {
         // CONSUME (renderDepthFromCache) stays in renderDepth where the render
         // target/effect are bound. Touches no ipcClient, so it can run while the
         // worker drains the statics RPC on the single channel.
-        MGE::GeometryCache::onFrameReady(MGE::SceneGraph::getDataHandler());
+        MGE::GeometryCache::onFrameReady(MGE::SceneGraph::getDataHandler(),
+                                         &eyePos.x, cacheGateRadius);
         earlyWalkedCache = true;
 
         // Stage 2 early classify. Ask the plugin to run the engine's world-camera
@@ -223,7 +242,8 @@ void DistantLand::frameSetupEarly() {
         // renderDepth then skips its own copies. Non-latched frames keep the serial
         // renderDepth path untouched.
         if (earlyForgeKickoff) {
-            MGE::GeometryCache::onFrameReady(MGE::SceneGraph::getDataHandler());
+            MGE::GeometryCache::onFrameReady(MGE::SceneGraph::getDataHandler(),
+                                             &eyePos.x, cacheGateRadius);
             earlyWalkedCache = true;
             buildFrustumVisibleSet(&mwView, &mwProj);
         }
