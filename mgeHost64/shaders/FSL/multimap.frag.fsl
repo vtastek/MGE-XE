@@ -69,6 +69,8 @@ float4 PS_MAIN( VSOutput In )
 
             float3 toLight = posR.xyz - In.WorldPos;
             float  dist2   = dot(toLight, toLight);
+            // EXACT early-out at the smoothstep cutoff (att = 0 beyond 2r) — see opaque.frag.
+            if (dist2 >= 4.0f * radius * radius) { continue; }
             float  invDist = rsqrt(max(dist2, 1e-8f));
             float  dist    = dist2 * invDist;
 

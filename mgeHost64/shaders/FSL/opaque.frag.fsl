@@ -79,6 +79,11 @@ float4 PS_MAIN( VSOutput In )
 
             float3 toLight = posR.xyz - In.WorldPos;
             float  dist2   = dot(toLight, toLight);
+            // EXACT early-out: the soft cutoff below multiplies att by 0 at dist >= 2·radius
+            // (smoothstep ramp end), so pixels beyond it contribute nothing — skip the
+            // rsqrt/divide/smoothstep. Most pixels are beyond 2r of most of the ~128 scene
+            // lights, so this is the bulk of the loop. Byte-identical output.
+            if (dist2 >= 4.0f * radius * radius) { continue; }
             float  invDist = rsqrt(max(dist2, 1e-8f));
             float  dist    = dist2 * invDist;
 
