@@ -662,16 +662,18 @@ public:
     // the engine's exact drawn set (engine-set mode). worldCamera may be null (the
     // plugin resolves it). No-op if the plugin lacks the export or self-declines.
     static void earlyClassifyMainScene(void* worldCamera);
-    // The main-view MSOC visible set (s_prevVisibleKeys), keyed on
-    // NiTriBasedGeometry* == GeometryCache keys. No longer drives the cache
-    // depth/opaque paths (they consume the early frustum set, buildFrustumVisibleSet)
-    // — kept for the distant-statics path and as the foundation for Phase 3 (an
-    // early MGE-driven MSOC mask over the cache, replacing this lagged verdict).
-    static const std::unordered_set<uint32_t>& visibleCacheKeys();
     // The deterministic current-frame frustum-visible set (s_frustumVisibleKeys),
     // built by buildFrustumVisibleSet. The cache opaque color pass consumes it so it
     // stays in lockstep with the depth pre-pass (same set). Keys = GeometryCache keys.
     static const std::vector<uint32_t>& frustumVisibleKeys();
+    // Cut 2B fold: when this frame's buildFrustumVisibleSet DEFERRED its ensureLive
+    // loop into the kickoff draw-list build (Forge owns depth, no other consumer of
+    // s_frustumVisibleKeys), returns the raw classify-visible keys (s_visibleKeys) for
+    // buildGeometryDrawLists to iterate directly — ensureLive + emit in ONE pass.
+    // nullptr on non-fold frames (iterate frustumVisibleKeys() as before).
+    // CONSUME-ONCE: returns non-null at most once per latched frame (the classify
+    // pointers are only valid the frame they were latched).
+    static const std::vector<uint32_t>* foldVisibleKeys();
     // Diagnostic: count of cache entries the last buildFrustumVisibleSet dropped via
     // MSOC occlusion refinement (0 when disarmed). For the LogDistantPipeline line.
     static unsigned lastRefineCulled();
