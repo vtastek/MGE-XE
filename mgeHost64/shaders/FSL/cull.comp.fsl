@@ -3,6 +3,9 @@
 // Direct port of dlLiveCullAndBuild's PER-INSTANCE rule (forgerender.cpp): tier range² + near cutoff
 // + Gribb-Hartmann frustum-sphere test, in camera-relative space. Every surviving instance:
 //   - AtomicAdd(gCullCount[0], numSubsets)  — kept for the post-fence CPU-parity check (== 13,611).
+//     gCullCount[0] counts FRUSTUM survivors (PRE-occlusion) so the heartbeat MATCH-vs-CPU stays
+//     meaningful; Hi-Z-occluded instances then add numSubsets to gCullCount[1] (hizOccl readback)
+//     and skip the gSubsetCount adds — they draw nothing.
 //   - AtomicAdd(gSubsetCount[firstSubset+k], 1) for each of its subsets — the per-subset survivor
 //     count the prefix-sum (cullscan) turns into per-subset instance offsets + indirect args.
 //
@@ -10,6 +13,7 @@
 // cullscatter.comp re-runs this EXACT test; the two MUST agree (same CullParams, no data races).
 
 #include "cull.srt.h"
+#include "hizocclusion.h.fsl"
 
 ROOT_SIGNATURE(ComputeRootSignature)
 NUM_THREADS(64, 1, 1)
@@ -52,6 +56,17 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
 
     uint orig;
     AtomicAdd(gCullCount[0], inst.numSubsets, orig);
+
+    // Occlusion M2: frustum survivor vs the PREVIOUS frame's Hi-Z pyramid (hizEyeDelta rebases
+    // this frame's camera-relative center into the pyramid camera's space). Occluded -> counted
+    // in gCullCount[1] for the heartbeat, contributes NO subsets (cullscatter skips it too).
+    if (hizOccluded(float3(dx, dy, cz) + gCullParams.hizEyeDelta.xyz, inst.effR))
+    {
+        uint occ;
+        AtomicAdd(gCullCount[1], inst.numSubsets, occ);
+        RETURN();
+    }
+
     for (uint k = 0u; k < inst.numSubsets; ++k)
     {
         uint sid = inst.firstSubset + k;

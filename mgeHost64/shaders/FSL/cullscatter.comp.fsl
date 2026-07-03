@@ -11,6 +11,7 @@
 // the same 16 floats then subtracts eye), so no matrix decode. Draw = cmdExecuteIndirect over gArgs.
 
 #include "cull.srt.h"
+#include "hizocclusion.h.fsl"
 
 #define kMaxInst 65536u
 
@@ -46,6 +47,11 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         if (dist < -inst.effR)
             RETURN();
     }
+
+    // Occlusion M2: identical test to cull.comp (same inputs/code -> bit-for-bit agreement with
+    // the counts the prefix-sum sized the runs from). Occluded -> no scatter.
+    if (hizOccluded(float3(dx, dy, cz) + gCullParams.hizEyeDelta.xyz, inst.effR))
+        RETURN();
 
     // Camera-relative world rows (translation shifted by -eye; the only per-frame change).
     float4 r0 = inst.wr0;

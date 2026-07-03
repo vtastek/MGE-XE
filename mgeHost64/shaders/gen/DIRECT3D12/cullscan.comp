@@ -923,8 +923,8 @@ inline int2 GetDimensions(TextureCube t, SamplerState smp) { return GetDimension
 
 #endif // _D3D_H
 
-#line 1 "FSL/shaders.list"
-#line 10 "FSL/shaders.list"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shaders.list"
+#line 10 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 #line 25 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fsl_srt.h"
@@ -957,8 +957,8 @@ SamplerState gSamplerTrilinearBorder : register( s9 , space100 ) ;
 SamplerState gSamplerAnisotropic : register( s10 , space100 ) ;
 #line 167 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
-#line 11 "FSL/shaders.list"
-#line 166 "FSL/shaders.list"
+#line 11 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shaders.list"
+#line 175 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullscan.comp.fsl"
 #line 14 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullscan.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cull.srt.h"
@@ -997,7 +997,14 @@ STRUCT(CullParams)
     float4 eye;
     float4 ranges;
     float4 misc;
-#line 58
+
+
+
+
+    float4x4 hizVP;
+    float4 hizParams;
+    float4 hizEyeDelta;
+#line 65
 };
 
         CBUFFER(CullParams) gCullParams :  register(b0,space2);
@@ -1009,6 +1016,8 @@ STRUCT(CullParams)
         RWBuffer(uint) gSubsetCursor :  register(u6,space2);
         RWBuffer(uint) gArgs :  register(u7,space2);
         RWBuffer(uint) gInstOut :  register(u8,space2);
+        Tex2D(float) gCullHiz :  register(t9,space2);
+
 #line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullscan.comp.fsl"
 
 
@@ -1076,4 +1085,4 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     }
     return;
 }
-#line 167 "FSL/shaders.list"
+#line 176 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shaders.list"
