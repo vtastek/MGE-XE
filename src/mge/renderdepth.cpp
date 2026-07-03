@@ -18,20 +18,21 @@
 #include <unordered_set>
 #include <vector>
 
-// MSOC-culled visible set received from the VisibleGeomCallback.
-// s_visibleKeys: current frame (being built by callback).
-// s_prevVisibleKeys: previous frame (ready at renderDepth time).
-// Both keyed on NiTriBasedGeometry* cast to uint32_t — matches GeometryCache keys.
+// MSOC-culled visible set received from the VisibleGeomCallback, current frame.
+// Keys = NiTriBasedGeometry* cast to uint32_t — matches GeometryCache keys.
 // updateVisibleSet (the only writer) runs on the MAIN thread — msoc.dll fires the
 // callback from inside the engine's drainPendingDisplays — so a main-thread
 // snapshot at kick cannot race it.
 //
-// NOTE: as of the early-deterministic-cull work these no longer drive the cache
-// depth/opaque paths (those consume s_frustumVisibleKeys, built this frame). Kept
-// because the lagged engine-MSOC verdict still feeds the distant-statics path and
-// is the foundation for Phase 3 (an early MGE-driven MSOC mask over the cache).
-static std::unordered_set<uint32_t> s_visibleKeys;
-static std::unordered_set<uint32_t> s_prevVisibleKeys;
+// A plain VECTOR, not a set: every consumer only ITERATES it (buildFrustumVisibleSet
+// MSOC branch, the Cut 2B fold loop) — nothing does membership lookups — and the
+// callback fires INSIDE the synchronous classify call, so the old per-key
+// unordered_set insert (~3.5k hashes) billed straight to the [classify] serial
+// block. assign() is a flat copy. The plugin defers each leaf exactly once per
+// scene, so the set's de-dup was doing nothing (wire counts verify).
+// (The previous-frame copy, s_prevVisibleKeys/visibleCacheKeys, had NO consumers
+// left — removed with the vector change.)
+static std::vector<uint32_t> s_visibleKeys;
 
 // Deterministic, current-frame frustum-culled visible set over the full cacheMap,
 // built in the early stage (frameSetupEarly, after the cache walk) by
@@ -64,12 +65,19 @@ static unsigned     s_refineCulledCount = 0;
 static bool         s_visibleCallbackFired = false;
 static bool         s_earlyClassifyRan     = false;
 
+// Cut 2B fold latch: this frame's buildFrustumVisibleSet took the MSOC branch but
+// DEFERRED its ensureLive loop into the kickoff draw-list build (see the fold gate
+// in buildFrustumVisibleSet). Set there; consumed by foldVisibleKeys() (once) and
+// reset at the top of the next buildFrustumVisibleSet call. A kickoff early-out
+// wastes it harmlessly (in fold mode nothing else consumes the visible set).
+static bool         s_foldDeferred         = false;
+
 void DistantLand::updateVisibleSet(void* const* shapes, int count) {
-    s_prevVisibleKeys = std::move(s_visibleKeys);
-    s_visibleKeys.clear();
-    s_visibleKeys.reserve(count);
-    for (int i = 0; i < count; ++i)
-        s_visibleKeys.insert(reinterpret_cast<uint32_t>(shapes[i]));
+    // x86: void* is 4 bytes, so the plugin's pointer array reinterprets directly as
+    // the key array — one flat assign, no per-key hashing (see s_visibleKeys above).
+    static_assert(sizeof(void*) == sizeof(uint32_t), "key = pointer bits");
+    const uint32_t* keys = reinterpret_cast<const uint32_t*>(shapes);
+    s_visibleKeys.assign(keys, keys + count);
     s_visibleCallbackFired = true;
 }
 
@@ -132,12 +140,19 @@ void DistantLand::earlyClassifyMainScene(void* worldCamera) {
     }
 }
 
-const std::unordered_set<uint32_t>& DistantLand::visibleCacheKeys() {
-    return s_prevVisibleKeys;
-}
-
 const std::vector<uint32_t>& DistantLand::frustumVisibleKeys() {
     return s_frustumVisibleKeys;
+}
+
+const std::vector<uint32_t>* DistantLand::foldVisibleKeys() {
+    // Consume-once: the latch pairs ONE buildFrustumVisibleSet (which latched it,
+    // classify keys valid THIS frame) with ONE kickoff draw-list build. Without the
+    // consume, a frame where buildFrustumVisibleSet is skipped but the kickoff still
+    // runs (menus) would re-serve last frame's classify set — dangling NiTriShape
+    // pointers under ensureLive.
+    if (!s_foldDeferred) return nullptr;
+    s_foldDeferred = false;
+    return &s_visibleKeys;
 }
 
 unsigned DistantLand::lastRefineCulled() {
@@ -166,6 +181,7 @@ unsigned DistantLand::lastRefineCulled() {
 // drawn and would trip the bound helper (div-by-zero / pts[] overrun); see cachebounds.h.
 void DistantLand::buildFrustumVisibleSet(const D3DXMATRIX* view, const D3DXMATRIX* proj) {
     MGE_ZoneScopedN("buildFrustumVisibleSet");
+    s_foldDeferred = false;   // one-frame latch (Cut 2B fold)
     s_frustumVisibleKeys.clear();
     s_refineCulledCount = 0;
 
@@ -180,6 +196,26 @@ void DistantLand::buildFrustumVisibleSet(const D3DXMATRIX* view, const D3DXMATRI
     // MSOC-culled mode: the engine's authoritative current-frame drawn set.
     if (Configuration.UseOcclusionCulling && s_earlyClassifyRan) {
         s_earlyClassifyRan = false;   // one frame only
+
+        // Cut 2B fold: in the Forge baseline (F11 composite + F7 water, no render
+        // thread, near-depth replay off) NOTHING else consumes s_frustumVisibleKeys —
+        // the near depth draws are skipped (forgeOwnsDepth), the render-thread
+        // snapshot is off, and the legacy cache color/shadow paths only run without
+        // Forge ownership. So don't run the ensureLive loop here and copy survivors,
+        // only for buildGeometryDrawLists to re-hash the same keys at kickoff: DEFER —
+        // hand the raw classify set across (foldVisibleKeys) and let the kickoff build
+        // do ensureLive + emit in ONE pass. s_frustumVisibleKeys stays EMPTY on fold
+        // frames (cleared above; nothing may consume it stale). The VISKEYS /
+        // refineCulled diagnostics simply don't update on fold frames.
+        const bool fold = Configuration.ForgeLiveDrawBuild
+            && RenderProcess::ownsOpaqueWorld() && RenderProcess::wantsWaterCapture()  // == forgeOwnsDepth
+            && !Configuration.UseRenderThread
+            && !Configuration.ForgeNearDepthReplay;
+        if (fold) {
+            s_foldDeferred = true;
+            return;
+        }
+
         s_frustumVisibleKeys.reserve(s_visibleKeys.size() + 16);
         // Iterate the DRAWN set and probe the cache — not the whole cache probing the
         // drawn set. The drawn set (~3-4k) is a fraction of the cache (~10k+ across

@@ -1070,11 +1070,17 @@ namespace {
         drawCount = 0;
         skinnedCount = 0;
         multiMapCount = 0;
+        // Cut 2B fold: on fold frames buildFrustumVisibleSet deferred its ensureLive
+        // loop here (foldVisibleKeys = the raw classify set) instead of running it AND
+        // having this function re-hash the same keys — ONE pass does live-freshen +
+        // emit. Non-fold frames iterate frustumVisibleKeys exactly as before (entries
+        // already freshened by buildFrustumVisibleSet or the full walk).
+        const auto* foldKeys = DistantLand::foldVisibleKeys();
         const auto& keys = DistantLand::frustumVisibleKeys();
         const auto& cacheMap = MGE::GeometryCache::cache();
 
         g_drawScratch.clear();
-        g_drawScratch.reserve(keys.size() * sizeof(IPC::DrawItemWire));
+        g_drawScratch.reserve((foldKeys ? foldKeys->size() : keys.size()) * sizeof(IPC::DrawItemWire));
         g_skinnedScratch.clear();
         g_multiMapScratch.clear();
 
@@ -1082,6 +1088,43 @@ namespace {
         const bool wantSkinned = (bool)g_skinnedVec;
         const bool wantMM      = (bool)g_multiMapVec;
         if (!wantStatic && !wantSkinned && !wantMM) {
+            return;
+        }
+
+        // Per-entry dispatch, identical on both paths (see the filter contract above).
+        // slot is mutable — the emit helpers update its cached texture SlotInfo.
+        auto dispatch = [&](auto& slot, const auto& e) {
+            if (e.isSky) return;   // sky rides the Forge alpha-blend sky pass (buildSkyDrawList)
+            if (e.isSkinned) {
+                if (wantSkinned) emitSkinnedDraw(slot, e, skinnedCount);
+                return;
+            }
+            if (!e.d3dTexture) return;
+            if (!e.isLandscape && e.blendEnable) return;
+            if (!e.isLandscape && (e.d3dDark || e.d3dDetail || e.d3dGlow)) {
+                if (wantMM) emitMultiMapDraw(slot, e, multiMapCount);
+            } else if (wantStatic) {
+                emitStaticDraw(slot, e, drawCount);
+            }
+        };
+
+        if (foldKeys) {
+            for (std::uint32_t key : *foldKeys) {
+                // Freshen (or lazily capture) straight off the live NiTriShape — a
+                // classify key is engine-drawn THIS frame, so the pointer is valid by
+                // construction. MUST run before the g_keySlot probe: a first-sight key
+                // has no slot until ensureLive's capture registers it (same frame).
+                const auto* e = MGE::GeometryCache::ensureLive(key);
+                if (!e) continue;                     // no model data / capture failed
+                // The unusable-skinned filter buildFrustumVisibleSet applies on
+                // non-fold frames (never drawn; trips the bound helper).
+                if (e->isSkinned && (e->skinnedUnsupported || e->numBones == 0)) continue;
+                auto ks = g_keySlot.find(key);
+                if (ks == g_keySlot.end()) {
+                    continue;   // not an uploaded part (or not yet shipped)
+                }
+                dispatch(ks->second, *e);
+            }
             return;
         }
 
@@ -1094,19 +1137,7 @@ namespace {
             if (ce == cacheMap.end()) {
                 continue;   // evicted since the visible-set build
             }
-            const auto& e = ce->second;
-            if (e.isSky) continue;   // sky rides the Forge alpha-blend sky pass (buildSkyDrawList)
-            if (e.isSkinned) {
-                if (wantSkinned) emitSkinnedDraw(ks->second, e, skinnedCount);
-                continue;
-            }
-            if (!e.d3dTexture) continue;
-            if (!e.isLandscape && e.blendEnable) continue;
-            if (!e.isLandscape && (e.d3dDark || e.d3dDetail || e.d3dGlow)) {
-                if (wantMM) emitMultiMapDraw(ks->second, e, multiMapCount);
-            } else if (wantStatic) {
-                emitStaticDraw(ks->second, e, drawCount);
-            }
+            dispatch(ks->second, ce->second);
         }
     }
 
@@ -1127,14 +1158,33 @@ namespace {
         MGE::SceneGraph::SnapshotReadLock lk;
         const auto& lights = MGE::SceneGraph::pointLights();
 
+        // Frustum cull (host GPU shrink): only the NEAR scene consumes point lights
+        // (opaque.frag/multimap.frag loop them; statics/distantland don't), and a light's
+        // contribution is EXACTLY zero beyond 2·radius (the shader's smoothstep cutoff).
+        // So a light whose 2r sphere misses the game frustum can't touch any lit pixel —
+        // drop it before it costs every pixel a loop iteration. This also makes the
+        // kMaxPointLights cap meaningful: cull first, THEN cap, so a dense cell keeps the
+        // lights that can actually show (was: arbitrary first-128 of the snapshot order).
+        D3DXMATRIX lightVP;
+        D3DXMatrixMultiply(&lightVP, &DistantLand::mwView, &DistantLand::mwProj);
+        const ViewFrustum lightFrustum(&lightVP);
+
         g_lightScratch.clear();
         std::uint32_t count = 0;
+        std::uint32_t culled = 0;
         for (const auto& pl : lights) {
+            BoundingSphere ls;
+            ls.center = D3DXVECTOR3(pl.worldPos[0], pl.worldPos[1], pl.worldPos[2]);
+            ls.radius = 2.0f * pl.radius;
+            if (lightFrustum.ContainsSphere(ls) == ViewFrustum::OUTSIDE) {
+                ++culled;
+                continue;
+            }
             if (count >= IPC::kMaxPointLights) {
                 static bool logged = false;
                 if (!logged) {
-                    LOG::logline("!! [light] %zu point lights this frame > cap %u — extra dropped (Tier 3b clustering lifts this)",
-                                 lights.size(), IPC::kMaxPointLights);
+                    LOG::logline("!! [light] %zu in-frustum point lights this frame > cap %u — extra dropped (Tier 3b clustering lifts this)",
+                                 lights.size() - culled, IPC::kMaxPointLights);
                     logged = true;
                 }
                 break;
@@ -1298,7 +1348,7 @@ namespace RenderProcess {
         if (!device || !g_initOk) {
             return;
         }
-        // Client-side Forge driving phase, kickoff half: geom flush → build draw lists → tex
+        // Client-side Forge driving phase, kickoff half: build draw lists → geom flush → tex
         // flush → start the host RenderFrame WITHOUT waiting. The host renders frame N while
         // MW's own frame-N work continues; onStage0CompositeFinish drains the completion and
         // composites. Zoned so the Tracy frame has NO unaccounted gap here.
@@ -1308,24 +1358,16 @@ namespace RenderProcess {
         const double dtPresent = (g_lastPresentMs > 0.0) ? (tStart - g_lastPresentMs) : 0.0;
         g_lastPresentMs = tStart;
 
-        // Ship any geometry the cache captured this frame (independent of the F11
-        // composite toggle, so the host's mesh store is ready when we turn it on).
-        const std::uint32_t geomParts = g_pendingParts;            // snapshot (flush clears it)
-        const std::size_t   geomBytes = g_pendingBlob.size();
-        {
-            // The ~1ms "beginning gap" before the build-lists zone: shipping this frame's captured
-            // geometry over IPC (the cache walk's output). Cheap on steady frames (geom+=0KB), spikes
-            // on cell loads. Goes to ~0 with Phase 2 (resident GPU geometry — nothing to ship).
-            MGE_ZoneScopedN("Forge geom flush");
-            flushGeometry();
-        }
-        const double tGeomFlush = nowMs();
-
         // (Edge-triggered dev-key polls — F11/F12/F9/F7/F8 — moved to
         // onStage0CompositeFinish so every per-frame ownership gate, including the
         // frameSetupEarly early-kickoff latch that runs BEFORE this function, sees
         // one consistent value per frame. See the comment there.)
         if (!g_enabled) {
+            // Still ship any geometry the cache captured this frame (walk-driven while
+            // the composite is off), so the host's mesh store is ready when F11 turns
+            // it on.
+            MGE_ZoneScopedN("Forge geom flush");
+            flushGeometry();
             return;
         }
 
@@ -1346,6 +1388,20 @@ namespace RenderProcess {
             skyCount = buildSkyDrawList();
         }
         const double tBuild = nowMs();
+
+        // Ship this frame's captured geometry AFTER the build (Cut 2B): on fold frames
+        // first-sight parts are captured DURING buildGeometryDrawLists (ensureLive lazy
+        // capture), and the host must have the mesh bytes before the RenderFrame RPC
+        // draws them — same reason textures flush after the build. Cheap on steady
+        // frames (geom+=0KB), spikes on cell loads; goes to ~0 with Phase 2 (resident
+        // GPU geometry — nothing to ship).
+        const std::uint32_t geomParts = g_pendingParts;            // snapshot (flush clears it)
+        const std::size_t   geomBytes = g_pendingBlob.size();
+        {
+            MGE_ZoneScopedN("Forge geom flush");
+            flushGeometry();
+        }
+        const double tGeomFlush = nowMs();
 
         // Ship any textures newly referenced this frame BEFORE the scene draw that uses them
         // (buildDrawList queued their DDS via resolveTextureSlot). Lazy: only first-seen textures.
@@ -1397,9 +1453,12 @@ namespace RenderProcess {
         // walks its scene-graph cache to rebuild the host's draw lists + uploads geom/tex over IPC.
         // This is exactly the dependence to drive toward 0 — a resident flat GPU scene (Phase 2) lets
         // the host keep geometry across frames and the GPU cull build draw lists, removing both.
-        MGE_TracyPlot("Forge prep: geomFlush ms", tGeomFlush - tStart);
-        MGE_TracyPlot("Forge prep: buildLists ms", tBuild - tGeomFlush);
-        MGE_TracyPlot("Forge prep: texFlush ms", tTexFlush - tBuild);
+        // Cut 2B bucket order: build runs FIRST now (geom flush moved after it), and on
+        // fold frames the build bucket includes the ensureLive cost that used to bill
+        // to buildFrustumVisibleSet (cross-run comparison caveat).
+        MGE_TracyPlot("Forge prep: buildLists ms", tBuild - tStart);
+        MGE_TracyPlot("Forge prep: geomFlush ms", tGeomFlush - tBuild);
+        MGE_TracyPlot("Forge prep: texFlush ms", tTexFlush - tGeomFlush);
         MGE_TracyPlot("Forge prep: assign ms", tAssign - tTexFlush);
 
         // Only drive + composite the host when there's actual scene data this frame. With no
@@ -1752,8 +1811,9 @@ namespace RenderProcess {
         const double renderBucket = (g_kick.tKick - g_kick.tAssign) + (tRender - tWait0);
 
         // Baseline heartbeat over every composited frame (sees the <kSpikeMs majority).
-        g_hb.feed += feed; g_hb.geom += (g_kick.tGeomFlush - g_kick.tStart);
-        g_hb.build += (g_kick.tBuild - g_kick.tGeomFlush);
+        // Cut 2B: build first, then geom flush (fold frames capture during build).
+        g_hb.feed += feed; g_hb.geom += (g_kick.tGeomFlush - g_kick.tBuild);
+        g_hb.build += (g_kick.tBuild - g_kick.tStart);
         g_hb.render += renderBucket; g_hb.host += hostMs; g_hb.overlap += overlap;
         g_hb.copy += (tCopy - tRender); g_hb.blit += (tEnd - tCopy); g_hb.dt += g_kick.dtPresent;
         if (feed > g_hb.maxFeed) g_hb.maxFeed = feed;
@@ -1775,8 +1835,8 @@ namespace RenderProcess {
                          "assign=%.2f render=%.2f[host=%.2f] overlap=%.2f copy=%.2f blit=%.2f) "
                          "draws=%u skin=%u mm=%u light=%u geom+=%u/%uKB tex+=%u/%uKB dt=%.2fms",
                          g_kick.frame, feed,
-                         g_kick.tGeomFlush - g_kick.tStart, g_kick.tBuild - g_kick.tGeomFlush,
-                         g_kick.tTexFlush - g_kick.tBuild, g_kick.tAssign - g_kick.tTexFlush,
+                         g_kick.tGeomFlush - g_kick.tBuild, g_kick.tBuild - g_kick.tStart,
+                         g_kick.tTexFlush - g_kick.tGeomFlush, g_kick.tAssign - g_kick.tTexFlush,
                          renderBucket, hostMs, overlap, tCopy - tRender, tEnd - tCopy,
                          g_kick.drawCount, g_kick.skinnedCount, g_kick.multiMapCount, g_kick.lightCount,
                          g_kick.geomParts, (unsigned)(g_kick.geomBytes >> 10),
