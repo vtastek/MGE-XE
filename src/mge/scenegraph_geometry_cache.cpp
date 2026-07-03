@@ -15,7 +15,6 @@
 
 #include "configuration.h"
 #include "datahandler_view.h"
-#include "mwbridge.h"
 #include "mge_tracy.h"
 #include "proxydx/d3d8texture.h"
 #include "proxydx/devicelock.h"
@@ -1230,53 +1229,11 @@ namespace MGE::GeometryCache {
         // seam compositing). walk()'s getAppCulled() early-return gives free day/night/phase/
         // weather selection; captured shapes ride the same capture/IPC seam as opaques but are
         // tagged isSky → the Forge host's dedicated alpha-blend sky pass draws them.
-        //
-        // A1 engine-sky no-op: while the FULL Forge baseline owns the frame (composite +
-        // Forge water — the same forgeOwnsDepth family; F7-off must restore the engine sky
-        // because MGE's own water/reflection path renders it), set appCulled on skyRoot so
-        // the engine's scene-0 CullShow skips the whole sky subtree (traversal + state + the
-        // 2 sky DIPs — pure dead pixels under the composite). Weather SIMULATION is
-        // untouched (appCulled gates render traversal only). Our capture walk passes
-        // bypassCull for the ROOT, so Forge sky capture continues; children keep their real
-        // flags (day/night/moon-phase selection — the moons lesson: appCulled = phase, not
-        // frustum). The latch only restores a flag WE set: if the engine itself culled the
-        // root (it never does today), we neither latch nor clobber it on release. Re-asserted
-        // every frame while owned, cleared on the first non-owned onFrameReady (one-frame
-        // latency, same as every ownership gate).
-        {
-            // Precipitation guard: MW parents the rain/snow/storm particle emitters under
-            // skyRoot, and they are NiParticles — NOT NiTriBasedGeom, so the Forge sky
-            // capture never ships them. Suppressing the root in weathers 4-9
-            // (rain/thunder/ash/blight/snow/blizzard) would silently kill precipitation.
-            // Only suppress when BOTH current and next weather are particle-free (<= 3,
-            // clear/cloudy/foggy/overcast — transitions count as wet).
-            auto* mwBridge = MWBridge::get();
-            const bool dryWeather = mwBridge->CellHasWeather()
-                                 && (int)mwBridge->GetCurrentWeather() <= 3
-                                 && (int)mwBridge->GetNextWeather() <= 3;
-            const bool skySuppress = dryWeather
-                                  && RenderProcess::wantsSkyCapture()
-                                  && RenderProcess::wantsWaterCapture();
-            static bool s_engineSkySuppressed = false;
-            if (skySuppress || s_engineSkySuppressed) {
-                if (NI::Node* skyRoot = findSkyRoot(dataHandler)) {
-                    if (skySuppress) {
-                        if (!skyRoot->getAppCulled()) {
-                            skyRoot->setAppCulled(true);
-                            s_engineSkySuppressed = true;
-                        }
-                    } else {
-                        skyRoot->setAppCulled(false);
-                        s_engineSkySuppressed = false;
-                    }
-                }
-            }
-        }
         if (RenderProcess::wantsSkyCapture()) {
             MGE_ZoneScopedN("GeomCache:walkSky");
             g_walkingSky = true;
             g_skyVisitCounter = 0;   // SK2: restart back-to-front ordering each sky walk
-            walk(findSkyRoot(dataHandler), false, /*bypassCull=*/true);   // root only; children respect their flags
+            walk(findSkyRoot(dataHandler));
             g_walkingSky = false;
         }
         const double tSky = gcNowMs();
