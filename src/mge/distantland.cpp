@@ -132,6 +132,12 @@ void DistantLand::frameSetupEarly() {
         cacheGateRadius = mwBridge->GetViewDistance()
                         * sqrtf(1.0f + tanX * tanX + tanY * tanY) + 1024.0f;
     }
+    // W3 live-read at build: skip the refresh walk on Forge-owned frames — the
+    // classify-visible keys are freshened off their live NiTriShapes inside
+    // buildFrustumVisibleSet (ensureLive), with a full-walk fallback when no
+    // classify ran. Exteriors AND interiors (classify runs in both).
+    const bool liveDrawBuild =
+        Configuration.ForgeLiveDrawBuild && RenderProcess::ownsOpaqueWorld();
 
     if (isDistantCell() && !mwBridge->IsMenu()) {
         // Kick the distant-statics cull FIRST — before the GeometryCache walk —
@@ -177,7 +183,7 @@ void DistantLand::frameSetupEarly() {
         // target/effect are bound. Touches no ipcClient, so it can run while the
         // worker drains the statics RPC on the single channel.
         MGE::GeometryCache::onFrameReady(MGE::SceneGraph::getDataHandler(),
-                                         &eyePos.x, cacheGateRadius);
+                                         &eyePos.x, cacheGateRadius, liveDrawBuild);
         earlyWalkedCache = true;
 
         // Stage 2 early classify. Ask the plugin to run the engine's world-camera
@@ -243,7 +249,7 @@ void DistantLand::frameSetupEarly() {
         // renderDepth path untouched.
         if (earlyForgeKickoff) {
             MGE::GeometryCache::onFrameReady(MGE::SceneGraph::getDataHandler(),
-                                             &eyePos.x, cacheGateRadius);
+                                             &eyePos.x, cacheGateRadius, liveDrawBuild);
             earlyWalkedCache = true;
             buildFrustumVisibleSet(&mwView, &mwProj);
         }

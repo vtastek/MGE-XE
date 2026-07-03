@@ -167,7 +167,27 @@ namespace MGE::GeometryCache {
     // (or null eye) disables the gate — the full-walk behavior is unchanged. Skipped
     // entries go stale but are kept by the eviction sweep's hysteresis (see .cpp)
     // so returning to an area doesn't re-capture/re-upload it.
-    void onFrameReady(void* dataHandler, const float* gateEye = nullptr, float gateRadius = 0.0f);
+    // W3 live-read at build: when liveDrawBuild is true the per-frame refresh walk is
+    // SKIPPED — the classify-visible keys are freshened individually via ensureLive()
+    // in buildFrustumVisibleSet (lazy capture on first sight), and a frame with no
+    // classify result pulls the full walk in via ensureFullWalk(). Sky walk, eviction
+    // sweep (age-rule on live frames) and heartbeat still run here every frame.
+    void onFrameReady(void* dataHandler, const float* gateEye = nullptr, float gateRadius = 0.0f,
+                      bool liveDrawBuild = false);
+
+    // Refresh (or lazily capture) ONE entry straight off its live NiTriShape*. Only
+    // valid for keys the engine drew THIS frame (classify visible set) — that is what
+    // guarantees the pointer is alive. Refreshes exactly the per-frame-varying fields
+    // the draw paths read (worldTransformD3D, bonePalette, mirrored, lastFrame) plus
+    // the revision-gated re-upload; on a cache miss it captures with root-derived
+    // context (object/pick/landscape). Returns null if the shape has no model data or
+    // capture failed. A no-op lookup on entries the full walk already stamped.
+    const CachedGeometry* ensureLive(uint32_t key);
+
+    // Run the full refresh walk NOW if this frame hasn't run one — the fail-safe for
+    // live-draw-build frames where no classify result exists (the frustum fallback
+    // iterates the whole cache and needs current-frame freshness). Idempotent.
+    void ensureFullWalk();
 
     const std::unordered_map<uint32_t, CachedGeometry>& cache();
 

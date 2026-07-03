@@ -94,10 +94,22 @@ namespace MGE::GeometryCache {
         // entries untouched this long are evicted anyway (frees VBs of genuinely
         // unloaded far cells; they re-capture only if the area is ever revisited).
         constexpr uint64_t kFarKeepFrames = 600;
+        // W3 live-read at build: on Forge-owned frames the per-frame refresh walk is
+        // SKIPPED entirely — buildFrustumVisibleSet freshens exactly the classify-
+        // visible keys via ensureLive() (live NiTriShape reads + lazy capture on first
+        // sight) and calls ensureFullWalk() on frames with no classify. State below
+        // tracks whether the walk ran this frame (eviction rule + deferred walk) and
+        // the per-frame root pointers (capture context + deferred walk).
+        uint64_t  g_walkRanFrame = 0;      // frame stamp of the last full refresh walk
+        NI::Node* g_objRoot  = nullptr;
+        NI::Node* g_pickRoot = nullptr;
+        NI::Node* g_landRoot = nullptr;
+        uint32_t  g_liveRefreshThisFrame = 0;
+        uint32_t  g_liveCaptureThisFrame = 0;
         // Per-phase walk timing (QPC), logged every kGcHeartbeatFrames frames as
         // ">> [gc] ..." — the walk is on the dense-city serial chain, so its cost is
         // tracked with the same always-on heartbeat discipline as [hb]/[forge-hb].
-        struct GcAccum { double obj, pick, land, sky, evict, visited, gateSkip; uint64_t n; };
+        struct GcAccum { double obj, pick, land, sky, evict, visited, gateSkip, live, cap; uint64_t n; };
         GcAccum           g_gcAccum = {};
         constexpr uint64_t kGcHeartbeatFrames = 300;
         // Per-frame gate observability, accumulated into the [gc] heartbeat:
@@ -1140,15 +1152,56 @@ namespace MGE::GeometryCache {
         return 1000.0 * (double)c.QuadPart / (double)freq.QuadPart;
     }
 
-    void onFrameReady(void* dataHandler, const float* gateEye, float gateRadius) {
+    // The full per-frame refresh walk (objects + pick + landscape) over this frame's
+    // stored roots. On live-draw-build frames this is skipped in onFrameReady and only
+    // runs on demand (ensureFullWalk) when a frame has no classify result to drive
+    // ensureLive. Accumulates its own [gc] phase timings; stamps g_walkRanFrame.
+    static void runRefreshWalks() {
+        const double t0 = gcNowMs();
+        {
+            MGE_ZoneScopedN("GeomCache:walkObjects");
+            walk(g_objRoot);
+        }
+        const double tObj = gcNowMs();
+        {
+            MGE_ZoneScopedN("GeomCache:walkPickObjects");
+            g_walkingPick = true;
+            walk(g_pickRoot);
+            g_walkingPick = false;
+        }
+        const double tPick = gcNowMs();
+        {
+            MGE_ZoneScopedN("GeomCache:walkLandscape");
+            g_walkingLandscape = true;
+            walk(g_landRoot);
+            g_walkingLandscape = false;
+        }
+        g_gcAccum.obj  += tObj - t0;
+        g_gcAccum.pick += tPick - tObj;
+        g_gcAccum.land += gcNowMs() - tPick;
+        g_walkRanFrame = g_frame;
+    }
+
+    void onFrameReady(void* dataHandler, const float* gateEye, float gateRadius, bool liveDrawBuild) {
         if (!g_device || !dataHandler) return;
         if (!Configuration.UseSceneGraphSnapshot) return;
         MGE_ZoneScopedN("GeometryCache::onFrameReady");
 
         ++g_frame;
+        // Accumulate the PREVIOUS frame's per-frame counters and uploads before
+        // resetting: ensureLive runs AFTER onFrameReady returns (inside
+        // buildFrustumVisibleSet), so its counts/uploads finalize between calls.
+        // One frame of skew is irrelevant to a 300-frame average.
+        g_gcAccum.visited  += g_visitedThisFrame;
+        g_gcAccum.gateSkip += g_gateSkipsThisFrame;
+        g_gcAccum.live     += g_liveRefreshThisFrame;
+        g_gcAccum.cap      += g_liveCaptureThisFrame;
+        g_uploadedInterval += g_uploadedThisFrame;
         g_uploadedThisFrame = 0;
         g_visitedThisFrame = 0;
         g_gateSkipsThisFrame = 0;
+        g_liveRefreshThisFrame = 0;
+        g_liveCaptureThisFrame = 0;
         // Arm the active-cell gate for this walk; the eye/radius persist for the
         // eviction hysteresis even on later ungated frames (see declarations).
         g_gateThisFrame = (gateEye != nullptr && gateRadius > 0.0f);
@@ -1158,25 +1211,18 @@ namespace MGE::GeometryCache {
             g_gateEye[2] = gateEye[2];
             g_gateRadius = gateRadius;
         }
-        const double t0 = gcNowMs();
+        // Roots for this frame: the walks below, ensureFullWalk's deferred walk, and
+        // ensureLive's capture-context climb all key off these.
+        g_objRoot  = MGE::DataHandlerView::worldObjectRoot(dataHandler);
+        g_pickRoot = MGE::DataHandlerView::worldPickObjectRoot(dataHandler);
+        g_landRoot = MGE::DataHandlerView::worldLandscapeRoot(dataHandler);
 
-        {
-            MGE_ZoneScopedN("GeomCache:walkObjects");
-            walk(MGE::DataHandlerView::worldObjectRoot(dataHandler));
-        }
-        const double tObj = gcNowMs();
-        {
-            MGE_ZoneScopedN("GeomCache:walkPickObjects");
-            g_walkingPick = true;
-            walk(MGE::DataHandlerView::worldPickObjectRoot(dataHandler));
-            g_walkingPick = false;
-        }
-        const double tPick = gcNowMs();
-        {
-            MGE_ZoneScopedN("GeomCache:walkLandscape");
-            g_walkingLandscape = true;
-            walk(MGE::DataHandlerView::worldLandscapeRoot(dataHandler));
-            g_walkingLandscape = false;
+        // W3 live-read: on Forge-owned frames the refresh walk is dead work — the
+        // classify-visible keys are freshened one-by-one off their live NiTriShapes
+        // in buildFrustumVisibleSet (ensureLive), and a frame with no classify pulls
+        // the full walk in via ensureFullWalk. Sky/eviction/heartbeat still run here.
+        if (!liveDrawBuild) {
+            runRefreshWalks();
         }
         const double tLand = gcNowMs();
         // SK1 sky takeover: walk skyRoot only when the Forge sky pass is live (F7 toggle ON +
@@ -1215,23 +1261,33 @@ namespace MGE::GeometryCache {
         // staleness/pointer-recycle window to one sweep interval.
         if (g_frame % kEvictSweepInterval == 0) {
             MGE_ZoneScopedN("GeomCache:evict");
+            // Two eviction rules, selected by whether the full walk ran THIS frame:
+            //  - walk ran: stale == visitable but unvisited == genuinely gone. Evict,
+            //    except the active-cell hysteresis — a stale entry beyond the gate
+            //    radius was likely SKIPPED, not removed; keep it up to kFarKeepFrames
+            //    so a returning player doesn't pay re-capture/re-upload.
+            //  - live frame (walk skipped): only classify-VISIBLE entries got stamped,
+            //    so off-screen != gone — pure age rule (untouched > kFarKeepFrames).
+            //    Rotation churn is impossible: anything re-seen within that window is
+            //    still cached; beyond it, one lazy re-capture (no IPC geometry — the
+            //    capture-side dedup still knows the mesh).
+            const bool walkedThisFrame = (g_walkRanFrame == g_frame);
             const float evictR2 = g_gateRadius * g_gateRadius;
             for (auto it = g_cache.begin(); it != g_cache.end(); ) {
                 auto& e = it->second;
-                bool evict = (e.lastFrame != g_frame);
-                // Hysteresis (active-cell gate): a stale entry beyond the gate radius
-                // was likely SKIPPED, not removed — keep it up to kFarKeepFrames so a
-                // returning player doesn't pay re-capture/re-upload. Stale entries
-                // WITHIN the radius were visitable but unvisited => genuinely gone
-                // (their subtree would have been walked), evict as before. Uses the
-                // entry's world translation — coarse is fine at cell granularity.
-                if (evict && g_gateRadius > 0.0f && g_frame - e.lastFrame <= kFarKeepFrames) {
-                    const float dx = e.worldTransformD3D[12] - g_gateEye[0];
-                    const float dy = e.worldTransformD3D[13] - g_gateEye[1];
-                    const float dz = e.worldTransformD3D[14] - g_gateEye[2];
-                    if (dx * dx + dy * dy + dz * dz > evictR2) {
-                        evict = false;
+                bool evict;
+                if (walkedThisFrame) {
+                    evict = (e.lastFrame != g_frame);
+                    if (evict && g_gateRadius > 0.0f && g_frame - e.lastFrame <= kFarKeepFrames) {
+                        const float dx = e.worldTransformD3D[12] - g_gateEye[0];
+                        const float dy = e.worldTransformD3D[13] - g_gateEye[1];
+                        const float dz = e.worldTransformD3D[14] - g_gateEye[2];
+                        if (dx * dx + dy * dy + dz * dz > evictR2) {
+                            evict = false;
+                        }
                     }
+                } else {
+                    evict = (g_frame - e.lastFrame > kFarKeepFrames);
                 }
                 if (evict) {
                     releaseEntry(e);
@@ -1246,26 +1302,20 @@ namespace MGE::GeometryCache {
 
         // [gc] heartbeat: per-phase walk cost, averaged over the window. Always on —
         // this walk sits on the dense-city serial frame chain.
-        g_gcAccum.obj   += tObj - t0;
-        g_gcAccum.pick  += tPick - tObj;
-        g_gcAccum.land  += tLand - tPick;
         g_gcAccum.sky   += tSky - tLand;
         g_gcAccum.evict += tEvict - tSky;
-        g_gcAccum.visited  += g_visitedThisFrame;
-        g_gcAccum.gateSkip += g_gateSkipsThisFrame;
         if (++g_gcAccum.n >= kGcHeartbeatFrames) {
             const double n = (double)g_gcAccum.n;
-            LOG::logline(">> [gc] %llu frames avg: walk=%.2f (obj=%.2f pick=%.2f land=%.2f sky=%.2f evict=%.2f) entries=%zu visited=%.0f gateSkip=%.0f%s gateR=%.0f",
+            LOG::logline(">> [gc] %llu frames avg: walk=%.2f (obj=%.2f pick=%.2f land=%.2f sky=%.2f evict=%.2f) entries=%zu visited=%.0f gateSkip=%.0f live=%.0f cap=%.1f%s gateR=%.0f",
                          (unsigned long long)g_gcAccum.n,
                          (g_gcAccum.obj + g_gcAccum.pick + g_gcAccum.land + g_gcAccum.sky + g_gcAccum.evict) / n,
                          g_gcAccum.obj / n, g_gcAccum.pick / n, g_gcAccum.land / n,
                          g_gcAccum.sky / n, g_gcAccum.evict / n, g_cache.size(),
                          g_gcAccum.visited / n, g_gcAccum.gateSkip / n,
+                         g_gcAccum.live / n, g_gcAccum.cap / n,
                          g_gateThisFrame ? " gate=ON" : "", g_gateRadius);
             g_gcAccum = GcAccum{};
         }
-
-        g_uploadedInterval += g_uploadedThisFrame;
 
         if (Configuration.LogDistantPipeline) {
             static uint64_t s_lastLog = 0;
@@ -1280,8 +1330,9 @@ namespace MGE::GeometryCache {
                 const char* landTexA = nullptr; const char* landTexB = nullptr;
                 for (const auto& kv : g_cache) {
                     // Hysteresis-kept far entries may outlive their cell (NI string
-                    // pointers dangle after unload) — characterize live entries only.
-                    if (kv.second.lastFrame != g_frame) continue;
+                    // pointers dangle after unload) — characterize recent entries only.
+                    // (<=1: on live frames this frame's stamps happen after this dump.)
+                    if (g_frame - kv.second.lastFrame > 1) continue;
                     if (kv.second.isSkinned) ++skinnedCount;
                     if (kv.second.mirrored) ++mirroredCount;
                     if (kv.second.d3dTexture && kv.second.textureName) ++namedTexCount;
@@ -1322,6 +1373,94 @@ namespace MGE::GeometryCache {
 
     uint64_t currentFrame() {
         return g_frame;
+    }
+
+    const CachedGeometry* ensureLive(uint32_t key) {
+        if (!g_device) return nullptr;
+        auto* geom = reinterpret_cast<NI::TriBasedGeometry*>(key);
+
+        auto it = g_cache.find(key);
+        if (it != g_cache.end() && it->second.lastFrame == g_frame) {
+            return &it->second;     // already fresh (full walk ran, or a duplicate key)
+        }
+
+        auto* data = geom->getModelData().get();
+        if (!data) return nullptr;
+
+        if (it != g_cache.end() && it->second.dataPtr != data) {
+            // Recycled NiTriShape address — the entry describes a different mesh.
+            releaseEntry(it->second);
+            g_cache.erase(it);
+            it = g_cache.end();
+        }
+
+        if (it == g_cache.end()) {
+            // Lazy capture on first sight. Classify the leaf by climbing to its root so
+            // isPickRoot/isLandscape (and landscape's forced single-UV upload) come out
+            // exactly as the walk would have set them. The classify set covers the whole
+            // world-camera scene — leaves OUTSIDE the walk's three roots (engine water
+            // plane, shadow receivers, ...) were never cached by the walk and must not
+            // be captured here either.
+            bool isLand = false, isPick = false, inDomain = false;
+            for (NI::AVObject* a = geom->parentNode; a; a = a->parentNode) {
+                if (a == g_landRoot) { isLand = true; inDomain = true; break; }
+                if (a == g_pickRoot) { isPick = true; inDomain = true; break; }
+                if (a == g_objRoot)  { inDomain = true; break; }
+            }
+            if (!inDomain) return nullptr;
+            g_walkingLandscape = isLand;
+            g_walkingPick = isPick;
+            visitGeometry(geom, false);
+            g_walkingLandscape = false;
+            g_walkingPick = false;
+            ++g_liveCaptureThisFrame;
+            it = g_cache.find(key);
+            return (it != g_cache.end()) ? &it->second : nullptr;
+        }
+
+        // Refresh the per-frame-varying fields the draw paths read — transform, bone
+        // palette, mirrored — plus the revision-gated re-extract/re-upload. This is the
+        // walk's existing-entry path, run only for keys the engine actually drew.
+        auto& e = it->second;
+        e.lastFrame = g_frame;
+        ++g_liveRefreshThisFrame;
+
+        NI::SkinInstance* si = geom->skinInstance.get();
+        NI::SkinData*     sd = si ? si->skinData.get() : nullptr;
+        const bool sk = (si && sd && si->bones);
+        if (sk) {
+            if (data->revisionID != e.revisionID || !e.isSkinned) {
+                extractMaterial(e, geom);
+                buildSkinnedVB(e, geom, data, si, sd);
+            }
+            if (!e.skinnedUnsupported) buildBonePalette(e, geom, si, sd);
+            buildD3DTransform(e.worldTransformD3D, geom);
+            e.dynamicHint = 4;
+            e.mirrored = computeMirrored(e);
+        } else {
+            if (data->revisionID != e.revisionID || e.isSkinned) {
+                g_walkingLandscape = e.isLandscape;   // landscape re-upload keeps single-UV
+                extractMaterial(e, geom);
+                uploadEntry(e, geom, data, key);
+                g_walkingLandscape = false;
+            }
+            float newTransform[16];
+            buildD3DTransform(newTransform, geom);
+            if (memcmp(newTransform, e.worldTransformD3D, sizeof(newTransform)) != 0) {
+                memcpy(e.worldTransformD3D, newTransform, sizeof(newTransform));
+                e.dynamicHint = 4;
+                e.mirrored = computeMirrored(e);
+            } else if (e.dynamicHint > 0) {
+                --e.dynamicHint;
+            }
+        }
+        return &e;
+    }
+
+    void ensureFullWalk() {
+        if (g_walkRanFrame == g_frame) return;
+        if (!g_device || !g_objRoot) return;
+        runRefreshWalks();
     }
 
     int buildMoonDrawList(void* moonRoot, MoonShapeDraw out[2]) {
