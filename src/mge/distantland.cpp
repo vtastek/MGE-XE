@@ -1585,6 +1585,21 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
         }
     }
 
+    // AT1 sorted-alpha A/B + AT3 inventory: while the Forge alpha pass is live, MW's sorted-alpha
+    // draw is redundant — the host already drew the blended set (depth-correct, behind Forge
+    // walls). Reject BLENDED DIPs in any scene >= 1. NOT a bare sceneCount==1 gate: MW's scene
+    // indices are CONDITIONAL (see EndScene) — with no sorted alpha visible, scene 1 IS the
+    // 1st-person scene, and with stencil shadows the indices shift; a scene-index gate would eat
+    // the player's hands. Blended-only matches exactly what the sorter draws (No-Sorter blends
+    // went to scene 0; water never reaches here — the isWaterMaterial branch bypasses
+    // inspection). Placed AFTER the recordMW capture above so depth-replay records are
+    // untouched. Whatever still renders with this ON is the AT3 leftover set (particles/VFX —
+    // not NiTriShapes, not captured by the cache walk).
+    if (Configuration.ForgeAlphaPass && Configuration.ForgeAlphaSuppressS1
+        && sceneCount >= 1 && rs->blendEnable && RenderProcess::ownsOpaqueWorld()) {
+        return false;
+    }
+
     // Special case, capture sky
     if (recordMW.empty() && rs->blendEnable && sceneCount == 0 && mwBridge->CellHasWeather()) {
         recordSky.emplace_back(*rs);

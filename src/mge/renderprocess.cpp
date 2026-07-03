@@ -72,7 +72,7 @@ namespace {
         bool rpcPending;
         bool early;     // fired from the BeginScene(0) site (DistantLand::earlyForgeKickoff latch)
         unsigned frame;
-        std::uint32_t drawCount, skinnedCount, multiMapCount, lightCount, skyCount;
+        std::uint32_t drawCount, skinnedCount, multiMapCount, lightCount, skyCount, alphaCount;
         std::uint32_t geomParts, texCount;
         std::size_t geomBytes, texBytes;
         double dtPresent;
@@ -102,6 +102,7 @@ namespace {
     std::optional<IPC::VecView<IPC::GeomChunk>> g_multiMapVec;      // persistent per-frame multi-map draw-list vec (Tier 4)
     std::optional<IPC::VecView<IPC::GeomChunk>> g_lightVec;         // persistent per-frame point-light vec (Tier 3a)
     std::optional<IPC::VecView<IPC::GeomChunk>> g_skyVec;           // persistent per-frame sky draw-list vec (SK1)
+    std::optional<IPC::VecView<IPC::GeomChunk>> g_alphaVec;         // persistent per-frame sorted-alpha draw-list vec (AT1)
     std::vector<std::uint8_t>                 g_pendingBlob;        // packed parts awaiting flush
     std::uint32_t                             g_pendingParts = 0;
     // Cache key -> host slot, plus per-key cached bindless texture slots so the
@@ -138,6 +139,7 @@ namespace {
     std::vector<std::uint8_t>                 g_multiMapScratch;    // packed MultiMapDrawWire[] this frame (Tier 4)
     std::vector<std::uint8_t>                 g_lightScratch;       // packed PointLightWire[] this frame
     std::vector<std::uint8_t>                 g_skyScratch;         // packed SkyDrawWire[] this frame (SK1)
+    std::vector<std::uint8_t>                 g_alphaScratch;       // packed AlphaDrawWire[] this frame (AT1, back-to-front)
 
     // --- Phase 2 bindless texture residency (client) ---
     // Each unique texture (by normalized name) gets a dense bindless slot; its raw DDS bytes
@@ -660,6 +662,16 @@ namespace {
             g_skyVec.emplace(std::move(*kv));
         }
 
+        // Sorted-alpha draw list (AT1) rides its own 1-chunk vec — kMaxAlphaDraws * 128B = 128KB,
+        // well under 1MB. AlphaDrawWire[] back-to-front sorted, rebuilt each frame from the
+        // blendEnable cache entries the opaque lists skip.
+        auto av = g_client->allocVecBlocking<IPC::GeomChunk>(1, 1, 1);
+        if (!av) {
+            LOG::logline("!! [seam] alpha draw-list vec alloc failed — Forge alpha (AT1) disabled");
+        } else {
+            g_alphaVec.emplace(std::move(*av));
+        }
+
         // Texture upload vec: kTexChunks (32MB window) — larger than geometry because a single DDS
         // must fit one window (oversize textures are dropped to white in resolveTextureSlot).
         auto tv = g_client->allocVecBlocking<IPC::GeomChunk>(
@@ -669,7 +681,7 @@ namespace {
         } else {
             g_texVec.emplace(std::move(*tv));
         }
-        LOG::logline(">> [seam] scene vecs ready (geom %u, draw %u, skinned %u, multimap 1, light 1, tex %u chunks)",
+        LOG::logline(">> [seam] scene vecs ready (geom %u, draw %u, skinned %u, multimap 1, light 1, sky 1, alpha 1, tex %u chunks)",
                      IPC::kGeomChunks, kDrawChunks, kDrawChunks, IPC::kTexChunks);
     }
 
@@ -1038,6 +1050,35 @@ namespace {
             ++count;
     }
 
+    // AT1 sorted-alpha: emit one blended STATIC part into g_alphaScratch as an AlphaDrawWire.
+    // Called AFTER the visible-set loop in back-to-front order (the collect/sort lives in
+    // buildGeometryDrawLists), so the wire order IS the draw order — the host never re-sorts.
+    // Field packing mirrors emitStaticDraw (texture SlotInfo cache, material, vColSource,
+    // camera-relative world) plus the SkyDrawWire blend fields and the material alpha.
+    void emitAlphaDraw(SlotInfo& si, const MGE::GeometryCache::CachedGeometry& e,
+                       std::uint32_t& count) {
+            IPC::AlphaDrawWire item;
+            item.slot      = si.slot;
+            item.texIndex  = resolveCachedSlot(e.textureName, si.baseNamePtr, si.baseSlot, si.baseEpoch);
+            item.srcBlend  = e.srcBlend;
+            item.destBlend = e.destBlend;
+            item.alphaRef  = e.alphaTest ? e.alphaRef : 0.0f;
+            item.matDiffuse[0]  = e.matDiffuse[0];  item.matDiffuse[1]  = e.matDiffuse[1];  item.matDiffuse[2]  = e.matDiffuse[2];
+            item.matAlpha       = e.matDiffuse[3];   // MaterialProperty::alpha (the FFE per-draw fade)
+            item.matAmbient[0]  = e.matAmbient[0];  item.matAmbient[1]  = e.matAmbient[1];  item.matAmbient[2]  = e.matAmbient[2];
+            item.matEmissive[0] = e.matEmissive[0]; item.matEmissive[1] = e.matEmissive[1]; item.matEmissive[2] = e.matEmissive[2];
+            item.vColSource = (e.hasVertexColor && e.vColSource != 0) ? e.vColSource : 0u;
+            memcpy(item.world, e.worldTransformD3D, 16 * sizeof(float));
+            // CAMERA-RELATIVE: shift translation by -eye (see emitStaticDraw).
+            item.world[12] -= DistantLand::eyePos.x;
+            item.world[13] -= DistantLand::eyePos.y;
+            item.world[14] -= DistantLand::eyePos.z;
+            const std::size_t at = g_alphaScratch.size();
+            g_alphaScratch.resize(at + sizeof(item));
+            memcpy(g_alphaScratch.data() + at, &item, sizeof(item));
+            ++count;
+    }
+
     // Cut 2 (dense-city frame attack): ONE pass over the visible set builds all three
     // geometry draw lists. Previously three functions each re-iterated
     // frustumVisibleKeys with their own g_keySlot + cache-map finds — 3x the hash
@@ -1066,10 +1107,11 @@ namespace {
     //   - non-landscape parts with dark/detail/glow siblings → multi-map pipeline
     //     (stride-60 wide VB); everything else (terrain included) → static pipeline.
     void buildGeometryDrawLists(std::uint32_t& drawCount, std::uint32_t& skinnedCount,
-                                std::uint32_t& multiMapCount) {
+                                std::uint32_t& multiMapCount, std::uint32_t& alphaCount) {
         drawCount = 0;
         skinnedCount = 0;
         multiMapCount = 0;
+        alphaCount = 0;
         // Cut 2B fold: on fold frames buildFrustumVisibleSet deferred its ensureLive
         // loop here (foldVisibleKeys = the raw classify set) instead of running it AND
         // having this function re-hash the same keys — ONE pass does live-freshen +
@@ -1083,13 +1125,29 @@ namespace {
         g_drawScratch.reserve((foldKeys ? foldKeys->size() : keys.size()) * sizeof(IPC::DrawItemWire));
         g_skinnedScratch.clear();
         g_multiMapScratch.clear();
+        g_alphaScratch.clear();
 
         const bool wantStatic  = (bool)g_drawVec;
         const bool wantSkinned = (bool)g_skinnedVec;
         const bool wantMM      = (bool)g_multiMapVec;
-        if (!wantStatic && !wantSkinned && !wantMM) {
+        // AT1 sorted-alpha: gated by the bring-up ini flag on top of the vec (capture + emit +
+        // host draw all ride this one gate; off = the blended set stays engine-drawn as before).
+        const bool wantAlpha   = (bool)g_alphaVec && Configuration.ForgeAlphaPass;
+        if (!wantStatic && !wantSkinned && !wantMM && !wantAlpha) {
             return;
         }
+
+        // AT1 collect: blended shapes are gathered (not emitted) during the loop, then sorted
+        // back-to-front and packed AFTER it — MW's sorter criterion is bound-center view depth.
+        // Pointers into the two unordered_maps are element-stable across ensureLive inserts.
+        struct AlphaCand { float depth; SlotInfo* si; const MGE::GeometryCache::CachedGeometry* e; };
+        static std::vector<AlphaCand> alphaCands;   // single-threaded; reused frame-to-frame
+        alphaCands.clear();
+        // World-space view forward (mwView's 3rd column) for the depth key; eye-relative so the
+        // key is invariant to the camera-relative world shift emitAlphaDraw applies later.
+        const float fwdX = DistantLand::mwView._13;
+        const float fwdY = DistantLand::mwView._23;
+        const float fwdZ = DistantLand::mwView._33;
 
         // Per-entry dispatch, identical on both paths (see the filter contract above).
         // slot is mutable — the emit helpers update its cached texture SlotInfo.
@@ -1100,7 +1158,20 @@ namespace {
                 return;
             }
             if (!e.d3dTexture) return;
-            if (!e.isLandscape && e.blendEnable) return;
+            if (!e.isLandscape && e.blendEnable) {
+                // AT1: non-landscape blended shapes ride the host alpha pass (v1 = static
+                // single-map tri shapes only; multi-map blends keep today's behavior — skipped —
+                // and skinned blends were already routed to the skinned path above).
+                if (wantAlpha && !(e.d3dDark || e.d3dDetail || e.d3dGlow)) {
+                    const float* w = e.worldTransformD3D;
+                    const float cx = e.boundsCenter[0], cy = e.boundsCenter[1], cz = e.boundsCenter[2];
+                    const float wx = cx * w[0] + cy * w[4] + cz * w[8]  + w[12] - DistantLand::eyePos.x;
+                    const float wy = cx * w[1] + cy * w[5] + cz * w[9]  + w[13] - DistantLand::eyePos.y;
+                    const float wz = cx * w[2] + cy * w[6] + cz * w[10] + w[14] - DistantLand::eyePos.z;
+                    alphaCands.push_back({ wx * fwdX + wy * fwdY + wz * fwdZ, &slot, &e });
+                }
+                return;
+            }
             if (!e.isLandscape && (e.d3dDark || e.d3dDetail || e.d3dGlow)) {
                 if (wantMM) emitMultiMapDraw(slot, e, multiMapCount);
             } else if (wantStatic) {
@@ -1125,19 +1196,54 @@ namespace {
                 }
                 dispatch(ks->second, *e);
             }
-            return;
+        } else {
+            for (std::uint32_t key : keys) {
+                auto ks = g_keySlot.find(key);
+                if (ks == g_keySlot.end()) {
+                    continue;   // not an uploaded part (or not yet shipped)
+                }
+                auto ce = cacheMap.find(key);
+                if (ce == cacheMap.end()) {
+                    continue;   // evicted since the visible-set build
+                }
+                dispatch(ks->second, ce->second);
+            }
         }
 
-        for (std::uint32_t key : keys) {
-            auto ks = g_keySlot.find(key);
-            if (ks == g_keySlot.end()) {
-                continue;   // not an uploaded part (or not yet shipped)
+        // AT1: back-to-front (descending view depth — farthest drawn first, MW's sort) then pack.
+        if (!alphaCands.empty()) {
+            std::sort(alphaCands.begin(), alphaCands.end(),
+                      [](const AlphaCand& a, const AlphaCand& b) { return a.depth > b.depth; });
+            std::size_t first = 0;
+            if (alphaCands.size() > IPC::kMaxAlphaDraws) {
+                // Over cap: drop the FARTHEST (sorted front) — the near draws matter most.
+                first = alphaCands.size() - IPC::kMaxAlphaDraws;
+                static bool logged = false;
+                if (!logged) {
+                    LOG::logline("!! [alpha] %zu blended shapes this frame > cap %u — farthest dropped",
+                                 alphaCands.size(), IPC::kMaxAlphaDraws);
+                    logged = true;
+                }
             }
-            auto ce = cacheMap.find(key);
-            if (ce == cacheMap.end()) {
-                continue;   // evicted since the visible-set build
+            g_alphaScratch.reserve((alphaCands.size() - first) * sizeof(IPC::AlphaDrawWire));
+            for (std::size_t i = first; i < alphaCands.size(); ++i) {
+                emitAlphaDraw(*alphaCands[i].si, *alphaCands[i].e, alphaCount);
             }
-            dispatch(ks->second, ce->second);
+            // Bring-up diagnostic: name the captured set once (what the alpha list actually IS —
+            // if the in-game "sorted" the eye notices isn't in here, it's an AT3 leftover, not a
+            // draw bug). Remove after verify.
+            static bool s_alphaNamed = false;
+            if (!s_alphaNamed) {
+                s_alphaNamed = true;
+                LOG::logline(">> [alpha-cap] %zu blended shapes captured this frame:", alphaCands.size());
+                const std::size_t nDump = (alphaCands.size() < 16u) ? alphaCands.size() : 16u;
+                for (std::size_t i = 0; i < nDump; ++i) {
+                    const auto& e = *alphaCands[i].e;
+                    LOG::logline(">> [alpha-cap] #%zu depth=%.0f tex=%s vc=%u tri=%u blend=%u/%u matA=%.2f",
+                                 i, alphaCands[i].depth, e.textureName ? e.textureName : "(null)",
+                                 e.vertexCount, e.triangleCount, e.srcBlend, e.destBlend, e.matDiffuse[3]);
+                }
+            }
         }
     }
 
@@ -1380,10 +1486,10 @@ namespace RenderProcess {
         bool ok = false;
         // Re-walk the geometry cache to build the host's draw lists (the MGE→Forge feeding cost —
         // Phase 2 makes this GPU-resident so it goes to 0).
-        std::uint32_t drawCount, skinnedCount, multiMapCount, lightCount, skyCount;
+        std::uint32_t drawCount, skinnedCount, multiMapCount, lightCount, skyCount, alphaCount;
         {
             MGE_ZoneScopedN("Forge build draw lists");
-            buildGeometryDrawLists(drawCount, skinnedCount, multiMapCount);
+            buildGeometryDrawLists(drawCount, skinnedCount, multiMapCount, alphaCount);
             lightCount = buildLightList();
             skyCount = buildSkyDrawList();
         }
@@ -1447,6 +1553,14 @@ namespace RenderProcess {
             skyId    = g_skyVec->id();
             skyBytes = (std::uint32_t)g_skyScratch.size();
         }
+
+        IPC::VecId   alphaId = IPC::InvalidVector;
+        std::uint32_t alphaBytes = 0;
+        if (g_alphaVec && alphaCount > 0
+            && g_alphaVec->assign_bytes(g_alphaScratch.data(), (std::uint32_t)g_alphaScratch.size())) {
+            alphaId    = g_alphaVec->id();
+            alphaBytes = (std::uint32_t)g_alphaScratch.size();
+        }
         const double tAssign = nowMs();
 
         // The MGE→Forge FEEDING cost (the bulk of the "unaccounted" client gap): every frame MGE
@@ -1466,7 +1580,7 @@ namespace RenderProcess {
         // triangle and composite it — that flashes the debug triangle over MW's loading/menu
         // frame. Skip the seam entirely and let MW present its own (fixed-function) frame.
         if (!haveDraw && skinnedId == IPC::InvalidVector && multiMapId == IPC::InvalidVector
-            && skyId == IPC::InvalidVector) {
+            && skyId == IPC::InvalidVector && alphaId == IPC::InvalidVector) {
             return;
         }
 
@@ -1608,6 +1722,7 @@ namespace RenderProcess {
                      multiMapId, (multiMapId != IPC::InvalidVector) ? multiMapCount : 0, multiMapBytes,
                      lightId, (lightId != IPC::InvalidVector) ? lightCount : 0, lightBytes,
                      skyId, (skyId != IPC::InvalidVector) ? skyCount : 0, skyBytes,
+                     alphaId, (alphaId != IPC::InvalidVector) ? alphaCount : 0, alphaBytes,
                      (std::uint32_t)g_debugMode, &devInput, waterParams, waterOn);
         }
         if (!ok) {
@@ -1623,6 +1738,7 @@ namespace RenderProcess {
         g_kick.multiMapCount = multiMapCount;
         g_kick.lightCount    = lightCount;
         g_kick.skyCount      = skyCount;
+        g_kick.alphaCount    = alphaCount;
         g_kick.geomParts     = geomParts;
         g_kick.texCount      = texCount;
         g_kick.geomBytes     = geomBytes;
@@ -1840,12 +1956,13 @@ namespace RenderProcess {
         if (feed >= kSpikeMs) {
             LOG::logline("!! [spike] frame %u feed=%.2fms (geomflush=%.2f build=%.2f texflush=%.2f "
                          "assign=%.2f render=%.2f[host=%.2f] overlap=%.2f copy=%.2f blit=%.2f) "
-                         "draws=%u skin=%u mm=%u light=%u geom+=%u/%uKB tex+=%u/%uKB dt=%.2fms",
+                         "draws=%u skin=%u mm=%u light=%u alpha=%u geom+=%u/%uKB tex+=%u/%uKB dt=%.2fms",
                          g_kick.frame, feed,
                          g_kick.tGeomFlush - g_kick.tBuild, g_kick.tBuild - g_kick.tStart,
                          g_kick.tTexFlush - g_kick.tGeomFlush, g_kick.tAssign - g_kick.tTexFlush,
                          renderBucket, hostMs, overlap, tCopy - tRender, tEnd - tCopy,
                          g_kick.drawCount, g_kick.skinnedCount, g_kick.multiMapCount, g_kick.lightCount,
+                         g_kick.alphaCount,
                          g_kick.geomParts, (unsigned)(g_kick.geomBytes >> 10),
                          g_kick.texCount, (unsigned)(g_kick.texBytes >> 10),
                          g_kick.dtPresent);
@@ -2038,6 +2155,7 @@ namespace RenderProcess {
         g_multiMapVec.reset();
         g_lightVec.reset();
         g_skyVec.reset();
+        g_alphaVec.reset();
         g_texVec.reset();
         g_pendingBlob.clear();
         g_pendingBlob.shrink_to_fit();
@@ -2051,6 +2169,8 @@ namespace RenderProcess {
         g_lightScratch.shrink_to_fit();
         g_skyScratch.clear();
         g_skyScratch.shrink_to_fit();
+        g_alphaScratch.clear();
+        g_alphaScratch.shrink_to_fit();
         g_texPendingBlob.clear();
         g_texPendingBlob.shrink_to_fit();
         g_pendingParts = 0;

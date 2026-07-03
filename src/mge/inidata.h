@@ -158,6 +158,8 @@ const iniSetting iniSettings[] = {
     {&Configuration.ForgeOpaqueDisplaySkip, t_bool, 1, siniMisc, "Forge Opaque Display Skip", True, &dictBool, DICTONLY, 0, 0},
     {&Configuration.ForgeActiveCellWalk, t_bool, 1, siniMisc, "Forge Active Cell Walk", True, &dictBool, DICTONLY, 0, 0},
     {&Configuration.ForgeLiveDrawBuild, t_bool, 1, siniMisc, "Forge Live Draw Build", True, &dictBool, DICTONLY, 0, 0},
+    {&Configuration.ForgeAlphaPass, t_bool, 1, siniMisc, "Forge Alpha Pass", True, &dictBool, DICTONLY, 0, 0},
+    {&Configuration.ForgeAlphaSuppressS1, t_bool, 1, siniMisc, "Forge Alpha Suppress S1", True, &dictBool, DICTONLY, 0, 0},
     {&Configuration.UseRenderProcessEx, t_bool, 1, siniMisc, "Use Render Process Ex", False, &dictBool, DICTONLY, 0, 0},
 
     // Distant Land flags

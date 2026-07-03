@@ -1,0 +1,128 @@
+// mgeHost64 — AT1 sorted-alpha pass (fragment stage).
+//
+// opaque.frag clone for the scene-1 alpha-BLENDED world shapes (banners, tapestries, foliage,
+// window glass): identical Tier 1 (sun+ambient+tonemap+fog) + 2b (material/vColSource routing) +
+// 3a (point lights) lighting, but outputs REAL alpha for the SRCALPHA blend pipelines:
+//     a = albedo.a * vcolA * matAlpha
+// where vcolA = In.Color.a when a VertexColorProperty drives the shape (vColSource != 0) else 1,
+// and matAlpha = the captured MaterialProperty alpha, bit-cast through the spare overlay
+// instance slot (opaque.vert forwards it as the FLAT uint OverlayIndex; asfloat recovers it).
+// The terrain DECAL_1 splat does NOT run here — terrain never rides the alpha list, and the
+// overlay slot is repurposed for matAlpha.
+//
+// PAIRING HAZARD: this frag shares VSOutput with opaque.vert and must ONLY be paired with it
+// (see [[project_forge_shared_frag_vsoutput]] — a mismatched vert hangs the GPU).
+
+#include "opaque.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4,      Position, SV_Position);
+    DATA(float3,      Normal,   NORMAL);
+    DATA(float2,      Uv,       TEXCOORD0);
+    DATA(FLAT(uint),  TexIndex, TEXCOORD1);
+    DATA(float,       Fog,      TEXCOORD2);
+    DATA(float4,      Color,    COLOR);       // per-vertex DiffAmb colour
+    DATA(float,       AlphaRef, TEXCOORD3);   // alpha-test ref 0..1 (0 = no test)
+    DATA(FLAT(float3),MatDiffuse, TEXCOORD4); // Tier 2b material constants (per draw)
+    DATA(FLAT(float3),MatAmbient, TEXCOORD5);
+    DATA(FLAT(float3),MatEmissive,TEXCOORD6);
+    DATA(FLAT(uint),  VColSource, TEXCOORD7); // 0 none, 1 emissive, 2 diffamb
+    DATA(float3,      WorldPos,   TEXCOORD8); // Tier 3a: world position for point-light eval
+    DATA(FLAT(uint),  OverlayIndex,TEXCOORD9);// AT1: matAlpha bit-cast (overlay slot reused)
+};
+
+// Static semi-HDR tonemap — ported verbatim from XE FixedFuncEmu.fx::tonemap.
+float3 tonemap(float3 c)
+{
+    c = clamp(c, 0.0f, 2.2f);
+    c = (((0.0548303f * c - 0.189786f) * c - 0.154732f) * c + 1.12969f) * c;
+    return c;
+}
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    float3 N = normalize(In.Normal);
+
+    // AO sample + toggles — identical to opaque.frag (blended shapes share the scene lighting).
+    uint   aoFlags  = (uint)(gFrameData.debugParams.w + 0.5f);
+    float2 aoUv     = In.Position.xy * gFrameData.debugParams.yz;
+    float4 aoSample = SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
+    if ((aoFlags & 2u) != 0u) { N = normalize(aoSample.rgb); }
+
+    float  ndl = saturate(dot(N, -gFrameData.sunDir.xyz));
+    float3 d = gFrameData.sunCol.rgb * ndl;
+    float3 a = ((aoFlags & 4u) != 0u) ? float3(1.0f, 1.0f, 1.0f) : gFrameData.ambCol.rgb;
+    if ((aoFlags & 1u) != 0u) { a *= aoSample.a; }
+    a *= gFrameData.dbgScales.x;
+
+    // Tier 3a point lights — same evalOnePointLight loop as opaque.frag.
+    {
+        uint nLights = (uint)gLights.lightParams.x;
+        for (uint i = 0; i < nLights; ++i)
+        {
+            float4 posR    = gLights.lights[i * 3u + 0u];
+            float3 lightCol= gLights.lights[i * 3u + 1u].rgb;
+            float3 fo      = gLights.lights[i * 3u + 2u].xyz;
+            float  radius  = posR.w;
+
+            float3 toLight = posR.xyz - In.WorldPos;
+            float  dist2   = dot(toLight, toLight);
+            if (dist2 >= 4.0f * radius * radius) { continue; }
+            float  invDist = rsqrt(max(dist2, 1e-8f));
+            float  dist    = dist2 * invDist;
+
+            float  att = 1.0f / max(fo.z * dist2 + fo.y * dist + fo.x, 1e-4f);
+            att *= 1.0f - smoothstep(radius, 2.0f * radius, dist);
+
+            float  lambert = saturate(dot(N, toLight) * invDist);
+            d += lambert * att * lightCol;
+        }
+    }
+    d *= gFrameData.dbgScales.y;
+
+    // Tier 2b material routing — identical to opaque.frag.
+    float3 lit;
+    if (In.VColSource == 2u) {
+        lit = In.Color.rgb * (d + a) + In.MatEmissive;
+    } else if (In.VColSource == 1u) {
+        lit = In.MatDiffuse * d + In.MatAmbient * a + In.Color.rgb;
+    } else {
+        lit = In.MatDiffuse * d + In.MatAmbient * a + In.MatEmissive;
+    }
+
+    float4 albedo = SampleTex2D(gTextures[In.TexIndex], gSamplerAnisotropic, In.Uv);
+
+    // Alpha test (some blended shapes ALSO alpha-test). Same GREATEREQUAL approximation.
+    if (albedo.a < In.AlphaRef) { discard; }
+
+    albedo.rgb *= gFrameData.dbgScales.z;
+
+    // AT1 output alpha: texture alpha x per-vertex alpha (only when vertex colour drives the
+    // shape) x material alpha (bit-cast through the overlay instance slot).
+    float vcolA    = (In.VColSource != 0u) ? In.Color.a : 1.0f;
+    float matAlpha = asfloat(In.OverlayIndex);
+    float outA     = albedo.a * vcolA * matAlpha;
+
+    float3 c = albedo.rgb * lit;
+    c *= gFrameData.dbgScales.w;
+    c = tonemap(c);
+    c = lerp(gFrameData.fogColNear.rgb, c, In.Fog);
+
+    // F12 debug views (opaque.frag's, alpha forced 1 so the view reads clearly).
+    uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
+    if (dbg == 3u || dbg == 4u) {
+        if (dbg == 4u) { RETURN(float4(aoSample.rgb, 1.0f)); }
+        float v = aoSample.a; RETURN(float4(v, v, v, 1.0f));
+    }
+    if (dbg == 5u) { RETURN(float4(albedo.rgb, 1.0f)); }
+    if (dbg == 6u) { RETURN(float4(lit, 1.0f)); }
+    if (dbg == 1u || dbg == 2u) {
+        float dist = length(In.WorldPos - gFrameData.eyePos.xyz);
+        float g = saturate(dist * (1.0f / 8192.0f));
+        RETURN(float4(g, g, g, 1.0f));
+    }
+    RETURN(float4(c, outA));
+}
