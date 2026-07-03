@@ -1566,7 +1566,14 @@ namespace RenderProcess {
         // is a calm constant (windVec isn't exposed to MGE — tune later). camFwd = mwView's 3rd column
         // (world-space view forward) for the slant→perpendicular shoreline depth correction.
         float waterParams[12] = {};
-        const std::uint32_t waterOn = wantsWaterCapture() ? 1u : 0u;
+        // CellHasWater: waterless interiors (most of them) must not draw the host water —
+        // MGE's own water path always gated on this and the Forge crossing lost it, so the
+        // host drew the geo-clipmap at a stale WaterLevel() in dry cells. Per-frame cell
+        // state gates only THIS wire flag (host skips water + its reflection pass);
+        // wantsWaterCapture() stays the mode gate (forgeOwnsDepth / fold / WT3 suppression
+        // must not flip per cell). Exteriors always have water (CellHasWater true there).
+        const std::uint32_t waterOn =
+            (wantsWaterCapture() && MWBridge::get()->CellHasWater()) ? 1u : 0u;
         if (waterOn) {
             MWBridge* mw = MWBridge::get();
             const float sunlightFactor = 1.0f - (1.0f - DistantLand::sunVis) * (1.0f - DistantLand::sunVis);
