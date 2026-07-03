@@ -156,6 +156,7 @@ const iniSetting iniSettings[] = {
     {&Configuration.UseAsyncHostFrame, t_bool, 1, siniMisc, "Use Async Host Frame", True, &dictBool, DICTONLY, 0, 0},
     {&Configuration.ForgeNearDepthReplay, t_bool, 1, siniMisc, "Forge Near Depth Replay", False, &dictBool, DICTONLY, 0, 0},
     {&Configuration.ForgeOpaqueDisplaySkip, t_bool, 1, siniMisc, "Forge Opaque Display Skip", True, &dictBool, DICTONLY, 0, 0},
+    {&Configuration.ForgeActiveCellWalk, t_bool, 1, siniMisc, "Forge Active Cell Walk", True, &dictBool, DICTONLY, 0, 0},
     {&Configuration.UseRenderProcessEx, t_bool, 1, siniMisc, "Use Render Process Ex", False, &dictBool, DICTONLY, 0, 0},
 
     // Distant Land flags

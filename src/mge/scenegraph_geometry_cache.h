@@ -138,6 +138,12 @@ namespace MGE::GeometryCache {
         uint8_t vColSource;
         // Lifecycle
         uint64_t lastFrame;             // frame counter from most recent visit
+        // The GeometryData* this entry was built from. A NiTriShape address can be
+        // recycled onto a NEW shape (cell transitions) while the entry survives —
+        // with deferred eviction + the far-keep hysteresis that window is real, so
+        // identity is checked on every visit: mismatch rebuilds from scratch (the
+        // same recycled-key guard the host-side captureGeometry dedup uses).
+        const void* dataPtr;
         // D3D row-major world transform for non-skinned objects (model-space VBs).
         // Cast to D3DXMATRIX* for use with D3DXMatrixMultiply.
         // Skinned objects are CPU-skinned to world-space; worldTransformD3D is unused for them.
@@ -151,7 +157,17 @@ namespace MGE::GeometryCache {
     // from the two world roots, creates/updates VBs for new/changed geometry,
     // and evicts entries not seen this frame. dataHandler is the
     // TES3::DataHandler* (typed void* to avoid TES3 header deps).
-    void onFrameReady(void* dataHandler);
+    //
+    // W1.5 active-cell gate: when gateRadius > 0, whole NiNode subtrees whose world
+    // bound lies entirely beyond gateRadius of gateEye (xyz) are SKIPPED — MW's own
+    // view-distance cull means nothing there can enter any drawn set, so refreshing
+    // those entries is dead per-frame work (the Forge host draws the far world from
+    // its own data). Callers must size gateRadius to cover the frustum's far CORNERS
+    // (view-z far plane * slope factor), not just the view distance. gateRadius <= 0
+    // (or null eye) disables the gate — the full-walk behavior is unchanged. Skipped
+    // entries go stale but are kept by the eviction sweep's hysteresis (see .cpp)
+    // so returning to an area doesn't re-capture/re-upload it.
+    void onFrameReady(void* dataHandler, const float* gateEye = nullptr, float gateRadius = 0.0f);
 
     const std::unordered_map<uint32_t, CachedGeometry>& cache();
 

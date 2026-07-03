@@ -80,12 +80,30 @@ namespace MGE::GeometryCache {
         // lastFrame == g_frame), they only hold memory/VBs a little longer. The sweep
         // now runs every kEvictSweepInterval frames.
         constexpr uint64_t kEvictSweepInterval = 30;
+        // W1.5 active-cell gate (see onFrameReady's header comment). g_gateThisFrame
+        // arms the walk's subtree skip for the current frame only; g_gateEye/
+        // g_gateRadius persist across ungated frames (menus, the renderDepth
+        // fallback) so the eviction hysteresis below keeps working there — the
+        // player can't move while the gate is down, so the last gated eye is valid.
+        bool     g_gateThisFrame = false;
+        float    g_gateEye[3]    = {};
+        float    g_gateRadius    = 0.0f;
+        // Eviction hysteresis: a stale entry BEYOND the gate radius was most likely
+        // just skipped by the gate (not removed from the scene), so it is kept — no
+        // re-capture/re-upload churn when the player returns. Bounded by age: far
+        // entries untouched this long are evicted anyway (frees VBs of genuinely
+        // unloaded far cells; they re-capture only if the area is ever revisited).
+        constexpr uint64_t kFarKeepFrames = 600;
         // Per-phase walk timing (QPC), logged every kGcHeartbeatFrames frames as
         // ">> [gc] ..." — the walk is on the dense-city serial chain, so its cost is
         // tracked with the same always-on heartbeat discipline as [hb]/[forge-hb].
-        struct GcAccum { double obj, pick, land, sky, evict; uint64_t n; };
+        struct GcAccum { double obj, pick, land, sky, evict, visited, gateSkip; uint64_t n; };
         GcAccum           g_gcAccum = {};
         constexpr uint64_t kGcHeartbeatFrames = 300;
+        // Per-frame gate observability, accumulated into the [gc] heartbeat:
+        // entries actually visited vs whole subtrees the gate skipped.
+        uint32_t          g_visitedThisFrame  = 0;
+        uint32_t          g_gateSkipsThisFrame = 0;
         // Reverse map GPU texture -> SourceTexture::fileName, for resolveTextureName().
         // DORMANT: nothing populates this currently. The per-frame rebuild (walking
         // NI property state per node) cost ~1.5ms and had no consumer, so it was
@@ -689,11 +707,21 @@ namespace MGE::GeometryCache {
             NI::SkinData*     sd = si ? si->skinData.get() : nullptr;
             const bool sk = (si && sd && si->bones);
 
+            ++g_visitedThisFrame;
+
             auto it = g_cache.find(key);
+            if (it != g_cache.end() && it->second.dataPtr != data) {
+                // Recycled NiTriShape address (or a live setModelData swap): the entry
+                // describes a different mesh — drop it and rebuild through the fresh path.
+                releaseEntry(it->second);
+                g_cache.erase(it);
+                it = g_cache.end();
+            }
             if (it == g_cache.end()) {
                 auto& e = g_cache[key];
                 e.vb[0] = e.vb[1] = nullptr; e.ib = nullptr; e.writeSlot = 0;
                 e.numBones = 0; e.skinnedUnsupported = false;
+                e.dataPtr = data;
                 // Material first: uploadEntry reads the captured map UV sets (baseUV/
                 // darkUV/detailUV/glowUV, set here) to size the VB's UV-set count.
                 extractMaterial(e, geom);
@@ -780,6 +808,24 @@ namespace MGE::GeometryCache {
         void walk(NI::AVObject* av, bool inCharacter = false, bool bypassCull = false) {
             if (!av) return;
             if (!bypassCull && av->getAppCulled()) return;
+
+            // W1.5 active-cell gate: skip anything whose world bound lies entirely
+            // beyond the gate sphere — a NiNode prunes its whole subtree (per-cell
+            // containers at the roots' direct children), a leaf prunes itself (cell
+            // bounds are ~half-a-diagonal fat, so a kept edge cell still has a far
+            // half worth trimming). Distance-only (not frustum) so panning never
+            // churns capture. The sky walk is exempt — sky shapes ride orbit
+            // transforms unrelated to eye distance.
+            if (g_gateThisFrame && !g_walkingSky) {
+                const float dx = av->worldBoundOrigin.x - g_gateEye[0];
+                const float dy = av->worldBoundOrigin.y - g_gateEye[1];
+                const float dz = av->worldBoundOrigin.z - g_gateEye[2];
+                const float reach = g_gateRadius + av->worldBoundRadius;
+                if (dx * dx + dy * dy + dz * dz > reach * reach) {
+                    ++g_gateSkipsThisFrame;
+                    return;
+                }
+            }
 
             if (av->isInstanceOfType(NI::RTTIStaticPtr::NiTriBasedGeom)) {
                 visitGeometry(static_cast<NI::TriBasedGeometry*>(av), inCharacter);
@@ -1094,13 +1140,24 @@ namespace MGE::GeometryCache {
         return 1000.0 * (double)c.QuadPart / (double)freq.QuadPart;
     }
 
-    void onFrameReady(void* dataHandler) {
+    void onFrameReady(void* dataHandler, const float* gateEye, float gateRadius) {
         if (!g_device || !dataHandler) return;
         if (!Configuration.UseSceneGraphSnapshot) return;
         MGE_ZoneScopedN("GeometryCache::onFrameReady");
 
         ++g_frame;
         g_uploadedThisFrame = 0;
+        g_visitedThisFrame = 0;
+        g_gateSkipsThisFrame = 0;
+        // Arm the active-cell gate for this walk; the eye/radius persist for the
+        // eviction hysteresis even on later ungated frames (see declarations).
+        g_gateThisFrame = (gateEye != nullptr && gateRadius > 0.0f);
+        if (g_gateThisFrame) {
+            g_gateEye[0] = gateEye[0];
+            g_gateEye[1] = gateEye[1];
+            g_gateEye[2] = gateEye[2];
+            g_gateRadius = gateRadius;
+        }
         const double t0 = gcNowMs();
 
         {
@@ -1158,9 +1215,26 @@ namespace MGE::GeometryCache {
         // staleness/pointer-recycle window to one sweep interval.
         if (g_frame % kEvictSweepInterval == 0) {
             MGE_ZoneScopedN("GeomCache:evict");
+            const float evictR2 = g_gateRadius * g_gateRadius;
             for (auto it = g_cache.begin(); it != g_cache.end(); ) {
-                if (it->second.lastFrame != g_frame) {
-                    releaseEntry(it->second);
+                auto& e = it->second;
+                bool evict = (e.lastFrame != g_frame);
+                // Hysteresis (active-cell gate): a stale entry beyond the gate radius
+                // was likely SKIPPED, not removed — keep it up to kFarKeepFrames so a
+                // returning player doesn't pay re-capture/re-upload. Stale entries
+                // WITHIN the radius were visitable but unvisited => genuinely gone
+                // (their subtree would have been walked), evict as before. Uses the
+                // entry's world translation — coarse is fine at cell granularity.
+                if (evict && g_gateRadius > 0.0f && g_frame - e.lastFrame <= kFarKeepFrames) {
+                    const float dx = e.worldTransformD3D[12] - g_gateEye[0];
+                    const float dy = e.worldTransformD3D[13] - g_gateEye[1];
+                    const float dz = e.worldTransformD3D[14] - g_gateEye[2];
+                    if (dx * dx + dy * dy + dz * dz > evictR2) {
+                        evict = false;
+                    }
+                }
+                if (evict) {
+                    releaseEntry(e);
                     it = g_cache.erase(it);
                 } else {
                     ++it;
@@ -1177,13 +1251,17 @@ namespace MGE::GeometryCache {
         g_gcAccum.land  += tLand - tPick;
         g_gcAccum.sky   += tSky - tLand;
         g_gcAccum.evict += tEvict - tSky;
+        g_gcAccum.visited  += g_visitedThisFrame;
+        g_gcAccum.gateSkip += g_gateSkipsThisFrame;
         if (++g_gcAccum.n >= kGcHeartbeatFrames) {
             const double n = (double)g_gcAccum.n;
-            LOG::logline(">> [gc] %llu frames avg: walk=%.2f (obj=%.2f pick=%.2f land=%.2f sky=%.2f evict=%.2f) entries=%zu",
+            LOG::logline(">> [gc] %llu frames avg: walk=%.2f (obj=%.2f pick=%.2f land=%.2f sky=%.2f evict=%.2f) entries=%zu visited=%.0f gateSkip=%.0f%s gateR=%.0f",
                          (unsigned long long)g_gcAccum.n,
                          (g_gcAccum.obj + g_gcAccum.pick + g_gcAccum.land + g_gcAccum.sky + g_gcAccum.evict) / n,
                          g_gcAccum.obj / n, g_gcAccum.pick / n, g_gcAccum.land / n,
-                         g_gcAccum.sky / n, g_gcAccum.evict / n, g_cache.size());
+                         g_gcAccum.sky / n, g_gcAccum.evict / n, g_cache.size(),
+                         g_gcAccum.visited / n, g_gcAccum.gateSkip / n,
+                         g_gateThisFrame ? " gate=ON" : "", g_gateRadius);
             g_gcAccum = GcAccum{};
         }
 
@@ -1201,6 +1279,9 @@ namespace MGE::GeometryCache {
                 uint32_t landCount = 0, landOpaque = 0, landAlphaTest = 0, landBlend = 0, landVCol = 0;
                 const char* landTexA = nullptr; const char* landTexB = nullptr;
                 for (const auto& kv : g_cache) {
+                    // Hysteresis-kept far entries may outlive their cell (NI string
+                    // pointers dangle after unload) — characterize live entries only.
+                    if (kv.second.lastFrame != g_frame) continue;
                     if (kv.second.isSkinned) ++skinnedCount;
                     if (kv.second.mirrored) ++mirroredCount;
                     if (kv.second.d3dTexture && kv.second.textureName) ++namedTexCount;
