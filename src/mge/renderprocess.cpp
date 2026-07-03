@@ -62,7 +62,7 @@ namespace {
     // own cost (kickoff prep + residual wait + copy + blit), so feed is comparable across
     // fused/async modes and IS the perf baseline once the wait bucket collapses.
     constexpr unsigned kHeartbeatFrames = 300;
-    struct Accum { double feed, geom, render, host, overlap, copy, blit, dt; double maxFeed, maxDt; unsigned n, earlyN; };
+    struct Accum { double feed, geom, build, render, host, overlap, copy, blit, dt; double maxFeed, maxDt; unsigned n, earlyN; };
     Accum g_hb = {};
 
     // Async-frame split: everything the finish half needs from the kickoff half. Reset at
@@ -104,7 +104,29 @@ namespace {
     std::optional<IPC::VecView<IPC::GeomChunk>> g_skyVec;           // persistent per-frame sky draw-list vec (SK1)
     std::vector<std::uint8_t>                 g_pendingBlob;        // packed parts awaiting flush
     std::uint32_t                             g_pendingParts = 0;
-    std::unordered_map<std::uint32_t, std::uint32_t> g_keySlot;    // cache key -> host slot
+    // Cache key -> host slot, plus per-key cached bindless texture slots so the
+    // per-frame draw-list build doesn't re-run resolveTextureSlot's normalize
+    // (heap string) + string-hash find for every item every frame. A cached slot
+    // is valid iff BOTH hold:
+    //   - the entry's texture-name POINTER is unchanged (NiSourceTexture fileName
+    //     storage is stable; NiFlipController animation swaps to a different
+    //     SourceTexture = different pointer, so animated textures still re-resolve)
+    //   - the epoch matches g_texEpoch (bumped when the LRU recycles a bindless
+    //     slot to a new texture, which invalidates every cached slot value).
+    // The cached fast path still refreshes g_slotLastUsed so the LRU stays exact.
+    struct SlotInfo {
+        std::uint32_t slot = 0;              // host geometry slot (stable per key)
+        const char*   baseNamePtr = nullptr; // texture-name identity for baseSlot
+        std::uint32_t baseSlot = 0;
+        std::uint32_t baseEpoch = 0;
+        const char*   ovNamePtr = nullptr;   // texture-name identity for ovSlot
+        std::uint32_t ovSlot = 0;
+        std::uint32_t ovEpoch = 0;           // separate epochs: one field re-validating
+                                             // the other's stale slot after a recycle
+                                             // would alias textures
+    };
+    std::unordered_map<std::uint32_t, SlotInfo> g_keySlot;
+    std::uint32_t g_texEpoch = 0;            // bumped on bindless-slot LRU recycle
     // Last-shipped identity per cache key. Dedup is on (modelId, vc, rev), NOT rev alone:
     // the key is a recycled NiTriShape*, so a new object can inherit a freed key+slot; the
     // GeometryData ptr (modelId) + vertexCount disambiguate it (see captureGeometry).
@@ -724,6 +746,9 @@ namespace {
             }
             g_texSlot.erase(g_slotName[lru]);   // evict the recycled name
             slot = lru;
+            // The recycled slot now means a different texture: every SlotInfo-cached
+            // slot value is suspect. Epoch bump forces per-key re-resolve (one-off).
+            ++g_texEpoch;
         }
         g_texSlot[name] = slot;
         g_slotName[slot] = name;
@@ -847,80 +872,36 @@ namespace {
     // current-frame frustum-visible key set (built in renderStage0); only keys we've
     // assigned a host slot (uploaded, non-skinned, non-landscape) are included. Returns
     // the packed item count (0 if nothing to draw / scene path unavailable).
-    std::uint32_t buildDrawList() {
-        if (!g_drawVec) {
-            return 0;
+    // Resolve a bindless texture slot through a SlotInfo cache field (see SlotInfo).
+    // Fast path = pointer-identity + epoch check, no string normalize/hash. The
+    // LRU age refresh matches what resolveTextureSlot's memoized path would do.
+    std::uint32_t resolveCachedSlot(const char* name, const char*& namePtr,
+                                    std::uint32_t& slotVal, std::uint32_t& slotEpoch) {
+        if (name == namePtr && slotEpoch == g_texEpoch) {
+            if (slotVal != 0) { g_slotLastUsed[slotVal] = g_frame; }
+            return slotVal;
         }
-        // Source = MGE's OWN current-frame frustum-visible set (frustumVisibleKeys /
-        // buildFrustumVisibleSet, built in renderStage0) — the SAME source the proven D3D9
-        // cache color path (renderCachedOpaque) consumes. This is adaptive and decouples the
-        // Forge near draw from the MWSE occlusion plugin entirely:
-        //   - plugin ON  → buildFrustumVisibleSet fills it from the engine's drawn set
-        //     (s_visibleKeys: de-duped, one LOD per object, occlusion-correct, CURRENT frame —
-        //     strictly better than the old visibleCacheKeys, which lagged a frame).
-        //   - plugin OFF → frustum-only fallback (whole-cache frustum walk). Near still renders.
-        // The old MSOC-set choice (visibleCacheKeys) went empty when the plugin was disabled,
-        // blanking ALL near opaques. The frustum-fallback's only cost is a transient double-draw
-        // of an object that has BOTH its original AND a stale LOD mesh still cached across an LOD
-        // transition (statics overlap → invisible; the rare mover case z-fights until eviction) —
-        // the exact tradeoff renderCachedOpaque already lives with.
-        const auto& keys = DistantLand::frustumVisibleKeys();
-        const auto& cacheMap = MGE::GeometryCache::cache();
+        slotVal = resolveTextureSlot(name);
+        namePtr = name;
+        slotEpoch = g_texEpoch;
+        return slotVal;
+    }
 
-        g_drawScratch.clear();
-        g_drawScratch.reserve(keys.size() * sizeof(IPC::DrawItemWire));
-
-        IPC::DrawItemWire item;
-        std::uint32_t count = 0;
-        for (std::uint32_t key : keys) {
-            auto ks = g_keySlot.find(key);
-            if (ks == g_keySlot.end()) {
-                continue;   // not an uploaded opaque part (skinned/landscape/not yet sent)
-            }
-            auto ce = cacheMap.find(key);
-            if (ce == cacheMap.end()) {
-                continue;   // evicted since the visible-set build
-            }
-            const auto& e = ce->second;
-            // Mirror the PROVEN D3D9 cache color pass's per-entry filters EXACTLY (drawEntry
-            // in rendercachedcolor.cpp) so the Forge draw list draws the same set:
-            //   - !d3dTexture: drops UNTEXTURED entries — the worldPickObjectRoot collision
-            //     proxies that mirror each visual object. Drawing those gave a second
-            //     near-coincident copy; statics overlapped exactly (invisible) but MOVING
-            //     objects' visual vs proxy transforms diverged a frame → Z-FIGHTING. This
-            //     is THE de-dup. (Do NOT also filter isPickRoot — legit movers like dropped
-            //     items/projectiles LIVE in the pick root and ARE textured; the proven path
-            //     keeps them, dropping them blanked all movers.)
-            //   - blendEnable: alpha-blended OBJECTS stay on the engine/alpha path. But
-            //     terrain is the exception — the D9 oracle (renderCachedTerrain) draws ALL
-            //     isLandscape regardless of blendEnable (alpha-splat trishapes included),
-            //     and at flat-shaded fidelity blend-vs-opaque is invisible. So only filter
-            //     blendEnable for non-landscape.
-            //   - skinned: ALL skinned parts go through buildSkinnedDrawList (their own
-            //     stride-44 VB + GPU palette pipeline). They now share g_keySlot with the
-            //     static path (so they HAVE a slot here), so this static loop MUST exclude
-            //     every skinned entry — drawing a stride-44 skinned VB through the stride-24
-            //     static pipeline would garble it.
-            // Terrain now draws (near worldLandscapeRoot patches; flat-shaded geometry).
-            if (e.isSky) continue;   // sky rides the Forge alpha-blend sky pass (buildSkyDrawList)
-            if (!e.d3dTexture) continue;
-            if (!e.isLandscape && e.blendEnable) continue;
-            if (e.isSkinned) continue;
-            //   - multi-map: parts with dark/detail/glow siblings go through
-            //     buildMultiMapDrawList (their own stride-60 wide VB + multimap pipeline).
-            //     They share g_keySlot with the static path (so they HAVE a slot here), so this
-            //     static loop MUST exclude them — drawing a stride-60 wide VB through the
-            //     stride-36 static pipeline would garble it. Matches the capture-side condition
-            //     (non-landscape; landscape is forced single-UV / single-map).
-            if (!e.isLandscape && (e.d3dDark || e.d3dDetail || e.d3dGlow)) continue;
-
-            item.slot = ks->second;
-            item.texIndex = resolveTextureSlot(e.textureName);   // bindless base map (0 = white)
+    // Emit one STATIC opaque draw (pre-filtered by buildGeometryDrawLists — the
+    // per-entry filter rationale lives there). Mirrors the PROVEN D3D9 cache color
+    // pass's per-entry packing (drawEntry in rendercachedcolor.cpp) so the Forge
+    // draw list draws the same set. Terrain draws too (near worldLandscapeRoot
+    // patches; flat-shaded geometry).
+    void emitStaticDraw(SlotInfo& si, const MGE::GeometryCache::CachedGeometry& e,
+                        std::uint32_t& count) {
+            IPC::DrawItemWire item;
+            item.slot = si.slot;
+            item.texIndex = resolveCachedSlot(e.textureName, si.baseNamePtr, si.baseSlot, si.baseEpoch);
             // Terrain DECAL_1 overlay (second land texture). resolveTextureSlot ships its DDS
             // bytes the same way as the base map. Non-landscape / single-texture draws get 0,
             // which gates the frag's splat off → byte-for-byte unchanged.
             item.overlayTexIndex = (e.isLandscape && e.d3dOverlay && e.overlayTextureName)
-                ? resolveTextureSlot(e.overlayTextureName) : 0u;
+                ? resolveCachedSlot(e.overlayTextureName, si.ovNamePtr, si.ovSlot, si.ovEpoch) : 0u;
             item.alphaRef = e.alphaTest ? e.alphaRef : 0.0f;     // alpha-test cutout (0 = no test)
             // Tier 2b material: ship the captured MaterialProperty colours + the vertex-colour
             // routing, replicating buildCacheReflectionState/buildCacheMainState EXACTLY. useVCol
@@ -946,7 +927,7 @@ namespace {
             // slot means duplicates of one object (same or different slot) appear as two
             // separated copies. Hash the slot to a pseudo-random ±range.
             if (g_debugMode == 2) {
-                const std::uint32_t s = ks->second;
+                const std::uint32_t s = si.slot;
                 std::uint32_t h = s * 2654435761u;        // Knuth multiplicative hash
                 auto axis = [&](std::uint32_t shift) {
                     std::uint32_t v = (h >> shift) & 0x3FF;   // 10 bits
@@ -960,51 +941,29 @@ namespace {
             g_drawScratch.resize(at + sizeof(item));
             memcpy(g_drawScratch.data() + at, &item, sizeof(item));
             ++count;
-        }
-        return count;
     }
 
-    // M-Skinning: gather this frame's visible SKINNED parts into g_skinnedScratch as a
-    // sequence of [SkinnedDrawWire][palette]. Same visible-set source as buildDrawList
-    // (DistantLand::frustumVisibleKeys); skinned keys are EXCLUDED from buildDrawList's static
-    // loop (it requires the per-draw world matrix; skinned has none), so the two lists are
-    // disjoint over the same set. There is no per-draw world transform — the bone palette
-    // (read fresh from the cache entry each frame, that IS the animation) is world-space.
-    // Returns the packed item count (0 if nothing skinned / skinned path unavailable).
-    std::uint32_t buildSkinnedDrawList() {
-        if (!g_skinnedVec) {
-            return 0;
-        }
-        const auto& keys = DistantLand::frustumVisibleKeys();
-        const auto& cacheMap = MGE::GeometryCache::cache();
-
-        g_skinnedScratch.clear();
-        std::uint32_t count = 0;
-        for (std::uint32_t key : keys) {
-            auto ks = g_keySlot.find(key);
-            if (ks == g_keySlot.end()) {
-                continue;   // not an uploaded part (or not yet shipped)
-            }
-            auto ce = cacheMap.find(key);
-            if (ce == cacheMap.end()) {
-                continue;   // evicted since the visible-set build
-            }
-            const auto& e = ce->second;
+    // M-Skinning: emit one visible SKINNED part into g_skinnedScratch as
+    // [SkinnedDrawWire][palette] (pre-filtered by buildGeometryDrawLists; skinned
+    // keys are EXCLUDED from the static list — stride-44 VB + GPU palette pipeline).
+    // There is no per-draw world transform — the bone palette (read fresh from the
+    // cache entry each frame, that IS the animation) is world-space.
+    void emitSkinnedDraw(SlotInfo& si, const MGE::GeometryCache::CachedGeometry& e,
+                         std::uint32_t& count) {
             // Only GPU-skinnable parts: a built skinned VB, bones within the palette cap,
             // and a current bone palette of the expected size.
-            if (e.isSky) continue;   // sky rides the Forge alpha-blend sky pass (buildSkyDrawList)
-            if (!e.isSkinned || e.skinnedUnsupported || e.numBones == 0) {
-                continue;
+            if (e.skinnedUnsupported || e.numBones == 0) {
+                return;
             }
             if (e.bonePalette.size() < (std::size_t)e.numBones * 16) {
-                continue;   // palette not yet built this frame
+                return;   // palette not yet built this frame
             }
 
             IPC::SkinnedDrawWire item;
-            item.slot     = ks->second;
+            item.slot     = si.slot;
             item.numBones = e.numBones;
             item.mirror   = e.mirrored ? 1u : 0u;
-            item.texIndex = resolveTextureSlot(e.textureName);   // bindless base map (0 = white)
+            item.texIndex = resolveCachedSlot(e.textureName, si.baseNamePtr, si.baseSlot, si.baseEpoch);
             item.alphaRef = e.alphaTest ? e.alphaRef : 0.0f;     // alpha-test cutout (0 = no test)
 
             const std::size_t paletteBytes = (std::size_t)e.numBones * 64;  // numBones * 16 floats
@@ -1025,44 +984,19 @@ namespace {
                 }
             }
             ++count;
-        }
-        return count;
     }
 
-    // Tier 4 multi-map: gather this frame's visible STATIC multi-map parts (dark/detail/glow
-    // siblings) into g_multiMapScratch as MultiMapDrawWire[]. Same visible-set source as
-    // buildDrawList; multi-map keys are EXCLUDED from buildDrawList's static loop (they need the
-    // wide stride-60 VB + multimap pipeline), so the two lists are disjoint over the same set.
-    // The ORDERED stage list is built here on the CLIENT, replicating rendercachedcolor.cpp::
-    // buildCacheStages EXACTLY (present maps pushed with their op + UV set, stable-sorted by
-    // texCoordSet ascending — MW assigns the D3D stage index = texCoordSet, not the map slot).
-    // Returns the packed item count (0 if nothing multi-map / path unavailable).
-    std::uint32_t buildMultiMapDrawList() {
-        if (!g_multiMapVec) {
-            return 0;
-        }
-        const auto& keys = DistantLand::frustumVisibleKeys();
-        const auto& cacheMap = MGE::GeometryCache::cache();
-
-        g_multiMapScratch.clear();
-        std::uint32_t count = 0;
-        for (std::uint32_t key : keys) {
-            auto ks = g_keySlot.find(key);
-            if (ks == g_keySlot.end()) {
-                continue;   // not an uploaded part (or not yet shipped)
-            }
-            auto ce = cacheMap.find(key);
-            if (ce == cacheMap.end()) {
-                continue;   // evicted since the visible-set build
-            }
-            const auto& e = ce->second;
-            // Must match the capture-side isMultiMap condition + the static loop's filters:
-            // non-landscape, textured, opaque, non-skinned, with a dark/detail/glow sibling.
-            if (e.isSky) continue;   // sky rides the Forge alpha-blend sky pass (buildSkyDrawList)
-            if (e.isLandscape || e.isSkinned || !e.d3dTexture) continue;
-            if (e.blendEnable) continue;
-            if (!(e.d3dDark || e.d3dDetail || e.d3dGlow)) continue;
-
+    // Tier 4 multi-map: emit one visible STATIC multi-map part (dark/detail/glow
+    // siblings) into g_multiMapScratch as a MultiMapDrawWire (pre-filtered by
+    // buildGeometryDrawLists; multi-map keys are EXCLUDED from the static list —
+    // wide stride-60 VB + multimap pipeline). The ORDERED stage list is built here
+    // on the CLIENT, replicating rendercachedcolor.cpp::buildCacheStages EXACTLY
+    // (present maps pushed with their op + UV set, stable-sorted by texCoordSet
+    // ascending — MW assigns the D3D stage index = texCoordSet, not the map slot).
+    // Stage textures resolve through resolveTextureSlot directly (multi-map items
+    // are rare — a handful per frame — not worth SlotInfo fields for 4 maps).
+    void emitMultiMapDraw(SlotInfo& si, const MGE::GeometryCache::CachedGeometry& e,
+                          std::uint32_t& count) {
             // Build the ordered stage list, replicating buildCacheStages. A present map is usable
             // only if the wide VB carries the UV set it samples (uv < uvSetCount) — cacheMapActive.
             // Base is pushed unconditionally (e.d3dTexture); the others gated by cacheMapActive.
@@ -1082,7 +1016,7 @@ namespace {
             }
 
             IPC::MultiMapDrawWire item = {};
-            item.slot = ks->second;
+            item.slot = si.slot;
             memcpy(item.world, e.worldTransformD3D, 16 * sizeof(float));
             // CAMERA-RELATIVE: shift translation by -eye (see buildDrawList).
             item.world[12] -= DistantLand::eyePos.x;
@@ -1102,8 +1036,78 @@ namespace {
             g_multiMapScratch.resize(at + sizeof(item));
             memcpy(g_multiMapScratch.data() + at, &item, sizeof(item));
             ++count;
+    }
+
+    // Cut 2 (dense-city frame attack): ONE pass over the visible set builds all three
+    // geometry draw lists. Previously three functions each re-iterated
+    // frustumVisibleKeys with their own g_keySlot + cache-map finds — 3x the hash
+    // work on the frame's hottest client loop — and re-resolved every texture name
+    // through resolveTextureSlot's normalize (heap string) + string-hash find every
+    // frame (now SlotInfo-cached, see resolveCachedSlot). Emission order within each
+    // list is unchanged (same key iteration order), so the wire bytes are identical.
+    //
+    // Source = MGE's OWN current-frame frustum-visible set (frustumVisibleKeys /
+    // buildFrustumVisibleSet, built in renderStage0) — the SAME source the proven D3D9
+    // cache color path (renderCachedOpaque) consumes. This is adaptive and decouples the
+    // Forge near draw from the MWSE occlusion plugin entirely:
+    //   - plugin ON  → buildFrustumVisibleSet fills it from the engine's drawn set
+    //     (s_visibleKeys: de-duped, one LOD per object, occlusion-correct, CURRENT frame).
+    //   - plugin OFF → frustum-only fallback (whole-cache frustum walk). Near still renders.
+    //
+    // Dispatch replicates the three old loops' per-entry filters EXACTLY:
+    //   - skinned first (stride-44 VB + GPU palette pipeline), regardless of texture.
+    //   - !d3dTexture: drops UNTEXTURED entries — the worldPickObjectRoot collision
+    //     proxies that mirror each visual object; drawing them z-fights movers. This is
+    //     THE de-dup. (Do NOT also filter isPickRoot — legit movers like dropped
+    //     items/projectiles LIVE in the pick root and ARE textured.)
+    //   - blendEnable (non-landscape): alpha-blended OBJECTS stay on the engine/alpha
+    //     path. Terrain is the exception — the D9 oracle draws ALL isLandscape
+    //     regardless of blendEnable (alpha-splat trishapes included).
+    //   - non-landscape parts with dark/detail/glow siblings → multi-map pipeline
+    //     (stride-60 wide VB); everything else (terrain included) → static pipeline.
+    void buildGeometryDrawLists(std::uint32_t& drawCount, std::uint32_t& skinnedCount,
+                                std::uint32_t& multiMapCount) {
+        drawCount = 0;
+        skinnedCount = 0;
+        multiMapCount = 0;
+        const auto& keys = DistantLand::frustumVisibleKeys();
+        const auto& cacheMap = MGE::GeometryCache::cache();
+
+        g_drawScratch.clear();
+        g_drawScratch.reserve(keys.size() * sizeof(IPC::DrawItemWire));
+        g_skinnedScratch.clear();
+        g_multiMapScratch.clear();
+
+        const bool wantStatic  = (bool)g_drawVec;
+        const bool wantSkinned = (bool)g_skinnedVec;
+        const bool wantMM      = (bool)g_multiMapVec;
+        if (!wantStatic && !wantSkinned && !wantMM) {
+            return;
         }
-        return count;
+
+        for (std::uint32_t key : keys) {
+            auto ks = g_keySlot.find(key);
+            if (ks == g_keySlot.end()) {
+                continue;   // not an uploaded part (or not yet shipped)
+            }
+            auto ce = cacheMap.find(key);
+            if (ce == cacheMap.end()) {
+                continue;   // evicted since the visible-set build
+            }
+            const auto& e = ce->second;
+            if (e.isSky) continue;   // sky rides the Forge alpha-blend sky pass (buildSkyDrawList)
+            if (e.isSkinned) {
+                if (wantSkinned) emitSkinnedDraw(ks->second, e, skinnedCount);
+                continue;
+            }
+            if (!e.d3dTexture) continue;
+            if (!e.isLandscape && e.blendEnable) continue;
+            if (!e.isLandscape && (e.d3dDark || e.d3dDetail || e.d3dGlow)) {
+                if (wantMM) emitMultiMapDraw(ks->second, e, multiMapCount);
+            } else if (wantStatic) {
+                emitStaticDraw(ks->second, e, drawCount);
+            }
+        }
     }
 
     // Tier 3a: gather this frame's point lights into g_lightScratch as PointLightWire[]. Source is
@@ -1178,14 +1182,19 @@ namespace {
         struct SkyCand { std::uint16_t order; const MGE::GeometryCache::CachedGeometry* e; std::uint32_t slot; };
         static std::vector<SkyCand> cands;   // single-threaded; reused frame-to-frame
         cands.clear();
+        // Eviction is a periodic sweep now, so this whole-cache scan must skip stale
+        // entries itself: a sky shape the walk stopped visiting (moon set, weather
+        // change → appCulled) would otherwise keep drawing until the next sweep.
+        const auto cacheFrame = MGE::GeometryCache::currentFrame();
         for (const auto& kv : cacheMap) {
             const auto& e = kv.second;
             if (!e.isSky) continue;
+            if (e.lastFrame != cacheFrame) continue;   // stale (awaiting eviction sweep)
             auto ks = g_keySlot.find(kv.first);
             if (ks == g_keySlot.end()) {
                 continue;   // not yet uploaded to the host
             }
-            cands.push_back({ e.skyOrder, &e, ks->second });
+            cands.push_back({ e.skyOrder, &e, ks->second.slot });
         }
         std::sort(cands.begin(), cands.end(),
                   [](const SkyCand& a, const SkyCand& b) { return a.order < b.order; });
@@ -1332,9 +1341,7 @@ namespace RenderProcess {
         std::uint32_t drawCount, skinnedCount, multiMapCount, lightCount, skyCount;
         {
             MGE_ZoneScopedN("Forge build draw lists");
-            drawCount = buildDrawList();
-            skinnedCount = buildSkinnedDrawList();
-            multiMapCount = buildMultiMapDrawList();
+            buildGeometryDrawLists(drawCount, skinnedCount, multiMapCount);
             lightCount = buildLightList();
             skyCount = buildSkyDrawList();
         }
@@ -1746,15 +1753,16 @@ namespace RenderProcess {
 
         // Baseline heartbeat over every composited frame (sees the <kSpikeMs majority).
         g_hb.feed += feed; g_hb.geom += (g_kick.tGeomFlush - g_kick.tStart);
+        g_hb.build += (g_kick.tBuild - g_kick.tGeomFlush);
         g_hb.render += renderBucket; g_hb.host += hostMs; g_hb.overlap += overlap;
         g_hb.copy += (tCopy - tRender); g_hb.blit += (tEnd - tCopy); g_hb.dt += g_kick.dtPresent;
         if (feed > g_hb.maxFeed) g_hb.maxFeed = feed;
         if (g_kick.dtPresent > g_hb.maxDt) g_hb.maxDt = g_kick.dtPresent;
         if (g_kick.early) ++g_hb.earlyN;
         if (++g_hb.n >= kHeartbeatFrames) {
-            LOG::logline(">> [hb] %u frames avg: feed=%.2f geom=%.2f render=%.2f[host=%.2f] "
+            LOG::logline(">> [hb] %u frames avg: feed=%.2f geom=%.2f build=%.2f render=%.2f[host=%.2f] "
                          "overlap=%.2f copy=%.2f blit=%.2f dt=%.2f early=%u | max feed=%.2f dt=%.2f (~%.0f fps)",
-                         g_hb.n, g_hb.feed / g_hb.n, g_hb.geom / g_hb.n,
+                         g_hb.n, g_hb.feed / g_hb.n, g_hb.geom / g_hb.n, g_hb.build / g_hb.n,
                          g_hb.render / g_hb.n, g_hb.host / g_hb.n, g_hb.overlap / g_hb.n,
                          g_hb.copy / g_hb.n, g_hb.blit / g_hb.n, g_hb.dt / g_hb.n, g_hb.earlyN,
                          g_hb.maxFeed, g_hb.maxDt,
@@ -1842,10 +1850,10 @@ namespace RenderProcess {
         std::uint32_t slot;
         auto ks = g_keySlot.find(key);
         if (ks != g_keySlot.end()) {
-            slot = ks->second;
+            slot = ks->second.slot;
         } else {
             slot = g_nextSlot++;
-            g_keySlot.emplace(key, slot);
+            g_keySlot.emplace(key, SlotInfo{ slot });
         }
 
         IPC::GeomPartWire hdr = {};
@@ -1885,10 +1893,10 @@ namespace RenderProcess {
         std::uint32_t slot;
         auto ks = g_keySlot.find(key);
         if (ks != g_keySlot.end()) {
-            slot = ks->second;
+            slot = ks->second.slot;
         } else {
             slot = g_nextSlot++;
-            g_keySlot.emplace(key, slot);
+            g_keySlot.emplace(key, SlotInfo{ slot });
         }
 
         IPC::GeomPartWire hdr = {};
@@ -1929,10 +1937,10 @@ namespace RenderProcess {
         std::uint32_t slot;
         auto ks = g_keySlot.find(key);
         if (ks != g_keySlot.end()) {
-            slot = ks->second;
+            slot = ks->second.slot;
         } else {
             slot = g_nextSlot++;
-            g_keySlot.emplace(key, slot);
+            g_keySlot.emplace(key, SlotInfo{ slot });
         }
 
         IPC::GeomPartWire hdr = {};
