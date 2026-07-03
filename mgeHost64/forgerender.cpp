@@ -1133,6 +1133,23 @@ namespace {
         DescriptorSet* pPerBatchSetSky = nullptr;          // gBatch bound to pSkyWorldsBuf, 1 instance
         Buffer*        pSkyInstanceBuf = nullptr;          // per-draw instance VB (kStaticInstU32 slots), CPU-mapped
 
+        // --- AT1: sorted-alpha pass (alpha-blended world shapes, after water) ---------
+        // The scene-1 blended set (banners/tapestries/foliage/glass) MW used to draw over the
+        // Forge composite. Reuses opaque.vert + the GeomVertexWire layout (vl) with a dedicated
+        // alpha.frag (real alpha out: tex.a * vcolA * matAlpha). Depth GEQUAL test ON / write OFF
+        // against the completed opaque+DL+water depth; the CLIENT ships the list back-to-front
+        // sorted, so the host draws in received order. Cull NONE: MW sorted alpha is thin
+        // double-sided geometry (NiStencilProperty DRAW_BOTH, which the cache does NOT capture) —
+        // CULL_BACK killed panes/banners viewed from behind in-game. NONE also makes winding
+        // irrelevant, so there are no mirror PSO variants. 2 PSOs: alpha-over / additive.
+        Shader*        pAlphaShader = nullptr;
+        Pipeline*      pAlphaPipeline = nullptr;           // SRCALPHA/INVSRCALPHA, cull NONE
+        Pipeline*      pAlphaPipelineAdd = nullptr;        // SRCALPHA/ONE additive, cull NONE
+        Pipeline*      pAlphaPipelineDebug = nullptr;      // bring-up: alpha-over, depth OFF, cull NONE (panel toggle)
+        Buffer*        pAlphaWorldsBuf = nullptr;          // gBatch: one 64KB world window (kMaxAlphaDraws x 64B)
+        DescriptorSet* pPerBatchSetAlpha = nullptr;        // gBatch bound to pAlphaWorldsBuf, 1 instance
+        Buffer*        pAlphaInstanceBuf = nullptr;        // per-draw instance VB (kStaticInstU32 slots), CPU-mapped
+
         // --- WT1: Forge water takeover (host-generated geo-clipmap surface) -----------
         // Reuses the SAME SrtData/default.rootsig: the per-LOD-level worlds + packed params + invVP
         // ride gBatch.worlds (pWaterWorldsBuf, one window) exactly like the sky path; the 4 water SRVs
@@ -1275,6 +1292,7 @@ namespace {
            kGpuPhaseColorSkin,  // GPU palette skinning loop
            kGpuPhaseColorMM,    // multi-map (dark/detail/glow) loop
            kGpuPhaseColorDL,    // dlLiveRecord (distant land + DL statics)
+           kGpuPhaseColorAlpha, // AT1 sorted-alpha pass (after water, before resolve)
            kGpuPhaseCount };
 
     // Tier 4 multi-map: ONE 64KB world window holds kBatchSize(1024) matrices; cap at 256
@@ -1288,6 +1306,10 @@ namespace {
     // SK1 sky: per-frame sky draw cap (must match IPC::kMaxSkyDraws). SK1 draws only the dome;
     // the full sky subtree is ~15 shapes (SK2). One 64KB world window (< 1024 matrices) holds them.
     constexpr uint32_t kMaxSkyDraws = 64;
+
+    // AT1 sorted alpha: per-frame alpha draw cap (must match IPC::kMaxAlphaDraws). Exactly one
+    // 64KB world window (1024 x 64B matrices) — dense cities run a few hundred blended shapes.
+    constexpr uint32_t kMaxAlphaDraws = 1024;
 
     // WT1 Forge water: the geo-clipmap (port of MGE initWaterLodMesh, distantinit.cpp:1047) — 6 LOD
     // levels, finest cell 128u, 64 cells/side, T-junction stitch + 4 trim variants/level. The host
@@ -2689,6 +2711,125 @@ namespace {
             updateDescriptorSet(R, 0, g_live.pPerBatchSetSky, 1, &skp);
         }
 
+        // --- AT1: sorted-alpha shader + 2 blend PSOs + world window + instance VB ---------------
+        // opaque.vert (SAME vl + SrtData/default.rootsig — SV_Position matches the prepass exactly)
+        // + a dedicated alpha.frag that keeps the full Tier 1/2b/3a lighting but outputs REAL alpha
+        // (tex.a * vcolA * matAlpha) for the SRCALPHA blend. Depth GEQUAL test ON / write OFF: the
+        // pass runs after opaque+DL+water have completed depth, so blended shapes occlude correctly
+        // behind Forge walls (the original bug) without disturbing the depth buffer. Cull NONE
+        // (see LiveState comment — double-sided thin alpha; winding-agnostic, no mirror variants).
+        {
+            ShaderLoadDesc aDesc = {};
+            aDesc.mVert.pFileName = "opaque.vert";
+            aDesc.mFrag.pFileName = "alpha.frag";
+            addShader(R, &aDesc, &g_live.pAlphaShader);
+            if (!g_live.pAlphaShader) {
+                std::printf("[forge] addShader(alpha) FAILED\n");
+                return false;
+            }
+
+            DepthStateDesc alphaDepth = {};
+            alphaDepth.mDepthTest = true;
+            alphaDepth.mDepthWrite = false;
+            alphaDepth.mDepthFunc = CMP_GEQUAL;   // reverse-Z: pass when nearer-or-equal
+
+            // Alpha-over (the sky pass's premultiplied-coverage convention: colour
+            // SRCALPHA/INVSRCALPHA, alpha ONE/INVSRCALPHA so RT coverage accumulates for the
+            // present-seam ONE/INVSRCALPHA composite).
+            BlendStateDesc alphaBlend = {};
+            alphaBlend.mSrcFactors[0]      = BC_SRC_ALPHA;
+            alphaBlend.mDstFactors[0]      = BC_ONE_MINUS_SRC_ALPHA;
+            alphaBlend.mSrcAlphaFactors[0] = BC_ONE;
+            alphaBlend.mDstAlphaFactors[0] = BC_ONE_MINUS_SRC_ALPHA;
+            alphaBlend.mBlendModes[0]      = BM_ADD;
+            alphaBlend.mBlendAlphaModes[0] = BM_ADD;
+            alphaBlend.mColorWriteMasks[0] = COLOR_MASK_ALL;
+            alphaBlend.mRenderTargetMask   = BLEND_STATE_TARGET_0;
+            alphaBlend.mIndependentBlend   = false;
+            // Additive variant (SRCALPHA/ONE — glows, magic effects on statics).
+            BlendStateDesc alphaBlendAdd = alphaBlend;
+            alphaBlendAdd.mDstFactors[0]      = BC_ONE;
+            alphaBlendAdd.mDstAlphaFactors[0] = BC_ONE;
+
+            RasterizerStateDesc alphaRaster = {};
+            alphaRaster.mCullMode = CULL_MODE_NONE;
+            alphaRaster.mFrontFace = FRONT_FACE_CCW;
+
+            PipelineDesc apd = {};
+            apd.mType = PIPELINE_TYPE_GRAPHICS;
+            GraphicsPipelineDesc& ag = apd.mGraphicsDesc;
+            ag.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+            ag.mRenderTargetCount = 1;
+            ag.pColorFormats = &g_live.pRT->mFormat;
+            ag.mSampleCount = (SampleCount)g_live.sampleCount;
+            ag.mSampleQuality = 0;
+            ag.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+            ag.pDepthState = &alphaDepth;
+            ag.pBlendState = &alphaBlend;
+            ag.pVertexLayout = &vl;                 // reuse the opaque GeomVertexWire layout
+            ag.pRasterizerState = &alphaRaster;
+            ag.pShaderProgram = g_live.pAlphaShader;
+            addPipeline(R, &apd, &g_live.pAlphaPipeline);
+            ag.pBlendState = &alphaBlendAdd;
+            addPipeline(R, &apd, &g_live.pAlphaPipelineAdd);
+            if (!g_live.pAlphaPipeline || !g_live.pAlphaPipelineAdd) {
+                std::printf("[forge] addPipeline(alpha x2) FAILED\n");
+                return false;
+            }
+
+            // Bring-up debug PSO (dev-panel "ALPHA: depth OFF"): alpha-over with depth test
+            // disabled — draws every received alpha item unconditionally on top, isolating
+            // depth-kill from shader/blend/transform issues in-game.
+            DepthStateDesc alphaDepthOff = {};
+            alphaDepthOff.mDepthTest = false;
+            alphaDepthOff.mDepthWrite = false;
+            ag.pDepthState = &alphaDepthOff;
+            ag.pBlendState = &alphaBlend;
+            addPipeline(R, &apd, &g_live.pAlphaPipelineDebug);
+            ag.pDepthState = &alphaDepth;   // restore for clarity (apd is local; no later use)
+            if (!g_live.pAlphaPipelineDebug) {
+                std::printf("[forge] addPipeline(alpha debug) FAILED\n");
+                return false;
+            }
+
+            // One 64KB world window (kMaxAlphaDraws x 64B exactly) + per-draw instance VB.
+            BufferLoadDesc awb = {};
+            awb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            awb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            awb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            awb.mDesc.mSize = kBatchBytes;
+            awb.mDesc.pName = "alphaWorldsCbv";
+            awb.pData = nullptr;
+            awb.ppBuffer = &g_live.pAlphaWorldsBuf;
+            addResource(&awb, nullptr);
+
+            BufferLoadDesc aib = {};
+            aib.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+            aib.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            aib.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            aib.mDesc.mSize = (uint64_t)kMaxAlphaDraws * kStaticInstU32 * sizeof(uint32_t);
+            aib.mDesc.pName = "instanceVBAlpha";
+            aib.pData = nullptr;
+            aib.ppBuffer = &g_live.pAlphaInstanceBuf;
+            addResource(&aib, nullptr);
+
+            waitForAllResourceLoads();
+            if (!g_live.pAlphaWorldsBuf || !g_live.pAlphaInstanceBuf) {
+                return false;
+            }
+
+            // Alpha PerBatch set (1 instance): gBatch = the single alpha world window.
+            DescriptorSetDesc abDesc = SRT_SET_DESC(SrtData, PerBatch, 1, 0);
+            addDescriptorSet(R, &abDesc, &g_live.pPerBatchSetAlpha);
+            if (!g_live.pPerBatchSetAlpha) {
+                return false;
+            }
+            DescriptorData abp = {};
+            abp.mIndex = SRT_RES_IDX(SrtData, PerBatch, gBatch);
+            abp.ppBuffers = &g_live.pAlphaWorldsBuf;
+            updateDescriptorSet(R, 0, g_live.pPerBatchSetAlpha, 1, &abp);
+        }
+
         // --- WT1: Forge water (host-generated geo-clipmap surface) ------------------------------
         // Own position-only vertex layout (float3 + per-instance DrawIndex=level). Reuses the shared
         // SrtData/default.rootsig: worlds+params ride gBatch (pWaterWorldsBuf, one window, like sky),
@@ -3218,6 +3359,7 @@ namespace {
     unsigned  g_lastSkinnedDrawn = 0;  // skinned parts actually drawn in the last renderScene
     unsigned  g_lastMultiMapDrawn = 0; // multi-map parts actually drawn in the last renderScene
     unsigned  g_lastSkyDrawn = 0;      // SK1 sky parts actually drawn in the last renderScene
+    unsigned  g_lastAlphaDrawn = 0;    // AT1 sorted-alpha parts actually drawn in the last renderScene
     unsigned  g_lastLightCount = 0;    // point lights uploaded in the last renderScene
     // Phase 0 panel readouts: extra per-frame counters + single-frame timings (the 300-frame
     // accumulators g_recAccum/g_gpuAccum are for the heartbeat; these are this frame's values).
@@ -3275,6 +3417,9 @@ namespace {
     // drops the same frame (a skipped rebuild means a stale pyramid), so occlusion passes through.
     bool g_hizPrologue   = true;
     bool g_drawWater     = true;
+    // AT1 bring-up: draw the alpha list with the depth-OFF debug PSO (panel toggle) —
+    // separates depth kills from shader/blend/transform issues without a rebuild.
+    bool g_alphaDebugNoDepth = false;
     bool g_drawReflect   = true;
     bool g_drawReflectGeo = true;   // WV2: reflect host-owned land + statics (off = sky-only reflection)
     bool g_reflHorizonScissor = true; // WV2 perf: scissor the reflect pass to below the water-plane horizon
@@ -3472,6 +3617,8 @@ namespace {
         uiAddComponentWidget(g_uiPanel, "-- Forge subsystems (off = show MW) --", &subLbl, WIDGET_TYPE_LABEL);
         CheckboxWidget cDSky = {}; cDSky.pData = &g_drawSky;
         uiAddComponentWidget(g_uiPanel, "Draw: sky", &cDSky, WIDGET_TYPE_CHECKBOX);
+        CheckboxWidget cADbg = {}; cADbg.pData = &g_alphaDebugNoDepth;
+        uiAddComponentWidget(g_uiPanel, "ALPHA: depth OFF (debug)", &cADbg, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cDLand = {}; cDLand.pData = &g_drawDLLand;
         uiAddComponentWidget(g_uiPanel, "Draw: distant land", &cDLand, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cDStat = {}; cDStat.pData = &g_drawDLStatics;
@@ -3528,13 +3675,13 @@ namespace {
         // Phase 0: refresh the live-stats text from this frame's counters (Forge bformat pattern).
         bformat(&g_statsText,
                 "near opaque %u | skinned %u | multimap %u\n"
-                "sky %u | reflect-sky %u | lights %u\n"
+                "sky %u | reflect-sky %u | lights %u | alpha %u\n"
                 "DL land %u | DL statics %u inst / %u subsets\n"
                 "water levels %u\n"
                 "host %.2f ms = setup %.2f + cull %.2f + rec %.2f + gpu %.2f + post %.2f\n"
                 "gpu: prepass %.2f gtao %.2f reflect %.2f color %.2f water %.2f resolve %.2f",
                 g_lastDrawn, g_lastSkinnedDrawn, g_lastMultiMapDrawn,
-                g_lastSkyDrawn, g_lastReflSkyDrawn, g_lastLightCount,
+                g_lastSkyDrawn, g_lastReflSkyDrawn, g_lastLightCount, g_lastAlphaDrawn,
                 g_liveLastLand, g_liveLastInst, g_liveLastSubsets,
                 g_lastWaterLevels,
                 g_lastTotalMs, g_lastSetupMs, g_lastCullMs, g_lastRecMs, g_lastGpuMs, g_lastPostMs,
@@ -3854,6 +4001,7 @@ namespace ForgeRender {
                      const void* multiMapBlob, unsigned multiMapCount, unsigned multiMapBytes,
                      const void* lightBlob, unsigned lightCount, unsigned lightBytes,
                      const void* skyBlob, unsigned skyCount, unsigned skyBytes,
+                     const void* alphaBlob, unsigned alphaCount, unsigned alphaBytes,
                      const float* waterParams, unsigned waterEnabled) {
         if (!g_live.pRenderer) {
             return false;
@@ -5280,6 +5428,134 @@ namespace ForgeRender {
         cmdBindRenderTargets(g_live.pCmd, nullptr);
 
         gpuPhaseEnd(kGpuPhaseWater);
+
+        // ===================== AT1: SORTED-ALPHA PASS =====================
+        // The scene-1 blended world shapes (banners/tapestries/foliage/glass), drawn AFTER water so
+        // the whole opaque+DL+water frame is complete: depth GEQUAL test (no write) makes them
+        // occlude correctly behind Forge walls — the bug this pass exists to fix. The CLIENT ships
+        // the list back-to-front sorted (MW's sorter criterion), so we draw in received order with
+        // a per-draw blend-PSO pick (alpha-over / additive; cull NONE). Sky-pass clone: each
+        // item writes its world into pAlphaWorldsBuf[idx] + its instance data into
+        // pAlphaInstanceBuf[idx], drawn with firstInstance=idx. matAlpha bit-casts into the spare
+        // overlay instance slot [11] (alpha.frag reads asfloat(In.OverlayIndex)).
+        uint32_t alphaDrawn = 0;
+        gpuPhaseBegin(kGpuPhaseColorAlpha);
+        if (alphaBlob && alphaCount && alphaBytes && g_live.pAlphaPipeline && g_live.pAlphaWorldsBuf) {
+            const uint32_t haveAlpha = alphaBytes / (uint32_t)sizeof(IPC::AlphaDrawWire);
+            uint32_t nAlpha = (alphaCount < haveAlpha) ? alphaCount : haveAlpha;
+            if (nAlpha > kMaxAlphaDraws) { nAlpha = kMaxAlphaDraws; }
+            const IPC::AlphaDrawWire* alphaItems = (const IPC::AlphaDrawWire*)alphaBlob;
+
+            // Bring-up diagnostic: dump the first frame's items once (wire ground truth — blend
+            // pair, matAlpha, camera-relative translation, mesh validity). Remove after verify.
+            static bool s_alphaDumped = false;
+            if (!s_alphaDumped) {
+                s_alphaDumped = true;
+                LOG::logline(">> [alpha-dump] nAlpha=%u (count=%u bytes=%u)", nAlpha, alphaCount, alphaBytes);
+                const uint32_t nDump = (nAlpha < 12u) ? nAlpha : 12u;
+                for (uint32_t k = 0; k < nDump; ++k) {
+                    const IPC::AlphaDrawWire& it = alphaItems[k];
+                    const bool haveMesh = (it.slot < g_meshHigh) && g_meshes[it.slot].valid;
+                    LOG::logline(">> [alpha-dump] #%u slot=%u tex=%u blend=%u/%u aRef=%.2f matA=%.2f "
+                                 "vcs=%u mir=%d t=(%.0f,%.0f,%.0f) mesh=%s idx=%u",
+                                 k, it.slot, it.texIndex, it.srcBlend, it.destBlend, it.alphaRef,
+                                 it.matAlpha, it.vColSource, worldMirrored(it.world) ? 1 : 0,
+                                 it.world[12], it.world[13], it.world[14],
+                                 haveMesh ? (g_meshes[it.slot].skinned ? "SKINNED" :
+                                             g_meshes[it.slot].multimap ? "MULTIMAP" : "ok") : "MISSING",
+                                 haveMesh ? g_meshes[it.slot].indexCount : 0);
+                }
+                LOG::flush();
+            }
+
+            // Re-bind the colour pass (LOAD/LOAD) — the water pass leaves the targets unbound.
+            BindRenderTargetsDesc abind = {};
+            abind.mRenderTargetCount = 1;
+            abind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };
+            abind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_LOAD };
+            cmdBindRenderTargets(g_live.pCmd, &abind);
+            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+
+            // Bind a pipeline FIRST (establishes the shared default.rootsig for the descriptor
+            // binds); the loop switches between the 4 blend/winding PSOs per draw.
+            cmdBindPipeline(g_live.pCmd, g_live.pAlphaPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetAlpha);
+            Pipeline* curAlphaPipe = g_live.pAlphaPipeline;
+
+            for (uint32_t k = 0; k < nAlpha; ++k) {
+                const IPC::AlphaDrawWire& it = alphaItems[k];
+                const uint32_t slot = it.slot;
+                if (slot >= g_meshHigh || !g_meshes[slot].valid) {
+                    continue;   // mesh not uploaded yet
+                }
+                HostMesh& m = g_meshes[slot];
+                if (m.skinned || m.multimap) {
+                    continue;   // AT1 draws the lean GeomVertexWire layout only
+                }
+                const uint32_t idx = alphaDrawn;
+
+                // Blend-pair pick (sky-pass convention): SRCALPHA/INVSRCALPHA = alpha-over,
+                // SRCALPHA/ONE = additive, anything else falls back to alpha-over + one log.
+                const bool additive = (it.srcBlend == kD3DBLEND_SRCALPHA && it.destBlend == kD3DBLEND_ONE);
+                if (!additive && !(it.srcBlend == kD3DBLEND_SRCALPHA && it.destBlend == kD3DBLEND_INVSRCALPHA)) {
+                    static bool warnedAlphaBlend = false;
+                    if (!warnedAlphaBlend) {
+                        std::printf("[forge][alpha] unhandled blend pair src=%u dst=%u -> alpha-over fallback\n",
+                                    it.srcBlend, it.destBlend);
+                        warnedAlphaBlend = true;
+                    }
+                }
+                Pipeline* want = additive ? g_live.pAlphaPipelineAdd : g_live.pAlphaPipeline;
+                if (g_alphaDebugNoDepth && g_live.pAlphaPipelineDebug) {
+                    want = g_live.pAlphaPipelineDebug;   // bring-up: depth off, alpha-over
+                }
+                if (want != curAlphaPipe) {
+                    cmdBindPipeline(g_live.pCmd, want);
+                    curAlphaPipe = want;
+                }
+
+                uint8_t* dst = (uint8_t*)g_live.pAlphaWorldsBuf->pCpuMappedAddress;
+                std::memcpy(dst + (size_t)idx * 64, it.world, 64);
+
+                uint32_t* inst = (uint32_t*)g_live.pAlphaInstanceBuf->pCpuMappedAddress;
+                inst[idx * kStaticInstU32 + 0] = idx;   // DrawIndex → gBatch.worlds[idx]
+                inst[idx * kStaticInstU32 + 1] = packTexAlpha(it.texIndex, it.alphaRef, it.vColSource);
+                float* finst = (float*)inst;
+                finst[idx * kStaticInstU32 + 2]  = it.matDiffuse[0];
+                finst[idx * kStaticInstU32 + 3]  = it.matDiffuse[1];
+                finst[idx * kStaticInstU32 + 4]  = it.matDiffuse[2];
+                finst[idx * kStaticInstU32 + 5]  = it.matAmbient[0];
+                finst[idx * kStaticInstU32 + 6]  = it.matAmbient[1];
+                finst[idx * kStaticInstU32 + 7]  = it.matAmbient[2];
+                finst[idx * kStaticInstU32 + 8]  = it.matEmissive[0];
+                finst[idx * kStaticInstU32 + 9]  = it.matEmissive[1];
+                finst[idx * kStaticInstU32 + 10] = it.matEmissive[2];
+                // matAlpha rides the overlay slot [11] (opaque.vert reads it as a uint;
+                // alpha.frag asfloat's it back — the terrain splat doesn't run in this frag).
+                finst[idx * kStaticInstU32 + 11] = it.matAlpha;
+
+                Buffer*  meshVb     = m.inArena ? g_live.pArenaVB : m.vb;
+                Buffer*  meshIb     = m.inArena ? g_live.pArenaIB : m.ib;
+                uint32_t firstVertex = m.inArena ? (uint32_t)(m.vbOff / sizeof(IPC::GeomVertexWire)) : 0u;
+                uint32_t firstIndex  = m.inArena ? (uint32_t)(m.ibOff / sizeof(uint16_t)) : 0u;
+                if (!meshVb || !meshIb) {
+                    continue;
+                }
+                Buffer*  vbs[2]     = { meshVb, g_live.pAlphaInstanceBuf };
+                uint32_t strides[2] = { vStride, iStride };
+                cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                cmdBindIndexBuffer(g_live.pCmd, meshIb, INDEX_TYPE_UINT16, 0);
+                cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, firstIndex, 1, firstVertex, idx);
+                ++alphaDrawn;
+            }
+            cmdBindRenderTargets(g_live.pCmd, nullptr);
+        }
+        gpuPhaseEnd(kGpuPhaseColorAlpha);
+
         gpuPhaseBegin(kGpuPhaseResolve);
         if (g_live.sampleCount > 1) {
             // MSAA: resolve the multisampled color into the shared single-sample RT, then leave
@@ -5484,6 +5760,7 @@ namespace ForgeRender {
         g_lastSkinnedDrawn = skinnedDrawn;
         g_lastMultiMapDrawn = multiMapDrawn;
         g_lastSkyDrawn = skyDrawn;
+        g_lastAlphaDrawn = alphaDrawn;
 
         // Host-side heartbeat to mgeHost64.log (LOG::logline; LOGF goes to uncaptured stdout).
         // dynamic = meshes in the upload-heap ring (must stay tiny — hundreds = over-promotion);
@@ -5494,9 +5771,9 @@ namespace ForgeRender {
         g_lastPostMs  = hostNowMs() - (tRec1 + gpuMs);
         g_lastTotalMs = hostNowMs() - tEntry;
         if ((g_renderFrame % 300u) == 0u) {
-            LOG::logline(">> [forge-hb] frame=%u drawn=%u skinned=%u multimap=%u sky=%u dynamic=%u meshHigh=%u "
+            LOG::logline(">> [forge-hb] frame=%u drawn=%u skinned=%u multimap=%u sky=%u alpha=%u dynamic=%u meshHigh=%u "
                          "| record=%.2fms gpu=%.2fms (avg/frame over 300)",
-                         g_renderFrame, drawn, skinnedDrawn, multiMapDrawn, skyDrawn, g_dynamicCount, g_meshHigh,
+                         g_renderFrame, drawn, skinnedDrawn, multiMapDrawn, skyDrawn, alphaDrawn, g_dynamicCount, g_meshHigh,
                          g_recAccum / 300.0, g_gpuAccum / 300.0);
             // Host-frame split (this frame's instantaneous values) so the ~2ms "unaccounted inside the
             // host" the client saw is localized: setup (per-draw memcpy) + cull (DL CPU cull + lazy
@@ -5517,11 +5794,12 @@ namespace ForgeRender {
                          g_lastHizGpuMs, g_hizOverruns);
             // Host-GPU-shrink sub-phases: WHERE inside color/reflect the ms live. sky+near+skin+mm+dl
             // ≈ color above (same frame's timestamps); refl sky = reflect − reflgeo.
-            LOG::logline(">> [forge-hb] gpu color sub: sky=%.2f near=%.2f skin=%.2f mm=%.2f dl=%.2f"
+            LOG::logline(">> [forge-hb] gpu color sub: sky=%.2f near=%.2f skin=%.2f mm=%.2f dl=%.2f alpha=%.2f"
                          " | refl geo=%.2f (refl sky=%.2f) ms",
                          g_lastGpuPhaseMs[kGpuPhaseColorSky],  g_lastGpuPhaseMs[kGpuPhaseColorNear],
                          g_lastGpuPhaseMs[kGpuPhaseColorSkin], g_lastGpuPhaseMs[kGpuPhaseColorMM],
                          g_lastGpuPhaseMs[kGpuPhaseColorDL],
+                         g_lastGpuPhaseMs[kGpuPhaseColorAlpha],
                          g_lastGpuPhaseMs[kGpuPhaseReflGeo],
                          g_lastGpuPhaseMs[kGpuPhaseReflect] - g_lastGpuPhaseMs[kGpuPhaseReflGeo]);
             // Whole-frame GPU EXECUTION vs submit->fence WALL clock. If exec << wall, the frame is
@@ -9177,6 +9455,13 @@ namespace ForgeRender {
         if (g_live.pSkyPipeline)            { removePipeline(R, g_live.pSkyPipeline); }
         if (g_live.pSkyPipelineAdd)         { removePipeline(R, g_live.pSkyPipelineAdd); }
         if (g_live.pSkyShader)              { removeShader(R, g_live.pSkyShader); }
+        if (g_live.pPerBatchSetAlpha)       { removeDescriptorSet(R, g_live.pPerBatchSetAlpha); }
+        if (g_live.pAlphaWorldsBuf)         { removeResource(g_live.pAlphaWorldsBuf); }
+        if (g_live.pAlphaInstanceBuf)       { removeResource(g_live.pAlphaInstanceBuf); }
+        if (g_live.pAlphaPipeline)          { removePipeline(R, g_live.pAlphaPipeline); }
+        if (g_live.pAlphaPipelineAdd)       { removePipeline(R, g_live.pAlphaPipelineAdd); }
+        if (g_live.pAlphaPipelineDebug)     { removePipeline(R, g_live.pAlphaPipelineDebug); }
+        if (g_live.pAlphaShader)            { removeShader(R, g_live.pAlphaShader); }
         // WT1 water teardown.
         if (g_live.pPerBatchSetWater)       { removeDescriptorSet(R, g_live.pPerBatchSetWater); }
         if (g_live.pWaterWorldsBuf)         { removeResource(g_live.pWaterWorldsBuf); }

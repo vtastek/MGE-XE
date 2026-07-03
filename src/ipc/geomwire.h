@@ -219,6 +219,34 @@ namespace IPC {
     // MUST match the host kMaxSkyDraws (forgerender.cpp).
     constexpr std::uint32_t kMaxSkyDraws = 64;
 
+    // AT1 sorted-alpha takeover: per-frame alpha-BLENDED world draw item (banners, tapestries,
+    // foliage, window glass — the scene-1 sorted set MW draws over the empty z-buffer when Forge
+    // owns the opaques). Like DrawItemWire it references an uploaded mesh slot + its camera-
+    // relative world; srcBlend/destBlend are the captured NiAlphaProperty D3DBLEND_* factors
+    // (SkyDrawWire's pattern — the host buckets alpha-over vs additive per draw). The CLIENT
+    // sorts the list back-to-front (MW's sorter criterion: bound-center view depth) and the host
+    // draws in received order, depth-tested against the opaque prepass but never writing.
+    // matAlpha = MaterialProperty alpha (the FFE per-draw fade); the frag does
+    // a = tex.a * vcolA * matAlpha. 128 bytes.
+    struct AlphaDrawWire {
+        std::uint32_t slot;
+        float         world[16];
+        std::uint32_t texIndex;    // bindless gTextures[] slot (0 = default white)
+        std::uint32_t srcBlend;    // D3DBLEND_* source factor
+        std::uint32_t destBlend;   // D3DBLEND_* dest factor
+        float         alphaRef;    // alpha-test ref 0..1 (0 = no test)
+        float         matDiffuse[3];
+        float         matAlpha;    // material alpha (MaterialProperty::alpha)
+        float         matAmbient[3];
+        float         matEmissive[3];
+        std::uint32_t vColSource;  // 0 none (const material), 1 emissive, 2 diffamb
+    };
+
+    // Per-frame alpha draw cap. Dense cities run a few hundred blended shapes; 1024 gives 4x
+    // headroom while keeping the world window at exactly 64KB (1024 x 64B, one CBV window).
+    // MUST match the host kMaxAlphaDraws (forgerender.cpp).
+    constexpr std::uint32_t kMaxAlphaDraws = 1024;
+
 #pragma pack(pop)
 
     // Transport chunk for the shared upload vector. The IPC Vec reserves

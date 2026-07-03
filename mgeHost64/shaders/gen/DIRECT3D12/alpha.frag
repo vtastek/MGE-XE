@@ -958,23 +958,225 @@ SamplerState gSamplerAnisotropic : register( s10 , space100 ) ;
 #line 167 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 26 "FSL/shaders.list"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/tri.frag.fsl"
+#line 45 "FSL/shaders.list"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/alpha.frag.fsl"
+#line 16 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/alpha.frag.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+STRUCT(FrameData)
+{
+    float4x4 viewProj;
 
 
 
+    float4 sunDir;
+    float4 sunCol;
+    float4 ambCol;
+    float4 fogColNear;
+    float4 fogParams;
+    float4 eyePos;
+
+
+    float4 debugParams;
+
+
+
+    float4 dbgScales;
+
+
+
+
+    float4 lodParams;
+
+    float4 lodSunAmb;
+
+
+
+
+    float4 lodEye;
+
+
+
+
+    float4 skyParams;
+
+
+
+
+
+
+    float4 gReflWaterClip;
+
+
+
+
+    float4 skyZenith;
+#line 75
+};
+
+STRUCT(BatchData)
+{
+    float4x4 worlds[ 1024 ];
+#line 80
+};
+
+
+
+
+
+
+
+
+STRUCT(LightData)
+{
+    float4 lightParams;
+    float4 lights[ 128  * 3];
+#line 93
+};
+
+        CBUFFER(FrameData) gFrameData :  register(b0,space1);
+
+
+
+
+
+        Tex2D(float4) gAO :  register(t1,space1);
+
+
+
+
+
+
+
+
+        Tex3D(float4) gWaterNormalVol :  register(t2,space1);
+        Tex2D(float4) gRefractColor :  register(t3,space1);
+        Tex2D(float4) gSceneLinDepth :  register(t4,space1);
+        Tex2D(float4) gReflectColor :  register(t5,space1);
+
+
+
+
+        CBUFFER(LightData) gLights :  register(b0,space3);
+#line 135 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+        Tex2D(float4) gTextures[ 896 ] :  register(t0,space0);
+
+
+
+        Tex2DArray(float4) gStaticsArrays[ 128 ] :  register(t896,space0);
+        CBUFFER(BatchData) gBatch :  register(b0,space2);
+#line 17 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/alpha.frag.fsl"
 
 STRUCT(VSOutput)
 {
     DATA(float4, Position, SV_Position);
+    DATA(float3, Normal, NORMAL);
+    DATA(float2, Uv, TEXCOORD0);
+    DATA(FLAT(uint), TexIndex, TEXCOORD1);
+    DATA(float, Fog, TEXCOORD2);
     DATA(float4, Color, COLOR);
-#line 9
+    DATA(float, AlphaRef, TEXCOORD3);
+    DATA(FLAT(float3),MatDiffuse, TEXCOORD4);
+    DATA(FLAT(float3),MatAmbient, TEXCOORD5);
+    DATA(FLAT(float3),MatEmissive,TEXCOORD6);
+    DATA(FLAT(uint), VColSource, TEXCOORD7);
+    DATA(float3, WorldPos, TEXCOORD8);
+    DATA(FLAT(uint), OverlayIndex,TEXCOORD9);
+#line 33
 };
 
+
+float3 tonemap(float3 c)
+{
+    c = clamp(c, 0.0f, 2.2f);
+    c = (((0.0548303f * c - 0.189786f) * c - 0.154732f) * c + 1.12969f) * c;
+    return c;
+}
+
 [RootSignature( "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)" )]
-float4 PS_MAIN(VSOutput In): SV_TARGET
+float4 PS_MAIN( VSOutput In ): SV_TARGET
 {
     //INIT_MAIN;
-    return (In.Color);
+    float3 N = normalize(In.Normal);
+
+
+    uint aoFlags = (uint)(gFrameData.debugParams.w + 0.5f);
+    float2 aoUv = In.Position.xy * gFrameData.debugParams.yz;
+    float4 aoSample = SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
+    if ((aoFlags & 2u) != 0u) { N = normalize(aoSample.rgb); }
+
+    float ndl = saturate(dot(N, -gFrameData.sunDir.xyz));
+    float3 d = gFrameData.sunCol.rgb * ndl;
+    float3 a = ((aoFlags & 4u) != 0u) ? float3(1.0f, 1.0f, 1.0f) : gFrameData.ambCol.rgb;
+    if ((aoFlags & 1u) != 0u) { a *= aoSample.a; }
+    a *= gFrameData.dbgScales.x;
+
+
+    {
+        uint nLights = (uint)gLights.lightParams.x;
+        for (uint i = 0; i < nLights; ++i)
+        {
+            float4 posR = gLights.lights[i * 3u + 0u];
+            float3 lightCol= gLights.lights[i * 3u + 1u].rgb;
+            float3 fo = gLights.lights[i * 3u + 2u].xyz;
+            float radius = posR.w;
+
+            float3 toLight = posR.xyz - In.WorldPos;
+            float dist2 = dot(toLight, toLight);
+            if (dist2 >= 4.0f * radius * radius) { continue; }
+            float invDist = rsqrt(max(dist2, 1e-8f));
+            float dist = dist2 * invDist;
+
+            float att = 1.0f / max(fo.z * dist2 + fo.y * dist + fo.x, 1e-4f);
+            att *= 1.0f - smoothstep(radius, 2.0f * radius, dist);
+
+            float lambert = saturate(dot(N, toLight) * invDist);
+            d += lambert * att * lightCol;
+        }
+    }
+    d *= gFrameData.dbgScales.y;
+
+
+    float3 lit;
+    if (In.VColSource == 2u) {
+        lit = In.Color.rgb * (d + a) + In.MatEmissive;
+    } else if (In.VColSource == 1u) {
+        lit = In.MatDiffuse * d + In.MatAmbient * a + In.Color.rgb;
+    } else {
+        lit = In.MatDiffuse * d + In.MatAmbient * a + In.MatEmissive;
+    }
+
+    float4 albedo = SampleTex2D(gTextures[In.TexIndex], gSamplerAnisotropic, In.Uv);
+
+
+    if (albedo.a < In.AlphaRef) { discard; }
+
+    albedo.rgb *= gFrameData.dbgScales.z;
+
+
+
+    float vcolA = (In.VColSource != 0u) ? In.Color.a : 1.0f;
+    float matAlpha = asfloat(In.OverlayIndex);
+    float outA = albedo.a * vcolA * matAlpha;
+
+    float3 c = albedo.rgb * lit;
+    c *= gFrameData.dbgScales.w;
+    c = tonemap(c);
+    c = lerp(gFrameData.fogColNear.rgb, c, In.Fog);
+
+
+    uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
+    if (dbg == 3u || dbg == 4u) {
+        if (dbg == 4u) { RETURN(float4(aoSample.rgb, 1.0f)); }
+        float v = aoSample.a; RETURN(float4(v, v, v, 1.0f));
+    }
+    if (dbg == 5u) { RETURN(float4(albedo.rgb, 1.0f)); }
+    if (dbg == 6u) { RETURN(float4(lit, 1.0f)); }
+    if (dbg == 1u || dbg == 2u) {
+        float dist = length(In.WorldPos - gFrameData.eyePos.xyz);
+        float g = saturate(dist * (1.0f / 8192.0f));
+        return (float4(g, g, g, 1.0f));
+    }
+    return (float4(c, outA));
 }
-#line 27 "FSL/shaders.list"
+#line 46 "FSL/shaders.list"

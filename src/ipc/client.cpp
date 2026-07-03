@@ -468,6 +468,9 @@ namespace IPC {
 		params.multiMapList = InvalidVector;
 		params.multiMapCount = 0;
 		params.multiMapBytes = 0;
+		params.alphaList = InvalidVector;
+		params.alphaCount = 0;
+		params.alphaBytes = 0;
 		params.bytesWritten = 0;
 		params.renderMs = 0.0;
 		if (!beginRpc(Command::RenderFrame)) {
@@ -491,6 +494,7 @@ namespace IPC {
 		VecId multiMapList, std::uint32_t multiMapCount, std::uint32_t multiMapBytes,
 		VecId lightList, std::uint32_t lightCount, std::uint32_t lightBytes,
 		VecId skyList, std::uint32_t skyCount, std::uint32_t skyBytes,
+		VecId alphaList, std::uint32_t alphaCount, std::uint32_t alphaBytes,
 		std::uint32_t debugMode,
 		const DevInput* devInput,
 		const float* waterParams, std::uint32_t waterEnabled) {
@@ -516,6 +520,9 @@ namespace IPC {
 		params.skyList = skyList;
 		params.skyCount = skyCount;
 		params.skyBytes = skyBytes;
+		params.alphaList = alphaList;
+		params.alphaCount = alphaCount;
+		params.alphaBytes = alphaBytes;
 		params.debugMode = debugMode;
 		// WT1 Forge water: 12 per-frame surface params + the F7 enable gate (no geometry).
 		if (waterParams) { std::memcpy(params.waterParams, waterParams, 12 * sizeof(float)); }
@@ -564,6 +571,7 @@ namespace IPC {
 		VecId multiMapList, std::uint32_t multiMapCount, std::uint32_t multiMapBytes,
 		VecId lightList, std::uint32_t lightCount, std::uint32_t lightBytes,
 		VecId skyList, std::uint32_t skyCount, std::uint32_t skyBytes,
+		VecId alphaList, std::uint32_t alphaCount, std::uint32_t alphaBytes,
 		std::uint32_t debugMode,
 		const DevInput* devInput,
 		const float* waterParams, std::uint32_t waterEnabled,
@@ -575,6 +583,7 @@ namespace IPC {
 			multiMapList, multiMapCount, multiMapBytes,
 			lightList, lightCount, lightBytes,
 			skyList, skyCount, skyBytes,
+			alphaList, alphaCount, alphaBytes,
 			debugMode, devInput, waterParams, waterEnabled)) {
 			return false;
 		}

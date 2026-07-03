@@ -98,12 +98,17 @@ namespace ForgeRender {
     // SK1: skyBlob is an array of IPC::SkyDrawWire (alpha-blended sky shapes, SK1 = the gradient
     // dome); skyCount items, skyBytes total. Drawn FIRST in the colour pass with depth off + alpha
     // blend so it sits behind the opaque world. May be null / 0 (Forge sky toggle off → MW sky).
+    // AT1: alphaBlob is an array of IPC::AlphaDrawWire (the scene-1 sorted-alpha world shapes,
+    // CLIENT-sorted back-to-front); alphaCount items, alphaBytes total. Drawn AFTER water with
+    // depth GEQUAL test + no write, per-draw blend PSO from the captured (src,dst) pair. May be
+    // null / 0 (Forge Alpha Pass off → MW draws its own sorted alpha).
     bool renderScene(const float* viewProj, const float* lighting, const void* drawBlob,
                      unsigned drawCount, unsigned drawBytes,
                      const void* skinnedBlob, unsigned skinnedCount, unsigned skinnedBytes,
                      const void* multiMapBlob, unsigned multiMapCount, unsigned multiMapBytes,
                      const void* lightBlob, unsigned lightCount, unsigned lightBytes,
                      const void* skyBlob = nullptr, unsigned skyCount = 0, unsigned skyBytes = 0,
+                     const void* alphaBlob = nullptr, unsigned alphaCount = 0, unsigned alphaBytes = 0,
                      // WT1: per-frame water params (12 floats; see bridge.h RenderFrameParameters)
                      // + the F7 water-enable gate. Null/0 ⇒ no Forge water pass this frame.
                      const float* waterParams = nullptr, unsigned waterEnabled = 0);

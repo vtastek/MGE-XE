@@ -359,6 +359,14 @@ namespace IPC {
         IN std::uint32_t devUiVisible;
         IN std::uint32_t devReloadShaders;   // one-shot (F8 edge): host rebuilds compute pipelines from disk
 
+        // AT1 sorted-alpha takeover: per-frame alpha draw list of AlphaDrawWire[] (geomwire.h) —
+        // the scene-1 blended world shapes, CLIENT-sorted back-to-front, drawn by the host after
+        // water (depth-tested GEQUAL, no write). Invalid / count 0 ⇒ no Forge alpha this frame.
+        // Appended after the dev-input fields so every existing field offset is unchanged.
+        IN VecId alphaList;
+        IN std::uint32_t alphaCount;
+        IN std::uint32_t alphaBytes;
+
         OUT std::uint32_t bytesWritten;
         OUT double renderMs;             // host-side render+readback time
     };

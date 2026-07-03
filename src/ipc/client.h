@@ -310,6 +310,7 @@ namespace IPC {
 			VecId multiMapList, std::uint32_t multiMapCount, std::uint32_t multiMapBytes,
 			VecId lightList, std::uint32_t lightCount, std::uint32_t lightBytes,
 			VecId skyList, std::uint32_t skyCount, std::uint32_t skyBytes,
+			VecId alphaList = InvalidVector, std::uint32_t alphaCount = 0, std::uint32_t alphaBytes = 0,
 			std::uint32_t debugMode = 0,
 			const DevInput* devInput = nullptr,
 			const float* waterParams = nullptr, std::uint32_t waterEnabled = 0,
@@ -331,6 +332,7 @@ namespace IPC {
 			VecId multiMapList, std::uint32_t multiMapCount, std::uint32_t multiMapBytes,
 			VecId lightList, std::uint32_t lightCount, std::uint32_t lightBytes,
 			VecId skyList, std::uint32_t skyCount, std::uint32_t skyBytes,
+			VecId alphaList = InvalidVector, std::uint32_t alphaCount = 0, std::uint32_t alphaBytes = 0,
 			std::uint32_t debugMode = 0,
 			const DevInput* devInput = nullptr,
 			const float* waterParams = nullptr, std::uint32_t waterEnabled = 0);

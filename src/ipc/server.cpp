@@ -504,7 +504,8 @@ namespace IPC {
 		LARGE_INTEGER t0; QueryPerformanceCounter(&t0);
 		bool ok;
 		if (params.drawList != InvalidVector || params.skinnedList != InvalidVector
-			|| params.multiMapList != InvalidVector || params.skyList != InvalidVector) {
+			|| params.multiMapList != InvalidVector || params.skyList != InvalidVector
+			|| params.alphaList != InvalidVector) {
 			// M1c/M-Skinning scene path: static DrawItemWire[] (drawList) and/or skinned
 			// [SkinnedDrawWire][palette]* (skinnedList) + inline camera. Either may be Invalid.
 			const void* drawPtr = nullptr;
@@ -562,6 +563,17 @@ namespace IPC {
 				}
 				skyPtr = kvec.size() ? &kvec[0] : nullptr;
 			}
+			const void* alphaPtr = nullptr;
+			std::uint32_t alphaBytes = 0;
+			if (params.alphaList != InvalidVector) {
+				auto& avec = getVec<IPC::GeomChunk>(params.alphaList);
+				const std::uint32_t aavail = avec.size() * static_cast<std::uint32_t>(sizeof(IPC::GeomChunk));
+				alphaBytes = params.alphaBytes;
+				if (alphaBytes == 0 || alphaBytes > aavail) {
+					alphaBytes = aavail;
+				}
+				alphaPtr = avec.size() ? &avec[0] : nullptr;
+			}
 			static unsigned s_sceneLog = 0;
 			const bool logScene = (s_sceneLog++ % 60) == 0;
 			if (logScene) {
@@ -580,6 +592,7 @@ namespace IPC {
 				multiMapPtr, params.multiMapCount, multiMapBytes,
 				lightPtr, params.lightCount, lightBytes,
 				skyPtr, params.skyCount, skyBytes,
+				alphaPtr, params.alphaCount, alphaBytes,
 				params.waterParams, params.waterEnabled);
 			if (logScene) {
 				LOG::logline(">> [scene] renderScene DONE ok=%d drawn=%u skinned=%u",
