@@ -150,11 +150,9 @@ void DistantLand::buildFrustumVisibleSet(const D3DXMATRIX* view, const D3DXMATRI
     s_frustumVisibleKeys.clear();
     s_refineCulledCount = 0;
 
+    // NOTE: no empty-cache early-out — on live-draw-build frames the cache fills HERE
+    // (ensureLive lazy capture below), and the fallback runs ensureFullWalk first.
     const auto& cacheMap = MGE::GeometryCache::cache();
-    if (cacheMap.empty()) {
-        s_earlyClassifyRan = false;   // consume the latch even on the empty-cache early out
-        return;
-    }
 
     D3DXMATRIX viewproj;
     D3DXMatrixMultiply(&viewproj, view, proj);
@@ -177,27 +175,45 @@ void DistantLand::buildFrustumVisibleSet(const D3DXMATRIX* view, const D3DXMATRI
         // NOT drawn this frame (now computed as size difference, incl. stale entries
         // awaiting the deferred eviction sweep — diagnostic only).
         unsigned visLand = 0, visObj = 0, visPick = 0;
+        // W3 diagnostic: wall cost of the ensureLive loop (the walk's replacement),
+        // averaged into the periodic VISKEYS line below.
+        static double s_liveMsAccum = 0.0; static unsigned s_liveN = 0;
+        LARGE_INTEGER liveFreq, liveT0, liveT1;
+        QueryPerformanceFrequency(&liveFreq);
+        QueryPerformanceCounter(&liveT0);
         for (const uint32_t key : s_visibleKeys) {
-            auto it = cacheMap.find(key);
-            if (it == cacheMap.end()) continue;   // engine leaf not cached (or just spawned)
-            const auto& e = it->second;
-            if (e.isSkinned && (e.skinnedUnsupported || e.numBones == 0)) continue;
+            // W3 live-read: freshen (or lazily capture) the entry straight off the live
+            // NiTriShape — a classify key is engine-drawn THIS frame, so the pointer is
+            // valid by construction. On full-walk frames this is a no-op lookup, so the
+            // kept-set is identical to the old cacheMap.find probe.
+            const auto* e = MGE::GeometryCache::ensureLive(key);
+            if (!e) continue;                     // no model data / capture failed
+            if (e->isSkinned && (e->skinnedUnsupported || e->numBones == 0)) continue;
             s_frustumVisibleKeys.push_back(key);      // engine drew it this frame
-            if (e.isLandscape)    ++visLand;
-            else if (e.isPickRoot) ++visPick;
+            if (e->isLandscape)    ++visLand;
+            else if (e->isPickRoot) ++visPick;
             else                   ++visObj;
         }
+        QueryPerformanceCounter(&liveT1);
+        s_liveMsAccum += 1000.0 * (double)(liveT1.QuadPart - liveT0.QuadPart) / (double)liveFreq.QuadPart;
+        ++s_liveN;
         s_refineCulledCount = (unsigned)(cacheMap.size() - s_frustumVisibleKeys.size());
         if (Configuration.LogDistantPipeline) {
             static unsigned s_n = 0;
-            if (++s_n % 300 == 0)
-                LOG::logline("-- [VISKEYS] MSOC: land=%u obj=%u pickVis=%u total=%zu (refineCulled=%u)",
-                             visLand, visObj, visPick, s_frustumVisibleKeys.size(), s_refineCulledCount);
+            if (++s_n % 300 == 0) {
+                LOG::logline("-- [VISKEYS] MSOC: land=%u obj=%u pickVis=%u total=%zu (refineCulled=%u) liveMs=%.2f",
+                             visLand, visObj, visPick, s_frustumVisibleKeys.size(), s_refineCulledCount,
+                             s_liveMsAccum / (double)s_liveN);
+                s_liveMsAccum = 0.0; s_liveN = 0;
+            }
         }
         return;
     }
 
-    // Frustum-only fallback: no MSOC this frame.
+    // Frustum-only fallback: no MSOC this frame. On live-draw-build frames the refresh
+    // walk was skipped and this path iterates the WHOLE cache with a freshness filter —
+    // pull the full walk in now (idempotent; no-op when onFrameReady already walked).
+    MGE::GeometryCache::ensureFullWalk();
     s_earlyClassifyRan = false;
     s_frustumVisibleKeys.reserve(cacheMap.size());
     const auto cacheFrame = MGE::GeometryCache::currentFrame();
