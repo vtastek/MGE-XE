@@ -83,6 +83,17 @@ void DistantLand::updateVisibleSet(void* const* shapes, int count) {
 void DistantLand::earlyClassifyMainScene(void* worldCamera) {
     s_earlyClassifyRan = false;
     if (!Configuration.UseOcclusionCulling || !MSOCClient::hasEarlyClassify()) return;
+
+    // Owned-opaque display skip (Cut 1, engine scene-0 opaque no-op): tell the
+    // plugin whether the Forge composite owns the opaque world THIS frame, before
+    // either classify path latches its per-frame state. While owned, the plugin
+    // skips engine display() of covered-opaque leaves — the DIPs our proxy rejects
+    // per-draw anyway (inspectIndexedPrimitive) — killing their traversal/state
+    // cost. F11 (ownsOpaqueWorld false) restores full display next frame. Logged
+    // plugin-side on change; absent export = false return = today's behavior.
+    MSOCClient::setOpaqueWorldOwned(
+        Configuration.ForgeOpaqueDisplaySkip && RenderProcess::ownsOpaqueWorld());
+
     s_visibleCallbackFired = false;
     const int rc = MSOCClient::classifyMainSceneNow(worldCamera);
     s_earlyClassifyRan = s_visibleCallbackFired;
@@ -153,35 +164,35 @@ void DistantLand::buildFrustumVisibleSet(const D3DXMATRIX* view, const D3DXMATRI
     if (Configuration.UseOcclusionCulling && s_earlyClassifyRan) {
         s_earlyClassifyRan = false;   // one frame only
         s_frustumVisibleKeys.reserve(s_visibleKeys.size() + 16);
-        // Diagnostic: split the engine-visible set into landscape vs object so we can see
-        // whether the early classify covers terrain (worldLandscapeRoot). If visLand is
-        // substantial, terrain IS in visKeys (occlusion-culled) and renderCachedTerrain
-        // should consume it instead of re-frustum-culling the full 2304-tile cache.
-        // Pick-root entries are NO LONGER frustum-rescued: the visible-geom callback
-        // reports occlusion SURVIVORS only (the exact set the engine draws), and the
-        // engine's drawn count matches objects alone — so pick entries absent from
-        // s_visibleKeys are occluded clutter the engine doesn't draw. Treat them like
-        // any other entry: keep iff the engine drew it, else occlusion-cull. (Diagnostic
-        // pickVis = visible pick still drawn; pickCulled = pick now correctly dropped.)
-        unsigned visLand = 0, visObj = 0, visPick = 0, pickCulled = 0;
-        for (const auto& kv : cacheMap) {
-            const auto& e = kv.second;
+        // Iterate the DRAWN set and probe the cache — not the whole cache probing the
+        // drawn set. The drawn set (~3-4k) is a fraction of the cache (~10k+ across
+        // 16 cells), so this cuts the per-frame work ~3x; a drawn key with no cache
+        // entry simply doesn't match (identical to the old absence-from-cache case).
+        // Kept-set is IDENTICAL to the old full-cache intersection; only the emission
+        // ORDER changes (set order vs map order — both unordered; the opaque consumers
+        // are order-independent).
+        // Pick-root entries are NOT frustum-rescued: the visible-geom callback reports
+        // occlusion SURVIVORS only (the exact set the engine draws) — keep iff drawn.
+        // Diagnostic: split into landscape/object/pick; refineCulled = cache entries
+        // NOT drawn this frame (now computed as size difference, incl. stale entries
+        // awaiting the deferred eviction sweep — diagnostic only).
+        unsigned visLand = 0, visObj = 0, visPick = 0;
+        for (const uint32_t key : s_visibleKeys) {
+            auto it = cacheMap.find(key);
+            if (it == cacheMap.end()) continue;   // engine leaf not cached (or just spawned)
+            const auto& e = it->second;
             if (e.isSkinned && (e.skinnedUnsupported || e.numBones == 0)) continue;
-            if (s_visibleKeys.count(kv.first)) {
-                s_frustumVisibleKeys.push_back(kv.first);     // engine drew it this frame
-                if (e.isLandscape)    ++visLand;
-                else if (e.isPickRoot) ++visPick;
-                else                   ++visObj;
-            } else {
-                ++s_refineCulledCount;   // engine culled it (occluded / LOD / out of frustum)
-                if (e.isPickRoot) ++pickCulled;
-            }
+            s_frustumVisibleKeys.push_back(key);      // engine drew it this frame
+            if (e.isLandscape)    ++visLand;
+            else if (e.isPickRoot) ++visPick;
+            else                   ++visObj;
         }
+        s_refineCulledCount = (unsigned)(cacheMap.size() - s_frustumVisibleKeys.size());
         if (Configuration.LogDistantPipeline) {
             static unsigned s_n = 0;
             if (++s_n % 300 == 0)
-                LOG::logline("-- [VISKEYS] MSOC: land=%u obj=%u pickVis=%u pickCulled=%u total=%zu (refineCulled=%u)",
-                             visLand, visObj, visPick, pickCulled, s_frustumVisibleKeys.size(), s_refineCulledCount);
+                LOG::logline("-- [VISKEYS] MSOC: land=%u obj=%u pickVis=%u total=%zu (refineCulled=%u)",
+                             visLand, visObj, visPick, s_frustumVisibleKeys.size(), s_refineCulledCount);
         }
         return;
     }
@@ -189,8 +200,12 @@ void DistantLand::buildFrustumVisibleSet(const D3DXMATRIX* view, const D3DXMATRI
     // Frustum-only fallback: no MSOC this frame.
     s_earlyClassifyRan = false;
     s_frustumVisibleKeys.reserve(cacheMap.size());
+    const auto cacheFrame = MGE::GeometryCache::currentFrame();
     for (const auto& kv : cacheMap) {
         const auto& e = kv.second;
+        // Eviction is a periodic sweep now — skip entries the walk no longer visits
+        // (despawned/appCulled) or a stale entry could re-enter the visible set here.
+        if (e.lastFrame != cacheFrame) continue;
         BoundingSphere bs;
         if (e.isSkinned) {
             if (e.skinnedUnsupported || e.numBones == 0) continue;

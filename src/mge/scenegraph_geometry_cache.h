@@ -155,6 +155,12 @@ namespace MGE::GeometryCache {
 
     const std::unordered_map<uint32_t, CachedGeometry>& cache();
 
+    // The cache's frame counter (incremented by each onFrameReady). Eviction is a
+    // periodic sweep, not per-frame, so consumers that scan the WHOLE cache must
+    // treat entries with lastFrame != currentFrame() as stale (not in the scene this
+    // frame). Consumers driven by a current-frame visible set don't need this.
+    uint64_t currentFrame();
+
     // Vertex buffer format used by each CachedGeometry::vb.
     // D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_TEX1
     // Layout: float3 pos, float3 normal, DWORD color(0xFFFFFFFF), float2 uv

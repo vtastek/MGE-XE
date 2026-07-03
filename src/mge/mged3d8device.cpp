@@ -728,8 +728,12 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
             // Forge present-seam composite (end of scene 0, before scene 1). Two parts, both
             // gated on the live seam owning the opaque world:
             //   1. renderCacheDepthToMainZ — write the cache opaque/terrain depth into the main
-            //      depthstencil (game projection) so scene 1's sorted-alpha + first-person
-            //      occlude correctly against the Forge-rendered opaques.
+            //      depthstencil (game projection) so scene 1's sorted-alpha occludes correctly
+            //      against the Forge-rendered opaques (first-person gets its own Z-clear).
+            //      NEAR-SCENE NO-OP (2026-07-02): additionally gated on ForgeNearDepthReplay
+            //      (ini, default OFF) — the replay is ~3.5k depth draws/frame, the last near-
+            //      scene submission cost on the client. Skipped, sorted-alpha can show through
+            //      Forge walls (accepted until the Forge alpha pass); flag ON restores it.
             //   2. onStage0Composite — drive the host + alpha-blend the Forge colour over the
             //      sky/distant-land already on the backbuffer (self-gates on F11; also flushes
             //      geometry independent of the toggle).
@@ -747,12 +751,12 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
                 if (!RenderProcess::kickoffPending()) {
                     RenderProcess::onStage0CompositeKickoff(realDevice);
                 }
-                if (RenderProcess::ownsOpaqueWorld()) {
+                if (RenderProcess::ownsOpaqueWorld() && Configuration.ForgeNearDepthReplay) {
                     DistantLand::renderCacheDepthToMainZ();
                 }
                 RenderProcess::onStage0CompositeFinish(realDevice);
             } else {
-                if (RenderProcess::ownsOpaqueWorld()) {
+                if (RenderProcess::ownsOpaqueWorld() && Configuration.ForgeNearDepthReplay) {
                     DistantLand::renderCacheDepthToMainZ();
                 }
                 RenderProcess::onStage0Composite(realDevice);

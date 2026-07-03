@@ -178,4 +178,17 @@ public:
     // True if the loaded plugin exports the early-classify entrypoint (i.e. Stage 2 is
     // available). False on absent/old plugin — the frustum cull path then stands.
     static bool hasEarlyClassify();
+
+    // Owned-opaque display skip. Push true while the Forge composite owns the opaque
+    // world: the plugin then SKIPS the engine display() of leaves whose draws our
+    // proxy rejects anyway (covered-opaque + land splat), removing their traversal/
+    // state/DIP cost. Alpha-blended / decal / untextured leaves keep displaying, so
+    // the sorted-alpha pass is unaffected. Push once per frame at BeginScene(0),
+    // BEFORE classifyMainSceneNow (the plugin latches it per top-level frame).
+    // Returns false if the plugin is absent or predates the export — the engine then
+    // displays everything and the proxy keeps rejecting per-DIP (today's behavior).
+    static bool setOpaqueWorldOwned(bool owned);
+
+    // True if the loaded plugin exports the owned-opaque flag entrypoint.
+    static bool hasOpaqueWorldOwned();
 };

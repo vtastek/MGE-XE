@@ -64,6 +64,28 @@ namespace MGE::GeometryCache {
         const char*       g_nullBoneSampleTex     = nullptr; // a sample part's texture
 
         std::unordered_map<uint32_t, CachedGeometry>      g_cache;
+        // Character-subtree verdict per NiNode* (walk()'s "does any direct child carry
+        // a skin" look-ahead). The scan is O(children) RTTI checks per node PER FRAME
+        // and character assemblies essentially never change, so the verdict is computed
+        // once on first sight and cached. Cleared at every eviction sweep, which bounds
+        // both staleness (a node GAINING a skinned child later) and pointer recycling
+        // (freed NiNode address reused) to kEvictSweepInterval frames — and the only
+        // consumer of the flag is dynamicHint, a distance-fade/VB heuristic that
+        // self-heals via the per-frame transform compare (movement forces hint=4).
+        std::unordered_map<uint32_t, bool>                g_charNodeVerdict;
+        // Deferred eviction: entries not visited by the walk used to be evicted EVERY
+        // frame — a full traversal of the (scattered, ~10k-entry) map per frame just to
+        // find stale entries. Stale entries are harmless between sweeps: nothing draws
+        // them (all draw paths consume current-frame visible sets or filter on
+        // lastFrame == g_frame), they only hold memory/VBs a little longer. The sweep
+        // now runs every kEvictSweepInterval frames.
+        constexpr uint64_t kEvictSweepInterval = 30;
+        // Per-phase walk timing (QPC), logged every kGcHeartbeatFrames frames as
+        // ">> [gc] ..." — the walk is on the dense-city serial chain, so its cost is
+        // tracked with the same always-on heartbeat discipline as [hb]/[forge-hb].
+        struct GcAccum { double obj, pick, land, sky, evict; uint64_t n; };
+        GcAccum           g_gcAccum = {};
+        constexpr uint64_t kGcHeartbeatFrames = 300;
         // Reverse map GPU texture -> SourceTexture::fileName, for resolveTextureName().
         // DORMANT: nothing populates this currently. The per-frame rebuild (walking
         // NI property state per node) cost ~1.5ms and had no consumer, so it was
@@ -696,6 +718,7 @@ namespace MGE::GeometryCache {
                 e.isPickRoot = g_walkingPick;
                 e.isSky = g_walkingSky;
                 if (g_walkingSky) e.skyOrder = g_skyVisitCounter++;  // SK2 back-to-front key
+                bool transformChanged = true;   // skinned/inCharacter paths always re-derive
                 if (sk) {
                     // Static skinned VB: rebuild only on revision / skin-state change.
                     if (data->revisionID != e.revisionID || !e.isSkinned) {
@@ -732,13 +755,22 @@ namespace MGE::GeometryCache {
                         buildD3DTransform(newTransform, geom);
                         if (memcmp(newTransform, e.worldTransformD3D, sizeof(newTransform)) != 0) {
                             e.dynamicHint = 4;
-                        } else if (e.dynamicHint > 0) {
-                            --e.dynamicHint;
+                            memcpy(e.worldTransformD3D, newTransform, sizeof(newTransform));
+                        } else {
+                            transformChanged = false;   // mirrored can't have flipped
+                            if (e.dynamicHint > 0) {
+                                --e.dynamicHint;
+                            }
                         }
-                        memcpy(e.worldTransformD3D, newTransform, sizeof(newTransform));
                     }
                 }
-                e.mirrored = computeMirrored(e);                    // winding flip for depth/shadow
+                // Winding flip for depth/shadow. The sign is a pure function of the
+                // world/bone transform, so recompute only when that changed (skinned
+                // and inCharacter paths re-derive every frame; the static path's
+                // memcmp above proves it identical).
+                if (transformChanged) {
+                    e.mirrored = computeMirrored(e);
+                }
             }
         }
 
@@ -778,17 +810,26 @@ namespace MGE::GeometryCache {
                 // mesh — if so, the whole subtree is a character (NPC/creature) and all
                 // non-skinned geometry within it (bone-attached equipment, head, etc.)
                 // must be treated as dynamic regardless of per-frame transform delta.
+                // The O(children) RTTI scan runs once per node; the verdict is cached
+                // (g_charNodeVerdict, cleared at each eviction sweep — see declaration).
                 bool isCharNode = inCharacter;
                 if (!isCharNode) {
-                    for (size_t i = 0; i < count; ++i) {
-                        NI::AVObject* child = node->children.at(i).get();
-                        if (!child) continue;
-                        if (child->isInstanceOfType(NI::RTTIStaticPtr::NiTriBasedGeom)) {
-                            if (static_cast<NI::TriBasedGeometry*>(child)->skinInstance.get()) {
-                                isCharNode = true;
-                                break;
+                    const uint32_t nodeKey = reinterpret_cast<uint32_t>(node);
+                    auto vit = g_charNodeVerdict.find(nodeKey);
+                    if (vit != g_charNodeVerdict.end()) {
+                        isCharNode = vit->second;
+                    } else {
+                        for (size_t i = 0; i < count; ++i) {
+                            NI::AVObject* child = node->children.at(i).get();
+                            if (!child) continue;
+                            if (child->isInstanceOfType(NI::RTTIStaticPtr::NiTriBasedGeom)) {
+                                if (static_cast<NI::TriBasedGeometry*>(child)->skinInstance.get()) {
+                                    isCharNode = true;
+                                    break;
+                                }
                             }
                         }
+                        g_charNodeVerdict.emplace(nodeKey, isCharNode);
                     }
                 }
                 for (size_t i = 0; i < count; ++i)
@@ -1046,6 +1087,13 @@ namespace MGE::GeometryCache {
         }
     }
 
+    // QPC millisecond clock for the [gc] heartbeat (same pattern as renderprocess's nowMs).
+    static double gcNowMs() {
+        static LARGE_INTEGER freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
+        LARGE_INTEGER c; QueryPerformanceCounter(&c);
+        return 1000.0 * (double)c.QuadPart / (double)freq.QuadPart;
+    }
+
     void onFrameReady(void* dataHandler) {
         if (!g_device || !dataHandler) return;
         if (!Configuration.UseSceneGraphSnapshot) return;
@@ -1053,23 +1101,27 @@ namespace MGE::GeometryCache {
 
         ++g_frame;
         g_uploadedThisFrame = 0;
+        const double t0 = gcNowMs();
 
         {
             MGE_ZoneScopedN("GeomCache:walkObjects");
             walk(MGE::DataHandlerView::worldObjectRoot(dataHandler));
         }
+        const double tObj = gcNowMs();
         {
             MGE_ZoneScopedN("GeomCache:walkPickObjects");
             g_walkingPick = true;
             walk(MGE::DataHandlerView::worldPickObjectRoot(dataHandler));
             g_walkingPick = false;
         }
+        const double tPick = gcNowMs();
         {
             MGE_ZoneScopedN("GeomCache:walkLandscape");
             g_walkingLandscape = true;
             walk(MGE::DataHandlerView::worldLandscapeRoot(dataHandler));
             g_walkingLandscape = false;
         }
+        const double tLand = gcNowMs();
         // SK1 sky takeover: walk skyRoot only when the Forge sky pass is live (F7 toggle ON +
         // seam compositing). walk()'s getAppCulled() early-return gives free day/night/phase/
         // weather selection; captured shapes ride the same capture/IPC seam as opaques but are
@@ -1081,6 +1133,7 @@ namespace MGE::GeometryCache {
             walk(findSkyRoot(dataHandler));
             g_walkingSky = false;
         }
+        const double tSky = gcNowMs();
 
         // SK0 (sky takeover, diagnostic): periodically dump the skyRoot subtree so we can
         // confirm the shapes/materials the real walk will capture. No capture, no draw.
@@ -1097,8 +1150,13 @@ namespace MGE::GeometryCache {
             }
         }
 
-        // Evict entries not seen this frame
-        {
+        // Deferred eviction sweep (see kEvictSweepInterval declaration): drop entries
+        // the walk hasn't touched since the last sweep. Consumers that scan the whole
+        // cache filter on lastFrame == currentFrame() (buildSkyDrawList, the visible-set
+        // frustum fallback), so a stale entry between sweeps is memory, not pixels.
+        // The character-verdict cache is wiped on the same cadence, bounding its
+        // staleness/pointer-recycle window to one sweep interval.
+        if (g_frame % kEvictSweepInterval == 0) {
             MGE_ZoneScopedN("GeomCache:evict");
             for (auto it = g_cache.begin(); it != g_cache.end(); ) {
                 if (it->second.lastFrame != g_frame) {
@@ -1108,6 +1166,25 @@ namespace MGE::GeometryCache {
                     ++it;
                 }
             }
+            g_charNodeVerdict.clear();
+        }
+        const double tEvict = gcNowMs();
+
+        // [gc] heartbeat: per-phase walk cost, averaged over the window. Always on —
+        // this walk sits on the dense-city serial frame chain.
+        g_gcAccum.obj   += tObj - t0;
+        g_gcAccum.pick  += tPick - tObj;
+        g_gcAccum.land  += tLand - tPick;
+        g_gcAccum.sky   += tSky - tLand;
+        g_gcAccum.evict += tEvict - tSky;
+        if (++g_gcAccum.n >= kGcHeartbeatFrames) {
+            const double n = (double)g_gcAccum.n;
+            LOG::logline(">> [gc] %llu frames avg: walk=%.2f (obj=%.2f pick=%.2f land=%.2f sky=%.2f evict=%.2f) entries=%zu",
+                         (unsigned long long)g_gcAccum.n,
+                         (g_gcAccum.obj + g_gcAccum.pick + g_gcAccum.land + g_gcAccum.sky + g_gcAccum.evict) / n,
+                         g_gcAccum.obj / n, g_gcAccum.pick / n, g_gcAccum.land / n,
+                         g_gcAccum.sky / n, g_gcAccum.evict / n, g_cache.size());
+            g_gcAccum = GcAccum{};
         }
 
         g_uploadedInterval += g_uploadedThisFrame;
@@ -1160,6 +1237,10 @@ namespace MGE::GeometryCache {
 
     const std::unordered_map<uint32_t, CachedGeometry>& cache() {
         return g_cache;
+    }
+
+    uint64_t currentFrame() {
+        return g_frame;
     }
 
     int buildMoonDrawList(void* moonRoot, MoonShapeDraw out[2]) {

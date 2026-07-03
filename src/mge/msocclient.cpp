@@ -31,6 +31,7 @@ using FnRegisterOccGeom   = void (__cdecl*)(void(__cdecl*)(void* const*, const f
 using FnUnregisterOccGeom = void (__cdecl*)(void(__cdecl*)(void* const*, const float*, int));
 using FnCopyMask          = int  (__cdecl*)(void* dst, int dstBytes);
 using FnClassifyNow       = int  (__cdecl*)(void* camera);
+using FnSetOpaqueOwned    = void (__cdecl*)(int owned);
 
 HMODULE       g_module            = nullptr;
 FnIsMaskReady g_isMaskReady       = nullptr;
@@ -49,6 +50,7 @@ FnRegisterOccGeom     g_registerOccGeom   = nullptr;  // optional; occlusion ref
 FnUnregisterOccGeom   g_unregisterOccGeom = nullptr;  // optional
 FnCopyMask            g_copyMask          = nullptr;  // optional; host-cull only
 FnClassifyNow         g_classifyNow       = nullptr;  // optional; Stage 2 early classify
+FnSetOpaqueOwned      g_setOpaqueOwned    = nullptr;  // optional; owned-opaque display skip
 bool          g_probed             = false;
 
 // Frozen ABI codes from the plugin. Match PatchOcclusionCulling.h.
@@ -117,6 +119,8 @@ void MSOCClient::init() {
         GetProcAddress(g_module, "mwse_copyOcclusionMask"));
     g_classifyNow = reinterpret_cast<FnClassifyNow>(
         GetProcAddress(g_module, "mwse_classifyMainSceneNow"));
+    g_setOpaqueOwned = reinterpret_cast<FnSetOpaqueOwned>(
+        GetProcAddress(g_module, "mwse_setOpaqueWorldOwned"));
 
     if (!g_isMaskReady || !g_testSphere) {
         LOG::logline("-- MSOC: msoc.dll loaded but required exports missing; disabling");
@@ -138,14 +142,17 @@ void MSOCClient::init() {
         g_unregisterOccGeom = nullptr;
         g_copyMask = nullptr;
         g_classifyNow = nullptr;
+        g_setOpaqueOwned = nullptr;
         return;
     }
 
-    LOG::logline("-- MSOC: msoc.dll loaded, distant-statics occlusion active%s%s%s%s",
+    LOG::logline("-- MSOC: msoc.dll loaded, distant-statics occlusion active%s%s%s%s%s",
                  g_testOBB         ? " (OBB escalation available)" : " (sphere-only plugin)",
                  g_testSphereBatch ? " (batch query available)"    : "",
                  g_addOccluder     ? " (addOccluder available)"    : "",
-                 g_addPreTransformedOccluder ? " (pre-transformed occluder available)" : "");
+                 g_addPreTransformedOccluder ? " (pre-transformed occluder available)" : "",
+                 g_setOpaqueOwned  ? " (opaque-owned display skip available)"
+                                   : " (NO opaque-owned skip - old msoc.dll)");
 }
 
 bool MSOCClient::isAvailable() {
@@ -332,6 +339,16 @@ int MSOCClient::classifyMainSceneNow(void* camera) {
 
 bool MSOCClient::hasEarlyClassify() {
     return g_classifyNow != nullptr;
+}
+
+bool MSOCClient::setOpaqueWorldOwned(bool owned) {
+    if (!g_setOpaqueOwned) return false;
+    g_setOpaqueOwned(owned ? 1 : 0);
+    return true;
+}
+
+bool MSOCClient::hasOpaqueWorldOwned() {
+    return g_setOpaqueOwned != nullptr;
 }
 
 bool MSOCClient::hasMaskExport() {
