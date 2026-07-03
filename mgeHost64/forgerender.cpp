@@ -1266,6 +1266,15 @@ namespace {
            kGpuPhaseFrame,   // WHOLE command buffer GPU EXECUTION (beginCmd..resolve) — compare to the
                              // submit->fence WALL clock (g_lastGpuMs): wall - frame = GPU idle / queue-
                              // wait behind the client's shared-GPU work (NOT our render cost).
+           // Host-GPU-shrink sub-phases, NESTED inside Reflect / Color (timestamp pairs
+           // nest freely — kGpuPhaseFrame already brackets everything). Localize the
+           // color-pass milliseconds before deciding the cut.
+           kGpuPhaseReflGeo,    // dlReflectRecordGeo (reflected land+statics; rest of Reflect = sky)
+           kGpuPhaseColorSky,   // sky dome + sun/moons/stars
+           kGpuPhaseColorNear,  // near opaque statics (execute-indirect groups + dynamic morphs)
+           kGpuPhaseColorSkin,  // GPU palette skinning loop
+           kGpuPhaseColorMM,    // multi-map (dark/detail/glow) loop
+           kGpuPhaseColorDL,    // dlLiveRecord (distant land + DL statics)
            kGpuPhaseCount };
 
     // Tier 4 multi-map: ONE 64KB world window holds kBatchSize(1024) matrices; cap at 256
@@ -4557,7 +4566,15 @@ namespace ForgeRender {
             }
         }
         g_lastReflSkyDrawn = 0;   // Phase 0 panel: 0 unless the reflection pass runs below
-        if (g_drawReflect && g_live.reflectReady && waterEnabled && waterParams && skyBlob && skyCount && skyBytes) {
+        const bool reflectOn = g_drawReflect && g_live.reflectReady && waterEnabled
+            && waterParams && skyBlob && skyCount && skyBytes;
+        // Gated-off frames still write the ReflGeo pair (adjacent = ~0) — an index the
+        // frame never begins/ends reads back stale garbage at resolve.
+        if (!reflectOn) {
+            gpuPhaseBegin(kGpuPhaseReflGeo);
+            gpuPhaseEnd(kGpuPhaseReflGeo);
+        }
+        if (reflectOn) {
             const float* fcbvR = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
             const float eyeAbsZ = fcbvR[58];                       // lodEye.z (absolute camera)
             const float waterLevelAbs = waterParams[0];
@@ -4714,7 +4731,9 @@ namespace ForgeRender {
             // (dlReflectGeoCull, hoisted off record). Here we only RECORD the draws into the still-bound
             // pReflectColor/Depth, AFTER the sky (depth GEQUAL+write → occludes the reflected sky). Gated by
             // g_reflGeoReady (the cull ran + rings valid this frame).
+            gpuPhaseBegin(kGpuPhaseReflGeo);
             if (g_reflGeoReady) { dlReflectRecordGeo(); }
+            gpuPhaseEnd(kGpuPhaseReflGeo);
 
             static uint32_t s_reflDrawLog = 0;
             if ((s_reflDrawLog++ % 120) == 0) {
@@ -4755,6 +4774,7 @@ namespace ForgeRender {
         // captured as ordinary GeomVertexWire statics, so they live in the arena (or the dynamic ring
         // after the per-frame re-upload promotes them) — handle both. Capped at kMaxSkyDraws.
         uint32_t skyDrawn = 0;
+        gpuPhaseBegin(kGpuPhaseColorSky);
         if (g_drawSky && skyBlob && skyCount && skyBytes && g_live.pSkyPipeline && g_live.pSkyWorldsBuf) {
             const uint32_t haveSky = skyBytes / (uint32_t)sizeof(IPC::SkyDrawWire);
             uint32_t nSky = (skyCount < haveSky) ? skyCount : haveSky;
@@ -4835,6 +4855,9 @@ namespace ForgeRender {
             }
         }
 
+        gpuPhaseEnd(kGpuPhaseColorSky);
+        gpuPhaseBegin(kGpuPhaseColorNear);
+
         // Bind a pipeline FIRST — cmdBindPipeline establishes the root signature the descriptor
         // binds need. Start on the non-mirror colour pipeline; the loop switches per draw.
         cmdBindPipeline(g_live.pCmd, g_live.pOpaquePipeline);
@@ -4895,6 +4918,9 @@ namespace ForgeRender {
             cmdBindIndexBuffer(g_live.pCmd, m.ib, INDEX_TYPE_UINT16, 0);
             cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, 0, 1, 0, local);
         }
+
+        gpuPhaseEnd(kGpuPhaseColorNear);
+        gpuPhaseBegin(kGpuPhaseColorSkin);
 
         // --- M-Skinning: skinned draw loop (GPU palette skinning) --------------------
         // The blob is [SkinnedDrawWire][palette]* (palette = numBones * 64 bytes, each a
@@ -4975,6 +5001,9 @@ namespace ForgeRender {
             }
         }
 
+        gpuPhaseEnd(kGpuPhaseColorSkin);
+        gpuPhaseBegin(kGpuPhaseColorMM);
+
         // --- Tier 4: multi-map draw loop (dark/detail/glow) --------------------------
         // MultiMapDrawWire[]: each part writes its world into pMMWorldsBuf[idx] and its per-draw
         // stage/material into pInstanceBufMM[idx], then draws with firstInstance=idx so the
@@ -5048,11 +5077,15 @@ namespace ForgeRender {
             }
         }
 
+        gpuPhaseEnd(kGpuPhaseColorMM);
+        gpuPhaseBegin(kGpuPhaseColorDL);
+
         // Phase 1a/1b LIVE distant land: draw land + statics into the SAME colorTarget + pDepth as the
         // near scene (still bound here), depth-write reverse-Z GEQUAL so DL is occluded behind the near
         // scene and fills the horizon. Cull/ring-fill already ran before recording (dlLiveCullAndBuild).
         dlLiveRecord();
 
+        gpuPhaseEnd(kGpuPhaseColorDL);
         gpuPhaseEnd(kGpuPhaseColor);
 
         // ===================== Occlusion M2: Hi-Z mip-0 fill (colour->water seam) ==================
@@ -5482,6 +5515,15 @@ namespace ForgeRender {
                          g_lastGpuPhaseMs[kGpuPhaseReflect], g_lastGpuPhaseMs[kGpuPhaseColor],
                          g_lastGpuPhaseMs[kGpuPhaseWater], g_lastGpuPhaseMs[kGpuPhaseResolve],
                          g_lastHizGpuMs, g_hizOverruns);
+            // Host-GPU-shrink sub-phases: WHERE inside color/reflect the ms live. sky+near+skin+mm+dl
+            // ≈ color above (same frame's timestamps); refl sky = reflect − reflgeo.
+            LOG::logline(">> [forge-hb] gpu color sub: sky=%.2f near=%.2f skin=%.2f mm=%.2f dl=%.2f"
+                         " | refl geo=%.2f (refl sky=%.2f) ms",
+                         g_lastGpuPhaseMs[kGpuPhaseColorSky],  g_lastGpuPhaseMs[kGpuPhaseColorNear],
+                         g_lastGpuPhaseMs[kGpuPhaseColorSkin], g_lastGpuPhaseMs[kGpuPhaseColorMM],
+                         g_lastGpuPhaseMs[kGpuPhaseColorDL],
+                         g_lastGpuPhaseMs[kGpuPhaseReflGeo],
+                         g_lastGpuPhaseMs[kGpuPhaseReflect] - g_lastGpuPhaseMs[kGpuPhaseReflGeo]);
             // Whole-frame GPU EXECUTION vs submit->fence WALL clock. If exec << wall, the frame is
             // GPU-idle/queue-bound (waiting behind the client's shared-GPU work), NOT render-bound.
             const double frameExec = g_lastGpuPhaseMs[kGpuPhaseFrame];
