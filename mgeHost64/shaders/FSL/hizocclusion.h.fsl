@@ -1,0 +1,75 @@
+// mgeHost64 — occlusion M2: Hi-Z one-pass occlusion test, shared by cull.comp AND
+// cullscatter.comp (the two re-run the exact same per-instance test and MUST agree bit-for-bit —
+// same inputs, same code, no data races, so they do). SHADER-ONLY header: cull.srt.h stays the
+// C++-safe one; include this AFTER it (needs gCullParams + gCullHiz).
+//
+// Tests the instance sphere against the PREVIOUS frame's depth pyramid (gCullHiz), reprojected
+// with the previous frame's matrix (gCullParams.hizVP = that frame's raw rzViewProj, which maps
+// hizEye-camera-relative world -> clip — exactly what statics.vert projected with). One-pass:
+// a fast turn can disocclude an instance the old pyramid still covers => <=1-frame pop-in
+// (accepted until M3's two-phase re-test). Every uncertain case returns NOT-occluded — the only
+// harm of a false negative is a drawn-but-hidden instance.
+//
+// The pyramid stores the reverse-Z MIN (= FARTHEST) of each footprint. The sphere is occluded
+// iff its NEAREST point is still farther (smaller rz) than the farthest pyramid depth over its
+// screen rect: rzNear < min(4 corner taps). The 4 taps at mip = ceil(log2(rect_px)) each cover
+// the rect's quadrant superset, and min over a SUPERSET <= min over the rect, so the test only
+// gets HARDER to pass — conservative.
+
+// cHiz = sphere center relative to the PYRAMID's eye (this frame's c_rel + hizEyeDelta).
+bool hizOccluded(float3 cHiz, float effR)
+{
+    float4 hp = gCullParams.hizParams;   // x = mip0 W, y = mip0 H, z = mipCount-1, w = valid
+    if (hp.w < 0.5f)
+        return false;                    // no/stale pyramid (or F9 off) -> everything passes, loudly hizOccl=0
+
+    float d = length(cHiz);
+    if (d <= effR)
+        return false;                    // pyramid eye inside the sphere -> nearest-point math invalid
+
+    // Screen rect: project the 8 corners of the sphere's world AABB. Any corner behind/at the
+    // near plane, or a rect not FULLY inside [0,1] (prev frame has no data there) -> not occluded.
+    float2 uvMin = float2(1e9f, 1e9f);
+    float2 uvMax = float2(-1e9f, -1e9f);
+    UNROLL
+    for (uint k = 0u; k < 8u; ++k)
+    {
+        float3 c = cHiz + effR * float3(((k & 1u) != 0u) ? 1.0f : -1.0f,
+                                        ((k & 2u) != 0u) ? 1.0f : -1.0f,
+                                        ((k & 4u) != 0u) ? 1.0f : -1.0f);
+        float4 clip = mul(gCullParams.hizVP, float4(c, 1.0f));
+        if (clip.w <= 1e-4f)
+            return false;
+        float2 uv = float2(0.5f + 0.5f * clip.x / clip.w,
+                           0.5f - 0.5f * clip.y / clip.w);   // NDC y-up -> UV y-down
+        uvMin = min(uvMin, uv);
+        uvMax = max(uvMax, uv);
+    }
+    if (uvMin.x < 0.0f || uvMin.y < 0.0f || uvMax.x > 1.0f || uvMax.y > 1.0f)
+        return false;
+
+    // Nearest depth of the sphere: project the single point cHiz*(1 - r/d). With the pyramid
+    // camera at the origin of this space, that point IS the sphere's nearest point — exact.
+    float4 clipN = mul(gCullParams.hizVP, float4(cHiz * (1.0f - effR / d), 1.0f));
+    if (clipN.w <= 1e-4f)
+        return false;
+    float rzNear = clipN.z / clipN.w;
+
+    // Mip where the rect spans <= 1 texel, so the 4 corner texels cover it.
+    float2 rectPx = (uvMax - uvMin) * hp.xy;
+    float  mipF   = ceil(log2(max(max(rectPx.x, rectPx.y), 1.0f)));
+    uint   mip    = (uint)clamp(mipF, 0.0f, hp.z);
+    float  mw     = (float)max(1u, ((uint)hp.x) >> mip);   // D3D12 mip dims: max(1, W >> mip)
+    float  mh     = (float)max(1u, ((uint)hp.y) >> mip);
+    int2   t0     = int2((int)clamp(uvMin.x * mw, 0.0f, mw - 1.0f),
+                         (int)clamp(uvMin.y * mh, 0.0f, mh - 1.0f));
+    int2   t1     = int2((int)clamp(uvMax.x * mw, 0.0f, mw - 1.0f),
+                         (int)clamp(uvMax.y * mh, 0.0f, mh - 1.0f));
+
+    float dFar =            LoadTex2D(gCullHiz, NO_SAMPLER, int2(t0.x, t0.y), mip).r;
+    dFar = min(dFar,        LoadTex2D(gCullHiz, NO_SAMPLER, int2(t1.x, t0.y), mip).r);
+    dFar = min(dFar,        LoadTex2D(gCullHiz, NO_SAMPLER, int2(t0.x, t1.y), mip).r);
+    dFar = min(dFar,        LoadTex2D(gCullHiz, NO_SAMPLER, int2(t1.x, t1.y), mip).r);
+
+    return rzNear < dFar;   // reverse-Z: larger = nearer; nearest point still behind the farthest occluder
+}

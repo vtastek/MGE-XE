@@ -923,8 +923,8 @@ inline int2 GetDimensions(TextureCube t, SamplerState smp) { return GetDimension
 
 #endif // _D3D_H
 
-#line 1 "FSL/shaders.list"
-#line 10 "FSL/shaders.list"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shaders.list"
+#line 10 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 #line 25 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fsl_srt.h"
@@ -957,8 +957,8 @@ SamplerState gSamplerTrilinearBorder : register( s9 , space100 ) ;
 SamplerState gSamplerAnisotropic : register( s10 , space100 ) ;
 #line 167 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
-#line 11 "FSL/shaders.list"
-#line 171 "FSL/shaders.list"
+#line 11 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shaders.list"
+#line 180 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullscatter.comp.fsl"
 #line 13 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullscatter.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cull.srt.h"
@@ -997,7 +997,14 @@ STRUCT(CullParams)
     float4 eye;
     float4 ranges;
     float4 misc;
-#line 58
+
+
+
+
+    float4x4 hizVP;
+    float4 hizParams;
+    float4 hizEyeDelta;
+#line 65
 };
 
         CBUFFER(CullParams) gCullParams :  register(b0,space2);
@@ -1009,7 +1016,68 @@ STRUCT(CullParams)
         RWBuffer(uint) gSubsetCursor :  register(u6,space2);
         RWBuffer(uint) gArgs :  register(u7,space2);
         RWBuffer(uint) gInstOut :  register(u8,space2);
+        Tex2D(float) gCullHiz :  register(t9,space2);
+
 #line 14 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullscatter.comp.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/hizocclusion.h.fsl"
+#line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/hizocclusion.h.fsl"
+bool hizOccluded(float3 cHiz, float effR)
+{
+    float4 hp = gCullParams.hizParams;
+    if (hp.w < 0.5f)
+        return false;
+
+    float d = length(cHiz);
+    if (d <= effR)
+        return false;
+
+
+
+    float2 uvMin = float2(1e9f, 1e9f);
+    float2 uvMax = float2(-1e9f, -1e9f);
+    UNROLL
+    for (uint k = 0u; k < 8u; ++k)
+    {
+        float3 c = cHiz + effR * float3(((k & 1u) != 0u) ? 1.0f : -1.0f,
+                                        ((k & 2u) != 0u) ? 1.0f : -1.0f,
+                                        ((k & 4u) != 0u) ? 1.0f : -1.0f);
+        float4 clip = mul(gCullParams.hizVP, float4(c, 1.0f));
+        if (clip.w <= 1e-4f)
+            return false;
+        float2 uv = float2(0.5f + 0.5f * clip.x / clip.w,
+                           0.5f - 0.5f * clip.y / clip.w);
+        uvMin = min(uvMin, uv);
+        uvMax = max(uvMax, uv);
+    }
+    if (uvMin.x < 0.0f || uvMin.y < 0.0f || uvMax.x > 1.0f || uvMax.y > 1.0f)
+        return false;
+
+
+
+    float4 clipN = mul(gCullParams.hizVP, float4(cHiz * (1.0f - effR / d), 1.0f));
+    if (clipN.w <= 1e-4f)
+        return false;
+    float rzNear = clipN.z / clipN.w;
+
+
+    float2 rectPx = (uvMax - uvMin) * hp.xy;
+    float mipF = ceil(log2(max(max(rectPx.x, rectPx.y), 1.0f)));
+    uint mip = (uint)clamp(mipF, 0.0f, hp.z);
+    float mw = (float)max(1u, ((uint)hp.x) >> mip);
+    float mh = (float)max(1u, ((uint)hp.y) >> mip);
+    int2 t0 = int2((int)clamp(uvMin.x * mw, 0.0f, mw - 1.0f),
+                         (int)clamp(uvMin.y * mh, 0.0f, mh - 1.0f));
+    int2 t1 = int2((int)clamp(uvMax.x * mw, 0.0f, mw - 1.0f),
+                         (int)clamp(uvMax.y * mh, 0.0f, mh - 1.0f));
+
+    float dFar = LoadTex2D(gCullHiz, NO_SAMPLER, int2(t0.x, t0.y), mip).r;
+    dFar = min(dFar, LoadTex2D(gCullHiz, NO_SAMPLER, int2(t1.x, t0.y), mip).r);
+    dFar = min(dFar, LoadTex2D(gCullHiz, NO_SAMPLER, int2(t0.x, t1.y), mip).r);
+    dFar = min(dFar, LoadTex2D(gCullHiz, NO_SAMPLER, int2(t1.x, t1.y), mip).r);
+
+    return rzNear < dFar;
+}
+#line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/cullscatter.comp.fsl"
 
 
 
@@ -1047,6 +1115,11 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     }
 
 
+
+    if (hizOccluded(float3(dx, dy, cz) + gCullParams.hizEyeDelta.xyz, inst.effR))
+        return;
+
+
     float4 r0 = inst.wr0;
     float4 r1 = inst.wr1;
     float4 r2 = inst.wr2;
@@ -1081,4 +1154,4 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     }
     return;
 }
-#line 172 "FSL/shaders.list"
+#line 181 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shaders.list"

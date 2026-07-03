@@ -141,11 +141,20 @@
 #include "aoblur.comp.fsl"
 #end
 
-// Phase 3 prologue: Hi-Z mip-pyramid build (tail-submitted after the frame fence; occlusion M1).
-// Two variants of one body, like linearizedepth: FIRST copies pLinearDepth -> mip 0, the reduce
-// MIN-halves mip i-1 -> mip i (reverse-Z min = farthest = conservative for the later Hi-Z cull).
-#comp hizreduce_first.comp
+// Hi-Z mip-pyramid build (occlusion M2). FIRST copies sample 0 of the scene DSV (pDepth, FULL
+// scene depth at the colour->water seam) -> mip 0, in two SAMPLE_COUNT variants picked by
+// g_live.sampleCount (linearizedepth's pattern); the reduce (prologue cmd, tail-submitted after
+// the frame fence) MIN-halves mip i-1 -> mip i (reverse-Z min = farthest = conservative for the
+// Hi-Z cull in cull.comp/cullscatter.comp).
+#comp hizfirst_sc1.comp
 #define HIZ_FIRST 1
+#define SAMPLE_COUNT 1
+#include "hizreduce.comp.fsl"
+#end
+
+#comp hizfirst_sc4.comp
+#define HIZ_FIRST 1
+#define SAMPLE_COUNT 4
 #include "hizreduce.comp.fsl"
 #end
 

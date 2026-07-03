@@ -55,6 +55,13 @@ STRUCT(CullParams)
     DATA(float4, eye,       None);  // xyz = camera eye (absolute world)
     DATA(float4, ranges,    None);  // x=nearEnd² y=farEnd² z=vfarEnd² w=nearCut²
     DATA(float4, misc,      None);  // x = instance count, y = subset count (as floats; uint4 not C++-safe)
+    // -- Occlusion M2: the previous frame's Hi-Z pyramid camera (snapshotted at prologue submit).
+    // hizVP = the RAW rzViewProj bytes of the frame that filled the pyramid (camera-relative,
+    // reverse-Z, extended-far — the exact matrix statics.vert projected with). float4x4 in a
+    // C++-included SRT is proven (AOParams.invViewProj). Total 240B <= the 256B cbuffer.
+    DATA(float4x4, hizVP,       None);  // floats 36..51  prev-frame relative world -> clip
+    DATA(float4,   hizParams,   None);  // 52..55: x=mip0 W, y=mip0 H, z=mipCount-1, w=valid (0 = pass-through)
+    DATA(float4,   hizEyeDelta, None);  // 56..59: xyz = eyeNow - hizEye (rebase this frame's c_rel into hiz space)
 };
 
 BEGIN_SRT(CullSrtData)
@@ -68,5 +75,7 @@ BEGIN_SRT(CullSrtData)
         DECL_RWBUFFER(PerBatch, RWBuffer(uint),        gSubsetCursor)  // [sid] scatter cursor (reset in scan)
         DECL_RWBUFFER(PerBatch, RWBuffer(uint),        gArgs)          // IndirectDrawIndexArguments[sid] (5 uint each)
         DECL_RWBUFFER(PerBatch, RWBuffer(uint),        gInstOut)       // survivor rows (20 uint/inst = 80B), asuint(float)
+        DECL_TEXTURE (PerBatch, Tex2D(float),          gCullHiz)       // prev-frame Hi-Z pyramid (M2; appended
+                                                                       // LAST so the 9 existing slots are stable)
     END_SRT_SET(PerBatch)
 END_SRT(CullSrtData)

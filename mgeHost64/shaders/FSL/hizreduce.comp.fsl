@@ -1,12 +1,13 @@
-// mgeHost64 — Phase 3 prologue: Hi-Z mip-pyramid build (deferred occlusion milestone M1).
+// mgeHost64 — Hi-Z mip-pyramid build (occlusion M2: consumed by cull.comp/cullscatter.comp).
 //
-// Runs in the tail-submitted prologue cmd AFTER the frame fence, so the GPU builds frame N's
-// pyramid while MW runs its scene-1/UI/present window. No consumer yet — occlusion M2 points
-// cull.comp at it for frame N+1's two-phase Hi-Z cull.
+// The FIRST pass runs in the MAIN cmd at the colour->water seam (full-scene depth: prepass + DL
+// land + statics, but NOT water); the reduce runs in the tail-submitted prologue cmd AFTER the
+// frame fence, so the GPU builds frame N's pyramid while MW runs its scene-1/UI/present window.
+// Frame N+1's cull tests instance spheres against it (one-pass: <=1-frame disocclusion latency).
 //
-// Two compiled variants of this one body (HIZ_FIRST, like linearizedepth's SAMPLE_COUNT):
-//   hizreduce_first — 1:1 copy pLinearDepth -> mip 0 (dispatch covers mip-0 dims).
-//   hizreduce       — 2x2 MIN-reduce mip i-1 -> mip i (dispatch covers the DST mip dims).
+// Three compiled variants of this one body (HIZ_FIRST + SAMPLE_COUNT, like linearizedepth):
+//   hizfirst_sc1/sc4 — 1:1 copy sample 0 of pDepth -> mip 0 (dispatch covers mip-0 dims).
+//   hizreduce        — 2x2 MIN-reduce mip i-1 -> mip i (dispatch covers the DST mip dims).
 //
 // MIN because the depth is reverse-Z device depth (near = 1, far = 0): a pyramid texel must hold
 // the FARTHEST depth of its footprint or the later occlusion test culls visible objects. For the
@@ -32,7 +33,11 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     INIT_MAIN;
     int2 p = int2(DispatchThreadID.xy);
 #if HIZ_FIRST
-    float d = LoadTex2D(gHizLinDepth, NO_SAMPLER, p, 0).r;
+#if SAMPLE_COUNT > 1
+    float d = LoadTex2DMS(gHizSceneDepth, NO_SAMPLER, p, 0).r;
+#else
+    float d = LoadTex2D(gHizSceneDepth, NO_SAMPLER, p, 0).r;
+#endif
 #else
     int2 sd = GetDimensions(gHizSrcMip, NO_SAMPLER);
     int2 mx = sd - int2(1, 1);
