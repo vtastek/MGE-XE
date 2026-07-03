@@ -95,7 +95,26 @@ void DistantLand::earlyClassifyMainScene(void* worldCamera) {
         Configuration.ForgeOpaqueDisplaySkip && RenderProcess::ownsOpaqueWorld());
 
     s_visibleCallbackFired = false;
-    const int rc = MSOCClient::classifyMainSceneNow(worldCamera);
+    // classifyMainSceneNow is a SYNCHRONOUS plugin call: the engine's world-camera
+    // classify walk (~10k nodes) AND the owned-mode deferred-display drain both bill
+    // here — post-W3 it is the largest un-zoned block in the frameready→stage1
+    // window (MSOC.log drainUs alone ~1.8ms), so it gets its own timer + heartbeat.
+    LARGE_INTEGER ecFreq, ecT0, ecT1;
+    QueryPerformanceFrequency(&ecFreq);
+    QueryPerformanceCounter(&ecT0);
+    int rc;
+    {
+        MGE_ZoneScopedN("earlyClassifyMainScene");
+        MGE_SCOPED_TIMER("earlyClassifyMainScene");
+        rc = MSOCClient::classifyMainSceneNow(worldCamera);
+    }
+    QueryPerformanceCounter(&ecT1);
+    static double s_ecMsAccum = 0.0; static unsigned s_ecN = 0;
+    s_ecMsAccum += 1000.0 * (double)(ecT1.QuadPart - ecT0.QuadPart) / (double)ecFreq.QuadPart;
+    if (++s_ecN >= 300) {
+        LOG::logline(">> [classify] 300 frames avg: classifyMainSceneNow=%.2f ms", s_ecMsAccum / (double)s_ecN);
+        s_ecMsAccum = 0.0; s_ecN = 0;
+    }
     s_earlyClassifyRan = s_visibleCallbackFired;
 
     // Diagnostic: surface the plugin's status code so we can see WHETHER the early
