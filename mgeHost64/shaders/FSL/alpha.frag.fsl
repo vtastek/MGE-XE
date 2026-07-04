@@ -48,10 +48,29 @@ float4 PS_MAIN( VSOutput In )
 
     // AO sample + toggles — identical to opaque.frag (blended shapes share the scene lighting).
     uint   aoFlags  = (uint)(gFrameData.debugParams.w + 0.5f);
+    // AT3 triage (panel "ALPHA: highlight magenta", debug bit3): paint every sorted-alpha draw
+    // solid magenta so the alpha-pass set is identifiable vs opaque (opaque.frag ignores bit3).
+    if ((aoFlags & 8u) != 0u) { RETURN(float4(1.0f, 0.0f, 1.0f, 1.0f)); }
     float2 aoUv     = In.Position.xy * gFrameData.debugParams.yz;
     float4 aoSample = SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
     if ((aoFlags & 2u) != 0u) { N = normalize(aoSample.rgb); }
 
+    // Two-sided normal (bit4, panel "ALPHA: two-sided (fix)"): MW's blended cloth is DRAW_BOTH with
+    // authored normals facing the BACK; this pass is CULL_NONE so we may be shading either face.
+    // Flip N to face the viewer, then the one-sided N.L below lights the VISIBLE side by its true
+    // orientation to the light (matches MW's fixed-function two-sided lighting, and PPL "lit on the
+    // light-facing side"). WorldPos is camera-relative (opaque.vert shifts world by -eye), so the
+    // camera sits at the origin and the to-eye direction is simply -WorldPos.
+    if ((aoFlags & 16u) != 0u) {
+        float3 toEye = -In.WorldPos;
+        if (dot(N, toEye) < 0.0f) { N = -N; }
+    }
+
+    // One-sided sun N.L — matches the FFE reference (XE FixedFuncEmu.fx PerPixelPS:
+    // lightSunDiffuse * saturate(dot(normal, -lightSunDirection))). The FFE PPL path is the
+    // parity target for these blended shapes; it does NOT do two-sided/back-face normal flip,
+    // so we don't either. (A wavy fold reading "darker on some parts" vs PPL is a NORMAL
+    // difference in the cached geometry, not a lighting-model choice — chase it there.)
     float  ndl = saturate(dot(N, -gFrameData.sunDir.xyz));
     float3 d = gFrameData.sunCol.rgb * ndl;
     float3 a = ((aoFlags & 4u) != 0u) ? float3(1.0f, 1.0f, 1.0f) : gFrameData.ambCol.rgb;
@@ -59,6 +78,7 @@ float4 PS_MAIN( VSOutput In )
     a *= gFrameData.dbgScales.x;
 
     // Tier 3a point lights — same evalOnePointLight loop as opaque.frag.
+    uint litCount = 0u;   // debug (mode 9): point lights that reach this pixel (within 2·radius)
     {
         uint nLights = (uint)gLights.lightParams.x;
         for (uint i = 0; i < nLights; ++i)
@@ -71,13 +91,14 @@ float4 PS_MAIN( VSOutput In )
             float3 toLight = posR.xyz - In.WorldPos;
             float  dist2   = dot(toLight, toLight);
             if (dist2 >= 4.0f * radius * radius) { continue; }
+            ++litCount;
             float  invDist = rsqrt(max(dist2, 1e-8f));
             float  dist    = dist2 * invDist;
 
             float  att = 1.0f / max(fo.z * dist2 + fo.y * dist + fo.x, 1e-4f);
             att *= 1.0f - smoothstep(radius, 2.0f * radius, dist);
 
-            float  lambert = saturate(dot(N, toLight) * invDist);
+            float  lambert = saturate(dot(N, toLight) * invDist);   // one-sided (FFE parity)
             d += lambert * att * lightCol;
         }
     }
@@ -119,6 +140,21 @@ float4 PS_MAIN( VSOutput In )
     }
     if (dbg == 5u) { RETURN(float4(albedo.rgb, 1.0f)); }
     if (dbg == 6u) { RETURN(float4(lit, 1.0f)); }
+    if (dbg == 7u) {                                      // ambient-only (matches opaque.frag)
+        float3 al;
+        if (In.VColSource == 2u)      { al = In.Color.rgb * a + In.MatEmissive; }
+        else if (In.VColSource == 1u) { al = In.MatAmbient * a + In.Color.rgb; }
+        else                          { al = In.MatAmbient * a + In.MatEmissive; }
+        RETURN(float4(al, 1.0f));
+    }
+    if (dbg == 8u) {                                      // world-space normal (RGB = N*0.5+0.5)
+        RETURN(float4(N * 0.5f + 0.5f, 1.0f));
+    }
+    if (dbg == 9u) {                                      // point-light count heatmap (matches opaque.frag)
+        float t = saturate((float)litCount / 8.0f);
+        float3 heat = saturate(float3(t * 2.0f, 1.0f - abs(t - 0.5f) * 2.0f, 1.0f - t * 2.0f));
+        RETURN(float4(litCount == 0u ? float3(0.0f, 0.0f, 0.0f) : heat, 1.0f));
+    }
     if (dbg == 1u || dbg == 2u) {
         float dist = length(In.WorldPos - gFrameData.eyePos.xyz);
         float g = saturate(dist * (1.0f / 8192.0f));

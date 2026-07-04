@@ -1602,6 +1602,11 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
     // pass doesn't draw either.
     if (Configuration.ForgeAlphaPass && Configuration.ForgeAlphaSuppressS1
         && sceneCount >= 1 && rs->blendEnable && RenderProcess::ownsOpaqueWorld()) {
+        // AT3: before rejecting, capture MW's already-billboarded blended DIP (NiParticles smoke/
+        // flames + multimap/decal/untextured blends the host cache pass doesn't own) so the Forge
+        // host can draw it in the post-water sorted-alpha pass. Silent no-op when disabled/unsuited;
+        // the reject below is unchanged whether or not the capture takes.
+        RenderProcess::captureAlphaDraw(rs, frs);
         return false;
     }
 

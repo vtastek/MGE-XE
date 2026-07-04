@@ -6,6 +6,8 @@
 #include <cstdint>
 
 namespace IPC { class Client; }
+struct RenderedState;
+struct FragmentState;
 
 // Present-seam spike (client side). Coordinates the out-of-process 64-bit Vulkan
 // renderer: maps the host's framebuffer, drives the per-frame RenderFrame RPC, and
@@ -121,4 +123,14 @@ namespace RenderProcess {
     void captureMultiMapGeometry(std::uint32_t key, std::uint16_t revision, std::uint32_t modelId,
                                  const IPC::GeomVertexWireMM* verts, std::uint32_t vertexCount,
                                  const std::uint16_t* indices, std::uint32_t indexCount);
+
+    // AT3 captured-alpha: called from the ForgeAlphaSuppressS1 reject gate
+    // (distantland.cpp inspectIndexedPrimitive) for each alpha-BLENDED DIP MW is about to skip
+    // in scenes >= 1. MW already billboarded + sorted it; we Lock the live VB/IB, copy the final
+    // verts + rebased indices into pending scratch, and record the draw metadata so the next
+    // buildGeometryDrawLists ships the geometry and draws it in the Forge post-water sorted-alpha
+    // pass — restoring NiParticles (smoke/flames) + multimap/decal/untextured blends the host
+    // cache pass doesn't own. Silent no-op on any guard miss (flag off, HW-skinned, non-tri-list,
+    // caps, dedup); reject at the gate is unchanged whether or not this captures.
+    void captureAlphaDraw(const RenderedState* rs, const FragmentState* frs);
 }

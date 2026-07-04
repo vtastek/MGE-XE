@@ -367,6 +367,15 @@ namespace IPC {
         IN std::uint32_t alphaCount;
         IN std::uint32_t alphaBytes;
 
+        // AT3 captured-alpha: a 1-chunk GeomChunk vec holding [captured verts][captured indices]
+        // (indices at capturedVertBytes). Referenced by AlphaDrawWire items with
+        // slot == kAlphaSlotCaptured (the host binds pCapAlphaVB/pCapAlphaIB). Invalid / both
+        // byte counts 0 ⇒ no captured geometry this frame. Appended after the alpha fields so
+        // every existing offset is unchanged.
+        IN VecId capturedAlpha;
+        IN std::uint32_t capturedVertBytes;
+        IN std::uint32_t capturedIdxBytes;
+
         OUT std::uint32_t bytesWritten;
         OUT double renderMs;             // host-side render+readback time
     };

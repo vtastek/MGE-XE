@@ -471,6 +471,9 @@ namespace IPC {
 		params.alphaList = InvalidVector;
 		params.alphaCount = 0;
 		params.alphaBytes = 0;
+		params.capturedAlpha = InvalidVector;
+		params.capturedVertBytes = 0;
+		params.capturedIdxBytes = 0;
 		params.bytesWritten = 0;
 		params.renderMs = 0.0;
 		if (!beginRpc(Command::RenderFrame)) {
@@ -495,6 +498,7 @@ namespace IPC {
 		VecId lightList, std::uint32_t lightCount, std::uint32_t lightBytes,
 		VecId skyList, std::uint32_t skyCount, std::uint32_t skyBytes,
 		VecId alphaList, std::uint32_t alphaCount, std::uint32_t alphaBytes,
+		VecId capturedAlpha, std::uint32_t capturedVertBytes, std::uint32_t capturedIdxBytes,
 		std::uint32_t debugMode,
 		const DevInput* devInput,
 		const float* waterParams, std::uint32_t waterEnabled) {
@@ -523,6 +527,9 @@ namespace IPC {
 		params.alphaList = alphaList;
 		params.alphaCount = alphaCount;
 		params.alphaBytes = alphaBytes;
+		params.capturedAlpha = capturedAlpha;
+		params.capturedVertBytes = capturedVertBytes;
+		params.capturedIdxBytes = capturedIdxBytes;
 		params.debugMode = debugMode;
 		// WT1 Forge water: 12 per-frame surface params + the F7 enable gate (no geometry).
 		if (waterParams) { std::memcpy(params.waterParams, waterParams, 12 * sizeof(float)); }
@@ -572,6 +579,7 @@ namespace IPC {
 		VecId lightList, std::uint32_t lightCount, std::uint32_t lightBytes,
 		VecId skyList, std::uint32_t skyCount, std::uint32_t skyBytes,
 		VecId alphaList, std::uint32_t alphaCount, std::uint32_t alphaBytes,
+		VecId capturedAlpha, std::uint32_t capturedVertBytes, std::uint32_t capturedIdxBytes,
 		std::uint32_t debugMode,
 		const DevInput* devInput,
 		const float* waterParams, std::uint32_t waterEnabled,
@@ -584,6 +592,7 @@ namespace IPC {
 			lightList, lightCount, lightBytes,
 			skyList, skyCount, skyBytes,
 			alphaList, alphaCount, alphaBytes,
+			capturedAlpha, capturedVertBytes, capturedIdxBytes,
 			debugMode, devInput, waterParams, waterEnabled)) {
 			return false;
 		}

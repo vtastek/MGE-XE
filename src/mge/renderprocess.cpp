@@ -21,6 +21,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -62,7 +63,7 @@ namespace {
     // own cost (kickoff prep + residual wait + copy + blit), so feed is comparable across
     // fused/async modes and IS the perf baseline once the wait bucket collapses.
     constexpr unsigned kHeartbeatFrames = 300;
-    struct Accum { double feed, geom, build, render, host, overlap, copy, blit, dt; double maxFeed, maxDt; unsigned n, earlyN; };
+    struct Accum { double feed, geom, build, render, host, overlap, copy, blit, dt; double maxFeed, maxDt; double captured; unsigned n, earlyN; };
     Accum g_hb = {};
 
     // Async-frame split: everything the finish half needs from the kickoff half. Reset at
@@ -73,6 +74,7 @@ namespace {
         bool early;     // fired from the BeginScene(0) site (DistantLand::earlyForgeKickoff latch)
         unsigned frame;
         std::uint32_t drawCount, skinnedCount, multiMapCount, lightCount, skyCount, alphaCount;
+        std::uint32_t capturedCount;   // AT3: captured blended DIPs merged into the alpha list this frame
         std::uint32_t geomParts, texCount;
         std::size_t geomBytes, texBytes;
         double dtPresent;
@@ -140,6 +142,42 @@ namespace {
     std::vector<std::uint8_t>                 g_lightScratch;       // packed PointLightWire[] this frame
     std::vector<std::uint8_t>                 g_skyScratch;         // packed SkyDrawWire[] this frame (SK1)
     std::vector<std::uint8_t>                 g_alphaScratch;       // packed AlphaDrawWire[] this frame (AT1, back-to-front)
+
+    // --- AT3 captured-alpha (particles/smoke/flames restored under Forge) ------------
+    // MW already did the CPU billboarding + sort for these blended DIPs before the reject gate
+    // (distantland.cpp inspectIndexedPrimitive). captureAlphaDraw Locks the live VB/IB, copies
+    // the final verts + rebased indices into pending scratch DURING frame N, then the NEXT
+    // buildGeometryDrawLists (kickoff N+1) merges them into the sorted-alpha list (ONE sort with
+    // the cached blends) and ships the geometry to the host. Single-buffered: one pending scratch,
+    // consumed + cleared at the next consume. 1-frame-late particle positions are accepted (they
+    // were invisible before this feature); camera-relative subtraction uses the CURRENT eyePos at
+    // emit so there is no swim.
+    struct CapturedAlphaRec {
+        std::uint32_t vertexBase, vertexCount;   // into g_capVertScratch
+        std::uint32_t indexBase, indexCount;     // into g_capIdxScratch
+        float world[16];                          // ABSOLUTE model->world (emit subtracts eyePos)
+        float centroid[3];                        // ABSOLUTE world-space centroid (depth sort)
+        std::uint32_t texIndex;
+        std::uint32_t srcBlend, destBlend;
+        float alphaRef;
+        std::uint32_t vColSource;
+        float matDiffuse[3], matAmbient[3], matEmissive[3], matAlpha;
+    };
+    std::vector<IPC::GeomVertexWire> g_capVertScratch;   // pending captured verts (frame N)
+    std::vector<std::uint16_t>       g_capIdxScratch;    // pending captured indices (frame N)
+    std::vector<CapturedAlphaRec>    g_capRecs;          // pending captured records (frame N)
+    std::optional<IPC::VecView<IPC::GeomChunk>> g_capturedVec;   // shipped at kickoff ([verts][indices])
+    // Old-msoc double-draw guard: (d3dTexture<<32 | vertCount) of every cached blended shape the
+    // host already draws this frame; a captured DIP that matches one is a duplicate and is skipped
+    // (built in buildGeometryDrawLists while pushing alphaCands; consumed at the gate this frame).
+    std::unordered_set<std::uint64_t> g_alphaDedup;
+    // Per-frame texture-slot memo for captureAlphaDraw (cleared at consume): rs.texture ptr -> slot.
+    std::unordered_map<IDirect3DTexture9*, std::uint32_t> g_capTexMemo;
+    // Drop counters (one-shot logged): lock fail / cap overflow / INDEX32 rebase / no-name-white.
+    std::uint32_t g_capDropLock = 0, g_capDropCap = 0, g_capDropIdx32 = 0, g_capNoName = 0;
+    // Captured blended DIPs merged into the alpha list this frame (heartbeat cap=N). Set in
+    // buildGeometryDrawLists before the records are cleared; read into KickState at kickoff.
+    std::uint32_t g_capturedEmitted = 0;
 
     // --- Phase 2 bindless texture residency (client) ---
     // Each unique texture (by normalized name) gets a dense bindless slot; its raw DDS bytes
@@ -672,6 +710,16 @@ namespace {
             g_alphaVec.emplace(std::move(*av));
         }
 
+        // AT3 captured-alpha geometry vec: one 1-chunk (1MB) vec carrying [captured verts][captured
+        // indices] — 20000 verts (720KB) + 60000 uint16 (120KB) = 840KB fits one chunk (see
+        // kMaxCapturedAlpha* in geomwire.h). A 1-chunk vec sidesteps the IPC uint32-reservation hazard.
+        auto cv = g_client->allocVecBlocking<IPC::GeomChunk>(1, 1, 1);
+        if (!cv) {
+            LOG::logline("!! [seam] captured-alpha vec alloc failed — Forge captured alpha (AT3) disabled");
+        } else {
+            g_capturedVec.emplace(std::move(*cv));
+        }
+
         // Texture upload vec: kTexChunks (32MB window) — larger than geometry because a single DDS
         // must fit one window (oversize textures are dropped to white in resolveTextureSlot).
         auto tv = g_client->allocVecBlocking<IPC::GeomChunk>(
@@ -904,10 +952,27 @@ namespace {
     // pass's per-entry packing (drawEntry in rendercachedcolor.cpp) so the Forge
     // draw list draws the same set. Terrain draws too (near worldLandscapeRoot
     // patches; flat-shaded geometry).
+    // TEMP normal-flip diagnostic (remove after triage): one-shot per (name,tag) dump of the world
+    // 3x3 determinant sign. Negative det = MIRRORED placement — mul((float3x3)world, N) then flips
+    // the normal relative to the surface (green<->purple in F12 mode 8), which mis-lights the shape.
+    // Called from BOTH the opaque (STATIC) and sorted-alpha (ALPHA) emit so a wall's sign can be
+    // compared directly to a tapestry's.
+    void diagWorldDet(const char* tag, const char* name, const float* w) {
+        static std::unordered_set<std::string> s_seen;
+        std::string key = std::string(tag) + "|" + (name ? name : "(null)");
+        if (!s_seen.insert(key).second || s_seen.size() > 128) return;
+        const float det = w[0] * (w[5]*w[10] - w[6]*w[9])
+                        - w[1] * (w[4]*w[10] - w[6]*w[8])
+                        + w[2] * (w[4]*w[9]  - w[5]*w[8]);
+        LOG::logline(">> [norm-diag] %s %s det=%.3f %s", tag, name ? name : "(null)",
+                     det, det < 0.0f ? "MIRRORED" : "normal");
+    }
+
     void emitStaticDraw(SlotInfo& si, const MGE::GeometryCache::CachedGeometry& e,
                         std::uint32_t& count) {
             IPC::DrawItemWire item;
             item.slot = si.slot;
+            diagWorldDet("STATIC", e.textureName, e.worldTransformD3D);
             item.texIndex = resolveCachedSlot(e.textureName, si.baseNamePtr, si.baseSlot, si.baseEpoch);
             // Terrain DECAL_1 overlay (second land texture). resolveTextureSlot ships its DDS
             // bytes the same way as the base map. Non-landscape / single-texture draws get 0,
@@ -1059,6 +1124,7 @@ namespace {
                        std::uint32_t& count) {
             IPC::AlphaDrawWire item;
             item.slot      = si.slot;
+            diagWorldDet("ALPHA", e.textureName, e.worldTransformD3D);
             item.texIndex  = resolveCachedSlot(e.textureName, si.baseNamePtr, si.baseSlot, si.baseEpoch);
             item.srcBlend  = e.srcBlend;
             item.destBlend = e.destBlend;
@@ -1073,6 +1139,38 @@ namespace {
             item.world[12] -= DistantLand::eyePos.x;
             item.world[13] -= DistantLand::eyePos.y;
             item.world[14] -= DistantLand::eyePos.z;
+            // AT3 captured-geometry locators unused for a cached-mesh (slot) item — the host
+            // reads them only when slot == kAlphaSlotCaptured. Zero so they never alias garbage.
+            item.vertexBase = item.indexBase = item.indexCount = 0;
+            const std::size_t at = g_alphaScratch.size();
+            g_alphaScratch.resize(at + sizeof(item));
+            memcpy(g_alphaScratch.data() + at, &item, sizeof(item));
+            ++count;
+    }
+
+    // AT3: emit one captured blended DIP as a sentinel-slot AlphaDrawWire. Unlike emitAlphaDraw
+    // there is no uploaded mesh slot — slot = kAlphaSlotCaptured and vertexBase/indexBase/indexCount
+    // locate the geometry in the shared captured VB/IB the kickoff ships. Camera-relative world
+    // subtraction uses the CURRENT eyePos (rec.world is absolute), so 1-frame-old records don't swim.
+    void emitCapturedAlphaDraw(const CapturedAlphaRec& rec, std::uint32_t& count) {
+            IPC::AlphaDrawWire item;
+            item.slot      = IPC::kAlphaSlotCaptured;
+            item.texIndex  = rec.texIndex;
+            item.srcBlend  = rec.srcBlend;
+            item.destBlend = rec.destBlend;
+            item.alphaRef  = rec.alphaRef;
+            item.matDiffuse[0]  = rec.matDiffuse[0];  item.matDiffuse[1]  = rec.matDiffuse[1];  item.matDiffuse[2]  = rec.matDiffuse[2];
+            item.matAlpha       = rec.matAlpha;
+            item.matAmbient[0]  = rec.matAmbient[0];  item.matAmbient[1]  = rec.matAmbient[1];  item.matAmbient[2]  = rec.matAmbient[2];
+            item.matEmissive[0] = rec.matEmissive[0]; item.matEmissive[1] = rec.matEmissive[1]; item.matEmissive[2] = rec.matEmissive[2];
+            item.vColSource = rec.vColSource;
+            memcpy(item.world, rec.world, 16 * sizeof(float));
+            item.world[12] -= DistantLand::eyePos.x;
+            item.world[13] -= DistantLand::eyePos.y;
+            item.world[14] -= DistantLand::eyePos.z;
+            item.vertexBase = rec.vertexBase;
+            item.indexBase  = rec.indexBase;
+            item.indexCount = rec.indexCount;
             const std::size_t at = g_alphaScratch.size();
             g_alphaScratch.resize(at + sizeof(item));
             memcpy(g_alphaScratch.data() + at, &item, sizeof(item));
@@ -1134,15 +1232,33 @@ namespace {
         // host draw all ride this one gate; off = the blended set stays engine-drawn as before).
         const bool wantAlpha   = (bool)g_alphaVec && Configuration.ForgeAlphaPass;
         if (!wantStatic && !wantSkinned && !wantMM && !wantAlpha) {
+            // AT3 defensive clear: drop any captured records/geometry so an idle frame (menu/
+            // loading) can't leave last frame's captures to accumulate or ship stale.
+            g_capturedEmitted = 0;
+            g_capRecs.clear();
+            g_capVertScratch.clear();
+            g_capIdxScratch.clear();
+            g_capTexMemo.clear();
+            g_alphaDedup.clear();
             return;
         }
 
         // AT1 collect: blended shapes are gathered (not emitted) during the loop, then sorted
         // back-to-front and packed AFTER it — MW's sorter criterion is bound-center view depth.
         // Pointers into the two unordered_maps are element-stable across ensureLive inserts.
-        struct AlphaCand { float depth; SlotInfo* si; const MGE::GeometryCache::CachedGeometry* e; };
+        // AT1 cached-mesh (si+e) OR AT3 captured-geometry (cap) candidate — ONE sort covers both
+        // so cross-set blend order is correct. Exactly one of {e, cap} is non-null per entry.
+        struct AlphaCand {
+            float depth;
+            SlotInfo* si;                                       // cached: valid; captured: nullptr
+            const MGE::GeometryCache::CachedGeometry* e;        // cached: valid; captured: nullptr
+            const CapturedAlphaRec* cap;                        // captured: valid; cached: nullptr
+        };
         static std::vector<AlphaCand> alphaCands;   // single-threaded; reused frame-to-frame
         alphaCands.clear();
+        // AT3 old-msoc double-draw guard set — rebuilt THIS frame from the cached blends the host
+        // draws, then read by captureAlphaDraw during this frame's scene>=1 (see g_alphaDedup).
+        g_alphaDedup.clear();
         // World-space view forward (mwView's 3rd column) for the depth key; eye-relative so the
         // key is invariant to the camera-relative world shift emitAlphaDraw applies later.
         const float fwdX = DistantLand::mwView._13;
@@ -1168,7 +1284,14 @@ namespace {
                     const float wx = cx * w[0] + cy * w[4] + cz * w[8]  + w[12] - DistantLand::eyePos.x;
                     const float wy = cx * w[1] + cy * w[5] + cz * w[9]  + w[13] - DistantLand::eyePos.y;
                     const float wz = cx * w[2] + cy * w[6] + cz * w[10] + w[14] - DistantLand::eyePos.z;
-                    alphaCands.push_back({ wx * fwdX + wy * fwdY + wz * fwdZ, &slot, &e });
+                    alphaCands.push_back({ wx * fwdX + wy * fwdY + wz * fwdZ, &slot, &e, nullptr });
+                    // AT3: record (GPU texture, vertexCount) so captureAlphaDraw skips this exact
+                    // blend if MW's own DIP for it still reaches the reject gate (old-msoc dll:
+                    // opaque-only skip → cached single-map blends both DIP AND ride the host).
+                    if (e.d3dTexture) {
+                        g_alphaDedup.insert(((std::uint64_t)(std::uintptr_t)e.d3dTexture << 32)
+                                            | (std::uint64_t)e.vertexCount);
+                    }
                 }
                 return;
             }
@@ -1210,7 +1333,22 @@ namespace {
             }
         }
 
-        // AT1: back-to-front (descending view depth — farthest drawn first, MW's sort) then pack.
+        // AT3: merge the captured blended DIPs (particles/smoke/flames + multimap/decal/untextured
+        // blends the host cache pass doesn't own) captured LAST frame (g_capRecs) into the SAME
+        // candidate list so ONE sort orders the whole blended set back-to-front. Depth uses the
+        // CURRENT eye + forward against the record's absolute world-space centroid (no swim from the
+        // 1-frame latency). The records are consumed (cleared) after emit; the geometry bytes stay
+        // in g_capVertScratch/g_capIdxScratch for the kickoff to ship.
+        if (wantAlpha) {
+            for (const auto& rec : g_capRecs) {
+                const float dx = rec.centroid[0] - DistantLand::eyePos.x;
+                const float dy = rec.centroid[1] - DistantLand::eyePos.y;
+                const float dz = rec.centroid[2] - DistantLand::eyePos.z;
+                alphaCands.push_back({ dx * fwdX + dy * fwdY + dz * fwdZ, nullptr, nullptr, &rec });
+            }
+        }
+
+        // AT1/AT3: back-to-front (descending view depth — farthest drawn first, MW's sort) then pack.
         if (!alphaCands.empty()) {
             std::sort(alphaCands.begin(), alphaCands.end(),
                       [](const AlphaCand& a, const AlphaCand& b) { return a.depth > b.depth; });
@@ -1227,7 +1365,11 @@ namespace {
             }
             g_alphaScratch.reserve((alphaCands.size() - first) * sizeof(IPC::AlphaDrawWire));
             for (std::size_t i = first; i < alphaCands.size(); ++i) {
-                emitAlphaDraw(*alphaCands[i].si, *alphaCands[i].e, alphaCount);
+                if (alphaCands[i].cap) {
+                    emitCapturedAlphaDraw(*alphaCands[i].cap, alphaCount);
+                } else {
+                    emitAlphaDraw(*alphaCands[i].si, *alphaCands[i].e, alphaCount);
+                }
             }
             // Bring-up diagnostic: name the captured set once (what the alpha list actually IS —
             // if the in-game "sorted" the eye notices isn't in here, it's an AT3 leftover, not a
@@ -1235,15 +1377,36 @@ namespace {
             static bool s_alphaNamed = false;
             if (!s_alphaNamed) {
                 s_alphaNamed = true;
-                LOG::logline(">> [alpha-cap] %zu blended shapes captured this frame:", alphaCands.size());
+                LOG::logline(">> [alpha-cap] %zu blended shapes this frame (%zu captured AT3):",
+                             alphaCands.size(), g_capRecs.size());
                 const std::size_t nDump = (alphaCands.size() < 16u) ? alphaCands.size() : 16u;
                 for (std::size_t i = 0; i < nDump; ++i) {
-                    const auto& e = *alphaCands[i].e;
-                    LOG::logline(">> [alpha-cap] #%zu depth=%.0f tex=%s vc=%u tri=%u blend=%u/%u matA=%.2f",
-                                 i, alphaCands[i].depth, e.textureName ? e.textureName : "(null)",
-                                 e.vertexCount, e.triangleCount, e.srcBlend, e.destBlend, e.matDiffuse[3]);
+                    const auto& c = alphaCands[i];
+                    if (c.cap) {
+                        LOG::logline(">> [alpha-cap] #%zu depth=%.0f CAPTURED tex=%u vc=%u tri=%u blend=%u/%u matA=%.2f vcs=%u",
+                                     i, c.depth, c.cap->texIndex, c.cap->vertexCount, c.cap->indexCount / 3,
+                                     c.cap->srcBlend, c.cap->destBlend, c.cap->matAlpha, c.cap->vColSource);
+                    } else {
+                        const auto& e = *c.e;
+                        LOG::logline(">> [alpha-cap] #%zu depth=%.0f tex=%s vc=%u tri=%u blend=%u/%u matA=%.2f",
+                                     i, c.depth, e.textureName ? e.textureName : "(null)",
+                                     e.vertexCount, e.triangleCount, e.srcBlend, e.destBlend, e.matDiffuse[3]);
+                    }
                 }
             }
+        }
+
+        // AT3: the captured RECORDS are now consumed (emitted as wire items). Clear them + the
+        // per-frame texture memo so this frame's scene>=1 captures start fresh; the geometry BYTES
+        // (g_capVertScratch/g_capIdxScratch) stay for the kickoff assign to ship, then are cleared
+        // there. On !wantAlpha frames the records were never merged — drop them so they can't
+        // accumulate (and drop the bytes too, since nothing will ship them).
+        g_capturedEmitted = wantAlpha ? (std::uint32_t)g_capRecs.size() : 0u;
+        g_capRecs.clear();
+        g_capTexMemo.clear();
+        if (!wantAlpha) {
+            g_capVertScratch.clear();
+            g_capIdxScratch.clear();
         }
     }
 
@@ -1474,6 +1637,12 @@ namespace RenderProcess {
             // it on.
             MGE_ZoneScopedN("Forge geom flush");
             flushGeometry();
+            // AT3 defensive clear: nothing will consume/ship captured alpha while off — drop it so
+            // a stale record can't leak in on the next F11-on frame (captures require g_enabled).
+            g_capRecs.clear();
+            g_capVertScratch.clear();
+            g_capIdxScratch.clear();
+            g_capTexMemo.clear();
             return;
         }
 
@@ -1561,6 +1730,29 @@ namespace RenderProcess {
             alphaId    = g_alphaVec->id();
             alphaBytes = (std::uint32_t)g_alphaScratch.size();
         }
+
+        // AT3 captured-alpha: ship the geometry buildGeometryDrawLists left in the scratch
+        // (referenced by the sentinel-slot AlphaDrawWire items just packed). One 1-chunk vec
+        // holds [verts (GeomVertexWire)][indices (uint16)] contiguously — indices begin at
+        // capturedVertBytes. Then clear the scratch so this frame's fresh captures start at base 0
+        // (the wire bases match the shipped layout because we ship the whole scratch verbatim).
+        IPC::VecId   capturedId = IPC::InvalidVector;
+        std::uint32_t capVertBytes = 0, capIdxBytes = 0;
+        if (g_capturedVec && !g_capVertScratch.empty()) {
+            capVertBytes = (std::uint32_t)(g_capVertScratch.size() * sizeof(IPC::GeomVertexWire));
+            capIdxBytes  = (std::uint32_t)(g_capIdxScratch.size() * sizeof(std::uint16_t));
+            static std::vector<std::uint8_t> capBlob;   // reused staging blob (contiguous verts+indices)
+            capBlob.resize((std::size_t)capVertBytes + capIdxBytes);
+            memcpy(capBlob.data(), g_capVertScratch.data(), capVertBytes);
+            if (capIdxBytes) { memcpy(capBlob.data() + capVertBytes, g_capIdxScratch.data(), capIdxBytes); }
+            if (g_capturedVec->assign_bytes(capBlob.data(), (std::uint32_t)capBlob.size())) {
+                capturedId = g_capturedVec->id();
+            } else {
+                capVertBytes = capIdxBytes = 0;   // over one window (shouldn't happen at these caps)
+            }
+        }
+        g_capVertScratch.clear();
+        g_capIdxScratch.clear();
         const double tAssign = nowMs();
 
         // The MGE→Forge FEEDING cost (the bulk of the "unaccounted" client gap): every frame MGE
@@ -1723,6 +1915,7 @@ namespace RenderProcess {
                      lightId, (lightId != IPC::InvalidVector) ? lightCount : 0, lightBytes,
                      skyId, (skyId != IPC::InvalidVector) ? skyCount : 0, skyBytes,
                      alphaId, (alphaId != IPC::InvalidVector) ? alphaCount : 0, alphaBytes,
+                     capturedId, capVertBytes, capIdxBytes,
                      (std::uint32_t)g_debugMode, &devInput, waterParams, waterOn);
         }
         if (!ok) {
@@ -1739,6 +1932,7 @@ namespace RenderProcess {
         g_kick.lightCount    = lightCount;
         g_kick.skyCount      = skyCount;
         g_kick.alphaCount    = alphaCount;
+        g_kick.capturedCount = g_capturedEmitted;
         g_kick.geomParts     = geomParts;
         g_kick.texCount      = texCount;
         g_kick.geomBytes     = geomBytes;
@@ -1771,12 +1965,14 @@ namespace RenderProcess {
             // draw just looks displaced). Reveals duplicate draws regardless of source.
             if (GetAsyncKeyState(VK_F12) & 0x0001) {
                 // Tier 2 GTAO added 3 (AO) + 4 (bent normal); dev panel added 5 (albedo) 6 (lit)
-                // 7 (ambient) shading-isolation views — cycle is now %8.
-                g_debugMode = (g_debugMode + 1) % 8;
+                // 7 (ambient) shading-isolation views; 8 (world normal) 9 (point-light count)
+                // A/B the alpha vs opaque lighting inputs — cycle is now %10.
+                g_debugMode = (g_debugMode + 1) % 10;
                 const char* name = (g_debugMode == 1) ? "DEPTH" : (g_debugMode == 2) ? "SCATTER"
                                  : (g_debugMode == 3) ? "AO" : (g_debugMode == 4) ? "BENT NORMAL"
                                  : (g_debugMode == 5) ? "ALBEDO" : (g_debugMode == 6) ? "LIT"
-                                 : (g_debugMode == 7) ? "AMBIENT" : "NORMAL";
+                                 : (g_debugMode == 7) ? "AMBIENT" : (g_debugMode == 8) ? "WORLD NORMAL"
+                                 : (g_debugMode == 9) ? "LIGHT COUNT" : "NORMAL";
                 LOG::logline(">> [seam] debug mode %d (%s)", g_debugMode, name);
             }
             // F9 toggles the in-host dev overlay.
@@ -1939,15 +2135,17 @@ namespace RenderProcess {
         g_hb.build += (g_kick.tBuild - g_kick.tStart);
         g_hb.render += renderBucket; g_hb.host += hostMs; g_hb.overlap += overlap;
         g_hb.copy += (tCopy - tRender); g_hb.blit += (tEnd - tCopy); g_hb.dt += g_kick.dtPresent;
+        g_hb.captured += g_kick.capturedCount;
         if (feed > g_hb.maxFeed) g_hb.maxFeed = feed;
         if (g_kick.dtPresent > g_hb.maxDt) g_hb.maxDt = g_kick.dtPresent;
         if (g_kick.early) ++g_hb.earlyN;
         if (++g_hb.n >= kHeartbeatFrames) {
             LOG::logline(">> [hb] %u frames avg: feed=%.2f geom=%.2f build=%.2f render=%.2f[host=%.2f] "
-                         "overlap=%.2f copy=%.2f blit=%.2f dt=%.2f early=%u | max feed=%.2f dt=%.2f (~%.0f fps)",
+                         "overlap=%.2f copy=%.2f blit=%.2f dt=%.2f early=%u cap=%.1f | max feed=%.2f dt=%.2f (~%.0f fps)",
                          g_hb.n, g_hb.feed / g_hb.n, g_hb.geom / g_hb.n, g_hb.build / g_hb.n,
                          g_hb.render / g_hb.n, g_hb.host / g_hb.n, g_hb.overlap / g_hb.n,
                          g_hb.copy / g_hb.n, g_hb.blit / g_hb.n, g_hb.dt / g_hb.n, g_hb.earlyN,
+                         g_hb.captured / g_hb.n,
                          g_hb.maxFeed, g_hb.maxDt,
                          g_hb.dt > 0.0 ? 1000.0 * g_hb.n / g_hb.dt : 0.0);
             g_hb = Accum{};
@@ -1956,13 +2154,13 @@ namespace RenderProcess {
         if (feed >= kSpikeMs) {
             LOG::logline("!! [spike] frame %u feed=%.2fms (geomflush=%.2f build=%.2f texflush=%.2f "
                          "assign=%.2f render=%.2f[host=%.2f] overlap=%.2f copy=%.2f blit=%.2f) "
-                         "draws=%u skin=%u mm=%u light=%u alpha=%u geom+=%u/%uKB tex+=%u/%uKB dt=%.2fms",
+                         "draws=%u skin=%u mm=%u light=%u alpha=%u cap=%u geom+=%u/%uKB tex+=%u/%uKB dt=%.2fms",
                          g_kick.frame, feed,
                          g_kick.tGeomFlush - g_kick.tBuild, g_kick.tBuild - g_kick.tStart,
                          g_kick.tTexFlush - g_kick.tGeomFlush, g_kick.tAssign - g_kick.tTexFlush,
                          renderBucket, hostMs, overlap, tCopy - tRender, tEnd - tCopy,
                          g_kick.drawCount, g_kick.skinnedCount, g_kick.multiMapCount, g_kick.lightCount,
-                         g_kick.alphaCount,
+                         g_kick.alphaCount, g_kick.capturedCount,
                          g_kick.geomParts, (unsigned)(g_kick.geomBytes >> 10),
                          g_kick.texCount, (unsigned)(g_kick.texBytes >> 10),
                          g_kick.dtPresent);
@@ -2010,6 +2208,186 @@ namespace RenderProcess {
         // compositing. Same gate as ownsOpaqueWorld (F11 = g_enabled) for a clean A/B; the
         // caller adds the exterior check (Forge DL is exterior-only). See header.
         return g_initOk && g_enabled;
+    }
+
+    void captureAlphaDraw(const RenderedState* rs, const FragmentState* frs) {
+        if (!Configuration.ForgeAlphaCapture) return;
+        if (!g_initOk || !g_enabled || !g_capturedVec) return;
+        if (!rs || !frs) return;
+        // HW-skinned blends (ghosts) excluded — the bind-pose VB here is the wrong pose (a
+        // separate follow-up). Need an indexed TRIANGLELIST with a real stride (TRISTRIP/FAN and
+        // non-indexed particle DIPs are dropped; a counter would reveal if MW emits any).
+        if (rs->vertexBlendState != 0) return;
+        if (rs->primType != D3DPT_TRIANGLELIST) return;
+        if (!rs->vb || !rs->ib || rs->vbStride == 0) return;
+        if ((rs->fvf & D3DFVF_POSITION_MASK) != D3DFVF_XYZ) return;   // untransformed XYZ only
+        if (rs->vertCount == 0 || rs->primCount == 0) return;
+
+        // Old-msoc double-draw guard: this DIP is a duplicate iff the host already draws a cached
+        // blended shape with the same (GPU texture, vertexCount) — the cache draws from its own VB
+        // copies so rs->vb never matches, but (tex, vertCount) does (the vertCount term kills the
+        // shared-texture false positive — particle counts vary). g_alphaDedup is built this frame
+        // in buildGeometryDrawLists while pushing the cached alphaCands.
+        const std::uint64_t dedupKey =
+            ((std::uint64_t)(std::uintptr_t)rs->texture << 32) | (std::uint64_t)rs->vertCount;
+        if (g_alphaDedup.find(dedupKey) != g_alphaDedup.end()) return;
+
+        // Caps: keep the shared captured buffers within their single-chunk budget. Drop WHOLE
+        // (never partial) on overflow so an index range can't dangle past the shipped vertex window.
+        const std::uint32_t idxCount = rs->primCount * 3;
+        if (g_capRecs.size() >= IPC::kMaxCapturedAlphaDraws
+            || g_capVertScratch.size() + rs->vertCount > IPC::kMaxCapturedAlphaVerts
+            || g_capIdxScratch.size() + idxCount > IPC::kMaxCapturedAlphaIndices) {
+            if (g_capDropCap++ == 0) {
+                LOG::logline("!! [alpha-cap] captured-alpha cap hit (draws/verts/indices) — dropping rest this session-window");
+            }
+            return;
+        }
+
+        // Texture slot: rs->texture is the proxy realTexture pointer, identical to the GPU texture
+        // the cache walk registered in g_textureNameMap. Resolve name -> bindless slot (per-frame
+        // memo). No name -> slot 0 (host default white): a visible white particle beats an invisible
+        // one, and NiFlipController textures self-correct after the first walk registers them.
+        std::uint32_t texIndex;
+        auto mit = g_capTexMemo.find(rs->texture);
+        if (mit != g_capTexMemo.end()) {
+            texIndex = mit->second;
+        } else {
+            const char* name = MGE::GeometryCache::resolveTextureName(rs->texture);
+            texIndex = name ? resolveTextureSlot(name) : 0u;
+            if (!name && g_capNoName++ < 20) {
+                LOG::logline("!! [alpha-cap] no source name for tex=%p (white)", (void*)rs->texture);
+            }
+            g_capTexMemo.emplace(rs->texture, texIndex);
+        }
+
+        // FVF offsets within the source stride (XYZ at 0; then NORMAL, PSIZE, DIFFUSE, SPECULAR,
+        // TEX in D3D order). We read pos/normal/diffuse/UV0.
+        const UINT stride = rs->vbStride;
+        UINT off = 12;   // past XYZ
+        const bool hasNorm = (rs->fvf & D3DFVF_NORMAL) != 0; const UINT normOff = off; if (hasNorm) off += 12;
+        if (rs->fvf & D3DFVF_PSIZE) off += 4;
+        const bool hasCol = (rs->fvf & D3DFVF_DIFFUSE) != 0;  const UINT colOff = off; if (hasCol) off += 4;
+        if (rs->fvf & D3DFVF_SPECULAR) off += 4;
+        const UINT texCount = (rs->fvf & D3DFVF_TEXCOUNT_MASK) >> D3DFVF_TEXCOUNT_SHIFT;
+        const bool hasUV = texCount >= 1; const UINT uvOff = off;
+
+        // vColSource forward map (inverse proven at rendercachedcolor.cpp:141-142). The captured
+        // frag reads real vertex color for source 1 and vertex alpha for any nonzero source, so we
+        // write the REAL captured D3DCOLOR whenever vColSource != 0 (particles fade via vertex alpha).
+        std::uint32_t vColSource = 0;
+        if (hasCol) {
+            if (rs->matSrcDiffuse == D3DMCS_COLOR1) vColSource = 2;
+            else if (rs->matSrcEmissive == D3DMCS_COLOR1) vColSource = 1;
+        }
+
+        // TEMP AT3 lighting-mismatch diagnostic (remove after triage): dump each first-seen captured
+        // source-name's full state — FVF layout (rule out a wrong normal offset), lighting/vColSource/
+        // material (the frag's lit path), and whether stage 1+ carries a texture (multi-map: the frag
+        // only samples the BASE map, so a dark/detail/glow blend renders wrong). Keyed on the name ptr.
+        {
+            static std::unordered_set<const void*> s_capDiagSeen;
+            const char* dname = MGE::GeometryCache::resolveTextureName(rs->texture);
+            const void* dkey = dname ? (const void*)dname : (const void*)rs->texture;
+            if (s_capDiagSeen.insert(dkey).second && s_capDiagSeen.size() <= 64) {
+                const int st1 = (int)frs->stage[1].colorOp, st2 = (int)frs->stage[2].colorOp, st3 = (int)frs->stage[3].colorOp;
+                LOG::logline(">> [cap-diag] %s fvf=0x%X stride=%u norm=%d@%u col=%d@%u uv=%d@%u "
+                             "vcs=%u lit=%u matD=(%.2f,%.2f,%.2f) matA=%.2f stageOps=[%d,%d,%d,%d]",
+                             dname ? dname : "(null)", (unsigned)rs->fvf, (unsigned)stride,
+                             (int)hasNorm, (unsigned)normOff, (int)hasCol, (unsigned)colOff, (int)hasUV, (unsigned)uvOff,
+                             vColSource, (unsigned)rs->useLighting,
+                             frs->material.diffuse.r, frs->material.diffuse.g, frs->material.diffuse.b,
+                             frs->material.diffuse.a, (int)frs->stage[0].colorOp, st1, st2, st3);
+            }
+        }
+
+        // Lock VB whole-remainder from vbOffset + IB (computeBoundingBox's exact flags); graceful drop.
+        void* pVerts = nullptr;
+        if (FAILED(rs->vb->Lock(rs->vbOffset, 0, &pVerts, D3DLOCK_READONLY | D3DLOCK_NOSYSLOCK))) {
+            if (g_capDropLock++ == 0) LOG::logline("!! [alpha-cap] VB lock failed — dropping");
+            return;
+        }
+        void* pIdx = nullptr;
+        if (FAILED(rs->ib->Lock(0, 0, &pIdx, D3DLOCK_READONLY | D3DLOCK_NOSYSLOCK))) {
+            rs->vb->Unlock();
+            if (g_capDropLock++ == 0) LOG::logline("!! [alpha-cap] IB lock failed — dropping");
+            return;
+        }
+        D3DINDEXBUFFER_DESC ibd; rs->ib->GetDesc(&ibd);
+        const bool is16 = (ibd.Format == D3DFMT_INDEX16);
+
+        // Copy the vertex window [baseIndex+minIndex, +vertCount) → captured VB, building the
+        // model-space bbox for the centroid. (The host adds vertexBase to each index, so indices
+        // are rebased to 0 within this window below.)
+        const std::uint32_t vBase = (std::uint32_t)g_capVertScratch.size();
+        const UINT srcVBase = rs->baseIndex + rs->minIndex;
+        float mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
+        for (UINT j = 0; j < rs->vertCount; ++j) {
+            const BYTE* v = (const BYTE*)pVerts + (size_t)(srcVBase + j) * stride;
+            const float* p = (const float*)v;
+            IPC::GeomVertexWire out;
+            out.px = p[0]; out.py = p[1]; out.pz = p[2];
+            if (hasNorm) { const float* n = (const float*)(v + normOff); out.nx = n[0]; out.ny = n[1]; out.nz = n[2]; }
+            else { out.nx = 0.0f; out.ny = 0.0f; out.nz = 1.0f; }
+            out.color = (vColSource != 0) ? *(const std::uint32_t*)(v + colOff) : 0xFFFFFFFFu;
+            if (hasUV) { const float* t = (const float*)(v + uvOff); out.u = t[0]; out.v = t[1]; }
+            else { out.u = 0.0f; out.v = 0.0f; }
+            g_capVertScratch.push_back(out);
+            for (int c = 0; c < 3; ++c) { mn[c] = std::min(mn[c], p[c]); mx[c] = std::max(mx[c], p[c]); }
+        }
+
+        // Copy primCount*3 indices from startIndex, rebased by -minIndex → [0, vertCount). Any
+        // rebased value out of uint16 → drop the whole record (roll back the pushed verts+indices).
+        const std::uint32_t iBase = (std::uint32_t)g_capIdxScratch.size();
+        bool idxDrop = false;
+        for (UINT i = 0; i < idxCount; ++i) {
+            const UINT raw = is16 ? ((const WORD*)pIdx)[rs->startIndex + i]
+                                  : ((const DWORD*)pIdx)[rs->startIndex + i];
+            const long rebased = (long)raw - (long)rs->minIndex;
+            if (rebased < 0 || rebased > 0xFFFF) { idxDrop = true; break; }
+            g_capIdxScratch.push_back((std::uint16_t)rebased);
+        }
+        rs->ib->Unlock();
+        rs->vb->Unlock();
+
+        if (idxDrop) {
+            g_capVertScratch.resize(vBase);
+            g_capIdxScratch.resize(iBase);
+            if (g_capDropIdx32++ == 0) LOG::logline("!! [alpha-cap] index rebase out of uint16 — dropping");
+            return;
+        }
+        if (mn[0] > mx[0]) { g_capVertScratch.resize(vBase); g_capIdxScratch.resize(iBase); return; }
+
+        // World-space centroid via worldTransforms[0] (model-space bbox center → world). The
+        // camera-relative subtraction is applied at emit with the CURRENT eyePos (no swim).
+        const float cx = 0.5f * (mn[0] + mx[0]), cy = 0.5f * (mn[1] + mx[1]), cz = 0.5f * (mn[2] + mx[2]);
+        const D3DXMATRIX& w = rs->worldTransforms[0];
+
+        CapturedAlphaRec rec;
+        rec.vertexBase = vBase; rec.vertexCount = rs->vertCount;
+        rec.indexBase = iBase;  rec.indexCount = idxCount;
+        memcpy(rec.world, &w, 16 * sizeof(float));   // D3DXMATRIX is row-major (host convention)
+        rec.centroid[0] = cx * w._11 + cy * w._21 + cz * w._31 + w._41;
+        rec.centroid[1] = cx * w._12 + cy * w._22 + cz * w._32 + w._42;
+        rec.centroid[2] = cx * w._13 + cy * w._23 + cz * w._33 + w._43;
+        rec.texIndex = texIndex;
+        rec.srcBlend = rs->srcBlend; rec.destBlend = rs->destBlend;
+        rec.alphaRef = rs->alphaTest
+            ? (float)(rs->alphaRef + (rs->alphaFunc == D3DCMP_GREATER ? 1 : 0)) / 255.0f : 0.0f;
+        rec.vColSource = vColSource;
+        // FFP-unlit approximation (verify in-game): unlit draws (particles) get zero diffuse/ambient
+        // + white emissive so the frag emits texture * vcol; lit draws pass the material through.
+        if (rs->useLighting == 0) {
+            rec.matDiffuse[0] = rec.matDiffuse[1] = rec.matDiffuse[2] = 0.0f;
+            rec.matAmbient[0] = rec.matAmbient[1] = rec.matAmbient[2] = 0.0f;
+            rec.matEmissive[0] = rec.matEmissive[1] = rec.matEmissive[2] = 1.0f;
+        } else {
+            rec.matDiffuse[0]  = frs->material.diffuse.r;  rec.matDiffuse[1]  = frs->material.diffuse.g;  rec.matDiffuse[2]  = frs->material.diffuse.b;
+            rec.matAmbient[0]  = frs->material.ambient.r;  rec.matAmbient[1]  = frs->material.ambient.g;  rec.matAmbient[2]  = frs->material.ambient.b;
+            rec.matEmissive[0] = frs->material.emissive.r; rec.matEmissive[1] = frs->material.emissive.g; rec.matEmissive[2] = frs->material.emissive.b;
+        }
+        rec.matAlpha = frs->material.diffuse.a;
+        g_capRecs.push_back(rec);
     }
 
     void captureGeometry(std::uint32_t key, std::uint16_t revision, std::uint32_t modelId,
