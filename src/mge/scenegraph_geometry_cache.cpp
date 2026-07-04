@@ -166,6 +166,7 @@ namespace MGE::GeometryCache {
             e.alphaRef    = 0.0f;
             e.alphaTest   = false;
             e.blendEnable = false;
+            e.twoSided    = false;   // single-sided (CULL_BACK) unless NiStencilProperty DRAW_BOTH
             // SK1 sky: default to the standard transparency blend; overwritten below from the
             // NiAlphaProperty flags when present. Only consumed for isSky entries (the Forge
             // sky pass); opaque/alpha-test draws ignore these.
@@ -205,6 +206,15 @@ namespace MGE::GeometryCache {
                     (ap->flags & NI::AlphaProperty::SRC_BLEND_MASK)  >> NI::AlphaProperty::SRC_BLEND_POS));
                 e.destBlend = static_cast<unsigned char>(niBlendToD3D(
                     (ap->flags & NI::AlphaProperty::DEST_BLEND_MASK) >> NI::AlphaProperty::DEST_BLEND_POS));
+            }
+
+            // NiStencilProperty draw mode → two-sided flag. DRAW_BOTH means MW disables
+            // culling (thin double-sided geometry). Absent stencil or any other mode
+            // (DRAW_CCW_OR_BOTH / DRAW_CCW / DRAW_CW) is single-sided → CULL_BACK in the
+            // alpha pass. (DRAW_CW is reversed single-sided; rare — treated as CULL_BACK
+            // for now, revisit if a shape reads inside-out.)
+            if (ps->stencil) {
+                e.twoSided = (ps->stencil->drawMode == NI::StencilProperty::DRAW_BOTH);
             }
 
             if (ps->texture) {

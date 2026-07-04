@@ -1143,7 +1143,10 @@ namespace {
         // CULL_BACK killed panes/banners viewed from behind in-game. NONE also makes winding
         // irrelevant, so there are no mirror PSO variants. 2 PSOs: alpha-over / additive.
         Shader*        pAlphaShader = nullptr;
-        Pipeline*      pAlphaPipeline = nullptr;           // SRCALPHA/INVSRCALPHA, cull NONE
+        Pipeline*      pAlphaPipeline = nullptr;           // SRCALPHA/INVSRCALPHA, cull NONE, depth no-write
+        Pipeline*      pAlphaPipelineWrite = nullptr;      // SRCALPHA/INVSRCALPHA, cull NONE, depth GEQUAL + WRITE (fold fix)
+        Pipeline*      pAlphaPipelineBack = nullptr;       // SRCALPHA/INVSRCALPHA, cull BACK (single-sided), depth WRITE
+        Pipeline*      pAlphaPipelineBackMirror = nullptr; // as Back, FRONT_FACE_CW (mirrored winding)
         Pipeline*      pAlphaPipelineAdd = nullptr;        // SRCALPHA/ONE additive, cull NONE
         Pipeline*      pAlphaPipelineDebug = nullptr;      // bring-up: alpha-over, depth OFF, cull NONE (panel toggle)
         Buffer*        pAlphaWorldsBuf = nullptr;          // gBatch: one 64KB world window (kMaxAlphaDraws x 64B)
@@ -2778,8 +2781,53 @@ namespace {
             addPipeline(R, &apd, &g_live.pAlphaPipeline);
             ag.pBlendState = &alphaBlendAdd;
             addPipeline(R, &apd, &g_live.pAlphaPipelineAdd);
-            if (!g_live.pAlphaPipeline || !g_live.pAlphaPipelineAdd) {
-                std::printf("[forge] addPipeline(alpha x2) FAILED\n");
+
+            // Fold fix (panel "ALPHA: depth-write fold fix"): a self-overlapping alpha-over mesh
+            // (folded tapestry/banner) drawn CULL_NONE with NO depth write lets whichever layer is
+            // later in index order paint over the other, so the BACK face shows through the fold.
+            // A depth-WRITE alpha-over PSO makes the nearer layer win per-pixel (winding-independent):
+            // the far/back layer is either depth-rejected or fully covered. Used ONLY for CACHED
+            // solid-cloth draws — captured particles + additive keep the no-write PSOs so their
+            // translucent layers still ACCUMULATE (smoke density, additive glow). Inter-object
+            // layering is preserved by the back-to-front sort (far writes depth first, near blends
+            // over later). Depth is the last thing the frame writes here, so nothing downstream cares.
+            DepthStateDesc alphaDepthWrite = alphaDepth;
+            alphaDepthWrite.mDepthWrite = true;         // GEQUAL test + write (reverse-Z)
+            ag.pDepthState = &alphaDepthWrite;
+            ag.pBlendState = &alphaBlend;               // alpha-over
+            addPipeline(R, &apd, &g_live.pAlphaPipelineWrite);
+            ag.pDepthState = &alphaDepth;               // restore for the debug PSO below
+
+            // Single-sided alpha (CULL_BACK): MW draws any alpha shape WITHOUT NiStencilProperty
+            // DRAW_BOTH single-sided (backface-culled). Forcing CULL_NONE on a solid 3D alpha mesh
+            // (a draped altar cloth) showed its back/interior faces through the front. These PSOs
+            // draw only the front face, exactly like MW — so no interior show-through and no need for
+            // the two-sided normal flip. Depth WRITE (fold fix) still applies: a draped single-sided
+            // cloth self-overlaps front-over-front, and nearest-wins keeps it solid. Mirror variant
+            // flips the front face (negative-determinant winding), matching the opaque mirror PSO.
+            RasterizerStateDesc alphaRasterBack = alphaRaster;
+            alphaRasterBack.mCullMode = CULL_MODE_BACK;
+            alphaRasterBack.mFrontFace = FRONT_FACE_CCW;
+            // Depth WRITE (GEQUAL): a solid 3D drape self-occludes — a nearer wrinkle must hide the
+            // farther part of the same surface behind it. Without the write those far front-facing
+            // layers paint through in draw order and the winner shifts with the camera (show-through
+            // + lighting shimmer). Nearest-wins fixes that. The only cost is a thin near-coplanar
+            // z-fight exactly where two layers press together, which reads in the normal-debug view
+            // but is hidden in colour (same fabric) — an acceptable trade vs. broken occlusion.
+            ag.pDepthState = &alphaDepthWrite;
+            ag.pBlendState = &alphaBlend;               // alpha-over
+            ag.pRasterizerState = &alphaRasterBack;
+            addPipeline(R, &apd, &g_live.pAlphaPipelineBack);
+            RasterizerStateDesc alphaRasterBackMirror = alphaRasterBack;
+            alphaRasterBackMirror.mFrontFace = FRONT_FACE_CW;
+            ag.pRasterizerState = &alphaRasterBackMirror;
+            addPipeline(R, &apd, &g_live.pAlphaPipelineBackMirror);
+            ag.pRasterizerState = &alphaRaster;         // restore CULL_NONE
+            ag.pDepthState = &alphaDepth;
+
+            if (!g_live.pAlphaPipeline || !g_live.pAlphaPipelineAdd || !g_live.pAlphaPipelineWrite
+                || !g_live.pAlphaPipelineBack || !g_live.pAlphaPipelineBackMirror) {
+                std::printf("[forge] addPipeline(alpha x5) FAILED\n");
                 return false;
             }
 
@@ -3454,11 +3502,14 @@ namespace {
     // AT3 triage: paint every sorted-alpha draw solid magenta (alpha.frag debug bit3) so the
     // alpha-pass set is identifiable at a glance vs the opaque set (which ignores this bit).
     bool g_alphaHighlight = false;
-    // AT3 two-sided lighting (alpha.frag debug bit4, default ON): MW's blended cloth (tapestries/
-    // banners) is DRAW_BOTH two-sided with authored normals facing the BACK; the sorted-alpha pass
-    // is CULL_NONE, so we flip N to face the viewer before the one-sided N.L (matches MW's fixed-
-    // function two-sided lighting). Toggle off = flat authored-normal lighting (the "dark folds" A/B).
-    bool g_alphaTwoSided = true;
+    // (Two-sided normal flip REMOVED — it diverged from FFE/PPL, which never flip, and caused a
+    // grazing-angle normal artifact at fold seams. The alpha pass now honours each shape's real
+    // NiStencilProperty cull mode instead: single-sided → CULL_BACK, DRAW_BOTH → CULL_NONE.)
+    // Fold fix (default ON): cached solid-cloth alpha-over draws write depth so a self-overlapping
+    // mesh (folded tapestry) resolves nearest-layer-wins instead of letting the back face show
+    // through the fold. Captured particles + additive always keep the no-write PSOs. Toggle off =
+    // the old CULL_NONE/no-write behaviour (the "back face shows through" A/B).
+    bool g_alphaDepthWrite = true;
     bool g_drawReflect   = true;
     bool g_drawReflectGeo = true;   // WV2: reflect host-owned land + statics (off = sky-only reflection)
     bool g_reflHorizonScissor = true; // WV2 perf: scissor the reflect pass to below the water-plane horizon
@@ -3660,8 +3711,8 @@ namespace {
         uiAddComponentWidget(g_uiPanel, "ALPHA: depth OFF (debug)", &cADbg, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cAHl = {}; cAHl.pData = &g_alphaHighlight;
         uiAddComponentWidget(g_uiPanel, "ALPHA: highlight magenta", &cAHl, WIDGET_TYPE_CHECKBOX);
-        CheckboxWidget cA2S = {}; cA2S.pData = &g_alphaTwoSided;
-        uiAddComponentWidget(g_uiPanel, "ALPHA: two-sided (fix)", &cA2S, WIDGET_TYPE_CHECKBOX);
+        CheckboxWidget cADW = {}; cADW.pData = &g_alphaDepthWrite;
+        uiAddComponentWidget(g_uiPanel, "ALPHA: depth-write fold fix", &cADW, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cDLand = {}; cDLand.pData = &g_drawDLLand;
         uiAddComponentWidget(g_uiPanel, "Draw: distant land", &cDLand, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cDStat = {}; cDStat.pData = &g_drawDLStatics;
@@ -4146,8 +4197,8 @@ namespace ForgeRender {
             dp[42] = 1.0f / (float)g_live.height;   // invScreen.y
             dp[43] = (float)((g_aoEnable ? 1u : 0u) | (g_bentNormalEnable ? 2u : 0u)
                            | (g_ambientWhite ? 4u : 0u)      // AO toggles (bits 0-2)
-                           | (g_alphaHighlight ? 8u : 0u)    // bit3: alpha.frag magenta highlight (opaque ignores)
-                           | (g_alphaTwoSided ? 16u : 0u));  // bit4: alpha.frag two-sided normal flip (opaque ignores)
+                           | (g_alphaHighlight ? 8u : 0u));  // bit3: alpha.frag magenta highlight (opaque ignores)
+                                                             // bit4 (two-sided flip) retired — see alpha.frag
             // dbgScales (float index 44..47): dev panel intensity modifiers.
             dp[44] = g_ambScale; dp[45] = g_litScale; dp[46] = g_albedoScale; dp[47] = g_overallScale;
             // skyParams (float index 60..63): SK2 "ownership tell" — sky.frag tints the Forge sky
@@ -5601,7 +5652,26 @@ namespace ForgeRender {
                         warnedAlphaBlend = true;
                     }
                 }
-                Pipeline* want = additive ? g_live.pAlphaPipelineAdd : g_live.pAlphaPipeline;
+                // Cull-mode pick (honours MW's per-shape NiStencilProperty, shipped in it.cullFlags):
+                //  - additive: CULL_NONE (glow/particles, order-independent).
+                //  - two-sided (DRAW_BOTH) OR captured particles: CULL_NONE, with the depth-write
+                //    fold fix for cached solid double-sided cloth (toggle / not-captured, as before).
+                //  - single-sided (default MW cull): CULL_BACK (+ mirror winding), depth WRITE — draws
+                //    only the front face like MW, so a solid alpha mesh (draped altar cloth) no longer
+                //    shows its back/interior through the front. This is the real fix; the two-sided
+                //    normal flip never triggers here because there are no visible back faces.
+                const bool twoSided = (it.cullFlags & IPC::kAlphaCullTwoSided) != 0u;
+                const bool mirrored = (it.cullFlags & IPC::kAlphaCullMirrored) != 0u;
+                Pipeline* want;
+                if (additive) {
+                    want = g_live.pAlphaPipelineAdd;
+                } else if (!twoSided) {
+                    want = mirrored ? g_live.pAlphaPipelineBackMirror : g_live.pAlphaPipelineBack;
+                } else if (g_alphaDepthWrite && !isCaptured && g_live.pAlphaPipelineWrite) {
+                    want = g_live.pAlphaPipelineWrite;
+                } else {
+                    want = g_live.pAlphaPipeline;
+                }
                 if (g_alphaDebugNoDepth && g_live.pAlphaPipelineDebug) {
                     want = g_live.pAlphaPipelineDebug;   // bring-up: depth off, alpha-over
                 }
@@ -9546,6 +9616,9 @@ namespace ForgeRender {
         if (g_live.pCapAlphaVB)             { removeResource(g_live.pCapAlphaVB); }
         if (g_live.pCapAlphaIB)             { removeResource(g_live.pCapAlphaIB); }
         if (g_live.pAlphaPipeline)          { removePipeline(R, g_live.pAlphaPipeline); }
+        if (g_live.pAlphaPipelineWrite)     { removePipeline(R, g_live.pAlphaPipelineWrite); }
+        if (g_live.pAlphaPipelineBack)      { removePipeline(R, g_live.pAlphaPipelineBack); }
+        if (g_live.pAlphaPipelineBackMirror){ removePipeline(R, g_live.pAlphaPipelineBackMirror); }
         if (g_live.pAlphaPipelineAdd)       { removePipeline(R, g_live.pAlphaPipelineAdd); }
         if (g_live.pAlphaPipelineDebug)     { removePipeline(R, g_live.pAlphaPipelineDebug); }
         if (g_live.pAlphaShader)            { removeShader(R, g_live.pAlphaShader); }

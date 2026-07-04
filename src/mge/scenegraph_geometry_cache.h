@@ -122,6 +122,12 @@ namespace MGE::GeometryCache {
         float alphaRef;
         bool  alphaTest;
         bool  blendEnable;
+        // NiStencilProperty DRAW_BOTH: the shape is authored two-sided (window panes,
+        // waterfalls, thin cloth) and MW draws it with culling OFF. Single-sided shapes
+        // (no stencil / not DRAW_BOTH) MW draws CULL_BACK — the Forge alpha pass must
+        // honour this so a solid alpha mesh (draped altar cloth) doesn't show its back/
+        // interior faces through the front. Default false = single-sided (CULL_BACK).
+        bool  twoSided;
         // Material colours (RGBA) captured from the NI MaterialProperty on the
         // create/material-change path, for the cache-driven color pass
         // (Phase 0.5). Default to white diffuse/ambient, zero emissive when the

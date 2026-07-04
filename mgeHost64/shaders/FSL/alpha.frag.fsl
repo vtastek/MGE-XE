@@ -55,22 +55,16 @@ float4 PS_MAIN( VSOutput In )
     float4 aoSample = SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
     if ((aoFlags & 2u) != 0u) { N = normalize(aoSample.rgb); }
 
-    // Two-sided normal (bit4, panel "ALPHA: two-sided (fix)"): MW's blended cloth is DRAW_BOTH with
-    // authored normals facing the BACK; this pass is CULL_NONE so we may be shading either face.
-    // Flip N to face the viewer, then the one-sided N.L below lights the VISIBLE side by its true
-    // orientation to the light (matches MW's fixed-function two-sided lighting, and PPL "lit on the
-    // light-facing side"). WorldPos is camera-relative (opaque.vert shifts world by -eye), so the
-    // camera sits at the origin and the to-eye direction is simply -WorldPos.
-    if ((aoFlags & 16u) != 0u) {
-        float3 toEye = -In.WorldPos;
-        if (dot(N, toEye) < 0.0f) { N = -N; }
-    }
+    // NO normal flip — the authored normal is used as-is, byte-for-byte matching the FFE/PPL
+    // reference and MW's fixed-function pipeline (neither does two-sided lighting; D3D8/9 has no
+    // such render state). The alpha pass now honours each shape's NiStencilProperty cull mode on
+    // the host (single-sided → CULL_BACK, DRAW_BOTH → CULL_NONE), exactly like MW — so a solid
+    // alpha mesh (draped altar cloth) shows only its front face and never needs a per-pixel flip.
+    // (bit4 is retired; the host may still set it, but this frag ignores it.)
 
     // One-sided sun N.L — matches the FFE reference (XE FixedFuncEmu.fx PerPixelPS:
-    // lightSunDiffuse * saturate(dot(normal, -lightSunDirection))). The FFE PPL path is the
-    // parity target for these blended shapes; it does NOT do two-sided/back-face normal flip,
-    // so we don't either. (A wavy fold reading "darker on some parts" vs PPL is a NORMAL
-    // difference in the cached geometry, not a lighting-model choice — chase it there.)
+    // lightSunDiffuse * saturate(dot(normal, -lightSunDirection))). Parity gaps are DATA
+    // (normals/lights from the cached geometry), never the lighting formula.
     float  ndl = saturate(dot(N, -gFrameData.sunDir.xyz));
     float3 d = gFrameData.sunCol.rgb * ndl;
     float3 a = ((aoFlags & 4u) != 0u) ? float3(1.0f, 1.0f, 1.0f) : gFrameData.ambCol.rgb;
