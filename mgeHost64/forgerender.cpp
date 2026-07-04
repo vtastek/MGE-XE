@@ -1149,6 +1149,12 @@ namespace {
         Buffer*        pAlphaWorldsBuf = nullptr;          // gBatch: one 64KB world window (kMaxAlphaDraws x 64B)
         DescriptorSet* pPerBatchSetAlpha = nullptr;        // gBatch bound to pAlphaWorldsBuf, 1 instance
         Buffer*        pAlphaInstanceBuf = nullptr;        // per-draw instance VB (kStaticInstU32 slots), CPU-mapped
+        // AT3 captured-alpha: single-buffered persistent-mapped VB/IB the client refills each frame
+        // from its VB/IB Lock-copy of MW's blended DIPs (NiParticles smoke/flames + multimap/decal/
+        // untextured blends). Sentinel-slot AlphaDrawWire items (slot == kAlphaSlotCaptured) draw
+        // from these instead of an uploaded mesh slot. GeomVertexWire (36B) layout, uint16 indices.
+        Buffer*        pCapAlphaVB = nullptr;              // captured verts (kMaxCapturedAlphaVerts x 36B)
+        Buffer*        pCapAlphaIB = nullptr;              // captured indices (kMaxCapturedAlphaIndices x 2B)
 
         // --- WT1: Forge water takeover (host-generated geo-clipmap surface) -----------
         // Reuses the SAME SrtData/default.rootsig: the per-LOD-level worlds + packed params + invVP
@@ -2813,8 +2819,33 @@ namespace {
             aib.ppBuffer = &g_live.pAlphaInstanceBuf;
             addResource(&aib, nullptr);
 
+            // AT3 captured-alpha VB/IB: single-buffered, persistent-mapped, CPU_TO_GPU — the client
+            // refills them (memcpy in renderScene) each frame from its VB/IB Lock-copy of MW's
+            // blended DIPs. Sized to the client caps (geomwire.h): 20000 verts (720KB) + 60000
+            // uint16 (120KB). The host renderFrame is fence-waited/blocking, so single-buffered is safe.
+            BufferLoadDesc cvb = {};
+            cvb.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+            cvb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            cvb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            cvb.mDesc.mSize = (uint64_t)IPC::kMaxCapturedAlphaVerts * sizeof(IPC::GeomVertexWire);
+            cvb.mDesc.pName = "capAlphaVB";
+            cvb.pData = nullptr;
+            cvb.ppBuffer = &g_live.pCapAlphaVB;
+            addResource(&cvb, nullptr);
+
+            BufferLoadDesc cib = {};
+            cib.mDesc.mDescriptors = DESCRIPTOR_TYPE_INDEX_BUFFER;
+            cib.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            cib.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            cib.mDesc.mSize = (uint64_t)IPC::kMaxCapturedAlphaIndices * sizeof(uint16_t);
+            cib.mDesc.pName = "capAlphaIB";
+            cib.pData = nullptr;
+            cib.ppBuffer = &g_live.pCapAlphaIB;
+            addResource(&cib, nullptr);
+
             waitForAllResourceLoads();
-            if (!g_live.pAlphaWorldsBuf || !g_live.pAlphaInstanceBuf) {
+            if (!g_live.pAlphaWorldsBuf || !g_live.pAlphaInstanceBuf
+                || !g_live.pCapAlphaVB || !g_live.pCapAlphaIB) {
                 return false;
             }
 
@@ -3420,6 +3451,14 @@ namespace {
     // AT1 bring-up: draw the alpha list with the depth-OFF debug PSO (panel toggle) —
     // separates depth kills from shader/blend/transform issues without a rebuild.
     bool g_alphaDebugNoDepth = false;
+    // AT3 triage: paint every sorted-alpha draw solid magenta (alpha.frag debug bit3) so the
+    // alpha-pass set is identifiable at a glance vs the opaque set (which ignores this bit).
+    bool g_alphaHighlight = false;
+    // AT3 two-sided lighting (alpha.frag debug bit4, default ON): MW's blended cloth (tapestries/
+    // banners) is DRAW_BOTH two-sided with authored normals facing the BACK; the sorted-alpha pass
+    // is CULL_NONE, so we flip N to face the viewer before the one-sided N.L (matches MW's fixed-
+    // function two-sided lighting). Toggle off = flat authored-normal lighting (the "dark folds" A/B).
+    bool g_alphaTwoSided = true;
     bool g_drawReflect   = true;
     bool g_drawReflectGeo = true;   // WV2: reflect host-owned land + statics (off = sky-only reflection)
     bool g_reflHorizonScissor = true; // WV2 perf: scissor the reflect pass to below the water-plane horizon
@@ -3487,7 +3526,7 @@ namespace {
     // F12 debug-view names; index = debugParams.x. The dropdown writes g_debugMode directly so the
     // overlay selector and the F12 key cycle stay unified.
     const char* const kDebugModeNames[] = { "0 normal", "1 depth", "2 scatter", "3 AO", "4 bent-normal",
-                                            "5 albedo", "6 lit", "7 ambient" };
+                                            "5 albedo", "6 lit", "7 ambient", "8 world-normal", "9 light-count" };
 
     // Build the dev overlay once. The headless host has no Load/Unload reload split, so font-system
     // + UI-system init AND their pipeline load happen together here, right after pRT exists.
@@ -3619,6 +3658,10 @@ namespace {
         uiAddComponentWidget(g_uiPanel, "Draw: sky", &cDSky, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cADbg = {}; cADbg.pData = &g_alphaDebugNoDepth;
         uiAddComponentWidget(g_uiPanel, "ALPHA: depth OFF (debug)", &cADbg, WIDGET_TYPE_CHECKBOX);
+        CheckboxWidget cAHl = {}; cAHl.pData = &g_alphaHighlight;
+        uiAddComponentWidget(g_uiPanel, "ALPHA: highlight magenta", &cAHl, WIDGET_TYPE_CHECKBOX);
+        CheckboxWidget cA2S = {}; cA2S.pData = &g_alphaTwoSided;
+        uiAddComponentWidget(g_uiPanel, "ALPHA: two-sided (fix)", &cA2S, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cDLand = {}; cDLand.pData = &g_drawDLLand;
         uiAddComponentWidget(g_uiPanel, "Draw: distant land", &cDLand, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cDStat = {}; cDStat.pData = &g_drawDLStatics;
@@ -4002,6 +4045,7 @@ namespace ForgeRender {
                      const void* lightBlob, unsigned lightCount, unsigned lightBytes,
                      const void* skyBlob, unsigned skyCount, unsigned skyBytes,
                      const void* alphaBlob, unsigned alphaCount, unsigned alphaBytes,
+                     const void* capturedAlphaBlob, unsigned capturedVertBytes, unsigned capturedIdxBytes,
                      const float* waterParams, unsigned waterEnabled) {
         if (!g_live.pRenderer) {
             return false;
@@ -4101,7 +4145,9 @@ namespace ForgeRender {
             dp[41] = 1.0f / (float)g_live.width;    // invScreen.x (F12 AO/bent-normal gAO sample)
             dp[42] = 1.0f / (float)g_live.height;   // invScreen.y
             dp[43] = (float)((g_aoEnable ? 1u : 0u) | (g_bentNormalEnable ? 2u : 0u)
-                           | (g_ambientWhite ? 4u : 0u)); // AO toggles
+                           | (g_ambientWhite ? 4u : 0u)      // AO toggles (bits 0-2)
+                           | (g_alphaHighlight ? 8u : 0u)    // bit3: alpha.frag magenta highlight (opaque ignores)
+                           | (g_alphaTwoSided ? 16u : 0u));  // bit4: alpha.frag two-sided normal flip (opaque ignores)
             // dbgScales (float index 44..47): dev panel intensity modifiers.
             dp[44] = g_ambScale; dp[45] = g_litScale; dp[46] = g_albedoScale; dp[47] = g_overallScale;
             // skyParams (float index 60..63): SK2 "ownership tell" — sky.frag tints the Forge sky
@@ -5440,6 +5486,25 @@ namespace ForgeRender {
         // overlay instance slot [11] (alpha.frag reads asfloat(In.OverlayIndex)).
         uint32_t alphaDrawn = 0;
         gpuPhaseBegin(kGpuPhaseColorAlpha);
+
+        // AT3: refill the captured VB/IB from this frame's blob ([verts][indices], indices at
+        // capturedVertBytes) BEFORE the alpha loop draws the sentinel-slot items. Clamp element
+        // counts to the buffer caps; capVertsAvail/capIdxAvail bound the per-draw range check.
+        uint32_t capVertsAvail = 0, capIdxAvail = 0;
+        if (capturedAlphaBlob && capturedVertBytes && g_live.pCapAlphaVB && g_live.pCapAlphaIB) {
+            capVertsAvail = capturedVertBytes / (uint32_t)sizeof(IPC::GeomVertexWire);
+            capIdxAvail   = capturedIdxBytes / (uint32_t)sizeof(uint16_t);
+            if (capVertsAvail > IPC::kMaxCapturedAlphaVerts)   capVertsAvail = IPC::kMaxCapturedAlphaVerts;
+            if (capIdxAvail   > IPC::kMaxCapturedAlphaIndices) capIdxAvail   = IPC::kMaxCapturedAlphaIndices;
+            const uint8_t* blob = (const uint8_t*)capturedAlphaBlob;
+            std::memcpy(g_live.pCapAlphaVB->pCpuMappedAddress, blob,
+                        (size_t)capVertsAvail * sizeof(IPC::GeomVertexWire));
+            if (capIdxAvail) {
+                std::memcpy(g_live.pCapAlphaIB->pCpuMappedAddress, blob + capturedVertBytes,
+                            (size_t)capIdxAvail * sizeof(uint16_t));
+            }
+        }
+
         if (alphaBlob && alphaCount && alphaBytes && g_live.pAlphaPipeline && g_live.pAlphaWorldsBuf) {
             const uint32_t haveAlpha = alphaBytes / (uint32_t)sizeof(IPC::AlphaDrawWire);
             uint32_t nAlpha = (alphaCount < haveAlpha) ? alphaCount : haveAlpha;
@@ -5489,12 +5554,39 @@ namespace ForgeRender {
             for (uint32_t k = 0; k < nAlpha; ++k) {
                 const IPC::AlphaDrawWire& it = alphaItems[k];
                 const uint32_t slot = it.slot;
-                if (slot >= g_meshHigh || !g_meshes[slot].valid) {
-                    continue;   // mesh not uploaded yet
-                }
-                HostMesh& m = g_meshes[slot];
-                if (m.skinned || m.multimap) {
-                    continue;   // AT1 draws the lean GeomVertexWire layout only
+
+                // AT3: a sentinel-slot item draws CAPTURED geometry (client VB/IB Lock-copy) from
+                // pCapAlphaVB/pCapAlphaIB, not an uploaded mesh slot — resolve its buffers/range
+                // here, BEFORE the mesh-slot reject. Everything else (PSO pick, world/instance
+                // writes) is shared. Range-validate against this frame's received captured counts.
+                const bool isCaptured = (slot == IPC::kAlphaSlotCaptured);
+                Buffer*  meshVb; Buffer* meshIb;
+                uint32_t firstVertex, firstIndex, drawIndexCount;
+                if (isCaptured) {
+                    if (!g_live.pCapAlphaVB || !g_live.pCapAlphaIB
+                        || it.indexCount == 0
+                        || it.indexBase + it.indexCount > capIdxAvail
+                        || it.vertexBase >= capVertsAvail) {
+                        continue;   // no captured geometry this frame / range out of bounds
+                    }
+                    meshVb = g_live.pCapAlphaVB;  meshIb = g_live.pCapAlphaIB;
+                    firstVertex = it.vertexBase;  firstIndex = it.indexBase;  drawIndexCount = it.indexCount;
+                } else {
+                    if (slot >= g_meshHigh || !g_meshes[slot].valid) {
+                        continue;   // mesh not uploaded yet
+                    }
+                    HostMesh& m = g_meshes[slot];
+                    if (m.skinned || m.multimap) {
+                        continue;   // AT1 draws the lean GeomVertexWire layout only
+                    }
+                    meshVb = m.inArena ? g_live.pArenaVB : m.vb;
+                    meshIb = m.inArena ? g_live.pArenaIB : m.ib;
+                    firstVertex = m.inArena ? (uint32_t)(m.vbOff / sizeof(IPC::GeomVertexWire)) : 0u;
+                    firstIndex  = m.inArena ? (uint32_t)(m.ibOff / sizeof(uint16_t)) : 0u;
+                    drawIndexCount = m.indexCount;
+                    if (!meshVb || !meshIb) {
+                        continue;
+                    }
                 }
                 const uint32_t idx = alphaDrawn;
 
@@ -5538,18 +5630,11 @@ namespace ForgeRender {
                 // alpha.frag asfloat's it back — the terrain splat doesn't run in this frag).
                 finst[idx * kStaticInstU32 + 11] = it.matAlpha;
 
-                Buffer*  meshVb     = m.inArena ? g_live.pArenaVB : m.vb;
-                Buffer*  meshIb     = m.inArena ? g_live.pArenaIB : m.ib;
-                uint32_t firstVertex = m.inArena ? (uint32_t)(m.vbOff / sizeof(IPC::GeomVertexWire)) : 0u;
-                uint32_t firstIndex  = m.inArena ? (uint32_t)(m.ibOff / sizeof(uint16_t)) : 0u;
-                if (!meshVb || !meshIb) {
-                    continue;
-                }
                 Buffer*  vbs[2]     = { meshVb, g_live.pAlphaInstanceBuf };
                 uint32_t strides[2] = { vStride, iStride };
                 cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
                 cmdBindIndexBuffer(g_live.pCmd, meshIb, INDEX_TYPE_UINT16, 0);
-                cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, firstIndex, 1, firstVertex, idx);
+                cmdDrawIndexedInstanced(g_live.pCmd, drawIndexCount, firstIndex, 1, firstVertex, idx);
                 ++alphaDrawn;
             }
             cmdBindRenderTargets(g_live.pCmd, nullptr);
@@ -9458,6 +9543,8 @@ namespace ForgeRender {
         if (g_live.pPerBatchSetAlpha)       { removeDescriptorSet(R, g_live.pPerBatchSetAlpha); }
         if (g_live.pAlphaWorldsBuf)         { removeResource(g_live.pAlphaWorldsBuf); }
         if (g_live.pAlphaInstanceBuf)       { removeResource(g_live.pAlphaInstanceBuf); }
+        if (g_live.pCapAlphaVB)             { removeResource(g_live.pCapAlphaVB); }
+        if (g_live.pCapAlphaIB)             { removeResource(g_live.pCapAlphaIB); }
         if (g_live.pAlphaPipeline)          { removePipeline(R, g_live.pAlphaPipeline); }
         if (g_live.pAlphaPipelineAdd)       { removePipeline(R, g_live.pAlphaPipelineAdd); }
         if (g_live.pAlphaPipelineDebug)     { removePipeline(R, g_live.pAlphaPipelineDebug); }

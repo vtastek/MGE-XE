@@ -117,10 +117,12 @@ namespace MGE::GeometryCache {
         uint32_t          g_visitedThisFrame  = 0;
         uint32_t          g_gateSkipsThisFrame = 0;
         // Reverse map GPU texture -> SourceTexture::fileName, for resolveTextureName().
-        // DORMANT: nothing populates this currently. The per-frame rebuild (walking
-        // NI property state per node) cost ~1.5ms and had no consumer, so it was
-        // removed. When a feature needs GPU-texture -> source-path resolution, populate
-        // incrementally from extractMaterial (create/material-change only), not per frame.
+        // AT3 captured-alpha consumer: populated INCREMENTALLY (never per-frame) from
+        // extractMaterial (base/dark/detail/glow/overlay maps of every cached shape) AND from
+        // walk()'s NiGeometry branch (NiParticles, which never reach extractMaterial). The
+        // client's captureAlphaDraw resolves rs.texture (a proxy realTexture pointer, identical
+        // to getDX9Texture) -> the source name -> a bindless slot. insert_or_assign so a
+        // recycled NiTriShape*/GPU-texture pointer self-corrects to the current name.
         std::unordered_map<IDirect3DTexture9*, const char*> g_textureNameMap;
 
         void releaseEntry(CachedGeometry& e) {
@@ -135,6 +137,20 @@ namespace MGE::GeometryCache {
                 static_cast<void*>(tex->rendererData));
             if (!srd->d3dTexture) return nullptr;
             return static_cast<ProxyTexture*>(srd->d3dTexture)->realTexture;
+        }
+
+        // AT3: register a confirmed-NiSourceTexture's GPU texture -> source fileName in the
+        // reverse map, so the Forge alpha-capture path can resolve rs.texture (a proxy
+        // realTexture pointer) to a bindless slot by name. No-op for non-SourceTextures /
+        // unloaded (no rendererData) textures. Cheap: one hash insert per material extract.
+        void registerTextureName(NI::Texture* tex) {
+            if (!tex) return;
+            if (!tex->isInstanceOfType(NI::RTTIStaticPtr::NiSourceTexture)) return;
+            IDirect3DTexture9* d3d = getDX9Texture(tex);
+            if (!d3d) return;
+            const char* name = static_cast<NI::SourceTexture*>(tex)->fileName;
+            if (!name) return;
+            g_textureNameMap.insert_or_assign(d3d, name);
         }
 
         void extractMaterial(CachedGeometry& e, NI::Geometry* geom) {
@@ -200,6 +216,7 @@ namespace MGE::GeometryCache {
                         e.textureName = st->fileName;
                         e.d3dTexture  = getDX9Texture(tex);
                         e.baseUV = baseMap->texCoordSet >= 3u ? 3u : static_cast<uint8_t>(baseMap->texCoordSet);
+                        registerTextureName(tex);   // AT3 reverse-map populate (base map)
                     }
                 }
                 // Multi-map siblings (dark/detail/glow) on the same property — the
@@ -219,6 +236,7 @@ namespace MGE::GeometryCache {
                     // The map's texture is a confirmed NiSourceTexture — also record its
                     // source filename so the Forge path can resolve it to a bindless slot.
                     outName = static_cast<NI::SourceTexture*>(mtex)->fileName;
+                    registerTextureName(mtex);   // AT3 reverse-map populate (dark/detail/glow)
                     // Store the map's TRUE UV set (clamped to 3 — FFE texcoordIndex is
                     // 2-bit / FVF carries <=4 sets). uploadEntry sizes the VB to cover it.
                     outUV  = map->texCoordSet >= 3u ? 3u : static_cast<uint8_t>(map->texCoordSet);
@@ -238,6 +256,7 @@ namespace MGE::GeometryCache {
                             // Record the overlay source filename so the Forge path can
                             // resolve it to a bindless slot (same cast captureMap uses).
                             e.overlayTextureName = static_cast<NI::SourceTexture*>(dtex)->fileName;
+                            registerTextureName(dtex);   // AT3 reverse-map populate (decal overlay)
                         }
                     }
                 }
@@ -841,6 +860,23 @@ namespace MGE::GeometryCache {
 
             if (av->isInstanceOfType(NI::RTTIStaticPtr::NiTriBasedGeom)) {
                 visitGeometry(static_cast<NI::TriBasedGeometry*>(av), inCharacter);
+                return;
+            }
+
+            // AT3 captured-alpha: NiParticles (chimney smoke, candle/camp flames) derive from
+            // NiGeometry but NOT NiTriBasedGeom, so visitGeometry never sees them and their GPU
+            // texture never lands in g_textureNameMap. Register the base-map name here (leaf,
+            // registration-only — no capture; MW still simulates + billboards the particles) so
+            // the client's captureAlphaDraw can resolve rs.texture -> a bindless slot.
+            if (av->isInstanceOfType(NI::RTTIStaticPtr::NiGeometry)) {
+                auto* geom = static_cast<NI::Geometry*>(av);
+                auto* ps = reinterpret_cast<NI::PropertyState*>(geom->propertyState);
+                if (ps && ps->texture) {
+                    const auto* baseMap = ps->texture->getBaseMap();
+                    if (baseMap && baseMap->texture) {
+                        registerTextureName(baseMap->texture.get());
+                    }
+                }
                 return;
             }
 

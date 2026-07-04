@@ -1101,9 +1101,28 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
     uint aoFlags = (uint)(gFrameData.debugParams.w + 0.5f);
+
+
+    if ((aoFlags & 8u) != 0u) { RETURN(float4(1.0f, 0.0f, 1.0f, 1.0f)); }
     float2 aoUv = In.Position.xy * gFrameData.debugParams.yz;
     float4 aoSample = SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
     if ((aoFlags & 2u) != 0u) { N = normalize(aoSample.rgb); }
+
+
+
+
+
+
+
+    if ((aoFlags & 16u) != 0u) {
+        float3 toEye = -In.WorldPos;
+        if (dot(N, toEye) < 0.0f) { N = -N; }
+    }
+
+
+
+
+
 
     float ndl = saturate(dot(N, -gFrameData.sunDir.xyz));
     float3 d = gFrameData.sunCol.rgb * ndl;
@@ -1112,6 +1131,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     a *= gFrameData.dbgScales.x;
 
 
+    uint litCount = 0u;
     {
         uint nLights = (uint)gLights.lightParams.x;
         for (uint i = 0; i < nLights; ++i)
@@ -1124,6 +1144,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
             float3 toLight = posR.xyz - In.WorldPos;
             float dist2 = dot(toLight, toLight);
             if (dist2 >= 4.0f * radius * radius) { continue; }
+            ++litCount;
             float invDist = rsqrt(max(dist2, 1e-8f));
             float dist = dist2 * invDist;
 
@@ -1172,6 +1193,21 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     }
     if (dbg == 5u) { RETURN(float4(albedo.rgb, 1.0f)); }
     if (dbg == 6u) { RETURN(float4(lit, 1.0f)); }
+    if (dbg == 7u) {
+        float3 al;
+        if (In.VColSource == 2u) { al = In.Color.rgb * a + In.MatEmissive; }
+        else if (In.VColSource == 1u) { al = In.MatAmbient * a + In.Color.rgb; }
+        else { al = In.MatAmbient * a + In.MatEmissive; }
+        return (float4(al, 1.0f));
+    }
+    if (dbg == 8u) {
+        return (float4(N * 0.5f + 0.5f, 1.0f));
+    }
+    if (dbg == 9u) {
+        float t = saturate((float)litCount / 8.0f);
+        float3 heat = saturate(float3(t * 2.0f, 1.0f - abs(t - 0.5f) * 2.0f, 1.0f - t * 2.0f));
+        return (float4(litCount == 0u ? float3(0.0f, 0.0f, 0.0f) : heat, 1.0f));
+    }
     if (dbg == 1u || dbg == 2u) {
         float dist = length(In.WorldPos - gFrameData.eyePos.xyz);
         float g = saturate(dist * (1.0f / 8192.0f));

@@ -227,7 +227,7 @@ namespace IPC {
     // sorts the list back-to-front (MW's sorter criterion: bound-center view depth) and the host
     // draws in received order, depth-tested against the opaque prepass but never writing.
     // matAlpha = MaterialProperty alpha (the FFE per-draw fade); the frag does
-    // a = tex.a * vcolA * matAlpha. 128 bytes.
+    // a = tex.a * vcolA * matAlpha. 140 bytes (128 + AT3 captured-geometry locators).
     struct AlphaDrawWire {
         std::uint32_t slot;
         float         world[16];
@@ -240,12 +240,33 @@ namespace IPC {
         float         matAmbient[3];
         float         matEmissive[3];
         std::uint32_t vColSource;  // 0 none (const material), 1 emissive, 2 diffamb
+        // AT3 captured-alpha: when slot == kAlphaSlotCaptured this item does NOT reference an
+        // uploaded mesh slot — its geometry lives in the shared captured VB/IB (see kMaxCaptured*
+        // below), and these three fields locate it: [vertexBase, vertexBase+?) verts,
+        // indexCount indices starting at indexBase (index values already rebased to 0). The
+        // host binds pCapAlphaVB/pCapAlphaIB and draws cmdDrawIndexedInstanced(indexCount,
+        // indexBase, 1, vertexBase, idx). Zeroed for cached-mesh (slot) items. 12 bytes.
+        std::uint32_t vertexBase;  // first captured vertex (index into the shared captured VB)
+        std::uint32_t indexBase;   // first captured index (into the shared captured IB)
+        std::uint32_t indexCount;  // captured index count (triangleCount * 3)
     };
+
+    // AT3 sentinel slot: an AlphaDrawWire whose geometry is CAPTURED (shared VB/IB), not a
+    // cached mesh slot. Chosen 0xFFFFFFFF so it can never collide with a real dense slot.
+    constexpr std::uint32_t kAlphaSlotCaptured = 0xFFFFFFFFu;
 
     // Per-frame alpha draw cap. Dense cities run a few hundred blended shapes; 1024 gives 4x
     // headroom while keeping the world window at exactly 64KB (1024 x 64B, one CBV window).
     // MUST match the host kMaxAlphaDraws (forgerender.cpp).
     constexpr std::uint32_t kMaxAlphaDraws = 1024;
+
+    // AT3 captured-alpha caps (within the shared kMaxAlphaDraws sort). The captured VB/IB are
+    // single-buffered persistent-mapped host resources filled per frame from the client's copy;
+    // 20000 verts (36B GeomVertexWire = 720KB) + 60000 uint16 indices (120KB) = 840KB fits one
+    // GeomChunk (1MB), so a 1-chunk vec sidesteps the IPC uint32-reservation hazard.
+    constexpr std::uint32_t kMaxCapturedAlphaDraws   = 256;
+    constexpr std::uint32_t kMaxCapturedAlphaVerts   = 20000;
+    constexpr std::uint32_t kMaxCapturedAlphaIndices = 60000;
 
 #pragma pack(pop)
 

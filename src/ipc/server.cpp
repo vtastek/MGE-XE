@@ -574,6 +574,21 @@ namespace IPC {
 				}
 				alphaPtr = avec.size() ? &avec[0] : nullptr;
 			}
+			// AT3 captured-alpha geometry: one GeomChunk vec holding [verts][indices] (indices at
+			// capturedVertBytes). The host memcpy's the two ranges into pCapAlphaVB/pCapAlphaIB
+			// and draws sentinel-slot AlphaDrawWire items from them. Clamp both byte counts to the
+			// mapped window so a stale/oversized count can't over-read.
+			const void* capturedAlphaPtr = nullptr;
+			std::uint32_t capVertBytes = 0, capIdxBytes = 0;
+			if (params.capturedAlpha != InvalidVector) {
+				auto& cvec = getVec<IPC::GeomChunk>(params.capturedAlpha);
+				const std::uint32_t cavail = cvec.size() * static_cast<std::uint32_t>(sizeof(IPC::GeomChunk));
+				capVertBytes = params.capturedVertBytes;
+				capIdxBytes = params.capturedIdxBytes;
+				if (capVertBytes > cavail) { capVertBytes = cavail; }
+				if (capIdxBytes > cavail - capVertBytes) { capIdxBytes = cavail - capVertBytes; }
+				capturedAlphaPtr = cvec.size() ? &cvec[0] : nullptr;
+			}
 			static unsigned s_sceneLog = 0;
 			const bool logScene = (s_sceneLog++ % 60) == 0;
 			if (logScene) {
@@ -593,6 +608,7 @@ namespace IPC {
 				lightPtr, params.lightCount, lightBytes,
 				skyPtr, params.skyCount, skyBytes,
 				alphaPtr, params.alphaCount, alphaBytes,
+				capturedAlphaPtr, capVertBytes, capIdxBytes,
 				params.waterParams, params.waterEnabled);
 			if (logScene) {
 				LOG::logline(">> [scene] renderScene DONE ok=%d drawn=%u skinned=%u",

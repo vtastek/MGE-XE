@@ -1127,6 +1127,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
 
+    uint litCount = 0u;
     {
         uint nLights = (uint)gLights.lightParams.x;
         for (uint i = 0; i < nLights; ++i)
@@ -1143,6 +1144,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
             if (dist2 >= 4.0f * radius * radius) { continue; }
+            ++litCount;
             float invDist = rsqrt(max(dist2, 1e-8f));
             float dist = dist2 * invDist;
 
@@ -1222,6 +1224,14 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
         else if (In.VColSource == 1u) { al = In.MatAmbient * a + In.Color.rgb; }
         else { al = In.MatAmbient * a + In.MatEmissive; }
         return (float4(al, 1.0f));
+    }
+    if (dbg == 8u) {
+        return (float4(N * 0.5f + 0.5f, 1.0f));
+    }
+    if (dbg == 9u) {
+        float t = saturate((float)litCount / 8.0f);
+        float3 heat = saturate(float3(t * 2.0f, 1.0f - abs(t - 0.5f) * 2.0f, 1.0f - t * 2.0f));
+        return (float4(litCount == 0u ? float3(0.0f, 0.0f, 0.0f) : heat, 1.0f));
     }
     if (dbg == 1u || dbg == 2u) {
         float dist = length(In.WorldPos - gFrameData.eyePos.xyz);

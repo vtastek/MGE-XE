@@ -68,6 +68,7 @@ float4 PS_MAIN( VSOutput In )
     // already baked into each light's colour client-side (the main cache path uses 1.0). The
     // lights cbuffer packs 3 float4 per light: [i*3+0]=(pos.xyz, radius), [i*3+1]=(col.rgb,_),
     // [i*3+2]=(k0,k1,k2,_). lightParams.x is the active count (host-written).
+    uint litCount = 0u;   // debug (mode 9): point lights that reach this pixel (within 2·radius)
     {
         uint nLights = (uint)gLights.lightParams.x;
         for (uint i = 0; i < nLights; ++i)
@@ -84,6 +85,7 @@ float4 PS_MAIN( VSOutput In )
             // rsqrt/divide/smoothstep. Most pixels are beyond 2r of most of the ~128 scene
             // lights, so this is the bulk of the loop. Byte-identical output.
             if (dist2 >= 4.0f * radius * radius) { continue; }
+            ++litCount;
             float  invDist = rsqrt(max(dist2, 1e-8f));
             float  dist    = dist2 * invDist;
 
@@ -163,6 +165,14 @@ float4 PS_MAIN( VSOutput In )
         else if (In.VColSource == 1u) { al = In.MatAmbient * a + In.Color.rgb; }
         else                          { al = In.MatAmbient * a + In.MatEmissive; }
         RETURN(float4(al, 1.0f));
+    }
+    if (dbg == 8u) {                                                        // mode 8: world-space normal (RGB = N*0.5+0.5)
+        RETURN(float4(N * 0.5f + 0.5f, 1.0f));
+    }
+    if (dbg == 9u) {                                                        // mode 9: point-light count heatmap (0 black→blue→green→yellow→red)
+        float t = saturate((float)litCount / 8.0f);
+        float3 heat = saturate(float3(t * 2.0f, 1.0f - abs(t - 0.5f) * 2.0f, 1.0f - t * 2.0f));
+        RETURN(float4(litCount == 0u ? float3(0.0f, 0.0f, 0.0f) : heat, 1.0f));
     }
     if (dbg == 1u || dbg == 2u) {   // world-distance grayscale (reverse-Z NDC is too crushed to read)
         float dist = length(In.WorldPos - gFrameData.eyePos.xyz);

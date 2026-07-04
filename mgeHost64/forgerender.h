@@ -109,6 +109,10 @@ namespace ForgeRender {
                      const void* lightBlob, unsigned lightCount, unsigned lightBytes,
                      const void* skyBlob = nullptr, unsigned skyCount = 0, unsigned skyBytes = 0,
                      const void* alphaBlob = nullptr, unsigned alphaCount = 0, unsigned alphaBytes = 0,
+                     // AT3: captured-alpha geometry — one blob [verts (GeomVertexWire)][indices (uint16)]
+                     // (indices at capturedVertBytes). Referenced by AlphaDrawWire items with
+                     // slot == IPC::kAlphaSlotCaptured. Null/0 ⇒ no captured geometry this frame.
+                     const void* capturedAlphaBlob = nullptr, unsigned capturedVertBytes = 0, unsigned capturedIdxBytes = 0,
                      // WT1: per-frame water params (12 floats; see bridge.h RenderFrameParameters)
                      // + the F7 water-enable gate. Null/0 ⇒ no Forge water pass this frame.
                      const float* waterParams = nullptr, unsigned waterEnabled = 0);
