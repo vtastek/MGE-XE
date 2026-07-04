@@ -179,16 +179,25 @@ public:
     // available). False on absent/old plugin — the frustum cull path then stands.
     static bool hasEarlyClassify();
 
-    // Owned-opaque display skip. Push true while the Forge composite owns the opaque
-    // world: the plugin then SKIPS the engine display() of leaves whose draws our
-    // proxy rejects anyway (covered-opaque + land splat), removing their traversal/
-    // state/DIP cost. Alpha-blended / decal / untextured leaves keep displaying, so
-    // the sorted-alpha pass is unaffected. Push once per frame at BeginScene(0),
-    // BEFORE classifyMainSceneNow (the plugin latches it per top-level frame).
-    // Returns false if the plugin is absent or predates the export — the engine then
-    // displays everything and the proxy keeps rejecting per-DIP (today's behavior).
-    static bool setOpaqueWorldOwned(bool owned);
+    // Owned display-skip flags word (same mwse_setOpaqueWorldOwned export —
+    // name frozen, semantics widened bool → flags compatibly):
+    //   kOwnedOpaque — the Forge composite owns the opaque world: the plugin
+    //     SKIPS the engine display() of leaves whose draws our proxy rejects
+    //     anyway (covered-opaque + land splat).
+    //   kOwnedAlpha — our sorted-alpha host pass is live (AT1): the plugin
+    //     additionally skips single-map blended leaves. Never water (its DIP
+    //     triggers renderStageWater), particles, skinned, multi-map/decal, or
+    //     sky/landscape — those keep displaying and our per-DIP reject stays
+    //     on as the belt.
+    // Push once per frame at BeginScene(0), BEFORE classifyMainSceneNow (the
+    // plugin latches it per top-level frame). An old plugin reads the word as
+    // a bool → opaque-only skip; the DIP-reject fallback keeps correctness.
+    // Returns false if the plugin is absent or predates the export — the
+    // engine then displays everything and the proxy rejects per-DIP.
+    static constexpr int kOwnedOpaque = 1;
+    static constexpr int kOwnedAlpha = 2;
+    static bool setOwnedFlags(int flags);
 
-    // True if the loaded plugin exports the owned-opaque flag entrypoint.
+    // True if the loaded plugin exports the owned-flags entrypoint.
     static bool hasOpaqueWorldOwned();
 };
