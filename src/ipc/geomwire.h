@@ -227,7 +227,7 @@ namespace IPC {
     // sorts the list back-to-front (MW's sorter criterion: bound-center view depth) and the host
     // draws in received order, depth-tested against the opaque prepass but never writing.
     // matAlpha = MaterialProperty alpha (the FFE per-draw fade); the frag does
-    // a = tex.a * vcolA * matAlpha. 140 bytes (128 + AT3 captured-geometry locators).
+    // a = tex.a * vcolA * matAlpha. 144 bytes (128 + AT3 captured-geometry locators + cullFlags).
     struct AlphaDrawWire {
         std::uint32_t slot;
         float         world[16];
@@ -249,7 +249,13 @@ namespace IPC {
         std::uint32_t vertexBase;  // first captured vertex (index into the shared captured VB)
         std::uint32_t indexBase;   // first captured index (into the shared captured IB)
         std::uint32_t indexCount;  // captured index count (triangleCount * 3)
+        // Cull selection (mirrors MW's per-shape cull mode). bit0 = twoSided (NiStencilProperty
+        // DRAW_BOTH → CULL_NONE); bit1 = mirrored (negative-determinant world → reversed winding,
+        // like the opaque mirror PSO). Single-sided non-mirrored (flags==0) → CULL_BACK.
+        std::uint32_t cullFlags;
     };
+    constexpr std::uint32_t kAlphaCullTwoSided = 1u;   // bit0
+    constexpr std::uint32_t kAlphaCullMirrored = 2u;   // bit1
 
     // AT3 sentinel slot: an AlphaDrawWire whose geometry is CAPTURED (shared VB/IB), not a
     // cached mesh slot. Chosen 0xFFFFFFFF so it can never collide with a real dense slot.

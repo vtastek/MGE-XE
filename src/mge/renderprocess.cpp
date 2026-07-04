@@ -1142,6 +1142,11 @@ namespace {
             // AT3 captured-geometry locators unused for a cached-mesh (slot) item — the host
             // reads them only when slot == kAlphaSlotCaptured. Zero so they never alias garbage.
             item.vertexBase = item.indexBase = item.indexCount = 0;
+            // Cull mode from the shape's live NiStencilProperty (DRAW_BOTH → CULL_NONE) + winding
+            // from the mirror flag, so the host draws it exactly as MW does (single-sided alpha
+            // like the draped altar cloth gets CULL_BACK, hiding its back/interior faces).
+            item.cullFlags = (e.twoSided ? IPC::kAlphaCullTwoSided : 0u)
+                           | (e.mirrored ? IPC::kAlphaCullMirrored : 0u);
             const std::size_t at = g_alphaScratch.size();
             g_alphaScratch.resize(at + sizeof(item));
             memcpy(g_alphaScratch.data() + at, &item, sizeof(item));
@@ -1171,6 +1176,9 @@ namespace {
             item.vertexBase = rec.vertexBase;
             item.indexBase  = rec.indexBase;
             item.indexCount = rec.indexCount;
+            // Captured DIPs are billboarded particles (smoke/flames) — keep CULL_NONE (two-sided)
+            // so they render exactly as today; culling a camera-facing quad by winding is fragile.
+            item.cullFlags  = IPC::kAlphaCullTwoSided;
             const std::size_t at = g_alphaScratch.size();
             g_alphaScratch.resize(at + sizeof(item));
             memcpy(g_alphaScratch.data() + at, &item, sizeof(item));
