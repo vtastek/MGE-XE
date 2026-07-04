@@ -1595,6 +1595,11 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
     // inspection). Placed AFTER the recordMW capture above so depth-replay records are
     // untouched. Whatever still renders with this ON is the AT3 leftover set (particles/VFX —
     // not NiTriShapes, not captured by the cache walk).
+    // AT2: the msoc plugin's kOwnedAlpha display skip (renderdepth.cpp setOwnedFlags) is now
+    // the PRIMARY mechanism — most covered blended leaves never display, so their DIPs never
+    // reach here. This gate stays as the belt: old msoc.dll (opaque-only), and blended leaves
+    // the plugin conservatively keeps displaying (decal/multi-map/untextured) that our host
+    // pass doesn't draw either.
     if (Configuration.ForgeAlphaPass && Configuration.ForgeAlphaSuppressS1
         && sceneCount >= 1 && rs->blendEnable && RenderProcess::ownsOpaqueWorld()) {
         return false;

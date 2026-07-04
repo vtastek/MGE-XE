@@ -341,9 +341,9 @@ bool MSOCClient::hasEarlyClassify() {
     return g_classifyNow != nullptr;
 }
 
-bool MSOCClient::setOpaqueWorldOwned(bool owned) {
+bool MSOCClient::setOwnedFlags(int flags) {
     if (!g_setOpaqueOwned) return false;
-    g_setOpaqueOwned(owned ? 1 : 0);
+    g_setOpaqueOwned(flags);
     return true;
 }
 

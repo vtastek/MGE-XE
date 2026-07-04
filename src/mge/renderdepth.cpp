@@ -92,15 +92,26 @@ void DistantLand::earlyClassifyMainScene(void* worldCamera) {
     s_earlyClassifyRan = false;
     if (!Configuration.UseOcclusionCulling || !MSOCClient::hasEarlyClassify()) return;
 
-    // Owned-opaque display skip (Cut 1, engine scene-0 opaque no-op): tell the
-    // plugin whether the Forge composite owns the opaque world THIS frame, before
-    // either classify path latches its per-frame state. While owned, the plugin
-    // skips engine display() of covered-opaque leaves — the DIPs our proxy rejects
-    // per-draw anyway (inspectIndexedPrimitive) — killing their traversal/state
-    // cost. F11 (ownsOpaqueWorld false) restores full display next frame. Logged
-    // plugin-side on change; absent export = false return = today's behavior.
-    MSOCClient::setOpaqueWorldOwned(
-        Configuration.ForgeOpaqueDisplaySkip && RenderProcess::ownsOpaqueWorld());
+    // Owned display skips (Cut 1 opaque + AT2 alpha): tell the plugin which
+    // parts of the frame the Forge side covers THIS frame, before either
+    // classify path latches its per-frame state. Opaque bit: the plugin skips
+    // engine display() of covered-opaque leaves — the DIPs our proxy rejects
+    // per-draw anyway (inspectIndexedPrimitive). Alpha bit: it also skips
+    // single-map blended leaves our sorted-alpha host pass redraws (AT1) —
+    // gated on SuppressS1 so the F-panel A/B (suppress off = MW's full alpha
+    // path) stays intact. F11 (ownsOpaqueWorld false) restores full display
+    // next frame. Logged plugin-side on change; absent/old export = opaque-
+    // only or no-op = the per-DIP reject fallback keeps correctness.
+    int ownedFlags = 0;
+    if (RenderProcess::ownsOpaqueWorld()) {
+        if (Configuration.ForgeOpaqueDisplaySkip) {
+            ownedFlags |= MSOCClient::kOwnedOpaque;
+        }
+        if (Configuration.ForgeAlphaPass && Configuration.ForgeAlphaSuppressS1) {
+            ownedFlags |= MSOCClient::kOwnedAlpha;
+        }
+    }
+    MSOCClient::setOwnedFlags(ownedFlags);
 
     s_visibleCallbackFired = false;
     // classifyMainSceneNow is a SYNCHRONOUS plugin call: the engine's world-camera
