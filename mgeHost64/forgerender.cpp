@@ -72,6 +72,9 @@
 // Phase 3 prologue: Hi-Z pyramid build SRT (HizSrtData, Persistent frequency). Shares the merged
 // ComputeRootSignature. See [[project_forge_gpu_occlusion]] M1.
 #include "shaders/FSL/hizreduce.srt.h"
+// P1 point-light shadows: screen-space mask SRT (ShadowMaskSrtData, PerBatch frequency). Shares
+// the merged ComputeRootSignature. See [[project_forge_point_lights]] / tasks/todo.md.
+#include "shaders/FSL/shadowmask.srt.h"
 
 // App-layer callback normally provided by WindowsBase.cpp (which we exclude — it
 // drags in the window system). The backend calls this on device-lost. Headless:
@@ -1010,6 +1013,34 @@ namespace {
         DescriptorSet* pLinearizeSet = nullptr;   // LinDepthSrtData PerBatch: gSceneDepth + gLinearDepthOut
         DescriptorSet* pGtaoBatchSet = nullptr;   // AOSrtData PerBatch:  gLinearDepthIn + gAOOut
         DescriptorSet* pAOBlurSet = nullptr;      // AOBlurSrtData PerFrame: gBlurParams + gAOSrc + gBlurDepthIn + gAODst
+
+        // --- P1 point-light shadows: cached cube-face atlas + screen-space mask -------------
+        // One D32 atlas of 3x2 face blocks per light (kShadowAtlasSize/kMaxShadowLights). Face
+        // tiles are re-rendered with opaque.vert + depthonly.frag into SINGLE-SAMPLE depth-only
+        // PSOs (the main prepass PSOs are MSAA-shaped) with a reverse-Z-signed depth bias; the
+        // per-tile clear is a viewport triangle at z=0 (shadowclear.*, CMP_ALWAYS + write).
+        // shadowmask.comp then does ALL sampling in screen space (pLinearDepth reconstruct →
+        // analytic face pick → atlas compare) and writes the R32G32_UINT visibility mask the
+        // forward frags load — no atlas code in any colour shader, whole path hot-reloadable.
+        RenderTarget*  pShadowAtlas = nullptr;            // 4096² D32; RESTS in SHADER_RESOURCE
+        Pipeline*      pShadowPipeline = nullptr;         // FRONT_FACE_CCW, biased depth-only
+        Pipeline*      pShadowPipelineMirror = nullptr;   // FRONT_FACE_CW (mirrored world)
+        Shader*        pShadowClearShader = nullptr;      // shadowclear.vert/.frag
+        Pipeline*      pShadowClearPipeline = nullptr;    // CMP_ALWAYS + write, no layout
+        Buffer*        pShadowFaceCbv[12] = {};           // per-face FrameData copies (512B, persistent-mapped)
+        DescriptorSet* pShadowFaceSet = nullptr;          // SrtData PerFrame, maxSets = kShadowFaceCbvs (instance = face)
+        Texture*       pShadowMask = nullptr;             // R32G32_UINT screen-size mask (SRV|UAV, UAV/SRV ping-pong)
+        Shader*        pShadowMaskShader = nullptr;       // shadowmask.comp (hot-reloadable)
+        Pipeline*      pShadowMaskPipeline = nullptr;
+        Buffer*        pShadowMaskParamsCbv = nullptr;    // ShadowMaskParams (invVP/screen/knobs/slots), persistent-mapped
+        DescriptorSet* pShadowMaskSet = nullptr;          // ShadowMaskSrtData PerBatch: CBV + linDepth + atlas + mask UAV
+        // P1.5: the face pass's OWN world window + instance VB (one 64KB gBatch = 1024 matrices
+        // >= kShadowMaxCasters). Casters come from the per-slot lastWorld records, NOT this
+        // frame's batch windows — offscreen (frustum-culled) casters keep casting.
+        Buffer*        pShadowWorldsBuf = nullptr;        // caster worlds, CAMERA-RELATIVE for this frame
+        Buffer*        pShadowInstanceBuf = nullptr;      // kStaticInstU32 stride: [0]=identity, [1]=texAlpha
+        DescriptorSet* pShadowBatchSet = nullptr;         // gBatch bound to pShadowWorldsBuf, 1 instance
+        bool           shadowReady = false;               // every shadow resource/PSO built (failure = shadows off, non-fatal)
         // --- Hi-Z pyramid (occlusion M2). Mip 0 is filled in the MAIN cmd at the colour->water
         // seam (FULL scene depth: prepass + DL land + statics; water must not enter it); the
         // reduce runs in a SECOND, independently-fenced cmd tail-submitted right after the frame
@@ -1302,6 +1333,7 @@ namespace {
            kGpuPhaseColorMM,    // multi-map (dark/detail/glow) loop
            kGpuPhaseColorDL,    // dlLiveRecord (distant land + DL statics)
            kGpuPhaseColorAlpha, // AT1 sorted-alpha pass (after water, before resolve)
+           kGpuPhaseShadow,     // P1 point-light shadow faces (atlas tile re-renders; ~0 when nothing dirty)
            kGpuPhaseCount };
 
     // Tier 4 multi-map: ONE 64KB world window holds kBatchSize(1024) matrices; cap at 256
@@ -1347,6 +1379,89 @@ namespace {
     // 16 + 128*3*16 = 6160 B, rounded up to a 256-byte CBV multiple.
     constexpr uint32_t kMaxPointLights = 128;
     constexpr uint32_t kLightCbvBytes  = ((16 + kMaxPointLights * 3 * 16) + 255) & ~255u;  // 6400
+
+    // --- P1 point-light shadows -------------------------------------------------------------
+    // One kShadowAtlasSize² D32 atlas of per-light 3-wide x 2-tall cube-face blocks. Tier A =
+    // atlas/8 faces (512² at 4096: block 1536x1024, 8 slots in x < 3072); tier B = atlas/16
+    // faces (256²: block 768x512, 8 slots in the x = 3072 column). 16 slots total; the P1 stub
+    // uses slot 0 only. kShadowAtlasSize 4096 -> 2048 is the one-line VRAM fallback (every tile
+    // derives from it). Mask nibbles: 4 bits x 16 slots = R32G32_UINT (must match MAX_SHADOW_SLOTS).
+    constexpr uint32_t kShadowAtlasSize  = 4096;
+    constexpr uint32_t kMaxShadowLights  = 16;     // MUST match MAX_SHADOW_SLOTS (shadowmask.srt.h)
+    constexpr uint32_t kShadowFaceCbvs   = 12;     // per-frame face budget: 2 lights x 6 faces
+    constexpr uint32_t kShadowMaxCasters = 512;    // per-light caster cap (sphere-filtered, one list for all 6 faces)
+    constexpr float    kShadowNearZ      = 4.0f;   // face frustum near (world u); far = the light's 2·radius
+    // How long a slot's lastWorld record stays a caster candidate after the item was last in
+    // the client's visible set. Statics don't move so stale is correct; the window only bounds
+    // recycled-slot ghosts after cell changes (records also reset on re-upload).
+    constexpr uint32_t kShadowCasterKeepFrames = 900;
+
+    // 3x2 face-block origin + face size for a slot, in atlas pixels. Face f sits at block +
+    // ((f%3)·size, (f/3)·size) — shadowmask.comp recomputes that from slotTile; keep in sync.
+    inline void shadowSlotBlock(uint32_t slot, uint32_t& x, uint32_t& y, uint32_t& size) {
+        if (slot < 8) {
+            size = kShadowAtlasSize / 8;                       // tier A face (512 at 4096)
+            x = (slot % 2) * (3 * size);
+            y = (slot / 2) * (2 * size);
+        } else {
+            size = kShadowAtlasSize / 16;                      // tier B face (256 at 4096)
+            x = 6 * (kShadowAtlasSize / 8);                    // right column (x = 3072 at 4096)
+            y = (slot - 8) * (2 * size);
+        }
+    }
+
+    // Build one cube-face viewProj: row-major ROW-VECTOR convention (like the client's D3DX
+    // matrices — uploaded as-is, shader mul(M,v) reads the transpose), D3D cube-face order
+    // (+X -X +Y -Y +Z -Z) with the standard D3D look/up basis, 90° FOV, aspect 1, REVERSE-Z:
+    // depth(z) = n(f-z)/(z(f-n)) → near = 1, far = 0, matching the atlas clear 0 + CMP_GEQUAL.
+    // eye = the light's CAMERA-RELATIVE position (worlds are camera-relative), so a cached
+    // tile's texels are light-local axis distances — translation-invariant, valid across pure
+    // camera motion. NO half-pixel offset (the atlas never composites against a D3D9 layer).
+    // The analytic face pick + UV in shadowmask.comp is the OTHER half of this convention
+    // table; verify with the face-id/atlas debug views before trusting either.
+    void buildShadowFaceVP(const float* lightPosRel, uint32_t face, float nearZ, float farZ, float* out16) {
+        static const float kLook[6][3] = { {1,0,0}, {-1,0,0}, {0,1,0}, {0,-1,0}, {0,0,1}, {0,0,-1} };
+        static const float kUp[6][3]   = { {0,1,0}, {0,1,0},  {0,0,-1},{0,0,1},  {0,1,0}, {0,1,0}  };
+        const float* za = kLook[face];
+        const float* up = kUp[face];
+        const float xa[3] = { up[1]*za[2] - up[2]*za[1],       // cross(up, zaxis)
+                              up[2]*za[0] - up[0]*za[2],
+                              up[0]*za[1] - up[1]*za[0] };
+        const float ya[3] = { za[1]*xa[2] - za[2]*xa[1],       // cross(zaxis, xaxis)
+                              za[2]*xa[0] - za[0]*xa[2],
+                              za[0]*xa[1] - za[1]*xa[0] };
+        const float* e = lightPosRel;
+        // View (LookAtLH layout for row vectors) composed with the reverse-Z 90° projection:
+        // clip.x = xv, clip.y = yv, clip.z = zv·q + qn, clip.w = zv.
+        const float q  = -nearZ / (farZ - nearZ);
+        const float qn = nearZ * farZ / (farZ - nearZ);
+        float V[4][3];
+        for (int i = 0; i < 3; ++i) { V[i][0] = xa[i]; V[i][1] = ya[i]; V[i][2] = za[i]; }
+        V[3][0] = -(xa[0]*e[0] + xa[1]*e[1] + xa[2]*e[2]);
+        V[3][1] = -(ya[0]*e[0] + ya[1]*e[1] + ya[2]*e[2]);
+        V[3][2] = -(za[0]*e[0] + za[1]*e[1] + za[2]*e[2]);
+        for (int i = 0; i < 4; ++i) {
+            out16[i*4 + 0] = V[i][0];
+            out16[i*4 + 1] = V[i][1];
+            out16[i*4 + 2] = V[i][2] * q + ((i == 3) ? qn : 0.0f);
+            out16[i*4 + 3] = V[i][2];
+        }
+    }
+
+    // P1 shadow frame state: filled by the manager stub PRE-beginCmd (persistent-mapped CBV
+    // writes + CPU caster gather), consumed by the face pass during command recording. Casters
+    // are mesh SLOTS (via HostMesh::lastWorld records), not items[] indices — the face pass is
+    // fully decoupled from the camera-culled draw list. List order == shadow-window order
+    // (draw k uses firstInstance = k into pShadowWorldsBuf/pShadowInstanceBuf).
+    struct ShadowCaster { uint32_t slot; uint8_t mirror; };
+    std::vector<ShadowCaster> g_shadowCasters;
+    bool  g_shadowFrameActive = false;    // face re-render should record this frame
+    float g_shadowLightPos[3] = {};       // camera-relative (matches worlds + face CBVs)
+    float g_shadowLightRadius = 0.0f;
+    // The client's camera-relative shift eye (lighting[24..26]) — the SAME value buildDrawList/
+    // buildLightList subtracted this frame, so rel + this = the client's absolute world. Used to
+    // absolutize lastWorld records and de-absolutize them into the shadow window.
+    float g_eyeAbsShadow[3] = {};
 
     // Bindless base-map texture array size (must match MAX_TEXTURES in opaque.srt.h).
     constexpr uint32_t kMaxTextures = MAX_TEXTURES;
@@ -1812,6 +1927,105 @@ namespace {
                         (unsigned)R->pGpu->mFormatCaps[TinyImageFormat_R32G32B32A32_SFLOAT]);
         }
 
+        // --- P1 point-light shadows: atlas + mask + face/params CBVs. Created BEFORE the
+        // PerFrame set update below so gShadowMask can bind there. PSOs follow the prepass
+        // PSO block; the compute pipeline joins the Tier-2 compute block. Any failure leaves
+        // shadowReady false (shadows off) without failing the scene path. ---
+        {
+            RenderTargetDesc sd = {};
+            sd.mWidth = kShadowAtlasSize;
+            sd.mHeight = kShadowAtlasSize;
+            sd.mDepth = 1;
+            sd.mArraySize = 1;
+            sd.mMipLevels = 1;
+            sd.mSampleCount = SAMPLE_COUNT_1;
+            sd.mFormat = TinyImageFormat_D32_SFLOAT;
+            // Rests SHADER_RESOURCE (the mask pass samples cached tiles every frame); flips to
+            // DEPTH_WRITE only on face re-render frames.
+            sd.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+            sd.mClearValue.depth = 0.0f;   // reverse-Z far (the per-tile clear triangle writes 0 too)
+            sd.mClearValue.stencil = 0;
+            sd.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+            sd.pName = "shadowAtlas";
+            addRenderTarget(R, &sd, &g_live.pShadowAtlas);
+
+            TextureDesc md = {};
+            md.mWidth = width; md.mHeight = height; md.mDepth = 1;
+            md.mArraySize = 1; md.mMipLevels = 1;
+            md.mSampleCount = SAMPLE_COUNT_1;
+            md.mFormat = TinyImageFormat_R32G32_UINT;   // 4-bit visibility x 16 slots
+            md.mStartState = RESOURCE_STATE_UNORDERED_ACCESS;   // the compute writes it first
+            md.mDescriptors = (DescriptorType)(DESCRIPTOR_TYPE_TEXTURE | DESCRIPTOR_TYPE_RW_TEXTURE);
+            md.pName = "shadowMask";
+            TextureLoadDesc mld = {};
+            mld.ppTexture = &g_live.pShadowMask;
+            mld.pDesc = &md;
+            addResource(&mld, nullptr);
+
+            for (uint32_t f = 0; f < kShadowFaceCbvs; ++f) {
+                BufferLoadDesc fc = {};
+                fc.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                fc.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+                fc.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+                fc.mDesc.mSize = 512;                  // full FrameData copy, viewProj overwritten per face
+                fc.mDesc.pName = "shadowFaceCbv";
+                fc.pData = nullptr;
+                fc.ppBuffer = &g_live.pShadowFaceCbv[f];
+                addResource(&fc, nullptr);
+            }
+
+            BufferLoadDesc sp = {};
+            sp.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            sp.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            sp.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            sp.mDesc.mSize = 1024;                     // >= sizeof(ShadowMaskParams) (608B)
+            sp.mDesc.pName = "shadowMaskParamsCbv";
+            sp.pData = nullptr;
+            sp.ppBuffer = &g_live.pShadowMaskParamsCbv;
+            addResource(&sp, nullptr);
+
+            // P1.5: the face pass's own world window + instance VB (decouples casters from the
+            // camera-culled batch windows; the gather refills both from lastWorld records).
+            BufferLoadDesc sw = {};
+            sw.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            sw.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            sw.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            sw.mDesc.mSize = kBatchBytes;              // 1024 matrices >= kShadowMaxCasters
+            sw.mDesc.pName = "shadowWorldsCbv";
+            sw.pData = nullptr;
+            sw.ppBuffer = &g_live.pShadowWorldsBuf;
+            addResource(&sw, nullptr);
+
+            BufferLoadDesc si = {};
+            si.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+            si.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            si.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            si.mDesc.mSize = (uint64_t)kShadowMaxCasters * kStaticInstU32 * sizeof(uint32_t);
+            si.mDesc.pName = "instanceVBShadow";
+            si.pData = nullptr;
+            si.ppBuffer = &g_live.pShadowInstanceBuf;
+            addResource(&si, nullptr);
+
+            waitForAllResourceLoads();
+            if (!g_live.pShadowAtlas || !g_live.pShadowMask
+                || !g_live.pShadowFaceCbv[kShadowFaceCbvs - 1] || !g_live.pShadowMaskParamsCbv
+                || !g_live.pShadowWorldsBuf || !g_live.pShadowInstanceBuf) {
+                std::printf("[forge][shadow] resource alloc FAILED — shadows disabled\n");
+            } else {
+                std::memset(g_live.pShadowMaskParamsCbv->pCpuMappedAddress, 0, 1024);
+                // Shadow instance VB: [0] = identity DrawIndex (firstInstance=k reads its own
+                // matrix), [1] texAlpha per gather, material/overlay lanes stay 0 (depth-only).
+                uint32_t* sinst = (uint32_t*)g_live.pShadowInstanceBuf->pCpuMappedAddress;
+                for (uint32_t k = 0; k < kShadowMaxCasters; ++k) {
+                    sinst[k * kStaticInstU32 + 0] = k;
+                    for (uint32_t j = 1; j < kStaticInstU32; ++j) { sinst[k * kStaticInstU32 + j] = 0; }
+                }
+                std::printf("[forge][shadow] atlas %u^2 D32 + mask %ux%u R32G32_UINT (caps=0x%X)\n",
+                            kShadowAtlasSize, width, height,
+                            (unsigned)R->pGpu->mFormatCaps[TinyImageFormat_R32G32_UINT]);
+            }
+        }
+
         // Opaque shaders (share the global root signature already loaded for the triangle).
         ShaderLoadDesc sDesc = {};
         sDesc.mVert.pFileName = "opaque.vert";
@@ -1984,6 +2198,73 @@ namespace {
             }
         }
 
+        // --- P1 shadow-face PSOs: opaque.vert + depthonly.frag (alpha-tested casting free)
+        // into the SINGLE-SAMPLE atlas — the MSAA prepass PSOs above are not reusable. Depth
+        // bias in the rasterizer; REVERSE-Z flips its sign (negative pushes casters FARTHER
+        // from the light). Non-fatal: failure just leaves shadowReady false. ---
+        if (g_live.pShadowAtlas) {
+            DepthStateDesc shDepth = {};
+            shDepth.mDepthTest = true;
+            shDepth.mDepthWrite = true;
+            shDepth.mDepthFunc = CMP_GEQUAL;       // reverse-Z, matches the main prepass
+
+            RasterizerStateDesc shRaster = rasterDesc;             // CULL_BACK + CCW
+            shRaster.mDepthBias = -32;
+            shRaster.mSlopeScaledDepthBias = -2.0f;
+            RasterizerStateDesc shRasterMirror = shRaster;
+            shRasterMirror.mFrontFace = FRONT_FACE_CW;
+
+            PipelineDesc spd = {};
+            spd.mType = PIPELINE_TYPE_GRAPHICS;
+            GraphicsPipelineDesc& sg = spd.mGraphicsDesc;
+            sg.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+            sg.mRenderTargetCount = 0;             // depth-only
+            sg.pColorFormats = nullptr;
+            sg.mSampleCount = SAMPLE_COUNT_1;      // the atlas is never MSAA
+            sg.mSampleQuality = 0;
+            sg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+            sg.pDepthState = &shDepth;
+            sg.pVertexLayout = &vl;
+            sg.pRasterizerState = &shRaster;
+            sg.pShaderProgram = g_live.pDepthOnlyShader;
+            addPipeline(R, &spd, &g_live.pShadowPipeline);
+            sg.pRasterizerState = &shRasterMirror;
+            addPipeline(R, &spd, &g_live.pShadowPipelineMirror);
+
+            // Per-tile clear PSO: viewport-covering triangle at z = 0, CMP_ALWAYS + write (a
+            // LOAD_ACTION_CLEAR on the atlas would wipe every cached tile). No vertex layout.
+            ShaderLoadDesc scDesc = {};
+            scDesc.mVert.pFileName = "shadowclear.vert";
+            scDesc.mFrag.pFileName = "shadowclear.frag";
+            addShader(R, &scDesc, &g_live.pShadowClearShader);
+            if (g_live.pShadowClearShader) {
+                DepthStateDesc clrDepth = {};
+                clrDepth.mDepthTest = true;
+                clrDepth.mDepthWrite = true;
+                clrDepth.mDepthFunc = CMP_ALWAYS;
+                RasterizerStateDesc clrRaster = {};
+                clrRaster.mCullMode = CULL_MODE_NONE;
+                clrRaster.mFrontFace = FRONT_FACE_CCW;
+                PipelineDesc cpd = {};
+                cpd.mType = PIPELINE_TYPE_GRAPHICS;
+                GraphicsPipelineDesc& cg = cpd.mGraphicsDesc;
+                cg.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+                cg.mRenderTargetCount = 0;
+                cg.pColorFormats = nullptr;
+                cg.mSampleCount = SAMPLE_COUNT_1;
+                cg.mSampleQuality = 0;
+                cg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+                cg.pDepthState = &clrDepth;
+                cg.pVertexLayout = nullptr;        // SV_VertexID fullscreen-triangle, no attributes
+                cg.pRasterizerState = &clrRaster;
+                cg.pShaderProgram = g_live.pShadowClearShader;
+                addPipeline(R, &cpd, &g_live.pShadowClearPipeline);
+            }
+            if (!g_live.pShadowPipeline || !g_live.pShadowPipelineMirror || !g_live.pShadowClearPipeline) {
+                std::printf("[forge][shadow] face/clear PSO build FAILED — shadows disabled\n");
+            }
+        }
+
         // gFrameData: small viewProj cbuffer, persistent-mapped. 512B (was 256): WV2 appended
         // gReflWaterClip pushed the struct to 272B, over the 256 min CBV → next 256-aligned size.
         BufferLoadDesc fb = {};
@@ -2109,19 +2390,59 @@ namespace {
             // (pAOBlur), not raw pAO; pAOBlur's per-frame UAV<->SHADER_RESOURCE ping-pong (renderScene)
             // leaves it SHADER_RESOURCE before the colour pass samples it. (Raw pAO still feeds the
             // blur as an SRV, and the DebugTextures/readback paths still inspect pAO directly.)
-            DescriptorData p[2] = {};
+            DescriptorData p[3] = {};
             p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
             p[0].ppBuffers = &g_live.pFrameCbv;
             p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
             p[1].mCount = 1;   // single-texture SRV needs explicit count (else binds nothing)
             p[1].ppTextures = &g_live.pAOBlur;
-            updateDescriptorSet(R, 0, g_live.pPerFrameSet, 2, p);
+            uint32_t np = 2;
+            // P1 shadows: the screen-space visibility mask opaque.frag loads per shadowed light.
+            if (g_live.pShadowMask) {
+                p[np].mIndex = SRT_RES_IDX(SrtData, PerFrame, gShadowMask);
+                p[np].mCount = 1;
+                p[np].ppTextures = &g_live.pShadowMask;
+                ++np;
+            }
+            updateDescriptorSet(R, 0, g_live.pPerFrameSet, np, p);
         }
         {
             DescriptorData p = {};
             p.mIndex = SRT_RES_IDX(SrtData, PerDraw, gLights);
             p.ppBuffers = &g_live.pLightCbv;
             updateDescriptorSet(R, 0, g_live.pPerLightsSet, 1, &p);
+        }
+
+        // P1 shadows: per-face PerFrame set — instance f binds face CBV f (the reflection pass's
+        // second-view pattern; two matrices live in one command buffer only via two cbuffers).
+        // Only gFrameData is bound: the depth-only face pass never touches gAO/water/mask slots.
+        if (g_live.pShadowFaceCbv[kShadowFaceCbvs - 1]) {
+            DescriptorSetDesc sfDesc = SRT_SET_DESC(SrtData, PerFrame, kShadowFaceCbvs, 0);
+            addDescriptorSet(R, &sfDesc, &g_live.pShadowFaceSet);
+            if (g_live.pShadowFaceSet) {
+                for (uint32_t f = 0; f < kShadowFaceCbvs; ++f) {
+                    DescriptorData d = {};
+                    d.mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
+                    d.ppBuffers = &g_live.pShadowFaceCbv[f];
+                    updateDescriptorSet(R, f, g_live.pShadowFaceSet, 1, &d);
+                }
+            } else {
+                std::printf("[forge][shadow] addDescriptorSet(face set) FAILED — shadows disabled\n");
+            }
+        }
+        // P1.5: gBatch bound to the shadow world window (single instance; the face pass binds
+        // this instead of the camera-shaped pPerBatchSet windows).
+        if (g_live.pShadowWorldsBuf) {
+            DescriptorSetDesc sbDesc = SRT_SET_DESC(SrtData, PerBatch, 1, 0);
+            addDescriptorSet(R, &sbDesc, &g_live.pShadowBatchSet);
+            if (g_live.pShadowBatchSet) {
+                DescriptorData d = {};
+                d.mIndex = SRT_RES_IDX(SrtData, PerBatch, gBatch);
+                d.ppBuffers = &g_live.pShadowWorldsBuf;
+                updateDescriptorSet(R, 0, g_live.pShadowBatchSet, 1, &d);
+            } else {
+                std::printf("[forge][shadow] addDescriptorSet(shadow batch set) FAILED — shadows disabled\n");
+            }
         }
 
         // --- Phase 2: bindless texture array (default white), bound once. ---
@@ -3268,6 +3589,51 @@ namespace {
                         (unsigned)g_live.pGtaoBatchSet->mDx.mCbvSrvUavRootIndex, (unsigned long long)g_live.pGtaoBatchSet->mDx.mCbvSrvUavHandle, (unsigned)g_live.pGtaoBatchSet->mDx.mCbvSrvUavStride);
             std::printf("[forge] Tier 2 compute ready (linearize=%s, gtao.comp; pLinearDepth R32F, pAO RGBA16F)\n",
                         linName);
+
+            // --- P1 shadows: shadowmask.comp pipeline + its single PerBatch set (CBV + linear-
+            // depth SRV + atlas SRV + mask UAV). Reads the RESOLVED pLinearDepth, so no MSAA
+            // variants. Non-fatal on failure (shadowReady stays false, shadows off). ---
+            if (g_live.pShadowAtlas && g_live.pShadowMask && g_live.pShadowMaskParamsCbv) {
+                ShaderLoadDesc smd = {};
+                smd.mComp.pFileName = "shadowmask.comp";
+                addShader(R, &smd, &g_live.pShadowMaskShader);
+                if (g_live.pShadowMaskShader) {
+                    PipelineDesc smp = {};
+                    smp.mType = PIPELINE_TYPE_COMPUTE;
+                    smp.mComputeDesc.pShaderProgram = g_live.pShadowMaskShader;
+                    addPipeline(R, &smp, &g_live.pShadowMaskPipeline);
+                }
+                if (g_live.pShadowMaskPipeline) {
+                    DescriptorSetDesc smset = SRT_SET_DESC(ShadowMaskSrtData, PerBatch, 1, 0);
+                    addDescriptorSet(R, &smset, &g_live.pShadowMaskSet);
+                }
+                if (g_live.pShadowMaskSet) {
+                    DescriptorData d[4] = {};
+                    d[0].mIndex = SRT_RES_IDX(ShadowMaskSrtData, PerBatch, gShadowMaskParams);
+                    d[0].ppBuffers = &g_live.pShadowMaskParamsCbv;
+                    d[1].mIndex = SRT_RES_IDX(ShadowMaskSrtData, PerBatch, gShadowLinDepth);
+                    d[1].mCount = 1;
+                    d[1].ppTextures = &g_live.pLinearDepth;
+                    d[2].mIndex = SRT_RES_IDX(ShadowMaskSrtData, PerBatch, gShadowAtlas);
+                    d[2].mCount = 1;
+                    d[2].ppTextures = &g_live.pShadowAtlas->pTexture;
+                    d[3].mIndex = SRT_RES_IDX(ShadowMaskSrtData, PerBatch, gShadowMaskOut);
+                    d[3].mCount = 1;
+                    d[3].ppTextures = &g_live.pShadowMask;
+                    updateDescriptorSet(R, 0, g_live.pShadowMaskSet, 4, d);
+                }
+                g_live.shadowReady = g_live.pShadowAtlas && g_live.pShadowMask
+                                  && g_live.pShadowPipeline && g_live.pShadowPipelineMirror
+                                  && g_live.pShadowClearPipeline && g_live.pShadowFaceSet
+                                  && g_live.pShadowMaskPipeline && g_live.pShadowMaskSet
+                                  && g_live.pShadowMaskParamsCbv
+                                  && g_live.pShadowWorldsBuf && g_live.pShadowInstanceBuf
+                                  && g_live.pShadowBatchSet;
+                std::printf("[forge][shadow] %s (slot 0 = tier-A %u^2 faces; shadowmask.comp %s)\n",
+                            g_live.shadowReady ? "READY" : "DISABLED (create failed)",
+                            kShadowAtlasSize / 8,
+                            g_live.pShadowMaskPipeline ? "ok" : "MISSING (dxil not deployed?)");
+            }
         }
 
         // GPU timestamp pool for the per-phase 4ms breakdown (kGpuPhaseCount begin/end pairs).
@@ -3413,6 +3779,20 @@ namespace {
         // VB has high-latency uncached GPU vertex fetch, and mass-promoting churn tanks render.
         uint32_t lastUploadFrame;
         uint16_t uploadStreak;  // consecutive-frame re-uploads at the same shape
+        // P1 shadows: model-space bounding sphere, computed at upload (all wire vertex formats
+        // start with float3 pos). The caster gather transforms it by the draw's world per frame.
+        float    localCenter[3];
+        float    localRadius;
+        // P1.5 shadows: last-seen ABSOLUTE world transform (+ packed tex/alphaRef + winding),
+        // refreshed every frame the slot appears in items[]. Lets the face pass keep casting
+        // geometry the CAMERA frustum culled (items[] is the client's visible set — without
+        // this, a caster's shadow popped the moment the caster left the screen). Statics don't
+        // move, so a stale transform stays correct; lastWorldFrame bounds recycled-slot ghosts
+        // and is reset on every re-upload.
+        float    lastWorld[16];      // ABSOLUTE world (rel world + client shift eye)
+        uint32_t lastTexAlpha;       // packTexAlpha(texIndex, alphaRef, vColSource) at last sight
+        uint32_t lastWorldFrame;     // g_renderFrame at last sight; 0 = no valid record
+        uint8_t  lastMirror;         // worldMirrored at last sight
     };
     HostMesh* g_meshes   = nullptr;
     uint32_t  g_meshCap  = 0;   // allocated slot count
@@ -3574,10 +3954,19 @@ namespace {
     bool g_waterReflOnly = false;
     bool g_waterRefrOnly = false;
 
+    // ---- P1 point-light shadow knobs ----
+    // Master toggle gates the slot-lane patch + face re-render only; the mask pass still runs
+    // (writes an all-lit mask) so the UAV/SRV ping-pong and frag reads stay state-valid.
+    bool  g_shadowEnable     = true;
+    bool  g_shadowFaceDebug  = false;   // shadowmask debug 1: nibble = face id (convention check FIRST)
+    bool  g_shadowAtlasDebug = false;   // shadowmask debug 2: nibble = atlas depth (slot-0 block on screen)
+    float g_shadowSlack      = 0.02f;   // relative reverse-Z compare slack (acne knob; live via mask params)
+
     // F12 debug-view names; index = debugParams.x. The dropdown writes g_debugMode directly so the
     // overlay selector and the F12 key cycle stay unified.
     const char* const kDebugModeNames[] = { "0 normal", "1 depth", "2 scatter", "3 AO", "4 bent-normal",
-                                            "5 albedo", "6 lit", "7 ambient", "8 world-normal", "9 light-count" };
+                                            "5 albedo", "6 lit", "7 ambient", "8 world-normal", "9 light-count",
+                                            "10 shadow-mask" };
 
     // Build the dev overlay once. The headless host has no Load/Unload reload split, so font-system
     // + UI-system init AND their pipeline load happen together here, right after pRT exists.
@@ -3701,6 +4090,19 @@ namespace {
         uiAddComponentWidget(g_uiPanel, "Water: reflection only", &cWRefl, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cWRefr = {}; cWRefr.pData = &g_waterRefrOnly;
         uiAddComponentWidget(g_uiPanel, "Water: refraction only", &cWRefr, WIDGET_TYPE_CHECKBOX);
+
+        // P1 point-light shadows: master toggle + the two mask-pass debug views (face-id bands /
+        // atlas depth — the face-convention check) + the live acne slack knob.
+        LabelWidget shLbl = {};
+        uiAddComponentWidget(g_uiPanel, "-- Point-light shadows (P1) --", &shLbl, WIDGET_TYPE_LABEL);
+        CheckboxWidget cShEn = {}; cShEn.pData = &g_shadowEnable;
+        uiAddComponentWidget(g_uiPanel, "Shadows: enable", &cShEn, WIDGET_TYPE_CHECKBOX);
+        CheckboxWidget cShFd = {}; cShFd.pData = &g_shadowFaceDebug;
+        uiAddComponentWidget(g_uiPanel, "Shadow: face-id debug (F12 mode 10)", &cShFd, WIDGET_TYPE_CHECKBOX);
+        CheckboxWidget cShAd = {}; cShAd.pData = &g_shadowAtlasDebug;
+        uiAddComponentWidget(g_uiPanel, "Shadow: atlas view (F12 mode 10)", &cShAd, WIDGET_TYPE_CHECKBOX);
+        SliderFloatWidget sShS = {}; sShS.pData = &g_shadowSlack; sShS.mMin = 0.0f; sShS.mMax = 0.2f; sShS.mStep = 0.002f;
+        uiAddComponentWidget(g_uiPanel, "Shadow depth slack", &sShS, WIDGET_TYPE_SLIDER_FLOAT);
 
         // -- Phase 0: per-subsystem draw toggles (off → MW's version shows through the composite) --
         LabelWidget subLbl = {};
@@ -4181,6 +4583,11 @@ namespace ForgeRender {
             // scene-probe passes 0s). The near scene is camera-relative (eyePos=0); resident DL is in
             // ABSOLUTE coords, so the live DL cull/build shifts it by -realEye. lodEye -> gFrameData[56..59].
             dlSetFrameEye(lighting[24], lighting[25], lighting[26], lighting[27] != 0.0f);
+            // P1.5 shadows: this is the client's camera-relative shift eye for THIS frame's
+            // items/lights — the absolutize/de-absolutize anchor for lastWorld caster records.
+            g_eyeAbsShadow[0] = lighting[24];
+            g_eyeAbsShadow[1] = lighting[25];
+            g_eyeAbsShadow[2] = lighting[26];
             // C2: lighting[28..31] = skyZenith.rgb (current interpolated zenith sky colour). Host dome
             // gradient (sky.frag) reads FrameData.skyZenith at float index 68..71 (after gReflWaterClip
             // at 64..67). The scene-probe passes only 24 floats, so guard on the null-lighting path.
@@ -4226,6 +4633,143 @@ namespace ForgeRender {
             }
             g_lastLightCount = nL;
         }
+
+        // --- P1 shadow manager STUB: argmax-importance light -> slot 0, all 6 faces re-rendered
+        // EVERY frame (no caching/identity — that's P2/P3). Pre-beginCmd: patches the chosen
+        // light's falloff.w CBV lane with slot+1 (opaque.frag applies the mask nibble), fills the
+        // 6 face CBVs (FrameData copies with per-face viewProjs) + the mask-params CBV, and
+        // gathers the sphere-filtered caster list the face pass records from. ---
+        g_shadowFrameActive = false;
+        if (g_live.shadowReady) {
+            float* lc = (float*)g_live.pLightCbv->pCpuMappedAddress;
+            const uint32_t nL = g_lastLightCount;
+
+            // Selection with HYSTERESIS (D7 pulled forward): the per-frame argmax alone made
+            // slot 0 hop lights on every camera turn, popping the shadow you were looking at.
+            // No identity yet (P2), so the held light is matched by ABSOLUTE position (rel +
+            // shift eye) within a small tolerance — flicker doesn't move a light, and a carried
+            // torch moves far less than the tolerance per frame. A challenger must beat the
+            // incumbent by 1.5x importance to steal the slot.
+            static bool  s_holdValid = false;
+            static float s_holdAbs[3] = {};
+            int   best = -1, hold = -1;
+            float bestImp = 0.0f, holdImp = 0.0f;
+            for (uint32_t i = 0; i < nL; ++i) {
+                const float* pl = lc + 4 + i * 12;    // posRadius lane (after the 4-float header)
+                const float  r  = pl[3];
+                if (r <= 1.0f) { continue; }
+                const float dist = std::sqrt(pl[0]*pl[0] + pl[1]*pl[1] + pl[2]*pl[2]);
+                const float imp  = r / (dist > r ? dist : r);   // screen-coverage proxy (D7)
+                if (imp > bestImp) { bestImp = imp; best = (int)i; }
+                if (s_holdValid) {
+                    const float hx = pl[0] + g_eyeAbsShadow[0] - s_holdAbs[0];
+                    const float hy = pl[1] + g_eyeAbsShadow[1] - s_holdAbs[1];
+                    const float hz = pl[2] + g_eyeAbsShadow[2] - s_holdAbs[2];
+                    if (hx*hx + hy*hy + hz*hz < 8.0f * 8.0f) { hold = (int)i; holdImp = imp; }
+                }
+            }
+            int chosen = best;
+            if (hold >= 0 && best != hold && bestImp < 1.5f * holdImp) { chosen = hold; }
+
+            float* mp = (float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress;
+            float  sInvVP[16];
+            if (!invert4x4(rzViewProj, sInvVP)) {
+                for (int k = 0; k < 16; ++k) { sInvVP[k] = (k % 5 == 0) ? 1.0f : 0.0f; }
+            }
+            std::memcpy(mp, sInvVP, 16 * sizeof(float));
+            mp[16] = (float)g_live.width;        mp[17] = (float)g_live.height;
+            mp[18] = 1.0f / (float)g_live.width; mp[19] = 1.0f / (float)g_live.height;
+
+            uint32_t activeBits = 0;
+            if (g_shadowEnable && chosen >= 0) {
+                const float* pl = lc + 4 + chosen * 12;
+                g_shadowLightPos[0] = pl[0]; g_shadowLightPos[1] = pl[1]; g_shadowLightPos[2] = pl[2];
+                g_shadowLightRadius = pl[3];
+                lc[4 + chosen * 12 + 11] = 1.0f;    // falloff.w = slot 0 + 1 (0 = unshadowed)
+                activeBits = 1u;
+                s_holdAbs[0] = pl[0] + g_eyeAbsShadow[0];
+                s_holdAbs[1] = pl[1] + g_eyeAbsShadow[1];
+                s_holdAbs[2] = pl[2] + g_eyeAbsShadow[2];
+                s_holdValid = true;
+
+                // Slot-0 lanes for the mask pass (ShadowMaskParams float layout: slotPosRad[0]
+                // at float 24, slotTile[0] at float 88 — 16 slots apart).
+                mp[24] = pl[0]; mp[25] = pl[1]; mp[26] = pl[2]; mp[27] = pl[3];
+                uint32_t bx, by, bs;
+                shadowSlotBlock(0, bx, by, bs);
+                mp[88] = (float)bx; mp[89] = (float)by; mp[90] = (float)bs; mp[91] = 1.0f;
+
+                // Caster gather (P1.5): over the RESIDENT lastWorld records, in ABSOLUTE space —
+                // NOT over items[] (the camera-frustum-culled visible set), so a caster keeps
+                // casting after it leaves the screen. V1 = owned opaque statics only.
+                g_shadowCasters.clear();
+                const float reach = 2.0f * g_shadowLightRadius;
+                const float lax = g_shadowLightPos[0] + g_eyeAbsShadow[0];
+                const float lay = g_shadowLightPos[1] + g_eyeAbsShadow[1];
+                const float laz = g_shadowLightPos[2] + g_eyeAbsShadow[2];
+                for (uint32_t slot = 0; slot < g_meshHigh; ++slot) {
+                    const HostMesh& hm = g_meshes[slot];
+                    if (!hm.valid || hm.skinned || hm.multimap) { continue; }
+                    if (hm.lastWorldFrame == 0
+                        || g_renderFrame - hm.lastWorldFrame > kShadowCasterKeepFrames) { continue; }
+                    const float* w = hm.lastWorld;   // ABSOLUTE (row-vector: rows 0..2 basis, row 3 T)
+                    const float cx = hm.localCenter[0]*w[0] + hm.localCenter[1]*w[4] + hm.localCenter[2]*w[8]  + w[12];
+                    const float cy = hm.localCenter[0]*w[1] + hm.localCenter[1]*w[5] + hm.localCenter[2]*w[9]  + w[13];
+                    const float cz = hm.localCenter[0]*w[2] + hm.localCenter[1]*w[6] + hm.localCenter[2]*w[10] + w[14];
+                    const float s0 = w[0]*w[0] + w[1]*w[1] + w[2]*w[2];
+                    const float s1 = w[4]*w[4] + w[5]*w[5] + w[6]*w[6];
+                    const float s2 = w[8]*w[8] + w[9]*w[9] + w[10]*w[10];
+                    float smax = s0 > s1 ? s0 : s1; if (s2 > smax) { smax = s2; }
+                    const float wr = hm.localRadius * std::sqrt(smax);
+                    const float dx = cx - lax;
+                    const float dy = cy - lay;
+                    const float dz = cz - laz;
+                    const float rr = reach + wr;
+                    if (dx*dx + dy*dy + dz*dz > rr * rr) { continue; }
+                    g_shadowCasters.push_back({ slot, hm.lastMirror });
+                    if (g_shadowCasters.size() >= kShadowMaxCasters) { break; }
+                }
+                std::sort(g_shadowCasters.begin(), g_shadowCasters.end(),
+                          [](const ShadowCaster& a, const ShadowCaster& b) {
+                              if (a.mirror != b.mirror) { return a.mirror < b.mirror; }
+                              return a.slot < b.slot;
+                          });
+                // Fill the shadow world window + instance texAlpha IN LIST ORDER (draw k reads
+                // matrix k via firstInstance = k). Worlds go in CAMERA-RELATIVE for this frame.
+                {
+                    uint8_t*  swd  = (uint8_t*)g_live.pShadowWorldsBuf->pCpuMappedAddress;
+                    uint32_t* sins = (uint32_t*)g_live.pShadowInstanceBuf->pCpuMappedAddress;
+                    for (uint32_t k = 0; k < (uint32_t)g_shadowCasters.size(); ++k) {
+                        const HostMesh& hm = g_meshes[g_shadowCasters[k].slot];
+                        float relW[16];
+                        std::memcpy(relW, hm.lastWorld, 64);
+                        relW[12] -= g_eyeAbsShadow[0];
+                        relW[13] -= g_eyeAbsShadow[1];
+                        relW[14] -= g_eyeAbsShadow[2];
+                        std::memcpy(swd + (size_t)k * 64, relW, 64);
+                        sins[k * kStaticInstU32 + 1] = hm.lastTexAlpha;
+                    }
+                }
+
+                // Face CBVs 0..5 = this frame's FrameData with the face viewProj swapped in.
+                const float nearZ = kShadowNearZ;
+                const float farZ  = (reach > nearZ + 1.0f) ? reach : nearZ + 1.0f;
+                for (uint32_t f = 0; f < 6; ++f) {
+                    uint8_t* fc = (uint8_t*)g_live.pShadowFaceCbv[f]->pCpuMappedAddress;
+                    std::memcpy(fc, g_live.pFrameCbv->pCpuMappedAddress, 512);
+                    float faceVP[16];
+                    buildShadowFaceVP(g_shadowLightPos, f, nearZ, farZ, faceVP);
+                    std::memcpy(fc, faceVP, 16 * sizeof(float));
+                }
+                g_shadowFrameActive = true;
+            } else {
+                s_holdValid = false;
+            }
+            mp[20] = (float)activeBits;           // maskParams.x = active-slot bitmask
+            mp[21] = kShadowNearZ;                // maskParams.y = face near plane
+            mp[22] = g_shadowSlack;               // maskParams.z = compare slack (live knob)
+            mp[23] = g_shadowAtlasDebug ? 2.0f : (g_shadowFaceDebug ? 1.0f : 0.0f);
+        }
         for (uint32_t i = 0; i < count; ++i) {
             const uint32_t batch = i / kBatchSize;
             const uint32_t local = i % kBatchSize;
@@ -4235,7 +4779,23 @@ namespace ForgeRender {
             // stays the identity DrawIndex set at creation. Tier 2b material rgb in slots [2..10]
             // (float). Unloaded/unknown slots fall back to 0 (white texture).
             uint32_t* inst = (uint32_t*)g_live.pInstanceBuf[batch]->pCpuMappedAddress;
-            inst[local * kStaticInstU32 + 1] = packTexAlpha(items[i].texIndex, items[i].alphaRef, items[i].vColSource);
+            const uint32_t texAlphaPacked = packTexAlpha(items[i].texIndex, items[i].alphaRef, items[i].vColSource);
+            inst[local * kStaticInstU32 + 1] = texAlphaPacked;
+            // P1.5 shadows: refresh the slot's last-seen ABSOLUTE world record so the caster
+            // gather can keep drawing this part after the camera frustum culls it from items[].
+            {
+                const uint32_t slot = items[i].slot;
+                if (slot < g_meshHigh && g_meshes[slot].valid) {
+                    HostMesh& shm = g_meshes[slot];
+                    std::memcpy(shm.lastWorld, items[i].world, 64);
+                    shm.lastWorld[12] += g_eyeAbsShadow[0];
+                    shm.lastWorld[13] += g_eyeAbsShadow[1];
+                    shm.lastWorld[14] += g_eyeAbsShadow[2];
+                    shm.lastTexAlpha   = texAlphaPacked;
+                    shm.lastMirror     = worldMirrored(items[i].world) ? 1 : 0;
+                    shm.lastWorldFrame = g_renderFrame;
+                }
+            }
             float* finst = (float*)inst;
             finst[local * kStaticInstU32 + 2] = items[i].matDiffuse[0];
             finst[local * kStaticInstU32 + 3] = items[i].matDiffuse[1];
@@ -4643,6 +5203,90 @@ namespace ForgeRender {
         }
 
         gpuPhaseEnd(kGpuPhasePrepass);
+
+        // ===================== P1: POINT-LIGHT SHADOW FACES (atlas tile re-render) ==========
+        // Direct draws — ≤ kShadowMaxCasters low-poly casters x 6 faces; the exec-indirect args
+        // buffer is camera-shaped + single-buffered, so indirect here would fight the main pass
+        // (revisit only if profiled). Atlas rests SHADER_RESOURCE and flips to DEPTH_WRITE only
+        // on re-render frames; each tile is cleared by the viewport triangle (z = 0), NEVER by a
+        // load action (that would wipe every cached tile once caching lands in P3).
+        gpuPhaseBegin(kGpuPhaseShadow);
+        if (g_live.shadowReady && g_shadowFrameActive) {
+            cmdBindRenderTargets(g_live.pCmd, nullptr);   // end the prepass pass before the barrier
+            {
+                RenderTargetBarrier rtb = {};
+                rtb.pRenderTarget = g_live.pShadowAtlas;
+                rtb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                rtb.mNewState = RESOURCE_STATE_DEPTH_WRITE;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rtb);
+            }
+            BindRenderTargetsDesc sbind = {};
+            sbind.mRenderTargetCount = 0;
+            sbind.mDepthStencil = { g_live.pShadowAtlas, LOAD_ACTION_LOAD };
+            cmdBindRenderTargets(g_live.pCmd, &sbind);
+            cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.7f, 0.1f, "SHADOW FACES (slot 0 re-render)");
+
+            uint32_t bx, by, bs;
+            shadowSlotBlock(0, bx, by, bs);
+            for (uint32_t f = 0; f < 6; ++f) {
+                const uint32_t tx = bx + (f % 3) * bs;
+                const uint32_t ty = by + (f / 3) * bs;
+                cmdSetViewport(g_live.pCmd, (float)tx, (float)ty, (float)bs, (float)bs, 0.0f, 1.0f);
+                cmdSetScissor(g_live.pCmd, tx, ty, bs, bs);
+
+                // Per-tile clear triangle (CMP_ALWAYS + write, z = 0 = reverse-Z far).
+                cmdBindPipeline(g_live.pCmd, g_live.pShadowClearPipeline);
+                cmdDraw(g_live.pCmd, 3, 0);
+
+                // One shared caster list for all 6 faces (V1), fully decoupled from the frame's
+                // camera-culled batch windows: draw k reads matrix k of the SHADOW world window
+                // (pShadowBatchSet) via firstInstance = k into pShadowInstanceBuf. The list is
+                // (mirror, slot)-sorted so the pipeline flips at most once. Face CBV f carries
+                // this face's light-centred viewProj.
+                int shMirror = -1;
+                for (uint32_t k = 0; k < (uint32_t)g_shadowCasters.size(); ++k) {
+                    const ShadowCaster& scst = g_shadowCasters[k];
+                    HostMesh& hm = g_meshes[scst.slot];
+                    if ((int)scst.mirror != shMirror) {
+                        cmdBindPipeline(g_live.pCmd, scst.mirror ? g_live.pShadowPipelineMirror
+                                                                 : g_live.pShadowPipeline);
+                        cmdBindDescriptorSet(g_live.pCmd, f, g_live.pShadowFaceSet);
+                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pShadowBatchSet);
+                        shMirror = (int)scst.mirror;
+                    }
+                    if (hm.inArena) {
+                        Buffer*  vbs[2]     = { g_live.pArenaVB, g_live.pShadowInstanceBuf };
+                        uint32_t strides[2] = { vStride, iStride };
+                        cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                        cmdBindIndexBuffer(g_live.pCmd, g_live.pArenaIB, INDEX_TYPE_UINT16, 0);
+                        cmdDrawIndexedInstanced(g_live.pCmd, hm.indexCount,
+                                                (uint32_t)(hm.ibOff / sizeof(uint16_t)), 1,
+                                                (uint32_t)(hm.vbOff / sizeof(IPC::GeomVertexWire)), k);
+                    } else {
+                        Buffer*  vbs[2]     = { hm.vb, g_live.pShadowInstanceBuf };
+                        uint32_t strides[2] = { vStride, iStride };
+                        cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                        cmdBindIndexBuffer(g_live.pCmd, hm.ib, INDEX_TYPE_UINT16, 0);
+                        cmdDrawIndexedInstanced(g_live.pCmd, hm.indexCount, 0, 1, 0, k);
+                    }
+                }
+            }
+            cmdEndDebugMarker(g_live.pCmd);
+            cmdBindRenderTargets(g_live.pCmd, nullptr);
+            {
+                RenderTargetBarrier rtb = {};
+                rtb.pRenderTarget = g_live.pShadowAtlas;
+                rtb.mCurrentState = RESOURCE_STATE_DEPTH_WRITE;
+                rtb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &rtb);
+            }
+            // Restore the full-screen viewport/scissor for the compute + colour passes below
+            // (the colour pass re-sets them at bind, but the AO block in between binds nothing).
+            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+        }
+        gpuPhaseEnd(kGpuPhaseShadow);
         gpuPhaseBegin(kGpuPhaseGtao);
         // ===================== TIER 2: LINEARIZE + GTAO COMPUTE =====================
         // First compute work in the host. Sits between the depth-complete prepass and the colour
@@ -4787,6 +5431,33 @@ namespace ForgeRender {
                 // pAOBlur UAV -> SRV for the colour pass.
                 TextureBarrier tb = {};
                 tb.pTexture = g_live.pAOBlur;
+                tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
+                tb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+            }
+        }
+
+        // P1: screen-space shadow-mask dispatch. Needs pLinearDepth in SHADER_RESOURCE, which
+        // the AO block above guarantees (linearize always runs; only the GTAO dispatches are
+        // gated) — mirror its gate so the states line up. Runs whenever shadowReady, even with
+        // ZERO active slots: the comp then writes an all-lit mask, keeping the UAV/SRV ping-pong
+        // and the colour frag's mode-10 read state-valid. Rides the gtao phase timestamp (tiny).
+        if (g_live.shadowReady && g_live.pLinearizePipeline && g_live.pGtaoPipeline) {
+            if (!g_live.firstFrame) {
+                TextureBarrier tb = {};
+                tb.pTexture = g_live.pShadowMask;
+                tb.mCurrentState = RESOURCE_STATE_SHADER_RESOURCE;
+                tb.mNewState = RESOURCE_STATE_UNORDERED_ACCESS;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
+            }
+            cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.8f, 0.2f, "SHADOW MASK (atlas -> per-pixel visibility)");
+            cmdBindPipeline(g_live.pCmd, g_live.pShadowMaskPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pShadowMaskSet);
+            cmdDispatch(g_live.pCmd, (g_live.width + 7u) / 8u, (g_live.height + 7u) / 8u, 1);
+            cmdEndDebugMarker(g_live.pCmd);
+            {
+                TextureBarrier tb = {};
+                tb.pTexture = g_live.pShadowMask;
                 tb.mCurrentState = RESOURCE_STATE_UNORDERED_ACCESS;
                 tb.mNewState = RESOURCE_STATE_SHADER_RESOURCE;
                 cmdResourceBarrier(g_live.pCmd, 0, nullptr, 1, &tb, 0, nullptr);
@@ -5940,13 +6611,15 @@ namespace ForgeRender {
                          g_lastCullExamined ? (g_lastCullMs * 1000.0 / (g_lastCullExamined / 1000.0)) : 0.0,
                          g_lastGpuCullCount, (g_lastGpuCullCount == g_liveLastInst) ? "MATCH" : "MISMATCH",
                          g_lastGpuOccluded);
-            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f gtao=%.2f reflect=%.2f color=%.2f water=%.2f resolve=%.2f ms"
-                         " | hiz=%.2f (prologue, overruns=%u)",
+            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f gtao=%.2f reflect=%.2f color=%.2f water=%.2f resolve=%.2f ms"
+                         " | hiz=%.2f (prologue, overruns=%u) | shadowCasters=%u",
                          g_lastGpuPhaseMs[kGpuPhaseCull],
-                         g_lastGpuPhaseMs[kGpuPhasePrepass], g_lastGpuPhaseMs[kGpuPhaseGtao],
+                         g_lastGpuPhaseMs[kGpuPhasePrepass], g_lastGpuPhaseMs[kGpuPhaseShadow],
+                         g_lastGpuPhaseMs[kGpuPhaseGtao],
                          g_lastGpuPhaseMs[kGpuPhaseReflect], g_lastGpuPhaseMs[kGpuPhaseColor],
                          g_lastGpuPhaseMs[kGpuPhaseWater], g_lastGpuPhaseMs[kGpuPhaseResolve],
-                         g_lastHizGpuMs, g_hizOverruns);
+                         g_lastHizGpuMs, g_hizOverruns,
+                         (unsigned)g_shadowCasters.size());
             // Host-GPU-shrink sub-phases: WHERE inside color/reflect the ms live. sky+near+skin+mm+dl
             // ≈ color above (same frame's timestamps); refl sky = reflect − reflgeo.
             LOG::logline(">> [forge-hb] gpu color sub: sky=%.2f near=%.2f skin=%.2f mm=%.2f dl=%.2f alpha=%.2f"
@@ -6063,6 +6736,35 @@ namespace ForgeRender {
                 g_live.hizReady = false;
                 g_hizValid = false;   // M2: no rebuilds while disabled -> the occlusion test passes through
                 LOG::logline("!! [forge] hiz hot-reload FAILED — pyramid DISABLED (dxil missing on disk?)"); LOG::flush();
+            }
+        }
+
+        // P1 shadows: rebuild shadowmask.comp on the same trigger (its bias/debug logic is THE
+        // hot-iteration surface for acne tuning). Failure disables shadows loudly rather than
+        // dispatching a null pipeline; resources/sets stay valid for the next reload attempt.
+        if (g_live.pShadowMaskShader) {
+            removePipeline(R, g_live.pShadowMaskPipeline); g_live.pShadowMaskPipeline = nullptr;
+            removeShader(R, g_live.pShadowMaskShader);     g_live.pShadowMaskShader = nullptr;
+            ShaderLoadDesc smd = {};
+            smd.mComp.pFileName = "shadowmask.comp";
+            addShader(R, &smd, &g_live.pShadowMaskShader);
+            if (g_live.pShadowMaskShader) {
+                PipelineDesc smp = {};
+                smp.mType = PIPELINE_TYPE_COMPUTE;
+                smp.mComputeDesc.pShaderProgram = g_live.pShadowMaskShader;
+                addPipeline(R, &smp, &g_live.pShadowMaskPipeline);
+            }
+            if (g_live.pShadowMaskPipeline) {
+                g_live.shadowReady = g_live.pShadowAtlas && g_live.pShadowMask
+                                  && g_live.pShadowPipeline && g_live.pShadowPipelineMirror
+                                  && g_live.pShadowClearPipeline && g_live.pShadowFaceSet
+                                  && g_live.pShadowMaskSet && g_live.pShadowMaskParamsCbv
+                                  && g_live.pShadowWorldsBuf && g_live.pShadowInstanceBuf
+                                  && g_live.pShadowBatchSet;
+                LOG::logline(">> [forge][shadow] shadowmask.comp hot-reloaded"); LOG::flush();
+            } else {
+                g_live.shadowReady = false;
+                LOG::logline("!! [forge][shadow] shadowmask hot-reload FAILED — shadows DISABLED"); LOG::flush();
             }
         }
 
@@ -9351,6 +10053,39 @@ namespace ForgeRender {
 
             HostMesh& m = g_meshes[hdr.slot];
 
+            // P1 shadows: model-space bounding sphere (AABB centre + max distance). Every wire
+            // vertex format starts with float3 pos, so one stride-walk covers all three. Runs on
+            // every upload (morph re-uploads refresh it too — cheap next to the memcpy itself).
+            {
+                float mn[3] = {  3.4e38f,  3.4e38f,  3.4e38f };
+                float mx[3] = { -3.4e38f, -3.4e38f, -3.4e38f };
+                const uint8_t* vp = (const uint8_t*)verts;
+                for (uint32_t v = 0; v < hdr.vertexCount; ++v) {
+                    float pos[3];
+                    std::memcpy(pos, vp + (size_t)v * vStride, sizeof(pos));
+                    for (int k = 0; k < 3; ++k) {
+                        if (pos[k] < mn[k]) { mn[k] = pos[k]; }
+                        if (pos[k] > mx[k]) { mx[k] = pos[k]; }
+                    }
+                }
+                float r2 = 0.0f;
+                for (int k = 0; k < 3; ++k) { m.localCenter[k] = 0.5f * (mn[k] + mx[k]); }
+                for (uint32_t v = 0; v < hdr.vertexCount; ++v) {
+                    float pos[3];
+                    std::memcpy(pos, vp + (size_t)v * vStride, sizeof(pos));
+                    const float dx = pos[0] - m.localCenter[0];
+                    const float dy = pos[1] - m.localCenter[1];
+                    const float dz = pos[2] - m.localCenter[2];
+                    const float d2 = dx*dx + dy*dy + dz*dz;
+                    if (d2 > r2) { r2 = d2; }
+                }
+                m.localRadius = std::sqrt(r2);
+                // Any upload invalidates the last-seen world record (recycled slots must not
+                // cast at the OLD object's transform); it refreshes the next frame the part is
+                // drawn. Morph re-uploads refresh the same frame (upload precedes renderScene).
+                m.lastWorldFrame = 0;
+            }
+
             // A re-upload at the SAME shape (vertex/index count + skinned flag) MIGHT be an
             // animated morph. But only a CONSECUTIVE-frame streak proves it — promote those to
             // the upload-heap ring (fence-free memcpy). Non-consecutive re-uploads (cell churn /
@@ -9711,6 +10446,24 @@ namespace ForgeRender {
         if (g_live.pHizCmd)          { exitCmd(R, g_live.pHizCmd); }
         if (g_live.pHizCmdPool)      { exitCmdPool(R, g_live.pHizCmdPool); }
         if (g_live.pHiz)             { removeResource(g_live.pHiz); }
+        // P1 point-light shadows.
+        if (g_live.pShadowMaskSet)       { removeDescriptorSet(R, g_live.pShadowMaskSet); }
+        if (g_live.pShadowFaceSet)       { removeDescriptorSet(R, g_live.pShadowFaceSet); }
+        if (g_live.pShadowBatchSet)      { removeDescriptorSet(R, g_live.pShadowBatchSet); }
+        if (g_live.pShadowWorldsBuf)     { removeResource(g_live.pShadowWorldsBuf); }
+        if (g_live.pShadowInstanceBuf)   { removeResource(g_live.pShadowInstanceBuf); }
+        if (g_live.pShadowMaskPipeline)  { removePipeline(R, g_live.pShadowMaskPipeline); }
+        if (g_live.pShadowMaskShader)    { removeShader(R, g_live.pShadowMaskShader); }
+        if (g_live.pShadowClearPipeline) { removePipeline(R, g_live.pShadowClearPipeline); }
+        if (g_live.pShadowClearShader)   { removeShader(R, g_live.pShadowClearShader); }
+        if (g_live.pShadowPipeline)       { removePipeline(R, g_live.pShadowPipeline); }
+        if (g_live.pShadowPipelineMirror) { removePipeline(R, g_live.pShadowPipelineMirror); }
+        for (uint32_t f = 0; f < kShadowFaceCbvs; ++f) {
+            if (g_live.pShadowFaceCbv[f]) { removeResource(g_live.pShadowFaceCbv[f]); }
+        }
+        if (g_live.pShadowMaskParamsCbv) { removeResource(g_live.pShadowMaskParamsCbv); }
+        if (g_live.pShadowMask)          { removeResource(g_live.pShadowMask); }
+        if (g_live.pShadowAtlas)         { removeRenderTarget(R, g_live.pShadowAtlas); }
         // Tier 2 compute (linearize + GTAO + AO bilateral blur).
         if (g_live.pAOBlurSet)      { removeDescriptorSet(R, g_live.pAOBlurSet); }
         if (g_live.pGtaoBatchSet)   { removeDescriptorSet(R, g_live.pGtaoBatchSet); }

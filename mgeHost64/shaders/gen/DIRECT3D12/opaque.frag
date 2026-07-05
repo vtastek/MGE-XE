@@ -1057,8 +1057,14 @@ STRUCT(LightData)
 
 
 
+
+        Tex2D(uint2) gShadowMask :  register(t6,space1);
+
+
+
+
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 135 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 141 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 896 ] :  register(t0,space0);
 
 
@@ -1155,6 +1161,18 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
             att *= 1.0f - smoothstep(radius, 2.0f * radius, dist);
 
+
+
+
+            uint slotP1 = (uint)gLights.lights[i * 3u + 2u].w;
+            if (slotP1 != 0u)
+            {
+                uint2 mw = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xy;
+                uint s = slotP1 - 1u;
+                uint nib = ((s < 8u ? mw.x : mw.y) >> ((s & 7u) * 4u)) & 0xFu;
+                att *= float(nib) * (1.0f / 15.0f);
+            }
+
             float lambert = saturate(dot(N, toLight) * invDist);
             d += lambert * att * lightCol;
         }
@@ -1227,6 +1245,11 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     }
     if (dbg == 8u) {
         return (float4(N * 0.5f + 0.5f, 1.0f));
+    }
+    if (dbg == 10u) {
+        uint2 mw = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xy;
+        float g = float(mw.x & 0xFu) * (1.0f / 15.0f);
+        return (float4(g, g, g, 1.0f));
     }
     if (dbg == 9u) {
         float t = saturate((float)litCount / 8.0f);

@@ -113,6 +113,12 @@ BEGIN_SRT_NO_AB(SrtData)
         DECL_TEXTURE(PerFrame, Tex2D(float4), gRefractColor)
         DECL_TEXTURE(PerFrame, Tex2D(float4), gSceneLinDepth)
         DECL_TEXTURE(PerFrame, Tex2D(float4), gReflectColor)
+        // P1 point-light shadows: the screen-space visibility mask written by shadowmask.comp
+        // (R32G32_UINT; 4 bits per shadow slot — x = slots 0-7, y = 8-15, 15 = fully lit).
+        // Appended AFTER gReflectColor so every existing PerFrame offset stays stable. Read by
+        // opaque.frag's light loop when a light's falloff.w lane carries slot+1 (host-patched);
+        // multimap.frag joins in P4. All other frags ignore it (harmless null tail elsewhere).
+        DECL_TEXTURE(PerFrame, Tex2D(uint2), gShadowMask)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has

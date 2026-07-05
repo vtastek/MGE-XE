@@ -1,0 +1,99 @@
+// mgeHost64 — P1 point-light shadows: screen-space visibility-mask pass.
+//
+// For each pixel with prepass depth, reconstruct the CAMERA-RELATIVE world position (same
+// invViewProj reconstruction as gtao.comp — lights and worlds are both camera-relative, so
+// the whole test is translation-invariant) and, for every ACTIVE shadow slot, run the
+// analytic cube-face atlas test:
+//
+//   face  = dominant axis of (pixel - light)         } ONE convention table with the host's
+//   uv    = standard D3D cube lookup for that face   } buildShadowFaceVP (D3D face order
+//   ref   = reverse-Z depth n(f-z)/(z(f-n)) along the face axis, n = maskParams.y, f = 2r
+//
+// stored > ref * (1+slack) means a caster is meaningfully NEARER the light than this pixel
+// (reverse-Z: nearer = larger) → shadowed. The 4-bit visibility (hard 0/15 in P1; PCF is the
+// P5 polish) packs into the R32G32_UINT mask the forward frags load per light.
+//
+// This whole file is HOT-RELOADABLE (rides the gtao dxil mtime poll / F8) — bias/debug
+// experiments never need a host restart.
+
+#include "shadowmask.srt.h"
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(8, 8, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    int2  px   = int2(DispatchThreadID.xy);
+    uint2 mask = uint2(0xFFFFFFFFu, 0xFFFFFFFFu);   // default: every slot fully lit
+
+    float2 invScreen  = gShadowMaskParams.screenParams.zw;
+    uint   activeBits = (uint)gShadowMaskParams.maskParams.x;
+    uint   dbg        = (uint)gShadowMaskParams.maskParams.w;
+    float  deviceZ    = LoadTex2D(gShadowLinDepth, NO_SAMPLER, px, 0).r;
+
+    // Reverse-Z far/cleared = 0.0 (sky / no geometry) → leave fully lit.
+    if (deviceZ > 0.0f && activeBits != 0u)
+    {
+        float2 uv   = (float2(px) + 0.5f) * invScreen;
+        float  ndcX = uv.x * 2.0f - 1.0f;
+        float  ndcY = 1.0f - uv.y * 2.0f;
+        float4 wp   = mul(gShadowMaskParams.invViewProj, float4(ndcX, ndcY, deviceZ, 1.0f));
+        float3 P    = wp.xyz / wp.w;                   // camera-relative world position
+
+        for (uint s = 0u; s < (uint)MAX_SHADOW_SLOTS; ++s)
+        {
+            if ((activeBits & (1u << s)) == 0u) { continue; }
+            float4 posRad = gShadowMaskParams.slotPosRad[s];
+            float4 tile   = gShadowMaskParams.slotTile[s];
+            float3 d      = P - posRad.xyz;            // light -> pixel
+            float  nearZ  = gShadowMaskParams.maskParams.y;
+            float  farZ   = 2.0f * posRad.w;           // shadow range = the light's soft-cutoff end
+            float3 ad     = abs(d);
+
+            // Dominant-axis face pick + face UV — standard D3D cube order (+X -X +Y -Y +Z -Z).
+            uint  face; float ma; float u; float v;
+            if (ad.x >= ad.y && ad.x >= ad.z) { ma = ad.x; face = d.x > 0.0f ? 0u : 1u;
+                                                u  = d.x > 0.0f ? -d.z :  d.z; v = -d.y; }
+            else if (ad.y >= ad.z)            { ma = ad.y; face = d.y > 0.0f ? 2u : 3u;
+                                                u  = d.x; v = d.y > 0.0f ? d.z : -d.z; }
+            else                              { ma = ad.z; face = d.z > 0.0f ? 4u : 5u;
+                                                u  = d.z > 0.0f ?  d.x : -d.x; v = -d.y; }
+
+            uint nib = 15u;
+            if (ma > nearZ && ma < farZ)
+            {
+                // Texel-inset gutter: clamp inside this face's sub-tile so the tap can never
+                // land on a neighbouring face's texels.
+                float  inset = 1.0f / tile.z;
+                float2 fuv   = clamp(float2(u, v) / ma * 0.5f + 0.5f,
+                                     f2(inset), f2(1.0f - inset));
+                float2 fpx   = float2(tile.x + float(face % 3u) * tile.z,
+                                      tile.y + float(face / 3u) * tile.z);
+                float  stored = LoadTex2D(gShadowAtlas, NO_SAMPLER, int2(fpx + fuv * tile.z), 0).r;
+
+                // Reverse-Z reference along the face axis; nearer = larger. Relative slack +
+                // epsilon = the acne knob (PSO bias already pushed casters slightly farther).
+                float refZ = nearZ * (farZ - ma) / (ma * (farZ - nearZ));
+                bool  shadowed = stored > refZ * (1.0f + gShadowMaskParams.maskParams.z) + 1e-6f;
+                nib = shadowed ? 0u : 15u;
+            }
+            if (dbg == 1u) { nib = (face + 1u) * 2u; }   // face-id bands (convention check FIRST)
+            if (dbg == 2u)
+            {
+                // Atlas view: map the whole screen onto this slot's 3x2 face block and show the
+                // stored reverse-Z depth (sqrt-boosted so far values aren't crushed black).
+                float2 suv = float2(px) * invScreen;
+                int2   tpx = int2(tile.x + suv.x * tile.z * 3.0f, tile.y + suv.y * tile.z * 2.0f);
+                float  az  = LoadTex2D(gShadowAtlas, NO_SAMPLER, tpx, 0).r;
+                nib = (uint)(saturate(sqrt(az)) * 15.0f);
+            }
+
+            uint sh = (s & 7u) * 4u;
+            if (s < 8u) { mask.x = (mask.x & ~(0xFu << sh)) | (nib << sh); }
+            else        { mask.y = (mask.y & ~(0xFu << sh)) | (nib << sh); }
+        }
+    }
+
+    Write2D(gShadowMaskOut, px, mask);
+    RETURN();
+}

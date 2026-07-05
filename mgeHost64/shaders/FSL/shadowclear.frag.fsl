@@ -1,0 +1,14 @@
+// mgeHost64 — P1 point-light shadows: per-tile atlas clear (fragment stage).
+// Depth-only pipeline (0 render targets); the depth write is the whole job.
+
+STRUCT(VSOut)
+{
+    DATA(float4, Position, SV_Position);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+void PS_MAIN( VSOut In )
+{
+    INIT_MAIN;
+    RETURN();
+}
