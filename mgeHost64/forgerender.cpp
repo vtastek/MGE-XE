@@ -4632,6 +4632,36 @@ namespace ForgeRender {
                 std::memcpy(lc + 16, lightBlob, (size_t)nL * sizeof(IPC::PointLightWire));
             }
             g_lastLightCount = nL;
+
+            // --- P2 light identity (LOG-ONLY) --------------------------------------------
+            // The client packs a persistent 24-bit id + 8-bit change flags into each light's
+            // color.w lane (packLightIdFlags; the frag reads only color.rgb so the bits are
+            // inert on the GPU). P2 just parses + logs to prove identity is stable — P3 wires
+            // the id into the shadow slot manager (hold a slot on an id, not on a position
+            // tolerance). Throttled: a line on any spawn/recycle frame (>=20 frames apart) and
+            // a heartbeat every 240 frames, so a cell-change id refresh is visible without spam.
+            {
+                const float* lf = (const float*)lc;
+                uint32_t nNew = 0, nMoved = 0, idMin = 0xFFFFFFFFu, idMax = 0, firstId = 0;
+                for (uint32_t i = 0; i < nL; ++i) {
+                    uint32_t id, flags;
+                    IPC::unpackLightIdFlags(lf[4 + i * 12 + 7], id, flags);
+                    if (i == 0) { firstId = id; }
+                    if (flags & IPC::kLightFlagNew)   { ++nNew; }
+                    if (flags & IPC::kLightFlagMoved) { ++nMoved; }
+                    if (id < idMin) { idMin = id; }
+                    if (id > idMax) { idMax = id; }
+                }
+                static uint64_t s_lastLightIdLog = 0;
+                const bool spawn = (nNew > 0) && (g_renderFrame - s_lastLightIdLog >= 20);
+                const bool beat  = (g_renderFrame - s_lastLightIdLog >= 240);
+                if (nL && (spawn || beat)) {
+                    LOG::logline(">> [p2-lightid] f=%llu lights=%u ids[%u..%u] new=%u moved=%u first=%u",
+                                 (unsigned long long)g_renderFrame, nL,
+                                 (idMin == 0xFFFFFFFFu ? 0u : idMin), idMax, nNew, nMoved, firstId);
+                    s_lastLightIdLog = g_renderFrame;
+                }
+            }
         }
 
         // --- P1 shadow manager STUB: argmax-importance light -> slot 0, all 6 faces re-rendered

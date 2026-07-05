@@ -124,6 +124,10 @@ namespace MGE::SceneGraph {
             out.falloff[2] = pl->quadraticAttenuation;
 
             out.radius = pl->specular.r;
+
+            // P2: stable per-frame identity key. Downstream tracking recycles it when a freed
+            // NiLight's address is reused (frame-gap + teleport guards in buildLightList).
+            out.source = pl;
             return out;
         }
 

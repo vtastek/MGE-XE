@@ -12,6 +12,7 @@
 // Per-frame draw lists (M1c) reference the same slots.
 
 #include <cstdint>
+#include <cstring>   // std::memcpy — bit-copy for the packed light-identity lane
 
 namespace IPC {
 
@@ -178,9 +179,32 @@ namespace IPC {
     // color client-side (the main cache path uses 1.0, so this is identity today).
     struct PointLightWire {
         float posRadius[4];   // xyz = world position, w = soft-cutoff radius (specular.r)
-        float color[4];       // xyz = diffuse rgb (dimmer- and pointLightMult-scaled); w unused
-        float falloff[4];     // x = k0 const, y = k1 linear, z = k2 quad; w unused
+        float color[4];       // xyz = diffuse rgb (dimmer- and pointLightMult-scaled);
+                              // w = P2 identity lane: packLightIdFlags() bits (id<<8 | flags).
+                              // The frag reads only .rgb, so the bit pattern is inert on the GPU.
+        float falloff[4];     // x = k0 const, y = k1 linear, z = k2 quad; w = shadow slot+1
+                              // (host-patched by the shadow manager; 0 = unshadowed)
     };
+
+    // P2 light identity/change flags. Packed by the client into PointLightWire::color[3] (an
+    // unused-by-shader lane) and read back by the host shadow manager (P2 = log-only; P3 uses
+    // it to hold a slot across frames without the position-tolerance hack). 24-bit id + 8-bit
+    // flags carried as the float's raw bits — NOT a numeric float value; always bit-copy.
+    constexpr std::uint32_t kLightFlagMoved = 1u << 0;   // moved > 0.5u since last seen
+    constexpr std::uint32_t kLightFlagNew   = 1u << 1;   // fresh id this frame (spawn / recycle)
+
+    inline float packLightIdFlags(std::uint32_t id, std::uint32_t flags) {
+        const std::uint32_t bits = ((id & 0x00FFFFFFu) << 8) | (flags & 0xFFu);
+        float f;
+        std::memcpy(&f, &bits, sizeof(f));
+        return f;
+    }
+    inline void unpackLightIdFlags(float lane, std::uint32_t& id, std::uint32_t& flags) {
+        std::uint32_t bits;
+        std::memcpy(&bits, &lane, sizeof(bits));
+        id    = bits >> 8;
+        flags = bits & 0xFFu;
+    }
 
     // Per-frame point-light cap. The frag loops a bounded working set (Tier 3a is the
     // correctness-first, no-cull step); Tier 3b clustered culling lifts this. MUST match the
