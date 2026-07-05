@@ -57,6 +57,14 @@ namespace MGE::SceneGraph {
         float diffuse[3];    // pl->diffuse.rgb * pl->dimmer
         float falloff[3];    // (constantAttenuation, linearAttenuation, quadraticAttenuation)
         float radius;        // specular.r — Bethesda's modder-set fade radius
+        // P2 light identity: the source NI::PointLight* (opaque — consumers that can't take
+        // NI headers still get a stable per-frame key). A persistent light keeps the same
+        // pointer across frames; a freed lantern's NiLight can have its address recycled by a
+        // new light, so downstream identity tracking (renderprocess buildLightList) still
+        // guards recycled pointers by frame-gap + teleport distance. Excluded from nothing —
+        // it participates in the change-detection memcmp, but a live light's pointer is stable,
+        // so it never trips a spurious frameRevision bump.
+        const void* source;
     };
     const std::vector<PointLight>& pointLights();
 

@@ -140,6 +140,25 @@ namespace {
     std::vector<std::uint8_t>                 g_skinnedScratch;     // packed [SkinnedDrawWire][palette]* this frame
     std::vector<std::uint8_t>                 g_multiMapScratch;    // packed MultiMapDrawWire[] this frame (Tier 4)
     std::vector<std::uint8_t>                 g_lightScratch;       // packed PointLightWire[] this frame
+
+    // --- P2 light identity tracking -------------------------------------------------------
+    // Persistent per-light id across frames, keyed by the scene-graph snapshot's stable
+    // NI::PointLight* (PointLight::source). Feeds the host shadow manager a real identity
+    // (P2 = log-only; P3 holds a shadow slot on the id instead of the position-tolerance
+    // hack). A live light keeps its id; the id is RECYCLED (fresh + NEW flag) when the same
+    // pointer resurfaces after a long gap (a freed NiLight's address reused) OR teleports
+    // farther than max(2r, floor) in one step (cell-door swap onto the same address).
+    struct LightTrack {
+        std::uint32_t id;
+        std::uint32_t lastFrame;    // g_frame it was last seen
+        float         lastPos[3];   // world position when last seen (for moved / teleport test)
+    };
+    std::unordered_map<const void*, LightTrack> g_lightTracks;
+    std::uint32_t                               g_nextLightId = 1;   // 0 = "no identity"
+    constexpr std::uint32_t kLightIdGapFrames = 10;      // gap > this frames -> recycle id
+    constexpr float         kLightIdJumpFloor = 512.0f;  // teleport floor (min of the 2r/floor test)
+    constexpr float         kLightMovedEps    = 0.5f;    // moved flag threshold (world units)
+    constexpr std::uint32_t kLightTrackEvict  = 300u;    // drop map entries unseen this long
     std::vector<std::uint8_t>                 g_skyScratch;         // packed SkyDrawWire[] this frame (SK1)
     std::vector<std::uint8_t>                 g_alphaScratch;       // packed AlphaDrawWire[] this frame (AT1, back-to-front)
 
@@ -1450,6 +1469,36 @@ namespace {
         std::uint32_t count = 0;
         std::uint32_t culled = 0;
         for (const auto& pl : lights) {
+            // P2: resolve persistent identity BEFORE the frustum cull so a light that steps
+            // off-screen keeps its id + lastPos updated (it can't recycle just for being culled).
+            std::uint32_t id = 0, flags = 0;
+            {
+                const float* p = pl.worldPos;
+                auto it = g_lightTracks.find(pl.source);
+                if (it == g_lightTracks.end()) {
+                    LightTrack t{ g_nextLightId++, g_frame, { p[0], p[1], p[2] } };
+                    g_lightTracks.emplace(pl.source, t);
+                    id = t.id;
+                    flags = IPC::kLightFlagNew;
+                } else {
+                    LightTrack& t = it->second;
+                    const float dx = p[0] - t.lastPos[0];
+                    const float dy = p[1] - t.lastPos[1];
+                    const float dz = p[2] - t.lastPos[2];
+                    const float d2 = dx*dx + dy*dy + dz*dz;
+                    const float jump = std::max(2.0f * pl.radius, kLightIdJumpFloor);
+                    if ((g_frame - t.lastFrame) > kLightIdGapFrames || d2 > jump * jump) {
+                        t.id = g_nextLightId++;       // recycled address -> new light
+                        flags = IPC::kLightFlagNew;
+                    } else if (d2 > kLightMovedEps * kLightMovedEps) {
+                        flags = IPC::kLightFlagMoved;
+                    }
+                    id = t.id;
+                    t.lastFrame  = g_frame;
+                    t.lastPos[0] = p[0]; t.lastPos[1] = p[1]; t.lastPos[2] = p[2];
+                }
+            }
+
             BoundingSphere ls;
             ls.center = D3DXVECTOR3(pl.worldPos[0], pl.worldPos[1], pl.worldPos[2]);
             ls.radius = 2.0f * pl.radius;
@@ -1476,7 +1525,7 @@ namespace {
             w.color[0] = pl.diffuse[0] * pointLightMult;
             w.color[1] = pl.diffuse[1] * pointLightMult;
             w.color[2] = pl.diffuse[2] * pointLightMult;
-            w.color[3] = 0.0f;
+            w.color[3] = IPC::packLightIdFlags(id, flags);   // P2 identity lane (shader ignores .w)
             w.falloff[0] = pl.falloff[0];
             w.falloff[1] = pl.falloff[1];
             w.falloff[2] = pl.falloff[2];
@@ -1485,6 +1534,17 @@ namespace {
             g_lightScratch.resize(at + sizeof(w));
             memcpy(g_lightScratch.data() + at, &w, sizeof(w));
             ++count;
+        }
+
+        // Evict identity entries whose light hasn't been seen in a long time (cell changes drop
+        // whole lantern sets — their pointers age out here so the map stays bounded and a future
+        // NiLight reusing an old address is guaranteed a fresh id via the not-found path).
+        for (auto it = g_lightTracks.begin(); it != g_lightTracks.end(); ) {
+            if (g_frame - it->second.lastFrame > kLightTrackEvict) {
+                it = g_lightTracks.erase(it);
+            } else {
+                ++it;
+            }
         }
         return count;
     }
