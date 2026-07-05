@@ -958,7 +958,7 @@ SamplerState gSamplerAnisotropic : register( s10 , space100 ) ;
 #line 167 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 102 "FSL/shaders.list"
+#line 112 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
 #line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1057,8 +1057,14 @@ STRUCT(LightData)
 
 
 
+
+        Tex2D(uint2) gShadowMask :  register(t6,space1);
+
+
+
+
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 135 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 141 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 896 ] :  register(t0,space0);
 
 
@@ -1138,4 +1144,4 @@ VSOutput VS_MAIN( VSInput In )
     Out.Clip = dot(gFrameData.gReflWaterClip.xyz, worldPos.xyz) + gFrameData.gReflWaterClip.w;
     return (Out);
 }
-#line 103 "FSL/shaders.list"
+#line 113 "FSL/shaders.list"

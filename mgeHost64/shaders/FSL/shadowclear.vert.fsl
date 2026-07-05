@@ -1,0 +1,26 @@
+// mgeHost64 — P1 point-light shadows: per-tile atlas clear (vertex stage).
+//
+// A viewport-covering triangle at z = 0 (the reverse-Z far plane == the atlas clear value),
+// drawn with CMP_ALWAYS + depth write before a tile's casters. This is the per-TILE clear:
+// a LOAD_ACTION_CLEAR on the atlas would wipe every cached tile, not just the one being
+// re-rendered. No vertex buffer — SV_VertexID fullscreen-triangle pattern (09's display.vert);
+// the viewport/scissor confine it to the face tile.
+
+STRUCT(VSOut)
+{
+    DATA(float4, Position, SV_Position);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+VSOut VS_MAIN( SV_VertexID(uint) VertexID )
+{
+    INIT_MAIN;
+    VSOut Out;
+    float4 position;
+    position.x = (VertexID == 2) ? 3.0 : -1.0;
+    position.y = (VertexID == 0) ? -3.0 : 1.0;
+    position.z = 0.0;   // reverse-Z far
+    position.w = 1.0;
+    Out.Position = position;
+    RETURN(Out);
+}

@@ -958,165 +958,33 @@ SamplerState gSamplerAnisotropic : register( s10 , space100 ) ;
 #line 167 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 78 "FSL/shaders.list"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sky.vert.fsl"
-#line 16 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sky.vert.fsl"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-#line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-STRUCT(FrameData)
-{
-    float4x4 viewProj;
+#line 55 "FSL/shaders.list"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowclear.vert.fsl"
 
 
 
-    float4 sunDir;
-    float4 sunCol;
-    float4 ambCol;
-    float4 fogColNear;
-    float4 fogParams;
-    float4 eyePos;
 
 
-    float4 debugParams;
 
 
 
-    float4 dbgScales;
-
-
-
-
-    float4 lodParams;
-
-    float4 lodSunAmb;
-
-
-
-
-    float4 lodEye;
-
-
-
-
-    float4 skyParams;
-
-
-
-
-
-
-    float4 gReflWaterClip;
-
-
-
-
-    float4 skyZenith;
-#line 75
-};
-
-STRUCT(BatchData)
-{
-    float4x4 worlds[ 1024 ];
-#line 80
-};
-
-
-
-
-
-
-
-
-STRUCT(LightData)
-{
-    float4 lightParams;
-    float4 lights[ 128  * 3];
-#line 93
-};
-
-        CBUFFER(FrameData) gFrameData :  register(b0,space1);
-
-
-
-
-
-        Tex2D(float4) gAO :  register(t1,space1);
-
-
-
-
-
-
-
-
-        Tex3D(float4) gWaterNormalVol :  register(t2,space1);
-        Tex2D(float4) gRefractColor :  register(t3,space1);
-        Tex2D(float4) gSceneLinDepth :  register(t4,space1);
-        Tex2D(float4) gReflectColor :  register(t5,space1);
-
-
-
-
-
-        Tex2D(uint2) gShadowMask :  register(t6,space1);
-
-
-
-
-        CBUFFER(LightData) gLights :  register(b0,space3);
-#line 141 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-        Tex2D(float4) gTextures[ 896 ] :  register(t0,space0);
-
-
-
-        Tex2DArray(float4) gStaticsArrays[ 128 ] :  register(t896,space0);
-        CBUFFER(BatchData) gBatch :  register(b0,space2);
-#line 17 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/sky.vert.fsl"
-
-STRUCT(VSInput)
-{
-    DATA(float3, Position, POSITION);
-    DATA(float2, Uv, TEXCOORD0);
-    DATA(float4, Color, COLOR);
-    DATA(uint, DrawIndex, TEXCOORD1);
-    DATA(uint, TexAlpha, TEXCOORD2);
-    DATA(float3, MatDiffuse, TEXCOORD3);
-    DATA(uint, MatAlphaBits,TEXCOORD6);
-#line 27
-};
-
-STRUCT(VSOutput)
+STRUCT(VSOut)
 {
     DATA(float4, Position, SV_Position);
-    DATA(float2, Uv, TEXCOORD0);
-    DATA(float4, Color, COLOR);
-    DATA(FLAT(uint), TexIndex, TEXCOORD1);
-    DATA(FLAT(float3),MatDiffuse, TEXCOORD2);
-    DATA(FLAT(uint), VColSource, TEXCOORD3);
-    DATA(FLAT(float), MatAlpha, TEXCOORD4);
-    DATA(float3, WorldDir, TEXCOORD5);
-#line 39
+#line 12
 };
 
 [RootSignature( "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)" )]
-VSOutput VS_MAIN( VSInput In )
+VSOut VS_MAIN( uint VertexID : SV_VERTEXID )
 {
     //INIT_MAIN;
-    VSOutput Out;
-
-    float4x4 world = gBatch.worlds[In.DrawIndex];
-    float4 worldPos = mul(world, float4(In.Position, 1.0f));
-    Out.Position = mul(gFrameData.viewProj, worldPos);
-    Out.Uv = In.Uv;
-    Out.Color = In.Color;
-    Out.TexIndex = In.TexAlpha & 0xFFFFu;
-    Out.VColSource = (In.TexAlpha >> 24u) & 0x3u;
-    Out.MatDiffuse = In.MatDiffuse;
-    Out.MatAlpha = asfloat(In.MatAlphaBits);
-
-
-
-    Out.WorldDir = worldPos.xyz;
+    VSOut Out;
+    float4 position;
+    position.x = (VertexID == 2) ? 3.0 : -1.0;
+    position.y = (VertexID == 0) ? -3.0 : 1.0;
+    position.z = 0.0;
+    position.w = 1.0;
+    Out.Position = position;
     return (Out);
 }
-#line 79 "FSL/shaders.list"
+#line 56 "FSL/shaders.list"

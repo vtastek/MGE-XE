@@ -49,6 +49,16 @@
 #include "depthonly_mm.frag.fsl"
 #end
 
+// P1 point-light shadows: per-tile atlas clear (viewport-covering triangle at z=0,
+// CMP_ALWAYS + write — LOAD_ACTION_CLEAR would wipe every cached tile). Depth-only PSO.
+#vert shadowclear.vert
+#include "shadowclear.vert.fsl"
+#end
+
+#frag shadowclear.frag
+#include "shadowclear.frag.fsl"
+#end
+
 #vert skinned.vert
 #include "skinned.vert.fsl"
 #end
@@ -146,6 +156,13 @@
 // AO bilateral blur: third compute pass — denoises pAO -> pAOBlur (depth-aware, no silhouette bleed).
 #comp aoblur.comp
 #include "aoblur.comp.fsl"
+#end
+
+// P1 point-light shadows: screen-space visibility mask. Reads the RESOLVED single-sample
+// prepass depth (pLinearDepth) — no MSAA variants needed — plus the shadow atlas; writes the
+// R32G32_UINT per-slot mask the forward frags load. Hot-reloadable (rides the gtao mtime poll).
+#comp shadowmask.comp
+#include "shadowmask.comp.fsl"
 #end
 
 // Hi-Z mip-pyramid build (occlusion M2). FIRST copies sample 0 of the scene DSV (pDepth, FULL

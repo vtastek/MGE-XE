@@ -96,6 +96,18 @@ float4 PS_MAIN( VSOutput In )
             // has no hard seam (matches evalOnePointLight / OpenMW PerObjectUniform).
             att *= 1.0f - smoothstep(radius, 2.0f * radius, dist);
 
+            // P1 point-light shadows: the host patches falloff.w = shadow slot + 1 (0 = no
+            // shadow). shadowmask.comp already did the cube-face atlas test for this pixel —
+            // the slot's 4-bit visibility just scales the light (15 = lit, 0 = shadowed).
+            uint slotP1 = (uint)gLights.lights[i * 3u + 2u].w;
+            if (slotP1 != 0u)
+            {
+                uint2 mw  = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xy;
+                uint  s   = slotP1 - 1u;
+                uint  nib = ((s < 8u ? mw.x : mw.y) >> ((s & 7u) * 4u)) & 0xFu;
+                att *= float(nib) * (1.0f / 15.0f);
+            }
+
             float  lambert = saturate(dot(N, toLight) * invDist);
             d += lambert * att * lightCol;
         }
@@ -168,6 +180,11 @@ float4 PS_MAIN( VSOutput In )
     }
     if (dbg == 8u) {                                                        // mode 8: world-space normal (RGB = N*0.5+0.5)
         RETURN(float4(N * 0.5f + 0.5f, 1.0f));
+    }
+    if (dbg == 10u) {   // mode 10: shadow-mask slot 0 nibble (also shadowmask.comp's debug output channel)
+        uint2 mw = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xy;
+        float g = float(mw.x & 0xFu) * (1.0f / 15.0f);
+        RETURN(float4(g, g, g, 1.0f));
     }
     if (dbg == 9u) {                                                        // mode 9: point-light count heatmap (0 black→blue→green→yellow→red)
         float t = saturate((float)litCount / 8.0f);
