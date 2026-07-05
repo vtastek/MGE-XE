@@ -197,6 +197,12 @@ namespace MGE::GeometryCache {
 
     const std::unordered_map<uint32_t, CachedGeometry>& cache();
 
+    // Drain the keys the eviction sweep dropped since the last call (objects that left the world
+    // within a cell — picked up, despawned, disabled). The Forge feed maps each to its host mesh
+    // slot and ships a release sentinel so the host forgets the slot's shadow-caster record.
+    // Moves the internal list into `out` and clears it (so each key is delivered exactly once).
+    void takeEvictedKeys(std::vector<uint32_t>& out);
+
     // The cache's frame counter (incremented by each onFrameReady). Eviction is a
     // periodic sweep, not per-frame, so consumers that scan the WHOLE cache must
     // treat entries with lastFrame != currentFrame() as stale (not in the scene this

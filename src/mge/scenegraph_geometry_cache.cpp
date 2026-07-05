@@ -64,6 +64,11 @@ namespace MGE::GeometryCache {
         const char*       g_nullBoneSampleTex     = nullptr; // a sample part's texture
 
         std::unordered_map<uint32_t, CachedGeometry>      g_cache;
+        // Keys evicted by the sweep since the last drain (object left the world within a cell).
+        // The Forge feed drains these each frame (takeEvictedKeys) to release the matching host
+        // mesh slot so its shadow-caster record stops ghosting. Only the "genuinely gone" sweep
+        // eviction feeds this — NOT the identity-mismatch rebuild (that reuses the same key/slot).
+        std::vector<uint32_t>                             g_evictedKeys;
         // Character-subtree verdict per NiNode* (walk()'s "does any direct child carry
         // a skin" look-ahead). The scan is O(children) RTTI checks per node PER FRAME
         // and character assemblies essentially never change, so the verdict is computed
@@ -1364,6 +1369,18 @@ namespace MGE::GeometryCache {
             }
         }
 
+        // Precise gone-detection for the sweep. On W3 live-read frames runRefreshWalks is
+        // skipped, so the sweep below can only AGE entries out (kFarKeepFrames ~3.6s at 165fps) —
+        // a picked-up / despawned object's shadow-caster record then lingers that long before its
+        // slot-release ships (the drop/pickup ghost delay). Force ONE full walk on sweep frames so
+        // the walk-based "visitable but unvisited = gone" rule fires instead: a removed near object
+        // is evicted (and released) within one sweep interval (~0.18s at 165fps), while culled-but-
+        // resident objects are re-stamped by the walk and correctly kept. Cost: a full graph walk
+        // 1-in-kEvictSweepInterval frames (idempotent if the walk already ran this frame).
+        if (g_frame % kEvictSweepInterval == 0) {
+            ensureFullWalk();
+        }
+
         // Deferred eviction sweep (see kEvictSweepInterval declaration): drop entries
         // the walk hasn't touched since the last sweep. Consumers that scan the whole
         // cache filter on lastFrame == currentFrame() (buildSkyDrawList, the visible-set
@@ -1389,7 +1406,15 @@ namespace MGE::GeometryCache {
                 bool evict;
                 if (walkedThisFrame) {
                     evict = (e.lastFrame != g_frame);
-                    if (evict && g_gateRadius > 0.0f && g_frame - e.lastFrame <= kFarKeepFrames) {
+                    // Far-keep hysteresis: a stale entry BEYOND the gate radius was gate-SKIPPED by
+                    // this frame's walk, not removed — keep it (returning player pays no re-upload).
+                    // Gate this on g_gateThisFrame (armed THIS frame, so g_gateEye is current), NOT
+                    // the persisted g_gateRadius: after exterior->interior the radius lingers >0 while
+                    // g_gateEye still points at the old exterior camera, so a dropped-at-your-feet
+                    // interior item measured against that stale eye looks "far" and was wrongly held
+                    // the full kFarKeepFrames (~3.6s) before aging out — the delayed drop/pickup ghost.
+                    // When the gate isn't armed this frame the walk covered everything → unvisited = gone.
+                    if (evict && g_gateThisFrame && g_frame - e.lastFrame <= kFarKeepFrames) {
                         const float dx = e.worldTransformD3D[12] - g_gateEye[0];
                         const float dy = e.worldTransformD3D[13] - g_gateEye[1];
                         const float dz = e.worldTransformD3D[14] - g_gateEye[2];
@@ -1401,6 +1426,7 @@ namespace MGE::GeometryCache {
                     evict = (g_frame - e.lastFrame > kFarKeepFrames);
                 }
                 if (evict) {
+                    g_evictedKeys.push_back(it->first);   // tell the Forge feed to release the host slot
                     releaseEntry(e);
                     it = g_cache.erase(it);
                 } else {
@@ -1484,6 +1510,11 @@ namespace MGE::GeometryCache {
 
     uint64_t currentFrame() {
         return g_frame;
+    }
+
+    void takeEvictedKeys(std::vector<uint32_t>& out) {
+        out.clear();
+        out.swap(g_evictedKeys);   // move-out + leave g_evictedKeys empty for the next sweep
     }
 
     const CachedGeometry* ensureLive(uint32_t key) {
