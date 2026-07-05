@@ -8,6 +8,7 @@
 #include "mwbridge.h"
 #include "scenegraph_geometry_cache.h"
 #include "scenegraph.h"
+#include "datahandler_view.h"
 #include "morrowindbsa.h"
 #include "mge_tracy.h"
 
@@ -159,6 +160,17 @@ namespace {
     constexpr float         kLightIdJumpFloor = 512.0f;  // teleport floor (min of the 2r/floor test)
     constexpr float         kLightMovedEps    = 0.5f;    // moved flag threshold (world units)
     constexpr std::uint32_t kLightTrackEvict  = 300u;    // drop map entries unseen this long
+
+    // Cell-change shadow eviction. A load-door transition (interior<->interior/exterior, fast
+    // travel, coc) discontinuously swaps the resident geometry AND recycles NiPointLight
+    // addresses, so a lantern in the NEW cell can inherit an OLD cell's light id (address reuse
+    // inside the recycle window at a similar local position) and, host-side, keep sampling the
+    // previous cell's cached shadow tile — the "shadows from another interior" bug. This monotonic
+    // epoch is bumped on any such transition (shipped in lighting[19]); the host evicts every
+    // shadow slot + stale caster record when it changes, and the client drops all identity tracks
+    // so every new-cell light takes a fresh id. Continuous exterior walking never trips it.
+    std::uint32_t                               g_cellEpoch = 0;
+    constexpr float         kCellTeleportDist = 8192.0f;   // one MW cell moved in ONE frame = teleport
     std::vector<std::uint8_t>                 g_skyScratch;         // packed SkyDrawWire[] this frame (SK1)
     std::vector<std::uint8_t>                 g_alphaScratch;       // packed AlphaDrawWire[] this frame (AT1, back-to-front)
 
@@ -880,11 +892,39 @@ namespace {
         g_texPendingCount = 0;
     }
 
+    // Turn this frame's cache evictions into host slot-release records. An object that LEFT the
+    // world within a cell (picked up into inventory, despawned, MWSE-disabled) is dropped by the
+    // geometry cache's eviction sweep; without a signal the host keeps its last transform as a
+    // persistent SHADOW CASTER and its shadow ghosts in place. Emit a header-only GeomPartWire with
+    // kGeomFlagRelease for each evicted key that owns a host slot, then prune the slot/upload maps
+    // (a re-drop is a new NiTriShape → new key → fresh slot; a recycled key must re-upload, not
+    // dedup-skip). Cross-cell removals are handled separately by the cell-epoch eviction (C1).
+    void drainReleasedSlots() {
+        static std::vector<std::uint32_t> evicted;
+        MGE::GeometryCache::takeEvictedKeys(evicted);
+        for (std::uint32_t key : evicted) {
+            auto ks = g_keySlot.find(key);
+            if (ks == g_keySlot.end()) {
+                continue;   // never had a host slot (culled-only / never shipped)
+            }
+            IPC::GeomPartWire hdr = {};
+            hdr.slot  = ks->second.slot;
+            hdr.flags = IPC::kGeomFlagRelease;   // vertexCount = indexCount = 0 → header-only sentinel
+            const std::size_t at = g_pendingBlob.size();
+            g_pendingBlob.resize(at + sizeof(hdr));
+            memcpy(g_pendingBlob.data() + at, &hdr, sizeof(hdr));
+            ++g_pendingParts;
+            g_keySlot.erase(ks);
+            g_uploadedRev.erase(key);
+        }
+    }
+
     // Drain g_pendingBlob to the host in window-sized whole-part chunks. Parts are
     // self-describing (GeomPartWire carries vert/index counts), so we walk part
     // boundaries to never split a part across a chunk. Blocking RPCs — called at
     // present time. Static cost: each part ships once per (key,revision).
     void flushGeometry() {
+        drainReleasedSlots();   // append host slot-release records before the empty check
         if (!g_geomVec || g_pendingBlob.empty() || g_pendingParts == 0) {
             return;
         }
@@ -1716,6 +1756,29 @@ namespace RenderProcess {
 
         const unsigned frame = g_frame++;
 
+        // Cell-change shadow eviction (see g_cellEpoch): bump the epoch on any load-door
+        // transition BEFORE buildLightList so the cleared identity map hands every new-cell light a
+        // fresh id. Signal = the engine's authoritative interior-cell pointer (covers
+        // interior<->interior and interior<->exterior) OR a single-frame eye teleport (covers
+        // exterior<->exterior load doors / fast travel, which keep the interior pointer null).
+        {
+            void* dh = MGE::SceneGraph::getDataHandler();
+            const void* interiorCell = dh ? MGE::DataHandlerView::currentInteriorCell(dh) : nullptr;
+            const float eye[3] = { DistantLand::eyePos.x, DistantLand::eyePos.y, DistantLand::eyePos.z };
+            static const void* s_lastInteriorCell = nullptr;
+            static float       s_lastEye[3] = { 1e30f, 1e30f, 1e30f };
+            static bool        s_haveEye = false;
+            const float ex = eye[0] - s_lastEye[0], ey = eye[1] - s_lastEye[1], ez = eye[2] - s_lastEye[2];
+            const bool teleport = s_haveEye && (ex*ex + ey*ey + ez*ez > kCellTeleportDist * kCellTeleportDist);
+            if (interiorCell != s_lastInteriorCell || teleport) {
+                ++g_cellEpoch;
+                g_lightTracks.clear();   // new-cell lights all take fresh ids (no address-reuse inheritance)
+            }
+            s_lastInteriorCell = interiorCell;
+            s_lastEye[0] = eye[0]; s_lastEye[1] = eye[1]; s_lastEye[2] = eye[2];
+            s_haveEye = true;
+        }
+
         // Drive the host renderer into the shared RT. Async — the host fence-waits before
         // signalling completion, so at renderSceneFinish the draw is GPU-complete and the
         // resource quiescent before our copy. M1c: build this frame's visible draw list
@@ -1894,7 +1957,9 @@ namespace RenderProcess {
             sunColEff.r,               sunColEff.g,               sunColEff.b,               0.0f,
             ambColEff.r,               ambColEff.g,               ambColEff.b,               0.0f,
             DistantLand::nearFogCol.r, DistantLand::nearFogCol.g, DistantLand::nearFogCol.b, 0.0f,
-            DistantLand::fogNearStart, DistantLand::fogNearEnd,   0.0f,                      0.0f,
+            // [18] free pad; [19] = cell epoch (host lands it in fogParams.w, which no shader reads;
+            // the host shadow manager evicts all slots + caster records when this value changes).
+            DistantLand::fogNearStart, DistantLand::fogNearEnd,   0.0f,                      float(g_cellEpoch),
             // CAMERA-RELATIVE: WorldPos reaches the shader already relative to the eye, so the
             // eyePos used for the per-vertex fog distance |worldPos - eyePos| is the origin (0).
             0.0f,                      0.0f,                      0.0f,                      0.0f,

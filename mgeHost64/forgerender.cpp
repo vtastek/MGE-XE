@@ -1489,6 +1489,13 @@ namespace {
     };
     ShadowSlot g_shadowSlots[kMaxShadowLights];
 
+    // Last cell epoch seen from the client (lighting[19]). A load-door transition bumps it; when it
+    // changes the host evicts EVERY shadow slot (old-cell cached tiles are meaningless in the new
+    // cell) and resets all caster records (stale lastWorld from the old cell must not draw into a
+    // new-cell light's atlas). Fixes "shadows from another interior". ~0u so the first frame with a
+    // real epoch (>=1) triggers a clean reset. See g_cellEpoch (client renderprocess.cpp).
+    uint32_t g_shadowCellEpoch = 0xFFFFFFFFu;
+
     // One scheduled face-block re-render this frame. b = index in g_shadowRenders (< kShadowBudget);
     // GPU caster region base = b*kShadowMaxCasters, face CBV base = b*6. casterBegin/End index the
     // concatenated g_shadowCasters CPU list.
@@ -4639,6 +4646,22 @@ namespace ForgeRender {
             g_eyeAbsShadow[0] = lighting[24];
             g_eyeAbsShadow[1] = lighting[25];
             g_eyeAbsShadow[2] = lighting[26];
+            // Cell-change shadow eviction (see g_shadowCellEpoch): a load door recycles NiPointLight
+            // addresses AND swaps the resident geometry, so an old slot could keep sampling the prior
+            // cell's cached tile while old-cell caster records still draw into new-cell atlases. On any
+            // epoch change wipe ALL slots (nothing cached is valid across cells) and forget every
+            // caster record (only geometry re-drawn in the new cell re-registers), bumping g_casterEpoch
+            // so the re-assigned slots re-render. lighting[19] carries the client's monotonic epoch.
+            const uint32_t cellEpoch = (uint32_t)(int)lighting[19];
+            if (cellEpoch != g_shadowCellEpoch) {
+                g_shadowCellEpoch = cellEpoch;
+                for (uint32_t s = 0; s < kMaxShadowLights; ++s) { g_shadowSlots[s] = ShadowSlot{}; }
+                for (uint32_t s2 = 0; s2 < g_meshHigh; ++s2) {
+                    g_meshes[s2].lastWorldFrame = 0;
+                    g_meshes[s2].everMoved      = false;
+                }
+                g_casterEpoch = g_renderFrame;
+            }
             // C2: lighting[28..31] = skyZenith.rgb (current interpolated zenith sky colour). Host dome
             // gradient (sky.frag) reads FrameData.skyZenith at float index 68..71 (after gReflWaterClip
             // at 64..67). The scene-probe passes only 24 floats, so guard on the null-lighting path.
@@ -10299,6 +10322,20 @@ namespace ForgeRender {
             IPC::GeomPartWire hdr;
             std::memcpy(&hdr, p, sizeof(hdr));
             p += sizeof(hdr);
+
+            // RELEASE sentinel (header-only, no payload): the client's cache evicted this object
+            // (picked up / despawned / disabled WITHIN a cell). Forget its shadow-caster record so
+            // its shadow stops ghosting in place; bump g_casterEpoch so covering shadow slots
+            // re-render without it. Keep the GPU buffers (a later re-upload to this slot rebuilds).
+            if (hdr.flags & IPC::kGeomFlagRelease) {
+                if (hdr.slot < g_meshHigh) {
+                    HostMesh& rm = g_meshes[hdr.slot];
+                    rm.lastWorldFrame = 0;   // drops it from the caster gather (see the == 0 skip)
+                    rm.everMoved      = false;
+                    g_casterEpoch     = g_renderFrame;
+                }
+                continue;
+            }
 
             const bool isSkinned  = (hdr.flags & IPC::kGeomFlagSkinned) != 0;
             const bool isMultiMap = (hdr.flags & IPC::kGeomFlagMultiMap) != 0;

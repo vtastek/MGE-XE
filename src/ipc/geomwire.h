@@ -60,6 +60,12 @@ namespace IPC {
     // GeomPartWire::flags bits.
     constexpr std::uint16_t kGeomFlagSkinned  = 0x1;   // part vertices are SkinnedVertexWire (stride 56)
     constexpr std::uint16_t kGeomFlagMultiMap = 0x2;   // part vertices are GeomVertexWireMM (stride 60)
+    // RELEASE sentinel: the client's geometry cache evicted this slot's object (picked up into
+    // inventory, despawned, MWSE-disabled — gone from the world WITHIN a cell, not a cell change).
+    // The record is header-only (vertexCount = indexCount = 0, no payload). The host forgets the
+    // slot's shadow-caster record so its shadow stops ghosting in place. See renderprocess release
+    // emit + forgerender release handler.
+    constexpr std::uint16_t kGeomFlagRelease  = 0x4;
 
     // Per-part header preceding the part's vertex+index data in the batch blob. When
     // (flags & kGeomFlagSkinned), the part's vertices are SkinnedVertexWire (stride 44)
