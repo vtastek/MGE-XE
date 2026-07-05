@@ -1198,6 +1198,64 @@ namespace MGE::GeometryCache {
         return 1000.0 * (double)c.QuadPart / (double)freq.QuadPart;
     }
 
+    // Raw-offset walk over the active mobile actors: fn(animData, headGeometry) for
+    // every actor that has a head. MGE only pulls SharedSE, so the TES3 structs are
+    // read by raw x86 offset, all validated against the MWSE headers:
+    //   WorldController*        @ 0x7C67DC          (TES3WorldController.cpp:565)
+    //   ->mobManager            +0x5C               (TES3WorldController.h:326)
+    //   ->processManager        +0x24               (TES3MobManager.h:82)
+    //   plannerCount / planners +0x58 / +0x5C[500]  (TES3MobManager.h:19-20)
+    //   AIPlanner->mobileActor  +0x4                (TES3AIData.h:9)
+    //   MobileActor vtbl getAnimationAttachment @ byte 0xCC (TES3MobileObject.h:167)
+    //   AnimationData: headGeometry 0x2E8, headMorphTiming 0x2F4
+    //   (TES3AnimationData.h:43-50)
+    template <typename Fn>
+    static void forEachActorHead(Fn&& fn) {
+        const char* wc = *(const char* const*)0x7C67DC;
+        if (!wc) return;
+        const char* mobMgr = *(const char* const*)(wc + 0x5C);
+        if (!mobMgr) return;
+        const char* procMgr = *(const char* const*)(mobMgr + 0x24);
+        if (!procMgr) return;
+        const uint32_t plannerCount = *(const uint32_t*)(procMgr + 0x58);
+        const char* const* planners = (const char* const*)(procMgr + 0x5C);
+        const uint32_t n = plannerCount > 500u ? 500u : plannerCount;
+        for (uint32_t i = 0; i < n; ++i) {
+            const char* planner = planners[i];
+            if (!planner) continue;
+            const char* actor = *(const char* const*)(planner + 0x4);
+            if (!actor) continue;
+            using GetAnim = const char* (__thiscall*)(const void*);
+            const void* const* vtbl = *(const void* const* const*)actor;
+            const char* anim = ((GetAnim)vtbl[0xCC / 4])(actor);
+            if (!anim) continue;
+            auto* head = *(NI::Geometry* const*)(anim + 0x2E8);
+            if (!head) continue;
+            fn(anim, head);
+        }
+    }
+
+    // Forge lip/blink fix: MW applies the head morph (talk mouth-flap + blink) to
+    // data->vertex only from ITS OWN display of the head — which the msoc owned-display
+    // skip suppresses under Forge takeover, freezing every face at rest pose while the
+    // per-actor clocks keep advancing. AnimationData::headMorphTiming is already mapped
+    // into the morpher's talk/blink key windows, so drive the apply ourselves each
+    // frame: update(timing) evaluates the morph weights at that time, onPreDisplay()
+    // writes the blended verts. Both calls are required — update alone never touches
+    // verts. The clock MUST be headMorphTiming, not the global sim timestamp (~3.7M),
+    // which evaluates outside the key range and zeroes the weights.
+    // Runs before the walks/ensureLive so the same frame's capture sees moved verts.
+    static void driveHeadMorphs() {
+        forEachActorHead([](const char* anim, NI::Geometry* head) {
+            const float timing = *(const float*)(anim + 0x2F4);
+            for (NI::TimeController* c = head->controllers; c; c = c->nextController) {
+                if (!c->isOfType(NI::RTTIStaticPtr::NiGeomMorpherController)) continue;
+                c->vTable.asController->update(c, timing);
+                c->vTable.asController->onPreDisplay(c);
+            }
+        });
+    }
+
     // The full per-frame refresh walk (objects + pick + landscape) over this frame's
     // stored roots. On live-draw-build frames this is skipped in onFrameReady and only
     // runs on demand (ensureFullWalk) when a frame has no classify result to drive
@@ -1262,6 +1320,13 @@ namespace MGE::GeometryCache {
         g_objRoot  = MGE::DataHandlerView::worldObjectRoot(dataHandler);
         g_pickRoot = MGE::DataHandlerView::worldPickObjectRoot(dataHandler);
         g_landRoot = MGE::DataHandlerView::worldLandscapeRoot(dataHandler);
+
+        // Forge lip/blink: the msoc owned-display skip starves MW's own head-morph
+        // apply, so drive it here — BEFORE the walks/ensureLive capture this frame's
+        // verts. DX9 frames (F11 off) keep the engine's own display-time apply.
+        if (RenderProcess::ownsOpaqueWorld()) {
+            driveHeadMorphs();
+        }
 
         // W3 live-read: on Forge-owned frames the refresh walk is dead work — the
         // classify-visible keys are freshened one-by-one off their live NiTriShapes
