@@ -1888,6 +1888,7 @@ namespace MGEgui {
             // 
             // tpDL
             // 
+            this.tpDL.Controls.Add(this.bDistantLandWizard);
             this.tpDL.Controls.Add(this.cbDLDistantLand);
             this.tpDL.Controls.Add(this.gbDistantLand);
             this.tpDL.Location = new System.Drawing.Point(4, 34);
@@ -1962,7 +1963,6 @@ namespace MGEgui {
             // 
             // gbDLDrawDist
             // 
-            this.gbDLDrawDist.Controls.Add(this.bDistantLandWizard);
             this.gbDLDrawDist.Controls.Add(this.lDLDrawDist);
             this.gbDLDrawDist.Controls.Add(this.udDLDrawDist);
             this.gbDLDrawDist.Dock = System.Windows.Forms.DockStyle.Top;
@@ -1970,7 +1970,7 @@ namespace MGEgui {
             this.gbDLDrawDist.Margin = new System.Windows.Forms.Padding(4);
             this.gbDLDrawDist.Name = "gbDLDrawDist";
             this.gbDLDrawDist.Padding = new System.Windows.Forms.Padding(4);
-            this.gbDLDrawDist.Size = new System.Drawing.Size(516, 114);
+            this.gbDLDrawDist.Size = new System.Drawing.Size(516, 93);
             this.gbDLDrawDist.TabIndex = 0;
             this.gbDLDrawDist.TabStop = false;
             this.gbDLDrawDist.Text = "&Draw Distance";
@@ -1978,10 +1978,10 @@ namespace MGEgui {
             // 
             // bDistantLandWizard
             // 
-            this.bDistantLandWizard.Location = new System.Drawing.Point(228, 33);
+            this.bDistantLandWizard.Location = new System.Drawing.Point(204, 63);
             this.bDistantLandWizard.Margin = new System.Windows.Forms.Padding(4);
             this.bDistantLandWizard.Name = "bDistantLandWizard";
-            this.bDistantLandWizard.Size = new System.Drawing.Size(273, 63);
+            this.bDistantLandWizard.Size = new System.Drawing.Size(201, 63);
             this.bDistantLandWizard.TabIndex = 10;
             this.bDistantLandWizard.Text = "Distant land generator wizard";
             this.bDistantLandWizard.Click += new System.EventHandler(this.bDistantLandWizard_Click);
