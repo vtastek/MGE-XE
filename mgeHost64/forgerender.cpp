@@ -1509,6 +1509,14 @@ namespace {
     // Bindless base-map texture array size (must match MAX_TEXTURES in opaque.srt.h).
     constexpr uint32_t kMaxTextures = MAX_TEXTURES;
 
+    // C3a shadow casters: per-slot alpha-channel classification, computed once at DDS upload
+    // (classifyDdsAlpha). MW's NIF alpha flags can't tell a cutout MASK from true translucency —
+    // e.g. the hammock (active_de_bed_30) is blend=1 test=0 yet its wicker texture is binary
+    // 0/255 alpha. MASK-textured alpha-over blends cast shadows (with a synthetic alpha-test
+    // ref); TRANSLUCENT ones (smoke, ghosts, soft glass) never do.
+    enum : uint8_t { kTexAlphaOpaque = 0, kTexAlphaMask = 1, kTexAlphaTranslucent = 2 };
+    uint8_t g_texAlphaKind[MAX_TEXTURES] = {};
+
     // Static per-instance VB stride (uint32 slots). Tier 2b grew it past the old uint2:
     //   [0] DrawIndex (identity, set once)   [1] TexAlpha (tex|alphaRef|vColSource, per-frame)
     //   [2..4] matDiffuse.rgb (float)        [5..7] matAmbient.rgb (float)   [8..10] matEmissive.rgb (float)
@@ -3841,6 +3849,12 @@ namespace {
         // trusted only while freshly seen — a stale mover record is forgotten (lastWorldFrame→0) so
         // a hidden animated part (1st-person player, off-screen NPC) can't cast a frozen shadow.
         bool     everMoved;
+        // C3b: max material-emissive ≥ g_shadowEmissiveSkip at last sight → this is a light's own
+        // hot part (lantern paper, candle flame) — the gather skips it as a caster.
+        bool     emissiveHot;
+        // C3a: record came from the cached-alpha draw loop (cutout blend), not items[]. Lets the
+        // g_shadowBlendCasters toggle-off sweep forget exactly these records.
+        bool     alphaCaster;
     };
     HostMesh* g_meshes   = nullptr;
     uint32_t  g_meshCap  = 0;   // allocated slot count
@@ -3852,6 +3866,48 @@ namespace {
     // binds (D3D9-style) and the DX12 win needs buffer consolidation / batched draws.
     double    g_recAccum = 0.0;     // summed cmd-record ms over the heartbeat window
     double    g_gpuAccum = 0.0;     // summed submit→fence ms over the heartbeat window
+
+    // C3: shared caster-record refresh — the items[] static loop and the cached-alpha cutout
+    // path (C3a) both land here. world = the CAMERA-RELATIVE wire transform; stored ABSOLUTE
+    // (+ this frame's shift eye) so the record survives camera motion between refreshes.
+    // Skinned/multimap slots still record lastWorld (pre-existing behavior, harmless) but never
+    // touch the caster epoch — the gather excludes them. An emissiveHot flip on a live record
+    // bumps the epoch so the g_shadowEmissiveSkip slider re-renders affected slots live.
+    static void refreshCasterRecord(uint32_t slot, const float* world, uint32_t texAlphaPacked,
+                                    bool emissiveHot, bool alphaCaster) {
+        if (slot >= g_meshHigh || !g_meshes[slot].valid) { return; }
+        HostMesh& shm = g_meshes[slot];
+        const float ax = world[12] + g_eyeAbsShadow[0];
+        const float ay = world[13] + g_eyeAbsShadow[1];
+        const float az = world[14] + g_eyeAbsShadow[2];
+        // Shadow-cache invalidation: a caster newly seen (first record) or one whose ABSOLUTE
+        // position actually moved bumps the caster epoch, dirtying every slot that hasn't
+        // re-rendered since. A part that ever moves is flagged everMoved (a MOVER — animated
+        // NPC/player part, a door) so the mover-expiry sweep can forget it when it stops being
+        // seen. FP reconstruction jitter is « kCasterMoveEps, so a truly static object never
+        // bumps or gets mis-flagged.
+        if (!shm.skinned && !shm.multimap) {
+            if (shm.lastWorldFrame == 0) {
+                g_casterEpoch = g_renderFrame;
+            } else {
+                const float mdx = ax - shm.lastWorld[12];
+                const float mdy = ay - shm.lastWorld[13];
+                const float mdz = az - shm.lastWorld[14];
+                if (mdx*mdx + mdy*mdy + mdz*mdz > kCasterMoveEps * kCasterMoveEps) {
+                    shm.everMoved = true;
+                    g_casterEpoch = g_renderFrame;
+                }
+                if (emissiveHot != shm.emissiveHot) { g_casterEpoch = g_renderFrame; }
+            }
+        }
+        std::memcpy(shm.lastWorld, world, 64);
+        shm.lastWorld[12] = ax; shm.lastWorld[13] = ay; shm.lastWorld[14] = az;
+        shm.lastTexAlpha   = texAlphaPacked;
+        shm.lastMirror     = worldMirrored(world) ? 1 : 0;
+        shm.lastWorldFrame = g_renderFrame;
+        shm.emissiveHot    = emissiveHot;
+        shm.alphaCaster    = alphaCaster;
+    }
 
     inline double hostNowMs() {
         return std::chrono::duration<double, std::milli>(
@@ -4009,12 +4065,24 @@ namespace {
     bool  g_shadowFaceDebug  = false;   // shadowmask debug 1: nibble = face id (convention check FIRST)
     bool  g_shadowAtlasDebug = false;   // shadowmask debug 2: nibble = atlas depth (slot-0 block on screen)
     float g_shadowSlack      = 0.02f;   // relative reverse-Z compare slack (acne knob; live via mask params)
-    // P3: self-shadow suppression — a light usually sits INSIDE its own fixture (lantern/torch/
-    // candle), so that fixture's opaque caps/frame throw harsh cage shadows that darken the room.
-    // Skip a caster when the light is inside its world bounding sphere AND the mesh is fixture-sized
-    // (small): the light's own fixture stops shadowing itself, walls/floors (large) still cast.
-    bool  g_shadowSelfSkip   = true;
-    float g_shadowSelfRadius = 200.0f;  // "fixture" world-radius ceiling for the self-skip test
+    // C3b: emissive caster skip — replaces the P3 fixture-radius self-shadow heuristic (which was
+    // finnicky: a lantern is several NiTriShapes with different bounding spheres, so parts of the
+    // fixture's shadow appeared/disappeared). MW marks a light's own hot part with a full-emissive
+    // material (light_de_lantern_03: paper = emissive (1,1,1), metal frame = 0), and the material
+    // already rides the draw wires — so skip casters whose max material-emissive component is at or
+    // above this threshold. The paper stops blocking its own light; the frame keeps casting stable
+    // cage shadows. vColSource==1 (vcol drives emissive) has no material signal → never skipped.
+    float g_shadowEmissiveSkip = 0.75f;   // >1.0 disables (no MW material exceeds 1.0)
+    // C3a: cutout-blend casters (see g_texAlphaKind). Toggling OFF forgets alpha-origin caster
+    // records so their cached shadows drop immediately (manager sweep).
+    bool  g_shadowBlendCasters = true;
+    // C3a knob: synthetic alpha-test ref for blend casters. > 0 → EVERY cached alpha-over blend
+    // casts, thresholded at this ref in the shadow depth pass (texels with alpha ≥ ref occlude;
+    // softer texels pass light). Soft-edged masks the histogram can't call — the hammock's woven
+    // rope is 47% transparent / 31% mid — cast their ≥-threshold weave. True translucents
+    // (smoke ~all-low alpha) discard everything → still no shadow. 0 → strict mode: only
+    // explicit-NIF-test or MASK-classified textures cast. Any change sweeps alpha records live.
+    float g_shadowBlendRef = 0.5f;
 
     // F12 debug-view names; index = debugParams.x. The dropdown writes g_debugMode directly so the
     // overlay selector and the F12 key cycle stay unified.
@@ -4157,10 +4225,12 @@ namespace {
         uiAddComponentWidget(g_uiPanel, "Shadow: atlas view (F12 mode 10)", &cShAd, WIDGET_TYPE_CHECKBOX);
         SliderFloatWidget sShS = {}; sShS.pData = &g_shadowSlack; sShS.mMin = 0.0f; sShS.mMax = 0.2f; sShS.mStep = 0.002f;
         uiAddComponentWidget(g_uiPanel, "Shadow depth slack", &sShS, WIDGET_TYPE_SLIDER_FLOAT);
-        CheckboxWidget cShSelf = {}; cShSelf.pData = &g_shadowSelfSkip;
-        uiAddComponentWidget(g_uiPanel, "Shadow: skip self (fixture)", &cShSelf, WIDGET_TYPE_CHECKBOX);
-        SliderFloatWidget sShSr = {}; sShSr.pData = &g_shadowSelfRadius; sShSr.mMin = 0.0f; sShSr.mMax = 600.0f; sShSr.mStep = 10.0f;
-        uiAddComponentWidget(g_uiPanel, "Shadow: self-skip fixture radius", &sShSr, WIDGET_TYPE_SLIDER_FLOAT);
+        SliderFloatWidget sShEm = {}; sShEm.pData = &g_shadowEmissiveSkip; sShEm.mMin = 0.0f; sShEm.mMax = 1.5f; sShEm.mStep = 0.05f;
+        uiAddComponentWidget(g_uiPanel, "Shadow: emissive caster skip (>1 = off)", &sShEm, WIDGET_TYPE_SLIDER_FLOAT);
+        CheckboxWidget cShBc = {}; cShBc.pData = &g_shadowBlendCasters;
+        uiAddComponentWidget(g_uiPanel, "Shadow: cutout-blend casters", &cShBc, WIDGET_TYPE_CHECKBOX);
+        SliderFloatWidget sShBr = {}; sShBr.pData = &g_shadowBlendRef; sShBr.mMin = 0.0f; sShBr.mMax = 1.0f; sShBr.mStep = 0.05f;
+        uiAddComponentWidget(g_uiPanel, "Shadow: blend caster alpha ref (0 = mask-only)", &sShBr, WIDGET_TYPE_SLIDER_FLOAT);
 
         // -- Phase 0: per-subsystem draw toggles (off → MW's version shows through the composite) --
         LabelWidget subLbl = {};
@@ -4170,7 +4240,7 @@ namespace {
         CheckboxWidget cADbg = {}; cADbg.pData = &g_alphaDebugNoDepth;
         uiAddComponentWidget(g_uiPanel, "ALPHA: depth OFF (debug)", &cADbg, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cAHl = {}; cAHl.pData = &g_alphaHighlight;
-        uiAddComponentWidget(g_uiPanel, "ALPHA: highlight magenta", &cAHl, WIDGET_TYPE_CHECKBOX);
+        uiAddComponentWidget(g_uiPanel, "ALPHA: caster classify colors", &cAHl, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cADW = {}; cADW.pData = &g_alphaDepthWrite;
         uiAddComponentWidget(g_uiPanel, "ALPHA: depth-write fold fix", &cADW, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cDLand = {}; cDLand.pData = &g_drawDLLand;
@@ -4782,6 +4852,27 @@ namespace ForgeRender {
                 }
             }
 
+            // C3a: any change to the blend-caster controls (checkbox OR the alpha-ref knob) must
+            // reflect in already-cached shadows — alpha-origin records are persistent statics, so
+            // without this sweep the hammock's shadow would keep its old ref (or linger after
+            // toggling OFF) until a cell change. Forgetting them + bumping the epoch makes the
+            // visible ones re-register from this frame's cached-alpha loop with the new gate/ref
+            // and re-render their slots next frame — the knob is effectively live.
+            static bool  s_prevBlendCasters = true;
+            static float s_prevBlendRef     = g_shadowBlendRef;
+            if (s_prevBlendCasters != g_shadowBlendCasters || s_prevBlendRef != g_shadowBlendRef) {
+                s_prevBlendCasters = g_shadowBlendCasters;
+                s_prevBlendRef     = g_shadowBlendRef;
+                for (uint32_t s2 = 0; s2 < g_meshHigh; ++s2) {
+                    HostMesh& hm = g_meshes[s2];
+                    if (hm.alphaCaster && hm.lastWorldFrame != 0) {
+                        hm.lastWorldFrame = 0;
+                        hm.alphaCaster = false;
+                    }
+                }
+                g_casterEpoch = frame;
+            }
+
             float* mp = (float*)g_live.pShadowMaskParamsCbv->pCpuMappedAddress;
             float  sInvVP[16];
             if (!invert4x4(rzViewProj, sInvVP)) {
@@ -4951,11 +5042,11 @@ namespace ForgeRender {
                     const float d2 = dx*dx + dy*dy + dz*dz;
                     const float rr = reach + wr;
                     if (d2 > rr * rr) { continue; }
-                    // Self-shadow suppression: the light sits INSIDE this fixture-sized mesh → it's
-                    // (almost certainly) the light's own lantern/torch; skip so it can't cage-shadow
-                    // itself. Large meshes (walls/floors) whose sphere merely contains the light are
-                    // NOT fixture-sized, so they still cast.
-                    if (g_shadowSelfSkip && wr < g_shadowSelfRadius && d2 < wr * wr) { continue; }
+                    // C3b self-source suppression: a full-emissive material is MW's marker for a
+                    // light's own hot part (lantern paper, candle flame) — skip it so a fixture
+                    // can't black-cage its own light. Non-emissive fixture parts (the metal frame)
+                    // keep casting stable cage shadows, and it's per-shape — no size guessing.
+                    if (hm.emissiveHot) { continue; }
                     g_shadowCasters.push_back({ slot, hm.lastMirror });
                     if (g_shadowCasters.size() - begin >= kShadowMaxCasters) { break; }
                 }
@@ -5048,38 +5139,15 @@ namespace ForgeRender {
             inst[local * kStaticInstU32 + 1] = texAlphaPacked;
             // P1.5 shadows: refresh the slot's last-seen ABSOLUTE world record so the caster
             // gather can keep drawing this part after the camera frustum culls it from items[].
+            // C3b: a full-emissive material marks a light's OWN hot part (lantern paper) — the
+            // gather skips it as a caster. vColSource 1 routes vcol→emissive (material unused).
             {
-                const uint32_t slot = items[i].slot;
-                if (slot < g_meshHigh && g_meshes[slot].valid) {
-                    HostMesh& shm = g_meshes[slot];
-                    const float ax = items[i].world[12] + g_eyeAbsShadow[0];
-                    const float ay = items[i].world[13] + g_eyeAbsShadow[1];
-                    const float az = items[i].world[14] + g_eyeAbsShadow[2];
-                    // Shadow-cache invalidation: a caster newly seen (first record) or one whose
-                    // ABSOLUTE position actually moved bumps the caster epoch, dirtying every slot
-                    // that hasn't re-rendered since. A part that ever moves is flagged everMoved (a
-                    // MOVER — animated NPC/player part, a door) so the mover-expiry sweep can forget
-                    // it when it stops being seen. FP reconstruction jitter is « kCasterMoveEps, so a
-                    // truly static object never bumps or gets mis-flagged.
-                    if (!shm.skinned && !shm.multimap) {
-                        if (shm.lastWorldFrame == 0) {
-                            g_casterEpoch = g_renderFrame;
-                        } else {
-                            const float mdx = ax - shm.lastWorld[12];
-                            const float mdy = ay - shm.lastWorld[13];
-                            const float mdz = az - shm.lastWorld[14];
-                            if (mdx*mdx + mdy*mdy + mdz*mdz > kCasterMoveEps * kCasterMoveEps) {
-                                shm.everMoved = true;
-                                g_casterEpoch = g_renderFrame;
-                            }
-                        }
-                    }
-                    std::memcpy(shm.lastWorld, items[i].world, 64);
-                    shm.lastWorld[12] = ax; shm.lastWorld[13] = ay; shm.lastWorld[14] = az;
-                    shm.lastTexAlpha   = texAlphaPacked;
-                    shm.lastMirror     = worldMirrored(items[i].world) ? 1 : 0;
-                    shm.lastWorldFrame = g_renderFrame;
-                }
+                const float* em = items[i].matEmissive;
+                const float emMax = em[0] > em[1] ? (em[0] > em[2] ? em[0] : em[2])
+                                                  : (em[1] > em[2] ? em[1] : em[2]);
+                const bool emissiveHot = (items[i].vColSource != 1u) && emMax >= g_shadowEmissiveSkip;
+                refreshCasterRecord(items[i].slot, items[i].world, texAlphaPacked,
+                                    emissiveHot, /*alphaCaster=*/false);
             }
             float* finst = (float*)inst;
             finst[local * kStaticInstU32 + 2] = items[i].matDiffuse[0];
@@ -6575,6 +6643,16 @@ namespace ForgeRender {
                 const bool isCaptured = (slot == IPC::kAlphaSlotCaptured);
                 Buffer*  meshVb; Buffer* meshIb;
                 uint32_t firstVertex, firstIndex, drawIndexCount;
+                // C3 debug (panel "ALPHA: caster classify colors" — was the flat magenta):
+                // per-draw shadow-caster classification, painted into the draw's matDiffuse
+                // instance floats; alpha.frag's debug-bit3 branch returns it flat.
+                //   BLUE   captured (particles/weather — can never cast)
+                //   GREEN  cached, caster record registered this frame
+                //   RED    cached, blend pair isn't alpha-over (dst != INVSRCALPHA)
+                //   ORANGE cached, matAlpha ≤ 0.5 (fading — must not cast)
+                //   WHITE  cached, strict-mode reject (knob 0, no NIF test, not MASK-classified)
+                //   GRAY   cutout-blend casters checkbox is off
+                float clsR = 0.4f, clsG = 0.4f, clsB = 0.4f;
                 if (isCaptured) {
                     if (!g_live.pCapAlphaVB || !g_live.pCapAlphaIB
                         || it.indexCount == 0
@@ -6584,6 +6662,7 @@ namespace ForgeRender {
                     }
                     meshVb = g_live.pCapAlphaVB;  meshIb = g_live.pCapAlphaIB;
                     firstVertex = it.vertexBase;  firstIndex = it.indexBase;  drawIndexCount = it.indexCount;
+                    clsR = 0.0f; clsG = 0.0f; clsB = 1.0f;   // BLUE: captured
                 } else {
                     if (slot >= g_meshHigh || !g_meshes[slot].valid) {
                         continue;   // mesh not uploaded yet
@@ -6599,6 +6678,37 @@ namespace ForgeRender {
                     drawIndexCount = m.indexCount;
                     if (!meshVb || !meshIb) {
                         continue;
+                    }
+
+                    // C3a: cutout-blend casters. A cached alpha-over blend registers a caster
+                    // record like an items[] static; depthonly.frag runs the packed alpha test,
+                    // so the shadow is the ≥-ref cutout, not the quad. Casts when: an explicit
+                    // NIF alpha test, a MASK-classified texture (binary 0/255 alpha), or the
+                    // g_shadowBlendRef knob > 0 (threshold mode — carves soft-edged masks like
+                    // the hammock's woven rope that the histogram calls TRANSLUCENT). Gates:
+                    // alpha-over only (dst = D3D INVSRCALPHA = 6; additive glows are light, not
+                    // occluders) and matAlpha > 0.5 (a fading part must not cast while invisible).
+                    if (g_shadowBlendCasters) {
+                        if (it.destBlend != kD3DBLEND_INVSRCALPHA) {
+                            clsR = 1.0f; clsG = 0.0f; clsB = 0.0f;         // RED: not alpha-over
+                        } else if (it.matAlpha <= 0.5f) {
+                            clsR = 1.0f; clsG = 0.4f; clsB = 0.0f;         // ORANGE: fading
+                        } else if (it.alphaRef > 0.0f || g_shadowBlendRef > 0.0f
+                                   || (it.texIndex < kMaxTextures
+                                       && g_texAlphaKind[it.texIndex] == kTexAlphaMask)) {
+                            clsR = 0.0f; clsG = 1.0f; clsB = 0.0f;         // GREEN: caster registered
+                            float refUse = (it.alphaRef > g_shadowBlendRef) ? it.alphaRef : g_shadowBlendRef;
+                            if (refUse <= 0.0f) { refUse = 0.5f; }   // MASK-only path with the knob at 0
+                            const float* em = it.matEmissive;
+                            const float emMax = em[0] > em[1] ? (em[0] > em[2] ? em[0] : em[2])
+                                                              : (em[1] > em[2] ? em[1] : em[2]);
+                            const bool emissiveHot = (it.vColSource != 1u) && emMax >= g_shadowEmissiveSkip;
+                            refreshCasterRecord(slot, it.world,
+                                                packTexAlpha(it.texIndex, refUse, it.vColSource),
+                                                emissiveHot, /*alphaCaster=*/true);
+                        } else {
+                            clsR = 1.0f; clsG = 1.0f; clsB = 1.0f;         // WHITE: strict-mode reject
+                        }
                     }
                 }
                 const uint32_t idx = alphaDrawn;
@@ -6649,9 +6759,11 @@ namespace ForgeRender {
                 inst[idx * kStaticInstU32 + 0] = idx;   // DrawIndex → gBatch.worlds[idx]
                 inst[idx * kStaticInstU32 + 1] = packTexAlpha(it.texIndex, it.alphaRef, it.vColSource);
                 float* finst = (float*)inst;
-                finst[idx * kStaticInstU32 + 2]  = it.matDiffuse[0];
-                finst[idx * kStaticInstU32 + 3]  = it.matDiffuse[1];
-                finst[idx * kStaticInstU32 + 4]  = it.matDiffuse[2];
+                // C3 debug: with the classify toggle on, matDiffuse carries the classification
+                // color instead (alpha.frag's bit3 branch returns In.MatDiffuse flat).
+                finst[idx * kStaticInstU32 + 2]  = g_alphaHighlight ? clsR : it.matDiffuse[0];
+                finst[idx * kStaticInstU32 + 3]  = g_alphaHighlight ? clsG : it.matDiffuse[1];
+                finst[idx * kStaticInstU32 + 4]  = g_alphaHighlight ? clsB : it.matDiffuse[2];
                 finst[idx * kStaticInstU32 + 5]  = it.matAmbient[0];
                 finst[idx * kStaticInstU32 + 6]  = it.matAmbient[1];
                 finst[idx * kStaticInstU32 + 7]  = it.matAmbient[2];
@@ -7326,6 +7438,86 @@ namespace ForgeRender {
         return r;
     }
 
+    // C3a: classify a DDS's mip-0 alpha channel into OPAQUE / MASK / TRANSLUCENT (g_texAlphaKind).
+    // A MASK is binary coverage (cutout: wicker, grates, foliage) — mostly ~0/~255 with only an
+    // edge-antialias mid-band; TRANSLUCENT has a broad mid-band (smoke, ghosts, soft glass).
+    // Buckets: transparent < 32, opaque ≥ 224, mid between. MASK = meaningful transparent
+    // coverage (> 1/64 of texels) AND mid-band < 1/4 (cutout edges stay well under that; true
+    // translucents are mostly mid). DXBC1 alpha is punch-through 1-bit → mask by construction.
+    static uint8_t classifyDdsAlpha(const uint8_t* d, uint32_t size, const DdsInfo& info) {
+        const uint8_t* src = d + info.dataOffset;
+        const uint8_t* end = d + size;
+        uint64_t nTrans = 0, nMid = 0, nTexels = 0;
+        const uint32_t w = info.width, h = info.height;
+        switch (info.fmt) {
+        case TinyImageFormat_DXBC1_RGBA_UNORM: {
+            const uint32_t blocks = ((w + 3) / 4) * ((h + 3) / 4);
+            const uint8_t* p = src;
+            for (uint32_t b = 0; b < blocks && p + 8 <= end; ++b, p += 8) {
+                nTexels += 16;
+                const uint16_t c0 = (uint16_t)(p[0] | (p[1] << 8));
+                const uint16_t c1 = (uint16_t)(p[2] | (p[3] << 8));
+                if (c0 <= c1) {   // alpha-mode block: 2-bit index 3 = transparent texel
+                    const uint32_t idx = p[4] | (p[5] << 8) | (p[6] << 16) | ((uint32_t)p[7] << 24);
+                    for (uint32_t t = 0; t < 16; ++t) {
+                        if (((idx >> (t * 2)) & 0x3u) == 3u) { ++nTrans; }
+                    }
+                }
+            }
+            break;   // 1-bit alpha: nMid stays 0 → OPAQUE or MASK
+        }
+        case TinyImageFormat_DXBC2_UNORM: {   // explicit 4-bit alpha (first 8 bytes/block)
+            const uint32_t blocks = ((w + 3) / 4) * ((h + 3) / 4);
+            const uint8_t* p = src;
+            for (uint32_t b = 0; b < blocks && p + 16 <= end; ++b, p += 16) {
+                for (uint32_t t = 0; t < 16; ++t) {
+                    const uint8_t a4 = (uint8_t)((p[t >> 1] >> ((t & 1) * 4)) & 0xFu);
+                    ++nTexels;
+                    if (a4 <= 1u) { ++nTrans; } else if (a4 < 14u) { ++nMid; }
+                }
+            }
+            break;
+        }
+        case TinyImageFormat_DXBC3_UNORM: {   // interpolated alpha (a0/a1 + 3-bit indices)
+            const uint32_t blocks = ((w + 3) / 4) * ((h + 3) / 4);
+            const uint8_t* p = src;
+            for (uint32_t b = 0; b < blocks && p + 16 <= end; ++b, p += 16) {
+                const uint8_t a0 = p[0], a1 = p[1];
+                uint8_t tab[8]; tab[0] = a0; tab[1] = a1;
+                if (a0 > a1) {
+                    for (int k = 0; k < 6; ++k) { tab[2 + k] = (uint8_t)(((6 - k) * a0 + (1 + k) * a1) / 7); }
+                } else {
+                    for (int k = 0; k < 4; ++k) { tab[2 + k] = (uint8_t)(((4 - k) * a0 + (1 + k) * a1) / 5); }
+                    tab[6] = 0; tab[7] = 255;
+                }
+                uint64_t bits = 0;
+                for (int k = 0; k < 6; ++k) { bits |= (uint64_t)p[2 + k] << (8 * k); }
+                for (uint32_t t = 0; t < 16; ++t) {
+                    const uint8_t a = tab[(bits >> (t * 3)) & 0x7u];
+                    ++nTexels;
+                    if (a < 32u) { ++nTrans; } else if (a < 224u) { ++nMid; }
+                }
+            }
+            break;
+        }
+        case TinyImageFormat_B8G8R8A8_UNORM:
+        case TinyImageFormat_R8G8B8A8_UNORM: {
+            const uint64_t n = (uint64_t)w * h;
+            for (uint64_t t = 0; t < n && src + t * 4 + 4 <= end; ++t) {
+                const uint8_t a = src[t * 4 + 3];
+                ++nTexels;
+                if (a < 32u) { ++nTrans; } else if (a < 224u) { ++nMid; }
+            }
+            break;
+        }
+        default:
+            return kTexAlphaOpaque;
+        }
+        if (nTexels == 0 || (nTrans + nMid) == 0) { return kTexAlphaOpaque; }
+        if (nTrans > nTexels / 64 && nMid < nTexels / 4) { return kTexAlphaMask; }
+        return kTexAlphaTranslucent;
+    }
+
     // Parse [TexUploadWire][dds bytes]* and decode each into gTextures[slot]. slot 0 is reserved
     // (default white). Returns the number of textures successfully built. No-op if Forge/the
     // opaque path isn't live yet (textures arrive after the first scene builds the PerFrame set).
@@ -7359,6 +7551,8 @@ namespace ForgeRender {
                 LOGF(eWARNING, "[forge] tex slot %u: unsupported DDS format (slot stays white)", hdr.slot);
                 continue;
             }
+            // C3a: shadow-caster alpha classification (OPAQUE/MASK/TRANSLUCENT), once per upload.
+            g_texAlphaKind[hdr.slot] = classifyDdsAlpha(dds, hdr.byteLen, info);
 
             Texture* tex = nullptr;
             TextureDesc td = {};
