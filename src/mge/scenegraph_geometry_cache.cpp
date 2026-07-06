@@ -158,6 +158,35 @@ namespace MGE::GeometryCache {
             g_textureNameMap.insert_or_assign(d3d, name);
         }
 
+        // Registration-only subtree sweep: map every NiGeometry's base-map GPU texture to its
+        // source name, no capture, no cache writes. For the worldRoot siblings the walks never
+        // visit (Precipitation Rain/Snow Root, Storm Root, WorldProjectileRoot, WorldSpellRoot,
+        // WorldVFXRoot): their alpha-blended particle DIPs reach captureAlphaDraw with GPU
+        // textures absent from g_textureNameMap, fell back to slot 0, and drew as opaque WHITE
+        // quads (ashstorm/blizzard whiteout). Culled subtrees are swept too, so inactive
+        // precipitation pre-registers before its storm starts.
+        void registerSubtreeTextureNames(NI::AVObject* av) {
+            if (!av) return;
+            if (av->isInstanceOfType(NI::RTTIStaticPtr::NiGeometry)) {
+                auto* geom = static_cast<NI::Geometry*>(av);
+                auto* ps = reinterpret_cast<NI::PropertyState*>(geom->propertyState);
+                if (ps && ps->texture) {
+                    const auto* baseMap = ps->texture->getBaseMap();
+                    if (baseMap && baseMap->texture) {
+                        registerTextureName(baseMap->texture.get());
+                    }
+                }
+                return;
+            }
+            if (av->isInstanceOfType(NI::RTTIStaticPtr::NiNode)) {
+                auto* node = static_cast<NI::Node*>(av);
+                const auto count = node->children.getEndIndex();
+                for (size_t i = 0; i < count; ++i) {
+                    registerSubtreeTextureNames(node->children.at(i).get());
+                }
+            }
+        }
+
         void extractMaterial(CachedGeometry& e, NI::Geometry* geom) {
             e.d3dTexture  = nullptr;
             e.d3dOverlay  = nullptr;
@@ -1325,6 +1354,22 @@ namespace MGE::GeometryCache {
         g_objRoot  = MGE::DataHandlerView::worldObjectRoot(dataHandler);
         g_pickRoot = MGE::DataHandlerView::worldPickObjectRoot(dataHandler);
         g_landRoot = MGE::DataHandlerView::worldLandscapeRoot(dataHandler);
+
+        // Weather/VFX texture-name registration (alpha-rigor): sweep worldRoot's UNWALKED
+        // children — Precipitation Rain/Snow Root, Storm Root, WorldProjectileRoot,
+        // WorldSpellRoot, WorldVFXRoot, ... — so their particle textures resolve by name in
+        // captureAlphaDraw instead of falling back to opaque white (ashstorm whiteout). The
+        // walked roots are skipped (their walks already register); subtrees are a handful of
+        // nodes each, so a per-frame sweep is noise.
+        if (RenderProcess::wantsGeometryCapture() && g_objRoot && g_objRoot->parentNode) {
+            NI::Node* worldRoot = g_objRoot->parentNode;
+            const auto count = worldRoot->children.getEndIndex();
+            for (size_t i = 0; i < count; ++i) {
+                NI::AVObject* c = worldRoot->children.at(i).get();
+                if (!c || c == g_objRoot || c == g_pickRoot || c == g_landRoot) continue;
+                registerSubtreeTextureNames(c);
+            }
+        }
 
         // Forge lip/blink: the msoc owned-display skip starves MW's own head-morph
         // apply, so drive it here — BEFORE the walks/ensureLive capture this frame's
