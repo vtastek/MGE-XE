@@ -1,0 +1,185 @@
+name: Release
+
+# Builds the full MGE XE distribution zip:
+#   - mgecore.dll + d3d8.dll shim + dinput8.dll + MGEfuncs.dll (x86)
+#   - MGEXEgui.exe (.NET 4.8, 4gb-patched) + SlimDX.dll
+#   - mgeHost64.exe (Release-Fast|x64, no D3D12 validation) + Forge runtime
+#     (Agility SDK / DXC DLLs, gpu.cfg/gpu.data, fonts, compiled FSL shaders)
+#   - assets (Data Files incl. prebuilt msoc.dll, readme, customfunctions.dat)
+#
+# Triggers: push a v* tag (creates a DRAFT GitHub release), or run manually.
+# SharedSE is consumed from a sibling MWSE checkout pinned below.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      mwse_ref:
+        description: 'MWSE ref to build SharedSE from'
+        required: false
+        default: '5bfc121ad3e56745792c70895931edf88aaf5ce7'
+
+permissions:
+  contents: write
+
+env:
+  MWSE_REF_DEFAULT: '5bfc121ad3e56745792c70895931edf88aaf5ce7'
+  VULKAN_VERSION: '1.4.313.2'
+  D3DX_NUGET_VERSION: '9.29.952.8'
+
+jobs:
+  release:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      # Layout must mirror the dev machine: MGE-XE.vcxproj imports
+      # ..\..\MWSE\SharedSE\SharedSE.vcxitems relative to the solution dir.
+      - name: Check out MGE-XE
+        uses: actions/checkout@v4
+        with:
+          path: mgexe/MGE-XE
+
+      - name: Check out submodules (shallow)
+        working-directory: mgexe/MGE-XE
+        run: git submodule update --init --depth 1
+
+      - name: Check out MWSE (SharedSE)
+        uses: actions/checkout@v4
+        with:
+          repository: MWSE/MWSE
+          ref: ${{ github.event.inputs.mwse_ref || '5bfc121ad3e56745792c70895931edf88aaf5ce7' }}
+          path: MWSE
+
+      # The vcxprojs hardcode the June 2010 DirectX SDK paths for d3dx9.
+      # Microsoft's official D3DX NuGet redist provides the same headers/libs;
+      # lay it out at the expected location so no project file changes are needed.
+      - name: Install d3dx9 (DirectX SDK June 2010 layout)
+        run: |
+          nuget install Microsoft.DXSDK.D3DX -Version $env:D3DX_NUGET_VERSION -OutputDirectory dxsdk-pkg -NonInteractive
+          $pkg = (Get-ChildItem dxsdk-pkg -Directory -Filter 'Microsoft.DXSDK.D3DX*' | Select-Object -First 1).FullName
+          $sdk = 'C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)'
+          New-Item -ItemType Directory -Force "$sdk\include", "$sdk\Lib\x86", "$sdk\Lib\x64" | Out-Null
+          Copy-Item "$pkg\build\native\include\*"          "$sdk\include" -Recurse -Force
+          Copy-Item "$pkg\build\native\release\lib\x86\*"  "$sdk\Lib\x86" -Force
+          Copy-Item "$pkg\build\native\release\lib\x64\*"  "$sdk\Lib\x64" -Force
+
+      - name: Cache Vulkan SDK installer
+        id: vulkan-cache
+        uses: actions/cache@v4
+        with:
+          path: vulkan-sdk-installer.exe
+          key: vulkan-sdk-${{ env.VULKAN_VERSION }}
+
+      - name: Download Vulkan SDK installer
+        if: steps.vulkan-cache.outputs.cache-hit != 'true'
+        run: |
+          $url = "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/vulkansdk-windows-X64-$env:VULKAN_VERSION.exe"
+          Invoke-WebRequest -Uri $url -OutFile vulkan-sdk-installer.exe
+
+      # mgecore (x86) needs the Vulkan headers (dxvk_interop.h); mgeHost64 links
+      # vulkan-1.lib. Projects pin C:\VulkanSDK\<version>, the installer default.
+      - name: Install Vulkan SDK
+        run: |
+          Start-Process -Wait -FilePath .\vulkan-sdk-installer.exe -ArgumentList '--accept-licenses','--default-answer','--confirm-command','install'
+          if (-not (Test-Path "C:\VulkanSDK\$env:VULKAN_VERSION\Include\vulkan\vulkan.h")) { throw "Vulkan SDK install failed" }
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      # Builds every project incl. the RELEASE packaging step (robocopies assets
+      # + copies binaries + 4gb-patches the GUI) into bin\MSVC-Packaged-Release.
+      - name: Build solution (Release x86)
+        working-directory: mgexe/MGE-XE
+        run: msbuild MGE-XE.sln /m /p:Configuration=Release /p:Platform=x86
+
+      # The sln builds mgeHost64 as Release|x64, which carries FORGE_DEBUG (D3D12
+      # validation, ~3-4x host CPU tax). Ship the fast build instead; it has no
+      # .sln mapping so build the vcxproj directly.
+      - name: Build mgeHost64 (Release-Fast x64)
+        working-directory: mgexe/MGE-XE
+        run: msbuild mgeHost64\mgeHost64.vcxproj /m /p:Configuration=Release-Fast /p:Platform=x64 "/p:SolutionDir=$((Get-Location).Path)\"
+
+      - name: Compile Forge shaders (FSL)
+        working-directory: mgexe/MGE-XE/mgeHost64/shaders
+        run: python ..\..\3rdparty\The-Forge\Common_3\Tools\ForgeShadingLanguage\fsl.py -d gen -b bin -l DIRECT3D12 --compile FSL\shaders.list
+
+      - name: Assemble Forge runtime into package
+        working-directory: mgexe/MGE-XE
+        run: |
+          $pkg = 'bin\MSVC-Packaged-Release'
+          $tp  = '3rdparty\The-Forge\Common_3\Graphics\ThirdParty\OpenSource'
+          # Fast host over the validation exe RELEASE packaged
+          Copy-Item bin\MSVC-Release-Fast\mgeHost64.exe "$pkg\mgeHost64.exe" -Force
+          # Runtime DLLs beside the exe (D3D12SDKPath = "" -> Agility core in exe dir)
+          Copy-Item "$tp\Direct3d12Agility\bin\x64\D3D12Core.dll"        $pkg -Force
+          Copy-Item "$tp\Direct3d12Agility\bin\x64\d3d12SDKLayers.dll"   $pkg -Force
+          Copy-Item "$tp\DirectXShaderCompiler\bin\x64\dxcompiler.dll"   $pkg -Force
+          Copy-Item "$tp\DirectXShaderCompiler\bin\x64\dxil.dll"         $pkg -Force
+          Copy-Item "$tp\ags\ags_lib\lib\amd_ags_x64.dll"                $pkg -Force
+          Copy-Item "$tp\winpixeventruntime\bin\WinPixEventRuntime.dll"  $pkg -Force
+          # The Forge GPU config (same files deployed beside the exe today)
+          Copy-Item '3rdparty\The-Forge\Examples_3\Unit_Tests\src\01_Transformations\GPUCfg\gpu.cfg' $pkg -Force
+          Copy-Item '3rdparty\The-Forge\Common_3\OS\Windows\pc_gpu.data' "$pkg\gpu.data" -Force
+          # Compiled shader containers (host loads DIRECT3D12\<name> beside the exe)
+          New-Item -ItemType Directory -Force "$pkg\DIRECT3D12" | Out-Null
+          Copy-Item mgeHost64\shaders\bin\DIRECT3D12\* "$pkg\DIRECT3D12" -Force
+          # Overlay font (RD_FONTS = fonts\ beside the exe)
+          New-Item -ItemType Directory -Force "$pkg\fonts" | Out-Null
+          Copy-Item mgeHost64\fonts\* "$pkg\fonts" -Force
+
+      # The RELEASE prebuild is a cmd batch whose copies don't fail the build if a
+      # source is missing — assert the package is actually complete.
+      - name: Verify package
+        working-directory: mgexe/MGE-XE
+        run: |
+          $pkg = 'bin\MSVC-Packaged-Release'
+          $required = @(
+            "$pkg\d3d8.dll", "$pkg\mgecore.dll", "$pkg\dinput8.dll",
+            "$pkg\MGEXEgui.exe", "$pkg\SlimDX.dll", "$pkg\mgeHost64.exe",
+            "$pkg\mge3\MGEfuncs.dll",
+            "$pkg\D3D12Core.dll", "$pkg\dxcompiler.dll", "$pkg\dxil.dll",
+            "$pkg\amd_ags_x64.dll", "$pkg\WinPixEventRuntime.dll",
+            "$pkg\gpu.cfg", "$pkg\gpu.data",
+            "$pkg\DIRECT3D12\opaque.frag", "$pkg\DIRECT3D12\opaque.vert",
+            "$pkg\fonts\ComicRelief.ttf",
+            "$pkg\Data Files\MWSE\lib\msoc.dll",
+            "$pkg\MGE XE Readme.txt", "$pkg\customfunctions.dat"
+          )
+          $missing = $required | Where-Object { -not (Test-Path $_) }
+          if ($missing) { $missing | ForEach-Object { Write-Error "MISSING: $_" }; throw "package incomplete" }
+          $shim = Get-Item "$pkg\d3d8.dll"
+          if ($shim.Length -gt 100KB) { throw "d3d8.dll is $($shim.Length) bytes - expected the small shim, got the full DLL?" }
+          Write-Host "package OK - $((Get-ChildItem $pkg -Recurse -File).Count) files"
+
+      - name: Determine version
+        id: ver
+        working-directory: mgexe/MGE-XE
+        run: |
+          $m = Select-String -Path src\mge\mgeversion.h -Pattern 'XE_VERSION_STRING\s+"MGE XE ([^"]+)"'
+          $ver = $m.Matches[0].Groups[1].Value
+          if ('${{ github.ref_type }}' -eq 'tag') { $name = '${{ github.ref_name }}' }
+          else { $name = "$ver-$('${{ github.sha }}'.Substring(0,7))" }
+          "name=$name" | Out-File -Append $env:GITHUB_OUTPUT
+          Write-Host "release name: $name (XE version $ver)"
+
+      - name: Zip package
+        working-directory: mgexe/MGE-XE
+        run: Compress-Archive -Path 'bin\MSVC-Packaged-Release\*' -DestinationPath "MGE-XE-${{ steps.ver.outputs.name }}.zip" -CompressionLevel Optimal
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MGE-XE-${{ steps.ver.outputs.name }}
+          path: mgexe/MGE-XE/MGE-XE-${{ steps.ver.outputs.name }}.zip
+
+      # Tags produce a DRAFT release: review + publish by hand.
+      - name: Create draft GitHub release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: mgexe/MGE-XE/MGE-XE-${{ steps.ver.outputs.name }}.zip
