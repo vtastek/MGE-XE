@@ -1666,6 +1666,38 @@ namespace {
         std::sort(cands.begin(), cands.end(),
                   [](const SkyCand& a, const SkyCand& b) { return a.order < b.order; });
 
+        // [sk-diag] night-sky decay: whenever the packed count CHANGES, dump every isSky entry
+        // with its freshness (lastFrame vs cacheFrame) and host-slot state — the missing stars/
+        // moons must show up here as either absent (walk/eviction), stale, or slot-less (upload
+        // chain). Remove after the decay root-cause is fixed.
+        {
+            static std::size_t s_lastCandCount = (std::size_t)-1;
+            std::size_t staleN = 0, noSlotN = 0, totalSky = 0;
+            for (const auto& kv : cacheMap) {
+                const auto& e = kv.second;
+                if (!e.isSky) continue;
+                ++totalSky;
+                if (e.lastFrame != cacheFrame) { ++staleN; continue; }
+                if (g_keySlot.find(kv.first) == g_keySlot.end()) { ++noSlotN; }
+            }
+            if (cands.size() != s_lastCandCount) {
+                s_lastCandCount = cands.size();
+                LOG::logline(">> [sk-diag] sky list CHANGED: packed=%zu (cache isSky=%zu stale=%zu noSlot=%zu) cacheFrame=%llu",
+                             cands.size(), totalSky, staleN, noSlotN,
+                             (unsigned long long)cacheFrame);
+                for (const auto& kv : cacheMap) {
+                    const auto& e = kv.second;
+                    if (!e.isSky) continue;
+                    const bool stale  = (e.lastFrame != cacheFrame);
+                    const bool noSlot = (g_keySlot.find(kv.first) == g_keySlot.end());
+                    LOG::logline(">> [sk-diag]   key=%08X tex=%s order=%u vc=%u %s%s",
+                                 kv.first, e.textureName ? e.textureName : "(none)",
+                                 (unsigned)e.skyOrder, e.vertexCount,
+                                 stale ? "STALE " : "fresh ", noSlot ? "NOSLOT" : "slot-ok");
+                }
+            }
+        }
+
         IPC::SkyDrawWire item;
         std::uint32_t count = 0;
         for (const auto& c : cands) {
@@ -1683,6 +1715,10 @@ namespace {
             item.matColor[1] = e.matDiffuse[1];
             item.matColor[2] = e.matDiffuse[2];
             item.matAlpha    = e.matDiffuse[3];
+            // SK3 cloud scroll: live-vs-uploaded UV diff from the sky walk (zero for every
+            // non-UV-animated shape); sky.vert adds it back to the baked UV.
+            item.uvOffset[0] = e.skyUVOffset[0];
+            item.uvOffset[1] = e.skyUVOffset[1];
             {
                 const std::uint32_t baseVCol = (e.hasVertexColor && e.vColSource != 0) ? e.vColSource : 0u;
                 // C3: the untextured atmosphere dome (texIndex 0, vertex-coloured) is now host-coloured

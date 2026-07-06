@@ -24,6 +24,7 @@
 #include "support/log.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <vector>
 
@@ -432,6 +433,15 @@ namespace MGE::GeometryCache {
                 }
                 e.aabbMin[0] = mn[0]; e.aabbMin[1] = mn[1]; e.aabbMin[2] = mn[2];
                 e.aabbMax[0] = mx[0]; e.aabbMax[1] = mx[1]; e.aabbMax[2] = mx[2];
+                // SK3 cloud scroll baseline: the UVs baked into THIS upload. The per-frame sky
+                // walk diffs the live UVs against these to derive the scroll offset (sky VBs
+                // never re-upload, so the baseline stays valid for the entry's lifetime).
+                e.skyBaseUV[0]     = uvs ? uvs[0].x : 0.0f;
+                e.skyBaseUV[1]     = uvs ? uvs[0].y : 0.0f;
+                e.skyBaseUVLast[0] = uvs ? uvs[vertexCount - 1].x : 0.0f;
+                e.skyBaseUVLast[1] = uvs ? uvs[vertexCount - 1].y : 0.0f;
+                e.skyUVOffset[0] = 0.0f;
+                e.skyUVOffset[1] = 0.0f;
                 e.vb[slot]->Unlock();
             }
 
@@ -845,6 +855,29 @@ namespace MGE::GeometryCache {
                     //  - Everything else: re-extract + re-upload on revision/skin change.
                     if (g_walkingSky) {
                         extractMaterial(e, geom);
+                        // SK3 cloud scroll: MW rebakes the cloud shape's UVs every frame (the
+                        // per-frame sky revisionID bump), but the VB shipped once — derive the
+                        // uniform scroll offset from vertex 0 instead; buildSkyDrawList ships it
+                        // and sky.vert adds it back. One-shot uniformity check: the last vertex
+                        // must have moved by the same delta (MW shifts the whole set together).
+                        if (const auto* uvs = data->textureCoords) {
+                            e.skyUVOffset[0] = uvs[0].x - e.skyBaseUV[0];
+                            e.skyUVOffset[1] = uvs[0].y - e.skyBaseUV[1];
+                            static bool s_sk3Checked = false;
+                            if (!s_sk3Checked
+                                && (std::fabs(e.skyUVOffset[0]) > 0.01f || std::fabs(e.skyUVOffset[1]) > 0.01f)) {
+                                s_sk3Checked = true;
+                                const uint32_t last = data->getActiveVertexCount()
+                                    ? (uint32_t)data->getActiveVertexCount() - 1u : 0u;
+                                const float dxL = uvs[last].x - e.skyBaseUVLast[0];
+                                const float dyL = uvs[last].y - e.skyBaseUVLast[1];
+                                LOG::logline(">> [sk3] cloud UV scroll live: v0 offset=(%.4f,%.4f) vLast delta=(%.4f,%.4f)%s",
+                                             e.skyUVOffset[0], e.skyUVOffset[1], dxL, dyL,
+                                             (std::fabs(dxL - e.skyUVOffset[0]) > 0.001f
+                                              || std::fabs(dyL - e.skyUVOffset[1]) > 0.001f)
+                                                 ? "  !! NON-UNIFORM — offset transport is wrong for this shape" : "");
+                            }
+                        }
                     } else if ((data->revisionID != e.revisionID) || e.isSkinned) {
                         extractMaterial(e, geom);
                         uploadEntry(e, geom, data, key);
