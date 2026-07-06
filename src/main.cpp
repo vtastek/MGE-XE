@@ -76,12 +76,7 @@ extern "C" BOOL _stdcall DllMain(HANDLE hModule, DWORD reason, void* unused) {
         }
     }
 
-    // Load extender for CS, if Construction Set detected
-    bool isCS = bool(GetModuleHandle("TES Construction Set.exe"));
-    if (isCS) {
-        // Load CSSE dll, it injects by itself
-        LoadLibraryA("CSSE.dll");
-    }
+    // CS/CSSE handling lives in the d3d8.dll shim; mgecore never loads in the CS.
 
     return true;
 }
