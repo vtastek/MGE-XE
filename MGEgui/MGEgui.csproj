@@ -84,6 +84,7 @@
       <RequiredTargetFramework>4.0</RequiredTargetFramework>
     </Reference>
     <Reference Include="SlimDX">
+      <HintPath>..\3rdparty\SlimDX\SlimDX.dll</HintPath>
       <Private>True</Private>
     </Reference>
     <Reference Include="System" />
