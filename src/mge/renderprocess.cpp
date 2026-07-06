@@ -1555,20 +1555,60 @@ namespace {
                 }
                 break;
             }
+            // Magic-light falloff classification — mirror of the engine-emit PPL path
+            // (ffeshader.cpp:1132-1167). The snapshot ships raw NiPointLight attenuation and
+            // the host frag evaluates c + l·d + q·d² verbatim, so MW's magic-light encodings
+            // need the same rewrites (FFE's post-memset default is c=0.33, l=0, q=0):
+            //   x > 0              — standard placed light: ship as-is.
+            //   z > 0 (x == 0)     — MCP-patched magic light: quadratic-only, over-bright diffuse.
+            //   y == 0.10000001f   — projectile light (MW hardcodes {0, 3/30, 0}): FFE's brighter
+            //                        pure-quadratic replacement, colour/position unchanged.
+            //   y > 0              — Light magic effect {0, 3/(22·mag), 0}: brightness override +
+            //                        quadratic falloff + Z lift. FFE's half-lambert ambient weight
+            //                        has no wire lane / frag term — known fidelity gap (backface
+            //                        glow-through is dimmer than PPL).
+            constexpr float kFFEDefaultFalloffConstant = 0.33f;
+            float diffuse[3] = { pl.diffuse[0], pl.diffuse[1], pl.diffuse[2] };
+            float falloff[3] = { pl.falloff[0], pl.falloff[1], pl.falloff[2] };
+            float zLift = 0.0f;
+            if (falloff[0] <= 0.0f) {
+                if (falloff[2] > 0.0f) {
+                    diffuse[0] *= kFFEDefaultFalloffConstant;
+                    diffuse[1] *= kFFEDefaultFalloffConstant;
+                    diffuse[2] *= kFFEDefaultFalloffConstant;
+                    falloff[0] = kFFEDefaultFalloffConstant;
+                    falloff[1] = 0.0f;
+                    falloff[2] = kFFEDefaultFalloffConstant * falloff[2];
+                } else if (falloff[1] == 0.10000001f) {
+                    falloff[0] = kFFEDefaultFalloffConstant;
+                    falloff[1] = 0.0f;
+                    falloff[2] = 5e-5f;
+                } else if (falloff[1] > 0.0f) {
+                    const float brightness = 0.25f + 1e-4f / falloff[1];
+                    diffuse[0] = brightness;
+                    diffuse[1] = brightness;
+                    diffuse[2] = brightness;
+                    falloff[0] = kFFEDefaultFalloffConstant;
+                    falloff[2] = 0.5555f * falloff[1] * falloff[1];
+                    falloff[1] = 0.0f;
+                    zLift = 25.0f;
+                }
+            }
+
             IPC::PointLightWire w;
             // CAMERA-RELATIVE: light positions are compared against the (now camera-relative)
             // WorldPos in the frag, so shift them by -eye too (see buildDrawList).
             w.posRadius[0] = pl.worldPos[0] - DistantLand::eyePos.x;
             w.posRadius[1] = pl.worldPos[1] - DistantLand::eyePos.y;
-            w.posRadius[2] = pl.worldPos[2] - DistantLand::eyePos.z;
+            w.posRadius[2] = pl.worldPos[2] - DistantLand::eyePos.z + zLift;
             w.posRadius[3] = pl.radius;
-            w.color[0] = pl.diffuse[0] * pointLightMult;
-            w.color[1] = pl.diffuse[1] * pointLightMult;
-            w.color[2] = pl.diffuse[2] * pointLightMult;
+            w.color[0] = diffuse[0] * pointLightMult;
+            w.color[1] = diffuse[1] * pointLightMult;
+            w.color[2] = diffuse[2] * pointLightMult;
             w.color[3] = IPC::packLightIdFlags(id, flags);   // P2 identity lane (shader ignores .w)
-            w.falloff[0] = pl.falloff[0];
-            w.falloff[1] = pl.falloff[1];
-            w.falloff[2] = pl.falloff[2];
+            w.falloff[0] = falloff[0];
+            w.falloff[1] = falloff[1];
+            w.falloff[2] = falloff[2];
             w.falloff[3] = 0.0f;
             const std::size_t at = g_lightScratch.size();
             g_lightScratch.resize(at + sizeof(w));

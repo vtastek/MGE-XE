@@ -204,8 +204,27 @@ namespace MGE::SceneGraph {
         // destination vectors (cleared / swapped as needed).
         //
         void runWalk() {
-            walk(MGE::DataHandlerView::worldObjectRoot(g_dataHandler));
-            walk(MGE::DataHandlerView::worldPickObjectRoot(g_dataHandler));
+            NI::Node* objRoot  = MGE::DataHandlerView::worldObjectRoot(g_dataHandler);
+            NI::Node* pickRoot = MGE::DataHandlerView::worldPickObjectRoot(g_dataHandler);
+            walk(objRoot);
+            walk(pickRoot);
+            // Magic-light coverage: projectile/spell/VFX point lights hang under
+            // worldRoot siblings the two walks above never visit (a fireball's
+            // NiPointLight rides its projectile node under WorldProjectileRoot;
+            // WorldSpellRoot/WorldVFXRoot likewise). Walk every remaining sibling
+            // except the landscape root (large subtree, never carries lights).
+            // walk()'s AppCulled gate keeps inactive subtrees (precipitation
+            // roots) free.
+            if (objRoot && objRoot->parentNode) {
+                NI::Node* worldRoot = objRoot->parentNode;
+                NI::Node* landRoot  = MGE::DataHandlerView::worldLandscapeRoot(g_dataHandler);
+                const auto count = worldRoot->children.getEndIndex();
+                for (size_t i = 0; i < count; ++i) {
+                    NI::AVObject* c = worldRoot->children.at(i);
+                    if (!c || c == objRoot || c == pickRoot || c == landRoot) continue;
+                    walk(c);
+                }
+            }
             // sgSunlight is a sibling root of the two NiNodes — the
             // global directional light. The walk's NiDirectionalLight
             // RTTI arm pushes it into gw_directionalLights.
