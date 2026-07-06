@@ -223,7 +223,7 @@ namespace IPC {
     // shapes carry a real bindless slot. srcBlend/destBlend are D3DBLEND_* (translated from
     // NiAlphaProperty); SK1 draws SRCALPHA/INVSRCALPHA, so the host ignores them for now and SK2
     // buckets draws by blend-pair. Drawn FIRST in the host colour pass (depth off) so it sits behind
-    // the opaque world. 108 bytes.
+    // the opaque world. 116 bytes.
     struct SkyDrawWire {
         std::uint32_t slot;
         float         world[16];
@@ -243,6 +243,13 @@ namespace IPC {
         // mirror so it stays round in the mirrored view (the moons arrive camera-faced too but look
         // fine, so only the sun is flagged). 0 for every other sky shape. Appended (offset-stable).
         std::uint32_t isSunDisc;
+        // SK3 cloud scroll: MW scrolls the cloud layer by REWRITING the shape's UVs in the mesh
+        // data every frame (the per-frame sky revisionID bump), but sky VBs ship ONCE — the host
+        // clouds froze at their capture-time scroll position (F11 re-toggle "fixed" it by
+        // re-capturing). The client diffs the live vertex-0 UV against the uploaded baseline and
+        // ships the uniform offset; sky.vert adds it to the baked UV (wrap sampler handles the
+        // modulo). Zero for every non-UV-animated sky shape. Appended (offset-stable).
+        float         uvOffset[2];
     };
 
     // Per-frame sky draw cap. SK1 draws only the dome; the full sky subtree is ~15 shapes (SK2).

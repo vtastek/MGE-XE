@@ -5985,6 +5985,10 @@ namespace ForgeRender {
                 finst[idx * kStaticInstU32 + 2] = it.matColor[0];
                 finst[idx * kStaticInstU32 + 3] = it.matColor[1];
                 finst[idx * kStaticInstU32 + 4] = it.matColor[2];
+                // SK3 cloud scroll (mirror): same matAmbient-lane transport as the main sky pass.
+                finst[idx * kStaticInstU32 + 5] = it.uvOffset[0];
+                finst[idx * kStaticInstU32 + 6] = it.uvOffset[1];
+                finst[idx * kStaticInstU32 + 7] = 0.0f;
                 finst[idx * kStaticInstU32 + 11] = it.matAlpha;
 
                 Buffer*  meshVb     = m.inArena ? g_live.pArenaVB : m.vb;
@@ -6065,14 +6069,27 @@ namespace ForgeRender {
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetSky);
             Pipeline* curSkyPipe = g_live.pSkyPipeline;
 
+            // [sk-diag host] which sky items get skipped and why — the client packs N but the
+            // host draws fewer from frame 1. Throttled dump. Remove after root-cause.
+            static uint32_t s_skySkipLog = 0;
+            const bool logSkips = ((s_skySkipLog++ % 300) == 0);
             for (uint32_t k = 0; k < nSky; ++k) {
                 const IPC::SkyDrawWire& it = skyItems[k];
                 const uint32_t slot = it.slot;
                 if (slot >= g_meshHigh || !g_meshes[slot].valid) {
+                    if (logSkips) {
+                        LOG::logline("!! [sk-diag host] item %u SKIP notUploaded slot=%u (meshHigh=%u valid=%d) tex=%u",
+                                     k, slot, g_meshHigh,
+                                     (slot < g_meshHigh) ? (int)g_meshes[slot].valid : -1, it.texIndex);
+                    }
                     continue;   // mesh not uploaded yet
                 }
                 HostMesh& m = g_meshes[slot];
                 if (m.skinned || m.multimap) {
+                    if (logSkips) {
+                        LOG::logline("!! [sk-diag host] item %u SKIP kind slot=%u skinned=%d multimap=%d tex=%u",
+                                     k, slot, (int)m.skinned, (int)m.multimap, it.texIndex);
+                    }
                     continue;   // sky uses the lean GeomVertexWire layout only
                 }
                 const uint32_t idx = skyDrawn;
@@ -6111,6 +6128,11 @@ namespace ForgeRender {
                 finst[idx * kStaticInstU32 + 2] = it.matColor[0];
                 finst[idx * kStaticInstU32 + 3] = it.matColor[1];
                 finst[idx * kStaticInstU32 + 4] = it.matColor[2];
+                // SK3 cloud scroll: uv offset rides the matAmbient lane (slots 5-7 = TEXCOORD4,
+                // unused by sky draws until now); sky.vert adds .xy to the baked UV.
+                finst[idx * kStaticInstU32 + 5] = it.uvOffset[0];
+                finst[idx * kStaticInstU32 + 6] = it.uvOffset[1];
+                finst[idx * kStaticInstU32 + 7] = 0.0f;
                 finst[idx * kStaticInstU32 + 11] = it.matAlpha;
 
                 // Arena (bind-once + offsets) vs dynamic-ring (own VB/IB) source.

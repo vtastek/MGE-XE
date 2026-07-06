@@ -76,6 +76,17 @@ namespace MGE::GeometryCache {
         // Forge sky pass sorts its draw list by this so multiple alpha-blended shapes layer
         // correctly. Only meaningful for isSky entries; stale (but harmless) otherwise.
         uint16_t skyOrder;
+        // SK3 cloud scroll: MW scrolls the cloud layer by rewriting the shape's UVs in the
+        // mesh data every frame, but sky VBs ship to the host ONCE — without this the host
+        // clouds freeze at their capture-time scroll position. skyBaseUV/skyBaseUVLast =
+        // vertex 0 / last-vertex UV at upload (the baseline baked into the shipped VB);
+        // skyUVOffset = live vertex-0 UV − baseline, refreshed by the per-frame sky walk and
+        // shipped in SkyDrawWire.uvOffset (sky.vert adds it; wrap sampler handles the modulo).
+        // skyBaseUVLast exists only for the one-shot uniformity check (MW is expected to
+        // shift ALL verts by the same delta). Only meaningful for isSky entries; zero otherwise.
+        float    skyBaseUV[2];
+        float    skyBaseUVLast[2];
+        float    skyUVOffset[2];
         // Material (pointers into NI memory — valid for the session)
         IDirect3DTexture9* d3dTexture;  // null if no base texture
         // Terrain decal overlay (TexturingProperty maps[6] = DECAL_1): the second
