@@ -48,9 +48,11 @@ float4 PS_MAIN( VSOutput In )
 
     // AO sample + toggles — identical to opaque.frag (blended shapes share the scene lighting).
     uint   aoFlags  = (uint)(gFrameData.debugParams.w + 0.5f);
-    // AT3 triage (panel "ALPHA: highlight magenta", debug bit3): paint every sorted-alpha draw
-    // solid magenta so the alpha-pass set is identifiable vs opaque (opaque.frag ignores bit3).
-    if ((aoFlags & 8u) != 0u) { RETURN(float4(1.0f, 0.0f, 1.0f, 1.0f)); }
+    // C3 debug (panel "ALPHA: caster classify colors", debug bit3): the host replaces each
+    // draw's matDiffuse instance floats with a shadow-caster classification color — GREEN
+    // caster / RED not-alpha-over / ORANGE fading / WHITE strict reject / BLUE captured /
+    // GRAY casters-off. Returned flat so the alpha set reads at a glance (opaque ignores bit3).
+    if ((aoFlags & 8u) != 0u) { RETURN(float4(In.MatDiffuse, 1.0f)); }
     float2 aoUv     = In.Position.xy * gFrameData.debugParams.yz;
     float4 aoSample = SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
     if ((aoFlags & 2u) != 0u) { N = normalize(aoSample.rgb); }

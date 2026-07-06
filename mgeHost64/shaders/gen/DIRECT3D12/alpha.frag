@@ -1109,11 +1109,13 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     uint aoFlags = (uint)(gFrameData.debugParams.w + 0.5f);
 
 
-    if ((aoFlags & 8u) != 0u) { RETURN(float4(1.0f, 0.0f, 1.0f, 1.0f)); }
+
+
+    if ((aoFlags & 8u) != 0u) { RETURN(float4(In.MatDiffuse, 1.0f)); }
     float2 aoUv = In.Position.xy * gFrameData.debugParams.yz;
     float4 aoSample = SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
     if ((aoFlags & 2u) != 0u) { N = normalize(aoSample.rgb); }
-#line 68 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/alpha.frag.fsl"
+#line 70 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/alpha.frag.fsl"
     float ndl = saturate(dot(N, -gFrameData.sunDir.xyz));
     float3 d = gFrameData.sunCol.rgb * ndl;
     float3 a = ((aoFlags & 4u) != 0u) ? float3(1.0f, 1.0f, 1.0f) : gFrameData.ambCol.rgb;
