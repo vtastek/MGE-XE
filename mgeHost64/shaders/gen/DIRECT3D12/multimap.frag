@@ -1141,6 +1141,20 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
             float att = 1.0f / max(fo.z * dist2 + fo.y * dist + fo.x, 1e-4f);
             att *= 1.0f - smoothstep(radius, 2.0f * radius, dist);
 
+
+
+
+
+
+            uint slotP1 = (uint)gLights.lights[i * 3u + 2u].w;
+            if (slotP1 != 0u)
+            {
+                uint2 mw = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xy;
+                uint s = slotP1 - 1u;
+                uint nib = ((s < 8u ? mw.x : mw.y) >> ((s & 7u) * 4u)) & 0xFu;
+                att *= float(nib) * (1.0f / 15.0f);
+            }
+
             float lambert = saturate(dot(N, toLight) * invDist);
             d += lambert * att * lightCol;
         }
@@ -1207,6 +1221,11 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     if (dbg == 1u || dbg == 2u) {
         float dist = length(In.WorldPos - gFrameData.eyePos.xyz);
         float g = saturate(dist * (1.0f / 8192.0f));
+        return (float4(g, g, g, 1.0f));
+    }
+    if (dbg == 10u) {
+        uint2 mw = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xy;
+        float g = float(mw.x & 0xFu) * (1.0f / 15.0f);
         return (float4(g, g, g, 1.0f));
     }
     return (float4(c, 1.0f));
