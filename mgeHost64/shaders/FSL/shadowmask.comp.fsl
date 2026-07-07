@@ -10,13 +10,60 @@
 //   ref   = reverse-Z depth n(f-z)/(z(f-n)) along the face axis, n = maskParams.y, f = 2r
 //
 // stored > ref * (1+slack) means a caster is meaningfully NEARER the light than this pixel
-// (reverse-Z: nearer = larger) → shadowed. The 4-bit visibility (hard 0/15 in P1; PCF is the
-// P5 polish) packs into the R32G32_UINT mask the forward frags load per light.
+// (reverse-Z: nearer = larger) → shadowed. The per-texel test is filtered with bilinear PCF
+// (compare-then-interpolate over a small grid) and packed as a 4-bit visibility (0 shadowed
+// .. 15 lit) into the R32G32_UINT mask the forward frags load per light.
 //
-// This whole file is HOT-RELOADABLE (rides the gtao dxil mtime poll / F8) — bias/debug
+// Forge's 11 built-in static samplers are all CMP_NEVER (no comparison sampler exists), so
+// the PCF is done manually: point-load the atlas texels around the fractional projection and
+// bilerp the BINARY comparisons. Filtering the comparison (not the depth) is correct across
+// depth discontinuities; the bilinear sub-texel weight is what removes the texel-grid
+// staircase, and the grid radius widens the penumbra.
+//
+// This whole file is HOT-RELOADABLE (rides the gtao dxil mtime poll / F8) — bias/PCF/debug
 // experiments never need a host restart.
 
 #include "shadowmask.srt.h"
+
+// PCF grid radius in bilinear taps. R=1 → a 3x3 grid of bilinear taps (each tap = 4 loads).
+// Bilinear alone kills the staircase; the grid softens the penumbra. Hot-tunable: bump and
+// save (F8 reload). Cost is (2R+1)^2 * 4 atlas loads per ACTIVE slot per pixel.
+#define SHADOW_PCF_R 1
+
+// Reverse-Z shadow test at ONE atlas texel, clamped inside the face sub-tile so a tap can
+// never bleed onto a neighbouring cube face. Returns 1 = lit, 0 = shadowed.
+float shadowLitAt(int2 tp, int2 tmin, int2 tmax, float thresh)
+{
+    tp = clamp(tp, tmin, tmax);
+    float stored = LoadTex2D(gShadowAtlas, NO_SAMPLER, tp, 0).r;
+    return (stored > thresh) ? 0.0f : 1.0f;
+}
+
+// Sub-texel bilinear PCF: compare the 4 texels around the fractional atlas position and
+// bilerp the BINARY results (compare-then-filter — correct at depth discontinuities, unlike
+// bilinear-sampling the depth first). One tap already gives a smooth, staircase-free edge.
+float shadowBilinear(float2 ap, int2 tmin, int2 tmax, float thresh)
+{
+    float2 p = ap - 0.5f;                 // shift to texel-centre space (texel c centred at c+0.5)
+    int2   b = int2(floor(p));
+    float2 f = p - float2(b);
+    float s00 = shadowLitAt(b + int2(0, 0), tmin, tmax, thresh);
+    float s10 = shadowLitAt(b + int2(1, 0), tmin, tmax, thresh);
+    float s01 = shadowLitAt(b + int2(0, 1), tmin, tmax, thresh);
+    float s11 = shadowLitAt(b + int2(1, 1), tmin, tmax, thresh);
+    return lerp(lerp(s00, s10, f.x), lerp(s01, s11, f.x), f.y);
+}
+
+// Reconstruct the CAMERA-RELATIVE world position at an integer pixel from its device depth —
+// same reverse-Z unproject as the centre pixel, reused for the depth-normal reconstruction.
+float3 reconstructWorldPx(int2 p, float dz, float2 invScreen)
+{
+    float2 uv   = (float2(p) + 0.5f) * invScreen;
+    float  ndcX = uv.x * 2.0f - 1.0f;
+    float  ndcY = 1.0f - uv.y * 2.0f;
+    float4 wp   = mul(gShadowMaskParams.invViewProj, float4(ndcX, ndcY, dz, 1.0f));
+    return wp.xyz / wp.w;
+}
 
 ROOT_SIGNATURE(ComputeRootSignature)
 NUM_THREADS(8, 8, 1)
@@ -34,18 +81,49 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     // Reverse-Z far/cleared = 0.0 (sky / no geometry) → leave fully lit.
     if (deviceZ > 0.0f && activeBits != 0u)
     {
-        float2 uv   = (float2(px) + 0.5f) * invScreen;
-        float  ndcX = uv.x * 2.0f - 1.0f;
-        float  ndcY = 1.0f - uv.y * 2.0f;
-        float4 wp   = mul(gShadowMaskParams.invViewProj, float4(ndcX, ndcY, deviceZ, 1.0f));
-        float3 P    = wp.xyz / wp.w;                   // camera-relative world position
+        float3 P = reconstructWorldPx(px, deviceZ, invScreen);   // camera-relative world position
+
+        // Reconstruct the receiver surface normal from neighbouring depth, silhouette-robust:
+        // pick the SMALLER world-space delta on each screen axis so the tangent basis never
+        // bridges a depth discontinuity. Camera sits at the origin (camera-relative world), so
+        // flip N to face the eye. This normal drives the live normal-offset bias below, which
+        // decouples the contact gap (face-on) from acne (grazing) that plain depth bias cannot.
+        int2   scr = int2(gShadowMaskParams.screenParams.xy);
+        int2   pR  = min(px + int2(1, 0), scr - int2(1, 1));
+        int2   pL  = max(px - int2(1, 0), int2(0, 0));
+        int2   pU  = min(px + int2(0, 1), scr - int2(1, 1));
+        int2   pD  = max(px - int2(0, 1), int2(0, 0));
+        float3 Pr  = reconstructWorldPx(pR, LoadTex2D(gShadowLinDepth, NO_SAMPLER, pR, 0).r, invScreen);
+        float3 Pl  = reconstructWorldPx(pL, LoadTex2D(gShadowLinDepth, NO_SAMPLER, pL, 0).r, invScreen);
+        float3 Pu  = reconstructWorldPx(pU, LoadTex2D(gShadowLinDepth, NO_SAMPLER, pU, 0).r, invScreen);
+        float3 Pd  = reconstructWorldPx(pD, LoadTex2D(gShadowLinDepth, NO_SAMPLER, pD, 0).r, invScreen);
+        float3 dRt = Pr - P;  float3 dLt = P - Pl;
+        float3 dUp = Pu - P;  float3 dDn = P - Pd;
+        float3 dpx = (dot(dRt, dRt) < dot(dLt, dLt)) ? dRt : dLt;
+        float3 dpy = (dot(dUp, dUp) < dot(dDn, dDn)) ? dUp : dDn;
+        float3 N   = normalize(cross(dpx, dpy));
+        if (dot(N, -P) < 0.0f) { N = -N; }             // face the eye (camera at origin)
+        float  normalOffsetK = gShadowMaskParams.biasParams.y;   // offset in atlas texels (live)
 
         for (uint s = 0u; s < (uint)MAX_SHADOW_SLOTS; ++s)
         {
             if ((activeBits & (1u << s)) == 0u) { continue; }
             float4 posRad = gShadowMaskParams.slotPosRad[s];
             float4 tile   = gShadowMaskParams.slotTile[s];
-            float3 d      = P - posRad.xyz;            // light -> pixel
+
+            // Normal-offset bias: push the sample OFF the surface along N before the atlas test,
+            // scaled by grazing (sin of the N·L angle) and by the world size of one atlas texel
+            // at this receiver. Face-on surfaces get ~zero offset (tight contact stays), grazing
+            // surfaces (where acne lives) get the most — so gap and acne stop fighting.
+            float3 Ldir  = posRad.xyz - P;
+            float  ndotl = dot(N, Ldir * rsqrt(max(dot(Ldir, Ldir), 1e-8f)));
+            float  sinT  = sqrt(saturate(1.0f - ndotl * ndotl));
+            float3 ad0   = abs(P - posRad.xyz);
+            float  ma0   = max(ad0.x, max(ad0.y, ad0.z));
+            float  texelW = 2.0f * ma0 / max(tile.z, 1.0f);
+            float3 Poff  = P + N * (normalOffsetK * sinT * texelW);
+
+            float3 d      = Poff - posRad.xyz;         // light -> pixel (normal-offset applied)
             float  nearZ  = gShadowMaskParams.maskParams.y;
             float  farZ   = 2.0f * posRad.w;           // shadow range = the light's soft-cutoff end
             float3 ad     = abs(d);
@@ -62,20 +140,37 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
             uint nib = 15u;
             if (ma > nearZ && ma < farZ)
             {
-                // Texel-inset gutter: clamp inside this face's sub-tile so the tap can never
-                // land on a neighbouring face's texels.
-                float  inset = 1.0f / tile.z;
-                float2 fuv   = clamp(float2(u, v) / ma * 0.5f + 0.5f,
-                                     f2(inset), f2(1.0f - inset));
-                float2 fpx   = float2(tile.x + float(face % 3u) * tile.z,
-                                      tile.y + float(face / 3u) * tile.z);
-                float  stored = LoadTex2D(gShadowAtlas, NO_SAMPLER, int2(fpx + fuv * tile.z), 0).r;
+                // Reverse-Z reference along the face axis; nearer = larger. Two live acne/gap
+                // knobs on the threshold: maskParams.z = RELATIVE (multiplicative) slack — biases
+                // more near the light; biasParams.x = ABSOLUTE add — the contact/interpenetration
+                // knob that replaces the old PSO constant depth bias (higher = less acne, more
+                // contact gap). The PSO now carries only the slope-scaled grazing-acne term.
+                float refZ   = nearZ * (farZ - ma) / (ma * (farZ - nearZ));
+                float thresh = refZ * (1.0f + gShadowMaskParams.maskParams.z)
+                             + gShadowMaskParams.biasParams.x + 1e-6f;
 
-                // Reverse-Z reference along the face axis; nearer = larger. Relative slack +
-                // epsilon = the acne knob (PSO bias already pushed casters slightly farther).
-                float refZ = nearZ * (farZ - ma) / (ma * (farZ - nearZ));
-                bool  shadowed = stored > refZ * (1.0f + gShadowMaskParams.maskParams.z) + 1e-6f;
-                nib = shadowed ? 0u : 15u;
+                // Face sub-tile origin + integer bounds. Every PCF tap is clamped into
+                // [tmin, tmax] so the kernel can never sample a neighbouring face's texels —
+                // replaces the old single-texel fuv inset gutter.
+                float2 faceOrg = float2(tile.x + float(face % 3u) * tile.z,
+                                        tile.y + float(face / 3u) * tile.z);
+                int2   tmin    = int2(faceOrg);
+                int2   tmax    = tmin + int2((int)tile.z - 1, (int)tile.z - 1);
+
+                // Continuous atlas-pixel position of this pixel's projection onto the face.
+                float2 fuv = float2(u, v) / ma * 0.5f + 0.5f;
+                float2 ap  = faceOrg + fuv * tile.z;
+
+                // Bilinear PCF over a (2R+1)^2 grid of bilinear taps.
+                float vis = 0.0f;
+                UNROLL for (int j = -SHADOW_PCF_R; j <= SHADOW_PCF_R; ++j)
+                UNROLL for (int i = -SHADOW_PCF_R; i <= SHADOW_PCF_R; ++i)
+                {
+                    vis += shadowBilinear(ap + float2(float(i), float(j)), tmin, tmax, thresh);
+                }
+                vis *= 1.0f / float((2 * SHADOW_PCF_R + 1) * (2 * SHADOW_PCF_R + 1));
+
+                nib = (uint)(saturate(vis) * 15.0f + 0.5f);
             }
             if (dbg == 1u) { nib = (face + 1u) * 2u; }   // face-id bands (convention check FIRST)
             if (dbg == 2u)

@@ -960,7 +960,7 @@ SamplerState gSamplerAnisotropic : register( s10 , space100 ) ;
 #line 11 "FSL/shaders.list"
 #line 165 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
-#line 19 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
+#line 26 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.srt.h"
 #line 18 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.srt.h"
 STRUCT(ShadowMaskParams)
@@ -973,14 +973,63 @@ STRUCT(ShadowMaskParams)
     float4 maskParams;
     float4 slotPosRad[ 16 ];
     float4 slotTile[ 16 ];
-#line 28
+
+
+
+
+
+
+
+
+    float4 biasParams;
+#line 37
 };
 
         CBUFFER(ShadowMaskParams) gShadowMaskParams :  register(b0,space2);
         Tex2D(float) gShadowLinDepth :  register(t1,space2);
         Tex2D(float) gShadowAtlas :  register(t2,space2);
         WTex2D(uint2) gShadowMaskOut :  register(u3,space2);
-#line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
+#line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
+
+
+
+
+
+
+
+
+float shadowLitAt(int2 tp, int2 tmin, int2 tmax, float thresh)
+{
+    tp = clamp(tp, tmin, tmax);
+    float stored = LoadTex2D(gShadowAtlas, NO_SAMPLER, tp, 0).r;
+    return (stored > thresh) ? 0.0f : 1.0f;
+}
+
+
+
+
+float shadowBilinear(float2 ap, int2 tmin, int2 tmax, float thresh)
+{
+    float2 p = ap - 0.5f;
+    int2 b = int2(floor(p));
+    float2 f = p - float2(b);
+    float s00 = shadowLitAt(b + int2(0, 0), tmin, tmax, thresh);
+    float s10 = shadowLitAt(b + int2(1, 0), tmin, tmax, thresh);
+    float s01 = shadowLitAt(b + int2(0, 1), tmin, tmax, thresh);
+    float s11 = shadowLitAt(b + int2(1, 1), tmin, tmax, thresh);
+    return lerp(lerp(s00, s10, f.x), lerp(s01, s11, f.x), f.y);
+}
+
+
+
+float3 reconstructWorldPx(int2 p, float dz, float2 invScreen)
+{
+    float2 uv = (float2(p) + 0.5f) * invScreen;
+    float ndcX = uv.x * 2.0f - 1.0f;
+    float ndcY = 1.0f - uv.y * 2.0f;
+    float4 wp = mul(gShadowMaskParams.invViewProj, float4(ndcX, ndcY, dz, 1.0f));
+    return wp.xyz / wp.w;
+}
 
 [RootSignature( "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)" )]
 NUM_THREADS(8, 8, 1)
@@ -998,18 +1047,49 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
     if (deviceZ > 0.0f && activeBits != 0u)
     {
-        float2 uv = (float2(px) + 0.5f) * invScreen;
-        float ndcX = uv.x * 2.0f - 1.0f;
-        float ndcY = 1.0f - uv.y * 2.0f;
-        float4 wp = mul(gShadowMaskParams.invViewProj, float4(ndcX, ndcY, deviceZ, 1.0f));
-        float3 P = wp.xyz / wp.w;
+        float3 P = reconstructWorldPx(px, deviceZ, invScreen);
+
+
+
+
+
+
+        int2 scr = int2(gShadowMaskParams.screenParams.xy);
+        int2 pR = min(px + int2(1, 0), scr - int2(1, 1));
+        int2 pL = max(px - int2(1, 0), int2(0, 0));
+        int2 pU = min(px + int2(0, 1), scr - int2(1, 1));
+        int2 pD = max(px - int2(0, 1), int2(0, 0));
+        float3 Pr = reconstructWorldPx(pR, LoadTex2D(gShadowLinDepth, NO_SAMPLER, pR, 0).r, invScreen);
+        float3 Pl = reconstructWorldPx(pL, LoadTex2D(gShadowLinDepth, NO_SAMPLER, pL, 0).r, invScreen);
+        float3 Pu = reconstructWorldPx(pU, LoadTex2D(gShadowLinDepth, NO_SAMPLER, pU, 0).r, invScreen);
+        float3 Pd = reconstructWorldPx(pD, LoadTex2D(gShadowLinDepth, NO_SAMPLER, pD, 0).r, invScreen);
+        float3 dRt = Pr - P; float3 dLt = P - Pl;
+        float3 dUp = Pu - P; float3 dDn = P - Pd;
+        float3 dpx = (dot(dRt, dRt) < dot(dLt, dLt)) ? dRt : dLt;
+        float3 dpy = (dot(dUp, dUp) < dot(dDn, dDn)) ? dUp : dDn;
+        float3 N = normalize(cross(dpx, dpy));
+        if (dot(N, -P) < 0.0f) { N = -N; }
+        float normalOffsetK = gShadowMaskParams.biasParams.y;
 
         for (uint s = 0u; s < (uint) 16 ; ++s)
         {
             if ((activeBits & (1u << s)) == 0u) { continue; }
             float4 posRad = gShadowMaskParams.slotPosRad[s];
             float4 tile = gShadowMaskParams.slotTile[s];
-            float3 d = P - posRad.xyz;
+
+
+
+
+
+            float3 Ldir = posRad.xyz - P;
+            float ndotl = dot(N, Ldir * rsqrt(max(dot(Ldir, Ldir), 1e-8f)));
+            float sinT = sqrt(saturate(1.0f - ndotl * ndotl));
+            float3 ad0 = abs(P - posRad.xyz);
+            float ma0 = max(ad0.x, max(ad0.y, ad0.z));
+            float texelW = 2.0f * ma0 / max(tile.z, 1.0f);
+            float3 Poff = P + N * (normalOffsetK * sinT * texelW);
+
+            float3 d = Poff - posRad.xyz;
             float nearZ = gShadowMaskParams.maskParams.y;
             float farZ = 2.0f * posRad.w;
             float3 ad = abs(d);
@@ -1028,18 +1108,35 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
             {
 
 
-                float inset = 1.0f / tile.z;
-                float2 fuv = clamp(float2(u, v) / ma * 0.5f + 0.5f,
-                                     f2(inset), f2(1.0f - inset));
-                float2 fpx = float2(tile.x + float(face % 3u) * tile.z,
-                                      tile.y + float(face / 3u) * tile.z);
-                float stored = LoadTex2D(gShadowAtlas, NO_SAMPLER, int2(fpx + fuv * tile.z), 0).r;
 
 
 
                 float refZ = nearZ * (farZ - ma) / (ma * (farZ - nearZ));
-                bool shadowed = stored > refZ * (1.0f + gShadowMaskParams.maskParams.z) + 1e-6f;
-                nib = shadowed ? 0u : 15u;
+                float thresh = refZ * (1.0f + gShadowMaskParams.maskParams.z)
+                             + gShadowMaskParams.biasParams.x + 1e-6f;
+
+
+
+
+                float2 faceOrg = float2(tile.x + float(face % 3u) * tile.z,
+                                        tile.y + float(face / 3u) * tile.z);
+                int2 tmin = int2(faceOrg);
+                int2 tmax = tmin + int2((int)tile.z - 1, (int)tile.z - 1);
+
+
+                float2 fuv = float2(u, v) / ma * 0.5f + 0.5f;
+                float2 ap = faceOrg + fuv * tile.z;
+
+
+                float vis = 0.0f;
+                UNROLL for (int j = - 1 ; j <=  1 ; ++j)
+                UNROLL for (int i = - 1 ; i <=  1 ; ++i)
+                {
+                    vis += shadowBilinear(ap + float2(float(i), float(j)), tmin, tmax, thresh);
+                }
+                vis *= 1.0f / float((2 *  1  + 1) * (2 *  1  + 1));
+
+                nib = (uint)(saturate(vis) * 15.0f + 0.5f);
             }
             if (dbg == 1u) { nib = (face + 1u) * 2u; }
             if (dbg == 2u)

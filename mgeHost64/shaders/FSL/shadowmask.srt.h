@@ -25,6 +25,15 @@ STRUCT(ShadowMaskParams)
     DATA(float4,   maskParams,   None);
     DATA(float4,   slotPosRad[MAX_SHADOW_SLOTS], None);   // xyz = camera-relative light pos, w = radius (far = 2r)
     DATA(float4,   slotTile[MAX_SHADOW_SLOTS],   None);   // xy = 3x2 face-block origin (atlas px), z = face size (px)
+    // biasParams: x = ABSOLUTE reverse-Z compare bias (contact/interpenetration knob, live). Added
+    //             to the compare threshold in place of the old PSO constant depth bias (higher =
+    //             less acne, more contact gap).
+    //             y = NORMAL-OFFSET bias in atlas texels (live). Pushes the receiver sample off
+    //             its surface along the depth-reconstructed normal, scaled by grazing angle — the
+    //             sole grazing-acne mechanism now that the PSO slope-scaled term is zeroed. Face-on
+    //             contact stays tight (offset → 0 there); grazing surfaces get the most.
+    // Appended at the struct tail so every slot offset above stays fixed.
+    DATA(float4,   biasParams,   None);
 };
 
 BEGIN_SRT(ShadowMaskSrtData)
