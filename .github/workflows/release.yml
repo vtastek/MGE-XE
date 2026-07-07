@@ -147,6 +147,8 @@ jobs:
             "$pkg\DIRECT3D12\opaque.frag", "$pkg\DIRECT3D12\opaque.vert",
             "$pkg\fonts\ComicRelief.ttf",
             "$pkg\Data Files\MWSE\lib\msoc.dll",
+            "$pkg\Data Files\MWSE\mods\msoc\main.lua",
+            "$pkg\Data Files\MWSE\mods\msoc\config.lua",
             "$pkg\MGE XE Readme.txt", "$pkg\customfunctions.dat"
           )
           $missing = $required | Where-Object { -not (Test-Path $_) }
