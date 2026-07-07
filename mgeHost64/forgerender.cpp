@@ -1129,6 +1129,14 @@ namespace {
         Shader*        pSkinnedDepthShader = nullptr;
         Pipeline*      pSkinnedPrepassPipeline = nullptr;
         Pipeline*      pSkinnedPrepassPipelineMirror = nullptr;
+        // C4a skinned shadow casters: skinned.vert + depthonly.frag into the SINGLE-SAMPLE atlas
+        // (prepass PSOs above are MSAA-shaped). Cull set mirrors the static caster PSOs so
+        // g_shadowCasterCull picks identically. Bones + face VP come from bound sets at draw time.
+        Pipeline*      pSkinnedShadowPipeline = nullptr;         // CULL_BACK CCW
+        Pipeline*      pSkinnedShadowPipelineMirror = nullptr;   // CULL_BACK CW
+        Pipeline*      pSkinnedShadowPipelineNone = nullptr;     // CULL_NONE (two-sided)
+        Pipeline*      pSkinnedShadowPipelineFront = nullptr;    // CULL_FRONT CCW
+        Pipeline*      pSkinnedShadowPipelineFrontMirror = nullptr; // CULL_FRONT CW
         Buffer*        pBonesBuf[16] = {};               // bone windows: one 64KB cbuffer per window, persistent-mapped
         DescriptorSet* pPerBatchSetSkin = nullptr;       // gBatch bound to pBonesBuf[], kMaxBatches instances
         // Skinned instance-rate VB of uint2 { .x = Base (bone offset in window), .y = texIndex }.
@@ -1504,6 +1512,15 @@ namespace {
     // concatenated g_shadowCasters CPU list.
     struct ShadowRender { uint32_t slot; uint32_t casterBegin; uint32_t casterEnd; };
     std::vector<ShadowRender> g_shadowRenders;
+
+    // C4a skinned shadow casters (this-frame poses). Pre-walked from the skinned blob in the SAME
+    // order the skinned Z-prepass assigns firstInstance (index i), BEFORE shadow scheduling — so a
+    // slot can be dirty-marked when a skinned part is in its reach. cRel = camera-relative world
+    // centre (localCenter through the root bone, same space as the shadow face VP); rad = a padded
+    // world radius. window = i/kSkinnedPerWindow (the bone window pPerBatchSetSkin binds). The bone
+    // palettes these draw from are filled by the prepass (runs before the shadow face pass).
+    struct SkinnedCaster { uint32_t index; uint32_t window; uint32_t mirror; uint32_t slot; float cRel[3]; float rad; };
+    std::vector<SkinnedCaster> g_skinnedCasters;
     // The client's camera-relative shift eye (lighting[24..26]) — the SAME value buildDrawList/
     // buildLightList subtracted this frame, so rel + this = the client's absolute world. Used to
     // absolutize lastWorld records and de-absolutize them into the shadow window.
@@ -2775,6 +2792,31 @@ namespace {
                 addPipeline(R, &skpPd, &g_live.pSkinnedPrepassPipelineMirror);
                 if (!g_live.pSkinnedPrepassPipelineMirror) {
                     std::printf("[forge] addPipeline(skinned prepass mirror) FAILED\n");
+                    return false;
+                }
+
+                // C4a: skinned shadow-caster PSOs — same skinned.vert+depthonly.frag, but into the
+                // SINGLE-SAMPLE atlas (SC1) with the caster cull set (BACK CCW/CW, NONE, FRONT CCW/CW).
+                spg.mSampleCount = SAMPLE_COUNT_1;
+                RasterizerStateDesc skShBack = skRaster;                 // CULL_BACK CCW
+                spg.pRasterizerState = &skShBack;
+                addPipeline(R, &skpPd, &g_live.pSkinnedShadowPipeline);
+                RasterizerStateDesc skShBackM = skRasterMirror;          // CULL_BACK CW
+                spg.pRasterizerState = &skShBackM;
+                addPipeline(R, &skpPd, &g_live.pSkinnedShadowPipelineMirror);
+                RasterizerStateDesc skShNone = skRaster; skShNone.mCullMode = CULL_MODE_NONE;
+                spg.pRasterizerState = &skShNone;
+                addPipeline(R, &skpPd, &g_live.pSkinnedShadowPipelineNone);
+                RasterizerStateDesc skShFront = skRaster; skShFront.mCullMode = CULL_MODE_FRONT;
+                spg.pRasterizerState = &skShFront;
+                addPipeline(R, &skpPd, &g_live.pSkinnedShadowPipelineFront);
+                RasterizerStateDesc skShFrontM = skShFront; skShFrontM.mFrontFace = FRONT_FACE_CW;
+                spg.pRasterizerState = &skShFrontM;
+                addPipeline(R, &skpPd, &g_live.pSkinnedShadowPipelineFrontMirror);
+                if (!g_live.pSkinnedShadowPipeline || !g_live.pSkinnedShadowPipelineMirror ||
+                    !g_live.pSkinnedShadowPipelineNone || !g_live.pSkinnedShadowPipelineFront ||
+                    !g_live.pSkinnedShadowPipelineFrontMirror) {
+                    std::printf("[forge] addPipeline(skinned shadow) FAILED\n");
                     return false;
                 }
             }
@@ -4094,7 +4136,7 @@ namespace {
     bool  g_shadowEnable     = true;
     bool  g_shadowFaceDebug  = false;   // shadowmask debug 1: nibble = face id (convention check FIRST)
     bool  g_shadowAtlasDebug = false;   // shadowmask debug 2: nibble = atlas depth (slot-0 block on screen)
-    float g_shadowSlack      = 0.026f;  // relative reverse-Z compare slack (acne knob; live via mask params).
+    float g_shadowSlack      = 0.030f;  // relative reverse-Z compare slack (acne knob; live via mask params).
                                         // Tuned for the CULL_FRONT (back-face) caster default below — storing the
                                         // far faces removes acne, so positive slack just tightens contact.
     float g_shadowBias       = 0.0023f; // ABSOLUTE reverse-Z compare bias (contact/interpenetration knob; live).
@@ -4105,6 +4147,10 @@ namespace {
                                         // the receiver sample along its depth-reconstructed normal, scaled by
                                         // grazing angle (PSO slope bias is 0). Tuned to 1.0; raise to kill any
                                         // residual grazing acne, lower to tighten contacts.
+    bool  g_shadowSkinnedCasters = true; // C4a: skinned NPC/creature/player parts CAST shadows (this-frame
+                                        // poses; reuses the resident bone windows). Off = pre-C4a behavior
+                                        // (only rigid parts cast → partial body shadow). Default ON
+                                        // (verified in-game 2026-07-07). Live A/B via checkbox.
     uint32_t g_shadowCasterCull = 2;    // caster cull mode (live A/B): 0 = CULL_BACK (light-facing faces only),
                                         // 1 = CULL_NONE (two-sided — writes far/under faces, closes the thin
                                         // contact line), 2 = CULL_FRONT (back faces only — acne cure, leaks on
@@ -4277,6 +4323,8 @@ namespace {
         static const char* const kCasterCullNames[] = { "0 back (light faces)", "1 none (two-sided)", "2 front (back faces)" };
         DropdownWidget ddCc = {}; ddCc.pData = &g_shadowCasterCull; ddCc.pNames = kCasterCullNames; ddCc.mCount = 3;
         uiAddComponentWidget(g_uiPanel, "Shadow caster cull", &ddCc, WIDGET_TYPE_DROPDOWN);
+        CheckboxWidget cShSk = {}; cShSk.pData = &g_shadowSkinnedCasters;
+        uiAddComponentWidget(g_uiPanel, "Shadow: skinned casters (NPC bodies)", &cShSk, WIDGET_TYPE_CHECKBOX);
         SliderFloatWidget sShEm = {}; sShEm.pData = &g_shadowEmissiveSkip; sShEm.mMin = 0.0f; sShEm.mMax = 1.5f; sShEm.mStep = 0.05f;
         uiAddComponentWidget(g_uiPanel, "Shadow: emissive caster skip (>1 = off)", &sShEm, WIDGET_TYPE_SLIDER_FLOAT);
         CheckboxWidget cShBc = {}; cShBc.pData = &g_shadowBlendCasters;
@@ -4934,6 +4982,53 @@ namespace ForgeRender {
             mp[16] = (float)g_live.width;        mp[17] = (float)g_live.height;
             mp[18] = 1.0f / (float)g_live.width; mp[19] = 1.0f / (float)g_live.height;
 
+            // C4a: pre-walk this frame's skinned parts BEFORE dirty-marking (scheduling runs before
+            // the skinned Z-prepass that fills the bone windows). SAME blob order + validity as that
+            // prepass, so index i == the firstInstance it assigns. Bone translations are camera-
+            // relative (= shadow face-VP space); bound each part by their centroid + spread + a slop
+            // for limb/vertex extent. A slot with a skinned part in reach is forced to re-render.
+            g_skinnedCasters.clear();
+            if (g_shadowSkinnedCasters && skinnedBlob && skinnedCount && skinnedBytes) {
+                const uint8_t* sp   = (const uint8_t*)skinnedBlob;
+                const uint8_t* sEnd = sp + skinnedBytes;
+                uint32_t idx = 0;
+                for (uint32_t k = 0; k < skinnedCount; ++k) {
+                    if (sp + sizeof(IPC::SkinnedDrawWire) > sEnd) { break; }
+                    IPC::SkinnedDrawWire item;
+                    std::memcpy(&item, sp, sizeof(item));
+                    const uint8_t* palette = sp + sizeof(item);
+                    const uint64_t paletteBytes = (uint64_t)item.numBones * 64;
+                    if (palette + paletteBytes > sEnd) { break; }
+                    sp = palette + paletteBytes;
+                    if (idx >= kMaxSkinned) { continue; }
+                    const uint32_t mslot = item.slot;
+                    if (mslot >= g_meshHigh || !g_meshes[mslot].valid || !g_meshes[mslot].skinned) { continue; }
+                    const uint32_t bones = (item.numBones < kMaxBonesPerPart) ? item.numBones : kMaxBonesPerPart;
+                    float cx = 0.0f, cy = 0.0f, cz = 0.0f;
+                    for (uint32_t bb = 0; bb < bones; ++bb) {
+                        const float* m = (const float*)(palette + (size_t)bb * 64);
+                        cx += m[12]; cy += m[13]; cz += m[14];   // bone world translation (camera-rel)
+                    }
+                    if (bones > 0) { const float inv = 1.0f / (float)bones; cx *= inv; cy *= inv; cz *= inv; }
+                    float maxd2 = 0.0f;
+                    for (uint32_t bb = 0; bb < bones; ++bb) {
+                        const float* m = (const float*)(palette + (size_t)bb * 64);
+                        const float dx = m[12] - cx, dy = m[13] - cy, dz = m[14] - cz;
+                        const float d2 = dx*dx + dy*dy + dz*dz;
+                        if (d2 > maxd2) { maxd2 = d2; }
+                    }
+                    SkinnedCaster sc;
+                    sc.index  = idx;
+                    sc.window = idx / kSkinnedPerWindow;
+                    sc.mirror = item.mirror ? 1u : 0u;
+                    sc.slot   = mslot;
+                    sc.cRel[0] = cx; sc.cRel[1] = cy; sc.cRel[2] = cz;
+                    sc.rad = std::sqrt(maxd2) + 96.0f;   // bone spread + limb/vertex slop
+                    g_skinnedCasters.push_back(sc);
+                    ++idx;
+                }
+            }
+
             // (1) Parse this frame's shadow-eligible lights (id-carrying, r>1). imp = the P1
             // screen-coverage proxy r/max(dist,r) (the contribution metric hopped slots → reverted).
             struct LightInfo { uint32_t idx, id, flags; float pos[3], radius, imp; };
@@ -5053,7 +5148,20 @@ namespace ForgeRender {
                 if (!sl.valid || !sl.activeThisFrame) { continue; }
                 const bool must  = (sl.lastRenderFrame == 0);
                 const bool stale = (sl.lastRenderFrame < g_casterEpoch);   // a caster appeared/moved/expired since we rendered
-                if (must || stale) { dirty.push_back(s); }
+                // C4a: a skinned part in reach re-poses every frame → force this slot to re-render.
+                bool skinnedHit = false;
+                if (g_shadowSkinnedCasters && !g_skinnedCasters.empty()) {
+                    const float lrx = sl.absPos[0] - g_eyeAbsShadow[0];
+                    const float lry = sl.absPos[1] - g_eyeAbsShadow[1];
+                    const float lrz = sl.absPos[2] - g_eyeAbsShadow[2];
+                    const float reach = 2.0f * sl.radius;
+                    for (const SkinnedCaster& sc : g_skinnedCasters) {
+                        const float dx = sc.cRel[0] - lrx, dy = sc.cRel[1] - lry, dz = sc.cRel[2] - lrz;
+                        const float rr = reach + sc.rad;
+                        if (dx*dx + dy*dy + dz*dz <= rr*rr) { skinnedHit = true; break; }
+                    }
+                }
+                if (must || stale || skinnedHit) { dirty.push_back(s); }
             }
             std::sort(dirty.begin(), dirty.end(), [&](uint32_t a, uint32_t b) {
                 const uint32_t ra = g_shadowSlots[a].lastRenderFrame, rb = g_shadowSlots[b].lastRenderFrame;
@@ -5690,6 +5798,50 @@ namespace ForgeRender {
                             cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
                             cmdBindIndexBuffer(g_live.pCmd, hm.ib, INDEX_TYPE_UINT16, 0);
                             cmdDrawIndexedInstanced(g_live.pCmd, hm.indexCount, 0, 1, 0, firstInst);
+                        }
+                    }
+
+                    // C4a: skinned casters for THIS slot/face. The skinned Z-prepass (runs before
+                    // this pass) already filled pBonesBuf + pInstanceBufSkin for every visible skinned
+                    // part; bind the skinned shadow PSO + this face's VP + the part's bone window and
+                    // draw firstInstance=index. Reach-culled against the slot's light sphere.
+                    if (g_shadowSkinnedCasters && !g_skinnedCasters.empty()) {
+                        const ShadowSlot& sl2 = g_shadowSlots[R.slot];
+                        const float lrx = sl2.absPos[0] - g_eyeAbsShadow[0];
+                        const float lry = sl2.absPos[1] - g_eyeAbsShadow[1];
+                        const float lrz = sl2.absPos[2] - g_eyeAbsShadow[2];
+                        const float reach = 2.0f * sl2.radius;
+                        int      skMirror = -1;
+                        uint32_t skWindow = UINT32_MAX;
+                        for (const SkinnedCaster& sc : g_skinnedCasters) {
+                            const float dx = sc.cRel[0] - lrx, dy = sc.cRel[1] - lry, dz = sc.cRel[2] - lrz;
+                            const float rr = reach + sc.rad;
+                            if (dx*dx + dy*dy + dz*dz > rr*rr) { continue; }
+                            if ((int)sc.mirror != skMirror) {
+                                Pipeline* skPso;
+                                switch (g_shadowCasterCull) {
+                                case 1:  skPso = g_live.pSkinnedShadowPipelineNone; break;
+                                case 2:  skPso = sc.mirror ? g_live.pSkinnedShadowPipelineFrontMirror
+                                                           : g_live.pSkinnedShadowPipelineFront; break;
+                                default: skPso = sc.mirror ? g_live.pSkinnedShadowPipelineMirror
+                                                           : g_live.pSkinnedShadowPipeline; break;
+                                }
+                                cmdBindPipeline(g_live.pCmd, skPso);
+                                cmdBindDescriptorSet(g_live.pCmd, b * 6 + f, g_live.pShadowFaceSet);
+                                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                                skMirror = (int)sc.mirror;
+                                skWindow = UINT32_MAX;
+                            }
+                            if (sc.window != skWindow) {
+                                cmdBindDescriptorSet(g_live.pCmd, sc.window, g_live.pPerBatchSetSkin);
+                                skWindow = sc.window;
+                            }
+                            HostMesh& sm = g_meshes[sc.slot];
+                            Buffer*  svbs[2]     = { sm.vb, g_live.pInstanceBufSkin };
+                            uint32_t sstrides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)(2 * sizeof(uint32_t)) };
+                            cmdBindVertexBuffer(g_live.pCmd, 2, svbs, sstrides, nullptr);
+                            cmdBindIndexBuffer(g_live.pCmd, sm.ib, INDEX_TYPE_UINT16, 0);
+                            cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, sc.index);
                         }
                     }
                 }
@@ -10913,6 +11065,11 @@ namespace ForgeRender {
         if (g_live.pSkinnedPipelineMirror) { removePipeline(R, g_live.pSkinnedPipelineMirror); }
         if (g_live.pSkinnedPrepassPipeline)       { removePipeline(R, g_live.pSkinnedPrepassPipeline); }
         if (g_live.pSkinnedPrepassPipelineMirror) { removePipeline(R, g_live.pSkinnedPrepassPipelineMirror); }
+        if (g_live.pSkinnedShadowPipeline)            { removePipeline(R, g_live.pSkinnedShadowPipeline); }
+        if (g_live.pSkinnedShadowPipelineMirror)      { removePipeline(R, g_live.pSkinnedShadowPipelineMirror); }
+        if (g_live.pSkinnedShadowPipelineNone)        { removePipeline(R, g_live.pSkinnedShadowPipelineNone); }
+        if (g_live.pSkinnedShadowPipelineFront)       { removePipeline(R, g_live.pSkinnedShadowPipelineFront); }
+        if (g_live.pSkinnedShadowPipelineFrontMirror) { removePipeline(R, g_live.pSkinnedShadowPipelineFrontMirror); }
         if (g_live.pSkinnedDepthShader)    { removeShader(R, g_live.pSkinnedDepthShader); }
         if (g_live.pSkinnedShader)         { removeShader(R, g_live.pSkinnedShader); }
         // Tier 4 multi-map teardown.
