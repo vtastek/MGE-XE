@@ -1023,8 +1023,11 @@ namespace {
         // analytic face pick → atlas compare) and writes the R32G32_UINT visibility mask the
         // forward frags load — no atlas code in any colour shader, whole path hot-reloadable.
         RenderTarget*  pShadowAtlas = nullptr;            // 4096² D32; RESTS in SHADER_RESOURCE
-        Pipeline*      pShadowPipeline = nullptr;         // FRONT_FACE_CCW, biased depth-only
-        Pipeline*      pShadowPipelineMirror = nullptr;   // FRONT_FACE_CW (mirrored world)
+        Pipeline*      pShadowPipeline = nullptr;         // CULL_BACK, FRONT_FACE_CCW, depth-only
+        Pipeline*      pShadowPipelineMirror = nullptr;   // CULL_BACK, FRONT_FACE_CW (mirrored world)
+        Pipeline*      pShadowPipelineNone = nullptr;     // CULL_NONE (two-sided; winding irrelevant, one PSO)
+        Pipeline*      pShadowPipelineFront = nullptr;    // CULL_FRONT, FRONT_FACE_CCW (store back faces)
+        Pipeline*      pShadowPipelineFrontMirror = nullptr; // CULL_FRONT, FRONT_FACE_CW (mirrored world)
         Shader*        pShadowClearShader = nullptr;      // shadowclear.vert/.frag
         Pipeline*      pShadowClearPipeline = nullptr;    // CMP_ALWAYS + write, no layout
         Buffer*        pShadowFaceCbv[12] = {};           // per-face FrameData copies (512B, persistent-mapped)
@@ -2260,8 +2263,17 @@ namespace {
             shDepth.mDepthFunc = CMP_GEQUAL;       // reverse-Z, matches the main prepass
 
             RasterizerStateDesc shRaster = rasterDesc;             // CULL_BACK + CCW
-            shRaster.mDepthBias = -32;
-            shRaster.mSlopeScaledDepthBias = -2.0f;
+            // Constant depth bias moved OUT of the PSO into a live shader knob (biasParams.x,
+            // g_shadowBias) so contact/interpenetration gap is tunable without a rebuild — the old
+            // baked -32 detached shadows from interpenetrating casters even at slack 0. Only the
+            // slope-scaled grazing-acne term stays baked (it needs the raster-time primitive slope).
+            shRaster.mDepthBias = 0;
+            // Slope-scaled grazing-acne bias ZEROED: the shader-side normal-offset bias
+            // (biasParams.y, g_shadowNormalOffset) is now the sole grazing-acne mechanism. It
+            // offsets the receiver sample along its reconstructed normal scaled by grazing angle,
+            // which decouples acne (grazing) from the contact gap (face-on) that any PSO depth
+            // bias couples together. Nothing acne-related is baked in the caster PSO anymore.
+            shRaster.mSlopeScaledDepthBias = 0.0f;
             RasterizerStateDesc shRasterMirror = shRaster;
             shRasterMirror.mFrontFace = FRONT_FACE_CW;
 
@@ -2281,6 +2293,21 @@ namespace {
             addPipeline(R, &spd, &g_live.pShadowPipeline);
             sg.pRasterizerState = &shRasterMirror;
             addPipeline(R, &spd, &g_live.pShadowPipelineMirror);
+
+            // Live caster-cull A/B variants (g_shadowCasterCull): CULL_NONE writes BOTH faces so the
+            // object's far-side / underside faces reach the atlas — closes the thin unshadowed line
+            // at contact points that CULL_BACK leaves (those faces get culled → coverage hole).
+            // CULL_FRONT stores only back faces (classic acne cure on closed solids; leaks on thin/
+            // open MW geometry). Winding is irrelevant under CULL_NONE, so it needs one PSO.
+            RasterizerStateDesc shRasterNone = shRaster; shRasterNone.mCullMode = CULL_MODE_NONE;
+            sg.pRasterizerState = &shRasterNone;
+            addPipeline(R, &spd, &g_live.pShadowPipelineNone);
+            RasterizerStateDesc shRasterFront = shRaster; shRasterFront.mCullMode = CULL_MODE_FRONT;
+            sg.pRasterizerState = &shRasterFront;
+            addPipeline(R, &spd, &g_live.pShadowPipelineFront);
+            RasterizerStateDesc shRasterFrontMirror = shRasterFront; shRasterFrontMirror.mFrontFace = FRONT_FACE_CW;
+            sg.pRasterizerState = &shRasterFrontMirror;
+            addPipeline(R, &spd, &g_live.pShadowPipelineFrontMirror);
 
             // Per-tile clear PSO: viewport-covering triangle at z = 0, CMP_ALWAYS + write (a
             // LOAD_ACTION_CLEAR on the atlas would wipe every cached tile). No vertex layout.
@@ -2311,7 +2338,8 @@ namespace {
                 cg.pShaderProgram = g_live.pShadowClearShader;
                 addPipeline(R, &cpd, &g_live.pShadowClearPipeline);
             }
-            if (!g_live.pShadowPipeline || !g_live.pShadowPipelineMirror || !g_live.pShadowClearPipeline) {
+            if (!g_live.pShadowPipeline || !g_live.pShadowPipelineMirror || !g_live.pShadowClearPipeline
+                || !g_live.pShadowPipelineNone || !g_live.pShadowPipelineFront || !g_live.pShadowPipelineFrontMirror) {
                 std::printf("[forge][shadow] face/clear PSO build FAILED — shadows disabled\n");
             }
         }
@@ -3675,6 +3703,8 @@ namespace {
                 }
                 g_live.shadowReady = g_live.pShadowAtlas && g_live.pShadowMask
                                   && g_live.pShadowPipeline && g_live.pShadowPipelineMirror
+                                  && g_live.pShadowPipelineNone && g_live.pShadowPipelineFront
+                                  && g_live.pShadowPipelineFrontMirror
                                   && g_live.pShadowClearPipeline && g_live.pShadowFaceSet
                                   && g_live.pShadowMaskPipeline && g_live.pShadowMaskSet
                                   && g_live.pShadowMaskParamsCbv
@@ -4064,7 +4094,21 @@ namespace {
     bool  g_shadowEnable     = true;
     bool  g_shadowFaceDebug  = false;   // shadowmask debug 1: nibble = face id (convention check FIRST)
     bool  g_shadowAtlasDebug = false;   // shadowmask debug 2: nibble = atlas depth (slot-0 block on screen)
-    float g_shadowSlack      = 0.02f;   // relative reverse-Z compare slack (acne knob; live via mask params)
+    float g_shadowSlack      = 0.026f;  // relative reverse-Z compare slack (acne knob; live via mask params).
+                                        // Tuned for the CULL_FRONT (back-face) caster default below — storing the
+                                        // far faces removes acne, so positive slack just tightens contact.
+    float g_shadowBias       = 0.0023f; // ABSOLUTE reverse-Z compare bias (contact/interpenetration knob; live).
+                                        // Replaces the old baked PSO constant depth bias. Tuned to +0.0023 with
+                                        // CULL_FRONT casters: positive = tighter contact with no gap (back faces
+                                        // stored, nothing to acne against).
+    float g_shadowNormalOffset = 1.0f;  // NORMAL-OFFSET bias in atlas texels (live via mask params). Offsets
+                                        // the receiver sample along its depth-reconstructed normal, scaled by
+                                        // grazing angle (PSO slope bias is 0). Tuned to 1.0; raise to kill any
+                                        // residual grazing acne, lower to tighten contacts.
+    uint32_t g_shadowCasterCull = 2;    // caster cull mode (live A/B): 0 = CULL_BACK (light-facing faces only),
+                                        // 1 = CULL_NONE (two-sided — writes far/under faces, closes the thin
+                                        // contact line), 2 = CULL_FRONT (back faces only — acne cure, leaks on
+                                        // thin/open MW geometry). Live: draw-time pipeline pick, no rebuild.
     // C3b: emissive caster skip — replaces the P3 fixture-radius self-shadow heuristic (which was
     // finnicky: a lantern is several NiTriShapes with different bounding spheres, so parts of the
     // fixture's shadow appeared/disappeared). MW marks a light's own hot part with a full-emissive
@@ -4225,6 +4269,14 @@ namespace {
         uiAddComponentWidget(g_uiPanel, "Shadow: atlas view (F12 mode 10)", &cShAd, WIDGET_TYPE_CHECKBOX);
         SliderFloatWidget sShS = {}; sShS.pData = &g_shadowSlack; sShS.mMin = 0.0f; sShS.mMax = 0.2f; sShS.mStep = 0.002f;
         uiAddComponentWidget(g_uiPanel, "Shadow depth slack", &sShS, WIDGET_TYPE_SLIDER_FLOAT);
+        SliderFloatWidget sShB = {}; sShB.pData = &g_shadowBias; sShB.mMin = -0.005f; sShB.mMax = 0.005f; sShB.mStep = 0.00002f;
+        strncpy(sShB.mFormat, "%.5f", sizeof(sShB.mFormat) - 1);   // show the tiny near-zero values
+        uiAddComponentWidget(g_uiPanel, "Shadow contact bias (negative = close gap)", &sShB, WIDGET_TYPE_SLIDER_FLOAT);
+        SliderFloatWidget sShNo = {}; sShNo.pData = &g_shadowNormalOffset; sShNo.mMin = 0.0f; sShNo.mMax = 8.0f; sShNo.mStep = 0.25f;
+        uiAddComponentWidget(g_uiPanel, "Shadow normal offset (kills grazing acne)", &sShNo, WIDGET_TYPE_SLIDER_FLOAT);
+        static const char* const kCasterCullNames[] = { "0 back (light faces)", "1 none (two-sided)", "2 front (back faces)" };
+        DropdownWidget ddCc = {}; ddCc.pData = &g_shadowCasterCull; ddCc.pNames = kCasterCullNames; ddCc.mCount = 3;
+        uiAddComponentWidget(g_uiPanel, "Shadow caster cull", &ddCc, WIDGET_TYPE_DROPDOWN);
         SliderFloatWidget sShEm = {}; sShEm.pData = &g_shadowEmissiveSkip; sShEm.mMin = 0.0f; sShEm.mMax = 1.5f; sShEm.mStep = 0.05f;
         uiAddComponentWidget(g_uiPanel, "Shadow: emissive caster skip (>1 = off)", &sShEm, WIDGET_TYPE_SLIDER_FLOAT);
         CheckboxWidget cShBc = {}; cShBc.pData = &g_shadowBlendCasters;
@@ -5106,6 +5158,8 @@ namespace ForgeRender {
             mp[21] = kShadowNearZ;                // maskParams.y = face near plane
             mp[22] = g_shadowSlack;               // maskParams.z = compare slack (live knob)
             mp[23] = g_shadowAtlasDebug ? 2.0f : (g_shadowFaceDebug ? 1.0f : 0.0f);
+            mp[152] = g_shadowBias;               // biasParams.x = absolute contact bias (live knob)
+            mp[153] = g_shadowNormalOffset;       // biasParams.y = normal-offset bias in texels (live knob)
             g_shadowFrameActive = !g_shadowRenders.empty();
 
             // Manager heartbeat (verify gate): active slots / this-frame renders / valid+active
@@ -5606,8 +5660,17 @@ namespace ForgeRender {
                         HostMesh& hm = g_meshes[scst.slot];
                         const uint32_t firstInst = regionBase + (k - R.casterBegin);
                         if ((int)scst.mirror != shMirror) {
-                            cmdBindPipeline(g_live.pCmd, scst.mirror ? g_live.pShadowPipelineMirror
-                                                                     : g_live.pShadowPipeline);
+                            // Live caster-cull pick (g_shadowCasterCull). CULL_NONE ignores winding
+                            // (one PSO); BACK/FRONT keep the mirror-winding pair.
+                            Pipeline* casterPso;
+                            switch (g_shadowCasterCull) {
+                            case 1:  casterPso = g_live.pShadowPipelineNone; break;
+                            case 2:  casterPso = scst.mirror ? g_live.pShadowPipelineFrontMirror
+                                                             : g_live.pShadowPipelineFront; break;
+                            default: casterPso = scst.mirror ? g_live.pShadowPipelineMirror
+                                                             : g_live.pShadowPipeline; break;
+                            }
+                            cmdBindPipeline(g_live.pCmd, casterPso);
                             cmdBindDescriptorSet(g_live.pCmd, b * 6 + f, g_live.pShadowFaceSet);
                             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
                             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pShadowBatchSet);
@@ -7182,6 +7245,8 @@ namespace ForgeRender {
             if (g_live.pShadowMaskPipeline) {
                 g_live.shadowReady = g_live.pShadowAtlas && g_live.pShadowMask
                                   && g_live.pShadowPipeline && g_live.pShadowPipelineMirror
+                                  && g_live.pShadowPipelineNone && g_live.pShadowPipelineFront
+                                  && g_live.pShadowPipelineFrontMirror
                                   && g_live.pShadowClearPipeline && g_live.pShadowFaceSet
                                   && g_live.pShadowMaskSet && g_live.pShadowMaskParamsCbv
                                   && g_live.pShadowWorldsBuf && g_live.pShadowInstanceBuf
@@ -10980,6 +11045,9 @@ namespace ForgeRender {
         if (g_live.pShadowClearShader)   { removeShader(R, g_live.pShadowClearShader); }
         if (g_live.pShadowPipeline)       { removePipeline(R, g_live.pShadowPipeline); }
         if (g_live.pShadowPipelineMirror) { removePipeline(R, g_live.pShadowPipelineMirror); }
+        if (g_live.pShadowPipelineNone)   { removePipeline(R, g_live.pShadowPipelineNone); }
+        if (g_live.pShadowPipelineFront)  { removePipeline(R, g_live.pShadowPipelineFront); }
+        if (g_live.pShadowPipelineFrontMirror) { removePipeline(R, g_live.pShadowPipelineFrontMirror); }
         for (uint32_t f = 0; f < kShadowFaceCbvs; ++f) {
             if (g_live.pShadowFaceCbv[f]) { removeResource(g_live.pShadowFaceCbv[f]); }
         }
