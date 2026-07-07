@@ -1720,12 +1720,13 @@ namespace {
             item.uvOffset[0] = e.skyUVOffset[0];
             item.uvOffset[1] = e.skyUVOffset[1];
             {
-                const std::uint32_t baseVCol = (e.hasVertexColor && e.vColSource != 0) ? e.vColSource : 0u;
-                // C3: the untextured atmosphere dome (texIndex 0, vertex-coloured) is now host-coloured
-                // with a vertical gradient. Tag it with the dedicated vColSource 3 ("host gradient dome")
-                // so sky.frag computes fogColNear->skyZenith from the vertex direction instead of using
-                // the (no-longer-re-uploaded) baked per-vertex gradient. SK2 textured shapes keep 0/1/2.
-                item.vColSource = (item.texIndex == 0u && baseVCol != 0u) ? 3u : baseVCol;
+                // SK4 retired the C3 host-gradient dome (vColSource 3): sky vcols now re-ship
+                // whenever MW rebakes them, so the dome's REAL per-frame gradient (vcolsrc=2,
+                // alpha FF — SKY DUMP-verified) renders through the standard In.Color path,
+                // pixel-exact with vanilla instead of the fogColNear->skyZenith approximation
+                // (which read slightly bright at the zenith). sky.frag keeps its 3-branch;
+                // it's just never selected now.
+                item.vColSource = (e.hasVertexColor && e.vColSource != 0) ? e.vColSource : 0u;
             }
             memcpy(item.world, e.worldTransformD3D, 16 * sizeof(float));
             // SK2 billboard fix (SUN ONLY): the sun disc hangs under a NiBillboardNode that MW

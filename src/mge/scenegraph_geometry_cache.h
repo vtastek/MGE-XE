@@ -87,6 +87,15 @@ namespace MGE::GeometryCache {
         float    skyBaseUV[2];
         float    skyBaseUVLast[2];
         float    skyUVOffset[2];
+        // SK4 sky vertex-colour tracking: FNV-1a hash of the vertex-colour array at last
+        // upload. MW rebakes sky vcols in place (cloud weather tint, star fade) without our
+        // walk seeing a re-upload trigger — sky skips the revisionID rule because MW bumps
+        // it EVERY frame (UV scroll). The per-frame sky walk hashes the live vcols of
+        // vColSource==2 shapes (the only ones whose real vcol ships to the host) and
+        // re-runs uploadEntry on mismatch, so tint changes ship as they happen (byte-
+        // quantized colour interpolation → a few re-uploads/sec during transitions).
+        // Only meaningful for isSky entries; zero otherwise.
+        uint32_t skyVcolHash;
         // Material (pointers into NI memory — valid for the session)
         IDirect3DTexture9* d3dTexture;  // null if no base texture
         // Terrain decal overlay (TexturingProperty maps[6] = DECAL_1): the second

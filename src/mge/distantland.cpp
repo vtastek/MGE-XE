@@ -1613,6 +1613,11 @@ bool DistantLand::inspectIndexedPrimitive(int sceneCount, const RenderedState* r
     // Special case, capture sky
     if (recordMW.empty() && rs->blendEnable && sceneCount == 0 && mwBridge->CellHasWeather()) {
         recordSky.emplace_back(*rs);
+        // (Sky FFP facts, probed 2026-07-07: DIPs carry useFog=0 — vanilla never fogs
+        // the sky — and lighting is enabled but fully white (white material, SkyNode
+        // ambientLight amb=(1,1,1) dimmer=1, globalAmbient 0, no active lights), so
+        // raw baked vertex colour IS the exact vanilla sky output. The Forge sky pass
+        // renders shipped vcols directly; SK4 keeps them live.)
 
         // Check for moon geometry, and mark those records by setting lighting off
         if (frs->material.emissive.a == kMoonTag) {

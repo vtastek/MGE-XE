@@ -1,5 +1,6 @@
 #include "mge_se_prelude.h"
 
+#include "NIAmbientLight.h"
 #include "NIAVObject.h"
 #include "NIGeometry.h"
 #include "NIGeometryData.h"
@@ -186,6 +187,17 @@ namespace MGE::GeometryCache {
                     registerSubtreeTextureNames(node->children.at(i).get());
                 }
             }
+        }
+
+        // SK4: FNV-1a over the live vertex-colour array (PackedColor = 4 bytes/vert).
+        // Sky shapes hash a few hundred bytes/frame — cheaper than any IPC round-trip.
+        uint32_t hashVertexColors(const void* vcol, uint32_t vertexCount) {
+            const auto* p = static_cast<const uint8_t*>(vcol);
+            uint32_t h = 2166136261u;
+            for (uint32_t i = 0; i < vertexCount * 4u; ++i) {
+                h = (h ^ p[i]) * 16777619u;
+            }
+            return h;
         }
 
         void extractMaterial(CachedGeometry& e, NI::Geometry* geom) {
@@ -442,6 +454,10 @@ namespace MGE::GeometryCache {
                 e.skyBaseUVLast[1] = uvs ? uvs[vertexCount - 1].y : 0.0f;
                 e.skyUVOffset[0] = 0.0f;
                 e.skyUVOffset[1] = 0.0f;
+                // SK4 vcol baseline: hash of the colours baked into THIS upload; the
+                // per-frame sky walk re-uploads when the live colours diverge.
+                e.skyVcolHash = (g_walkingSky && vcol)
+                    ? hashVertexColors(vcol, vertexCount) : 0u;
                 e.vb[slot]->Unlock();
             }
 
@@ -855,6 +871,28 @@ namespace MGE::GeometryCache {
                     //  - Everything else: re-extract + re-upload on revision/skin change.
                     if (g_walkingSky) {
                         extractMaterial(e, geom);
+                        // SK4 live vertex colour: MW rebakes sky vcols in place (cloud weather/
+                        // time-of-day tint, star fade) but the VB + wire capture shipped once, so
+                        // vcol-routed shapes froze at capture-time colours (the "F11 off/on
+                        // catches up" bug — the toggle evicts + recaptures). Hash the live vcols
+                        // of vColSource==2 shapes (the only ones whose real vcol ships — see the
+                        // Tier 2a rule in uploadEntry) and re-run the full upload on change,
+                        // which re-bakes the VB, re-ships the wire capture, and re-bases the
+                        // SK3 UV baselines (offset correctly returns 0 for the fresh bake).
+                        if (e.hasVertexColor && e.vColSource == 2 && data->color) {
+                            const uint32_t liveHash = hashVertexColors(
+                                data->color, (uint32_t)data->getActiveVertexCount());
+                            if (liveHash != e.skyVcolHash) {
+                                static uint32_t s_sk4Logged = 0;
+                                if (s_sk4Logged < 8) {
+                                    ++s_sk4Logged;
+                                    LOG::logline(">> [sk4] sky vcol changed: key=%08X tex=%s vc=%u — re-upload",
+                                                 key, e.textureName ? e.textureName : "(none)",
+                                                 (unsigned)data->getActiveVertexCount());
+                                }
+                                uploadEntry(e, geom, data, key);
+                            }
+                        }
                         // SK3 cloud scroll: MW rebakes the cloud shape's UVs every frame (the
                         // per-frame sky revisionID bump), but the VB shipped once — derive the
                         // uniform scroll offset from vertex 0 instead; buildSkyDrawList ships it
@@ -1229,6 +1267,7 @@ namespace MGE::GeometryCache {
             auto* data = geom->getModelData().get();
             const uint32_t vc = data ? static_cast<uint32_t>(data->getActiveVertexCount()) : 0u;
             bool blend = false, atest = false; const char* texName = nullptr;
+            int vcolSrc = -1;   // -1 = no VertexColorProperty
             auto* ps = reinterpret_cast<NI::PropertyState*>(geom->propertyState);
             if (ps) {
                 if (ps->alpha) {
@@ -1243,10 +1282,27 @@ namespace MGE::GeometryCache {
                             texName = static_cast<NI::SourceTexture*>(tex)->fileName;
                     }
                 }
+                if (ps->vertexColor) {
+                    vcolSrc = static_cast<int>(ps->vertexColor->source);
+                }
             }
-            LOG::logline("[SKY] %*sGEOM '%s' culled=%d verts=%u blend=%d atest=%d tex=%s",
+            // SK4 diag: live vertex-0 colour (D3DCOLOR) — tracks MW's in-place sky vcol
+            // rebake (cloud tint / star fade) across successive dumps.
+            const uint32_t vcol0 = (data && data->color)
+                ? *reinterpret_cast<const uint32_t*>(&data->color[0]) : 0u;
+            LOG::logline("[SKY] %*sGEOM '%s' culled=%d verts=%u blend=%d atest=%d vcolsrc=%d vcol0=%08X tex=%s",
                 depth * 2, "", nm ? nm : "(null)", culled ? 1 : 0, vc,
-                blend ? 1 : 0, atest ? 1 : 0, texName ? texName : "(none)");
+                blend ? 1 : 0, atest ? 1 : 0, vcolSrc, vcol0, texName ? texName : "(none)");
+            return;
+        }
+        // [sky-lit] diag: the sky subtree's own NiAmbientLight — the FFP modulation
+        // vanilla applies to lit amb+diff-vcol sky shapes (out = vcol · ambient).
+        if (av->isInstanceOfType(NI::RTTIStaticPtr::NiAmbientLight)) {
+            auto* li = static_cast<NI::Light*>(av);
+            LOG::logline("[SKY] %*sLIGHT '%s' culled=%d dimmer=%.3f amb=(%.3f,%.3f,%.3f) diff=(%.3f,%.3f,%.3f)",
+                depth * 2, "", nm ? nm : "(null)", culled ? 1 : 0, li->dimmer,
+                li->ambient.r, li->ambient.g, li->ambient.b,
+                li->diffuse.r, li->diffuse.g, li->diffuse.b);
             return;
         }
         LOG::logline("[SKY] %*sNODE '%s' culled=%d", depth * 2, "", nm ? nm : "(null)", culled ? 1 : 0);
