@@ -973,50 +973,43 @@ STRUCT(ShadowMaskParams)
     float4 maskParams;
     float4 slotPosRad[ 16 ];
     float4 slotTile[ 16 ];
-
-
-
-
-
-
-
-
+#line 40 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.srt.h"
     float4 biasParams;
-#line 37
+#line 41
 };
 
         CBUFFER(ShadowMaskParams) gShadowMaskParams :  register(b0,space2);
         Tex2D(float) gShadowLinDepth :  register(t1,space2);
         Tex2D(float) gShadowAtlas :  register(t2,space2);
         WTex2D(uint2) gShadowMaskOut :  register(u3,space2);
+
+
+        Tex2D(float) gShadowAtlasDyn :  register(t4,space2);
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
-
-
-
-
-
-
-
-
-float shadowLitAt(int2 tp, int2 tmin, int2 tmax, float thresh)
+#line 38 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
+float shadowLitAt(int2 tp, int2 tmin, int2 tmax, float thresh, uint dynSlot)
 {
     tp = clamp(tp, tmin, tmax);
     float stored = LoadTex2D(gShadowAtlas, NO_SAMPLER, tp, 0).r;
+    if (dynSlot != 0u)
+    {
+        stored = max(stored, LoadTex2D(gShadowAtlasDyn, NO_SAMPLER, tp, 0).r);
+    }
     return (stored > thresh) ? 0.0f : 1.0f;
 }
 
 
 
 
-float shadowBilinear(float2 ap, int2 tmin, int2 tmax, float thresh)
+float shadowBilinear(float2 ap, int2 tmin, int2 tmax, float thresh, uint dynSlot)
 {
     float2 p = ap - 0.5f;
     int2 b = int2(floor(p));
     float2 f = p - float2(b);
-    float s00 = shadowLitAt(b + int2(0, 0), tmin, tmax, thresh);
-    float s10 = shadowLitAt(b + int2(1, 0), tmin, tmax, thresh);
-    float s01 = shadowLitAt(b + int2(0, 1), tmin, tmax, thresh);
-    float s11 = shadowLitAt(b + int2(1, 1), tmin, tmax, thresh);
+    float s00 = shadowLitAt(b + int2(0, 0), tmin, tmax, thresh, dynSlot);
+    float s10 = shadowLitAt(b + int2(1, 0), tmin, tmax, thresh, dynSlot);
+    float s01 = shadowLitAt(b + int2(0, 1), tmin, tmax, thresh, dynSlot);
+    float s11 = shadowLitAt(b + int2(1, 1), tmin, tmax, thresh, dynSlot);
     return lerp(lerp(s00, s10, f.x), lerp(s01, s11, f.x), f.y);
 }
 
@@ -1070,10 +1063,12 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
         float3 N = normalize(cross(dpx, dpy));
         if (dot(N, -P) < 0.0f) { N = -N; }
         float normalOffsetK = gShadowMaskParams.biasParams.y;
+        uint dynBits = (uint)gShadowMaskParams.biasParams.z;
 
         for (uint s = 0u; s < (uint) 16 ; ++s)
         {
             if ((activeBits & (1u << s)) == 0u) { continue; }
+            uint dynSlot = (dynBits >> s) & 1u;
             float4 posRad = gShadowMaskParams.slotPosRad[s];
             float4 tile = gShadowMaskParams.slotTile[s];
 
@@ -1132,7 +1127,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
                 UNROLL for (int j = - 1 ; j <=  1 ; ++j)
                 UNROLL for (int i = - 1 ; i <=  1 ; ++i)
                 {
-                    vis += shadowBilinear(ap + float2(float(i), float(j)), tmin, tmax, thresh);
+                    vis += shadowBilinear(ap + float2(float(i), float(j)), tmin, tmax, thresh, dynSlot);
                 }
                 vis *= 1.0f / float((2 *  1  + 1) * (2 *  1  + 1));
 
@@ -1143,9 +1138,11 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
             {
 
 
+
                 float2 suv = float2(px) * invScreen;
                 int2 tpx = int2(tile.x + suv.x * tile.z * 3.0f, tile.y + suv.y * tile.z * 2.0f);
                 float az = LoadTex2D(gShadowAtlas, NO_SAMPLER, tpx, 0).r;
+                if (dynSlot != 0u) { az = max(az, LoadTex2D(gShadowAtlasDyn, NO_SAMPLER, tpx, 0).r); }
                 nib = (uint)(saturate(sqrt(az)) * 15.0f);
             }
 

@@ -61,6 +61,14 @@ namespace MGE::GeometryCache {
         // classify, so the Stage 2 engine-set cache cull keeps these via frustum
         // instead of dropping them for absence from the world classify.
         bool     isPickRoot;
+        // C4d shadow-caster category: true = LIVE (the game says this part moves) —
+        // geometry inside a character subtree (NPC/creature body parts + bone-attached
+        // equipment/weapons, via the inCharacter walk verdict) or owned by an Activator/
+        // Door reference (silt strider, steam machinery, doors; resolved once at capture
+        // through the node's TES3 extra data). Ships in DrawItemWire.casterFlags: the
+        // Forge host keeps LIVE casters out of the cached static shadow tiles and
+        // re-renders them in the per-frame dynamic tile instead.
+        bool     isLive;
         // SK1 sky takeover: true for entries walked from skyRoot (atmosphere dome, stars,
         // sun, moons, clouds). Sky is alpha-blended and drawn by the Forge host's dedicated
         // sky pass (depth off, behind the opaque world) — it's EXCLUDED from every opaque
