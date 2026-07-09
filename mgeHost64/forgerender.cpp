@@ -5032,6 +5032,15 @@ namespace ForgeRender {
             // scene-probe passes 0s). The near scene is camera-relative (eyePos=0); resident DL is in
             // ABSOLUTE coords, so the live DL cull/build shifts it by -realEye. lodEye -> gFrameData[56..59].
             dlSetFrameEye(lighting[24], lighting[25], lighting[26], lighting[27] != 0.0f);
+            // lodEye = the ABSOLUTE camera eye, consumed EVERY frame by water/reflection/Hi-Z/AO
+            // to camera-relativize their absolute anchors. dlCullAndBuild also writes fd[56..58],
+            // but it early-returns in interiors (g_dlExterior=false), so interiors would keep a
+            // STALE lodEye — the water plane then sits at a constant camera-relative height and
+            // "follows the eye". Write it here from realEye so it's live regardless of exterior.
+            {
+                float* fd56 = (float*)g_live.pFrameCbv->pCpuMappedAddress;
+                fd56[56] = lighting[24]; fd56[57] = lighting[25]; fd56[58] = lighting[26]; fd56[59] = 0.0f;
+            }
             // P1.5 shadows: this is the client's camera-relative shift eye for THIS frame's
             // items/lights — the absolutize/de-absolutize anchor for lastWorld caster records.
             g_eyeAbsShadow[0] = lighting[24];
