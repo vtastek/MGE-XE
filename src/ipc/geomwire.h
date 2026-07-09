@@ -81,11 +81,22 @@ namespace IPC {
         std::uint16_t pad2;
     };
 
+    // DrawItemWire::casterFlags bits (C4d categorical shadow casters).
+    // LIVE = the game says this part moves: geometry under a character subtree (NPC/creature
+    // body parts + bone-attached equipment/weapons) or owned by an Activator/Door reference
+    // (silt strider, steam machinery, doors). The host keeps LIVE casters OUT of the cached
+    // static shadow tiles and re-renders them in the per-frame dynamic tile instead — no
+    // motion heuristics, no bake/rebake epoch churn. Everything else (statics, clutter,
+    // containers, light fixtures) stays on the cached static path (move/appear/release
+    // bumps the caster epoch; clutter delay is acceptable).
+    constexpr std::uint32_t kDrawCasterLive = 0x1;
+
     // M1c per-frame draw item: which uploaded mesh (slot) to draw, with its current
     // model->world transform (D3DXMATRIX bytes, row-major — uploaded straight into the
     // host's gObject cbuffer; see opaque.srt.h for the no-transpose convention). The
     // per-frame draw list is an array of these in a chunked byte vec, with the camera
-    // view*proj carried inline in the RenderFrame RPC params. 108 bytes.
+    // view*proj carried inline in the RenderFrame RPC params. 112 bytes — client and
+    // host MUST ship together on any size change (AT3 precedent).
     struct DrawItemWire {
         std::uint32_t slot;
         float         world[16];
@@ -102,6 +113,7 @@ namespace IPC {
         // blended over the base by vcol ALPHA (the AlphaGrid). 0 = no decal / non-terrain
         // (the frag's splat is gated off when this is 0, so every other draw is unchanged).
         std::uint32_t overlayTexIndex;
+        std::uint32_t casterFlags; // kDrawCasterLive bit (C4d shadow-caster category)
     };
 
     // Texture-residency upload (Phase 2 bindless texturing). The client resolves each unique

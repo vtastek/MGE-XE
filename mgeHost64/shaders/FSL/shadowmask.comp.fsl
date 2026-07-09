@@ -32,25 +32,32 @@
 
 // Reverse-Z shadow test at ONE atlas texel, clamped inside the face sub-tile so a tap can
 // never bleed onto a neighbouring cube face. Returns 1 = lit, 0 = shadowed.
-float shadowLitAt(int2 tp, int2 tmin, int2 tmax, float thresh)
+// C4b composite: when the slot's DYNAMIC tile is valid this frame (dynSlot != 0), the
+// occluder depth is max(static, dynamic) — reverse-Z nearer-wins — so cached statics and
+// per-frame movers shadow together without the static tile ever re-rendering for a mover.
+float shadowLitAt(int2 tp, int2 tmin, int2 tmax, float thresh, uint dynSlot)
 {
     tp = clamp(tp, tmin, tmax);
     float stored = LoadTex2D(gShadowAtlas, NO_SAMPLER, tp, 0).r;
+    if (dynSlot != 0u)
+    {
+        stored = max(stored, LoadTex2D(gShadowAtlasDyn, NO_SAMPLER, tp, 0).r);
+    }
     return (stored > thresh) ? 0.0f : 1.0f;
 }
 
 // Sub-texel bilinear PCF: compare the 4 texels around the fractional atlas position and
 // bilerp the BINARY results (compare-then-filter — correct at depth discontinuities, unlike
 // bilinear-sampling the depth first). One tap already gives a smooth, staircase-free edge.
-float shadowBilinear(float2 ap, int2 tmin, int2 tmax, float thresh)
+float shadowBilinear(float2 ap, int2 tmin, int2 tmax, float thresh, uint dynSlot)
 {
     float2 p = ap - 0.5f;                 // shift to texel-centre space (texel c centred at c+0.5)
     int2   b = int2(floor(p));
     float2 f = p - float2(b);
-    float s00 = shadowLitAt(b + int2(0, 0), tmin, tmax, thresh);
-    float s10 = shadowLitAt(b + int2(1, 0), tmin, tmax, thresh);
-    float s01 = shadowLitAt(b + int2(0, 1), tmin, tmax, thresh);
-    float s11 = shadowLitAt(b + int2(1, 1), tmin, tmax, thresh);
+    float s00 = shadowLitAt(b + int2(0, 0), tmin, tmax, thresh, dynSlot);
+    float s10 = shadowLitAt(b + int2(1, 0), tmin, tmax, thresh, dynSlot);
+    float s01 = shadowLitAt(b + int2(0, 1), tmin, tmax, thresh, dynSlot);
+    float s11 = shadowLitAt(b + int2(1, 1), tmin, tmax, thresh, dynSlot);
     return lerp(lerp(s00, s10, f.x), lerp(s01, s11, f.x), f.y);
 }
 
@@ -104,10 +111,12 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         float3 N   = normalize(cross(dpx, dpy));
         if (dot(N, -P) < 0.0f) { N = -N; }             // face the eye (camera at origin)
         float  normalOffsetK = gShadowMaskParams.biasParams.y;   // offset in atlas texels (live)
+        uint   dynBits       = (uint)gShadowMaskParams.biasParams.z;   // C4b: slots with a valid dyn tile
 
         for (uint s = 0u; s < (uint)MAX_SHADOW_SLOTS; ++s)
         {
             if ((activeBits & (1u << s)) == 0u) { continue; }
+            uint dynSlot = (dynBits >> s) & 1u;
             float4 posRad = gShadowMaskParams.slotPosRad[s];
             float4 tile   = gShadowMaskParams.slotTile[s];
 
@@ -166,7 +175,7 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
                 UNROLL for (int j = -SHADOW_PCF_R; j <= SHADOW_PCF_R; ++j)
                 UNROLL for (int i = -SHADOW_PCF_R; i <= SHADOW_PCF_R; ++i)
                 {
-                    vis += shadowBilinear(ap + float2(float(i), float(j)), tmin, tmax, thresh);
+                    vis += shadowBilinear(ap + float2(float(i), float(j)), tmin, tmax, thresh, dynSlot);
                 }
                 vis *= 1.0f / float((2 * SHADOW_PCF_R + 1) * (2 * SHADOW_PCF_R + 1));
 
@@ -177,9 +186,11 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
             {
                 // Atlas view: map the whole screen onto this slot's 3x2 face block and show the
                 // stored reverse-Z depth (sqrt-boosted so far values aren't crushed black).
+                // Shows the same static+dynamic max-composite the shadow test sees.
                 float2 suv = float2(px) * invScreen;
                 int2   tpx = int2(tile.x + suv.x * tile.z * 3.0f, tile.y + suv.y * tile.z * 2.0f);
                 float  az  = LoadTex2D(gShadowAtlas, NO_SAMPLER, tpx, 0).r;
+                if (dynSlot != 0u) { az = max(az, LoadTex2D(gShadowAtlasDyn, NO_SAMPLER, tpx, 0).r); }
                 nib = (uint)(saturate(sqrt(az)) * 15.0f);
             }
 

@@ -797,6 +797,29 @@ namespace MGE::GeometryCache {
             return isMirroredMatrix(m);
         }
 
+        // C4d shadow-caster category: does the owning TES3 reference say this part MOVES?
+        // Resolved through the node's TES3 extra data (SharedSE getTes3Reference walks the
+        // parent chain — a held weapon has no reference of its own, so the search lands on
+        // the wielding NPC → live; the same weapon placed on a table IS its own Misc/Weapon
+        // reference → not live). MGE consumes only SharedSE, where TES3::Reference is
+        // opaque, so the two fields are read at the MWSE-documented offsets
+        // (MWSE/TES3Reference.h: baseObject @ 0x28; MWSE/TES3Object.h: objectType @ 0x4).
+        // Live types: Activator (silt strider idles, steam machinery), Door, NPC/Creature
+        // (+ clones). Everything else — statics, clutter, containers, light fixtures —
+        // stays on the cached static shadow path. Called ONCE per entry at capture.
+        bool referenceIsLiveType(const NI::ObjectNET* obj) {
+            const void* ref = obj->getTes3Reference(/*searchParents=*/true);
+            if (!ref) return false;
+            const void* base = *reinterpret_cast<void* const*>(
+                static_cast<const char*>(ref) + 0x28);
+            if (!base) return false;
+            const uint32_t t = *reinterpret_cast<const uint32_t*>(
+                static_cast<const char*>(base) + 0x4);
+            return t == 'ITCA' /*Activator*/ || t == 'ROOD' /*Door*/
+                || t == '_CPN' /*NPC*/      || t == 'CCPN' /*NPCClone*/
+                || t == 'AERC' /*Creature*/ || t == 'CERC' /*CreatureClone*/;
+        }
+
         void visitGeometry(NI::TriBasedGeometry* geom, bool inCharacter) {
             auto* data = geom->getModelData().get();
             if (!data) return;
@@ -837,6 +860,12 @@ namespace MGE::GeometryCache {
                 e.lastFrame = g_frame;
                 e.isLandscape = g_walkingLandscape;
                 e.isPickRoot = g_walkingPick;
+                // C4d: inCharacter is the cheap verdict (full-walk path); the reference
+                // walk is authoritative and also covers the ensureLive lazy-capture path
+                // (which passes inCharacter=false) — an NPC's equipment resolves to the
+                // NPC reference either way. Sky/landscape never have a TES3 reference.
+                e.isLive = !g_walkingSky && !g_walkingLandscape
+                        && (inCharacter || referenceIsLiveType(geom));
                 e.isSky = g_walkingSky;
                 if (g_walkingSky) e.skyOrder = g_skyVisitCounter++;  // SK2 back-to-front key
                 e.mirrored = computeMirrored(e);                    // winding flip for depth/shadow

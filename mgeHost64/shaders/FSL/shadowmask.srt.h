@@ -32,6 +32,10 @@ STRUCT(ShadowMaskParams)
     //             its surface along the depth-reconstructed normal, scaled by grazing angle — the
     //             sole grazing-acne mechanism now that the PSO slope-scaled term is zeroed. Face-on
     //             contact stays tight (offset → 0 there); grazing surfaces get the most.
+    //             z = DYNAMIC-slot BITMASK (C4b composite): bit s set = slot s's dynamic tile
+    //             (movers: skinned + multimap, re-rendered every frame) is valid THIS frame —
+    //             each PCF texel takes max(static, dynamic) = the nearer reverse-Z occluder.
+    //             Unset = the dynamic tile is stale (mover left reach); sample static only.
     // Appended at the struct tail so every slot offset above stays fixed.
     DATA(float4,   biasParams,   None);
 };
@@ -42,5 +46,8 @@ BEGIN_SRT(ShadowMaskSrtData)
         DECL_TEXTURE(PerBatch, Tex2D(float), gShadowLinDepth)
         DECL_TEXTURE(PerBatch, Tex2D(float), gShadowAtlas)
         DECL_RWTEXTURE(PerBatch, WTex2D(uint2), gShadowMaskOut)
+        // C4b composite: the parallel DYNAMIC atlas (same block layout as gShadowAtlas —
+        // movers only, re-rendered per frame). Appended LAST so existing indices stay put.
+        DECL_TEXTURE(PerBatch, Tex2D(float), gShadowAtlasDyn)
     END_SRT_SET(PerBatch)
 END_SRT(ShadowMaskSrtData)
