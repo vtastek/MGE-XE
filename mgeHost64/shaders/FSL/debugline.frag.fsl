@@ -8,11 +8,12 @@
 STRUCT(VSOutput)
 {
     DATA(float4, Position, SV_Position);
+    DATA(float4, Color,    TEXCOORD0);
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
 float4 PS_MAIN( VSOutput In )
 {
     INIT_MAIN;
-    RETURN(float4(1.0f, 0.25f, 0.05f, 1.0f));   // bright orange-red
+    RETURN(In.Color);   // flat per-vertex colour (light-box id hash)
 }

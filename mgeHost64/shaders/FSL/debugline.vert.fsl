@@ -10,11 +10,13 @@
 STRUCT(VSInput)
 {
     DATA(float3, Position, POSITION);   // eye-relative world position
+    DATA(float4, Color,    TEXCOORD0);  // per-vertex flat colour (light-box id hash)
 };
 
 STRUCT(VSOutput)
 {
     DATA(float4, Position, SV_Position);
+    DATA(float4, Color,    TEXCOORD0);
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -23,5 +25,6 @@ VSOutput VS_MAIN( VSInput In )
     INIT_MAIN;
     VSOutput Out;
     Out.Position = mul(gFrameData.viewProj, float4(In.Position, 1.0f));
+    Out.Color = In.Color;
     RETURN(Out);
 }

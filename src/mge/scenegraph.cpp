@@ -125,6 +125,21 @@ namespace MGE::SceneGraph {
 
             out.radius = pl->specular.r;
 
+            // Fixture classification for shadow-slot priority: a real ESM-placed light carries its
+            // editor id (light*/torch*/furn*); runtime-injected fill (window/ambient daylight fakes)
+            // is nameless. Prefix-match case-insensitively. Boosted host-side so fixtures outrank fill.
+            out.fixture = false;
+            if (const char* nm = pl->getName()) {
+                const auto pfx = [nm](const char* p) {
+                    for (size_t i = 0; p[i]; ++i) {
+                        const char a = nm[i];
+                        if (!a || (a | 0x20) != p[i]) { return false; }   // p is lowercase
+                    }
+                    return true;
+                };
+                out.fixture = pfx("light") || pfx("torch") || pfx("furn");
+            }
+
             // P2: stable per-frame identity key. Downstream tracking recycles it when a freed
             // NiLight's address is reused (frame-gap + teleport guards in buildLightList).
             out.source = pl;
