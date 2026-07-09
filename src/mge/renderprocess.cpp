@@ -1038,7 +1038,10 @@ namespace {
             IPC::DrawItemWire item;
             item.slot = si.slot;
             diagWorldDet("STATIC", e.textureName, e.worldTransformD3D);
-            item.texIndex = resolveCachedSlot(e.textureName, si.baseNamePtr, si.baseSlot, si.baseEpoch);
+            // Textureless visual (e.textureName null) → slot 0 = host default white; resolveCachedSlot
+            // would std::string(nullptr) on the name lookup, so short-circuit it.
+            item.texIndex = e.textureName
+                ? resolveCachedSlot(e.textureName, si.baseNamePtr, si.baseSlot, si.baseEpoch) : 0u;
             // Terrain DECAL_1 overlay (second land texture). resolveTextureSlot ships its DDS
             // bytes the same way as the base map. Non-landscape / single-texture draws get 0,
             // which gates the frag's splat off → byte-for-byte unchanged.
@@ -1346,7 +1349,17 @@ namespace {
                 if (wantSkinned) emitSkinnedDraw(slot, e, skinnedCount);
                 return;
             }
-            if (!e.d3dTexture) return;
+            if (!e.d3dTexture) {
+                // Textureless. Pick-root entries are worldPickObjectRoot COLLISION PROXIES that
+                // mirror each visual object and z-fight movers → still dropped (THE de-dup). But
+                // genuine textureless VISUAL geometry in the object root (e.g. ex_de_shack_02's
+                // solid day plane behind the netting) is drawn OPAQUE by MW — emit it on the static
+                // path with slot 0 (host default white) so material/vcol give the solid colour.
+                // Skip the blend path (a textureless alpha shape has no base to composite).
+                if (e.isPickRoot || e.blendEnable) return;
+                if (wantStatic) emitStaticDraw(slot, e, drawCount);
+                return;
+            }
             if (!e.isLandscape && e.blendEnable) {
                 // AT1: non-landscape blended shapes ride the host alpha pass (v1 = static
                 // single-map tri shapes only; multi-map blends keep today's behavior — skipped —
