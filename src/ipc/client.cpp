@@ -88,13 +88,31 @@ namespace IPC {
 
 	void Client::startWatcher() {
 		// Dev-only FSL hot-reload watcher: recompiles + deploys shaders on save so the host's
-		// dxil-mtime auto-reload makes edit->live automatic. Gated on the dev paths existing, so it
-		// is a silent no-op in a shipped tree. Own console window so its compile/deploy log is visible.
+		// dxil-mtime auto-reload makes edit->live automatic. Two gates keep it out of every non-dev run:
+		//   (1) the dev python + script paths must exist (never true in a shipped tree), AND
+		//   (2) the running game must BE the install the watcher deploys into (C:\mgem\morrowind64 — see
+		//       watch_shaders.py DEPLOY). So the RELEASE install (e.g. morrowinddonottouch) run on this
+		//       same dev machine gets NO watcher and NO window.
+		// In the dev install it launches with a MINIMIZED, non-activating console (SW_SHOWMINNOACTIVE):
+		// its compile/deploy log is there when wanted but it never steals focus from the game or covers it.
 		static const char* kPython = "C:\\Users\\devbox\\AppData\\Local\\Programs\\Python\\Python311\\python.exe";
 		static const char* kScript = "C:\\projects\\mgexe\\MGE-XE\\mgeHost64\\shaders\\watch_shaders.py";
 		if (GetFileAttributesA(kPython) == INVALID_FILE_ATTRIBUTES ||
 			GetFileAttributesA(kScript) == INVALID_FILE_ATTRIBUTES) {
 			return;   // not a dev tree — no watcher
+		}
+		// Gate (2): only the DEV install (the one watch_shaders.py DEPLOYs to) runs the watcher.
+		{
+			char exePath[MAX_PATH];
+			DWORD n = GetModuleFileNameA(NULL, exePath, MAX_PATH);
+			if (n == 0 || n >= MAX_PATH) { return; }
+			for (DWORD i = 0; i <= n; ++i) {
+				const char c = exePath[i];
+				exePath[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;   // lowercase in place
+			}
+			if (!std::strstr(exePath, "\\mgem\\morrowind64\\")) {
+				return;   // release / other install → no watcher, no window
+			}
 		}
 		// Job object so the watcher dies with us even on a hard exit (~Client may not run): the OS
 		// kills every process in the job when the last handle to it closes, i.e. when WE terminate.
@@ -107,14 +125,19 @@ namespace IPC {
 		char cmd[768];
 		std::sprintf(cmd, "\"%s\" \"%s\"", kPython, kScript);
 		STARTUPINFOA si = {}; si.cb = sizeof(si);
+		// Start the console MINIMIZED and WITHOUT activating it, so it never steals focus from the game
+		// or sits on top of it (CREATE_NEW_CONSOLE alone made a normal foreground window).
+		si.dwFlags     = STARTF_USESHOWWINDOW;
+		si.wShowWindow = SW_SHOWMINNOACTIVE;
 		PROCESS_INFORMATION pi = {};
-		// Suspended so we can assign it to the job BEFORE it runs (no window of an unparented child).
+		// CREATE_NEW_CONSOLE keeps the watcher's own log window (minimized, per si above). Suspended so
+		// we can assign it to the job BEFORE it runs.
 		if (CreateProcessA(kPython, cmd, NULL, NULL, FALSE, CREATE_NEW_CONSOLE | CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
 			if (m_watcherJob) { AssignProcessToJobObject(m_watcherJob, pi.hProcess); }
 			ResumeThread(pi.hThread);
 			m_watcherProcess = pi.hProcess;
 			CloseHandle(pi.hThread);
-			LOG::logline("FSL hot-reload watcher started (PID %u)", pi.dwProcessId);
+			LOG::logline("FSL hot-reload watcher started (PID %u, minimized)", pi.dwProcessId);
 		} else {
 			LOG::winerror("Failed to start FSL hot-reload watcher");
 			if (m_watcherJob) { CloseHandle(m_watcherJob); m_watcherJob = NULL; }
