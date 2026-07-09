@@ -196,8 +196,11 @@ namespace IPC {
     // unused-by-shader lane) and read back by the host shadow manager (P2 = log-only; P3 uses
     // it to hold a slot across frames without the position-tolerance hack). 24-bit id + 8-bit
     // flags carried as the float's raw bits — NOT a numeric float value; always bit-copy.
-    constexpr std::uint32_t kLightFlagMoved = 1u << 0;   // moved > 0.5u since last seen
-    constexpr std::uint32_t kLightFlagNew   = 1u << 1;   // fresh id this frame (spawn / recycle)
+    constexpr std::uint32_t kLightFlagMoved   = 1u << 0;   // moved > 0.5u since last seen
+    constexpr std::uint32_t kLightFlagNew     = 1u << 1;   // fresh id this frame (spawn / recycle)
+    constexpr std::uint32_t kLightFlagFixture = 1u << 2;   // ESM fixture light (name light*/torch*/furn*) →
+                                                           // shadow-priority BOOST so real fixtures win slots
+                                                           // over nameless injected window/ambient fill.
 
     inline float packLightIdFlags(std::uint32_t id, std::uint32_t flags) {
         const std::uint32_t bits = ((id & 0x00FFFFFFu) << 8) | (flags & 0xFFu);

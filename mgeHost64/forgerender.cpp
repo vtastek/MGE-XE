@@ -30,6 +30,7 @@
 #include <cmath>
 #include <unordered_map>
 #include <algorithm>
+#include <array>
 
 #include "OS/Interfaces/IOperatingSystem.h"
 #include "Utilities/Interfaces/IFileSystem.h"
@@ -351,6 +352,24 @@ namespace {
         Pipeline* pPipeline = nullptr;
         addPipeline(pRenderer, &pipelineDescOuter, &pPipeline);
         return pPipeline;
+    }
+
+    // Deterministic saturated colour from a light id (S=V=1 HSV → RGB via a hashed hue). Well-
+    // separated hues so the on-screen box colour survives any downstream tonemap and nearest-match
+    // to the logged legend stays unambiguous. Used by the light-origin debug boxes.
+    inline void debugIdColor(uint32_t id, float& r, float& g, float& b) {
+        const uint32_t h6 = (id * 2654435761u) >> 8;           // Knuth hash, drop low bits
+        const float hue = (float)(h6 & 0xFFFFu) / 65536.0f * 6.0f;
+        const int   seg = (int)hue;
+        const float f   = hue - (float)seg;
+        switch (seg % 6) {
+            case 0:  r = 1;     g = f;     b = 0;     break;
+            case 1:  r = 1 - f; g = 1;     b = 0;     break;
+            case 2:  r = 0;     g = 1;     b = f;     break;
+            case 3:  r = 0;     g = 1 - f; b = 1;     break;
+            case 4:  r = f;     g = 0;     b = 1;     break;
+            default: r = 1;     g = 0;     b = 1 - f; break;
+        }
     }
 
     // Record clear + draw into pRT, submit, read the RT back to system memory and
@@ -1030,7 +1049,7 @@ namespace {
         Pipeline*      pShadowPipelineFrontMirror = nullptr; // CULL_FRONT, FRONT_FACE_CW (mirrored world)
         Shader*        pShadowClearShader = nullptr;      // shadowclear.vert/.frag
         Pipeline*      pShadowClearPipeline = nullptr;    // CMP_ALWAYS + write, no layout
-        Buffer*        pShadowFaceCbv[12] = {};           // per-face FrameData copies (512B, persistent-mapped)
+        Buffer*        pShadowFaceCbv[24] = {};           // per-face FrameData copies (512B, persistent-mapped); >= kShadowFaceCbvs
         DescriptorSet* pShadowFaceSet = nullptr;          // SrtData PerFrame, maxSets = kShadowFaceCbvs (instance = face)
         Texture*       pShadowMask = nullptr;             // R32G32_UINT screen-size mask (SRV|UAV, UAV/SRV ping-pong)
         Shader*        pShadowMaskShader = nullptr;       // shadowmask.comp (hot-reloadable)
@@ -1157,6 +1176,13 @@ namespace {
         Shader*        pMultiMapDepthShader = nullptr;
         Pipeline*      pMultiMapPrepassPipeline = nullptr;
         Pipeline*      pMultiMapPrepassPipelineMirror = nullptr;
+        // Multimap shadow-caster PSOs (heads/glow parts) — same multimap.vert + depthonly_mm.frag,
+        // but into the SINGLE-SAMPLE atlas with the caster cull set. Mirrors the skinned-shadow PSOs.
+        Pipeline*      pMultiMapShadowPipeline = nullptr;         // CULL_BACK CCW
+        Pipeline*      pMultiMapShadowPipelineMirror = nullptr;   // CULL_BACK CW
+        Pipeline*      pMultiMapShadowPipelineNone = nullptr;     // CULL_NONE
+        Pipeline*      pMultiMapShadowPipelineFront = nullptr;    // CULL_FRONT CCW
+        Pipeline*      pMultiMapShadowPipelineFrontMirror = nullptr; // CULL_FRONT CW
         Buffer*        pMMWorldsBuf = nullptr;             // gBatch: one 64KB world window, persistent-mapped
         DescriptorSet* pPerBatchSetMM = nullptr;           // gBatch bound to pMMWorldsBuf, 1 instance
         // Per-draw instance VB (kMMInstU32 uint32 slots): { Meta, stages[4], matDiff3, matAmb3, matEmis3 },
@@ -1171,6 +1197,9 @@ namespace {
         Shader*        pSkyShader = nullptr;
         Pipeline*      pSkyPipeline = nullptr;             // SRCALPHA/INVSRCALPHA, depth test+write OFF
         Pipeline*      pSkyPipelineAdd = nullptr;          // SK2: SRCALPHA/ONE additive variant (glare/cloud groundwork)
+        Shader*        pDebugLineShader = nullptr;         // debugline.vert/.frag (flat per-vertex colour)
+        Pipeline*      pDebugLinePipeline = nullptr;       // LINE_LIST, depth OFF — light-origin debug boxes
+        Buffer*        pDebugLineVB = nullptr;             // dynamic {float3 pos, float4 col} verts, persistent-mapped
         Buffer*        pSkyWorldsBuf = nullptr;            // gBatch: one 64KB world window, persistent-mapped
         DescriptorSet* pPerBatchSetSky = nullptr;          // gBatch bound to pSkyWorldsBuf, 1 instance
         Buffer*        pSkyInstanceBuf = nullptr;          // per-draw instance VB (kStaticInstU32 slots), CPU-mapped
@@ -1399,20 +1428,27 @@ namespace {
     // derives from it). Mask nibbles: 4 bits x 16 slots = R32G32_UINT (must match MAX_SHADOW_SLOTS).
     constexpr uint32_t kShadowAtlasSize  = 4096;
     constexpr uint32_t kMaxShadowLights  = 16;     // MUST match MAX_SHADOW_SLOTS (shadowmask.srt.h)
-    constexpr uint32_t kShadowFaceCbvs   = 12;     // per-frame face budget: 2 lights x 6 faces
-    constexpr uint32_t kShadowMaxCasters = 512;    // per-light caster cap (sphere-filtered, one list for all 6 faces)
+    constexpr uint32_t kShadowFaceCbvs   = 24;     // per-frame face budget: 4 lights x 6 faces (= kShadowBudget*6)
+    constexpr uint32_t kShadowMaxCasters = 256;    // per-light caster cap (sphere-filtered, one list for all 6 faces)
     constexpr float    kShadowNearZ      = 4.0f;   // face frustum near (world u); far = the light's 2·radius
     // How long a slot's lastWorld record stays a caster candidate after the item was last in
     // the client's visible set. Statics don't move so stale is correct; the window only bounds
     // recycled-slot ghosts after cell changes (records also reset on re-upload).
     // P3 shadow manager budget/hysteresis knobs.
-    constexpr uint32_t kShadowBudget         = 2;     // slot face-blocks re-rendered per frame
+    constexpr uint32_t kShadowBudget         = 4;     // slot face-blocks re-rendered per frame
+                                                      // (budget*kShadowMaxCasters must stay <= 1024 = pShadowWorldsBuf CBV matrices)
     constexpr uint32_t kShadowHoldFrames     = 30;    // a slot is protected from challengers this many frames
     constexpr float    kShadowChallengeRatio = 1.5f;  // challenger importance must beat incumbent by this
     constexpr float    kShadowMovedEps       = 1.0f;  // LIGHT ABS-pos delta (world u) that dirties its slot
     constexpr float    kCasterMoveEps        = 0.1f;  // CASTER ABS-pos delta that counts as a move (catches
                                                       // idle animation; » FP reconstruction jitter <0.01)
     constexpr uint32_t kMoverFresh           = 3;     // a MOVER unseen longer than this is forgotten (no frozen shadow)
+    constexpr uint32_t kCasterSettleFrames   = 10;    // C4b: a record that sat still (in view) at least this many
+                                                      // frames before it vanished is treated as AT REST — kept when
+                                                      // hidden (its shadow is correct). Only a record still moving
+                                                      // within this window of its last sighting is a genuine mover
+                                                      // and expires. Fixes settled clutter (havok-nudged bottle) that
+                                                      // permanently trips everMoved yet never actually relocates.
 
     // P3 caching: a slot's atlas tile is re-rendered only when its caster set actually changes —
     // NEVER on a timer or on camera turn. g_casterEpoch = the last frame ANY caster appeared, moved,
@@ -1521,6 +1557,13 @@ namespace {
     // palettes these draw from are filled by the prepass (runs before the shadow face pass).
     struct SkinnedCaster { uint32_t index; uint32_t window; uint32_t mirror; uint32_t slot; float cRel[3]; float rad; };
     std::vector<SkinnedCaster> g_skinnedCasters;
+    // Multimap shadow casters (NPC heads / glow parts). Pre-walked from the multimap blob in the
+    // SAME order + skip logic the MM Z-prepass assigns firstInstance (index i), so a head reuses the
+    // resident pMMWorldsBuf/pInstanceBufMM slot i (both filled by the prepass, which runs before the
+    // shadow face pass). cRel = camera-relative world centre (localCenter through the draw's world,
+    // same space as the shadow face VP); rad = padded world radius.
+    struct MMCaster { uint32_t index; uint32_t mirror; uint32_t slot; float cRel[3]; float rad; };
+    std::vector<MMCaster> g_mmCasters;
     // The client's camera-relative shift eye (lighting[24..26]) — the SAME value buildDrawList/
     // buildLightList subtracted this frame, so rel + this = the client's absolute world. Used to
     // absolutize lastWorld records and de-absolutize them into the shadow window.
@@ -2061,7 +2104,7 @@ namespace {
             sw.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
             sw.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
             sw.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-            sw.mDesc.mSize = kBatchBytes;              // 1024 matrices >= kShadowMaxCasters
+            sw.mDesc.mSize = kBatchBytes;              // 1024 matrices >= kShadowBudget*kShadowMaxCasters
             sw.mDesc.pName = "shadowWorldsCbv";
             sw.pData = nullptr;
             sw.ppBuffer = &g_live.pShadowWorldsBuf;
@@ -3006,6 +3049,33 @@ namespace {
                     std::printf("[forge] addPipeline(multimap prepass mirror) FAILED\n");
                     return false;
                 }
+
+                // Multimap shadow-caster PSOs — same multimap.vert + depthonly_mm.frag, but into
+                // the SINGLE-SAMPLE atlas (SC1) with the caster cull set (BACK CCW/CW, NONE, FRONT
+                // CCW/CW). Heads reuse their resident pMMWorldsBuf window (camera-relative, matching
+                // the shadow face VP), so no absolute-space conversion — same trick as skinned casters.
+                mpg.mSampleCount = SAMPLE_COUNT_1;
+                RasterizerStateDesc mmShBack = mmRaster;                 // CULL_BACK CCW
+                mpg.pRasterizerState = &mmShBack;
+                addPipeline(R, &mmpPd, &g_live.pMultiMapShadowPipeline);
+                RasterizerStateDesc mmShBackM = mmRasterMirror;          // CULL_BACK CW
+                mpg.pRasterizerState = &mmShBackM;
+                addPipeline(R, &mmpPd, &g_live.pMultiMapShadowPipelineMirror);
+                RasterizerStateDesc mmShNone = mmRaster; mmShNone.mCullMode = CULL_MODE_NONE;
+                mpg.pRasterizerState = &mmShNone;
+                addPipeline(R, &mmpPd, &g_live.pMultiMapShadowPipelineNone);
+                RasterizerStateDesc mmShFront = mmRaster; mmShFront.mCullMode = CULL_MODE_FRONT;
+                mpg.pRasterizerState = &mmShFront;
+                addPipeline(R, &mmpPd, &g_live.pMultiMapShadowPipelineFront);
+                RasterizerStateDesc mmShFrontM = mmShFront; mmShFrontM.mFrontFace = FRONT_FACE_CW;
+                mpg.pRasterizerState = &mmShFrontM;
+                addPipeline(R, &mmpPd, &g_live.pMultiMapShadowPipelineFrontMirror);
+                if (!g_live.pMultiMapShadowPipeline || !g_live.pMultiMapShadowPipelineMirror ||
+                    !g_live.pMultiMapShadowPipelineNone || !g_live.pMultiMapShadowPipelineFront ||
+                    !g_live.pMultiMapShadowPipelineFrontMirror) {
+                    std::printf("[forge] addPipeline(multimap shadow) FAILED\n");
+                    return false;
+                }
             }
 
             // One 64KB world window (a valid full CBV; kMaxMultiMap=256 <= 1024 matrices).
@@ -3160,6 +3230,79 @@ namespace {
             skp.mIndex = SRT_RES_IDX(SrtData, PerBatch, gBatch);
             skp.ppBuffers = &g_live.pSkyWorldsBuf;
             updateDescriptorSet(R, 0, g_live.pPerBatchSetSky, 1, &skp);
+        }
+
+        // --- Debug light-origin boxes: LINE_LIST pipeline + dynamic vertex buffer -----------------
+        // Reuses opaque.srt.h/DefaultRootSignature (debugline.vert reads gFrameData.viewProj only,
+        // like the sky/DL passes). Own vertex layout: {float3 pos (eye-relative), float4 colour}.
+        // Depth OFF (always visible for pixel-sampling), no blend (writes the flat colour + a=1 so
+        // the composite shows it opaque), CULL_NONE. Built unconditionally; zero cost unless toggled.
+        {
+            ShaderLoadDesc dlDesc = {};
+            dlDesc.mVert.pFileName = "debugline.vert";
+            dlDesc.mFrag.pFileName = "debugline.frag";
+            addShader(R, &dlDesc, &g_live.pDebugLineShader);
+            if (!g_live.pDebugLineShader) {
+                std::printf("[forge] addShader(debugline) FAILED\n");
+                return false;
+            }
+
+            VertexLayout dlVL = {};
+            dlVL.mBindingCount = 1;
+            dlVL.mBindings[0].mStride = 7 * sizeof(float);         // float3 pos + float4 colour
+            dlVL.mBindings[0].mRate = VERTEX_BINDING_RATE_VERTEX;
+            dlVL.mAttribCount = 2;
+            dlVL.mAttribs[0].mSemantic = SEMANTIC_POSITION;
+            dlVL.mAttribs[0].mFormat = TinyImageFormat_R32G32B32_SFLOAT;
+            dlVL.mAttribs[0].mBinding = 0;
+            dlVL.mAttribs[0].mLocation = 0;
+            dlVL.mAttribs[0].mOffset = 0;
+            dlVL.mAttribs[1].mSemantic = SEMANTIC_TEXCOORD0;       // per-vertex colour (matches debugline.vert)
+            dlVL.mAttribs[1].mFormat = TinyImageFormat_R32G32B32A32_SFLOAT;
+            dlVL.mAttribs[1].mBinding = 0;
+            dlVL.mAttribs[1].mLocation = 1;
+            dlVL.mAttribs[1].mOffset = 3 * sizeof(float);
+
+            DepthStateDesc dlDepth = {};
+            dlDepth.mDepthTest = false;
+            dlDepth.mDepthWrite = false;
+
+            RasterizerStateDesc dlRaster = {};
+            dlRaster.mCullMode = CULL_MODE_NONE;
+
+            PipelineDesc dlPd = {};
+            dlPd.mType = PIPELINE_TYPE_GRAPHICS;
+            GraphicsPipelineDesc& dg = dlPd.mGraphicsDesc;
+            dg.mPrimitiveTopo = PRIMITIVE_TOPO_LINE_LIST;
+            dg.mRenderTargetCount = 1;
+            dg.pColorFormats = &g_live.pRT->mFormat;
+            dg.mSampleCount = (SampleCount)g_live.sampleCount;
+            dg.mSampleQuality = 0;
+            dg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+            dg.pDepthState = &dlDepth;
+            dg.pVertexLayout = &dlVL;
+            dg.pRasterizerState = &dlRaster;
+            dg.pShaderProgram = g_live.pDebugLineShader;
+            addPipeline(R, &dlPd, &g_live.pDebugLinePipeline);
+            if (!g_live.pDebugLinePipeline) {
+                std::printf("[forge] addPipeline(debugline) FAILED\n");
+                return false;
+            }
+
+            // 12 edges x 2 verts per light-box, up to kMaxPointLights boxes.
+            BufferLoadDesc dvb = {};
+            dvb.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+            dvb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            dvb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            dvb.mDesc.mSize = (uint64_t)IPC::kMaxPointLights * 24 * 7 * sizeof(float);
+            dvb.mDesc.pName = "debugLineVB";
+            dvb.pData = nullptr;
+            dvb.ppBuffer = &g_live.pDebugLineVB;
+            addResource(&dvb, nullptr);
+            waitForAllResourceLoads();
+            if (!g_live.pDebugLineVB) {
+                return false;
+            }
         }
 
         // --- AT1: sorted-alpha shader + 2 blend PSOs + world window + instance VB ---------------
@@ -3921,6 +4064,13 @@ namespace {
         // trusted only while freshly seen — a stale mover record is forgotten (lastWorldFrame→0) so
         // a hidden animated part (1st-person player, off-screen NPC) can't cast a frozen shadow.
         bool     everMoved;
+        // C4b settle-detection: g_renderFrame at the LAST >kCasterMoveEps move. everMoved alone is a
+        // permanent "moved once ever" flag — havok-settled clutter (a bottle nudged at cell load) trips
+        // it and then loses its shadow the moment it leaves the drawn set at distance. The expiry now
+        // forgets a hidden record only if it was STILL moving just before it vanished
+        // (lastWorldFrame - lastMoveFrame <= kCasterSettleFrames); a come-to-rest object keeps its
+        // shadow at its resting spot. 0 = never moved (stays a persistent static).
+        uint32_t lastMoveFrame;
         // C3b: max material-emissive ≥ g_shadowEmissiveSkip at last sight → this is a light's own
         // hot part (lantern paper, candle flame) — the gather skips it as a caster.
         bool     emissiveHot;
@@ -3966,7 +4116,8 @@ namespace {
                 const float mdy = ay - shm.lastWorld[13];
                 const float mdz = az - shm.lastWorld[14];
                 if (mdx*mdx + mdy*mdy + mdz*mdz > kCasterMoveEps * kCasterMoveEps) {
-                    shm.everMoved = true;
+                    shm.everMoved     = true;
+                    shm.lastMoveFrame = g_renderFrame;   // C4b: recency for settle-detection
                     g_casterEpoch = g_renderFrame;
                 }
                 if (emissiveHot != shm.emissiveHot) { g_casterEpoch = g_renderFrame; }
@@ -4147,14 +4298,66 @@ namespace {
                                         // the receiver sample along its depth-reconstructed normal, scaled by
                                         // grazing angle (PSO slope bias is 0). Tuned to 1.0; raise to kill any
                                         // residual grazing acne, lower to tighten contacts.
+    float g_shadowVertWeight = 3.0f;    // VERTICAL importance weighting for slot ranking. The importance
+                                        // metric weights the light's vertical offset from the eye (world Z,
+                                        // camera-relative) by this factor before ranking. >1 demotes lights on
+                                        // another FLOOR (large |Δz|) so they stop stealing the 16 shadow slots
+                                        // from lights on the player's own level — the multi-storey "pop per
+                                        // light" cure. 1.0 = isotropic (old behaviour); ~3 ≈ one floor-height of
+                                        // vertical separation costs as much rank as 3 floor-widths horizontal.
+                                        // Smooth (no hard threshold) so climbing stairs doesn't itself pop.
+    bool  g_shadowFixtureGate = true;   // HARD gate: only fixture lights (name light*/torch*/furn* OR an
+                                        // emissive-hot mesh at the origin) get a shadow slot. Nameless
+                                        // injected window/ambient fill casts NO shadow (still lit) so it
+                                        // can't fill slots real fixtures leave empty. Off = all lights
+                                        // eligible (pre-gate behaviour). Live A/B.
+    float g_shadowFixtureEmissiveBox = 12.0f; // Half-extent (world u, per-axis) of the box around a light
+                                        // origin an emissive-hot centroid must fall inside to vouch the
+                                        // light as a fixture (name-list miss). = the debug box (±12).
+                                        // Small = only a flame-on-the-light counts; too large sweeps in
+                                        // the offset window/glow plane. Live knob for tuning without rebuild.
+    float g_shadowFixtureBoost = 4.0f;  // Shadow-slot importance multiplier for ESM fixture lights
+                                        // (kLightFlagFixture: name light*/torch*/furn*). imp saturates at
+                                        // 1.0, so >1 lifts real fixtures above nameless injected window/
+                                        // ambient fill in the 16-slot ranking. 1.0 = off (old ranking).
+    bool  g_debugLightBoxes = false;    // Debug viz: wireframe box at each point-light origin, coloured by a
+                                        // deterministic id hash (legend logged as [light-box] id=.. rgb=..).
+                                        // Sample a box's on-screen colour → match it back to the light id.
+                                        // Drawn depth-OFF at the end of the colour pass (always visible).
     bool  g_shadowSkinnedCasters = true; // C4a: skinned NPC/creature/player parts CAST shadows (this-frame
                                         // poses; reuses the resident bone windows). Off = pre-C4a behavior
                                         // (only rigid parts cast → partial body shadow). Default ON
                                         // (verified in-game 2026-07-07). Live A/B via checkbox.
+    bool  g_shadowMMCasters = true;     // Multimap parts (NPC heads with glow-map eyes, glow-in-the-dark
+                                        // windows) CAST shadows — reuses the resident MM world/instance
+                                        // windows filled by the MM Z-prepass, drawn with the face VP.
+                                        // Off = headless body shadows (pre-fix). Default ON. Live A/B.
     uint32_t g_shadowCasterCull = 2;    // caster cull mode (live A/B): 0 = CULL_BACK (light-facing faces only),
                                         // 1 = CULL_NONE (two-sided — writes far/under faces, closes the thin
                                         // contact line), 2 = CULL_FRONT (back faces only — acne cure, leaks on
                                         // thin/open MW geometry). Live: draw-time pipeline pick, no rebuild.
+    bool  g_shadowSkipLinearLights = true; // Exclude synthetic ambient/sun fill lights from SHADOW management
+                                        // (they still light the scene — forward loop is untouched). Signature:
+                                        // nonzero LINEAR attenuation (pl[9] > 0). Real placed fixtures + the
+                                        // magic/projectile/spell rewrites all end with linear=0; only the engine/
+                                        // mod-injected nameless warm-white fill (r~512, k=(0.36,0.01,0.01)) keeps
+                                        // linear>0. Was casting a phantom flickering shadow + stealing a budget
+                                        // slot. Live A/B via checkbox to confirm what the light is.
+    uint32_t g_shadowMaxActiveLights = kMaxShadowLights; // Cap ACTIVE shadow-casting lights to the top-N by
+                                        // importance (live). The atlas has 16 slots, so in a light-dense room
+                                        // every fixture claims one — but a moving NPC forces a re-render of
+                                        // EVERY slot it's in reach of, every frame (skinnedHit), and the budget
+                                        // is only kShadowBudget/frame. With 16 active lights the budget can't
+                                        // keep up → each light's NPC shadow refreshes ~kMaxShadowLights/budget
+                                        // frames late → laggy/partial body shadows. Dropping N concentrates the
+                                        // budget on the lights that matter; deactivated slots keep their cached
+                                        // tile and fall out of activeBits + the budget contention. 16 = no cap.
+    bool  g_shadowExpireMovers = true;  // PROOF TOGGLE: the mover-expiry sweep forgets an everMoved caster
+                                        // kMoverFresh frames after it leaves view. everMoved is permanent-once-set
+                                        // (first >0.1u abs move — incl. FP reconstruction jitter far from origin),
+                                        // so a settled/false-flagged static (a bottle) loses its shadow offscreen.
+                                        // OFF = keep all caster records (proves the expiry is the offscreen-loss
+                                        // cause; genuine movers would keep a frozen shadow, hence only a proof).
     // C3b: emissive caster skip — replaces the P3 fixture-radius self-shadow heuristic (which was
     // finnicky: a lantern is several NiTriShapes with different bounding spheres, so parts of the
     // fixture's shadow appeared/disappeared). MW marks a light's own hot part with a full-emissive
@@ -4325,6 +4528,24 @@ namespace {
         uiAddComponentWidget(g_uiPanel, "Shadow caster cull", &ddCc, WIDGET_TYPE_DROPDOWN);
         CheckboxWidget cShSk = {}; cShSk.pData = &g_shadowSkinnedCasters;
         uiAddComponentWidget(g_uiPanel, "Shadow: skinned casters (NPC bodies)", &cShSk, WIDGET_TYPE_CHECKBOX);
+        CheckboxWidget cShMm = {}; cShMm.pData = &g_shadowMMCasters;
+        uiAddComponentWidget(g_uiPanel, "Shadow: multimap casters (NPC heads)", &cShMm, WIDGET_TYPE_CHECKBOX);
+        SliderUintWidget sShMa = {}; sShMa.pData = &g_shadowMaxActiveLights; sShMa.mMin = 1; sShMa.mMax = kMaxShadowLights; sShMa.mStep = 1;
+        uiAddComponentWidget(g_uiPanel, "Shadow: max active lights (16 = no cap)", &sShMa, WIDGET_TYPE_SLIDER_UINT);
+        SliderFloatWidget sShVw = {}; sShVw.pData = &g_shadowVertWeight; sShVw.mMin = 1.0f; sShVw.mMax = 8.0f; sShVw.mStep = 0.25f;
+        uiAddComponentWidget(g_uiPanel, "Shadow: vertical rank weight (multi-floor)", &sShVw, WIDGET_TYPE_SLIDER_FLOAT);
+        CheckboxWidget cShFg = {}; cShFg.pData = &g_shadowFixtureGate;
+        uiAddComponentWidget(g_uiPanel, "Shadow: fixture-only gate (drop window/ambient fill)", &cShFg, WIDGET_TYPE_CHECKBOX);
+        SliderFloatWidget sShFe = {}; sShFe.pData = &g_shadowFixtureEmissiveBox; sShFe.mMin = 0.0f; sShFe.mMax = 64.0f; sShFe.mStep = 1.0f;
+        uiAddComponentWidget(g_uiPanel, "Shadow: fixture emissive-vouch box (0 = name only)", &sShFe, WIDGET_TYPE_SLIDER_FLOAT);
+        SliderFloatWidget sShFb = {}; sShFb.pData = &g_shadowFixtureBoost; sShFb.mMin = 1.0f; sShFb.mMax = 8.0f; sShFb.mStep = 0.25f;
+        uiAddComponentWidget(g_uiPanel, "Shadow: fixture priority boost (light/torch/furn)", &sShFb, WIDGET_TYPE_SLIDER_FLOAT);
+        CheckboxWidget cDbgLb = {}; cDbgLb.pData = &g_debugLightBoxes;
+        uiAddComponentWidget(g_uiPanel, "Debug: light-origin boxes (id-coloured)", &cDbgLb, WIDGET_TYPE_CHECKBOX);
+        CheckboxWidget cShSl = {}; cShSl.pData = &g_shadowSkipLinearLights;
+        uiAddComponentWidget(g_uiPanel, "Shadow: skip ambient/sun fill (linear-atten)", &cShSl, WIDGET_TYPE_CHECKBOX);
+        CheckboxWidget cShEx = {}; cShEx.pData = &g_shadowExpireMovers;
+        uiAddComponentWidget(g_uiPanel, "Shadow: expire offscreen movers (OFF = proof)", &cShEx, WIDGET_TYPE_CHECKBOX);
         SliderFloatWidget sShEm = {}; sShEm.pData = &g_shadowEmissiveSkip; sShEm.mMin = 0.0f; sShEm.mMax = 1.5f; sShEm.mStep = 0.05f;
         uiAddComponentWidget(g_uiPanel, "Shadow: emissive caster skip (>1 = off)", &sShEm, WIDGET_TYPE_SLIDER_FLOAT);
         CheckboxWidget cShBc = {}; cShBc.pData = &g_shadowBlendCasters;
@@ -4829,6 +5050,7 @@ namespace ForgeRender {
                 for (uint32_t s2 = 0; s2 < g_meshHigh; ++s2) {
                     g_meshes[s2].lastWorldFrame = 0;
                     g_meshes[s2].everMoved      = false;
+                    g_meshes[s2].lastMoveFrame  = 0;
                 }
                 g_casterEpoch = g_renderFrame;
             }
@@ -4910,14 +5132,21 @@ namespace ForgeRender {
                                  (idMin == 0xFFFFFFFFu ? 0u : idMin), idMax, nNew, nMoved, firstId, nDark);
                     // Full per-light dump (color/radius/dist) only when the light SET changes
                     // (cell load / spawn / recycle) — steady state stays quiet.
-                    if (spawn) {
-                        for (uint32_t i = 0; i < nL && i < 16u; ++i) {
+                    if (spawn || beat) {   // TEMP DIAG: dump on beat too to inspect degenerate shadow light
+                        for (uint32_t i = 0; i < nL && i < 32u; ++i) {   // TEMP DIAG: uncapped 16→32 to inventory all lights
                             const float* pl = lf + 4 + i * 12;
                             uint32_t id, flags;
                             IPC::unpackLightIdFlags(lf[4 + i * 12 + 7], id, flags);
                             const float dist = std::sqrt(pl[0]*pl[0] + pl[1]*pl[1] + pl[2]*pl[2]);
-                            LOG::logline(">> [p2-lightid]   light[%u] id=%u color=(%.3f,%.3f,%.3f) r=%.1f dist=%.0f k=(%.3f,%.4f,%.5f)",
-                                         i, id, pl[4], pl[5], pl[6], pl[3], dist, pl[8], pl[9], pl[10]);
+                            const float r    = pl[3];
+                            const float vz   = g_shadowVertWeight * pl[2];   // vertical-weighted rank distance
+                            const float distV = std::sqrt(pl[0]*pl[0] + pl[1]*pl[1] + vz*vz);
+                            const float imp  = r / (distV > r ? distV : r);
+                            const float cmax = std::max(pl[4], std::max(pl[5], pl[6]));
+                            const float atten = 1.0f / (pl[8] + pl[9]*dist + pl[10]*dist*dist);
+                            const int   fx = (flags & IPC::kLightFlagFixture) ? 1 : 0;
+                            LOG::logline(">> [p2-lightid]   light[%u] id=%u fx=%d color=(%.3f,%.3f,%.3f) r=%.1f dist=%.0f dz=%.0f imp=%.2f contrib=%.3f k=(%.3f,%.4f,%.5f)",
+                                         i, id, fx, pl[4], pl[5], pl[6], r, dist, pl[2], imp, cmax*atten, pl[8], pl[9], pl[10]);
                         }
                     }
                     s_lastLightIdLog = g_renderFrame;
@@ -4944,9 +5173,18 @@ namespace ForgeRender {
             // animated part — 1st-person player, off-screen NPC) so it stops casting a frozen
             // shadow; forgetting bumps the epoch so the slots holding its stale shadow re-render and
             // drop it. Statics are never everMoved → never forgotten (persistent within the cell).
-            for (uint32_t s2 = 0; s2 < g_meshHigh; ++s2) {
-                HostMesh& hm = g_meshes[s2];
-                if (hm.everMoved && hm.lastWorldFrame != 0 && frame - hm.lastWorldFrame > kMoverFresh) {
+            if (g_shadowExpireMovers) {
+                for (uint32_t s2 = 0; s2 < g_meshHigh; ++s2) {
+                    HostMesh& hm = g_meshes[s2];
+                    if (!hm.everMoved || hm.lastWorldFrame == 0) { continue; }
+                    if (frame - hm.lastWorldFrame <= kMoverFresh) { continue; }   // still freshly seen
+                    // C4b settle-detection: only forget a record that was STILL MOVING just before it
+                    // left the drawn set. A come-to-rest object (sat still ≥ kCasterSettleFrames while
+                    // visible) keeps its shadow at its resting spot — fixes the havok-settled bottle
+                    // that trips everMoved once and then vanished at distance. A genuine mover (moved
+                    // within the window of its last sighting) still expires so it can't cast a frozen
+                    // shadow while hidden.
+                    if (hm.lastWorldFrame - hm.lastMoveFrame > kCasterSettleFrames) { continue; }   // at rest → keep
                     hm.lastWorldFrame = 0;
                     g_casterEpoch = frame;
                 }
@@ -5029,6 +5267,63 @@ namespace ForgeRender {
                 }
             }
 
+            // Multimap shadow casters: pre-walk the MM blob in the SAME order + skip logic as the
+            // MM Z-prepass so index i reuses the resident pMMWorldsBuf/pInstanceBufMM slot i. The
+            // draw world is camera-relative (= shadow face-VP space), so centroid needs no eye
+            // conversion (unlike the rigid gather, which absolutizes). localCenter/localRadius are
+            // filled at upload for every format (incl. multimap).
+            g_mmCasters.clear();
+            if (g_shadowMMCasters && multiMapBlob && multiMapCount && multiMapBytes) {
+                const uint32_t haveMM = multiMapBytes / (uint32_t)sizeof(IPC::MultiMapDrawWire);
+                const uint32_t nMM = (multiMapCount < haveMM) ? multiMapCount : haveMM;
+                const IPC::MultiMapDrawWire* mmItems = (const IPC::MultiMapDrawWire*)multiMapBlob;
+                uint32_t idxMM = 0;
+                for (uint32_t k = 0; k < nMM; ++k) {
+                    if (idxMM >= kMaxMultiMap) { break; }   // matches the prepass cap → idx alignment
+                    const IPC::MultiMapDrawWire& it = mmItems[k];
+                    const uint32_t mslot = it.slot;
+                    if (mslot >= g_meshHigh || !g_meshes[mslot].valid || !g_meshes[mslot].multimap) { continue; }
+                    const HostMesh& hm = g_meshes[mslot];
+                    const float* w = it.world;   // camera-relative
+                    const float cx = hm.localCenter[0]*w[0] + hm.localCenter[1]*w[4] + hm.localCenter[2]*w[8]  + w[12];
+                    const float cy = hm.localCenter[0]*w[1] + hm.localCenter[1]*w[5] + hm.localCenter[2]*w[9]  + w[13];
+                    const float cz = hm.localCenter[0]*w[2] + hm.localCenter[1]*w[6] + hm.localCenter[2]*w[10] + w[14];
+                    const float s0 = w[0]*w[0] + w[1]*w[1] + w[2]*w[2];
+                    const float s1 = w[4]*w[4] + w[5]*w[5] + w[6]*w[6];
+                    const float s2 = w[8]*w[8] + w[9]*w[9] + w[10]*w[10];
+                    float smax = s0 > s1 ? s0 : s1; if (s2 > smax) { smax = s2; }
+                    MMCaster mc;
+                    mc.index  = idxMM;
+                    mc.mirror = worldMirrored(it.world) ? 1u : 0u;
+                    mc.slot   = mslot;
+                    mc.cRel[0] = cx; mc.cRel[1] = cy; mc.cRel[2] = cz;
+                    mc.rad = hm.localRadius * std::sqrt(smax);
+                    g_mmCasters.push_back(mc);
+                    ++idxMM;
+                }
+            }
+
+            // Emissive-hot fixture origins (ABSOLUTE) for the fixture gate: a full-emissive mesh
+            // (torch flame, candle paper — the same emissiveHot marker the caster gather self-skips)
+            // sitting AT a light origin proves that light is a real fixture. The test is TIGHT: the
+            // emissive CENTROID must fall inside a small box (±g_shadowFixtureEmissiveBox, = the debug
+            // box) centred on the light. A window/ambient fill light sits in front of its glowing
+            // window PLANE, whose centroid is offset well outside that box — a loose sphere/AABB
+            // overlap would wrongly catch the big plane (its bounds reach the light), so we match the
+            // point-in-small-box the debug box visualises, not bounds intersection.
+            static std::vector<std::array<float, 3>> emissiveOrigins; emissiveOrigins.clear();
+            if (g_shadowFixtureGate) {
+                for (uint32_t slot = 0; slot < g_meshHigh; ++slot) {
+                    const HostMesh& hm = g_meshes[slot];
+                    if (!hm.valid || !hm.emissiveHot || hm.lastWorldFrame == 0) { continue; }
+                    const float* w = hm.lastWorld;
+                    const float cx = hm.localCenter[0]*w[0] + hm.localCenter[1]*w[4] + hm.localCenter[2]*w[8]  + w[12];
+                    const float cy = hm.localCenter[0]*w[1] + hm.localCenter[1]*w[5] + hm.localCenter[2]*w[9]  + w[13];
+                    const float cz = hm.localCenter[0]*w[2] + hm.localCenter[1]*w[6] + hm.localCenter[2]*w[10] + w[14];
+                    emissiveOrigins.push_back({ cx, cy, cz });
+                }
+            }
+
             // (1) Parse this frame's shadow-eligible lights (id-carrying, r>1). imp = the P1
             // screen-coverage proxy r/max(dist,r) (the contribution metric hopped slots → reverted).
             struct LightInfo { uint32_t idx, id, flags; float pos[3], radius, imp; };
@@ -5046,11 +5341,46 @@ namespace ForgeRender {
                     // part in forward lighting (opaque.frag loops them); just never shadow-managed.
                     const float cmax = std::max(pl[4], std::max(pl[5], pl[6]));
                     if (cmax < 0.01f) { continue; }
+                    // Skip synthetic ambient/sun fill lights: a nonzero LINEAR attenuation (pl[9], the
+                    // wire's falloff.y) marks the nameless engine/mod-injected fill (r~512, warm-white,
+                    // k=(0.36,0.01,0.01)). Real placed fixtures + the client's magic/projectile/spell
+                    // rewrites all leave linear=0, so this catches ONLY the phantom caster. Still lit by
+                    // the forward loop; just never shadow-managed. Live A/B via g_shadowSkipLinearLights.
+                    if (g_shadowSkipLinearLights && pl[9] > 0.0f) { continue; }
                     uint32_t id, flags;
                     IPC::unpackLightIdFlags(lc[4 + i * 12 + 7], id, flags);
                     if (id == 0u) { continue; }     // no P2 identity (old client) → not shadow-managed
-                    const float dist = std::sqrt(pl[0]*pl[0] + pl[1]*pl[1] + pl[2]*pl[2]);
-                    const float imp  = r / (dist > r ? dist : r);
+                    // Importance = screen-coverage proxy r/max(dist,r), but with the VERTICAL offset
+                    // (pl[2] = light.z − eye.z, world-axis camera-relative; MW Z is up) weighted by
+                    // g_shadowVertWeight. On a multi-storey interior this pushes another-floor lights
+                    // (large |Δz|) down the ranking so they don't steal slots from the player's own
+                    // level — the "pop per light" cure. Weight 1.0 restores the isotropic metric.
+                    const float vz   = g_shadowVertWeight * pl[2];
+                    const float dist = std::sqrt(pl[0]*pl[0] + pl[1]*pl[1] + vz*vz);
+                    float imp  = r / (dist > r ? dist : r);
+                    // Fixture determination: name light*/torch*/furn* (client kLightFlagFixture) OR an
+                    // emissive-hot mesh centroid INSIDE the light's small box (±g_shadowFixtureEmissiveBox).
+                    // The tight box rejects the offset window plane (its centroid is outside) while
+                    // catching a flame sitting on the light — the emissive vouch for a name-list miss.
+                    bool isFixture = (flags & IPC::kLightFlagFixture) != 0;
+                    if (!isFixture && g_shadowFixtureGate && !emissiveOrigins.empty()) {
+                        const float lax = pl[0] + g_eyeAbsShadow[0];   // light ABS = camera-rel + eye
+                        const float lay = pl[1] + g_eyeAbsShadow[1];
+                        const float laz = pl[2] + g_eyeAbsShadow[2];
+                        const float hb = g_shadowFixtureEmissiveBox;   // half-extent (per-axis), live knob
+                        for (const auto& e : emissiveOrigins) {
+                            if (std::fabs(e[0] - lax) <= hb && std::fabs(e[1] - lay) <= hb
+                                && std::fabs(e[2] - laz) <= hb) { isFixture = true; break; }
+                        }
+                    }
+                    // Hard gate (g_shadowFixtureGate): a non-fixture light is NEVER shadow-managed —
+                    // it keeps no slot, so nameless window/ambient fill can't fill the 4 slots real
+                    // fixtures leave empty (soft priority can only reorder, not vacate). Still fully
+                    // lit by the forward loop. Live A/B via the toggle.
+                    if (g_shadowFixtureGate && !isFixture) { continue; }
+                    // Fixture priority: boost so real fixtures outrank any non-gated fill. imp saturates
+                    // at 1.0, so a >1 boost lifts fixtures cleanly above. Live knob (1.0 = off).
+                    if (isFixture) { imp *= g_shadowFixtureBoost; }
                     lights.push_back({ i, id, flags, { pl[0], pl[1], pl[2] }, r, imp });
                 }
             }
@@ -5092,6 +5422,26 @@ namespace ForgeRender {
                 sl.radius = L.radius; sl.importance = L.imp;
                 sl.lastSeenFrame = frame; sl.activeThisFrame = true; sl.curLightIdx = L.idx;
                 if (moved) { sl.lastRenderFrame = 0; }   // 0 = dirty (also the never-rendered sentinel)
+            }
+
+            // Live-tuning aid: when a ranking knob (vertical weight or fixture boost) changes, drop
+            // every slot's hysteresis hold for THIS frame so the new ranking re-shuffles ownership
+            // immediately (the challenge loop below is otherwise gated by kShadowHoldFrames, so a knob
+            // change would take many frames to visibly apply). One-shot — steady-state anti-thrash is
+            // untouched next frame.
+            static float s_prevVertWeight   = g_shadowVertWeight;
+            static float s_prevFixtureBoost = g_shadowFixtureBoost;
+            static bool  s_prevFixtureGate  = g_shadowFixtureGate;
+            static float s_prevFixtureEBox  = g_shadowFixtureEmissiveBox;
+            if (s_prevVertWeight != g_shadowVertWeight || s_prevFixtureBoost != g_shadowFixtureBoost
+                || s_prevFixtureGate != g_shadowFixtureGate || s_prevFixtureEBox != g_shadowFixtureEmissiveBox) {
+                s_prevVertWeight   = g_shadowVertWeight;
+                s_prevFixtureBoost = g_shadowFixtureBoost;
+                s_prevFixtureGate  = g_shadowFixtureGate;
+                s_prevFixtureEBox  = g_shadowFixtureEmissiveBox;
+                for (uint32_t s = 0; s < kMaxShadowLights; ++s) {
+                    if (g_shadowSlots[s].valid) { g_shadowSlots[s].assignedFrame = 0; }
+                }
             }
 
             // (4) Assign unowned lights (most important first) to free slots; if none free, a
@@ -5139,6 +5489,26 @@ namespace ForgeRender {
                 }
             }
 
+            // (4b) Cap active shadow lights to the most important N (live g_shadowMaxActiveLights).
+            // Fewer active slots = fewer perpetually-dirty re-renders competing for the per-frame
+            // budget, so the surviving lights stay fresh even with moving skinned casters (which
+            // force a re-render every frame). Deactivated slots keep their cached tile but drop out
+            // of activeBits, the budget contention, and the mask.
+            if (g_shadowMaxActiveLights < kMaxShadowLights) {
+                static std::vector<uint32_t> act; act.clear();
+                for (uint32_t s = 0; s < kMaxShadowLights; ++s) {
+                    if (g_shadowSlots[s].valid && g_shadowSlots[s].activeThisFrame) { act.push_back(s); }
+                }
+                if ((uint32_t)act.size() > g_shadowMaxActiveLights) {
+                    std::sort(act.begin(), act.end(), [&](uint32_t a, uint32_t b) {
+                        return g_shadowSlots[a].importance > g_shadowSlots[b].importance;
+                    });
+                    for (uint32_t k = g_shadowMaxActiveLights; k < (uint32_t)act.size(); ++k) {
+                        g_shadowSlots[act[k]].activeThisFrame = false;
+                    }
+                }
+            }
+
             // (5)+(6) Collect DIRTY active slots (must-render first, then oldest stale), take up to
             // the per-frame budget, gather each one's casters into its GPU region, build its 6 face
             // CBVs, and record a render job. Standing still leaves this empty → shadow phase ≈ 0.
@@ -5161,7 +5531,21 @@ namespace ForgeRender {
                         if (dx*dx + dy*dy + dz*dz <= rr*rr) { skinnedHit = true; break; }
                     }
                 }
-                if (must || stale || skinnedHit) { dirty.push_back(s); }
+                // A multimap head in reach also re-poses every frame → force re-render. (Usually the
+                // NPC's skinned body already trips skinnedHit; this covers standalone MM movers.)
+                bool mmHit = false;
+                if (!skinnedHit && g_shadowMMCasters && !g_mmCasters.empty()) {
+                    const float lrx = sl.absPos[0] - g_eyeAbsShadow[0];
+                    const float lry = sl.absPos[1] - g_eyeAbsShadow[1];
+                    const float lrz = sl.absPos[2] - g_eyeAbsShadow[2];
+                    const float reach = 2.0f * sl.radius;
+                    for (const MMCaster& mc : g_mmCasters) {
+                        const float dx = mc.cRel[0] - lrx, dy = mc.cRel[1] - lry, dz = mc.cRel[2] - lrz;
+                        const float rr = reach + mc.rad;
+                        if (dx*dx + dy*dy + dz*dz <= rr*rr) { mmHit = true; break; }
+                    }
+                }
+                if (must || stale || skinnedHit || mmHit) { dirty.push_back(s); }
             }
             std::sort(dirty.begin(), dirty.end(), [&](uint32_t a, uint32_t b) {
                 const uint32_t ra = g_shadowSlots[a].lastRenderFrame, rb = g_shadowSlots[b].lastRenderFrame;
@@ -5180,7 +5564,13 @@ namespace ForgeRender {
                 const float lax = sl.absPos[0], lay = sl.absPos[1], laz = sl.absPos[2];   // ABSOLUTE
 
                 // Caster gather over RESIDENT lastWorld records (ABSOLUTE space; owned statics only).
-                const uint32_t begin = (uint32_t)g_shadowCasters.size();
+                // Collect ALL in-reach statics with their light distance, then keep the CLOSEST
+                // kShadowMaxCasters. Near statics cast the sharpest/largest shadows, so a slot that
+                // over-subscribes the per-light cap drops its FARTHEST (weakest) casters, never
+                // arbitrary slot-index ones — a static near the light can no longer be starved out
+                // by distant furniture that happens to sit at a lower slot index.
+                struct GatherC { float d2; uint32_t slot; uint8_t mirror; };
+                static std::vector<GatherC> gc; gc.clear();
                 for (uint32_t slot = 0; slot < g_meshHigh; ++slot) {
                     const HostMesh& hm = g_meshes[slot];
                     if (!hm.valid || hm.skinned || hm.multimap) { continue; }
@@ -5207,9 +5597,15 @@ namespace ForgeRender {
                     // can't black-cage its own light. Non-emissive fixture parts (the metal frame)
                     // keep casting stable cage shadows, and it's per-shape — no size guessing.
                     if (hm.emissiveHot) { continue; }
-                    g_shadowCasters.push_back({ slot, hm.lastMirror });
-                    if (g_shadowCasters.size() - begin >= kShadowMaxCasters) { break; }
+                    gc.push_back({ d2, slot, hm.lastMirror });
                 }
+                if (gc.size() > kShadowMaxCasters) {
+                    std::nth_element(gc.begin(), gc.begin() + kShadowMaxCasters, gc.end(),
+                                     [](const GatherC& a, const GatherC& b) { return a.d2 < b.d2; });
+                    gc.resize(kShadowMaxCasters);
+                }
+                const uint32_t begin = (uint32_t)g_shadowCasters.size();
+                for (const GatherC& g2 : gc) { g_shadowCasters.push_back({ g2.slot, g2.mirror }); }
                 const uint32_t end = (uint32_t)g_shadowCasters.size();
                 std::sort(g_shadowCasters.begin() + begin, g_shadowCasters.begin() + end,
                           [](const ShadowCaster& a, const ShadowCaster& b) {
@@ -5285,6 +5681,22 @@ namespace ForgeRender {
                     LOG::logline(">> [p3-shadow] f=%u valid=%u active=%u renders=%u activeBits=0x%04X casters=%u",
                                  frame, nValid, nActive, nRender, activeBits, (unsigned)g_shadowCasters.size());
                     s_lastShadowLog = frame;
+                }
+                // TEMP DIAG: per-slot OWNERSHIP snapshot (which light id holds each of the 16 slots +
+                // its imp/hold-age). Independent ~120-frame timer (the beat above resets on every
+                // render, so it can't tick while moving). Lets us diff slot ownership across restarts
+                // to see whether the pop is path-dependent assignment vs the metric.
+                static uint64_t s_lastSlotLog = 0;
+                if (frame - s_lastSlotLog >= 120) {
+                    s_lastSlotLog = frame;
+                    for (uint32_t s = 0; s < kMaxShadowLights; ++s) {
+                        const ShadowSlot& sl = g_shadowSlots[s];
+                        if (!sl.valid) { continue; }
+                        LOG::logline(">> [p3-slot]   slot[%u] id=%u imp=%.2f active=%u age=%u lastRender=%d",
+                                     s, sl.lightId, sl.importance, (unsigned)sl.activeThisFrame,
+                                     (unsigned)(frame - sl.assignedFrame),
+                                     (sl.lastRenderFrame == 0) ? -1 : (int)(frame - sl.lastRenderFrame));
+                    }
                 }
             }
         }
@@ -5842,6 +6254,45 @@ namespace ForgeRender {
                             cmdBindVertexBuffer(g_live.pCmd, 2, svbs, sstrides, nullptr);
                             cmdBindIndexBuffer(g_live.pCmd, sm.ib, INDEX_TYPE_UINT16, 0);
                             cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, sc.index);
+                        }
+                    }
+
+                    // Multimap casters (heads/glow) for THIS slot/face. Reuse the resident MM world
+                    // (pPerBatchSetMM) + instance (pInstanceBufMM) windows filled by the MM Z-prepass
+                    // (runs before this pass); bind the MM shadow PSO + this face's VP and draw
+                    // firstInstance=index. Reach-culled against the slot's light sphere.
+                    if (g_shadowMMCasters && !g_mmCasters.empty()) {
+                        const ShadowSlot& sl3 = g_shadowSlots[R.slot];
+                        const float lrx = sl3.absPos[0] - g_eyeAbsShadow[0];
+                        const float lry = sl3.absPos[1] - g_eyeAbsShadow[1];
+                        const float lrz = sl3.absPos[2] - g_eyeAbsShadow[2];
+                        const float reach = 2.0f * sl3.radius;
+                        int mmMirror = -1;
+                        for (const MMCaster& mc : g_mmCasters) {
+                            const float dx = mc.cRel[0] - lrx, dy = mc.cRel[1] - lry, dz = mc.cRel[2] - lrz;
+                            const float rr = reach + mc.rad;
+                            if (dx*dx + dy*dy + dz*dz > rr*rr) { continue; }
+                            if ((int)mc.mirror != mmMirror) {
+                                Pipeline* mmPso;
+                                switch (g_shadowCasterCull) {
+                                case 1:  mmPso = g_live.pMultiMapShadowPipelineNone; break;
+                                case 2:  mmPso = mc.mirror ? g_live.pMultiMapShadowPipelineFrontMirror
+                                                           : g_live.pMultiMapShadowPipelineFront; break;
+                                default: mmPso = mc.mirror ? g_live.pMultiMapShadowPipelineMirror
+                                                           : g_live.pMultiMapShadowPipeline; break;
+                                }
+                                cmdBindPipeline(g_live.pCmd, mmPso);
+                                cmdBindDescriptorSet(g_live.pCmd, b * 6 + f, g_live.pShadowFaceSet);
+                                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetMM);
+                                mmMirror = (int)mc.mirror;
+                            }
+                            HostMesh& mm = g_meshes[mc.slot];
+                            Buffer*  mvbs[2]     = { mm.vb, g_live.pInstanceBufMM };
+                            uint32_t mstrides[2] = { (uint32_t)sizeof(IPC::GeomVertexWireMM), (uint32_t)(kMMInstU32 * sizeof(uint32_t)) };
+                            cmdBindVertexBuffer(g_live.pCmd, 2, mvbs, mstrides, nullptr);
+                            cmdBindIndexBuffer(g_live.pCmd, mm.ib, INDEX_TYPE_UINT16, 0);
+                            cmdDrawIndexedInstanced(g_live.pCmd, mm.indexCount, 0, 1, 0, mc.index);
                         }
                     }
                 }
@@ -6598,6 +7049,59 @@ namespace ForgeRender {
         dlLiveRecord();
 
         gpuPhaseEnd(kGpuPhaseColorDL);
+
+        // --- Debug light-origin boxes (colorTarget + pDepth still bound; depth-OFF pipeline) -------
+        // One wireframe box per point light at its eye-relative origin (pl[0..2]), coloured by the
+        // id hash. Legend logged every ~240 frames so a sampled on-screen colour maps back to a light
+        // id. Reads the light CBV that this frame's lighting already populated.
+        if (g_debugLightBoxes && g_live.pDebugLinePipeline && g_live.pDebugLineVB
+            && g_live.pLightCbv && g_lastLightCount) {
+            struct DbgV { float p[3]; float c[4]; };
+            const float* lc = (const float*)g_live.pLightCbv->pCpuMappedAddress;
+            const uint32_t nBox = (g_lastLightCount < IPC::kMaxPointLights)
+                                  ? g_lastLightCount : IPC::kMaxPointLights;
+            DbgV* dv = (DbgV*)g_live.pDebugLineVB->pCpuMappedAddress;
+            static const int edges[12][2] = { {0,1},{2,3},{4,5},{6,7}, {0,2},{1,3},{4,6},{5,7},
+                                              {0,4},{1,5},{2,6},{3,7} };
+            const float hx = 12.0f;   // half-extent (24u cube)
+            uint32_t vcount = 0;
+            static uint64_t s_lastBoxLegend = 0;
+            const bool legend = (g_renderFrame - s_lastBoxLegend >= 240);
+            for (uint32_t i = 0; i < nBox; ++i) {
+                const float* pl = lc + 4 + i * 12;
+                uint32_t id, flags;
+                IPC::unpackLightIdFlags(lc[4 + i * 12 + 7], id, flags);
+                float cr, cg, cb; debugIdColor(id, cr, cg, cb);
+                if (legend) {
+                    LOG::logline(">> [light-box] id=%u rgb=(%.2f,%.2f,%.2f) pos=(%.0f,%.0f,%.0f)",
+                                 id, cr, cg, cb, pl[0], pl[1], pl[2]);
+                }
+                float corners[8][3];
+                for (int c = 0; c < 8; ++c) {
+                    corners[c][0] = pl[0] + ((c & 1) ? hx : -hx);
+                    corners[c][1] = pl[1] + ((c & 2) ? hx : -hx);
+                    corners[c][2] = pl[2] + ((c & 4) ? hx : -hx);
+                }
+                for (int e = 0; e < 12; ++e) {
+                    for (int k = 0; k < 2; ++k) {
+                        DbgV& d = dv[vcount++];
+                        const float* cc = corners[edges[e][k]];
+                        d.p[0] = cc[0]; d.p[1] = cc[1]; d.p[2] = cc[2];
+                        d.c[0] = cr; d.c[1] = cg; d.c[2] = cb; d.c[3] = 1.0f;
+                    }
+                }
+            }
+            if (legend) { s_lastBoxLegend = g_renderFrame; }
+            if (vcount) {
+                cmdBindPipeline(g_live.pCmd, g_live.pDebugLinePipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                const uint32_t stride = 7 * sizeof(float);
+                cmdBindVertexBuffer(g_live.pCmd, 1, &g_live.pDebugLineVB, &stride, nullptr);
+                cmdDraw(g_live.pCmd, vcount, 0);
+            }
+        }
+
         gpuPhaseEnd(kGpuPhaseColor);
 
         // ===================== Occlusion M2: Hi-Z mip-0 fill (colour->water seam) ==================
@@ -10765,6 +11269,7 @@ namespace ForgeRender {
                     HostMesh& rm = g_meshes[hdr.slot];
                     rm.lastWorldFrame = 0;   // drops it from the caster gather (see the == 0 skip)
                     rm.everMoved      = false;
+                    rm.lastMoveFrame  = 0;
                     g_casterEpoch     = g_renderFrame;
                 }
                 continue;
@@ -10823,6 +11328,7 @@ namespace ForgeRender {
                 // drawn. Morph re-uploads refresh the same frame (upload precedes renderScene).
                 m.lastWorldFrame = 0;
                 m.everMoved = false;   // a recycled slot starts as a fresh static until proven a mover
+                m.lastMoveFrame = 0;
             }
 
             // A re-upload at the SAME shape (vertex/index count + skinned flag) MIGHT be an
@@ -11080,6 +11586,11 @@ namespace ForgeRender {
         if (g_live.pMultiMapPipelineMirror) { removePipeline(R, g_live.pMultiMapPipelineMirror); }
         if (g_live.pMultiMapPrepassPipeline)       { removePipeline(R, g_live.pMultiMapPrepassPipeline); }
         if (g_live.pMultiMapPrepassPipelineMirror) { removePipeline(R, g_live.pMultiMapPrepassPipelineMirror); }
+        if (g_live.pMultiMapShadowPipeline)            { removePipeline(R, g_live.pMultiMapShadowPipeline); }
+        if (g_live.pMultiMapShadowPipelineMirror)      { removePipeline(R, g_live.pMultiMapShadowPipelineMirror); }
+        if (g_live.pMultiMapShadowPipelineNone)        { removePipeline(R, g_live.pMultiMapShadowPipelineNone); }
+        if (g_live.pMultiMapShadowPipelineFront)       { removePipeline(R, g_live.pMultiMapShadowPipelineFront); }
+        if (g_live.pMultiMapShadowPipelineFrontMirror) { removePipeline(R, g_live.pMultiMapShadowPipelineFrontMirror); }
         if (g_live.pMultiMapDepthShader)    { removeShader(R, g_live.pMultiMapDepthShader); }
         if (g_live.pMultiMapShader)         { removeShader(R, g_live.pMultiMapShader); }
         // SK1 sky teardown.
@@ -11089,6 +11600,9 @@ namespace ForgeRender {
         if (g_live.pSkyPipeline)            { removePipeline(R, g_live.pSkyPipeline); }
         if (g_live.pSkyPipelineAdd)         { removePipeline(R, g_live.pSkyPipelineAdd); }
         if (g_live.pSkyShader)              { removeShader(R, g_live.pSkyShader); }
+        if (g_live.pDebugLineVB)            { removeResource(g_live.pDebugLineVB); }
+        if (g_live.pDebugLinePipeline)      { removePipeline(R, g_live.pDebugLinePipeline); }
+        if (g_live.pDebugLineShader)        { removeShader(R, g_live.pDebugLineShader); }
         if (g_live.pPerBatchSetAlpha)       { removeDescriptorSet(R, g_live.pPerBatchSetAlpha); }
         if (g_live.pAlphaWorldsBuf)         { removeResource(g_live.pAlphaWorldsBuf); }
         if (g_live.pAlphaInstanceBuf)       { removeResource(g_live.pAlphaInstanceBuf); }

@@ -7,6 +7,7 @@
 #include "distantland.h"
 #include "mwbridge.h"
 #include "scenegraph_geometry_cache.h"
+#include "cachebounds.h"
 #include "scenegraph.h"
 #include "datahandler_view.h"
 #include "morrowindbsa.h"
@@ -141,6 +142,11 @@ namespace {
     std::vector<std::uint8_t>                 g_skinnedScratch;     // packed [SkinnedDrawWire][palette]* this frame
     std::vector<std::uint8_t>                 g_multiMapScratch;    // packed MultiMapDrawWire[] this frame (Tier 4)
     std::vector<std::uint8_t>                 g_lightScratch;       // packed PointLightWire[] this frame
+
+    // Offscreen shadow casters: skinned + multimap NPC parts this far (world units) from the eye
+    // are re-emitted for shadowing even when frustum-culled, so their shadows don't freeze/lose
+    // parts as they leave view. ~2r of the largest shadow lights; bounded to a few NPCs indoors.
+    constexpr float kShadowCasterRadius = 2048.0f;
 
     // --- P2 light identity tracking -------------------------------------------------------
     // Persistent per-light id across frames, keyed by the scene-graph snapshot's stable
@@ -1400,6 +1406,54 @@ namespace {
             }
         }
 
+        // Offscreen shadow casters: skinned + multimap NPC parts near the camera but OUTSIDE the
+        // frustum were dropped by the visible-set loops above, so their shadows freeze and shed
+        // parts as they leave view (the host can only cast what it receives). Re-emit them from
+        // CACHED data — NO live NiTriShape read, because an offscreen key may be stale/freed and
+        // ensureLive's recycled-address guard runs after the deref. The emit helpers subtract the
+        // CURRENT eye from the absolute cached pose, so a stationary/idle NPC's frozen pose is
+        // exactly right; a genuinely-moving offscreen NPC lags at its last-seen spot until it
+        // re-enters view (a live near-actor walk is the follow-up). De-dup against the ACTUAL
+        // emitted set (this frame's visible keys) — NOT lastFrame. The eviction sweep runs
+        // ensureFullWalk() every kEvictSweepInterval (~30) frames, which visits offscreen near
+        // entries and stamps lastFrame = currentFrame to keep them resident, WITHOUT adding them
+        // to the visible set. A lastFrame de-dup would then skip the offscreen NPC on exactly
+        // those frames while the main loop also skips it → the caster blinks every ~30 frames (the
+        // tradehouse pulsing). Visible-set membership is immune to that stamping.
+        if (wantSkinned || wantMM) {
+            static std::unordered_set<std::uint32_t> s_visLookup;
+            s_visLookup.clear();
+            if (foldKeys) { for (std::uint32_t k : *foldKeys) s_visLookup.insert(k); }
+            else          { for (std::uint32_t k : keys)      s_visLookup.insert(k); }
+            const float r2 = kShadowCasterRadius * kShadowCasterRadius;
+            for (const auto& kv : cacheMap) {
+                const auto& e = kv.second;
+                if (s_visLookup.count(kv.first)) continue;  // in the visible set → already emitted above
+                if (e.isSky) continue;
+                const bool isMM = !e.isLandscape && !e.blendEnable && e.d3dTexture
+                                  && (e.d3dDark || e.d3dDetail || e.d3dGlow);
+                if (e.isSkinned) {
+                    if (!wantSkinned || e.skinnedUnsupported || e.numBones == 0) continue;
+                } else if (isMM) {
+                    if (!wantMM) continue;
+                } else {
+                    continue;   // only shadow-relevant movers (skinned bodies / multimap heads)
+                }
+                // World-space centre from cached bounds (no NiTriShape deref).
+                D3DXVECTOR3 c; float rad;
+                if (e.isSkinned) cacheSkinnedWorldBounds(e, c, rad);
+                else             cacheWorldBounds(e, c, rad);
+                const float dx = c.x - DistantLand::eyePos.x;
+                const float dy = c.y - DistantLand::eyePos.y;
+                const float dz = c.z - DistantLand::eyePos.z;
+                if (dx * dx + dy * dy + dz * dz > r2) continue;
+                auto ks = g_keySlot.find(kv.first);
+                if (ks == g_keySlot.end()) continue;       // never uploaded a host slot
+                if (e.isSkinned) emitSkinnedDraw(ks->second, e, skinnedCount);
+                else             emitMultiMapDraw(ks->second, e, multiMapCount);
+            }
+        }
+
         // AT3: merge the captured blended DIPs (particles/smoke/flames + multimap/decal/untextured
         // blends the host cache pass doesn't own) captured LAST frame (g_capRecs) into the SAME
         // candidate list so ONE sort orders the whole blended set back-to-front. Depth uses the
@@ -1605,6 +1659,7 @@ namespace {
             w.color[0] = diffuse[0] * pointLightMult;
             w.color[1] = diffuse[1] * pointLightMult;
             w.color[2] = diffuse[2] * pointLightMult;
+            if (pl.fixture) { flags |= IPC::kLightFlagFixture; }   // ESM fixture → host shadow-priority boost
             w.color[3] = IPC::packLightIdFlags(id, flags);   // P2 identity lane (shader ignores .w)
             w.falloff[0] = falloff[0];
             w.falloff[1] = falloff[1];

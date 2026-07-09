@@ -57,6 +57,9 @@ namespace MGE::SceneGraph {
         float diffuse[3];    // pl->diffuse.rgb * pl->dimmer
         float falloff[3];    // (constantAttenuation, linearAttenuation, quadraticAttenuation)
         float radius;        // specular.r — Bethesda's modder-set fade radius
+        bool  fixture;       // name matches an ESM fixture prefix (light*/torch*/furn*). Runtime-
+                             // injected fill (nameless window/ambient lights) is NOT a fixture →
+                             // lower shadow-slot priority so real fixtures win. Set in extractPointLight.
         // P2 light identity: the source NI::PointLight* (opaque — consumers that can't take
         // NI headers still get a stable per-frame key). A persistent light keeps the same
         // pointer across frames; a freed lantern's NiLight can have its address recycled by a
