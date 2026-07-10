@@ -1436,7 +1436,7 @@ namespace {
         // to the visible set. A lastFrame de-dup would then skip the offscreen NPC on exactly
         // those frames while the main loop also skips it → the caster blinks every ~30 frames (the
         // tradehouse pulsing). Visible-set membership is immune to that stamping.
-        if (wantSkinned || wantMM) {
+        if (wantSkinned || wantMM || wantStatic) {
             static std::unordered_set<std::uint32_t> s_visLookup;
             s_visLookup.clear();
             if (foldKeys) { for (std::uint32_t k : *foldKeys) s_visLookup.insert(k); }
@@ -1452,8 +1452,25 @@ namespace {
                     if (!wantSkinned || e.skinnedUnsupported || e.numBones == 0) continue;
                 } else if (isMM) {
                     if (!wantMM) continue;
+                } else if (e.isLive && !e.blendEnable && !e.isLandscape) {
+                    // Rigid LIVE parts (C4d): on NPCs that is MOST of the body — MW attaches
+                    // hair/neck/arms/legs rigidly to bones; only a few parts are skin-deformed.
+                    // Since C4d these render ONLY from the dynamic tile, whose gather requires a
+                    // record refreshed within kMoverFresh(3) frames (forgerender.cpp:5637) — and
+                    // LIVE records are barred from the static gathers (5806). So an offscreen
+                    // actor's rigid parts vanished from the shadow in 3 frames (shack repro
+                    // 2026-07-10; the expire-movers toggle can't help — it only gates record
+                    // DELETION, not gather membership). Re-emitting here refreshes the host
+                    // record every frame; emitStaticDraw already ships casterFlags=LIVE + the
+                    // cached world (same freshness as the skinned palettes above).
+                    // isPickRoot does NOT disqualify: NPCs live under worldPickObjectRoot, so
+                    // every body part carries the flag — it only marks a COLLISION PROXY when
+                    // the shape is also textureless (dispatch()'s exact rule, replicated here;
+                    // first cut required !isPickRoot outright and skipped the whole body).
+                    if (!e.d3dTexture && e.isPickRoot) continue;   // collision proxies only
+                    if (!wantStatic) continue;
                 } else {
-                    continue;   // only shadow-relevant movers (skinned bodies / multimap heads)
+                    continue;   // shadow-relevant movers only (skinned / MM heads / rigid LIVE)
                 }
                 // World-space centre from cached bounds (no NiTriShape deref).
                 D3DXVECTOR3 c; float rad;
@@ -1465,8 +1482,9 @@ namespace {
                 if (dx * dx + dy * dy + dz * dz > r2) continue;
                 auto ks = g_keySlot.find(kv.first);
                 if (ks == g_keySlot.end()) continue;       // never uploaded a host slot
-                if (e.isSkinned) emitSkinnedDraw(ks->second, e, skinnedCount);
-                else             emitMultiMapDraw(ks->second, e, multiMapCount);
+                if (e.isSkinned)    emitSkinnedDraw(ks->second, e, skinnedCount);
+                else if (isMM)      emitMultiMapDraw(ks->second, e, multiMapCount);
+                else                emitStaticDraw(ks->second, e, drawCount);
             }
         }
 
