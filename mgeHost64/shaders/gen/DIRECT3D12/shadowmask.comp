@@ -962,7 +962,7 @@ SamplerState gSamplerAnisotropic : register( s10 , space100 ) ;
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
 #line 26 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.srt.h"
-#line 18 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.srt.h"
+#line 19 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.srt.h"
 STRUCT(ShadowMaskParams)
 {
     float4x4 invViewProj;
@@ -970,23 +970,41 @@ STRUCT(ShadowMaskParams)
 
 
 
+
+
     float4 maskParams;
-    float4 slotPosRad[ 16 ];
-    float4 slotTile[ 16 ];
-#line 40 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.srt.h"
+    float4 slotPosRad[ 32 ];
+    float4 slotTile[ 32 ];
+
+
+
+
+
+
+
+
     float4 biasParams;
-#line 41
+
+
+
+
+
+
+
+
+    uint4 slotBits;
+#line 49
 };
 
         CBUFFER(ShadowMaskParams) gShadowMaskParams :  register(b0,space2);
         Tex2D(float) gShadowLinDepth :  register(t1,space2);
         Tex2D(float) gShadowAtlas :  register(t2,space2);
-        WTex2D(uint2) gShadowMaskOut :  register(u3,space2);
+        WTex2D(uint4) gShadowMaskOut :  register(u3,space2);
 
 
         Tex2D(float) gShadowAtlasDyn :  register(t4,space2);
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
-#line 38 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
+#line 45 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
 float shadowLitAt(int2 tp, int2 tmin, int2 tmax, float thresh, uint dynSlot)
 {
     tp = clamp(tp, tmin, tmax);
@@ -1030,10 +1048,11 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 {
     INIT_MAIN;
     int2 px = int2(DispatchThreadID.xy);
-    uint2 mask = uint2(0xFFFFFFFFu, 0xFFFFFFFFu);
+    uint4 mask = uint4(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
+
 
     float2 invScreen = gShadowMaskParams.screenParams.zw;
-    uint activeBits = (uint)gShadowMaskParams.maskParams.x;
+    uint activeBits = gShadowMaskParams.slotBits.x;
     uint dbg = (uint)gShadowMaskParams.maskParams.w;
     float deviceZ = LoadTex2D(gShadowLinDepth, NO_SAMPLER, px, 0).r;
 
@@ -1041,6 +1060,31 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     if (deviceZ > 0.0f && activeBits != 0u)
     {
         float3 P = reconstructWorldPx(px, deviceZ, invScreen);
+
+
+
+
+
+
+
+
+
+
+        uint rangeBits = 0u;
+        for (uint rs = 0u; rs < (uint) 32 ; ++rs)
+        {
+            if ((activeBits & (1u << rs)) == 0u) { continue; }
+            float4 pr = gShadowMaskParams.slotPosRad[rs];
+            float3 adr = abs(P - pr.xyz);
+            float mar = max(adr.x, max(adr.y, adr.z));
+            if (mar < 2.0f * pr.w) { rangeBits |= (1u << rs); }
+        }
+        if (dbg != 0u) { rangeBits = activeBits; }
+        if (rangeBits == 0u)
+        {
+            Write2D(gShadowMaskOut, px, mask);
+            return;
+        }
 
 
 
@@ -1063,13 +1107,23 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
         float3 N = normalize(cross(dpx, dpy));
         if (dot(N, -P) < 0.0f) { N = -N; }
         float normalOffsetK = gShadowMaskParams.biasParams.y;
-        uint dynBits = (uint)gShadowMaskParams.biasParams.z;
+        uint dynBits = gShadowMaskParams.slotBits.y;
 
-        for (uint s = 0u; s < (uint) 16 ; ++s)
+
+
+
+
+        bool pcfNear = dot(P, P) <  360.0f  *  360.0f ;
+
+        for (uint s = 0u; s < (uint) 32 ; ++s)
         {
-            if ((activeBits & (1u << s)) == 0u) { continue; }
-            uint dynSlot = (dynBits >> s) & 1u;
+            if ((rangeBits & (1u << s)) == 0u) { continue; }
             float4 posRad = gShadowMaskParams.slotPosRad[s];
+            float3 ad0 = abs(P - posRad.xyz);
+            float ma0 = max(ad0.x, max(ad0.y, ad0.z));
+            float farZ = 2.0f * posRad.w;
+
+            uint dynSlot = (dynBits >> s) & 1u;
             float4 tile = gShadowMaskParams.slotTile[s];
 
 
@@ -1079,14 +1133,11 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
             float3 Ldir = posRad.xyz - P;
             float ndotl = dot(N, Ldir * rsqrt(max(dot(Ldir, Ldir), 1e-8f)));
             float sinT = sqrt(saturate(1.0f - ndotl * ndotl));
-            float3 ad0 = abs(P - posRad.xyz);
-            float ma0 = max(ad0.x, max(ad0.y, ad0.z));
             float texelW = 2.0f * ma0 / max(tile.z, 1.0f);
             float3 Poff = P + N * (normalOffsetK * sinT * texelW);
 
             float3 d = Poff - posRad.xyz;
             float nearZ = gShadowMaskParams.maskParams.y;
-            float farZ = 2.0f * posRad.w;
             float3 ad = abs(d);
 
 
@@ -1123,15 +1174,46 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
                 float2 ap = faceOrg + fuv * tile.z;
 
 
-                float vis = 0.0f;
-                UNROLL for (int j = - 1 ; j <=  1 ; ++j)
-                UNROLL for (int i = - 1 ; i <=  1 ; ++i)
-                {
-                    vis += shadowBilinear(ap + float2(float(i), float(j)), tmin, tmax, thresh, dynSlot);
-                }
-                vis *= 1.0f / float((2 *  1  + 1) * (2 *  1  + 1));
 
-                nib = (uint)(saturate(vis) * 15.0f + 0.5f);
+
+
+
+
+                if (!pcfNear)
+                {
+                    float vis1 = shadowBilinear(ap, tmin, tmax, thresh, dynSlot);
+                    nib = (uint)(saturate(vis1) * 15.0f + 0.5f);
+                }
+                else
+                {
+
+
+
+
+
+
+
+                    float2 fp = ap - 0.5f;
+                    int2 fb = int2(floor(fp));
+                    float2 ff = fp - float2(fb);
+                    float vis = 0.0f;
+                    UNROLL
+                    for (int j = 0; j < 2 *  1  + 2; ++j)
+                    {
+                        float wy = (j == 0) ? (1.0f - ff.y)
+                                 : ((j == 2 *  1  + 1) ? ff.y : 1.0f);
+                        UNROLL
+                        for (int i = 0; i < 2 *  1  + 2; ++i)
+                        {
+                            float wx = (i == 0) ? (1.0f - ff.x)
+                                     : ((i == 2 *  1  + 1) ? ff.x : 1.0f);
+                            vis += (wx * wy) * shadowLitAt(fb + int2(i -  1 , j -  1 ),
+                                                           tmin, tmax, thresh, dynSlot);
+                        }
+                    }
+                    vis *= 1.0f / float((2 *  1  + 1) * (2 *  1  + 1));
+                    nib = (uint)(saturate(vis) * 15.0f + 0.5f);
+                }
             }
             if (dbg == 1u) { nib = (face + 1u) * 2u; }
             if (dbg == 2u)
@@ -1147,8 +1229,11 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
             }
 
             uint sh = (s & 7u) * 4u;
-            if (s < 8u) { mask.x = (mask.x & ~(0xFu << sh)) | (nib << sh); }
-            else { mask.y = (mask.y & ~(0xFu << sh)) | (nib << sh); }
+            uint lane = s >> 3u;
+            if (lane == 0u) { mask.x = (mask.x & ~(0xFu << sh)) | (nib << sh); }
+            else if (lane == 1u) { mask.y = (mask.y & ~(0xFu << sh)) | (nib << sh); }
+            else if (lane == 2u) { mask.z = (mask.z & ~(0xFu << sh)) | (nib << sh); }
+            else { mask.w = (mask.w & ~(0xFu << sh)) | (nib << sh); }
         }
     }
 

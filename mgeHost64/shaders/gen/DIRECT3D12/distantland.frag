@@ -1058,13 +1058,14 @@ STRUCT(LightData)
 
 
 
-        Tex2D(uint2) gShadowMask :  register(t6,space1);
+
+        Tex2D(uint4) gShadowMask :  register(t6,space1);
 
 
 
 
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 141 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 142 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 896 ] :  register(t0,space0);
 
 
