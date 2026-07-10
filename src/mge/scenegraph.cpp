@@ -126,19 +126,13 @@ namespace MGE::SceneGraph {
             out.radius = pl->specular.r;
 
             // Fixture classification for shadow-slot priority: a real ESM-placed light carries its
-            // editor id (light*/torch*/furn*); runtime-injected fill (window/ambient daylight fakes)
-            // is nameless. Prefix-match case-insensitively. Boosted host-side so fixtures outrank fill.
-            out.fixture = false;
-            if (const char* nm = pl->getName()) {
-                const auto pfx = [nm](const char* p) {
-                    for (size_t i = 0; p[i]; ++i) {
-                        const char a = nm[i];
-                        if (!a || (a | 0x20) != p[i]) { return false; }   // p is lowercase
-                    }
-                    return true;
-                };
-                out.fixture = pfx("light") || pfx("torch") || pfx("furn");
-            }
+            // editor id; runtime-injected fill (window/ambient daylight fakes) is NAMELESS — that
+            // distinction is the gate's whole intent. The old light*/torch*/furn* PREFIX test
+            // encoded vanilla naming only: Tamriel_Data / mod interiors name lights TR_m2_light_*,
+            // AB_light@_* etc., so entire modded cells classified as non-fixture and the host's
+            // hard fixture gate zeroed every shadow slot (valid=0, no shadows anywhere).
+            const char* nm = pl->getName();
+            out.fixture = (nm != nullptr && nm[0] != '\0');
 
             // P2: stable per-frame identity key. Downstream tracking recycles it when a freed
             // NiLight's address is reused (frame-gap + teleport guards in buildLightList).

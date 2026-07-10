@@ -1012,6 +1012,17 @@ namespace {
         Shader*        pDepthOnlyShader = nullptr;
         Pipeline*      pOpaquePrepassPipeline = nullptr;        // FRONT_FACE_CCW, depth-only
         Pipeline*      pOpaquePrepassPipelineMirror = nullptr;  // FRONT_FACE_CW, depth-only
+        // Prepass fast path: pure-opaque draws (alphaRef == 0 — the vast majority) go through a
+        // PS-LESS depth pipeline: no fragment stage at all, so the raster keeps early/double-rate
+        // depth writes and does zero texture traffic. depthonly.frag's unconditional clip()
+        // forces LATE-Z + a bindless aniso sample on EVERY prepass fragment — that made the
+        // prepass cost equal the colour pass in overdraw-heavy interiors. Same opaque.vert
+        // BYTECODE as the alpha-tested prepass, so SV_Position stays bit-identical and the
+        // colour pass's CMP_EQUAL still matches. Cutout draws (alphaRef > 0) keep the
+        // alpha-tested pipelines above.
+        Shader*        pDepthOnlyShaderNoAT = nullptr;          // opaque.vert only, NO frag stage
+        Pipeline*      pOpaquePrepassPipelineNoAT = nullptr;        // FRONT_FACE_CCW
+        Pipeline*      pOpaquePrepassPipelineNoATMirror = nullptr;  // FRONT_FACE_CW
 
         // --- Tier 2 depth-takeover: depth-as-SRV + GTAO compute (AO buffer in isolation) ---
         // First compute pipelines / UAVs / depth->SRV barrier in the host. Two passes:
@@ -1284,12 +1295,23 @@ namespace {
     };
     LiveRenderer g_live;
 
-    // Mega-arena sizes. Holds the resident static-opaque working set (engine ~100m + MGE LOD
-    // ~16 cells). Generous; arena-full logs + skips (no fallback). True eviction across a
-    // 40000-cell world needs a client free-slot signal (follow-up); the free-list already
-    // reclaims on re-upload/shape-change.
-    constexpr uint64_t kArenaVBBytes = 256ull << 20;   // 256 MB
-    constexpr uint64_t kArenaIBBytes = 64ull << 20;    // 64 MB
+    // Mega-arena INITIAL sizes. Holds the resident static-opaque working set (engine ~100m +
+    // MGE LOD ~16 cells). Showcase-scale interiors can need several times this, so on
+    // arena-full the arena GROWS by doubling (growArenaBuffer: new buffer, GPU copy-in-place,
+    // offsets preserved) instead of skipping parts — pre-grow, overflow silently dropped
+    // objects ("geomUpload built 973/1693"). True eviction across a 40000-cell world needs a
+    // client free-slot signal (follow-up); the free-list already reclaims on
+    // re-upload/shape-change AND on release sentinels (arena ranges only).
+    //
+    // HARD CAPS: growth clamps to the cap; a grow that can't satisfy the request within it
+    // fails into the skippedParts path (loud log, objects missing) instead of asking D3D12
+    // for a buffer it can't give us — The-Forge's addBuffer null-derefs on a failed
+    // CreateCommittedResource (host AV = the interior black screens of 2026-07-10), so the
+    // failed allocation must never be attempted.
+    constexpr uint64_t kArenaVBBytes    = 256ull << 20;   // 256 MB
+    constexpr uint64_t kArenaIBBytes    = 64ull << 20;    // 64 MB
+    constexpr uint64_t kArenaVBMaxBytes = 3072ull << 20;  // 3 GB
+    constexpr uint64_t kArenaIBMaxBytes = 768ull << 20;   // 768 MB
 
     // First-fit free-list suballocator over a fixed byte arena (the mega VB or IB). VB allocs
     // are vertexCount*32, IB allocs indexCount*2 — both inherently aligned — so region offsets
@@ -2359,6 +2381,30 @@ namespace {
             addPipeline(R, &ppd, &g_live.pOpaquePrepassPipelineMirror);
             if (!g_live.pOpaquePrepassPipelineMirror) {
                 std::printf("[forge] addPipeline(opaque prepass mirror) FAILED\n");
+                return false;
+            }
+
+            // Prepass fast path (see the member comment): VS-only shader — the loader compiles
+            // just the vert stage, the D3D12 backend leaves PS bytecode null (legal with 0
+            // colour targets). Same vl/depth/sample state as the alpha-tested prepass above.
+            ShaderLoadDesc dpnDesc = {};
+            dpnDesc.mVert.pFileName = "opaque.vert";
+            addShader(R, &dpnDesc, &g_live.pDepthOnlyShaderNoAT);
+            if (!g_live.pDepthOnlyShaderNoAT) {
+                std::printf("[forge] addShader(depthonly noAT) FAILED\n");
+                return false;
+            }
+            pg.pShaderProgram = g_live.pDepthOnlyShaderNoAT;
+            pg.pRasterizerState = &rasterDesc;     // CCW (non-mirrored)
+            addPipeline(R, &ppd, &g_live.pOpaquePrepassPipelineNoAT);
+            if (!g_live.pOpaquePrepassPipelineNoAT) {
+                std::printf("[forge] addPipeline(opaque prepass noAT) FAILED\n");
+                return false;
+            }
+            pg.pRasterizerState = &rasterMirror;   // CW (negative-determinant world)
+            addPipeline(R, &ppd, &g_live.pOpaquePrepassPipelineNoATMirror);
+            if (!g_live.pOpaquePrepassPipelineNoATMirror) {
+                std::printf("[forge] addPipeline(opaque prepass noAT mirror) FAILED\n");
                 return false;
             }
         }
@@ -4208,6 +4254,8 @@ namespace {
     // then fence-free). Cell churn never reaches it (one-off re-uploads).
     constexpr uint16_t kDynPromoteStreak = 2;
     unsigned  g_lastDrawn = 0;  // static parts actually drawn in the last renderScene
+    uint32_t  g_lastNearTris = 0;     // heartbeat: near-set triangles submitted PER PASS (prepass and colour each rasterize this)
+    uint32_t  g_lastNearATDraws = 0;  // heartbeat: near draws on the alpha-tested (cutout) prepass path
     unsigned  g_lastSkinnedDrawn = 0;  // skinned parts actually drawn in the last renderScene
     unsigned  g_lastMultiMapDrawn = 0; // multi-map parts actually drawn in the last renderScene
     unsigned  g_lastSkyDrawn = 0;      // SK1 sky parts actually drawn in the last renderScene
@@ -6146,18 +6194,21 @@ namespace ForgeRender {
         // Classify the draw list once: arena parts → tmp records (for arg-buffer fill),
         // dynamic-morph parts → a small inline list. (worldMirrored + the slot lookup are
         // computed here once instead of twice.)
-        struct ArenaTmp { uint32_t indexCount, firstIndex, firstVertex, local; uint8_t mirror, batch; };
+        struct ArenaTmp { uint32_t indexCount, firstIndex, firstVertex, local; uint8_t mirror, at, batch; };
         static std::vector<ArenaTmp> s_arena;     // reused across frames (render is single-threaded)
         static std::vector<uint32_t> s_dynamic;   // draw indices i of dynamic-morph parts
         s_arena.clear();
         s_dynamic.clear();
         if (s_arena.capacity() < count) s_arena.reserve(count);
+        uint64_t nearIndexSum = 0;                // heartbeat: submitted index weight (per pass)
+        uint32_t nearATDraws = 0;                 // heartbeat: cutout draws (alpha-tested prepass)
         for (uint32_t i = 0; i < count; ++i) {
             const uint32_t slot = items[i].slot;
             if (slot >= g_meshHigh || !g_meshes[slot].valid) {
                 continue;   // mesh not uploaded yet (or evicted)
             }
             const HostMesh& m = g_meshes[slot];
+            nearIndexSum += m.indexCount;
             if (m.inArena) {
                 ArenaTmp t;
                 t.indexCount  = m.indexCount;
@@ -6165,33 +6216,42 @@ namespace ForgeRender {
                 t.firstVertex = (uint32_t)(m.vbOff / sizeof(IPC::GeomVertexWire));
                 t.local       = i % kBatchSize;
                 t.mirror      = worldMirrored(items[i].world) ? 1 : 0;
+                // Cutout vs pure-opaque: only alpha-tested draws need depthonly.frag in the
+                // prepass; alphaRef == 0 rides the PS-less fast path (see pipeline comment).
+                t.at          = (items[i].alphaRef > 0.0f) ? 1 : 0;
                 t.batch       = (uint8_t)(i / kBatchSize);
+                nearATDraws  += t.at;
                 s_arena.push_back(t);
             } else {
                 s_dynamic.push_back(i);   // own VB/IB → inline draw below
             }
         }
         const uint32_t drawn = (uint32_t)(s_arena.size() + s_dynamic.size());
+        g_lastNearTris    = (uint32_t)(nearIndexSum / 3u);
+        g_lastNearATDraws = nearATDraws;
 
-        // Count then prefix-sum the (mirror, batch) groups (mirror outer → ≤2 PSO binds).
-        uint32_t groupCount[2][kMaxBatches] = {};
-        for (const ArenaTmp& t : s_arena) { ++groupCount[t.mirror][t.batch]; }
-        uint32_t groupOff[2][kMaxBatches] = {};
+        // Count then prefix-sum the (mirror, at, batch) groups (mirror outer, then alpha-test →
+        // ≤4 prepass PSO binds; the colour pass ignores the at split, it just walks all groups).
+        uint32_t groupCount[2][2][kMaxBatches] = {};
+        for (const ArenaTmp& t : s_arena) { ++groupCount[t.mirror][t.at][t.batch]; }
+        uint32_t groupOff[2][2][kMaxBatches] = {};
         uint32_t running = 0;
         for (uint32_t mir = 0; mir < 2; ++mir) {
-            for (uint32_t b = 0; b < kMaxBatches; ++b) {
-                groupOff[mir][b] = running;
-                running += groupCount[mir][b];
+            for (uint32_t at = 0; at < 2; ++at) {
+                for (uint32_t b = 0; b < kMaxBatches; ++b) {
+                    groupOff[mir][at][b] = running;
+                    running += groupCount[mir][at][b];
+                }
             }
         }
         // Fill the indirect-args buffer in group order. firstInstance=local → the per-instance
         // Base attr reads pInstanceBuf[batch][local].x = local → gBatch.worlds[local] (+ texIndex).
         IndirectDrawIndexArguments* args =
             (IndirectDrawIndexArguments*)g_live.pIndirectArgs->pCpuMappedAddress;
-        uint32_t cursor[2][kMaxBatches];
+        uint32_t cursor[2][2][kMaxBatches];
         std::memcpy(cursor, groupOff, sizeof(cursor));
         for (const ArenaTmp& t : s_arena) {
-            IndirectDrawIndexArguments& a = args[cursor[t.mirror][t.batch]++];
+            IndirectDrawIndexArguments& a = args[cursor[t.mirror][t.at][t.batch]++];
             a.mIndexCount    = t.indexCount;
             a.mInstanceCount = 1;
             a.mStartIndex    = t.firstIndex;
@@ -6215,33 +6275,40 @@ namespace ForgeRender {
             cmdBindRenderTargets(g_live.pCmd, &pbind);
             cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
             cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
-            cmdBindPipeline(g_live.pCmd, g_live.pOpaquePrepassPipeline);
+            // PSO by (mirror, at): pure-opaque groups draw PS-less (early-Z full-rate depth,
+            // no texture traffic); cutout groups keep the alpha-tested depthonly.frag.
+            Pipeline* const prePSO[2][2] = {
+                { g_live.pOpaquePrepassPipelineNoAT,       g_live.pOpaquePrepassPipeline },
+                { g_live.pOpaquePrepassPipelineNoATMirror, g_live.pOpaquePrepassPipelineMirror },
+            };
+            cmdBindPipeline(g_live.pCmd, prePSO[0][0]);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);     // gFrameData viewProj
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);   // bindless gTextures (alpha test)
 
-            int preMirror = 0;
+            Pipeline* preBound = prePSO[0][0];
             for (uint32_t mir = 0; mir < 2; ++mir) {
-                bool anyInMirror = false;
-                for (uint32_t b = 0; b < kMaxBatches; ++b) { if (groupCount[mir][b]) { anyInMirror = true; break; } }
-                if (!anyInMirror) continue;
-                if ((int)mir != preMirror) {
-                    cmdBindPipeline(g_live.pCmd, mir ? g_live.pOpaquePrepassPipelineMirror
-                                                     : g_live.pOpaquePrepassPipeline);
-                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
-                    cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-                    preMirror = (int)mir;
-                }
-                for (uint32_t b = 0; b < kMaxBatches; ++b) {
-                    const uint32_t c = groupCount[mir][b];
-                    if (!c) continue;
-                    cmdBindDescriptorSet(g_live.pCmd, b, g_live.pPerBatchSet);
-                    Buffer*  vbs[2]     = { g_live.pArenaVB, g_live.pInstanceBuf[b] };
-                    uint32_t strides[2] = { vStride, iStride };
-                    cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
-                    cmdBindIndexBuffer(g_live.pCmd, g_live.pArenaIB, INDEX_TYPE_UINT16, 0);
-                    cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, c, g_live.pIndirectArgs,
-                                       (uint64_t)groupOff[mir][b] * sizeof(IndirectDrawIndexArguments),
-                                       nullptr, 0);
+                for (uint32_t at = 0; at < 2; ++at) {
+                    bool anyInGroup = false;
+                    for (uint32_t b = 0; b < kMaxBatches; ++b) { if (groupCount[mir][at][b]) { anyInGroup = true; break; } }
+                    if (!anyInGroup) continue;
+                    if (prePSO[mir][at] != preBound) {
+                        cmdBindPipeline(g_live.pCmd, prePSO[mir][at]);
+                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                        preBound = prePSO[mir][at];
+                    }
+                    for (uint32_t b = 0; b < kMaxBatches; ++b) {
+                        const uint32_t c = groupCount[mir][at][b];
+                        if (!c) continue;
+                        cmdBindDescriptorSet(g_live.pCmd, b, g_live.pPerBatchSet);
+                        Buffer*  vbs[2]     = { g_live.pArenaVB, g_live.pInstanceBuf[b] };
+                        uint32_t strides[2] = { vStride, iStride };
+                        cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                        cmdBindIndexBuffer(g_live.pCmd, g_live.pArenaIB, INDEX_TYPE_UINT16, 0);
+                        cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, c, g_live.pIndirectArgs,
+                                           (uint64_t)groupOff[mir][at][b] * sizeof(IndirectDrawIndexArguments),
+                                           nullptr, 0);
+                    }
                 }
             }
             for (uint32_t i : s_dynamic) {
@@ -6249,12 +6316,12 @@ namespace ForgeRender {
                 const uint32_t batch = i / kBatchSize;
                 const uint32_t local = i % kBatchSize;
                 const int mirror = worldMirrored(items[i].world) ? 1 : 0;
-                if (mirror != preMirror) {
-                    cmdBindPipeline(g_live.pCmd, mirror ? g_live.pOpaquePrepassPipelineMirror
-                                                        : g_live.pOpaquePrepassPipeline);
+                const int at     = (items[i].alphaRef > 0.0f) ? 1 : 0;
+                if (prePSO[mirror][at] != preBound) {
+                    cmdBindPipeline(g_live.pCmd, prePSO[mirror][at]);
                     cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
                     cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-                    preMirror = mirror;
+                    preBound = prePSO[mirror][at];
                 }
                 cmdBindDescriptorSet(g_live.pCmd, batch, g_live.pPerBatchSet);
                 HostMesh& m = g_meshes[slot];
@@ -7247,7 +7314,9 @@ namespace ForgeRender {
         int boundMirror = 0;   // matches the initial cmdBindPipeline(pOpaquePipeline) above
         for (uint32_t mir = 0; mir < 2; ++mir) {
             bool anyInMirror = false;
-            for (uint32_t b = 0; b < kMaxBatches; ++b) { if (groupCount[mir][b]) { anyInMirror = true; break; } }
+            for (uint32_t at = 0; at < 2 && !anyInMirror; ++at) {
+                for (uint32_t b = 0; b < kMaxBatches; ++b) { if (groupCount[mir][at][b]) { anyInMirror = true; break; } }
+            }
             if (!anyInMirror) continue;
             if ((int)mir != boundMirror) {
                 cmdBindPipeline(g_live.pCmd, mir ? g_live.pOpaquePipelineMirror
@@ -7257,17 +7326,20 @@ namespace ForgeRender {
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
                 boundMirror = (int)mir;
             }
-            for (uint32_t b = 0; b < kMaxBatches; ++b) {
-                const uint32_t c = groupCount[mir][b];
-                if (!c) continue;
-                cmdBindDescriptorSet(g_live.pCmd, b, g_live.pPerBatchSet);
-                Buffer*  vbs[2]     = { g_live.pArenaVB, g_live.pInstanceBuf[b] };
-                uint32_t strides[2] = { vStride, iStride };
-                cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
-                cmdBindIndexBuffer(g_live.pCmd, g_live.pArenaIB, INDEX_TYPE_UINT16, 0);
-                cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, c, g_live.pIndirectArgs,
-                                   (uint64_t)groupOff[mir][b] * sizeof(IndirectDrawIndexArguments),
-                                   nullptr, 0);
+            // The colour PSO doesn't care about the prepass at split — walk both at blocks.
+            for (uint32_t at = 0; at < 2; ++at) {
+                for (uint32_t b = 0; b < kMaxBatches; ++b) {
+                    const uint32_t c = groupCount[mir][at][b];
+                    if (!c) continue;
+                    cmdBindDescriptorSet(g_live.pCmd, b, g_live.pPerBatchSet);
+                    Buffer*  vbs[2]     = { g_live.pArenaVB, g_live.pInstanceBuf[b] };
+                    uint32_t strides[2] = { vStride, iStride };
+                    cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                    cmdBindIndexBuffer(g_live.pCmd, g_live.pArenaIB, INDEX_TYPE_UINT16, 0);
+                    cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, c, g_live.pIndirectArgs,
+                                       (uint64_t)groupOff[mir][at][b] * sizeof(IndirectDrawIndexArguments),
+                                       nullptr, 0);
+                }
             }
         }
 
@@ -8189,7 +8261,7 @@ namespace ForgeRender {
                          g_lastCpuPhaseMs[kGpuPhaseResolve],
                          g_lastRecMs - g_lastCpuPhaseMs[kGpuPhaseFrame]);
             LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f) gtao=%.2f (lin=%.2f mask=%.2f) reflect=%.2f color=%.2f water=%.2f resolve=%.2f ms"
-                         " | hiz=%.2f (prologue, overruns=%u) | shadowCasters=%u",
+                         " | hiz=%.2f (prologue, overruns=%u) | shadowCasters=%u | nearTris=%.2fM atDraws=%u",
                          g_lastGpuPhaseMs[kGpuPhaseCull],
                          g_lastGpuPhaseMs[kGpuPhasePrepass], g_lastGpuPhaseMs[kGpuPhaseShadow],
                          g_lastGpuPhaseMs[kGpuPhaseShadowStatic], g_lastGpuPhaseMs[kGpuPhaseShadowDyn],
@@ -8198,7 +8270,8 @@ namespace ForgeRender {
                          g_lastGpuPhaseMs[kGpuPhaseReflect], g_lastGpuPhaseMs[kGpuPhaseColor],
                          g_lastGpuPhaseMs[kGpuPhaseWater], g_lastGpuPhaseMs[kGpuPhaseResolve],
                          g_lastHizGpuMs, g_hizOverruns,
-                         (unsigned)g_shadowCasters.size());
+                         (unsigned)g_shadowCasters.size(),
+                         (double)g_lastNearTris / 1e6, g_lastNearATDraws);
             // Host-GPU-shrink sub-phases: WHERE inside color/reflect the ms live. sky+near+skin+mm+dl
             // ≈ color above (same frame's timestamps); refl sky = reflect − reflgeo.
             LOG::logline(">> [forge-hb] gpu color sub: sky=%.2f near=%.2f skin=%.2f mm=%.2f dl=%.2f alpha=%.2f"
@@ -11676,6 +11749,92 @@ namespace ForgeRender {
         return true;
     }
 
+    // Arena grow-by-copy: allocate a doubled GPU_ONLY buffer, GPU-copy the old contents to the
+    // SAME offsets (raw CopyBufferRegion — Forge has no buffer->buffer copy; same idiom as the
+    // cull-counter resets), swap the live pointer, free the old buffer, and hand the new tail
+    // to the free list. Existing vbOff/ibOff stay valid, so no draw-path changes anywhere.
+    // Safe to run here: uploadGeometry executes between host frames on the single IPC-service
+    // thread — renderScene fence-waits its own frame before returning, and the only overlapped
+    // GPU work (the Hi-Z prologue) never touches the arena; the copy is queue-ordered behind it
+    // anyway. Caller must settle any staged arena updates (flushTextureUploads) FIRST — the
+    // loader's update stream still targets the old Buffer*. Load-burst cost only.
+    bool growArenaBuffer(Buffer** ppBuf, FreeList& fl, uint64_t needBytes, uint64_t align,
+                         uint64_t maxBytes,
+                         DescriptorType descriptors, ResourceState liveState, const char* name) {
+        if (!g_live.pRenderer || !g_live.pCmd || !*ppBuf) { return false; }
+        const uint64_t oldTotal = fl.total;
+        uint64_t newTotal = oldTotal;
+        while (newTotal - oldTotal < needBytes + align) { newTotal *= 2; }
+        // Clamp doubling to the hard cap; refuse outright if even the cap can't hold the
+        // request. addResource MUST NOT see an allocation the device may refuse — The-Forge's
+        // addBuffer crashes (null-deref) instead of failing on CreateCommittedResource.
+        if (newTotal > maxBytes) {
+            if (oldTotal + needBytes + align <= maxBytes) {
+                newTotal = maxBytes;
+            } else {
+                LOG::logline("!! [forge] %s grow REFUSED at cap (%llu MB total, need %llu KB more, cap %llu MB) — parts will be skipped",
+                             name, (unsigned long long)(oldTotal >> 20),
+                             (unsigned long long)(needBytes >> 10),
+                             (unsigned long long)(maxBytes >> 20));
+                return false;
+            }
+        }
+
+        Buffer* pNew = nullptr;
+        BufferLoadDesc d = {};
+        d.mDesc.mDescriptors = descriptors;
+        d.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+        d.mDesc.mSize        = newTotal;
+        d.mDesc.mStartState  = RESOURCE_STATE_COPY_DEST;
+        d.mDesc.pName        = name;
+        d.pData              = nullptr;
+        d.ppBuffer           = &pNew;
+        addResource(&d, nullptr);
+        waitForAllResourceLoads();
+        if (!pNew) {
+            LOG::logline("!! [forge] %s grow FAILED (%llu -> %llu MB): buffer allocation failed",
+                         name, (unsigned long long)(oldTotal >> 20), (unsigned long long)(newTotal >> 20));
+            return false;
+        }
+
+        Renderer* R = g_live.pRenderer;
+        resetCmdPool(R, g_live.pCmdPool);
+        beginCmd(g_live.pCmd);
+        BufferBarrier toSrc = {};
+        toSrc.pBuffer = *ppBuf;
+        toSrc.mCurrentState = liveState;
+        toSrc.mNewState = RESOURCE_STATE_COPY_SOURCE;
+        cmdResourceBarrier(g_live.pCmd, 1, &toSrc, 0, nullptr, 0, nullptr);
+        g_live.pCmd->mDx.pCmdList->CopyBufferRegion(pNew->mDx.pResource, 0,
+                                                    (*ppBuf)->mDx.pResource, 0, oldTotal);
+        BufferBarrier toLive = {};
+        toLive.pBuffer = pNew;
+        toLive.mCurrentState = RESOURCE_STATE_COPY_DEST;
+        toLive.mNewState = liveState;
+        cmdResourceBarrier(g_live.pCmd, 1, &toLive, 0, nullptr, 0, nullptr);
+        endCmd(g_live.pCmd);
+        QueueSubmitDesc sd = {};
+        sd.mCmdCount = 1;
+        sd.ppCmds = &g_live.pCmd;
+        sd.pSignalFence = g_live.pFence;
+        sd.mSubmitDone = true;
+        queueSubmit(g_live.pQueue, &sd);
+        waitForFences(R, 1, &g_live.pFence);
+
+        removeResource(*ppBuf);
+        *ppBuf = pNew;
+        // New tail free region. Align its start up to the element stride: every existing
+        // region boundary is a past allocation edge (stride-multiples by construction), but
+        // the OLD total isn't one — and firstVertex = vbOff / stride truncates, so a
+        // misaligned offset would draw garbage. Wastes < stride bytes per grow.
+        const uint64_t tail = ((oldTotal + align - 1) / align) * align;
+        fl.release(tail, newTotal - tail);
+        fl.total = newTotal;
+        LOG::logline("-- [forge] %s grown %llu -> %llu MB (contents GPU-copied in place)",
+                     name, (unsigned long long)(oldTotal >> 20), (unsigned long long)(newTotal >> 20));
+        return true;
+    }
+
     unsigned uploadGeometry(const void* blobBytes, unsigned byteCount, unsigned partCount) {
         if (!g_live.pRenderer || !blobBytes || !byteCount || !partCount) {
             return 0;
@@ -11686,6 +11845,8 @@ namespace ForgeRender {
         unsigned built = 0;
         bool anyStatic = false;   // any per-mesh addResource (skinned) -> waitForAllResourceLoads
         bool anyArena  = false;   // any arena begin/endUpdateResource -> flushResourceUpdates
+        unsigned skippedParts = 0;                    // arena-full even after grow (VRAM exhausted)
+        uint64_t skippedVB = 0, skippedIB = 0;
 
         for (unsigned i = 0; i < partCount; ++i) {
             if (p + sizeof(IPC::GeomPartWire) > end) {
@@ -11696,9 +11857,15 @@ namespace ForgeRender {
             p += sizeof(hdr);
 
             // RELEASE sentinel (header-only, no payload): the client's cache evicted this object
-            // (picked up / despawned / disabled WITHIN a cell). Forget its shadow-caster record so
-            // its shadow stops ghosting in place; bump g_casterEpoch so covering shadow slots
-            // re-render without it. Keep the GPU buffers (a later re-upload to this slot rebuilds).
+            // (picked up / despawned / disabled — or the whole cell on a transition). Forget its
+            // shadow-caster record so its shadow stops ghosting in place; bump g_casterEpoch so
+            // covering shadow slots re-render without it. ARENA parts also free their VB/IB
+            // ranges back to the free list — pure bookkeeping, no D3D12 resource is destroyed —
+            // so a cell reload reuses the old cell's ~GBs instead of doubling the arena (2048→
+            // 4096 MB grow → addBuffer AV = the 2026-07-10 black screens). Per-mesh skinned/MM
+            // buffers keep the old keep-buffers behaviour: destroying a live ID3D12Resource an
+            // in-flight frame might still reference is a different hazard, and they're a small
+            // fraction of the bytes.
             if (hdr.flags & IPC::kGeomFlagRelease) {
                 if (hdr.slot < g_meshHigh) {
                     HostMesh& rm = g_meshes[hdr.slot];
@@ -11706,7 +11873,17 @@ namespace ForgeRender {
                     rm.everMoved      = false;
                     rm.lastMoveFrame  = 0;
                     g_casterEpoch     = g_renderFrame;
+                    if (rm.valid && rm.inArena) {
+                        releaseMeshBuffers(rm);
+                        rm.valid = false;
+                        rm.uploadStreak = 0;
+                    }
                 }
+                // COUNTS as consumed: `built` is the RPC's partsUploaded, and the client
+                // retries any chunk where built < partCount. Not counting sentinels made a
+                // cell-transition chunk (few meshes + thousands of eviction sentinels) look
+                // permanently failed → infinite blocking re-send of the same chunk.
+                ++built;
                 continue;
             }
 
@@ -11723,9 +11900,12 @@ namespace ForgeRender {
             const void* verts   = p; p += vbBytes;
             const void* indices = p; p += ibBytes;
             if (!hdr.vertexCount || !hdr.indexCount) {
+                ++built;   // consumed (nothing to build) — see the release-sentinel note
                 continue;
             }
             if (!ensureMeshSlot(hdr.slot)) {
+                ++built;   // consumed — host OOM won't improve on a client re-send
+                ++skippedParts;
                 continue;
             }
 
@@ -11828,7 +12008,9 @@ namespace ForgeRender {
                     for (uint32_t r = 0; r < kGeomRing; ++r) {
                         if (!m.dynVb[r] || !m.dynIb[r]) { ringOk = false; }
                     }
-                    if (!ringOk) { releaseMeshBuffers(m); m.valid = false; m.uploadStreak = 0; continue; }
+                    if (!ringOk) {   // ring alloc failed — consumed (re-send can't help), slot rebuilds on next upload
+                        releaseMeshBuffers(m); m.valid = false; m.uploadStreak = 0; ++built; continue;
+                    }
                     m.dynamic = true;
                     m.ring    = 0;
                     ++g_dynamicCount;
@@ -11859,15 +12041,39 @@ namespace ForgeRender {
                 uint64_t vbo = g_arenaVB.alloc(vbBytes);
                 uint64_t ibo = g_arenaIB.alloc(ibBytes);
                 if (vbo == UINT64_MAX || ibo == UINT64_MAX) {
+                    // Arena full: grow-by-copy (doubling) and retry once. Settle any staged
+                    // arena updates from earlier parts in THIS batch first — the loader's
+                    // update stream still targets the old Buffer*, and the grow deletes it.
+                    if (anyArena) {
+                        flushTextureUploads(g_live.pRenderer);
+                        anyArena = false;
+                    }
+                    if (vbo == UINT64_MAX) {
+                        growArenaBuffer(&g_live.pArenaVB, g_arenaVB, vbBytes,
+                                        sizeof(IPC::GeomVertexWire), kArenaVBMaxBytes,
+                                        DESCRIPTOR_TYPE_VERTEX_BUFFER,
+                                        RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, "arenaVB");
+                        vbo = g_arenaVB.alloc(vbBytes);
+                    }
+                    if (ibo == UINT64_MAX) {
+                        growArenaBuffer(&g_live.pArenaIB, g_arenaIB, ibBytes,
+                                        sizeof(uint16_t), kArenaIBMaxBytes,
+                                        DESCRIPTOR_TYPE_INDEX_BUFFER,
+                                        RESOURCE_STATE_INDEX_BUFFER, "arenaIB");
+                        ibo = g_arenaIB.alloc(ibBytes);
+                    }
+                }
+                if (vbo == UINT64_MAX || ibo == UINT64_MAX) {
+                    // Grow failed (GPU memory exhausted) — terminal skip, counted and logged
+                    // per upload call below (was a once-per-process warn that hid the scale).
+                    // Counted as consumed (`built`): a client re-send can't help, and an
+                    // uncounted part makes the client retry the whole chunk forever.
                     if (vbo != UINT64_MAX) { g_arenaVB.release(vbo, vbBytes); }
                     if (ibo != UINT64_MAX) { g_arenaIB.release(ibo, ibBytes); }
-                    static bool warned = false;
-                    if (!warned) {
-                        LOG::logline("!! [forge] geometry arena FULL (need %llu VB / %llu IB) — "
-                                     "part skipped (no fallback); eviction is the follow-up",
-                                     (unsigned long long)vbBytes, (unsigned long long)ibBytes);
-                        warned = true;
-                    }
+                    ++built;
+                    ++skippedParts;
+                    skippedVB += vbBytes;
+                    skippedIB += ibBytes;
                     continue;   // part won't draw this slot — logged, no fallback (PD1)
                 }
                 BufferUpdateDesc uv = {};
@@ -11946,6 +12152,12 @@ namespace ForgeRender {
                  built, partCount, byteCount, g_meshHigh);
             std::printf("[forge] uploadGeometry: built %u/%u parts (%u bytes), meshHigh=%u\n",
                         built, partCount, byteCount, g_meshHigh);
+        }
+        if (skippedParts) {
+            LOG::logline("!! [forge] uploadGeometry: %u parts SKIPPED (arena grow failed; "
+                         "need %llu KB VB / %llu KB IB more) — objects will be missing",
+                         skippedParts, (unsigned long long)(skippedVB >> 10),
+                         (unsigned long long)(skippedIB >> 10));
         }
         return built;
     }

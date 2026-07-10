@@ -99,19 +99,24 @@ void DistantLand::frameSetupEarly() {
     //     at all (no statics/grass/land cull; no weather → no shadow map; the interior
     //     reflection RPC is wantsWaterCapture-suppressed). The else-branch below hoists
     //     the cache walk + visible set so the kickoff has fresh data (2b).
-    //   - interior DISTANT cell    → NOT eligible (late kickoff): the host DL is
-    //     exterior-only, MGE still draws these statics, so its cull must keep the channel.
+    //   - interior DISTANT cell (worldspace interior — DL gen bakes LOD for it; the
+    //     TR-showcase category) → eligible TOO: on kickoff frames the statics cull and
+    //     the PASS_RENDERSTATICSINTERIOR colour draw both self-gate off the SAME
+    //     (USE_DISTANT_STATICS && !earlyForgeKickoff) predicate (kickedOffDistantStatics
+    //     = false → visDistant.RemoveAll(); renderDepth skips the finish — pairing stays
+    //     symmetric). Interior-worldspace LOD is deliberately NOT rendered in Forge mode
+    //     (host DL is exterior-only; interior LOD is future host work), so the cull was a
+    //     dead RPC squatting the channel — and it silently forced these monster interiors
+    //     to the fused serial render (client blocked for the whole host GPU frame).
     // One warm-up frame after any transition (load, interior↔exterior, toggle): the
     // first eligible frame keeps the late kickoff so the host never renders params
     // captured before the engine pushed this environment's sun/ambient
     // (SetLight/SetRenderState arrive mid-scene-0 — steady-state values are smooth,
     // transition jumps are not).
     static bool s_forgePrevEligible = false;
-    const bool distantCellNow = isDistantCell();
     const bool forgeEligibleNow = Configuration.UseAsyncHostFrame
         && RenderProcess::ownsOpaqueWorld() && RenderProcess::wantsWaterCapture()
-        && !mwBridge->IsMenu()
-        && (mwBridge->IsExterior() || !distantCellNow);
+        && !mwBridge->IsMenu();
     earlyForgeKickoff = forgeEligibleNow && s_forgePrevEligible;
     s_forgePrevEligible = forgeEligibleNow;
 
