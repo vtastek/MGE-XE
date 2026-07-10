@@ -74,6 +74,13 @@ namespace {
     struct KickState {
         bool rpcPending;
         bool early;     // fired from the BeginScene(0) site (DistantLand::earlyForgeKickoff latch)
+        // Mid-walk geometry drain (drainPendingIfFull) fired inside the async window and
+        // closed it early: renderSceneFinish already ran; the composite finish must consume
+        // these stored results instead of finishing again. Load-burst frames only.
+        bool rpcEarlyFinished;
+        bool earlyOk;
+        double earlyHostMs;
+        double tEarlyFinish;
         unsigned frame;
         std::uint32_t drawCount, skinnedCount, multiMapCount, lightCount, skyCount, alphaCount;
         std::uint32_t capturedCount;   // AT3: captured blended DIPs merged into the alpha list this frame
@@ -99,6 +106,13 @@ namespace {
     // Chunked shared vec (see ipc/geomwire.h): an 8MB window as 8x1MB chunks, so the
     // Vec reservation (maxSize*windowBytes) stays small. Chunk cap = the full window.
     constexpr std::uint32_t kGeomChunkCap = IPC::kGeomWindowBytes;  // <= window (assign_bytes)
+    // Mid-walk drain cap on the staging blob. A showcase-scale interior can capture ~1GB of
+    // geometry in ONE cell-load walk; accumulating it all until the present-time flush killed
+    // the 32-bit process (bad_alloc growing g_pendingBlob past ~700MB). Draining mid-walk is
+    // safe: geometry rides its own IPC channel, and the host is never mid-frame while the
+    // client walks (renderScene fence-waits before returning; only the arena-blind Hi-Z
+    // prologue overlaps). Steady-state frames never come near this, so it only fires on loads.
+    constexpr std::size_t kPendingFlushBytes = 32u << 20;           // 32 MB
 
     std::optional<IPC::VecView<IPC::GeomChunk>> g_geomVec;          // persistent geometry upload vec
     std::optional<IPC::VecView<IPC::GeomChunk>> g_drawVec;          // persistent per-frame draw-list vec
@@ -947,6 +961,15 @@ namespace {
         const std::uint32_t total = static_cast<std::uint32_t>(g_pendingBlob.size());
 
         std::uint32_t off = 0;
+        std::uint32_t shippedParts = 0;
+        bool corrupt = false;
+        // Consecutive failures on the LEADING chunk, surviving across flush calls. Bounded
+        // retry: a transient failure retries next flush, but a chunk the host persistently
+        // won't take is dropped after kFlushFailLimit attempts — an unbounded retry loop
+        // here re-sends 8MB per capture and grows the blob to the load-time bad_alloc
+        // (seen live: host miscounted release sentinels → 3376 re-sends of one chunk).
+        constexpr std::uint32_t kFlushFailLimit = 8;
+        static std::uint32_t s_flushFailStreak = 0;
         while (off < total) {
             std::uint32_t chunkBytes = 0;
             std::uint32_t chunkParts = 0;
@@ -970,11 +993,26 @@ namespace {
                 cursor += partSize;
             }
             if (chunkParts == 0) {
-                break;  // single part exceeds the cap (shouldn't happen) — bail
+                // Single part exceeds the window — impossible for real content (uint16 indices
+                // cap a part at ~4.3MB < 8MB window), so this means a corrupt header. The blob
+                // is unparseable from here — drop it all, loudly.
+                LOG::logline("!! [seam] geometry part exceeds chunk cap at offset %u/%u — dropping %u remaining bytes",
+                             off, total, total - off);
+                corrupt = true;
+                break;
             }
 
             if (!g_geomVec->assign_bytes(data + off, chunkBytes)) {
-                LOG::logline("!! [seam] geometry chunk assign_bytes failed (%u bytes)", chunkBytes);
+                if (++s_flushFailStreak >= kFlushFailLimit) {
+                    LOG::logline("!! [seam] geometry chunk assign_bytes failed %u times — DROPPING chunk (%u bytes, %u parts)",
+                                 s_flushFailStreak, chunkBytes, chunkParts);
+                    s_flushFailStreak = 0;
+                    shippedParts += chunkParts;   // gone either way — keep the parts count in sync
+                    off = cursor;
+                    continue;
+                }
+                LOG::logline("!! [seam] geometry chunk assign_bytes failed (%u bytes) — keeping %u bytes for retry",
+                             chunkBytes, total - off);
                 break;
             }
             // Blocking upload. With the dynamic-VB ring the host side is now a cheap memcpy
@@ -983,13 +1021,67 @@ namespace {
             // kickoff was reverted: it cost the framerate cap without helping the steady state).
             std::uint32_t uploaded = 0;
             if (!g_client->geomUploadBlocking(g_geomVec->id(), chunkParts, chunkBytes, &uploaded)) {
-                LOG::logline("!! [seam] geomUpload RPC built %u/%u parts", uploaded, chunkParts);
+                // Transient (async-window refusal / lost RPC): keep this chunk onward and let
+                // the next flush retry — slots are idempotent, a re-send just rebuilds. The
+                // old clear-anyway lost the geometry FOREVER (revs were already stamped).
+                // Bounded (kFlushFailLimit): a chunk the host persistently rejects gets
+                // dropped, not re-sent every capture until the blob re-creates the bad_alloc.
+                if (++s_flushFailStreak >= kFlushFailLimit) {
+                    LOG::logline("!! [seam] geomUpload built %u/%u parts %u times running — DROPPING chunk (%u bytes)",
+                                 uploaded, chunkParts, s_flushFailStreak, chunkBytes);
+                    s_flushFailStreak = 0;
+                    shippedParts += chunkParts;   // gone either way — keep the parts count in sync
+                    off = cursor;
+                    continue;
+                }
+                LOG::logline("!! [seam] geomUpload RPC built %u/%u parts — keeping %u bytes for retry",
+                             uploaded, chunkParts, total - off);
+                break;
             }
+            s_flushFailStreak = 0;
+            shippedParts += chunkParts;
             off = cursor;
         }
 
-        g_pendingBlob.clear();
-        g_pendingParts = 0;
+        if (corrupt || off >= total) {
+            g_pendingBlob.clear();
+            g_pendingParts = 0;
+        } else if (off > 0) {
+            g_pendingBlob.erase(g_pendingBlob.begin(), g_pendingBlob.begin() + off);
+            g_pendingParts = (shippedParts < g_pendingParts) ? (g_pendingParts - shippedParts) : 0;
+        }
+    }
+
+    // Mid-walk drain (see kPendingFlushBytes): called by the capture functions before they
+    // append, so the staging blob's peak stays bounded on cell-load bursts instead of
+    // accumulating the whole cell until present time. The walk runs inside the async
+    // RenderFrame window (host frame overlaps MW scene 0), where geomUploadBlocking REFUSES
+    // — so first close the window early (renderSceneFinish now, composite consumes the
+    // stored result). Costs that frame's overlap; load-burst frames only.
+    void drainPendingIfFull() {
+        if (g_pendingBlob.size() < kPendingFlushBytes) {
+            return;
+        }
+        if (g_kick.rpcPending) {
+            g_kick.rpcPending       = false;
+            g_kick.rpcEarlyFinished = true;
+            g_kick.earlyHostMs      = 0.0;
+            g_kick.earlyOk          = g_client->renderSceneFinish(&g_kick.earlyHostMs);
+            g_kick.tEarlyFinish     = nowMs();
+        }
+        LOG::logline("-- [seam] geometry staging at %u KB mid-walk — draining to host",
+                     static_cast<unsigned>(g_pendingBlob.size() >> 10));
+        flushGeometry();
+        // Failsafe: if flushes keep failing (host gone), the retry-kept blob would grow
+        // right back to the ~1GB bad_alloc this drain exists to prevent. Cap it loudly.
+        constexpr std::size_t kPendingAbandonBytes = 8 * kPendingFlushBytes;   // 256 MB
+        if (g_pendingBlob.size() >= kPendingAbandonBytes) {
+            LOG::logline("!! [seam] geometry staging still %u KB after drain — host unreachable, ABANDONING blob",
+                         static_cast<unsigned>(g_pendingBlob.size() >> 10));
+            g_pendingBlob.clear();
+            g_pendingBlob.shrink_to_fit();
+            g_pendingParts = 0;
+        }
     }
 
     // Gather this frame's visible opaque parts into g_drawScratch as DrawItemWire[]:
@@ -2085,13 +2177,24 @@ namespace RenderProcess {
         // occluded behind distant terrain in the shared depth). Near geometry is unaffected — only
         // the far plane moves; reverse-Z keeps near precision. mwProj is the NEAR projection; recover
         // its near plane (zn = -_43/_33 for a standard D3D perspective) and re-edit only z.
+        //
+        // EXTERIORS ONLY — the far extension exists solely for host-owned DL, which is itself
+        // gated on isExterior (lighting[27]). In ANY interior (weather or not: showcase mod
+        // interiors fly a full sky) MW hardware-clips at its own far plane (~view distance):
+        // giant meshes spanning the cell get most of their triangles clipped for free, and
+        // everything past the fog wall is simply absent. Extending the far plane there made the
+        // host rasterize + shade ALL of it — huge fill cost, and the beyond-fog geometry shades
+        // to solid fogColNear (black in dark interiors), walling the view where MW shows
+        // nothing. Keeping mwProj untouched clips exactly where MW clips; interior sky geometry
+        // is walked from MW's own skyRoot, which MW renders inside mwProj by construction.
+        const bool isExterior = MWBridge::get()->IsExterior();
         D3DXMATRIX farProj = DistantLand::mwProj;
-        const float zn = (farProj._33 != 0.0f) ? (-farProj._43 / farProj._33) : 4.0f;
-        DistantLand::editProjectionZ(&farProj, zn, Configuration.DL.DrawDist * DistantLand::kCellSize);
+        if (isExterior) {
+            const float zn = (farProj._33 != 0.0f) ? (-farProj._43 / farProj._33) : 4.0f;
+            DistantLand::editProjectionZ(&farProj, zn, Configuration.DL.DrawDist * DistantLand::kCellSize);
+        }
         D3DXMATRIX viewProj;
         D3DXMatrixMultiply(&viewProj, &viewRel, &farProj);
-
-        const bool isExterior = MWBridge::get()->IsExterior();
 
         // Tier 1 lighting (6 × float4): MW sun/ambient/fog for this frame, uploaded into the
         // host gFrameData after viewProj. sunVec is the world-space sun TRAVEL direction (the
@@ -2297,22 +2400,27 @@ namespace RenderProcess {
             }
         }
 
-        if (!g_kick.rpcPending) {
+        const bool earlyFinished = g_kick.rpcEarlyFinished;   // mid-walk drain closed the window
+        if (!g_kick.rpcPending && !earlyFinished) {
             return;
         }
-        g_kick.rpcPending = false;
+        g_kick.rpcPending       = false;
+        g_kick.rpcEarlyFinished = false;
 
         MGE_ZoneScopedN("Forge composite finish");
 
         // overlap = the MW frame work the host render ran under. In fused mode (Finish
         // called straight after Kickoff) this is ~0 and every bucket reduces to the old
-        // serial breakdown — the exact A/B.
+        // serial breakdown — the exact A/B. An early finish ends the overlap at the drain.
         const double tWait0 = nowMs();
-        const double overlap = tWait0 - g_kick.tKick;
+        const double overlap = (earlyFinished ? g_kick.tEarlyFinish : tWait0) - g_kick.tKick;
 
         double hostMs = 0.0;
         bool ok;
-        {
+        if (earlyFinished) {
+            ok     = g_kick.earlyOk;
+            hostMs = g_kick.earlyHostMs;
+        } else {
             MGE_ZoneScopedN("Forge renderSceneFinish (host wait)");
             ok = g_client->renderSceneFinish(&hostMs);
         }
@@ -2725,6 +2833,7 @@ namespace RenderProcess {
         hdr.vertexCount = vertexCount;
         hdr.indexCount  = indexCount;
 
+        drainPendingIfFull();
         const std::size_t vbBytes = (std::size_t)vertexCount * sizeof(IPC::GeomVertexWire);
         const std::size_t ibBytes = (std::size_t)indexCount * sizeof(std::uint16_t);
         const std::size_t at = g_pendingBlob.size();
@@ -2770,6 +2879,7 @@ namespace RenderProcess {
         hdr.indexCount  = indexCount;
         hdr.numBones    = static_cast<std::uint16_t>(numBones);
 
+        drainPendingIfFull();
         const std::size_t vbBytes = (std::size_t)vertexCount * sizeof(IPC::SkinnedVertexWire);
         const std::size_t ibBytes = (std::size_t)indexCount * sizeof(std::uint16_t);
         const std::size_t at = g_pendingBlob.size();
@@ -2813,6 +2923,7 @@ namespace RenderProcess {
         hdr.vertexCount = vertexCount;
         hdr.indexCount  = indexCount;
 
+        drainPendingIfFull();
         const std::size_t vbBytes = (std::size_t)vertexCount * sizeof(IPC::GeomVertexWireMM);
         const std::size_t ibBytes = (std::size_t)indexCount * sizeof(std::uint16_t);
         const std::size_t at = g_pendingBlob.size();
