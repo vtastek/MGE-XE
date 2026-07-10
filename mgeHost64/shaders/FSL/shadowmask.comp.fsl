@@ -12,7 +12,7 @@
 // stored > ref * (1+slack) means a caster is meaningfully NEARER the light than this pixel
 // (reverse-Z: nearer = larger) → shadowed. The per-texel test is filtered with bilinear PCF
 // (compare-then-interpolate over a small grid) and packed as a 4-bit visibility (0 shadowed
-// .. 15 lit) into the R32G32_UINT mask the forward frags load per light.
+// .. 15 lit) into the R32G32B32A32_UINT mask the forward frags load per light.
 //
 // Forge's 11 built-in static samplers are all CMP_NEVER (no comparison sampler exists), so
 // the PCF is done manually: point-load the atlas texels around the fractional projection and
@@ -25,10 +25,17 @@
 
 #include "shadowmask.srt.h"
 
-// PCF grid radius in bilinear taps. R=1 → a 3x3 grid of bilinear taps (each tap = 4 loads).
-// Bilinear alone kills the staircase; the grid softens the penumbra. Hot-tunable: bump and
-// save (F8 reload). Cost is (2R+1)^2 * 4 atlas loads per ACTIVE slot per pixel.
+// PCF grid radius CAP in bilinear taps. R=1 → a 3x3 grid of bilinear taps (each tap = 4 loads).
+// Bilinear alone kills the staircase; the grid widens the penumbra. Hot-tunable: bump and
+// save (F8 reload). Cost is (2R+1)^2 * 4 atlas loads per IN-RANGE slot per pixel.
 #define SHADOW_PCF_R 1
+
+// Eye-distance gate on the tap grid (user directive 2026-07-10): the texel-grid staircase is
+// only perceptible on near receivers — atlas resolutions are adequate beyond that. One MW
+// unit ≈ 1.4 cm (player height 128 ≈ 1.8 m); tuned in-game to 360 units (~5 m). Inside the
+// bubble: full SHADOW_PCF_R grid. Outside: one bilinear tap (4 loads instead of (2R+1)^2*4).
+// Hot-tunable (F8): 0 ≈ single-tap everywhere, 99999 ≈ full grid everywhere.
+#define SHADOW_PCF_NEAR_DIST 360.0f
 
 // Reverse-Z shadow test at ONE atlas texel, clamped inside the face sub-tile so a tap can
 // never bleed onto a neighbouring cube face. Returns 1 = lit, 0 = shadowed.
@@ -78,10 +85,11 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
 {
     INIT_MAIN;
     int2  px   = int2(DispatchThreadID.xy);
-    uint2 mask = uint2(0xFFFFFFFFu, 0xFFFFFFFFu);   // default: every slot fully lit
+    uint4 mask = uint4(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);   // default: every slot fully lit
+
 
     float2 invScreen  = gShadowMaskParams.screenParams.zw;
-    uint   activeBits = (uint)gShadowMaskParams.maskParams.x;
+    uint   activeBits = gShadowMaskParams.slotBits.x;   // real uint — float lanes drop bits >= 24
     uint   dbg        = (uint)gShadowMaskParams.maskParams.w;
     float  deviceZ    = LoadTex2D(gShadowLinDepth, NO_SAMPLER, px, 0).r;
 
@@ -89,6 +97,31 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
     if (deviceZ > 0.0f && activeBits != 0u)
     {
         float3 P = reconstructWorldPx(px, deviceZ, invScreen);   // camera-relative world position
+
+        // PIXEL-LEVEL range cull. The mask's dominant cost is per-pixel, not per-slot
+        // (instrumentation: ~2ms flat at 15/16/18 active slots): the 5-unproject normal
+        // reconstruction below runs a full float4x4 mul + divide FIVE times for every pixel on
+        // screen. So first find which slots can reach this pixel at all — Chebyshev (max-axis)
+        // distance vs farZ = 2r, the SAME metric as the cube-face range test (a Euclidean test
+        // would wrongly clip cube corners), needing only P and posRad — and bail out with the
+        // all-lit mask before any of the heavy work when NO slot is in range (in most scenes
+        // that is most of the screen). At farZ the light's smoothstep attenuation is exactly 0,
+        // so the boundary is invisible. Debug modes draw every active slot regardless of range.
+        uint rangeBits = 0u;
+        for (uint rs = 0u; rs < (uint)MAX_SHADOW_SLOTS; ++rs)
+        {
+            if ((activeBits & (1u << rs)) == 0u) { continue; }
+            float4 pr  = gShadowMaskParams.slotPosRad[rs];
+            float3 adr = abs(P - pr.xyz);
+            float  mar = max(adr.x, max(adr.y, adr.z));
+            if (mar < 2.0f * pr.w) { rangeBits |= (1u << rs); }
+        }
+        if (dbg != 0u) { rangeBits = activeBits; }
+        if (rangeBits == 0u)
+        {
+            Write2D(gShadowMaskOut, px, mask);
+            RETURN();
+        }
 
         // Reconstruct the receiver surface normal from neighbouring depth, silhouette-robust:
         // pick the SMALLER world-space delta on each screen axis so the tangent basis never
@@ -111,13 +144,23 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         float3 N   = normalize(cross(dpx, dpy));
         if (dot(N, -P) < 0.0f) { N = -N; }             // face the eye (camera at origin)
         float  normalOffsetK = gShadowMaskParams.biasParams.y;   // offset in atlas texels (live)
-        uint   dynBits       = (uint)gShadowMaskParams.biasParams.z;   // C4b: slots with a valid dyn tile
+        uint   dynBits       = gShadowMaskParams.slotBits.y;   // C4b: slots with a valid dyn tile
+
+        // Near-bubble test for this pixel (camera-relative world → eye distance = |P|),
+        // decided once — every slot at this receiver shares the same eye distance. The PCF
+        // below EARLY-RETURNS on the far path (one bilinear tap, no loop machinery) so the
+        // grid loop can keep compile-time bounds and fully unroll on the near path.
+        bool pcfNear = dot(P, P) < SHADOW_PCF_NEAR_DIST * SHADOW_PCF_NEAR_DIST;
 
         for (uint s = 0u; s < (uint)MAX_SHADOW_SLOTS; ++s)
         {
-            if ((activeBits & (1u << s)) == 0u) { continue; }
-            uint dynSlot = (dynBits >> s) & 1u;
+            if ((rangeBits & (1u << s)) == 0u) { continue; }   // pixel-level range cull above
             float4 posRad = gShadowMaskParams.slotPosRad[s];
+            float3 ad0  = abs(P - posRad.xyz);
+            float  ma0  = max(ad0.x, max(ad0.y, ad0.z));
+            float  farZ = 2.0f * posRad.w;             // shadow range = the light's soft-cutoff end
+
+            uint dynSlot = (dynBits >> s) & 1u;
             float4 tile   = gShadowMaskParams.slotTile[s];
 
             // Normal-offset bias: push the sample OFF the surface along N before the atlas test,
@@ -127,14 +170,11 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
             float3 Ldir  = posRad.xyz - P;
             float  ndotl = dot(N, Ldir * rsqrt(max(dot(Ldir, Ldir), 1e-8f)));
             float  sinT  = sqrt(saturate(1.0f - ndotl * ndotl));
-            float3 ad0   = abs(P - posRad.xyz);
-            float  ma0   = max(ad0.x, max(ad0.y, ad0.z));
             float  texelW = 2.0f * ma0 / max(tile.z, 1.0f);
             float3 Poff  = P + N * (normalOffsetK * sinT * texelW);
 
             float3 d      = Poff - posRad.xyz;         // light -> pixel (normal-offset applied)
             float  nearZ  = gShadowMaskParams.maskParams.y;
-            float  farZ   = 2.0f * posRad.w;           // shadow range = the light's soft-cutoff end
             float3 ad     = abs(d);
 
             // Dominant-axis face pick + face UV — standard D3D cube order (+X -X +Y -Y +Z -Z).
@@ -170,16 +210,47 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
                 float2 fuv = float2(u, v) / ma * 0.5f + 0.5f;
                 float2 ap  = faceOrg + fuv * tile.z;
 
-                // Bilinear PCF over a (2R+1)^2 grid of bilinear taps.
-                float vis = 0.0f;
-                UNROLL for (int j = -SHADOW_PCF_R; j <= SHADOW_PCF_R; ++j)
-                UNROLL for (int i = -SHADOW_PCF_R; i <= SHADOW_PCF_R; ++i)
+                // Bilinear PCF. The tap loop is ~96% of the whole mask pass (perf bisect
+                // 2026-07-10: dispatch 0.05 / +cull 0.07 / +normal recon 0.09 / +PCF 2.03ms),
+                // so it's written as an EARLY RETURN on the far path: beyond the near bubble
+                // one bilinear tap already gives a smooth sub-texel edge — take it and move
+                // on, no loop. Only near pixels (where the texel-contour zigzag is visible)
+                // run the grid, with COMPILE-TIME bounds so it fully unrolls.
+                if (!pcfNear)
                 {
-                    vis += shadowBilinear(ap + float2(float(i), float(j)), tmin, tmax, thresh, dynSlot);
+                    float vis1 = shadowBilinear(ap, tmin, tmax, thresh, dynSlot);
+                    nib = (uint)(saturate(vis1) * 15.0f + 0.5f);
                 }
-                vis *= 1.0f / float((2 * SHADOW_PCF_R + 1) * (2 * SHADOW_PCF_R + 1));
-
-                nib = (uint)(saturate(vis) * 15.0f + 0.5f);
+                else
+                {
+                    // The grid of (2R+1)^2 unit-spaced bilinear taps RE-FETCHES shared texels
+                    // (at R=1: 9 taps x 4 loads = 36, union footprint only 4x4 = 16, interior
+                    // texels loaded 4x — doubled again by the dyn composite). The tap sum is
+                    // SEPARABLE: per axis, tap k covers texel b+k (w=1-f) and b+k+1 (w=f), so
+                    // summing 2R+1 taps collapses to per-texel weights [1-f, 1, ..., 1, f]
+                    // over the (2R+2)-texel footprint. Fetch + compare each texel ONCE and
+                    // weight — bit-identical to the tap loop at 16/36 the loads.
+                    float2 fp = ap - 0.5f;               // texel-centre space (== shadowBilinear)
+                    int2   fb = int2(floor(fp));
+                    float2 ff = fp - float2(fb);
+                    float vis = 0.0f;
+                    UNROLL
+                    for (int j = 0; j < 2 * SHADOW_PCF_R + 2; ++j)
+                    {
+                        float wy = (j == 0) ? (1.0f - ff.y)
+                                 : ((j == 2 * SHADOW_PCF_R + 1) ? ff.y : 1.0f);
+                        UNROLL
+                        for (int i = 0; i < 2 * SHADOW_PCF_R + 2; ++i)
+                        {
+                            float wx = (i == 0) ? (1.0f - ff.x)
+                                     : ((i == 2 * SHADOW_PCF_R + 1) ? ff.x : 1.0f);
+                            vis += (wx * wy) * shadowLitAt(fb + int2(i - SHADOW_PCF_R, j - SHADOW_PCF_R),
+                                                           tmin, tmax, thresh, dynSlot);
+                        }
+                    }
+                    vis *= 1.0f / float((2 * SHADOW_PCF_R + 1) * (2 * SHADOW_PCF_R + 1));
+                    nib = (uint)(saturate(vis) * 15.0f + 0.5f);
+                }
             }
             if (dbg == 1u) { nib = (face + 1u) * 2u; }   // face-id bands (convention check FIRST)
             if (dbg == 2u)
@@ -194,9 +265,12 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
                 nib = (uint)(saturate(sqrt(az)) * 15.0f);
             }
 
-            uint sh = (s & 7u) * 4u;
-            if (s < 8u) { mask.x = (mask.x & ~(0xFu << sh)) | (nib << sh); }
-            else        { mask.y = (mask.y & ~(0xFu << sh)) | (nib << sh); }
+            uint sh   = (s & 7u) * 4u;
+            uint lane = s >> 3u;
+            if      (lane == 0u) { mask.x = (mask.x & ~(0xFu << sh)) | (nib << sh); }
+            else if (lane == 1u) { mask.y = (mask.y & ~(0xFu << sh)) | (nib << sh); }
+            else if (lane == 2u) { mask.z = (mask.z & ~(0xFu << sh)) | (nib << sh); }
+            else                 { mask.w = (mask.w & ~(0xFu << sh)) | (nib << sh); }
         }
     }
 

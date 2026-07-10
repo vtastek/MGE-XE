@@ -5,7 +5,8 @@
 // reconstruct the camera-relative world position from the resolved prepass depth
 // (gShadowLinDepth = pLinearDepth, raw reverse-Z device depth, single-sample so NO MSAA
 // variants needed), run the analytic cube-face atlas test per ACTIVE shadow slot, and pack
-// 4-bit visibilities into the R32G32_UINT mask (x = slots 0-7, y = 8-15; 15 = fully lit).
+// 4-bit visibilities into the R32G32B32A32_UINT mask (uint4 lanes of 8 slots each:
+// x = 0-7, y = 8-15, z = 16-23, w = 24-31; 15 = fully lit).
 //
 // PerBatch frequency (proven multi-user root slot: LinDepthSrtData + CullSrtData both ride
 // PerBatch with different layouts). Everything the pass needs lives in gShadowMaskParams —
@@ -13,13 +14,15 @@
 // radius into slotPosRad so the two stay decoupled.
 #pragma once
 
-#define MAX_SHADOW_SLOTS 16   // MUST match host kMaxShadowLights (forgerender.cpp)
+#define MAX_SHADOW_SLOTS 32   // MUST match host kMaxShadowLights (forgerender.cpp)
 
 STRUCT(ShadowMaskParams)
 {
     DATA(float4x4, invViewProj,  None);   // inverse of the reverse-Z camera-relative viewProj
     DATA(float4,   screenParams, None);   // xy = screen w,h ; zw = 1/w, 1/h
-    // maskParams: x = active-slot BITMASK (bit s = slot s live), y = face near plane (world u),
+    // maskParams: x = UNUSED (was the active-slot bitmask; moved to slotBits.x — a float lane is
+    //             exact only to 24 bits, so 32 slots need a real uint),
+    //             y = face near plane (world u),
     //             z = relative reverse-Z compare slack (acne knob, live-tunable),
     //             w = debug mode (0 off, 1 face-id nibble, 2 atlas-depth view)
     DATA(float4,   maskParams,   None);
@@ -32,12 +35,17 @@ STRUCT(ShadowMaskParams)
     //             its surface along the depth-reconstructed normal, scaled by grazing angle — the
     //             sole grazing-acne mechanism now that the PSO slope-scaled term is zeroed. Face-on
     //             contact stays tight (offset → 0 there); grazing surfaces get the most.
-    //             z = DYNAMIC-slot BITMASK (C4b composite): bit s set = slot s's dynamic tile
+    //             z = UNUSED (was the dynamic-slot bitmask; moved to slotBits.y).
+    DATA(float4,   biasParams,   None);
+    // slotBits: the 32-bit slot masks as REAL uints (float lanes drop bits >= 24).
+    //             x = ACTIVE-slot bitmask (bit s = slot s live).
+    //             y = DYNAMIC-slot bitmask (C4b composite): bit s set = slot s's dynamic tile
     //             (movers: skinned + multimap, re-rendered every frame) is valid THIS frame —
     //             each PCF texel takes max(static, dynamic) = the nearer reverse-Z occluder.
     //             Unset = the dynamic tile is stale (mover left reach); sample static only.
-    // Appended at the struct tail so every slot offset above stays fixed.
-    DATA(float4,   biasParams,   None);
+    //             z/w = spare.
+    // Appended at the struct tail so every offset above stays fixed.
+    DATA(uint4,    slotBits,     None);
 };
 
 BEGIN_SRT(ShadowMaskSrtData)
@@ -45,7 +53,7 @@ BEGIN_SRT(ShadowMaskSrtData)
         DECL_CBUFFER(PerBatch, CBUFFER(ShadowMaskParams), gShadowMaskParams)
         DECL_TEXTURE(PerBatch, Tex2D(float), gShadowLinDepth)
         DECL_TEXTURE(PerBatch, Tex2D(float), gShadowAtlas)
-        DECL_RWTEXTURE(PerBatch, WTex2D(uint2), gShadowMaskOut)
+        DECL_RWTEXTURE(PerBatch, WTex2D(uint4), gShadowMaskOut)
         // C4b composite: the parallel DYNAMIC atlas (same block layout as gShadowAtlas —
         // movers only, re-rendered per frame). Appended LAST so existing indices stay put.
         DECL_TEXTURE(PerBatch, Tex2D(float), gShadowAtlasDyn)
