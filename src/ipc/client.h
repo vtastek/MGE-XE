@@ -315,6 +315,7 @@ namespace IPC {
 			std::uint32_t debugMode = 0,
 			const DevInput* devInput = nullptr,
 			const float* waterParams = nullptr, std::uint32_t waterEnabled = 0,
+			const FPFrame* fp = nullptr,
 			double* outRenderMs = nullptr);
 
 		/**
@@ -337,7 +338,8 @@ namespace IPC {
 			VecId capturedAlpha = InvalidVector, std::uint32_t capturedVertBytes = 0, std::uint32_t capturedIdxBytes = 0,
 			std::uint32_t debugMode = 0,
 			const DevInput* devInput = nullptr,
-			const float* waterParams = nullptr, std::uint32_t waterEnabled = 0);
+			const float* waterParams = nullptr, std::uint32_t waterEnabled = 0,
+			const FPFrame* fp = nullptr);
 
 		/**
 		* @brief Async-frame split: wait for the RenderFrame started by renderSceneKickoff.

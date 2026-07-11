@@ -524,7 +524,8 @@ namespace IPC {
 		VecId capturedAlpha, std::uint32_t capturedVertBytes, std::uint32_t capturedIdxBytes,
 		std::uint32_t debugMode,
 		const DevInput* devInput,
-		const float* waterParams, std::uint32_t waterEnabled) {
+		const float* waterParams, std::uint32_t waterEnabled,
+		const FPFrame* fp) {
 		WAIT_FOR_PREVIOUS_COMMAND;
 
 		auto& params = m_ipcParameters->params.renderFrameParams;
@@ -558,6 +559,29 @@ namespace IPC {
 		if (waterParams) { std::memcpy(params.waterParams, waterParams, 12 * sizeof(float)); }
 		else { std::memset(params.waterParams, 0, 12 * sizeof(float)); }
 		params.waterEnabled = waterEnabled;
+		// FP1a first-person: one optional bundle; null ⇒ fpEnabled=0, host skips the FP pass.
+		if (fp) {
+			std::memcpy(params.fpViewProj, fp->viewProj, 16 * sizeof(float));
+			params.fpDrawList = fp->drawList;
+			params.fpDrawCount = fp->drawCount;
+			params.fpDrawBytes = fp->drawBytes;
+			params.fpSkinnedList = fp->skinnedList;
+			params.fpSkinnedCount = fp->skinnedCount;
+			params.fpSkinnedBytes = fp->skinnedBytes;
+			params.fpAlphaList = fp->alphaList;
+			params.fpAlphaCount = fp->alphaCount;
+			params.fpAlphaBytes = fp->alphaBytes;
+			params.fpEnabled = (fp->drawCount + fp->skinnedCount + fp->alphaCount) > 0 ? 1u : 0u;
+		} else {
+			std::memset(params.fpViewProj, 0, 16 * sizeof(float));
+			params.fpDrawList = InvalidVector;
+			params.fpDrawCount = params.fpDrawBytes = 0;
+			params.fpSkinnedList = InvalidVector;
+			params.fpSkinnedCount = params.fpSkinnedBytes = 0;
+			params.fpAlphaList = InvalidVector;
+			params.fpAlphaCount = params.fpAlphaBytes = 0;
+			params.fpEnabled = 0;
+		}
 		const DevInput di = devInput ? *devInput : DevInput{};
 		params.devMouseX = di.x;
 		params.devMouseY = di.y;
@@ -606,6 +630,7 @@ namespace IPC {
 		std::uint32_t debugMode,
 		const DevInput* devInput,
 		const float* waterParams, std::uint32_t waterEnabled,
+		const FPFrame* fp,
 		double* outRenderMs) {
 		// Fused kickoff+finish — the exact pre-split serial behaviour (A/B reference).
 		if (!renderSceneKickoff(frameIndex, viewProj, lighting,
@@ -616,7 +641,7 @@ namespace IPC {
 			skyList, skyCount, skyBytes,
 			alphaList, alphaCount, alphaBytes,
 			capturedAlpha, capturedVertBytes, capturedIdxBytes,
-			debugMode, devInput, waterParams, waterEnabled)) {
+			debugMode, devInput, waterParams, waterEnabled, fp)) {
 			return false;
 		}
 

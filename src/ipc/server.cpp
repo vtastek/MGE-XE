@@ -596,6 +596,37 @@ namespace IPC {
 					params.frameIndex, params.drawCount, bytes, params.skinnedCount, skinnedBytes, params.multiMapCount, params.lightCount);
 				LOG::flush();
 			}
+			// FP1a first-person bundle: resolve the fp vec pointers only when the client
+			// enabled the pass this frame. Byte counts clamp to the mapped windows like
+			// every other list; a missing/empty list just leaves that half null.
+			ForgeRender::FPScene fpScene;
+			const ForgeRender::FPScene* fpPtr = nullptr;
+			if (params.fpEnabled) {
+				fpScene.viewProj = params.fpViewProj;
+				if (params.fpDrawList != InvalidVector) {
+					auto& fvec = getVec<IPC::GeomChunk>(params.fpDrawList);
+					const std::uint32_t favail = fvec.size() * static_cast<std::uint32_t>(sizeof(IPC::GeomChunk));
+					std::uint32_t fbytes = params.fpDrawBytes;
+					if (fbytes == 0 || fbytes > favail) {
+						fbytes = favail;
+					}
+					fpScene.drawBlob  = fvec.size() ? &fvec[0] : nullptr;
+					fpScene.drawCount = params.fpDrawCount;
+					fpScene.drawBytes = fbytes;
+				}
+				if (params.fpSkinnedList != InvalidVector) {
+					auto& fsvec = getVec<IPC::GeomChunk>(params.fpSkinnedList);
+					const std::uint32_t fsavail = fsvec.size() * static_cast<std::uint32_t>(sizeof(IPC::GeomChunk));
+					std::uint32_t fsbytes = params.fpSkinnedBytes;
+					if (fsbytes == 0 || fsbytes > fsavail) {
+						fsbytes = fsavail;
+					}
+					fpScene.skinnedBlob  = fsvec.size() ? &fsvec[0] : nullptr;
+					fpScene.skinnedCount = params.fpSkinnedCount;
+					fpScene.skinnedBytes = fsbytes;
+				}
+				fpPtr = &fpScene;
+			}
 			ForgeRender::setDebugMode(params.debugMode);
 			ForgeRender::setDevInput(params.devMouseX, params.devMouseY, params.devMouseButtons,
 				params.devMouseWheel, params.devUiVisible);
@@ -609,7 +640,7 @@ namespace IPC {
 				skyPtr, params.skyCount, skyBytes,
 				alphaPtr, params.alphaCount, alphaBytes,
 				capturedAlphaPtr, capVertBytes, capIdxBytes,
-				params.waterParams, params.waterEnabled);
+				params.waterParams, params.waterEnabled, fpPtr);
 			if (logScene) {
 				LOG::logline(">> [scene] renderScene DONE ok=%d drawn=%u skinned=%u",
 					(int)ok, ForgeRender::lastDrawn(), ForgeRender::lastSkinnedDrawn());

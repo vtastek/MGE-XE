@@ -902,6 +902,123 @@ bool MWBridge::is3rdPerson() {
 
 //-----------------------------------------------------------------------------
 
+// getPlayer3rdPersonNode - the player reference's scene node (the 3rd-person body).
+// MACP -> TES3::MobileObject::reference (+0x14) -> TES3::Object::sceneNode (+0x10).
+NI::Node* MWBridge::getPlayer3rdPersonNode() {
+    if (IsLoadScreen()) {
+        return nullptr;
+    }
+
+    DWORD macp = getPlayerMACP();
+    if (macp == 0) {
+        return nullptr;
+    }
+
+    DWORD ref = read_dword(macp + 0x14);
+    if (ref == 0) {
+        return nullptr;
+    }
+
+    return (NI::Node*)read_dword(ref + 0x10);
+}
+
+//-----------------------------------------------------------------------------
+
+// FP1a - WorldController lives at *(0x7C67DC); WorldControllerRenderCamera structs are
+// INLINE members: worldCamera +0x124, armCamera +0x150 (root +0x8, cameraRoot +0xC,
+// CameraData +0x10 {NiCamera* +0, fovDeg +0x8, near +0xC, far +0x10}).
+
+NI::Node* MWBridge::getArmCameraRoot() {
+    DWORD wc = read_dword(0x7C67DC);
+    if (wc == 0) {
+        return nullptr;
+    }
+    return (NI::Node*)read_dword(wc + 0x150 + 0x8);
+}
+
+//-----------------------------------------------------------------------------
+
+bool MWBridge::getRenderCameraState(int which, float pos[3], float dir[3], float up[3],
+                                    float right[3], float camData[5]) {
+    DWORD wc = read_dword(0x7C67DC);
+    if (wc == 0) {
+        return false;
+    }
+    DWORD camStruct = wc + (which == 1 ? 0x150 : 0x124);
+    DWORD cam = read_dword(camStruct + 0x10);   // CameraData::camera (NiCamera*)
+    if (cam == 0) {
+        return false;
+    }
+    // NiCamera field offsets (SharedSE NICamera.h / NIAVObject.h):
+    //   worldTransform.translation +0x40+0x24; worldDirection +0xDC; worldUp +0xE8;
+    //   worldRight +0xF4.
+    for (int i = 0; i < 3; ++i) {
+        pos[i]   = read_float(cam + 0x64  + 4 * i);
+        dir[i]   = read_float(cam + 0xDC  + 4 * i);
+        up[i]    = read_float(cam + 0xE8  + 4 * i);
+        right[i] = read_float(cam + 0xF4  + 4 * i);
+    }
+    // CameraData (camStruct+0x10): fovDegrees +0x8, near +0xC, far +0x10,
+    // viewportWidth +0x14, viewportHeight +0x18 (uints). This is what MW derives its
+    // D3D projection from — the NiCamera viewFrustum is Gamebryo cull state and
+    // carries DIFFERENT (MGE-patched) values.
+    camData[0] = read_float(camStruct + 0x10 + 0x8);
+    camData[1] = read_float(camStruct + 0x10 + 0xC);
+    camData[2] = read_float(camStruct + 0x10 + 0x10);
+    camData[3] = (float)read_dword(camStruct + 0x10 + 0x14);
+    camData[4] = (float)read_dword(camStruct + 0x10 + 0x18);
+    return true;
+}
+
+//-----------------------------------------------------------------------------
+
+bool MWBridge::getRenderCameraFrustum(int which, float frustum[6], float port[4]) {
+    DWORD wc = read_dword(0x7C67DC);
+    if (wc == 0) {
+        return false;
+    }
+    DWORD cam = read_dword(wc + (which == 1 ? 0x150 : 0x124) + 0x10);
+    if (cam == 0) {
+        return false;
+    }
+    // NiCamera::viewFrustum +0x100 {l,r,t,b,n,f}, port +0x118 (SharedSE NICamera.h).
+    for (int i = 0; i < 6; ++i) {
+        frustum[i] = read_float(cam + 0x100 + 4 * i);
+    }
+    for (int i = 0; i < 4; ++i) {
+        port[i] = read_float(cam + 0x118 + 4 * i);
+    }
+    return true;
+}
+
+//-----------------------------------------------------------------------------
+
+// getSceneSunlight - the live scene-graph sunlight: TES3DataHandler+0x98 =
+// NI::DirectionalLight* sgSunlight (SharedSE NILight.h: dimmer +0xA8, ambient +0xAC,
+// diffuse +0xB8, direction +0xD0). This is the object MW programs D3D light 6 from, so
+// reading it is always fresh even when MW hasn't re-sent light state (a static interior
+// scene under full Forge ownership can go many frames with zero SetLight calls).
+bool MWBridge::getSceneSunlight(float dir[3], float diffuse[3], float ambient[3], float* dimmer) {
+    assert(m_loaded);
+    DWORD dh = read_dword(eEnviro);
+    if (dh == 0) {
+        return false;
+    }
+    DWORD light = read_dword(dh + 0x98);
+    if (light == 0) {
+        return false;
+    }
+    *dimmer = read_float(light + 0xA8);
+    for (int i = 0; i < 3; ++i) {
+        ambient[i] = read_float(light + 0xAC + 4 * i);
+        diffuse[i] = read_float(light + 0xB8 + 4 * i);
+        dir[i]     = read_float(light + 0xD0 + 4 * i);
+    }
+    return true;
+}
+
+//-----------------------------------------------------------------------------
+
 DWORD MWBridge::getPlayerTarget() {
     return read_dword(eLookMenu);
 }

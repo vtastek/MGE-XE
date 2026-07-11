@@ -94,6 +94,31 @@ public:
     D3DXVECTOR3* PCam3Offset();
     DWORD getPlayerMACP();
     bool is3rdPerson();
+    // The player reference's scene-graph node = the 3rd-person body (the engine
+    // appCulls it while in 1st person). Null during load screens / before MACP exists.
+    NI::Node* getPlayer3rdPersonNode();
+    // FP1a: the WorldController armCamera scene root — the first-person arms/weapon
+    // subtree MW renders in its own post-z-clear scene. Null when unavailable.
+    NI::Node* getArmCameraRoot();
+    // FP1a: world-space state of one WorldControllerRenderCamera (which: 0 =
+    // worldCamera/main view, 1 = armCamera/first person): the NiCamera basis
+    // (pos/dir/up/right) + the CameraData projection params {fovDegrees (HORIZONTAL),
+    // nearPlane, farPlane, viewportW, viewportH}. MW builds its D3D projection from
+    // CameraData, NOT from the NiCamera's Gamebryo viewFrustum — validated in-game:
+    // the frustum carries a different (MGE-patched) FOV and near=1 while the D3D proj
+    // follows CameraData (fov 75°, near 4). Returns false when unresolvable.
+    bool getRenderCameraState(int which, float pos[3], float dir[3], float up[3],
+                              float right[3], float camData[5]);
+    // FP cam diag: the raw Gamebryo viewFrustum {left,right,top,bottom,near,far} +
+    // viewport port {l,r,t,b} of a WorldControllerRenderCamera's NiCamera (which: 0 =
+    // worldCamera, 1 = armCamera). Cull state, NOT the projection authority (see above) —
+    // logged for triage only.
+    bool getRenderCameraFrustum(int which, float frustum[6], float port[4]);
+    // Live scene-graph sunlight (TES3DataHandler+0x98, NI::DirectionalLight): the
+    // authoritative light MW programs D3D light 6 FROM, interior AND exterior — fresh
+    // every frame regardless of whether MW re-sent any D3D light state. dir is the
+    // world-space travel direction (unnormalized); colors are pre-dimmer.
+    bool getSceneSunlight(float dir[3], float diffuse[3], float ambient[3], float* dimmer);
     DWORD getPlayerTarget();
     int getPlayerWeapon();
     bool isPlayerCasting();

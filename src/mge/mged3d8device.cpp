@@ -797,6 +797,12 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
 // Skybox mesh doesn't extend over whole background; cleared background colour is visible at horizon
 HRESULT _stdcall MGEProxyDevice::Clear(DWORD a, const D3DRECT* b, DWORD c, D3DCOLOR d, float e, DWORD f) {
     DistantLand::setHorizonColour(d);
+    // FP cam diag: the z-only clear in scenes >= 1 is MW's pre-first-person depth clear —
+    // arm the latch so the NEXT view/proj submitted (the arm scene's camera) get recorded.
+    // Self-gates on wantsFPCapture inside; inert otherwise.
+    if (isMainView && sceneCount >= 1 && (c & D3DCLEAR_ZBUFFER) && !(c & D3DCLEAR_TARGET)) {
+        RenderProcess::noteFPZClear();
+    }
     // Zone the clear during the scene-0 sky window — a Clear is a classic
     // point at which the CPU blocks on GPU backpressure, and that wait would
     // otherwise hide inside the "MW sky" zone.
@@ -820,6 +826,7 @@ HRESULT _stdcall MGEProxyDevice::SetTransform(D3DTRANSFORMSTATETYPE a, const D3D
             if (isMainView) {
                 D3DXMATRIX view = *b;
                 view *= camEffectsMatrix;
+                RenderProcess::noteFPSceneTransform(false, &view);   // FP cam diag (submitted form)
                 return ProxyDevice::SetTransform(a, &view);
             }
         } else if (a == D3DTS_PROJECTION) {
@@ -833,6 +840,7 @@ HRESULT _stdcall MGEProxyDevice::SetTransform(D3DTRANSFORMSTATETYPE a, const D3D
                     proj._22 *= Configuration.CameraEffects.zoom;
                 }
 
+                RenderProcess::noteFPSceneTransform(true, &proj);    // FP cam diag (submitted form)
                 return ProxyDevice::SetTransform(a, &proj);
             }
         }
