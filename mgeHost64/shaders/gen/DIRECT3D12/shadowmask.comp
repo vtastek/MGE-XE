@@ -972,6 +972,7 @@ STRUCT(ShadowMaskParams)
 
 
 
+
     float4 maskParams;
     float4 slotPosRad[ 32 ];
     float4 slotTile[ 32 ];
@@ -993,7 +994,7 @@ STRUCT(ShadowMaskParams)
 
 
     uint4 slotBits;
-#line 49
+#line 50
 };
 
         CBUFFER(ShadowMaskParams) gShadowMaskParams :  register(b0,space2);
@@ -1060,16 +1061,8 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     if (deviceZ > 0.0f && activeBits != 0u)
     {
         float3 P = reconstructWorldPx(px, deviceZ, invScreen);
-
-
-
-
-
-
-
-
-
-
+#line 114 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
+        float rangeK = gShadowMaskParams.maskParams.x;
         uint rangeBits = 0u;
         for (uint rs = 0u; rs < (uint) 32 ; ++rs)
         {
@@ -1077,7 +1070,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
             float4 pr = gShadowMaskParams.slotPosRad[rs];
             float3 adr = abs(P - pr.xyz);
             float mar = max(adr.x, max(adr.y, adr.z));
-            if (mar < 2.0f * pr.w) { rangeBits |= (1u << rs); }
+            if (mar < rangeK * pr.w) { rangeBits |= (1u << rs); }
         }
         if (dbg != 0u) { rangeBits = activeBits; }
         if (rangeBits == 0u)
@@ -1121,7 +1114,10 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
             float4 posRad = gShadowMaskParams.slotPosRad[s];
             float3 ad0 = abs(P - posRad.xyz);
             float ma0 = max(ad0.x, max(ad0.y, ad0.z));
+            float range = rangeK * posRad.w;
             float farZ = 2.0f * posRad.w;
+
+
 
             uint dynSlot = (dynBits >> s) & 1u;
             float4 tile = gShadowMaskParams.slotTile[s];
@@ -1150,7 +1146,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
                                                 u = d.z > 0.0f ? d.x : -d.x; v = -d.y; }
 
             uint nib = 15u;
-            if (ma > nearZ && ma < farZ)
+            if (ma > nearZ && ma < range)
             {
 
 
@@ -1179,10 +1175,10 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
 
 
+                float vis;
                 if (!pcfNear)
                 {
-                    float vis1 = shadowBilinear(ap, tmin, tmax, thresh, dynSlot);
-                    nib = (uint)(saturate(vis1) * 15.0f + 0.5f);
+                    vis = shadowBilinear(ap, tmin, tmax, thresh, dynSlot);
                 }
                 else
                 {
@@ -1196,7 +1192,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
                     float2 fp = ap - 0.5f;
                     int2 fb = int2(floor(fp));
                     float2 ff = fp - float2(fb);
-                    float vis = 0.0f;
+                    vis = 0.0f;
                     UNROLL
                     for (int j = 0; j < 2 *  1  + 2; ++j)
                     {
@@ -1212,8 +1208,13 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
                         }
                     }
                     vis *= 1.0f / float((2 *  1  + 1) * (2 *  1  + 1));
-                    nib = (uint)(saturate(vis) * 15.0f + 0.5f);
                 }
+
+
+
+
+                vis = lerp(vis, 1.0f, smoothstep(0.85f * range, range, ma));
+                nib = (uint)(saturate(vis) * 15.0f + 0.5f);
             }
             if (dbg == 1u) { nib = (face + 1u) * 2u; }
             if (dbg == 2u)

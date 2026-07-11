@@ -20,8 +20,9 @@ STRUCT(ShadowMaskParams)
 {
     DATA(float4x4, invViewProj,  None);   // inverse of the reverse-Z camera-relative viewProj
     DATA(float4,   screenParams, None);   // xy = screen w,h ; zw = 1/w, 1/h
-    // maskParams: x = UNUSED (was the active-slot bitmask; moved to slotBits.x — a float lane is
-    //             exact only to 24 bits, so 32 slots need a real uint),
+    // maskParams: x = shadow TEST RANGE in light radii (live knob, host g_shadowRangeK; 2.0 =
+    //             the atlas far plane = old behaviour). Range cull + slot test use it; the
+    //             refZ depth mapping always uses farZ = 2r (the atlas render far plane),
     //             y = face near plane (world u),
     //             z = relative reverse-Z compare slack (acne knob, live-tunable),
     //             w = debug mode (0 off, 1 face-id nibble, 2 atlas-depth view)

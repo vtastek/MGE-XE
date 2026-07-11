@@ -102,19 +102,24 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         // (instrumentation: ~2ms flat at 15/16/18 active slots): the 5-unproject normal
         // reconstruction below runs a full float4x4 mul + divide FIVE times for every pixel on
         // screen. So first find which slots can reach this pixel at all — Chebyshev (max-axis)
-        // distance vs farZ = 2r, the SAME metric as the cube-face range test (a Euclidean test
-        // would wrongly clip cube corners), needing only P and posRad — and bail out with the
-        // all-lit mask before any of the heavy work when NO slot is in range (in most scenes
-        // that is most of the screen). At farZ the light's smoothstep attenuation is exactly 0,
-        // so the boundary is invisible. Debug modes draw every active slot regardless of range.
-        uint rangeBits = 0u;
+        // distance vs the TEST RANGE rangeK*r (maskParams.x, live host knob; 2.0 = the atlas
+        // far plane = old behaviour), the SAME metric as the cube-face range test (a Euclidean
+        // test would wrongly clip cube corners), needing only P and posRad — and bail out with
+        // the all-lit mask before any of the heavy work when NO slot is in range. Below 2.0 the
+        // attenuation ramp is still non-zero at the cut (~0.5 at 1.5r), so the slot loop fades
+        // shadow→lit over the last 15% of range to hide the boundary. Covered area per light
+        // scales with rangeK² — the main cost knob in light-dense interiors, where blanket
+        // ranges keep this early-out from ever firing. Debug modes draw every active slot
+        // regardless of range.
+        float rangeK    = gShadowMaskParams.maskParams.x;
+        uint  rangeBits = 0u;
         for (uint rs = 0u; rs < (uint)MAX_SHADOW_SLOTS; ++rs)
         {
             if ((activeBits & (1u << rs)) == 0u) { continue; }
             float4 pr  = gShadowMaskParams.slotPosRad[rs];
             float3 adr = abs(P - pr.xyz);
             float  mar = max(adr.x, max(adr.y, adr.z));
-            if (mar < 2.0f * pr.w) { rangeBits |= (1u << rs); }
+            if (mar < rangeK * pr.w) { rangeBits |= (1u << rs); }
         }
         if (dbg != 0u) { rangeBits = activeBits; }
         if (rangeBits == 0u)
@@ -158,7 +163,10 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
             float4 posRad = gShadowMaskParams.slotPosRad[s];
             float3 ad0  = abs(P - posRad.xyz);
             float  ma0  = max(ad0.x, max(ad0.y, ad0.z));
-            float  farZ = 2.0f * posRad.w;             // shadow range = the light's soft-cutoff end
+            float  range = rangeK * posRad.w;          // shadow TEST range (live knob)
+            float  farZ  = 2.0f * posRad.w;            // refZ mapping ONLY: the atlas render far plane
+                                                       // (buildShadowFaceVP reach) — must stay 2r or
+                                                       // stored depths and refZ diverge
 
             uint dynSlot = (dynBits >> s) & 1u;
             float4 tile   = gShadowMaskParams.slotTile[s];
@@ -187,7 +195,7 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
                                                 u  = d.z > 0.0f ?  d.x : -d.x; v = -d.y; }
 
             uint nib = 15u;
-            if (ma > nearZ && ma < farZ)
+            if (ma > nearZ && ma < range)
             {
                 // Reverse-Z reference along the face axis; nearer = larger. Two live acne/gap
                 // knobs on the threshold: maskParams.z = RELATIVE (multiplicative) slack — biases
@@ -216,10 +224,10 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
                 // one bilinear tap already gives a smooth sub-texel edge — take it and move
                 // on, no loop. Only near pixels (where the texel-contour zigzag is visible)
                 // run the grid, with COMPILE-TIME bounds so it fully unrolls.
+                float vis;
                 if (!pcfNear)
                 {
-                    float vis1 = shadowBilinear(ap, tmin, tmax, thresh, dynSlot);
-                    nib = (uint)(saturate(vis1) * 15.0f + 0.5f);
+                    vis = shadowBilinear(ap, tmin, tmax, thresh, dynSlot);
                 }
                 else
                 {
@@ -233,7 +241,7 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
                     float2 fp = ap - 0.5f;               // texel-centre space (== shadowBilinear)
                     int2   fb = int2(floor(fp));
                     float2 ff = fp - float2(fb);
-                    float vis = 0.0f;
+                    vis = 0.0f;
                     UNROLL
                     for (int j = 0; j < 2 * SHADOW_PCF_R + 2; ++j)
                     {
@@ -249,8 +257,13 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
                         }
                     }
                     vis *= 1.0f / float((2 * SHADOW_PCF_R + 1) * (2 * SHADOW_PCF_R + 1));
-                    nib = (uint)(saturate(vis) * 15.0f + 0.5f);
                 }
+                // Fade band: shadow → lit over the last 15% of the test range, so the hard
+                // range cut above never shows as a lit/shadowed seam (below rangeK=2.0 the
+                // attenuation ramp is still non-zero at the cut). At rangeK=2.0 the band sits
+                // where attenuation reaches exactly 0 — visually the old output.
+                vis = lerp(vis, 1.0f, smoothstep(0.85f * range, range, ma));
+                nib = (uint)(saturate(vis) * 15.0f + 0.5f);
             }
             if (dbg == 1u) { nib = (face + 1u) * 2u; }   // face-id bands (convention check FIRST)
             if (dbg == 2u)
