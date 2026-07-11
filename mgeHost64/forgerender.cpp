@@ -1212,6 +1212,8 @@ namespace {
         Shader*        pDebugLineShader = nullptr;         // debugline.vert/.frag (flat per-vertex colour)
         Pipeline*      pDebugLinePipeline = nullptr;       // LINE_LIST, depth OFF — light-origin debug boxes
         Buffer*        pDebugLineVB = nullptr;             // dynamic {float3 pos, float4 col} verts, persistent-mapped
+        Shader*        pShadowAtlasViewShader = nullptr;   // shadowatlasview.vert/.frag (F12 mode 11/12 atlas blit)
+        Pipeline*      pShadowAtlasViewPipeline = nullptr; // fullscreen triangle, depth OFF, colour RT
         Buffer*        pSkyWorldsBuf = nullptr;            // gBatch: one 64KB world window, persistent-mapped
         DescriptorSet* pPerBatchSetSky = nullptr;          // gBatch bound to pSkyWorldsBuf, 1 instance
         Buffer*        pSkyInstanceBuf = nullptr;          // per-draw instance VB (kStaticInstU32 slots), CPU-mapped
@@ -2685,7 +2687,7 @@ namespace {
             // (pAOBlur), not raw pAO; pAOBlur's per-frame UAV<->SHADER_RESOURCE ping-pong (renderScene)
             // leaves it SHADER_RESOURCE before the colour pass samples it. (Raw pAO still feeds the
             // blur as an SRV, and the DebugTextures/readback paths still inspect pAO directly.)
-            DescriptorData p[3] = {};
+            DescriptorData p[5] = {};
             p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
             p[0].ppBuffers = &g_live.pFrameCbv;
             p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -2697,6 +2699,20 @@ namespace {
                 p[np].mIndex = SRT_RES_IDX(SrtData, PerFrame, gShadowMask);
                 p[np].mCount = 1;
                 p[np].ppTextures = &g_live.pShadowMask;
+                ++np;
+            }
+            // Shadow-atlas debug view (F12 mode 11/12): the two D32 atlases sampled read-only by
+            // shadowatlasview.frag. They rest in SHADER_RESOURCE after the mask pass, so binding the
+            // views here is stable (the atlas-view pass runs after the FP pass, well past the atlas
+            // face re-renders). Bound only into this main set — no other pass samples them.
+            if (g_live.pShadowAtlas && g_live.pShadowAtlasDyn) {
+                p[np].mIndex = SRT_RES_IDX(SrtData, PerFrame, gShadowAtlas);
+                p[np].mCount = 1;
+                p[np].ppTextures = &g_live.pShadowAtlas->pTexture;
+                ++np;
+                p[np].mIndex = SRT_RES_IDX(SrtData, PerFrame, gShadowAtlasDyn);
+                p[np].mCount = 1;
+                p[np].ppTextures = &g_live.pShadowAtlasDyn->pTexture;
                 ++np;
             }
             updateDescriptorSet(R, 0, g_live.pPerFrameSet, np, p);
@@ -3465,18 +3481,65 @@ namespace {
                 return false;
             }
 
-            // 12 edges x 2 verts per light-box, up to kMaxPointLights boxes.
+            // Boxes: 12 edges x 2 verts per light-box, up to kMaxPointLights boxes.
+            // Range spheres (g_debugRangeSpheres): per active shadow slot, TWO 3-ring cages (inner +
+            // outer) = 2 * (3 circles * 32 segments * 2 verts) = 384 verts, up to kMaxShadowLights.
+            // Boxes fill the VB head, spheres append after — both may be active at once.
             BufferLoadDesc dvb = {};
             dvb.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
             dvb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
             dvb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
-            dvb.mDesc.mSize = (uint64_t)IPC::kMaxPointLights * 24 * 7 * sizeof(float);
+            dvb.mDesc.mSize = ((uint64_t)IPC::kMaxPointLights * 24 + (uint64_t)kMaxShadowLights * 384)
+                              * 7 * sizeof(float);
             dvb.mDesc.pName = "debugLineVB";
             dvb.pData = nullptr;
             dvb.ppBuffer = &g_live.pDebugLineVB;
             addResource(&dvb, nullptr);
             waitForAllResourceLoads();
             if (!g_live.pDebugLineVB) {
+                return false;
+            }
+        }
+
+        // --- Shadow-atlas debug view: fullscreen-triangle blit of the whole D32 atlas -------------
+        // F12 mode 11 (static) / 12 (dynamic). shadowatlasview.vert/.frag reuse opaque.srt.h /
+        // DefaultRootSignature — gFrameData (mode + per-slot active/dyn bitmasks in atlasDbg) + the two
+        // atlas SRVs appended to the PerFrame set. No vertex buffer (SV_VertexID), depth OFF, no blend
+        // (it OVERWRITES the composited scene, alpha = 1). Colour format + sample count match the
+        // (possibly MSAA) colour target so it can be drawn straight into it after the FP pass. Built
+        // unconditionally; zero cost unless the debug mode selects it.
+        {
+            ShaderLoadDesc savDesc = {};
+            savDesc.mVert.pFileName = "shadowatlasview.vert";
+            savDesc.mFrag.pFileName = "shadowatlasview.frag";
+            addShader(R, &savDesc, &g_live.pShadowAtlasViewShader);
+            if (!g_live.pShadowAtlasViewShader) {
+                std::printf("[forge] addShader(shadowatlasview) FAILED\n");
+                return false;
+            }
+
+            DepthStateDesc savDepth = {};
+            savDepth.mDepthTest = false;
+            savDepth.mDepthWrite = false;
+
+            RasterizerStateDesc savRaster = {};
+            savRaster.mCullMode = CULL_MODE_NONE;
+
+            PipelineDesc savPd = {};
+            savPd.mType = PIPELINE_TYPE_GRAPHICS;
+            GraphicsPipelineDesc& sag = savPd.mGraphicsDesc;
+            sag.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+            sag.mRenderTargetCount = 1;
+            sag.pColorFormats = &g_live.pRT->mFormat;
+            sag.mSampleCount = (SampleCount)g_live.sampleCount;
+            sag.mSampleQuality = 0;
+            sag.pDepthState = &savDepth;
+            sag.pVertexLayout = nullptr;
+            sag.pRasterizerState = &savRaster;
+            sag.pShaderProgram = g_live.pShadowAtlasViewShader;
+            addPipeline(R, &savPd, &g_live.pShadowAtlasViewPipeline);
+            if (!g_live.pShadowAtlasViewPipeline) {
+                std::printf("[forge] addPipeline(shadowatlasview) FAILED\n");
                 return false;
             }
         }
@@ -4674,6 +4737,11 @@ namespace {
                                         // deterministic id hash (legend logged as [light-box] id=.. rgb=..).
                                         // Sample a box's on-screen colour → match it back to the light id.
                                         // Drawn depth-OFF at the end of the colour pass (always visible).
+    bool  g_debugRangeSpheres = false;  // Debug viz: 3-ring wireframe cage per ACTIVE shadow slot at its
+                                        // range volume — inner ring = g_shadowRangeK·radius (the mask test
+                                        // range), dimmer outer ring = 2·radius (atlas far / fade edge).
+                                        // Colour-matched to the light's box (same debugIdColor). Shares the
+                                        // debug-line pass/VB; independent of g_debugLightBoxes.
     bool  g_shadowSkinnedCasters = true; // C4a: skinned NPC/creature/player parts CAST shadows (this-frame
                                         // poses; reuses the resident bone windows). Off = pre-C4a behavior
                                         // (only rigid parts cast → partial body shadow). Default ON
@@ -4732,7 +4800,7 @@ namespace {
     // overlay selector and the F12 key cycle stay unified.
     const char* const kDebugModeNames[] = { "0 normal", "1 depth", "2 scatter", "3 AO", "4 bent-normal",
                                             "5 albedo", "6 lit", "7 ambient", "8 world-normal", "9 light-count",
-                                            "10 shadow-mask" };
+                                            "10 shadow-mask", "11 shadow-atlas (static)", "12 shadow-atlas (dyn)" };
 
     // Build the dev overlay once. The headless host has no Load/Unload reload split, so font-system
     // + UI-system init AND their pipeline load happen together here, right after pRT exists.
@@ -4897,6 +4965,8 @@ namespace {
         uiAddComponentWidget(g_uiPanel, "Shadow: fixture priority boost (light/torch/furn)", &sShFb, WIDGET_TYPE_SLIDER_FLOAT);
         CheckboxWidget cDbgLb = {}; cDbgLb.pData = &g_debugLightBoxes;
         uiAddComponentWidget(g_uiPanel, "Debug: light-origin boxes (id-coloured)", &cDbgLb, WIDGET_TYPE_CHECKBOX);
+        CheckboxWidget cDbgRs = {}; cDbgRs.pData = &g_debugRangeSpheres;
+        uiAddComponentWidget(g_uiPanel, "Debug: shadow range spheres (rangeK inner / 2r outer)", &cDbgRs, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cShSl = {}; cShSl.pData = &g_shadowSkipLinearLights;
         uiAddComponentWidget(g_uiPanel, "Shadow: skip ambient/sun fill (linear-atten)", &cShSl, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cShEx = {}; cShEx.pData = &g_shadowExpireMovers;
@@ -5451,6 +5521,11 @@ namespace ForgeRender {
             dp[61] = (float)(hostNowMs() * 0.001);
             dp[62] = g_skyTintPulse ? 1.0f : 0.0f;
             dp[63] = 0.0f;
+            // atlasDbg (float index 72/73): shadow-atlas debug-view per-slot state bitmasks. Default
+            // 0 (every tile dim); the shadow manager overwrites with the real active/dyn masks below.
+            reinterpret_cast<uint32_t*>(dp)[72] = 0u;
+            reinterpret_cast<uint32_t*>(dp)[73] = 0u;
+            reinterpret_cast<uint32_t*>(dp)[74] = 0u;
         }
 
         // Tier 3a: upload this frame's point lights into gLights. Each PointLightWire is exactly
@@ -6181,10 +6256,12 @@ namespace ForgeRender {
             // spill) must NOT be sampled — its atlas tile is still undefined. It stays dirty and
             // activates once rendered (graceful: the shadow appears a frame or two late, never as garbage).
             uint32_t activeBits = 0;
+            uint32_t staticReBits = 0;   // slots whose STATIC tile re-rendered THIS frame (not cached)
             for (uint32_t s = 0; s < kMaxShadowLights; ++s) {
                 ShadowSlot& sl = g_shadowSlots[s];
                 if (!sl.valid || !sl.activeThisFrame || sl.lastRenderFrame == 0) { continue; }
                 activeBits |= (1u << s);
+                if (sl.lastRenderFrame == frame) { staticReBits |= (1u << s); }
                 mp[24 + s * 4 + 0] = sl.absPos[0] - g_eyeAbsShadow[0];   // slotPosRad[s] CAMERA-RELATIVE
                 mp[24 + s * 4 + 1] = sl.absPos[1] - g_eyeAbsShadow[1];
                 mp[24 + s * 4 + 2] = sl.absPos[2] - g_eyeAbsShadow[2];
@@ -6206,6 +6283,14 @@ namespace ForgeRender {
             // to 24 bits, so at 32 slots the top-8 would silently vanish.
             reinterpret_cast<uint32_t*>(mp)[284] = activeBits;   // slotBits.x
             reinterpret_cast<uint32_t*>(mp)[285] = dynBits;      // slotBits.y (C4b dyn tile valid THIS frame)
+            // Mirror the masks into gFrameData.atlasDbg (float index 72/73) for the F12 mode-11/12
+            // shadow-atlas debug view (shadowatlasview.frag tints tiles green=active / red=dyn).
+            {
+                float* fdb = (float*)g_live.pFrameCbv->pCpuMappedAddress;
+                reinterpret_cast<uint32_t*>(fdb)[72] = activeBits;
+                reinterpret_cast<uint32_t*>(fdb)[73] = dynBits;
+                reinterpret_cast<uint32_t*>(fdb)[74] = staticReBits;   // atlasDbg.z: static tile re-rendered this frame
+            }
             g_shadowFrameActive = !g_shadowRenders.empty() || !g_shadowRendersDyn.empty();
 
             // Manager heartbeat (verify gate): active slots / this-frame renders / valid+active
@@ -7799,48 +7884,92 @@ namespace ForgeRender {
 
         gpuPhaseEnd(kGpuPhaseColorDL);
 
-        // --- Debug light-origin boxes (colorTarget + pDepth still bound; depth-OFF pipeline) -------
-        // One wireframe box per point light at its eye-relative origin (pl[0..2]), coloured by the
-        // id hash. Legend logged every ~240 frames so a sampled on-screen colour maps back to a light
-        // id. Reads the light CBV that this frame's lighting already populated.
-        if (g_debugLightBoxes && g_live.pDebugLinePipeline && g_live.pDebugLineVB
-            && g_live.pLightCbv && g_lastLightCount) {
+        // --- Debug light-origin boxes + shadow range spheres (colorTarget + pDepth still bound) ----
+        // Both share the depth-OFF LINE_LIST pipeline + VB (boxes fill the head, spheres append).
+        //  Boxes (g_debugLightBoxes): one wireframe box per point light at its eye-relative origin,
+        //    coloured by the id hash; legend logged every ~240 frames (sample a colour → light id).
+        //  Spheres (g_debugRangeSpheres): a 3-ring cage per ACTIVE shadow slot at its range volume —
+        //    inner = g_shadowRangeK·radius (mask test range), dimmer outer = 2·radius (atlas far).
+        //    Same debugIdColor(lightId) as the light's box so the two colour-match.
+        if ((g_debugLightBoxes || g_debugRangeSpheres) && g_live.pDebugLinePipeline
+            && g_live.pDebugLineVB) {
             struct DbgV { float p[3]; float c[4]; };
-            const float* lc = (const float*)g_live.pLightCbv->pCpuMappedAddress;
-            const uint32_t nBox = (g_lastLightCount < IPC::kMaxPointLights)
-                                  ? g_lastLightCount : IPC::kMaxPointLights;
             DbgV* dv = (DbgV*)g_live.pDebugLineVB->pCpuMappedAddress;
-            static const int edges[12][2] = { {0,1},{2,3},{4,5},{6,7}, {0,2},{1,3},{4,6},{5,7},
-                                              {0,4},{1,5},{2,6},{3,7} };
-            const float hx = 12.0f;   // half-extent (24u cube)
             uint32_t vcount = 0;
-            static uint64_t s_lastBoxLegend = 0;
-            const bool legend = (g_renderFrame - s_lastBoxLegend >= 240);
-            for (uint32_t i = 0; i < nBox; ++i) {
-                const float* pl = lc + 4 + i * 12;
-                uint32_t id, flags;
-                IPC::unpackLightIdFlags(lc[4 + i * 12 + 7], id, flags);
-                float cr, cg, cb; debugIdColor(id, cr, cg, cb);
-                if (legend) {
-                    LOG::logline(">> [light-box] id=%u rgb=(%.2f,%.2f,%.2f) pos=(%.0f,%.0f,%.0f)",
-                                 id, cr, cg, cb, pl[0], pl[1], pl[2]);
-                }
-                float corners[8][3];
-                for (int c = 0; c < 8; ++c) {
-                    corners[c][0] = pl[0] + ((c & 1) ? hx : -hx);
-                    corners[c][1] = pl[1] + ((c & 2) ? hx : -hx);
-                    corners[c][2] = pl[2] + ((c & 4) ? hx : -hx);
-                }
-                for (int e = 0; e < 12; ++e) {
-                    for (int k = 0; k < 2; ++k) {
-                        DbgV& d = dv[vcount++];
-                        const float* cc = corners[edges[e][k]];
-                        d.p[0] = cc[0]; d.p[1] = cc[1]; d.p[2] = cc[2];
-                        d.c[0] = cr; d.c[1] = cg; d.c[2] = cb; d.c[3] = 1.0f;
+
+            if (g_debugLightBoxes && g_live.pLightCbv && g_lastLightCount) {
+                const float* lc = (const float*)g_live.pLightCbv->pCpuMappedAddress;
+                const uint32_t nBox = (g_lastLightCount < IPC::kMaxPointLights)
+                                      ? g_lastLightCount : IPC::kMaxPointLights;
+                static const int edges[12][2] = { {0,1},{2,3},{4,5},{6,7}, {0,2},{1,3},{4,6},{5,7},
+                                                  {0,4},{1,5},{2,6},{3,7} };
+                const float hx = 12.0f;   // half-extent (24u cube)
+                static uint64_t s_lastBoxLegend = 0;
+                const bool legend = (g_renderFrame - s_lastBoxLegend >= 240);
+                for (uint32_t i = 0; i < nBox; ++i) {
+                    const float* pl = lc + 4 + i * 12;
+                    uint32_t id, flags;
+                    IPC::unpackLightIdFlags(lc[4 + i * 12 + 7], id, flags);
+                    float cr, cg, cb; debugIdColor(id, cr, cg, cb);
+                    if (legend) {
+                        LOG::logline(">> [light-box] id=%u rgb=(%.2f,%.2f,%.2f) pos=(%.0f,%.0f,%.0f)",
+                                     id, cr, cg, cb, pl[0], pl[1], pl[2]);
+                    }
+                    float corners[8][3];
+                    for (int c = 0; c < 8; ++c) {
+                        corners[c][0] = pl[0] + ((c & 1) ? hx : -hx);
+                        corners[c][1] = pl[1] + ((c & 2) ? hx : -hx);
+                        corners[c][2] = pl[2] + ((c & 4) ? hx : -hx);
+                    }
+                    for (int e = 0; e < 12; ++e) {
+                        for (int k = 0; k < 2; ++k) {
+                            DbgV& d = dv[vcount++];
+                            const float* cc = corners[edges[e][k]];
+                            d.p[0] = cc[0]; d.p[1] = cc[1]; d.p[2] = cc[2];
+                            d.c[0] = cr; d.c[1] = cg; d.c[2] = cb; d.c[3] = 1.0f;
+                        }
                     }
                 }
+                if (legend) { s_lastBoxLegend = g_renderFrame; }
             }
-            if (legend) { s_lastBoxLegend = g_renderFrame; }
+
+            if (g_debugRangeSpheres) {
+                // A 3-ring cage (XY/XZ/YZ great circles, 32 segments each) at an eye-relative centre.
+                const int   SEG  = 32;
+                const float step = 6.28318530718f / (float)SEG;
+                auto emitCage = [&](float cx, float cy, float cz, float rad,
+                                    float cr, float cg, float cb) {
+                    for (int plane = 0; plane < 3; ++plane) {
+                        for (int s = 0; s < SEG; ++s) {
+                            const float a0 = (float)s * step, a1 = (float)(s + 1) * step;
+                            float pts[2][3];
+                            for (int k = 0; k < 2; ++k) {
+                                const float a = k ? a1 : a0;
+                                const float u = rad * cosf(a), v = rad * sinf(a);
+                                if (plane == 0)      { pts[k][0] = cx + u; pts[k][1] = cy + v; pts[k][2] = cz; }
+                                else if (plane == 1) { pts[k][0] = cx + u; pts[k][1] = cy;     pts[k][2] = cz + v; }
+                                else                 { pts[k][0] = cx;     pts[k][1] = cy + u; pts[k][2] = cz + v; }
+                            }
+                            for (int k = 0; k < 2; ++k) {
+                                DbgV& d = dv[vcount++];
+                                d.p[0] = pts[k][0]; d.p[1] = pts[k][1]; d.p[2] = pts[k][2];
+                                d.c[0] = cr; d.c[1] = cg; d.c[2] = cb; d.c[3] = 1.0f;
+                            }
+                        }
+                    }
+                };
+                for (uint32_t s = 0; s < kMaxShadowLights; ++s) {
+                    const ShadowSlot& sl = g_shadowSlots[s];
+                    if (!sl.valid || !sl.activeThisFrame || sl.radius <= 0.0f) { continue; }
+                    const float cx = sl.absPos[0] - g_eyeAbsShadow[0];
+                    const float cy = sl.absPos[1] - g_eyeAbsShadow[1];
+                    const float cz = sl.absPos[2] - g_eyeAbsShadow[2];
+                    float cr, cg, cb; debugIdColor(sl.lightId, cr, cg, cb);
+                    emitCage(cx, cy, cz, g_shadowRangeK * sl.radius, cr, cg, cb);         // inner: test range
+                    emitCage(cx, cy, cz, 2.0f * sl.radius, cr * 0.4f, cg * 0.4f, cb * 0.4f); // outer: 2r fade edge
+                }
+            }
+
             if (vcount) {
                 cmdBindPipeline(g_live.pCmd, g_live.pDebugLinePipeline);
                 cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
@@ -8418,6 +8547,25 @@ namespace ForgeRender {
             }
         }
         gpuPhaseEnd(kGpuPhaseColorFP);
+
+        // --- Shadow-atlas debug view (F12 mode 11 static / 12 dynamic) --------------------------
+        // Fullscreen-triangle OVERWRITE of the composited colour target with the whole D32 shadow
+        // atlas, tinted per-slot by active/dyn state. Drawn LAST (after every scene pass incl. FP)
+        // so nothing overdraws it, before the resolve. Reuses pPerFrameSet (gFrameData + the atlas
+        // SRVs); depth OFF, no VB. Debug-only — costs nothing unless the mode is selected.
+        if ((g_debugMode == 11 || g_debugMode == 12) && g_live.pShadowAtlasViewPipeline
+            && g_live.pShadowAtlas && g_live.pShadowAtlasDyn) {
+            BindRenderTargetsDesc avbind = {};
+            avbind.mRenderTargetCount = 1;
+            avbind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };
+            cmdBindRenderTargets(g_live.pCmd, &avbind);
+            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+            cmdBindPipeline(g_live.pCmd, g_live.pShadowAtlasViewPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+            cmdDraw(g_live.pCmd, 3, 0);
+            cmdBindRenderTargets(g_live.pCmd, nullptr);
+        }
 
         gpuPhaseBegin(kGpuPhaseResolve);
         if (g_live.sampleCount > 1) {
@@ -12671,6 +12819,8 @@ namespace ForgeRender {
         if (g_live.pDebugLineVB)            { removeResource(g_live.pDebugLineVB); }
         if (g_live.pDebugLinePipeline)      { removePipeline(R, g_live.pDebugLinePipeline); }
         if (g_live.pDebugLineShader)        { removeShader(R, g_live.pDebugLineShader); }
+        if (g_live.pShadowAtlasViewPipeline){ removePipeline(R, g_live.pShadowAtlasViewPipeline); }
+        if (g_live.pShadowAtlasViewShader)  { removeShader(R, g_live.pShadowAtlasViewShader); }
         if (g_live.pPerBatchSetAlpha)       { removeDescriptorSet(R, g_live.pPerBatchSetAlpha); }
         if (g_live.pAlphaWorldsBuf)         { removeResource(g_live.pAlphaWorldsBuf); }
         if (g_live.pAlphaInstanceBuf)       { removeResource(g_live.pAlphaInstanceBuf); }

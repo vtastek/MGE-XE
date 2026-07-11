@@ -1,0 +1,26 @@
+// mgeHost64 — shadow-atlas debug view (vertex stage).
+//
+// Fullscreen triangle (SV_VertexID, no vertex buffer) — the F12 mode-11/12 debug overlay that
+// blits the whole D32 shadow atlas (static or dynamic) onto the screen so static/dynamic/empty
+// tiles are directly visible. Shares opaque.srt.h / DefaultRootSignature with the frag (which
+// samples gShadowAtlas/gShadowAtlasDyn from the PerFrame set + reads gFrameData for the atlas
+// selector + per-slot active/dyn bitmasks). uv (0,0) = top-left so atlas row 0 sits at screen top.
+
+#include "opaque.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float2, Uv,       TEXCOORD0);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+VSOutput VS_MAIN( SV_VertexID(uint) VertexID )
+{
+    INIT_MAIN;
+    VSOutput Out;
+    float2 uv = float2((VertexID << 1) & 2, VertexID & 2);   // (0,0) (2,0) (0,2)
+    Out.Uv = uv;
+    Out.Position = float4(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f, 0.0f, 1.0f);
+    RETURN(Out);
+}

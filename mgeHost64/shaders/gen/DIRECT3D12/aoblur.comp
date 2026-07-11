@@ -958,7 +958,7 @@ SamplerState gSamplerAnisotropic : register( s10 , space100 ) ;
 #line 167 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 158 "FSL/shaders.list"
+#line 170 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aoblur.comp.fsl"
 #line 10 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aoblur.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/aoblur.srt.h"
@@ -1045,4 +1045,4 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     Write2D(gAODst, px, outAO);
     return;
 }
-#line 159 "FSL/shaders.list"
+#line 171 "FSL/shaders.list"

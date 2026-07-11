@@ -72,6 +72,10 @@ STRUCT(FrameData)
     // vertical gradient fogColNear(horizon) -> skyZenith(zenith), so the atmosphere dome no longer
     // needs its baked per-vertex gradient re-uploaded each frame. Only sky.frag reads it. 288B < 512B.
     DATA(float4, skyZenith, None);
+    // Shadow-atlas debug view (F12 mode 11/12): per-slot state bitmasks as REAL uints (asuint —
+    // float lanes drop bits >= 24). x = ACTIVE-slot mask (static atlas view), y = DYNAMIC-slot mask
+    // (dynamic atlas view). Only shadowatlasview.frag reads these; 0 elsewhere = every tile dim. 304B.
+    DATA(float4, atlasDbg, None);
 };
 
 STRUCT(BatchData)
@@ -120,6 +124,12 @@ BEGIN_SRT_NO_AB(SrtData)
         // opaque.frag's light loop when a light's falloff.w lane carries slot+1 (host-patched);
         // multimap.frag joins in P4. All other frags ignore it (harmless null tail elsewhere).
         DECL_TEXTURE(PerFrame, Tex2D(uint4), gShadowMask)
+        // Shadow-atlas debug view (F12 mode 11/12): the two D32 shadow atlases sampled read-only
+        // by shadowatlasview.frag. Appended AFTER gShadowMask so every existing PerFrame offset
+        // stays stable; only the debug-view frag references them (harmless null tail elsewhere —
+        // they are bound ONLY into the main pPerFrameSet, like the water/mask SRVs).
+        DECL_TEXTURE(PerFrame, Tex2D(float), gShadowAtlas)
+        DECL_TEXTURE(PerFrame, Tex2D(float), gShadowAtlasDyn)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has

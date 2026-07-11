@@ -1,0 +1,114 @@
+// mgeHost64 — shadow-atlas debug view (fragment stage).
+//
+// F12 mode 11 (static atlas) / mode 12 (dynamic atlas): map the screen pixel to an atlas pixel
+// (aspect-fit / letterboxed into 6144x4096), point-LOAD the selected D32 atlas (same access as the
+// shadowmask compute — NO_SAMPLER), and render depth as sqrt-greyscale. The atlas layout is fully
+// deterministic (mirror of the host shadowSlotBlock): from the atlas pixel we recover which slot's
+// 3x2 face block it lands in, then TINT by that slot's state — occupied = wash (green for static,
+// red for dynamic), empty = dim — plus a 1px block border. The per-slot active/dyn bitmasks ride
+// gFrameData.atlasDbg (real uints via asuint); the mode-11-vs-12 selector rides gFrameData.debugParams.x.
+//
+// This is a pure debug overlay: it OVERWRITES the composited scene, alpha = 1 (opaque). Reuses the
+// opaque.srt.h SrtData PerFrame set (gFrameData + the two atlas SRVs appended there) so it needs no
+// dedicated SRT/root-parameter frequency slot.
+
+#include "opaque.srt.h"
+
+#define ATLAS_W 6144.0f
+#define ATLAS_H 4096.0f
+
+STRUCT(VSOutput)
+{
+    DATA(float4, Position, SV_Position);
+    DATA(float2, Uv,       TEXCOORD0);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+
+    // Aspect-fit the 1.5:1 atlas into the screen (invScreen = debugParams.yz → aspect = y/z).
+    float screenAspect = gFrameData.debugParams.y / max(gFrameData.debugParams.z, 1e-6f);
+    float atlasAspect  = ATLAS_W / ATLAS_H;      // 1.5
+    float2 fit;
+    if (screenAspect > atlasAspect) { fit = float2(atlasAspect / screenAspect, 1.0f); }
+    else                           { fit = float2(1.0f, screenAspect / atlasAspect); }
+    float2 lo = 0.5f - 0.5f * fit;
+    float2 hi = 0.5f + 0.5f * fit;
+
+    // Letterbox bars.
+    if (In.Uv.x < lo.x || In.Uv.x > hi.x || In.Uv.y < lo.y || In.Uv.y > hi.y)
+    {
+        RETURN(float4(0.0f, 0.0f, 0.0f, 1.0f));
+    }
+
+    float2 auv = (In.Uv - lo) / fit;             // 0..1 across the atlas
+    int2   apx = int2(auv * float2(ATLAS_W, ATLAS_H));
+    apx = clamp(apx, int2(0, 0), int2((int)ATLAS_W - 1, (int)ATLAS_H - 1));
+
+    // Inverse of host shadowSlotBlock(): atlas pixel -> slot index + block origin/face size.
+    // Tier A (slots 0-7): 512px faces, 2 cols x 4 rows of 3x2 blocks filling x in [0,3072).
+    // Tier B (slots 8-31): 256px faces, 3 strips (stride 1024, 768 wide) x 8 rows. slot = -1 = gap.
+    int  slot;
+    int2 blockOrigin;
+    int  faceSize;
+    bool gap = false;
+    if (apx.x < 3072)
+    {
+        int col = apx.x / 1536;                  // 0..1  (block = 3*512 wide)
+        int row = apx.y / 1024;                  // 0..3  (block = 2*512 tall)
+        blockOrigin = int2(col * 1536, row * 1024);
+        faceSize = 512;
+        slot = row * 2 + col;
+    }
+    else
+    {
+        int localX   = apx.x - 3072;
+        int strip    = localX / 1024;            // 0..2  (stride 4*256)
+        int inStripX = localX - strip * 1024;
+        int row2     = apx.y / 512;              // 0..7  (block = 2*256 tall)
+        blockOrigin = int2(3072 + strip * 1024, row2 * 512);
+        faceSize = 256;
+        slot = 8 + strip * 8 + row2;
+        if (inStripX >= 768 || strip > 2) { gap = true; }   // 256px gap between strips
+    }
+
+    // Gap between tier-B strips: draw dim, no slot.
+    if (gap)
+    {
+        RETURN(float4(0.03f, 0.03f, 0.04f, 1.0f));
+    }
+
+    bool  isDyn = (gFrameData.debugParams.x > 11.5f);       // mode 12 = dynamic atlas
+    uint  bits  = isDyn ? asuint(gFrameData.atlasDbg.y) : asuint(gFrameData.atlasDbg.x);
+    bool  occupied = (bits & (1u << (uint)slot)) != 0u;
+
+    // 1px border around the slot's 3x2 face block.
+    int blockW = faceSize * 3;
+    int blockH = faceSize * 2;
+    bool border = (apx.x - blockOrigin.x < 1) || (blockOrigin.x + blockW - 1 - apx.x < 1)
+               || (apx.y - blockOrigin.y < 1) || (blockOrigin.y + blockH - 1 - apx.y < 1);
+
+    float3 col;
+    if (occupied)
+    {
+        float depth = isDyn ? LoadTex2D(gShadowAtlasDyn, NO_SAMPLER, apx, 0).r
+                            : LoadTex2D(gShadowAtlas,    NO_SAMPLER, apx, 0).r;
+        float g = sqrt(saturate(depth));         // reverse-Z: near caster bright, far dim
+        // Static view (mode 11): AMBER = tile re-rendered THIS frame (not cached), GREEN = cached.
+        // Dynamic view (mode 12): RED = mover tile re-rendered this frame (they never cache).
+        float3 wash;
+        if (isDyn) { wash = float3(1.0f, 0.35f, 0.35f); }
+        else {
+            bool reRendered = (asuint(gFrameData.atlasDbg.z) & (1u << (uint)slot)) != 0u;
+            wash = reRendered ? float3(1.0f, 0.65f, 0.1f) : float3(0.35f, 1.0f, 0.35f);
+        }
+        col = border ? wash : (g * wash + 0.04f * wash);
+    }
+    else
+    {
+        col = border ? float3(0.14f, 0.14f, 0.17f) : float3(0.045f, 0.045f, 0.055f);
+    }
+    RETURN(float4(col, 1.0f));
+}

@@ -1011,13 +1011,17 @@ STRUCT(FrameData)
 
 
     float4 skyZenith;
-#line 75
+
+
+
+    float4 atlasDbg;
+#line 79
 };
 
 STRUCT(BatchData)
 {
     float4x4 worlds[ 1024 ];
-#line 80
+#line 84
 };
 
 
@@ -1031,7 +1035,7 @@ STRUCT(LightData)
 {
     float4 lightParams;
     float4 lights[ 128  * 3];
-#line 93
+#line 97
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1064,8 +1068,14 @@ STRUCT(LightData)
 
 
 
+        Tex2D(float) gShadowAtlas :  register(t7,space1);
+        Tex2D(float) gShadowAtlasDyn :  register(t8,space1);
+
+
+
+
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 142 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 152 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 896 ] :  register(t0,space0);
 
 

@@ -136,6 +136,18 @@
 #include "debugline.frag.fsl"
 #end
 
+// Shadow-atlas debug view (F12 mode 11 static / 12 dynamic): fullscreen triangle that blits the
+// whole D32 shadow atlas, tinting tiles by per-slot active/dyn state. Reuses opaque.srt.h /
+// DefaultRootSignature (gFrameData + the two atlas SRVs appended to the PerFrame set). Graphics
+// shader → loads at host startup only (kill mgeHost64 to reload).
+#vert shadowatlasview.vert
+#include "shadowatlasview.vert.fsl"
+#end
+
+#frag shadowatlasview.frag
+#include "shadowatlasview.frag.fsl"
+#end
+
 // --- Tier 2 depth-takeover compute passes (ComputeRootSignature) ---
 // Linearize/resolve: two SAMPLE_COUNT variants; host picks by g_live.sampleCount at pipeline build.
 #comp linearizedepth_sc1.comp
