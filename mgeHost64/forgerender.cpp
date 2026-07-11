@@ -4639,9 +4639,12 @@ namespace {
                                         // the receiver sample along its depth-reconstructed normal, scaled by
                                         // grazing angle (PSO slope bias is 0). Tuned to 1.0; raise to kill any
                                         // residual grazing acne, lower to tighten contacts.
-    float g_shadowRangeK     = 1.5f;    // SHADOW TEST RANGE in light radii (live via maskParams.x). The mask
+    float g_shadowRangeK     = 1.1f;    // SHADOW TEST RANGE in light radii (live via maskParams.x). The mask
                                         // tests (and dynHit catches movers) out to rangeK*r; the attenuation
                                         // ramp is ~0.5 at 1.5r so a fade band in the shader hides the cut.
+                                        // 1.1 default: user-verified clean cut point — the fade band's smooth
+                                        // gradient bands badly under the 4-bit mask nibble (16 levels), and at
+                                        // 1.1 attenuation (~0.85 of ramp remaining) hides the boundary anyway.
                                         // Covered area scales with rangeK^2 — the main mask-cost knob in
                                         // light-dense interiors. 2.0 = old behaviour (test to atlas far
                                         // plane); refZ mapping stays farZ=2r regardless.
