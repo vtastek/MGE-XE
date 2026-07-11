@@ -113,19 +113,69 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         // regardless of range.
         float rangeK    = gShadowMaskParams.maskParams.x;
         uint  rangeBits = 0u;
+        uint  nInRange  = 0u;
         for (uint rs = 0u; rs < (uint)MAX_SHADOW_SLOTS; ++rs)
         {
             if ((activeBits & (1u << rs)) == 0u) { continue; }
             float4 pr  = gShadowMaskParams.slotPosRad[rs];
             float3 adr = abs(P - pr.xyz);
             float  mar = max(adr.x, max(adr.y, adr.z));
-            if (mar < rangeK * pr.w) { rangeBits |= (1u << rs); }
+            if (mar < rangeK * pr.w) { rangeBits |= (1u << rs); ++nInRange; }
         }
         if (dbg != 0u) { rangeBits = activeBits; }
         if (rangeBits == 0u)
         {
             Write2D(gShadowMaskOut, px, mask);
             RETURN();
+        }
+
+        // Per-pixel K-STRONGEST cap: the PCF loop below is the pass's cost (~96%), and it
+        // pays per in-range slot — a 16-slot tavern pixel costs 2x an 8-slot one. Cap the
+        // slots any one pixel evaluates at SHADOW_MAX_SLOTS_PER_PIXEL, keeping the STRONGEST
+        // by smallest normalized Chebyshev fraction f = dist/(rangeK*r) (per-pixel proximity,
+        // not the manager's global rank — the light whose range you're deepest inside wins).
+        // Array-free selection by BUCKET HISTOGRAM (an exact K-pass insertion-select measured
+        // 0.3-0.7ms SLOWER than no cap — 8x32 iterations/pixel drowned the savings): quantize
+        // f into 8 buckets packed 8-bit in a uint2, find the bucket where the cumulative
+        // count crosses K, keep slots strictly below it plus enough of the crossing bucket to
+        // fill K exactly (ties fill in slot order = the manager's importance order). Two more
+        // 32-iteration loops of the same shape as the range cull (~0.02ms each), engaging
+        // only on pixels where MORE than K slots overlap. Kept count is exactly K — the hard
+        // scene-independent per-pixel ceiling; rollback = raise K to 32. Debug modes bypass
+        // (dbg forces rangeBits = activeBits above, same as they bypass the range cull).
+        #define SHADOW_MAX_SLOTS_PER_PIXEL 8u
+        if (nInRange > SHADOW_MAX_SLOTS_PER_PIXEL && dbg == 0u)
+        {
+            uint2 hist = uint2(0u, 0u);   // 8 buckets x 8 bits
+            for (uint hs = 0u; hs < (uint)MAX_SHADOW_SLOTS; ++hs)
+            {
+                if ((rangeBits & (1u << hs)) == 0u) { continue; }
+                float4 pr = gShadowMaskParams.slotPosRad[hs];
+                float3 ad = abs(P - pr.xyz);
+                float  f  = max(ad.x, max(ad.y, ad.z)) / (rangeK * pr.w);
+                uint   fb = min(7u, (uint)(f * 8.0f));
+                if (fb < 4u) { hist.x += 1u << (fb * 8u); }
+                else         { hist.y += 1u << ((fb - 4u) * 8u); }
+            }
+            uint cut = 7u; uint budget = SHADOW_MAX_SLOTS_PER_PIXEL;
+            for (uint hb = 0u; hb < 8u; ++hb)
+            {
+                uint c = ((hb < 4u) ? (hist.x >> (hb * 8u)) : (hist.y >> ((hb - 4u) * 8u))) & 0xFFu;
+                if (c >= budget) { cut = hb; break; }
+                budget -= c;
+            }
+            uint keep = 0u;
+            for (uint ks = 0u; ks < (uint)MAX_SHADOW_SLOTS; ++ks)
+            {
+                if ((rangeBits & (1u << ks)) == 0u) { continue; }
+                float4 pr = gShadowMaskParams.slotPosRad[ks];
+                float3 ad = abs(P - pr.xyz);
+                float  f  = max(ad.x, max(ad.y, ad.z)) / (rangeK * pr.w);
+                uint   fb = min(7u, (uint)(f * 8.0f));
+                if (fb < cut) { keep |= 1u << ks; }
+                else if (fb == cut && budget > 0u) { keep |= 1u << ks; --budget; }
+            }
+            rangeBits = keep;
         }
 
         // Reconstruct the receiver surface normal from neighbouring depth, silhouette-robust:
