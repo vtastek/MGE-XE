@@ -5992,7 +5992,10 @@ namespace ForgeRender {
                     const float lrx = sl.absPos[0] - g_eyeAbsShadow[0];
                     const float lry = sl.absPos[1] - g_eyeAbsShadow[1];
                     const float lrz = sl.absPos[2] - g_eyeAbsShadow[2];
-                    const float reach = 2.0f * sl.radius;
+                    // Mover-catch reach = the mask TEST range (a caster can only shadow a
+                    // TESTED receiver), not the 2r atlas far plane — idle movers past the
+                    // test range no longer dyn-flag the slot (2x-load taps in the mask).
+                    const float reach = g_shadowRangeK * sl.radius;
                     for (const SkinnedCaster& sc : g_skinnedCasters) {
                         const float dx = sc.cRel[0] - lrx, dy = sc.cRel[1] - lry, dz = sc.cRel[2] - lrz;
                         const float rr = reach + sc.rad;
@@ -6006,7 +6009,7 @@ namespace ForgeRender {
                     const float lrx = sl.absPos[0] - g_eyeAbsShadow[0];
                     const float lry = sl.absPos[1] - g_eyeAbsShadow[1];
                     const float lrz = sl.absPos[2] - g_eyeAbsShadow[2];
-                    const float reach = 2.0f * sl.radius;
+                    const float reach = g_shadowRangeK * sl.radius;   // = mask test range (see above)
                     for (const MMCaster& mc : g_mmCasters) {
                         const float dx = mc.cRel[0] - lrx, dy = mc.cRel[1] - lry, dz = mc.cRel[2] - lrz;
                         const float rr = reach + mc.rad;
@@ -6020,7 +6023,7 @@ namespace ForgeRender {
                     const float lrx = sl.absPos[0] - g_eyeAbsShadow[0];
                     const float lry = sl.absPos[1] - g_eyeAbsShadow[1];
                     const float lrz = sl.absPos[2] - g_eyeAbsShadow[2];
-                    const float reach = 2.0f * sl.radius;
+                    const float reach = g_shadowRangeK * sl.radius;   // = mask test range (see above)
                     for (const DynMoverCaster& dm : g_dynMoverCasters) {
                         const float dx = dm.cRel[0] - lrx, dy = dm.cRel[1] - lry, dz = dm.cRel[2] - lrz;
                         const float rr = reach + dm.rad;
