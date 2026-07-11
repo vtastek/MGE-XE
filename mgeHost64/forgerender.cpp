@@ -4639,6 +4639,12 @@ namespace {
                                         // the receiver sample along its depth-reconstructed normal, scaled by
                                         // grazing angle (PSO slope bias is 0). Tuned to 1.0; raise to kill any
                                         // residual grazing acne, lower to tighten contacts.
+    float g_shadowRangeK     = 1.5f;    // SHADOW TEST RANGE in light radii (live via maskParams.x). The mask
+                                        // tests (and dynHit catches movers) out to rangeK*r; the attenuation
+                                        // ramp is ~0.5 at 1.5r so a fade band in the shader hides the cut.
+                                        // Covered area scales with rangeK^2 — the main mask-cost knob in
+                                        // light-dense interiors. 2.0 = old behaviour (test to atlas far
+                                        // plane); refZ mapping stays farZ=2r regardless.
     float g_shadowVertWeight = 3.0f;    // VERTICAL importance weighting for slot ranking. The importance
                                         // metric weights the light's vertical offset from the eye (world Z,
                                         // camera-relative) by this factor before ranking. >1 demotes lights on
@@ -4865,6 +4871,8 @@ namespace {
         uiAddComponentWidget(g_uiPanel, "Shadow contact bias (negative = close gap)", &sShB, WIDGET_TYPE_SLIDER_FLOAT);
         SliderFloatWidget sShNo = {}; sShNo.pData = &g_shadowNormalOffset; sShNo.mMin = 0.0f; sShNo.mMax = 8.0f; sShNo.mStep = 0.25f;
         uiAddComponentWidget(g_uiPanel, "Shadow normal offset (kills grazing acne)", &sShNo, WIDGET_TYPE_SLIDER_FLOAT);
+        SliderFloatWidget sShRk = {}; sShRk.pData = &g_shadowRangeK; sShRk.mMin = 0.5f; sShRk.mMax = 2.0f; sShRk.mStep = 0.05f;
+        uiAddComponentWidget(g_uiPanel, "Shadow test range (radii; 2.0 = full)", &sShRk, WIDGET_TYPE_SLIDER_FLOAT);
         static const char* const kCasterCullNames[] = { "0 back (light faces)", "1 none (two-sided)", "2 front (back faces)" };
         DropdownWidget ddCc = {}; ddCc.pData = &g_shadowCasterCull; ddCc.pNames = kCasterCullNames; ddCc.mCount = 3;
         uiAddComponentWidget(g_uiPanel, "Shadow caster cull", &ddCc, WIDGET_TYPE_DROPDOWN);
@@ -6181,8 +6189,7 @@ namespace ForgeRender {
                 mp[152 + s * 4 + 2] = (float)bs; mp[152 + s * 4 + 3] = 1.0f;
                 lc[4 + sl.curLightIdx * 12 + 11] = (float)(s + 1);      // falloff.w = slot+1
             }
-            mp[20] = 0.0f;                        // maskParams.x UNUSED (activeBits moved to slotBits.x —
-                                                  // a float lane silently drops bits >= 24 at 32 slots)
+            mp[20] = g_shadowRangeK;              // maskParams.x = shadow test range in radii (live knob)
             mp[21] = kShadowNearZ;                // maskParams.y = face near plane
             mp[22] = g_shadowSlack;               // maskParams.z = compare slack (live knob)
             mp[23] = g_shadowAtlasDebug ? 2.0f : (g_shadowFaceDebug ? 1.0f : 0.0f);
