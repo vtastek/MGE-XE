@@ -2712,14 +2712,17 @@ namespace RenderProcess {
                 // Tier 2 GTAO added 3 (AO) + 4 (bent normal); dev panel added 5 (albedo) 6 (lit)
                 // 7 (ambient) shading-isolation views; 8 (world normal) 9 (point-light count);
                 // P1 shadows added 10 (shadow mask — the host panel's face-id/atlas checkboxes
-                // pick what it displays) — cycle is now %11.
-                g_debugMode = (g_debugMode + 1) % 11;
+                // pick what it displays); shadow observability added 11 (shadow-atlas static) +
+                // 12 (shadow-atlas dynamic) fullscreen atlas blits — cycle is now %13.
+                g_debugMode = (g_debugMode + 1) % 13;
                 const char* name = (g_debugMode == 1) ? "DEPTH" : (g_debugMode == 2) ? "SCATTER"
                                  : (g_debugMode == 3) ? "AO" : (g_debugMode == 4) ? "BENT NORMAL"
                                  : (g_debugMode == 5) ? "ALBEDO" : (g_debugMode == 6) ? "LIT"
                                  : (g_debugMode == 7) ? "AMBIENT" : (g_debugMode == 8) ? "WORLD NORMAL"
                                  : (g_debugMode == 9) ? "LIGHT COUNT"
-                                 : (g_debugMode == 10) ? "SHADOW MASK" : "NORMAL";
+                                 : (g_debugMode == 10) ? "SHADOW MASK"
+                                 : (g_debugMode == 11) ? "SHADOW ATLAS (STATIC)"
+                                 : (g_debugMode == 12) ? "SHADOW ATLAS (DYN)" : "NORMAL";
                 LOG::logline(">> [seam] debug mode %d (%s)", g_debugMode, name);
             }
             // F9 toggles the in-host dev overlay.
