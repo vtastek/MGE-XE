@@ -102,6 +102,23 @@ namespace ForgeRender {
     // CLIENT-sorted back-to-front); alphaCount items, alphaBytes total. Drawn AFTER water with
     // depth GEQUAL test + no write, per-draw blend PSO from the captured (src,dst) pair. May be
     // null / 0 (Forge Alpha Pass off → MW draws its own sorted alpha).
+    // FP1a: the per-frame first-person bundle — the arms/weapon lists MW renders in its
+    // own post-z-clear scene, with the ARM camera's viewProj (client-built, same
+    // camera-relative convention as the main viewProj; the host applies the same
+    // reverse-Z + half-pixel fixups). drawBlob = DrawItemWire[] (rigid parts),
+    // skinnedBlob = [SkinnedDrawWire][palette]*. Drawn by the dedicated FP pass after
+    // sorted-alpha: fresh reverse-Z depth clear, world screen-space AO/shadow masks
+    // neutralized. Null ⇒ no FP pass this frame.
+    struct FPScene {
+        const float* viewProj = nullptr;      // 16 floats
+        const void*  drawBlob = nullptr;
+        unsigned     drawCount = 0;
+        unsigned     drawBytes = 0;
+        const void*  skinnedBlob = nullptr;
+        unsigned     skinnedCount = 0;
+        unsigned     skinnedBytes = 0;
+    };
+
     bool renderScene(const float* viewProj, const float* lighting, const void* drawBlob,
                      unsigned drawCount, unsigned drawBytes,
                      const void* skinnedBlob, unsigned skinnedCount, unsigned skinnedBytes,
@@ -115,7 +132,9 @@ namespace ForgeRender {
                      const void* capturedAlphaBlob = nullptr, unsigned capturedVertBytes = 0, unsigned capturedIdxBytes = 0,
                      // WT1: per-frame water params (12 floats; see bridge.h RenderFrameParameters)
                      // + the F7 water-enable gate. Null/0 ⇒ no Forge water pass this frame.
-                     const float* waterParams = nullptr, unsigned waterEnabled = 0);
+                     const float* waterParams = nullptr, unsigned waterEnabled = 0,
+                     // FP1a: first-person bundle (see FPScene above). Null ⇒ no FP pass.
+                     const FPScene* fp = nullptr);
 
     // F12 debug view: 0 = normal, 1 = depth (world-distance grayscale), 2 = scatter (client-side).
     // Stored in a host global and written into FrameData.debugParams.x each renderScene.

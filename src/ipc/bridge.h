@@ -281,6 +281,22 @@ namespace IPC {
         std::uint32_t reloadShaders = 0;   // one-shot (F8 edge): host rebuilds compute pipelines from disk
     };
 
+    // FP1a: the per-frame first-person bundle handed to renderSceneKickoff as ONE optional
+    // pointer (nullptr ⇒ fpEnabled=0, no FP pass) instead of another 10 positional args.
+    // Field meanings match the fp* wire fields in RenderFrameParameters below.
+    struct FPFrame {
+        float viewProj[16] = {};
+        VecId drawList = InvalidVector;
+        std::uint32_t drawCount = 0;
+        std::uint32_t drawBytes = 0;
+        VecId skinnedList = InvalidVector;
+        std::uint32_t skinnedCount = 0;
+        std::uint32_t skinnedBytes = 0;
+        VecId alphaList = InvalidVector;      // FP1c
+        std::uint32_t alphaCount = 0;
+        std::uint32_t alphaBytes = 0;
+    };
+
     struct RenderFrameParameters {
         IN std::uint32_t frameIndex;     // for logging
         IN std::uint32_t targetIndex;    // which shared buffer to render into (double-buffer, C)
@@ -375,6 +391,28 @@ namespace IPC {
         IN VecId capturedAlpha;
         IN std::uint32_t capturedVertBytes;
         IN std::uint32_t capturedIdxBytes;
+
+        // FP1a first-person takeover: the arms/weapon draw lists MW renders in its own
+        // post-z-clear scene, shipped with the ARM camera's own viewProj (same D3DXMATRIX
+        // bytes + camera-relative convention as viewProj above; the host applies the same
+        // reverse-Z + half-pixel fixups). fpDrawList = DrawItemWire[] (rigid parts),
+        // fpSkinnedList = [SkinnedDrawWire][palette]* — both the exact main-pass wire
+        // formats, drawn by the host's dedicated FP pass (fresh depth clear, world
+        // screen-space AO/shadow masks neutralized). fpAlphaList = AlphaDrawWire[]
+        // reserved for FP1c (torch flame / enchant glow); count 0 until then.
+        // fpEnabled == 0 ⇒ no FP pass this frame (all lists ignored). Appended after the
+        // captured-alpha fields so every existing IN field offset is unchanged.
+        IN float fpViewProj[16];
+        IN VecId fpDrawList;
+        IN std::uint32_t fpDrawCount;
+        IN std::uint32_t fpDrawBytes;
+        IN VecId fpSkinnedList;
+        IN std::uint32_t fpSkinnedCount;
+        IN std::uint32_t fpSkinnedBytes;
+        IN VecId fpAlphaList;
+        IN std::uint32_t fpAlphaCount;
+        IN std::uint32_t fpAlphaBytes;
+        IN std::uint32_t fpEnabled;
 
         OUT std::uint32_t bytesWritten;
         OUT double renderMs;             // host-side render+readback time

@@ -17,6 +17,7 @@
 #include "configuration.h"
 #include "datahandler_view.h"
 #include "mge_tracy.h"
+#include "mwbridge.h"
 #include "proxydx/d3d8texture.h"
 #include "proxydx/devicelock.h"
 #include "scenegraph_geometry_cache.h"
@@ -48,6 +49,12 @@ namespace MGE::GeometryCache {
         // (CachedGeometry::isSky) and forces a per-frame re-upload — the dome's vertex-colour
         // gradient changes every frame (sun angle / weather) without bumping revisionID.
         bool              g_walkingSky = false;
+        // Set while walking the WorldController armCamera root (FP1a first-person
+        // takeover) so visitGeometry tags entries (CachedGeometry::isFP). The FP walk
+        // is exempt from the active-cell gate (the arm subtree rides the camera) and
+        // bypasses the ROOT's own app-cull flag (FP1b forces it culled to suppress
+        // MW's own arm draws while the capture must keep running).
+        bool              g_walkingFP = false;
         // SK2: monotonic counter assigned to each isSky entry's skyOrder during the skyRoot
         // walk (reset to 0 at the start of each sky walk). Encodes back-to-front subtree order
         // so the Forge sky pass can sort its alpha-blended draws (dome → stars → sun → moons).
@@ -867,6 +874,7 @@ namespace MGE::GeometryCache {
                 e.isLive = !g_walkingSky && !g_walkingLandscape
                         && (inCharacter || referenceIsLiveType(geom));
                 e.isSky = g_walkingSky;
+                e.isFP = g_walkingFP;
                 if (g_walkingSky) e.skyOrder = g_skyVisitCounter++;  // SK2 back-to-front key
                 e.mirrored = computeMirrored(e);                    // winding flip for depth/shadow
             } else {
@@ -875,6 +883,7 @@ namespace MGE::GeometryCache {
                 e.isLandscape = g_walkingLandscape;
                 e.isPickRoot = g_walkingPick;
                 e.isSky = g_walkingSky;
+                e.isFP = g_walkingFP;
                 if (g_walkingSky) e.skyOrder = g_skyVisitCounter++;  // SK2 back-to-front key
                 bool transformChanged = true;   // skinned/inCharacter paths always re-derive
                 if (sk) {
@@ -991,7 +1000,7 @@ namespace MGE::GeometryCache {
             // half worth trimming). Distance-only (not frustum) so panning never
             // churns capture. The sky walk is exempt — sky shapes ride orbit
             // transforms unrelated to eye distance.
-            if (g_gateThisFrame && !g_walkingSky) {
+            if (g_gateThisFrame && !g_walkingSky && !g_walkingFP) {
                 const float dx = av->worldBoundOrigin.x - g_gateEye[0];
                 const float dy = av->worldBoundOrigin.y - g_gateEye[1];
                 const float dz = av->worldBoundOrigin.z - g_gateEye[2];
@@ -1496,6 +1505,30 @@ namespace MGE::GeometryCache {
             driveHeadMorphs();
         }
 
+        // FP0: in 1st person the engine appCulls the player's 3rd-person body, but the
+        // offscreen shadow-caster re-emit loop (renderprocess) sweeps the whole cache
+        // with no appCulled knowledge and the body sits at the camera — well inside its
+        // radius — so it kept rendering until the eviction sweep (~30 frames) after a
+        // 3rd→1st switch. Stamp the body subtree suppressed EVERY 1st-person frame (the
+        // stamp is per-frame); the re-emit loop skips stamped entries. Derefs only the
+        // live node fetched from the engine this frame (never cached keys).
+        if (RenderProcess::ownsOpaqueWorld()) {
+            auto* mwBridge = MWBridge::get();
+            static bool s_was3rd = true;
+            const bool is3rd = mwBridge->is3rdPerson();
+            if (!is3rd) {
+                const uint32_t stamped =
+                    markSubtreeSuppressed(mwBridge->getPlayer3rdPersonNode());
+                if (s_was3rd) {
+                    LOG::logline("[fp0] POV switch -> 1st person (frame %llu): stamped %u body entries suppressed",
+                                 (unsigned long long)g_frame, stamped);
+                }
+            } else if (!s_was3rd) {
+                LOG::logline("[fp0] POV switch -> 3rd person (frame %llu)", (unsigned long long)g_frame);
+            }
+            s_was3rd = is3rd;
+        }
+
         // W3 live-read: on Forge-owned frames the refresh walk is dead work — the
         // classify-visible keys are freshened one-by-one off their live NiTriShapes
         // in buildFrustumVisibleSet (ensureLive), and a frame with no classify pulls
@@ -1516,6 +1549,36 @@ namespace MGE::GeometryCache {
             g_walkingSky = false;
         }
         const double tSky = gcNowMs();
+
+        // FP1a first-person takeover: walk the WorldController armCamera root (the arms/
+        // weapon subtree MW renders in its own post-z-clear scene). inCharacter=true — the
+        // whole subtree is the player's skinned body; bypassCull=true on the ROOT only,
+        // because FP1b force-culls that root to suppress MW's own arm draws while this
+        // capture must keep running (children keep their engine cull state, which selects
+        // the sheathed/drawn weapon variants etc.). Exempt from the active-cell gate
+        // (see walk()) — the arm subtree rides the camera, not the world grid.
+        if (RenderProcess::wantsFPCapture()) {
+            MGE_ZoneScopedN("GeomCache:walkFP");
+            g_walkingFP = true;
+            walk(MWBridge::get()->getArmCameraRoot(), /*inCharacter*/true, /*bypassCull*/true);
+            g_walkingFP = false;
+        }
+
+        // FP1b: while the host FP pass owns the arms, force MW's arm-scene ROOT appCulled
+        // so the engine's own first-person draws no-op (no double image). Applied every
+        // frame — the engine re-asserts its own cull state on POV/weapon changes — and
+        // restored ONCE on any gate release (F11 off / 3rd person / ini off / host dead).
+        // The FP walk above bypasses this root flag, so capture keeps running.
+        {
+            static bool s_fpForcedCull = false;
+            const bool want = RenderProcess::wantsFPSuppression();
+            if (want || s_fpForcedCull) {
+                if (NI::Node* armRoot = MWBridge::get()->getArmCameraRoot()) {
+                    armRoot->setAppCulled(want);
+                }
+                s_fpForcedCull = want;
+            }
+        }
 
         // SK0 (sky takeover, diagnostic): periodically dump the skyRoot subtree so we can
         // confirm the shapes/materials the real walk will capture. No capture, no draw.
@@ -1766,6 +1829,34 @@ namespace MGE::GeometryCache {
         if (g_walkRanFrame == g_frame) return;
         if (!g_device || !g_objRoot) return;
         runRefreshWalks();
+    }
+
+    // FP0: recursive stamp over a live subtree, deliberately IGNORING appCulled (the
+    // caller marks a subtree the engine just culled). Stamps only entries that already
+    // exist in the cache — no capture, no NI data derefs beyond the child arrays.
+    static uint32_t stampSuppressed(NI::AVObject* av) {
+        if (!av) return 0;
+        if (av->isInstanceOfType(NI::RTTIStaticPtr::NiTriBasedGeom)) {
+            auto it = g_cache.find(reinterpret_cast<uint32_t>(av));
+            if (it != g_cache.end()) {
+                it->second.suppressedFrame = g_frame;
+                return 1;
+            }
+            return 0;
+        }
+        uint32_t n = 0;
+        if (av->isInstanceOfType(NI::RTTIStaticPtr::NiNode)) {
+            auto* node = static_cast<NI::Node*>(av);
+            const auto count = node->children.getEndIndex();
+            for (size_t i = 0; i < count; ++i) {
+                n += stampSuppressed(node->children.at(i).get());
+            }
+        }
+        return n;
+    }
+
+    uint32_t markSubtreeSuppressed(void* avObject) {
+        return stampSuppressed(static_cast<NI::AVObject*>(avObject));
     }
 
     int buildMoonDrawList(void* moonRoot, MoonShapeDraw out[2]) {

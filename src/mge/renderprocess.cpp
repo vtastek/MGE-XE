@@ -46,6 +46,7 @@ namespace {
     bool   g_devUiVisible = false;     // F9; default off so it never blocks normal play
     HWND   g_devHwnd = nullptr;        // MW focus window (cached from device creation params)
     bool   g_reloadShadersPending = false; // F8 latched at composite finish, consumed by the next kickoff
+    bool   g_fpSuppressLive = false;   // FP1b: MW arm suppression; seeded from ForgeFPSuppress at init, numpad-/ flips live
 
     // --- Feeding-side spike logging --------------------------------------------------
     // Periodic FPS dips are suspected to come from the client feed (geometry/texture
@@ -121,6 +122,8 @@ namespace {
     std::optional<IPC::VecView<IPC::GeomChunk>> g_lightVec;         // persistent per-frame point-light vec (Tier 3a)
     std::optional<IPC::VecView<IPC::GeomChunk>> g_skyVec;           // persistent per-frame sky draw-list vec (SK1)
     std::optional<IPC::VecView<IPC::GeomChunk>> g_alphaVec;         // persistent per-frame sorted-alpha draw-list vec (AT1)
+    std::optional<IPC::VecView<IPC::GeomChunk>> g_fpDrawVec;        // persistent per-frame FP rigid draw-list vec (FP1a)
+    std::optional<IPC::VecView<IPC::GeomChunk>> g_fpSkinnedVec;     // persistent per-frame FP skinned draw-list vec (FP1a)
     std::vector<std::uint8_t>                 g_pendingBlob;        // packed parts awaiting flush
     std::uint32_t                             g_pendingParts = 0;
     // Cache key -> host slot, plus per-key cached bindless texture slots so the
@@ -154,6 +157,8 @@ namespace {
     std::uint32_t                             g_nextSlot = 0;
     std::vector<std::uint8_t>                 g_drawScratch;        // packed DrawItemWire[] this frame
     std::vector<std::uint8_t>                 g_skinnedScratch;     // packed [SkinnedDrawWire][palette]* this frame
+    std::vector<std::uint8_t>                 g_fpDrawScratch;      // packed FP rigid DrawItemWire[] this frame (FP1a)
+    std::vector<std::uint8_t>                 g_fpSkinnedScratch;   // packed FP [SkinnedDrawWire][palette]* this frame (FP1a)
     std::vector<std::uint8_t>                 g_multiMapScratch;    // packed MultiMapDrawWire[] this frame (Tier 4)
     std::vector<std::uint8_t>                 g_lightScratch;       // packed PointLightWire[] this frame
 
@@ -761,6 +766,22 @@ namespace {
             g_alphaVec.emplace(std::move(*av));
         }
 
+        // FP draw lists (FP1a) ride two 1-chunk vecs — the arm scene is ~10-30 parts:
+        // rigid DrawItemWire[] a few KB; skinned [SkinnedDrawWire][palette]* bounded far
+        // under the main skinned list (same wire formats, drawn by the host FP pass).
+        auto fdv = g_client->allocVecBlocking<IPC::GeomChunk>(1, 1, 1);
+        if (!fdv) {
+            LOG::logline("!! [seam] FP draw-list vec alloc failed — Forge FP pass (FP1a) disabled");
+        } else {
+            g_fpDrawVec.emplace(std::move(*fdv));
+        }
+        auto fsv = g_client->allocVecBlocking<IPC::GeomChunk>(1, 1, 1);
+        if (!fsv) {
+            LOG::logline("!! [seam] FP skinned draw-list vec alloc failed — Forge FP pass (FP1a) disabled");
+        } else {
+            g_fpSkinnedVec.emplace(std::move(*fsv));
+        }
+
         // AT3 captured-alpha geometry vec: one 1-chunk (1MB) vec carrying [captured verts][captured
         // indices] — 20000 verts (720KB) + 60000 uint16 (120KB) = 840KB fits one chunk (see
         // kMaxCapturedAlpha* in geomwire.h). A 1-chunk vec sidesteps the IPC uint32-reservation hazard.
@@ -1125,8 +1146,10 @@ namespace {
                      det, det < 0.0f ? "MIRRORED" : "normal");
     }
 
+    // FP1a: `dst` defaults to the main-pass scratch; buildFPDrawLists redirects the
+    // identical packing into the FP scratch (same wire format, different host pass).
     void emitStaticDraw(SlotInfo& si, const MGE::GeometryCache::CachedGeometry& e,
-                        std::uint32_t& count) {
+                        std::uint32_t& count, std::vector<std::uint8_t>& dst = g_drawScratch) {
             IPC::DrawItemWire item;
             item.slot = si.slot;
             diagWorldDet("STATIC", e.textureName, e.worldTransformD3D);
@@ -1177,9 +1200,9 @@ namespace {
                 item.world[13] += axis(10);
                 item.world[14] += axis(20);
             }
-            const std::size_t at = g_drawScratch.size();
-            g_drawScratch.resize(at + sizeof(item));
-            memcpy(g_drawScratch.data() + at, &item, sizeof(item));
+            const std::size_t at = dst.size();
+            dst.resize(at + sizeof(item));
+            memcpy(dst.data() + at, &item, sizeof(item));
             ++count;
     }
 
@@ -1189,7 +1212,7 @@ namespace {
     // There is no per-draw world transform — the bone palette (read fresh from the
     // cache entry each frame, that IS the animation) is world-space.
     void emitSkinnedDraw(SlotInfo& si, const MGE::GeometryCache::CachedGeometry& e,
-                         std::uint32_t& count) {
+                         std::uint32_t& count, std::vector<std::uint8_t>& dst = g_skinnedScratch) {
             // Only GPU-skinnable parts: a built skinned VB, bones within the palette cap,
             // and a current bone palette of the expected size.
             if (e.skinnedUnsupported || e.numBones == 0) {
@@ -1207,16 +1230,16 @@ namespace {
             item.alphaRef = e.alphaTest ? e.alphaRef : 0.0f;     // alpha-test cutout (0 = no test)
 
             const std::size_t paletteBytes = (std::size_t)e.numBones * 64;  // numBones * 16 floats
-            const std::size_t at = g_skinnedScratch.size();
-            g_skinnedScratch.resize(at + sizeof(item) + paletteBytes);
-            std::uint8_t* dst = g_skinnedScratch.data() + at;
-            memcpy(dst, &item, sizeof(item));                  dst += sizeof(item);
-            memcpy(dst, e.bonePalette.data(), paletteBytes);
+            const std::size_t at = dst.size();
+            dst.resize(at + sizeof(item) + paletteBytes);
+            std::uint8_t* out = dst.data() + at;
+            memcpy(out, &item, sizeof(item));                  out += sizeof(item);
+            memcpy(out, e.bonePalette.data(), paletteBytes);
             // CAMERA-RELATIVE: the bone palette is world-space; shift each bone matrix's
             // translation by -eye so the skinned vertices land near the origin, consistent
             // with the translation-free viewProj + shifted lights (see buildDrawList).
             {
-                float* pal = reinterpret_cast<float*>(dst);
+                float* pal = reinterpret_cast<float*>(out);
                 for (std::uint32_t b = 0; b < e.numBones; ++b) {
                     pal[b * 16 + 12] -= DistantLand::eyePos.x;
                     pal[b * 16 + 13] -= DistantLand::eyePos.y;
@@ -1440,6 +1463,7 @@ namespace {
         // slot is mutable — the emit helpers update its cached texture SlotInfo.
         auto dispatch = [&](auto& slot, const auto& e) {
             if (e.isSky) return;   // sky rides the Forge alpha-blend sky pass (buildSkyDrawList)
+            if (e.isFP) return;    // FP arms ride the dedicated host FP pass (buildFPDrawLists)
             if (e.isSkinned) {
                 if (wantSkinned) emitSkinnedDraw(slot, e, skinnedCount);
                 return;
@@ -1534,10 +1558,18 @@ namespace {
             if (foldKeys) { for (std::uint32_t k : *foldKeys) s_visLookup.insert(k); }
             else          { for (std::uint32_t k : keys)      s_visLookup.insert(k); }
             const float r2 = kShadowCasterRadius * kShadowCasterRadius;
+            const std::uint64_t cacheFrame = MGE::GeometryCache::currentFrame();
+            std::uint32_t suppressSkips = 0;
             for (const auto& kv : cacheMap) {
                 const auto& e = kv.second;
                 if (s_visLookup.count(kv.first)) continue;  // in the visible set → already emitted above
                 if (e.isSky) continue;
+                if (e.isFP) continue;   // FP arms: dedicated host FP pass, never a world caster (FP1a)
+                // FP0: entries the engine appCulled this frame (the 1st-person player's
+                // 3rd-person body — at the camera, so always inside the radius below).
+                // Without this the freshly-culled body kept re-emitting into the colour
+                // lists until the eviction sweep (the 3rd→1st POV-switch linger).
+                if (e.suppressedFrame == cacheFrame) { ++suppressSkips; continue; }
                 const bool isMM = !e.isLandscape && !e.blendEnable && e.d3dTexture
                                   && (e.d3dDark || e.d3dDetail || e.d3dGlow);
                 if (e.isSkinned) {
@@ -1577,6 +1609,19 @@ namespace {
                 if (e.isSkinned)    emitSkinnedDraw(ks->second, e, skinnedCount);
                 else if (isMM)      emitMultiMapDraw(ks->second, e, multiMapCount);
                 else                emitStaticDraw(ks->second, e, drawCount);
+            }
+            // FP0 instrumentation: each skipped frame is a frame the body WOULD have
+            // lingered pre-fix. A run ends when the re-emit condition stops matching
+            // (eviction / visible again) — its length is the exact pre-fix linger.
+            static std::uint32_t s_supRunFrames = 0, s_supRunMax = 0;
+            if (suppressSkips > 0) {
+                ++s_supRunFrames;
+                if (suppressSkips > s_supRunMax) s_supRunMax = suppressSkips;
+            } else if (s_supRunFrames > 0) {
+                LOG::logline("[fp0] re-emit suppression run ended: %u frames (pre-fix linger), max %u draws/frame",
+                             s_supRunFrames, s_supRunMax);
+                s_supRunFrames = 0;
+                s_supRunMax = 0;
             }
         }
 
@@ -1959,6 +2004,231 @@ namespace {
         }
         return count;
     }
+
+    // ---- FP1a first-person takeover --------------------------------------------------
+
+    // Build a D3D row-major VIEW matrix the way MW's DX8 renderer derives it from a
+    // NiCamera basis (D3D camera space: X=right, Y=up, Z=forward — the LookAtLH form),
+    // with the camera position already made RELATIVE by the caller (camera-relative
+    // pipeline: the emit helpers shift all world translations by -DistantLand::eyePos).
+    void buildNiCameraView(const float dir[3], const float up[3], const float right[3],
+                           const float eye[3], D3DXMATRIX* m) {
+        m->_11 = right[0]; m->_12 = up[0]; m->_13 = dir[0]; m->_14 = 0.0f;
+        m->_21 = right[1]; m->_22 = up[1]; m->_23 = dir[1]; m->_24 = 0.0f;
+        m->_31 = right[2]; m->_32 = up[2]; m->_33 = dir[2]; m->_34 = 0.0f;
+        m->_41 = -(right[0] * eye[0] + right[1] * eye[1] + right[2] * eye[2]);
+        m->_42 = -(up[0]    * eye[0] + up[1]    * eye[1] + up[2]    * eye[2]);
+        m->_43 = -(dir[0]   * eye[0] + dir[1]   * eye[1] + dir[2]   * eye[2]);
+        m->_44 = 1.0f;
+    }
+
+    // Build the D3D projection MW's scenes ACTUALLY rasterize with. fov/aspect come
+    // from WorldControllerRenderCamera::CameraData {fovDegrees, near, far, viewportW,
+    // viewportH}: fovDegrees is the HORIZONTAL field of view (proj._11 = cot(fov/2),
+    // proj._22 = _11 * w/h), symmetric frustum — in-game validated element-exact
+    // against mwProj. (The NiCamera's Gamebryo viewFrustum is NOT the projection
+    // authority — it carries different (MGE-patched cull) values: FOV≈88°/near=1 vs
+    // the real proj's 75°.) The z terms are NOT CameraData's near/far either: the
+    // proxy re-edits every main-view projection (DistantLand::setProjection under
+    // USE_DISTANT_LAND: near 4, far = DrawDist·cell), and the arm scene rides the
+    // SAME edit (isMainView stays true there) — so copy _33/_43 from the LIVE
+    // device-captured mwProj, which holds exactly the post-edit mapping.
+    void buildNiCameraProj(const float cd[5], D3DXMATRIX* m) {
+        const float fovRad = cd[0] * (3.14159265358979323846f / 180.0f);
+        const float aspect = (cd[4] > 0.0f) ? (cd[3] / cd[4]) : 1.0f;
+        memset(m, 0, sizeof(*m));
+        m->_11 = 1.0f / tanf(fovRad * 0.5f);
+        m->_22 = m->_11 * aspect;
+        m->_33 = DistantLand::mwProj._33;
+        m->_34 = 1.0f;
+        m->_43 = DistantLand::mwProj._43;
+    }
+
+    // Build the ARM scene's projection the way the engine does for THAT scene: from the
+    // live NiCamera viewFrustum (l/r/t/b = plane slopes at unit distance, + n/f), then
+    // the same proxy z-edit every main-view projection submission receives
+    // (DistantLand::setProjection — a no-op with DL off). In-game latch diag 2026-07-11:
+    // MW's submitted arm proj is EXACTLY frustum-form (_11 = 1/r = 1.03553 → 88°
+    // horizontal, _22 = 1/t, z = the frustum's n=1/f=7168 mapping) while its view
+    // matched ours to the last digit — the arm scene genuinely draws WIDER than the
+    // world scene's CameraData 75°, which is why CameraData-built arms rendered ~1.26x
+    // too large (the "mirrored offset from center"). Off-center terms kept general.
+    bool buildArmCameraProj(D3DXMATRIX* m) {
+        float fr[6], port[4];
+        if (!MWBridge::get()->getRenderCameraFrustum(1, fr, port)) {
+            return false;
+        }
+        const float l = fr[0], r = fr[1], t = fr[2], b = fr[3], n = fr[4], f = fr[5];
+        if (r - l <= 0.0f || t - b <= 0.0f || f - n <= 0.0f) {
+            return false;
+        }
+        memset(m, 0, sizeof(*m));
+        m->_11 = 2.0f / (r - l);
+        m->_22 = 2.0f / (t - b);
+        m->_31 = -(r + l) / (r - l);
+        m->_32 = -(t + b) / (t - b);
+        m->_33 = f / (f - n);
+        m->_43 = -n * f / (f - n);
+        m->_34 = 1.0f;
+        DistantLand::setProjection((D3DMATRIX*)m);
+        return true;
+    }
+
+    // FP camera ground-truth diagnostic (offset-from-center triage). The proxy arms this
+    // at the z-only clear before MW's first-person scene (noteFPZClear) and the FIRST
+    // view + proj MW submits afterwards latch here — the exact matrices the native arms
+    // rasterize with. buildFPFrame logs them against the built fpView/fpProj so the log
+    // answers "fov, scale, or offset?" directly. Diagnostic only; nothing consumes the
+    // latched values. Requires FP suppression OFF (MW must actually render its arm scene).
+    bool       g_fpDiagArmed = false;
+    bool       g_fpDiagHaveView = false;
+    bool       g_fpDiagHaveProj = false;
+    D3DXMATRIX g_fpDiagView;
+    D3DXMATRIX g_fpDiagProj;
+    unsigned   g_fpDiagAge = 0;          // frames since the last complete latch
+
+    // FP validation gate: rebuild the MAIN camera from engine state with the same code
+    // and diff against the proxy-captured DistantLand::mwView/mwProj. Retires the
+    // axis-convention risk before any FP frame ships — on mismatch the FP pass refuses
+    // to enable (throttled log says why). Latches after the first clean pass.
+    bool g_fpCamValid = false;
+    bool validateFPCameraMath() {
+        if (g_fpCamValid) {
+            return true;
+        }
+        float pos[3], dir[3], up[3], right[3], cd[5];
+        if (!MWBridge::get()->getRenderCameraState(0, pos, dir, up, right, cd)) {
+            return false;
+        }
+        D3DXMATRIX view, proj;
+        buildNiCameraView(dir, up, right, pos, &view);   // absolute eye == mwView's own form
+        buildNiCameraProj(cd, &proj);
+        const float* a  = (const float*)&view;
+        const float* av = (const float*)&DistantLand::mwView;
+        const float* b  = (const float*)&proj;
+        const float* bv = (const float*)&DistantLand::mwProj;
+        float maxV = 0.0f, maxP = 0.0f;
+        for (int i = 0; i < 16; ++i) {
+            maxV = std::max(maxV, fabsf(a[i] - av[i]) / std::max(1.0f, fabsf(av[i])));
+            maxP = std::max(maxP, fabsf(b[i] - bv[i]) / std::max(1.0f, fabsf(bv[i])));
+        }
+        if (maxV < 1e-3f && maxP < 1e-3f) {
+            g_fpCamValid = true;
+            LOG::logline(">> [fp] camera math VALIDATED (viewErr=%.2e projErr=%.2e) — FP pass may ship", maxV, maxP);
+            return true;
+        }
+        static unsigned s_n = 0;
+        if (s_n++ % 300 == 0) {
+            LOG::logline("!! [fp] camera validation MISMATCH (viewErr=%.4f projErr=%.4f) — FP pass held off", maxV, maxP);
+            LOG::logline("   built view r0 % .5f % .5f % .5f | mw % .5f % .5f % .5f", a[0], a[1], a[2], av[0], av[1], av[2]);
+            LOG::logline("   built view r3 % .2f % .2f % .2f | mw % .2f % .2f % .2f", a[12], a[13], a[14], av[12], av[13], av[14]);
+            LOG::logline("   built proj    % .5f % .5f % .5f % .2f | mw % .5f % .5f % .5f % .2f",
+                         b[0], b[5], b[10], b[14], bv[0], bv[5], bv[10], bv[14]);
+        }
+        return false;
+    }
+
+    // Build the FP draw lists (rigid + skinned) from the isFP entries the FP walk
+    // stamped THIS frame, plus the FP viewProj from the arm camera (camera-relative
+    // against the SAME eye the emit helpers subtract, then the arm scene's own
+    // projection — its FOV/near/far differ from the world camera's). Returns true
+    // when the FP pass has something to ship this frame.
+    bool buildFPFrame(IPC::FPFrame& fp, std::uint32_t& fpDraws, std::uint32_t& fpSkinned) {
+        fpDraws = 0;
+        fpSkinned = 0;
+        g_fpDrawScratch.clear();
+        g_fpSkinnedScratch.clear();
+        if (!RenderProcess::wantsFPCapture() || !g_fpDrawVec || !g_fpSkinnedVec) {
+            return false;
+        }
+        if (!validateFPCameraMath()) {
+            return false;
+        }
+
+        float pos[3], dir[3], up[3], right[3], cd[5];
+        if (!MWBridge::get()->getRenderCameraState(1, pos, dir, up, right, cd)) {
+            return false;
+        }
+        const float rel[3] = { pos[0] - DistantLand::eyePos.x,
+                               pos[1] - DistantLand::eyePos.y,
+                               pos[2] - DistantLand::eyePos.z };
+        D3DXMATRIX view, proj, viewProj;
+        buildNiCameraView(dir, up, right, rel, &view);
+        if (!buildArmCameraProj(&proj)) {
+            return false;
+        }
+        D3DXMatrixMultiply(&viewProj, &view, &proj);
+        memcpy(fp.viewProj, &viewProj, 16 * sizeof(float));
+
+        const auto& cacheMap = MGE::GeometryCache::cache();
+        const auto cacheFrame = MGE::GeometryCache::currentFrame();
+        for (auto& kv : cacheMap) {
+            const auto& e = kv.second;
+            if (!e.isFP || e.lastFrame != cacheFrame) continue;
+            if (e.blendEnable) continue;      // FP1c: fp-alpha (torch flame, enchant glow)
+            // Multi-map FP parts would need the wide-VB multimap pipeline in the FP pass;
+            // none expected on arms — skip rather than bind the wrong vertex layout.
+            if (e.d3dDark || e.d3dDetail || e.d3dGlow) continue;
+            auto ks = g_keySlot.find(kv.first);
+            if (ks == g_keySlot.end()) continue;   // not uploaded yet (first-sight frame)
+            if (e.isSkinned) {
+                emitSkinnedDraw(ks->second, e, fpSkinned, g_fpSkinnedScratch);
+            } else {
+                // Same textureless rule as dispatch: collision proxies drop; genuine
+                // textureless visuals draw opaque on slot 0 (host default white).
+                if (!e.d3dTexture && e.isPickRoot) continue;
+                emitStaticDraw(ks->second, e, fpDraws, g_fpDrawScratch);
+            }
+        }
+
+        static unsigned s_hb = 0;
+        if (s_hb++ % 300 == 0) {
+            LOG::logline(">> [fp] draws=%u skinned=%u | cam fov=%.1f near=%.1f far=%.1f vp=%.0fx%.0f",
+                         fpDraws, fpSkinned, cd[0], cd[1], cd[2], cd[3], cd[4]);
+        }
+
+        // Continuous arm-camera validation: diff the latched native-arm-scene matrices
+        // (see noteFPZClear/noteFPSceneTransform) against what we built. The latch is
+        // from LAST frame's FP scene (MW renders it after this kickoff), so only compare
+        // a FRESH latch (age<=2 — a stale one means suppression is on / the camera moved
+        // since). One PASS line on first agreement; full dump (throttled) on mismatch.
+        // built view uses the ABSOLUTE eye to match MW's own form.
+        ++g_fpDiagAge;
+        if (g_fpDiagHaveView && g_fpDiagHaveProj && g_fpDiagAge <= 2) {
+            D3DXMATRIX absView;
+            buildNiCameraView(dir, up, right, pos, &absView);
+            const float* mp = (const float*)&g_fpDiagProj;
+            const float* bp = (const float*)&proj;
+            const float* mv = (const float*)&g_fpDiagView;
+            const float* bv = (const float*)&absView;
+            float errP = 0.0f, errV = 0.0f;
+            for (int i = 0; i < 16; ++i) {
+                errP = std::max(errP, fabsf(bp[i] - mp[i]) / std::max(1.0f, fabsf(mp[i])));
+                errV = std::max(errV, fabsf(bv[i] - mv[i]) / std::max(1.0f, fabsf(mv[i])));
+            }
+            static bool s_passLogged = false;
+            if (errP < 1e-3f && errV < 2e-2f) {          // view tol loose: latch is 1 frame old
+                if (!s_passLogged) {
+                    s_passLogged = true;
+                    LOG::logline(">> [fp cam-diag] arm camera MATCHES native arm scene (projErr=%.2e viewErr=%.2e)", errP, errV);
+                }
+            } else {
+                static unsigned s_diag = 0;
+                if (s_diag++ % 300 == 0) {
+                    LOG::logline("!! [fp cam-diag] arm-scene MISMATCH (projErr=%.4f viewErr=%.4f, age=%u)", errP, errV, g_fpDiagAge);
+                    LOG::logline("   proj mw   _11=%.5f _22=%.5f _31=%.5f _32=%.5f _33=%.6f _43=%.3f",
+                                 mp[0], mp[5], mp[8], mp[9], mp[10], mp[14]);
+                    LOG::logline("   proj built _11=%.5f _22=%.5f _31=%.5f _32=%.5f _33=%.6f _43=%.3f",
+                                 bp[0], bp[5], bp[8], bp[9], bp[10], bp[14]);
+                    LOG::logline("   view mw    r0=(% .5f % .5f % .5f) t=(% .2f % .2f % .2f)",
+                                 mv[0], mv[1], mv[2], mv[12], mv[13], mv[14]);
+                    LOG::logline("   view built r0=(% .5f % .5f % .5f) t=(% .2f % .2f % .2f)",
+                                 bv[0], bv[1], bv[2], bv[12], bv[13], bv[14]);
+                }
+            }
+        }
+        return (fpDraws + fpSkinned) > 0;
+    }
 }
 
 namespace RenderProcess {
@@ -1967,6 +2237,7 @@ namespace RenderProcess {
             return;
         }
         g_client = client;
+        g_fpSuppressLive = Configuration.ForgeFPSuppress;   // FP1b seed; numpad-/ flips live
         if (!device) {
             LOG::logline("!! [seam] no device at init; seam disabled");
             return;
@@ -2045,11 +2316,17 @@ namespace RenderProcess {
         // Re-walk the geometry cache to build the host's draw lists (the MGE→Forge feeding cost —
         // Phase 2 makes this GPU-resident so it goes to 0).
         std::uint32_t drawCount, skinnedCount, multiMapCount, lightCount, skyCount, alphaCount;
+        IPC::FPFrame fpFrame;
+        std::uint32_t fpDraws = 0, fpSkinnedDraws = 0;
+        bool fpHave = false;
         {
             MGE_ZoneScopedN("Forge build draw lists");
             buildGeometryDrawLists(drawCount, skinnedCount, multiMapCount, alphaCount);
             lightCount = buildLightList();
             skyCount = buildSkyDrawList();
+            // FP1a: before the geom flush below so first-sight arm meshes (captured by
+            // this frame's FP walk) ship in the same flush the pass draws from.
+            fpHave = buildFPFrame(fpFrame, fpDraws, fpSkinnedDraws);
         }
         const double tBuild = nowMs();
 
@@ -2118,6 +2395,23 @@ namespace RenderProcess {
             && g_alphaVec->assign_bytes(g_alphaScratch.data(), (std::uint32_t)g_alphaScratch.size())) {
             alphaId    = g_alphaVec->id();
             alphaBytes = (std::uint32_t)g_alphaScratch.size();
+        }
+
+        // FP1a: assign the FP scratches into their vecs; a failed assign just drops that
+        // list this frame (fpEnabled derives from the counts inside renderSceneKickoff).
+        if (fpHave) {
+            if (fpDraws > 0
+                && g_fpDrawVec->assign_bytes(g_fpDrawScratch.data(), (std::uint32_t)g_fpDrawScratch.size())) {
+                fpFrame.drawList  = g_fpDrawVec->id();
+                fpFrame.drawCount = fpDraws;
+                fpFrame.drawBytes = (std::uint32_t)g_fpDrawScratch.size();
+            }
+            if (fpSkinnedDraws > 0
+                && g_fpSkinnedVec->assign_bytes(g_fpSkinnedScratch.data(), (std::uint32_t)g_fpSkinnedScratch.size())) {
+                fpFrame.skinnedList  = g_fpSkinnedVec->id();
+                fpFrame.skinnedCount = fpSkinnedDraws;
+                fpFrame.skinnedBytes = (std::uint32_t)g_fpSkinnedScratch.size();
+            }
         }
 
         // AT3 captured-alpha: ship the geometry buildGeometryDrawLists left in the scratch
@@ -2206,8 +2500,56 @@ namespace RenderProcess {
         //   ambient = lightAmbMult * (sunAmb + ambCol)   // ambCol alone == globalAmbient, often
         //                                                 // ~0 in exteriors; the ambient fill is
         //                                                 // mostly the sun light's sunAmb term.
-        const RGBVECTOR sunColEff = DistantLand::lightSunMult * DistantLand::sunCol;
-        const RGBVECTOR ambColEff = DistantLand::lightAmbMult * (DistantLand::sunAmb + DistantLand::ambCol);
+        RGBVECTOR sunColEff = DistantLand::lightSunMult * DistantLand::sunCol;
+        RGBVECTOR ambColEff = DistantLand::lightAmbMult * (DistantLand::sunAmb + DistantLand::ambCol);
+        D3DXVECTOR4 sunVecEff = DistantLand::sunVec;
+        // INTERIORS: don't trust the proxy-captured sun/ambient — the capture only refreshes
+        // when MW re-programs light state (SetLight(6) / D3DRS_AMBIENT), which happens on
+        // light-set churn, not per frame. Exteriors churn constantly (the sun MOVES, geometry
+        // streams), but a static interior under full Forge ownership can go untouched for
+        // MINUTES: on first load the crossing kept the previous cell's sun/ambient until
+        // movement or a weapon raise dirtied the light state ("stuck ambient/sun"). Read the
+        // authoritative live values instead: the scene-graph sunlight (TES3DataHandler
+        // sgSunlight — the NiDirectionalLight MW programs light 6 FROM; the weather
+        // controller drives it in weather-flying interiors too) and, in weatherless
+        // interiors, the cell record's ambient (what MW feeds D3DRS_AMBIENT; the sun light's
+        // own ambient rides along live and is ~0 there — same split OpenMW uses).
+        if (!isExterior) {
+            float sdir[3], sdif[3], samb[3], sdim = 1.0f;
+            if (MWBridge::get()->getSceneSunlight(sdir, sdif, samb, &sdim)) {
+                D3DXVECTOR3 sd(sdir[0], sdir[1], sdir[2]);
+                D3DXVec3Normalize(&sd, &sd);
+                sunVecEff = D3DXVECTOR4(sd.x, sd.y, sd.z, 1.0f);
+                const RGBVECTOR liveSun(sdif[0] * sdim, sdif[1] * sdim, sdif[2] * sdim);
+                const RGBVECTOR liveSunAmb(samb[0] * sdim, samb[1] * sdim, samb[2] * sdim);
+                sunColEff = DistantLand::lightSunMult * liveSun;
+                // sgSunlight.ambient ALREADY carries the cell ambient in interiors (in-game
+                // verified: it equals the cell record's ambientColor byte-for-byte) — same
+                // convention as exteriors, where the ambient fill rides in the sun light and
+                // the D3DRS_AMBIENT global is ~0. So the live light's ambient is the whole
+                // ambient term; adding the cell record on top would double it.
+                ambColEff = DistantLand::lightAmbMult * liveSunAmb;
+                // Periodic live-vs-captured compare (mapping oracle): after movement/weapon
+                // churn refreshes the captures, fresh captured ambCol tells whether interior
+                // D3DRS_AMBIENT really is ~0 (assumed above). cellAmb logged for reference.
+                static std::uint32_t s_lightLogEpoch = ~0u;
+                static unsigned s_lightLogN = 0;
+                const bool epochEdge = (g_cellEpoch != s_lightLogEpoch);
+                if (epochEdge || (s_lightLogN++ % 900 == 0)) {
+                    s_lightLogEpoch = g_cellEpoch;
+                    const BYTE* ca = MWBridge::get()->CellHasWeather() ? nullptr : MWBridge::get()->getInteriorAmb();
+                    LOG::logline(">> [light] interior live: sun=(%.3f %.3f %.3f) sunAmb=(%.3f %.3f %.3f) cellAmb=(%.3f %.3f %.3f) dir=(%.2f %.2f %.2f) dim=%.2f",
+                                 liveSun.r, liveSun.g, liveSun.b, liveSunAmb.r, liveSunAmb.g, liveSunAmb.b,
+                                 ca ? ca[0] / 255.0f : -1.0f, ca ? ca[1] / 255.0f : -1.0f, ca ? ca[2] / 255.0f : -1.0f,
+                                 sd.x, sd.y, sd.z, sdim);
+                    LOG::logline(">> [light] interior captured: sun=(%.3f %.3f %.3f) sunAmb=(%.3f %.3f %.3f) ambCol=(%.3f %.3f %.3f) dir=(%.2f %.2f %.2f)",
+                                 DistantLand::sunCol.r, DistantLand::sunCol.g, DistantLand::sunCol.b,
+                                 DistantLand::sunAmb.r, DistantLand::sunAmb.g, DistantLand::sunAmb.b,
+                                 DistantLand::ambCol.r, DistantLand::ambCol.g, DistantLand::ambCol.b,
+                                 DistantLand::sunVec.x, DistantLand::sunVec.y, DistantLand::sunVec.z);
+                }
+            }
+        }
         // Host-computed sky dome (C2): the current interpolated ZENITH sky colour MW already blended
         // this frame from the Weather_*_Sky_*_Color ini keys (getCurrentWeatherSkyCol; MW does the
         // time-of-day blend internally). The host colours the dome with a vertical gradient
@@ -2222,7 +2564,7 @@ namespace RenderProcess {
         const float skyZenithG = skyColPtr ? skyColPtr->g : DistantLand::nearFogCol.g;
         const float skyZenithB = skyColPtr ? skyColPtr->b : DistantLand::nearFogCol.b;
         const float lighting[32] = {
-            DistantLand::sunVec.x,     DistantLand::sunVec.y,     DistantLand::sunVec.z,     0.0f,
+            sunVecEff.x,               sunVecEff.y,               sunVecEff.z,               0.0f,
             sunColEff.r,               sunColEff.g,               sunColEff.b,               0.0f,
             ambColEff.r,               ambColEff.g,               ambColEff.b,               0.0f,
             DistantLand::nearFogCol.r, DistantLand::nearFogCol.g, DistantLand::nearFogCol.b, 0.0f,
@@ -2318,7 +2660,8 @@ namespace RenderProcess {
                      skyId, (skyId != IPC::InvalidVector) ? skyCount : 0, skyBytes,
                      alphaId, (alphaId != IPC::InvalidVector) ? alphaCount : 0, alphaBytes,
                      capturedId, capVertBytes, capIdxBytes,
-                     (std::uint32_t)g_debugMode, &devInput, waterParams, waterOn);
+                     (std::uint32_t)g_debugMode, &devInput, waterParams, waterOn,
+                     fpHave ? &fpFrame : nullptr);
         }
         if (!ok) {
             return;     // rpcPending stays false → Finish no-ops
@@ -2397,6 +2740,13 @@ namespace RenderProcess {
             if (GetAsyncKeyState(VK_F8) & 0x0001) {
                 g_reloadShadersPending = true;
                 LOG::logline(">> [seam] compute shader hot-reload requested (F8)");
+            }
+            // FP1b: numpad-/ toggles MW first-person arm suppression live (A/B of MW arms
+            // over the host FP pass vs host arms alone). Only takes effect while the FP
+            // pass ships (wantsFPSuppression gates on capture + camera validation).
+            if (GetAsyncKeyState(VK_DIVIDE) & 0x0001) {
+                g_fpSuppressLive = !g_fpSuppressLive;
+                LOG::logline(">> [seam] FP suppression (FP1b) %s", g_fpSuppressLive ? "ON" : "OFF");
             }
         }
 
@@ -2602,6 +2952,51 @@ namespace RenderProcess {
         // pass is toggled ON (F7). No geometry capture (the host generates the mesh); this gate drives
         // the per-frame water-params crossing and (WT3) the MGE water-pass suppression.
         return g_initOk && g_enabled && g_waterEnabled;
+    }
+
+    bool wantsFPCapture() {
+        // FP1a: seam live + geometry capture up + composite ON (F11) + ini flag + FIRST person.
+        // Gates the cache's armCamera-root walk, the FP draw-list build and the fp wire crossing.
+        return g_initOk && g_geomVec.has_value() && g_enabled
+            && Configuration.ForgeFPPass && !MWBridge::get()->is3rdPerson();
+    }
+
+    bool wantsFPSuppression() {
+        // FP1b: suppress MW's own arm draws ONLY while the host FP pass is actually able
+        // to ship them (capture live + camera math validated) — the arms must never
+        // vanish without a replacement. g_fpSuppressLive seeds from ForgeFPSuppress and
+        // flips live on numpad-/ for the A/B.
+        return wantsFPCapture() && g_fpSuppressLive && g_fpCamValid;
+    }
+
+    // FP camera diag latch (see the g_fpDiag* block above): the proxy calls these from
+    // Clear (z-only clear in scenes >= 1 → arm) and SetTransform (first view+proj submitted
+    // while armed → latch, disarm when both landed). Self-gates on wantsFPCapture so it's
+    // inert unless the FP pass is live.
+    void noteFPZClear() {
+        if (!wantsFPCapture()) {
+            return;
+        }
+        g_fpDiagArmed = true;
+        g_fpDiagHaveView = false;
+        g_fpDiagHaveProj = false;
+    }
+
+    void noteFPSceneTransform(bool isProj, const D3DMATRIX* m) {
+        if (!g_fpDiagArmed || !m) {
+            return;
+        }
+        if (isProj && !g_fpDiagHaveProj) {
+            g_fpDiagProj = *m;
+            g_fpDiagHaveProj = true;
+        } else if (!isProj && !g_fpDiagHaveView) {
+            g_fpDiagView = *m;
+            g_fpDiagHaveView = true;
+        }
+        if (g_fpDiagHaveView && g_fpDiagHaveProj) {
+            g_fpDiagArmed = false;
+            g_fpDiagAge = 0;
+        }
     }
 
     bool ownsOpaqueWorld() {
@@ -2946,6 +3341,8 @@ namespace RenderProcess {
         g_lightVec.reset();
         g_skyVec.reset();
         g_alphaVec.reset();
+        g_fpDrawVec.reset();
+        g_fpSkinnedVec.reset();
         g_texVec.reset();
         g_pendingBlob.clear();
         g_pendingBlob.shrink_to_fit();
@@ -2961,6 +3358,10 @@ namespace RenderProcess {
         g_skyScratch.shrink_to_fit();
         g_alphaScratch.clear();
         g_alphaScratch.shrink_to_fit();
+        g_fpDrawScratch.clear();
+        g_fpDrawScratch.shrink_to_fit();
+        g_fpSkinnedScratch.clear();
+        g_fpSkinnedScratch.shrink_to_fit();
         g_texPendingBlob.clear();
         g_texPendingBlob.shrink_to_fit();
         g_pendingParts = 0;

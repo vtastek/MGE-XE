@@ -288,6 +288,10 @@ void DistantLand::buildFrustumVisibleSet(const D3DXMATRIX* view, const D3DXMATRI
         // Eviction is a periodic sweep now — skip entries the walk no longer visits
         // (despawned/appCulled) or a stale entry could re-enter the visible set here.
         if (e.lastFrame != cacheFrame) continue;
+        // FP1a: arm-scene entries are walked fresh every 1st-person frame but belong to
+        // the host FP pass only — near the camera they'd otherwise always pass this
+        // frustum test and leak into the main visible set.
+        if (e.isFP) continue;
         BoundingSphere bs;
         if (e.isSkinned) {
             if (e.skinnedUnsupported || e.numBones == 0) continue;

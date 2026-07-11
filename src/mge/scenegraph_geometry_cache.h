@@ -76,6 +76,12 @@ namespace MGE::GeometryCache {
         // with sun angle / weather without a revisionID bump). srcBlend/destBlend are the
         // NiAlphaProperty blend factors (D3DBLEND_*), translated in extractMaterial.
         bool     isSky;
+        // FP1a first-person takeover: true for entries walked from the WorldController
+        // armCamera root (the first-person arms/weapon subtree, rendered by MW in its
+        // own post-z-clear scene with its own camera). FP entries are EXCLUDED from
+        // every main-scene draw list (dispatch, caster re-emit, frustum fallback) and
+        // drawn only by the host's dedicated FP pass under the arm camera's viewProj.
+        bool     isFP;
         unsigned char srcBlend;   // D3DBLEND_* (sky source blend factor)
         unsigned char destBlend;  // D3DBLEND_* (sky dest blend factor)
         // SK2: subtree visit order within the skyRoot walk (0 = first child visited).
@@ -172,6 +178,13 @@ namespace MGE::GeometryCache {
         uint8_t vColSource;
         // Lifecycle
         uint64_t lastFrame;             // frame counter from most recent visit
+        // FP0: frame stamp set by markSubtreeSuppressed on entries under a subtree the
+        // engine has appCulled this frame (the inactive-POV player body). The offscreen
+        // shadow-caster re-emit loop sweeps the whole cache with no appCulled knowledge
+        // (walk() early-returns on culled nodes without touching entries), so without
+        // this the freshly-culled 3rd-person body keeps rendering until the eviction
+        // sweep. Consumers skip entries with suppressedFrame == currentFrame().
+        uint64_t suppressedFrame;
         // The GeometryData* this entry was built from. A NiTriShape address can be
         // recycled onto a NEW shape (cell transitions) while the entry survives —
         // with deferred eviction + the far-keep hysteresis that window is real, so
@@ -222,6 +235,14 @@ namespace MGE::GeometryCache {
     // live-draw-build frames where no classify result exists (the frustum fallback
     // iterates the whole cache and needs current-frame freshness). Idempotent.
     void ensureFullWalk();
+
+    // FP0: stamp suppressedFrame = currentFrame() on every cached TriBasedGeom entry in
+    // the subtree rooted at avObject (a NI::AVObject*, passed as void* to keep NI deps
+    // out of headers), traversing WITHOUT the appCulled early-out — the whole point is
+    // marking a subtree the engine just culled. Derefs only the live node the caller
+    // fetched from the engine THIS frame; never touches cached keys. Returns the number
+    // of entries stamped. Called from onFrameReady for the player's inactive-POV body.
+    uint32_t markSubtreeSuppressed(void* avObject);
 
     const std::unordered_map<uint32_t, CachedGeometry>& cache();
 

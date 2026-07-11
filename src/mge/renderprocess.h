@@ -61,6 +61,25 @@ namespace RenderProcess {
     // walk only runs when the host will actually draw it.
     bool wantsSkyCapture();
 
+    // FP1a first-person takeover: true when the seam is live AND compositing AND the Forge FP
+    // pass is enabled (ForgeFPPass ini) AND the player is in FIRST person. Gates the cache's
+    // armCamera-root walk + the per-frame FP draw lists + the FP camera crossing. Default off
+    // (ini) → MW's own first-person rendering is untouched.
+    bool wantsFPCapture();
+
+    // FP1b: true when the host FP pass is live (wantsFPCapture + camera math validated) AND
+    // suppression is on (ForgeFPSuppress ini, flipped live with numpad-/). The cache walk
+    // applies it by force-culling MW's arm-scene root each frame (restored once on release),
+    // so MW's own first-person draws no-op while the host draws the arms.
+    bool wantsFPSuppression();
+
+    // FP camera ground-truth diagnostic (offset-from-center triage): the proxy arms this at
+    // the z-only clear MW issues before its first-person scene, then forwards the next
+    // view/proj it SUBMITS (post camEffects/proj-edit — exactly what rasterizes the native
+    // arms). buildFPFrame diffs the latched pair against the built fpView/fpProj and logs.
+    void noteFPZClear();
+    void noteFPSceneTransform(bool isProj, const D3DMATRIX* m);
+
     // WT1 Forge water takeover: true when the seam is live AND compositing (F11) AND the Forge water
     // pass is toggled ON (F7). No geometry capture (the host generates the geo-clipmap mesh); this
     // gates the per-frame water-params crossing and, later (WT3), suppression of MGE's own water +

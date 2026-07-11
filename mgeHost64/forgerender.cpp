@@ -1216,6 +1216,37 @@ namespace {
         DescriptorSet* pPerBatchSetSky = nullptr;          // gBatch bound to pSkyWorldsBuf, 1 instance
         Buffer*        pSkyInstanceBuf = nullptr;          // per-draw instance VB (kStaticInstU32 slots), CPU-mapped
 
+        // --- FP1a: first-person pass (arms/weapon, after sorted-alpha, fresh depth) ---
+        // The arm scene has its OWN camera (fpViewProj crossing) and MW z-clears before
+        // drawing it, so the pass gets a second PerFrame cbuffer (main cbuffer copy with
+        // the FP viewProj — the reflection/shadow-face second-view pattern) and clears
+        // depth on bind. World screen-space lookups must not sample main-scene pixels:
+        // the FP PerFrame set swaps gAO → default white (AO=1) and gShadowMask → a 1×1
+        // all-lit uint4 mask. Own world window + instance buffers (sky-pass pattern) and
+        // ONE dedicated 64KB bone window (32 parts × 32 bones — never contends with the
+        // main 256-part skinned budget). PSOs = colour clones with GEQUAL + depthWrite
+        // (no FP Z-prepass for ~10-30 draws).
+        Buffer*        pFPFrameCbv = nullptr;              // gFrameData copy w/ the ARM camera viewProj
+        DescriptorSet* pPerFrameSetFP = nullptr;           // PerFrame clone: FP cbv + neutral gAO/gShadowMask
+        // The REAL mask neutralization: opaque.frag Loads gShadowMask by PIXEL coordinate,
+        // so a 1×1 "all lit" texture would return 0 (shadowed) everywhere but (0,0). The
+        // frag only consults the mask when a light's falloff.w carries a shadow slot —
+        // so the FP pass binds a lights cbuffer COPY with every falloff.w zeroed and the
+        // mask is never loaded (the 1×1 below is just a type-correct inert binding).
+        Buffer*        pFPLightCbv = nullptr;              // gLights copy, shadow-slot lanes zeroed
+        DescriptorSet* pPerLightsSetFP = nullptr;          // gLights bound to pFPLightCbv
+        Texture*       pFPMaskAllLit = nullptr;            // 1×1 R32G32B32A32_UINT placeholder (never loaded)
+        Buffer*        pFPWorldsBuf = nullptr;             // gBatch: one 64KB world window (rigid FP parts)
+        DescriptorSet* pPerBatchSetFP = nullptr;           // gBatch bound to pFPWorldsBuf, 1 instance
+        Buffer*        pFPInstanceBuf = nullptr;           // rigid per-draw instance VB (kStaticInstU32 slots)
+        Buffer*        pFPBonesBuf = nullptr;              // gBatch: ONE 64KB bone window (FP skinned)
+        DescriptorSet* pPerBatchSetFPSkin = nullptr;       // gBatch bound to pFPBonesBuf, 1 instance
+        Buffer*        pFPInstanceBufSkin = nullptr;       // skinned per-draw instance VB (uint2)
+        Pipeline*      pFPOpaquePipeline = nullptr;        // opaque colour, GEQUAL + WRITE, CCW
+        Pipeline*      pFPOpaquePipelineMirror = nullptr;  // … FRONT_FACE_CW
+        Pipeline*      pFPSkinnedPipeline = nullptr;       // skinned colour, GEQUAL + WRITE, CCW
+        Pipeline*      pFPSkinnedPipelineMirror = nullptr; // … FRONT_FACE_CW
+
         // --- AT1: sorted-alpha pass (alpha-blended world shapes, after water) ---------
         // The scene-1 blended set (banners/tapestries/foliage/glass) MW used to draw over the
         // Forge composite. Reuses opaque.vert + the GeomVertexWire layout (vl) with a dedicated
@@ -1405,7 +1436,14 @@ namespace {
            // slots permanently dyn).
            kGpuPhaseShadowStatic,
            kGpuPhaseShadowDyn,
+           kGpuPhaseColorFP,    // FP1a first-person pass (after sorted-alpha, before resolve)
            kGpuPhaseCount };
+
+    // FP1a first-person pass caps: one 64KB world window bounds the rigid list at 1024,
+    // capped far lower (the arm scene is ~10-30 parts); ONE 64KB bone window bounds the
+    // skinned list at kSkinnedPerWindow (32) parts.
+    constexpr uint32_t kMaxFPDraws   = 128;
+    constexpr uint32_t kMaxFPSkinned = kSkinnedPerWindow;   // 32
 
     // Tier 4 multi-map: ONE 64KB world window holds kBatchSize(1024) matrices; cap at 256
     // parts/frame (< 1024 → a single window, no batching). Per-instance VB stride (uint32 slots):
@@ -2340,6 +2378,27 @@ namespace {
             return false;
         }
 
+        // FP1a: first-person rigid colour PSOs — the same opaque shader/layout/formats but
+        // depth GEQUAL + WRITE (the FP pass clears depth on bind and has no Z-prepass;
+        // ~10-30 draws make one impossible to justify).
+        {
+            DepthStateDesc fpDepth = {};
+            fpDepth.mDepthTest = true;
+            fpDepth.mDepthWrite = true;
+            fpDepth.mDepthFunc = CMP_GEQUAL;
+            g.pDepthState = &fpDepth;
+            g.pRasterizerState = &rasterDesc;
+            addPipeline(R, &pd, &g_live.pFPOpaquePipeline);
+            g.pRasterizerState = &rasterMirror;
+            addPipeline(R, &pd, &g_live.pFPOpaquePipelineMirror);
+            g.pRasterizerState = &rasterDesc;   // restore for any later use of pd
+            g.pDepthState = &depthDesc;
+            if (!g_live.pFPOpaquePipeline || !g_live.pFPOpaquePipelineMirror) {
+                std::printf("[forge] addPipeline(FP opaque) FAILED\n");
+                return false;
+            }
+        }
+
         // --- Phase 1 Z-prepass pipelines (opaque.vert + depthonly.frag) -----------------
         // Depth-only: GEQUAL + depthWrite ON, NO colour target (mRenderTargetCount = 0, the
         // Forge depth-pass convention). Reuses the SAME vertex layout (vl) + rasterizer states
@@ -2888,6 +2947,26 @@ namespace {
             if (!g_live.pSkinnedPipelineMirror) {
                 std::printf("[forge] addPipeline(skinned mirror) FAILED\n");
                 return false;
+            }
+
+            // FP1a: first-person skinned colour PSOs — GEQUAL + WRITE (the FP pass clears
+            // depth and has no skinned Z-prepass; the main pass's EQUAL would never match).
+            {
+                DepthStateDesc fpSkDepth = {};
+                fpSkDepth.mDepthTest = true;
+                fpSkDepth.mDepthWrite = true;
+                fpSkDepth.mDepthFunc = CMP_GEQUAL;
+                sg.pDepthState = &fpSkDepth;
+                sg.pRasterizerState = &skRaster;
+                addPipeline(R, &skPd, &g_live.pFPSkinnedPipeline);
+                sg.pRasterizerState = &skRasterMirror;
+                addPipeline(R, &skPd, &g_live.pFPSkinnedPipelineMirror);
+                sg.pRasterizerState = &skRaster;    // restore for any later use of skPd
+                sg.pDepthState = &skDepth;
+                if (!g_live.pFPSkinnedPipeline || !g_live.pFPSkinnedPipelineMirror) {
+                    std::printf("[forge] addPipeline(FP skinned) FAILED\n");
+                    return false;
+                }
             }
 
             // Tier 1b skinned Z-prepass pipelines: skinned.vert + the shared depthonly.frag
@@ -4102,6 +4181,150 @@ namespace {
                         width, height, mips);
         }
 
+        // --- FP1a: first-person pass resources ------------------------------------------
+        // Second PerFrame cbuffer (the reflection/shadow-face second-view pattern) + a
+        // PerFrame set clone with NEUTRAL swaps — FP pixels must not sample the main
+        // scene's screen-space terms: gAO → default white (AO = 1, it's UV-Sampled so a
+        // small white texture is exact) and gLights → a copy with every shadow-slot lane
+        // zeroed (see the member comment — the mask Load is pixel-addressed, so the
+        // neutralization lives in the lights, not the mask). Own world window +
+        // rigid/skinned instance buffers and ONE dedicated 64KB bone window (sky-pass
+        // pattern). Any failure leaves pPerFrameSetFP null → the FP pass just skips.
+        {
+            BufferLoadDesc fpb = {};
+            fpb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            fpb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            fpb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            fpb.mDesc.mSize = 512;                       // same size/layout as pFrameCbv
+            fpb.mDesc.pName = "fpFrameCbv";
+            fpb.pData = nullptr;
+            fpb.ppBuffer = &g_live.pFPFrameCbv;
+            addResource(&fpb, nullptr);
+
+            BufferLoadDesc flb = {};
+            flb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            flb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            flb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            flb.mDesc.mSize = kLightCbvBytes;
+            flb.mDesc.pName = "fpLightCbv";
+            flb.pData = nullptr;
+            flb.ppBuffer = &g_live.pFPLightCbv;
+            addResource(&flb, nullptr);
+
+            BufferLoadDesc fwb = {};
+            fwb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            fwb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            fwb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            fwb.mDesc.mSize = kBatchBytes;
+            fwb.mDesc.pName = "fpWorldsCbv";
+            fwb.pData = nullptr;
+            fwb.ppBuffer = &g_live.pFPWorldsBuf;
+            addResource(&fwb, nullptr);
+
+            BufferLoadDesc fib = {};
+            fib.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+            fib.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            fib.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            fib.mDesc.mSize = (uint64_t)kMaxFPDraws * kStaticInstU32 * sizeof(uint32_t);
+            fib.mDesc.pName = "instanceVBFP";
+            fib.pData = nullptr;
+            fib.ppBuffer = &g_live.pFPInstanceBuf;
+            addResource(&fib, nullptr);
+
+            BufferLoadDesc fbb = {};
+            fbb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            fbb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            fbb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            fbb.mDesc.mSize = kBatchBytes;               // 1024 matrices = 32 parts × 32 bones
+            fbb.mDesc.pName = "fpBonesCbv";
+            fbb.pData = nullptr;
+            fbb.ppBuffer = &g_live.pFPBonesBuf;
+            addResource(&fbb, nullptr);
+
+            BufferLoadDesc fsb = {};
+            fsb.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+            fsb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            fsb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            fsb.mDesc.mSize = (uint64_t)kMaxFPSkinned * 2 * sizeof(uint32_t);
+            fsb.mDesc.pName = "instanceVBFPSkin";
+            fsb.pData = nullptr;
+            fsb.ppBuffer = &g_live.pFPInstanceBufSkin;
+            addResource(&fsb, nullptr);
+
+            TextureDesc md = {};
+            md.mWidth = 1; md.mHeight = 1; md.mDepth = 1;
+            md.mArraySize = 1; md.mMipLevels = 1;
+            md.mSampleCount = SAMPLE_COUNT_1;
+            md.mFormat = TinyImageFormat_R32G32B32A32_UINT;   // the gShadowMask slot type
+            md.mStartState = RESOURCE_STATE_SHADER_RESOURCE;
+            md.mDescriptors = DESCRIPTOR_TYPE_TEXTURE;
+            md.pName = "fpMaskInert";
+            TextureLoadDesc mld = {};
+            mld.ppTexture = &g_live.pFPMaskAllLit;
+            mld.pDesc = &md;
+            addResource(&mld, nullptr);
+
+            waitForAllResourceLoads();
+            const bool fpBufsOk = g_live.pFPFrameCbv && g_live.pFPLightCbv && g_live.pFPWorldsBuf
+                && g_live.pFPInstanceBuf && g_live.pFPBonesBuf && g_live.pFPInstanceBufSkin
+                && g_live.pFPMaskAllLit;
+            if (fpBufsOk) {
+                std::memset(g_live.pFPLightCbv->pCpuMappedAddress, 0, kLightCbvBytes);
+
+                DescriptorSetDesc fpfDesc = SRT_SET_DESC(SrtData, PerFrame, 1, 0);
+                addDescriptorSet(R, &fpfDesc, &g_live.pPerFrameSetFP);
+                DescriptorSetDesc fplDesc = SRT_SET_DESC(SrtData, PerDraw, 1, 0);
+                addDescriptorSet(R, &fplDesc, &g_live.pPerLightsSetFP);
+                DescriptorSetDesc fpwDesc = SRT_SET_DESC(SrtData, PerBatch, 1, 0);
+                addDescriptorSet(R, &fpwDesc, &g_live.pPerBatchSetFP);
+                DescriptorSetDesc fpsDesc = SRT_SET_DESC(SrtData, PerBatch, 1, 0);
+                addDescriptorSet(R, &fpsDesc, &g_live.pPerBatchSetFPSkin);
+            }
+            if (fpBufsOk && g_live.pPerFrameSetFP && g_live.pPerLightsSetFP
+                && g_live.pPerBatchSetFP && g_live.pPerBatchSetFPSkin) {
+                // PerFrame clone — bind EVERY slot with a type-valid texture (the reflect-set
+                // pattern); the water slots are never read by opaque/skinned frags.
+                Texture* vol  = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
+                Texture* refr = g_live.pRefractColor   ? g_live.pRefractColor   : g_live.pDefaultWhite;
+                Texture* lin  = g_live.pLinearDepth    ? g_live.pLinearDepth    : g_live.pDefaultWhite;
+                DescriptorData p[7] = {};
+                p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
+                p[0].ppBuffers = &g_live.pFPFrameCbv;
+                p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
+                p[1].mCount = 1; p[1].ppTextures = &g_live.pDefaultWhite;   // AO = 1 (neutral)
+                p[2].mIndex = SRT_RES_IDX(SrtData, PerFrame, gShadowMask);
+                p[2].mCount = 1; p[2].ppTextures = &g_live.pFPMaskAllLit;   // inert (never loaded)
+                p[3].mIndex = SRT_RES_IDX(SrtData, PerFrame, gWaterNormalVol);
+                p[3].mCount = 1; p[3].ppTextures = &vol;
+                p[4].mIndex = SRT_RES_IDX(SrtData, PerFrame, gRefractColor);
+                p[4].mCount = 1; p[4].ppTextures = &refr;
+                p[5].mIndex = SRT_RES_IDX(SrtData, PerFrame, gSceneLinDepth);
+                p[5].mCount = 1; p[5].ppTextures = &lin;
+                p[6].mIndex = SRT_RES_IDX(SrtData, PerFrame, gReflectColor);
+                p[6].mCount = 1; p[6].ppTextures = &refr;
+                updateDescriptorSet(R, 0, g_live.pPerFrameSetFP, 7, p);
+
+                DescriptorData lp = {};
+                lp.mIndex = SRT_RES_IDX(SrtData, PerDraw, gLights);
+                lp.ppBuffers = &g_live.pFPLightCbv;
+                updateDescriptorSet(R, 0, g_live.pPerLightsSetFP, 1, &lp);
+
+                DescriptorData bw = {};
+                bw.mIndex = SRT_RES_IDX(SrtData, PerBatch, gBatch);
+                bw.ppBuffers = &g_live.pFPWorldsBuf;
+                updateDescriptorSet(R, 0, g_live.pPerBatchSetFP, 1, &bw);
+                DescriptorData bs = {};
+                bs.mIndex = SRT_RES_IDX(SrtData, PerBatch, gBatch);
+                bs.ppBuffers = &g_live.pFPBonesBuf;
+                updateDescriptorSet(R, 0, g_live.pPerBatchSetFPSkin, 1, &bs);
+                std::printf("[forge] FP pass ready (maxDraws=%u maxSkinned=%u)\n",
+                            kMaxFPDraws, kMaxFPSkinned);
+            } else {
+                g_live.pPerFrameSetFP = nullptr;   // single skip gate for the pass
+                std::printf("[forge] FP pass resource alloc FAILED — FP pass disabled\n");
+            }
+        }
+
         std::printf("[forge] opaque scene path ready (depth %ux%u, maxDraws=%u, batched %ux%u, maxSkinned=%u, maxMultiMap=%u)\n",
                     width, height, kMaxDraws, kMaxBatches, kBatchSize, kMaxSkinned, kMaxMultiMap);
         return true;
@@ -5062,6 +5285,37 @@ namespace ForgeRender {
     void dlLogHeartbeat();
     void dlLogGpuSlow(double gpuMs, double recMs, unsigned drawn);   // per-frame GPU spike (reads DL counts)
 
+    // REVERSE-Z + HALF-PIXEL fixups on a client row-major viewProj, shared by the main
+    // scene and the FP pass (FP1a) so both land in the exact same clip convention.
+    //   REVERSE-Z: post-multiply by Z_rev (maps clip z' = w - z, near->1 / far->0). On a
+    //   row-major matrix that ONLY touches column 2: m[i*4+2] := m[i*4+3] - m[i*4+2]. The
+    //   shader reads the cbuffer column-major (== the transpose) so mul(viewProj, worldPos)
+    //   applies viewProj*Z_rev in row-vector terms — exactly reverse-Z, no shader change.
+    //   Pairs with depth clear 0.0 + CMP_GEQUAL.
+    //   HALF-PIXEL: MW's own layers are drawn by DXVK as D3D9 (half-pixel rasterization
+    //   offset); Forge is D3D12 (none) → a ~1px whole-image shift in the composite.
+    //   Re-introduce the D3D9 offset: NDC dx = -1/width, dy = +1/height, added as d*col3
+    //   to the matching col so the shift scales with w (post-divide constant).
+    //   kHalfPixelSign flips the whole correction in one place for F5/F6 A/B.
+    void applyProjFixups(float dst[16], const float* viewProj) {
+        std::memcpy(dst, viewProj, 16 * sizeof(float));
+        dst[2]  = dst[3]  - dst[2];
+        dst[6]  = dst[7]  - dst[6];
+        dst[10] = dst[11] - dst[10];
+        dst[14] = dst[15] - dst[14];
+        const float kHalfPixelSign = -1.0f;  // -1 pushes Forge toward bottom-right (cancels the D3D9/D3D12 top-left mismatch)
+        const float dx = kHalfPixelSign * (-1.0f / (float)g_live.width);
+        const float dy = kHalfPixelSign * ( 1.0f / (float)g_live.height);
+        dst[0]  += dx * dst[3];
+        dst[4]  += dx * dst[7];
+        dst[8]  += dx * dst[11];
+        dst[12] += dx * dst[15];
+        dst[1]  += dy * dst[3];
+        dst[5]  += dy * dst[7];
+        dst[9]  += dy * dst[11];
+        dst[13] += dy * dst[15];
+    }
+
     bool renderScene(const float* viewProj, const float* lighting, const void* drawBlob,
                      unsigned drawCount, unsigned drawBytes,
                      const void* skinnedBlob, unsigned skinnedCount, unsigned skinnedBytes,
@@ -5070,7 +5324,8 @@ namespace ForgeRender {
                      const void* skyBlob, unsigned skyCount, unsigned skyBytes,
                      const void* alphaBlob, unsigned alphaCount, unsigned alphaBytes,
                      const void* capturedAlphaBlob, unsigned capturedVertBytes, unsigned capturedIdxBytes,
-                     const float* waterParams, unsigned waterEnabled) {
+                     const float* waterParams, unsigned waterEnabled,
+                     const FPScene* fp) {
         if (!g_live.pRenderer) {
             return false;
         }
@@ -5104,41 +5359,15 @@ namespace ForgeRender {
         const uint32_t count = (n < haveBytes) ? n : haveBytes;
         const IPC::DrawItemWire* items = (const IPC::DrawItemWire*)drawBlob;
 
-        // REVERSE-Z: post-multiply the received row-major viewProj by Z_rev (maps clip z'
-        // = w - z, i.e. near->1 / far->0). On a row-major matrix that ONLY touches column 2:
-        // m[i*4+2] := m[i*4+3] - m[i*4+2]. The shader reads the cbuffer column-major (== the
-        // transpose) so mul(viewProj, worldPos) applies viewProj*Z_rev in row-vector terms,
-        // i.e. Z_rev acts on the post-projection clip coords — exactly reverse-Z. No shader
-        // change. Pairs with depth clear 0.0 + CMP_GEQUAL above.
+        // REVERSE-Z + HALF-PIXEL fixups on the received client viewProj — factored into
+        // applyProjFixups (defined just above renderScene) so the FP pass (FP1a) applies
+        // the IDENTICAL transform to its arm-camera matrix. Same math as always:
+        //   - reverse-Z: post-multiply by Z_rev (col2 := col3 - col2) — pairs with the
+        //     depth clear 0.0 + CMP_GEQUAL;
+        //   - half-pixel: re-introduce the D3D9 rasterization offset so the Forge layer
+        //     registers with MW's DXVK-drawn (D3D9) layers in the composite.
         float rzViewProj[16];
-        std::memcpy(rzViewProj, viewProj, 16 * sizeof(float));
-        rzViewProj[2]  = rzViewProj[3]  - rzViewProj[2];
-        rzViewProj[6]  = rzViewProj[7]  - rzViewProj[6];
-        rzViewProj[10] = rzViewProj[11] - rzViewProj[10];
-        rzViewProj[14] = rzViewProj[15] - rzViewProj[14];
-
-        // HALF-PIXEL ALIGN: MW's own layers (sky/water/distant land/UI) are drawn by DXVK as
-        // D3D9, which applies the D3D9 half-pixel rasterization offset. Our Forge layer is D3D12
-        // (pixel centre at +0.5, no offset), so it lands ~½px off in BOTH axes from every
-        // MW-native layer → a ~1px whole-image shift in the composite. Re-introduce the D3D9
-        // offset on the Forge projection so the layers register. Shift screen-space by half a
-        // pixel: NDC dx = -1/width, dy = +1/height (y is flipped screen↔NDC). On the row-major
-        // viewProj clip.x = col0 (idx 0,4,8,12), clip.y = col1 (1,5,9,13), clip.w = col3
-        // (3,7,11,15); add d*col3 to the matching col so the shift scales with w (post-divide
-        // constant). kHalfPixelSign flips the whole correction in one place for F5/F6 A/B.
-        {
-            const float kHalfPixelSign = -1.0f;  // -1 pushes Forge toward bottom-right (cancels the D3D9/D3D12 top-left mismatch)
-            const float dx = kHalfPixelSign * (-1.0f / (float)g_live.width);
-            const float dy = kHalfPixelSign * ( 1.0f / (float)g_live.height);
-            rzViewProj[0]  += dx * rzViewProj[3];
-            rzViewProj[4]  += dx * rzViewProj[7];
-            rzViewProj[8]  += dx * rzViewProj[11];
-            rzViewProj[12] += dx * rzViewProj[15];
-            rzViewProj[1]  += dy * rzViewProj[3];
-            rzViewProj[5]  += dy * rzViewProj[7];
-            rzViewProj[9]  += dy * rzViewProj[11];
-            rzViewProj[13] += dy * rzViewProj[15];
-        }
+        applyProjFixups(rzViewProj, viewProj);
 
         // viewProj → the persistent-mapped frame cbuffer. world[i] → window (i/kBatchSize)
         // at local slot (i%kBatchSize): byte offset (i/kBatchSize)*kBatchBytes + (i%kBatchSize)*64.
@@ -6053,6 +6282,28 @@ namespace ForgeRender {
             }
         }
         const double tCull1 = hostNowMs();   // end of the DL cull (+ lazy resource/texture load)
+
+        // FP1a: fill the FP frame cbuffer AFTER every main-cbuffer write this frame (the
+        // lighting block, lodEye, clip lanes all ride along in the copy), then overwrite
+        // viewProj with the ARM camera's matrix under the same reverse-Z + half-pixel
+        // fixups. The FP light cbuffer = the main one (already shadow-slot-patched by the
+        // manager above) with every falloff.w zeroed, so opaque.frag never consults the
+        // main scene's screen-space shadow mask for FP pixels (see pFPLightCbv comment).
+        const bool fpActive = fp && fp->viewProj && g_live.pPerFrameSetFP
+                           && (fp->drawCount + fp->skinnedCount) > 0;
+        if (fpActive) {
+            std::memcpy(g_live.pFPFrameCbv->pCpuMappedAddress,
+                        g_live.pFrameCbv->pCpuMappedAddress, 512);
+            float fpRz[16];
+            applyProjFixups(fpRz, fp->viewProj);
+            std::memcpy(g_live.pFPFrameCbv->pCpuMappedAddress, fpRz, 16 * sizeof(float));
+            std::memcpy(g_live.pFPLightCbv->pCpuMappedAddress,
+                        g_live.pLightCbv->pCpuMappedAddress, kLightCbvBytes);
+            float* flc = (float*)g_live.pFPLightCbv->pCpuMappedAddress;
+            for (uint32_t i = 0; i < g_lastLightCount; ++i) {
+                flc[4 + i * 12 + 11] = 0.0f;   // lights[i*3+2].w = shadow slot + 1 → none
+            }
+        }
 
         resetCmdPool(R, g_live.pCmdPool);
         beginCmd(g_live.pCmd);
@@ -8013,6 +8264,147 @@ namespace ForgeRender {
             cmdBindRenderTargets(g_live.pCmd, nullptr);
         }
         gpuPhaseEnd(kGpuPhaseColorAlpha);
+
+        // ===================== FP1a: first-person pass =====================
+        // MW draws the arms in its OWN scene after a z-clear, with the arm camera's
+        // FOV/near/far — reproduce that: colour LOADs, depth binds with LOAD_ACTION_CLEAR
+        // (reverse-Z clear 0.0, the DSV's clear value), and every draw runs under
+        // pPerFrameSetFP (arm viewProj; neutral AO; shadow-slot-free lights) with depth
+        // GEQUAL + WRITE (no FP prepass). Depth isn't consumed downstream this frame —
+        // Hi-Z mip 0, linearize and water already ran. Rigid parts use the sky-pass
+        // pattern (own world window + instance VB, arena-or-own mesh source); skinned
+        // parts use the main skinned pattern with the ONE dedicated FP bone window.
+        uint32_t fpRigidDrawn = 0, fpSkinnedDrawn = 0;
+        gpuPhaseBegin(kGpuPhaseColorFP);
+        if (fpActive && g_live.pFPOpaquePipeline && g_live.pFPSkinnedPipeline) {
+            BindRenderTargetsDesc fbind = {};
+            fbind.mRenderTargetCount = 1;
+            fbind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };
+            fbind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_CLEAR };   // MW's z-clear before FP
+            cmdBindRenderTargets(g_live.pCmd, &fbind);
+            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+
+            // --- rigid FP parts (DrawItemWire[]) ---
+            if (fp->drawBlob && fp->drawCount && fp->drawBytes) {
+                const uint32_t haveFP = fp->drawBytes / (uint32_t)sizeof(IPC::DrawItemWire);
+                uint32_t nFP = (fp->drawCount < haveFP) ? fp->drawCount : haveFP;
+                if (nFP > kMaxFPDraws) { nFP = kMaxFPDraws; }
+                const IPC::DrawItemWire* fpItems = (const IPC::DrawItemWire*)fp->drawBlob;
+
+                cmdBindPipeline(g_live.pCmd, g_live.pFPOpaquePipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetFP);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSetFP);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetFP);
+                int fpBoundMirror = 0;
+                for (uint32_t k = 0; k < nFP; ++k) {
+                    const IPC::DrawItemWire& it = fpItems[k];
+                    const uint32_t slot = it.slot;
+                    if (slot >= g_meshHigh || !g_meshes[slot].valid) { continue; }
+                    HostMesh& m = g_meshes[slot];
+                    if (m.skinned || m.multimap) { continue; }   // rigid GeomVertexWire only
+                    const uint32_t idx = fpRigidDrawn;
+
+                    uint8_t* wdst = (uint8_t*)g_live.pFPWorldsBuf->pCpuMappedAddress;
+                    std::memcpy(wdst + (size_t)idx * 64, it.world, 64);
+                    uint32_t* inst = (uint32_t*)g_live.pFPInstanceBuf->pCpuMappedAddress;
+                    inst[idx * kStaticInstU32 + 0] = idx;   // DrawIndex → gBatch.worlds[idx]
+                    inst[idx * kStaticInstU32 + 1] = packTexAlpha(it.texIndex, it.alphaRef, it.vColSource);
+                    float* finst = (float*)inst;
+                    finst[idx * kStaticInstU32 + 2]  = it.matDiffuse[0];
+                    finst[idx * kStaticInstU32 + 3]  = it.matDiffuse[1];
+                    finst[idx * kStaticInstU32 + 4]  = it.matDiffuse[2];
+                    finst[idx * kStaticInstU32 + 5]  = it.matAmbient[0];
+                    finst[idx * kStaticInstU32 + 6]  = it.matAmbient[1];
+                    finst[idx * kStaticInstU32 + 7]  = it.matAmbient[2];
+                    finst[idx * kStaticInstU32 + 8]  = it.matEmissive[0];
+                    finst[idx * kStaticInstU32 + 9]  = it.matEmissive[1];
+                    finst[idx * kStaticInstU32 + 10] = it.matEmissive[2];
+                    inst[idx * kStaticInstU32 + 11]  = 0;   // no terrain decal on arms
+
+                    const int mirror = worldMirrored(it.world) ? 1 : 0;
+                    if (mirror != fpBoundMirror) {
+                        cmdBindPipeline(g_live.pCmd, mirror ? g_live.pFPOpaquePipelineMirror
+                                                            : g_live.pFPOpaquePipeline);
+                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetFP);
+                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSetFP);
+                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetFP);
+                        fpBoundMirror = mirror;
+                    }
+                    Buffer*  meshVb = m.inArena ? g_live.pArenaVB : m.vb;
+                    Buffer*  meshIb = m.inArena ? g_live.pArenaIB : m.ib;
+                    const uint32_t firstVertex = m.inArena ? (uint32_t)(m.vbOff / sizeof(IPC::GeomVertexWire)) : 0u;
+                    const uint32_t firstIndex  = m.inArena ? (uint32_t)(m.ibOff / sizeof(uint16_t)) : 0u;
+                    if (!meshVb || !meshIb) { continue; }
+                    Buffer*  vbs[2]     = { meshVb, g_live.pFPInstanceBuf };
+                    uint32_t strides[2] = { vStride, iStride };
+                    cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                    cmdBindIndexBuffer(g_live.pCmd, meshIb, INDEX_TYPE_UINT16, 0);
+                    cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, firstIndex, 1, firstVertex, idx);
+                    ++fpRigidDrawn;
+                }
+            }
+
+            // --- skinned FP parts ([SkinnedDrawWire][palette]*) ---
+            if (fp->skinnedBlob && fp->skinnedCount && fp->skinnedBytes) {
+                cmdBindPipeline(g_live.pCmd, g_live.pFPSkinnedPipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetFP);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSetFP);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetFPSkin);   // the ONE FP bone window
+                const uint8_t* sp   = (const uint8_t*)fp->skinnedBlob;
+                const uint8_t* sEnd = sp + fp->skinnedBytes;
+                int fpSkinMirror = 0;
+                for (uint32_t k = 0; k < fp->skinnedCount; ++k) {
+                    if (sp + sizeof(IPC::SkinnedDrawWire) > sEnd) { break; }
+                    IPC::SkinnedDrawWire item;
+                    std::memcpy(&item, sp, sizeof(item));
+                    const uint8_t* palette = sp + sizeof(item);
+                    const uint32_t bones = (item.numBones < kMaxBonesPerPart) ? item.numBones : kMaxBonesPerPart;
+                    const uint64_t paletteBytes = (uint64_t)item.numBones * 64;
+                    if (palette + paletteBytes > sEnd) { break; }
+                    sp = palette + paletteBytes;
+                    if (fpSkinnedDrawn >= kMaxFPSkinned) { continue; }
+                    const uint32_t slot = item.slot;
+                    if (slot >= g_meshHigh || !g_meshes[slot].valid || !g_meshes[slot].skinned) { continue; }
+
+                    const uint32_t base = fpSkinnedDrawn * kMaxBonesPerPart;
+                    uint8_t* bdst = (uint8_t*)g_live.pFPBonesBuf->pCpuMappedAddress;
+                    std::memcpy(bdst + (size_t)base * 64, palette, (size_t)bones * 64);
+                    uint32_t* sinst = (uint32_t*)g_live.pFPInstanceBufSkin->pCpuMappedAddress;
+                    sinst[fpSkinnedDrawn * 2 + 0] = base;
+                    sinst[fpSkinnedDrawn * 2 + 1] = packTexAlpha(item.texIndex, item.alphaRef);
+
+                    const int mirror = item.mirror ? 1 : 0;
+                    if (mirror != fpSkinMirror) {
+                        cmdBindPipeline(g_live.pCmd, mirror ? g_live.pFPSkinnedPipelineMirror
+                                                            : g_live.pFPSkinnedPipeline);
+                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetFP);
+                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSetFP);
+                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetFPSkin);
+                        fpSkinMirror = mirror;
+                    }
+                    HostMesh& sm = g_meshes[slot];
+                    Buffer*  vbs[2]     = { sm.vb, g_live.pFPInstanceBufSkin };
+                    uint32_t strides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)(2 * sizeof(uint32_t)) };
+                    cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                    cmdBindIndexBuffer(g_live.pCmd, sm.ib, INDEX_TYPE_UINT16, 0);
+                    cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, fpSkinnedDrawn);
+                    ++fpSkinnedDrawn;
+                }
+            }
+            cmdBindRenderTargets(g_live.pCmd, nullptr);
+
+            static uint32_t s_fpLog = 0;
+            if ((s_fpLog++ % 300) == 0) {
+                LOG::logline(">> [fp host] rigid=%u/%u skinned=%u/%u",
+                             fpRigidDrawn, fp->drawCount, fpSkinnedDrawn, fp->skinnedCount);
+            }
+        }
+        gpuPhaseEnd(kGpuPhaseColorFP);
 
         gpuPhaseBegin(kGpuPhaseResolve);
         if (g_live.sampleCount > 1) {
@@ -12240,6 +12632,22 @@ namespace ForgeRender {
         if (g_live.pMultiMapShadowPipelineFrontMirror) { removePipeline(R, g_live.pMultiMapShadowPipelineFrontMirror); }
         if (g_live.pMultiMapDepthShader)    { removeShader(R, g_live.pMultiMapDepthShader); }
         if (g_live.pMultiMapShader)         { removeShader(R, g_live.pMultiMapShader); }
+        // FP1a first-person teardown.
+        if (g_live.pPerFrameSetFP)          { removeDescriptorSet(R, g_live.pPerFrameSetFP); }
+        if (g_live.pPerLightsSetFP)         { removeDescriptorSet(R, g_live.pPerLightsSetFP); }
+        if (g_live.pPerBatchSetFP)          { removeDescriptorSet(R, g_live.pPerBatchSetFP); }
+        if (g_live.pPerBatchSetFPSkin)      { removeDescriptorSet(R, g_live.pPerBatchSetFPSkin); }
+        if (g_live.pFPFrameCbv)             { removeResource(g_live.pFPFrameCbv); }
+        if (g_live.pFPLightCbv)             { removeResource(g_live.pFPLightCbv); }
+        if (g_live.pFPWorldsBuf)            { removeResource(g_live.pFPWorldsBuf); }
+        if (g_live.pFPInstanceBuf)          { removeResource(g_live.pFPInstanceBuf); }
+        if (g_live.pFPBonesBuf)             { removeResource(g_live.pFPBonesBuf); }
+        if (g_live.pFPInstanceBufSkin)      { removeResource(g_live.pFPInstanceBufSkin); }
+        if (g_live.pFPMaskAllLit)           { removeResource(g_live.pFPMaskAllLit); }
+        if (g_live.pFPOpaquePipeline)        { removePipeline(R, g_live.pFPOpaquePipeline); }
+        if (g_live.pFPOpaquePipelineMirror)  { removePipeline(R, g_live.pFPOpaquePipelineMirror); }
+        if (g_live.pFPSkinnedPipeline)       { removePipeline(R, g_live.pFPSkinnedPipeline); }
+        if (g_live.pFPSkinnedPipelineMirror) { removePipeline(R, g_live.pFPSkinnedPipelineMirror); }
         // SK1 sky teardown.
         if (g_live.pPerBatchSetSky)         { removeDescriptorSet(R, g_live.pPerBatchSetSky); }
         if (g_live.pSkyWorldsBuf)           { removeResource(g_live.pSkyWorldsBuf); }
