@@ -1064,19 +1064,54 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 #line 114 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
         float rangeK = gShadowMaskParams.maskParams.x;
         uint rangeBits = 0u;
+        uint nInRange = 0u;
         for (uint rs = 0u; rs < (uint) 32 ; ++rs)
         {
             if ((activeBits & (1u << rs)) == 0u) { continue; }
             float4 pr = gShadowMaskParams.slotPosRad[rs];
             float3 adr = abs(P - pr.xyz);
             float mar = max(adr.x, max(adr.y, adr.z));
-            if (mar < rangeK * pr.w) { rangeBits |= (1u << rs); }
+            if (mar < rangeK * pr.w) { rangeBits |= (1u << rs); ++nInRange; }
         }
         if (dbg != 0u) { rangeBits = activeBits; }
         if (rangeBits == 0u)
         {
             Write2D(gShadowMaskOut, px, mask);
             return;
+        }
+#line 147 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
+        if (nInRange >  8u  && dbg == 0u)
+        {
+            uint2 hist = uint2(0u, 0u);
+            for (uint hs = 0u; hs < (uint) 32 ; ++hs)
+            {
+                if ((rangeBits & (1u << hs)) == 0u) { continue; }
+                float4 pr = gShadowMaskParams.slotPosRad[hs];
+                float3 ad = abs(P - pr.xyz);
+                float f = max(ad.x, max(ad.y, ad.z)) / (rangeK * pr.w);
+                uint fb = min(7u, (uint)(f * 8.0f));
+                if (fb < 4u) { hist.x += 1u << (fb * 8u); }
+                else { hist.y += 1u << ((fb - 4u) * 8u); }
+            }
+            uint cut = 7u; uint budget =  8u ;
+            for (uint hb = 0u; hb < 8u; ++hb)
+            {
+                uint c = ((hb < 4u) ? (hist.x >> (hb * 8u)) : (hist.y >> ((hb - 4u) * 8u))) & 0xFFu;
+                if (c >= budget) { cut = hb; break; }
+                budget -= c;
+            }
+            uint keep = 0u;
+            for (uint ks = 0u; ks < (uint) 32 ; ++ks)
+            {
+                if ((rangeBits & (1u << ks)) == 0u) { continue; }
+                float4 pr = gShadowMaskParams.slotPosRad[ks];
+                float3 ad = abs(P - pr.xyz);
+                float f = max(ad.x, max(ad.y, ad.z)) / (rangeK * pr.w);
+                uint fb = min(7u, (uint)(f * 8.0f));
+                if (fb < cut) { keep |= 1u << ks; }
+                else if (fb == cut && budget > 0u) { keep |= 1u << ks; --budget; }
+            }
+            rangeBits = keep;
         }
 
 
