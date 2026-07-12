@@ -1649,7 +1649,7 @@ namespace {
     // are mesh SLOTS (via HostMesh::lastWorld records), not items[] indices — the face pass is
     // fully decoupled from the camera-culled draw list. List order == shadow-window order
     // (draw k uses firstInstance = k into pShadowWorldsBuf/pShadowInstanceBuf).
-    struct ShadowCaster { uint32_t slot; uint8_t mirror; };
+    struct ShadowCaster { uint32_t slot; uint8_t mirror; uint8_t twoSided; };  // twoSided: fixture cage enclosing its own light → force CULL_NONE
     std::vector<ShadowCaster> g_shadowCasters;    // concatenated caster lists for THIS frame's scheduled renders
     bool  g_shadowFrameActive = false;    // face re-render should record this frame (== !g_shadowRenders.empty())
 
@@ -1679,6 +1679,21 @@ namespace {
                                             // bakes → a far in-view shadow fades in place instead of snapping.
                                             // Near/spawning lights start at 1.0 (instant — a cast spell at your
                                             // feet must not lag). 1.0 = full shadow (steady state).
+        // --- Flicker/pulse classifier (Path A, empirical) ------------------------------------------
+        // MW animates a light's DIFFUSE brightness in [0.25,1] (OpenMW LightController: ramps toward a
+        // target at ~15fps; FLICKER re-rolls a RANDOM target on arrival → jumpy, reverses mid-range;
+        // PULSE toggles the target 0.25<->1 → smooth triangle, reverses only at the ends). Radius is
+        // untouched (verified). We read I=max(color.rgb) per frame and classify from its SHAPE. Steady
+        // vs animated is the HARD gate (a no-flicker light must never be flagged); flicker<->pulse
+        // settles over a cycle. All host-side, no wire/client change.
+        float    fPrevI     = -1.0f;   // last frame's intensity (-1 = uninitialized)
+        float    fMinI      = 0.0f;    // running envelope (expand fast, contract slow) for normalization
+        float    fMaxI      = 0.0f;
+        float    fErratic   = 0.0f;    // EWMA |dI|/maxI — ~0 steady, rises with modulation depth*rate
+        float    fEndedness = 0.5f;    // EWMA of reversal-position min(en,1-en): ~0 pulse (ends), ~.25 flicker
+        int8_t   fPrevDir   = 0;       // sign of last significant dI (reversal detect)
+        uint8_t  fClass     = 0;       // 0 steady, 1 pulse, 2 flicker (derived; settles from warm-up)
+        uint16_t fAnimFrames= 0;       // consecutive-ish frames seen animated (warm-up / anti-flap hysteresis)
     };
     ShadowSlot g_shadowSlots[kMaxShadowLights];
 
@@ -4861,6 +4876,13 @@ namespace {
                                         // 1 = CULL_NONE (two-sided — writes far/under faces, closes the thin
                                         // contact line), 2 = CULL_FRONT (back faces only — acne cure, leaks on
                                         // thin/open MW geometry). Live: draw-time pipeline pick, no rebuild.
+    float g_shadowCageRadius = 64.0f;   // Fixture self-cage two-sided override. A small caster (world radius
+                                        // <= this) whose bound ENCLOSES the light (d2 < wr^2) is the light's
+                                        // OWN holder (lantern/torch/candle cage) — the face cameras sit inside
+                                        // it, so g_shadowCasterCull front/back-culls half its bars into random
+                                        // shapes. Force CULL_NONE (pShadowPipelineNone) for just those casters
+                                        // so the whole cage casts. 0 = off. Precise: encloses+small, so walls/
+                                        // floors (huge bound, light merely near their sphere) never trip it.
     bool  g_shadowSkipLinearLights = true; // Exclude synthetic ambient/sun fill lights from SHADOW management
                                         // (they still light the scene — forward loop is untouched). Signature:
                                         // nonzero LINEAR attenuation (pl[9] > 0). Real placed fixtures + the
@@ -4913,6 +4935,74 @@ namespace {
                                         // near light or a SPAWNING one (spell/torch at your feet) takes its
                                         // slot at full strength (instant), since a lagged near shadow reads as
                                         // a bug. The reclaim pops this smooths are the FAR ones. Live knob.
+    // --- Flicker/pulse classifier (Path A) knobs + helper ------------------------------------------
+    float g_flickAnimThresh = 0.005f;   // Erraticness (EWMA |dI|/maxI) above which a shadow light counts as
+                                        // ANIMATED. Set well above FP reconstruction jitter so a STEADY light
+                                        // never trips it (the hard no-false-positive constraint). Live-tune
+                                        // against the [p3-shadow] flk= counts (user-set 0.005).
+    float g_flickEndSplit   = 0.020f;   // Flicker/pulse split on reversal-endedness: < this = PULSE (reverses
+                                        // at the 0.25/1.0 envelope ends → triangle), >= this = FLICKER (random
+                                        // mid-range reversals). Live (user-set 0.020; tighten later if needed).
+    bool  g_debugFlickerClass = false;  // Range-sphere tint by CLASS (grey steady / blue pulse / orange flicker)
+                                        // instead of by light id. Needs g_debugRangeSpheres on.
+    // Flicker "movement" fake: a FLICKER-class light's SHADOW dances without re-baking the atlas. The mask
+    // rotates its LOOKUP DIRECTION by a small time-varying angle (a rotation = constant angular offset →
+    // world shadow displacement = angle*distance, so it's ~zero at the light/candle tip and grows toward
+    // the attenuation edge — what firelight actually does). Only the shadow moves (forward light list is
+    // untouched). ONLY fClass==2 (pulse/steady stay still). biasParams.z/.w + slotBits.z carry it to the mask.
+    float g_flickShadowMove  = 0.02f;   // Rotation amplitude (RADIANS, ~1°). Shadow travel = this*dist, so keep
+                                        // small; the tip stays put and far shadows sway most. 0 = off. Live (user-set).
+    float g_flickShadowSpeed = 4.2f;    // Phase speed (rad/s) scaling biasParams.z. Incommensurate per-axis sines
+                                        // + per-light position hash give an organic, desynced flame jitter. Live.
+    bool  g_flickIntensityMatch = true; // Couple a FLICKER light's forward BRIGHTNESS to the SAME synthetic
+                                        // flame signal that sways its shadow (same time-phase + slot seed +
+                                        // gust), so light and shadow move as one flame. Drives brightness =
+                                        // tracked-peak (fMaxI) * synthetic b, REPLACING MW's own independent
+                                        // flicker for these lights (per-frame; the client re-ships raw next
+                                        // frame, so classification still reads MW's real signal). Live A/B.
+    float g_flickIntensityDepth = 0.35f;// Depth of the injected brightness dip: b in [1-depth .. 1]. 0 = off
+                                        // (no intensity change), 0.75 ≈ MW's own 0.25..1 range. Live.
+    // Classify one shadow slot's light from this frame's intensity I=max(color.rgb). Steady vs animated
+    // is gated by erraticness with a frame-count hysteresis (fAnimFrames) so a transient (cell-load
+    // dimmer ramp) can't flag a steady light; flicker vs pulse reads reversal position once warmed up.
+    static void classifyFlickerSlot(ShadowSlot& sl, float I) {
+        constexpr float kEnvDecay   = 0.004f;  // envelope contracts slowly (~250 frames) so it tracks base drift
+        constexpr float kErrAlpha   = 0.05f;   // erraticness EWMA
+        constexpr float kEndAlpha   = 0.20f;   // endedness EWMA (updated only at reversals)
+        constexpr float kNoiseFrac  = 0.02f;   // dead-band on |dI|/maxI to reject FP noise as a reversal
+        constexpr uint16_t kAnimOn  = 8;       // frames of erraticness before ANIMATED is declared
+        constexpr uint16_t kWarmup  = 20;      // animated frames before the flicker/pulse split is trusted
+        if (sl.fPrevI < 0.0f) { sl.fPrevI = sl.fMinI = sl.fMaxI = I; return; }   // seed on first sight
+        // Running envelope: expand instantly to a new extreme, contract slowly toward I.
+        sl.fMaxI = (I > sl.fMaxI) ? I : sl.fMaxI + (I - sl.fMaxI) * kEnvDecay;
+        sl.fMinI = (I < sl.fMinI) ? I : sl.fMinI + (I - sl.fMinI) * kEnvDecay;
+        const float scale = (sl.fMaxI > 1e-4f) ? sl.fMaxI : 1e-4f;
+        const float dI    = I - sl.fPrevI;
+        const float rel   = std::fabs(dI) / scale;
+        sl.fErratic = sl.fErratic + (rel - sl.fErratic) * kErrAlpha;
+        // Reversal detection (dead-banded) → endedness of the extremum we just left.
+        int8_t dir = (rel > kNoiseFrac) ? (int8_t)(dI > 0.0f ? 1 : -1) : (int8_t)0;
+        if (dir != 0) {
+            if (sl.fPrevDir != 0 && dir != sl.fPrevDir) {
+                const float span = sl.fMaxI - sl.fMinI;
+                const float en   = (span > 1e-4f) ? (sl.fPrevI - sl.fMinI) / span : 0.5f;   // 0..1
+                const float ended= en < (1.0f - en) ? en : (1.0f - en);                     // dist to nearest end
+                sl.fEndedness = sl.fEndedness + (ended - sl.fEndedness) * kEndAlpha;
+            }
+            sl.fPrevDir = dir;
+        }
+        // Steady/animated hysteresis: accumulate while erratic, bleed fast when quiet.
+        if (sl.fErratic > g_flickAnimThresh) { if (sl.fAnimFrames < 60000) { ++sl.fAnimFrames; } }
+        else if (sl.fAnimFrames > 0)         { sl.fAnimFrames = (sl.fAnimFrames > 3) ? sl.fAnimFrames - 3 : 0; }
+        if (sl.fAnimFrames < kAnimOn) {
+            sl.fClass = 0;                                   // STEADY (the hard-gated default)
+        } else if (sl.fAnimFrames < kWarmup) {
+            sl.fClass = 2;                                   // animated but not settled → call it FLICKER early
+        } else {
+            sl.fClass = (sl.fEndedness < g_flickEndSplit) ? 1u : 2u;   // settled: PULSE vs FLICKER
+        }
+        sl.fPrevI = I;
+    }
     // C3b: emissive caster skip — replaces the P3 fixture-radius self-shadow heuristic (which was
     // finnicky: a lantern is several NiTriShapes with different bounding spheres, so parts of the
     // fixture's shadow appeared/disappeared). MW marks a light's own hot part with a full-emissive
@@ -5083,6 +5173,8 @@ namespace {
         static const char* const kCasterCullNames[] = { "0 back (light faces)", "1 none (two-sided)", "2 front (back faces)" };
         DropdownWidget ddCc = {}; ddCc.pData = &g_shadowCasterCull; ddCc.pNames = kCasterCullNames; ddCc.mCount = 3;
         uiAddComponentWidget(g_uiPanel, "Shadow caster cull", &ddCc, WIDGET_TYPE_DROPDOWN);
+        SliderFloatWidget sShCg = {}; sShCg.pData = &g_shadowCageRadius; sShCg.mMin = 0.0f; sShCg.mMax = 256.0f; sShCg.mStep = 4.0f;
+        uiAddComponentWidget(g_uiPanel, "Shadow: fixture cage two-sided radius (0=off)", &sShCg, WIDGET_TYPE_SLIDER_FLOAT);
         CheckboxWidget cShSk = {}; cShSk.pData = &g_shadowSkinnedCasters;
         uiAddComponentWidget(g_uiPanel, "Shadow: skinned casters (NPC bodies)", &cShSk, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cShMm = {}; cShMm.pData = &g_shadowMMCasters;
@@ -5105,6 +5197,20 @@ namespace {
         uiAddComponentWidget(g_uiPanel, "Debug: light-origin boxes (id-coloured)", &cDbgLb, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cDbgRs = {}; cDbgRs.pData = &g_debugRangeSpheres;
         uiAddComponentWidget(g_uiPanel, "Debug: shadow range spheres (rangeK inner / 2r outer)", &cDbgRs, WIDGET_TYPE_CHECKBOX);
+        SliderFloatWidget sFlkT = {}; sFlkT.pData = &g_flickAnimThresh; sFlkT.mMin = 0.0f; sFlkT.mMax = 0.10f; sFlkT.mStep = 0.001f;
+        uiAddComponentWidget(g_uiPanel, "Flicker: animated threshold (erraticness)", &sFlkT, WIDGET_TYPE_SLIDER_FLOAT);
+        SliderFloatWidget sFlkE = {}; sFlkE.pData = &g_flickEndSplit; sFlkE.mMin = 0.0f; sFlkE.mMax = 0.30f; sFlkE.mStep = 0.01f;
+        uiAddComponentWidget(g_uiPanel, "Flicker: pulse/flicker split (endedness)", &sFlkE, WIDGET_TYPE_SLIDER_FLOAT);
+        SliderFloatWidget sFlkM = {}; sFlkM.pData = &g_flickShadowMove; sFlkM.mMin = 0.0f; sFlkM.mMax = 0.40f; sFlkM.mStep = 0.005f;
+        uiAddComponentWidget(g_uiPanel, "Flicker: shadow wobble amplitude (rad, 0=off)", &sFlkM, WIDGET_TYPE_SLIDER_FLOAT);
+        SliderFloatWidget sFlkS = {}; sFlkS.pData = &g_flickShadowSpeed; sFlkS.mMin = 0.0f; sFlkS.mMax = 10.0f; sFlkS.mStep = 0.1f;
+        uiAddComponentWidget(g_uiPanel, "Flicker: shadow wobble speed (rad/s)", &sFlkS, WIDGET_TYPE_SLIDER_FLOAT);
+        CheckboxWidget cFlkI = {}; cFlkI.pData = &g_flickIntensityMatch;
+        uiAddComponentWidget(g_uiPanel, "Flicker: match light intensity to shadow", &cFlkI, WIDGET_TYPE_CHECKBOX);
+        SliderFloatWidget sFlkID = {}; sFlkID.pData = &g_flickIntensityDepth; sFlkID.mMin = 0.0f; sFlkID.mMax = 1.0f; sFlkID.mStep = 0.05f;
+        uiAddComponentWidget(g_uiPanel, "Flicker: intensity match depth", &sFlkID, WIDGET_TYPE_SLIDER_FLOAT);
+        CheckboxWidget cDbgFc = {}; cDbgFc.pData = &g_debugFlickerClass;
+        uiAddComponentWidget(g_uiPanel, "Debug: range-sphere tint by class (grey/blue/orange)", &cDbgFc, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cShSl = {}; cShSl.pData = &g_shadowSkipLinearLights;
         uiAddComponentWidget(g_uiPanel, "Shadow: skip ambient/sun fill (linear-atten)", &cShSl, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cShEx = {}; cShEx.pData = &g_shadowExpireMovers;
@@ -5971,7 +6077,7 @@ namespace ForgeRender {
 
             // (1) Parse this frame's shadow-eligible lights (id-carrying, r>1). imp = the P1
             // screen-coverage proxy r/max(dist,r) (the contribution metric hopped slots → reverted).
-            struct LightInfo { uint32_t idx, id, flags; float pos[3], radius, imp; };
+            struct LightInfo { uint32_t idx, id, flags; float pos[3], radius, imp, intensity; };
             static std::vector<LightInfo> lights;   lights.clear();
             static std::vector<char>      owned;    // lights[k] already owns a slot
             if (g_shadowEnable) {
@@ -6026,7 +6132,7 @@ namespace ForgeRender {
                     // Fixture priority: boost so real fixtures outrank any non-gated fill. imp saturates
                     // at 1.0, so a >1 boost lifts fixtures cleanly above. Live knob (1.0 = off).
                     if (isFixture) { imp *= g_shadowFixtureBoost; }
-                    lights.push_back({ i, id, flags, { pl[0], pl[1], pl[2] }, r, imp });
+                    lights.push_back({ i, id, flags, { pl[0], pl[1], pl[2] }, r, imp, cmax });
                 }
             }
             owned.assign(lights.size(), 0);
@@ -6060,12 +6166,16 @@ namespace ForgeRender {
                 // and the mask's depth reconstruction uses the same 2r, so if a darkening mod shrinks
                 // a light's radius the cached tile (old frustum) no longer matches the mask → must
                 // re-render with the new extent. Radius from specular.r is FP-stable, so > 1u = real.
+                // (MW flicker/pulse modulate the light's COLOR, not its radius — verified: no re-bake
+                // churn from flickering fixtures — so the flicker classifier below reads pl[4..6], and
+                // this radius test stays untouched.)
                 const bool moved = (L.flags & IPC::kLightFlagMoved)
                                    || (dx*dx + dy*dy + dz*dz > kShadowMovedEps * kShadowMovedEps)
                                    || (std::fabs(L.radius - sl.radius) > 1.0f);
                 sl.absPos[0] = ax; sl.absPos[1] = ay; sl.absPos[2] = az;
                 sl.radius = L.radius; sl.importance = L.imp;
                 sl.lastSeenFrame = frame; sl.activeThisFrame = true; sl.curLightIdx = L.idx;
+                classifyFlickerSlot(sl, L.intensity);   // Path A: steady / pulse / flicker from the diffuse signal
                 if (moved) { sl.lastRenderFrame = 0; }   // 0 = dirty (also the never-rendered sentinel)
             }
 
@@ -6370,7 +6480,7 @@ namespace ForgeRender {
                 // over-subscribes the per-light cap drops its FARTHEST (weakest) casters, never
                 // arbitrary slot-index ones — a static near the light can no longer be starved out
                 // by distant furniture that happens to sit at a lower slot index.
-                struct GatherC { float d2; uint32_t slot; uint8_t mirror; };
+                struct GatherC { float d2; uint32_t slot; uint8_t mirror; uint8_t twoSided; };
                 static std::vector<GatherC> gc; gc.clear();
                 for (uint32_t slot = 0; slot < g_meshHigh; ++slot) {
                     const HostMesh& hm = g_meshes[slot];
@@ -6402,7 +6512,12 @@ namespace ForgeRender {
                     // in the DYNAMIC tile every frame — baking one here would freeze it into the
                     // cached static tile.
                     if (g_shadowRigidMovers && isRigidMover(hm)) { continue; }   // A: still LIVE activators bake here
-                    gc.push_back({ d2, slot, hm.lastMirror });
+                    // Fixture self-cage: this caster is small (wr <= knob) AND its bound encloses the
+                    // light (d2 < wr^2) → it's the light's own holder; the face cameras are inside it,
+                    // so front/back culling shreds the cage. Flag it for a CULL_NONE draw below.
+                    const uint8_t twoSided = (g_shadowCageRadius > 0.0f && wr <= g_shadowCageRadius
+                                              && d2 < wr * wr) ? 1u : 0u;
+                    gc.push_back({ d2, slot, hm.lastMirror, twoSided });
                 }
                 if (gc.size() > kShadowMaxCasters) {
                     std::nth_element(gc.begin(), gc.begin() + kShadowMaxCasters, gc.end(),
@@ -6416,10 +6531,12 @@ namespace ForgeRender {
                     kShadowWorldMatrices - (uint32_t)g_dynMoverCasters.size()) { continue; }
                 const uint32_t regionBase = usedMats;   // GPU world/instance region for this job
                 const uint32_t begin = (uint32_t)g_shadowCasters.size();
-                for (const GatherC& g2 : gc) { g_shadowCasters.push_back({ g2.slot, g2.mirror }); }
+                for (const GatherC& g2 : gc) { g_shadowCasters.push_back({ g2.slot, g2.mirror, g2.twoSided }); }
                 const uint32_t end = (uint32_t)g_shadowCasters.size();
                 std::sort(g_shadowCasters.begin() + begin, g_shadowCasters.begin() + end,
                           [](const ShadowCaster& a, const ShadowCaster& b) {
+                              // twoSided first (one CULL_NONE PSO, winding-agnostic), then mirror pairs.
+                              if (a.twoSided != b.twoSided) { return a.twoSided < b.twoSided; }
                               if (a.mirror != b.mirror) { return a.mirror < b.mirror; }
                               return a.slot < b.slot;
                           });
@@ -6491,11 +6608,39 @@ namespace ForgeRender {
             // activates once rendered (graceful: the shadow appears a frame or two late, never as garbage).
             uint32_t activeBits = 0;
             uint32_t staticReBits = 0;   // slots whose STATIC tile re-rendered THIS frame (not cached)
+            uint32_t flickerBits = 0;    // slots whose light is FLICKER-class (fClass==2) → mask dir wobble
+            // Shared synthetic flame phase (time*speed off a captured base). Drives BOTH the mask's shadow
+            // sway (written to biasParams.z below) AND the forward light-intensity match here — same base,
+            // seed (slot index) and gust formula on both sides, so brightness and shadow move as one flame.
+            static const double s_flickT0b = hostNowMs();
+            const float flickA = (float)((hostNowMs() - s_flickT0b) * 0.001) * g_flickShadowSpeed;
             for (uint32_t s = 0; s < kMaxShadowLights; ++s) {
                 ShadowSlot& sl = g_shadowSlots[s];
                 if (!sl.valid || !sl.activeThisFrame || sl.lastRenderFrame == 0) { continue; }
                 activeBits |= (1u << s);
                 if (sl.lastRenderFrame == frame) { staticReBits |= (1u << s); }
+                if (sl.fClass == 2u) {
+                    flickerBits |= (1u << s);   // shadow "movement" applies here only
+                    // Intensity match: modulate this flicker light's FORWARD brightness with the SAME flame
+                    // signal (seed + gust + a fast term IN PHASE with the dominant sway octave). Drives
+                    // brightness = tracked peak (fMaxI) * b, replacing MW's own flicker for this light so the
+                    // two stay coherent. Rewrites the forward light rgb this frame (client re-ships next frame).
+                    if (g_flickIntensityMatch && g_flickIntensityDepth > 0.0f && sl.fMaxI > 1e-4f) {
+                        const float seed = (float)s * 2.399963f;                       // == mask per-slot seed
+                        const float g0   = 0.5f + 0.5f * sinf(flickA * 0.17f + seed * 0.9f);
+                        const float g1   = 0.5f + 0.5f * sinf(flickA * 0.31f + seed * 2.3f);
+                        const float gust = 0.22f + 0.78f * g0 * g1;                     // == mask gust envelope
+                        const float fast = 0.5f + 0.5f * sinf(flickA * 1.07f + seed * 0.5f);  // in phase w/ z sway
+                        const float flame = gust * (0.6f + 0.4f * fast);               // ~0.13 .. 1.0
+                        const float b     = 1.0f - g_flickIntensityDepth * (1.0f - flame);    // [1-depth .. 1]
+                        float* col = &lc[4 + sl.curLightIdx * 12 + 4];                  // forward light rgb (this frame)
+                        const float cur = std::max(col[0], std::max(col[1], col[2]));
+                        if (cur > 1e-4f) {
+                            const float scale = (sl.fMaxI * b) / cur;   // override MW flicker → peak * b
+                            col[0] *= scale; col[1] *= scale; col[2] *= scale;
+                        }
+                    }
+                }
                 mp[24 + s * 4 + 0] = sl.absPos[0] - g_eyeAbsShadow[0];   // slotPosRad[s] CAMERA-RELATIVE
                 mp[24 + s * 4 + 1] = sl.absPos[1] - g_eyeAbsShadow[1];
                 mp[24 + s * 4 + 2] = sl.absPos[2] - g_eyeAbsShadow[2];
@@ -6516,11 +6661,17 @@ namespace ForgeRender {
             mp[23] = g_shadowAtlasDebug ? 2.0f : (g_shadowFaceDebug ? 1.0f : 0.0f);
             mp[280] = g_shadowBias;               // biasParams.x = absolute contact bias (live knob)
             mp[281] = g_shadowNormalOffset;       // biasParams.y = normal-offset bias in texels (live knob)
-            mp[282] = 0.0f;                       // biasParams.z UNUSED (dynBits moved to slotBits.y)
+            // Flicker shadow "movement": the mask rotates the LOOKUP direction of flicker-class slots by a
+            // small time-varying angle → world displacement = angle*dist (stable at the light/candle tip,
+            // growing toward the attenuation edge). biasParams.z = evolving phase (time*speed, captured base
+            // so the float stays small), biasParams.w = rotation amplitude (radians). slotBits.z picks slots.
+            mp[282] = flickA;                     // biasParams.z = shared flame phase (== the intensity match)
+            mp[283] = g_flickShadowMove;          // biasParams.w = rotation amplitude (radians; 0 = off)
             // slotBits (uint4): the 32-bit slot masks as REAL uints — a float lane is exact only
             // to 24 bits, so at 32 slots the top-8 would silently vanish.
             reinterpret_cast<uint32_t*>(mp)[284] = activeBits;   // slotBits.x
             reinterpret_cast<uint32_t*>(mp)[285] = dynBits;      // slotBits.y (C4b dyn tile valid THIS frame)
+            reinterpret_cast<uint32_t*>(mp)[286] = flickerBits;  // slotBits.z (flicker-class slots → dir wobble)
             // validBits: slots that HOLD a rendered tile (valid + rendered at least once), whether or
             // not their light is in view this frame. Lets the debug view show a RETAINED/cached tile
             // (valid, inactive) distinctly from an empty slot — so a 360 turn visibly keeps all slots
@@ -6545,9 +6696,15 @@ namespace ForgeRender {
             // bitmask / caster count. Log a line on any render frame (≤10 apart) + a 240-frame beat
             // → "renders=0 standing still" and "active>1 = multi-shadow" are both visible.
             {
-                uint32_t nActive = 0, nValid = 0;
+                uint32_t nActive = 0, nValid = 0, nFlk = 0, nPul = 0, nStdy = 0;
                 for (uint32_t s = 0; s < kMaxShadowLights; ++s) {
-                    if (g_shadowSlots[s].valid) { ++nValid; if (g_shadowSlots[s].activeThisFrame) { ++nActive; } }
+                    if (g_shadowSlots[s].valid) {
+                        ++nValid;
+                        if (g_shadowSlots[s].activeThisFrame) {
+                            ++nActive;
+                            switch (g_shadowSlots[s].fClass) { case 2: ++nFlk; break; case 1: ++nPul; break; default: ++nStdy; break; }
+                        }
+                    }
                 }
                 static uint64_t s_lastShadowLog = 0;
                 const bool rend = (nRender > 0) && (frame - s_lastShadowLog >= 10);
@@ -6559,8 +6716,8 @@ namespace ForgeRender {
                     for (const auto& dm : g_dynMoverCasters) {
                         if (dm.slot < g_meshHigh && g_meshes[dm.slot].animated) { ++nMovAnim; }
                     }
-                    LOG::logline(">> [p3-shadow] f=%u valid=%u active=%u lights=%u churn(free=%u chal=%u) renders=%u (must=%u stale=%u) dyn=%u movers=%u (anim=%u) srcMover=%d rigidMov=%d occCull=%d occ=%u occBits=0x%08X activeBits=0x%08X dynBits=0x%08X casters=%u",
-                                 frame, nValid, nActive, (unsigned)lights.size(), nAssignFree, nAssignChal,
+                    LOG::logline(">> [p3-shadow] f=%u valid=%u active=%u lights=%u flk=%u/%u/%u(F/P/S) churn(free=%u chal=%u) renders=%u (must=%u stale=%u) dyn=%u movers=%u (anim=%u) srcMover=%d rigidMov=%d occCull=%d occ=%u occBits=0x%08X activeBits=0x%08X dynBits=0x%08X casters=%u",
+                                 frame, nValid, nActive, (unsigned)lights.size(), nFlk, nPul, nStdy, nAssignFree, nAssignChal,
                                  nRender, nMustR, nStaleR,
                                  (unsigned)g_shadowRendersDyn.size(),
                                  nMov, nMovAnim,
@@ -7145,19 +7302,24 @@ namespace ForgeRender {
                     cmdBindPipeline(g_live.pCmd, g_live.pShadowClearPipeline);
                     cmdDraw(g_live.pCmd, 3, 0);
 
-                    // This job's casters (mirror,slot)-sorted; draw local i reads matrix
+                    // This job's casters (twoSided,mirror,slot)-sorted; draw local i reads matrix
                     // regionBase+i of the SHADOW world window via firstInstance. Face CBV
                     // R.slot*6+f (per-slot, shared with the dyn pass) carries this job's face
-                    // light-centred viewProj.
-                    int shMirror = -1;
+                    // light-centred viewProj. Rebind keyed on the CHOSEN pso (covers both the
+                    // mirror flip AND the fixture-cage two-sided override).
+                    Pipeline* boundPso = nullptr;
                     for (uint32_t k = R.casterBegin; k < R.casterEnd; ++k) {
                         const ShadowCaster& scst = g_shadowCasters[k];
                         HostMesh& hm = g_meshes[scst.slot];
                         const uint32_t firstInst = regionBase + (k - R.casterBegin);
-                        if ((int)scst.mirror != shMirror) {
+                        // A fixture cage enclosing its own light forces CULL_NONE regardless of the
+                        // live g_shadowCasterCull mode (which front/back-culls half the cage away).
+                        Pipeline* casterPso;
+                        if (scst.twoSided) {
+                            casterPso = g_live.pShadowPipelineNone;
+                        } else {
                             // Live caster-cull pick (g_shadowCasterCull). CULL_NONE ignores winding
                             // (one PSO); BACK/FRONT keep the mirror-winding pair.
-                            Pipeline* casterPso;
                             switch (g_shadowCasterCull) {
                             case 1:  casterPso = g_live.pShadowPipelineNone; break;
                             case 2:  casterPso = scst.mirror ? g_live.pShadowPipelineFrontMirror
@@ -7165,11 +7327,13 @@ namespace ForgeRender {
                             default: casterPso = scst.mirror ? g_live.pShadowPipelineMirror
                                                              : g_live.pShadowPipeline; break;
                             }
+                        }
+                        if (casterPso != boundPso) {
                             cmdBindPipeline(g_live.pCmd, casterPso);
                             cmdBindDescriptorSet(g_live.pCmd, R.slot * 6 + f, g_live.pShadowFaceSet);
                             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
                             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pShadowBatchSet);
-                            shMirror = (int)scst.mirror;
+                            boundPso = casterPso;
                         }
                         if (hm.inArena) {
                             Buffer*  vbs[2]     = { g_live.pArenaVB, g_live.pShadowInstanceBuf };
@@ -8266,7 +8430,16 @@ namespace ForgeRender {
                     const float cx = sl.absPos[0] - g_eyeAbsShadow[0];
                     const float cy = sl.absPos[1] - g_eyeAbsShadow[1];
                     const float cz = sl.absPos[2] - g_eyeAbsShadow[2];
-                    float cr, cg, cb; debugIdColor(sl.lightId, cr, cg, cb);
+                    float cr, cg, cb;
+                    if (g_debugFlickerClass) {
+                        switch (sl.fClass) {
+                        case 2:  cr = 1.0f; cg = 0.5f; cb = 0.1f; break;   // FLICKER = orange
+                        case 1:  cr = 0.2f; cg = 0.5f; cb = 1.0f; break;   // PULSE   = blue
+                        default: cr = 0.6f; cg = 0.6f; cb = 0.6f; break;   // STEADY  = grey
+                        }
+                    } else {
+                        debugIdColor(sl.lightId, cr, cg, cb);
+                    }
                     emitCage(cx, cy, cz, g_shadowRangeK * sl.radius, cr, cg, cb);         // inner: test range
                     emitCage(cx, cy, cz, 2.0f * sl.radius, cr * 0.4f, cg * 0.4f, cb * 0.4f); // outer: 2r fade edge
                 }
