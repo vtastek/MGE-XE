@@ -4879,6 +4879,17 @@ namespace {
                                         // shadow. Must-renders (freshly assigned / moved slots) are never
                                         // vetoed. Cuts the recurring every-frame dyn-tile re-bake for hidden
                                         // movers. OFF = byte-identical to pre-Follow-on-3 bake scheduling.
+    float g_shadowInactivePenalty = 0.0f; // Slot-reclaim bias: an INACTIVE slot (its light absent this
+                                        // frame — yawed away, or gone) shows nothing visible right now, yet
+                                        // ranks by its yaw-invariant last-seen importance, so it can hoard a
+                                        // slot against a light that IS in view. This scales an inactive slot's
+                                        // EFFECTIVE importance when picking the challenge victim (:6089). DEFAULT
+                                        // 0.0 (user-verified in a starved interior: 5 far table lights that sat
+                                        // unshadowed at active=11/19 all light up, and the eviction fight lands
+                                        // ENTIRELY on low-importance small lights — an inactive slot's effImp is
+                                        // 0 so ANY present light reclaims it, while kShadowHoldFrames=30 bounds
+                                        // thrash → chal stayed 0-2, no visible downside). 1.0 = off (old ranking,
+                                        // absent lights hoard slots); >0 keeps a partial bias. Live A/B knob.
     // C3b: emissive caster skip — replaces the P3 fixture-radius self-shadow heuristic (which was
     // finnicky: a lantern is several NiTriShapes with different bounding spheres, so parts of the
     // fixture's shadow appeared/disappeared). MW marks a light's own hot part with a full-emissive
@@ -5077,6 +5088,8 @@ namespace {
         uiAddComponentWidget(g_uiPanel, "Shadow: expire offscreen movers (OFF = proof)", &cShEx, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cShOc = {}; cShOc.pData = &g_shadowOcclusionCull;
         uiAddComponentWidget(g_uiPanel, "Shadow: occlusion-cull bakes (Hi-Z; OFF = byte-identical)", &cShOc, WIDGET_TYPE_CHECKBOX);
+        SliderFloatWidget sShIp = {}; sShIp.pData = &g_shadowInactivePenalty; sShIp.mMin = 0.0f; sShIp.mMax = 1.0f; sShIp.mStep = 0.05f;
+        uiAddComponentWidget(g_uiPanel, "Shadow: inactive-slot reclaim penalty (1 = off)", &sShIp, WIDGET_TYPE_SLIDER_FLOAT);
         SliderFloatWidget sShEm = {}; sShEm.pData = &g_shadowEmissiveSkip; sShEm.mMin = 0.0f; sShEm.mMax = 1.5f; sShEm.mStep = 0.05f;
         uiAddComponentWidget(g_uiPanel, "Shadow: emissive caster skip (>1 = off)", &sShEm, WIDGET_TYPE_SLIDER_FLOAT);
         CheckboxWidget cShBc = {}; cShBc.pData = &g_shadowBlendCasters;
@@ -6091,7 +6104,15 @@ namespace ForgeRender {
                     ShadowSlot& sl = g_shadowSlots[s];
                     if (!sl.valid) { continue; }
                     if (frame - sl.assignedFrame < kShadowHoldFrames) { continue; }   // protected
-                    if (sl.importance < weakImp) { weakImp = sl.importance; weak = (int)s; }
+                    // A present, in-view light should be able to reclaim a slot an ABSENT light is merely
+                    // holding — its cached tile shows nothing visible this frame. Penalise an inactive slot's
+                    // effective importance (g_shadowInactivePenalty) so a visible light can out-challenge a
+                    // gone/far absent incumbent, while a near-behind absent light (high base imp) still wins →
+                    // yaw-back stays pop-free. 1.0 = today's ranking. Feeds the ratio test below too (a lower
+                    // weakImp is easier to beat), so the penalty both PICKS the idle slot and eases taking it.
+                    const float effImp = sl.activeThisFrame ? sl.importance
+                                                            : (g_shadowInactivePenalty * sl.importance);
+                    if (effImp < weakImp) { weakImp = effImp; weak = (int)s; }
                 }
                 if (weak >= 0 && lights[c].imp > kShadowChallengeRatio * weakImp) {
                     assignSlot((uint32_t)weak, lights[c]); ++nAssignChal;
