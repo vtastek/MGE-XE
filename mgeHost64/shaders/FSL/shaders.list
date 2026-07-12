@@ -215,3 +215,11 @@
 #comp cullscatter.comp
 #include "cullscatter.comp.fsl"
 #end
+
+// Follow-on 3: occlusion-cull SHADOW LIGHTS vs the Hi-Z pyramid. One thread per shadow slot (32,
+// one group); reuses hizocclusion.h.fsl (same test as cull.comp). ORs each fully-occluded slot's
+// bit into gLightOccBits[0] — the host reads it back and skips that slot's atlas bake (bakes-only,
+// never the cached tile / mask). Shares compute.rootsig + its own ShadowLightCullSrtData PerBatch set.
+#comp shadowlightcull.comp
+#include "shadowlightcull.comp.fsl"
+#end

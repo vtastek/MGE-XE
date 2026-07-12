@@ -1,0 +1,38 @@
+// mgeHost64 — Follow-on 3: occlusion-cull shadow lights vs the Hi-Z pyramid.
+//
+// One thread per shadow slot (32-wide, ONE group). Reads the slot's influence sphere, tests it
+// against the PREVIOUS frame's Hi-Z pyramid with the SAME one-pass test the statics cull uses
+// (hizocclusion.h.fsl — hizEyeDelta rebases this frame's camera-relative center into the pyramid
+// camera's space), and ORs the slot's bit into gLightOccBits[0] when fully occluded. The host
+// reads it back (1-frame latency) and skips that slot's bake — never its cached tile / mask.
+//
+// Every uncertain case in hizOccluded() returns NOT-occluded (no bit set), so a mis-cull can only
+// delay a bake by a frame (the cached tile covers it) — never delete a visible shadow.
+
+#include "shadowlightcull.srt.h"
+#include "hizocclusion.h.fsl"
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(32, 1, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    // NB: every RETURN() MUST start its own line (fsl.py only rewrites a line-leading RETURN).
+    uint s = DispatchThreadID.x;
+    if (s >= 32u)
+        RETURN();
+
+    float4 sp = gCullParams.spheres[s];
+    float effR = sp.w;
+    if (effR <= 0.0f)          // inactive slot -> never occluded
+        RETURN();
+
+    // Rebase the current camera-relative center into the pyramid camera's space, exactly as
+    // cull.comp does (center + hizEyeDelta), then run the shared sphere-vs-Hi-Z test.
+    if (hizOccluded(sp.xyz + gCullParams.hizEyeDelta.xyz, effR))
+    {
+        uint prev;
+        AtomicOr(gLightOccBits[0], (1u << s), prev);
+    }
+    RETURN();
+}

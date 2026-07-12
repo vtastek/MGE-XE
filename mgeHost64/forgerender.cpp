@@ -76,6 +76,10 @@
 // P1 point-light shadows: screen-space mask SRT (ShadowMaskSrtData, PerBatch frequency). Shares
 // the merged ComputeRootSignature. See [[project_forge_point_lights]] / tasks/todo.md.
 #include "shaders/FSL/shadowmask.srt.h"
+// Follow-on 3: shadow-light occlusion cull SRT (ShadowLightCullSrtData, PerBatch frequency). Shares
+// the merged ComputeRootSignature. Names its cbuffer gCullParams + texture gCullHiz so it can reuse
+// hizocclusion.h.fsl verbatim; the struct type (LightCullParams) is distinct from cull's CullParams.
+#include "shaders/FSL/shadowlightcull.srt.h"
 
 // App-layer callback normally provided by WindowsBase.cpp (which we exclude — it
 // drags in the window system). The backend calls this on device-lost. Headless:
@@ -1123,6 +1127,19 @@ namespace {
         uint32_t       cullSubsetCount = 0;         // g_staticsSubsets.size() at upload
         bool           gpuStaticsReady = false;     // all B3 resources + pipelines created
         bool           gpuArgsInDrawState = false;  // pGpuArgs/pGpuInstOut currently in INDIRECT/VERTEX (else UAV)
+        // --- Follow-on 3: shadow-light occlusion cull (one dispatch/frame, 1-frame readback) -------
+        // Tests each shadow slot's influence sphere vs the PREVIOUS frame's Hi-Z pyramid (the SAME
+        // test as cull.comp); a fully-occluded slot ORs its bit into pLightOccBits[0]. The host reads
+        // it back post-fence and skips that slot's atlas BAKE next frame (bakes-only, pop-free). All
+        // scene-independent (interiors too), so created lazily in the shadow manager, NOT the DL init.
+        Buffer*        pLightOccBits     = nullptr;  // GPU_ONLY RW uint[1]: occluded-slot bitmask
+        Buffer*        pLightOccReadback = nullptr;  // GPU_TO_CPU, persistent-mapped (post-fence read)
+        Buffer*        pLightOccZero     = nullptr;  // CPU_TO_GPU zero (per-frame reset source)
+        Buffer*        pLightHizCbv      = nullptr;  // gCullParams (hizVP/hizParams/hizEyeDelta + spheres[32]), per-frame
+        Shader*        pShadowLightCullShader = nullptr;
+        Pipeline*      pShadowLightCullPipeline = nullptr;
+        DescriptorSet* pShadowLightCullSet = nullptr; // ShadowLightCullSrtData PerBatch
+        bool           shadowLightCullReady = false;
         DescriptorSet* pPerFrameSet = nullptr;    // gFrameData cbuffer (viewProj), 1 instance
         DescriptorSet* pPerBatchSet = nullptr;    // gBatch cbuffer window, kMaxBatches instances
         Buffer*        pFrameCbv = nullptr;        // gFrameData cbuffer (viewProj), persistent-mapped
@@ -1547,6 +1564,15 @@ namespace {
                                         // instead of re-rendering 6 faces every frame (the F12-12 dyn-atlas
                                         // pollution). OFF: legacy behavior — every LIVE rigid caster is a mover.
                                         // A/B for regression comparison; always-on is the shipping default.
+
+    // Follow-on 3: shadow-light occlusion cull runtime state. A tiny GPU dispatch tests each slot's
+    // influence sphere vs the PREVIOUS frame's Hi-Z pyramid; the host reads it back with 1-frame
+    // latency and skips the BAKE for fully-occluded slots (never the cached tile / mask — pop-free).
+    uint32_t g_lightOccludedBits = 0;     // latched post-fence: bit s = slot s fully occluded last frame
+    bool     g_lightOccValid     = false; // a fresh readback exists (false until the first latch)
+    uint32_t g_lightOccTestId[kMaxShadowLights] = {}; // the lightId each slot held when its sphere was
+                                          // filled → keyed consumption (a reassigned slot disarms the veto)
+    uint32_t g_lightOccVetoed    = 0;     // heartbeat: slots vetoed (bake skipped) this frame
 
     // P3 caching: a slot's atlas tile is re-rendered only when its caster set actually changes —
     // NEVER on a timer or on camera turn. Two invalidation channels:
@@ -4845,6 +4871,14 @@ namespace {
                                         // so a settled/false-flagged static (a bottle) loses its shadow offscreen.
                                         // OFF = keep all caster records (proves the expiry is the offscreen-loss
                                         // cause; genuine movers would keep a frozen shadow, hence only a proof).
+    bool  g_shadowOcclusionCull = true; // Follow-on 3 (default ON): skip the atlas BAKE for shadow slots
+                                        // whose whole influence sphere is occluded by the Hi-Z pyramid (a
+                                        // torch behind a wall, a fixture across a building). Bakes-only veto:
+                                        // the cached tile + screen-space mask are untouched, so a mis-cull
+                                        // only reuses a stale tile one extra frame — never deletes a visible
+                                        // shadow. Must-renders (freshly assigned / moved slots) are never
+                                        // vetoed. Cuts the recurring every-frame dyn-tile re-bake for hidden
+                                        // movers. OFF = byte-identical to pre-Follow-on-3 bake scheduling.
     // C3b: emissive caster skip — replaces the P3 fixture-radius self-shadow heuristic (which was
     // finnicky: a lantern is several NiTriShapes with different bounding spheres, so parts of the
     // fixture's shadow appeared/disappeared). MW marks a light's own hot part with a full-emissive
@@ -5041,6 +5075,8 @@ namespace {
         uiAddComponentWidget(g_uiPanel, "Shadow: skip ambient/sun fill (linear-atten)", &cShSl, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cShEx = {}; cShEx.pData = &g_shadowExpireMovers;
         uiAddComponentWidget(g_uiPanel, "Shadow: expire offscreen movers (OFF = proof)", &cShEx, WIDGET_TYPE_CHECKBOX);
+        CheckboxWidget cShOc = {}; cShOc.pData = &g_shadowOcclusionCull;
+        uiAddComponentWidget(g_uiPanel, "Shadow: occlusion-cull bakes (Hi-Z; OFF = byte-identical)", &cShOc, WIDGET_TYPE_CHECKBOX);
         SliderFloatWidget sShEm = {}; sShEm.pData = &g_shadowEmissiveSkip; sShEm.mMin = 0.0f; sShEm.mMax = 1.5f; sShEm.mStep = 0.05f;
         uiAddComponentWidget(g_uiPanel, "Shadow: emissive caster skip (>1 = off)", &sShEm, WIDGET_TYPE_SLIDER_FLOAT);
         CheckboxWidget cShBc = {}; cShBc.pData = &g_shadowBlendCasters;
@@ -5433,6 +5469,7 @@ namespace ForgeRender {
     void dlLiveRecord();
     bool dlCreateLiveRings(Renderer* R);   // statics instance/arg rings (forward: --forge-view eager init)
     void buildStaticsGrid();               // live cull grid (forward: --forge-view eager init)
+    bool createShadowLightCullResources(Renderer* R);   // Follow-on 3: lazy from the shadow manager
     void dlLogHeartbeat();
     void dlLogGpuSlow(double gpuMs, double recMs, unsigned drawn);   // per-frame GPU spike (reads DL counts)
 
@@ -5700,7 +5737,12 @@ namespace ForgeRender {
         g_shadowRendersDyn.clear();
         g_shadowCasters.clear();
         g_dynMoverCasters.clear();
+        g_lightOccVetoed = 0;   // Follow-on 3: slots vetoed this frame (heartbeat)
         if (g_live.shadowReady) {
+            // Follow-on 3: lazy one-time create of the occlusion-cull resources (runs BEFORE beginCmd,
+            // where addResource/addPipeline are legal). shadowReady ⇒ buildOpaquePath already made pHiz,
+            // so gCullHiz binds the real pyramid. Non-fatal: a failure leaves the veto disabled.
+            if (!g_live.pShadowLightCullPipeline) { createShadowLightCullResources(R); }
             float* lc = (float*)g_live.pLightCbv->pCpuMappedAddress;
             const uint32_t nL    = g_lastLightCount;
             const uint32_t frame = g_renderFrame;
@@ -6157,6 +6199,14 @@ namespace ForgeRender {
                 // PRECISE dirty (a caster in THIS slot's reach changed) OR a GLOBAL event (cell/knob
                 // flip). The precise flag is what keeps a camera turn from re-baking untouched slots.
                 const bool stale = sl.dirty || (sl.lastRenderFrame < g_casterEpoch);
+                // Follow-on 3: veto the BAKE (never the cached tile/mask) when this slot's whole
+                // influence sphere was occluded by last frame's Hi-Z pyramid AND the slot still holds
+                // the same light the sphere was filled for (keyed via g_lightOccTestId — a reassigned
+                // slot disarms the veto). NEVER veto a must-render (fresh/moved slot always bakes) —
+                // that also covers the slot-reassignment case (assignSlot resets lastRenderFrame=0).
+                const bool occCulled = !must && g_shadowOcclusionCull && g_lightOccValid
+                                       && ((g_lightOccludedBits >> s) & 1u) != 0u
+                                       && g_lightOccTestId[s] == sl.lightId;
                 // C4a: a skinned part in reach re-poses every frame. C4b: that no longer dirties
                 // the STATIC tile — it schedules the slot's cheap DYNAMIC tile instead (below).
                 bool skinnedHit = false;
@@ -6202,8 +6252,32 @@ namespace ForgeRender {
                         if (dx*dx + dy*dy + dz*dz <= rr*rr) { rigidHit = true; break; }
                     }
                 }
-                dynHit[s] = skinnedHit || mmHit || rigidHit;
-                if (must || stale) { dirty.push_back(s); }   // C4b: movers no longer force a static re-render
+                // Follow-on 3: an occluded slot skips BOTH bakes — the every-frame dyn re-bake
+                // (dynHit forced false, the recurring win) and the static re-bake (not pushed to
+                // dirty). sl.dirty is LEFT SET so it bakes the frame it disoccludes (occCulled clears).
+                dynHit[s] = (skinnedHit || mmHit || rigidHit) && !occCulled;
+                if (occCulled) { ++g_lightOccVetoed; }
+                if (must || (stale && !occCulled)) { dirty.push_back(s); }   // C4b: movers no longer force a static re-render
+            }
+
+            // Follow-on 3: record THIS frame's slot influence spheres for NEXT frame's occlusion test
+            // (filled AFTER the veto loop above so g_lightOccTestId still holds the ids the just-read
+            // occlusion bits were computed for). center = absPos − eye (current camera-relative, the
+            // space the statics cull feeds); radius = the mask TEST reach (g_shadowRangeK·r — the
+            // tightest correct sphere: a shadow only lands where the mask tests). Inactive slots write
+            // radius 0 (the shader skips them). g_lightOccTestId keys next frame's keyed consumption.
+            // spheres[] ride IN the cbuffer at float 24 (after hizVP@0 / hizParams@16 / hizEyeDelta@20).
+            if (g_live.pLightHizCbv && g_live.pLightHizCbv->pCpuMappedAddress) {
+                float* sph = (float*)g_live.pLightHizCbv->pCpuMappedAddress + 24;
+                for (uint32_t s = 0; s < kMaxShadowLights; ++s) {
+                    const ShadowSlot& sl = g_shadowSlots[s];
+                    const bool on = sl.valid && sl.activeThisFrame;
+                    sph[s * 4 + 0] = on ? (sl.absPos[0] - g_eyeAbsShadow[0]) : 0.0f;
+                    sph[s * 4 + 1] = on ? (sl.absPos[1] - g_eyeAbsShadow[1]) : 0.0f;
+                    sph[s * 4 + 2] = on ? (sl.absPos[2] - g_eyeAbsShadow[2]) : 0.0f;
+                    sph[s * 4 + 3] = on ? (g_shadowRangeK * sl.radius) : 0.0f;   // <=0 ⇒ inactive
+                    g_lightOccTestId[s] = on ? sl.lightId : 0u;
+                }
             }
             std::sort(dirty.begin(), dirty.end(), [&](uint32_t a, uint32_t b) {
                 const uint32_t ra = g_shadowSlots[a].lastRenderFrame, rb = g_shadowSlots[b].lastRenderFrame;
@@ -6423,12 +6497,14 @@ namespace ForgeRender {
                     for (const auto& dm : g_dynMoverCasters) {
                         if (dm.slot < g_meshHigh && g_meshes[dm.slot].animated) { ++nMovAnim; }
                     }
-                    LOG::logline(">> [p3-shadow] f=%u valid=%u active=%u lights=%u churn(free=%u chal=%u) renders=%u (must=%u stale=%u) dyn=%u movers=%u (anim=%u) srcMover=%d rigidMov=%d activeBits=0x%08X dynBits=0x%08X casters=%u",
+                    LOG::logline(">> [p3-shadow] f=%u valid=%u active=%u lights=%u churn(free=%u chal=%u) renders=%u (must=%u stale=%u) dyn=%u movers=%u (anim=%u) srcMover=%d rigidMov=%d occCull=%d occ=%u occBits=0x%08X activeBits=0x%08X dynBits=0x%08X casters=%u",
                                  frame, nValid, nActive, (unsigned)lights.size(), nAssignFree, nAssignChal,
                                  nRender, nMustR, nStaleR,
                                  (unsigned)g_shadowRendersDyn.size(),
                                  nMov, nMovAnim,
                                  g_shadowSourceMover ? 1 : 0, g_shadowRigidMovers ? 1 : 0,
+                                 g_shadowOcclusionCull ? 1 : 0, g_lightOccVetoed,
+                                 (g_lightOccValid ? g_lightOccludedBits : 0u),
                                  activeBits, dynBits, (unsigned)g_shadowCasters.size());
                     s_lastShadowLog = frame;
                 }
@@ -6627,6 +6703,49 @@ namespace ForgeRender {
             cl->CopyBufferRegion(g_live.pCullCountReadback->mDx.pResource, 0,
                                  g_live.pCullCountBuf->mDx.pResource, 0, 2 * sizeof(uint32_t));
             bufBarrier(g_live.pCullCountBuf, RESOURCE_STATE_COPY_SOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+
+        // ===================== Follow-on 3: shadow-light occlusion cull =============================
+        // One group of 32 threads (one per shadow slot) tests each slot's influence sphere vs the
+        // PREVIOUS frame's Hi-Z pyramid (reprojected via hizEyeDelta) — the SAME reprojected contract
+        // the statics cull uses (this frame's mip 0 fills later at the colour->water seam). Runs
+        // OUTSIDE the statics `if` so it fires in interiors too (no statics dependency). Result reads
+        // back with 1-frame latency; the shadow manager consumes it next frame (bakes-only veto).
+        if (g_live.shadowLightCullReady && g_live.pShadowLightCullPipeline) {
+            ID3D12GraphicsCommandList* cl2 = g_live.pCmd->mDx.pCmdList;
+            auto bufBarrier2 = [&](Buffer* buf, ResourceState from, ResourceState to) {
+                BufferBarrier bb = {}; bb.pBuffer = buf; bb.mCurrentState = from; bb.mNewState = to;
+                cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
+            };
+            // Fill gCullParams (LightCullParams: hizVP @0, hizParams @16, hizEyeDelta @20) directly
+            // from the prev-frame pyramid state — NOT the DL cull cbuffer (quiet on interior frames).
+            if (g_live.pLightHizCbv && g_live.pLightHizCbv->pCpuMappedAddress) {
+                float* cp = (float*)g_live.pLightHizCbv->pCpuMappedAddress;
+                std::memcpy(cp, g_hizVP, 16 * sizeof(float));                               // hizVP
+                const float dEx = g_eyeAbsShadow[0] - g_hizEye[0];
+                const float dEy = g_eyeAbsShadow[1] - g_hizEye[1];
+                const float dEz = g_eyeAbsShadow[2] - g_hizEye[2];
+                const bool eyeJump = (dEx*dEx + dEy*dEy + dEz*dEz) > (2048.0f * 2048.0f);
+                cp[16] = (float)g_live.width; cp[17] = (float)g_live.height;                // hizParams.xy
+                cp[18] = (float)(g_live.hizMips > 0 ? g_live.hizMips - 1 : 0);              // hizParams.z
+                cp[19] = (g_hizValid && !eyeJump) ? 1.0f : 0.0f;                            // hizParams.w = valid
+                cp[20] = dEx; cp[21] = dEy; cp[22] = dEz; cp[23] = 0.0f;                    // hizEyeDelta
+            }
+            // reset gLightOccBits[0] -> 0 (UAV -> COPY_DEST, copy zeros, -> UAV)
+            bufBarrier2(g_live.pLightOccBits, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_DEST);
+            cl2->CopyBufferRegion(g_live.pLightOccBits->mDx.pResource, 0,
+                                  g_live.pLightOccZero->mDx.pResource, 0, sizeof(uint32_t));
+            bufBarrier2(g_live.pLightOccBits, RESOURCE_STATE_COPY_DEST, RESOURCE_STATE_UNORDERED_ACCESS);
+            cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.6f, 0.2f, "SHADOW-LIGHT occlusion cull");
+            cmdBindPipeline(g_live.pCmd, g_live.pShadowLightCullPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pShadowLightCullSet);
+            cmdDispatch(g_live.pCmd, 1, 1, 1);
+            cmdEndDebugMarker(g_live.pCmd);
+            // readback gLightOccBits[0]: UAV -> COPY_SOURCE, copy to readback, -> UAV
+            bufBarrier2(g_live.pLightOccBits, RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_COPY_SOURCE);
+            cl2->CopyBufferRegion(g_live.pLightOccReadback->mDx.pResource, 0,
+                                  g_live.pLightOccBits->mDx.pResource, 0, sizeof(uint32_t));
+            bufBarrier2(g_live.pLightOccBits, RESOURCE_STATE_COPY_SOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
         }
         gpuPhaseEnd(kGpuPhaseCull);
 
@@ -8785,6 +8904,13 @@ namespace ForgeRender {
             const uint32_t* rb = (const uint32_t*)g_live.pCullCountReadback->pCpuMappedAddress;
             g_lastGpuCullCount = rb[0];
             g_lastGpuOccluded  = rb[1];
+        }
+        // Follow-on 3: latch this frame's shadow-light occlusion bits (valid now the fence signalled).
+        // Next frame's shadow manager consumes them (keyed by g_lightOccTestId) to veto bakes only.
+        if (g_live.shadowLightCullReady && g_live.pLightOccReadback
+            && g_live.pLightOccReadback->pCpuMappedAddress) {
+            g_lightOccludedBits = *(const uint32_t*)g_live.pLightOccReadback->pCpuMappedAddress;
+            g_lightOccValid     = true;
         }
         // Per-frame slow-GPU self-report (the 300-frame average can't surface a fresh dense-area
         // stall at 0.2 fps). Pairs with [dl-slow] (CPU cull) to localize a hitch to CPU vs GPU.
@@ -11727,6 +11853,111 @@ namespace ForgeRender {
             && g_pStaticsInstRingRefl && g_pStaticsArgsRingRefl;
     }
 
+    // Follow-on 3: shadow-light occlusion-cull resources. Scene-INDEPENDENT (no statics dependency —
+    // works in interiors too), so created lazily from the shadow manager on first use, NOT the DL
+    // init. Mirrors the statics cull's readback idiom: a per-frame CPU_TO_GPU cbuffer (hiz params +
+    // the 32 slot spheres — a structured SRV over an upload heap is illegal in D3D12, so the spheres
+    // ride in the cbuffer), a GPU_ONLY bit-mask UAV, GPU_TO_CPU readback + CPU_TO_GPU zero staging,
+    // and the one-group shadowlightcull.comp pipeline/descriptor set. Idempotent; non-fatal (a
+    // failure just leaves the veto disabled — every slot bakes as before).
+    bool createShadowLightCullResources(Renderer* R) {
+        if (g_live.pShadowLightCullPipeline) { return g_live.shadowLightCullReady; }
+
+        // (1) Occluded-slot bitmask UAV (uint[1]). DEFAULT heap.
+        BufferLoadDesc ob = {};
+        ob.mDesc.mDescriptors  = DESCRIPTOR_TYPE_RW_BUFFER;
+        ob.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+        ob.mDesc.mStructStride = sizeof(uint32_t);
+        ob.mDesc.mElementCount = 1;
+        ob.mDesc.mSize         = sizeof(uint32_t);
+        ob.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
+        ob.mDesc.pName         = "lightOccBits";
+        ob.ppBuffer            = &g_live.pLightOccBits;
+        addResource(&ob, nullptr);
+
+        // (2) Readback (GPU_TO_CPU) + zero-reset (CPU_TO_GPU) staging, persistent-mapped. Reset/read
+        //     via raw D3D12 CopyBufferRegion (Forge has no buffer->buffer copy), exactly like the cull.
+        BufferLoadDesc rb = {};
+        rb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_TO_CPU;
+        rb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+        rb.mDesc.mSize        = 16;
+        rb.mDesc.mStartState  = RESOURCE_STATE_COPY_DEST;
+        rb.mDesc.pName        = "lightOccReadback";
+        rb.ppBuffer           = &g_live.pLightOccReadback;
+        addResource(&rb, nullptr);
+        BufferLoadDesc zb = {};
+        zb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+        zb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+        zb.mDesc.mSize        = 16;
+        zb.mDesc.pName        = "lightOccZero";
+        zb.ppBuffer           = &g_live.pLightOccZero;
+        addResource(&zb, nullptr);
+
+        // (3) Per-frame cbuffer (gCullParams: hizVP + hizParams + hizEyeDelta + spheres[32]). The hiz
+        //     block is filled at dispatch from g_hizVP/g_hizEye/g_hizValid; the spheres are filled in
+        //     the shadow manager. NOT shared with pCullParamsCbv (that one is written only on the DL
+        //     primary path; a dedicated cbuffer keeps the light cull correct on frames the DL cull is
+        //     quiet, e.g. interiors).
+        BufferLoadDesc hb = {};
+        hb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        hb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+        hb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+        hb.mDesc.mSize        = 1024;                         // >= sizeof(LightCullParams) (608B), CBV-aligned
+        hb.mDesc.pName        = "lightHizCbv";
+        hb.ppBuffer           = &g_live.pLightHizCbv;
+        addResource(&hb, nullptr);
+
+        waitForAllResourceLoads();
+        if (g_live.pLightOccZero && g_live.pLightOccZero->pCpuMappedAddress) {
+            std::memset(g_live.pLightOccZero->pCpuMappedAddress, 0, 16);   // reset source (never changes)
+        }
+        if (!g_live.pLightOccBits || !g_live.pLightOccReadback
+            || !g_live.pLightOccZero || !g_live.pLightHizCbv) {
+            std::printf("[forge][lightcull] resource alloc FAILED — occlusion cull disabled\n");
+            return false;
+        }
+
+        // (4) Pipeline (merged ComputeRootSignature) + descriptor set (ShadowLightCullSrtData PerBatch).
+        {
+            ShaderLoadDesc csd = {};
+            csd.mComp.pFileName = "shadowlightcull.comp";
+            addShader(R, &csd, &g_live.pShadowLightCullShader);
+            if (!g_live.pShadowLightCullShader) {
+                std::printf("[forge][lightcull] addShader FAILED\n"); return false;
+            }
+            PipelineDesc cpd = {};
+            cpd.mType = PIPELINE_TYPE_COMPUTE;
+            cpd.mComputeDesc.pShaderProgram = g_live.pShadowLightCullShader;
+            addPipeline(R, &cpd, &g_live.pShadowLightCullPipeline);
+            if (!g_live.pShadowLightCullPipeline) {
+                std::printf("[forge][lightcull] addPipeline FAILED\n"); return false;
+            }
+        }
+        DescriptorSetDesc lset = SRT_SET_DESC(ShadowLightCullSrtData, PerBatch, 1, 0);
+        addDescriptorSet(R, &lset, &g_live.pShadowLightCullSet);
+        if (!g_live.pShadowLightCullSet) {
+            std::printf("[forge][lightcull] addDescriptorSet FAILED\n"); return false;
+        }
+        {
+            DescriptorData d[4] = {};
+            uint32_t n = 0;
+            d[n].mIndex    = SRT_RES_IDX(ShadowLightCullSrtData, PerBatch, gCullParams);
+            d[n].ppBuffers = &g_live.pLightHizCbv; ++n;
+            d[n].mIndex    = SRT_RES_IDX(ShadowLightCullSrtData, PerBatch, gLightOccBits);
+            d[n].mCount = 1; d[n].ppBuffers = &g_live.pLightOccBits; ++n;
+            // Prev-frame Hi-Z pyramid (SHADER_RESOURCE at the top-of-cmd cull dispatch). If it failed
+            // to create, bind pLinearDepth as an inert placeholder — the shader never samples it
+            // because hizParams.w stays 0 (g_hizValid never sets).
+            d[n].mIndex    = SRT_RES_IDX(ShadowLightCullSrtData, PerBatch, gCullHiz);
+            d[n].mCount = 1;
+            d[n].ppTextures = g_live.pHiz ? &g_live.pHiz : &g_live.pLinearDepth; ++n;
+            updateDescriptorSet(R, 0, g_live.pShadowLightCullSet, n, d);
+        }
+        g_live.shadowLightCullReady = true;
+        std::printf("[forge][lightcull] ready (32-slot occlusion cull)\n");
+        return true;
+    }
+
     // Stage B (M1) GPU statics cull resources (B2 = COUNT-only validation). One-time, AFTER
     // buildStaticsGrid fills g_cullInst: upload the canonical instance struct as a structured SRV,
     // create the survivor-count UAV + readback/zero staging + per-frame CullParams cbuffer, and the
@@ -13040,6 +13271,16 @@ namespace ForgeRender {
         if (g_live.pSubsetCountZero)    { removeResource(g_live.pSubsetCountZero);   g_live.pSubsetCountZero = nullptr; }
         if (g_live.pGpuArgs)            { removeResource(g_live.pGpuArgs);           g_live.pGpuArgs = nullptr; }
         if (g_live.pGpuInstOut)         { removeResource(g_live.pGpuInstOut);        g_live.pGpuInstOut = nullptr; }
+        // Follow-on 3: shadow-light occlusion-cull resources.
+        if (g_live.pShadowLightCullSet)      { removeDescriptorSet(R, g_live.pShadowLightCullSet); g_live.pShadowLightCullSet = nullptr; }
+        if (g_live.pShadowLightCullPipeline) { removePipeline(R, g_live.pShadowLightCullPipeline);  g_live.pShadowLightCullPipeline = nullptr; }
+        if (g_live.pShadowLightCullShader)   { removeShader(R, g_live.pShadowLightCullShader);      g_live.pShadowLightCullShader = nullptr; }
+        if (g_live.pLightOccBits)       { removeResource(g_live.pLightOccBits);      g_live.pLightOccBits = nullptr; }
+        if (g_live.pLightOccReadback)   { removeResource(g_live.pLightOccReadback);  g_live.pLightOccReadback = nullptr; }
+        if (g_live.pLightOccZero)       { removeResource(g_live.pLightOccZero);      g_live.pLightOccZero = nullptr; }
+        if (g_live.pLightHizCbv)        { removeResource(g_live.pLightHizCbv);       g_live.pLightHizCbv = nullptr; }
+        g_live.shadowLightCullReady = false;
+        g_lightOccludedBits = 0; g_lightOccValid = false;
         g_live.cullInstCount = 0; g_live.cullSubsetCount = 0;
         g_live.gpuStaticsReady = false; g_live.gpuArgsInDrawState = false;
         g_liveGrid.clear(); g_liveLandVisible.clear(); g_liveLandVisibleRefl.clear();
