@@ -1152,8 +1152,13 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     }
 
     bool isDyn = (gFrameData.debugParams.x > 11.5f);
-    uint bits = isDyn ? asuint(gFrameData.atlasDbg.y) : asuint(gFrameData.atlasDbg.x);
-    bool occupied = (bits & (1u << (uint)slot)) != 0u;
+
+
+
+
+    uint occBits = isDyn ? asuint(gFrameData.atlasDbg.y) : asuint(gFrameData.atlasDbg.w);
+    bool occupied = (occBits & (1u << (uint)slot)) != 0u;
+    bool active = (asuint(gFrameData.atlasDbg.x) & (1u << (uint)slot)) != 0u;
 
 
     int blockW = faceSize * 3;
@@ -1169,11 +1174,14 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
         float g = sqrt(saturate(depth));
 
 
+
         float3 wash;
         if (isDyn) { wash = float3(1.0f, 0.35f, 0.35f); }
         else {
             bool reRendered = (asuint(gFrameData.atlasDbg.z) & (1u << (uint)slot)) != 0u;
-            wash = reRendered ? float3(1.0f, 0.65f, 0.1f) : float3(0.35f, 1.0f, 0.35f);
+            if (reRendered) { wash = float3(1.0f, 0.65f, 0.1f); }
+            else if (active) { wash = float3(0.35f, 1.0f, 0.35f); }
+            else { wash = float3(0.25f, 0.5f, 1.0f); }
         }
         col = border ? wash : (g * wash + 0.04f * wash);
     }

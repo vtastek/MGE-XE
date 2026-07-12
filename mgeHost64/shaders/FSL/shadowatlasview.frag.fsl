@@ -81,8 +81,13 @@ float4 PS_MAIN( VSOutput In )
     }
 
     bool  isDyn = (gFrameData.debugParams.x > 11.5f);       // mode 12 = dynamic atlas
-    uint  bits  = isDyn ? asuint(gFrameData.atlasDbg.y) : asuint(gFrameData.atlasDbg.x);
-    bool  occupied = (bits & (1u << (uint)slot)) != 0u;
+    // Static mode occupancy = VALID/cached (atlasDbg.w): a slot that holds a rendered tile shows even
+    // when its light is out of view this frame, so a camera turn visibly KEEPS tiles instead of
+    // emptying to the few active ones. 'active' (atlasDbg.x) then only picks the tint. Dynamic tiles
+    // never cache, so mode 12 keeps dyn-bits (atlasDbg.y) as occupancy.
+    uint  occBits  = isDyn ? asuint(gFrameData.atlasDbg.y) : asuint(gFrameData.atlasDbg.w);
+    bool  occupied = (occBits & (1u << (uint)slot)) != 0u;
+    bool  active   = (asuint(gFrameData.atlasDbg.x) & (1u << (uint)slot)) != 0u;
 
     // 1px border around the slot's 3x2 face block.
     int blockW = faceSize * 3;
@@ -96,13 +101,16 @@ float4 PS_MAIN( VSOutput In )
         float depth = isDyn ? LoadTex2D(gShadowAtlasDyn, NO_SAMPLER, apx, 0).r
                             : LoadTex2D(gShadowAtlas,    NO_SAMPLER, apx, 0).r;
         float g = sqrt(saturate(depth));         // reverse-Z: near caster bright, far dim
-        // Static view (mode 11): AMBER = tile re-rendered THIS frame (not cached), GREEN = cached.
+        // Static view (mode 11): AMBER = re-rendered THIS frame (not cached), GREEN = active + cached,
+        // BLUE = retained/cached but light out of view this frame (the 360 case — kept, not emptied).
         // Dynamic view (mode 12): RED = mover tile re-rendered this frame (they never cache).
         float3 wash;
         if (isDyn) { wash = float3(1.0f, 0.35f, 0.35f); }
         else {
             bool reRendered = (asuint(gFrameData.atlasDbg.z) & (1u << (uint)slot)) != 0u;
-            wash = reRendered ? float3(1.0f, 0.65f, 0.1f) : float3(0.35f, 1.0f, 0.35f);
+            if (reRendered)   { wash = float3(1.0f, 0.65f, 0.1f); }   // amber: re-baked this frame
+            else if (active)  { wash = float3(0.35f, 1.0f, 0.35f); }  // green: active + cached
+            else              { wash = float3(0.25f, 0.5f, 1.0f); }   // blue: retained, out of view
         }
         col = border ? wash : (g * wash + 0.04f * wash);
     }
