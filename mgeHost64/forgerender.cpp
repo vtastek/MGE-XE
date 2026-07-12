@@ -1063,6 +1063,7 @@ namespace {
         Pipeline*      pShadowPipelineNone = nullptr;     // CULL_NONE (two-sided; winding irrelevant, one PSO)
         Pipeline*      pShadowPipelineFront = nullptr;    // CULL_FRONT, FRONT_FACE_CCW (store back faces)
         Pipeline*      pShadowPipelineFrontMirror = nullptr; // CULL_FRONT, FRONT_FACE_CW (mirrored world)
+        Shader*        pShadowCasterShader = nullptr;     // opaque.vert + shadowcaster.frag (alpha + emissive carve)
         Shader*        pShadowClearShader = nullptr;      // shadowclear.vert/.frag
         Pipeline*      pShadowClearPipeline = nullptr;    // CMP_ALWAYS + write, no layout
         Buffer*        pShadowFaceCbv[192] = {};          // per-face FrameData copies (512B, persistent-mapped); >= kShadowFaceCbvs
@@ -2547,6 +2548,22 @@ namespace {
         // bias in the rasterizer; REVERSE-Z flips its sign (negative pushes casters FARTHER
         // from the light). Non-fatal: failure just leaves shadowReady false. ---
         if (g_live.pShadowAtlas) {
+            // Shadow-caster frag: depthonly.frag + a per-texel emissive carve (drop the glowing
+            // texels of a lantern/candle, keep its dark lettering/imperfections). SEPARATE shader so
+            // the main Z-prepass keeps depthonly.frag's CMP_EQUAL parity. Non-fatal: on failure the
+            // caster PSOs fall back to the plain depth-only shader (no carve, old behaviour).
+            {
+                ShaderLoadDesc scfDesc = {};
+                scfDesc.mVert.pFileName = "opaque.vert";
+                scfDesc.mFrag.pFileName = "shadowcaster.frag";
+                addShader(R, &scfDesc, &g_live.pShadowCasterShader);
+                if (!g_live.pShadowCasterShader) {
+                    std::printf("[forge] addShader(shadowcaster) FAILED — caster PSOs use depthonly.frag\n");
+                }
+            }
+            Shader* pCasterShader = g_live.pShadowCasterShader ? g_live.pShadowCasterShader
+                                                               : g_live.pDepthOnlyShader;
+
             DepthStateDesc shDepth = {};
             shDepth.mDepthTest = true;
             shDepth.mDepthWrite = true;
@@ -2579,7 +2596,7 @@ namespace {
             sg.pDepthState = &shDepth;
             sg.pVertexLayout = &vl;
             sg.pRasterizerState = &shRaster;
-            sg.pShaderProgram = g_live.pDepthOnlyShader;
+            sg.pShaderProgram = pCasterShader;
             addPipeline(R, &spd, &g_live.pShadowPipeline);
             sg.pRasterizerState = &shRasterMirror;
             addPipeline(R, &spd, &g_live.pShadowPipelineMirror);
@@ -5011,6 +5028,14 @@ namespace {
     // above this threshold. The paper stops blocking its own light; the frame keeps casting stable
     // cage shadows. vColSource==1 (vcol drives emissive) has no material signal → never skipped.
     float g_shadowEmissiveSkip = 0.75f;   // >1.0 disables (no MW material exceeds 1.0)
+    // C3b-texel: instead of DROPPING the whole emissive mesh as a caster, submit it and carve it
+    // PER-TEXEL in shadowcaster.frag — the glowing texels (lantern glass, candle paper) discard,
+    // the dark texels (printed lettering, seams, small imperfections) cast. Lets a lantern's own
+    // detail enter shadows without black-caging its light. g_shadowEmissiveCast gates the un-skip
+    // (OFF → old whole-mesh drop, for A/B). g_shadowEmissiveTexel = the per-texel emitted-luminance
+    // threshold the frag reads via gFrameData.atlasDbg.z (0 → carve off, every emissive texel casts).
+    bool  g_shadowEmissiveCast  = true;
+    float g_shadowEmissiveTexel = 0.35f;
     // C3a: cutout-blend casters (see g_texAlphaKind). Toggling OFF forgets alpha-origin caster
     // records so their cached shadows drop immediately (manager sweep).
     bool  g_shadowBlendCasters = true;
@@ -5225,6 +5250,10 @@ namespace {
         uiAddComponentWidget(g_uiPanel, "Shadow: fade-in min distance (near/spawn = instant)", &sShFd, WIDGET_TYPE_SLIDER_FLOAT);
         SliderFloatWidget sShEm = {}; sShEm.pData = &g_shadowEmissiveSkip; sShEm.mMin = 0.0f; sShEm.mMax = 1.5f; sShEm.mStep = 0.05f;
         uiAddComponentWidget(g_uiPanel, "Shadow: emissive caster skip (>1 = off)", &sShEm, WIDGET_TYPE_SLIDER_FLOAT);
+        CheckboxWidget cShEc = {}; cShEc.pData = &g_shadowEmissiveCast;
+        uiAddComponentWidget(g_uiPanel, "Shadow: emissive per-texel carve (off = whole-mesh drop)", &cShEc, WIDGET_TYPE_CHECKBOX);
+        SliderFloatWidget sShEt = {}; sShEt.pData = &g_shadowEmissiveTexel; sShEt.mMin = 0.0f; sShEt.mMax = 1.0f; sShEt.mStep = 0.02f;
+        uiAddComponentWidget(g_uiPanel, "Shadow: emissive carve threshold (0 = cast all)", &sShEt, WIDGET_TYPE_SLIDER_FLOAT);
         CheckboxWidget cShBc = {}; cShBc.pData = &g_shadowBlendCasters;
         uiAddComponentWidget(g_uiPanel, "Shadow: cutout-blend casters", &cShBc, WIDGET_TYPE_CHECKBOX);
         SliderFloatWidget sShBr = {}; sShBr.pData = &g_shadowBlendRef; sShBr.mMin = 0.0f; sShBr.mMax = 1.0f; sShBr.mStep = 0.05f;
@@ -6300,7 +6329,10 @@ namespace ForgeRender {
                     const HostMesh& hm = g_meshes[slot];
                     if (!hm.valid || hm.skinned || hm.multimap) { continue; }
                     if (hm.lastWorldFrame == 0 || frame - hm.lastWorldFrame > kMoverFresh) { continue; }
-                    if (!isRigidMover(hm) || hm.emissiveHot) { continue; }   // A: LIVE && (animated | !sourceMover)
+                    if (!isRigidMover(hm)) { continue; }   // A: LIVE && (animated | !sourceMover)
+                    // Emissive fixtures cast their DARK detail per-texel (shadowcaster.frag carve);
+                    // only drop the whole mesh when the carve is OFF (A/B).
+                    if (hm.emissiveHot && !g_shadowEmissiveCast) { continue; }
                     const float* w = hm.lastWorld;   // ABSOLUTE (refresh re-based it)
                     const float cx = hm.localCenter[0]*w[0] + hm.localCenter[1]*w[4] + hm.localCenter[2]*w[8]  + w[12];
                     const float cy = hm.localCenter[0]*w[1] + hm.localCenter[1]*w[5] + hm.localCenter[2]*w[9]  + w[13];
@@ -6352,6 +6384,11 @@ namespace ForgeRender {
                     relW[12] -= g_eyeAbsShadow[0]; relW[13] -= g_eyeAbsShadow[1]; relW[14] -= g_eyeAbsShadow[2];
                     std::memcpy(dwd + (size_t)dm.matIdx * 64, relW, 64);
                     dins[dm.matIdx * kStaticInstU32 + 1] = hm.lastTexAlpha;
+                    // MatEmissive (+8..+10) for the per-texel emissive carve (see the static site).
+                    const float em = hm.emissiveHot ? 1.0f : 0.0f;
+                    ((float*)dins)[dm.matIdx * kStaticInstU32 + 8]  = em;
+                    ((float*)dins)[dm.matIdx * kStaticInstU32 + 9]  = em;
+                    ((float*)dins)[dm.matIdx * kStaticInstU32 + 10] = em;
                 }
             }
 
@@ -6504,10 +6541,12 @@ namespace ForgeRender {
                     const float rr = reach + wr;
                     if (d2 > rr * rr) { continue; }
                     // C3b self-source suppression: a full-emissive material is MW's marker for a
-                    // light's own hot part (lantern paper, candle flame) — skip it so a fixture
-                    // can't black-cage its own light. Non-emissive fixture parts (the metal frame)
-                    // keep casting stable cage shadows, and it's per-shape — no size guessing.
-                    if (hm.emissiveHot) { continue; }
+                    // light's own hot part (lantern paper, candle flame). With the per-texel carve ON
+                    // (default) we KEEP the mesh — shadowcaster.frag discards the glowing texels and
+                    // casts only the dark detail (lettering/imperfections), so the fixture can't
+                    // black-cage its own light yet its detail still enters shadows. Carve OFF → the
+                    // old whole-mesh drop (metal frame casts, paper doesn't), for A/B.
+                    if (hm.emissiveHot && !g_shadowEmissiveCast) { continue; }
                     // C4d: LIVE-category casters (NPC parts/equipment, activators, doors) render
                     // in the DYNAMIC tile every frame — baking one here would freeze it into the
                     // cached static tile.
@@ -6549,6 +6588,14 @@ namespace ForgeRender {
                     relW[12] -= g_eyeAbsShadow[0]; relW[13] -= g_eyeAbsShadow[1]; relW[14] -= g_eyeAbsShadow[2];
                     std::memcpy(swd + (size_t)g * 64, relW, 64);
                     sins[g * kStaticInstU32 + 1] = hm.lastTexAlpha;
+                    // MatEmissive (+8..+10) for shadowcaster.frag's per-texel carve: white on an
+                    // emissive-hot caster (carve = texture luminance → drop glow, keep dark detail),
+                    // 0 otherwise so ordinary casters are untouched. MUST reset both ways — the GPU
+                    // region index g is reused across frames by different casters.
+                    const float em = hm.emissiveHot ? 1.0f : 0.0f;
+                    ((float*)sins)[g * kStaticInstU32 + 8]  = em;
+                    ((float*)sins)[g * kStaticInstU32 + 9]  = em;
+                    ((float*)sins)[g * kStaticInstU32 + 10] = em;
                 }
                 // 6 face CBVs for this slot at base s*6 (C4b: indexed BY SLOT, not by job, so a
                 // dyn-only job for the same slot shares them). Light pos CAMERA-RELATIVE = abs − eye.
@@ -6563,6 +6610,7 @@ namespace ForgeRender {
                     float faceVP[16];
                     buildShadowFaceVP(lightRel, f, nearZ, farZ, faceVP);
                     std::memcpy(fc, faceVP, 16 * sizeof(float));
+                    ((float*)fc)[74] = g_shadowEmissiveTexel;   // atlasDbg.z: per-texel emissive-carve threshold
                 }
                 sl.lastRenderFrame = frame;
                 sl.dirty = false;   // precise invalidation satisfied — this tile is current again
@@ -6596,6 +6644,7 @@ namespace ForgeRender {
                         float faceVP[16];
                         buildShadowFaceVP(lightRel, f, nearZ, farZ, faceVP);
                         std::memcpy(fc, faceVP, 16 * sizeof(float));
+                        ((float*)fc)[74] = g_shadowEmissiveTexel;   // atlasDbg.z: per-texel emissive-carve threshold
                     }
                 }
                 g_shadowRendersDyn.push_back(s);
@@ -13543,6 +13592,7 @@ namespace ForgeRender {
         if (g_live.pShadowMaskShader)    { removeShader(R, g_live.pShadowMaskShader); }
         if (g_live.pShadowClearPipeline) { removePipeline(R, g_live.pShadowClearPipeline); }
         if (g_live.pShadowClearShader)   { removeShader(R, g_live.pShadowClearShader); }
+        if (g_live.pShadowCasterShader)  { removeShader(R, g_live.pShadowCasterShader); }
         if (g_live.pShadowPipeline)       { removePipeline(R, g_live.pShadowPipeline); }
         if (g_live.pShadowPipelineMirror) { removePipeline(R, g_live.pShadowPipelineMirror); }
         if (g_live.pShadowPipelineNone)   { removePipeline(R, g_live.pShadowPipelineNone); }

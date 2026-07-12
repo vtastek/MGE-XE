@@ -958,7 +958,7 @@ SamplerState gSamplerAnisotropic : register( s10 , space100 ) ;
 #line 167 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 49 "FSL/shaders.list"
+#line 57 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/depthonly_mm.frag.fsl"
 #line 12 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/depthonly_mm.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1128,4 +1128,4 @@ void PS_MAIN( VSOutput In )
     clip(baseA < alphaRef ? -1.0f : 1.0f);
     return;
 }
-#line 50 "FSL/shaders.list"
+#line 58 "FSL/shaders.list"

@@ -958,7 +958,7 @@ SamplerState gSamplerAnisotropic : register( s10 , space100 ) ;
 #line 167 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 90 "FSL/shaders.list"
+#line 98 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skymesh.vert.fsl"
 #line 23 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skymesh.vert.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1154,4 +1154,4 @@ VSOutput VS_MAIN( VSInput In )
     Out.AtmoBot = In.P3.rgb;
     return (Out);
 }
-#line 91 "FSL/shaders.list"
+#line 99 "FSL/shaders.list"
