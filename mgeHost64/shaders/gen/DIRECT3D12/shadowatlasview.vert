@@ -958,7 +958,7 @@ SamplerState gSamplerAnisotropic : register( s10 , space100 ) ;
 #line 167 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 144 "FSL/shaders.list"
+#line 152 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowatlasview.vert.fsl"
 #line 9 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowatlasview.vert.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1101,4 +1101,4 @@ VSOutput VS_MAIN( uint VertexID : SV_VERTEXID )
     Out.Position = float4(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f, 0.0f, 1.0f);
     return (Out);
 }
-#line 145 "FSL/shaders.list"
+#line 153 "FSL/shaders.list"

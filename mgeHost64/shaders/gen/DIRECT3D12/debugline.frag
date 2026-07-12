@@ -958,7 +958,7 @@ SamplerState gSamplerAnisotropic : register( s10 , space100 ) ;
 #line 167 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 136 "FSL/shaders.list"
+#line 144 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/debugline.frag.fsl"
 #line 6 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/debugline.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1097,4 +1097,4 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     //INIT_MAIN;
     return (In.Color);
 }
-#line 137 "FSL/shaders.list"
+#line 145 "FSL/shaders.list"

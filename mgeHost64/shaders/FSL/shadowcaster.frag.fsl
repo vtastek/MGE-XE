@@ -1,0 +1,60 @@
+// mgeHost64 — point-light shadow-caster fragment stage (depth-only, alpha + emissive carve).
+//
+// A CLONE of depthonly.frag used ONLY by the shadow-atlas caster PSOs (pShadowPipeline*). It
+// must NOT replace depthonly.frag on the main Z-prepass: the prepass clip() has to stay bit-
+// identical to the colour pass for CMP_EQUAL parity, and the emissive carve below would punch
+// holes in that. Keeping it a separate frag isolates the shadow behaviour entirely.
+//
+// Two discards:
+//   1. Alpha cutout — identical to depthonly.frag (the hammock/foliage cutout that already casts).
+//   2. Emissive carve — a self-illuminated caster (lantern glass, candle paper, torch shade) casts
+//      only its DARK texels: the printed lettering, seams, and small imperfections. The GLOWING
+//      texels ARE the light source and must not black-cage it. This is the alpha-cutout trick
+//      applied to emitted brightness instead of coverage — so the old all-or-nothing whole-mesh
+//      emissive skip (forgerender C3b) becomes a per-texel carve.
+//
+//      emitted ≈ MatEmissive * texColor (MW's MODULATE texture stage), so a NON-emissive caster
+//      has MatEmissive≈0 → emitted≈0 → this never fires and ordinary casters are untouched — the
+//      same self-gating the whole-mesh classifier relied on, now per-texel and free.
+//
+//      Threshold rides gFrameData.atlasDbg.z (a lane the per-face shadow cbuffer leaves spare —
+//      only faceVP[0..15] is filled there), = host g_shadowEmissiveTexel. thr <= 0 disables the
+//      carve (every emissive texel casts). Graphics shader: loads at host startup, so the knob is
+//      plumbed through the cbuffer, not a #define.
+//
+// Shares opaque.vert's VSOutput (declare the full struct for a matched signature; read only
+// Uv / TexIndex / AlphaRef / MatEmissive).
+
+#include "opaque.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4,      Position, SV_Position);
+    DATA(float3,      Normal,   NORMAL);
+    DATA(float2,      Uv,       TEXCOORD0);
+    DATA(FLAT(uint),  TexIndex, TEXCOORD1);
+    DATA(float,       Fog,      TEXCOORD2);
+    DATA(float4,      Color,    COLOR);
+    DATA(float,       AlphaRef, TEXCOORD3);
+    DATA(FLAT(float3),MatDiffuse, TEXCOORD4);
+    DATA(FLAT(float3),MatAmbient, TEXCOORD5);
+    DATA(FLAT(float3),MatEmissive,TEXCOORD6);
+    DATA(FLAT(uint),  VColSource, TEXCOORD7);
+    DATA(float3,      WorldPos,   TEXCOORD8);
+    DATA(FLAT(uint),  OverlayIndex,TEXCOORD9);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+void PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    float4 tex = SampleTex2D(gTextures[In.TexIndex], gSamplerAnisotropic, In.Uv);
+    // 1. Alpha cutout — MUST match depthonly.frag / opaque.frag exactly (strict '<').
+    clip(tex.a < In.AlphaRef ? -1.0f : 1.0f);
+    // 2. Emissive carve — drop the glowing texels, keep the dark detail.
+    float3 emit    = In.MatEmissive * tex.rgb;
+    float  emitLum = dot(emit, float3(0.299f, 0.587f, 0.114f));
+    float  thr     = gFrameData.atlasDbg.z;
+    clip((thr > 0.0f && emitLum > thr) ? -1.0f : 1.0f);
+    RETURN();
+}

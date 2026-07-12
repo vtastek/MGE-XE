@@ -958,7 +958,7 @@ SamplerState gSamplerAnisotropic : register( s10 , space100 ) ;
 #line 167 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 63 "FSL/shaders.list"
+#line 71 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skinned.vert.fsl"
 #line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skinned.vert.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1163,4 +1163,4 @@ VSOutput VS_MAIN( VSInput In )
                        / (gFrameData.fogParams.y - gFrameData.fogParams.x));
     return (Out);
 }
-#line 64 "FSL/shaders.list"
+#line 72 "FSL/shaders.list"
