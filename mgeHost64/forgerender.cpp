@@ -1549,11 +1549,16 @@ namespace {
                                         // A/B for regression comparison; always-on is the shipping default.
 
     // P3 caching: a slot's atlas tile is re-rendered only when its caster set actually changes —
-    // NEVER on a timer or on camera turn. g_casterEpoch = the last frame ANY caster appeared, moved,
-    // or a stale mover was forgotten (bumped in the per-draw lastWorld refresh + the mover-expiry
-    // sweep); a slot with lastRenderFrame < g_casterEpoch is stale. A fully STATIC scene freezes the
-    // epoch → turning the camera triggers ZERO re-renders; an animating NPC keeps bumping it so its
-    // shadow tracks (the static+dynamic split / composited dynamic layer is the P6 efficiency step).
+    // NEVER on a timer or on camera turn. Two invalidation channels:
+    //  - PRECISE (per-caster): a caster appearing / moving / being released dirties ONLY the slots
+    //    whose light is within shadow reach of it (markSlotsDirtyNear → ShadowSlot.dirty). The
+    //    scatter test matches the gather test exactly, so a slot is dirtied IFF that caster is in
+    //    its gather — no over- or under-invalidation. This is what stops a reveal near ONE light
+    //    from re-baking all 32 during a camera turn.
+    //  - GLOBAL (g_casterEpoch): whole-scene events only — a cell change, or a live ranking-knob
+    //    flip that re-partitions casters. A slot with lastRenderFrame < g_casterEpoch is stale.
+    // A fully STATIC scene bumps neither → turning the camera triggers ZERO re-renders; an
+    // animating NPC scatters onto only the slots it actually shadows.
     uint32_t g_casterEpoch = 1;   // starts at 1 so a never-rendered slot (lastRenderFrame 0) is stale
 
     // 3x2 face-block origin + face size for a slot, in atlas pixels. Face f sits at block +
@@ -1630,6 +1635,11 @@ namespace {
         uint32_t assignedFrame   = 0;       // frame the light took this slot (hysteresis hold)
         uint32_t lastSeenFrame   = 0;       // last frame the light was present (eviction clock)
         uint32_t lastRenderFrame = 0;       // last frame the 6 faces were re-rendered (0 = never → must render)
+        bool     dirty           = false;   // PRECISE invalidation: a caster within THIS slot's shadow
+                                            // reach appeared / moved / was released since it last rendered.
+                                            // Set by markSlotsDirtyNear (scatter at the change site), cleared
+                                            // on render. Replaces the global caster-epoch for per-caster
+                                            // changes so a reveal near ONE light no longer re-bakes all 32.
         bool     activeThisFrame = false;   // light present this frame (mask activeBits + forward patch)
         uint32_t curLightIdx     = 0;       // TRANSIENT: this frame's light cbuffer index (valid iff active)
     };
@@ -4503,12 +4513,30 @@ namespace {
         return rigidMoverPred(hm.isLive, hm.animated);
     }
 
+    // PRECISE shadow invalidation: a caster whose world-space bound (center cx/cy/cz, radius wr)
+    // just changed dirties ONLY the shadow slots whose light is within reach. The reach here is
+    // IDENTICAL to the static gather's (rr = 2*radius + wr, see the gather loop), so a slot is
+    // dirtied exactly when this caster is a member of its gather — no over-invalidation (the other
+    // 31 slots stay cached through a camera turn) and no under-invalidation (every slot that would
+    // bake this caster re-renders). Cheap: called only at a change site (appear/move/release), not
+    // per frame. Uses the slot's last-frame absPos, which for a static light equals this frame's;
+    // a moved light re-renders via its own must-path anyway.
+    static inline void markSlotsDirtyNear(float cx, float cy, float cz, float wr) {
+        for (uint32_t s = 0; s < kMaxShadowLights; ++s) {
+            ShadowSlot& sl = g_shadowSlots[s];
+            if (!sl.valid) { continue; }
+            const float rr = 2.0f * sl.radius + wr;
+            const float dx = cx - sl.absPos[0], dy = cy - sl.absPos[1], dz = cz - sl.absPos[2];
+            if (dx*dx + dy*dy + dz*dz <= rr * rr) { sl.dirty = true; }
+        }
+    }
+
     // C3: shared caster-record refresh — the items[] static loop and the cached-alpha cutout
     // path (C3a) both land here. world = the CAMERA-RELATIVE wire transform; stored ABSOLUTE
     // (+ this frame's shift eye) so the record survives camera motion between refreshes.
     // Skinned/multimap slots still record lastWorld (pre-existing behavior, harmless) but never
-    // touch the caster epoch — the gather excludes them. An emissiveHot flip on a live record
-    // bumps the epoch so the g_shadowEmissiveSkip slider re-renders affected slots live.
+    // touch shadow invalidation — the gather excludes them. Appear/move/emissive-flip scatter-
+    // dirty only the slots that actually shadow this caster (markSlotsDirtyNear).
     static void refreshCasterRecord(uint32_t slot, const float* world, uint32_t texAlphaPacked,
                                     bool emissiveHot, bool alphaCaster, bool isLive, bool animated) {
         if (slot >= g_meshHigh || !g_meshes[slot].valid) { return; }
@@ -4528,19 +4556,22 @@ namespace {
         // other records keep the C4b semantics: appear/move/emissive-flip bumps the epoch
         // (a thrown clutter item churns briefly while airborne — acceptable by spec).
         if (!shm.skinned && !shm.multimap && !(rigidMoverPred(isLive, animated) && g_shadowRigidMovers)) {
+            // World-space BOUND CENTER (not the transform ORIGIN) + world radius, for the spatial
+            // slot scatter. Center-not-origin matters for anything that rotates about a pivot: a
+            // door keeps its origin pinned at the hinge while the panel — and its shadow — swings,
+            // so an origin-delta test never sees the motion. The local center arcs and is caught.
+            const float* lc = shm.localCenter;
+            const float ncx = lc[0]*world[0] + lc[1]*world[4] + lc[2]*world[8]  + ax;
+            const float ncy = lc[0]*world[1] + lc[1]*world[5] + lc[2]*world[9]  + ay;
+            const float ncz = lc[0]*world[2] + lc[1]*world[6] + lc[2]*world[10] + az;
+            const float sc0 = world[0]*world[0] + world[1]*world[1] + world[2]*world[2];
+            const float sc1 = world[4]*world[4] + world[5]*world[5] + world[6]*world[6];
+            const float sc2 = world[8]*world[8] + world[9]*world[9] + world[10]*world[10];
+            float scMax = sc0 > sc1 ? sc0 : sc1; if (sc2 > scMax) { scMax = sc2; }
+            const float wr = shm.localRadius * std::sqrt(scMax);
             if (shm.lastWorldFrame == 0) {
-                g_casterEpoch = g_renderFrame;
+                markSlotsDirtyNear(ncx, ncy, ncz, wr);   // first sighting: dirty only slots in reach
             } else {
-                // Track the world-space BOUND CENTER, not the transform ORIGIN. A door (and any
-                // object that rotates about a pivot) keeps its origin pinned at the hinge while the
-                // panel — and its shadow — swings, so an origin-delta test never sees the motion
-                // and the shadow sticks. The local center, carried through the rotation, arcs and
-                // is caught. (Pure translation moves the center identically, so this strictly
-                // supersedes the old origin test.)
-                const float* lc = shm.localCenter;
-                const float ncx = lc[0]*world[0] + lc[1]*world[4] + lc[2]*world[8]  + ax;
-                const float ncy = lc[0]*world[1] + lc[1]*world[5] + lc[2]*world[9]  + ay;
-                const float ncz = lc[0]*world[2] + lc[1]*world[6] + lc[2]*world[10] + az;
                 const float* ow = shm.lastWorld;   // stored ABSOLUTE (origin re-based below last call)
                 const float ocx = lc[0]*ow[0] + lc[1]*ow[4] + lc[2]*ow[8]  + ow[12];
                 const float ocy = lc[0]*ow[1] + lc[1]*ow[5] + lc[2]*ow[9]  + ow[13];
@@ -4549,9 +4580,10 @@ namespace {
                 if (mdx*mdx + mdy*mdy + mdz*mdz > kCasterMoveEps * kCasterMoveEps) {
                     shm.everMoved     = true;
                     shm.lastMoveFrame = g_renderFrame;   // C4b: recency for settle-detection
-                    g_casterEpoch = g_renderFrame;
+                    markSlotsDirtyNear(ncx, ncy, ncz, wr);   // shadow arrives at the new location
+                    markSlotsDirtyNear(ocx, ocy, ocz, wr);   // and clears from the vacated one
                 }
-                if (emissiveHot != shm.emissiveHot) { g_casterEpoch = g_renderFrame; }
+                if (emissiveHot != shm.emissiveHot) { markSlotsDirtyNear(ncx, ncy, ncz, wr); }
             }
         }
         std::memcpy(shm.lastWorld, world, 64);
@@ -4746,14 +4778,15 @@ namespace {
                                         // Covered area scales with rangeK^2 — the main mask-cost knob in
                                         // light-dense interiors. 2.0 = old behaviour (test to atlas far
                                         // plane); refZ mapping stays farZ=2r regardless.
-    float g_shadowVertWeight = 3.0f;    // VERTICAL importance weighting for slot ranking. The importance
+    float g_shadowVertWeight = 1.0f;    // VERTICAL importance weighting for slot ranking. The importance
                                         // metric weights the light's vertical offset from the eye (world Z,
                                         // camera-relative) by this factor before ranking. >1 demotes lights on
                                         // another FLOOR (large |Δz|) so they stop stealing the 16 shadow slots
                                         // from lights on the player's own level — the multi-storey "pop per
-                                        // light" cure. 1.0 = isotropic (old behaviour); ~3 ≈ one floor-height of
-                                        // vertical separation costs as much rank as 3 floor-widths horizontal.
-                                        // Smooth (no hard threshold) so climbing stairs doesn't itself pop.
+                                        // light" cure. 1.0 = isotropic (DEFAULT now — "floor detection" off while
+                                        // we chase the exterior slot-churn; live knob, crank it back for interiors);
+                                        // ~3 ≈ one floor-height of vertical separation costs as much rank as 3
+                                        // floor-widths horizontal. Smooth (no hard threshold) so stairs don't pop.
     bool  g_shadowFixtureGate = true;   // HARD gate: only fixture lights (name light*/torch*/furn* OR an
                                         // emissive-hot mesh at the origin) get a shadow slot. Nameless
                                         // injected window/ambient fill casts NO shadow (still lit) so it
@@ -5674,8 +5707,8 @@ namespace ForgeRender {
 
             // Mover-expiry sweep: forget a MOVER not seen within kMoverFresh frames (a hidden
             // animated part — 1st-person player, off-screen NPC) so it stops casting a frozen
-            // shadow; forgetting bumps the epoch so the slots holding its stale shadow re-render and
-            // drop it. Statics are never everMoved → never forgotten (persistent within the cell).
+            // shadow; forgetting scatter-dirties only the slots holding its stale shadow so they
+            // re-render and drop it. Statics are never everMoved → never forgotten (persistent).
             if (g_shadowExpireMovers) {
                 for (uint32_t s2 = 0; s2 < g_meshHigh; ++s2) {
                     HostMesh& hm = g_meshes[s2];
@@ -5688,8 +5721,16 @@ namespace ForgeRender {
                     // within the window of its last sighting) still expires so it can't cast a frozen
                     // shadow while hidden.
                     if (hm.lastWorldFrame - hm.lastMoveFrame > kCasterSettleFrames) { continue; }   // at rest → keep
+                    const float* ow = hm.lastWorld;   // ABSOLUTE resting/last-seen transform
+                    const float cx = hm.localCenter[0]*ow[0] + hm.localCenter[1]*ow[4] + hm.localCenter[2]*ow[8]  + ow[12];
+                    const float cy = hm.localCenter[0]*ow[1] + hm.localCenter[1]*ow[5] + hm.localCenter[2]*ow[9]  + ow[13];
+                    const float cz = hm.localCenter[0]*ow[2] + hm.localCenter[1]*ow[6] + hm.localCenter[2]*ow[10] + ow[14];
+                    const float es0 = ow[0]*ow[0]+ow[1]*ow[1]+ow[2]*ow[2];
+                    const float es1 = ow[4]*ow[4]+ow[5]*ow[5]+ow[6]*ow[6];
+                    const float es2 = ow[8]*ow[8]+ow[9]*ow[9]+ow[10]*ow[10];
+                    float esMax = es0 > es1 ? es0 : es1; if (es2 > esMax) { esMax = es2; }
                     hm.lastWorldFrame = 0;
-                    g_casterEpoch = frame;
+                    markSlotsDirtyNear(cx, cy, cz, hm.localRadius * std::sqrt(esMax));
                 }
             }
 
@@ -5965,9 +6006,18 @@ namespace ForgeRender {
                 }
             }
 
-            // (4) Assign unowned lights (most important first) to free slots; if none free, a
-            // challenger evicts the weakest ACTIVE incumbent only when it beats it by the ratio AND
-            // the incumbent has held its slot past the hysteresis window (anti-thrash).
+            // (4) Assign unowned lights (most important first). A free slot is taken outright;
+            // otherwise the light CHALLENGES the weakest slot by IMPORTANCE — and, unlike before,
+            // an inactive (absent) slot is NOT special-cased for eviction. The old rule reclaimed
+            // the oldest inactive slot on sight, which is exactly what churned shadows during a
+            // camera turn: a light that yawed out of view had its cached tile stolen by a light
+            // yawing IN, then re-rendered when it came back around — "same lights, re-baked". Since
+            // importance is eye-POSITION based (yaw-invariant), the top-N lights are a stable set
+            // through a pure spin, so ranking every slot (active + inactive) by stored importance
+            // and only replacing on a genuine importance win keeps every cached tile put. A light
+            // turned away keeps its slot and reactivates from cache on return — fill it, keep it,
+            // replace only when a stronger light truly needs the slot.
+            uint32_t nAssignFree = 0, nAssignChal = 0;   // diag: slot churn this frame
             static std::vector<uint32_t> cand; cand.clear();
             for (uint32_t k = 0; k < (uint32_t)lights.size(); ++k) { if (!owned[k]) { cand.push_back(k); } }
             std::sort(cand.begin(), cand.end(),
@@ -5981,32 +6031,28 @@ namespace ForgeRender {
                 sl.radius = L.radius; sl.importance = L.imp;
                 sl.assignedFrame = frame; sl.lastSeenFrame = frame;
                 sl.lastRenderFrame = 0;   // must render once
+                sl.dirty = false;         // must-path covers the first render; no stale carry-over
                 sl.activeThisFrame = true; sl.curLightIdx = L.idx;
             };
             for (uint32_t c : cand) {
                 // 1. A free (never-used / never-reclaimed) slot.
                 int free = -1;
                 for (uint32_t s = 0; s < kMaxShadowLights; ++s) { if (!g_shadowSlots[s].valid) { free = (int)s; break; } }
-                if (free >= 0) { assignSlot((uint32_t)free, lights[c]); continue; }
-                // 2. Reclaim an INACTIVE valid slot (its light is absent this frame) — oldest first.
-                // Preferred over stealing from an active light: an absent light shows no shadow anyway.
-                int inact = -1; uint32_t oldestSeen = 0xFFFFFFFFu;
-                for (uint32_t s = 0; s < kMaxShadowLights; ++s) {
-                    ShadowSlot& sl = g_shadowSlots[s];
-                    if (!sl.valid || sl.activeThisFrame) { continue; }
-                    if (sl.lastSeenFrame < oldestSeen) { oldestSeen = sl.lastSeenFrame; inact = (int)s; }
-                }
-                if (inact >= 0) { assignSlot((uint32_t)inact, lights[c]); continue; }
-                // 3. Challenge the weakest ACTIVE incumbent (past its hysteresis hold).
+                if (free >= 0) { assignSlot((uint32_t)free, lights[c]); ++nAssignFree; continue; }
+                // 2. No free slot: challenge the weakest slot by IMPORTANCE across ALL valid slots
+                // (active or inactive). An inactive slot keeps its last-seen importance, which for a
+                // pure camera turn equals its current value — so a turned-away light is only ousted
+                // by a genuinely stronger one, not merely for being absent. Hysteresis still shields
+                // a just-assigned slot from immediate re-challenge.
                 int weak = -1; float weakImp = 1e30f;
                 for (uint32_t s = 0; s < kMaxShadowLights; ++s) {
                     ShadowSlot& sl = g_shadowSlots[s];
-                    if (!sl.valid || !sl.activeThisFrame) { continue; }
+                    if (!sl.valid) { continue; }
                     if (frame - sl.assignedFrame < kShadowHoldFrames) { continue; }   // protected
                     if (sl.importance < weakImp) { weakImp = sl.importance; weak = (int)s; }
                 }
                 if (weak >= 0 && lights[c].imp > kShadowChallengeRatio * weakImp) {
-                    assignSlot((uint32_t)weak, lights[c]);
+                    assignSlot((uint32_t)weak, lights[c]); ++nAssignChal;
                 }
             }
 
@@ -6108,7 +6154,9 @@ namespace ForgeRender {
                 ShadowSlot& sl = g_shadowSlots[s];
                 if (!sl.valid || !sl.activeThisFrame) { continue; }
                 const bool must  = (sl.lastRenderFrame == 0);
-                const bool stale = (sl.lastRenderFrame < g_casterEpoch);   // a caster appeared/moved/expired since we rendered
+                // PRECISE dirty (a caster in THIS slot's reach changed) OR a GLOBAL event (cell/knob
+                // flip). The precise flag is what keeps a camera turn from re-baking untouched slots.
+                const bool stale = sl.dirty || (sl.lastRenderFrame < g_casterEpoch);
                 // C4a: a skinned part in reach re-poses every frame. C4b: that no longer dirties
                 // the STATIC tile — it schedules the slot's cheap DYNAMIC tile instead (below).
                 bool skinnedHit = false;
@@ -6268,6 +6316,7 @@ namespace ForgeRender {
                     std::memcpy(fc, faceVP, 16 * sizeof(float));
                 }
                 sl.lastRenderFrame = frame;
+                sl.dirty = false;   // precise invalidation satisfied — this tile is current again
                 if (wasMust) { ++nMustR; } else { ++nStaleR; }   // diag
                 g_shadowRenders.push_back({ s, begin, end, regionBase });
                 usedMats += end - begin;
@@ -6336,13 +6385,23 @@ namespace ForgeRender {
             // to 24 bits, so at 32 slots the top-8 would silently vanish.
             reinterpret_cast<uint32_t*>(mp)[284] = activeBits;   // slotBits.x
             reinterpret_cast<uint32_t*>(mp)[285] = dynBits;      // slotBits.y (C4b dyn tile valid THIS frame)
-            // Mirror the masks into gFrameData.atlasDbg (float index 72/73) for the F12 mode-11/12
-            // shadow-atlas debug view (shadowatlasview.frag tints tiles green=active / red=dyn).
+            // validBits: slots that HOLD a rendered tile (valid + rendered at least once), whether or
+            // not their light is in view this frame. Lets the debug view show a RETAINED/cached tile
+            // (valid, inactive) distinctly from an empty slot — so a 360 turn visibly keeps all slots
+            // filled (cached) instead of looking like it empties down to the few active ones.
+            uint32_t validBits = 0;
+            for (uint32_t s = 0; s < kMaxShadowLights; ++s) {
+                const ShadowSlot& sl = g_shadowSlots[s];
+                if (sl.valid && sl.lastRenderFrame != 0) { validBits |= (1u << s); }
+            }
+            // Mirror the masks into gFrameData.atlasDbg for the F12 mode-11/12 shadow-atlas debug view
+            // (shadowatlasview.frag: .x active, .y dyn, .z re-rendered-this-frame, .w valid/cached).
             {
                 float* fdb = (float*)g_live.pFrameCbv->pCpuMappedAddress;
                 reinterpret_cast<uint32_t*>(fdb)[72] = activeBits;
                 reinterpret_cast<uint32_t*>(fdb)[73] = dynBits;
                 reinterpret_cast<uint32_t*>(fdb)[74] = staticReBits;   // atlasDbg.z: static tile re-rendered this frame
+                reinterpret_cast<uint32_t*>(fdb)[75] = validBits;      // atlasDbg.w: slot holds a cached tile
             }
             g_shadowFrameActive = !g_shadowRenders.empty() || !g_shadowRendersDyn.empty();
 
@@ -6364,8 +6423,9 @@ namespace ForgeRender {
                     for (const auto& dm : g_dynMoverCasters) {
                         if (dm.slot < g_meshHigh && g_meshes[dm.slot].animated) { ++nMovAnim; }
                     }
-                    LOG::logline(">> [p3-shadow] f=%u valid=%u active=%u renders=%u (must=%u stale=%u) dyn=%u movers=%u (anim=%u) srcMover=%d rigidMov=%d activeBits=0x%08X dynBits=0x%08X casters=%u",
-                                 frame, nValid, nActive, nRender, nMustR, nStaleR,
+                    LOG::logline(">> [p3-shadow] f=%u valid=%u active=%u lights=%u churn(free=%u chal=%u) renders=%u (must=%u stale=%u) dyn=%u movers=%u (anim=%u) srcMover=%d rigidMov=%d activeBits=0x%08X dynBits=0x%08X casters=%u",
+                                 frame, nValid, nActive, (unsigned)lights.size(), nAssignFree, nAssignChal,
+                                 nRender, nMustR, nStaleR,
                                  (unsigned)g_shadowRendersDyn.size(),
                                  nMov, nMovAnim,
                                  g_shadowSourceMover ? 1 : 0, g_shadowRigidMovers ? 1 : 0,
@@ -12483,10 +12543,24 @@ namespace ForgeRender {
             if (hdr.flags & IPC::kGeomFlagRelease) {
                 if (hdr.slot < g_meshHigh) {
                     HostMesh& rm = g_meshes[hdr.slot];
+                    // Precise invalidation: dirty only the slots that were shadowing this caster so
+                    // its shadow stops ghosting in place — instead of re-baking all 32. (Whole-cell
+                    // transitions reset every slot separately via g_shadowCellEpoch, so those slots
+                    // are already invalid here and the scatter is a no-op.)
+                    if (rm.lastWorldFrame != 0) {
+                        const float* ow = rm.lastWorld;   // ABSOLUTE
+                        const float cx = rm.localCenter[0]*ow[0] + rm.localCenter[1]*ow[4] + rm.localCenter[2]*ow[8]  + ow[12];
+                        const float cy = rm.localCenter[0]*ow[1] + rm.localCenter[1]*ow[5] + rm.localCenter[2]*ow[9]  + ow[13];
+                        const float cz = rm.localCenter[0]*ow[2] + rm.localCenter[1]*ow[6] + rm.localCenter[2]*ow[10] + ow[14];
+                        const float rs0 = ow[0]*ow[0]+ow[1]*ow[1]+ow[2]*ow[2];
+                        const float rs1 = ow[4]*ow[4]+ow[5]*ow[5]+ow[6]*ow[6];
+                        const float rs2 = ow[8]*ow[8]+ow[9]*ow[9]+ow[10]*ow[10];
+                        float rsMax = rs0 > rs1 ? rs0 : rs1; if (rs2 > rsMax) { rsMax = rs2; }
+                        markSlotsDirtyNear(cx, cy, cz, rm.localRadius * std::sqrt(rsMax));
+                    }
                     rm.lastWorldFrame = 0;   // drops it from the caster gather (see the == 0 skip)
                     rm.everMoved      = false;
                     rm.lastMoveFrame  = 0;
-                    g_casterEpoch     = g_renderFrame;
                     if (rm.valid && rm.inArena) {
                         releaseMeshBuffers(rm);
                         rm.valid = false;
