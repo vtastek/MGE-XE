@@ -232,6 +232,45 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
             float3 Poff  = P + N * (normalOffsetK * sinT * texelW);
 
             float3 d      = Poff - posRad.xyz;         // light -> pixel (normal-offset applied)
+            // Flicker "movement": rotate the lookup DIRECTION by a small time-varying angle for flicker-
+            // class slots (slotBits.z). A rotation is a constant ANGULAR offset, so the shadow's world
+            // displacement = angle*|d| — ~zero at the light (candle tip stays put) and grows toward the
+            // attenuation edge, like real firelight. Applied BEFORE the face pick (face-coherent); the
+            // atlas is never re-baked, only re-aimed. Host: biasParams.z phase, biasParams.w amp (rad).
+            uint  flickerBits = gShadowMaskParams.slotBits.z;
+            float wobAmp      = gShadowMaskParams.biasParams.w;
+            if (wobAmp > 0.0f && ((flickerBits >> s) & 1u) != 0u)
+            {
+                float a    = gShadowMaskParams.biasParams.z;      // time * speed (global)
+                float seed = float(s) * 2.399963f;                // per-SLOT phase — camera-INVARIANT. (A
+                                                                  // camera-relative position hash shakes the
+                                                                  // wobble as the eye moves; the slot index
+                                                                  // is stable per light and doesn't.)
+                // Angular-velocity vector (radians). Each axis = 3 octaves at incommensurate frequencies,
+                // but each octave's PHASE is modulated by a slow wandering term m (FM turbulence) so the
+                // motion never repeats — quasi-periodic + chaotic without raising the base rate. Vertical
+                // axis (z) dominant → sway is mostly horizontal. The GUST envelope is a PRODUCT of two slow
+                // 0..1 swells: the product sits low most of the time with occasional coincident peaks, so
+                // the flame is mostly calm and then gusts — deeper and burstier than a single sine.
+                float m  = 0.75f * sin(a * 0.29f + seed * 1.7f);            // slow wandering phase modulator
+                float g0 = 0.5f + 0.5f * sin(a * 0.17f + seed * 0.9f);      // 0..1 slow swell
+                float g1 = 0.5f + 0.5f * sin(a * 0.31f + seed * 2.3f);      // 0..1 slower, different phase
+                float gust = 0.22f + 0.78f * g0 * g1;                       // 0.22 .. 1.0, gusty (biased low)
+                float3 wvec;
+                wvec.x = 0.34f*sin(a*0.83f + seed      + m)      + 0.17f*sin(a*1.97f + seed*1.7f - m*1.3f) + 0.09f*sin(a*3.71f + seed*3.1f + m*0.7f);
+                wvec.y = 0.34f*sin(a*0.91f + seed*1.3f - m)      + 0.17f*sin(a*2.13f + seed*0.7f + m*0.9f) + 0.09f*sin(a*4.29f + seed*2.3f - m*1.1f);
+                wvec.z = 0.90f*sin(a*1.07f + seed*0.5f + m*1.2f) + 0.40f*sin(a*2.33f + seed*2.1f - m*0.8f) + 0.16f*sin(a*4.90f + seed*1.1f + m*1.5f);
+                wvec  *= wobAmp * gust;
+                // Pole guard: when d is near-VERTICAL (camera below an overhead/carried torch, shading the
+                // floor right under it), rotating about a HORIZONTAL axis sweeps that near-vertical direction
+                // across the cube-face pole → erratic swirl. Fade the horizontal-axis tilt (wvec.xy) by how
+                // horizontal d is, leaving only the vertical-axis horizontal-sway term (which → 0 there anyway,
+                // so it degrades gracefully to no wobble underfoot). Side walls (d horizontal) are unaffected.
+                float horiz = length(d.xy) / max(length(d), 1e-4f);   // 0 straight up/down .. 1 horizontal
+                wvec.x *= horiz;
+                wvec.y *= horiz;
+                d = d + cross(wvec, d);    // first-order small rotation: |offset| ∝ |d| → constant uv shift
+            }
             float  nearZ  = gShadowMaskParams.maskParams.y;
             float3 ad     = abs(d);
 

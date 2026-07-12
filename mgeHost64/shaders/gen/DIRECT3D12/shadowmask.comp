@@ -1168,6 +1168,45 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
             float3 Poff = P + N * (normalOffsetK * sinT * texelW);
 
             float3 d = Poff - posRad.xyz;
+
+
+
+
+
+            uint flickerBits = gShadowMaskParams.slotBits.z;
+            float wobAmp = gShadowMaskParams.biasParams.w;
+            if (wobAmp > 0.0f && ((flickerBits >> s) & 1u) != 0u)
+            {
+                float a = gShadowMaskParams.biasParams.z;
+                float seed = float(s) * 2.399963f;
+
+
+
+
+
+
+
+
+
+                float m = 0.75f * sin(a * 0.29f + seed * 1.7f);
+                float g0 = 0.5f + 0.5f * sin(a * 0.17f + seed * 0.9f);
+                float g1 = 0.5f + 0.5f * sin(a * 0.31f + seed * 2.3f);
+                float gust = 0.22f + 0.78f * g0 * g1;
+                float3 wvec;
+                wvec.x = 0.34f*sin(a*0.83f + seed + m) + 0.17f*sin(a*1.97f + seed*1.7f - m*1.3f) + 0.09f*sin(a*3.71f + seed*3.1f + m*0.7f);
+                wvec.y = 0.34f*sin(a*0.91f + seed*1.3f - m) + 0.17f*sin(a*2.13f + seed*0.7f + m*0.9f) + 0.09f*sin(a*4.29f + seed*2.3f - m*1.1f);
+                wvec.z = 0.90f*sin(a*1.07f + seed*0.5f + m*1.2f) + 0.40f*sin(a*2.33f + seed*2.1f - m*0.8f) + 0.16f*sin(a*4.90f + seed*1.1f + m*1.5f);
+                wvec *= wobAmp * gust;
+
+
+
+
+
+                float horiz = length(d.xy) / max(length(d), 1e-4f);
+                wvec.x *= horiz;
+                wvec.y *= horiz;
+                d = d + cross(wvec, d);
+            }
             float nearZ = gShadowMaskParams.maskParams.y;
             float3 ad = abs(d);
 
