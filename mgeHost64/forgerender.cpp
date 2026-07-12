@@ -1539,6 +1539,14 @@ namespace {
                                         // Off = C4b behavior (LIVE parts re-bake into static tiles). Live A/B.
                                         // Declared here (not with the other debug knobs) so refreshCasterRecord
                                         // can gate its epoch logic on it.
+    bool g_shadowSourceMover = true;    // Deliverable A (default ON): refine the rigid-mover decision with the
+                                        // source-side ANIMATED bit (DrawItemWire.casterFlags kDrawCasterAnimated —
+                                        // the part carries an ACTIVE transform controller). ON: only LIVE && ANIMATED
+                                        // rigid casters take the dynamic tile; a LIVE-but-static activator (still
+                                        // hammock, fixed lantern, shut door) bakes into the cached static tile
+                                        // instead of re-rendering 6 faces every frame (the F12-12 dyn-atlas
+                                        // pollution). OFF: legacy behavior — every LIVE rigid caster is a mover.
+                                        // A/B for regression comparison; always-on is the shipping default.
 
     // P3 caching: a slot's atlas tile is re-rendered only when its caster set actually changes —
     // NEVER on a timer or on camera turn. g_casterEpoch = the last frame ANY caster appeared, moved,
@@ -4469,6 +4477,10 @@ namespace {
         // caster epoch. Refreshed on every sighting (stale value inert: gathers and the dyn
         // prewalk both require a fresh lastWorldFrame).
         bool     isLive;
+        // Deliverable A: source-side ANIMATED bit (kDrawCasterAnimated) — the LIVE part carries
+        // an ACTIVE transform controller, i.e. it really moves. Only consulted for rigid LIVE
+        // meshes when g_shadowSourceMover is on (skinned/character movers take the skinned path).
+        bool     animated;
     };
     HostMesh* g_meshes   = nullptr;
     uint32_t  g_meshCap  = 0;   // allocated slot count
@@ -4481,6 +4493,16 @@ namespace {
     double    g_recAccum = 0.0;     // summed cmd-record ms over the heartbeat window
     double    g_gpuAccum = 0.0;     // summed submit→fence ms over the heartbeat window
 
+    // Deliverable A rigid-mover predicate: a rigid LIVE caster is treated as a MOVER (dynamic
+    // tile) only if it also ANIMATES when g_shadowSourceMover is on. Off → legacy (every LIVE
+    // rigid caster is a mover). Skinned/multimap are excluded by their own checks at each site.
+    static inline bool rigidMoverPred(bool isLive, bool animated) {
+        return isLive && (!g_shadowSourceMover || animated);
+    }
+    static inline bool isRigidMover(const HostMesh& hm) {
+        return rigidMoverPred(hm.isLive, hm.animated);
+    }
+
     // C3: shared caster-record refresh — the items[] static loop and the cached-alpha cutout
     // path (C3a) both land here. world = the CAMERA-RELATIVE wire transform; stored ABSOLUTE
     // (+ this frame's shift eye) so the record survives camera motion between refreshes.
@@ -4488,7 +4510,7 @@ namespace {
     // touch the caster epoch — the gather excludes them. An emissiveHot flip on a live record
     // bumps the epoch so the g_shadowEmissiveSkip slider re-renders affected slots live.
     static void refreshCasterRecord(uint32_t slot, const float* world, uint32_t texAlphaPacked,
-                                    bool emissiveHot, bool alphaCaster, bool isLive) {
+                                    bool emissiveHot, bool alphaCaster, bool isLive, bool animated) {
         if (slot >= g_meshHigh || !g_meshes[slot].valid) { return; }
         HostMesh& shm = g_meshes[slot];
         const float ax = world[12] + g_eyeAbsShadow[0];
@@ -4505,13 +4527,25 @@ namespace {
         // never in a cached static tile, so there is nothing to invalidate or expire. All
         // other records keep the C4b semantics: appear/move/emissive-flip bumps the epoch
         // (a thrown clutter item churns briefly while airborne — acceptable by spec).
-        if (!shm.skinned && !shm.multimap && !(isLive && g_shadowRigidMovers)) {
+        if (!shm.skinned && !shm.multimap && !(rigidMoverPred(isLive, animated) && g_shadowRigidMovers)) {
             if (shm.lastWorldFrame == 0) {
                 g_casterEpoch = g_renderFrame;
             } else {
-                const float mdx = ax - shm.lastWorld[12];
-                const float mdy = ay - shm.lastWorld[13];
-                const float mdz = az - shm.lastWorld[14];
+                // Track the world-space BOUND CENTER, not the transform ORIGIN. A door (and any
+                // object that rotates about a pivot) keeps its origin pinned at the hinge while the
+                // panel — and its shadow — swings, so an origin-delta test never sees the motion
+                // and the shadow sticks. The local center, carried through the rotation, arcs and
+                // is caught. (Pure translation moves the center identically, so this strictly
+                // supersedes the old origin test.)
+                const float* lc = shm.localCenter;
+                const float ncx = lc[0]*world[0] + lc[1]*world[4] + lc[2]*world[8]  + ax;
+                const float ncy = lc[0]*world[1] + lc[1]*world[5] + lc[2]*world[9]  + ay;
+                const float ncz = lc[0]*world[2] + lc[1]*world[6] + lc[2]*world[10] + az;
+                const float* ow = shm.lastWorld;   // stored ABSOLUTE (origin re-based below last call)
+                const float ocx = lc[0]*ow[0] + lc[1]*ow[4] + lc[2]*ow[8]  + ow[12];
+                const float ocy = lc[0]*ow[1] + lc[1]*ow[5] + lc[2]*ow[9]  + ow[13];
+                const float ocz = lc[0]*ow[2] + lc[1]*ow[6] + lc[2]*ow[10] + ow[14];
+                const float mdx = ncx - ocx, mdy = ncy - ocy, mdz = ncz - ocz;
                 if (mdx*mdx + mdy*mdy + mdz*mdz > kCasterMoveEps * kCasterMoveEps) {
                     shm.everMoved     = true;
                     shm.lastMoveFrame = g_renderFrame;   // C4b: recency for settle-detection
@@ -4528,6 +4562,7 @@ namespace {
         shm.emissiveHot    = emissiveHot;
         shm.alphaCaster    = alphaCaster;
         shm.isLive         = isLive;
+        shm.animated       = animated;
     }
 
     inline double hostNowMs() {
@@ -4953,6 +4988,8 @@ namespace {
         uiAddComponentWidget(g_uiPanel, "Shadow: multimap casters (NPC heads)", &cShMm, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cShRm = {}; cShRm.pData = &g_shadowRigidMovers;
         uiAddComponentWidget(g_uiPanel, "Shadow: rigid movers dyn-tile (hands/weapons)", &cShRm, WIDGET_TYPE_CHECKBOX);
+        CheckboxWidget cShSm = {}; cShSm.pData = &g_shadowSourceMover;
+        uiAddComponentWidget(g_uiPanel, "Shadow: source-mover (dyn only if transform-animated)", &cShSm, WIDGET_TYPE_CHECKBOX);
         SliderUintWidget sShMa = {}; sShMa.pData = &g_shadowMaxActiveLights; sShMa.mMin = 1; sShMa.mMax = kMaxShadowLights; sShMa.mStep = 1;
         uiAddComponentWidget(g_uiPanel, "Shadow: max active lights (32 = no cap)", &sShMa, WIDGET_TYPE_SLIDER_UINT);
         SliderFloatWidget sShVw = {}; sShVw.pData = &g_shadowVertWeight; sShVw.mMin = 1.0f; sShVw.mMax = 8.0f; sShVw.mStep = 0.25f;
@@ -5613,7 +5650,8 @@ namespace ForgeRender {
             refreshCasterRecord(items[i].slot, items[i].world,
                                 packTexAlpha(items[i].texIndex, items[i].alphaRef, items[i].vColSource),
                                 emissiveHot, /*alphaCaster=*/false,
-                                (items[i].casterFlags & IPC::kDrawCasterLive) != 0);
+                                (items[i].casterFlags & IPC::kDrawCasterLive) != 0,
+                                (items[i].casterFlags & IPC::kDrawCasterAnimated) != 0);
         }
 
         // --- P3 shadow manager: 16-slot cache + budget-limited re-render, keyed by the P2 light
@@ -5683,6 +5721,14 @@ namespace ForgeRender {
             static bool s_prevRigidMovers = g_shadowRigidMovers;
             if (s_prevRigidMovers != g_shadowRigidMovers) {
                 s_prevRigidMovers = g_shadowRigidMovers;
+                g_casterEpoch = frame;
+            }
+            // A: flipping the source-mover refinement re-partitions LIVE rigid casters between the
+            // cached-static and dynamic tiles — re-bake every slot so still activators enter (ON)
+            // or leave (OFF) the static tiles immediately instead of at their next epoch trigger.
+            static bool s_prevSourceMover = g_shadowSourceMover;
+            if (s_prevSourceMover != g_shadowSourceMover) {
+                s_prevSourceMover = g_shadowSourceMover;
                 g_casterEpoch = frame;
             }
 
@@ -5998,7 +6044,7 @@ namespace ForgeRender {
                     const HostMesh& hm = g_meshes[slot];
                     if (!hm.valid || hm.skinned || hm.multimap) { continue; }
                     if (hm.lastWorldFrame == 0 || frame - hm.lastWorldFrame > kMoverFresh) { continue; }
-                    if (!hm.isLive || hm.emissiveHot) { continue; }
+                    if (!isRigidMover(hm) || hm.emissiveHot) { continue; }   // A: LIVE && (animated | !sourceMover)
                     const float* w = hm.lastWorld;   // ABSOLUTE (refresh re-based it)
                     const float cx = hm.localCenter[0]*w[0] + hm.localCenter[1]*w[4] + hm.localCenter[2]*w[8]  + w[12];
                     const float cy = hm.localCenter[0]*w[1] + hm.localCenter[1]*w[5] + hm.localCenter[2]*w[9]  + w[13];
@@ -6117,6 +6163,11 @@ namespace ForgeRender {
                 if (ma != mb) { return ma < mb; }
                 return ra < rb;                                             // then oldest
             });
+            // Diag (settles the "what re-renders on rotation" question): count actual static
+            // re-renders split by cause — mustR = lastRenderFrame==0 (fresh assign / moved / evict),
+            // staleR = epoch bump. Printed in the [p3-shadow] heartbeat so a camera rotation reveals
+            // must-path (slot churn) vs stale-path (global epoch).
+            uint32_t nMustR = 0, nStaleR = 0;
             // C4b lever 1 — pack dirty slots (priority order) into the 1024-matrix caster pool by
             // prefix sum of each slot's ACTUAL gather size, instead of 4 flat kShadowMaxCasters
             // reservations. A torch with 12 in-reach statics now costs 12 matrices, so many small
@@ -6129,6 +6180,7 @@ namespace ForgeRender {
             for (uint32_t di = 0; di < (uint32_t)dirty.size(); ++di) {
                 const uint32_t s = dirty[di];   // ≤ kMaxShadowLights jobs; face CBVs are per-slot (s*6)
                 ShadowSlot& sl = g_shadowSlots[s];
+                const bool wasMust = (sl.lastRenderFrame == 0);   // diag: fresh/moved/evict vs stale
                 const float reach = 2.0f * sl.radius;
                 const float lax = sl.absPos[0], lay = sl.absPos[1], laz = sl.absPos[2];   // ABSOLUTE
 
@@ -6169,7 +6221,7 @@ namespace ForgeRender {
                     // C4d: LIVE-category casters (NPC parts/equipment, activators, doors) render
                     // in the DYNAMIC tile every frame — baking one here would freeze it into the
                     // cached static tile.
-                    if (g_shadowRigidMovers && hm.isLive) { continue; }
+                    if (g_shadowRigidMovers && isRigidMover(hm)) { continue; }   // A: still LIVE activators bake here
                     gc.push_back({ d2, slot, hm.lastMirror });
                 }
                 if (gc.size() > kShadowMaxCasters) {
@@ -6216,6 +6268,7 @@ namespace ForgeRender {
                     std::memcpy(fc, faceVP, 16 * sizeof(float));
                 }
                 sl.lastRenderFrame = frame;
+                if (wasMust) { ++nMustR; } else { ++nStaleR; }   // diag
                 g_shadowRenders.push_back({ s, begin, end, regionBase });
                 usedMats += end - begin;
             }
@@ -6305,9 +6358,17 @@ namespace ForgeRender {
                 const bool rend = (nRender > 0) && (frame - s_lastShadowLog >= 10);
                 const bool beat = (frame - s_lastShadowLog >= 240);
                 if (rend || beat) {
-                    LOG::logline(">> [p3-shadow] f=%u valid=%u active=%u renders=%u dyn=%u movers=%u activeBits=0x%08X dynBits=0x%08X casters=%u",
-                                 frame, nValid, nActive, nRender, (unsigned)g_shadowRendersDyn.size(),
-                                 (unsigned)g_dynMoverCasters.size(),
+                    // Diag: split the mover pool by animated + print the toggle states so we can tell
+                    // whether source-mover is actually excluding non-animated activators.
+                    uint32_t nMov = (uint32_t)g_dynMoverCasters.size(), nMovAnim = 0;
+                    for (const auto& dm : g_dynMoverCasters) {
+                        if (dm.slot < g_meshHigh && g_meshes[dm.slot].animated) { ++nMovAnim; }
+                    }
+                    LOG::logline(">> [p3-shadow] f=%u valid=%u active=%u renders=%u (must=%u stale=%u) dyn=%u movers=%u (anim=%u) srcMover=%d rigidMov=%d activeBits=0x%08X dynBits=0x%08X casters=%u",
+                                 frame, nValid, nActive, nRender, nMustR, nStaleR,
+                                 (unsigned)g_shadowRendersDyn.size(),
+                                 nMov, nMovAnim,
+                                 g_shadowSourceMover ? 1 : 0, g_shadowRigidMovers ? 1 : 0,
                                  activeBits, dynBits, (unsigned)g_shadowCasters.size());
                     s_lastShadowLog = frame;
                 }
@@ -8325,7 +8386,7 @@ namespace ForgeRender {
                             refreshCasterRecord(slot, it.world,
                                                 packTexAlpha(it.texIndex, refUse, it.vColSource),
                                                 emissiveHot, /*alphaCaster=*/true,
-                                                /*isLive=*/false);   // C4d: alpha-origin records
+                                                /*isLive=*/false, /*animated=*/false);   // C4d: alpha-origin records
                                                                      // (hammock/banner cutouts) stay
                                                                      // on the cached static path
                         } else {

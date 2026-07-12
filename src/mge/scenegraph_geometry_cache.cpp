@@ -814,17 +814,63 @@ namespace MGE::GeometryCache {
         // Live types: Activator (silt strider idles, steam machinery), Door, NPC/Creature
         // (+ clones). Everything else — statics, clutter, containers, light fixtures —
         // stays on the cached static shadow path. Called ONCE per entry at capture.
-        bool referenceIsLiveType(const NI::ObjectNET* obj) {
+        // C4d/Deliverable-A: LIVE record categories split by whether they are a DEFINITE mover or
+        // only an AMBIGUOUS "live" record that may in fact be static. NPC/Creature (+clones) animate
+        // their skeletons every frame — always dynamic. Activators AND Doors are ambiguous: a door's
+        // swing is an ENGINE-applied 90° transform rotation (no controller — the game hardcodes it
+        // for any non-teleport door; scripted rotate/playgroup likewise mutate the transform, and no
+        // vanilla door actually scripts one). So a door has no active transform controller →
+        // hasTransformAnim=false → it takes the STATIC path: shut/teleport doors stay cached, while a
+        // swinging door's panel center arcs far past the host move-eps and re-renders via the
+        // caster-moved epoch bump that same frame. Same story as a still hammock / fixed lantern.
+        enum class LiveKind { None, Mover, Ambiguous };
+        LiveKind referenceLiveKind(const NI::ObjectNET* obj) {
             const void* ref = obj->getTes3Reference(/*searchParents=*/true);
-            if (!ref) return false;
+            if (!ref) return LiveKind::None;
             const void* base = *reinterpret_cast<void* const*>(
                 static_cast<const char*>(ref) + 0x28);
-            if (!base) return false;
+            if (!base) return LiveKind::None;
             const uint32_t t = *reinterpret_cast<const uint32_t*>(
                 static_cast<const char*>(base) + 0x4);
-            return t == 'ITCA' /*Activator*/ || t == 'ROOD' /*Door*/
-                || t == '_CPN' /*NPC*/      || t == 'CCPN' /*NPCClone*/
-                || t == 'AERC' /*Creature*/ || t == 'CERC' /*CreatureClone*/;
+            if (t == '_CPN' /*NPC*/ || t == 'CCPN' /*NPCClone*/
+             || t == 'AERC' /*Creature*/ || t == 'CERC' /*CreatureClone*/) { return LiveKind::Mover; }
+            if (t == 'ITCA' /*Activator*/ || t == 'ROOD' /*Door*/) { return LiveKind::Ambiguous; }
+            return LiveKind::None;
+        }
+
+        // Deliverable A source-mover: does this node — or an ancestor within its OWN object
+        // hierarchy — carry an ACTIVE transform-animating controller? referenceLiveKind is a
+        // coarse TES3 record-TYPE flag (every Activator/Door is "live"), but the shadow atlas
+        // debug view (F12 12) showed most of those never move: a fixed hammock, a still lantern
+        // whose only controller flips its flame texture. NI's controller taxonomy is closed —
+        // exactly four controllers mutate a node's TRANSFORM (Keyframe / Path / LookAt / Roll);
+        // UV/Flip/Vis/Alpha/Material/Color/Morpher/Particle controllers never touch it. So a node
+        // driven by an ACTIVE transform controller genuinely moves (→ dynamic shadow tile); a
+        // fixture with only a flame-texture controller reads as static (→ cached tile). Walks up
+        // to the node owning the TES3 reference (object root); parents above it are shared
+        // cell/world scene nodes. Called ONCE per entry at capture, like referenceLiveKind.
+        bool hasTransformAnim(const NI::ObjectNET* obj) {
+            for (const NI::ObjectNET* node = obj; node; ) {
+                for (const NI::TimeController* c = node->controllers; c; c = c->nextController) {
+                    if ((c->flags & NI::TimeControllerFlags::Active) == 0) continue;
+                    if (c->isInstanceOfType(NI::RTTIStaticPtr::NiKeyframeController)
+                     || c->isInstanceOfType(NI::RTTIStaticPtr::NiPathController)
+                     || c->isInstanceOfType(NI::RTTIStaticPtr::NiLookAtController)
+                     || c->isInstanceOfType(NI::RTTIStaticPtr::NiRollController)) {
+                        return true;
+                    }
+                }
+                // Stop once the node owning the TES3 reference (object root) is checked — parents
+                // above it are shared cell/world nodes not specific to this reference.
+                bool atRoot = false;
+                for (const NI::ExtraData* ed = node->extraData; ed; ed = ed->next) {
+                    if (ed->isOfType(NI::RTTIStaticPtr::TES3ObjectExtraData)) { atRoot = true; break; }
+                }
+                if (atRoot) break;
+                if (!node->isInstanceOfType(NI::RTTIStaticPtr::NiAVObject)) break;
+                node = static_cast<const NI::AVObject*>(node)->parentNode;
+            }
+            return false;
         }
 
         void visitGeometry(NI::TriBasedGeometry* geom, bool inCharacter) {
@@ -871,8 +917,17 @@ namespace MGE::GeometryCache {
                 // walk is authoritative and also covers the ensureLive lazy-capture path
                 // (which passes inCharacter=false) — an NPC's equipment resolves to the
                 // NPC reference either way. Sky/landscape never have a TES3 reference.
-                e.isLive = !g_walkingSky && !g_walkingLandscape
-                        && (inCharacter || referenceIsLiveType(geom));
+                // Deliverable A: classify the LIVE category, then decide `animated` = does this part
+                // actually MOVE. Character parts (inCharacter — incl. MW's RIGID hair/neck/limbs
+                // attached to animated bones) and definite-mover records (NPC/Creature/Door) are
+                // movers by construction → animated. Only an Activator is ambiguous, so ONLY it pays
+                // the transform-controller walk (silt strider animates → dyn; still hammock → static).
+                const LiveKind kind = (g_walkingSky || g_walkingLandscape)
+                                      ? LiveKind::None
+                                      : (inCharacter ? LiveKind::Mover : referenceLiveKind(geom));
+                e.isLive   = (kind != LiveKind::None);
+                e.animated = (kind == LiveKind::Mover)
+                          || (kind == LiveKind::Ambiguous && hasTransformAnim(geom));
                 e.isSky = g_walkingSky;
                 e.isFP = g_walkingFP;
                 if (g_walkingSky) e.skyOrder = g_skyVisitCounter++;  // SK2 back-to-front key
@@ -1603,7 +1658,15 @@ namespace MGE::GeometryCache {
         // is evicted (and released) within one sweep interval (~0.18s at 165fps), while culled-but-
         // resident objects are re-stamped by the walk and correctly kept. Cost: a full graph walk
         // 1-in-kEvictSweepInterval frames (idempotent if the walk already ran this frame).
-        if (g_frame % kEvictSweepInterval == 0) {
+        // Menu-mode fast sweep: in menu mode the game advances ONE frame per mouse click, and the
+        // player can drop or pick at most ONE near (hand-reach) object per tick — so the per-frame
+        // full walk that the 30-frame throttle exists to avoid (165fps) is free here, while the
+        // normal cadence would leave a picked-up item's ghost shadow lingering a whole sweep
+        // interval (~30 dead clicks, not 0.18s). Force the sweep EVERY menu frame so the removed
+        // near object is detected + released on the very next click. Hand-reach ⇒ always within the
+        // gate radius, so the plain walk-based "visitable but unvisited = gone" rule applies cleanly.
+        const bool sweepNow = (g_frame % kEvictSweepInterval == 0) || MWBridge::get()->IsMenu();
+        if (sweepNow) {
             ensureFullWalk();
         }
 
@@ -1612,8 +1675,8 @@ namespace MGE::GeometryCache {
         // cache filter on lastFrame == currentFrame() (buildSkyDrawList, the visible-set
         // frustum fallback), so a stale entry between sweeps is memory, not pixels.
         // The character-verdict cache is wiped on the same cadence, bounding its
-        // staleness/pointer-recycle window to one sweep interval.
-        if (g_frame % kEvictSweepInterval == 0) {
+        // staleness/pointer-recycle window to one sweep interval (or every frame in menu mode).
+        if (sweepNow) {
             MGE_ZoneScopedN("GeomCache:evict");
             // Two eviction rules, selected by whether the full walk ran THIS frame:
             //  - walk ran: stale == visitable but unvisited == genuinely gone. Evict,

@@ -69,6 +69,13 @@ namespace MGE::GeometryCache {
         // Forge host keeps LIVE casters out of the cached static shadow tiles and
         // re-renders them in the per-frame dynamic tile instead.
         bool     isLive;
+        // Deliverable A source-mover: true when this LIVE part actually moves — it or an
+        // ancestor in its own object hierarchy carries an ACTIVE transform-animating controller
+        // (Keyframe/Path/LookAt/Roll). Distinguishes a swinging lantern from a fixed one (both
+        // Activator = isLive). Ships in DrawItemWire.casterFlags as kDrawCasterAnimated; the host
+        // (g_shadowSourceMover on) keeps only isLive && animated rigid casters in the dynamic
+        // tile, baking still activators into the cached static tile. Set once at capture.
+        bool     animated;
         // SK1 sky takeover: true for entries walked from skyRoot (atmosphere dome, stars,
         // sun, moons, clouds). Sky is alpha-blended and drawn by the Forge host's dedicated
         // sky pass (depth off, behind the opaque world) — it's EXCLUDED from every opaque

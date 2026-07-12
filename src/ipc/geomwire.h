@@ -91,6 +91,16 @@ namespace IPC {
     // bumps the caster epoch; clutter delay is acceptable).
     constexpr std::uint32_t kDrawCasterLive = 0x1;
 
+    // ANIMATED (Deliverable A, source-mover): the LIVE part actually MOVES — it (or an
+    // ancestor in its own object hierarchy) carries an ACTIVE transform-animating NI
+    // controller (Keyframe/Path/LookAt/Roll). LIVE is a coarse TES3 record-TYPE flag (every
+    // Activator/Door), but most fixtures — a still hammock, a fixed lantern whose only
+    // controller animates its flame texture — never move. With the host g_shadowSourceMover
+    // toggle on, only LIVE|ANIMATED casters take the per-frame dynamic tile; a LIVE-but-static
+    // activator falls back to the cached static path (no dyn-atlas pollution, no 6-face churn).
+    // Resolved once at capture (hasTransformAnim), like the LIVE category itself.
+    constexpr std::uint32_t kDrawCasterAnimated = 0x2;
+
     // M1c per-frame draw item: which uploaded mesh (slot) to draw, with its current
     // model->world transform (D3DXMATRIX bytes, row-major — uploaded straight into the
     // host's gObject cbuffer; see opaque.srt.h for the no-transpose convention). The

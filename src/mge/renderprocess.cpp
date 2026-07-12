@@ -1174,7 +1174,8 @@ namespace {
             item.vColSource = (e.hasVertexColor && e.vColSource != 0) ? e.vColSource : 0u;
             // C4d shadow-caster category: LIVE (NPC/creature parts + held equipment,
             // activators, doors) → the host's dynamic shadow tile, not the cached statics.
-            item.casterFlags = e.isLive ? IPC::kDrawCasterLive : 0u;
+            item.casterFlags = (e.isLive ? IPC::kDrawCasterLive : 0u)
+                             | (e.animated ? IPC::kDrawCasterAnimated : 0u);
             memcpy(item.world, e.worldTransformD3D, 16 * sizeof(float));
             // CAMERA-RELATIVE rendering: subtract the camera world position from the world
             // translation so vertices reach the shader near the origin. At MW's exterior
