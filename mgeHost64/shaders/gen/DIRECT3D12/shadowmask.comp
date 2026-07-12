@@ -993,8 +993,9 @@ STRUCT(ShadowMaskParams)
 
 
 
+
     uint4 slotBits;
-#line 50
+#line 51
 };
 
         CBUFFER(ShadowMaskParams) gShadowMaskParams :  register(b0,space2);
@@ -1005,7 +1006,7 @@ STRUCT(ShadowMaskParams)
 
         Tex2D(float) gShadowAtlasDyn :  register(t4,space2);
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
-#line 45 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
+#line 54 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
 float shadowLitAt(int2 tp, int2 tmin, int2 tmax, float thresh, uint dynSlot)
 {
     tp = clamp(tp, tmin, tmax);
@@ -1061,7 +1062,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     if (deviceZ > 0.0f && activeBits != 0u)
     {
         float3 P = reconstructWorldPx(px, deviceZ, invScreen);
-#line 114 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
+#line 123 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
         float rangeK = gShadowMaskParams.maskParams.x;
         uint rangeBits = 0u;
         uint nInRange = 0u;
@@ -1079,7 +1080,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
             Write2D(gShadowMaskOut, px, mask);
             return;
         }
-#line 147 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
+#line 156 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
         if (nInRange >  8u  && dbg == 0u)
         {
             uint2 hist = uint2(0u, 0u);
@@ -1136,6 +1137,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
         if (dot(N, -P) < 0.0f) { N = -N; }
         float normalOffsetK = gShadowMaskParams.biasParams.y;
         uint dynBits = gShadowMaskParams.slotBits.y;
+        uint lanternBits = gShadowMaskParams.slotBits.w;
 
 
 
@@ -1287,7 +1289,18 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
 
 
-                vis = lerp(vis, 1.0f, smoothstep(0.85f * range, range, ma));
+
+
+
+                if (((lanternBits >> s) & 1u) != 0u)
+                {
+                    vis = lerp(vis, 1.0f, smoothstep( 0.30f  * range, range, ma));
+                    vis = lerp( 0.25f , 1.0f, vis);
+                }
+                else
+                {
+                    vis = lerp(vis, 1.0f, smoothstep(0.85f * range, range, ma));
+                }
 
 
 

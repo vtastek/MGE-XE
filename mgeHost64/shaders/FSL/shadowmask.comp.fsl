@@ -37,6 +37,15 @@
 // Hot-tunable (F8): 0 ≈ single-tap everywhere, 99999 ≈ full grid everywhere.
 #define SHADOW_PCF_NEAR_DIST 360.0f
 
+// Soft LANTERN shadows (host slotBits.w marks lantern slots — lights enclosed by their own
+// glass/paper cage; candles/torches are NOT flagged and stay crisp). Filtering is expensive, so
+// instead of a wide PCF penumbra these fade: (1) the shadow→lit dissolve starts far earlier so it
+// melts across most of the light's reach ("the whole light in attenuation"), and (2) an opacity
+// FLOOR keeps some light even where fully occluded, so glass imperfections don't read too dark.
+// Both hot-tunable (compute shader → edit + F8, no host restart).
+#define LANTERN_FADE_START 0.30f   // lanterns dissolve shadow→lit from 30% of range (candles: 0.85)
+#define LANTERN_FLOOR      0.25f   // lantern shadow keeps >= 25% light even fully occluded (0 = full black)
+
 // Reverse-Z shadow test at ONE atlas texel, clamped inside the face sub-tile so a tap can
 // never bleed onto a neighbouring cube face. Returns 1 = lit, 0 = shadowed.
 // C4b composite: when the slot's DYNAMIC tile is valid this frame (dynSlot != 0), the
@@ -200,6 +209,7 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         if (dot(N, -P) < 0.0f) { N = -N; }             // face the eye (camera at origin)
         float  normalOffsetK = gShadowMaskParams.biasParams.y;   // offset in atlas texels (live)
         uint   dynBits       = gShadowMaskParams.slotBits.y;   // C4b: slots with a valid dyn tile
+        uint   lanternBits   = gShadowMaskParams.slotBits.w;  // lantern slots → soft attenuation-fade
 
         // Near-bubble test for this pixel (camera-relative world → eye distance = |P|),
         // decided once — every slot at this receiver shares the same eye distance. The PCF
@@ -351,7 +361,18 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
                 // range cut above never shows as a lit/shadowed seam (below rangeK=2.0 the
                 // attenuation ramp is still non-zero at the cut). At rangeK=2.0 the band sits
                 // where attenuation reaches exactly 0 — visually the old output.
-                vis = lerp(vis, 1.0f, smoothstep(0.85f * range, range, ma));
+                // LANTERN soft-fade: for enclosed (diffused) lights, start the dissolve MUCH earlier
+                // so the shadow melts across most of the reach, and lift it off full-black by a floor —
+                // a cheap soft look without extra PCF taps. Candles/torches (bit clear) keep the crisp band.
+                if (((lanternBits >> s) & 1u) != 0u)
+                {
+                    vis = lerp(vis, 1.0f, smoothstep(LANTERN_FADE_START * range, range, ma));
+                    vis = lerp(LANTERN_FLOOR, 1.0f, vis);   // opacity floor: never fully black
+                }
+                else
+                {
+                    vis = lerp(vis, 1.0f, smoothstep(0.85f * range, range, ma));
+                }
                 // Temporal fade-IN (host-driven per slot): slotTile[s].w ramps 0→1 when a FAR light
                 // newly pops into this slot (a reclaim), 1.0 in steady state / for near lights. Lerp
                 // vis toward LIT (1.0) so the far shadow eases in place instead of snapping on.
