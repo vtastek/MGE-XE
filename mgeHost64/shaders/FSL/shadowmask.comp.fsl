@@ -313,6 +313,10 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
                 // attenuation ramp is still non-zero at the cut). At rangeK=2.0 the band sits
                 // where attenuation reaches exactly 0 — visually the old output.
                 vis = lerp(vis, 1.0f, smoothstep(0.85f * range, range, ma));
+                // Temporal fade-IN (host-driven per slot): slotTile[s].w ramps 0→1 when a FAR light
+                // newly pops into this slot (a reclaim), 1.0 in steady state / for near lights. Lerp
+                // vis toward LIT (1.0) so the far shadow eases in place instead of snapping on.
+                vis = lerp(1.0f, vis, saturate(tile.w));
                 nib = (uint)(saturate(vis) * 15.0f + 0.5f);
             }
             if (dbg == 1u) { nib = (face + 1u) * 2u; }   // face-id bands (convention check FIRST)
