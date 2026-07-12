@@ -1531,6 +1531,10 @@ namespace {
     // <= 1024 caster matrices x 6 faces, exactly the old budget*cap ceiling.
     constexpr uint32_t kShadowWorldMatrices  = kBatchBytes / 64;   // 1024 — total packed casters/frame
     constexpr uint32_t kShadowHoldFrames     = 30;    // a slot is protected from challengers this many frames
+    constexpr uint32_t kShadowCellInstantFrames = 90; // after a cell change / teleport, slots assigned within
+                                                      // this window skip the far-reclaim fade-in (a whole new
+                                                      // cell's shadows must appear INSTANTLY, not ease in as it
+                                                      // loads) — covers the multi-frame light/geometry stream-in.
     constexpr float    kShadowChallengeRatio = 1.5f;  // challenger importance must beat incumbent by this
     constexpr float    kShadowMovedEps       = 1.0f;  // LIGHT ABS-pos delta (world u) that dirties its slot
     constexpr float    kCasterMoveEps        = 0.1f;  // CASTER ABS-pos delta that counts as a move (catches
@@ -1668,6 +1672,13 @@ namespace {
                                             // changes so a reveal near ONE light no longer re-bakes all 32.
         bool     activeThisFrame = false;   // light present this frame (mask activeBits + forward patch)
         uint32_t curLightIdx     = 0;       // TRANSIENT: this frame's light cbuffer index (valid iff active)
+        float    fadeLevel       = 1.0f;    // temporal fade-IN [0..1] ridden in slotTile[s].w → shadowmask
+                                            // lerps vis toward LIT below 1. Reset to 0 in assignSlot ONLY when
+                                            // a FAR light newly takes the slot (a reclaim pop the penalty just
+                                            // created), then ramped +g_shadowFadeInStep/frame once the tile
+                                            // bakes → a far in-view shadow fades in place instead of snapping.
+                                            // Near/spawning lights start at 1.0 (instant — a cast spell at your
+                                            // feet must not lag). 1.0 = full shadow (steady state).
     };
     ShadowSlot g_shadowSlots[kMaxShadowLights];
 
@@ -1677,6 +1688,8 @@ namespace {
     // new-cell light's atlas). Fixes "shadows from another interior". ~0u so the first frame with a
     // real epoch (>=1) triggers a clean reset. See g_cellEpoch (client renderprocess.cpp).
     uint32_t g_shadowCellEpoch = 0xFFFFFFFFu;
+    uint32_t g_shadowCellChangeFrame = 0;   // g_renderFrame of the last cell change / teleport — slots assigned
+                                            // within kShadowCellInstantFrames of it skip the far-reclaim fade-in.
 
     // One scheduled face-block re-render this frame. b = index in g_shadowRenders (< kMaxShadowLights);
     // GPU caster region base = regionBase (C4b prefix-sum packed, sized by the ACTUAL gather — not a
@@ -4890,6 +4903,16 @@ namespace {
                                         // 0 so ANY present light reclaims it, while kShadowHoldFrames=30 bounds
                                         // thrash → chal stayed 0-2, no visible downside). 1.0 = off (old ranking,
                                         // absent lights hoard slots); >0 keeps a partial bias. Live A/B knob.
+    float g_shadowFadeInStep = 0.05f;   // Temporal fade-IN speed for a FAR shadow that newly pops into a slot
+                                        // (the reclaim the inactive-slot penalty just made). Per-frame ramp of
+                                        // ShadowSlot.fadeLevel 0→1, ridden in slotTile[s].w; shadowmask lerps
+                                        // that slot's vis toward LIT below 1 → the far table shadow fades in
+                                        // place instead of snapping on. 0.05 ≈ 20-frame fade. 0 = OFF (instant,
+                                        // fadeLevel forced 1). Frame-based (simple; retune per fps). Live.
+    float g_shadowFadeInDist = 512.0f;  // Only a light farther than this (eye distance, world u) fades in — a
+                                        // near light or a SPAWNING one (spell/torch at your feet) takes its
+                                        // slot at full strength (instant), since a lagged near shadow reads as
+                                        // a bug. The reclaim pops this smooths are the FAR ones. Live knob.
     // C3b: emissive caster skip — replaces the P3 fixture-radius self-shadow heuristic (which was
     // finnicky: a lantern is several NiTriShapes with different bounding spheres, so parts of the
     // fixture's shadow appeared/disappeared). MW marks a light's own hot part with a full-emissive
@@ -5090,6 +5113,10 @@ namespace {
         uiAddComponentWidget(g_uiPanel, "Shadow: occlusion-cull bakes (Hi-Z; OFF = byte-identical)", &cShOc, WIDGET_TYPE_CHECKBOX);
         SliderFloatWidget sShIp = {}; sShIp.pData = &g_shadowInactivePenalty; sShIp.mMin = 0.0f; sShIp.mMax = 1.0f; sShIp.mStep = 0.05f;
         uiAddComponentWidget(g_uiPanel, "Shadow: inactive-slot reclaim penalty (1 = off)", &sShIp, WIDGET_TYPE_SLIDER_FLOAT);
+        SliderFloatWidget sShFi = {}; sShFi.pData = &g_shadowFadeInStep; sShFi.mMin = 0.0f; sShFi.mMax = 1.0f; sShFi.mStep = 0.01f;
+        uiAddComponentWidget(g_uiPanel, "Shadow: far-reclaim fade-in speed (0 = instant)", &sShFi, WIDGET_TYPE_SLIDER_FLOAT);
+        SliderFloatWidget sShFd = {}; sShFd.pData = &g_shadowFadeInDist; sShFd.mMin = 0.0f; sShFd.mMax = 4096.0f; sShFd.mStep = 64.0f;
+        uiAddComponentWidget(g_uiPanel, "Shadow: fade-in min distance (near/spawn = instant)", &sShFd, WIDGET_TYPE_SLIDER_FLOAT);
         SliderFloatWidget sShEm = {}; sShEm.pData = &g_shadowEmissiveSkip; sShEm.mMin = 0.0f; sShEm.mMax = 1.5f; sShEm.mStep = 0.05f;
         uiAddComponentWidget(g_uiPanel, "Shadow: emissive caster skip (>1 = off)", &sShEm, WIDGET_TYPE_SLIDER_FLOAT);
         CheckboxWidget cShBc = {}; cShBc.pData = &g_shadowBlendCasters;
@@ -5607,6 +5634,7 @@ namespace ForgeRender {
             const uint32_t cellEpoch = (uint32_t)(int)lighting[19];
             if (cellEpoch != g_shadowCellEpoch) {
                 g_shadowCellEpoch = cellEpoch;
+                g_shadowCellChangeFrame = g_renderFrame;   // fresh cell: its shadows appear INSTANT, not faded in
                 for (uint32_t s = 0; s < kMaxShadowLights; ++s) { g_shadowSlots[s] = ShadowSlot{}; }
                 for (uint32_t s2 = 0; s2 < g_meshHigh; ++s2) {
                     g_meshes[s2].lastWorldFrame = 0;
@@ -6088,6 +6116,15 @@ namespace ForgeRender {
                 sl.lastRenderFrame = 0;   // must render once
                 sl.dirty = false;         // must-path covers the first render; no stale carry-over
                 sl.activeThisFrame = true; sl.curLightIdx = L.idx;
+                // Temporal fade-IN: a FAR light newly popping into a slot (a reclaim the penalty just
+                // made) starts at 0 and ramps up once its tile bakes, so the far table shadow fades in
+                // place. A near / spawning light (spell at your feet) starts full — instant. Gated on
+                // g_shadowFadeInStep>0 so OFF (0) never strands a far slot at fadeLevel 0. A fresh cell /
+                // teleport is ALSO instant (the whole new cell's shadows must not ease in as it loads).
+                const float d2 = L.pos[0]*L.pos[0] + L.pos[1]*L.pos[1] + L.pos[2]*L.pos[2];
+                const bool  farLight = d2 >= g_shadowFadeInDist * g_shadowFadeInDist;
+                const bool  cellSettling = (frame - g_shadowCellChangeFrame) < kShadowCellInstantFrames;
+                sl.fadeLevel = (g_shadowFadeInStep > 0.0f && farLight && !cellSettling) ? 0.0f : 1.0f;
             };
             for (uint32_t c : cand) {
                 // 1. A free (never-used / never-reclaimed) slot.
@@ -6465,8 +6502,12 @@ namespace ForgeRender {
                 mp[24 + s * 4 + 3] = sl.radius;
                 uint32_t bx, by, bs;
                 shadowSlotBlock(s, bx, by, bs);
+                // Ramp the temporal fade-in NOW the tile is baked+in-mask (this loop only reaches
+                // rendered active slots), then ride it in slotTile[s].w. Far reclaims start at 0
+                // (assignSlot) and climb; steady/near slots are already at 1.0 (no visible ramp).
+                sl.fadeLevel = std::min(1.0f, sl.fadeLevel + g_shadowFadeInStep);
                 mp[152 + s * 4 + 0] = (float)bx; mp[152 + s * 4 + 1] = (float)by;
-                mp[152 + s * 4 + 2] = (float)bs; mp[152 + s * 4 + 3] = 1.0f;
+                mp[152 + s * 4 + 2] = (float)bs; mp[152 + s * 4 + 3] = sl.fadeLevel;
                 lc[4 + sl.curLightIdx * 12 + 11] = (float)(s + 1);      // falloff.w = slot+1
             }
             mp[20] = g_shadowRangeK;              // maskParams.x = shadow test range in radii (live knob)

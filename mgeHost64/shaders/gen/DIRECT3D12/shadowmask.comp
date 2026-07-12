@@ -1249,6 +1249,10 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
 
                 vis = lerp(vis, 1.0f, smoothstep(0.85f * range, range, ma));
+
+
+
+                vis = lerp(1.0f, vis, saturate(tile.w));
                 nib = (uint)(saturate(vis) * 15.0f + 0.5f);
             }
             if (dbg == 1u) { nib = (face + 1u) * 2u; }
