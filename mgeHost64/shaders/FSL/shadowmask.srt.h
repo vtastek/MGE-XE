@@ -44,7 +44,8 @@ STRUCT(ShadowMaskParams)
     //             (movers: skinned + multimap, re-rendered every frame) is valid THIS frame —
     //             each PCF texel takes max(static, dynamic) = the nearer reverse-Z occluder.
     //             Unset = the dynamic tile is stale (mover left reach); sample static only.
-    //             z/w = spare.
+    //             z = FLICKER-class bitmask (fClass==2 slots → shadow direction wobble).
+    //             w = LANTERN bitmask (light enclosed by its own cage → soft attenuation-fade).
     // Appended at the struct tail so every offset above stays fixed.
     DATA(uint4,    slotBits,     None);
 };

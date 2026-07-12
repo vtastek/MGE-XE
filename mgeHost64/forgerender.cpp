@@ -1695,6 +1695,11 @@ namespace {
         int8_t   fPrevDir   = 0;       // sign of last significant dI (reversal detect)
         uint8_t  fClass     = 0;       // 0 steady, 1 pulse, 2 flicker (derived; settles from warm-up)
         uint16_t fAnimFrames= 0;       // consecutive-ish frames seen animated (warm-up / anti-flap hysteresis)
+        // Soft-shadow category (LANTERN, not candle): a caster of THIS light encloses it (fixture cage
+        // → twoSided). A lantern diffuses its light through glass/paper, so its shadows read soft; a bare
+        // candle flame encloses nothing and stays crisp. Set on the slot's gather, persists between renders
+        // (statics don't move), re-derived on reassignment. Feeds the mask's soft attenuation-fade (slotBits.w).
+        bool     isLantern  = false;
     };
     ShadowSlot g_shadowSlots[kMaxShadowLights];
 
@@ -5036,6 +5041,11 @@ namespace {
     // threshold the frag reads via gFrameData.atlasDbg.z (0 → carve off, every emissive texel casts).
     bool  g_shadowEmissiveCast  = true;
     float g_shadowEmissiveTexel = 0.35f;
+    // Soft LANTERN shadows: lights enclosed by their own cage (glass/paper lantern) get a wide
+    // attenuation-fade + opacity floor in the mask (slotBits.w). Bare candles/torches enclose
+    // nothing → not flagged → crisp. OFF → all point-light shadows stay crisp (A/B). The fade
+    // SHAPE (start/floor) is hot-tunable in shadowmask.comp (LANTERN_FADE_START / LANTERN_FLOOR, F8).
+    bool  g_shadowLanternSoft   = true;
     // C3a: cutout-blend casters (see g_texAlphaKind). Toggling OFF forgets alpha-origin caster
     // records so their cached shadows drop immediately (manager sweep).
     bool  g_shadowBlendCasters = true;
@@ -5254,6 +5264,8 @@ namespace {
         uiAddComponentWidget(g_uiPanel, "Shadow: emissive per-texel carve (off = whole-mesh drop)", &cShEc, WIDGET_TYPE_CHECKBOX);
         SliderFloatWidget sShEt = {}; sShEt.pData = &g_shadowEmissiveTexel; sShEt.mMin = 0.0f; sShEt.mMax = 1.0f; sShEt.mStep = 0.02f;
         uiAddComponentWidget(g_uiPanel, "Shadow: emissive carve threshold (0 = cast all)", &sShEt, WIDGET_TYPE_SLIDER_FLOAT);
+        CheckboxWidget cShLs = {}; cShLs.pData = &g_shadowLanternSoft;
+        uiAddComponentWidget(g_uiPanel, "Shadow: soft lantern shadows (candles stay crisp)", &cShLs, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cShBc = {}; cShBc.pData = &g_shadowBlendCasters;
         uiAddComponentWidget(g_uiPanel, "Shadow: cutout-blend casters", &cShBc, WIDGET_TYPE_CHECKBOX);
         SliderFloatWidget sShBr = {}; sShBr.pData = &g_shadowBlendRef; sShBr.mMin = 0.0f; sShBr.mMax = 1.0f; sShBr.mStep = 0.05f;
@@ -6558,6 +6570,12 @@ namespace ForgeRender {
                                               && d2 < wr * wr) ? 1u : 0u;
                     gc.push_back({ d2, slot, hm.lastMirror, twoSided });
                 }
+                // LANTERN category: this light is enclosed by one of its own casters (a fixture cage
+                // → twoSided). Enclosed = diffused = soft shadows (glass/paper lantern); a bare candle
+                // flame encloses nothing → stays crisp. Sticky per slot (re-derived each render).
+                bool anyCage = false;
+                for (const GatherC& g2 : gc) { if (g2.twoSided) { anyCage = true; break; } }
+                sl.isLantern = anyCage;
                 if (gc.size() > kShadowMaxCasters) {
                     std::nth_element(gc.begin(), gc.begin() + kShadowMaxCasters, gc.end(),
                                      [](const GatherC& a, const GatherC& b) { return a.d2 < b.d2; });
@@ -6658,6 +6676,7 @@ namespace ForgeRender {
             uint32_t activeBits = 0;
             uint32_t staticReBits = 0;   // slots whose STATIC tile re-rendered THIS frame (not cached)
             uint32_t flickerBits = 0;    // slots whose light is FLICKER-class (fClass==2) → mask dir wobble
+            uint32_t lanternBits = 0;    // slots whose light is a LANTERN (enclosed by its own cage) → soft fade
             // Shared synthetic flame phase (time*speed off a captured base). Drives BOTH the mask's shadow
             // sway (written to biasParams.z below) AND the forward light-intensity match here — same base,
             // seed (slot index) and gust formula on both sides, so brightness and shadow move as one flame.
@@ -6668,6 +6687,7 @@ namespace ForgeRender {
                 if (!sl.valid || !sl.activeThisFrame || sl.lastRenderFrame == 0) { continue; }
                 activeBits |= (1u << s);
                 if (sl.lastRenderFrame == frame) { staticReBits |= (1u << s); }
+                if (sl.isLantern) { lanternBits |= (1u << s); }   // soft attenuation-fade in the mask
                 if (sl.fClass == 2u) {
                     flickerBits |= (1u << s);   // shadow "movement" applies here only
                     // Intensity match: modulate this flicker light's FORWARD brightness with the SAME flame
@@ -6721,6 +6741,7 @@ namespace ForgeRender {
             reinterpret_cast<uint32_t*>(mp)[284] = activeBits;   // slotBits.x
             reinterpret_cast<uint32_t*>(mp)[285] = dynBits;      // slotBits.y (C4b dyn tile valid THIS frame)
             reinterpret_cast<uint32_t*>(mp)[286] = flickerBits;  // slotBits.z (flicker-class slots → dir wobble)
+            reinterpret_cast<uint32_t*>(mp)[287] = g_shadowLanternSoft ? lanternBits : 0u;  // slotBits.w (lantern → soft fade; 0 = crisp A/B)
             // validBits: slots that HOLD a rendered tile (valid + rendered at least once), whether or
             // not their light is in view this frame. Lets the debug view show a RETAINED/cached tile
             // (valid, inactive) distinctly from an empty slot — so a 360 turn visibly keeps all slots
