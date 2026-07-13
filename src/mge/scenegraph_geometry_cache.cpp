@@ -73,6 +73,27 @@ namespace MGE::GeometryCache {
         const char*       g_nullBoneSampleTex     = nullptr; // a sample part's texture
 
         std::unordered_map<uint32_t, CachedGeometry>      g_cache;
+        // STRONG reference to every cached NiTriShape, keyed exactly like g_cache.
+        //
+        // The cache KEY IS THE RAW ADDRESS of the shape, and ensureLive() dereferences that address
+        // (geom->getModelData()) BEFORE it can validate anything — so if the engine freed the shape
+        // while we still hold the key, that deref is a use-after-free. It is not defendable at the
+        // deref site: you cannot ask a dangling pointer whether it is dangling. (Crash 2026-07-13:
+        // loading a save tore down the scene; the offscreen near-actor re-emit path ensureLive()d the
+        // now-freed keys still sitting in the cache. The old guard reasoned "near ⇒ alive", which is a
+        // proximity argument, not a liveness one — a teardown frees near and far alike.)
+        //
+        // So make the pointer genuinely valid instead: hold an actual engine reference for exactly as
+        // long as we cache the key. NI::Pointer is RAII (claim on assign, DecRef in the dtor), so the
+        // shape cannot be destroyed under us, and every later deref of a cached key is sound BY
+        // CONSTRUCTION. The ref is taken in visitGeometry — the one capture point, reached only from
+        // the walk or ensureLive's lazy capture, where the shape is provably alive because we are
+        // reading it right then.
+        //
+        // It also retires the recycled-address hazard: an address cannot be handed to a NEW shape
+        // while we still own a reference to the old one. The dataPtr identity guards stay as
+        // belt-and-braces (a live setModelData swap still needs them).
+        std::unordered_map<uint32_t, NI::Pointer<NI::TriBasedGeometry>> g_geomRefs;
         // Keys evicted by the sweep since the last drain (object left the world within a cell).
         // The Forge feed drains these each frame (takeEvictedKeys) to release the matching host
         // mesh slot so its shadow-caster record stops ghosting. Only the "genuinely gone" sweep
@@ -892,10 +913,16 @@ namespace MGE::GeometryCache {
                 // describes a different mesh — drop it and rebuild through the fresh path.
                 releaseEntry(it->second);
                 g_cache.erase(it);
+                g_geomRefs.erase(key);   // key leaving the cache → drop the engine ref
                 it = g_cache.end();
             }
             if (it == g_cache.end()) {
                 auto& e = g_cache[key];
+                // Take the engine reference the moment the key enters the cache. `geom` is provably
+                // alive here (we are dereferencing it), and holding this ref is what makes every LATER
+                // deref of this key safe — including ensureLive()'s, on an offscreen key, frames after
+                // the engine dropped the object. Released only where the key leaves the cache.
+                g_geomRefs[key] = geom;
                 e.vb[0] = e.vb[1] = nullptr; e.ib = nullptr; e.writeSlot = 0;
                 e.numBones = 0; e.skinnedUnsupported = false;
                 e.dataPtr = data;
@@ -1717,6 +1744,7 @@ namespace MGE::GeometryCache {
                 if (evict) {
                     g_evictedKeys.push_back(it->first);   // tell the Forge feed to release the host slot
                     releaseEntry(e);
+                    g_geomRefs.erase(it->first);          // key leaving the cache → drop the engine ref
                     it = g_cache.erase(it);
                 } else {
                     ++it;
@@ -1806,6 +1834,29 @@ namespace MGE::GeometryCache {
         out.swap(g_evictedKeys);   // move-out + leave g_evictedKeys empty for the next sweep
     }
 
+    void purgeAll() {
+        // A cell teardown (load door, teleport, save load) destroys the whole scene graph, but the
+        // cache is keyed on shape ADDRESSES and knows nothing about it — so every entry survives into
+        // the new cell as a corpse. They were then still being emitted for a frame before the age
+        // sweep caught them: the one-frame flash of the OLD cell's objects and NPCs on a transition.
+        //
+        // Drop the lot. Every key goes through the SAME eviction channel the age sweep uses, so the
+        // Forge feed releases the matching host mesh slots (and their shadow-caster records) instead
+        // of leaving them ghosting host-side. Everything still present in the new cell is re-captured
+        // lazily on first sight — cell changes already re-upload, so this costs nothing that the
+        // transition wasn't paying anyway.
+        //
+        // Note this is a CORRECTNESS fix, not a safety one: the g_geomRefs strong refs are what make
+        // a stale key safe to touch. That ordering matters — it means a MISSED purge (the cell-change
+        // signal is a heuristic) degrades to a harmless ghost rather than to a use-after-free.
+        for (auto& kv : g_cache) {
+            g_evictedKeys.push_back(kv.first);
+            releaseEntry(kv.second);
+        }
+        g_cache.clear();
+        g_geomRefs.clear();   // NI::Pointer dtors → DecRef every shape we were pinning
+    }
+
     const CachedGeometry* ensureLive(uint32_t key) {
         if (!g_device) return nullptr;
         auto* geom = reinterpret_cast<NI::TriBasedGeometry*>(key);
@@ -1815,13 +1866,23 @@ namespace MGE::GeometryCache {
             return &it->second;     // already fresh (full walk ran, or a duplicate key)
         }
 
+        // The deref below is only sound for two kinds of key, and both are covered:
+        //   - ALREADY CACHED  → g_geomRefs holds an engine reference, so the shape cannot have been
+        //                       freed, however long ago it was last seen and wherever it is now.
+        //   - FIRST SIGHT     → the caller passed a key from THIS frame's classify set (live by
+        //                       construction; foldVisibleKeys() is consume-once for exactly that
+        //                       reason), so it is alive right now and the lazy capture below takes
+        //                       the ref before anyone can deref it again.
+        // Never hand this function a raw key from any other source.
         auto* data = geom->getModelData().get();
         if (!data) return nullptr;
 
         if (it != g_cache.end() && it->second.dataPtr != data) {
-            // Recycled NiTriShape address — the entry describes a different mesh.
+            // A live setModelData swap (the address itself can no longer be recycled onto a new
+            // shape — g_geomRefs pins it — but the DATA behind it can still be replaced).
             releaseEntry(it->second);
             g_cache.erase(it);
+            g_geomRefs.erase(key);   // key leaving the cache → drop the engine ref
             it = g_cache.end();
         }
 
