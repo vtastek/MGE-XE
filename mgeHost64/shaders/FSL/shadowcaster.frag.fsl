@@ -13,13 +13,21 @@
 //      applied to emitted brightness instead of coverage — so the old all-or-nothing whole-mesh
 //      emissive skip (forgerender C3b) becomes a per-texel carve.
 //
-//      emitted ≈ MatEmissive * texColor (MW's MODULATE texture stage), so a NON-emissive caster
-//      has MatEmissive≈0 → emitted≈0 → this never fires and ordinary casters are untouched — the
-//      same self-gating the whole-mesh classifier relied on, now per-texel and free.
+//      OWNER-KEYED. The carve exists to stop a fixture caging ITS OWN light — that is the only
+//      light it may be see-through to. From any OTHER light the fixture is just an object, and its
+//      glowing texels must cast like the opaque geometry they are (a lit lantern across the room is
+//      not a hole in the shadow). So the host tags each caster instance with its OWNER slot in
+//      MatEmissive.y and stamps the slot being baked into gFrameData.atlasDbg.w; the carve fires
+//      only when they match. MatEmissive.y: 0 = no owner (never carve — cast fully opaque),
+//      -1 = the legacy un-keyed carve (see-through from every light; host A/B).
 //
-//      Threshold rides gFrameData.atlasDbg.z (a lane the per-face shadow cbuffer leaves spare —
-//      only faceVP[0..15] is filled there), = host g_shadowEmissiveTexel. thr <= 0 disables the
-//      carve (every emissive texel casts). Graphics shader: loads at host startup, so the knob is
+//      emit scale rides MatEmissive.x (host writes 1 on an emissive-hot caster, 0 otherwise), so an
+//      ordinary caster has emit≈0 → this never fires — the same self-gating the whole-mesh
+//      classifier relied on, now per-texel and free.
+//
+//      Threshold rides gFrameData.atlasDbg.z (lanes the per-face shadow cbuffer leaves spare — only
+//      faceVP[0..15] is filled there), = host g_shadowEmissiveTexel. thr <= 0 disables the carve
+//      (every emissive texel casts). Graphics shader: loads at host startup, so the knobs are
 //      plumbed through the cbuffer, not a #define.
 //
 // Shares opaque.vert's VSOutput (declare the full struct for a matched signature; read only
@@ -51,10 +59,14 @@ void PS_MAIN( VSOutput In )
     float4 tex = SampleTex2D(gTextures[In.TexIndex], gSamplerAnisotropic, In.Uv);
     // 1. Alpha cutout — MUST match depthonly.frag / opaque.frag exactly (strict '<').
     clip(tex.a < In.AlphaRef ? -1.0f : 1.0f);
-    // 2. Emissive carve — drop the glowing texels, keep the dark detail.
-    float3 emit    = In.MatEmissive * tex.rgb;
+    // 2. Emissive carve — drop the glowing texels, keep the dark detail. ONLY in the owner's bake:
+    //    a fixture is see-through to its own light and opaque to every other.
+    float3 emit    = In.MatEmissive.x * tex.rgb;
     float  emitLum = dot(emit, float3(0.299f, 0.587f, 0.114f));
     float  thr     = gFrameData.atlasDbg.z;
-    clip((thr > 0.0f && emitLum > thr) ? -1.0f : 1.0f);
+    float  owner   = In.MatEmissive.y;        // 0 = none (never carve), -1 = every light (legacy A/B)
+    float  bakeSlot= gFrameData.atlasDbg.w;   // slot being baked, +1
+    bool   ownsMe  = (owner < -0.5f) || (owner > 0.5f && abs(owner - bakeSlot) < 0.5f);
+    clip((thr > 0.0f && ownsMe && emitLum > thr) ? -1.0f : 1.0f);
     RETURN();
 }

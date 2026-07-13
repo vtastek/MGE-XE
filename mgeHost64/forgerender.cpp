@@ -5104,6 +5104,43 @@ namespace {
     // threshold the frag reads via gFrameData.atlasDbg.z (0 → carve off, every emissive texel casts).
     bool  g_shadowEmissiveCast  = true;
     float g_shadowEmissiveTexel = 0.35f;
+    // C3b-owner: the carve is a SELF-shadow fix, so it must only apply to the light it protects. A
+    // lantern's glow must not black-cage ITS OWN light — but from ANY OTHER light the fixture is just
+    // an object, and its glowing texels should cast like the opaque geometry they are (a lit lantern
+    // seen across a room is not a hole). So the carve is now keyed: the instance carries its OWNER slot
+    // and the bake carries the slot being baked; shadowcaster.frag carves only when they match.
+    // Ownership = the light sits INSIDE the mesh's bounding sphere (the fixture self-cage relation the
+    // gather already relies on) — a candle flame / lantern paper encloses its own light and nothing else.
+    // OFF → the old un-keyed carve (see-through from every light), for A/B. Glass rides the alpha-cutout
+    // path and is untouched either way.
+    bool  g_shadowEmissiveOwnerOnly = true;
+    // Owner slot of an emissive-hot caster, +1 (0 = no owner: its light isn't slotted, so it simply casts
+    // opaque everywhere). Cost is (emissive meshes x 32) float compares per frame — noise.
+    static uint32_t emissiveOwnerSlot(const HostMesh& hm) {
+        if (!hm.emissiveHot || hm.lastWorldFrame == 0) { return 0; }
+        const float* w = hm.lastWorld;   // ABSOLUTE
+        const float cx = hm.localCenter[0]*w[0] + hm.localCenter[1]*w[4] + hm.localCenter[2]*w[8]  + w[12];
+        const float cy = hm.localCenter[0]*w[1] + hm.localCenter[1]*w[5] + hm.localCenter[2]*w[9]  + w[13];
+        const float cz = hm.localCenter[0]*w[2] + hm.localCenter[1]*w[6] + hm.localCenter[2]*w[10] + w[14];
+        const float s0 = w[0]*w[0] + w[1]*w[1] + w[2]*w[2];
+        const float s1 = w[4]*w[4] + w[5]*w[5] + w[6]*w[6];
+        const float s2 = w[8]*w[8] + w[9]*w[9] + w[10]*w[10];
+        float smax = s0 > s1 ? s0 : s1; if (s2 > smax) { smax = s2; }
+        const float wr = hm.localRadius * std::sqrt(smax);
+        // Light inside the mesh's bound (+ the same slack the fixture emissive-vouch uses, so a flame
+        // billboard whose light origin sits just off its centre still claims its own light). NEAREST
+        // wins: two candles a hand's width apart must each own their own flame, not the other's.
+        const float reach = wr + g_shadowFixtureEmissiveBox;
+        uint32_t best = 0; float bestD2 = reach * reach;
+        for (uint32_t s = 0; s < kMaxShadowLights; ++s) {
+            const ShadowSlot& sl = g_shadowSlots[s];
+            if (!sl.valid || !sl.activeThisFrame) { continue; }
+            const float dx = sl.absPos[0] - cx, dy = sl.absPos[1] - cy, dz = sl.absPos[2] - cz;
+            const float d2 = dx*dx + dy*dy + dz*dz;
+            if (d2 <= bestD2) { bestD2 = d2; best = s + 1; }
+        }
+        return best;
+    }
     // Soft LANTERN shadows: lights enclosed by their own cage (glass/paper lantern) get a wide
     // attenuation-fade + opacity floor in the mask (slotBits.w). Bare candles/torches enclose
     // nothing → not flagged → crisp. OFF → all point-light shadows stay crisp (A/B). The fade
@@ -5347,6 +5384,8 @@ namespace {
         uiAddComponentWidget(g_uiPanel, "Shadow: emissive per-texel carve (off = whole-mesh drop)", &cShEc, WIDGET_TYPE_CHECKBOX);
         SliderFloatWidget sShEt = {}; sShEt.pData = &g_shadowEmissiveTexel; sShEt.mMin = 0.0f; sShEt.mMax = 1.0f; sShEt.mStep = 0.02f;
         uiAddComponentWidget(g_uiPanel, "Shadow: emissive carve threshold (0 = cast all)", &sShEt, WIDGET_TYPE_SLIDER_FLOAT);
+        CheckboxWidget cShEo = {}; cShEo.pData = &g_shadowEmissiveOwnerOnly;
+        uiAddComponentWidget(g_uiPanel, "Shadow: emissive carve OWN light only (off = see-through to all)", &cShEo, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cShLs = {}; cShLs.pData = &g_shadowLanternSoft;
         uiAddComponentWidget(g_uiPanel, "Shadow: soft lantern shadows (candles stay crisp)", &cShLs, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cShBc = {}; cShBc.pData = &g_shadowBlendCasters;
@@ -6529,11 +6568,15 @@ namespace ForgeRender {
                     relW[12] -= g_eyeAbsShadow[0]; relW[13] -= g_eyeAbsShadow[1]; relW[14] -= g_eyeAbsShadow[2];
                     std::memcpy(dwd + (size_t)dm.matIdx * 64, relW, 64);
                     dins[dm.matIdx * kStaticInstU32 + 1] = hm.lastTexAlpha;
-                    // MatEmissive (+8..+10) for the per-texel emissive carve (see the static site).
-                    const float em = hm.emissiveHot ? 1.0f : 0.0f;
-                    ((float*)dins)[dm.matIdx * kStaticInstU32 + 8]  = em;
-                    ((float*)dins)[dm.matIdx * kStaticInstU32 + 9]  = em;
-                    ((float*)dins)[dm.matIdx * kStaticInstU32 + 10] = em;
+                    // MatEmissive (+8..+10) for shadowcaster.frag's per-texel emissive carve (see the
+                    // static site). These dyn instances are packed ONCE and shared by every slot that
+                    // draws them, so the "is this my own light" test can't live in the flag — the OWNER
+                    // rides +9 and the frag compares it against the slot being baked.
+                    const float em    = hm.emissiveHot ? 1.0f : 0.0f;
+                    const float owner = g_shadowEmissiveOwnerOnly ? (float)emissiveOwnerSlot(hm) : -1.0f;
+                    ((float*)dins)[dm.matIdx * kStaticInstU32 + 8]  = em;      // .x = emit scale / carve flag
+                    ((float*)dins)[dm.matIdx * kStaticInstU32 + 9]  = owner;   // .y = owner slot+1 (0 none, -1 all)
+                    ((float*)dins)[dm.matIdx * kStaticInstU32 + 10] = 0.0f;
                 }
             }
 
@@ -6739,14 +6782,18 @@ namespace ForgeRender {
                     relW[12] -= g_eyeAbsShadow[0]; relW[13] -= g_eyeAbsShadow[1]; relW[14] -= g_eyeAbsShadow[2];
                     std::memcpy(swd + (size_t)g * 64, relW, 64);
                     sins[g * kStaticInstU32 + 1] = hm.lastTexAlpha;
-                    // MatEmissive (+8..+10) for shadowcaster.frag's per-texel carve: white on an
-                    // emissive-hot caster (carve = texture luminance → drop glow, keep dark detail),
-                    // 0 otherwise so ordinary casters are untouched. MUST reset both ways — the GPU
-                    // region index g is reused across frames by different casters.
-                    const float em = hm.emissiveHot ? 1.0f : 0.0f;
+                    // MatEmissive (+8..+10) for shadowcaster.frag's per-texel carve. .x = emit scale on
+                    // an emissive-hot caster (carve = texture luminance → drop glow, keep dark detail),
+                    // 0 otherwise so ordinary casters are untouched. .y = the caster's OWNER slot+1: the
+                    // carve is a SELF-shadow fix, so it fires only in its own light's bake — from every
+                    // other light the fixture casts opaque. (0 = no owner → opaque everywhere; -1 = the
+                    // legacy un-keyed carve, A/B.) MUST reset all lanes — the GPU region index g is
+                    // reused across frames by different casters.
+                    const float em    = hm.emissiveHot ? 1.0f : 0.0f;
+                    const float owner = g_shadowEmissiveOwnerOnly ? (float)emissiveOwnerSlot(hm) : -1.0f;
                     ((float*)sins)[g * kStaticInstU32 + 8]  = em;
-                    ((float*)sins)[g * kStaticInstU32 + 9]  = em;
-                    ((float*)sins)[g * kStaticInstU32 + 10] = em;
+                    ((float*)sins)[g * kStaticInstU32 + 9]  = owner;
+                    ((float*)sins)[g * kStaticInstU32 + 10] = 0.0f;
                 }
                 // 6 face CBVs for this slot at base s*6 (C4b: indexed BY SLOT, not by job, so a
                 // dyn-only job for the same slot shares them). Light pos CAMERA-RELATIVE = abs − eye.
@@ -6762,6 +6809,8 @@ namespace ForgeRender {
                     buildShadowFaceVP(lightRel, f, nearZ, farZ, faceVP);
                     std::memcpy(fc, faceVP, 16 * sizeof(float));
                     ((float*)fc)[74] = g_shadowEmissiveTexel;   // atlasDbg.z: per-texel emissive-carve threshold
+                    ((float*)fc)[75] = (float)(s + 1);          // atlasDbg.w: SLOT being baked (+1) — the carve
+                                                               // fires only on its owner's bake (MatEmissive.y)
                 }
                 sl.lastRenderFrame = frame;
                 sl.dirty = false;   // precise invalidation satisfied — this tile is current again
@@ -6796,6 +6845,7 @@ namespace ForgeRender {
                         buildShadowFaceVP(lightRel, f, nearZ, farZ, faceVP);
                         std::memcpy(fc, faceVP, 16 * sizeof(float));
                         ((float*)fc)[74] = g_shadowEmissiveTexel;   // atlasDbg.z: per-texel emissive-carve threshold
+                        ((float*)fc)[75] = (float)(s + 1);          // atlasDbg.w: SLOT being baked (+1)
                     }
                 }
                 g_shadowRendersDyn.push_back(s);
