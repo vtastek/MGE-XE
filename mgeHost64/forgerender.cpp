@@ -1515,6 +1515,18 @@ namespace {
     // 768x512, slots 8-31 in three 1024-wide column strips at x = 3072/4096/5120, 8 per strip).
     // 32 slots total. Mask nibbles: 4 bits x 32 slots = R32G32B32A32_UINT (must match
     // MAX_SHADOW_SLOTS).
+    //
+    // DO NOT SHRINK THIS FOR MEMORY. It was halved to 3072x2048 on 2026-07-13 (saving ~151 MB) and
+    // reverted the same day: the atlas size is not a free memory knob, it is the RESOLUTION that the
+    // soft-shadow look is built out of. A soft (lantern/big-light) tile gets its penumbra from the
+    // world size of one atlas texel, so halving the atlas halved the very quantity being tuned —
+    // lantern faces fell from 256² to 128², which staircased; widening the PCF grid to compensate
+    // then blew the penumbra out to ~6x and made the mask's 4-bit (16-level) visibility band. Softness
+    // is texel size; you cannot shrink the atlas and keep it. Both atlases (static + the parallel
+    // dynamic one) are D32: 2 x 6144x4096x4 = 201 MB, and that is the price of the look.
+    // (If VRAM ever must come back, spend SLOTS or the tier-B size — not the tier-A face size.)
+    // The whole layout derives from kShadowAtlasH; ATLAS_W/H in shadowatlasview.frag (the F12 debug
+    // view) mirrors it and must be kept in step.
     constexpr uint32_t kShadowAtlasW     = 6144;
     constexpr uint32_t kShadowAtlasH     = 4096;
     constexpr uint32_t kMaxShadowLights  = 32;     // MUST match MAX_SHADOW_SLOTS (shadowmask.srt.h)
@@ -1592,20 +1604,8 @@ namespace {
     // animating NPC scatters onto only the slots it actually shadows.
     uint32_t g_casterEpoch = 1;   // starts at 1 so a never-rendered slot (lastRenderFrame 0) is stale
 
-    // 3x2 face-block origin + face size for a slot, in atlas pixels. Face f sits at block +
-    // ((f%3)·size, (f/3)·size) — shadowmask.comp recomputes that from slotTile; keep in sync.
-    inline void shadowSlotBlock(uint32_t slot, uint32_t& x, uint32_t& y, uint32_t& size) {
-        if (slot < 8) {
-            size = kShadowAtlasH / 8;                          // tier A face (512)
-            x = (slot % 2) * (3 * size);
-            y = (slot / 2) * (2 * size);
-        } else {
-            size = kShadowAtlasH / 16;                         // tier B face (256)
-            x = 6 * (kShadowAtlasH / 8)                        // strips at x = 3072/4096/5120
-              + ((slot - 8) / 8) * (4 * size);
-            y = ((slot - 8) % 8) * (2 * size);
-        }
-    }
+    // shadowSlotBlock() — the slot→atlas layout — is defined just below g_shadowSlots (it reads the
+    // slot's per-tile resolution shift, so it needs the manager state in scope).
 
     // Build one cube-face viewProj: row-major ROW-VECTOR convention (like the client's D3DX
     // matrices — uploaded as-is, shader mul(M,v) reads the transpose), D3D cube-face order
@@ -1616,7 +1616,15 @@ namespace {
     // camera motion. NO half-pixel offset (the atlas never composites against a D3D9 layer).
     // The analytic face pick + UV in shadowmask.comp is the OTHER half of this convention
     // table; verify with the face-id/atlas debug views before trusting either.
-    void buildShadowFaceVP(const float* lightPosRel, uint32_t face, float nearZ, float farZ, float* out16) {
+    // uvScale (= 1/k) widens the face frustum past 90° so ADJACENT FACES OVERLAP by a few texels.
+    // Without it each face stores exactly its 90° wedge and nothing more, so a PCF tap that reaches
+    // past the wedge is clamped to the edge texel (shadowLitAt) — the kernel degenerates and the seam
+    // between two faces filters differently on each side. The gutter puts real cross-seam geometry in
+    // the clamp region so the kernel stays valid right up to the boundary.
+    // clip.x = xv * uvScale (uvScale < 1 ⇒ wider FOV); the mask divides its face UV by the same
+    // amount (slotFlick[s].z), so the two must always be the SAME number. 1.0 = exactly 90°, no gutter.
+    void buildShadowFaceVP(const float* lightPosRel, uint32_t face, float nearZ, float farZ, float* out16,
+                           float uvScale) {
         static const float kLook[6][3] = { {1,0,0}, {-1,0,0}, {0,1,0}, {0,-1,0}, {0,0,1}, {0,0,-1} };
         static const float kUp[6][3]   = { {0,1,0}, {0,1,0},  {0,0,-1},{0,0,1},  {0,1,0}, {0,1,0}  };
         const float* za = kLook[face];
@@ -1638,11 +1646,24 @@ namespace {
         V[3][1] = -(ya[0]*e[0] + ya[1]*e[1] + ya[2]*e[2]);
         V[3][2] = -(za[0]*e[0] + za[1]*e[1] + za[2]*e[2]);
         for (int i = 0; i < 4; ++i) {
-            out16[i*4 + 0] = V[i][0];
-            out16[i*4 + 1] = V[i][1];
+            out16[i*4 + 0] = V[i][0] * uvScale;      // < 1 = wider than 90° = the overlap gutter
+            out16[i*4 + 1] = V[i][1] * uvScale;
             out16[i*4 + 2] = V[i][2] * q + ((i == 3) ? qn : 0.0f);
             out16[i*4 + 3] = V[i][2];
         }
+    }
+
+    // Face-frustum uvScale for a rendered face of `size` texels, giving `kShadowFaceGutter` texels of
+    // overlap on EVERY side. The 90° wedge lands on size*uvScale texels, leaving (size - size*uvScale)/2
+    // = gutter texels of neighbour data at each edge → uvScale = 1 - 2*gutter/size.
+    // Sized in TEXELS (not degrees) because it has to cover the PCF kernel, which is measured in texels:
+    // a low-res soft tile therefore needs a proportionally wider FOV, and gives up proportionally more
+    // resolution to it (512² → 1.6%, 64² → 12.5%). That is the correct trade — a coarse tile is exactly
+    // the one whose kernel reaches furthest past the seam.
+    constexpr float kShadowFaceGutter = 4.0f;   // texels of overlap per side (>= PCF radius + bilinear)
+    inline float shadowFaceUvScale(uint32_t size) {
+        const float s = (size > 0u) ? (float)size : 1.0f;
+        return std::max(0.5f, 1.0f - 2.0f * kShadowFaceGutter / s);
     }
 
     // P1 shadow frame state: filled by the manager stub PRE-beginCmd (persistent-mapped CBV
@@ -1711,8 +1732,54 @@ namespace {
         // candle flame encloses nothing and stays crisp. Set on the slot's gather, persists between renders
         // (statics don't move), re-derived on reassignment. Feeds the mask's soft attenuation-fade (slotBits.w).
         bool     isLantern  = false;
+        float    lantEncl   = 2.0f;        // DIAG/tuning: how DEEP the light sits inside its nearest small
+                                           // caster, as dist/radius (0 = dead centre of a cage, ~1 = at the
+                                           // rim, 2 = no small caster near it at all). This is the number the
+                                           // lantern-vs-candle call is made on — logged per slot in [p3-slot].
+        // LOW-RES LANTERN TILE: the resolution shift this slot's CACHED tile was baked at (0 = the
+        // full tier face, 1 = half, 2 = quarter). A lantern's light is already diffused through
+        // glass/paper, so it doesn't need — or want — a crisp cage silhouette: baking it into a
+        // smaller face makes every atlas texel cover more of the world, and the mask's bilinear PCF
+        // (which filters in TEXELS) widens with it. Softness for free, in the SAME atlas: no second
+        // mip/ESM atlas, no shader change, and the bake gets cheaper (¼ the pixels at shift 1).
+        // It is per-SLOT state, not a live read of the knob, because the mask must always sample the
+        // tile at the size it was actually BAKED with — so the shift only changes on a frame the
+        // slot genuinely re-bakes (see the pack loop), never underneath a cached tile.
+        uint8_t  faceShift  = 0;
+        // Face-frustum uvScale the CACHED tile was baked with (see shadowFaceUvScale). Rides
+        // slotFlick[s].z to the mask, which must divide its face UV by the identical number — so, like
+        // faceShift, it is per-slot state set only when the slot actually re-bakes, never a live read.
+        float    faceUvScale = 1.0f;
     };
     ShadowSlot g_shadowSlots[kMaxShadowLights];
+
+    // 3x2 face-block origin + RENDERED face size for a slot, in atlas pixels. Face f sits at block +
+    // ((f%3)·size, (f/3)·size) — shadowmask.comp recomputes exactly that from slotTile.xy/.z, so this
+    // is the single source of truth for the bake viewport, the per-tile clear, the mask, and the F12
+    // atlas view: shrink `size` here and all four follow.
+    // The block ORIGIN is fixed by the tier (A: slots 0-7, 512² faces; B: slots 8-31, 256²). The
+    // rendered face SIZE is that tier size >> the slot's faceShift — a soft slot simply renders a
+    // smaller 3x2 arrangement in the same corner of its block, leaving the rest of its (already
+    // allocated) block unused. Nothing reads outside the rendered rect. That leftover area is
+    // deliberately NOT reclaimed: 32 slots is the mask's hard ceiling (4 bits x 32 = the uint4), so a
+    // packing allocator would buy no extra lights — only churn, since a slot that moves block must
+    // re-bake, which is exactly what the tile cache exists to avoid. The atlas was shrunk instead.
+    inline void shadowSlotBlock(uint32_t slot, uint32_t& x, uint32_t& y, uint32_t& size) {
+        if (slot < 8) {
+            size = kShadowAtlasH / 8;                          // tier A face (512)
+            x = (slot % 2) * (3 * size);
+            y = (slot / 2) * (2 * size);
+        } else {
+            size = kShadowAtlasH / 16;                         // tier B face (256)
+            x = 6 * (kShadowAtlasH / 8)                        // strips at x = 3072/4096/5120
+              + ((slot - 8) / 8) * (4 * size);
+            y = ((slot - 8) % 8) * (2 * size);
+        }
+        // Floor at 64px. Beware raising faceShift past 1: a soft tile's penumbra is (2R+2) texels
+        // wide, so every extra shift DOUBLES it, and the mask can only carry 16 visibility levels —
+        // push it far enough and the gradient bands. Shift 1 (tier-A 256²) is the tuned look.
+        size = std::max(size >> g_shadowSlots[slot].faceShift, 64u);   // low-res soft tile
+    }
 
     // Last cell epoch seen from the client (lighting[19]). A load-door transition bumps it; when it
     // changes the host evicts EVERY shadow slot (old-cell cached tiles are meaningless in the new
@@ -4242,9 +4309,11 @@ namespace {
                                   && g_live.pShadowMaskParamsCbv
                                   && g_live.pShadowWorldsBuf && g_live.pShadowInstanceBuf
                                   && g_live.pShadowBatchSet;
-                std::printf("[forge][shadow] %s (slot 0 = tier-A %u^2 faces; shadowmask.comp %s)\n",
+                std::printf("[forge][shadow] %s (atlas %ux%u D32 x2 = %.0f MB; tier-A %u^2 / tier-B %u^2 faces; shadowmask.comp %s)\n",
                             g_live.shadowReady ? "READY" : "DISABLED (create failed)",
-                            kShadowAtlasH / 8,
+                            kShadowAtlasW, kShadowAtlasH,
+                            2.0 * kShadowAtlasW * kShadowAtlasH * 4.0 / (1024.0 * 1024.0),
+                            kShadowAtlasH / 8, kShadowAtlasH / 16,
                             g_live.pShadowMaskPipeline ? "ok" : "MISSING (dxil not deployed?)");
             }
         }
@@ -5141,11 +5210,22 @@ namespace {
         }
         return best;
     }
-    // Soft LANTERN shadows: lights enclosed by their own cage (glass/paper lantern) get a wide
-    // attenuation-fade + opacity floor in the mask (slotBits.w). Bare candles/torches enclose
-    // nothing → not flagged → crisp. OFF → all point-light shadows stay crisp (A/B). The fade
-    // SHAPE (start/floor) is hot-tunable in shadowmask.comp (LANTERN_FADE_START / LANTERN_FLOOR, F8).
-    bool  g_shadowLanternSoft   = true;
+    // A BIG light is soft too. A wide source has a wide penumbra in reality, and a big radius already
+    // means each atlas texel spans more world (the face far plane is 2r), so a big light gains little
+    // from a crisp tile — it gets the same low-res treatment as a lantern. 0 = off (only lanterns).
+    float g_shadowBigLightRadius = 500.0f;
+    // LOW-RES LANTERN TILE (the other half of "a lantern is diffuse"): bake a lantern slot's 6 faces
+    // at tierSize >> this shift, in the SAME atlas block. Softness comes from the atlas itself — one
+    // texel covers 2^shift as much world, and the mask's bilinear PCF filters in texels — so no
+    // second (mipped/ESM) atlas is needed, and the bake costs 4^shift less. 0 = off (crisp, today's
+    // behaviour), 1 = half (512→256 / 256→128), 2 = quarter. Applied at BAKE time only.
+    uint32_t g_shadowLanternShift = 1;
+    // LANTERN vs CANDLE — the gate BOTH lantern features hang off. A light counts as caged/diffused only
+    // if it sits within this fraction of its holder's radius from the holder's centre: 0.5 = the light is
+    // in the middle half of the shade (a lantern), ~1.0 = anywhere inside the bound at all, which is the
+    // degenerate old behaviour (a candle's flame is inside its own candle's bounding sphere, so EVERY
+    // fixture light qualified and both features went global). Tune against the encl= read in [p3-slot].
+    float g_shadowLanternEnclose = 0.5f;
     // C3a: cutout-blend casters (see g_texAlphaKind). Toggling OFF forgets alpha-origin caster
     // records so their cached shadows drop immediately (manager sweep).
     bool  g_shadowBlendCasters = true;
@@ -5386,8 +5466,12 @@ namespace {
         uiAddComponentWidget(g_uiPanel, "Shadow: emissive carve threshold (0 = cast all)", &sShEt, WIDGET_TYPE_SLIDER_FLOAT);
         CheckboxWidget cShEo = {}; cShEo.pData = &g_shadowEmissiveOwnerOnly;
         uiAddComponentWidget(g_uiPanel, "Shadow: emissive carve OWN light only (off = see-through to all)", &cShEo, WIDGET_TYPE_CHECKBOX);
-        CheckboxWidget cShLs = {}; cShLs.pData = &g_shadowLanternSoft;
-        uiAddComponentWidget(g_uiPanel, "Shadow: soft lantern shadows (candles stay crisp)", &cShLs, WIDGET_TYPE_CHECKBOX);
+        SliderFloatWidget sShBl = {}; sShBl.pData = &g_shadowBigLightRadius; sShBl.mMin = 0.0f; sShBl.mMax = 1200.0f; sShBl.mStep = 25.0f;
+        uiAddComponentWidget(g_uiPanel, "Shadow: big-light soft radius (>= this = low-res/soft; 0 = lanterns only)", &sShBl, WIDGET_TYPE_SLIDER_FLOAT);
+        SliderUintWidget sShLr = {}; sShLr.pData = &g_shadowLanternShift; sShLr.mMin = 0; sShLr.mMax = 2; sShLr.mStep = 1;
+        uiAddComponentWidget(g_uiPanel, "Shadow: lantern low-res tile shift (0 = crisp, 1 = half, 2 = quarter)", &sShLr, WIDGET_TYPE_SLIDER_UINT);
+        SliderFloatWidget sShLe = {}; sShLe.pData = &g_shadowLanternEnclose; sShLe.mMin = 0.0f; sShLe.mMax = 1.2f; sShLe.mStep = 0.05f;
+        uiAddComponentWidget(g_uiPanel, "Shadow: lantern enclosure depth (light must sit this deep in its shade; 1.2 = every fixture)", &sShLe, WIDGET_TYPE_SLIDER_FLOAT);
         CheckboxWidget cShBc = {}; cShBc.pData = &g_shadowBlendCasters;
         uiAddComponentWidget(g_uiPanel, "Shadow: cutout-blend casters", &cShBc, WIDGET_TYPE_CHECKBOX);
         SliderFloatWidget sShBr = {}; sShBr.pData = &g_shadowBlendRef; sShBr.mMin = 0.0f; sShBr.mMax = 1.0f; sShBr.mStep = 0.05f;
@@ -6407,6 +6491,28 @@ namespace ForgeRender {
                 }
             }
 
+            // Low-res lantern tile: the shift is BAKED INTO the tile, so a live change of the knob
+            // only takes effect on the next bake — dirty every lantern slot so the A/B is immediate.
+            // (Dirtying, not writing faceShift here: a slot keeps sampling at its baked size until it
+            // actually re-renders, so there is never a frame where the mask and the tile disagree.)
+            // The enclosure gate is likewise only evaluated during a gather, so a change to EITHER knob
+            // has to re-bake to take effect. Shift alone → only lanterns need it (nothing else can change
+            // size); enclosure → every slot, since the lantern/candle call itself is being re-decided.
+            static uint32_t s_prevLanternShift   = g_shadowLanternShift;
+            static float    s_prevLanternEnclose = g_shadowLanternEnclose;
+            static float    s_prevBigLightRadius = g_shadowBigLightRadius;
+            if (s_prevLanternShift   != g_shadowLanternShift
+                || s_prevLanternEnclose != g_shadowLanternEnclose
+                || s_prevBigLightRadius != g_shadowBigLightRadius) {
+                s_prevLanternShift   = g_shadowLanternShift;
+                s_prevLanternEnclose = g_shadowLanternEnclose;
+                s_prevBigLightRadius = g_shadowBigLightRadius;
+                // Every slot re-decides its soft/crisp class, so every slot re-bakes.
+                for (uint32_t s = 0; s < kMaxShadowLights; ++s) {
+                    if (g_shadowSlots[s].valid) { g_shadowSlots[s].dirty = true; }
+                }
+            }
+
             // (4) Assign unowned lights (most important first). A free slot is taken outright;
             // otherwise the light CHALLENGES the weakest slot by IMPORTANCE — and, unlike before,
             // an inactive (absent) slot is NOT special-cased for eviction. The old rule reclaimed
@@ -6448,6 +6554,11 @@ namespace ForgeRender {
                 // its wobble picks up mid-flame instead of restarting from 0 (which would read as a snap).
                 sl.fSpeed = 0.0f;
                 sl.fPhase = s_flickPhaseGlobal;
+                // New tenant: full-res until its first bake re-derives the cage (the mask ignores the
+                // slot while lastRenderFrame==0, so it never samples the old tenant's low-res rect).
+                sl.isLantern   = false;
+                sl.faceShift   = 0;
+                sl.faceUvScale = 1.0f;   // re-derived on the first bake (mask ignores the slot until then)
             };
             for (uint32_t c : cand) {
                 // 1. A free (never-used / never-reclaimed) slot.
@@ -6707,6 +6818,7 @@ namespace ForgeRender {
                 // by distant furniture that happens to sit at a lower slot index.
                 struct GatherC { float d2; uint32_t slot; uint8_t mirror; uint8_t twoSided; };
                 static std::vector<GatherC> gc; gc.clear();
+                float minEncl = 2.0f;   // deepest enclosure by a small caster (dist/radius); 2 = none
                 for (uint32_t slot = 0; slot < g_meshHigh; ++slot) {
                     const HostMesh& hm = g_meshes[slot];
                     if (!hm.valid || hm.skinned || hm.multimap) { continue; }
@@ -6742,16 +6854,30 @@ namespace ForgeRender {
                     // Fixture self-cage: this caster is small (wr <= knob) AND its bound encloses the
                     // light (d2 < wr^2) → it's the light's own holder; the face cameras are inside it,
                     // so front/back culling shreds the cage. Flag it for a CULL_NONE draw below.
-                    const uint8_t twoSided = (g_shadowCageRadius > 0.0f && wr <= g_shadowCageRadius
-                                              && d2 < wr * wr) ? 1u : 0u;
+                    // ('small' is a macro in rpcndr.h — don't name a local that.)
+                    const bool    tiny     = (g_shadowCageRadius > 0.0f && wr <= g_shadowCageRadius);
+                    const uint8_t twoSided = (tiny && d2 < wr * wr) ? 1u : 0u;
+                    // ...and how DEEP the light sits in it. This is a DIFFERENT question from the one
+                    // above, and conflating them was the bug: a bounding SPHERE that merely contains the
+                    // light does not mean the light is caged. A candle/torch IS its own light object, so
+                    // its flame always lands inside its own mesh's bound — at the RIM (the flame sits on
+                    // top of the wax/haft, ~1 radius from the centroid). A lantern's flame hangs in the
+                    // MIDDLE of its shade (~0.2-0.3). So depth, not containment, is what separates a
+                    // diffused light from a bare flame on a stick.
+                    if (tiny && wr > 1e-3f) {
+                        minEncl = std::min(minEncl, std::sqrt(d2) / wr);
+                    }
                     gc.push_back({ d2, slot, hm.lastMirror, twoSided });
                 }
-                // LANTERN category: this light is enclosed by one of its own casters (a fixture cage
-                // → twoSided). Enclosed = diffused = soft shadows (glass/paper lantern); a bare candle
-                // flame encloses nothing → stays crisp. Sticky per slot (re-derived each render).
-                bool anyCage = false;
-                for (const GatherC& g2 : gc) { if (g2.twoSided) { anyCage = true; break; } }
-                sl.isLantern = anyCage;
+                // LANTERN category: the light hangs DEEP inside one of its own casters — a shade around
+                // the flame. Diffused = soft shadows + a low-res tile. A candle/torch sits at the RIM of
+                // its own mesh's bound (its flame is on top of the wax/haft), so it stays crisp.
+                // NOT "is the light inside some caster's bounding sphere" — that is true of EVERY MW
+                // fixture light (the light object IS the mesh, flame attached inside it), which flagged
+                // nearly every light as a lantern and made both the soft-fade and the low-res tile look
+                // global. Re-derived each render; lantEncl is the tuning read.
+                sl.lantEncl  = minEncl;
+                sl.isLantern = (minEncl <= g_shadowLanternEnclose);
                 if (gc.size() > kShadowMaxCasters) {
                     std::nth_element(gc.begin(), gc.begin() + kShadowMaxCasters, gc.end(),
                                      [](const GatherC& a, const GatherC& b) { return a.d2 < b.d2; });
@@ -6762,6 +6888,25 @@ namespace ForgeRender {
                 // frame. C4c: the pool TAIL is reserved for this frame's dyn-mover matrices.
                 if (usedMats + (uint32_t)gc.size() >
                     kShadowWorldMatrices - (uint32_t)g_dynMoverCasters.size()) { continue; }
+                // This slot is now COMMITTED to bake this frame, so it is the one safe moment to change
+                // its tile resolution: shadowSlotBlock() feeds the bake viewport, the mask's slotTile,
+                // and the dyn tile from this same value, and all three are consumed later in this frame.
+                // Changing it for a slot that did NOT re-bake (e.g. the budget skip above) would leave
+                // the mask sampling a shrunk rect of a tile baked at full size — garbage. A lantern
+                // (light enclosed by its own cage) bakes low-res so its shadows come out soft.
+                // SOFT = diffused (a lantern's shade) or simply BIG (a wide source has a wide penumbra).
+                // Either way the shadow wants to be soft, so bake it low-res. faceShift != 0 is then the
+                // single source of truth for "this tile is soft" — it ships to the mask as slotBits.w and
+                // suppresses the tap grid there, so the two can never disagree about which slots are soft.
+                const bool bigLight = (g_shadowBigLightRadius > 0.0f && sl.radius >= g_shadowBigLightRadius);
+                sl.faceShift = (uint8_t)((sl.isLantern || bigLight) ? g_shadowLanternShift : 0u);
+                // The gutter is sized against the tile we are ABOUT to bake, so it must be derived
+                // AFTER faceShift is settled — and, like faceShift, only on a frame the slot re-bakes.
+                {
+                    uint32_t gx, gy, gs;
+                    shadowSlotBlock(s, gx, gy, gs);          // reads the faceShift just set
+                    sl.faceUvScale = shadowFaceUvScale(gs);
+                }
                 const uint32_t regionBase = usedMats;   // GPU world/instance region for this job
                 const uint32_t begin = (uint32_t)g_shadowCasters.size();
                 for (const GatherC& g2 : gc) { g_shadowCasters.push_back({ g2.slot, g2.mirror, g2.twoSided }); }
@@ -6806,7 +6951,7 @@ namespace ForgeRender {
                     uint8_t* fc = (uint8_t*)g_live.pShadowFaceCbv[s * 6 + f]->pCpuMappedAddress;
                     std::memcpy(fc, g_live.pFrameCbv->pCpuMappedAddress, 512);
                     float faceVP[16];
-                    buildShadowFaceVP(lightRel, f, nearZ, farZ, faceVP);
+                    buildShadowFaceVP(lightRel, f, nearZ, farZ, faceVP, sl.faceUvScale);
                     std::memcpy(fc, faceVP, 16 * sizeof(float));
                     ((float*)fc)[74] = g_shadowEmissiveTexel;   // atlasDbg.z: per-texel emissive-carve threshold
                     ((float*)fc)[75] = (float)(s + 1);          // atlasDbg.w: SLOT being baked (+1) — the carve
@@ -6842,7 +6987,10 @@ namespace ForgeRender {
                         uint8_t* fc = (uint8_t*)g_live.pShadowFaceCbv[s * 6 + f]->pCpuMappedAddress;
                         std::memcpy(fc, g_live.pFrameCbv->pCpuMappedAddress, 512);
                         float faceVP[16];
-                        buildShadowFaceVP(lightRel, f, nearZ, farZ, faceVP);
+                        // The dyn tile shares the static tile's block AND its frustum — same uvScale, or
+                        // the two would disagree about where a face's texels land and the composite max()
+                        // would mix misaligned depths.
+                        buildShadowFaceVP(lightRel, f, nearZ, farZ, faceVP, sl.faceUvScale);
                         std::memcpy(fc, faceVP, 16 * sizeof(float));
                         ((float*)fc)[74] = g_shadowEmissiveTexel;   // atlasDbg.z: per-texel emissive-carve threshold
                         ((float*)fc)[75] = (float)(s + 1);          // atlasDbg.w: SLOT being baked (+1)
@@ -6859,13 +7007,14 @@ namespace ForgeRender {
             uint32_t activeBits = 0;
             uint32_t staticReBits = 0;   // slots whose STATIC tile re-rendered THIS frame (not cached)
             uint32_t flickerBits = 0;    // slots whose light is FLICKER-class (fClass==2) → mask dir wobble
-            uint32_t lanternBits = 0;    // slots whose light is a LANTERN (enclosed by its own cage) → soft fade
+            uint32_t softBits = 0;       // slots whose tile was BAKED low-res (lantern / big light) → already
+                                         // soft in the atlas, so the mask skips its near-bubble tap grid
             for (uint32_t s = 0; s < kMaxShadowLights; ++s) {
                 ShadowSlot& sl = g_shadowSlots[s];
                 if (!sl.valid || !sl.activeThisFrame || sl.lastRenderFrame == 0) { continue; }
                 activeBits |= (1u << s);
                 if (sl.lastRenderFrame == frame) { staticReBits |= (1u << s); }
-                if (sl.isLantern) { lanternBits |= (1u << s); }   // soft attenuation-fade in the mask
+                if (sl.faceShift != 0) { softBits |= (1u << s); }   // low-res tile → no tap grid in the mask
                 // Per-slot flame: PHASE (integrated above at this slot's own motion/wind-boosted rate) and
                 // AMPLITUDE GAIN. Both ride slotFlick[s] so the mask can wobble a carried torch harder than
                 // the sconce beside it. The amp gains stay small on purpose — amplitude is the axis that
@@ -6878,7 +7027,9 @@ namespace ForgeRender {
                                                        + g_flickWindAmp   * windDrive);
                 mp[288 + s * 4 + 0] = ampGain;   // slotFlick[s].x = amplitude gain
                 mp[288 + s * 4 + 1] = flickA;    // slotFlick[s].y = this slot's flame phase (rad)
-                mp[288 + s * 4 + 2] = 0.0f;
+                // .z = the face-frustum uvScale this slot's tile was BAKED with (overlap gutter). The
+                // mask must divide its face UV by exactly this, or every face is sampled off-centre.
+                mp[288 + s * 4 + 2] = sl.faceUvScale;
                 mp[288 + s * 4 + 3] = 0.0f;
                 if (sl.fClass == 2u) {
                     flickerBits |= (1u << s);   // shadow "movement" applies here only
@@ -6937,7 +7088,7 @@ namespace ForgeRender {
             reinterpret_cast<uint32_t*>(mp)[284] = activeBits;   // slotBits.x
             reinterpret_cast<uint32_t*>(mp)[285] = dynBits;      // slotBits.y (C4b dyn tile valid THIS frame)
             reinterpret_cast<uint32_t*>(mp)[286] = flickerBits;  // slotBits.z (flicker-class slots → dir wobble)
-            reinterpret_cast<uint32_t*>(mp)[287] = g_shadowLanternSoft ? lanternBits : 0u;  // slotBits.w (lantern → soft fade; 0 = crisp A/B)
+            reinterpret_cast<uint32_t*>(mp)[287] = softBits;     // slotBits.w (low-res tile → skip the tap grid)
             // validBits: slots that HOLD a rendered tile (valid + rendered at least once), whether or
             // not their light is in view this frame. Lets the debug view show a RETAINED/cached tile
             // (valid, inactive) distinctly from an empty slot — so a 360 turn visibly keeps all slots
@@ -6963,11 +7114,14 @@ namespace ForgeRender {
             // → "renders=0 standing still" and "active>1 = multi-shadow" are both visible.
             {
                 uint32_t nActive = 0, nValid = 0, nFlk = 0, nPul = 0, nStdy = 0;
+                uint32_t nLant = 0, nLowRes = 0;   // lantern slots / of those, tiles actually baked low-res
                 float maxSpd = 0.0f;   // fastest-travelling active light (u/s) — the motion-drive tuning read
                 float radLo = 1e9f, radHi = 0.0f;   // active-light radius span — the candle-guard tuning read
                 for (uint32_t s = 0; s < kMaxShadowLights; ++s) {
                     if (g_shadowSlots[s].valid) {
                         ++nValid;
+                        if (g_shadowSlots[s].isLantern)      { ++nLant; }
+                        if (g_shadowSlots[s].faceShift != 0) { ++nLowRes; }
                         if (g_shadowSlots[s].activeThisFrame) {
                             ++nActive;
                             switch (g_shadowSlots[s].fClass) { case 2: ++nFlk; break; case 1: ++nPul; break; default: ++nStdy; break; }
@@ -6988,10 +7142,11 @@ namespace ForgeRender {
                     for (const auto& dm : g_dynMoverCasters) {
                         if (dm.slot < g_meshHigh && g_meshes[dm.slot].animated) { ++nMovAnim; }
                     }
-                    LOG::logline(">> [p3-shadow] f=%u dt=%.1fms wind=%.2f(drive=%.2f) maxSpd=%.0f(drive=%.2f) rad=%.0f..%.0f valid=%u active=%u lights=%u flk=%u/%u/%u(F/P/S) churn(free=%u chal=%u) renders=%u (must=%u stale=%u) dyn=%u movers=%u (anim=%u) srcMover=%d rigidMov=%d occCull=%d occ=%u occBits=0x%08X activeBits=0x%08X dynBits=0x%08X casters=%u",
+                    LOG::logline(">> [p3-shadow] f=%u dt=%.1fms wind=%.2f(drive=%.2f) maxSpd=%.0f(drive=%.2f) rad=%.0f..%.0f lant=%u(lowres=%u shift=%u) valid=%u active=%u lights=%u flk=%u/%u/%u(F/P/S) churn(free=%u chal=%u) renders=%u (must=%u stale=%u) dyn=%u movers=%u (anim=%u) srcMover=%d rigidMov=%d occCull=%d occ=%u occBits=0x%08X activeBits=0x%08X dynBits=0x%08X casters=%u",
                                  frame, flickDt * 1000.0f, g_flickWind, windDrive,
                                  maxSpd, (g_flickMotionRef > 1e-3f) ? std::min(1.0f, maxSpd / g_flickMotionRef) : 0.0f,
                                  radLo, radHi,
+                                 nLant, nLowRes, g_shadowLanternShift,
                                  nValid, nActive, (unsigned)lights.size(), nFlk, nPul, nStdy, nAssignFree, nAssignChal,
                                  nRender, nMustR, nStaleR,
                                  (unsigned)g_shadowRendersDyn.size(),
@@ -7012,10 +7167,11 @@ namespace ForgeRender {
                     for (uint32_t s = 0; s < kMaxShadowLights; ++s) {
                         const ShadowSlot& sl = g_shadowSlots[s];
                         if (!sl.valid) { continue; }
-                        LOG::logline(">> [p3-slot]   slot[%u] id=%u imp=%.2f active=%u age=%u lastRender=%d",
+                        LOG::logline(">> [p3-slot]   slot[%u] id=%u imp=%.2f active=%u age=%u lastRender=%d rad=%.0f encl=%.2f lant=%u shift=%u",
                                      s, sl.lightId, sl.importance, (unsigned)sl.activeThisFrame,
                                      (unsigned)(frame - sl.assignedFrame),
-                                     (sl.lastRenderFrame == 0) ? -1 : (int)(frame - sl.lastRenderFrame));
+                                     (sl.lastRenderFrame == 0) ? -1 : (int)(frame - sl.lastRenderFrame),
+                                     sl.radius, sl.lantEncl, (unsigned)sl.isLantern, (unsigned)sl.faceShift);
                     }
                 }
             }

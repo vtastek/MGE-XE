@@ -25,26 +25,60 @@
 
 #include "shadowmask.srt.h"
 
-// PCF grid radius CAP in bilinear taps. R=1 → a 3x3 grid of bilinear taps (each tap = 4 loads).
-// Bilinear alone kills the staircase; the grid widens the penumbra. Hot-tunable: bump and
-// save (F8 reload). Cost is (2R+1)^2 * 4 atlas loads per IN-RANGE slot per pixel.
-#define SHADOW_PCF_R 1
+// PCF grid radius in bilinear taps. R=1 → a 3x3 grid (each tap = 4 loads, but the separable form
+// in shadowGrid() collapses the shared fetches). The grid is what SAMPLES the penumbra; a lone
+// bilinear tap is a hard edge with a one-texel ramp. Hot-tunable: bump and save (F8 reload).
+#define SHADOW_PCF_R      1   // CRISP slots (full-res tile)
+// SOFT slots (lantern / big light — a half-res tile, host slotBits.w). SAME radius: their texels are
+// already 2x wider in world space, so R=1 here IS the soft look, and the tile's resolution is what
+// makes it soft. Do not raise this to "add softness" — it was briefly 2 to paper over the staircase
+// caused by the (since-reverted) atlas halving, and the wider grid blew the penumbra out until the
+// mask's 16 visibility levels banded across it. Penumbra ~ (2R+2) texels: R is a SAMPLING knob, and
+// widening it widens the gradient the 4-bit mask has to carry.
+#define SHADOW_PCF_R_SOFT 1
 
-// Eye-distance gate on the tap grid (user directive 2026-07-10): the texel-grid staircase is
-// only perceptible on near receivers — atlas resolutions are adequate beyond that. One MW
-// unit ≈ 1.4 cm (player height 128 ≈ 1.8 m); tuned in-game to 360 units (~5 m). Inside the
-// bubble: full SHADOW_PCF_R grid. Outside: one bilinear tap (4 loads instead of (2R+1)^2*4).
-// Hot-tunable (F8): 0 ≈ single-tap everywhere, 99999 ≈ full grid everywhere.
-#define SHADOW_PCF_NEAR_DIST 360.0f
+// Grid gate: run the tap grid only where one atlas texel is big enough ON SCREEN for its grid to
+// show — the angle a texel subtends from the eye, texelW / eyeDist (see the call site).
+//
+// Replaces a fixed 360-unit eye-distance bubble. Eye distance alone cannot answer the question: a
+// soft slot's texels are 2x wider in world space than a crisp slot's, so they stay visible twice as
+// far out, and the flat bubble cut them off at the same 360u — soft up close, staircase one step
+// back (exactly the reported symptom). Being per-slot, this gives a coarse tile the longer reach it
+// needs, and re-derives itself from slotTile.z if resolutions ever change again.
+//
+// Reference points: the old bubble's boundary (512² tile, receiver ~200u from the light, 360u from
+// the eye) is 2*200/512/360 ≈ 0.002 rad. 0.001 (in use) reaches about twice as far — user-tuned, and
+// what finally killed the staircase.
+// This gate only decides WHERE the grid runs; it does NOT widen the penumbra (that is R and the tile
+// resolution), so lowering it cannot cause banding — it only costs mask time.
+// Hot-tunable (F8): LOWER = grid reaches further (smoother, costs more); higher = grid stays close.
+#define SHADOW_PCF_TEXEL_ANGLE 0.001f
+// ...and FADE the grid in over a band below it, instead of switching at a hard threshold.
+//
+// This gate selects between two filters of DIFFERENT WIDTH (the grid's ~(2R+2) texels vs a lone
+// bilinear tap's 2), and penumbra width is the one thing you can actually see at a shadow edge. So a
+// binary switch draws its own iso-surface into the image: a crisp line running ALONG every shadow
+// edge, soft on one side and showing bare texel corners on the other. (It is the same artifact as
+// the old "soft near the lantern, staircase further out" — a threshold, not a distance, was always
+// the problem; moving it merely moved the line.) Blending across a band makes the filter width
+// continuous, so no iso-surface exists to be seen.
+// Band = [ANGLE*FADE .. ANGLE]: full grid at/above ANGLE, pure bilinear below the band, smooth mix
+// between. Lower FADE = wider, gentler band (and more pixels paying for the grid).
+#define SHADOW_PCF_GATE_FADE 0.5f
 
-// Soft LANTERN shadows (host slotBits.w marks lantern slots — lights enclosed by their own
-// glass/paper cage; candles/torches are NOT flagged and stay crisp). Filtering is expensive, so
-// instead of a wide PCF penumbra these fade: (1) the shadow→lit dissolve starts far earlier so it
-// melts across most of the light's reach ("the whole light in attenuation"), and (2) an opacity
-// FLOOR keeps some light even where fully occluded, so glass imperfections don't read too dark.
-// Both hot-tunable (compute shader → edit + F8, no host restart).
-#define LANTERN_FADE_START 0.30f   // lanterns dissolve shadow→lit from 30% of range (candles: 0.85)
-#define LANTERN_FLOOR      0.25f   // lantern shadow keeps >= 25% light even fully occluded (0 = full black)
+// SOFT slots (host slotBits.w): the slot's atlas tile was baked at HALF resolution (a lantern's
+// diffused light, or a big light), so its texels are 2x wider in world space and its shadow is
+// genuinely soft — in the atlas, not in a post-hoc fade. The bit exists so the gate above can give
+// those coarser texels the longer grid reach they need; the grid RADIUS is the same as crisp.
+//
+// Three separate things, learned the hard way on 2026-07-13 — keep them straight:
+//   penumbra WIDTH   = tile resolution (faceShift) and R.  This is the look.
+//   penumbra SAMPLES = the grid, R taps across it.  Too few → staircase.
+//   penumbra REACH   = the gate.  Too short → soft up close, staircase further out.
+// The old lantern "softness" (an attenuation dissolve + opacity floor, since deleted) faked WIDTH in
+// the fade, which is why it leaked and banded. Real width comes from the tile — but only so far: the
+// mask carries 16 visibility levels, so a gradient made too wide will band no matter how well it is
+// sampled. Softness has a ceiling, and it is the mask's 4 bits.
 
 // Reverse-Z shadow test at ONE atlas texel, clamped inside the face sub-tile so a tap can
 // never bleed onto a neighbouring cube face. Returns 1 = lit, 0 = shadowed.
@@ -75,6 +109,40 @@ float shadowBilinear(float2 ap, int2 tmin, int2 tmax, float thresh, uint dynSlot
     float s01 = shadowLitAt(b + int2(0, 1), tmin, tmax, thresh, dynSlot);
     float s11 = shadowLitAt(b + int2(1, 1), tmin, tmax, thresh, dynSlot);
     return lerp(lerp(s00, s10, f.x), lerp(s01, s11, f.x), f.y);
+}
+
+// Separable PCF tap grid of radius R (in bilinear taps) around the fractional atlas position.
+//
+// This is the ONLY real filter in the mask, and it is what produces the penumbra — a single
+// bilinear tap gives a HARD edge with a one-texel ramp, and on a low-res tile that one texel is
+// wide enough in world space that its ramp reads as a STAIRCASE (an under-sampled soft edge, whose
+// contour follows the texel grid). Width of the penumbra ~ (2R+2)/faceSize; the taps across it are
+// what make it smooth. So a low-res (soft) tile needs MORE radius, not less.
+//
+// The grid of (2R+1)^2 unit-spaced bilinear taps RE-FETCHES shared texels (at R=1: 9 taps x 4 loads
+// = 36, union footprint only 4x4 = 16). The sum is SEPARABLE: per axis, tap k covers texel b+k
+// (w=1-f) and b+k+1 (w=f), so summing 2R+1 taps collapses to per-texel weights [1-f, 1, ..., 1, f]
+// over the (2R+2)-texel footprint. Fetch + compare each texel ONCE and weight — bit-identical to the
+// tap loop at 16/36 the loads. R is passed as a literal at every call site, so the bounds are
+// compile-time after inlining and the loops fully unroll.
+float shadowGrid(float2 ap, int2 tmin, int2 tmax, float thresh, uint dynSlot, int R)
+{
+    float2 fp = ap - 0.5f;               // texel-centre space (== shadowBilinear)
+    int2   fb = int2(floor(fp));
+    float2 ff = fp - float2(fb);
+    float  vis = 0.0f;
+    UNROLL
+    for (int j = 0; j < 2 * R + 2; ++j)
+    {
+        float wy = (j == 0) ? (1.0f - ff.y) : ((j == 2 * R + 1) ? ff.y : 1.0f);
+        UNROLL
+        for (int i = 0; i < 2 * R + 2; ++i)
+        {
+            float wx = (i == 0) ? (1.0f - ff.x) : ((i == 2 * R + 1) ? ff.x : 1.0f);
+            vis += (wx * wy) * shadowLitAt(fb + int2(i - R, j - R), tmin, tmax, thresh, dynSlot);
+        }
+    }
+    return vis * (1.0f / float((2 * R + 1) * (2 * R + 1)));
 }
 
 // Reconstruct the CAMERA-RELATIVE world position at an integer pixel from its device depth —
@@ -209,13 +277,11 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
         if (dot(N, -P) < 0.0f) { N = -N; }             // face the eye (camera at origin)
         float  normalOffsetK = gShadowMaskParams.biasParams.y;   // offset in atlas texels (live)
         uint   dynBits       = gShadowMaskParams.slotBits.y;   // C4b: slots with a valid dyn tile
-        uint   lanternBits   = gShadowMaskParams.slotBits.w;  // lantern slots → soft attenuation-fade
+        uint   softBits      = gShadowMaskParams.slotBits.w;  // low-res tiles → wider grid, longer reach
 
-        // Near-bubble test for this pixel (camera-relative world → eye distance = |P|),
-        // decided once — every slot at this receiver shares the same eye distance. The PCF
-        // below EARLY-RETURNS on the far path (one bilinear tap, no loop machinery) so the
-        // grid loop can keep compile-time bounds and fully unroll on the near path.
-        bool pcfNear = dot(P, P) < SHADOW_PCF_NEAR_DIST * SHADOW_PCF_NEAR_DIST;
+        // Eye distance of this receiver — one component of the grid gate below (the other, the
+        // texel's world size, is per-SLOT and so is computed inside the loop).
+        float eyeDist = sqrt(max(dot(P, P), 1e-8f));
 
         for (uint s = 0u; s < (uint)MAX_SHADOW_SLOTS; ++s)
         {
@@ -238,8 +304,29 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
             float3 Ldir  = posRad.xyz - P;
             float  ndotl = dot(N, Ldir * rsqrt(max(dot(Ldir, Ldir), 1e-8f)));
             float  sinT  = sqrt(saturate(1.0f - ndotl * ndotl));
-            float  texelW = 2.0f * ma0 / max(tile.z, 1.0f);
+            // Overlap gutter (host buildShadowFaceVP / slotFlick[s].z): the face frustum is wider than
+            // 90°, so the 90° wedge covers only tile.z*uvScale texels and ONE TEXEL IS CORRESPONDINGLY
+            // WIDER in world space. Everything derived from texel size — the normal-offset bias below
+            // and the grid gate — has to use that, or both are quietly under-scaled on a gutter'd face.
+            float  uvScale = gShadowMaskParams.slotFlick[s].z;
+            uvScale = (uvScale > 0.01f) ? uvScale : 1.0f;      // stale/zero lane ⇒ exactly 90°
+            float  texelW = 2.0f * ma0 / max(tile.z * uvScale, 1.0f);
             float3 Poff  = P + N * (normalOffsetK * sinT * texelW);
+
+            // GRID GATE. The question "will the texel grid be visible here?" is really "how big is one
+            // atlas texel ON SCREEN?", and that is texelW (its world size at this receiver, already
+            // computed just above) over the eye distance — the angle it subtends. It is NOT eye
+            // distance alone, which is what the old fixed 360-unit near-bubble used: that ignored the
+            // tile's resolution entirely, so when the atlas halved and soft tiles shifted down again
+            // (a 4x coarser lantern texel), the bubble stayed put and the shadow fell off a cliff into
+            // a single tap — staircase — one step outside it.
+            // Being per-SLOT, this now gives a coarse tile (soft / low-res) or a big light exactly the
+            // longer reach it needs, keeps a crisp tile's reach roughly where it was, and re-calibrates
+            // itself for free if the atlas is ever resized again.
+            float texelAngle = texelW / eyeDist;
+            float gridMix    = saturate((texelAngle - SHADOW_PCF_TEXEL_ANGLE * SHADOW_PCF_GATE_FADE)
+                                        / (SHADOW_PCF_TEXEL_ANGLE * (1.0f - SHADOW_PCF_GATE_FADE)));
+            gridMix = gridMix * gridMix * (3.0f - 2.0f * gridMix);   // smoothstep — C1, no visible band edge
 
             float3 d      = Poff - posRad.xyz;         // light -> pixel (normal-offset applied)
             // Flicker "movement": rotate the lookup DIRECTION by a small time-varying angle for flicker-
@@ -318,65 +405,45 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
                 int2   tmax    = tmin + int2((int)tile.z - 1, (int)tile.z - 1);
 
                 // Continuous atlas-pixel position of this pixel's projection onto the face.
-                float2 fuv = float2(u, v) / ma * 0.5f + 0.5f;
+                // uvScale (read above) MUST equal the one the tile was baked with — the same widened
+                // frustum, or every face is sampled off-centre.
+                float2 fuv = float2(u, v) / ma * (0.5f * uvScale) + 0.5f;
                 float2 ap  = faceOrg + fuv * tile.z;
 
-                // Bilinear PCF. The tap loop is ~96% of the whole mask pass (perf bisect
-                // 2026-07-10: dispatch 0.05 / +cull 0.07 / +normal recon 0.09 / +PCF 2.03ms),
-                // so it's written as an EARLY RETURN on the far path: beyond the near bubble
-                // one bilinear tap already gives a smooth sub-texel edge — take it and move
-                // on, no loop. Only near pixels (where the texel-contour zigzag is visible)
-                // run the grid, with COMPILE-TIME bounds so it fully unrolls.
+                // PCF. The tap loop is ~96% of the whole mask pass (perf bisect 2026-07-10: dispatch
+                // 0.05 / +cull 0.07 / +normal recon 0.09 / +PCF 2.03ms), so the FAR path early-returns
+                // to a single bilinear tap: beyond the near bubble the texel is small enough on screen
+                // that one tap's sub-texel ramp is already smooth.
+                //
+                // Inside the bubble we grid — and a SOFT (low-res) slot grids WIDER, not less. Its
+                // texels are big in world space, so its penumbra is wide whether we like it or not;
+                // the only question is how many samples cross it. Too few and that wide edge shows up
+                // as a staircase. (Skipping the grid on soft slots was exactly that mistake.)
+                // Filter width is CONTINUOUS in gridMix: pure bilinear below the band, pure grid above,
+                // a blend of the two inside it. The blend is what stops the gate drawing a crisp line
+                // along every shadow edge. Only pixels actually inside the band pay for both filters.
                 float vis;
-                if (!pcfNear)
+                if (gridMix <= 0.0f)
                 {
                     vis = shadowBilinear(ap, tmin, tmax, thresh, dynSlot);
                 }
                 else
                 {
-                    // The grid of (2R+1)^2 unit-spaced bilinear taps RE-FETCHES shared texels
-                    // (at R=1: 9 taps x 4 loads = 36, union footprint only 4x4 = 16, interior
-                    // texels loaded 4x — doubled again by the dyn composite). The tap sum is
-                    // SEPARABLE: per axis, tap k covers texel b+k (w=1-f) and b+k+1 (w=f), so
-                    // summing 2R+1 taps collapses to per-texel weights [1-f, 1, ..., 1, f]
-                    // over the (2R+2)-texel footprint. Fetch + compare each texel ONCE and
-                    // weight — bit-identical to the tap loop at 16/36 the loads.
-                    float2 fp = ap - 0.5f;               // texel-centre space (== shadowBilinear)
-                    int2   fb = int2(floor(fp));
-                    float2 ff = fp - float2(fb);
-                    vis = 0.0f;
-                    UNROLL
-                    for (int j = 0; j < 2 * SHADOW_PCF_R + 2; ++j)
-                    {
-                        float wy = (j == 0) ? (1.0f - ff.y)
-                                 : ((j == 2 * SHADOW_PCF_R + 1) ? ff.y : 1.0f);
-                        UNROLL
-                        for (int i = 0; i < 2 * SHADOW_PCF_R + 2; ++i)
-                        {
-                            float wx = (i == 0) ? (1.0f - ff.x)
-                                     : ((i == 2 * SHADOW_PCF_R + 1) ? ff.x : 1.0f);
-                            vis += (wx * wy) * shadowLitAt(fb + int2(i - SHADOW_PCF_R, j - SHADOW_PCF_R),
-                                                           tmin, tmax, thresh, dynSlot);
-                        }
-                    }
-                    vis *= 1.0f / float((2 * SHADOW_PCF_R + 1) * (2 * SHADOW_PCF_R + 1));
+                    float g = (((softBits >> s) & 1u) != 0u)
+                            ? shadowGrid(ap, tmin, tmax, thresh, dynSlot, SHADOW_PCF_R_SOFT)
+                            : shadowGrid(ap, tmin, tmax, thresh, dynSlot, SHADOW_PCF_R);
+                    vis = (gridMix >= 1.0f) ? g
+                                            : lerp(shadowBilinear(ap, tmin, tmax, thresh, dynSlot), g, gridMix);
                 }
                 // Fade band: shadow → lit over the last 15% of the test range, so the hard
                 // range cut above never shows as a lit/shadowed seam (below rangeK=2.0 the
                 // attenuation ramp is still non-zero at the cut). At rangeK=2.0 the band sits
                 // where attenuation reaches exactly 0 — visually the old output.
-                // LANTERN soft-fade: for enclosed (diffused) lights, start the dissolve MUCH earlier
-                // so the shadow melts across most of the reach, and lift it off full-black by a floor —
-                // a cheap soft look without extra PCF taps. Candles/torches (bit clear) keep the crisp band.
-                if (((lanternBits >> s) & 1u) != 0u)
-                {
-                    vis = lerp(vis, 1.0f, smoothstep(LANTERN_FADE_START * range, range, ma));
-                    vis = lerp(LANTERN_FLOOR, 1.0f, vis);   // opacity floor: never fully black
-                }
-                else
-                {
-                    vis = lerp(vis, 1.0f, smoothstep(0.85f * range, range, ma));
-                }
+                // (The old LANTERN attenuation-dissolve + opacity floor lived here: it faked softness
+                // by melting the shadow across the light's reach and never letting it reach black.
+                // Removed — it leaked light through occluders and banded, and the low-res lantern tile
+                // now produces REAL softness in the atlas instead of faking it in the fade.)
+                vis = lerp(vis, 1.0f, smoothstep(0.85f * range, range, ma));
                 // Temporal fade-IN (host-driven per slot): slotTile[s].w ramps 0→1 when a FAR light
                 // newly pops into this slot (a reclaim), 1.0 in steady state / for near lights. Lerp
                 // vis toward LIT (1.0) so the far shadow eases in place instead of snapping on.

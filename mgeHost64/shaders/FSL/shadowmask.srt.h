@@ -47,7 +47,9 @@ STRUCT(ShadowMaskParams)
     //             each PCF texel takes max(static, dynamic) = the nearer reverse-Z occluder.
     //             Unset = the dynamic tile is stale (mover left reach); sample static only.
     //             z = FLICKER-class bitmask (fClass==2 slots → shadow direction wobble).
-    //             w = LANTERN bitmask (light enclosed by its own cage → soft attenuation-fade).
+    //             w = SOFT bitmask: the slot's tile was baked at REDUCED resolution (lantern or big
+    //             light). Its texels are big in world space → wide penumbra → it needs the WIDER PCF
+    //             grid (SHADOW_PCF_R_SOFT) to sample that penumbra without staircasing.
     // Appended at the struct tail so every offset above stays fixed.
     DATA(uint4,    slotBits,     None);
     // Per-slot flame state (flicker slots only — slotBits.z gates the read):
@@ -58,7 +60,12 @@ STRUCT(ShadowMaskParams)
     //       rate (fPhase += dt*rate), so a carried torch in a gale dances faster than the sconce beside it,
     //       the flame runs on wall-clock (identical at 60 and 165 fps), and a rate change never pops the
     //       waveform the way scaling a shared clock would. Replaces the old global biasParams.z.
-    //   zw = spare.
+    //   z = the face-frustum uvScale this slot's tile was BAKED with (host shadowFaceUvScale). < 1 =
+    //       the face was rendered WIDER than 90°, so adjacent cube faces overlap by a few texels and a
+    //       PCF tap reaching across a seam lands on real geometry instead of a clamped edge texel. The
+    //       mask must divide its face UV — and its texel-size derivations — by exactly this number.
+    //       0 (never baked) ⇒ treat as 1.0 = exactly 90°, no gutter.
+    //   w = spare.
     // Appended at the struct tail so every offset above stays fixed (host writes it at float index 288).
     DATA(float4,   slotFlick[MAX_SHADOW_SLOTS], None);
 };
