@@ -171,9 +171,15 @@ namespace {
     // were re-emitted from CACHED palettes, which the geometry cache only refreshes on the
     // eviction sweep (~every 30 frames) — so a still-animating offscreen NPC's shadow baked a
     // 30-frame-stale pose and SNAPPED every 30 frames (measured: skinnedΔ=0 for 29f, ~1.9u
-    // spike on the 30th). These movers are radius-gated (2048u) → near → ALIVE, so it is safe
-    // to ensureLive() them each frame (the freed-key hazard is far-only). ON = fresh pose every
-    // frame; OFF = the old 30-frame-stale re-emit (A/B).
+    // spike on the 30th). ON = fresh pose every frame; OFF = the old 30-frame-stale re-emit (A/B).
+    //
+    // This ensureLive()s OFFSCREEN keys, which is only safe because GeometryCache now holds a real
+    // engine reference to every cached shape (g_geomRefs), pinning it alive for as long as we hold
+    // the key. It shipped originally on the argument that these movers are radius-gated (2048u) →
+    // "near ⇒ alive" — which is a PROXIMITY argument, not a liveness one. A scene teardown (save
+    // load) frees near and far alike, and this path then dereferenced the freed shapes: crash
+    // 2026-07-13, AV in ensureLive → NI::Pointer::claim. Distance never implied liveness; only
+    // owning a reference does.
     bool g_shadowLiveNearActors = true;
 
     // --- P2 light identity tracking -------------------------------------------------------
@@ -2334,6 +2340,33 @@ namespace RenderProcess {
             if (interiorCell != s_lastInteriorCell || teleport) {
                 ++g_cellEpoch;
                 g_lightTracks.clear();   // new-cell lights all take fresh ids (no address-reuse inheritance)
+                // The scene graph was torn down with the old cell, but the geometry cache keys on
+                // shape ADDRESSES and cannot see that — so the old cell's entries survive and get
+                // emitted below for a frame (the one-frame flash of the previous cell's objects/NPCs
+                // on a transition). Purge them here, BEFORE buildGeometryDrawLists runs.
+                //
+                // NOT on the very first evaluation: s_lastInteriorCell starts null, so frame 0 always
+                // looks like a "transition" — and purging there would throw away the 1524 entries the
+                // startup walk just captured, for nothing. There is no old cell to leave yet. (s_haveEye
+                // is false exactly once, which is the same condition the teleport test already uses.)
+                const bool firstEval = !s_haveEye;
+                LOG::logline(">> [cell-purge] epoch=%u frame=%u interiorChanged=%d teleport=%d first=%d cached=%u",
+                             g_cellEpoch, frame, (int)(interiorCell != s_lastInteriorCell), (int)teleport,
+                             (int)firstEval, (unsigned)MGE::GeometryCache::cache().size());
+                if (!firstEval) {
+                    MGE::GeometryCache::purgeAll();
+                    // Then resolve those keys to host slots IMMEDIATELY — do not leave them for the
+                    // deferred drain in flushGeometry(). The purge just released our engine refs, so
+                    // the old shapes are freed and the allocator will hand the SAME ADDRESSES to the
+                    // new cell's shapes; buildGeometryDrawLists (below) then re-captures them under
+                    // the very same keys and assigns them fresh host slots. A drain running after
+                    // that would look each evicted key up in g_keySlot, find the NEW slot, and
+                    // release the object we just uploaded — losing every part of the new cell that
+                    // landed on a recycled address (measured: ~half a cell, every save load).
+                    // Draining here resolves the keys to the OLD slots, while they still mean what
+                    // they meant at purge time.
+                    drainReleasedSlots();
+                }
             }
             s_lastInteriorCell = interiorCell;
             s_lastEye[0] = eye[0]; s_lastEye[1] = eye[1]; s_lastEye[2] = eye[2];

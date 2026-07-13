@@ -229,6 +229,14 @@ namespace MGE::GeometryCache {
     void onFrameReady(void* dataHandler, const float* gateEye = nullptr, float gateRadius = 0.0f,
                       bool liveDrawBuild = false);
 
+    // Drop EVERY cached entry, routing each key through the normal eviction channel so the
+    // Forge feed releases the matching host mesh slots. Call on a cell teardown (load door,
+    // teleport, save load): the cache keys on shape addresses and cannot otherwise tell that the
+    // whole scene graph was destroyed, so old-cell entries survive into the new cell and get
+    // emitted for a frame — the one-frame flash of the previous cell's objects/NPCs. Survivors
+    // are re-captured lazily on first sight.
+    void purgeAll();
+
     // Refresh (or lazily capture) ONE entry straight off its live NiTriShape*. Only
     // valid for keys the engine drew THIS frame (classify visible set) — that is what
     // guarantees the pointer is alive. Refreshes exactly the per-frame-varying fields
