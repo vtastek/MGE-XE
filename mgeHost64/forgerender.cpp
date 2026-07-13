@@ -1690,11 +1690,22 @@ namespace {
         float    fPrevI     = -1.0f;   // last frame's intensity (-1 = uninitialized)
         float    fMinI      = 0.0f;    // running envelope (expand fast, contract slow) for normalization
         float    fMaxI      = 0.0f;
-        float    fErratic   = 0.0f;    // EWMA |dI|/maxI — ~0 steady, rises with modulation depth*rate
+        float    fErratic   = 0.0f;    // EWMA of the intensity change RATE (per 60Hz-reference frame, so the
+                                       // tuned g_flickAnimThresh keeps its meaning at ANY fps) — ~0 steady,
+                                       // rises with modulation depth*rate.
         float    fEndedness = 0.5f;    // EWMA of reversal-position min(en,1-en): ~0 pulse (ends), ~.25 flicker
         int8_t   fPrevDir   = 0;       // sign of last significant dI (reversal detect)
         uint8_t  fClass     = 0;       // 0 steady, 1 pulse, 2 flicker (derived; settles from warm-up)
-        uint16_t fAnimFrames= 0;       // consecutive-ish frames seen animated (warm-up / anti-flap hysteresis)
+        float    fAnimTime  = 0.0f;    // SECONDS seen animated (warm-up / anti-flap hysteresis). Was a frame
+                                       // count — at 165fps that made the warm-up 3x shorter than at 60.
+        // Frame-rate-independent flame phase + the motion signal that speeds it up.
+        double   fPhase     = 0.0;     // INTEGRATED synthetic-flame phase (rad): += dt * speed * rateGain each
+                                       // frame. Integrating (not multiplying a global clock) is what lets the
+                                       // rate change — with motion/wind — without popping the waveform. Double
+                                       // so it stays exact over a long session; shipped to the mask as float.
+        float    fSpeed     = 0.0f;    // EWMA world speed of the light (units/s). A CARRIED torch flickers
+                                       // harder than a wall sconce; reset on (re)assignment so a slot swap or
+                                       // a teleport is never read as motion.
         // Soft-shadow category (LANTERN, not candle): a caster of THIS light encloses it (fixture cage
         // → twoSided). A lantern diffuses its light through glass/paper, so its shadows read soft; a bare
         // candle flame encloses nothing and stays crisp. Set on the slot's gather, persists between renders
@@ -4974,8 +4985,45 @@ namespace {
     // untouched). ONLY fClass==2 (pulse/steady stay still). biasParams.z/.w + slotBits.z carry it to the mask.
     float g_flickShadowMove  = 0.02f;   // Rotation amplitude (RADIANS, ~1°). Shadow travel = this*dist, so keep
                                         // small; the tip stays put and far shadows sway most. 0 = off. Live (user-set).
-    float g_flickShadowSpeed = 4.2f;    // Phase speed (rad/s) scaling biasParams.z. Incommensurate per-axis sines
-                                        // + per-light position hash give an organic, desynced flame jitter. Live.
+    float g_flickShadowSpeed = 4.2f;    // BASE phase rate (rad/s). Each slot INTEGRATES this (fPhase += dt*rate),
+                                        // so the flame runs on wall-clock — identical at 60 and 165 fps — and a
+                                        // rate change (motion/wind below) speeds it up without popping. Live.
+    // Excitation: a flame dances harder when it's CARRIED (an NPC walking with a torch) or when the WIND blows
+    // (exteriors only — the client ships 0 wind in interiors). Both feed the same 0..1 drive and push mostly on
+    // the RATE, not the amplitude: raising the amplitude swings the lookup direction far enough to expose atlas
+    // artifacts, whereas raising the rate reads as a livelier flame at the same (safe) amplitude.
+    float g_flickMotionRef   = 150.0f;  // Light speed (world u/s) that counts as FULL motion drive. ~NPC walk.
+    float g_flickMotionRate  = 1.20f;   // Rate gain at full motion (1.2 = a carried torch flickers 2.2x faster).
+    float g_flickMotionAmp   = 0.10f;   // Amplitude gain at full motion. Keep SMALL — amp is the artifact axis.
+    // Wind maps as a RANGE, not a scalar: MW's smoothed |wind| is NOT 0..1. Measured off the wind= heartbeat:
+    // a CALM exterior reads 1.8-2.3, an ASHSTORM 7.4-9.1. Treating it as 0..1 would pin every outdoor flame
+    // at permanent full gale; a too-low ref pins the storm at drive=1.00 and flattens its gusting.
+    // Drive = saturate((|wind| - floor) / (ref - floor)) — calm contributes nothing, and the storm's own
+    // gusts ride through as ~0.75..1.0 instead of a flat clamp. Both ends live (other weathers may exceed).
+    float g_flickWindFloor   = 2.50f;   // |wind| at/below which there is NO wind excitation (measured calm ~2.3).
+    float g_flickWindRef     = 9.00f;   // |wind| that counts as FULL wind drive (measured ashstorm peak ~9.1).
+    float g_flickWindRate    = 3.00f;   // Rate gain in a full gale (exteriors only).
+    float g_flickWindAmp     = 1.00f;   // Amplitude gain in a full gale — safe to run maxed BECAUSE of the
+                                        // candle guard below (it was small lights that artifacted, not big ones).
+    // Candle guard. The amp artifacts trace to CANDLES: a small light sits close to its own fixture, so the
+    // same ANGULAR wobble that gently sways a lantern's far shadow throws a candle's near shadow across the
+    // atlas face. Scale the EXCITATION amp (motion + wind) by light radius — a candle gets none of it, a
+    // lantern/torch gets all. The BASE amplitude (g_flickShadowMove) is untouched, so a candle flickers
+    // exactly as it did before; only the extra swing is withheld. Both ends live (radii print in the log).
+    float g_flickAmpRadMin   = 150.0f;  // Radius at/below which excitation adds NO amplitude (candle).
+    float g_flickAmpRadMax   = 300.0f;  // Radius at/above which excitation adds FULL amplitude (lantern/torch).
+    float g_flickWind        = 0.0f;    // THIS frame's smoothed wind magnitude from the client (lighting[18];
+                                        // 0 in interiors — the exterior gate lives client-side).
+    // A slot's motion drive (0..1): its smoothed travel speed against the full-drive reference.
+    static float motionDrive(const ShadowSlot& sl) {
+        return (g_flickMotionRef > 1e-3f) ? std::min(1.0f, sl.fSpeed / g_flickMotionRef) : 0.0f;
+    }
+    // How much EXCITATION amplitude this light may take (0..1), by radius — the candle guard.
+    static float ampAllowance(const ShadowSlot& sl) {
+        const float span = g_flickAmpRadMax - g_flickAmpRadMin;
+        if (span <= 1e-3f) { return (sl.radius >= g_flickAmpRadMax) ? 1.0f : 0.0f; }
+        return std::min(1.0f, std::max(0.0f, (sl.radius - g_flickAmpRadMin) / span));
+    }
     bool  g_flickIntensityMatch = true; // Couple a FLICKER light's forward BRIGHTNESS to the SAME synthetic
                                         // flame signal that sways its shadow (same time-phase + slot seed +
                                         // gust), so light and shadow move as one flame. Drives brightness =
@@ -4985,24 +5033,39 @@ namespace {
     float g_flickIntensityDepth = 0.35f;// Depth of the injected brightness dip: b in [1-depth .. 1]. 0 = off
                                         // (no intensity change), 0.75 ≈ MW's own 0.25..1 range. Live.
     // Classify one shadow slot's light from this frame's intensity I=max(color.rgb). Steady vs animated
-    // is gated by erraticness with a frame-count hysteresis (fAnimFrames) so a transient (cell-load
-    // dimmer ramp) can't flag a steady light; flicker vs pulse reads reversal position once warmed up.
-    static void classifyFlickerSlot(ShadowSlot& sl, float I) {
-        constexpr float kEnvDecay   = 0.004f;  // envelope contracts slowly (~250 frames) so it tracks base drift
-        constexpr float kErrAlpha   = 0.05f;   // erraticness EWMA
-        constexpr float kEndAlpha   = 0.20f;   // endedness EWMA (updated only at reversals)
-        constexpr float kNoiseFrac  = 0.02f;   // dead-band on |dI|/maxI to reject FP noise as a reversal
-        constexpr uint16_t kAnimOn  = 8;       // frames of erraticness before ANIMATED is declared
-        constexpr uint16_t kWarmup  = 20;      // animated frames before the flicker/pulse split is trusted
+    // is gated by erraticness with a hysteresis in SECONDS (fAnimTime) so a transient (cell-load dimmer
+    // ramp) can't flag a steady light; flicker vs pulse reads reversal position once warmed up.
+    //
+    // FRAME-RATE INDEPENDENCE. MW's flicker signal evolves in TIME, so its per-frame delta shrinks as fps
+    // rises — a raw per-frame EWMA of |dI| is ~3x smaller at 165fps than at 60, which used to move a torch
+    // across the fixed g_flickAnimThresh and decide whether it flickered AT ALL based on frame rate. So:
+    //   * erraticness measures a RATE, expressed per 60Hz reference frame (the tuned threshold keeps its
+    //     exact 60fps meaning and now holds at any fps). This is correct in both regimes: if MW's signal is
+    //     continuous, rel ∝ dt and rel60 is invariant; if MW instead steps on its own tick (most frames
+    //     dI=0, one frame jumps), the time-constant EWMA below averages the same total variation per second.
+    //   * both EWMAs run on TIME CONSTANTS (alpha = 1-exp(-dt/tau)), not fixed per-frame alphas.
+    //   * the reversal dead-band stays on the RAW per-frame delta: it rejects FP reconstruction noise, which
+    //     is per-SAMPLE, not per-second — normalizing it would make the noise floor fps-dependent instead.
+    static void classifyFlickerSlot(ShadowSlot& sl, float I, float dt) {
+        constexpr float kRefDt      = 1.0f / 60.0f;  // reference frame the tuned knobs are expressed in
+        constexpr float kEnvTau     = 4.17f;   // envelope contracts slowly (was 0.004/frame @60) → tracks base drift
+        constexpr float kErrTau     = 0.333f;  // erraticness EWMA time constant (was 0.05/frame @60)
+        constexpr float kEndAlpha   = 0.20f;   // endedness EWMA — event-driven (reversals only), no dt term
+        constexpr float kNoiseFrac  = 0.02f;   // dead-band on the RAW |dI|/maxI to reject FP noise as a reversal
+        constexpr float kAnimOn     = 0.133f;  // seconds of erraticness before ANIMATED is declared (was 8f @60)
+        constexpr float kWarmup     = 0.333f;  // animated seconds before the flicker/pulse split is trusted
         if (sl.fPrevI < 0.0f) { sl.fPrevI = sl.fMinI = sl.fMaxI = I; return; }   // seed on first sight
+        const float aEnv = 1.0f - std::exp(-dt / kEnvTau);
+        const float aErr = 1.0f - std::exp(-dt / kErrTau);
         // Running envelope: expand instantly to a new extreme, contract slowly toward I.
-        sl.fMaxI = (I > sl.fMaxI) ? I : sl.fMaxI + (I - sl.fMaxI) * kEnvDecay;
-        sl.fMinI = (I < sl.fMinI) ? I : sl.fMinI + (I - sl.fMinI) * kEnvDecay;
+        sl.fMaxI = (I > sl.fMaxI) ? I : sl.fMaxI + (I - sl.fMaxI) * aEnv;
+        sl.fMinI = (I < sl.fMinI) ? I : sl.fMinI + (I - sl.fMinI) * aEnv;
         const float scale = (sl.fMaxI > 1e-4f) ? sl.fMaxI : 1e-4f;
         const float dI    = I - sl.fPrevI;
-        const float rel   = std::fabs(dI) / scale;
-        sl.fErratic = sl.fErratic + (rel - sl.fErratic) * kErrAlpha;
-        // Reversal detection (dead-banded) → endedness of the extremum we just left.
+        const float rel   = std::fabs(dI) / scale;          // raw per-frame relative delta (noise gate)
+        const float rel60 = rel * (kRefDt / dt);            // same delta as a RATE, per 60Hz frame
+        sl.fErratic = sl.fErratic + (rel60 - sl.fErratic) * aErr;
+        // Reversal detection (dead-banded on the raw delta) → endedness of the extremum we just left.
         int8_t dir = (rel > kNoiseFrac) ? (int8_t)(dI > 0.0f ? 1 : -1) : (int8_t)0;
         if (dir != 0) {
             if (sl.fPrevDir != 0 && dir != sl.fPrevDir) {
@@ -5013,12 +5076,12 @@ namespace {
             }
             sl.fPrevDir = dir;
         }
-        // Steady/animated hysteresis: accumulate while erratic, bleed fast when quiet.
-        if (sl.fErratic > g_flickAnimThresh) { if (sl.fAnimFrames < 60000) { ++sl.fAnimFrames; } }
-        else if (sl.fAnimFrames > 0)         { sl.fAnimFrames = (sl.fAnimFrames > 3) ? sl.fAnimFrames - 3 : 0; }
-        if (sl.fAnimFrames < kAnimOn) {
+        // Steady/animated hysteresis: accumulate while erratic, bleed 3x as fast when quiet.
+        if (sl.fErratic > g_flickAnimThresh) { sl.fAnimTime = std::min(sl.fAnimTime + dt, 10.0f); }
+        else                                 { sl.fAnimTime = std::max(sl.fAnimTime - 3.0f * dt, 0.0f); }
+        if (sl.fAnimTime < kAnimOn) {
             sl.fClass = 0;                                   // STEADY (the hard-gated default)
-        } else if (sl.fAnimFrames < kWarmup) {
+        } else if (sl.fAnimTime < kWarmup) {
             sl.fClass = 2;                                   // animated but not settled → call it FLICKER early
         } else {
             sl.fClass = (sl.fEndedness < g_flickEndSplit) ? 1u : 2u;   // settled: PULSE vs FLICKER
@@ -5240,6 +5303,26 @@ namespace {
         uiAddComponentWidget(g_uiPanel, "Flicker: shadow wobble amplitude (rad, 0=off)", &sFlkM, WIDGET_TYPE_SLIDER_FLOAT);
         SliderFloatWidget sFlkS = {}; sFlkS.pData = &g_flickShadowSpeed; sFlkS.mMin = 0.0f; sFlkS.mMax = 10.0f; sFlkS.mStep = 0.1f;
         uiAddComponentWidget(g_uiPanel, "Flicker: shadow wobble speed (rad/s)", &sFlkS, WIDGET_TYPE_SLIDER_FLOAT);
+        // Excitation: a carried torch / a windy exterior flickers harder. Both push mostly on RATE — amp is
+        // the axis that swings the lookup direction into atlas artifacts, so its gains stay small.
+        SliderFloatWidget sFlkMR = {}; sFlkMR.pData = &g_flickMotionRef; sFlkMR.mMin = 20.0f; sFlkMR.mMax = 400.0f; sFlkMR.mStep = 10.0f;
+        uiAddComponentWidget(g_uiPanel, "Flicker: motion full-drive speed (u/s)", &sFlkMR, WIDGET_TYPE_SLIDER_FLOAT);
+        SliderFloatWidget sFlkMS = {}; sFlkMS.pData = &g_flickMotionRate; sFlkMS.mMin = 0.0f; sFlkMS.mMax = 3.0f; sFlkMS.mStep = 0.05f;
+        uiAddComponentWidget(g_uiPanel, "Flicker: motion RATE gain (carried torch)", &sFlkMS, WIDGET_TYPE_SLIDER_FLOAT);
+        SliderFloatWidget sFlkMA = {}; sFlkMA.pData = &g_flickMotionAmp; sFlkMA.mMin = 0.0f; sFlkMA.mMax = 1.0f; sFlkMA.mStep = 0.05f;
+        uiAddComponentWidget(g_uiPanel, "Flicker: motion AMP gain (artifact axis — keep low)", &sFlkMA, WIDGET_TYPE_SLIDER_FLOAT);
+        SliderFloatWidget sFlkWF = {}; sFlkWF.pData = &g_flickWindFloor; sFlkWF.mMin = 0.0f; sFlkWF.mMax = 10.0f; sFlkWF.mStep = 0.1f;
+        uiAddComponentWidget(g_uiPanel, "Flicker: wind CALM floor |wind| (see wind= in log)", &sFlkWF, WIDGET_TYPE_SLIDER_FLOAT);
+        SliderFloatWidget sFlkWR = {}; sFlkWR.pData = &g_flickWindRef; sFlkWR.mMin = 0.1f; sFlkWR.mMax = 15.0f; sFlkWR.mStep = 0.1f;
+        uiAddComponentWidget(g_uiPanel, "Flicker: wind full-drive |wind| (storm)", &sFlkWR, WIDGET_TYPE_SLIDER_FLOAT);
+        SliderFloatWidget sFlkWS = {}; sFlkWS.pData = &g_flickWindRate; sFlkWS.mMin = 0.0f; sFlkWS.mMax = 3.0f; sFlkWS.mStep = 0.05f;
+        uiAddComponentWidget(g_uiPanel, "Flicker: wind RATE gain (exteriors)", &sFlkWS, WIDGET_TYPE_SLIDER_FLOAT);
+        SliderFloatWidget sFlkWA = {}; sFlkWA.pData = &g_flickWindAmp; sFlkWA.mMin = 0.0f; sFlkWA.mMax = 1.0f; sFlkWA.mStep = 0.05f;
+        uiAddComponentWidget(g_uiPanel, "Flicker: wind AMP gain (candle-guarded)", &sFlkWA, WIDGET_TYPE_SLIDER_FLOAT);
+        SliderFloatWidget sFlkAN = {}; sFlkAN.pData = &g_flickAmpRadMin; sFlkAN.mMin = 0.0f; sFlkAN.mMax = 600.0f; sFlkAN.mStep = 10.0f;
+        uiAddComponentWidget(g_uiPanel, "Flicker: amp guard — candle radius (no extra swing)", &sFlkAN, WIDGET_TYPE_SLIDER_FLOAT);
+        SliderFloatWidget sFlkAX = {}; sFlkAX.pData = &g_flickAmpRadMax; sFlkAX.mMin = 0.0f; sFlkAX.mMax = 1200.0f; sFlkAX.mStep = 10.0f;
+        uiAddComponentWidget(g_uiPanel, "Flicker: amp guard — lantern radius (full swing)", &sFlkAX, WIDGET_TYPE_SLIDER_FLOAT);
         CheckboxWidget cFlkI = {}; cFlkI.pData = &g_flickIntensityMatch;
         uiAddComponentWidget(g_uiPanel, "Flicker: match light intensity to shadow", &cFlkI, WIDGET_TYPE_CHECKBOX);
         SliderFloatWidget sFlkID = {}; sFlkID.pData = &g_flickIntensityDepth; sFlkID.mMin = 0.0f; sFlkID.mMax = 1.0f; sFlkID.mStep = 0.05f;
@@ -5772,6 +5855,9 @@ namespace ForgeRender {
             g_eyeAbsShadow[0] = lighting[24];
             g_eyeAbsShadow[1] = lighting[25];
             g_eyeAbsShadow[2] = lighting[26];
+            // lighting[18] = the client's SMOOTHED wind magnitude (0 in interiors — it gates on IsExterior
+            // there). CPU-side only: it drives the flame-flicker rate, so a gale makes torch shadows dance.
+            g_flickWind = lighting[18];
             // Cell-change shadow eviction (see g_shadowCellEpoch): a load door recycles NiPointLight
             // addresses AND swaps the resident geometry, so an old slot could keep sampling the prior
             // cell's cached tile while old-cell caster records still draw into new-cell atlases. On any
@@ -6182,6 +6268,25 @@ namespace ForgeRender {
                 return -1;
             };
 
+            // Wall-clock frame delta — the whole flicker system (classifier hysteresis, EWMAs, flame phase)
+            // runs on TIME, not frames, so it behaves identically at 60 and 165 fps. Clamped: a hitch, an
+            // alt-tab or a breakpoint must not fast-forward the flame or spike the classifier.
+            static double s_flickPrevMs = 0.0;
+            const double  flickNowMs = hostNowMs();
+            float flickDt = (s_flickPrevMs > 0.0) ? (float)((flickNowMs - s_flickPrevMs) * 0.001) : (1.0f / 60.0f);
+            s_flickPrevMs = flickNowMs;
+            flickDt = std::min(std::max(flickDt, 0.001f), 0.1f);
+            // Global flame phase at the BASE rate. Slots integrate their own (motion/wind speed them up);
+            // this is the base a newly-assigned slot inherits so its wobble starts mid-flame, not from 0.
+            static double s_flickPhaseGlobal = 0.0;
+            s_flickPhaseGlobal += (double)(flickDt * g_flickShadowSpeed);
+            // Wind drive (0..1), exteriors only (the client ships 0 wind indoors — and 0 is below the floor,
+            // so an interior gets no wind excitation for free). Shared by every slot.
+            const float windSpan  = g_flickWindRef - g_flickWindFloor;
+            const float windDrive = (windSpan > 1e-3f)
+                                  ? std::min(1.0f, std::max(0.0f, (g_flickWind - g_flickWindFloor) / windSpan))
+                                  : 0.0f;
+
             // (2) Clear the per-frame active flag. NO time-based eviction: a valid slot keeps its
             // cached tile even while its light is absent (camera turned away / frustum-culled), so
             // turning back reactivates it instantly from cache — no re-render pop. Slots are only
@@ -6213,10 +6318,33 @@ namespace ForgeRender {
                 const bool moved = (L.flags & IPC::kLightFlagMoved)
                                    || (dx*dx + dy*dy + dz*dz > kShadowMovedEps * kShadowMovedEps)
                                    || (std::fabs(L.radius - sl.radius) > 1.0f);
+                // Motion drive: how fast this light is TRAVELLING (world u/s), from the same delta the move
+                // test above already computed — a carried torch flickers harder than a wall sconce. Only
+                // sampled on frame-CONTIGUOUS sightings: a slot that was inactive for a while (light out of
+                // view, tile retained) has a delta spanning many frames, and a cell shuffle / teleport can
+                // move a light arbitrarily far in one — neither is motion. EWMA'd on a time constant so the
+                // drive ramps with the walk cycle instead of jittering per frame.
+                {
+                    constexpr float kMotionTau = 0.15f;    // speed EWMA time constant (s)
+                    constexpr float kMotionMax = 3000.0f;  // above this it's a teleport, not a walk (u/s)
+                    if (sl.lastSeenFrame + 1 == frame) {
+                        const float spd = std::sqrt(dx*dx + dy*dy + dz*dz) / flickDt;
+                        if (spd < kMotionMax) {
+                            const float aM = 1.0f - std::exp(-flickDt / kMotionTau);
+                            sl.fSpeed += (spd - sl.fSpeed) * aM;
+                        }
+                    }
+                }
                 sl.absPos[0] = ax; sl.absPos[1] = ay; sl.absPos[2] = az;
                 sl.radius = L.radius; sl.importance = L.imp;
                 sl.lastSeenFrame = frame; sl.activeThisFrame = true; sl.curLightIdx = L.idx;
-                classifyFlickerSlot(sl, L.intensity);   // Path A: steady / pulse / flicker from the diffuse signal
+                classifyFlickerSlot(sl, L.intensity, flickDt);   // Path A: steady / pulse / flicker from the diffuse signal
+                // Advance this slot's own flame phase. Motion and wind push the RATE (a carried torch in a
+                // gale runs fastest); integrating rather than scaling a global clock means a changing rate
+                // never discontinuously jumps the waveform — and dt-driven means it's fps-independent.
+                const float rateGain = 1.0f + g_flickMotionRate * motionDrive(sl)
+                                            + g_flickWindRate   * windDrive;
+                sl.fPhase += (double)(flickDt * g_flickShadowSpeed * rateGain);
                 if (moved) { sl.lastRenderFrame = 0; }   // 0 = dirty (also the never-rendered sentinel)
             }
 
@@ -6276,6 +6404,11 @@ namespace ForgeRender {
                 const bool  farLight = d2 >= g_shadowFadeInDist * g_shadowFadeInDist;
                 const bool  cellSettling = (frame - g_shadowCellChangeFrame) < kShadowCellInstantFrames;
                 sl.fadeLevel = (g_shadowFadeInStep > 0.0f && farLight && !cellSettling) ? 0.0f : 1.0f;
+                // Flame state belongs to the LIGHT, not the slot: a new tenant starts with no motion (the
+                // absPos jump from the evicted light is not travel) and inherits the global base phase, so
+                // its wobble picks up mid-flame instead of restarting from 0 (which would read as a snap).
+                sl.fSpeed = 0.0f;
+                sl.fPhase = s_flickPhaseGlobal;
             };
             for (uint32_t c : cand) {
                 // 1. A free (never-used / never-reclaimed) slot.
@@ -6677,17 +6810,26 @@ namespace ForgeRender {
             uint32_t staticReBits = 0;   // slots whose STATIC tile re-rendered THIS frame (not cached)
             uint32_t flickerBits = 0;    // slots whose light is FLICKER-class (fClass==2) → mask dir wobble
             uint32_t lanternBits = 0;    // slots whose light is a LANTERN (enclosed by its own cage) → soft fade
-            // Shared synthetic flame phase (time*speed off a captured base). Drives BOTH the mask's shadow
-            // sway (written to biasParams.z below) AND the forward light-intensity match here — same base,
-            // seed (slot index) and gust formula on both sides, so brightness and shadow move as one flame.
-            static const double s_flickT0b = hostNowMs();
-            const float flickA = (float)((hostNowMs() - s_flickT0b) * 0.001) * g_flickShadowSpeed;
             for (uint32_t s = 0; s < kMaxShadowLights; ++s) {
                 ShadowSlot& sl = g_shadowSlots[s];
                 if (!sl.valid || !sl.activeThisFrame || sl.lastRenderFrame == 0) { continue; }
                 activeBits |= (1u << s);
                 if (sl.lastRenderFrame == frame) { staticReBits |= (1u << s); }
                 if (sl.isLantern) { lanternBits |= (1u << s); }   // soft attenuation-fade in the mask
+                // Per-slot flame: PHASE (integrated above at this slot's own motion/wind-boosted rate) and
+                // AMPLITUDE GAIN. Both ride slotFlick[s] so the mask can wobble a carried torch harder than
+                // the sconce beside it. The amp gains stay small on purpose — amplitude is the axis that
+                // swings the lookup direction far enough to expose atlas artifacts, so excitation is spent
+                // mostly on rate. The forward intensity match below reads the SAME phase and gain, so a
+                // light and its shadow always move as one flame.
+                const float flickA  = (float)sl.fPhase;
+                const float ampAllow = ampAllowance(sl);   // candle guard: small lights take no extra swing
+                const float ampGain = 1.0f + ampAllow * (g_flickMotionAmp * motionDrive(sl)
+                                                       + g_flickWindAmp   * windDrive);
+                mp[288 + s * 4 + 0] = ampGain;   // slotFlick[s].x = amplitude gain
+                mp[288 + s * 4 + 1] = flickA;    // slotFlick[s].y = this slot's flame phase (rad)
+                mp[288 + s * 4 + 2] = 0.0f;
+                mp[288 + s * 4 + 3] = 0.0f;
                 if (sl.fClass == 2u) {
                     flickerBits |= (1u << s);   // shadow "movement" applies here only
                     // Intensity match: modulate this flicker light's FORWARD brightness with the SAME flame
@@ -6701,7 +6843,10 @@ namespace ForgeRender {
                         const float gust = 0.22f + 0.78f * g0 * g1;                     // == mask gust envelope
                         const float fast = 0.5f + 0.5f * sinf(flickA * 1.07f + seed * 0.5f);  // in phase w/ z sway
                         const float flame = gust * (0.6f + 0.4f * fast);               // ~0.13 .. 1.0
-                        const float b     = 1.0f - g_flickIntensityDepth * (1.0f - flame);    // [1-depth .. 1]
+                        // Excitation deepens the DIP too (a guttering flame dims harder), capped so b can
+                        // never reach 0 — a torch that blinks fully out reads as a bug, not as wind.
+                        const float depth = std::min(0.9f, g_flickIntensityDepth * ampGain);
+                        const float b     = 1.0f - depth * (1.0f - flame);             // [1-depth .. 1]
                         float* col = &lc[4 + sl.curLightIdx * 12 + 4];                  // forward light rgb (this frame)
                         const float cur = std::max(col[0], std::max(col[1], col[2]));
                         if (cur > 1e-4f) {
@@ -6732,10 +6877,11 @@ namespace ForgeRender {
             mp[281] = g_shadowNormalOffset;       // biasParams.y = normal-offset bias in texels (live knob)
             // Flicker shadow "movement": the mask rotates the LOOKUP direction of flicker-class slots by a
             // small time-varying angle → world displacement = angle*dist (stable at the light/candle tip,
-            // growing toward the attenuation edge). biasParams.z = evolving phase (time*speed, captured base
-            // so the float stays small), biasParams.w = rotation amplitude (radians). slotBits.z picks slots.
-            mp[282] = flickA;                     // biasParams.z = shared flame phase (== the intensity match)
-            mp[283] = g_flickShadowMove;          // biasParams.w = rotation amplitude (radians; 0 = off)
+            // growing toward the attenuation edge). The PHASE is now PER-SLOT (slotFlick[s].y — each flame
+            // runs at its own motion/wind-boosted rate), as is the amplitude GAIN (slotFlick[s].x); this is
+            // the BASE amplitude every slot's gain multiplies. slotBits.z picks the slots.
+            mp[282] = (float)s_flickPhaseGlobal;  // biasParams.z = base-rate phase (reference/diagnostic only)
+            mp[283] = g_flickShadowMove;          // biasParams.w = BASE rotation amplitude (radians; 0 = off)
             // slotBits (uint4): the 32-bit slot masks as REAL uints — a float lane is exact only
             // to 24 bits, so at 32 slots the top-8 would silently vanish.
             reinterpret_cast<uint32_t*>(mp)[284] = activeBits;   // slotBits.x
@@ -6767,15 +6913,21 @@ namespace ForgeRender {
             // → "renders=0 standing still" and "active>1 = multi-shadow" are both visible.
             {
                 uint32_t nActive = 0, nValid = 0, nFlk = 0, nPul = 0, nStdy = 0;
+                float maxSpd = 0.0f;   // fastest-travelling active light (u/s) — the motion-drive tuning read
+                float radLo = 1e9f, radHi = 0.0f;   // active-light radius span — the candle-guard tuning read
                 for (uint32_t s = 0; s < kMaxShadowLights; ++s) {
                     if (g_shadowSlots[s].valid) {
                         ++nValid;
                         if (g_shadowSlots[s].activeThisFrame) {
                             ++nActive;
                             switch (g_shadowSlots[s].fClass) { case 2: ++nFlk; break; case 1: ++nPul; break; default: ++nStdy; break; }
+                            maxSpd = std::max(maxSpd, g_shadowSlots[s].fSpeed);
+                            radLo  = std::min(radLo, g_shadowSlots[s].radius);
+                            radHi  = std::max(radHi, g_shadowSlots[s].radius);
                         }
                     }
                 }
+                if (radLo > radHi) { radLo = 0.0f; }   // no active slots
                 static uint64_t s_lastShadowLog = 0;
                 const bool rend = (nRender > 0) && (frame - s_lastShadowLog >= 10);
                 const bool beat = (frame - s_lastShadowLog >= 240);
@@ -6786,8 +6938,11 @@ namespace ForgeRender {
                     for (const auto& dm : g_dynMoverCasters) {
                         if (dm.slot < g_meshHigh && g_meshes[dm.slot].animated) { ++nMovAnim; }
                     }
-                    LOG::logline(">> [p3-shadow] f=%u valid=%u active=%u lights=%u flk=%u/%u/%u(F/P/S) churn(free=%u chal=%u) renders=%u (must=%u stale=%u) dyn=%u movers=%u (anim=%u) srcMover=%d rigidMov=%d occCull=%d occ=%u occBits=0x%08X activeBits=0x%08X dynBits=0x%08X casters=%u",
-                                 frame, nValid, nActive, (unsigned)lights.size(), nFlk, nPul, nStdy, nAssignFree, nAssignChal,
+                    LOG::logline(">> [p3-shadow] f=%u dt=%.1fms wind=%.2f(drive=%.2f) maxSpd=%.0f(drive=%.2f) rad=%.0f..%.0f valid=%u active=%u lights=%u flk=%u/%u/%u(F/P/S) churn(free=%u chal=%u) renders=%u (must=%u stale=%u) dyn=%u movers=%u (anim=%u) srcMover=%d rigidMov=%d occCull=%d occ=%u occBits=0x%08X activeBits=0x%08X dynBits=0x%08X casters=%u",
+                                 frame, flickDt * 1000.0f, g_flickWind, windDrive,
+                                 maxSpd, (g_flickMotionRef > 1e-3f) ? std::min(1.0f, maxSpd / g_flickMotionRef) : 0.0f,
+                                 radLo, radHi,
+                                 nValid, nActive, (unsigned)lights.size(), nFlk, nPul, nStdy, nAssignFree, nAssignChal,
                                  nRender, nMustR, nStaleR,
                                  (unsigned)g_shadowRendersDyn.size(),
                                  nMov, nMovAnim,
