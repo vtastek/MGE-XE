@@ -1,7 +1,7 @@
 // mgeHost64 — shadow-atlas debug view (fragment stage).
 //
 // F12 mode 11 (static atlas) / mode 12 (dynamic atlas): map the screen pixel to an atlas pixel
-// (aspect-fit / letterboxed into 6144x4096), point-LOAD the selected D32 atlas (same access as the
+// (aspect-fit / letterboxed into the atlas), point-LOAD the selected D32 atlas (same access as the
 // shadowmask compute — NO_SAMPLER), and render depth as sqrt-greyscale. The atlas layout is fully
 // deterministic (mirror of the host shadowSlotBlock): from the atlas pixel we recover which slot's
 // 3x2 face block it lands in, then TINT by that slot's state — occupied = wash (green for static,
@@ -14,6 +14,7 @@
 
 #include "opaque.srt.h"
 
+// MUST match host kShadowAtlasW/H (forgerender.cpp).
 #define ATLAS_W 6144.0f
 #define ATLAS_H 4096.0f
 
@@ -48,30 +49,38 @@ float4 PS_MAIN( VSOutput In )
     apx = clamp(apx, int2(0, 0), int2((int)ATLAS_W - 1, (int)ATLAS_H - 1));
 
     // Inverse of host shadowSlotBlock(): atlas pixel -> slot index + block origin/face size.
-    // Tier A (slots 0-7): 512px faces, 2 cols x 4 rows of 3x2 blocks filling x in [0,3072).
-    // Tier B (slots 8-31): 256px faces, 3 strips (stride 1024, 768 wide) x 8 rows. slot = -1 = gap.
+    // Everything derives from ATLAS_H exactly as the host derives it from kShadowAtlasH, so this
+    // view follows an atlas resize instead of silently mis-mapping (it was hardcoded to the old
+    // 6144x4096 sizes, which is precisely the drift this avoids).
+    // Tier A (slots 0-7): TA-px faces, 2 cols x 4 rows of 3x2 blocks filling x in [0, 6*TA).
+    // Tier B (slots 8-31): TB-px faces, 3 strips (stride 4*TB, 3*TB wide) x 8 rows. gap = dead space.
+    // NOTE: the face size drawn here is the BLOCK size. A soft slot renders a smaller 3x2 arrangement
+    // in the block's top-left corner, so its unused remainder shows as stale/empty — that is expected,
+    // and it is how you can SEE which slots are running low-res tiles.
+    int TA = int(ATLAS_H) / 8;                   // tier A face
+    int TB = int(ATLAS_H) / 16;                  // tier B face
     int  slot;
     int2 blockOrigin;
     int  faceSize;
     bool gap = false;
-    if (apx.x < 3072)
+    if (apx.x < 6 * TA)
     {
-        int col = apx.x / 1536;                  // 0..1  (block = 3*512 wide)
-        int row = apx.y / 1024;                  // 0..3  (block = 2*512 tall)
-        blockOrigin = int2(col * 1536, row * 1024);
-        faceSize = 512;
+        int col = apx.x / (3 * TA);              // 0..1  (block = 3*TA wide)
+        int row = apx.y / (2 * TA);              // 0..3  (block = 2*TA tall)
+        blockOrigin = int2(col * (3 * TA), row * (2 * TA));
+        faceSize = TA;
         slot = row * 2 + col;
     }
     else
     {
-        int localX   = apx.x - 3072;
-        int strip    = localX / 1024;            // 0..2  (stride 4*256)
-        int inStripX = localX - strip * 1024;
-        int row2     = apx.y / 512;              // 0..7  (block = 2*256 tall)
-        blockOrigin = int2(3072 + strip * 1024, row2 * 512);
-        faceSize = 256;
+        int localX   = apx.x - 6 * TA;
+        int strip    = localX / (4 * TB);        // 0..2  (stride 4*TB)
+        int inStripX = localX - strip * (4 * TB);
+        int row2     = apx.y / (2 * TB);         // 0..7  (block = 2*TB tall)
+        blockOrigin = int2(6 * TA + strip * (4 * TB), row2 * (2 * TB));
+        faceSize = TB;
         slot = 8 + strip * 8 + row2;
-        if (inStripX >= 768 || strip > 2) { gap = true; }   // 256px gap between strips
+        if (inStripX >= 3 * TB || strip > 2) { gap = true; }   // TB-wide gap between strips
     }
 
     // Gap between tier-B strips: draw dim, no slot.

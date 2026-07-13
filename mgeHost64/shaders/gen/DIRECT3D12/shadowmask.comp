@@ -987,28 +987,11 @@ STRUCT(ShadowMaskParams)
 
 
     float4 biasParams;
-
-
-
-
-
-
-
-
-
+#line 54 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.srt.h"
     uint4 slotBits;
-
-
-
-
-
-
-
-
-
-
+#line 70 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.srt.h"
     float4 slotFlick[ 32 ];
-#line 64
+#line 71
 };
 
         CBUFFER(ShadowMaskParams) gShadowMaskParams :  register(b0,space2);
@@ -1019,7 +1002,7 @@ STRUCT(ShadowMaskParams)
 
         Tex2D(float) gShadowAtlasDyn :  register(t4,space2);
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
-#line 54 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
+#line 88 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
 float shadowLitAt(int2 tp, int2 tmin, int2 tmax, float thresh, uint dynSlot)
 {
     tp = clamp(tp, tmin, tmax);
@@ -1044,6 +1027,26 @@ float shadowBilinear(float2 ap, int2 tmin, int2 tmax, float thresh, uint dynSlot
     float s01 = shadowLitAt(b + int2(0, 1), tmin, tmax, thresh, dynSlot);
     float s11 = shadowLitAt(b + int2(1, 1), tmin, tmax, thresh, dynSlot);
     return lerp(lerp(s00, s10, f.x), lerp(s01, s11, f.x), f.y);
+}
+#line 128 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
+float shadowGrid(float2 ap, int2 tmin, int2 tmax, float thresh, uint dynSlot, int R)
+{
+    float2 fp = ap - 0.5f;
+    int2 fb = int2(floor(fp));
+    float2 ff = fp - float2(fb);
+    float vis = 0.0f;
+    UNROLL
+    for (int j = 0; j < 2 * R + 2; ++j)
+    {
+        float wy = (j == 0) ? (1.0f - ff.y) : ((j == 2 * R + 1) ? ff.y : 1.0f);
+        UNROLL
+        for (int i = 0; i < 2 * R + 2; ++i)
+        {
+            float wx = (i == 0) ? (1.0f - ff.x) : ((i == 2 * R + 1) ? ff.x : 1.0f);
+            vis += (wx * wy) * shadowLitAt(fb + int2(i - R, j - R), tmin, tmax, thresh, dynSlot);
+        }
+    }
+    return vis * (1.0f / float((2 * R + 1) * (2 * R + 1)));
 }
 
 
@@ -1075,7 +1078,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
     if (deviceZ > 0.0f && activeBits != 0u)
     {
         float3 P = reconstructWorldPx(px, deviceZ, invScreen);
-#line 123 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
+#line 191 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
         float rangeK = gShadowMaskParams.maskParams.x;
         uint rangeBits = 0u;
         uint nInRange = 0u;
@@ -1093,7 +1096,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
             Write2D(gShadowMaskOut, px, mask);
             return;
         }
-#line 156 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
+#line 224 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
         if (nInRange >  8u  && dbg == 0u)
         {
             uint2 hist = uint2(0u, 0u);
@@ -1150,13 +1153,11 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
         if (dot(N, -P) < 0.0f) { N = -N; }
         float normalOffsetK = gShadowMaskParams.biasParams.y;
         uint dynBits = gShadowMaskParams.slotBits.y;
-        uint lanternBits = gShadowMaskParams.slotBits.w;
+        uint softBits = gShadowMaskParams.slotBits.w;
 
 
 
-
-
-        bool pcfNear = dot(P, P) <  360.0f  *  360.0f ;
+        float eyeDist = sqrt(max(dot(P, P), 1e-8f));
 
         for (uint s = 0u; s < (uint) 32 ; ++s)
         {
@@ -1179,8 +1180,19 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
             float3 Ldir = posRad.xyz - P;
             float ndotl = dot(N, Ldir * rsqrt(max(dot(Ldir, Ldir), 1e-8f)));
             float sinT = sqrt(saturate(1.0f - ndotl * ndotl));
-            float texelW = 2.0f * ma0 / max(tile.z, 1.0f);
+
+
+
+
+            float uvScale = gShadowMaskParams.slotFlick[s].z;
+            uvScale = (uvScale > 0.01f) ? uvScale : 1.0f;
+            float texelW = 2.0f * ma0 / max(tile.z * uvScale, 1.0f);
             float3 Poff = P + N * (normalOffsetK * sinT * texelW);
+#line 326 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
+            float texelAngle = texelW / eyeDist;
+            float gridMix = saturate((texelAngle -  0.001f  *  0.5f )
+                                        / ( 0.001f  * (1.0f -  0.5f )));
+            gridMix = gridMix * gridMix * (3.0f - 2.0f * gridMix);
 
             float3 d = Poff - posRad.xyz;
 
@@ -1259,48 +1271,23 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
                 int2 tmax = tmin + int2((int)tile.z - 1, (int)tile.z - 1);
 
 
-                float2 fuv = float2(u, v) / ma * 0.5f + 0.5f;
+
+
+                float2 fuv = float2(u, v) / ma * (0.5f * uvScale) + 0.5f;
                 float2 ap = faceOrg + fuv * tile.z;
-
-
-
-
-
-
-
+#line 425 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
                 float vis;
-                if (!pcfNear)
+                if (gridMix <= 0.0f)
                 {
                     vis = shadowBilinear(ap, tmin, tmax, thresh, dynSlot);
                 }
                 else
                 {
-
-
-
-
-
-
-
-                    float2 fp = ap - 0.5f;
-                    int2 fb = int2(floor(fp));
-                    float2 ff = fp - float2(fb);
-                    vis = 0.0f;
-                    UNROLL
-                    for (int j = 0; j < 2 *  1  + 2; ++j)
-                    {
-                        float wy = (j == 0) ? (1.0f - ff.y)
-                                 : ((j == 2 *  1  + 1) ? ff.y : 1.0f);
-                        UNROLL
-                        for (int i = 0; i < 2 *  1  + 2; ++i)
-                        {
-                            float wx = (i == 0) ? (1.0f - ff.x)
-                                     : ((i == 2 *  1  + 1) ? ff.x : 1.0f);
-                            vis += (wx * wy) * shadowLitAt(fb + int2(i -  1 , j -  1 ),
-                                                           tmin, tmax, thresh, dynSlot);
-                        }
-                    }
-                    vis *= 1.0f / float((2 *  1  + 1) * (2 *  1  + 1));
+                    float g = (((softBits >> s) & 1u) != 0u)
+                            ? shadowGrid(ap, tmin, tmax, thresh, dynSlot,  1 )
+                            : shadowGrid(ap, tmin, tmax, thresh, dynSlot,  1 );
+                    vis = (gridMix >= 1.0f) ? g
+                                            : lerp(shadowBilinear(ap, tmin, tmax, thresh, dynSlot), g, gridMix);
                 }
 
 
@@ -1309,15 +1296,8 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
 
 
-                if (((lanternBits >> s) & 1u) != 0u)
-                {
-                    vis = lerp(vis, 1.0f, smoothstep( 0.30f  * range, range, ma));
-                    vis = lerp( 0.25f , 1.0f, vis);
-                }
-                else
-                {
-                    vis = lerp(vis, 1.0f, smoothstep(0.85f * range, range, ma));
-                }
+
+                vis = lerp(vis, 1.0f, smoothstep(0.85f * range, range, ma));
 
 
 
