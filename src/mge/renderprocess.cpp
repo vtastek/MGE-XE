@@ -2595,14 +2595,28 @@ namespace RenderProcess {
         const float skyZenithR = skyColPtr ? skyColPtr->r : DistantLand::nearFogCol.r;
         const float skyZenithG = skyColPtr ? skyColPtr->g : DistantLand::nearFogCol.g;
         const float skyZenithB = skyColPtr ? skyColPtr->b : DistantLand::nearFogCol.b;
+        // Wind magnitude (lighting[18]) — drives the host's flame-flicker rate: a windy exterior makes
+        // torch/candle shadows dance harder. MW's wind vector is very noisy, so smooth it the same way
+        // DistantLand::update does (EWMA f=0.02) and ship the magnitude only (the flicker is isotropic).
+        // Exterior + weather-cell gated CLIENT-side (IsExterior is authoritative here), so an interior
+        // always ships 0 and the host needs no exterior gate of its own.
+        static float s_smoothWind[2] = {};
+        float windMag = 0.0f;
+        if (isExterior && mwb->CellHasWeather() && !mwb->IsMenu()) {
+            const float* wind = mwb->GetWindVector();
+            s_smoothWind[0] += 0.02f * (wind[0] - s_smoothWind[0]);
+            s_smoothWind[1] += 0.02f * (wind[1] - s_smoothWind[1]);
+            windMag = std::sqrt(s_smoothWind[0] * s_smoothWind[0] + s_smoothWind[1] * s_smoothWind[1]);
+        }
         const float lighting[32] = {
             sunVecEff.x,               sunVecEff.y,               sunVecEff.z,               0.0f,
             sunColEff.r,               sunColEff.g,               sunColEff.b,               0.0f,
             ambColEff.r,               ambColEff.g,               ambColEff.b,               0.0f,
             DistantLand::nearFogCol.r, DistantLand::nearFogCol.g, DistantLand::nearFogCol.b, 0.0f,
-            // [18] free pad; [19] = cell epoch (host lands it in fogParams.w, which no shader reads;
-            // the host shadow manager evicts all slots + caster records when this value changes).
-            DistantLand::fogNearStart, DistantLand::fogNearEnd,   0.0f,                      float(g_cellEpoch),
+            // [18] = smoothed wind magnitude (0 in interiors); [19] = cell epoch. Both land in
+            // fogParams.zw, which no shader reads — the host consumes them CPU-side (wind → flicker
+            // rate; epoch change → evict all shadow slots + caster records).
+            DistantLand::fogNearStart, DistantLand::fogNearEnd,   windMag,                   float(g_cellEpoch),
             // CAMERA-RELATIVE: WorldPos reaches the shader already relative to the eye, so the
             // eyePos used for the per-vertex fog distance |worldPos - eyePos| is the origin (0).
             0.0f,                      0.0f,                      0.0f,                      0.0f,

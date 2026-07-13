@@ -984,6 +984,8 @@ STRUCT(ShadowMaskParams)
 
 
 
+
+
     float4 biasParams;
 
 
@@ -995,7 +997,18 @@ STRUCT(ShadowMaskParams)
 
 
     uint4 slotBits;
-#line 51
+
+
+
+
+
+
+
+
+
+
+    float4 slotFlick[ 32 ];
+#line 64
 };
 
         CBUFFER(ShadowMaskParams) gShadowMaskParams :  register(b0,space2);
@@ -1175,11 +1188,15 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
 
 
 
+
             uint flickerBits = gShadowMaskParams.slotBits.z;
-            float wobAmp = gShadowMaskParams.biasParams.w;
+            float4 flick = gShadowMaskParams.slotFlick[s];
+            float wobAmp = gShadowMaskParams.biasParams.w * flick.x;
             if (wobAmp > 0.0f && ((flickerBits >> s) & 1u) != 0u)
             {
-                float a = gShadowMaskParams.biasParams.z;
+                float a = flick.y;
+
+
                 float seed = float(s) * 2.399963f;
 
 

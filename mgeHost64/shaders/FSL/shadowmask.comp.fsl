@@ -246,12 +246,16 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
             // class slots (slotBits.z). A rotation is a constant ANGULAR offset, so the shadow's world
             // displacement = angle*|d| — ~zero at the light (candle tip stays put) and grows toward the
             // attenuation edge, like real firelight. Applied BEFORE the face pick (face-coherent); the
-            // atlas is never re-baked, only re-aimed. Host: biasParams.z phase, biasParams.w amp (rad).
-            uint  flickerBits = gShadowMaskParams.slotBits.z;
-            float wobAmp      = gShadowMaskParams.biasParams.w;
+            // atlas is never re-baked, only re-aimed. Host: slotFlick[s].y phase, biasParams.w * slotFlick[s].x
+            // amp (rad) — both PER-SLOT, so a carried torch dances harder/faster than the sconce beside it.
+            uint   flickerBits = gShadowMaskParams.slotBits.z;
+            float4 flick       = gShadowMaskParams.slotFlick[s];
+            float  wobAmp      = gShadowMaskParams.biasParams.w * flick.x;   // base amp * this slot's gain
             if (wobAmp > 0.0f && ((flickerBits >> s) & 1u) != 0u)
             {
-                float a    = gShadowMaskParams.biasParams.z;      // time * speed (global)
+                float a    = flick.y;                             // this slot's INTEGRATED flame phase (rad):
+                                                                  // wall-clock driven (fps-independent) and
+                                                                  // sped up by motion + wind, host-side.
                 float seed = float(s) * 2.399963f;                // per-SLOT phase — camera-INVARIANT. (A
                                                                   // camera-relative position hash shakes the
                                                                   // wobble as the eye moves; the slot index

@@ -36,7 +36,9 @@ STRUCT(ShadowMaskParams)
     //             its surface along the depth-reconstructed normal, scaled by grazing angle — the
     //             sole grazing-acne mechanism now that the PSO slope-scaled term is zeroed. Face-on
     //             contact stays tight (offset → 0 there); grazing surfaces get the most.
-    //             z = UNUSED (was the dynamic-slot bitmask; moved to slotBits.y).
+    //             z = base-rate flame phase (diagnostic only — the wobble reads the PER-SLOT phase
+    //             in slotFlick.y, since each flame runs at its own motion/wind-boosted rate).
+    //             w = BASE flicker wobble amplitude in radians (0 = off), scaled per slot by slotFlick.x.
     DATA(float4,   biasParams,   None);
     // slotBits: the 32-bit slot masks as REAL uints (float lanes drop bits >= 24).
     //             x = ACTIVE-slot bitmask (bit s = slot s live).
@@ -48,6 +50,17 @@ STRUCT(ShadowMaskParams)
     //             w = LANTERN bitmask (light enclosed by its own cage → soft attenuation-fade).
     // Appended at the struct tail so every offset above stays fixed.
     DATA(uint4,    slotBits,     None);
+    // Per-slot flame state (flicker slots only — slotBits.z gates the read):
+    //   x = wobble AMPLITUDE GAIN. Multiplies biasParams.w. A CARRIED torch (an NPC walking with it) and
+    //       a WINDY exterior each raise it, but only slightly: amplitude is the axis that swings the lookup
+    //       direction far enough to expose atlas artifacts, so the host spends excitation on rate instead.
+    //   y = this slot's flame PHASE (radians). The host INTEGRATES it per slot at a motion/wind-boosted
+    //       rate (fPhase += dt*rate), so a carried torch in a gale dances faster than the sconce beside it,
+    //       the flame runs on wall-clock (identical at 60 and 165 fps), and a rate change never pops the
+    //       waveform the way scaling a shared clock would. Replaces the old global biasParams.z.
+    //   zw = spare.
+    // Appended at the struct tail so every offset above stays fixed (host writes it at float index 288).
+    DATA(float4,   slotFlick[MAX_SHADOW_SLOTS], None);
 };
 
 BEGIN_SRT(ShadowMaskSrtData)
