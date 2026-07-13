@@ -167,6 +167,15 @@ namespace {
     // parts as they leave view. ~2r of the largest shadow lights; bounded to a few NPCs indoors.
     constexpr float kShadowCasterRadius = 2048.0f;
 
+    // Live near-actor pose refresh (fixes the offscreen dyn-shadow drift). Offscreen movers
+    // were re-emitted from CACHED palettes, which the geometry cache only refreshes on the
+    // eviction sweep (~every 30 frames) — so a still-animating offscreen NPC's shadow baked a
+    // 30-frame-stale pose and SNAPPED every 30 frames (measured: skinnedΔ=0 for 29f, ~1.9u
+    // spike on the 30th). These movers are radius-gated (2048u) → near → ALIVE, so it is safe
+    // to ensureLive() them each frame (the freed-key hazard is far-only). ON = fresh pose every
+    // frame; OFF = the old 30-frame-stale re-emit (A/B).
+    bool g_shadowLiveNearActors = true;
+
     // --- P2 light identity tracking -------------------------------------------------------
     // Persistent per-light id across frames, keyed by the scene-graph snapshot's stable
     // NI::PointLight* (PointLight::source). Feeds the host shadow manager a real identity
@@ -1558,6 +1567,9 @@ namespace {
             s_visLookup.clear();
             if (foldKeys) { for (std::uint32_t k : *foldKeys) s_visLookup.insert(k); }
             else          { for (std::uint32_t k : keys)      s_visLookup.insert(k); }
+            // [drift-fix] near offscreen movers to pose-refresh after this loop (see below).
+            struct ReEmitCand { std::uint32_t key; std::uint8_t kind; };
+            static std::vector<ReEmitCand> s_reEmitRefresh;   s_reEmitRefresh.clear();
             const float r2 = kShadowCasterRadius * kShadowCasterRadius;
             const std::uint64_t cacheFrame = MGE::GeometryCache::currentFrame();
             std::uint32_t suppressSkips = 0;
@@ -1607,9 +1619,28 @@ namespace {
                 if (dx * dx + dy * dy + dz * dz > r2) continue;
                 auto ks = g_keySlot.find(kv.first);
                 if (ks == g_keySlot.end()) continue;       // never uploaded a host slot
-                if (e.isSkinned)    emitSkinnedDraw(ks->second, e, skinnedCount);
-                else if (isMM)      emitMultiMapDraw(ks->second, e, multiMapCount);
-                else                emitStaticDraw(ks->second, e, drawCount);
+                if (g_shadowLiveNearActors) {
+                    // Defer: these near movers get a live pose refresh AFTER the loop (ensureLive
+                    // must not mutate cacheMap while we iterate it). kind: 0 skinned, 1 MM, 2 rigid.
+                    s_reEmitRefresh.push_back({ kv.first, (std::uint8_t)(e.isSkinned ? 0 : isMM ? 1 : 2) });
+                } else {
+                    if (e.isSkinned)    emitSkinnedDraw(ks->second, e, skinnedCount);
+                    else if (isMM)      emitMultiMapDraw(ks->second, e, multiMapCount);
+                    else                emitStaticDraw(ks->second, e, drawCount);
+                }
+            }
+            // [drift-fix] Live near-actor pose refresh. Now OUTSIDE the cacheMap iteration, so
+            // ensureLive() may freely refresh/re-capture each entry. It rebuilds the bone palette
+            // from the CURRENT skeleton pose (skips VB/material unless the mesh revision changed),
+            // so the offscreen shadow tracks every frame instead of snapping on the 30-frame sweep.
+            for (const auto& rc : s_reEmitRefresh) {
+                const auto* fr = MGE::GeometryCache::ensureLive(rc.key);
+                if (!fr) continue;                          // key gone/out-of-domain → skip (no stale fallback)
+                auto ks = g_keySlot.find(rc.key);
+                if (ks == g_keySlot.end()) continue;
+                if      (rc.kind == 0) emitSkinnedDraw(ks->second, *fr, skinnedCount);
+                else if (rc.kind == 1) emitMultiMapDraw(ks->second, *fr, multiMapCount);
+                else                   emitStaticDraw(ks->second, *fr, drawCount);
             }
             // FP0 instrumentation: each skipped frame is a frame the body WOULD have
             // lingered pre-fix. A run ends when the re-emit condition stops matching
