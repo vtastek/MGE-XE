@@ -1,0 +1,79 @@
+// mgeHost64 — AT1 sorted-alpha NEAR-OPAQUE depth prepass (fragment stage).
+//
+// WHY THIS EXISTS. The alpha pass must not write depth: it is drawn back-to-front and depth-tested
+// against the opaque prepass, but a translucent surface that writes depth will DEPTH-KILL any
+// translucent surface drawn after it. That is exactly what happened to the flame inside a glass
+// lantern: the glass and the flame are concentric, so MW's per-object sort (bound-center view
+// depth) cannot reliably order them and the winner flips with the camera. Harmless in vanilla —
+// neither writes depth, so whichever loses just gets blended over. But the old "fold fix" gave the
+// glass a depth-WRITE colour PSO, so on the frames the glass sorted first it wrote depth and the
+// flame failed GEQUAL and vanished. A per-object sort CANNOT order concentric geometry; that is
+// why translucent passes do not write depth.
+//
+// The fold fix still needed something real, though: a self-overlapping SOLID cloth (a folded
+// banner, a draped altar cloth) must have its nearer layer hide the farther part of the same
+// surface, and without depth the winner is just index order (show-through + shimmer as the camera
+// moves). So we split the two cases by OPACITY, per pixel, instead of by mesh:
+//
+//   near-opaque pixel (a >= threshold) -> behaves like opaque geometry: writes depth here, so it
+//                                         self-occludes correctly and the fold is resolved.
+//   translucent pixel (a <  threshold) -> writes NOTHING: it cannot depth-kill anything drawn
+//                                         later, so the flame survives behind the glass at EVERY
+//                                         angle, no matter how the sort came out.
+//
+// The colour pass then draws every alpha item with depth WRITE OFF (contract restored). Glass is
+// translucent everywhere, so it contributes no depth at all; cloth is opaque in its body, so it
+// keeps its fold fix. Nothing here depends on guessing which MESH is "solid".
+//
+// Threshold is gFrameData.alphaParams.x (live knob "ALPHA: depth-write opacity"), NOT a constant:
+// a pane of glass at a = 0.9 must still not occlude, so this wants tuning against real content.
+//
+// Alpha is computed EXACTLY as alpha.frag computes its output alpha (a = albedo.a * vcolA *
+// matAlpha) — if the two ever drift, the prepass would write depth at pixels the colour pass draws
+// as see-through, which is the original bug wearing a different hat.
+//
+// PAIRING HAZARD: shares VSOutput with opaque.vert (like alpha.frag / depthonly.frag) and must ONLY
+// be paired with it — see [[project_forge_shared_frag_vsoutput]]; a mismatched vert hangs the GPU.
+// Convention (void PS_MAIN + clip + RETURN(), 0 render targets) = The Forge's own depth-pass pattern.
+
+#include "opaque.srt.h"
+#include "texsample.h.fsl"   // sampleBase() — MW address mode + AF level
+
+STRUCT(VSOutput)
+{
+    DATA(float4,      Position, SV_Position);
+    DATA(float3,      Normal,   NORMAL);
+    DATA(float2,      Uv,       TEXCOORD0);
+    DATA(FLAT(uint),  TexIndex, TEXCOORD1);
+    DATA(float,       Fog,      TEXCOORD2);
+    DATA(float4,      Color,    COLOR);
+    DATA(float,       AlphaRef, TEXCOORD3);
+    DATA(FLAT(float3),MatDiffuse, TEXCOORD4);
+    DATA(FLAT(float3),MatAmbient, TEXCOORD5);
+    DATA(FLAT(float3),MatEmissive,TEXCOORD6);
+    DATA(FLAT(uint),  VColSource, TEXCOORD7);
+    DATA(float3,      WorldPos,   TEXCOORD8);
+    DATA(FLAT(uint),  OverlayIndex,TEXCOORD9);
+    DATA(FLAT(uint),  ClampMode,  TEXCOORD10);// MW texture address mode (0..3) -> sampleBase()
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+void PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    float4 albedo = sampleBase(In.TexIndex, In.ClampMode, In.Uv, useLowAF(In.AlphaRef, true));
+
+    // The cutout test first, matching alpha.frag exactly (some blended shapes ALSO alpha-test).
+    // A discarded cutout texel is a hole — it must not write depth.
+    clip(albedo.a < In.AlphaRef ? -1.0f : 1.0f);
+
+    // Same output alpha alpha.frag blends with.
+    float vcolA    = (In.VColSource != 0u) ? In.Color.a : 1.0f;
+    float matAlpha = asfloat(In.OverlayIndex);
+    float outA     = albedo.a * vcolA * matAlpha;
+
+    // Only near-opaque pixels are allowed to occlude. matAlpha rides in here too, so a part fading
+    // out (matAlpha -> 0) stops writing depth on its own, with no host-side gate.
+    clip(outA < gFrameData.alphaParams.x ? -1.0f : 1.0f);
+    RETURN();
+}

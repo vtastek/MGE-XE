@@ -145,6 +145,18 @@ namespace MGE::GeometryCache {
         // (e.g. the "Glow in the Dark" detail map on set 2), matching PPL. Glow-mod
         // windows carry 3 UV sets: base(0), dark(1), detail(2).
         uint8_t baseUV, darkUV, detailUV, glowUV;
+        // Each map's NiTexturingProperty::Map::clampMode, RAW (0 CLAMP_S_CLAMP_T, 1 CLAMP_S_WRAP_T,
+        // 2 WRAP_S_CLAMP_T, 3 WRAP_S_WRAP_T). PER MAP, not per shape: a glow map can clamp while the
+        // base map wraps. The Forge host used to ignore this entirely and sampled everything through
+        // one anisotropic REPEAT sampler, so any mesh with UVs outside [0,1] that relied on CLAMP
+        // tiled instead of holding its edge texel (the texture "kept going" past the artist's edge —
+        // glaring on alpha-tested cutouts).
+        //
+        // These MUST default to 3 (WRAP_S_WRAP_T), and that is why they carry explicit initializers
+        // while every field around them does not: entries are created by `g_cache[key]`, which
+        // value-initializes, and a zeroed clampMode would read as CLAMP_S_CLAMP_T — the exact
+        // OPPOSITE of MW's default. A shape with no texturing property would clamp instead of wrap.
+        uint8_t baseClamp = 3, darkClamp = 3, detailClamp = 3, glowClamp = 3;
         // Non-skinned VB UV-set count + the derived stride/FVF. uvSetCount = the
         // highest UV set any present map uses + 1, bounded by the mesh's set count and
         // 4 (1 = ordinary single-UV geometry, the 99% case → stride 36). Every cache

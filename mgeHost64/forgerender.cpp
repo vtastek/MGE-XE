@@ -1276,13 +1276,27 @@ namespace {
         // double-sided geometry (NiStencilProperty DRAW_BOTH, which the cache does NOT capture) —
         // CULL_BACK killed panes/banners viewed from behind in-game. NONE also makes winding
         // irrelevant, so there are no mirror PSO variants. 2 PSOs: alpha-over / additive.
+        //
+        // NO alpha COLOUR PSO writes depth. A translucent surface that writes depth depth-kills any
+        // translucent surface drawn after it, and a per-object sort cannot order concentric geometry
+        // (the flame inside a glass lantern) — so the write is not merely redundant, it is fatal.
+        // The fold fix that needs depth lives in the near-opaque PREPASS below instead.
         Shader*        pAlphaShader = nullptr;
         Pipeline*      pAlphaPipeline = nullptr;           // SRCALPHA/INVSRCALPHA, cull NONE, depth no-write
-        Pipeline*      pAlphaPipelineWrite = nullptr;      // SRCALPHA/INVSRCALPHA, cull NONE, depth GEQUAL + WRITE (fold fix)
-        Pipeline*      pAlphaPipelineBack = nullptr;       // SRCALPHA/INVSRCALPHA, cull BACK (single-sided), depth WRITE
+        Pipeline*      pAlphaPipelineBack = nullptr;       // as above, cull BACK (single-sided, MW default)
         Pipeline*      pAlphaPipelineBackMirror = nullptr; // as Back, FRONT_FACE_CW (mirrored winding)
         Pipeline*      pAlphaPipelineAdd = nullptr;        // SRCALPHA/ONE additive, cull NONE
         Pipeline*      pAlphaPipelineDebug = nullptr;      // bring-up: alpha-over, depth OFF, cull NONE (panel toggle)
+        // AT1 near-opaque depth PREPASS (opaque.vert + alphadepth.frag, 0 RTs, GEQUAL + WRITE): runs
+        // before the alpha colour draws and writes depth ONLY where the pixel is near-opaque
+        // (a >= g_alphaDepthRef). Solid cloth self-occludes (fold fix intact); translucent pixels
+        // write nothing, so glass can never depth-kill the flame behind it. Cull variants mirror the
+        // colour PSOs so the depth matches the geometry actually drawn. Additive + captured draws get
+        // NO prepass at all (a glow/particle must never occlude). Gated by g_alphaDepthWrite.
+        Shader*        pAlphaDepthShader = nullptr;
+        Pipeline*      pAlphaPrepassPipeline = nullptr;        // cull NONE (two-sided)
+        Pipeline*      pAlphaPrepassPipelineBack = nullptr;    // cull BACK, FRONT_FACE_CCW
+        Pipeline*      pAlphaPrepassPipelineBackMirror = nullptr; // cull BACK, FRONT_FACE_CW
         Buffer*        pAlphaWorldsBuf = nullptr;          // gBatch: one 64KB world window (kMaxAlphaDraws x 64B)
         DescriptorSet* pPerBatchSetAlpha = nullptr;        // gBatch bound to pAlphaWorldsBuf, 1 instance
         Buffer*        pAlphaInstanceBuf = nullptr;        // per-draw instance VB (kStaticInstU32 slots), CPU-mapped
@@ -1852,15 +1866,22 @@ namespace {
     constexpr uint32_t kStaticInstU32 = 12;
 
     // Pack the per-draw instance .y: texIndex in the low 16 bits (slots < kMaxTextures=1024,
-    // so ≤10 bits), the alpha-test reference quantised to a byte in bits 16-23, and the
-    // vertex-colour routing (0/1/2) in bits 24-25. The vert shaders unpack: TexIndex = packed
-    // & 0xFFFF, AlphaRef = ((packed>>16)&0xFF)/255, VColSource = (packed>>24)&0x3. alphaRef 0 →
-    // frag's strict a<ref never discards (opaque-safe). See opaque.vert/skinned.vert/opaque.frag.
-    inline uint32_t packTexAlpha(uint32_t texIndex, float alphaRef, uint32_t vColSource = 0u) {
+    // so ≤10 bits), the alpha-test reference quantised to a byte in bits 16-23, the
+    // vertex-colour routing (0/1/2) in bits 24-25, and MW's texture ADDRESS MODE in bits 26-27.
+    // The vert shaders unpack: TexIndex = packed & 0xFFFF, AlphaRef = ((packed>>16)&0xFF)/255,
+    // VColSource = (packed>>24)&0x3, ClampMode = (packed>>26)&0x3. alphaRef 0 → frag's strict
+    // a<ref never discards (opaque-safe). See opaque.vert/skinned.vert/opaque.frag.
+    //
+    // clampMode is MW's raw NiTexturingProperty::Map::clampMode (0 CLAMP_S_CLAMP_T .. 3
+    // WRAP_S_WRAP_T) and it selects the sampler in the frag (opaque.srt.h::sampleBase). It
+    // defaults to 3 = WRAP = the old always-REPEAT behaviour, so a caller that forgets it keeps
+    // today's look rather than silently clamping the world.
+    inline uint32_t packTexAlpha(uint32_t texIndex, float alphaRef, uint32_t vColSource = 0u,
+                                 uint32_t clampMode = 3u) {
         const uint32_t tex = texIndex < kMaxTextures ? texIndex : 0u;
         float r = alphaRef < 0.0f ? 0.0f : (alphaRef > 1.0f ? 1.0f : alphaRef);
         const uint32_t aref = (uint32_t)(r * 255.0f + 0.5f) & 0xFFu;
-        return tex | (aref << 16) | ((vColSource & 0x3u) << 24);
+        return tex | (aref << 16) | ((vColSource & 0x3u) << 24) | ((clampMode & 0x3u) << 26);
     }
 
     // SK2: D3DBLEND_* (the SkyDrawWire blend factors, captured from NiAlphaProperty) — the host
@@ -3778,39 +3799,20 @@ namespace {
             ag.pBlendState = &alphaBlendAdd;
             addPipeline(R, &apd, &g_live.pAlphaPipelineAdd);
 
-            // Fold fix (panel "ALPHA: depth-write fold fix"): a self-overlapping alpha-over mesh
-            // (folded tapestry/banner) drawn CULL_NONE with NO depth write lets whichever layer is
-            // later in index order paint over the other, so the BACK face shows through the fold.
-            // A depth-WRITE alpha-over PSO makes the nearer layer win per-pixel (winding-independent):
-            // the far/back layer is either depth-rejected or fully covered. Used ONLY for CACHED
-            // solid-cloth draws — captured particles + additive keep the no-write PSOs so their
-            // translucent layers still ACCUMULATE (smoke density, additive glow). Inter-object
-            // layering is preserved by the back-to-front sort (far writes depth first, near blends
-            // over later). Depth is the last thing the frame writes here, so nothing downstream cares.
-            DepthStateDesc alphaDepthWrite = alphaDepth;
-            alphaDepthWrite.mDepthWrite = true;         // GEQUAL test + write (reverse-Z)
-            ag.pDepthState = &alphaDepthWrite;
-            ag.pBlendState = &alphaBlend;               // alpha-over
-            addPipeline(R, &apd, &g_live.pAlphaPipelineWrite);
-            ag.pDepthState = &alphaDepth;               // restore for the debug PSO below
-
             // Single-sided alpha (CULL_BACK): MW draws any alpha shape WITHOUT NiStencilProperty
             // DRAW_BOTH single-sided (backface-culled). Forcing CULL_NONE on a solid 3D alpha mesh
             // (a draped altar cloth) showed its back/interior faces through the front. These PSOs
             // draw only the front face, exactly like MW — so no interior show-through and no need for
-            // the two-sided normal flip. Depth WRITE (fold fix) still applies: a draped single-sided
-            // cloth self-overlaps front-over-front, and nearest-wins keeps it solid. Mirror variant
-            // flips the front face (negative-determinant winding), matching the opaque mirror PSO.
+            // the two-sided normal flip. Mirror variant flips the front face (negative-determinant
+            // winding), matching the opaque mirror PSO.
+            //
+            // Depth WRITE used to live on THESE PSOs (the fold fix). It is gone: a translucent
+            // surface must never write depth, or it depth-kills the translucent surfaces sorted
+            // after it (glass lantern vs the flame inside it). The fold fix moved to the near-opaque
+            // prepass below, which resolves self-overlap without ever letting glass occlude.
             RasterizerStateDesc alphaRasterBack = alphaRaster;
             alphaRasterBack.mCullMode = CULL_MODE_BACK;
             alphaRasterBack.mFrontFace = FRONT_FACE_CCW;
-            // Depth WRITE (GEQUAL): a solid 3D drape self-occludes — a nearer wrinkle must hide the
-            // farther part of the same surface behind it. Without the write those far front-facing
-            // layers paint through in draw order and the winner shifts with the camera (show-through
-            // + lighting shimmer). Nearest-wins fixes that. The only cost is a thin near-coplanar
-            // z-fight exactly where two layers press together, which reads in the normal-debug view
-            // but is hidden in colour (same fabric) — an acceptable trade vs. broken occlusion.
-            ag.pDepthState = &alphaDepthWrite;
             ag.pBlendState = &alphaBlend;               // alpha-over
             ag.pRasterizerState = &alphaRasterBack;
             addPipeline(R, &apd, &g_live.pAlphaPipelineBack);
@@ -3819,13 +3821,58 @@ namespace {
             ag.pRasterizerState = &alphaRasterBackMirror;
             addPipeline(R, &apd, &g_live.pAlphaPipelineBackMirror);
             ag.pRasterizerState = &alphaRaster;         // restore CULL_NONE
-            ag.pDepthState = &alphaDepth;
 
-            if (!g_live.pAlphaPipeline || !g_live.pAlphaPipelineAdd || !g_live.pAlphaPipelineWrite
+            if (!g_live.pAlphaPipeline || !g_live.pAlphaPipelineAdd
                 || !g_live.pAlphaPipelineBack || !g_live.pAlphaPipelineBackMirror) {
-                std::printf("[forge] addPipeline(alpha x5) FAILED\n");
+                std::printf("[forge] addPipeline(alpha x4) FAILED\n");
                 return false;
             }
+
+            // --- AT1 near-opaque depth prepass PSOs (opaque.vert + alphadepth.frag) --------------
+            // Depth-only (mRenderTargetCount = 0), GEQUAL + WRITE, same MSAA sample count and same
+            // cull variants as the colour PSOs above so the depth matches the geometry that will be
+            // drawn. alphadepth.frag discards every pixel below g_alphaDepthRef, so ONLY near-opaque
+            // pixels contribute depth: solid cloth self-occludes (fold fix), glass contributes none.
+            {
+                ShaderLoadDesc adDesc = {};
+                adDesc.mVert.pFileName = "opaque.vert";        // SAME vert as alpha.frag (VSOutput match)
+                adDesc.mFrag.pFileName = "alphadepth.frag";
+                addShader(R, &adDesc, &g_live.pAlphaDepthShader);
+                if (!g_live.pAlphaDepthShader) {
+                    std::printf("[forge] addShader(alphadepth) FAILED\n");
+                    return false;
+                }
+                DepthStateDesc apDepth = {};
+                apDepth.mDepthTest  = true;
+                apDepth.mDepthWrite = true;
+                apDepth.mDepthFunc  = CMP_GEQUAL;
+
+                PipelineDesc ppd = {};
+                ppd.mType = PIPELINE_TYPE_GRAPHICS;
+                GraphicsPipelineDesc& pg = ppd.mGraphicsDesc;
+                pg.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+                pg.mRenderTargetCount = 0;                     // depth only
+                pg.pColorFormats = nullptr;
+                pg.mSampleCount = (SampleCount)g_live.sampleCount;
+                pg.mSampleQuality = 0;
+                pg.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+                pg.pDepthState = &apDepth;
+                pg.pBlendState = nullptr;
+                pg.pVertexLayout = &vl;
+                pg.pShaderProgram = g_live.pAlphaDepthShader;
+                pg.pRasterizerState = &alphaRaster;            // CULL_NONE (two-sided)
+                addPipeline(R, &ppd, &g_live.pAlphaPrepassPipeline);
+                pg.pRasterizerState = &alphaRasterBack;        // CULL_BACK CCW (single-sided)
+                addPipeline(R, &ppd, &g_live.pAlphaPrepassPipelineBack);
+                pg.pRasterizerState = &alphaRasterBackMirror;  // CULL_BACK CW (mirrored)
+                addPipeline(R, &ppd, &g_live.pAlphaPrepassPipelineBackMirror);
+                if (!g_live.pAlphaPrepassPipeline || !g_live.pAlphaPrepassPipelineBack
+                    || !g_live.pAlphaPrepassPipelineBackMirror) {
+                    std::printf("[forge] addPipeline(alpha prepass x3) FAILED\n");
+                    return false;
+                }
+            }
+            ag.pDepthState = &alphaDepth;               // restore for the debug PSO below
 
             // Bring-up debug PSO (dev-panel "ALPHA: depth OFF"): alpha-over with depth test
             // disabled — draws every received alpha item unconditionally on top, isolating
@@ -4769,6 +4816,7 @@ namespace {
     unsigned  g_lastMultiMapDrawn = 0; // multi-map parts actually drawn in the last renderScene
     unsigned  g_lastSkyDrawn = 0;      // SK1 sky parts actually drawn in the last renderScene
     unsigned  g_lastAlphaDrawn = 0;    // AT1 sorted-alpha parts actually drawn in the last renderScene
+    unsigned  g_lastAlphaPrepassDrawn = 0;  // ...of which contributed to the near-opaque depth prepass
     unsigned  g_lastLightCount = 0;    // point lights uploaded in the last renderScene
     // Phase 0 panel readouts: extra per-frame counters + single-frame timings (the 300-frame
     // accumulators g_recAccum/g_gpuAccum are for the heartbeat; these are this frame's values).
@@ -4839,11 +4887,34 @@ namespace {
     // (Two-sided normal flip REMOVED — it diverged from FFE/PPL, which never flip, and caused a
     // grazing-angle normal artifact at fold seams. The alpha pass now honours each shape's real
     // NiStencilProperty cull mode instead: single-sided → CULL_BACK, DRAW_BOTH → CULL_NONE.)
-    // Fold fix (default ON): cached solid-cloth alpha-over draws write depth so a self-overlapping
-    // mesh (folded tapestry) resolves nearest-layer-wins instead of letting the back face show
-    // through the fold. Captured particles + additive always keep the no-write PSOs. Toggle off =
-    // the old CULL_NONE/no-write behaviour (the "back face shows through" A/B).
+    // Fold fix (default ON) — now a separate NEAR-OPAQUE DEPTH PREPASS over the alpha list, not a
+    // depth-write on the colour draw. A self-overlapping solid cloth (folded tapestry, draped altar
+    // cloth) still resolves nearest-layer-wins, because its near-opaque pixels write depth in the
+    // prepass; but the alpha COLOUR pass now never writes depth, so a translucent surface can no
+    // longer depth-kill a translucent surface that sorts after it.
+    //
+    // That kill was real and it was this toggle's fault: the old fold fix put mDepthWrite on the
+    // single-sided alpha COLOUR PSO, so a glass lantern pane wrote depth, and on the frames MW's
+    // per-object sort put the glass before the concentric flame inside it, the flame failed GEQUAL
+    // and disappeared. (Bound-center sorting cannot order concentric geometry — which is exactly
+    // why translucent passes must not write depth.) Fixed by splitting the two cases per PIXEL by
+    // opacity instead of per mesh: see alphadepth.frag.fsl.
+    //
+    // Also note this toggle used to be a LIE: the single-sided branch (MW's default, so most alpha
+    // draws) checked neither this flag nor isCaptured, so turning it off changed nothing for them.
+    // It now gates the prepass, i.e. every depth write the alpha list makes. Off = no alpha depth
+    // at all (the true "back face shows through the fold" A/B).
     bool g_alphaDepthWrite = true;
+    // Opacity at/above which an alpha pixel may write depth in that prepass (gFrameData.alphaParams.x).
+    // 1.0 = only fully-opaque pixels occlude. Lower it if a solid cloth stops self-occluding; raise
+    // it if a translucent surface still occludes something behind it. Live.
+    float g_alphaDepthRef = 0.95f;
+    // Perf: sample ALPHA-TESTED and ALPHA-BLENDED draws at 2x anisotropy instead of 8x
+    // (gFrameData.alphaParams.y; opaque geometry always keeps 8x). Those draws are the overdraw- and
+    // fetch-heavy part of the frame — foliage, grates, banners, glass — and they gain the least from
+    // high AF, so this is the cheapest AF to give back. Pure A/B: flip it and watch the cutouts at
+    // grazing angles. Default OFF = today's 8x everywhere (no silent quality change).
+    bool g_alphaLowAF = false;
     bool g_drawReflect   = true;
     bool g_drawReflectGeo = true;   // WV2: reflect host-owned land + statics (off = sky-only reflection)
     bool g_reflHorizonScissor = true; // WV2 perf: scissor the reflect pass to below the water-plane horizon
@@ -5507,7 +5578,11 @@ namespace {
         CheckboxWidget cAHl = {}; cAHl.pData = &g_alphaHighlight;
         uiAddComponentWidget(g_uiPanel, "ALPHA: caster classify colors", &cAHl, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cADW = {}; cADW.pData = &g_alphaDepthWrite;
-        uiAddComponentWidget(g_uiPanel, "ALPHA: depth-write fold fix", &cADW, WIDGET_TYPE_CHECKBOX);
+        uiAddComponentWidget(g_uiPanel, "ALPHA: fold fix (near-opaque depth prepass)", &cADW, WIDGET_TYPE_CHECKBOX);
+        SliderFloatWidget sADR = {}; sADR.pData = &g_alphaDepthRef; sADR.mMin = 0.5f; sADR.mMax = 1.0f; sADR.mStep = 0.01f;
+        uiAddComponentWidget(g_uiPanel, "ALPHA: depth-write opacity (higher = less occluding)", &sADR, WIDGET_TYPE_SLIDER_FLOAT);
+        CheckboxWidget cALA = {}; cALA.pData = &g_alphaLowAF;
+        uiAddComponentWidget(g_uiPanel, "ALPHA: 2x AF on alpha-test/blend draws (perf A/B)", &cALA, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cDLand = {}; cDLand.pData = &g_drawDLLand;
         uiAddComponentWidget(g_uiPanel, "Draw: distant land", &cDLand, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cDStat = {}; cDStat.pData = &g_drawDLStatics;
@@ -6050,6 +6125,12 @@ namespace ForgeRender {
             reinterpret_cast<uint32_t*>(dp)[72] = 0u;
             reinterpret_cast<uint32_t*>(dp)[73] = 0u;
             reinterpret_cast<uint32_t*>(dp)[74] = 0u;
+            // alphaParams.x (float index 76): opacity at/above which an alpha pixel may write depth
+            // in the AT1 near-opaque prepass. Only alphadepth.frag reads it.
+            // alphaParams.y (77): 1 = sample alpha-tested/alpha-blended draws at 2x AF (perf A/B).
+            dp[76] = g_alphaDepthRef;
+            dp[77] = g_alphaLowAF ? 1.0f : 0.0f;
+            dp[78] = 0.0f; dp[79] = 0.0f;
         }
 
         // Tier 3a: upload this frame's point lights into gLights. Each PointLightWire is exactly
@@ -6139,7 +6220,7 @@ namespace ForgeRender {
                                               : (em[1] > em[2] ? em[1] : em[2]);
             const bool emissiveHot = (items[i].vColSource != 1u) && emMax >= g_shadowEmissiveSkip;
             refreshCasterRecord(items[i].slot, items[i].world,
-                                packTexAlpha(items[i].texIndex, items[i].alphaRef, items[i].vColSource),
+                                packTexAlpha(items[i].texIndex, items[i].alphaRef, items[i].vColSource, items[i].clampMode),
                                 emissiveHot, /*alphaCaster=*/false,
                                 (items[i].casterFlags & IPC::kDrawCasterLive) != 0,
                                 (items[i].casterFlags & IPC::kDrawCasterAnimated) != 0);
@@ -7209,7 +7290,7 @@ namespace ForgeRender {
             // stays the identity DrawIndex set at creation. Tier 2b material rgb in slots [2..10]
             // (float). Unloaded/unknown slots fall back to 0 (white texture).
             uint32_t* inst = (uint32_t*)g_live.pInstanceBuf[batch]->pCpuMappedAddress;
-            const uint32_t texAlphaPacked = packTexAlpha(items[i].texIndex, items[i].alphaRef, items[i].vColSource);
+            const uint32_t texAlphaPacked = packTexAlpha(items[i].texIndex, items[i].alphaRef, items[i].vColSource, items[i].clampMode);
             inst[local * kStaticInstU32 + 1] = texAlphaPacked;
             // P1.5 shadows: the caster-record refresh for items[] moved to a pre-manager loop
             // (C4c) so shadow scheduling sees this frame's poses — see above the manager block.
@@ -7627,7 +7708,7 @@ namespace ForgeRender {
                     std::memcpy(dst + (size_t)base * 64, palette, (size_t)bones * 64);
                     uint32_t* sinst = (uint32_t*)g_live.pInstanceBufSkin->pCpuMappedAddress;
                     sinst[preDrawn * 2 + 0] = base;
-                    sinst[preDrawn * 2 + 1] = packTexAlpha(item.texIndex, item.alphaRef);
+                    sinst[preDrawn * 2 + 1] = packTexAlpha(item.texIndex, item.alphaRef, 0u, item.clampMode);
                     const int mirror = item.mirror ? 1 : 0;
                     if (mirror != boundSkinMirror) {
                         cmdBindPipeline(g_live.pCmd, mirror ? g_live.pSkinnedPrepassPipelineMirror : g_live.pSkinnedPrepassPipeline);
@@ -8695,7 +8776,7 @@ namespace ForgeRender {
 
                 uint32_t* sinst = (uint32_t*)g_live.pInstanceBufSkin->pCpuMappedAddress;
                 sinst[skinnedDrawn * 2 + 0] = base;
-                sinst[skinnedDrawn * 2 + 1] = packTexAlpha(item.texIndex, item.alphaRef);
+                sinst[skinnedDrawn * 2 + 1] = packTexAlpha(item.texIndex, item.alphaRef, 0u, item.clampMode);
 
                 const int mirror = item.mirror ? 1 : 0;
                 if (mirror != boundSkinMirror) {
@@ -9166,23 +9247,24 @@ namespace ForgeRender {
                 LOG::flush();
             }
 
-            // Re-bind the colour pass (LOAD/LOAD) — the water pass leaves the targets unbound.
-            BindRenderTargetsDesc abind = {};
-            abind.mRenderTargetCount = 1;
-            abind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };
-            abind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_LOAD };
-            cmdBindRenderTargets(g_live.pCmd, &abind);
-            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
-            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
-
-            // Bind a pipeline FIRST (establishes the shared default.rootsig for the descriptor
-            // binds); the loop switches between the 4 blend/winding PSOs per draw.
-            cmdBindPipeline(g_live.pCmd, g_live.pAlphaPipeline);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetAlpha);
-            Pipeline* curAlphaPipe = g_live.pAlphaPipeline;
+            // The list is RESOLVED first (validation, caster records, per-draw data, PSO picks) into
+            // a small command list, then REPLAYED twice: once as the near-opaque depth prepass, once
+            // as the colour pass. The prepass has to be recorded first — it writes the depth the
+            // colour draws test against — but both passes draw the same items with the same per-draw
+            // index into the same world/instance windows, so resolving once and replaying is what
+            // keeps them in lockstep. (Resolving twice would also fire refreshCasterRecord twice.)
+            struct AlphaCmd {
+                Buffer*   vb;
+                Buffer*   ib;
+                uint32_t  firstVertex;
+                uint32_t  firstIndex;
+                uint32_t  indexCount;
+                uint32_t  idx;
+                Pipeline* colorPipe;
+                Pipeline* depthPipe;   // null = contributes NO depth (additive / captured / toggle off)
+            };
+            static std::vector<AlphaCmd> s_alphaCmds;   // reused across frames (no per-frame alloc)
+            s_alphaCmds.clear();
 
             for (uint32_t k = 0; k < nAlpha; ++k) {
                 const IPC::AlphaDrawWire& it = alphaItems[k];
@@ -9256,7 +9338,7 @@ namespace ForgeRender {
                                                               : (em[1] > em[2] ? em[1] : em[2]);
                             const bool emissiveHot = (it.vColSource != 1u) && emMax >= g_shadowEmissiveSkip;
                             refreshCasterRecord(slot, it.world,
-                                                packTexAlpha(it.texIndex, refUse, it.vColSource),
+                                                packTexAlpha(it.texIndex, refUse, it.vColSource, it.clampMode),
                                                 emissiveHot, /*alphaCaster=*/true,
                                                 /*isLive=*/false, /*animated=*/false);   // C4d: alpha-origin records
                                                                      // (hammock/banner cutouts) stay
@@ -9281,12 +9363,11 @@ namespace ForgeRender {
                 }
                 // Cull-mode pick (honours MW's per-shape NiStencilProperty, shipped in it.cullFlags):
                 //  - additive: CULL_NONE (glow/particles, order-independent).
-                //  - two-sided (DRAW_BOTH) OR captured particles: CULL_NONE, with the depth-write
-                //    fold fix for cached solid double-sided cloth (toggle / not-captured, as before).
-                //  - single-sided (default MW cull): CULL_BACK (+ mirror winding), depth WRITE — draws
-                //    only the front face like MW, so a solid alpha mesh (draped altar cloth) no longer
-                //    shows its back/interior through the front. This is the real fix; the two-sided
-                //    normal flip never triggers here because there are no visible back faces.
+                //  - two-sided (DRAW_BOTH): CULL_NONE.
+                //  - single-sided (default MW cull): CULL_BACK (+ mirror winding) — draws only the
+                //    front face like MW, so a solid alpha mesh (draped altar cloth) no longer shows
+                //    its back/interior through the front.
+                // NONE of these write depth any more; the depth pick is separate, below.
                 const bool twoSided = (it.cullFlags & IPC::kAlphaCullTwoSided) != 0u;
                 const bool mirrored = (it.cullFlags & IPC::kAlphaCullMirrored) != 0u;
                 Pipeline* want;
@@ -9294,17 +9375,25 @@ namespace ForgeRender {
                     want = g_live.pAlphaPipelineAdd;
                 } else if (!twoSided) {
                     want = mirrored ? g_live.pAlphaPipelineBackMirror : g_live.pAlphaPipelineBack;
-                } else if (g_alphaDepthWrite && !isCaptured && g_live.pAlphaPipelineWrite) {
-                    want = g_live.pAlphaPipelineWrite;
                 } else {
                     want = g_live.pAlphaPipeline;
                 }
                 if (g_alphaDebugNoDepth && g_live.pAlphaPipelineDebug) {
                     want = g_live.pAlphaPipelineDebug;   // bring-up: depth off, alpha-over
                 }
-                if (want != curAlphaPipe) {
-                    cmdBindPipeline(g_live.pCmd, want);
-                    curAlphaPipe = want;
+
+                // Depth pick (the fold fix). A draw contributes depth ONLY if it can legitimately
+                // occlude: never additive (a glow is light, not a surface), never captured (smoke /
+                // flames / weather are translucent by nature), and never when the fold fix is off or
+                // the depth-off debug PSO is in play. Whether it ACTUALLY writes is then decided
+                // per-PIXEL by alphadepth.frag's g_alphaDepthRef test — so a glass pane in this list
+                // still contributes nothing, and a part fading out (matAlpha -> 0) stops on its own.
+                // Cull mode matches the colour PSO or the depth would not describe the same surface.
+                Pipeline* wantDepth = nullptr;
+                if (g_alphaDepthWrite && !g_alphaDebugNoDepth && !additive && !isCaptured) {
+                    wantDepth = twoSided ? g_live.pAlphaPrepassPipeline
+                                         : (mirrored ? g_live.pAlphaPrepassPipelineBackMirror
+                                                     : g_live.pAlphaPrepassPipelineBack);
                 }
 
                 uint8_t* dst = (uint8_t*)g_live.pAlphaWorldsBuf->pCpuMappedAddress;
@@ -9312,7 +9401,7 @@ namespace ForgeRender {
 
                 uint32_t* inst = (uint32_t*)g_live.pAlphaInstanceBuf->pCpuMappedAddress;
                 inst[idx * kStaticInstU32 + 0] = idx;   // DrawIndex → gBatch.worlds[idx]
-                inst[idx * kStaticInstU32 + 1] = packTexAlpha(it.texIndex, it.alphaRef, it.vColSource);
+                inst[idx * kStaticInstU32 + 1] = packTexAlpha(it.texIndex, it.alphaRef, it.vColSource, it.clampMode);
                 float* finst = (float*)inst;
                 // C3 debug: with the classify toggle on, matDiffuse carries the classification
                 // color instead (alpha.frag's bit3 branch returns In.MatDiffuse flat).
@@ -9329,12 +9418,76 @@ namespace ForgeRender {
                 // alpha.frag asfloat's it back — the terrain splat doesn't run in this frag).
                 finst[idx * kStaticInstU32 + 11] = it.matAlpha;
 
-                Buffer*  vbs[2]     = { meshVb, g_live.pAlphaInstanceBuf };
+                s_alphaCmds.push_back(AlphaCmd{ meshVb, meshIb, firstVertex, firstIndex,
+                                                drawIndexCount, idx, want, wantDepth });
+                ++alphaDrawn;
+            }
+
+            // --- (1) near-opaque depth prepass (0 RTs, depth GEQUAL + WRITE) ---------------------
+            // Writes depth only at near-opaque pixels of draws that may occlude, so a self-
+            // overlapping solid cloth resolves nearest-layer-wins in the colour pass below (which
+            // tests GEQUAL and writes nothing). Skipped entirely when the fold-fix toggle is off —
+            // that is the honest A/B now, and it really is the whole of the alpha list's depth.
+            uint32_t alphaPrepassDrawn = 0;
+            for (const AlphaCmd& c : s_alphaCmds) { if (c.depthPipe) { ++alphaPrepassDrawn; } }
+            if (alphaPrepassDrawn) {
+                BindRenderTargetsDesc pbind = {};
+                pbind.mRenderTargetCount = 0;
+                pbind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_LOAD };
+                cmdBindRenderTargets(g_live.pCmd, &pbind);
+                cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+                cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+
+                // Pipeline FIRST (establishes the shared default.rootsig), then the descriptor sets.
+                cmdBindPipeline(g_live.pCmd, g_live.pAlphaPrepassPipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetAlpha);
+                Pipeline* curPre = g_live.pAlphaPrepassPipeline;
+
+                for (const AlphaCmd& c : s_alphaCmds) {
+                    if (!c.depthPipe) { continue; }
+                    if (c.depthPipe != curPre) {
+                        cmdBindPipeline(g_live.pCmd, c.depthPipe);
+                        curPre = c.depthPipe;
+                    }
+                    Buffer*  vbs[2]     = { c.vb, g_live.pAlphaInstanceBuf };
+                    uint32_t strides[2] = { vStride, iStride };
+                    cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                    cmdBindIndexBuffer(g_live.pCmd, c.ib, INDEX_TYPE_UINT16, 0);
+                    cmdDrawIndexedInstanced(g_live.pCmd, c.indexCount, c.firstIndex, 1, c.firstVertex, c.idx);
+                }
+                cmdBindRenderTargets(g_live.pCmd, nullptr);
+            }
+            g_lastAlphaPrepassDrawn = alphaPrepassDrawn;
+
+            // --- (2) colour pass (LOAD/LOAD; depth GEQUAL test, NEVER write) --------------------
+            BindRenderTargetsDesc abind = {};
+            abind.mRenderTargetCount = 1;
+            abind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };
+            abind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_LOAD };
+            cmdBindRenderTargets(g_live.pCmd, &abind);
+            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+
+            cmdBindPipeline(g_live.pCmd, g_live.pAlphaPipeline);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetAlpha);
+            Pipeline* curAlphaPipe = g_live.pAlphaPipeline;
+
+            for (const AlphaCmd& c : s_alphaCmds) {
+                if (c.colorPipe != curAlphaPipe) {
+                    cmdBindPipeline(g_live.pCmd, c.colorPipe);
+                    curAlphaPipe = c.colorPipe;
+                }
+                Buffer*  vbs[2]     = { c.vb, g_live.pAlphaInstanceBuf };
                 uint32_t strides[2] = { vStride, iStride };
                 cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
-                cmdBindIndexBuffer(g_live.pCmd, meshIb, INDEX_TYPE_UINT16, 0);
-                cmdDrawIndexedInstanced(g_live.pCmd, drawIndexCount, firstIndex, 1, firstVertex, idx);
-                ++alphaDrawn;
+                cmdBindIndexBuffer(g_live.pCmd, c.ib, INDEX_TYPE_UINT16, 0);
+                cmdDrawIndexedInstanced(g_live.pCmd, c.indexCount, c.firstIndex, 1, c.firstVertex, c.idx);
             }
             cmdBindRenderTargets(g_live.pCmd, nullptr);
         }
@@ -9385,7 +9538,7 @@ namespace ForgeRender {
                     std::memcpy(wdst + (size_t)idx * 64, it.world, 64);
                     uint32_t* inst = (uint32_t*)g_live.pFPInstanceBuf->pCpuMappedAddress;
                     inst[idx * kStaticInstU32 + 0] = idx;   // DrawIndex → gBatch.worlds[idx]
-                    inst[idx * kStaticInstU32 + 1] = packTexAlpha(it.texIndex, it.alphaRef, it.vColSource);
+                    inst[idx * kStaticInstU32 + 1] = packTexAlpha(it.texIndex, it.alphaRef, it.vColSource, it.clampMode);
                     float* finst = (float*)inst;
                     finst[idx * kStaticInstU32 + 2]  = it.matDiffuse[0];
                     finst[idx * kStaticInstU32 + 3]  = it.matDiffuse[1];
@@ -9450,7 +9603,7 @@ namespace ForgeRender {
                     std::memcpy(bdst + (size_t)base * 64, palette, (size_t)bones * 64);
                     uint32_t* sinst = (uint32_t*)g_live.pFPInstanceBufSkin->pCpuMappedAddress;
                     sinst[fpSkinnedDrawn * 2 + 0] = base;
-                    sinst[fpSkinnedDrawn * 2 + 1] = packTexAlpha(item.texIndex, item.alphaRef);
+                    sinst[fpSkinnedDrawn * 2 + 1] = packTexAlpha(item.texIndex, item.alphaRef, 0u, item.clampMode);
 
                     const int mirror = item.mirror ? 1 : 0;
                     if (mirror != fpSkinMirror) {
@@ -9723,9 +9876,10 @@ namespace ForgeRender {
         g_lastPostMs  = hostNowMs() - (tRec1 + gpuMs);
         g_lastTotalMs = hostNowMs() - tEntry;
         if ((g_renderFrame % 300u) == 0u) {
-            LOG::logline(">> [forge-hb] frame=%u drawn=%u skinned=%u multimap=%u sky=%u alpha=%u dynamic=%u meshHigh=%u "
+            LOG::logline(">> [forge-hb] frame=%u drawn=%u skinned=%u multimap=%u sky=%u alpha=%u(zpre=%u) dynamic=%u meshHigh=%u "
                          "| record=%.2fms gpu=%.2fms (avg/frame over 300)",
-                         g_renderFrame, drawn, skinnedDrawn, multiMapDrawn, skyDrawn, alphaDrawn, g_dynamicCount, g_meshHigh,
+                         g_renderFrame, drawn, skinnedDrawn, multiMapDrawn, skyDrawn, alphaDrawn,
+                         g_lastAlphaPrepassDrawn, g_dynamicCount, g_meshHigh,
                          g_recAccum / 300.0, g_gpuAccum / 300.0);
             // Host-frame split (this frame's instantaneous values) so the ~2ms "unaccounted inside the
             // host" the client saw is localized: setup (per-draw memcpy) + cull (DL CPU cull + lazy
@@ -13886,12 +14040,15 @@ namespace ForgeRender {
         if (g_live.pCapAlphaVB)             { removeResource(g_live.pCapAlphaVB); }
         if (g_live.pCapAlphaIB)             { removeResource(g_live.pCapAlphaIB); }
         if (g_live.pAlphaPipeline)          { removePipeline(R, g_live.pAlphaPipeline); }
-        if (g_live.pAlphaPipelineWrite)     { removePipeline(R, g_live.pAlphaPipelineWrite); }
         if (g_live.pAlphaPipelineBack)      { removePipeline(R, g_live.pAlphaPipelineBack); }
         if (g_live.pAlphaPipelineBackMirror){ removePipeline(R, g_live.pAlphaPipelineBackMirror); }
         if (g_live.pAlphaPipelineAdd)       { removePipeline(R, g_live.pAlphaPipelineAdd); }
         if (g_live.pAlphaPipelineDebug)     { removePipeline(R, g_live.pAlphaPipelineDebug); }
         if (g_live.pAlphaShader)            { removeShader(R, g_live.pAlphaShader); }
+        if (g_live.pAlphaPrepassPipeline)   { removePipeline(R, g_live.pAlphaPrepassPipeline); }
+        if (g_live.pAlphaPrepassPipelineBack) { removePipeline(R, g_live.pAlphaPrepassPipelineBack); }
+        if (g_live.pAlphaPrepassPipelineBackMirror) { removePipeline(R, g_live.pAlphaPrepassPipelineBackMirror); }
+        if (g_live.pAlphaDepthShader)       { removeShader(R, g_live.pAlphaDepthShader); }
         // WT1 water teardown.
         if (g_live.pPerBatchSetWater)       { removeDescriptorSet(R, g_live.pPerBatchSetWater); }
         if (g_live.pWaterWorldsBuf)         { removeResource(g_live.pWaterWorldsBuf); }

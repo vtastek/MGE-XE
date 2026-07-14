@@ -1178,6 +1178,7 @@ namespace {
             item.overlayTexIndex = (e.isLandscape && e.d3dOverlay && e.overlayTextureName)
                 ? resolveCachedSlot(e.overlayTextureName, si.ovNamePtr, si.ovSlot, si.ovEpoch) : 0u;
             item.alphaRef = e.alphaTest ? e.alphaRef : 0.0f;     // alpha-test cutout (0 = no test)
+            item.clampMode = e.baseClamp;                        // MW's per-map texture address mode
             // Tier 2b material: ship the captured MaterialProperty colours + the vertex-colour
             // routing, replicating buildCacheReflectionState/buildCacheMainState EXACTLY. useVCol
             // = mesh has colours AND its VertexColorProperty says to use them (else real material
@@ -1244,6 +1245,7 @@ namespace {
             item.mirror   = e.mirrored ? 1u : 0u;
             item.texIndex = resolveCachedSlot(e.textureName, si.baseNamePtr, si.baseSlot, si.baseEpoch);
             item.alphaRef = e.alphaTest ? e.alphaRef : 0.0f;     // alpha-test cutout (0 = no test)
+            item.clampMode = e.baseClamp;                        // MW's per-map texture address mode
 
             const std::size_t paletteBytes = (std::size_t)e.numBones * 64;  // numBones * 16 floats
             const std::size_t at = dst.size();
@@ -1279,13 +1281,15 @@ namespace {
             // Build the ordered stage list, replicating buildCacheStages. A present map is usable
             // only if the wide VB carries the UV set it samples (uv < uvSetCount) — cacheMapActive.
             // Base is pushed unconditionally (e.d3dTexture); the others gated by cacheMapActive.
-            struct Stage { const char* name; std::uint8_t uv; std::uint32_t op; };
+            // clamp rides PER STAGE: each NiTexturingProperty::Map has its own address mode, so a
+            // glow map can clamp over a base map that wraps. It follows the map through the sort.
+            struct Stage { const char* name; std::uint8_t uv; std::uint32_t op; std::uint8_t clamp; };
             Stage st[4];
             int ns = 0;
-            st[ns++] = { e.textureName, e.baseUV, IPC::kMMOpBase };
-            if (e.d3dDark   && e.darkUV   < e.uvSetCount) st[ns++] = { e.darkTextureName,   e.darkUV,   IPC::kMMOpMod };
-            if (e.d3dDetail && e.detailUV < e.uvSetCount) st[ns++] = { e.detailTextureName, e.detailUV, IPC::kMMOpMod2X };
-            if (e.d3dGlow   && e.glowUV   < e.uvSetCount) st[ns++] = { e.glowTextureName,   e.glowUV,   IPC::kMMOpAdd };
+            st[ns++] = { e.textureName, e.baseUV, IPC::kMMOpBase, e.baseClamp };
+            if (e.d3dDark   && e.darkUV   < e.uvSetCount) st[ns++] = { e.darkTextureName,   e.darkUV,   IPC::kMMOpMod,   e.darkClamp };
+            if (e.d3dDetail && e.detailUV < e.uvSetCount) st[ns++] = { e.detailTextureName, e.detailUV, IPC::kMMOpMod2X, e.detailClamp };
+            if (e.d3dGlow   && e.glowUV   < e.uvSetCount) st[ns++] = { e.glowTextureName,   e.glowUV,   IPC::kMMOpAdd,   e.glowClamp };
             // Stable insertion sort by UV ascending (<=4 stages; keeps slot order on ties).
             for (int a = 1; a < ns; ++a) {
                 Stage tmp = st[a];
@@ -1309,7 +1313,7 @@ namespace {
             item.stageCount = (std::uint32_t)ns;
             for (int s = 0; s < ns; ++s) {
                 const std::uint32_t tex = resolveTextureSlot(st[s].name);   // bindless slot (0 = white)
-                item.stages[s] = IPC::packMMStage(tex, st[s].uv, st[s].op);
+                item.stages[s] = IPC::packMMStage(tex, st[s].uv, st[s].op, st[s].clamp);
             }
             const std::size_t at = g_multiMapScratch.size();
             g_multiMapScratch.resize(at + sizeof(item));
@@ -1331,6 +1335,7 @@ namespace {
             item.srcBlend  = e.srcBlend;
             item.destBlend = e.destBlend;
             item.alphaRef  = e.alphaTest ? e.alphaRef : 0.0f;
+            item.clampMode = e.baseClamp;            // MW's per-map texture address mode
             item.matDiffuse[0]  = e.matDiffuse[0];  item.matDiffuse[1]  = e.matDiffuse[1];  item.matDiffuse[2]  = e.matDiffuse[2];
             item.matAlpha       = e.matDiffuse[3];   // MaterialProperty::alpha (the FFE per-draw fade)
             item.matAmbient[0]  = e.matAmbient[0];  item.matAmbient[1]  = e.matAmbient[1];  item.matAmbient[2]  = e.matAmbient[2];
@@ -1381,6 +1386,14 @@ namespace {
             // Captured DIPs are billboarded particles (smoke/flames) — keep CULL_NONE (two-sided)
             // so they render exactly as today; culling a camera-facing quad by winding is fragile.
             item.cullFlags  = IPC::kAlphaCullTwoSided;
+            // SCOPE GAP (disclosed, not a silent default): captured DIPs are reconstructed from D3D8
+            // render state, not from the scene graph, and RenderedState does not carry the sampler
+            // address mode (the proxy translates D3DTSS_ADDRESSU->D3DSAMP_ADDRESSU but never records
+            // it). So we ship MW's default here. Harmless for what actually lands on this path —
+            // billboarded particle quads whose UVs live inside [0,1], where wrap and clamp are the
+            // same sample. If a captured DECAL ever shows the tiling artifact, the fix is to snapshot
+            // D3DSAMP_ADDRESSU/V into RenderedState at the reject gate and ship it here.
+            item.clampMode  = IPC::kTexWrapSWrapT;
             const std::size_t at = g_alphaScratch.size();
             g_alphaScratch.resize(at + sizeof(item));
             memcpy(g_alphaScratch.data() + at, &item, sizeof(item));

@@ -10,6 +10,7 @@
 // (pipeline binds mRenderTargetCount=0). Same void PS + clip + RETURN() depth-pass convention.
 
 #include "opaque.srt.h"
+#include "texsample.h.fsl"   // sampleBase() — MW address mode + AF level
 
 STRUCT(VSOutput)
 {
@@ -46,9 +47,12 @@ void PS_MAIN( VSOutput In )
         if (op == 0u) {
             uint   tex   = sw & 0xFFFFu;
             uint   uvSet = (sw >> 16u) & 0x3u;
+            uint   clampMode = (sw >> 20u) & 0x3u;   // per-stage address mode (see multimap.frag)
             float2 uv = (uvSet == 0u) ? In.Uv0 : (uvSet == 1u) ? In.Uv1
                       : (uvSet == 2u) ? In.Uv2 : In.Uv3;
-            baseA = SampleTex2D(gTextures[tex], gSamplerAnisotropic, uv).a;
+            // MUST match multimap.frag's base-stage sample exactly, or the prepass writes depth at
+            // different texels than the colour pass shades and CMP_EQUAL drops cutout edges.
+            baseA = sampleBase(tex, clampMode, uv, useLowAF(alphaRef, false)).a;
         }
     }
     clip(baseA < alphaRef ? -1.0f : 1.0f);

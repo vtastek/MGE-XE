@@ -9,6 +9,7 @@
 // opaque.frag — keep the two in LOCKSTEP so Tier 1/2b/3a stay identical across both paths.
 
 #include "opaque.srt.h"
+#include "texsample.h.fsl"   // sampleBase() — MW address mode + AF level
 
 STRUCT(VSOutput)
 {
@@ -128,9 +129,12 @@ float4 PS_MAIN( VSOutput In )
         uint tex   = sw & 0xFFFFu;
         uint uvSet = (sw >> 16u) & 0x3u;
         uint op    = (sw >> 18u) & 0x3u;
+        // Address mode is PER STAGE here (each NiTexturingProperty::Map carries its own — a glow map
+        // can clamp over a base map that wraps), so it rides the stage word, not a per-draw lane.
+        uint clampMode = (sw >> 20u) & 0x3u;
         float2 uv = (uvSet == 0u) ? In.Uv0 : (uvSet == 1u) ? In.Uv1
                   : (uvSet == 2u) ? In.Uv2 : In.Uv3;
-        float4 t = SampleTex2D(gTextures[tex], gSamplerAnisotropic, uv);
+        float4 t = sampleBase(tex, clampMode, uv, useLowAF(alphaRef, false));
         if (op == 0u)      { float3 b = t.rgb * albScale; c = b * lit; baseA = t.a; alb = b; } // BASE (MOD x DIFFUSE)
         else if (op == 1u) { c *= t.rgb;        alb *= t.rgb; }          // MOD
         else if (op == 2u) { c *= t.rgb * 2.0f; alb *= t.rgb * 2.0f; }   // MOD2X

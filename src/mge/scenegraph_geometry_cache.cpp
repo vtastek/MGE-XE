@@ -301,6 +301,9 @@ namespace MGE::GeometryCache {
                         e.textureName = st->fileName;
                         e.d3dTexture  = getDX9Texture(tex);
                         e.baseUV = baseMap->texCoordSet >= 3u ? 3u : static_cast<uint8_t>(baseMap->texCoordSet);
+                        // The map's address mode (CLAMP_S_CLAMP_T .. WRAP_S_WRAP_T), shipped raw to
+                        // the host — without it every draw sampled REPEAT and clamped meshes tiled.
+                        e.baseClamp = static_cast<uint8_t>(baseMap->clampMode) & 3u;
                         registerTextureName(tex);   // AT3 reverse-map populate (base map)
                     }
                 }
@@ -311,7 +314,7 @@ namespace MGE::GeometryCache {
                 // carried (e.g. the glow-mod detail map on set 2).
                 auto captureMap = [&](NI::TexturingProperty::Map* map,
                                       IDirect3DTexture9*& outTex, uint8_t& outUV,
-                                      const char*& outName) {
+                                      const char*& outName, uint8_t& outClamp) {
                     if (!map || !map->texture) return;
                     auto* mtex = map->texture.get();
                     if (!mtex->isInstanceOfType(NI::RTTIStaticPtr::NiSourceTexture)) return;
@@ -325,10 +328,13 @@ namespace MGE::GeometryCache {
                     // Store the map's TRUE UV set (clamped to 3 — FFE texcoordIndex is
                     // 2-bit / FVF carries <=4 sets). uploadEntry sizes the VB to cover it.
                     outUV  = map->texCoordSet >= 3u ? 3u : static_cast<uint8_t>(map->texCoordSet);
+                    // Per-map address mode — each stage carries its OWN (a glow map can clamp over a
+                    // wrapping base), so this cannot be hoisted to one value per shape.
+                    outClamp = static_cast<uint8_t>(map->clampMode) & 3u;
                 };
-                captureMap(ps->texture->getDarkMap(),   e.d3dDark,   e.darkUV,   e.darkTextureName);
-                captureMap(ps->texture->getDetailMap(), e.d3dDetail, e.detailUV, e.detailTextureName);
-                captureMap(ps->texture->getGlowMap(),   e.d3dGlow,   e.glowUV,   e.glowTextureName);
+                captureMap(ps->texture->getDarkMap(),   e.d3dDark,   e.darkUV,   e.darkTextureName,   e.darkClamp);
+                captureMap(ps->texture->getDetailMap(), e.d3dDetail, e.detailUV, e.detailTextureName, e.detailClamp);
+                captureMap(ps->texture->getGlowMap(),   e.d3dGlow,   e.glowUV,   e.glowTextureName,   e.glowClamp);
 
                 // Terrain decal overlay: maps[6] = DECAL_1 (the second land texture
                 // for splat blending). Present on multi-texture terrain patches.

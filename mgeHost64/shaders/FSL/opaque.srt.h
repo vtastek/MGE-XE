@@ -76,6 +76,10 @@ STRUCT(FrameData)
     // float lanes drop bits >= 24). x = ACTIVE-slot mask (static atlas view), y = DYNAMIC-slot mask
     // (dynamic atlas view). Only shadowatlasview.frag reads these; 0 elsewhere = every tile dim. 304B.
     DATA(float4, atlasDbg, None);
+    // AT1 near-opaque alpha depth prepass. x = the opacity at or above which an alpha pixel is
+    // allowed to WRITE DEPTH (live knob "ALPHA: depth-write opacity"). Only alphadepth.frag reads
+    // it; the alpha COLOUR pass never writes depth at all. 320B < 512B. See alphadepth.frag.fsl.
+    DATA(float4, alphaParams, None);
 };
 
 STRUCT(BatchData)

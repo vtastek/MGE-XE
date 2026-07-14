@@ -35,6 +35,7 @@ STRUCT(VSOutput)
     DATA(FLAT(uint),  VColSource, TEXCOORD7); // 0 none, 1 emissive, 2 diffamb
     DATA(float3,      WorldPos,   TEXCOORD8); // Tier 3a: world position for point-light eval
     DATA(FLAT(uint),  OverlayIndex,TEXCOORD9);// terrain DECAL_1 bindless slot (0 = no decal)
+    DATA(FLAT(uint),  ClampMode,  TEXCOORD10);// MW texture address mode (0..3) -> sampleBase()
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -56,6 +57,9 @@ VSOutput VS_MAIN( VSInput In )
     Out.TexIndex = In.TexAlpha & 0xFFFFu;
     Out.AlphaRef = float((In.TexAlpha >> 16u) & 0xFFu) * (1.0f / 255.0f);
     Out.VColSource = (In.TexAlpha >> 24u) & 0x3u;
+    // MW texture address mode (NiTexturingProperty::Map::clampMode). 3 = WRAP_S_WRAP_T = MW's
+    // default; before this the host sampled everything REPEAT and clamped meshes tiled.
+    Out.ClampMode  = (In.TexAlpha >> 26u) & 0x3u;
     Out.Color = In.Color;
     Out.MatDiffuse  = In.MatDiffuse;
     Out.MatAmbient  = In.MatAmbient;

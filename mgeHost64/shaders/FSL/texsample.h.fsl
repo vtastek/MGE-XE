@@ -1,0 +1,54 @@
+// mgeHost64 — texture sampling helpers (FSL ONLY).
+//
+// These live here and NOT in opaque.srt.h because the HOST C++ also includes that header (it needs
+// the SRT descriptor indices, with defaults.h supplying C++ versions of the STRUCT/DATA/BEGIN_SRT
+// macros). A raw HLSL function in an .srt.h therefore breaks the C++ build. Same discipline as
+// hizocclusion.h.fsl: shader-only code goes in a .h.fsl that C++ never sees.
+//
+// Include AFTER opaque.srt.h — needs gTextures, the static samplers, and gFrameData in scope.
+
+// --- Per-mesh texture address mode (MW NiTexturingProperty::Map::clampMode) -----------------------
+// MW authors meshes with a per-map address mode and the Forge path used to ignore it completely:
+// EVERY draw sampled through gSamplerAnisotropic, which is anisotropic 8x REPEAT. Any mesh whose UVs
+// run outside [0,1] and relies on CLAMP therefore TILED instead of holding its edge texel — the
+// texture "kept going" past where the artist ended it (glaring on an alpha-tested cutout, which grew
+// extra geometry out of the repeat). These four modes are MW's four, in MW's order, so the wire can
+// ship the raw enum with no translation:
+//   0 CLAMP_S_CLAMP_T   1 CLAMP_S_WRAP_T   2 WRAP_S_CLAMP_T   3 WRAP_S_WRAP_T (default)
+// S = U, T = V. The clamp samplers are an MGE addition to the vendored The-Forge defaults.h — stock
+// ships anisotropic in REPEAT only, so honouring clamp with matched filtering needed new statics.
+//
+// The branch is uniform across a draw (it comes from a FLAT per-draw lane), so it costs nothing.
+// Decode lives HERE, once: a per-shader copy is how the wrap sampler survived in seven frags.
+#define TEX_CLAMP_S_CLAMP_T 0u
+#define TEX_CLAMP_S_WRAP_T  1u
+#define TEX_WRAP_S_CLAMP_T  2u
+#define TEX_WRAP_S_WRAP_T   3u
+
+// lowAF: sample this draw at 2x anisotropy instead of 8x. The host sets it for ALPHA-TEST and
+// ALPHA-BLENDED draws only (gFrameData.alphaParams.y, live A/B toggle) — those are the overdraw-
+// and fetch-heavy part of the frame (foliage, grates, banners, glass) and they gain the least from
+// high AF, so it is the cheapest AF to give back. Opaque geometry always keeps 8x. Both the address
+// mode and the AF level are uniform per draw, so this whole chain is a uniform branch: free.
+float4 sampleBase(uint texIdx, uint clampMode, float2 uv, bool lowAF)
+{
+    if (lowAF)
+    {
+        if (clampMode == TEX_CLAMP_S_CLAMP_T) { return SampleTex2D(gTextures[texIdx], gSampler2xClampClamp, uv); }
+        if (clampMode == TEX_CLAMP_S_WRAP_T)  { return SampleTex2D(gTextures[texIdx], gSampler2xClampWrap,  uv); }
+        if (clampMode == TEX_WRAP_S_CLAMP_T)  { return SampleTex2D(gTextures[texIdx], gSampler2xWrapClamp,  uv); }
+        return SampleTex2D(gTextures[texIdx], gSampler2xWrapWrap, uv);
+    }
+    if (clampMode == TEX_CLAMP_S_CLAMP_T) { return SampleTex2D(gTextures[texIdx], gSamplerAnisoClampClamp, uv); }
+    if (clampMode == TEX_CLAMP_S_WRAP_T)  { return SampleTex2D(gTextures[texIdx], gSamplerAnisoClampWrap,  uv); }
+    if (clampMode == TEX_WRAP_S_CLAMP_T)  { return SampleTex2D(gTextures[texIdx], gSamplerAnisoWrapClamp,  uv); }
+    return SampleTex2D(gTextures[texIdx], gSamplerAnisotropic, uv);   // WRAP_S_WRAP_T — MW's default
+}
+
+// alphaParams.y = 1 when the host's "alpha draws at 2x AF" toggle is on. A draw qualifies if it is
+// alpha-TESTED (alphaRef > 0 — cutout foliage/grates in the opaque + prepass + shadow paths) or it
+// is in the alpha-BLENDED pass (which passes alphaBlended = true unconditionally).
+bool useLowAF(float alphaRef, bool alphaBlended)
+{
+    return (gFrameData.alphaParams.y > 0.5f) && (alphaBlended || (alphaRef > 0.0f));
+}
