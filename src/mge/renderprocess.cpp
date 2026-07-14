@@ -2592,7 +2592,16 @@ namespace RenderProcess {
         // controller drives it in weather-flying interiors too) and, in weatherless
         // interiors, the cell record's ambient (what MW feeds D3DRS_AMBIENT; the sun light's
         // own ambient rides along live and is ~0 there — same split OpenMW uses).
-        if (!isExterior) {
+        // EXTERIORS TOO (2026-07-14): the capture starves in exteriors as well, whenever MW draws no
+        // lit geometry. Start the game high in the sky, outside MW's own draw range, and it programs
+        // no light state at all — so sun/ambient stay FROZEN at whatever was last captured, then snap
+        // the moment you drop back into range and MW re-sends light 6 ("doesn't update in the sky,
+        // updates instantly when I move close"). The premise above — that exteriors churn constantly —
+        // holds only while MW is actually drawing something. sgSunlight is what MW programs light 6
+        // FROM and the weather controller animates it every frame regardless of what's on screen, so
+        // read it live in BOTH cases. Only the STALE sunVec/sunCol/sunAmb are replaced; the exterior
+        // ambient composition (sun ambient + the D3DRS_AMBIENT global) is preserved as-is.
+        {
             float sdir[3], sdif[3], samb[3], sdim = 1.0f;
             if (MWBridge::get()->getSceneSunlight(sdir, sdif, samb, &sdim)) {
                 D3DXVECTOR3 sd(sdir[0], sdir[1], sdir[2]);
@@ -2602,11 +2611,12 @@ namespace RenderProcess {
                 const RGBVECTOR liveSunAmb(samb[0] * sdim, samb[1] * sdim, samb[2] * sdim);
                 sunColEff = DistantLand::lightSunMult * liveSun;
                 // sgSunlight.ambient ALREADY carries the cell ambient in interiors (in-game
-                // verified: it equals the cell record's ambientColor byte-for-byte) — same
-                // convention as exteriors, where the ambient fill rides in the sun light and
-                // the D3DRS_AMBIENT global is ~0. So the live light's ambient is the whole
-                // ambient term; adding the cell record on top would double it.
-                ambColEff = DistantLand::lightAmbMult * liveSunAmb;
+                // verified: it equals the cell record's ambientColor byte-for-byte), so there it IS
+                // the whole ambient term and adding the cell record on top would double it. Exteriors
+                // keep their existing composition (sun ambient + the D3DRS_AMBIENT global ambCol) —
+                // same formula as the captured path, just with a live sun ambient.
+                ambColEff = isExterior ? (DistantLand::lightAmbMult * (liveSunAmb + DistantLand::ambCol))
+                                       : (DistantLand::lightAmbMult * liveSunAmb);
                 // Periodic live-vs-captured compare (mapping oracle): after movement/weapon
                 // churn refreshes the captures, fresh captured ambCol tells whether interior
                 // D3DRS_AMBIENT really is ~0 (assumed above). cellAmb logged for reference.
@@ -2616,11 +2626,12 @@ namespace RenderProcess {
                 if (epochEdge || (s_lightLogN++ % 900 == 0)) {
                     s_lightLogEpoch = g_cellEpoch;
                     const BYTE* ca = MWBridge::get()->CellHasWeather() ? nullptr : MWBridge::get()->getInteriorAmb();
-                    LOG::logline(">> [light] interior live: sun=(%.3f %.3f %.3f) sunAmb=(%.3f %.3f %.3f) cellAmb=(%.3f %.3f %.3f) dir=(%.2f %.2f %.2f) dim=%.2f",
+                    LOG::logline(">> [light] %s live: sun=(%.3f %.3f %.3f) sunAmb=(%.3f %.3f %.3f) cellAmb=(%.3f %.3f %.3f) dir=(%.2f %.2f %.2f) dim=%.2f",
+                                 isExterior ? "exterior" : "interior",
                                  liveSun.r, liveSun.g, liveSun.b, liveSunAmb.r, liveSunAmb.g, liveSunAmb.b,
                                  ca ? ca[0] / 255.0f : -1.0f, ca ? ca[1] / 255.0f : -1.0f, ca ? ca[2] / 255.0f : -1.0f,
                                  sd.x, sd.y, sd.z, sdim);
-                    LOG::logline(">> [light] interior captured: sun=(%.3f %.3f %.3f) sunAmb=(%.3f %.3f %.3f) ambCol=(%.3f %.3f %.3f) dir=(%.2f %.2f %.2f)",
+                    LOG::logline(">> [light] captured (stale if MW drew nothing lit): sun=(%.3f %.3f %.3f) sunAmb=(%.3f %.3f %.3f) ambCol=(%.3f %.3f %.3f) dir=(%.2f %.2f %.2f)",
                                  DistantLand::sunCol.r, DistantLand::sunCol.g, DistantLand::sunCol.b,
                                  DistantLand::sunAmb.r, DistantLand::sunAmb.g, DistantLand::sunAmb.b,
                                  DistantLand::ambCol.r, DistantLand::ambCol.g, DistantLand::ambCol.b,
