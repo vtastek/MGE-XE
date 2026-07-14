@@ -4926,14 +4926,32 @@ namespace {
                                         // grazing angle (PSO slope bias is 0). Tuned to 1.0; raise to kill any
                                         // residual grazing acne, lower to tighten contacts.
     float g_shadowRangeK     = 1.1f;    // SHADOW TEST RANGE in light radii (live via maskParams.x). The mask
-                                        // tests (and dynHit catches movers) out to rangeK*r; the attenuation
-                                        // ramp is ~0.5 at 1.5r so a fade band in the shader hides the cut.
-                                        // 1.1 default: user-verified clean cut point — the fade band's smooth
-                                        // gradient bands badly under the 4-bit mask nibble (16 levels), and at
-                                        // 1.1 attenuation (~0.85 of ramp remaining) hides the boundary anyway.
-                                        // Covered area scales with rangeK^2 — the main mask-cost knob in
-                                        // light-dense interiors. 2.0 = old behaviour (test to atlas far
-                                        // plane); refZ mapping stays farZ=2r regardless.
+                                        // tests, the caster gather, dynHit and the bake far plane all reach
+                                        // exactly rangeK*r. Mask cost scales with the covered area (~rangeK²),
+                                        // so this is the perf dial.
+                                        //
+                                        // THE LIGHT IS SLAVED TO IT. See g_lightReachFrac: the point light's
+                                        // attenuation is driven to zero at lightReachFrac*rangeK*r, i.e. it
+                                        // dies STRICTLY INSIDE the shadow-tested region. So raising this makes
+                                        // lights reach further AND cost more, together; lowering it makes them
+                                        // shorter and cheaper, together. A leak is impossible at any setting —
+                                        // that is the whole point of tying the two.
+                                        //
+                                        // History (do not undo): this was the leak. The light used to reach a
+                                        // hardcoded 2r while the mask tested only 1.1r, so the shell from 1.1r
+                                        // to 2r received light that was never shadow-tested — a bright light
+                                        // behind a door leaked around its far edge, structurally. A fade band
+                                        // in the mask "hid" it only by dissolving the shadow while the light
+                                        // was still ~60-70% bright (that is where the residual shadow opacity
+                                        // came from). Both are gone: the light now ends before the test does.
+    float g_lightReachFrac   = 0.9f;    // Point-light reach as a FRACTION of the shadow test range (live via
+                                        // lightParams.y = rangeK*frac; read by opaque/alpha/multimap .frag).
+                                        // The light's attenuation ramps to exactly zero at frac*rangeK*r, so
+                                        // the 10% margin is dead-dark shell in which the mask's own boundary —
+                                        // its hard cut, its cube-face seams, any edge ugliness — sits in light
+                                        // that has already reached zero and therefore cannot be seen. This is
+                                        // what buys us 100%-opaque shadows with NO fade anywhere.
+                                        // Clamped to <=1 on upload: the light must never outrun the test.
     float g_shadowVertWeight = 1.0f;    // VERTICAL importance weighting for slot ranking. The importance
                                         // metric weights the light's vertical offset from the eye (world Z,
                                         // camera-relative) by this factor before ranking. >1 demotes lights on
@@ -5384,7 +5402,9 @@ namespace {
         SliderFloatWidget sShNo = {}; sShNo.pData = &g_shadowNormalOffset; sShNo.mMin = 0.0f; sShNo.mMax = 8.0f; sShNo.mStep = 0.25f;
         uiAddComponentWidget(g_uiPanel, "Shadow normal offset (kills grazing acne)", &sShNo, WIDGET_TYPE_SLIDER_FLOAT);
         SliderFloatWidget sShRk = {}; sShRk.pData = &g_shadowRangeK; sShRk.mMin = 0.5f; sShRk.mMax = 2.0f; sShRk.mStep = 0.05f;
-        uiAddComponentWidget(g_uiPanel, "Shadow test range (radii; 2.0 = full)", &sShRk, WIDGET_TYPE_SLIDER_FLOAT);
+        uiAddComponentWidget(g_uiPanel, "Shadow test range (radii) — light reach rides on this", &sShRk, WIDGET_TYPE_SLIDER_FLOAT);
+        SliderFloatWidget sLrf = {}; sLrf.pData = &g_lightReachFrac; sLrf.mMin = 0.4f; sLrf.mMax = 1.0f; sLrf.mStep = 0.02f;
+        uiAddComponentWidget(g_uiPanel, "Light reach (fraction of test range; <1 hides the edge)", &sLrf, WIDGET_TYPE_SLIDER_FLOAT);
         static const char* const kCasterCullNames[] = { "0 back (light faces)", "1 none (two-sided)", "2 front (back faces)" };
         DropdownWidget ddCc = {}; ddCc.pData = &g_shadowCasterCull; ddCc.pNames = kCasterCullNames; ddCc.mCount = 3;
         uiAddComponentWidget(g_uiPanel, "Shadow caster cull", &ddCc, WIDGET_TYPE_DROPDOWN);
@@ -6042,8 +6062,12 @@ namespace ForgeRender {
             const uint32_t haveLights = lightBytes / (uint32_t)sizeof(IPC::PointLightWire);
             if (nL > haveLights) { nL = haveLights; }
             uint8_t* lc = (uint8_t*)g_live.pLightCbv->pCpuMappedAddress;
-            ((float*)lc)[0] = (float)nL;   // lightParams.x = count (.yzw already 0)
-            ((float*)lc)[1] = 0.0f; ((float*)lc)[2] = 0.0f; ((float*)lc)[3] = 0.0f;
+            ((float*)lc)[0] = (float)nL;   // lightParams.x = count
+            // lightParams.y = point-light reach in RADII. The frag drives attenuation to zero
+            // here. Slaved to the shadow test range and clamped strictly inside it, so the lit
+            // region is always a subset of the shadow-tested region — see g_shadowRangeK.
+            ((float*)lc)[1] = g_shadowRangeK * std::min(std::max(g_lightReachFrac, 0.05f), 1.0f);
+            ((float*)lc)[2] = 0.0f; ((float*)lc)[3] = 0.0f;
             if (nL && lightBlob) {
                 std::memcpy(lc + 16, lightBlob, (size_t)nL * sizeof(IPC::PointLightWire));
             }
@@ -8871,8 +8895,11 @@ namespace ForgeRender {
                     } else {
                         debugIdColor(sl.lightId, cr, cg, cb);
                     }
-                    emitCage(cx, cy, cz, g_shadowRangeK * sl.radius, cr, cg, cb);         // inner: test range
-                    emitCage(cx, cy, cz, 2.0f * sl.radius, cr * 0.4f, cg * 0.4f, cb * 0.4f); // outer: 2r fade edge
+                    // OUTER = shadow test range, INNER = where the light dies. The inner sphere
+                    // must always sit inside the outer one — that gap IS the no-leak margin.
+                    emitCage(cx, cy, cz, g_shadowRangeK * sl.radius, cr * 0.4f, cg * 0.4f, cb * 0.4f);
+                    const float lreach = g_shadowRangeK * std::min(std::max(g_lightReachFrac, 0.05f), 1.0f);
+                    emitCage(cx, cy, cz, lreach * sl.radius, cr, cg, cb);
                 }
             }
 

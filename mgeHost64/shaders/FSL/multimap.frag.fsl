@@ -60,22 +60,24 @@ float4 PS_MAIN( VSOutput In )
     a *= gFrameData.dbgScales.x;   // dev panel: ambient intensity modifier (lockstep w/ opaque.frag)
     {
         uint nLights = (uint)gLights.lightParams.x;
+        float reachK = gLights.lightParams.y;   // host-slaved light reach — see opaque.srt.h
         for (uint i = 0; i < nLights; ++i)
         {
             float4 posR    = gLights.lights[i * 3u + 0u];
             float3 lightCol= gLights.lights[i * 3u + 1u].rgb;
             float3 fo      = gLights.lights[i * 3u + 2u].xyz;
             float  radius  = posR.w;
+            float  reach   = radius * reachK;
 
             float3 toLight = posR.xyz - In.WorldPos;
             float  dist2   = dot(toLight, toLight);
-            // EXACT early-out at the smoothstep cutoff (att = 0 beyond 2r) — see opaque.frag.
-            if (dist2 >= 4.0f * radius * radius) { continue; }
+            // EXACT early-out at the tail cutoff (att = 0 beyond reach) — see opaque.frag.
+            if (dist2 >= reach * reach) { continue; }
             float  invDist = rsqrt(max(dist2, 1e-8f));
             float  dist    = dist2 * invDist;
 
             float  att = 1.0f / max(fo.z * dist2 + fo.y * dist + fo.x, 1e-4f);
-            att *= 1.0f - smoothstep(radius, 2.0f * radius, dist);
+            att *= 1.0f - smoothstep(POINT_LIGHT_TAIL * reach, reach, dist);
 
             // P1 point-light shadows (lockstep with opaque.frag): the host patches
             // falloff.w = shadow slot + 1 (0 = no shadow). shadowmask.comp already did the

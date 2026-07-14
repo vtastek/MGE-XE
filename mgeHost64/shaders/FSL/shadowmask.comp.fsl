@@ -435,15 +435,23 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
                     vis = (gridMix >= 1.0f) ? g
                                             : lerp(shadowBilinear(ap, tmin, tmax, thresh, dynSlot), g, gridMix);
                 }
-                // Fade band: shadow → lit over the last 15% of the test range, so the hard
-                // range cut above never shows as a lit/shadowed seam (below rangeK=2.0 the
-                // attenuation ramp is still non-zero at the cut). At rangeK=2.0 the band sits
-                // where attenuation reaches exactly 0 — visually the old output.
-                // (The old LANTERN attenuation-dissolve + opacity floor lived here: it faked softness
-                // by melting the shadow across the light's reach and never letting it reach black.
-                // Removed — it leaked light through occluders and banded, and the low-res lantern tile
-                // now produces REAL softness in the atlas instead of faking it in the fade.)
-                vis = lerp(vis, 1.0f, smoothstep(0.85f * range, range, ma));
+                // NO distance fade. Shadows are 100% opaque all the way out to the edge of the test
+                // range, and that is sound because THE LIGHT DIES FIRST: the host drives point-light
+                // attenuation to exactly zero at lightReachFrac*rangeK*r (frac = 0.9), strictly inside
+                // the rangeK*r we test here. So the lit region is a strict subset of the shadow-tested
+                // region — a leak is impossible by construction — and this filter's outer boundary,
+                // with whatever hard cut or cube-face seam it has, lands in light that is already black
+                // and therefore cannot be seen. We hide the edge of the shadow behind the edge of the
+                // LIGHT, rather than dissolving the shadow to hide it.
+                //
+                // Both fades that used to live here (this range band, and the lantern dissolve + opacity
+                // floor) were the same mistake: they made the occluder stop occluding while its light was
+                // still ~60-70% bright. That is where the leak AND the residual shadow transparency both
+                // came from. Real softness comes from the low-res tile + the PCF grid, never from a fade.
+                //
+                // Corollary: rangeK is now free to move for performance — the light follows it (they are
+                // one dial). What must NEVER happen is a light reaching past this test: keep frac <= 1,
+                // and if you add another point-light frag, read lightParams.y like the other three do.
                 // Temporal fade-IN (host-driven per slot): slotTile[s].w ramps 0→1 when a FAR light
                 // newly pops into this slot (a reclaim), 1.0 in steady state / for near lights. Lerp
                 // vis toward LIT (1.0) so the far shadow eases in place instead of snapping on.

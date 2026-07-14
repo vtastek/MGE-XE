@@ -1023,19 +1023,12 @@ STRUCT(BatchData)
     float4x4 worlds[ 1024 ];
 #line 84
 };
-
-
-
-
-
-
-
-
+#line 105 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(LightData)
 {
     float4 lightParams;
     float4 lights[ 128  * 3];
-#line 97
+#line 109
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1075,7 +1068,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 152 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 164 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 896 ] :  register(t0,space0);
 
 
@@ -1147,20 +1140,26 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     uint litCount = 0u;
     {
         uint nLights = (uint)gLights.lightParams.x;
+
+
+
+
+
+        float reachK = gLights.lightParams.y;
         for (uint i = 0; i < nLights; ++i)
         {
             float4 posR = gLights.lights[i * 3u + 0u];
             float3 lightCol= gLights.lights[i * 3u + 1u].rgb;
             float3 fo = gLights.lights[i * 3u + 2u].xyz;
             float radius = posR.w;
+            float reach = radius * reachK;
 
             float3 toLight = posR.xyz - In.WorldPos;
             float dist2 = dot(toLight, toLight);
 
 
 
-
-            if (dist2 >= 4.0f * radius * radius) { continue; }
+            if (dist2 >= reach * reach) { continue; }
             ++litCount;
             float invDist = rsqrt(max(dist2, 1e-8f));
             float dist = dist2 * invDist;
@@ -1170,7 +1169,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
             float att = 1.0f / max(fo.z * dist2 + fo.y * dist + fo.x, 1e-4f);
 
 
-            att *= 1.0f - smoothstep(radius, 2.0f * radius, dist);
+            att *= 1.0f - smoothstep( 0.75f  * reach, reach, dist);
 
 
 

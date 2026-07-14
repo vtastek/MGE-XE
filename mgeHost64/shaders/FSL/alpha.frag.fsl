@@ -74,25 +74,27 @@ float4 PS_MAIN( VSOutput In )
     a *= gFrameData.dbgScales.x;
 
     // Tier 3a point lights — same evalOnePointLight loop as opaque.frag.
-    uint litCount = 0u;   // debug (mode 9): point lights that reach this pixel (within 2·radius)
+    uint litCount = 0u;   // debug (mode 9): point lights that reach this pixel
     {
         uint nLights = (uint)gLights.lightParams.x;
+        float reachK = gLights.lightParams.y;   // host-slaved light reach — see opaque.srt.h
         for (uint i = 0; i < nLights; ++i)
         {
             float4 posR    = gLights.lights[i * 3u + 0u];
             float3 lightCol= gLights.lights[i * 3u + 1u].rgb;
             float3 fo      = gLights.lights[i * 3u + 2u].xyz;
             float  radius  = posR.w;
+            float  reach   = radius * reachK;
 
             float3 toLight = posR.xyz - In.WorldPos;
             float  dist2   = dot(toLight, toLight);
-            if (dist2 >= 4.0f * radius * radius) { continue; }
+            if (dist2 >= reach * reach) { continue; }
             ++litCount;
             float  invDist = rsqrt(max(dist2, 1e-8f));
             float  dist    = dist2 * invDist;
 
             float  att = 1.0f / max(fo.z * dist2 + fo.y * dist + fo.x, 1e-4f);
-            att *= 1.0f - smoothstep(radius, 2.0f * radius, dist);
+            att *= 1.0f - smoothstep(POINT_LIGHT_TAIL * reach, reach, dist);
 
             float  lambert = saturate(dot(N, toLight) * invDist);   // one-sided (FFE parity)
             d += lambert * att * lightCol;
