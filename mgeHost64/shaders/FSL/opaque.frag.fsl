@@ -8,6 +8,7 @@
 // The base map is the bindless gTextures[TexIndex] (slot 0 = white), MODULATE'd over the material.
 
 #include "opaque.srt.h"
+#include "texsample.h.fsl"   // sampleBase() — MW address mode + AF level
 
 STRUCT(VSOutput)
 {
@@ -24,6 +25,7 @@ STRUCT(VSOutput)
     DATA(FLAT(uint),  VColSource, TEXCOORD7); // 0 none, 1 emissive, 2 diffamb
     DATA(float3,      WorldPos,   TEXCOORD8); // Tier 3a: world position for point-light eval
     DATA(FLAT(uint),  OverlayIndex,TEXCOORD9);// terrain DECAL_1 bindless slot (0 = no decal)
+    DATA(FLAT(uint),  ClampMode,  TEXCOORD10);// MW texture address mode (0..3) -> sampleBase()
 };
 
 // Static semi-HDR tonemap — ported verbatim from XE FixedFuncEmu.fx::tonemap.
@@ -145,7 +147,7 @@ float4 PS_MAIN( VSOutput In )
     // descriptor counter, so the host's bind lands at sampler-table slot 1024 while the shader reads
     // s0 (= null sampler => POINT filter + non-REPEAT address => tiled UVs sample black). A static
     // sampler sidesteps that entirely. See opaque.srt.h.
-    float4 albedo = SampleTex2D(gTextures[In.TexIndex], gSamplerAnisotropic, In.Uv);
+    float4 albedo = sampleBase(In.TexIndex, In.ClampMode, In.Uv, useLowAF(In.AlphaRef, false));
 
     // Terrain DECAL_1 splat — replicates cacheTerrainLitColor (XE Mod Landscape Lit.fx):
     //   albedo = lerp(base, overlay, vcol.a)   (overlay shares uv0; vcol ALPHA = AlphaGrid).

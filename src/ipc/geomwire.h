@@ -124,7 +124,18 @@ namespace IPC {
         // (the frag's splat is gated off when this is 0, so every other draw is unchanged).
         std::uint32_t overlayTexIndex;
         std::uint32_t casterFlags; // kDrawCasterLive bit (C4d shadow-caster category)
+        std::uint32_t clampMode;   // NiTexturingProperty::Map::clampMode, RAW (see kTexClamp*)
     };
+
+    // MW's texture address mode, shipped raw (the shader's TEX_* defines use the same 4 values in
+    // the same order, so nothing translates it anywhere along the way).
+    //   0 CLAMP_S_CLAMP_T   1 CLAMP_S_WRAP_T   2 WRAP_S_CLAMP_T   3 WRAP_S_WRAP_T (MW's default)
+    // Before this existed the host sampled EVERYTHING through one anisotropic REPEAT sampler, so any
+    // mesh with UVs outside [0,1] that relied on CLAMP tiled instead of holding its edge texel.
+    constexpr std::uint32_t kTexClampSClampT = 0u;
+    constexpr std::uint32_t kTexClampSWrapT  = 1u;
+    constexpr std::uint32_t kTexWrapSClampT  = 2u;
+    constexpr std::uint32_t kTexWrapSWrapT   = 3u;   // default when a mesh has no texturing property
 
     // Texture-residency upload (Phase 2 bindless texturing). The client resolves each unique
     // texture to a dense slot, reads its RAW DDS bytes via BSA::loadFileBytes, and ships
@@ -165,6 +176,7 @@ namespace IPC {
         std::uint32_t mirror;        // 1 = mirrored (negative-determinant); pick CW pipeline
         std::uint32_t texIndex;      // bindless gTextures[] slot for the base map (0 = default white)
         float         alphaRef;      // alpha-test reference 0..1 (0 = no alpha test; frag discards a < ref)
+        std::uint32_t clampMode;     // NiTexturingProperty::Map::clampMode, RAW (see kTexClamp*)
     };
 
     // Tier 4 multi-map per-frame draw item: a STATIC opaque part with up to 4 ORDERED texture
@@ -184,8 +196,10 @@ namespace IPC {
         std::uint32_t vColSource;    // 0 none (const material), 1 emissive, 2 diffamb
         float         alphaRef;      // base-stage alpha test 0..1 (0 = no test)
         std::uint32_t stageCount;    // 1..4 (ordered by texCoordSet)
-        // Per stage: texIndex (low 16) | uvSet (bits 16-17) | op (bits 18-19).
+        // Per stage: texIndex (low 16) | uvSet (bits 16-17) | op (bits 18-19) | clampMode (bits 20-21).
         // op: 0 BASE (MOD x DIFFUSE), 1 MOD, 2 MOD2X, 3 ADD.
+        // clampMode is PER STAGE (each NiTexturingProperty::Map carries its own) — a glow map can
+        // clamp while the base map wraps, so it cannot live once per draw like the other paths.
         std::uint32_t stages[4];
     };
 
@@ -194,8 +208,10 @@ namespace IPC {
     constexpr std::uint32_t kMMOpMod   = 1u;
     constexpr std::uint32_t kMMOpMod2X = 2u;
     constexpr std::uint32_t kMMOpAdd   = 3u;
-    inline std::uint32_t packMMStage(std::uint32_t texIndex, std::uint32_t uvSet, std::uint32_t op) {
-        return (texIndex & 0xFFFFu) | ((uvSet & 0x3u) << 16) | ((op & 0x3u) << 18);
+    inline std::uint32_t packMMStage(std::uint32_t texIndex, std::uint32_t uvSet, std::uint32_t op,
+                                     std::uint32_t clampMode = kTexWrapSWrapT) {
+        return (texIndex & 0xFFFFu) | ((uvSet & 0x3u) << 16) | ((op & 0x3u) << 18)
+             | ((clampMode & 0x3u) << 20);
     }
 
     // Tier 3a point light (per-frame, world-space). One entry == three float4, so the host
@@ -315,6 +331,7 @@ namespace IPC {
         // DRAW_BOTH → CULL_NONE); bit1 = mirrored (negative-determinant world → reversed winding,
         // like the opaque mirror PSO). Single-sided non-mirrored (flags==0) → CULL_BACK.
         std::uint32_t cullFlags;
+        std::uint32_t clampMode;   // NiTexturingProperty::Map::clampMode, RAW (see kTexClamp*)
     };
     constexpr std::uint32_t kAlphaCullTwoSided = 1u;   // bit0
     constexpr std::uint32_t kAlphaCullMirrored = 2u;   // bit1

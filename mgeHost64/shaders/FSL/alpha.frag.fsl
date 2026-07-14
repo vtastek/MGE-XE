@@ -14,6 +14,7 @@
 // (see [[project_forge_shared_frag_vsoutput]] — a mismatched vert hangs the GPU).
 
 #include "opaque.srt.h"
+#include "texsample.h.fsl"   // sampleBase() — MW address mode + AF level
 
 STRUCT(VSOutput)
 {
@@ -30,6 +31,7 @@ STRUCT(VSOutput)
     DATA(FLAT(uint),  VColSource, TEXCOORD7); // 0 none, 1 emissive, 2 diffamb
     DATA(float3,      WorldPos,   TEXCOORD8); // Tier 3a: world position for point-light eval
     DATA(FLAT(uint),  OverlayIndex,TEXCOORD9);// AT1: matAlpha bit-cast (overlay slot reused)
+    DATA(FLAT(uint),  ClampMode,  TEXCOORD10);// MW texture address mode (0..3) -> sampleBase()
 };
 
 // Static semi-HDR tonemap — ported verbatim from XE FixedFuncEmu.fx::tonemap.
@@ -112,7 +114,7 @@ float4 PS_MAIN( VSOutput In )
         lit = In.MatDiffuse * d + In.MatAmbient * a + In.MatEmissive;
     }
 
-    float4 albedo = SampleTex2D(gTextures[In.TexIndex], gSamplerAnisotropic, In.Uv);
+    float4 albedo = sampleBase(In.TexIndex, In.ClampMode, In.Uv, useLowAF(In.AlphaRef, true));
 
     // Alpha test (some blended shapes ALSO alpha-test). Same GREATEREQUAL approximation.
     if (albedo.a < In.AlphaRef) { discard; }

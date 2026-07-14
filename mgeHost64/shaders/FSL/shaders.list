@@ -53,6 +53,14 @@
 #include "alpha.frag.fsl"
 #end
 
+// AT1 near-opaque depth prepass: runs BEFORE the alpha colour draws, writes depth ONLY at pixels
+// that are near-opaque (a >= gFrameData.alphaParams.x). Keeps the fold fix (solid cloth self-
+// occludes) while translucent pixels (glass) write nothing, so they can never depth-kill a
+// translucent draw that sorts after them (the flame-in-a-lantern bug). Pairs with opaque.vert.
+#frag alphadepth.frag
+#include "alphadepth.frag.fsl"
+#end
+
 #frag depthonly_mm.frag
 #include "depthonly_mm.frag.fsl"
 #end

@@ -34,6 +34,7 @@
 // Uv / TexIndex / AlphaRef / MatEmissive).
 
 #include "opaque.srt.h"
+#include "texsample.h.fsl"   // sampleBase() — MW address mode + AF level
 
 STRUCT(VSOutput)
 {
@@ -50,13 +51,14 @@ STRUCT(VSOutput)
     DATA(FLAT(uint),  VColSource, TEXCOORD7);
     DATA(float3,      WorldPos,   TEXCOORD8);
     DATA(FLAT(uint),  OverlayIndex,TEXCOORD9);
+    DATA(FLAT(uint),  ClampMode,  TEXCOORD10);// MW texture address mode (0..3) -> sampleBase()
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
 void PS_MAIN( VSOutput In )
 {
     INIT_MAIN;
-    float4 tex = SampleTex2D(gTextures[In.TexIndex], gSamplerAnisotropic, In.Uv);
+    float4 tex = sampleBase(In.TexIndex, In.ClampMode, In.Uv, useLowAF(In.AlphaRef, false));
     // 1. Alpha cutout — MUST match depthonly.frag / opaque.frag exactly (strict '<').
     clip(tex.a < In.AlphaRef ? -1.0f : 1.0f);
     // 2. Emissive carve — drop the glowing texels, keep the dark detail. ONLY in the owner's bake:
