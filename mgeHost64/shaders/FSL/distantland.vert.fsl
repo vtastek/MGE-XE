@@ -50,7 +50,11 @@ VSOutput VS_MAIN( VSInput In )
     // the reflected terrain far below its true height (huge near shore) — skip it in the reflect-geo
     // pass. gReflWaterClip is pass-all (0,0,0,1) everywhere EXCEPT reflect-geo (nz = ±1), so .z != 0
     // uniquely identifies the reflection.
-    if (gFrameData.gReflWaterClip.z == 0.0f) {
+    // nearViewRange == 0 also disables the sink outright: the standalone viewer has no near scene for
+    // the coarse mesh to hide under, so sinking only carves a crater around the camera (the ramp is
+    // ~-12000 units at the eye) and makes close inspection impossible. The live path passes 7168, so
+    // this gate is inert there.
+    if (gFrameData.gReflWaterClip.z == 0.0f && gFrameData.lodParams.w > 0.0f) {
         float  maxDist = gFrameData.lodParams.w - 1152.0f;   // lodParams.w = nearViewRange
         worldPos.z += -30.0f + -2.0f * max(0.0f, maxDist - dist);
     }
