@@ -28,18 +28,27 @@ STRUCT(VSInput)
     DATA(float4, InstParams, TEXCOORD5); // x = packed texSlot (bucket<<16|layer), y = flags (bit1 = hasAlpha cutout)
 };
 
+// CENTROID on Color + Fog is REQUIRED, not cosmetic — MGE marks the same two (XE Common.fx
+// StatVertOut: `centroid float4 color : COLOR0; centroid float4 fog : TEXCOORD0;`) and the port
+// originally dropped it. Without centroid, a partially-covered MSAA pixel is shaded at the pixel
+// CENTRE, which on a thin sliver triangle lies OUTSIDE the triangle, so its attributes are
+// EXTRAPOLATED past the vertex range. Statics carry ALL their lighting in Color (per-vertex lit),
+// so that overshoots >1 (blown white) or goes NEGATIVE (clamps to near-black) — verified in a
+// RenderDoc pixel history. Land is immune (it lights per-pixel from a normal map), which is why
+// only statics broke, and worst on thin/distant geometry where slivers dominate. Uv stays
+// non-centroid, matching MGE (texcoords_range has no modifier there).
 STRUCT(VSOutput)
 {
-    DATA(float4,      Position, SV_Position);
-    DATA(float2,      Uv,       TEXCOORD0);
-    DATA(float4,      Color,    COLOR);     // per-vertex lit colour
-    DATA(float,       Fog,      TEXCOORD1);
-    DATA(FLAT(uint),  TexIndex, TEXCOORD2);
-    DATA(FLAT(uint),  Flags,    TEXCOORD3);
-    DATA(float3,      WorldPos, TEXCOORD4); // F12 distance grayscale parity
+    DATA(float4,           Position, SV_Position);
+    DATA(float2,           Uv,       TEXCOORD0);
+    DATA(CENTROID(float4), Color,    COLOR);     // per-vertex lit colour — MUST be centroid (see above)
+    DATA(CENTROID(float),  Fog,      TEXCOORD1); // lerp factor — extrapolates out of [0,1] otherwise
+    DATA(FLAT(uint),       TexIndex, TEXCOORD2);
+    DATA(FLAT(uint),       Flags,    TEXCOORD3);
+    DATA(float3,           WorldPos, TEXCOORD4); // F12 distance grayscale parity
     // Real water reflection (WV2): below-water clip. Pass-all (0,0,0,1) in every non-reflect frame
     // cbuffer → Clip = 1 >= 0 (nothing clipped). Rasterizer system-value; no frag input, no PSO state.
-    DATA(float,       Clip,     SV_ClipDistance0);
+    DATA(float,            Clip,     SV_ClipDistance0);
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
