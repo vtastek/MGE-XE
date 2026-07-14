@@ -2256,6 +2256,12 @@ namespace {
                 return false;
             }
         }
+        // The sample count is CLIENT-driven (Configuration.AALevel) and was never logged, so "is MSAA
+        // even on?" could only be inferred from the ini. State it.
+        LOG::logline(">> [msaa] sampleCount=%u (%s) %ux%u", g_live.sampleCount,
+                     (g_live.sampleCount > 1) ? "MSAA color RT + resolve" : "OFF — single-sample, no resolve",
+                     width, height);
+        LOG::flush();
 
         // --- Tier 2: single-sample linear depth + AO targets (SRV+UAV). Created here so the
         // graphics PerFrame set (below) can bind pAO as its gAO SRV. Both start UNORDERED_ACCESS
@@ -4866,6 +4872,22 @@ namespace {
     bool g_drawSky       = true;
     bool g_drawDLLand    = true;
     bool g_drawDLStatics = true;
+    // Statics facing A/B (dlPickStaticsPipeline). Built while hunting the dark/bright distant statics, on
+    // the theory that back-face rasterization was shading each mesh's FAR side with outward normals (N.L
+    // saturating to 0 or 1). It wasn't — the cause was the missing `centroid` on statics' Color+Fog — but
+    // the winding had only ever been established empirically, so keep the switch: it settles "is the
+    // global winding right?" in one frame instead of a rebuild.
+    //   0 = auto (g_dlStaticsFrontCW: CCW live / CW viewer), 1 = force CCW, 2 = force CW, 3 = no cull
+    uint32_t g_staticsFacing = 0;
+    // lodParams.w = nearViewRange. Two consumers, both about the near HANDOVER (which only exists in
+    // game, where the near cache owns the near field): the DL land z-sink in distantland.vert, and the
+    // statics near-cut in the CPU cull. The viewer has NO near scene, so both just carve a hole around
+    // the camera and stop you inspecting anything up close — it sets this to 0 (see worldViewer).
+    // 0 also switches the land z-sink off entirely (distantland.vert gates on lodParams.w > 0).
+    float g_dlNearViewRange = 7168.0f;
+    // Viewer: draw DL statics all the way to the eye (same reason the water REFLECTION does — no near
+    // path covers them, so the near-cut would just delete them).
+    bool  g_dlNoStaticsNearCut = false;
     // Stage B (B3): draw the far statics from the GPU-driven cull (count->prefix-sum->scatter->
     // execute-indirect) instead of the CPU cull's rings. The CPU cull still runs (fills g_liveLastInst
     // for the parity check + the reflect path); this only switches which instance/arg buffers the MAIN
@@ -5589,6 +5611,10 @@ namespace {
         uiAddComponentWidget(g_uiPanel, "Draw: distant statics", &cDStat, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cGpuCull = {}; cGpuCull.pData = &g_gpuStaticsCull;
         uiAddComponentWidget(g_uiPanel, "Statics: GPU cull (B3 draw)", &cGpuCull, WIDGET_TYPE_CHECKBOX);
+        static const char* const kStaticsFacingNames[] = {
+            "0 auto (CCW live / CW viewer)", "1 force CCW", "2 force CW", "3 no cull (two-sided)" };
+        DropdownWidget ddSf = {}; ddSf.pData = &g_staticsFacing; ddSf.pNames = kStaticsFacingNames; ddSf.mCount = 4;
+        uiAddComponentWidget(g_uiPanel, "Statics: facing (dark/bright A/B)", &ddSf, WIDGET_TYPE_DROPDOWN);
         CheckboxWidget cHizOcc = {}; cHizOcc.pData = &g_hizOcclusion;
         uiAddComponentWidget(g_uiPanel, "Statics: Hi-Z occlusion (M2)", &cHizOcc, WIDGET_TYPE_CHECKBOX);
         CheckboxWidget cHiz = {}; cHiz.pData = &g_hizPrologue;
@@ -9876,6 +9902,16 @@ namespace ForgeRender {
         g_lastPostMs  = hostNowMs() - (tRec1 + gpuMs);
         g_lastTotalMs = hostNowMs() - tEntry;
         if ((g_renderFrame % 300u) == 0u) {
+            // MW's live lighting, as the host actually received it. The standalone viewer has no MW, so
+            // it synthesizes sun/ambient — these are the values to copy into its defaults so it lights
+            // the world the way the game does (else the viewer's contrast is its own invention).
+            {
+                const float* lf = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
+                LOG::logline(">> [forge-hb][light] sunDir=(%.4f,%.4f,%.4f) sunCol=(%.4f,%.4f,%.4f) ambCol=(%.4f,%.4f,%.4f)"
+                             " eyeAbs=(%.0f,%.0f,%.0f)",
+                             lf[16], lf[17], lf[18], lf[20], lf[21], lf[22], lf[24], lf[25], lf[26],
+                             lf[56], lf[57], lf[58]);   // lodEye = ABSOLUTE world eye (viewer start pos)
+            }
             LOG::logline(">> [forge-hb] frame=%u drawn=%u skinned=%u multimap=%u sky=%u alpha=%u(zpre=%u) dynamic=%u meshHigh=%u "
                          "| record=%.2fms gpu=%.2fms (avg/frame over 300)",
                          g_renderFrame, drawn, skinnedDrawn, multiMapDrawn, skyDrawn, alphaDrawn,
@@ -10554,6 +10590,12 @@ namespace ForgeRender {
     // cmdExecuteIndirect. See [[project_forge_dl_statics_format]].
     constexpr uint32_t kStaticsBuckets    = MAX_STATICS_BUCKETS;  // gStaticsArrays element count (128)
     constexpr uint32_t kStaticsTexCap     = 512;   // cap the long side: extract that mip + chain (raw copy)
+    // Mips a w x h texture would have with a complete chain down to 1x1.
+    inline uint32_t fullMipCount(uint32_t w, uint32_t h) {
+        uint32_t n = 1;
+        while (w > 1u || h > 1u) { w = (w > 1u) ? (w >> 1) : 1u; h = (h > 1u) ? (h >> 1) : 1u; ++n; }
+        return n;
+    }
     constexpr uint32_t kStaticsInstStride = 80;    // 4 world rows (64 B) + params float4 (16 B)
     constexpr float    kStaticsScopeR     = 6144.0f; // probe: draw instances within this radius of the densest cell
 
@@ -10573,9 +10615,20 @@ namespace ForgeRender {
     Shader*   g_pStaticsShader   = nullptr;
     Pipeline* g_pStaticsPipeline = nullptr;   // FRONT_FACE_CCW: MW's live in-game viewProj
     Pipeline* g_pStaticsPipelineCW = nullptr; // FRONT_FACE_CW: synthetic dlLookAtLH camera (--forge-view)
-    // The standalone viewer's synthetic LH camera winds statics OPPOSITE to MW's live viewProj (the
-    // land hides it via CULL_NONE; statics CULL_BACK shows "inside out"). Set by worldViewer so
-    // dlLiveRecord binds the CW variant — a known camera-convention artifact, not a Forge bug.
+    Pipeline* g_pStaticsPipelineNone = nullptr; // CULL_MODE_NONE: facing A/B (see g_staticsFacing)
+    // LIVE path: front face = CCW, per the MGE oracle — XE Main.fx Pass P4ext (the distant-statics
+    // exterior pass) sets CullMode = CW, i.e. D3D9 culls the CW-wound triangles, so the FRONT faces are
+    // CCW. (An explicit override; D3D9's default is D3DCULL_CCW.) The D3D12 equivalent is
+    // FrontCounterClockwise = TRUE + CULL_MODE_BACK = FRONT_FACE_CCW + CULL_MODE_BACK = g_pStaticsPipeline.
+    //
+    // VIEWER (--forge-view) needs the CW variant instead — VERIFIED 2026-07-14 by flipping it to CCW and
+    // getting the INSIDES of every mesh. MW's live view matrix carries a handedness flip that a plain
+    // dlLookAtLH/dlPerspLH does not, so the synthetic camera genuinely winds statics the other way. Don't
+    // "fix" this to match the live path; it has been tried. The water-plane reflection flips handedness
+    // again, and dlPickStaticsPipeline inverts the winding for that draw.
+    //
+    // Facing was investigated as the cause of the dark/bright distant statics and EXONERATED: the real
+    // culprit was the missing `centroid` on statics.vert/frag's Color+Fog (MSAA sliver extrapolation).
     bool      g_dlStaticsFrontCW = false;
     std::vector<StaticsSubsetGPU> g_staticsSubsets;
     std::vector<StaticsDefCPU>    g_staticsDefs;
@@ -10983,6 +11036,13 @@ namespace ForgeRender {
         g.pRasterizerState = &rsCW;
         addPipeline(R, &pd, &g_pStaticsPipelineCW);
         if (!g_pStaticsPipelineCW) { std::printf("[forge][dl] addPipeline(statics CW) FAILED\n"); return false; }
+
+        // CULL_NONE variant: the facing A/B's control case (see g_staticsFacing). If the dark/bright
+        // pixels vanish here, back-face rasterization is the cause and one of CCW/CW is simply wrong.
+        RasterizerStateDesc rsNone = rs; rsNone.mCullMode = CULL_MODE_NONE;
+        g.pRasterizerState = &rsNone;
+        addPipeline(R, &pd, &g_pStaticsPipelineNone);
+        if (!g_pStaticsPipelineNone) { std::printf("[forge][dl] addPipeline(statics NONE) FAILED\n"); return false; }
 
         std::printf("[forge][dl] statics pipeline built\n");
         return true;
@@ -11556,37 +11616,44 @@ namespace ForgeRender {
         s_firstWater = false;
 
         // (2) Copy colorTarget -> pRefractColor (refraction source). Raw D3D12 barriers (matches the
-        // live pass); viewer is single-sample so CopyResource, not ResolveSubresource.
+        // live pass): CopyResource for 1x; for MSAA the colour is multisampled → ResolveSubresource
+        // into the single-sample refraction copy (CopyResource from an MSAA source is illegal).
         ID3D12GraphicsCommandList* cl = cmd->mDx.pCmdList;
         ID3D12Resource* colRes  = colorTarget->pTexture->mDx.pResource;
         ID3D12Resource* refrRes = g_live.pRefractColor->mDx.pResource;
+        const bool msaa = (g_live.sampleCount > 1);
         {
             D3D12_RESOURCE_BARRIER pre[2] = {};
             pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             pre[0].Transition.pResource = colRes;
             pre[0].Transition.Subresource = 0;
             pre[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-            pre[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            pre[0].Transition.StateAfter  = msaa ? D3D12_RESOURCE_STATE_RESOLVE_SOURCE
+                                                 : D3D12_RESOURCE_STATE_COPY_SOURCE;
             pre[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             pre[1].Transition.pResource = refrRes;
             pre[1].Transition.Subresource = 0;
             pre[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
                                           | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-            pre[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+            pre[1].Transition.StateAfter  = msaa ? D3D12_RESOURCE_STATE_RESOLVE_DEST
+                                                 : D3D12_RESOURCE_STATE_COPY_DEST;
             cl->ResourceBarrier(2, pre);
         }
-        cl->CopyResource(refrRes, colRes);
+        if (msaa) { cl->ResolveSubresource(refrRes, 0, colRes, 0, DXGI_FORMAT_B8G8R8A8_UNORM); }
+        else      { cl->CopyResource(refrRes, colRes); }
         {
             D3D12_RESOURCE_BARRIER post[2] = {};
             post[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             post[0].Transition.pResource = colRes;
             post[0].Transition.Subresource = 0;
-            post[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            post[0].Transition.StateBefore = msaa ? D3D12_RESOURCE_STATE_RESOLVE_SOURCE
+                                                  : D3D12_RESOURCE_STATE_COPY_SOURCE;
             post[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
             post[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             post[1].Transition.pResource = refrRes;
             post[1].Transition.Subresource = 0;
-            post[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            post[1].Transition.StateBefore = msaa ? D3D12_RESOURCE_STATE_RESOLVE_DEST
+                                                  : D3D12_RESOURCE_STATE_COPY_DEST;
             post[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
                                            | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             cl->ResourceBarrier(2, post);
@@ -11741,6 +11808,24 @@ namespace ForgeRender {
         }
 
         // Pass 2: create + bind one Texture2DArray per real bucket.
+        // DIAG: a bucket's mip chain is the MIN over its members (see above), so ONE member whose DDS
+        // ships no mips collapses the whole bucket to mips=1 — and every distant static in it then
+        // minifies with no mip chain, which shimmers exactly at distance. Report the damage.
+        {
+            uint32_t noMip = 0, thin = 0;
+            for (uint32_t b = 1; b < g_staticsBuckets.size(); ++b) {
+                const StaticsTexBucket& bk = g_staticsBuckets[b];
+                const uint32_t full = fullMipCount(bk.w, bk.h);
+                if (bk.mips <= 1)     { ++noMip; }
+                else if (bk.mips < full) { ++thin; }
+                LOG::logline(">> [statics-tex] bucket=%u %ux%u slices=%u mips=%u (full=%u)%s",
+                             b, bk.w, bk.h, bk.count, bk.mips, full,
+                             (bk.mips <= 1) ? "  <-- NO MIPS (aliases at distance)" : "");
+            }
+            LOG::logline(">> [statics-tex] buckets=%u  NO-MIP=%u  short-chain=%u",
+                         (uint32_t)g_staticsBuckets.size() - 1u, noMip, thin);
+            LOG::flush();
+        }
         for (uint32_t b = 1; b < g_staticsBuckets.size(); ++b) {
             StaticsTexBucket& bk = g_staticsBuckets[b];
             TextureDesc td = {};
@@ -12256,8 +12341,14 @@ namespace ForgeRender {
                     (int)cfgOk, Configuration.DL.NearStaticEnd, Configuration.DL.FarStaticEnd,
                     Configuration.DL.VeryFarStaticEnd, Configuration.DL.DrawDist);
 
-        // --- init renderer (single-sample, 8x aniso) ---
-        if (!init(W, H, 1, 8)) { std::printf("[forge][view] init FAILED\n"); return false; }
+        // --- init renderer: MATCH the in-game AA/AF so the viewer reproduces what the seam shows.
+        // The viewer was hardcoded single-sample, which made it useless for chasing aliasing (and
+        // silently disagreed with the live path's MSAA colour RT + resolve). Same mapping the client
+        // uses (renderprocess.cpp): AALevel is the D3DMULTISAMPLE value (0/2/4/8), 0 -> 1 sample.
+        const uint32_t viewSamples = Configuration.AALevel > 0 ? (uint32_t)Configuration.AALevel : 1u;
+        const uint32_t viewAniso   = (uint32_t)Configuration.AnisoLevel;
+        std::printf("[forge][view] AA=%ux  AF=%ux (from MGE.ini)\n", viewSamples, viewAniso);
+        if (!init(W, H, viewSamples, viewAniso)) { std::printf("[forge][view] init FAILED\n"); return false; }
         Renderer* R = g_live.pRenderer;
 
         // Run the SAME resident load the live path's lazy init does (buildLandPath/loadDistantLand +
@@ -12274,7 +12365,24 @@ namespace ForgeRender {
         if (g_staticsLiveOk) { buildStaticsGrid(); pickStaticsTarget(staticsT); }
         else { std::printf("[forge][view] statics unavailable — land only\n"); }
         g_dlLiveInit = true;
-        g_dlStaticsFrontCW = true;   // synthetic LH camera → statics wind opposite to MW's live view
+        // Inspection mode: the viewer has no near scene, so the two near-handover mechanisms only carve
+        // a hole around the camera. Kill both — DL land draws at its TRUE height (no z-sink) and DL
+        // statics draw all the way to the eye. Live path untouched (it still passes 7168 / near-cuts).
+        g_dlNearViewRange   = 0.0f;
+        g_dlNoStaticsNearCut = true;
+        // The viewer's synthetic camera really does wind statics OPPOSITE to MW's live viewProj —
+        // VERIFIED 2026-07-14: forcing the live (CCW) winding here renders the INSIDES. So MW's own
+        // view matrix carries a handedness flip that a plain dlLookAtLH/dlPerspLH does not, and the
+        // viewer needs the CW variant. (MGE's XE Main.fx P4ext sets CullMode = CW ⇒ front = CCW, which
+        // is what the LIVE path uses; this override applies to the viewer's camera only.)
+        g_dlStaticsFrontCW = true;
+        // The viewer skips dlCreateCullResources (above), so the GPU cull can never fill the indirect
+        // args (gpuStaticsReady stays false). But dlLiveCullAndBuild skips the CPU cell-walk whenever
+        // g_gpuStaticsCull is set (default ON since B3 made the GPU cull the primary path) and zeroes
+        // g_liveLastSubsets — so BOTH culls went quiet and dlLiveRecord's statics gate never fired:
+        // the viewer silently became land-only. Force the CPU cull here, which is what the viewer was
+        // always documented to run.
+        g_gpuStaticsCull = false;
         bool haveStatics = g_staticsLiveOk;
         std::printf("[forge][view] loaded: %u land meshes, statics-live=%d\n",
                     g_landMeshCount, (int)haveStatics);
@@ -12291,7 +12399,17 @@ namespace ForgeRender {
         // pReflectColor (a mirror RT the viewer never renders -> would sample black), so re-point it at
         // a 4x4 fog-colour texture. Single-colour reflection, no mirror pass, no shader change.
         const float kViewerFog[3]     = { 0.60f, 0.66f, 0.78f };   // horizon/fog colour (== fd[28..30])
-        const float kViewerAmbient[3] = { 0.34f, 0.38f, 0.46f };   // ambient colour   (== fd[24..26])
+        // Sun/ambient CAPTURED FROM THE LIVE GAME (auto-load test scene; mgeHost64.log
+        // ">> [forge-hb][light]", 2026-07-14) instead of invented. The old made-up values (sun
+        // 1.0/0.96/0.86, ambient 0.34/0.38/0.46) carried barely HALF the game's real ambient, so the
+        // viewer rendered at roughly twice MW's lit-to-shadow ratio — statics came out "very dark or
+        // very bright" in a way they never do in game, which sent us chasing a repro artifact.
+        const float kViewerAmbient[3] = { 0.725f, 0.768f, 0.847f };  // ambient colour (== fd[24..26])
+        const float kViewerSunCol[3]  = { 1.600f, 1.481f, 1.387f };  // sun colour     (== fd[20..22])
+        const float kViewerSunDir[3]  = { 0.786f, 0.370f, -0.494f }; // world sun TRAVEL dir (to-sun = -dir)
+        // Camera start: the auto-load save's eye (same capture). Overridden below by the statics
+        // cluster only if the statics library failed to load.
+        const float kViewerEyeStart[3] = { -11751.0f, -19035.0f, 14210.0f };
         bool haveWater = false;
         if (g_live.waterReady) {
             TextureDesc rd = {};
@@ -12361,14 +12479,16 @@ namespace ForgeRender {
         float ext=((mxX-mnX)>(mxY-mnY))?(mxX-mnX):(mxY-mnY);
         float tgt[3] = { cx, cy, cz };
         float eye[3] = { cx - 0.35f*ext, cy, mxZ + 0.10f*ext + 4000.0f };
-        // Start where the content is: if statics loaded, open ON the dense statics cluster
-        // (pickStaticsTarget's cell) so the camera-relative statics are dead ahead at launch,
-        // not the land centre (which can be far from the scoped statics).
+        // Start where the GAME starts: the auto-load save's eye (kViewerEyeStart, captured live —
+        // see the light block above), aimed at the dense statics cluster. That puts the viewer on the
+        // same ground, in the same light, looking at the same content the in-game A/B shots show, so
+        // the two are directly comparable. Falls back to the statics cluster / land overview if the
+        // statics library didn't load.
         if (haveStatics) {
             tgt[0]=staticsT[0]; tgt[1]=staticsT[1]; tgt[2]=staticsT[2];
-            eye[0]=staticsT[0]-6000.0f; eye[1]=staticsT[1]; eye[2]=staticsT[2]+3000.0f;
-            std::printf("[forge][view] staticsT=(%.0f,%.0f,%.0f) eyeStart=(%.0f,%.0f,%.0f)\n",
-                        staticsT[0],staticsT[1],staticsT[2], eye[0],eye[1],eye[2]);
+            eye[0]=kViewerEyeStart[0]; eye[1]=kViewerEyeStart[1]; eye[2]=kViewerEyeStart[2];
+            std::printf("[forge][view] eyeStart=(%.0f,%.0f,%.0f) (game auto-load) staticsT=(%.0f,%.0f,%.0f)\n",
+                        eye[0],eye[1],eye[2], staticsT[0],staticsT[1],staticsT[2]);
         }
         // Aim at the target (statics cluster, or land centre).
         float aim[3] = { tgt[0] - eye[0], tgt[1] - eye[1], tgt[2] - eye[2] };
@@ -12470,9 +12590,9 @@ namespace ForgeRender {
 
             float* fd = (float*)g_live.pFrameCbv->pCpuMappedAddress;
             std::memcpy(fd, vp, 16*sizeof(float));
-            float sun[3] = { 0.4f, 0.2f, -0.9f }; dlNorm3(sun);
+            float sun[3] = { kViewerSunDir[0], kViewerSunDir[1], kViewerSunDir[2] }; dlNorm3(sun);
             fd[16]=sun[0]; fd[17]=sun[1]; fd[18]=sun[2]; fd[19]=0;
-            fd[20]=1.0f; fd[21]=0.96f; fd[22]=0.86f; fd[23]=0;
+            fd[20]=kViewerSunCol[0]; fd[21]=kViewerSunCol[1]; fd[22]=kViewerSunCol[2]; fd[23]=0;
             fd[24]=kViewerAmbient[0]; fd[25]=kViewerAmbient[1]; fd[26]=kViewerAmbient[2]; fd[27]=0;
             fd[28]=kViewerFog[0]; fd[29]=kViewerFog[1]; fd[30]=kViewerFog[2]; fd[31]=0;
             fd[32]=kFogStart; fd[33]=kFogEnd; fd[34]=0; fd[35]=0;  // fogParams (start, end) — tied to draw distance
@@ -12493,14 +12613,17 @@ namespace ForgeRender {
 
             resetCmdPool(R, g_live.pCmdPool);
             beginCmd(g_live.pCmd);
-            // Render STRAIGHT into the acquired backbuffer (no pRT round-trip / copy). It comes back
-            // from acquire in PRESENT state → transition to RENDER_TARGET, draw, then back to PRESENT.
+            // MSAA (sampleCount > 1): draw into g_live.pMSAAColor and ResolveSubresource into the
+            // acquired backbuffer at the end — the same shape as the live path (which resolves into
+            // the shared RT). At 1x we render STRAIGHT into the backbuffer as before. Either way bb
+            // comes back from acquire in PRESENT state and goes back to PRESENT before queuePresent.
+            RenderTarget* viewTarget = (g_live.sampleCount > 1) ? g_live.pMSAAColor : bb;
             RenderTargetBarrier toRT = {};
             toRT.pRenderTarget = bb; toRT.mCurrentState = RESOURCE_STATE_PRESENT; toRT.mNewState = RESOURCE_STATE_RENDER_TARGET;
             cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &toRT);
             BindRenderTargetsDesc bind = {};
             bind.mRenderTargetCount = 1;
-            bind.mRenderTargets[0] = { bb, LOAD_ACTION_CLEAR };
+            bind.mRenderTargets[0] = { viewTarget, LOAD_ACTION_CLEAR };
             bind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_CLEAR };
             cmdBindRenderTargets(g_live.pCmd, &bind);
             cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)W, (float)H, 0.0f, 1.0f);
@@ -12524,11 +12647,46 @@ namespace ForgeRender {
             // scene-depth source; depth GEQUAL+write vs pDepth makes terrain occlude / be-occluded.
             // Runs the same linearize + water pass the live renderScene runs (F7-equivalent = g_drawWater).
             // Leaves the backbuffer+depth bound (LOAD).
-            if (haveWater) { dlDrawViewerWater(bb, vp, eye, fwd, zf); }
+            if (haveWater) { dlDrawViewerWater(viewTarget, vp, eye, fwd, zf); }
 
             cmdBindRenderTargets(g_live.pCmd, nullptr);
-            toRT.mCurrentState = RESOURCE_STATE_RENDER_TARGET; toRT.mNewState = RESOURCE_STATE_PRESENT;
-            cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &toRT);
+            if (g_live.sampleCount > 1) {
+                // Resolve the multisampled colour into the acquired backbuffer (same call the live
+                // path makes into the shared RT). pMSAAColor is left in RENDER_TARGET between frames.
+                ID3D12GraphicsCommandList* cl = g_live.pCmd->mDx.pCmdList;
+                ID3D12Resource* msaaRes = g_live.pMSAAColor->pTexture->mDx.pResource;
+                ID3D12Resource* bbRes   = bb->pTexture->mDx.pResource;
+                D3D12_RESOURCE_BARRIER pre[2] = {};
+                pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                pre[0].Transition.pResource = msaaRes;
+                pre[0].Transition.Subresource = 0;
+                pre[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                pre[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+                pre[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                pre[1].Transition.pResource = bbRes;
+                pre[1].Transition.Subresource = 0;
+                pre[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                pre[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_RESOLVE_DEST;
+                cl->ResourceBarrier(2, pre);
+
+                cl->ResolveSubresource(bbRes, 0, msaaRes, 0, DXGI_FORMAT_B8G8R8A8_UNORM);
+
+                D3D12_RESOURCE_BARRIER post[2] = {};
+                post[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                post[0].Transition.pResource = msaaRes;
+                post[0].Transition.Subresource = 0;
+                post[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+                post[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                post[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                post[1].Transition.pResource = bbRes;
+                post[1].Transition.Subresource = 0;
+                post[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RESOLVE_DEST;
+                post[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
+                cl->ResourceBarrier(2, post);
+            } else {
+                toRT.mCurrentState = RESOURCE_STATE_RENDER_TARGET; toRT.mNewState = RESOURCE_STATE_PRESENT;
+                cmdResourceBarrier(g_live.pCmd, 0, nullptr, 0, nullptr, 1, &toRT);
+            }
             endCmd(g_live.pCmd);
 
             QueueSubmitDesc sub = {};
@@ -13110,7 +13268,7 @@ namespace ForgeRender {
         if (T.primary) {
             float* fd = (float*)g_live.pFrameCbv->pCpuMappedAddress;
             fd[48] = (float)kLandBaseSlot; fd[49] = (float)kLandNormalSlot;
-            fd[50] = (float)kLandDetailSlot; fd[51] = 7168.0f;     // lodParams.zw (detail slot, nearViewRange)
+            fd[50] = (float)kLandDetailSlot; fd[51] = g_dlNearViewRange;  // lodParams.zw (detail slot, nearViewRange)
             fd[52] = fd[24]; fd[53] = fd[25]; fd[54] = fd[26]; fd[55] = 0.0f;  // lodSunAmb = ambCol
             fd[56] = g_dlEye[0]; fd[57] = g_dlEye[1]; fd[58] = g_dlEye[2]; fd[59] = 0.0f;  // lodEye
         }
@@ -13306,6 +13464,7 @@ namespace ForgeRender {
         T.lastSubsets = &g_liveLastSubsets;
         T.lastInst    = &g_liveLastInst;
         T.primary     = true;
+        T.suppressNearCut = g_dlNoStaticsNearCut;   // viewer inspection: keep statics right up to the eye
         dlCullAndBuild(R, rzViewProj, T);
     }
 
@@ -13323,6 +13482,18 @@ namespace ForgeRender {
         T.primary     = false;
         T.suppressNearCut = true;   // draw DL statics to the eye (reflection has no near-scene path)
         dlCullAndBuild(R, mirrorViewProj, T);
+    }
+
+    // Statics facing selector (g_staticsFacing dropdown). `mirror` = the water-plane reflection draw,
+    // whose mirror matrix flips handedness, so it takes the OPPOSITE winding of the main record.
+    // CULL_NONE ignores mirror (nothing is culled either way).
+    Pipeline* dlPickStaticsPipeline(bool mirror) {
+        const bool cw = (g_staticsFacing == 1u) ? false            // force CCW
+                      : (g_staticsFacing == 2u) ? true             // force CW
+                      : g_dlStaticsFrontCW;                        // 0 = auto (per-camera default)
+        if (g_staticsFacing == 3u) { return g_pStaticsPipelineNone; }
+        const bool wantCW = mirror ? !cw : cw;
+        return wantCW ? g_pStaticsPipelineCW : g_pStaticsPipeline;
     }
 
     // Record the live DL draws into g_live.pCmd. Runs AFTER the near colour pass with colorTarget +
@@ -13354,7 +13525,7 @@ namespace ForgeRender {
         // runs either way (fills g_liveLastInst for the parity check + the reflect path).
         const bool gpuDraw = g_gpuStaticsCull && g_live.gpuStaticsReady && g_live.gpuArgsInDrawState;
         if (g_drawDLStatics && g_staticsLiveOk && (gpuDraw || g_liveLastSubsets > 0)) {
-            cmdBindPipeline(g_live.pCmd, g_dlStaticsFrontCW ? g_pStaticsPipelineCW : g_pStaticsPipeline);
+            cmdBindPipeline(g_live.pCmd, dlPickStaticsPipeline(/*mirror*/false));
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
@@ -13402,7 +13573,7 @@ namespace ForgeRender {
 
         if (g_drawDLStatics && g_staticsLiveOk && g_liveLastSubsetsRefl > 0) {
             // Opposite winding to the main record (the water-plane mirror flips handedness).
-            cmdBindPipeline(g_live.pCmd, g_dlStaticsFrontCW ? g_pStaticsPipeline : g_pStaticsPipelineCW);
+            cmdBindPipeline(g_live.pCmd, dlPickStaticsPipeline(/*mirror*/true));
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetReflectGeo);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
@@ -14083,6 +14254,8 @@ namespace ForgeRender {
         if (g_pStaticsInst)     { removeResource(g_pStaticsInst);     g_pStaticsInst = nullptr; }
         if (g_pStaticsVB)       { removeResource(g_pStaticsVB);       g_pStaticsVB = nullptr; }
         if (g_pStaticsIB)       { removeResource(g_pStaticsIB);       g_pStaticsIB = nullptr; }
+        if (g_pStaticsPipelineNone) { removePipeline(R, g_pStaticsPipelineNone); g_pStaticsPipelineNone = nullptr; }
+        if (g_pStaticsPipelineCW)   { removePipeline(R, g_pStaticsPipelineCW);   g_pStaticsPipelineCW = nullptr; }
         if (g_pStaticsPipeline) { removePipeline(R, g_pStaticsPipeline); g_pStaticsPipeline = nullptr; }
         if (g_pStaticsShader)   { removeShader(R, g_pStaticsShader);   g_pStaticsShader = nullptr; }
         g_staticsSubsets.clear(); g_staticsDefs.clear(); g_staticsSubsetTex.clear();
