@@ -10,15 +10,18 @@
 
 #include "opaque.srt.h"
 
+// MUST stay byte-identical to statics.vert.fsl's VSOutput, CENTROID modifiers included — see the
+// long comment there for why Color/Fog are centroid (MSAA sliver extrapolation drove the lit colour
+// negative / past 1.0; MGE's StatVertOut marks the same two).
 STRUCT(VSOutput)
 {
-    DATA(float4,      Position, SV_Position);
-    DATA(float2,      Uv,       TEXCOORD0);
-    DATA(float4,      Color,    COLOR);
-    DATA(float,       Fog,      TEXCOORD1);
-    DATA(FLAT(uint),  TexIndex, TEXCOORD2);
-    DATA(FLAT(uint),  Flags,    TEXCOORD3);
-    DATA(float3,      WorldPos, TEXCOORD4);
+    DATA(float4,           Position, SV_Position);
+    DATA(float2,           Uv,       TEXCOORD0);
+    DATA(CENTROID(float4), Color,    COLOR);
+    DATA(CENTROID(float),  Fog,      TEXCOORD1);
+    DATA(FLAT(uint),       TexIndex, TEXCOORD2);
+    DATA(FLAT(uint),       Flags,    TEXCOORD3);
+    DATA(float3,           WorldPos, TEXCOORD4);
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
