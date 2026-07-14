@@ -1023,19 +1023,12 @@ STRUCT(BatchData)
     float4x4 worlds[ 1024 ];
 #line 84
 };
-
-
-
-
-
-
-
-
+#line 105 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(LightData)
 {
     float4 lightParams;
     float4 lights[ 128  * 3];
-#line 97
+#line 109
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1075,7 +1068,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 152 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 164 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 896 ] :  register(t0,space0);
 
 

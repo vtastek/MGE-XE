@@ -89,10 +89,22 @@ STRUCT(BatchData)
 //   lights[i*3+1] = float4(diffuse.rgb,  unused)   // dimmer- & pointLightMult-scaled
 //   lights[i*3+2] = float4(k0, k1, k2,   unused)   // 1/(k0+k1·d+k2·d²) attenuation
 // lightParams.x = active light count (host writes the actual uploaded count).
+// lightParams.y = point-light REACH in radii. Attenuation is driven to exactly zero at
+//   reach*radius. The host slaves this to the shadow test range (g_shadowRangeK * g_lightReachFrac,
+//   frac<=1), so the lit region is always strictly INSIDE the shadow-tested region and a light can
+//   never spill past the shadow it should be casting. Every frag that evaluates point lights
+//   (opaque/alpha/multimap) must use it — one of them keeping a hardcoded reach = a leak on that
+//   material only.
 // 16 + 128*3*16 = 6160 B < the 64KB cbuffer limit.
+//
+// POINT_LIGHT_TAIL: where the 1->0 ramp to the reach begins, as a fraction of reach. The light is
+// unchanged inside it and fades over the remainder, so shortening the reach trims the faint tail
+// rather than dimming the light's core. Shared by all three point-light frags — keep it here, not
+// copied into each: a per-shader reach/ramp is exactly how the leak got in.
+#define POINT_LIGHT_TAIL 0.75f
 STRUCT(LightData)
 {
-    DATA(float4, lightParams, None);                 // x = count
+    DATA(float4, lightParams, None);                 // x = count, y = light reach in radii
     DATA(float4, lights[MAX_POINT_LIGHTS * 3], None);
 };
 

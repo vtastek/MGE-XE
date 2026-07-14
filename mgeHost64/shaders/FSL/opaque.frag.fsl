@@ -67,24 +67,30 @@ float4 PS_MAIN( VSOutput In )
     // space (Forge normals + positions are world-space, like the Tier 1 sun). pointLightMult is
     // already baked into each light's colour client-side (the main cache path uses 1.0). The
     // lights cbuffer packs 3 float4 per light: [i*3+0]=(pos.xyz, radius), [i*3+1]=(col.rgb,_),
-    // [i*3+2]=(k0,k1,k2,_). lightParams.x is the active count (host-written).
-    uint litCount = 0u;   // debug (mode 9): point lights that reach this pixel (within 2·radius)
+    // [i*3+2]=(k0,k1,k2,_). lightParams.x is the active count (host-written), .y the reach.
+    uint litCount = 0u;   // debug (mode 9): point lights that reach this pixel
     {
         uint nLights = (uint)gLights.lightParams.x;
+        // Light reach in radii — host-slaved to the shadow test range (see opaque.srt.h). The
+        // attenuation is driven to EXACTLY zero here, and the host guarantees this is inside the
+        // shadow-tested region, so the mask's outer boundary always lands in already-black light.
+        // That is what lets the shadow itself stay 100% opaque with no fade: we hide the edge of
+        // the shadow behind the edge of the light, instead of dissolving the shadow to hide it.
+        float reachK = gLights.lightParams.y;
         for (uint i = 0; i < nLights; ++i)
         {
             float4 posR    = gLights.lights[i * 3u + 0u];
             float3 lightCol= gLights.lights[i * 3u + 1u].rgb;
             float3 fo      = gLights.lights[i * 3u + 2u].xyz;   // x=k0 const, y=k1 linear, z=k2 quad
             float  radius  = posR.w;
+            float  reach   = radius * reachK;
 
             float3 toLight = posR.xyz - In.WorldPos;
             float  dist2   = dot(toLight, toLight);
-            // EXACT early-out: the soft cutoff below multiplies att by 0 at dist >= 2·radius
-            // (smoothstep ramp end), so pixels beyond it contribute nothing — skip the
-            // rsqrt/divide/smoothstep. Most pixels are beyond 2r of most of the ~128 scene
-            // lights, so this is the bulk of the loop. Byte-identical output.
-            if (dist2 >= 4.0f * radius * radius) { continue; }
+            // EXACT early-out: the tail ramp below multiplies att by 0 at dist >= reach, so pixels
+            // beyond it contribute nothing — skip the rsqrt/divide/smoothstep. Most pixels are
+            // beyond reach of most of the ~128 scene lights, so this is the bulk of the loop.
+            if (dist2 >= reach * reach) { continue; }
             ++litCount;
             float  invDist = rsqrt(max(dist2, 1e-8f));
             float  dist    = dist2 * invDist;
@@ -92,9 +98,9 @@ float4 PS_MAIN( VSOutput In )
             // Full 1/(k0 + k1·d + k2·d²) attenuation. The linear k1 term is essential —
             // MW candle/torch lights are pure-linear (k0=k2=0). max() guards d->0.
             float  att = 1.0f / max(fo.z * dist2 + fo.y * dist + fo.x, 1e-4f);
-            // Soft cutoff: ramp 1->0 over [radius, 2·radius] so the future CPU cull boundary
-            // has no hard seam (matches evalOnePointLight / OpenMW PerObjectUniform).
-            att *= 1.0f - smoothstep(radius, 2.0f * radius, dist);
+            // Tail ramp 1->0 over the last quarter of the reach: no hard cull seam, and the light's
+            // core (out to 0.75·reach) is left untouched — we trim the faint tail, not the light.
+            att *= 1.0f - smoothstep(POINT_LIGHT_TAIL * reach, reach, dist);
 
             // P1 point-light shadows: the host patches falloff.w = shadow slot + 1 (0 = no
             // shadow). shadowmask.comp already did the cube-face atlas test for this pixel —

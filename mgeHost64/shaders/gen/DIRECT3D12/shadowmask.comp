@@ -1289,18 +1289,7 @@ void CS_MAIN( uint3 DispatchThreadID : SV_DISPATCHTHREADID )
                     vis = (gridMix >= 1.0f) ? g
                                             : lerp(shadowBilinear(ap, tmin, tmax, thresh, dynSlot), g, gridMix);
                 }
-
-
-
-
-
-
-
-
-                vis = lerp(vis, 1.0f, smoothstep(0.85f * range, range, ma));
-
-
-
+#line 458 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
                 vis = lerp(1.0f, vis, saturate(tile.w));
                 nib = (uint)(saturate(vis) * 15.0f + 0.5f);
             }
