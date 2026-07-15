@@ -73,23 +73,45 @@ namespace MGEgui.DirectX {
     }
 
     class StaticTexCreator {
-        private readonly System.Collections.Generic.List<string> texCache;
-        private readonly int sizeDivisor;
+        private readonly System.Collections.Generic.HashSet<string> texCache;
+        private readonly float pixelsPerWorld;
+        private readonly int minLod;
 
-        public StaticTexCreator(int skipMips) {
-            sizeDivisor = (1 << skipMips);
-            texCache = new System.Collections.Generic.List<string>();
+        // End-of-run report buckets
+        public int Sliced = 0;
+        public int Resampled = 0;
+        public int Magenta = 0;
+        public readonly System.Collections.Generic.List<string> ResampledPaths = new System.Collections.Generic.List<string>();
+        public readonly System.Collections.Generic.List<string> MagentaPaths = new System.Collections.Generic.List<string>();
+
+        // pixelsPerWorld = renderWidth / (2 * switchDistance * tan(hFov/2)) -- the on-screen texel
+        // budget at the near->distant LOD switch. minLod = smallest texture dimension we ever emit.
+        // (No max clamp: sizing never exceeds the source, and legit large textures are rare.)
+        public StaticTexCreator(float pixelsPerWorld, int minLod) {
+            this.pixelsPerWorld = pixelsPerWorld;
+            this.minLod = minLod;
+            texCache = new System.Collections.Generic.HashSet<string>();
         }
 
         public void Dispose() {
             texCache.Clear();
         }
 
-        public bool LoadTexture(string path) {
-            if (texCache.Contains(path)) {
+        private static int NextPow2(int v) {
+            int p = 1;
+            while (p < v) {
+                p <<= 1;
+            }
+            return p;
+        }
+
+        // extent = world-space size (2 * bounding radius) of the LARGEST static using this texture.
+        // The LOD texture is sized to the object's projected screen size at the switch, one mip
+        // above (x2) for safety -- so the LOD can only ever be sharper than the near view.
+        public bool LoadTexture(string path, float extent) {
+            if (!texCache.Add(path)) {
                 return true;
             }
-            texCache.Add(path);
 
             byte[] data = MGEgui.DistantLand.BSA.GetTexture(path);
             if (data == null) {
@@ -102,25 +124,125 @@ namespace MGEgui.DirectX {
                 data[5] = data[6] = 0;
             }
 
-            path = System.IO.Path.ChangeExtension(path, ".dds");
-            ImageInformation imginfo;
-            Format format;
+            int pixelsAcross = (int)System.Math.Ceiling(extent * pixelsPerWorld);
+            int targetDim = NextPow2(pixelsAcross) * 2;
+            if (targetDim < minLod) {
+                targetDim = minLod;
+            }
 
+            var outputPath = System.IO.Path.Combine(Statics.fn_stattex, System.IO.Path.ChangeExtension(path, ".dds"));
+            System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(outputPath));
+
+            // Non-DDS -> magenta placeholder so modders can see the asset isn't an optimized DDS.
+            bool isDDS = data.Length >= 128 && data[0] == 0x44 && data[1] == 0x44 && data[2] == 0x53 && data[3] == 0x20;
+            if (!isDDS) {
+                if (WriteMagenta(outputPath, targetDim)) {
+                    Magenta++;
+                    MagentaPaths.Add(path);
+                    return true;
+                }
+                return false;
+            }
+
+            // Parse the DDS header
+            int width = BitConverter.ToInt32(data, 16);
+            int height = BitConverter.ToInt32(data, 12);
+            int mipCount = System.Math.Max(1, BitConverter.ToInt32(data, 28));
+            int pfFlags = BitConverter.ToInt32(data, 80);
+            uint fourCC = BitConverter.ToUInt32(data, 84);
+            int bitCount = BitConverter.ToInt32(data, 88);
+            bool isCompressed = (pfFlags & 0x4) != 0;                                  // DDPF_FOURCC
+            int blockSize = isCompressed ? ((fourCC == 0x31545844) ? 8 : 16) : (bitCount / 8); // "DXT1"
+
+            // Pick the source mip whose largest dimension is the smallest one still >= targetDim.
+            int srcMax = System.Math.Max(width, height);
+            int k = 0;
+            while ((srcMax >> (k + 1)) >= targetDim && (srcMax >> (k + 1)) >= 4) {
+                k++;
+            }
+
+            // A complete chain has floor(log2(maxDim)) + 1 levels (down to 1x1). Many modded source
+            // DDS ship a short or absent chain; byte-copying that would leave the LOD texture with
+            // missing mips, so only slice when the source really is complete -- otherwise fall
+            // through to the decode+regenerate path, which rebuilds the whole pyramid.
+            int fullLevels = 1;
+            for (int m = srcMax; m > 1; m >>= 1) {
+                fullLevels++;
+            }
+            bool completeChain = mipCount >= fullLevels;
+
+            // Fast path: slice mip k straight out of the source chain (keeps the author's filtering).
+            if (completeChain && blockSize > 0 && k < mipCount) {
+                int offset = 128, curW = width, curH = height, i = 0;
+                bool ok = true;
+                for (; i < k; i++) {
+                    int mipSize = isCompressed
+                        ? System.Math.Max(1, (curW + 3) / 4) * System.Math.Max(1, (curH + 3) / 4) * blockSize
+                        : curW * curH * blockSize;
+                    if (offset + mipSize > data.Length) { ok = false; break; }
+                    offset += mipSize;
+                    curW = System.Math.Max(1, curW / 2);
+                    curH = System.Math.Max(1, curH / 2);
+                }
+                if (ok) {
+                    int targetMipSize = isCompressed
+                        ? System.Math.Max(1, (curW + 3) / 4) * System.Math.Max(1, (curH + 3) / 4) * blockSize
+                        : curW * curH * blockSize;
+                    if (offset + targetMipSize <= data.Length && WriteSlicedDDS(outputPath, data, offset, curW, curH, targetMipSize, mipCount - k)) {
+                        Sliced++;
+                        return true;
+                    }
+                }
+            }
+
+            // No / incomplete mips: decode the finest level present and downsample to targetDim.
+            if (ResampleTexture(outputPath, data, targetDim)) {
+                Resampled++;
+                ResampledPaths.Add(path);
+                return true;
+            }
+            return false;
+        }
+
+        // Copy the source's 128-byte header, retarget it so the chosen mip (w,h) becomes the top
+        // level, and append that mip PLUS the rest of the source pyramid below it (everything from
+        // offset to end already is that sub-chain). Keeps a real mip chain so the distant texture
+        // doesn't shimmer as it recedes. Preserves the source pixel format exactly.
+        private bool WriteSlicedDDS(string outputPath, byte[] data, int offset, int w, int h, int topMipSize, int mipLevels) {
+            try {
+                using (var fs = new System.IO.FileStream(outputPath, System.IO.FileMode.Create, System.IO.FileAccess.Write)) {
+                    byte[] header = new byte[128];
+                    Array.Copy(data, 0, header, 0, 128);
+                    Array.Copy(BitConverter.GetBytes(h), 0, header, 12, 4);          // height
+                    Array.Copy(BitConverter.GetBytes(w), 0, header, 16, 4);          // width
+                    Array.Copy(BitConverter.GetBytes(topMipSize), 0, header, 20, 4); // pitch / linear size (top level)
+                    Array.Copy(BitConverter.GetBytes(mipLevels), 0, header, 28, 4);  // mip count
+                    Array.Copy(BitConverter.GetBytes(0x401008), 0, header, 108, 4);  // caps: TEXTURE | MIPMAP | COMPLEX
+                    fs.Write(header, 0, 128);
+                    fs.Write(data, offset, data.Length - offset);                    // top mip + rest of the pyramid
+                }
+                return true;
+            } catch (System.IO.IOException) {
+                return false;
+            }
+        }
+
+        // Decode the source (any format, incl. an incomplete chain) and re-emit a DDS at targetDim
+        // (never upscaled beyond the source) with a freshly generated full mip chain, recompressed
+        // to a sensible DXT format.
+        private bool ResampleTexture(string outputPath, byte[] data, int targetDim) {
+            ImageInformation imginfo;
             try {
                 imginfo = ImageInformation.FromMemory(data);
             } catch (SlimDXException) {
                 return false;
             }
- 
-            // Avoid reducing a texture to sizes that aren't DXT block compressible
-            int newWidth = imginfo.Width / sizeDivisor, newHeight = imginfo.Height / sizeDivisor;
-            if (newWidth < 4 || newHeight < 4) {
-                return true;
-            }
 
-            // Select best compressed DDS format for this texture
+            int newWidth = System.Math.Max(4, System.Math.Min(targetDim, imginfo.Width));
+            int newHeight = System.Math.Max(4, System.Math.Min(targetDim, imginfo.Height));
+
+            Format format;
             if (imginfo.Format == Format.Dxt1) {
-                // Mipmaps generate smooth alphas, so any transparency requires DXT3
                 format = isDXT1a(imginfo, data) ? Format.Dxt3 : Format.Dxt1;
             } else if (imginfo.Format == Format.Dxt3 || imginfo.Format == Format.Dxt5) {
                 format = imginfo.Format;
@@ -130,44 +252,48 @@ namespace MGEgui.DirectX {
                 format = Format.Dxt3;
             }
 
-            // Create distant texture if resized or if format conversion is required
-            if (sizeDivisor > 1 || format != imginfo.Format) {
-                Texture t = null;
-
-                var outputPath = System.IO.Path.Combine(Statics.fn_stattex, path);
-                System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(outputPath));
-
-                try {
-                    if (format == imginfo.Format) {
-                        // Load reduced size texture
-                        t = Texture.FromMemory(DXMain.device, data, newWidth, newHeight, 0, Usage.None, format, Pool.Scratch, Filter.Triangle | Filter.Dither, Filter.Triangle, 0);
-                    } else {
-                        // Recalculate mipmaps
-                        Texture srctex = Texture.FromMemory(DXMain.device, data, newWidth, newHeight, 0, Usage.None, Format.A8B8G8R8, Pool.Scratch, Filter.Triangle | Filter.Dither, Filter.Triangle, 0);
-                        t = new Texture(DXMain.device, newWidth, newHeight, 0, Usage.None, format, Pool.Scratch);
-
-                        srctex.FilterTexture(0, Filter.Triangle | Filter.Srgb);
-                        for (int i = 0; i != t.LevelCount; ++i) {
-                            Surface dest = t.GetSurfaceLevel(i);
-                            Surface src = srctex.GetSurfaceLevel(i);
-                            Surface.FromSurface(dest, src, Filter.Point, 0);
-                            src.Dispose();
-                            dest.Dispose();
-                        }
-
-                        srctex.Dispose();
-                    }
-                    Texture.ToFile(t, outputPath, ImageFileFormat.Dds);
+            Texture t = null;
+            try {
+                t = Texture.FromMemory(DXMain.device, data, newWidth, newHeight, 0, Usage.None, format, Pool.Scratch, Filter.Triangle | Filter.Dither, Filter.Triangle, 0);
+                Texture.ToFile(t, outputPath, ImageFileFormat.Dds);
+                t.Dispose();
+                return true;
+            } catch (SlimDXException) {
+                if (t != null) {
                     t.Dispose();
-                } catch (SlimDXException) {
-                    if (t != null) {
-                        t.Dispose();
-                    }
-                    return false;
                 }
+                return false;
             }
+        }
 
-            return true;
+        // Solid-magenta DDS at (dim,dim) with a full mip chain. Used for non-DDS source textures.
+        private bool WriteMagenta(string outputPath, int dim) {
+            Texture t = null;
+            try {
+                t = new Texture(DXMain.device, dim, dim, 0, Usage.None, Format.A8R8G8B8, Pool.Scratch);
+                DataRectangle dr = t.LockRectangle(0, LockFlags.None);
+                byte[] row = new byte[dim * 4];
+                for (int x = 0; x < dim; x++) {
+                    row[x * 4 + 0] = 0xFF; // B
+                    row[x * 4 + 1] = 0x00; // G
+                    row[x * 4 + 2] = 0xFF; // R
+                    row[x * 4 + 3] = 0xFF; // A
+                }
+                for (int y = 0; y < dim; y++) {
+                    dr.Data.Seek((long)y * dr.Pitch, System.IO.SeekOrigin.Begin);
+                    dr.Data.Write(row, 0, row.Length);
+                }
+                t.UnlockRectangle(0);
+                t.FilterTexture(0, Filter.Point); // propagate magenta down the generated mip chain
+                Texture.ToFile(t, outputPath, ImageFileFormat.Dds);
+                t.Dispose();
+                return true;
+            } catch (SlimDXException) {
+                if (t != null) {
+                    t.Dispose();
+                }
+                return false;
+            }
         }
 
         private bool isDXT1a(ImageInformation imginfo, byte[] data) {

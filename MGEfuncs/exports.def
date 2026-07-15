@@ -4,6 +4,9 @@ EXPORTS
 BeginStaticCreation=BeginStaticCreation
 EndStaticCreation=EndStaticCreation
 SetAllowTexturelessShapes=SetAllowTexturelessShapes
+BeginHeroAnim=BeginHeroAnim
+EndHeroAnim=EndHeroAnim
+SetHeroMode=SetHeroMode
 ProcessNif=ProcessNif
 TessellateLandscapeAtlased=TessellateLandscapeAtlased
 

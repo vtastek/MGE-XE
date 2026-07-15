@@ -17,6 +17,7 @@
 #include "../3rdparty/niflib/include/obj/NiTriBasedGeomData.h"
 #include "../3rdparty/niflib/include/obj/NiTriStripsData.h"
 #include "../3rdparty/niflib/include/obj/NiUVController.h"
+#include "../3rdparty/niflib/include/obj/NiUVData.h"
 #include "../3rdparty/niflib/include/obj/RootCollisionNode.h"
 
 #include <assert.h>
@@ -26,6 +27,8 @@
 #include <float.h>
 #include <map>
 #include <memory>
+#include <cstdint>
+#include <utility>
 
 #include <d3d9.h>
 #include <d3dx9.h>
@@ -42,6 +45,17 @@ using std::vector;
 
 static IDirect3DDevice9* device;
 static HANDLE staticFile;
+
+// --- Hero distant-statics animation capture (MGE XE mod: ghostfence + lava) ---
+// When g_heroMode is set (C# loaded a <model>_herodist.nif variant), ProcessNif captures the REAL
+// per-subset NiUVData key groups + NiAlphaProperty blend/test state and appends them to a side file
+// (hero_anim.data) opened by BeginHeroAnim. The side file is additive: absent => no hero anim, and
+// every existing bake keeps loading byte-identically. g_staticOrdinal tracks the distant-static
+// record index (one per successful nif.Save) so hero records join back to the host statics library.
+static bool     g_heroMode = false;
+static HANDLE   g_heroFile = 0;
+static uint32_t g_staticOrdinal = 0;   // next static_meshes record index (reset in BeginStaticCreation)
+static uint32_t g_heroRecordCount = 0; // backpatched into the hero_anim.data header at EndHeroAnim
 
 // Sky-bake only (default false = real distant-land statics gen behaviour is byte-for-byte unchanged):
 // when set, ExportShape accepts textureless / UV-less shapes (MW's vertex/material-coloured sky dome)
@@ -90,6 +104,21 @@ struct DXMatrix {
     float data[4*4];
 };
 
+// Per-subset hero animation, captured only in hero mode. Default-copyable (vectors), so ExportedNode
+// operator= just assigns it. src/dst default to SRCALPHA/INVSRCALPHA, the MW ghostfence/lava blend.
+struct HeroAnim {
+    bool    hasAnim    = false;              // subset carries a NiUVController with keys
+    bool    blend      = false;              // NiAlphaProperty blend enabled
+    uint8_t src        = 6;                  // BlendFunc BF_SRC_ALPHA
+    uint8_t dst        = 7;                  // BlendFunc BF_ONE_MINUS_SRC_ALPHA
+    bool    test       = false;              // alpha test enabled
+    uint8_t func       = 4;                  // TestFunc TF_GREATER
+    uint8_t threshold  = 128;
+    float   cycleStart = 0.0f, cycleStop = 0.0f;  // NiTimeController LOOP window
+    std::vector<std::pair<float, float>> uKeys;   // (time, U offset)
+    std::vector<std::pair<float, float>> vKeys;   // (time, V offset)
+};
+
 struct ExportedNode {
     Vector3 center;
     float radius;
@@ -104,6 +133,7 @@ struct ExportedNode {
     bool alphaTestEnabled;
     bool alphaBlendEnabled;
     bool hasUVController;
+    HeroAnim hero;
 
     ExportedNode() :
         center(0,0,0), radius(0), verts(0), faces(0), emissive(0),
@@ -128,6 +158,7 @@ struct ExportedNode {
         alphaTestEnabled = src.alphaTestEnabled;
         alphaBlendEnabled = src.alphaBlendEnabled;
         hasUVController = src.hasUVController;
+        hero = src.hero;
 
         if (verts) {
             vBuffer = std::make_unique<DXVertex[]>(verts);
@@ -532,6 +563,16 @@ private:
         if (niAlphaProp) {
             node->alphaTestEnabled = niAlphaProp->GetTestState();
             node->alphaBlendEnabled = niAlphaProp->GetBlendState();
+            // Hero mode captures the full blend/test state per subset (the legacy bake collapses both
+            // to one bool; the host would then draw a translucent fence as an opaque cutout).
+            if (g_heroMode) {
+                node->hero.blend     = niAlphaProp->GetBlendState();
+                node->hero.src       = (uint8_t)niAlphaProp->GetSourceBlendFunc();
+                node->hero.dst       = (uint8_t)niAlphaProp->GetDestBlendFunc();
+                node->hero.test      = niAlphaProp->GetTestState();
+                node->hero.func      = (uint8_t)niAlphaProp->GetTestFunc();
+                node->hero.threshold = niAlphaProp->GetTestThreshold();
+            }
         }
 
         // Get diffuse color (will be baked into vertices)
@@ -551,16 +592,35 @@ private:
         // Check for UV controller and extra data, to flag for special rendering
         const char *specialTag = "mge.distant.scroll";
         bool detectedUVAnim = false;
+        NiUVControllerRef uvCtrl = NULL;
 
         if (niGeom->IsAnimated()) {
             for (auto& c : niGeom->GetControllers()) {
-                if (c->IsDerivedType(NiUVController::TYPE)) {
+                NiUVControllerRef uvc = DynamicCast<NiUVController>(c);
+                if (uvc) {
                     detectedUVAnim = true;
+                    uvCtrl = uvc;
                     break;
                 }
             }
         }
-        if (detectedUVAnim) {
+        if (g_heroMode) {
+            // Hero path: capture the REAL NiUVData key groups (0=U off, 1=V off) + LOOP window. No tag
+            // required (the _herodist copy IS the opt-in). hasUVController stays FALSE so the host does
+            // NOT also apply the legacy 0.08 V-scroll; hero anim rides its own slot from hero_anim.data.
+            if (uvCtrl) {
+                NiUVDataRef uvData = uvCtrl->GetData();
+                if (uvData) {
+                    vector<KeyGroup<float>> groups = uvData->GetUVGroups();
+                    for (const auto& k : groups[0].keys) { node->hero.uKeys.push_back(std::make_pair(k.time, k.data)); }
+                    for (const auto& k : groups[1].keys) { node->hero.vKeys.push_back(std::make_pair(k.time, k.data)); }
+                }
+                node->hero.cycleStart = uvCtrl->GetStartTime();
+                node->hero.cycleStop  = uvCtrl->GetStopTime();
+                node->hero.hasAnim    = !node->hero.uKeys.empty() || !node->hero.vKeys.empty();
+            }
+        } else if (detectedUVAnim) {
+            // Legacy path: only the hand-tagged _dist stand-ins get the single-layer V scroll.
             for (auto& extra : niGeom->GetExtraData()) {
                 auto extraString = DynamicCast<NiStringExtraData>(extra);
                 if (extraString && extraString->GetData() == specialTag) {
@@ -677,6 +737,11 @@ public:
         // Try to combine nodes that have the same texture path
         map<string, ExportedNode*> node_tex;
 
+        // Hero meshes must NOT merge by texture: the ghostfence layers a "faster" and a "slower"
+        // NiTriShape over the SAME tx_gg_fence_01 texture, and the interference between them at 2:1
+        // scroll speeds IS the effect. Merging would collapse them to one subset (one UV offset) and
+        // kill it. Keep every subset distinct so each carries its own controller + alpha state.
+        if (!g_heroMode) {
         for (size_t i = 0; i < nodes.size(); ++i) {
             // Check if this node has already been found
             map<string, ExportedNode*>::iterator it = node_tex.find(nodes[i].tex);
@@ -688,6 +753,7 @@ public:
                 // A shape with this texture has been found already.  Merge this one into it.
                 MergeShape(it->second, &nodes[i]);
             }
+        }
         }
 
         size_t count = 0;
@@ -835,16 +901,95 @@ extern "C" float __stdcall ProcessNif(char* data, int datasize, float simplify, 
         return -3;
     }
 
+    // This static's index in static_meshes == the host statics-library index. Increment for EVERY
+    // successful Save (hero or not) so hero records join back to the right library static.
+    uint32_t thisStatic = g_staticOrdinal++;
+
+    // Hero mode: append this static's animated / blended subsets to hero_anim.data. Subset index i
+    // matches the host's subset order because hero mode skips the texture merge (subsets stay 1:1).
+    if (g_heroMode && g_heroFile) {
+        DWORD unused;
+        for (size_t i = 0; i < nif.nodes.size(); ++i) {
+            const HeroAnim& h = nif.nodes[i].hero;
+            if (!h.hasAnim && !h.blend) { continue; }   // only subsets the host needs to know about
+            uint16_t subset = (uint16_t)i;
+            uint8_t  blend = h.blend ? 1 : 0;
+            uint8_t  test  = h.test  ? 1 : 0;
+            uint8_t  nU = h.uKeys.size() > 255 ? 255 : (uint8_t)h.uKeys.size();
+            uint8_t  nV = h.vKeys.size() > 255 ? 255 : (uint8_t)h.vKeys.size();
+            WriteFile(g_heroFile, &thisStatic, 4, &unused, 0);
+            WriteFile(g_heroFile, &subset, 2, &unused, 0);
+            WriteFile(g_heroFile, &blend, 1, &unused, 0);
+            WriteFile(g_heroFile, &h.src, 1, &unused, 0);
+            WriteFile(g_heroFile, &h.dst, 1, &unused, 0);
+            WriteFile(g_heroFile, &test, 1, &unused, 0);
+            WriteFile(g_heroFile, &h.func, 1, &unused, 0);
+            WriteFile(g_heroFile, &h.threshold, 1, &unused, 0);
+            WriteFile(g_heroFile, &h.cycleStart, 4, &unused, 0);
+            WriteFile(g_heroFile, &h.cycleStop, 4, &unused, 0);
+            WriteFile(g_heroFile, &nU, 1, &unused, 0);
+            WriteFile(g_heroFile, &nV, 1, &unused, 0);
+            for (uint8_t k = 0; k < nU; ++k) {
+                float t = h.uKeys[k].first, v = h.uKeys[k].second;
+                WriteFile(g_heroFile, &t, 4, &unused, 0);
+                WriteFile(g_heroFile, &v, 4, &unused, 0);
+            }
+            for (uint8_t k = 0; k < nV; ++k) {
+                float t = h.vKeys[k].first, v = h.vKeys[k].second;
+                WriteFile(g_heroFile, &t, 4, &unused, 0);
+                WriteFile(g_heroFile, &v, 4, &unused, 0);
+            }
+            ++g_heroRecordCount;
+        }
+    }
+
     return nif.radius;
 }
 
 extern "C" void __stdcall BeginStaticCreation(IDirect3DDevice9* _device, char* outpath) {
     device = _device;
+    g_staticOrdinal = 0;   // fresh library index run; hero records join against it
     if (outpath) {
         staticFile = CreateFileA(outpath, FILE_GENERIC_WRITE, 0, 0, CREATE_ALWAYS, 0, 0);
     } else {
         staticFile = 0;
     }
+}
+
+// --- Hero animation side file (MGE XE mod) ---------------------------------------------------
+// SetHeroMode toggles per-NIF capture; the C# driver sets it right before ProcessNif when it loaded
+// a <model>_herodist.nif variant, and clears it after. BeginHeroAnim/EndHeroAnim bracket the whole
+// statics run (call once, around BeginStaticCreation/EndStaticCreation).
+extern "C" void __stdcall SetHeroMode(int on) {
+    g_heroMode = (on != 0);
+}
+
+extern "C" void __stdcall BeginHeroAnim(char* outpath) {
+    g_heroRecordCount = 0;
+    g_heroFile = 0;
+    if (outpath) {
+        HANDLE h = CreateFileA(outpath, FILE_GENERIC_WRITE, 0, 0, CREATE_ALWAYS, 0, 0);
+        if (h != INVALID_HANDLE_VALUE) {
+            g_heroFile = h;
+            DWORD unused;
+            char     magic[4] = { 'M', 'G', 'H', 'A' };
+            uint32_t version  = 1;
+            uint32_t count    = 0;   // placeholder, backpatched in EndHeroAnim
+            WriteFile(g_heroFile, magic, 4, &unused, 0);
+            WriteFile(g_heroFile, &version, 4, &unused, 0);
+            WriteFile(g_heroFile, &count, 4, &unused, 0);
+        }
+    }
+}
+
+extern "C" void __stdcall EndHeroAnim() {
+    if (g_heroFile) {
+        SetFilePointer(g_heroFile, 8, NULL, FILE_BEGIN);   // recordCount field (after magic+version)
+        DWORD unused;
+        WriteFile(g_heroFile, &g_heroRecordCount, 4, &unused, 0);
+        CloseHandle(g_heroFile);
+    }
+    g_heroFile = 0;
 }
 
 extern "C" void __stdcall EndStaticCreation() {

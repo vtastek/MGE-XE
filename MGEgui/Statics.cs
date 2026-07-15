@@ -215,6 +215,7 @@ namespace MGEgui {
         public const string fn_statics = fn_dl + @"\statics";
         public const string fn_usagedata = fn_dl + @"\statics\usage.data";
         public const string fn_statmesh = fn_dl + @"\statics\static_meshes";
+        public const string fn_heroanim = fn_dl + @"\statics\hero_anim.data";
         public const string fn_stattex = fn_dl + @"\statics\textures";
         public const string fn_postShaders = fn_dataFiles + @"\shaders\XEshaders";
         public const string fn_testImagePath = "MGE3";
