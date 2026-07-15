@@ -533,6 +533,7 @@ cbStatIntExt = "Интерьеры, похожие на экстерьер"
 cbStatIntWater = "Отражения на воде в интерьерах\n(увеличит время их загрузки)"
 cbStatActivators = "Активаторы"
 cbStatIncludeMisc = "Прочие объекты"
+cbStatFixMips = "Fix incomplete source mipmaps"
 bStatOverrideList = "List"
 lStatOverrideList = "Нет объектов-исключений"
 bStatExportStatics = "Экспорт"
@@ -543,6 +544,7 @@ cbStatOverrideList = "Использовать следующие списки �
 tabFinish = "Готово"
 lFinishDesc = "Создаются объекты"
 bFinish = "Готово"
+bStatReport = "View report"
 
 
 

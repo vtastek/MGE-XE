@@ -82,6 +82,7 @@ namespace MGEgui.DistantLand {
             this.cbStatIntWater = new System.Windows.Forms.CheckBox();
             this.cbStatActivators = new System.Windows.Forms.CheckBox();
             this.cbStatIncludeMisc = new System.Windows.Forms.CheckBox();
+            this.cbStatFixMips = new System.Windows.Forms.CheckBox();
             this.lStatDesc = new System.Windows.Forms.Label();
             this.bStatOverrideList = new System.Windows.Forms.Button();
             this.bStatExportStatics = new System.Windows.Forms.Button();
@@ -91,6 +92,7 @@ namespace MGEgui.DistantLand {
             this.tabFinish = new System.Windows.Forms.TabPage();
             this.lFinishDesc = new System.Windows.Forms.Label();
             this.bFinish = new System.Windows.Forms.Button();
+            this.bStatReport = new System.Windows.Forms.Button();
             this.saveStaticListDialog = new System.Windows.Forms.SaveFileDialog();
             this.toolTip = new System.Windows.Forms.ToolTip(this.components);
             this.statusBar.SuspendLayout();
@@ -755,6 +757,7 @@ namespace MGEgui.DistantLand {
             this.flowLayoutStaticsOptions.Controls.Add(this.cbStatIntWater);
             this.flowLayoutStaticsOptions.Controls.Add(this.cbStatActivators);
             this.flowLayoutStaticsOptions.Controls.Add(this.cbStatIncludeMisc);
+            this.flowLayoutStaticsOptions.Controls.Add(this.cbStatFixMips);
             this.flowLayoutStaticsOptions.FlowDirection = System.Windows.Forms.FlowDirection.TopDown;
             this.flowLayoutStaticsOptions.Location = new System.Drawing.Point(296, 50);
             this.flowLayoutStaticsOptions.Name = "flowLayoutStaticsOptions";
@@ -811,7 +814,19 @@ namespace MGEgui.DistantLand {
             this.cbStatIncludeMisc.TabIndex = 9;
             this.cbStatIncludeMisc.Text = "Include misc objects";
             this.cbStatIncludeMisc.UseVisualStyleBackColor = true;
-            // 
+            //
+            // cbStatFixMips
+            //
+            this.cbStatFixMips.AutoSize = true;
+            this.cbStatFixMips.Checked = true;
+            this.cbStatFixMips.CheckState = System.Windows.Forms.CheckState.Checked;
+            this.cbStatFixMips.Location = new System.Drawing.Point(3, 143);
+            this.cbStatFixMips.Name = "cbStatFixMips";
+            this.cbStatFixMips.Size = new System.Drawing.Size(180, 19);
+            this.cbStatFixMips.TabIndex = 10;
+            this.cbStatFixMips.Text = "Fix incomplete source mipmaps";
+            this.cbStatFixMips.UseVisualStyleBackColor = true;
+            //
             // lStatDesc
             // 
             this.lStatDesc.AutoSize = true;
@@ -884,6 +899,7 @@ namespace MGEgui.DistantLand {
             // 
             this.tabFinish.Controls.Add(this.lFinishDesc);
             this.tabFinish.Controls.Add(this.bFinish);
+            this.tabFinish.Controls.Add(this.bStatReport);
             this.tabFinish.Location = new System.Drawing.Point(4, 27);
             this.tabFinish.Name = "tabFinish";
             this.tabFinish.Size = new System.Drawing.Size(586, 368);
@@ -911,6 +927,18 @@ namespace MGEgui.DistantLand {
             this.bFinish.Text = "Finish";
             this.bFinish.UseVisualStyleBackColor = true;
             this.bFinish.Click += new System.EventHandler(this.bFinish_Click);
+            //
+            // bStatReport
+            //
+            this.bStatReport.Anchor = ((System.Windows.Forms.AnchorStyles)((System.Windows.Forms.AnchorStyles.Top | System.Windows.Forms.AnchorStyles.Right)));
+            this.bStatReport.Enabled = false;
+            this.bStatReport.Location = new System.Drawing.Point(276, 310);
+            this.bStatReport.Name = "bStatReport";
+            this.bStatReport.Size = new System.Drawing.Size(148, 25);
+            this.bStatReport.TabIndex = 2;
+            this.bStatReport.Text = "View report";
+            this.bStatReport.UseVisualStyleBackColor = true;
+            this.bStatReport.Click += new System.EventHandler(this.bStatReport_Click);
             // 
             // saveStaticListDialog
             // 
@@ -1019,6 +1047,7 @@ namespace MGEgui.DistantLand {
         private System.Windows.Forms.Label lStatSkipMipDesc;
         private System.Windows.Forms.CheckBox cbStatActivators;
         private System.Windows.Forms.CheckBox cbStatIncludeMisc;
+        private System.Windows.Forms.CheckBox cbStatFixMips;
         private System.Windows.Forms.CheckBox cbStatIntWater;
         private System.Windows.Forms.CheckBox cbStatOverrideList;
         private System.Windows.Forms.Button bStatOverrideList;
@@ -1030,6 +1059,7 @@ namespace MGEgui.DistantLand {
         private System.Windows.Forms.Button bStatRun;
         private System.Windows.Forms.Label lFinishDesc;
         private System.Windows.Forms.Button bFinish;
+        private System.Windows.Forms.Button bStatReport;
         public System.Windows.Forms.SaveFileDialog saveStaticListDialog;
     }
 }

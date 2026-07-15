@@ -226,6 +226,7 @@ namespace MGEgui.DistantLand {
         private static INIFile.INIVariableDef iniActivators = new INIFile.INIVariableDef("Activators", iniDLWizardSets, "Include activators", INIFile.INIBoolType.Text, "True");
         private static INIFile.INIVariableDef iniMiscObj = new INIFile.INIVariableDef("MiscObj", iniDLWizardSets, "Include misc objects", INIFile.INIBoolType.Text, "True");
         private static INIFile.INIVariableDef iniUseStatOvr = new INIFile.INIVariableDef("UseStatOvr", iniDLWizardSets, "Use static overrides", INIFile.INIBoolType.Text, "True");
+        private static INIFile.INIVariableDef iniFixMips = new INIFile.INIVariableDef("FixMips", iniDLWizardSets, "Fix incomplete source mipmaps", INIFile.INIBoolType.OnOff, "On");
 
         // set of keys to read at form creation
         private static INIFile.INIVariableDef[] iniDLWizardVars = {
@@ -244,7 +245,8 @@ namespace MGEgui.DistantLand {
             iniStatIntWater,
             iniActivators, 
             iniMiscObj, 
-            iniUseStatOvr
+            iniUseStatOvr,
+            iniFixMips
         };
 
         // set of keys to write after plugin selection
@@ -279,7 +281,8 @@ namespace MGEgui.DistantLand {
             iniStatIntWater,
             iniActivators, 
             iniMiscObj, 
-            iniUseStatOvr
+            iniUseStatOvr,
+            iniFixMips
         };
 
         // configuration of setup steps
@@ -351,6 +354,7 @@ namespace MGEgui.DistantLand {
             cbStatActivators.Checked = (iniFile.getKeyValue("Activators") == 1);
             cbStatIncludeMisc.Checked = (iniFile.getKeyValue("MiscObj") == 1);
             cbStatOverrideList.Checked = (iniFile.getKeyValue("UseStatOvr") == 1);
+            cbStatFixMips.Checked = (iniFile.getKeyValue("FixMips") == 1);
 
             lbStatOverrideList.Items.Clear();
             lbStatOverrideList.BeginUpdate();
@@ -412,6 +416,7 @@ namespace MGEgui.DistantLand {
             iniFile.setKey("Activators", cbStatActivators.Checked);
             iniFile.setKey("MiscObj", cbStatIncludeMisc.Checked);
             iniFile.setKey("UseStatOvr", cbStatOverrideList.Checked);
+            iniFile.setKey("FixMips", cbStatFixMips.Checked);
 
             var tempList = new List<string>();
             foreach (OverrideListItem item in lbStatOverrideList.Items) {
@@ -979,6 +984,7 @@ namespace MGEgui.DistantLand {
             public bool UseOverrideList;
             public bool Activators;
             public bool Misc;
+            public bool FixMips;
         }
 
         private void GrassDensityThreshold(float GrassDensity, KeyValuePair<string, Dictionary<string, StaticReference>> cellStatics, KeyValuePair<string, StaticReference> pair, Random rnd, List<StaticToRemove> UsedStaticsToRemove) {
@@ -1392,7 +1398,7 @@ namespace MGEgui.DistantLand {
                 } catch { }
                 float pixelsPerWorld = renderWidth / (2.0f * switchDist * (float)System.Math.Tan(hFov * 0.5));
 
-                var stc = new StaticTexCreator(pixelsPerWorld, 64);
+                var stc = new StaticTexCreator(pixelsPerWorld, 64, args.FixMips);
                 int vert_size = NativeMethods.GetCompressedVertSize(), face_size = 6;
 
                 // Phase 1: walk the mesh library, record the largest bounding size per texture.
@@ -1445,6 +1451,10 @@ namespace MGEgui.DistantLand {
                 dlMagenta = stc.Magenta;
                 dlMagentaPaths = stc.MagentaPaths;
                 dlResampledPaths = stc.ResampledPaths;
+                dlMipFixed = stc.MipFixed;
+                dlMipFixSkippedBsa = stc.MipFixSkippedBsa;
+                dlMipFixedPaths = stc.MipFixedPaths;
+                dlBsaSkippedPaths = stc.BsaSkippedPaths;
 
                 stc.Dispose();
             }
@@ -1459,6 +1469,9 @@ namespace MGEgui.DistantLand {
         private int dlSliced, dlResampled, dlMagenta;
         private List<string> dlMagentaPaths;
         private List<string> dlResampledPaths;
+        private int dlMipFixed, dlMipFixSkippedBsa;
+        private List<string> dlMipFixedPaths;
+        private List<string> dlBsaSkippedPaths;
 
         void workerFCreateStatics(object sender, System.ComponentModel.RunWorkerCompletedEventArgs e) {
             if (e != null) {
@@ -1532,19 +1545,37 @@ namespace MGEgui.DistantLand {
                              + strings["TotalSize"] + (fileSize / (1024 * 1024)) + " MB";/* + "\r\n"
                 + "Total processed cells: " + cells + "\r\n"
                 + "Total unique statics: " + (statics - 2);*/
-            summary += "\r\n\r\nDistant statics textures: " + dlSliced + " sliced, " + dlResampled + " resampled, " + dlMagenta + " magenta (non-DDS)"
+            summary += "\r\n\r\nDistant statics textures: " + dlSliced + " sliced, " + dlResampled + " resampled, " + dlMagenta + " magenta (non-DDS), " + dlMipFixed + " mip-fixed"
                      + "\r\nDistant textures stage: " + dlStaticsTexMs + " ms";
+            // Concise counts stay in the finish window; the (potentially long) per-texture lists go
+            // only to the log, opened via the "View report" button, so the window stays readable.
+            string detail = summary;
             if (dlMagenta > 0 && dlMagentaPaths != null) {
-                summary += "\r\nNon-DDS (magenta) textures to optimize:";
+                detail += "\r\nNon-DDS (magenta) textures to optimize:";
                 foreach (string mp in dlMagentaPaths) {
-                    summary += "\r\n  " + mp;
+                    detail += "\r\n  " + mp;
                 }
             }
             if (dlResampled > 0 && dlResampledPaths != null) {
-                summary += "\r\nMissing/incomplete mips (resampled):";
+                detail += "\r\nMissing/incomplete mips (resampled):";
                 foreach (string rp in dlResampledPaths) {
-                    summary += "\r\n  " + rp;
+                    detail += "\r\n  " + rp;
                 }
+            }
+            if (dlMipFixed > 0 && dlMipFixedPaths != null) {
+                detail += "\r\nSource mipmaps completed (originals backed up in " + StaticTexCreator.MipFixBackupDir + "):";
+                foreach (string fp in dlMipFixedPaths) {
+                    detail += "\r\n  " + fp;
+                }
+            }
+            if (dlMipFixSkippedBsa > 0 && dlBsaSkippedPaths != null) {
+                detail += "\r\nIncomplete mips in BSA (left untouched -- cannot fix packed vanilla assets):";
+                foreach (string bp in dlBsaSkippedPaths) {
+                    detail += "\r\n  " + bp;
+                }
+            }
+            if (detail.Length != summary.Length) {
+                summary += "\r\n\r\nClick 'View report' for the full per-texture list.";
             }
             if (SetupFlags["AutoRun"]) {
                 setFinishDesc(5);
@@ -1553,10 +1584,11 @@ namespace MGEgui.DistantLand {
                 lFinishDesc.Text = summary;
             }
             try {
-                File.AppendAllText(Statics.fn_dlLog, "########################################\r\n" + summary);
+                File.AppendAllText(Statics.fn_dlLog, "########################################\r\n" + detail);
             } catch {
             }
             bFinish.Enabled = true;
+            bStatReport.Enabled = true;
         }
 
         private struct ExportStaticsArgs {
@@ -2703,6 +2735,7 @@ namespace MGEgui.DistantLand {
             csa.Activators = cbStatActivators.Checked;
             csa.Misc = cbStatIncludeMisc.Checked;
             csa.UseOverrideList = cbStatOverrideList.Checked;
+            csa.FixMips = cbStatFixMips.Checked;
             csa.OverrideFiles = new List<string>();
             csa.OverrideFiles.Add(Statics.fn_dlDefaultOverride);
             foreach (OverrideListItem item in lbStatOverrideList.Items) {
@@ -3164,6 +3197,15 @@ namespace MGEgui.DistantLand {
             ChangingPage = true;
             Statics.mf.tabControl.SelectedIndex = 7;
             Close();
+        }
+
+        private void bStatReport_Click(object sender, EventArgs e) {
+            try {
+                if (File.Exists(Statics.fn_dlLog)) {
+                    System.Diagnostics.Process.Start(Statics.fn_dlLog);
+                }
+            } catch {
+            }
         }
 
         /* Finish tab methods */
