@@ -314,8 +314,13 @@ namespace IPC {
         // frame zeroes the shipped eyePos), isExterior gates DL feeding. Host reads it into
         // FrameData.lodEye + g_dlExterior.
         // C2 appends an 8th float4 (skyZenith.rgb, _) — the current interpolated zenith sky colour for
-        // the host-computed dome gradient (FrameData.skyZenith). 32 floats total.
-        IN float lighting[32];
+        // the host-computed dome gradient (FrameData.skyZenith).
+        // A 9th float4 carries [32] = MW's SIMULATION time in seconds (mwBridge->simulationTime()),
+        // which drives the UV scroll of UV-animated distant statics (ghostfence). It must be MW's sim
+        // clock, not the host's: sim time does not advance in menus, and it is the exact value MGE's
+        // DX9 path feeds its `time` shader uniform (distantland.cpp SetFloat(ehTime, simulationTime())),
+        // so both renderers scroll in step under an F11 A/B. 36 floats total.
+        IN float lighting[36];
         IN VecId drawList;               // chunked byte vec of DrawItemWire[]; Invalid ⇒ triangle
         IN std::uint32_t drawCount;
         IN std::uint32_t drawBytes;

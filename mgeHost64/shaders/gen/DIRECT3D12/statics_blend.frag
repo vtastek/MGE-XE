@@ -972,9 +972,9 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 156 "FSL/shaders.list"
-#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
-#line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 145 "FSL/shaders.list"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics_blend.frag.fsl"
+#line 11 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics_blend.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 #line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(FrameData)
@@ -1105,158 +1105,42 @@ STRUCT(LightData)
 
         Tex2DArray(float4) gStaticsArrays[ 128 ] :  register(t896,space0);
         CBUFFER(BatchData) gBatch :  register(b0,space2);
-#line 22 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/water.frag.fsl"
+#line 12 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics_blend.frag.fsl"
+
 
 STRUCT(VSOutput)
 {
     DATA(float4, Position, SV_Position);
-    DATA(float3, WorldPos, TEXCOORD0);
-#line 27
+    DATA(float2, Uv, TEXCOORD0);
+    DATA(CENTROID(float4), Color, COLOR);
+    DATA(CENTROID(float), Fog, TEXCOORD1);
+    DATA(FLAT(uint), TexIndex, TEXCOORD2);
+    DATA(FLAT(uint), Flags, TEXCOORD3);
+    DATA(float3, WorldPos, TEXCOORD4);
+#line 23
 };
-
-
-
-float3 reconstructWorld(float4x4 invVP, float2 uv, float deviceZ)
-{
-    float ndcX = uv.x * 2.0f - 1.0f;
-    float ndcY = 1.0f - uv.y * 2.0f;
-    float4 p = mul(invVP, float4(ndcX, ndcY, deviceZ, 1.0f));
-    return p.xyz / p.w;
-}
 
 [RootSignature( "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "3" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "3" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "2" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "2" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "1" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "1" ", offset = 0))," "DescriptorTable(" "SRV(t0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "CBV(b0, numDescriptors = unbounded, space = " "0" ", offset = 0)," "UAV(u0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "DescriptorTable(" "SAMPLER(s0, numDescriptors = unbounded, space = " "0" ", offset = 0))," "StaticSampler(s0, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s1, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s2, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s3, space = 100," "filter = FILTER_MIN_MAG_LINEAR_MIP_POINT," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s4, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s5, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s6, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s7, space = 100," "filter = FILTER_MIN_MAG_MIP_POINT, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s8, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR," "addressU = TEXTURE_ADDRESS_MIRROR, addressV = TEXTURE_ADDRESS_MIRROR, addressW = TEXTURE_ADDRESS_MIRROR)," "StaticSampler(s9, space = 100," "filter = FILTER_MIN_MAG_MIP_LINEAR, borderColor = STATIC_BORDER_COLOR_TRANSPARENT_BLACK," "addressU = TEXTURE_ADDRESS_BORDER, addressV = TEXTURE_ADDRESS_BORDER, addressW = TEXTURE_ADDRESS_BORDER)," "StaticSampler(s10, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s11, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s12, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s13, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 8," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s14, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s15, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP)," "StaticSampler(s16, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_WRAP, addressW = TEXTURE_ADDRESS_WRAP)," "StaticSampler(s17, space = 100," "filter = FILTER_ANISOTROPIC, maxAnisotropy = 2," "addressU = TEXTURE_ADDRESS_WRAP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_WRAP)" )]
 float4 PS_MAIN( VSOutput In ): SV_TARGET
 {
     //INIT_MAIN;
+    uint bucket = In.TexIndex >> 16;
+    uint layer = In.TexIndex & 0xFFFFu;
+    float4 tex = SampleTex2DArray(gStaticsArrays[bucket], gSamplerAnisotropic, float3(In.Uv, (float)layer));
+
+    float3 result = tex.rgb * In.Color.rgb;
+    result = lerp(gFrameData.fogColNear.rgb, result, In.Fog);
 
 
-    float4x4 P = transpose(gBatch.worlds[6]);
-    float4x4 invVP = gBatch.worlds[7];
-    float waterLevelRel = P[0].x;
-    float windFactor = P[0].y;
-    float shoreDepthBias= P[0].z;
-    float time = P[0].w;
-    float3 depthBaseColor= P[1].xyz;
-    bool underwater = P[1].w > 0.5f;
-    float3 camFwd = P[2].xyz;
-    uint waterDbg = (uint)(P[3].x + 0.5f);
-
-    float2 invScreen = gFrameData.debugParams.yz;
-    float3 fogCol = gFrameData.fogColNear.rgb;
-
-
-    float3 EyeVec = In.WorldPos;
-    float dist = length(EyeVec);
-    EyeVec = (dist > 1e-4f) ? EyeVec / dist : float3(0, 0, 1);
-
-
-    float fog = saturate((gFrameData.fogParams.y - dist)
-                       / (gFrameData.fogParams.y - gFrameData.fogParams.x));
-
-
-
-    float2 worldXY = In.WorldPos.xy + gFrameData.lodEye.xy;
-
-
-    if (underwater) {
-        float uw = saturate(exp(-dist / 4096.0f));
-        float3 col = lerp(fogCol, depthBaseColor, uw);
-        return (float4(col, 1.0f));
+    uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
+    if (dbg == 1u || dbg == 2u) {
+        float dist = length(In.WorldPos - gFrameData.eyePos.xyz);
+        float g = saturate(dist * (1.0f / 8192.0f));
+        return (float4(g, g, g, 1.0f));
     }
 
 
-    float t = 0.4f * time;
-    float2 tc1 = worldXY / 3900.0f;
-    float2 tc2 = worldXY / 527.0f;
-    float2 far_n = SampleLvlTex3D(gWaterNormalVol, gSamplerBilinearWrap, float3(tc1, t), 0.0f).rg;
-    float2 close_n = SampleLvlTex3D(gWaterNormalVol, gSamplerBilinearWrap, float3(tc2, t), 0.0f).rg;
-    float2 normal_R = 2.0f * lerp(close_n, far_n, saturate(dist / 8000.0f)) - 1.0f;
-    float3 normal = normalize(float3(normal_R, 1.0f));
-
-
-    float3 depthColor = lerp(fogCol, depthBaseColor, fog);
-
-
-    float2 reffactor = (windFactor * dist + 0.1f) * normal.xy;
-    float2 baseUV = In.Position.xy * invScreen;
-
-
-    float2 distUV = baseUV + reffactor.yx * invScreen;
-    float sceneDevZ= SampleLvlTex2D(gSceneLinDepth, gSamplerPointClamp, distUV, 0.0f).r;
-    float3 sceneW = reconstructWorld(invVP, distUV, sceneDevZ);
-    float sceneDist= length(sceneW);
-    float aboveWater = step(sceneDist + shoreDepthBias, dist);
-    float depth = max(shoreDepthBias, sceneDist - dist);
-
-    float3 refracted = depthColor;
-    float shorefactor = 0.0f;
-    if (depth < 4000.0f && aboveWater < 0.5f) {
-        float2 ruv = baseUV + saturate(depth / 100.0f) * reffactor.yx * invScreen;
-        refracted = SampleLvlTex2D(gRefractColor, gSamplerBilinearClamp, ruv, 0.0f).rgb;
-
-
-        sceneDevZ = SampleLvlTex2D(gSceneLinDepth, gSamplerPointClamp, ruv, 0.0f).r;
-        sceneW = reconstructWorld(invVP, ruv, sceneDevZ);
-        sceneDist = length(sceneW);
-        depth = max(shoreDepthBias, sceneDist - dist);
-        float denom = max(abs(dot(EyeVec, camFwd)), 0.25f);
-        depth /= denom;
-        depth += 300.0f * (0.95f - normal.z);
-
-        float depthscale = saturate(exp(-depth / 500.0f));
-        shorefactor = pow(depthscale, 25.0f);
-        refracted = lerp(depthColor, refracted, 0.8f * depthscale + 0.2f * shorefactor);
-    }
-
-
-
-
-
-
-    float2 reflUV = baseUV + float2(-2.1f * reffactor.x, abs(reffactor.y)) * invScreen;
-    float4 reflSample = SampleLvlTex2D(gReflectColor, gSamplerBilinearClamp, reflUV, 0.0f);
-    float3 reflected = reflSample.rgb + fogCol * (1.0f - reflSample.a);
-	float3 deb = reflected;
-    reflected = lerp(reflected * 0.96f, reflected, fog);
-
-
-
-
-
-    if (waterDbg == 1u) { RETURN(float4(reflSample.rgb, 1.0f)); }
-    if (waterDbg == 2u) { RETURN(float4(refracted, 1.0f)); }
-
-
-    float3 adjustnormal = lerp(float3(0, 0, 0.1f), normal, pow(saturate(1.05f * fog), 2.0f));
-    adjustnormal = lerp(adjustnormal, float3(0, 0, 1.0f),
-                        (1.0f + EyeVec.z) * (1.0f - saturate(1.0f / (dist / 1000.0f + 1.0f))));
-    float fresnel = dot(-EyeVec, adjustnormal);
-    fresnel = 0.02f + pow(saturate(0.9988f - 0.28f * fresnel), 16.0f);
-    float3 result = lerp(refracted, reflected, fresnel);
-
-
-
-    float3 sunPos = -gFrameData.sunDir.xyz;
-    float vdotr = dot(-EyeVec, reflect(-sunPos, normal));
-    vdotr = saturate(1.0025f * vdotr);
-    float3 spec = gFrameData.sunCol.rgb * (pow(vdotr, 170.0f) + 0.07f * pow(vdotr, 4.0f));
-    result += spec * fog;
-
-
-    float wdist = dist / lerp(1200.0f, 0.0f, saturate((-waterLevelRel) / 7.0f));
-    float wcut = smoothstep(0.09f, 0.1f, wdist);
-    float wcutdark = smoothstep(0.0889f, 0.101f, wdist);
-    wcutdark = wcutdark * (1.0f - wcutdark);
-    wcutdark = saturate(wcutdark * 3.0f);
-    result = lerp(refracted, result, wcut);
-    result = lerp(result, result * 0.1f, wcutdark);
-
-
-
-    result = lerp(result, refracted, shorefactor * fog);
-
-	result = result;
-
-    return (float4(result, 1.0f));
+    float alpha = saturate(tex.a * In.Color.a);
+    return (float4(result, alpha));
 }
-#line 157 "FSL/shaders.list"
+#line 146 "FSL/shaders.list"

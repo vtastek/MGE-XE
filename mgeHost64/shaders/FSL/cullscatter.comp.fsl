@@ -32,13 +32,15 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
                     : (inst.rangeEndIdx == 1u) ? gCullParams.ranges.y
                                                : gCullParams.ranges.z;
 
+    // Near cut is 3D (height-aware), far tier range horizontal — MUST match cull.comp.fsl exactly
+    // (same inputs/order) so the scatter agrees bit-for-bit with the counts the prefix-sum sized.
     float dx = inst.posX - gCullParams.eye.x;
     float dy = inst.posY - gCullParams.eye.y;
-    float d2 = dx * dx + dy * dy;
-    if (d2 < gCullParams.ranges.w || d2 > rangeEnd2)
-        RETURN();
-
     float cz = inst.posZ - gCullParams.eye.z;
+    float d2 = dx * dx + dy * dy;
+    float dNear2 = d2 + cz * cz;
+    if (dNear2 < gCullParams.ranges.w || d2 > rangeEnd2)
+        RETURN();
     UNROLL
     for (uint p = 0u; p < 6u; ++p)
     {

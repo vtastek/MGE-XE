@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 164 "FSL/shaders.list"
+#line 177 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowatlasview.frag.fsl"
 #line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowatlasview.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1033,20 +1033,32 @@ STRUCT(FrameData)
 
 
     float4 alphaParams;
-#line 83
+
+
+
+
+    float4 timeParams;
+
+
+
+
+
+
+    float4 uvOffsets[8];
+#line 95
 };
 
 STRUCT(BatchData)
 {
     float4x4 worlds[ 1024 ];
-#line 88
+#line 100
 };
-#line 109 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 121 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(LightData)
 {
     float4 lightParams;
     float4 lights[ 128  * 3];
-#line 113
+#line 125
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1086,7 +1098,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 168 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 180 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 896 ] :  register(t0,space0);
 
 
@@ -1211,4 +1223,4 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     }
     return (float4(col, 1.0f));
 }
-#line 165 "FSL/shaders.list"
+#line 178 "FSL/shaders.list"

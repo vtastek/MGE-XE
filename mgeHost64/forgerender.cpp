@@ -676,7 +676,7 @@ namespace ForgeRender {
         float vp[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
         // Tier 1 lighting (6×float4): sun OFF, ambient 0.5, no fog — so the SLOT-0 white-texture
         // guard below stays a clean normal-independent value (white × 0.5, tonemapped ≈ 129).
-        float lt[32] = {
+        float lt[36] = {
             0,0,-1,0,           // sunDir (unused, sunCol=0)
             0,0,0,0,            // sunCol = 0
             0.5f,0.5f,0.5f,0,   // ambCol
@@ -684,7 +684,8 @@ namespace ForgeRender {
             0, 1e9f, 0,0,       // fogParams: start=0, end=1e9 -> fog ≈ 1 (clear)
             0,0,0,0,            // eyePos
             0,0,0,0,            // realEye.xyz + isExterior (0 -> no host-owned DL in the scene-probe)
-            0,0,0,0             // C2 skyZenith (unused in the probe)
+            0,0,0,0,            // C2 skyZenith (unused in the probe)
+            0,0,0,0             // [32] MW sim time (0 -> UV-animated statics stand still in the probe)
         };
         IPC::DrawItemWire item = {};
         item.slot = 0;
@@ -1435,6 +1436,15 @@ namespace {
     constexpr uint32_t kBatchBytes = kBatchSize * 64;      // 65536 = exactly the D3D12 CBV max
     constexpr uint32_t kMaxBatches = 8;                    // 8 * 1024 = 8192 draws/frame
     constexpr uint32_t kMaxDraws   = kBatchSize * kMaxBatches;
+
+    // sizeof(FrameData) as declared in shaders/FSL/opaque.srt.h — viewProj(64) + 17 float4 = 336 B.
+    // The derived per-pass frame cbuffers (reflect-geo, ...) are memcpy'd from the main one, and a
+    // copy sized SHORTER than this silently drops every field appended past it. Keep the two in step:
+    // add a float4 to FrameData -> bump this by 16. The buffers themselves are 512 B (256-aligned).
+    constexpr uint32_t kFrameDataBytes = 464;   // FrameData size incl. hero uvOffsets[8] (was 336; +128).
+                                                 // The reflect-geo cbuffer copy (dlReflectGeoCull) uses
+                                                 // this, so the reflected fence/lava animate from the same
+                                                 // uvOffsets the main pass writes (and no stale tail).
 
     // M-Skinning palette packing: a FIXED 32-matrix stride per skinned part (kMaxBonesPerPart,
     // matches the cache's kMaxBones). One 64KB bone window (float4x4[1024]) holds 1024/32 = 32
@@ -4900,6 +4910,7 @@ namespace {
     // drops the same frame (a skipped rebuild means a stale pyramid), so occlusion passes through.
     bool g_hizPrologue   = true;
     bool g_drawWater     = true;
+    bool g_heroBlendPass = true;   // Phase 4: draw the post-water hero (ghostfence/lava) blend pass
     // AT1 bring-up: draw the alpha list with the depth-OFF debug PSO (panel toggle) —
     // separates depth kills from shader/blend/transform issues without a rebuild.
     bool g_alphaDebugNoDepth = false;
@@ -5974,6 +5985,7 @@ namespace ForgeRender {
     void dlLiveCullAndBuild(Renderer* R, const float* rzViewProj);
     void dlReflectCullAndBuild(Renderer* R, const float* mirrorViewProj);   // WV2 reflect-geo cull
     void dlReflectRecordGeo();                                              // WV2 reflect-geo record
+    void heroWriteUvOffsets(float* fd, double simT);                        // Phase 3 hero UV anim (defined w/ hero globals)
     // WV2: reflect-geo CPU CULL (build mirror-about-water matrix + clip plane, write pReflectFrameCbvGeo,
     // cull into the reflection rings). Runs PRE-beginCmd (hoisted off the record phase, like the main
     // cull); the reflect pass then only RECORDS the draws (dlReflectRecordGeo) gated by g_reflGeoReady.
@@ -5981,6 +5993,7 @@ namespace ForgeRender {
     void dlReflectGeoCull(Renderer* R, const float* viewProj, const float* fcbvR,
                           float dRel, float eyeAbsZ, float waterLevelAbs, bool underwater);
     void dlLiveRecord();
+    void dlDrawHeroBlend();                                                 // Phase 4 post-water hero blend pass
     bool dlCreateLiveRings(Renderer* R);   // statics instance/arg rings (forward: --forge-view eager init)
     void buildStaticsGrid();               // live cull grid (forward: --forge-view eager init)
     bool createShadowLightCullResources(Renderer* R);   // Follow-on 3: lazy from the shadow manager
@@ -6125,6 +6138,21 @@ namespace ForgeRender {
             // at 64..67). The scene-probe passes only 24 floats, so guard on the null-lighting path.
             float* fd = (float*)g_live.pFrameCbv->pCpuMappedAddress;
             fd[68] = lighting[28]; fd[69] = lighting[29]; fd[70] = lighting[30]; fd[71] = lighting[31];
+            // lighting[32] = MW's simulation time (seconds this session; frozen in menus) -> the UV
+            // scroll of UV-animated distant statics (statics.vert, FrameData.timeParams.x at float 80).
+            // WRAP IT HERE, in double, before the float cast: the scroll is fmod(0.08*t, 1), so period
+            // 12.5s is exactly ONE full V cycle (0.08 * 12.5 == 1.0) and wrapping there is seamless
+            // while keeping t small enough that float32 holds sub-frame precision. Feeding a raw,
+            // ever-growing seconds count is how the host's water normals ended up juddering (:9150).
+            fd[80] = (float)std::fmod((double)lighting[32], 12.5);
+            // Hero distant statics: evaluate the real NiUVController keys into FrameData.uvOffsets
+            // (float 84..). Uses RAW sim time (each anim wraps by its own cycleStop, 8s/48s). Nil cost
+            // (<=8 unique anims). statics.vert adds uvOffsets[slot-1] per subset. Absent hero file =>
+            // g_heroAnims empty => no writes (uvOffsets stay 0 = harmless).
+            heroWriteUvOffsets(fd, (double)lighting[32]);
+            // timeParams.y = hero blend-pass enabled (statics.vert HERO_PASS=0 clips hero-blend
+            // subsets only when set, so toggling the blend pass off falls back to drawing them opaque).
+            fd[81] = g_heroBlendPass ? 1.0f : 0.0f;
         }
         // F12 debug view: debugParams.x at float index 40 (160B = viewProj 16f + 6×float4 24f).
         // 0=normal (frag is byte-for-byte unchanged), 1=depth world-distance grayscale,
@@ -9227,6 +9255,10 @@ namespace ForgeRender {
         uint32_t alphaDrawn = 0;
         gpuPhaseBegin(kGpuPhaseColorAlpha);
 
+        // Phase 4: distant hero statics (ghostfence/lava) blend FIRST — they're the farthest
+        // translucent geometry, so drawing them before the near sorted-alpha keeps back-to-front.
+        dlDrawHeroBlend();
+
         // AT3: refill the captured VB/IB from this frame's blob ([verts][indices], indices at
         // capturedVertBytes) BEFORE the alpha loop draws the sentinel-slot items. Clamp element
         // counts to the buffer caps; capVertsAvail/capIdxAvail bound the per-draw range check.
@@ -10604,7 +10636,7 @@ namespace ForgeRender {
         uint32_t ibBase;       // first index  in the mega-IB (StartIndexLocation)
         uint32_t indexCount;   // faces*3
         uint32_t texSlot;      // bindless gTextures slot (0 until its texture is loaded in scope)
-        uint32_t flags;        // bit1 = hasAlpha cutout
+        uint32_t flags;        // bit1 = hasAlpha cutout, bit2 = UV-animated (NiUVController)
     };
     struct StaticsDefCPU { uint32_t firstSubset, numSubsets; float radius; uint8_t type; }; // mirrors DistantStatic
 
@@ -10616,6 +10648,8 @@ namespace ForgeRender {
     Pipeline* g_pStaticsPipeline = nullptr;   // FRONT_FACE_CCW: MW's live in-game viewProj
     Pipeline* g_pStaticsPipelineCW = nullptr; // FRONT_FACE_CW: synthetic dlLookAtLH camera (--forge-view)
     Pipeline* g_pStaticsPipelineNone = nullptr; // CULL_MODE_NONE: facing A/B (see g_staticsFacing)
+    Shader*   g_pStaticsBlendShader   = nullptr; // Phase 4 hero blend: statics_heroblend.vert + statics_blend.frag
+    Pipeline* g_pStaticsBlendPipeline = nullptr; // SRCALPHA/INVSRCALPHA, depth GEQUAL test / no write, cull NONE
     // LIVE path: front face = CCW, per the MGE oracle — XE Main.fx Pass P4ext (the distant-statics
     // exterior pass) sets CullMode = CW, i.e. D3D9 culls the CW-wound triangles, so the FRONT faces are
     // CCW. (An explicit override; D3D9's default is D3DCULL_CCW.) The D3D12 equivalent is
@@ -10633,6 +10667,56 @@ namespace ForgeRender {
     std::vector<StaticsSubsetGPU> g_staticsSubsets;
     std::vector<StaticsDefCPU>    g_staticsDefs;
     std::vector<std::string>      g_staticsSubsetTex;   // per-subset basename (lowercased)
+
+    // Hero distant statics (ghostfence/lava): real per-subset UV animation + alpha blend, parsed from
+    // Data Files\distantland\statics\hero_anim.data (owned by the bake). Phase 3 = animation only.
+    // Subsets are deduped to a handful of UNIQUE animations (all fence meshes share 3 layer anims,
+    // all lava meshes share 3) — each gets a 1-based slot baked into subset.flags bits 16-23, and its
+    // per-frame U/V offset lands in FrameData.uvOffsets[slot-1]. See tasks/forge-hero-statics.md.
+    constexpr uint32_t kMaxHeroAnimSlots = 8;   // MUST match FrameData.uvOffsets[8] (opaque.srt.h)
+    struct HeroAnim {                            // one unique animation; slot = index+1
+        float cycleStop = 1.0f;
+        std::vector<std::pair<float, float>> uKeys, vKeys;   // (time, value) piecewise-linear
+    };
+    struct HeroSubset {                          // one animated/blended hero subset
+        uint32_t globalSubset = 0;               // index into g_staticsSubsets
+        uint32_t slot = 0;                       // 1-based anim slot (0 = no UV anim)
+        bool     blend = false;                  // Phase 4: SRCALPHA/INVSRCALPHA
+        uint8_t  srcBlend = 0, dstBlend = 0;
+    };
+    std::vector<HeroAnim>   g_heroAnims;
+    std::vector<HeroSubset> g_heroSubsets;
+
+    // Piecewise-linear key evaluation (mirrors a MW NiUVData float key group), clamped at the ends.
+    inline float heroEvalKeys(const std::vector<std::pair<float, float>>& k, float t) {
+        if (k.empty())     { return 0.0f; }
+        if (k.size() == 1) { return k[0].second; }
+        if (t <= k.front().first) { return k.front().second; }
+        if (t >= k.back().first)  { return k.back().second; }
+        for (size_t i = 1; i < k.size(); ++i) {
+            if (t <= k[i].first) {
+                float t0 = k[i - 1].first, t1 = k[i].first;
+                float a = (t1 > t0) ? (t - t0) / (t1 - t0) : 0.0f;
+                return k[i - 1].second + a * (k[i].second - k[i - 1].second);
+            }
+        }
+        return k.back().second;
+    }
+
+    // Write this frame's hero UV offsets into FrameData.uvOffsets (float index 84.., after
+    // timeParams). Each unique anim is evaluated at fmod(simTime, its cycleStop); statics.vert adds
+    // uvOffsets[slot-1] for any subset carrying a 1-based slot in flags bits 16-23. Defined here (with
+    // the hero globals) and forward-declared for the per-frame cbuffer update earlier in the file.
+    void heroWriteUvOffsets(float* fd, double simT) {
+        for (size_t a = 0; a < g_heroAnims.size(); ++a) {
+            const HeroAnim& ha = g_heroAnims[a];
+            float tt = (float)std::fmod(simT, (double)ha.cycleStop);
+            fd[84 + a * 4 + 0] = heroEvalKeys(ha.uKeys, tt);
+            fd[84 + a * 4 + 1] = heroEvalKeys(ha.vKeys, tt);
+            fd[84 + a * 4 + 2] = 0.0f;
+            fd[84 + a * 4 + 3] = 0.0f;
+        }
+    }
     // DL statics texture residency = gStaticsArrays: a descriptor-array of Texture2DArrays, one
     // element per (format, capped-size) BUCKET. Every statics texture is uploaded ONCE at load into
     // its bucket as an array slice (raw mip-extract: the largest mip with long side <= kStaticsTexCap,
@@ -11044,6 +11128,37 @@ namespace ForgeRender {
         addPipeline(R, &pd, &g_pStaticsPipelineNone);
         if (!g_pStaticsPipelineNone) { std::printf("[forge][dl] addPipeline(statics NONE) FAILED\n"); return false; }
 
+        // Phase 4 hero distant statics BLEND pass. statics_heroblend.vert (HERO_PASS=1 -> keeps only
+        // hero-blend subsets, clips the rest) + statics_blend.frag (real alpha). SRCALPHA/INVSRCALPHA,
+        // depth GEQUAL TEST / NO write, cull NONE (two-sided translucent fence/lava). Same vertex
+        // layout, RT + reverse-Z depth. Drawn after water over the same gArgs/instance stream.
+        ShaderLoadDesc sbd = {};
+        sbd.mVert.pFileName = "statics_heroblend.vert";
+        sbd.mFrag.pFileName = "statics_blend.frag";
+        addShader(R, &sbd, &g_pStaticsBlendShader);
+        if (!g_pStaticsBlendShader) { std::printf("[forge][dl] addShader(statics blend) FAILED\n"); return false; }
+
+        DepthStateDesc dsB = {};
+        dsB.mDepthTest = true; dsB.mDepthWrite = false; dsB.mDepthFunc = CMP_GEQUAL;
+        RasterizerStateDesc rsB = {};
+        rsB.mCullMode = CULL_MODE_NONE; rsB.mFrontFace = FRONT_FACE_CCW;
+        BlendStateDesc bsB = {};
+        bsB.mSrcFactors[0]      = BC_SRC_ALPHA;
+        bsB.mDstFactors[0]      = BC_ONE_MINUS_SRC_ALPHA;
+        bsB.mSrcAlphaFactors[0] = BC_ONE;
+        bsB.mDstAlphaFactors[0] = BC_ONE_MINUS_SRC_ALPHA;
+        bsB.mBlendModes[0]      = BM_ADD;
+        bsB.mBlendAlphaModes[0] = BM_ADD;
+        bsB.mColorWriteMasks[0] = COLOR_MASK_ALL;
+        bsB.mRenderTargetMask   = BLEND_STATE_TARGET_0;
+        bsB.mIndependentBlend   = false;
+        g.pDepthState      = &dsB;
+        g.pRasterizerState = &rsB;
+        g.pBlendState      = &bsB;
+        g.pShaderProgram   = g_pStaticsBlendShader;
+        addPipeline(R, &pd, &g_pStaticsBlendPipeline);
+        if (!g_pStaticsBlendPipeline) { std::printf("[forge][dl] addPipeline(statics blend) FAILED\n"); return false; }
+
         std::printf("[forge][dl] statics pipeline built\n");
         return true;
     }
@@ -11102,7 +11217,7 @@ namespace ForgeRender {
                 if (verts < 0 || faces < 0 || p + vbBytes + ibBytes + 4 > end) { p = end; break; }
                 const uint8_t* vbSrc = p;       p += vbBytes;
                 const uint8_t* ibSrc = p;       p += ibBytes;
-                uint8_t hasAlpha = *p; p += 2;            // bool[2] {hasAlpha, hasUVController}
+                uint8_t hasAlpha = p[0], hasUVCtrl = p[1]; p += 2;   // bool[2] {hasAlpha, hasUVController}
                 uint16_t pathsize = 0; std::memcpy(&pathsize, p, 2); p += 2;
                 if (p + pathsize > end) { p = end; break; }
                 // texname -> path RELATIVE to statics\textures\, lowercased, .dds. The LOD library
@@ -11135,7 +11250,8 @@ namespace ForgeRender {
                 sub.ibBase     = (uint32_t)(megaIB.size() / 2);
                 sub.indexCount = (uint32_t)faces * 3;
                 sub.texSlot    = 0;                       // assigned lazily when first drawn in scope
-                sub.flags      = hasAlpha ? 0x2u : 0u;
+                sub.flags      = (hasAlpha ? 0x2u : 0u)      // bit1: alpha-test cutout
+                               | (hasUVCtrl ? 0x4u : 0u);   // bit2: NiUVController -> scroll V (ghostfence)
                 if (verts > 0 && faces > 0) {
                     megaVB.insert(megaVB.end(), vbSrc, vbSrc + vbBytes);
                     megaIB.insert(megaIB.end(), ibSrc, ibSrc + ibBytes);
@@ -11145,8 +11261,85 @@ namespace ForgeRender {
             }
             g_staticsDefs.push_back(def);
         }
-        std::printf("[forge][dl] statics library: %zu statics, %zu subsets, megaVB %.1fMB megaIB %.1fMB\n",
-                    g_staticsDefs.size(), g_staticsSubsets.size(), megaVB.size()/1e6, megaIB.size()/1e6);
+
+        // ---- Hero distant statics: parse hero_anim.data, dedup animations, bake anim slots into
+        // subset flags (bits 16-23). Absent file => hero statics stay inert (byte-identical to before).
+        g_heroAnims.clear(); g_heroSubsets.clear();
+        {
+            std::vector<uint8_t> hf;
+            if (dlReadWholeFile("Data Files\\distantland\\statics\\hero_anim.data", hf) && hf.size() >= 12
+                && hf[0] == 'M' && hf[1] == 'G' && hf[2] == 'H' && hf[3] == 'A') {
+                const uint8_t* hp   = hf.data() + 4;
+                const uint8_t* hend = hf.data() + hf.size();
+                uint32_t ver = 0, count = 0;
+                std::memcpy(&ver, hp, 4);   hp += 4;
+                std::memcpy(&count, hp, 4); hp += 4;
+                auto rdKeys = [&](uint8_t n, std::vector<std::pair<float, float>>& out) {
+                    for (uint8_t i = 0; i < n && hp + 8 <= hend; ++i) {
+                        float t, v; std::memcpy(&t, hp, 4); std::memcpy(&v, hp + 4, 4); hp += 8;
+                        out.emplace_back(t, v);
+                    }
+                };
+                for (uint32_t r = 0; r < count && hp + 20 <= hend; ++r) {
+                    uint32_t ord = 0; std::memcpy(&ord, hp, 4); hp += 4;
+                    uint16_t subIdx = 0; std::memcpy(&subIdx, hp, 2); hp += 2;
+                    uint8_t blendEnabled = hp[0], srcB = hp[1], dstB = hp[2]; hp += 6; // + alphaTest/func/thr
+                    float cs = 0, ce = 0; std::memcpy(&cs, hp, 4); std::memcpy(&ce, hp + 4, 4); hp += 8;
+                    uint8_t nU = hp[0], nV = hp[1]; hp += 2;
+                    HeroAnim anim; anim.cycleStop = (ce > 1e-4f) ? ce : 1.0f;
+                    rdKeys(nU, anim.uKeys); rdKeys(nV, anim.vKeys);
+
+                    if (ord >= g_staticsDefs.size()) { continue; }
+                    const StaticsDefCPU& d = g_staticsDefs[ord];
+                    if (subIdx >= d.numSubsets) { continue; }
+                    uint32_t gsub = d.firstSubset + subIdx;
+                    if (gsub >= g_staticsSubsets.size()) { continue; }
+
+                    // Dedup: subsets with identical key groups share one anim slot (fence/lava layers
+                    // repeat across every instance mesh). Blend differs per subset and doesn't split slots.
+                    uint32_t slot = 0;
+                    if (!anim.uKeys.empty() || !anim.vKeys.empty()) {
+                        int found = -1;
+                        for (size_t a = 0; a < g_heroAnims.size(); ++a) {
+                            if (g_heroAnims[a].cycleStop == anim.cycleStop
+                                && g_heroAnims[a].uKeys == anim.uKeys
+                                && g_heroAnims[a].vKeys == anim.vKeys) { found = (int)a; break; }
+                        }
+                        if (found < 0 && g_heroAnims.size() < kMaxHeroAnimSlots) {
+                            found = (int)g_heroAnims.size();
+                            g_heroAnims.push_back(anim);
+                        }
+                        if (found >= 0) {
+                            slot = (uint32_t)found + 1;
+                            g_staticsSubsets[gsub].flags |= (slot << 16);
+                        }
+                    }
+                    HeroSubset hs; hs.globalSubset = gsub; hs.slot = slot;
+                    hs.blend = (blendEnabled != 0); hs.srcBlend = srcB; hs.dstBlend = dstB;
+                    // Phase 4: flag blend subsets (bit5). statics.vert HERO_PASS=0 (opaque) clips
+                    // them; the post-water blend draw (HERO_PASS=1) keeps only them. Rides the
+                    // existing instance path (scatter copies flags), so no GPU-cull change.
+                    if (hs.blend) { g_staticsSubsets[gsub].flags |= 0x20u; }
+                    g_heroSubsets.push_back(hs);
+                }
+                LOG::logline(">> [forge][dl] hero_anim: %u records -> %zu unique anims, %zu hero subsets",
+                             count, g_heroAnims.size(), g_heroSubsets.size());
+            } else {
+                LOG::logline(">> [forge][dl] hero_anim.data absent - hero statics inert");
+            }
+        }
+
+        // uvAnim = subsets whose source NIF carried an NiUVController (flags bit2 -> statics.vert
+        // scrolls their V). Expect a small non-zero count (the ghostfence and friends); a ZERO here
+        // means the bake dropped the flag, and no amount of shader work will make anything scroll.
+        size_t uvAnimSubsets = 0;
+        for (const StaticsSubsetGPU& s : g_staticsSubsets) { if (s.flags & 0x4u) { ++uvAnimSubsets; } }
+        // logline, not printf: printf/LOGF go to stdout, which is UNCAPTURED in normal play (it only
+        // shows up under --forge-view). This count is the one that tells us whether UV animation can
+        // work at all, so it belongs in mgeHost64.log where it is readable in-game.
+        LOG::logline(">> [forge][dl] statics library: %zu statics, %zu subsets (%zu uv-animated), megaVB %.1fMB megaIB %.1fMB",
+                     g_staticsDefs.size(), g_staticsSubsets.size(), uvAnimSubsets, megaVB.size()/1e6, megaIB.size()/1e6);
+        LOG::flush();
         if (megaVB.empty() || megaIB.empty()) { return false; }
 
         BufferLoadDesc vbd = {};
@@ -13356,11 +13549,13 @@ namespace ForgeRender {
                 if (gi.rangeEndIdx == 0xFFFFFFFFu) { continue; }   // grass / invalid → skip
                 float rangeEnd = (gi.rangeEndIdx == 0) ? nearEnd : (gi.rangeEndIdx == 1) ? farEnd : vfarEnd;
                 float dx = gi.posX - eye[0], dy = gi.posY - eye[1];
+                float dz = gi.world[14] - eye[2];
                 float d2 = dx*dx + dy*dy;
-                if (d2 < nearCut2 || d2 > rangeEnd*rangeEnd) { continue; }   // near-owned or beyond tier
+                float dNear2 = d2 + dz*dz;   // near cut 3D (height-aware, matches DX9); far tier stays horizontal
+                if (dNear2 < nearCut2 || d2 > rangeEnd*rangeEnd) { continue; }   // near-owned or beyond tier
 
                 // Frustum-cull the instance sphere (relative space). z = world[14] (absolute pos.z).
-                if (!dlSphereInFrustum(planes, dx, dy, gi.world[14]-eye[2], gi.effR)) { continue; }
+                if (!dlSphereInFrustum(planes, dx, dy, dz, gi.effR)) { continue; }
 
                 // World matrix: copy the precomputed absolute matrix, then the ONLY per-frame change —
                 // the camera-relative -eye shift on the translation row.
@@ -13546,6 +13741,37 @@ namespace ForgeRender {
         cmdEndDebugMarker(g_live.pCmd);
     }
 
+    // Phase 4: the post-water HERO BLEND pass. Re-issues the SAME statics indirect draw with the
+    // blend PSO — statics_heroblend.vert (HERO_PASS=1) clips every subset EXCEPT the hero-blend ones,
+    // so only the ghostfence/lava layers survive and composite SRCALPHA/INVSRCALPHA over the finished
+    // opaque+water frame (depth GEQUAL test, no write). Same gArgs/instance stream as the opaque
+    // statics draw (which clips these same subsets away) — no GPU-cull change. Called inside the
+    // sorted-alpha phase, BEFORE the near alpha (distant draws first = correct back-to-front).
+    void dlDrawHeroBlend() {
+        if (!g_heroBlendPass || g_heroSubsets.empty()) { return; }
+        if (!g_pStaticsBlendPipeline || !g_drawDLStatics || !g_staticsLiveOk) { return; }
+        const bool gpuDraw = g_gpuStaticsCull && g_live.gpuStaticsReady && g_live.gpuArgsInDrawState;
+        if (!gpuDraw && g_liveLastSubsets == 0) { return; }
+        cmdBeginDebugMarker(g_live.pCmd, 0.6f, 0.3f, 0.8f, "HERO STATICS BLEND");
+        cmdBindPipeline(g_live.pCmd, g_pStaticsBlendPipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSet);
+        Buffer*  svbs[2]     = { g_pStaticsVB, gpuDraw ? g_live.pGpuInstOut : g_pStaticsInstRing };
+        uint32_t sstrides[2] = { 20, kStaticsInstStride };
+        cmdBindVertexBuffer(g_live.pCmd, 2, svbs, sstrides, nullptr);
+        cmdBindIndexBuffer(g_live.pCmd, g_pStaticsIB, INDEX_TYPE_UINT16, 0);
+        if (gpuDraw) {
+            cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_live.cullSubsetCount,
+                               g_live.pGpuArgs, 0, nullptr, 0);
+        } else {
+            cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_liveLastSubsets,
+                               g_pStaticsArgsRing, 0, nullptr, 0);
+        }
+        cmdEndDebugMarker(g_live.pCmd);
+    }
+
     // WV2: record the reflected land + statics into pReflectColor/pReflectDepth (already bound by the
     // reflect pass). A mirror of dlLiveRecord bound to the REFLECT targets: pPerFrameSetReflectGeo (the
     // water-plane mirror matrix + below-water clip plane), the reflection rings, and the OPPOSITE-winding
@@ -13625,8 +13851,11 @@ namespace ForgeRender {
         const float dClip = dw + nz * eyeAbsZ;
 
         // pReflectFrameCbvGeo = copy of the main frame data, viewProj := mirror-about-water,
-        // gReflWaterClip (float 64..67) := the camera-relative below-water plane.
-        std::memcpy(g_live.pReflectFrameCbvGeo->pCpuMappedAddress, fcbvR, 272);
+        // gReflWaterClip (float 64..67) := the camera-relative below-water plane. Copy the WHOLE
+        // FrameData: this was a bare 272 (= through gReflWaterClip), which silently truncated every
+        // field appended after it — timeParams (float 80) landed past the end, so the reflected
+        // ghostfence would have stood still while the real one scrolled. Size it off the struct.
+        std::memcpy(g_live.pReflectFrameCbvGeo->pCpuMappedAddress, fcbvR, kFrameDataBytes);
         std::memcpy(g_live.pReflectFrameCbvGeo->pCpuMappedAddress, mirrorGeoVP, 64);
         {
             float* gp = (float*)g_live.pReflectFrameCbvGeo->pCpuMappedAddress;
@@ -14254,9 +14483,11 @@ namespace ForgeRender {
         if (g_pStaticsInst)     { removeResource(g_pStaticsInst);     g_pStaticsInst = nullptr; }
         if (g_pStaticsVB)       { removeResource(g_pStaticsVB);       g_pStaticsVB = nullptr; }
         if (g_pStaticsIB)       { removeResource(g_pStaticsIB);       g_pStaticsIB = nullptr; }
+        if (g_pStaticsBlendPipeline) { removePipeline(R, g_pStaticsBlendPipeline); g_pStaticsBlendPipeline = nullptr; }
         if (g_pStaticsPipelineNone) { removePipeline(R, g_pStaticsPipelineNone); g_pStaticsPipelineNone = nullptr; }
         if (g_pStaticsPipelineCW)   { removePipeline(R, g_pStaticsPipelineCW);   g_pStaticsPipelineCW = nullptr; }
         if (g_pStaticsPipeline) { removePipeline(R, g_pStaticsPipeline); g_pStaticsPipeline = nullptr; }
+        if (g_pStaticsBlendShader) { removeShader(R, g_pStaticsBlendShader); g_pStaticsBlendShader = nullptr; }
         if (g_pStaticsShader)   { removeShader(R, g_pStaticsShader);   g_pStaticsShader = nullptr; }
         g_staticsSubsets.clear(); g_staticsDefs.clear(); g_staticsSubsetTex.clear();
         // Bucketed statics texture arrays (gStaticsArrays). Bucket 0 aliases the white array — free

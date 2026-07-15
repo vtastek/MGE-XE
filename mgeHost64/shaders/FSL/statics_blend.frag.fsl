@@ -1,0 +1,47 @@
+// mgeHost64 — Phase 4 hero distant statics BLEND fragment (ghostfence/lava layers).
+//
+// A copy of statics.frag with two changes for the post-water SRCALPHA/INVSRCALPHA blend pass:
+//   1. NO cutout discard — hero-blend subsets have alpha-test OFF (real translucency, not a mask).
+//   2. Outputs REAL alpha (tex.a * vertex-colour a) so the blend state can composite the layers,
+//      instead of forcing alpha = 1.
+// Pairs with statics.vert built HERO_PASS=1 (statics_heroblend.vert), which keeps only the
+// hero-blend subsets. Everything else (bindless statics array, per-vertex lit colour, fog, the F12
+// distance-grayscale parity) is byte-identical to statics.frag.
+
+#include "opaque.srt.h"
+
+// MUST stay byte-identical to statics.vert.fsl's VSOutput (CENTROID modifiers included).
+STRUCT(VSOutput)
+{
+    DATA(float4,           Position, SV_Position);
+    DATA(float2,           Uv,       TEXCOORD0);
+    DATA(CENTROID(float4), Color,    COLOR);
+    DATA(CENTROID(float),  Fog,      TEXCOORD1);
+    DATA(FLAT(uint),       TexIndex, TEXCOORD2);
+    DATA(FLAT(uint),       Flags,    TEXCOORD3);
+    DATA(float3,           WorldPos, TEXCOORD4);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    uint bucket = In.TexIndex >> 16;
+    uint layer  = In.TexIndex & 0xFFFFu;
+    float4 tex = SampleTex2DArray(gStaticsArrays[bucket], gSamplerAnisotropic, float3(In.Uv, (float)layer));
+
+    float3 result = tex.rgb * In.Color.rgb;
+    result = lerp(gFrameData.fogColNear.rgb, result, In.Fog);
+
+    // F12 distance grayscale parity (debugParams.x 1/2), matching statics.frag.
+    uint dbg = (uint)(gFrameData.debugParams.x + 0.5f);
+    if (dbg == 1u || dbg == 2u) {
+        float dist = length(In.WorldPos - gFrameData.eyePos.xyz);
+        float g = saturate(dist * (1.0f / 8192.0f));
+        RETURN(float4(g, g, g, 1.0f));
+    }
+
+    // Real alpha for the SRCALPHA/INVSRCALPHA blend (non-premultiplied; the blend state multiplies).
+    float alpha = saturate(tex.a * In.Color.a);
+    RETURN(float4(result, alpha));
+}
