@@ -36,15 +36,20 @@ void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
                     : (inst.rangeEndIdx == 1u) ? gCullParams.ranges.y
                                                : gCullParams.ranges.z;
 
-    // Horizontal distance test: near-owned (< nearCut²) or beyond the tier range -> reject.
+    // Near cut is 3D (includes height): a static far BELOW an airborne camera has a small XY
+    // distance but a large true distance, so an XY-only cut wrongly rejected it as near-owned and
+    // left a hole under the player. Matches DX9 XE Mod Statics.fx. The far tier range stays
+    // HORIZONTAL (MGE tiers are authored as cell distance; a 3D far test would pop distant statics
+    // as you gain altitude).
     float dx = inst.posX - gCullParams.eye.x;
     float dy = inst.posY - gCullParams.eye.y;
+    float cz = inst.posZ - gCullParams.eye.z;
     float d2 = dx * dx + dy * dy;
-    if (d2 < gCullParams.ranges.w || d2 > rangeEnd2)
+    float dNear2 = d2 + cz * cz;
+    if (dNear2 < gCullParams.ranges.w || d2 > rangeEnd2)
         RETURN();
 
     // Frustum-cull the instance sphere (camera-relative center, radius effR).
-    float cz = inst.posZ - gCullParams.eye.z;
     UNROLL
     for (uint p = 0u; p < 6u; ++p)
     {

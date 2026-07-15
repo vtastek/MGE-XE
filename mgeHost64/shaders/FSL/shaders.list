@@ -132,6 +132,19 @@
 #include "statics.frag.fsl"
 #end
 
+// Phase 4 hero distant statics blend pass: the SAME statics.vert body built HERO_PASS=1 (keeps only
+// the hero-blend subsets, clips the rest) + a blend frag (statics.frag minus discard, real alpha).
+// Drawn after water on a SRCALPHA/INVSRCALPHA depth-GEQUAL/no-write PSO. No GPU-cull change — reuses
+// the same gArgs/instance stream; the opaque statics.vert (HERO_PASS=0) clips these same subsets.
+#vert statics_heroblend.vert
+#define HERO_PASS 1
+#include "statics.vert.fsl"
+#end
+
+#frag statics_blend.frag
+#include "statics_blend.frag.fsl"
+#end
+
 // Forge water takeover (WT1): host-generated geo-clipmap water. Position-only verts + per-instance
 // clipmap level; reuses opaque.srt.h / DefaultRootSignature (worlds+params ride gBatch, 4 water SRVs
 // appended to the PerFrame set). Depth-write reverse-Z GEQUAL, cull NONE, frag outputs alpha=1.

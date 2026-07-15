@@ -80,6 +80,18 @@ STRUCT(FrameData)
     // allowed to WRITE DEPTH (live knob "ALPHA: depth-write opacity"). Only alphadepth.frag reads
     // it; the alpha COLOUR pass never writes depth at all. 320B < 512B. See alphadepth.frag.fsl.
     DATA(float4, alphaParams, None);
+    // UV-animated distant statics (ghostfence). x = MW SIMULATION time in seconds, pre-wrapped by the
+    // host to [0, 12.5) — exactly one V cycle of the 0.08/s scroll, so the wrap is seamless and t stays
+    // small enough for float32 to hold sub-frame precision. Only statics.vert reads it (a subset scrolls
+    // only if its flags carry bit2, set from the NIF's NiUVController at bake time). 336B < 512B.
+    DATA(float4, timeParams, None);
+    // Hero distant statics UV animation (Phase 3). The host evaluates the real NiUVController keys
+    // for up to 8 UNIQUE (deduped) animations — the fence fasterA/fasterB/slower layers + lava
+    // base/crust/third — into these per frame. A subset carries its 1-based slot in flags bits
+    // 16-23 (statics.vert); uvOffsets[slot-1].xy is ADDED to the base UV. Appended after timeParams
+    // so every existing field keeps its offset. 336 + 128 = 464B < 512B CBV. Only statics.vert reads
+    // it; 0 elsewhere is a harmless null tail. Slot count MUST match kMaxHeroAnimSlots host-side.
+    DATA(float4, uvOffsets[8], None);
 };
 
 STRUCT(BatchData)

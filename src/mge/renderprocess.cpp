@@ -2665,7 +2665,7 @@ namespace RenderProcess {
             s_smoothWind[1] += 0.02f * (wind[1] - s_smoothWind[1]);
             windMag = std::sqrt(s_smoothWind[0] * s_smoothWind[0] + s_smoothWind[1] * s_smoothWind[1]);
         }
-        const float lighting[32] = {
+        const float lighting[36] = {
             sunVecEff.x,               sunVecEff.y,               sunVecEff.z,               0.0f,
             sunColEff.r,               sunColEff.g,               sunColEff.b,               0.0f,
             ambColEff.r,               ambColEff.g,               ambColEff.b,               0.0f,
@@ -2683,6 +2683,13 @@ namespace RenderProcess {
             // C2 skyZenith (float4 28..31): zenith sky colour for the host dome gradient. Host reads
             // it into FrameData.skyZenith; only sky.frag (dome branch) consumes it.
             skyZenithR,                skyZenithG,                skyZenithB,                0.0f,
+            // [32] MW SIMULATION time (seconds this session, frozen in menus) — drives the UV scroll
+            // of UV-animated distant statics (ghostfence) in statics.vert. This is the SAME clock MGE's
+            // DX9 path feeds its `time` uniform (distantland.cpp:987), so the Forge and MGE fences
+            // scroll in step under an F11 A/B. NOT a host wall clock: that keeps running in menus and,
+            // being steady_clock-since-BOOT, quantizes to 0.02-0.13s steps once cast to float32 (the
+            // bug that made the host's water normals judder — see forgerender.cpp:9150).
+            mwb->simulationTime(),     0.0f,                      0.0f,                      0.0f,
         };
 
         // Dev overlay input (Stage 2): poll the mouse in MW client-space pixels (1:1 with the host
