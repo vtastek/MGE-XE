@@ -574,6 +574,7 @@ cbStatIntExt = "Dołącz wnętrza udające otwarte tereny"
 cbStatIntWater = "Dołącz wodę z odbiciami we wnętrzach\n(wydłuża czas ładowania)"
 cbStatActivators = "Dołącz aktywatory"
 cbStatIncludeMisc = "Dołącz pomniejsze obiekty"
+cbStatFixMips = "Fix incomplete source mipmaps"
 bStatOverrideList = "Edytuj\nlistę"
 lStatOverrideList = "BRAK LISTY NADPISYWANIA OBIEKTOW STATYCZNYCH"
 bStatExportStatics = "Eksportuj listę obiektów statycznych"
@@ -584,6 +585,7 @@ cbStatOverrideList = "Użyj listy obiektów statycznych nadpisującą powyższe 
 tabFinish = "Ukończono"
 lFinishDesc = "Oczekiwanie na ukończenie generowania obiektów statycznych"
 bFinish = "Zakończ"
+bStatReport = "View report"
 
 
 

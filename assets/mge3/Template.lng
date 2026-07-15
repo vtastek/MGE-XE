@@ -639,6 +639,7 @@ cbStatIntExt = "Include interiors behaving like exteriors"
 cbStatIntWater = "Include reflective water in interiors\n(increases load time)"
 cbStatActivators = "Include activators"
 cbStatIncludeMisc = "Include misc objects"
+cbStatFixMips = "Fix incomplete source mipmaps"
 bStatOverrideList = "Edit\nlist"
 lStatOverrideList = "No custom static overrides"
 bStatExportStatics = "Export list of statics"
@@ -649,6 +650,7 @@ cbStatOverrideList = "Use lists of statics overriding parameters set above"
 tabFinish = "Finished"
 lFinishDesc = "Waiting for statics generation to complete"
 bFinish = "Finish"
+bStatReport = "View report"
 
 
 

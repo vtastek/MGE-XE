@@ -575,6 +575,7 @@ cbStatIntExt = "Inclure les intérieurs agissant comme des extérieurs\n(comme l
 cbStatIntWater = "Inclure les réflexions de l'eau dans les intérieurs \n(augmente les temps de chargement)"
 cbStatActivators = "Inclure les activateurs"
 cbStatIncludeMisc = "Inclure les objets divers"
+cbStatFixMips = "Fix incomplete source mipmaps"
 bStatOverrideList = "Éditer\nla liste"
 lStatOverrideList = "AUCUNE LISTE D'OUTREPASSEMENT DE STATIQUES PRÉSENTE"
 bStatExportStatics = "Exporter liste"
@@ -585,6 +586,7 @@ cbStatOverrideList = "Utiliser des listes de statiques pour outrepasser les rég
 tabFinish = "Terminé"
 lFinishDesc = "Veuillez attendre que la génération des statiques se termine"
 bFinish = "Terminé"
+bStatReport = "View report"
 
 
 

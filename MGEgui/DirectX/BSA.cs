@@ -129,6 +129,30 @@ namespace MGEgui.DistantLand {
             return null;
         }
 
+        // Resolve a texture name to its on-disk LOOSE path (mirrors GetTexture's file-system search,
+        // .dds preferred). Returns null when the texture exists only inside a BSA -- BSA assets are
+        // the known-good vanilla textures and must never be rewritten by the mip fixer.
+        public static string ResolveLoosePath(string name) {
+            if (Path.IsPathRooted(name)) {
+                throw new ArgumentException("Something tried to load a texture using an absolute path.");
+            }
+
+            string dds_name = Path.ChangeExtension(name, ".dds");
+
+            var search_paths = new List<string>();
+            search_paths.Add(Path.Combine(Statics.fn_textures, dds_name));
+            search_paths.Add(Path.Combine(Statics.fn_dataFiles, dds_name));
+            search_paths.Add(Path.Combine(Statics.fn_textures, name));
+            search_paths.Add(Path.Combine(Statics.fn_dataFiles, name));
+
+            foreach (string file_path in search_paths) {
+                if (File.Exists(file_path)) {
+                    return file_path;
+                }
+            }
+            return null;
+        }
+
         public static byte[] GetNif(string name) {
             if (Path.IsPathRooted(name)) {
                 throw new ArgumentException("Something tried to load a nif using an absolute path.");

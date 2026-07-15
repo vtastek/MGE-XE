@@ -76,20 +76,30 @@ namespace MGEgui.DirectX {
         private readonly System.Collections.Generic.HashSet<string> texCache;
         private readonly float pixelsPerWorld;
         private readonly int minLod;
+        private readonly bool fixMips;
 
         // End-of-run report buckets
         public int Sliced = 0;
         public int Resampled = 0;
         public int Magenta = 0;
+        public int MipFixed = 0;
+        public int MipFixSkippedBsa = 0;
         public readonly System.Collections.Generic.List<string> ResampledPaths = new System.Collections.Generic.List<string>();
         public readonly System.Collections.Generic.List<string> MagentaPaths = new System.Collections.Generic.List<string>();
+        public readonly System.Collections.Generic.List<string> MipFixedPaths = new System.Collections.Generic.List<string>();
+        public readonly System.Collections.Generic.List<string> BsaSkippedPaths = new System.Collections.Generic.List<string>();
+
+        // Backup directory for loose source textures the mip fixer rewrites (under distantland\, out
+        // of MW's texture load path so the untouched original is never loaded, only kept to restore).
+        public const string MipFixBackupDir = Statics.fn_dl + @"\mipfix_backup";
 
         // pixelsPerWorld = renderWidth / (2 * switchDistance * tan(hFov/2)) -- the on-screen texel
         // budget at the near->distant LOD switch. minLod = smallest texture dimension we ever emit.
         // (No max clamp: sizing never exceeds the source, and legit large textures are rare.)
-        public StaticTexCreator(float pixelsPerWorld, int minLod) {
+        public StaticTexCreator(float pixelsPerWorld, int minLod, bool fixMips) {
             this.pixelsPerWorld = pixelsPerWorld;
             this.minLod = minLod;
+            this.fixMips = fixMips;
             texCache = new System.Collections.Generic.HashSet<string>();
         }
 
@@ -171,6 +181,29 @@ namespace MGEgui.DirectX {
             }
             bool completeChain = mipCount >= fullLevels;
 
+            // The source ships a truncated mip chain -- the root defect behind both the slow
+            // resample fallback below AND the near<->distant handoff mismatch (MW-near rebuilds the
+            // missing tail from its truncated chain, the LOD from a fresh resample). If enabled,
+            // complete the chain in place (loose files only) so BOTH derive from one full chain,
+            // then fall into the fast byte-slice path for this run's LOD too.
+            if (isDDS && !completeChain && fixMips) {
+                string loosePath = MGEgui.DistantLand.BSA.ResolveLoosePath(path);
+                if (loosePath == null) {
+                    // BSA-only: vanilla asset, leave untouched -- just report it.
+                    MipFixSkippedBsa++;
+                    BsaSkippedPaths.Add(path);
+                } else {
+                    byte[] fixedBytes = FixSourceMips(data, width, height, mipCount, fullLevels, blockSize, isCompressed, loosePath);
+                    if (fixedBytes != null) {
+                        data = fixedBytes;
+                        mipCount = System.Math.Max(1, BitConverter.ToInt32(data, 28));
+                        completeChain = mipCount >= fullLevels;
+                        MipFixed++;
+                        MipFixedPaths.Add(path);
+                    }
+                }
+            }
+
             // Fast path: slice mip k straight out of the source chain (keeps the author's filtering).
             if (completeChain && blockSize > 0 && k < mipCount) {
                 int offset = 128, curW = width, curH = height, i = 0;
@@ -224,6 +257,113 @@ namespace MGEgui.DirectX {
                 return true;
             } catch (System.IO.IOException) {
                 return false;
+            }
+        }
+
+        // Append-only mip completion for an incomplete LOOSE source DDS. Keeps every authored mip
+        // byte-for-byte and only synthesises the MISSING tail below the smallest present level,
+        // in the source's exact pixel format. Backs up the untouched original first, then rewrites
+        // the loose file with a complete chain. Returns the fixed file bytes, or null on ANY failure
+        // (leaving the original intact) so distant-land generation never breaks.
+        private byte[] FixSourceMips(byte[] data, int width, int height, int mipCount, int fullLevels, int blockSize, bool isCompressed, string loosePath) {
+            Texture t = null;
+            try {
+                if (blockSize <= 0) {
+                    return null;
+                }
+
+                // Walk the present mips down to the smallest authored level (same block-size loop as
+                // the fast path). authoredEnd = byte offset just past the last authored mip.
+                int offset = 128, curW = width, curH = height;
+                int smallestOffset = 128, smallestW = width, smallestH = height, smallestSize = 0;
+                for (int i = 0; i < mipCount; i++) {
+                    int mipSize = isCompressed
+                        ? System.Math.Max(1, (curW + 3) / 4) * System.Math.Max(1, (curH + 3) / 4) * blockSize
+                        : curW * curH * blockSize;
+                    if (offset + mipSize > data.Length) {
+                        return null; // truncated / corrupt source
+                    }
+                    smallestOffset = offset;
+                    smallestW = curW;
+                    smallestH = curH;
+                    smallestSize = mipSize;
+                    offset += mipSize;
+                    curW = System.Math.Max(1, curW / 2);
+                    curH = System.Math.Max(1, curH / 2);
+                }
+                int authoredEnd = offset;
+
+                // Preserve the source's exact D3D format (DXT1 -> DXT1, etc.).
+                Format sourceFormat = ImageInformation.FromMemory(data).Format;
+
+                // Wrap the smallest present mip as a standalone 1-level DDS, then let D3DX rebuild a
+                // full chain from it: level 0 = that smallest present mip, levels 1.. = the tail.
+                byte[] oneMip = new byte[128 + smallestSize];
+                Array.Copy(data, 0, oneMip, 0, 128);
+                Array.Copy(BitConverter.GetBytes(smallestH), 0, oneMip, 12, 4);        // height
+                Array.Copy(BitConverter.GetBytes(smallestW), 0, oneMip, 16, 4);        // width
+                Array.Copy(BitConverter.GetBytes(smallestSize), 0, oneMip, 20, 4);     // linear size
+                Array.Copy(BitConverter.GetBytes(1), 0, oneMip, 28, 4);                // mip count
+                Array.Copy(BitConverter.GetBytes(0x1000), 0, oneMip, 108, 4);          // caps: TEXTURE
+                Array.Copy(data, smallestOffset, oneMip, 128, smallestSize);
+
+                t = Texture.FromMemory(DXMain.device, oneMip, smallestW, smallestH, 0 /* full chain */, Usage.None, sourceFormat, Pool.Scratch, Filter.Box, Filter.Box, 0);
+
+                byte[] gen;
+                using (DataStream ds = Texture.ToStream(t, ImageFileFormat.Dds)) {
+                    gen = new byte[ds.Length];
+                    ds.Position = 0;
+                    ds.Read(gen, 0, gen.Length);
+                }
+
+                // Skip the regenerated level 0 (identical dims/format to the smallest present mip)
+                // and take only the appended tail.
+                int genLevel0Size = isCompressed
+                    ? System.Math.Max(1, (smallestW + 3) / 4) * System.Math.Max(1, (smallestH + 3) / 4) * blockSize
+                    : smallestW * smallestH * blockSize;
+                int tailStart = 128 + genLevel0Size;
+                int tailLen = gen.Length - tailStart;
+                if (tailLen <= 0) {
+                    return null; // nothing to append -- treat as no-op rather than rewrite the file
+                }
+
+                // Compose: original header (mipCount = fullLevels, caps |= MIPMAP|COMPLEX, flags |=
+                // MIPMAPCOUNT) + authored mips verbatim + synthesised tail.
+                int authoredLen = authoredEnd - 128;
+                byte[] fixedFile = new byte[128 + authoredLen + tailLen];
+                Array.Copy(data, 0, fixedFile, 0, 128);
+                int flags = BitConverter.ToInt32(data, 8) | 0x20000;                   // DDSD_MIPMAPCOUNT
+                int caps = BitConverter.ToInt32(data, 108) | 0x401008;                 // TEXTURE | MIPMAP | COMPLEX
+                Array.Copy(BitConverter.GetBytes(flags), 0, fixedFile, 8, 4);
+                Array.Copy(BitConverter.GetBytes(fullLevels), 0, fixedFile, 28, 4);
+                Array.Copy(BitConverter.GetBytes(caps), 0, fixedFile, 108, 4);
+                Array.Copy(data, 128, fixedFile, 128, authoredLen);                    // authored mips, byte-for-byte
+                Array.Copy(gen, tailStart, fixedFile, 128 + authoredLen, tailLen);     // appended tail
+
+                // Back up the untouched original (never overwrite an existing backup -- keep the
+                // true original), then rewrite the loose file. Mirror the sub-path under the source
+                // root so backups never collide across subdirectories.
+                string rel;
+                if (loosePath.StartsWith(Statics.fn_textures + "\\", StringComparison.OrdinalIgnoreCase)) {
+                    rel = loosePath.Substring(Statics.fn_textures.Length + 1);
+                } else if (loosePath.StartsWith(Statics.fn_dataFiles + "\\", StringComparison.OrdinalIgnoreCase)) {
+                    rel = loosePath.Substring(Statics.fn_dataFiles.Length + 1);
+                } else {
+                    rel = System.IO.Path.GetFileName(loosePath);
+                }
+                string backupPath = System.IO.Path.Combine(MipFixBackupDir, rel);
+                System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(backupPath));
+                if (!System.IO.File.Exists(backupPath)) {
+                    System.IO.File.Copy(loosePath, backupPath);
+                }
+                System.IO.File.WriteAllBytes(loosePath, fixedFile);
+                return fixedFile;
+            } catch (Exception) {
+                return null;
+            } finally {
+                if (t != null) {
+                    t.Dispose();
+                }
             }
         }
 
