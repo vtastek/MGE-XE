@@ -1196,6 +1196,9 @@ namespace MGEgui.DistantLand {
             unsafe {
                 NativeMethods.BeginStaticCreation((IntPtr)DXMain.device.ComPointer, Statics.fn_statmesh);
             }
+            // Hero distant-statics animation side file (MGE XE mod: ghostfence + lava). Joins to the
+            // static_meshes library by record index, so it must bracket the SAME ProcessNif run.
+            NativeMethods.BeginHeroAnim(Statics.fn_heroanim);
             var rnd = new Random();
             try {
                 // Try to load the NIFs and remove any from the list that fail or are too small
@@ -1217,17 +1220,29 @@ namespace MGEgui.DistantLand {
                         file_name = file_name.Substring(0, dot_pos);
                     }
                     string dist_name = file_name + "_dist" + extension;
+                    string hero_name = file_name + "_herodist" + extension;
+                    bool heroThisNif = false;
                     try {
-                        data = BSA.GetNif(dist_name);
-                        // Do not simplify '_dist' NIFs.
+                        // Highest priority: a <model>_herodist.nif hero copy - the REAL multi-layer mesh
+                        // whose per-subset UV keys + alpha blending we capture (MGE XE mod). Its mere
+                        // presence is the opt-in, so only ghostfence/lava (which ship such a copy) qualify.
+                        data = BSA.GetNif(hero_name);
+                        heroThisNif = true;
                         simplify = 1.0f;
                     } catch {
-                        // We didn't find a NIF file with '_dist' in its name,
-                        // so search for the normal NIF file now.
+                        // No hero copy; fall back to the '_dist' low-poly stand-in, then the real NIF.
                         try {
-                            data = BSA.GetNif(name);
+                            data = BSA.GetNif(dist_name);
+                            // Do not simplify '_dist' NIFs.
+                            simplify = 1.0f;
                         } catch {
-                            data = null;
+                            // We didn't find a NIF file with '_dist' in its name,
+                            // so search for the normal NIF file now.
+                            try {
+                                data = BSA.GetNif(name);
+                            } catch {
+                                data = null;
+                            }
                         }
                     }
 
@@ -1240,6 +1255,10 @@ namespace MGEgui.DistantLand {
                             if (DEBUG) {
                                 allWarnings.Add("Processing NIF: " + name);
                             }
+
+                            // Capture real UV keys + alpha only for the hero copy; every other NIF bakes
+                            // exactly as before (self-corrects each iteration, so a throw can't leak it).
+                            NativeMethods.SetHeroMode(heroThisNif ? 1 : 0);
 
                             float size = -1;
                             if (overrideList.ContainsKey(name)) {
@@ -1273,7 +1292,9 @@ namespace MGEgui.DistantLand {
                     }
                 }
             } finally {
+                NativeMethods.SetHeroMode(0);
                 NativeMethods.EndStaticCreation();
+                NativeMethods.EndHeroAnim();
             }
 
             // Reset used distant static ID numbers to match NIF list order
@@ -1359,16 +1380,32 @@ namespace MGEgui.DistantLand {
             setFinishDesc(4);
             backgroundWorker.ReportProgress(5, strings["StaticsGenerate5"]);
             {
-                var stc = new StaticTexCreator(args.MipSkip);
+                // Size each distant-statics texture to the object's projected screen size at the
+                // near->distant LOD switch (bbox-driven), one mip above for safety.
+                // See tasks/forge-dl-lod-textures.md.
+                float switchDist = (float)Statics.mf.udDLDistNear.Value * 8192.0f;
+                float hFov = (float)Statics.mf.udFOV.Value * (float)System.Math.PI / 180.0f;
+                int renderWidth = 1920;
+                try {
+                    string[] resParts = Statics.mf.tbResolution.Text.Split('x');
+                    renderWidth = int.Parse(resParts[0].Trim());
+                } catch { }
+                float pixelsPerWorld = renderWidth / (2.0f * switchDist * (float)System.Math.Tan(hFov * 0.5));
+
+                var stc = new StaticTexCreator(pixelsPerWorld, 64);
                 int vert_size = NativeMethods.GetCompressedVertSize(), face_size = 6;
 
+                // Phase 1: walk the mesh library, record the largest bounding size per texture.
+                var texMaxExtent = new Dictionary<string, float>();
+                var texFirstName = new Dictionary<string, string>();
                 using (var br = new BinaryReader(File.OpenRead(Statics.fn_statmesh), Statics.ESPEncoding)) {
                     foreach (var name in UsedNifList) {
                         int nodes = br.ReadInt32();
                         br.BaseStream.Position += 16; // Byte count: 4 - radius, 12 - center
                         int type = br.BaseStream.ReadByte();
                         for (int j = 0; j < nodes; j++) {
-                            br.BaseStream.Position += 40; // Byte count: 4 - radius, 12 - center, 12 - AABB min, 12 - AABB max
+                            float radius = br.ReadSingle();
+                            br.BaseStream.Position += 36; // Byte count: 12 - center, 12 - AABB min, 12 - AABB max
                             int verts = br.ReadInt32();
                             int faces = br.ReadInt32();
                             br.BaseStream.Position += verts * vert_size + faces * face_size;
@@ -1377,21 +1414,38 @@ namespace MGEgui.DistantLand {
                             string path = new string(br.ReadChars(chars - 1));
                             br.BaseStream.Position += 1;
 
-                            try {
-                                if (type != (int)StaticType.Grass && type != (int)StaticType.Tree) {
-                                    bool ok = stc.LoadTexture(path);
-                                    if (!ok) {
-                                        String warn = String.Format(strings["MissingTexture"], path, name);
-                                        // MessageBox.Show(warn, "Warning", MessageBoxButtons.OK);
-                                        staticsWarnings.Add(warn);
-                                    }
+                            if (type != (int)StaticType.Grass && type != (int)StaticType.Tree) {
+                                float extent = 2.0f * radius;
+                                float prev;
+                                if (!texMaxExtent.TryGetValue(path, out prev) || extent > prev) {
+                                    texMaxExtent[path] = extent;
+                                    texFirstName[path] = name;
                                 }
-                            } catch (ArgumentException) {
-                                // warnings.Add("Warning: Texture '"+path+"' on subset "+j+" of mesh '"+pair.Key+"' could not be found");
                             }
                         }
                     }
                 }
+
+                // Phase 2: create one LOD texture per unique path, sized by its largest user.
+                var texStopwatch = System.Diagnostics.Stopwatch.StartNew();
+                foreach (var kv in texMaxExtent) {
+                    try {
+                        bool ok = stc.LoadTexture(kv.Key, kv.Value);
+                        if (!ok) {
+                            staticsWarnings.Add(String.Format(strings["MissingTexture"], kv.Key, texFirstName[kv.Key]));
+                        }
+                    } catch (ArgumentException) {
+                    }
+                }
+                texStopwatch.Stop();
+
+                dlStaticsTexMs = texStopwatch.ElapsedMilliseconds;
+                dlSliced = stc.Sliced;
+                dlResampled = stc.Resampled;
+                dlMagenta = stc.Magenta;
+                dlMagentaPaths = stc.MagentaPaths;
+                dlResampledPaths = stc.ResampledPaths;
+
                 stc.Dispose();
             }
 
@@ -1399,6 +1453,12 @@ namespace MGEgui.DistantLand {
                 e.Result = staticsWarnings;
             }
         }
+
+        // Distant-statics LOD-texture report (populated by workerCreateStatics)
+        private long dlStaticsTexMs;
+        private int dlSliced, dlResampled, dlMagenta;
+        private List<string> dlMagentaPaths;
+        private List<string> dlResampledPaths;
 
         void workerFCreateStatics(object sender, System.ComponentModel.RunWorkerCompletedEventArgs e) {
             if (e != null) {
@@ -1472,6 +1532,20 @@ namespace MGEgui.DistantLand {
                              + strings["TotalSize"] + (fileSize / (1024 * 1024)) + " MB";/* + "\r\n"
                 + "Total processed cells: " + cells + "\r\n"
                 + "Total unique statics: " + (statics - 2);*/
+            summary += "\r\n\r\nDistant statics textures: " + dlSliced + " sliced, " + dlResampled + " resampled, " + dlMagenta + " magenta (non-DDS)"
+                     + "\r\nDistant textures stage: " + dlStaticsTexMs + " ms";
+            if (dlMagenta > 0 && dlMagentaPaths != null) {
+                summary += "\r\nNon-DDS (magenta) textures to optimize:";
+                foreach (string mp in dlMagentaPaths) {
+                    summary += "\r\n  " + mp;
+                }
+            }
+            if (dlResampled > 0 && dlResampledPaths != null) {
+                summary += "\r\nMissing/incomplete mips (resampled):";
+                foreach (string rp in dlResampledPaths) {
+                    summary += "\r\n  " + rp;
+                }
+            }
             if (SetupFlags["AutoRun"]) {
                 setFinishDesc(5);
                 lFinishDesc.Text += "________________________________________\r\n" + summary;

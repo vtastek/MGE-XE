@@ -138,4 +138,11 @@ std::list<NiObject *> NiUVData::GetPtrs() const {
 }
 
 //--BEGIN MISC CUSTOM CODE--//
+vector< KeyGroup<float> > NiUVData::GetUVGroups() const {
+	vector< KeyGroup<float> > out(4);
+	for (unsigned int i = 0; i < 4; ++i) {
+		out[i] = uvGroups[i];
+	}
+	return out;
+}
 //--END CUSTOM CODE--//

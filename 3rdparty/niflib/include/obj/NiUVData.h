@@ -56,6 +56,12 @@ public:
 	NIFLIB_API virtual const Type & GetType() const;
 
 	//--BEGIN MISC CUSTOM CODE--//
+	/*!
+	 * Retrieves the four UV animation key groups as a plain vector.
+	 * Index 0 = U translation, 1 = V translation, 2 = U tiling, 3 = V tiling.
+	 * Added for MGE XE's hero distant-statics bake (real per-layer UV keys).
+	 */
+	NIFLIB_API vector< KeyGroup<float> > GetUVGroups() const;
 	//--END CUSTOM CODE--//
 protected:
 	/*!
