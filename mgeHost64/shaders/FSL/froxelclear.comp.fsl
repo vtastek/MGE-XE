@@ -1,0 +1,21 @@
+// mgeHost64 — clustered forward lighting: zero the froxel light-mask before the scatter.
+//
+// One thread per mask word (froxels*4). Runs as its OWN dispatch before froxelassign.comp, with a
+// UAV barrier between, so the whole grid is cleared before any light scatters its bit. numWords is
+// gFroxelParams.screen.w (host-filled = tilesX*tilesY*NZ*4 for the CURRENT resolution).
+
+#include "froxelassign.srt.h"
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(64, 1, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    // NB: every RETURN() MUST start its own line (fsl.py only rewrites a line-leading RETURN).
+    uint i = DispatchThreadID.x;
+    uint numWords = (uint)gFroxelParams.screen.w;
+    if (i >= numWords)
+        RETURN();
+    gFroxelMaskRW[i] = 0u;
+    RETURN();
+}

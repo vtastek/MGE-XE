@@ -46,6 +46,7 @@ namespace {
     bool   g_devUiVisible = false;     // F9; default off so it never blocks normal play
     HWND   g_devHwnd = nullptr;        // MW focus window (cached from device creation params)
     bool   g_reloadShadersPending = false; // F8 latched at composite finish, consumed by the next kickoff
+    bool   g_distLightsTogglePending = false; // numpad- latched at composite finish; one-shot host dist-light A/B
     bool   g_fpSuppressLive = false;   // FP1b: MW arm suppression; seeded from ForgeFPSuppress at init, numpad-/ flips live
 
     // --- Feeding-side spike logging --------------------------------------------------
@@ -2703,6 +2704,10 @@ namespace RenderProcess {
             devInput.reloadShaders = 1u;
             g_reloadShadersPending = false;
         }
+        if (g_distLightsTogglePending) {
+            devInput.distLightsToggle = 1u;
+            g_distLightsTogglePending = false;
+        }
         if (g_devUiVisible) {
             if (!g_devHwnd) {
                 D3DDEVICE_CREATION_PARAMETERS cp = {};
@@ -2853,6 +2858,13 @@ namespace RenderProcess {
             if (GetAsyncKeyState(VK_F8) & 0x0001) {
                 g_reloadShadersPending = true;
                 LOG::logline(">> [seam] compute shader hot-reload requested (F8)");
+            }
+            // Numpad -: perf A/B for the baked distant point-light loop. Latched here (edge), flipped
+            // host-side in the next kickoff's DevInput so the gpu-split `dl=` bracket can be diffed
+            // on/off in a heavy night scene (the clustered-vs-forward cost measurement).
+            if (GetAsyncKeyState(VK_SUBTRACT) & 0x0001) {
+                g_distLightsTogglePending = true;
+                LOG::logline(">> [seam] distant-light A/B toggle requested (numpad -)");
             }
             // FP1b: numpad-/ toggles MW first-person arm suppression live (A/B of MW arms
             // over the host FP pass vs host arms alone). Only takes effect while the FP

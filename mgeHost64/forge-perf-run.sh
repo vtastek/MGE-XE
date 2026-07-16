@@ -38,7 +38,7 @@ echo "=== VERIFY (device removed / FAILED / fatal in new log) ==="
 tail -n +$((startlines + 1)) "$LOG" | grep -Ei "device removed|FAILED|fatal|crash" | tail -20 || echo "  (clean)"
 
 echo "=== last splits ==="
-tail -n +$((startlines + 1)) "$LOG" | grep -E "host split:|gpu split:|\[dl\] exterior" | tail -$((SAMPLES * 3))
+tail -n +$((startlines + 1)) "$LOG" | grep -E "host split:|gpu split:|gpu color sub:|\[dl\] exterior|dist lights " | tail -$((SAMPLES * 4))
 
 echo "[harness] killing procs..."
 powershell.exe -Command "Stop-Process -Name Morrowind,mgeHost64 -Force -ErrorAction SilentlyContinue" >/dev/null 2>&1

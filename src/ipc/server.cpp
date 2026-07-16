@@ -633,6 +633,9 @@ namespace IPC {
 			if (params.devReloadShaders) {
 				ForgeRender::reloadComputeShaders();
 			}
+			if (params.devDistLightsToggle) {
+				ForgeRender::toggleDistLights();
+			}
 			ok = ForgeRender::renderScene(params.viewProj, params.lighting, drawPtr, params.drawCount, bytes,
 				skinnedPtr, params.skinnedCount, skinnedBytes,
 				multiMapPtr, params.multiMapCount, multiMapBytes,

@@ -1,0 +1,87 @@
+// mgeHost64 — clustered forward lighting: scatter each baked light into the froxel mask.
+//
+// One thread per uploaded light. Project the light's world-space AABB (centre +- reach, cam-relative)
+// to a screen-tile box, and its RADIAL distance range [|c|-reach, |c|+reach] to a Z-slice range, then
+// OR the light's bit into every covered froxel's 128-bit mask (4 x uint; light i -> word i>>5, bit
+// i&31). The frag (distantland.frag / statics.frag) computes the SAME froxel from SV_Position + radial
+// distance and loops only the set bits. Radial distance (not planar view-Z) is the slice metric so
+// assignment + frag stay trivially consistent with no view-forward vector.
+//
+// Conservative: the screen AABB over-covers the sphere, the slice range is a necessary condition, and
+// a near-plane-straddling light expands to the full screen at its slices — all OVER-inclusion, so the
+// lit result is byte-identical to the brute loop, just far fewer per-fragment iterations.
+
+#include "froxelassign.srt.h"
+
+ROOT_SIGNATURE(ComputeRootSignature)
+NUM_THREADS(64, 1, 1)
+void CS_MAIN( SV_DispatchThreadID(uint3) DispatchThreadID )
+{
+    INIT_MAIN;
+    // NB: every RETURN() MUST start its own line (fsl.py only rewrites a line-leading RETURN).
+    uint li = DispatchThreadID.x;
+    uint lightCount = (uint)gFroxelParams.dims.w;
+    if (li >= lightCount)
+        RETURN();
+
+    float4 sp = gFroxelParams.spheres[li];
+    float3 c     = sp.xyz;
+    float  reach = sp.w;
+    if (reach <= 0.0f)
+        RETURN();
+
+    int   tilesX = (int)gFroxelParams.dims.x;
+    int   tilesY = (int)gFroxelParams.dims.y;
+    int   NZ     = (int)gFroxelParams.dims.z;
+    float W      = gFroxelParams.screen.x;
+    float H      = gFroxelParams.screen.y;
+    float tile   = gFroxelParams.screen.z;
+
+    // Screen-tile box: project the 8 corners of the light's world AABB, take the pixel min/max.
+    float3 lo = c - reach;
+    float3 hi = c + reach;
+    float2 pmin = float2( 1e9f,  1e9f);
+    float2 pmax = float2(-1e9f, -1e9f);
+    bool   nearStraddle = false;
+    for (int corner = 0; corner < 8; ++corner)
+    {
+        float3 p = float3((corner & 1) != 0 ? hi.x : lo.x,
+                          (corner & 2) != 0 ? hi.y : lo.y,
+                          (corner & 4) != 0 ? hi.z : lo.z);
+        float4 cl = mul(gFroxelParams.viewProj, float4(p, 1.0f));
+        if (cl.w <= 1e-4f) { nearStraddle = true; continue; }   // corner behind near plane
+        float2 ndc = cl.xy / cl.w;                              // -1..1
+        float2 px  = float2((ndc.x * 0.5f + 0.5f) * W, (0.5f - ndc.y * 0.5f) * H);   // flip Y
+        pmin = min(pmin, px);
+        pmax = max(pmax, px);
+    }
+    if (nearStraddle) { pmin = float2(0.0f, 0.0f); pmax = float2(W, H); }   // conservative full-screen
+    pmin = max(pmin, float2(0.0f, 0.0f));
+    pmax = min(pmax, float2(W, H));
+    if (pmax.x < pmin.x || pmax.y < pmin.y)
+        RETURN();
+
+    int tx0 = clamp((int)(pmin.x / tile), 0, tilesX - 1);
+    int tx1 = clamp((int)(pmax.x / tile), 0, tilesX - 1);
+    int ty0 = clamp((int)(pmin.y / tile), 0, tilesY - 1);
+    int ty1 = clamp((int)(pmax.y / tile), 0, tilesY - 1);
+
+    // Radial-distance slice range. sliceOf(d) = (log(d) - log(d0)) * invLogRange * NZ, clamped.
+    float dc   = length(c);
+    float dmin = max(dc - reach, gFroxelParams.zparams.x);
+    float dmax = dc + reach;
+    int zs0 = clamp((int)((log(max(dmin, 1.0f)) - gFroxelParams.zparams.z) * gFroxelParams.zparams.w * (float)NZ), 0, NZ - 1);
+    int zs1 = clamp((int)((log(max(dmax, 1.0f)) - gFroxelParams.zparams.z) * gFroxelParams.zparams.w * (float)NZ), 0, NZ - 1);
+
+    uint word = li >> 5u;
+    uint bit  = 1u << (li & 31u);
+    for (int ty = ty0; ty <= ty1; ++ty)
+        for (int tx = tx0; tx <= tx1; ++tx)
+            for (int zs = zs0; zs <= zs1; ++zs)
+            {
+                uint froxel = ((uint)ty * (uint)tilesX + (uint)tx) * (uint)NZ + (uint)zs;
+                uint prev;
+                AtomicOr(gFroxelMaskRW[froxel * 4u + word], bit, prev);
+            }
+    RETURN();
+}

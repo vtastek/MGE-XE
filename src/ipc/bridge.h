@@ -279,6 +279,7 @@ namespace IPC {
         float         wheel = 0.0f;
         std::uint32_t uiVisible = 0;
         std::uint32_t reloadShaders = 0;   // one-shot (F8 edge): host rebuilds compute pipelines from disk
+        std::uint32_t distLightsToggle = 0; // one-shot (numpad- edge): host flips baked distant-light loop (perf A/B)
     };
 
     // FP1a: the per-frame first-person bundle handed to renderSceneKickoff as ONE optional
@@ -379,6 +380,7 @@ namespace IPC {
         IN float         devMouseWheel;
         IN std::uint32_t devUiVisible;
         IN std::uint32_t devReloadShaders;   // one-shot (F8 edge): host rebuilds compute pipelines from disk
+        IN std::uint32_t devDistLightsToggle; // one-shot (numpad- edge): host flips baked distant-light loop (perf A/B)
 
         // AT1 sorted-alpha takeover: per-frame alpha draw list of AlphaDrawWire[] (geomwire.h) —
         // the scene-1 blended world shapes, CLIENT-sorted back-to-front, drawn by the host after
