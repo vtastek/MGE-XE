@@ -26,6 +26,7 @@
 #include <cstring>
 #include <chrono>
 #include <vector>
+#include <deque>
 #include <string>
 #include <cmath>
 #include <unordered_map>
@@ -80,6 +81,10 @@
 // the merged ComputeRootSignature. Names its cbuffer gCullParams + texture gCullHiz so it can reuse
 // hizocclusion.h.fsl verbatim; the struct type (LightCullParams) is distinct from cull's CullParams.
 #include "shaders/FSL/shadowlightcull.srt.h"
+// Clustered forward lighting: froxel light-assignment SRT (FroxelSrtData, PerBatch frequency). Shares
+// the merged ComputeRootSignature (1 CBV + 1 UAV — within the cull set's union). froxelclear.comp +
+// froxelassign.comp both include it. See tasks/forge-clustered-lighting.md.
+#include "shaders/FSL/froxelassign.srt.h"
 
 // App-layer callback normally provided by WindowsBase.cpp (which we exclude — it
 // drags in the window system). The backend calls this on device-lost. Headless:
@@ -1142,6 +1147,22 @@ namespace {
         Pipeline*      pShadowLightCullPipeline = nullptr;
         DescriptorSet* pShadowLightCullSet = nullptr; // ShadowLightCullSrtData PerBatch
         bool           shadowLightCullReady = false;
+        // --- Clustered forward lighting: froxel grid for the DISTANT baked point lights. Two compute
+        // passes (clear + light-scatter) fill a 128-bit-per-froxel mask; distantland.frag/statics.frag
+        // loop only their froxel's lights. Created EAGERLY (so gFroxelMask can bind into pPerFrameSet
+        // at init); dispatched each frame before the DL colour pass. See tasks/forge-clustered-lighting.md.
+        Buffer*        pFroxelMask    = nullptr;   // GPU_ONLY RW|SRV uint[maxFroxels*4]: 128-bit mask/froxel
+        Buffer*        pFroxelParamsCbv = nullptr; // FroxelParams (viewProj/dims/screen/zparams + spheres[128]), per-frame
+        Shader*        pFroxelClearShader = nullptr;
+        Shader*        pFroxelAssignShader = nullptr;
+        Pipeline*      pFroxelClearPipeline = nullptr;
+        Pipeline*      pFroxelAssignPipeline = nullptr;
+        DescriptorSet* pFroxelSet = nullptr;       // FroxelSrtData PerBatch (gFroxelParams + gFroxelMaskRW)
+        bool           froxelReady = false;
+        bool           froxelActive = false;       // set per-frame (primary): clear+assign dispatched this frame
+        uint32_t       froxelNumWords = 0;         // this frame's grid words (tilesX*tilesY*NZ*4) to clear
+        uint32_t       froxelLightCount = 0;       // this frame's uploaded light count (assign thread count)
+        bool           froxelMaskInShaderState = false;  // true once transitioned to PIXEL SRV this frame
         DescriptorSet* pPerFrameSet = nullptr;    // gFrameData cbuffer (viewProj), 1 instance
         DescriptorSet* pPerBatchSet = nullptr;    // gBatch cbuffer window, kMaxBatches instances
         Buffer*        pFrameCbv = nullptr;        // gFrameData cbuffer (viewProj), persistent-mapped
@@ -1537,6 +1558,17 @@ namespace {
     // 16 + 128*3*16 = 6160 B, rounded up to a 256-byte CBV multiple.
     constexpr uint32_t kMaxPointLights = 128;
     constexpr uint32_t kLightCbvBytes  = ((16 + kMaxPointLights * 3 * 16) + 255) & ~255u;  // 6400
+
+    // --- Clustered forward lighting (froxel grid) -------------------------------------------------
+    constexpr uint32_t kFroxelTile     = 32;    // screen tile size (px) — MUST match the frag's divisor
+    constexpr uint32_t kFroxelZSlices  = 24;    // view-Z (radial) log slices
+    // Max grid the froxel-mask buffer must fit (sized for a generous max resolution so it never
+    // reallocs on window/backbuffer size). 2560x1440 / 32 = 80x45 tiles x 24 slices x 4 uints.
+    constexpr uint32_t kFroxelMaxTilesX = (2560 + kFroxelTile - 1) / kFroxelTile;   // 80
+    constexpr uint32_t kFroxelMaxTilesY = (1440 + kFroxelTile - 1) / kFroxelTile;   // 45
+    constexpr uint32_t kFroxelMaxWords  = kFroxelMaxTilesX * kFroxelMaxTilesY * kFroxelZSlices * 4u; // 345600
+    // FroxelParams cbuffer bytes: 64 (mat) + 48 (3 float4) + 128*16 (spheres) = 2160 -> 256-aligned.
+    constexpr uint32_t kFroxelParamsBytes = ((64 + 48 + kMaxPointLights * 16) + 255) & ~255u;  // 2304
 
     // --- P1 point-light shadows -------------------------------------------------------------
     // One kShadowAtlasW x kShadowAtlasH D32 atlas of per-light 3-wide x 2-tall cube-face blocks.
@@ -2217,6 +2249,7 @@ namespace {
     // instance buffer. The opaque shaders share the global default.rootsig (regenerated from the
     // SRT in opaque.srt.h). On any failure tears down what it made and returns false
     // (the triangle path stays usable).
+    bool createFroxelResources(Renderer* R);   // clustered forward (defined later; called from buildOpaquePath)
     bool buildOpaquePath(Renderer* R, uint32_t width, uint32_t height) {
         // Depth target (reverse-Z not needed for M1c; standard LEQUAL + clear to 1.0).
         RenderTargetDesc dDesc = {};
@@ -2896,18 +2929,31 @@ namespace {
         if (!g_live.pPerFrameSet || !g_live.pPerLightsSet || !g_live.pPerBatchSet || !g_live.pPersistentSet) {
             return false;
         }
+        // Clustered forward: create the froxel mask + compute pipelines NOW so gFroxelMask can bind
+        // into pPerFrameSet below. Non-fatal — on failure froxelReady stays false and the frags brute-loop.
+        createFroxelResources(R);
         {
             // PerFrame set: gFrameData CBV + gAO SRV. The frags read the BILATERAL-BLURRED AO
             // (pAOBlur), not raw pAO; pAOBlur's per-frame UAV<->SHADER_RESOURCE ping-pong (renderScene)
             // leaves it SHADER_RESOURCE before the colour pass samples it. (Raw pAO still feeds the
             // blur as an SRV, and the DebugTextures/readback paths still inspect pAO directly.)
-            DescriptorData p[5] = {};
+            DescriptorData p[6] = {};
             p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
             p[0].ppBuffers = &g_live.pFrameCbv;
             p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
             p[1].mCount = 1;   // single-texture SRV needs explicit count (else binds nothing)
             p[1].ppTextures = &g_live.pAOBlur;
             uint32_t np = 2;
+            // Clustered forward: bind the froxel light-mask (read as an SRV here; froxelassign.comp
+            // writes it as a UAV). Created eagerly just above so it's always available. The frags only
+            // index it when gFrameData.froxelDims.x > 0 (else the brute loop), but it must be BOUND for
+            // every opaque-sig frag since the set is shared.
+            if (g_live.pFroxelMask) {
+                p[np].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFroxelMask);
+                p[np].mCount = 1;
+                p[np].ppBuffers = &g_live.pFroxelMask;
+                ++np;
+            }
             // P1 shadows: the screen-space visibility mask opaque.frag loads per shadowed light.
             if (g_live.pShadowMask) {
                 p[np].mIndex = SRT_RES_IDX(SrtData, PerFrame, gShadowMask);
@@ -5097,6 +5143,8 @@ namespace {
     constexpr float kMWLightConstant  = 0.36f;   // Morrowind.ini ConstantValue
     constexpr float kMWLightQuadratic = 3.25f;   // Morrowind.ini QuadraticValue (Method 2 → /R²)
     bool  g_drawDistLights  = true;              // A/B enable (dev panel checkbox; NOT a brightness knob)
+    bool  g_useFroxel       = true;              // clustered forward A/B: OFF forces the brute gLights loop
+                                                 // (SAME lights) so the froxel image can be diffed vs brute
     float g_shadowVertWeight = 1.0f;    // VERTICAL importance weighting for slot ranking. The importance
                                         // metric weights the light's vertical offset from the eye (world Z,
                                         // camera-relative) by this factor before ranking. >1 demotes lights on
@@ -5406,6 +5454,65 @@ namespace {
                                             "5 albedo", "6 lit", "7 ambient", "8 world-normal", "9 light-count",
                                             "10 shadow-mask", "11 shadow-atlas (static)", "12 shadow-atlas (dyn)" };
 
+    // The dev panel outgrew a flat widget list (~250 entries → unreadable). TabBuilder groups them
+    // into WIDGET_TYPE_COLLAPSING_HEADER sections ("tabs"). The-Forge deep-copies the whole subtree
+    // on uiAddComponentWidget (cloneWidget recurses pGroupedWidgets), so the payloads/bases only need
+    // to live until flush(). std::deque keeps node-stable addresses for the pWidget pointers as we
+    // append (a vector would realloc and dangle them). One builder per tab; flush() emits the header.
+    struct TabBuilder {
+        UIComponent* panel = nullptr;
+        const char*  name  = "";
+        bool         defaultOpen = false;
+        std::deque<CheckboxWidget>    cbs;
+        std::deque<SliderFloatWidget> sfs;
+        std::deque<SliderUintWidget>  sus;
+        std::deque<DropdownWidget>    dds;
+        std::deque<LabelWidget>       lbls;
+        std::deque<DynamicTextWidget> dyns;
+        std::deque<UIWidget>          bases;
+        std::vector<UIWidget*>        ptrs;
+
+        void push(WidgetType t, const char* label, void* payload) {
+            UIWidget& b = bases.emplace_back();
+            b.mType = t;
+            b.pWidget = payload;
+            strncpy(b.mLabel, label, MAX_LABEL_STR_LENGTH - 1);
+            ptrs.push_back(&b);
+        }
+        void checkbox(const char* label, bool* p) {
+            CheckboxWidget& w = cbs.emplace_back(); w.pData = p;
+            push(WIDGET_TYPE_CHECKBOX, label, &w);
+        }
+        void sliderF(const char* label, float* p, float mn, float mx, float st, const char* fmt = nullptr) {
+            SliderFloatWidget& w = sfs.emplace_back(); w.pData = p; w.mMin = mn; w.mMax = mx; w.mStep = st;
+            if (fmt) { strncpy(w.mFormat, fmt, sizeof(w.mFormat) - 1); }
+            push(WIDGET_TYPE_SLIDER_FLOAT, label, &w);
+        }
+        void sliderU(const char* label, uint32_t* p, uint32_t mn, uint32_t mx, uint32_t st) {
+            SliderUintWidget& w = sus.emplace_back(); w.pData = p; w.mMin = mn; w.mMax = mx; w.mStep = st;
+            push(WIDGET_TYPE_SLIDER_UINT, label, &w);
+        }
+        void dropdown(const char* label, uint32_t* p, const char* const* names, uint32_t count) {
+            DropdownWidget& w = dds.emplace_back(); w.pData = p; w.pNames = names; w.mCount = count;
+            push(WIDGET_TYPE_DROPDOWN, label, &w);
+        }
+        void label(const char* label) {
+            LabelWidget& w = lbls.emplace_back();
+            push(WIDGET_TYPE_LABEL, label, &w);
+        }
+        void dynamicText(const char* label, bstring* text, float4* color) {
+            DynamicTextWidget& w = dyns.emplace_back(); w.pText = text; w.pColor = color;
+            push(WIDGET_TYPE_DYNAMIC_TEXT, label, &w);
+        }
+        void flush() {
+            CollapsingHeaderWidget hdr = {};
+            hdr.pGroupedWidgets = ptrs.data();
+            hdr.mWidgetsCount   = (uint32_t)ptrs.size();
+            hdr.mDefaultOpen    = defaultOpen;
+            uiAddComponentWidget(panel, name, &hdr, WIDGET_TYPE_COLLAPSING_HEADER);
+        }
+    };
+
     // Build the dev overlay once. The headless host has no Load/Unload reload split, so font-system
     // + UI-system init AND their pipeline load happen together here, right after pRT exists.
     void initDevUI(Renderer* R, uint32_t width, uint32_t height, uint32_t colorFmt) {
@@ -5473,225 +5580,138 @@ namespace {
         LabelWidget lbl = {};
         uiAddComponentWidget(g_uiPanel, "Forge dev overlay (F9 toggles)", &lbl, WIDGET_TYPE_LABEL);
 
+        // Root-level (always visible): the fullscreen debug-buffer picker (F12 also cycles it).
         DropdownWidget dd = {};
         dd.pData = &g_debugMode;
         dd.pNames = kDebugModeNames;
         dd.mCount = (uint32_t)(sizeof(kDebugModeNames) / sizeof(kDebugModeNames[0]));
         uiAddComponentWidget(g_uiPanel, "Fullscreen buffer", &dd, WIDGET_TYPE_DROPDOWN);
 
-        SliderFloatWidget sR = {}; sR.pData = &g_aoRadius;    sR.mMin = 1.0f;  sR.mMax = 64.0f;  sR.mStep = 0.5f;
-        uiAddComponentWidget(g_uiPanel, "AO radius (world)", &sR, WIDGET_TYPE_SLIDER_FLOAT);
-        SliderFloatWidget sF = {}; sF.pData = &g_aoFalloff;   sF.mMin = 1.0f;  sF.mMax = 200.0f; sF.mStep = 1.0f;
-        uiAddComponentWidget(g_uiPanel, "AO falloff (world)", &sF, WIDGET_TYPE_SLIDER_FLOAT);
-        SliderFloatWidget sI = {}; sI.pData = &g_aoIntensity; sI.mMin = 0.0f;  sI.mMax = 8.0f;   sI.mStep = 0.05f;
-        uiAddComponentWidget(g_uiPanel, "AO intensity", &sI, WIDGET_TYPE_SLIDER_FLOAT);
-        SliderFloatWidget sT = {}; sT.pData = &g_aoThickness; sT.mMin = 0.0f;  sT.mMax = 0.5f;   sT.mStep = 0.005f;
-        uiAddComponentWidget(g_uiPanel, "AO horizon bias", &sT, WIDGET_TYPE_SLIDER_FLOAT);
-
-        // Phase C: baked distant point lights (MW ini-baked attenuation; no brightness knob). Enable
-        // is just an A/B toggle.
-        CheckboxWidget cDL = {}; cDL.pData = &g_drawDistLights;
-        uiAddComponentWidget(g_uiPanel, "Dist lights: enable", &cDL, WIDGET_TYPE_CHECKBOX);
-        SliderFloatWidget sBl = {}; sBl.pData = &g_aoBlurPx;    sBl.mMin = 0.0f; sBl.mMax = 4.0f;   sBl.mStep = 0.1f;
-        uiAddComponentWidget(g_uiPanel, "AO blur spatial (px)", &sBl, WIDGET_TYPE_SLIDER_FLOAT);
-        SliderFloatWidget sBd = {}; sBd.pData = &g_aoBlurDepth; sBd.mMin = 1.0f; sBd.mMax = 256.0f; sBd.mStep = 1.0f;
-        uiAddComponentWidget(g_uiPanel, "AO blur range (world)", &sBd, WIDGET_TYPE_SLIDER_FLOAT);
-
-        // AO contribution toggles.
-        CheckboxWidget cAO = {}; cAO.pData = &g_aoEnable;
-        uiAddComponentWidget(g_uiPanel, "AO enable", &cAO, WIDGET_TYPE_CHECKBOX);
-        CheckboxWidget cBN = {}; cBN.pData = &g_bentNormalEnable;
-        uiAddComponentWidget(g_uiPanel, "Bent normal enable", &cBN, WIDGET_TYPE_CHECKBOX);
-        CheckboxWidget cAW = {}; cAW.pData = &g_ambientWhite;
-        uiAddComponentWidget(g_uiPanel, "Ambient = white (debug)", &cAW, WIDGET_TYPE_CHECKBOX);
-
-        // Intensity modifiers (dbgScales) — crank one to see which surfaces respond (= Forge-drawn).
-        SliderFloatWidget sAmb = {}; sAmb.pData = &g_ambScale;     sAmb.mMin = 0.0f; sAmb.mMax = 4.0f; sAmb.mStep = 0.02f;
-        uiAddComponentWidget(g_uiPanel, "Ambient intensity", &sAmb, WIDGET_TYPE_SLIDER_FLOAT);
-        SliderFloatWidget sLit = {}; sLit.pData = &g_litScale;     sLit.mMin = 0.0f; sLit.mMax = 4.0f; sLit.mStep = 0.02f;
-        uiAddComponentWidget(g_uiPanel, "Diffuse intensity", &sLit, WIDGET_TYPE_SLIDER_FLOAT);
-        SliderFloatWidget sAlb = {}; sAlb.pData = &g_albedoScale;  sAlb.mMin = 0.0f; sAlb.mMax = 4.0f; sAlb.mStep = 0.02f;
-        uiAddComponentWidget(g_uiPanel, "Albedo intensity", &sAlb, WIDGET_TYPE_SLIDER_FLOAT);
-        SliderFloatWidget sOvr = {}; sOvr.pData = &g_overallScale; sOvr.mMin = 0.0f; sOvr.mMax = 4.0f; sOvr.mStep = 0.02f;
-        uiAddComponentWidget(g_uiPanel, "Overall intensity", &sOvr, WIDGET_TYPE_SLIDER_FLOAT);
-
-        // SK2 sky-takeover "ownership tell". The Forge sky is byte-identical to MW's, so crank this
-        // (F7 on) to tint the Forge sky magenta — it only moves if Forge is drawing the sky. Pulse
-        // animates it for an unmistakable confirmation. Leave at 0 for a clean vanilla-vs-Forge A/B.
-        LabelWidget skyLbl = {};
-        uiAddComponentWidget(g_uiPanel, "-- Sky takeover (F7) --", &skyLbl, WIDGET_TYPE_LABEL);
-        SliderFloatWidget sSky = {}; sSky.pData = &g_skyDebugTint; sSky.mMin = 0.0f; sSky.mMax = 1.0f; sSky.mStep = 0.02f;
-        uiAddComponentWidget(g_uiPanel, "Sky tint (Forge tell)", &sSky, WIDGET_TYPE_SLIDER_FLOAT);
-        CheckboxWidget cSkyP = {}; cSkyP.pData = &g_skyTintPulse;
-        uiAddComponentWidget(g_uiPanel, "Sky tint pulse", &cSkyP, WIDGET_TYPE_CHECKBOX);
-
-        // WT2 water debug: isolate the reflection / refraction inputs so they can be inspected
-        // directly (the composited surface can hide a black/empty reflection RT). 0 = normal water.
-        LabelWidget watLbl = {};
-        uiAddComponentWidget(g_uiPanel, "-- Water takeover (F7) --", &watLbl, WIDGET_TYPE_LABEL);
-        CheckboxWidget cWRefl = {}; cWRefl.pData = &g_waterReflOnly;
-        uiAddComponentWidget(g_uiPanel, "Water: reflection only", &cWRefl, WIDGET_TYPE_CHECKBOX);
-        CheckboxWidget cWRefr = {}; cWRefr.pData = &g_waterRefrOnly;
-        uiAddComponentWidget(g_uiPanel, "Water: refraction only", &cWRefr, WIDGET_TYPE_CHECKBOX);
-
-        // P1 point-light shadows: master toggle + the two mask-pass debug views (face-id bands /
-        // atlas depth — the face-convention check) + the live acne slack knob.
-        LabelWidget shLbl = {};
-        uiAddComponentWidget(g_uiPanel, "-- Point-light shadows (P1) --", &shLbl, WIDGET_TYPE_LABEL);
-        CheckboxWidget cShEn = {}; cShEn.pData = &g_shadowEnable;
-        uiAddComponentWidget(g_uiPanel, "Shadows: enable", &cShEn, WIDGET_TYPE_CHECKBOX);
-        CheckboxWidget cShFd = {}; cShFd.pData = &g_shadowFaceDebug;
-        uiAddComponentWidget(g_uiPanel, "Shadow: face-id debug (F12 mode 10)", &cShFd, WIDGET_TYPE_CHECKBOX);
-        CheckboxWidget cShAd = {}; cShAd.pData = &g_shadowAtlasDebug;
-        uiAddComponentWidget(g_uiPanel, "Shadow: atlas view (F12 mode 10)", &cShAd, WIDGET_TYPE_CHECKBOX);
-        SliderFloatWidget sShS = {}; sShS.pData = &g_shadowSlack; sShS.mMin = 0.0f; sShS.mMax = 0.2f; sShS.mStep = 0.002f;
-        uiAddComponentWidget(g_uiPanel, "Shadow depth slack", &sShS, WIDGET_TYPE_SLIDER_FLOAT);
-        SliderFloatWidget sShB = {}; sShB.pData = &g_shadowBias; sShB.mMin = -0.005f; sShB.mMax = 0.005f; sShB.mStep = 0.00002f;
-        strncpy(sShB.mFormat, "%.5f", sizeof(sShB.mFormat) - 1);   // show the tiny near-zero values
-        uiAddComponentWidget(g_uiPanel, "Shadow contact bias (negative = close gap)", &sShB, WIDGET_TYPE_SLIDER_FLOAT);
-        SliderFloatWidget sShNo = {}; sShNo.pData = &g_shadowNormalOffset; sShNo.mMin = 0.0f; sShNo.mMax = 8.0f; sShNo.mStep = 0.25f;
-        uiAddComponentWidget(g_uiPanel, "Shadow normal offset (kills grazing acne)", &sShNo, WIDGET_TYPE_SLIDER_FLOAT);
-        SliderFloatWidget sShRk = {}; sShRk.pData = &g_shadowRangeK; sShRk.mMin = 0.5f; sShRk.mMax = 2.0f; sShRk.mStep = 0.05f;
-        uiAddComponentWidget(g_uiPanel, "Shadow test range (radii) — light reach rides on this", &sShRk, WIDGET_TYPE_SLIDER_FLOAT);
-        SliderFloatWidget sLrf = {}; sLrf.pData = &g_lightReachFrac; sLrf.mMin = 0.4f; sLrf.mMax = 1.0f; sLrf.mStep = 0.02f;
-        uiAddComponentWidget(g_uiPanel, "Light reach (fraction of test range; <1 hides the edge)", &sLrf, WIDGET_TYPE_SLIDER_FLOAT);
+        // Dropdown name tables must outlive the panel (cloneDropdownWidget copies pNames BY POINTER,
+        // not deep) — keep them static.
         static const char* const kCasterCullNames[] = { "0 back (light faces)", "1 none (two-sided)", "2 front (back faces)" };
-        DropdownWidget ddCc = {}; ddCc.pData = &g_shadowCasterCull; ddCc.pNames = kCasterCullNames; ddCc.mCount = 3;
-        uiAddComponentWidget(g_uiPanel, "Shadow caster cull", &ddCc, WIDGET_TYPE_DROPDOWN);
-        SliderFloatWidget sShCg = {}; sShCg.pData = &g_shadowCageRadius; sShCg.mMin = 0.0f; sShCg.mMax = 256.0f; sShCg.mStep = 4.0f;
-        uiAddComponentWidget(g_uiPanel, "Shadow: fixture cage two-sided radius (0=off)", &sShCg, WIDGET_TYPE_SLIDER_FLOAT);
-        CheckboxWidget cShSk = {}; cShSk.pData = &g_shadowSkinnedCasters;
-        uiAddComponentWidget(g_uiPanel, "Shadow: skinned casters (NPC bodies)", &cShSk, WIDGET_TYPE_CHECKBOX);
-        CheckboxWidget cShMm = {}; cShMm.pData = &g_shadowMMCasters;
-        uiAddComponentWidget(g_uiPanel, "Shadow: multimap casters (NPC heads)", &cShMm, WIDGET_TYPE_CHECKBOX);
-        CheckboxWidget cShRm = {}; cShRm.pData = &g_shadowRigidMovers;
-        uiAddComponentWidget(g_uiPanel, "Shadow: rigid movers dyn-tile (hands/weapons)", &cShRm, WIDGET_TYPE_CHECKBOX);
-        CheckboxWidget cShSm = {}; cShSm.pData = &g_shadowSourceMover;
-        uiAddComponentWidget(g_uiPanel, "Shadow: source-mover (dyn only if transform-animated)", &cShSm, WIDGET_TYPE_CHECKBOX);
-        SliderUintWidget sShMa = {}; sShMa.pData = &g_shadowMaxActiveLights; sShMa.mMin = 1; sShMa.mMax = kMaxShadowLights; sShMa.mStep = 1;
-        uiAddComponentWidget(g_uiPanel, "Shadow: max active lights (32 = no cap)", &sShMa, WIDGET_TYPE_SLIDER_UINT);
-        SliderFloatWidget sShVw = {}; sShVw.pData = &g_shadowVertWeight; sShVw.mMin = 1.0f; sShVw.mMax = 8.0f; sShVw.mStep = 0.25f;
-        uiAddComponentWidget(g_uiPanel, "Shadow: vertical rank weight (multi-floor)", &sShVw, WIDGET_TYPE_SLIDER_FLOAT);
-        CheckboxWidget cShFg = {}; cShFg.pData = &g_shadowFixtureGate;
-        uiAddComponentWidget(g_uiPanel, "Shadow: fixture-only gate (drop window/ambient fill)", &cShFg, WIDGET_TYPE_CHECKBOX);
-        SliderFloatWidget sShFe = {}; sShFe.pData = &g_shadowFixtureEmissiveBox; sShFe.mMin = 0.0f; sShFe.mMax = 64.0f; sShFe.mStep = 1.0f;
-        uiAddComponentWidget(g_uiPanel, "Shadow: fixture emissive-vouch box (0 = name only)", &sShFe, WIDGET_TYPE_SLIDER_FLOAT);
-        SliderFloatWidget sShFb = {}; sShFb.pData = &g_shadowFixtureBoost; sShFb.mMin = 1.0f; sShFb.mMax = 8.0f; sShFb.mStep = 0.25f;
-        uiAddComponentWidget(g_uiPanel, "Shadow: fixture priority boost (light/torch/furn)", &sShFb, WIDGET_TYPE_SLIDER_FLOAT);
-        CheckboxWidget cDbgLb = {}; cDbgLb.pData = &g_debugLightBoxes;
-        uiAddComponentWidget(g_uiPanel, "Debug: light-origin boxes (id-coloured)", &cDbgLb, WIDGET_TYPE_CHECKBOX);
-        CheckboxWidget cDbgRs = {}; cDbgRs.pData = &g_debugRangeSpheres;
-        uiAddComponentWidget(g_uiPanel, "Debug: shadow range spheres (rangeK inner / 2r outer)", &cDbgRs, WIDGET_TYPE_CHECKBOX);
-        SliderFloatWidget sFlkT = {}; sFlkT.pData = &g_flickAnimThresh; sFlkT.mMin = 0.0f; sFlkT.mMax = 0.10f; sFlkT.mStep = 0.001f;
-        uiAddComponentWidget(g_uiPanel, "Flicker: animated threshold (erraticness)", &sFlkT, WIDGET_TYPE_SLIDER_FLOAT);
-        SliderFloatWidget sFlkE = {}; sFlkE.pData = &g_flickEndSplit; sFlkE.mMin = 0.0f; sFlkE.mMax = 0.30f; sFlkE.mStep = 0.01f;
-        uiAddComponentWidget(g_uiPanel, "Flicker: pulse/flicker split (endedness)", &sFlkE, WIDGET_TYPE_SLIDER_FLOAT);
-        SliderFloatWidget sFlkM = {}; sFlkM.pData = &g_flickShadowMove; sFlkM.mMin = 0.0f; sFlkM.mMax = 0.40f; sFlkM.mStep = 0.005f;
-        uiAddComponentWidget(g_uiPanel, "Flicker: shadow wobble amplitude (rad, 0=off)", &sFlkM, WIDGET_TYPE_SLIDER_FLOAT);
-        SliderFloatWidget sFlkS = {}; sFlkS.pData = &g_flickShadowSpeed; sFlkS.mMin = 0.0f; sFlkS.mMax = 10.0f; sFlkS.mStep = 0.1f;
-        uiAddComponentWidget(g_uiPanel, "Flicker: shadow wobble speed (rad/s)", &sFlkS, WIDGET_TYPE_SLIDER_FLOAT);
-        // Excitation: a carried torch / a windy exterior flickers harder. Both push mostly on RATE — amp is
-        // the axis that swings the lookup direction into atlas artifacts, so its gains stay small.
-        SliderFloatWidget sFlkMR = {}; sFlkMR.pData = &g_flickMotionRef; sFlkMR.mMin = 20.0f; sFlkMR.mMax = 400.0f; sFlkMR.mStep = 10.0f;
-        uiAddComponentWidget(g_uiPanel, "Flicker: motion full-drive speed (u/s)", &sFlkMR, WIDGET_TYPE_SLIDER_FLOAT);
-        SliderFloatWidget sFlkMS = {}; sFlkMS.pData = &g_flickMotionRate; sFlkMS.mMin = 0.0f; sFlkMS.mMax = 3.0f; sFlkMS.mStep = 0.05f;
-        uiAddComponentWidget(g_uiPanel, "Flicker: motion RATE gain (carried torch)", &sFlkMS, WIDGET_TYPE_SLIDER_FLOAT);
-        SliderFloatWidget sFlkMA = {}; sFlkMA.pData = &g_flickMotionAmp; sFlkMA.mMin = 0.0f; sFlkMA.mMax = 1.0f; sFlkMA.mStep = 0.05f;
-        uiAddComponentWidget(g_uiPanel, "Flicker: motion AMP gain (artifact axis — keep low)", &sFlkMA, WIDGET_TYPE_SLIDER_FLOAT);
-        SliderFloatWidget sFlkWF = {}; sFlkWF.pData = &g_flickWindFloor; sFlkWF.mMin = 0.0f; sFlkWF.mMax = 10.0f; sFlkWF.mStep = 0.1f;
-        uiAddComponentWidget(g_uiPanel, "Flicker: wind CALM floor |wind| (see wind= in log)", &sFlkWF, WIDGET_TYPE_SLIDER_FLOAT);
-        SliderFloatWidget sFlkWR = {}; sFlkWR.pData = &g_flickWindRef; sFlkWR.mMin = 0.1f; sFlkWR.mMax = 15.0f; sFlkWR.mStep = 0.1f;
-        uiAddComponentWidget(g_uiPanel, "Flicker: wind full-drive |wind| (storm)", &sFlkWR, WIDGET_TYPE_SLIDER_FLOAT);
-        SliderFloatWidget sFlkWS = {}; sFlkWS.pData = &g_flickWindRate; sFlkWS.mMin = 0.0f; sFlkWS.mMax = 3.0f; sFlkWS.mStep = 0.05f;
-        uiAddComponentWidget(g_uiPanel, "Flicker: wind RATE gain (exteriors)", &sFlkWS, WIDGET_TYPE_SLIDER_FLOAT);
-        SliderFloatWidget sFlkWA = {}; sFlkWA.pData = &g_flickWindAmp; sFlkWA.mMin = 0.0f; sFlkWA.mMax = 1.0f; sFlkWA.mStep = 0.05f;
-        uiAddComponentWidget(g_uiPanel, "Flicker: wind AMP gain (candle-guarded)", &sFlkWA, WIDGET_TYPE_SLIDER_FLOAT);
-        SliderFloatWidget sFlkAN = {}; sFlkAN.pData = &g_flickAmpRadMin; sFlkAN.mMin = 0.0f; sFlkAN.mMax = 600.0f; sFlkAN.mStep = 10.0f;
-        uiAddComponentWidget(g_uiPanel, "Flicker: amp guard — candle radius (no extra swing)", &sFlkAN, WIDGET_TYPE_SLIDER_FLOAT);
-        SliderFloatWidget sFlkAX = {}; sFlkAX.pData = &g_flickAmpRadMax; sFlkAX.mMin = 0.0f; sFlkAX.mMax = 1200.0f; sFlkAX.mStep = 10.0f;
-        uiAddComponentWidget(g_uiPanel, "Flicker: amp guard — lantern radius (full swing)", &sFlkAX, WIDGET_TYPE_SLIDER_FLOAT);
-        CheckboxWidget cFlkI = {}; cFlkI.pData = &g_flickIntensityMatch;
-        uiAddComponentWidget(g_uiPanel, "Flicker: match light intensity to shadow", &cFlkI, WIDGET_TYPE_CHECKBOX);
-        SliderFloatWidget sFlkID = {}; sFlkID.pData = &g_flickIntensityDepth; sFlkID.mMin = 0.0f; sFlkID.mMax = 1.0f; sFlkID.mStep = 0.05f;
-        uiAddComponentWidget(g_uiPanel, "Flicker: intensity match depth", &sFlkID, WIDGET_TYPE_SLIDER_FLOAT);
-        CheckboxWidget cDbgFc = {}; cDbgFc.pData = &g_debugFlickerClass;
-        uiAddComponentWidget(g_uiPanel, "Debug: range-sphere tint by class (grey/blue/orange)", &cDbgFc, WIDGET_TYPE_CHECKBOX);
-        CheckboxWidget cShSl = {}; cShSl.pData = &g_shadowSkipLinearLights;
-        uiAddComponentWidget(g_uiPanel, "Shadow: skip ambient/sun fill (linear-atten)", &cShSl, WIDGET_TYPE_CHECKBOX);
-        CheckboxWidget cShEx = {}; cShEx.pData = &g_shadowExpireMovers;
-        uiAddComponentWidget(g_uiPanel, "Shadow: expire offscreen movers (OFF = proof)", &cShEx, WIDGET_TYPE_CHECKBOX);
-        CheckboxWidget cShOc = {}; cShOc.pData = &g_shadowOcclusionCull;
-        uiAddComponentWidget(g_uiPanel, "Shadow: occlusion-cull bakes (Hi-Z; OFF = byte-identical)", &cShOc, WIDGET_TYPE_CHECKBOX);
-        SliderFloatWidget sShIp = {}; sShIp.pData = &g_shadowInactivePenalty; sShIp.mMin = 0.0f; sShIp.mMax = 1.0f; sShIp.mStep = 0.05f;
-        uiAddComponentWidget(g_uiPanel, "Shadow: inactive-slot reclaim penalty (1 = off)", &sShIp, WIDGET_TYPE_SLIDER_FLOAT);
-        SliderFloatWidget sShFi = {}; sShFi.pData = &g_shadowFadeInStep; sShFi.mMin = 0.0f; sShFi.mMax = 1.0f; sShFi.mStep = 0.01f;
-        uiAddComponentWidget(g_uiPanel, "Shadow: far-reclaim fade-in speed (0 = instant)", &sShFi, WIDGET_TYPE_SLIDER_FLOAT);
-        SliderFloatWidget sShFd = {}; sShFd.pData = &g_shadowFadeInDist; sShFd.mMin = 0.0f; sShFd.mMax = 4096.0f; sShFd.mStep = 64.0f;
-        uiAddComponentWidget(g_uiPanel, "Shadow: fade-in min distance (near/spawn = instant)", &sShFd, WIDGET_TYPE_SLIDER_FLOAT);
-        SliderFloatWidget sShEm = {}; sShEm.pData = &g_shadowEmissiveSkip; sShEm.mMin = 0.0f; sShEm.mMax = 1.5f; sShEm.mStep = 0.05f;
-        uiAddComponentWidget(g_uiPanel, "Shadow: emissive caster skip (>1 = off)", &sShEm, WIDGET_TYPE_SLIDER_FLOAT);
-        CheckboxWidget cShEc = {}; cShEc.pData = &g_shadowEmissiveCast;
-        uiAddComponentWidget(g_uiPanel, "Shadow: emissive per-texel carve (off = whole-mesh drop)", &cShEc, WIDGET_TYPE_CHECKBOX);
-        SliderFloatWidget sShEt = {}; sShEt.pData = &g_shadowEmissiveTexel; sShEt.mMin = 0.0f; sShEt.mMax = 1.0f; sShEt.mStep = 0.02f;
-        uiAddComponentWidget(g_uiPanel, "Shadow: emissive carve threshold (0 = cast all)", &sShEt, WIDGET_TYPE_SLIDER_FLOAT);
-        CheckboxWidget cShEo = {}; cShEo.pData = &g_shadowEmissiveOwnerOnly;
-        uiAddComponentWidget(g_uiPanel, "Shadow: emissive carve OWN light only (off = see-through to all)", &cShEo, WIDGET_TYPE_CHECKBOX);
-        SliderFloatWidget sShBl = {}; sShBl.pData = &g_shadowBigLightRadius; sShBl.mMin = 0.0f; sShBl.mMax = 1200.0f; sShBl.mStep = 25.0f;
-        uiAddComponentWidget(g_uiPanel, "Shadow: big-light soft radius (>= this = low-res/soft; 0 = lanterns only)", &sShBl, WIDGET_TYPE_SLIDER_FLOAT);
-        SliderUintWidget sShLr = {}; sShLr.pData = &g_shadowLanternShift; sShLr.mMin = 0; sShLr.mMax = 2; sShLr.mStep = 1;
-        uiAddComponentWidget(g_uiPanel, "Shadow: lantern low-res tile shift (0 = crisp, 1 = half, 2 = quarter)", &sShLr, WIDGET_TYPE_SLIDER_UINT);
-        SliderFloatWidget sShLe = {}; sShLe.pData = &g_shadowLanternEnclose; sShLe.mMin = 0.0f; sShLe.mMax = 1.2f; sShLe.mStep = 0.05f;
-        uiAddComponentWidget(g_uiPanel, "Shadow: lantern enclosure depth (light must sit this deep in its shade; 1.2 = every fixture)", &sShLe, WIDGET_TYPE_SLIDER_FLOAT);
-        CheckboxWidget cShBc = {}; cShBc.pData = &g_shadowBlendCasters;
-        uiAddComponentWidget(g_uiPanel, "Shadow: cutout-blend casters", &cShBc, WIDGET_TYPE_CHECKBOX);
-        SliderFloatWidget sShBr = {}; sShBr.pData = &g_shadowBlendRef; sShBr.mMin = 0.0f; sShBr.mMax = 1.0f; sShBr.mStep = 0.05f;
-        uiAddComponentWidget(g_uiPanel, "Shadow: blend caster alpha ref (0 = mask-only)", &sShBr, WIDGET_TYPE_SLIDER_FLOAT);
-
-        // -- Phase 0: per-subsystem draw toggles (off → MW's version shows through the composite) --
-        LabelWidget subLbl = {};
-        uiAddComponentWidget(g_uiPanel, "-- Forge subsystems (off = show MW) --", &subLbl, WIDGET_TYPE_LABEL);
-        CheckboxWidget cDSky = {}; cDSky.pData = &g_drawSky;
-        uiAddComponentWidget(g_uiPanel, "Draw: sky", &cDSky, WIDGET_TYPE_CHECKBOX);
-        CheckboxWidget cADbg = {}; cADbg.pData = &g_alphaDebugNoDepth;
-        uiAddComponentWidget(g_uiPanel, "ALPHA: depth OFF (debug)", &cADbg, WIDGET_TYPE_CHECKBOX);
-        CheckboxWidget cAHl = {}; cAHl.pData = &g_alphaHighlight;
-        uiAddComponentWidget(g_uiPanel, "ALPHA: caster classify colors", &cAHl, WIDGET_TYPE_CHECKBOX);
-        CheckboxWidget cADW = {}; cADW.pData = &g_alphaDepthWrite;
-        uiAddComponentWidget(g_uiPanel, "ALPHA: fold fix (near-opaque depth prepass)", &cADW, WIDGET_TYPE_CHECKBOX);
-        SliderFloatWidget sADR = {}; sADR.pData = &g_alphaDepthRef; sADR.mMin = 0.5f; sADR.mMax = 1.0f; sADR.mStep = 0.01f;
-        uiAddComponentWidget(g_uiPanel, "ALPHA: depth-write opacity (higher = less occluding)", &sADR, WIDGET_TYPE_SLIDER_FLOAT);
-        CheckboxWidget cALA = {}; cALA.pData = &g_alphaLowAF;
-        uiAddComponentWidget(g_uiPanel, "ALPHA: 2x AF on alpha-test/blend draws (perf A/B)", &cALA, WIDGET_TYPE_CHECKBOX);
-        CheckboxWidget cDLand = {}; cDLand.pData = &g_drawDLLand;
-        uiAddComponentWidget(g_uiPanel, "Draw: distant land", &cDLand, WIDGET_TYPE_CHECKBOX);
-        CheckboxWidget cDStat = {}; cDStat.pData = &g_drawDLStatics;
-        uiAddComponentWidget(g_uiPanel, "Draw: distant statics", &cDStat, WIDGET_TYPE_CHECKBOX);
-        CheckboxWidget cGpuCull = {}; cGpuCull.pData = &g_gpuStaticsCull;
-        uiAddComponentWidget(g_uiPanel, "Statics: GPU cull (B3 draw)", &cGpuCull, WIDGET_TYPE_CHECKBOX);
         static const char* const kStaticsFacingNames[] = {
             "0 auto (CCW live / CW viewer)", "1 force CCW", "2 force CW", "3 no cull (two-sided)" };
-        DropdownWidget ddSf = {}; ddSf.pData = &g_staticsFacing; ddSf.pNames = kStaticsFacingNames; ddSf.mCount = 4;
-        uiAddComponentWidget(g_uiPanel, "Statics: facing (dark/bright A/B)", &ddSf, WIDGET_TYPE_DROPDOWN);
-        CheckboxWidget cHizOcc = {}; cHizOcc.pData = &g_hizOcclusion;
-        uiAddComponentWidget(g_uiPanel, "Statics: Hi-Z occlusion (M2)", &cHizOcc, WIDGET_TYPE_CHECKBOX);
-        CheckboxWidget cHiz = {}; cHiz.pData = &g_hizPrologue;
-        uiAddComponentWidget(g_uiPanel, "Prologue: Hi-Z pyramid (P3)", &cHiz, WIDGET_TYPE_CHECKBOX);
-        CheckboxWidget cDWat = {}; cDWat.pData = &g_drawWater;
-        uiAddComponentWidget(g_uiPanel, "Draw: water", &cDWat, WIDGET_TYPE_CHECKBOX);
-        CheckboxWidget cDRef = {}; cDRef.pData = &g_drawReflect;
-        uiAddComponentWidget(g_uiPanel, "Draw: reflection", &cDRef, WIDGET_TYPE_CHECKBOX);
-        CheckboxWidget cDRefG = {}; cDRefG.pData = &g_drawReflectGeo;
-        uiAddComponentWidget(g_uiPanel, "Draw: reflect land+statics", &cDRefG, WIDGET_TYPE_CHECKBOX);
-        CheckboxWidget cRScis = {}; cRScis.pData = &g_reflHorizonScissor;
-        uiAddComponentWidget(g_uiPanel, "Reflect: horizon scissor", &cRScis, WIDGET_TYPE_CHECKBOX);
 
-        // -- Phase 0: live per-frame stats (updated each frame in drawDevUI) --
-        LabelWidget statLbl = {};
-        uiAddComponentWidget(g_uiPanel, "-- Stats (this frame) --", &statLbl, WIDGET_TYPE_LABEL);
-        DynamicTextWidget statsW = {};
-        statsW.pText = &g_statsText;
-        statsW.pColor = &g_statsColor;
-        uiAddComponentWidget(g_uiPanel, "", &statsW, WIDGET_TYPE_DYNAMIC_TEXT);
+        // The panel is grouped into collapsing-header "tabs" (WIDGET_TYPE_COLLAPSING_HEADER) so the
+        // ~250 controls aren't one unreadable scroll. TabBuilder deep-copies on flush(); one block
+        // per tab. Stats + the on/off Draw A/B open by default (the day-to-day controls).
+
+        // -- Tab: Draw / A/B (the on/off subsystem toggles — the top-level measurement controls) --
+        { TabBuilder t; t.panel = g_uiPanel; t.name = "Draw / A/B"; t.defaultOpen = true;
+          t.checkbox("Dist lights: enable (numpad- live A/B)", &g_drawDistLights);
+          t.checkbox("Dist lights: clustered froxel (off = brute, same lights)", &g_useFroxel);
+          t.checkbox("Draw: sky", &g_drawSky);
+          t.checkbox("Draw: distant land", &g_drawDLLand);
+          t.checkbox("Draw: distant statics", &g_drawDLStatics);
+          t.checkbox("Statics: GPU cull (B3 draw)", &g_gpuStaticsCull);
+          t.dropdown("Statics: facing (dark/bright A/B)", &g_staticsFacing, kStaticsFacingNames, 4);
+          t.checkbox("Statics: Hi-Z occlusion (M2)", &g_hizOcclusion);
+          t.checkbox("Prologue: Hi-Z pyramid (P3)", &g_hizPrologue);
+          t.checkbox("Draw: water", &g_drawWater);
+          t.checkbox("Draw: reflection", &g_drawReflect);
+          t.checkbox("Draw: reflect land+statics", &g_drawReflectGeo);
+          t.checkbox("Reflect: horizon scissor", &g_reflHorizonScissor);
+          t.flush(); }
+
+        // -- Tab: Alpha (sorted-alpha takeover debug) --
+        { TabBuilder t; t.panel = g_uiPanel; t.name = "Alpha";
+          t.checkbox("ALPHA: depth OFF (debug)", &g_alphaDebugNoDepth);
+          t.checkbox("ALPHA: caster classify colors", &g_alphaHighlight);
+          t.checkbox("ALPHA: fold fix (near-opaque depth prepass)", &g_alphaDepthWrite);
+          t.sliderF("ALPHA: depth-write opacity (higher = less occluding)", &g_alphaDepthRef, 0.5f, 1.0f, 0.01f);
+          t.checkbox("ALPHA: 2x AF on alpha-test/blend draws (perf A/B)", &g_alphaLowAF);
+          t.flush(); }
+
+        // -- Tab: AO & Lighting (GTAO knobs + intensity debug scales) --
+        { TabBuilder t; t.panel = g_uiPanel; t.name = "AO & Lighting";
+          t.checkbox("AO enable", &g_aoEnable);
+          t.checkbox("Bent normal enable", &g_bentNormalEnable);
+          t.checkbox("Ambient = white (debug)", &g_ambientWhite);
+          t.sliderF("AO radius (world)",  &g_aoRadius,    1.0f, 64.0f,  0.5f);
+          t.sliderF("AO falloff (world)", &g_aoFalloff,   1.0f, 200.0f, 1.0f);
+          t.sliderF("AO intensity",       &g_aoIntensity, 0.0f, 8.0f,   0.05f);
+          t.sliderF("AO horizon bias",    &g_aoThickness, 0.0f, 0.5f,   0.005f);
+          t.sliderF("AO blur spatial (px)",  &g_aoBlurPx,    0.0f, 4.0f,   0.1f);
+          t.sliderF("AO blur range (world)", &g_aoBlurDepth, 1.0f, 256.0f, 1.0f);
+          t.sliderF("Ambient intensity", &g_ambScale,     0.0f, 4.0f, 0.02f);
+          t.sliderF("Diffuse intensity", &g_litScale,     0.0f, 4.0f, 0.02f);
+          t.sliderF("Albedo intensity",  &g_albedoScale,  0.0f, 4.0f, 0.02f);
+          t.sliderF("Overall intensity", &g_overallScale, 0.0f, 4.0f, 0.02f);
+          t.flush(); }
+
+        // -- Tab: Sky & Water (F7 takeover tells + water input isolation) --
+        { TabBuilder t; t.panel = g_uiPanel; t.name = "Sky & Water";
+          t.sliderF("Sky tint (Forge tell)", &g_skyDebugTint, 0.0f, 1.0f, 0.02f);
+          t.checkbox("Sky tint pulse", &g_skyTintPulse);
+          t.checkbox("Water: reflection only", &g_waterReflOnly);
+          t.checkbox("Water: refraction only", &g_waterRefrOnly);
+          t.flush(); }
+
+        // -- Tab: Shadows (P1 point-light shadow atlas + fixture classification) --
+        { TabBuilder t; t.panel = g_uiPanel; t.name = "Shadows";
+          t.checkbox("Shadows: enable", &g_shadowEnable);
+          t.checkbox("Shadow: face-id debug (F12 mode 10)", &g_shadowFaceDebug);
+          t.checkbox("Shadow: atlas view (F12 mode 10)", &g_shadowAtlasDebug);
+          t.sliderF("Shadow depth slack", &g_shadowSlack, 0.0f, 0.2f, 0.002f);
+          t.sliderF("Shadow contact bias (negative = close gap)", &g_shadowBias, -0.005f, 0.005f, 0.00002f, "%.5f");
+          t.sliderF("Shadow normal offset (kills grazing acne)", &g_shadowNormalOffset, 0.0f, 8.0f, 0.25f);
+          t.sliderF("Shadow test range (radii) — light reach rides on this", &g_shadowRangeK, 0.5f, 2.0f, 0.05f);
+          t.sliderF("Light reach (fraction of test range; <1 hides the edge)", &g_lightReachFrac, 0.4f, 1.0f, 0.02f);
+          t.dropdown("Shadow caster cull", &g_shadowCasterCull, kCasterCullNames, 3);
+          t.sliderF("Shadow: fixture cage two-sided radius (0=off)", &g_shadowCageRadius, 0.0f, 256.0f, 4.0f);
+          t.checkbox("Shadow: skinned casters (NPC bodies)", &g_shadowSkinnedCasters);
+          t.checkbox("Shadow: multimap casters (NPC heads)", &g_shadowMMCasters);
+          t.checkbox("Shadow: rigid movers dyn-tile (hands/weapons)", &g_shadowRigidMovers);
+          t.checkbox("Shadow: source-mover (dyn only if transform-animated)", &g_shadowSourceMover);
+          t.sliderU("Shadow: max active lights (32 = no cap)", &g_shadowMaxActiveLights, 1, kMaxShadowLights, 1);
+          t.sliderF("Shadow: vertical rank weight (multi-floor)", &g_shadowVertWeight, 1.0f, 8.0f, 0.25f);
+          t.checkbox("Shadow: fixture-only gate (drop window/ambient fill)", &g_shadowFixtureGate);
+          t.sliderF("Shadow: fixture emissive-vouch box (0 = name only)", &g_shadowFixtureEmissiveBox, 0.0f, 64.0f, 1.0f);
+          t.sliderF("Shadow: fixture priority boost (light/torch/furn)", &g_shadowFixtureBoost, 1.0f, 8.0f, 0.25f);
+          t.checkbox("Debug: light-origin boxes (id-coloured)", &g_debugLightBoxes);
+          t.checkbox("Debug: shadow range spheres (rangeK inner / 2r outer)", &g_debugRangeSpheres);
+          t.checkbox("Shadow: skip ambient/sun fill (linear-atten)", &g_shadowSkipLinearLights);
+          t.checkbox("Shadow: expire offscreen movers (OFF = proof)", &g_shadowExpireMovers);
+          t.checkbox("Shadow: occlusion-cull bakes (Hi-Z; OFF = byte-identical)", &g_shadowOcclusionCull);
+          t.sliderF("Shadow: inactive-slot reclaim penalty (1 = off)", &g_shadowInactivePenalty, 0.0f, 1.0f, 0.05f);
+          t.sliderF("Shadow: far-reclaim fade-in speed (0 = instant)", &g_shadowFadeInStep, 0.0f, 1.0f, 0.01f);
+          t.sliderF("Shadow: fade-in min distance (near/spawn = instant)", &g_shadowFadeInDist, 0.0f, 4096.0f, 64.0f);
+          t.sliderF("Shadow: emissive caster skip (>1 = off)", &g_shadowEmissiveSkip, 0.0f, 1.5f, 0.05f);
+          t.checkbox("Shadow: emissive per-texel carve (off = whole-mesh drop)", &g_shadowEmissiveCast);
+          t.sliderF("Shadow: emissive carve threshold (0 = cast all)", &g_shadowEmissiveTexel, 0.0f, 1.0f, 0.02f);
+          t.checkbox("Shadow: emissive carve OWN light only (off = see-through to all)", &g_shadowEmissiveOwnerOnly);
+          t.sliderF("Shadow: big-light soft radius (>= this = low-res/soft; 0 = lanterns only)", &g_shadowBigLightRadius, 0.0f, 1200.0f, 25.0f);
+          t.sliderU("Shadow: lantern low-res tile shift (0 = crisp, 1 = half, 2 = quarter)", &g_shadowLanternShift, 0, 2, 1);
+          t.sliderF("Shadow: lantern enclosure depth (light must sit this deep in its shade; 1.2 = every fixture)", &g_shadowLanternEnclose, 0.0f, 1.2f, 0.05f);
+          t.checkbox("Shadow: cutout-blend casters", &g_shadowBlendCasters);
+          t.sliderF("Shadow: blend caster alpha ref (0 = mask-only)", &g_shadowBlendRef, 0.0f, 1.0f, 0.05f);
+          t.flush(); }
+
+        // -- Tab: Flicker (procedural light/shadow scintillation) --
+        { TabBuilder t; t.panel = g_uiPanel; t.name = "Flicker";
+          t.sliderF("Flicker: animated threshold (erraticness)", &g_flickAnimThresh, 0.0f, 0.10f, 0.001f);
+          t.sliderF("Flicker: pulse/flicker split (endedness)", &g_flickEndSplit, 0.0f, 0.30f, 0.01f);
+          t.sliderF("Flicker: shadow wobble amplitude (rad, 0=off)", &g_flickShadowMove, 0.0f, 0.40f, 0.005f);
+          t.sliderF("Flicker: shadow wobble speed (rad/s)", &g_flickShadowSpeed, 0.0f, 10.0f, 0.1f);
+          t.sliderF("Flicker: motion full-drive speed (u/s)", &g_flickMotionRef, 20.0f, 400.0f, 10.0f);
+          t.sliderF("Flicker: motion RATE gain (carried torch)", &g_flickMotionRate, 0.0f, 3.0f, 0.05f);
+          t.sliderF("Flicker: motion AMP gain (artifact axis — keep low)", &g_flickMotionAmp, 0.0f, 1.0f, 0.05f);
+          t.sliderF("Flicker: wind CALM floor |wind| (see wind= in log)", &g_flickWindFloor, 0.0f, 10.0f, 0.1f);
+          t.sliderF("Flicker: wind full-drive |wind| (storm)", &g_flickWindRef, 0.1f, 15.0f, 0.1f);
+          t.sliderF("Flicker: wind RATE gain (exteriors)", &g_flickWindRate, 0.0f, 3.0f, 0.05f);
+          t.sliderF("Flicker: wind AMP gain (candle-guarded)", &g_flickWindAmp, 0.0f, 1.0f, 0.05f);
+          t.sliderF("Flicker: amp guard — candle radius (no extra swing)", &g_flickAmpRadMin, 0.0f, 600.0f, 10.0f);
+          t.sliderF("Flicker: amp guard — lantern radius (full swing)", &g_flickAmpRadMax, 0.0f, 1200.0f, 10.0f);
+          t.checkbox("Flicker: match light intensity to shadow", &g_flickIntensityMatch);
+          t.sliderF("Flicker: intensity match depth", &g_flickIntensityDepth, 0.0f, 1.0f, 0.05f);
+          t.checkbox("Debug: range-sphere tint by class (grey/blue/orange)", &g_debugFlickerClass);
+          t.flush(); }
+
+        // -- Tab: Stats (live per-frame counters, updated each frame in drawDevUI) --
+        { TabBuilder t; t.panel = g_uiPanel; t.name = "Stats"; t.defaultOpen = true;
+          t.dynamicText("", &g_statsText, &g_statsColor);
+          t.flush(); }
 
         g_uiInited = true;
         LOG::logline(">> [devui] ready (%ux%u fmt=%u)", width, height, colorFmt); LOG::flush();
@@ -5828,6 +5848,83 @@ namespace {
         g_meshes   = nullptr;
         g_meshCap  = 0;
         g_meshHigh = 0;
+    }
+
+    // Clustered forward lighting: create the froxel light-mask buffer, the per-frame FroxelParams
+    // cbuffer, and the clear+scatter compute pipelines/descriptor set. Called EAGERLY from
+    // buildOpaquePath (same anon namespace) before pPerFrameSet binds gFroxelMask. Mirrors
+    // createShadowLightCullResources. Non-fatal: on failure froxelReady stays false and the frags
+    // fall back to the brute gLights loop.
+    bool createFroxelResources(Renderer* R) {
+        if (g_live.pFroxelAssignPipeline) { return g_live.froxelReady; }
+
+        // (1) Froxel mask: GPU_ONLY, both UAV (froxelassign writes) and SRV (frags read). uint[maxWords].
+        BufferLoadDesc mb = {};
+        mb.mDesc.mDescriptors  = (DescriptorType)(DESCRIPTOR_TYPE_RW_BUFFER | DESCRIPTOR_TYPE_BUFFER);
+        mb.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+        mb.mDesc.mStructStride = sizeof(uint32_t);
+        mb.mDesc.mElementCount = kFroxelMaxWords;
+        mb.mDesc.mSize         = (uint64_t)kFroxelMaxWords * sizeof(uint32_t);
+        mb.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
+        mb.mDesc.pName         = "froxelMask";
+        mb.ppBuffer            = &g_live.pFroxelMask;
+        addResource(&mb, nullptr);
+
+        // (2) Per-frame FroxelParams cbuffer (viewProj/dims/screen/zparams + spheres[128]).
+        BufferLoadDesc pb = {};
+        pb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        pb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+        pb.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+        pb.mDesc.mSize        = kFroxelParamsBytes;
+        pb.mDesc.pName        = "froxelParams";
+        pb.ppBuffer           = &g_live.pFroxelParamsCbv;
+        addResource(&pb, nullptr);
+
+        waitForAllResourceLoads();
+        if (!g_live.pFroxelMask || !g_live.pFroxelParamsCbv) {
+            std::printf("[forge][froxel] resource alloc FAILED — clustering disabled\n");
+            return false;
+        }
+
+        // (3) Pipelines (merged ComputeRootSignature): froxelclear.comp + froxelassign.comp.
+        {
+            ShaderLoadDesc cs = {};
+            cs.mComp.pFileName = "froxelclear.comp";
+            addShader(R, &cs, &g_live.pFroxelClearShader);
+            ShaderLoadDesc as = {};
+            as.mComp.pFileName = "froxelassign.comp";
+            addShader(R, &as, &g_live.pFroxelAssignShader);
+            if (!g_live.pFroxelClearShader || !g_live.pFroxelAssignShader) {
+                std::printf("[forge][froxel] addShader FAILED\n"); return false;
+            }
+            PipelineDesc cp = {}; cp.mType = PIPELINE_TYPE_COMPUTE;
+            cp.mComputeDesc.pShaderProgram = g_live.pFroxelClearShader;
+            addPipeline(R, &cp, &g_live.pFroxelClearPipeline);
+            PipelineDesc ap = {}; ap.mType = PIPELINE_TYPE_COMPUTE;
+            ap.mComputeDesc.pShaderProgram = g_live.pFroxelAssignShader;
+            addPipeline(R, &ap, &g_live.pFroxelAssignPipeline);
+            if (!g_live.pFroxelClearPipeline || !g_live.pFroxelAssignPipeline) {
+                std::printf("[forge][froxel] addPipeline FAILED\n"); return false;
+            }
+        }
+        // (4) One descriptor set (both pipelines share the SRT: gFroxelParams CBV + gFroxelMaskRW UAV).
+        DescriptorSetDesc fset = SRT_SET_DESC(FroxelSrtData, PerBatch, 1, 0);
+        addDescriptorSet(R, &fset, &g_live.pFroxelSet);
+        if (!g_live.pFroxelSet) {
+            std::printf("[forge][froxel] addDescriptorSet FAILED\n"); return false;
+        }
+        {
+            DescriptorData d[2] = {};
+            d[0].mIndex    = SRT_RES_IDX(FroxelSrtData, PerBatch, gFroxelParams);
+            d[0].ppBuffers = &g_live.pFroxelParamsCbv;
+            d[1].mIndex    = SRT_RES_IDX(FroxelSrtData, PerBatch, gFroxelMaskRW);
+            d[1].mCount    = 1; d[1].ppBuffers = &g_live.pFroxelMask;
+            updateDescriptorSet(R, 0, g_live.pFroxelSet, 2, d);
+        }
+        g_live.froxelReady = true;
+        std::printf("[forge][froxel] ready (%u tiles max, %u slices, %u words)\n",
+                    kFroxelMaxTilesX * kFroxelMaxTilesY, kFroxelZSlices, kFroxelMaxWords);
+        return true;
     }
 }
 
@@ -8977,6 +9074,37 @@ namespace ForgeRender {
         }
 
         gpuPhaseEnd(kGpuPhaseColorMM);
+
+        // Clustered forward: build this frame's froxel light-mask (main view) BEFORE the DL colour
+        // pass reads it. Two compute dispatches — clear (zero the mask) then light-scatter — sharing
+        // pFroxelSet; the FroxelParams cbuffer + gFrameData froxel fields were filled in dlCullAndBuild
+        // (pre-record). Leaves pFroxelMask in SHADER_RESOURCE so distantland.frag/statics.frag read it.
+        {
+            auto froxBarrier = [&](ResourceState from, ResourceState to) {
+                BufferBarrier bb = {}; bb.pBuffer = g_live.pFroxelMask; bb.mCurrentState = from; bb.mNewState = to;
+                cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
+            };
+            if (g_live.froxelActive && g_live.pFroxelAssignPipeline && g_live.froxelNumWords > 0) {
+                cmdBeginDebugMarker(g_live.pCmd, 0.2f, 0.7f, 0.9f, "FROXEL light assign");
+                if (g_live.froxelMaskInShaderState) { froxBarrier(RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS); }
+                cmdBindPipeline(g_live.pCmd, g_live.pFroxelClearPipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pFroxelSet);
+                cmdDispatch(g_live.pCmd, (g_live.froxelNumWords + 63u) / 64u, 1, 1);
+                froxBarrier(RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_UNORDERED_ACCESS);   // clear -> assign
+                cmdBindPipeline(g_live.pCmd, g_live.pFroxelAssignPipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pFroxelSet);
+                cmdDispatch(g_live.pCmd, (g_live.froxelLightCount + 63u) / 64u, 1, 1);
+                froxBarrier(RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE);
+                cmdEndDebugMarker(g_live.pCmd);
+                g_live.froxelMaskInShaderState = true;
+            } else if (g_live.pFroxelMask && !g_live.froxelMaskInShaderState) {
+                // Inactive and still in the UAV creation state — move it to SHADER_RESOURCE so its SRV
+                // binding in pPerFrameSet is valid (the frags never index it while froxelDims.x == 0).
+                froxBarrier(RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE);
+                g_live.froxelMaskInShaderState = true;
+            }
+        }
+
         gpuPhaseBegin(kGpuPhaseColorDL);
 
         // Phase 1a/1b LIVE distant land: draw land + statics into the SAME colorTarget + pDepth as the
@@ -10066,6 +10194,14 @@ namespace ForgeRender {
         g_inMBtn   = (buttons & 0x4u) != 0;
         g_inWheel  = wheel;
         g_uiVisible = (uiVisible != 0);
+    }
+
+    // Perf A/B (numpad -, one-shot edge from the client): flip the baked distant point-light loop.
+    // Same bool the "Dist lights: enable" panel checkbox drives, so hotkey + checkbox compose. Diff
+    // the gpu-split `dl=` bracket on/off to read the loop's GPU cost in a heavy night scene.
+    void toggleDistLights() {
+        g_drawDistLights = !g_drawDistLights;
+        LOG::logline(">> [devui] dist lights %s (perf A/B)", g_drawDistLights ? "ON" : "OFF");
     }
 
     // Dev hot-reload (F8): rebuild the compute pipelines (gtao + linearize) from the dxil currently
@@ -13574,6 +13710,8 @@ namespace ForgeRender {
             fd[50] = (float)kLandDetailSlot; fd[51] = g_dlNearViewRange;  // lodParams.zw (detail slot, nearViewRange)
             fd[52] = fd[24]; fd[53] = fd[25]; fd[54] = fd[26]; fd[55] = 0.0f;  // lodSunAmb = ambCol
             fd[56] = g_dlEye[0]; fd[57] = g_dlEye[1]; fd[58] = g_dlEye[2]; fd[59] = 0.0f;  // lodEye
+            fd[116] = 0.0f;   // clustered forward default OFF (froxelDims.x); the froxel fill below sets it when active
+
         }
 
         float planes[6][4];
@@ -13595,13 +13733,27 @@ namespace ForgeRender {
         // them exactly like the near opaque path loops gLights. Throttled heartbeat as in Phase B.
         if (T.primary && g_dlBakedLightsLoaded && !g_dlBakedLights.empty()) {
             const float sr2 = g_dlBakedLightStreamR * g_dlBakedLightStreamR;
+            // reachK (shader's posR.w * reachK = a light's max reach) — hoisted so the candidate
+            // loop can frustum-cull by reach-sphere AND the fill below reuses it (one source).
+            const float reachK = g_shadowRangeK * std::min(std::max(g_lightReachFrac, 0.05f), 1.0f);
             static std::vector<std::pair<float, uint32_t>> s_cand;   // (dist2, index), reused
             s_cand.clear();
+            uint32_t inRadius = 0;   // diagnostics: within stream radius, pre-frustum
             for (uint32_t i = 0; i < (uint32_t)g_dlBakedLights.size(); ++i) {
                 const DlBakedLight& L = g_dlBakedLights[i];
                 const float dx = L.x - eye[0], dy = L.y - eye[1], dz = L.z - eye[2];
                 const float d2 = dx * dx + dy * dy + dz * dz;
-                if (d2 <= sr2) { s_cand.push_back(std::make_pair(d2, i)); }
+                if (d2 > sr2) { continue; }
+                ++inRadius;
+                // Frustum-cull by the light's reach-sphere. A baked light whose reach doesn't
+                // intersect the view frustum illuminates ZERO visible distant fragments — behind
+                // the camera, off to the sides, or (looking down from height) below the bottom
+                // plane. This is the dominant waste in the forward loop: the per-fragment cost is
+                // fragments x uploaded-lights, and most streamed lights are off-screen. Conservative
+                // (sphere-vs-frustum), so no visual change — just a much shorter loop. reach =
+                // radius * reachK matches the shader's max reach exactly.
+                if (!dlSphereInFrustum(planes, dx, dy, dz, L.radius * reachK)) { continue; }
+                s_cand.push_back(std::make_pair(d2, i));
             }
             const uint32_t streamed = (uint32_t)s_cand.size();
 
@@ -13617,8 +13769,8 @@ namespace ForgeRender {
             if (g_live.pDistLightCbv) {
                 float* lc = (float*)g_live.pDistLightCbv->pCpuMappedAddress;
                 if (g_drawDistLights) {
-                    // reachK matches the near path so baked + live lights fade identically at the handoff.
-                    const float reachK = g_shadowRangeK * std::min(std::max(g_lightReachFrac, 0.05f), 1.0f);
+                    // reachK (hoisted above) matches the near path so baked + live lights fade
+                    // identically at the handoff.
                     lc[0] = (float)nUp; lc[1] = reachK; lc[2] = 0.0f; lc[3] = 0.0f;
                     for (uint32_t k = 0; k < nUp; ++k) {
                         const DlBakedLight& L = g_dlBakedLights[s_cand[k].second];
@@ -13648,9 +13800,53 @@ namespace ForgeRender {
                                   : (streamed > s_lastStreamed ? streamed - s_lastStreamed
                                                                : s_lastStreamed - streamed);
             if (delta >= 16u || (++s_throttle % 300) == 0) {
-                LOG::logline(">> [forge][dl] baked lights streamed: %u / %zu within %.0f of eye (uploaded %u)",
-                             streamed, g_dlBakedLights.size(), g_dlBakedLightStreamR, nUp);
+                LOG::logline(">> [forge][dl] baked lights: %u in-radius -> %u in-frustum -> %u uploaded (/ %zu, r=%.0f)",
+                             inRadius, streamed, nUp, g_dlBakedLights.size(), g_dlBakedLightStreamR);
                 s_lastStreamed = streamed;
+            }
+
+            // -------- Clustered forward: fill FroxelParams + gFrameData froxel fields (main view) -----
+            // Bin the just-uploaded nUp lights (same s_cand order as gLights) into a screen-tile x
+            // radial-slice grid. The reflect pass keeps froxelDims=0 in ITS frame cbuffer (mirror
+            // viewProj differs) -> brute loop there. Clustering off (no lights / disabled / not ready)
+            // -> froxelDims.x=0 -> frags brute-loop. Slice metric = radial distance, matching the frag.
+            float* mfd = (float*)g_live.pFrameCbv->pCpuMappedAddress;
+            g_live.froxelActive = false;
+            if (g_live.froxelReady && g_useFroxel && g_drawDistLights && nUp > 0u && g_live.pFroxelParamsCbv) {
+                const float d0 = std::max(mfd[51], 256.0f);                        // nearViewRange (handoff) = slice near
+                const float d1 = std::max(g_dlBakedLightStreamR, d0 * 1.01f);      // stream radius = slice far
+                const uint32_t tile   = kFroxelTile;
+                const uint32_t tilesX = (g_live.width  + tile - 1) / tile;
+                const uint32_t tilesY = (g_live.height + tile - 1) / tile;
+                uint32_t numWords = tilesX * tilesY * kFroxelZSlices * 4u;
+                if (numWords > kFroxelMaxWords) { numWords = kFroxelMaxWords; }    // safety clamp (huge res)
+                const float logd0  = std::log(d0);
+                const float invLog = 1.0f / std::max(std::log(d1 / d0), 1e-4f);
+
+                float* fp = (float*)g_live.pFroxelParamsCbv->pCpuMappedAddress;
+                std::memcpy(fp, mfd, 16 * sizeof(float));                          // [0..15] = gFrameData.viewProj
+                // ^ use the FRAME cbuffer's viewProj (what the DL vertex shader uses to make SV_Position),
+                //   NOT the `viewProj` param — guarantees the froxel projection matches the rasterized tile.
+                fp[16] = (float)tilesX;      fp[17] = (float)tilesY;      fp[18] = (float)kFroxelZSlices; fp[19] = (float)nUp;
+                fp[20] = (float)g_live.width; fp[21] = (float)g_live.height; fp[22] = (float)tile;          fp[23] = (float)numWords;
+                fp[24] = d0; fp[25] = d1; fp[26] = logd0; fp[27] = invLog;
+                float* sph = fp + 28;
+                for (uint32_t k = 0; k < nUp; ++k) {
+                    const DlBakedLight& L = g_dlBakedLights[s_cand[k].second];
+                    sph[k * 4 + 0] = L.x - eye[0];
+                    sph[k * 4 + 1] = L.y - eye[1];
+                    sph[k * 4 + 2] = L.z - eye[2];
+                    sph[k * 4 + 3] = L.radius * reachK;                            // reach = shader's posR.w * reachK
+                }
+                // gFrameData froxel fields: froxelDims @ float 116 (464B), froxelZ @ 120 (480B).
+                mfd[116] = (float)tilesX; mfd[117] = (float)tilesY; mfd[118] = (float)kFroxelZSlices; mfd[119] = (float)tile;
+                mfd[120] = logd0; mfd[121] = invLog; mfd[122] = 0.0f; mfd[123] = 0.0f;
+
+                g_live.froxelActive     = true;
+                g_live.froxelNumWords   = numWords;
+                g_live.froxelLightCount = nUp;
+            } else {
+                mfd[116] = 0.0f;   // clustering off -> brute loop
             }
         }
 
@@ -14040,6 +14236,10 @@ namespace ForgeRender {
         {
             float* gp = (float*)g_live.pReflectFrameCbvGeo->pCpuMappedAddress;
             gp[64] = 0.0f; gp[65] = 0.0f; gp[66] = nz; gp[67] = dClip;
+            // Clustered forward is MAIN-VIEW only: the memcpy above copied the main view's froxelDims
+            // (float 116), but this pass uses the MIRROR viewProj + reflection rings, so its froxel grid
+            // is wrong. Force froxelDims.x = 0 so the reflected DL frags brute-loop gLights instead.
+            gp[116] = 0.0f;
         }
 
         // Cull into the reflection rings with the mirror frustum. primary=false → no lazy loads (the

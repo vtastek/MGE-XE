@@ -589,6 +589,7 @@ namespace IPC {
 		params.devMouseWheel = di.wheel;
 		params.devUiVisible = di.uiVisible;
 		params.devReloadShaders = di.reloadShaders;
+		params.devDistLightsToggle = di.distLightsToggle;
 		params.bytesWritten = 0;
 		params.renderMs = 0.0;
 		if (!beginRpc(Command::RenderFrame)) {

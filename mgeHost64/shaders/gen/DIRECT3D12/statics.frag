@@ -1045,20 +1045,28 @@ STRUCT(FrameData)
 
 
     float4 uvOffsets[8];
-#line 95
+
+
+
+
+
+
+    float4 froxelDims;
+    float4 froxelZ;
+#line 103
 };
 
 STRUCT(BatchData)
 {
     float4x4 worlds[ 1024 ];
-#line 100
+#line 108
 };
-#line 121 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 129 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(LightData)
 {
     float4 lightParams;
     float4 lights[ 128  * 3];
-#line 125
+#line 133
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1097,8 +1105,14 @@ STRUCT(LightData)
 
 
 
+
+        Buffer(uint) gFroxelMask :  register(t9,space1);
+
+
+
+
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 180 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 194 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 896 ] :  register(t0,space0);
 
 
@@ -1156,26 +1170,58 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
 
+
+
+
+
     {
         float3 N = normalize(In.WorldNormal);
         uint nL = (uint)gLights.lightParams.x;
         float reachK = gLights.lightParams.y;
         float3 pointDiffuse = float3(0.0f, 0.0f, 0.0f);
-        for (uint i = 0u; i < nL; ++i)
+        int tilesX = (int)gFrameData.froxelDims.x;
+        bool clustered = (tilesX > 0);
+        uint base = 0u;
+        if (clustered)
         {
-            float4 posR = gLights.lights[i * 3u + 0u];
-            float3 lcol = gLights.lights[i * 3u + 1u].rgb;
-            float3 fo = gLights.lights[i * 3u + 2u].xyz;
-            float reach = posR.w * reachK;
-            float3 toL = posR.xyz - In.WorldPos;
-            float d2 = dot(toL, toL);
-            if (d2 >= reach * reach) { continue; }
-            float invD = rsqrt(max(d2, 1e-8f));
-            float d = d2 * invD;
-            float att = 1.0f / max(fo.z * d2 + fo.y * d + fo.x, 1e-4f);
-            att *= 1.0f - smoothstep( 0.75f  * reach, reach, d);
-            float lambert = saturate(dot(N, toL) * invD);
-            pointDiffuse += lambert * att * lcol;
+            int tilesY = (int)gFrameData.froxelDims.y;
+            int NZ = (int)gFrameData.froxelDims.z;
+            float tile = gFrameData.froxelDims.w;
+            int tx = clamp((int)(In.Position.x / tile), 0, tilesX - 1);
+            int ty = clamp((int)(In.Position.y / tile), 0, tilesY - 1);
+            float dd = length(In.WorldPos);
+            int zs = clamp((int)((log(max(dd, 1.0f)) - gFrameData.froxelZ.x) * gFrameData.froxelZ.y * (float)NZ), 0, NZ - 1);
+            base = (((uint)ty * (uint)tilesX + (uint)tx) * (uint)NZ + (uint)zs) * 4u;
+        }
+        for (uint wi = 0u; wi < 4u; ++wi)
+        {
+            uint bits;
+            if (clustered) {
+                bits = gFroxelMask[base + wi];
+            } else {
+                uint lo = wi * 32u;
+                uint cnt = (lo >= nL) ? 0u : min(32u, nL - lo);
+                bits = (cnt >= 32u) ? 0xFFFFFFFFu : ((1u << cnt) - 1u);
+            }
+            while (bits != 0u)
+            {
+                uint i = wi * 32u + firstbitlow(bits);
+                bits = bits & (bits - 1u);
+                if (i >= nL) { continue; }
+                float4 posR = gLights.lights[i * 3u + 0u];
+                float3 lcol = gLights.lights[i * 3u + 1u].rgb;
+                float3 fo = gLights.lights[i * 3u + 2u].xyz;
+                float reach = posR.w * reachK;
+                float3 toL = posR.xyz - In.WorldPos;
+                float d2 = dot(toL, toL);
+                if (d2 >= reach * reach) { continue; }
+                float invD = rsqrt(max(d2, 1e-8f));
+                float d = d2 * invD;
+                float att = 1.0f / max(fo.z * d2 + fo.y * d + fo.x, 1e-4f);
+                att *= 1.0f - smoothstep( 0.75f  * reach, reach, d);
+                float lambert = saturate(dot(N, toL) * invD);
+                pointDiffuse += lambert * att * lcol;
+            }
         }
         result += tex.rgb * pointDiffuse;
     }

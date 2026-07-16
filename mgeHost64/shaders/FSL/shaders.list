@@ -252,3 +252,15 @@
 #comp shadowlightcull.comp
 #include "shadowlightcull.comp.fsl"
 #end
+
+// Clustered forward lighting: froxel light-assignment. froxelclear.comp zeros the 128-bit-per-froxel
+// mask; froxelassign.comp scatters each uploaded distant light's bit into every froxel its reach-sphere
+// touches (screen-tile box x radial-slice range). distantland.frag/statics.frag then loop only their
+// froxel's lights. Both share compute.rootsig + FroxelSrtData PerBatch. See tasks/forge-clustered-lighting.md.
+#comp froxelclear.comp
+#include "froxelclear.comp.fsl"
+#end
+
+#comp froxelassign.comp
+#include "froxelassign.comp.fsl"
+#end

@@ -148,6 +148,10 @@ namespace ForgeRender {
     // no game restart. Recompile + redeploy the *_0.dxil first. Idles the queue before swapping.
     void reloadComputeShaders();
 
+    // Perf A/B (numpad -): flip the baked distant point-light loop on/off live. Same host bool the
+    // dev panel "Dist lights: enable" checkbox drives — diff the gpu-split `dl=` bracket with it.
+    void toggleDistLights();
+
     // Parts actually drawn (slot valid) in the last renderScene — for diagnostics.
     unsigned lastDrawn();
 

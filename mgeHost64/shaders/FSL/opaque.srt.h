@@ -92,6 +92,14 @@ STRUCT(FrameData)
     // so every existing field keeps its offset. 336 + 128 = 464B < 512B CBV. Only statics.vert reads
     // it; 0 elsewhere is a harmless null tail. Slot count MUST match kMaxHeroAnimSlots host-side.
     DATA(float4, uvOffsets[8], None);
+    // Clustered forward lighting (froxel grid) for the DISTANT baked point lights. distantland.frag /
+    // statics.frag read these to find their froxel (screen tile x radial-distance slice) and loop only
+    // that froxel's lights from gFroxelMask, instead of the whole streamed <=128 set. Appended after
+    // uvOffsets so every field above keeps its offset (464 -> 496B < 512B CBV). froxelDims.x == 0 =>
+    // clustering OFF => both frags fall back to the brute gLights loop (near/opaque paths never read
+    // these). Slice metric = length(worldPosRel), matching froxelassign.comp exactly.
+    DATA(float4, froxelDims, None);   // x=tilesX, y=tilesY, z=NZslices, w=tileSize(px); x<=0 => brute loop
+    DATA(float4, froxelZ,    None);   // x=log(d0), y=invLogRange (1/log(d1/d0)); zw unused
 };
 
 STRUCT(BatchData)
@@ -158,6 +166,12 @@ BEGIN_SRT_NO_AB(SrtData)
         // they are bound ONLY into the main pPerFrameSet, like the water/mask SRVs).
         DECL_TEXTURE(PerFrame, Tex2D(float), gShadowAtlas)
         DECL_TEXTURE(PerFrame, Tex2D(float), gShadowAtlasDyn)
+        // Clustered forward lighting: the froxel light-mask (128 bits/froxel = 4 uint), written by
+        // froxelassign.comp (UAV) and read here as an SRV. Appended AFTER gShadowAtlasDyn so every
+        // existing PerFrame offset stays stable. Bound once into pPerFrameSet (like gShadowMask); only
+        // distantland.frag / statics.frag index it, and only when gFrameData.froxelDims.x > 0 (else the
+        // brute loop). All other frags ignore it (harmless null tail).
+        DECL_BUFFER(PerFrame, Buffer(uint), gFroxelMask)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has
