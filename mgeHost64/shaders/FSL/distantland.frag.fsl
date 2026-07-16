@@ -10,6 +10,18 @@
 
 #include "opaque.srt.h"
 
+// Static semi-HDR tonemap — byte-identical to opaque.frag::tonemap (XE FixedFuncEmu.fx). The near
+// path tonemaps its final lit colour; distant land historically did NOT (to match old MGE DL, which
+// had no host point lights). Now that near + far share one renderer AND baked point lights, the far
+// path must tonemap too, or a bright point-light core stays hot on far while near's is rolled off
+// (the "far has a brighter core" difference). Maps 0->0, 1->0.84, clamps 2.2->1.0.
+float3 tonemap(float3 c)
+{
+    c = clamp(c, 0.0f, 2.2f);
+    c = (((0.0548303f * c - 0.189786f) * c - 0.154732f) * c + 1.12969f) * c;
+    return c;
+}
+
 STRUCT(VSOutput)
 {
     DATA(float4, Position, SV_Position);
@@ -31,6 +43,7 @@ float4 PS_MAIN( VSOutput In )
 
     // World base colour.
     float3 result = SampleTex2D(gTextures[baseIdx], gSamplerAnisotropic, In.Uv).rgb;
+    float3 albedo = result;   // Phase C: kept for the additive point-light term below
 
     // Two-scale tiled detail (XE Mod Landscape.fx:89-90).
     float detail = SampleTex2D(gTextures[detailIdx], gSamplerAnisotropic, In.Uv * 333.0f).g + 0.5f;
@@ -39,6 +52,38 @@ float4 PS_MAIN( VSOutput In )
     // Sun diffuse (to-sun = -sunDir) + distant-land ambient. Matches LandscapePS:93.
     result *= gFrameData.sunCol.rgb * saturate(dot(-gFrameData.sunDir.xyz, normal)) + gFrameData.lodSunAmb.rgb;
     result *= detail;
+
+    // Phase C: baked DISTANT point lights. gLights is bound to the streamed baked set (camera-relative
+    // positions — In.WorldPos is also camera-relative here), packed exactly like the near path: per
+    // light [i*3+0]=(pos.xyz, radius), [i*3+1]=col.rgb, [i*3+2]=(k0,k1,k2). This replicates the near
+    // opaque.frag evalOnePointLight form; the additive diffuse is modulated by albedo + detail so it
+    // matches the sun term's shading, then fogged with everything else below.
+    float3 pointDiffuse = float3(0.0f, 0.0f, 0.0f);
+    {
+        uint  nL     = (uint)gLights.lightParams.x;
+        float reachK = gLights.lightParams.y;
+        for (uint i = 0u; i < nL; ++i)
+        {
+            float4 posR = gLights.lights[i * 3u + 0u];
+            float3 lcol = gLights.lights[i * 3u + 1u].rgb;
+            float3 fo   = gLights.lights[i * 3u + 2u].xyz;   // k0, k1, k2
+            float  reach = posR.w * reachK;
+            float3 toL  = posR.xyz - In.WorldPos;
+            float  d2   = dot(toL, toL);
+            if (d2 >= reach * reach) { continue; }
+            float invD = rsqrt(max(d2, 1e-8f));
+            float d    = d2 * invD;
+            float att  = 1.0f / max(fo.z * d2 + fo.y * d + fo.x, 1e-4f);
+            att *= 1.0f - smoothstep(POINT_LIGHT_TAIL * reach, reach, d);
+            float lambert = saturate(dot(normal, toL) * invD);
+            pointDiffuse += lambert * att * lcol;
+        }
+    }
+    result += albedo * pointDiffuse * detail;
+
+    // Match the near path: tonemap the final lit colour BEFORE fog (opaque.frag order). This rolls
+    // off the bright point-light core the same way, so near/far cores agree.
+    result = tonemap(result);
 
     // Placeholder distant fog (Phase 1c = atmospheric scatter). lerp toward fogColNear by Fog.
     result = lerp(gFrameData.fogColNear.rgb, result, In.Fog);

@@ -56,6 +56,11 @@ STRUCT(VSOutput)
     DATA(FLAT(uint),       TexIndex, TEXCOORD2);
     DATA(FLAT(uint),       Flags,    TEXCOORD3);
     DATA(float3,           WorldPos, TEXCOORD4); // F12 distance grayscale parity
+    // Phase C: world-space normal for the distant point-light loop in statics.frag (statics carry
+    // their SUN lighting per-vertex in Color, but a per-pixel normal is needed for point Lambert).
+    // Also emitted by statics_heroblend.vert (HERO_PASS=1, same body); statics_blend.frag declares
+    // the matching field so both frag signatures stay byte-identical to this VSOutput.
+    DATA(float3,           WorldNormal, TEXCOORD5);
     // Real water reflection (WV2): below-water clip. Pass-all (0,0,0,1) in every non-reflect frame
     // cbuffer → Clip = 1 >= 0 (nothing clipped). Rasterizer system-value; no frag input, no PSO state.
     DATA(float,            Clip,     SV_ClipDistance0);
@@ -82,6 +87,7 @@ VSOutput VS_MAIN( VSInput In )
     // sun N.L + distant ambient + emissive, modulating the per-vertex colour.
     float3 n      = normalize(2.0f * In.Normal.xyz - 1.0f);
     float3 nWorld = n.x * In.W0.xyz + n.y * In.W1.xyz + n.z * In.W2.xyz;
+    Out.WorldNormal = nWorld;   // Phase C: for the point-light Lambert in statics.frag (frag normalizes)
     float  emissive = In.Normal.w;
     float3 light = gFrameData.sunCol.rgb * saturate(dot(nWorld, -gFrameData.sunDir.xyz))
                  + gFrameData.lodSunAmb.rgb + emissive;
