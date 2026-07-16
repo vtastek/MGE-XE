@@ -1149,6 +1149,9 @@ namespace MGEgui.DistantLand {
             StaticsList.Clear();
             UsedStaticsList.Clear();
             StaticMap.Clear();
+            LightDefs.Clear();
+            UsedLightsList.Clear();
+            lightsSkippedFlagged = 0;
 
             if (args.UseOverrideList && args.OverrideFiles.Count > 0) {
                 ParseOverrideFiles(args.OverrideFiles, overrideList, namedObjectDisables, interiorEnables, dynamicVisDataSet, staticsWarnings);
@@ -1167,6 +1170,13 @@ namespace MGEgui.DistantLand {
                 }
                 br.Close();
             }
+
+            // Match the modded near lights: apply LetThereBeDarkness's per-light-name radius/colour
+            // override + global radius scaling to the collected LIGH defs (its editLights() edits every
+            // base light record globally by name; the DL baker operates on the same base records). This
+            // runs before the cell parse, so the placements copy the already-transformed values.
+            ApplyLtbdMods(staticsWarnings);
+            dlLtbdModded = ltbdTransformed; dlLtbdActive = ltbdActive; dlLtbdScale = ltbdScale;
 
             backgroundWorker.ReportProgress(1, strings["StaticsGenerate1"]);
             UsedStaticsList.Add("", new Dictionary<string, StaticReference>());
@@ -1379,6 +1389,28 @@ namespace MGEgui.DistantLand {
                 bw.Write((float)Convert.ToSingle(udStatMinSize.Value));
             }
 
+            // Baked static point lights for the Forge deferred distant lightmap. Main worldspace
+            // ("") only -- distant lighting is an exterior concern. Record layout per light:
+            //   float posX,posY,posZ; float radius; byte r,g,b; byte flags(bit0=hasMesh)
+            // Negative + OffByDefault lights were already dropped at parse (never enter LightDefs).
+            // Radius is the base LHDT radius (vanilla does not scale light range by ref XSCL).
+            Dictionary<string, LightReference> mainLights;
+            if (!UsedLightsList.TryGetValue("", out mainLights)) {
+                mainLights = new Dictionary<string, LightReference>();
+            }
+            int lightsMeshless = 0;
+            using (var lbw = new BinaryWriter(File.Create(Statics.fn_lightsdata), Statics.ESPEncoding)) {
+                lbw.Write((int)1);              // version
+                lbw.Write(mainLights.Count);
+                foreach (var lp in mainLights) {
+                    if (!lp.Value.HasMesh) { lightsMeshless++; }
+                    lp.Value.Write(lbw);
+                }
+            }
+            dlLightsBaked = mainLights.Count;
+            dlLightsMeshless = lightsMeshless;
+            dlLightsSkipped = lightsSkippedFlagged;
+
             if (!File.Exists(Statics.fn_statmesh)) {
                 return;
             }
@@ -1472,6 +1504,8 @@ namespace MGEgui.DistantLand {
         private int dlMipFixed, dlMipFixSkippedBsa;
         private List<string> dlMipFixedPaths;
         private List<string> dlBsaSkippedPaths;
+        private int dlLightsBaked, dlLightsMeshless, dlLightsSkipped;
+        private int dlLtbdModded; private bool dlLtbdActive; private float dlLtbdScale;
 
         void workerFCreateStatics(object sender, System.ComponentModel.RunWorkerCompletedEventArgs e) {
             if (e != null) {
@@ -1547,6 +1581,10 @@ namespace MGEgui.DistantLand {
                 + "Total unique statics: " + (statics - 2);*/
             summary += "\r\n\r\nDistant statics textures: " + dlSliced + " sliced, " + dlResampled + " resampled, " + dlMagenta + " magenta (non-DDS), " + dlMipFixed + " mip-fixed"
                      + "\r\nDistant textures stage: " + dlStaticsTexMs + " ms";
+            summary += "\r\nBaked distant lights: " + dlLightsBaked + " (" + dlLightsMeshless + " meshless, " + dlLightsSkipped + " skipped negative/off-by-default)";
+            if (dlLtbdActive) {
+                summary += "\r\nLetThereBeDarkness: " + dlLtbdModded + " light types adjusted (radius scale " + dlLtbdScale + "%)";
+            }
             // Concise counts stay in the finish window; the (potentially long) per-texture lists go
             // only to the log, opened via the "View report" button, so the window stays readable.
             string detail = summary;
@@ -2392,6 +2430,9 @@ namespace MGEgui.DistantLand {
         private readonly Dictionary<string, Static> StaticsList = new Dictionary<string, Static>();
         private readonly Dictionary<string, Dictionary<string, StaticReference>> UsedStaticsList = new Dictionary<string,Dictionary<string,StaticReference>>();
         private readonly Dictionary<string, uint> StaticMap = new Dictionary<string, uint>();
+        private readonly Dictionary<string, LightDef> LightDefs = new Dictionary<string, LightDef>();
+        private readonly Dictionary<string, Dictionary<string, LightReference>> UsedLightsList = new Dictionary<string, Dictionary<string, LightReference>>();
+        private int lightsSkippedFlagged = 0;
         private readonly Dictionary<string, bool> DisableScripts = new Dictionary<string, bool>();
 
         /* Statics tab definitions */
@@ -2468,6 +2509,156 @@ namespace MGEgui.DistantLand {
                 bw.Write(Scale);
             }
 
+        }
+
+        private class LightDef {
+            public float Radius;
+            public byte R, G, B;
+            public int Flags;
+            public bool HasMesh;
+        }
+
+        private class LightReference {
+            public float X, Y, Z;
+            public float Scale;
+            public float Radius;
+            public byte R, G, B;
+            public bool HasMesh;
+
+            public void Write(BinaryWriter bw) {
+                bw.Write(X);
+                bw.Write(Y);
+                bw.Write(Z);
+                bw.Write(Radius);
+                bw.Write(R);
+                bw.Write(G);
+                bw.Write(B);
+                bw.Write((byte)(HasMesh ? 1 : 0));
+            }
+        }
+
+        // --- LetThereBeDarkness (RFD) light-mod bake ---------------------------------------------
+        // The mod's editLights() rewrites every base LIGH record at runtime (by name): an optional
+        // per-name radius+colour override (overrideLightTLaD / overrideLightTST), then a global
+        // radius *= scaleLightRadius% for radius <= scaleCutoff. That is exactly the near-light state
+        // the Forge distant path must match, and it is pure data (MWSE config JSON + overrides.lua),
+        // so the DL baker reproduces it offline. Absent files => raw LHDT radii (mod not installed).
+        private class LtbdLightMod {
+            public bool  HasColor, HasRadius;
+            public byte  R, G, B;
+            public float Radius;
+        }
+        private readonly Dictionary<string, LtbdLightMod> ltbdTLaD = new Dictionary<string, LtbdLightMod>();
+        private readonly Dictionary<string, LtbdLightMod> ltbdTST  = new Dictionary<string, LtbdLightMod>();
+        private float ltbdScale = 100.0f, ltbdCutoff = 1024.0f;
+        private bool  ltbdLightOverride = false, ltbdTorchOverride = false, ltbdActive = false;
+        private int   ltbdTransformed = 0;
+
+        private static float LtbdJsonNumber(string j, string key, float dflt) {
+            var m = System.Text.RegularExpressions.Regex.Match(j, "\"" + key + "\"\\s*:\\s*(-?[0-9.]+)");
+            return m.Success ? float.Parse(m.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture) : dflt;
+        }
+        private static bool LtbdJsonBool(string j, string key, bool dflt) {
+            var m = System.Text.RegularExpressions.Regex.Match(j, "\"" + key + "\"\\s*:\\s*(true|false)");
+            return m.Success ? (m.Groups[1].Value == "true") : dflt;
+        }
+
+        // Extract the brace block of a named Lua table, then parse its ["name"] = { radius=, color= }
+        // entries. Entries have no nested braces (colour uses tes3vector3.new(...) parens), so a flat
+        // [^}] body match is exact.
+        private static void LtbdParseTable(string lua, string tableName,
+                                           Dictionary<string, LtbdLightMod> dict, bool withColor) {
+            int start = lua.IndexOf(tableName);
+            if (start < 0) { return; }
+            int open = lua.IndexOf('{', start);
+            if (open < 0) { return; }
+            int depth = 0, end = -1;
+            for (int i = open; i < lua.Length; i++) {
+                char c = lua[i];
+                if (c == '{') { depth++; }
+                else if (c == '}') { depth--; if (depth == 0) { end = i; break; } }
+            }
+            if (end < 0) { return; }
+            string block = lua.Substring(open + 1, end - open - 1);
+
+            var entry = new System.Text.RegularExpressions.Regex(
+                "\\[\"([^\"]+)\"\\]\\s*=\\s*\\{([^}]*)\\}");
+            foreach (System.Text.RegularExpressions.Match m in entry.Matches(block)) {
+                string name = m.Groups[1].Value.ToLowerInvariant();
+                string body = m.Groups[2].Value;
+                var lm = new LtbdLightMod();
+                var rm = System.Text.RegularExpressions.Regex.Match(body, "radius\\s*=\\s*(-?[0-9.]+)");
+                if (rm.Success) {
+                    lm.Radius = float.Parse(rm.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture);
+                    lm.HasRadius = true;
+                }
+                if (withColor) {
+                    var cm = System.Text.RegularExpressions.Regex.Match(body,
+                        "tes3vector3\\.new\\(\\s*([0-9]+)\\s*,\\s*([0-9]+)\\s*,\\s*([0-9]+)\\s*\\)");
+                    if (cm.Success) {
+                        lm.HasColor = true;
+                        lm.R = (byte)Math.Min(255, int.Parse(cm.Groups[1].Value));
+                        lm.G = (byte)Math.Min(255, int.Parse(cm.Groups[2].Value));
+                        lm.B = (byte)Math.Min(255, int.Parse(cm.Groups[3].Value));
+                    }
+                }
+                dict[name] = lm;
+            }
+        }
+
+        private void LoadLtbdMods(List<string> warnings) {
+            ltbdTLaD.Clear(); ltbdTST.Clear();
+            ltbdScale = 100.0f; ltbdCutoff = 1024.0f;
+            ltbdLightOverride = ltbdTorchOverride = ltbdActive = false;
+
+            string cfg = Path.Combine(Statics.fn_dataFiles, @"MWSE\config\Let There Be Darkness.json");
+            string ovr = Path.Combine(Statics.fn_dataFiles, @"MWSE\mods\RFD\LetThereBeDarkness\overrides.lua");
+            if (!File.Exists(cfg) || !File.Exists(ovr)) { return; }   // mod not installed -> raw radii
+
+            try {
+                string j = File.ReadAllText(cfg);
+                ltbdScale         = LtbdJsonNumber(j, "scaleLightRadius", 100.0f);
+                ltbdCutoff        = LtbdJsonNumber(j, "scaleCutoff", 1024.0f);
+                ltbdLightOverride = LtbdJsonBool(j, "lightOverride", false);
+                ltbdTorchOverride = LtbdJsonBool(j, "torchOverride", false);
+
+                string lua = File.ReadAllText(ovr);
+                if (ltbdLightOverride) { LtbdParseTable(lua, "overrideLightTLaD", ltbdTLaD, true); }
+                if (ltbdTorchOverride) { LtbdParseTable(lua, "overrideLightTST", ltbdTST, false); }
+                ltbdActive = true;
+            } catch (Exception ex) {
+                warnings.Add("Let There Be Darkness light-mod read failed: " + ex.Message);
+                ltbdActive = false;
+            }
+        }
+
+        // Transform every collected LIGH def in place (TLaD colour+radius, then TST radius, then the
+        // global scale), mirroring the mod's editLights() order exactly. Runs before placements are
+        // built, so LightReference copies the modded values.
+        private void ApplyLtbdMods(List<string> warnings) {
+            LoadLtbdMods(warnings);
+            ltbdTransformed = 0;
+            if (!ltbdActive) { return; }
+
+            foreach (var kv in LightDefs) {
+                LightDef ld = kv.Value;
+                bool changed = false;
+                LtbdLightMod m;
+                if (ltbdLightOverride && ltbdTLaD.TryGetValue(kv.Key, out m)) {
+                    if (m.HasColor)  { ld.R = m.R; ld.G = m.G; ld.B = m.B; }
+                    if (m.HasRadius) { ld.Radius = m.Radius; }
+                    changed = true;
+                }
+                if (ltbdTorchOverride && ltbdTST.TryGetValue(kv.Key, out m)) {
+                    if (m.HasRadius) { ld.Radius = m.Radius; }
+                    changed = true;
+                }
+                if (ltbdScale != 100.0f && ld.Radius <= ltbdCutoff) {
+                    ld.Radius = ld.Radius * ltbdScale * 0.01f;
+                    changed = true;
+                }
+                if (changed) { ltbdTransformed++; }
+            }
         }
 
         private class StaticOverride {
@@ -2811,6 +3002,9 @@ namespace MGEgui.DistantLand {
                     string name = null;
                     string model = null;
                     string script = null;
+                    int lightRadius = 0, lightFlags = 0;
+                    byte lightR = 0, lightG = 0, lightB = 0;
+                    bool hasLHDT = false;
 
                     while (rr.NextSubrecord()) {
                         switch (rr.SubTag) {
@@ -2823,6 +3017,33 @@ namespace MGEgui.DistantLand {
                             case "SCRI":
                                 script = rr.ReadCString().ToLowerInvariant();
                                 break;
+                            case "LHDT":
+                                br.ReadSingle();            // Weight
+                                br.ReadInt32();             // Value
+                                br.ReadInt32();             // Time
+                                lightRadius = br.ReadInt32();
+                                lightR = br.ReadByte();
+                                lightG = br.ReadByte();
+                                lightB = br.ReadByte();
+                                br.ReadByte();              // color padding
+                                lightFlags = br.ReadInt32();
+                                hasLHDT = true;
+                                break;
+                        }
+                    }
+
+                    // Collect LIGH definitions (incl. meshless) for the Forge deferred distant
+                    // lightmap. Skip Negative (0x0004) + OffByDefault (0x0020) -- never baked.
+                    if (rr.Tag == "LIGH" && name != null && hasLHDT) {
+                        if ((lightFlags & 0x0004) == 0 && (lightFlags & 0x0020) == 0) {
+                            LightDef ld = new LightDef();
+                            ld.Radius = lightRadius;
+                            ld.R = lightR; ld.G = lightG; ld.B = lightB;
+                            ld.Flags = lightFlags;
+                            ld.HasMesh = (model != null && model.Trim() != string.Empty);
+                            LightDefs[name] = ld;
+                        } else {
+                            lightsSkippedFlagged++;
                         }
                     }
 
@@ -2899,6 +3120,39 @@ namespace MGEgui.DistantLand {
             if (DEBUG) {
                 allWarnings.Add("Static definitions: " + DEBUG_statics + "; Ignored definitions: " + DEBUG_ignored);
             }
+        }
+
+        // Emit a baked distant-light placement when a cell reference points at a collected LIGH.
+        // Mirrors the statics reference path: honours DELE deletes and the .ovr [names] disable
+        // list (the interim ghost-light removal), keyed the same way so both stay in sync.
+        private void AddLightReference(StaticReference sr, bool referenceDeleted, bool isInterior,
+                                       string cellName, int cellX, int cellY, List<string> masters,
+                                       int mastID, uint refID, Dictionary<string, bool> namedObjectDisables) {
+            LightDef ld;
+            if (!LightDefs.TryGetValue(sr.Name, out ld)) {
+                return;
+            }
+            if (namedObjectDisables.ContainsKey(sr.Name) && namedObjectDisables[sr.Name]) {
+                return;
+            }
+            string worldspace = isInterior ? cellName : "";
+            string refKey = masters[mastID] + "\u0001" + (isInterior ? "" : cellX + "\u0002" + cellY + "\u0001") + refID;
+            if (referenceDeleted) {
+                if (UsedLightsList.ContainsKey(worldspace) && UsedLightsList[worldspace].ContainsKey(refKey)) {
+                    UsedLightsList[worldspace].Remove(refKey);
+                }
+                return;
+            }
+            if (!UsedLightsList.ContainsKey(worldspace)) {
+                UsedLightsList.Add(worldspace, new Dictionary<string, LightReference>());
+            }
+            LightReference lr = new LightReference();
+            lr.X = sr.X; lr.Y = sr.Y; lr.Z = sr.Z;
+            lr.Scale = sr.Scale;
+            lr.Radius = ld.Radius;
+            lr.R = ld.R; lr.G = ld.G; lr.B = ld.B;
+            lr.HasMesh = ld.HasMesh;
+            UsedLightsList[worldspace][refKey] = lr;
         }
 
         private void ParseFileForCells(BinaryReader br, string pluginName, Dictionary<string, bool> namedObjectDisables, Dictionary<string, bool> interiorEnables) {
@@ -2984,6 +3238,7 @@ namespace MGEgui.DistantLand {
                                             sr.Scale = 1;
                                         }
 
+                                        AddLightReference(sr, referenceDeleted, isInterior, cellName, cellX, cellY, masters, mastID, refID, namedObjectDisables);
                                         Static stat;
                                         StaticsList.TryGetValue(sr.Name, out stat);
                                         if (stat != null && (stat.VisIndex > 0 || !namedObjectDisables.ContainsKey(sr.Name) || !namedObjectDisables[sr.Name])) {
@@ -3044,6 +3299,7 @@ namespace MGEgui.DistantLand {
                                 sr.Scale = 1;
                             }
 
+                            AddLightReference(sr, referenceDeleted, isInterior, cellName, cellX, cellY, masters, mastID, refID, namedObjectDisables);
                             Static stat;
                             StaticsList.TryGetValue(sr.Name, out stat);
                             if (stat != null && (stat.VisIndex > 0 || !namedObjectDisables.ContainsKey(sr.Name) || !namedObjectDisables[sr.Name])) {

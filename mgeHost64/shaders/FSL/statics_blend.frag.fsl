@@ -20,6 +20,7 @@ STRUCT(VSOutput)
     DATA(FLAT(uint),       TexIndex, TEXCOORD2);
     DATA(FLAT(uint),       Flags,    TEXCOORD3);
     DATA(float3,           WorldPos, TEXCOORD4);
+    DATA(float3,           WorldNormal, TEXCOORD5);   // Phase C: unused here; matches statics.vert (HERO_PASS) VSOutput
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)

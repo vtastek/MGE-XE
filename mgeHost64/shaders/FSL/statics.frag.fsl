@@ -10,6 +10,17 @@
 
 #include "opaque.srt.h"
 
+// Static semi-HDR tonemap — byte-identical to opaque.frag / distantland.frag::tonemap (XE
+// FixedFuncEmu.fx). Applied to the final lit colour so the distant statics' point-light core rolls
+// off the same as the near path (and the distant land, which also tonemaps). Maps 0->0, 1->0.84,
+// clamps 2.2->1.0.
+float3 tonemap(float3 c)
+{
+    c = clamp(c, 0.0f, 2.2f);
+    c = (((0.0548303f * c - 0.189786f) * c - 0.154732f) * c + 1.12969f) * c;
+    return c;
+}
+
 // MUST stay byte-identical to statics.vert.fsl's VSOutput, CENTROID modifiers included — see the
 // long comment there for why Color/Fog are centroid (MSAA sliver extrapolation drove the lit colour
 // negative / past 1.0; MGE's StatVertOut marks the same two).
@@ -22,6 +33,7 @@ STRUCT(VSOutput)
     DATA(FLAT(uint),       TexIndex, TEXCOORD2);
     DATA(FLAT(uint),       Flags,    TEXCOORD3);
     DATA(float3,           WorldPos, TEXCOORD4);
+    DATA(float3,           WorldNormal, TEXCOORD5);   // Phase C: for the distant point-light loop
 };
 
 ROOT_SIGNATURE(DefaultRootSignature)
@@ -41,6 +53,39 @@ float4 PS_MAIN( VSOutput In )
     }
 
     float3 result = tex.rgb * In.Color.rgb;
+
+    // Phase C: baked DISTANT point lights (same camera-relative gLights set the distant land loops).
+    // Statics carry their SUN+ambient per-vertex in Color; this ADDS point diffuse modulated by the
+    // texture albedo (tex.rgb), matching the near opaque.frag evalOnePointLight form. Normal is the
+    // interpolated world normal (re-normalized); positions are camera-relative like In.WorldPos.
+    {
+        float3 N      = normalize(In.WorldNormal);
+        uint   nL     = (uint)gLights.lightParams.x;
+        float  reachK = gLights.lightParams.y;
+        float3 pointDiffuse = float3(0.0f, 0.0f, 0.0f);
+        for (uint i = 0u; i < nL; ++i)
+        {
+            float4 posR = gLights.lights[i * 3u + 0u];
+            float3 lcol = gLights.lights[i * 3u + 1u].rgb;
+            float3 fo   = gLights.lights[i * 3u + 2u].xyz;   // k0, k1, k2
+            float  reach = posR.w * reachK;
+            float3 toL  = posR.xyz - In.WorldPos;
+            float  d2   = dot(toL, toL);
+            if (d2 >= reach * reach) { continue; }
+            float invD = rsqrt(max(d2, 1e-8f));
+            float d    = d2 * invD;
+            float att  = 1.0f / max(fo.z * d2 + fo.y * d + fo.x, 1e-4f);
+            att *= 1.0f - smoothstep(POINT_LIGHT_TAIL * reach, reach, d);
+            float lambert = saturate(dot(N, toL) * invD);
+            pointDiffuse += lambert * att * lcol;
+        }
+        result += tex.rgb * pointDiffuse;
+    }
+
+    // Match near + distant land: tonemap the final lit colour BEFORE fog so the point-light core
+    // rolls off identically (opaque.frag order).
+    result = tonemap(result);
+
     result = lerp(gFrameData.fogColNear.rgb, result, In.Fog);
 
     // F12 distance grayscale parity (debugParams.x 1/2) with distantland.frag + opaque.frag.

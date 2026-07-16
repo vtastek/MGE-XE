@@ -1149,6 +1149,11 @@ namespace {
         // shared opaque.frag for both the static and skinned paths).
         Buffer*        pLightCbv = nullptr;        // gLights cbuffer, persistent-mapped
         DescriptorSet* pPerLightsSet = nullptr;    // gLights, 1 instance
+        // Phase C: baked DISTANT lights (lights.data). A second gLights-layout cbuffer + PerDraw set,
+        // bound in place of pPerLightsSet for the distant-land/statics draws so the distant frags loop
+        // the streamed baked set (camera-relative) instead of the near lights. Same LightData layout.
+        Buffer*        pDistLightCbv     = nullptr;
+        DescriptorSet* pPerLightsSetDist = nullptr;
         Buffer*        pWorldsBuf[16] = {};        // gBatch windows: one 64KB cbuffer PER batch, persistent-mapped
         // Per-batch instance-rate VB of uint2 { .x = identity DrawIndex/Base, .y = per-draw
         // texIndex }. CPU-mapped so the static loop writes texIndex per frame; .x stays identity
@@ -4511,6 +4516,17 @@ namespace {
             flb.ppBuffer = &g_live.pFPLightCbv;
             addResource(&flb, nullptr);
 
+            // Phase C: baked distant-light cbuffer (same LightData layout as gLights/pLightCbv).
+            BufferLoadDesc dlb = {};
+            dlb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            dlb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            dlb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            dlb.mDesc.mSize = kLightCbvBytes;
+            dlb.mDesc.pName = "distLightCbv";
+            dlb.pData = nullptr;
+            dlb.ppBuffer = &g_live.pDistLightCbv;
+            addResource(&dlb, nullptr);
+
             BufferLoadDesc fwb = {};
             fwb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
             fwb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
@@ -4579,6 +4595,10 @@ namespace {
                 addDescriptorSet(R, &fpwDesc, &g_live.pPerBatchSetFP);
                 DescriptorSetDesc fpsDesc = SRT_SET_DESC(SrtData, PerBatch, 1, 0);
                 addDescriptorSet(R, &fpsDesc, &g_live.pPerBatchSetFPSkin);
+                if (g_live.pDistLightCbv) {
+                    DescriptorSetDesc dlDesc = SRT_SET_DESC(SrtData, PerDraw, 1, 0);
+                    addDescriptorSet(R, &dlDesc, &g_live.pPerLightsSetDist);
+                }
             }
             if (fpBufsOk && g_live.pPerFrameSetFP && g_live.pPerLightsSetFP
                 && g_live.pPerBatchSetFP && g_live.pPerBatchSetFPSkin) {
@@ -4608,6 +4628,15 @@ namespace {
                 lp.mIndex = SRT_RES_IDX(SrtData, PerDraw, gLights);
                 lp.ppBuffers = &g_live.pFPLightCbv;
                 updateDescriptorSet(R, 0, g_live.pPerLightsSetFP, 1, &lp);
+
+                // Phase C: bind the baked distant-light cbuffer to its PerDraw set (same gLights slot).
+                if (g_live.pDistLightCbv && g_live.pPerLightsSetDist) {
+                    std::memset(g_live.pDistLightCbv->pCpuMappedAddress, 0, kLightCbvBytes);
+                    DescriptorData dlp = {};
+                    dlp.mIndex = SRT_RES_IDX(SrtData, PerDraw, gLights);
+                    dlp.ppBuffers = &g_live.pDistLightCbv;
+                    updateDescriptorSet(R, 0, g_live.pPerLightsSetDist, 1, &dlp);
+                }
 
                 DescriptorData bw = {};
                 bw.mIndex = SRT_RES_IDX(SrtData, PerBatch, gBatch);
@@ -5056,6 +5085,18 @@ namespace {
                                         // that has already reached zero and therefore cannot be seen. This is
                                         // what buys us 100%-opaque shadows with NO fade anywhere.
                                         // Clamped to <=1 on upload: the light must never outrun the test.
+    // Phase C baked DISTANT lights: reproduce MW's placed-light attenuation EXACTLY from the same
+    // Morrowind.ini [LightAttenuation] the engine bakes into the near lights — no free calibration.
+    //   c (constant)  = ConstantValue            = 0.36
+    //   l (linear)    = LinearValue / R^1        = 0        (LinearValue = 0)
+    //   q (quadratic) = QuadraticValue / R^2     = 3.25/R²  (QuadraticMethod = 2)
+    // att(d) = 1/(c + q·d²) is exactly a physical SPHERICAL light: core = color/c, source radius
+    // a = R·sqrt(c/q) ≈ 0.33R. Fed to the UNCHANGED frag (which already evaluates 1/(c+l·d+q·d²)),
+    // so distant lights become byte-identical to the near path fed from the same ini. (Gamma space
+    // for now — recalibrate at the linear-lighting migration; the near path migrates with it.)
+    constexpr float kMWLightConstant  = 0.36f;   // Morrowind.ini ConstantValue
+    constexpr float kMWLightQuadratic = 3.25f;   // Morrowind.ini QuadraticValue (Method 2 → /R²)
+    bool  g_drawDistLights  = true;              // A/B enable (dev panel checkbox; NOT a brightness knob)
     float g_shadowVertWeight = 1.0f;    // VERTICAL importance weighting for slot ranking. The importance
                                         // metric weights the light's vertical offset from the eye (world Z,
                                         // camera-relative) by this factor before ranking. >1 demotes lights on
@@ -5446,6 +5487,11 @@ namespace {
         uiAddComponentWidget(g_uiPanel, "AO intensity", &sI, WIDGET_TYPE_SLIDER_FLOAT);
         SliderFloatWidget sT = {}; sT.pData = &g_aoThickness; sT.mMin = 0.0f;  sT.mMax = 0.5f;   sT.mStep = 0.005f;
         uiAddComponentWidget(g_uiPanel, "AO horizon bias", &sT, WIDGET_TYPE_SLIDER_FLOAT);
+
+        // Phase C: baked distant point lights (MW ini-baked attenuation; no brightness knob). Enable
+        // is just an A/B toggle.
+        CheckboxWidget cDL = {}; cDL.pData = &g_drawDistLights;
+        uiAddComponentWidget(g_uiPanel, "Dist lights: enable", &cDL, WIDGET_TYPE_CHECKBOX);
         SliderFloatWidget sBl = {}; sBl.pData = &g_aoBlurPx;    sBl.mMin = 0.0f; sBl.mMax = 4.0f;   sBl.mStep = 0.1f;
         uiAddComponentWidget(g_uiPanel, "AO blur spatial (px)", &sBl, WIDGET_TYPE_SLIDER_FLOAT);
         SliderFloatWidget sBd = {}; sBd.pData = &g_aoBlurDepth; sBd.mMin = 1.0f; sBd.mMax = 256.0f; sBd.mStep = 1.0f;
@@ -10613,6 +10659,23 @@ namespace ForgeRender {
     Pipeline*   g_pLandPipeline = nullptr;
     bool        g_landLoaded    = false;
 
+    // --- Phase B: baked distant static lights (DL-gen lights.data) ------------------------------
+    // Resident set loaded once with the land; distance-streamed per frame around g_dlEye. This is
+    // the load+stream+observe checkpoint — the Phase C deferred lightmap consumes them (no GPU
+    // upload yet). radius is the base LHDT radius; falloff (k0/k1/k2) is derived in Phase C where it
+    // can be A/B'd against the live near lights. hasMesh gates the Phase F billboard.
+    struct DlBakedLight {
+        float    x, y, z;
+        float    radius;
+        uint8_t  r, g, b;
+        bool     hasMesh;
+    };
+    std::vector<DlBakedLight> g_dlBakedLights;
+    bool  g_dlBakedLightsLoaded = false;
+    float g_dlBakedLightStreamR = 8192.0f * 6.0f;   // ~6 cells: deferred/billboard working radius
+    // (g_drawDistLights / g_distLightIntensity / g_distLightRadiusScale declared up by the shadow
+    //  knobs so the dev-panel UI setup — which runs earlier in the file — can bind sliders to them.)
+
     // --- Phase 1b distant STATICS (host-owned, GPU-driven: instancing + bindless + execute-indirect) ---
     // The unique mesh LIBRARY (static_meshes) is packed ONCE into a mega VB (StaticElem, 20 B) + a
     // mega 16-bit IB; each subset records its (vbBase, ibBase, indexCount) into those. Placements
@@ -10977,6 +11040,52 @@ namespace ForgeRender {
         return true;
     }
 
+    // Phase B: load the DL-gen baked static lights (distantland\lights.data) into the resident set.
+    // One-shot (missing file is fine — pre-Phase-A DL gens have none). Format v1: int32 version;
+    // int32 count; then count * { float x,y,z; float radius; byte r,g,b; byte flags(bit0=hasMesh) }.
+    void dlLoadBakedLights() {
+        if (g_dlBakedLightsLoaded) { return; }
+        g_dlBakedLightsLoaded = true;   // one-shot regardless of outcome
+        g_dlBakedLights.clear();
+
+        std::vector<uint8_t> file;
+        if (!dlReadWholeFile("Data Files\\distantland\\lights.data", file) || file.size() < 8) {
+            LOG::logline(">> [forge][dl] baked lights: none (lights.data missing/empty)");
+            return;
+        }
+        const uint8_t* p   = file.data();
+        const uint8_t* end = file.data() + file.size();
+        uint32_t version = 0, count = 0;
+        std::memcpy(&version, p, 4); p += 4;
+        std::memcpy(&count,   p, 4); p += 4;
+        if (version != 1) {
+            LOG::logline(">> [forge][dl] baked lights: unsupported version %u", version);
+            return;
+        }
+
+        g_dlBakedLights.reserve(count);
+        uint32_t meshless = 0;
+        float rmin = 1e30f, rmax = 0.0f;
+        for (uint32_t i = 0; i < count; ++i) {
+            if (p + 20 > end) { LOG::logline(">> [forge][dl] baked lights: truncated at %u/%u", i, count); break; }
+            DlBakedLight L;
+            std::memcpy(&L.x,      p,      4);
+            std::memcpy(&L.y,      p + 4,  4);
+            std::memcpy(&L.z,      p + 8,  4);
+            std::memcpy(&L.radius, p + 12, 4);
+            L.r = p[16]; L.g = p[17]; L.b = p[18];
+            L.hasMesh = (p[19] & 0x1) != 0;
+            p += 20;
+            if (!L.hasMesh) { ++meshless; }
+            rmin = std::min(rmin, L.radius);
+            rmax = std::max(rmax, L.radius);
+            g_dlBakedLights.push_back(L);
+        }
+        LOG::logline(">> [forge][dl] baked lights: %zu loaded (%u meshless), radius %.0f..%.0f",
+                     g_dlBakedLights.size(), meshless,
+                     g_dlBakedLights.empty() ? 0.0f : rmin, rmax);
+    }
+
     // Load the 3 atlas textures + parse the distantland\world container into resident Forge
     // VB/IB + bounding spheres. Idempotent. Requires buildOpaquePath (pPersistentSet) already built.
     bool loadDistantLand(Renderer* R) {
@@ -11044,6 +11153,7 @@ namespace ForgeRender {
         }
         std::printf("[forge][dl] resident land meshes: %u\n", g_landMeshCount);
         g_landLoaded = (built > 0);
+        dlLoadBakedLights();
         return g_landLoaded;
     }
 
@@ -13479,6 +13589,71 @@ namespace ForgeRender {
         }
         if (T.primary) { g_liveLastLand = (uint32_t)T.landVisible->size(); }
 
+        // Phase C: stream + UPLOAD the baked distant lights around the eye. Fill the gLights-layout
+        // distant cbuffer with the NEAREST <=128 within the working radius (camera-relative: pos-eye,
+        // matching distantland.vert's worldPos = In.Position - lodEye), so the distant-land frag loops
+        // them exactly like the near opaque path loops gLights. Throttled heartbeat as in Phase B.
+        if (T.primary && g_dlBakedLightsLoaded && !g_dlBakedLights.empty()) {
+            const float sr2 = g_dlBakedLightStreamR * g_dlBakedLightStreamR;
+            static std::vector<std::pair<float, uint32_t>> s_cand;   // (dist2, index), reused
+            s_cand.clear();
+            for (uint32_t i = 0; i < (uint32_t)g_dlBakedLights.size(); ++i) {
+                const DlBakedLight& L = g_dlBakedLights[i];
+                const float dx = L.x - eye[0], dy = L.y - eye[1], dz = L.z - eye[2];
+                const float d2 = dx * dx + dy * dy + dz * dz;
+                if (d2 <= sr2) { s_cand.push_back(std::make_pair(d2, i)); }
+            }
+            const uint32_t streamed = (uint32_t)s_cand.size();
+
+            uint32_t nUp = streamed;
+            if (nUp > kMaxPointLights) {
+                std::nth_element(s_cand.begin(), s_cand.begin() + kMaxPointLights, s_cand.end(),
+                                 [](const std::pair<float, uint32_t>& a, const std::pair<float, uint32_t>& b) {
+                                     return a.first < b.first;
+                                 });
+                nUp = kMaxPointLights;
+            }
+
+            if (g_live.pDistLightCbv) {
+                float* lc = (float*)g_live.pDistLightCbv->pCpuMappedAddress;
+                if (g_drawDistLights) {
+                    // reachK matches the near path so baked + live lights fade identically at the handoff.
+                    const float reachK = g_shadowRangeK * std::min(std::max(g_lightReachFrac, 0.05f), 1.0f);
+                    lc[0] = (float)nUp; lc[1] = reachK; lc[2] = 0.0f; lc[3] = 0.0f;
+                    for (uint32_t k = 0; k < nUp; ++k) {
+                        const DlBakedLight& L = g_dlBakedLights[s_cand[k].second];
+                        const float R = L.radius;
+                        const float q = kMWLightQuadratic / std::max(R * R, 1.0f);   // ini QuadraticValue / R²
+                        float* e = lc + 4 + k * 12;
+                        e[0] = L.x - eye[0]; e[1] = L.y - eye[1]; e[2] = L.z - eye[2]; e[3] = R;   // posRad (cam-rel)
+                        // RAW LHDT diffuse (0..1), exactly like the near path's pl->diffuse; the frag's
+                        // 1/(c+q·d²) supplies the core = color/c brightness — no premultiply here.
+                        e[4] = L.r * (1.0f / 255.0f);
+                        e[5] = L.g * (1.0f / 255.0f);
+                        e[6] = L.b * (1.0f / 255.0f);
+                        e[7] = 0.0f;
+                        // MW ini-baked attenuation: c=0.36, l=0, q=3.25/R². Same coefficients the engine
+                        // gives the near lights → distant is byte-identical, no shader change.
+                        e[8] = kMWLightConstant; e[9] = 0.0f; e[10] = q; e[11] = 0.0f;   // k0,k1,k2 ; w=0
+                    }
+                } else {
+                    lc[0] = 0.0f;   // count 0 -> distant frag light loop is a no-op
+                    nUp = 0u;
+                }
+            }
+
+            static uint32_t s_lastStreamed = 0xFFFFFFFFu;
+            static int      s_throttle     = 0;
+            const uint32_t  delta = (s_lastStreamed == 0xFFFFFFFFu) ? 0xFFFFFFFFu
+                                  : (streamed > s_lastStreamed ? streamed - s_lastStreamed
+                                                               : s_lastStreamed - streamed);
+            if (delta >= 16u || (++s_throttle % 300) == 0) {
+                LOG::logline(">> [forge][dl] baked lights streamed: %u / %zu within %.0f of eye (uploaded %u)",
+                             streamed, g_dlBakedLights.size(), g_dlBakedLightStreamR, nUp);
+                s_lastStreamed = streamed;
+            }
+        }
+
         if (!g_staticsLiveOk) { return; }
         // nearViewRange (fd[51]) is a constant written by the primary path; read it for the near cutoff.
         const float* fd = (const float*)g_live.pFrameCbv->pCpuMappedAddress;
@@ -13699,10 +13874,15 @@ namespace ForgeRender {
         if (!g_dlExterior || !g_dlLiveInit || !g_landLoaded) { return; }
         cmdBeginDebugMarker(g_live.pCmd, 0.3f, 0.8f, 0.5f, "DISTANT LAND (live)");
 
+        // Phase C: bind the baked DISTANT light set for BOTH distant land + statics frags (falls back
+        // to the near set if the baked set failed to build). They loop these camera-relative lights.
+        DescriptorSet* distLightsSet = g_live.pPerLightsSetDist ? g_live.pPerLightsSetDist
+                                                                : g_live.pPerLightsSet;
+
         if (g_drawDLLand) {   // Phase 0 panel toggle
         cmdBindPipeline(g_live.pCmd, g_pLandPipeline);
         cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
-        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+        cmdBindDescriptorSet(g_live.pCmd, 0, distLightsSet);
         cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
         cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSet);
         for (uint32_t idx : g_liveLandVisible) {
@@ -13722,7 +13902,7 @@ namespace ForgeRender {
         if (g_drawDLStatics && g_staticsLiveOk && (gpuDraw || g_liveLastSubsets > 0)) {
             cmdBindPipeline(g_live.pCmd, dlPickStaticsPipeline(/*mirror*/false));
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
-            cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+            cmdBindDescriptorSet(g_live.pCmd, 0, distLightsSet);   // Phase C: baked distant lights
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
             cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSet);
             Buffer*  svbs[2]     = { g_pStaticsVB, gpuDraw ? g_live.pGpuInstOut : g_pStaticsInstRing };
