@@ -1505,7 +1505,12 @@ namespace {
     constexpr uint32_t kMaxSkinned = kSkinnedPerWindow * kMaxBatches;       // 256
 
     // GPU timestamp phases (the ~4ms gpu breakdown). Index = QueryDesc index in renderScene.
-    enum { kGpuPhasePrepass = 0, kGpuPhaseGtao, kGpuPhaseReflect, kGpuPhaseColor,
+    // kGpuPhasePostDepth: the post-depth compute container (between prepass and reflect). Despite
+    // the old "gtao" name it is NOT dominated by AO — it holds linearize (kGpuPhaseLinearize,
+    // always on, feeds water+AO), the GTAO horizon-search + blur (gated OFF at baseline → ~0), and
+    // the screen-space point-light SHADOW MASK (kGpuPhaseShadowMask), which is the real cost. Logs
+    // split it as postdepth=(lin + ao + mask) so ao = container-lin-mask reads its true (~0) value.
+    enum { kGpuPhasePrepass = 0, kGpuPhasePostDepth, kGpuPhaseReflect, kGpuPhaseColor,
            kGpuPhaseWater, kGpuPhaseResolve,
            kGpuPhaseCull,    // the 3-pass GPU statics cull compute (before prepass; was unwrapped)
            kGpuPhaseFrame,   // WHOLE command buffer GPU EXECUTION (beginCmd..resolve) — compare to the
@@ -4819,6 +4824,10 @@ namespace {
         uint32_t lastTexAlpha;       // packTexAlpha(texIndex, alphaRef, vColSource) at last sight
         uint32_t lastWorldFrame;     // g_renderFrame at last sight; 0 = no valid record
         uint8_t  lastMirror;         // worldMirrored at last sight
+        // Caster-index membership: this slot is in g_casterSlots. Set by refreshCasterRecord on
+        // first record, cleared ONLY by the compaction sweep that drops it (the two must stay in
+        // lockstep — a slot flagged in-list but absent from the vector would never be re-added).
+        bool     inCasterList;
         // P3 caching: has this part's world EVER moved (animated NPC/player opaque part, a door)?
         // A static (never moved) is a PERSISTENT caster (trusted even when unseen). A MOVER is
         // trusted only while freshly seen — a stale mover record is forgotten (lastWorldFrame→0) so
@@ -4851,6 +4860,24 @@ namespace {
     HostMesh* g_meshes   = nullptr;
     uint32_t  g_meshCap  = 0;   // allocated slot count
     uint32_t  g_meshHigh = 0;   // highest slot+1 ever populated
+    // CASTER INDEX: the slots that hold a caster record (valid && lastWorldFrame != 0). The shadow
+    // manager's per-frame sweeps used to scan 0..g_meshHigh — but g_meshHigh is a monotonic
+    // high-water mark inflated by SKINNED slot churn (~1.3 new slots/frame even with the camera
+    // parked; 12k→27k in one session), while the sweeps only ever want STATIC casters and skip
+    // skinned wholesale. So the scans grew without bound to find the same statics, and setup cost
+    // scaled as (3 + dirtySlots) x g_meshHigh — climbing with BOTH session time and camera motion.
+    // Iterating this index instead makes them scale with real casters and immune to that churn.
+    // refreshCasterRecord (the ONLY writer of lastWorldFrame != 0) appends, so the index is a
+    // SUPERSET of live casters; every consumer keeps its own filters, so behaviour is identical.
+    //
+    // KEPT SORTED ASCENDING — this is load-bearing, not tidiness. The scans it replaced were
+    // CONTIGUOUS over g_meshes, so the hardware prefetcher streamed them and a cheap early-out
+    // filter cost almost nothing per slot. Appending in DRAW order gave a scattered index whose
+    // random HostMesh accesses (struct is ~250B, spanning several cache lines) cost MORE than the
+    // iterations saved — measured 1.5ms -> 2.3ms, i.e. 2.65x less work but 48% SLOWER. Ascending
+    // order restores sequential-with-gaps walking of g_meshes and keeps the prefetcher working.
+    std::vector<uint32_t> g_casterSlots;
+    bool                  g_casterSlotsUnsorted = false;   // an append happened → re-sort at compaction
     uint32_t  g_renderFrame = 0;   // monotonic, ++ per renderScene; drives the dynamic-promote streak
     uint32_t  g_dynamicCount = 0;  // meshes currently in the upload-heap ring (should stay tiny)
     // Split the host render cost into CPU command-recording (the per-draw bind+draw loop) vs
@@ -4947,6 +4974,14 @@ namespace {
         shm.lastTexAlpha   = texAlphaPacked;
         shm.lastMirror     = worldMirrored(world) ? 1 : 0;
         shm.lastWorldFrame = g_renderFrame;
+        // This is the only place lastWorldFrame becomes non-zero, so it is the only place the
+        // caster index can gain a member. Dedup on the flag (a slot is refreshed every frame it
+        // is drawn); the compaction sweep is what removes + clears the flag.
+        if (!shm.inCasterList) {
+            shm.inCasterList = true;
+            g_casterSlots.push_back(slot);       // appended out of order (draw order)…
+            g_casterSlotsUnsorted = true;        // …so the compaction sweep re-sorts. See g_casterSlots.
+        }
         shm.emissiveHot    = emissiveHot;
         shm.alphaCaster    = alphaCaster;
         shm.isLive         = isLive;
@@ -4997,6 +5032,66 @@ namespace {
     // when the next frame reached the tail (MW's inter-frame window shorter than the build).
     double    g_lastHizGpuMs = 0.0;
     unsigned  g_hizOverruns  = 0;
+    // Skinned-loop record probe: splits the per-part CPU cost of the skinned colour loop into
+    // data-prep (palette + instance memcpy — reads the IPC blob, so page-faults under memory
+    // pressure surface HERE) vs command-recording (bindVB/IB + draw — the ONLY part a skinned
+    // mega-VB/bind-once would remove). Settles whether the dense-city skin=4.5ms is memcpy/fault
+    // or per-draw recording, since lockstep rules out any GPU-buffer stall (record is timed before
+    // submit/fence). Set each frame in the skinned loop; logged in the heartbeat.
+    double    g_lastSkinPrepMs = 0.0;
+    double    g_lastSkinRecMs  = 0.0;
+    // Outlier detection — the DECISIVE bit. Same 256 parts cost 0.03ms idle vs 4.5ms loaded, so the
+    // shape of the distribution names the cause: max ≈ mean (uniformly slow) = CPU contention /
+    // cache misses (the async split means MW's scene 0 + MWSE anim blending run DURING host record,
+    // so the record thread is preempted) ⇒ fix is NOT in this loop. One huge max = a single stall
+    // (driver alloc / fault) ⇒ hunt that. maxSlot identifies the offending part.
+    double    g_lastSkinMaxPartMs = 0.0;
+    uint32_t  g_lastSkinMaxSlot   = 0;
+    uint32_t  g_lastSkinPipeSwitches = 0;   // mirror flips (each also forces a window rebind)
+    // SETUP split (breaks down g_lastSetupMs = tEntry..tCull0, a ~1400-line bucket whose comment
+    // claims "per-draw memcpy"). Prime suspect = the shadow manager's caster GATHER: for EVERY
+    // dirty shadow slot it linearly scans ALL g_meshHigh slots doing per-mesh matrix math, so cost
+    // = dirty × meshHigh. meshHigh is monotonic churn (12k→27k in one stationary session) and
+    // movement/rotation dirties more slots ⇒ setup climbs with BOTH time and motion. gatherIters
+    // is the raw iteration count — the number that should be ~casters, not ~meshHigh.
+    // shadowMgr sub-buckets. shadowMgr is ~1.5-2.3ms yet its gather is only ~0.2ms and it stays
+    // ~1.8ms at dirty=0 — so the bulk is in these unmeasured blocks, NOT the caster gather.
+    // Measure before optimizing (the gather looked like the villain and was a rounding error).
+    enum { kSetupBlkExpiry = 0,   // mover-expiry + caster-index compaction sweep
+           kSetupBlkSkinned,      // skinned caster prewalk (per-part, nested bone loops)
+           kSetupBlkMM,           // multimap caster prewalk
+           kSetupBlkFixture,      // emissive-fixture origin gather
+           kSetupBlkLights,       // per-light classify (fixture test / lantern / id match)
+           kSetupBlkSlots,        // slot own/evict/assign + activation
+           kSetupBlkMovers,       // rigid-mover scan (matrix math + nested active-slot loop)
+           kSetupBlkPack,         // dirty-slot caster gather + matrix packing + render jobs
+           // pack sub-buckets (pack is ~90% of shadowMgr; gather is only ~0.2ms of it, so the
+           // rest is here). fill = the per-caster matrix/instance write into the persistent-mapped
+           // CPU_TO_GPU (write-combined) shadow buffers — scattered 4-byte WC writes are the
+           // suspect, but measure before believing it.
+           kSetupBlkPackCap,      // nth_element down to kShadowMaxCasters
+           kSetupBlkPackSort,     // per-job caster sort (twoSided/mirror/slot)
+           kSetupBlkPackFill,     // matrix + instance-lane writes into the WC buffers
+           kSetupBlkPackJob,      // 6 face CBVs + job push
+           // The [p3-shadow]/[p3-slot] diagnostic logging, which lives INSIDE the manager and fires
+           // "on any render frame" — i.e. every frame the camera moves enough to dirty slots.
+           // LOG::logline flushes, so this is file I/O on the render path.
+           kSetupBlkLog,
+           kSetupBlkDyn,          // C4b dyn-tile face-CBV rebuild (6 faces x every dyn-flagged slot)
+           kSetupBlkCount };
+    double    g_setupBlkMs[kSetupBlkCount]     = {};   // accumulator (reset each frame)
+    double    g_lastSetupBlkMs[kSetupBlkCount] = {};   // last frame's snapshot (logged)
+    static const char* kSetupBlkName[kSetupBlkCount] = {
+        "expiry", "skin", "mm", "fixture", "lights", "slots", "movers", "pack",
+        "pk.cap", "pk.sort", "pk.fill", "pk.job", "LOG", "dyn"
+    };
+    double    g_lastSetupCasterRefreshMs = 0.0;
+    double    g_lastSetupShadowMgrMs     = 0.0;
+    double    g_lastSetupGatherMs        = 0.0;
+    uint64_t  g_lastSetupGatherIters     = 0;
+    uint32_t  g_lastSetupGatherSlots     = 0;   // dirty slots that ran a gather this frame
+    uint32_t  g_lastSetupGatherKept      = 0;   // casters actually kept (the useful yield)
+    double    g_lastSetupDrawMemcpyMs    = 0.0;
     // Occlusion M2: the pyramid's camera, snapshotted at prologue submit (the frame whose depth
     // the pyramid holds). g_hizVP = that frame's RAW rzViewProj bytes (relative world -> clip,
     // exactly what statics.vert projected with); g_hizEye = its absolute eye (gFrameData.lodEye).
@@ -5843,14 +5938,16 @@ namespace {
                 "DL land %u | DL statics %u inst / %u subsets\n"
                 "water levels %u\n"
                 "host %.2f ms = setup %.2f + cull %.2f + rec %.2f + gpu %.2f + post %.2f\n"
-                "gpu: prepass %.2f gtao %.2f (lin %.2f mask %.2f) reflect %.2f color %.2f water %.2f resolve %.2f",
+                "gpu: prepass %.2f postdepth %.2f (lin %.2f ao %.2f mask %.2f) reflect %.2f color %.2f water %.2f resolve %.2f",
                 g_lastDrawn, g_lastSkinnedDrawn, g_lastMultiMapDrawn,
                 g_lastSkyDrawn, g_lastReflSkyDrawn, g_lastLightCount, g_lastAlphaDrawn,
                 g_liveLastLand, g_liveLastInst, g_liveLastSubsets,
                 g_lastWaterLevels,
                 g_lastTotalMs, g_lastSetupMs, g_lastCullMs, g_lastRecMs, g_lastGpuMs, g_lastPostMs,
-                g_lastGpuPhaseMs[kGpuPhasePrepass], g_lastGpuPhaseMs[kGpuPhaseGtao],
-                g_lastGpuPhaseMs[kGpuPhaseLinearize], g_lastGpuPhaseMs[kGpuPhaseShadowMask],
+                g_lastGpuPhaseMs[kGpuPhasePrepass], g_lastGpuPhaseMs[kGpuPhasePostDepth],
+                g_lastGpuPhaseMs[kGpuPhaseLinearize],
+                g_lastGpuPhaseMs[kGpuPhasePostDepth] - g_lastGpuPhaseMs[kGpuPhaseLinearize] - g_lastGpuPhaseMs[kGpuPhaseShadowMask],
+                g_lastGpuPhaseMs[kGpuPhaseShadowMask],
                 g_lastGpuPhaseMs[kGpuPhaseReflect], g_lastGpuPhaseMs[kGpuPhaseColor],
                 g_lastGpuPhaseMs[kGpuPhaseWater], g_lastGpuPhaseMs[kGpuPhaseResolve]);
 
@@ -5945,6 +6042,7 @@ namespace {
         g_meshes   = nullptr;
         g_meshCap  = 0;
         g_meshHigh = 0;
+        g_casterSlots.clear();   // indices into the array we just freed
     }
 
     // Clustered forward lighting: create the froxel light-mask buffer, the per-frame FroxelParams
@@ -6422,7 +6520,9 @@ namespace ForgeRender {
                     g_meshes[s2].lastWorldFrame = 0;
                     g_meshes[s2].everMoved      = false;
                     g_meshes[s2].lastMoveFrame  = 0;
+                    g_meshes[s2].inCasterList   = false;   // index rebuilds from this frame's records
                 }
+                g_casterSlots.clear();
                 g_casterEpoch = g_renderFrame;
             }
             // C2: lighting[28..31] = skyZenith.rgb (current interpolated zenith sky colour). Host dome
@@ -6612,6 +6712,7 @@ namespace ForgeRender {
         // held weapon) packs the same-frame transform its skinned arm's prepass uses, so the two
         // halves of a punch shadow stay attached. (Was fused into the worlds-upload loop below,
         // which runs after the manager — records lagged one frame.)
+        const double tCasterRefresh0 = hostNowMs();
         for (uint32_t i = 0; i < count; ++i) {
             const float* em = items[i].matEmissive;
             const float emMax = em[0] > em[1] ? (em[0] > em[2] ? em[0] : em[2])
@@ -6623,6 +6724,13 @@ namespace ForgeRender {
                                 (items[i].casterFlags & IPC::kDrawCasterLive) != 0,
                                 (items[i].casterFlags & IPC::kDrawCasterAnimated) != 0);
         }
+        const double tShadowMgr0 = hostNowMs();
+        g_lastSetupCasterRefreshMs = tShadowMgr0 - tCasterRefresh0;
+        for (uint32_t b = 0; b < kSetupBlkCount; ++b) { g_setupBlkMs[b] = 0.0; }
+        g_lastSetupGatherMs    = 0.0;   // accumulated by the per-dirty-slot gather below
+        g_lastSetupGatherIters = 0;
+        g_lastSetupGatherSlots = 0;
+        g_lastSetupGatherKept  = 0;
 
         // --- P3 shadow manager: 16-slot cache + budget-limited re-render, keyed by the P2 light
         // id (color.w). Each slot OWNS a light across frames; its atlas face-block is CACHED and
@@ -6651,30 +6759,58 @@ namespace ForgeRender {
             // animated part — 1st-person player, off-screen NPC) so it stops casting a frozen
             // shadow; forgetting scatter-dirties only the slots holding its stale shadow so they
             // re-render and drop it. Statics are never everMoved → never forgotten (persistent).
-            if (g_shadowExpireMovers) {
-                for (uint32_t s2 = 0; s2 < g_meshHigh; ++s2) {
+            //
+            // This sweep also doubles as the caster index's ONLY remover, so it walks g_casterSlots
+            // (not 0..g_meshHigh) and always runs — the expiry decision itself stays gated on
+            // g_shadowExpireMovers and is semantically unchanged. It rebuilds the vector in place
+            // (write-head idiom), dropping any entry whose record died (expired here, slot freed, or
+            // re-uploaded — lastWorldFrame is reset to 0 in those paths) and clearing inCasterList in
+            // lockstep so refreshCasterRecord re-adds the slot on its next sighting. Dropping a
+            // valid-but-record-less slot is safe: a persistent static keeps a non-zero lastWorldFrame
+            // even while unseen, so only genuinely record-less slots leave the index.
+            const double tBlkExpiry0 = hostNowMs();
+            {
+                size_t w = 0;
+                for (size_t r = 0; r < g_casterSlots.size(); ++r) {
+                    const uint32_t s2 = g_casterSlots[r];
                     HostMesh& hm = g_meshes[s2];
-                    if (!hm.everMoved || hm.lastWorldFrame == 0) { continue; }
-                    if (frame - hm.lastWorldFrame <= kMoverFresh) { continue; }   // still freshly seen
                     // C4b settle-detection: only forget a record that was STILL MOVING just before it
                     // left the drawn set. A come-to-rest object (sat still ≥ kCasterSettleFrames while
                     // visible) keeps its shadow at its resting spot — fixes the havok-settled bottle
                     // that trips everMoved once and then vanished at distance. A genuine mover (moved
                     // within the window of its last sighting) still expires so it can't cast a frozen
                     // shadow while hidden.
-                    if (hm.lastWorldFrame - hm.lastMoveFrame > kCasterSettleFrames) { continue; }   // at rest → keep
-                    const float* ow = hm.lastWorld;   // ABSOLUTE resting/last-seen transform
-                    const float cx = hm.localCenter[0]*ow[0] + hm.localCenter[1]*ow[4] + hm.localCenter[2]*ow[8]  + ow[12];
-                    const float cy = hm.localCenter[0]*ow[1] + hm.localCenter[1]*ow[5] + hm.localCenter[2]*ow[9]  + ow[13];
-                    const float cz = hm.localCenter[0]*ow[2] + hm.localCenter[1]*ow[6] + hm.localCenter[2]*ow[10] + ow[14];
-                    const float es0 = ow[0]*ow[0]+ow[1]*ow[1]+ow[2]*ow[2];
-                    const float es1 = ow[4]*ow[4]+ow[5]*ow[5]+ow[6]*ow[6];
-                    const float es2 = ow[8]*ow[8]+ow[9]*ow[9]+ow[10]*ow[10];
-                    float esMax = es0 > es1 ? es0 : es1; if (es2 > esMax) { esMax = es2; }
-                    hm.lastWorldFrame = 0;
-                    markSlotsDirtyNear(cx, cy, cz, hm.localRadius * std::sqrt(esMax));
+                    const bool expire = g_shadowExpireMovers
+                                     && hm.everMoved && hm.lastWorldFrame != 0
+                                     && (frame - hm.lastWorldFrame > kMoverFresh)          // gone stale
+                                     && (hm.lastWorldFrame - hm.lastMoveFrame <= kCasterSettleFrames);
+                    if (expire) {
+                        const float* ow = hm.lastWorld;   // ABSOLUTE resting/last-seen transform
+                        const float cx = hm.localCenter[0]*ow[0] + hm.localCenter[1]*ow[4] + hm.localCenter[2]*ow[8]  + ow[12];
+                        const float cy = hm.localCenter[0]*ow[1] + hm.localCenter[1]*ow[5] + hm.localCenter[2]*ow[9]  + ow[13];
+                        const float cz = hm.localCenter[0]*ow[2] + hm.localCenter[1]*ow[6] + hm.localCenter[2]*ow[10] + ow[14];
+                        const float es0 = ow[0]*ow[0]+ow[1]*ow[1]+ow[2]*ow[2];
+                        const float es1 = ow[4]*ow[4]+ow[5]*ow[5]+ow[6]*ow[6];
+                        const float es2 = ow[8]*ow[8]+ow[9]*ow[9]+ow[10]*ow[10];
+                        float esMax = es0 > es1 ? es0 : es1; if (es2 > esMax) { esMax = es2; }
+                        hm.lastWorldFrame = 0;
+                        markSlotsDirtyNear(cx, cy, cz, hm.localRadius * std::sqrt(esMax));
+                    }
+                    if (!hm.valid || hm.lastWorldFrame == 0) {
+                        hm.inCasterList = false;   // record died → leave the index (re-added on sighting)
+                        continue;
+                    }
+                    g_casterSlots[w++] = s2;
+                }
+                g_casterSlots.resize(w);
+                // Compaction preserves relative order, so only fresh appends can break the sort.
+                // Steady state adds nothing → no sort; panning adds a few → one cheap sort.
+                if (g_casterSlotsUnsorted) {
+                    std::sort(g_casterSlots.begin(), g_casterSlots.end());
+                    g_casterSlotsUnsorted = false;
                 }
             }
+            g_setupBlkMs[kSetupBlkExpiry] += hostNowMs() - tBlkExpiry0;
 
             // C3a: any change to the blend-caster controls (checkbox OR the alpha-ref knob) must
             // reflect in already-cached shadows — alpha-origin records are persistent statics, so
@@ -6687,7 +6823,9 @@ namespace ForgeRender {
             if (s_prevBlendCasters != g_shadowBlendCasters || s_prevBlendRef != g_shadowBlendRef) {
                 s_prevBlendCasters = g_shadowBlendCasters;
                 s_prevBlendRef     = g_shadowBlendRef;
-                for (uint32_t s2 = 0; s2 < g_meshHigh; ++s2) {
+                // Index-driven: only recorded slots can be alpha casters. The records zeroed here
+                // leave the index at the next compaction sweep (which clears inCasterList).
+                for (uint32_t s2 : g_casterSlots) {
                     HostMesh& hm = g_meshes[s2];
                     if (hm.alphaCaster && hm.lastWorldFrame != 0) {
                         hm.lastWorldFrame = 0;
@@ -6729,6 +6867,7 @@ namespace ForgeRender {
             // prepass, so index i == the firstInstance it assigns. Bone translations are camera-
             // relative (= shadow face-VP space); bound each part by their centroid + spread + a slop
             // for limb/vertex extent. A slot with a skinned part in reach is forced to re-render.
+            const double tBlkSkin0 = hostNowMs();
             g_skinnedCasters.clear();
             if (g_shadowSkinnedCasters && skinnedBlob && skinnedCount && skinnedBytes) {
                 const uint8_t* sp   = (const uint8_t*)skinnedBlob;
@@ -6770,6 +6909,8 @@ namespace ForgeRender {
                     ++idx;
                 }
             }
+            g_setupBlkMs[kSetupBlkSkinned] += hostNowMs() - tBlkSkin0;
+            const double tBlkMM0 = hostNowMs();
 
             // Multimap shadow casters: pre-walk the MM blob in the SAME order + skip logic as the
             // MM Z-prepass so index i reuses the resident pMMWorldsBuf/pInstanceBufMM slot i. The
@@ -6815,9 +6956,13 @@ namespace ForgeRender {
             // window PLANE, whose centroid is offset well outside that box — a loose sphere/AABB
             // overlap would wrongly catch the big plane (its bounds reach the light), so we match the
             // point-in-small-box the debug box visualises, not bounds intersection.
+            g_setupBlkMs[kSetupBlkMM] += hostNowMs() - tBlkMM0;
+            const double tBlkFixture0 = hostNowMs();
             static std::vector<std::array<float, 3>> emissiveOrigins; emissiveOrigins.clear();
             if (g_shadowFixtureGate) {
-                for (uint32_t slot = 0; slot < g_meshHigh; ++slot) {
+                // Index-driven (was 0..g_meshHigh): an emissive fixture must hold a record to matter
+                // here, and every recorded slot is in the index. Filters below are unchanged.
+                for (uint32_t slot : g_casterSlots) {
                     const HostMesh& hm = g_meshes[slot];
                     if (!hm.valid || !hm.emissiveHot || hm.lastWorldFrame == 0) { continue; }
                     const float* w = hm.lastWorld;
@@ -6828,6 +6973,8 @@ namespace ForgeRender {
                 }
             }
 
+            g_setupBlkMs[kSetupBlkFixture] += hostNowMs() - tBlkFixture0;
+            const double tBlkLights0 = hostNowMs();
             // (1) Parse this frame's shadow-eligible lights (id-carrying, r>1). imp = the P1
             // screen-coverage proxy r/max(dist,r) (the contribution metric hopped slots → reverted).
             struct LightInfo { uint32_t idx, id, flags; float pos[3], radius, imp, intensity; };
@@ -6913,6 +7060,8 @@ namespace ForgeRender {
                                   ? std::min(1.0f, std::max(0.0f, (g_flickWind - g_flickWindFloor) / windSpan))
                                   : 0.0f;
 
+            g_setupBlkMs[kSetupBlkLights] += hostNowMs() - tBlkLights0;
+            const double tBlkSlots0 = hostNowMs();
             // (2) Clear the per-frame active flag. NO time-based eviction: a valid slot keeps its
             // cached tile even while its light is absent (camera turned away / frustum-culled), so
             // turning back reactivates it instantly from cache — no re-render pop. Slots are only
@@ -7122,8 +7271,12 @@ namespace ForgeRender {
             // the POOL TAIL — matrices are slot-independent, so every slot/face draw shares it
             // via firstInstance = matIdx, and the static packing wall below shrinks by the
             // caster count.
+            g_setupBlkMs[kSetupBlkSlots] += hostNowMs() - tBlkSlots0;
+            const double tBlkMovers0 = hostNowMs();
             if (g_shadowRigidMovers) {
-                for (uint32_t slot = 0; slot < g_meshHigh; ++slot) {
+                // Index-driven (was 0..g_meshHigh, every frame, with per-mesh matrix math AND the
+                // nested active-slot loop below). Filters unchanged.
+                for (uint32_t slot : g_casterSlots) {
                     const HostMesh& hm = g_meshes[slot];
                     if (!hm.valid || hm.skinned || hm.multimap) { continue; }
                     if (hm.lastWorldFrame == 0 || frame - hm.lastWorldFrame > kMoverFresh) { continue; }
@@ -7194,6 +7347,8 @@ namespace ForgeRender {
                 }
             }
 
+            g_setupBlkMs[kSetupBlkMovers] += hostNowMs() - tBlkMovers0;
+            const double tBlkPack0 = hostNowMs();
             // (5)+(6) Collect DIRTY active slots (must-render first, then oldest stale), take up to
             // the per-frame budget, gather each one's casters into its GPU region, build its 6 face
             // CBVs, and record a render job. Standing still leaves this empty → shadow phase ≈ 0.
@@ -7296,6 +7451,16 @@ namespace ForgeRender {
             // re-renders split by cause — mustR = lastRenderFrame==0 (fresh assign / moved / evict),
             // staleR = epoch bump. Printed in the [p3-shadow] heartbeat so a camera rotation reveals
             // must-path (slot churn) vs stale-path (global epoch).
+            // Cached copy of the frame cbuffer for the face-CBV builds below (static jobs AND the
+            // per-frame dyn-tile rebuild). pFrameCbv is CPU_TO_GPU persistent-mapped = WRITE-
+            // COMBINED: writes stream fine but READS are uncached and unprefetched. Both face paths
+            // memcpy'd 512B FROM it per face — 6 faces x up to 32 dyn slots = ~192 WC reads/frame,
+            // and slot re-renders scale with camera motion, which is exactly why setup climbed with
+            // movement. Read it ONCE here into cached memory; the copies below are then cached->WC
+            // writes (the fast direction). Byte-identical: nothing writes pFrameCbv between here and
+            // the last consumer (the atlasDbg lanes are patched after, straight to the mapping).
+            alignas(16) uint8_t frameCbvCache[512];
+            std::memcpy(frameCbvCache, g_live.pFrameCbv->pCpuMappedAddress, 512);
             uint32_t nMustR = 0, nStaleR = 0;
             // C4b lever 1 — pack dirty slots (priority order) into the 1024-matrix caster pool by
             // prefix sum of each slot's ACTUAL gather size, instead of 4 flat kShadowMaxCasters
@@ -7322,7 +7487,12 @@ namespace ForgeRender {
                 struct GatherC { float d2; uint32_t slot; uint8_t mirror; uint8_t twoSided; };
                 static std::vector<GatherC> gc; gc.clear();
                 float minEncl = 2.0f;   // deepest enclosure by a small caster (dist/radius); 2 = none
-                for (uint32_t slot = 0; slot < g_meshHigh; ++slot) {
+                const double tGather0 = hostNowMs();
+                g_lastSetupGatherIters += (uint64_t)g_casterSlots.size();   // was g_meshHigh
+                ++g_lastSetupGatherSlots;
+                // Index-driven (was 0..g_meshHigh per dirty slot — the dirty x meshHigh term).
+                // Filters unchanged, so the kept set is identical.
+                for (uint32_t slot : g_casterSlots) {
                     const HostMesh& hm = g_meshes[slot];
                     if (!hm.valid || hm.skinned || hm.multimap) { continue; }
                     // Persistent within a cell: once a static has been seen ONCE it stays a caster
@@ -7372,6 +7542,8 @@ namespace ForgeRender {
                     }
                     gc.push_back({ d2, slot, hm.lastMirror, twoSided });
                 }
+                g_lastSetupGatherMs += hostNowMs() - tGather0;
+                g_lastSetupGatherKept += (uint32_t)gc.size();
                 // LANTERN category: the light hangs DEEP inside one of its own casters — a shade around
                 // the flame. Diffused = soft shadows + a low-res tile. A candle/torch sits at the RIM of
                 // its own mesh's bound (its flame is on top of the wax/haft), so it stays crisp.
@@ -7381,11 +7553,13 @@ namespace ForgeRender {
                 // global. Re-derived each render; lantEncl is the tuning read.
                 sl.lantEncl  = minEncl;
                 sl.isLantern = (minEncl <= g_shadowLanternEnclose);
+                const double tPkCap0 = hostNowMs();
                 if (gc.size() > kShadowMaxCasters) {
                     std::nth_element(gc.begin(), gc.begin() + kShadowMaxCasters, gc.end(),
                                      [](const GatherC& a, const GatherC& b) { return a.d2 < b.d2; });
                     gc.resize(kShadowMaxCasters);
                 }
+                g_setupBlkMs[kSetupBlkPackCap] += hostNowMs() - tPkCap0;
                 // Prefix-sum fit check: skip (not stop) so smaller dirty slots behind a fat one
                 // still land this frame. The skipped slot keeps lastRenderFrame → retried next
                 // frame. C4c: the pool TAIL is reserved for this frame's dyn-mover matrices.
@@ -7410,6 +7584,7 @@ namespace ForgeRender {
                     shadowSlotBlock(s, gx, gy, gs);          // reads the faceShift just set
                     sl.faceUvScale = shadowFaceUvScale(gs);
                 }
+                const double tPkSort0 = hostNowMs();
                 const uint32_t regionBase = usedMats;   // GPU world/instance region for this job
                 const uint32_t begin = (uint32_t)g_shadowCasters.size();
                 for (const GatherC& g2 : gc) { g_shadowCasters.push_back({ g2.slot, g2.mirror, g2.twoSided }); }
@@ -7421,6 +7596,8 @@ namespace ForgeRender {
                               if (a.mirror != b.mirror) { return a.mirror < b.mirror; }
                               return a.slot < b.slot;
                           });
+                g_setupBlkMs[kSetupBlkPackSort] += hostNowMs() - tPkSort0;
+                const double tPkFill0 = hostNowMs();
                 // Fill this job's GPU region (CAMERA-RELATIVE worlds; instance DrawIndex is preset).
                 for (uint32_t k = begin; k < end; ++k) {
                     const HostMesh& hm = g_meshes[g_shadowCasters[k].slot];
@@ -7443,6 +7620,8 @@ namespace ForgeRender {
                     ((float*)sins)[g * kStaticInstU32 + 9]  = owner;
                     ((float*)sins)[g * kStaticInstU32 + 10] = 0.0f;
                 }
+                g_setupBlkMs[kSetupBlkPackFill] += hostNowMs() - tPkFill0;
+                const double tPkJob0 = hostNowMs();
                 // 6 face CBVs for this slot at base s*6 (C4b: indexed BY SLOT, not by job, so a
                 // dyn-only job for the same slot shares them). Light pos CAMERA-RELATIVE = abs − eye.
                 const float lightRel[3] = { sl.absPos[0] - g_eyeAbsShadow[0],
@@ -7452,7 +7631,7 @@ namespace ForgeRender {
                 const float farZ  = (reach > nearZ + 1.0f) ? reach : nearZ + 1.0f;
                 for (uint32_t f = 0; f < 6; ++f) {
                     uint8_t* fc = (uint8_t*)g_live.pShadowFaceCbv[s * 6 + f]->pCpuMappedAddress;
-                    std::memcpy(fc, g_live.pFrameCbv->pCpuMappedAddress, 512);
+                    std::memcpy(fc, frameCbvCache, 512);   // cached src (see frameCbvCache)
                     float faceVP[16];
                     buildShadowFaceVP(lightRel, f, nearZ, farZ, faceVP, sl.faceUvScale);
                     std::memcpy(fc, faceVP, 16 * sizeof(float));
@@ -7465,6 +7644,7 @@ namespace ForgeRender {
                 if (wasMust) { ++nMustR; } else { ++nStaleR; }   // diag
                 g_shadowRenders.push_back({ s, begin, end, regionBase });
                 usedMats += end - begin;
+                g_setupBlkMs[kSetupBlkPackJob] += hostNowMs() - tPkJob0;
             }
             const uint32_t nRender = (uint32_t)g_shadowRenders.size();
 
@@ -7474,6 +7654,7 @@ namespace ForgeRender {
             // Gated on a rendered static tile (lastRenderFrame != 0 — matches the activeBits gate
             // below, so the mask never reads an undefined slot). A slot NOT statically rendered
             // this frame still needs CURRENT camera-relative face VPs (the camera moved).
+            const double tBlkDyn0 = hostNowMs();
             uint32_t dynBits = 0;
             for (uint32_t s = 0; s < kMaxShadowLights; ++s) {
                 ShadowSlot& sl = g_shadowSlots[s];
@@ -7488,7 +7669,7 @@ namespace ForgeRender {
                     const float farZ  = (reach > nearZ + 1.0f) ? reach : nearZ + 1.0f;
                     for (uint32_t f = 0; f < 6; ++f) {
                         uint8_t* fc = (uint8_t*)g_live.pShadowFaceCbv[s * 6 + f]->pCpuMappedAddress;
-                        std::memcpy(fc, g_live.pFrameCbv->pCpuMappedAddress, 512);
+                        std::memcpy(fc, frameCbvCache, 512);   // cached src (see frameCbvCache)
                         float faceVP[16];
                         // The dyn tile shares the static tile's block AND its frustum — same uvScale, or
                         // the two would disagree about where a face's texels land and the composite max()
@@ -7502,6 +7683,7 @@ namespace ForgeRender {
                 g_shadowRendersDyn.push_back(s);
                 dynBits |= (1u << s);
             }
+            g_setupBlkMs[kSetupBlkDyn] += hostNowMs() - tBlkDyn0;
 
             // (7) Mask params + forward patch for EVERY active slot (whether re-rendered or cached).
             // Gate on lastRenderFrame != 0: a slot assigned this frame but not yet rendered (budget
@@ -7615,6 +7797,7 @@ namespace ForgeRender {
             // Manager heartbeat (verify gate): active slots / this-frame renders / valid+active
             // bitmask / caster count. Log a line on any render frame (≤10 apart) + a 240-frame beat
             // → "renders=0 standing still" and "active>1 = multi-shadow" are both visible.
+            const double tBlkLog0 = hostNowMs();
             {
                 uint32_t nActive = 0, nValid = 0, nFlk = 0, nPul = 0, nStdy = 0;
                 uint32_t nLant = 0, nLowRes = 0;   // lantern slots / of those, tiles actually baked low-res
@@ -7678,7 +7861,12 @@ namespace ForgeRender {
                     }
                 }
             }
+            g_setupBlkMs[kSetupBlkLog]  += hostNowMs() - tBlkLog0;
+            g_setupBlkMs[kSetupBlkPack] += hostNowMs() - tBlkPack0;
         }
+        const double tDrawMemcpy0 = hostNowMs();
+        g_lastSetupShadowMgrMs = tDrawMemcpy0 - tShadowMgr0;
+        for (uint32_t b = 0; b < kSetupBlkCount; ++b) { g_lastSetupBlkMs[b] = g_setupBlkMs[b]; }
         for (uint32_t i = 0; i < count; ++i) {
             const uint32_t batch = i / kBatchSize;
             const uint32_t local = i % kBatchSize;
@@ -7712,6 +7900,7 @@ namespace ForgeRender {
         // The recorded draws (dlLiveRecord) go in after the near colour pass. rzViewProj is the
         // relative, reverse-Z, extended-far matrix already in gFrameData.
         const double tCull0 = hostNowMs();   // end of per-draw setup, start of the DL cull
+        g_lastSetupDrawMemcpyMs = tCull0 - tDrawMemcpy0;
         dlLiveCullAndBuild(R, rzViewProj);
         // WV2 perf: hoist the reflect-geo CPU cull off the record phase — run it here (pre-beginCmd, like
         // the main cull; counts in the `cull` metric, not `record`). Fills the reflection rings + writes
@@ -8576,7 +8765,7 @@ namespace ForgeRender {
             cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
         }
         gpuPhaseEnd(kGpuPhaseShadow);
-        gpuPhaseBegin(kGpuPhaseGtao);
+        gpuPhaseBegin(kGpuPhasePostDepth);
         // ===================== TIER 2: LINEARIZE + GTAO COMPUTE =====================
         // First compute work in the host. Sits between the depth-complete prepass and the colour
         // pass: resolve pDepth (sample 0, MSAA-robust) -> single-sample pLinearDepth, then GTAO
@@ -8758,7 +8947,7 @@ namespace ForgeRender {
             gpuPhaseEnd(kGpuPhaseShadowMask);
         }
 
-        gpuPhaseEnd(kGpuPhaseGtao);
+        gpuPhaseEnd(kGpuPhasePostDepth);
         gpuPhaseBegin(kGpuPhaseReflect);
         // ===================== WT2: REFLECTION PASS (sky-only, Stage 1) =====================
         // Render the mirrored scene into pReflectColor (1024²) BEFORE the main colour pass, so the
@@ -9178,6 +9367,9 @@ namespace ForgeRender {
             uint32_t boundWindow = UINT32_MAX;
             int      boundSkinMirror = 0;
             bool     dropLogged = false;
+            double   skinPrepMs = 0.0, skinRecMs = 0.0;   // record probe (see g_lastSkinPrepMs)
+            double   skinMaxPartMs = 0.0;
+            uint32_t skinMaxSlot = 0, skinPipeSwitches = 0;
             for (uint32_t k = 0; k < skinnedCount; ++k) {
                 if (sp + sizeof(IPC::SkinnedDrawWire) > sEnd) {
                     break;
@@ -9208,6 +9400,7 @@ namespace ForgeRender {
                     continue;   // mesh not uploaded yet / not a skinned mesh
                 }
 
+                const double tPrep0 = hostNowMs();
                 const uint32_t window = skinnedDrawn / kSkinnedPerWindow;
                 const uint32_t base   = (skinnedDrawn % kSkinnedPerWindow) * kMaxBonesPerPart;
                 uint8_t* dst = (uint8_t*)g_live.pBonesBuf[window]->pCpuMappedAddress;
@@ -9216,13 +9409,16 @@ namespace ForgeRender {
                 uint32_t* sinst = (uint32_t*)g_live.pInstanceBufSkin->pCpuMappedAddress;
                 sinst[skinnedDrawn * 2 + 0] = base;
                 sinst[skinnedDrawn * 2 + 1] = packTexAlpha(item.texIndex, item.alphaRef, 0u, item.clampMode);
+                skinPrepMs += hostNowMs() - tPrep0;
 
+                const double tRec0s = hostNowMs();
                 const int mirror = item.mirror ? 1 : 0;
                 if (mirror != boundSkinMirror) {
                     cmdBindPipeline(g_live.pCmd, mirror ? g_live.pSkinnedPipelineMirror
                                                         : g_live.pSkinnedPipeline);
                     boundSkinMirror = mirror;
                     boundWindow = UINT32_MAX;
+                    ++skinPipeSwitches;
                 }
                 if (window != boundWindow) {
                     cmdBindDescriptorSet(g_live.pCmd, window, g_live.pPerBatchSetSkin);
@@ -9235,8 +9431,16 @@ namespace ForgeRender {
                 cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
                 cmdBindIndexBuffer(g_live.pCmd, sm.ib, INDEX_TYPE_UINT16, 0);
                 cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, skinnedDrawn);
+                skinRecMs += hostNowMs() - tRec0s;
+                const double partMs = hostNowMs() - tPrep0;   // prep + rec for THIS part
+                if (partMs > skinMaxPartMs) { skinMaxPartMs = partMs; skinMaxSlot = slot; }
                 ++skinnedDrawn;
             }
+            g_lastSkinPrepMs      = skinPrepMs;
+            g_lastSkinRecMs       = skinRecMs;
+            g_lastSkinMaxPartMs   = skinMaxPartMs;
+            g_lastSkinMaxSlot     = skinMaxSlot;
+            g_lastSkinPipeSwitches = skinPipeSwitches;
         }
 
         gpuPhaseEnd(kGpuPhaseColorSkin);
@@ -10399,11 +10603,11 @@ namespace ForgeRender {
             // commands. Same phase brackets as the gpu split; "other" = record − Frame bracket
             // (pre-phase barriers, query resolve, endCmd). shadow further split static vs dyn —
             // the dyn pass re-records 6 face passes per dyn-flagged slot EVERY frame.
-            LOG::logline(">> [forge-hb] rec split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f) gtao=%.2f reflect=%.2f color=%.2f (sky=%.2f near=%.2f skin=%.2f mm=%.2f dl=%.2f) water=%.2f glow=%.2f alpha=%.2f resolve=%.2f other=%.2f ms",
+            LOG::logline(">> [forge-hb] rec split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f) postdepth=%.2f reflect=%.2f color=%.2f (sky=%.2f near=%.2f skin=%.2f mm=%.2f dl=%.2f) water=%.2f glow=%.2f alpha=%.2f resolve=%.2f other=%.2f ms",
                          g_lastCpuPhaseMs[kGpuPhaseCull], g_lastCpuPhaseMs[kGpuPhasePrepass],
                          g_lastCpuPhaseMs[kGpuPhaseShadow],
                          g_lastCpuPhaseMs[kGpuPhaseShadowStatic], g_lastCpuPhaseMs[kGpuPhaseShadowDyn],
-                         g_lastCpuPhaseMs[kGpuPhaseGtao], g_lastCpuPhaseMs[kGpuPhaseReflect],
+                         g_lastCpuPhaseMs[kGpuPhasePostDepth], g_lastCpuPhaseMs[kGpuPhaseReflect],
                          g_lastCpuPhaseMs[kGpuPhaseColor],
                          g_lastCpuPhaseMs[kGpuPhaseColorSky], g_lastCpuPhaseMs[kGpuPhaseColorNear],
                          g_lastCpuPhaseMs[kGpuPhaseColorSkin], g_lastCpuPhaseMs[kGpuPhaseColorMM],
@@ -10412,13 +10616,15 @@ namespace ForgeRender {
                          g_lastCpuPhaseMs[kGpuPhaseColorAlpha],
                          g_lastCpuPhaseMs[kGpuPhaseResolve],
                          g_lastRecMs - g_lastCpuPhaseMs[kGpuPhaseFrame]);
-            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f) gtao=%.2f (lin=%.2f mask=%.2f) reflect=%.2f color=%.2f water=%.2f resolve=%.2f ms"
+            LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f) postdepth=%.2f (lin=%.2f ao=%.2f mask=%.2f) reflect=%.2f color=%.2f water=%.2f resolve=%.2f ms"
                          " | hiz=%.2f (prologue, overruns=%u) | shadowCasters=%u | nearTris=%.2fM atDraws=%u",
                          g_lastGpuPhaseMs[kGpuPhaseCull],
                          g_lastGpuPhaseMs[kGpuPhasePrepass], g_lastGpuPhaseMs[kGpuPhaseShadow],
                          g_lastGpuPhaseMs[kGpuPhaseShadowStatic], g_lastGpuPhaseMs[kGpuPhaseShadowDyn],
-                         g_lastGpuPhaseMs[kGpuPhaseGtao],
-                         g_lastGpuPhaseMs[kGpuPhaseLinearize], g_lastGpuPhaseMs[kGpuPhaseShadowMask],
+                         g_lastGpuPhaseMs[kGpuPhasePostDepth],
+                         g_lastGpuPhaseMs[kGpuPhaseLinearize],
+                         g_lastGpuPhaseMs[kGpuPhasePostDepth] - g_lastGpuPhaseMs[kGpuPhaseLinearize] - g_lastGpuPhaseMs[kGpuPhaseShadowMask],
+                         g_lastGpuPhaseMs[kGpuPhaseShadowMask],
                          g_lastGpuPhaseMs[kGpuPhaseReflect], g_lastGpuPhaseMs[kGpuPhaseColor],
                          g_lastGpuPhaseMs[kGpuPhaseWater], g_lastGpuPhaseMs[kGpuPhaseResolve],
                          g_lastHizGpuMs, g_hizOverruns,
@@ -10438,6 +10644,38 @@ namespace ForgeRender {
                          g_lastGpuPhaseMs[kGpuPhaseColorGlow], g_lastGlowDrawn, g_lastGlowWalkMs,
                          g_lastGpuPhaseMs[kGpuPhaseReflGeo],
                          g_lastGpuPhaseMs[kGpuPhaseReflect] - g_lastGpuPhaseMs[kGpuPhaseReflGeo]);
+            // Skinned-loop CPU RECORD probe: rec-split skin= is prep(palette+instance memcpy, IPC-blob
+            // reads → faults) + rec(bindVB/IB+draw). Only rec is removable by a skinned mega-VB.
+            // SETUP split: localizes the 1400-line setup bucket. gather= is the O(dirty x meshHigh)
+            // caster scan; iters/kept shows how much of that scan is WASTED (kept << iters ⇒ the
+            // scan is the wrong data structure, not just slow).
+            // casters= the index size: the sweeps' real iteration domain. It should stay ~flat while
+            // meshHigh churns upward — if casters tracks meshHigh, the index is leaking.
+            LOG::logline(">> [forge-hb] setup split: casterRefresh=%.2f shadowMgr=%.2f (gather=%.2f,"
+                         " slots=%u iters=%llu kept=%u) drawMemcpy=%.2f other=%.2f ms"
+                         " | meshHigh=%u casters=%u",
+                         g_lastSetupCasterRefreshMs, g_lastSetupShadowMgrMs, g_lastSetupGatherMs,
+                         g_lastSetupGatherSlots, (unsigned long long)g_lastSetupGatherIters,
+                         g_lastSetupGatherKept, g_lastSetupDrawMemcpyMs,
+                         g_lastSetupMs - g_lastSetupCasterRefreshMs - g_lastSetupShadowMgrMs
+                             - g_lastSetupDrawMemcpyMs,
+                         g_meshHigh, (unsigned)g_casterSlots.size());
+            // shadowMgr sub-buckets — where its ~1.5-2.3ms ACTUALLY lives (the gather is ~0.2ms of it).
+            {
+                char blk[256]; int off = 0;
+                for (uint32_t b = 0; b < kSetupBlkCount && off < (int)sizeof(blk) - 1; ++b) {
+                    off += std::snprintf(blk + off, sizeof(blk) - off, "%s%s=%.2f",
+                                         b ? " " : "", kSetupBlkName[b], g_lastSetupBlkMs[b]);
+                }
+                LOG::logline(">> [forge-hb] shadowMgr blk: %s ms", blk);
+            }
+            // max vs mean is the tell: max~=mean = uniform (contention/cache, NOT this loop's fault);
+            // one big max = a single stall to hunt at that slot.
+            LOG::logline(">> [forge-hb] skin rec probe: prep=%.2f rec=%.2f ms (n=%u parts, mean=%.1fus,"
+                         " max=%.1fus @slot%u, pipeSwitches=%u)",
+                         g_lastSkinPrepMs, g_lastSkinRecMs, g_lastSkinnedDrawn,
+                         g_lastSkinnedDrawn ? ((g_lastSkinPrepMs + g_lastSkinRecMs) * 1000.0 / g_lastSkinnedDrawn) : 0.0,
+                         g_lastSkinMaxPartMs * 1000.0, g_lastSkinMaxSlot, g_lastSkinPipeSwitches);
             // Whole-frame GPU EXECUTION vs submit->fence WALL clock. If exec << wall, the frame is
             // GPU-idle/queue-bound (waiting behind the client's shared-GPU work), NOT render-bound.
             const double frameExec = g_lastGpuPhaseMs[kGpuPhaseFrame];
