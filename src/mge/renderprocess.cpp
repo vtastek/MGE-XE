@@ -125,6 +125,7 @@ namespace {
     std::optional<IPC::VecView<IPC::GeomChunk>> g_alphaVec;         // persistent per-frame sorted-alpha draw-list vec (AT1)
     std::optional<IPC::VecView<IPC::GeomChunk>> g_fpDrawVec;        // persistent per-frame FP rigid draw-list vec (FP1a)
     std::optional<IPC::VecView<IPC::GeomChunk>> g_fpSkinnedVec;     // persistent per-frame FP skinned draw-list vec (FP1a)
+    std::optional<IPC::VecView<IPC::GeomChunk>> g_fpAlphaVec;       // persistent per-frame FP alpha draw-list vec (FP1c)
     std::vector<std::uint8_t>                 g_pendingBlob;        // packed parts awaiting flush
     std::uint32_t                             g_pendingParts = 0;
     // Cache key -> host slot, plus per-key cached bindless texture slots so the
@@ -160,6 +161,7 @@ namespace {
     std::vector<std::uint8_t>                 g_skinnedScratch;     // packed [SkinnedDrawWire][palette]* this frame
     std::vector<std::uint8_t>                 g_fpDrawScratch;      // packed FP rigid DrawItemWire[] this frame (FP1a)
     std::vector<std::uint8_t>                 g_fpSkinnedScratch;   // packed FP [SkinnedDrawWire][palette]* this frame (FP1a)
+    std::vector<std::uint8_t>                 g_fpAlphaScratch;     // packed FP AlphaDrawWire[] this frame (FP1c, back-to-front)
     std::vector<std::uint8_t>                 g_multiMapScratch;    // packed MultiMapDrawWire[] this frame (Tier 4)
     std::vector<std::uint8_t>                 g_lightScratch;       // packed PointLightWire[] this frame
 
@@ -797,6 +799,14 @@ namespace {
         } else {
             g_fpSkinnedVec.emplace(std::move(*fsv));
         }
+        // FP1c: blended FP parts (torch flame, enchant glow) ride their own tiny
+        // AlphaDrawWire[] vec — a handful of shapes, same wire format as the world list.
+        auto fav = g_client->allocVecBlocking<IPC::GeomChunk>(1, 1, 1);
+        if (!fav) {
+            LOG::logline("!! [seam] FP alpha draw-list vec alloc failed — FP alpha (FP1c) disabled");
+        } else {
+            g_fpAlphaVec.emplace(std::move(*fav));
+        }
 
         // AT3 captured-alpha geometry vec: one 1-chunk (1MB) vec carrying [captured verts][captured
         // indices] — 20000 verts (720KB) + 60000 uint16 (120KB) = 840KB fits one chunk (see
@@ -1327,8 +1337,10 @@ namespace {
     // buildGeometryDrawLists), so the wire order IS the draw order — the host never re-sorts.
     // Field packing mirrors emitStaticDraw (texture SlotInfo cache, material, vColSource,
     // camera-relative world) plus the SkyDrawWire blend fields and the material alpha.
+    // FP1c: `dst` defaults to the main-pass scratch; buildFPFrame redirects the identical
+    // packing into the FP alpha scratch (same wire format, drawn by the host FP pass).
     void emitAlphaDraw(SlotInfo& si, const MGE::GeometryCache::CachedGeometry& e,
-                       std::uint32_t& count) {
+                       std::uint32_t& count, std::vector<std::uint8_t>& dst = g_alphaScratch) {
             IPC::AlphaDrawWire item;
             item.slot      = si.slot;
             diagWorldDet("ALPHA", e.textureName, e.worldTransformD3D);
@@ -1355,9 +1367,9 @@ namespace {
             // like the draped altar cloth gets CULL_BACK, hiding its back/interior faces).
             item.cullFlags = (e.twoSided ? IPC::kAlphaCullTwoSided : 0u)
                            | (e.mirrored ? IPC::kAlphaCullMirrored : 0u);
-            const std::size_t at = g_alphaScratch.size();
-            g_alphaScratch.resize(at + sizeof(item));
-            memcpy(g_alphaScratch.data() + at, &item, sizeof(item));
+            const std::size_t at = dst.size();
+            dst.resize(at + sizeof(item));
+            memcpy(dst.data() + at, &item, sizeof(item));
             ++count;
     }
 
@@ -2185,11 +2197,14 @@ namespace {
     // against the SAME eye the emit helpers subtract, then the arm scene's own
     // projection — its FOV/near/far differ from the world camera's). Returns true
     // when the FP pass has something to ship this frame.
-    bool buildFPFrame(IPC::FPFrame& fp, std::uint32_t& fpDraws, std::uint32_t& fpSkinned) {
+    bool buildFPFrame(IPC::FPFrame& fp, std::uint32_t& fpDraws, std::uint32_t& fpSkinned,
+                      std::uint32_t& fpAlpha) {
         fpDraws = 0;
         fpSkinned = 0;
+        fpAlpha = 0;
         g_fpDrawScratch.clear();
         g_fpSkinnedScratch.clear();
+        g_fpAlphaScratch.clear();
         if (!RenderProcess::wantsFPCapture() || !g_fpDrawVec || !g_fpSkinnedVec) {
             return false;
         }
@@ -2212,18 +2227,47 @@ namespace {
         D3DXMatrixMultiply(&viewProj, &view, &proj);
         memcpy(fp.viewProj, &viewProj, 16 * sizeof(float));
 
+        // FP1c fp-alpha candidates: blended FP parts (torch flame, enchant glow) are
+        // collected during the loop, sorted back-to-front against the ARM camera, then
+        // packed — same collect/sort/emit shape as the world alpha list (AT1). Same
+        // representability rules too: single-map, non-skinned, textured (a textureless
+        // blend has no base to composite; skinned/multimap blends aren't expressible in
+        // AlphaDrawWire and are skipped exactly as before).
+        struct FPAlphaCand {
+            float depth;
+            SlotInfo* si;
+            const MGE::GeometryCache::CachedGeometry* e;
+        };
+        static std::vector<FPAlphaCand> s_fpAlphaCands;   // single-threaded; reused frame-to-frame
+        s_fpAlphaCands.clear();
+
         const auto& cacheMap = MGE::GeometryCache::cache();
         const auto cacheFrame = MGE::GeometryCache::currentFrame();
         for (auto& kv : cacheMap) {
             const auto& e = kv.second;
             if (!e.isFP || e.lastFrame != cacheFrame) continue;
-            if (e.blendEnable) continue;      // FP1c: fp-alpha (torch flame, enchant glow)
             // Multi-map FP parts would need the wide-VB multimap pipeline in the FP pass;
             // none expected on arms — skip rather than bind the wrong vertex layout.
             if (e.d3dDark || e.d3dDetail || e.d3dGlow) continue;
             auto ks = g_keySlot.find(kv.first);
             if (ks == g_keySlot.end()) continue;   // not uploaded yet (first-sight frame)
+            if (e.blendEnable && !e.isSkinned) {
+                if (!e.d3dTexture) continue;   // textureless blend: nothing to composite
+                // Depth key: bound-center view depth against the ARM camera (pos/dir from
+                // getRenderCameraState above) — MW's sorter criterion, FP camera's frame.
+                const float* w = e.worldTransformD3D;
+                const float cx = e.boundsCenter[0], cy = e.boundsCenter[1], cz = e.boundsCenter[2];
+                const float wx = cx * w[0] + cy * w[4] + cz * w[8]  + w[12] - pos[0];
+                const float wy = cx * w[1] + cy * w[5] + cz * w[9]  + w[13] - pos[1];
+                const float wz = cx * w[2] + cy * w[6] + cz * w[10] + w[14] - pos[2];
+                s_fpAlphaCands.push_back({ wx * dir[0] + wy * dir[1] + wz * dir[2],
+                                           &ks->second, &e });
+                continue;
+            }
             if (e.isSkinned) {
+                // Skinned blends stay dropped (as in FP1a) — the skinned pipeline has no
+                // blend state, so drawing them opaquely would be wrong, not better.
+                if (e.blendEnable) continue;
                 emitSkinnedDraw(ks->second, e, fpSkinned, g_fpSkinnedScratch);
             } else {
                 // Same textureless rule as dispatch: collision proxies drop; genuine
@@ -2233,10 +2277,19 @@ namespace {
             }
         }
 
+        // FP1c: back-to-front (descending view depth), then pack into the FP alpha scratch.
+        if (!s_fpAlphaCands.empty()) {
+            std::sort(s_fpAlphaCands.begin(), s_fpAlphaCands.end(),
+                      [](const FPAlphaCand& a, const FPAlphaCand& b) { return a.depth > b.depth; });
+            for (const auto& c : s_fpAlphaCands) {
+                emitAlphaDraw(*c.si, *c.e, fpAlpha, g_fpAlphaScratch);
+            }
+        }
+
         static unsigned s_hb = 0;
         if (s_hb++ % 300 == 0) {
-            LOG::logline(">> [fp] draws=%u skinned=%u | cam fov=%.1f near=%.1f far=%.1f vp=%.0fx%.0f",
-                         fpDraws, fpSkinned, cd[0], cd[1], cd[2], cd[3], cd[4]);
+            LOG::logline(">> [fp] draws=%u skinned=%u alpha=%u | cam fov=%.1f near=%.1f far=%.1f vp=%.0fx%.0f",
+                         fpDraws, fpSkinned, fpAlpha, cd[0], cd[1], cd[2], cd[3], cd[4]);
         }
 
         // Continuous arm-camera validation: diff the latched native-arm-scene matrices
@@ -2396,7 +2449,7 @@ namespace RenderProcess {
         // Phase 2 makes this GPU-resident so it goes to 0).
         std::uint32_t drawCount, skinnedCount, multiMapCount, lightCount, skyCount, alphaCount;
         IPC::FPFrame fpFrame;
-        std::uint32_t fpDraws = 0, fpSkinnedDraws = 0;
+        std::uint32_t fpDraws = 0, fpSkinnedDraws = 0, fpAlphaDraws = 0;
         bool fpHave = false;
         {
             MGE_ZoneScopedN("Forge build draw lists");
@@ -2405,7 +2458,7 @@ namespace RenderProcess {
             skyCount = buildSkyDrawList();
             // FP1a: before the geom flush below so first-sight arm meshes (captured by
             // this frame's FP walk) ship in the same flush the pass draws from.
-            fpHave = buildFPFrame(fpFrame, fpDraws, fpSkinnedDraws);
+            fpHave = buildFPFrame(fpFrame, fpDraws, fpSkinnedDraws, fpAlphaDraws);
         }
         const double tBuild = nowMs();
 
@@ -2490,6 +2543,14 @@ namespace RenderProcess {
                 fpFrame.skinnedList  = g_fpSkinnedVec->id();
                 fpFrame.skinnedCount = fpSkinnedDraws;
                 fpFrame.skinnedBytes = (std::uint32_t)g_fpSkinnedScratch.size();
+            }
+            // FP1c: the blended FP parts (torch flame, enchant glow), client-sorted
+            // back-to-front vs the ARM camera in buildFPFrame.
+            if (fpAlphaDraws > 0 && g_fpAlphaVec
+                && g_fpAlphaVec->assign_bytes(g_fpAlphaScratch.data(), (std::uint32_t)g_fpAlphaScratch.size())) {
+                fpFrame.alphaList  = g_fpAlphaVec->id();
+                fpFrame.alphaCount = fpAlphaDraws;
+                fpFrame.alphaBytes = (std::uint32_t)g_fpAlphaScratch.size();
             }
         }
 
@@ -3468,6 +3529,7 @@ namespace RenderProcess {
         g_alphaVec.reset();
         g_fpDrawVec.reset();
         g_fpSkinnedVec.reset();
+        g_fpAlphaVec.reset();
         g_texVec.reset();
         g_pendingBlob.clear();
         g_pendingBlob.shrink_to_fit();
@@ -3487,6 +3549,8 @@ namespace RenderProcess {
         g_fpDrawScratch.shrink_to_fit();
         g_fpSkinnedScratch.clear();
         g_fpSkinnedScratch.shrink_to_fit();
+        g_fpAlphaScratch.clear();
+        g_fpAlphaScratch.shrink_to_fit();
         g_texPendingBlob.clear();
         g_texPendingBlob.shrink_to_fit();
         g_pendingParts = 0;

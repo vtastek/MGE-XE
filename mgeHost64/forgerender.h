@@ -117,6 +117,11 @@ namespace ForgeRender {
         const void*  skinnedBlob = nullptr;
         unsigned     skinnedCount = 0;
         unsigned     skinnedBytes = 0;
+        // FP1c: blended FP parts (torch flame, enchant glow) — AlphaDrawWire[] client-sorted
+        // back-to-front vs the ARM camera, drawn last in the FP pass with the main alpha PSOs.
+        const void*  alphaBlob = nullptr;
+        unsigned     alphaCount = 0;
+        unsigned     alphaBytes = 0;
     };
 
     bool renderScene(const float* viewProj, const float* lighting, const void* drawBlob,
