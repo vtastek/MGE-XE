@@ -159,6 +159,7 @@ const iniSetting iniSettings[] = {
     {&Configuration.ForgeActiveCellWalk, t_bool, 1, siniMisc, "Forge Active Cell Walk", True, &dictBool, DICTONLY, 0, 0},
     {&Configuration.ForgeLiveDrawBuild, t_bool, 1, siniMisc, "Forge Live Draw Build", True, &dictBool, DICTONLY, 0, 0},
     {&Configuration.ForgeAlphaPass, t_bool, 1, siniMisc, "Forge Alpha Pass", True, &dictBool, DICTONLY, 0, 0},
+    {&Configuration.ForgeEmissiveBoost, t_bool, 1, siniMisc, "Forge Emissive Boost", True, &dictBool, DICTONLY, 0, 0},
     {&Configuration.ForgeAlphaSuppressS1, t_bool, 1, siniMisc, "Forge Alpha Suppress S1", True, &dictBool, DICTONLY, 0, 0},
     {&Configuration.ForgeAlphaCapture, t_bool, 1, siniMisc, "Forge Alpha Capture", True, &dictBool, DICTONLY, 0, 0},
     {&Configuration.ForgeFPPass, t_bool, 1, siniMisc, "Forge FP Pass", False, &dictBool, DICTONLY, 0, 0},

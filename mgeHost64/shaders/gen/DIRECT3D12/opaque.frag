@@ -1066,7 +1066,18 @@ STRUCT(LightData)
 {
     float4 lightParams;
     float4 lights[ 128  * 3];
-#line 133
+
+
+
+
+
+
+
+
+
+    float4 froxelDimsNear;
+    float4 froxelZNear;
+#line 144
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1111,8 +1122,16 @@ STRUCT(LightData)
 
 
 
+
+
+
+        Buffer(uint) gFroxelMaskNear :  register(t10,space1);
+
+
+
+
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 194 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 213 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 896 ] :  register(t0,space0);
 
 
@@ -1216,47 +1235,81 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
 
 
         float reachK = gLights.lightParams.y;
-        for (uint i = 0; i < nLights; ++i)
+
+
+
+
+
+
+        int nfTilesX = (int)gLights.froxelDimsNear.x;
+        bool clustered = (nfTilesX > 0);
+        uint fbase = 0u;
+        if (clustered)
         {
-            float4 posR = gLights.lights[i * 3u + 0u];
-            float3 lightCol= gLights.lights[i * 3u + 1u].rgb;
-            float3 fo = gLights.lights[i * 3u + 2u].xyz;
-            float radius = posR.w;
-            float reach = radius * reachK;
-
-            float3 toLight = posR.xyz - In.WorldPos;
-            float dist2 = dot(toLight, toLight);
-
-
-
-            if (dist2 >= reach * reach) { continue; }
-            ++litCount;
-            float invDist = rsqrt(max(dist2, 1e-8f));
-            float dist = dist2 * invDist;
-
-
-
-            float att = 1.0f / max(fo.z * dist2 + fo.y * dist + fo.x, 1e-4f);
-
-
-            att *= 1.0f - smoothstep( 0.75f  * reach, reach, dist);
-
-
-
-
-            uint slotP1 = (uint)gLights.lights[i * 3u + 2u].w;
-            if (slotP1 != 0u)
-            {
-                uint4 mw = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xyzw;
-                uint s = slotP1 - 1u;
-                uint lane = s >> 3u;
-                uint word = lane == 0u ? mw.x : (lane == 1u ? mw.y : (lane == 2u ? mw.z : mw.w));
-                uint nib = (word >> ((s & 7u) * 4u)) & 0xFu;
-                att *= float(nib) * (1.0f / 15.0f);
+            int nfTilesY = (int)gLights.froxelDimsNear.y;
+            int nfNZ = (int)gLights.froxelDimsNear.z;
+            float nfTile = gLights.froxelDimsNear.w;
+            int tx = clamp((int)(In.Position.x / nfTile), 0, nfTilesX - 1);
+            int ty = clamp((int)(In.Position.y / nfTile), 0, nfTilesY - 1);
+            float dd = length(In.WorldPos);
+            int zs = clamp((int)((log(max(dd, 1.0f)) - gLights.froxelZNear.x) * gLights.froxelZNear.y * (float)nfNZ), 0, nfNZ - 1);
+            fbase = (((uint)ty * (uint)nfTilesX + (uint)tx) * (uint)nfNZ + (uint)zs) * 4u;
+        }
+        for (uint wi = 0u; wi < 4u; ++wi)
+        {
+            uint bits;
+            if (clustered) {
+                bits = gFroxelMaskNear[fbase + wi];
+            } else {
+                uint lo = wi * 32u;
+                uint cnt = (lo >= nLights) ? 0u : min(32u, nLights - lo);
+                bits = (cnt >= 32u) ? 0xFFFFFFFFu : ((1u << cnt) - 1u);
             }
+            while (bits != 0u)
+            {
+                uint i = wi * 32u + firstbitlow(bits);
+                bits = bits & (bits - 1u);
+                if (i >= nLights) { continue; }
+                float4 posR = gLights.lights[i * 3u + 0u];
+                float3 lightCol= gLights.lights[i * 3u + 1u].rgb;
+                float3 fo = gLights.lights[i * 3u + 2u].xyz;
+                float radius = posR.w;
+                float reach = radius * reachK;
 
-            float lambert = saturate(dot(N, toLight) * invDist);
-            d += lambert * att * lightCol;
+                float3 toLight = posR.xyz - In.WorldPos;
+                float dist2 = dot(toLight, toLight);
+
+
+
+                if (dist2 >= reach * reach) { continue; }
+                ++litCount;
+                float invDist = rsqrt(max(dist2, 1e-8f));
+                float dist = dist2 * invDist;
+
+
+
+                float att = 1.0f / max(fo.z * dist2 + fo.y * dist + fo.x, 1e-4f);
+
+
+                att *= 1.0f - smoothstep( 0.75f  * reach, reach, dist);
+
+
+
+
+                uint slotP1 = (uint)gLights.lights[i * 3u + 2u].w;
+                if (slotP1 != 0u)
+                {
+                    uint4 mw = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xyzw;
+                    uint s = slotP1 - 1u;
+                    uint lane = s >> 3u;
+                    uint word = lane == 0u ? mw.x : (lane == 1u ? mw.y : (lane == 2u ? mw.z : mw.w));
+                    uint nib = (word >> ((s & 7u) * 4u)) & 0xFu;
+                    att *= float(nib) * (1.0f / 15.0f);
+                }
+
+                float lambert = saturate(dot(N, toLight) * invDist);
+                d += lambert * att * lightCol;
+            }
         }
     }
     d *= gFrameData.dbgScales.y;

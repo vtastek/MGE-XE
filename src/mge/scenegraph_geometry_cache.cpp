@@ -20,6 +20,7 @@
 #include "mwbridge.h"
 #include "proxydx/d3d8texture.h"
 #include "proxydx/devicelock.h"
+#include "scenegraph.h"
 #include "scenegraph_geometry_cache.h"
 #include "renderprocess.h"
 #include "ipc/geomwire.h"
@@ -228,7 +229,140 @@ namespace MGE::GeometryCache {
             return h;
         }
 
-        void extractMaterial(CachedGeometry& e, NI::Geometry* geom) {
+        // Per-walk copy of the scene-graph point-light snapshot, for computeEmissiveGain.
+        // Copied (not read under the lock) because the geometry walk is ~1.5ms and would
+        // stall the async scene-graph worker's swap, and because ensureLive's lazy capture
+        // calls extractMaterial after onFrameReady has returned. One frame stale on the
+        // async path — fixture light colours are static, so that never shows.
+        std::vector<MGE::SceneGraph::PointLight> g_lightSnapshot;
+
+        // Emissive fixtures carry HDR the 8-bit texture never held. A light's own emissive
+        // surface is far brighter than the illumination it casts — a candle core is ~1000 nits —
+        // so `emissive 1,1,1` ("show the texture unlit at full") lands ~two orders of magnitude
+        // short of the authored intent. The engine is not at fault: all three independent FFE
+        // implementations agree on lit = matDiffuse*d + matAmbient*a + matEmissive with no
+        // multiplier, and the clipping happened at texture-export time, in ~1999. Restoring it
+        // is our deliberate feature.
+        //
+        // The restored value is the emitter's RADIANCE, and radiance is flux over area:
+        //
+        //     emissive = authored(1.0) * kEmissiveFlux * lightColour / emissiveArea
+        //
+        // The light record supplies the flux; the MESH supplies the area. That split is the
+        // whole point — it is why one constant covers every fixture class. A candle flame
+        // concentrates a modest flux into a tiny billboard (huge radiance); a paper lantern
+        // spreads the same kind of flux over a big diffuse sphere (small radiance). Nothing is
+        // fitted per asset: feed it the mesh and the light and the answer falls out. Radius is
+        // deliberately NOT an input — the same lantern NIF ships at radii 64..512, so radius and
+        // emitter size are independent authored values.
+        //
+        // The texture then shapes the result for free: the frag already computes
+        // c = albedo * lit, so a candle-flame texture's own falloff scales the radiance down
+        // exactly where the artist painted it dark. (For fixtures whose texture is itself an
+        // unwitting record of clip(k*L) — the lantern papers — this applies the texture's colour
+        // a second time and reads slightly more saturated than the raw light. Deliberate: the
+        // texture is a modulation here, not the colour source.)
+        //
+        // Applied only where the emission demonstrably CAME FROM a light: the shape must be
+        // emissive AND own a light. Meshless-emissive assets (glowing mushrooms, the ampoule
+        // pod) have no flux to divide and are deliberately left untouched.
+        //
+        // CALIBRATION: kEmissiveFlux = k_ref * area_ref.
+        //
+        // k_ref is deliberately BELOW the measured 4.5 (Light_paper_lantern_01's paper fits
+        // clip(4.52*L), rms 0.063; the blue _02 fits 5.03). Reason: the colour chain is
+        // B8G8R8A8_UNORM and tonemap()'s polynomial reaches 1.0 at c=2.2, so anything past that
+        // pins to white. The reference paper's brightest texel clips once albedo_R*k*L_R > 2.2
+        // => k > 2.29; at the authored 4.5 both R and G pin, R:G snaps to 1.00, and the lantern
+        // reads hot CREAM instead of its light's orange. 2.2 is the largest boost that keeps the
+        // reference fixture entirely under the knee, so its hue survives and can be matched
+        // against. Restore k_ref to the measured 4.5 when the HDR/linear post lands — that is
+        // what makes the authored value expressible.
+        //
+        // area_ref is the paper's emissive area, which the [emissive] logline prints; until a
+        // lantern has actually been walked past in-game it is an ESTIMATE (a ~20cm paper sphere
+        // ~= r7 units => 4*pi*r^2 ~= 600), so every fixture's absolute brightness scales with it.
+        // The RATIOS between fixture classes are already correct — they come from the meshes, not
+        // from this number. (Small-area emitters — candle flames — still blow past 2.2 and pin to
+        // white by construction; only HDR fixes those.)
+        constexpr float kEmissiveRefK    = 2.2f;    // LDR-limited; measured value is 4.5 (see above)
+        constexpr float kEmissiveRefArea = 600.0f;  // ESTIMATE: paper-lantern emissive area (units^2)
+        constexpr float kEmissiveFlux    = kEmissiveRefK * kEmissiveRefArea;
+
+        // World-space emissive surface area: sum of triangle areas, scaled by the world
+        // transform. Correct for both a lantern's sphere and a flame's flat billboard, which a
+        // bound-radius sphere proxy would get wrong by ~4x in opposite directions. Runs once per
+        // cache entry (alongside the VB upload's own full vertex walk), never per frame.
+        float computeEmissiveArea(const NI::TriBasedGeometry* geom) {
+            const auto* data = geom->getModelData().get();
+            if (!data) return 0.0f;
+            const auto* verts = data->vertex;
+            const auto* tris  = data->getTriList();
+            const uint32_t tc = static_cast<uint32_t>(data->getActiveTriangleCount());
+            if (!verts || !tris || !tc) return 0.0f;
+
+            double area = 0.0;
+            for (uint32_t i = 0; i < tc; ++i) {
+                const auto& a = verts[tris[i].vertices[0]];
+                const auto& b = verts[tris[i].vertices[1]];
+                const auto& c = verts[tris[i].vertices[2]];
+                const float ux = b.x - a.x, uy = b.y - a.y, uz = b.z - a.z;
+                const float vx = c.x - a.x, vy = c.y - a.y, vz = c.z - a.z;
+                const float cx = uy * vz - uz * vy;
+                const float cy = uz * vx - ux * vz;
+                const float cz = ux * vy - uy * vx;
+                area += 0.5 * std::sqrt(double(cx * cx + cy * cy + cz * cz));
+            }
+            const float s = geom->worldTransform.scale;   // model -> world: area scales by s^2
+            return static_cast<float>(area) * s * s;
+        }
+
+        // The shape's OWN light = a point light whose world position lies inside the shape's own
+        // world bound — a lantern's NiPointLight sits at the flame, inside its paper. Nearest
+        // wins if several qualify. The snapshot is already filtered to lights the engine would
+        // actually render (radius > 0 and affectedNodes non-empty — see scenegraph.cpp's walk),
+        // so a logically-off lantern can't donate a gain.
+        void computeEmissiveGain(CachedGeometry& e, const NI::TriBasedGeometry* geom) {
+            if (e.matEmissive[0] <= 0.0f && e.matEmissive[1] <= 0.0f && e.matEmissive[2] <= 0.0f) {
+                return;
+            }
+            const float r = geom->worldBoundRadius;
+            if (!(r > 0.0f)) return;
+
+            const MGE::SceneGraph::PointLight* own = nullptr;
+            float bestD2 = r * r;   // doubles as the inside-the-bound threshold
+            for (const auto& pl : g_lightSnapshot) {
+                const float dx = pl.worldPos[0] - geom->worldBoundOrigin.x;
+                const float dy = pl.worldPos[1] - geom->worldBoundOrigin.y;
+                const float dz = pl.worldPos[2] - geom->worldBoundOrigin.z;
+                const float d2 = dx * dx + dy * dy + dz * dz;
+                if (d2 <= bestD2) { bestD2 = d2; own = &pl; }
+            }
+            if (!own) return;
+
+            const float area = computeEmissiveArea(geom);
+            if (!(area > 0.0f)) return;
+
+            for (int i = 0; i < 3; ++i) {
+                e.emissiveGain[i] = kEmissiveFlux * own->diffuse[i] / area;
+            }
+
+            if (Configuration.LogDistantPipeline) {
+                static uint32_t s_logged = 0;
+                if (s_logged < 16) {
+                    ++s_logged;
+                    LOG::logline(">> [emissive] fixture tex=%s emissive=(%.2f,%.2f,%.2f) light=(%.3f,%.3f,%.3f) "
+                                 "d=%.1f r=%.1f area=%.1f gain=(%.2f,%.2f,%.2f)",
+                                 e.textureName ? e.textureName : "(none)",
+                                 e.matEmissive[0], e.matEmissive[1], e.matEmissive[2],
+                                 own->diffuse[0], own->diffuse[1], own->diffuse[2],
+                                 std::sqrt(bestD2), r, area,
+                                 e.emissiveGain[0], e.emissiveGain[1], e.emissiveGain[2]);
+                }
+            }
+        }
+
+        void extractMaterial(CachedGeometry& e, NI::TriBasedGeometry* geom) {
             e.d3dTexture  = nullptr;
             e.d3dOverlay  = nullptr;
             e.d3dDark     = nullptr;
@@ -252,6 +386,7 @@ namespace MGE::GeometryCache {
             e.matDiffuse[0]  = e.matDiffuse[1]  = e.matDiffuse[2]  = e.matDiffuse[3]  = 1.0f;
             e.matAmbient[0]  = e.matAmbient[1]  = e.matAmbient[2]  = e.matAmbient[3]  = 1.0f;
             e.matEmissive[0] = e.matEmissive[1] = e.matEmissive[2] = e.matEmissive[3] = 0.0f;
+            e.emissiveGain[0] = e.emissiveGain[1] = e.emissiveGain[2] = 1.0f;   // no boost
             e.vColSource = 0;   // SOURCE_IGNORE until a VertexColorProperty says otherwise
 
             auto* ps = reinterpret_cast<NI::PropertyState*>(geom->propertyState);
@@ -352,6 +487,13 @@ namespace MGE::GeometryCache {
                     }
                 }
             }
+
+            // Last: needs matEmissive (read above) and, for the diagnostic logline, the
+            // captured base texture name. Derived unconditionally rather than gated on the
+            // INI knob so ForgeEmissiveBoost can be flipped live — materials are captured
+            // once per cache entry, so the gain must already be sitting there when the
+            // toggle turns on.
+            computeEmissiveGain(e, geom);
         }
 
         // Vertex layout matching MorrowindVertIn (depth/shadow VS input).
@@ -1564,6 +1706,14 @@ namespace MGE::GeometryCache {
             g_gateEye[2] = gateEye[2];
             g_gateRadius = gateRadius;
         }
+        // Emissive-boost light data. SceneGraph::onFrameReady() ran earlier this frame
+        // (distantland.cpp), so this is the current walk's lights on the sync path and last
+        // frame's on the async path. Copy is a few KB — noise against the walk.
+        {
+            MGE::SceneGraph::SnapshotReadLock lk;
+            g_lightSnapshot = MGE::SceneGraph::pointLights();
+        }
+
         // Roots for this frame: the walks below, ensureFullWalk's deferred walk, and
         // ensureLive's capture-context climb all key off these.
         g_objRoot  = MGE::DataHandlerView::worldObjectRoot(dataHandler);
@@ -1829,6 +1979,18 @@ namespace MGE::GeometryCache {
 
     const std::unordered_map<uint32_t, CachedGeometry>& cache() {
         return g_cache;
+    }
+
+    void emissiveForDraw(const CachedGeometry& e, float* out) {
+        if (Configuration.ForgeEmissiveBoost) {
+            out[0] = e.matEmissive[0] * e.emissiveGain[0];
+            out[1] = e.matEmissive[1] * e.emissiveGain[1];
+            out[2] = e.matEmissive[2] * e.emissiveGain[2];
+        } else {
+            out[0] = e.matEmissive[0];
+            out[1] = e.matEmissive[1];
+            out[2] = e.matEmissive[2];
+        }
     }
 
     uint64_t currentFrame() {

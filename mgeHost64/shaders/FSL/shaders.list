@@ -110,6 +110,19 @@
 #include "skymesh.frag.fsl"
 #end
 
+// Phase F distant-light GLOW billboards: one additive camera-facing sprite per light FIXTURE, drawn
+// after water / before sorted-alpha so the lamp still reads once its tier-0 static mesh has coverage-
+// culled (~2 cells). Binding 0 = static unit-quad corner+radial UV; binding 1 = per-instance survivor
+// record (cam-rel centre+size, colour+intensity). PRIVATE frag (no shared-frag hazard). Reuses
+// opaque.srt.h / DefaultRootSignature verbatim — brightness/fade/min-pixel resolved host-side.
+#vert glow.vert
+#include "glow.vert.fsl"
+#end
+
+#frag glow.frag
+#include "glow.frag.fsl"
+#end
+
 // Phase 1a: host-owned distant-land LOD. Own 16B vertex layout (pos + SHORT2N atlas UV),
 // reuses opaque.srt.h / DefaultRootSignature + the bindless gTextures atlas. One colour
 // pipeline (depth-write, reverse-Z GEQUAL), no prepass (terrain is fully opaque).

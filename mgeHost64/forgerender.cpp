@@ -1158,11 +1158,24 @@ namespace {
         Pipeline*      pFroxelClearPipeline = nullptr;
         Pipeline*      pFroxelAssignPipeline = nullptr;
         DescriptorSet* pFroxelSet = nullptr;       // FroxelSrtData PerBatch (gFroxelParams + gFroxelMaskRW)
+        uint32_t       froxelBufWords = 0;         // allocated mask capacity (words) — sized from render res
         bool           froxelReady = false;
         bool           froxelActive = false;       // set per-frame (primary): clear+assign dispatched this frame
         uint32_t       froxelNumWords = 0;         // this frame's grid words (tilesX*tilesY*NZ*4) to clear
         uint32_t       froxelLightCount = 0;       // this frame's uploaded light count (assign thread count)
         bool           froxelMaskInShaderState = false;  // true once transitioned to PIXEL SRV this frame
+        // Near clustered forward: a PARALLEL froxel grid for the NEAR live point lights (opaque/multimap
+        // frags). Separate mask + params from the distant grid above so the two never entangle buffer
+        // state (near builds+consumes within kGpuPhaseColorNear/MM, distant rebuilds gFroxelMask after).
+        // Reuses the SAME froxelclear/froxelassign pipelines via pFroxelSetNear. Near grid params ride
+        // gLights (LightData.froxelDimsNear/froxelZNear), not gFrameData — see opaque.srt.h.
+        Buffer*        pFroxelMaskNear     = nullptr;  // GPU_ONLY RW|SRV uint[maxFroxels*4]: near 128-bit mask/froxel
+        Buffer*        pFroxelParamsCbvNear = nullptr; // near FroxelParams (viewProj/dims/screen/zparams + spheres)
+        DescriptorSet* pFroxelSetNear      = nullptr;  // FroxelSrtData PerBatch (near params + near maskRW)
+        bool           froxelNearActive    = false;    // set per-frame: near clear+assign dispatched this frame
+        uint32_t       froxelNearNumWords  = 0;        // this frame's near grid words to clear
+        uint32_t       froxelNearLightCount = 0;       // this frame's near light count (assign thread count)
+        bool           froxelMaskNearInShaderState = false;  // true once transitioned to PIXEL SRV this frame
         DescriptorSet* pPerFrameSet = nullptr;    // gFrameData cbuffer (viewProj), 1 instance
         DescriptorSet* pPerBatchSet = nullptr;    // gBatch cbuffer window, kMaxBatches instances
         Buffer*        pFrameCbv = nullptr;        // gFrameData cbuffer (viewProj), persistent-mapped
@@ -1351,6 +1364,17 @@ namespace {
         Texture*       pWaterNormalVol = nullptr;          // water_NRM.dds 3D animated-normal volume
         bool           waterReady = false;                 // all water resources built (gates the pass)
 
+        // --- Phase F: additive distant-light GLOW billboards (procedural sprite per fixture) ------
+        // One camera-facing additive sprite per meshed baked light, drawn across the whole view
+        // distance (fades in as the fixture's tier-0 static mesh coverage-culls at ~2 cells). Reuses
+        // opaque.srt.h / DefaultRootSignature; the sprite carries its own tiny vertex + instance VBs.
+        Shader*        pGlowShader   = nullptr;             // glow.vert + glow.frag
+        Pipeline*      pGlowPipeline = nullptr;            // additive SRCALPHA/ONE, depth GEQUAL test / no write, cull NONE
+        Buffer*        pGlowBaseVB   = nullptr;            // static unit-quad (6 verts: corner.xy + radial uv, stride 16)
+        Buffer*        pGlowInstBuf  = nullptr;            // CPU_TO_GPU per-instance survivor records (stride 32)
+        uint32_t       glowInstCap   = 0;                  // records allocated in pGlowInstBuf (== g_dlBakedLights.size())
+        bool           glowReady     = false;              // shader + pipeline + buffers built (gates the pass)
+
         // --- WT2: real Forge reflection RT (replaces WT1's flat stand-in) ----------------
         // A fixed 1024² RT (matches MGE's texReflection budget; sampled with normalized UV so the
         // resolution is decoupled from the screen). Rendered by mirroring world geometry about the
@@ -1507,6 +1531,8 @@ namespace {
            kGpuPhaseShadowStatic,
            kGpuPhaseShadowDyn,
            kGpuPhaseColorFP,    // FP1a first-person pass (after sorted-alpha, before resolve)
+           kGpuPhaseColorGlow,  // Phase F distant-light glow billboards (after water, before sorted-alpha)
+           kGpuPhaseFroxelNear, // near clustered-lighting froxel clear+assign (before the near colour phase)
            kGpuPhaseCount };
 
     // FP1a first-person pass caps: one 64KB world window bounds the rigid list at 1024,
@@ -1560,13 +1586,31 @@ namespace {
     constexpr uint32_t kLightCbvBytes  = ((16 + kMaxPointLights * 3 * 16) + 255) & ~255u;  // 6400
 
     // --- Clustered forward lighting (froxel grid) -------------------------------------------------
-    constexpr uint32_t kFroxelTile     = 32;    // screen tile size (px) — MUST match the frag's divisor
-    constexpr uint32_t kFroxelZSlices  = 24;    // view-Z (radial) log slices
-    // Max grid the froxel-mask buffer must fit (sized for a generous max resolution so it never
-    // reallocs on window/backbuffer size). 2560x1440 / 32 = 80x45 tiles x 24 slices x 4 uints.
-    constexpr uint32_t kFroxelMaxTilesX = (2560 + kFroxelTile - 1) / kFroxelTile;   // 80
-    constexpr uint32_t kFroxelMaxTilesY = (1440 + kFroxelTile - 1) / kFroxelTile;   // 45
-    constexpr uint32_t kFroxelMaxWords  = kFroxelMaxTilesX * kFroxelMaxTilesY * kFroxelZSlices * 4u; // 345600
+    constexpr uint32_t kFroxelTile     = 32;    // DISTANT grid screen tile (px). Distant lights are small
+    constexpr uint32_t kFroxelZSlices  = 24;    // on screen, so a fine grid is cheap to scatter into.
+    // NEAR grid is COARSER. Near lights sit close to the camera → large screen footprint (a
+    // near-plane-straddling one expands to the whole screen in froxelassign), so a fine grid makes the
+    // scatter atomic-OR into thousands of froxels per light — the ~0.9ms nearfrox cost. The near set is
+    // FEW lights of KNOWN (bounded) size, so a coarse grid barely loses cull precision (a fragment loops
+    // a couple extra candidates) while cutting froxel count ~6x → ~6x less clear AND scatter. Tile/slice
+    // are read from the cbuffer at runtime (froxelDimsNear), so this is host-only — no shader change. The
+    // near mask reuses the distant-sized buffer (froxelBufWords, sized for the FINER 32px/24-slice grid),
+    // so the coarse near grid always fits.
+    constexpr uint32_t kFroxelTileNear    = 64;
+    constexpr uint32_t kFroxelZSlicesNear = 16;
+    // The froxel-mask buffer is sized from the ACTUAL render resolution, NOT a fixed constant — a
+    // hardcoded cap silently drops every light below the covered rows on any taller target (the old
+    // 2560x1440 cap killed all lights below y=1440 at 2560x1600, near AND distant grids). It's a PC
+    // game: resolution can be anything. createFroxelResources computes the word count from
+    // g_live.width/height (g_live.froxelBufWords) and both masks are sized to it; init() re-inits on a
+    // resolution change (shutdown frees the froxel resources), so the grid is always re-sized to fit.
+    // The per-frame fill still recomputes numWords from the live resolution and clamps to the allocated
+    // capacity (defensive — only bites if the RT ever grows without a re-init).
+    inline uint32_t froxelWordsFor(uint32_t w, uint32_t h) {
+        const uint32_t tx = (w + kFroxelTile - 1) / kFroxelTile;
+        const uint32_t ty = (h + kFroxelTile - 1) / kFroxelTile;
+        return tx * ty * kFroxelZSlices * 4u;
+    }
     // FroxelParams cbuffer bytes: 64 (mat) + 48 (3 float4) + 128*16 (spheres) = 2160 -> 256-aligned.
     constexpr uint32_t kFroxelParamsBytes = ((64 + 48 + kMaxPointLights * 16) + 255) & ~255u;  // 2304
 
@@ -2937,7 +2981,7 @@ namespace {
             // (pAOBlur), not raw pAO; pAOBlur's per-frame UAV<->SHADER_RESOURCE ping-pong (renderScene)
             // leaves it SHADER_RESOURCE before the colour pass samples it. (Raw pAO still feeds the
             // blur as an SRV, and the DebugTextures/readback paths still inspect pAO directly.)
-            DescriptorData p[6] = {};
+            DescriptorData p[7] = {};
             p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
             p[0].ppBuffers = &g_live.pFrameCbv;
             p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -2952,6 +2996,15 @@ namespace {
                 p[np].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFroxelMask);
                 p[np].mCount = 1;
                 p[np].ppBuffers = &g_live.pFroxelMask;
+                ++np;
+            }
+            // Near clustered forward: bind the near froxel mask (SRV here; froxelassign.comp writes it
+            // as a UAV via pFroxelSetNear). Read only by opaque.frag/multimap.frag when
+            // gLights.froxelDimsNear.x > 0; must be BOUND for every opaque-sig frag (shared set).
+            if (g_live.pFroxelMaskNear) {
+                p[np].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFroxelMaskNear);
+                p[np].mCount = 1;
+                p[np].ppBuffers = &g_live.pFroxelMaskNear;
                 ++np;
             }
             // P1 shadows: the screen-space visibility mask opaque.frag loads per shadowed light.
@@ -4653,7 +4706,7 @@ namespace {
                 Texture* vol  = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
                 Texture* refr = g_live.pRefractColor   ? g_live.pRefractColor   : g_live.pDefaultWhite;
                 Texture* lin  = g_live.pLinearDepth    ? g_live.pLinearDepth    : g_live.pDefaultWhite;
-                DescriptorData p[7] = {};
+                DescriptorData p[8] = {};
                 p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
                 p[0].ppBuffers = &g_live.pFPFrameCbv;
                 p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -4668,7 +4721,16 @@ namespace {
                 p[5].mCount = 1; p[5].ppTextures = &lin;
                 p[6].mIndex = SRT_RES_IDX(SrtData, PerFrame, gReflectColor);
                 p[6].mCount = 1; p[6].ppTextures = &refr;
-                updateDescriptorSet(R, 0, g_live.pPerFrameSetFP, 7, p);
+                uint32_t fpn = 7;
+                // opaque.frag (used by FP) references gFroxelMaskNear — bind a type-valid buffer even
+                // though the FP path forces the brute loop (froxelDimsNear.x=0 in pFPLightCbv), so the
+                // descriptor is valid and never dereferenced. Mirrors the "bind every slot" pattern.
+                if (g_live.pFroxelMaskNear) {
+                    p[fpn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFroxelMaskNear);
+                    p[fpn].mCount = 1; p[fpn].ppBuffers = &g_live.pFroxelMaskNear;
+                    ++fpn;
+                }
+                updateDescriptorSet(R, 0, g_live.pPerFrameSetFP, fpn, p);
 
                 DescriptorData lp = {};
                 lp.mIndex = SRT_RES_IDX(SrtData, PerDraw, gLights);
@@ -5143,8 +5205,34 @@ namespace {
     constexpr float kMWLightConstant  = 0.36f;   // Morrowind.ini ConstantValue
     constexpr float kMWLightQuadratic = 3.25f;   // Morrowind.ini QuadraticValue (Method 2 → /R²)
     bool  g_drawDistLights  = true;              // A/B enable (dev panel checkbox; NOT a brightness knob)
+    // Phase F distant-light glow billboards. All brightness/fade/min-pixel maths run host-side (the
+    // instance record carries final colour+size+intensity), so these are plain live knobs — no shader
+    // or FrameData change. See [[project_light_radius_mesh_independent]] / [[project_emissive_light_coupling]].
+    bool  g_drawGlow        = true;              // A/B enable (dev panel checkbox)
+    float g_glowFlux        = 1.0f;              // kGlowFlux: sprite brightness law scale (the tunable far-border knob)
+    float g_glowFalloffPow  = 1.45f;             // ARTISTIC extra falloff exponent: intensity ∝ (fadeStart/d)^pow.
+                                                 //   (user-tuned 2026-07-16; 0 = pure physical radiance — see below)
+                                                 // DEFAULT 0 (flat) is the PHYSICAL answer: a resolved emitter's
+                                                 // RADIANCE is distance-invariant (the 1/r² apparent-area shrink is
+                                                 // cancelled by the r² gain in emitted light per viewing cone), so
+                                                 // per-pixel brightness is constant and the 1/d² total-flux falloff
+                                                 // comes for free from the sprite covering fewer pixels — carried
+                                                 // by the min-pixel flux-conserving clamp once it goes subpixel.
+                                                 // ANY pow>0 DOUBLE-COUNTS with that clamp (pow=2 ⇒ 1/d⁴ subpixel,
+                                                 // why lamps vanished by ~8 cells). Raise only for deliberate art.
+    float g_glowFadeStart   = 32768.0f;          // fade-in start (4 cells; user-tuned 2026-07-16, was 2-cell tier-0 end)
+    float g_glowFadeLen     = 8192.0f;           // fade-in ramp length (1 cell)
+    float g_glowMinPx       = 4.0f;              // min on-screen sprite half-size (px); flux-conserving floor
+    float g_glowWorldSize   = 512.0f;            // base sprite world half-size (mesh-INDEPENDENT; radius≠mesh size)
+    uint32_t g_lastGlowDrawn = 0;                // diagnostics: sprites drawn last frame (gpu color sub `glow=`)
+    double   g_lastGlowWalkMs = 0.0;             // diagnostics: CPU walk cost only (excl. RT bind + draw record)
     bool  g_useFroxel       = true;              // clustered forward A/B: OFF forces the brute gLights loop
                                                  // (SAME lights) so the froxel image can be diffed vs brute
+    bool  g_useFroxelNear   = true;              // NEAR clustered forward A/B: OFF forces the near brute loop
+                                                 // (opaque/multimap frags) so the near froxel image diffs vs brute
+    bool  g_dlLightNearDedup = true;             // Phase E handoff dedup: drop baked lights the NEAR path owns
+                                                 // (reach can't cross the near cut → they light nothing distant,
+                                                 // but the nearest-128 upload let them evict real far lights)
     float g_shadowVertWeight = 1.0f;    // VERTICAL importance weighting for slot ranking. The importance
                                         // metric weights the light's vertical offset from the eye (world Z,
                                         // camera-relative) by this factor before ranking. >1 demotes lights on
@@ -5601,6 +5689,9 @@ namespace {
         { TabBuilder t; t.panel = g_uiPanel; t.name = "Draw / A/B"; t.defaultOpen = true;
           t.checkbox("Dist lights: enable (numpad- live A/B)", &g_drawDistLights);
           t.checkbox("Dist lights: clustered froxel (off = brute, same lights)", &g_useFroxel);
+          t.checkbox("Near lights: clustered froxel (off = brute, same lights)", &g_useFroxelNear);
+          t.checkbox("Dist lights: drop near-owned (handoff dedup)", &g_dlLightNearDedup);
+          t.checkbox("Dist glow: enable (fixture billboards)", &g_drawGlow);
           t.checkbox("Draw: sky", &g_drawSky);
           t.checkbox("Draw: distant land", &g_drawDLLand);
           t.checkbox("Draw: distant statics", &g_drawDLStatics);
@@ -5638,6 +5729,12 @@ namespace {
           t.sliderF("Diffuse intensity", &g_litScale,     0.0f, 4.0f, 0.02f);
           t.sliderF("Albedo intensity",  &g_albedoScale,  0.0f, 4.0f, 0.02f);
           t.sliderF("Overall intensity", &g_overallScale, 0.0f, 4.0f, 0.02f);
+          t.sliderF("Dist glow: flux (brightness law scale)", &g_glowFlux,      0.0f, 8.0f,   0.05f);
+          t.sliderF("Dist glow: extra falloff pow (0=physical radiance; >0 dims far, art only)", &g_glowFalloffPow, 0.0f, 2.0f, 0.05f);
+          t.sliderF("Dist glow: fade-in start (world)",       &g_glowFadeStart, 0.0f, 65536.0f, 256.0f);
+          t.sliderF("Dist glow: fade-in ramp length (world)", &g_glowFadeLen,   64.0f, 16384.0f, 64.0f);
+          t.sliderF("Dist glow: min screen size (px floor)",  &g_glowMinPx,     0.5f, 16.0f,  0.5f);
+          t.sliderF("Dist glow: base world size",             &g_glowWorldSize, 8.0f, 2048.0f, 4.0f);
           t.flush(); }
 
         // -- Tab: Sky & Water (F7 takeover tells + water input isolation) --
@@ -5858,13 +5955,19 @@ namespace {
     bool createFroxelResources(Renderer* R) {
         if (g_live.pFroxelAssignPipeline) { return g_live.froxelReady; }
 
-        // (1) Froxel mask: GPU_ONLY, both UAV (froxelassign writes) and SRV (frags read). uint[maxWords].
+        // Size the mask from the ACTUAL render resolution (floored so a not-yet-sized 0 never
+        // under-allocates). init() re-inits on a resolution change, so this re-runs and re-sizes.
+        const uint32_t resW = g_live.width  ? g_live.width  : 1920u;
+        const uint32_t resH = g_live.height ? g_live.height : 1080u;
+        g_live.froxelBufWords = froxelWordsFor(resW, resH);
+
+        // (1) Froxel mask: GPU_ONLY, both UAV (froxelassign writes) and SRV (frags read). uint[bufWords].
         BufferLoadDesc mb = {};
         mb.mDesc.mDescriptors  = (DescriptorType)(DESCRIPTOR_TYPE_RW_BUFFER | DESCRIPTOR_TYPE_BUFFER);
         mb.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
         mb.mDesc.mStructStride = sizeof(uint32_t);
-        mb.mDesc.mElementCount = kFroxelMaxWords;
-        mb.mDesc.mSize         = (uint64_t)kFroxelMaxWords * sizeof(uint32_t);
+        mb.mDesc.mElementCount = g_live.froxelBufWords;
+        mb.mDesc.mSize         = (uint64_t)g_live.froxelBufWords * sizeof(uint32_t);
         mb.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
         mb.mDesc.pName         = "froxelMask";
         mb.ppBuffer            = &g_live.pFroxelMask;
@@ -5921,9 +6024,53 @@ namespace {
             d[1].mCount    = 1; d[1].ppBuffers = &g_live.pFroxelMask;
             updateDescriptorSet(R, 0, g_live.pFroxelSet, 2, d);
         }
+
+        // (5) NEAR froxel grid: a parallel mask + params (same layout/pipelines) for the near live
+        // lights. Own buffers so the near build (before the near colour phase) and the distant build
+        // (after it) never share buffer state. Non-fatal — on failure the near frags brute-loop.
+        {
+            BufferLoadDesc mbn = {};
+            mbn.mDesc.mDescriptors  = (DescriptorType)(DESCRIPTOR_TYPE_RW_BUFFER | DESCRIPTOR_TYPE_BUFFER);
+            mbn.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+            mbn.mDesc.mStructStride = sizeof(uint32_t);
+            mbn.mDesc.mElementCount = g_live.froxelBufWords;
+            mbn.mDesc.mSize         = (uint64_t)g_live.froxelBufWords * sizeof(uint32_t);
+            mbn.mDesc.mStartState   = RESOURCE_STATE_UNORDERED_ACCESS;
+            mbn.mDesc.pName         = "froxelMaskNear";
+            mbn.ppBuffer            = &g_live.pFroxelMaskNear;
+            addResource(&mbn, nullptr);
+
+            BufferLoadDesc pbn = {};
+            pbn.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            pbn.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            pbn.mDesc.mFlags       = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            pbn.mDesc.mSize        = kFroxelParamsBytes;
+            pbn.mDesc.pName        = "froxelParamsNear";
+            pbn.ppBuffer           = &g_live.pFroxelParamsCbvNear;
+            addResource(&pbn, nullptr);
+
+            waitForAllResourceLoads();
+            if (g_live.pFroxelMaskNear && g_live.pFroxelParamsCbvNear) {
+                DescriptorSetDesc fsetN = SRT_SET_DESC(FroxelSrtData, PerBatch, 1, 0);
+                addDescriptorSet(R, &fsetN, &g_live.pFroxelSetNear);
+                if (g_live.pFroxelSetNear) {
+                    DescriptorData dn[2] = {};
+                    dn[0].mIndex    = SRT_RES_IDX(FroxelSrtData, PerBatch, gFroxelParams);
+                    dn[0].ppBuffers = &g_live.pFroxelParamsCbvNear;
+                    dn[1].mIndex    = SRT_RES_IDX(FroxelSrtData, PerBatch, gFroxelMaskRW);
+                    dn[1].mCount    = 1; dn[1].ppBuffers = &g_live.pFroxelMaskNear;
+                    updateDescriptorSet(R, 0, g_live.pFroxelSetNear, 2, dn);
+                }
+            }
+            if (!g_live.pFroxelMaskNear || !g_live.pFroxelParamsCbvNear || !g_live.pFroxelSetNear) {
+                std::printf("[forge][froxel] NEAR grid alloc FAILED — near clustering disabled\n");
+            }
+        }
+
         g_live.froxelReady = true;
-        std::printf("[forge][froxel] ready (%u tiles max, %u slices, %u words)\n",
-                    kFroxelMaxTilesX * kFroxelMaxTilesY, kFroxelZSlices, kFroxelMaxWords);
+        std::printf("[forge][froxel] ready (%ux%u -> %u tiles, %u slices, %u words)\n",
+                    resW, resH, (froxelWordsFor(resW, resH) / (kFroxelZSlices * 4u)),
+                    kFroxelZSlices, g_live.froxelBufWords);
         return true;
     }
 }
@@ -6137,6 +6284,8 @@ namespace ForgeRender {
                           float dRel, float eyeAbsZ, float waterLevelAbs, bool underwater);
     void dlLiveRecord();
     void dlDrawHeroBlend();                                                 // Phase 4 post-water hero blend pass
+    bool buildGlowPath(Renderer* R);                                        // Phase F glow billboards: build (idempotent)
+    void dlDrawGlowBillboards();                                            // Phase F glow billboards: per-frame fill + draw
     bool dlCreateLiveRings(Renderer* R);   // statics instance/arg rings (forward: --forge-view eager init)
     void buildStaticsGrid();               // live cull grid (forward: --forge-view eager init)
     bool createShadowLightCullResources(Renderer* R);   // Follow-on 3: lazy from the shadow manager
@@ -6350,6 +6499,58 @@ namespace ForgeRender {
                 std::memcpy(lc + 16, lightBlob, (size_t)nL * sizeof(IPC::PointLightWire));
             }
             g_lastLightCount = nL;
+
+            // Near clustered forward: bin the just-uploaded near lights (same order as gLights) into a
+            // screen-tile x radial-slice froxel grid — exactly the distant fill in dlLiveCullAndBuild,
+            // but with the near range + the near mask. Near lights are camera-relative (eyePos=0),
+            // SAME space as In.WorldPos, so spheres[i] = the light pos as-is (no eye offset). The grid
+            // params ride gLights (froxelDimsNear/froxelZNear) — NOT gFrameData, which the distant path
+            // owns for this frame. froxelDimsNear.x=0 (default written below) => the near frags brute-loop.
+            {
+                const uint32_t kNearFroxDimsFloat = 4u + kMaxPointLights * 3u * 4u;  // LightData.froxelDimsNear
+                float* nfDims = (float*)lc + kNearFroxDimsFloat;
+                float* nfZ    = nfDims + 4;                                          // LightData.froxelZNear
+                nfDims[0] = 0.0f; nfDims[1] = 0.0f; nfDims[2] = 0.0f; nfDims[3] = 0.0f;
+                nfZ[0] = 0.0f; nfZ[1] = 0.0f; nfZ[2] = 0.0f; nfZ[3] = 0.0f;
+                g_live.froxelNearActive = false;
+                if (g_live.froxelReady && g_useFroxelNear && nL > 0u && g_live.pFroxelParamsCbvNear) {
+                    const float* mfd    = (const float*)g_live.pFrameCbv->pCpuMappedAddress;  // viewProj @ [0..15]
+                    const float  reachK = ((float*)lc)[1];                                    // == lightParams.y
+                    // Near radial range: d0 = a small floor; d1 = the DL handoff (mfd[51]=nearViewRange)
+                    // where the distant grid takes over, floored to cover interiors (where mfd[51] can be
+                    // stale — the DL cull early-returns there). Correctness holds for any d0/d1: assign +
+                    // frag use IDENTICAL params, so an out-of-range light just clamps to slice 0/NZ-1.
+                    const float d0 = 32.0f;
+                    const float d1 = std::max(std::max(mfd[51], 4096.0f), d0 * 1.01f);
+                    const uint32_t tile   = kFroxelTileNear;      // COARSE near grid (few, large-on-screen lights)
+                    const uint32_t nz     = kFroxelZSlicesNear;
+                    const uint32_t tilesX = (g_live.width  + tile - 1) / tile;
+                    const uint32_t tilesY = (g_live.height + tile - 1) / tile;
+                    uint32_t numWords = tilesX * tilesY * nz * 4u;
+                    if (numWords > g_live.froxelBufWords) { numWords = g_live.froxelBufWords; }  // defensive: RT grew w/o re-init
+                    const float logd0  = std::log(d0);
+                    const float invLog = 1.0f / std::max(std::log(d1 / d0), 1e-4f);
+
+                    float* fp = (float*)g_live.pFroxelParamsCbvNear->pCpuMappedAddress;
+                    std::memcpy(fp, mfd, 16 * sizeof(float));   // [0..15] = gFrameData.viewProj (rzViewProj)
+                    fp[16] = (float)tilesX;       fp[17] = (float)tilesY;       fp[18] = (float)nz;   fp[19] = (float)nL;
+                    fp[20] = (float)g_live.width; fp[21] = (float)g_live.height; fp[22] = (float)tile; fp[23] = (float)numWords;
+                    fp[24] = d0; fp[25] = d1; fp[26] = logd0; fp[27] = invLog;
+                    float* sph = fp + 28;
+                    const float* lgt = (const float*)(lc + 16);   // near lights: [i*12 + 0..2]=pos, [3]=radius
+                    for (uint32_t k = 0; k < nL; ++k) {
+                        sph[k * 4 + 0] = lgt[k * 12 + 0];              // pos.x (camera-relative)
+                        sph[k * 4 + 1] = lgt[k * 12 + 1];             // pos.y
+                        sph[k * 4 + 2] = lgt[k * 12 + 2];             // pos.z
+                        sph[k * 4 + 3] = lgt[k * 12 + 3] * reachK;    // reach = radius * reachK (frag's reach)
+                    }
+                    nfDims[0] = (float)tilesX; nfDims[1] = (float)tilesY; nfDims[2] = (float)nz; nfDims[3] = (float)tile;
+                    nfZ[0] = logd0; nfZ[1] = invLog;
+                    g_live.froxelNearActive     = true;
+                    g_live.froxelNearNumWords   = numWords;
+                    g_live.froxelNearLightCount = nL;
+                }
+            }
 
             // --- P2 light identity (LOG-ONLY) --------------------------------------------
             // The client packs a persistent 24-bit id + 8-bit change flags into each light's
@@ -7550,6 +7751,10 @@ namespace ForgeRender {
             for (uint32_t i = 0; i < g_lastLightCount; ++i) {
                 flc[4 + i * 12 + 11] = 0.0f;   // lights[i*3+2].w = shadow slot + 1 → none
             }
+            // Near clustering is MAIN-VIEW only: the froxel mask was built with the main viewProj, but
+            // the FP pass renders with the arm camera's viewProj, so a froxel lookup would mis-cluster
+            // FP pixels. Force the FP near frags to brute-loop (froxelDimsNear.x = 0).
+            flc[4 + kMaxPointLights * 3 * 4] = 0.0f;
         }
 
         resetCmdPool(R, g_live.pCmdPool);
@@ -7700,6 +7905,42 @@ namespace ForgeRender {
             bufBarrier2(g_live.pLightOccBits, RESOURCE_STATE_COPY_SOURCE, RESOURCE_STATE_UNORDERED_ACCESS);
         }
         gpuPhaseEnd(kGpuPhaseCull);
+
+        // Near clustered forward: build this frame's NEAR froxel light-mask HERE — in the pure-compute
+        // section (NO render target bound yet), NOT mid-colour-pass. Dispatching this tiny clear+scatter
+        // between the sky and near draws cost ~0.8-1ms of pure OVERHEAD: a graphics→compute→graphics
+        // context switch plus UAV/SR barrier bubbles that drain the render pass for microseconds of real
+        // work. Slotting it right after the GPU cull (already in compute mode) amortizes that away, and
+        // the mask is ready long before the colour pass reads it — the whole prepass/shadow/gtao/reflect
+        // stretch hides the build. Params + gLights.froxelDimsNear were filled at the light upload
+        // (pre-record). Leaves pFroxelMaskNear in SHADER_RESOURCE so opaque.frag/multimap.frag read it.
+        gpuPhaseBegin(kGpuPhaseFroxelNear);
+        {
+            auto froxBarrierN = [&](ResourceState from, ResourceState to) {
+                BufferBarrier bb = {}; bb.pBuffer = g_live.pFroxelMaskNear; bb.mCurrentState = from; bb.mNewState = to;
+                cmdResourceBarrier(g_live.pCmd, 1, &bb, 0, nullptr, 0, nullptr);
+            };
+            if (g_live.froxelNearActive && g_live.pFroxelAssignPipeline && g_live.pFroxelSetNear && g_live.froxelNearNumWords > 0) {
+                cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.7f, 0.2f, "FROXEL near light assign");
+                if (g_live.froxelMaskNearInShaderState) { froxBarrierN(RESOURCE_STATE_SHADER_RESOURCE, RESOURCE_STATE_UNORDERED_ACCESS); }
+                cmdBindPipeline(g_live.pCmd, g_live.pFroxelClearPipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pFroxelSetNear);
+                cmdDispatch(g_live.pCmd, (g_live.froxelNearNumWords + 63u) / 64u, 1, 1);
+                froxBarrierN(RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_UNORDERED_ACCESS);   // clear -> assign
+                cmdBindPipeline(g_live.pCmd, g_live.pFroxelAssignPipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pFroxelSetNear);
+                cmdDispatch(g_live.pCmd, (g_live.froxelNearLightCount + 63u) / 64u, 1, 1);
+                froxBarrierN(RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE);
+                cmdEndDebugMarker(g_live.pCmd);
+                g_live.froxelMaskNearInShaderState = true;
+            } else if (g_live.pFroxelMaskNear && !g_live.froxelMaskNearInShaderState) {
+                // Inactive + still in the UAV creation state — move it to SHADER_RESOURCE so its SRV
+                // binding in pPerFrameSet is valid (near frags never index it while froxelDimsNear.x==0).
+                froxBarrierN(RESOURCE_STATE_UNORDERED_ACCESS, RESOURCE_STATE_SHADER_RESOURCE);
+                g_live.froxelMaskNearInShaderState = true;
+            }
+        }
+        gpuPhaseEnd(kGpuPhaseFroxelNear);
 
         // Color target: the MSAA color when antialiasing is on (resolved into pRT at the end),
         // else the shared pRT directly. The MSAA target is left in RENDER_TARGET between frames
@@ -8847,6 +9088,7 @@ namespace ForgeRender {
         }
 
         gpuPhaseEnd(kGpuPhaseColorSky);
+
         gpuPhaseBegin(kGpuPhaseColorNear);
 
         // Bind a pipeline FIRST — cmdBindPipeline establishes the root signature the descriptor
@@ -9416,6 +9658,26 @@ namespace ForgeRender {
         cmdBindRenderTargets(g_live.pCmd, nullptr);
 
         gpuPhaseEnd(kGpuPhaseWater);
+
+        // ===================== PHASE F: DISTANT-LIGHT GLOW BILLBOARDS =====================
+        // Additive camera-facing sprites for fixture lights whose tier-0 static meshes have coverage-
+        // culled (~2 cells). Drawn AFTER water (the whole opaque+DL+water frame is complete, so the
+        // GEQUAL depth test occludes them behind walls) but BEFORE the sorted-alpha pass, so AT1
+        // translucents (banners/glass) composite correctly OVER the glow. The water pass unbound the
+        // render targets (above), so re-bind our own colour+depth (LOAD) + viewport/scissor here.
+        gpuPhaseBegin(kGpuPhaseColorGlow);
+        if (g_drawGlow && g_live.glowReady) {
+            BindRenderTargetsDesc gbind = {};
+            gbind.mRenderTargetCount = 1;
+            gbind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };
+            gbind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_LOAD };
+            cmdBindRenderTargets(g_live.pCmd, &gbind);
+            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+            dlDrawGlowBillboards();
+            cmdBindRenderTargets(g_live.pCmd, nullptr);
+        }
+        gpuPhaseEnd(kGpuPhaseColorGlow);
 
         // ===================== AT1: SORTED-ALPHA PASS =====================
         // The scene-1 blended world shapes (banners/tapestries/foliage/glass), drawn AFTER water so
@@ -10137,7 +10399,7 @@ namespace ForgeRender {
             // commands. Same phase brackets as the gpu split; "other" = record − Frame bracket
             // (pre-phase barriers, query resolve, endCmd). shadow further split static vs dyn —
             // the dyn pass re-records 6 face passes per dyn-flagged slot EVERY frame.
-            LOG::logline(">> [forge-hb] rec split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f) gtao=%.2f reflect=%.2f color=%.2f (sky=%.2f near=%.2f skin=%.2f mm=%.2f dl=%.2f) water=%.2f alpha=%.2f resolve=%.2f other=%.2f ms",
+            LOG::logline(">> [forge-hb] rec split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f) gtao=%.2f reflect=%.2f color=%.2f (sky=%.2f near=%.2f skin=%.2f mm=%.2f dl=%.2f) water=%.2f glow=%.2f alpha=%.2f resolve=%.2f other=%.2f ms",
                          g_lastCpuPhaseMs[kGpuPhaseCull], g_lastCpuPhaseMs[kGpuPhasePrepass],
                          g_lastCpuPhaseMs[kGpuPhaseShadow],
                          g_lastCpuPhaseMs[kGpuPhaseShadowStatic], g_lastCpuPhaseMs[kGpuPhaseShadowDyn],
@@ -10146,7 +10408,8 @@ namespace ForgeRender {
                          g_lastCpuPhaseMs[kGpuPhaseColorSky], g_lastCpuPhaseMs[kGpuPhaseColorNear],
                          g_lastCpuPhaseMs[kGpuPhaseColorSkin], g_lastCpuPhaseMs[kGpuPhaseColorMM],
                          g_lastCpuPhaseMs[kGpuPhaseColorDL],
-                         g_lastCpuPhaseMs[kGpuPhaseWater], g_lastCpuPhaseMs[kGpuPhaseColorAlpha],
+                         g_lastCpuPhaseMs[kGpuPhaseWater], g_lastCpuPhaseMs[kGpuPhaseColorGlow],
+                         g_lastCpuPhaseMs[kGpuPhaseColorAlpha],
                          g_lastCpuPhaseMs[kGpuPhaseResolve],
                          g_lastRecMs - g_lastCpuPhaseMs[kGpuPhaseFrame]);
             LOG::logline(">> [forge-hb] gpu split: cull=%.2f prepass=%.2f shadow=%.2f (st=%.2f dyn=%.2f) gtao=%.2f (lin=%.2f mask=%.2f) reflect=%.2f color=%.2f water=%.2f resolve=%.2f ms"
@@ -10163,12 +10426,16 @@ namespace ForgeRender {
                          (double)g_lastNearTris / 1e6, g_lastNearATDraws);
             // Host-GPU-shrink sub-phases: WHERE inside color/reflect the ms live. sky+near+skin+mm+dl
             // ≈ color above (same frame's timestamps); refl sky = reflect − reflgeo.
-            LOG::logline(">> [forge-hb] gpu color sub: sky=%.2f near=%.2f skin=%.2f mm=%.2f dl=%.2f alpha=%.2f"
+            LOG::logline(">> [forge-hb] gpu color sub: sky=%.2f nearfrox=%.2f(%s,n=%u) near=%.2f skin=%.2f mm=%.2f dl=%.2f alpha=%.2f glow=%.2f(%u,walk=%.2fms)"
                          " | refl geo=%.2f (refl sky=%.2f) ms",
-                         g_lastGpuPhaseMs[kGpuPhaseColorSky],  g_lastGpuPhaseMs[kGpuPhaseColorNear],
+                         g_lastGpuPhaseMs[kGpuPhaseColorSky],
+                         g_lastGpuPhaseMs[kGpuPhaseFroxelNear],
+                         g_live.froxelNearActive ? "on" : "off", g_live.froxelNearLightCount,
+                         g_lastGpuPhaseMs[kGpuPhaseColorNear],
                          g_lastGpuPhaseMs[kGpuPhaseColorSkin], g_lastGpuPhaseMs[kGpuPhaseColorMM],
                          g_lastGpuPhaseMs[kGpuPhaseColorDL],
                          g_lastGpuPhaseMs[kGpuPhaseColorAlpha],
+                         g_lastGpuPhaseMs[kGpuPhaseColorGlow], g_lastGlowDrawn, g_lastGlowWalkMs,
                          g_lastGpuPhaseMs[kGpuPhaseReflGeo],
                          g_lastGpuPhaseMs[kGpuPhaseReflect] - g_lastGpuPhaseMs[kGpuPhaseReflGeo]);
             // Whole-frame GPU EXECUTION vs submit->fence WALL clock. If exec << wall, the frame is
@@ -10326,6 +10593,18 @@ namespace ForgeRender {
         if (g_live.pWaterPipeline || g_live.pWaterShader) {
             if (buildWaterPipeline(R)) {
                 LOG::logline(">> [forge][water] water graphics pipeline hot-reloaded (water.vert + water.frag)"); LOG::flush();
+            }
+        }
+
+        // Phase F: rebuild the glow pipeline so glow.vert/.frag edits go live on the same trigger.
+        // Only the shader + PSO are swapped (the base/instance VBs are untouched); skipped cleanly if
+        // the glow path was never built (g_live.glowReady false, e.g. no baked lights).
+        if (g_live.glowReady) {
+            removePipeline(R, g_live.pGlowPipeline); g_live.pGlowPipeline = nullptr;
+            removeShader(R, g_live.pGlowShader);     g_live.pGlowShader = nullptr;
+            g_live.glowReady = false;   // buildGlowPath rebuilds shader+PSO; base/instance VBs already exist
+            if (buildGlowPath(R)) {
+                LOG::logline(">> [forge][glow] glow graphics pipeline hot-reloaded (glow.vert + glow.frag)"); LOG::flush();
             }
         }
     }
@@ -10808,6 +11087,11 @@ namespace ForgeRender {
     };
     std::vector<DlBakedLight> g_dlBakedLights;
     bool  g_dlBakedLightsLoaded = false;
+    // Phase F: compact, MESHED-only glow source list (positions + precomputed luminance/chromaticity),
+    // built once from g_dlBakedLights. The per-frame billboard walk streams THIS — cache-tight, no
+    // meshless skips (6098/9504 were meshless), no per-frame colour math — not the full 20B×9504 set.
+    struct GlowSrc { float x, y, z, lum, hueR, hueG, hueB; };
+    std::vector<GlowSrc> g_glowSrc;
     float g_dlBakedLightStreamR = 8192.0f * 6.0f;   // ~6 cells: deferred/billboard working radius
     // (g_drawDistLights / g_distLightIntensity / g_distLightRadiusScale declared up by the shadow
     //  knobs so the dev-panel UI setup — which runs earlier in the file — can bind sliders to them.)
@@ -11825,6 +12109,133 @@ namespace ForgeRender {
 
         std::printf("[forge][sky] pipelines built (dome/cloud/sun/fill)\n");
         g_sky.ready = true;
+        return true;
+    }
+
+    // Phase F — build the distant-light GLOW billboard path (glow.vert/.frag). One additive, camera-
+    // facing procedural sprite per meshed baked light. Reuses opaque.srt.h / DefaultRootSignature.
+    //   binding 0 = a static unit-quad (corner.xy + radial uv, float4, stride 16, 6 verts / 2 tris),
+    //   binding 1 = the per-instance survivor record (I0 = cam-rel centre.xyz + worldSize,
+    //               I1 = colour.rgb + intensity; stride 32) sized for the whole resident baked set.
+    // Additive SRCALPHA/ONE, depth GEQUAL test / NO write (nearer geometry occludes the sprite),
+    // cull NONE. Idempotent + hot-reload-safe: re-creates ONLY the shader+PSO when the VBs already
+    // exist (the graphics hot-reload nulls those two). Requires g_dlBakedLights already loaded (the
+    // instance buffer is sized from it) — called from the DL live init after loadDistantLand.
+    bool buildGlowPath(Renderer* R) {
+        if (g_live.glowReady) { return true; }
+        if (!g_live.pRT) { return false; }
+
+        if (!g_live.pGlowShader) {
+            ShaderLoadDesc sd = {};
+            sd.mVert.pFileName = "glow.vert";
+            sd.mFrag.pFileName = "glow.frag";
+            addShader(R, &sd, &g_live.pGlowShader);
+            if (!g_live.pGlowShader) { std::printf("[forge][glow] addShader(glow) FAILED\n"); return false; }
+        }
+
+        if (!g_live.pGlowPipeline) {
+            VertexLayout vl = {};
+            vl.mBindingCount = 2;
+            vl.mBindings[0].mStride = 16;                     // corner.xy + radial uv (float4)
+            vl.mBindings[0].mRate   = VERTEX_BINDING_RATE_VERTEX;
+            vl.mBindings[1].mStride = 32;                     // I0 (centre.xyz,size) + I1 (colour.rgb,intensity)
+            vl.mBindings[1].mRate   = VERTEX_BINDING_RATE_INSTANCE;
+            vl.mAttribCount = 3;
+            vl.mAttribs[0].mSemantic = SEMANTIC_POSITION;
+            vl.mAttribs[0].mFormat   = TinyImageFormat_R32G32B32A32_SFLOAT;
+            vl.mAttribs[0].mBinding  = 0; vl.mAttribs[0].mLocation = 0; vl.mAttribs[0].mOffset = 0;
+            vl.mAttribs[1].mSemantic = SEMANTIC_TEXCOORD1;
+            vl.mAttribs[1].mFormat   = TinyImageFormat_R32G32B32A32_SFLOAT;
+            vl.mAttribs[1].mBinding  = 1; vl.mAttribs[1].mLocation = 1; vl.mAttribs[1].mOffset = 0;
+            vl.mAttribs[2].mSemantic = SEMANTIC_TEXCOORD2;
+            vl.mAttribs[2].mFormat   = TinyImageFormat_R32G32B32A32_SFLOAT;
+            vl.mAttribs[2].mBinding  = 1; vl.mAttribs[2].mLocation = 2; vl.mAttribs[2].mOffset = 16;
+
+            DepthStateDesc ds = {}; ds.mDepthTest = true; ds.mDepthWrite = false; ds.mDepthFunc = CMP_GEQUAL;
+            RasterizerStateDesc rs = {}; rs.mCullMode = CULL_MODE_NONE; rs.mFrontFace = FRONT_FACE_CCW;
+            // Additive: out = src.rgb * src.a + dst (SRCALPHA/ONE).
+            BlendStateDesc ab = {};
+            ab.mSrcFactors[0] = BC_SRC_ALPHA;  ab.mDstFactors[0] = BC_ONE;
+            ab.mSrcAlphaFactors[0] = BC_ONE;   ab.mDstAlphaFactors[0] = BC_ONE;
+            ab.mBlendModes[0] = BM_ADD;        ab.mBlendAlphaModes[0] = BM_ADD;
+            ab.mColorWriteMasks[0] = COLOR_MASK_ALL; ab.mRenderTargetMask = BLEND_STATE_TARGET_0;
+            ab.mIndependentBlend = false;
+
+            PipelineDesc pd = {};
+            pd.mType = PIPELINE_TYPE_GRAPHICS;
+            GraphicsPipelineDesc& g = pd.mGraphicsDesc;
+            g.mPrimitiveTopo = PRIMITIVE_TOPO_TRI_LIST;
+            g.mRenderTargetCount = 1;
+            g.pColorFormats = &g_live.pRT->mFormat;
+            g.mSampleCount = (SampleCount)g_live.sampleCount;
+            g.mSampleQuality = 0;
+            g.mDepthStencilFormat = TinyImageFormat_D32_SFLOAT;
+            g.pDepthState = &ds;
+            g.pVertexLayout = &vl;
+            g.pRasterizerState = &rs;
+            g.pBlendState = &ab;
+            g.pShaderProgram = g_live.pGlowShader;
+            addPipeline(R, &pd, &g_live.pGlowPipeline);
+            if (!g_live.pGlowPipeline) { std::printf("[forge][glow] addPipeline(glow) FAILED\n"); return false; }
+        }
+
+        // Static unit-quad base VB (6 verts, 2 tris). Each vert = float4(cornerX, cornerY, uvX, uvY),
+        // uv == corner so r = length(uv) is 0 at the centre and 1 at the edge midpoints.
+        if (!g_live.pGlowBaseVB) {
+            BufferLoadDesc vb = {};
+            vb.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+            vb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            vb.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            vb.mDesc.mSize = 6 * 16; vb.mDesc.pName = "glowBaseVB";
+            vb.pData = nullptr; vb.ppBuffer = &g_live.pGlowBaseVB;
+            addResource(&vb, nullptr);
+            waitForAllResourceLoads();
+            if (!g_live.pGlowBaseVB) { std::printf("[forge][glow] base VB alloc FAILED\n"); return false; }
+            const float quad[6][2] = {
+                { -1.0f,  1.0f }, {  1.0f,  1.0f }, {  1.0f, -1.0f },   // TL, TR, BR
+                { -1.0f,  1.0f }, {  1.0f, -1.0f }, { -1.0f, -1.0f },   // TL, BR, BL
+            };
+            float* bv = (float*)g_live.pGlowBaseVB->pCpuMappedAddress;
+            for (int i = 0; i < 6; ++i) {
+                bv[i*4+0] = quad[i][0]; bv[i*4+1] = quad[i][1];   // corner.xy
+                bv[i*4+2] = quad[i][0]; bv[i*4+3] = quad[i][1];   // radial uv == corner
+            }
+        }
+
+        // Per-instance survivor buffer, sized for the whole resident baked set (the per-frame fill
+        // writes only survivors, then draws instanceCount = nSurvivors). Guard the empty case.
+        // Compact the MESHED baked lights into g_glowSrc once, precomputing luminance + chromaticity so
+        // the per-frame walk does no colour math and skips no meshless entries (they aren't in the list).
+        if (g_glowSrc.empty() && !g_dlBakedLights.empty()) {
+            g_glowSrc.reserve(g_dlBakedLights.size());
+            for (const DlBakedLight& L : g_dlBakedLights) {
+                if (!L.hasMesh) { continue; }
+                const float lr = L.r * (1.0f/255.0f), lg = L.g * (1.0f/255.0f), lb = L.b * (1.0f/255.0f);
+                const float lum = std::max(lr, std::max(lg, lb));
+                if (lum <= 1e-4f) { continue; }   // black/zero light: no glow ever — drop at build time
+                const float inv = 1.0f / lum;
+                g_glowSrc.push_back(GlowSrc{ L.x, L.y, L.z, lum, lr*inv, lg*inv, lb*inv });
+            }
+            LOG::logline(">> [forge][glow] compacted %zu meshed sources (of %zu baked)",
+                         g_glowSrc.size(), g_dlBakedLights.size());
+        }
+        if (!g_live.pGlowInstBuf) {
+            uint32_t cap = (uint32_t)g_glowSrc.size();
+            if (cap == 0) { cap = 1; }   // keep a valid 1-record buffer even with no lights (draws 0)
+            BufferLoadDesc ib = {};
+            ib.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+            ib.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            ib.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            ib.mDesc.mSize = (uint64_t)cap * 32; ib.mDesc.pName = "glowInstBuf";
+            ib.pData = nullptr; ib.ppBuffer = &g_live.pGlowInstBuf;
+            addResource(&ib, nullptr);
+            waitForAllResourceLoads();
+            if (!g_live.pGlowInstBuf) { std::printf("[forge][glow] instance VB alloc FAILED\n"); return false; }
+            g_live.glowInstCap = cap;
+        }
+
+        std::printf("[forge][glow] pipeline built (instCap=%u)\n", g_live.glowInstCap);
+        g_live.glowReady = true;
         return true;
     }
 
@@ -13695,6 +14106,9 @@ namespace ForgeRender {
                 dlCreateCullResources(R);
             }
             else { std::printf("[forge][dl] live statics unavailable — land only\n"); }
+            // Phase F: build the glow-billboard path now that loadDistantLand has populated
+            // g_dlBakedLights (the instance buffer is sized from it). Non-fatal (glowReady gates the pass).
+            buildGlowPath(R);
             g_dlLiveInit = true;
             std::printf("[forge][dl] live init done (land meshes=%u, statics=%d)\n",
                         g_landMeshCount, (int)g_staticsLiveOk);
@@ -13736,15 +14150,38 @@ namespace ForgeRender {
             // reachK (shader's posR.w * reachK = a light's max reach) — hoisted so the candidate
             // loop can frustum-cull by reach-sphere AND the fill below reuses it (one source).
             const float reachK = g_shadowRangeK * std::min(std::max(g_lightReachFrac, 0.05f), 1.0f);
+            // Phase E — near↔far handoff dedup. This baked set feeds ONLY the main-view DL land +
+            // DL statics (the reflection binds the LIVE near set at dlReflectRecordGeo), and both are
+            // near-cut: statics inside nearViewRange-768 are skipped as near-path duplicates, and DL
+            // land inside nearViewRange-1152 is z-sunk under MW's near land (always ≥1 cell = 8192
+            // around the eye) so its fragments fail early-Z. So a baked light whose whole reach sphere
+            // stays inside `nearOwn` of the eye lights ZERO distant fragments — the live near set is
+            // already drawing that light, on the near geometry that owns those pixels. Dropping it is
+            // provably invisible, and NOT free to keep: the ≤128 upload keeps the NEAREST candidates,
+            // so near-owned duplicates were evicting genuinely distant lights, which then never
+            // appeared at all. nearOwn is deliberately the SMALLER of the two cuts (conservative).
+            // Viewer/no-near-cut paths set g_dlNearViewRange = 0 → nearOwn 0 → the test never fires.
+            const float nearOwn = (g_dlLightNearDedup && !g_dlNoStaticsNearCut)
+                                ? std::max(g_dlNearViewRange - 1152.0f, 0.0f) : 0.0f;
             static std::vector<std::pair<float, uint32_t>> s_cand;   // (dist2, index), reused
             s_cand.clear();
-            uint32_t inRadius = 0;   // diagnostics: within stream radius, pre-frustum
+            uint32_t inRadius  = 0;  // diagnostics: within stream radius, pre-dedup/frustum
+            uint32_t nearOwned = 0;  // diagnostics: dropped as near-path-owned
+            float    nearestD2 = 3.4e38f;  // closest streamed light — read against nearOwn, it says at a
+                                           // glance whether a 0-drop funnel means "gate broken" or
+                                           // "nothing is in the near field" (hilltop: nearest=35652).
             for (uint32_t i = 0; i < (uint32_t)g_dlBakedLights.size(); ++i) {
                 const DlBakedLight& L = g_dlBakedLights[i];
                 const float dx = L.x - eye[0], dy = L.y - eye[1], dz = L.z - eye[2];
                 const float d2 = dx * dx + dy * dy + dz * dz;
                 if (d2 > sr2) { continue; }
                 ++inRadius;
+                if (d2 < nearestD2) { nearestD2 = d2; }
+                const float reach = L.radius * reachK;
+                if (nearOwn > 0.0f && reach < nearOwn) {
+                    const float lim = nearOwn - reach;   // reach sphere entirely inside the near ball
+                    if (d2 <= lim * lim) { ++nearOwned; continue; }
+                }
                 // Frustum-cull by the light's reach-sphere. A baked light whose reach doesn't
                 // intersect the view frustum illuminates ZERO visible distant fragments — behind
                 // the camera, off to the sides, or (looking down from height) below the bottom
@@ -13752,7 +14189,7 @@ namespace ForgeRender {
                 // fragments x uploaded-lights, and most streamed lights are off-screen. Conservative
                 // (sphere-vs-frustum), so no visual change — just a much shorter loop. reach =
                 // radius * reachK matches the shader's max reach exactly.
-                if (!dlSphereInFrustum(planes, dx, dy, dz, L.radius * reachK)) { continue; }
+                if (!dlSphereInFrustum(planes, dx, dy, dz, reach)) { continue; }
                 s_cand.push_back(std::make_pair(d2, i));
             }
             const uint32_t streamed = (uint32_t)s_cand.size();
@@ -13800,8 +14237,11 @@ namespace ForgeRender {
                                   : (streamed > s_lastStreamed ? streamed - s_lastStreamed
                                                                : s_lastStreamed - streamed);
             if (delta >= 16u || (++s_throttle % 300) == 0) {
-                LOG::logline(">> [forge][dl] baked lights: %u in-radius -> %u in-frustum -> %u uploaded (/ %zu, r=%.0f)",
-                             inRadius, streamed, nUp, g_dlBakedLights.size(), g_dlBakedLightStreamR);
+                LOG::logline(">> [forge][dl] baked lights: %u in-radius -> %u near-owned dropped -> %u in-frustum"
+                             " -> %u uploaded (/ %zu, r=%.0f, nearOwn=%.0f, nearest=%.0f)",
+                             inRadius, nearOwned, streamed, nUp, g_dlBakedLights.size(),
+                             g_dlBakedLightStreamR, nearOwn,
+                             (inRadius ? std::sqrt(nearestD2) : -1.0f));
                 s_lastStreamed = streamed;
             }
 
@@ -13819,7 +14259,7 @@ namespace ForgeRender {
                 const uint32_t tilesX = (g_live.width  + tile - 1) / tile;
                 const uint32_t tilesY = (g_live.height + tile - 1) / tile;
                 uint32_t numWords = tilesX * tilesY * kFroxelZSlices * 4u;
-                if (numWords > kFroxelMaxWords) { numWords = kFroxelMaxWords; }    // safety clamp (huge res)
+                if (numWords > g_live.froxelBufWords) { numWords = g_live.froxelBufWords; }  // defensive: RT grew w/o re-init
                 const float logd0  = std::log(d0);
                 const float invLog = 1.0f / std::max(std::log(d1 / d0), 1e-4f);
 
@@ -14145,6 +14585,140 @@ namespace ForgeRender {
             cmdExecuteIndirect(g_live.pCmd, INDIRECT_DRAW_INDEX, g_liveLastSubsets,
                                g_pStaticsArgsRing, 0, nullptr, 0);
         }
+        cmdEndDebugMarker(g_live.pCmd);
+    }
+
+    // Phase F — per-frame fill + draw of the distant-light GLOW billboards. Walks the compact meshed-only
+    // g_glowSrc (built once, luminance/chromaticity precomputed), keeps sources in the [fadeStart, maxView)
+    // shell + frustum, and draws one additive camera-facing sprite each. Per-pixel brightness = the light's
+    // distance-INVARIANT radiance (g_glowFlux · lum): a resolved emitter's per-pixel value is constant with
+    // distance (the two r² effects cancel); the 1/d² total-flux falloff emerges from the sprite shrinking on
+    // screen, and the min-pixel floor (flux-conserving: intensity /= grow²) carries it once it goes subpixel.
+    // NO mesh size feeds brightness; the sprite WORLD size is a dev knob. Camera-relative (positions
+    // pre-shifted by -g_dlEye). The caller binds the colour+depth RTs (LOAD) + viewport and wraps this in
+    // gpuPhaseBegin/End(kGpuPhaseColorGlow). See tasks/forge-deferred-lightmap.md Phase F.
+    void dlDrawGlowBillboards() {
+        g_lastGlowDrawn = 0;
+        if (!g_drawGlow || !g_live.glowReady || !g_dlExterior) { return; }
+        if (g_glowSrc.empty() || !g_live.pGlowInstBuf || g_live.glowInstCap == 0) { return; }
+        if (!g_live.pFrameCbv) { return; }
+
+        const double tWalk0 = hostNowMs();   // isolate the CPU walk from the caller's RT-bind/draw overhead
+        const float* vp = (const float*)g_live.pFrameCbv->pCpuMappedAddress;   // reverse-Z, camera-relative (v*M)
+        float planes[6][4];
+        dlExtractFrustum(vp, planes);
+        const float eye[3] = { g_dlEye[0], g_dlEye[1], g_dlEye[2] };
+
+        const float fadeStart = g_glowFadeStart;
+        const float fadeEnd   = g_glowFadeStart + std::max(g_glowFadeLen, 1.0f);
+        const float baseSize  = std::max(g_glowWorldSize, 1.0f);
+        const float minPx     = std::max(g_glowMinPx, 0.0f);
+        const float ndcToPxX  = 0.5f * (float)g_live.width;        // NDC[-1,1] half-width → pixels
+        const uint32_t cap    = g_live.glowInstCap;
+        // Cap the glow at the REAL max view distance (the distant-land draw distance) so sprites vanish
+        // into the fog exactly where the world stops rendering — NOT out at the extended frustum far plane,
+        // which would leave lamps floating past the fogged-out horizon. Smooth fade-out over the outer band
+        // so they don't pop at the edge (matches the terrain fogging out at the same distance).
+        const float maxView   = (Configuration.DL.DrawDist > 0 ? (float)Configuration.DL.DrawDist : 40.0f) * 8192.0f;
+        const float farFadeS  = std::max(0.85f * maxView, fadeEnd + 1.0f);   // fade-out begins here → 0 at maxView
+        const float fadeStart2 = fadeStart * fadeStart;                      // squared bounds → reject without sqrt
+        const float maxView2   = maxView * maxView;
+
+        // v*M projection of a camera-relative world point (row-major viewProj bytes) → clip.x, clip.w.
+        auto clipXW = [&](float x, float y, float z, float& ox, float& ow) {
+            ox = x*vp[0] + y*vp[4] + z*vp[8]  + vp[12];
+            ow = x*vp[3] + y*vp[7] + z*vp[11] + vp[15];
+        };
+
+        float* out = (float*)g_live.pGlowInstBuf->pCpuMappedAddress;
+        uint32_t n = 0;
+        const size_t nSrc = g_glowSrc.size();
+        const GlowSrc* src = g_glowSrc.data();
+        for (size_t i = 0; i < nSrc && n < cap; ++i) {
+            const GlowSrc& L = src[i];                             // meshed + non-black only (compacted at build)
+
+            const float cx = L.x - eye[0], cy = L.y - eye[1], cz = L.z - eye[2];
+            const float d2 = cx*cx + cy*cy + cz*cz;
+            // Cheap rejects FIRST — no sqrt, no pow, no projection (most sources die here): distance shell
+            // [fadeStart, maxView) via SQUARED bounds, then a 6-plane frustum test. The expensive per-sprite
+            // maths below runs only for the ~few-hundred survivors.
+            if (d2 <= fadeStart2) { continue; }                    // still inside the fixture mesh's coverage
+            if (d2 >= maxView2)   { continue; }                    // beyond the rendered world (matches view distance)
+            // Conservative frustum radius = baseSize (min-px grow only ENLARGES far/subpixel sprites, whose
+            // edge-of-frustum case is negligible + dim). Uses cx/cy/cz directly — no sqrt needed.
+            if (!dlSphereInFrustum(planes, cx, cy, cz, baseSize)) { continue; }
+
+            const float d = std::sqrt(d2);                         // survivors only
+            // Global fade-in (smoothstep) ramps up as the fixture mesh coverage-culls; far fade-out → 0 at maxView.
+            float fade;
+            if (d >= fadeEnd) { fade = 1.0f; }
+            else { const float t = (d - fadeStart) / (fadeEnd - fadeStart); fade = t * t * (3.0f - 2.0f * t); }
+            if (d > farFadeS) {
+                const float t = (maxView - d) / (maxView - farFadeS);
+                fade *= t * t * (3.0f - 2.0f * t);
+            }
+
+            // Luminance + chromaticity were precomputed at build time (g_glowSrc).
+            const float lum  = L.lum;
+            const float hueR = L.hueR, hueG = L.hueG, hueB = L.hueB;
+
+            // Per-pixel RADIANCE = g_glowFlux · lum, distance-invariant (constant for a resolved emitter —
+            // the two r² effects cancel). The correct 1/d² total-flux falloff is NOT applied here: it emerges
+            // from the sprite shrinking on screen, and once it hits the min-pixel floor the flux-conserving
+            // clamp below (intensity /= grow², grow ∝ d) supplies the 1/d² per-pixel dimming. g_glowFalloffPow
+            // is an ARTISTIC extra term (default 0 = no-op = physical); >0 double-counts with the clamp.
+            float intensity = g_glowFlux * lum * fade;
+            if (g_glowFalloffPow > 0.0f) { intensity *= std::pow(fadeStart / d, g_glowFalloffPow); }
+
+            // Min-pixel floor (flux-conserving), host-side so g_glowMinPx stays a live knob and the shader
+            // needs no invScreen/threshold. Build the SAME billboard right vector the VS will, project the
+            // centre and a +right·baseSize offset, and grow baseSize until the on-screen half-width reaches
+            // minPx; scale intensity by 1/grow² so intensity·pixelArea is conserved.
+            const float invD = 1.0f / d;
+            const float fwd[3] = { cx*invD, cy*invD, cz*invD };
+            float up0[3];
+            if (std::fabs(fwd[2]) > 0.95f) { up0[0]=0.0f; up0[1]=1.0f; up0[2]=0.0f; }
+            else                           { up0[0]=0.0f; up0[1]=0.0f; up0[2]=1.0f; }
+            float rgt[3] = { up0[1]*fwd[2] - up0[2]*fwd[1],
+                             up0[2]*fwd[0] - up0[0]*fwd[2],
+                             up0[0]*fwd[1] - up0[1]*fwd[0] };
+            const float rl = std::sqrt(rgt[0]*rgt[0] + rgt[1]*rgt[1] + rgt[2]*rgt[2]) + 1e-6f;
+            rgt[0]/=rl; rgt[1]/=rl; rgt[2]/=rl;
+
+            float finalSize = baseSize;
+            float cX, cW, rX, rW;
+            clipXW(cx, cy, cz, cX, cW);
+            clipXW(cx + rgt[0]*baseSize, cy + rgt[1]*baseSize, cz + rgt[2]*baseSize, rX, rW);
+            if (cW > 1e-4f && rW > 1e-4f) {
+                const float ndcHalf = std::fabs(rX/rW - cX/cW);
+                const float pxHalf  = ndcHalf * ndcToPxX;
+                if (pxHalf > 1e-4f && pxHalf < minPx) {
+                    const float grow = minPx / pxHalf;
+                    finalSize = baseSize * grow;
+                    intensity /= (grow * grow);
+                }
+            }
+
+            float* rec = out + (size_t)n * 8;
+            rec[0]=cx;   rec[1]=cy;   rec[2]=cz;   rec[3]=finalSize;    // I0 = centre (cam-rel) + worldSize
+            rec[4]=hueR; rec[5]=hueG; rec[6]=hueB; rec[7]=intensity;    // I1 = colour (chromaticity) + intensity
+            ++n;
+        }
+        g_lastGlowWalkMs = hostNowMs() - tWalk0;   // pure CPU walk cost (excludes RT bind + draw record)
+
+        g_lastGlowDrawn = n;
+        if (n == 0) { return; }
+
+        cmdBeginDebugMarker(g_live.pCmd, 0.9f, 0.7f, 0.3f, "DIST GLOW");
+        cmdBindPipeline(g_live.pCmd, g_live.pGlowPipeline);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSet);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSet);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSet);
+        Buffer*  gvbs[2]     = { g_live.pGlowBaseVB, g_live.pGlowInstBuf };
+        uint32_t gstrides[2] = { 16, 32 };
+        cmdBindVertexBuffer(g_live.pCmd, 2, gvbs, gstrides, nullptr);
+        cmdDrawInstanced(g_live.pCmd, 6, 0, n, 0);
         cmdEndDebugMarker(g_live.pCmd);
     }
 
@@ -14839,6 +15413,11 @@ namespace ForgeRender {
         if (g_live.pWaterNormalVol)         { removeResource(g_live.pWaterNormalVol); }
         if (g_live.pWaterPipeline)          { removePipeline(R, g_live.pWaterPipeline); }
         if (g_live.pWaterShader)            { removeShader(R, g_live.pWaterShader); }
+        // Phase F glow-billboard teardown.
+        if (g_live.pGlowPipeline)           { removePipeline(R, g_live.pGlowPipeline); }
+        if (g_live.pGlowShader)             { removeShader(R, g_live.pGlowShader); }
+        if (g_live.pGlowBaseVB)             { removeResource(g_live.pGlowBaseVB); }
+        if (g_live.pGlowInstBuf)            { removeResource(g_live.pGlowInstBuf); }
         // WT2 reflection teardown.
         if (g_live.pPerFrameSetReflect)     { removeDescriptorSet(R, g_live.pPerFrameSetReflect); }
         if (g_live.pPerFrameSetReflectGeo)  { removeDescriptorSet(R, g_live.pPerFrameSetReflectGeo); }
@@ -14972,6 +15551,20 @@ namespace ForgeRender {
         if (g_live.pAOBlur)         { removeResource(g_live.pAOBlur); }
         if (g_live.pAO)             { removeResource(g_live.pAO); }
         if (g_live.pLinearDepth)    { removeResource(g_live.pLinearDepth); }
+        // Clustered forward: froxel grids (distant + near). Must be freed here — the mask is sized
+        // from the render resolution, so a re-init (resolution change) reallocates it; without this
+        // teardown every resize leaked the old masks/params/pipelines (they were only null'd by the
+        // g_live reset below, never removeResource'd). Descriptor sets first, then buffers, then pipes.
+        if (g_live.pFroxelSet)            { removeDescriptorSet(R, g_live.pFroxelSet); }
+        if (g_live.pFroxelSetNear)        { removeDescriptorSet(R, g_live.pFroxelSetNear); }
+        if (g_live.pFroxelMask)           { removeResource(g_live.pFroxelMask); }
+        if (g_live.pFroxelParamsCbv)      { removeResource(g_live.pFroxelParamsCbv); }
+        if (g_live.pFroxelMaskNear)       { removeResource(g_live.pFroxelMaskNear); }
+        if (g_live.pFroxelParamsCbvNear)  { removeResource(g_live.pFroxelParamsCbvNear); }
+        if (g_live.pFroxelClearPipeline)  { removePipeline(R, g_live.pFroxelClearPipeline); }
+        if (g_live.pFroxelAssignPipeline) { removePipeline(R, g_live.pFroxelAssignPipeline); }
+        if (g_live.pFroxelClearShader)    { removeShader(R, g_live.pFroxelClearShader); }
+        if (g_live.pFroxelAssignShader)   { removeShader(R, g_live.pFroxelAssignShader); }
         if (g_live.pMSAAColor)      { removeRenderTarget(R, g_live.pMSAAColor); }
         if (g_live.pDepth)          { removeRenderTarget(R, g_live.pDepth); }
         if (g_live.pFence)    { exitFence(R, g_live.pFence); }

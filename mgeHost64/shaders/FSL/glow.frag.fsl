@@ -1,0 +1,30 @@
+// mgeHost64 — Phase F distant-light GLOW billboard (fragment stage, host-owned, PRIVATE frag).
+//
+// Additive procedural sprite: a radial analytic falloff, no texture. The colour (light chromaticity)
+// and intensity ride FLAT per-instance; the radial UV is the only smooth interpolator (non-centroid,
+// matching convention — no lighting term needs `centroid` here). Output float4(Colour·f, Intensity·f)
+// with f = saturate(1 - r²)² — the additive PSO (SRCALPHA/ONE) accumulates dst += rgb·a, so the
+// on-screen contribution is Colour·Intensity·f². LDR ceiling (B8G8R8A8 clamps additive at 1.0/channel)
+// is known + temporary — fine to PROVE the pass; overshoot for bloom waits on the HDR post path.
+//
+// Own VSOutput (private frag ⇒ no shared-frag hazard); shares opaque.srt.h / DefaultRootSignature.
+
+#include "opaque.srt.h"
+
+STRUCT(VSOutput)
+{
+    DATA(float4,       Position,  SV_Position);
+    DATA(float2,       Uv,        TEXCOORD0);
+    DATA(FLAT(float3), Colour,    TEXCOORD1);
+    DATA(FLAT(float),  Intensity, TEXCOORD2);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+float4 PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    float r2 = dot(In.Uv, In.Uv);
+    float f  = saturate(1.0f - r2);
+    f = f * f;                                  // saturate(1 - r²)²
+    RETURN(float4(In.Colour * f, In.Intensity * f));
+}

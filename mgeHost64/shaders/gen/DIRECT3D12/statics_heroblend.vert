@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 141 "FSL/shaders.list"
+#line 154 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
 #line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1066,7 +1066,18 @@ STRUCT(LightData)
 {
     float4 lightParams;
     float4 lights[ 128  * 3];
-#line 133
+
+
+
+
+
+
+
+
+
+    float4 froxelDimsNear;
+    float4 froxelZNear;
+#line 144
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1111,8 +1122,16 @@ STRUCT(LightData)
 
 
 
+
+
+
+        Buffer(uint) gFroxelMaskNear :  register(t10,space1);
+
+
+
+
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 194 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 213 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 896 ] :  register(t0,space0);
 
 
@@ -1239,4 +1258,4 @@ VSOutput VS_MAIN( VSInput In )
 #line 157 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics.vert.fsl"
     return (Out);
 }
-#line 142 "FSL/shaders.list"
+#line 155 "FSL/shaders.list"
