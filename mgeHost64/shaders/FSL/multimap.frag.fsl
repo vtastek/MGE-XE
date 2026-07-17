@@ -62,42 +62,73 @@ float4 PS_MAIN( VSOutput In )
     {
         uint nLights = (uint)gLights.lightParams.x;
         float reachK = gLights.lightParams.y;   // host-slaved light reach — see opaque.srt.h
-        for (uint i = 0; i < nLights; ++i)
+        // Near clustered forward (lockstep with opaque.frag): froxelDimsNear.x > 0 => loop only this
+        // fragment's froxel lights from gFroxelMaskNear; else the brute loop over all uploaded lights.
+        // Byte-identical result — the brute path just synthesizes full-word bitmasks.
+        int   nfTilesX = (int)gLights.froxelDimsNear.x;
+        bool  clustered = (nfTilesX > 0);
+        uint  fbase = 0u;
+        if (clustered)
         {
-            float4 posR    = gLights.lights[i * 3u + 0u];
-            float3 lightCol= gLights.lights[i * 3u + 1u].rgb;
-            float3 fo      = gLights.lights[i * 3u + 2u].xyz;
-            float  radius  = posR.w;
-            float  reach   = radius * reachK;
-
-            float3 toLight = posR.xyz - In.WorldPos;
-            float  dist2   = dot(toLight, toLight);
-            // EXACT early-out at the tail cutoff (att = 0 beyond reach) — see opaque.frag.
-            if (dist2 >= reach * reach) { continue; }
-            float  invDist = rsqrt(max(dist2, 1e-8f));
-            float  dist    = dist2 * invDist;
-
-            float  att = 1.0f / max(fo.z * dist2 + fo.y * dist + fo.x, 1e-4f);
-            att *= 1.0f - smoothstep(POINT_LIGHT_TAIL * reach, reach, dist);
-
-            // P1 point-light shadows (lockstep with opaque.frag): the host patches
-            // falloff.w = shadow slot + 1 (0 = no shadow). shadowmask.comp already did the
-            // cube-face atlas test for this pixel — scale the light by the slot's 4-bit
-            // visibility (15 = lit, 0 = shadowed). Fixes multimap receivers (NPC heads,
-            // interior walls/trim) that previously took point lights with no shadow.
-            uint slotP1 = (uint)gLights.lights[i * 3u + 2u].w;
-            if (slotP1 != 0u)
-            {
-                uint4 mw   = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xyzw;
-                uint  s    = slotP1 - 1u;
-                uint  lane = s >> 3u;
-                uint  word = lane == 0u ? mw.x : (lane == 1u ? mw.y : (lane == 2u ? mw.z : mw.w));
-                uint  nib  = (word >> ((s & 7u) * 4u)) & 0xFu;
-                att *= float(nib) * (1.0f / 15.0f);
+            int   nfTilesY = (int)gLights.froxelDimsNear.y;
+            int   nfNZ     = (int)gLights.froxelDimsNear.z;
+            float nfTile   = gLights.froxelDimsNear.w;
+            int tx = clamp((int)(In.Position.x / nfTile), 0, nfTilesX - 1);
+            int ty = clamp((int)(In.Position.y / nfTile), 0, nfTilesY - 1);
+            float dd = length(In.WorldPos);
+            int zs = clamp((int)((log(max(dd, 1.0f)) - gLights.froxelZNear.x) * gLights.froxelZNear.y * (float)nfNZ), 0, nfNZ - 1);
+            fbase = (((uint)ty * (uint)nfTilesX + (uint)tx) * (uint)nfNZ + (uint)zs) * 4u;
+        }
+        for (uint wi = 0u; wi < 4u; ++wi)
+        {
+            uint bits;
+            if (clustered) {
+                bits = gFroxelMaskNear[fbase + wi];
+            } else {
+                uint lo = wi * 32u;
+                uint cnt = (lo >= nLights) ? 0u : min(32u, nLights - lo);
+                bits = (cnt >= 32u) ? 0xFFFFFFFFu : ((1u << cnt) - 1u);
             }
+            while (bits != 0u)
+            {
+                uint i = wi * 32u + firstbitlow(bits);
+                bits = bits & (bits - 1u);
+                if (i >= nLights) { continue; }
+                float4 posR    = gLights.lights[i * 3u + 0u];
+                float3 lightCol= gLights.lights[i * 3u + 1u].rgb;
+                float3 fo      = gLights.lights[i * 3u + 2u].xyz;
+                float  radius  = posR.w;
+                float  reach   = radius * reachK;
 
-            float  lambert = saturate(dot(N, toLight) * invDist);
-            d += lambert * att * lightCol;
+                float3 toLight = posR.xyz - In.WorldPos;
+                float  dist2   = dot(toLight, toLight);
+                // EXACT early-out at the tail cutoff (att = 0 beyond reach) — see opaque.frag.
+                if (dist2 >= reach * reach) { continue; }
+                float  invDist = rsqrt(max(dist2, 1e-8f));
+                float  dist    = dist2 * invDist;
+
+                float  att = 1.0f / max(fo.z * dist2 + fo.y * dist + fo.x, 1e-4f);
+                att *= 1.0f - smoothstep(POINT_LIGHT_TAIL * reach, reach, dist);
+
+                // P1 point-light shadows (lockstep with opaque.frag): the host patches
+                // falloff.w = shadow slot + 1 (0 = no shadow). shadowmask.comp already did the
+                // cube-face atlas test for this pixel — scale the light by the slot's 4-bit
+                // visibility (15 = lit, 0 = shadowed). Fixes multimap receivers (NPC heads,
+                // interior walls/trim) that previously took point lights with no shadow.
+                uint slotP1 = (uint)gLights.lights[i * 3u + 2u].w;
+                if (slotP1 != 0u)
+                {
+                    uint4 mw   = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xyzw;
+                    uint  s    = slotP1 - 1u;
+                    uint  lane = s >> 3u;
+                    uint  word = lane == 0u ? mw.x : (lane == 1u ? mw.y : (lane == 2u ? mw.z : mw.w));
+                    uint  nib  = (word >> ((s & 7u) * 4u)) & 0xFu;
+                    att *= float(nib) * (1.0f / 15.0f);
+                }
+
+                float  lambert = saturate(dot(N, toLight) * invDist);
+                d += lambert * att * lightCol;
+            }
         }
     }
     d *= gFrameData.dbgScales.y;   // dev panel: diffuse (sun + point) intensity modifier

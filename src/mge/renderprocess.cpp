@@ -1187,7 +1187,7 @@ namespace {
             // constant material (vertexMaterialNone), ignoring the VB's colour slot.
             item.matDiffuse[0]  = e.matDiffuse[0];  item.matDiffuse[1]  = e.matDiffuse[1];  item.matDiffuse[2]  = e.matDiffuse[2];
             item.matAmbient[0]  = e.matAmbient[0];  item.matAmbient[1]  = e.matAmbient[1];  item.matAmbient[2]  = e.matAmbient[2];
-            item.matEmissive[0] = e.matEmissive[0]; item.matEmissive[1] = e.matEmissive[1]; item.matEmissive[2] = e.matEmissive[2];
+            MGE::GeometryCache::emissiveForDraw(e, item.matEmissive);
             item.vColSource = (e.hasVertexColor && e.vColSource != 0) ? e.vColSource : 0u;
             // C4d shadow-caster category: LIVE (NPC/creature parts + held equipment,
             // activators, doors) → the host's dynamic shadow tile, not the cached statics.
@@ -1308,7 +1308,7 @@ namespace {
             item.world[14] -= DistantLand::eyePos.z;
             item.matDiffuse[0]  = e.matDiffuse[0];  item.matDiffuse[1]  = e.matDiffuse[1];  item.matDiffuse[2]  = e.matDiffuse[2];
             item.matAmbient[0]  = e.matAmbient[0];  item.matAmbient[1]  = e.matAmbient[1];  item.matAmbient[2]  = e.matAmbient[2];
-            item.matEmissive[0] = e.matEmissive[0]; item.matEmissive[1] = e.matEmissive[1]; item.matEmissive[2] = e.matEmissive[2];
+            MGE::GeometryCache::emissiveForDraw(e, item.matEmissive);
             item.vColSource = (e.hasVertexColor && e.vColSource != 0) ? e.vColSource : 0u;
             item.alphaRef   = e.alphaTest ? e.alphaRef : 0.0f;   // base-stage alpha test
             item.stageCount = (std::uint32_t)ns;
@@ -1340,7 +1340,7 @@ namespace {
             item.matDiffuse[0]  = e.matDiffuse[0];  item.matDiffuse[1]  = e.matDiffuse[1];  item.matDiffuse[2]  = e.matDiffuse[2];
             item.matAlpha       = e.matDiffuse[3];   // MaterialProperty::alpha (the FFE per-draw fade)
             item.matAmbient[0]  = e.matAmbient[0];  item.matAmbient[1]  = e.matAmbient[1];  item.matAmbient[2]  = e.matAmbient[2];
-            item.matEmissive[0] = e.matEmissive[0]; item.matEmissive[1] = e.matEmissive[1]; item.matEmissive[2] = e.matEmissive[2];
+            MGE::GeometryCache::emissiveForDraw(e, item.matEmissive);
             item.vColSource = (e.hasVertexColor && e.vColSource != 0) ? e.vColSource : 0u;
             memcpy(item.world, e.worldTransformD3D, 16 * sizeof(float));
             // CAMERA-RELATIVE: shift translation by -eye (see emitStaticDraw).

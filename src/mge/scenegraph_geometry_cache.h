@@ -188,6 +188,12 @@ namespace MGE::GeometryCache {
         float matDiffuse[4];
         float matAmbient[4];
         float matEmissive[4];
+        // Per-channel emissive-boost gain derived from this fixture's OWN light at capture
+        // (see computeEmissiveGain). 1,1,1 = not a lit fixture / no boost. Applied — gated on
+        // Configuration.ForgeEmissiveBoost — by emissiveForDraw(), NOT folded into matEmissive,
+        // so the toggle is live: materials are captured once per entry, but the draw list is
+        // rebuilt every frame.
+        float emissiveGain[3];
         // Vertex colour usage. hasVertexColor: the mesh carries per-vertex colours
         // (filled into the non-skinned VB's DIFFUSE slot). vColSource: NI
         // VertexColorProperty::source — 0 ignore (vcol unused, constant material),
@@ -284,6 +290,12 @@ namespace MGE::GeometryCache {
     // treat entries with lastFrame != currentFrame() as stale (not in the scene this
     // frame). Consumers driven by a current-frame visible set don't need this.
     uint64_t currentFrame();
+
+    // The emissive triple a draw should ship: matEmissive, times emissiveGain when
+    // Configuration.ForgeEmissiveBoost is on. Every Forge draw-list builder goes through this
+    // so the toggle is a single live gate; the DX9 baseline path reads matEmissive directly
+    // and stays vanilla (it is the A/B reference). `out` receives 3 floats.
+    void emissiveForDraw(const CachedGeometry& e, float* out);
 
     // Vertex buffer format used by each CachedGeometry::vb.
     // D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_TEX1

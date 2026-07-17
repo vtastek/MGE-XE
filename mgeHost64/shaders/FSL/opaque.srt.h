@@ -130,6 +130,17 @@ STRUCT(LightData)
 {
     DATA(float4, lightParams, None);                 // x = count, y = light reach in radii
     DATA(float4, lights[MAX_POINT_LIGHTS * 3], None);
+    // Near clustered forward lighting (froxel grid) for the NEAR live point lights. opaque.frag /
+    // multimap.frag read these to find their froxel (screen tile x radial-distance slice) and loop
+    // only that froxel's lights from gFroxelMaskNear, instead of the whole uploaded <=128 set. Parked
+    // in the NEAR light cbuffer (pLightCbv) — NOT gFrameData — because the distant path owns
+    // gFrameData.froxelDims for the same frame; the near phase is temporally separate so its grid
+    // params ride the near-specific gLights. Appended after lights[] (harmless null tail for the
+    // distant/FP paths that bind a different gLights buffer). froxelDimsNear.x == 0 => clustering OFF
+    // => the near frags fall back to the brute gLights loop. Slice metric = length(In.WorldPos),
+    // matching froxelassign.comp exactly (near lights are already camera-relative, like In.WorldPos).
+    DATA(float4, froxelDimsNear, None);   // x=tilesX, y=tilesY, z=NZslices, w=tileSize(px); x<=0 => brute loop
+    DATA(float4, froxelZNear,    None);   // x=log(d0), y=invLogRange (1/log(d1/d0)); zw unused
 };
 
 BEGIN_SRT_NO_AB(SrtData)
@@ -172,6 +183,14 @@ BEGIN_SRT_NO_AB(SrtData)
         // distantland.frag / statics.frag index it, and only when gFrameData.froxelDims.x > 0 (else the
         // brute loop). All other frags ignore it (harmless null tail).
         DECL_BUFFER(PerFrame, Buffer(uint), gFroxelMask)
+        // Near clustered forward lighting: a SECOND froxel light-mask (128 bits/froxel = 4 uint) for
+        // the NEAR live point lights, written by froxelassign.comp into the near mask (UAV) and read
+        // here as an SRV. Kept separate from gFroxelMask (which the distant path builds AFTER the near
+        // colour phase within the same frame) so the near and distant grids never entangle their
+        // buffer state. Appended AFTER gFroxelMask so every existing PerFrame offset stays stable; only
+        // opaque.frag / multimap.frag index it, and only when gLights.froxelDimsNear.x > 0 (else the
+        // brute loop). All other frags ignore it (harmless null tail).
+        DECL_BUFFER(PerFrame, Buffer(uint), gFroxelMaskNear)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has

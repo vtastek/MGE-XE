@@ -79,47 +79,81 @@ float4 PS_MAIN( VSOutput In )
         // That is what lets the shadow itself stay 100% opaque with no fade: we hide the edge of
         // the shadow behind the edge of the light, instead of dissolving the shadow to hide it.
         float reachK = gLights.lightParams.y;
-        for (uint i = 0; i < nLights; ++i)
+        // Near clustered forward: when the near froxel grid is active (froxelDimsNear.x > 0) loop
+        // ONLY this fragment's froxel lights (128-bit mask from gFroxelMaskNear); else fall back to
+        // the brute gLights loop over all uploaded lights. Both paths share ONE inlined per-light
+        // body — the brute path synthesizes full-word bitmasks, so the clustered result is
+        // byte-identical, just far fewer iterations. Slice metric = length(In.WorldPos), matching
+        // froxelassign.comp (near lights are camera-relative, same space as In.WorldPos).
+        int   nfTilesX = (int)gLights.froxelDimsNear.x;
+        bool  clustered = (nfTilesX > 0);
+        uint  fbase = 0u;
+        if (clustered)
         {
-            float4 posR    = gLights.lights[i * 3u + 0u];
-            float3 lightCol= gLights.lights[i * 3u + 1u].rgb;
-            float3 fo      = gLights.lights[i * 3u + 2u].xyz;   // x=k0 const, y=k1 linear, z=k2 quad
-            float  radius  = posR.w;
-            float  reach   = radius * reachK;
-
-            float3 toLight = posR.xyz - In.WorldPos;
-            float  dist2   = dot(toLight, toLight);
-            // EXACT early-out: the tail ramp below multiplies att by 0 at dist >= reach, so pixels
-            // beyond it contribute nothing — skip the rsqrt/divide/smoothstep. Most pixels are
-            // beyond reach of most of the ~128 scene lights, so this is the bulk of the loop.
-            if (dist2 >= reach * reach) { continue; }
-            ++litCount;
-            float  invDist = rsqrt(max(dist2, 1e-8f));
-            float  dist    = dist2 * invDist;
-
-            // Full 1/(k0 + k1·d + k2·d²) attenuation. The linear k1 term is essential —
-            // MW candle/torch lights are pure-linear (k0=k2=0). max() guards d->0.
-            float  att = 1.0f / max(fo.z * dist2 + fo.y * dist + fo.x, 1e-4f);
-            // Tail ramp 1->0 over the last quarter of the reach: no hard cull seam, and the light's
-            // core (out to 0.75·reach) is left untouched — we trim the faint tail, not the light.
-            att *= 1.0f - smoothstep(POINT_LIGHT_TAIL * reach, reach, dist);
-
-            // P1 point-light shadows: the host patches falloff.w = shadow slot + 1 (0 = no
-            // shadow). shadowmask.comp already did the cube-face atlas test for this pixel —
-            // the slot's 4-bit visibility just scales the light (15 = lit, 0 = shadowed).
-            uint slotP1 = (uint)gLights.lights[i * 3u + 2u].w;
-            if (slotP1 != 0u)
-            {
-                uint4 mw   = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xyzw;
-                uint  s    = slotP1 - 1u;
-                uint  lane = s >> 3u;
-                uint  word = lane == 0u ? mw.x : (lane == 1u ? mw.y : (lane == 2u ? mw.z : mw.w));
-                uint  nib  = (word >> ((s & 7u) * 4u)) & 0xFu;
-                att *= float(nib) * (1.0f / 15.0f);
+            int   nfTilesY = (int)gLights.froxelDimsNear.y;
+            int   nfNZ     = (int)gLights.froxelDimsNear.z;
+            float nfTile   = gLights.froxelDimsNear.w;
+            int tx = clamp((int)(In.Position.x / nfTile), 0, nfTilesX - 1);
+            int ty = clamp((int)(In.Position.y / nfTile), 0, nfTilesY - 1);
+            float dd = length(In.WorldPos);
+            int zs = clamp((int)((log(max(dd, 1.0f)) - gLights.froxelZNear.x) * gLights.froxelZNear.y * (float)nfNZ), 0, nfNZ - 1);
+            fbase = (((uint)ty * (uint)nfTilesX + (uint)tx) * (uint)nfNZ + (uint)zs) * 4u;
+        }
+        for (uint wi = 0u; wi < 4u; ++wi)
+        {
+            uint bits;
+            if (clustered) {
+                bits = gFroxelMaskNear[fbase + wi];
+            } else {
+                uint lo = wi * 32u;
+                uint cnt = (lo >= nLights) ? 0u : min(32u, nLights - lo);
+                bits = (cnt >= 32u) ? 0xFFFFFFFFu : ((1u << cnt) - 1u);
             }
+            while (bits != 0u)
+            {
+                uint i = wi * 32u + firstbitlow(bits);
+                bits = bits & (bits - 1u);
+                if (i >= nLights) { continue; }
+                float4 posR    = gLights.lights[i * 3u + 0u];
+                float3 lightCol= gLights.lights[i * 3u + 1u].rgb;
+                float3 fo      = gLights.lights[i * 3u + 2u].xyz;   // x=k0 const, y=k1 linear, z=k2 quad
+                float  radius  = posR.w;
+                float  reach   = radius * reachK;
 
-            float  lambert = saturate(dot(N, toLight) * invDist);
-            d += lambert * att * lightCol;
+                float3 toLight = posR.xyz - In.WorldPos;
+                float  dist2   = dot(toLight, toLight);
+                // EXACT early-out: the tail ramp below multiplies att by 0 at dist >= reach, so pixels
+                // beyond it contribute nothing — skip the rsqrt/divide/smoothstep. In the clustered
+                // path this still runs, but only over the froxel's handful of candidates.
+                if (dist2 >= reach * reach) { continue; }
+                ++litCount;
+                float  invDist = rsqrt(max(dist2, 1e-8f));
+                float  dist    = dist2 * invDist;
+
+                // Full 1/(k0 + k1·d + k2·d²) attenuation. The linear k1 term is essential —
+                // MW candle/torch lights are pure-linear (k0=k2=0). max() guards d->0.
+                float  att = 1.0f / max(fo.z * dist2 + fo.y * dist + fo.x, 1e-4f);
+                // Tail ramp 1->0 over the last quarter of the reach: no hard cull seam, and the light's
+                // core (out to 0.75·reach) is left untouched — we trim the faint tail, not the light.
+                att *= 1.0f - smoothstep(POINT_LIGHT_TAIL * reach, reach, dist);
+
+                // P1 point-light shadows: the host patches falloff.w = shadow slot + 1 (0 = no
+                // shadow). shadowmask.comp already did the cube-face atlas test for this pixel —
+                // the slot's 4-bit visibility just scales the light (15 = lit, 0 = shadowed).
+                uint slotP1 = (uint)gLights.lights[i * 3u + 2u].w;
+                if (slotP1 != 0u)
+                {
+                    uint4 mw   = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xyzw;
+                    uint  s    = slotP1 - 1u;
+                    uint  lane = s >> 3u;
+                    uint  word = lane == 0u ? mw.x : (lane == 1u ? mw.y : (lane == 2u ? mw.z : mw.w));
+                    uint  nib  = (word >> ((s & 7u) * 4u)) & 0xFu;
+                    att *= float(nib) * (1.0f / 15.0f);
+                }
+
+                float  lambert = saturate(dot(N, toLight) * invDist);
+                d += lambert * att * lightCol;
+            }
         }
     }
     d *= gFrameData.dbgScales.y;   // dev panel: diffuse (sun + point) intensity modifier

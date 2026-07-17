@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 173 "FSL/shaders.list"
+#line 186 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowatlasview.vert.fsl"
 #line 9 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowatlasview.vert.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1066,7 +1066,18 @@ STRUCT(LightData)
 {
     float4 lightParams;
     float4 lights[ 128  * 3];
-#line 133
+
+
+
+
+
+
+
+
+
+    float4 froxelDimsNear;
+    float4 froxelZNear;
+#line 144
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1111,8 +1122,16 @@ STRUCT(LightData)
 
 
 
+
+
+
+        Buffer(uint) gFroxelMaskNear :  register(t10,space1);
+
+
+
+
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 194 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 213 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 896 ] :  register(t0,space0);
 
 
@@ -1138,4 +1157,4 @@ VSOutput VS_MAIN( uint VertexID : SV_VERTEXID )
     Out.Position = float4(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f, 0.0f, 1.0f);
     return (Out);
 }
-#line 174 "FSL/shaders.list"
+#line 187 "FSL/shaders.list"

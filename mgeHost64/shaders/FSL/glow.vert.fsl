@@ -1,0 +1,59 @@
+// mgeHost64 — Phase F distant-light GLOW billboard (vertex stage, host-owned).
+//
+// One additive, camera-facing sprite per distant light FIXTURE (lantern/candle/torch/sconce),
+// drawn across the whole view distance so the lamp still reads once its tier-0 static MESH has
+// coverage-culled (~2 cells). See tasks/forge-deferred-lightmap.md Phase F.
+//
+// Binding 0 (per-VERTEX): a static unit-quad corner. xy = corner in [-1,1], zw = radial UV
+//   (== corner, so r=length(uv) is 0 at centre, 1 at edge midpoints). 6 verts (2 tris), built once.
+// Binding 1 (per-INSTANCE): the survivor record the host fills each frame —
+//   I0 = (centre.xyz camera-relative, worldSize)   worldSize already min-pixel-grown host-side
+//   I1 = (colour.rgb chromaticity, intensity)      intensity already fade+1/d²+flux-scaled host-side
+//
+// The billboard basis needs NO view matrix: streamed positions are CAMERA-RELATIVE, so
+// normalize(centre) IS the eye->light direction. right/up are built from it, and the quad faces the
+// eye. Out.Position = viewProj·worldPos is reverse-Z aware (the sprite sits at the light's true
+// depth, so the GEQUAL depth test lets nearer geometry occlude it). Shares opaque.srt.h /
+// DefaultRootSignature verbatim (no SRT / FrameData change — brightness, fade and the min-pixel
+// floor are all resolved host-side; the VS only billboards + projects).
+
+#include "opaque.srt.h"
+
+STRUCT(VSInput)
+{
+    DATA(float4, Corner, POSITION);    // xy = corner [-1,1], zw = radial UV
+    DATA(float4, I0,     TEXCOORD1);   // centre.xyz (cam-rel), worldSize
+    DATA(float4, I1,     TEXCOORD2);   // colour.rgb, intensity
+};
+
+STRUCT(VSOutput)
+{
+    DATA(float4,       Position,  SV_Position);
+    DATA(float2,       Uv,        TEXCOORD0);   // radial UV (smooth, non-centroid — no lighting interp)
+    DATA(FLAT(float3), Colour,    TEXCOORD1);
+    DATA(FLAT(float),  Intensity, TEXCOORD2);
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+VSOutput VS_MAIN( VSInput In )
+{
+    INIT_MAIN;
+    VSOutput Out;
+
+    float3 centre    = In.I0.xyz;
+    float  worldSize = In.I0.w;
+
+    // Camera-relative → normalize(centre) is the eye→light direction. Point-facing quad basis.
+    float3 fwd   = normalize(centre);
+    float3 up0   = (abs(fwd.z) > 0.95f) ? float3(0.0f, 1.0f, 0.0f) : float3(0.0f, 0.0f, 1.0f);
+    float3 right = normalize(cross(up0, fwd));
+    float3 up    = cross(fwd, right);
+
+    float3 worldPos = centre + (right * In.Corner.x + up * In.Corner.y) * worldSize;
+    Out.Position  = mul(gFrameData.viewProj, float4(worldPos, 1.0f));
+
+    Out.Uv        = In.Corner.zw;
+    Out.Colour    = In.I1.rgb;
+    Out.Intensity = In.I1.w;
+    RETURN(Out);
+}
