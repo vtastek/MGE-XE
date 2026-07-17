@@ -21,6 +21,7 @@
 
 #include "configuration.h"
 #include "datahandler_view.h"
+#include "mwbridge.h"
 #include "scenegraph.h"
 #include "support/log.h"
 #include "mge_tracy.h"
@@ -239,6 +240,24 @@ namespace MGE::SceneGraph {
             // RTTI arm pushes it into gw_directionalLights.
             if (auto sun = MGE::DataHandlerView::sgSunlight(g_dataHandler)) {
                 walk(reinterpret_cast<NI::AVObject*>(sun));
+            }
+            // Carried-light coverage in first person: the engine appCulls the player's
+            // WHOLE 3rd-person sceneNode on the 3rd→1st switch (MWSE TES3Reference.cpp:369),
+            // and a held torch/lantern's NiPointLight is attached UNDER it (the body's
+            // "AttachLight" node — the light attachment is per-REFERENCE, and the actor
+            // reference's sceneNode is the 3rd-person body). walk()'s appCull gate would
+            // drop it, so the carried light stops lighting the world exactly while it's in
+            // your hand. Bypass ONLY the body root's flag and walk its children — inner
+            // nodes still honour their own flags, a NiLight has one parent so nothing the
+            // main walks saw can repeat, and in 3rd person the body isn't appCulled (the
+            // objRoot walk already covered it), so this runs only when needed.
+            if (!MWBridge::get()->is3rdPerson()) {
+                if (NI::Node* body = MWBridge::get()->getPlayer3rdPersonNode()) {
+                    const auto count = body->children.getEndIndex();
+                    for (size_t i = 0; i < count; ++i) {
+                        walk(body->children.at(i));
+                    }
+                }
             }
         }
 

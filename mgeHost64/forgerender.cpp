@@ -10200,7 +10200,7 @@ namespace ForgeRender {
         // Hi-Z mip 0, linearize and water already ran. Rigid parts use the sky-pass
         // pattern (own world window + instance VB, arena-or-own mesh source); skinned
         // parts use the main skinned pattern with the ONE dedicated FP bone window.
-        uint32_t fpRigidDrawn = 0, fpSkinnedDrawn = 0;
+        uint32_t fpRigidDrawn = 0, fpSkinnedDrawn = 0, fpAlphaDrawn = 0;
         gpuPhaseBegin(kGpuPhaseColorFP);
         if (fpActive && g_live.pFPOpaquePipeline && g_live.pFPSkinnedPipeline) {
             BindRenderTargetsDesc fbind = {};
@@ -10322,12 +10322,92 @@ namespace ForgeRender {
                     ++fpSkinnedDrawn;
                 }
             }
+
+            // --- FP1c: blended FP parts (torch flame, enchant glow) ---
+            // AlphaDrawWire[] client-sorted back-to-front vs the ARM camera. Reuses the main
+            // sorted-alpha PSOs unchanged — GEQUAL test + no depth write against the FP depth
+            // the opaque arms just wrote is exactly the contract — and the TAIL of the main
+            // alpha world/instance windows (indices continue past alphaDrawn; both fills are
+            // CPU-side before submit, so nothing aliases). Drawn under the FP sets (arm
+            // viewProj, shadow-neutralized lights). No depth prepass and no caster records:
+            // arms cast nothing, and the flame is additive glow, not an occluder.
+            if (fp->alphaBlob && fp->alphaCount && fp->alphaBytes
+                && g_live.pAlphaPipeline && g_live.pAlphaWorldsBuf) {
+                const uint32_t haveFPA = fp->alphaBytes / (uint32_t)sizeof(IPC::AlphaDrawWire);
+                uint32_t nFPA = (fp->alphaCount < haveFPA) ? fp->alphaCount : haveFPA;
+                const IPC::AlphaDrawWire* fpaItems = (const IPC::AlphaDrawWire*)fp->alphaBlob;
+
+                cmdBindPipeline(g_live.pCmd, g_live.pAlphaPipeline);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetFP);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSetFP);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetAlpha);
+                Pipeline* curFPAlphaPipe = g_live.pAlphaPipeline;
+
+                for (uint32_t k = 0; k < nFPA; ++k) {
+                    const IPC::AlphaDrawWire& it = fpaItems[k];
+                    const uint32_t slot = it.slot;
+                    if (slot == IPC::kAlphaSlotCaptured) { continue; }   // FP list is cache-mesh only
+                    if (slot >= g_meshHigh || !g_meshes[slot].valid) { continue; }
+                    HostMesh& m = g_meshes[slot];
+                    if (m.skinned || m.multimap) { continue; }
+                    Buffer*  meshVb = m.inArena ? g_live.pArenaVB : m.vb;
+                    Buffer*  meshIb = m.inArena ? g_live.pArenaIB : m.ib;
+                    if (!meshVb || !meshIb) { continue; }
+                    const uint32_t idx = alphaDrawn + fpAlphaDrawn;      // tail of the main alpha window
+                    if (idx >= kMaxAlphaDraws) { break; }
+
+                    // Blend/cull PSO pick — same rules as the main alpha loop.
+                    const bool additive = (it.srcBlend == kD3DBLEND_SRCALPHA && it.destBlend == kD3DBLEND_ONE);
+                    const bool twoSided = (it.cullFlags & IPC::kAlphaCullTwoSided) != 0u;
+                    const bool mirrored = (it.cullFlags & IPC::kAlphaCullMirrored) != 0u;
+                    Pipeline* want;
+                    if (additive) {
+                        want = g_live.pAlphaPipelineAdd;
+                    } else if (!twoSided) {
+                        want = mirrored ? g_live.pAlphaPipelineBackMirror : g_live.pAlphaPipelineBack;
+                    } else {
+                        want = g_live.pAlphaPipeline;
+                    }
+
+                    uint8_t* wdst = (uint8_t*)g_live.pAlphaWorldsBuf->pCpuMappedAddress;
+                    std::memcpy(wdst + (size_t)idx * 64, it.world, 64);
+                    uint32_t* inst = (uint32_t*)g_live.pAlphaInstanceBuf->pCpuMappedAddress;
+                    inst[idx * kStaticInstU32 + 0] = idx;   // DrawIndex → gBatch.worlds[idx]
+                    inst[idx * kStaticInstU32 + 1] = packTexAlpha(it.texIndex, it.alphaRef, it.vColSource, it.clampMode);
+                    float* finst = (float*)inst;
+                    finst[idx * kStaticInstU32 + 2]  = it.matDiffuse[0];
+                    finst[idx * kStaticInstU32 + 3]  = it.matDiffuse[1];
+                    finst[idx * kStaticInstU32 + 4]  = it.matDiffuse[2];
+                    finst[idx * kStaticInstU32 + 5]  = it.matAmbient[0];
+                    finst[idx * kStaticInstU32 + 6]  = it.matAmbient[1];
+                    finst[idx * kStaticInstU32 + 7]  = it.matAmbient[2];
+                    finst[idx * kStaticInstU32 + 8]  = it.matEmissive[0];
+                    finst[idx * kStaticInstU32 + 9]  = it.matEmissive[1];
+                    finst[idx * kStaticInstU32 + 10] = it.matEmissive[2];
+                    finst[idx * kStaticInstU32 + 11] = it.matAlpha;      // alpha.frag asfloat's it back
+
+                    if (want != curFPAlphaPipe) {
+                        cmdBindPipeline(g_live.pCmd, want);
+                        curFPAlphaPipe = want;
+                    }
+                    const uint32_t firstVertex = m.inArena ? (uint32_t)(m.vbOff / sizeof(IPC::GeomVertexWire)) : 0u;
+                    const uint32_t firstIndex  = m.inArena ? (uint32_t)(m.ibOff / sizeof(uint16_t)) : 0u;
+                    Buffer*  vbs[2]     = { meshVb, g_live.pAlphaInstanceBuf };
+                    uint32_t strides[2] = { vStride, iStride };
+                    cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                    cmdBindIndexBuffer(g_live.pCmd, meshIb, INDEX_TYPE_UINT16, 0);
+                    cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, firstIndex, 1, firstVertex, idx);
+                    ++fpAlphaDrawn;
+                }
+            }
             cmdBindRenderTargets(g_live.pCmd, nullptr);
 
             static uint32_t s_fpLog = 0;
             if ((s_fpLog++ % 300) == 0) {
-                LOG::logline(">> [fp host] rigid=%u/%u skinned=%u/%u",
-                             fpRigidDrawn, fp->drawCount, fpSkinnedDrawn, fp->skinnedCount);
+                LOG::logline(">> [fp host] rigid=%u/%u skinned=%u/%u alpha=%u/%u",
+                             fpRigidDrawn, fp->drawCount, fpSkinnedDrawn, fp->skinnedCount,
+                             fpAlphaDrawn, fp->alphaCount);
             }
         }
         gpuPhaseEnd(kGpuPhaseColorFP);

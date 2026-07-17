@@ -625,6 +625,17 @@ namespace IPC {
 					fpScene.skinnedCount = params.fpSkinnedCount;
 					fpScene.skinnedBytes = fsbytes;
 				}
+				if (params.fpAlphaList != InvalidVector) {
+					auto& favec = getVec<IPC::GeomChunk>(params.fpAlphaList);
+					const std::uint32_t faavail = favec.size() * static_cast<std::uint32_t>(sizeof(IPC::GeomChunk));
+					std::uint32_t fabytes = params.fpAlphaBytes;
+					if (fabytes == 0 || fabytes > faavail) {
+						fabytes = faavail;
+					}
+					fpScene.alphaBlob  = favec.size() ? &favec[0] : nullptr;
+					fpScene.alphaCount = params.fpAlphaCount;
+					fpScene.alphaBytes = fabytes;
+				}
 				fpPtr = &fpScene;
 			}
 			ForgeRender::setDebugMode(params.debugMode);
