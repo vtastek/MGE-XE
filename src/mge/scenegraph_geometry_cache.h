@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 struct IDirect3DDevice9;
@@ -278,6 +279,15 @@ namespace MGE::GeometryCache {
     uint32_t markSubtreeSuppressed(void* avObject);
 
     const std::unordered_map<uint32_t, CachedGeometry>& cache();
+
+    // Keys whose cached entry passes the offscreen shadow-caster PRE-DISTANCE mover filter
+    // (skinned / multimap head / rigid LIVE — everything the Forge feed's offscreen re-emit loop
+    // in buildGeometryDrawLists would consider before the per-frame distance cull). Maintained
+    // incrementally at capture / reclassify / evict, so that loop iterates ~dozens of candidate
+    // movers instead of scanning the WHOLE cache every frame (the fixed ~1ms tail probe pinned to
+    // the full-map walk). Superset of what any want-flags admit — the consumer still applies the
+    // per-frame distance / visible-set / suppressedFrame / want-flag checks unchanged.
+    const std::unordered_set<uint32_t>& moverCandidates();
 
     // Drain the keys the eviction sweep dropped since the last call (objects that left the world
     // within a cell — picked up, despawned, disabled). The Forge feed maps each to its host mesh
