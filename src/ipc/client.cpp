@@ -16,6 +16,7 @@
 // as a 60s IPC timeout frames later. Fail LOUD instead: refuse the RPC and log.
 #define WAIT_FOR_PREVIOUS_COMMAND { \
 	if (m_frameWindowOpen) { \
+		++m_windowRefusals; \
 		LOG::logline("!! IPC RPC attempted inside the async RenderFrame window (would clobber the pending frame)"); \
 		return false; \
 	} \
@@ -33,6 +34,7 @@ namespace IPC {
 		m_ipcParameters(nullptr),
 		m_isRpcPending(false),
 		m_frameWindowOpen(false),
+		m_windowRefusals(0),
 		m_watcherProcess(INVALID_HANDLE_VALUE),
 		m_watcherJob(NULL),
 		m_geomSharedMem(INVALID_HANDLE_VALUE),
@@ -590,6 +592,10 @@ namespace IPC {
 		params.devUiVisible = di.uiVisible;
 		params.devReloadShaders = di.reloadShaders;
 		params.devDistLightsToggle = di.distLightsToggle;
+		params.devFrameAhead = di.frameAhead;
+		params.devClientWaitMs = di.clientWaitMs;
+		params.devClientDtMs = di.clientDtMs;
+		params.devClientMwStartMs = di.clientMwStartMs;
 		params.bytesWritten = 0;
 		params.renderMs = 0.0;
 		if (!beginRpc(Command::RenderFrame)) {
@@ -660,6 +666,7 @@ namespace IPC {
 		// a mid-window upload silently blocks until the whole host frame completes,
 		// defeating the overlap. The async window must be IPC-free on BOTH channels.
 		if (m_frameWindowOpen) {
+			++m_windowRefusals;
 			LOG::logline("!! IPC geom upload attempted inside the async RenderFrame window (would serialize behind the host frame)");
 			return false;
 		}
@@ -691,6 +698,7 @@ namespace IPC {
 		// channel). Wait only for the previous geom-channel RPC. Same async-window rule as
 		// geomUploadBlocking: IPC-free on both channels while a RenderFrame is in flight.
 		if (m_frameWindowOpen) {
+			++m_windowRefusals;
 			LOG::logline("!! IPC tex upload attempted inside the async RenderFrame window (would serialize behind the host frame)");
 			return false;
 		}

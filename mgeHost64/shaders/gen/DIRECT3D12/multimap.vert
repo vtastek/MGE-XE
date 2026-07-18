@@ -976,7 +976,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap.vert.fsl"
 #line 11 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/multimap.vert.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-#line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 30 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(FrameData)
 {
     float4x4 viewProj;
@@ -1053,15 +1053,15 @@ STRUCT(FrameData)
 
     float4 froxelDims;
     float4 froxelZ;
-#line 103
+#line 106
 };
 
 STRUCT(BatchData)
 {
     float4x4 worlds[ 1024 ];
-#line 108
+#line 111
 };
-#line 129 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 132 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(LightData)
 {
     float4 lightParams;
@@ -1077,7 +1077,7 @@ STRUCT(LightData)
 
     float4 froxelDimsNear;
     float4 froxelZNear;
-#line 144
+#line 147
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1130,8 +1130,15 @@ STRUCT(LightData)
 
 
 
+
+
+        Buffer(float4) gUVAnim :  register(t11,space1);
+
+
+
+
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 213 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 223 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 896 ] :  register(t0,space0);
 
 
@@ -1182,7 +1189,13 @@ VSOutput VS_MAIN( VSInput In )
     //INIT_MAIN;
     VSOutput Out;
 
-    uint drawIndex = In.Meta & 0xFFu;
+
+
+    uint drawIndex = In.Meta & 0x3FFu;
+    uint stageCount = (In.Meta >> 10u) & 0x7u;
+    uint vColSource = (In.Meta >> 13u) & 0x3u;
+    uint alphaRefB = (In.Meta >> 16u) & 0xFFu;
+    uint uvAnimId = (In.Meta >> 24u) & 0xFFu;
 
 
     float4x4 world = gBatch.worlds[drawIndex];
@@ -1194,13 +1207,25 @@ VSOutput VS_MAIN( VSInput In )
     Out.Uv1 = In.Uv1;
     Out.Uv2 = In.Uv2;
     Out.Uv3 = In.Uv3;
+
+
+    if (uvAnimId != 0u) {
+        float4 anim = gUVAnim[uvAnimId];
+        uint setIdx = uint(anim.z);
+        if (setIdx == 0u) { Out.Uv0 += anim.xy; }
+        else if (setIdx == 1u) { Out.Uv1 += anim.xy; }
+        else if (setIdx == 2u) { Out.Uv2 += anim.xy; }
+        else { Out.Uv3 += anim.xy; }
+    }
     Out.Color = In.Color;
     Out.MatDiffuse = In.MatDiffuse;
     Out.MatAmbient = In.MatAmbient;
     Out.MatEmissive = In.MatEmissive;
     Out.Stages = In.Stages;
 
-    Out.Packed = In.Meta >> 8u;
+
+
+    Out.Packed = stageCount | (vColSource << 3u) | (alphaRefB << 8u);
 
     float dist = length(worldPos.xyz - gFrameData.eyePos.xyz);
     Out.Fog = saturate((gFrameData.fogParams.y - dist)

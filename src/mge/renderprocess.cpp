@@ -49,6 +49,32 @@ namespace {
     bool   g_distLightsTogglePending = false; // numpad- latched at composite finish; one-shot host dist-light A/B
     bool   g_fpSuppressLive = false;   // FP1b: MW arm suppression; seeded from ForgeFPSuppress at init, numpad-/ flips live
 
+    // Frame-ahead pipelining (ForgeFrameAhead): on early-kickoff frames the paired
+    // renderSceneFinish + RT copy defer to the NEXT frame's BeginScene(0) collect, and the
+    // EndScene(0) composite point blits the PREVIOUS host frame from g_mainTex (which the
+    // copy left as a stable snapshot — the blit never reads the shared RT directly). The
+    // host frame thus overlaps the WHOLE MW frame, not just scene 0. World image lags
+    // input by one frame (UI stays current).
+    bool   g_frameAheadLive = false;   // seeded from ForgeFrameAhead at init; numpad-* flips live (A/B)
+    bool   g_mainTexValid = false;     // g_mainTex holds a successfully copied host frame (deferred-blit gate)
+    double g_lastBlitMs = 0.0;         // deferred EndScene blit cost, folded into the next collect's [hb]
+    unsigned g_frameSerial = 0;        // Present tick (onFramePresented) — dedups the dev-key poll
+    unsigned g_lastPollSerial = ~0u;   // frame serial of the last dev-key poll
+
+    // A0 Cut-4 probe: MW frame-start span = engine Present return → BeginScene(0).
+    // Everything MW does there (input, sim, AI, animation) is engine-side and has never
+    // been zoned; its magnitude decides whether a frame-start no-op (Cut 4) exists at
+    // all. Stamped in the proxy Present, consumed at the BeginScene(0) collect, averaged
+    // into the [hb] heartbeat as mwstart=.
+    double g_presentReturnMs = 0.0;    // engine Present return stamp (0 = none pending)
+    double g_pendingMwStart = 0.0;     // this frame's Present→BeginScene(0) gap (ms)
+
+    // Frame-ahead observability: last-frame values shipped to the host Stats panel via
+    // DevInput each kickoff (bridge.h DevInput frame-ahead fields). Set at the collect
+    // (wait) and the mwstart close; read at the next kickoff — 1-frame skew, panel only.
+    double g_lastWaitMsStat = 0.0;     // last residual collect wait (pipeline success metric)
+    double g_lastMwStartStat = 0.0;    // last Present-return → BeginScene(0) gap
+
     // --- Feeding-side spike logging --------------------------------------------------
     // Periodic FPS dips are suspected to come from the client feed (geometry/texture
     // uploads + the blocking host RPC), not the host GPU. Time each phase of onPresent
@@ -67,8 +93,17 @@ namespace {
     // own cost (kickoff prep + residual wait + copy + blit), so feed is comparable across
     // fused/async modes and IS the perf baseline once the wait bucket collapses.
     constexpr unsigned kHeartbeatFrames = 300;
-    struct Accum { double feed, geom, build, render, host, overlap, copy, blit, dt; double maxFeed, maxDt; double captured; unsigned n, earlyN; };
+    struct Accum { double feed, geom, build, render, host, overlap, copy, blit, dt, mwstart; double maxFeed, maxDt; double captured; unsigned n, earlyN, pipeN; };
     Accum g_hb = {};
+
+    // Upload cost accounting (Part A). Two accumulators: g_upFrame is THIS frame's per-category
+    // reship cost (parts + bytes), read into lighting[33..34] when the kickoff builds the frame
+    // and then zeroed; g_upHb sums the same over the kHeartbeatFrames window for the [uploads]
+    // breakdown line logged alongside [hb]. noteUpload() (called from the geometry cache) is the
+    // only writer; both are single-threaded with the cache walk + kickoff.
+    struct UploadAccum { std::uint32_t parts[RenderProcess::kUpCount]; std::uint64_t bytes[RenderProcess::kUpCount]; };
+    UploadAccum g_upFrame = {};
+    UploadAccum g_upHb    = {};
 
     // Async-frame split: everything the finish half needs from the kickoff half. Reset at
     // every kickoff entry; rpcPending=true only when renderSceneKickoff actually started the
@@ -76,6 +111,11 @@ namespace {
     struct KickState {
         bool rpcPending;
         bool early;     // fired from the BeginScene(0) site (DistantLand::earlyForgeKickoff latch)
+        // ForgeFrameAhead: this kickoff's finish is deferred to the NEXT frame's
+        // BeginScene(0) collect; the EndScene(0) composite point blits the previous
+        // frame instead of finishing. Set only on early-kickoff frames — exactly the
+        // frames whose whole MW frame is already validated IPC-free on both channels.
+        bool deferFinish;
         // Mid-walk geometry drain (drainPendingIfFull) fired inside the async window and
         // closed it early: renderSceneFinish already ran; the composite finish must consume
         // these stored results instead of finishing again. Load-burst frames only.
@@ -570,6 +610,7 @@ namespace {
             if (g_importMem) { vk.FreeMemory(g_dev, g_importMem, nullptr); g_importMem = VK_NULL_HANDLE; }
         }
         if (g_mainTex)     { g_mainTex->Release(); g_mainTex = nullptr; }
+        g_mainTexValid = false;
         g_dstImg = VK_NULL_HANDLE;
         if (g_hostHandle)  { CloseHandle(g_hostHandle); g_hostHandle = nullptr; }
         if (g_vki)         { g_vki->Release(); g_vki = nullptr; }
@@ -927,6 +968,9 @@ namespace {
         if (!g_texVec || g_texPendingBlob.empty() || g_texPendingCount == 0) {
             return;
         }
+        // A0 sub-buckets (see flushGeometry): assign vs RPC wait, one line per >=1ms flush.
+        const double tFlush0 = nowMs();
+        double assignMs = 0.0, rpcMs = 0.0;
         const std::size_t windowBytes = (std::size_t)IPC::kTexWindowBytes;
         const std::uint8_t* base = g_texPendingBlob.data();
         const std::size_t total = g_texPendingBlob.size();
@@ -945,8 +989,14 @@ namespace {
             if (batchCount == 0) { break; }   // safety (each entry <= window)
             const std::uint32_t bytes = (std::uint32_t)(batchEnd - off);
             std::uint32_t uploaded = 0;
-            if (g_texVec->assign_bytes(base + off, bytes)) {
+            const double tAssign0 = nowMs();
+            const bool assigned = g_texVec->assign_bytes(base + off, bytes);
+            assignMs += nowMs() - tAssign0;
+            if (assigned) {
+                const double tRpc0 = nowMs();
+                MGE_ZoneScopedN("Forge texUpload RPC");
                 g_client->texUploadBlocking(g_texVec->id(), batchCount, bytes, &uploaded);
+                rpcMs += nowMs() - tRpc0;
             }
             if (uploaded == 0xFFFFFFFFu) {
                 // Host opaque path not built yet (first scene frame) — keep the whole queue and
@@ -955,8 +1005,15 @@ namespace {
             }
             off = batchEnd;
         }
+        const std::uint32_t flushedTexCount = g_texPendingCount;
         g_texPendingBlob.clear();
         g_texPendingCount = 0;
+
+        const double flushMs = nowMs() - tFlush0;
+        if (flushMs >= 1.0) {
+            LOG::logline("-- [texflush] %.2fms tex=%u bytes=%uKB assign=%.2f rpc=%.2f",
+                         flushMs, flushedTexCount, (unsigned)(total >> 10), assignMs, rpcMs);
+        }
     }
 
     // Turn this frame's cache evictions into host slot-release records. An object that LEFT the
@@ -991,7 +1048,18 @@ namespace {
     // boundaries to never split a part across a chunk. Blocking RPCs — called at
     // present time. Static cost: each part ships once per (key,revision).
     void flushGeometry() {
-        drainReleasedSlots();   // append host slot-release records before the empty check
+        // A0 geom-flush sub-buckets: the [hb]/[spike] geom= bucket is this whole
+        // function; split it into drain (eviction records) / assign (shared-vec memcpy)
+        // / rpc (geomUploadBlocking wait — the host-side turnaround) so an anomalous
+        // flush names its component. One [geomflush] line per >=1ms flush.
+        const double tFlush0 = nowMs();
+        double drainMs = 0.0, assignMs = 0.0, rpcMs = 0.0;
+        std::uint32_t chunkCount = 0;
+        {
+            const double t0 = nowMs();
+            drainReleasedSlots();   // append host slot-release records before the empty check
+            drainMs = nowMs() - t0;
+        }
         if (!g_geomVec || g_pendingBlob.empty() || g_pendingParts == 0) {
             return;
         }
@@ -1031,7 +1099,8 @@ namespace {
                 const std::uint32_t partSize = static_cast<std::uint32_t>(
                     sizeof(IPC::GeomPartWire)
                     + (std::uint64_t)hdr.vertexCount * vStride
-                    + (std::uint64_t)hdr.indexCount * sizeof(std::uint16_t));
+                    + (std::uint64_t)hdr.indexCount * sizeof(std::uint16_t)
+                    + hdr.uvAnimBytes);   // NiUVController key track (0 for most parts)
                 if (chunkBytes != 0 && chunkBytes + partSize > kGeomChunkCap) {
                     break;  // close this chunk on a part boundary
                 }
@@ -1049,7 +1118,10 @@ namespace {
                 break;
             }
 
-            if (!g_geomVec->assign_bytes(data + off, chunkBytes)) {
+            const double tAssign0 = nowMs();
+            const bool assigned = g_geomVec->assign_bytes(data + off, chunkBytes);
+            assignMs += nowMs() - tAssign0;
+            if (!assigned) {
                 if (++s_flushFailStreak >= kFlushFailLimit) {
                     LOG::logline("!! [seam] geometry chunk assign_bytes failed %u times — DROPPING chunk (%u bytes, %u parts)",
                                  s_flushFailStreak, chunkBytes, chunkParts);
@@ -1067,7 +1139,15 @@ namespace {
             // the old recreate+fence cost — and it keeps the present pipeline simple (async
             // kickoff was reverted: it cost the framerate cap without helping the steady state).
             std::uint32_t uploaded = 0;
-            if (!g_client->geomUploadBlocking(g_geomVec->id(), chunkParts, chunkBytes, &uploaded)) {
+            const double tRpc0 = nowMs();
+            bool rpcOk;
+            {
+                MGE_ZoneScopedN("Forge geomUpload RPC");
+                rpcOk = g_client->geomUploadBlocking(g_geomVec->id(), chunkParts, chunkBytes, &uploaded);
+            }
+            rpcMs += nowMs() - tRpc0;
+            ++chunkCount;
+            if (!rpcOk) {
                 // Transient (async-window refusal / lost RPC): keep this chunk onward and let
                 // the next flush retry — slots are idempotent, a re-send just rebuilds. The
                 // old clear-anyway lost the geometry FOREVER (revs were already stamped).
@@ -1096,6 +1176,12 @@ namespace {
         } else if (off > 0) {
             g_pendingBlob.erase(g_pendingBlob.begin(), g_pendingBlob.begin() + off);
             g_pendingParts = (shippedParts < g_pendingParts) ? (g_pendingParts - shippedParts) : 0;
+        }
+
+        const double flushMs = nowMs() - tFlush0;
+        if (flushMs >= 1.0) {
+            LOG::logline("-- [geomflush] %.2fms parts=%u bytes=%uKB chunks=%u drain=%.2f assign=%.2f rpc=%.2f",
+                         flushMs, shippedParts, total >> 10, chunkCount, drainMs, assignMs, rpcMs);
         }
     }
 
@@ -2343,6 +2429,7 @@ namespace RenderProcess {
         }
         g_client = client;
         g_fpSuppressLive = Configuration.ForgeFPSuppress;   // FP1b seed; numpad-/ flips live
+        g_frameAheadLive = Configuration.ForgeFrameAhead;   // frame-ahead seed; numpad-* flips live
         if (!device) {
             LOG::logline("!! [seam] no device at init; seam disabled");
             return;
@@ -2352,7 +2439,332 @@ namespace RenderProcess {
         lazyInit(device);
     }
 
+
+    // --- Finish-half pieces -----------------------------------------------------------
+    // The composite finish is split into once-per-frame pieces so frame-ahead pipelining
+    // (ForgeFrameAhead) can run them at different points: dev-key poll + finish/copy at
+    // the NEXT frame's BeginScene(0) collect, the composite blit alone at EndScene(0).
+    // The non-deferred path (onStage0CompositeFinish) runs all of them back to back —
+    // behaviour identical to before the split.
+
+    // Poll the seam's edge-triggered dev keys, once per display frame (Present-serial
+    // dedup — collect and finish can both run in one frame during mode transitions, and
+    // a double edge-poll would eat or double-flip a keypress). Deferred mode polls at
+    // the BeginScene(0) collect — BEFORE the earlyForgeKickoff latch and every
+    // suppression gate, so all per-frame consumers see one consistent value; on
+    // non-deferred frames the finish still polls (whichever runs first this frame wins).
+    void pollDevKeys() {
+        if (!g_initOk) {
+            return;
+        }
+        if (g_lastPollSerial == g_frameSerial) {
+            return;     // already polled this display frame
+        }
+        g_lastPollSerial = g_frameSerial;
+        // F11: live composite toggle.
+        if (GetAsyncKeyState(VK_F11) & 0x0001) {
+            g_enabled = !g_enabled;
+            LOG::logline(">> [seam] composite %s", g_enabled ? "ON" : "OFF");
+        }
+        // F12 diagnostic: scatter each object by a fixed per-slot offset so any object that
+        // is drawn more than once appears as TWO separated copies of the same mesh (a single
+        // draw just looks displaced). Reveals duplicate draws regardless of source.
+        if (GetAsyncKeyState(VK_F12) & 0x0001) {
+            // Tier 2 GTAO added 3 (AO) + 4 (bent normal); dev panel added 5 (albedo) 6 (lit)
+            // 7 (ambient) shading-isolation views; 8 (world normal) 9 (point-light count);
+            // P1 shadows added 10 (shadow mask — the host panel's face-id/atlas checkboxes
+            // pick what it displays); shadow observability added 11 (shadow-atlas static) +
+            // 12 (shadow-atlas dynamic) fullscreen atlas blits — cycle is now %13.
+            g_debugMode = (g_debugMode + 1) % 13;
+            const char* name = (g_debugMode == 1) ? "DEPTH" : (g_debugMode == 2) ? "SCATTER"
+                             : (g_debugMode == 3) ? "AO" : (g_debugMode == 4) ? "BENT NORMAL"
+                             : (g_debugMode == 5) ? "ALBEDO" : (g_debugMode == 6) ? "LIT"
+                             : (g_debugMode == 7) ? "AMBIENT" : (g_debugMode == 8) ? "WORLD NORMAL"
+                             : (g_debugMode == 9) ? "LIGHT COUNT"
+                             : (g_debugMode == 10) ? "SHADOW MASK"
+                             : (g_debugMode == 11) ? "SHADOW ATLAS (STATIC)"
+                             : (g_debugMode == 12) ? "SHADOW ATLAS (DYN)" : "NORMAL";
+            LOG::logline(">> [seam] debug mode %d (%s)", g_debugMode, name);
+        }
+        // F9 toggles the in-host dev overlay.
+        if (GetAsyncKeyState(VK_F9) & 0x0001) {
+            g_devUiVisible = !g_devUiVisible;
+            LOG::logline(">> [seam] dev overlay %s", g_devUiVisible ? "ON" : "OFF");
+        }
+        // F7 toggles the Forge WATER takeover. The sky takeover is finished, so the sky
+        // pass is always on now and F7 was freed — it drives water (WT1). ON (default) →
+        // the host draws its geo-clipmap water surface. OFF → MW's own water (clean A/B).
+        if (GetAsyncKeyState(VK_F7) & 0x0001) {
+            g_waterEnabled = !g_waterEnabled;
+            LOG::logline(">> [seam] Forge water (WT1) %s", g_waterEnabled ? "ON" : "OFF");
+        }
+        // F8: one-shot host compute-shader hot-reload — rebuild gtao/linearize from the
+        // dxil on disk (recompile + redeploy first). Latched into the NEXT kickoff's
+        // DevInput. Independent of panel visibility.
+        if (GetAsyncKeyState(VK_F8) & 0x0001) {
+            g_reloadShadersPending = true;
+            LOG::logline(">> [seam] compute shader hot-reload requested (F8)");
+        }
+        // Numpad -: perf A/B for the baked distant point-light loop. Latched here (edge), flipped
+        // host-side in the next kickoff's DevInput so the gpu-split `dl=` bracket can be diffed
+        // on/off in a heavy night scene (the clustered-vs-forward cost measurement).
+        if (GetAsyncKeyState(VK_SUBTRACT) & 0x0001) {
+            g_distLightsTogglePending = true;
+            LOG::logline(">> [seam] distant-light A/B toggle requested (numpad -)");
+        }
+        // FP1b: numpad-/ toggles MW first-person arm suppression live (A/B of MW arms
+        // over the host FP pass vs host arms alone). Only takes effect while the FP
+        // pass ships (wantsFPSuppression gates on capture + camera validation).
+        if (GetAsyncKeyState(VK_DIVIDE) & 0x0001) {
+            g_fpSuppressLive = !g_fpSuppressLive;
+            LOG::logline(">> [seam] FP suppression (FP1b) %s", g_fpSuppressLive ? "ON" : "OFF");
+        }
+        // Numpad *: frame-ahead pipelining live A/B (ForgeFrameAhead). Takes effect at the
+        // next kickoff; a pending deferred frame still collects normally (the collect keys
+        // on g_kick.deferFinish, not this flag), so the toggle can never wedge the window.
+        if (GetAsyncKeyState(VK_MULTIPLY) & 0x0001) {
+            g_frameAheadLive = !g_frameAheadLive;
+            LOG::logline(">> [seam] frame-ahead pipelining %s", g_frameAheadLive ? "ON" : "OFF");
+        }
+    }
+
+    // Consume the pending host RenderFrame: drain the completion (or the stored mid-walk
+    // early-finish result) and copy the shared RT into g_mainTex. Shared by the finish
+    // (same frame) and the frame-ahead collect (next frame). Updates g_mainTexValid —
+    // the deferred-blit gate; on failure the blit is skipped, which is exactly today's
+    // "no composite this frame" failure behaviour.
+    struct FinishResult {
+        bool consumed;      // a pending / early-finished frame existed
+        bool ok;            // finish AND copy both succeeded
+        double hostMs, overlap, tWait0, tRender, tCopy;
+    };
+    FinishResult finishAndCopy() {
+        FinishResult r = {};
+        const bool earlyFinished = g_kick.rpcEarlyFinished;   // mid-walk drain closed the window
+        if (!g_kick.rpcPending && !earlyFinished) {
+            return r;
+        }
+        g_kick.rpcPending       = false;
+        g_kick.rpcEarlyFinished = false;
+        r.consumed = true;
+
+        // overlap = the MW frame work the host render ran under. In fused mode (Finish
+        // called straight after Kickoff) this is ~0 and every bucket reduces to the old
+        // serial breakdown — the exact A/B. Async ≈ scene 0; deferred collect ≈ the whole
+        // previous MW frame. An early finish ends the overlap at the drain.
+        r.tWait0 = nowMs();
+        r.overlap = (earlyFinished ? g_kick.tEarlyFinish : r.tWait0) - g_kick.tKick;
+
+        if (earlyFinished) {
+            r.ok     = g_kick.earlyOk;
+            r.hostMs = g_kick.earlyHostMs;
+        } else {
+            MGE_ZoneScopedN("Forge renderSceneFinish (host wait)");
+            r.ok = g_client->renderSceneFinish(&r.hostMs);
+        }
+        r.tRender = nowMs();
+        // Split the wait: hostMs = host self-timed cost; (residual wait + kickoff cost - hostMs)
+        // = IPC/sync/host-present overhead. With the finish deferred to the next frame's
+        // collect, the residual wait collapsing toward 0 is the whole point of the pipeline.
+        MGE_TracyPlot("Forge client wait ms", r.tRender - r.tWait0);
+        MGE_TracyPlot("Forge overlap ms", r.overlap);
+        MGE_TracyPlot("Forge host ms", r.hostMs);
+        // Host-inflight lane: the paired 1.0 is set when the kickoff RPC is issued — the
+        // step plot spans the host's whole render window across the frame boundary, the
+        // thing per-thread zones can't show (the host is another process).
+        MGE_TracyPlot("Forge host inflight", 0.0);
+        g_lastWaitMsStat = r.tRender - r.tWait0;   // → host Stats panel next kickoff
+        if (!r.ok) {
+            g_mainTexValid = false;
+            return r;
+        }
+
+        bool copyOk;
+        {
+            MGE_ZoneScopedN("Forge RT copy");
+            copyOk = copyHostRtToDst();
+        }
+        if (!copyOk) {
+            static bool logged = false;
+            if (!logged) { LOG::logline("!! [seam] copyHostRtToDst failed"); logged = true; }
+            g_mainTexValid = false;
+            r.ok = false;
+            return r;
+        }
+        r.tCopy = nowMs();
+        g_mainTexValid = true;
+        return r;
+    }
+
+    // Composite the Forge layer (g_mainTex) OVER MW's frame as a full-screen textured quad
+    // with PREMULTIPLIED alpha blend. The Forge RT clears to alpha=0 and geometry writes
+    // alpha=1, so alpha is a coverage mask: sky/distant land (already on the backbuffer from
+    // renderStage0) show through alpha=0 regions and alpha-test holes. Premultiplied
+    // (SRCBLEND=ONE, DESTBLEND=INVSRCALPHA) — NOT SRCALPHA — because MSAA resolve leaves
+    // edge pixels premultiplied (rgb already scaled by partial coverage); SRCALPHA would
+    // darken edges. State-blocked so nothing leaks into MW's scene 1 (every DistantLand
+    // stage does this). -0.5 px offset + POINT filter = the 1:1 texel mapping StretchRect
+    // gave (the geometry half-pixel was already corrected host-side). Returns its cost (ms).
+    double compositeBlitMainTex(IDirect3DDevice9* device) {
+        MGE_ZoneScopedN("Forge composite blit");
+        const double t0 = nowMs();
+        IDirect3DStateBlock9* sb = nullptr;
+        device->CreateStateBlock(D3DSBT_ALL, &sb);
+
+        IDirect3DSurface9* backbuffer = nullptr;
+        if (SUCCEEDED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backbuffer)) && backbuffer) {
+            device->SetRenderTarget(0, backbuffer);
+            backbuffer->Release();
+        }
+
+        device->SetPixelShader(nullptr);
+        device->SetVertexShader(nullptr);
+        device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+        device->SetTexture(0, g_mainTex);
+
+        device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+        device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
+        device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+        device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+        device->SetRenderState(D3DRS_ZENABLE, FALSE);
+        device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+        device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+        device->SetRenderState(D3DRS_LIGHTING, FALSE);
+        device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+        device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+        device->SetRenderState(D3DRS_COLORWRITEENABLE, 0x0F);
+
+        device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+        device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+        device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+        device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+        device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+        device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+        // CRITICAL: disable texture-coordinate transformation. MW leaves a VIEW-DEPENDENT
+        // texture matrix active for environment/sphere-map reflections; without this the FF
+        // pipeline would transform our blit UVs by that matrix, shearing the composited image
+        // as the camera rotates (host output g_mainTex is correct; only the sampled blit skews).
+        device->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+        device->SetTextureStageState(1, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+        // CRITICAL: MW leaves environment/sphere-map TEXGEN active (D3DTSS_TEXCOORDINDEX carries
+        // a TCI_CAMERASPACE* flag). With texgen the FF pipeline SYNTHESISES texcoords from
+        // camera-space position/normal and IGNORES the vertex UVs — disabling the texture matrix
+        // alone isn't enough (the generated coords are the zoom/skew gradient we saw). Force the
+        // stage to read vertex texcoord set 0 with no texgen.
+        device->SetTextureStageState(0, D3DTSS_TEXCOORDINDEX, 0);
+        // Belt-and-suspenders: also neutralise the texture matrix itself. Identity == passthrough.
+        {
+            D3DMATRIX ident = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+            device->SetTransform(D3DTS_TEXTURE0, &ident);
+        }
+        device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+        device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+        device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+        device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+
+        const float fw = (float)g_w, fh = (float)g_h;
+        struct CV { float x, y, z, rhw, u, v; };
+        const CV quad[4] = {
+            { -0.5f,      -0.5f,      0.0f, 1.0f, 0.0f, 0.0f },
+            { fw - 0.5f,  -0.5f,      0.0f, 1.0f, 1.0f, 0.0f },
+            { -0.5f,      fh - 0.5f,  0.0f, 1.0f, 0.0f, 1.0f },
+            { fw - 0.5f,  fh - 0.5f,  0.0f, 1.0f, 1.0f, 1.0f },
+        };
+        device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(CV));
+
+        device->SetTexture(0, nullptr);
+        if (sb) { sb->Apply(); sb->Release(); }
+        return nowMs() - t0;
+    }
+
+    // [hb] heartbeat + spike accounting, shared by the finish (same-frame) and the
+    // frame-ahead collect (next frame). On deferred frames tEnd is the collect end
+    // (post-copy) and the blit bucket is the PREVIOUS EndScene's deferred blit — carried
+    // in via pipeBlitMs (1-frame skew, irrelevant across the 300-frame window) — folded
+    // into feed so it stays "the client's own cost" and comparable across all modes.
+    void accumFrameStats(const FinishResult& fr, double tEnd, bool pipelined, double pipeBlitMs) {
+        const double blitMs = pipelined ? pipeBlitMs : (tEnd - fr.tCopy);
+        // feed EXCLUDES the overlap window — it's the client's own cost, comparable
+        // across fused/async/pipelined: (kickoff prep) + (residual wait + copy + blit).
+        const double feed = (g_kick.tKick - g_kick.tStart) + (tEnd - fr.tWait0)
+                          + (pipelined ? pipeBlitMs : 0.0);
+        const double renderBucket = (g_kick.tKick - g_kick.tAssign) + (fr.tRender - fr.tWait0);
+
+        // Baseline heartbeat over every composited frame (sees the <kSpikeMs majority).
+        // Cut 2B: build first, then geom flush (fold frames capture during build).
+        g_hb.feed += feed; g_hb.geom += (g_kick.tGeomFlush - g_kick.tBuild);
+        g_hb.build += (g_kick.tBuild - g_kick.tStart);
+        g_hb.render += renderBucket; g_hb.host += fr.hostMs; g_hb.overlap += fr.overlap;
+        g_hb.copy += (fr.tCopy - fr.tRender); g_hb.blit += blitMs; g_hb.dt += g_kick.dtPresent;
+        g_hb.mwstart += g_pendingMwStart; g_pendingMwStart = 0.0;   // A0 Cut-4 probe (1-frame skew on deferred frames)
+        g_hb.captured += g_kick.capturedCount;
+        if (feed > g_hb.maxFeed) g_hb.maxFeed = feed;
+        if (g_kick.dtPresent > g_hb.maxDt) g_hb.maxDt = g_kick.dtPresent;
+        if (g_kick.early) ++g_hb.earlyN;
+        if (pipelined) ++g_hb.pipeN;
+        if (++g_hb.n >= kHeartbeatFrames) {
+            // pipe = frames whose finish deferred to the collect; refuse = CUMULATIVE
+            // window-guard refusals (must stay 0 — nonzero means an unaudited RPC site
+            // fired inside the now frame-long async window).
+            LOG::logline(">> [hb] %u frames avg: feed=%.2f geom=%.2f build=%.2f render=%.2f[host=%.2f] "
+                         "overlap=%.2f copy=%.2f blit=%.2f dt=%.2f mwstart=%.2f early=%u pipe=%u refuse=%u cap=%.1f | max feed=%.2f dt=%.2f (~%.0f fps)",
+                         g_hb.n, g_hb.feed / g_hb.n, g_hb.geom / g_hb.n, g_hb.build / g_hb.n,
+                         g_hb.render / g_hb.n, g_hb.host / g_hb.n, g_hb.overlap / g_hb.n,
+                         g_hb.copy / g_hb.n, g_hb.blit / g_hb.n, g_hb.dt / g_hb.n,
+                         g_hb.mwstart / g_hb.n, g_hb.earlyN,
+                         g_hb.pipeN, g_client ? g_client->windowRefusals() : 0u,
+                         g_hb.captured / g_hb.n,
+                         g_hb.maxFeed, g_hb.maxDt,
+                         g_hb.dt > 0.0 ? 1000.0 * g_hb.n / g_hb.dt : 0.0);
+            // Part A: per-frame host-geom upload cost, broken down by cause over the same window.
+            // parts/frame + KB/frame per category; skin=NPC/creature, morph=pos rewrite (morphing
+            // statics + particle regen), uvleak should stay ~0 after the UVController takeover.
+            const double invN = 1.0 / g_hb.n;
+            auto pf = [&](RenderProcess::UploadCat c) { return g_upHb.parts[c] * invN; };
+            auto kf = [&](RenderProcess::UploadCat c) { return g_upHb.bytes[c] * invN / 1024.0; };
+            std::uint64_t totB = 0; std::uint32_t totP = 0;
+            for (int c = 0; c < RenderProcess::kUpCount; ++c) { totB += g_upHb.bytes[c]; totP += g_upHb.parts[c]; }
+            LOG::logline(">> [uploads] %u frames avg/frame: total=%.1f parts/%.1fKB | "
+                         "new=%.1f/%.1f skin=%.1f/%.1f morph=%.1f/%.1f vcol=%.1f/%.1f "
+                         "topo=%.1f/%.1f uvleak=%.1f/%.1f other=%.1f/%.1f",
+                         g_hb.n, totP * invN, totB * invN / 1024.0,
+                         pf(RenderProcess::kUpNew),   kf(RenderProcess::kUpNew),
+                         pf(RenderProcess::kUpSkin),  kf(RenderProcess::kUpSkin),
+                         pf(RenderProcess::kUpMorph), kf(RenderProcess::kUpMorph),
+                         pf(RenderProcess::kUpVcol),  kf(RenderProcess::kUpVcol),
+                         pf(RenderProcess::kUpTopo),  kf(RenderProcess::kUpTopo),
+                         pf(RenderProcess::kUpUvLeak),kf(RenderProcess::kUpUvLeak),
+                         pf(RenderProcess::kUpOther), kf(RenderProcess::kUpOther));
+            g_upHb = UploadAccum{};
+            g_hb = Accum{};
+        }
+
+        if (feed >= kSpikeMs) {
+            LOG::logline("!! [spike] frame %u feed=%.2fms (geomflush=%.2f build=%.2f texflush=%.2f "
+                         "assign=%.2f render=%.2f[host=%.2f] overlap=%.2f copy=%.2f blit=%.2f) "
+                         "draws=%u skin=%u mm=%u light=%u alpha=%u cap=%u geom+=%u/%uKB tex+=%u/%uKB dt=%.2fms",
+                         g_kick.frame, feed,
+                         g_kick.tGeomFlush - g_kick.tBuild, g_kick.tBuild - g_kick.tStart,
+                         g_kick.tTexFlush - g_kick.tGeomFlush, g_kick.tAssign - g_kick.tTexFlush,
+                         renderBucket, fr.hostMs, fr.overlap, fr.tCopy - fr.tRender, blitMs,
+                         g_kick.drawCount, g_kick.skinnedCount, g_kick.multiMapCount, g_kick.lightCount,
+                         g_kick.alphaCount, g_kick.capturedCount,
+                         g_kick.geomParts, (unsigned)(g_kick.geomBytes >> 10),
+                         g_kick.texCount, (unsigned)(g_kick.texBytes >> 10),
+                         g_kick.dtPresent);
+        }
+    }
+
     void onStage0CompositeKickoff(IDirect3DDevice9* device) {
+        // Frame-ahead backstop: every kickoff must consume the previous deferred frame
+        // FIRST (the collect normally did, at BeginScene(0) — before this runs in frame
+        // order). Reaching here with one still pending means an unexpected path skipped
+        // the collect; collect it now (accounting discarded) so the reset below can
+        // never orphan the pending RPC and wedge the window guard.
+        if (g_kick.deferFinish && (g_kick.rpcPending || g_kick.rpcEarlyFinished)) {
+            LOG::logline("!! [pipe] kickoff entered with an uncollected deferred frame — collecting late");
+            finishAndCopy();
+        }
         // Whole-frame no-op guarantee: rpcPending stays false on every early-out below, so
         // the paired Finish returns immediately.
         g_kick = KickState{};
@@ -2369,8 +2781,9 @@ namespace RenderProcess {
         const double dtPresent = (g_lastPresentMs > 0.0) ? (tStart - g_lastPresentMs) : 0.0;
         g_lastPresentMs = tStart;
 
-        // (Edge-triggered dev-key polls — F11/F12/F9/F7/F8 — moved to
-        // onStage0CompositeFinish so every per-frame ownership gate, including the
+        // (Edge-triggered dev-key polls — F11/F12/F9/F7/F8/… — live in pollDevKeys,
+        // run once per frame from the frame-ahead collect at BeginScene(0) or from
+        // onStage0CompositeFinish, so every per-frame ownership gate, including the
         // frameSetupEarly early-kickoff latch that runs BEFORE this function, sees
         // one consistent value per frame. See the comment there.)
         if (!g_enabled) {
@@ -2751,8 +3164,26 @@ namespace RenderProcess {
             // scroll in step under an F11 A/B. NOT a host wall clock: that keeps running in menus and,
             // being steady_clock-since-BOOT, quantizes to 0.02-0.13s steps once cast to float32 (the
             // bug that made the host's water normals judder — see forgerender.cpp:9150).
+            // [33]/[34] Part A upload cost: THIS frame's total host-geom reship KB + part count,
+            // surfaced on the host perf panel. Filled from g_upFrame just below (the array is const,
+            // so a non-const alias writes the two slots after the aggregate is computed).
             mwb->simulationTime(),     0.0f,                      0.0f,                      0.0f,
         };
+
+        // Part A: aggregate this frame's per-category upload cost, publish the total to the host
+        // (lighting[33]=KB, [34]=parts), fold the window sum for the [uploads] heartbeat, then zero
+        // the frame accumulator for the next walk.
+        {
+            float* lightingW = const_cast<float*>(lighting);
+            std::uint64_t frameBytes = 0; std::uint32_t frameParts = 0;
+            for (int c = 0; c < RenderProcess::kUpCount; ++c) {
+                frameBytes += g_upFrame.bytes[c]; frameParts += g_upFrame.parts[c];
+                g_upHb.bytes[c] += g_upFrame.bytes[c]; g_upHb.parts[c] += g_upFrame.parts[c];
+            }
+            lightingW[33] = float(frameBytes) * (1.0f / 1024.0f);   // KB this frame
+            lightingW[34] = float(frameParts);
+            g_upFrame = UploadAccum{};
+        }
 
         // Dev overlay input (Stage 2): poll the mouse in MW client-space pixels (1:1 with the host
         // render target) + L/R/M buttons, and forward with the F9 visibility flag. Only meaningful
@@ -2769,6 +3200,12 @@ namespace RenderProcess {
             devInput.distLightsToggle = 1u;
             g_distLightsTogglePending = false;
         }
+        // Frame-ahead observability → host Stats panel: last frame's collect wait and
+        // mwstart (1-frame skew, panel only) + this frame's dt and the live toggle.
+        devInput.frameAhead     = g_frameAheadLive ? 1u : 0u;
+        devInput.clientWaitMs   = (float)g_lastWaitMsStat;
+        devInput.clientDtMs     = (float)dtPresent;
+        devInput.clientMwStartMs = (float)g_lastMwStartStat;
         if (g_devUiVisible) {
             if (!g_devHwnd) {
                 D3DDEVICE_CREATION_PARAMETERS cp = {};
@@ -2844,8 +3281,20 @@ namespace RenderProcess {
         }
 
         // Hand everything the finish half needs across the overlap window.
+        // Host-inflight lane start (paired 0.0 in finishAndCopy): from here until the
+        // collect/finish drains the completion, the host owns the frame.
+        MGE_TracyPlot("Forge host inflight", 1.0);
         g_kick.rpcPending    = true;
         g_kick.early         = DistantLand::earlyForgeKickoff;  // BeginScene(0) site vs late (EndScene)
+        // Frame-ahead pipelining: defer the finish to the NEXT frame's BeginScene(0)
+        // collect — but ONLY on early-kickoff frames. The earlyForgeKickoff latch is
+        // exactly the "whole MW frame is IPC-free on both channels" predicate (statics
+        // cull gated off, grass hoisted, reflection/shadow RPCs suppressed under
+        // wantsWaterCapture), so widening the window from scene 0 to the whole frame is
+        // safe precisely there. Late/warm-up/menu frames keep the same-frame finish —
+        // which also primes g_mainTex before the first deferred blit (the latch needs
+        // two consecutive eligible frames, so a serial frame always runs first).
+        g_kick.deferFinish   = g_frameAheadLive && DistantLand::earlyForgeKickoff;
         g_kick.frame         = frame;
         g_kick.drawCount     = drawCount;
         g_kick.skinnedCount  = skinnedCount;
@@ -2868,248 +3317,24 @@ namespace RenderProcess {
     }
 
     void onStage0CompositeFinish(IDirect3DDevice9* device) {
-        // Poll the seam's edge-triggered dev keys HERE, at composite finish — after every
-        // consumer of the ownership gates has run this frame. Phase 2 latches the early-
-        // kickoff decision (DistantLand::earlyForgeKickoff) at BeginScene(0), BEFORE the
-        // kickoff; polling in the kickoff flipped g_enabled/g_waterEnabled between that
-        // latch and the stage-0 suppression gates — a mid-frame mixed state that could
-        // e.g. fire the shadow/reflection RPCs inside the still-open async window. Costs
-        // one frame of latency on dev toggles; every gate now sees one value per frame.
-        if (g_initOk) {
-            // F11: live composite toggle.
-            if (GetAsyncKeyState(VK_F11) & 0x0001) {
-                g_enabled = !g_enabled;
-                LOG::logline(">> [seam] composite %s", g_enabled ? "ON" : "OFF");
-            }
-            // F12 diagnostic: scatter each object by a fixed per-slot offset so any object that
-            // is drawn more than once appears as TWO separated copies of the same mesh (a single
-            // draw just looks displaced). Reveals duplicate draws regardless of source.
-            if (GetAsyncKeyState(VK_F12) & 0x0001) {
-                // Tier 2 GTAO added 3 (AO) + 4 (bent normal); dev panel added 5 (albedo) 6 (lit)
-                // 7 (ambient) shading-isolation views; 8 (world normal) 9 (point-light count);
-                // P1 shadows added 10 (shadow mask — the host panel's face-id/atlas checkboxes
-                // pick what it displays); shadow observability added 11 (shadow-atlas static) +
-                // 12 (shadow-atlas dynamic) fullscreen atlas blits — cycle is now %13.
-                g_debugMode = (g_debugMode + 1) % 13;
-                const char* name = (g_debugMode == 1) ? "DEPTH" : (g_debugMode == 2) ? "SCATTER"
-                                 : (g_debugMode == 3) ? "AO" : (g_debugMode == 4) ? "BENT NORMAL"
-                                 : (g_debugMode == 5) ? "ALBEDO" : (g_debugMode == 6) ? "LIT"
-                                 : (g_debugMode == 7) ? "AMBIENT" : (g_debugMode == 8) ? "WORLD NORMAL"
-                                 : (g_debugMode == 9) ? "LIGHT COUNT"
-                                 : (g_debugMode == 10) ? "SHADOW MASK"
-                                 : (g_debugMode == 11) ? "SHADOW ATLAS (STATIC)"
-                                 : (g_debugMode == 12) ? "SHADOW ATLAS (DYN)" : "NORMAL";
-                LOG::logline(">> [seam] debug mode %d (%s)", g_debugMode, name);
-            }
-            // F9 toggles the in-host dev overlay.
-            if (GetAsyncKeyState(VK_F9) & 0x0001) {
-                g_devUiVisible = !g_devUiVisible;
-                LOG::logline(">> [seam] dev overlay %s", g_devUiVisible ? "ON" : "OFF");
-            }
-            // F7 toggles the Forge WATER takeover. The sky takeover is finished, so the sky
-            // pass is always on now and F7 was freed — it drives water (WT1). ON (default) →
-            // the host draws its geo-clipmap water surface. OFF → MW's own water (clean A/B).
-            if (GetAsyncKeyState(VK_F7) & 0x0001) {
-                g_waterEnabled = !g_waterEnabled;
-                LOG::logline(">> [seam] Forge water (WT1) %s", g_waterEnabled ? "ON" : "OFF");
-            }
-            // F8: one-shot host compute-shader hot-reload — rebuild gtao/linearize from the
-            // dxil on disk (recompile + redeploy first). Latched into the NEXT kickoff's
-            // DevInput. Independent of panel visibility.
-            if (GetAsyncKeyState(VK_F8) & 0x0001) {
-                g_reloadShadersPending = true;
-                LOG::logline(">> [seam] compute shader hot-reload requested (F8)");
-            }
-            // Numpad -: perf A/B for the baked distant point-light loop. Latched here (edge), flipped
-            // host-side in the next kickoff's DevInput so the gpu-split `dl=` bracket can be diffed
-            // on/off in a heavy night scene (the clustered-vs-forward cost measurement).
-            if (GetAsyncKeyState(VK_SUBTRACT) & 0x0001) {
-                g_distLightsTogglePending = true;
-                LOG::logline(">> [seam] distant-light A/B toggle requested (numpad -)");
-            }
-            // FP1b: numpad-/ toggles MW first-person arm suppression live (A/B of MW arms
-            // over the host FP pass vs host arms alone). Only takes effect while the FP
-            // pass ships (wantsFPSuppression gates on capture + camera validation).
-            if (GetAsyncKeyState(VK_DIVIDE) & 0x0001) {
-                g_fpSuppressLive = !g_fpSuppressLive;
-                LOG::logline(">> [seam] FP suppression (FP1b) %s", g_fpSuppressLive ? "ON" : "OFF");
-            }
-        }
+        // Dev-key poll: once per display frame, at a stable point BEFORE the finish
+        // consumers — normally the BeginScene(0) collect already polled (it runs first
+        // in frame order and pollDevKeys dedups on the Present serial); this call only
+        // wins on frames without a scene-0 collect. One consistent value per frame for
+        // every ownership gate, including the frameSetupEarly early-kickoff latch.
+        pollDevKeys();
 
-        const bool earlyFinished = g_kick.rpcEarlyFinished;   // mid-walk drain closed the window
-        if (!g_kick.rpcPending && !earlyFinished) {
+        if (!g_kick.rpcPending && !g_kick.rpcEarlyFinished) {
             return;
         }
-        g_kick.rpcPending       = false;
-        g_kick.rpcEarlyFinished = false;
-
         MGE_ZoneScopedN("Forge composite finish");
 
-        // overlap = the MW frame work the host render ran under. In fused mode (Finish
-        // called straight after Kickoff) this is ~0 and every bucket reduces to the old
-        // serial breakdown — the exact A/B. An early finish ends the overlap at the drain.
-        const double tWait0 = nowMs();
-        const double overlap = (earlyFinished ? g_kick.tEarlyFinish : tWait0) - g_kick.tKick;
-
-        double hostMs = 0.0;
-        bool ok;
-        if (earlyFinished) {
-            ok     = g_kick.earlyOk;
-            hostMs = g_kick.earlyHostMs;
-        } else {
-            MGE_ZoneScopedN("Forge renderSceneFinish (host wait)");
-            ok = g_client->renderSceneFinish(&hostMs);
-        }
-        const double tRender = nowMs();
-        // Split the wait: hostMs = host self-timed cost; (residual wait + kickoff cost - hostMs)
-        // = IPC/sync/host-present overhead. Once the kickoff is hoisted to frame start, the
-        // residual wait collapsing toward 0 is the whole point of the async split.
-        MGE_TracyPlot("Forge client wait ms", tRender - tWait0);
-        MGE_TracyPlot("Forge overlap ms", overlap);
-        MGE_TracyPlot("Forge host ms", hostMs);
-        if (!ok) {
+        const FinishResult fr = finishAndCopy();
+        if (!fr.ok) {
             return;
         }
-
-        bool copyOk;
-        {
-            MGE_ZoneScopedN("Forge RT copy");
-            copyOk = copyHostRtToDst();
-        }
-        if (!copyOk) {
-            static bool logged = false;
-            if (!logged) { LOG::logline("!! [seam] copyHostRtToDst failed"); logged = true; }
-            return;
-        }
-        const double tCopy = nowMs();
-
-        // Composite the Forge layer (g_mainTex) OVER MW's frame as a full-screen textured quad
-        // with PREMULTIPLIED alpha blend. The Forge RT clears to alpha=0 and geometry writes
-        // alpha=1, so alpha is a coverage mask: sky/distant land (already on the backbuffer from
-        // renderStage0) show through alpha=0 regions and alpha-test holes. Premultiplied
-        // (SRCBLEND=ONE, DESTBLEND=INVSRCALPHA) — NOT SRCALPHA — because MSAA resolve leaves
-        // edge pixels premultiplied (rgb already scaled by partial coverage); SRCALPHA would
-        // darken edges. State-blocked so nothing leaks into MW's scene 1 (every DistantLand
-        // stage does this). -0.5 px offset + POINT filter = the 1:1 texel mapping StretchRect
-        // gave (the geometry half-pixel was already corrected host-side).
-        {
-            MGE_ZoneScopedN("Forge composite blit");
-            IDirect3DStateBlock9* sb = nullptr;
-            device->CreateStateBlock(D3DSBT_ALL, &sb);
-
-            IDirect3DSurface9* backbuffer = nullptr;
-            if (SUCCEEDED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backbuffer)) && backbuffer) {
-                device->SetRenderTarget(0, backbuffer);
-                backbuffer->Release();
-            }
-
-            device->SetPixelShader(nullptr);
-            device->SetVertexShader(nullptr);
-            device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
-            device->SetTexture(0, g_mainTex);
-
-            device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
-            device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
-            device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
-            device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
-            device->SetRenderState(D3DRS_ZENABLE, FALSE);
-            device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
-            device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
-            device->SetRenderState(D3DRS_LIGHTING, FALSE);
-            device->SetRenderState(D3DRS_FOGENABLE, FALSE);
-            device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
-            device->SetRenderState(D3DRS_COLORWRITEENABLE, 0x0F);
-
-            device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
-            device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
-            device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
-            device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
-            device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
-            device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
-            // CRITICAL: disable texture-coordinate transformation. MW leaves a VIEW-DEPENDENT
-            // texture matrix active for environment/sphere-map reflections; without this the FF
-            // pipeline would transform our blit UVs by that matrix, shearing the composited image
-            // as the camera rotates (host output g_mainTex is correct; only the sampled blit skews).
-            device->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
-            device->SetTextureStageState(1, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
-            // CRITICAL: MW leaves environment/sphere-map TEXGEN active (D3DTSS_TEXCOORDINDEX carries
-            // a TCI_CAMERASPACE* flag). With texgen the FF pipeline SYNTHESISES texcoords from
-            // camera-space position/normal and IGNORES the vertex UVs — disabling the texture matrix
-            // alone isn't enough (the generated coords are the zoom/skew gradient we saw). Force the
-            // stage to read vertex texcoord set 0 with no texgen.
-            device->SetTextureStageState(0, D3DTSS_TEXCOORDINDEX, 0);
-            // Belt-and-suspenders: also neutralise the texture matrix itself. Identity == passthrough.
-            {
-                D3DMATRIX ident = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
-                device->SetTransform(D3DTS_TEXTURE0, &ident);
-            }
-            device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
-            device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
-            device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
-            device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
-
-            const float fw = (float)g_w, fh = (float)g_h;
-            struct CV { float x, y, z, rhw, u, v; };
-            const CV quad[4] = {
-                { -0.5f,      -0.5f,      0.0f, 1.0f, 0.0f, 0.0f },
-                { fw - 0.5f,  -0.5f,      0.0f, 1.0f, 1.0f, 0.0f },
-                { -0.5f,      fh - 0.5f,  0.0f, 1.0f, 0.0f, 1.0f },
-                { fw - 0.5f,  fh - 0.5f,  0.0f, 1.0f, 1.0f, 1.0f },
-            };
-            device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(CV));
-
-            device->SetTexture(0, nullptr);
-            if (sb) { sb->Apply(); sb->Release(); }
-        }
-        const double tEnd = nowMs();
-
-        // Spike log: one breakdown line when the client feed blew the budget. render =
-        // kickoff issue + residual host wait (host's own GPU time = host[]); overlap =
-        // MW frame work the host ran under (NOT client cost). texflush is the prime
-        // suspect for the *periodic* dips (textures stream in as you cross into new
-        // cells). dt = inter-present delta (the visible dip).
-        //
-        // feed EXCLUDES the overlap window — it's the client's own cost, comparable
-        // across fused/async: (kickoff prep) + (residual wait + copy + blit).
-        const double feed = (g_kick.tKick - g_kick.tStart) + (tEnd - tWait0);
-        const double renderBucket = (g_kick.tKick - g_kick.tAssign) + (tRender - tWait0);
-
-        // Baseline heartbeat over every composited frame (sees the <kSpikeMs majority).
-        // Cut 2B: build first, then geom flush (fold frames capture during build).
-        g_hb.feed += feed; g_hb.geom += (g_kick.tGeomFlush - g_kick.tBuild);
-        g_hb.build += (g_kick.tBuild - g_kick.tStart);
-        g_hb.render += renderBucket; g_hb.host += hostMs; g_hb.overlap += overlap;
-        g_hb.copy += (tCopy - tRender); g_hb.blit += (tEnd - tCopy); g_hb.dt += g_kick.dtPresent;
-        g_hb.captured += g_kick.capturedCount;
-        if (feed > g_hb.maxFeed) g_hb.maxFeed = feed;
-        if (g_kick.dtPresent > g_hb.maxDt) g_hb.maxDt = g_kick.dtPresent;
-        if (g_kick.early) ++g_hb.earlyN;
-        if (++g_hb.n >= kHeartbeatFrames) {
-            LOG::logline(">> [hb] %u frames avg: feed=%.2f geom=%.2f build=%.2f render=%.2f[host=%.2f] "
-                         "overlap=%.2f copy=%.2f blit=%.2f dt=%.2f early=%u cap=%.1f | max feed=%.2f dt=%.2f (~%.0f fps)",
-                         g_hb.n, g_hb.feed / g_hb.n, g_hb.geom / g_hb.n, g_hb.build / g_hb.n,
-                         g_hb.render / g_hb.n, g_hb.host / g_hb.n, g_hb.overlap / g_hb.n,
-                         g_hb.copy / g_hb.n, g_hb.blit / g_hb.n, g_hb.dt / g_hb.n, g_hb.earlyN,
-                         g_hb.captured / g_hb.n,
-                         g_hb.maxFeed, g_hb.maxDt,
-                         g_hb.dt > 0.0 ? 1000.0 * g_hb.n / g_hb.dt : 0.0);
-            g_hb = Accum{};
-        }
-
-        if (feed >= kSpikeMs) {
-            LOG::logline("!! [spike] frame %u feed=%.2fms (geomflush=%.2f build=%.2f texflush=%.2f "
-                         "assign=%.2f render=%.2f[host=%.2f] overlap=%.2f copy=%.2f blit=%.2f) "
-                         "draws=%u skin=%u mm=%u light=%u alpha=%u cap=%u geom+=%u/%uKB tex+=%u/%uKB dt=%.2fms",
-                         g_kick.frame, feed,
-                         g_kick.tGeomFlush - g_kick.tBuild, g_kick.tBuild - g_kick.tStart,
-                         g_kick.tTexFlush - g_kick.tGeomFlush, g_kick.tAssign - g_kick.tTexFlush,
-                         renderBucket, hostMs, overlap, tCopy - tRender, tEnd - tCopy,
-                         g_kick.drawCount, g_kick.skinnedCount, g_kick.multiMapCount, g_kick.lightCount,
-                         g_kick.alphaCount, g_kick.capturedCount,
-                         g_kick.geomParts, (unsigned)(g_kick.geomBytes >> 10),
-                         g_kick.texCount, (unsigned)(g_kick.texBytes >> 10),
-                         g_kick.dtPresent);
-        }
+        compositeBlitMainTex(device);
+        accumFrameStats(fr, nowMs(), false, 0.0);
     }
 
     void onStage0Composite(IDirect3DDevice9* device) {
@@ -3121,6 +3346,67 @@ namespace RenderProcess {
 
     bool kickoffPending() {
         return g_kick.rpcPending;
+    }
+
+    bool finishDeferred() {
+        return g_kick.deferFinish && (g_kick.rpcPending || g_kick.rpcEarlyFinished);
+    }
+
+    void onFramePresented() {
+        ++g_frameSerial;
+    }
+
+    void noteEnginePresentReturn() {
+        g_presentReturnMs = nowMs();
+    }
+
+    void onFrameAheadCollect(IDirect3DDevice9* /*device*/) {
+        // BeginScene(0), BEFORE frameSetupEarly: poll the dev keys first so the
+        // earlyForgeKickoff latch and every suppression gate this frame see the fresh
+        // values, then consume the PREVIOUS frame's deferred host render (finish + RT
+        // copy). This closes the IPC window before any of the new frame's RPCs
+        // (setWorldSpace, grass cull, geom/tex flushes) need the channel. The residual
+        // wait here is ~0 whenever the MW frame outlasts the host frame — the success
+        // metric of the whole pipeline (the [hb] render= bucket).
+        //
+        // A0 Cut-4 probe: close the Present→BeginScene(0) span (MW's un-zoned frame
+        // start — input/sim/AI/animation) before anything else this frame runs.
+        if (g_presentReturnMs > 0.0) {
+            g_pendingMwStart = nowMs() - g_presentReturnMs;
+            g_presentReturnMs = 0.0;
+            g_lastMwStartStat = g_pendingMwStart;   // → host Stats panel next kickoff
+            MGE_TracyPlot("MW frame start ms", g_pendingMwStart);
+        }
+        pollDevKeys();
+        if (!finishDeferred()) {
+            return;
+        }
+        MGE_ZoneScopedN("Forge frame-ahead collect");
+        g_kick.deferFinish = false;
+        const FinishResult fr = finishAndCopy();
+        if (!fr.ok) {
+            // Host death / copy failure: g_mainTexValid is already down, so the next
+            // deferred blit skips — the same empty-world frame as today's finish-failure
+            // path; ownership gates release via g_initOk/ServerLost as before.
+            LOG::logline("!! [pipe] deferred collect failed (host dead?) — composite skipped until recovery");
+            g_lastBlitMs = 0.0;
+            return;
+        }
+        accumFrameStats(fr, nowMs(), true, g_lastBlitMs);
+        g_lastBlitMs = 0.0;
+    }
+
+    void onFrameAheadBlit(IDirect3DDevice9* device) {
+        // EndScene(0) composite point on a deferred frame: no finish, no IPC, no wait —
+        // just lay the PREVIOUS host frame (still valid in g_mainTex; the composite
+        // never reads the shared RT directly) over MW's backbuffer. Skipped while
+        // g_mainTexValid is down (host death / copy failure) — the same empty-world
+        // frame as today's finish-failure path.
+        if (!g_mainTexValid) {
+            g_lastBlitMs = 0.0;
+            return;
+        }
+        g_lastBlitMs = compositeBlitMainTex(device);
     }
 
     bool wantsGeometryCapture() {
@@ -3380,10 +3666,17 @@ namespace RenderProcess {
         g_capRecs.push_back(rec);
     }
 
+    // Part A upload accounting: the geometry cache tags each host geom reship by cause.
+    void noteUpload(std::uint8_t cat, std::uint32_t bytes) {
+        if (cat >= kUpCount) cat = kUpOther;
+        g_upFrame.parts[cat] += 1; g_upFrame.bytes[cat] += bytes;
+    }
+
     void captureGeometry(std::uint32_t key, std::uint16_t revision, std::uint32_t modelId,
                          const IPC::GeomVertexWire* verts, std::uint32_t vertexCount,
                          const std::uint16_t* indices, std::uint32_t indexCount,
-                         bool forceReupload) {
+                         bool forceReupload,
+                         const std::uint8_t* uvAnim, std::uint16_t uvAnimBytes) {
         if (!wantsGeometryCapture() || !verts || !indices || !vertexCount || !indexCount) {
             return;
         }
@@ -3413,16 +3706,21 @@ namespace RenderProcess {
         hdr.revisionID  = revision;
         hdr.vertexCount = vertexCount;
         hdr.indexCount  = indexCount;
+        if (uvAnim && uvAnimBytes) {
+            hdr.flags      |= IPC::kGeomFlagUVAnim;
+            hdr.uvAnimBytes = uvAnimBytes;
+        }
 
         drainPendingIfFull();
         const std::size_t vbBytes = (std::size_t)vertexCount * sizeof(IPC::GeomVertexWire);
         const std::size_t ibBytes = (std::size_t)indexCount * sizeof(std::uint16_t);
         const std::size_t at = g_pendingBlob.size();
-        g_pendingBlob.resize(at + sizeof(hdr) + vbBytes + ibBytes);
+        g_pendingBlob.resize(at + sizeof(hdr) + vbBytes + ibBytes + hdr.uvAnimBytes);
         std::uint8_t* dst = g_pendingBlob.data() + at;
         memcpy(dst, &hdr, sizeof(hdr));            dst += sizeof(hdr);
         memcpy(dst, verts, vbBytes);               dst += vbBytes;
-        memcpy(dst, indices, ibBytes);
+        memcpy(dst, indices, ibBytes);             dst += ibBytes;
+        if (hdr.uvAnimBytes) { memcpy(dst, uvAnim, hdr.uvAnimBytes); }
 
         ++g_pendingParts;
         g_uploadedRev[key] = { modelId, vertexCount, revision };
@@ -3476,7 +3774,8 @@ namespace RenderProcess {
 
     void captureMultiMapGeometry(std::uint32_t key, std::uint16_t revision, std::uint32_t modelId,
                                  const IPC::GeomVertexWireMM* verts, std::uint32_t vertexCount,
-                                 const std::uint16_t* indices, std::uint32_t indexCount) {
+                                 const std::uint16_t* indices, std::uint32_t indexCount,
+                                 const std::uint8_t* uvAnim, std::uint16_t uvAnimBytes) {
         if (!wantsGeometryCapture() || !verts || !indices || !vertexCount || !indexCount) {
             return;
         }
@@ -3503,22 +3802,34 @@ namespace RenderProcess {
         hdr.flags       = IPC::kGeomFlagMultiMap;
         hdr.vertexCount = vertexCount;
         hdr.indexCount  = indexCount;
+        if (uvAnim && uvAnimBytes) {
+            hdr.flags      |= IPC::kGeomFlagUVAnim;
+            hdr.uvAnimBytes = uvAnimBytes;
+        }
 
         drainPendingIfFull();
         const std::size_t vbBytes = (std::size_t)vertexCount * sizeof(IPC::GeomVertexWireMM);
         const std::size_t ibBytes = (std::size_t)indexCount * sizeof(std::uint16_t);
         const std::size_t at = g_pendingBlob.size();
-        g_pendingBlob.resize(at + sizeof(hdr) + vbBytes + ibBytes);
+        g_pendingBlob.resize(at + sizeof(hdr) + vbBytes + ibBytes + hdr.uvAnimBytes);
         std::uint8_t* dst = g_pendingBlob.data() + at;
         memcpy(dst, &hdr, sizeof(hdr));            dst += sizeof(hdr);
         memcpy(dst, verts, vbBytes);               dst += vbBytes;
-        memcpy(dst, indices, ibBytes);
+        memcpy(dst, indices, ibBytes);             dst += ibBytes;
+        if (hdr.uvAnimBytes) { memcpy(dst, uvAnim, hdr.uvAnimBytes); }
 
         ++g_pendingParts;
         g_uploadedRev[key] = { modelId, vertexCount, revision };
     }
 
     void shutdown() {
+        // Never tear down with a host RenderFrame still pending (deferred or not):
+        // drain it so the host isn't mid-frame and the window guard isn't latched
+        // if the seam comes back up.
+        if (g_client && g_kick.rpcPending) {
+            g_client->renderSceneFinish(nullptr);
+        }
+        g_kick = KickState{};
         releaseAll();
         g_geomVec.reset();
         g_drawVec.reset();

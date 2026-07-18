@@ -57,6 +57,11 @@ namespace IPC {
 		// either steal the RenderFrame completion (main) or serialize behind the whole
 		// host frame on the single host service thread (geom). See client.cpp.
 		bool m_frameWindowOpen;
+		// Cumulative count of RPCs refused because the window was open (either channel).
+		// Must stay 0 — nonzero means an unaudited call site fired mid-window (surfaced
+		// as refuse= in the client's [hb] heartbeat, critical for ForgeFrameAhead where
+		// the window spans the whole MW frame).
+		unsigned m_windowRefusals;
 
 		// Dev FSL hot-reload watcher: a Windows-python child (watch_shaders.py) launched alongside
 		// the host in a dev tree, killed with it. INVALID when not spawned (shipped tree / no python).
@@ -95,6 +100,10 @@ namespace IPC {
 
 		bool startServer(const char* executable);
 		bool isServerActive();
+
+		// Async-window observability: total RPCs refused because the RenderFrame window
+		// was open. Must read 0 in every run (see m_windowRefusals).
+		unsigned windowRefusals() const { return m_windowRefusals; }
 
 		/**
 		* @brief Asynchronously allocate a shared vector.

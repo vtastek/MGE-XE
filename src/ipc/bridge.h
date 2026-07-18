@@ -280,6 +280,12 @@ namespace IPC {
         std::uint32_t uiVisible = 0;
         std::uint32_t reloadShaders = 0;   // one-shot (F8 edge): host rebuilds compute pipelines from disk
         std::uint32_t distLightsToggle = 0; // one-shot (numpad- edge): host flips baked distant-light loop (perf A/B)
+        // Frame-ahead observability: the client's own last-frame timings, shown live in the
+        // host Stats panel. Purely informational — no host behaviour keys off these.
+        std::uint32_t frameAhead = 0;      // 1 = deferred-finish pipelining live (ForgeFrameAhead / numpad-*)
+        float clientWaitMs = 0.0f;         // last residual collect wait (the pipeline success metric)
+        float clientDtMs = 0.0f;           // last whole MW frame delta (kickoff-to-kickoff)
+        float clientMwStartMs = 0.0f;      // last Present-return -> BeginScene(0) gap (engine sim)
     };
 
     // FP1a: the per-frame first-person bundle handed to renderSceneKickoff as ONE optional
@@ -420,6 +426,14 @@ namespace IPC {
         IN std::uint32_t fpAlphaCount;
         IN std::uint32_t fpAlphaBytes;
         IN std::uint32_t fpEnabled;
+
+        // Frame-ahead observability (host Stats panel): the client's own last-frame timings,
+        // forwarded from DevInput each kickoff. Purely informational. Appended after the FP
+        // fields so every existing IN field offset is unchanged.
+        IN std::uint32_t devFrameAhead;
+        IN float devClientWaitMs;
+        IN float devClientDtMs;
+        IN float devClientMwStartMs;
 
         OUT std::uint32_t bytesWritten;
         OUT double renderMs;             // host-side render+readback time

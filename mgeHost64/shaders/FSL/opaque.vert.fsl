@@ -12,7 +12,7 @@ STRUCT(VSInput)
     DATA(float3, Normal,    NORMAL);
     DATA(float2, Uv,        TEXCOORD0);    // per-vertex: base-map UV
     DATA(float4, Color,      COLOR);        // per-vertex: DiffAmb colour (white when unused)
-    DATA(uint,   DrawIndex,  TEXCOORD1);    // per-instance: index into gWorlds (instance buf .x)
+    DATA(uint,   DrawIndex,  TEXCOORD1);    // per-instance: gWorlds index (low 16) | UV-anim id (bits 16+, 0 = none)
     DATA(uint,   TexAlpha,   TEXCOORD2);    // per-instance packed: texIndex (16) | alphaRef*255 (8) | vColSource (bits 24-25)
     DATA(float3, MatDiffuse, TEXCOORD3);    // per-instance: material diffuse rgb
     DATA(float3, MatAmbient, TEXCOORD4);    // per-instance: material ambient rgb
@@ -44,8 +44,13 @@ VSOutput VS_MAIN( VSInput In )
     INIT_MAIN;
     VSOutput Out;
 
-    // DrawIndex is the LOCAL index within the bound batch window (0..1023).
-    float4x4 world = gBatch.worlds[In.DrawIndex];
+    // Word [0] low 16 bits = the LOCAL index within the bound batch window (0..1023); bits
+    // 16+ = the per-frame UV-animation table id (NiUVController takeover; 0 = none). Every
+    // other opaque-layout writer (shadow/sky/FP/reflect instance bufs) leaves the high bits
+    // 0, so the mask is a no-op there.
+    uint drawIndex = In.DrawIndex & 0xFFFFu;
+    uint uvAnimId  = In.DrawIndex >> 16u;
+    float4x4 world = gBatch.worlds[drawIndex];
     // Cbuffer matrices are column-major (DXC default), so mul(M, v) with the D3DX bytes
     // uploaded as-is == D3DX v*M. viewProj likewise.
     float4 worldPos = mul(world, float4(In.Position, 1.0f));
@@ -53,6 +58,11 @@ VSOutput VS_MAIN( VSInput In )
     Out.Normal = mul((float3x3)world, In.Normal);
     Out.WorldPos = worldPos.xyz;   // Tier 3a: point lights evaluate in world space
     Out.Uv = In.Uv;
+    // NiUVController takeover: host-evaluated scroll delta for this draw (opaque wire carries
+    // one UV set, so setIndex is ignored here). Wrap handled by the sampler's address mode.
+    if (uvAnimId != 0u) {
+        Out.Uv += gUVAnim[uvAnimId].xy;
+    }
     // Unpack the per-instance texIndex (low 16) + alpha-test ref (bits 16-23, /255) + vColSource (bits 24-25).
     Out.TexIndex = In.TexAlpha & 0xFFFFu;
     Out.AlphaRef = float((In.TexAlpha >> 16u) & 0xFFu) * (1.0f / 255.0f);

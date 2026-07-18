@@ -48,6 +48,34 @@ namespace RenderProcess {
     // fired this frame.
     bool kickoffPending();
 
+    // Frame-ahead pipelining (ForgeFrameAhead ini, numpad-* live A/B). On early-kickoff
+    // frames the kickoff marks its finish DEFERRED: the EndScene(0) composite point only
+    // blits the PREVIOUS host frame (onFrameAheadBlit — zero IPC, zero wait), and the
+    // finish + RT copy run at the NEXT frame's BeginScene(0) (onFrameAheadCollect —
+    // before frameSetupEarly, so the IPC window closes before any of the new frame's
+    // RPCs need the channel). The host D3D12 frame thus overlaps the whole MW frame;
+    // the composited world lags input by one frame (UI stays current). Late/warm-up
+    // frames keep the same-frame finish, which also primes g_mainTex before the first
+    // deferred blit. Collect additionally owns the once-per-frame dev-key poll (deduped
+    // against the finish via onFramePresented's frame serial), so call it on EVERY
+    // scene-0 frame, not just deferred ones.
+    void onFrameAheadCollect(IDirect3DDevice9* device);
+    void onFrameAheadBlit(IDirect3DDevice9* device);
+
+    // True when the current kickoff deferred its finish to the next frame's collect:
+    // the EndScene composite point must blit (onFrameAheadBlit) instead of finishing.
+    bool finishDeferred();
+
+    // Display-frame tick, called from the proxy Present's scene-reset block. Drives the
+    // once-per-frame dedup of the dev-key poll across the collect/finish call sites.
+    void onFramePresented();
+
+    // A0 Cut-4 probe: called right after the engine's Present returns. The span from
+    // here to the next BeginScene(0) is MW's un-zoned frame start (input/sim/AI/
+    // animation); onFrameAheadCollect closes it and the [hb] heartbeat reports the
+    // average as mwstart=. Its magnitude decides whether a frame-start cut exists.
+    void noteEnginePresentReturn();
+
     void shutdown();
 
     // --- M1b: opaque-geometry capture (32-bit cache -> 64-bit Forge host) ---------
@@ -118,10 +146,13 @@ namespace RenderProcess {
     // `forceReupload` (SK1 sky) bypasses the (modelId, vertexCount, revision) dedup so a part whose
     // vertex data changes WITHOUT a revisionID bump (the sky dome's per-frame gradient) re-ships
     // every frame. Default false keeps every existing caller's dedup behaviour.
+    // `uvAnim`/`uvAnimBytes` (NiUVController takeover): optional GeomUVAnimWire key-track blob
+    // appended after the part's indices (flags |= kGeomFlagUVAnim); default null = no payload.
     void captureGeometry(std::uint32_t key, std::uint16_t revision, std::uint32_t modelId,
                          const IPC::GeomVertexWire* verts, std::uint32_t vertexCount,
                          const std::uint16_t* indices, std::uint32_t indexCount,
-                         bool forceReupload = false);
+                         bool forceReupload = false,
+                         const std::uint8_t* uvAnim = nullptr, std::uint16_t uvAnimBytes = 0);
 
     // M-Skinning: capture a skinned part's bind-pose VB (model-space pos/normal +
     // per-vertex weights + packed bone indices). Like captureGeometry it assigns/reuses a
@@ -141,7 +172,8 @@ namespace RenderProcess {
     // (texture slots + ops + UV sets) is built separately in buildMultiMapDrawList (onPresent).
     void captureMultiMapGeometry(std::uint32_t key, std::uint16_t revision, std::uint32_t modelId,
                                  const IPC::GeomVertexWireMM* verts, std::uint32_t vertexCount,
-                                 const std::uint16_t* indices, std::uint32_t indexCount);
+                                 const std::uint16_t* indices, std::uint32_t indexCount,
+                                 const std::uint8_t* uvAnim = nullptr, std::uint16_t uvAnimBytes = 0);
 
     // AT3 captured-alpha: called from the ForgeAlphaSuppressS1 reject gate
     // (distantland.cpp inspectIndexedPrimitive) for each alpha-BLENDED DIP MW is about to skip
@@ -152,4 +184,21 @@ namespace RenderProcess {
     // cache pass doesn't own. Silent no-op on any guard miss (flag off, HW-skinned, non-tri-list,
     // caps, dedup); reject at the gate is unchanged whether or not this captures.
     void captureAlphaDraw(const RenderedState* rs, const FragmentState* frs);
+
+    // Upload cost accounting (Part A, upload-debug). The geometry cache calls noteUpload()
+    // once per host geom reship, tagged by cause so the [uploads] heartbeat line can break the
+    // per-frame cost down and the host panel can show total KB/parts per frame. Categories are
+    // derived for free from the content-gate's changed-component diff + isSkinned — no extra NIF
+    // walking. `bytes` = the model-space wire payload shipped (VB verts + IB indices).
+    enum UploadCat : std::uint8_t {
+        kUpNew = 0,    // first upload of a part (not a reship)
+        kUpSkin,       // reship on a skinned actor (NPC/creature) — expected
+        kUpMorph,      // non-skinned changed=pos (morphing statics + particle-system regen)
+        kUpVcol,       // changed=vcol
+        kUpTopo,       // vertex/tri/uvset count change → full re-alloc
+        kUpUvLeak,     // changed=uv after the UVController takeover (should be ~0)
+        kUpOther,      // anything else (normals, etc.)
+        kUpCount
+    };
+    void noteUpload(std::uint8_t cat, std::uint32_t bytes);
 }

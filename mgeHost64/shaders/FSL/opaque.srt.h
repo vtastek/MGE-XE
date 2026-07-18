@@ -23,6 +23,9 @@
 // 1024, the proven-OK Persistent-table size (see geomwire.h). statics texSlot = (bucket<<16)|layer.
 #define MAX_STATICS_BUCKETS 128
 #define MAX_POINT_LIGHTS 128 // per-frame point-light cap; MUST match IPC::kMaxPointLights (geomwire.h)
+// NiUVController takeover: per-frame UV-animation table (gUVAnim). Entry id = (du, dv, setIndex, 0);
+// id 0 is reserved = "no animation" (entry 0 stays zero). MUST match host kMaxUVAnim (forgerender.cpp).
+#define MAX_UV_ANIM 256
 
 STRUCT(FrameData)
 {
@@ -191,6 +194,13 @@ BEGIN_SRT_NO_AB(SrtData)
         // opaque.frag / multimap.frag index it, and only when gLights.froxelDimsNear.x > 0 (else the
         // brute loop). All other frags ignore it (harmless null tail).
         DECL_BUFFER(PerFrame, Buffer(uint), gFroxelMaskNear)
+        // NiUVController takeover: the per-frame UV-animation table — float4[MAX_UV_ANIM] of
+        // (du, dv, setIndex, 0), evaluated host-side from MW sim time (one entry per animated
+        // draw; id rides the instance stream — opaque word[0] bits 16+, multimap Meta bits
+        // 24-31; id 0 = no animation). Appended AFTER gFroxelMaskNear so every existing
+        // PerFrame offset stays stable. Read by opaque.vert / multimap.vert only when the
+        // stamped id != 0 (harmless null tail everywhere else).
+        DECL_BUFFER(PerFrame, Buffer(float4), gUVAnim)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has

@@ -1176,6 +1176,12 @@ namespace {
         uint32_t       froxelNearNumWords  = 0;        // this frame's near grid words to clear
         uint32_t       froxelNearLightCount = 0;       // this frame's near light count (assign thread count)
         bool           froxelMaskNearInShaderState = false;  // true once transitioned to PIXEL SRV this frame
+        // NiUVController takeover: the per-frame UV-animation table (gUVAnim in the PerFrame set) —
+        // float4[kMaxUVAnim] of (du, dv, setIndex, 0), persistent-mapped, filled by uvAnimIdFor as
+        // draws stamp ids. Entry 0 stays zero (id 0 = no animation). Bound into EVERY SrtData
+        // PerFrame set instance (main/FP/reflect/shadow-face) — the MM shadow-caster draws reuse
+        // the resident stamped Meta, so the table must be reachable there too.
+        Buffer*        pUVAnimBuf = nullptr;
         DescriptorSet* pPerFrameSet = nullptr;    // gFrameData cbuffer (viewProj), 1 instance
         DescriptorSet* pPerBatchSet = nullptr;    // gBatch cbuffer window, kMaxBatches instances
         Buffer*        pFrameCbv = nullptr;        // gFrameData cbuffer (viewProj), persistent-mapped
@@ -1237,7 +1243,7 @@ namespace {
         // --- Tier 4: multi-map (dark/detail/glow) path -------------------------------
         // Wide vertex (GeomVertexWireMM, 4 UV sets) + its own pipeline. Shares the SAME
         // SrtData/default.rootsig + opaque frag-side lighting (duplicated in multimap.frag).
-        // gBatch is bound to ONE 64KB world window (kMaxMultiMap=256 <= 1024 matrices).
+        // gBatch is bound to ONE 64KB world window (kMaxMultiMap=1024 == the 1024-matrix cap).
         Shader*        pMultiMapShader = nullptr;
         Pipeline*      pMultiMapPipeline = nullptr;        // FRONT_FACE_CCW (non-mirrored)
         Pipeline*      pMultiMapPipelineMirror = nullptr;  // FRONT_FACE_CW (mirrored world)
@@ -1546,13 +1552,21 @@ namespace {
     constexpr uint32_t kMaxFPDraws   = 128;
     constexpr uint32_t kMaxFPSkinned = kSkinnedPerWindow;   // 32
 
-    // Tier 4 multi-map: ONE 64KB world window holds kBatchSize(1024) matrices; cap at 256
-    // parts/frame (< 1024 → a single window, no batching). Per-instance VB stride (uint32 slots):
-    //   [0] Meta (DrawIndex|stageCount|vColSource|alphaRef)   [1..4] stages[4]
-    //   [5..7] matDiffuse.rgb   [8..10] matAmbient.rgb   [11..13] matEmissive.rgb
-    // 14 * 4 = 56 bytes. Rare geometry → a flat 256-cap (log-drop, no fallback) is ample.
-    constexpr uint32_t kMaxMultiMap = 256;
+    // Tier 4 multi-map: ONE 64KB world window holds kBatchSize(1024) matrices; cap at 1024
+    // parts/frame (== the window, no batching). Raised 256 -> 1024 (2026-07-17): glow-windows
+    // nights pin the count over 256 and cap-drop silently ate window/NPC draws; Meta's index
+    // field widened to 10 bits to match (see the pack sites + multimap.vert).
+    // Per-instance VB stride (uint32 slots):
+    //   [0] Meta (idx 0-9 | stageCount 10-12 | vColSource 13-14 | alphaRef*255 16-23 | uvAnimId 24-31)
+    //   [1..4] stages[4]  [5..7] matDiffuse.rgb  [8..10] matAmbient.rgb  [11..13] matEmissive.rgb
+    // 14 * 4 = 56 bytes.
+    constexpr uint32_t kMaxMultiMap = 1024;
     constexpr uint32_t kMMInstU32   = 14;
+
+    // NiUVController takeover: per-frame UV-animation table capacity (gUVAnim = float4[kMaxUVAnim];
+    // MUST match MAX_UV_ANIM in opaque.srt.h). Id 0 is reserved = "no animation", so up to
+    // kMaxUVAnim-1 animated draws per frame; extras draw with base UVs (frozen) + a 1/s log.
+    constexpr uint32_t kMaxUVAnim = 256;
 
     // SK1 sky: per-frame sky draw cap (must match IPC::kMaxSkyDraws). SK1 draws only the dome;
     // the full sky subtree is ~15 shapes (SK2). One 64KB world window (< 1024 matrices) holds them.
@@ -2981,18 +2995,51 @@ namespace {
         // Clustered forward: create the froxel mask + compute pipelines NOW so gFroxelMask can bind
         // into pPerFrameSet below. Non-fatal — on failure froxelReady stays false and the frags brute-loop.
         createFroxelResources(R);
+        // NiUVController takeover: the gUVAnim table — a persistent-mapped typed-buffer SRV
+        // (Buffer<float4>[kMaxUVAnim]) the draw loops fill via uvAnimIdFor. Created before the
+        // PerFrame set updates so every SrtData PerFrame instance can bind it. Zeroed once so
+        // entry 0 (id 0 = "no animation") reads (0,0,0,0). Non-fatal: without it uvAnimIdFor
+        // returns 0 and every draw keeps base UVs.
+        if (!g_live.pUVAnimBuf) {
+            BufferLoadDesc ub = {};
+            ub.mDesc.mDescriptors  = DESCRIPTOR_TYPE_BUFFER;
+            ub.mDesc.mMemoryUsage  = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+            ub.mDesc.mFlags        = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+            ub.mDesc.mFormat       = TinyImageFormat_R32G32B32A32_SFLOAT;   // typed Buffer<float4>
+            ub.mDesc.mElementCount = kMaxUVAnim;
+            ub.mDesc.mStructStride = 0;
+            ub.mDesc.mSize         = (uint64_t)kMaxUVAnim * 16;
+            ub.mDesc.pName         = "uvAnimTable";
+            ub.pData               = nullptr;
+            ub.ppBuffer            = &g_live.pUVAnimBuf;
+            addResource(&ub, nullptr);
+            waitForAllResourceLoads();
+            if (g_live.pUVAnimBuf) {
+                std::memset(g_live.pUVAnimBuf->pCpuMappedAddress, 0, (size_t)kMaxUVAnim * 16);
+            } else {
+                std::printf("[forge] gUVAnim table alloc FAILED — UV animation disabled (base UVs)\n");
+            }
+        }
         {
             // PerFrame set: gFrameData CBV + gAO SRV. The frags read the BILATERAL-BLURRED AO
             // (pAOBlur), not raw pAO; pAOBlur's per-frame UAV<->SHADER_RESOURCE ping-pong (renderScene)
             // leaves it SHADER_RESOURCE before the colour pass samples it. (Raw pAO still feeds the
             // blur as an SRV, and the DebugTextures/readback paths still inspect pAO directly.)
-            DescriptorData p[7] = {};
+            DescriptorData p[8] = {};
             p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
             p[0].ppBuffers = &g_live.pFrameCbv;
             p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
             p[1].mCount = 1;   // single-texture SRV needs explicit count (else binds nothing)
             p[1].ppTextures = &g_live.pAOBlur;
             uint32_t np = 2;
+            // NiUVController takeover: the UV-animation table (opaque.vert / multimap.vert
+            // index it only when a draw's stamped id != 0).
+            if (g_live.pUVAnimBuf) {
+                p[np].mIndex = SRT_RES_IDX(SrtData, PerFrame, gUVAnim);
+                p[np].mCount = 1;
+                p[np].ppBuffers = &g_live.pUVAnimBuf;
+                ++np;
+            }
             // Clustered forward: bind the froxel light-mask (read as an SRV here; froxelassign.comp
             // writes it as a UAV). Created eagerly just above so it's always available. The frags only
             // index it when gFrameData.froxelDims.x > 0 (else the brute loop), but it must be BOUND for
@@ -3050,10 +3097,20 @@ namespace {
             addDescriptorSet(R, &sfDesc, &g_live.pShadowFaceSet);
             if (g_live.pShadowFaceSet) {
                 for (uint32_t f = 0; f < kShadowFaceCbvs; ++f) {
-                    DescriptorData d = {};
-                    d.mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
-                    d.ppBuffers = &g_live.pShadowFaceCbv[f];
-                    updateDescriptorSet(R, f, g_live.pShadowFaceSet, 1, &d);
+                    DescriptorData d[2] = {};
+                    d[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
+                    d[0].ppBuffers = &g_live.pShadowFaceCbv[f];
+                    uint32_t dn = 1;
+                    // NiUVController takeover: the MM shadow-caster draws reuse the resident
+                    // pInstanceBufMM Meta — stamped uvAnimId included — so multimap.vert
+                    // indexes gUVAnim from this set instance too. Bind the same global table.
+                    if (g_live.pUVAnimBuf) {
+                        d[dn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gUVAnim);
+                        d[dn].mCount = 1;
+                        d[dn].ppBuffers = &g_live.pUVAnimBuf;
+                        ++dn;
+                    }
+                    updateDescriptorSet(R, f, g_live.pShadowFaceSet, dn, d);
                 }
             } else {
                 std::printf("[forge][shadow] addDescriptorSet(face set) FAILED — shadows disabled\n");
@@ -3588,7 +3645,7 @@ namespace {
                 }
             }
 
-            // One 64KB world window (a valid full CBV; kMaxMultiMap=256 <= 1024 matrices).
+            // One 64KB world window (a valid full CBV; kMaxMultiMap=1024 == the 1024-matrix cap).
             BufferLoadDesc mwb = {};
             mwb.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
             mwb.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
@@ -4274,7 +4331,7 @@ namespace {
             if (!g_live.pPerFrameSetReflect || !g_live.pPerBatchSetReflectSky) { return false; }
             {
                 Texture* vol = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
-                DescriptorData p[6] = {};
+                DescriptorData p[7] = {};
                 p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
                 p[0].ppBuffers = &g_live.pReflectFrameCbv;
                 p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -4287,7 +4344,13 @@ namespace {
                 p[4].mCount = 1; p[4].ppTextures = &g_live.pLinearDepth;
                 p[5].mIndex = SRT_RES_IDX(SrtData, PerFrame, gReflectColor);
                 p[5].mCount = 1; p[5].ppTextures = &g_live.pRefractColor;   // reflect set never reads this
-                updateDescriptorSet(R, 0, g_live.pPerFrameSetReflect, 6, p);
+                uint32_t rn = 6;
+                if (g_live.pUVAnimBuf) {   // type-valid bind (reflect draws stamp id 0 = never read)
+                    p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gUVAnim);
+                    p[rn].mCount = 1; p[rn].ppBuffers = &g_live.pUVAnimBuf;
+                    ++rn;
+                }
+                updateDescriptorSet(R, 0, g_live.pPerFrameSetReflect, rn, p);
             }
             {
                 DescriptorData rbp = {};
@@ -4304,7 +4367,7 @@ namespace {
             if (!g_live.pPerFrameSetReflectGeo) { return false; }
             {
                 Texture* vol = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
-                DescriptorData p[6] = {};
+                DescriptorData p[7] = {};
                 p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
                 p[0].ppBuffers = &g_live.pReflectFrameCbvGeo;
                 p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -4317,7 +4380,13 @@ namespace {
                 p[4].mCount = 1; p[4].ppTextures = &g_live.pLinearDepth;
                 p[5].mIndex = SRT_RES_IDX(SrtData, PerFrame, gReflectColor);
                 p[5].mCount = 1; p[5].ppTextures = &g_live.pRefractColor;   // reflect-geo set never reads this
-                updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, 6, p);
+                uint32_t rn = 6;
+                if (g_live.pUVAnimBuf) {   // type-valid bind (reflect-geo draws never read it)
+                    p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gUVAnim);
+                    p[rn].mCount = 1; p[rn].ppBuffers = &g_live.pUVAnimBuf;
+                    ++rn;
+                }
+                updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, rn, p);
             }
 
             g_live.reflectReady = g_live.waterReady && g_live.pReflectColor && g_live.pReflectDepth
@@ -4711,7 +4780,7 @@ namespace {
                 Texture* vol  = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
                 Texture* refr = g_live.pRefractColor   ? g_live.pRefractColor   : g_live.pDefaultWhite;
                 Texture* lin  = g_live.pLinearDepth    ? g_live.pLinearDepth    : g_live.pDefaultWhite;
-                DescriptorData p[8] = {};
+                DescriptorData p[9] = {};
                 p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
                 p[0].ppBuffers = &g_live.pFPFrameCbv;
                 p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -4733,6 +4802,12 @@ namespace {
                 if (g_live.pFroxelMaskNear) {
                     p[fpn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFroxelMaskNear);
                     p[fpn].mCount = 1; p[fpn].ppBuffers = &g_live.pFroxelMaskNear;
+                    ++fpn;
+                }
+                // NiUVController takeover: type-valid bind (FP draws stamp id 0 = never read).
+                if (g_live.pUVAnimBuf) {
+                    p[fpn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gUVAnim);
+                    p[fpn].mCount = 1; p[fpn].ppBuffers = &g_live.pUVAnimBuf;
                     ++fpn;
                 }
                 updateDescriptorSet(R, 0, g_live.pPerFrameSetFP, fpn, p);
@@ -4856,6 +4931,14 @@ namespace {
         // an ACTIVE transform controller, i.e. it really moves. Only consulted for rigid LIVE
         // meshes when g_shadowSourceMover is on (skinned/character movers take the skinned path).
         bool     animated;
+        // NiUVController takeover: the shipped key track (GeomUVAnimWire + linear keys). uvKeys
+        // is tf_malloc'd ((keyCountU + keyCountV) x {t, v}, U track first); null = no animation.
+        // uvAnimFrame/uvAnimId memoize this frame's gUVAnim table assignment (uvAnimIdFor) so the
+        // prepass/colour/alpha loops stamp one consistent id per mesh per frame.
+        IPC::GeomUVAnimWire uvMeta;
+        float*   uvKeys;
+        uint32_t uvAnimFrame;   // g_renderFrame of the memoized eval (0 = none)
+        uint32_t uvAnimId;      // table id assigned that frame (0 = none / table full)
     };
     HostMesh* g_meshes   = nullptr;
     uint32_t  g_meshCap  = 0;   // allocated slot count
@@ -4894,6 +4977,87 @@ namespace {
     }
     static inline bool isRigidMover(const HostMesh& hm) {
         return rigidMoverPred(hm.isLive, hm.animated);
+    }
+
+    // --- NiUVController takeover: per-frame UV-animation table fill -----------------------
+    // Draw loops that meet a mesh with a shipped key track call uvAnimIdFor once per mesh per
+    // frame; it evaluates the offset at MW sim time, writes (du, dv, setIndex, 0) into the
+    // next gUVAnim slot (persistent-mapped, write-only — WC trap), and returns the 1-based id
+    // the loop stamps into its instance stream. Id 0 = no animation (table entry 0 stays 0).
+    inline double hostNowMs();               // defined below (rate-limits the table-full log)
+    uint32_t g_uvAnimCount = 0;      // ids handed out this frame (reset with g_renderFrame)
+    double   g_uvAnimSimT  = 0.0;    // MW sim time (lighting[32]) — frozen in menus, like MW
+    float    g_uploadKB    = 0.0f;   // Part A: client's host-geom reship cost THIS frame (lighting[33], KB)
+    float    g_uploadParts = 0.0f;   // Part A: parts reshipped this frame (lighting[34])
+    float    g_uploadKBEma = 0.0f;   // smoothed for a steady panel readout
+
+    // Piecewise-linear (t, v) key evaluation over a flat pair array, clamped at the ends
+    // (heroEvalKeys' twin, on wire-format data).
+    static inline float uvEvalKeys(const float* k, uint32_t n, float t) {
+        if (n == 0) { return 0.0f; }
+        if (n == 1 || t <= k[0]) { return k[1]; }
+        const float* last = k + (size_t)(n - 1) * 2;
+        if (t >= last[0]) { return last[1]; }
+        for (uint32_t i = 1; i < n; ++i) {
+            const float* b = k + (size_t)i * 2;
+            if (t <= b[0]) {
+                const float* a = b - 2;
+                const float dt = b[0] - a[0];
+                const float u = dt > 0.0f ? (t - a[0]) / dt : 0.0f;
+                return a[1] + u * (b[1] - a[1]);
+            }
+        }
+        return last[1];
+    }
+
+    uint32_t uvAnimIdFor(HostMesh& m) {
+        if (!m.uvKeys || !g_live.pUVAnimBuf) { return 0; }
+        if (m.uvAnimFrame == g_renderFrame) { return m.uvAnimId; }   // memoized this frame
+        m.uvAnimFrame = g_renderFrame;
+        m.uvAnimId    = 0;
+        if (g_uvAnimCount + 1 >= kMaxUVAnim) {
+            static double s_lastFullLogMs = 0.0;
+            if (hostNowMs() - s_lastFullLogMs >= 1000.0) {
+                s_lastFullLogMs = hostNowMs();
+                LOG::logline("!! [forge] gUVAnim table full (%u) — extra animated draws frozen at base UVs",
+                             kMaxUVAnim);
+            }
+            return 0;
+        }
+        const IPC::GeomUVAnimWire& w = m.uvMeta;
+        // Key time = simT*frequency + phase, cycled into [keyMin, keyMax] per cycleType.
+        // fmod in double BEFORE the float cast (the water-judder lesson, forgerender.cpp:9150).
+        const double raw  = g_uvAnimSimT * (double)w.frequency + (double)w.phase;
+        const float  span = w.keyMax - w.keyMin;
+        float tt;
+        if (span <= 0.0f) {
+            tt = w.keyMin;
+        } else if (w.cycleType == 2) {                       // clamp
+            tt = (float)raw;
+            if (tt < w.keyMin) { tt = w.keyMin; } else if (tt > w.keyMax) { tt = w.keyMax; }
+        } else if (w.cycleType == 1) {                       // reverse (ping-pong)
+            double ph = std::fmod(raw - (double)w.keyMin, 2.0 * (double)span);
+            if (ph < 0.0) { ph += 2.0 * (double)span; }
+            tt = w.keyMin + (float)(ph < (double)span ? ph : 2.0 * (double)span - ph);
+        } else {                                             // loop
+            double ph = std::fmod(raw - (double)w.keyMin, (double)span);
+            if (ph < 0.0) { ph += (double)span; }
+            tt = w.keyMin + (float)ph;
+        }
+        const float* uk = m.uvKeys;
+        const float* vk = m.uvKeys + (size_t)w.keyCountU * 2;
+        // The captured verts already embed the controller's capture-time offset (baseU/baseV),
+        // so the shader adds only the delta.
+        const float du = w.keyCountU ? (uvEvalKeys(uk, w.keyCountU, tt) - w.baseU) : 0.0f;
+        const float dv = w.keyCountV ? (uvEvalKeys(vk, w.keyCountV, tt) - w.baseV) : 0.0f;
+        const uint32_t id = ++g_uvAnimCount;                 // first id = 1
+        float* tbl = (float*)g_live.pUVAnimBuf->pCpuMappedAddress;
+        tbl[(size_t)id * 4 + 0] = du;
+        tbl[(size_t)id * 4 + 1] = dv;
+        tbl[(size_t)id * 4 + 2] = (float)w.setIndex;
+        tbl[(size_t)id * 4 + 3] = 0.0f;
+        m.uvAnimId = id;
+        return id;
     }
 
     // PRECISE shadow invalidation: a caster whose world-space bound (center cx/cy/cz, radius wr)
@@ -5202,6 +5366,11 @@ namespace {
     unsigned char g_statsBuf[1024] = {};
     bstring       g_statsText = bfromarr(g_statsBuf);
     float4        g_statsColor = { 0.70f, 1.0f, 0.70f, 1.0f };
+    // Frame-ahead observability: client-forwarded last-frame timings (setClientStats, per
+    // kickoff) + the server-measured host idle gap between RenderFrames. Stats panel only.
+    unsigned      g_clientFrameAhead = 0;
+    float         g_clientWaitMs = 0.0f, g_clientDtMs = 0.0f, g_clientMwStartMs = 0.0f;
+    double        g_hostIdleMs = 0.0;
 
     // ---- AO knobs (Stage 3): promoted from the hardcoded constants so sliders drive them live.
     // ap[20..23] read these each frame, so a slider move takes effect next frame. aoThickness is
@@ -5938,7 +6107,9 @@ namespace {
                 "DL land %u | DL statics %u inst / %u subsets\n"
                 "water levels %u\n"
                 "host %.2f ms = setup %.2f + cull %.2f + rec %.2f + gpu %.2f + post %.2f\n"
-                "gpu: prepass %.2f postdepth %.2f (lin %.2f ao %.2f mask %.2f) reflect %.2f color %.2f water %.2f resolve %.2f",
+                "gpu: prepass %.2f postdepth %.2f (lin %.2f ao %.2f mask %.2f) reflect %.2f color %.2f water %.2f resolve %.2f\n"
+                "uploads %6.1f KB/f (~%6.1f KB avg) | %5.0f parts/f  [breakdown in mgeXE.log [uploads]]\n"
+                "frame-ahead %s | client dt %.2f wait %.2f mwstart %.2f | host idle %.2f ms",
                 g_lastDrawn, g_lastSkinnedDrawn, g_lastMultiMapDrawn,
                 g_lastSkyDrawn, g_lastReflSkyDrawn, g_lastLightCount, g_lastAlphaDrawn,
                 g_liveLastLand, g_liveLastInst, g_liveLastSubsets,
@@ -5949,7 +6120,10 @@ namespace {
                 g_lastGpuPhaseMs[kGpuPhasePostDepth] - g_lastGpuPhaseMs[kGpuPhaseLinearize] - g_lastGpuPhaseMs[kGpuPhaseShadowMask],
                 g_lastGpuPhaseMs[kGpuPhaseShadowMask],
                 g_lastGpuPhaseMs[kGpuPhaseReflect], g_lastGpuPhaseMs[kGpuPhaseColor],
-                g_lastGpuPhaseMs[kGpuPhaseWater], g_lastGpuPhaseMs[kGpuPhaseResolve]);
+                g_lastGpuPhaseMs[kGpuPhaseWater], g_lastGpuPhaseMs[kGpuPhaseResolve],
+                g_uploadKB, g_uploadKBEma, g_uploadParts,
+                g_clientFrameAhead ? "ON" : "OFF",
+                g_clientDtMs, g_clientWaitMs, g_clientMwStartMs, g_hostIdleMs);
 
         uiSetExternalInput(g_inMouseX, g_inMouseY, g_inWheel, g_inLBtn, g_inRBtn, g_inMBtn, g_uiVisible);
         uiSetComponentActive(g_uiPanel, g_uiVisible);
@@ -6028,6 +6202,12 @@ namespace {
         }
         m.dynamic = false;
         m.ring = 0;
+        // NiUVController takeover: the key track dies with the mesh buffers (re-uploads
+        // re-parse it from the fresh payload; evictions must not leave a dangling track).
+        if (m.uvKeys) { tf_free(m.uvKeys); m.uvKeys = nullptr; }
+        m.uvMeta = IPC::GeomUVAnimWire{};
+        m.uvAnimFrame = 0;
+        m.uvAnimId = 0;
     }
 
     void freeMeshStore() {
@@ -6458,6 +6638,7 @@ namespace ForgeRender {
             return false;
         }
         ++g_renderFrame;   // drives the dynamic-promote consecutive-frame streak in uploadGeometry
+        g_uvAnimCount = 0; // fresh gUVAnim table this frame (memoized ids re-assign on demand)
 
         const uint32_t n = (drawCount < g_live.maxDraws) ? drawCount : g_live.maxDraws;
         const uint32_t haveBytes = drawBytes / (uint32_t)sizeof(IPC::DrawItemWire);
@@ -6537,6 +6718,14 @@ namespace ForgeRender {
             // while keeping t small enough that float32 holds sub-frame precision. Feeding a raw,
             // ever-growing seconds count is how the host's water normals ended up juddering (:9150).
             fd[80] = (float)std::fmod((double)lighting[32], 12.5);
+            // NiUVController takeover: the same sim-time clock drives the NEAR UV-anim table
+            // (uvAnimIdFor cycles it per track into [keyMin, keyMax] in double, so the raw
+            // ever-growing seconds count is safe to keep here).
+            g_uvAnimSimT = (double)lighting[32];
+            // Part A upload cost: [33]=KB, [34]=parts reshipped by the client this frame. EMA the KB
+            // so the panel readout doesn't strobe frame-to-frame.
+            g_uploadKB = lighting[33]; g_uploadParts = lighting[34];
+            g_uploadKBEma += 0.1f * (g_uploadKB - g_uploadKBEma);
             // Hero distant statics: evaluate the real NiUVController keys into FrameData.uvOffsets
             // (float 84..). Uses RAW sim time (each anim wraps by its own cycleStop, 8s/48s). Nil cost
             // (<=8 unique anims). statics.vert adds uvOffsets[slot-1] per subset. Absent hero file =>
@@ -7877,6 +8066,17 @@ namespace ForgeRender {
             // (float). Unloaded/unknown slots fall back to 0 (white texture).
             uint32_t* inst = (uint32_t*)g_live.pInstanceBuf[batch]->pCpuMappedAddress;
             const uint32_t texAlphaPacked = packTexAlpha(items[i].texIndex, items[i].alphaRef, items[i].vColSource, items[i].clampMode);
+            // NiUVController takeover: word [0] = local DrawIndex (low 16) | UV-anim table id
+            // (bits 16+, 0 = none). Was the creation-time identity; id 0 writes the identical
+            // value. The Z-prepass shares this instance buffer, so it scrolls in lockstep.
+            {
+                const uint32_t slot = items[i].slot;
+                uint32_t uvId = 0;
+                if (slot < g_meshHigh && g_meshes[slot].uvKeys) {
+                    uvId = uvAnimIdFor(g_meshes[slot]);
+                }
+                inst[local * kStaticInstU32 + 0] = local | (uvId << 16);
+            }
             inst[local * kStaticInstU32 + 1] = texAlphaPacked;
             // P1.5 shadows: the caster-record refresh for items[] moved to a pre-manager loop
             // (C4c) so shadow scheduling sees this frame's poses — see above the manager block.
@@ -8390,7 +8590,11 @@ namespace ForgeRender {
                     float ar = it.alphaRef < 0.0f ? 0.0f : (it.alphaRef > 1.0f ? 1.0f : it.alphaRef);
                     const uint32_t aref = (uint32_t)(ar * 255.0f + 0.5f) & 0xFFu;
                     const uint32_t vcs  = it.vColSource & 0x3u;
-                    e[0] = (idx & 0xFFu) | (sc << 8u) | (vcs << 11u) | (aref << 16u);   // Meta
+                    // Meta: idx(0-9)|sc(10-12)|vcs(13-14)|aref(16-23)|uvAnimId(24-31). Index
+                    // widened to 10 bits for the 1024 cap; uvAnimId = NiUVController takeover
+                    // (memoized per mesh per frame, so the colour loop repack matches).
+                    const uint32_t uvId = g_meshes[slot].uvKeys ? uvAnimIdFor(g_meshes[slot]) : 0u;
+                    e[0] = (idx & 0x3FFu) | (sc << 10u) | (vcs << 13u) | (aref << 16u) | (uvId << 24u);
                     e[1] = it.stages[0]; e[2] = it.stages[1]; e[3] = it.stages[2]; e[4] = it.stages[3];
                     float* fe = (float*)e;
                     fe[5]  = it.matDiffuse[0];  fe[6]  = it.matDiffuse[1];  fe[7]  = it.matDiffuse[2];
@@ -9386,7 +9590,14 @@ namespace ForgeRender {
                 sp = palette + paletteBytes;   // advance regardless of whether we draw
 
                 if (skinnedDrawn >= kMaxSkinned) {
-                    if (!dropLogged) {
+                    // Rate-limited (night-collapse finding 2026-07-17): with the count PINNED
+                    // over the cap (dense crowds), the per-frame-local dropLogged fired this
+                    // LOGF+printf pair EVERY frame — ~4.7ms of logger/console tax INSIDE the
+                    // record loop (the rec-split skin= spikes; same disease as the A1 upload
+                    // log). Keep the warning, cap it at ~1 line/s.
+                    static double s_lastCapLogMs = 0.0;
+                    if (!dropLogged && hostNowMs() - s_lastCapLogMs >= 1000.0) {
+                        s_lastCapLogMs = hostNowMs();
                         LOGF(eWARNING, "[forge] skinned over cap %u — dropping extra parts (count=%u)",
                              kMaxSkinned, skinnedCount);
                         std::printf("[forge] skinned over cap %u — dropping extra parts (count=%u)\n",
@@ -9449,7 +9660,7 @@ namespace ForgeRender {
         // --- Tier 4: multi-map draw loop (dark/detail/glow) --------------------------
         // MultiMapDrawWire[]: each part writes its world into pMMWorldsBuf[idx] and its per-draw
         // stage/material into pInstanceBufMM[idx], then draws with firstInstance=idx so the
-        // per-instance Meta.DrawIndex selects gBatch.worlds[idx]. Capped at kMaxMultiMap (256).
+        // per-instance Meta.DrawIndex selects gBatch.worlds[idx]. Capped at kMaxMultiMap (1024).
         uint32_t multiMapDrawn = 0;
         if (multiMapBlob && multiMapCount && multiMapBytes &&
             g_live.pMultiMapPipeline && g_live.pMultiMapPipelineMirror) {
@@ -9466,7 +9677,13 @@ namespace ForgeRender {
             bool mmDropLogged = false;
             for (uint32_t k = 0; k < nMM; ++k) {
                 if (multiMapDrawn >= kMaxMultiMap) {
-                    if (!mmDropLogged) {
+                    // Rate-limited (night-collapse finding 2026-07-17): glow-windows nights pin
+                    // multiMapCount over the cap, so the per-frame-local mmDropLogged fired this
+                    // LOGF+printf pair EVERY frame — the rec-split mm=4.4-6.6ms was ~all logger/
+                    // console tax, not draw recording. Keep the warning, cap it at ~1 line/s.
+                    static double s_lastCapLogMs = 0.0;
+                    if (!mmDropLogged && hostNowMs() - s_lastCapLogMs >= 1000.0) {
+                        s_lastCapLogMs = hostNowMs();
                         LOGF(eWARNING, "[forge] multi-map over cap %u — dropping extra parts (count=%u)",
                              kMaxMultiMap, multiMapCount);
                         std::printf("[forge] multi-map over cap %u — dropping extra parts (count=%u)\n",
@@ -9491,7 +9708,10 @@ namespace ForgeRender {
                 float ar = it.alphaRef < 0.0f ? 0.0f : (it.alphaRef > 1.0f ? 1.0f : it.alphaRef);
                 const uint32_t aref = (uint32_t)(ar * 255.0f + 0.5f) & 0xFFu;
                 const uint32_t vcs  = it.vColSource & 0x3u;
-                e[0] = (idx & 0xFFu) | (sc << 8u) | (vcs << 11u) | (aref << 16u);   // Meta
+                // Meta layout matches the Z-prepass pack above (idx 10 bits + uvAnimId 24-31);
+                // uvAnimIdFor is memoized per frame, so both loops stamp the same id.
+                const uint32_t uvId = g_meshes[slot].uvKeys ? uvAnimIdFor(g_meshes[slot]) : 0u;
+                e[0] = (idx & 0x3FFu) | (sc << 10u) | (vcs << 13u) | (aref << 16u) | (uvId << 24u);
                 e[1] = it.stages[0]; e[2] = it.stages[1]; e[3] = it.stages[2]; e[4] = it.stages[3];
                 float* fe = (float*)e;
                 fe[5]  = it.matDiffuse[0];  fe[6]  = it.matDiffuse[1];  fe[7]  = it.matDiffuse[2];
@@ -10098,7 +10318,16 @@ namespace ForgeRender {
                 std::memcpy(dst + (size_t)idx * 64, it.world, 64);
 
                 uint32_t* inst = (uint32_t*)g_live.pAlphaInstanceBuf->pCpuMappedAddress;
-                inst[idx * kStaticInstU32 + 0] = idx;   // DrawIndex → gBatch.worlds[idx]
+                // NiUVController takeover: cached alpha-BLENDED meshes (waterfalls, scrolling
+                // glows) carry key tracks too — their engine reships are gated off client-side,
+                // so without an id here they would freeze. Captured items have no mesh slot.
+                {
+                    uint32_t uvId = 0;
+                    if (!isCaptured && it.slot < g_meshHigh && g_meshes[it.slot].uvKeys) {
+                        uvId = uvAnimIdFor(g_meshes[it.slot]);
+                    }
+                    inst[idx * kStaticInstU32 + 0] = idx | (uvId << 16);   // DrawIndex | uv-anim id
+                }
                 inst[idx * kStaticInstU32 + 1] = packTexAlpha(it.texIndex, it.alphaRef, it.vColSource, it.clampMode);
                 float* finst = (float*)inst;
                 // C3 debug: with the classify toggle on, matDiffuse carries the classification
@@ -10770,6 +10999,15 @@ namespace ForgeRender {
     }
 
     void setDebugMode(unsigned m) { g_debugMode = m; }
+
+    void setClientStats(unsigned frameAhead, float clientWaitMs, float clientDtMs,
+                        float clientMwStartMs, double hostIdleMs) {
+        g_clientFrameAhead = frameAhead;
+        g_clientWaitMs     = clientWaitMs;
+        g_clientDtMs       = clientDtMs;
+        g_clientMwStartMs  = clientMwStartMs;
+        g_hostIdleMs       = hostIdleMs;
+    }
 
     void setDevInput(int x, int y, unsigned buttons, float wheel, unsigned uiVisible) {
         g_inMouseX = (float)x;
@@ -15264,6 +15502,12 @@ namespace ForgeRender {
             return 0;
         }
         if (!ensureArena()) { return 0; }
+        // A0 probe: the client measures ~5ms geom-RPC turnaround for 1-part KB-sized
+        // flushes (see [geomflush] in mgeXE.log). Split this handler's cost — part loop
+        // vs the static-load wait vs the arena streamer flush — so the A1 cut targets
+        // the right component. One line per >=1ms upload.
+        const double tUp0 = hostNowMs();
+        double tLoopMs = 0.0, tStaticMs = 0.0, tArenaMs = 0.0;
         const uint8_t* p   = (const uint8_t*)blobBytes;
         const uint8_t* end = p + byteCount;
         unsigned built = 0;
@@ -15332,11 +15576,15 @@ namespace ForgeRender {
                                                 : sizeof(IPC::GeomVertexWire);
             const uint64_t vbBytes = (uint64_t)hdr.vertexCount * vStride;
             const uint64_t ibBytes = (uint64_t)hdr.indexCount * sizeof(uint16_t);
-            if (p + vbBytes + ibBytes > end) {
+            if (p + vbBytes + ibBytes + hdr.uvAnimBytes > end) {
                 break;  // malformed / truncated blob
             }
             const void* verts   = p; p += vbBytes;
             const void* indices = p; p += ibBytes;
+            // NiUVController takeover: key-track payload after the indices. ALWAYS consumed
+            // here (part-boundary walk) even on the early-continue paths below.
+            const uint8_t* uvAnimP = hdr.uvAnimBytes ? p : nullptr;
+            p += hdr.uvAnimBytes;
             if (!hdr.vertexCount || !hdr.indexCount) {
                 ++built;   // consumed (nothing to build) — see the release-sentinel note
                 continue;
@@ -15559,6 +15807,24 @@ namespace ForgeRender {
                 anyStatic = true;
             }
 
+            // NiUVController takeover: parse/store the key track for this (re)built mesh.
+            // releaseMeshBuffers already freed any prior track on the rebuild paths; a part
+            // without the flag leaves uvKeys null (uvAnimIdFor then never assigns an id).
+            if (uvAnimP && (hdr.flags & IPC::kGeomFlagUVAnim)
+                && hdr.uvAnimBytes >= sizeof(IPC::GeomUVAnimWire)) {
+                std::memcpy(&m.uvMeta, uvAnimP, sizeof(IPC::GeomUVAnimWire));
+                const uint32_t nk = (uint32_t)m.uvMeta.keyCountU + m.uvMeta.keyCountV;
+                const uint64_t keyBytes = (uint64_t)nk * 8;
+                if (nk && sizeof(IPC::GeomUVAnimWire) + keyBytes <= hdr.uvAnimBytes) {
+                    m.uvKeys = (float*)tf_malloc((size_t)keyBytes);
+                    if (m.uvKeys) {
+                        std::memcpy(m.uvKeys, uvAnimP + sizeof(IPC::GeomUVAnimWire), (size_t)keyBytes);
+                    }
+                }
+                if (!m.uvKeys) { m.uvMeta = IPC::GeomUVAnimWire{}; }
+                m.uvAnimFrame = 0;
+                m.uvAnimId = 0;
+            }
             m.vertexCount    = hdr.vertexCount;
             m.indexCount     = hdr.indexCount;
             m.valid          = true;
@@ -15570,22 +15836,42 @@ namespace ForgeRender {
             ++built;
         }
 
+        tLoopMs = hostNowMs() - tUp0;
+
         // Only fence/log when a static GPU_ONLY build happened. The steady-state dynamic path
         // (animated meshes) is pure memcpy into persistent buffers — no loader work to wait on,
         // and logging it every frame is the very per-frame cost we're removing.
         if (anyStatic) {
+            const double t0 = hostNowMs();
             waitForAllResourceLoads();   // flush per-mesh (skinned) addResource loads
+            tStaticMs = hostNowMs() - t0;
         }
         if (anyArena) {
             // begin/endUpdateResource records on the loader's UPDATE stream, which
             // waitForAllResourceLoads does NOT flush — must flushResourceUpdates + fence (same
             // gotcha as texture uploads), else arena geometry stays zero.
+            const double t0 = hostNowMs();
             flushTextureUploads(g_live.pRenderer);
+            tArenaMs = hostNowMs() - t0;
         }
         if (anyStatic || anyArena) {
             // Exterior uploads ship ~1000+ parts in one batch; this is where a prior in-game
             // test went DEVICE_REMOVED. Pin a removal to the upload (vs the later draw).
+            // (logDeviceRemoved measured free — 0.00ms.)
             logDeviceRemoved(g_live.pRenderer, "uploadGeometry/flush");
+        }
+        // A1 geom-flush cut (probe-sized 2026-07-17): the per-upload LOGF (~3.2ms — The-Forge
+        // logger fsyncs) + std::printf (~1.5ms console write) were ~4.7ms of the ~5ms geom-RPC
+        // turnaround the CLIENT blocks on — every steady-state frame ships a 1-part KB-sized
+        // revision bump, so this tail log was a per-frame client tax, not a load-burst log.
+        // Log load bursts only; the client's [geomflush] line still covers steady state.
+        // NightDaySwitch addendum: 200+ tiny ARENA parts re-shipping EVERY frame pass the
+        // partCount>=16 "burst" test and keep anyArena true — cap at ~1 line/s as well.
+        static double s_lastBuiltLogMs = 0.0;
+        const double nowLogMs = hostNowMs();
+        if ((anyStatic || anyArena) && (partCount >= 16 || byteCount >= (256u << 10))
+            && (nowLogMs - s_lastBuiltLogMs >= 1000.0)) {
+            s_lastBuiltLogMs = nowLogMs;
             LOGF(eINFO, "[forge] uploadGeometry: built %u/%u parts (%u bytes), meshHigh=%u",
                  built, partCount, byteCount, g_meshHigh);
             std::printf("[forge] uploadGeometry: built %u/%u parts (%u bytes), meshHigh=%u\n",
@@ -15596,6 +15882,11 @@ namespace ForgeRender {
                          "need %llu KB VB / %llu KB IB more) — objects will be missing",
                          skippedParts, (unsigned long long)(skippedVB >> 10),
                          (unsigned long long)(skippedIB >> 10));
+        }
+        const double totalMs = hostNowMs() - tUp0;
+        if (totalMs >= 1.0) {
+            LOG::logline("-- [forge] uploadGeometry SLOW %.2fms (loop=%.2f staticWait=%.2f arenaFlush=%.2f) parts=%u bytes=%u",
+                         totalMs, tLoopMs, tStaticMs, tArenaMs, partCount, byteCount);
         }
         return built;
     }
@@ -15883,6 +16174,7 @@ namespace ForgeRender {
         if (g_live.pFroxelAssignPipeline) { removePipeline(R, g_live.pFroxelAssignPipeline); }
         if (g_live.pFroxelClearShader)    { removeShader(R, g_live.pFroxelClearShader); }
         if (g_live.pFroxelAssignShader)   { removeShader(R, g_live.pFroxelAssignShader); }
+        if (g_live.pUVAnimBuf)            { removeResource(g_live.pUVAnimBuf); }
         if (g_live.pMSAAColor)      { removeRenderTarget(R, g_live.pMSAAColor); }
         if (g_live.pDepth)          { removeRenderTarget(R, g_live.pDepth); }
         if (g_live.pFence)    { exitFence(R, g_live.pFence); }

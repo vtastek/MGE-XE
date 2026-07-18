@@ -148,6 +148,10 @@ namespace ForgeRender {
     // Dev overlay input bridge (Stage 2): the client forwards polled mouse each frame; the host
     // pushes it into Forge UI via uiSetExternalInput. buttons bitmask: bit0=L,bit1=R,bit2=M.
     void setDevInput(int x, int y, unsigned buttons, float wheel, unsigned uiVisible);
+    // Frame-ahead observability: client-forwarded last-frame timings + the host-side idle
+    // gap (server-measured, ms between RenderFrame exits/entries) for the Stats panel.
+    void setClientStats(unsigned frameAhead, float clientWaitMs, float clientDtMs,
+                        float clientMwStartMs, double hostIdleMs);
 
     // Dev hot-reload (F8): rebuild the compute pipelines (gtao + linearize) from the on-disk dxil,
     // no game restart. Recompile + redeploy the *_0.dxil first. Idles the queue before swapping.

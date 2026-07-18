@@ -976,7 +976,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skinned.vert.fsl"
 #line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skinned.vert.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-#line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 30 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(FrameData)
 {
     float4x4 viewProj;
@@ -1053,15 +1053,15 @@ STRUCT(FrameData)
 
     float4 froxelDims;
     float4 froxelZ;
-#line 103
+#line 106
 };
 
 STRUCT(BatchData)
 {
     float4x4 worlds[ 1024 ];
-#line 108
+#line 111
 };
-#line 129 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 132 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(LightData)
 {
     float4 lightParams;
@@ -1077,7 +1077,7 @@ STRUCT(LightData)
 
     float4 froxelDimsNear;
     float4 froxelZNear;
-#line 144
+#line 147
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1130,8 +1130,15 @@ STRUCT(LightData)
 
 
 
+
+
+        Buffer(float4) gUVAnim :  register(t11,space1);
+
+
+
+
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 213 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 223 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 896 ] :  register(t0,space0);
 
 
