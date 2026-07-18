@@ -16,6 +16,9 @@
 #include <windows.h>
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -56,6 +59,29 @@ namespace {
     // host frame thus overlaps the WHOLE MW frame, not just scene 0. World image lags
     // input by one frame (UI stays current).
     bool   g_frameAheadLive = false;   // seeded from ForgeFrameAhead at init; numpad-* flips live (A/B)
+    // Client produce (buildGeometryDrawLists + flush + RPC-start, D3D9-free after Tier 1a) on a
+    // fresh dedicated worker. NUMPAD8 cycles 3 modes; gated on !UseRenderThread (that path owns the
+    // legacy device-lock worker + a MULTITHREADED device — don't mix the two):
+    //   0 OFF     — run inline on the MW main thread (pre-worker behaviour).
+    //   1 FENCED  — Tier 1b: run on the worker, wait() immediately (serial, behaviour-identical;
+    //               a correctness checkpoint that the produce runs correctly off-main).
+    //   2 OVERLAP — Tier 2: on early-kickoff frames kick at BeginScene(0) and DON'T wait; wait at
+    //               EndScene(0) before the finish. The produce overlaps MW's scene-0 draw window.
+    //               Bounded to scene 0 on purpose: the worker reads the LIVE NI scene graph, which
+    //               is quiescent during the scene-0 draw but mutated by mwstart(N+1) — deferring the
+    //               wait past EndScene would race that. Non-early frames (interior/menu/warm-up)
+    //               fence like mode 1 (the finish follows immediately, no window to overlap).
+    int    g_produceMode = 2;          // 0 OFF / 1 FENCED / 2 OVERLAP; NUMPAD8 cycles. DEFAULT OVERLAP
+                                       // (user 2026-07-18: keep overlap always on) — degrades to a
+                                       // fence on non-early frames, so it's safe as the boot default.
+    bool   g_produceInFlight = false;  // an async (mode 2) produce is running / not yet waited
+    // Tracy host-frame fiber lane (see mge_tracy.h): the ctx spans the host's inflight window
+    // (kickoff RPC issued on the produce worker -> completion drained on the main thread).
+    TracyCZoneCtx g_hostZoneCtx{};
+    bool          g_hostZoneOpen = false;
+    double g_produceKickMs = 0.0;      // nowMs() at the async kick (overlap measurement)
+    double g_produceWorkerMs = 0.0;    // last worker run duration (set by the worker)
+    double g_produceBlockedMs = 0.0;   // last main-thread block at waitProduce (0 == fully hidden)
     bool   g_mainTexValid = false;     // g_mainTex holds a successfully copied host frame (deferred-blit gate)
     double g_lastBlitMs = 0.0;         // deferred EndScene blit cost, folded into the next collect's [hb]
     unsigned g_frameSerial = 0;        // Present tick (onFramePresented) — dedups the dev-key poll
@@ -80,7 +106,7 @@ namespace {
     // uploads + the blocking host RPC), not the host GPU. Time each phase of onPresent
     // with QPC and, when the whole feed exceeds kSpikeMs, emit ONE breakdown line to
     // mgeXE.log so the periodic culprit (almost certainly texture streaming) is visible.
-    constexpr double kSpikeMs = 5.0;   // ~ one 165Hz frame budget; tune as needed
+    constexpr double kSpikeMs = 10.0;  // spike-log threshold (raised from 5.0 — 5ms was log spam)
     double g_lastPresentMs = 0.0;      // for the inter-present delta (dip magnitude)
 
     // Baseline heartbeat: the spike log only fires on >=kSpikeMs frames, so it's BLIND to the
@@ -2594,6 +2620,17 @@ namespace RenderProcess {
             g_frameAheadLive = !g_frameAheadLive;
             LOG::logline(">> [seam] frame-ahead pipelining %s", g_frameAheadLive ? "ON" : "OFF");
         }
+        // NUMPAD8: produce-worker mode cycle OFF -> FENCED (Tier 1b) -> OVERLAP (Tier 2) -> OFF.
+        // FENCED runs the produce on the worker but waits immediately (serial A/B); OVERLAP defers
+        // the wait to EndScene(0) so it overlaps scene-0 draw. Inert on the legacy UseRenderThread
+        // path (dispatcher gates it out). Takes effect at the next kickoff.
+        if (GetAsyncKeyState(VK_NUMPAD8) & 0x0001) {
+            g_produceMode = (g_produceMode + 1) % 3;
+            const char* name = (g_produceMode == 1) ? "FENCED (Tier 1b)"
+                             : (g_produceMode == 2) ? "OVERLAP (Tier 2)" : "OFF (inline)";
+            LOG::logline(">> [seam] produce worker: %s%s", name,
+                         (g_produceMode != 0 && Configuration.UseRenderThread) ? " (inert — UseRenderThread owns the worker)" : "");
+        }
     }
 
     // Consume the pending host RenderFrame: drain the completion (or the stored mid-walk
@@ -2639,7 +2676,9 @@ namespace RenderProcess {
         MGE_TracyPlot("Forge host ms", r.hostMs);
         // Host-inflight lane: the paired 1.0 is set when the kickoff RPC is issued — the
         // step plot spans the host's whole render window across the frame boundary, the
-        // thing per-thread zones can't show (the host is another process).
+        // thing per-thread zones can't show (the host is another process). The fiber zone
+        // below turns that same window into a box on the "Forge Host GPU" lane.
+        if (g_hostZoneOpen) { MGE_TracyHostFrameEnd(g_hostZoneCtx); g_hostZoneOpen = false; }
         MGE_TracyPlot("Forge host inflight", 0.0);
         g_lastWaitMsStat = r.tRender - r.tWait0;   // → host Stats panel next kickoff
         if (!r.ok) {
@@ -2848,16 +2887,16 @@ namespace RenderProcess {
         }
     }
 
-    void onStage0CompositeKickoff(IDirect3DDevice9* device) {
-        // Frame-ahead backstop: every kickoff must consume the previous deferred frame
-        // FIRST (the collect normally did, at BeginScene(0) — before this runs in frame
-        // order). Reaching here with one still pending means an unexpected path skipped
-        // the collect; collect it now (accounting discarded) so the reset below can
-        // never orphan the pending RPC and wedge the window guard.
-        if (g_kick.deferFinish && (g_kick.rpcPending || g_kick.rpcEarlyFinished)) {
-            LOG::logline("!! [pipe] kickoff entered with an uncollected deferred frame — collecting late");
-            finishAndCopy();
-        }
+    // The produce+RPC-start body (Tier 1a made it D3D9-free). Runs either inline on the MW
+    // main thread or, when g_produceOffMain, on the fresh ProduceWorker below. onStage0Composite-
+    // Kickoff is the dispatcher that chooses.
+    void kickoffBody(IDirect3DDevice9* device) {
+        // Phase 0: the previous deferred frame is finished by onStage0CompositeKickoff (the
+        // dispatcher, on the MAIN thread) BEFORE this body runs — so g_kick.deferFinish is always
+        // cleared on entry. The old in-body backstop (finishAndCopy here) was removed: this body
+        // can run on the produce WORKER (OVERLAP mode), and finishAndCopy does a D3D9 RT copy that
+        // must never run off the main thread. If a deferred frame ever reached here uncollected it
+        // would be a dispatcher bug, not something to paper over with a worker-side D3D9 finish.
         // Whole-frame no-op guarantee: rpcPending stays false on every early-out below, so
         // the paired Finish returns immediately.
         g_kick = KickState{};
@@ -3377,6 +3416,11 @@ namespace RenderProcess {
         // Host-inflight lane start (paired 0.0 in finishAndCopy): from here until the
         // collect/finish drains the completion, the host owns the frame.
         MGE_TracyPlot("Forge host inflight", 1.0);
+        // Open the host-frame fiber zone (box on the "Forge Host GPU" lane) — spans until the
+        // finish drains the completion. Begins here on whichever thread issued the kickoff (the
+        // produce worker in OVERLAP/FENCED mode, else the main thread).
+        MGE_TracyHostFrameBegin(g_hostZoneCtx);
+        g_hostZoneOpen = true;
         g_kick.rpcPending    = true;
         g_kick.early         = DistantLand::earlyForgeKickoff;  // BeginScene(0) site vs late (EndScene)
         // Frame-ahead pipelining: defer the finish to the NEXT frame's BeginScene(0)
@@ -3416,6 +3460,126 @@ namespace RenderProcess {
         g_kick.bKeys         = g_lastBuildKeys;
     }
 
+    // ---- Tier 1b: fresh produce worker ------------------------------------------------------
+    // A single dedicated std::thread that runs kickoffBody() off the MW main thread. Deliberately
+    // NOT MGE::RenderThread — that worker owns a D3D9 device lock + a D3DCREATE_MULTITHREADED
+    // device and proved crashy; this one touches NO D3D9 (the produce path is D3D9-free after
+    // Tier 1a), so it needs no device lock. For Tier 1b the caller kicks then wait()s immediately
+    // (fully serial, zero race); Tier 2 will drop that fence to overlap MW's frame. The mutex the
+    // kick/wait handshake takes also publishes every write the worker made to g_kick + the cache
+    // globals back to the main thread (happens-before) before the finish half reads them.
+    class ProduceWorker {
+    public:
+        void ensure() {
+            if (m_thread.joinable()) return;
+            m_stop = false;
+            m_thread = std::thread([this] { run(); });
+        }
+        void kick(IDirect3DDevice9* device) {
+            {
+                std::lock_guard<std::mutex> lk(m_mx);
+                m_device = device;
+                m_hasJob = true;
+            }
+            m_cvJob.notify_one();
+        }
+        void wait() {
+            std::unique_lock<std::mutex> lk(m_mx);
+            m_cvDone.wait(lk, [this] { return !m_hasJob; });
+        }
+        void stop() {
+            if (!m_thread.joinable()) return;
+            {
+                std::lock_guard<std::mutex> lk(m_mx);
+                m_stop = true;
+            }
+            m_cvJob.notify_one();
+            m_thread.join();
+        }
+    private:
+        void run() {
+            MGE_TracyNameThread("Forge Produce Worker");   // labels the worker's lane in Tracy
+            for (;;) {
+                IDirect3DDevice9* device;
+                {
+                    std::unique_lock<std::mutex> lk(m_mx);
+                    m_cvJob.wait(lk, [this] { return m_hasJob || m_stop; });
+                    if (m_stop) return;
+                    device = m_device;
+                }
+                const double t0 = nowMs();
+                kickoffBody(device);
+                g_produceWorkerMs = nowMs() - t0;   // published under the lock below (happens-before)
+                {
+                    std::lock_guard<std::mutex> lk(m_mx);
+                    m_hasJob = false;
+                }
+                m_cvDone.notify_one();
+            }
+        }
+        std::thread              m_thread;
+        std::mutex               m_mx;
+        std::condition_variable  m_cvJob, m_cvDone;
+        IDirect3DDevice9*        m_device = nullptr;
+        bool                     m_hasJob = false;
+        bool                     m_stop   = false;
+    };
+    ProduceWorker g_produceWorker;
+
+    // Drain an in-flight async (mode 2) produce. Idempotent + cheap when none is pending, so it can
+    // be called unconditionally at the finish boundary. Records how long the main thread actually
+    // blocked (0 == the produce was fully hidden under scene 0). MUST be called before any code
+    // reads g_kick or kickoffPending()/finishDeferred() for control flow.
+    void waitProduce() {
+        if (!g_produceInFlight) return;
+        const double t0 = nowMs();
+        g_produceWorker.wait();
+        g_produceBlockedMs = nowMs() - t0;
+        g_produceInFlight = false;
+        // Periodic overlap read: workerRun = the produce's wall time on the worker; blocked = the
+        // slice scene 0 could NOT hide (main stalled for it). blocked≈0 ⇒ produce fully overlapped.
+        static unsigned s_n = 0;
+        if (++s_n % 300 == 0) {
+            LOG::logline(">> [produce] overlap: workerRun=%.2f blocked=%.2f ms (hidden=%.2f)",
+                         g_produceWorkerMs, g_produceBlockedMs,
+                         g_produceWorkerMs - g_produceBlockedMs);
+        }
+    }
+
+    void doDeferredFinish();   // fwd (defined below); Phase 0 deferred wait
+
+    // Dispatcher: route the produce onto the fresh worker per g_produceMode (unless the legacy
+    // UseRenderThread path owns threading). Mode 2 (OVERLAP) only defers the wait on early-kickoff
+    // frames — there the kick fires at BeginScene(0) and the paired waitProduce() runs at
+    // EndScene(0); every other frame fences here so g_kick is complete on return exactly as inline.
+    void onStage0CompositeKickoff(IDirect3DDevice9* device) {
+        // Never kick while a previous async produce is still in flight (would race m_device); the
+        // normal EndScene waitProduce already drained it, this is a belt-and-braces no-op there.
+        waitProduce();
+
+        // Phase 0 deferred wait: finish the PREVIOUS deferred frame HERE (main thread, late) — on
+        // early-kickoff frames the BeginScene collect skipped it, so the host had the whole
+        // BeginScene window to finish and this wait collapses to ~0. MUST precede kickoffBody's
+        // g_kick reset (it consumes N-1's g_kick state) AND the worker dispatch (finishAndCopy is
+        // D3D9, main-only). On non-early frames this is a no-op — collectDeferredFinish already ran.
+        doDeferredFinish();
+
+        if (g_produceMode == 0 || Configuration.UseRenderThread) {
+            kickoffBody(device);
+            return;
+        }
+        g_produceWorker.ensure();
+        if (g_produceMode == 2 && DistantLand::earlyForgeKickoff) {
+            g_produceKickMs   = nowMs();
+            g_produceInFlight = true;
+            g_produceWorker.kick(device);        // async — waited at EndScene(0) before the finish
+            return;
+        }
+        // Mode 1 (FENCED) or mode 2 on a non-early frame: kick + wait immediately (serial).
+        g_produceWorker.kick(device);
+        g_produceWorker.wait();
+    }
+
     void onStage0CompositeFinish(IDirect3DDevice9* device) {
         // Dev-key poll: once per display frame, at a stable point BEFORE the finish
         // consumers — normally the BeginScene(0) collect already polled (it runs first
@@ -3445,7 +3609,9 @@ namespace RenderProcess {
     }
 
     bool kickoffPending() {
-        return g_kick.rpcPending;
+        // g_produceInFlight covers the mode-2 window between the BeginScene(0) async kick and the
+        // EndScene(0) waitProduce, so the late-kick guard never double-kicks before g_kick is set.
+        return g_kick.rpcPending || g_produceInFlight;
     }
 
     bool finishDeferred() {
@@ -3478,22 +3644,43 @@ namespace RenderProcess {
             MGE_TracyPlot("MW frame start ms", g_pendingMwStart);
         }
         pollDevKeys();
+        // Defensive: normally EndScene(0) already drained the mode-2 async produce, but if that
+        // frame's scene-0 path was skipped it could still be in flight — drain it before anything
+        // downstream reads g_kick (a no-op in the common case).
+        waitProduce();
+        // Phase 0: the previous frame's deferred finish NO LONGER runs here. It moves to
+        // collectDeferredFinish (non-early / not-ready frames, after frameSetupEarly latches the
+        // gate) or to onStage0CompositeKickoff (early frames, run late). See collectDeferredFinish.
+    }
+
+    // Finish + copy the previous deferred host frame (frame-ahead). Main thread ONLY — finishAndCopy
+    // does a D3D9 RT copy. Shared by collectDeferredFinish and onStage0CompositeKickoff. No-op unless
+    // a deferred finish is pending; consumes g_kick's N-1 state, so it MUST run before kickoffBody
+    // resets g_kick for the new frame.
+    void doDeferredFinish() {
         if (!finishDeferred()) {
             return;
         }
-        MGE_ZoneScopedN("Forge frame-ahead collect");
+        MGE_ZoneScopedN("Forge deferred finish");
         g_kick.deferFinish = false;
         const FinishResult fr = finishAndCopy();
         if (!fr.ok) {
             // Host death / copy failure: g_mainTexValid is already down, so the next
             // deferred blit skips — the same empty-world frame as today's finish-failure
             // path; ownership gates release via g_initOk/ServerLost as before.
-            LOG::logline("!! [pipe] deferred collect failed (host dead?) — composite skipped until recovery");
+            LOG::logline("!! [pipe] deferred finish failed (host dead?) — composite skipped until recovery");
             g_lastBlitMs = 0.0;
             return;
         }
         accumFrameStats(fr, nowMs(), true, g_lastBlitMs);
         g_lastBlitMs = 0.0;
+    }
+
+    void collectDeferredFinish(IDirect3DDevice9* /*device*/) {
+        // Non-early / not-ready frames: finish the previous deferred frame NOW, at BeginScene,
+        // before the MGE pipeline (selectDistantCell/culls/depth) reuses the IPC channel. Early
+        // frames skip this and defer to the kickoff. See doDeferredFinish.
+        doDeferredFinish();
     }
 
     void onFrameAheadBlit(IDirect3DDevice9* device) {
@@ -3923,12 +4110,16 @@ namespace RenderProcess {
     }
 
     void shutdown() {
+        // Tier 1b: stop the produce worker BEFORE draining/releasing anything it may touch —
+        // no-op if it was never started (produce-off-main stayed OFF the whole session).
+        g_produceWorker.stop();
         // Never tear down with a host RenderFrame still pending (deferred or not):
         // drain it so the host isn't mid-frame and the window guard isn't latched
         // if the seam comes back up.
         if (g_client && g_kick.rpcPending) {
             g_client->renderSceneFinish(nullptr);
         }
+        if (g_hostZoneOpen) { MGE_TracyHostFrameEnd(g_hostZoneCtx); g_hostZoneOpen = false; }
         g_kick = KickState{};
         releaseAll();
         g_geomVec.reset();

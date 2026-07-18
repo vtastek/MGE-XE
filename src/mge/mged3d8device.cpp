@@ -677,8 +677,20 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                     // Latch false (interiors, menus, F11/F7-off, fused mode, warm-up
                     // frame) → the late kickoff at EndScene(0) runs instead.
                     if (DistantLand::earlyForgeKickoff) {
+                        // Phase 0: the kickoff dispatcher finishes the PREVIOUS deferred frame
+                        // late (host had the whole BeginScene window → exposed wait → ~0), then
+                        // kicks this one. The IPC-free early window guarantees the deferral is safe.
                         RenderProcess::onStage0CompositeKickoff(realDevice);
+                    } else {
+                        // Non-early frame: the MGE scene-0 pipeline (selectDistantCell/culls/
+                        // depth) will reuse the IPC channel, so finish the previous deferred frame
+                        // NOW — at BeginScene, before that traffic — exactly as the old collect did.
+                        RenderProcess::collectDeferredFinish(realDevice);
                     }
+                } else {
+                    // Not ready (menu/loading transition): no kickoff will run this frame — finish
+                    // any pending deferred frame here so it can never orphan the host RPC.
+                    RenderProcess::collectDeferredFinish(realDevice);
                 }
 
                 // Open the MW sky zone *after* frameSetupEarly so it brackets only
@@ -769,6 +781,11 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
             // the whole MW frame, which the early-kickoff eligibility predicate already
             // guarantees is RPC-free on both channels.
             if (Configuration.UseAsyncHostFrame) {
+                // Produce-worker OVERLAP mode: drain the async produce kicked at BeginScene(0) NOW,
+                // before kickoffPending()/finishDeferred() read g_kick — this bounds the worker's
+                // live-NI reads to the quiescent scene-0 window (out of mwstart(N+1)). No-op in the
+                // OFF/FENCED modes.
+                RenderProcess::waitProduce();
                 if (!RenderProcess::kickoffPending()) {
                     RenderProcess::onStage0CompositeKickoff(realDevice);
                 }
@@ -1047,9 +1064,10 @@ ULONG _stdcall MGEProxyDevice::Release() {
 // Called after new game or load game is selected from the main menu
 void initOnLoad() {
     // Frame-ahead backstop (ForgeFrameAhead): a quickload can reach this re-init path
-    // with the previous frame's deferred finish still pending — collect it before the
-    // load path's blocking init RPCs (renderInit/allocVec) hit the window guard.
-    RenderProcess::onFrameAheadCollect(nullptr);
+    // with the previous frame's deferred finish still pending — finish it before the
+    // load path's blocking init RPCs (renderInit/allocVec) hit the window guard. Phase 0:
+    // the FINISH lives in collectDeferredFinish now (onFrameAheadCollect only polls/probes).
+    RenderProcess::collectDeferredFinish(nullptr);
 
     auto mwBridge = MWBridge::get();
 

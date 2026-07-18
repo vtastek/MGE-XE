@@ -42,6 +42,13 @@ namespace RenderProcess {
     void onStage0CompositeKickoff(IDirect3DDevice9* device);
     void onStage0CompositeFinish(IDirect3DDevice9* device);
 
+    // Produce-worker OVERLAP mode (NUMPAD8 -> 2): drains the async produce kicked at BeginScene(0)
+    // so it completes within the quiescent scene-0 window (before the finish reads g_kick and before
+    // mwstart(N+1) mutates the live scene graph the worker read). No-op in the OFF/FENCED modes and
+    // whenever no async produce is in flight — safe to call unconditionally at the EndScene(0)
+    // finish boundary, which is the ONLY place it must run.
+    void waitProduce();
+
     // True while a kicked-off host RenderFrame awaits its Finish (the async window is
     // open). The EndScene call site uses this to skip its late kickoff when the Phase 2
     // early kickoff (BeginScene(0), gated by DistantLand::earlyForgeKickoff) already
@@ -61,6 +68,15 @@ namespace RenderProcess {
     // scene-0 frame, not just deferred ones.
     void onFrameAheadCollect(IDirect3DDevice9* device);
     void onFrameAheadBlit(IDirect3DDevice9* device);
+
+    // Phase 0 (deferred wait): the previous frame's deferred finish no longer runs inside
+    // onFrameAheadCollect. On NON-early / not-ready frames the caller invokes this after
+    // frameSetupEarly has latched earlyForgeKickoff — it finishes+copies the pending frame at
+    // BeginScene, before the MGE pipeline's scene-0 IPC needs the channel. On EARLY-kickoff
+    // frames the caller skips this; the finish moves into onStage0CompositeKickoff (run late,
+    // just before the kickoff reuses the channel, so the host had the whole BeginScene window to
+    // finish and the exposed wait collapses to ~0). No-op unless a deferred finish is pending.
+    void collectDeferredFinish(IDirect3DDevice9* device);
 
     // True when the current kickoff deferred its finish to the next frame's collect:
     // the EndScene composite point must blit (onFrameAheadBlit) instead of finishing.
