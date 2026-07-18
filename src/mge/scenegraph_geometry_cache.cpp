@@ -13,6 +13,7 @@
 #include "NITriBasedGeometry.h"
 #include "NITriBasedGeometryData.h"
 #include "NISkinInstance.h"
+#include "NIUVController.h"
 
 #include "configuration.h"
 #include "datahandler_view.h"
@@ -28,6 +29,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -66,6 +68,7 @@ namespace MGE::GeometryCache {
         D3DBLEND niBlendToD3D(unsigned int ni);
         uint32_t          g_uploadedThisFrame  = 0;
         uint64_t          g_uploadedInterval   = 0; // cumulative over log interval
+        uint32_t          g_walkSerial         = 0; // ++ per onFrameReady (reship-streak probe)
         // Phase 0 diagnostic: null-bone influence accounting (the suspected NPC
         // "explosion" source — a null SkinInstance::bones[b] currently falls back
         // to identity, parking influenced verts at the model/cell origin).
@@ -522,6 +525,134 @@ namespace MGE::GeometryCache {
         };
         static_assert(sizeof(SkinnedVertex) == 56, "SkinnedVertex size mismatch");
 
+        // NiUVController takeover: find an ACTIVE NiUVController that animates the UV OFFSETS
+        // of this shape. The engine applies such a controller by rewriting the mesh's vertex UV
+        // array every update tick (revisionID bump -> D3D9 VB rebuild + blocking geom-RPC
+        // reship — the GitD night-collapse class). Instead the key track ships ONCE and the
+        // Forge host scrolls the UVs in-shader from sim time. Returns nullptr when absent or
+        // unsupported (animated TILING — rare; those shapes keep the engine reship path).
+        NI::UVController* findUVAnimController(NI::TriBasedGeometry* geom) {
+            for (NI::TimeController* c = geom->controllers; c; c = c->nextController) {
+                if ((c->flags & NI::TimeControllerFlags::Active) == 0) { continue; }
+                if (!c->isOfType(NI::RTTIStaticPtr::NiUVController)) { continue; }
+                auto* uvc = static_cast<NI::UVController*>(c);
+                NI::UVData* d = uvc->uvData.get();
+                if (!d) { return nullptr; }
+                if (d->UTilingData.numKeys > 1 || d->VTilingData.numKeys > 1) {
+                    static bool warnedTiling = false;
+                    if (!warnedTiling) {
+                        warnedTiling = true;
+                        const char* nm = geom->getName();
+                        LOG::logline("!! [uvanim] animated UV TILING unsupported (shape '%s') — engine reship path kept",
+                                     (nm && *nm) ? nm : "?");
+                    }
+                    return nullptr;
+                }
+                if (d->UOffsetData.numKeys < 2 && d->VOffsetData.numKeys < 2) {
+                    return nullptr;   // constant offsets — nothing animates
+                }
+                return uvc;
+            }
+            return nullptr;
+        }
+
+        // Extract one NiUVData float-key track as linear (time, value) pairs. Linear keys
+        // (type 1, stride 8) ship as-is; bezier keys (type 2, stride 16: t/v/forward/backward)
+        // are Hermite-RESAMPLED to linear at 15 Hz over the track's own time span; TBC keys
+        // (type 3, stride 20) fall back to a linear walk of their (t, v) lanes (log once —
+        // base-game UV anims are linear/bezier). Unknown types clear the output.
+        void extractUVTrack(const NI::UVData::KeyData& kd,
+                            std::vector<std::pair<float, float>>& out) {
+            out.clear();
+            if (!kd.keys || kd.numKeys == 0) { return; }
+            const auto* bytes = static_cast<const uint8_t*>(kd.keys);
+            const uint32_t n = kd.numKeys;
+            if (kd.type == 1) {                       // linear {t, v}
+                out.reserve(n);
+                for (uint32_t i = 0; i < n; ++i) {
+                    const float* k = reinterpret_cast<const float*>(bytes + (size_t)i * 8);
+                    out.emplace_back(k[0], k[1]);
+                }
+            } else if (kd.type == 2) {                // bezier {t, v, forward, backward}
+                struct BK { float t, v, fwd, bwd; };
+                auto keyAt = [&](uint32_t i) {
+                    BK k; std::memcpy(&k, bytes + (size_t)i * 16, sizeof(k)); return k;
+                };
+                const float t0 = keyAt(0).t, t1 = keyAt(n - 1).t;
+                const float span = t1 - t0;
+                if (span <= 0.0f || n < 2) { out.emplace_back(t0, keyAt(0).v); return; }
+                uint32_t samples = (uint32_t)(span * 15.0f) + 2u;   // ~15 Hz, ends inclusive
+                if (samples > 512u) { samples = 512u; }
+                out.reserve(samples);
+                uint32_t seg = 0;
+                for (uint32_t s = 0; s < samples; ++s) {
+                    const float t = t0 + span * ((float)s / (float)(samples - 1));
+                    while (seg + 2 < n && keyAt(seg + 1).t <= t) { ++seg; }
+                    const BK a = keyAt(seg), b = keyAt(seg + 1);
+                    const float dt = b.t - a.t;
+                    const float u = dt > 0.0f ? (t - a.t) / dt : 0.0f;
+                    const float u2 = u * u, u3 = u2 * u;
+                    const float v = (2*u3 - 3*u2 + 1) * a.v + (-2*u3 + 3*u2) * b.v
+                                  + (u3 - 2*u2 + u) * a.fwd + (u3 - u2) * b.bwd;
+                    out.emplace_back(t, v);
+                }
+            } else if (kd.type == 3) {                // TBC {t, v, tension, bias, continuity}
+                static bool warnedTBC = false;
+                if (!warnedTBC) {
+                    warnedTBC = true;
+                    LOG::logline("-- [uvanim] TBC UV keys approximated as linear");
+                }
+                out.reserve(n);
+                for (uint32_t i = 0; i < n; ++i) {
+                    const float* k = reinterpret_cast<const float*>(bytes + (size_t)i * 20);
+                    out.emplace_back(k[0], k[1]);
+                }
+            }
+        }
+
+        // Build the GeomUVAnimWire blob (header + U keys + V keys) shipped once with the mesh.
+        // Returns false (empty out) when nothing usable — the caller then keeps the engine
+        // reship path (and must NOT exclude the UV component from the content gate).
+        bool buildUVAnimPayload(NI::UVController* uvc, uint8_t uvSetCount,
+                                std::vector<uint8_t>& out) {
+            out.clear();
+            NI::UVData* d = uvc->uvData.get();
+            if (!d) { return false; }
+            static std::vector<std::pair<float, float>> uKeys, vKeys;  // single-threaded walk
+            extractUVTrack(d->UOffsetData, uKeys);
+            extractUVTrack(d->VOffsetData, vKeys);
+            if (uKeys.size() < 2 && vKeys.size() < 2) { return false; }
+            const size_t bytes = sizeof(IPC::GeomUVAnimWire) + 8u * (uKeys.size() + vKeys.size());
+            if (bytes > 0xFFFFu) { return false; }   // uvAnimBytes is uint16 (never hit in practice)
+
+            IPC::GeomUVAnimWire w = {};
+            const uint8_t maxSet = uvSetCount ? (uint8_t)(uvSetCount - 1) : 0u;
+            w.setIndex  = uvc->textureSet < maxSet ? (uint8_t)uvc->textureSet : maxSet;
+            // TimeController cycleType bits 1-2: Loop=0 / Reverse=2 / Clamp=4 -> 0/1/2.
+            w.cycleType = (uint8_t)((uvc->flags & NI::TimeControllerFlags::CycleTypeMask) >> 1);
+            w.keyCountU = (uint16_t)uKeys.size();
+            w.keyCountV = (uint16_t)vKeys.size();
+            w.frequency = uvc->frequency;
+            w.phase     = uvc->phase;
+            w.keyMin    = uvc->lowKeyFrame;
+            w.keyMax    = uvc->highKeyFrame;
+            // The verts captured THIS run already embed the controller's current offsets —
+            // the host applies eval(t) - base so capture time drops out.
+            w.baseU     = uvc->currentUOffset;
+            w.baseV     = uvc->currentVOffset;
+
+            out.resize(bytes);
+            uint8_t* dst = out.data();
+            std::memcpy(dst, &w, sizeof(w));                       dst += sizeof(w);
+            if (!uKeys.empty()) {
+                std::memcpy(dst, uKeys.data(), uKeys.size() * 8);  dst += uKeys.size() * 8;
+            }
+            if (!vKeys.empty()) {
+                std::memcpy(dst, vKeys.data(), vKeys.size() * 8);
+            }
+            return true;
+        }
+
         void uploadEntry(CachedGeometry& e, NI::TriBasedGeometry* geom,
                          NI::TriBasedGeometryData* data, uint32_t key) {
             const auto vertexCount = static_cast<uint32_t>(data->getActiveVertexCount());
@@ -533,6 +664,33 @@ namespace MGE::GeometryCache {
             if (!vertexCount || !triCount || !mv) {
                 releaseEntry(e);
                 return;
+            }
+
+            // Reship probe: uploadEntry only runs on first upload or a revision bump, so an
+            // entry passing through here EVERY walk means an engine controller bumps
+            // data->revisionID per frame — and each rebuild re-ships the part to the Forge
+            // host over the blocking geom RPC (the [hb] geom= floor; seen live as one slot
+            // rev++ every frame in the host log). Name the offender once so the source can
+            // be fixed or rerouted to the dynamic ring.
+            {
+                struct ReshipStreak { uint32_t lastWalk; uint32_t streak; bool logged; };
+                static std::unordered_map<uint32_t, ReshipStreak> s_reship;
+                auto& rs = s_reship[key];
+                rs.streak = (rs.lastWalk + 1 == g_walkSerial) ? rs.streak + 1 : 1;
+                rs.lastWalk = g_walkSerial;
+                if (rs.streak == 120 && !rs.logged) {
+                    rs.logged = true;
+                    const char* nm = geom->getName();
+                    NI::Node* p1 = geom->parentNode;
+                    NI::Node* p2 = p1 ? p1->parentNode : nullptr;
+                    NI::Node* p3 = p2 ? p2->parentNode : nullptr;
+                    LOG::logline("!! [reship] every-walk rebuild: key=%08X v=%u tri=%u rev=%u shape='%s' parents='%s' <- '%s' <- '%s'",
+                                 key, vertexCount, triCount, (unsigned)data->revisionID,
+                                 (nm && *nm) ? nm : "?",
+                                 (p1 && p1->getName()) ? p1->getName() : "?",
+                                 (p2 && p2->getName()) ? p2->getName() : "?",
+                                 (p3 && p3->getName()) ? p3->getName() : "?");
+                }
             }
 
             // UV-set count: carry as many sets as the maps actually use (the glow-mod
@@ -556,12 +714,119 @@ namespace MGE::GeometryCache {
             const DWORD vbFVF = MGE::GeometryCache::kVBFVFBase
                               | (static_cast<DWORD>(uvSetCount) << D3DFVF_TEXCOUNT_SHIFT);
 
+            // NiUVController takeover: build the key-track payload BEFORE the content gate so
+            // the gate can drop the UV component from its hash — the engine's per-tick UV
+            // rewrite then short-circuits the ENTIRE rebuild+reship above instead of only
+            // absorbing identical frames. Payload-build failure (or an unsupported controller)
+            // leaves the vector empty -> no exclusion, engine reship path unchanged. Sky keeps
+            // its own SK3 scroll-diff mechanism; FP and landscape have no host id stamping.
+            static std::vector<uint8_t> uvAnimPayload;   // single-threaded cache walk
+            uvAnimPayload.clear();
+            if (!g_walkingSky && !g_walkingFP && !g_walkingLandscape && data->textureCoords) {
+                if (NI::UVController* uvc = findUVAnimController(geom)) {
+                    buildUVAnimPayload(uvc, uvSetCount, uvAnimPayload);
+                }
+            }
+            const bool hasUVAnim = !uvAnimPayload.empty();
+
+            // Part A upload accounting: tag WHY this part reships (new vs which array changed) so
+            // the [uploads] heartbeat + host panel can break the per-frame host-geom cost down by
+            // cause. Set from the content gate below; kUpTopo overrides on a size/stride change.
+            int uploadCat = RenderProcess::kUpNew;
+
+            // Content-identity gate (NightDaySwitch finding, 2026-07-17): a mod can bump
+            // data->revisionID EVERY frame on hundreds of parts without changing a byte —
+            // the glow-windows day/night switch does exactly that at night (235 4-vert
+            // window quads, named by the [reship] probe), and each spurious bump costs a
+            // D3D9 VB rebuild here AND a client-blocking geom-RPC reship. Hash the source
+            // arrays; identical content ⇒ consume the revision stamp and skip everything.
+            // Real animation (morph heads, sky vcol fades) hashes differently and passes
+            // through unchanged, so this can never drop a genuine update.
+            {
+                auto fnv = [](const void* p, size_t n, uint64_t h) {
+                    const uint8_t* b = static_cast<const uint8_t*>(p);
+                    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+                    return h;
+                };
+                constexpr uint64_t kFnvBasis = 1469598103934665603ull;
+                // Per-component hashes: the combined value drives the skip; the parts tell
+                // the [reship-diff] log WHICH array a per-frame animator actually rewrites
+                // (pos/nrm/vcol/uv/tri) — the artist-facing answer.
+                uint64_t hc[5] = { kFnvBasis, kFnvBasis, kFnvBasis, kFnvBasis, kFnvBasis };
+                hc[0] = fnv(mv, vertexCount * sizeof(mv[0]), hc[0]);
+                if (data->normal) hc[1] = fnv(data->normal, vertexCount * sizeof(data->normal[0]), hc[1]);
+                if (data->color)  hc[2] = fnv(data->color,  vertexCount * sizeof(data->color[0]), hc[2]);
+                if (data->textureCoords) {
+                    for (uint8_t s = 0; s < uvSetCount; ++s) {
+                        hc[3] = fnv(data->textureCoords + (uint32_t)s * storedVerts,
+                                    vertexCount * sizeof(data->textureCoords[0]), hc[3]);
+                    }
+                }
+                if (const auto* tl = data->getTriList()) hc[4] = fnv(tl, (size_t)triCount * 6u, hc[4]);
+                const uint32_t counts[3] = { vertexCount, triCount, uvSetCount };
+                uint64_t h = fnv(counts, sizeof(counts), kFnvBasis);
+                // NiUVController takeover: the host animates this shape's UVs from the shipped
+                // key track, so the engine's per-tick UV rewrites must NOT read as "content
+                // changed" — exclude the UV component from the skip hash. hc[3] is still
+                // computed for the [reship-diff] component log.
+                for (int c = 0; c < 5; ++c) {
+                    if (c == 3 && hasUVAnim) { continue; }
+                    h = fnv(&hc[c], sizeof(hc[c]), h);
+                }
+
+                struct ContentSig { uint64_t h; uint64_t hc[5]; uint32_t lastChangeWalk; bool loggedDiff; };
+                static std::unordered_map<uint32_t, ContentSig> s_contentSig;
+                auto it = s_contentSig.find(key);
+                if (it != s_contentSig.end() && it->second.h == h && e.vb[e.writeSlot]) {
+                    e.revisionID = data->revisionID;   // consume the spurious bump
+                    return;
+                }
+                if (it != s_contentSig.end()) {
+                    // Part A: tag the dominant changed component for the upload breakdown. uv first
+                    // (a uv change here after the takeover is the unmigrated remainder / leak), then
+                    // pos (morph + particle regen), vcol, tri, normals.
+                    if      (it->second.hc[3] != hc[3]) uploadCat = RenderProcess::kUpUvLeak;
+                    else if (it->second.hc[0] != hc[0]) uploadCat = RenderProcess::kUpMorph;
+                    else if (it->second.hc[2] != hc[2]) uploadCat = RenderProcess::kUpVcol;
+                    else if (it->second.hc[4] != hc[4]) uploadCat = RenderProcess::kUpTopo;
+                    else                                uploadCat = RenderProcess::kUpOther;
+                    // Content really changed under a revision bump. Name the changed
+                    // component(s) + the tick interval once per mesh — this is the
+                    // "which animation method" answer for content authors.
+                    if (!it->second.loggedDiff) {
+                        it->second.loggedDiff = true;
+                        char comps[24]; int off = 0;
+                        static const char* kCompName[5] = { "pos", "nrm", "vcol", "uv", "tri" };
+                        for (int c = 0; c < 5; ++c) {
+                            if (it->second.hc[c] != hc[c]) {
+                                off += std::snprintf(comps + off, sizeof(comps) - off, "%s%s",
+                                                     off ? "+" : "", kCompName[c]);
+                            }
+                        }
+                        const char* nm = geom->getName();
+                        LOG::logline("!! [reship-diff] key=%08X changed=%s interval=%u walks v=%u shape='%s'",
+                                     key, off ? comps : "counts", g_walkSerial - it->second.lastChangeWalk,
+                                     vertexCount, (nm && *nm) ? nm : "?");
+                    }
+                    it->second.h = h;
+                    std::memcpy(it->second.hc, hc, sizeof(hc));
+                    it->second.lastChangeWalk = g_walkSerial;
+                } else {
+                    ContentSig sig = {};
+                    sig.h = h;
+                    std::memcpy(sig.hc, hc, sizeof(hc));
+                    sig.lastChangeWalk = g_walkSerial;
+                    s_contentSig.emplace(key, sig);
+                }
+            }
+
             // On a size OR UV-layout change, drop both slots + IB so they repopulate
             // at the new size/stride.
             const bool sizeChanged = (e.vertexCount != vertexCount)
                 || (e.triangleCount != triCount) || (e.uvSetCount != uvSetCount);
             if (sizeChanged) {
                 releaseEntry(e);
+                if (uploadCat != RenderProcess::kUpNew) uploadCat = RenderProcess::kUpTopo;  // realloc dominates
             }
 
             const uint8_t slot = 1u - e.writeSlot;
@@ -716,7 +981,12 @@ namespace MGE::GeometryCache {
                     RenderProcess::captureMultiMapGeometry(key, data->revisionID,
                         reinterpret_cast<uint32_t>(data),   // object identity (recycled-key guard)
                         mmScratch.data(), vertexCount,
-                        reinterpret_cast<const uint16_t*>(triList), triCount * 3u);
+                        reinterpret_cast<const uint16_t*>(triList), triCount * 3u,
+                        hasUVAnim ? uvAnimPayload.data() : nullptr,
+                        hasUVAnim ? (uint16_t)uvAnimPayload.size() : 0u);
+                    RenderProcess::noteUpload((uint8_t)uploadCat,
+                        vertexCount * (uint32_t)sizeof(IPC::GeomVertexWireMM)
+                        + triCount * 6u + (uint32_t)uvAnimPayload.size());
                 } else {
                     static std::vector<IPC::GeomVertexWire> scratch;  // single-threaded cache walk
                     scratch.resize(vertexCount);
@@ -743,7 +1013,12 @@ namespace MGE::GeometryCache {
                             reinterpret_cast<uint32_t>(data),   // object identity (recycled-key guard)
                             scratch.data(), vertexCount,
                             reinterpret_cast<const uint16_t*>(triList), triCount * 3u,
-                            false);
+                            false,
+                            hasUVAnim ? uvAnimPayload.data() : nullptr,
+                            hasUVAnim ? (uint16_t)uvAnimPayload.size() : 0u);
+                        RenderProcess::noteUpload((uint8_t)uploadCat,
+                            vertexCount * (uint32_t)sizeof(IPC::GeomVertexWire)
+                            + triCount * 6u + (uint32_t)uvAnimPayload.size());
                     }
                 }
             }
@@ -895,6 +1170,9 @@ namespace MGE::GeometryCache {
                         reinterpret_cast<uint32_t>(data),   // object identity (recycled-key guard)
                         skScratch.data(), vertexCount,
                         reinterpret_cast<const uint16_t*>(triList), triCount * 3u, numBones);
+                    // Part A: skinned reships are the known NPC/creature cost.
+                    RenderProcess::noteUpload(RenderProcess::kUpSkin,
+                        vertexCount * (uint32_t)sizeof(IPC::SkinnedVertexWire) + triCount * 6u);
                 }
             }
 
@@ -1693,6 +1971,7 @@ namespace MGE::GeometryCache {
         g_gcAccum.cap      += g_liveCaptureThisFrame;
         g_uploadedInterval += g_uploadedThisFrame;
         g_uploadedThisFrame = 0;
+        ++g_walkSerial;
         g_visitedThisFrame = 0;
         g_gateSkipsThisFrame = 0;
         g_liveRefreshThisFrame = 0;

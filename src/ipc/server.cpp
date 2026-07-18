@@ -502,6 +502,11 @@ namespace IPC {
 		params.renderMs = 0.0;
 
 		LARGE_INTEGER t0; QueryPerformanceCounter(&t0);
+		// Host idle gap: how long this process sat between finishing the previous
+		// RenderFrame and this one arriving — the host-side view of the client's
+		// frame-ahead runway (idle ≈ 0 ⇒ host-bound; large ⇒ client-bound).
+		static LARGE_INTEGER s_lastExit = {};
+		const double idleMs = s_lastExit.QuadPart ? msBetween(s_lastExit, t0) : 0.0;
 		bool ok;
 		if (params.drawList != InvalidVector || params.skinnedList != InvalidVector
 			|| params.multiMapList != InvalidVector || params.skyList != InvalidVector
@@ -641,6 +646,8 @@ namespace IPC {
 			ForgeRender::setDebugMode(params.debugMode);
 			ForgeRender::setDevInput(params.devMouseX, params.devMouseY, params.devMouseButtons,
 				params.devMouseWheel, params.devUiVisible);
+			ForgeRender::setClientStats(params.devFrameAhead, params.devClientWaitMs,
+				params.devClientDtMs, params.devClientMwStartMs, idleMs);
 			if (params.devReloadShaders) {
 				ForgeRender::reloadComputeShaders();
 			}
@@ -664,12 +671,14 @@ namespace IPC {
 			ok = ForgeRender::renderFrame(params.frameIndex);
 		}
 		if (!ok) {
+			QueryPerformanceCounter(&s_lastExit);
 			return;
 		}
 		LARGE_INTEGER t1; QueryPerformanceCounter(&t1);
 
 		params.bytesWritten = g_spikeWidth * g_spikeHeight * 4u;
 		params.renderMs = msBetween(t0, t1);
+		s_lastExit = t1;
 	}
 
 	// M1b: hand the packed geometry blob to the Forge host, which builds a D3D12
@@ -703,15 +712,23 @@ namespace IPC {
 		// (cell-load bursts — the risky path). A single-part upload every frame is the
 		// steady animated-mesh re-upload; logging it spammed the host log (partsUploaded
 		// is 0 pre-call, so the old `!= partCount` test was always true for partCount=1).
-		const bool logThis = (params.partCount > 1);
+		// Steady-stream guard (NightDaySwitch finding, 2026-07-17): a mod can dirty 200+
+		// tiny parts EVERY frame, turning this ENTER/DONE pair + flushes into a per-frame
+		// tax on the client-blocking geom RPC (part of the 6.4ms rpc= at night). Cap the
+		// stream at ~1 line/s; failures always log.
+		static LARGE_INTEGER s_lastLog = {};
+		LARGE_INTEGER nowQpc; QueryPerformanceCounter(&nowQpc);
+		const bool logThis = (params.partCount > 1)
+			&& (s_lastLog.QuadPart == 0 || msBetween(s_lastLog, nowQpc) >= 1000.0);
 		if (logThis) {
+			s_lastLog = nowQpc;
 			LOG::logline(">> [geom] geomUpload ENTER: partCount=%u size=%u availBytes=%u byteCount=%u bytes=%u p0{slot=%u rev=%u v=%u i=%u}",
 				params.partCount, vec.size(), availBytes, params.byteCount, bytes,
 				h0.slot, h0.revisionID, h0.vertexCount, h0.indexCount);
 			LOG::flush();
 		}
 		params.partsUploaded = ForgeRender::uploadGeometry(p, bytes, params.partCount);
-		if (params.partCount > 1 || params.partsUploaded != params.partCount) {
+		if (logThis || params.partsUploaded != params.partCount) {
 			LOG::logline(">> [geom] geomUpload DONE: built %u/%u", params.partsUploaded, params.partCount);
 			LOG::flush();
 		}

@@ -66,6 +66,10 @@ namespace IPC {
     // slot's shadow-caster record so its shadow stops ghosting in place. See renderprocess release
     // emit + forgerender release handler.
     constexpr std::uint16_t kGeomFlagRelease  = 0x4;
+    // NiUVController takeover: the part carries a GeomUVAnimWire key track appended AFTER its
+    // indices (uvAnimBytes in the header). The host evaluates the track from MW sim time and
+    // scrolls the UVs in-shader — the engine's per-tick vertex-UV rewrites no longer reship.
+    constexpr std::uint16_t kGeomFlagUVAnim   = 0x8;
 
     // Per-part header preceding the part's vertex+index data in the batch blob. When
     // (flags & kGeomFlagSkinned), the part's vertices are SkinnedVertexWire (stride 44)
@@ -78,8 +82,33 @@ namespace IPC {
         std::uint32_t vertexCount;   // GeomVertexWire / SkinnedVertexWire count
         std::uint32_t indexCount;    // uint16 index count (= triangleCount * 3)
         std::uint16_t numBones;      // skinned parts: bone count (<= kMaxBones); 0 otherwise
-        std::uint16_t pad2;
+        // kGeomFlagUVAnim: byte size of the GeomUVAnimWire payload (header + keys) appended
+        // after this part's indices. 0 for every other part (was pad2 — always zero on the
+        // wire, so old blobs parse identically). Both part-boundary walkers (client chunker
+        // flushGeometry, host parser uploadGeometry) add it to the part size.
+        std::uint16_t uvAnimBytes;
     };
+
+    // NiUVController key track, shipped ONCE with the mesh (appended after the part's indices;
+    // size in GeomPartWire::uvAnimBytes). Followed inline by (keyCountU + keyCountV) x
+    // {float time, float value} linear keys — U-offset track first, then V-offset. Bezier/TBC
+    // source keys are resampled to linear CLIENT-side at capture; animated TILING tracks are
+    // out of scope (no payload is shipped — those rare parts stay on the engine reship path).
+    // The host evaluates offset(t) at t = MW sim time cycled into [keyMin, keyMax] per
+    // cycleType, and applies delta = offset(t) - base (the captured verts already embed the
+    // controller's offset AT CAPTURE, carried here as baseU/baseV).
+    struct GeomUVAnimWire {
+        std::uint8_t  setIndex;      // UVController::textureSet, clamped to the captured uvSetCount-1
+        std::uint8_t  cycleType;     // 0 loop / 1 reverse (ping-pong) / 2 clamp
+        std::uint16_t keyCountU;     // U-offset linear keys following this header
+        std::uint16_t keyCountV;     // V-offset linear keys (after the U keys)
+        std::uint16_t pad;
+        float         frequency;     // TimeController frequency/phase: keyTime = t*frequency + phase
+        float         phase;
+        float         keyMin, keyMax;// TimeController low/highKeyFrame (the cycle window)
+        float         baseU, baseV;  // controller currentU/VOffset AT CAPTURE (embedded in the verts)
+    };
+    static_assert(sizeof(GeomUVAnimWire) == 32, "GeomUVAnimWire wire size");
 
     // DrawItemWire::casterFlags bits (C4d categorical shadow casters).
     // LIVE = the game says this part moves: geometry under a character subtree (NPC/creature

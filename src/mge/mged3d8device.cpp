@@ -487,6 +487,10 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
 
     // Reset scene identifiers
     sceneCount = -1;
+    // Display-frame tick for the seam's once-per-frame dev-key poll dedup
+    // (ForgeFrameAhead: the poll can run at the BeginScene(0) collect OR the
+    // EndScene(0) finish — the serial makes whichever runs first this frame win).
+    RenderProcess::onFramePresented();
     stage0Complete = false;
     waterDrawn = false;
     isFrameComplete = false;
@@ -554,6 +558,9 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
         MGE_ZoneScopedN("engPresent");
         hr = ProxyDevice::Present(a, b, c, d);
     }
+    // A0 Cut-4 probe: stamp the engine-Present return; the span to the next
+    // BeginScene(0) (MW input/sim/AI/animation — never zoned) lands in [hb] mwstart=.
+    RenderProcess::noteEnginePresentReturn();
 
 #ifdef TRACY_ENABLE
     if (g_tracyActive) g_gpuTimer.beginFrame();  // open frame F+1's GPU span
@@ -639,6 +646,14 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
 
             // Set any custom FOV and check distant water state
             if (sceneCount == 0) {
+                // Frame-ahead collect (ForgeFrameAhead): consume LAST frame's deferred
+                // host render NOW — dev-key poll + renderSceneFinish + RT copy — BEFORE
+                // frameSetupEarly opens this frame's IPC traffic (setWorldSpace, culls,
+                // flushes). No-op unless the previous kickoff deferred its finish; in
+                // every mode it owns the once-per-frame dev-key poll, so it runs on all
+                // scene-0 frames (before the earlyForgeKickoff latch reads the gates).
+                RenderProcess::onFrameAheadCollect(realDevice);
+
                 if (Configuration.ScreenFOV > 0) {
                     mwBridge->SetFOV(Configuration.ScreenFOV);
                 }
@@ -747,6 +762,12 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
             // and Finish must stay IPC-free on both channels — renderCacheDepthToMainZ is
             // pure client-side D3D9 (verified: no ipcClient traffic). Fused mode keeps the
             // exact pre-split order for a deterministic A/B.
+            //
+            // Frame-ahead (ForgeFrameAhead, early-kickoff frames only): the Finish moves
+            // to the NEXT frame's BeginScene(0) collect and this composite point only
+            // blits the previous host frame — the IPC-free window widens from scene 0 to
+            // the whole MW frame, which the early-kickoff eligibility predicate already
+            // guarantees is RPC-free on both channels.
             if (Configuration.UseAsyncHostFrame) {
                 if (!RenderProcess::kickoffPending()) {
                     RenderProcess::onStage0CompositeKickoff(realDevice);
@@ -754,7 +775,16 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
                 if (RenderProcess::ownsOpaqueWorld() && Configuration.ForgeNearDepthReplay) {
                     DistantLand::renderCacheDepthToMainZ();
                 }
-                RenderProcess::onStage0CompositeFinish(realDevice);
+                if (RenderProcess::finishDeferred()) {
+                    // Frame-ahead (ForgeFrameAhead): the host is still rendering THIS
+                    // frame — blit the PREVIOUS one from g_mainTex (zero IPC, zero
+                    // wait); the finish + copy run at the next BeginScene(0) collect.
+                    // Late/warm-up kickoffs never defer, so they fall through to the
+                    // same-frame finish below — no black frame on pipeline entry.
+                    RenderProcess::onFrameAheadBlit(realDevice);
+                } else {
+                    RenderProcess::onStage0CompositeFinish(realDevice);
+                }
             } else {
                 if (RenderProcess::ownsOpaqueWorld() && Configuration.ForgeNearDepthReplay) {
                     DistantLand::renderCacheDepthToMainZ();
@@ -1016,6 +1046,11 @@ ULONG _stdcall MGEProxyDevice::Release() {
 // Initializes distant land
 // Called after new game or load game is selected from the main menu
 void initOnLoad() {
+    // Frame-ahead backstop (ForgeFrameAhead): a quickload can reach this re-init path
+    // with the previous frame's deferred finish still pending — collect it before the
+    // load path's blocking init RPCs (renderInit/allocVec) hit the window guard.
+    RenderProcess::onFrameAheadCollect(nullptr);
+
     auto mwBridge = MWBridge::get();
 
     // Compose loading message from translated string

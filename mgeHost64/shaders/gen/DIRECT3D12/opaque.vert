@@ -976,7 +976,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.vert.fsl"
 #line 7 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.vert.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-#line 27 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 30 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(FrameData)
 {
     float4x4 viewProj;
@@ -1053,15 +1053,15 @@ STRUCT(FrameData)
 
     float4 froxelDims;
     float4 froxelZ;
-#line 103
+#line 106
 };
 
 STRUCT(BatchData)
 {
     float4x4 worlds[ 1024 ];
-#line 108
+#line 111
 };
-#line 129 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 132 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(LightData)
 {
     float4 lightParams;
@@ -1077,7 +1077,7 @@ STRUCT(LightData)
 
     float4 froxelDimsNear;
     float4 froxelZNear;
-#line 144
+#line 147
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1130,8 +1130,15 @@ STRUCT(LightData)
 
 
 
+
+
+        Buffer(float4) gUVAnim :  register(t11,space1);
+
+
+
+
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 213 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 223 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 896 ] :  register(t0,space0);
 
 
@@ -1181,7 +1188,12 @@ VSOutput VS_MAIN( VSInput In )
     VSOutput Out;
 
 
-    float4x4 world = gBatch.worlds[In.DrawIndex];
+
+
+
+    uint drawIndex = In.DrawIndex & 0xFFFFu;
+    uint uvAnimId = In.DrawIndex >> 16u;
+    float4x4 world = gBatch.worlds[drawIndex];
 
 
     float4 worldPos = mul(world, float4(In.Position, 1.0f));
@@ -1189,6 +1201,11 @@ VSOutput VS_MAIN( VSInput In )
     Out.Normal = mul((float3x3)world, In.Normal);
     Out.WorldPos = worldPos.xyz;
     Out.Uv = In.Uv;
+
+
+    if (uvAnimId != 0u) {
+        Out.Uv += gUVAnim[uvAnimId].xy;
+    }
 
     Out.TexIndex = In.TexAlpha & 0xFFFFu;
     Out.AlphaRef = float((In.TexAlpha >> 16u) & 0xFFu) * (1.0f / 255.0f);

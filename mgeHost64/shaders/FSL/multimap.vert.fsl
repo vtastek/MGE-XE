@@ -19,7 +19,7 @@ STRUCT(VSInput)
     DATA(float2, Uv1,        TEXCOORD1);   // per-vertex UV set 1
     DATA(float2, Uv2,        TEXCOORD2);   // per-vertex UV set 2
     DATA(float2, Uv3,        TEXCOORD3);   // per-vertex UV set 3
-    DATA(uint,   Meta,       TEXCOORD4);   // per-instance: DrawIndex(0-7)|stageCount(8-10)|vColSource(11-12)|alphaRef*255(16-23)
+    DATA(uint,   Meta,       TEXCOORD4);   // per-instance: DrawIndex(0-9)|stageCount(10-12)|vColSource(13-14)|alphaRef*255(16-23)|uvAnimId(24-31)
     DATA(uint4,  Stages,     TEXCOORD5);   // per-instance: 4 packed stage words (texIndex(16)|uvSet(16-17)|op(18-19))
     DATA(float3, MatDiffuse, TEXCOORD6);   // per-instance: material diffuse rgb
     DATA(float3, MatAmbient, TEXCOORD7);   // per-instance: material ambient rgb
@@ -50,9 +50,15 @@ VSOutput VS_MAIN( VSInput In )
     INIT_MAIN;
     VSOutput Out;
 
-    uint drawIndex = In.Meta & 0xFFu;
+    // Meta layout (kMaxMultiMap=1024 widened the index to 10 bits):
+    //   idx(0-9) | stageCount(10-12) | vColSource(13-14) | alphaRef*255(16-23) | uvAnimId(24-31)
+    uint drawIndex  = In.Meta & 0x3FFu;
+    uint stageCount = (In.Meta >> 10u) & 0x7u;
+    uint vColSource = (In.Meta >> 13u) & 0x3u;
+    uint alphaRefB  = (In.Meta >> 16u) & 0xFFu;
+    uint uvAnimId   = (In.Meta >> 24u) & 0xFFu;
     // Cbuffer matrices are column-major (DXC default), so mul(M, v) with the D3DX bytes
-    // uploaded as-is == D3DX v*M. The worlds buffer is ONE 256-matrix window for multimap.
+    // uploaded as-is == D3DX v*M. The worlds buffer is ONE 1024-matrix window for multimap.
     float4x4 world = gBatch.worlds[drawIndex];
     float4 worldPos = mul(world, float4(In.Position, 1.0f));
     Out.Position = mul(gFrameData.viewProj, worldPos);
@@ -62,13 +68,25 @@ VSOutput VS_MAIN( VSInput In )
     Out.Uv1 = In.Uv1;
     Out.Uv2 = In.Uv2;
     Out.Uv3 = In.Uv3;
+    // NiUVController takeover: host-evaluated scroll delta, applied to the controller's
+    // textureSet only (gUVAnim[id].z carries the set index).
+    if (uvAnimId != 0u) {
+        float4 anim = gUVAnim[uvAnimId];
+        uint setIdx = uint(anim.z);
+        if      (setIdx == 0u) { Out.Uv0 += anim.xy; }
+        else if (setIdx == 1u) { Out.Uv1 += anim.xy; }
+        else if (setIdx == 2u) { Out.Uv2 += anim.xy; }
+        else                   { Out.Uv3 += anim.xy; }
+    }
     Out.Color = In.Color;
     Out.MatDiffuse  = In.MatDiffuse;
     Out.MatAmbient  = In.MatAmbient;
     Out.MatEmissive = In.MatEmissive;
     Out.Stages = In.Stages;
-    // Packed = Meta>>8 = stageCount(0-2)|vColSource(3-4)|alphaRef*255(8-15).
-    Out.Packed = In.Meta >> 8u;
+    // Packed keeps the LEGACY interpolator layout — stageCount(0-2)|vColSource(3-4)|
+    // alphaRef*255(8-15) — repacked explicitly from the new Meta bits, so multimap.frag /
+    // depthonly_mm.frag are byte-for-byte unchanged.
+    Out.Packed = stageCount | (vColSource << 3u) | (alphaRefB << 8u);
     // MW near fog (per-vertex, matches opaque.vert).
     float dist = length(worldPos.xyz - gFrameData.eyePos.xyz);
     Out.Fog = saturate((gFrameData.fogParams.y - dist)
