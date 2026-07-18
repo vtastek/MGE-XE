@@ -31,6 +31,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <unordered_set>
 #include <vector>
 
 namespace MGE::GeometryCache {
@@ -77,6 +78,12 @@ namespace MGE::GeometryCache {
         const char*       g_nullBoneSampleTex     = nullptr; // a sample part's texture
 
         std::unordered_map<uint32_t, CachedGeometry>      g_cache;
+        // Offscreen shadow-caster candidate keys — the subset of g_cache whose entry passes the
+        // pre-distance mover filter (skinned / multimap head / rigid LIVE). Maintained incrementally
+        // (updateMoverMembership at capture/reclassify; erased at every g_cache erase/clear) so the
+        // Forge feed's offscreen re-emit loop iterates this instead of scanning the whole cache each
+        // frame. Exposed via moverCandidates(). Invariant: g_moverCandidates ⊆ keys(g_cache).
+        std::unordered_set<uint32_t>                      g_moverCandidates;
         // STRONG reference to every cached NiTriShape, keyed exactly like g_cache.
         //
         // The cache KEY IS THE RAW ADDRESS of the shape, and ensureLive() dereferences that address
@@ -1320,6 +1327,35 @@ namespace MGE::GeometryCache {
             return false;
         }
 
+        // Offscreen shadow-caster PRE-DISTANCE predicate — a byte-for-byte mirror of the filter in
+        // renderprocess.cpp buildGeometryDrawLists' offscreen re-emit loop, MINUS the per-frame parts
+        // (distance, visible-set, suppressedFrame, want-flags), which the consumer keeps. It reads only
+        // capture-time classification fields, so membership changes only when those are (re)computed.
+        // Keep in exact sync with that loop; a mesh that is a candidate there MUST be a candidate here.
+        bool isMoverCandidate(const CachedGeometry& e) {
+            if (e.isSky || e.isFP) return false;
+            const bool isMM = !e.isLandscape && !e.blendEnable && e.d3dTexture
+                              && (e.d3dDark || e.d3dDetail || e.d3dGlow);
+            if (e.isSkinned) {
+                return !(e.skinnedUnsupported || e.numBones == 0);
+            }
+            if (isMM) {
+                return true;
+            }
+            if (e.isLive && !e.blendEnable && !e.isLandscape) {
+                if (!e.d3dTexture && e.isPickRoot) return false;   // collision proxies only
+                return true;
+            }
+            return false;
+        }
+
+        // Add/drop the key from the candidate set to match the entry's current classification.
+        // Called wherever an entry's classification fields are (re)computed.
+        void updateMoverMembership(uint32_t key, const CachedGeometry& e) {
+            if (isMoverCandidate(e)) g_moverCandidates.insert(key);
+            else                     g_moverCandidates.erase(key);
+        }
+
         void visitGeometry(NI::TriBasedGeometry* geom, bool inCharacter) {
             auto* data = geom->getModelData().get();
             if (!data) return;
@@ -1492,6 +1528,11 @@ namespace MGE::GeometryCache {
                     e.mirrored = computeMirrored(e);
                 }
             }
+            // Mover-candidate membership: the entry (new or refreshed) is now fully classified.
+            // Covers full-walk capture/refresh AND ensureLive's first-sight lazy capture (which
+            // routes through here). The ensureLive REFRESH path re-checks separately on reclassify.
+            auto mit = g_cache.find(key);
+            if (mit != g_cache.end()) updateMoverMembership(key, mit->second);
         }
 
         // bypassCull skips the entry's own app-cull check. Used for a NiSwitchNode's
@@ -2180,6 +2221,7 @@ namespace MGE::GeometryCache {
                     g_evictedKeys.push_back(it->first);   // tell the Forge feed to release the host slot
                     releaseEntry(e);
                     g_geomRefs.erase(it->first);          // key leaving the cache → drop the engine ref
+                    g_moverCandidates.erase(it->first);   // key leaving the cache → drop the candidate
                     it = g_cache.erase(it);
                 } else {
                     ++it;
@@ -2260,6 +2302,10 @@ namespace MGE::GeometryCache {
         return g_cache;
     }
 
+    const std::unordered_set<uint32_t>& moverCandidates() {
+        return g_moverCandidates;
+    }
+
     void emissiveForDraw(const CachedGeometry& e, float* out) {
         if (Configuration.ForgeEmissiveBoost) {
             out[0] = e.matEmissive[0] * e.emissiveGain[0];
@@ -2301,6 +2347,7 @@ namespace MGE::GeometryCache {
             releaseEntry(kv.second);
         }
         g_cache.clear();
+        g_moverCandidates.clear();   // whole cache dropped → no candidates survive
         g_geomRefs.clear();   // NI::Pointer dtors → DecRef every shape we were pinning
     }
 
@@ -2330,6 +2377,7 @@ namespace MGE::GeometryCache {
             releaseEntry(it->second);
             g_cache.erase(it);
             g_geomRefs.erase(key);   // key leaving the cache → drop the engine ref
+            g_moverCandidates.erase(key);   // stale entry gone; re-capture below re-adds if applicable
             it = g_cache.end();
         }
 
@@ -2367,10 +2415,15 @@ namespace MGE::GeometryCache {
         NI::SkinInstance* si = geom->skinInstance.get();
         NI::SkinData*     sd = si ? si->skinData.get() : nullptr;
         const bool sk = (si && sd && si->bones);
+        // Only a re-extract/re-upload can change the mover classification (skin state, blend,
+        // multimap maps) — a plain pose refresh cannot. Track it so the membership update stays
+        // off the hot per-visible-key path unless something actually reclassified.
+        bool reclassified = false;
         if (sk) {
             if (data->revisionID != e.revisionID || !e.isSkinned) {
                 extractMaterial(e, geom);
                 buildSkinnedVB(e, geom, data, si, sd);
+                reclassified = true;
             }
             if (!e.skinnedUnsupported) buildBonePalette(e, geom, si, sd);
             buildD3DTransform(e.worldTransformD3D, geom);
@@ -2382,6 +2435,7 @@ namespace MGE::GeometryCache {
                 extractMaterial(e, geom);
                 uploadEntry(e, geom, data, key);
                 g_walkingLandscape = false;
+                reclassified = true;
             }
             float newTransform[16];
             buildD3DTransform(newTransform, geom);
@@ -2393,6 +2447,7 @@ namespace MGE::GeometryCache {
                 --e.dynamicHint;
             }
         }
+        if (reclassified) updateMoverMembership(key, e);
         return &e;
     }
 

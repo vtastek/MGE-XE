@@ -93,8 +93,23 @@ namespace {
     // own cost (kickoff prep + residual wait + copy + blit), so feed is comparable across
     // fused/async modes and IS the perf baseline once the wait bucket collapses.
     constexpr unsigned kHeartbeatFrames = 300;
-    struct Accum { double feed, geom, build, render, host, overlap, copy, blit, dt, mwstart; double maxFeed, maxDt; double captured; unsigned n, earlyN, pipeN; };
+    struct Accum { double feed, geom, build, render, host, overlap, copy, blit, dt, mwstart; double maxFeed, maxDt; double captured; unsigned n, earlyN, pipeN;
+                   double bEnsure, bEmit, bTail, bTailEnsure, bTailScan, bTailAlpha; double bKeys; };   // Phase 0: build-split sub-probe
     Accum g_hb = {};
+
+    // Phase 0 build sub-probe: decompose buildGeometryDrawLists' cost (the main-thread `build=`
+    // bucket) into ensureLive (live NiTriShape read — immovable, must stay main) vs emit/dispatch
+    // (our own scratch memory — a worker-offload candidate) vs the tail (offscreen casters + pose
+    // refresh + alpha sort/pack). Decision gate: emit ≥ ~2ms ⇒ the emit→worker offload is worth it.
+    // buildGeometryDrawLists writes these; the kickoff copies them into g_kick so accumFrameStats
+    // reads them skew-free alongside build= (same 1-frame pipelined discipline as tBuild).
+    double g_lastBuildEnsureLiveMs = 0.0;
+    double g_lastBuildEmitMs       = 0.0;
+    double g_lastBuildTailMs       = 0.0;
+    double g_lastBuildTailEnsureMs = 0.0;   // live pose-refresh subset of the tail (immovable)
+    double g_lastBuildTailScanMs   = 0.0;   // offscreen-caster full-cacheMap scan subset of the tail
+    double g_lastBuildTailAlphaMs  = 0.0;   // alpha merge/sort/pack subset of the tail
+    std::uint32_t g_lastBuildKeys  = 0;
 
     // Upload cost accounting (Part A). Two accumulators: g_upFrame is THIS frame's per-category
     // reship cost (parts + bytes), read into lighting[33..34] when the kickoff builds the frame
@@ -130,6 +145,7 @@ namespace {
         std::size_t geomBytes, texBytes;
         double dtPresent;
         double tStart, tGeomFlush, tBuild, tTexFlush, tAssign, tKick;
+        double bEnsure, bEmit, bTail, bTailEnsure, bTailScan, bTailAlpha; std::uint32_t bKeys;   // Phase 0 build-split sub-probe
     };
     KickState g_kick = {};
 
@@ -1532,6 +1548,16 @@ namespace {
         skinnedCount = 0;
         multiMapCount = 0;
         alphaCount = 0;
+        // Phase 0 sub-probe accumulators (published to g_lastBuild* below; ~20-30ns/call QPC tax).
+        // tailEnsureMs = the tail's LIVE near-actor pose-refresh ensureLive (immovable, subset of
+        // tailMs); tailMs - tailEnsureMs is the worker-safe part of the tail (cached caster re-emit
+        // + alpha sort/pack). movable = emit + (tail - tailEnsure); immovable = ensureLive + tailEnsure.
+        double ensureLiveMs = 0.0, emitMs = 0.0, tailMs = 0.0, tailEnsureMs = 0.0;
+        // Tail sub-probe: is the fixed ~1.1ms tail the offscreen-caster full-cacheMap scan
+        // (tailScanMs — the @1694 for-loop over EVERY cached entry) or the alpha merge/sort/pack
+        // (tailAlphaMs)? The scan is the reduce-directly candidate (near-caster spatial list).
+        double tailScanMs = 0.0, tailAlphaMs = 0.0;
+        std::uint32_t visitedKeys = 0;
         // Cut 2B fold: on fold frames buildFrustumVisibleSet deferred its ensureLive
         // loop here (foldVisibleKeys = the raw classify set) instead of running it AND
         // having this function re-hash the same keys — ONE pass does live-freshen +
@@ -1562,6 +1588,13 @@ namespace {
             g_capIdxScratch.clear();
             g_capTexMemo.clear();
             g_alphaDedup.clear();
+            g_lastBuildEnsureLiveMs = 0.0;   // Phase 0: idle frame did no build work
+            g_lastBuildEmitMs       = 0.0;
+            g_lastBuildTailMs       = 0.0;
+            g_lastBuildTailEnsureMs = 0.0;
+            g_lastBuildTailScanMs   = 0.0;
+            g_lastBuildTailAlphaMs  = 0.0;
+            g_lastBuildKeys         = 0;
             return;
         }
 
@@ -1637,11 +1670,14 @@ namespace {
 
         if (foldKeys) {
             for (std::uint32_t key : *foldKeys) {
+                ++visitedKeys;
                 // Freshen (or lazily capture) straight off the live NiTriShape — a
                 // classify key is engine-drawn THIS frame, so the pointer is valid by
                 // construction. MUST run before the g_keySlot probe: a first-sight key
                 // has no slot until ensureLive's capture registers it (same frame).
+                const double te0 = nowMs();
                 const auto* e = MGE::GeometryCache::ensureLive(key);
+                ensureLiveMs += nowMs() - te0;
                 if (!e) continue;                     // no model data / capture failed
                 // The unusable-skinned filter buildFrustumVisibleSet applies on
                 // non-fold frames (never drawn; trips the bound helper).
@@ -1650,10 +1686,13 @@ namespace {
                 if (ks == g_keySlot.end()) {
                     continue;   // not an uploaded part (or not yet shipped)
                 }
+                const double td0 = nowMs();
                 dispatch(ks->second, *e);
+                emitMs += nowMs() - td0;
             }
         } else {
             for (std::uint32_t key : keys) {
+                ++visitedKeys;
                 auto ks = g_keySlot.find(key);
                 if (ks == g_keySlot.end()) {
                     continue;   // not an uploaded part (or not yet shipped)
@@ -1662,7 +1701,9 @@ namespace {
                 if (ce == cacheMap.end()) {
                     continue;   // evicted since the visible-set build
                 }
+                const double td0 = nowMs();
                 dispatch(ks->second, ce->second);
+                emitMs += nowMs() - td0;
             }
         }
 
@@ -1680,6 +1721,7 @@ namespace {
         // to the visible set. A lastFrame de-dup would then skip the offscreen NPC on exactly
         // those frames while the main loop also skips it → the caster blinks every ~30 frames (the
         // tradehouse pulsing). Visible-set membership is immune to that stamping.
+        const double tail0 = nowMs();   // Phase 0: offscreen casters + pose refresh + alpha sort/pack
         if (wantSkinned || wantMM || wantStatic) {
             static std::unordered_set<std::uint32_t> s_visLookup;
             s_visLookup.clear();
@@ -1691,9 +1733,17 @@ namespace {
             const float r2 = kShadowCasterRadius * kShadowCasterRadius;
             const std::uint64_t cacheFrame = MGE::GeometryCache::currentFrame();
             std::uint32_t suppressSkips = 0;
-            for (const auto& kv : cacheMap) {
-                const auto& e = kv.second;
-                if (s_visLookup.count(kv.first)) continue;  // in the visible set → already emitted above
+            // Iterate the cache's maintained mover-candidate set (skinned / multimap head / rigid
+            // LIVE) instead of the WHOLE cache — the offscreen re-emit only ever cared about that
+            // subset, and the full-map scan was the fixed ~1ms tail the build sub-probe pinned down.
+            // The set is a want-flag-independent SUPERSET, so the per-frame filter below runs
+            // unchanged (belt-and-braces: any key still fails exactly as it did in the full scan).
+            const auto& moverKeys = MGE::GeometryCache::moverCandidates();
+            for (std::uint32_t mkey : moverKeys) {
+                auto cit = cacheMap.find(mkey);
+                if (cit == cacheMap.end()) continue;        // set ⊆ cache invariant; guard anyway
+                const auto& e = cit->second;
+                if (s_visLookup.count(mkey)) continue;      // in the visible set → already emitted above
                 if (e.isSky) continue;
                 if (e.isFP) continue;   // FP arms: dedicated host FP pass, never a world caster (FP1a)
                 // FP0: entries the engine appCulled this frame (the 1st-person player's
@@ -1735,12 +1785,13 @@ namespace {
                 const float dy = c.y - DistantLand::eyePos.y;
                 const float dz = c.z - DistantLand::eyePos.z;
                 if (dx * dx + dy * dy + dz * dz > r2) continue;
-                auto ks = g_keySlot.find(kv.first);
+                auto ks = g_keySlot.find(mkey);
                 if (ks == g_keySlot.end()) continue;       // never uploaded a host slot
                 if (g_shadowLiveNearActors) {
                     // Defer: these near movers get a live pose refresh AFTER the loop (ensureLive
-                    // must not mutate cacheMap while we iterate it). kind: 0 skinned, 1 MM, 2 rigid.
-                    s_reEmitRefresh.push_back({ kv.first, (std::uint8_t)(e.isSkinned ? 0 : isMM ? 1 : 2) });
+                    // must not mutate cacheMap / the candidate set while we iterate it). kind: 0
+                    // skinned, 1 MM, 2 rigid.
+                    s_reEmitRefresh.push_back({ mkey, (std::uint8_t)(e.isSkinned ? 0 : isMM ? 1 : 2) });
                 } else {
                     if (e.isSkinned)    emitSkinnedDraw(ks->second, e, skinnedCount);
                     else if (isMM)      emitMultiMapDraw(ks->second, e, multiMapCount);
@@ -1752,7 +1803,9 @@ namespace {
             // from the CURRENT skeleton pose (skips VB/material unless the mesh revision changed),
             // so the offscreen shadow tracks every frame instead of snapping on the 30-frame sweep.
             for (const auto& rc : s_reEmitRefresh) {
+                const double tpr0 = nowMs();   // Phase 0: live pose-refresh ensureLive (immovable)
                 const auto* fr = MGE::GeometryCache::ensureLive(rc.key);
+                tailEnsureMs += nowMs() - tpr0;
                 if (!fr) continue;                          // key gone/out-of-domain → skip (no stale fallback)
                 auto ks = g_keySlot.find(rc.key);
                 if (ks == g_keySlot.end()) continue;
@@ -1774,6 +1827,8 @@ namespace {
                 s_supRunMax = 0;
             }
         }
+        const double tScanEnd = nowMs();   // Phase 0: offscreen-caster scan done; alpha merge/sort next
+        tailScanMs = tScanEnd - tail0;
 
         // AT3: merge the captured blended DIPs (particles/smoke/flames + multimap/decal/untextured
         // blends the host cache pass doesn't own) captured LAST frame (g_capRecs) into the SAME
@@ -1850,6 +1905,19 @@ namespace {
             g_capVertScratch.clear();
             g_capIdxScratch.clear();
         }
+
+        // Phase 0: publish the build-split. tailMs covers the offscreen-caster re-emit + live
+        // near-actor pose refresh + alpha merge/sort/pack (everything after the two main loops).
+        const double tBuildEnd = nowMs();
+        tailMs = tBuildEnd - tail0;
+        tailAlphaMs = tBuildEnd - tScanEnd;   // alpha merge + sort + pack (worker-safe, but not the scan)
+        g_lastBuildEnsureLiveMs = ensureLiveMs;
+        g_lastBuildEmitMs       = emitMs;
+        g_lastBuildTailMs       = tailMs;
+        g_lastBuildTailEnsureMs = tailEnsureMs;
+        g_lastBuildTailScanMs   = tailScanMs;
+        g_lastBuildTailAlphaMs  = tailAlphaMs;
+        g_lastBuildKeys         = visitedKeys;
     }
 
     // Tier 3a: gather this frame's point lights into g_lightScratch as PointLightWire[]. Source is
@@ -2698,6 +2766,9 @@ namespace RenderProcess {
         g_hb.copy += (fr.tCopy - fr.tRender); g_hb.blit += blitMs; g_hb.dt += g_kick.dtPresent;
         g_hb.mwstart += g_pendingMwStart; g_pendingMwStart = 0.0;   // A0 Cut-4 probe (1-frame skew on deferred frames)
         g_hb.captured += g_kick.capturedCount;
+        g_hb.bEnsure += g_kick.bEnsure; g_hb.bEmit += g_kick.bEmit; g_hb.bTail += g_kick.bTail;   // Phase 0 build-split
+        g_hb.bTailEnsure += g_kick.bTailEnsure; g_hb.bKeys += g_kick.bKeys;
+        g_hb.bTailScan += g_kick.bTailScan; g_hb.bTailAlpha += g_kick.bTailAlpha;
         if (feed > g_hb.maxFeed) g_hb.maxFeed = feed;
         if (g_kick.dtPresent > g_hb.maxDt) g_hb.maxDt = g_kick.dtPresent;
         if (g_kick.early) ++g_hb.earlyN;
@@ -2716,6 +2787,22 @@ namespace RenderProcess {
                          g_hb.captured / g_hb.n,
                          g_hb.maxFeed, g_hb.maxDt,
                          g_hb.dt > 0.0 ? 1000.0 * g_hb.n / g_hb.dt : 0.0);
+            // Phase 0 build sub-probe: how much of build= is ensureLive (immovable live read)
+            // vs emit (worker-offload candidate) vs tail. Gate: emit ≥ ~2ms ⇒ emit→worker worth it.
+            // movable = emit + (tail - tailEnsure); immovable = ensureLive + tailEnsure (live reads).
+            LOG::logline(">> [hb] build split: ensureLive=%.2f emit=%.2f tail=%.2f (tailLive=%.2f) ms "
+                         "=> movable=%.2f immovable=%.2f (keys=%u)",
+                         g_hb.bEnsure / g_hb.n, g_hb.bEmit / g_hb.n, g_hb.bTail / g_hb.n,
+                         g_hb.bTailEnsure / g_hb.n,
+                         (g_hb.bEmit + g_hb.bTail - g_hb.bTailEnsure) / g_hb.n,
+                         (g_hb.bEnsure + g_hb.bTailEnsure) / g_hb.n,
+                         (unsigned)(g_hb.bKeys / g_hb.n));
+            // Tail sub-probe: scan = offscreen-caster full-cacheMap loop (@1694, direct-reduce
+            // candidate); alpha = merge/sort/pack. tailLive is the scan's live pose-refresh subset.
+            LOG::logline(">> [hb] tail split: scan=%.2f alpha=%.2f ms (scan-live=%.2f => scan-scanwork=%.2f)",
+                         g_hb.bTailScan / g_hb.n, g_hb.bTailAlpha / g_hb.n,
+                         g_hb.bTailEnsure / g_hb.n,
+                         (g_hb.bTailScan - g_hb.bTailEnsure) / g_hb.n);
             // Part A: per-frame host-geom upload cost, broken down by cause over the same window.
             // parts/frame + KB/frame per category; skin=NPC/creature, morph=pos rewrite (morphing
             // statics + particle regen), uvleak should stay ~0 after the UVController takeover.
@@ -2740,10 +2827,16 @@ namespace RenderProcess {
         }
 
         if (feed >= kSpikeMs) {
-            LOG::logline("!! [spike] frame %u feed=%.2fms (geomflush=%.2f build=%.2f texflush=%.2f "
+            // Overlap diagnosis: early = kickoff fired at BeginScene(0) (vs late EndScene); defer =
+            // frame-ahead deferred its finish to the next collect; pipe = this stat came from the
+            // deferred collect path. A slow frame with early=0/defer=0 ran FUSED (host fully exposed
+            // → the overlap was never armed); early=1/defer=1 but render≈host means the host GPU
+            // simply outran the MW overlap window (host-bound — needs host shrink or earlier kick).
+            LOG::logline("!! [spike] frame %u feed=%.2fms early=%u defer=%u pipe=%u (geomflush=%.2f build=%.2f texflush=%.2f "
                          "assign=%.2f render=%.2f[host=%.2f] overlap=%.2f copy=%.2f blit=%.2f) "
                          "draws=%u skin=%u mm=%u light=%u alpha=%u cap=%u geom+=%u/%uKB tex+=%u/%uKB dt=%.2fms",
                          g_kick.frame, feed,
+                         (unsigned)g_kick.early, (unsigned)g_kick.deferFinish, (unsigned)pipelined,
                          g_kick.tGeomFlush - g_kick.tBuild, g_kick.tBuild - g_kick.tStart,
                          g_kick.tTexFlush - g_kick.tGeomFlush, g_kick.tAssign - g_kick.tTexFlush,
                          renderBucket, fr.hostMs, fr.overlap, fr.tCopy - fr.tRender, blitMs,
@@ -3314,6 +3407,13 @@ namespace RenderProcess {
         g_kick.tTexFlush     = tTexFlush;
         g_kick.tAssign       = tAssign;
         g_kick.tKick         = nowMs();
+        g_kick.bEnsure       = g_lastBuildEnsureLiveMs;   // Phase 0 build-split (skew-free w/ tBuild)
+        g_kick.bEmit         = g_lastBuildEmitMs;
+        g_kick.bTail         = g_lastBuildTailMs;
+        g_kick.bTailEnsure   = g_lastBuildTailEnsureMs;
+        g_kick.bTailScan     = g_lastBuildTailScanMs;
+        g_kick.bTailAlpha    = g_lastBuildTailAlphaMs;
+        g_kick.bKeys         = g_lastBuildKeys;
     }
 
     void onStage0CompositeFinish(IDirect3DDevice9* device) {
