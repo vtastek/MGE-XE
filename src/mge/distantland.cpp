@@ -351,7 +351,10 @@ void DistantLand::renderStage0() {
         // CACHE-ONLY : cacheOpaqueMode=1, cacheOnlyMode=1 (only cache draws scene 0; rest black)
         if (!cacheOpaqueMode) {
             cacheOpaqueMode = true;  cacheOnlyMode = false;
-            StatusOverlay::setStatus("Opaque source: CACHE (MGE-driven)");
+            // NOTE: CACHE mode is the obsolete pre-DX12 opaque-cache attempt, superseded by the
+            // Forge takeover. The DX9 mirror VB it drew is no longer built (needMirror() excludes
+            // cacheOpaqueMode), so this now renders empty — kept only as an inert legacy toggle.
+            StatusOverlay::setStatus("Opaque source: CACHE (legacy/empty — superseded by Forge)");
         } else if (!cacheOnlyMode) {
             cacheOnlyMode = true;
             StatusOverlay::setStatus("Opaque source: CACHE-ONLY (cache coverage; rest suppressed)");

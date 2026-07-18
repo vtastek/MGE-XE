@@ -40,6 +40,12 @@ namespace MGE::GeometryCache {
         float    aabbMin[3];
         float    aabbMax[3];
         uint16_t revisionID;            // GeometryData::revisionID at last upload
+        // Forge-mode "already shipped to host" sentinel. In default Forge play the dead DX9
+        // mirror VB (e.vb) is no longer built (needMirror() false), so its pointer can no
+        // longer serve as uploadEntry's content-identity gate "already uploaded" proxy. Set
+        // true at the end of a capture (uploadEntry/buildSkinnedVB); cleared in releaseEntry
+        // (topo change / eviction => must re-process + re-ship).
+        bool     hostUploaded = false;
         bool     isSkinned;
         // Skinned: per-frame bone palette (model->world, 16 floats per bone) and
         // bone count. skinnedUnsupported set when numBones exceeds the shader palette
