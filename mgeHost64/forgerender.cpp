@@ -1354,6 +1354,10 @@ namespace {
         Pipeline*      pAlphaShadowPrepassPipelineBack = nullptr;    // cull BACK, FRONT_FACE_CCW
         Pipeline*      pAlphaShadowPrepassPipelineBackMirror = nullptr; // cull BACK, FRONT_FACE_CW
         DescriptorSet* pAlphaShadowMaskSet = nullptr;   // ShadowMaskSrtData PerBatch: gShadowLinDepth = pAlphaShadowDepth
+        // First-person shadow RECEPTION is a DIRECT cube-atlas test in opaque.frag (fpShadowVisibility),
+        // driven by the FP frame's alphaShadowParams.y flag + gShadowParams/gShadowAtlas bound in
+        // pPerFrameSetFP. No FP-specific mask/depth/PSO resources — the earlier screen-space scratch-mask
+        // (arm invViewProj reconstruction) mangled isolated near-plane arm pixels and is gone.
         Buffer*        pAlphaWorldsBuf = nullptr;          // gBatch: one 64KB world window (kMaxAlphaDraws x 64B)
         DescriptorSet* pPerBatchSetAlpha = nullptr;        // gBatch bound to pAlphaWorldsBuf, 1 instance
         Buffer*        pAlphaInstanceBuf = nullptr;        // per-draw instance VB (kStaticInstU32 slots), CPU-mapped
@@ -2539,6 +2543,8 @@ namespace {
             sp.pData = nullptr;
             sp.ppBuffer = &g_live.pShadowMaskParamsCbv;
             addResource(&sp, nullptr);
+            // (First-person shadow reception reuses THIS pShadowMaskParamsCbv directly — the arm
+            // path needs no invViewProj, so there's no second FP params cbuffer.)
 
             // P1.5: the face pass's own world window + instance VB (decouples casters from the
             // camera-culled batch windows; the gather refills both from lastWorld records).
@@ -2797,6 +2803,9 @@ namespace {
                 std::printf("[forge] addPipeline(opaque prepass noAT mirror) FAILED\n");
                 return false;
             }
+
+            // (First-person shadow reception no longer needs its own depth PSOs — it's a direct
+            // cube-atlas test in the FP colour frag, not a screen-space arm-depth prepass.)
         }
 
         // --- P1 shadow-face PSOs: opaque.vert + depthonly.frag (alpha-tested casting free)
@@ -3060,7 +3069,7 @@ namespace {
             // (pAOBlur), not raw pAO; pAOBlur's per-frame UAV<->SHADER_RESOURCE ping-pong (renderScene)
             // leaves it SHADER_RESOURCE before the colour pass samples it. (Raw pAO still feeds the
             // blur as an SRV, and the DebugTextures/readback paths still inspect pAO directly.)
-            DescriptorData p[8] = {};
+            DescriptorData p[9] = {};
             p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
             p[0].ppBuffers = &g_live.pFrameCbv;
             p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -3113,6 +3122,13 @@ namespace {
                 p[np].mIndex = SRT_RES_IDX(SrtData, PerFrame, gShadowAtlasDyn);
                 p[np].mCount = 1;
                 p[np].ppTextures = &g_live.pShadowAtlasDyn->pTexture;
+                ++np;
+            }
+            // FP direct-atlas shadow reception: the per-slot params. Read only by opaque.frag's
+            // first-person path (alphaShadowParams.y set); bound here so the shared set is valid.
+            if (g_live.pShadowMaskParamsCbv) {
+                p[np].mIndex = SRT_RES_IDX(SrtData, PerFrame, gShadowParams);
+                p[np].ppBuffers = &g_live.pShadowMaskParamsCbv;
                 ++np;
             }
             updateDescriptorSet(R, 0, g_live.pPerFrameSet, np, p);
@@ -4393,7 +4409,7 @@ namespace {
             if (!g_live.pPerFrameSetReflect || !g_live.pPerBatchSetReflectSky) { return false; }
             {
                 Texture* vol = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
-                DescriptorData p[7] = {};
+                DescriptorData p[8] = {};
                 p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
                 p[0].ppBuffers = &g_live.pReflectFrameCbv;
                 p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -4410,6 +4426,11 @@ namespace {
                 if (g_live.pUVAnimBuf) {   // type-valid bind (reflect draws stamp id 0 = never read)
                     p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gUVAnim);
                     p[rn].mCount = 1; p[rn].ppBuffers = &g_live.pUVAnimBuf;
+                    ++rn;
+                }
+                if (g_live.pShadowMaskParamsCbv) {   // gShadowParams: type-valid bind (reflect never reads it)
+                    p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gShadowParams);
+                    p[rn].ppBuffers = &g_live.pShadowMaskParamsCbv;
                     ++rn;
                 }
                 updateDescriptorSet(R, 0, g_live.pPerFrameSetReflect, rn, p);
@@ -4429,7 +4450,7 @@ namespace {
             if (!g_live.pPerFrameSetReflectGeo) { return false; }
             {
                 Texture* vol = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
-                DescriptorData p[7] = {};
+                DescriptorData p[8] = {};
                 p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
                 p[0].ppBuffers = &g_live.pReflectFrameCbvGeo;
                 p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -4446,6 +4467,11 @@ namespace {
                 if (g_live.pUVAnimBuf) {   // type-valid bind (reflect-geo draws never read it)
                     p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gUVAnim);
                     p[rn].mCount = 1; p[rn].ppBuffers = &g_live.pUVAnimBuf;
+                    ++rn;
+                }
+                if (g_live.pShadowMaskParamsCbv) {   // gShadowParams: type-valid bind (reflect-geo never reads it)
+                    p[rn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gShadowParams);
+                    p[rn].ppBuffers = &g_live.pShadowMaskParamsCbv;
                     ++rn;
                 }
                 updateDescriptorSet(R, 0, g_live.pPerFrameSetReflectGeo, rn, p);
@@ -4629,6 +4655,8 @@ namespace {
                         updateDescriptorSet(R, 0, g_live.pAlphaShadowMaskSet, 5, d);
                     }
                 }
+                // (No FP shadow-mask set — first-person reception is a direct cube-atlas test in the
+                // FP colour frag, so there's no arm-depth screen-space mask dispatch.)
                 g_live.shadowReady = g_live.pShadowAtlas && g_live.pShadowAtlasDyn && g_live.pShadowMask
                                   && g_live.pShadowPipeline && g_live.pShadowPipelineMirror
                                   && g_live.pShadowPipelineNone && g_live.pShadowPipelineFront
@@ -4868,7 +4896,7 @@ namespace {
                 Texture* vol  = g_live.pWaterNormalVol ? g_live.pWaterNormalVol : g_live.pDefaultWhite;
                 Texture* refr = g_live.pRefractColor   ? g_live.pRefractColor   : g_live.pDefaultWhite;
                 Texture* lin  = g_live.pLinearDepth    ? g_live.pLinearDepth    : g_live.pDefaultWhite;
-                DescriptorData p[9] = {};
+                DescriptorData p[12] = {};
                 p[0].mIndex = SRT_RES_IDX(SrtData, PerFrame, gFrameData);
                 p[0].ppBuffers = &g_live.pFPFrameCbv;
                 p[1].mIndex = SRT_RES_IDX(SrtData, PerFrame, gAO);
@@ -4896,6 +4924,22 @@ namespace {
                 if (g_live.pUVAnimBuf) {
                     p[fpn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gUVAnim);
                     p[fpn].mCount = 1; p[fpn].ppBuffers = &g_live.pUVAnimBuf;
+                    ++fpn;
+                }
+                // FP direct-atlas shadow reception: the arms sample gShadowAtlas/gShadowAtlasDyn
+                // DIRECTLY (opaque.frag's fpShadowVisibility) using the per-slot gShadowParams. Both
+                // atlases rest in SHADER_RESOURCE after the mask pass, well before this FP pass — the
+                // same state the main set's atlas-debug bind relies on. Bound REAL here (unlike the
+                // reflect sets' type-valid fillers) because the FP frag actually reads them.
+                if (g_live.pShadowAtlas && g_live.pShadowAtlasDyn && g_live.pShadowMaskParamsCbv) {
+                    p[fpn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gShadowAtlas);
+                    p[fpn].mCount = 1; p[fpn].ppTextures = &g_live.pShadowAtlas->pTexture;
+                    ++fpn;
+                    p[fpn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gShadowAtlasDyn);
+                    p[fpn].mCount = 1; p[fpn].ppTextures = &g_live.pShadowAtlasDyn->pTexture;
+                    ++fpn;
+                    p[fpn].mIndex = SRT_RES_IDX(SrtData, PerFrame, gShadowParams);
+                    p[fpn].ppBuffers = &g_live.pShadowMaskParamsCbv;
                     ++fpn;
                 }
                 updateDescriptorSet(R, 0, g_live.pPerFrameSetFP, fpn, p);
@@ -5457,6 +5501,11 @@ namespace {
     // scratch depth so the mask pays full per-light PCF over the whole alpha coverage (waterfalls =
     // "fans loud"); higher = only solid-ish alpha pays. Default 0 = richest (user pref); raise for ms.
     float g_alphaShadowRef = 0.0f;
+    // FP2-lite: first-person arms/weapon RECEIVE point-light shadows. Off = today's behaviour
+    // (falloff.w zeroed → arms lit unshadowed). On = render FP depth into the alpha scratch, re-run
+    // shadowmask under the ARM camera, overwrite gShadowMask so the arms read their own visibility.
+    // Coverage-scaled (mask early-outs on the far-cleared scratch), so it costs only the arms' pixels.
+    bool g_fpReceiveShadows = true;
     bool g_drawReflect   = true;
     bool g_drawReflectGeo = true;   // WV2: reflect host-owned land + statics (off = sky-only reflection)
     bool g_reflHorizonScissor = true; // WV2 perf: scissor the reflect pass to below the water-plane horizon
@@ -6154,6 +6203,7 @@ namespace {
           t.sliderF("Shadow: fixture cage two-sided radius (0=off)", &g_shadowCageRadius, 0.0f, 256.0f, 4.0f);
           t.checkbox("Shadow: skinned casters (NPC bodies)", &g_shadowSkinnedCasters);
           t.checkbox("Shadow: multimap casters (NPC heads)", &g_shadowMMCasters);
+          t.checkbox("Shadow: first-person arms RECEIVE shadows", &g_fpReceiveShadows);
           t.checkbox("Shadow: rigid movers dyn-tile (hands/weapons)", &g_shadowRigidMovers);
           t.checkbox("Shadow: source-mover (dyn only if transform-animated)", &g_shadowSourceMover);
           t.sliderU("Shadow: max active lights (32 = no cap)", &g_shadowMaxActiveLights, 1, kMaxShadowLights, 1);
@@ -6907,6 +6957,10 @@ namespace ForgeRender {
             // without semi-transparent surfaces depth-killing each other. Only alphashadowdepth.frag
             // reads it. Index 124 is past froxelZ (…123), so the froxel fill never clobbers it.
             dp[124] = g_alphaShadowRef;
+            // alphaShadowParams.y (float index 125): FIRST-PERSON direct-atlas shadow flag. 0 on the
+            // main frame cbuffer so opaque.frag reads the screen-space gShadowMask; the FP frame copy
+            // sets it to 1 so the arms sample the cube atlas directly (see the FP cbuffer fill).
+            dp[125] = 0.0f;
         }
 
         // Tier 3a: upload this frame's point lights into gLights. Each PointLightWire is exactly
@@ -8269,17 +8323,31 @@ namespace ForgeRender {
         // main scene's screen-space shadow mask for FP pixels (see pFPLightCbv comment).
         const bool fpActive = fp && fp->viewProj && g_live.pPerFrameSetFP
                            && (fp->drawCount + fp->skinnedCount) > 0;
+        // FP shadow reception (DIRECT ATLAS): the arms sample the cube shadow atlas straight from
+        // their interpolated world pos + vertex normal (opaque.frag's fpShadowVisibility) — no
+        // screen-space mask, no depth reconstruction (the old scratch-mask mangled isolated arm
+        // pixels). When on, keep pFPLightCbv's real falloff.w slots so the frag knows which lights
+        // cast, and set the FP frame's alphaShadowParams.y flag; the atlases + gShadowParams are
+        // bound in pPerFrameSetFP. Needs the shadow atlas + per-slot params resident.
+        const bool fpWantShadow = fpActive && g_fpReceiveShadows && g_live.shadowReady
+                               && g_live.pShadowMaskParamsCbv
+                               && g_live.pShadowAtlas && g_live.pShadowAtlasDyn;
         if (fpActive) {
             std::memcpy(g_live.pFPFrameCbv->pCpuMappedAddress,
                         g_live.pFrameCbv->pCpuMappedAddress, 512);
             float fpRz[16];
             applyProjFixups(fpRz, fp->viewProj);
             std::memcpy(g_live.pFPFrameCbv->pCpuMappedAddress, fpRz, 16 * sizeof(float));
+            // FP direct-atlas shadow flag (alphaShadowParams.y, float index 125). 1 → opaque.frag's
+            // FP path samples the cube atlas; 0 → it would read the (wrong-for-arms) screen mask.
+            ((float*)g_live.pFPFrameCbv->pCpuMappedAddress)[125] = fpWantShadow ? 1.0f : 0.0f;
             std::memcpy(g_live.pFPLightCbv->pCpuMappedAddress,
                         g_live.pLightCbv->pCpuMappedAddress, kLightCbvBytes);
             float* flc = (float*)g_live.pFPLightCbv->pCpuMappedAddress;
-            for (uint32_t i = 0; i < g_lastLightCount; ++i) {
-                flc[4 + i * 12 + 11] = 0.0f;   // lights[i*3+2].w = shadow slot + 1 → none
+            if (!fpWantShadow) {
+                for (uint32_t i = 0; i < g_lastLightCount; ++i) {
+                    flc[4 + i * 12 + 11] = 0.0f;   // lights[i*3+2].w = shadow slot + 1 → none
+                }
             }
             // Near clustering is MAIN-VIEW only: the froxel mask was built with the main viewProj, but
             // the FP pass renders with the arm camera's viewProj, so a froxel lookup would mis-cluster
@@ -10660,33 +10728,31 @@ namespace ForgeRender {
         uint32_t fpRigidDrawn = 0, fpSkinnedDrawn = 0, fpAlphaDrawn = 0;
         gpuPhaseBegin(kGpuPhaseColorFP);
         if (fpActive && g_live.pFPOpaquePipeline && g_live.pFPSkinnedPipeline) {
-            BindRenderTargetsDesc fbind = {};
-            fbind.mRenderTargetCount = 1;
-            fbind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };
-            fbind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_CLEAR };   // MW's z-clear before FP
-            cmdBindRenderTargets(g_live.pCmd, &fbind);
-            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
-            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+            // FP2-lite: FILL the FP world/instance/bone buffers ONCE and record each draw, so the
+            // shadow-receive depth prepass and the colour pass replay the SAME records — the fill +
+            // skip logic lives in one place, and both passes reference identical instance slots.
+            struct FPRigidRec { Buffer* vb; Buffer* ib; uint32_t indexCount, firstVertex, firstIndex, idx; int mirror; };
+            struct FPSkinRec  { Buffer* vb; Buffer* ib; uint32_t indexCount, instance; int mirror; };
+            static std::vector<FPRigidRec> s_fpRigid;   // single-threaded record (renderScene)
+            static std::vector<FPSkinRec>  s_fpSkin;
+            s_fpRigid.clear();
+            s_fpSkin.clear();
 
-            // --- rigid FP parts (DrawItemWire[]) ---
+            // --- rigid FP parts (DrawItemWire[]) — FILL + RECORD ---
             if (fp->drawBlob && fp->drawCount && fp->drawBytes) {
                 const uint32_t haveFP = fp->drawBytes / (uint32_t)sizeof(IPC::DrawItemWire);
                 uint32_t nFP = (fp->drawCount < haveFP) ? fp->drawCount : haveFP;
                 if (nFP > kMaxFPDraws) { nFP = kMaxFPDraws; }
                 const IPC::DrawItemWire* fpItems = (const IPC::DrawItemWire*)fp->drawBlob;
-
-                cmdBindPipeline(g_live.pCmd, g_live.pFPOpaquePipeline);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetFP);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSetFP);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetFP);
-                int fpBoundMirror = 0;
                 for (uint32_t k = 0; k < nFP; ++k) {
                     const IPC::DrawItemWire& it = fpItems[k];
                     const uint32_t slot = it.slot;
                     if (slot >= g_meshHigh || !g_meshes[slot].valid) { continue; }
                     HostMesh& m = g_meshes[slot];
                     if (m.skinned || m.multimap) { continue; }   // rigid GeomVertexWire only
+                    Buffer*  meshVb = m.inArena ? g_live.pArenaVB : m.vb;
+                    Buffer*  meshIb = m.inArena ? g_live.pArenaIB : m.ib;
+                    if (!meshVb || !meshIb) { continue; }
                     const uint32_t idx = fpRigidDrawn;
 
                     uint8_t* wdst = (uint8_t*)g_live.pFPWorldsBuf->pCpuMappedAddress;
@@ -10706,40 +10772,18 @@ namespace ForgeRender {
                     finst[idx * kStaticInstU32 + 10] = it.matEmissive[2];
                     inst[idx * kStaticInstU32 + 11]  = 0;   // no terrain decal on arms
 
-                    const int mirror = worldMirrored(it.world) ? 1 : 0;
-                    if (mirror != fpBoundMirror) {
-                        cmdBindPipeline(g_live.pCmd, mirror ? g_live.pFPOpaquePipelineMirror
-                                                            : g_live.pFPOpaquePipeline);
-                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetFP);
-                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSetFP);
-                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetFP);
-                        fpBoundMirror = mirror;
-                    }
-                    Buffer*  meshVb = m.inArena ? g_live.pArenaVB : m.vb;
-                    Buffer*  meshIb = m.inArena ? g_live.pArenaIB : m.ib;
                     const uint32_t firstVertex = m.inArena ? (uint32_t)(m.vbOff / sizeof(IPC::GeomVertexWire)) : 0u;
                     const uint32_t firstIndex  = m.inArena ? (uint32_t)(m.ibOff / sizeof(uint16_t)) : 0u;
-                    if (!meshVb || !meshIb) { continue; }
-                    Buffer*  vbs[2]     = { meshVb, g_live.pFPInstanceBuf };
-                    uint32_t strides[2] = { vStride, iStride };
-                    cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
-                    cmdBindIndexBuffer(g_live.pCmd, meshIb, INDEX_TYPE_UINT16, 0);
-                    cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, firstIndex, 1, firstVertex, idx);
+                    s_fpRigid.push_back({ meshVb, meshIb, m.indexCount, firstVertex, firstIndex, idx,
+                                          worldMirrored(it.world) ? 1 : 0 });
                     ++fpRigidDrawn;
                 }
             }
 
-            // --- skinned FP parts ([SkinnedDrawWire][palette]*) ---
+            // --- skinned FP parts ([SkinnedDrawWire][palette]*) — FILL + RECORD ---
             if (fp->skinnedBlob && fp->skinnedCount && fp->skinnedBytes) {
-                cmdBindPipeline(g_live.pCmd, g_live.pFPSkinnedPipeline);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetFP);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSetFP);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetFPSkin);   // the ONE FP bone window
                 const uint8_t* sp   = (const uint8_t*)fp->skinnedBlob;
                 const uint8_t* sEnd = sp + fp->skinnedBytes;
-                int fpSkinMirror = 0;
                 for (uint32_t k = 0; k < fp->skinnedCount; ++k) {
                     if (sp + sizeof(IPC::SkinnedDrawWire) > sEnd) { break; }
                     IPC::SkinnedDrawWire item;
@@ -10760,23 +10804,65 @@ namespace ForgeRender {
                     sinst[fpSkinnedDrawn * 2 + 0] = base;
                     sinst[fpSkinnedDrawn * 2 + 1] = packTexAlpha(item.texIndex, item.alphaRef, 0u, item.clampMode);
 
-                    const int mirror = item.mirror ? 1 : 0;
-                    if (mirror != fpSkinMirror) {
-                        cmdBindPipeline(g_live.pCmd, mirror ? g_live.pFPSkinnedPipelineMirror
-                                                            : g_live.pFPSkinnedPipeline);
-                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetFP);
-                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSetFP);
-                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
-                        cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetFPSkin);
-                        fpSkinMirror = mirror;
-                    }
                     HostMesh& sm = g_meshes[slot];
-                    Buffer*  vbs[2]     = { sm.vb, g_live.pFPInstanceBufSkin };
+                    s_fpSkin.push_back({ sm.vb, sm.ib, sm.indexCount, fpSkinnedDrawn, item.mirror ? 1 : 0 });
+                    ++fpSkinnedDrawn;
+                }
+            }
+
+            // FP shadow reception is now a DIRECT cube-atlas test inside the colour frag
+            // (opaque.frag's fpShadowVisibility, gated by the FP alphaShadowParams.y flag) — no
+            // depth prepass and no mask refresh here. The arms read their OWN visibility from the
+            // interpolated world pos + vertex normal, so nothing has to be reconstructed.
+
+            // --- FP colour pass: MW's z-clear + draw the arms (direct-atlas shadow in the frag) ---
+            BindRenderTargetsDesc fbind = {};
+            fbind.mRenderTargetCount = 1;
+            fbind.mRenderTargets[0] = { colorTarget, LOAD_ACTION_LOAD };
+            fbind.mDepthStencil = { g_live.pDepth, LOAD_ACTION_CLEAR };   // MW's z-clear before FP
+            cmdBindRenderTargets(g_live.pCmd, &fbind);
+            cmdSetViewport(g_live.pCmd, 0.0f, 0.0f, (float)g_live.width, (float)g_live.height, 0.0f, 1.0f);
+            cmdSetScissor(g_live.pCmd, 0, 0, g_live.width, g_live.height);
+
+            if (!s_fpRigid.empty()) {
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetFP);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSetFP);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetFP);
+                cmdBindPipeline(g_live.pCmd, g_live.pFPOpaquePipeline);
+                int cMirror = 0;
+                for (const FPRigidRec& r : s_fpRigid) {
+                    if (r.mirror != cMirror) {
+                        cmdBindPipeline(g_live.pCmd, r.mirror ? g_live.pFPOpaquePipelineMirror
+                                                              : g_live.pFPOpaquePipeline);
+                        cMirror = r.mirror;
+                    }
+                    Buffer*  vbs[2]     = { r.vb, g_live.pFPInstanceBuf };
+                    uint32_t strides[2] = { vStride, iStride };
+                    cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
+                    cmdBindIndexBuffer(g_live.pCmd, r.ib, INDEX_TYPE_UINT16, 0);
+                    cmdDrawIndexedInstanced(g_live.pCmd, r.indexCount, r.firstIndex, 1, r.firstVertex, r.idx);
+                }
+            }
+
+            if (!s_fpSkin.empty()) {
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerFrameSetFP);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerLightsSetFP);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPersistentSet);
+                cmdBindDescriptorSet(g_live.pCmd, 0, g_live.pPerBatchSetFPSkin);   // the ONE FP bone window
+                cmdBindPipeline(g_live.pCmd, g_live.pFPSkinnedPipeline);
+                int csMirror = 0;
+                for (const FPSkinRec& r : s_fpSkin) {
+                    if (r.mirror != csMirror) {
+                        cmdBindPipeline(g_live.pCmd, r.mirror ? g_live.pFPSkinnedPipelineMirror
+                                                              : g_live.pFPSkinnedPipeline);
+                        csMirror = r.mirror;
+                    }
+                    Buffer*  vbs[2]     = { r.vb, g_live.pFPInstanceBufSkin };
                     uint32_t strides[2] = { (uint32_t)sizeof(IPC::SkinnedVertexWire), (uint32_t)(2 * sizeof(uint32_t)) };
                     cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
-                    cmdBindIndexBuffer(g_live.pCmd, sm.ib, INDEX_TYPE_UINT16, 0);
-                    cmdDrawIndexedInstanced(g_live.pCmd, sm.indexCount, 0, 1, 0, fpSkinnedDrawn);
-                    ++fpSkinnedDrawn;
+                    cmdBindIndexBuffer(g_live.pCmd, r.ib, INDEX_TYPE_UINT16, 0);
+                    cmdDrawIndexedInstanced(g_live.pCmd, r.indexCount, 0, 1, 0, r.instance);
                 }
             }
 
@@ -16260,6 +16346,7 @@ namespace ForgeRender {
         if (g_live.pAlphaShadowDepthShader) { removeShader(R, g_live.pAlphaShadowDepthShader); }
         if (g_live.pAlphaShadowMaskSet)     { removeDescriptorSet(R, g_live.pAlphaShadowMaskSet); }
         if (g_live.pAlphaShadowDepth)       { removeRenderTarget(R, g_live.pAlphaShadowDepth); }
+        // (First-person shadow reception is a direct cube-atlas frag test — no FP-specific resources.)
         // WT1 water teardown.
         if (g_live.pPerBatchSetWater)       { removeDescriptorSet(R, g_live.pPerBatchSetWater); }
         if (g_live.pWaterWorldsBuf)         { removeResource(g_live.pWaterWorldsBuf); }

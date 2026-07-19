@@ -977,16 +977,18 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 26 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.comp.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.srt.h"
 #line 19 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.srt.h"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
 STRUCT(ShadowMaskParams)
 {
     float4x4 invViewProj;
+
+
+
+
+
+
     float4 screenParams;
-
-
-
-
-
-
     float4 maskParams;
     float4 slotPosRad[ 32 ];
     float4 slotTile[ 32 ];
@@ -994,19 +996,17 @@ STRUCT(ShadowMaskParams)
 
 
 
-
-
-
-
-
-
     float4 biasParams;
-#line 54 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.srt.h"
+
+
+
     uint4 slotBits;
-#line 70 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.srt.h"
+
+
     float4 slotFlick[ 32 ];
-#line 71
+#line 40
 };
+#line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowmask.srt.h"
 
         CBUFFER(ShadowMaskParams) gShadowMaskParams :  register(b0,space2);
         Tex2D(float) gShadowLinDepth :  register(t1,space2);

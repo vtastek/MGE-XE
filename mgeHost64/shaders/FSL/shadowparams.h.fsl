@@ -1,0 +1,40 @@
+// mgeHost64 — shared point-light shadow SLOT params.
+//
+// The ShadowMaskParams cbuffer describes every ACTIVE shadow slot (camera-relative light
+// pos/radius, its 3x2 cube-face atlas tile, bias/flicker state). Two consumers read it:
+//   - shadowmask.comp  (ShadowMaskSrtData) — the once-per-frame screen-space mask pass.
+//   - opaque.frag      (SrtData, PerFrame gShadowParams) — the FIRST-PERSON direct-atlas path,
+//     which samples the cube atlas straight from the interpolated world pos + vertex normal
+//     (the screen mask reconstructs the WORLD behind the arm, not the arm itself).
+// Factored here so both share ONE definition — the cbuffer bytes are identical, so the host
+// binds the SAME pShadowMaskParamsCbv to either root signature.
+#pragma once
+
+#define MAX_SHADOW_SLOTS 32   // MUST match host kMaxShadowLights (forgerender.cpp)
+
+STRUCT(ShadowMaskParams)
+{
+    DATA(float4x4, invViewProj,  None);   // inverse of the reverse-Z camera-relative viewProj
+    // maskParams: x = shadow TEST RANGE in light radii (live knob, host g_shadowRangeK; 2.0 =
+    //             the atlas far plane = old behaviour). Range cull + slot test use it; the
+    //             refZ depth mapping always uses farZ = 2r (the atlas render far plane),
+    //             y = face near plane (world u),
+    //             z = relative reverse-Z compare slack (acne knob, live-tunable),
+    //             w = debug mode (0 off, 1 face-id nibble, 2 atlas-depth view)
+    DATA(float4,   screenParams, None);   // xy = screen w,h ; zw = 1/w, 1/h
+    DATA(float4,   maskParams,   None);
+    DATA(float4,   slotPosRad[MAX_SHADOW_SLOTS], None);   // xyz = camera-relative light pos, w = radius (far = 2r)
+    DATA(float4,   slotTile[MAX_SHADOW_SLOTS],   None);   // xy = 3x2 face-block origin (atlas px), z = face size (px), w = temporal fade-in
+    // biasParams: x = ABSOLUTE reverse-Z compare bias (contact/interpenetration knob, live).
+    //             y = NORMAL-OFFSET bias in atlas texels (live).
+    //             z = base-rate flame phase (diagnostic only).
+    //             w = BASE flicker wobble amplitude in radians (0 = off), scaled per slot by slotFlick.x.
+    DATA(float4,   biasParams,   None);
+    // slotBits: the 32-bit slot masks as REAL uints (float lanes drop bits >= 24).
+    //             x = ACTIVE-slot bitmask, y = DYNAMIC-slot bitmask (valid dyn tile this frame),
+    //             z = FLICKER-class bitmask, w = SOFT bitmask (reduced-res tile).
+    DATA(uint4,    slotBits,     None);
+    // Per-slot flame state (flicker slots only). x = wobble amp gain, y = flame phase (rad),
+    // z = the face-frustum uvScale this slot's tile was BAKED with (< 1 = wider than 90°), w = spare.
+    DATA(float4,   slotFlick[MAX_SHADOW_SLOTS], None);
+};
