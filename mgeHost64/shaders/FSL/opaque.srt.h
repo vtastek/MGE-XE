@@ -14,6 +14,11 @@
 // cbuffer): host uploads D3DXMATRIX bytes as-is, mul(M, v) reproduces D3DX's row-vector v*M.
 #pragma once
 
+// Point-light shadow SLOT params (slotPosRad/slotTile/bias/flicker) — the first-person forward
+// path (opaque.frag's fpShadowVisibility) samples the cube atlas directly from these; the host
+// binds the SAME pShadowMaskParamsCbv the compute mask uses into PerFrame gShadowParams.
+#include "shadowparams.h.fsl"
+
 #define OPAQUE_BATCH 1024   // matrices per 64KB cbuffer window; must match host kBatchSize
 #define MAX_TEXTURES 896    // bindless gTextures[] array size; MUST match IPC::kMaxTextures (geomwire.h)
 // Distant-statics texture residency: a descriptor-array of Texture2DArrays, one element per
@@ -206,6 +211,15 @@ BEGIN_SRT_NO_AB(SrtData)
         // PerFrame offset stays stable. Read by opaque.vert / multimap.vert only when the
         // stamped id != 0 (harmless null tail everywhere else).
         DECL_BUFFER(PerFrame, Buffer(float4), gUVAnim)
+        // First-person shadow reception (direct cube-atlas test). The FP arms are a post-composite
+        // overlay drawn under the ARM camera — the screen-space gShadowMask reconstructs the WORLD
+        // behind each arm pixel, not the arm, so opaque.frag's FP path (gFrameData.alphaShadowParams.y
+        // set) instead samples gShadowAtlas/gShadowAtlasDyn DIRECTLY using the interpolated world pos +
+        // vertex normal, driven by these per-slot params. A 2nd CBV in the set → register b1 (gFrameData
+        // is b0); textures/buffers keep their registers. Host binds the SAME pShadowMaskParamsCbv the
+        // compute mask uses (slots are camera-relative → identical for the arm view). Read only when the
+        // FP flag is set (harmless everywhere else). MUST be bound into every SrtData PerFrame instance.
+        DECL_CBUFFER(PerFrame, CBUFFER(ShadowMaskParams), gShadowParams)
     END_SRT_SET(PerFrame)
     // Point-light cbuffer — rides the otherwise-unused PerDraw set (FSL has exactly four
     // fixed update frequencies: Persistent/PerFrame/PerBatch/PerDraw; a custom set name has

@@ -9,6 +9,7 @@
 
 #include "opaque.srt.h"
 #include "texsample.h.fsl"   // sampleBase() — MW address mode + AF level
+#include "fpshadow.h.fsl"    // fpShadowVisibility() — first-person direct cube-atlas shadow test
 
 STRUCT(VSOutput)
 {
@@ -143,12 +144,22 @@ float4 PS_MAIN( VSOutput In )
                 uint slotP1 = (uint)gLights.lights[i * 3u + 2u].w;
                 if (slotP1 != 0u)
                 {
-                    uint4 mw   = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xyzw;
-                    uint  s    = slotP1 - 1u;
-                    uint  lane = s >> 3u;
-                    uint  word = lane == 0u ? mw.x : (lane == 1u ? mw.y : (lane == 2u ? mw.z : mw.w));
-                    uint  nib  = (word >> ((s & 7u) * 4u)) & 0xFu;
-                    att *= float(nib) * (1.0f / 15.0f);
+                    // First-person arms (alphaShadowParams.y set): sample the cube atlas DIRECTLY
+                    // from the true world pos + geometric vertex normal — the screen gShadowMask
+                    // holds the WORLD behind the arm, not the arm. Everything else reads the mask.
+                    if (gFrameData.alphaShadowParams.y > 0.5f)
+                    {
+                        att *= fpShadowVisibility(In.WorldPos, normalize(In.Normal), slotP1 - 1u);
+                    }
+                    else
+                    {
+                        uint4 mw   = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xyzw;
+                        uint  s    = slotP1 - 1u;
+                        uint  lane = s >> 3u;
+                        uint  word = lane == 0u ? mw.x : (lane == 1u ? mw.y : (lane == 2u ? mw.z : mw.w));
+                        uint  nib  = (word >> ((s & 7u) * 4u)) & 0xFu;
+                        att *= float(nib) * (1.0f / 15.0f);
+                    }
                 }
 
                 float  lambert = saturate(dot(N, toLight) * invDist);

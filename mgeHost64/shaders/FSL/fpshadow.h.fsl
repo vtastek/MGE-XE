@@ -1,0 +1,99 @@
+// mgeHost64 — first-person DIRECT cube-atlas shadow test (forward path).
+//
+// The first-person arms are a post-composite overlay drawn under their OWN (arm-FOV) camera. The
+// screen-space gShadowMask that opaque/multimap/alpha read reconstructs the WORLD surface behind
+// each pixel — for an arm pixel that is the wall behind the hand, not the hand — so it cannot give
+// the arm its own shadow. The earlier screen-space attempt reran shadowmask.comp over an arm-depth
+// scratch, but reconstructing P (and a depth-derived N) from isolated near-plane arm pixels
+// surrounded by cleared depth is degenerate → mangled shadows.
+//
+// This path sidesteps reconstruction entirely: the FP frag has the EXACT interpolated world
+// position and the true vertex normal, so it runs the same analytic cube-face atlas test
+// shadowmask.comp does, directly, per shadow-slotted light. Correct by construction. Arms are a
+// small screen region and few draws, so a single bilinear PCF tap (no grid/flicker/K-cap) is
+// plenty. Reads gShadowParams / gShadowAtlas / gShadowAtlasDyn — all bound in the opaque PerFrame
+// set — so this must be included AFTER opaque.srt.h.
+#pragma once
+
+// One atlas texel, clamped inside the face sub-tile. Composite the static + (if valid) dynamic
+// tile — reverse-Z nearer wins. Returns 1 = lit, 0 = shadowed. Mirrors shadowmask.comp's
+// shadowLitAt so the arm shadow matches what the world receives from the same light.
+float fpShadowLitAt(int2 tp, int2 tmin, int2 tmax, float thresh, uint dynSlot)
+{
+    tp = clamp(tp, tmin, tmax);
+    float stored = LoadTex2D(gShadowAtlas, NO_SAMPLER, tp, 0).r;
+    if (dynSlot != 0u) { stored = max(stored, LoadTex2D(gShadowAtlasDyn, NO_SAMPLER, tp, 0).r); }
+    return (stored > thresh) ? 0.0f : 1.0f;
+}
+
+// Sub-texel bilinear PCF: compare the 4 texels around the fractional atlas position and bilerp the
+// BINARY results (compare-then-filter — correct at depth discontinuities).
+float fpShadowBilinear(float2 ap, int2 tmin, int2 tmax, float thresh, uint dynSlot)
+{
+    float2 p = ap - 0.5f;                 // texel-centre space
+    int2   b = int2(floor(p));
+    float2 f = p - float2(b);
+    float s00 = fpShadowLitAt(b + int2(0, 0), tmin, tmax, thresh, dynSlot);
+    float s10 = fpShadowLitAt(b + int2(1, 0), tmin, tmax, thresh, dynSlot);
+    float s01 = fpShadowLitAt(b + int2(0, 1), tmin, tmax, thresh, dynSlot);
+    float s11 = fpShadowLitAt(b + int2(1, 1), tmin, tmax, thresh, dynSlot);
+    return lerp(lerp(s00, s10, f.x), lerp(s01, s11, f.x), f.y);
+}
+
+// Visibility 0 (shadowed) .. 1 (lit) at CAMERA-RELATIVE world pos P with surface normal N, for
+// shadow slot `slot`. P and gShadowParams.slotPosRad are both camera-relative to the SAME shift
+// eye (the FP frame subtracts DistantLand::eyePos, like the slots), so (P - slotPos) is the true
+// light->receiver vector, translation-invariant. No flicker wobble here — the arm's shadow edge
+// stays still while the world's dances; acceptable for a small overlay, and it keeps this cheap.
+float fpShadowVisibility(float3 P, float3 N, uint slot)
+{
+    float4 posRad = gShadowParams.slotPosRad[slot];
+    float4 tile   = gShadowParams.slotTile[slot];
+    float  rangeK = gShadowParams.maskParams.x;
+    float  nearZ  = gShadowParams.maskParams.y;
+    float  range  = rangeK * posRad.w;
+    float  farZ   = 2.0f * posRad.w;      // atlas render far plane (refZ mapping)
+
+    float3 ad0 = abs(P - posRad.xyz);
+    float  ma0 = max(ad0.x, max(ad0.y, ad0.z));   // Chebyshev dist, pre-offset (range + texelW)
+    if (ma0 <= nearZ || ma0 >= range) { return 1.0f; }
+
+    uint  dynSlot = (gShadowParams.slotBits.y >> slot) & 1u;
+    float uvScale = gShadowParams.slotFlick[slot].z;
+    uvScale = (uvScale > 0.01f) ? uvScale : 1.0f;   // stale/zero lane => exactly 90°
+
+    // Normal-offset bias along the TRUE vertex normal (no depth-derived normal to go degenerate),
+    // scaled by grazing angle and one atlas texel's world size — same recipe as shadowmask.comp.
+    float3 Ldir   = posRad.xyz - P;
+    float  ndotl  = dot(N, Ldir * rsqrt(max(dot(Ldir, Ldir), 1e-8f)));
+    float  sinT   = sqrt(saturate(1.0f - ndotl * ndotl));
+    float  texelW = 2.0f * ma0 / max(tile.z * uvScale, 1.0f);
+    float3 Poff   = P + N * (gShadowParams.biasParams.y * sinT * texelW);
+
+    float3 d  = Poff - posRad.xyz;
+    float3 ad = abs(d);
+    // Dominant-axis face pick + face UV — standard D3D cube order (+X -X +Y -Y +Z -Z).
+    uint face; float ma; float u; float v;
+    if (ad.x >= ad.y && ad.x >= ad.z) { ma = ad.x; face = d.x > 0.0f ? 0u : 1u;
+                                        u  = d.x > 0.0f ? -d.z :  d.z; v = -d.y; }
+    else if (ad.y >= ad.z)            { ma = ad.y; face = d.y > 0.0f ? 2u : 3u;
+                                        u  = d.x; v = d.y > 0.0f ? d.z : -d.z; }
+    else                              { ma = ad.z; face = d.z > 0.0f ? 4u : 5u;
+                                        u  = d.z > 0.0f ?  d.x : -d.x; v = -d.y; }
+    if (ma <= nearZ || ma >= range) { return 1.0f; }
+
+    float refZ   = nearZ * (farZ - ma) / (ma * (farZ - nearZ));
+    float thresh = refZ * (1.0f + gShadowParams.maskParams.z)
+                 + gShadowParams.biasParams.x + 1e-6f;
+
+    float2 faceOrg = float2(tile.x + float(face % 3u) * tile.z,
+                            tile.y + float(face / 3u) * tile.z);
+    int2   tmin    = int2(faceOrg);
+    int2   tmax    = tmin + int2((int)tile.z - 1, (int)tile.z - 1);
+    float2 fuv     = float2(u, v) / ma * (0.5f * uvScale) + 0.5f;
+    float2 ap      = faceOrg + fuv * tile.z;
+
+    float vis = fpShadowBilinear(ap, tmin, tmax, thresh, dynSlot);
+    vis = lerp(1.0f, vis, saturate(tile.w));   // temporal fade-in for a far reclaim (matches world)
+    return vis;
+}

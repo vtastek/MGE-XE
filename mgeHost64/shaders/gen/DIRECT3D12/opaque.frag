@@ -976,7 +976,38 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 #line 10 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-#line 30 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+STRUCT(ShadowMaskParams)
+{
+    float4x4 invViewProj;
+
+
+
+
+
+
+    float4 screenParams;
+    float4 maskParams;
+    float4 slotPosRad[ 32 ];
+    float4 slotTile[ 32 ];
+
+
+
+
+    float4 biasParams;
+
+
+
+    uint4 slotBits;
+
+
+    float4 slotFlick[ 32 ];
+#line 40
+};
+#line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 35 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(FrameData)
 {
     float4x4 viewProj;
@@ -1058,15 +1089,15 @@ STRUCT(FrameData)
 
 
     float4 alphaShadowParams;
-#line 111
+#line 116
 };
 
 STRUCT(BatchData)
 {
     float4x4 worlds[ 1024 ];
-#line 116
+#line 121
 };
-#line 137 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 142 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(LightData)
 {
     float4 lightParams;
@@ -1082,7 +1113,7 @@ STRUCT(LightData)
 
     float4 froxelDimsNear;
     float4 froxelZNear;
-#line 152
+#line 157
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1142,8 +1173,17 @@ STRUCT(LightData)
 
 
 
+
+
+
+
+        CBUFFER(ShadowMaskParams) gShadowParams :  register(b12,space1);
+
+
+
+
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 228 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 242 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 896 ] :  register(t0,space0);
 
 
@@ -1176,6 +1216,88 @@ bool useLowAF(float alphaRef, bool alphaBlended)
     return (gFrameData.alphaParams.y > 0.5f) && (alphaBlended || (alphaRef > 0.0f));
 }
 #line 12 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fpshadow.h.fsl"
+#line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/fpshadow.h.fsl"
+float fpShadowLitAt(int2 tp, int2 tmin, int2 tmax, float thresh, uint dynSlot)
+{
+    tp = clamp(tp, tmin, tmax);
+    float stored = LoadTex2D(gShadowAtlas, NO_SAMPLER, tp, 0).r;
+    if (dynSlot != 0u) { stored = max(stored, LoadTex2D(gShadowAtlasDyn, NO_SAMPLER, tp, 0).r); }
+    return (stored > thresh) ? 0.0f : 1.0f;
+}
+
+
+
+float fpShadowBilinear(float2 ap, int2 tmin, int2 tmax, float thresh, uint dynSlot)
+{
+    float2 p = ap - 0.5f;
+    int2 b = int2(floor(p));
+    float2 f = p - float2(b);
+    float s00 = fpShadowLitAt(b + int2(0, 0), tmin, tmax, thresh, dynSlot);
+    float s10 = fpShadowLitAt(b + int2(1, 0), tmin, tmax, thresh, dynSlot);
+    float s01 = fpShadowLitAt(b + int2(0, 1), tmin, tmax, thresh, dynSlot);
+    float s11 = fpShadowLitAt(b + int2(1, 1), tmin, tmax, thresh, dynSlot);
+    return lerp(lerp(s00, s10, f.x), lerp(s01, s11, f.x), f.y);
+}
+
+
+
+
+
+
+float fpShadowVisibility(float3 P, float3 N, uint slot)
+{
+    float4 posRad = gShadowParams.slotPosRad[slot];
+    float4 tile = gShadowParams.slotTile[slot];
+    float rangeK = gShadowParams.maskParams.x;
+    float nearZ = gShadowParams.maskParams.y;
+    float range = rangeK * posRad.w;
+    float farZ = 2.0f * posRad.w;
+
+    float3 ad0 = abs(P - posRad.xyz);
+    float ma0 = max(ad0.x, max(ad0.y, ad0.z));
+    if (ma0 <= nearZ || ma0 >= range) { return 1.0f; }
+
+    uint dynSlot = (gShadowParams.slotBits.y >> slot) & 1u;
+    float uvScale = gShadowParams.slotFlick[slot].z;
+    uvScale = (uvScale > 0.01f) ? uvScale : 1.0f;
+
+
+
+    float3 Ldir = posRad.xyz - P;
+    float ndotl = dot(N, Ldir * rsqrt(max(dot(Ldir, Ldir), 1e-8f)));
+    float sinT = sqrt(saturate(1.0f - ndotl * ndotl));
+    float texelW = 2.0f * ma0 / max(tile.z * uvScale, 1.0f);
+    float3 Poff = P + N * (gShadowParams.biasParams.y * sinT * texelW);
+
+    float3 d = Poff - posRad.xyz;
+    float3 ad = abs(d);
+
+    uint face; float ma; float u; float v;
+    if (ad.x >= ad.y && ad.x >= ad.z) { ma = ad.x; face = d.x > 0.0f ? 0u : 1u;
+                                        u = d.x > 0.0f ? -d.z : d.z; v = -d.y; }
+    else if (ad.y >= ad.z) { ma = ad.y; face = d.y > 0.0f ? 2u : 3u;
+                                        u = d.x; v = d.y > 0.0f ? d.z : -d.z; }
+    else { ma = ad.z; face = d.z > 0.0f ? 4u : 5u;
+                                        u = d.z > 0.0f ? d.x : -d.x; v = -d.y; }
+    if (ma <= nearZ || ma >= range) { return 1.0f; }
+
+    float refZ = nearZ * (farZ - ma) / (ma * (farZ - nearZ));
+    float thresh = refZ * (1.0f + gShadowParams.maskParams.z)
+                 + gShadowParams.biasParams.x + 1e-6f;
+
+    float2 faceOrg = float2(tile.x + float(face % 3u) * tile.z,
+                            tile.y + float(face / 3u) * tile.z);
+    int2 tmin = int2(faceOrg);
+    int2 tmax = tmin + int2((int)tile.z - 1, (int)tile.z - 1);
+    float2 fuv = float2(u, v) / ma * (0.5f * uvScale) + 0.5f;
+    float2 ap = faceOrg + fuv * tile.z;
+
+    float vis = fpShadowBilinear(ap, tmin, tmax, thresh, dynSlot);
+    vis = lerp(1.0f, vis, saturate(tile.w));
+    return vis;
+}
+#line 13 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.frag.fsl"
 
 STRUCT(VSOutput)
 {
@@ -1193,7 +1315,7 @@ STRUCT(VSOutput)
     DATA(float3, WorldPos, TEXCOORD8);
     DATA(FLAT(uint), OverlayIndex,TEXCOORD9);
     DATA(FLAT(uint), ClampMode, TEXCOORD10);
-#line 29
+#line 30
 };
 
 
@@ -1311,12 +1433,22 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
                 uint slotP1 = (uint)gLights.lights[i * 3u + 2u].w;
                 if (slotP1 != 0u)
                 {
-                    uint4 mw = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xyzw;
-                    uint s = slotP1 - 1u;
-                    uint lane = s >> 3u;
-                    uint word = lane == 0u ? mw.x : (lane == 1u ? mw.y : (lane == 2u ? mw.z : mw.w));
-                    uint nib = (word >> ((s & 7u) * 4u)) & 0xFu;
-                    att *= float(nib) * (1.0f / 15.0f);
+
+
+
+                    if (gFrameData.alphaShadowParams.y > 0.5f)
+                    {
+                        att *= fpShadowVisibility(In.WorldPos, normalize(In.Normal), slotP1 - 1u);
+                    }
+                    else
+                    {
+                        uint4 mw = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xyzw;
+                        uint s = slotP1 - 1u;
+                        uint lane = s >> 3u;
+                        uint word = lane == 0u ? mw.x : (lane == 1u ? mw.y : (lane == 2u ? mw.z : mw.w));
+                        uint nib = (word >> ((s & 7u) * 4u)) & 0xFu;
+                        att *= float(nib) * (1.0f / 15.0f);
+                    }
                 }
 
                 float lambert = saturate(dot(N, toLight) * invDist);

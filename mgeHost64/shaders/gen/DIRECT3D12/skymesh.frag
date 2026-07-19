@@ -976,7 +976,38 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skymesh.frag.fsl"
 #line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/skymesh.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
-#line 30 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 20 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+#line 15 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/shadowparams.h.fsl"
+STRUCT(ShadowMaskParams)
+{
+    float4x4 invViewProj;
+
+
+
+
+
+
+    float4 screenParams;
+    float4 maskParams;
+    float4 slotPosRad[ 32 ];
+    float4 slotTile[ 32 ];
+
+
+
+
+    float4 biasParams;
+
+
+
+    uint4 slotBits;
+
+
+    float4 slotFlick[ 32 ];
+#line 40
+};
+#line 21 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 35 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(FrameData)
 {
     float4x4 viewProj;
@@ -1058,15 +1089,15 @@ STRUCT(FrameData)
 
 
     float4 alphaShadowParams;
-#line 111
+#line 116
 };
 
 STRUCT(BatchData)
 {
     float4x4 worlds[ 1024 ];
-#line 116
+#line 121
 };
-#line 137 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 142 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(LightData)
 {
     float4 lightParams;
@@ -1082,7 +1113,7 @@ STRUCT(LightData)
 
     float4 froxelDimsNear;
     float4 froxelZNear;
-#line 152
+#line 157
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1142,8 +1173,17 @@ STRUCT(LightData)
 
 
 
+
+
+
+
+        CBUFFER(ShadowMaskParams) gShadowParams :  register(b12,space1);
+
+
+
+
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 228 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 242 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 896 ] :  register(t0,space0);
 
 
