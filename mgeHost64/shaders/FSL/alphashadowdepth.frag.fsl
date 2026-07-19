@@ -1,0 +1,62 @@
+// mgeHost64 — alpha SHADOW-RECEIVE depth prepass (fragment stage).
+//
+// Twin of alphadepth.frag, but clips on a SEPARATE, lower opacity threshold
+// (gFrameData.alphaShadowParams.x, dev knob "ALPHA: shadow-receive opacity") and writes into the DEDICATED single-sample scratch
+// depth (pAlphaShadowDepth), NOT the shared pDepth.
+//
+// WHY A SECOND THRESHOLD. The fold-fix prepass (alphadepth.frag) writes pDepth at a HIGH threshold
+// (~0.95) so semi-transparent surfaces don't depth-kill each other in the colour pass's GEQUAL.
+// But shadow RECEPTION wants a LOW threshold: a paper curtain (~0.6-0.9 opaque) is a shadow caster
+// = opaque for light, and should receive its own point-light shadow. One threshold can't serve
+// both (see [[project_forge_alpha_shadow_reception]]), so this pass renders the same alpha geometry
+// at the lower threshold into its own depth, which the alpha shadow-mask refresh then reconstructs.
+// The colour pass's pDepth (0.95 fold-fix) is untouched — the two are fully decoupled.
+//
+// Alpha is computed EXACTLY as alpha.frag / alphadepth.frag compute output alpha
+// (a = albedo.a * vcolA * matAlpha). Pixels below the threshold write no depth, so a thin gauzy
+// edge keeps the opaque reconstruction behind it (or reads "lit" where the scratch was cleared to
+// far) rather than casting a spurious self-shadow.
+//
+// PAIRING HAZARD: shares VSOutput with opaque.vert (like alpha.frag / alphadepth.frag) and must
+// ONLY be paired with it — see [[project_forge_shared_frag_vsoutput]]; a mismatched vert hangs the GPU.
+
+#include "opaque.srt.h"
+#include "texsample.h.fsl"   // sampleBase() — MW address mode + AF level
+
+STRUCT(VSOutput)
+{
+    DATA(float4,      Position, SV_Position);
+    DATA(float3,      Normal,   NORMAL);
+    DATA(float2,      Uv,       TEXCOORD0);
+    DATA(FLAT(uint),  TexIndex, TEXCOORD1);
+    DATA(float,       Fog,      TEXCOORD2);
+    DATA(float4,      Color,    COLOR);
+    DATA(float,       AlphaRef, TEXCOORD3);
+    DATA(FLAT(float3),MatDiffuse, TEXCOORD4);
+    DATA(FLAT(float3),MatAmbient, TEXCOORD5);
+    DATA(FLAT(float3),MatEmissive,TEXCOORD6);
+    DATA(FLAT(uint),  VColSource, TEXCOORD7);
+    DATA(float3,      WorldPos,   TEXCOORD8);
+    DATA(FLAT(uint),  OverlayIndex,TEXCOORD9);
+    DATA(FLAT(uint),  ClampMode,  TEXCOORD10);// MW texture address mode (0..3) -> sampleBase()
+};
+
+ROOT_SIGNATURE(DefaultRootSignature)
+void PS_MAIN( VSOutput In )
+{
+    INIT_MAIN;
+    float4 albedo = sampleBase(In.TexIndex, In.ClampMode & 3u, In.Uv, useLowAF(In.AlphaRef, true));  // bit2 = two-sided flag (alpha.frag)
+
+    // Cutout test first (a discarded cutout texel is a hole — it must not write depth).
+    clip(albedo.a < In.AlphaRef ? -1.0f : 1.0f);
+
+    // Same output alpha alpha.frag blends with.
+    float vcolA    = (In.VColSource != 0u) ? In.Color.a : 1.0f;
+    float matAlpha = asfloat(In.OverlayIndex);
+    float outA     = albedo.a * vcolA * matAlpha;
+
+    // Shadow-receive threshold (separate, lower than the fold-fix's alphaParams.x): only sheets
+    // opaque enough to be their own shadow receiver write depth here.
+    clip(outA < gFrameData.alphaShadowParams.x ? -1.0f : 1.0f);
+    RETURN();
+}

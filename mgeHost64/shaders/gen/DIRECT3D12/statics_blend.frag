@@ -972,7 +972,7 @@ SamplerState gSampler2xWrapClamp : register( s17 , space100 ) ;
 #line 247 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/../../../3rdparty/The-Forge/Common_3/Graphics/FSL/defaults.h"
 
 #line 11 "FSL/shaders.list"
-#line 158 "FSL/shaders.list"
+#line 165 "FSL/shaders.list"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics_blend.frag.fsl"
 #line 11 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/statics_blend.frag.fsl"
 #line 1 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
@@ -1053,15 +1053,20 @@ STRUCT(FrameData)
 
     float4 froxelDims;
     float4 froxelZ;
-#line 106
+
+
+
+
+    float4 alphaShadowParams;
+#line 111
 };
 
 STRUCT(BatchData)
 {
     float4x4 worlds[ 1024 ];
-#line 111
+#line 116
 };
-#line 132 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 137 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(LightData)
 {
     float4 lightParams;
@@ -1077,7 +1082,7 @@ STRUCT(LightData)
 
     float4 froxelDimsNear;
     float4 froxelZNear;
-#line 147
+#line 152
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1138,7 +1143,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 223 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 228 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 896 ] :  register(t0,space0);
 
 
@@ -1184,4 +1189,4 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     float alpha = saturate(tex.a * In.Color.a);
     return (float4(result, alpha));
 }
-#line 159 "FSL/shaders.list"
+#line 166 "FSL/shaders.list"

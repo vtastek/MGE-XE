@@ -67,9 +67,11 @@ VSOutput VS_MAIN( VSInput In )
     Out.TexIndex = In.TexAlpha & 0xFFFFu;
     Out.AlphaRef = float((In.TexAlpha >> 16u) & 0xFFu) * (1.0f / 255.0f);
     Out.VColSource = (In.TexAlpha >> 24u) & 0x3u;
-    // MW texture address mode (NiTexturingProperty::Map::clampMode). 3 = WRAP_S_WRAP_T = MW's
-    // default; before this the host sampled everything REPEAT and clamped meshes tiled.
-    Out.ClampMode  = (In.TexAlpha >> 26u) & 0x3u;
+    // MW texture address mode (NiTexturingProperty::Map::clampMode, bits 26-27). 3 = WRAP_S_WRAP_T =
+    // MW's default; before this the host sampled everything REPEAT and clamped meshes tiled.
+    // Bit 28 (packed by packTexAlpha for two-sided DRAW_BOTH alpha) rides along as ClampMode bit2:
+    // alpha.frag reads (ClampMode & 4) for two-sided lighting and masks (& 3) before sampling.
+    Out.ClampMode  = (In.TexAlpha >> 26u) & 0x7u;
     Out.Color = In.Color;
     Out.MatDiffuse  = In.MatDiffuse;
     Out.MatAmbient  = In.MatAmbient;
