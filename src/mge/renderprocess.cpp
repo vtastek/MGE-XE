@@ -12,6 +12,7 @@
 #include "datahandler_view.h"
 #include "morrowindbsa.h"
 #include "mge_tracy.h"
+#include "imgui.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -2466,6 +2467,93 @@ namespace {
             }
         }
 
+        // FP1c particles (torch flame, enchant sparks): the cache walk billboarded each FP
+        // particle system's live particles against the arm camera. Ship the quads through the
+        // shared captured-alpha VB/IB (same buffers the world captured path uses; the host binds
+        // them for kAlphaSlotCaptured items) and emit one FP alpha item per system. Appended to
+        // g_capVertScratch AFTER buildGeometryDrawLists emitted the world captured items (their
+        // bases already fixed), BEFORE the captured blob ships — so the FP quads ride this frame's
+        // blob and the FP items' bases point past the world region. See tasks/forge-fp-particles.md.
+        {
+            const auto& precs = MGE::GeometryCache::fpParticleRecs();
+            if (!precs.empty()) {
+                std::uint32_t pvCount = 0, piCount = 0;
+                const IPC::GeomVertexWire* pv =
+                    (const IPC::GeomVertexWire*)MGE::GeometryCache::fpParticleVerts(pvCount);
+                const std::uint16_t* pi =
+                    (const std::uint16_t*)MGE::GeometryCache::fpParticleIndices(piCount);
+                for (const auto& rec : precs) {
+                    if (!rec.indexCount || rec.vertexBase + rec.vertexCount > pvCount
+                        || rec.indexBase + rec.indexCount > piCount) continue;
+                    if (g_capVertScratch.size() + rec.vertexCount > IPC::kMaxCapturedAlphaVerts
+                        || g_capIdxScratch.size() + rec.indexCount > IPC::kMaxCapturedAlphaIndices)
+                        break;
+                    const std::uint32_t vBase = (std::uint32_t)g_capVertScratch.size();
+                    const std::uint32_t iBase = (std::uint32_t)g_capIdxScratch.size();
+                    g_capVertScratch.insert(g_capVertScratch.end(),
+                                            pv + rec.vertexBase, pv + rec.vertexBase + rec.vertexCount);
+                    for (std::uint32_t j = 0; j < rec.indexCount; ++j)
+                        g_capIdxScratch.push_back(pi[rec.indexBase + j]);   // 0-based; host adds vertexBase
+
+                    std::uint32_t texIndex = 0;
+                    auto mit = g_capTexMemo.find(rec.texture);
+                    if (mit != g_capTexMemo.end()) texIndex = mit->second;
+                    else {
+                        const char* name = rec.texture ? MGE::GeometryCache::resolveTextureName(rec.texture) : nullptr;
+                        texIndex = name ? resolveTextureSlot(name) : 0u;
+                        g_capTexMemo.emplace(rec.texture, texIndex);
+                    }
+
+                    IPC::AlphaDrawWire item{};
+                    item.slot      = IPC::kAlphaSlotCaptured;
+                    item.texIndex  = texIndex;
+                    item.srcBlend  = rec.srcBlend;
+                    item.destBlend = rec.destBlend;
+                    item.alphaRef  = 0.0f;
+                    // Two particle regimes, matching MW's FFP (which clamps the lit vertex colour to
+                    // [0,1] BEFORE modulating the texture):
+                    //   * Self-illuminated flame — NIF material emissive ~ (1,1,1). MW's clamp pins
+                    //     the vertex colour to white, so the flame renders as PURE albedo, immune to
+                    //     world lights (a blue point light can't tint it). We reproduce that with
+                    //     vColSource=1 (lit = MatDiffuse*d + MatAmbient*a + Color.rgb) + zeroed
+                    //     MatDiffuse/MatAmbient → d (incl. point lights) and a drop out → lit =
+                    //     Color.rgb, and buildFPParticleQuads forces the flame vertex RGB to white →
+                    //     lit = (1,1,1) → c = albedo. Per-particle ALPHA still drives the fade.
+                    //   * Smoke — emissive 0. vColSource=2 (Color*(d+a)) so it picks up the scene's
+                    //     sun+ambient like MW (values stay < 1, so the missing clamp is invisible).
+                    // NOTE (accepted deviation, 2026-07-19): real MW DOES let a flame go faintly pale-
+                    // blue when a blue point light is very close (its clamp saturates only most of the
+                    // way, not fully). We render the flame fully light-immune instead — the user
+                    // prefers this look. If exact MW parity is ever wanted, replace this with a real
+                    // FFP-clamp path (saturate(Color*(d+a)+MatEmissive)) in alpha.frag. See also the
+                    // emissive-lantern regression follow-up in tasks/forge-fp-particles.md.
+                    const bool emissiveSat = (rec.matEmissive[0] > 0.5f || rec.matEmissive[1] > 0.5f
+                                              || rec.matEmissive[2] > 0.5f);
+                    item.matDiffuse[0] = item.matDiffuse[1] = item.matDiffuse[2] = 0.0f;
+                    item.matAlpha      = 1.0f;
+                    item.matAmbient[0] = item.matAmbient[1] = item.matAmbient[2] = 0.0f;
+                    item.matEmissive[0] = item.matEmissive[1] = item.matEmissive[2] = 0.0f;
+                    item.vColSource = emissiveSat ? 1u : 2u;
+                    // Quads are already in absolute world space → identity world minus the
+                    // camera-relative eye (matches the world captured path + FP emit helpers).
+                    memset(item.world, 0, sizeof(item.world));
+                    item.world[0] = item.world[5] = item.world[10] = item.world[15] = 1.0f;
+                    item.world[12] = -DistantLand::eyePos.x;
+                    item.world[13] = -DistantLand::eyePos.y;
+                    item.world[14] = -DistantLand::eyePos.z;
+                    item.vertexBase = vBase;
+                    item.indexBase  = iBase;
+                    item.indexCount = rec.indexCount;
+                    item.cullFlags  = IPC::kAlphaCullTwoSided;
+                    item.clampMode  = IPC::kTexWrapSWrapT;
+                    const std::size_t at = g_fpAlphaScratch.size();
+                    g_fpAlphaScratch.resize(at + sizeof(item));
+                    memcpy(g_fpAlphaScratch.data() + at, &item, sizeof(item));
+                    ++fpAlpha;
+                }
+            }
+        }
+
         static unsigned s_hb = 0;
         if (s_hb++ % 300 == 0) {
             LOG::logline(">> [fp] draws=%u skinned=%u alpha=%u | cam fov=%.1f near=%.1f far=%.1f vp=%.0fx%.0f",
@@ -2630,6 +2718,16 @@ namespace RenderProcess {
                              : (g_produceMode == 2) ? "OVERLAP (Tier 2)" : "OFF (inline)";
             LOG::logline(">> [seam] produce worker: %s%s", name,
                          (g_produceMode != 0 && Configuration.UseRenderThread) ? " (inert — UseRenderThread owns the worker)" : "");
+        }
+        // VK_SCROLL (Scroll Lock): Phase 1 host-cull-only A/B. ON routes the Forge produce
+        // off the engine MSOC classify onto the self-contained frustum-only visible set
+        // (full refresh walk + whole-cache frustum cull; host Hi-Z GPU cull owns occlusion).
+        // OFF = the known-good MSOC/live-draw-build path. Takes effect next frame
+        // (frameSetupEarly reads liveDrawBuild; buildFrustumVisibleSet reads the branch gate).
+        if (GetAsyncKeyState(VK_SCROLL) & 0x0001) {
+            DistantLand::hostCullOnly = !DistantLand::hostCullOnly;
+            LOG::logline(">> [seam] host-cull-only (Phase 1, frustum set) %s",
+                         DistantLand::hostCullOnly ? "ON" : "OFF");
         }
     }
 
@@ -4167,4 +4265,52 @@ namespace RenderProcess {
         g_initOk = false;
         g_enabled = false;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Client-side Dear ImGui dev panel — drawn by ImGuiWater::onPresent under the F10
+// overlay, alongside the Water/Foam panel. Replaces the hardware-key seam A/B
+// toggles with clickable controls (some keys, e.g. Scroll Lock for host-cull, are
+// missing on compact keyboards). Defined here (not imgui_water.cpp) so it can reach
+// the file-static seam state + DistantLand::hostCullOnly directly; declared extern
+// in imgui_water.cpp. Each control mirrors the equivalent [seam] key in pollDevKeys,
+// logging on change so the log reads the same whether toggled by key or click.
+// ---------------------------------------------------------------------------
+void DrawForgeDevPanel() {
+    if (!ImGui::Begin("Forge Dev")) { ImGui::End(); return; }
+
+    // Flip a bool AND log on change (matches the key handlers' >> [seam] lines).
+    auto logCheck = [](const char* label, bool& v, const char* msg) {
+        if (ImGui::Checkbox(label, &v))
+            LOG::logline(">> [seam] %s %s", msg, v ? "ON" : "OFF");
+    };
+
+    ImGui::Separator();
+    ImGui::Text("Phase 1 - MW-only pipeline");
+    logCheck("Host-cull only (frustum set)", DistantLand::hostCullOnly,
+             "host-cull-only (Phase 1, frustum set)");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "ON: the Forge produce feeds off the self-contained frustum set (full refresh\n"
+            "walk + whole-cache frustum cull); the host Hi-Z GPU cull owns occlusion. The\n"
+            "engine MSOC classify is bypassed (was Scroll Lock).\n"
+            "OFF: known-good MSOC / live-draw-build path.");
+
+    ImGui::Separator();
+    ImGui::Text("Produce worker (NUMPAD8)");
+    const char* modes[] = { "OFF (inline)", "FENCED (Tier 1b)", "OVERLAP (Tier 2)" };
+    int mode = g_produceMode;
+    if (ImGui::Combo("produce mode", &mode, modes, 3)) {
+        g_produceMode = mode;
+        LOG::logline(">> [seam] produce worker: %s", modes[mode]);
+    }
+
+    ImGui::Separator();
+    ImGui::Text("Seam A/B");
+    logCheck("Forge composite (F11)", g_enabled, "composite");
+    logCheck("Forge water (F7)", g_waterEnabled, "Forge water (WT1)");
+    logCheck("Frame-ahead pipelining (numpad *)", g_frameAheadLive, "frame-ahead pipelining");
+    logCheck("FP arm suppression (numpad /)", g_fpSuppressLive, "FP suppression (FP1b)");
+
+    ImGui::End();
 }

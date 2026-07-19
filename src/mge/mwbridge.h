@@ -4,7 +4,7 @@
 
 // Forward declaration so accessors can hand back typed scene-graph nodes without
 // pulling the MWSE SharedSE NI headers into every consumer of mwbridge.h.
-namespace NI { struct Node; }
+namespace NI { struct Node; struct Camera; }
 
 //-----------------------------------------------------------------------------
 
@@ -100,6 +100,12 @@ public:
     // FP1a: the WorldController armCamera scene root — the first-person arms/weapon
     // subtree MW renders in its own post-z-clear scene. Null when unavailable.
     NI::Node* getArmCameraRoot();
+    // FP1c: the armCamera's NiCamera (CameraData::camera at wc+0x150+0x10), typed as
+    // NI::Camera*. Used to re-face first-person billboards (held candle/enchant glow)
+    // toward the arm view during the FP capture walk — MW's own billboard re-orient runs
+    // in the arm cull/render pass that FP suppression skips, so the facing goes stale.
+    // Null when unavailable.
+    NI::Camera* getArmCamera();
     // FP1a: world-space state of one WorldControllerRenderCamera (which: 0 =
     // worldCamera/main view, 1 = armCamera/first person): the NiCamera basis
     // (pos/dir/up/right) + the CameraData projection params {fovDegrees (HORIZONTAL),

@@ -368,4 +368,26 @@ namespace MGE::GeometryCache {
     // a consumer repopulates it incrementally from extractMaterial.
     const char* resolveTextureName(IDirect3DTexture9* tex);
 
+    // ---- FP particle billboarding (torch flame, enchant sparks) --------------------
+    // buildFPParticleQuads (run during the first-person walk) billboards each FP particle
+    // system's live particles against the arm camera into camera-facing quads. MW's particle
+    // renderer does this at draw time; under FP suppression that never runs, and visitGeometry
+    // captured only particle CENTERS (a degenerate mesh). The client's buildFPFrame appends
+    // these quads to the shared captured-alpha VB/IB and emits kAlphaSlotCaptured FP alpha
+    // items. Vert data is IPC::GeomVertexWire[]; index data is uint16[] (rebased per system to
+    // 0 at vertexBase). See tasks/forge-fp-particles.md.
+    struct FPParticleRec {
+        uint32_t vertexBase;   // first vertex in fpParticleVerts()
+        uint32_t vertexCount;
+        uint32_t indexBase;    // first index in fpParticleIndices()
+        uint32_t indexCount;
+        IDirect3DTexture9* texture;   // base map GPU texture (resolve to a bindless slot)
+        uint32_t srcBlend;            // D3DBLEND_* (from NiAlphaProperty)
+        uint32_t destBlend;           // D3DBLEND_*
+        float    matEmissive[3];      // NiMaterialProperty emissive (flame glow; smoke = 0)
+    };
+    const void* fpParticleVerts(uint32_t& countOut);    // GeomVertexWire[countOut]
+    const void* fpParticleIndices(uint32_t& countOut);  // uint16[countOut]
+    const std::vector<FPParticleRec>& fpParticleRecs();
+
 }

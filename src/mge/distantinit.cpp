@@ -35,6 +35,7 @@ bool DistantLand::earlyWalkedCache = false;
 bool DistantLand::renderThreadJobKicked = false;
 bool DistantLand::earlyForgeKickoff = false;
 bool DistantLand::earlyCulledGrass = false;
+bool DistantLand::hostCullOnly = false;   // Phase 1 A/B (VK_SCROLL); boot = MSOC path
 std::vector<D3DXVECTOR4> DistantLand::reflectionWaterRects;
 bool DistantLand::reflWaterCullActive = true;
 bool DistantLand::reflGateWanted = false;

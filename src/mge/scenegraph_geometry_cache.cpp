@@ -6,11 +6,16 @@
 #include "NIGeometryData.h"
 #include "NINode.h"
 #include "NISwitchNode.h"
+#include "NIBillboardNode.h"
+#include "NICamera.h"
 #include "NIProperty.h"
 #include "NIRTTIDefines.h"
 #include "NISourceTexture.h"
 #include "NIDX8TextureData.h"
 #include "NITriBasedGeometry.h"
+#include "NIParticles.h"
+#include "NIParticleSystemController.h"
+#include "NIColor.h"
 #include "NITriBasedGeometryData.h"
 #include "NISkinInstance.h"
 #include "NIUVController.h"
@@ -59,6 +64,18 @@ namespace MGE::GeometryCache {
         // bypasses the ROOT's own app-cull flag (FP1b forces it culled to suppress
         // MW's own arm draws while the capture must keep running).
         bool              g_walkingFP = false;
+        // FP particle systems (torch flame, enchant sparks) met during the FP walk. NiParticles
+        // reach visitGeometry (they ARE NiTriBasedGeom in MW RTTI) but capture only as degenerate
+        // particle-center meshes; collected here instead so buildFPParticleQuads can billboard
+        // them against the arm camera. Cleared at each FP walk start; pointers are live only for
+        // the remainder of the frame's build. See tasks/forge-fp-particles.md.
+        std::vector<NI::Particles*> g_fpParticleSystems;
+        // Billboarded FP-particle quads built by buildFPParticleQuads, shipped by the client's
+        // buildFPFrame as FP captured-alpha geometry. Reused frame-to-frame. g_fpPartRecs is one
+        // record per particle system (its vertex/index range + texture + blend).
+        std::vector<IPC::GeomVertexWire>  g_fpPartVerts;
+        std::vector<std::uint16_t>        g_fpPartIndices;
+        std::vector<FPParticleRec>        g_fpPartRecs;
         // SK2: monotonic counter assigned to each isSky entry's skyOrder during the skyRoot
         // walk (reset to 0 at the start of each sky walk). Encodes back-to-front subtree order
         // so the Forge sky pass can sort its alpha-blended draws (dome → stars → sun → moons).
@@ -1290,6 +1307,152 @@ namespace MGE::GeometryCache {
             buildD3DFromTransform(out, geom->worldTransform);
         }
 
+        // FP particle billboarding (see tasks/forge-fp-particles.md). MW's particle renderer
+        // expands each live particle into a camera-facing quad at draw time; under FP
+        // suppression that never runs and visitGeometry captured only particle centers. Rebuild
+        // the quads here against the ARM camera. P0 = build into g_fpPart* + log (confirm vertex
+        // space / sizes); P1 ships them as FP captured-alpha geometry.
+        void buildFPParticleQuads() {
+            g_fpPartVerts.clear();
+            g_fpPartIndices.clear();
+            g_fpPartRecs.clear();
+            if (g_fpParticleSystems.empty()) return;
+
+            // Arm camera basis (which=1): right/up billboard the quads to face the FP view.
+            float pos[3], dir[3], up[3], right[3], cd[5];
+            if (!MWBridge::get()->getRenderCameraState(1, pos, dir, up, right, cd)) return;
+
+            // Under FP suppression the arm subtree's Update traversal is skipped, so the particle
+            // SIMULATION (NiParticleSystemController) is frozen — positions AND per-particle sizes
+            // stall until an F11 seam cycle lets a real arm render tick it. Drive it ourselves with
+            // MW's app clock (same clock the engine ticks controllers with). Gated to suppression so
+            // we never double-tick with MW (when the seam is off, MW ticks it and we don't capture).
+            const bool tickSim = RenderProcess::wantsFPSuppression();
+            const float simTime = tickSim ? MWBridge::get()->simulationTime() : 0.0f;
+
+            for (NI::Particles* p : g_fpParticleSystems) {
+                if (!p) continue;
+
+                // Locate the NiParticleSystemController (on the NiParticles or its parent): tick it
+                // (un-freeze the sim) and read initialSize — the base particle size in world units
+                // that the per-particle sizes[] fraction ([0,1] grow/fade) scales.
+                NI::ParticleSystemController* psc = nullptr;
+                auto findPSC = [&](NI::ObjectNET* o) {
+                    if (!o) return;
+                    for (NI::TimeController* c = o->controllers.get(); c && !psc; c = c->nextController.get()) {
+                        if (c->isInstanceOfType(NI::RTTIStaticPtr::NiParticleSystemController))
+                            psc = static_cast<NI::ParticleSystemController*>(c);
+                    }
+                };
+                findPSC(p);
+                if (!psc) findPSC(p->parentNode);
+                if (psc && tickSim) psc->update(simTime);
+                const float initSize = (psc && psc->initialSize > 0.0f) ? psc->initialSize : 1.0f;
+
+                auto* pd = p->getModelData().get();
+                if (!pd || !pd->vertex) continue;
+                const unsigned active = pd->activeCount;
+                if (active == 0) continue;
+
+                // Per-system material: base-map GPU texture + NiAlphaProperty blend. Default to
+                // additive (SRC_ALPHA/ONE) — the torch-flame case — when no alpha prop is present.
+                IDirect3DTexture9* tex = nullptr;
+                std::uint32_t srcB = (std::uint32_t)D3DBLEND_SRCALPHA, dstB = (std::uint32_t)D3DBLEND_ONE;
+                float matEmis[3] = { 0.0f, 0.0f, 0.0f };   // flame NIF glow; smoke NIF = 0
+                if (auto* ps = reinterpret_cast<NI::PropertyState*>(p->propertyState)) {
+                    if (ps->texture) {
+                        const auto* bm = ps->texture->getBaseMap();
+                        if (bm && bm->texture) tex = getDX9Texture(bm->texture.get());
+                    }
+                    if (ps->alpha) {
+                        const unsigned f = ps->alpha->flags;
+                        srcB = (std::uint32_t)niBlendToD3D((f & NI::AlphaProperty::SRC_BLEND_MASK)  >> NI::AlphaProperty::SRC_BLEND_POS);
+                        dstB = (std::uint32_t)niBlendToD3D((f & NI::AlphaProperty::DEST_BLEND_MASK) >> NI::AlphaProperty::DEST_BLEND_POS);
+                    }
+                    // Material emissive: the torch-flame NIF sets emissive=(1,1,1) so the world
+                    // captured path lights it to solid white (matE forwarded from the NiMaterial);
+                    // the smoke NIF has none. Forward it so the FP flame matches (vColSource=2:
+                    // lit = Color*(d+a) + MatEmissive). See renderprocess [cap-diag] proof.
+                    if (ps->material) {
+                        matEmis[0] = ps->material->emissive.r;
+                        matEmis[1] = ps->material->emissive.g;
+                        matEmis[2] = ps->material->emissive.b;
+                    }
+                }
+
+                const NI::Point3*      verts = pd->vertex;
+                const NI::PackedColor*  cols = pd->color;   // may be null → opaque white
+                const float*           sizes = pd->sizes;   // may be null → radius fallback
+                const NI::Transform&      wt = p->worldTransform;
+                const float                s = wt.scale;
+                const NI::Matrix33&        R = wt.rotation;
+                const NI::Point3&          T = wt.translation;
+
+                FPParticleRec rec{};
+                rec.vertexBase = (std::uint32_t)g_fpPartVerts.size();
+                rec.indexBase  = (std::uint32_t)g_fpPartIndices.size();
+                rec.texture    = tex;
+                rec.srcBlend   = srcB;
+                rec.destBlend  = dstB;
+                rec.matEmissive[0] = matEmis[0]; rec.matEmissive[1] = matEmis[1]; rec.matEmissive[2] = matEmis[2];
+                // Self-illuminated flame (emissive ~ 1): MW's FFP clamp pins the lit vertex colour to
+                // white, so the flame renders as pure albedo regardless of the per-particle colour.
+                // Force the vertex RGB to white here (keeping per-particle ALPHA for the fade); the
+                // client routes these through vColSource=1 → lit = Color.rgb = white → c = albedo,
+                // immune to world point lights (exactly as MW renders a torch flame under any light).
+                const bool emissiveSat = (matEmis[0] > 0.5f || matEmis[1] > 0.5f || matEmis[2] > 0.5f);
+
+                for (unsigned i = 0; i < active; ++i) {
+                    const NI::Point3& v = verts[i];
+                    // world = scale * (R · v) + T  (row-major rows m0/m1/m2 — matches buildD3DFromTransform)
+                    const float wx = s * (v.x * R.m0.x + v.y * R.m0.y + v.z * R.m0.z) + T.x;
+                    const float wy = s * (v.x * R.m1.x + v.y * R.m1.y + v.z * R.m1.z) + T.y;
+                    const float wz = s * (v.x * R.m2.x + v.y * R.m2.y + v.z * R.m2.z) + T.z;
+                    // MW's particle quad half-extent = per-particle grow/fade fraction × the
+                    // controller's base initialSize (world units), scaled by the node transform.
+                    const float half = (sizes ? sizes[i] : 1.0f) * initSize * s;
+                    std::uint32_t col = 0xFFFFFFFFu;
+                    if (cols) std::memcpy(&col, &cols[i], sizeof(std::uint32_t));  // B,G,R,A == D3DCOLOR
+                    if (emissiveSat) col |= 0x00FFFFFFu;   // force RGB white, keep A (flame fade)
+
+                    // Camera-facing quad: center ± half*right ± half*up. Indices are rebased to
+                    // 0 at rec.vertexBase (the host adds vertexBase back), matching the captured path.
+                    const std::uint16_t base = (std::uint16_t)(g_fpPartVerts.size() - rec.vertexBase);
+                    const float uvx[4] = { 0.f, 1.f, 1.f, 0.f };
+                    const float uvy[4] = { 0.f, 0.f, 1.f, 1.f };
+                    const float sx[4]  = { -1.f, 1.f, 1.f, -1.f };
+                    const float sy[4]  = {  1.f, 1.f,-1.f, -1.f };
+                    for (int k = 0; k < 4; ++k) {
+                        IPC::GeomVertexWire gv{};
+                        gv.px = wx + half * (sx[k] * right[0] + sy[k] * up[0]);
+                        gv.py = wy + half * (sx[k] * right[1] + sy[k] * up[1]);
+                        gv.pz = wz + half * (sx[k] * right[2] + sy[k] * up[2]);
+                        // MW's particle renderer writes this exact CONSTANT normal to every
+                        // billboard vertex (proven by renderprocess [nrm-diag] on world torches);
+                        // it makes ndl constant per frame so the lit flame (vColSource=2) matches
+                        // the world path and never swings colour with the camera.
+                        gv.nx = 0.3f; gv.ny = 0.3f; gv.nz = 0.3f;
+                        gv.u = uvx[k]; gv.v = uvy[k];
+                        gv.color = col;
+                        g_fpPartVerts.push_back(gv);
+                    }
+                    const std::uint16_t idx[6] = { base, (std::uint16_t)(base+1), (std::uint16_t)(base+2),
+                                                   base, (std::uint16_t)(base+2), (std::uint16_t)(base+3) };
+                    g_fpPartIndices.insert(g_fpPartIndices.end(), idx, idx + 6);
+                }
+
+                rec.vertexCount = (std::uint32_t)g_fpPartVerts.size() - rec.vertexBase;
+                rec.indexCount  = (std::uint32_t)g_fpPartIndices.size() - rec.indexBase;
+                if (rec.indexCount) g_fpPartRecs.push_back(rec);
+            }
+
+            static unsigned s_hb = 0;
+            if ((s_hb++ % 600) == 0 && !g_fpPartRecs.empty()) {
+                LOG::logline(">> [fp part] systems=%u quads=%u",
+                             (unsigned)g_fpPartRecs.size(), (unsigned)(g_fpPartIndices.size() / 6));
+            }
+        }
+
         // Sign of the upper-left 3x3 determinant of a row-major affine matrix.
         // Negative => the transform mirrors (reflects) the mesh, flipping clip-space
         // triangle winding. Left-side body parts / armor reuse the right mesh via a
@@ -1615,6 +1778,26 @@ namespace MGE::GeometryCache {
             }
 
             if (av->isInstanceOfType(NI::RTTIStaticPtr::NiTriBasedGeom)) {
+                // NiParticles ARE NiTriBasedGeom in MW's RTTI, so they land here — but
+                // visitGeometry would capture only the particle CENTERS as a degenerate mesh
+                // (the billboarded quads are generated by MW's particle renderer at draw time).
+                // In the FP walk, collect them for client-side billboarding instead of shipping
+                // the useless point-mesh. World particles keep the captureAlphaDraw path.
+                if (g_walkingFP && av->isInstanceOfType(NI::RTTIStaticPtr::NiParticles)) {
+                    auto* pgeom = static_cast<NI::Particles*>(av);
+                    // Register the base-map texture HERE: the FP walk intercepts particles before
+                    // the NiGeometry branch (and they aren't cached → no extractMaterial), so
+                    // without this the reverse map never learns the flame texture and the host
+                    // draws it white/pale until a 3rd-person world render registers it for us.
+                    if (auto* ps = reinterpret_cast<NI::PropertyState*>(pgeom->propertyState)) {
+                        if (ps->texture) {
+                            const auto* bm = ps->texture->getBaseMap();
+                            if (bm && bm->texture) registerTextureName(bm->texture.get());
+                        }
+                    }
+                    g_fpParticleSystems.push_back(pgeom);
+                    return;
+                }
                 visitGeometry(static_cast<NI::TriBasedGeometry*>(av), inCharacter);
                 return;
             }
@@ -1656,6 +1839,67 @@ namespace MGE::GeometryCache {
             if (av->isInstanceOfType(NI::RTTIStaticPtr::NiNode)) {
                 auto* node = static_cast<NI::Node*>(av);
                 const auto count = node->children.getEndIndex();
+
+                // FP1c "gravity" tick: the erect mod hangs a NiLookAtController on the candle-
+                // flame parent (NiBSAnimationNode) that aims it at an up-∞ target → the flame
+                // stays world-vertical. That controller is a scene-graph node controller, only
+                // ticked by the arm-scene Update traversal — which FP suppression (armRoot
+                // appCulled) skips, so it stays frozen (flame tilted) until an F11 seam cycle
+                // lets one real render re-seed it. Drive it ourselves here: tick the look-at
+                // (writes node LOCAL rotation), then refresh the node world so the billboard
+                // child below reads a vertical parent up. FP-walk-only; idempotent (static
+                // target). Runs at the controller-owning node, one recursion level above the
+                // NiBillboardNode handled below.
+                if (g_walkingFP) {
+                    for (NI::TimeController* c = node->controllers.get(); c;
+                         c = c->nextController.get()) {
+                        if (c->isInstanceOfType(NI::RTTIStaticPtr::NiLookAtController)) {
+                            c->update(0.0f);
+                            node->update(0.0f, false, false);
+                            break;
+                        }
+                    }
+                }
+
+                // FP1c billboard re-face: MW re-orients NiBillboardNode quads (held candle
+                // flame, enchant glow) toward the camera during the arm cull/render pass —
+                // which FP suppression skips, so the quad's WORLD rotation goes stale
+                // (edge-on → invisible even though the alpha part still captures & draws).
+                // During the FP walk only, re-face the billboard against the arm camera and
+                // re-derive its children's world transforms so visitGeometry (below) reads
+                // the corrected orientation. FP-only: world / wall / NPC candles are re-faced
+                // by the engine's own world render every frame and must NOT be touched here.
+                if (g_walkingFP &&
+                    node->isInstanceOfType(NI::RTTIStaticPtr::NiBillboardNode)) {
+                    if (NI::Camera* armCam = MWBridge::get()->getArmCamera()) {
+                        auto* bb = static_cast<NI::BillboardNode*>(node);
+                        const NI::Point3& wt = bb->worldTransform.translation;
+                        // Guard the erect-mod up-∞ LookUpTarget (z≈3.4e38): never re-face or
+                        // recompute a node whose world position is non-finite / astronomical.
+                        if (std::isfinite(wt.x) && std::isfinite(wt.y) &&
+                            std::isfinite(wt.z) && std::fabs(wt.z) < 1.0e30f) {
+                            // Match the engine's order: recompute the billboard's own world
+                            // from its parent FIRST (the parent carries the erect-mod
+                            // NiLookAtController "gravity" → a vertical world up), THEN
+                            // rotateToCamera. RotateAboutUp mode preserves the world up, so
+                            // feeding it the fresh parent-derived up is what keeps the flame
+                            // vertical. Without this it yawed around a stale up (flame tilted
+                            // until an F11 seam cycle let a real engine render re-seed it).
+                            // bUpdateChildren=false — children are re-derived below.
+                            bb->update(0.0f, false, false);
+                            bb->rotateToCamera(armCam);
+                            // Re-derive children off the freshly-rotated billboard world
+                            // (child.world = billboard.world * child.local). update() on the
+                            // CHILDREN only — calling it on the billboard itself would rebuild
+                            // its world from parent*local and clobber the facing just set.
+                            for (size_t i = 0; i < count; ++i) {
+                                if (NI::AVObject* child = node->children.at(i).get())
+                                    child->update(0.0f, false, true);
+                            }
+                        }
+                    }
+                }
+
                 // If not already flagged, check whether any direct child is a skinned
                 // mesh — if so, the whole subtree is a character (NPC/creature) and all
                 // non-skinned geometry within it (bone-attached equipment, head, etc.)
@@ -2171,9 +2415,17 @@ namespace MGE::GeometryCache {
         // (see walk()) — the arm subtree rides the camera, not the world grid.
         if (RenderProcess::wantsFPCapture()) {
             MGE_ZoneScopedN("GeomCache:walkFP");
+            g_fpParticleSystems.clear();   // populated by walk() when it meets NiParticles leaves
             g_walkingFP = true;
             walk(MWBridge::get()->getArmCameraRoot(), /*inCharacter*/true, /*bypassCull*/true);
             g_walkingFP = false;
+
+            // FP particle billboarding (P0, log-only): MW's particle renderer expands each
+            // particle into a camera-facing quad at draw time; under FP suppression that draw
+            // never runs, and visitGeometry captures only particle CENTERS. Rebuild the quads
+            // ourselves against the arm camera. P0 just logs counts + sample positions so we
+            // can confirm the vertex space (local-vs-world) and sizes before wiring to the host.
+            buildFPParticleQuads();
         }
 
         // FP1b: while the host FP pass owns the arms, force MW's arm-scene ROOT appCulled
@@ -2358,6 +2610,18 @@ namespace MGE::GeometryCache {
 
     const std::unordered_set<uint32_t>& moverCandidates() {
         return g_moverCandidates;
+    }
+
+    const void* fpParticleVerts(uint32_t& countOut) {
+        countOut = (uint32_t)g_fpPartVerts.size();
+        return g_fpPartVerts.data();
+    }
+    const void* fpParticleIndices(uint32_t& countOut) {
+        countOut = (uint32_t)g_fpPartIndices.size();
+        return g_fpPartIndices.data();
+    }
+    const std::vector<FPParticleRec>& fpParticleRecs() {
+        return g_fpPartRecs;
     }
 
     void emissiveForDraw(const CachedGeometry& e, float* out) {

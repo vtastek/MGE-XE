@@ -205,7 +205,10 @@ void DistantLand::buildFrustumVisibleSet(const D3DXMATRIX* view, const D3DXMATRI
     ViewFrustum frustum(&viewproj);
 
     // MSOC-culled mode: the engine's authoritative current-frame drawn set.
-    if (Configuration.UseOcclusionCulling && s_earlyClassifyRan) {
+    // Phase 1 host-cull-only (VK_SCROLL): bypass this branch so the produce feeds off the
+    // self-contained frustum-only fallback below (no s_visibleKeys / engine-classify
+    // dependency); the Forge host's Hi-Z GPU cull owns occlusion.
+    if (Configuration.UseOcclusionCulling && s_earlyClassifyRan && !hostCullOnly) {
         s_earlyClassifyRan = false;   // one frame only
 
         // Cut 2B fold: in the Forge baseline (F11 composite + F7 water, no render
