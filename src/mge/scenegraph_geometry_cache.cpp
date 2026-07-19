@@ -623,6 +623,14 @@ namespace MGE::GeometryCache {
                     out.emplace_back(k[0], k[1]);
                 }
             } else if (kd.type == 2) {                // bezier {t, v, forward, backward}
+                // TANGENT CONVENTION (2026-07-19): MW's runtime treats a key's BACKWARD tangent as
+                // the OUTGOING (segment-start) slope and its FORWARD tangent as the INCOMING
+                // (segment-end) slope — the OPPOSITE of niflib. Proven on ex_vivec_waterfall_01:
+                // the VOffset ramp stores its real slope (-3) in key0.backward + key1.forward and
+                // 0 in key0.forward + key1.backward. Feeding (a.fwd, b.bwd) into the Hermite basis
+                // gave both end tangents = 0 → an ease-in/ease-out ramp (visible as a waterfall
+                // that slows then speeds each loop); (a.bwd, b.fwd) reproduces MW's exact linear
+                // constant-speed scroll. So the h10 (start) term takes a.bwd, the h11 (end) b.fwd.
                 struct BK { float t, v, fwd, bwd; };
                 auto keyAt = [&](uint32_t i) {
                     BK k; std::memcpy(&k, bytes + (size_t)i * 16, sizeof(k)); return k;
@@ -642,7 +650,7 @@ namespace MGE::GeometryCache {
                     const float u = dt > 0.0f ? (t - a.t) / dt : 0.0f;
                     const float u2 = u * u, u3 = u2 * u;
                     const float v = (2*u3 - 3*u2 + 1) * a.v + (-2*u3 + 3*u2) * b.v
-                                  + (u3 - 2*u2 + u) * a.fwd + (u3 - u2) * b.bwd;
+                                  + (u3 - 2*u2 + u) * a.bwd + (u3 - u2) * b.fwd;
                     out.emplace_back(t, v);
                 }
             } else if (kd.type == 3) {                // TBC {t, v, tension, bias, continuity}
