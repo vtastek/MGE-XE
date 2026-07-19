@@ -5724,10 +5724,24 @@ namespace {
     // finnicky: a lantern is several NiTriShapes with different bounding spheres, so parts of the
     // fixture's shadow appeared/disappeared). MW marks a light's own hot part with a full-emissive
     // material (light_de_lantern_03: paper = emissive (1,1,1), metal frame = 0), and the material
-    // already rides the draw wires — so skip casters whose max material-emissive component is at or
-    // above this threshold. The paper stops blocking its own light; the frame keeps casting stable
-    // cage shadows. vColSource==1 (vcol drives emissive) has no material signal → never skipped.
-    float g_shadowEmissiveSkip = 0.75f;   // >1.0 disables (no MW material exceeds 1.0)
+    // already rides the draw wires — so treat casters whose max material-emissive component is at or
+    // above this threshold as the fixture's glowing part. The paper stops blocking its own light; the
+    // frame keeps casting stable cage shadows. vColSource==1 (vcol drives emissive) has no material
+    // signal → never treated.
+    //
+    // THRESHOLD IS A NOISE FLOOR, NOT A FIXTURE TEST. The real safety is owner-keying (the carve
+    // fires only in the bake of a light that sits INSIDE this mesh's bound — emissiveOwnerSlot; a
+    // dim-emissive mesh with no enclosed light resolves owner=0 → shadowcaster.frag casts it fully
+    // opaque, unchanged). So the threshold need only exclude zero/noise emissive. It was 0.75 to
+    // match MW's white-(1,1,1) paper convention — but OUR OWN emissive fixture coupling (client
+    // scenegraph_geometry_cache.cpp: emissiveGain = kEmissiveFlux * ownLight.diffuse / area, shipped
+    // as matEmissive*emissiveGain) tints a fixture's emissive to ~0.75*lightColor, so a coloured
+    // lantern ships emMax ~0.5-0.73 (orange (0.73,0.42,0.12), blue (0,0.26,0.48)) and fell just under
+    // 0.75 → hot=0 → self-shadow (dark lantern, load-order dependent: the coupling only applies once
+    // the fixture is paired with its light, immediate after a cell round-trip). 0.15 catches tinted
+    // fixtures while staying above emissive noise; owner-keying keeps non-fixtures unaffected. The
+    // tint is a WANTED feature — do NOT remove it. >1.0 disables the whole emissive-hot treatment.
+    float g_shadowEmissiveSkip = 0.15f;
     // C3b-texel: instead of DROPPING the whole emissive mesh as a caster, submit it and carve it
     // PER-TEXEL in shadowcaster.frag — the glowing texels (lantern glass, candle paper) discard,
     // the dark texels (printed lettering, seams, small imperfections) cast. Lets a lantern's own
