@@ -48,6 +48,22 @@ float4 PS_MAIN( VSOutput In )
     INIT_MAIN;
     float3 N = normalize(In.Normal);
 
+    // Alpha lighting toggles (gFrameData.alphaParams): .z = transmission strength (0 disables),
+    // .w = bitmask (1 = receive point-light shadows, 2 = two-sided LIGHTING). The per-DRAW two-sided
+    // flag (DRAW_BOTH sheets only) rides ClampMode bit2 — packed by the host in packTexAlpha — so a
+    // single-sided draw is never two-sided-lit. Live dev toggles (Alpha tab).
+    float  transStrength = gFrameData.alphaParams.z;
+    uint   alphaToggles  = (uint)(gFrameData.alphaParams.w + 0.5f);
+    bool   receiveShadows = (alphaToggles & 1u) != 0u;
+    // Two-sided lighting applies to ALL alpha when the toggle is on — NOT gated on the per-draw
+    // DRAW_BOTH flag: MW alpha cloth (wall screens, curtains, banners) almost never carries a
+    // NiStencilProperty, so gating on it left two-sided lighting basically never engaging. Alpha is
+    // inherently thin/translucent, so lighting both faces is right for the whole class. (ClampMode
+    // bit2 still carries the DRAW_BOTH flag from the host but is no longer read here.)
+    bool   twoSidedLight  = (alphaToggles & 2u) != 0u;
+    uint   clampMode      = In.ClampMode & 3u;   // strip the (now-unused) two-sided bit before sampling
+    float3 transLit       = float3(0.0f, 0.0f, 0.0f);   // Change 3: accumulated transmitted (back-face) light
+
     // AO sample + toggles — identical to opaque.frag (blended shapes share the scene lighting).
     uint   aoFlags  = (uint)(gFrameData.debugParams.w + 0.5f);
     // C3 debug (panel "ALPHA: caster classify colors", debug bit3): the host replaces each
@@ -59,18 +75,18 @@ float4 PS_MAIN( VSOutput In )
     float4 aoSample = SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
     if ((aoFlags & 2u) != 0u) { N = normalize(aoSample.rgb); }
 
-    // NO normal flip — the authored normal is used as-is, byte-for-byte matching the FFE/PPL
-    // reference and MW's fixed-function pipeline (neither does two-sided lighting; D3D8/9 has no
-    // such render state). The alpha pass now honours each shape's NiStencilProperty cull mode on
-    // the host (single-sided → CULL_BACK, DRAW_BOTH → CULL_NONE), exactly like MW — so a solid
-    // alpha mesh (draped altar cloth) shows only its front face and never needs a per-pixel flip.
-    // (bit4 is retired; the host may still set it, but this frag ignores it.)
-
-    // One-sided sun N.L — matches the FFE reference (XE FixedFuncEmu.fx PerPixelPS:
-    // lightSunDiffuse * saturate(dot(normal, -lightSunDirection))). Parity gaps are DATA
-    // (normals/lights from the cached geometry), never the lighting formula.
-    float  ndl = saturate(dot(N, -gFrameData.sunDir.xyz));
+    // Two-sided LIGHTING (the "normal trick"). A DRAW_BOTH sheet's far face is UNLIT under a one-
+    // sided N.L, so a point-light shadow landing on it can't be SEEN — the light contributes 0 there,
+    // and 0 * shadow = 0. Light BOTH faces with |N.L| so the position-correct shadow shows through.
+    // This is NOT an eye-facing normal flip: that put a VIEW-DEPENDENT dark seam on fold creases
+    // (flickers as you move). |N.L| is view-independent and adds no crease darkening — it only
+    // brightens the back — and it is gated per-draw so single-sided folded carpets keep their
+    // correct one-sided shading. The shadow sample itself is position-based (In.Position), unchanged.
+    float  sndl = dot(N, -gFrameData.sunDir.xyz);
+    float  ndl  = twoSidedLight ? abs(sndl) : saturate(sndl);
     float3 d = gFrameData.sunCol.rgb * ndl;
+    // Change 3 (opt-in, default off): sun transmitting through the far face (wrap term).
+    transLit += gFrameData.sunCol.rgb * saturate(dot(-N, -gFrameData.sunDir.xyz));
     float3 a = ((aoFlags & 4u) != 0u) ? float3(1.0f, 1.0f, 1.0f) : gFrameData.ambCol.rgb;
     if ((aoFlags & 1u) != 0u) { a *= aoSample.a; }
     a *= gFrameData.dbgScales.x;
@@ -98,8 +114,26 @@ float4 PS_MAIN( VSOutput In )
             float  att = 1.0f / max(fo.z * dist2 + fo.y * dist + fo.x, 1e-4f);
             att *= 1.0f - smoothstep(POINT_LIGHT_TAIL * reach, reach, dist);
 
-            float  lambert = saturate(dot(N, toLight) * invDist);   // one-sided (FFE parity)
+            // Change 1: receive point-light shadows — byte-identical to opaque.frag:143-152. The
+            // host patches falloff.w = shadow slot + 1 (0 = no shadow); shadowmask.comp already did
+            // the cube-face atlas PCF, so the slot's 4-bit visibility just scales the light.
+            uint slotP1 = (uint)gLights.lights[i * 3u + 2u].w;
+            if (receiveShadows && slotP1 != 0u)
+            {
+                uint4 mw   = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xyzw;
+                uint  s    = slotP1 - 1u;
+                uint  lane = s >> 3u;
+                uint  word = lane == 0u ? mw.x : (lane == 1u ? mw.y : (lane == 2u ? mw.z : mw.w));
+                uint  nib  = (word >> ((s & 7u) * 4u)) & 0xFu;
+                att *= float(nib) * (1.0f / 15.0f);
+            }
+
+            float  ndlp    = dot(N, toLight) * invDist;
+            float  lambert = twoSidedLight ? abs(ndlp) : saturate(ndlp);   // two-sided lights the far face
             d += lambert * att * lightCol;
+            // Change 3: this light transmitting through the far face — back-facing lambert, reusing
+            // the same att (incl. the shadow nibble above, so transmitted light is occluded too).
+            transLit += saturate(dot(-N, toLight) * invDist) * att * lightCol;
         }
     }
     d *= gFrameData.dbgScales.y;
@@ -114,7 +148,7 @@ float4 PS_MAIN( VSOutput In )
         lit = In.MatDiffuse * d + In.MatAmbient * a + In.MatEmissive;
     }
 
-    float4 albedo = sampleBase(In.TexIndex, In.ClampMode, In.Uv, useLowAF(In.AlphaRef, true));
+    float4 albedo = sampleBase(In.TexIndex, clampMode, In.Uv, useLowAF(In.AlphaRef, true));
 
     // Alpha test (some blended shapes ALSO alpha-test). Same GREATEREQUAL approximation.
     if (albedo.a < In.AlphaRef) { discard; }
@@ -128,6 +162,10 @@ float4 PS_MAIN( VSOutput In )
     float outA     = albedo.a * vcolA * matAlpha;
 
     float3 c = albedo.rgb * lit;
+    // Change 3: add transmitted (wrap) light, tinted by the sheet's own albedo and scaled by its
+    // thinness (1 - final opacity: thinner/more-transparent -> more bleed-through). transStrength
+    // (alphaParams.z) drives it live; at 0 the far side is flat MW-dark (parity).
+    c += transStrength * (1.0f - outA) * transLit * albedo.rgb;
     c *= gFrameData.dbgScales.w;
     c = tonemap(c);
     c = lerp(gFrameData.fogColNear.rgb, c, In.Fog);

@@ -1053,15 +1053,20 @@ STRUCT(FrameData)
 
     float4 froxelDims;
     float4 froxelZ;
-#line 106
+
+
+
+
+    float4 alphaShadowParams;
+#line 111
 };
 
 STRUCT(BatchData)
 {
     float4x4 worlds[ 1024 ];
-#line 111
+#line 116
 };
-#line 132 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 137 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(LightData)
 {
     float4 lightParams;
@@ -1077,7 +1082,7 @@ STRUCT(LightData)
 
     float4 froxelDimsNear;
     float4 froxelZNear;
-#line 147
+#line 152
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1138,7 +1143,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 223 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 228 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 896 ] :  register(t0,space0);
 
 
@@ -1206,6 +1211,22 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     float3 N = normalize(In.Normal);
 
 
+
+
+
+    float transStrength = gFrameData.alphaParams.z;
+    uint alphaToggles = (uint)(gFrameData.alphaParams.w + 0.5f);
+    bool receiveShadows = (alphaToggles & 1u) != 0u;
+
+
+
+
+
+    bool twoSidedLight = (alphaToggles & 2u) != 0u;
+    uint clampMode = In.ClampMode & 3u;
+    float3 transLit = float3(0.0f, 0.0f, 0.0f);
+
+
     uint aoFlags = (uint)(gFrameData.debugParams.w + 0.5f);
 
 
@@ -1215,9 +1236,19 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     float2 aoUv = In.Position.xy * gFrameData.debugParams.yz;
     float4 aoSample = SampleTex2D(gAO, gSamplerAnisotropic, aoUv);
     if ((aoFlags & 2u) != 0u) { N = normalize(aoSample.rgb); }
-#line 72 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/alpha.frag.fsl"
-    float ndl = saturate(dot(N, -gFrameData.sunDir.xyz));
+
+
+
+
+
+
+
+
+    float sndl = dot(N, -gFrameData.sunDir.xyz);
+    float ndl = twoSidedLight ? abs(sndl) : saturate(sndl);
     float3 d = gFrameData.sunCol.rgb * ndl;
+
+    transLit += gFrameData.sunCol.rgb * saturate(dot(-N, -gFrameData.sunDir.xyz));
     float3 a = ((aoFlags & 4u) != 0u) ? float3(1.0f, 1.0f, 1.0f) : gFrameData.ambCol.rgb;
     if ((aoFlags & 1u) != 0u) { a *= aoSample.a; }
     a *= gFrameData.dbgScales.x;
@@ -1245,8 +1276,26 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
             float att = 1.0f / max(fo.z * dist2 + fo.y * dist + fo.x, 1e-4f);
             att *= 1.0f - smoothstep( 0.75f  * reach, reach, dist);
 
-            float lambert = saturate(dot(N, toLight) * invDist);
+
+
+
+            uint slotP1 = (uint)gLights.lights[i * 3u + 2u].w;
+            if (receiveShadows && slotP1 != 0u)
+            {
+                uint4 mw = LoadTex2D(gShadowMask, NO_SAMPLER, int2(In.Position.xy), 0).xyzw;
+                uint s = slotP1 - 1u;
+                uint lane = s >> 3u;
+                uint word = lane == 0u ? mw.x : (lane == 1u ? mw.y : (lane == 2u ? mw.z : mw.w));
+                uint nib = (word >> ((s & 7u) * 4u)) & 0xFu;
+                att *= float(nib) * (1.0f / 15.0f);
+            }
+
+            float ndlp = dot(N, toLight) * invDist;
+            float lambert = twoSidedLight ? abs(ndlp) : saturate(ndlp);
             d += lambert * att * lightCol;
+
+
+            transLit += saturate(dot(-N, toLight) * invDist) * att * lightCol;
         }
     }
     d *= gFrameData.dbgScales.y;
@@ -1261,7 +1310,7 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
         lit = In.MatDiffuse * d + In.MatAmbient * a + In.MatEmissive;
     }
 
-    float4 albedo = sampleBase(In.TexIndex, In.ClampMode, In.Uv, useLowAF(In.AlphaRef, true));
+    float4 albedo = sampleBase(In.TexIndex, clampMode, In.Uv, useLowAF(In.AlphaRef, true));
 
 
     if (albedo.a < In.AlphaRef) { discard; }
@@ -1275,6 +1324,10 @@ float4 PS_MAIN( VSOutput In ): SV_TARGET
     float outA = albedo.a * vcolA * matAlpha;
 
     float3 c = albedo.rgb * lit;
+
+
+
+    c += transStrength * (1.0f - outA) * transLit * albedo.rgb;
     c *= gFrameData.dbgScales.w;
     c = tonemap(c);
     c = lerp(gFrameData.fogColNear.rgb, c, In.Fog);

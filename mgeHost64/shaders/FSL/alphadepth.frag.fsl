@@ -61,7 +61,7 @@ ROOT_SIGNATURE(DefaultRootSignature)
 void PS_MAIN( VSOutput In )
 {
     INIT_MAIN;
-    float4 albedo = sampleBase(In.TexIndex, In.ClampMode, In.Uv, useLowAF(In.AlphaRef, true));
+    float4 albedo = sampleBase(In.TexIndex, In.ClampMode & 3u, In.Uv, useLowAF(In.AlphaRef, true));  // bit2 = two-sided flag (alpha.frag)
 
     // The cutout test first, matching alpha.frag exactly (some blended shapes ALSO alpha-test).
     // A discarded cutout texel is a hole — it must not write depth.

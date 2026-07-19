@@ -61,6 +61,13 @@
 #include "alphadepth.frag.fsl"
 #end
 
+// Alpha SHADOW-RECEIVE depth prepass — twin of alphadepth.frag at a separate, lower opacity
+// threshold (froxelZ.z), rendered into the dedicated pAlphaShadowDepth so a near-opaque sheet
+// (paper curtain) receives its own point-light shadow without weakening the 0.95 fold-fix.
+#frag alphashadowdepth.frag
+#include "alphashadowdepth.frag.fsl"
+#end
+
 #frag depthonly_mm.frag
 #include "depthonly_mm.frag.fsl"
 #end

@@ -1053,15 +1053,20 @@ STRUCT(FrameData)
 
     float4 froxelDims;
     float4 froxelZ;
-#line 106
+
+
+
+
+    float4 alphaShadowParams;
+#line 111
 };
 
 STRUCT(BatchData)
 {
     float4x4 worlds[ 1024 ];
-#line 111
+#line 116
 };
-#line 132 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 137 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
 STRUCT(LightData)
 {
     float4 lightParams;
@@ -1077,7 +1082,7 @@ STRUCT(LightData)
 
     float4 froxelDimsNear;
     float4 froxelZNear;
-#line 147
+#line 152
 };
 
         CBUFFER(FrameData) gFrameData :  register(b0,space1);
@@ -1138,7 +1143,7 @@ STRUCT(LightData)
 
 
         CBUFFER(LightData) gLights :  register(b0,space3);
-#line 223 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
+#line 228 "C:/projects/mgexe/MGE-XE/mgeHost64/shaders/FSL/opaque.srt.h"
         Tex2D(float4) gTextures[ 896 ] :  register(t0,space0);
 
 
@@ -1195,7 +1200,7 @@ STRUCT(VSOutput)
 void PS_MAIN( VSOutput In )
 {
     INIT_MAIN;
-    float4 albedo = sampleBase(In.TexIndex, In.ClampMode, In.Uv, useLowAF(In.AlphaRef, true));
+    float4 albedo = sampleBase(In.TexIndex, In.ClampMode & 3u, In.Uv, useLowAF(In.AlphaRef, true));
 
 
 

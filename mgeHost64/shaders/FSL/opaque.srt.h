@@ -103,6 +103,11 @@ STRUCT(FrameData)
     // these). Slice metric = length(worldPosRel), matching froxelassign.comp exactly.
     DATA(float4, froxelDims, None);   // x=tilesX, y=tilesY, z=NZslices, w=tileSize(px); x<=0 => brute loop
     DATA(float4, froxelZ,    None);   // x=log(d0), y=invLogRange (1/log(d1/d0)); zw unused
+    // Alpha SHADOW-RECEIVE threshold (496B, float index 124). x = the opacity at/above which an alpha
+    // sheet writes into the dedicated shadow-receive depth (alphashadowdepth.frag) so it receives its
+    // own point-light shadow — SEPARATE from alphaParams.x (the fold-fix depth-write threshold). Only
+    // alphashadowdepth.frag reads it; 0 elsewhere is inert. 512B == the 512B host CBV.
+    DATA(float4, alphaShadowParams, None);
 };
 
 STRUCT(BatchData)
