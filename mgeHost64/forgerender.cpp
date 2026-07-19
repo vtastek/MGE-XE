@@ -10576,13 +10576,29 @@ namespace ForgeRender {
                 for (uint32_t k = 0; k < nFPA; ++k) {
                     const IPC::AlphaDrawWire& it = fpaItems[k];
                     const uint32_t slot = it.slot;
-                    if (slot == IPC::kAlphaSlotCaptured) { continue; }   // FP list is cache-mesh only
-                    if (slot >= g_meshHigh || !g_meshes[slot].valid) { continue; }
-                    HostMesh& m = g_meshes[slot];
-                    if (m.skinned || m.multimap) { continue; }
-                    Buffer*  meshVb = m.inArena ? g_live.pArenaVB : m.vb;
-                    Buffer*  meshIb = m.inArena ? g_live.pArenaIB : m.ib;
-                    if (!meshVb || !meshIb) { continue; }
+                    // Resolve VB/IB + draw range for captured (FP particles: torch flame /
+                    // enchant sparks — client-billboarded quads in the shared captured VB/IB)
+                    // or a cache-mesh slot.
+                    Buffer*  meshVb; Buffer* meshIb;
+                    uint32_t firstVertex, firstIndex, drawIndexCount;
+                    if (slot == IPC::kAlphaSlotCaptured) {
+                        if (!g_live.pCapAlphaVB || !g_live.pCapAlphaIB
+                            || it.indexCount == 0
+                            || it.indexBase + it.indexCount > capIdxAvail
+                            || it.vertexBase >= capVertsAvail) { continue; }
+                        meshVb = g_live.pCapAlphaVB;  meshIb = g_live.pCapAlphaIB;
+                        firstVertex = it.vertexBase;  firstIndex = it.indexBase;  drawIndexCount = it.indexCount;
+                    } else {
+                        if (slot >= g_meshHigh || !g_meshes[slot].valid) { continue; }
+                        HostMesh& m = g_meshes[slot];
+                        if (m.skinned || m.multimap) { continue; }
+                        meshVb = m.inArena ? g_live.pArenaVB : m.vb;
+                        meshIb = m.inArena ? g_live.pArenaIB : m.ib;
+                        if (!meshVb || !meshIb) { continue; }
+                        firstVertex = m.inArena ? (uint32_t)(m.vbOff / sizeof(IPC::GeomVertexWire)) : 0u;
+                        firstIndex  = m.inArena ? (uint32_t)(m.ibOff / sizeof(uint16_t)) : 0u;
+                        drawIndexCount = m.indexCount;
+                    }
                     const uint32_t idx = alphaDrawn + fpAlphaDrawn;      // tail of the main alpha window
                     if (idx >= kMaxAlphaDraws) { break; }
 
@@ -10620,13 +10636,11 @@ namespace ForgeRender {
                         cmdBindPipeline(g_live.pCmd, want);
                         curFPAlphaPipe = want;
                     }
-                    const uint32_t firstVertex = m.inArena ? (uint32_t)(m.vbOff / sizeof(IPC::GeomVertexWire)) : 0u;
-                    const uint32_t firstIndex  = m.inArena ? (uint32_t)(m.ibOff / sizeof(uint16_t)) : 0u;
                     Buffer*  vbs[2]     = { meshVb, g_live.pAlphaInstanceBuf };
                     uint32_t strides[2] = { vStride, iStride };
                     cmdBindVertexBuffer(g_live.pCmd, 2, vbs, strides, nullptr);
                     cmdBindIndexBuffer(g_live.pCmd, meshIb, INDEX_TYPE_UINT16, 0);
-                    cmdDrawIndexedInstanced(g_live.pCmd, m.indexCount, firstIndex, 1, firstVertex, idx);
+                    cmdDrawIndexedInstanced(g_live.pCmd, drawIndexCount, firstIndex, 1, firstVertex, idx);
                     ++fpAlphaDrawn;
                 }
             }

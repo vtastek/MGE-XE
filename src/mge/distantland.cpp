@@ -141,8 +141,11 @@ void DistantLand::frameSetupEarly() {
     // classify-visible keys are freshened off their live NiTriShapes inside
     // buildFrustumVisibleSet (ensureLive), with a full-walk fallback when no
     // classify ran. Exteriors AND interiors (classify runs in both).
+    // Phase 1 host-cull-only: live-draw-build leans on the engine classify to discover
+    // newly-visible objects (lazy capture from s_visibleKeys). With the classify decoupled,
+    // force it off so onFrameReady's full refresh walk does the discovery instead.
     const bool liveDrawBuild =
-        Configuration.ForgeLiveDrawBuild && RenderProcess::ownsOpaqueWorld();
+        Configuration.ForgeLiveDrawBuild && RenderProcess::ownsOpaqueWorld() && !hostCullOnly;
 
     if (isDistantCell() && !mwBridge->IsMenu()) {
         // Kick the distant-statics cull FIRST — before the GeometryCache walk —

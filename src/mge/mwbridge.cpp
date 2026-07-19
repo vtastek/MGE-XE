@@ -938,6 +938,17 @@ NI::Node* MWBridge::getArmCameraRoot() {
 
 //-----------------------------------------------------------------------------
 
+NI::Camera* MWBridge::getArmCamera() {
+    DWORD wc = read_dword(0x7C67DC);
+    if (wc == 0) {
+        return nullptr;
+    }
+    // armCamera CameraData::camera (NiCamera*, derives from NI::Camera) at +0x150+0x10.
+    return (NI::Camera*)read_dword(wc + 0x150 + 0x10);
+}
+
+//-----------------------------------------------------------------------------
+
 bool MWBridge::getRenderCameraState(int which, float pos[3], float dir[3], float up[3],
                                     float right[3], float camData[5]) {
     DWORD wc = read_dword(0x7C67DC);

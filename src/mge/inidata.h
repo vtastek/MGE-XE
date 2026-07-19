@@ -164,7 +164,7 @@ const iniSetting iniSettings[] = {
     {&Configuration.ForgeAlphaSuppressS1, t_bool, 1, siniMisc, "Forge Alpha Suppress S1", True, &dictBool, DICTONLY, 0, 0},
     {&Configuration.ForgeAlphaCapture, t_bool, 1, siniMisc, "Forge Alpha Capture", True, &dictBool, DICTONLY, 0, 0},
     {&Configuration.ForgeFPPass, t_bool, 1, siniMisc, "Forge FP Pass", False, &dictBool, DICTONLY, 0, 0},
-    {&Configuration.ForgeFPSuppress, t_bool, 1, siniMisc, "Forge FP Suppress", False, &dictBool, DICTONLY, 0, 0},
+    {&Configuration.ForgeFPSuppress, t_bool, 1, siniMisc, "Forge FP Suppress", True, &dictBool, DICTONLY, 0, 0},
     {&Configuration.UseRenderProcessEx, t_bool, 1, siniMisc, "Use Render Process Ex", True, &dictBool, DICTONLY, 0, 0},
 
     // Distant Land flags

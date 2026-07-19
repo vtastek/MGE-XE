@@ -115,6 +115,14 @@ public:
     // Set when frameSetupEarly already ran the grass cull (pre-kickoff, channel free);
     // renderDepth skips its own cullGrass then (grass depth/color consume the same VB).
     static bool earlyCulledGrass;
+    // Phase 1 (MW-only pipeline): route the Forge produce's visible set OFF the engine
+    // MSOC classify. When true, liveDrawBuild is forced off (onFrameReady's full refresh
+    // walk discovers newly-visible objects instead of the classify's lazy-capture) and
+    // buildFrustumVisibleSet takes the frustum-only branch (whole-cache frustum cull, no
+    // s_visibleKeys dependency) — the host's two-phase Hi-Z GPU cull then owns ALL
+    // occlusion. A/B live via VK_SCROLL. Boot default off (= known-good MSOC path) until
+    // verified; Phase 2 deletes earlyClassifyMainScene once this is proven.
+    static bool hostCullOnly;
     static int numWaterVerts, numWaterTris;
 
     static IDirect3DDevice9* device;

@@ -10,6 +10,9 @@
 
 // The panel body — defined in renderexterior.cpp, where all flow/foam settings are in scope.
 extern void DrawFlowFoamPanel();
+// Forge seam / Phase-1 dev toggles — defined in renderprocess.cpp (reaches the seam state).
+// Shares the F10 overlay; clickable replacement for the hardware-key A/B toggles.
+extern void DrawForgeDevPanel();
 
 namespace {
     bool g_init    = false;
@@ -59,8 +62,10 @@ void onPresent(IDirect3DDevice9* device) {
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
 
-    if (g_visible)
+    if (g_visible) {
         DrawFlowFoamPanel();
+        DrawForgeDevPanel();
+    }
 
     ImGui::EndFrame();
     ImGui::Render();
