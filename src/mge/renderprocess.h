@@ -42,6 +42,12 @@ namespace RenderProcess {
     void onStage0CompositeKickoff(IDirect3DDevice9* device);
     void onStage0CompositeFinish(IDirect3DDevice9* device);
 
+    // Frame-start kick (async OVERLAP mode + early-kickoff frames only): dispatch the produce the
+    // instant frameSetupEarly has built its inputs, instead of after frameSetupEarly returns. The
+    // paired finish still runs from onStage0CompositeKickoff moments later, under the build.
+    // No-op on every other path — those kick from the dispatcher as before.
+    void kickProduceEarly(IDirect3DDevice9* device);
+
     // Produce-worker OVERLAP mode (NUMPAD8 -> 2): drains the async produce kicked at BeginScene(0)
     // so it completes within the quiescent scene-0 window (before the finish reads g_kick and before
     // mwstart(N+1) mutates the live scene graph the worker read). No-op in the OFF/FENCED modes and

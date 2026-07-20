@@ -711,6 +711,22 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
             // UI scene, apply post-process if there was anything drawn before it
             // Race menu will render an extra scene past this point
             if (DistantLand::ready && sceneCount > 0 && !isFrameComplete) {
+                // After-first-person Forge composite (early-kickoff frames): this is the first
+                // point past ALL of MW's main-view scenes (opaque, alpha, first-person, sunglare)
+                // and before the HUD below — the correct order to lay the host frame, which
+                // includes host-rendered hands, over MW's. BLIT ONLY: it reads g_mainTex, which
+                // doDeferredFinish already finished + copied back at BeginScene(0), so it needs
+                // no produce wait. The wait deliberately does NOT live here — with Phase 2 the
+                // scenes between the kick and this point are empty (MW's 3D is rejected at the
+                // proxy gate), so waiting here just parked the whole ~4.5ms produce inside the
+                // Tracy UI zone (blocked≈workerRun, hidden≈0.3ms). It now drains at the NEXT
+                // frame's onFrameAheadCollect instead, under Present + MW's ~5.5ms un-zoned
+                // frame start (mwstart) — the only overlap window this frame shape still has.
+                // onFrameAheadBlit self-gates on g_mainTexValid. Non-early frames composite at
+                // EndScene(0) and skip this. postProcess() is a proven draw point here.
+                if (DistantLand::earlyForgeKickoff && Configuration.UseAsyncHostFrame) {
+                    RenderProcess::onFrameAheadBlit(realDevice);
+                }
                 DistantLand::postProcess();
             }
 
@@ -781,26 +797,31 @@ HRESULT _stdcall MGEProxyDevice::EndScene() {
             // the whole MW frame, which the early-kickoff eligibility predicate already
             // guarantees is RPC-free on both channels.
             if (Configuration.UseAsyncHostFrame) {
-                // Produce-worker OVERLAP mode: drain the async produce kicked at BeginScene(0) NOW,
-                // before kickoffPending()/finishDeferred() read g_kick — this bounds the worker's
-                // live-NI reads to the quiescent scene-0 window (out of mwstart(N+1)). No-op in the
-                // OFF/FENCED modes.
-                RenderProcess::waitProduce();
-                if (!RenderProcess::kickoffPending()) {
-                    RenderProcess::onStage0CompositeKickoff(realDevice);
-                }
-                if (RenderProcess::ownsOpaqueWorld() && Configuration.ForgeNearDepthReplay) {
-                    DistantLand::renderCacheDepthToMainZ();
-                }
-                if (RenderProcess::finishDeferred()) {
-                    // Frame-ahead (ForgeFrameAhead): the host is still rendering THIS
-                    // frame — blit the PREVIOUS one from g_mainTex (zero IPC, zero
-                    // wait); the finish + copy run at the next BeginScene(0) collect.
-                    // Late/warm-up kickoffs never defer, so they fall through to the
-                    // same-frame finish below — no black frame on pipeline entry.
-                    RenderProcess::onFrameAheadBlit(realDevice);
-                } else {
+                // After-FP consume (early-kickoff frames): the produce wait + composite blit
+                // move OUT of here to the first-person→UI transition (BeginScene UI branch,
+                // the postProcess point). Phase 2 emptied scene 0, so waiting on the ~3ms
+                // produce worker here just blocked exposed; deferring it to after scenes 1..FP
+                // hides it under MW's alpha + first-person draws, and blitting there lays the
+                // host frame (incl. host-rendered hands) in the correct order, before the HUD.
+                // The N-1 host FINISH still ran at BeginScene (doDeferredFinish, ~0 — host is
+                // hidden by frame-ahead) and already copied g_mainTex, so the relocated blit
+                // needs no second g_kick holder. See mged3d8device BeginScene UI branch.
+                //
+                // Non-early frames (interiors/menus/warm-up) never deferred and have no
+                // after-FP overlap to gain — finish here exactly as before.
+                if (!DistantLand::earlyForgeKickoff) {
+                    RenderProcess::waitProduce();
+                    if (!RenderProcess::kickoffPending()) {
+                        RenderProcess::onStage0CompositeKickoff(realDevice);
+                    }
+                    if (RenderProcess::ownsOpaqueWorld() && Configuration.ForgeNearDepthReplay) {
+                        DistantLand::renderCacheDepthToMainZ();
+                    }
                     RenderProcess::onStage0CompositeFinish(realDevice);
+                } else if (RenderProcess::ownsOpaqueWorld() && Configuration.ForgeNearDepthReplay) {
+                    // Near-depth replay (if enabled) must still precede scene-1 alpha even on
+                    // early frames — only the produce wait + blit relocate, not this.
+                    DistantLand::renderCacheDepthToMainZ();
                 }
             } else {
                 if (RenderProcess::ownsOpaqueWorld() && Configuration.ForgeNearDepthReplay) {
