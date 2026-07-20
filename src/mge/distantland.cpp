@@ -225,6 +225,13 @@ void DistantLand::frameSetupEarly() {
             earlyCulledGrass = true;
         }
 
+        // FRAME-START KICK. Everything the produce consumes now exists (camera, cache walk,
+        // classify, visible set) and the last scene-0 RPC (the grass cull above) has vacated the
+        // channel — so dispatch the worker HERE rather than after frameSetupEarly returns. The
+        // render-thread kick below and the rest of the frame then overlap the ~3.5ms build instead
+        // of sitting in front of it. No-op outside async OVERLAP mode / early-kickoff frames.
+        RenderProcess::kickProduceEarly(device);
+
         // Kick the render-thread depth-cache job now — after the geometry-cache
         // walk (so the cache + VBs it consumes are stable) and before the engine's
         // sky pass — so the worker's ~1ms submission CPU overlaps the engine's
@@ -260,6 +267,9 @@ void DistantLand::frameSetupEarly() {
                                              &eyePos.x, cacheGateRadius, liveDrawBuild);
             earlyWalkedCache = true;
             buildFrustumVisibleSet(&mwView, &mwProj);
+            // Frame-start kick (see the exterior branch): interiors have no scene-0 RPC at all, so
+            // the channel is free the moment the visible set is built.
+            RenderProcess::kickProduceEarly(device);
         }
     }
 }
@@ -308,6 +318,22 @@ void DistantLand::renderStage0() {
     // job has had the whole sky window to finish, so this typically reads ~0.
     if (renderThreadJobKicked) {
         MGE::RenderThread::wait();
+    }
+
+    // Phase 2 (MW-only pipeline): Forge renders ALL 3D. On steady-state Forge frames
+    // (earlyForgeKickoff — the geometry-cache walk + frustum-visible set were already
+    // built in frameSetupEarly, the distant-statics cull RPC is gated off there, and
+    // every DX9 pass below would be overwritten by the present composite), skip the
+    // entire DX9 scene layer. Preserve only the per-frame record-list clear this stage
+    // owned: recordMW/recordSky are still captured in inspectIndexedPrimitive but have
+    // no Forge consumer, so they must be drained here or they grow across frames. The
+    // render-thread fence above still ran and the Tracy sky zone was closed at the top.
+    // Warm-up / menu / F11-off frames (!earlyForgeKickoff) fall through to the full path
+    // — that's where the cache-walk fallback and the statics-RPC drain still live.
+    if (earlyForgeKickoff) {
+        recordMW.clear();
+        recordSky.clear();
+        return;
     }
 
     // (Channel-free gate moved into renderDepth, right after renderDepthFromCache:
@@ -732,6 +758,17 @@ void DistantLand::renderStage1() {
 #endif
     MGE_ZoneScopedN("Stage1");
     MGE_TracyPlot("MW draw calls", (int64_t)recordMW.size());
+
+    // Phase 2 (MW-only pipeline): Forge renders all 3D — skip MGE's grass + shadow
+    // overlay on steady-state Forge frames. Grass returns host-side (fed from distant-
+    // land data); the shadow overlay is already Forge-gated below. Preserve the recordMW
+    // clear this stage owned. (!earlyForgeKickoff keeps the full path for warm-up / menu
+    // / F11-off; the Tracy MW-draws zone was closed at the top.)
+    if (earlyForgeKickoff) {
+        recordMW.clear();
+        return;
+    }
+
     auto mwBridge = MWBridge::get();
     IDirect3DStateBlock9* stateSaved;
     UINT passes;

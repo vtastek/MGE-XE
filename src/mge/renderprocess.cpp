@@ -19,6 +19,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <mutex>
+#include <atomic>
 #include <thread>
 #include <cstdint>
 #include <cstring>
@@ -175,6 +176,61 @@ namespace {
         double bEnsure, bEmit, bTail, bTailEnsure, bTailScan, bTailAlpha; std::uint32_t bKeys;   // Phase 0 build-split sub-probe
     };
     KickState g_kick = {};
+
+    // Frame-ahead finish holder. The produce worker OWNS g_kick from the moment it is kicked
+    // (kickoffBody resets it), so N-1's deferred-finish state must be moved out of g_kick BEFORE
+    // the kick — that hand-off is what lets the kick run ahead of the finish instead of behind it.
+    // stashDeferredFinish() moves it here; doDeferredFinish() consumes it. Main thread only.
+    KickState g_pendingFinish = {};
+
+    // Host-RPC serialisation gate. There is ONE shared host RT (g_importImg), so the host must not
+    // begin frame N until the client has finished frame N-1 and copied that RT out. With the kick
+    // moved ahead of the finish, the worker can reach renderSceneKickoff before main has done
+    // either — so the worker blocks here until main signals. In practice main's finish+copy runs
+    // under the worker's ~3.5ms build and the gate is already open when the worker arrives (wait
+    // ≈ 0); the block is correctness insurance, not the expected path. Armed only on the async
+    // (mode 2, early-kickoff) path — every other path is main-thread-serial and leaves it open.
+    inline double nowMs();   // fwd (defined below)
+
+    std::mutex              g_finishGateMx;
+    std::condition_variable g_finishGateCv;
+    bool                    g_finishGateOpen = true;
+
+    // Set by kickProduceEarly, cleared at the frame-start collect. Guards the dispatcher against
+    // re-kicking (and re-waiting on) a produce that frameSetupEarly already dispatched.
+    bool g_earlyKicked = false;
+
+    void armFinishGate()  { std::lock_guard<std::mutex> l(g_finishGateMx); g_finishGateOpen = false; }
+    void openFinishGate() {
+        { std::lock_guard<std::mutex> l(g_finishGateMx); g_finishGateOpen = true; }
+        g_finishGateCv.notify_all();
+    }
+    // Worker-side: block until the previous frame's finish+copy has released the shared state.
+    // MAIN thread returns immediately — main is the thread that OPENS the gate, so waiting on it
+    // there would self-deadlock (flushGeometry has main-thread callers on the non-async paths).
+    std::atomic<std::thread::id> g_produceThreadId{};
+
+    double waitFinishGate() {
+        if (std::this_thread::get_id() != g_produceThreadId.load(std::memory_order_relaxed)) {
+            return 0.0;
+        }
+        std::unique_lock<std::mutex> l(g_finishGateMx);
+        if (g_finishGateOpen) return 0.0;
+        MGE_ZoneScopedN("Forge kickoff gate (prev finish)");
+        const double t0 = nowMs();
+        g_finishGateCv.wait(l, [] { return g_finishGateOpen; });
+        return nowMs() - t0;
+    }
+
+    // Gate + probe. Called at every point where the produce crosses from client-private memory
+    // into shared memory the host may still be reading for the previous frame.
+    void gateOnPrevFinish() {
+        const double gateMs = waitFinishGate();
+        if (gateMs > 0.05) {
+            MGE_TracyPlot("Forge kickoff gate ms", gateMs);   // compiles out in Release
+            (void)gateMs;
+        }
+    }
 
     inline double nowMs() {
         static LARGE_INTEGER freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
@@ -1238,6 +1294,9 @@ namespace {
         if (g_pendingBlob.size() < kPendingFlushBytes) {
             return;
         }
+        // Load-burst escape hatch out of the client-private half: this drains to shared memory
+        // mid-build, so it needs the same release as the flush below (see gateOnPrevFinish).
+        gateOnPrevFinish();
         if (g_kick.rpcPending) {
             g_kick.rpcPending       = false;
             g_kick.rpcEarlyFinished = true;
@@ -2741,14 +2800,16 @@ namespace RenderProcess {
         bool ok;            // finish AND copy both succeeded
         double hostMs, overlap, tWait0, tRender, tCopy;
     };
-    FinishResult finishAndCopy() {
+    // ks = the kickoff state being finished: g_kick for a same-frame (fused/async) finish,
+    // g_pendingFinish for a frame-ahead deferred finish — by then the worker owns g_kick.
+    FinishResult finishAndCopy(KickState& ks) {
         FinishResult r = {};
-        const bool earlyFinished = g_kick.rpcEarlyFinished;   // mid-walk drain closed the window
-        if (!g_kick.rpcPending && !earlyFinished) {
+        const bool earlyFinished = ks.rpcEarlyFinished;   // mid-walk drain closed the window
+        if (!ks.rpcPending && !earlyFinished) {
             return r;
         }
-        g_kick.rpcPending       = false;
-        g_kick.rpcEarlyFinished = false;
+        ks.rpcPending       = false;
+        ks.rpcEarlyFinished = false;
         r.consumed = true;
 
         // overlap = the MW frame work the host render ran under. In fused mode (Finish
@@ -2756,11 +2817,11 @@ namespace RenderProcess {
         // serial breakdown — the exact A/B. Async ≈ scene 0; deferred collect ≈ the whole
         // previous MW frame. An early finish ends the overlap at the drain.
         r.tWait0 = nowMs();
-        r.overlap = (earlyFinished ? g_kick.tEarlyFinish : r.tWait0) - g_kick.tKick;
+        r.overlap = (earlyFinished ? ks.tEarlyFinish : r.tWait0) - ks.tKick;
 
         if (earlyFinished) {
-            r.ok     = g_kick.earlyOk;
-            r.hostMs = g_kick.earlyHostMs;
+            r.ok     = ks.earlyOk;
+            r.hostMs = ks.earlyHostMs;
         } else {
             MGE_ZoneScopedN("Forge renderSceneFinish (host wait)");
             r.ok = g_client->renderSceneFinish(&r.hostMs);
@@ -2887,28 +2948,29 @@ namespace RenderProcess {
     // (post-copy) and the blit bucket is the PREVIOUS EndScene's deferred blit — carried
     // in via pipeBlitMs (1-frame skew, irrelevant across the 300-frame window) — folded
     // into feed so it stays "the client's own cost" and comparable across all modes.
-    void accumFrameStats(const FinishResult& fr, double tEnd, bool pipelined, double pipeBlitMs) {
+    void accumFrameStats(const KickState& ks, const FinishResult& fr, double tEnd,
+                         bool pipelined, double pipeBlitMs) {
         const double blitMs = pipelined ? pipeBlitMs : (tEnd - fr.tCopy);
         // feed EXCLUDES the overlap window — it's the client's own cost, comparable
         // across fused/async/pipelined: (kickoff prep) + (residual wait + copy + blit).
-        const double feed = (g_kick.tKick - g_kick.tStart) + (tEnd - fr.tWait0)
+        const double feed = (ks.tKick - ks.tStart) + (tEnd - fr.tWait0)
                           + (pipelined ? pipeBlitMs : 0.0);
-        const double renderBucket = (g_kick.tKick - g_kick.tAssign) + (fr.tRender - fr.tWait0);
+        const double renderBucket = (ks.tKick - ks.tAssign) + (fr.tRender - fr.tWait0);
 
         // Baseline heartbeat over every composited frame (sees the <kSpikeMs majority).
         // Cut 2B: build first, then geom flush (fold frames capture during build).
-        g_hb.feed += feed; g_hb.geom += (g_kick.tGeomFlush - g_kick.tBuild);
-        g_hb.build += (g_kick.tBuild - g_kick.tStart);
+        g_hb.feed += feed; g_hb.geom += (ks.tGeomFlush - ks.tBuild);
+        g_hb.build += (ks.tBuild - ks.tStart);
         g_hb.render += renderBucket; g_hb.host += fr.hostMs; g_hb.overlap += fr.overlap;
-        g_hb.copy += (fr.tCopy - fr.tRender); g_hb.blit += blitMs; g_hb.dt += g_kick.dtPresent;
+        g_hb.copy += (fr.tCopy - fr.tRender); g_hb.blit += blitMs; g_hb.dt += ks.dtPresent;
         g_hb.mwstart += g_pendingMwStart; g_pendingMwStart = 0.0;   // A0 Cut-4 probe (1-frame skew on deferred frames)
-        g_hb.captured += g_kick.capturedCount;
-        g_hb.bEnsure += g_kick.bEnsure; g_hb.bEmit += g_kick.bEmit; g_hb.bTail += g_kick.bTail;   // Phase 0 build-split
-        g_hb.bTailEnsure += g_kick.bTailEnsure; g_hb.bKeys += g_kick.bKeys;
-        g_hb.bTailScan += g_kick.bTailScan; g_hb.bTailAlpha += g_kick.bTailAlpha;
+        g_hb.captured += ks.capturedCount;
+        g_hb.bEnsure += ks.bEnsure; g_hb.bEmit += ks.bEmit; g_hb.bTail += ks.bTail;   // Phase 0 build-split
+        g_hb.bTailEnsure += ks.bTailEnsure; g_hb.bKeys += ks.bKeys;
+        g_hb.bTailScan += ks.bTailScan; g_hb.bTailAlpha += ks.bTailAlpha;
         if (feed > g_hb.maxFeed) g_hb.maxFeed = feed;
-        if (g_kick.dtPresent > g_hb.maxDt) g_hb.maxDt = g_kick.dtPresent;
-        if (g_kick.early) ++g_hb.earlyN;
+        if (ks.dtPresent > g_hb.maxDt) g_hb.maxDt = ks.dtPresent;
+        if (ks.early) ++g_hb.earlyN;
         if (pipelined) ++g_hb.pipeN;
         if (++g_hb.n >= kHeartbeatFrames) {
             // pipe = frames whose finish deferred to the collect; refuse = CUMULATIVE
@@ -2972,16 +3034,16 @@ namespace RenderProcess {
             LOG::logline("!! [spike] frame %u feed=%.2fms early=%u defer=%u pipe=%u (geomflush=%.2f build=%.2f texflush=%.2f "
                          "assign=%.2f render=%.2f[host=%.2f] overlap=%.2f copy=%.2f blit=%.2f) "
                          "draws=%u skin=%u mm=%u light=%u alpha=%u cap=%u geom+=%u/%uKB tex+=%u/%uKB dt=%.2fms",
-                         g_kick.frame, feed,
-                         (unsigned)g_kick.early, (unsigned)g_kick.deferFinish, (unsigned)pipelined,
-                         g_kick.tGeomFlush - g_kick.tBuild, g_kick.tBuild - g_kick.tStart,
-                         g_kick.tTexFlush - g_kick.tGeomFlush, g_kick.tAssign - g_kick.tTexFlush,
+                         ks.frame, feed,
+                         (unsigned)ks.early, (unsigned)ks.deferFinish, (unsigned)pipelined,
+                         ks.tGeomFlush - ks.tBuild, ks.tBuild - ks.tStart,
+                         ks.tTexFlush - ks.tGeomFlush, ks.tAssign - ks.tTexFlush,
                          renderBucket, fr.hostMs, fr.overlap, fr.tCopy - fr.tRender, blitMs,
-                         g_kick.drawCount, g_kick.skinnedCount, g_kick.multiMapCount, g_kick.lightCount,
-                         g_kick.alphaCount, g_kick.capturedCount,
-                         g_kick.geomParts, (unsigned)(g_kick.geomBytes >> 10),
-                         g_kick.texCount, (unsigned)(g_kick.texBytes >> 10),
-                         g_kick.dtPresent);
+                         ks.drawCount, ks.skinnedCount, ks.multiMapCount, ks.lightCount,
+                         ks.alphaCount, ks.capturedCount,
+                         ks.geomParts, (unsigned)(ks.geomBytes >> 10),
+                         ks.texCount, (unsigned)(ks.texBytes >> 10),
+                         ks.dtPresent);
         }
     }
 
@@ -3113,6 +3175,25 @@ namespace RenderProcess {
         // GPU geometry — nothing to ship).
         const std::uint32_t geomParts = g_pendingParts;            // snapshot (flush clears it)
         const std::size_t   geomBytes = g_pendingBlob.size();
+
+        // ---- END OF THE CLIENT-PRIVATE HALF. Everything above wrote only *Scratch/g_pendingBlob
+        // (client memory); everything below writes SHARED memory the host is still reading for
+        // frame N-1 — the geometry blob, then the draw/skinned/multiMap/light/sky/alpha vectors,
+        // then the RenderFrame params, and finally the one imported host RT.
+        //
+        // Being a frame ahead means two frames are alive at once, and every resource they share is
+        // single-buffered. The kick now runs AHEAD of the finish (that is what recovered the host
+        // overlap), so without this gate the worker overwrites frame N's geometry while the host is
+        // mid-render on N-1 — visible as alternating good/bad frames, worst on geometry that is
+        // re-uploaded every frame (particles: smoke/flames flicker).
+        //
+        // So the gate sits HERE, not at renderSceneKickoff: the whole ~3-4ms build overlaps the
+        // finish (the win), and not one shared byte is touched until main's renderSceneFinish +
+        // RT copy have released frame N-1. Expected wait ≈ 0 — the finish is ~1.7ms under a ~3.5ms
+        // build. If "Forge kickoff gate ms" starts showing real time, the build got cheaper than
+        // the finish and double-buffering the shared vectors is the next move.
+        gateOnPrevFinish();
+
         {
             MGE_ZoneScopedN("Forge geom flush");
             flushGeometry();
@@ -3597,6 +3678,8 @@ namespace RenderProcess {
     private:
         void run() {
             MGE_TracyNameThread("Forge Produce Worker");   // labels the worker's lane in Tracy
+            // Identify this thread to waitFinishGate — only the produce worker blocks on the gate.
+            g_produceThreadId.store(std::this_thread::get_id(), std::memory_order_relaxed);
             for (;;) {
                 IDirect3DDevice9* device;
                 {
@@ -3624,12 +3707,26 @@ namespace RenderProcess {
     };
     ProduceWorker g_produceWorker;
 
+    void doDeferredFinish();      // fwd (defined below); Phase 0 deferred wait
+    void stashDeferredFinish();   // fwd (defined below); move g_kick's finish state to the holder
+
     // Drain an in-flight async (mode 2) produce. Idempotent + cheap when none is pending, so it can
     // be called unconditionally at the finish boundary. Records how long the main thread actually
     // blocked (0 == the produce was fully hidden under scene 0). MUST be called before any code
     // reads g_kick or kickoffPending()/finishDeferred() for control flow.
     void waitProduce() {
         if (!g_produceInFlight) return;
+        // DEADLOCK INVARIANT: main must never block on the worker while the finish gate is shut.
+        // The gate is armed at the kick (kickProduceEarly, inside frameSetupEarly) and opened by
+        // doDeferredFinish in the dispatcher moments later — but any main-thread waitProduce()
+        // landing in that window would park main on a worker that is itself parked on a gate only
+        // main can open. That is the load freeze: initOnLoad -> collectDeferredFinish ->
+        // waitProduce, reached without ever passing the dispatcher.
+        //
+        // Doing the pending finish here is not just the unwedge, it is the correct action: the
+        // finish is precisely what the worker is waiting for, and it has to happen before the
+        // frame can advance anyway. No-op once the dispatcher has already run it.
+        doDeferredFinish();
         const double t0 = nowMs();
         g_produceWorker.wait();
         g_produceBlockedMs = nowMs() - t0;
@@ -3644,13 +3741,23 @@ namespace RenderProcess {
         }
     }
 
-    void doDeferredFinish();   // fwd (defined below); Phase 0 deferred wait
 
     // Dispatcher: route the produce onto the fresh worker per g_produceMode (unless the legacy
     // UseRenderThread path owns threading). Mode 2 (OVERLAP) only defers the wait on early-kickoff
     // frames — there the kick fires at BeginScene(0) and the paired waitProduce() runs at
     // EndScene(0); every other frame fences here so g_kick is complete on return exactly as inline.
     void onStage0CompositeKickoff(IDirect3DDevice9* device) {
+        // Frame-start kick already dispatched this frame's produce: the ONLY thing left here is the
+        // N-1 finish, which runs under the worker's build. Returning early is essential, not an
+        // optimisation — the waitProduce() below would drain the produce we just kicked (blocking
+        // main for the whole build) and clear g_produceInFlight, after which the kick guard would
+        // read "nothing in flight" and dispatch a SECOND kickoffBody. That was two composite
+        // kickoffs and two blocking waits in one frame (~24ms).
+        if (g_earlyKicked) {
+            doDeferredFinish();
+            return;
+        }
+
         // Never kick while a previous async produce is still in flight (would race m_device); the
         // normal EndScene waitProduce already drained it, this is a belt-and-braces no-op there.
         waitProduce();
@@ -3660,22 +3767,66 @@ namespace RenderProcess {
         // BeginScene window to finish and this wait collapses to ~0. MUST precede kickoffBody's
         // g_kick reset (it consumes N-1's g_kick state) AND the worker dispatch (finishAndCopy is
         // D3D9, main-only). On non-early frames this is a no-op — collectDeferredFinish already ran.
-        doDeferredFinish();
-
         if (g_produceMode == 0 || Configuration.UseRenderThread) {
+            doDeferredFinish();
             kickoffBody(device);
             return;
         }
         g_produceWorker.ensure();
         if (g_produceMode == 2 && DistantLand::earlyForgeKickoff) {
-            g_produceKickMs   = nowMs();
-            g_produceInFlight = true;
-            g_produceWorker.kick(device);        // async — waited at EndScene(0) before the finish
+            // KICK FIRST, FINISH SECOND. The old order (finish N-1, then kick N) put the whole
+            // deferred finish — host wait + Forge RT copy — in front of the worker, which fed a
+            // loop: a late kick issues the host RPC late, so the host gets less overlap, so the
+            // next finish waits longer, so the next kick is later still ([hb] render 1.4 -> 5.3,
+            // overlap 8.1 -> 2.6). Kicking first breaks it: the ~3.5ms build now runs UNDER the
+            // finish+copy instead of after it, and the host RPC goes out ~5ms earlier.
+            //
+            // Hand-off: the worker resets g_kick on entry, so N-1's finish state must be moved to
+            // g_pendingFinish BEFORE the kick. The shared-RT ordering (host must not start frame N
+            // until the copy released the RT) is held by the finish gate, which the worker waits on
+            // immediately before renderSceneKickoff.
+            // frameSetupEarly may already have kicked at the earliest possible point (see
+            // kickProduceEarly) — then only the finish is left to do here.
+            if (!g_produceInFlight) {
+                stashDeferredFinish();
+                armFinishGate();
+                g_produceKickMs   = nowMs();
+                g_produceInFlight = true;
+                g_produceWorker.kick(device);    // async — drained at the NEXT frame's collect
+            }
+            doDeferredFinish();                  // runs under the worker's build; opens the gate
             return;
         }
+        doDeferredFinish();
         // Mode 1 (FENCED) or mode 2 on a non-early frame: kick + wait immediately (serial).
         g_produceWorker.kick(device);
         g_produceWorker.wait();
+    }
+
+    // Kick the produce at FRAME START — the earliest point in the frame where its inputs exist.
+    // Called from frameSetupEarly the instant the geometry-cache walk + frustum-visible set are
+    // built (and after the grass cull, the one remaining scene-0 RPC), rather than waiting for
+    // frameSetupEarly to return and the dispatcher to run. Everything the produce needs is ready
+    // there; the rest of frameSetupEarly (render-thread kick, return path) is pure main-thread work
+    // that now overlaps the build instead of delaying it.
+    //
+    // The N-1 finish deliberately does NOT run first: the host frame is a full frame ahead and ends
+    // well before the worker's ~3.5ms build reaches shared memory. onStage0CompositeKickoff does
+    // the finish moments later, under the build. gateOnPrevFinish is the proof — if the previous
+    // frame ever does NOT end in time, it shows up as "Forge kickoff gate ms" in Tracy instead of
+    // as corruption.
+    void kickProduceEarly(IDirect3DDevice9* device) {
+        if (g_produceMode != 2 || Configuration.UseRenderThread || !DistantLand::earlyForgeKickoff) {
+            return;   // every other path is main-thread-serial and kicks from the dispatcher
+        }
+        waitProduce();          // belt-and-braces: never kick over an in-flight produce
+        g_earlyKicked = true;   // tells the dispatcher this frame is already dispatched
+        g_produceWorker.ensure();
+        stashDeferredFinish();  // hand N-1's finish state over before the worker resets g_kick
+        armFinishGate();
+        g_produceKickMs   = nowMs();
+        g_produceInFlight = true;
+        g_produceWorker.kick(device);
     }
 
     void onStage0CompositeFinish(IDirect3DDevice9* device) {
@@ -3691,12 +3842,12 @@ namespace RenderProcess {
         }
         MGE_ZoneScopedN("Forge composite finish");
 
-        const FinishResult fr = finishAndCopy();
+        const FinishResult fr = finishAndCopy(g_kick);
         if (!fr.ok) {
             return;
         }
         compositeBlitMainTex(device);
-        accumFrameStats(fr, nowMs(), false, 0.0);
+        accumFrameStats(g_kick, fr, nowMs(), false, 0.0);
     }
 
     void onStage0Composite(IDirect3DDevice9* device) {
@@ -3712,8 +3863,21 @@ namespace RenderProcess {
         return g_kick.rpcPending || g_produceInFlight;
     }
 
+    // A deferred finish is pending in the HOLDER (stashDeferredFinish moved it there). Reads no
+    // worker-owned state, so it is safe while a produce is in flight.
     bool finishDeferred() {
-        return g_kick.deferFinish && (g_kick.rpcPending || g_kick.rpcEarlyFinished);
+        return g_pendingFinish.deferFinish
+            && (g_pendingFinish.rpcPending || g_pendingFinish.rpcEarlyFinished);
+    }
+
+    // Move this frame's deferred finish out of g_kick into the holder. MUST run on the main thread
+    // before the produce worker is kicked (kickoffBody resets g_kick). No-op on non-deferred frames.
+    void stashDeferredFinish() {
+        if (!g_kick.deferFinish || (!g_kick.rpcPending && !g_kick.rpcEarlyFinished)) {
+            return;
+        }
+        g_pendingFinish = g_kick;
+        g_kick.deferFinish = g_kick.rpcPending = g_kick.rpcEarlyFinished = false;
     }
 
     void onFramePresented() {
@@ -3742,9 +3906,19 @@ namespace RenderProcess {
             MGE_TracyPlot("MW frame start ms", g_pendingMwStart);
         }
         pollDevKeys();
-        // Defensive: normally EndScene(0) already drained the mode-2 async produce, but if that
-        // frame's scene-0 path was skipped it could still be in flight — drain it before anything
-        // downstream reads g_kick (a no-op in the common case).
+        g_earlyKicked = false;   // new frame: no frame-start kick has fired yet
+        // THE produce drain point (mode 2). The previous frame kicked the worker at its
+        // BeginScene(0) and nothing in that frame waited for it, so it has had all of frame
+        // N-1's tail + Present + MW's un-zoned frame start (mwstart, ~5.5ms of engine
+        // input/sim/AI/animation) to run — the only overlap window left once Phase 2 emptied
+        // MW's scenes. Waiting here also fixes the ordering: it precedes frameSetupEarly (which
+        // rewalks the geometry cache + rebuilds the visible set the worker reads) and every
+        // downstream reader of g_kick (doDeferredFinish consumes N-1's state; kickoffBody resets
+        // it). No-op in modes 0/1 and on non-early frames, which fence at the kickoff.
+        //
+        // NI-read note: the worker reads the live scene graph, so it now spans mwstart(N), where
+        // the engine mutates it. Accepted deliberately (we are a frame ahead and the host owns
+        // the draw); g_produceMode 1 (FENCED) is the instant A/B back to an in-frame fence.
         waitProduce();
         // Phase 0: the previous frame's deferred finish NO LONGER runs here. It moves to
         // collectDeferredFinish (non-early / not-ready frames, after frameSetupEarly latches the
@@ -3757,11 +3931,17 @@ namespace RenderProcess {
     // resets g_kick for the new frame.
     void doDeferredFinish() {
         if (!finishDeferred()) {
+            // Nothing to release, but the worker may be parked on the gate (armed unconditionally
+            // at the kick) — open it or the host RPC never goes out.
+            openFinishGate();
             return;
         }
         MGE_ZoneScopedN("Forge deferred finish");
-        g_kick.deferFinish = false;
-        const FinishResult fr = finishAndCopy();
+        g_pendingFinish.deferFinish = false;
+        const FinishResult fr = finishAndCopy(g_pendingFinish);
+        // The shared host RT is released the moment finishAndCopy returns (success or not) — the
+        // copy is the last thing that reads it. Let the worker issue frame N's kickoff now.
+        openFinishGate();
         if (!fr.ok) {
             // Host death / copy failure: g_mainTexValid is already down, so the next
             // deferred blit skips — the same empty-world frame as today's finish-failure
@@ -3770,7 +3950,7 @@ namespace RenderProcess {
             g_lastBlitMs = 0.0;
             return;
         }
-        accumFrameStats(fr, nowMs(), true, g_lastBlitMs);
+        accumFrameStats(g_pendingFinish, fr, nowMs(), true, g_lastBlitMs);
         g_lastBlitMs = 0.0;
     }
 
@@ -3778,6 +3958,13 @@ namespace RenderProcess {
         // Non-early / not-ready frames: finish the previous deferred frame NOW, at BeginScene,
         // before the MGE pipeline (selectDistantCell/culls/depth) reuses the IPC channel. Early
         // frames skip this and defer to the kickoff. See doDeferredFinish.
+        //
+        // A produce can still be in flight here now that the wait spans the frame boundary — the
+        // load/reset backstop (initOnLoad) reaches this without passing onFrameAheadCollect. Drain
+        // it first, then stash: these paths never went through the kick-first dispatcher, so a
+        // deferred finish may still be sitting in g_kick rather than the holder.
+        waitProduce();
+        stashDeferredFinish();
         doDeferredFinish();
     }
 
