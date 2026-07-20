@@ -202,7 +202,17 @@ void DistantLand::frameSetupEarly() {
         // kick (so the snapshot below captures the engine-set). Null camera = plugin
         // resolves the world camera. No-op (frustum cull stands) if the plugin predates
         // the export or self-declines (root unverified, scene disabled).
-        earlyClassifyMainScene(nullptr);
+        //
+        // SKIPPED under host-cull-only: renderdepth.cpp's MSOC branch is gated on
+        // (UseOcclusionCulling && s_earlyClassifyRan && !hostCullOnly), so with the host's Hi-Z
+        // GPU cull owning occlusion the classify's answer is DISCARDED — we were paying ~1.4ms of
+        // main-thread time per frame for a result nobody reads, and paying it on the critical path
+        // between MW's physics and the produce kick, delaying the host RPC by its full duration.
+        // buildFrustumVisibleSet falls back to the self-contained frustum cull (the same path the
+        // plugin-absent case already takes), and the host culls what the frustum over-includes.
+        if (!hostCullOnly) {
+            earlyClassifyMainScene(nullptr);
+        }
 
         // Build the current-frame visible set over the fresh cache, using the camera
         // read above (mwView/mwProj). This is the set MGE owns: the depth pre-pass
@@ -255,7 +265,11 @@ void DistantLand::frameSetupEarly() {
         // a pure-frustum visible set and drew clutter the engine occludes). This fills
         // s_visibleKeys + latches s_earlyClassifyRan; renderDepth's buildFrustumVisibleSet
         // then consumes it (MSOC branch) once it has walked the cache.
-        earlyClassifyMainScene(nullptr);
+        // Same host-cull-only skip as the exterior branch above — the result is discarded when
+        // the host's Hi-Z GPU cull owns occlusion, so don't pay for it on the critical path.
+        if (!hostCullOnly) {
+            earlyClassifyMainScene(nullptr);
+        }
 
         // 2b: early-Forge-kickoff frames need the kickoff's inputs ready NOW — hoist the
         // cache walk + current-frame visible set here (the exact pair renderDepth's

@@ -106,6 +106,12 @@ public:
     // in the arm cull/render pass that FP suppression skips, so the facing goes stale.
     // Null when unavailable.
     NI::Camera* getArmCamera();
+    // MW-ONLY-UI: the WORLD camera's NiCamera (the which==0 counterpart of getArmCamera).
+    // Needed to re-face world billboards ourselves once suppression stops MW traversing the
+    // world roots — MW re-orients NiBillboardNode during its cull pass, so without that pass
+    // flame/glow quads keep last frame's facing (edge-on, and tilted off vertical). Null when
+    // unavailable.
+    NI::Camera* getWorldCamera();
     // FP1a: world-space state of one WorldControllerRenderCamera (which: 0 =
     // worldCamera/main view, 1 = armCamera/first person): the NiCamera basis
     // (pos/dir/up/right) + the CameraData projection params {fovDegrees (HORIZONTAL),

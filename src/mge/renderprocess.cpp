@@ -2788,6 +2788,10 @@ namespace RenderProcess {
             LOG::logline(">> [seam] host-cull-only (Phase 1, frustum set) %s",
                          DistantLand::hostCullOnly ? "ON" : "OFF");
         }
+
+        // (MW-ONLY-UI world suppression has NO key: the keyspace is full — numpad - is already
+        // the distant-light A/B a few lines above, and binding it there made one press fire both.
+        // It lives in the Forge Dev imgui panel instead, where its level is also readable.)
     }
 
     // Consume the pending host RenderFrame: drain the completion (or the stored mid-walk
@@ -4482,6 +4486,29 @@ void DrawForgeDevPanel() {
             "walk + whole-cache frustum cull); the host Hi-Z GPU cull owns occlusion. The\n"
             "engine MSOC classify is bypassed (was Scroll Lock).\n"
             "OFF: known-good MSOC / live-draw-build path.");
+
+    // MW-ONLY-UI: how much of MW's world the ENGINE is forbidden to traverse. Phase 2 stopped
+    // MGE drawing and the proxy rejects MW's draws one by one, but MW still walks its whole
+    // scene graph and issues every call first — that traversal is the mwsky/mwdraws time.
+    // A combo, not a key: the level must be READABLE. It was invisible before, a level-1
+    // session got read as level 3, and the conclusion drawn from it was wrong.
+    ImGui::Separator();
+    ImGui::Text("MW world traversal");
+    const char* supNames[] = { "0 - full (off)", "1 - no landscape",
+                               "2 - no landscape/pick", "3 - UI only" };
+    if (ImGui::Combo("suppress", &DistantLand::mwWorldSuppress, supNames, 4)) {
+        LOG::logline(">> [seam] MW world suppression -> %d (%s)",
+                     DistantLand::mwWorldSuppress, supNames[DistantLand::mwWorldSuppress]);
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Forbids the ENGINE from traversing MW's world roots (appCulled), so it stops\n"
+            "walking the scene and issuing draws the proxy would only reject.\n"
+            "1 landscape: host owns terrain, terrain emits no blended DIPs - safe.\n"
+            "2 +pick: ground items; loses any captured blend they emit.\n"
+            "3 +objects: statics/NPCs, the bulk of the traversal. World particles reach us\n"
+            "ONLY via captureAlphaDraw intercepting MW's own draws, so at 3 they stop\n"
+            "arriving - watch smoke/flames. Weather/VFX roots are never suppressed.");
 
     ImGui::Separator();
     ImGui::Text("Produce worker (NUMPAD8)");

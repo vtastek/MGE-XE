@@ -284,6 +284,21 @@ namespace MGE::GeometryCache {
     // of entries stamped. Called from onFrameReady for the player's inactive-POV body.
     uint32_t markSubtreeSuppressed(void* avObject);
 
+    // MW-ONLY-UI world suppression. Drives appCulled on MW's world roots so the ENGINE stops
+    // traversing them (Phase 2 stopped MGE drawing, but MW still walked the graph and issued
+    // every draw for the proxy to reject). Level ladder, applied in onFrameReady AFTER our
+    // capture walks: 0 none, 1 landscape, 2 +pick objects, 3 +world objects.
+    // Higher levels also suppress the blended DIPs captureAlphaDraw consumes from those roots —
+    // verify visually before trusting level 3. Weather/VFX roots are never suppressed.
+    void applyWorldSuppression(int level);
+    // The level currently APPLIED to the engine's roots (not the requested one). Consumers that
+    // walk those roots themselves must consult this and bypass the root's appCulled flag, or they
+    // read an empty scene — see SceneGraph::runWalk.
+    int  worldSuppressionApplied();
+    // Clear every flag we set. Called at the UI transition and at Present: the roots are shared
+    // with MW's off-screen targets (local map), which must never render culled.
+    void restoreWorldSuppression();
+
     const std::unordered_map<uint32_t, CachedGeometry>& cache();
 
     // Keys whose cached entry passes the offscreen shadow-caster PRE-DISTANCE mover filter

@@ -949,6 +949,18 @@ NI::Camera* MWBridge::getArmCamera() {
 
 //-----------------------------------------------------------------------------
 
+NI::Camera* MWBridge::getWorldCamera() {
+    DWORD wc = read_dword(0x7C67DC);
+    if (wc == 0) {
+        return nullptr;
+    }
+    // worldCamera CameraData::camera — same layout as the arm camera above, at the
+    // which==0 struct base (see getRenderCameraState: 0x124 vs the arm's 0x150).
+    return (NI::Camera*)read_dword(wc + 0x124 + 0x10);
+}
+
+//-----------------------------------------------------------------------------
+
 bool MWBridge::getRenderCameraState(int which, float pos[3], float dir[3], float up[3],
                                     float right[3], float camData[5]) {
     DWORD wc = read_dword(0x7C67DC);

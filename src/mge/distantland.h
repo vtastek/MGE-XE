@@ -123,6 +123,10 @@ public:
     // occlusion. A/B live via VK_SCROLL. Boot default off (= known-good MSOC path) until
     // verified; Phase 2 deletes earlyClassifyMainScene once this is proven.
     static bool hostCullOnly;
+    // MW-ONLY-UI: how much of MW's world the engine is forbidden to traverse, 0..3 (none /
+    // landscape / +pick / +objects). Set from the Forge Dev imgui panel — no key, the keyspace
+    // is full and the level needs to be readable. See GeometryCache::applyWorldSuppression.
+    static int  mwWorldSuppress;
     static int numWaterVerts, numWaterTris;
 
     static IDirect3DDevice9* device;

@@ -23,6 +23,7 @@
 #include "datahandler_view.h"
 #include "mwbridge.h"
 #include "scenegraph.h"
+#include "distantland.h"                 // DistantLand::mwWorldSuppress (MW-ONLY-UI root cull)
 #include "support/log.h"
 #include "mge_tracy.h"
 
@@ -213,11 +214,35 @@ namespace MGE::SceneGraph {
         // Caller has already set gw_* targets and prepped the
         // destination vectors (cleared / swapped as needed).
         //
+        // MW-ONLY-UI: descend into a root's children WITHOUT testing the root's own appCulled.
+        // GeometryCache::applyWorldSuppression sets that flag on MW's world roots to stop the
+        // ENGINE traversing them — but this lights walk starts AT those roots and runs on its own
+        // worker thread, so it would fire after the flag went up and return an empty snapshot.
+        // That is a near/point-light blackout (distant baked lights come from the host froxel
+        // path, so they stay lit — the tell is "only the near lights changed").
+        // Children keep their normal appCulled gating, so genuinely inactive subtrees still skip.
+        void walkRootBypassCull(NI::Node* root) {
+            if (!root) return;
+            const auto count = root->children.getEndIndex();
+            for (size_t i = 0; i < count; ++i) {
+                walk(root->children.at(i));
+            }
+        }
+
         void runWalk() {
             NI::Node* objRoot  = MGE::DataHandlerView::worldObjectRoot(g_dataHandler);
             NI::Node* pickRoot = MGE::DataHandlerView::worldPickObjectRoot(g_dataHandler);
-            walk(objRoot);
-            walk(pickRoot);
+            // Bypass ONLY the flags we set ourselves (level 2 covers pick, 3 covers objects), so
+            // with suppression off this is bit-for-bit the old walk and a genuine engine cull of
+            // a root is still honoured.
+            //
+            // Test the REQUESTED level, not the applied one: this walk runs on its own worker
+            // thread and can fire at any point in the frame — before the flags go up, or after
+            // Present has cleared them. The requested level is the only value stable across the
+            // whole frame, so it is the only one that gives a race-free answer.
+            const int suppressed = DistantLand::mwWorldSuppress;
+            if (suppressed >= 3) walkRootBypassCull(objRoot);  else walk(objRoot);
+            if (suppressed >= 2) walkRootBypassCull(pickRoot); else walk(pickRoot);
             // Magic-light coverage: projectile/spell/VFX point lights hang under
             // worldRoot siblings the two walks above never visit (a fireball's
             // NiPointLight rides its projectile node under WorldProjectileRoot;

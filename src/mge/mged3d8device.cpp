@@ -18,6 +18,7 @@
 #include "videobackground.h"
 #include "imgui_water.h"
 #include "renderprocess.h"
+#include "scenegraph_geometry_cache.h"   // restoreWorldSuppression (MW-ONLY-UI)
 #include "mge_tracy.h"
 #include "drawstats.h"
 #include "support/timing.h"
@@ -491,6 +492,10 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
     // (ForgeFrameAhead: the poll can run at the BeginScene(0) collect OR the
     // EndScene(0) finish — the serial makes whichever runs first this frame win).
     RenderProcess::onFramePresented();
+    // MW-ONLY-UI backstop: guarantee the world roots are un-culled at the frame boundary. The UI
+    // transition normally restores them, but a frame that never reaches it (menu open, load,
+    // race-menu extra scene) must not leave MW's world culled into the next frame.
+    MGE::GeometryCache::restoreWorldSuppression();
     stage0Complete = false;
     waterDrawn = false;
     isFrameComplete = false;
@@ -727,6 +732,11 @@ HRESULT _stdcall MGEProxyDevice::BeginScene() {
                 if (DistantLand::earlyForgeKickoff && Configuration.UseAsyncHostFrame) {
                     RenderProcess::onFrameAheadBlit(realDevice);
                 }
+                // MW-ONLY-UI: hand MW's world roots back BEFORE the UI/menu layer. Past this
+                // point MW may render off the back buffer (local map at cell changes, inventory
+                // previews) using these same roots — culled roots would draw them empty. The
+                // main-view traversal we wanted to skip is already behind us.
+                MGE::GeometryCache::restoreWorldSuppression();
                 DistantLand::postProcess();
             }
 
