@@ -286,12 +286,18 @@ namespace MGE::GeometryCache {
 
     // MW-ONLY-UI world suppression. Drives appCulled on MW's world roots so the ENGINE stops
     // traversing them (Phase 2 stopped MGE drawing, but MW still walked the graph and issued
-    // every draw for the proxy to reject). Level ladder, applied in onFrameReady AFTER our
-    // capture walks: 0 none, 1 landscape, 2 +pick objects, 3 +world objects.
-    // Higher levels also suppress the blended DIPs captureAlphaDraw consumes from those roots —
-    // verify visually before trusting level 3. Weather/VFX roots are never suppressed.
-    void applyWorldSuppression(int level);
-    // The level currently APPLIED to the engine's roots (not the requested one). Consumers that
+    // every draw for the proxy to reject). Applied in onFrameReady AFTER our capture walks.
+    //
+    // INDEPENDENT BITS, not a ladder. A cumulative ladder cannot attribute a symptom to a root:
+    // "smoke vanished at level 2" only ever implied pick, because level 2 culled landscape AND
+    // pick together. Each root must be switchable alone for the observation to mean anything.
+    //
+    // Suppressing a root also removes the blended DIPs captureAlphaDraw consumes from it (that
+    // content reaches the host ONLY via MW actually issuing the draw). Weather/VFX/projectile/
+    // spell roots are worldRoot siblings and are never suppressed.
+    enum SuppressBits { kSuppressLand = 1, kSuppressPick = 2, kSuppressObjects = 4 };
+    void applyWorldSuppression(int mask);
+    // The mask currently APPLIED to the engine's roots (not the requested one). Consumers that
     // walk those roots themselves must consult this and bypass the root's appCulled flag, or they
     // read an empty scene — see SceneGraph::runWalk.
     int  worldSuppressionApplied();

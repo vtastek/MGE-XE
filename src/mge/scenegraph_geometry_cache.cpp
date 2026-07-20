@@ -2863,13 +2863,13 @@ namespace MGE::GeometryCache {
     // anything else drawn off the back buffer). Leaving them culled past the main view would draw
     // an empty local map, which is why restoreWorldSuppression() runs at the UI transition and
     // again at Present rather than trusting one call site.
-    void applyWorldSuppression(int level) {
-        if (level == g_worldSuppressApplied) return;
+    void applyWorldSuppression(int mask) {
+        if (mask == g_worldSuppressApplied) return;
         // Roots are re-read per frame in onFrameReady; nulls just mean "nothing to do".
-        if (g_landRoot) g_landRoot->setAppCulled(level >= 1);
-        if (g_pickRoot) g_pickRoot->setAppCulled(level >= 2);
-        if (g_objRoot)  g_objRoot->setAppCulled(level >= 3);
-        g_worldSuppressApplied = level;
+        if (g_landRoot) g_landRoot->setAppCulled((mask & kSuppressLand) != 0);
+        if (g_pickRoot) g_pickRoot->setAppCulled((mask & kSuppressPick) != 0);
+        if (g_objRoot)  g_objRoot->setAppCulled((mask & kSuppressObjects) != 0);
+        g_worldSuppressApplied = mask;
     }
 
     void restoreWorldSuppression() {

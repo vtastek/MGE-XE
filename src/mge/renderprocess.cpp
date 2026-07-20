@@ -4492,23 +4492,37 @@ void DrawForgeDevPanel() {
     // scene graph and issues every call first — that traversal is the mwsky/mwdraws time.
     // A combo, not a key: the level must be READABLE. It was invisible before, a level-1
     // session got read as level 3, and the conclusion drawn from it was wrong.
+    // INDEPENDENT checkboxes, not a ladder: a cumulative level cannot attribute a symptom to a
+    // root. "Smoke vanished at level 2" only ever implied pick, because level 2 culled landscape
+    // AND pick together — the conclusion was an inference, not an observation. One box per root
+    // makes each answer direct.
     ImGui::Separator();
-    ImGui::Text("MW world traversal");
-    const char* supNames[] = { "0 - full (off)", "1 - no landscape",
-                               "2 - no landscape/pick", "3 - UI only" };
-    if (ImGui::Combo("suppress", &DistantLand::mwWorldSuppress, supNames, 4)) {
-        LOG::logline(">> [seam] MW world suppression -> %d (%s)",
-                     DistantLand::mwWorldSuppress, supNames[DistantLand::mwWorldSuppress]);
+    ImGui::Text("MW world traversal (appCulled roots)");
+    {
+        int m = DistantLand::mwWorldSuppress;
+        auto bit = [&](const char* label, int flag) {
+            bool on = (m & flag) != 0;
+            if (ImGui::Checkbox(label, &on)) {
+                m = on ? (m | flag) : (m & ~flag);
+                DistantLand::mwWorldSuppress = m;
+                LOG::logline(">> [seam] MW world suppression mask -> %d (land=%d pick=%d obj=%d)",
+                             m, (m & MGE::GeometryCache::kSuppressLand)    ? 1 : 0,
+                                (m & MGE::GeometryCache::kSuppressPick)    ? 1 : 0,
+                                (m & MGE::GeometryCache::kSuppressObjects) ? 1 : 0);
+            }
+        };
+        bit("suppress landscape", MGE::GeometryCache::kSuppressLand);
+        bit("suppress pick objects", MGE::GeometryCache::kSuppressPick);
+        bit("suppress world objects", MGE::GeometryCache::kSuppressObjects);
     }
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip(
-            "Forbids the ENGINE from traversing MW's world roots (appCulled), so it stops\n"
-            "walking the scene and issuing draws the proxy would only reject.\n"
-            "1 landscape: host owns terrain, terrain emits no blended DIPs - safe.\n"
-            "2 +pick: ground items; loses any captured blend they emit.\n"
-            "3 +objects: statics/NPCs, the bulk of the traversal. World particles reach us\n"
-            "ONLY via captureAlphaDraw intercepting MW's own draws, so at 3 they stop\n"
-            "arriving - watch smoke/flames. Weather/VFX roots are never suppressed.");
+            "Forbids the ENGINE from traversing a world root, so it stops walking that\n"
+            "subtree and issuing draws the proxy would only reject.\n"
+            "Content reaching the host via captureAlphaDraw (world particles, blended fire)\n"
+            "exists ONLY because MW really issues the draw - suppressing its root removes it.\n"
+            "Toggle ONE at a time to attribute a missing effect to a specific root.\n"
+            "Weather/VFX/projectile/spell roots are worldRoot siblings, never suppressed.");
 
     ImGui::Separator();
     ImGui::Text("Produce worker (NUMPAD8)");
