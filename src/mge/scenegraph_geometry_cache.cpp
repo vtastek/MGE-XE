@@ -29,6 +29,7 @@
 #include "scenegraph.h"
 #include "scenegraph_geometry_cache.h"
 #include "renderprocess.h"
+#include "distantland.h"   // DistantLand::mwWorldSuppress (MW-ONLY-UI suppression level)
 #include "ipc/geomwire.h"
 #include "support/log.h"
 
@@ -166,6 +167,10 @@ namespace MGE::GeometryCache {
         uint64_t  g_walkRanFrame = 0;      // frame stamp of the last full refresh walk
         NI::Node* g_objRoot  = nullptr;
         NI::Node* g_pickRoot = nullptr;
+
+        // MW-ONLY-UI world suppression: the level currently APPLIED to the engine's roots, so the
+        // flags can be restored exactly (and only when they were ours to set). 0 = nothing culled.
+        int g_worldSuppressApplied = 0;
         NI::Node* g_landRoot = nullptr;
         uint32_t  g_liveRefreshThisFrame = 0;
         uint32_t  g_liveCaptureThisFrame = 0;
@@ -1875,11 +1880,27 @@ namespace MGE::GeometryCache {
                 // (edge-on → invisible even though the alpha part still captures & draws).
                 // During the FP walk only, re-face the billboard against the arm camera and
                 // re-derive its children's world transforms so visitGeometry (below) reads
-                // the corrected orientation. FP-only: world / wall / NPC candles are re-faced
-                // by the engine's own world render every frame and must NOT be touched here.
-                if (g_walkingFP &&
+                // the corrected orientation.
+                //
+                // WORLD billboards need the SAME re-face, and NOT because of suppression — it is
+                // a walk-ORDER problem that predates it. This walk runs at BeginScene(0); MW's
+                // world cull pass, where NiBillboardNode re-faces itself, runs later in scene 0.
+                // The host draws from what we capture here, so we were always shipping the
+                // PREVIOUS frame's facing — invisible while still, plainly wrong as soon as the
+                // camera moves (flames edge-on / not tracking). Proven at suppression level 1,
+                // where MW still traverses objRoot and re-faces normally, and they were stale
+                // anyway. First person never showed it because FP1c above already re-faces.
+                //
+                // So: gate on the host owning the world, not on the suppression level. Doing it
+                // early is harmless when MW re-faces again later — the computation is the same
+                // one, we just need our capture to see the result rather than precede it.
+                const bool refaceWorldBillboards =
+                    !g_walkingFP && !g_walkingSky && RenderProcess::ownsOpaqueWorld();
+                if ((g_walkingFP || refaceWorldBillboards) &&
                     node->isInstanceOfType(NI::RTTIStaticPtr::NiBillboardNode)) {
-                    if (NI::Camera* armCam = MWBridge::get()->getArmCamera()) {
+                    NI::Camera* faceCam = g_walkingFP ? MWBridge::get()->getArmCamera()
+                                                      : MWBridge::get()->getWorldCamera();
+                    if (NI::Camera* armCam = faceCam) {
                         auto* bb = static_cast<NI::BillboardNode*>(node);
                         const NI::Point3& wt = bb->worldTransform.translation;
                         // Guard the erect-mod up-∞ LookUpTarget (z≈3.4e38): never re-face or
@@ -2452,6 +2473,32 @@ namespace MGE::GeometryCache {
             }
         }
 
+        // MW-ONLY-UI: force MW's world roots appCulled so the ENGINE never traverses them.
+        // Phase 2 stopped MGE drawing, and the proxy reject gate drops MW's draws one by one —
+        // but MW still walks its whole scene graph and issues every DrawIndexedPrimitive first.
+        // That traversal + per-draw rejection is the "mwsky"/"mwdraws" time in Tracy: work whose
+        // only product is calls we throw away.
+        //
+        // Applied HERE, after the capture walks above, so our walk still sees the full graph —
+        // and on the ROOTS only, which our walks start AT (walk() checks the node's own flag, and
+        // these roots' children are untouched), exactly like the FP1b arm-root trick.
+        //
+        // Per-root because MW's draws are NOT all waste: captureAlphaDraw (distantland.cpp:1671)
+        // consumes MW's blended DIPs in scene >= 1 for particles/VFX. MW culls ONCE per frame and
+        // draws both scenes off that one list, so suppressing a root kills its scene-1 alpha too.
+        // Hence the ladder — each step is a bet about what the host already draws:
+        //   1 land  : landscape only. Host owns terrain; terrain has no blended DIPs. Safe.
+        //   2 +pick : ground items. Host owns them; loses any captured blend they emit.
+        //   3 +obj  : the big one — statics/NPCs, the bulk of the traversal. Loses captured
+        //             blends from object subtrees (banners/curtains/decals the host cache pass
+        //             does not own). Watch for vanishing alpha bits before trusting it.
+        // Weather/VFX/projectile/spell roots are NEVER suppressed — they are worldRoot siblings
+        // and their particle DIPs are exactly what AT3 capture exists for.
+        {
+            const int level = RenderProcess::ownsOpaqueWorld() ? DistantLand::mwWorldSuppress : 0;
+            applyWorldSuppression(level);
+        }
+
         // SK0 (sky takeover, diagnostic): periodically dump the skyRoot subtree so we can
         // confirm the shapes/materials the real walk will capture. No capture, no draw.
         if (Configuration.LogDistantPipeline) {
@@ -2805,6 +2852,32 @@ namespace MGE::GeometryCache {
             }
         }
         return n;
+    }
+
+    // MW-ONLY-UI: drive the engine's world-root appCulled flags to `level` (0..3, see the ladder
+    // at the call site). Idempotent — re-asserted every frame because the engine rewrites its own
+    // cull state on cell/POV changes — and it only ever clears flags it set itself, so a level
+    // drop or a gate release restores MW exactly.
+    //
+    // MUST be restorable: these roots are shared with MW's OTHER render targets (local map, and
+    // anything else drawn off the back buffer). Leaving them culled past the main view would draw
+    // an empty local map, which is why restoreWorldSuppression() runs at the UI transition and
+    // again at Present rather than trusting one call site.
+    void applyWorldSuppression(int level) {
+        if (level == g_worldSuppressApplied) return;
+        // Roots are re-read per frame in onFrameReady; nulls just mean "nothing to do".
+        if (g_landRoot) g_landRoot->setAppCulled(level >= 1);
+        if (g_pickRoot) g_pickRoot->setAppCulled(level >= 2);
+        if (g_objRoot)  g_objRoot->setAppCulled(level >= 3);
+        g_worldSuppressApplied = level;
+    }
+
+    void restoreWorldSuppression() {
+        applyWorldSuppression(0);
+    }
+
+    int worldSuppressionApplied() {
+        return g_worldSuppressApplied;
     }
 
     uint32_t markSubtreeSuppressed(void* avObject) {

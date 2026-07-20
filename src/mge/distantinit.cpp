@@ -35,7 +35,14 @@ bool DistantLand::earlyWalkedCache = false;
 bool DistantLand::renderThreadJobKicked = false;
 bool DistantLand::earlyForgeKickoff = false;
 bool DistantLand::earlyCulledGrass = false;
-bool DistantLand::hostCullOnly = false;   // Phase 1 A/B (VK_SCROLL); boot = MSOC path
+// Branch A (lead-in shrink): boot HOST-CULL-ONLY. The host's two-phase Hi-Z GPU cull owns
+// occlusion, which lets frameSetupEarly skip the ~1.4ms main-thread MSOC classify entirely —
+// the single largest serial item between MW's physics and the produce kick. VK_SCROLL flips
+// back to the MSOC path for the A/B.
+bool DistantLand::hostCullOnly = true;
+// MW-ONLY-UI: boot at 1 (landscape) — the only level with no captured-alpha risk, since terrain
+// emits no blended DIPs and the host owns it outright. Raise it in the Forge Dev imgui panel.
+int  DistantLand::mwWorldSuppress = 1;
 std::vector<D3DXVECTOR4> DistantLand::reflectionWaterRects;
 bool DistantLand::reflWaterCullActive = true;
 bool DistantLand::reflGateWanted = false;
