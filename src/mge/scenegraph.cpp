@@ -24,6 +24,7 @@
 #include "mwbridge.h"
 #include "scenegraph.h"
 #include "distantland.h"                 // DistantLand::mwWorldSuppress (MW-ONLY-UI root cull)
+#include "scenegraph_geometry_cache.h"   // kSuppress* bits
 #include "support/log.h"
 #include "mge_tracy.h"
 
@@ -241,8 +242,10 @@ namespace MGE::SceneGraph {
             // Present has cleared them. The requested level is the only value stable across the
             // whole frame, so it is the only one that gives a race-free answer.
             const int suppressed = DistantLand::mwWorldSuppress;
-            if (suppressed >= 3) walkRootBypassCull(objRoot);  else walk(objRoot);
-            if (suppressed >= 2) walkRootBypassCull(pickRoot); else walk(pickRoot);
+            if (suppressed & MGE::GeometryCache::kSuppressObjects) walkRootBypassCull(objRoot);
+            else                                                   walk(objRoot);
+            if (suppressed & MGE::GeometryCache::kSuppressPick)     walkRootBypassCull(pickRoot);
+            else                                                    walk(pickRoot);
             // Magic-light coverage: projectile/spell/VFX point lights hang under
             // worldRoot siblings the two walks above never visit (a fireball's
             // NiPointLight rides its projectile node under WorldProjectileRoot;

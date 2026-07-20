@@ -40,9 +40,11 @@ bool DistantLand::earlyCulledGrass = false;
 // the single largest serial item between MW's physics and the produce kick. VK_SCROLL flips
 // back to the MSOC path for the A/B.
 bool DistantLand::hostCullOnly = true;
-// MW-ONLY-UI: boot at 1 (landscape) — the only level with no captured-alpha risk, since terrain
-// emits no blended DIPs and the host owns it outright. Raise it in the Forge Dev imgui panel.
-int  DistantLand::mwWorldSuppress = 1;
+// MW-ONLY-UI: boot OFF. Suppressing landscape has no visible cost, but its frame-time payoff was
+// never isolated, and the whole suppression line measured only ~0.75ms while costing smoke and
+// sorted alpha (tasks/forge-world-particles.md) — not enough to justify shipping an engine-state
+// change by default. Opt in per root from the Forge Dev imgui panel.
+int  DistantLand::mwWorldSuppress = 0;
 std::vector<D3DXVECTOR4> DistantLand::reflectionWaterRects;
 bool DistantLand::reflWaterCullActive = true;
 bool DistantLand::reflGateWanted = false;
