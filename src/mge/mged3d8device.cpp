@@ -152,6 +152,11 @@ static bool isTracyProfilerRunning() {
     return found;
 }
 
+// [s0cost] scene-0 DIP probe (see DrawIndexedPrimitive): calls MW issued this frame, and the
+// wall time spent inside our handler servicing them. Reset each frame in Present.
+static unsigned  g_s0Draws = 0;
+static long long g_s0DrawTicks = 0;
+
 static int sceneCount;
 static bool rendertargetNormal, isHUDready;
 static bool isMainView, isStencilScene, isAmbientWhite;
@@ -491,6 +496,48 @@ HRESULT _stdcall MGEProxyDevice::Present(const RECT* a, const RECT* b, HWND c, c
     // Display-frame tick for the seam's once-per-frame dev-key poll dedup
     // (ForgeFrameAhead: the poll can run at the BeginScene(0) collect OR the
     // EndScene(0) finish — the serial makes whichever runs first this frame win).
+    // [s0cost] Report the scene-0 DIP probe: how many calls MW issued and how much of the
+    // "MW draws" zone was spent inside our handler. If inHandler is a small fraction of the
+    // zone, the zone is engine/GPU time between draws and suppressing traversal cannot reach it.
+    //
+    // STEADY-STATE GATE: the first reading of this probe (in-handler=9.47ms/frame) was
+    // garbage — its own window reported max feed=41.33 dt=69.97, i.e. it had averaged in
+    // load-burst frames where MW streams a cell and issues thousands of draws. Those frames
+    // are not what we are budgeting against. Drop any frame whose inter-Present delta
+    // exceeds kSteadyDtMs, and report how many were dropped so a window that is mostly
+    // bursts can't masquerade as a steady-state measurement.
+    {
+        static LARGE_INTEGER s_freq = {};
+        if (s_freq.QuadPart == 0) QueryPerformanceFrequency(&s_freq);
+        static long long s_prevPresent = 0;
+        static unsigned s_n = 0, s_skipped = 0;
+        static unsigned long long s_draws = 0;
+        static long long s_ticks = 0;
+
+        constexpr double kSteadyDtMs = 25.0;   // ~2x the 11ms steady frame; well under a burst
+        LARGE_INTEGER now; QueryPerformanceCounter(&now);
+        const double dtMs = s_prevPresent
+            ? 1000.0 * (double)(now.QuadPart - s_prevPresent) / (double)s_freq.QuadPart
+            : 0.0;
+        s_prevPresent = now.QuadPart;
+
+        if (dtMs > 0.0 && dtMs <= kSteadyDtMs) {
+            s_draws += g_s0Draws; s_ticks += g_s0DrawTicks;
+            ++s_n;
+        } else if (dtMs > kSteadyDtMs) {
+            ++s_skipped;
+        }
+        if (s_n >= 300) {
+            LOG::logline("-- [s0cost] scene0 DIPs/frame=%.1f  in-handler=%.2fms/frame  "
+                         "(%u steady frames, %u burst frames dropped)",
+                         (double)s_draws / s_n,
+                         1000.0 * (double)s_ticks / (double)s_freq.QuadPart / s_n,
+                         s_n, s_skipped);
+            s_n = 0; s_skipped = 0; s_draws = 0; s_ticks = 0;
+        }
+        g_s0Draws = 0; g_s0DrawTicks = 0;
+    }
+
     RenderProcess::onFramePresented();
     // MW-ONLY-UI backstop: guarantee the world roots are un-culled at the frame boundary. The UI
     // transition normally restores them, but a frame that never reaches it (menu open, load,
@@ -1017,6 +1064,23 @@ HRESULT _stdcall MGEProxyDevice::SetTextureStageState(DWORD a, D3DTEXTURESTAGEST
 // DrawIndexedPrimitive - Where all the drawing happens
 // Inspect draw calls for re-use later
 HRESULT _stdcall MGEProxyDevice::DrawIndexedPrimitive(D3DPRIMITIVETYPE a, UINT b, UINT c, UINT d, UINT e) {
+    // [s0cost] Is the ~2ms "MW draws" zone actually DRAWS? It stays ~2.1ms even with every world
+    // root appCulled, which should leave almost nothing to draw — so either MW still issues a lot
+    // of calls (our reject path is the cost) or it issues very few and the zone is engine/GPU time
+    // between them (nothing here to attack). Count scene-0 DIPs and the wall time spent INSIDE
+    // this handler; Present logs both against the zone. Handler-time << zone-time ⇒ not our draws.
+    const bool s0probe = isMainView && sceneCount == 0;
+    LARGE_INTEGER s0t0;
+    if (s0probe) { QueryPerformanceCounter(&s0t0); ++g_s0Draws; }
+    struct S0Probe {
+        bool on; const LARGE_INTEGER* t0;
+        ~S0Probe() {
+            if (!on) return;
+            LARGE_INTEGER t1; QueryPerformanceCounter(&t1);
+            g_s0DrawTicks += (t1.QuadPart - t0->QuadPart);
+        }
+    } s0probeGuard{ s0probe, &s0t0 };
+
     // Allow distant land to inspect draw calls
     bool isShadowStencil = isStencilScene && stencilRef <= 1;
     if (DistantLand::ready && rendertargetNormal && isMainView && !isShadowStencil) {

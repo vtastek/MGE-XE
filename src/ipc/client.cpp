@@ -609,7 +609,7 @@ namespace IPC {
 		return true;
 	}
 
-	bool Client::renderSceneFinish(double* outRenderMs) {
+	bool Client::renderSceneFinish(double* outRenderMs, HostFrameTimings* outTimings) {
 		// ALWAYS drop the window guard, even on failure — a stale guard would refuse
 		// every subsequent RPC forever (fail-loud, not fail-dead).
 		m_frameWindowOpen = false;
@@ -621,6 +621,9 @@ namespace IPC {
 		auto& params = m_ipcParameters->params.renderFrameParams;
 		if (outRenderMs) {
 			*outRenderMs = params.renderMs;
+		}
+		if (outTimings) {
+			*outTimings = params.hostTimings;
 		}
 		return params.bytesWritten > 0;
 	}

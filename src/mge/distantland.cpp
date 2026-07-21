@@ -25,6 +25,81 @@ static tracy::ScopedZone* s_mwSkyZone   = nullptr;
 static tracy::ScopedZone* s_mwDrawsZone = nullptr;
 #endif
 
+// --- [fse] frameSetupEarly main-thread budget probe --------------------------------
+// The frame is client-main-thread bound, not GPU bound: dt ~= mwstart (engine, ~4.2ms)
+// + ~6.8ms of our own main-thread work, while render= (the wait on the host) sits at
+// ~0.2-1.0ms. frameSetupEarly is where most of that work lives and it has never been
+// zoned, so the 6.8ms is unattributed. Time every step with QPC and average over the
+// same 300-frame window as [hb]. Steps of interest: `cell` issues a BLOCKING setWorldSpace
+// RPC on main, and `walk` is the geometry-cache walk — the relocation target. Only frames
+// that pass the ready/UseSharedMemory gate are counted (menu/load frames are exactly the
+// load-burst contamination that made the first [s0cost] reading useless).
+namespace {
+
+inline double fseNowMs() {
+    static LARGE_INTEGER freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
+    LARGE_INTEGER c; QueryPerformanceCounter(&c);
+    return 1000.0 * (double)c.QuadPart / (double)freq.QuadPart;
+}
+
+constexpr unsigned kFseWindow = 300;
+struct FseAccum {
+    double lights, cell, view, statics, walk, classify, vis, grass, kick, rt, total;
+    double maxTotal;
+    unsigned n, extN;
+};
+FseAccum s_fse = {};
+
+// [mwdraw] probe state: opened in beginDrawsZone (first world DIP of scene 0), closed at
+// renderStage1 (EndScene(0)). 0 = the window never opened this frame (MW culled everything,
+// so EndScene took the !stage0Complete path and no draw ever triggered it).
+double s_mwDrawsT0 = 0.0;
+
+void mwDrawsAccum(double ms) {
+    static double s_sum = 0.0, s_max = 0.0;
+    static unsigned s_n = 0, s_skipped = 0;
+    constexpr double kSteadyMs = 25.0;   // same burst gate as [s0cost]
+    if (ms > kSteadyMs) { ++s_skipped; return; }
+    s_sum += ms; if (ms > s_max) s_max = ms;
+    if (++s_n < kFseWindow) return;
+    LOG::logline(">> [mwdraw] %u frames avg: window=%.3f ms (max=%.3f, %u burst dropped) "
+                 "-- first world DIP -> EndScene(0)",
+                 s_n, s_sum / s_n, s_max, s_skipped);
+    s_sum = 0.0; s_max = 0.0; s_n = 0; s_skipped = 0;
+}
+
+// One call at the end of frameSetupEarly; logs the averaged breakdown every window.
+void fseAccum(double lights, double cell, double view, double statics, double walk,
+              double classify, double vis, double grass, double kick, double rt,
+              double total, bool exterior) {
+    s_fse.lights += lights; s_fse.cell += cell; s_fse.view += view;
+    s_fse.statics += statics; s_fse.walk += walk; s_fse.classify += classify;
+    s_fse.vis += vis; s_fse.grass += grass; s_fse.kick += kick; s_fse.rt += rt;
+    s_fse.total += total;
+    if (total > s_fse.maxTotal) s_fse.maxTotal = total;
+    if (exterior) ++s_fse.extN;
+    if (++s_fse.n < kFseWindow) return;
+
+    const double inv = 1.0 / s_fse.n;
+    // accounted = the sum of the named steps; total - accounted is frameSetupEarly's own
+    // residue (branch/gate work). A large residue means the split is missing a step.
+    const double accounted = (s_fse.lights + s_fse.cell + s_fse.view + s_fse.statics
+                            + s_fse.walk + s_fse.classify + s_fse.vis + s_fse.grass
+                            + s_fse.kick + s_fse.rt) * inv;
+    LOG::logline(">> [fse] %u frames avg: total=%.2f | lights=%.2f cell=%.2f view=%.2f "
+                 "statics=%.2f walk=%.2f classify=%.2f vis=%.2f grass=%.2f kick=%.2f rt=%.2f "
+                 "=> accounted=%.2f residue=%.2f | max total=%.2f ext=%u",
+                 s_fse.n, s_fse.total * inv, s_fse.lights * inv, s_fse.cell * inv,
+                 s_fse.view * inv, s_fse.statics * inv, s_fse.walk * inv,
+                 s_fse.classify * inv, s_fse.vis * inv, s_fse.grass * inv,
+                 s_fse.kick * inv, s_fse.rt * inv,
+                 accounted, s_fse.total * inv - accounted,
+                 s_fse.maxTotal, s_fse.extN);
+    s_fse = {};
+}
+
+} // namespace
+
 // Set by frameSetupEarly() when the per-frame statics-cull setup ran at
 // BeginScene(scene 0); read by renderStage0 to skip the redundant work.
 static bool s_frameSetupEarly   = false;  // selectDistantCell + camera/fog setup done early
@@ -36,6 +111,11 @@ static bool s_earlyKickedStatics = false; // cullDistantStatics_kickoff already 
 // the cull off now — its ~4ms server-side compute then overlaps the ~1.5ms
 // sky window plus the GeometryCache walk, instead of stalling cullDistantStatics_finish.
 void DistantLand::frameSetupEarly() {
+    MGE_ZoneScopedN("frameSetupEarly");
+    // [fse] step stamps (see fseAccum above). Deltas stay 0 for steps this frame skipped.
+    const double tFse0 = fseNowMs();
+    double dStatics = 0, dWalk = 0, dClassify = 0, dVis = 0, dGrass = 0, dKick = 0, dRt = 0;
+
     s_frameSetupEarly = false;
     s_earlyKickedStatics = false;
     earlyWalkedCache = false;
@@ -63,11 +143,14 @@ void DistantLand::frameSetupEarly() {
     // point lights. The camera is this-frame-valid here (BeginScene scene 0), which
     // matches the view/proj the main draws use, so the grid lines up with VPOS.
     FixedFunctionShader::buildTileGrid();
+    const double tLights = fseNowMs();
 
     // Only the IPC (shared-memory) path benefits from the early statics/geometry
     // work: there the cull is async and overlaps. The non-IPC path does
     // synchronous quadtree work in the kickoff, which has no overlap to gain —
     // leave selectDistantCell + the GeometryCache walk in renderStage0/renderDepth.
+    // Not counted in [fse]: menu/load/non-IPC frames are the load-burst contamination
+    // that has to stay out of the steady-state budget.
     if (!ready || !device || !Configuration.UseSharedMemory) return;
 
     auto mwBridge = MWBridge::get();
@@ -77,11 +160,13 @@ void DistantLand::frameSetupEarly() {
     // pure computation into members (no device/effect side-effects — those live
     // in setupCommonEffect/updateLighting, which stay in renderStage0).
     selectDistantCell();
+    const double tCell = fseNowMs();
     device->GetTransform(D3DTS_VIEW, &mwView);
     device->GetTransform(D3DTS_PROJECTION, &mwProj);
     setView(&mwView);
     adjustFog();
     s_frameSetupEarly = true;
+    const double tView = fseNowMs();
 
     // Skip in menus: renderStage0 may take the render-cached path there and
     // never run renderDepth / cullDistantStatics_finish. (An undrained RPC is
@@ -163,6 +248,7 @@ void DistantLand::frameSetupEarly() {
         // and it would squat the main channel exactly where the async RenderFrame
         // needs it. First cut of the MGE gutting, not a workaround; F11/F7-off or
         // fused mode restores it (clean A/B).
+        const double tStatics0 = fseNowMs();
         if ((Configuration.MGEFlags & USE_DISTANT_STATICS) && !earlyForgeKickoff) {
             // Stash the reflection cull inputs FIRST — before the kickoff — so the
             // batched statics RPC can fold in the reflection query (4th query →
@@ -183,6 +269,7 @@ void DistantLand::frameSetupEarly() {
 
             signalCullFinish();
         }
+        dStatics = fseNowMs() - tStatics0;
 
         // Build the geometry cache (walk + VB uploads). The ~1.46ms main-thread
         // walk now overlaps both the sky pass and the worker drain kicked above;
@@ -190,9 +277,11 @@ void DistantLand::frameSetupEarly() {
         // CONSUME (renderDepthFromCache) stays in renderDepth where the render
         // target/effect are bound. Touches no ipcClient, so it can run while the
         // worker drains the statics RPC on the single channel.
+        const double tWalk0 = fseNowMs();
         MGE::GeometryCache::onFrameReady(MGE::SceneGraph::getDataHandler(),
                                          &eyePos.x, cacheGateRadius, liveDrawBuild);
         earlyWalkedCache = true;
+        dWalk = fseNowMs() - tWalk0;
 
         // Stage 2 early classify. Ask the plugin to run the engine's world-camera
         // occlusion classify NOW (before the engine's own renderMainScene CullShow), so
@@ -211,7 +300,9 @@ void DistantLand::frameSetupEarly() {
         // buildFrustumVisibleSet falls back to the self-contained frustum cull (the same path the
         // plugin-absent case already takes), and the host culls what the frustum over-includes.
         if (!hostCullOnly) {
+            const double tCls0 = fseNowMs();
             earlyClassifyMainScene(nullptr);
+            dClassify = fseNowMs() - tCls0;
         }
 
         // Build the current-frame visible set over the fresh cache, using the camera
@@ -222,7 +313,9 @@ void DistantLand::frameSetupEarly() {
         // — either way current-frame, so leading-edge tiles a pan reveals get depth (no
         // sky holes). Must run before snapshotVisibleKeysForThread (the render-thread
         // job reads a snapshot of it). ~0.4ms, overlapping the sky window.
+        const double tVis0 = fseNowMs();
         buildFrustumVisibleSet(&mwView, &mwProj);
+        dVis = fseNowMs() - tVis0;
 
         // Early Forge kickoff frames: run the grass cull NOW, before the async window
         // opens. Grass is the one scene-0 RPC with a live consumer in Forge mode (MGE
@@ -231,8 +324,10 @@ void DistantLand::frameSetupEarly() {
         // free here — the statics cull kickoff/worker above is gated off on exactly
         // these frames. renderDepth skips its own cullGrass via earlyCulledGrass.
         if (earlyForgeKickoff && (Configuration.MGEFlags & USE_GRASS) && mwBridge->IsExterior()) {
+            const double tGrass0 = fseNowMs();
             cullGrass(&mwView, &mwProj);
             earlyCulledGrass = true;
+            dGrass = fseNowMs() - tGrass0;
         }
 
         // FRAME-START KICK. Everything the produce consumes now exists (camera, cache walk,
@@ -240,7 +335,9 @@ void DistantLand::frameSetupEarly() {
         // channel — so dispatch the worker HERE rather than after frameSetupEarly returns. The
         // render-thread kick below and the rest of the frame then overlap the ~3.5ms build instead
         // of sitting in front of it. No-op outside async OVERLAP mode / early-kickoff frames.
+        const double tKick0 = fseNowMs();
         RenderProcess::kickProduceEarly(device);
+        dKick = fseNowMs() - tKick0;
 
         // Kick the render-thread depth-cache job now — after the geometry-cache
         // walk (so the cache + VBs it consumes are stable) and before the engine's
@@ -251,9 +348,11 @@ void DistantLand::frameSetupEarly() {
         // onto the worker's depth buffer. Snapshot the visible-key set here (main
         // thread) so the worker never races updateVisibleSet.
         if (Configuration.UseRenderThread) {
+            const double tRt0 = fseNowMs();
             snapshotVisibleKeysForThread();
             MGE::RenderThread::kick(&DistantLand::renderThreadDepthCacheJob);
             renderThreadJobKicked = true;
+            dRt = fseNowMs() - tRt0;
         }
     } else if (!mwBridge->IsMenu()) {
         // Interior / non-distant cell: the exterior early block above is skipped (it
@@ -268,7 +367,9 @@ void DistantLand::frameSetupEarly() {
         // Same host-cull-only skip as the exterior branch above — the result is discarded when
         // the host's Hi-Z GPU cull owns occlusion, so don't pay for it on the critical path.
         if (!hostCullOnly) {
+            const double tCls0 = fseNowMs();
             earlyClassifyMainScene(nullptr);
+            dClassify = fseNowMs() - tCls0;
         }
 
         // 2b: early-Forge-kickoff frames need the kickoff's inputs ready NOW — hoist the
@@ -277,15 +378,26 @@ void DistantLand::frameSetupEarly() {
         // renderDepth then skips its own copies. Non-latched frames keep the serial
         // renderDepth path untouched.
         if (earlyForgeKickoff) {
+            const double tWalk0 = fseNowMs();
             MGE::GeometryCache::onFrameReady(MGE::SceneGraph::getDataHandler(),
                                              &eyePos.x, cacheGateRadius, liveDrawBuild);
             earlyWalkedCache = true;
+            const double tVis0 = fseNowMs();
+            dWalk = tVis0 - tWalk0;
             buildFrustumVisibleSet(&mwView, &mwProj);
             // Frame-start kick (see the exterior branch): interiors have no scene-0 RPC at all, so
             // the channel is free the moment the visible set is built.
+            const double tKick0 = fseNowMs();
+            dVis = tKick0 - tVis0;
             RenderProcess::kickProduceEarly(device);
+            dKick = fseNowMs() - tKick0;
         }
     }
+
+    const double tEnd = fseNowMs();
+    fseAccum(tLights - tFse0, tCell - tLights, tView - tCell, dStatics, dWalk,
+             dClassify, dVis, dGrass, dKick, dRt, tEnd - tFse0,
+             isDistantCell() && !mwBridge->IsMenu());
 }
 
 void DistantLand::beginSkyZone() {
@@ -295,6 +407,15 @@ void DistantLand::beginSkyZone() {
 }
 
 void DistantLand::beginDrawsZone() {
+    // [mwdraw] Always-on QPC twin of the Tracy "MW draw loop" zone. That zone reads ~2.1ms
+    // and stayed ~2.1ms even with every world root appCulled (2.0 DIPs/frame), which is not
+    // physically sensible — and [s0cost] since showed only 0.04ms/frame is spent inside our
+    // DIP handler across 246 draws. Every DX9 stage inside this window (renderStage1/2/Blend/
+    // Water) already early-returns under Forge, so there is no MGE work left in it either.
+    // Either the window really does hold 2.1ms of engine/driver time, or the Tracy zone is an
+    // artifact like the "MW sky gap" was. Tracy can't answer that about itself; QPC in the
+    // shipping build can.
+    s_mwDrawsT0 = fseNowMs();
 #ifdef TRACY_ENABLE
     if (g_tracyActive) s_mwDrawsZone = new tracy::ScopedZone(&s_mwDrawsLoc, 0, true);
 #endif
@@ -766,6 +887,10 @@ void DistantLand::renderStage0() {
 
 // renderStage1 - Render grass and shadows over near features, and write depth texture for scene 0
 void DistantLand::renderStage1() {
+    if (s_mwDrawsT0 != 0.0) {
+        mwDrawsAccum(fseNowMs() - s_mwDrawsT0);
+        s_mwDrawsT0 = 0.0;
+    }
 #ifdef TRACY_ENABLE
     delete s_mwDrawsZone;
     s_mwDrawsZone = nullptr;

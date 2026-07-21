@@ -358,7 +358,9 @@ namespace IPC {
 		* @param outRenderMs Optional out: host-side render time in ms.
 		* @return Whether the frame rendered (bytesWritten > 0).
 		*/
-		bool renderSceneFinish(double* outRenderMs = nullptr);
+		// outTimings (optional): the host's CPU/GPU phase split for the frame just drained, for
+		// Tracy plots — see ipc/hostframetimings.h. Zeroed by the host on a failed frame.
+		bool renderSceneFinish(double* outRenderMs = nullptr, HostFrameTimings* outTimings = nullptr);
 
 		/**
 		* @brief M1b: upload a batch of static opaque meshes to the Forge host.

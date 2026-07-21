@@ -14,16 +14,23 @@ extern bool g_tracyActive;
 // thread in this capture — a Tracy FIBER gives it a virtual lane so its inflight window
 // [kickoff RPC issued -> completion drained] shows as a box aligned with the real client thread
 // lanes, on the client's own clock. Requires TRACY_FIBERS (defined in the Release-Tracy config).
+//
+// The lane is named "(inflight)" ON PURPOSE: the box is the whole client-side round trip —
+// IPC + host CPU (setup/cull/record/post) + host GPU + completion drain — NOT GPU execution.
+// It was called "Forge Host GPU", which invited reading its width as GPU time and concluding
+// "GPU bound": a ~9.5ms box against ~4.0ms of summed [forge-hb] gpu-split timestamps, i.e. the
+// GPU is under half of it and ~26% of a 15.3ms frame. There is no real GPU lane in this capture
+// (the host has no Tracy of its own); read per-pass GPU cost from mgeHost64.log's `gpu split`.
 // Begin and End may run on DIFFERENT OS threads (the produce worker kicks the host; the main
 // thread drains it) — the fiber rebinds the zone context by name regardless of the caller thread.
 #define MGE_TracyHostFrameBegin(ctxLValue) do { if (g_tracyActive) { \
-        TracyCFiberEnter("Forge Host GPU"); \
+        TracyCFiberEnter("Forge Host Frame (inflight)"); \
         static const struct ___tracy_source_location_data ___mge_hostsl = \
             { "host frame", __func__, __FILE__, (uint32_t)__LINE__, 0x00B87333 }; \
         (ctxLValue) = ___tracy_emit_zone_begin(&___mge_hostsl, 1); \
         TracyCFiberLeave; } } while(0)
 #define MGE_TracyHostFrameEnd(ctxRValue) do { if (g_tracyActive) { \
-        TracyCFiberEnter("Forge Host GPU"); \
+        TracyCFiberEnter("Forge Host Frame (inflight)"); \
         ___tracy_emit_zone_end(ctxRValue); \
         TracyCFiberLeave; } } while(0)
 #define MGE_TracyNameThread(name) do { if (g_tracyActive) tracy::SetThreadName(name); } while(0)

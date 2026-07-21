@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <unordered_set>
@@ -144,6 +145,74 @@ namespace MGE::GeometryCache {
         // lastFrame == g_frame), they only hold memory/VBs a little longer. The sweep
         // now runs every kEvictSweepInterval frames.
         constexpr uint64_t kEvictSweepInterval = 30;
+        // Parent-chain eviction. NOTE: this replaced a REFCOUNT test that did not work — recorded
+        // here because the failure is the interesting part. The refcount premise was "a parented
+        // shape is held by its parent's child list, so unlinking leaves us the sole holder at
+        // refCount == 1". In practice MW keeps a SECOND reference to a removed object's shape
+        // (rc stayed 2 on entries the walk proved gone), so the signal never once fired: 20 sweeps
+        // logged `evicted=0 byRef=0` while `walk=GONE ref=ALIVE` ran ~344/sweep. Eviction silently
+        // degraded to the kFarKeepFrames age rule alone, which is the "picked-up clutter keeps its
+        // shadow for ~3.6s, but re-appears instantly" asymmetry, and left ~14k entries (each
+        // holding a strong NI::Pointer) resident far longer than the walk rule did.
+        //
+        // Reachability is the property we actually care about, and it is directly observable:
+        // climb NIAVObject::parentNode (0x18) and see whether the chain still terminates at one of
+        // MW's live roots. A lingering reference cannot mask that. O(depth) — a handful of derefs
+        // per entry per sweep, nothing like a full walk, so the spike stays dead.
+        //
+        // CAVEATS, both real:
+        //  - parentNode is a RAW back-pointer. Sound only under the NI convention that a dying
+        //    parent detaches its children (nulling the field); our strong ref protects the shape
+        //    itself, NOT its ancestors.
+        //  - Sky entries hang off skyRoot, which is found on demand (findSkyRoot) and not tracked
+        //    here, so their chain would end at an "unknown" root and read as GONE. isSky entries
+        //    are therefore excluded and fall back to the age rule.
+        // The kEvictValidateSweeps window below cross-checks every verdict against the walk oracle;
+        // `walk=KEEP parent=GONE` is the dangerous direction and must stay 0.
+        //
+        // The walk-based "visitable but unvisited = gone" rule is precise but costs a FULL graph
+        // walk on every sweep frame (~6.6ms over 12.5k entries) — amortised in the [gc] average to
+        // a harmless-looking 0.22ms, but on the wire a ~7ms main-thread hitch 3x/second (Tracy:
+        // walksappear.png). The parent-chain test gets the same answer without traversing anything.
+        //
+        // g_evictByParentChain = A/B escape hatch back to the walk rule. While
+        // g_evictSweepNo < kEvictValidateSweeps the sweep still forces the walk and CROSS-CHECKS the
+        // two verdicts into [evict-cmp] lines; "walk=KEEP parent=GONE" is the dangerous direction
+        // (would evict a live object) and must be zero before the validation window is retired.
+        // Non-recovering freeze reported 2026-07-20: ROOT CAUSE FOUND, and it is NOT eviction. The
+        // bisect (g_evictByParentChain off = original forced-walk path, no eviction bursts) STILL
+        // froze, which exonerated the verdict change. The real culprit is the produce finish-gate:
+        // waitFinishGate() was the one unbounded wait in the pipeline (every IPC wait caps at
+        // MaxWait=60s), and drainPendingIfFull parks the WORKER on it mid-build — any missed
+        // openFinishGate() wedged forever with zero log. Fixed in renderprocess.cpp by bounding that
+        // wait (500ms) + logging "[gate] finish-gate WEDGED ... in '<who>'". The earlier "wrong
+        // waiter drains the completion" theory was wrong: finishAndCopy already skips a second
+        // renderSceneFinish on the early-finished path.
+        // 2026-07-20: perf win RE-ENABLED (parentChain=true, forceWalk=false) with the ROOT-CAUSE
+        // FIX finally in place. The two earlier freezes on this flip were BOTH downstream of the
+        // eviction verdict, not the verdict itself:
+        //   1. Raw flip froze on a DANGLING parentNode deref (we hold a ref on each cached leaf but
+        //      not its parent; a freed detached subtree left stale heap under p->parentNode). FIXED
+        //      by the isLiveNode() vtable guard in the sweep block (engine-informed, MWSE vtable
+        //      addresses, no disasm) — the instrumented probe measured ~87% of the cache dangling
+        //      (vtBad) yet countMs~1ms, proving the climb itself is cheap.
+        //   2. Instrumented flip then froze on the RELEASE FLOOD: with no forced re-stamp, orphaned
+        //      far cells age out en masse (512/sweep), and each host-slot release rode the BLOCKING
+        //      present-time geometry RPC (measured 517 parts = 5.5ms, backlog blew the 32MB staging
+        //      cap). FIXED in renderprocess.cpp: releases now queue and drain a bounded
+        //      kMaxReleasesPerFlush per present (safe because host slots are monotonic/never reused),
+        //      so mass eviction can never flood the RPC again. Watch >> [release] draining.
+        // The instrumentation (isLiveNode guard, 250ms climb watchdog, >> [evict-climb] line) stays.
+        // Escape hatch back to the known-good walk rule: false / true.
+        bool               g_evictByParentChain = true;
+        bool               g_evictForceWalk     = false;  // bisect knob; false = the perf win
+        constexpr unsigned kEvictValidateSweeps = 20;
+        // Ancestor-climb bound. MW object subtrees are shallow (single digits); exceeding this means
+        // an unexpected/cyclic graph, so the verdict is "unknown" and the age rule decides.
+        constexpr int      kMaxParentDepth      = 24;
+        unsigned           g_evictSweepNo       = 0;
+        unsigned           g_evictDisagreeWalkGone   = 0;  // walk=GONE parent=ALIVE (retention only)
+        unsigned           g_evictDisagreeGraphGone  = 0;  // walk=KEEP parent=GONE (DANGEROUS)
         // W1.5 active-cell gate (see onFrameReady's header comment). g_gateThisFrame
         // arms the walk's subtree skip for the current frame only; g_gateEye/
         // g_gateRadius persist across ungated frames (menus, the renderDepth
@@ -1731,6 +1800,22 @@ namespace MGE::GeometryCache {
                     } else if ((data->revisionID != e.revisionID) || e.isSkinned) {
                         extractMaterial(e, geom);
                         uploadEntry(e, geom, data, key);
+                    } else if (e.d3dTexture == nullptr && e.textureName != nullptr) {
+                        // UNRESOLVED-TEXTURE RETRY. getDX9Texture returns null while MW has not yet
+                        // uploaded the NiSourceTexture (rendererData null) — the texture streams in
+                        // lazily, on MW's schedule. A STATIC shape (a roof, a wall) never bumps
+                        // revisionID, so without this the entry captured mid-stream keeps
+                        // d3dTexture=null for the rest of the session and the host draws it
+                        // untextured/white. Hoisting the walk to BeginScene(0) widened exactly this
+                        // race, which is why it shows on this branch.
+                        //
+                        // textureName != nullptr is what separates "should have a texture, didn't
+                        // resolve" from "legitimately textureless" (both null) — the latter is a real
+                        // class we must NOT churn on (see the textureless-visual-drop regression), and
+                        // it never enters this branch. Self-limiting: an entry retries only until its
+                        // texture lands, so the steady-state cost is zero. Material only — the VB is
+                        // unaffected by texture residency, so no re-upload and no wire traffic.
+                        extractMaterial(e, geom);
                     }
                     // Transform (orbit for sky) + dynamic hint, shared by sky and opaque.
                     if (inCharacter) {
@@ -2529,8 +2614,14 @@ namespace MGE::GeometryCache {
         // interval (~30 dead clicks, not 0.18s). Force the sweep EVERY menu frame so the removed
         // near object is detected + released on the very next click. Hand-reach ⇒ always within the
         // gate radius, so the plain walk-based "visitable but unvisited = gone" rule applies cleanly.
+        // Under g_evictByParentChain the forced walk is unnecessary — reachability answers "gone?"
+        // without traversing anything — so it fires only during the validation window, where the
+        // walk verdict is the oracle the refcount verdict is checked against. Menu-mode sweeps keep
+        // running every frame and get MORE precise this way (an unparented item is detected on the
+        // very next click) while no longer pulling a walk per click.
         const bool sweepNow = (g_frame % kEvictSweepInterval == 0) || MWBridge::get()->IsMenu();
-        if (sweepNow) {
+        const bool validating = g_evictByParentChain && (g_evictSweepNo < kEvictValidateSweeps);
+        if (sweepNow && (!g_evictByParentChain || validating || g_evictForceWalk)) {
             ensureFullWalk();
         }
 
@@ -2554,6 +2645,157 @@ namespace MGE::GeometryCache {
             //    capture-side dedup still knows the mesh).
             const bool walkedThisFrame = (g_walkRanFrame == g_frame);
             const float evictR2 = g_gateRadius * g_gateRadius;
+            ++g_evictSweepNo;
+            // Parent-chain verdict: is this shape still REACHABLE from a live MW root?
+            //   0 = alive   (chain terminates at g_objRoot / g_pickRoot / g_landRoot)
+            //   1 = gone    (detached: no parent, or the chain dead-ends at an unknown top)
+            //   2 = unknown (no stored ref, sky entry, or depth cap hit → age rule decides)
+            // Read THROUGH the stored pointer; never copy the NI::Pointer (a copy would claim a ref).
+            // "Chain dead-ends at a top we don't recognise ⇒ gone" is only sound if we know EVERY
+            // live root, and we do not. Matching {obj,pick,land} evicted 12 live FIRST-PERSON hand
+            // parts per sweep (Dark Elf Hfinger/Hpalm/Hthumb/_M_LA/shirt sleeve, every one at
+            // `lastFrame=-0` — walked that very frame): FP geometry hangs off the FP root, absent
+            // from that set, so its chain dead-ended and read as GONE. skyRoot is the same trap, and
+            // any root added later would silently re-introduce it.
+            //
+            // Climbing to a shared "live top" was tried and does NOT work: MW's roots are
+            // INDEPENDENT tops (g_objRoot has no parent), so the climb returns g_objRoot itself and
+            // the FP chain still fails to match — the re-run reproduced 12/sweep exactly.
+            //
+            // The fix is to NAME the FP root rather than guess: MWBridge exposes it as
+            // getArmCameraRoot() (already used by FP suppression below), so it joins the known set
+            // and FP chains resolve as ALIVE for the right reason.
+            //
+            // A blanket "stamped within the last sweep interval ⇒ alive" guard was tried first and
+            // is WRONG, because a picked-up object is exactly the ambiguous case: MW detaches the
+            // object's ROOT node, so its shapes keep a non-null parentNode into that detached root
+            // and land in the same dead-end branch as FP. Holding everything recently stamped meant
+            // parts of one object evicted on different sweeps — the reported "object left some of
+            // its parts". What IS sound is the walk's own verdict: if the walk ran THIS frame and
+            // stamped this entry, the entry is reachable by definition. That is authoritative, not
+            // a heuristic, and it costs no latency for objects that stopped being stamped.
+            // Roots are re-read from dataHandler EVERY frame (see onFrameReady). Two states make
+            // the graph verdict meaningless, and both would otherwise condemn the whole cache:
+            //  - roots null (teardown / mid-load): nothing matches, everything reads GONE.
+            //  - roots REPLACED (cell change): surviving entries are parented under the OLD root,
+            //    so their chains dead-end and the entire previous world reads GONE in one sweep.
+            // Evicting ~14k entries in a single sweep pushes a release record per key into
+            // g_pendingBlob and flushes them as blocking RPCs at present time — a multi-second
+            // stall that presents as a game freeze. Cross-cell removal is ALREADY handled by the
+            // cell-epoch eviction (see drainReleasedSlots), so this sweep doing it too is redundant,
+            // not load-bearing: refusing is strictly safer than participating.
+            const bool rootsValid = (g_objRoot != nullptr);
+            const bool walkAuthoritative = walkedThisFrame;
+            NI::Node* const armRoot = MWBridge::get()->getArmCameraRoot();
+            // --- parent-climb INSTRUMENTATION + engine-informed liveness guard (2026-07-20) ---
+            // The un-instrumented flip to this path froze the CLIENT. The climb is bounded in DEPTH
+            // (kMaxParentDepth) so it cannot infinite-loop, and an AV would crash (with a dump), not
+            // hang — so a probe must establish two things: (a) is the climb burning real wall time,
+            // (b) is it walking DANGLING parents. A cached leaf keeps a strong ref on ITSELF but NOT
+            // on its parent, so once MW frees a detached subtree's root our stored parentNode dangles
+            // into stale heap; the next `p->parentNode` reads dead memory. Fix + probe: validate each
+            // candidate parent against the real NI node-subtype vtables (MWSE-provided addresses in
+            // NI::VirtualTableAddress — no disassembly). A freed slot no longer matches any node
+            // vtable, so we treat it as GONE instead of chasing it further. This makes EVERY deref in
+            // the loop safe (first hop is off a leaf we hold; every later hop is off a vtable-validated
+            // live node) and turns the unbounded hazard into counted diagnostics (climbVtBad).
+            unsigned climbMaxDepth = 0, climbVtBad = 0, climbDepthCap = 0;
+            auto isLiveNode = [](const NI::Node* n) -> bool {
+                if (!n) return false;
+                namespace VA = NI::VirtualTableAddress;
+                switch (reinterpret_cast<std::uintptr_t>(n->vTable.asNode)) {
+                    case VA::NiNode:            case VA::NiBillboardNode:  case VA::BSMirroredNode:
+                    case VA::NiSwitchNode:      case VA::NiBSAnimationNode: case VA::NiBSParticleNode:
+                    case VA::NiBSPNode:         case VA::NiFltAnimationNode: case VA::NiLODNode:
+                    case VA::NiSortAdjustNode:  case VA::AvoidNode:        case VA::RootCollisionNode:
+                        return true;
+                    default:
+                        return false;   // dangling/freed parent, or a node type outside the family
+                }
+            };
+            auto parentVerdict = [&](uint32_t key, const CachedGeometry& e) -> int {
+                if (!rootsValid) return 2;              // no usable reference point → age rule only
+                // The walk reached it this frame ⇒ reachable. Belt-and-braces against any root we
+                // still don't know about (this is what the FP hands tripped).
+                if (walkAuthoritative && e.lastFrame == g_frame) return 0;
+                if (e.isSky) return 2;                  // skyRoot untracked; sky is few entries
+                auto rit = g_geomRefs.find(key);
+                if (rit == g_geomRefs.end() || !rit->second.get()) return 2;
+                NI::Node* p = rit->second.get()->parentNode;
+                // Detached outright — the common drop/pick-up case, and unambiguous.
+                if (!p) return 1;
+                for (int depth = 0; depth < kMaxParentDepth; ++depth) {
+                    if (p == g_objRoot || p == g_pickRoot || p == g_landRoot || (armRoot && p == armRoot)) {
+                        if ((unsigned)depth > climbMaxDepth) climbMaxDepth = (unsigned)depth;
+                        return 0;
+                    }
+                    // Engine-informed guard: a real parent is a live node subtype. A dangling/freed
+                    // parent fails the vtable check ⇒ the subtree was unlinked and released ⇒ gone.
+                    if (!isLiveNode(p)) { ++climbVtBad; return 1; }
+                    NI::Node* next = p->parentNode;
+                    // Chain ended without reaching a known root: the whole subtree was unlinked
+                    // (MW removes an object's ROOT node, so the shape keeps a non-null parent that
+                    // is itself detached). This is the case a plain !parent test would miss.
+                    if (!next) return 1;
+                    p = next;
+                }
+                ++climbDepthCap;
+                return 2;   // depth cap: refuse to guess
+            };
+            unsigned nEvicted = 0, nByGraph = 0, nByAge = 0, nUnknown = 0, nDeferred = 0;
+            unsigned nLogWalkGone = 0, nLogGraphGone = 0;
+            constexpr unsigned kEvictCmpLogCap = 12;
+            // CIRCUIT BREAKER. A correct sweep retires a handful of entries (an object left the
+            // world). A verdict condemning a large FRACTION of the cache is not a world event, it
+            // is a root-identity artifact — and acting on it is what stalls the frame. Count first,
+            // then refuse the graph verdict wholesale for this sweep if it looks like a mass kill;
+            // the age rule still retires anything genuinely stale within kFarKeepFrames. Loud,
+            // ALWAYS-ON log: the [evict] summary below only prints while validating, so without
+            // this a mass eviction after sweep 20 would be completely invisible.
+            // PER-SWEEP EVICTION BUDGET — the actual freeze guard, and it covers EVERY cause.
+            // Observed with the always-on log above: one sweep evicted 10186 entries, all byAge
+            // (entries 12572 -> 2386). Removing the forced walk left far more entries unstamped, so
+            // instead of trickling out they all cross kFarKeepFrames on the SAME sweep. Each
+            // eviction pushes a slot-release record into g_pendingBlob, and 10k of them flush as
+            // blocking RPCs at present time — a multi-second stall, i.e. the reported game freeze.
+            // Evicting them is correct; doing it in one frame is not. Whatever is left over is
+            // simply re-evaluated next sweep, so nothing is retained permanently — the backlog
+            // drains at kMaxEvictPerSweep per sweep with no visible hitch.
+            constexpr unsigned kMaxEvictPerSweep = 512;
+            bool graphTrusted = true;
+            // WATCHDOG: the un-instrumented flip froze in this climb. If it ever burns real wall
+            // time, abort the graph verdict, fall back to the age rule, and log the exact ms +
+            // progress. Combined with isLiveNode() above (no dangling deref), the probe can NEVER
+            // hard-freeze the game the way the raw flip did.
+            constexpr double kClimbWatchdogMs = 250.0;
+            const double     tClimb0 = gcNowMs();
+            double           climbCountMs = 0.0;
+            bool             climbRunaway = false;
+            if (g_evictByParentChain && rootsValid) {
+                unsigned wouldEvict = 0, scanned = 0;
+                for (const auto& kv : g_cache) {
+                    if (parentVerdict(kv.first, kv.second) == 1) ++wouldEvict;
+                    if ((++scanned & 2047) == 0 && gcNowMs() - tClimb0 > kClimbWatchdogMs) {
+                        climbRunaway = true;
+                        graphTrusted = false;
+                        LOG::logline("!! [evict-climb] RUNAWAY in count pass: %.0fms at %u/%zu entries"
+                                     " (maxDepth=%u vtBad=%u depthCap=%u) — aborting graph verdict,"
+                                     " age rule only this sweep",
+                                     gcNowMs() - tClimb0, scanned, g_cache.size(),
+                                     climbMaxDepth, climbVtBad, climbDepthCap);
+                        break;
+                    }
+                }
+                const size_t cap = g_cache.size() / 4;   // >25% of the cache in one sweep
+                if (!climbRunaway && g_cache.size() > 64 && wouldEvict > cap) {
+                    graphTrusted = false;
+                    LOG::logline("!! [evict] MASS-EVICT REFUSED: graph verdict condemned %u/%zu entries"
+                                 " (>25%%) — treating as a root-identity artifact (cell change/teardown),"
+                                 " falling back to the age rule this sweep",
+                                 wouldEvict, g_cache.size());
+                }
+            }
+            climbCountMs = gcNowMs() - tClimb0;
             for (auto it = g_cache.begin(); it != g_cache.end(); ) {
                 auto& e = it->second;
                 bool evict;
@@ -2578,7 +2820,55 @@ namespace MGE::GeometryCache {
                 } else {
                     evict = (g_frame - e.lastFrame > kFarKeepFrames);
                 }
+                if (g_evictByParentChain) {
+                    const int  graph = graphTrusted ? parentVerdict(it->first, e) : 2;
+                    const bool aged  = (g_frame - e.lastFrame > kFarKeepFrames);
+                    // Age is the backstop, not the hysteresis: it covers `unknown` verdicts (sky
+                    // entries, missing refs, depth-cap bailouts). The active-cell far-keep
+                    // hysteresis is not needed here — a gate-SKIPPED object is still PARENTED, so
+                    // reachability already says "alive"; it survives only in the walk verdict above.
+                    const bool refEvict = (graph == 1) || aged;
+                    if (validating && evict != refEvict) {
+                        const char* tex = e.textureName ? e.textureName : resolveTextureName(e.d3dTexture);
+                        // Real engine refCount, not the verdict — how far above 1 an "alive"
+                        // entry sits is the diagnostic (2 = parent only; higher = other holders).
+                        auto rit = g_geomRefs.find(it->first);
+                        const int rc = (rit != g_geomRefs.end() && rit->second.get())
+                                           ? rit->second.get()->refCount : -1;
+                        if (evict && !refEvict) {
+                            ++g_evictDisagreeWalkGone;
+                            if (nLogWalkGone < kEvictCmpLogCap) {
+                                ++nLogWalkGone;
+                                LOG::logline("!! [evict-cmp] sweep=%u key=%08x tex=%s walk=GONE parent=ALIVE rc=%d sky=%d lastFrame=-%llu",
+                                             g_evictSweepNo, it->first, tex ? tex : "(none)", rc,
+                                             (int)e.isSky,
+                                             (unsigned long long)(g_frame - e.lastFrame));
+                            }
+                        } else {
+                            ++g_evictDisagreeGraphGone;
+                            if (nLogGraphGone < kEvictCmpLogCap) {
+                                ++nLogGraphGone;
+                                LOG::logline("!! [evict-cmp] sweep=%u key=%08x tex=%s walk=KEEP parent=GONE rc=%d sky=%d lastFrame=-%llu",
+                                             g_evictSweepNo, it->first, tex ? tex : "(none)", rc,
+                                             (int)e.isSky,
+                                             (unsigned long long)(g_frame - e.lastFrame));
+                            }
+                        }
+                    }
+                    if (refEvict) {
+                        if (graph == 1)      ++nByGraph;
+                        else if (graph == 2) ++nUnknown;
+                        else                 ++nByAge;
+                    }
+                    evict = refEvict;
+                }
+                // Budget spent: leave the rest for the next sweep (see kMaxEvictPerSweep).
+                if (evict && nEvicted >= kMaxEvictPerSweep) {
+                    evict = false;
+                    ++nDeferred;
+                }
                 if (evict) {
+                    ++nEvicted;
                     g_evictedKeys.push_back(it->first);   // tell the Forge feed to release the host slot
                     releaseEntry(e);
                     g_geomRefs.erase(it->first);          // key leaving the cache → drop the engine ref
@@ -2589,6 +2879,27 @@ namespace MGE::GeometryCache {
                 }
             }
             g_charNodeVerdict.clear();
+            // Print while validating, and ALWAYS whenever a sweep actually evicted something — the
+            // eviction path is where the freeze/ghosting bugs live, so a non-zero sweep must never
+            // be silent (it was, between sweep 20 and the mass-evict investigation).
+            if (validating || nEvicted > 0) {
+                LOG::logline(">> [evict] sweeps=%u walk-forced=%u entries=%zu evicted=%u byGraph=%u byAge=%u unknown=%u deferred=%u disagree(walkGone/parentGone)=%u/%u",
+                             g_evictSweepNo, walkedThisFrame ? 1u : 0u, g_cache.size(),
+                             nEvicted, nByGraph, nByAge, nUnknown, nDeferred,
+                             g_evictDisagreeWalkGone, g_evictDisagreeGraphGone);
+            }
+            // Parent-climb probe (every sweep while the graph verdict is active). countMs = wall time
+            // of the full-cache climb; if it ever spikes this IS the freeze. vtBad = dangling/freed
+            // parents the vtable guard rejected (the health of the whole premise — a large number
+            // means the raw pointer climb was chasing dead memory). depthCap = chains that never
+            // reached a known root within kMaxParentDepth (garbage-chain smell). runaway = watchdog
+            // tripped this sweep.
+            if (g_evictByParentChain) {
+                LOG::logline(">> [evict-climb] sweep=%u entries=%zu countMs=%.2f maxDepth=%u vtBad=%u depthCap=%u runaway=%d trusted=%d walked=%d",
+                             g_evictSweepNo, g_cache.size(), climbCountMs,
+                             climbMaxDepth, climbVtBad, climbDepthCap,
+                             (int)climbRunaway, (int)graphTrusted, walkedThisFrame ? 1 : 0);
+            }
         }
         const double tEvict = gcNowMs();
 

@@ -39,7 +39,14 @@ bool DistantLand::earlyCulledGrass = false;
 // occlusion, which lets frameSetupEarly skip the ~1.4ms main-thread MSOC classify entirely —
 // the single largest serial item between MW's physics and the produce kick. VK_SCROLL flips
 // back to the MSOC path for the A/B.
-bool DistantLand::hostCullOnly = true;
+//
+// ROUTE A MEASUREMENT (2026-07-20): booted OFF to price the other side of that trade. Skipping
+// the classify does save its ~1.4ms, but the classify is also our DISCOVERY feed: without it
+// liveDrawBuild is forced false (distantland.cpp) and onFrameReady runs the full refresh walk
+// — measured at 7.05ms over 12,572 entries ([fse] walk=, [gc] visited=). We were re-walking the
+// scene to rediscover what MW's own CullShow traversal already enumerated. Trading 1.4 for 7 is
+// the wrong direction; this flip measures the other side. See tasks/cache-walk-offthread.md.
+bool DistantLand::hostCullOnly = false;
 // MW-ONLY-UI: boot OFF. Suppressing landscape has no visible cost, but its frame-time payoff was
 // never isolated, and the whole suppression line measured only ~0.75ms while costing smoke and
 // sorted alpha (tasks/forge-world-particles.md) — not enough to justify shipping an engine-state

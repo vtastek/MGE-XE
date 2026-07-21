@@ -500,6 +500,10 @@ namespace IPC {
 		auto& params = m_ipcParameters->params.renderFrameParams;
 		params.bytesWritten = 0;
 		params.renderMs = 0.0;
+		// Clear the timing block too: renderScene can bail early (the !ok return below) without
+		// ever reaching fillFrameTimings, and a stale block would plot the last GOOD frame's
+		// numbers on a frame that never rendered — a lie that reads as a healthy flat line.
+		params.hostTimings = {};
 
 		LARGE_INTEGER t0; QueryPerformanceCounter(&t0);
 		// Host idle gap: how long this process sat between finishing the previous
@@ -678,6 +682,10 @@ namespace IPC {
 
 		params.bytesWritten = g_spikeWidth * g_spikeHeight * 4u;
 		params.renderMs = msBetween(t0, t1);
+		// Tier 1 (tasks/forge-host-gpu-lane.md): forward this frame's CPU/GPU phase split so the
+		// client can plot it in Tracy. Cost is 16 float stores into shared memory already being
+		// written for bytesWritten/renderMs — no extra sync, no extra RPC.
+		ForgeRender::fillFrameTimings(params.hostTimings);
 		s_lastExit = t1;
 	}
 
