@@ -128,7 +128,8 @@ namespace {
     // fused/async modes and IS the perf baseline once the wait bucket collapses.
     constexpr unsigned kHeartbeatFrames = 300;
     struct Accum { double feed, geom, build, render, host, overlap, copy, blit, dt, mwstart; double maxFeed, maxDt; double captured; unsigned n, earlyN, pipeN;
-                   double bEnsure, bEmit, bTail, bTailEnsure, bTailScan, bTailAlpha; double bKeys; };   // Phase 0: build-split sub-probe
+                   double bEnsure, bEmit, bTail, bTailEnsure, bTailScan, bTailAlpha; double bKeys;
+                   double maxBuild, bCaptures; };   // Phase 0: build-split sub-probe (+ Stage 0 spike observability)
     Accum g_hb = {};
 
     // Phase 0 build sub-probe: decompose buildGeometryDrawLists' cost (the main-thread `build=`
@@ -144,6 +145,28 @@ namespace {
     double g_lastBuildTailScanMs   = 0.0;   // offscreen-caster full-cacheMap scan subset of the tail
     double g_lastBuildTailAlphaMs  = 0.0;   // alpha merge/sort/pack subset of the tail
     std::uint32_t g_lastBuildKeys  = 0;
+    std::uint32_t g_lastBuildCaptures = 0;  // first-sight lazy captures during the build
+
+    // Build-spike observability (Forge Dev panel): throttled [bspike] one-liner naming the
+    // component that carried a slow build. DEFAULT OFF — hot-path logging has collapsed the
+    // frame twice before (LOGF/printf lessons), so even when on it is hard-throttled >=1s
+    // apart + a session cap. All three build-shrink toggles are panel-only (no keys — the
+    // free numpad keys collide with the water-flow handlers' edge polls).
+    bool g_buildSpikeLog = false;
+    // Sky/FP membership-set drift validation (panel): run the old full-cache scans alongside
+    // the set-driven consumers and log !! [memb-cmp] on any kept-key mismatch. DEFAULT OFF.
+    bool g_membershipValidate = false;
+    // First-sight capture budget A/B (panel): capped (default, the fix) vs unlimited (the
+    // old behavior — a reveal burst captures whole in one build). See buildGeometryDrawLists.
+    bool g_captureBudgetOn = true;
+    constexpr int      kCaptureBudgetPerFrame   = 32;
+    // Frames after a cell-epoch change during which the budget stays unlimited. Every load-door
+    // transition runs purgeAll() (the one-frame-flash guard), so the WHOLE cell re-captures
+    // through the budget — and the first look-around takes seconds, not 30 frames (0.2s at
+    // 150fps was the "buildings appear late after interior->exterior" trickle). ~4s covers a
+    // full post-transition 360; the capture spikes it allows hide inside the load hitch, and
+    // steady state stays capped (the eviction parent-chain rescue prevents re-capture churn).
+    constexpr unsigned kCaptureEpochGraceFrames = 600;
 
     // Upload cost accounting (Part A). Two accumulators: g_upFrame is THIS frame's per-category
     // reship cost (parts + bytes), read into lighting[33..34] when the kickoff builds the frame
@@ -183,6 +206,7 @@ namespace {
         double dtPresent;
         double tStart, tGeomFlush, tBuild, tTexFlush, tAssign, tKick;
         double bEnsure, bEmit, bTail, bTailEnsure, bTailScan, bTailAlpha; std::uint32_t bKeys;   // Phase 0 build-split sub-probe
+        std::uint32_t bCaptures;   // first-sight captures during that build (Stage 0)
     };
     KickState g_kick = {};
 
@@ -1886,6 +1910,9 @@ namespace {
     //     (stride-60 wide VB); everything else (terrain included) → static pipeline.
     void buildGeometryDrawLists(std::uint32_t& drawCount, std::uint32_t& skinnedCount,
                                 std::uint32_t& multiMapCount, std::uint32_t& alphaCount) {
+        MGE_ZoneScopedN("build:geometry");
+        const double tFn0 = nowMs();   // whole-function wall (the [bspike] "build" number)
+        const std::uint32_t cap0 = MGE::GeometryCache::liveCaptureCount();
         drawCount = 0;
         skinnedCount = 0;
         multiMapCount = 0;
@@ -1937,6 +1964,7 @@ namespace {
             g_lastBuildTailScanMs   = 0.0;
             g_lastBuildTailAlphaMs  = 0.0;
             g_lastBuildKeys         = 0;
+            g_lastBuildCaptures     = 0;
             return;
         }
 
@@ -2017,44 +2045,63 @@ namespace {
             }
         };
 
-        if (foldKeys) {
-            for (std::uint32_t key : *foldKeys) {
-                ++visitedKeys;
-                // Freshen (or lazily capture) straight off the live NiTriShape — a
-                // classify key is engine-drawn THIS frame, so the pointer is valid by
-                // construction. MUST run before the g_keySlot probe: a first-sight key
-                // has no slot until ensureLive's capture registers it (same frame).
-                const double te0 = nowMs();
-                const auto* e = MGE::GeometryCache::ensureLive(key);
-                ensureLiveMs += nowMs() - te0;
-                if (!e) continue;                     // no model data / capture failed
-                // The unusable-skinned filter buildFrustumVisibleSet applies on
-                // non-fold frames (never drawn; trips the bound helper).
-                if (e->isSkinned && (e->skinnedUnsupported || e->numBones == 0)) continue;
-                auto ks = g_keySlot.find(key);
-                if (ks == g_keySlot.end()) {
-                    continue;   // not an uploaded part (or not yet shipped)
+        // Stage 2a: arm the first-sight capture budget for the visible-set loop only.
+        // Unlimited when uncapped (panel A/B), when the cache is empty (boot), or within the
+        // cell-epoch grace window (a transition's mass recapture must land at once, not
+        // trickle). Reset to unlimited right after the loop so no OTHER ensureLive caller
+        // (tail pose refresh here, main-thread classify in buildFrustumVisibleSet) is gated.
+        {
+            static std::uint32_t s_seenEpoch  = ~0u;
+            static unsigned      s_epochFrame = 0;
+            if (g_cellEpoch != s_seenEpoch) { s_seenEpoch = g_cellEpoch; s_epochFrame = g_frame; }
+            const bool unlimited = !g_captureBudgetOn || cacheMap.empty()
+                                   || (g_frame - s_epochFrame < kCaptureEpochGraceFrames);
+            MGE::GeometryCache::setCaptureBudget(unlimited ? -1 : kCaptureBudgetPerFrame);
+        }
+        {
+            MGE_ZoneScopedN("geom:visLoop");
+            if (foldKeys) {
+                for (std::uint32_t key : *foldKeys) {
+                    ++visitedKeys;
+                    // Freshen (or lazily capture) straight off the live NiTriShape — a
+                    // classify key is engine-drawn THIS frame, so the pointer is valid by
+                    // construction. MUST run before the g_keySlot probe: a first-sight key
+                    // has no slot until ensureLive's capture registers it (same frame).
+                    const double te0 = nowMs();
+                    const auto* e = MGE::GeometryCache::ensureLive(key);
+                    ensureLiveMs += nowMs() - te0;
+                    if (!e) continue;                     // no model data / capture failed / deferred
+                    // The unusable-skinned filter buildFrustumVisibleSet applies on
+                    // non-fold frames (never drawn; trips the bound helper).
+                    if (e->isSkinned && (e->skinnedUnsupported || e->numBones == 0)) continue;
+                    auto ks = g_keySlot.find(key);
+                    if (ks == g_keySlot.end()) {
+                        continue;   // not an uploaded part (or not yet shipped)
+                    }
+                    const double td0 = nowMs();
+                    dispatch(ks->second, *e);
+                    emitMs += nowMs() - td0;
                 }
-                const double td0 = nowMs();
-                dispatch(ks->second, *e);
-                emitMs += nowMs() - td0;
-            }
-        } else {
-            for (std::uint32_t key : keys) {
-                ++visitedKeys;
-                auto ks = g_keySlot.find(key);
-                if (ks == g_keySlot.end()) {
-                    continue;   // not an uploaded part (or not yet shipped)
+            } else {
+                for (std::uint32_t key : keys) {
+                    ++visitedKeys;
+                    auto ks = g_keySlot.find(key);
+                    if (ks == g_keySlot.end()) {
+                        continue;   // not an uploaded part (or not yet shipped)
+                    }
+                    auto ce = cacheMap.find(key);
+                    if (ce == cacheMap.end()) {
+                        continue;   // evicted since the visible-set build
+                    }
+                    const double td0 = nowMs();
+                    dispatch(ks->second, ce->second);
+                    emitMs += nowMs() - td0;
                 }
-                auto ce = cacheMap.find(key);
-                if (ce == cacheMap.end()) {
-                    continue;   // evicted since the visible-set build
-                }
-                const double td0 = nowMs();
-                dispatch(ks->second, ce->second);
-                emitMs += nowMs() - td0;
             }
         }
+        // Snapshot BEFORE the reset — setCaptureBudget clears the deferred counter.
+        const std::uint32_t capDeferred = MGE::GeometryCache::captureDeferredLastBuild();
+        MGE::GeometryCache::setCaptureBudget(-1);
 
         // Offscreen shadow casters: skinned + multimap NPC parts near the camera but OUTSIDE the
         // frustum were dropped by the visible-set loops above, so their shadows freeze and shed
@@ -2072,6 +2119,7 @@ namespace {
         // tradehouse pulsing). Visible-set membership is immune to that stamping.
         const double tail0 = nowMs();   // Phase 0: offscreen casters + pose refresh + alpha sort/pack
         if (wantSkinned || wantMM || wantStatic) {
+            MGE_ZoneScopedN("geom:offscreenCasters");
             static std::unordered_set<std::uint32_t> s_visLookup;
             s_visLookup.clear();
             if (foldKeys) { for (std::uint32_t k : *foldKeys) s_visLookup.insert(k); }
@@ -2185,6 +2233,8 @@ namespace {
         // CURRENT eye + forward against the record's absolute world-space centroid (no swim from the
         // 1-frame latency). The records are consumed (cleared) after emit; the geometry bytes stay
         // in g_capVertScratch/g_capIdxScratch for the kickoff to ship.
+        {
+        MGE_ZoneScopedN("geom:alphaMergeSort");   // AT3 merge + AT1 sort/pack (the alpha tail)
         if (wantAlpha) {
             for (const auto& rec : g_capRecs) {
                 const float dx = rec.centroid[0] - DistantLand::eyePos.x;
@@ -2241,6 +2291,7 @@ namespace {
                 }
             }
         }
+        }   // geom:alphaMergeSort
 
         // AT3: the captured RECORDS are now consumed (emitted as wire items). Clear them + the
         // per-frame texture memo so this frame's scene>=1 captures start fresh; the geometry BYTES
@@ -2267,6 +2318,38 @@ namespace {
         g_lastBuildTailScanMs   = tailScanMs;
         g_lastBuildTailAlphaMs  = tailAlphaMs;
         g_lastBuildKeys         = visitedKeys;
+        const std::uint32_t captures = MGE::GeometryCache::liveCaptureCount() - cap0;
+        g_lastBuildCaptures     = captures;
+
+        // Stage 0 sub-probe plots (no-ops without Tracy): the same split as [hb], but per-frame
+        // so a spike frame's carrier is directly readable off the timeline.
+        MGE_TracyPlot("build ensureLive ms", ensureLiveMs);
+        MGE_TracyPlot("build emit ms", emitMs);
+        MGE_TracyPlot("build tailScan ms", tailScanMs);
+        MGE_TracyPlot("build tailAlpha ms", tailAlphaMs);
+        MGE_TracyPlot("build captures", (std::int64_t)captures);
+        MGE_TracyPlot("build alphaCands", (std::int64_t)alphaCands.size());
+
+        // [bspike] (panel toggle, default OFF): one line naming WHICH component carried a slow build
+        // and whether it aligns with an eviction sweep or a capture burst. Hard-throttled >=1s
+        // apart + session cap — spike logging on this hot path has collapsed the frame before.
+        const double buildTotal = tBuildEnd - tFn0;
+        static double s_buildEma = 0.0;
+        s_buildEma = (s_buildEma == 0.0) ? buildTotal : s_buildEma * 0.95 + buildTotal * 0.05;
+        if (g_buildSpikeLog && buildTotal > std::max(1.5 * s_buildEma, 1.2)) {
+            static double   s_lastSpikeLogMs = 0.0;
+            static unsigned s_spikeLogged    = 0;
+            if (tBuildEnd - s_lastSpikeLogMs >= 1000.0 && s_spikeLogged < 64) {
+                s_lastSpikeLogMs = tBuildEnd;
+                ++s_spikeLogged;
+                LOG::logline("!! [bspike] build=%.2f ema=%.2f ensure=%.2f emit=%.2f scan=%.2f alpha=%.2f tailLive=%.2f "
+                             "keys=%u captures=%u deferred=%u alphaCands=%zu movers=%zu cache=%zu sweepAge=%u",
+                             buildTotal, s_buildEma, ensureLiveMs, emitMs, tailScanMs, tailAlphaMs,
+                             tailEnsureMs, visitedKeys, captures, capDeferred, alphaCands.size(),
+                             MGE::GeometryCache::moverCandidates().size(), cacheMap.size(),
+                             MGE::GeometryCache::framesSinceEvictSweep());
+            }
+        }
     }
 
     // Tier 3a: gather this frame's point lights into g_lightScratch as PointLightWire[]. Source is
@@ -2276,6 +2359,7 @@ namespace {
     // whole set). Diffuse is already dimmer-scaled; pointLightMult is baked here (1.0 on the main
     // cache path → identity). Clamped to kMaxPointLights (logged once if exceeded). Returns the count.
     std::uint32_t buildLightList() {
+        MGE_ZoneScopedN("build:lights");
         if (!g_lightVec) {
             return 0;
         }
@@ -2283,7 +2367,12 @@ namespace {
         // and passes pointLightMult = 1.0f, so bake 1.0 (kept explicit for future per-frame scaling).
         constexpr float pointLightMult = 1.0f;
 
+        // Stage 4b feed: how long this builder stalls acquiring the walk-thread snapshot lock.
+        // Plotted (not zoned — the lock must outlive any acquisition scope); >0.1ms stalls
+        // coinciding with build spikes are the go-signal for the RCU snapshot swap.
+        const double tLock0 = nowMs();
         MGE::SceneGraph::SnapshotReadLock lk;
+        MGE_TracyPlot("lights snapshotLock ms", nowMs() - tLock0);
         const auto& lights = MGE::SceneGraph::pointLights();
 
         // Frustum cull (host GPU shrink): only the NEAR scene consumes point lights
@@ -2430,6 +2519,7 @@ namespace {
     // (the sky is camera-attached). Only runs when the Forge sky pass is toggled on (F7), so the
     // full-cache scan is paid only during the A/B. Returns the packed item count.
     std::uint32_t buildSkyDrawList() {
+        MGE_ZoneScopedN("build:sky");
         if (!g_skyVec || !g_skyEnabled) {
             return 0;
         }
@@ -2442,19 +2532,43 @@ namespace {
         struct SkyCand { std::uint16_t order; const MGE::GeometryCache::CachedGeometry* e; std::uint32_t slot; };
         static std::vector<SkyCand> cands;   // single-threaded; reused frame-to-frame
         cands.clear();
-        // Eviction is a periodic sweep now, so this whole-cache scan must skip stale
-        // entries itself: a sky shape the walk stopped visiting (moon set, weather
-        // change → appCulled) would otherwise keep drawing until the next sweep.
+        // Stage 1: iterate the cache's maintained sky membership set instead of scanning the
+        // WHOLE cache (this was one of the two remaining full-map scans, cache-size-
+        // proportional). Every filter is kept byte-identical — isSky stays as belt-and-braces
+        // (membership mirrors it), and eviction being a periodic sweep still means stale
+        // entries must be skipped here: a sky shape the walk stopped visiting (moon set,
+        // weather change → appCulled) would otherwise keep drawing until the next sweep.
         const auto cacheFrame = MGE::GeometryCache::currentFrame();
-        for (const auto& kv : cacheMap) {
-            const auto& e = kv.second;
+        const auto& skySet = MGE::GeometryCache::skyKeys();
+        for (std::uint32_t skey : skySet) {
+            auto cit = cacheMap.find(skey);
+            if (cit == cacheMap.end()) continue;   // set ⊆ cache invariant; guard anyway
+            const auto& e = cit->second;
             if (!e.isSky) continue;
             if (e.lastFrame != cacheFrame) continue;   // stale (awaiting eviction sweep)
-            auto ks = g_keySlot.find(kv.first);
+            auto ks = g_keySlot.find(skey);
             if (ks == g_keySlot.end()) {
                 continue;   // not yet uploaded to the host
             }
             cands.push_back({ e.skyOrder, &e, ks->second.slot });
+        }
+        // Stage 1 drift safety (panel toggle, default off): the old full-cache scan must keep
+        // exactly the keys the membership set delivered. Any line here = set-maintenance bug.
+        if (g_membershipValidate) {
+            for (const auto& kv : cacheMap) {
+                if (kv.second.isSky && !skySet.count(kv.first)) {
+                    LOG::logline("!! [memb-cmp] sky key=%08X tex=%s isSky in cache but NOT in skyKeys",
+                                 kv.first, kv.second.textureName ? kv.second.textureName : "(none)");
+                }
+            }
+            for (std::uint32_t skey : skySet) {
+                auto cit = cacheMap.find(skey);
+                if (cit == cacheMap.end()) {
+                    LOG::logline("!! [memb-cmp] sky key=%08X in skyKeys but NOT in cache", skey);
+                } else if (!cit->second.isSky) {
+                    LOG::logline("!! [memb-cmp] sky key=%08X in skyKeys but entry !isSky", skey);
+                }
+            }
         }
         std::sort(cands.begin(), cands.end(),
                   [](const SkyCand& a, const SkyCand& b) { return a.order < b.order; });
@@ -2464,27 +2578,33 @@ namespace {
         // moons must show up here as either absent (walk/eviction), stale, or slot-less (upload
         // chain). Remove after the decay root-cause is fixed.
         {
+            // Stage 1: the count loop rides the sky membership set too (it was the SECOND
+            // unconditional full-cache scan in this builder).
             static std::size_t s_lastCandCount = (std::size_t)-1;
             std::size_t staleN = 0, noSlotN = 0, totalSky = 0;
-            for (const auto& kv : cacheMap) {
-                const auto& e = kv.second;
+            for (std::uint32_t skey : skySet) {
+                auto cit = cacheMap.find(skey);
+                if (cit == cacheMap.end()) continue;
+                const auto& e = cit->second;
                 if (!e.isSky) continue;
                 ++totalSky;
                 if (e.lastFrame != cacheFrame) { ++staleN; continue; }
-                if (g_keySlot.find(kv.first) == g_keySlot.end()) { ++noSlotN; }
+                if (g_keySlot.find(skey) == g_keySlot.end()) { ++noSlotN; }
             }
             if (cands.size() != s_lastCandCount) {
                 s_lastCandCount = cands.size();
                 LOG::logline(">> [sk-diag] sky list CHANGED: packed=%zu (cache isSky=%zu stale=%zu noSlot=%zu) cacheFrame=%llu",
                              cands.size(), totalSky, staleN, noSlotN,
                              (unsigned long long)cacheFrame);
-                for (const auto& kv : cacheMap) {
-                    const auto& e = kv.second;
+                for (std::uint32_t skey : skySet) {
+                    auto cit = cacheMap.find(skey);
+                    if (cit == cacheMap.end()) continue;
+                    const auto& e = cit->second;
                     if (!e.isSky) continue;
                     const bool stale  = (e.lastFrame != cacheFrame);
-                    const bool noSlot = (g_keySlot.find(kv.first) == g_keySlot.end());
+                    const bool noSlot = (g_keySlot.find(skey) == g_keySlot.end());
                     LOG::logline(">> [sk-diag]   key=%08X tex=%s order=%u vc=%u %s%s",
-                                 kv.first, e.textureName ? e.textureName : "(none)",
+                                 skey, e.textureName ? e.textureName : "(none)",
                                  (unsigned)e.skyOrder, e.vertexCount,
                                  stale ? "STALE " : "fresh ", noSlot ? "NOSLOT" : "slot-ok");
                 }
@@ -2702,6 +2822,7 @@ namespace {
     // when the FP pass has something to ship this frame.
     bool buildFPFrame(IPC::FPFrame& fp, std::uint32_t& fpDraws, std::uint32_t& fpSkinned,
                       std::uint32_t& fpAlpha) {
+        MGE_ZoneScopedN("build:fp");
         fpDraws = 0;
         fpSkinned = 0;
         fpAlpha = 0;
@@ -2746,13 +2867,37 @@ namespace {
 
         const auto& cacheMap = MGE::GeometryCache::cache();
         const auto cacheFrame = MGE::GeometryCache::currentFrame();
-        for (auto& kv : cacheMap) {
-            const auto& e = kv.second;
+        // Stage 1: iterate the cache's maintained FP membership set instead of scanning the
+        // whole cache (the last remaining full-map scan on the build path). isFP stays as
+        // belt-and-braces; every other filter unchanged. FP opaque emit order is
+        // order-insensitive and fp-alpha is depth-sorted below, so set iteration order is fine.
+        const auto& fpSet = MGE::GeometryCache::fpKeys();
+        if (g_membershipValidate) {
+            // Stage 1 drift safety (panel toggle, default off) — mirror of the sky check.
+            for (const auto& kv : cacheMap) {
+                if (kv.second.isFP && !fpSet.count(kv.first)) {
+                    LOG::logline("!! [memb-cmp] fp key=%08X tex=%s isFP in cache but NOT in fpKeys",
+                                 kv.first, kv.second.textureName ? kv.second.textureName : "(none)");
+                }
+            }
+            for (std::uint32_t fkey : fpSet) {
+                auto cit = cacheMap.find(fkey);
+                if (cit == cacheMap.end()) {
+                    LOG::logline("!! [memb-cmp] fp key=%08X in fpKeys but NOT in cache", fkey);
+                } else if (!cit->second.isFP) {
+                    LOG::logline("!! [memb-cmp] fp key=%08X in fpKeys but entry !isFP", fkey);
+                }
+            }
+        }
+        for (std::uint32_t fkey : fpSet) {
+            auto cit = cacheMap.find(fkey);
+            if (cit == cacheMap.end()) continue;   // set ⊆ cache invariant; guard anyway
+            const auto& e = cit->second;
             if (!e.isFP || e.lastFrame != cacheFrame) continue;
             // Multi-map FP parts would need the wide-VB multimap pipeline in the FP pass;
             // none expected on arms — skip rather than bind the wrong vertex layout.
             if (e.d3dDark || e.d3dDetail || e.d3dGlow) continue;
-            auto ks = g_keySlot.find(kv.first);
+            auto ks = g_keySlot.find(fkey);
             if (ks == g_keySlot.end()) continue;   // not uploaded yet (first-sight frame)
             if (e.blendEnable && !e.isSkinned) {
                 if (!e.d3dTexture) continue;   // textureless blend: nothing to composite
@@ -3054,7 +3199,11 @@ namespace RenderProcess {
 
         // (MW-ONLY-UI world suppression has NO key: the keyspace is full — numpad - is already
         // the distant-light A/B a few lines above, and binding it there made one press fire both.
-        // It lives in the Forge Dev imgui panel instead, where its level is also readable.)
+        // It lives in the Forge Dev imgui panel instead, where its level is also readable.
+        // The build-shrink toggles — [bspike] spike log, sky/FP membership validation, the
+        // first-sight capture budget — live there too: the free numpad keys collide with the
+        // water-flow handlers' GetAsyncKeyState edge bits when UseWaterFlowMap is on, and a
+        // panel checkbox is READABLE state besides.)
     }
 
     // Consume the pending host RenderFrame: drain the completion (or the stored mid-walk
@@ -3268,6 +3417,9 @@ namespace RenderProcess {
         g_hb.bEnsure += ks.bEnsure; g_hb.bEmit += ks.bEmit; g_hb.bTail += ks.bTail;   // Phase 0 build-split
         g_hb.bTailEnsure += ks.bTailEnsure; g_hb.bKeys += ks.bKeys;
         g_hb.bTailScan += ks.bTailScan; g_hb.bTailAlpha += ks.bTailAlpha;
+        g_hb.bCaptures += ks.bCaptures;   // Stage 0: capture-burst visibility in the window
+        const double buildMs = ks.tBuild - ks.tStart;
+        if (buildMs > g_hb.maxBuild) g_hb.maxBuild = buildMs;
         if (feed > g_hb.maxFeed) g_hb.maxFeed = feed;
         if (ks.dtPresent > g_hb.maxDt) g_hb.maxDt = ks.dtPresent;
         if (ks.early) ++g_hb.earlyN;
@@ -3296,12 +3448,13 @@ namespace RenderProcess {
             // vs emit (worker-offload candidate) vs tail. Gate: emit ≥ ~2ms ⇒ emit→worker worth it.
             // movable = emit + (tail - tailEnsure); immovable = ensureLive + tailEnsure (live reads).
             LOG::logline(">> [hb] build split: ensureLive=%.2f emit=%.2f tail=%.2f (tailLive=%.2f) ms "
-                         "=> movable=%.2f immovable=%.2f (keys=%u)",
+                         "=> movable=%.2f immovable=%.2f (keys=%u) | maxBuild=%.2f captures/f=%.2f",
                          g_hb.bEnsure / g_hb.n, g_hb.bEmit / g_hb.n, g_hb.bTail / g_hb.n,
                          g_hb.bTailEnsure / g_hb.n,
                          (g_hb.bEmit + g_hb.bTail - g_hb.bTailEnsure) / g_hb.n,
                          (g_hb.bEnsure + g_hb.bTailEnsure) / g_hb.n,
-                         (unsigned)(g_hb.bKeys / g_hb.n));
+                         (unsigned)(g_hb.bKeys / g_hb.n),
+                         g_hb.maxBuild, g_hb.bCaptures / g_hb.n);
             // Tail sub-probe: scan = offscreen-caster full-cacheMap loop (@1694, direct-reduce
             // candidate); alpha = merge/sort/pack. tailLive is the scan's live pose-refresh subset.
             LOG::logline(">> [hb] tail split: scan=%.2f alpha=%.2f ms (scan-live=%.2f => scan-scanwork=%.2f)",
@@ -3964,6 +4117,7 @@ namespace RenderProcess {
         g_kick.bTailScan     = g_lastBuildTailScanMs;
         g_kick.bTailAlpha    = g_lastBuildTailAlphaMs;
         g_kick.bKeys         = g_lastBuildKeys;
+        g_kick.bCaptures     = g_lastBuildCaptures;
     }
 
     // ---- Tier 1b: fresh produce worker ------------------------------------------------------
@@ -4894,6 +5048,41 @@ void DrawForgeDevPanel() {
     logCheck("Forge water (F7)", g_waterEnabled, "Forge water (WT1)");
     logCheck("Frame-ahead pipelining (numpad *)", g_frameAheadLive, "frame-ahead pipelining");
     logCheck("FP arm suppression (numpad /)", g_fpSuppressLive, "FP suppression (FP1b)");
+
+    // Build-shrink toggles (Stages 0-2a). Panel-only, no keys: the free numpad keys collide
+    // with the water-flow handlers' edge-triggered polls when UseWaterFlowMap is on.
+    ImGui::Separator();
+    ImGui::Text("Build draw lists (shrink)");
+    logCheck("[bspike] build-spike log", g_buildSpikeLog, "build-spike log [bspike]");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Logs one !! [bspike] line when a buildGeometryDrawLists frame runs\n"
+            "> max(1.5x EMA, 1.2ms), naming which component carried it (ensure/emit/\n"
+            "scan/alpha) + captures/movers/cacheSize/sweepAge. Hard-throttled >=1s\n"
+            "apart, 64 lines/session — hot-path logging has collapsed the frame before.");
+    logCheck("sky/FP membership validation", g_membershipValidate, "sky/FP membership validation");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Runs the old full-cache sky/FP scans alongside the g_skyKeys/g_fpKeys\n"
+            "set consumers every frame. Any !! [memb-cmp] line = set-maintenance bug;\n"
+            "must stay silent across city / interior / weather / moon rise / POV\n"
+            "switch / cell transitions. Costs a full-map scan per frame while on.");
+    {
+        bool capped = g_captureBudgetOn;
+        if (ImGui::Checkbox("first-sight capture budget", &capped)) {
+            g_captureBudgetOn = capped;
+            LOG::logline(">> [seam] first-sight capture budget %s (cap=%d/frame)",
+                         g_captureBudgetOn ? "CAPPED" : "UNLIMITED", kCaptureBudgetPerFrame);
+        }
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "ON (default): ensureLive defers first-sight lazy captures past %d per build,\n"
+            "spreading reveal bursts over frames (deferred keys re-arrive via the next\n"
+            "classify — 1-2 frame late pop-in at reveal edges is the trade).\n"
+            "OFF: old behavior — a burst captures whole in one frame's build (the spike).\n"
+            "Unlimited either way on cell transitions and an empty cache.",
+            kCaptureBudgetPerFrame);
 
     ImGui::End();
 }
