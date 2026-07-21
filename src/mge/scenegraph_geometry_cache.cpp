@@ -204,6 +204,23 @@ namespace MGE::GeometryCache {
         //      so mass eviction can never flood the RPC again. Watch >> [release] draining.
         // The instrumentation (isLiveNode guard, 250ms climb watchdog, >> [evict-climb] line) stays.
         // Escape hatch back to the known-good walk rule: false / true.
+        // CELL-GRID EVICTION (2026-07-21) — the engine-authoritative gone-signal that replaces
+        // BOTH the parent-chain climb (froze) and the age rule (LEAKED: a 9999-speed flight
+        // captured tens of thousands of far meshes the sweep never shed → host draw set grew to
+        // 16k survivors / GBs). MW streams exterior cells in a fixed 3x3 active / 5x5 background
+        // grid centered on DataHandler::centralGrid (see cellgrid overlays); each cache entry is
+        // tagged with its home cell at capture, and a cell that leaves the grid evicts its entries.
+        // O(entries) int compares, no walk (kills the 6.6ms spike), bounded to <=25 cells no matter
+        // the speed (leak is structurally impossible). When ON it OWNS eviction; g_evictByParentChain
+        // is the A/B escape hatch back to the (leaking) parent-chain path. Interior <-> exterior and
+        // door/teleport transitions stay handled by renderprocess's purgeAll (g_cellEpoch); this
+        // fills the gap those miss: continuous EXTERIOR grid-shift.
+        bool               g_evictByCellGrid    = true;
+        constexpr int      kCellGridRadius      = 2;      // match MW's 5x5 background-load ring
+        constexpr float    kCellSize            = 8192.0f; // MW exterior cell size (world units)
+        // Home-cell capture context: MW's current interior Cell* (null in exterior), refreshed once
+        // per frame at onFrameReady entry and stamped onto every entry captured this frame.
+        const void*        g_captureInteriorCell = nullptr;
         bool               g_evictByParentChain = true;
         bool               g_evictForceWalk     = false;  // bisect knob; false = the perf win
         constexpr unsigned kEvictValidateSweeps = 20;
@@ -1699,6 +1716,7 @@ namespace MGE::GeometryCache {
                 buildD3DTransform(e.worldTransformD3D, geom);       // bounds center
                 e.dynamicHint = (sk || inCharacter) ? 4 : 0;
                 e.lastFrame = g_frame;
+                e.homeInteriorCell = g_captureInteriorCell;         // cell-grid eviction home tag
                 e.isLandscape = g_walkingLandscape;
                 e.isPickRoot = g_walkingPick;
                 // C4d: inCharacter is the cheap verdict (full-walk path); the reference
@@ -1723,6 +1741,7 @@ namespace MGE::GeometryCache {
             } else {
                 auto& e = it->second;
                 e.lastFrame = g_frame;
+                e.homeInteriorCell = g_captureInteriorCell;         // cell-grid eviction home tag
                 e.isLandscape = g_walkingLandscape;
                 e.isPickRoot = g_walkingPick;
                 e.isSky = g_walkingSky;
@@ -2413,6 +2432,12 @@ namespace MGE::GeometryCache {
         if (!Configuration.UseSceneGraphSnapshot) return;
         MGE_ZoneScopedN("GeometryCache::onFrameReady");
 
+        // Cell-grid eviction: refresh the home-cell capture context once per frame. Every entry
+        // captured this frame (main walk + ensureLive lazy captures) inherits it; the sweep uses
+        // it to tell a stale exterior entry (null) from an interior one. Cell only changes at a
+        // frame boundary, so one read here covers the whole frame's captures.
+        g_captureInteriorCell = MGE::DataHandlerView::currentInteriorCell(dataHandler);
+
         ++g_frame;
         // Accumulate the PREVIOUS frame's per-frame counters and uploads before
         // resetting: ensureLive runs AFTER onFrameReady returns (inside
@@ -2620,8 +2645,10 @@ namespace MGE::GeometryCache {
         // running every frame and get MORE precise this way (an unparented item is detected on the
         // very next click) while no longer pulling a walk per click.
         const bool sweepNow = (g_frame % kEvictSweepInterval == 0) || MWBridge::get()->IsMenu();
-        const bool validating = g_evictByParentChain && (g_evictSweepNo < kEvictValidateSweeps);
-        if (sweepNow && (!g_evictByParentChain || validating || g_evictForceWalk)) {
+        // Cell-grid mode NEVER forces a walk — it reads MW's grid directly. Parent-chain forces one
+        // only during its validation window / the forceWalk bisect knob.
+        const bool validating = g_evictByParentChain && !g_evictByCellGrid && (g_evictSweepNo < kEvictValidateSweeps);
+        if (sweepNow && !g_evictByCellGrid && (!g_evictByParentChain || validating || g_evictForceWalk)) {
             ensureFullWalk();
         }
 
@@ -2646,6 +2673,31 @@ namespace MGE::GeometryCache {
             const bool walkedThisFrame = (g_walkRanFrame == g_frame);
             const float evictR2 = g_gateRadius * g_gateRadius;
             ++g_evictSweepNo;
+
+            // --- Cell-grid eviction (engine-authoritative; OWNS eviction when on) ---------------
+            // Read MW's live grid ONCE per sweep. Verdict per entry:
+            //   interior now  → keep iff the entry's home interior == the current interior cell
+            //                   (evicts stale exterior [home==null] AND any other interior).
+            //   exterior now  → interior-tagged entry is stale (evict); else derive the entry's
+            //                   owning cell from its world translation and evict when it left the
+            //                   center±kCellGridRadius square (MW's 5x5 background-load grid).
+            // Sky/FP are not world-cell geometry (skyRoot/armCamera roots) → never cell-evicted.
+            const bool  cellGrid   = g_evictByCellGrid;
+            const int   cgX        = cellGrid ? MGE::DataHandlerView::centralGridX(dataHandler) : 0;
+            const int   cgY        = cellGrid ? MGE::DataHandlerView::centralGridY(dataHandler) : 0;
+            const void* curInterior = cellGrid ? MGE::DataHandlerView::currentInteriorCell(dataHandler)
+                                               : nullptr;
+            auto cellGridGone = [&](const CachedGeometry& e) -> bool {
+                if (e.isSky || e.isFP) return false;
+                if (curInterior) return e.homeInteriorCell != curInterior;
+                if (e.homeInteriorCell) return true;               // interior entry, now exterior
+                const int cx = (int)std::floor(e.worldTransformD3D[12] / kCellSize);
+                const int cy = (int)std::floor(e.worldTransformD3D[13] / kCellSize);
+                int dx = cx - cgX; if (dx < 0) dx = -dx;
+                int dy = cy - cgY; if (dy < 0) dy = -dy;
+                return dx > kCellGridRadius || dy > kCellGridRadius;
+            };
+            unsigned nByCell = 0;
             // Parent-chain verdict: is this shape still REACHABLE from a live MW root?
             //   0 = alive   (chain terminates at g_objRoot / g_pickRoot / g_landRoot)
             //   1 = gone    (detached: no parent, or the chain dead-ends at an unknown top)
@@ -2771,7 +2823,7 @@ namespace MGE::GeometryCache {
             const double     tClimb0 = gcNowMs();
             double           climbCountMs = 0.0;
             bool             climbRunaway = false;
-            if (g_evictByParentChain && rootsValid) {
+            if (g_evictByParentChain && !cellGrid && rootsValid) {
                 unsigned wouldEvict = 0, scanned = 0;
                 for (const auto& kv : g_cache) {
                     if (parentVerdict(kv.first, kv.second) == 1) ++wouldEvict;
@@ -2799,7 +2851,17 @@ namespace MGE::GeometryCache {
             for (auto it = g_cache.begin(); it != g_cache.end(); ) {
                 auto& e = it->second;
                 bool evict;
-                if (walkedThisFrame) {
+                if (cellGrid) {
+                    // Cell departure is the authoritative bulk signal (kills the leak). The age
+                    // rule stays ONLY as the within-cell despawn backstop — a dropped/picked-up
+                    // item whose cell is still loaded, so cellGridGone can't see it; its stale
+                    // shadow-caster record ages out within kFarKeepFrames (the old drop/pickup
+                    // behaviour). It can never leak: cellGridGone already bounds the set to <=25 cells.
+                    const bool gone = cellGridGone(e);
+                    const bool aged = (g_frame - e.lastFrame > kFarKeepFrames);
+                    evict = gone || aged;
+                    if (gone) ++nByCell; else if (aged) ++nByAge;
+                } else if (walkedThisFrame) {
                     evict = (e.lastFrame != g_frame);
                     // Far-keep hysteresis: a stale entry BEYOND the gate radius was gate-SKIPPED by
                     // this frame's walk, not removed — keep it (returning player pays no re-upload).
@@ -2820,7 +2882,7 @@ namespace MGE::GeometryCache {
                 } else {
                     evict = (g_frame - e.lastFrame > kFarKeepFrames);
                 }
-                if (g_evictByParentChain) {
+                if (g_evictByParentChain && !cellGrid) {
                     const int  graph = graphTrusted ? parentVerdict(it->first, e) : 2;
                     const bool aged  = (g_frame - e.lastFrame > kFarKeepFrames);
                     // Age is the backstop, not the hysteresis: it covers `unknown` verdicts (sky
@@ -2883,9 +2945,11 @@ namespace MGE::GeometryCache {
             // eviction path is where the freeze/ghosting bugs live, so a non-zero sweep must never
             // be silent (it was, between sweep 20 and the mass-evict investigation).
             if (validating || nEvicted > 0) {
-                LOG::logline(">> [evict] sweeps=%u walk-forced=%u entries=%zu evicted=%u byGraph=%u byAge=%u unknown=%u deferred=%u disagree(walkGone/parentGone)=%u/%u",
-                             g_evictSweepNo, walkedThisFrame ? 1u : 0u, g_cache.size(),
-                             nEvicted, nByGraph, nByAge, nUnknown, nDeferred,
+                LOG::logline(">> [evict] sweeps=%u mode=%s walk-forced=%u entries=%zu evicted=%u byCell=%u grid=(%d,%d)r%d int=%d byGraph=%u byAge=%u unknown=%u deferred=%u disagree(walkGone/parentGone)=%u/%u",
+                             g_evictSweepNo, cellGrid ? "cell" : (g_evictByParentChain ? "parent" : "walk"),
+                             walkedThisFrame ? 1u : 0u, g_cache.size(),
+                             nEvicted, nByCell, cgX, cgY, kCellGridRadius, (int)(curInterior != nullptr),
+                             nByGraph, nByAge, nUnknown, nDeferred,
                              g_evictDisagreeWalkGone, g_evictDisagreeGraphGone);
             }
             // Parent-climb probe (every sweep while the graph verdict is active). countMs = wall time
@@ -2894,7 +2958,7 @@ namespace MGE::GeometryCache {
             // means the raw pointer climb was chasing dead memory). depthCap = chains that never
             // reached a known root within kMaxParentDepth (garbage-chain smell). runaway = watchdog
             // tripped this sweep.
-            if (g_evictByParentChain) {
+            if (g_evictByParentChain && !cellGrid) {
                 LOG::logline(">> [evict-climb] sweep=%u entries=%zu countMs=%.2f maxDepth=%u vtBad=%u depthCap=%u runaway=%d trusted=%d walked=%d",
                              g_evictSweepNo, g_cache.size(), climbCountMs,
                              climbMaxDepth, climbVtBad, climbDepthCap,
