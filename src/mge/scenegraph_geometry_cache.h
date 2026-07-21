@@ -96,6 +96,13 @@ namespace MGE::GeometryCache {
         // every main-scene draw list (dispatch, caster re-emit, frustum fallback) and
         // drawn only by the host's dedicated FP pass under the arm camera's viewProj.
         bool     isFP;
+        // Cell-grid eviction (engine-authoritative gone-signal). Tagged at capture from MW's
+        // DataHandler: null => this entry belongs to the EXTERIOR (its owning cell is derived
+        // from worldTransformD3D at sweep time); non-null => the interior Cell* it was captured
+        // under. The sweep evicts any entry whose home cell has left MW's live grid — exterior:
+        // |cell - centralGrid| > kCellGridRadius; interior: homeInteriorCell != currentInteriorCell.
+        // This replaces the parent-chain climb / age rule with the grid MW itself streams on.
+        const void* homeInteriorCell = nullptr;
         unsigned char srcBlend;   // D3DBLEND_* (sky source blend factor)
         unsigned char destBlend;  // D3DBLEND_* (sky dest blend factor)
         // SK2: subtree visit order within the skyRoot walk (0 = first child visited).

@@ -292,6 +292,32 @@ namespace {
         g_mainPhaseTick.fetch_add(1, std::memory_order_relaxed);
     }
 
+    // Produce-WORKER phase breadcrumb. When main stalls in 'wait-produce' the wedge is inside the
+    // worker's kickoffBody, invisible to the main breadcrumb — this names WHICH stage the worker is
+    // stuck in (build-drawlists reading g_cache, a flush RPC, the kickoff RPC, …). Set from the
+    // worker thread only; read by the watchdog. Observe-only.
+    enum WorkerPhase : std::uint32_t {
+        WK_IDLE = 0,        // between jobs / kickoffBody returned
+        WK_BUILD_DRAW,      // buildGeometryDrawLists — ensureLive reads g_cache + LIVE scene graph (prime hang suspect)
+        WK_BUILD_LIGHT,     // buildLightList
+        WK_BUILD_SKY,       // buildSkyDrawList
+        WK_BUILD_FP,        // buildFPFrame
+        WK_GATE,            // gateOnPrevFinish("kickoff")
+        WK_GEOM,            // flushGeometry (blocking geom RPC)
+        WK_TEX,             // flushTextures (blocking tex RPC)
+        WK_ASSIGN,          // assign shared draw/skinned/multimap/light/sky vectors
+        WK_KICKOFF,         // renderSceneKickoff (start the host frame)
+        WK_COUNT
+    };
+    const char* const kWorkerPhaseName[WK_COUNT] = {
+        "idle/done", "build-drawlists", "build-lights", "build-sky", "build-fp",
+        "gate-kickoff", "geom-flush", "tex-flush", "assign-vecs", "kickoff-rpc"
+    };
+    std::atomic<std::uint32_t> g_workerPhase{WK_IDLE};
+    inline void markWorkerPhase(std::uint32_t p) {
+        g_workerPhase.store(p, std::memory_order_relaxed);
+    }
+
     std::atomic<bool> g_watchdogStarted{false};
     void startWedgeWatchdog() {
         bool expected = false;
@@ -322,9 +348,11 @@ namespace {
                     const std::uint32_t ph =
                         std::min<std::uint32_t>(g_mainPhase.load(std::memory_order_relaxed), MP_COUNT - 1);
                     const HWND fg = GetForegroundWindow();
-                    LOG::logline("!! [watchdog] MAIN STALLED %.1fs at phase '%s' — foreground=%s "
-                                 "(MW hwnd=%p fg=%p) frame=%u",
-                                 (now - lastMoveMs) / 1000.0, kMainPhaseName[ph],
+                    const std::uint32_t wph =
+                        std::min<std::uint32_t>(g_workerPhase.load(std::memory_order_relaxed), WK_COUNT - 1);
+                    LOG::logline("!! [watchdog] MAIN STALLED %.1fs at phase '%s' | worker at '%s' — "
+                                 "foreground=%s (MW hwnd=%p fg=%p) frame=%u",
+                                 (now - lastMoveMs) / 1000.0, kMainPhaseName[ph], kWorkerPhaseName[wph],
                                  (fg == g_devHwnd) ? "MW" : "OTHER", (void*)g_devHwnd, (void*)fg, g_frame);
                     reported = true;
                 }
@@ -3401,11 +3429,15 @@ namespace RenderProcess {
         bool fpHave = false;
         {
             MGE_ZoneScopedN("Forge build draw lists");
+            markWorkerPhase(WK_BUILD_DRAW);   // ensureLive reads g_cache + LIVE scene graph
             buildGeometryDrawLists(drawCount, skinnedCount, multiMapCount, alphaCount);
+            markWorkerPhase(WK_BUILD_LIGHT);
             lightCount = buildLightList();
+            markWorkerPhase(WK_BUILD_SKY);
             skyCount = buildSkyDrawList();
             // FP1a: before the geom flush below so first-sight arm meshes (captured by
             // this frame's FP walk) ship in the same flush the pass draws from.
+            markWorkerPhase(WK_BUILD_FP);
             fpHave = buildFPFrame(fpFrame, fpDraws, fpSkinnedDraws, fpAlphaDraws);
         }
         const double tBuild = nowMs();
@@ -3435,9 +3467,11 @@ namespace RenderProcess {
         // RT copy have released frame N-1. Expected wait ≈ 0 — the finish is ~1.7ms under a ~3.5ms
         // build. If "Forge kickoff gate ms" starts showing real time, the build got cheaper than
         // the finish and double-buffering the shared vectors is the next move.
+        markWorkerPhase(WK_GATE);
         gateOnPrevFinish("kickoff");
 
         {
+            markWorkerPhase(WK_GEOM);
             MGE_ZoneScopedN("Forge geom flush");
             flushGeometry();
         }
@@ -3448,10 +3482,12 @@ namespace RenderProcess {
         const std::uint32_t texCount = g_texPendingCount;          // snapshot (flush clears it)
         const std::size_t   texBytes = g_texPendingBlob.size();
         {
+            markWorkerPhase(WK_TEX);
             MGE_ZoneScopedN("Forge tex flush");
             flushTextures();
         }
         const double tTexFlush = nowMs();
+        markWorkerPhase(WK_ASSIGN);
 
         const bool haveDraw = g_drawVec && drawCount > 0
             && g_drawVec->assign_bytes(g_drawScratch.data(), (std::uint32_t)g_drawScratch.size());
@@ -3816,6 +3852,7 @@ namespace RenderProcess {
         // (viewProj/lighting/devInput/waterParams) are memcpy'd into the IPC block before
         // renderSceneKickoff returns, so these stack locals can die here.
         {
+            markWorkerPhase(WK_KICKOFF);
             MGE_ZoneScopedN("Forge renderSceneKickoff");
             ok = g_client->renderSceneKickoff(frame, (const float*)&viewProj, lighting,
                      haveDraw ? g_drawVec->id() : IPC::InvalidVector,
@@ -3933,6 +3970,7 @@ namespace RenderProcess {
                 }
                 const double t0 = nowMs();
                 kickoffBody(device);
+                markWorkerPhase(WK_IDLE);            // body returned (covers every kickoffBody exit path)
                 g_produceWorkerMs = nowMs() - t0;   // published under the lock below (happens-before)
                 {
                     std::lock_guard<std::mutex> lk(m_mx);
